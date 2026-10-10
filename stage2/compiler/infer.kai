@@ -10502,139 +10502,62 @@ fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
 }
 
 # detect the surface shape `Eff.op(args)` and treat it as
-# an op call. `Eff` must be a declared effect (its op signatures
-# were registered under dotted keys by `add_effect_op_sigs`). Args
-# are unified against the op's parameter types; the result type
-# is the op's return type; `Eff` is added to the caller's row.
+# an op call. Args are unified against the op's parameter types; the
+# result type is the op's return type; `Eff` is added to the caller's row.
 #
-# An "effect name" is detected by scanning the env for any entry
-# of the form `Eff.<something>` — equivalent to "this name has
-# at least one op registered". If `Eff` is an effect but the op
-# is missing, we emit a dedicated diagnostic instead of falling
+# The resolver settled the head: a declared effect (a row alias reads as
+# the component that declares the op) is its id, an alias binder or a
+# capability parameter is the local it is. If `Eff` is an effect but the
+# op is missing, we emit a dedicated diagnostic instead of falling
 # through to the generic `unknown identifier` path.
 fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
 
 
   match callee.kind {
-    # A settled base and a bare one take the same path: the id decides
-    # the lookup key, the written name decides the row label. Reading
-    # them apart is what lets a homonymous effect reach its own op
-    # without the name having been respelled upstream.
-    EField(base, op_name) -> match op_base_of(base.kind) {
-      Some(OpBase(bsym, name)) -> {
-        # A base the resolver settled keys by the effect's identity, so
-        # two modules declaring one effect name reach their own op
-        # without either having been respelled. A base it could not
-        # settle — an alias, a capability parameter — keys by the
-        # written name, which is the ladder below.
-        let key = if sym_raw(bsym) >= 0 { ty_op_key_sym(bsym, op_name) }
-                  else { ty_op_key_name(name, op_name) }
-        # The scheme is found by identity; the row label and the
-        # collision report stay keyed by the written name, which is what
-        # the runtime evidence stack and the diagnostics are keyed by.
-        let named_key = ty_op_key_name(name, op_name)
-        match op_lookup_either(st.env, key, named_key) {
-          Some(sc) -> Some(op_callee_carries(record_op_res(synth_op_call_with_scheme(st, sc, args_, named_key, bsym, line, col), named_key, None, false, line, col), bsym))
-          None ->
-            if is_effect_in_env(st.env, name) {
-              Some(synth_op_call_unknown_op(st, name, op_name, line, col))
-            } else {
-              # maybe `name` is an alias bound by an
-              # enclosing `handle ... with Eff as name`. Resolve
-              # to the underlying effect and retry.
-              # `@cap` desugars to `cap.get()` for every
-              # capability shape; for a Reader-bound alias the op
-              # is `ask`, not `get`. Remap here so the lookup hits.
-              # A capability PARAMETER (`c: Eff`, not a `with..as` alias) is
-              # provided by the caller, so it falls through to `cap_op_call`
-              # below — its op does not join the row (§6 named instances).
-              match lookup_alias(st.aliases, name) {
-                None ->
-                  # try type alias (`type Console =
-                  # Stdout + Stderr + Stdin`, `type Io = Console + Env
-                  # + File`). Find which component effect provides
-                  # `op_name` and retry the lookup with that effect's
-                  # qualified key. Body row label uses the resolved
-                  # effect name so subset checking sees atomic labels
-                  # and the runtime evidence stack is queried with
-                  # the right key. Ambiguity (multiple components
-                  # share an op_name) resolves to the leftmost.
-                  match find_alias(st.type_aliases, name) {
-                    # Not an effect, not a `with..as` alias, not a type alias —
-                    # last shot: a capability PARAMETER (`c: Eff`), provided by
-                    # the caller (§6 named instances). Op dispatches against the
-                    # param's evidence; effect does not join the row.
-                    None -> cap_op_call(st, name, op_name, args_, line, col)
-                    Some(components) ->
-                      match inf_find_eff_for_alias_op(components, st.op_to_eff, op_name) {
-                        None -> None
-                        Some(RL(real_eff, _, rsym)) -> {
-                          let key2 = string_concat(real_eff, string_concat(".", op_name))
-                          match ty_env_lookup(st.env, key2) {
-                            Some(sc) -> Some(op_callee_carries(record_op_res(synth_op_call_with_scheme(st, sc, args_, key2, rsym, line, col), key2, None, false, line, col), rsym))
-                            None ->
-                              if is_effect_in_env(st.env, real_eff) {
-                                Some(synth_op_call_unknown_op(st, real_eff, op_name, line, col))
-                              } else { None }
-                          }
-                        }
-                      }
-                  }
-                Some(eff) -> {
-                  let real_op = canonical_cap_getter(lookup_alias_sym(st.aliases, name), op_name)
-                  let lookup_key = string_concat(eff, string_concat(".", real_op))
-                  # §6 named instances: a `with Eff as name` binding dispatches
-                  # `name.op` against the handle's own evidence node, bound in the
-                  # prologue as `kai_<name>`. The dispatch key carries `#<name>`
-                  # so codegen reads that node directly — the same path a
-                  # capability parameter uses, no by-id walk. Inside a lambda body
-                  # the prologue local is out of scope, so the tag is suppressed
-                  # and the bare name-keyed lookup runs (closure-capture path).
-                  let taggable = match lookup_alias_taggable(st.aliases, name) {
-                    Some(b) -> b
-                    None    -> false
-                  }
-                  # `var`/State/Reader cells keep the legacy by-id dispatch (`@`):
-                  # their naked-read sugar and nested-cell identity ride that path
-                  # across the corpus. A user effect's `with Eff as name` uses the
-                  # §6 capability dispatch (`#`) so it threads as a first-class
-                  # value through calls — the named-instances surface.
-                  let dispatch_key = if taggable {
-                    if eff_is_cell_effect(lookup_alias_sym(st.aliases, name)) {
-                      string_concat(lookup_key, string_concat("@", name))
-                    } else {
-                      string_concat(lookup_key, string_concat("#", name))
-                    }
-                  } else {
-                    lookup_key
-                  }
-                  # this is the confirmed-alias branch, so
-                  # `name` is a `with <eff> as <name>` cell. Tag the row
-                  # label with the cell identity (`State@i`) so two
-                  # distinct cells (`var i`, `var go`) stay distinct
-                  # labels under row unification. Independent of
-                  # `taggable`: the codegen dispatch tag is suppressed
-                  # inside a lambda, but row identity must hold there too
-                  # (the `while` thunks are lambdas).
-                  # The callee names the declaration the `handle` head
-                  # resolved to; a cell's evidence node is still found by id.
-                  let asym = lookup_alias_sym(st.aliases, name)
-                  match ty_env_lookup(st.env, lookup_key) {
-                    Some(sc) -> Some(op_callee_carries(
-                                       record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, Some(name), asym, line, col), lookup_key, Some(name), taggable, line, col),
-                                       asym))
-                    None ->
-                      if is_effect_in_env(st.env, eff) {
-                        Some(synth_op_call_unknown_op(st, eff, real_op, line, col))
-                      } else { None }
-                  }
-                }
-              }
-            }
+    EField(base, op_name) -> match base.kind {
+      ESym(bsym, _) -> match env_op(st.env, bsym, written(op_name)) {
+        Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, bsym, op_name, line, col), bsym, written(op_name), None, false, line, col))
+        None ->
+          if env_has_effect(st.env, bsym) {
+            Some(synth_op_call_unknown_op(st, bsym, op_name, line, col))
+          } else { None }
+      }
+      # A local heads the op: an alias bound by an enclosing
+      # `handle ... with Eff as name`, else a capability PARAMETER
+      # (`c: Eff`), provided by the caller, whose op does not join the row
+      # (§6 named instances).
+      ELocal(l) -> match lookup_alias_taggable(st.aliases, l) {
+        None -> cap_op_call(st, l, op_name, args_, line, col)
+        Some(taggable) -> {
+          # The callee names the declaration the `handle` head resolved to.
+          let asym = lookup_alias_sym(st.aliases, l)
+          # `@cap` desugars to `cap.get()` for every capability shape; for
+          # a Reader-bound alias the op is `ask`, not `get`.
+          let real_op = canonical_cap_getter(asym, op_name)
+          # §6 named instances: a `with Eff as name` binding dispatches
+          # `name.op` against the handle's own evidence node, the value the
+          # alias holds — the same path a capability parameter uses, no
+          # by-id walk. `var`/State/Reader cells keep the by-id dispatch:
+          # their naked-read sugar and nested-cell identity ride that path.
+          # Inside a lambda body the prologue local is out of scope, so the
+          # instance is not named and the ambient lookup runs.
+          let via = if not taggable { ViaAmbient }
+                    else if eff_is_cell_effect(asym) { ViaAlias(l) }
+                    else { ViaRecv(l) }
+          # The row label is tagged with the cell whatever `taggable`
+          # says: row identity must hold inside a lambda too (the `while`
+          # thunks are lambdas).
+          match env_op(st.env, asym, written(real_op)) {
+            Some(sc) -> Some(record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, asym, real_op, via, Some(l), line, col), asym, written(real_op), Some(l), taggable, line, col))
+            None ->
+              if env_has_effect(st.env, asym) {
+                Some(synth_op_call_unknown_op(st, asym, real_op, line, col))
+              } else { None }
+          }
         }
       }
-      None -> None
+      _ -> None
     }
     _ -> None
   }
@@ -10651,12 +10574,12 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
 #      record, returns None — let `synth_call`'s generic path run
 #      `synth(st, callee)` (which dispatches `synth_field`) so field
 #      access wins on ties.
-#   2. Else if `ident` resolves in the type env to a function whose
-#      first parameter unifies with `obj`'s type, lowers the call to
-#      `ECall(EName(ident), [obj, ...args])` and finishes typing it
-#      with the same expected-row pattern `synth_call`/`synth_pipe_dispatch`
-#      use, so call-site row-tracking and unify diagnostics stay
-#      identical to the prefix form.
+#   2. Else if `ident` names a function whose first parameter unifies
+#      with `obj`'s type, lowers the call to `ident(obj, ...args)` on that
+#      function's id and finishes typing it with the same expected-row
+#      pattern `synth_call`/`synth_pipe_dispatch` use, so call-site
+#      row-tracking and unify diagnostics stay identical to the prefix
+#      form.
 #   3. Else, emits a Q4-style diagnostic naming the receiver type and
 #      hinting at scope candidates whose first arg matches, then
 #      stamps `TyAny` to keep cascade graceful.
@@ -10702,23 +10625,24 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 
 
   match obj_ty {
-    TyCon(_, _, _, tcs) ->
+    TyCon(tcs, _) ->
       if core_ty_is(tcs, CtRef) {
-        let key_opt =
-          if ident == "get" { Some("Mutable.ref_get") }
-          else if ident == "set" { Some("Mutable.ref_set") }
+        let op_opt =
+          if ident == "get" { Some("ref_get") }
+          else if ident == "set" { Some("ref_set") }
           else { None }
-        match key_opt {
+        match op_opt {
           None -> None
-          Some(key) -> match ty_env_lookup(st.env, key) {
-            None -> None
-            Some(sc) -> {
-              # `obj` re-walks once inside `synth_op_call_with_scheme`
-              # (via `synth_many`); `synth` on `EName(name)` is a pure
-              # env lookup, so a second walk is idempotent.
-              let all_args = [obj, ...args_]
-              let ms = core_effect_id(CeMutable)
-              Some(op_callee_carries(synth_op_call_with_scheme(st, sc, all_args, key, ms, line, col), ms))
+          Some(op) -> {
+            let ms = core_effect_id(CeMutable)
+            match env_op(st.env, ms, written(op)) {
+              None -> None
+              Some(sc) -> {
+                # `obj` re-walks once inside `synth_op_call_with_scheme`
+                # (via `synth_many`); typing a read twice is idempotent.
+                let all_args = [obj, ...args_]
+                Some(synth_op_call_with_scheme(st, sc, all_args, ms, op, line, col))
+              }
             }
           }
         }
@@ -10732,7 +10656,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 # field-wins-on-ties precedence rule before attempting UFCS lookup.
 fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
   match obj_ty {
-    TyCon(_, cname, cargs, tsym) -> match rec_pick(st.recs, tsym, cname, list_length(cargs), ident) {
+    TyCon(tsym, _) -> match rec_pick(st.recs, tsym) {
       None -> false
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
@@ -10749,23 +10673,17 @@ fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
 # result of `pick_by_first_arg`. The picked scheme has
 # already been instantiated (state's `fresh` and `sub` advanced); the
 # caller proceeds with the standard unify-arg-then-emit pipeline.
-# `mod` carries the declaring module so the caller rewrites the
-# callee to `EModCall(mod, fname)`, the identity of the settled contest.
+# `sym` is the picked function, which the caller makes the callee: the
+# identity of the settled contest.
 type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
-                    mod: String }
-
-# shared shape used by `synth_ufcs_dispatch`. Pairs the
-# instantiated state with the resolved callee form: the picked
-# declaration's `ESym`, or a bare `EVar` for a binder with no id.
-type UfcsPick = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
-                  callee_kind: ExprKind }
+                    sym: SymId }
 
 # choose the candidate whose first parameter unifies
 # with `target_ty`, preferring CONCRETE-headed matches over
 # tyvar-headed ones.
 #
 # A scheme's first param can be either:
-#   - concrete-headed: TyCon(None, "Result", [...]), TyListT(...), TyString,
+#   - concrete-headed: a nominal type, a list, `String`,
 #     etc. These match `target_ty` only when the heads agree, so a
 #     `Result[String, Int]` arg never accidentally picks `list.map`.
 #   - tyvar-headed: TyVarT(_), TyAny. Vacuously unifies with any
@@ -10778,9 +10696,7 @@ type UfcsPick = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
 # Walk strategy: a single pass that records two best candidates —
 # the first concrete-headed match and the first tyvar-headed match.
 # Concrete wins if any was found. Within each kind the most-recently-
-# registered match wins (env order is newest first). This matches
-# the legacy `ty_env_lookup` tie-break on the bare side and gives
-# correct dispatch on the qualified side.
+# registered match wins (candidates come newest first).
 #
 # Each tried candidate bumps the inference state's fresh counter
 # (instantiation mints fresh tyvars). On a match the `sub` is *not*
@@ -10845,7 +10761,7 @@ fn pick_by_first_arg_loop(st: InferState, candidates: [TyCandidate],
       }
       let pick = PickResult { st: inst.st, inst_ty: inst.ty,
                                fresh: inst.fresh, unit_fresh: inst.unit_fresh,
-                               mod: c.mod }
+                               sym: c.sym }
       let new_concrete = match probe {
         ProbeConcrete -> match best_concrete {
           Some(_) -> Some(pick_advance_st(best_concrete, inst.st))
@@ -10873,14 +10789,14 @@ fn pick_by_first_arg_loop(st: InferState, candidates: [TyCandidate],
 
 # replace a pending pick's `st` with `latest_st` so the
 # fresh-counters advance past every candidate's instantiation. The
-# pick's `inst_ty`, `fresh`, `unit_fresh`, and `mod` are preserved
+# pick's `inst_ty`, `fresh`, `unit_fresh`, and `sym` are preserved
 # unchanged. Returns the input verbatim when it's `None` (caller
 # only invokes this on `Some(_)`).
 fn pick_advance_st(p: Option[PickResult], latest_st: InferState) : PickResult {
   match p {
-    None -> PickResult { st: latest_st, inst_ty: TyAny, fresh: [], unit_fresh: [], mod: "" }
+    None -> PickResult { st: latest_st, inst_ty: TyAny, fresh: [], unit_fresh: [], sym: sym_none() }
     Some(pp) -> PickResult { st: latest_st, inst_ty: pp.inst_ty,
-                              fresh: pp.fresh, unit_fresh: pp.unit_fresh, mod: pp.mod }
+                              fresh: pp.fresh, unit_fresh: pp.unit_fresh, sym: pp.sym }
   }
 }
 
@@ -10908,16 +10824,16 @@ fn first_param_head_is_concrete(t: Ty) : Bool = match t {
   TyInt128       -> true
   TyListT(_)   -> true
   TyFnT(_, _, _) -> true
-  TyCon(_, _, _, _)  -> true
+  TyCon(_, _)  -> true
   TyDimT(_, _) -> true
   _            -> false
 }
 
-# Lowers `obj.ident(args)` to `ident(obj, args)`. Looks up `ident`
-# in the type env; if missing or its first param doesn't unify with
-# `obj_ty`, emits the Q4 method-not-found diagnostic and returns a
-# TyAny stamp. Mirrors `synth_pipe_dispatch`'s open-row pattern so
-# the dispatched call's effect labels and unify diagnostics match
+# Lowers `obj.ident(args)` to `ident(obj, args)`. Picks among the
+# functions spelled `ident`; if none is found or its first param doesn't
+# unify with `obj_ty`, emits the Q4 method-not-found diagnostic and
+# returns a TyAny stamp. Mirrors `synth_pipe_dispatch`'s open-row pattern
+# so the dispatched call's effect labels and unify diagnostics match
 # the prefix-form call (`ident(obj, args)`).
 #
 # `obj_expr` has already been walked by `try_ufcs_call`; we walk
@@ -10930,20 +10846,20 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
 
 
   # The receiver's type picks among the modules declaring `ident`; a
-  # name no module-tagged declaration answers (a root-file fn, a local
-  # binder, a core signature) reads what the bare name reads.
+  # name none of them answers reads the root file's function, else the
+  # builtin.
   let candidates = st_visible_candidates(st, ident)
   let picked = match pick_by_first_arg(st, candidates, obj_ty) {
-    Some(p) -> Some(UfcsPick { st: p.st, inst_ty: p.inst_ty,
-                                fresh: p.fresh, unit_fresh: p.unit_fresh,
-                                callee_kind: ufcs_home_callee(st.env, st_reader(st), ident, p.mod) })
-    None -> match ty_env_lookup(st.env, ident) {
+    Some(p) -> Some(p)
+    None -> match ufcs_bare_sym(st.env, ident) {
       None -> None
-      Some(sc) -> {
-        let inst = st_instantiate_report(st, sc)
-        Some(UfcsPick { st: inst.st, inst_ty: inst.ty,
-                         fresh: inst.fresh, unit_fresh: inst.unit_fresh,
-                         callee_kind: ufcs_bare_callee(st.env, ident) })
+      Some(s) -> match env_sym(st.env, s) {
+        None -> None
+        Some(sc) -> {
+          let inst = st_instantiate_report(st, sc)
+          Some(PickResult { st: inst.st, inst_ty: inst.ty,
+                            fresh: inst.fresh, unit_fresh: inst.unit_fresh, sym: s })
+        }
       }
     }
   }
@@ -10955,7 +10871,7 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
       let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
         inst_st
       } else {
-        st_push_inst(inst_st, CS(ident, line, col, pick.fresh, pick.unit_fresh, None))
+        st_push_inst(inst_st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
       }
       match inst_ty {
         TyFnT(params, _, _) -> match params {
@@ -10980,7 +10896,7 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let st_fresh = st_set_sub(rv.st, fr.subst)
               let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
               let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-              let synth_callee = mk_expr(pick.callee_kind, line, col)
+              let synth_callee = mk_sym(pick.sym, line, col)
               # propagate capability-only labels through UFCS.
               let st_unif = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
               let st2 = st_propagate_capability_labels(st_unif,
@@ -10998,21 +10914,28 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
   }
 }
 
-# The function `home` declares under `ident`, by its id where a bare
-# `ident` read from `reader` names one function. Where several modules
-# declare it the receiver's type settled the contest, and the
-# home-qualified call is the form a settled contest takes: an id there
-# reads as a bare use the name report must reject.
-fn ufcs_home_callee(env: TyEnv, reader: String, ident: String, home: String) : ExprKind =
-  if tsh_fn_settled(env.ty_homes, ident, reader) { ESym(sym_derive(NCFn, ident, home), spec_none(), ident) }
-  else { EModCall(home, ident) }
-
-# A root-file function when no binder registered after it shadows the
-# bare name; otherwise the binder, which carries no id here.
-fn ufcs_bare_callee(env: TyEnv, ident: String) : ExprKind {
-  let s = sym_derive(NCFn, ident, tsh_target(env.ty_homes))
-  if ty_env_bare_is_sym(env, s, ident) { ESym(s, spec_none(), ident) } else { EName(ident) }
+# The function module `home` declares as `name`, when the env holds it.
+fn env_home_fn(env: TyEnv, home: String, name: String) : Option[SymId] = match st_module(env.tab, home) {
+  None    -> None
+  Some(h) -> match st_lookup(env.tab, NCFn, name, h) {
+    None    -> None
+    Some(s) -> match env_sym(env, s) {
+      Some(_) -> Some(s)
+      None    -> None
+    }
+  }
 }
+
+# What a method name no visible module answers reads: the root file's
+# function, else the builtin.
+fn ufcs_bare_sym(env: TyEnv, ident: String) : Option[SymId] =
+  match env_home_fn(env, tsh_target(env.ty_homes), ident) {
+    Some(s) -> Some(s)
+    None    -> match env_sym(env, builtin_sym(ident)) {
+      Some(_) -> Some(builtin_sym(ident))
+      None    -> None
+    }
+  }
 
 # Q4 diagnostic — the receiver's type is statically known (or `TyAny`
 # from a cascade), no field of that type matches, and no scope
@@ -11024,7 +10947,7 @@ fn ufcs_method_not_found(st: InferState, ident: String, obj_expr: Expr,
                           line: Int, col: Int) : Inferred / Console + File {
 
 
-  let head_msg = match inf_ty_head_name(obj_ty) {
+  let head_msg = match inf_ty_head_name(st.env.tab, obj_ty) {
     Some(name) -> concat_all(["method `", ident, "` not found for type `", name, "`"])
     None       -> concat_all(["method `", ident, "` not found (receiver type unresolved)"])
   }
@@ -11037,27 +10960,16 @@ fn ufcs_method_not_found(st: InferState, ident: String, obj_expr: Expr,
   mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root)
 }
 
-# When `name` is a value bound to a capability type — a parameter `c: Eff` or a
-# `with Eff as name` binding (§6 named instances) — return the effect it carries.
-# The capability type is the effect's own nominal `TyCon(_, Eff, args)`; an
-# `Eff.op` exists in the env iff `Eff` is a declared effect, so a TyCon head that
-# `is_effect_in_env` recognises is a capability. Returns the effect label with
-# the resolved ty_args so the op-call instantiation pins the row instance.
-# The capability a binder carries: its effect label, and the declaration
-# that effect's `TyCon` names. The id is what tells two homonymous effects
-# apart below the erasure; the label stays keyed by the written name,
-# which the runtime evidence stack and the diagnostics are keyed by.
-type CapEff = CapEff(Label, SymId)
-
-fn cap_eff_of_var(st: InferState, name: String) : Option[CapEff] =
-  match ty_env_lookup(st.env, name) {
+# When the local `l` is bound to a capability type — a parameter `c: Eff`
+# or a `with Eff as name` binding (§6 named instances) — the effect it
+# carries. The capability type is the effect's own nominal type, so a
+# `TyCon` whose declaration has ops registered is a capability.
+fn cap_eff_of_var(st: InferState, l: LocalId) : Option[SymId] =
+  match env_local(st.env, l) {
     None     -> None
     Some(sc) -> match sc {
       Scheme(_, _, _, _, ty) -> match apply_ty(st.sub, ty) {
-        TyCon(_, ename, targs, esym) ->
-          if is_effect_in_env(st.env, ename) {
-            Some(CapEff(Label { eff: ename, ty_args: targs, sym: esym }, esym))
-          } else { None }
+        TyCon(esym, _) -> if env_has_effect(st.env, esym) { Some(esym) } else { None }
         _ -> None
       }
     }
@@ -11071,62 +10983,42 @@ fn eff_is_cell_effect(s: SymId) : Bool = effect_is(s, CeState) or effect_is(s, C
 # Type `name.op(args)` where `name` is a capability value. Dispatch the op to the
 # effect it carries; codegen reads `name`'s evidence node. The effect does NOT
 # join the row — the capability is provided, not demanded.
-fn cap_op_call(st: InferState, name: String, op_name: String, args_: [Expr],
+fn cap_op_call(st: InferState, l: LocalId, op_name: String, args_: [Expr],
                line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
-  match cap_eff_of_var(st, name) {
+  match cap_eff_of_var(st, l) {
     None -> None
-    Some(CapEff(lab, esym)) -> {
-      let cap_eff = lab.eff
-      let cap_key = string_concat(cap_eff, string_concat(".", op_name))
-      match ty_env_lookup(st.env, cap_key) {
-        Some(sc) -> Some(op_callee_carries(
-                           synth_op_call_provided(st, sc, args_, name, cap_key, line, col), esym))
-        None     -> Some(synth_op_call_unknown_op(st, cap_eff, op_name, line, col))
-      }
+    Some(esym) -> match env_op(st.env, esym, written(op_name)) {
+      Some(sc) -> Some(synth_op_call_provided(st, sc, args_, l, esym, op_name, line, col))
+      None     -> Some(synth_op_call_unknown_op(st, esym, op_name, line, col))
     }
   }
 
-fn is_effect_in_env(env: TyEnv, eff_name: String) : Bool =
-  is_effect_in_env_loop(env.entries, string_concat(eff_name, "."))
-
-fn is_effect_in_env_loop(entries: [TyEntry], prefix: String) : Bool {
-  match entries {
-    [] -> false
-    [e, ...rest] ->
-      if string_has_prefix(e.name, prefix) { true }
-      else { is_effect_in_env_loop(rest, prefix) }
-  }
-}
-
-fn string_has_prefix(s: String, p: String) : Bool {
-  let pl = string_length(p)
-  if string_length(s) < pl { false }
-  else { string_slice(s, 0, pl) == p }
-}
-
-fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
+fn synth_op_call_unknown_op(st: InferState, eff: SymId, op_name: String,
                              line: Int, col: Int) : Inferred / Console + File {
 
 
+  let eff_name = decl_name(st.env.tab, eff)
   let perr = mk_diag(SevError, st.file, line, col,
-    string_concat("unknown op `", string_concat(op_name,
-      string_concat("` on effect `", string_concat(eff_name, "`")))), [])
+    "unknown op `#{op_name}` on effect `#{eff_name}`", [])
   render_diag(perr)
   diag_note("`#{eff_name}.#{op_name}` is not declared in `effect #{eff_name} { ... }`")
   diag_help("declare `#{op_name}(...)` inside the effect, or call an existing op")
   let st1 = st_bump_err(st_push_diag(st, perr))
-  mk_inferred(st1, TyAny, with_ty(mk_ref(eff_name, line, col), TyAny))
+  mk_inferred(st1, TyAny, with_ty(mk_sym(eff, line, col), TyAny))
 }
 
+# How a unify failure names the op being called.
+fn op_what(st: InferState, lead: String, eff: SymId, op: String) : String =
+  "#{lead}#{decl_name(st.env.tab, eff)}.#{op}"
+
 fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
-                              key: String, esym: SymId, line: Int, col: Int) : Inferred / Console + File + Mutable {
+                              esym: SymId, op: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  # most call sites pass a single key — both the type
-  # lookup key and the codegen dispatch key are the same. No alias:
-  # a direct `Eff.op(...)` call is not a `with ... as <name>` cell, so
-  # its row label keeps the bare effect name.
-  synth_op_call_with_scheme_keys(st, sc, args_, key, key, None, esym, line, col)
+  # No alias: a direct `Eff.op(...)` call is not a `with ... as <name>`
+  # cell, so it reaches the ambient handler and its row label is the
+  # effect's own.
+  synth_op_call_with_scheme_keys(st, sc, args_, esym, op, ViaAmbient, None, line, col)
 }
 
 # An op call on a PROVIDED capability (`c.op(...)` where `c: Eff` is a value
@@ -11134,94 +11026,83 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
 # instantiate, unify args against the op scheme — but does NOT add the effect to
 # the body's row: a capability passed in is satisfied by the caller, not demanded
 # by this function (design §3 "capability as a parameter does not enter the row").
-# Codegen reads the evidence from the parameter's own slot, keyed by the variable
-# name so distinct instances stay distinct by parameter position.
+# Codegen reads the evidence from the parameter's own slot, so distinct instances
+# stay distinct by parameter position.
 fn synth_op_call_provided(st: InferState, sc: TyScheme, args_: [Expr],
-                           recv: String, key: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+                           recv: LocalId, esym: SymId, op: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
   let inst = st_instantiate_report(st, sc)
   let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
-  let st2 = st_unify(rv.st, inst.ty, expected, string_concat("cap op call ", key), line, col)
+  let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "cap op call ", esym, op), line, col)
   let ty = apply_ty(st2.sub, rv.ty)
-  # Dispatch key carries the receiver name so codegen reads `recv`'s own evidence
-  # slot rather than walking by effect name — distinct capability params resolve
-  # to distinct nodes. No row label: the capability is provided, not demanded.
-  let root = with_ty(mk_expr(ECall(callee_expr_for_op(string_concat(key, string_concat("#", recv)), line, col), ra.exprs), line, col), ty)
+  # The callee goes through the receiver, so codegen reads `recv`'s own
+  # evidence slot rather than walking by effect — distinct capability params
+  # resolve to distinct nodes. No row label: the capability is provided, not
+  # demanded.
+  let root = with_ty(mk_expr(ECall(op_callee(esym, op, ViaRecv(recv), line, col), ra.exprs), line, col), ty)
   mk_inferred(st2, ty, root)
 }
 
 fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
-                                   lookup_key: String, dispatch_key: String,
-                                   row_alias: Option[String], esym: SymId,
+                                   esym: SymId, op: String, via: OpVia,
+                                   row_alias: Option[LocalId],
                                    line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   # capture the fresh ids minted by instantiation. For
   # parametric effects (where the scheme quantifies over the effect's
   # tparams) these fresh tyvars are the row label's ty_args. For
-  # stateless effects the list is empty and we add a bare-name label.
+  # stateless effects the list is empty and the label has none.
   # per-op generic schemes also quantify over op-level
   # tparams; those are NOT part of the row label's ty_args. Use the
   # `op_eff_arities` table to take only the first N fresh ids
   # (corresponding to the effect's tparams) for the row.
-  # alias-rewritten op calls carry a `dispatch_key` with an
-  # `@<alias>` suffix so codegen can route through the handle's
-  # `kai_alias_<a>_id` local. Type-level lookups (op_eff_arities,
-  # row label) still use the bare `lookup_key`.
+  # `via` routes the perform through the handle's own instance; the
+  # type-level lookups (op_eff_arities, row label) read the effect.
   let inst = st_instantiate_report(st, sc)
-  let eff_fresh = take_first(inst.fresh, lookup_op_eff_arity(st.op_eff_arities, lookup_key))
+  let eff_fresh = take_first(inst.fresh, eff_tparam_arity(st.op_eff_arities, esym))
   # Read before unifying: the substitution's slots mutate in place.
   let pinned = map(eff_fresh, (id) => occurs(id, inst.ty, inst.st.sub))
   let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
-  let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", lookup_key), line, col)
-  let eff_n = dotted_prefix(lookup_key)
+  let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "op call ", esym, op), line, col)
   let row_args = phantom_eff_args(eff_fresh, pinned, st2.sub)
-  # tag the row label with the cell alias so two distinct
-  # `with <eff> as <name>` cells stay distinct labels (see
-  # `label_eff_with_alias`). The suffix is discharged symmetrically by
-  # the cell's own handler and stripped for display.
-  let lab = Label { eff: label_eff_with_alias(eff_n, row_alias), ty_args: row_args, sym: esym }
-  # stash the effect name + live payload tyvar ids before
+  # tag the row label with the cell so two distinct
+  # `with <eff> as <name>` cells stay distinct labels. The cell is
+  # discharged symmetrically by its own handler.
+  let cell = alias_cell(row_alias)
+  let lab = label_in_cell(esym, row_args, cell)
+  # stash the effect + live payload tyvar ids before
   # `st_add_label`, whose dedup may drop this label against a sibling op's
   # concrete label of the same effect. The deferred-field drain reads it
   # to pin a receiver the dropped label was the only carrier for, under
   # the final sub so the `match` binder's receiver-to-payload link shows.
-  let st2p = st_push_op_payload_vars(st2, label_eff_with_alias(eff_n, row_alias), esym, eff_fresh)
-  # The `@alias` in `lab.eff` keeps distinct cells apart, so this only
+  let st2p = st_push_op_payload_vars(st2, esym, cell, eff_fresh)
+  # The cell keeps distinct cells apart, so this only
   # threads ty_args between ops of the same cell (`cur.set` → `cur.get`).
   let st2u = st_unify_dedup_label(st2p, lab, line, col)
   let st3 = st_add_label(st2u, lab, line, col)
   let ty = apply_ty(st3.sub, rv.ty)
   # The callee carries the instance the perform resolved to, for evidence selection.
-  let callee = with_ty(callee_expr_for_op(dispatch_key, line, col), TyCon(None, eff_n, row_args, esym))
+  let callee = with_ty(op_callee(esym, op, via, line, col), TyCon(esym, row_args))
   let root = with_ty(mk_expr(ECall(callee, ra.exprs), line, col), ty)
   mk_inferred(st3, ty, root)
 }
 
-fn lookup_op_eff_arity(table: [OpEffArity], key: String) : Int {
-  match table {
-    [] -> 0
-    [h, ...rest] -> match h {
-      OEA(k, n) -> if k == key { n } else { lookup_op_eff_arity(rest, key) }
-    }
-  }
-}
+# How many of an op's quantified variables are its effect's own: every
+# op of one effect records that same count.
+fn lookup_op_eff_arity(table: [OpEffArity], eff: SymId) : Int = eff_tparam_arity(table, eff)
 
 # The tparam arity of an effect — how many type args its capability type carries.
-# Found via any op key `<eff>.<op>` in the arity table (all ops of one effect
-# share its tparam count). A non-parametric effect (`Cell`) returns 0 so its
-# capability type is the bare `TyCon(None, "Cell", [])` a parameter annotates.
-fn eff_tparam_arity(table: [OpEffArity], eff: String) : Int =
-  eff_tparam_arity_loop(table, string_concat(eff, "."))
-
-fn eff_tparam_arity_loop(table: [OpEffArity], prefix: String) : Int {
+# A non-parametric effect (`Cell`) returns 0 so its capability type is the bare
+# nominal type a parameter annotates.
+fn eff_tparam_arity(table: [OpEffArity], eff: SymId) : Int {
   match table {
     [] -> 0
     [h, ...rest] -> match h {
-      OEA(k, n) -> if string_has_prefix(k, prefix) { n } else { eff_tparam_arity_loop(rest, prefix) }
+      OEA(e, _, n) -> if sym_same(e, eff) { n } else { eff_tparam_arity(rest, eff) }
     }
   }
 }
@@ -11319,9 +11200,7 @@ fn real_lit_is_float_typed(s: String, i: Int, n: Int) : Bool {
   }
 }
 
-# (compiler integration) — locate the `@` separator the
-# alias rewrite uses to tag op names. Returns the byte index, or
-# -1 when no `@` is present.
+# The byte index of the first `@` in `s`, or -1 when it has none.
 #[doc("infer: `string_index_of_at` — typer entry point invoked by the driver.")]
 pub fn string_index_of_at(s: String) : Int = string_index_of_at_loop(s, 0, string_length(s))
 
@@ -11333,32 +11212,10 @@ fn string_index_of_at_loop(s: String, i: Int, n: Int) : Int {
   } }
 }
 
-# drop the `@<alias>` suffix from a tagged op key. When
-# absent, returns the key unchanged.
-#[doc("infer: `string_strip_alias_tag` — typer entry point invoked by the driver.")]
-pub fn string_strip_alias_tag(s: String) : String {
-  let at = string_index_of_at(s)
-  if at < 0 { s } else { string_slice(s, 0, at) }
-}
-
-# Synthesise a placeholder callee for the typed AST that emit later
-# turns into the runtime op-dispatch call. Keeps the original surface
-# shape (EField/EVar) so the existing emitter path falls through.
-fn callee_expr_for_op(key: String, line: Int, col: Int) : Expr =
-  mk_ref(key, line, col)
-
-# A settled op call keeps the effect's id on its callee, so the backend's
-# perform can tell two homonymous effects apart.
-fn op_callee_carries(r: Inferred, s: SymId) : Inferred =
-  if sym_raw(s) < 0 { r }
-  else { match r.expr.kind {
-    ECall(f, xs) -> match f.kind {
-      EName(k) -> mk_inferred(r.st, r.ty, Expr { kind: ECall(Expr { kind: ESym(s, spec_none(), k), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }, xs),
-                                                line: r.expr.line, col: r.expr.col, ty: r.expr.ty, mode: r.expr.mode , site: 0 })
-      _ -> r
-    }
-    _ -> r
-  } }
+# The callee of a settled perform: the effect, the operation, and the
+# instance it goes through. Emit turns it into the runtime op dispatch.
+fn op_callee(eff: SymId, op: String, via: OpVia, line: Int, col: Int) : Expr =
+  mk_expr(EOp(OpRef { eff: eff, op: written(op), via: via }), line, col)
 
 fn field_root(obj_expr: Expr, fnm: String, line: Int, col: Int, ty: Ty) : Expr =
   with_ty(mk_expr(EField(obj_expr, fnm), line, col), ty)
@@ -11369,7 +11226,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   let r = synth(st, obj)
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
-    TyCon(_, cname, cargs, tsym) -> match rec_pick(r.st.recs, tsym, cname, list_length(cargs), fnm) {
+    TyCon(tsym, _) -> match rec_pick(r.st.recs, tsym) {
       None -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
@@ -11380,7 +11237,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
             mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
           }
           None -> {
-            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}", [])
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}#{field_hint(inst.fields, fnm)}", [])
             render_diag(perr)
             mk_inferred(st_bump_err(st_push_diag(st1, perr)), TyAny, field_root(r.expr, fnm, line, col, TyAny))
           }
@@ -11475,14 +11332,14 @@ fn pin_via_op_vars(st: InferState, rrep: Int, ops: [OpPayloadVars],
   match ops {
     [] -> st
     [op, ...rest] -> match op {
-      OPV(eff, esym, ids) ->
+      OPV(esym, cell, ids) ->
         if ids_share_rep(ids, rrep, st.sub) {
           # The receiver is in this op's payload class. Rebuild the op's
           # label with ty_args resolved under the FINAL sub, then unify
           # it against its declared counterpart — pinning the receiver's
           # still-free class members (the payload position) to the
           # declared concrete type.
-          let lab = Label { eff: eff, ty_args: resolve_fresh_ids(ids, st.sub), sym: esym }
+          let lab = label_in_cell(esym, resolve_fresh_ids(ids, st.sub), cell)
           match find_matching_declared(declared, lab, st) {
             Some(st1) -> st1
             None      -> pin_via_op_vars(st, rrep, rest, declared)
@@ -11523,7 +11380,7 @@ fn decl_row_concrete_labels(row: RowExpr, hv: TyHomeView) : [Label] {
 fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
                              res_id: Int, line: Int, col: Int, in_pat: Bool) : InferState / Console + File + Mutable {
   match recv {
-    TyCon(_, cname, cargs, tsym) -> match rec_pick(st.recs, tsym, cname, list_length(cargs), fnm) {
+    TyCon(tsym, _) -> match rec_pick(st.recs, tsym) {
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
         let st0 = st_unify(inst.st, inst.result_ty, recv, "deferred field access", line, col)
@@ -11531,14 +11388,14 @@ fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
         match fty_find(inst.fields, fnm) {
           Some(t) -> st_unify(st1, TyVarT(res_id), apply_ty(st1.sub, t), "deferred field access", line, col)
           None -> {
-            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}", [])
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}#{field_hint(inst.fields, fnm)}", [])
             render_diag(perr)
             st_bump_err(st_push_diag(st1, perr))
           }
         }
       }
       None -> {
-        let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{cname}", [])
+        let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}", [])
         render_diag(perr)
         st_bump_err(st_push_diag(st, perr))
       }
@@ -11574,7 +11431,7 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
                                      line: Int, col: Int) : Inferred / Console + File {
 
 
-  match ty_env_lookup(st.env, fnm) {
+  match ufcs_fn_named(st, fnm) {
     Some(_) -> {
       let perr = mk_diag(SevError, st.file, line, col,
         concat_all(["`", fnm, "` is a function in scope, not a field. ",
@@ -11585,6 +11442,12 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
     }
     None -> mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny))
   }
+}
+
+# A function a UFCS call could reach under `ident`.
+fn ufcs_fn_named(st: InferState, ident: String) : Option[SymId] = match st_visible_candidates(st, ident) {
+  [c, ..._] -> Some(c.sym)
+  []        -> ufcs_bare_sym(st.env, ident)
 }
 
 # `e1[e2]` dispatches on the container's inferred
@@ -11615,14 +11478,14 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
   let coll_ty = apply_ty(probe.st.sub, probe.ty)
   let ph = ixc_ref(coll)
   match coll_ty {
-    TyCon(_, _, _, tcs) ->
+    TyCon(tcs, _) ->
       if core_ty_is(tcs, CtVec) { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
       else { synth_on_coll(probe, coll_ty, ECall(index_getter(coll_ty, line, col), [ph, ix]), line, col) }
     # A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index
     # is a bare struct field load with the bound proved at compile time
     # (no runtime check). A dynamic index is declined in v1.
     TyDimT(inner, _) -> match inner {
-      TyCon(_, _, _, tcs) ->
+      TyCon(tcs, _) ->
         if core_ty_is(tcs, CtVec) {
           if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, probe.expr, ix, coll_ty, line, col) }
           else {
@@ -11639,20 +11502,20 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
 # `Map` and `HashMap` read through the `get` of the module that declares
 # the collection's type, which is the home its symbols were minted under.
 fn index_getter(t: Ty, line: Int, col: Int) : Expr = match ty_coll(t) {
-  Some(c) -> mk_expr(EModCall(core_coll_home(c), "get"), line, col)
+  Some(c) -> mk_expr(home_fn_ref(core_coll_home(c), "get"), line, col)
   None    -> builtin_mk(CbArrayGet, line, col)
 }
 
 fn ty_coll(t: Ty) : Option[CoreColl] = match t {
-  TyCon(_, _, _, s) -> core_coll_of(s)
-  _                 -> None
+  TyCon(s, _) -> core_coll_of(s)
+  _           -> None
 }
 
 # Types the read `k`, whose collection is the placeholder, against the
 # probe's type for it, then splices the probe's typed collection back.
 fn synth_on_coll(probe: Inferred, t: Ty, k: ExprKind, line: Int,
       col: Int) : Inferred / Console + File + Mutable {
-  let st1 = st_set_env(probe.st, ty_env_add(probe.st.env, ixc_name(), mono(t)))
+  let st1 = st_set_env(probe.st, env_bind_local(probe.st.env, binder_minted(ixc_name()), mono(t)))
   let r = synth(st1, mk_expr(k, line, col))
   mk_inferred(st_restore_entries(probe.st, r.st), r.ty, ixc_splice(r.expr, probe.expr))
 }
@@ -11675,13 +11538,13 @@ fn synth_vec_index(probe: Inferred, t: Ty, coll: Expr, ix: Expr,
 # so it is bound once: typed once and evaluated once. The collection is
 # bound ahead of it to keep the source's evaluation order.
 fn vec_slice_block(coll: Expr, a: Expr, b: Expr, line: Int, col: Int) : ExprKind {
-  let lo = mk_ref("__slice_lo", a.line, a.col)
+  let lo = mk_local(local_minted("__slice_lo"), a.line, a.col)
   let slen = mk_expr(EBinop(BoAdd, mk_expr(EBinop(BoSub, b, lo), line, col),
                             mk_expr(mk_int_synth(1), line, col)),
                      line, col)
-  let call = mk_expr(ECall(builtin_mk(CbVecSlice, line, col), [mk_ref("__slice_coll", line, col), lo, slen]), line, col)
-  EBlock([SLet(mk_pat(PBind("__slice_coll"), line, col), None, coll),
-          SLet(mk_pat(PBind("__slice_lo"), a.line, a.col), None, a)], Some(call))
+  let call = mk_expr(ECall(builtin_mk(CbVecSlice, line, col), [mk_local(local_minted("__slice_coll"), line, col), lo, slen]), line, col)
+  EBlock([SLet(mk_pat(PBind(binder_minted("__slice_coll")), line, col), None, coll),
+          SLet(mk_pat(PBind(binder_minted("__slice_lo")), a.line, a.col), None, a)], Some(call))
 }
 
 # `v[k]` on a fixed-width `Vec[e]<n>`: a static literal index in range
@@ -11929,8 +11792,8 @@ fn ty_same_head(a: Ty, b: Ty) : Bool = {
   let ha = ty_dispatch_head(a)
   let hb = ty_dispatch_head(b)
   match ha {
-    TyCon(_, _, _, sa) -> sym_raw(sa) >= 0 and sym_same(sa, ty_head_sym(hb))
-    TyListT(_)         -> sym_same(core_ty_sym(CtList), ty_head_sym(hb))
+    TyCon(sa, _) -> sym_raw(sa) >= 0 and sym_same(sa, ty_head_sym(hb))
+    TyListT(_)   -> sym_same(core_ty_sym(CtList), ty_head_sym(hb))
     _ -> match scalar_ty_name(ha) {
       Some(_) -> inf_ty_eq(ha, hb)
       None    -> false
@@ -11955,8 +11818,8 @@ fn binop_should_dispatch_proto(lt: Ty, rt: Ty) : Bool =
   ty_is_concrete_nonprim(lt) and ty_is_concrete_nonprim(rt)
 
 
-# heterogeneous-friendly variant. Returns the head type
-# name of the dispatch receiver (`Self`) when an impl matching the
+# heterogeneous-friendly variant. Returns the head
+# of the dispatch receiver (`Self`) when an impl matching the
 # (lhs, rhs) pair exists in the post-lower-protocols snapshot, or
 # None when no such impl is registered. The choice between
 # `(receiver=lhs, arg=rhs)` and `(receiver=rhs, arg=lhs)` is
@@ -11967,26 +11830,35 @@ fn binop_should_dispatch_proto(lt: Ty, rt: Ty) : Bool =
 # through to the unify-and-emit primitive arithmetic path (for
 # matching primitive pairs) or the standard mismatch diagnostic
 # (for everything else).
-type BinopProtoChoice = BPC(String, [String])
-#                          recv     proto_args (head names)
+type BinopProtoChoice = BPC(DispHead, [DispHead])
+#                          recv       proto_args
+
+# The dispatch head of `t`: its declaration for a nominal type, the
+# scalar itself for a scalar.
+fn inf_disp_head(t: Ty) : Option[DispHead] = match ty_dispatch_head(t) {
+  TyCon(s, _) -> Some(DhSym(s))
+  TyListT(_)  -> Some(DhSym(core_ty_sym(CtList)))
+  h           -> match scalar_ty_name(h) {
+    Some(_) -> Some(DhScalar(h))
+    None    -> None
+  }
+}
 
 fn binop_pick_proto_dispatch(impls: [ProtoImplReg], proto: SymId, op: String,
                               lt: Ty, rt: Ty, sub: Subst) : Option[BinopProtoChoice] {
   let l = apply_ty(sub, lt)
   let r = apply_ty(sub, rt)
-  let l_name = inf_ty_head_name(l)
-  let r_name = inf_ty_head_name(r)
-  match l_name {
+  match inf_disp_head(l) {
     None -> None
-    Some(ln) -> match r_name {
+    Some(lh) -> match inf_disp_head(r) {
       None -> None
-      Some(rn) -> {
+      Some(rh) -> {
         # Try (receiver = lhs, arg = rhs) first.
-        if impl_pair_exists(impls, proto, op, ln, [rn]) {
-          Some(BPC(ln, [rn]))
+        if impl_pair_exists(impls, proto, op, lh, [rh]) {
+          Some(BPC(lh, [rh]))
         # Mirror: (receiver = rhs, arg = lhs).
-        } else if impl_pair_exists(impls, proto, op, rn, [ln]) {
-          Some(BPC(rn, [ln]))
+        } else if impl_pair_exists(impls, proto, op, rh, [lh]) {
+          Some(BPC(rh, [lh]))
         } else {
           None
         }
@@ -11996,42 +11868,46 @@ fn binop_pick_proto_dispatch(impls: [ProtoImplReg], proto: SymId, op: String,
 }
 
 fn impl_pair_exists(impls: [ProtoImplReg], proto: SymId, op: String,
-                     recv: String, args: [String]) : Bool {
+                     recv: DispHead, args: [DispHead]) : Bool {
   match impls {
     [] -> false
-    [it, ...rest] -> match it {
-      PIR(_, t, o, _, ans, _, _, _, _) ->
-        if pir_of_proto(it, proto) and t == recv and o == op and arg_names_match(ans, recv, args) {
-          true
-        } else {
-          impl_pair_exists(rest, proto, op, recv, args)
-        }
-    }
+    [it, ...rest] ->
+      if pir_answers(it, proto, op, recv, args) { true }
+      else { impl_pair_exists(rest, proto, op, recv, args) }
   }
 }
 
-# legacy `impl P for X` is registered with arg_names = [].
+# `it` is the impl of `proto` that supplies `op` for `recv` with the
+# protocol arguments `args`. An operation has no id of its own: within
+# one protocol its label is all that tells it apart.
+fn pir_answers(it: ProtoImplReg, proto: SymId, op: String,
+               recv: DispHead, args: [DispHead]) : Bool = match it {
+  PIR(_, _, o, _, ans, _, _) ->
+    pir_of_proto(it, proto) and pir_serves(it, recv) and written_text(o) == op and arg_names_match(ans, recv, args)
+}
+
+# legacy `impl P for X` is registered with no protocol arguments.
 # For matching purposes treat it as `impl P[X] for X` (i.e. the
-# homogeneous default). The new heterogeneous form
-# `impl P[Y] for X` registers arg_names = [Y]; matching is exact.
-#[doc("infer: `arg_names_match` — typer entry point invoked by the driver.")]
-pub fn arg_names_match(reg_args: [String], recv: String, want: [String]) : Bool {
+# homogeneous default). The heterogeneous form
+# `impl P[Y] for X` registers `[Y]`; matching is exact.
+#[doc("True when an impl registered with the protocol arguments `reg_args` for the receiver `recv` serves a call whose protocol arguments are `want`.")]
+pub fn arg_names_match(reg_args: [DeclRef], recv: DispHead, want: [DispHead]) : Bool {
   match reg_args {
     [] -> match want {
       [] -> true
-      [w] -> w == recv
+      [w] -> dh_same(w, recv)
       _ -> false
     }
-    _ -> eff_op_names_eq(reg_args, want)
+    _ -> refs_name_heads(reg_args, want)
   }
 }
 
-fn eff_op_names_eq(a: [String], b: [String]) : Bool {
-  match a {
-    [] -> match b { [] -> true _ -> false }
-    [x, ...xrest] -> match b {
+fn refs_name_heads(rs: [DeclRef], hs: [DispHead]) : Bool {
+  match rs {
+    [] -> match hs { [] -> true _ -> false }
+    [r, ...rrest] -> match hs {
       [] -> false
-      [y, ...yrest] -> x == y and eff_op_names_eq(xrest, yrest)
+      [h, ...hrest] -> dh_ref_is(r, h) and refs_name_heads(rrest, hrest)
     }
   }
 }
@@ -12043,7 +11919,7 @@ fn ty_is_concrete_nonprim(t: Ty) : Bool {
     TyVarT(_)       -> false
     TyDimT(inner, _)    -> ty_is_concrete_nonprim(inner)
     TyRefineT(inner, _) -> ty_is_concrete_nonprim(inner)
-    TyCon(_, _, _, _)     -> true
+    TyCon(_, _)     -> true
     _               -> false
   }
 }
@@ -12071,15 +11947,15 @@ fn binop_dispatcher_ref(ids: ProtoIds, bp: BinopProto, line: Int, col: Int) : Ex
   }
   match disp {
     Some(k) -> mk_expr(k, line, col)
-    None    -> mk_ref(inf_proto_dispatcher_name(method), line, col)
+    None    -> mk_name(inf_proto_dispatcher_name(method), line, col)
   }
 }
 
 # The dispatcher's signature is generic over `Self`, so unifying against
-# it accepts any operand sharing the impl's head name and lets a wrong
+# it accepts any operand sharing the impl's head and lets a wrong
 # habitant through. Re-run the ordinary call unification against the
 # selected impl's own concrete signature — the check a direct call to
-# that fn would get. Dispatch stays keyed on head names (O(1)); only the
+# that fn would get. Dispatch stays keyed on heads (O(1)); only the
 # winner is re-checked.
 fn binop_check_against_impl(st: InferState, op: BinOp, lt0: Ty, rt0: Ty,
                             line: Int, col: Int) : InferState / Console + File + Mutable {
@@ -12093,13 +11969,13 @@ fn binop_check_against_impl(st: InferState, op: BinOp, lt0: Ty, rt0: Ty,
   }
   match impl_sym {
     None -> st
-    Some(sym) -> match ty_env_lookup(st.env, sym) {
+    Some(sym) -> match env_sym(st.env, sym) {
       None -> st
       Some(sc) -> {
         let inst = st_instantiate(st, sc)
         # The notes cite the operator the user wrote, not the impl's
-        # mangled symbol, which is never spelled in source.
-        let callee = mk_ref(binop_text(op), line, col)
+        # function, which is never spelled in source.
+        let callee = mk_name(binop_text(op), line, col)
         let rv = st_fresh_ty(inst.st)
         let fr = subst_fresh_row(rv.st.sub)
         let st2 = st_set_sub(rv.st, fr.subst)
@@ -12137,27 +12013,22 @@ fn binop_arg_for_param(param: Ty, arg: Ty, s: Subst) : Ty =
   if ty_is_dimmed(apply_ty(s, param)) { arg }
   else { (ty_split_dim(arg, s)).base }
 
-# The mangled symbol of the impl the operator dispatches to, matching
+# The function of the impl the operator dispatches to, matching
 # `binop_pick_proto_dispatch`'s receiver/mirror order.
 fn binop_impl_sym(impls: [ProtoImplReg], proto: SymId, method: String,
-                  lt: Ty, rt: Ty, sub: Subst) : Option[String] =
+                  lt: Ty, rt: Ty, sub: Subst) : Option[SymId] =
   match binop_pick_proto_dispatch(impls, proto, method, lt, rt, sub) {
     None -> None
     Some(BPC(recv, want)) -> impl_sym_for(impls, proto, method, recv, want)
   }
 
 fn impl_sym_for(impls: [ProtoImplReg], proto: SymId, op: String,
-                recv: String, want: [String]) : Option[String] =
+                recv: DispHead, want: [DispHead]) : Option[SymId] =
   match impls {
     [] -> None
-    [it, ...rest] -> match it {
-      PIR(_, t, o, sym, ans, _, _, _, _) ->
-        if pir_of_proto(it, proto) and t == recv and o == op and arg_names_match(ans, recv, want) {
-          Some(sym)
-        } else {
-          impl_sym_for(rest, proto, op, recv, want)
-        }
-    }
+    [it, ...rest] ->
+      if pir_answers(it, proto, op, recv, want) { Some(pir_sym(it)) }
+      else { impl_sym_for(rest, proto, op, recv, want) }
   }
 
 # both operands share a concrete TyCon head and at least one carries
@@ -12230,7 +12101,7 @@ fn synth_dim_pow(st: InferState, lt: Ty, le: Expr,
       let perr = mk_diag(SevError, st.file, line, col,
         "exponent of `^` must be Int", [])
       render_diag(perr)
-      diag_note(string_concat("found: ", inf_ty_to_string(rt_now)))
+      diag_note(string_concat("found: ", inf_ty_to_string(st.env.tab, rt_now)))
       diag_help("convert the exponent to Int (e.g. `real_to_int(x)`), or use a stdlib helper like `Numeric.pow_int(base, n)` if the integer exponent is available separately")
       st_bump_err(st_push_diag(st, perr))
     }
@@ -12637,15 +12508,15 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
   let rl = synth(st, lhs)
   let res = match rhs.kind {
     ECall(f, pa) -> {
-      # when the callee is a bare-name `EName(nm)` whose
-      # qualified env has multiple candidates (e.g. `filter` exported
+      # when the callee is a name the resolver left for the typer, one
+      # several modules declare (e.g. `filter` exported
       # by both `option` and `list`), narrow by the LHS's type — the
       # LHS becomes the callee's first argument under the pipe
-      # rewrite. Fall back to the legacy `synth(f)` path when the
-      # callee is not bare or has a single candidate.
+      # rewrite. Fall back to the `synth(f)` path when the
+      # callee is settled or has a single candidate.
       let rf = match f.kind {
         EName(nm) -> {
-          let candidates = st_visible_candidates(rl.st, nm)
+          let candidates = st_visible_candidates(rl.st, written_text(nm))
           if list_length(candidates) < 2 { synth(rl.st, f) }
           else {
             let lhs_ty = apply_ty(rl.st.sub, rl.ty)
@@ -12655,9 +12526,9 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
                 let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
                   pick.st
                 } else {
-                  st_push_inst(pick.st, CS(nm, f.line, f.col, pick.fresh, pick.unit_fresh, None))
+                  st_push_inst(pick.st, CS(pick.sym, f.line, f.col, pick.fresh, pick.unit_fresh, None))
                 }
-                let callee_node = with_ty(mk_expr(EModCall(pick.mod, nm), f.line, f.col), pick.inst_ty)
+                let callee_node = with_ty(mk_sym(pick.sym, f.line, f.col), pick.inst_ty)
                 mk_inferred(st_inst, pick.inst_ty, callee_node)
               }
             }
@@ -12725,7 +12596,7 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
 #     mirrors how qualified-name resolution already works for
 #     `EModCall`-driven calls.
 #
-# The cache shape: `[HOE(head_name, [module_path])]`. A single-element
+# The cache shape: `[HOE(head type, [module_path])]`. A single-element
 # `module_path` list is the dispatchable case; a multi-element list is
 # ambiguous and the typer reports the modules at the use site so the
 # user can pick `mod.T` annotation or rename one of the conflicting
@@ -12742,7 +12613,7 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
 #
 # A head carrying an `(element, row)` parameter list — `Stream[t, e]`,
 # the streaming carrier whose effect row is a type parameter — also
-# rides the pipes: dispatch is by head NAME (arity-agnostic), and the
+# rides the pipes: dispatch is by the head type (arity-agnostic), and the
 # whole LHS type unifies against the canonical receiver, so the row
 # slot threads via the row carrier (`row_arg_carrier`). The element
 # unifies against the first slot; the row threads as `e`.
@@ -12773,12 +12644,12 @@ type HeadLookup
   | HLAmbiguous([String])
   | HLNone
 
-fn find_head_owner_loop(es: [HeadOwnerEntry], head: String) : HeadLookup {
+fn find_head_owner_loop(es: [HeadOwnerEntry], head: SymId) : HeadLookup {
   match es {
     [] -> HLNone
     [e, ...rest] -> match e {
-      HOE(name, mods) ->
-        if name == head {
+      HOE(s, mods) ->
+        if sym_raw(head) >= 0 and sym_same(s, head) {
           match mods {
             [m]      -> HLOk(m)
             [_, _, ...] -> HLAmbiguous(mods)
@@ -12789,7 +12660,7 @@ fn find_head_owner_loop(es: [HeadOwnerEntry], head: String) : HeadLookup {
   }
 }
 
-fn find_head_owner(env: TyEnv, head: String) : HeadLookup =
+fn find_head_owner(env: TyEnv, head: SymId) : HeadLookup =
   find_head_owner_loop(env.head_owners, head)
 
 # Build the head-owner cache from a `[Decl]` post-`expand_imports`
@@ -12814,10 +12685,10 @@ fn find_head_owner(env: TyEnv, head: String) : HeadLookup =
 # it — otherwise `|`, `||` and `|?` over a list are rejected on code
 # the build accepts.
 #[doc("infer: the built-in head-owner seed — `List` maps to `list` in every scope.")]
-pub fn head_owner_seed() : [HeadOwnerEntry] = [HOE("List", ["list"])]
+pub fn head_owner_seed() : [HeadOwnerEntry] = [HOE(core_ty_sym(CtList), ["list"])]
 
 #[doc("infer: `build_head_owner_map` — typer entry point invoked by the driver.")]
-pub fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
+pub fn build_head_owner_map(decls: [Decl], tab: SymTab, modules: [ModuleEntry],
                          target_mod: String, edition: Edition) : [HeadOwnerEntry] {
   # gate the convention-based pipe dispatch on
   # edition >= hanga-roa. Pre-hanga-roa (tongariki) packages keep only
@@ -12827,103 +12698,93 @@ pub fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
   # via HLNone).
   let walk_user_types = edition_at_least(edition, EdHangaRoa)
   if walk_user_types {
-    let pub_type_names = collect_pub_type_names(decls, [])
+    let pub_types = collect_pub_types(decls, [])
     # Filter out the target file's ME from the dispatch search. The
     # target ME's `exports` list is built over the post-`expand_imports`
     # decl stream, which transitively includes every imported module's
     # decls — so a `pub type T` exported by an imported module appears
     # in BOTH the imported module's ME and the target ME. Without this
     # filter every imported `pub type` would surface as ambiguously
-    # declared by `(<owning_module>, <target_basename>)`. Filtering by
-    # name preserves the cache's invariant that each entry's `mods`
+    # declared by `(<owning_module>, <target_basename>)`. Filtering
+    # preserves the cache's invariant that each entry's `mods`
     # list contains only modules that genuinely own the `pub type`
     # declaration. Pipes against `pub type` declared in the root file
     # are intentionally not dispatchable — the rejection diagnostic
     # ("no module declaring type `T` is in scope") is the design.
     let modules_filtered = filter_out_target(modules, target_mod, [])
-    let from_decls = build_head_owner_loop(pub_type_names, modules_filtered, [])
-    list_append(head_owner_seed(), list_append(from_decls, spelled_head_owners(decls, [])))
+    let from_decls = build_head_owner_loop(pub_types, tab, modules_filtered, [])
+    list_append(head_owner_seed(), list_append(from_decls, spelled_head_owners(decls, tab, [])))
   } else {
     # Tongariki: only the seeded built-in `List → list` participates.
     # User-defined `pub type T` is invisible to pipe dispatch and the
     # rejection diagnostic falls through to the standard HLNone path.
-    # Spelled entries ride along regardless of edition: they feed
-    # diagnostics (un-spelling a contested name to `mod.T`), which need
+    # Contested entries ride along regardless of edition: they feed
+    # diagnostics (showing a contested name as `mod.T`), which need
     # the owner even where old-edition dispatch ignores the cache.
-    list_append(head_owner_seed(), spelled_head_owners(decls, []))
+    list_append(head_owner_seed(), spelled_head_owners(decls, tab, []))
   }
 }
 
-# A home-spelled declaration (`Source__mod_a`) is not in any export
-# list — the exports carry the written name — but its spelling carries
-# its owner. Effects join types here: the runtime keys a perform on the
-# spelled label, so only the diagnostic un-spells it.
-#[doc("The home each home-spelled declaration in `ds` was keyed by, as head-owner entries a diagnostic un-spells names with.")]
-pub fn spelled_head_owners(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
-  sho_loop(ds, root_spelled_owners(ds, bare_module_effects(ds, []), acc))
-
-# A root effect is home-spelled only when a module's effect holds its bare
-# name; it reads back as that bare name, the one its source wrote.
-fn root_spelled_owners(ds: [Decl], bare: [String], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
-  [] -> acc
-  [DEffect(_, name, _, _, _, _, _, None, _), ...rest] -> {
-    let w = root_written(name, 0, string_length(name))
-    root_spelled_owners(rest, bare, if w != name and list_has(bare, w) { [HOE(name, [""]), ...acc] } else { acc })
-  }
-  [_, ...rest] -> root_spelled_owners(rest, bare, acc)
-}
-
-fn bare_module_effects(ds: [Decl], acc: [String]) : [String] = match ds {
-  [] -> acc
-  [DEffect(_, name, _, _, _, _, _, Some(m), _), ...rest] ->
-    bare_module_effects(rest, if hs_display(name, Some(m)) == name { [name, ...acc] } else { acc })
-  [_, ...rest] -> bare_module_effects(rest, acc)
-}
-
-fn sho_loop(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
+# A module's type or effect whose name another declaration of its class
+# shares is not found through an export list, which carries the name
+# alone: its owner is its home. Effects join types here for the
+# diagnostics that show a contested name as `mod.T`.
+#[doc("The home of each contested type and effect a module of `ds` declares, as head-owner entries a diagnostic qualifies names with.")]
+pub fn spelled_head_owners(ds: [Decl], tab: SymTab, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> sho_loop([inner, ...rest], acc)
+    Some(inner) -> spelled_head_owners([inner, ...rest], tab, acc)
     None -> match d {
-      DType(true, name, _, _, _, _, Some(m), _, _) ->
-        sho_loop(rest, spelled_owner(name, m, acc))
-      DEffect(_, name, _, _, _, _, _, Some(m), _) ->
-        sho_loop(rest, spelled_owner(name, m, acc))
-      _ -> sho_loop(rest, acc)
+      DType(true, s, _, _, _, _, Some(m), _) ->
+        spelled_head_owners(rest, tab, spelled_owner(tab, s, m, acc))
+      DEffect(_, s, _, _, _, _, _, Some(m)) ->
+        spelled_head_owners(rest, tab, spelled_owner(tab, s, m, acc))
+      _ -> spelled_head_owners(rest, tab, acc)
     }
   }
 }
 
-fn spelled_owner(name: String, m: String, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
-  if hs_display(name, Some(m)) == name { acc } else { [HOE(name, [m]), ...acc] }
+fn spelled_owner(tab: SymTab, s: SymId, m: String, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
+  if decl_contested(tab, s) { [HOE(s, [m]), ...acc] } else { acc }
 
-fn collect_pub_type_names(ds: [Decl], acc: [String]) : [String] {
+fn decl_contested(tab: SymTab, s: SymId) : Bool = st_valid(tab, s) and sym_contested(tab, s)
+
+fn collect_pub_types(ds: [Decl], acc: [SymId]) : [SymId] {
   match ds {
     [] -> acc
-    [d, ...rest] -> collect_pub_type_names(rest, collect_pub_type_name_one(d, acc))
+    [d, ...rest] -> collect_pub_types(rest, collect_pub_type_one(d, acc))
   }
 }
 
-fn collect_pub_type_name_one(d: Decl, acc: [String]) : [String] = match d {
-  DType(true, name, _, _, _, _, _, _, _) ->
-    if list_has(acc, name) { acc } else { [name, ...acc] }
-  DDerive(_, inner, _, _) -> collect_pub_type_name_one(inner, acc)
-  DUnstable(inner, _, _) -> collect_pub_type_name_one(inner, acc)
-  DProtoLaws(_, inner, _, _, _) -> collect_pub_type_name_one(inner, acc)
-  DImplAxiom(_, inner, _, _, _) -> collect_pub_type_name_one(inner, acc)
-  DConstructor(inner, _, _) -> collect_pub_type_name_one(inner, acc)
+fn collect_pub_type_one(d: Decl, acc: [SymId]) : [SymId] = match d {
+  DType(true, s, _, _, _, _, _, _) ->
+    if sym_in(acc, s) { acc } else { [s, ...acc] }
+  DDerive(_, inner, _, _) -> collect_pub_type_one(inner, acc)
+  DUnstable(inner, _, _) -> collect_pub_type_one(inner, acc)
+  DProtoLaws(_, inner, _, _, _) -> collect_pub_type_one(inner, acc)
+  DImplAxiom(_, inner, _, _, _) -> collect_pub_type_one(inner, acc)
+  DConstructor(inner, _, _) -> collect_pub_type_one(inner, acc)
   _ -> acc
 }
 
-fn build_head_owner_loop(names: [String], modules: [ModuleEntry],
+fn sym_in(ss: [SymId], s: SymId) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> sym_same(h, s) or sym_in(rest, s)
+}
+
+# A module's export list carries names, so the type is looked up in it
+# by the name it was declared with; a contested type, which no export
+# list tells apart, is left to its `spelled_head_owners` entry.
+fn build_head_owner_loop(tys: [SymId], tab: SymTab, modules: [ModuleEntry],
                           acc: [HeadOwnerEntry]) : [HeadOwnerEntry] {
-  match names {
+  match tys {
     [] -> acc
-    [n, ...rest] -> {
-      let mods = modules_declaring_type(modules, n, [])
+    [s, ...rest] -> {
+      let mods = if decl_contested(tab, s) { [] }
+                 else { modules_declaring_type(modules, written_text(decl_name(tab, s)), []) }
       match mods {
-        [] -> build_head_owner_loop(rest, modules, acc)
-        _  -> build_head_owner_loop(rest, modules, [HOE(n, mods), ...acc])
+        [] -> build_head_owner_loop(rest, tab, modules, acc)
+        _  -> build_head_owner_loop(rest, tab, modules, [HOE(s, mods), ...acc])
       }
     }
   }
@@ -12960,20 +12821,19 @@ fn modules_declaring_type(modules: [ModuleEntry], head: String,
 # the rest of the env. Called once per compile from `compile_source`
 # right before the typer runs.
 fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
-          head_owners: hos, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
+  TyEnv { ...env, head_owners: hos }
 
 # Explicit, typed rejection for the
 # `Option` / `Result` heads. Returns `Some(diagnostic)` for the
 # rejected heads and `None` otherwise so callers can tell apart
 # "rejected by name" from "no module mapping".
-fn pipe_rejection_reason(head: String, op: String) : Option[String] {
-  if head == "Option" {
+fn pipe_rejection_reason(head: SymId, op: String) : Option[String] {
+  if core_ty_is(head, CtOption) {
     Some(concat_all([
       op, "-pipe is not supported on `Option`. Use `!` for ",
       "propagation (`x!`) or `option.and_then` for explicit chaining."
     ]))
-  } else if head == "Result" {
+  } else if core_ty_is(head, CtResult) {
     Some(concat_all([
       op, "-pipe is not supported on `Result`. Use `!` for ",
       "propagation (`x!`) or `result.and_then` for explicit chaining."
@@ -13007,31 +12867,37 @@ fn pipe_rejection_reason(head: String, op: String) : Option[String] {
 #   * the standard call-inference signature mismatch (when `mod::op`
 #     exists but its declared shape does not unify with the pipe's
 #     expected `(T[A], (A) -> ...) -> T[B]`).
-# True when some protocol impl for type `head` supplies operation `op`
+# True when some protocol impl for the head of `t` supplies operation `op`
 # (`impl Sequence for Chain` provides `map`/`foldl` for head `Chain`),
 # so a pipe over that head routes through the protocol.
-fn pipe_op_has_impl(impls: [ProtoImplReg], head: String, op: String) : Bool = match pipe_op_impl(impls, head, op) {
+fn pipe_op_has_impl(impls: [ProtoImplReg], t: Ty, op: String) : Bool = match pipe_op_impl(impls, t, op) {
   Some(_) -> true
   None    -> false
 }
 
-fn pipe_op_impl(impls: [ProtoImplReg], head: String, op: String) : Option[ProtoImplReg] = match impls {
+fn pipe_op_impl(impls: [ProtoImplReg], t: Ty, op: String) : Option[ProtoImplReg] = match inf_disp_head(t) {
+  Some(h) -> pipe_op_impl_of(impls, h, op)
+  None    -> None
+}
+
+fn pipe_op_impl_of(impls: [ProtoImplReg], h: DispHead, op: String) : Option[ProtoImplReg] = match impls {
   [] -> None
   [p, ...rest] -> match p {
-    PIR(_, t, o, _, _, _, _, _, _) -> if t == head and o == op { Some(p) } else { pipe_op_impl(rest, head, op) }
+    PIR(_, _, o, _, _, _, _) -> if pir_serves(p, h) and written_text(o) == op { Some(p) } else { pipe_op_impl_of(rest, h, op) }
   }
 }
 
-# The dispatcher of the protocol whose impl for `head` supplies `op`, by
-# its id. An impl of a protocol that resolved to none names it bare.
-fn pipe_op_dispatcher(pv: ProtoView, head: String, op: String) : ExprKind = {
-  let disp = match pipe_op_impl(pv.impls, head, op) {
+# The dispatcher of the protocol whose impl for the head of `t` supplies
+# `op`, by its id. An impl of a protocol that resolved to none leaves the
+# dispatcher's name unsettled.
+fn pipe_op_dispatcher(pv: ProtoView, t: Ty, op: String) : ExprKind = {
+  let disp = match pipe_op_impl(pv.impls, t, op) {
     Some(p) -> pid_op_ref(pv.ids, pir_proto(p), op)
     None    -> None
   }
   match disp {
     Some(k) -> k
-    None    -> EName(inf_proto_dispatcher_name(op))
+    None    -> EName(written(inf_proto_dispatcher_name(op)))
   }
 }
 
@@ -13086,19 +12952,19 @@ fn pipe_surface_op(op: String) : String =
 
 # The `|` → `|>` suggestion. Names the stage when it has one so the
 # message reads as the user's own code, not the desugared `map` call.
-fn emit_pipe_wants_apply(file: String, op: String, stage: Expr, param: Ty,
+fn emit_pipe_wants_apply(st: InferState, op: String, stage: Expr, param: Ty,
                           elem: Option[Ty], line: Int, col: Int) : Unit / Console + File {
-  let what = match callee_display_name(stage) {
+  let what = match callee_display_name(st, stage) {
     Some(nm) -> "`#{nm}` takes"
     None     -> "the stage takes"
   }
   let elem_txt = match elem {
-    Some(et) -> inf_ty_to_string(et)
+    Some(et) -> inf_ty_to_string(st.env.tab, et)
     None     -> "the element"
   }
-  diag_error(file, line, col,
+  diag_error(st.file, line, col,
     concat_all(["`", pipe_surface_op(op), "` is element-wise; ", what, " `",
-      inf_ty_to_string(param), "`, not `", elem_txt, "`"]))
+      inf_ty_to_string(st.env.tab, param), "`, not `", elem_txt, "`"]))
   diag_help("did you mean `|>` (apply to the whole value)?")
 }
 
@@ -13109,7 +12975,8 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
 
   let rl = synth(st, lhs)
   let lhs_ty = apply_ty(rl.st.sub, rl.ty)
-  match inf_ty_head_name(lhs_ty) {
+  let hsym = ty_head_sym(lhs_ty)
+  match inf_ty_head_name(rl.st.env.tab, lhs_ty) {
     None -> {
       let perr = mk_diag(SevError, rl.st.file, line, col,
         concat_all([op, "-pipe requires a concrete head type on the ",
@@ -13119,14 +12986,14 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
       let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
       mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
     }
-    Some(head) -> match pipe_rejection_reason(head, op) {
+    Some(head) -> match pipe_rejection_reason(hsym, op) {
       Some(msg) -> {
         let perr = mk_diag(SevError, rl.st.file, line, col, msg, [])
         render_diag(perr)
         let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
         mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
       }
-      None -> match find_head_owner(rl.st.env, head) {
+      None -> match find_head_owner(rl.st.env, hsym) {
         HLNone -> {
           let perr = mk_diag(SevError, rl.st.file, line, col,
             concat_all(["no module declaring type `", head, "` is in scope"]), [])
@@ -13144,12 +13011,11 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
         }
         HLOk(module_name) -> {
-          # emit `EModCall(module_name, op)` when the
-          # qualified `<module>::<op>` entry is registered — that is
+          # call the module's own `op` when it declares one — that is
           # the dispatch-eligible case (the diagnostic surface
           # `pipe_no_map` checks). When
-          # no qualified entry exists we fall back to a bare-name
-          # callee (`EName(op)`); this preserves the earlier
+          # it declares none we fall back to the bare name, which
+          # reads as any bare `op` does; this preserves the earlier
           # behaviour for the only seeded head, `List → list`, when
           # invoked by harnesses that do not load `core/list.kai`
           # as a core (the runtime `kai_core_map` /
@@ -13163,15 +13029,15 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           # heads that are actually module-resident, so reaching
           # `HLOk` for a user head implies the module IS loaded
           # and the missing qualified entry IS the user's bug.
-          let qualified = ty_env_lookup_qualified(rl.st.env, module_name, op)
+          let qualified = env_home_fn(rl.st.env, module_name, op)
           # A `Shape`-protocol impl (`impl Sequence for Chain { map, ... }`)
           # provides the pipe op even when the head's module ships no
           # `map` function: call its dispatcher, which `resolve_protocol_calls`
           # retargets to `__pimpl_<P>_<head>_<op>` post-typing.
-          let head_proto_op = pipe_op_has_impl(rl.st.protos.impls, head, op)
+          let head_proto_op = pipe_op_has_impl(rl.st.protos.impls, lhs_ty, op)
           let callee_kind = match qualified {
-            Some(_) -> EModCall(module_name, op)
-            None    -> if head_proto_op { pipe_op_dispatcher(rl.st.protos, head, op) } else { EName(op) }
+            Some(s) -> ESym(s, spec_none())
+            None    -> if head_proto_op { pipe_op_dispatcher(rl.st.protos, lhs_ty, op) } else { EName(written(op)) }
           }
           # emit the "module declares T but does not
           # export op" diagnostic only when the head was contributed
@@ -13183,7 +13049,7 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           let st_after_diag = match qualified {
             Some(_) -> rl.st
             None ->
-              if head == "List" or head_proto_op { rl.st }
+              if core_ty_is(hsym, CtList) or head_proto_op { rl.st }
               else {
                 let perr = mk_diag(SevError, rl.st.file, line, col,
                   concat_all(["module `", module_name, "` declares `", head,
@@ -13213,7 +13079,7 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           let pipe_callee = mk_expr(callee_kind, line, col)
           let st2 = match pipe_stage_wants_container(st_fresh.env, st_fresh.sub, rl.ty, rf.ty, elem) {
             Some(param) -> {
-              emit_pipe_wants_apply(st_fresh.file, op, rhs, param, elem, line, col)
+              emit_pipe_wants_apply(st_fresh, op, rhs, param, elem, line, col)
               st_bump_err(st_fresh)
             }
             None ->
@@ -13389,10 +13255,8 @@ type FuseSeqPeek = FSP(InferState, Bool)
 
 fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : FuseSeqPeek / Console + File + Mutable {
   let r = synth(st, ff.source)
-  let head_ok = match inf_ty_head_name(apply_ty(r.st.sub, r.ty)) {
-    Some(head) -> head != "List" and pipe_op_has_impl(st.protos.impls, head, "foldl")
-    None -> false
-  }
+  let src_ty = apply_ty(r.st.sub, r.ty)
+  let head_ok = not core_ty_is(ty_head_sym(src_ty), CtList) and pipe_op_has_impl(st.protos.impls, src_ty, "foldl")
   FSP(st_restore_deferred_fields(r.st, st.deferred_fields, st.deferred_homs), head_ok)
 }
 
@@ -13436,11 +13300,7 @@ fn fuse_raw(st: InferState, closure: Expr, strict: Bool) : FuseGate / Console + 
 }
 
 fn st_restore_deferred_fields(st: InferState, dfs: [DeferredField], hs: [DeferredHom]) : InferState =
-  InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: dfs, deferred_homs: hs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
+  InferState { ...st, deferred_fields: dfs, deferred_homs: hs }
 
 fn fuse_row_strict(sub: Subst, stage: Expr) : Bool =
   match pipe_fusion_fn_row(apply_ty(sub, fuse_expr_ty(stage))) {
@@ -13518,7 +13378,7 @@ fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) 
 #     container op like `hashmap.put`, or any user fn `/ Mutable`).
 #     The demand is "local" iff every argument that CARRIES MUTATION
 #     (head `Array`/`Ref`, or a record with a transitive `Array`/`Ref`
-#     field) is an `EName(n)` with `n` local-constructed, not a
+#     field) is a read of a local `n`, with `n` local-constructed, not a
 #     parameter, and not escaped. Otherwise the demand is "external".
 #   If every demand is local, `Mutable` is removed from
 #   `st.row` (and from `st.eff_uses` to keep diagnostics
@@ -13535,7 +13395,7 @@ fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) 
 # The direct/dispatch distinction is gone: a value carries mutation or
 # it does not, and the only question is whether it escapes. The masking
 # invariant: a callee `/ Mutable` is masked iff every mutation-carrying
-# argument is a local, non-parameter, non-escaping `EVar`; an argument
+# argument is a local, non-parameter, non-escaping read; an argument
 # that carries mutation and is a parameter or escapes keeps `Mutable`.
 
 fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : InferState {
@@ -13552,7 +13412,7 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
     let local_set = collect_local_arrays(body_resolved, [], dmut)
     let opaque = opaque_binders(params, body_resolved)
     let escaped_set = collect_escaped_names(st.protos.ids, body_resolved, [])
-    if all_demands_local(body_resolved, local_set, escaped_set, opaque, dmut) {
+    if all_demands_local(st.env.tab, body_resolved, local_set, escaped_set, opaque, dmut) {
       st_drop_effect(st, CeMutable)
     } else { st }
   }
@@ -13562,35 +13422,36 @@ fn carrier_shapes(recs: [RecInfo], sums: [SumInfo]) : [CarrierShape] =
   list_append(map(recs, record_shape), map(sums, sum_carrier_shape))
 
 fn sum_carrier_shape(s: SumInfo) : CarrierShape = match s {
-  SI(name, _, vs, _) -> sum_shape(name, vs)
+  SI(sum, _, vs, _) -> sum_shape(sum, vs)
 }
 
 fn st_drop_effect(st: InferState, c: CoreEffect) : InferState {
   let row1 = filter(st.row, (h) => not effect_is(h.sym, c))
   let uses1 = filter(st.eff_uses, (u) => match u { EU(l, _, _) -> not effect_is(l.sym, c) })
-  InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: row1, eff_uses: uses1, aliases: st.aliases,
-               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
+  InferState { ...st, row: row1, eff_uses: uses1 }
 }
 
-fn mut_collect_param_names(ps: [Param], acc: [String]) : [String] {
+fn mut_collect_param_ids(ps: [Param], acc: [LocalId]) : [LocalId] {
   match ps {
     []           -> acc
-    [p, ...rest] -> mut_collect_param_names(rest, [p.pname, ...acc])
+    [p, ...rest] -> mut_collect_param_ids(rest, [p.binder.id, ...acc])
   }
 }
 
-# Walk the typed body and accumulate names bound to a locally-
+fn lid_in(ls: [LocalId], l: LocalId) : Bool = match ls {
+  []           -> false
+  [h, ...rest] -> local_eq(h, l) or lid_in(rest, l)
+}
+
+# Walk the typed body and accumulate the locals bound to a locally-
 # constructed mutable value (an Array, a Ref, or a Ref-backed
-# container — `dmut` lists the mutating record names). Recurses
+# container — `dmut` lists the mutating types). Recurses
 # through every sub-expression so locals introduced inside
 # if/match/block branches are caught.
-fn collect_local_arrays(e: Expr, acc: [String], dmut: [String]) : [String] =
+fn collect_local_arrays(e: Expr, acc: [LocalId], dmut: [SymId]) : [LocalId] =
   collect_local_arrays_kind(e.kind, acc, dmut)
 
-fn collect_local_arrays_kind(k: ExprKind, acc: [String], dmut: [String]) : [String] {
+fn collect_local_arrays_kind(k: ExprKind, acc: [LocalId], dmut: [SymId]) : [LocalId] {
   match k {
     EBlock(stmts, tail) -> {
       let acc1 = collect_local_in_stmts(stmts, acc, dmut)
@@ -13624,13 +13485,13 @@ fn collect_local_arrays_kind(k: ExprKind, acc: [String], dmut: [String]) : [Stri
     EFlatMapPipe(a, b)-> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
     EFilterPipe(a, b) -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
     ELambda(_, b)     -> collect_local_arrays(b, acc, dmut)
-    ERecordLit(_, _, fs) -> collect_local_in_field_inits(fs, acc, dmut)
+    ERecordLit(_, fs) -> collect_local_in_field_inits(fs, acc, dmut)
     EList(els)        -> collect_local_in_list_elems(els, acc, dmut)
     ERange(a, b, oc)  -> {
       let a1 = collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
       match oc { Some(c) -> collect_local_arrays(c, a1, dmut) None -> a1 }
     }
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = collect_local_arrays(body, acc, dmut)
       let a2 = match init_opt { Some(i) -> collect_local_arrays(i, a1, dmut) None -> a1 }
       let a3 = collect_local_in_hclauses(clauses, a2, dmut)
@@ -13645,19 +13506,19 @@ fn collect_local_arrays_kind(k: ExprKind, acc: [String], dmut: [String]) : [Stri
   }
 }
 
-fn collect_local_in_exprs(es: [Expr], acc: [String], dmut: [String]) : [String] = match es {
+fn collect_local_in_exprs(es: [Expr], acc: [LocalId], dmut: [SymId]) : [LocalId] = match es {
   []           -> acc
   [h, ...rest] -> collect_local_in_exprs(rest, collect_local_arrays(h, acc, dmut), dmut)
 }
 
-fn collect_local_in_field_inits(fs: [FieldInit], acc: [String], dmut: [String]) : [String] = match fs {
+fn collect_local_in_field_inits(fs: [FieldInit], acc: [LocalId], dmut: [SymId]) : [LocalId] = match fs {
   []           -> acc
   [h, ...rest] -> match h {
     FI(_, v) -> collect_local_in_field_inits(rest, collect_local_arrays(v, acc, dmut), dmut)
   }
 }
 
-fn collect_local_in_list_elems(els: [ListElem], acc: [String], dmut: [String]) : [String] = match els {
+fn collect_local_in_list_elems(els: [ListElem], acc: [LocalId], dmut: [SymId]) : [LocalId] = match els {
   []           -> acc
   [h, ...rest] -> match h {
     ElPlain(x)  -> collect_local_in_list_elems(rest, collect_local_arrays(x, acc, dmut), dmut)
@@ -13665,7 +13526,7 @@ fn collect_local_in_list_elems(els: [ListElem], acc: [String], dmut: [String]) :
   }
 }
 
-fn collect_local_in_arms(arms: [Arm], acc: [String], dmut: [String]) : [String] = match arms {
+fn collect_local_in_arms(arms: [Arm], acc: [LocalId], dmut: [SymId]) : [LocalId] = match arms {
   []           -> acc
   [h, ...rest] -> match h {
     Arm(_, g, b) -> {
@@ -13675,28 +13536,28 @@ fn collect_local_in_arms(arms: [Arm], acc: [String], dmut: [String]) : [String] 
   }
 }
 
-fn collect_local_in_hclauses(cs: [HClause], acc: [String], dmut: [String]) : [String] = match cs {
+fn collect_local_in_hclauses(cs: [HClause], acc: [LocalId], dmut: [SymId]) : [LocalId] = match cs {
   []           -> acc
   [h, ...rest] -> match h {
     HC(_, _, b, _, _) -> collect_local_in_hclauses(rest, collect_local_arrays(b, acc, dmut), dmut)
   }
 }
 
-fn collect_local_in_stmts(stmts: [Stmt], acc: [String], dmut: [String]) : [String] = match stmts {
+fn collect_local_in_stmts(stmts: [Stmt], acc: [LocalId], dmut: [SymId]) : [LocalId] = match stmts {
   []           -> acc
   [s, ...rest] -> collect_local_in_stmts(rest, collect_local_in_stmt(s, acc, dmut), dmut)
 }
 
-fn collect_local_in_stmt(s: Stmt, acc: [String], dmut: [String]) : [String] {
+fn collect_local_in_stmt(s: Stmt, acc: [LocalId], dmut: [SymId]) : [LocalId] {
   match s {
     SLet(p, _, rhs) -> {
       # Recurse into rhs first (a let RHS may itself contain nested
       # local-construction bindings inside an if/match branch).
       let acc1 = collect_local_arrays(rhs, acc, dmut)
       match p.pkind {
-        PBind(name) ->
+        PBind(b) ->
           if rhs_is_local_origin(rhs, acc1, dmut) {
-            [name, ...acc1]
+            [b.id, ...acc1]
           } else { acc1 }
         _ -> acc1
       }
@@ -13721,7 +13582,7 @@ fn collect_local_in_stmt(s: Stmt, acc: [String], dmut: [String]) : [String] {
 # (Tofte-Talpin) / JVM escape analysis (Choi et al. 1999): a value whose
 # identity did not come in from a parameter is local.
 #
-#   * an alias `EName(n)` is local iff `n` is already local (propagate —
+#   * a read of a local `n` is local iff `n` is already local (propagate —
 #     never decide by type, so `let m2 = param_map` stays non-local);
 #   * an `if`/`match`/block-tail is local iff EVERY tail branch is local
 #     (so `if c { local_a } else { param_ref }` is correctly non-local);
@@ -13733,9 +13594,9 @@ fn collect_local_in_stmt(s: Stmt, acc: [String], dmut: [String]) : [String] {
 #     a fresh value (`array_make`, `Mutable.ref_make`, `hashmap.empty`,
 #     `from_pairs`). A call that DOES take a mutable argument (a user helper
 #     that might return it) is conservatively non-local.
-fn rhs_is_local_origin(rhs: Expr, local_so_far: [String], dmut: [String]) : Bool =
-  match sym_local_kind(rhs.kind) {
-    EName(n)            -> list_has(local_so_far, n)
+fn rhs_is_local_origin(rhs: Expr, local_so_far: [LocalId], dmut: [SymId]) : Bool =
+  match rhs.kind {
+    ELocal(l)          -> lid_in(local_so_far, l)
     EBlock(_, tail)    -> {
       match tail {
         Some(t) -> rhs_is_local_origin(t, local_so_far, dmut)
@@ -13764,11 +13625,11 @@ fn rhs_is_local_origin(rhs: Expr, local_so_far: [String], dmut: [String]) : Bool
     # init aliases a non-local mutation carrier. `Box { arr: array_make(..) }`
     # is local; `Box { arr: param_arr }` is not (it aliases the caller's
     # buffer, so a callee mutating `b.arr` is observable through the param).
-    ERecordLit(_, _, fs)  -> field_inits_all_local_origin(fs, local_so_far, dmut)
+    ERecordLit(_, fs)  -> field_inits_all_local_origin(fs, local_so_far, dmut)
     _ -> false
   }
 
-fn field_inits_all_local_origin(fs: [FieldInit], local_so_far: [String], dmut: [String]) : Bool =
+fn field_inits_all_local_origin(fs: [FieldInit], local_so_far: [LocalId], dmut: [SymId]) : Bool =
   match fs {
     []           -> true
     [f, ...rest] -> match f {
@@ -13782,18 +13643,18 @@ fn field_inits_all_local_origin(fs: [FieldInit], local_so_far: [String], dmut: [
 # A field init keeps the record local iff it does not bring in a
 # non-local mutation carrier: a non-carrier value is harmless, and a
 # carrier value must itself be locally originated.
-fn field_init_local(v: Expr, local_so_far: [String], dmut: [String]) : Bool =
+fn field_init_local(v: Expr, local_so_far: [LocalId], dmut: [SymId]) : Bool =
   match v.ty {
     Some(t) -> if ty_may_carry_mutation(t, dmut) { rhs_is_local_origin(v, local_so_far, dmut) }
                else { true }
     None    -> true
   }
 
-fn both_local_origin(a: Expr, b: Expr, local_so_far: [String], dmut: [String]) : Bool =
+fn both_local_origin(a: Expr, b: Expr, local_so_far: [LocalId], dmut: [SymId]) : Bool =
   if rhs_is_local_origin(a, local_so_far, dmut) { rhs_is_local_origin(b, local_so_far, dmut) }
   else { false }
 
-fn arms_all_local_origin(arms: [Arm], local_so_far: [String], dmut: [String]) : Bool = match arms {
+fn arms_all_local_origin(arms: [Arm], local_so_far: [LocalId], dmut: [SymId]) : Bool = match arms {
   []           -> true
   [h, ...rest] -> match h {
     Arm(_, _, b) ->
@@ -13802,32 +13663,28 @@ fn arms_all_local_origin(arms: [Arm], local_so_far: [String], dmut: [String]) : 
   }
 }
 
-# In-place ops (`array_set` / `array_grow`, bare or qualified) return the
+# The in-place builtins (`array_set` / `array_grow`) return the
 # SAME cell they were given, so the binding is local iff the first arg is
-# already a local name. Checked BEFORE the constructor rule because these
+# already a local. Checked BEFORE the constructor rule because these
 # DO take a mutable first arg (which the constructor rule would reject).
-fn rhs_is_inplace_local(callee: Expr, args_: [Expr], local_so_far: [String]) : Bool =
-  match callee.kind {
-    EName(name) ->
-      if is_inplace_array_op(name) {
-        match args_ {
-          [first, ..._ignore] -> match sym_local_kind(first.kind) {
-            EName(n) -> list_has(local_so_far, n)
-            _       -> false
-          }
-          [] -> false
-        }
-      } else { false }
-    _ -> false
-  }
+fn rhs_is_inplace_local(callee: Expr, args_: [Expr], local_so_far: [LocalId]) : Bool =
+  if is_inplace_array_op(callee) {
+    match args_ {
+      [first, ..._ignore] -> match first.kind {
+        ELocal(l) -> lid_in(local_so_far, l)
+        _         -> false
+      }
+      [] -> false
+    }
+  } else { false }
 
-fn is_inplace_array_op(name: String) : Bool =
-  name == "array_set" or name == "array_grow" or name == "Mutable.array_set" or name == "Mutable.array_grow"
+fn is_inplace_array_op(callee: Expr) : Bool =
+  is_builtin_ref(callee, CbArraySet) or is_builtin_ref(callee, CbArrayGrow)
 
 # A call is a fresh-value constructor iff its result type carries mutation
 # and NO argument carries mutation (it cannot alias a mutable value it never
 # received). The result-type guard also rejects pure non-mutable calls.
-fn rhs_is_constructor(ret_ty: Option[Ty], args_: [Expr], dmut: [String]) : Bool =
+fn rhs_is_constructor(ret_ty: Option[Ty], args_: [Expr], dmut: [SymId]) : Bool =
   match ret_ty {
     None    -> false
     Some(t) -> ty_may_carry_mutation(t, dmut) and not any_arg_carries_mutation(args_, dmut)
@@ -13837,13 +13694,13 @@ fn rhs_is_constructor(ret_ty: Option[Ty], args_: [Expr], dmut: [String]) : Bool 
 # carrier argument is local-origin: the returned carrier can only alias one
 # it received, and all were local. (`string_builder.append(local, s)`.)
 fn rhs_threads_local_carrier(ret_ty: Option[Ty], args_: [Expr],
-                             local_so_far: [String], dmut: [String]) : Bool =
+                             local_so_far: [LocalId], dmut: [SymId]) : Bool =
   match ret_ty {
     None    -> false
     Some(t) -> ty_may_carry_mutation(t, dmut) and carrier_args_all_local(args_, local_so_far, dmut)
   }
 
-fn carrier_args_all_local(args_: [Expr], local_so_far: [String], dmut: [String]) : Bool = match args_ {
+fn carrier_args_all_local(args_: [Expr], local_so_far: [LocalId], dmut: [SymId]) : Bool = match args_ {
   []           -> true
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
@@ -13854,7 +13711,7 @@ fn carrier_args_all_local(args_: [Expr], local_so_far: [String], dmut: [String])
   }
 }
 
-fn any_arg_carries_mutation(args_: [Expr], dmut: [String]) : Bool = match args_ {
+fn any_arg_carries_mutation(args_: [Expr], dmut: [SymId]) : Bool = match args_ {
   []           -> false
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
@@ -13869,10 +13726,10 @@ fn any_arg_carries_mutation(args_: [Expr], dmut: [String]) : Bool = match args_ 
 # mutate it. The whitelist covers reads
 # (array_get / array_length) and writes the demand pass already
 # inspects (array_set / array_grow / array_make).
-fn collect_escaped_names(ids: ProtoIds, e: Expr, acc: [String]) : [String] =
+fn collect_escaped_names(ids: ProtoIds, e: Expr, acc: [LocalId]) : [LocalId] =
   collect_escaped_names_kind(ids, e.kind, acc)
 
-fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [String]) : [String] {
+fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [LocalId]) : [LocalId] {
   match k {
     ECall(callee, args_) -> {
       # generalised the previous `is_array_safe_callee`
@@ -13890,13 +13747,13 @@ fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [String]) : [Stri
       #     pass's `mutable_callee_args_all_local` then decides per call
       #     site whether the locally-constructed Arrays are still safe
       #     (every Array/Ref arg must be a local non-param non-escaped
-      #     EVar). The two checks agree: if every Array arg is local,
+      #     read). The two checks agree: if every Array arg is local,
       #     escape's pessimism is overridden by the demand check.
-      # every named callee (`EVar`) is safe for escape
+      # every named callee (a declaration, a local) is safe for escape
       # purposes. The masking pass's `mutable_callee_args_all_local`
       # is the sole authority on whether passing an Array/Ref to a
       # callee `/ Mutable` is observable mutation. For non-Mutable
-      # callees the question doesn't arise. Non-EVar callees (lambdas,
+      # callees the question doesn't arise. Unnamed callees (lambdas,
       # field accesses, etc.) remain conservative.
       # a callee whose row carries `/ Mutable` (a module op
       # like `hashmap.put`, or any user fn `/ Mutable`) is NOT an escape:
@@ -13904,12 +13761,14 @@ fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [String]) : [Stri
       # sole authority on whether passing a local mutable value to it is
       # observable. Treating it as escape here would mark a locally-built
       # `HashMap` as escaped the moment it is read or written through its
-      # own module ops, defeating the masking entirely. A named `EVar`
-      # callee stays safe as before; a `/ Mutable` `EModCall` now joins it.
+      # own module ops, defeating the masking entirely.
       let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
       let safe = match callee.kind {
+        ELocal(_) -> true
+        ESym(_, _) -> true
+        EOp(_) -> true
+        # A callee the typer has yet to settle names a declaration.
         EName(_) -> true
-        ESym(_, _, _) -> true
         # A primitive mark is a named callee like any bare one.
         EMark(m) -> mark_is_prim(m) or ty_callee_has_mutable(callee_ty)
         # A module-qualified dispatcher is a named callee like any bare
@@ -13946,13 +13805,13 @@ fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [String]) : [Stri
     # A record literal stores values into fields — that hands the
     # reference to a structured carrier the caller may inspect or
     # mutate. Treat field-init args as escaping.
-    ERecordLit(_, _, fs) -> collect_escaped_in_field_inits(ids, fs, acc)
+    ERecordLit(_, fs) -> collect_escaped_in_field_inits(ids, fs, acc)
     EList(els)        -> collect_escaped_in_list_elems(ids, els, acc)
     ERange(a, b, oc)  -> {
       let a1 = collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
       match oc { Some(c) -> collect_escaped_names(ids, c, a1) None -> a1 }
     }
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = collect_escaped_names(ids, body, acc)
       let a2 = match init_opt { Some(i) -> collect_escaped_names(ids, i, a1) None -> a1 }
       let a3 = collect_escaped_in_hclauses(ids, clauses, a2)
@@ -13968,21 +13827,18 @@ fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [String]) : [Stri
 }
 
 # A collection pipe hands the LHS to its stage: it escapes unless the
-# stage is a safe array_* core name.
-fn collect_escaped_via_pipe(ids: ProtoIds, a: Expr, b: Expr, acc: [String]) : [String] {
-  let safe = match b.kind {
-    EName(n) -> is_array_safe_callee(n)
-    _       -> false
-  }
+# stage is a safe array_* core builtin.
+fn collect_escaped_via_pipe(ids: ProtoIds, a: Expr, b: Expr, acc: [LocalId]) : [LocalId] {
+  let safe = is_array_safe_callee(b)
   let a1 = collect_escaped_names(ids, b, acc)
   if safe { collect_escaped_names(ids, a, a1) }
-  else { match sym_local_kind(a.kind) {
-    EName(n) -> [n, ...collect_escaped_names(ids, a, a1)]
-    _       -> collect_escaped_names(ids, a, a1)
+  else { match a.kind {
+    ELocal(l) -> [l, ...collect_escaped_names(ids, a, a1)]
+    _         -> collect_escaped_names(ids, a, a1)
   } }
 }
 
-fn is_array_safe_callee(name: String) : Bool {
+fn is_array_safe_callee(callee: Expr) : Bool {
   # Runtime builtins for Array — their first argument is the array
   # they read or mutate. The masking pass already classifies each
   # call site as local-vs-external by inspecting that argument, so
@@ -13993,45 +13849,47 @@ fn is_array_safe_callee(name: String) : Bool {
   # entries crossed an abstraction boundary — the compiler should
   # not know about specific stdlib symbols. They are gone; their
   # callers now propagate `/ Mutable` honestly through the row.
-  if name == "array_make" { true }
-  else if name == "array_length" { true }
-  else if name == "array_get" { true }
-  else if name == "array_set" { true }
-  else if name == "array_grow" { true }
-  else { false }
+  match builtin_ref(callee) {
+    Some(CbArrayMake)   -> true
+    Some(CbArrayLength) -> true
+    Some(CbArrayGet)    -> true
+    Some(CbArraySet)    -> true
+    Some(CbArrayGrow)   -> true
+    _                   -> false
+  }
 }
 
 # Variant for argument lists of safe (whitelisted) callees:
-# argument names that are direct `EVar` references DO NOT escape,
+# arguments that are direct references DO NOT escape,
 # but we still recurse structurally so deeper calls inside e.g.
 # `array_set(local, idx, helper(local))` register `helper(local)`'s
 # escape correctly.
-fn collect_escaped_in_exprs_safe(ids: ProtoIds, es: [Expr], acc: [String]) : [String] = match es {
+fn collect_escaped_in_exprs_safe(ids: ProtoIds, es: [Expr], acc: [LocalId]) : [LocalId] = match es {
   []           -> acc
   [h, ...rest] -> match h.kind {
-    EName(_) -> collect_escaped_in_exprs_safe(ids, rest, acc)
-    ESym(_, _, _) -> collect_escaped_in_exprs_safe(ids, rest, acc)
+    ELocal(_) -> collect_escaped_in_exprs_safe(ids, rest, acc)
+    ESym(_, _) -> collect_escaped_in_exprs_safe(ids, rest, acc)
     _       -> collect_escaped_in_exprs_safe(ids, rest, collect_escaped_names(ids, h, acc))
   }
 }
 
 # Variant for argument lists of NON-whitelisted callees: every direct
-# `EName(n)` argument escapes (the callee may mutate it). Otherwise
+# read of a local escapes (the callee may mutate it). Otherwise
 # recurse.
-fn collect_escaped_in_exprs(ids: ProtoIds, es: [Expr], acc: [String]) : [String] = match es {
+fn collect_escaped_in_exprs(ids: ProtoIds, es: [Expr], acc: [LocalId]) : [LocalId] = match es {
   []           -> acc
-  [h, ...rest] -> match sym_local_kind(h.kind) {
-    EName(n) -> collect_escaped_in_exprs(ids, rest, [n, ...acc])
-    _       -> collect_escaped_in_exprs(ids, rest, collect_escaped_names(ids, h, acc))
+  [h, ...rest] -> match h.kind {
+    ELocal(l) -> collect_escaped_in_exprs(ids, rest, [l, ...acc])
+    _         -> collect_escaped_in_exprs(ids, rest, collect_escaped_names(ids, h, acc))
   }
 }
 
-fn collect_escaped_in_stmts(ids: ProtoIds, stmts: [Stmt], acc: [String]) : [String] = match stmts {
+fn collect_escaped_in_stmts(ids: ProtoIds, stmts: [Stmt], acc: [LocalId]) : [LocalId] = match stmts {
   []           -> acc
   [s, ...rest] -> collect_escaped_in_stmts(ids, rest, collect_escaped_in_stmt(ids, s, acc))
 }
 
-fn collect_escaped_in_stmt(ids: ProtoIds, s: Stmt, acc: [String]) : [String] {
+fn collect_escaped_in_stmt(ids: ProtoIds, s: Stmt, acc: [LocalId]) : [LocalId] {
   match s {
     SLet(_, _, rhs)             -> collect_escaped_names(ids, rhs, acc)
     SAssert(c, m) -> {
@@ -14048,7 +13906,7 @@ fn collect_escaped_in_stmt(ids: ProtoIds, s: Stmt, acc: [String]) : [String] {
   }
 }
 
-fn collect_escaped_in_arms(ids: ProtoIds, arms: [Arm], acc: [String]) : [String] = match arms {
+fn collect_escaped_in_arms(ids: ProtoIds, arms: [Arm], acc: [LocalId]) : [LocalId] = match arms {
   []           -> acc
   [h, ...rest] -> match h {
     Arm(_, g, b) -> {
@@ -14058,29 +13916,29 @@ fn collect_escaped_in_arms(ids: ProtoIds, arms: [Arm], acc: [String]) : [String]
   }
 }
 
-fn collect_escaped_in_hclauses(ids: ProtoIds, cs: [HClause], acc: [String]) : [String] = match cs {
+fn collect_escaped_in_hclauses(ids: ProtoIds, cs: [HClause], acc: [LocalId]) : [LocalId] = match cs {
   []           -> acc
   [h, ...rest] -> match h {
     HC(_, _, b, _, _) -> collect_escaped_in_hclauses(ids, rest, collect_escaped_names(ids, b, acc))
   }
 }
 
-fn collect_escaped_in_field_inits(ids: ProtoIds, fs: [FieldInit], acc: [String]) : [String] = match fs {
+fn collect_escaped_in_field_inits(ids: ProtoIds, fs: [FieldInit], acc: [LocalId]) : [LocalId] = match fs {
   []           -> acc
   [h, ...rest] -> match h {
-    FI(_, v) -> match sym_local_kind(v.kind) {
-      EName(n) -> collect_escaped_in_field_inits(ids, rest, [n, ...acc])
-      _       -> collect_escaped_in_field_inits(ids, rest, collect_escaped_names(ids, v, acc))
+    FI(_, v) -> match v.kind {
+      ELocal(l) -> collect_escaped_in_field_inits(ids, rest, [l, ...acc])
+      _         -> collect_escaped_in_field_inits(ids, rest, collect_escaped_names(ids, v, acc))
     }
   }
 }
 
-fn collect_escaped_in_list_elems(ids: ProtoIds, els: [ListElem], acc: [String]) : [String] = match els {
+fn collect_escaped_in_list_elems(ids: ProtoIds, els: [ListElem], acc: [LocalId]) : [LocalId] = match els {
   []           -> acc
   [h, ...rest] -> match h {
-    ElPlain(x) -> match sym_local_kind(x.kind) {
-      EName(n) -> collect_escaped_in_list_elems(ids, rest, [n, ...acc])
-      _       -> collect_escaped_in_list_elems(ids, rest, collect_escaped_names(ids, x, acc))
+    ElPlain(x) -> match x.kind {
+      ELocal(l) -> collect_escaped_in_list_elems(ids, rest, [l, ...acc])
+      _         -> collect_escaped_in_list_elems(ids, rest, collect_escaped_names(ids, x, acc))
     }
     ElSpread(x) -> collect_escaped_in_list_elems(ids, rest, collect_escaped_names(ids, x, acc))
   }
@@ -14107,13 +13965,13 @@ fn labels_contain_mutable(labels: [Label]) : Bool = match labels {
 }
 
 # True iff the call's callee is an op of the `Mutable` effect: the callee
-# of a perform carries its effect's id. Its `.ty` is the op's result type,
+# of a perform names its effect. Its `.ty` is the op's result type,
 # so `ty_callee_has_mutable` cannot see the demand. This is NOT a per-op
 # whitelist — `array_set`, `ref_set`, `ref_get`, `ref_make`, and any other
 # `Mutable` op all match.
 fn callee_is_mutable_op(callee: Expr) : Bool = match callee.kind {
-  ESym(s, _, _) -> effect_is(s, CeMutable)
-  _             -> false
+  EOp(r) -> effect_is(r.eff, CeMutable)
+  _      -> false
 }
 
 
@@ -14123,14 +13981,14 @@ fn callee_is_mutable_op(callee: Expr) : Bool = match callee.kind {
 # other type cannot carry mutation and is ignored. An escaping or parameter
 # mutable argument makes the demand observable, so `Mutable` stays on the row.
 #
-# A mutation-carrying arg is local iff it is `local_origin` (a local `EVar`,
+# A mutation-carrying arg is local iff it is `local_origin` (a local read,
 # a fresh-constructor inline like `string_builder.new()`, or a record literal
 # whose fields are all local) — which lets `foldl(xs, new(), \b -> mutate(b))`
 # mask: the HOF's local `init` makes the lambda's accumulator local. A shared
 # parameter or a constructor that wraps a shared value is rejected (its arg
 # carries mutation and is not local).
-fn mutable_callee_args_all_local(args_: [Expr], locals: [String],
-                                  escaped: [String], opaque: [String], dmut: [String]) : Bool = match args_ {
+fn mutable_callee_args_all_local(args_: [Expr], locals: [LocalId],
+                                  escaped: [LocalId], opaque: [LocalId], dmut: [SymId]) : Bool = match args_ {
   []           -> true
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
@@ -14144,33 +14002,32 @@ fn mutable_callee_args_all_local(args_: [Expr], locals: [String],
 
 # A writer that mutates only its first argument makes the demand
 # observable only through that destination.
-fn mutable_writer_dst_local(args_: [Expr], locals: [String], escaped: [String], dmut: [String]) : Bool = match args_ {
+fn mutable_writer_dst_local(args_: [Expr], locals: [LocalId], escaped: [LocalId], dmut: [SymId]) : Bool = match args_ {
   []            -> true
   [h, ..._rest] -> arg_is_local_carrier(h, locals, escaped, dmut)
 }
 
-fn callee_writes_only_first_arg(callee: Expr) : Bool = match callee.kind {
-  EName(name)    -> writes_only_first_arg(name)
-  ESym(_, _, name) -> writes_only_first_arg(name)
-  _             -> false
+fn callee_writes_only_first_arg(tab: SymTab, callee: Expr) : Bool = match callee.kind {
+  ESym(s, _) -> writes_only_first_arg(tab, s)
+  _          -> false
 }
 
 # A mutation-carrying argument is local iff its origin is local AND, when it
 # names a local, that name is not escaped. `rhs_is_local_origin` covers the
 # fresh-constructor and record-literal shapes (recursing into args/fields, so
 # a `wrap(shared)` factory is correctly non-local).
-fn arg_is_local_carrier(h: Expr, locals: [String], escaped: [String], dmut: [String]) : Bool =
-  match sym_local_kind(h.kind) {
-    EName(n) -> if list_has(escaped, n) { false } else { list_has(locals, n) }
-    _       -> rhs_is_local_origin(h, locals, dmut)
+fn arg_is_local_carrier(h: Expr, locals: [LocalId], escaped: [LocalId], dmut: [SymId]) : Bool =
+  match h.kind {
+    ELocal(l) -> if lid_in(escaped, l) { false } else { lid_in(locals, l) }
+    _         -> rhs_is_local_origin(h, locals, dmut)
   }
 
-fn all_demands_local(body: Expr, locals: [String], escaped: [String],
-                     opaque: [String], dmut: [String]) : Bool =
-  all_demands_local_kind(body.kind, locals, escaped, opaque, dmut)
+fn all_demands_local(tab: SymTab, body: Expr, locals: [LocalId], escaped: [LocalId],
+                     opaque: [LocalId], dmut: [SymId]) : Bool =
+  all_demands_local_kind(tab, body.kind, locals, escaped, opaque, dmut)
 
-fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
-                           opaque: [String], dmut: [String]) : Bool {
+fn all_demands_local_kind(tab: SymTab, k: ExprKind, locals: [LocalId], escaped: [LocalId],
+                           opaque: [LocalId], dmut: [SymId]) : Bool {
   match k {
     ECall(callee, args_) -> {
       # every Mutable demand now flows through ONE rule: a
@@ -14180,10 +14037,9 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
       # across all the spellings that reach here:
       #   * the core `array_set` / `array_grow` (their scheme carries
       #     `/ Mutable`, so the first `Array` arg is the mutation carrier);
-      #   * the qualified `Mutable.array_set` / `Mutable.ref_set` dispatch
-      #     keys (rewritten to `EName("Mutable.…")` by
-      #     `synth_op_call_with_scheme_keys`, type also `/ Mutable`);
-      #   * a Ref-backed container op (`hashmap.put`, an `EModCall` whose
+      #   * the qualified `Mutable.array_set` / `Mutable.ref_set` performs
+      #     (an `EOp` callee of the `Mutable` effect);
+      #   * a Ref-backed container op (`hashmap.put`, whose
       #     type is `/ Mutable`);
       #   * any user fn declared `/ Mutable`.
       # A mutable PARAMETER or escaping value is never local, so `Mutable`
@@ -14192,12 +14048,12 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
       # mutation-carrying argument of its own, so it is maskable when its
       # real mutation is a local cell — the per-argument check, not a blanket
       # decision, is what keeps `array.from` and friends maskable.
-      # A qualified `Mutable.<op>` op-call has its callee rewritten to one
-      # flat reference (`synth_op_call_with_scheme_keys` →
-      # `callee_expr_for_op`) whose `.ty` is the op's RESULT type, not a
-      # `/ Mutable` fn type — the effect lives on the caller's row, not the
-      # callee node. So `ty_callee_has_mutable` alone misses the dispatched
-      # op. The effect id that reference carries is the effect-level check
+      # A qualified `Mutable.<op>` op-call has its callee rewritten to an
+      # `EOp` (`synth_op_call_with_scheme_keys`) whose `.ty` is the effect
+      # instance, not a `/ Mutable` fn type — the effect lives on the
+      # caller's row, not the callee node. So `ty_callee_has_mutable`
+      # alone misses the dispatched op. The effect that callee names is
+      # the effect-level check
       # (NOT a per-op whitelist): every op of `Mutable` — `array_set`,
       # `ref_set`, `ref_get`, `ref_make`, and any future op — flows through
       # the same escape rule.
@@ -14207,80 +14063,80 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
       let here =
         if demands_mutable {
           if callee_is_opaque(callee, opaque) { false }
-          else if callee_writes_only_first_arg(callee) { mutable_writer_dst_local(args_, locals, escaped, dmut) }
+          else if callee_writes_only_first_arg(tab, callee) { mutable_writer_dst_local(args_, locals, escaped, dmut) }
           else { mutable_callee_args_all_local(args_, locals, escaped, opaque, dmut) }
         } else { true }
       if not here { false }
-      else if not all_demands_local(callee, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(tab, callee, locals, escaped, opaque, dmut) { false }
       # When the call passed the carrier-locality check, a lambda argument
       # threads a local accumulator: its params inherit the locality the
       # init proved at this site (`foldl(xs, new(), \b -> mutate(b))`). Pass
       # the lambda's params as locals into its body walk. The inheritance is
       # SOUND only because `here` verified every carrier arg (including the
       # init) is local; a shared init would have set `here` false above.
-      else { all_demands_local_in_exprs(args_, locals, escaped, opaque, dmut, here) }
+      else { all_demands_local_in_exprs(tab, args_, locals, escaped, opaque, dmut, here) }
     }
     EBlock(stmts, tail) -> {
-      if not all_demands_local_in_stmts(stmts, locals, escaped, opaque, dmut) { false }
+      if not all_demands_local_in_stmts(tab, stmts, locals, escaped, opaque, dmut) { false }
       else { match tail {
-        Some(t) -> all_demands_local(t, locals, escaped, opaque, dmut)
+        Some(t) -> all_demands_local(tab, t, locals, escaped, opaque, dmut)
         None    -> true
       } }
     }
     EIf(c, t_, eo) -> {
-      if not all_demands_local(c, locals, escaped, opaque, dmut) { false }
-      else if not all_demands_local(t_, locals, escaped, opaque, dmut) { false }
+      if not all_demands_local(tab, c, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(tab, t_, locals, escaped, opaque, dmut) { false }
       else { match eo {
-        Some(e2) -> all_demands_local(e2, locals, escaped, opaque, dmut)
+        Some(e2) -> all_demands_local(tab, e2, locals, escaped, opaque, dmut)
         None     -> true
       } }
     }
     EMatch(scr, arms) ->
-      if not all_demands_local(scr, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local_in_arms(arms, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, scr, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_arms(tab, arms, locals, escaped, opaque, dmut) }
     EBinop(_, a, b)   ->
-      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(b, locals, escaped, opaque, dmut) }
-    EUnop(_, x)       -> all_demands_local(x, locals, escaped, opaque, dmut)
-    EField(b, _)      -> all_demands_local(b, locals, escaped, opaque, dmut)
+      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
+    EUnop(_, x)       -> all_demands_local(tab, x, locals, escaped, opaque, dmut)
+    EField(b, _)      -> all_demands_local(tab, b, locals, escaped, opaque, dmut)
     EIndex(a, b)      ->
-      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(b, locals, escaped, opaque, dmut) }
-    EPipe(a, b)       -> all_demands_local(pipe_as_call(a, b), locals, escaped, opaque, dmut)
+      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
+    EPipe(a, b)       -> all_demands_local(tab, pipe_as_call(a, b), locals, escaped, opaque, dmut)
     EMapPipe(a, b)    ->
-      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(b, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
     EFlatMapPipe(a, b)->
-      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(b, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
     EFilterPipe(a, b) ->
-      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(b, locals, escaped, opaque, dmut) }
-    ELambda(_, b)     -> all_demands_local(b, locals, escaped, opaque, dmut)
-    ERecordLit(_, _, fs) -> all_demands_local_in_field_inits(fs, locals, escaped, opaque, dmut)
-    EList(els)        -> all_demands_local_in_list_elems(els, locals, escaped, opaque, dmut)
+      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
+    ELambda(_, b)     -> all_demands_local(tab, b, locals, escaped, opaque, dmut)
+    ERecordLit(_, fs) -> all_demands_local_in_field_inits(tab, fs, locals, escaped, opaque, dmut)
+    EList(els)        -> all_demands_local_in_list_elems(tab, els, locals, escaped, opaque, dmut)
     ERange(a, b, oc)  -> {
-      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
-      else if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
+      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(tab, b, locals, escaped, opaque, dmut) { false }
       else { match oc {
-        Some(c) -> all_demands_local(c, locals, escaped, opaque, dmut)
+        Some(c) -> all_demands_local(tab, c, locals, escaped, opaque, dmut)
         None    -> true
       } }
     }
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
-      if not all_demands_local(body, locals, escaped, opaque, dmut) { false }
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      if not all_demands_local(tab, body, locals, escaped, opaque, dmut) { false }
       else if not (match init_opt {
-        Some(i) -> all_demands_local(i, locals, escaped, opaque, dmut)
+        Some(i) -> all_demands_local(tab, i, locals, escaped, opaque, dmut)
         None    -> true
       }) { false }
-      else if not all_demands_local_in_hclauses(clauses, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local_in_hclauses(tab, clauses, locals, escaped, opaque, dmut) { false }
       else { match ret_opt {
-        Some(HR(_, b, _, _)) -> all_demands_local(b, locals, escaped, opaque, dmut)
+        Some(HR(_, b, _, _)) -> all_demands_local(tab, b, locals, escaped, opaque, dmut)
         None           -> true
       } }
     }
-    ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, opaque, dmut)
-    EBang(inner)       -> all_demands_local(inner, locals, escaped, opaque, dmut)
+    ELitUnit(inner, _) -> all_demands_local(tab, inner, locals, escaped, opaque, dmut)
+    EBang(inner)       -> all_demands_local(tab, inner, locals, escaped, opaque, dmut)
     _ -> true
   }
 }
@@ -14288,145 +14144,134 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
 # `hof_local` is set when the enclosing call passed the carrier-locality
 # check: a lambda argument's params then inherit that proven locality and
 # are walked as locals (the `foldl(xs, new(), \b -> mutate(b))` thread).
-fn all_demands_local_in_exprs(es: [Expr], locals: [String], escaped: [String],
-                              opaque: [String], dmut: [String], hof_local: Bool) : Bool = match es {
+fn all_demands_local_in_exprs(tab: SymTab, es: [Expr], locals: [LocalId], escaped: [LocalId],
+                              opaque: [LocalId], dmut: [SymId], hof_local: Bool) : Bool = match es {
   []           -> true
   [h, ...rest] -> {
     let ok = match h.kind {
       ELambda(ps, body) ->
         if hof_local {
-          let locals2 = mut_collect_param_names(ps, locals)
-          all_demands_local(body, locals2, escaped, opaque, dmut)
-        } else { all_demands_local(h, locals, escaped, opaque, dmut) }
-      _ -> all_demands_local(h, locals, escaped, opaque, dmut)
+          let locals2 = mut_collect_param_ids(ps, locals)
+          all_demands_local(tab, body, locals2, escaped, opaque, dmut)
+        } else { all_demands_local(tab, h, locals, escaped, opaque, dmut) }
+      _ -> all_demands_local(tab, h, locals, escaped, opaque, dmut)
     }
     if not ok { false }
-    else { all_demands_local_in_exprs(rest, locals, escaped, opaque, dmut, hof_local) }
+    else { all_demands_local_in_exprs(tab, rest, locals, escaped, opaque, dmut, hof_local) }
   }
 }
 
-fn all_demands_local_in_stmts(stmts: [Stmt], locals: [String],
-                              escaped: [String], opaque: [String], dmut: [String]) : Bool = match stmts {
+fn all_demands_local_in_stmts(tab: SymTab, stmts: [Stmt], locals: [LocalId],
+                              escaped: [LocalId], opaque: [LocalId], dmut: [SymId]) : Bool = match stmts {
   []           -> true
   [s, ...rest] ->
-    if not all_demands_local_in_stmt(s, locals, escaped, opaque, dmut) { false }
-    else { all_demands_local_in_stmts(rest, locals, escaped, opaque, dmut) }
+    if not all_demands_local_in_stmt(tab, s, locals, escaped, opaque, dmut) { false }
+    else { all_demands_local_in_stmts(tab, rest, locals, escaped, opaque, dmut) }
 }
 
-fn all_demands_local_in_stmt(s: Stmt, locals: [String], escaped: [String],
-                              opaque: [String], dmut: [String]) : Bool {
+fn all_demands_local_in_stmt(tab: SymTab, s: Stmt, locals: [LocalId], escaped: [LocalId],
+                              opaque: [LocalId], dmut: [SymId]) : Bool {
   match s {
-    SLet(_, _, rhs)             -> all_demands_local(rhs, locals, escaped, opaque, dmut)
+    SLet(_, _, rhs)             -> all_demands_local(tab, rhs, locals, escaped, opaque, dmut)
     SAssert(c, m) -> {
-      if not all_demands_local(c, locals, escaped, opaque, dmut) { false }
+      if not all_demands_local(tab, c, locals, escaped, opaque, dmut) { false }
       else { match m {
-        Some(mx) -> all_demands_local(mx, locals, escaped, opaque, dmut)
+        Some(mx) -> all_demands_local(tab, mx, locals, escaped, opaque, dmut)
         None     -> true
       } }
     }
-    SExprStmt(x)                -> all_demands_local(x, locals, escaped, opaque, dmut)
+    SExprStmt(x)                -> all_demands_local(tab, x, locals, escaped, opaque, dmut)
     SIndexAssign(b, i, v, _, _) ->
-      if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
-      else if not all_demands_local(i, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(v, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, b, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(tab, i, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, v, locals, escaped, opaque, dmut) }
     SAssign(b, v, _, _) ->
-      if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(v, locals, escaped, opaque, dmut) }
-    SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, opaque, dmut)
+      if not all_demands_local(tab, b, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(tab, v, locals, escaped, opaque, dmut) }
+    SVar(_, _, rhs, _, _)       -> all_demands_local(tab, rhs, locals, escaped, opaque, dmut)
     SUse(_, _, _)               -> true
   }
 }
 
-fn all_demands_local_in_arms(arms: [Arm], locals: [String], escaped: [String],
-                              opaque: [String], dmut: [String]) : Bool = match arms {
+fn all_demands_local_in_arms(tab: SymTab, arms: [Arm], locals: [LocalId], escaped: [LocalId],
+                              opaque: [LocalId], dmut: [SymId]) : Bool = match arms {
   []           -> true
   [h, ...rest] -> match h {
     Arm(_, g, b) -> {
       let g_ok = match g {
-        Some(gx) -> all_demands_local(gx, locals, escaped, opaque, dmut)
+        Some(gx) -> all_demands_local(tab, gx, locals, escaped, opaque, dmut)
         None     -> true
       }
       if not g_ok { false }
-      else if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local_in_arms(rest, locals, escaped, opaque, dmut) }
+      else if not all_demands_local(tab, b, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_arms(tab, rest, locals, escaped, opaque, dmut) }
     }
   }
 }
 
-fn all_demands_local_in_hclauses(cs: [HClause], locals: [String],
-                                  escaped: [String], opaque: [String], dmut: [String]) : Bool = match cs {
+fn all_demands_local_in_hclauses(tab: SymTab, cs: [HClause], locals: [LocalId],
+                                  escaped: [LocalId], opaque: [LocalId], dmut: [SymId]) : Bool = match cs {
   []           -> true
   [h, ...rest] -> match h {
     HC(_, _, b, _, _) ->
-      if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local_in_hclauses(rest, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, b, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_hclauses(tab, rest, locals, escaped, opaque, dmut) }
   }
 }
 
-fn all_demands_local_in_field_inits(fs: [FieldInit], locals: [String],
-                                     escaped: [String], opaque: [String], dmut: [String]) : Bool = match fs {
+fn all_demands_local_in_field_inits(tab: SymTab, fs: [FieldInit], locals: [LocalId],
+                                     escaped: [LocalId], opaque: [LocalId], dmut: [SymId]) : Bool = match fs {
   []           -> true
   [h, ...rest] -> match h {
     FI(_, v) ->
-      if not all_demands_local(v, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local_in_field_inits(rest, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, v, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_field_inits(tab, rest, locals, escaped, opaque, dmut) }
   }
 }
 
-fn all_demands_local_in_list_elems(els: [ListElem], locals: [String],
-                                    escaped: [String], opaque: [String], dmut: [String]) : Bool = match els {
+fn all_demands_local_in_list_elems(tab: SymTab, els: [ListElem], locals: [LocalId],
+                                    escaped: [LocalId], opaque: [LocalId], dmut: [SymId]) : Bool = match els {
   []           -> true
   [h, ...rest] -> match h {
     ElPlain(x) ->
-      if not all_demands_local(x, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local_in_list_elems(rest, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, x, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_list_elems(tab, rest, locals, escaped, opaque, dmut) }
     ElSpread(x) ->
-      if not all_demands_local(x, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local_in_list_elems(rest, locals, escaped, opaque, dmut) }
+      if not all_demands_local(tab, x, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_list_elems(tab, rest, locals, escaped, opaque, dmut) }
   }
 }
 
-fn synth_record_lit(st: InferState, rh: DeclRef, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred / Console + File + Mutable {
+fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  # disambiguate same-(name, arity) record collisions by
-  # field name. `synth_record_lit` is called with the construction's
-  # `[FieldInit]`; use the first init's name to pick the `RI` whose
-  # declared field set includes that name. Two arity-0 `Thread`
-  # records (private core + user redeclaration) are distinguished
-  # this way: the user's `Thread { id, name }` literal probes for
-  # `id` and matches the user's `RI`; the core's `Thread {
-  # state_id, captures }` literal probes for `state_id` and matches
-  # the core's `RI`. Falls back to bare arity-aware lookup when
-  # no fields are present (zero-field constructions are rare and
-  # arity alone suffices).
-  let probe_field = match fis {
-    [] -> ""
-    [fi, ..._] -> match fi { FI(fnm, _) -> fnm }
-  }
-  let lookup = rec_pick(st.recs, tsh_ref_sym(st_home_view(st), rh, nm), nm, -1, probe_field)
-  match lookup {
+  # The record is the type the reference names from the module under
+  # inference: two modules' homonymous records are two declarations, and
+  # each literal reaches its reader's. The typed literal carries that
+  # declaration's id.
+  let named = tsh_tycon_at(st_home_view(st), rh, [])
+  let rsym = ty_head_sym(named)
+  match rec_pick(st.recs, rsym) {
     None -> {
       let r = synth_field_inits(st, fis, [], line, col)
-      let ty = tsh_tycon(st_home_view(st), nm, [])
-      let root = with_ty(mk_expr(ERecordLit(rh, nm, r.fis), line, col), ty)
-      mk_inferred(r.st, ty, root)
+      let root = with_ty(mk_expr(ERecordLit(rh, r.fis), line, col), named)
+      mk_inferred(r.st, named, root)
     }
     Some(ri) -> {
       let inst = rec_instantiate(st, ri)
       let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
-      let st1 = check_record_lit_fields(r.st, nm, fis, inst.fields, line, col)
+      let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
       let ty = apply_ty(st1.sub, inst.result_ty)
-      let root = with_ty(mk_expr(ERecordLit(rh, nm, r.fis), line, col), ty)
+      let root = with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)
       mk_inferred(st1, ty, root)
     }
   }
 }
 
-fn check_record_lit_fields(st: InferState, nm: String, fis: [FieldInit], fields: [FTy],
+fn check_record_lit_fields(st: InferState, rsym: SymId, fis: [FieldInit], fields: [FTy],
                            line: Int, col: Int) : InferState / Console + File {
   let given = map(fis, (fi) => match fi { FI(fnm, _) -> fnm })
-  foldl(record_lit_field_errors(nm, given, fty_names(fields)), st, (s, msg) => {
+  foldl(record_lit_field_errors(written_text(decl_name(st.env.tab, rsym)), given, fty_names(fields)), st, (s, msg) => {
     let perr = mk_diag(SevError, s.file, line, col, msg, [])
     render_diag(perr)
     st_bump_err(st_push_diag(s, perr))
@@ -14441,10 +14286,10 @@ fn check_record_lit_fields(st: InferState, nm: String, fis: [FieldInit], fields:
 # unifier reports it.
 fn try_lower_decimal_uom_lit(value: Expr, expected: Ty, bh: String) : Expr {
   match expected {
-    TyDimT(TyCon(_, _, _, dsym), u_field) -> match value.kind {
+    TyDimT(TyCon(dsym, _), u_field) -> match value.kind {
       ELitUnit(inner, u_lit) ->
         if ty_is(dsym, CdDecimal) and inf_unit_eq(u_lit, u_field) {
-          let dec = TyCon(None, core_decl_ty_name(CdDecimal), [], dsym)
+          let dec = TyCon(dsym, [])
           match mint_literal(inner, dec, bh) {
             MintOk(e) -> with_ty(e, TyDimT(dec, unit_canon(u_field)))
             _ -> value
@@ -14507,7 +14352,7 @@ fn refine_flow(m: MintedExpr, want: Ty, what: String, line: Int, col: Int) : Min
   let e = m.pair.expr
   let built = match e.kind {
     EList(_)      -> true
-    ECall(c, _)   -> callee_ctor_name(c) != None
+    ECall(c, _)   -> callee_is_ctor(m.st.env.tab, c)
     _             -> false
   }
   if built { m } else {
@@ -14539,34 +14384,35 @@ fn rf_keep_result(want: Ty, have: Ty) : Ty = match want {
   _ -> want
 }
 
-# Every type of `name` the program declares, with its parameters and
+# The type a declaration defines, with its parameters and
 # the types its values hold, so variance reads the definition.
-fn st_ty_defs(st: InferState) : (String) -> [TyDef] =
-  (name) => list_append(rec_defs_named(st.recs, name), sum_defs_named(st.sums, name))
+fn st_ty_defs(st: InferState) : (SymId) -> [TyDef] =
+  (s) => list_append(rec_defs_of(st.recs, s), sum_defs_of(st.sums, s))
 
-fn rec_defs_named(rs: [RecInfo], name: String) : [TyDef] = match rs {
+fn rec_defs_of(rs: [RecInfo], s: SymId) : [TyDef] = match rs {
   [] -> []
-  [RI(n, tps, fs, _, _), ...rest] ->
-    if n == name { [TyDef(tps, map(fs, (f) => match f { FD(_, _, te, _) -> te })), ...rec_defs_named(rest, name)] }
-    else { rec_defs_named(rest, name) }
+  [RI(n, tps, fs, _), ...rest] ->
+    if sym_same(n, s) { [TyDef(tps, map(fs, (f) => match f { FD(_, _, te, _) -> te })), ...rec_defs_of(rest, s)] }
+    else { rec_defs_of(rest, s) }
 }
 
-fn sum_defs_named(ss: [SumInfo], name: String) : [TyDef] = match ss {
+fn sum_defs_of(ss: [SumInfo], s: SymId) : [TyDef] = match ss {
   [] -> []
   [SI(n, tps, vs, _), ...rest] ->
-    if n == name { [TyDef(tps, flat_map(vs, (v) => match v { Var(_, args_) -> args_ })), ...sum_defs_named(rest, name)] }
-    else { sum_defs_named(rest, name) }
+    if sym_same(n, s) { [TyDef(tps, flat_map(vs, (v) => match v { Var(_, args_) -> args_ })), ...sum_defs_of(rest, s)] }
+    else { sum_defs_of(rest, s) }
 }
 
 fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, what: String, line: Int, col: Int, note: String) : InferState / Console + File = match miss {
   RvMiss(pol, h, w, p) -> {
-    let pred = fmt_expr_text(p)
+    let tab = st.env.tab
+    let pred = rv_pred_text(tab, p)
     let why = if pol == 1 {
-      concat_all(["`", rv_text(have), "` does not narrow to `", rv_text(want), "`: inside a generic type nothing checks `", pred, "`; map the value through a function that checks it"])
+      concat_all(["`", rv_text(tab, have), "` does not narrow to `", rv_text(tab, want), "`: inside a generic type nothing checks `", pred, "`; map the value through a function that checks it"])
     } else if pol == 2 {
-      concat_all(["`", rv_text(have), "` does not fit `", rv_text(want), "`: a function taking `", rv_text(h), "` cannot stand in for one taking `", rv_text(w), "`"])
+      concat_all(["`", rv_text(tab, have), "` does not fit `", rv_text(tab, want), "`: a function taking `", rv_text(tab, h), "` cannot stand in for one taking `", rv_text(tab, w), "`"])
     } else {
-      concat_all(["`", rv_text(have), "` does not fit `", rv_text(want), "`: a mutable type keeps its refinements exactly, and these differ in `", pred, "`"])
+      concat_all(["`", rv_text(tab, have), "` does not fit `", rv_text(tab, want), "`: a mutable type keeps its refinements exactly, and these differ in `", pred, "`"])
     }
     let perr = mk_diag(SevError, st.file, line, col, concat_all([what, ": ", why, note]), [])
     render_diag(perr)
@@ -14574,13 +14420,17 @@ fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, what: S
   }
 }
 
-fn rv_text(t: Ty) : String = match t {
-  TyRefineT(b, p)       -> concat_all([rv_text(b), " where ", fmt_expr_text(p)])
-  TyListT(x)            -> concat_all(["[", rv_text(x), "]"])
-  TyCon(_, n, [], _)    -> n
-  TyCon(_, n, args_, _) -> concat_all([n, "[", string_join(map(args_, (a) => rv_text(a)), ", "), "]"])
-  TyFnT(ps, r, _)       -> concat_all(["(", string_join(map(ps, (a) => rv_text(a)), ", "), ") -> ", rv_text(r)])
-  _                     -> inf_ty_to_string(t)
+# A refinement predicate belongs to a type: the resolver never reaches
+# it, so it reads no local and prints with no binder names.
+fn rv_pred_text(tab: SymTab, p: Expr) : String = fmt_expr_text(p, tab, ln_empty())
+
+fn rv_text(tab: SymTab, t: Ty) : String = match t {
+  TyRefineT(b, p)  -> concat_all([rv_text(tab, b), " where ", rv_pred_text(tab, p)])
+  TyListT(x)       -> concat_all(["[", rv_text(tab, x), "]"])
+  TyCon(s, [])     -> "#{decl_name(tab, s)}"
+  TyCon(s, args_)  -> concat_all(["#{decl_name(tab, s)}", "[", string_join(map(args_, (a) => rv_text(tab, a)), ", "), "]"])
+  TyFnT(ps, r, _)  -> concat_all(["(", string_join(map(ps, (a) => rv_text(tab, a)), ", "), ") -> ", rv_text(tab, r)])
+  _                -> inf_ty_to_string(tab, t)
 }
 
 fn refine_coerce_applied(m: MintedExpr, want: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable {
@@ -14600,7 +14450,10 @@ fn refine_coerce_value(m: MintedExpr, want: Ty, what: String, line: Int, col: In
   match rc_verdict(want, m.pair.expr, apply_ty(m.st.sub, m.pair.ty)) {
     RcProven -> m
     RcRefuted(why) -> {
-      let perr = mk_diag(SevError, m.st.file, line, col, concat_all([what, ": ", why]), [])
+      # The refuted value and the refinement it carries read the locals in scope.
+      let names = st_local_names(m.st, m.pair.expr)
+      let show = (e) => fmt_expr_text(e, m.st.env.tab, names)
+      let perr = mk_diag(SevError, m.st.file, line, col, concat_all([what, ": ", loose_text(why, show, show)]), [])
       render_diag(perr)
       MintedExpr { st: st_bump_err(st_push_diag(m.st, perr)), pair: m.pair }
     }
@@ -14635,7 +14488,7 @@ fn refine_call(st: InferState, callee: Expr, callee_ty: Ty, args_: [Expr], arg_t
       let have = zip_with(args_, arg_tys, (a, t) => lambda_have(st, a, apply_ty(st.sub, t)))
       let binds = rv_call_binds(ps, have)
       let wants = map(ps, (p) => apply_ty(st.sub, rc_subst(p, rv_pairs_of(binds))))
-      let st1 = refine_args_flow(st, args_, have, wants, binds, 1, callee_label(callee))
+      let st1 = refine_args_flow(st, args_, have, wants, binds, 1, callee_label(st, callee))
       let refined = if binds == [] and not rc_mentions(ret) { ty } else { apply_ty(st1.sub, rc_subst(ret, rv_pairs_of(binds))) }
       RefCall(st1, refined)
     }
@@ -14650,7 +14503,7 @@ fn rc_mentions_in(s: Subst, t: Ty) : Bool = match t {
     None    -> false
   }
   TyListT(x)            -> rc_mentions_in(s, x)
-  TyCon(_, _, args_, _) -> rc_any_mentions_in(s, args_)
+  TyCon(_, args_)       -> rc_any_mentions_in(s, args_)
   TyFnT(ps, r, _)       -> rc_mentions_in(s, r) or rc_any_mentions_in(s, ps)
   _                     -> false
 }
@@ -14666,7 +14519,7 @@ fn refine_args_flow(st: InferState, args_: [Expr], have: [Ty], wants: [Ty], bind
       [w, ...wrest] -> {
         let built = match a.kind {
           EList(_)    -> true
-          ECall(c, _) -> callee_ctor_name(c) != None
+          ECall(c, _) -> callee_is_ctor(st.env.tab, c)
           _           -> false
         }
         let target = match a.kind {
@@ -14701,11 +14554,29 @@ fn expr_tail(e: Expr) : Expr = match e.kind {
   _                  -> e
 }
 
-fn callee_label(c: Expr) : String = match c.kind {
-  EName(n)        -> concat_all([" of `", n, "`"])
-  EModCall(_, n) -> concat_all([" of `", n, "`"])
-  ESym(_, _, n)  -> concat_all([" of `", n, "`"])
+fn callee_label(st: InferState, c: Expr) : String = match c.kind {
+  EName(n)       -> " of `#{n}`"
+  EModCall(_, n) -> " of `#{n}`"
+  ESym(s, _)     -> " of `#{decl_name(st.env.tab, s)}`"
+  ELocal(l)      -> " of `#{st_local_text(st, l)}`"
   _              -> ""
+}
+
+# The name the local `l` was bound with, for a diagnostic.
+fn st_local_text(st: InferState, l: LocalId) : Written = local_text_in(st.env.entries, l)
+
+fn local_text_in(es: [TyEntry], l: LocalId) : Written = match es {
+  [] -> written("")
+  [e, ...rest] -> match e.key {
+    KLocal(b) -> if local_eq(b.id, l) { b.name } else { local_text_in(rest, l) }
+    _         -> local_text_in(rest, l)
+  }
+}
+
+# The names a diagnostic printing `e` needs: `e` itself when it reads a local.
+fn st_local_names(st: InferState, e: Expr) : LocalNames = match e.kind {
+  ELocal(l) -> ln_with_binder(ln_empty(), Binder { id: l, name: st_local_text(st, l) })
+  _         -> ln_empty()
 }
 
 # Where a join widened a type variable, so a later mismatch names it.
@@ -14719,8 +14590,8 @@ fn widened_note(args_: [Expr], binds: [RvBind]) : String = match nth(args_, rv_w
 # coerces each argument to the declared payload type.
 fn coerce_ctor_args(st: InferState, callee: Expr, args_: [Expr], arg_tys: [Ty], callee_ty: Ty) : InferredList / Console + File + Mutable =
   if not list_any_may_owe(fn_param_tys(st, callee_ty)) { InferredList { st: st, tys: arg_tys, exprs: args_ } }
-  else { match callee_ctor_name(callee) {
-    Some(cn) -> coerce_args_to(st, args_, arg_tys, fn_param_tys(st, callee_ty), concat_all(["argument of `", cn, "`"]))
+  else { match callee_ctor_name(st.env.tab, callee) {
+    Some(cn) -> coerce_args_to(st, args_, arg_tys, fn_param_tys(st, callee_ty), "argument of `#{cn}`")
     None     -> InferredList { st: st, tys: arg_tys, exprs: args_ }
   } }
 
@@ -14757,13 +14628,13 @@ fn fn_ret_only(t: Ty) : Ty = match t {
 # refined type the expectation gives its variable, as `Some(v)` does
 # for an `Option[Pos]`.
 fn ctor_coerce_expected(r: Inferred, expected: Ty) : Inferred / Console + File + Mutable = match r.expr.kind {
-  ECall(c, args_) -> match callee_ctor_name(c) {
+  ECall(c, args_) -> match callee_ctor_name(r.st.env.tab, c) {
     Some(cn) -> if not rc_mentions(apply_ty(r.st.sub, expected)) { r } else { match ctor_fresh_sig(r.st.env, c) {
       TyFnT(ps, res, _) -> {
         let binds = rc_var_binds(res, apply_ty(r.st.sub, expected))
         if binds == [] { r } else {
           let ca = coerce_args_to(r.st, args_, map(args_, (a) => typed_ty_or(a, TyAny)),
-                                  map(ps, (p) => rc_subst(p, binds)), concat_all(["argument of `", cn, "`"]))
+                                  map(ps, (p) => rc_subst(p, binds)), "argument of `#{cn}`")
           mk_inferred(ca.st, r.ty, Expr { ...r.expr, kind: ECall(c, ca.exprs) })
         }
       }
@@ -14775,26 +14646,33 @@ fn ctor_coerce_expected(r: Inferred, expected: Ty) : Inferred / Console + File +
 }
 
 fn ctor_fresh_sig(env: TyEnv, c: Expr) : Ty = match c.kind {
-  EName(n) -> match ty_env_lookup(env, n) {
-    Some(sc) -> instantiate(env, sc).ty
-    None     -> TyAny
-  }
-  EModCall(m, n) -> match ty_env_lookup_qualified(env, m, n) {
+  ESym(s, _) -> match env_sym(env, s) {
     Some(sc) -> instantiate(env, sc).ty
     None     -> TyAny
   }
   _ -> TyAny
 }
 
-fn callee_ctor_name(callee: Expr) : Option[String] = match callee.kind {
-  EName(n)        -> if name_is_ctor(n) { Some(n) } else { None }
-  EModCall(_, n) -> if name_is_ctor(n) { Some(n) } else { None }
+# The constructor a callee names, as a diagnostic spells it: a settled
+# callee by its declaration, one the typer has yet to settle by the
+# constructors its written name can denote.
+fn callee_ctor_name(tab: SymTab, callee: Expr) : Option[Written] = match callee.kind {
+  ESym(s, _)     -> if inf_is_ctor(tab, s) { Some(sym_name(tab, s)) } else { None }
+  EName(n)       -> if name_is_ctor(tab, n) { Some(n) } else { None }
+  EModCall(_, n) -> if name_is_ctor(tab, n) { Some(n) } else { None }
   _              -> None
 }
 
-fn name_is_ctor(n: String) : Bool = match char_at(n, 0) {
-  Some(c) -> ch_is_upper(c)
+fn callee_is_ctor(tab: SymTab, callee: Expr) : Bool = match callee_ctor_name(tab, callee) {
+  Some(_) -> true
   None    -> false
+}
+
+fn inf_is_ctor(tab: SymTab, s: SymId) : Bool = st_valid(tab, s) and ncls_same(sym_class(tab, s), NCCtor)
+
+fn name_is_ctor(tab: SymTab, n: Written) : Bool = match st_candidates(tab, NCCtor, written_text(n)) {
+  [] -> false
+  _  -> true
 }
 
 fn coerce_args_to(st: InferState, args_: [Expr], arg_tys: [Ty], params: [Ty], what: String) : InferredList / Console + File + Mutable =
@@ -14834,14 +14712,18 @@ fn typed_ty_or(e: Expr, fallback: Ty) : Ty = match e.ty {
 fn field_what(fnm: String) : String = string_concat("record field '", string_concat(fnm, "'"))
 
 fn binding_what(pat: Pattern, fallback: String) : String = match pat.pkind {
-  PBind(n) -> concat_all(["binding `", if string_ends_with(n, "__ann") { string_slice(n, 0, string_length(n) - 5) } else { n }, "`"])
+  PBind(b) -> {
+    let n = written_text(b.name)
+    concat_all(["binding `", if string_ends_with(n, "__ann") { string_slice(n, 0, string_length(n) - 5) } else { n }, "`"])
+  }
   _        -> fallback
 }
 
 fn refine_checked(st: InferState, v: Expr, vty: Ty, preds: [Expr], strip: Bool) : Inferred / Console + File + Mutable {
-  let pat = mk_pat(PBind("__rv"), v.line, v.col)
-  let checks = synth_stmts(check_pattern(st, pat, vty), map(preds, (p) => rc_assert("__rv", p, st.refine_ctx, strip)))
-  let tail = synth(checks.st, mk_ref("__rv", v.line, v.col))
+  let rv = binder_minted("__rv")
+  let pat = mk_pat(PBind(rv), v.line, v.col)
+  let checks = synth_stmts(check_pattern(st, pat, vty), map(preds, (p) => rc_assert(rv, p, st.refine_ctx, strip)))
+  let tail = synth(checks.st, mk_local(rv.id, v.line, v.col))
   let block = mk_expr(EBlock([SLet(pat, None, v), ...checks.stmts], Some(tail.expr)), v.line, v.col)
   mk_inferred(st_restore_entries(st, tail.st), vty, with_ty(block, vty))
 }
@@ -14898,8 +14780,7 @@ fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 fn synth_mint_decimal(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
-  let dec_name = core_decl_ty_name(CdDecimal)
-  let dec = TyCon(None, dec_name, [], tsh_decl_sym(st.env.ty_homes, Some(core_decl_ty_home(CdDecimal)), dec_name))
+  let dec = TyCon(core_decl_ty_id(CdDecimal), [])
   match mint_literal(e, dec, mint_bigint_home(st.env)) {
     MintOk(e2) -> {
       let ty = match e2.ty { Some(t) -> t None -> dec }
@@ -15011,12 +14892,10 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let amb_st = match ann {
         None -> match rhs.kind {
           ECall(c, _) -> match c.kind {
-            EName(nm)    -> report_ctor_ambiguity_if_any(st, nm, c.line, c.col)
-            ESym(_, _, nm) -> report_ctor_ambiguity_if_any(st, nm, c.line, c.col)
+            EName(nm) -> report_ctor_ambiguity_if_any(st, nm, c.line, c.col)
             _ -> st
           }
-          EName(nm)    -> report_ctor_ambiguity_if_any(st, nm, rhs.line, rhs.col)
-          ESym(_, _, nm) -> report_ctor_ambiguity_if_any(st, nm, rhs.line, rhs.col)
+          EName(nm) -> report_ctor_ambiguity_if_any(st, nm, rhs.line, rhs.col)
           _ -> st
         }
         Some(_) -> st
@@ -15029,7 +14908,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       # synthesised RHS type, which is preserved in both paths.
       # same routing for `EIf` via `check_if`.
       let rr = match ann {
-        Some(te) -> match sym_local_kind(rhs.kind) {
+        Some(te) -> match rhs.kind {
           EMatch(_, _) -> {
             let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
@@ -15051,15 +14930,18 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
             let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
-          # route ECall/EVar with annotation
-          # context through check_expr_against so a bare ctor whose
-          # qualified `<parent>::<cname>` matches the annotation
-          # resolves to the qualified scheme.
+          # route a call, a bare name and a local read with annotation
+          # context through check_expr_against so a bare ctor the
+          # annotation's type declares resolves to that constructor.
           ECall(_, _) -> {
             let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EName(_) -> {
+            let exp_resolved = st_annot_ty(amb_st, te)
+            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+          }
+          ELocal(_) -> {
             let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
@@ -15112,8 +14994,8 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
         fixed_vec_unbrand(binding_ty0)
       } else { binding_ty0 }
       let dup_st = check_pattern_no_dup_binds(binding_st, pat)
-      let after = check_pattern(dup_st, pat, binding_ty)
-      OneStmt { st: after, stmt: SLet(pat, ann, lower_pair.expr) }
+      let after = check_pattern_stamped(dup_st, pat, binding_ty)
+      OneStmt { st: after.st, stmt: SLet(after.pat, ann, lower_pair.expr) }
     }
     SAssert(cond, msg) -> {
       let rc = synth_assert_cond(st, cond, contract_assert_kind(msg))
