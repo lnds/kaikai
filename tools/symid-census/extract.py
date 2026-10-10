@@ -60,6 +60,20 @@ def balanced(s, i):
             if d == 0: return j
     return -1
 
+STR = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+def compared_literal(code):
+    """The first string literal that is an operand of `==` / `!=`; an operator inside a literal is text."""
+    lits = []
+    def mask(m):
+        lits.append(m.group(0)[1:-1])
+        return "\x00%d\x00" % (len(lits) - 1)
+    masked = STR.sub(mask, code)
+    m = re.search(r'(?:==|!=)\s*\x00(\d+)\x00|\x00(\d+)\x00\s*(?:==|!=)', masked)
+    if not m:
+        return None
+    return lits[int(m.group(1) if m.group(1) is not None else m.group(2))]
+
 def lit_shape(t):
     if t == "": return "empty"
     if re.fullmatch(r'[a-z_][A-Za-z0-9_]*', t): return "lower"
@@ -112,9 +126,9 @@ for fname in sorted(os.listdir(SRC)):
         elif re.search(r'string_starts_with\([^)]*"__', code):
             rows.append((fname, ln, cur_fn, "lit", "__prefix", code.strip()[:200]))
         else:
-            m = re.search(r'(?:==|!=)\s*"([^"]*)"|"([^"]*)"\s*(?:==|!=)', code)
-            if m:
-                rows.append((fname, ln, cur_fn, "lit", "==" + lit_shape(m.group(1) if m.group(1) is not None else m.group(2)), code.strip()[:200]))
+            lit = compared_literal(code)
+            if lit is not None:
+                rows.append((fname, ln, cur_fn, "lit", "==" + lit_shape(lit), code.strip()[:200]))
             elif re.match(r'\s*"[^"]*"\s*->', code):
                 rows.append((fname, ln, cur_fn, "lit", "match", code.strip()[:200]))
 
