@@ -51,6 +51,7 @@ import compiler.fn_bounds
 import compiler.call_site_check
 import compiler.parse
 import compiler.surface_lower
+import compiler.refine_settle
 import compiler.resolve
 import compiler.symtab_build
 import compiler.core_syms
@@ -162,6 +163,14 @@ fn wants_law_checks(m: Mode) : Bool = match m {
   _          -> false
 }
 
+# A build whose binary starts the runner of its test, bench or check blocks.
+fn runs_blocks(m: Mode) : Bool = match m {
+  MTest      -> true
+  MBench     -> true
+  MPropCheck -> true
+  _          -> false
+}
+
 # Typecheck-only: ride the build arm's front-end (same proto registry,
 # head-owner cache, kind theories, post-typer validations) and stop
 # before monomorphisation, so diagnostics are identical to a build's
@@ -200,9 +209,9 @@ fn is_report_mode(m: Mode) : Bool = match m {
   _ -> false
 }
 
-# `hidden` names the top-level bindings the root file cannot reach, which
+# `hidden` holds the top-level declarations the root file cannot reach, which
 # a hole report must not offer.
-fn run_report_dump(m: Mode, df: DiagFiles, hidden: [String], tp: TypedProgram, tab: SymTab,
+fn run_report_dump(m: Mode, df: DiagFiles, hidden: [SymId], tp: TypedProgram, tab: SymTab,
       doc_items: [DocItem]) : Int / Console + File = {
   let path = df_root(df)
   match m {
@@ -2578,9 +2587,10 @@ fn decl_partition_home(d: Decl) : Option[String] = match d {
 #    anyway, so the qualified-key registration `add_decls_loop`
 #    would do for them is unreachable.
 #
-# 2. The entry point stays untagged even when `pub`: its emitted symbol
-#    key stays bare, the one the C emitter spells `kai_main` for the
-#    runtime to call.
+# 2. The entry point stays untagged even when `pub`: it is defined in
+#    the root unit, beside the startup that calls it. A `main` the
+#    binary does not start is tagged even when private: its bare symbol
+#    is the one the OS starts.
 #
 # 3. DFns that ALREADY carry a `module_origin = Some(_)` stay
 #    untouched. Those came from `expand_imports` (an `import foo`
@@ -2588,22 +2598,23 @@ fn decl_partition_home(d: Decl) : Option[String] = match d {
 #    so re-tagging would rename `kai_foo__bar` to `kai_<target>__bar`
 #    and break the qualified call from the user's `foo.bar()` site,
 #    which still emits `kai_foo__bar` from `EModCall("foo", "bar")`.
-fn tag_target_decls_module_origin(ds: [Decl], mod: String) : [Decl] = match ds {
-  [] -> []
-  [d, ...rest] -> [tag_target_decl(d, mod), ...tag_target_decls_module_origin(rest, mod)]
-}
+fn tag_target_decls_module_origin(ds: [Decl], mod: String, entry: SymId) : [Decl] =
+  map(ds, (d) => tag_target_decl(d, mod, main_id(mod), entry))
 
-fn tag_target_decl(d: Decl, mod: String) : Decl = match d {
+# `own_main` is the id of the target's `main`, `entry` what the binary starts.
+fn tag_target_decl(d: Decl, mod: String, own_main: SymId, entry: SymId) : Decl = match d {
   DFn(p, f, _, _, _, _, _, _, _, mo) ->
     match mo {
       Some(_) -> d
-      None    -> if p and not is_entry(entry_id(mod), f) { tag_decl_module_origin(d, mod) } else { d }
+      None    -> if is_entry(entry, f) { d }
+                 else if p or is_main(own_main, f) { tag_decl_module_origin(d, mod) }
+                 else { d }
     }
-  DDerive(ps, inner, l, c) -> DDerive(ps, tag_target_decl(inner, mod), l, c)
-  DUnstable(inner, l, c) -> DUnstable(tag_target_decl(inner, mod), l, c)
-  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, tag_target_decl(inner, mod), l, c, mo)
-  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, tag_target_decl(inner, mod), l, c, mo)
-  DConstructor(inner, l, c) -> DConstructor(tag_target_decl(inner, mod), l, c)
+  DDerive(ps, inner, l, c) -> DDerive(ps, tag_target_decl(inner, mod, own_main, entry), l, c)
+  DUnstable(inner, l, c) -> DUnstable(tag_target_decl(inner, mod, own_main, entry), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, tag_target_decl(inner, mod, own_main, entry), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, tag_target_decl(inner, mod, own_main, entry), l, c, mo)
+  DConstructor(inner, l, c) -> DConstructor(tag_target_decl(inner, mod, own_main, entry), l, c)
   # Same carve-out as tag_target_decl's DFn arm — only `pub` axioms
   # get the module stamp. A non-pub axiom (rare, but
   # legal as an in-file FFI helper) keeps the bare `kai_<name>` symbol
@@ -4553,8 +4564,8 @@ fn ec_key_decl_id(d: Decl, tab: SymTab, specs: SpecNames, target: String) : Stri
 # carries a lambda body's `line`/`col`, so admitting it would let a plain
 # body edit that adds, removes, or moves a specialisable HOF call re-key
 # the core surface. It cannot perturb a core TU, so it stays out.
-fn ec_decl_is_cspec(d: Decl, tab: SymTab, specs: SpecNames) : Bool = match d {
-  DFn(_, f, _, _, _, _, _, _, _, _) -> string_contains("#{fn_emit_name(tab, specs, f)}", "__cspec__")
+fn ec_decl_is_cspec(d: Decl, tab: SymTab) : Bool = match d {
+  DFn(_, f, _, _, _, _, _, _, _, _) -> match sym_mint(tab, fnid_sym(f)) { NmSpec -> true  _ -> false }
   _ -> false
 }
 
@@ -4565,7 +4576,7 @@ fn ec_key_user_ids(decls: [Decl], tab: SymTab, specs: SpecNames, core_names: [St
       None -> false
       Some(m) -> list_has(core_names, m)
     }
-    if is_core or ec_decl_is_cspec(d, tab, specs) { ec_key_user_ids(rest, tab, specs, core_names, target, acc) }
+    if is_core or ec_decl_is_cspec(d, tab) { ec_key_user_ids(rest, tab, specs, core_names, target, acc) }
     else { ec_key_user_ids(rest, tab, specs, core_names, target, [ec_key_decl_id(d, tab, specs, target), ...acc]) }
   }
 }
@@ -4597,7 +4608,7 @@ fn core_emit_key(cc: CoreCacheOpt, edition: Option[Edition], decls: [Decl], tab:
 # participate: test/bench shapes skip the cache instead of folding the
 # shape into the key.
 fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymTab, specs: SpecNames,
-                             ids: ProtoIds, bmode: BuildMode, target_mod_name: String,
+                             ids: ProtoIds, bmode: BuildMode, target_mod_name: String, entry: SymId,
                              regions: [RegionMark], cc: CoreCacheOpt,
                              core_mods: [ModuleEntry], edition: Option[Edition], stamp_ids: [SymId])
                              : String / Console + File + Mutable = {
@@ -4606,10 +4617,10 @@ fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymT
   let key = if plain { core_emit_key(cc, edition, decls, tab, specs, cacheable, target_mod_name) } else { "" }
   if key == "" {
     let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
-    emit_program_modular(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), regions, stamp_ids)
+    emit_program_modular(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), entry, regions, stamp_ids)
   } else {
     let cached = match ec_lookup(cc.dir, key) { None -> [] Some(tus) -> tus }
-    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), regions, cached, cacheable, stamp_ids) {
+    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), entry, regions, cached, cacheable, stamp_ids) {
       EMO(stream, fresh) -> {
         let n_hit = list_length(cached)
         let _w = if n_hit == 0 and list_length(fresh) > 0 {
@@ -4649,6 +4660,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
         # The root file's declarations are homed at the build target.
         let target_mod_name = module_name_of_path(path)
         let roots = roots_of(target_mod_name, map(test_roots, (r) => module_home(r, core_mods)))
+        # What the binary starts; every pass below is handed this one id.
+        let entry = entry_id(target_mod_name, runs_blocks(mode))
         let parsed = parse_program(path, src, tokens, target_mod_name)
         # The root file's own names, for the stages that stop before the
         # program's table exists.
@@ -4776,8 +4789,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # inside `stdlib/core/option.kai` cannot say
             # `option.map(o, f)` — rqc rejects the qualifier when only
             # core files are registered. Tag the target's DFns with
-            # `module_origin = Some(<basename>)` (skipping only `main`
-            # so the C harness's `kai_main()` call still links) so
+            # `module_origin = Some(<basename>)` (skipping only the entry
+            # point, which stays in the root unit) so
             # `add_decls_loop` registers them under the qualified key
             # `<mod>::<fname>`, matching the core path. This makes
             # self-qualified calls inside the target route through the
@@ -4786,7 +4799,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let target_exports = collect_pub_exports(expanded_decls_raw, tab0, [])
             let target_unstable = collect_unstable_exports(expanded_decls_raw, tab0, [])
             let target_me = ME(target_mod_name, target_exports, path, target_unstable)
-            let expanded_decls = tag_target_decls_module_origin(expanded_decls_raw, target_mod_name)
+            let expanded_decls = tag_target_decls_module_origin(expanded_decls_raw, target_mod_name, entry)
             # Free-fn protocol bounds for the root file. Stdlib/core
             # bounded aggregates already dispatch their op via a `_loop`
             # helper, so the existing post-mono validator covers them;
@@ -5131,8 +5144,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # (`type Pos = Int where p`) expand to their inline
             # `TyRefine` form at every use site (the synthesised
             # `__ref_pred_X` fns and the pattern-narrow lowering have
-            # already run).
-            let ta_table = collect_transparent_aliases(raw_decls_post_eff, tab3,
+            # already run). A copy carries the identities the alias's
+            # own module gives its predicate.
+            let raw_decls_settled = settle_alias_refinements(raw_decls_post_eff, tab3, sym_views, target_mod_name)
+            let ta_table = collect_transparent_aliases(raw_decls_settled, tab3,
                                                         eff_names_for_alias, target_mod_name,
                                                         core_mod_names(core_mods, []))
             # Re-run effect-alias expansion after transparent type-alias
@@ -5144,7 +5159,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # syntactically in the decl stream.
             let raw_decls_pre_pos0 =
               expand_aliases_in_decls(
-                expand_ta_decls(raw_decls_post_eff, tab3, ta_table,
+                expand_ta_decls(raw_decls_settled, tab3, ta_table,
                                  alias_res.aliases),
                 tab3, alias_res.aliases)
             # Alias expansion may have inserted bare unit symbols
@@ -5435,7 +5450,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # The typer knows the entry point by id, so the declarations
                 # are stamped first; a resolver error leaves them unstamped.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                dump_evidence_obligations(path, rd.decls, sym_tab, entry_id(target_mod_name))
+                dump_evidence_obligations(path, rd.decls, sym_tab, entry)
               }
               MDumpEvidenceArity -> {
                 # Injection-arity histogram for the §A.3 ABI spike. Runs
@@ -5444,7 +5459,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # reports the per-fn evidence-param count distribution.
                 # Analysis only; exit 0.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                dump_evidence_arity(path, rd.decls, sym_tab, entry_id(target_mod_name))
+                dump_evidence_arity(path, rd.decls, sym_tab, entry)
               }
               MDocJson -> {
                 # Docs are syntactic — dump the side table collected at
@@ -5624,7 +5639,6 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # over carriers this function built.
                       let emit_tab = st_extend(typed_tab, mf.rows)
                       let specs = spec_names_of(spec_names_rows(mf.specs))
-                      let entry = entry_id(target_mod_name)
                       # Per-function evidence obligations, computed pre-mono
                       # and re-keyed onto the specialised symbols. Codegen
                       # reads none of it: the result is exercised, not consumed.
@@ -5692,7 +5706,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # re-emulate perceus's exit-drop computation, so a
                       # change to one has to be mirrored in the other.
                       # Below the erasure a name is a C symbol to spell.
-                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, emit_tab, specs, sym_views, target_mod_name))
+                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, emit_tab, specs, sym_views, target_mod_name, entry))
                       # TCO is mandatory on BOTH backends.
                       # `tcrec_rewrite_decls` is a pure AST→AST pre-pass
                       # that plants the `__kai_tcrec|...` self-tail-call
@@ -5808,9 +5822,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                           emit_kir(perceus_decls, emit_tab, specs, region_marks, kir_inline_on, stamp_ids, entry)
                         } else if use_modular {
                           # Per-module .c/.h stream; the wrapper splits + links.
-                          emit_modular_maybe_cached(path, src, perceus_decls, emit_tab, specs, proto_reg.ids, bmode, target_mod_name, region_marks, core_cache, core_mods, edition, stamp_ids)
+                          emit_modular_maybe_cached(path, src, perceus_decls, emit_tab, specs, proto_reg.ids, bmode, target_mod_name, entry, region_marks, core_cache, core_mods, edition, stamp_ids)
                         } else {
-                          emit_program(path, src, perceus_decls, emit_tab, specs, proto_reg.ids, bmode, Some(target_mod_name), region_marks, stamp_ids)
+                          emit_program(path, src, perceus_decls, emit_tab, specs, proto_reg.ids, bmode, Some(target_mod_name), entry, region_marks, stamp_ids)
                         }
                         match batch_out {
                           # `print` appends a trailing newline; match it

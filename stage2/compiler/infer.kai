@@ -62,6 +62,8 @@ import compiler.infer_index
 import compiler.refinements
 import compiler.refine_coerce
 import compiler.refine_variance
+import compiler.refine_help
+import compiler.refine_types
 import compiler.fmt
 import compiler.cont_type
 import compiler.index_coll
@@ -3723,20 +3725,8 @@ fn shape_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
 # compiler/parse.kai; the kind decoders (tp_kind_is_unit / tp_kind_of /
 # tp_strip_kind / tp_kind_name) live in compiler/kinds.kai.
 
-fn string_ends_with(s: String, suffix: String) : Bool {
-  let sl = string_length(s)
-  let xl = string_length(suffix)
-  if xl > sl { false }
-  else { string_slice(s, sl - xl, xl) == suffix }
-}
-
 # The binder the `var` desugar mints to pin a declared cell type.
-fn pat_binds_var_ann(p: Pattern) : Bool {
-  match p.pkind {
-    PBind(b) -> string_ends_with(written_text(b.name), "__ann")
-    _ -> false
-  }
-}
+fn pat_binds_var_ann(p: Pattern) : Bool = pat_is_var_ann(p)
 
 fn param_ty_with_binds(pm: Param, tpbinds: [TPBind], rbinds: [RVBind],
                        rk: [RowKindEntry], hv: TyHomeView) : Ty {
@@ -8283,10 +8273,10 @@ fn settle_name(st: InferState, q: Option[Written], w: Written, expected: Ty, cs:
   let name = written_text(w)
   match settle_list(ctors_of_type(st.env, ut_ty_sym(apply_ty(st.sub, expected)), name, 4)) {
     SetNone -> match q {
-      None    -> settle_bare(st, w, name, cs)
+      None    -> settle_bare(st, name, cs)
       Some(m) -> match settle_qualified(st, written_text(m), name, cs) {
         SetNone -> if ncls_in(cs, NCFn) { settle_list(bound_syms(st.env, [builtin_sym(name)])) }
-                   else { settle_bare(st, w, name, cs) }
+                   else { settle_bare(st, name, cs) }
         r       -> r
       }
     }
@@ -8358,9 +8348,9 @@ fn opt_syms(os: [Option[SymId]]) : [SymId] = match os {
 # has no tie to report about it. A name no declaration of the classes
 # answers may still be a union's tag, and past that it is whatever else
 # the scope declares under it.
-fn settle_bare(st: InferState, w: Written, name: String, cs: [NCls]) : Settled = match settle_on_ladder(st, name, cs) {
+fn settle_bare(st: InferState, name: String, cs: [NCls]) : Settled = match settle_on_ladder(st, name, cs) {
   SetOne(s) -> SetOne(s)
-  r         -> match shared_dispatcher(st, w, name, cs) {
+  r         -> match shared_dispatcher(st, name, cs) {
     Some(s) -> SetOne(s)
     None    -> match r {
       SetNone -> if list_is_empty(cs) { SetNone } else { settle_unanswered(st, name, cs) }
@@ -8408,9 +8398,14 @@ fn names_a_kind(c: NCls) : Bool = match c {
   _            -> false
 }
 
-fn shared_dispatcher(st: InferState, w: Written, name: String, cs: [NCls]) : Option[SymId] =
-  if not ncls_in(cs, NCFn) or is_none(pid_named_disp(st.protos.ids, w)) { None }
-  else { match ty_env_collect_candidates(st.env, name) {
+# The dispatchers generated under `name`, whichever module holds the
+# protocol: the resolver reaches an operation through the protocol rung,
+# which sees past the reader's imports. They stand for one operation, and
+# the dispatch rewrite finds the impl from the receiver's type whichever
+# of them the call names.
+fn shared_dispatcher(st: InferState, name: String, cs: [NCls]) : Option[SymId] =
+  if not ncls_in(cs, NCFn) { None }
+  else { match filter(ty_env_collect_candidates(st.env, name), (c) => pid_is_disp(st.protos.ids, c.sym)) {
     [c, ..._] -> Some(c.sym)
     []        -> None
   } }
@@ -8636,12 +8631,9 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
         }
       } }
     # A qualified reference the resolver left. Settled here, the node
-    # carries the declaration's id. A dispatcher keeps its qualifier:
-    # the dispatch rewrite reads it as the home whose protocols answer,
-    # which a bare reference to the same dispatcher does not say.
+    # carries the declaration's id.
     EModCall(m, fname) -> match settle_name(st, Some(m), fname, TyAny, value_classes()) {
-      SetOne(s)  -> if pid_is_disp(st.protos.ids, s) { synth_sym_read(st, s, e) }
-                    else { synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) }) }
+      SetOne(s)  -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
       SetTie(ss) -> inferred_leaf(report_name_tie(st, fname, ss, false, e.line, e.col), TyAny, e)
       _ -> {
         # The resolver only leaves a name the module exports, so the
@@ -14372,9 +14364,9 @@ fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, what: S
   }
 }
 
-# A refinement predicate belongs to a type: the resolver never reaches
-# it, so it reads no local and prints with no binder names.
-fn rv_pred_text(tab: SymTab, p: Expr) : String = fmt_expr_text(p, tab, ln_empty())
+# A refinement predicate belongs to a type: the one binder it is sure
+# to read is its own `self`.
+fn rv_pred_text(tab: SymTab, p: Expr) : String = refine_pred_text(p, tab, ln_empty())
 
 fn rv_text(tab: SymTab, t: Ty) : String = match t {
   TyRefineT(b, p)  -> concat_all([rv_text(tab, b), " where ", rv_pred_text(tab, p)])
@@ -14403,7 +14395,7 @@ fn refine_coerce_value(m: MintedExpr, want: Ty, what: String, line: Int, col: In
     RcProven -> m
     RcRefuted(why) -> {
       # The refuted value and the refinement it carries read the locals in scope.
-      let names = st_local_names(m.st, m.pair.expr)
+      let names = ln_with_binder(st_local_names(m.st, m.pair.expr), pred_self_binder())
       let show = (e) => fmt_expr_text(e, m.st.env.tab, names)
       let perr = mk_diag(SevError, m.st.file, line, col, concat_all([what, ": ", loose_text(why, show, show)]), [])
       render_diag(perr)
@@ -14655,17 +14647,15 @@ fn typed_ty_or(e: Expr, fallback: Ty) : Ty = match e.ty {
 fn field_what(fnm: String) : String = string_concat("record field '", string_concat(fnm, "'"))
 
 fn binding_what(pat: Pattern, fallback: String) : String = match pat.pkind {
-  PBind(b) -> {
-    let n = written_text(b.name)
-    concat_all(["binding `", if string_ends_with(n, "__ann") { string_slice(n, 0, string_length(n) - 5) } else { n }, "`"])
-  }
+  PBind(b) -> concat_all(["binding `", if pat_is_var_ann(pat) { var_ann_cell(b) } else { written_text(b.name) }, "`"])
   _        -> fallback
 }
 
 fn refine_checked(st: InferState, v: Expr, vty: Ty, preds: [Expr], strip: Bool) : Inferred / Console + File + Mutable {
   let rv = binder_minted("__rv")
   let pat = mk_pat(PBind(rv), v.line, v.col)
-  let checks = synth_stmts(check_pattern(st, pat, vty), map(preds, (p) => rc_assert(rv, p, st.refine_ctx, strip)))
+  let named = (p) => pred_local_names(p, (l) => st_local_text(st, l), ln_empty())
+  let checks = synth_stmts(check_pattern(st, pat, vty), map(preds, (p) => rc_assert(rv, p, st.refine_ctx, strip, st.env.tab, named(p))))
   let tail = synth(checks.st, mk_local(rv.id, v.line, v.col))
   let block = mk_expr(EBlock([SLet(pat, None, v), ...checks.stmts], Some(tail.expr)), v.line, v.col)
   mk_inferred(st_restore_entries(st, tail.st), vty, with_ty(block, vty))
@@ -17988,7 +17978,8 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
     holes: hole_reports,
     row_holes: [],
     diags: finalize_diags(st2.diags),
-    op_res: stamp_op_res_fn(list_reverse(st2.op_res), fnid_decl(entry_id(tsh_target(env.ty_homes))))
+    # A block runs under its build's runner.
+    op_res: stamp_op_res_fn(list_reverse(st2.op_res), fnid_decl(entry_id(tsh_target(env.ty_homes), true)))
   }
 }
 

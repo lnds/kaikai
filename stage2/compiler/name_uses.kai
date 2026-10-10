@@ -48,17 +48,19 @@ pub fn nu_scan_consts(decls: [Decl], tab: SymTab, target: String, picks: [NPick]
   nu_scan_picks(decls, nt_only(nt_collect(decls, tab, target), NCConst), target, [], [], picks)
 
 #[doc("The dispatchers of a lowered protocol registry.")]
-pub fn nu_dispatchers(reg: ProtocolReg) : [NDisp] = nu_disp_build(reg.ops, reg.root, [])
+pub fn nu_dispatchers(reg: ProtocolReg) : [NDisp] = nu_disp_build(reg.ops, reg.ids, [])
 
-fn nu_disp_build(ops: [ProtoOpReg], root: String, acc: [NDisp]) : [NDisp] = match ops {
+# An operation with no dispatcher was never lowered and has no use to report.
+fn nu_disp_build(ops: [ProtoOpReg], ids: ProtoIds, acc: [NDisp]) : [NDisp] = match ops {
   [] -> acc
-  [POR(proto, op, _, _, _, _, home), ...rest] ->
-    nu_disp_build(rest, root, [NDisp(pid_fn_id(nu_disp_name(written_text(op)), home, root), written_text(op), proto), ...acc])
+  [POR(proto, op, params, _, _, _, _), ...rest] -> {
+    let label = written_text(op)
+    match pid_op_disp_at(ids, proto, label, list_length(params)) {
+      Some(d) -> nu_disp_build(rest, ids, [NDisp(d, label, proto), ...acc])
+      None    -> nu_disp_build(rest, ids, acc)
+    }
+  }
 }
-
-# The name a dispatcher is declared with, which a reference the resolver
-# left to the type still writes.
-fn nu_disp_name(op: String) : String = concat_all(["__proto_", op])
 
 #[doc("`a` followed by the uses of `b` not already reported in `a`.")]
 pub fn nu_merge(a: [NUse], b: [NUse]) : [NUse] = match b {
@@ -238,7 +240,7 @@ fn nu_positions(ps: [XPos], cx: NuCx, acc: [NUse]) : [NUse] =
 # call.
 fn nu_name_hit(name: String, line: Int, col: Int, called: Bool, cx: NuCx,
       acc: [NUse]) : [NUse] =
-  match nu_disp_find(cx.ds, name) {
+  match nu_disp_named(cx, name) {
     Some(NDisp(_, op, proto)) -> nu_hit_proto(proto, line, col, op, cx, acc)
     None ->
       if list_length(nt_homes(idx_chain(cx.t, name), NCCtor, name)) > 0 {
@@ -250,19 +252,19 @@ fn nu_name_hit(name: String, line: Int, col: Int, called: Bool, cx: NuCx,
       }
   }
 
-# Dispatchers all start with `__`; anything else skips the list.
-fn nu_disp_find(ds: [NDisp], name: String) : Option[NDisp] =
-  if nu_internal(name) { nu_disp_loop(ds, name) } else { None }
-
-fn nu_internal(name: String) : Bool = match char_at(name, 0) {
-  Some(c0) -> c0 == '_' and match char_at(name, 1) { Some(c1) -> c1 == '_'  None -> false }
-  None -> false
+# A name left written is one several declarations answer to. When those
+# are dispatchers the contest is their protocol's, and the first of them
+# stands for it as a settled use would.
+fn nu_disp_named(cx: NuCx, name: String) : Option[NDisp] = match cx.ds {
+  [] -> None
+  _  -> nu_disp_among(cx.ds, st_candidates(cx.tab, NCFn, name))
 }
 
-fn nu_disp_loop(ds: [NDisp], name: String) : Option[NDisp] = match ds {
+fn nu_disp_among(ds: [NDisp], cands: [SymId]) : Option[NDisp] = match cands {
   [] -> None
-  [d, ...rest] -> match d {
-    NDisp(_, op, _) -> if nu_disp_name(op) == name { Some(d) } else { nu_disp_loop(rest, name) }
+  [s, ...rest] -> match nu_disp_of(ds, s) {
+    Some(d) -> Some(d)
+    None    -> nu_disp_among(ds, rest)
   }
 }
 
@@ -312,7 +314,7 @@ pub fn nu_const_coll(decls: [Decl], tab: SymTab, target: String) : [NEnt] {
 fn nu_keep_collided(all: [NEnt], todo: [NEnt], acc: [NEnt]) : [NEnt] = match todo {
   [] -> list_reverse(acc)
   [e, ...rest] -> match e {
-    NEnt(NCConst, n, h, _) ->
+    NEnt(NCConst, n, h, _, _) ->
       if nu_other_home(all, n, h) { nu_keep_collided(all, rest, [e, ...acc]) }
       else { nu_keep_collided(all, rest, acc) }
     _ -> nu_keep_collided(all, rest, acc)
@@ -321,7 +323,7 @@ fn nu_keep_collided(all: [NEnt], todo: [NEnt], acc: [NEnt]) : [NEnt] = match tod
 
 fn nu_other_home(t: [NEnt], name: String, home: String) : Bool = match t {
   [] -> false
-  [NEnt(c, n, h, _), ...rest] ->
+  [NEnt(c, n, h, _, _), ...rest] ->
     if nu_is_const(c) and n == name and h != home { true }
     else { nu_other_home(rest, name, home) }
 }
@@ -347,7 +349,7 @@ pub fn nu_const_owner(cx: CSCtx, name: String) : Option[String] =
 fn nu_const_foreign_pub(t: [NEnt], name: String, home: String,
       target: String) : Option[String] = match t {
   [] -> None
-  [NEnt(c, n, h, p), ...rest] ->
+  [NEnt(c, n, h, p, _), ...rest] ->
     if nu_is_const(c) and n == name and p and h != home and h != target { Some(h) }
     else { nu_const_foreign_pub(rest, name, home, target) }
 }
@@ -355,7 +357,7 @@ fn nu_const_foreign_pub(t: [NEnt], name: String, home: String,
 #[doc("True when `home` declares a pub const `name` in the collision table.")]
 pub fn nu_is_pub_const(t: [NEnt], name: String, home: String) : Bool = match t {
   [] -> false
-  [NEnt(c, n, h, p), ...rest] ->
+  [NEnt(c, n, h, p, _), ...rest] ->
     if nu_is_const(c) and n == name and h == home and p { true }
     else { nu_is_pub_const(rest, name, home) }
 }
