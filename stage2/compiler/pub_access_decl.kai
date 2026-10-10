@@ -14,12 +14,13 @@ import compiler.modules
 import compiler.fnreg
 import compiler.pub_access_refs
 import compiler.infer.{IPart, IpExp, IpLit}
+import compiler.written
 
 type PaScope = { bound: [String], refs: [PaRef] }
 
 #[doc("Every free name referenced by `d`, in both namespaces and every syntactic position. Locals, pattern binders and type parameters are already excluded; qualified (dotted) references are excluded because the qualified resolver validates them.")]
 pub fn pa_decl_refs(d: Decl) : [PaRef] / Console = match d {
-  DFn(_, _, tps0, ps, ret, row, body, line, col, _, _) -> {
+  DFn(_, _, tps0, ps, ret, row, body, line, col, _) -> {
     let tps = pa_tparam_names(tps0)
     let a1 = par_params(ps, tps, pa_bound_refs(tps0, line, col, []))
     let a2 = par_opt_te(ret, tps, true, a1)
@@ -31,18 +32,17 @@ pub fn pa_decl_refs(d: Decl) : [PaRef] / Console = match d {
     let a1 = par_params(ps, tps, pa_bound_refs(tps0, line, col, []))
     par_row(row, tps, true, true, line, col, par_te(ret, tps, true, true, a1))
   }
-  DConst(_, _, te, body, _, _, _, _) ->
+  DConst(_, _, te, body, _, _, _) ->
     par_expr(body, [], [], par_te(te, [], true, true, []))
-  DType(_, _, tps0, body, line, col, _, _, _) ->
+  DType(_, _, tps0, body, line, col, _, _) ->
     par_typebody(body, pa_tparam_names(tps0), line, col, [])
-  DEffect(_, _, tps0, ops, defblk, _, _, _, _) ->
+  DEffect(_, _, tps0, ops, defblk, _, _, _) ->
     par_default_opt(defblk, par_eops(ops, pa_tparam_names(tps0), []))
-  DProtocol(_, _, tps0, ops, _, _, _, _) ->
+  DProtocol(_, _, tps0, ops, _, _, _) ->
     par_pops(ops, ["Self", ...pa_tparam_names(tps0)], [])
-  DImpl(pname, targs, target, subs, line, col, impl_tps, _) -> {
+  DImpl(proto, targs, target, subs, line, col, impl_tps, _) -> {
     let tps = pa_tparam_names(impl_tps)
-    let a1 = pa_bound_refs(impl_tps, line, col,
-      [pa_ref(pname, true, false, false, line, col)])
+    let a1 = pa_bound_refs(impl_tps, line, col, pa_head_ref(proto, line, col, []))
     let a2 = par_te(target, tps, false, false, a1)
     par_sub_decls(subs, par_te_list(targs, tps, false, false, a2))
   }
@@ -102,7 +102,7 @@ fn par_typebody(b: TypeBody, tps: [String], line: Int, col: Int,
   TBAlias(te)  -> par_te(te, tps, true, true, acc)
   TBRecord(fs) -> par_fdecls(fs, tps, acc)
   TBSum(vs)    -> par_variants(vs, tps, acc)
-  TBEffectAlias(ls) -> pa_bound_names(rl_names(ls), line, col, acc)
+  TBEffectAlias(ls) -> par_row(RClosed(ls), [], true, true, line, col, acc)
 }
 
 # A `priv` field's type is still a cross-module reference, but it
@@ -145,16 +145,17 @@ fn par_default_opt(db: Option[DefaultBlock], acc: [PaRef]) : [PaRef] / Console =
 
 fn par_expr(e: Expr, locals: [String], tps: [String],
       acc: [PaRef]) : [PaRef] / Console = match e.kind {
-  EName(nm) ->
-    if list_has(locals, nm) or pa_dotted(nm) { acc }
-    else { [pa_ref(nm, false, false, false, e.line, e.col), ...acc] }
+  EName(w) ->
+    if list_has(locals, written_text(w)) or pa_dotted(written_text(w)) { acc }
+    else { [pa_ref(written_text(w), false, false, false, e.line, e.col), ...acc] }
   # `locals` shadow a declaration, and a resolved reference is never
   # one of them, so it is always a reference worth recording.
-  ESym(_, _, nm) ->
-    if pa_dotted(nm) { acc }
-    else { [pa_ref(nm, false, false, false, e.line, e.col), ...acc] }
-  # A mark names no declaration, so there is no access to check.
+  ESym(s, _) -> [pa_ref_sym(s, false, false, false, e.line, e.col), ...acc]
+  # A local read and a mark name no declaration, and a settled effect
+  # operation is the typer's, made after this check.
+  ELocal(_) -> acc
   EMark(_) -> acc
+  EOp(_) -> acc
   ECall(callee, args_) ->
     par_exprs(args_, locals, tps, par_expr(callee, locals, tps, acc))
   EField(obj, _)   -> par_expr(obj, locals, tps, acc)
@@ -168,11 +169,7 @@ fn par_expr(e: Expr, locals: [String], tps: [String],
   ELambda(ps, body) ->
     par_expr(body, list_append(locals, fn_param_names(ps)), tps,
       par_params_body(ps, tps, acc))
-  ERecordLit(_, name, fis) -> {
-    let a1 = if name == "" or pa_dotted(name) or list_has(tps, name) { acc }
-      else { [pa_ref(name, true, false, false, e.line, e.col), ...acc] }
-    par_fis(fis, locals, tps, a1)
-  }
+  ERecordLit(r, fis) -> par_fis(fis, locals, tps, pa_record_ref(r, tps, e.line, e.col, acc))
   EList(els) -> par_elems(els, locals, tps, acc)
   ERange(lo, hi, stp) ->
     par_opt_expr(stp, locals, tps,
@@ -189,8 +186,8 @@ fn par_expr(e: Expr, locals: [String], tps: [String],
   ELitUnit(inner, u) ->
     par_uexpr(u, tps, false, false, e.line, e.col,
       par_expr(inner, locals, tps, acc))
-  EHandle(body, ename, _, tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-    par_handle(body, ename, tyargs, init_opt, alias_opt, clauses, ret_opt,
+  EHandle(body, eff, tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+    par_handle(body, eff, tyargs, init_opt, alias_opt, clauses, ret_opt,
       locals, tps, e.line, e.col, acc)
   EVariantsOf(te, _) -> par_te(te, tps, false, false, acc)
   EIntrinsic(_, args_) -> par_exprs(args_, locals, tps, acc)
@@ -233,16 +230,33 @@ fn par_exprs(xs: [Expr], locals: [String], tps: [String],
   [x, ...rest] -> par_exprs(rest, locals, tps, par_expr(x, locals, tps, acc))
 }
 
-fn par_handle(body: Expr, ename: String, tyargs: [TypeExpr],
-      init_opt: Option[Expr], alias_opt: Option[String],
+# A record literal's head: a settled one is checked on its declaration,
+# a written one on its name unless a type parameter binds it.
+fn pa_record_ref(r: DeclRef, tps: [String], line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrSym(s)        -> [pa_ref_sym(s, true, false, false, line, col), ...acc]
+  DrWritten(_, n) ->
+    if written_text(n) == "" or pa_dotted(written_text(n)) or list_has(tps, written_text(n)) { acc }
+    else { [pa_ref(written_text(n), true, false, false, line, col), ...acc] }
+}
+
+# A handler or impl head. A qualified one was gated by the qualified resolver.
+fn pa_head_ref(r: DeclRef, line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrSym(s)              -> [pa_ref_sym(s, true, false, false, line, col), ...acc]
+  DrWritten(Some(_), _) -> acc
+  DrWritten(None, n)    ->
+    if pa_dotted(written_text(n)) { acc }
+    else { [pa_ref(written_text(n), true, false, false, line, col), ...acc] }
+}
+
+fn par_handle(body: Expr, eff: DeclRef, tyargs: [TypeExpr],
+      init_opt: Option[Expr], alias_opt: Option[Binder],
       clauses: [HClause], ret_opt: Option[HReturn],
       locals: [String], tps: [String], line: Int, col: Int,
       acc: [PaRef]) : [PaRef] / Console = {
-  let a1 = if pa_dotted(ename) { acc }
-      else { [pa_ref(ename, true, false, false, line, col), ...acc] }
+  let a1 = pa_head_ref(eff, line, col, acc)
   let a2 = par_opt_expr(init_opt, locals, tps,
       par_te_list(tyargs, tps, false, false, a1))
-  let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+  let inner = match alias_opt { Some(a) -> [written_text(a.name), ...locals] None -> locals }
   let a3 = par_hclauses(clauses, inner, tps, par_expr(body, inner, tps, a2))
   par_hreturn_opt(ret_opt, inner, tps, a3)
 }
@@ -257,9 +271,12 @@ fn par_arms(arms: [Arm], locals: [String], tps: [String],
   }
 }
 
-fn pa_pat_name(name: String, line: Int, col: Int, acc: [PaRef]) : [PaRef] =
-  if pa_dotted(name) { acc }
-  else { [pa_ref(name, false, false, false, line, col), ...acc] }
+fn pa_pat_ref(r: DeclRef, line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrSym(s)        -> [pa_ref_sym(s, false, false, false, line, col), ...acc]
+  DrWritten(_, n) ->
+    if pa_dotted(written_text(n)) { acc }
+    else { [pa_ref(written_text(n), false, false, false, line, col), ...acc] }
+}
 
 fn par_pat(p: Pattern, locals: [String], tps: [String],
       acc: [PaRef]) : [PaRef] / Console = match p.pkind {
@@ -269,10 +286,10 @@ fn par_pat(p: Pattern, locals: [String], tps: [String],
   PLit(e)  -> par_expr(e, locals, tps, acc)
   PRange(lo, hi) -> par_expr(hi, locals, tps, par_expr(lo, locals, tps, acc))
   PList(subs, _) -> par_pats(subs, locals, tps, acc)
-  PVariant(_, name, subs) ->
-    par_pats(subs, locals, tps, pa_pat_name(name, p.line, p.col, acc))
-  PVariantRecord(_, name, pfs) ->
-    par_pfields(pfs, locals, tps, pa_pat_name(name, p.line, p.col, acc))
+  PVariant(r, subs) ->
+    par_pats(subs, locals, tps, pa_pat_ref(r, p.line, p.col, acc))
+  PVariantRecord(r, pfs) ->
+    par_pfields(pfs, locals, tps, pa_pat_ref(r, p.line, p.col, acc))
   PRecord(pfs)   -> par_pfields(pfs, locals, tps, acc)
   PAs(_, inner)  -> par_pat(inner, locals, tps, acc)
   PNarrow(_, te) -> par_te(te, tps, false, false, acc)
@@ -329,8 +346,8 @@ fn par_stmt(s: Stmt, locals: [String], tps: [String],
     pa_scope(pat_binders(pat, locals),
       par_expr(e, locals, tps, par_pat(pat, locals, tps, a1)))
   }
-  SVar(name, tyo, init, _, _) ->
-    pa_scope([name, ...locals],
+  SVar(b, tyo, init, _, _) ->
+    pa_scope([written_text(b.name), ...locals],
       par_expr(init, locals, tps, par_opt_annot(tyo, tps, acc)))
   SAssert(cond, msgo) ->
     pa_scope(locals, par_opt_expr(msgo, locals, tps,
@@ -366,7 +383,7 @@ fn par_hclauses(cs: [HClause], locals: [String], tps: [String],
 
 fn par_hreturn_opt(r: Option[HReturn], locals: [String], tps: [String],
       acc: [PaRef]) : [PaRef] / Console = match r {
-  Some(HR(pname, body, _, _)) -> par_expr(body, [pname, ...locals], tps, acc)
+  Some(HR(b, body, _, _)) -> par_expr(body, [written_text(b.name), ...locals], tps, acc)
   None -> acc
 }
 

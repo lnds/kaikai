@@ -14,6 +14,8 @@ import compiler.ast
 import compiler.util
 import compiler.diag
 import compiler.diag_file
+import compiler.symtab
+import compiler.written
 
 #[doc("An alias candidate: its name, the labels as written, whether it is the explicit `+` form, its position, and the file declaring it.")]
 pub type AliasCand = AC(String, [RowLabel], Bool, Int, Int, String)
@@ -36,21 +38,31 @@ type AOne = { st: AState, r: Option[[RowLabel]] }
 type ACtx = { cands: [AliasCand], effs: [String], file: String }
 
 #[doc("The alias candidates `decls` declares, in stream order.")]
-pub fn collect_alias_cands(decls: [Decl], df: DiagFiles) : [AliasCand] = match decls {
+pub fn collect_alias_cands(decls: [Decl], tab: SymTab, df: DiagFiles) : [AliasCand] = match decls {
   [] -> []
   [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> collect_alias_cands([inner, ...rest], df)
-    None        -> list_append(alias_cand_of(d, decl_diag_file(d, df)), collect_alias_cands(rest, df))
+    Some(inner) -> collect_alias_cands([inner, ...rest], tab, df)
+    None        -> list_append(alias_cand_of(d, tab, decl_diag_file(d, df)), collect_alias_cands(rest, tab, df))
   }
 }
 
-fn alias_cand_of(d: Decl, f: String) : [AliasCand] = match d {
-  DType(_, name, _, TBEffectAlias(labels), line, col, _, _, _) -> [AC(name, labels, true, line, col, f)]
-  DType(_, name, _, TBAlias(ty), line, col, _, _, _) -> match ty.tkind {
-    TyName(_, n, []) -> [AC(name, [RL(n, [], sym_none())], false, line, col, f)]
+# A body the type pass settled names a type, so it is no candidate.
+fn alias_cand_of(d: Decl, tab: SymTab, f: String) : [AliasCand] = match d {
+  DType(_, s, _, TBEffectAlias(labels), line, col, _, _) ->
+    [AC(written_text(sym_name(tab, s)), labels, true, line, col, f)]
+  DType(_, s, _, TBAlias(ty), line, col, _, _) -> match ty.tkind {
+    TyName(DrWritten(q, n), []) ->
+      [AC(written_text(sym_name(tab, s)), [RL(DrWritten(q, n), [])], false, line, col, f)]
     _ -> []
   }
   _ -> []
+}
+
+# What a label nothing settled spells; a settled label names an effect.
+fn ea_written(l: RowLabel) : Option[String] = match l {
+  RL(DrSym(_), _)              -> None
+  RL(DrWritten(None, n), _)    -> Some(written_text(n))
+  RL(DrWritten(Some(q), n), _) -> Some("#{q}.#{n}")
 }
 
 #[doc("Resolve every candidate that is not itself an effect name; a candidate that fails is dropped and its error counted.")]
@@ -97,19 +109,20 @@ type AliasAt = AliasAt(String, Bool, Int, Int, String)
 
 fn ea_labels(cx: ACtx, raw: [RowLabel], at: AliasAt, st: AState, acc: [RowLabel]) : AOne / Console + File = match raw {
   [] -> AOne { st: st, r: Some(list_reverse(acc)) }
-  [l, ...rest] -> {
-    let n = rl_name(l)
-    if list_has(cx.effs, n) { ea_labels(cx, rest, at, st, [l, ...acc]) }
-    else { match ea_cand(cx.cands, n) {
-      Some(_) -> {
-        let sub = ea_resolve(cx, n, st)
-        match sub.r {
-          None     -> AOne { st: sub.st, r: None }
-          Some(ls) -> ea_labels(cx, rest, at, sub.st, list_append(list_reverse(ls), acc))
+  [l, ...rest] -> match ea_written(l) {
+    None    -> ea_labels(cx, rest, at, st, [l, ...acc])
+    Some(n) ->
+      if list_has(cx.effs, n) { ea_labels(cx, rest, at, st, [l, ...acc]) }
+      else { match ea_cand(cx.cands, n) {
+        Some(_) -> {
+          let sub = ea_resolve(cx, n, st)
+          match sub.r {
+            None     -> AOne { st: sub.st, r: None }
+            Some(ls) -> ea_labels(cx, rest, at, sub.st, list_append(list_reverse(ls), acc))
+          }
         }
-      }
-      None -> ea_unknown(at, n, st)
-    } }
+        None -> ea_unknown(at, n, st)
+      } }
   }
 }
 
@@ -168,9 +181,11 @@ fn ea_has(ls: [RowLabel], l: RowLabel) : Bool = match ls {
   [h, ...rest] -> ea_same(h, l) or ea_has(rest, l)
 }
 
-fn ea_same(a: RowLabel, b: RowLabel) : Bool = match a {
-  RL(an, _, asym) -> match b {
-    RL(bn, _, bsym) -> if sym_raw(asym) >= 0 { sym_raw(asym) == sym_raw(bsym) } else { sym_raw(bsym) < 0 and an == bn }
+fn ea_same(a: RowLabel, b: RowLabel) : Bool = match ea_written(a) {
+  None     -> sym_raw(rl_sym(a)) == sym_raw(rl_sym(b))
+  Some(an) -> match ea_written(b) {
+    Some(bn) -> an == bn
+    None     -> false
   }
 }
 
