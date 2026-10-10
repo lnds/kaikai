@@ -111,6 +111,9 @@ import compiler.json_shape
 import compiler.json_derive
 import compiler.derive_generic
 import compiler.derive_reach
+import compiler.derive_pick
+import compiler.derive_mint
+import compiler.core_modules
 import compiler.resolve_callee
 import compiler.symtab_build
 import compiler.mutation_carriers
@@ -1288,29 +1291,35 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
 # Show can be discharged: each field type must reach an impl of `P`
 # (explicit, derived, or builtin) through every type argument a container
 # impl bounds by `P`, so `[(Int, String)]` needs `P` on `List` and `Pair`.
-fn validate_derives(ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
-  list_reverse(validate_derives_loop(ds, df, collect_impl_reach(ds, []), []))
+fn validate_derives(ps: PScope, ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
+  list_reverse(validate_derives_loop(ps, ds, df, collect_impl_reach(ps, ds, []), []))
 
-fn collect_impl_reach(ds: [Decl], acc: [ImplReach]) : [ImplReach] {
+fn collect_impl_reach(ps: PScope, ds: [Decl], acc: [ImplReach]) : [ImplReach] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, _, _, _, tps, _) ->
-        collect_impl_reach(rest, [impl_reach(dotted_bare(pname), head_tree(target), tps), ...acc])
+      DImpl(pname, _, target, ms, _, _, tps, _) -> {
+        let acc1 = match derive_gen(ps, pname, impl_home_of(ms)) {
+          Some(g) -> [impl_reach(core_proto_name(g), head_tree(target), tps), ...acc]
+          None    -> acc
+        }
+        collect_impl_reach(ps, rest, acc1)
+      }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, tps, _, _, _, _, _, _) ->
-          collect_impl_reach(rest, list_append(map(names, (n) => derived_reach(dotted_bare(n), tname, tps)), acc))
-        _ -> collect_impl_reach(rest, acc)
+          collect_impl_reach(ps, rest, list_append(map(derive_gens(ps, names, derive_from(ps, inner)),
+                                                   (d) => derived_reach(gen_key(d), tname, tps)), acc))
+        _ -> collect_impl_reach(ps, rest, acc)
       }
       DUnstable(inner, _, _) ->
-        collect_impl_reach([inner, ...rest], acc)
+        collect_impl_reach(ps, [inner, ...rest], acc)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_impl_reach([inner, ...rest], acc)
+        collect_impl_reach(ps, [inner, ...rest], acc)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_impl_reach([inner, ...rest], acc)
+        collect_impl_reach(ps, [inner, ...rest], acc)
       DConstructor(inner, _, _) ->
-        collect_impl_reach([inner, ...rest], acc)
-      _ -> collect_impl_reach(rest, acc)
+        collect_impl_reach(ps, [inner, ...rest], acc)
+      _ -> collect_impl_reach(ps, rest, acc)
     }
   }
 }
@@ -1341,53 +1350,45 @@ pub fn derive_builtin_impl(p: CoreProto, tname: String) : Bool = match p {
   _     -> false
 }
 
-# A `#[derive]` entry read once: the bare name it prints as and the
-# generator that name picks. The bare name alone picks it, whatever
-# protocol the entry resolves to: the impl a generator builds keeps the
-# entry as written and resolves like a hand-written one.
-type DeriveGen = DeriveGen(String, CoreProto)
+# The file a derive's entries are written in: the one declaring the type.
+fn derive_from(ps: PScope, inner: Decl) : Option[String] = decl_type_home(inner, ps_root(ps))
 
-fn derive_gen(pspell: String) : Option[CoreProto] = core_proto_named(dotted_bare(pspell))
+# The name a generator's impls are filed under in the reach table.
+fn gen_key(d: DeriveGen) : String = match d { DeriveGen(_, g) -> core_proto_name(g) }
 
-fn derive_gens(names: [String]) : [DeriveGen] = match names {
-  []           -> []
-  [n, ...rest] -> match derive_gen(n) {
-    Some(g) -> [DeriveGen(dotted_bare(n), g), ...derive_gens(rest)]
-    None    -> derive_gens(rest)
+# What each `#[derive]` entry fails to pick, in declaration order.
+fn derive_entry_diags(ps: PScope, ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DDerive(names, inner, line, col) ->
+      derive_entry_diags(ps, rest, df,
+        derive_pick_diags(ps, names, derive_from(ps, inner), decl_diag_file(d, df), line, col, acc))
+    DUnstable(inner, _, _)        -> derive_entry_diags(ps, [inner, ...rest], df, acc)
+    DProtoLaws(_, inner, _, _, _) -> derive_entry_diags(ps, [inner, ...rest], df, acc)
+    DImplAxiom(_, inner, _, _, _) -> derive_entry_diags(ps, [inner, ...rest], df, acc)
+    DConstructor(inner, _, _)     -> derive_entry_diags(ps, [inner, ...rest], df, acc)
+    _ -> derive_entry_diags(ps, rest, df, acc)
   }
 }
 
-# True when the written protocol name `pspell` picks the generator `g`.
-# A derive checks its fields against impls the same way: an impl
-# provides for a generator when its written protocol name spells it.
-fn spells_gen(pspell: String, g: CoreProto) : Bool = match derive_gen(pspell) {
-  Some(p) -> core_proto_same(p, g)
-  None    -> false
-}
-
-fn derives_gen(names: [String], g: CoreProto) : Bool = match names {
-  []           -> false
-  [n, ...rest] -> spells_gen(n, g) or derives_gen(rest, g)
-}
-
-fn validate_derives_loop(ds: [Decl], df: DiagFiles, reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console {
+fn validate_derives_loop(ps: PScope, ds: [Decl], df: DiagFiles, reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console {
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, line, col) -> {
         let file = decl_diag_file(d, df)
-        let errs1 = validate_derive_decl(map(names, dotted_bare), inner, file, reach, line, col, errs)
-        validate_derives_loop(rest, df, reach, errs1)
+        let errs1 = validate_derive_decl(ps, names, inner, file, reach, line, col, errs)
+        validate_derives_loop(ps, rest, df, reach, errs1)
       }
       DUnstable(inner, _, _) ->
-        validate_derives_loop([inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derives_loop([inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derives_loop([inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
       DConstructor(inner, _, _) ->
-        validate_derives_loop([inner, ...rest], df, reach, errs)
-      _ -> validate_derives_loop(rest, df, reach, errs)
+        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
+      _ -> validate_derives_loop(ps, rest, df, reach, errs)
     }
   }
 }
@@ -1395,12 +1396,14 @@ fn validate_derives_loop(ds: [Decl], df: DiagFiles, reach: [ImplReach], errs: [D
 # Where a derive reports: the file and position of its declaration.
 type DeriveSite = DS(String, Int, Int)
 
-fn validate_derive_decl(names: [String], inner: Decl, file: String, reach: [ImplReach],
+fn validate_derive_decl(ps: PScope, names: [String], inner: Decl, file: String, reach: [ImplReach],
                         dline: Int, dcol: Int, errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
   DType(_, tname, tps, body, _, _, _, _, _) -> {
     let fields = derive_field_types(body)
-    let own = list_append(map(names, (n) => derived_reach(n, tname, tps)), param_reach(names, tps))
-    validate_derive_protos(filter(derive_gens(names), derive_reach_checked), tname, fields,
+    let gens = derive_gens(ps, names, derive_from(ps, inner))
+    let keys = map(gens, gen_key)
+    let own = list_append(map(keys, (n) => derived_reach(n, tname, tps)), param_reach(keys, tps))
+    validate_derive_protos(filter(gens, derive_reach_checked), tname, fields,
                            list_append(own, reach), DS(file, dline, dcol), errs)
   }
   _ -> errs
@@ -1462,7 +1465,7 @@ fn validate_derive_fields(d: DeriveGen, tname: String, fields: [DeriveField],
   []           -> errs
   [f, ...rest] -> match f {
     DFld(what, te) -> match d { DeriveGen(pname, g) -> {
-      let path = missing_path(pname, head_tree(te), reach, (h) => derive_builtin_impl(g, h))
+      let path = missing_path(core_proto_name(g), head_tree(te), reach, (h) => derive_builtin_impl(g, h))
       let errs1 = match path {
         [] -> errs
         _  -> {
@@ -1509,28 +1512,32 @@ fn report_derive_missing(pname: String, tname: String, what: String, path: [Stri
 # derives minted on their own.
 type Expanded = Expanded([Decl], [Decl])
 
-fn expand_derives(ds: [Decl], target_mod: String) : Expanded =
-  expand_derives_loop(ds, target_mod, collect_binser_types(ds, false, []), [], [])
+# What an expansion resolves and mints against: the protocol scope, the
+# dispatchers by id, and the core modules.
+type DeriveCx = { ps: PScope, ids: ProtoIds, cores: [String] }
+
+fn expand_derives(dx: DeriveCx, ds: [Decl], target_mod: String) : Expanded =
+  expand_derives_loop(dx, ds, target_mod, collect_binser_types(dx.ps, ds, false, []), [], [])
 
 # `writers` names every type deriving BinSerialize: a field of one of
 # them is encoded by its writer instead of a fresh `to_bytes` array.
-fn expand_derives_loop(ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl]) : Expanded {
+fn expand_derives_loop(dx: DeriveCx, ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl]) : Expanded {
   match ds {
     [] -> Expanded(list_reverse(acc), minted)
     [d, ...rest] -> match d {
       DDerive(names, inner, l, c) -> {
         let home = decl_type_home(inner, target_mod)
-        let derived = map(derive_impls_for(names, inner, home, writers),
+        let derived = map(derive_impls_for(dx, names, inner, home, writers),
                           (dd) => stamp_derived_home(dd, home, l, c))
-        expand_derives_loop(rest, target_mod, writers,
+        expand_derives_loop(dx, rest, target_mod, writers,
                             list_append([inner, ...list_reverse(derived)], acc),
                             list_append(derived, minted))
       }
       DUnstable(inner, _, _) ->
-        expand_derives_loop([inner, ...rest], target_mod, writers, acc, minted)
+        expand_derives_loop(dx, [inner, ...rest], target_mod, writers, acc, minted)
       # Every other wrapper stays: the `#[constructor]` registry is
       # collected in the typer, so unwrapping it would lose it.
-      _ -> expand_derives_loop(rest, target_mod, writers, [d, ...acc], minted)
+      _ -> expand_derives_loop(dx, rest, target_mod, writers, [d, ...acc], minted)
     }
   }
 }
@@ -1561,30 +1568,45 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # by the typer / resolver after lowering.
 # `shown` is the name the user wrote: what a derived `show` prints and
 # what a synthesised shim is called, behind any home spelling.
-type DerivedType = { tname: String, tps: [String], shown: String, body: TypeBody, writers: [String] }
+# `ids` and `homed` say how a derived body names a protocol operation:
+# its dispatcher, through its home unless a core module derives.
+type DerivedType = { tname: String, tps: [String], shown: String, body: TypeBody, writers: [String],
+                     ids: ProtoIds, homed: Bool }
 
-fn derive_impls_for(names: [String], dt: Decl, home: Option[String], writers: [String]) : [Decl] {
+fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String], writers: [String]) : [Decl] {
   match dt {
     DType(_, tname, tps, body, line, col, _, _, _) ->
-      derive_impls_loop(names, DerivedType { tname: tname, tps: tps, shown: hs_display(tname, home),
-                                             body: body, writers: writers }, line, col, [])
+      derive_impls_loop(dx.ps, home, names,
+                        DerivedType { tname: tname, tps: tps, shown: hs_display(tname, home),
+                                      body: body, writers: writers, ids: dx.ids,
+                                      homed: derive_homed(dx.cores, home) },
+                        line, col, [])
     _ -> []
   }
 }
 
-# The bare name picks the generator; the impl keeps the spelling as
-# written (`m.P`) so it resolves against that module's protocol.
-fn derive_impls_loop(names: [String], dt: DerivedType, line: Int, col: Int, acc: [Decl]) : [Decl] {
+# A core module's own derive reaches a dispatcher bare, as its
+# interpolations do.
+fn derive_homed(cores: [String], home: Option[String]) : Bool = match home {
+  Some(m) -> not list_has(cores, m)
+  None    -> true
+}
+
+# The protocol an entry resolves to, from the type's file, picks the
+# generator; the impl keeps the spelling as written (`m.P`), which
+# resolves to that same protocol.
+fn derive_impls_loop(ps: PScope, home: Option[String], names: [String], dt: DerivedType,
+                     line: Int, col: Int, acc: [Decl]) : [Decl] {
   match names {
     [] -> list_reverse(acc)
     [pspell, ...rest] -> {
-      let generated = match derive_gen(pspell) {
+      let generated = match derive_gen(ps, pspell, home) {
         Some(g) -> derive_impl_for_protocol(g, dt, line, col)
         None    -> []
       }
       let ds = map(generated,
                    (dd) => derive_generalize(impl_with_pname(dd, pspell), pspell, dt.tname, dt.tps))
-      derive_impls_loop(rest, dt, line, col, list_append(list_reverse(ds), acc))
+      derive_impls_loop(ps, home, rest, dt, line, col, list_append(list_reverse(ds), acc))
     }
   }
 }
@@ -1630,10 +1652,10 @@ fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) 
   let shown = dt.shown
   let body = dt.body
   match g {
-    CpShow         -> option_to_list(derive_show_impl(tname, shown, body, line, col))
-    CpEq           -> option_to_list(derive_eq_impl(tname, body, line, col))
-    CpHash         -> option_to_list(derive_hash_impl(tname, body, line, col))
-    CpOrd          -> option_to_list(derive_ord_impl(tname, body, line, col))
+    CpShow         -> option_to_list(derive_show_impl(derive_op_ref(dt.ids, dt.homed, CpShow, "show"), tname, shown, body, line, col))
+    CpEq           -> option_to_list(derive_eq_impl(derive_op_ref(dt.ids, dt.homed, CpEq, "eq"), tname, body, line, col))
+    CpHash         -> option_to_list(derive_hash_impl(derive_op_ref(dt.ids, dt.homed, CpHash, "hash"), tname, body, line, col))
+    CpOrd          -> option_to_list(derive_ord_impl(derive_op_ref(dt.ids, dt.homed, CpOrd, "cmp"), tname, body, line, col))
     CpBinSerialize -> derive_binserialize_impl(tname, shown, body, dt.writers, line, col)
     CpLayout       -> derive_layout_impl(tname, shown, body, line, col)
     CpJson         -> derive_json_impl(tname, shown, body, line, col)
@@ -1646,10 +1668,10 @@ fn option_to_list(o: Option[Decl]) : [Decl] = match o {
   Some(d) -> [d]
 }
 
-fn derive_show_impl(tname: String, shown: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
+fn derive_show_impl(opk: ExprKind, tname: String, shown: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
   match body {
     TBRecord(fields) -> {
-      let body_expr = derive_show_record_body(shown, fields, line, col)
+      let body_expr = derive_show_record_body(opk, shown, fields, line, col)
       Some(make_derived_impl("Show", tname, "show",
         [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
                  pline: line, pcol: col, pborrow: false }],
@@ -1657,7 +1679,7 @@ fn derive_show_impl(tname: String, shown: String, body: TypeBody, line: Int, col
         body_expr, line, col))
     }
     TBSum(variants) -> {
-      let body_expr = derive_show_sum_body(variants, line, col)
+      let body_expr = derive_show_sum_body(opk, variants, line, col)
       Some(make_derived_impl("Show", tname, "show",
         [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
                  pline: line, pcol: col, pborrow: false }],
@@ -1668,21 +1690,21 @@ fn derive_show_impl(tname: String, shown: String, body: TypeBody, line: Int, col
   }
 }
 
-fn derive_show_record_body(tname: String, fields: [FieldDecl], line: Int, col: Int) : Expr {
-  let parts = derive_show_record_parts(tname, fields, line, col)
-  mk_expr(ECall(mk_ref("string_concat_all", line, col),
+fn derive_show_record_body(opk: ExprKind, tname: String, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  let parts = derive_show_record_parts(opk, tname, fields, line, col)
+  mk_expr(ECall(derive_builtin_ref("string_concat_all", line, col),
                 [mk_expr(EList(map(parts, (e: Expr) => ElPlain(e))), line, col)]),
           line, col)
 }
 
-fn derive_show_record_parts(tname: String, fields: [FieldDecl], line: Int, col: Int) : [Expr] {
+fn derive_show_record_parts(opk: ExprKind, tname: String, fields: [FieldDecl], line: Int, col: Int) : [Expr] {
   let head = mk_expr(EStr(concat_all(["\"", tname, " { \""]), false), line, col)
-  let body_parts = derive_show_field_parts(fields, line, col, true)
+  let body_parts = derive_show_field_parts(opk, fields, line, col, true)
   let tail = mk_expr(EStr("\" }\"", false), line, col)
   list_append([head, ...body_parts], [tail])
 }
 
-fn derive_show_field_parts(fields: [FieldDecl], line: Int, col: Int, first: Bool) : [Expr] {
+fn derive_show_field_parts(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int, first: Bool) : [Expr] {
   match fields {
     [] -> []
     [fd, ...rest] -> match fd {
@@ -1691,25 +1713,25 @@ fn derive_show_field_parts(fields: [FieldDecl], line: Int, col: Int, first: Bool
                        else { concat_all(["\", ", name, ": \""]) }
         let prefix = mk_expr(EStr(prefix_s, false), line, col)
         let access = mk_expr(EField(mk_ref("x", line, col), name), line, col)
-        let call = mk_expr(ECall(mk_ref("show", line, col), [access]), line, col)
-        list_append([prefix, call], derive_show_field_parts(rest, line, col, false))
+        let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
+        list_append([prefix, call], derive_show_field_parts(opk, rest, line, col, false))
       }
     }
   }
 }
 
-fn derive_show_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+fn derive_show_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
   let scrut = mk_ref("x", line, col)
-  let arms = map(variants, (v) => derive_show_sum_arm(v, line, col))
+  let arms = map(variants, (v) => derive_show_sum_arm(opk, v, line, col))
   mk_expr(EMatch(scrut, arms), line, col)
 }
 
-fn derive_show_sum_arm(v: Variant, line: Int, col: Int) : Arm {
+fn derive_show_sum_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
   match v {
     Var(name, vargs) -> {
       let pat_subs = derive_sum_pat_subs(vargs, 0, line, col)
       let pat = mk_pat(PVariant(None, name, pat_subs), line, col)
-      let body = derive_show_sum_arm_body(name, vargs, line, col)
+      let body = derive_show_sum_arm_body(opk, name, vargs, line, col)
       Arm(pat, None, body)
     }
   }
@@ -1724,38 +1746,38 @@ fn derive_sum_pat_subs(vargs: [TypeExpr], i: Int, line: Int, col: Int) : [Patter
   }
 }
 
-fn derive_show_sum_arm_body(name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+fn derive_show_sum_arm_body(opk: ExprKind, name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
   match vargs {
     [] -> mk_expr(EStr(concat_all(["\"", name, "\""]), false), line, col)
     _  -> {
       let head = mk_expr(EStr(concat_all(["\"", name, "(\""]), false), line, col)
       let tail = mk_expr(EStr("\")\"", false), line, col)
-      let calls = derive_sum_arg_show_calls(vargs, 0, line, col, true)
+      let calls = derive_sum_arg_show_calls(opk, vargs, 0, line, col, true)
       let parts = list_append([head, ...calls], [tail])
-      mk_expr(ECall(mk_ref("string_concat_all", line, col),
+      mk_expr(ECall(derive_builtin_ref("string_concat_all", line, col),
                     [mk_expr(EList(map(parts, (e: Expr) => ElPlain(e))), line, col)]),
               line, col)
     }
   }
 }
 
-fn derive_sum_arg_show_calls(vargs: [TypeExpr], i: Int, line: Int, col: Int, first: Bool) : [Expr] {
+fn derive_sum_arg_show_calls(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int, col: Int, first: Bool) : [Expr] {
   match vargs {
     [] -> []
     [_, ...rest] -> {
       let prefix = if first { mk_expr(EStr("\"\"", false), line, col) }
                    else { mk_expr(EStr("\", \"", false), line, col) }
       let av = mk_ref(concat_all(["a", int_to_string(i)]), line, col)
-      let call = mk_expr(ECall(mk_ref("show", line, col), [av]), line, col)
-      list_append([prefix, call], derive_sum_arg_show_calls(rest, i + 1, line, col, false))
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [av]), line, col)
+      list_append([prefix, call], derive_sum_arg_show_calls(opk, rest, i + 1, line, col, false))
     }
   }
 }
 
-fn derive_eq_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
+fn derive_eq_impl(opk: ExprKind, tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
   match body {
     TBRecord(fields) -> {
-      let body_expr = derive_eq_record_body(fields, line, col)
+      let body_expr = derive_eq_record_body(opk, fields, line, col)
       Some(make_derived_impl("Eq", tname, "eq",
         [Param { pname: "a", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
                  pline: line, pcol: col, pborrow: false },
@@ -1765,7 +1787,7 @@ fn derive_eq_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[D
         body_expr, line, col))
     }
     TBSum(variants) -> {
-      let body_expr = derive_eq_sum_body(variants, line, col)
+      let body_expr = derive_eq_sum_body(opk, variants, line, col)
       Some(make_derived_impl("Eq", tname, "eq",
         [Param { pname: "a", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
                  pline: line, pcol: col, pborrow: false },
@@ -1778,24 +1800,24 @@ fn derive_eq_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[D
   }
 }
 
-fn derive_eq_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
+fn derive_eq_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
   match fields {
     [] -> mk_expr(EBool(true), line, col)
-    [fd, ...rest] -> derive_eq_record_chain(fd, rest, line, col)
+    [fd, ...rest] -> derive_eq_record_chain(opk, fd, rest, line, col)
   }
 }
 
-fn derive_eq_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
+fn derive_eq_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
   match head {
     FD(_, name, _, _) -> {
       let l_access = mk_expr(EField(mk_ref("a", line, col), name), line, col)
       let r_access = mk_expr(EField(mk_ref("b", line, col), name), line, col)
-      let call = mk_expr(ECall(mk_ref("eq", line, col), [l_access, r_access]),
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [l_access, r_access]),
                          line, col)
       match rest {
         [] -> call
         [next, ...more] -> {
-          let tail_e = derive_eq_record_chain(next, more, line, col)
+          let tail_e = derive_eq_record_chain(opk, next, more, line, col)
           mk_expr(EBinop(BoAnd, call, tail_e), line, col)
         }
       }
@@ -1808,33 +1830,33 @@ fn derive_eq_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: In
 # (returning `eq(la_0, lb_0) and eq(la_1, lb_1) and ...`) with a
 # wildcard arm returning `false`. Empty sums (no variants) are
 # defensive; the parser does not produce them today.
-fn derive_eq_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+fn derive_eq_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
   match variants {
     [] -> mk_expr(EBool(false), line, col)
     _  -> {
       let scrut = mk_ref("a", line, col)
-      let arms = map(variants, (v) => derive_eq_sum_outer_arm(v, line, col))
+      let arms = map(variants, (v) => derive_eq_sum_outer_arm(opk, v, line, col))
       mk_expr(EMatch(scrut, arms), line, col)
     }
   }
 }
 
-fn derive_eq_sum_outer_arm(v: Variant, line: Int, col: Int) : Arm {
+fn derive_eq_sum_outer_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
   match v {
     Var(name, vargs) -> {
       let pat_subs = derive_eq_sum_pat_subs("la_", vargs, 0, line, col)
       let pat = mk_pat(PVariant(None, name, pat_subs), line, col)
-      let inner = derive_eq_sum_inner_match(name, vargs, line, col)
+      let inner = derive_eq_sum_inner_match(opk, name, vargs, line, col)
       Arm(pat, None, inner)
     }
   }
 }
 
-fn derive_eq_sum_inner_match(name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+fn derive_eq_sum_inner_match(opk: ExprKind, name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
   let scrut = mk_ref("b", line, col)
   let pat_subs = derive_eq_sum_pat_subs("lb_", vargs, 0, line, col)
   let match_pat = mk_pat(PVariant(None, name, pat_subs), line, col)
-  let body = derive_eq_sum_field_chain(vargs, 0, line, col)
+  let body = derive_eq_sum_field_chain(opk, vargs, 0, line, col)
   let arm_match = Arm(match_pat, None, body)
   let arm_wild  = Arm(mk_pat(PWild, line, col), None,
                       mk_expr(EBool(false), line, col))
@@ -1851,17 +1873,17 @@ fn derive_eq_sum_pat_subs(prefix: String, vargs: [TypeExpr], i: Int,
   }
 }
 
-fn derive_eq_sum_field_chain(vargs: [TypeExpr], i: Int, line: Int, col: Int) : Expr {
+fn derive_eq_sum_field_chain(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int, col: Int) : Expr {
   match vargs {
     [] -> mk_expr(EBool(true), line, col)
     [_, ...rest] -> {
       let l = mk_ref(concat_all(["la_", int_to_string(i)]), line, col)
       let r = mk_ref(concat_all(["lb_", int_to_string(i)]), line, col)
-      let call = mk_expr(ECall(mk_ref("eq", line, col), [l, r]), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [l, r]), line, col)
       match rest {
         [] -> call
         _  -> {
-          let tail = derive_eq_sum_field_chain(rest, i + 1, line, col)
+          let tail = derive_eq_sum_field_chain(opk, rest, i + 1, line, col)
           mk_expr(EBinop(BoAnd, call, tail), line, col)
         }
       }
@@ -1869,10 +1891,10 @@ fn derive_eq_sum_field_chain(vargs: [TypeExpr], i: Int, line: Int, col: Int) : E
   }
 }
 
-fn derive_hash_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
+fn derive_hash_impl(opk: ExprKind, tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
   match body {
     TBRecord(fields) -> {
-      let body_expr = derive_hash_record_body(fields, line, col)
+      let body_expr = derive_hash_record_body(opk, fields, line, col)
       Some(make_derived_impl("Hash", tname, "hash",
         [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
                  pline: line, pcol: col, pborrow: false }],
@@ -1880,7 +1902,7 @@ fn derive_hash_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option
         body_expr, line, col))
     }
     TBSum(variants) -> {
-      let body_expr = derive_hash_sum_body(variants, line, col)
+      let body_expr = derive_hash_sum_body(opk, variants, line, col)
       Some(make_derived_impl("Hash", tname, "hash",
         [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
                  pline: line, pcol: col, pborrow: false }],
@@ -1891,22 +1913,22 @@ fn derive_hash_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option
   }
 }
 
-fn derive_hash_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
+fn derive_hash_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
   match fields {
     [] -> mk_expr(mk_int_synth(0), line, col)
-    [fd, ...rest] -> derive_hash_record_chain(fd, rest, line, col)
+    [fd, ...rest] -> derive_hash_record_chain(opk, fd, rest, line, col)
   }
 }
 
-fn derive_hash_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
+fn derive_hash_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
   match head {
     FD(_, name, _, _) -> {
       let access = mk_expr(EField(mk_ref("x", line, col), name), line, col)
-      let call = mk_expr(ECall(mk_ref("hash", line, col), [access]), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
       match rest {
         [] -> call
         [next, ...more] -> {
-          let tail_e = derive_hash_record_chain(next, more, line, col)
+          let tail_e = derive_hash_record_chain(opk, next, more, line, col)
           let mul = mk_expr(EBinop(BoMul, call, mk_expr(mk_int_synth(31), line, col)), line, col)
           mk_expr(EBinop(BoAdd, mul, tail_e), line, col)
         }
@@ -1920,52 +1942,52 @@ fn derive_hash_record_chain(head: FieldDecl, rest: [FieldDecl], line: Int, col: 
 # variant's 1-based tag and folds in `hash(field)` using the same
 # `acc * 31 + h` combination the record helper uses, so two values
 # that are eq via the derived Eq hash to the same Int.
-fn derive_hash_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+fn derive_hash_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
   match variants {
     [] -> mk_expr(mk_int_synth(0), line, col)
     _  -> {
       let scrut = mk_ref("x", line, col)
-      let arms = derive_hash_sum_arms(variants, 1, line, col)
+      let arms = derive_hash_sum_arms(opk, variants, 1, line, col)
       mk_expr(EMatch(scrut, arms), line, col)
     }
   }
 }
 
-fn derive_hash_sum_arms(vs: [Variant], tag: Int, line: Int, col: Int) : [Arm] {
+fn derive_hash_sum_arms(opk: ExprKind, vs: [Variant], tag: Int, line: Int, col: Int) : [Arm] {
   match vs {
     [] -> []
     [v, ...rest] ->
-      [derive_hash_sum_arm(v, tag, line, col),
-       ...derive_hash_sum_arms(rest, tag + 1, line, col)]
+      [derive_hash_sum_arm(opk, v, tag, line, col),
+       ...derive_hash_sum_arms(opk, rest, tag + 1, line, col)]
   }
 }
 
-fn derive_hash_sum_arm(v: Variant, tag: Int, line: Int, col: Int) : Arm {
+fn derive_hash_sum_arm(opk: ExprKind, v: Variant, tag: Int, line: Int, col: Int) : Arm {
   match v {
     Var(name, vargs) -> {
       let pat_subs = derive_eq_sum_pat_subs("h_", vargs, 0, line, col)
       let pat = mk_pat(PVariant(None, name, pat_subs), line, col)
-      let body = derive_hash_sum_arm_body(vargs, tag, line, col)
+      let body = derive_hash_sum_arm_body(opk, vargs, tag, line, col)
       Arm(pat, None, body)
     }
   }
 }
 
-fn derive_hash_sum_arm_body(vargs: [TypeExpr], tag: Int, line: Int, col: Int) : Expr {
+fn derive_hash_sum_arm_body(opk: ExprKind, vargs: [TypeExpr], tag: Int, line: Int, col: Int) : Expr {
   let head = mk_expr(mk_int_synth(tag), line, col)
-  derive_hash_sum_chain(head, vargs, 0, line, col)
+  derive_hash_sum_chain(opk, head, vargs, 0, line, col)
 }
 
-fn derive_hash_sum_chain(acc: Expr, vargs: [TypeExpr], i: Int,
+fn derive_hash_sum_chain(opk: ExprKind, acc: Expr, vargs: [TypeExpr], i: Int,
                           line: Int, col: Int) : Expr {
   match vargs {
     [] -> acc
     [_, ...rest] -> {
       let v = mk_ref(concat_all(["h_", int_to_string(i)]), line, col)
-      let h = mk_expr(ECall(mk_ref("hash", line, col), [v]), line, col)
+      let h = mk_expr(ECall(mk_expr(opk, line, col), [v]), line, col)
       let mul = mk_expr(EBinop(BoMul, acc, mk_expr(mk_int_synth(31), line, col)), line, col)
       let next = mk_expr(EBinop(BoAdd, mul, h), line, col)
-      derive_hash_sum_chain(next, rest, i + 1, line, col)
+      derive_hash_sum_chain(opk, next, rest, i + 1, line, col)
     }
   }
 }
@@ -1986,12 +2008,12 @@ fn derive_hash_sum_chain(acc: Expr, vargs: [TypeExpr], i: Int,
 # `Ord` impl — naming the missing call site in the diagnostic.
 # `min` and `max` only call the just-synthesised `cmp`, so they
 # carry no extra requirement on sub-types.
-fn derive_ord_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
+fn derive_ord_impl(opk: ExprKind, tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
   match body {
     TBRecord(fields) ->
-      Some(derive_ord_make_impl(tname, derive_ord_record_body(fields, line, col), line, col))
+      Some(derive_ord_make_impl(opk, tname, derive_ord_record_body(opk, fields, line, col), line, col))
     TBSum(variants) ->
-      Some(derive_ord_make_impl(tname, derive_ord_sum_body(variants, line, col), line, col))
+      Some(derive_ord_make_impl(opk, tname, derive_ord_sum_body(opk, variants, line, col), line, col))
     _ -> None
   }
 }
@@ -1999,7 +2021,7 @@ fn derive_ord_impl(tname: String, body: TypeBody, line: Int, col: Int) : Option[
 # Build the three-method `impl Ord for T` given a ready-to-use `cmp`
 # body expression. Factored out so the record / sum arms above share
 # the impl assembly, and so `min` / `max` are produced in one place.
-fn derive_ord_make_impl(tname: String, cmp_body: Expr, line: Int, col: Int) : Decl {
+fn derive_ord_make_impl(opk: ExprKind, tname: String, cmp_body: Expr, line: Int, col: Int) : Decl {
   let self_ty = mk_ty(TyName(ty_ref_none(), tname, []), line, col)
   let int_ty = mk_ty(TyName(ty_ref_none(), "Int", []), line, col)
   let params2 = [
@@ -2013,9 +2035,9 @@ fn derive_ord_make_impl(tname: String, cmp_body: Expr, line: Int, col: Int) : De
   let a_var = mk_ref("a", line, col)
   let b_var = mk_ref("b", line, col)
   let zero = mk_expr(mk_int_synth(0), line, col)
-  let cmp_call_min = mk_expr(ECall(mk_ref("cmp", line, col),
+  let cmp_call_min = mk_expr(ECall(mk_expr(opk, line, col),
                                        [a_var, b_var]), line, col)
-  let cmp_call_max = mk_expr(ECall(mk_ref("cmp", line, col),
+  let cmp_call_max = mk_expr(ECall(mk_expr(opk, line, col),
                                        [a_var, b_var]), line, col)
   let min_body = mk_expr(EIf(
     mk_expr(EBinop(BoLe, cmp_call_min, zero), line, col),
@@ -2030,20 +2052,20 @@ fn derive_ord_make_impl(tname: String, cmp_body: Expr, line: Int, col: Int) : De
   DImpl("Ord", [], self_ty, [cmp_method, min_method, max_method], line, col, [], sym_none())
 }
 
-fn derive_ord_record_body(fields: [FieldDecl], line: Int, col: Int) : Expr {
+fn derive_ord_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
   match fields {
     [] -> mk_expr(mk_int_synth(0), line, col)
-    [fd, ...rest] -> derive_ord_record_chain(fd, rest, 0, line, col)
+    [fd, ...rest] -> derive_ord_record_chain(opk, fd, rest, 0, line, col)
   }
 }
 
-fn derive_ord_record_chain(head: FieldDecl, rest: [FieldDecl], idx: Int,
+fn derive_ord_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], idx: Int,
                             line: Int, col: Int) : Expr {
   match head {
     FD(_, name, _, _) -> {
       let l_access = mk_expr(EField(mk_ref("a", line, col), name), line, col)
       let r_access = mk_expr(EField(mk_ref("b", line, col), name), line, col)
-      let cmp_call = mk_expr(ECall(mk_ref("cmp", line, col),
+      let cmp_call = mk_expr(ECall(mk_expr(opk, line, col),
                                     [l_access, r_access]),
                              line, col)
       match rest {
@@ -2056,7 +2078,7 @@ fn derive_ord_record_chain(head: FieldDecl, rest: [FieldDecl], idx: Int,
                                           mk_expr(mk_int_synth(0), line, col)),
                              line, col)
           let then_e = mk_ref(cvar, line, col)
-          let else_e = derive_ord_record_chain(next, more, idx + 1, line, col)
+          let else_e = derive_ord_record_chain(opk, next, more, idx + 1, line, col)
           let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
           mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
         }
@@ -2065,30 +2087,30 @@ fn derive_ord_record_chain(head: FieldDecl, rest: [FieldDecl], idx: Int,
   }
 }
 
-fn derive_ord_sum_body(variants: [Variant], line: Int, col: Int) : Expr {
+fn derive_ord_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
   let scrut = mk_ref("a", line, col)
-  let arms = derive_ord_sum_outer_arms(variants, variants, 0, line, col)
+  let arms = derive_ord_sum_outer_arms(opk, variants, variants, 0, line, col)
   mk_expr(EMatch(scrut, arms), line, col)
 }
 
-fn derive_ord_sum_outer_arms(remaining: [Variant], all_variants: [Variant],
+fn derive_ord_sum_outer_arms(opk: ExprKind, remaining: [Variant], all_variants: [Variant],
                               idx: Int, line: Int, col: Int) : [Arm] {
   match remaining {
     [] -> []
     [v, ...rest] -> {
-      let arm = derive_ord_sum_outer_arm(v, all_variants, idx, line, col)
-      [arm, ...derive_ord_sum_outer_arms(rest, all_variants, idx + 1, line, col)]
+      let arm = derive_ord_sum_outer_arm(opk, v, all_variants, idx, line, col)
+      [arm, ...derive_ord_sum_outer_arms(opk, rest, all_variants, idx + 1, line, col)]
     }
   }
 }
 
-fn derive_ord_sum_outer_arm(outer_v: Variant, all_variants: [Variant],
+fn derive_ord_sum_outer_arm(opk: ExprKind, outer_v: Variant, all_variants: [Variant],
                              outer_idx: Int, line: Int, col: Int) : Arm {
   match outer_v {
     Var(name, vargs) -> {
       let outer_pat_subs = derive_ord_sum_pat_subs(vargs, "a", 0, line, col)
       let outer_pat = mk_pat(PVariant(None, name, outer_pat_subs), line, col)
-      let inner = derive_ord_sum_inner_match(outer_v, outer_idx,
+      let inner = derive_ord_sum_inner_match(opk, outer_v, outer_idx,
                                               all_variants, line, col)
       Arm(outer_pat, None, inner)
     }
@@ -2107,10 +2129,10 @@ fn derive_ord_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
   }
 }
 
-fn derive_ord_sum_inner_match(outer_v: Variant, outer_idx: Int,
+fn derive_ord_sum_inner_match(opk: ExprKind, outer_v: Variant, outer_idx: Int,
                                all_variants: [Variant], line: Int, col: Int) : Expr {
   let scrut = mk_ref("b", line, col)
-  let arms = derive_ord_sum_inner_arms(outer_v, outer_idx, all_variants,
+  let arms = derive_ord_sum_inner_arms(opk, outer_v, outer_idx, all_variants,
                                         0, line, col)
   mk_expr(EMatch(scrut, arms), line, col)
 }
@@ -2124,7 +2146,7 @@ fn derive_ord_sum_inner_match(outer_v: Variant, outer_idx: Int,
 #                         <payload chain>`. After the self arm, fold
 #                         every later variant under a single
 #                         `_ -> -1` wildcard and stop.
-fn derive_ord_sum_inner_arms(outer_v: Variant, outer_idx: Int,
+fn derive_ord_sum_inner_arms(opk: ExprKind, outer_v: Variant, outer_idx: Int,
                               variants: [Variant], idx: Int,
                               line: Int, col: Int) : [Arm] {
   match variants {
@@ -2132,10 +2154,10 @@ fn derive_ord_sum_inner_arms(outer_v: Variant, outer_idx: Int,
     [v, ...rest] -> {
       if idx < outer_idx {
         let arm = derive_ord_sum_wild_arm(v, 1, line, col)
-        [arm, ...derive_ord_sum_inner_arms(outer_v, outer_idx, rest,
+        [arm, ...derive_ord_sum_inner_arms(opk, outer_v, outer_idx, rest,
                                             idx + 1, line, col)]
       } else if idx == outer_idx {
-        let self_arm = derive_ord_sum_self_arm(outer_v, line, col)
+        let self_arm = derive_ord_sum_self_arm(opk, outer_v, line, col)
         match rest {
           [] -> [self_arm]
           _  -> [self_arm, derive_ord_sum_default_arm(-1, line, col)]
@@ -2179,25 +2201,25 @@ fn derive_ord_sum_default_arm(ret: Int, line: Int, col: Int) : Arm {
 # `Variant(b0, b1, ...) -> <payload chain>` — the same-variant case.
 # Payloads are compared field-by-field in declaration order; the
 # first non-zero `cmp` wins.
-fn derive_ord_sum_self_arm(v: Variant, line: Int, col: Int) : Arm {
+fn derive_ord_sum_self_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
   match v {
     Var(name, vargs) -> {
       let inner_pat_subs = derive_ord_sum_pat_subs(vargs, "b", 0, line, col)
       let pat = mk_pat(PVariant(None, name, inner_pat_subs), line, col)
-      let body = derive_ord_payload_chain(vargs, 0, line, col)
+      let body = derive_ord_payload_chain(opk, vargs, 0, line, col)
       Arm(pat, None, body)
     }
   }
 }
 
-fn derive_ord_payload_chain(vargs: [TypeExpr], idx: Int,
+fn derive_ord_payload_chain(opk: ExprKind, vargs: [TypeExpr], idx: Int,
                              line: Int, col: Int) : Expr {
   match vargs {
     [] -> mk_expr(mk_int_synth(0), line, col)
     [_, ...rest] -> {
       let av = mk_ref(concat_all(["a", int_to_string(idx)]), line, col)
       let bv = mk_ref(concat_all(["b", int_to_string(idx)]), line, col)
-      let cmp_call = mk_expr(ECall(mk_ref("cmp", line, col), [av, bv]),
+      let cmp_call = mk_expr(ECall(mk_expr(opk, line, col), [av, bv]),
                              line, col)
       match rest {
         [] -> cmp_call
@@ -2209,7 +2231,7 @@ fn derive_ord_payload_chain(vargs: [TypeExpr], idx: Int,
                                           mk_expr(mk_int_synth(0), line, col)),
                              line, col)
           let then_e = mk_ref(cvar, line, col)
-          let else_e = derive_ord_payload_chain(rest, idx + 1, line, col)
+          let else_e = derive_ord_payload_chain(opk, rest, idx + 1, line, col)
           let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
           mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
         }
@@ -2257,9 +2279,9 @@ fn derive_binser_decls(tname: String, shown: String, put: Expr, from_b: Expr,
 # buffer. The masking pass keeps this pure because a derived writer
 # mutates only its buffer (`writes_only_first_arg`).
 fn derive_binser_to_bytes(tname: String, line: Int, col: Int) : Expr {
-  let fresh = binser_call("bin_buf_new", [], line, col)
+  let fresh = binser_lib("bin_buf_new", [], line, col)
   let put = binser_call(binser_put_name(tname), [fresh, mk_ref("self", line, col)], line, col)
-  binser_call("bin_buf_bytes", [put], line, col)
+  binser_lib("bin_buf_bytes", [put], line, col)
 }
 
 # `fn <writer>(buf: BinBuf, self: T) : BinBuf / Mutable` appends `self`
@@ -2278,6 +2300,10 @@ fn binser_put_name(tname: String) : String = concat_all([derived_writer_prefix()
 
 fn binser_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
   mk_expr(ECall(mk_ref(name, line, col), args), line, col)
+
+# A call of a function the core module of `BinSerialize` declares.
+fn binser_lib(name: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(derive_lib_ref(CmProtocols, name, line, col), args), line, col)
 
 # `impl BinSerialize for T { fn to_bytes ... fn from_bytes ... }`
 #
@@ -2408,7 +2434,7 @@ fn derive_binser_put_via(comb: String, acc: Expr, v: Expr, elem: TypeExpr, write
   let bx = Param { pname: "__bx", ptype: None, pline: line, pcol: lcol, pborrow: false }
   let body = derive_binser_put_at(mk_ref("__bw", line, lcol), mk_ref("__bx", line, lcol),
                                   elem, writers, line, col, depth + 1)
-  binser_call(comb, [acc, v, mk_expr(ELambda([bw, bx], body), line, lcol)], line, col)
+  binser_lib(comb, [acc, v, mk_expr(ELambda([bw, bx], body), line, lcol)], line, col)
 }
 
 # A primitive leaf is written straight into the buffer. Any other head
@@ -2422,10 +2448,10 @@ fn derive_binser_put_leaf(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String]
     binser_call(binser_put_name(head), [acc, v], line, col)
   } else {
     match binser_prim_writer(binser_leaf_ty(resolve_ty(ftype))) {
-      Some(w) -> binser_call(w, [acc, v], line, col)
+      Some(w) -> binser_lib(w, [acc, v], line, col)
       None    -> {
         let enc = proto_mangled_fn("BinSerialize", head, "to_bytes")
-        binser_call("bin_buf_put", [acc, binser_call(enc, [v], line, col)], line, col)
+        binser_lib("bin_buf_put", [acc, binser_call(enc, [v], line, col)], line, col)
       }
     }
   }
@@ -2456,7 +2482,7 @@ fn derive_binser_decode_call_at(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
       let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
                                                 depth + 1)
       let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
-      mk_expr(ECall(mk_ref("bin_list_from_bytes", line, col),
+      mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_list_from_bytes", line, col),
                     [buf_e, pos_e, dec_lam]), line, col)
     }
     TyName(_, _, _) -> match binser_option_elem(ftype) {
@@ -2469,11 +2495,11 @@ fn derive_binser_decode_call_at(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
         let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
                                                   depth + 1)
         let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
-        mk_expr(ECall(mk_ref("bin_option_from_bytes", line, col),
+        mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_option_from_bytes", line, col),
                       [buf_e, pos_e, dec_lam]), line, col)
       }
       None -> match resolve_ty(ftype) {
-        TyChar -> mk_expr(ECall(mk_ref("bin_char_from_bytes", line, col),
+        TyChar -> mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_char_from_bytes", line, col),
                                 [buf_e, pos_e]), line, col)
         _      -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
       }
@@ -2519,9 +2545,9 @@ fn derive_binser_field_guard(ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Exp
   match binser_prim_reader(ftype) {
     Some(r) -> {
       let evar = binser_end_var(idx)
-      let end_e = binser_call(binser_prim_end(r), [buf_e, pos_e], line, col)
+      let end_e = binser_lib(binser_prim_end(r), [buf_e, pos_e], line, col)
       let bad = mk_expr(EBinop(BoLt, mk_ref(evar, line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
-      let err = binser_call("Err", [binser_call("bin_end_error", [mk_ref(evar, line, col)], line, col)], line, col)
+      let err = binser_call("Err", [binser_lib("bin_end_error", [mk_ref(evar, line, col)], line, col)], line, col)
       let bind = SLet(mk_pat(PBind(evar), line, col), None, end_e)
       mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(then_e)), line, col))), line, col)
     }
@@ -2540,7 +2566,7 @@ fn derive_binser_field_next(ftype: TypeExpr, idx: Int, line: Int, col: Int) : Ex
 # The decoded value of field `idx`, which starts at `pos_e`.
 fn derive_binser_field_value(ftype: TypeExpr, idx: Int, pos_e: Expr, line: Int, col: Int) : Expr =
   match binser_prim_reader(ftype) {
-    Some(r) -> binser_call(binser_prim_at(r), [mk_ref("buf", line, col), pos_e], line, col)
+    Some(r) -> binser_lib(binser_prim_at(r), [mk_ref("buf", line, col), pos_e], line, col)
     None    -> mk_expr(EField(mk_ref(binser_cursor_var(idx), line, col), "value"), line, col)
   }
 
@@ -2697,7 +2723,7 @@ fn derive_binser_put_arm(v: Variant, idx: Int, writers: [String],
     Var(name, vargs) -> {
       let pat = mk_pat(PVariant(None, name, derive_binser_sum_pat_subs(vargs, "p", 0, line, col)),
                        line, col)
-      let tag = binser_call("bin_buf_byte", [mk_ref("buf", line, col),
+      let tag = binser_lib("bin_buf_byte", [mk_ref("buf", line, col),
                                              mk_expr(mk_int_synth(idx), line, col)], line, col)
       Arm(pat, None, derive_binser_put_payload(tag, vargs, 0, writers, line, col + idx * 256))
     }
@@ -2739,14 +2765,14 @@ fn derive_binser_put_payload(acc: Expr, vargs: [TypeExpr], i: Int, writers: [Str
 # the variant's constructor call.
 fn derive_binser_sum_from_bytes(tname: String, variants: [Variant],
                                   line: Int, col: Int) : Expr {
-  let tag_e = binser_call("bin_tag_at", [mk_ref("buf", line, col), mk_ref("pos", line, col)], line, col)
+  let tag_e = binser_lib("bin_tag_at", [mk_ref("buf", line, col), mk_ref("pos", line, col)], line, col)
   let inner_pos = mk_expr(EBinop(BoAdd, mk_ref("pos", line, col),
                                        mk_expr(mk_int_synth(1), line, col)),
                            line, col)
   let chain = derive_binser_sum_tag_chain(tname, variants, 0, inner_pos,
                                             line, col)
   let bad = mk_expr(EBinop(BoLt, mk_ref("__tag", line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
-  let err = binser_call("Err", [binser_call("bin_end_error", [mk_ref("__tag", line, col)], line, col)], line, col)
+  let err = binser_call("Err", [binser_lib("bin_end_error", [mk_ref("__tag", line, col)], line, col)], line, col)
   let bind = SLet(mk_pat(PBind("__tag"), line, col), None, tag_e)
   mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(chain)), line, col))), line, col)
 }
@@ -2812,47 +2838,47 @@ fn derive_binser_sum_decode_chain(vname: String, remaining: [TypeExpr],
 # (recursive types are legal). The user gets a typer-time message
 # pointing at the offending field instead of the dispatcher's
 # generic runtime panic.
-fn validate_derive_binserialize(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
+fn validate_derive_binserialize(ps: PScope, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
 
-  let providers = collect_binser_types(decls, true, [])
-  list_reverse(validate_derive_binser_loop(decls, df, providers, []))
+  let providers = collect_binser_types(ps, decls, true, [])
+  list_reverse(validate_derive_binser_loop(ps, decls, df, providers, []))
 }
 
 # Types deriving BinSerialize, plus with `impls` those with a
 # hand-written impl.
-fn collect_binser_types(decls: [Decl], impls: Bool, acc: [String]) : [String] {
+fn collect_binser_types(ps: PScope, decls: [Decl], impls: Bool, acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, _, _, _, _, isym) ->
-        if impls and spells_gen(pname, CpBinSerialize) {
-          collect_binser_types(rest, impls, [proto_type_name(target), ...acc])
+      DImpl(pname, _, target, ms, _, _, _, isym) ->
+        if impls and picks_gen(ps, pname, impl_home_of(ms), CpBinSerialize) {
+          collect_binser_types(ps, rest, impls, [proto_type_name(target), ...acc])
         } else {
-          collect_binser_types(rest, impls, acc)
+          collect_binser_types(ps, rest, impls, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, _, _, _, _, _, _) ->
-          if derives_gen(names, CpBinSerialize) {
-            collect_binser_types(rest, impls, [tname, ...acc])
+          if derives_gen(ps, names, derive_from(ps, inner), CpBinSerialize) {
+            collect_binser_types(ps, rest, impls, [tname, ...acc])
           } else {
-            collect_binser_types(rest, impls, acc)
+            collect_binser_types(ps, rest, impls, acc)
           }
-        _ -> collect_binser_types(rest, impls, acc)
+        _ -> collect_binser_types(ps, rest, impls, acc)
       }
       DUnstable(inner, _, _) ->
-        collect_binser_types([inner, ...rest], impls, acc)
+        collect_binser_types(ps, [inner, ...rest], impls, acc)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_binser_types([inner, ...rest], impls, acc)
+        collect_binser_types(ps, [inner, ...rest], impls, acc)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_binser_types([inner, ...rest], impls, acc)
+        collect_binser_types(ps, [inner, ...rest], impls, acc)
       DConstructor(inner, _, _) ->
-        collect_binser_types([inner, ...rest], impls, acc)
-      _ -> collect_binser_types(rest, impls, acc)
+        collect_binser_types(ps, [inner, ...rest], impls, acc)
+      _ -> collect_binser_types(ps, rest, impls, acc)
     }
   }
 }
 
-fn validate_derive_binser_loop(decls: [Decl], df: DiagFiles,
+fn validate_derive_binser_loop(ps: PScope, decls: [Decl], df: DiagFiles,
                                  providers: [String], errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match decls {
@@ -2860,25 +2886,25 @@ fn validate_derive_binser_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _, _) ->
-          if derives_gen(names, CpBinSerialize) {
+          if derives_gen(ps, names, derive_from(ps, inner), CpBinSerialize) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_binser_body(file, tname, body,
                                                      providers, line, col, errs)
-            validate_derive_binser_loop(rest, df, providers, errs1)
+            validate_derive_binser_loop(ps, rest, df, providers, errs1)
           } else {
-            validate_derive_binser_loop(rest, df, providers, errs)
+            validate_derive_binser_loop(ps, rest, df, providers, errs)
           }
-        _ -> validate_derive_binser_loop(rest, df, providers, errs)
+        _ -> validate_derive_binser_loop(ps, rest, df, providers, errs)
       }
       DUnstable(inner, _, _) ->
-        validate_derive_binser_loop([inner, ...rest], df, providers, errs)
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derive_binser_loop([inner, ...rest], df, providers, errs)
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derive_binser_loop([inner, ...rest], df, providers, errs)
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
       DConstructor(inner, _, _) ->
-        validate_derive_binser_loop([inner, ...rest], df, providers, errs)
-      _ -> validate_derive_binser_loop(rest, df, providers, errs)
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
+      _ -> validate_derive_binser_loop(ps, rest, df, providers, errs)
     }
   }
 }
@@ -2984,35 +3010,35 @@ fn binser_collection_head(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve
 # pass the omission surfaces only as a missing `to_bytes` at the first
 # call site. Walks the original decl stream and reports each offending
 # field with the remedy that applies to it.
-fn validate_derive_layout(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console =
-  list_reverse(validate_derive_layout_loop(decls, df, []))
+fn validate_derive_layout(ps: PScope, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console =
+  list_reverse(validate_derive_layout_loop(ps, decls, df, []))
 
-fn validate_derive_layout_loop(decls: [Decl], df: DiagFiles,
+fn validate_derive_layout_loop(ps: PScope, decls: [Decl], df: DiagFiles,
                                  errs: [Diagnostic]) : [Diagnostic] / Console {
   match decls {
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _, _) ->
-          if derives_gen(names, CpLayout) {
+          if derives_gen(ps, names, derive_from(ps, inner), CpLayout) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_layout_body(file, tname, body,
                                                      line, col, errs)
-            validate_derive_layout_loop(rest, df, errs1)
+            validate_derive_layout_loop(ps, rest, df, errs1)
           } else {
-            validate_derive_layout_loop(rest, df, errs)
+            validate_derive_layout_loop(ps, rest, df, errs)
           }
-        _ -> validate_derive_layout_loop(rest, df, errs)
+        _ -> validate_derive_layout_loop(ps, rest, df, errs)
       }
       DUnstable(inner, _, _) ->
-        validate_derive_layout_loop([inner, ...rest], df, errs)
+        validate_derive_layout_loop(ps, [inner, ...rest], df, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derive_layout_loop([inner, ...rest], df, errs)
+        validate_derive_layout_loop(ps, [inner, ...rest], df, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derive_layout_loop([inner, ...rest], df, errs)
+        validate_derive_layout_loop(ps, [inner, ...rest], df, errs)
       DConstructor(inner, _, _) ->
-        validate_derive_layout_loop([inner, ...rest], df, errs)
-      _ -> validate_derive_layout_loop(rest, df, errs)
+        validate_derive_layout_loop(ps, [inner, ...rest], df, errs)
+      _ -> validate_derive_layout_loop(ps, rest, df, errs)
     }
   }
 }
@@ -3067,34 +3093,34 @@ fn validate_derive_layout_one(file: String, tname: String, fd: FieldDecl,
 # Layout one: `derive_json_impl` returns no decls when a field has no
 # JSON denotation, so without this pass the omission surfaces only as a
 # missing `to_json` at the first call site.
-fn validate_derive_json(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console =
-  list_reverse(validate_derive_json_loop(decls, df, []))
+fn validate_derive_json(ps: PScope, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console =
+  list_reverse(validate_derive_json_loop(ps, decls, df, []))
 
-fn validate_derive_json_loop(decls: [Decl], df: DiagFiles,
+fn validate_derive_json_loop(ps: PScope, decls: [Decl], df: DiagFiles,
                               errs: [Diagnostic]) : [Diagnostic] / Console {
   match decls {
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _, _) ->
-          if derives_gen(names, CpJson) {
+          if derives_gen(ps, names, derive_from(ps, inner), CpJson) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_json_body(file, tname, body, line, col, errs)
-            validate_derive_json_loop(rest, df, errs1)
+            validate_derive_json_loop(ps, rest, df, errs1)
           } else {
-            validate_derive_json_loop(rest, df, errs)
+            validate_derive_json_loop(ps, rest, df, errs)
           }
-        _ -> validate_derive_json_loop(rest, df, errs)
+        _ -> validate_derive_json_loop(ps, rest, df, errs)
       }
       DUnstable(inner, _, _) ->
-        validate_derive_json_loop([inner, ...rest], df, errs)
+        validate_derive_json_loop(ps, [inner, ...rest], df, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derive_json_loop([inner, ...rest], df, errs)
+        validate_derive_json_loop(ps, [inner, ...rest], df, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derive_json_loop([inner, ...rest], df, errs)
+        validate_derive_json_loop(ps, [inner, ...rest], df, errs)
       DConstructor(inner, _, _) ->
-        validate_derive_json_loop([inner, ...rest], df, errs)
-      _ -> validate_derive_json_loop(rest, df, errs)
+        validate_derive_json_loop(ps, [inner, ...rest], df, errs)
+      _ -> validate_derive_json_loop(ps, rest, df, errs)
     }
   }
 }
@@ -3264,45 +3290,45 @@ fn binser_builtin_impl(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve_ty
 # `proto_type_name`, so a field of type `[Int]` looks like `List`
 # in the providers set — and unless `impl Ord for List` is
 # declared, the derive is rejected.
-fn validate_derive_ord(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
+fn validate_derive_ord(ps: PScope, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
 
-  let providers = collect_ord_providers(decls, [])
-  list_reverse(validate_derive_ord_loop(decls, df, providers, []))
+  let providers = collect_ord_providers(ps, decls, [])
+  list_reverse(validate_derive_ord_loop(ps, decls, df, providers, []))
 }
 
-fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
+fn collect_ord_providers(ps: PScope, decls: [Decl], acc: [String]) : [String] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, _, _, _, _, isym) ->
-        if spells_gen(pname, CpOrd) {
-          collect_ord_providers(rest, [proto_type_name(target), ...acc])
+      DImpl(pname, _, target, ms, _, _, _, isym) ->
+        if picks_gen(ps, pname, impl_home_of(ms), CpOrd) {
+          collect_ord_providers(ps, rest, [proto_type_name(target), ...acc])
         } else {
-          collect_ord_providers(rest, acc)
+          collect_ord_providers(ps, rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, _, _, _, _, _, _) ->
-          if derives_gen(names, CpOrd) {
-            collect_ord_providers(rest, [tname, ...acc])
+          if derives_gen(ps, names, derive_from(ps, inner), CpOrd) {
+            collect_ord_providers(ps, rest, [tname, ...acc])
           } else {
-            collect_ord_providers(rest, acc)
+            collect_ord_providers(ps, rest, acc)
           }
-        _ -> collect_ord_providers(rest, acc)
+        _ -> collect_ord_providers(ps, rest, acc)
       }
       DUnstable(inner, _, _) ->
-        collect_ord_providers([inner, ...rest], acc)
+        collect_ord_providers(ps, [inner, ...rest], acc)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_ord_providers([inner, ...rest], acc)
+        collect_ord_providers(ps, [inner, ...rest], acc)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_ord_providers([inner, ...rest], acc)
+        collect_ord_providers(ps, [inner, ...rest], acc)
       DConstructor(inner, _, _) ->
-        collect_ord_providers([inner, ...rest], acc)
-      _ -> collect_ord_providers(rest, acc)
+        collect_ord_providers(ps, [inner, ...rest], acc)
+      _ -> collect_ord_providers(ps, rest, acc)
     }
   }
 }
 
-fn validate_derive_ord_loop(decls: [Decl], df: DiagFiles,
+fn validate_derive_ord_loop(ps: PScope, decls: [Decl], df: DiagFiles,
                               providers: [String], errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match decls {
@@ -3310,26 +3336,26 @@ fn validate_derive_ord_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, tps, body, line, col, _, _, _) ->
-          if derives_gen(names, CpOrd) {
+          if derives_gen(ps, names, derive_from(ps, inner), CpOrd) {
             let file = decl_diag_file(d, df)
             let own = list_append(derive_bound_params(tps), providers)
             let errs1 = validate_derive_ord_body(file, tname, body, own,
                                                   line, col, errs)
-            validate_derive_ord_loop(rest, df, providers, errs1)
+            validate_derive_ord_loop(ps, rest, df, providers, errs1)
           } else {
-            validate_derive_ord_loop(rest, df, providers, errs)
+            validate_derive_ord_loop(ps, rest, df, providers, errs)
           }
-        _ -> validate_derive_ord_loop(rest, df, providers, errs)
+        _ -> validate_derive_ord_loop(ps, rest, df, providers, errs)
       }
       DUnstable(inner, _, _) ->
-        validate_derive_ord_loop([inner, ...rest], df, providers, errs)
+        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derive_ord_loop([inner, ...rest], df, providers, errs)
+        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derive_ord_loop([inner, ...rest], df, providers, errs)
+        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
       DConstructor(inner, _, _) ->
-        validate_derive_ord_loop([inner, ...rest], df, providers, errs)
-      _ -> validate_derive_ord_loop(rest, df, providers, errs)
+        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
+      _ -> validate_derive_ord_loop(ps, rest, df, providers, errs)
     }
   }
 }
@@ -3431,7 +3457,8 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # variant field's head type must already have an impl reachable in
   # this compilation unit. Reported errors short-circuit the typer
   # via `proto_errs > 0` in the driver.
-  let pre_diags = validate_derives(decls, df)
+  let pre_diags = validate_derives(ps, decls, df)
+  let pick_diags = derive_entry_diags(ps, decls, df, [])
   # Step 0b — m12.8.z: validate `#derive(Ord)` against available
   # impls *before* expansion. The synthesised `cmp` body delegates
   # to `cmp` on each field type, and the post-inference rewrite
@@ -3442,24 +3469,31 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # isn't surfaced. This pass walks the original decl stream
   # (DDerive nodes still intact) and emits a clear typer-time error
   # naming the offending field/payload.
-  let derive_diags = list_append(validate_derive_ord(decls, df),
-                     list_append(validate_derive_binserialize(decls, df),
-                     list_append(validate_derive_layout(decls, df),
-                                 validate_derive_json(decls, df))))
-  # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
-  # decls so subsequent steps see all impls uniformly.
-  let exp = expand_derives(decls, target_mod)
+  let derive_diags = list_append(validate_derive_ord(ps, decls, df),
+                     list_append(validate_derive_binserialize(ps, decls, df),
+                     list_append(validate_derive_layout(ps, decls, df),
+                                 validate_derive_json(ps, decls, df))))
+  # Step 1 — collect every protocol op into the registry, each entry
+  # tagged with its declaring module's home, and synthesise one
+  # dispatcher fn per op so the typer can resolve the call as ordinary
+  # polymorphic dispatch; the post-inference rewrite redirects each
+  # reachable call to the matching `__pimpl_*` direct call. A derive
+  # adds no protocol, and its bodies name the dispatchers by id.
+  let reg0 = reg_with_scope(collect_proto_decls(decls, proto_reg_empty(), ps), cores, imports, ps)
+  let disp_gen = generate_dispatchers(reg0)
+  let dispatchers = disp_gen.decls
+  # Step 2 — expand `#derive(...)` annotations into synthetic DImpl
+  # decls so subsequent steps see all impls uniformly. The home-anchor
+  # stream scopes the impl validations below, so it is computed once
+  # here.
+  let exp = expand_derives(DeriveCx { ps: ps, ids: disp_gen.ids, cores: cores }, decls, target_mod)
   let expanded = match exp { Expanded(ds, _) -> ds }
-  # Step 2 — collect every protocol op into the registry, each entry
-  # tagged with its declaring module's home. The same home-anchor
-  # stream also scopes the impl validations below, so it is computed
-  # once here.
   let homes = imports_home_anchors(expanded, target_mod, target_mod, [])
-  let reg0 = reg_with_scope(collect_proto_decls(expanded, proto_reg_empty(), ps), cores, imports, ps)
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
   let coh_diags = validate_impls(expanded, homes, df, reg0, target_mod, ps)
+  each(pick_diags, render_diag)
   each(coh_diags, render_diag)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
@@ -3467,18 +3501,13 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # impl's own module sees — never a same-named one elsewhere.
   let impl_diags = validate_impl_methods(expanded, homes, df, reg0, target_mod, ps)
   each(impl_diags, render_diag)
-  let diags = list_append(pre_diags, list_append(derive_diags, list_append(coh_diags, impl_diags)))
+  let diags = list_append(pre_diags, list_append(derive_diags,
+                list_append(pick_diags, list_append(coh_diags, impl_diags))))
   let errs = list_length(diags)
   # Step 4 — lower each DImpl method into a top-level DFn (mangled
   # name) and record the (P, T) -> impl_fn entry in the registry.
   let lower_res = lower_impls(expanded, reg0, ps, [])
-  # Step 5 — synthesise one dispatcher fn per protocol op so the
-  # typer can resolve the call as ordinary polymorphic dispatch; the
-  # post-inference rewrite redirects each reachable call to the
-  # matching `__pimpl_*` direct call.
-  let disp_gen = generate_dispatchers(lower_res.reg)
-  let dispatchers = disp_gen.decls
-  # Step 6 — drop DProtocol / DImpl / DDerive from the decl stream.
+  # Step 5 — drop DProtocol / DImpl / DDerive from the decl stream.
   let stripped = strip_protocols(expanded)
   # Two homonymous types' impls mint one symbol; the root entry's is
   # respelled so every impl function keeps a name of its own.
