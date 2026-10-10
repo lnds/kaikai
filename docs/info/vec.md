@@ -161,6 +161,9 @@ fn main() : Unit / Stdout = {
 - Writes copy when the vector is shared — including while a slice is
   live. To stay on the in-place fast path, thread the vector linearly
   and let slices die before writing.
+- Reading the vector to compute what it writes stays in place:
+  `vec_set(v, i, vec_get(v, i) + 1)` copies nothing. A read that runs
+  after the write sees the old vector, so that write copies.
 - Equality (`==`) is structural, element by element.
 
 ## See also

@@ -54,6 +54,7 @@ import compiler.perceus_payer
 import compiler.perceus_branch_pay
 import compiler.perceus_branch_plant
 import compiler.perceus_path_move
+import compiler.perceus_lend_order
 import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
 import compiler.consume_index
@@ -1441,12 +1442,13 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # Boxed locals whose single read a short circuit may skip take
         # the same force-dup + exit-drop treatment as the mixed path.
         let branchy_lets = pcs_branchy_let_binders(body, me, uses, [])
-        let new_body0 = pcs_rewrite_expr(body, [], uses, false, [], branchy_lets, bmap, [])
+        let lend_lets = pcs_lend_move_lets(body, uses, pcs_collect_opaque_let_binders(body, opaque_ret_fns, []), bmap)
+        let new_body0 = pcs_rewrite_expr(body, [], uses, false, lend_lets, branchy_lets, bmap, lend_lets)
         # A boxed local whose last read sits in the tail needs the same
         # post-tail release as the mixed path — this body shape is where
         # every read of a multi-use local can land in a borrowed slot and
         # orphan the birth ref.
-        let new_body = ptd_tail_exit_drops(new_body0, me, uses, [], branchy_lets,
+        let new_body = ptd_tail_exit_drops(new_body0, me, uses, lend_lets, branchy_lets,
                                            pcs_borrow_lookup(bmap, bv_fid_key(fsym)))
         let arm_dropped = pcs_arm_drop_pass(new_body, me, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [],
                                                                        borrowed: [], bmap: bm_empty(), forced: branchy_lets })
@@ -1458,7 +1460,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # borrowed/raw/skip sets and no `no_wrap` names.
         let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
-                            no_wrap: [], uses: uses, fns: fns, cores: cores }
+                            no_wrap: lend_lets, uses: uses, fns: fns, cores: cores }
         let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo, fsym)
       }
@@ -1550,7 +1552,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # Arm binders of a borrowed param read only in borrowed slots: released
         # as their arm starts, every read a borrow.
         let borrow_only = prt_borrow_only_binders(body, borrowed, (c) => pcs_user_borrow_slots(bmap, c))
-        let move_last_set = pcs_strs_minus(
+        let move_last0 = pcs_strs_minus(
           pcs_list_union(
             pcs_strs_inter(
               pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap),
@@ -1561,11 +1563,15 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # drop (each shim call consumes a dup; the birth ref is released
         # here, even when the last use is in tail position).
         let opaque_lets = pcs_collect_opaque_let_binders(body, opaque_ret_fns, [])
+        # Lets lent and then handed over: bare on every read, paid by the
+        # owning one, so they join both the moved set and the payers' set.
+        let lend_lets = pcs_lend_move_lets(body, uses, pcs_list_union(skip_set, opaque_lets), bmap)
+        let move_last_set = pcs_list_union(move_last0, lend_lets)
         # `rewrite_skip_set` suppresses the dup wrap for #1126 borrow-move
         # params too, so the re-thread transfers raw. The exit-drop set
         # (`skip_set`) deliberately excludes them: the base arm still frees
         # the container. Keep the two sets distinct.
-        let moved0 = pcs_list_union(skip_set, borrow_move_params)
+        let moved0 = pcs_list_union(pcs_list_union(skip_set, borrow_move_params), lend_lets)
         # Arm binders read at most once per path move on every read; the
         # branch payer releases them on the alternatives that skip them.
         let path_moves = ppm_path_moves(body, uses, pcs_list_union(moved0, pnames), borrowed,
@@ -2552,8 +2558,8 @@ pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr,
                                     bmap: BorrowMap) : [String] = match pnames {
   []           -> []
   [h, ...rest] -> {
-    # Borrowed reads still count here: the branch planter assumes one read
-    # per path, and a lent read ahead of the move is a second one.
+    # A lent read ahead of the move is a second read to the branch planter,
+    # which then declines; every path consumes, so it has nothing to plant.
     let rest_skip = pcs_branch_aware_skip_params(rest, body, bmap)
     if pcs_param_moves_raw(h, body, bmap) { [h, ...rest_skip] } else { rest_skip }
   }
@@ -2561,9 +2567,23 @@ pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr,
 
 # Each condition walks the body, so a failing one spares the rest.
 fn pcs_param_moves_raw(h: String, body: Expr, bmap: BorrowMap) : Bool =
-  pcs_max_paths_in_expr(h, body) <= 1 and
+  (pcs_max_paths_in_expr(h, body) <= 1 or pcs_lends_end_first(h, body, bmap)) and
   pcs_consumed_b_expr(h, body, bmap) and
   pcs_all_consumers_linear(h, body)
+
+# One owning read on every path, every lend on that path over before it.
+fn pcs_lends_end_first(nm: String, e: Expr, bmap: BorrowMap) : Bool =
+  plo_moves_after_lends(nm, e, (f) => pcs_borrow_slots(bmap, f))
+
+# A `let` owns what it binds, as a param does: its one owning read per path
+# hands the reference on once every lend of it is over.
+fn pcs_lend_move_lets(body: Expr, uses: UseIx, skip: [String], bmap: BorrowMap) : [String] =
+  plo_lend_move_lets(body, uses, skip, (nm, scope) => pcs_let_lends_then_moves(nm, scope, bmap))
+
+fn pcs_let_lends_then_moves(nm: String, scope: Expr, bmap: BorrowMap) : Bool =
+  pcs_lends_end_first(nm, scope, bmap) and
+  pcs_all_consumers_linear(nm, scope) and
+  pcs_consumed_b_expr(nm, scope, bmap)
 
 # Issue #599 extended to LOCALS (arm-level pattern binders). A match-arm
 # binder `l` whose body reads it at most once on any path (branch-aware

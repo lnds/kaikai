@@ -6991,8 +6991,8 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135.rc \
 	  || { echo "perceus-1135-vec-raw FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135.rc || true; exit 1; }; \
-	grep -q 'vec_inplace=233 vec_cow=57' build/s2-vec_bare_words.rc \
-	  || { echo "perceus-1135-vec-raw FAIL (bare words: expected vec_inplace=233 vec_cow=57)"; \
+	grep -q 'vec_inplace=283 vec_cow=7' build/s2-vec_bare_words.rc \
+	  || { echo "perceus-1135-vec-raw FAIL (bare words: expected vec_inplace=283 vec_cow=7)"; \
 	       grep vec_ build/s2-vec_bare_words.rc || true; exit 1; }; \
 	echo "perceus-1135-vec-raw OK (raw moves ride unique-or-copy; qualified self-call keeps the goto)"
 
@@ -7009,8 +7009,8 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135-n.rc \
 	  || { echo "perceus-1135-vec-raw-native FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135-n.rc || true; exit 1; }; \
-	grep -q 'vec_inplace=233 vec_cow=57' build/s2-vec_bare_words-n.rc \
-	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: expected vec_inplace=233 vec_cow=57)"; \
+	grep -q 'vec_inplace=283 vec_cow=7' build/s2-vec_bare_words-n.rc \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: expected vec_inplace=283 vec_cow=7)"; \
 	       grep vec_ build/s2-vec_bare_words-n.rc || true; exit 1; }; \
 	KAI_NATIVE_DUMP_IR=build/s2-vec_bare_words-n.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/vec_bare_words.kai -o build/s2-vec_bare_words-ir 2> build/s2-vec_bare_words-ir.err \
 	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: whole-program build errored)"; cat build/s2-vec_bare_words-ir.err; exit 1; }; \
@@ -7025,6 +7025,50 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	diff -q ../examples/stdlib/vec_bare_word_traps.out.expected build/s2-vec_bare_word_traps-n.out > /dev/null \
 	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: output diff)"; diff ../examples/stdlib/vec_bare_word_traps.out.expected build/s2-vec_bare_word_traps-n.out; exit 1; }; \
 	echo "perceus-1135-vec-raw-native OK (counters + outputs match the C-direct gate)"
+
+# A read of a vector that feeds its own write is a lend that ends before the
+# write runs. Each entry is `fixture:in-place:copies`: the output must match
+# the golden and the KAI_TRACE_RC counters must be exactly those. The first
+# two write a uniquely owned vector in place whether the read sits in the
+# write's arguments or in an earlier `let`, on a param or on a local. The
+# third reads after the write, so each of its writes must copy.
+PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4
+
+test-perceus-vec-lend-write: $(TARGET) build
+	@set -e; \
+	for fx in $(PERCEUS_VEC_LEND_FIXTURES); do \
+	  name=$${fx%%:*}; \
+	  want="vec_inplace=$$(echo $$fx | cut -d: -f2) vec_cow=$$(echo $$fx | cut -d: -f3)"; \
+	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	    || { echo "perceus-vec-lend-write FAIL ($$name kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    || { echo "perceus-vec-lend-write FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	  got="$$(grep -o 'vec_inplace=[0-9]* vec_cow=[0-9]*' build/s2-$$name.rc || true)"; \
+	  [ "$$got" = "$$want" ] \
+	    || { echo "perceus-vec-lend-write FAIL ($$name: expected $$want, got $$got)"; exit 1; }; \
+	done; \
+	echo "perceus-vec-lend-write OK (lent-then-written vectors stay in place; a read after the write copies)"
+
+.PHONY: test-perceus-vec-lend-write-native
+test-perceus-vec-lend-write-native: $(TARGET) bin-kai build
+	@set -e; \
+	for fx in $(PERCEUS_VEC_LEND_FIXTURES); do \
+	  name=$${fx%%:*}; \
+	  want="vec_inplace=$$(echo $$fx | cut -d: -f2) vec_cow=$$(echo $$fx | cut -d: -f3)"; \
+	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
+	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
+	    || { echo "perceus-vec-lend-write-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
+	    || { echo "perceus-vec-lend-write-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
+	  got="$$(grep -o 'vec_inplace=[0-9]* vec_cow=[0-9]*' build/s2-$$name-n.rc || true)"; \
+	  [ "$$got" = "$$want" ] \
+	    || { echo "perceus-vec-lend-write-native FAIL ($$name: expected $$want, got $$got)"; exit 1; }; \
+	done; \
+	echo "perceus-vec-lend-write-native OK (counters + outputs match the C-direct gate)"
 
 # Issue #1151 — recursive vec_push growth from empty. A loop threading
 # the vec through the stdlib module call appends on the SHARED (CoW)
