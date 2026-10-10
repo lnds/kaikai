@@ -1417,8 +1417,8 @@ fn check_default_coverage_loop(df: DiagFiles, all_decls: [Decl],
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, fid, _, _, _, _, body, _, _, mo) -> {
-        let acc1 = walk_coverage_expr(decl_diag_file(d, df), all_decls, cx, decl_is_entry(homes, mo, fid), body, [], acc)
+      DFn(_, fid, _, _, _, _, body, _, _, _) -> {
+        let acc1 = walk_coverage_expr(decl_diag_file(d, df), all_decls, cx, decl_types_as_entry(homes, fid), body, [], acc)
         check_default_coverage_loop(df, all_decls, cx, homes, rest, acc1)
       }
       _ -> check_default_coverage_loop(df, all_decls, cx, homes, rest, acc)
@@ -3844,7 +3844,7 @@ pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
   match d {
     DFn(_, fid, tparams, params, opt_ret, rexpr, _, _, _, dmo) -> {
       let hv = tsh_view(homes, dmo)
-      let phantom = elaborate_phantom_row(rexpr, decl_is_entry(homes, dmo, fid))
+      let phantom = elaborate_phantom_row(rexpr, decl_types_as_entry(homes, fid))
       # collect row-variable names per decl, allocate small
       # bound ids (0, 1, ...) in order of appearance, build the body
       # type with those ids in tail positions. The scheme generalises
@@ -3924,11 +3924,15 @@ fn elaborate_phantom_row(rexpr: RowExpr, entry: Bool) : Bool {
   }
 }
 
-# A file types the same whether it is the root or loaded as a module (an
-# import, a member of a grouped test build), so the entry rules apply to
-# the function each module would start at were it the root.
-fn decl_is_entry(hs: TyHomes, mo: Option[String], f: FnId) : Bool =
-  is_file_entry(tsh_target(hs), mo, f)
+# A root module's `main` types as the entry point it is when its file is
+# built alone, whether or not this binary starts there.
+fn decl_types_as_entry(hs: TyHomes, f: FnId) : Bool =
+  is_root_main(tsh_roots(hs), f)
+
+# What an unhandled effect is told when its function `f` declares no row:
+# an imported module's `main` gets none of the entry point's.
+fn unrowed_notes(st: InferState, f: FnId) : [String] =
+  if is_imported_main(tsh_roots(st.env.ty_homes), st_mo(st), f) { [imported_main_note()] } else { [] }
 
 # walk a decl's signature for lowercase identifiers in type
 # position, appending them in first-seen order. Skip names already
@@ -4314,7 +4318,7 @@ pub fn build_ty_env(decls: [Decl], tab: SymTab) : BuiltEnv {
   # harvest the union summary once and stash it on the
   # env so every downstream typer query (`variants_of_type`,
   # `union_upcast_ok`, the collision diagnostic) sees the same data.
-  let homes = tsh_homes(decls, tab, fv_empty(), "")
+  let homes = tsh_homes(decls, tab, fv_empty(), "", roots_of("", []))
   let unions = ut_add(ut_empty(), collect_union_rows(decls, tab, tsh_view(homes, None)))
   # pre-compute top-level type names so variant
   # registration can skip ctor entries whose name shadows.
@@ -17626,7 +17630,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # Without this advance, the inferencer's first fresh row var
       # would alias `phantom_id = len(rbinds)`, which the scheme
       # already quantifies over.
-      let entry = decl_is_entry(env.ty_homes, mo, fid)
+      let entry = decl_types_as_entry(env.ty_homes, fid)
       let phantom_extra = if elaborate_phantom_row(row, entry) { 1 } else { 0 }
       let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: rbinds }, list_length(rbinds) + phantom_extra)
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
@@ -17725,7 +17729,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # `mask_local_mutable_demand` and is a no-op when `Mutable`
       # is not in the row to begin with.
       let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr)
-      let st2pre = check_body_row(st1c, nm, entry, row, rbinds, line, col, all_decls)
+      let st2pre = check_body_row(st1c, nm, entry, fid, row, rbinds, line, col, all_decls)
       # drain the deferred field-access constraints now that
       # the body's tyvars have settled — `check_body_row` above unified
       # the inferred effect row against the declared one, so a generic
@@ -17907,7 +17911,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
   # audit point for FFI stays on the wrappers' public `/ Ffi` rows.
   let st2pre = check_body_row_label_loop(rb.st, "main",
     test_non_absorbed_labels(rb.st, rb.st.row, all_decls),
-    [], line, col)
+    [], [], line, col)
   let hd = drain_deferred_homs(st2pre, list_reverse(st2pre.deferred_homs), [])
   let st2 = hd.st
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
@@ -18350,11 +18354,11 @@ fn subst_tparams_tes(ts: [TypeExpr], mapping: [TParamMapEntry]) : [TypeExpr] {
 # Every effect the body performs, including the labels and tail of each
 # row variable it performs, must appear in the declared row. Row
 # variables resolve only once the body is typed, so they are checked here.
-fn check_body_row(st: InferState, fname: String, entry: Bool, declared: RowExpr, rbinds: [RVBind],
+fn check_body_row(st: InferState, fname: String, entry: Bool, f: FnId, declared: RowExpr, rbinds: [RVBind],
                   line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable =
   if declares_row_hole(declared) { st }
   else {
-    let st1 = check_body_labels(st_add_tail_labels(st, st.row_tails), fname, entry, declared, line, col, decls)
+    let st1 = check_body_labels(st_add_tail_labels(st, st.row_tails), fname, entry, f, declared, line, col, decls)
     match rbinds {
       [] -> st1
       _  -> check_body_tails(st1, fname, declared_root(st.sub, declared, rbinds), rbinds, st.row_tails)
@@ -18440,7 +18444,7 @@ fn report_row_var_unhandled(st: InferState, fname: String, n: String, line: Int,
   st_bump_err(st_push_diag(st, d))
 }
 
-fn check_body_labels(st: InferState, fname: String, entry: Bool, declared: RowExpr,
+fn check_body_labels(st: InferState, fname: String, entry: Bool, f: FnId, declared: RowExpr,
                      line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable {
   # every body label must match a declared label by effect AND
   # unifiable ty_args. An open declared row's tail is the caller's row
@@ -18474,9 +18478,10 @@ fn check_body_labels(st: InferState, fname: String, entry: Bool, declared: RowEx
       if entry {
         check_body_row_label_loop(st, fname,
                                   only_non_absorbed_labels(st, st.row, decls),
-                                  [], line, col)
+                                  [], [], line, col)
       }
-      else { check_body_row_label_loop(st, fname, st.row, [], line, col) }
+      else if list_is_empty(st.row) { st }
+      else { check_body_row_label_loop(st, fname, st.row, [], unrowed_notes(st, f), line, col) }
     RClosed(lbs) -> {
       # for `main`, every declared row label must also
       # have an `emit_main_wrapper` default handler. `main : Int / Net`
@@ -18486,12 +18491,12 @@ fn check_body_labels(st: InferState, fname: String, entry: Bool, declared: RowEx
       # this added pass surfaces the unhandled top-level row.
       let st1 = check_body_row_label_loop(st, fname, st.row,
                                             st_annot_labels(st, lbs),
-                                            line, col)
+                                            [], line, col)
       if entry {
         check_main_row_handlable(st1, st.row, line, col, decls)
       } else { st1 }
     }
-    ROpen(_, lbs) -> check_body_row_label_loop(st, fname, st.row, st_annot_labels(st, lbs), line, col)
+    ROpen(_, lbs) -> check_body_row_label_loop(st, fname, st.row, st_annot_labels(st, lbs), [], line, col)
   }
 }
 
@@ -18592,9 +18597,9 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
 # body performed, look for an `eff`-name match in the declared list;
 # unify ty_args with `unify_label_args` (extends the substitution).
 # Unification failure or absence both report "effect not handled" with
-# the parametric label rendered in full.
+# the parametric label rendered in full, and the notes of `extra`.
 fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
-                              declared: [Label], fline: Int, fcol: Int) : InferState / Console + File + Mutable {
+                              declared: [Label], extra: [String], fline: Int, fcol: Int) : InferState / Console + File + Mutable {
 
 
   match performed {
@@ -18631,12 +18636,14 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               diag_note(n1)
               diag_note(n2)
               diag_note(n3)
+              foreach(extra, (n) => diag_note(n))
               foreach(helps, (h) => diag_help(h))
               # T5 collected diagnostic.
               let related = list_append([
                 ri_note(st.file, line, col, n1),
                 ri_note(st.file, line, col, n2),
-                ri_note(st.file, line, col, n3)
+                ri_note(st.file, line, col, n3),
+                ...map(extra, (n) => ri_note(st.file, line, col, n))
               ], map(helps, (h) => ri_help(st.file, line, col, h)))
               let d = mk_diag(SevError, st.file, line, col, header, related)
               st_bump_err(st_push_diag(st, d))
@@ -18644,7 +18651,7 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
           }
         }
       }
-      check_body_row_label_loop(st1, fname, rest, declared, fline, fcol)
+      check_body_row_label_loop(st1, fname, rest, declared, extra, fline, fcol)
     }
   }
 }
@@ -19052,13 +19059,13 @@ pub type TcShared = {
   unions_ahead: [UnionRow]
 }
 
-#[doc("infer: build the `TcShared` tables once over the whole program, so a module's typecheck neither rebuilds the seed nor rescans the program for homes and aliases.")]
+#[doc("infer: build the `TcShared` tables once over the whole program, so a module's typecheck neither rebuilds the seed nor rescans the program for homes and aliases. `roots` are the compile's root modules.")]
 pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
-                 tab: SymTab, views: FileViews) : TcShared / Console + File {
+                 tab: SymTab, views: FileViews, roots: Roots) : TcShared / Console + File {
   let alias_cands = collect_alias_cands(all_program_decls, tab, df)
   let eff_names = sym_names(tab, collect_effect_ids(all_program_decls))
   let seed = build_ty_env_seed()
-  let homes = tsh_homes(all_program_decls, tab, views, module_name_of_path(file))
+  let homes = tsh_homes(all_program_decls, tab, views, module_name_of_path(file), roots)
   TcShared {
     seed: seed,
     inh: TEP(seed.env.entries, seed.env.index, seed.env.vindex),
@@ -19282,7 +19289,8 @@ fn typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls],
                       tab: SymTab, protos: ProtoView,
                       verbose: Bool) : TypedProgram / Console + File + Mutable =
   typecheck_program_with_head_owners(file, df, modules, protos,
-                                     head_owner_seed(), [], tab, fv_empty(), verbose)
+                                     head_owner_seed(), [], tab, fv_empty(),
+                                     roots_of(module_name_of_path(file), []), verbose)
 
 # variant accepting the per-compile head-owner cache. The
 # cache is built once by `compile_source` after `expand_imports`
@@ -19293,7 +19301,7 @@ fn typecheck_program_with_head_owners(file: String, df: DiagFiles, modules: [Mod
                                        protos: ProtoView,
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
-                                       tab: SymTab, views: FileViews,
+                                       tab: SymTab, views: FileViews, roots: Roots,
                                        verbose: Bool) : TypedProgram / Console + File + Mutable {
 
 
@@ -19302,7 +19310,7 @@ fn typecheck_program_with_head_owners(file: String, df: DiagFiles, modules: [Mod
   # `DEffect default { ... }` blocks (and other program-wide
   # decl-shaped data) without seeing the partition boundary.
   let all_program_decls = flatten_module_decls(modules, [])
-  let sh = tc_shared(file, df, all_program_decls, tab, views)
+  let sh = tc_shared(file, df, all_program_decls, tab, views, roots)
   typecheck_program_loop(file, df, modules, module_env_delta_empty(),
                           all_program_decls,
                           protos, head_owners, kind_theories, tab, sh, verbose,
@@ -19625,19 +19633,20 @@ fn infer_program_with_protos(file: String, decls: [Decl], tab: SymTab, verbose: 
                                protos: ProtoView) : TypedProgram / Console + File + Mutable =
   infer_program_with_protos_cached(file, diag_files_flat(file), decls, verbose,
                                    protos, head_owner_seed(),
-                                   atomic_kind_theories(decls), tab, fv_empty())
+                                   atomic_kind_theories(decls), tab, fv_empty(),
+                                   roots_of(module_name_of_path(file), []))
 
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
 # decl stream + module table once per invocation and passes it here so
 # `synth_pipe_dispatch` can resolve any in-scope `pub type T` against
 # its declaring module without a hardcoded compiler table.
-#[doc("infer: infer a program with protocol-impl registry + per-compile cache hooks. `df` attributes each diagnostic to the file declaring the decl it fires on.")]
+#[doc("infer: infer a program with protocol-impl registry + per-compile cache hooks. `df` attributes each diagnostic to the file declaring the decl it fires on; `roots` are the compile's root modules.")]
 pub fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Decl], verbose: Bool,
                                        protos: ProtoView,
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
-                                       tab: SymTab, views: FileViews) : TypedProgram / Console + File + Mutable {
+                                       tab: SymTab, views: FileViews, roots: Roots) : TypedProgram / Console + File + Mutable {
 
 
   # Hanga Roa modular typecheck: partition the post-cascade decl
@@ -19657,7 +19666,7 @@ pub fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Dec
     [_]          -> [ModuleDecls { name: None, decls: decls }]
     _            -> mods0
   }
-  typecheck_program_with_head_owners(file, df, mods, protos, head_owners, kind_theories, tab, views, verbose)
+  typecheck_program_with_head_owners(file, df, mods, protos, head_owners, kind_theories, tab, views, roots, verbose)
 }
 
 

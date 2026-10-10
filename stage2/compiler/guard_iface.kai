@@ -13,11 +13,17 @@ reported there. A body under `requires`/`ensures` stays in with every
 position, since a broken clause is reported at its own line. Positions
 of everything else stay out: a caller's diagnostic names only its own
 file otherwise.
+
+A `main` that leaves its row out stays in too, without positions: where
+the module is the root it is the entry point and may perform what
+startup handles, where the module is imported it must perform nothing,
+so an importer's check reads that body.
 A module that does not parse has no digest, and its caller keys on the
 whole source instead.
 """)]
 
 import compiler.ast
+import compiler.entry
 import compiler.lex
 import compiler.parse
 import compiler.user_cache
@@ -26,10 +32,12 @@ import compiler.util
 #[doc("The interface digest of the module `src` read from `file`, as 16 hex chars; None when it does not parse.")]
 pub fn gi_interface_hex(file: String, src: String) : Option[String] / Console = {
   let toks = tokenize(src)
-  # Only the shapes are read, so the home the ids derive from is immaterial.
-  match parse_program(file, src, toks, file).decls {
+  # No table is read, so any home serves the ids: the one the module's
+  # own `main` is told by.
+  let home = file
+  match parse_program(file, src, toks, home).decls {
     None     -> None
-    Some(ds) -> match gi_walk(src, toks, gi_sorted(gi_starts(ds, [])), GiSt([], GiOut, false, false)) {
+    Some(ds) -> match gi_walk(src, toks, gi_sorted(gi_starts(ds, entry_id(home), [])), GiSt([], GiOut, false, false)) {
       Some(text) -> Some(uc_content_hex(text))
       None       -> None
     }
@@ -55,35 +63,42 @@ pub fn gi_interface_memo(memo_dir: String, file: String, src: String) : Option[S
 # ---- where bodies start ---------------------------------------------
 
 # A function body's first position, and how the digest takes it: left
-# out, kept as text after its declaration's position, or kept with the
-# position of every token.
+# out, kept as text, kept as text after its declaration's position, or
+# kept with the position of every token.
 type GiStart = GiStart(Int, Int, GiKind)
-type GiKind = Strip | Content(Int, Int) | Placed
+type GiKind = Strip | Text | Content(Int, Int) | Placed
 
-fn gi_starts(ds: [Decl], acc: [GiStart]) : [GiStart] = match ds {
+# `entry` is the id of the module's own `main`.
+fn gi_starts(ds: [Decl], entry: SymId, acc: [GiStart]) : [GiStart] = match ds {
   []           -> acc
-  [d, ...rest] -> gi_starts(rest, gi_decl(d, true, acc))
+  [d, ...rest] -> gi_starts(rest, entry, gi_decl(d, true, entry, acc))
 }
 
-fn gi_decl(d: Decl, plain_impl: Bool, acc: [GiStart]) : [GiStart] = match d {
-  DFn(_, _, tps, _, _, _, body, l, c, _) -> [GiStart(body.line, body.col, gi_kind(plain_impl and list_is_empty(tps), body, l, c)), ...acc]
-  DImpl(_, _, _, ms, _, _, itps, _)         -> gi_methods(ms, list_is_empty(itps), acc)
-  DDerive(_, inner, _, _)                   -> gi_decl(inner, plain_impl, acc)
-  DUnstable(inner, _, _)                    -> gi_decl(inner, plain_impl, acc)
-  DConstructor(inner, _, _)                 -> gi_decl(inner, plain_impl, acc)
-  DDoc(_, _, inner, _, _)                   -> gi_decl(inner, plain_impl, acc)
-  DAttr(_, inner, _, _)                     -> gi_decl(inner, plain_impl, acc)
+fn gi_decl(d: Decl, plain_impl: Bool, entry: SymId, acc: [GiStart]) : [GiStart] = match d {
+  DFn(_, fid, tps, _, _, row, body, l, c, _) ->
+    [GiStart(body.line, body.col, gi_kind(plain_impl and list_is_empty(tps), gi_unrowed_main(entry, fid, row), body, l, c)), ...acc]
+  DImpl(_, _, _, ms, _, _, itps, _)         -> gi_methods(ms, list_is_empty(itps), entry, acc)
+  DDerive(_, inner, _, _)                   -> gi_decl(inner, plain_impl, entry, acc)
+  DUnstable(inner, _, _)                    -> gi_decl(inner, plain_impl, entry, acc)
+  DConstructor(inner, _, _)                 -> gi_decl(inner, plain_impl, entry, acc)
+  DDoc(_, _, inner, _, _)                   -> gi_decl(inner, plain_impl, entry, acc)
+  DAttr(_, inner, _, _)                     -> gi_decl(inner, plain_impl, entry, acc)
   _                                         -> acc
 }
 
-fn gi_methods(ms: [Decl], plain: Bool, acc: [GiStart]) : [GiStart] = match ms {
+fn gi_methods(ms: [Decl], plain: Bool, entry: SymId, acc: [GiStart]) : [GiStart] = match ms {
   []           -> acc
-  [m, ...rest] -> gi_methods(rest, plain, gi_decl(m, plain, acc))
+  [m, ...rest] -> gi_methods(rest, plain, entry, gi_decl(m, plain, entry, acc))
 }
 
-fn gi_kind(plain: Bool, body: Expr, l: Int, c: Int) : GiKind = match body.kind {
+fn gi_unrowed_main(entry: SymId, f: FnId, row: RowExpr) : Bool = match row {
+  REmpty -> is_entry(entry, f)
+  _      -> false
+}
+
+fn gi_kind(plain: Bool, unrowed_main: Bool, body: Expr, l: Int, c: Int) : GiKind = match body.kind {
   ESurface(SfContract(_, _, _)) -> Placed
-  _                             -> if plain { Strip } else { Content(l, c) }
+  _                             -> if not plain { Content(l, c) } else if unrowed_main { Text } else { Strip }
 }
 
 fn gi_sorted(xs: [GiStart]) : [GiStart] = sort_by(xs, (a, b) => gi_cmp(a, b))
@@ -147,6 +162,7 @@ fn gi_inside(src: String, t: Token, rest: [Token], starts: [GiStart], out: [Stri
     let d1 = depth + gi_delta(t)
     let out1 = match k {
       Strip         -> out
+      Text          -> [gi_text(src, t), ...out]
       Content(_, _) -> [gi_text(src, t), ...out]
       Placed        -> [gi_placed(src, t), ...out]
     }
