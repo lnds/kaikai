@@ -16,11 +16,11 @@ expression. A block tail that merely reads back a `let` bound earlier
 in the same block is peeled, so the call the binding hid is seen as the
 tail position it is.
 
-Edges are keyed by `(name, mo)` — the emitted symbol identity — so a
-call qualified by the monomorphiser as `EModCall(host, name)` joins the
-same node as the bare call it came from. A name rebound by an inner
-`let` or a lambda parameter shadows the top-level function, so the walk
-carries the shadowing scope and drops an edge whose callee is shadowed.
+A resolved call finds its node by the declaration's id, so two
+same-named functions are two targets and a local binder is none. A name
+the resolver left bare is found by `(name, mo)`; one rebound by an inner
+`let` or a pattern shadows the top-level function, so the walk carries
+the shadowing scope and drops an edge whose callee is shadowed.
 
 The pass is a PURE analysis producing a side table (the `purity.kai`
 pattern): it does not mutate the AST.
@@ -34,6 +34,7 @@ import compiler.sym_read
 import compiler.emit_shared
 import compiler.fnreg
 import compiler.ret_slots
+import compiler.call_site_target
 
 #[doc("One node of the tail-call graph: a top-level function's name, its module origin, its arity, and the id of the declaration it stands for. Arity is carried because a call whose argument count differs from the declaration is not a tail call the rewrite can fuse; the id is what a resolved call matches on, so two same-named functions are two nodes whatever they spell.")]
 pub type TgNode = TgN(String, Option[String], Int, SymId)
@@ -145,7 +146,7 @@ fn tg_tail_targets(body: Expr, mo: Option[String], nodes: TgIx, scope: [String])
 
 fn tg_walk_tail(k: ExprKind, mo: Option[String], nodes: TgIx, scope: [String]) : [Int] {
   match k {
-    ECall(f, xs) -> tg_call_target(f.kind, list_length(xs), mo, nodes, scope)
+    ECall(f, xs) -> tg_call_target(f, list_length(xs), mo, nodes, scope)
     EIf(_, t, opt_e) ->
       list_append(tg_walk_tail(t.kind, mo, nodes, scope), tg_walk_opt(opt_e, mo, nodes, scope))
     EMatch(_, arms) -> tg_walk_arms(arms, mo, nodes, scope)
@@ -209,33 +210,24 @@ fn tg_pattern_binds(p: Pattern, target: String) : Bool = match p.pkind {
   _        -> false
 }
 
-fn tg_call_target(fk: ExprKind, argc: Int, mo: Option[String],
-                  nodes: TgIx, scope: [String]) : [Int] {
-  match fk {
-    # A resolved callee names one declaration, so the node is found by
-    # id and no (name, module) pair has to agree. A local binder still
-    # shadows: the resolver leaves a local as an `EVar`, so an id here
-    # is never one.
-    ESym(s, _, callee) -> tg_resolve_sym(s, callee, mo, argc, nodes, scope)
-    EVar(callee) -> tg_resolve_in(callee, mo, argc, nodes, scope)
-    EModCall(callmod, callee) ->
-      if tg_modcall_is_own(callmod, mo) { tg_resolve_in(callee, mo, argc, nodes, scope) }
-      else { tg_resolve_in(callee, Some(callmod), argc, nodes, scope) }
-    _ -> []
+fn tg_call_target(f: Expr, argc: Int, mo: Option[String],
+                  nodes: TgIx, scope: [String]) : [Int] = match f.kind {
+  # A name the resolver left bare is found by (name, module), unless a
+  # binder in scope shadows it.
+  EVar(callee) -> tg_resolve_in(callee, mo, argc, nodes, scope)
+  # Any other callee names one declaration or none: the node is found
+  # by id, and a local's id is no node's.
+  _ -> match callee_id(f) {
+    Some(s) -> tg_resolve_sym(s, argc, nodes)
+    None    -> []
   }
 }
 
-
-# A node whose declaration is the one the call resolved to. Nodes built
-# from decls the resolver never stamped carry no id and never match.
-fn tg_resolve_sym(s: SymId, callee: String, mo: Option[String], argc: Int,
-                  nodes: TgIx, scope: [String]) : [Int] {
-  if list_has(scope, callee) { [] }
-  else { match tg_first(idx_chain_sym(nodes.by_sym, s), (n) => sym_raw(tgnode_sym(n)) >= 0 and sym_raw(tgnode_sym(n)) == sym_raw(s)) {
+fn tg_resolve_sym(s: SymId, argc: Int, nodes: TgIx) : [Int] =
+  match tg_first(idx_chain_sym(nodes.by_sym, s), (n) => sym_raw(tgnode_sym(n)) == sym_raw(s)) {
     Some(at) -> tg_arity_ok(at, argc)
-    None     -> tg_resolve_in(callee, mo, argc, nodes, scope)
-  } }
-}
+    None     -> []
+  }
 
 fn tg_resolve_in(callee: String, mo: Option[String], argc: Int,
                  nodes: TgIx, scope: [String]) : [Int] {
@@ -248,11 +240,6 @@ fn tg_resolve_in(callee: String, mo: Option[String], argc: Int,
 
 fn tg_arity_ok(at: (Int, TgNode), argc: Int) : [Int] = match at {
   (i, n) -> if tgnode_arity(n) == argc { [i] } else { [] }
-}
-
-fn tg_modcall_is_own(callmod: String, mo: Option[String]) : Bool = match mo {
-  None    -> false
-  Some(m) -> m == callmod
 }
 
 # ---- shadowing -----------------------------------------------------
