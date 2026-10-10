@@ -9104,14 +9104,11 @@ fn check_call_list(n: Int, i: Int) : String {
   }
 }
 
-fn has_main_decl(decls: [Decl], entry: SymId) : Bool {
-  match decls {
-    [] -> false
-    [d, ...rest] -> match d {
-      DFn(_, fid, _, _, _, _, _, _, _, _) -> if is_entry(entry, fid) { true } else { has_main_decl(rest, entry) }
-      _ -> has_main_decl(rest, entry)
-    }
-  }
+# The C symbol key of the function the binary starts, when a function is.
+fn entry_csym(fns: [EFn], entry: SymId) : Option[String] = match fns {
+  [] -> None
+  [EFn(n, _, mo, _, f), ...rest] ->
+    if is_entry(entry, f) { Some(c_sym(written_text(n), mo)) } else { entry_csym(rest, entry) }
 }
 
 # Option C runtime infrastructure — emit the impl-table + variant->head
@@ -9521,12 +9518,13 @@ fn emit_main_wrapper(decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds
     BMTest  -> emit_runner_main(decls, tab, proto_tables, proto_init, test_register_list(decls), "kai_test_summary")
     BMBench -> emit_runner_main(decls, tab, proto_tables, proto_init, bench_call_list(bench_count(decls), 0), "kai_bench_summary")
     BMCheck -> emit_runner_main(decls, tab, proto_tables, proto_init, check_call_list(check_count(decls), 0), "kai_check_summary")
-    BMBuild -> {
-      if has_main_decl(decls, entry) {
-        # m7a #7: install default handlers around `kai_main` only for
-        # the builtin effects that appear in `main`'s row. The push/pop
+    BMBuild -> match entry_csym(fns, entry) {
+      None -> ""
+      Some(start) -> {
+        # m7a #7: install default handlers around the entry point only for
+        # the builtin effects that appear in its row. The push/pop
         # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
-        # pop runs even if `kai_main` returns. Pops are emitted in
+        # pop runs even if the entry point returns. Pops are emitted in
         # reverse-push order so the evidence stack stays LIFO-balanced.
         #
         # Issue #115: the shim block below is emitted at file scope,
@@ -9565,14 +9563,12 @@ fn emit_main_wrapper(decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds
           "    kai_set_args(argc, argv);\n",
           proto_init,
           setup,
-          "    KaiValue *_result = kai_sched_bootstrap(kai_main);\n",
+          "    KaiValue *_result = kai_sched_bootstrap(", c_user_sym(start), ");\n",
           "    int _status = kai_main_exit_status(_result);\n",
           "    kai_decref(_result);\n",
           "    return _status;\n",
           "}\n"
         ])
-      } else {
-        ""
       }
     }
   }
@@ -10392,8 +10388,8 @@ fn dots_to_underscores_loop(s: String, i: Int, n: Int, acc: String) : String =
 type CModuleTU = { stem: String, body: String }
 
 #[doc("Issue #748 — separate-compilation entry point. Emits the program as N per-module translation units plus two shared headers, joined into one marker-delimited String the `bin/kai` wrapper splits into files. Reuses every `emit_program` section emitter; the only new work is partitioning `decls` by module-origin.")]
-pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable =
-  match emit_program_modular_cached(file, src, raw_decls, tab, specs, ids, bmode, target_origin, regions, [], [], stamp_ids) {
+pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], entry: SymId, regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable =
+  match emit_program_modular_cached(file, src, raw_decls, tab, specs, ids, bmode, target_origin, entry, regions, [], [], stamp_ids) {
     EMO(stream, _) -> stream
   }
 
@@ -10401,9 +10397,8 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: S
 pub type EmitModularOut = EMO(String, [CTU])
 
 #[doc("As `emit_program_modular`, with the core emit cache threaded through: TUs whose stem appears in `cached` splice the cached body instead of emitting; freshly emitted TUs whose module origin appears in `cacheable` are returned for the caller to persist.")]
-pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String], stamp_ids: [SymId]) : EmitModularOut / Console + Mutable {
+pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], entry: SymId, regions: [RegionMark], cached: [CTU], cacheable: [String], stamp_ids: [SymId]) : EmitModularOut / Console + Mutable {
 
-  let entry = entry_of_root(target_origin)
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = desugar_op_calls_decls(alias_resolved, collect_effect_ids(alias_resolved))
   let fns = register_fn_decls(decls, tab, specs, entry)
@@ -10558,11 +10553,10 @@ fn assemble_modular_output(nonce: String, sliced: [SlicedHeaders], tus: [CModule
 }
 
 #[doc("Emit-layer entry point emit_program")]
-pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable {
+pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], entry: SymId, regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable {
 
   # A callee still spelled `Eff.op` becomes the perform the emitter
   # dispatches through the evidence.
-  let entry = entry_of_root(target_origin)
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = desugar_op_calls_decls(alias_resolved, collect_effect_ids(alias_resolved))
   let fns = register_fn_decls(decls, tab, specs, entry)
