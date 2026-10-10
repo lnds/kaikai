@@ -126,6 +126,7 @@ import compiler.emit_unwind_c
 import compiler.kir_pat_alias
 import compiler.resume_scan
 import compiler.decl_names
+import compiler.core_effects
 import compiler.effect_alias
 import compiler.evidence_frame
 import compiler.expr_positions
@@ -7140,8 +7141,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # a shim; reaching it as an ordinary expression is a compiler bug.
     EExternBody(_, _) -> concat_all(["kai_core_panic(kai_str(\"extern body in expression position\"))"])
     EBang(inner) -> emit_bang(src, x, inner, cx)
-    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      emit_handle(src, body, eff_name, inst_key_of_tes(eff_name, eff_tyargs), init_opt, alias_opt,
+    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      emit_handle(src, body, eff_name, hsym, inst_key_of_tes(eff_name, eff_tyargs), init_opt, alias_opt,
                   clauses, ret_opt, x.line, x.col, x.site, cx)
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
     # Units are typer-only; the generated value carries no unit tag.
@@ -7504,9 +7505,9 @@ fn emit_bang(src: String, x: Expr, inner: Expr, cx: EmitCtx) : String / Console 
 # `kai_<name> = &_node` alias node a `#` dispatch would read is dead for
 # them, and emitting it collides with the user's own `kai_<name>` (a return
 # param or the stateful prologue's `kai_state`/`kai_log`) inside one block.
-fn alias_is_byid_cell(eff_name: String) : Bool = eff_name == "State" or eff_name == "Reader"
+fn alias_is_byid_cell(hsym: SymId) : Bool = effect_is(hsym, CeState) or effect_is(hsym, CeReader)
 
-fn emit_handle(src: String, body: Expr, eff_name: String, key: String, init_opt: Option[Expr],
+fn emit_handle(src: String, body: Expr, eff_name: String, hsym: SymId, key: String, init_opt: Option[Expr],
                alias_opt: Option[String],
                clauses: [HClause],
                ret_opt: Option[HReturn], hline: Int, hcol: Int, hsite: Int,
@@ -7538,7 +7539,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, key: String, init_opt:
   let alias_id_c = match alias_opt {
     Some(a) -> {
       let id_bind = concat_all(["KaiHandlerId ", c_alias_id(a), " = _ev.handler_id; "])
-      if alias_is_byid_cell(eff_name) { id_bind }
+      if alias_is_byid_cell(hsym) { id_bind }
       else { concat_all([id_bind, "KaiValue *", c_local(a), " = (KaiValue *) &_node; "]) }
     }
     None -> ""
@@ -8072,10 +8073,10 @@ fn emit_op_fn_ptr(ev_n: String, op: EffectOp) : String {
 # called through its exact function type.
 fn emit_effect_struct(d: Decl) : String {
   match d {
-    DEffect(_, name, _tparams, ops, _, _, _, mo, _) -> {
+    DEffect(_, name, _tparams, ops, _, _, _, mo, esym) -> {
       let evn = ev_name(name, mo)
       let fields = concat_all(map(ops, (op) => emit_op_fn_ptr(evn, op)))
-      if evn == "Evconcurrent__Cancel" { concat_all(["typedef KaiRtEvCancel ", evn, ";\n\n"]) }
+      if effect_is(esym, CeCancel) { concat_all(["typedef KaiRtEvCancel ", evn, ";\n\n"]) }
       else { concat_all([
         "typedef struct ", evn, " ", evn, ";\n",
         "struct ", evn, " {\n",
@@ -11256,10 +11257,11 @@ fn dedup_row_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [Row
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
       RL(n, targs, ls) -> {
-        # Key by name, declaration and args, each arg with the declarations
-        # it names: two homonymous effects, `Actor[Request]` and
-        # `Actor[Reply]`, or two types spelled alike, all survive.
-        let key = concat_all([n, "#", int_to_string(sym_raw(ls)), "[", join_with(map(targs, row_arg_key), ","), "]"])
+        # Key by declaration and args, each arg with the declarations it
+        # names: two homonymous effects, `Actor[Request]` and
+        # `Actor[Reply]`, or two types spelled alike, all survive. A label
+        # nothing settled keys by its spelling.
+        let key = concat_all([if sym_raw(ls) >= 0 { "" } else { n }, "#", int_to_string(sym_raw(ls)), "[", join_with(map(targs, row_arg_key), ","), "]"])
         if list_has(seen, key) {
           dedup_row_labels_loop(rest, seen, acc)
         } else {

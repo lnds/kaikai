@@ -21,7 +21,10 @@ pub fn canon_handle_instances(decls: [Decl]) : [Decl] = {
   map(decls, (d) => canon_decl(d, arities))
 }
 
-type RowPin = RP(String, [TypeExpr])
+type RowPin = RP(SymId, [TypeExpr])
+
+# One effect declaration; an unresolved id is none.
+fn eff_same(a: SymId, b: SymId) : Bool = sym_raw(a) >= 0 and sym_raw(a) == sym_raw(b)
 
 type CanonCx = { tps: [String], arities: [EffArity], pins: [RowPin] }
 
@@ -46,9 +49,9 @@ fn may_canon(e: Expr) : Bool = match e.kind {
 # Conservative: a pinnable op under a lambda or a same-effect `handle` is
 # left as it is by `canon_expr`, at the cost of one rebuild.
 fn needs_canon(e: Expr, cx: CanonCx) : Bool = match e.kind {
-  EHandle(_, eff, _, args, init, _, _, _) -> handle_args(eff, args, init, cx) != args
+  EHandle(_, _, hsym, args, init, _, _, _) -> handle_args(hsym, args, init, cx) != args
   ECall(f, _) -> match f.ty {
-    Some(TyCon(_, eff, args, _)) -> any(args, ty_unpinned) and any(cx.pins, (p) => match p { RP(n, _) -> n == eff })
+    Some(TyCon(_, _, args, s)) -> any(args, ty_unpinned) and any(cx.pins, (p) => match p { RP(ps, _) -> eff_same(ps, s) })
     _ -> false
   }
   _ -> false
@@ -59,8 +62,8 @@ fn canon_expr(e: Expr, cx: CanonCx) : Expr = {
     # Clauses run outside their own `handle`, so only the body loses the pin.
     EHandle(body, eff, hsym, args, init, alias, cls, ret) -> {
       let outer = (sub) => canon_expr(sub, cx)
-      EHandle(canon_expr(body, CanonCx { ...cx, pins: filter(cx.pins, (p) => match p { RP(n, _) -> n != eff }) }),
-              eff, hsym, handle_args(eff, args, init, cx), prc_map_opt_expr(init, outer), alias,
+      EHandle(canon_expr(body, CanonCx { ...cx, pins: filter(cx.pins, (p) => match p { RP(ps, _) -> not eff_same(ps, hsym) }) }),
+              eff, hsym, handle_args(hsym, args, init, cx), prc_map_opt_expr(init, outer), alias,
               map(cls, (c) => prc_map_clause_exprs(c, outer)), prc_map_opt_return_exprs(ret, outer))
     }
     ELambda(ps, body) -> ELambda(ps, canon_expr(body, CanonCx { ...cx, pins: [] }))
@@ -72,7 +75,7 @@ fn canon_expr(e: Expr, cx: CanonCx) : Expr = {
 
 fn pin_op(f: Expr, pins: [RowPin]) : Expr = match f.ty {
   Some(TyCon(m, eff, args, s)) ->
-    if any(args, ty_unpinned) { match filter(pins, (p) => match p { RP(n, _) -> n == eff }) {
+    if any(args, ty_unpinned) { match filter(pins, (p) => match p { RP(ps, _) -> eff_same(ps, s) }) {
       [RP(_, tes)] -> Expr { kind: f.kind, line: f.line, col: f.col, ty: Some(TyCon(m, eff, map(tes, te_as_ty), s)), mode: f.mode,  site: f.site }
       _            -> f
     } } else { f }
@@ -81,10 +84,10 @@ fn pin_op(f: Expr, pins: [RowPin]) : Expr = match f.ty {
 
 # The effects a row carries exactly once, at a pinned instance.
 fn row_pins(ls: [RowLabel], tps: [String]) : [RowPin] =
-  map(filter(ls, (l) => is_sole_pinned(ls, l, tps)), (l) => match l { RL(n, args, _) -> RP(n, args) })
+  map(filter(ls, (l) => is_sole_pinned(ls, l, tps)), (l) => match l { RL(_, args, s) -> RP(s, args) })
 
 fn is_sole_pinned(ls: [RowLabel], l: RowLabel, tps: [String]) : Bool = match l {
-  RL(n, args, _) -> list_length(filter(ls, (o) => rl_name(o) == n)) == 1 and not any(args, (a) => is_unpinned(te_text(a, tps)))
+  RL(_, args, s) -> list_length(filter(ls, (o) => eff_same(rl_sym(o), s))) == 1 and not any(args, (a) => is_unpinned(te_text(a, tps)))
 }
 
 fn row_labels_of(row: RowExpr) : [RowLabel] = match row {
@@ -93,9 +96,9 @@ fn row_labels_of(row: RowExpr) : [RowLabel] = match row {
   ROpen(_, ls) -> ls
 }
 
-fn handle_args(eff: String, args: [TypeExpr], init: Option[Expr], cx: CanonCx) : [TypeExpr] = match args {
+fn handle_args(hsym: SymId, args: [TypeExpr], init: Option[Expr], cx: CanonCx) : [TypeExpr] = match args {
   [] -> match init {
-    Some(ie) -> if arity_of(cx.arities, eff) > 0 { init_args(ie) } else { [] }
+    Some(ie) -> if arity_of(cx.arities, hsym) > 0 { init_args(ie) } else { [] }
     None     -> []
   }
   _ -> if any(args, (a) => is_unpinned(te_text(a, cx.tps))) { [] } else { args }
@@ -176,17 +179,17 @@ fn te_mentions(te: TypeExpr, tp: String) : Bool = match te.tkind {
   _               -> false
 }
 
-type EffArity = EA(String, Int)
+type EffArity = EA(SymId, Int)
 
 fn effect_arities(decls: [Decl]) : [EffArity] = match decls {
   []           -> []
   [d, ...rest] -> match d {
-    DEffect(_, n, tps, _, _, _, _, _, _) -> [EA(n, list_length(tps)), ...effect_arities(rest)]
+    DEffect(_, _, tps, _, _, _, _, _, s) -> [EA(s, list_length(tps)), ...effect_arities(rest)]
     _ -> effect_arities(rest)
   }
 }
 
-fn arity_of(arities: [EffArity], eff: String) : Int = match arities {
+fn arity_of(arities: [EffArity], hsym: SymId) : Int = match arities {
   []                 -> 0
-  [EA(n, k), ...rest] -> if n == eff { k } else { arity_of(rest, eff) }
+  [EA(s, k), ...rest] -> if eff_same(s, hsym) { k } else { arity_of(rest, hsym) }
 }

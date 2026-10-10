@@ -71,6 +71,7 @@ import compiler.modules
 import compiler.refinements
 import compiler.loop_lower
 import compiler.brand_transp
+import compiler.core_effects
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule)
@@ -1402,7 +1403,7 @@ fn caps_minus_names(caps: [String], names: [String]) : [String] {
 # binds `name` as a readable cell, the same as a desugared `var`. Other
 # effects' aliases (`with Console as c`) are ordinary capability values,
 # not cells, so their alias shadows rather than seeds the cell set.
-fn eff_is_cell(eff: String) : Bool = eff == "State" or eff == "Reader"
+fn eff_is_cell(s: SymId) : Bool = effect_is(s, CeState) or effect_is(s, CeReader)
 
 fn lcr_expr(e: Expr, caps: [String], reject_at: Bool, file: String, errs: Int) : VLExpr / Console + File {
 
@@ -1575,7 +1576,7 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
       let ri = lcr_opt(init_opt, caps, reject_at, file, errs)
       let body_caps = match alias_opt {
         Some(a) ->
-          if eff_is_cell(eff) { [a, ...caps_remove_name(caps, a)] }
+          if eff_is_cell(hsym) { [a, ...caps_remove_name(caps, a)] }
           else { caps_remove_name(caps, a) }
         None -> caps
       }
@@ -2869,7 +2870,7 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
           let tyargs = match ty { Some(t) -> [t] None -> [] }
           let clauses = var_canonical_clauses(line, col)
           let ret = var_canonical_return(line, col)
-          let handle_kind = EHandle(inner_expr, "State", sym_none(), tyargs,
+          let handle_kind = EHandle(inner_expr, core_effect_name(CeState), core_effect_id(CeState), tyargs,
                                      Some(init_d), Some(name),
                                      clauses, Some(ret))
           EBlock(ann_pre, Some(mk_expr(handle_kind, line, col)))
@@ -3610,7 +3611,7 @@ fn use_rewrite_decls(decls: [Decl], table: [EffOps], file_opens: [String],
 #   1. Each `ECall(EVar("nursery"), [..., ELambda([Param(n, ...)], body)])`
 #      mints a fresh BrandId and rewrites the body so every
 #      `EField(EVar(n), op)` whose op is a Spawn primitive becomes
-#      `EField(EVar("Spawn"), op)`. The brand is recorded in a side
+#      `Spawn.op`, its base settled to the core effect. The brand is recorded in a side
 #      registry (`brand_registry` below) keyed by the lambda's
 #      file:line:col so `--dump-brands` and the brand-mismatch
 #      diagnostic can resolve allocation sites.
@@ -3653,6 +3654,10 @@ fn nursery_cap_op_names() : [String] =
 
 fn is_nursery_cap_op(name: String) : Bool =
   list_has(nursery_cap_op_names(), name)
+
+# The effect a rewritten cap call performs on: the core `Spawn`, already settled.
+fn spawn_ref(line: Int, col: Int) : Expr =
+  mk_expr(ESym(core_effect_id(CeSpawn), spec_none(), core_effect_name(CeSpawn)), line, col)
 
 # Stack of active cap binders. Innermost first.
 type NCapStack = NCS([NCapBinding])
@@ -3836,7 +3841,7 @@ type NurseryRwKind = { kind: ExprKind, bw: BrandWalk }
 # cases: (1) a `nursery` call with a 1-arg trailing lambda (mints a
 # brand and recurses with cap pushed), (2) a `EField(EVar(n), op)`
 # whose `n` matches an active cap and `op` is a Spawn primitive
-# (rewrites to `EField(EVar("Spawn"), op)`), and (3) every other
+# (rewrites to `Spawn.op` on the core effect), and (3) every other
 # kind, which recurses structurally.
 fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
                                bw: BrandWalk, line: Int, col: Int) : NurseryRwKind {
@@ -3867,7 +3872,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
                   let bw1 = bw_record_call(bw, file, line, col, bid, op_name)
                   let ar = rewrite_nursery_caps_exprs(args_, s, file, bw1, [])
                   let new_callee = mk_expr(
-                    EField(mk_ref("Spawn", base.line, base.col), op_name),
+                    EField(spawn_ref(base.line, base.col), op_name),
                     callee.line, callee.col)
                   NurseryRwKind { kind: ECall(new_callee, ar.exprs), bw: ar.bw }
                 }
@@ -3907,7 +3912,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
             match ncs_lookup(s, name) {
               Some(_) ->
                 NurseryRwKind {
-                  kind: EField(mk_ref("Spawn", base.line, base.col), op_name),
+                  kind: EField(spawn_ref(base.line, base.col), op_name),
                   bw: bw }
               None -> {
                 let br = rewrite_nursery_caps_expr(base, s, file, bw)
@@ -4365,8 +4370,8 @@ fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
     EVar(name) -> benv_lookup(env, name)
     ECall(callee, args_) -> match callee.kind {
       EField(base, op_name) -> match base.kind {
-        EVar(eff_name) ->
-          if eff_name == "Spawn" and op_name == "spawn" {
+        ESym(eff_sym, _, _) ->
+          if effect_is(eff_sym, CeSpawn) and op_name == "spawn" {
             match brand_call_lookup(calls, "", e.line, e.col) {
               Some(BC(_, _, _, bid, _)) -> Some(bid)
               # The registry stores file as recorded at rewrite. Try

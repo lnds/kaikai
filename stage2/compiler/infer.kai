@@ -73,6 +73,7 @@ import compiler.homonym
 import compiler.record_fields
 import compiler.field_privacy
 import compiler.effect_alias
+import compiler.core_effects
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -1394,14 +1395,14 @@ fn collect_call_labels_clauses(cs: [HClause], acc: [Label]) : [Label] = match cs
   }
 }
 
-# Append `xs` onto `acc`, skipping labels already present by `eff`
-# name (caller's own dedup via `st_add_label` is structural; we use
-# the simpler eff-name dedup here because all builtin handlers are
+# Append `xs` onto `acc`, skipping labels whose effect is already
+# present (caller's own dedup via `st_add_label` is structural; the
+# type arguments are ignored here because all builtin handlers are
 # non-parametric — `inferred_main_row` would drop the ty_args anyway).
 
 fn append_labels(xs: [Label], acc: [Label]) : [Label] = match xs {
   []           -> acc
-  [h, ...rest] -> if eff_already_in(acc, h.eff) {
+  [h, ...rest] -> if eff_already_in(acc, h) {
     append_labels(rest, acc)
   } else {
     append_labels(rest, [h, ...acc])
@@ -1409,9 +1410,9 @@ fn append_labels(xs: [Label], acc: [Label]) : [Label] = match xs {
 }
 
 
-fn eff_already_in(acc: [Label], eff: String) : Bool = match acc {
+fn eff_already_in(acc: [Label], lab: Label) : Bool = match acc {
   []           -> false
-  [l, ...rest] -> if l.eff == eff { true } else { eff_already_in(rest, eff) }
+  [l, ...rest] -> if label_same(l, lab) { true } else { eff_already_in(rest, lab) }
 }
 
 # extract the row labels declared on `fn main`. A row of
@@ -2541,8 +2542,8 @@ fn op_base_of(k: ExprKind) : Option[OpBase] = match k {
 }
 
 # The op scheme under the identity key, else under the written-name
-# key. An effect the table never gave an id — a core one, or one from a
-# path with no whole-program build — registers only the second.
+# key. A program typed with no resolver pass before it has no id on its
+# effect declarations, which register only the second.
 fn op_lookup_either(env: TyEnv, k1: String, k2: String) : Option[TyScheme] =
   match ty_env_lookup(env, k1) {
     Some(sc) -> Some(sc)
@@ -4428,9 +4429,11 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           let env2 = add_variants_of_decl(env1, d, top_names, tab, target, homes)
           EnvWithArities { env: env2, arities: ar_acc }
         }
-        DEffect(_, eff_name, tparams, ops, _, _, _, emo, _) -> {
-          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops,
-                                      ty_decl_sym(tab, NCEffect, eff_name, emo, target),
+        DEffect(_, eff_name, tparams, ops, _, _, _, emo, esym) -> {
+          # A contested effect is spelled per home, which the table does
+          # not hold: the declaration's own id is the one to register.
+          let es = if sym_raw(esym) >= 0 { esym } else { ty_decl_sym(tab, NCEffect, eff_name, emo, target) }
+          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops, es,
                                       tsh_view(homes, emo))
           # merge per-effect arities into the running accumulator.
           EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
@@ -7319,7 +7322,7 @@ type ResumeBind = RB(Ty, Ty, Ty)
 # `check_body_row` reads this when it needs to point a diagnostic
 # at the op call that caused the row to widen, instead of pinning
 # the whole error to the function's declaration site.
-type EffUse = EU(String, Int, Int)
+type EffUse = EU(Label, Int, Int)
 
 # Stack entry for `Eff as log`. The stack is pushed on entering
 # the body of a `handle ... with Eff as log { ... }` and popped
@@ -7473,7 +7476,7 @@ fn st_add_label(st0: InferState, lab: Label, line: Int, col: Int) : InferState /
     InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                  recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                  row: st.row,
-                 eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
+                 eff_uses: [EU(lab, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                  ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
@@ -7567,13 +7570,22 @@ fn tail_uses_have(us: [TailUse], t: Int) : Bool = match us {
 # signatures, no hardcoded filters.
 fn capability_labels_only(labels: [Label]) : [Label] = labels
 
-# Two labels name one effect: one spelling, and one declaration whenever
-# both know theirs. A label still unsettled matches by spelling alone.
+# Two labels are one effect instance: one declaration, and one cell when
+# a `with .. as` alias tells two instances of it apart. A label no
+# declaration answered has only its spelling.
 fn label_same(a: Label, b: Label) : Bool =
-  a.eff == b.eff and (sym_raw(a.sym) < 0 or sym_raw(b.sym) < 0 or sym_raw(a.sym) == sym_raw(b.sym))
+  if sym_raw(a.sym) >= 0 and sym_raw(b.sym) >= 0 { label_same_id(a, b) } else { a.eff == b.eff }
 
 fn label_same_id(a: Label, b: Label) : Bool =
-  a.eff == b.eff and sym_raw(a.sym) >= 0 and sym_raw(a.sym) == sym_raw(b.sym)
+  sym_raw(a.sym) >= 0 and sym_raw(a.sym) == sym_raw(b.sym) and label_cells_same(a.eff, b.eff)
+
+# The cell rides a label's spelling after an `@`; most labels carry none.
+fn label_cells_same(a: String, b: String) : Bool = {
+  let i = string_index_of_char(a, '@')
+  let j = string_index_of_char(b, '@')
+  if i < 0 or j < 0 { i < 0 and j < 0 }
+  else { string_slice(a, i, string_length(a) - i) == string_slice(b, j, string_length(b) - j) }
+}
 
 # `lab` is already in `row` up to its id: an unsettled twin takes `lab`'s
 # id rather than shadowing it, so a dedup never drops the settled one.
@@ -7815,7 +7827,7 @@ fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
 fn aliases_clause_tags(aliases: [AliasBinding]) : [AliasBinding] {
   match aliases {
     [] -> []
-    [AB(a, e, t, s), ...rest] -> [AB(a, e, t and eff_is_cell_effect(e), s), ...aliases_clause_tags(rest)]
+    [AB(a, e, t, s), ...rest] -> [AB(a, e, t and eff_is_cell_effect(s), s), ...aliases_clause_tags(rest)]
   }
 }
 
@@ -7845,11 +7857,11 @@ fn st_push_hole(st: InferState, h: HoleSite) : InferState =
 # Returns (-1, -1) when the effect was never tracked — that should
 # only happen when the row was set via st_set_row from outside, in
 # which case the caller falls back to the function's decl span.
-fn lookup_eff_use(uses: [EffUse], target: String) : EffUse {
+fn lookup_eff_use(uses: [EffUse], target: Label) : EffUse {
   match uses {
     [] -> EU(target, -1, -1)
     [u, ...rest] -> match u {
-      EU(name, _, _) -> if name == target { u } else { lookup_eff_use(rest, target) }
+      EU(l, _, _) -> if label_same(l, target) { u } else { lookup_eff_use(rest, target) }
     }
   }
 }
@@ -10685,8 +10697,8 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
         # A base the resolver settled keys by the effect's identity, so
         # two modules declaring one effect name reach their own op
         # without either having been respelled. A base it could not
-        # settle — a core effect, an alias, a capability parameter —
-        # keys by the written name, which is the ladder below.
+        # settle — an alias, a capability parameter — keys by the
+        # written name, which is the ladder below.
         let key = if sym_raw(bsym) >= 0 { ty_op_key_sym(bsym, op_name) }
                   else { ty_op_key_name(name, op_name) }
         # The scheme is found by identity; the row label and the
@@ -10741,7 +10753,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                       }
                   }
                 Some(eff) -> {
-                  let real_op = canonical_cap_getter(eff, op_name)
+                  let real_op = canonical_cap_getter(lookup_alias_sym(st.aliases, name), op_name)
                   let lookup_key = string_concat(eff, string_concat(".", real_op))
                   # §6 named instances: a `with Eff as name` binding dispatches
                   # `name.op` against the handle's own evidence node, bound in the
@@ -10760,7 +10772,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                   # §6 capability dispatch (`#`) so it threads as a first-class
                   # value through calls — the named-instances surface.
                   let dispatch_key = if taggable {
-                    if eff_is_cell_effect(eff) {
+                    if eff_is_cell_effect(lookup_alias_sym(st.aliases, name)) {
                       string_concat(lookup_key, string_concat("@", name))
                     } else {
                       string_concat(lookup_key, string_concat("#", name))
@@ -10876,7 +10888,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
               # (via `synth_many`); `synth` on `EVar(name)` is a pure
               # env lookup, so a second walk is idempotent.
               let all_args = [obj, ...args_]
-              let ms = core_effect_sym("Mutable")
+              let ms = core_effect_id(CeMutable)
               Some(op_callee_carries(synth_op_call_with_scheme(st, sc, all_args, key, ms, line, col), ms))
             }
           }
@@ -11225,7 +11237,7 @@ fn cap_eff_of_var(st: InferState, name: String) : Option[CapEff] =
 # `State`/`Reader` are readable cells: a `var` desugars to `with State as name`
 # and reads naked. Their dispatch keeps the legacy by-id path; a user effect's
 # named instance uses the §6 capability path. Mirrors desugar's `eff_is_cell`.
-fn eff_is_cell_effect(eff: String) : Bool = eff == "State" or eff == "Reader"
+fn eff_is_cell_effect(s: SymId) : Bool = effect_is(s, CeState) or effect_is(s, CeReader)
 
 # Type `name.op(args)` where `name` is a capability value. Dispatch the op to the
 # effect it carries; codegen reads `name`'s evidence node. The effect does NOT
@@ -13654,7 +13666,7 @@ fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) 
 # that carries mutation and is a parameter or escapes keeps `Mutable`.
 
 fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : InferState {
-  if not list_has_label(st.row, "Mutable") { st }
+  if not labels_contain_mutable(st.row) { st }
   else {
     let body_resolved = finalise_typed_expr(st.sub, body)
     # The mutation-carrying record names (every record with a transitive
@@ -13668,7 +13680,7 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
     let opaque = opaque_binders(params, body_resolved)
     let escaped_set = collect_escaped_names(body_resolved, [])
     if all_demands_local(body_resolved, local_set, escaped_set, opaque, dmut) {
-      st_drop_label(st, "Mutable")
+      st_drop_effect(st, CeMutable)
     } else { st }
   }
 }
@@ -13680,41 +13692,14 @@ fn sum_carrier_shape(s: SumInfo) : CarrierShape = match s {
   SI(name, _, vs, _) -> sum_shape(name, vs)
 }
 
-fn list_has_label(row: [Label], eff: String) : Bool {
-  match row {
-    []           -> false
-    [h, ...rest] -> if h.eff == eff { true } else { list_has_label(rest, eff) }
-  }
-}
-
-fn st_drop_label(st: InferState, eff: String) : InferState {
-  let row1 = drop_labels_named(st.row, eff)
-  let uses1 = drop_eff_uses_named(st.eff_uses, eff)
+fn st_drop_effect(st: InferState, c: CoreEffect) : InferState {
+  let row1 = filter(st.row, (h) => not effect_is(h.sym, c))
+  let uses1 = filter(st.eff_uses, (u) => match u { EU(l, _, _) -> not effect_is(l.sym, c) })
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: row1, eff_uses: uses1, aliases: st.aliases,
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
-}
-
-fn drop_labels_named(row: [Label], eff: String) : [Label] {
-  match row {
-    []           -> []
-    [h, ...rest] ->
-      if h.eff == eff { drop_labels_named(rest, eff) }
-      else { [h, ...drop_labels_named(rest, eff)] }
-  }
-}
-
-fn drop_eff_uses_named(uses: [EffUse], eff: String) : [EffUse] {
-  match uses {
-    []           -> []
-    [h, ...rest] -> match h {
-      EU(name, _, _) ->
-        if name == eff { drop_eff_uses_named(rest, eff) }
-        else { [h, ...drop_eff_uses_named(rest, eff)] }
-    }
-  }
 }
 
 fn mut_collect_param_names(ps: [Param], acc: [String]) : [String] {
@@ -14245,18 +14230,17 @@ fn ty_callee_has_mutable(t: Ty) : Bool = match t {
 
 fn labels_contain_mutable(labels: [Label]) : Bool = match labels {
   []           -> false
-  [h, ...rest] -> if h.eff == "Mutable" { true } else { labels_contain_mutable(rest) }
+  [h, ...rest] -> if effect_is(h.sym, CeMutable) { true } else { labels_contain_mutable(rest) }
 }
 
-# True iff the call's callee is a qualified op of the `Mutable` effect —
-# `EVar("Mutable.<op>")` (possibly `Mutable.<op>@<alias>`). Its `.ty` is the
-# op's result type, so `ty_callee_has_mutable` cannot see the demand; the
-# dispatch-key prefix is the effect-level signal. This is NOT a per-op
+# True iff the call's callee is an op of the `Mutable` effect: the callee
+# of a perform carries its effect's id. Its `.ty` is the op's result type,
+# so `ty_callee_has_mutable` cannot see the demand. This is NOT a per-op
 # whitelist — `array_set`, `ref_set`, `ref_get`, `ref_make`, and any other
 # `Mutable` op all match.
-fn callee_is_mutable_op(callee: Expr) : Bool = match sym_read_kind(callee.kind) {
-  EVar(name) -> dotted_prefix(strip_alias_suffix(name)) == "Mutable"
-  _          -> false
+fn callee_is_mutable_op(callee: Expr) : Bool = match callee.kind {
+  ESym(s, _, _) -> effect_is(s, CeMutable)
+  _             -> false
 }
 
 
@@ -14335,15 +14319,15 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
       # mutation-carrying argument of its own, so it is maskable when its
       # real mutation is a local cell — the per-argument check, not a blanket
       # decision, is what keeps `array.from` and friends maskable.
-      # A qualified `Mutable.<op>` op-call has its callee rewritten to
-      # `EVar("Mutable.<op>")` (`synth_op_call_with_scheme_keys` →
-      # `callee_expr_for_op`), and that `EVar`'s `.ty` is the op's RESULT
-      # type, not a `/ Mutable` fn type — the effect lives on the caller's
-      # row, not the callee node. So `ty_callee_has_mutable` alone misses
-      # the dispatched-op spelling. Recognising the callee by its `Mutable.`
-      # dispatch prefix is the effect-level check (NOT a per-op whitelist):
-      # every op of `Mutable` — `array_set`, `ref_set`, `ref_get`,
-      # `ref_make`, and any future op — flows through the same escape rule.
+      # A qualified `Mutable.<op>` op-call has its callee rewritten to one
+      # flat reference (`synth_op_call_with_scheme_keys` →
+      # `callee_expr_for_op`) whose `.ty` is the op's RESULT type, not a
+      # `/ Mutable` fn type — the effect lives on the caller's row, not the
+      # callee node. So `ty_callee_has_mutable` alone misses the dispatched
+      # op. The effect id that reference carries is the effect-level check
+      # (NOT a per-op whitelist): every op of `Mutable` — `array_set`,
+      # `ref_set`, `ref_get`, `ref_make`, and any future op — flows through
+      # the same escape rule.
       let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
       let demands_mutable =
         ty_callee_has_mutable(callee_ty) or callee_is_mutable_op(callee)
@@ -19036,7 +19020,7 @@ type HandleBreach = HBDirect | HBSum(String, String)
 # handlers of what its body performs.
 fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + File =
   foldl(cont_crossings(body, (t) => apply_ty(st.sub, t), (t) => ty_holds_cont(t, st.sums, st.recs, []),
-                       (t, eff, es) => ty_cont_needs(t, eff, es, st.sums, st.recs)), st,
+                       (t, es) => ty_cont_needs(t, es, st.sums, st.recs)), st,
         (acc, c) => match c {
           Crossing(msg, help, l, col) -> {
             diag_error(acc.file, l, col, msg)
@@ -19053,30 +19037,31 @@ fn ty_holds_cont(t: Ty, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool
   _ -> false
 }
 
-# A value of `t` holds a continuation whose row names `eff`: a `Cont` with
-# `eff` in its row, or a type holding one that `t` instantiates with such a row.
-fn ty_cont_needs(t: Ty, eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match cont_parts(t) {
-  Some(cp) -> row_arg_names(cp.row, eff, es) or cont_needs_any([cp.arg, cp.answer], eff, es, sums, recs)
-  None -> ty_cont_needs_in(t, eff, es, sums, recs)
+# A value of `t` holds a continuation whose row names the effect `es`: a
+# `Cont` with it in its row, or a type holding one that `t` instantiates
+# with such a row.
+fn ty_cont_needs(t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match cont_parts(t) {
+  Some(cp) -> row_arg_names(cp.row, es) or cont_needs_any([cp.arg, cp.answer], es, sums, recs)
+  None -> ty_cont_needs_in(t, es, sums, recs)
 }
 
-fn ty_cont_needs_in(t: Ty, eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match t {
-  TyCon(_, n, args, _) -> cont_named_needs(n, args, eff, es, sums, recs)
-  TyListT(x) -> ty_cont_needs(x, eff, es, sums, recs)
-  TyFnT(_, r, _) -> ty_cont_needs(r, eff, es, sums, recs)
+fn ty_cont_needs_in(t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match t {
+  TyCon(_, n, args, _) -> cont_named_needs(n, args, es, sums, recs)
+  TyListT(x) -> ty_cont_needs(x, es, sums, recs)
+  TyFnT(_, r, _) -> ty_cont_needs(r, es, sums, recs)
   _ -> false
 }
 
-fn cont_named_needs(n: String, args: [Ty], eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
-  cont_needs_any(args, eff, es, sums, recs)
-    or (any(args, (a) => row_arg_names(a, eff, es)) and named_holds_cont(n, sums, recs, []))
+fn cont_named_needs(n: String, args: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
+  cont_needs_any(args, es, sums, recs)
+    or (any(args, (a) => row_arg_names(a, es)) and named_holds_cont(n, sums, recs, []))
 
-fn cont_needs_any(ts: [Ty], eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
-  any(ts, (t) => ty_cont_needs(t, eff, es, sums, recs))
+fn cont_needs_any(ts: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
+  any(ts, (t) => ty_cont_needs(t, es, sums, recs))
 
-# A row carrier naming `eff`.
-fn row_arg_names(t: Ty, eff: String, es: SymId) : Bool = match t {
-  TyFnT([], TyUnit, row) -> any(row.labels, (l) => label_same(l, Label { eff: eff, ty_args: [], sym: es }))
+# A row carrier naming the effect `es`, bare of any cell.
+fn row_arg_names(t: Ty, es: SymId) : Bool = match t {
+  TyFnT([], TyUnit, row) -> any(row.labels, (l) => sym_raw(es) >= 0 and sym_raw(l.sym) == sym_raw(es) and not label_is_aliased_cell(l.eff))
   _ -> false
 }
 
@@ -19420,14 +19405,14 @@ fn only_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Labe
 # accepts it in `main`'s declared row (capability tag, no handler to
 # install) and a test block has no row surface to opt in through.
 fn test_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Label] =
-  only_non_absorbed_labels(st, filter(row, (h) => h.eff != "Ffi"), decls)
+  only_non_absorbed_labels(st, filter(row, (h) => not effect_is(h.sym, CeFfi)), decls)
 
 # A label `main` absorbs: the declaration it names carries an all-extern
 # default, or it is a parametric stdlib effect whose handler the `var`
 # desugar installs. A root homonym without a default names itself, so the
 # prelude's handler is never installed for its ops.
 fn label_absorbed(h: Label, decls: [Decl]) : Bool =
-  effect_decl_default_all_extern(effect_decl_of(h.sym, decls)) or is_parametric_handlerless_stdlib_eff(h.eff)
+  effect_decl_default_all_extern(effect_decl_of(h.sym, decls)) or is_parametric_handlerless_stdlib_eff(h.sym)
 
 
 # Parametric stdlib effects whose handlers are always user-installed
@@ -19435,9 +19420,8 @@ fn label_absorbed(h: Label, decls: [Decl]) : Bool =
 # carry no runtime default but main absorption stays true so the sugar
 # surface keeps compiling — see the long comment on the legacy
 # `is_absorbable_stdlib_eff` for the row-arithmetic rationale.
-fn is_parametric_handlerless_stdlib_eff(name: String) : Bool {
-  name == "State" or name == "Reader" or name == "Writer"
-}
+fn is_parametric_handlerless_stdlib_eff(s: SymId) : Bool =
+  effect_is_any(s, [CeState, CeReader, CeWriter])
 
 # walk `main`'s body row reporting any label whose
 # effect lacks an `emit_main_wrapper` default handler. Catches
@@ -19456,9 +19440,9 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
       # directly. Treat it as handlable here so `main : Int / Ffi`
       # still typechecks; the REmpty path keeps rejecting an
       # undeclared Ffi label so the silent contract holds.
-      let st1 = if h.eff == "Ffi" or label_absorbed(h, decls) { st }
+      let st1 = if effect_is(h.sym, CeFfi) or label_absorbed(h, decls) { st }
       else {
-        let use_eu = lookup_eff_use(st.eff_uses, h.eff)
+        let use_eu = lookup_eff_use(st.eff_uses, h)
         match use_eu {
           EU(_, uline, ucol) -> {
             let ln = if uline >= 0 { uline } else { line }
@@ -19503,7 +19487,7 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
       let st1 = match find_matching_declared(declared, lab, st) {
         Some(s_after) -> s_after
         None -> {
-          let use_eu = lookup_eff_use(st.eff_uses, lab.eff)
+          let use_eu = lookup_eff_use(st.eff_uses, lab)
           match use_eu {
             EU(_, uline, ucol) -> {
               let line = if uline >= 0 { uline } else { fline }
@@ -19563,7 +19547,7 @@ fn synth_assert_cond(st: InferState, cond: Expr, kind: Option[ContractKind]) : I
 
 fn reject_predicate_effect(st: InferState, kind: String, performed: [Label], cond: Expr) : InferState / Console + File = match performed {
   [] -> st
-  [lab, ..._] -> match lookup_eff_use(st.eff_uses, lab.eff) {
+  [lab, ..._] -> match lookup_eff_use(st.eff_uses, lab) {
     EU(_, uline, ucol) -> {
       let line = if uline >= 0 { uline } else { cond.line }
       let col  = if ucol  >= 0 { ucol  } else { cond.col }
@@ -19636,7 +19620,7 @@ fn ty_identical(a: Ty, b: Ty) : Bool = match a {
 
 # Two declared instances fit the perform and nothing pins which one it means.
 fn report_ambiguous_instance(st: InferState, target: Label, cands: [Label]) : InferState / Console + File + Mutable = {
-  let at = lookup_eff_use(st.eff_uses, target.eff)
+  let at = lookup_eff_use(st.eff_uses, target)
   let line = match at { EU(_, l, _) -> l }
   let col = match at { EU(_, _, c) -> c }
   let shown = label_display(st.env.head_owners, label_diag_string(st.sub, apply_label_args(st.sub, target)))

@@ -6,6 +6,7 @@ import compiler.expr_positions
 import compiler.loop_lower
 import compiler.region
 import compiler.util
+import compiler.core_effects
 
 # The arena stack is a per-thread bump stack whose live pointer is the
 # region's `KaiArena*`. A fiber that parks between a region push and its
@@ -18,8 +19,8 @@ import compiler.util
 # row does not.
 
 #[doc("Effects whose ops are fiber suspension points — the ones that let a fiber migrate across a park.")]
-pub fn ry_suspending_effects() : [String] =
-  ["Spawn", "Actor", "Cancel", "Link", "Monitor"]
+pub fn ry_suspending_effects() : [CoreEffect] =
+  [CeSpawn, CeActor, CeCancel, CeLink, CeMonitor]
 
 #[doc("Fail the compile for every `region { }` whose body can reach a fiber suspension point; returns the diagnostics, already printed.")]
 pub fn region_yield_findings(decls: [Decl], regions: [RegionMark], file: String) : [Diagnostic] / Console =
@@ -85,7 +86,8 @@ fn ry_pos_is_region(ms: [RegionMark], line: Int, col: Int) : Bool {
 # the invariant forbids.
 fn ry_check_region(e: Expr, file: String) : [Diagnostic] / Console {
   match ry_first_suspend(ry_effects_in_expr(e, [])) {
-    Some(eff) -> {
+    Some(c) -> {
+      let eff = core_effect_name(c)
       let msg = concat_all(["a `region { }` block may not reach a `", eff,
         "` suspension point — a region never spans a yield (the pinned-region invariant), so an arena pointer would dangle after a migrating fiber resumes on another thread"])
       eprint(concat_all([file, ":", int_to_string(e.line), ":", int_to_string(e.col), ": error: ", msg, "\n"]))
@@ -95,11 +97,19 @@ fn ry_check_region(e: Expr, file: String) : [Diagnostic] / Console {
   }
 }
 
-fn ry_first_suspend(effs: [String]) : Option[String] {
+fn ry_first_suspend(effs: [SymId]) : Option[CoreEffect] {
   match effs {
-    []             -> None
-    [eff, ...rest] -> if ry_mem(eff, ry_suspending_effects()) { Some(eff) } else { ry_first_suspend(rest) }
+    []           -> None
+    [s, ...rest] -> match ry_suspending_of(s, ry_suspending_effects()) {
+      Some(c) -> Some(c)
+      None    -> ry_first_suspend(rest)
+    }
   }
+}
+
+fn ry_suspending_of(s: SymId, cs: [CoreEffect]) : Option[CoreEffect] = match cs {
+  []           -> None
+  [c, ...rest] -> if effect_is(s, c) { Some(c) } else { ry_suspending_of(s, rest) }
 }
 
 # ---- suspending effects demanded by a region body --------------------
@@ -113,7 +123,7 @@ fn ry_first_suspend(effs: [String]) : Option[String] {
 # bodies run in place. Nested regions and handler clauses ARE walked:
 # they run inside this body, so an effect they reach is reachable here.
 
-fn ry_effects_in_expr(e: Expr, acc: [String]) : [String] {
+fn ry_effects_in_expr(e: Expr, acc: [SymId]) : [SymId] {
   let a1 = ry_effects_here(e, acc)
   match e.kind {
     EIntrinsic(nm, xs) ->
@@ -123,7 +133,7 @@ fn ry_effects_in_expr(e: Expr, acc: [String]) : [String] {
   }
 }
 
-fn ry_effects_in_ps(ps: [XPos], acc: [String]) : [String] {
+fn ry_effects_in_ps(ps: [XPos], acc: [SymId]) : [SymId] {
   match ps {
     []                     -> acc
     [XP(XLam, _), ...rest] -> ry_effects_in_ps(rest, acc)
@@ -131,70 +141,34 @@ fn ry_effects_in_ps(ps: [XPos], acc: [String]) : [String] {
   }
 }
 
-# An effect-op callee reaches here untyped, so ops are recognised by name.
-fn ry_effects_here(e: Expr, acc: [String]) : [String] {
+# An effect-op callee reaches here untyped; the id it carries is its effect's.
+fn ry_effects_here(e: Expr, acc: [SymId]) : [SymId] {
   match e.kind {
-    EVar(name)       -> ry_add_op_effect(name, acc)
-    ESym(_, _, name)    -> ry_add_op_effect(name, acc)
+    ESym(s, _, _)    -> if sym_is_local(s) { acc } else { [s, ...acc] }
     ECall(callee, _) -> ry_add_callee_effects(callee, acc)
-    EHandle(_, eff, _, _, _, _, _, _) -> [eff, ...acc]
+    EHandle(_, _, hsym, _, _, _, _, _) -> [hsym, ...acc]
     _                -> acc
   }
 }
 
-fn ry_add_op_effect(name: String, acc: [String]) : [String] {
-  let pre = ry_upper_dotted_prefix(name)
-  if pre == "" { acc } else { [pre, ...acc] }
-}
-
-fn ry_upper_dotted_prefix(name: String) : String {
-  let n = string_length(name)
-  if n == 0 { "" }
-  else if ry_first_upper(name) { ry_take_to_dot(name, 0, n) } else { "" }
-}
-
-fn ry_first_upper(name: String) : Bool {
-  match char_at(name, 0) {
-    Some(c) -> c >= 'A' and c <= 'Z'
-    None    -> false
-  }
-}
-
-fn ry_take_to_dot(name: String, i: Int, n: Int) : String {
-  if i >= n { "" }
-  else {
-    match char_at(name, i) {
-      Some('.') -> string_slice(name, 0, i)
-      Some(_)   -> ry_take_to_dot(name, i + 1, n)
-      None      -> ""
-    }
-  }
-}
-
-fn ry_add_callee_effects(callee: Expr, acc: [String]) : [String] {
+fn ry_add_callee_effects(callee: Expr, acc: [SymId]) : [SymId] {
   match callee.ty {
     Some(TyFnT(_, _, row)) -> ry_add_label_effects(row.labels, acc)
     _                      -> acc
   }
 }
 
-fn ry_add_label_effects(ls: [Label], acc: [String]) : [String] {
+fn ry_add_label_effects(ls: [Label], acc: [SymId]) : [SymId] {
   match ls {
     []           -> acc
-    [l, ...rest] -> ry_add_label_effects(rest, [l.eff, ...acc])
+    [l, ...rest] -> ry_add_label_effects(rest, [l.sym, ...acc])
   }
 }
 
-fn ry_effects_in_exprs(xs: [Expr], acc: [String]) : [String] {
+fn ry_effects_in_exprs(xs: [Expr], acc: [SymId]) : [SymId] {
   match xs {
     []           -> acc
     [x, ...rest] -> ry_effects_in_exprs(rest, ry_effects_in_expr(x, acc))
   }
 }
 
-fn ry_mem(name: String, xs: [String]) : Bool {
-  match xs {
-    []           -> false
-    [x, ...rest] -> if x == name { true } else { ry_mem(name, rest) }
-  }
-}

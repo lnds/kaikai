@@ -21,11 +21,12 @@ import compiler.unwind_carriers
 import compiler.unwind_cx
 import compiler.unwind_calls
 import compiler.borrow_view
+import compiler.core_effects
 
 #[doc("The unwind context of a program: its decls and every handler clause in them.")]
 pub fn unw_cx(decls: [Decl], clauses: [ClauseInfo]) : UnwCx = {
   let c = ue_cx_of(decls, unw_clauses(clauses, decls))
-  UnwCx { effs: c.effs, fns: c.fns, unw: c.unw, all: c.all, carriers: c.carriers, handles: ue_handle_fns(clauses, []) }
+  UnwCx { ...c, handles: ue_handle_fns(clauses, []) }
 }
 
 #[doc("The unwind context of `decls` before their clauses are lifted: each `handle` brings its own; no fn is marked as installing one.")]
@@ -35,13 +36,31 @@ fn ue_cx_of(decls: [Decl], hs: [UnwClause]) : UnwCx = {
   let effs = ue_effect_names(decls, [])
   let all = ue_rows_cancel(decls)
   let carriers = unw_carriers(decls)
-  let unw = if all { [] } else { ue_fix(hs, decls, effs, carriers, unw_abandoning(hs, ["Cancel"])) }
+  let unw = if all { [] } else { ue_fix(hs, decls, effs, carriers, unw_abandoning(hs, [sym_raw(core_effect_id(CeCancel))])) }
   ue_cx(decls, effs, carriers, unw, all)
 }
 
-fn ue_cx(decls: [Decl], effs: [String], carriers: [String], unw: [String], all: Bool) : UnwCx = {
-  let base = UnwCx { effs: effs, fns: array_make(1, []), unw: unw, all: all, carriers: carriers, handles: [] }
-  UnwCx { effs: effs, unw: unw, all: all, carriers: carriers, fns: ue_table(decls, base), handles: [] }
+fn ue_cx(decls: [Decl], effs: [String], carriers: [String], unw: [Int], all: Bool) : UnwCx = {
+  let base = UnwCx { effs: effs, eff_ids: ue_effect_ids(decls, []), fns: array_make(1, []), unw: unw,
+                     unw_spelled: ue_spelled(decls, unw), all: all, carriers: carriers, handles: [] }
+  UnwCx { ...base, fns: ue_table(decls, base) }
+}
+
+# The names the effects `unw` are declared with.
+fn ue_spelled(decls: [Decl], unw: [Int]) : [String] = match decls {
+  [] -> []
+  [d, ...rest] -> match d {
+    DEffect(_, name, _, _, _, _, _, _, s) -> if unw_has_id(unw, s) { [name, ...ue_spelled(rest, unw)] } else { ue_spelled(rest, unw) }
+    _ -> ue_spelled(rest, unw)
+  }
+}
+
+fn ue_effect_ids(decls: [Decl], acc: [Int]) : [Int] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DEffect(_, _, _, _, _, _, _, _, s) -> ue_effect_ids(rest, if sym_raw(s) >= 0 { [sym_raw(s), ...acc] } else { acc })
+    _ -> ue_effect_ids(rest, acc)
+  }
 }
 
 fn ue_handle_fns(cs: [ClauseInfo], acc: [String]) : [String] = match cs {
@@ -88,24 +107,25 @@ fn ue_rows_cancel(decls: [Decl]) : Bool = match decls {
 
 fn ue_row_cancels(row: RowExpr) : Bool = match row {
   REmpty       -> false
-  RClosed(ls)  -> ue_cancel_label(rl_names(ls))
-  ROpen(_, ls) -> ue_cancel_label(rl_names(ls))
+  RClosed(ls)  -> ue_cancel_label(ls)
+  ROpen(_, ls) -> ue_cancel_label(ls)
 }
 
-fn ue_cancel_label(ns: [String]) : Bool = unw_any_effect_in(ns, ["Spawn", "Link"])
+fn ue_cancel_label(ls: [RowLabel]) : Bool =
+  any(ls, (l) => effect_is_any(rl_sym(l), [CeSpawn, CeLink]))
 
 # Adds every effect one of whose clauses can unwind, until none is added.
-fn ue_fix(hs: [UnwClause], decls: [Decl], effs: [String], carriers: [String], unw: [String]) : [String] = {
+fn ue_fix(hs: [UnwClause], decls: [Decl], effs: [String], carriers: [String], unw: [Int]) : [Int] = {
   let ucx = ue_cx(decls, effs, carriers, unw, false)
   let more = ue_unwinding_clauses(hs, ucx, unw)
   if list_length(more) == list_length(unw) { unw } else { ue_fix(hs, decls, effs, carriers, more) }
 }
 
-fn ue_unwinding_clauses(hs: [UnwClause], ucx: UnwCx, acc: [String]) : [String] = match hs {
+fn ue_unwinding_clauses(hs: [UnwClause], ucx: UnwCx, acc: [Int]) : [Int] = match hs {
   [] -> acc
   [UnwC(eff, k, body), ...rest] ->
-    if list_has(acc, eff) or not ue_clause_unwinds(body, k, ucx) { ue_unwinding_clauses(rest, ucx, acc) }
-    else { ue_unwinding_clauses(rest, ucx, [eff, ...acc]) }
+    if sym_raw(eff) < 0 or unw_has_id(acc, eff) or not ue_clause_unwinds(body, k, ucx) { ue_unwinding_clauses(rest, ucx, acc) }
+    else { ue_unwinding_clauses(rest, ucx, [sym_raw(eff), ...acc]) }
 }
 
 # A clause's resume in tail position returns into the perform: only its
