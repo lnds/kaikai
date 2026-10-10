@@ -6,6 +6,7 @@ import compiler.symtab_build
 import compiler.util
 import compiler.core_effects
 import compiler.proto_ids
+import compiler.written
 
 # Map-pipe deforestation (issue #1134). `map g . map f = map (g . f)`
 # collapses two map traversals into one — one result list, zero
@@ -19,8 +20,8 @@ import compiler.proto_ids
 # construction. The purity gate and type projections that need the live
 # substitution stay in the typer (`try_fuse_map_pipe`).
 
-# A recognised map-call: the `map` callee (`EModCall`/`EVar`), the
-# source list, and the stage closure — all already typed.
+# A recognised map-call: the `map` callee, the source list, and the
+# stage closure — all already typed.
 pub type FusedMapCall = { callee: Expr, source: Expr, stage: Expr }
 
 # Resolved stage types the composed lambda is built from: the parameter
@@ -38,15 +39,15 @@ pub fn pipe_fusion_as_map_call(e: Expr) : Option[FusedMapCall] =
     _ -> None
   }
 
-# The canonical `map` op is `EModCall(_, "map")` for a module-resident
-# head or the bare `EName("map")` fallback the seeded `List` head routes
-# through. `flat_map`/`filter` are deliberately not matched — v1 fuses
+# The canonical `map` op is a module's `map` the typer has not settled
+# yet, a bare `map` the resolver left to the type, or the core list one
+# by its id. `flat_map`/`filter` are deliberately not matched — v1 fuses
 # map-map only.
 fn pipe_fusion_callee_is_map(callee: Expr) : Bool =
   match callee.kind {
-    EModCall(_, op) -> op == "map"
-    EName(name)      -> name == "map"
-    ESym(s, _, _)   -> pipe_fusion_is_list_fn(s, "map")
+    EModCall(_, op) -> written_text(op) == "map"
+    EName(name)     -> written_text(name) == "map"
+    ESym(s, _)      -> pipe_fusion_is_list_fn(s, "map")
     _               -> false
   }
 
@@ -77,8 +78,8 @@ pub fn pipe_fusion_labels_pure(labels: [Label]) : Bool =
 pub fn pipe_fusion_compose(inner: Expr, outer: Expr, tys: FuseTypes,
                            line: Int, col: Int) : Expr {
   let pname = concat_all(["__fuse_", int_to_string(line), "_", int_to_string(col)])
-  let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
-  let arg = with_ty(mk_ref(pname, line, col), tys.param)
+  let param = pipe_fusion_param(pname, line, col)
+  let arg = with_ty(mk_local(local_minted(pname), line, col), tys.param)
   let inner_call = with_ty(pipe_fusion_apply(inner, [arg]), tys.mid)
   let outer_call = with_ty(pipe_fusion_apply(outer, [inner_call]), tys.result)
   let lam_ty = TyFnT([tys.param], tys.result, tys.row)
@@ -127,16 +128,18 @@ fn pipe_fusion_as_terminal(ids: ProtoIds, rhs: Expr) : Option[FoldTerminal] =
       if pipe_fusion_callee_is_foldl(ids, callee) { Some(TermFoldl(init, combine)) }
       else { None }
     # `|> sum()` — the zero-arg call spelling of a named terminal.
-    ECall(callee, []) -> match callee.kind {
-      EModCall(mod, op) -> if home_is(mod, CmList) { pipe_fusion_named_terminal(op) } else { None }
-      EName(name)        -> pipe_fusion_named_terminal(name)
-      ESym(s, _, name)  -> pipe_fusion_sym_terminal(s, name)
-      _                 -> None
-    }
-    EModCall(mod, op) -> if home_is(mod, CmList) { pipe_fusion_named_terminal(op) } else { None }
-    EName(name)        -> pipe_fusion_named_terminal(name)
-    ESym(s, _, name)  -> pipe_fusion_sym_terminal(s, name)
-    _                 -> None
+    ECall(callee, []) -> pipe_fusion_ref_terminal(callee)
+    _                 -> pipe_fusion_ref_terminal(rhs)
+  }
+
+# The terminal a reference names: a module's function the typer has not
+# settled yet, a name the resolver left to the type, or a declaration.
+fn pipe_fusion_ref_terminal(f: Expr) : Option[FoldTerminal] =
+  match f.kind {
+    EModCall(mod, op) -> pipe_fusion_sym_terminal(sym_derive(NCFn, written_text(op), written_text(mod)))
+    EName(name) -> pipe_fusion_named_terminal(written_text(name))
+    ESym(s, _)  -> pipe_fusion_sym_terminal(s)
+    _           -> None
   }
 
 # A resolved stage is the core list function only by its id: a root or
@@ -144,8 +147,11 @@ fn pipe_fusion_as_terminal(ids: ProtoIds, rhs: Expr) : Option[FoldTerminal] =
 fn pipe_fusion_is_list_fn(s: SymId, name: String) : Bool =
   sym_raw(s) == sym_raw(sym_derive(NCFn, name, core_module_name(CmList)))
 
-fn pipe_fusion_sym_terminal(s: SymId, name: String) : Option[FoldTerminal] =
-  if pipe_fusion_is_list_fn(s, name) { pipe_fusion_named_terminal(name) } else { None }
+fn pipe_fusion_sym_terminal(s: SymId) : Option[FoldTerminal] =
+  if pipe_fusion_is_list_fn(s, "sum") { Some(TermSum) }
+  else if pipe_fusion_is_list_fn(s, "product") { Some(TermProduct) }
+  else if pipe_fusion_is_list_fn(s, "length") { Some(TermLength) }
+  else { None }
 
 fn pipe_fusion_named_terminal(name: String) : Option[FoldTerminal] =
   if name == "sum" { Some(TermSum) }
@@ -173,9 +179,9 @@ fn pipe_fusion_flatten_map_chain(e: Expr) : FlatMapChain =
 
 fn pipe_fusion_callee_is_foldl(ids: ProtoIds, callee: Expr) : Bool =
   match callee.kind {
-    EModCall(_, op) -> op == "foldl"
-    EName(name)      -> name == "foldl"
-    ESym(s, _, _)   -> pipe_fusion_is_list_fn(s, "foldl") or pipe_fusion_is_proto_foldl(ids, s)
+    EModCall(_, op) -> written_text(op) == "foldl"
+    EName(name)     -> written_text(name) == "foldl"
+    ESym(s, _)      -> pipe_fusion_is_list_fn(s, "foldl") or pipe_fusion_is_proto_foldl(ids, s)
     _               -> false
   }
 
@@ -188,8 +194,8 @@ fn pipe_fusion_is_proto_foldl(ids: ProtoIds, s: SymId) : Bool = match pid_disp(i
 #[doc("The reference the chain's `foldl` terminal calls when it is the protocol operation rather than `list.foldl`: only a container implementing the protocol then fuses, through the model's own `foldl`.")]
 pub fn pipe_fusion_proto_foldl(ids: ProtoIds, rhs: Expr) : Option[ExprKind] = match rhs.kind {
   ECall(callee, _) -> match callee.kind {
-    ESym(s, _, _) -> if pipe_fusion_is_proto_foldl(ids, s) { Some(callee.kind) } else { None }
-    _             -> None
+    ESym(s, _) -> if pipe_fusion_is_proto_foldl(ids, s) { Some(callee.kind) } else { None }
+    _          -> None
   }
   _ -> None
 }
@@ -223,9 +229,9 @@ fn pipe_fusion_hoist_lambdas(stages: [Expr], i: Int, line: Int, col: Int) : Hois
         ELambda(_, _) -> {
           let name = concat_all(["__fusev_", int_to_string(line), "_",
                                  int_to_string(col), "_", int_to_string(i)])
-          let pat = Pattern { pkind: PBind(name), line: line, col: col }
+          let pat = Pattern { pkind: PBind(binder_minted(name)), line: line, col: col }
           HoistedStages { binds: [SLet(pat, None, s), ...r.binds],
-                          refs: [mk_ref(name, line, col), ...r.refs] }
+                          refs: [mk_local(local_minted(name), line, col), ...r.refs] }
         }
         _ -> HoistedStages { binds: r.binds, refs: [s, ...r.refs] }
       }
@@ -236,10 +242,13 @@ fn pipe_fusion_hoist_lambdas(stages: [Expr], i: Int, line: Int, col: Int) : Hois
 # `x => ...g(f(x))`.
 fn pipe_fusion_compose_stages(stages: [Expr], line: Int, col: Int) : Expr {
   let pname = concat_all(["__fusef_", int_to_string(line), "_", int_to_string(col)])
-  let param = Param { pname: pname, ptype: None, pline: line, pcol: col, pborrow: false }
-  let body = pipe_fusion_apply_stages(stages, mk_ref(pname, line, col))
-  mk_expr(ELambda([param], body), line, col)
+  let body = pipe_fusion_apply_stages(stages, mk_local(local_minted(pname), line, col))
+  mk_expr(ELambda([pipe_fusion_param(pname, line, col)], body), line, col)
 }
+
+# The parameter a fusion closure mints under `key`.
+fn pipe_fusion_param(key: String, line: Int, col: Int) : Param =
+  Param { binder: binder_minted(key), ptype: None, pline: line, pcol: col, pborrow: false }
 
 fn pipe_fusion_apply_stages(stages: [Expr], acc: Expr) : Expr =
   match stages {
@@ -324,11 +333,9 @@ fn pipe_fusion_compose_combiner(stage: Expr, combine: Expr,
                                 line: Int, col: Int) : Expr {
   let accn = concat_all(["__fuse_acc_", int_to_string(line), "_", int_to_string(col)])
   let xn   = concat_all(["__fuse_x_", int_to_string(line), "_", int_to_string(col)])
-  let accp = Param { pname: accn, ptype: None, pline: line, pcol: col, pborrow: false }
-  let xp   = Param { pname: xn, ptype: None, pline: line, pcol: col, pborrow: false }
-  let staged = pipe_fusion_apply(stage, [mk_ref(xn, line, col)])
-  let body = pipe_fusion_apply(combine, [mk_ref(accn, line, col), staged])
-  mk_expr(ELambda([accp, xp], body), line, col)
+  let staged = pipe_fusion_apply(stage, [mk_local(local_minted(xn), line, col)])
+  let body = pipe_fusion_apply(combine, [mk_local(local_minted(accn), line, col), staged])
+  mk_expr(ELambda([pipe_fusion_param(accn, line, col), pipe_fusion_param(xn, line, col)], body), line, col)
 }
 
 # `<target>(source-args..., stage, extra...)` with the lambda stages
@@ -368,7 +375,7 @@ fn range_fold(cf: CoreFn, stepped: Bool) : CoreFn = match cf {
 }
 
 fn fold_call(cf: CoreFn, args: [Expr], line: Int, col: Int) : Expr =
-  mk_expr(ECall(mk_expr(EModCall(core_fn_home(cf), core_fn_name(cf)), line, col), args), line, col)
+  mk_expr(ECall(mk_expr(EModCall(written(core_fn_home(cf)), written(core_fn_name(cf))), line, col), args), line, col)
 
 # A map-pipe chain in Vec-expected context — the collect shape. The
 # stages are raw (pre-synth) so the typer's purity gate can read each

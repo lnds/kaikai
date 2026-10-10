@@ -14,7 +14,6 @@
 
 import compiler.ast
 import compiler.marks
-import compiler.sym_read
 import compiler.util
 import compiler.pipe_fusion
 import compiler.closure_spec_ast
@@ -28,11 +27,14 @@ import compiler.symtab
 import compiler.core_syms
 import compiler.proto_ids
 
-#[doc("Specialise every higher-order call on a known env-empty closure; returns the decls with per-site specs appended and their call sites retargeted. Runs post-monomorphisation so each specialised callee is already concrete — the inlined loop body unboxes exactly like the hand-written recursion.")]
-pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab, ids: ProtoIds) : [Decl] = {
+#[doc("What closure specialisation hands back: the decls with the per-site specs appended and their call sites retargeted, and the table row of each spec.")]
+pub type CSpecOut = { decls: [Decl], rows: [NEnt] }
+
+#[doc("Specialise every higher-order call on a known env-empty closure. Runs before monomorphisation, which then grounds each spec to concrete types — the inlined loop body unboxes exactly like the hand-written recursion. `tab` holds the declarations of `ds`.")]
+pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab, ids: ProtoIds) : CSpecOut = {
   let hofns = collect_hofns(ds)
-  if list_length(hofns) == 0 { ds }
-  else { cspec_fixpoint(ds, hofns, [], cspec_fuel(), target, tab, ids) }
+  if list_length(hofns) == 0 { CSpecOut { decls: ds, rows: [] } }
+  else { cspec_fixpoint(ds, hofns, [], [], cspec_fuel(), target, tab, ids) }
 }
 
 # Specialisation propagates across fn boundaries: specialising `foldl`
@@ -48,31 +50,53 @@ fn cspec_fuel() : Int = 64
 # the raw `inner(..., L)` call whose request the next round must find;
 # rewriting inside the loop would retarget it away before it is seen,
 # stranding the transitive spec (`foldl → foldl_loop`).
-fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int, target: String, tab: SymTab, ids: ProtoIds) : [Decl] =
-  if fuel <= 0 { rewrite_all(ds, ds, tab, ids, hofns, target) }
+# A spec is a declaration of its own, so each round's specs enter the
+# table: the next round spells a spec's host and callee from it.
+fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [SymId], rows: [NEnt], fuel: Int, target: String, tab: SymTab, ids: ProtoIds) : CSpecOut =
+  if fuel <= 0 { CSpecOut { decls: rewrite_all(ds, ds, tab, ids, hofns, target), rows: rows } }
   else {
-    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns), emitted, [])
-    if list_length(reqs) == 0 { rewrite_all(ds, ds, tab, ids, hofns, target) }
+    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns), tab, target, emitted, [])
+    if list_length(reqs) == 0 { CSpecOut { decls: rewrite_all(ds, ds, tab, ids, hofns, target), rows: rows } }
     else {
-      let specs = map(reqs, (r) => emit_cspec(r, ds, target))
+      let specs = map(reqs, (r) => emit_cspec(r, req_spec_name(tab, r), target))
+      let rows1 = map(reqs, (r) => req_spec_row(tab, r, target))
       let ds1 = list_append(ds, specs)
       let hofns1 = list_append(hofns, filter_hofns(specs))
-      let emitted1 = list_append(emitted, map(reqs, req_spec_name))
-      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1, target, tab, ids)
+      let emitted1 = list_append(emitted, map(reqs, (r) => req_spec_sym(tab, r, target)))
+      cspec_fixpoint(ds1, hofns1, emitted1, list_append(rows, rows1), fuel - 1, target, st_extend(tab, rows1), ids)
     }
   }
 
-fn req_spec_name(r: CSpecReq) : String =
-  match r { CSReq(callee, _, _, disc) -> cspec_name(cs_decl_mo(callee), cs_decl_name(callee), disc) }
+fn req_spec_name(tab: SymTab, r: CSpecReq) : String =
+  match r { CSReq(callee, _, _, disc) -> cs_spec_name(tab, callee, disc) }
 
-fn dedup_reqs(reqs: [CSpecReq], emitted: [String], seen: [String]) : [CSpecReq] =
+# The name of the spec of the callee `hd` on the closure `disc` identifies.
+fn cs_spec_name(tab: SymTab, hd: Decl, disc: String) : String =
+  cspec_name(cs_decl_mo(hd), cs_decl_text(tab, hd), disc)
+
+fn req_spec_sym(tab: SymTab, r: CSpecReq, target: String) : SymId = cspec_sym(req_spec_name(tab, r), target)
+
+# A spec is exported exactly when its callee is: it is declared with the callee's own flag.
+fn req_spec_row(tab: SymTab, r: CSpecReq, target: String) : NEnt =
+  match r { CSReq(callee, _, _, _) -> NEnt(NCFn, req_spec_name(tab, r), target, decl_is_pub(callee)) }
+
+fn decl_is_pub(d: Decl) : Bool =
+  match d { DFn(p, _, _, _, _, _, _, _, _, _) -> p  _ -> false }
+
+fn dedup_reqs(reqs: [CSpecReq], tab: SymTab, target: String, emitted: [SymId], seen: [SymId]) : [CSpecReq] =
   match reqs {
     [] -> []
     [r, ...rest] -> {
-      let nm = req_spec_name(r)
-      if list_has(emitted, nm) or list_has(seen, nm) { dedup_reqs(rest, emitted, seen) }
-      else { [r, ...dedup_reqs(rest, emitted, [nm, ...seen])] }
+      let s = req_spec_sym(tab, r, target)
+      if syms_have(emitted, s) or syms_have(seen, s) { dedup_reqs(rest, tab, target, emitted, seen) }
+      else { [r, ...dedup_reqs(rest, tab, target, emitted, [s, ...seen])] }
     }
+  }
+
+fn syms_have(ss: [SymId], s: SymId) : Bool =
+  match ss {
+    [] -> false
+    [x, ...rest] -> sym_raw(x) == sym_raw(s) or syms_have(rest, s)
   }
 
 fn filter_hofns(specs: [Decl]) : [Decl] =
@@ -108,12 +132,11 @@ fn first_fn_param_idx(ps: [Param], i: Int) : Int =
   }
 
 # The higher-order fn a call names: the declaration its id names. A
-# specialisation is already specialised, and a bare spelling is a local or
-# a builtin, so neither names one.
+# specialisation is already specialised, and a local is no declaration,
+# so neither names one.
 fn callee_hofn(hofns: [Decl], callee: Expr) : Option[Decl] = match callee.kind {
-  ESym(s, inst, _) -> if inst == spec_none() { lookup_hofn_sym(hofns, s) } else { None }
-  EModCall(m, n)   -> lookup_hofn_sym(hofns, sym_derive(NCFn, n, m))
-  _                -> None
+  ESym(s, inst) -> if inst == spec_none() { lookup_hofn_sym(hofns, s) } else { None }
+  _             -> None
 }
 
 fn lookup_hofn_sym(hofns: [Decl], s: SymId) : Option[Decl] = match hofns {
@@ -132,7 +155,7 @@ fn cs_collect_decls(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: 
   match ds {
     [] -> []
     [d, ...rest] -> {
-      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), cs_decl_name(d), all, tab, ids, hofns) } else { [] }
+      let here = if cs_specialisable_host(tab, d) { cs_collect_expr(decl_body(d), cs_decl_sym(d), all, tab, ids, hofns) } else { [] }
       list_append(here, cs_collect_decls(rest, all, tab, ids, hofns))
     }
   }
@@ -142,23 +165,26 @@ fn cs_collect_decls(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: 
 # combinators inside one derive share a key and their specs collide —
 # the encoder that writes a payload gets the decoder's inlined stage.
 # Only a hand-written root-file body has positions that separate.
-fn cs_specialisable_host(d: Decl) : Bool =
-  match cs_decl_mo(d) { Some(_) -> false  None -> not cs_decl_is_derived(d) }
+fn cs_specialisable_host(tab: SymTab, d: Decl) : Bool =
+  match cs_decl_mo(d) { Some(_) -> false  None -> not cs_decl_is_derived(tab, d) }
 
-fn cs_decl_is_derived(d: Decl) : Bool = match d {
-  DFn(_, n, _, _, _, _, _, _, _, _, _) ->
+# No table says which functions a derive wrote, so the name it gave them does.
+fn cs_decl_is_derived(tab: SymTab, d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> {
+    let n = cs_decl_text(tab, d)
     string_contains(n, "__pimpl_") or string_starts_with_q(n, "__binser_put_")
+  }
   _ -> false
 }
 
 # Bottom-up read walk: a request per specialisable `G(args)`. Children
 # first so nested folds are discovered too.
-fn cs_collect_expr(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] = {
+fn cs_collect_expr(e: Expr, host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] = {
   let kid_reqs = collect_kids(cspec_kids(e), host, all, tab, ids, hofns)
   list_append(kid_reqs, site_req(e, host, all, tab, ids, hofns))
 }
 
-fn collect_kids(es: [Expr], host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
+fn collect_kids(es: [Expr], host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
   match es {
     [] -> []
     [k, ...rest] -> list_append(cs_collect_expr(k, host, all, tab, ids, hofns), collect_kids(rest, host, all, tab, ids, hofns))
@@ -166,7 +192,7 @@ fn collect_kids(es: [Expr], host: String, all: [Decl], tab: SymTab, ids: ProtoId
 
 # A specialisation request for this node when it is a higher-order call
 # on an env-empty closure; empty otherwise.
-fn site_req(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
+fn site_req(e: Expr, host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
       Some(hd) -> req_of(args_, hd, host, all, tab, ids)
@@ -175,12 +201,12 @@ fn site_req(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofn
     _ -> []
   }
 
-fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab, ids: ProtoIds) : [CSpecReq] = {
+fn req_of(args_: [Expr], hd: Decl, host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds) : [CSpecReq] = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(ids, hd, idx) { [] }
   else {
     match classify_closure(ids, elem_at(args_, idx), all, tab) {
-      Some(ca) -> [CSReq(hd, idx, ca, closure_disc(host, ca))]
+      Some(ca) -> [CSReq(hd, idx, ca, closure_disc(tab, host, ca))]
       None     -> []
     }
   }
@@ -196,15 +222,15 @@ fn rewrite_all(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl
 # decl is left untouched: no spec was discovered for its internal calls.
 fn rewrite_decl(d: Decl, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Decl =
   match d {
-    DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) ->
-      if cs_specialisable_host(d) {
-        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, n, all, tab, ids, hofns, target), l, c, mo, fsym)
+    DFn(p, f, tp, ps, rt, row, body, l, c, mo) ->
+      if cs_specialisable_host(tab, d) {
+        DFn(p, f, tp, ps, rt, row, rewrite_expr(body, fnid_sym(f), all, tab, ids, hofns, target), l, c, mo)
       } else { d }
     _ -> d
   }
 
 # Rewrite bottom-up: children via the shared functor, then this node.
-fn rewrite_expr(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Expr = {
+fn rewrite_expr(e: Expr, host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Expr = {
   let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, tab, ids, hofns, target)),
                   line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
   retarget_site(e1, host, all, tab, ids, hofns, target)
@@ -212,7 +238,7 @@ fn rewrite_expr(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, 
 
 # A specialisable higher-order call `G(args)` becomes `G__cspec__<disc>(rest)`
 # with the functional argument dropped; other nodes pass through.
-fn retarget_site(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Expr =
+fn retarget_site(e: Expr, host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Expr =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
       Some(hd) -> retarget_call(e, callee, args_, hd, host, all, tab, ids, target)
@@ -221,14 +247,14 @@ fn retarget_site(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds,
     _ -> e
   }
 
-fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, target: String) : Expr = {
+fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: SymId, all: [Decl], tab: SymTab, ids: ProtoIds, target: String) : Expr = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(ids, hd, idx) { e }
   else {
     match classify_closure(ids, elem_at(args_, idx), all, tab) {
       Some(ca) -> {
-        let nm = cspec_name(cs_decl_mo(hd), cs_decl_name(hd), closure_disc(host, ca))
-        Expr { kind: ECall(retarget_callee(callee, nm, target), drop_at(args_, idx)),
+        let nm = cs_spec_name(tab, hd, closure_disc(tab, host, ca))
+        Expr { kind: ECall(retarget_callee(callee, cspec_sym(nm, target)), drop_at(args_, idx)),
                line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
       }
       None -> e
@@ -249,7 +275,7 @@ fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, a
 # it lives in the row, not a `TyName`, and the spec closes it.
 fn hofn_specialisable(ids: ProtoIds, hd: Decl, idx: Int) : Bool =
   match hd {
-    DFn(_, n, _, ps, rt, _, body, _, _, _, fsym) -> {
+    DFn(_, me, _, ps, rt, _, body, _, _, _) -> {
       # A return-only tparam alone is fine — mono grounds it from the call
       # site's resolved return type, and unbox lands the loop's element.
       # The unsound case is narrower: a return-only tparam that the body
@@ -258,7 +284,7 @@ fn hofn_specialisable(ids: ProtoIds, hd: Decl, idx: Int) : Bool =
       # A collect uses `vec_push`/`vec_reserve` (parametric, element opaque)
       # and specialises; `map_sum`'s `zero()` still declines.
       let unsound_ret = any_return_only(drop_param_at(ps, idx), rt) and body_has_arity0_proto_op(ids, body)
-      let flow_ok = functional_param_safe(body, param_name_at(ps, idx), SelfRef(fsym, n))
+      let flow_ok = functional_param_safe(body, param_id_at(ps, idx), SelfRef(me))
       not unsound_ret and flow_ok
     }
     _ -> false
@@ -301,56 +327,50 @@ fn callee_is_proto_op(ids: ProtoIds, callee: Expr) : Bool = match pid_ref_disp(i
 # once. A body that applies it and passes it only to its OWN recursion (a
 # fold's loop step `foldl_loop(..., f(acc,x), f)`) is safe too, since
 # `retarget_self` folds that into the same spec.
-fn functional_param_safe(body: Expr, fname: String, me: SelfRef) : Bool =
-  not (param_applied(body, fname) and passed_to_other(body, fname, me))
+fn functional_param_safe(body: Expr, f: LocalId, me: SelfRef) : Bool =
+  not (param_applied(body, f) and passed_to_other(body, f, me))
 
-# `fname` appears in callee position (`fname(...)`).
-fn param_applied(e: Expr, fname: String) : Bool =
+# The parameter `f` appears in callee position (`f(...)`).
+fn param_applied(e: Expr, f: LocalId) : Bool =
   match e.kind {
     ECall(callee, args_) ->
-      callee_is(callee, fname) or param_applied(callee, fname) or kids_applied(args_, fname)
-    _ -> kids_applied(cspec_kids(e), fname)
+      reads_local(callee, f) or param_applied(callee, f) or kids_applied(args_, f)
+    _ -> kids_applied(cspec_kids(e), f)
   }
 
-fn kids_applied(es: [Expr], fname: String) : Bool =
+fn kids_applied(es: [Expr], f: LocalId) : Bool =
   match es {
     [] -> false
-    [k, ...rest] -> param_applied(k, fname) or kids_applied(rest, fname)
+    [k, ...rest] -> param_applied(k, f) or kids_applied(rest, f)
   }
 
-# `fname` appears as a plain argument in a call to a fn other than `me`.
-fn passed_to_other(e: Expr, fname: String, me: SelfRef) : Bool =
+# The parameter `f` appears as a plain argument in a call to a fn other than `me`.
+fn passed_to_other(e: Expr, f: LocalId, me: SelfRef) : Bool =
   match e.kind {
-    ECall(callee, args_) -> call_passes_to_other(callee, args_, fname, me)
-    _ -> kids_passed(cspec_kids(e), fname, me)
+    ECall(callee, args_) -> call_passes_to_other(callee, args_, f, me)
+    _ -> kids_passed(cspec_kids(e), f, me)
   }
 
-fn call_passes_to_other(callee: Expr, args_: [Expr], fname: String, me: SelfRef) : Bool = {
-  let here = not is_self_callee(callee, me) and args_have_var(args_, fname)
-  here or passed_to_other(callee, fname, me) or kids_passed(args_, fname, me)
+fn call_passes_to_other(callee: Expr, args_: [Expr], f: LocalId, me: SelfRef) : Bool = {
+  let here = not is_self_callee(callee, me) and args_read_local(args_, f)
+  here or passed_to_other(callee, f, me) or kids_passed(args_, f, me)
 }
 
-fn kids_passed(es: [Expr], fname: String, me: SelfRef) : Bool =
+fn kids_passed(es: [Expr], f: LocalId, me: SelfRef) : Bool =
   match es {
     [] -> false
-    [k, ...rest] -> passed_to_other(k, fname, me) or kids_passed(rest, fname, me)
+    [k, ...rest] -> passed_to_other(k, f, me) or kids_passed(rest, f, me)
   }
 
-fn callee_is(callee: Expr, name: String) : Bool =
-  match sym_read_kind(callee.kind) {
-    EName(n)        -> n == name
-    EModCall(_, n) -> n == name
-    _              -> false
-  }
-
-fn args_have_var(args_: [Expr], fname: String) : Bool =
+fn args_read_local(args_: [Expr], f: LocalId) : Bool =
   match args_ {
     [] -> false
-    [a, ...rest] -> arg_is_var(a, fname) or args_have_var(rest, fname)
+    [a, ...rest] -> reads_local(a, f) or args_read_local(rest, f)
   }
 
-fn arg_is_var(a: Expr, fname: String) : Bool =
-  match sym_read_kind(a.kind) { EName(n) -> n == fname  _ -> false }
+# True when `e` is a read of the binder `l`.
+fn reads_local(e: Expr, l: LocalId) : Bool =
+  match e.kind { ELocal(x) -> local_eq(x, l)  _ -> false }
 
 # True when some lowercase type-variable name appears in the result type
 # but in no surviving parameter type — a return-only tparam.
@@ -371,9 +391,9 @@ fn return_only_exists(in_ret: [String], in_params: [String]) : Bool =
 fn is_tyvar_name(n: String) : Bool = not name_is_global(n)
 
 # A functional argument qualifies iff it is a syntactic lambda that
-# captures nothing beyond its own params, or a resolved reference to a
-# monomorphic top-level fn — and its resolved row is PURE. An `EVar` is a
-# local binder, never a top-level fn. An effectful closure is
+# captures nothing beyond its own params, or a reference to a
+# monomorphic top-level fn — and its resolved row is PURE. A local is
+# never a top-level fn. An effectful closure is
 # left alone: a `map`/pipe over it observes per-element effect ordering
 # that inlining the stage into the loop would reorder (soundness, the
 # same gate pipe fusion applies).
@@ -382,16 +402,14 @@ fn classify_closure(ids: ProtoIds, a: Expr, all: [Decl], tab: SymTab) : Option[C
   else {
     match a.kind {
       ELambda(ps, b) ->
-        if captures_free(tab, b, cs_param_names(ps)) { None } else { Some(CaLambda(ps, b)) }
-      ESym(s, _, _) -> cs_named(ids, s, all)
+        if captures_free(tab, b, cs_param_ids(ps)) { None } else { Some(CaLambda(ps, b)) }
+      ESym(s, _) -> cs_named(ids, s, all)
       _ -> None
     }
   }
 
-# The declaration the resolver chose for a reference, found by its id: a
-# bare-name lookup can land on a homonym (a generic root `helper` shadowing
-# an imported monomorphic one). A protocol dispatcher or impl method is
-# one impl among many, so it is never inlined.
+# The declaration a reference names, found by its id. A protocol
+# dispatcher or impl method is one impl among many, so it is never inlined.
 fn cs_named(ids: ProtoIds, s: SymId, all: [Decl]) : Option[ClosureArg] =
   if sym_raw(s) < 0 or pid_is_disp(ids, s) or pid_is_impl(ids, s) { None }
   else { match monomorphic_fn_with_sym(all, sym_raw(s)) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
@@ -400,7 +418,7 @@ fn monomorphic_fn_with_sym(ds: [Decl], id: Int) : Option[Decl] =
   match ds {
     [] -> None
     [d, ...rest] -> match d {
-      DFn(_, _, tps, _, _, _, body, _, _, _, ds_sym) ->
+      DFn(_, ds_sym, tps, _, _, _, body, _, _, _) ->
         if sym_raw(fnid_sym(ds_sym)) == id {
           if list_length(tps) == 0 and not cs_is_extern(body) { Some(d) } else { None }
         } else { monomorphic_fn_with_sym(rest, id) }
@@ -426,32 +444,32 @@ fn fn_ty_pure(t: Option[Ty]) : Bool =
 
 # ---- capture analysis (scoped) ----
 
-# True when the body reads a name bound neither by its own params nor
-# by a binder introduced inside it, and which is not a global. Such a
-# name is a captured caller local, so the closure carries an env.
-fn captures_free(tab: SymTab, e: Expr, bound: [String]) : Bool =
-  match sym_local_kind(e.kind) {
-    EName(n)           -> not list_has(bound, n) and not name_is_global(n)
+# True when the body reads a binder declared neither by its own params
+# nor inside it. Such a read is a captured caller local, so the closure
+# carries an env.
+fn captures_free(tab: SymTab, e: Expr, bound: [LocalId]) : Bool =
+  match e.kind {
+    ELocal(l)         -> not cs_has(bound, l)
     # A core builtin is no global here: a lambda that calls one is not specialised.
-    ESym(s, _, _)     -> sym_is_builtin(tab, s)
+    ESym(s, _)        -> sym_is_builtin(tab, s)
     # A lambda that calls a primitive mark is not specialised.
     EMark(m)          -> mark_is_prim(m)
-    ELambda(ps, b)    -> captures_free(tab, b, list_append(bound, cs_param_names(ps)))
+    ELambda(ps, b)    -> captures_free(tab, b, list_append(bound, cs_param_ids(ps)))
     EBlock(ss, t)     -> block_captures(tab, ss, t, bound)
     EMatch(scr, arms) -> captures_free(tab, scr, bound) or arms_capture(tab, arms, bound)
     _                 -> kids_capture(tab, cspec_kids(e), bound)
   }
 
-fn kids_capture(tab: SymTab, es: [Expr], bound: [String]) : Bool =
+fn kids_capture(tab: SymTab, es: [Expr], bound: [LocalId]) : Bool =
   match es {
     [] -> false
     [c, ...rest] -> captures_free(tab, c, bound) or kids_capture(tab, rest, bound)
   }
 
-# A `let` binder extends `bound` for the rest of the block; the rhs
-# sees the pre-binding scope. A stmt shape we do not model (index-
-# assign, var, use) is treated as a capture — err strict, skip.
-fn block_captures(tab: SymTab, ss: [Stmt], t: Option[Expr], bound: [String]) : Bool =
+# A `let` binder extends `bound` for the rest of the block. A stmt shape
+# we do not model (index-assign, var, use) is treated as a capture — err
+# strict, skip.
+fn block_captures(tab: SymTab, ss: [Stmt], t: Option[Expr], bound: [LocalId]) : Bool =
   match ss {
     [] -> opt_captures(tab, t, bound)
     [s, ...rest] -> match s {
@@ -463,10 +481,10 @@ fn block_captures(tab: SymTab, ss: [Stmt], t: Option[Expr], bound: [String]) : B
     }
   }
 
-fn opt_captures(tab: SymTab, o: Option[Expr], bound: [String]) : Bool =
+fn opt_captures(tab: SymTab, o: Option[Expr], bound: [LocalId]) : Bool =
   match o { Some(e) -> captures_free(tab, e, bound)  None -> false }
 
-fn arms_capture(tab: SymTab, arms: [Arm], bound: [String]) : Bool =
+fn arms_capture(tab: SymTab, arms: [Arm], bound: [LocalId]) : Bool =
   match arms {
     [] -> false
     [Arm(pat, g, b), ...rest] -> {
