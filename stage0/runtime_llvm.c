@@ -1311,6 +1311,18 @@ KaiValue *kaix_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx)        { re
 KaiValue *kaix_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) { return kai_vec_get_field_borrow(v, i, fidx); }
 KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names) { return kai_vec_push_rec_raw(v, n, xs, names); }
 KaiValue *kaix_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n, KaiValue **xs) { return kai_vec_set_rec_raw(v, i, n, xs); }
+/* Vec raw scalar paths: always inlined, so a loop over a read keeps its
+ * guards hoistable and a write keeps its in-place store in the caller. */
+__attribute__((always_inline)) int64_t kaix_vec_field_i64(KaiValue *v, int64_t i, int32_t fidx, int32_t n, int32_t owned) { return kai_vec_field_i64(v, i, fidx, n, owned); }
+__attribute__((always_inline)) double kaix_vec_field_f64(KaiValue *v, int64_t i, int32_t fidx, int32_t n, int32_t owned) { return kai_vec_field_f64(v, i, fidx, n, owned); }
+__attribute__((always_inline)) int64_t kaix_vec_get_i64(KaiValue *v, int64_t i, int32_t owned) { return kai_vec_get_i64(v, i, owned); }
+__attribute__((always_inline)) double kaix_vec_get_f64(KaiValue *v, int64_t i, int32_t owned) { return kai_vec_get_f64(v, i, owned); }
+__attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names) { return kai_vec_push_rec_bits(v, n, bits, kinds, names); }
+__attribute__((always_inline)) KaiValue *kaix_vec_set_rec_bits(KaiValue *v, int64_t i, int64_t n, const int64_t *bits, const char *kinds) { return kai_vec_set_rec_bits(v, i, n, bits, kinds); }
+__attribute__((always_inline)) KaiValue *kaix_vec_push_i64(KaiValue *v, int64_t x) { return kai_vec_push_bits(v, x, KAI_INT); }
+__attribute__((always_inline)) KaiValue *kaix_vec_push_f64(KaiValue *v, double x) { return kai_vec_push_bits(v, kai_real_bits(x), KAI_REAL); }
+__attribute__((always_inline)) KaiValue *kaix_vec_set_i64(KaiValue *v, int64_t i, int64_t x) { return kai_vec_set_bits(v, i, x, KAI_INT); }
+__attribute__((always_inline)) KaiValue *kaix_vec_set_f64(KaiValue *v, int64_t i, double x) { return kai_vec_set_bits(v, i, kai_real_bits(x), KAI_REAL); }
 /* Issue #364: `impl Rem for Real` in stdlib/protocols.kai delegates
  * to this libm fmod binding. Listed in the LLVM core table so the
  * monomorphised __pimpl_Rem_Real_rem body resolves a real symbol. */

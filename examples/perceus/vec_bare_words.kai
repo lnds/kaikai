@@ -1,0 +1,132 @@
+# Bare-word Vec paths: an Int / Real payload crosses the buffer with no
+# box — `vec_get(v, i).f` on an inline-record vec, `vec_get(v, i)` on a
+# flat-scalar one, and `vec_push` / `vec_set` of a record literal or a
+# scalar. Every write still rides the unique-or-copy decision. Exercises:
+#   - the accumulator loops (record column, Int, Real) and a build loop
+#     growing from empty;
+#   - a raw read in every position: operator operand, `let` binder,
+#     comparison, boxed argument, discarded statement;
+#   - words that do not fit a tagged immediate, and Real bit patterns;
+#   - a mixed Int/Real record, a permuted literal, and a record with a
+#     Bool column (which keeps the boxed fusion);
+#   - reads and writes through a slice, and a shared vec: the write
+#     copies and the original reads back intact;
+#   - a read out of a row that is itself the result of a read: the row
+#     is an owned temporary the read releases;
+#   - exact in-place / CoW counters under KAI_TRACE_RC.
+
+type Point = { x: Int, y: Int }
+type Mix = { w: Real, k: Int }
+type Flag = { on: Bool, n: Int }
+
+fn fill(v: Vec[Point], k: Int, n: Int) : Vec[Point] =
+  if k > n { v } else { fill(vec_push(v, Point { x: k, y: k * 2 }), k + 1, n) }
+
+fn sum_x(v: Vec[Point], i: Int, n: Int, acc: Int) : Int =
+  if i >= n { acc } else { sum_x(v, i + 1, n, acc + vec_get(v, i).x) }
+
+fn count_hits(v: Vec[Point], i: Int, n: Int, acc: Int) : Int =
+  if i >= n { acc } else {
+    let y = vec_get(v, i).y
+    let hit = if vec_get(v, i).x > 50 and y % 8 == 0 { 1 } else { 0 }
+    count_hits(v, i + 1, n, acc + hit)
+  }
+
+fn ints(v: Vec[Int], k: Int, n: Int) : Vec[Int] =
+  if k > n { v } else { ints(vec_push(v, k * k), k + 1, n) }
+
+fn sum_ints(v: Vec[Int], i: Int, n: Int, acc: Int) : Int =
+  if i >= n { acc } else { sum_ints(v, i + 1, n, acc + vec_get(v, i)) }
+
+fn reals(v: Vec[Real], k: Int, n: Int) : Vec[Real] =
+  if k > n { v } else { reals(vec_push(v, int_to_real(k) * 0.5), k + 1, n) }
+
+fn sum_reals(v: Vec[Real], i: Int, n: Int, acc: Real) : Real =
+  if i >= n { acc } else { sum_reals(v, i + 1, n, acc + vec_get(v, i)) }
+
+fn bump(v: Vec[Int], i: Int, n: Int) : Vec[Int] =
+  if i >= n { v } else {
+    let old = vec_get(v, i)
+    bump(vec_set(v, i, old + 1), i + 1, n)
+  }
+
+fn mixes(v: Vec[Mix], k: Int, n: Int) : Vec[Mix] =
+  if k > n { v } else { mixes(vec_push(v, Mix { w: int_to_real(k) + 0.25, k: k }), k + 1, n) }
+
+fn sum_mix(v: Vec[Mix], i: Int, n: Int, acc: Real) : Real =
+  if i >= n { acc } else { sum_mix(v, i + 1, n, acc + vec_get(v, i).w * int_to_real(vec_get(v, i).k)) }
+
+fn cell(rows: Vec[Vec[Int]], i: Int, j: Int) : Int = vec_get(vec_get(rows, i), j)
+
+fn rw(rows: Vec[Vec[Real]], i: Int, j: Int) : Real = vec_get(vec_get(rows, i), j) + 0.5
+
+fn main() : Int / Stdout = {
+  # Record column: build from empty, sum, and read in other positions.
+  let ps = fill(vec_empty(), 1, 100)
+  Stdout.print(int_to_string(sum_x(ps, 0, 100, 0)))
+  Stdout.print(int_to_string(count_hits(ps, 0, 100, 0)))
+  Stdout.print(int_to_string(vec_get(ps, 99).y))
+
+  # In-place raw set on a unique vec, then a permuted literal.
+  let ps2 = vec_set(ps, 0, Point { x: 7, y: 9 })
+  let ps3 = vec_push(ps2, Point { y: 4, x: 3 })
+  Stdout.print(int_to_string(vec_get(ps3, 0).x * 10 + vec_get(ps3, 0).y))
+  Stdout.print(int_to_string(vec_get(ps3, 100).x * 10 + vec_get(ps3, 100).y))
+
+  # A boxed read of a slot the raw path wrote.
+  let p = vec_get(ps3, 1)
+  Stdout.print(int_to_string(p.x + p.y))
+
+  # Flat Int: build, sum, in-place bump.
+  let is = bump(ints(vec_empty(), 1, 50), 0, 50)
+  Stdout.print(int_to_string(sum_ints(is, 0, 50, 0)))
+
+  # Words that do not fit a tagged immediate survive both directions.
+  let big = vec_push(vec_push(vec_empty(), 4611686018427387904), 0 - 4611686018427387905)
+  Stdout.print(int_to_string(vec_get(big, 0)))
+  Stdout.print(int_to_string(vec_get(big, 1) + 1))
+  let bp = vec_push(vec_empty(), Point { x: 9223372036854775807, y: 0 - 9223372036854775807 })
+  Stdout.print(int_to_string(vec_get(bp, 0).x))
+  Stdout.print(int_to_string(vec_get(bp, 0).y))
+
+  # Flat Real: bit-exact round trip, and a discarded read.
+  let rs = reals(vec_empty(), 1, 40)
+  Stdout.print(real_to_string(sum_reals(rs, 0, 40, 0.0)))
+  let rs2 = vec_set(rs, 3, 0.1)
+  vec_get(rs2, 3)
+  if vec_get(rs2, 3) == 0.1 { Stdout.print("real-ok") } else { Stdout.print("real-bad") }
+
+  # Mixed Int / Real record.
+  let ms = mixes(vec_empty(), 1, 10)
+  Stdout.print(real_to_string(sum_mix(ms, 0, 10, 0.0)))
+  let ms2 = vec_set(ms, 9, Mix { w: 1.5, k: 2 })
+  Stdout.print(real_to_string(vec_get(ms2, 9).w + int_to_real(vec_get(ms2, 9).k)))
+
+  # A Bool column keeps the boxed fusion; its Int column still reads raw.
+  let fs = vec_push(vec_push(vec_empty(), Flag { on: true, n: 5 }), Flag { on: false, n: 6 })
+  Stdout.print(int_to_string(vec_get(fs, 0).n + vec_get(fs, 1).n))
+  if vec_get(fs, 0).on { Stdout.print("on") } else { Stdout.print("off") }
+
+  # Slices: a read through a view, and a write through one copies.
+  let base = ints(vec_empty(), 1, 10)
+  let mid = vec_slice(base, 2, 5)
+  Stdout.print(int_to_string(sum_ints(mid, 0, 5, 0)))
+  let mid2 = vec_set(mid, 0, 1000)
+  Stdout.print(int_to_string(vec_get(mid2, 0) + vec_get(base, 2)))
+
+  # Rows of rows: each inner read consumes the row the outer read handed it.
+  let grid = vec_push(vec_push(vec_empty(), ints(vec_empty(), 1, 4)), ints(vec_empty(), 5, 8))
+  Stdout.print(int_to_string(cell(grid, 0, 3) + cell(grid, 1, 0) + cell(grid, 1, 3)))
+  let rgrid = vec_push(vec_empty(), reals(vec_empty(), 1, 3))
+  Stdout.print(real_to_string(rw(rgrid, 0, 2)))
+
+  # Shared vec: the raw write copies; the original stays intact.
+  let a = vec_push(vec_push(vec_empty(), 1), 2)
+  let b = vec_set(a, 0, 9)
+  let c = vec_push(a, 3)
+  Stdout.print(int_to_string(vec_get(a, 0) * 100 + vec_get(b, 0) * 10 + vec_length(c)))
+  let pa = vec_push(vec_empty(), Point { x: 1, y: 1 })
+  let pb = vec_set(pa, 0, Point { x: 8, y: 8 })
+  Stdout.print(int_to_string(vec_get(pa, 0).x * 10 + vec_get(pb, 0).x))
+  0
+}

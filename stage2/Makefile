@@ -6975,7 +6975,7 @@ test-perceus-1135-vec-value-native: $(TARGET) bin-kai build
 #   3. the stdlib-module map shape: a module-qualified self-call must
 #      still tcrec-rewrite to the goto (over-release + stack growth
 #      without it) — gated by output diff incl. a 200k-deep map.
-PERCEUS_1135_RAW_FIXTURES := vec_rec_raw_fusion_1135 vec_stdlib_map_qualified_tco_1135
+PERCEUS_1135_RAW_FIXTURES := vec_rec_raw_fusion_1135 vec_stdlib_map_qualified_tco_1135 vec_bare_words
 
 test-perceus-1135-vec-raw: $(TARGET) build
 	@set -e; \
@@ -6991,6 +6991,9 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135.rc \
 	  || { echo "perceus-1135-vec-raw FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135.rc || true; exit 1; }; \
+	grep -q 'vec_inplace=233 vec_cow=57' build/s2-vec_bare_words.rc \
+	  || { echo "perceus-1135-vec-raw FAIL (bare words: expected vec_inplace=233 vec_cow=57)"; \
+	       grep vec_ build/s2-vec_bare_words.rc || true; exit 1; }; \
 	echo "perceus-1135-vec-raw OK (raw moves ride unique-or-copy; qualified self-call keeps the goto)"
 
 test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
@@ -7006,6 +7009,21 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135-n.rc \
 	  || { echo "perceus-1135-vec-raw-native FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135-n.rc || true; exit 1; }; \
+	grep -q 'vec_inplace=233 vec_cow=57' build/s2-vec_bare_words-n.rc \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: expected vec_inplace=233 vec_cow=57)"; \
+	       grep vec_ build/s2-vec_bare_words-n.rc || true; exit 1; }; \
+	KAI_NATIVE_DUMP_IR=build/s2-vec_bare_words-n.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/vec_bare_words.kai -o build/s2-vec_bare_words-ir 2> build/s2-vec_bare_words-ir.err \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: whole-program build errored)"; cat build/s2-vec_bare_words-ir.err; exit 1; }; \
+	for sym in kaix_vec_field_i64 kaix_vec_field_f64 kaix_vec_get_i64 kaix_vec_get_f64 kaix_vec_push_rec_bits kaix_vec_set_rec_bits kaix_vec_push_i64 kaix_vec_push_f64 kaix_vec_set_i64 kaix_vec_set_f64; do \
+	  grep -q "@$$sym(" build/s2-vec_bare_words-n.ll \
+	    || { echo "perceus-1135-vec-raw-native FAIL (bare words: no $$sym in the IR — the access fell back to a box)"; exit 1; }; \
+	done; \
+	../bin/kai build ../examples/stdlib/vec_bare_word_traps.kai -o build/s2-vec_bare_word_traps-n 2> build/s2-vec_bare_word_traps-n.err \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: native build errored)"; cat build/s2-vec_bare_word_traps-n.err; exit 1; }; \
+	./build/s2-vec_bare_word_traps-n > build/s2-vec_bare_word_traps-n.out 2>&1 \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: a trap escaped its fiber)"; cat build/s2-vec_bare_word_traps-n.out; exit 1; }; \
+	diff -q ../examples/stdlib/vec_bare_word_traps.out.expected build/s2-vec_bare_word_traps-n.out > /dev/null \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: output diff)"; diff ../examples/stdlib/vec_bare_word_traps.out.expected build/s2-vec_bare_word_traps-n.out; exit 1; }; \
 	echo "perceus-1135-vec-raw-native OK (counters + outputs match the C-direct gate)"
 
 # Issue #1151 — recursive vec_push growth from empty. A loop threading
