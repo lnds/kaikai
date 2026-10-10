@@ -55,6 +55,8 @@ import compiler.escapes
 import compiler.diag
 import compiler.lex
 import compiler.ast
+import compiler.written
+import compiler.decl_names
 import compiler.intrinsics
 import compiler.marks
 import compiler.operators
@@ -96,7 +98,10 @@ pub type Parser = { file: String, src: String, rest: [Token], error: Option[Diag
                 # Expression / pattern / type nesting entered so far;
                 # bounded by `nest_max` so the recursive descent cannot
                 # exhaust the stack.
-                depth: Int }
+                depth: Int,
+                # The module the file's declarations belong to: every
+                # declaration and constructor id is derived with it.
+                home: String }
 
 # A result = a new parser plus an optional payload. `None` means the
 # parser failed (`error` is set on `p`). This mirrors stage 0's
@@ -108,7 +113,10 @@ type PPat    = { p: Parser, r: Option[Pattern] }
 type PTy     = { p: Parser, r: Option[TypeExpr] }
 type PFAttrs = { p: Parser, r: Option[[FieldAttr]] }
 type PFAttr  = { p: Parser, r: Option[FieldAttr] }
-type PDecl   = { p: Parser, r: Option[Decl], bounds: [FnTPBound] }
+# `names` holds the entries the declaration contributes to the symbol
+# table, in declaration order: itself, then a sum's constructors or an
+# impl's methods.
+type PDecl   = { p: Parser, r: Option[Decl], bounds: [FnTPBound], names: [NEnt] }
 type PArm    = { p: Parser, r: Option[Arm] }
 type PParam  = { p: Parser, r: Option[Param] }
 type PFI     = { p: Parser, r: Option[FieldInit] }
@@ -117,16 +125,16 @@ type PFD     = { p: Parser, r: Option[FieldDecl] }
 type PPF     = { p: Parser, r: Option[PField] }
 type PEL     = { p: Parser, r: Option[ListElem] }
 
-fn parser_new(file: String, src: String, toks: [Token]) : Parser =
+fn parser_new(file: String, src: String, toks: [Token], home: String) : Parser =
   Parser { file: file, src: src, rest: toks, error: None,
            allow_trailing_lambda: true, allow_record_lit: true,
-           kind_reg: prescan_kinds(src, toks), depth: 0 }
+           kind_reg: prescan_kinds(src, toks), depth: 0, home: home }
 
 fn p_mark_err(p: Parser, d: Diagnostic) : Parser =
   Parser { file: p.file, src: p.src, rest: p.rest, error: Some(d),
            allow_trailing_lambda: p.allow_trailing_lambda,
            allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg,
-           depth: p.depth }
+           depth: p.depth, home: p.home }
 
 fn p_failed(p: Parser) : Bool = match p.error {
   Some(_) -> true
@@ -151,7 +159,7 @@ fn p_advance(p: Parser) : Parser {
                               error: p.error,
                               allow_trailing_lambda: p.allow_trailing_lambda,
                               allow_record_lit: p.allow_record_lit,
-                              kind_reg: p.kind_reg, depth: p.depth }
+                              kind_reg: p.kind_reg, depth: p.depth, home: p.home }
     [] -> p
   }
 }
@@ -301,7 +309,7 @@ fn p_skip_newlines(p: Parser) : Parser {
 fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
   Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
            allow_trailing_lambda: allow, allow_record_lit: p.allow_record_lit,
-           kind_reg: p.kind_reg, depth: p.depth }
+           kind_reg: p.kind_reg, depth: p.depth, home: p.home }
 }
 
 # Toggle positional record-literal parsing (see `Parser.allow_record_lit`).
@@ -310,13 +318,14 @@ fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
 fn p_with_record_lit(p: Parser, allow: Bool) : Parser {
   Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
            allow_trailing_lambda: p.allow_trailing_lambda, allow_record_lit: allow,
-           kind_reg: p.kind_reg, depth: p.depth }
+           kind_reg: p.kind_reg, depth: p.depth, home: p.home }
 }
 
 fn p_at_depth(p: Parser, d: Int) : Parser {
   Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
            allow_trailing_lambda: p.allow_trailing_lambda,
-           allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg, depth: d }
+           allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg, depth: d,
+           home: p.home }
 }
 
 fn p_too_deep(p: Parser) : Parser / Console = p_error_here(p, nest_msg())
@@ -371,21 +380,21 @@ fn is_upper_ident(src: String, t: Token) : Bool {
 
 fn tok_source(src: String, t: Token) : String = string_slice(src, t.start, t.length)
 
-type PQName = { p: Parser, name: String }
+type PQName = { p: Parser, name: String, dref: DeclRef }
 
 # A habitant name in declaration-head position (`with m.E`, `impl m.P`),
-# optionally qualified by a lowercase module. The qualifier is folded
-# into the returned spelling as `mod.Name`; the module resolver
-# validates it and strips it before the name is looked up.
+# optionally qualified by a lowercase module. `dref` is the reference as
+# written; `name` folds the qualifier into one spelling, `mod.Name`, for
+# the slots that hold a name and no reference.
 fn parse_qualified_head_name(p: Parser, t: Token) : PQName {
   let p1 = p_advance(p)
   let qualified = (not is_upper_ident(p.src, t)) and p_at(p1, TkDot) and tk_is(p_peek1(p1).kind, TkIdent) and is_upper_ident(p1.src, p_peek1(p1))
   if qualified {
-    let nt = p_peek1(p1)
-    PQName { p: p_advance(p_advance(p1)),
-             name: concat_all([tok_source(p.src, t), ".", tok_source(p1.src, nt)]) }
+    let q = tok_source(p.src, t)
+    let n = tok_source(p1.src, p_peek1(p1))
+    PQName { p: p_advance(p_advance(p1)), name: concat_all([q, ".", n]), dref: ref_qualified(q, n) }
   } else {
-    PQName { p: p1, name: tok_source(p.src, t) }
+    PQName { p: p1, name: tok_source(p.src, t), dref: ref_written(tok_source(p.src, t)) }
   }
 }
 
@@ -682,14 +691,20 @@ fn ok_p(p: Parser, x: Pattern) : PPat = PPat { p: p, r: Some(x) }
 fn err_p(p: Parser) : PPat = PPat { p: p, r: None }
 fn ok_t(p: Parser, x: TypeExpr) : PTy = PTy { p: p, r: Some(x) }
 fn err_t(p: Parser) : PTy = PTy { p: p, r: None }
-fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x), bounds: [] }
-fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None, bounds: [] }
+fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x), bounds: [], names: [] }
+fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None, bounds: [], names: [] }
+fn ok_dn(p: Parser, x: Decl, names: [NEnt]) : PDecl = PDecl { p: p, r: Some(x), bounds: [], names: names }
+# A wrapper around the declaration `inner` parsed declares what `inner` does.
+fn ok_d_wrap(inner: PDecl, x: Decl) : PDecl = PDecl { p: inner.p, r: Some(x), bounds: [], names: inner.names }
+# The entry of a declaration of the file being parsed, and the id it derives.
+fn p_ent(p: Parser, cls: NCls, name: String, is_pub: Bool) : NEnt = NEnt(cls, name, p.home, is_pub)
+fn p_sym(p: Parser, cls: NCls, name: String) : SymId = sym_derive_word(ncls_word(cls), name, p.home)
 # `parse_fn_decl` variant carrying the fn's declared protocol bounds
 # alongside the (already stripped) DFn. `parse_program_loop` seeds the
 # root file's fn-bounds side table from these; the DFn itself stays
 # stripped, so every downstream pass and every load path (root,
 # core, cache) sees clean tparam strings.
-fn ok_d_fn(p: Parser, x: Decl, bs: [FnTPBound]) : PDecl = PDecl { p: p, r: Some(x), bounds: bs }
+fn ok_d_fn(p: Parser, x: Decl, bs: [FnTPBound], names: [NEnt]) : PDecl = PDecl { p: p, r: Some(x), bounds: bs, names: names }
 fn ok_a(p: Parser, x: Arm) : PArm = PArm { p: p, r: Some(x) }
 fn err_a(p: Parser) : PArm = PArm { p: p, r: None }
 fn ok_pm(p: Parser, x: Param) : PParam = PParam { p: p, r: Some(x) }
@@ -722,7 +737,7 @@ fn parse_expr(p: Parser) : PExpr / Console {
 # here and no caller compares the spelling.
 pub fn parse_interp_expr(src: String) : Option[Expr] / Console {
   let toks = tokenize(src)
-  let prs = parser_new(interp_parse_file(), src, toks)
+  let prs = parser_new(interp_parse_file(), src, toks, "")
   match parse_expr(prs).r {
     Some(e) -> Some(marks_read_spelled(src, e))
     None    -> None
@@ -760,11 +775,11 @@ fn try_pipe_placeholder(line: Int, col: Int, lhs: Expr, rhs: Expr, p: Parser) : 
         # capture, perceus, monomorphisation) without depending on
         # the SLet -> EBlock walker quirks for sub-expressions
         # synthesised mid-parse.
-        let tmp_name = "__pipe"
-        let tmp_var = mk_ref(tmp_name, lhs.line, lhs.col)
+        let tmp = binder_minted("__pipe")
+        let tmp_var = mk_local(tmp.id, lhs.line, lhs.col)
         let new_args = subst_underscores(args_, tmp_var)
         let new_call = mk_expr(ECall(callee, new_args), rhs.line, rhs.col)
-        let param = Param { pname: tmp_name, ptype: None, pline: lhs.line, pcol: lhs.col, pborrow: false }
+        let param = Param { binder: tmp, ptype: None, pline: lhs.line, pcol: lhs.col, pborrow: false }
         let lam = mk_expr(ELambda([param], new_call), line, col)
         let app = mk_expr(ECall(lam, [lhs]), line, col)
         PPRSubstituted(app, p)
@@ -821,7 +836,9 @@ fn arg_has_placeholder(e: Expr) : Bool {
     EUnit               -> false
     EName(_)             -> false
     EMark(_)             -> false
-    ESym(_, _, _)             -> false
+    ESym(_, _)           -> false
+    ELocal(_)            -> false
+    EOp(_)               -> false
     EUnder              -> false
     EHole(_)            -> false
     ETodo(_)            -> false
@@ -837,7 +854,7 @@ fn arg_has_placeholder(e: Expr) : Bool {
     # node as a scope barrier. The handler body is a normal
     # expression but mixing `.` with effect handlers in argument
     # position is not in the documented sugar surface.
-    EHandle(_, _, _, _, _, _, _, _) -> false
+    EHandle(_, _, _, _, _, _, _) -> false
     ECall(callee, args_) ->
       arg_has_placeholder(callee) or any_arg_has_placeholder(args_)
     EField(base, _)     -> arg_has_placeholder(base)
@@ -849,7 +866,7 @@ fn arg_has_placeholder(e: Expr) : Bool {
       opt_arg_has_placeholder(eo)
     EMatch(scr, arms)   ->
       arg_has_placeholder(scr) or any_arm_has_placeholder(arms)
-    ERecordLit(_, _, fs)   -> any_field_has_placeholder(fs)
+    ERecordLit(_, fs)   -> any_field_has_placeholder(fs)
     EList(els)          -> any_elem_has_placeholder(els)
     ERange(a, b, opt_step) ->
       arg_has_placeholder(a) or arg_has_placeholder(b) or
@@ -922,7 +939,7 @@ fn subst_placeholder_expr(e: Expr, repl: Expr) : Expr {
     EPlaceholder -> repl
     # ELambda / EHandle are scope barriers — leave them alone.
     ELambda(_, _) -> e
-    EHandle(_, _, _, _, _, _, _, _) -> e
+    EHandle(_, _, _, _, _, _, _) -> e
     _ -> {
       let new_kind = subst_placeholder_kind(e.kind, repl)
       Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
@@ -944,7 +961,9 @@ fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
     EUnit               -> k
     EName(_)             -> k
     EMark(_)             -> k
-    ESym(_, _, _)             -> k
+    ESym(_, _)           -> k
+    ELocal(_)            -> k
+    EOp(_)               -> k
     EUnder              -> k
     EHole(_)            -> k
     ETodo(_)            -> k
@@ -955,7 +974,7 @@ fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
       EIntrinsic(name, map(args_, (a) => subst_placeholder_expr(a, repl)))
     EPlaceholder        -> k    # handled by subst_placeholder_expr
     ELambda(_, _)       -> k    # scope barrier
-    EHandle(_, _, _, _, _, _, _, _) -> k    # scope barrier
+    EHandle(_, _, _, _, _, _, _) -> k    # scope barrier
     ECall(callee, args_) ->
       ECall(subst_placeholder_expr(callee, repl),
             map(args_, (a) => subst_placeholder_expr(a, repl)))
@@ -972,8 +991,8 @@ fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
     EMatch(scr, arms)   ->
       EMatch(subst_placeholder_expr(scr, repl),
               map(arms, (a) => subst_placeholder_arm(a, repl)))
-    ERecordLit(rh, name, fs) ->
-      ERecordLit(rh, name, map(fs, (fi) => subst_placeholder_field(fi, repl)))
+    ERecordLit(rh, fs) ->
+      ERecordLit(rh, map(fs, (fi) => subst_placeholder_field(fi, repl)))
     EList(els)          -> EList(map(els, (el) => subst_placeholder_elem(el, repl)))
     ERange(a, b, opt_step) ->
       ERange(subst_placeholder_expr(a, repl),
@@ -1036,10 +1055,10 @@ fn subst_placeholder_stmt(s: Stmt, repl: Expr) : Stmt = match s {
 # parser shape for those cases.
 fn desugar_placeholder_arg(arg: Expr) : Expr {
   if arg_has_placeholder(arg) {
-    let pl_name = point_free_binder()
-    let pl_var = mk_ref(pl_name, arg.line, arg.col)
+    let pl = point_free_binder()
+    let pl_var = mk_local(pl.id, arg.line, arg.col)
     let body = subst_placeholder_expr(arg, pl_var)
-    let pl_param = Param { pname: pl_name, ptype: None,
+    let pl_param = Param { binder: pl, ptype: None,
                             pline: arg.line, pcol: arg.col, pborrow: false }
     mk_expr(ELambda([pl_param], body), arg.line, arg.col)
   } else {
@@ -1245,7 +1264,7 @@ fn parse_unary_in(p: Parser) : PExpr / Console {
     } else {
       let name = tok_source(p1.src, id)
       let p2 = p_advance(p1)
-      let cap = mk_ref(name, id.line, id.col)
+      let cap = mk_name(name, id.line, id.col)
       let pr = parse_deref_path(p2, cap)
       match pr.r {
         None -> err_e(pr.p)
@@ -1519,8 +1538,8 @@ fn try_parse_lambda_block_pattern(p: Parser) : Option[LamBlockParams] / Console 
         let p2 = p_skip_newlines(pr.p)
         if not p_at(p2, TkArrow) { None }
         else {
-          let fresh = lam_pat_binder_name(pat.line, pat.col)
-          let pm = Param { pname: fresh, ptype: None, pline: pat.line, pcol: pat.col, pborrow: false }
+          let fresh = binder_minted(lam_pat_binder_name(pat.line, pat.col))
+          let pm = Param { binder: fresh, ptype: None, pline: pat.line, pcol: pat.col, pborrow: false }
           Some(LamBlockParams { p: p_advance(p2), params: [pm], wrap: Some(pat) })
         }
       }
@@ -1536,17 +1555,17 @@ fn finish_block_lambda(res: LamBlockParams, body: Expr, t: Token) : Expr {
   match res.wrap {
     None -> mk_expr(ELambda(res.params, body), t.line, t.col)
     Some(pat) -> {
-      let scrut = mk_ref(lam_block_binder(res.params), pat.line, pat.col)
+      let scrut = mk_local(lam_block_binder(res.params), pat.line, pat.col)
       let m = mk_expr(EMatch(scrut, [Arm(pat, None, body)]), pat.line, pat.col)
       mk_expr(ELambda(res.params, m), t.line, t.col)
     }
   }
 }
 
-fn lam_block_binder(params: [Param]) : String {
+fn lam_block_binder(params: [Param]) : LocalId {
   match params {
-    [pm, ..._] -> pm.pname
-    [] -> "_"
+    [pm, ..._] -> pm.binder.id
+    [] -> local_none()
   }
 }
 
@@ -1556,7 +1575,7 @@ fn try_parse_lambda_block_params_loop(p: Parser, acc: [Param]) : Option[LamBlock
   else {
     let name = tok_source(p.src, t)
     let p1 = p_advance(p)
-    let pm = Param { pname: name, ptype: None, pline: t.line, pcol: t.col, pborrow: false }
+    let pm = Param { binder: binder_written(name), ptype: None, pline: t.line, pcol: t.col, pborrow: false }
     let acc1 = [pm, ...acc]
     if p_at(p1, TkComma) {
       try_parse_lambda_block_params_loop(p_skip_newlines(p_advance(p1)), acc1)
@@ -1705,7 +1724,7 @@ fn parse_primary(p: Parser) : PExpr / Console {
       let im = decode_real(im_span)
       let zero = mk_expr(EReal(0.0, "0.0"), t.line, t.col)
       let im_e = mk_expr(EReal(im, im_span), t.line, t.col)
-      let mod_var = mk_ref("complex", t.line, t.col)
+      let mod_var = mk_name("complex", t.line, t.col)
       let callee = mk_expr(EField(mod_var, "mk"), t.line, t.col)
       ok_e(p_advance(p), mk_expr(ECall(callee, [zero, im_e]), t.line, t.col))
     }
@@ -1744,10 +1763,10 @@ fn parse_primary(p: Parser) : PExpr / Console {
         # with user bindings. The body grows the rest of the postfix
         # chain inside the lambda, so `.a.b` and `.f(x)` apply to the
         # receiver, not to the synthesised function value.
-        let pl_name = point_free_binder()
-        let pl_param = Param { pname: pl_name, ptype: None,
+        let pl = point_free_binder()
+        let pl_param = Param { binder: pl, ptype: None,
                                  pline: t.line, pcol: t.col, pborrow: false }
-        let pl_var = mk_ref(pl_name, t.line, t.col)
+        let pl_var = mk_local(pl.id, t.line, t.col)
         let head = mk_expr(EField(pl_var, name), t.line, t.col)
         let body_r = parse_postfix_rest(p2, head)
         match body_r.r {
@@ -1887,7 +1906,7 @@ fn parse_handle(p: Parser, t: Token) : PExpr / Console {
             err_e(p_error(p2, eff_t, "expected effect name after `with`"))
           } else {
             let eff_q = parse_qualified_head_name(p2, eff_t)
-            let eff_name = eff_q.name
+            let eff_name = eff_q.dref
             let p3 = eff_q.p
             # Optional `[T1, T2]` after the effect name —
             # the type instantiation. e.g. `with Reader[Int]`.
@@ -1976,7 +1995,7 @@ fn parse_clause_params(p: Parser, acc: [Param]) : PParams / Console {
         } else {
           PTy { p: p1, r: None }
         }
-      let pm = Param { pname: name, ptype: opt_ty_r.r, pline: t.line, pcol: t.col, pborrow: false }
+      let pm = Param { binder: binder_written(name), ptype: opt_ty_r.r, pline: t.line, pcol: t.col, pborrow: false }
       let p2 = p_skip_newlines(opt_ty_r.p)
       if p_at(p2, TkComma) {
         parse_clause_params(p_skip_newlines(p_advance(p2)), [pm, ...acc])
@@ -1989,7 +2008,7 @@ fn parse_clause_params(p: Parser, acc: [Param]) : PParams / Console {
   }
 }
 
-type PAlias = { p: Parser, r: Option[String] }
+type PAlias = { p: Parser, r: Option[Binder] }
 
 fn parse_handle_alias(p: Parser) : PAlias / Console {
 
@@ -2000,7 +2019,7 @@ fn parse_handle_alias(p: Parser) : PAlias / Console {
     if not tk_is(nt.kind, TkIdent) {
       PAlias { p: p_error(p1, nt, "expected alias name after `as`"), r: None }
     } else {
-      PAlias { p: p_advance(p1), r: Some(tok_source(p1.src, nt)) }
+      PAlias { p: p_advance(p1), r: Some(binder_written(tok_source(p1.src, nt))) }
     }
   }
 }
@@ -2090,7 +2109,7 @@ fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelud
                   if name == "return" {
                     match params {
                       [pp] -> {
-                        let hr = HR(pp.pname, body, id_t.line, id_t.col)
+                        let hr = HR(pp.binder, body, id_t.line, id_t.col)
                         parse_handle_clauses(rb.p, acc, Some(hr), prelude)
                       }
                       _ -> PClauses { p: p_error(p3, id_t,
@@ -2155,9 +2174,9 @@ fn parse_lifecycle_clause(p: Parser, id_t: Token, acc: [HClause],
 # Assemble the `EHandle` once the clause block has parsed: lift
 # `initially` into the handler-state slot, then wrap in the `var`/`let`
 # prelude block if the clause list opened with one.
-fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
+fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: DeclRef,
                  eff_tyargs: [TypeExpr], init_r: PInit,
-                 alias: Option[String], cr: PClauses) : PExpr / Console {
+                 alias: Option[Binder], cr: PClauses) : PExpr / Console {
 
   # `initially { }` fills the same handler-state slot as the `(init)`
   # form, so the two are mutually exclusive.
@@ -2173,7 +2192,7 @@ fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
       None                       -> init_r.r
     }
     let handle_e = mk_expr(
-      EHandle(body, eff_name, sym_none(), eff_tyargs, eff_init, alias,
+      EHandle(body, eff_name, eff_tyargs, eff_init, alias,
               drop_initially_clauses(cr.clauses), cr.return_clause),
       t.line, t.col)
     # A `var` / `let` prelude lifts to a sibling block whose tail is the
@@ -2258,7 +2277,7 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
     match r.r {
       None -> err_e(r.p)
       Some(body) -> {
-        let param = Param { pname: name, ptype: None, pline: t.line, pcol: t.col, pborrow: false }
+        let param = Param { binder: binder_written(name), ptype: None, pline: t.line, pcol: t.col, pborrow: false }
         ok_e(r.p, mk_expr(ELambda([param], body), t.line, t.col))
       }
     }
@@ -2267,27 +2286,25 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
   # and record literals are allowed here (suppressed in `if`/`match` cond
   # position so the `{` opens the body, not a positional record).
   else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) and p.allow_record_lit {
-    parse_record_lit(p1, name, t)
+    parse_record_lit(p1, ref_written(name), t)
   }
   # Qualified record literal `mod.Type { ... }`. Lowercase head +
-  # `.UpperIdent` + `{` commits to a record literal whose type name
-  # is folded into the dotted string `"mod.Type"`. The qualtype
-  # rewriter pass validates against the module table and strips the
-  # qualifier before resolve runs (mirrors the qualified-type-head
-  # treatment in `parse_named_type`).
+  # `.UpperIdent` + `{` commits to a record literal whose type is the
+  # qualified reference. The qualtype rewriter pass validates the
+  # qualifier against the module table before resolve runs (mirrors
+  # the qualified-type-head treatment in `parse_named_type`).
   else if (not is_upper_ident(p.src, t)) and p_at(p1, TkDot) and
           tk_is(p_peek1(p1).kind, TkIdent) and
           is_upper_ident(p1.src, p_peek1(p1)) and
           tk_is(p_peek2(p1).kind, TkLbrace) and p.allow_record_lit {
     let nt = p_peek1(p1)
-    let qname = concat_all([name, ".", tok_source(p1.src, nt)])
     # Advance past `.` and the UpperIdent so `p2` is at the `{`.
     let p2 = p_advance(p_advance(p1))
-    parse_record_lit(p2, qname, t)
+    parse_record_lit(p2, ref_qualified(name, tok_source(p1.src, nt)), t)
   }
   # Plain variable reference.
   else {
-    ok_e(p1, mk_ref(name, t.line, t.col))
+    ok_e(p1, mk_name(name, t.line, t.col))
   }
 }
 
@@ -2350,7 +2367,7 @@ fn parse_region(p: Parser, t: Token) : PExpr / Console {
       match body_r.r {
         None -> err_e(body_r.p)
         Some(body) -> {
-          let param = Param { pname: bres.name, ptype: None, pline: t.line, pcol: t.col, pborrow: false }
+          let param = Param { binder: binder_written(bres.name), ptype: None, pline: t.line, pcol: t.col, pborrow: false }
           let lam = mk_expr(ELambda([param], body), t.line, t.col)
           let callee = mk_expr(EMark(MkRegion), t.line, t.col)
           ok_e(body_r.p, mk_expr(ECall(callee, [lam]), t.line, t.col))
@@ -2412,7 +2429,7 @@ fn parse_ensure_primary(p: Parser, t: Token) : PExpr / Console {
         if not p_at(p3, TkWhere) {
           # No `where` suffix — fall back to an ordinary call so the
           # name `ensure` remains usable as a regular function.
-          let callee = mk_ref("ensure", t.line, t.col)
+          let callee = mk_name("ensure", t.line, t.col)
           ok_e(p3, mk_expr(ECall(callee, [value]), t.line, t.col))
         } else {
           let p4 = p_skip_newlines(p_advance(p3))
@@ -2456,7 +2473,7 @@ fn parse_regex_sigil(p: Parser, t: Token) : PExpr / Console {
     let escaped = regex_pattern_to_kai_str_body(pattern, 0, string_length(pattern), "")
     let str_span = concat_all(["\"", escaped, "\""])
     let pat_str = mk_expr(EStr(str_span, false), t.line, t.col)
-    let callee = mk_expr(EModCall("regexp", "compile_or_panic"), t.line, t.col)
+    let callee = mk_expr(EModCall(written("regexp"), written("compile_or_panic")), t.line, t.col)
     let call = mk_expr(ECall(callee, [pat_str]), t.line, t.col)
     ok_e(p_advance(p), call)
   }
@@ -2494,12 +2511,12 @@ fn regex_pattern_has_hash(s: String, i: Int, n: Int) : Bool {
   }
 }
 
-fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr / Console {
+fn parse_record_lit(p: Parser, type_name: DeclRef, tname: Token) : PExpr / Console {
 
   # `{` is next. Consume it.
   let p1 = p_skip_newlines(p_advance(p))
   if p_at(p1, TkRbrace) {
-    ok_e(p_advance(p1), mk_expr(ERecordLit(ty_ref_none(), type_name, []), tname.line, tname.col))
+    ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, []), tname.line, tname.col))
   } else if p_at(p1, TkEllipsis) {
     # Record-spread sugar: `T { ...src, x: 10, y: 20 }`.
     # The `...src` MUST be the first item; only named-field overrides
@@ -2515,7 +2532,7 @@ fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr / Consol
         let acc0 = [mk_field_spread(src)]
         let p3 = p_skip_newlines(r.p)
         if p_at(p3, TkRbrace) {
-          ok_e(p_advance(p3), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc0)),
+          ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc0)),
                                       tname.line, tname.col))
         } else if p_at(p3, TkComma) {
           parse_record_spread_loop(p_skip_newlines(p_advance(p3)), acc0, type_name, tname)
@@ -2553,11 +2570,11 @@ fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr / Consol
 # `x: x` from the local scope, which the spread form forbids;
 # positional would conflict with the positional-sugar path. A second
 # `...` is also rejected — a literal admits a single spread.
-fn parse_record_spread_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr / Console {
+fn parse_record_spread_loop(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_e(p_advance(p0), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc)),
+    ok_e(p_advance(p0), mk_expr(ERecordLit(type_name, list_reverse(acc)),
                                 tname.line, tname.col))
   } else if p_at(p0, TkEllipsis) {
     err_e(p_error_here(p0,
@@ -2581,7 +2598,7 @@ fn parse_record_spread_loop(p: Parser, acc: [FieldInit], type_name: String, tnam
             if p_at(p3, TkComma) {
               parse_record_spread_loop(p_skip_newlines(p_advance(p3)), acc1, type_name, tname)
             } else if p_at(p3, TkRbrace) {
-              ok_e(p_advance(p3), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc1)),
+              ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc1)),
                                           tname.line, tname.col))
             } else {
               err_e(p_error_here(p3, "expected `,` or `}` in record literal"))
@@ -2598,7 +2615,7 @@ fn parse_record_spread_loop(p: Parser, acc: [FieldInit], type_name: String, tnam
 
 # Positional record sugar. Accumulates positional fields. Each
 # item is a full Expr; intermixing `IDENT :` is a parse error.
-fn parse_record_pos_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr / Console {
+fn parse_record_pos_loop(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   # Reject mixed forms: any subsequent item starting with `IDENT :`
@@ -2607,7 +2624,7 @@ fn parse_record_pos_loop(p: Parser, acc: [FieldInit], type_name: String, tname: 
   let tk1 = p_peek1(p0)
   if tk_is(tk0.kind, TkRbrace) {
     # Trailing comma: `R { 1, 2, }` — close the literal.
-    ok_e(p_advance(p0), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc)), tname.line, tname.col))
+    ok_e(p_advance(p0), mk_expr(ERecordLit(type_name, list_reverse(acc)), tname.line, tname.col))
   } else if tk_is(tk0.kind, TkIdent) and tk_is(tk1.kind, TkColon) {
     err_e(p_error_here(p0, "expected positional or all-named record fields, found mixed forms"))
   } else {
@@ -2620,7 +2637,7 @@ fn parse_record_pos_loop(p: Parser, acc: [FieldInit], type_name: String, tname: 
         if p_at(p1, TkComma) {
           parse_record_pos_loop(p_skip_newlines(p_advance(p1)), acc1, type_name, tname)
         } else if p_at(p1, TkRbrace) {
-          ok_e(p_advance(p1), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc1)), tname.line, tname.col))
+          ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, list_reverse(acc1)), tname.line, tname.col))
         } else {
           err_e(p_error_here(p1, "expected `,` or `}` in positional record literal"))
         }
@@ -2629,7 +2646,7 @@ fn parse_record_pos_loop(p: Parser, acc: [FieldInit], type_name: String, tname: 
   }
 }
 
-fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr / Console {
+fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console {
 
   let p0 = p_skip_newlines(p)
   let tk = p_peek(p0)
@@ -2639,7 +2656,7 @@ fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tnam
   } else if tk_is(tk.kind, TkRbrace) {
     # Trailing comma: `R { a: 1, b: 2, }` — `acc` already contains the
     # parsed fields; close the literal here.
-    ok_e(p_advance(p0), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc)), tname.line, tname.col))
+    ok_e(p_advance(p0), mk_expr(ERecordLit(type_name, list_reverse(acc)), tname.line, tname.col))
   } else if not tk_is(tk.kind, TkIdent) {
     err_e(p_error(p0, tk, "expected field name in record literal"))
   } else {
@@ -2656,7 +2673,7 @@ fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tnam
           if p_at(p3, TkComma) {
             parse_record_fields_loop(p_skip_newlines(p_advance(p3)), acc1, type_name, tname)
           } else if p_at(p3, TkRbrace) {
-            ok_e(p_advance(p3), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc1)), tname.line, tname.col))
+            ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc1)), tname.line, tname.col))
           } else {
             err_e(p_error_here(p3, "expected `,` or `}` in record literal"))
           }
@@ -2670,12 +2687,12 @@ fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tnam
     # Mixed forms (`{ x, y: other }`) compose because the punning
     # decision is per-field.
     else if p_at(p1, TkComma) or p_at(p1, TkRbrace) {
-      let val = mk_ref(fname, tk.line, tk.col)
+      let val = mk_name(fname, tk.line, tk.col)
       let acc1 = [mk_field_pun(fname, val), ...acc]
       if p_at(p1, TkComma) {
         parse_record_fields_loop(p_skip_newlines(p_advance(p1)), acc1, type_name, tname)
       } else {
-        ok_e(p_advance(p1), mk_expr(ERecordLit(ty_ref_none(), type_name, list_reverse(acc1)), tname.line, tname.col))
+        ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, list_reverse(acc1)), tname.line, tname.col))
       }
     }
     else {
@@ -2796,7 +2813,7 @@ fn parse_tuple_expr_rest(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
 pub fn tuple_type_home() : String = "tuple"
 
 #[doc("The core tuple declaration named `n`: tuple sugar denotes it whatever the file declares under that name.")]
-pub fn tuple_type_ref(n: String) : DeclRef = ty_ref_decl(sym_derive_word("type", n, tuple_type_home()))
+pub fn tuple_type_ref(n: String) : DeclRef = DrSym(sym_derive_word("type", n, tuple_type_home()))
 
 # Map arity → stdlib tuple type name. `None` for unsupported arities.
 pub fn tuple_type_for_arity(n: Int) : Option[String] {
@@ -2828,13 +2845,13 @@ pub fn build_tuple_field_inits(elems: [Expr], i: Int, acc: [FieldInit]) : [Field
 
 #[doc("The tuple literal `(x0, …)` of 2 to 4 elements, as the parser builds it.")]
 pub fn tuple_lit_expr(xs: [Expr], line: Int, col: Int) : Expr = match tuple_type_for_arity(list_length(xs)) {
-  Some(n) -> mk_expr(ERecordLit(tuple_type_ref(n), n, build_tuple_field_inits(xs, 0, [])), line, col)
+  Some(n) -> mk_expr(ERecordLit(tuple_type_ref(n), build_tuple_field_inits(xs, 0, [])), line, col)
   None -> mk_expr(EUnit, line, col)
 }
 
 #[doc("The tuple pattern `(p0, …)` of 2 to 4 elements, as the parser builds it.")]
 pub fn tuple_pat_of(ps: [Pattern], line: Int, col: Int) : Pattern = match tuple_type_for_arity(list_length(ps)) {
-  Some(n) -> mk_pat(PVariantRecord(tuple_type_ref(n), n, build_tuple_pfields(ps, 0, [])), line, col)
+  Some(n) -> mk_pat(PVariantRecord(tuple_type_ref(n), build_tuple_pfields(ps, 0, [])), line, col)
   None -> mk_pat(PWild, line, col)
 }
 
@@ -2857,7 +2874,7 @@ fn close_param_group_untyped(names: [PendName], acc: [Param]) : [Param] {
     [] -> acc
     [pn, ...rest] ->
       close_param_group_untyped(rest,
-        [Param { pname: pn.nm, ptype: None, pline: pn.nline, pcol: pn.ncol, pborrow: pn.pborrow }, ...acc])
+        [Param { binder: binder_written(pn.nm), ptype: None, pline: pn.nline, pcol: pn.ncol, pborrow: pn.pborrow }, ...acc])
   }
 }
 
@@ -3434,7 +3451,7 @@ fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt / Console {
 fn is_index_lhs_path(e: Expr) : Bool {
   match e.kind {
     EName(_) -> true
-    ESym(_, _, _) -> true
+    ESym(_, _) -> true
     EField(base, _) -> is_index_lhs_path(base)
     _ -> false
   }
@@ -3515,7 +3532,7 @@ fn parse_var(p: Parser, t: Token) : PStmt / Console {
         let re = parse_expr(p_rhs)
         match re.r {
           None -> err_s(re.p)
-          Some(rhs) -> ok_s(re.p, SVar(name, ty_opt_r.r, rhs, t.line, t.col))
+          Some(rhs) -> ok_s(re.p, SVar(binder_written(name), ty_opt_r.r, rhs, t.line, t.col))
         }
       }
     }
@@ -3782,7 +3799,7 @@ fn build_scrut_lets(scruts: [Expr], i: Int, acc: [Stmt]) : [Stmt] {
     [] -> acc
     [e, ...rest] -> {
       let nm = scrut_var_name(i)
-      let pat = mk_pat(PBind(nm), e.line, e.col)
+      let pat = mk_pat(PBind(binder_minted(nm)), e.line, e.col)
       build_scrut_lets(rest, i + 1, [SLet(pat, None, e), ...acc])
     }
   }
@@ -3792,7 +3809,7 @@ fn make_scrut_var_exprs(scruts: [Expr], i: Int, line: Int, col: Int) : [Expr] {
   match scruts {
     [] -> []
     [_, ...rest] -> [
-      mk_ref(scrut_var_name(i), line, col),
+      mk_local(local_minted(scrut_var_name(i)), line, col),
       ...make_scrut_var_exprs(rest, i + 1, line, col)
     ]
   }
@@ -3955,7 +3972,7 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console {
             # turns it into a guard over the bound name (same desugar as
             # `ensure(value) where pred`), welded with any user guard.
             ArmRefine { p: rt.p,
-                        new_pat: Some(mk_pat(PSurface(PsRefine(name, ty)),
+                        new_pat: Some(mk_pat(PSurface(PsRefine(written_text(name.name), ty)),
                                              pat.line, pat.col)) }
           }
           # `name : TyName(t, ...)`. Parser cannot tell whether `t` is
@@ -3968,7 +3985,7 @@ fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console {
           # not a refinement alias survive as `PNarrow` for the typer,
           # which checks the scrutinee is a union containing the
           # component.
-          TyName(_, _, _) -> ArmRefine {
+          TyName(_, _) -> ArmRefine {
             p: rt.p,
             new_pat: Some(mk_pat(PNarrow(name, ty), pat.line, pat.col))
           }
@@ -4166,7 +4183,7 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
       let name = tok_source(p1.src, id)
       let p2 = p_skip_newlines(p_advance(p1))
       if p_at(p2, TkRbracket) {
-        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some(name)), t.line, t.col))
+        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some(binder_written(name))), t.line, t.col))
       } else {
         err_p(p_error_here(p2, "expected `]` after spread pattern"))
       }
@@ -4280,7 +4297,7 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
     # Variant with positional sub-patterns.
     let p2 = p_skip_newlines(p_advance(p1))
     if p_at(p2, TkRparen) {
-      ok_p(p_advance(p2), mk_pat(PVariant(None, name, []), t.line, t.col))
+      ok_p(p_advance(p2), mk_pat(PVariant(ref_written(name), []), t.line, t.col))
     } else {
       parse_variant_sub_patterns(p2, [], name, t)
     }
@@ -4290,7 +4307,7 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
     parse_record_pattern_fields(p2, [], Some(name), t)
   } else if is_upper_ident(p.src, t) {
     # Bare uppercase ident: 0-arg variant.
-    ok_p(p1, mk_pat(PVariant(None, name, []), t.line, t.col))
+    ok_p(p1, mk_pat(PVariant(ref_written(name), []), t.line, t.col))
   } else if p_at(p1, TkAs) or p_at(p1, TkAt) {
     # `name as pattern` — as-pattern. Bind `name` to the whole scrutinee
     # and continue matching with the sub-pattern. The lowercase ident
@@ -4308,11 +4325,11 @@ fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
         if spelled_as {
           ok_p(r.p, mk_pat(PSurface(PsAs(name, sub)), t.line, t.col))
         } else {
-          ok_p(r.p, mk_pat(PAs(name, sub), t.line, t.col))
+          ok_p(r.p, mk_pat(PAs(binder_written(name), sub), t.line, t.col))
         }
     }
   } else {
-    ok_p(p1, mk_pat(PBind(name), t.line, t.col))
+    ok_p(p1, mk_pat(PBind(binder_written(name)), t.line, t.col))
   }
 }
 
@@ -4326,7 +4343,7 @@ fn parse_variant_sub_patterns(p: Parser, acc: [Pattern], name: String, t: Token)
       if p_at(p1, TkComma) {
         parse_variant_sub_patterns(p_skip_newlines(p_advance(p1)), [sub, ...acc], name, t)
       } else if p_at(p1, TkRparen) {
-        ok_p(p_advance(p1), mk_pat(PVariant(None, name, list_reverse([sub, ...acc])), t.line, t.col))
+        ok_p(p_advance(p1), mk_pat(PVariant(ref_written(name), list_reverse([sub, ...acc])), t.line, t.col))
       } else {
         err_p(p_error_here(p1, "expected `,` or `)` in variant pattern"))
       }
@@ -4341,7 +4358,7 @@ fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t
     let p1 = p_advance(p0)
     match ctor {
       None -> ok_p(p1, mk_pat(PRecord(list_reverse(acc)), t.line, t.col))
-      Some(name) -> ok_p(p1, mk_pat(PVariantRecord(ty_ref_none(), name, list_reverse(acc)), t.line, t.col))
+      Some(name) -> ok_p(p1, mk_pat(PVariantRecord(ref_written(name), list_reverse(acc)), t.line, t.col))
     }
   } else {
     let fn_t = p_peek(p0)
@@ -4358,7 +4375,7 @@ fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t
             Some(sp) -> PPat { p: r.p, r: Some(sp) }
           }
         } else {
-          PPat { p: p1, r: Some(mk_pat(PBind(fname), fn_t.line, fn_t.col)) }
+          PPat { p: p1, r: Some(mk_pat(PBind(binder_written(fname)), fn_t.line, fn_t.col)) }
         }
       match sub_r.r {
         None -> err_p(sub_r.p)
@@ -4446,13 +4463,13 @@ fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow / Console {
     let name = tok_source(p.src, t)
     let p1 = p_advance(p)
     if is_upper_ident(p.src, t) {
-      parse_row_label_tail(p1, name, acc)
+      parse_row_label_tail(p1, ref_written(name), acc)
     } else if p_at(p1, TkDot) {
       # Module qualifier: `ea.Emit`.
       let p2 = p_advance(p1)
       let t2 = p_peek(p2)
       if tk_is(t2.kind, TkIdent) and is_upper_ident(p.src, t2) {
-        parse_row_label_tail(p_advance(p2), concat_all([name, ".", tok_source(p.src, t2)]), acc)
+        parse_row_label_tail(p_advance(p2), ref_qualified(name, tok_source(p.src, t2)), acc)
       } else {
         PRow { p: p_error(p2, t2, "expected effect name after module qualifier"), r: REmpty }
       }
@@ -4476,7 +4493,7 @@ fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow / Console {
 # `[T1, T2]` (`Reader[Int]` in row position parses the same way as a
 # generic type application — distinct labels for distinct
 # instantiations), then `+` or row end.
-fn parse_row_label_tail(p: Parser, name: String, acc: [RowLabel]) : PRow / Console {
+fn parse_row_label_tail(p: Parser, name: DeclRef, acc: [RowLabel]) : PRow / Console {
   let args_r =
     if p_at(p, TkLbracket) {
       parse_row_label_args(p_skip_newlines(p_advance(p)), [])
@@ -4486,7 +4503,7 @@ fn parse_row_label_tail(p: Parser, name: String, acc: [RowLabel]) : PRow / Conso
   match args_r.r {
     None -> PRow { p: args_r.p, r: REmpty }
     Some(targs) -> {
-      let acc1 = [RL(name, targs, sym_none()), ...acc]
+      let acc1 = [RL(name, targs), ...acc]
       if p_at(args_r.p, TkPlus) {
         parse_row_labels(p_advance(args_r.p), acc1)
       } else {
@@ -4576,7 +4593,7 @@ fn parse_refinement_predicate(p: Parser, line: Int, col: Int) : PExpr / Console 
 
   let t = p_peek(p)
   if is_cmp_tok(t.kind) {
-    let lhs = mk_ref("self", line, col)
+    let lhs = mk_name("self", line, col)
     parse_refinement_cmp_with(p, lhs, line, col)
   } else if is_matches_sugar_start(p, t) {
     parse_refinement_matches_with(p, t, line, col)
@@ -4598,8 +4615,8 @@ fn parse_refinement_matches_with(p: Parser, t: Token, line: Int, col: Int) : PEx
   match rhs.r {
     None -> rhs
     Some(rv) -> {
-      let self_e = mk_ref("self", line, col)
-      let callee = mk_ref("matches", t.line, t.col)
+      let self_e = mk_name("self", line, col)
+      let callee = mk_name("matches", t.line, t.col)
       let call = mk_expr(ECall(callee, [self_e, rv]), t.line, t.col)
       PExpr { p: rhs.p, r: Some(call) }
     }
@@ -4690,13 +4707,12 @@ fn parse_named_type(p: Parser, t: Token) : PTy / Console {
   let name = tok_source(p.src, t)
   let p1 = p_advance(p)
   # Qualified type head `mod.Type[args?]`. When the leading ident
-  # is lowercase and followed by `.UpperIdent`, fold
-  # the qualifier into the TyName payload as a dotted string. The
-  # qualtype rewriter pass validates against the module table and
-  # strips the qualifier before resolve_ty runs.
+  # is lowercase and followed by `.UpperIdent`, the TyName carries the
+  # qualified reference. The qualtype rewriter pass validates the
+  # qualifier against the module table before resolve_ty runs.
   if (not is_upper_ident(p.src, t)) and p_at(p1, TkDot) and tk_is(p_peek1(p1).kind, TkIdent) and is_upper_ident(p1.src, p_peek1(p1)) {
     let nt = p_peek1(p1)
-    let qname = concat_all([name, ".", tok_source(p1.src, nt)])
+    let qname = ref_qualified(name, tok_source(p1.src, nt))
     let p2 = p_advance(p_advance(p1))
     if p_at(p2, TkLbracket) and not tk_is(p_peek1(p2).kind, TkLt) {
       let p3 = p_skip_newlines(p_advance(p2))
@@ -4704,9 +4720,9 @@ fn parse_named_type(p: Parser, t: Token) : PTy / Console {
       # lowercase module qualifier (`mod.Type[a]<hab>`).
       ty_args_habitant(parse_type_args_loop(p3, [], qname, t), nt)
     } else if p_at(p2, TkLt) {
-      parse_habitant_slot(p2, mk_ty(TyName(ty_ref_none(), qname, []), t.line, t.col), t)
+      parse_habitant_slot(p2, mk_ty(TyName(qname, []), t.line, t.col), t)
     } else {
-      ok_t(p2, mk_ty(TyName(ty_ref_none(), qname, []), t.line, t.col))
+      ok_t(p2, mk_ty(TyName(qname, []), t.line, t.col))
     }
   }
   # Peek-2 disambiguation. `Foo[<...>]` is the
@@ -4717,7 +4733,7 @@ fn parse_named_type(p: Parser, t: Token) : PTy / Console {
     # Generic type: Name[T1, T2, ...], optionally with a trailing
     # habitant (`Money[Decimal]<USD>`).
     let p2 = p_skip_newlines(p_advance(p1))
-    ty_args_habitant(parse_type_args_loop(p2, [], name, t), t)
+    ty_args_habitant(parse_type_args_loop(p2, [], ref_written(name), t), t)
   } else if ty_head_takes_habitant(p.src, t, name) and p_at(p1, TkLt) {
     # Dimensioned type — a habitant in angle brackets on the head.
     # Numeric heads (`Real<m/s>`, `Decimal<USD>`) carry a unit-expr; a
@@ -4727,13 +4743,13 @@ fn parse_named_type(p: Parser, t: Token) : PTy / Console {
     # carries it. The typer collapses `TyDim` to the head `TyName` at
     # protocol-dispatch time (see `proto_type_name`), so the brand rides
     # the type without disturbing structural unification of the head.
-    parse_habitant_slot(p1, mk_ty(TyName(ty_ref_none(), name, []), t.line, t.col), t)
+    parse_habitant_slot(p1, mk_ty(TyName(ref_written(name), []), t.line, t.col), t)
   } else {
-    ok_t(p1, mk_ty(TyName(ty_ref_none(), name, []), t.line, t.col))
+    ok_t(p1, mk_ty(TyName(ref_written(name), []), t.line, t.col))
   }
 }
 
-fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PTy / Console {
+fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: DeclRef, t: Token) : PTy / Console {
 
   let r = parse_type(p)
   match r.r {
@@ -4756,7 +4772,7 @@ fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PT
             if p_at(p2, TkComma) {
               parse_type_args_loop(p_skip_newlines(p_advance(p2)), [row_te, ...acc], name, t)
             } else if p_at(p2, TkRbracket) {
-              ok_t(p_advance(p2), mk_ty(TyName(ty_ref_none(), name, list_reverse([row_te, ...acc])), t.line, t.col))
+              ok_t(p_advance(p2), mk_ty(TyName(name, list_reverse([row_te, ...acc])), t.line, t.col))
             } else {
               err_t(p_error_here(p2, "expected `,` or `]` after type arguments"))
             }
@@ -4765,7 +4781,7 @@ fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PT
       } else if p_at(p1, TkComma) {
         parse_type_args_loop(p_skip_newlines(p_advance(p1)), [arg, ...acc], name, t)
       } else if p_at(p1, TkRbracket) {
-        ok_t(p_advance(p1), mk_ty(TyName(ty_ref_none(), name, list_reverse([arg, ...acc])), t.line, t.col))
+        ok_t(p_advance(p1), mk_ty(TyName(name, list_reverse([arg, ...acc])), t.line, t.col))
       } else {
         err_t(p_error_here(p1, "expected `,` or `]` after type arguments"))
       }
@@ -4851,8 +4867,11 @@ fn parse_row_type_arg(p: Parser, first: TypeExpr) : PTy / Console {
 # matching the `parse_row_labels` discipline). A function/list/dim/
 # refine type in label position is also rejected.
 fn te_as_row_label(te: TypeExpr) : Option[RowLabel] = match te.tkind {
-  TyName(_, nm, targs) -> if row_label_name_is_upper(nm) { Some(RL(nm, targs, sym_none())) } else { None }
-  _                 -> None
+  TyName(r, targs) -> match r {
+    DrWritten(None, nm) -> if row_label_name_is_upper(written_text(nm)) { Some(RL(r, targs)) } else { None }
+    _                   -> None
+  }
+  _ -> None
 }
 
 fn row_label_name_is_upper(s: String) : Bool = match char_at(s, 0) {
@@ -4956,7 +4975,7 @@ fn parse_decl(p: Parser) : PDecl / Console {
     parse_extern_decl(p_advance(p0), t)
   } else {
   let is_pub_r =
-    if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName(ty_ref_none(), "", []), 0, 0)) } }
+    if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName(ref_written(""), []), 0, 0)) } }
     else { PTy { p: p0, r: None } }
   let is_pub =
     match is_pub_r.r { Some(_) -> true None -> false }
@@ -5051,7 +5070,8 @@ fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
             match re.r {
               None -> err_d(re.p)
               Some(body) -> {
-                ok_d(re.p, DConst(is_pub, name, ty, body, None, t.line, t.col, sym_none()))
+                ok_dn(re.p, DConst(is_pub, p_sym(p, NCConst, name), ty, body, None, t.line, t.col),
+                      [p_ent(p, NCConst, name, is_pub)])
               }
             }
           }
@@ -5240,7 +5260,7 @@ fn parse_extern_struct_decl(p: Parser, t: Token) : PDecl / Console {
         match body_r.r {
           None -> body_r
           Some(d) -> match d {
-            DType(_, _, _, TBRecord(fields), _, _, _, _, _) ->
+            DType(_, _, _, TBRecord(fields), _, _, _, _) ->
               validate_extern_struct_decl(name, fields, body_r.p, t)
             _ -> err_d(p_error(body_r.p, t, "internal: extern struct body did not parse as a record"))
           }
@@ -5258,7 +5278,7 @@ fn parse_extern_opaque_decl(p: Parser, t: Token) : PDecl / Console {
     err_d(p_error(p, id, "expected an uppercase type name after `extern \"C\" opaque`"))
   } else {
     let name = tok_source(p.src, id)
-    ok_d(p_advance(p), DExternType(name, ETOpaque, t.line, t.col, None))
+    ok_dn(p_advance(p), DExternType(name, ETOpaque, t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
   }
 }
 
@@ -5280,9 +5300,24 @@ fn row_label_names_has(labels: [RowLabel], target: String) : Bool {
   match labels {
     [] -> false
     [l, ...rest] -> match l {
-      RL(name, _, _) -> if name == target { true } else { row_label_names_has(rest, target) }
+      RL(r, _) -> if ref_bare_text(r) == target { true } else { row_label_names_has(rest, target) }
     }
   }
+}
+
+# The name of an unqualified reference as written, `""` for any other.
+# Nothing is resolved while the file is parsed, so the checks the parser
+# makes on a declaration it just read have only this text to go by.
+fn ref_bare_text(r: DeclRef) : String = match r {
+  DrWritten(None, n) -> written_text(n)
+  _                  -> ""
+}
+
+# A reference as the source spelled it, for a diagnostic.
+fn ref_surface(r: DeclRef) : String = match r {
+  DrWritten(None, n)    -> written_text(n)
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+  DrSym(_)              -> ""
 }
 
 # A type appearing in the parameter list or return slot of an
@@ -5308,7 +5343,8 @@ fn is_fixed_width_ffi_name(name: String) : Bool =
 
 fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool {
   match t.tkind {
-    TyName(_, name, targs) ->
+    TyName(r, targs) -> {
+      let name = ref_bare_text(r)
       if list_length(targs) > 0 { false }
       else if name == "Int" { true }
       else if name == "Real" { true }
@@ -5325,6 +5361,7 @@ fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool {
       # real C ABI never has them).
       else if is_upper_first(name) { true }
       else { false }
+    }
     _ -> false
   }
 }
@@ -5355,7 +5392,7 @@ fn validate_extern_struct_decl(name: String, fields: [FieldDecl],
         err_d(p_error(p, t, msg))
       }
     }
-    None -> ok_d(p, DExternType(name, ETStruct(fields), t.line, t.col, None))
+    None -> ok_dn(p, DExternType(name, ETStruct(fields), t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
   }
 }
 
@@ -5379,11 +5416,13 @@ fn first_non_c_field(fields: [FieldDecl]) : Option[FieldDecl] {
 # (U8..F32) for struct fields.
 fn is_c_field_type(t: TypeExpr) : Bool {
   match t.tkind {
-    TyName(_, name, targs) ->
+    TyName(r, targs) -> {
+      let name = ref_bare_text(r)
       if list_length(targs) > 0 { false }
       else if is_fixed_width_ffi_name(name) { true }
       else if is_v1_primitive_name(name) { false }
       else { is_upper_first(name) }
+    }
     _ -> false
   }
 }
@@ -5415,9 +5454,9 @@ fn first_non_c_abi_param(params: [Param]) : Option[Param] {
 # offending site.
 fn type_surface(t: TypeExpr) : String {
   match t.tkind {
-    TyName(_, name, targs) ->
-      if list_length(targs) == 0 { name }
-      else { concat_all([name, "[", type_args_surface(targs), "]"]) }
+    TyName(r, targs) ->
+      if list_length(targs) == 0 { ref_surface(r) }
+      else { concat_all([ref_surface(r), "[", type_args_surface(targs), "]"]) }
     TyList(inner) -> concat_all(["[", type_surface(inner), "]"])
     TyFn(_, _, _) -> "fn(...)"
     TyDim(base, _) -> concat_all([type_surface(base), "<...>"])
@@ -5446,8 +5485,8 @@ fn row_surface(r: RowExpr) : String {
 fn row_labels_surface(ls: [RowLabel]) : String {
   match ls {
     [] -> ""
-    [RL(n, _, _)] -> n
-    [RL(n, _, _), ...rest] -> concat_all([n, " + ", row_labels_surface(rest)])
+    [RL(r, _)] -> ref_surface(r)
+    [RL(r, _), ...rest] -> concat_all([ref_surface(r), " + ", row_labels_surface(rest)])
   }
 }
 
@@ -5488,7 +5527,7 @@ fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console {
               }
               let msg = concat_all([
                 "`extern \"C\" fn ", name,
-                "` parameter `", p.pname,
+                "` parameter `", written_text(p.binder.name),
                 "` has type `", ty_s,
                 "` which is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
               ])
@@ -5592,7 +5631,8 @@ fn parse_axiom_decl(p: Parser, is_pub: Bool, abi: Option[ExternAbi], c_sym_over:
                     if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
                       err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
                     } else {
-                      ok_d(row_r.p, DAxiom(is_pub, abi, name, c_sym_over, tparams, params, ty, row_r.r, t.line, t.col))
+                      ok_dn(row_r.p, DAxiom(is_pub, abi, name, c_sym_over, tparams, params, ty, row_r.r, t.line, t.col),
+                            [p_ent(p, NCFn, name, is_pub)])
                     }
                   }
                 }
@@ -5657,11 +5697,11 @@ fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
         let rb = parse_unit_expr(p2)
         match rb.r {
           None -> err_d(rb.p)
-          Some(u) -> ok_d(rb.p, DUnit(is_pub, name, UBAlias(u), intro, t.line, t.col, None))
+          Some(u) -> ok_dn(rb.p, DUnit(is_pub, name, UBAlias(u), intro, t.line, t.col, None), [p_ent(p, NCUnit, name, is_pub)])
         }
       }
     } else {
-      ok_d(p1, DUnit(is_pub, name, UBNone, intro, t.line, t.col, None))
+      ok_dn(p1, DUnit(is_pub, name, UBNone, intro, t.line, t.col, None), [p_ent(p, NCUnit, name, is_pub)])
     }
   }
 }
@@ -5678,7 +5718,7 @@ fn parse_unit_measure(p: Parser, is_pub: Bool, name: String, intro: String,
      p_at(p1, TkPlus) or p_at(p1, TkMinus) or p_at(p1, TkPercent) {
     err_d(p_error_here(p1, "a habitant measure must be a single exact numeric literal (e.g. `= 70`)"))
   } else {
-    ok_d(p1, DUnit(is_pub, name, UBMeasure(lit), intro, t.line, t.col, None))
+    ok_dn(p1, DUnit(is_pub, name, UBMeasure(lit), intro, t.line, t.col, None), [p_ent(p, NCUnit, name, is_pub)])
   }
 }
 
@@ -5881,7 +5921,7 @@ fn parse_kind_over(p: Parser, is_pub: Bool, name: String,
 fn parse_kind_with(p: Parser, is_pub: Bool, name: String, thy: String,
                    over: String, t: Token) : PDecl / Console {
   if not p_at(p, TkWith) {
-    ok_d(p, DKind(is_pub, name, thy, over, HabNone, t.line, t.col, None))
+    ok_dn(p, DKind(is_pub, name, thy, over, HabNone, t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
   } else {
     parse_kind_introducer(p_advance(p), is_pub, name, thy, over, t)
   }
@@ -5895,16 +5935,16 @@ fn parse_kind_with(p: Parser, is_pub: Bool, name: String, thy: String,
 fn parse_kind_introducer(p: Parser, is_pub: Bool, name: String,
                          thy: String, over: String, t: Token) : PDecl / Console {
   if p_at(p, TkType) {
-    ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabIntro("type"), t.line, t.col, None))
+    ok_dn(p_advance(p), DKind(is_pub, name, thy, over, HabIntro("type"), t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
   } else if p_at(p, TkEffect) {
-    ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabIntro("effect"), t.line, t.col, None))
+    ok_dn(p_advance(p), DKind(is_pub, name, thy, over, HabIntro("effect"), t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
   } else {
     let it = p_peek(p)
     if not tk_is(it.kind, TkIdent) {
       err_d(p_error_here(p, "expected an introducer word or a value domain after `with` (e.g. `with metric`, `with Int`)"))
     } else if is_upper_ident(p.src, it) {
       match value_domain_of_name(tok_source(p.src, it)) {
-        Some(dom) -> ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabDomain(dom), t.line, t.col, None))
+        Some(dom) -> ok_dn(p_advance(p), DKind(is_pub, name, thy, over, HabDomain(dom), t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
         None      -> err_d(p_error(p, it, "a value-habitant domain must be `Int` or `String`"))
       }
     } else {
@@ -5914,7 +5954,7 @@ fn parse_kind_introducer(p: Parser, is_pub: Bool, name: String,
         parse_kind_closed_set(p_skip_newlines(p_advance(p1)), is_pub, name, thy,
                               over, word, t, [])
       } else {
-        ok_d(p1, DKind(is_pub, name, thy, over, HabIntro(word), t.line, t.col, None))
+        ok_dn(p1, DKind(is_pub, name, thy, over, HabIntro(word), t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
       }
     }
   }
@@ -5929,9 +5969,10 @@ fn parse_kind_closed_set(p: Parser, is_pub: Bool, name: String, thy: String,
   if p_at(p, TkRbrace) {
     match acc {
       [] -> err_d(p_error_here(p, "a closed habitant set cannot be empty"))
-      _ -> ok_d(p_advance(p),
-                DKind(is_pub, name, thy, over, HabClosed(word, list_reverse(acc)),
-                      t.line, t.col, None))
+      _ -> ok_dn(p_advance(p),
+                 DKind(is_pub, name, thy, over, HabClosed(word, list_reverse(acc)),
+                       t.line, t.col, None),
+                 [p_ent(p, NCKind, name, is_pub)])
     }
   } else {
     let a = p_peek(p)
@@ -6157,8 +6198,8 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                 None -> err_d(rb.p)
                 Some(body) -> {
                   let body2 = contract_surface(body, cc.reqs, cc.enss, t)
-                  let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None, fnid_none())
-                  ok_d_fn(rb.p, dfn, fn_bounds)
+                  let dfn = DFn(is_pub, fnid_decl(p_sym(p, NCFn, name)), tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
+                  ok_d_fn(rb.p, dfn, fn_bounds, [p_ent(p, NCFn, name, is_pub)])
                 }
               }
             } else if p_at(p4, TkLbrace) {
@@ -6175,8 +6216,8 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                   None -> err_d(rb.p)
                   Some(body) -> {
                     let body2 = contract_surface(body, cc.reqs, cc.enss, t)
-                    let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None, fnid_none())
-                    ok_d_fn(rb.p, dfn, fn_bounds)
+                    let dfn = DFn(is_pub, fnid_decl(p_sym(p, NCFn, name)), tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
+                    ok_d_fn(rb.p, dfn, fn_bounds, [p_ent(p, NCFn, name, is_pub)])
                   }
                 }
               } else {
@@ -6185,8 +6226,8 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                   None -> err_d(rb.p)
                   Some(body) -> {
                     let body2 = contract_surface(body, cc.reqs, cc.enss, t)
-                    let dfn = DFn(is_pub, name, tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None, fnid_none())
-                    ok_d_fn(rb.p, dfn, fn_bounds)
+                    let dfn = DFn(is_pub, fnid_decl(p_sym(p, NCFn, name)), tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
+                    ok_d_fn(rb.p, dfn, fn_bounds, [p_ent(p, NCFn, name, is_pub)])
                   }
                 }
               }
@@ -6447,14 +6488,16 @@ fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
                         let p_close = p_advance(p_after_block)
                         let defblk = DBlk(cr.clauses, cr.return_clause,
                                           id_t.line, id_t.col)
-                        ok_d(p_close, DEffect(is_pub, name, tparams, ops,
-                                              Some(defblk), t.line, t.col, None, sym_none()))
+                        ok_dn(p_close, DEffect(is_pub, p_sym(p, NCEffect, name), tparams, ops,
+                                               Some(defblk), t.line, t.col, None),
+                              [p_ent(p, NCEffect, name, is_pub)])
                       }
                     }
                   }
                 }
               } else {
-                ok_d(ops_r.p, DEffect(is_pub, name, tparams, ops, None, t.line, t.col, None, sym_none()))
+                ok_dn(ops_r.p, DEffect(is_pub, p_sym(p, NCEffect, name), tparams, ops, None, t.line, t.col, None),
+                      [p_ent(p, NCEffect, name, is_pub)])
               }
             }
           }
@@ -6523,7 +6566,7 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
               match rt.r {
                 None -> PEffectOps { p: rt.p, r: None }
                 Some(ty) -> {
-                  let op = EOp(opname, op_tparams, params, ty, id.line, id.col)
+                  let op : EffectOp = EOp(opname, op_tparams, params, ty, id.line, id.col)
                   parse_effect_ops(rt.p, [op, ...acc])
                 }
               }
@@ -6554,7 +6597,7 @@ fn close_param_group(names: [PendName], ty: TypeExpr, acc: [Param]) : [Param] {
     [] -> acc
     [pn, ...rest] ->
       close_param_group(rest, ty,
-        [Param { pname: pn.nm, ptype: Some(ty), pline: pn.nline, pcol: pn.ncol, pborrow: pn.pborrow }, ...acc])
+        [Param { binder: binder_written(pn.nm), ptype: Some(ty), pline: pn.nline, pcol: pn.ncol, pborrow: pn.pborrow }, ...acc])
   }
 }
 
@@ -6650,9 +6693,10 @@ fn parse_protocol_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
               match ops_r.r {
                 None -> err_d(ops_r.p)
                 Some(ops) -> {
-                  let proto = DProtocol(is_pub, name, proto_tparams, ops, t.line, t.col, None, sym_none())
-                  if thy == "" { ok_d(ops_r.p, proto) }
-                  else { ok_d(ops_r.p, DProtoLaws(thy, proto, t.line, t.col, None)) }
+                  let proto = DProtocol(is_pub, p_sym(p, NCProtocol, name), proto_tparams, ops, t.line, t.col, None)
+                  let rows = [p_ent(p, NCProtocol, name, is_pub)]
+                  if thy == "" { ok_dn(ops_r.p, proto, rows) }
+                  else { ok_dn(ops_r.p, DProtoLaws(thy, proto, t.line, t.col, None), rows) }
                 }
               }
             }
@@ -6691,7 +6735,7 @@ fn parse_optional_proto_theory(p: Parser) : PProtoTheory / Console {
 # After an impl body, an optional `axiom <Law>` clause asserts the impl
 # obeys the named law set, exempting it from the autogenerated
 # law-checks (the audited escape). `axiom` is the existing keyword.
-fn parse_trailing_axiom(p: Parser, impl_decl: Decl, t: Token) : PDecl / Console {
+fn parse_trailing_axiom(p: Parser, impl_decl: Decl, rows: [NEnt], t: Token) : PDecl / Console {
   let pn = p_skip_newlines(p)
   # `axiom` also starts a top-level body-less-decl (`axiom f(x): T`), so a
   # trailing impl clause is claimed ONLY when `axiom` is followed by a known
@@ -6700,9 +6744,9 @@ fn parse_trailing_axiom(p: Parser, impl_decl: Decl, t: Token) : PDecl / Console 
     let p1 = p_skip_newlines(p_advance(pn))
     let th = p_peek(p1)
     let thy = tok_source(p1.src, th)
-    ok_d(p_advance(p1), DImplAxiom(thy, impl_decl, t.line, t.col, None))
+    ok_dn(p_advance(p1), DImplAxiom(thy, impl_decl, t.line, t.col, None), rows)
   } else {
-    ok_d(p, impl_decl)
+    ok_dn(p, impl_decl, rows)
   }
 }
 
@@ -6803,7 +6847,7 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
         err_d(p_error(p_after_tps, id, "expected an uppercase protocol name after `impl`"))
       } else {
         let pq = parse_qualified_head_name(p_after_tps, id)
-        let pname = pq.name
+        let pname = pq.dref
         let p1 = pq.p
         # Optional `[T1, T2, ...]` after the protocol name binds the
         # protocol's type-parameters at this impl-site
@@ -6833,7 +6877,7 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
                     err_d(p_error_here(p3, "expected `{` to start impl body"))
                   } else {
                     let p4 = p_skip_newlines(p_advance(p3))
-                    let methods_r = parse_impl_methods(p4, [])
+                    let methods_r = parse_impl_methods(p4, impl_scope(p.home, t.line, t.col), [], [])
                     match methods_r.r {
                       None -> err_d(methods_r.p)
                       Some(ms) -> {
@@ -6842,7 +6886,7 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
                         # `surface_lower_decls` prepends them (bounds
                         # stripped) to each method's own tparams.
                         let impl_d = DImpl(pname, proto_args, target_ty, ms, t.line, t.col, impl_tparams, sym_none())
-                        parse_trailing_axiom(methods_r.p, impl_d, t)
+                        parse_trailing_axiom(methods_r.p, impl_d, methods_r.names, t)
                       }
                     }
                   }
@@ -6884,26 +6928,40 @@ fn parse_impl_proto_args(p: Parser, acc: [TypeExpr]) : PImplArgs / Console {
   }
 }
 
-type PImplMethods = { p: Parser, r: Option[[Decl]] }
+type PImplMethods = { p: Parser, r: Option[[Decl]], names: [NEnt] }
 
-fn parse_impl_methods(p: Parser, acc: [Decl]) : PImplMethods / Console {
+# `scope` is the impl block's: a method is declared in it, not in the
+# module's function namespace, so two impls' `show` are two symbols.
+fn parse_impl_methods(p: Parser, scope: String, acc: [Decl], racc: [NEnt]) : PImplMethods / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    PImplMethods { p: p_advance(p0), r: Some(list_reverse(acc)) }
+    PImplMethods { p: p_advance(p0), r: Some(list_reverse(acc)), names: list_reverse(racc) }
   } else {
     if not p_at(p0, TkFn) {
-      PImplMethods { p: p_error_here(p0, "expected `fn` to start an impl method"), r: None }
+      PImplMethods { p: p_error_here(p0, "expected `fn` to start an impl method"), r: None, names: [] }
     } else {
       let fn_tok = p_peek(p0)
       let p1 = p_advance(p0)
       let dr = parse_fn_decl(p1, false, fn_tok)
       match dr.r {
-        None -> PImplMethods { p: dr.p, r: None }
-        Some(d) -> parse_impl_methods(dr.p, [d, ...acc])
+        None -> PImplMethods { p: dr.p, r: None, names: [] }
+        Some(d) -> match dr.names {
+          [NEnt(_, op, _, _)] ->
+            parse_impl_methods(dr.p, scope, [impl_method(d, op, scope), ...acc], [method_ent(op, scope), ...racc])
+          _ -> panic("parse: an impl method without its entry")
+        }
       }
     }
   }
+}
+
+# The function `d`, read as a module's, re-identified as the method `op`
+# of the impl block whose scope is `scope`.
+fn impl_method(d: Decl, op: String, scope: String) : Decl = match d {
+  DFn(is_pub, _, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, fnid_decl(method_sym(op, scope)), tps, ps, ret, row, body, l, c, mo)
+  _ -> d
 }
 
 # `#[ident (args)?]` attribute, dispatched after the lexer emits
@@ -6956,7 +7014,7 @@ fn parse_attr_derive_body(p: Parser, hash_tok: Token) : PDecl / Console {
         } else {
           let p2 = p_skip_newlines(p_advance(p_close))
           let p2_pub_r =
-            if tk_is(p_peek(p2).kind, TkPub) { PTy { p: p_advance(p2), r: Some(mk_ty(TyName(ty_ref_none(), "", []), 0, 0)) } }
+            if tk_is(p_peek(p2).kind, TkPub) { PTy { p: p_advance(p2), r: Some(mk_ty(TyName(ref_written(""), []), 0, 0)) } }
             else { PTy { p: p2, r: None } }
           let inner_pub = match p2_pub_r.r { Some(_) -> true None -> false }
           let p3 = p2_pub_r.p
@@ -6967,7 +7025,7 @@ fn parse_attr_derive_body(p: Parser, hash_tok: Token) : PDecl / Console {
             let inner = parse_type_decl(p_advance(p3), inner_pub, hd)
             match inner.r {
               None -> err_d(inner.p)
-              Some(d) -> ok_d(inner.p, DDerive(names, d, hash_tok.line, hash_tok.col))
+              Some(d) -> ok_d_wrap(inner, DDerive(names, d, hash_tok.line, hash_tok.col))
             }
           }
         }
@@ -7006,7 +7064,7 @@ fn parse_attr_constructor_body(p: Parser, hash_tok: Token) : PDecl / Console {
       None    -> err_d(inner.p)
       Some(d) ->
         if constructor_wraps_fn(d) {
-          ok_d(inner.p, constructor_wrap(d, hash_tok.line, hash_tok.col))
+          ok_d_wrap(inner, constructor_wrap(d, hash_tok.line, hash_tok.col))
         } else {
           err_d(p_error_here(p0, "`#[constructor]` must precede a `pub fn` returning the constructed type"))
         }
@@ -7017,7 +7075,7 @@ fn parse_attr_constructor_body(p: Parser, hash_tok: Token) : PDecl / Console {
 # True when `d` is a `pub fn`, seeing through a `#[doc(...)]` wrapper.
 fn constructor_wraps_fn(d: Decl) : Bool {
   match d {
-    DFn(is_pub, _, _, _, _, _, _, _, _, _, _) -> is_pub
+    DFn(is_pub, _, _, _, _, _, _, _, _, _) -> is_pub
     DDoc(_, _, inner, _, _)                -> constructor_wraps_fn(inner)
     DAttr(_, inner, _, _)                  -> constructor_wraps_fn(inner)
     _                                      -> false
@@ -7093,7 +7151,7 @@ fn finish_doc_attr(p: Parser, raw: String, text: String, t: Token) : PDecl / Con
           err_d(p_fail_at(inner.p, il, ic,
             "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute"))
         }
-        _ -> ok_d(inner.p, DDoc(raw, text, d, t.line, t.col))
+        _ -> ok_d_wrap(inner, DDoc(raw, text, d, t.line, t.col))
       }
     }
   } else {
@@ -7142,7 +7200,7 @@ fn parse_attr_unknown_body(p: Parser, name: String, hash_tok: Token) : PDecl / C
     let inner = parse_decl(p2)
     match inner.r {
       None    -> err_d(inner.p)
-      Some(d) -> ok_d(inner.p, DAttr(raw, d, hash_tok.line, hash_tok.col))
+      Some(d) -> ok_d_wrap(inner, DAttr(raw, d, hash_tok.line, hash_tok.col))
     }
   }
 }
@@ -7207,31 +7265,31 @@ fn parse_unstable_decl(p: Parser, t: Token) : PDecl / Console {
       let inner = parse_fn_decl(p_advance(p1), true, hd)
       match inner.r {
         None    -> err_d(inner.p)
-        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+        Some(d) -> ok_d_wrap(inner, DUnstable(d, t.line, t.col))
       }
     } else if tk_is(hd.kind, TkType) {
       let inner = parse_type_decl(p_advance(p1), true, hd)
       match inner.r {
         None    -> err_d(inner.p)
-        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+        Some(d) -> ok_d_wrap(inner, DUnstable(d, t.line, t.col))
       }
     } else if tk_is(hd.kind, TkConst) {
       let inner = parse_const_decl(p_advance(p1), true, hd)
       match inner.r {
         None    -> err_d(inner.p)
-        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+        Some(d) -> ok_d_wrap(inner, DUnstable(d, t.line, t.col))
       }
     } else if tk_is(hd.kind, TkEffect) {
       let inner = parse_effect_decl(p_advance(p1), true, hd)
       match inner.r {
         None    -> err_d(inner.p)
-        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+        Some(d) -> ok_d_wrap(inner, DUnstable(d, t.line, t.col))
       }
     } else if tk_is(hd.kind, TkProtocol) {
       let inner = parse_protocol_decl(p_advance(p1), true, hd)
       match inner.r {
         None    -> err_d(inner.p)
-        Some(d) -> ok_d(inner.p, DUnstable(d, t.line, t.col))
+        Some(d) -> ok_d_wrap(inner, DUnstable(d, t.line, t.col))
       }
     } else {
       err_d(p_error(p1, hd, "`#[unstable] pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"))
@@ -7534,7 +7592,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], slo
     # A leading bar marks a sum outright, which is what lets a
     # one-member sum exist: without it `= X` is an alias, and no
     # amount of lookahead can tell the two apart.
-    parse_sum_body(p_skip_newlines(p_advance(p)), [], is_pub, name, tparams, slots, t)
+    parse_sum_body(p_skip_newlines(p_advance(p)), [], [], is_pub, name, tparams, slots, t)
   } else {
     # Sum or alias: check for an uppercase ident followed by `(` OR
     # followed eventually by `|` to decide. Simpler approach: try to
@@ -7546,7 +7604,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], slo
     # A qualified head only enters the sum path when a `|` follows: on
     # its own, `type T = m.U` is an alias.
     if tk_is(hd.kind, TkIdent) and at_qualified_member(p, hd) and looks_like_sum(p) {
-      parse_sum_body(p, [], is_pub, name, tparams, slots, t)
+      parse_sum_body(p, [], [], is_pub, name, tparams, slots, t)
     } else if tk_is(hd.kind, TkIdent) and is_upper_ident(p.src, hd) {
       # Effect alias body has the form `Eff1 + Eff2 + ...`. The `+`
       # immediately after the first uppercase ident is the unambiguous
@@ -7560,12 +7618,12 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], slo
       } else {
         let is_sum = looks_like_sum(p)
         if is_sum {
-          parse_sum_body(p, [], is_pub, name, tparams, slots, t)
+          parse_sum_body(p, [], [], is_pub, name, tparams, slots, t)
         } else {
           let rt = parse_type(p)
           match rt.r {
             None -> err_d(rt.p)
-            Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None, slots, sym_none()))
+            Some(aliased) -> ok_dn(rt.p, DType(is_pub, p_sym(p, NCType, name), tparams, TBAlias(aliased), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
           }
         }
       }
@@ -7573,7 +7631,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], slo
       let rt = parse_type(p)
       match rt.r {
         None -> err_d(rt.p)
-        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col, None, slots, sym_none()))
+        Some(aliased) -> ok_dn(rt.p, DType(is_pub, p_sym(p, NCType, name), tparams, TBAlias(aliased), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
       }
     }
   }
@@ -7626,7 +7684,7 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col, None, slots, sym_none()))
+    ok_dn(p_advance(p0), DType(is_pub, p_sym(p, NCType, name), tparams, TBRecord(list_reverse(acc)), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
   } else {
     # A field may carry zero or more `#[json(...)]` overrides before its
     # `priv`/name; they parse to `[FieldAttr]` on the FieldDecl.
@@ -7663,7 +7721,7 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
                 if p_at(p2, TkComma) {
                   parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, slots, t)
                 } else if p_at(p2, TkRbrace) {
-                  ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None, slots, sym_none()))
+                  ok_dn(p_advance(p2), DType(is_pub, p_sym(p, NCType, name), tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
                 } else {
                   err_d(p_error_here(p2, "expected `,` or `}` in record type"))
                 }
@@ -7786,18 +7844,20 @@ fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String,
     if p_at(p1, TkPlus) {
       parse_effect_alias_body(p_advance(p1), acc1, is_pub, name, tparams, slots, t)
     } else {
-      ok_d(p1, DType(is_pub, name, tparams, TBEffectAlias(map(list_reverse(acc1), (n) => RL(n, [], sym_none()))), t.line, t.col, None, slots, sym_none()))
+      ok_dn(p1, DType(is_pub, p_sym(p, NCType, name), tparams, TBEffectAlias(map(list_reverse(acc1), (n) => RL(ref_written(n), []))), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
     }
   }
 }
 
 # `mod.Type` in member position. A constructor never carries a module
 # qualifier, so this spelling only ever reads as a union over a
-# pre-declared type.
+# pre-declared type. A variant has no slot for what was written, so the
+# member's entry carries the qualified spelling until the module pass
+# settles it.
 fn at_qualified_member(p: Parser, t: Token) : Bool =
   (not is_upper_ident(p.src, t)) and tk_is(p_peek1(p).kind, TkDot) and tk_is(p_peek2(p).kind, TkIdent) and is_upper_ident(p.src, p_peek2(p))
 
-fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
+fn parse_sum_body(p: Parser, acc: [Variant], racc: [NEnt], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
 
   let p0 = p_skip_newlines(p)
   let vt = p_peek(p0)
@@ -7818,12 +7878,14 @@ fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams
     match args_r.r {
       None -> err_d(args_r.p)
       Some(vargs) -> {
-        let vnode = Var(vname, vargs)
+        let vnode = Var(p_sym(p, NCCtor, vname), vargs)
+        let racc1 = [p_ent(p, NCCtor, vname, is_pub), ...racc]
         let p2 = p_skip_newlines(args_r.p)
         if p_at(p2, TkPipe) {
-          parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], is_pub, name, tparams, slots, t)
+          parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], racc1, is_pub, name, tparams, slots, t)
         } else {
-          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col, None, slots, sym_none()))
+          ok_dn(p2, DType(is_pub, p_sym(p, NCType, name), tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col, None, slots),
+                [p_ent(p, NCType, name, is_pub), ...list_reverse(racc1)])
         }
       }
     }
@@ -7927,7 +7989,7 @@ fn parse_check_with_params(p: Parser, acc: [Param]) : PParams / Console {
       match rt.r {
         None -> PParams { p: rt.p, r: None }
         Some(ty) -> {
-          let param = Param { pname: name, ptype: Some(ty), pline: t.line, pcol: t.col, pborrow: false }
+          let param = Param { binder: binder_written(name), ptype: Some(ty), pline: t.line, pcol: t.col, pborrow: false }
           let p2 = p_skip_newlines(rt.p)
           if p_at(p2, TkComma) {
             parse_check_with_params(p_skip_newlines(p_advance(p2)), [param, ...acc])
@@ -8042,7 +8104,7 @@ fn parse_import_selectives(p: Parser, acc: [String], path: String, t: Token) : P
 # program
 # ====================================================================
 
-fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec]) : PParser / Console {
+fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec], nacc: [NEnt]) : PParser / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkEof) {
@@ -8051,40 +8113,53 @@ fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec]) : PParser / C
     # the driver claim success. Surface the error as `decls: None`
     # so the entry point exits non-zero, even when every decl
     # parsed in shape.
-    if p_failed(p0) { PParser { p: p0, decls: None, fn_bounds: [] } }
-    else { PParser { p: p0, decls: Some(list_reverse(acc)), fn_bounds: list_reverse(bacc) } }
+    if p_failed(p0) { PParser { p: p0, decls: None, fn_bounds: [], names: [] } }
+    else { PParser { p: p0, decls: Some(list_reverse(acc)), fn_bounds: list_reverse(bacc),
+                     names: list_reverse(nacc) } }
   }
   else {
     let r = parse_decl(p0)
     match r.r {
-      None -> PParser { p: r.p, decls: None, fn_bounds: [] }
-      Some(d) -> parse_program_loop(r.p, [d, ...acc], fn_bounds_seed(d, r.bounds, bacc))
+      None -> PParser { p: r.p, decls: None, fn_bounds: [], names: [] }
+      Some(d) -> parse_program_loop(r.p, [d, ...acc], fn_bounds_seed(d, r.bounds, r.names, bacc),
+                                    names_onto(r.names, nacc))
     }
   }
 }
 
-# Seed a fn-bounds record for a bounded free fn. `mo` is None here (the
-# parser only produces root-file decls); the driver re-keys the target
-# file's records to its module name to match the monomorphiser's view.
-fn fn_bounds_seed(d: Decl, bs: [FnTPBound], bacc: [FnBoundsRec]) : [FnBoundsRec] =
+fn names_onto(ns: [NEnt], acc: [NEnt]) : [NEnt] = match ns {
+  []           -> acc
+  [n, ...rest] -> names_onto(rest, [n, ...acc])
+}
+
+# Seed a fn-bounds record for a bounded free fn, named by the entry the
+# fn declares. `mo` is None here (the parser stamps no origin); the
+# driver re-keys the target file's records to its module name to match
+# the monomorphiser's view.
+fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) : [FnBoundsRec] =
   match bs {
     [] -> bacc
     _  -> match d {
-      DFn(_, name, _, _, _, _, _, _, _, mo, _) -> [FBR(name, mo, bs), ...bacc]
+      DFn(_, _, _, _, _, _, _, _, _, mo) -> match names {
+        [NEnt(_, name, _, _), ..._] -> [FBR(name, mo, bs), ...bacc]
+        []                          -> bacc
+      }
       _ -> bacc
     }
   }
 
-pub type PParser = { p: Parser, decls: Option[[Decl]], fn_bounds: [FnBoundsRec] }
+#[doc("What parsing a file gives: the parser's final state, the declarations, the protocol bounds its functions declare, and one entry per declaration, constructor and impl method it declares, in declaration order.")]
+pub type PParser = { p: Parser, decls: Option[[Decl]], fn_bounds: [FnBoundsRec], names: [NEnt] }
 
-pub fn parse_program(file: String, src: String, toks: [Token]) : PParser / Console {
+#[doc("Parses the file `file`. `home` is the module the file's declarations belong to: every declaration and constructor id is derived with it.")]
+pub fn parse_program(file: String, src: String, toks: [Token], home: String) : PParser / Console {
 
-  let r = parse_program_loop(parser_new(file, src, toks), [], [])
+  let r = parse_program_loop(parser_new(file, src, toks, home), [], [], [])
   match r.decls {
     None -> r
     Some(ds) -> match nest_first_over(ds) {
       None -> r
-      Some(e) -> PParser { p: p_fail_at(r.p, e.line, e.col, nest_msg()), decls: None, fn_bounds: [] }
+      Some(e) -> PParser { p: p_fail_at(r.p, e.line, e.col, nest_msg()), decls: None, fn_bounds: [], names: [] }
     }
   }
 }
