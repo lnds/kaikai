@@ -9,26 +9,31 @@ decl it resolves to, never against a same-named fn elsewhere.
 """)]
 
 import compiler.ast
+import compiler.decl_names
+import compiler.decl_text
 import compiler.parse
+import compiler.symtab
+import compiler.symtab_build
+import compiler.written
 
 #[doc("A bounded fn's declaration identity and its per-tparam protocol bounds.")]
 pub type SymBounds = SymBoundsEntry(SymId, [FnTPBound])
 
-#[doc("Surface-stream bounds of every bounded free fn, keyed by (name, module origin); a root-file fn has origin `None`.")]
-pub fn collect_surface_bounds(ds: [Decl]) : [FnBoundsRec] = surface_bounds_loop(ds, [])
+#[doc("Surface-stream bounds of every bounded free fn, keyed by (name, module origin); a root-file fn has origin `None`. `tab` holds the stream's declarations.")]
+pub fn collect_surface_bounds(ds: [Decl], tab: SymTab) : [FnBoundsRec] = surface_bounds_loop(ds, tab, [])
 
-fn surface_bounds_loop(ds: [Decl], acc: [FnBoundsRec]) : [FnBoundsRec] = match ds {
+fn surface_bounds_loop(ds: [Decl], tab: SymTab, acc: [FnBoundsRec]) : [FnBoundsRec] = match ds {
   [] -> acc
-  [d, ...rest] -> surface_bounds_loop(rest, surface_bounds_of(d, acc))
+  [d, ...rest] -> surface_bounds_loop(rest, tab, surface_bounds_of(d, tab, acc))
 }
 
-fn surface_bounds_of(d: Decl, acc: [FnBoundsRec]) : [FnBoundsRec] = match d {
-  DFn(_, name, tps, _, _, _, _, _, _, mo, _) -> match fn_tp_bounds_of(tps) {
+fn surface_bounds_of(d: Decl, tab: SymTab, acc: [FnBoundsRec]) : [FnBoundsRec] = match d {
+  DFn(_, f, tps, _, _, _, _, _, _, mo) -> match fn_tp_bounds_of(tps) {
     [] -> acc
-    bs -> [FBR(name, mo, bs), ...acc]
+    bs -> [FBR(written_text(decl_name(tab, fnid_sym(f))), mo, bs), ...acc]
   }
-  DDoc(_, _, inner, _, _) -> surface_bounds_of(inner, acc)
-  DAttr(_, inner, _, _)   -> surface_bounds_of(inner, acc)
+  DDoc(_, _, inner, _, _) -> surface_bounds_of(inner, tab, acc)
+  DAttr(_, inner, _, _)   -> surface_bounds_of(inner, tab, acc)
   _ -> acc
 }
 
@@ -36,42 +41,28 @@ fn surface_bounds_of(d: Decl, acc: [FnBoundsRec]) : [FnBoundsRec] = match d {
 pub fn bounds_by_sym(ds: [Decl], recs: [FnBoundsRec], target_mod: String) : [SymBounds] =
   match recs {
     [] -> []
-    _  -> sym_bounds_loop(ds, recs, target_mod, [])
+    _  -> sym_bounds_loop(ds, map(recs, (r) => rec_by_sym(r, target_mod)), [])
   }
 
-fn sym_bounds_loop(ds: [Decl], recs: [FnBoundsRec], target_mod: String,
-                   acc: [SymBounds]) : [SymBounds] = match ds {
+# A surface record with no origin is a root-file fn, homed at the target.
+fn rec_by_sym(r: FnBoundsRec, target_mod: String) : SymBounds = match r {
+  FBR(n, mo, bs) -> SymBoundsEntry(sym_derive(NCFn, n, match mo { Some(m) -> m  None -> target_mod }), bs)
+}
+
+fn sym_bounds_loop(ds: [Decl], recs: [SymBounds], acc: [SymBounds]) : [SymBounds] = match ds {
   [] -> acc
   [d, ...rest] -> match d {
-    DFn(_, name, tps, _, _, _, _, _, _, mo, fsym) ->
-      if list_length(tps) == 0 or sym_raw(fnid_sym(fsym)) < 0 {
-        sym_bounds_loop(rest, recs, target_mod, acc)
-      }
+    DFn(_, f, tps, _, _, _, _, _, _, _) ->
+      if list_length(tps) == 0 or sym_raw(fnid_sym(f)) < 0 { sym_bounds_loop(rest, recs, acc) }
       else {
-        match find_bounds(recs, name, mo, target_mod) {
-          Some(bs) -> sym_bounds_loop(rest, recs, target_mod, [SymBoundsEntry(fnid_sym(fsym), bs), ...acc])
-          None     -> sym_bounds_loop(rest, recs, target_mod, acc)
+        match bounds_of_sym(recs, fnid_sym(f)) {
+          Some(bs) -> sym_bounds_loop(rest, recs, [SymBoundsEntry(fnid_sym(f), bs), ...acc])
+          None     -> sym_bounds_loop(rest, recs, acc)
         }
       }
-    _ -> sym_bounds_loop(rest, recs, target_mod, acc)
+    _ -> sym_bounds_loop(rest, recs, acc)
   }
 }
-
-# A surface record with no origin is a root-file fn, which the driver tags
-# `Some(target)` when public and leaves untagged otherwise.
-fn find_bounds(recs: [FnBoundsRec], name: String, mo: Option[String],
-               target_mod: String) : Option[[FnTPBound]] = match recs {
-  [] -> None
-  [FBR(n, rmo, bs), ...rest] ->
-    if n == name and origin_matches(rmo, mo, target_mod) { Some(bs) }
-    else { find_bounds(rest, name, mo, target_mod) }
-}
-
-fn origin_matches(rec_mo: Option[String], decl_mo: Option[String], target_mod: String) : Bool =
-  match rec_mo {
-    Some(r) -> match decl_mo { Some(m) -> r == m  None -> false }
-    None    -> match decl_mo { None -> true  Some(m) -> m == target_mod }
-  }
 
 #[doc("The bounds recorded for the fn declared as `s`, or `None` when it has none.")]
 pub fn bounds_of_sym(tbl: [SymBounds], s: SymId) : Option[[FnTPBound]] = match tbl {
