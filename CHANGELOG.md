@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.3 (2026-10-09)
+
+### Fixed
+
+- **resolve**: a file with only test blocks sees its own imports (#2662)
+- **emit**: compound == calls a record field type's Eq (#2663)
+- **typer**: a priv field cannot be destructured outside its module (#2664)
+- **perceus**: a modulo-cons step releases a param a resolved callee borrows (#2661)
+- **native**: landing pads release the operand values in flight (#2659)
+- **typer**: core types carry stable ids (#2660)
+- **perceus**: a runtime-dispatched impl's params are not inferred borrowed (#2657)
+- **resolve**: an import makes names visible only in the file that writes it (#2654)
+- **native**: key unwind sites by node identity (#2653)
+
+### Changed
+
+- **emit**: direct calls keep an impl's inferred borrows (#2658)
+- **resolve**: gather homonyms once and only when a use can be hidden (#2655)
+
 ## v0.139.2 (2026-10-09)
 
 ### Fixed
