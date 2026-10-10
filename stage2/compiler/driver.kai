@@ -84,6 +84,7 @@ import compiler.const_pattern
 import compiler.refine_enforce
 import compiler.region
 import compiler.region_yield
+import compiler.edition
 import compiler.infer
 import compiler.infer_unit_validate
 import compiler.infer_shape_validate
@@ -496,8 +497,8 @@ fn dump_mmarm(a: MMArm, depth: Int) : Unit / Console {
 fn dump_hclause(c: HClause, depth: Int) : Unit / Console {
 
   match c {
-    HC(name, params, body, line, col) -> {
-      emit_line(depth, "clause #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    HC(head, params, body, line, col) -> {
+      emit_line(depth, "clause #{clause_head_word(head)} @#{int_to_string(line)}:#{int_to_string(col)}")
       params |> each((pm) => dump_param(pm, depth + 1))
       dump_expr(body, depth + 1)
     }
@@ -650,6 +651,11 @@ fn dump_pat(pat: Pattern, depth: Int) : Unit / Console {
       PsRefine(name, ty) -> {
         emit_line(depth, "pat_refine #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
         dump_type(ty, depth + 1)
+      }
+      PsAnonRest(pats, wild) -> {
+        emit_line(depth, "pat_list @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+        pats |> each((pp) => dump_pat(pp, depth + 1))
+        emit_line(depth + 1, if wild { "..._" } else { "..." })
       }
     }
   }
@@ -873,7 +879,7 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
       let hab_s = match hab {
         HabNone -> ""
         HabIntro(w) -> w
-        HabDomain(dom) -> dom
+        HabDomain(dom) -> value_domain_name(dom)
         HabClosed(w, atoms) -> concat_all([w, " { ", join_with(atoms, " "), " }"])
       }
       emit_line(depth, "kind #{pub_s}\"#{name}\" : #{thy} with #{hab_s} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -1787,13 +1793,13 @@ pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], core
                     # opted-in deps.
                     package_name: String,
                     unstable_optins: [String],
-                    # Edition name parsed from `--edition <name>`.
+                    # The edition `--edition <name>` selected.
                     # `bin/kai` always provides a value (kai.toml field
-                    # or repo EDITION fallback); an empty string means
-                    # the driver did not supply the flag. The typer
-                    # gates feature branches on this (e.g. convention
-                    # pipe dispatch is active only for >= hanga-roa).
-                    edition: String,
+                    # or repo EDITION fallback); `None` means the flag
+                    # was not passed. The typer gates feature branches
+                    # on this (e.g. convention pipe dispatch is active
+                    # only for >= hanga-roa).
+                    edition: Option[Edition],
                     # Opt-in user-file incremental cache. `bin/kai`
                     # passes `--user-cache` (and creates
                     # `<project>/.kai-cache/`) only under `KAI_CACHE=1`,
@@ -1902,33 +1908,20 @@ fn cli_parse_site(w: String) : Int = match string_to_int(w) {
 fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
   CliOptions { ...opts, package_name: n }
 
-# Set the consumer-declared edition (parsed from `--edition <name>`
-# which `bin/kai` derives from kai.toml's `edition = "..."` field,
-# falling back to the repo EDITION file). An empty string at compile
-# time means the driver did not pass the flag; the typer treats that
-# as the oldest edition (tongariki) so flagless invocations and old
-# fixture harnesses keep working.
-fn cli_with_edition(opts: CliOptions, n: String) : CliOptions =
-  CliOptions { ...opts, edition: n }
-
-# The canonical lowercase set of edition names the compiler accepts.
-# Adding a new edition (Orongo) flips this list AND adds an
-# `edition_rank` row below.
-fn known_editions() : [String] = ["tongariki", "hanga-roa", "orongo"]
-
-fn edition_is_known_loop(es: [String], n: String) : Bool = match es {
-  [] -> false
-  [e, ...rest] -> if e == n { true } else { edition_is_known_loop(rest, n) }
-}
-
-fn edition_is_known(n: String) : Bool = edition_is_known_loop(known_editions(), n)
+# Set the consumer-declared edition (`--edition <name>`, which
+# `bin/kai` derives from kai.toml's `edition = "..."` field, falling
+# back to the repo EDITION file). A build that never passes the flag
+# runs under the oldest edition (tongariki), so flagless invocations
+# and old fixture harnesses keep working.
+fn cli_with_edition(opts: CliOptions, e: Edition) : CliOptions =
+  CliOptions { ...opts, edition: Some(e) }
 
 # The newest edition whose semantics this compiler actually implements.
-# `known_editions` runs ahead of it: a name is parseable as soon as the
-# edition is being built out, but selecting it only means something once
-# the gates keyed on it exist. Bump on the edition cut, together with
-# the EDITION file.
-fn implemented_edition() : String = "hanga-roa"
+# The `Edition` type runs ahead of it: a name is parseable as soon as
+# the edition is being built out, but selecting it only means something
+# once the gates keyed on it exist. Bump on the edition cut, together
+# with the EDITION file.
+fn implemented_edition() : Edition = EdHangaRoa
 
 # A manifest may name an edition this compiler does not implement yet.
 # That is not an error — the name is legal and the build is sound today,
@@ -1936,19 +1929,17 @@ fn implemented_edition() : String = "hanga-roa"
 # absent. It is worth a warning: the manifest reads as a promise the
 # toolchain cannot keep, and the moment the first gate lands the same
 # source silently changes meaning.
-fn warn_if_edition_ahead(n: String) : Unit / Console =
-  if edition_rank(n) > edition_rank(implemented_edition()) {
-    eprint(concat_all(["kaic2: warning: kai.toml selects edition `", n,
+fn warn_if_edition_ahead(e: Edition) : Unit / Console =
+  if edition_rank(e) > edition_rank(implemented_edition()) {
+    let have = edition_name(implemented_edition())
+    eprint(concat_all(["kaic2: warning: kai.toml selects edition `", edition_name(e),
       "`, which this compiler does not implement yet (it provides `",
-      implemented_edition(),
-      "`); the build proceeds under `", implemented_edition(),
-      "` semantics — set the edition to `", implemented_edition(),
+      have,
+      "`); the build proceeds under `", have,
+      "` semantics — set the edition to `", have,
       "` to pin what is actually being compiled"]))
   } else { () }
 
-# Numeric rank for `>=` comparisons. Unknown values default to 0
-# (tongariki) defensively; the CLI rejects unknown values before any
-# rank lookup runs.
 fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
   CliOptions { ...opts, unstable_optins: list_append(opts.unstable_optins, [pkg]) }
 
@@ -2216,15 +2207,17 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         # manifest is present). Unknown values produce an error that
         # names the known set so the user can correct the manifest.
         match more {
-          [n, ...rest2] ->
-            if edition_is_known(n) {
-              let _w = warn_if_edition_ahead(n)
-              parse_cli_loop(rest2, cli_with_edition(opts, n))
-            } else {
+          [n, ...rest2] -> match edition_of_name(n) {
+            Some(e) -> {
+              let _w = warn_if_edition_ahead(e)
+              parse_cli_loop(rest2, cli_with_edition(opts, e))
+            }
+            None -> {
               eprint(concat_all(["kaic2: unknown edition `", n,
                 "` in kai.toml — known editions: tongariki, hanga-roa, orongo"]))
               cli_with_mode(opts, MUsageError)
             }
+          }
           [] -> {
             eprint("kaic2: --edition requires an edition-name argument")
             cli_with_mode(opts, MUsageError)
@@ -2252,7 +2245,7 @@ pub fn parse_cli(argv: [String]) : CliOptions / Console {
                                     core_caches: [], cache_sha: "",
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
-                                    edition: "", user_cache: false, core_cache: cc_opt_off(),
+                                    edition: None, user_cache: false, core_cache: cc_opt_off(),
                                     test_roots: [], test_plan: "", kir_verify: "" })
 }
 
@@ -4513,7 +4506,7 @@ fn dump_library_mode(file: String, src: String, decls: [Decl]) : Int / Console +
 # `decls`, so reusing one binding for both passes would leave the scan
 # reading freed sub-lists. Re-parsing is cheap next to the rest of
 # migrate and keeps the two passes fully decoupled.
-fn run_migrate(path: String, src: String, decls: [Decl], cmts: [Cmt], edition: String) : Int / Console =
+fn run_migrate(path: String, src: String, decls: [Decl], cmts: [Cmt], edition: Option[Edition]) : Int / Console =
   if migrate_flips_types(edition) {
     run_migrate_scanned(path, src, cmts, scan_source(path, src), migrate_type_flip_count(decls), migrate_decls(decls))
   } else {
@@ -4527,7 +4520,10 @@ fn run_migrate(path: String, src: String, decls: [Decl], cmts: [Cmt], edition: S
 # declared source edition is the only convergence signal. Anything but
 # hanga-roa, including a flagless invocation, gets the call renames
 # only; that is what makes a second migrate a no-op.
-fn migrate_flips_types(edition: String) : Bool = edition == "hanga-roa"
+fn migrate_flips_types(edition: Option[Edition]) : Bool = match edition {
+  Some(EdHangaRoa) -> true
+  _                -> false
+}
 
 fn scan_source(path: String, src: String) : [MigRep] / Console = match parse_program(path, src, tokenize(src)).decls {
   None -> []
@@ -4673,8 +4669,8 @@ fn native_core_srcs(backend: Backend, cc: CoreCacheOpt, core_names: [String]) : 
     _ -> ""
   }
 
-fn native_core_pre(cc: CoreCacheOpt, edition: String, srcs: String) : String =
-  if srcs == "" { "" } else { ncore_pre_key(cc.toolchain, edition, llvm_backend_tag(), srcs, cc.inputs) }
+fn native_core_pre(cc: CoreCacheOpt, edition: Option[Edition], srcs: String) : String =
+  if srcs == "" { "" } else { ncore_pre_key(cc.toolchain, edition_key_text(edition), llvm_backend_tag(), srcs, cc.inputs) }
 
 # The single-TU native emit: link a core object the cache holds, emit and
 # cache the core object, or emit the whole program as one object. Prints
@@ -4781,14 +4777,14 @@ fn ec_key_surface_hex(decls: [Decl], core_names: [String], target: String) : Str
 # type-level surface. "" means the cache does not participate; a
 # missing toolchain id disables it so a rebuilt dev compiler can never
 # splice another build's C.
-fn core_emit_key(cc: CoreCacheOpt, edition: String, decls: [Decl],
+fn core_emit_key(cc: CoreCacheOpt, edition: Option[Edition], decls: [Decl],
                  core_names: [String], target: String) : String / Console + File =
   if cc.dir == "" or cc.toolchain == "" { "" }
   else {
     match core_src_hexes(core_module_paths(), []) {
       None -> ""
       Some(hexes) -> uc_content_hex(concat_all([
-        ec_format_tag(), "\n", cc.toolchain, "\n", edition, "\n",
+        ec_format_tag(), "\n", cc.toolchain, "\n", edition_key_text(edition), "\n",
         ec_key_surface_hex(decls, core_names, target), "\n",
         string_join(hexes, "\n")]))
     }
@@ -4802,7 +4798,7 @@ fn core_emit_key(cc: CoreCacheOpt, edition: String, decls: [Decl],
 fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
                              bmode: BuildMode, target_mod_name: String,
                              regions: [RegionMark], cc: CoreCacheOpt,
-                             core_mods: [ModuleEntry], edition: String, stamp_ids: [SymId])
+                             core_mods: [ModuleEntry], edition: Option[Edition], stamp_ids: [SymId])
                              : String / Console + File + Mutable = {
   let plain = match bmode { BMBuild -> true _ -> false }
   let cacheable = core_mod_names(core_mods, [])
@@ -4828,7 +4824,7 @@ fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
   }
 }
 
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String, kir_verify: String) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: Option[Edition], user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String, kir_verify: String) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lexed = lex_diags(path, src, tokens)
@@ -5354,7 +5350,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let pos_rec_errs = pos_rec.errs
             if pos_rec_errs > 0 { pos_rec_errs } else {
             # Opt-in Perceus regions. Unwrap the `region { }` markers
-            # (`ECall(EVar("region"), [block])`) the parser emitted, as
+            # (`ECall(EMark(MkRegion), [block])`) the parser emitted, as
             # the FIRST post-parse rewrite — before any other desugar
             # pass can choke on the unusual "block as a call argument"
             # shape (a marker that survives into a pass whose match
@@ -5592,7 +5588,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
-                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name, edition)
+                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name, edition_or_oldest(edition))
                   let typed = tcut_infer_program(path, diag_ctx, tailfuse_decls(all_decls, target_mod_name, rd.params), "", lowered.reg.impls, head_owners, kind_theories, rd.tab, sym_views, false)
                   if typed.errs != 0 { typed.errs } else { dump_call_elision(path, core_unstamp_decls(rd.tab, typed.decls)) }
                 }
@@ -5652,7 +5648,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   run_lint(path, diag_ctx, lint_owned_mods(expanded), all_decls,
                            post_use_decls,
                            build_head_owner_map(all_decls, module_table,
-                                                target_mod_name, edition))
+                                                target_mod_name, edition_or_oldest(edition)))
                 }
               }
               MLintJson -> {
@@ -5663,7 +5659,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   run_lint_json(path, diag_ctx, lint_owned_mods(expanded), all_decls,
                                 post_use_decls,
                                 build_head_owner_map(all_decls, module_table,
-                                                     target_mod_name, edition))
+                                                     target_mod_name, edition_or_oldest(edition)))
                 }
               }
               _ -> {
@@ -5698,7 +5694,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   let all_decls = match cut { CoreCut(kept, _) -> kept }
                   let dropped = match cut { CoreCut(_, d) -> d }
                   let pruned = match dropped { [] -> false _ -> true }
-                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name, edition)
+                  let head_owners = build_head_owner_map(all_decls, module_table, target_mod_name, edition_or_oldest(edition))
                   # The typed blobs follow the sources, so an explicit
                   # project directory wins over the entry's own: the
                   # native paths compile a copy of the entry from an
@@ -5951,7 +5947,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         native_single_emit(kp, perceus_decls, nvariants, nfns, bmode, obj_path, path, ncore_names,
                                            if pruned { core_hit } else { None },
                                            NCoreCfg { dir: core_cache.dir, toolchain: core_cache.toolchain,
-                                                      edition: edition, tag: llvm_backend_tag(), srcs_hex: nsrcs,
+                                                      edition: edition_key_text(edition), tag: llvm_backend_tag(), srcs_hex: nsrcs,
                                                       stats: core_cache.stats, pre: npre })
                       }
                       else if use_native_modular {

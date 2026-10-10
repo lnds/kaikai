@@ -3056,7 +3056,9 @@ fn emit_record_lit(src: String, fields: [FieldInit], cx: EmitCtx) : String / Con
 
 # ---- match: pattern test + bind emission ----
 
-fn emit_pat_test(src: String, pat: Pattern, scr: String, cx: EmitCtx) : String / Console {
+# `root` holds while `scr` is the match's own scrutinee, not a cell
+# reached from it: only the scrutinee's slots are hoisted.
+fn emit_pat_test(src: String, pat: Pattern, scr: String, root: Bool, cx: EmitCtx) : String / Console {
 
   match pat.pkind {
     PWild -> "1"
@@ -3066,13 +3068,13 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, cx: EmitCtx) : String /
     PRange(_, _) -> "1"
     PLit(e) -> emit_pat_test_lit(src, e, scr, cx)
     PList(pats, opt_rest) -> emit_pat_test_list(src, pats, opt_rest, scr, cx)
-    PVariant(hm, name, subs) -> emit_pat_test_variant(src, hm, name, subs, scr, cx)
+    PVariant(hm, name, subs) -> emit_pat_test_variant(src, hm, name, subs, scr, root, cx)
     PVariantRecord(hm, name, fields) -> emit_pat_test_variant_record(src, ty_ref_qual(hm), name, fields, scr, cx)
     PRecord(fields) -> emit_pat_test_record(src, fields, scr, cx)
     PHole(_) -> "1"
     # m7d §14: `name @ sub` matches iff `sub` matches; the binding
     # is performed by emit_pat_binds.
-    PAs(_, sub) -> emit_pat_test(src, sub, scr, cx)
+    PAs(_, sub) -> emit_pat_test(src, sub, scr, root, cx)
     # issue #187 phase 3: PNarrow is rewritten to PAs+PVariant in
     # synth_match before codegen runs; this arm only fires if a
     # `match` outside the typer's scope reaches codegen with a raw
@@ -3123,7 +3125,7 @@ fn emit_pat_test_list_loop(src: String, pats: [Pattern], has_rest: Bool,
     let head = cat2(cur, "->as.cons.head")
     let tail = cat2(cur, "->as.cons.tail")
     let pi = list_nth(pats, i)
-    let head_test = emit_pat_test(src, pi, head, cx)
+    let head_test = emit_pat_test(src, pi, head, false, cx)
     let cons_guard = concat_all(["kai_seq_norm(", cur, ") && ", cur, "->tag == KAI_CONS"])
     concat_all([
       cons_guard, " && ", head_test, " && ",
@@ -3186,7 +3188,7 @@ fn emit_variant_tag_test(scr: String, home: Option[String], name: String,
 }
 
 fn emit_pat_test_variant(src: String, home: Option[String], name: String,
-                         subs: [Pattern], scr: String, cx: EmitCtx) : String / Console {
+                         subs: [Pattern], scr: String, root: Bool, cx: EmitCtx) : String / Console {
 
   let base = concat_all(["(", scr, " && ",
                          emit_variant_tag_test_arity(scr, home, name, list_length(subs), cx.variants)])
@@ -3197,7 +3199,7 @@ fn emit_pat_test_variant(src: String, home: Option[String], name: String,
     Some(ts) -> ts
     None     -> []
   }
-  cat3(base, emit_pat_test_variant_subs(src, subs, tys, scr, 0, cx), ")")
+  cat3(base, emit_pat_test_variant_subs(src, subs, tys, scr, root, 0, cx), ")")
 }
 
 # A boxed view of slot `i` for a pattern test: the alias for a pointer slot,
@@ -3231,17 +3233,17 @@ fn emit_enum_slot_test(scr: String, i: Int, sp: Pattern, cx: EmitCtx) : String =
   }
 
 # The C expression for the pointer sub-cell at slot `i` off `scr`. When
-# `scr` is the match scrutinee `_scr` and slot i has been hoisted to a
+# `scr` is the match scrutinee (`root`) and slot i has been hoisted to a
 # local (cx.hoisted), spell the local `_hs<i>` — sharing the dependent
 # load across the separate `if`-arms. Otherwise the inline slot deref.
-fn sub_scr_expr(scr: String, i: Int, cx: EmitCtx) : String =
-  if scr == "_scr" and hoist_slot_member(cx.hoisted, i) {
+fn sub_scr_expr(scr: String, root: Bool, i: Int, cx: EmitCtx) : String =
+  if root and hoist_slot_member(cx.hoisted, i) {
     concat_all(["_hs", int_to_string(i)])
   } else {
     concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].ptr"])
   }
 
-fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [Int], scr: String, i: Int,
+fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [Int], scr: String, root: Bool, i: Int,
                               cx: EmitCtx) : String / Console {
 
   match subs {
@@ -3266,13 +3268,13 @@ fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [Int], scr: Str
         } else {
           let sub_scr =
             if k == 0 {
-              sub_scr_expr(scr, i, cx)
+              sub_scr_expr(scr, root, i, cx)
             } else {
               slot_read_for_test(scr, i, tys)
             }
-          emit_pat_test(src, sp, sub_scr, cx)
+          emit_pat_test(src, sp, sub_scr, false, cx)
         }
-      concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, tys, scr, i + 1, cx)])
+      concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, tys, scr, root, i + 1, cx)])
     }
   }
 }
@@ -3311,7 +3313,7 @@ fn emit_pat_test_record_fields(src: String, fields: [PField], scr: String,
         # per field tested. emit_pat_binds (below, line 8334) still
         # uses kai_op_field; matched arms keep owned bindings.
         let tmp = concat_all(["kai_op_field_borrow(", scr, ", \"", name, "\")"])
-        let t = emit_pat_test(src, sub, tmp, cx)
+        let t = emit_pat_test(src, sub, tmp, false, cx)
         concat_all([" && (", t, ")", emit_pat_test_record_fields(src, rest, scr, cx)])
       }
     }
@@ -3349,7 +3351,7 @@ fn emit_pat_test_variant_record(src: String, home: Option[String], name: String,
 # decref'd at exit must not free a value still pointed at by the original
 # scrutinee's variant slot — landed in the m5.x runtime flip
 # (atomic A+B+C+D, 2026-04-28); see `git log` if archaeology is needed.
-fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
+fn emit_pat_binds(src: String, pat: Pattern, scr: String, root: Bool, is_alias: Bool,
                   cx: EmitCtx) : String {
   match pat.pkind {
     PWild ->
@@ -3374,7 +3376,7 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
         Some(ts) -> ts
         None     -> []
       }
-      emit_pat_binds_variant(src, subs, tys, scr, 0, cx)
+      emit_pat_binds_variant(src, subs, tys, scr, root, 0, cx)
     }
     PVariantRecord(_, _, fields) -> emit_pat_binds_record(src, fields, scr, cx)
     PRecord(fields) -> emit_pat_binds_record(src, fields, scr, cx)
@@ -3390,7 +3392,7 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
       } else {
         concat_all(["KaiValue *", c_local(name), " = ", scr, "; "])
       }
-      cat2(head_bind, emit_pat_binds(src, sub, scr, true, cx))
+      cat2(head_bind, emit_pat_binds(src, sub, scr, root, true, cx))
     }
     # issue #187 phase 3: defensive arm; PNarrow is rewritten to
     # PAs+PVariant before codegen. If reached, bind the name like
@@ -3416,7 +3418,7 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
       let head = cat2(cur, "->as.cons.head")
       let tail = cat2(cur, "->as.cons.tail")
       # cons.head / cons.tail are aliases of cur's storage.
-      cat2(emit_pat_binds(src, p, head, true, cx),
+      cat2(emit_pat_binds(src, p, head, false, true, cx),
            emit_pat_binds_list(src, rest, opt_rest, tail, i + 1, cx))
     }
   }
@@ -3489,7 +3491,7 @@ fn kind1_slot_decls(names: [String], scr: String, i: Int) : String = match names
                                "].i64; (void) kair_", nm, "; ", kind1_slot_decls(rest, scr, i)])
 }
 
-fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String, i: Int,
+fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String, root: Bool, i: Int,
                           cx: EmitCtx) : String {
   match subs {
     [] -> ""
@@ -3504,18 +3506,18 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String,
       # decref needed at arm exit because no extra ref was taken.
       let k = kind_at(tys, i)
       if k == 0 {
-        let sub_scr = sub_scr_expr(scr, i, cx)
+        let sub_scr = sub_scr_expr(scr, root, i, cx)
         # variant arg slot is alias of scr's storage.
-        cat2(emit_pat_binds(src, sp, sub_scr, true, cx),
-             emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx))
+        cat2(emit_pat_binds(src, sp, sub_scr, false, true, cx),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx))
       } else if k == 3 {
         # Enum slot: re-intern the immediate tag into its singleton
         # KaiValue*. The singleton is immortal (rc==INT32_MAX), so the
         # binding is alias-shaped — PBind needs no incref, PWild no
         # decref (decref of an immortal is a no-op either way).
         let sub_scr = concat_all(["kai_enum_slot_box(", "kai_var_slots(", scr, ")[", int_to_string(i), "].i64)"])
-        cat2(emit_pat_binds(src, sp, sub_scr, true, cx),
-             emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx))
+        cat2(emit_pat_binds(src, sp, sub_scr, false, true, cx),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx))
       } else if pat_binds_nothing(sp) {
         # Scalar slot (Int / Real) whose sub-pattern binds nothing
         # (PWild or `_`-prefixed PBind). An unboxed scalar carries no
@@ -3524,20 +3526,20 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String,
         # (immediate under tagged-Int, but still two calls); post-FAM,
         # with malloc no longer the bottleneck, eliding it removes
         # ~18M no-op calls from the rb-tree's is_red hot path.
-        emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx)
+        emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx)
       } else if k == 1 {
         # The raw read takes no ref: a kind-1 slot carries no RC.
         let names = kind1_slot_binders(sp)
         cat2(kind1_slot_decls(names, scr, i),
-             emit_pat_binds_variant(src, rest, tys, scr, i + 1,
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1,
                                     emit_ctx_with_kind1_raw(cx, list_append(names, cx.kind1_raw))))
       } else {
         let sub_scr = concat_all(["kai_real(", "kai_var_slots(", scr, ")[", int_to_string(i), "].r)"])
         # The primitive slot read allocates a fresh boxed temp; the
         # bind owns it (is_alias=false) so PBind takes the ref
         # directly without an incref, PWild releases it, etc.
-        cat2(emit_pat_binds(src, sp, sub_scr, false, cx),
-             emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx))
+        cat2(emit_pat_binds(src, sp, sub_scr, false, false, cx),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx))
       }
     }
   }
@@ -3565,7 +3567,7 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
         if pat_is_destructuring(sub) {
           let tname = concat_all(["_pf_", int_to_string(sub.line), "_",
                                     int_to_string(sub.col)])
-          let inner = emit_pat_binds(src, sub, tname, true, cx)
+          let inner = emit_pat_binds(src, sub, tname, false, true, cx)
           cat2(
             concat_all([
               "KaiValue *", tname, " = kai_op_field(", scr, ", \"", name, "\"); ",
@@ -3576,7 +3578,7 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
         } else {
           let tmp = concat_all(["kai_op_field(", scr, ", \"", name, "\")"])
           # kai_op_field returns an incref'd value; child is owned.
-          cat2(emit_pat_binds(src, sub, tmp, false, cx),
+          cat2(emit_pat_binds(src, sub, tmp, false, false, cx),
                emit_pat_binds_record(src, rest, scr, cx))
         }
       }
@@ -3697,7 +3699,7 @@ fn reuse_held_cx(cx: EmitCtx, f: String, t: String) : EmitCtx = emit_ctx_with_tc
 fn cons_slot_bind(src: String, head_pat: Pattern, slot: String, read: Bool, own: Bool, cx: EmitCtx) : String = match head_pat.pkind {
   PBind(hn) -> if read { reuse_slot_decl(hn, concat_all(["_scr->as.cons.", slot]), own) } else { "" }
   PWild     -> ""
-  _         -> emit_pat_binds(src, head_pat, concat_all(["_scr->as.cons.", slot]), true, cx)
+  _         -> emit_pat_binds(src, head_pat, concat_all(["_scr->as.cons.", slot]), false, true, cx)
 }
 
 # Emit a single reuse-arm with the dual-path layout. Pre-condition: the
@@ -4143,7 +4145,7 @@ fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int,
           else if k == 2 { concat_all(["KaiValue *", c_local(nm), " = kai_real(", slot, ".r); "]) }
           else if k == 3 { concat_all(["KaiValue *", c_local(nm), " = kai_enum_slot_box(", slot, ".i64); "]) }
           else { concat_all(["KaiValue *", c_local(nm), " = ", slot, ".ptr; "]) }
-        _ -> if k == 0 { emit_pat_binds(src, sp, concat_all([slot, ".ptr"]), true, cx) } else { "" }
+        _ -> if k == 0 { emit_pat_binds(src, sp, concat_all([slot, ".ptr"]), false, true, cx) } else { "" }
       }
       cat2(here, emit_arm_borrow_binds(src, rest, tys, i + 1, cx))
     }
@@ -4461,7 +4463,7 @@ fn rv_slot_binds(src: String, subs: [Pattern], tys: [Int], i: Int, borrow: Bool,
         PBind(nm) ->
           if k == 0 and not borrow { concat_all(["KaiValue *", c_local(nm), " = kai_incref(", slot, ".ptr); "]) }
           else { rv_bind(nm, k, slot) }
-        _ -> if reuse_is_cell(sp, k) { rv_cell_binds(sp, sub_scr_expr("_scr", i, cx), cx.variants) } else { "" }
+        _ -> if reuse_is_cell(sp, k) { rv_cell_binds(sp, sub_scr_expr("_scr", true, i, cx), cx.variants) } else { "" }
       }
       cat2(here, rv_slot_binds(src, rest, tys, i + 1, borrow, cx))
     }
@@ -4718,7 +4720,7 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
 
   match a {
     Arm(pat, opt_guard, body) -> {
-      let pt = emit_pat_test(src, pat, "_scr", cx)
+      let pt = emit_pat_test(src, pat, "_scr", true, cx)
       # The arm's guard and body see this pattern's bound names as
       # locals, so an `EVar(p)` with `p` matching a pattern binder
       # (e.g. `match xs { [drop, ...rest] -> drop }` where `drop` is
@@ -4756,7 +4758,7 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
             # it after this one's pat_test/guard rejects, and a guard inside
             # this arm may consume the binding (e.g. const-pattern desugar's
             # `__cv_NAME == NAME()`). Treat as alias so PBind increfs.
-            let binds = cat2(emit_pat_binds(src, pat, "_scr", true, cx),
+            let binds = cat2(emit_pat_binds(src, pat, "_scr", true, true, cx),
                              pbind_raw_alias(pat, "_scr", scr_ty))
             # A tcrec goto in the body leaves every enclosing match
             # statement-expression, skipping the post-do-while
@@ -4785,7 +4787,7 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
           }
         }
         Some(g) -> {
-          let binds = cat2(emit_pat_binds(src, pat, "_scr", true, cx),
+          let binds = cat2(emit_pat_binds(src, pat, "_scr", true, true, cx),
                            pbind_raw_alias(pat, "_scr", scr_ty))
           let bcx = emit_ctx_tcpend_after(tcp_arm_body_cx(emit_unw_owning(pat, arm_cx), scr_alias, pat, body, cx), g)
           let body_c = emit_expr(src, body, bcx)
@@ -5265,12 +5267,12 @@ fn emit_match_arms_raw(src: String, arms: [Arm], scr_alias: Option[String], scr_
 # so an arm reading a payload sees the same `kair_<n>` / `kaiv_<n>` locals.
 fn emit_match_arm_raw(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option[Ty], cx: EmitCtx) : String / Console = match a {
   Arm(pat, opt_guard, body) -> {
-    let pt = emit_pat_test(src, pat, "_scr", cx)
+    let pt = emit_pat_test(src, pat, "_scr", true, cx)
     let arm_lcs = list_append(cx.lcs, pat_binders(pat, []))
     let arm_cx0 = emit_unw_owning(pat, emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
                                           list_append(cx.kind1_raw, pat_kind1_binders(pat, cx, []))))
     let arm_cx = tcp_arm_body_cx(arm_cx0, scr_alias, pat, body, cx)
-    let binds = cat2(emit_pat_binds(src, pat, "_scr", true, cx),
+    let binds = cat2(emit_pat_binds(src, pat, "_scr", true, true, cx),
                      pbind_raw_alias(pat, "_scr", scr_ty))
     # A divergent arm (`panic`/`exit`) never assigns `_r` — emit the
     # call boxed (it aborts) and `break`. Without this, `emit_expr_raw`
@@ -5687,7 +5689,8 @@ fn emit_lam_forward_decls(lams: [LamInfo]) : String =
 
 fn emit_clause_sig(c: ClauseInfo, effs: [Decl]) : String {
   match c {
-    CI(line, col, eff, op_name, params, _, _, enc_fn, _, _, _) -> {
+    CI(line, col, eff, head, params, _, _, enc_fn, _, _, _) -> {
+      let op_name = clause_head_word(head)
       let op_args = op_args_only(params)
       let arg_str = match op_args {
         [] -> ""
@@ -5703,8 +5706,8 @@ fn emit_clause_sig(c: ClauseInfo, effs: [Decl]) : String {
 
 fn emit_clause_forward(c: ClauseInfo, effs: [Decl]) : String =
   match c {
-    CI(line, col, _, op_name, cps, _, _, enc_fn, _, _, _) ->
-      if is_lifecycle_clause(op_name, cps) {
+    CI(line, col, _, head, _, _, _, enc_fn, _, _, _) ->
+      if is_lifecycle_clause(head) {
         cat2(emit_cleanup_sig(enc_fn, line, col), ";\n")
       } else { cat2(emit_clause_sig(c, effs), ";\n") }
   }
@@ -5826,8 +5829,8 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
 fn emit_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Console {
 
   match c {
-    CI(_, _, _, op_name, cps, _, _, _, _, _, _) ->
-      if is_lifecycle_clause(op_name, cps) { emit_cleanup_thunk(src, c, cx) }
+    CI(_, _, _, head, _, _, _, _, _, _, _) ->
+      if is_lifecycle_clause(head) { emit_cleanup_thunk(src, c, cx) }
       else { emit_op_clause_body(src, c, cx) }
   }
 }
@@ -7588,7 +7591,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, key: String, init_opt:
   # `finally { }`: armed on the node so every unwind path runs it, and
   # called explicitly on the normal exit (which never touches the node).
   # `cleanup_done` makes the pair idempotent when both fire.
-  let fin_c = match find_hclause(clauses, "finally") {
+  let fin_c = match find_finally_clause(clauses) {
     Some(_) -> {
       let thunk = user_cleanup_sym(enc, hline, hcol)
       Cleanup {
@@ -7652,14 +7655,14 @@ fn emit_unw_handle(hsite: Int, stateful: Bool, cx: EmitCtx) : UnwHandleC =
   }
 
 # The lifecycle `finally { }` only — an op clause that happens to be named
-# `finally` carries params and is not one.
-fn find_hclause(cs: [HClause], name: String) : Option[HClause] {
+# `finally` is not one.
+fn find_finally_clause(cs: [HClause]) : Option[HClause] {
   match cs {
     [] -> None
     [c, ...rest] -> match c {
-      HC(n, ps, _, _, _) ->
-        if n == name and is_lifecycle_clause(n, ps) { Some(c) }
-        else { find_hclause(rest, name) }
+      HC(h, _, _, _, _) ->
+        if is_lifecycle_clause(h) { Some(c) }
+        else { find_finally_clause(rest) }
     }
   }
 }
@@ -7766,12 +7769,13 @@ fn emit_clause_assignments(eff_name: String, cs: [HClause],
   match cs {
     [] -> ""
     [c, ...rest] -> match c {
-      HC(op_name, cps, _, _, _) ->
+      HC(head, _, _, _, _) ->
         # `finally` is not an op: it has no `Ev` slot and is wired to the
         # evidence node instead.
-        if is_lifecycle_clause(op_name, cps) {
+        if is_lifecycle_clause(head) {
           emit_clause_assignments(eff_name, rest, enc, hline, hcol)
         } else {
+          let op_name = clause_head_word(head)
           concat_all([
             "_ev.", op_name, " = &", user_clause_sym(enc, hline, hcol, op_name), "; ",
             emit_clause_assignments(eff_name, rest, enc, hline, hcol)
@@ -7946,7 +7950,7 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       let rhs_c = emit_expr(src, rhs, cx)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
-      let binds = emit_pat_binds(src, pat, tmp, true, cx)
+      let binds = emit_pat_binds(src, pat, tmp, false, true, cx)
       concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds, "kai_decref(", tmp, "); "])
     }
   }
@@ -10148,7 +10152,8 @@ fn effect_has_default_block(eff_name: String, decls: [Decl]) : Bool =
 # whatever they retain, so without the release here the argument is orphaned.
 fn default_shim_from_clause(eff_name: String, ev_n: String, c: HClause) : String =
   match c {
-    HC(op_name, params, body, _, _) -> {
+    HC(head, params, body, _, _) -> {
+      let op_name = clause_head_word(head)
       let csym_opt = extern_handler_c_symbol(body)
       match csym_opt {
         None        -> ""
@@ -10180,9 +10185,10 @@ fn default_shim_from_clause(eff_name: String, ev_n: String, c: HClause) : String
 # Returns "" when the clause is not an extern_handler bridge.
 fn default_setup_assign_from_clause(eff_name: String, c: HClause) : String =
   match c {
-    HC(op_name, _, body, _, _) -> match extern_handler_c_symbol(body) {
+    HC(head, _, body, _, _) -> match extern_handler_c_symbol(body) {
       None    -> ""
       Some(_) -> {
+        let op_name = clause_head_word(head)
         let eff_lc = string_to_lower_ascii(eff_name)
         concat_all([
           "    _kai_default_ev_", eff_lc, ".", op_name,

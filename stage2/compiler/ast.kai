@@ -323,6 +323,9 @@ pub type Mark = MkFuseMissing | MkScrutinee | MkGuardDrop | MkBorrow
   | MkDup | MkReuseCons | MkReuseVariant | MkReuseRecord
   | MkFixedVecLit | MkFixedVecGet | MkFixedVecGetDyn
   | MkTcrecStep(TcrecStep) | MkTrmcStep(TrmcStep)
+  # A `region { }` block as the parser read it: called on the block, or
+  # on a one-parameter lambda that names the region.
+  | MkRegion
 
 #[doc("A compiler-internal operation, written `$name(args)`. The set is closed because this compiler implements every one of them; `compiler.intrinsics` holds the spelling each has after the `$`.")]
 #[derive(BinSerialize)]
@@ -607,6 +610,9 @@ pub type PatSurface
   # A match-arm narrowing `name : Base where pred`; dissolves to
   # `PBind(name)` plus a guard evaluating the refinement's predicate.
   | PsRefine(String, TypeExpr)
+  # A list pattern whose rest binds nothing: `[a, ...]`, or `[a, ..._]`
+  # when the flag is set. Lowering names the rest with a unique binder.
+  | PsAnonRest([Pattern], Bool)
 
 #[doc("Child types of a type-surface form; order is shared with `tysurface_rebuild`.")]
 pub fn tysurface_children(ts: TypeSurface) : [TypeExpr] = match ts {
@@ -629,6 +635,7 @@ pub fn patsurface_children(ps: PatSurface) : [Pattern] = match ps {
   PsQualified(_, sub)  -> [sub]
   PsAs(_, sub)         -> [sub]
   PsRefine(_, _)       -> []
+  PsAnonRest(pats, _)  -> pats
 }
 
 #[doc("Rebuild a pattern-surface form from a transformed child list in `patsurface_children` order.")]
@@ -643,6 +650,7 @@ pub fn patsurface_rebuild(ps: PatSurface, xs: [Pattern]) : PatSurface = match ps
     _           -> panic("patsurface_rebuild: child list does not match the form")
   }
   PsRefine(_, _) -> ps
+  PsAnonRest(_, wild) -> PsAnonRest(xs, wild)
 }
 
 #[doc("Child expressions of a surface form, left to right; order is shared with `surface_rebuild`.")]
@@ -845,12 +853,11 @@ pub type PatKind
   # fresh <= hi` guard before the typer, so nothing past desugar handles it.
   | PRange(Expr, Expr)
   | PBind(String)
-  # Fixed sub-patterns plus optional rest binder. The rest slot stores
-  # the SOURCE spelling: `Some("")` for bare `...`, `Some("_")` for
-  # `..._`, `Some(name)` for `...name`, `None` for no rest.
-  # `surface_lower_decls` replaces the two anonymous spellings with a
-  # unique `__list_rest_<line>_<col>__` sentinel, so every pass after
-  # it sees a real binder name.
+  # Fixed sub-patterns plus optional rest binder: `Some(name)` for
+  # `...name`, `None` for no rest. An anonymous rest (`...`, `..._`)
+  # parses as `PsAnonRest`; `surface_lower_decls` gives it a unique
+  # `__list_rest_<line>_<col>__` binder, so every pass after it sees
+  # a real binder name.
   | PList([Pattern], Option[String])
   # Home slot: the module the pattern was qualified with, `None` when
   # written bare. Kept through every pass so a written qualifier is
@@ -992,11 +999,29 @@ pub fn tp_shape_suffix() : String = "#Shape"
 #[doc("Name of the built-in abelian kind (`Measure`) that the `unit` keyword introduces habitants into.")]
 pub fn measure_kind_name() : String = "Measure"
 
-# Handler clause (op): `op_name(args..., resume) -> body`. The
-# resume binding is conventionally the last param; m7a #4d will
-# validate. m7a #4b stores the param list verbatim.
+# Handler clause: `op_name(args..., resume) -> body`, the resume
+# binding conventionally the last param, or a lifecycle clause
+# `finally { body }`, which carries no params.
 #[derive(BinSerialize)]
-pub type HClause = HC(String, [Param], Expr, Int, Int)
+pub type HClause = HC(ClauseHead, [Param], Expr, Int, Int)
+
+#[doc("What a handler clause handles: an operation of the effect, by name, or one end of the handler's own lifetime. The parser decides which, so an effect stays free to declare an op called `initially` or `finally`.")]
+#[derive(BinSerialize)]
+pub type ClauseHead = ChOp(String) | ChInitially | ChFinally
+
+#[doc("The word a clause is headed by: the operation's name, or the lifecycle keyword.")]
+pub fn clause_head_word(h: ClauseHead) : String = match h {
+  ChOp(n)     -> n
+  ChInitially -> "initially"
+  ChFinally   -> "finally"
+}
+
+#[doc("The lifecycle clause a keyword opens, or `None` for any other word.")]
+pub fn clause_lifecycle_of_word(w: String) : Option[ClauseHead] = match w {
+  "initially" -> Some(ChInitially)
+  "finally"   -> Some(ChFinally)
+  _           -> None
+}
 
 # Optional `return(x) -> expr` clause inside a handle. `pname` is
 # the parameter name bound inside `body`.
@@ -1265,8 +1290,25 @@ pub type UnitBody = UBNone | UBAlias(UnitExprT) | UBMeasure(String)
 pub type KindHab
   = HabNone
   | HabIntro(String)
-  | HabDomain(String)
+  | HabDomain(ValueDomain)
   | HabClosed(String, [String])
+
+#[doc("The domain of a value-habitant kind: its habitants are the literals of this type, written directly in `<>`.")]
+#[derive(BinSerialize)]
+pub type ValueDomain = VdInt | VdString
+
+#[doc("The value domain a type name spells after a kind's `with`, or `None` when it spells none.")]
+pub fn value_domain_of_name(n: String) : Option[ValueDomain] = match n {
+  "Int"    -> Some(VdInt)
+  "String" -> Some(VdString)
+  _        -> None
+}
+
+#[doc("The type name a value domain is written as.")]
+pub fn value_domain_name(d: ValueDomain) : String = match d {
+  VdInt    -> "Int"
+  VdString -> "String"
+}
 
 #[doc("The introducer word a `KindHab` registers for habitant declarations, or empty when the form declares none (`HabNone`, `HabDomain`).")]
 pub fn kind_hab_intro(h: KindHab) : String = match h {

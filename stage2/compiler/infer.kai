@@ -14,6 +14,7 @@ import compiler.core_shadow_diag
 import compiler.util
 import compiler.chars
 import compiler.diag
+import compiler.edition
 import compiler.ast
 import compiler.operators
 import compiler.type_stamp
@@ -1803,7 +1804,7 @@ fn walk_field_priv_clauses(file: String, home: TyHomeView,
 fn handle_clause_op_names(cs: [HClause]) : [String] = match cs {
   []           -> []
   [c, ...rest] -> match c {
-    HC(name, _, _, _, _) -> [name, ...handle_clause_op_names(rest)]
+    HC(h, _, _, _, _) -> [clause_head_word(h), ...handle_clause_op_names(rest)]
   }
 }
 
@@ -1867,9 +1868,9 @@ fn edop_get(table: [EffDefaultOps], id: Int) : [String] = match table {
 fn extern_handler_op_names(cs: [HClause]) : [String] = match cs {
   []           -> []
   [c, ...rest] -> match c {
-    HC(name, _, body, _, _) -> match extern_handler_c_symbol(body) {
+    HC(h, _, body, _, _) -> match extern_handler_c_symbol(body) {
       None    -> extern_handler_op_names(rest)
-      Some(_) -> [name, ...extern_handler_op_names(rest)]
+      Some(_) -> [clause_head_word(h), ...extern_handler_op_names(rest)]
     }
   }
 }
@@ -2317,17 +2318,6 @@ fn describe_default_status(eff_name: String, op_name: String,
 # the resolver picks the global fn over the let-binding, emitting the
 # expression as a closure reference instead of a string read. Use
 # `csym_name` or similar to dodge the collision.
-
-#[doc("Numeric rank of an edition name, for `>=` ordering. Unknown names rank as the oldest edition.")]
-pub fn edition_rank(n: String) : Int =
-  if n == "orongo" { 2 }
-  else if n == "hanga-roa" { 1 }
-  else if n == "tongariki" { 0 }
-  else { 0 }
-
-
-fn edition_at_least(have: String, target: String) : Bool =
-  edition_rank(have) >= edition_rank(target)
 
 # register a `[unstable] <pkg> = true` opt-in from
 # kai.toml. Repeated flags accumulate.
@@ -9197,15 +9187,16 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
   match cs {
     [] -> ClausesTyped { st: st, clauses: list_reverse(acc) }
     [c, ...rest] -> match c {
-      HC(op_name, params, body, line, col) ->
-        if is_lifecycle_clause(op_name, params) {
-          let ft = check_finally_clause(st, op_name, params, body, line, col,
+      HC(head, params, body, line, col) ->
+        if is_lifecycle_clause(head) {
+          let ft = check_finally_clause(st, head, params, body, line, col,
                                          stateful, state_ty)
           check_clauses_types_loop(ft.st, eff_name, rest, stateful, state_ty,
                                     eff_tyargs, result_ty, [ft.clause, ...acc])
         } else {
       {
         let outer = st
+        let op_name = clause_head_word(head)
         # clause shape: the clause's positional parameter
         # count must equal the op's declared arity plus one (the
         # trailing `resume`). Without this check `print_io(s) -> 0`
@@ -9252,7 +9243,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # discarding `rb.expr` was the bug behind the `kai_Console`
         # leak in `demos/concurrent` — handler-clause bodies kept the
         # original `EField(EVar("Console"), "print")` shape.
-        let new_clause = HC(op_name, params, rb.expr, line, col)
+        let new_clause = HC(head, params, rb.expr, line, col)
         check_clauses_types_loop(st_out, eff_name, rest, stateful, state_ty,
                                   eff_tyargs, result_ty, [new_clause, ...acc])
       }
@@ -9269,7 +9260,7 @@ type ClauseTyped1 = { st: InferState, clause: HClause }
 # runtime loop. It carries no params and its value is discarded, so it
 # is checked against `Unit`. A stateful handler exposes `state`, which is
 # what connects an `initially`-acquired resource to its release.
-fn check_finally_clause(st: InferState, name: String, params: [Param], body: Expr,
+fn check_finally_clause(st: InferState, head: ClauseHead, params: [Param], body: Expr,
                         line: Int, col: Int, stateful: Bool,
                         state_ty: Option[Ty]) : ClauseTyped1 / Console + File + Mutable {
 
@@ -9277,7 +9268,7 @@ fn check_finally_clause(st: InferState, name: String, params: [Param], body: Exp
     [] -> st
     _  -> {
       let perr = mk_diag(SevError, st.file, line, col,
-        string_concat("`", string_concat(name, " { }` takes no parameters")), [])
+        string_concat("`", string_concat(clause_head_word(head), " { }` takes no parameters")), [])
       render_diag(perr)
       diag_note("`finally` runs for its effect only; use `return(x) -> ...` to transform the result")
       st_bump_err(st_push_diag(st, perr))
@@ -9288,7 +9279,7 @@ fn check_finally_clause(st: InferState, name: String, params: [Param], body: Exp
   let env1 = if stateful { add_state_aliases(outer.env, outer.env, sty) } else { outer.env }
   let rb = synth(st_clause_alias_tags(st_set_env(outer, env1)), body)
   let st_out = st_restore_entries(outer, rb.st)
-  ClauseTyped1 { st: st_out, clause: HC(name, params, rb.expr, line, col) }
+  ClauseTyped1 { st: st_out, clause: HC(head, params, rb.expr, line, col) }
 }
 
 # bind clause params; also returns the answer type recovered
@@ -9490,9 +9481,10 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
   match cs {
     [] -> st
     [c, ...rest] -> match c {
-      HC(name, cparams, _, cline, ccol) -> {
+      HC(head, _, _, cline, ccol) -> {
+        let name = clause_head_word(head)
         let key = string_concat(eff, string_concat(".", name))
-        if is_lifecycle_clause(name, cparams) {
+        if is_lifecycle_clause(head) {
           check_clause_names(st, eff, rest, line, col)
         } else {
         match ty_env_lookup(st.env, key) {
@@ -9515,18 +9507,15 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
   }
 }
 
-# `finally` is a handler lifecycle clause, not an op of the effect.
-# (`initially` never reaches the typer — the parser lifts it into the
-# handler-state slot.)
-pub fn is_lifecycle_clause_name(name: String) : Bool = name == "finally"
-
-# The lifecycle form is `finally { }` — parsed with NO params, where an op
-# clause always carries at least `resume`. Keying on the shape, not the
-# name alone, is what lets an effect still declare an op called `finally`
-# and handle it as `finally(v, resume) -> ...`.
-pub fn is_lifecycle_clause(name: String, params: [Param]) : Bool =
-  if is_lifecycle_clause_name(name) { match params { [] -> true _ -> false } }
-  else { false }
+# `initially { }` never reaches a handle past the parser, which lifts it
+# into the handler-state slot; anywhere else it reads as a clause for an
+# op of that name.
+#[doc("True for `finally { }`, the handler lifecycle clause: it is not an op of the effect.")]
+pub fn is_lifecycle_clause(h: ClauseHead) : Bool = match h {
+  ChFinally   -> true
+  ChInitially -> false
+  ChOp(_)     -> false
+}
 
 # verify a handler clause's positional parameter count
 # matches the op signature plus one for `resume`. Unknown ops fall
@@ -12958,15 +12947,14 @@ pub fn head_owner_seed() : [HeadOwnerEntry] = [HOE("List", ["list"])]
 
 #[doc("infer: `build_head_owner_map` — typer entry point invoked by the driver.")]
 pub fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
-                         target_mod: String, edition: String) : [HeadOwnerEntry] {
+                         target_mod: String, edition: Edition) : [HeadOwnerEntry] {
   # gate the convention-based pipe dispatch on
   # edition >= hanga-roa. Pre-hanga-roa (tongariki) packages keep only
   # the seeded `List → list` mapping. User `pub type` heads
   # therefore route through the bare-name fallback in
   # `synth_pipe_dispatch` ("no module declaring type `T` is in scope"
-  # via HLNone). An empty edition string also falls into the
-  # tongariki branch.
-  let walk_user_types = edition_at_least(edition, "hanga-roa")
+  # via HLNone).
+  let walk_user_types = edition_at_least(edition, EdHangaRoa)
   if walk_user_types {
     let pub_type_names = collect_pub_type_names(decls, [])
     # Filter out the target file's ME from the dispatch search. The
@@ -16712,7 +16700,7 @@ fn fixed_vec_hab(hab: UnitExprT, n: Int) : FixedVecHab = match hab {
   UOne -> if n == 1 { FVOk(UOne) } else { FVLen(1) }
   USym(s) -> {
     let bare = kind_sym_bare(s)
-    if unit_sym_value_domain(bare) == "Int" {
+    if unit_sym_is_int_value(bare) {
       if decode_int(bare) == n { FVOk(hab) } else { FVLen(decode_int(bare)) }
     } else { FVCarrier }
   }
@@ -19553,12 +19541,12 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
 
 # A contract predicate is synthesised against an empty row, so what it
 # performs is its own and not hidden by the enclosing body's effects.
-fn synth_assert_cond(st: InferState, cond: Expr, kind: Option[String]) : Inferred / Console + File + Mutable =
+fn synth_assert_cond(st: InferState, cond: Expr, kind: Option[ContractKind]) : Inferred / Console + File + Mutable =
   match kind {
     None    -> synth(st, cond)
     Some(k) -> {
       let r = synth(InferState { ...st, row: [], eff_uses: [] }, cond)
-      let st1 = reject_predicate_effect(r.st, k, r.st.row, cond)
+      let st1 = reject_predicate_effect(r.st, contract_kind_word(k), r.st.row, cond)
       Inferred { st: InferState { ...st1, row: st.row, eff_uses: st.eff_uses }, ty: r.ty, expr: r.expr }
     }
   }

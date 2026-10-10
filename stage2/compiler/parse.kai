@@ -2098,7 +2098,7 @@ fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelud
                              clauses: [], return_clause: None, prelude: [], r: None }
                     }
                   } else {
-                    let hc = HC(name, params, body, id_t.line, id_t.col)
+                    let hc = HC(ChOp(name), params, body, id_t.line, id_t.col)
                     parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
                   }
                 }
@@ -2115,20 +2115,24 @@ fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelud
 # handler. Contextual idents, not lexer keywords: an op clause always
 # has `(` after the name, so the `{` lookahead disambiguates and user
 # code may still declare an op called `finally`.
-fn is_lifecycle_clause_at(p: Parser, id_t: Token) : Bool {
-  let name = tok_source(p.src, id_t)
-  if name == "initially" or name == "finally" {
-    p_at(p_skip_newlines(p_advance(p)), TkLbrace)
-  } else { false }
-}
+fn is_lifecycle_clause_at(p: Parser, id_t: Token) : Bool =
+  match clause_lifecycle_of_word(tok_source(p.src, id_t)) {
+    Some(_) -> p_at(p_skip_newlines(p_advance(p)), TkLbrace)
+    None    -> false
+  }
 
 # Both lower to an `HClause` with no params. `initially` is unwrapped by
 # `parse_handle` into the handler-state slot the `(init)` form already
-# fills; `finally` stays in the clause list and is recognised by name.
+# fills; `finally` stays in the clause list under its own head.
 fn parse_lifecycle_clause(p: Parser, id_t: Token, acc: [HClause],
                           rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
 
   let name = tok_source(p.src, id_t)
+  # The caller saw one of the two keywords, so the fallback never runs.
+  let head = match clause_lifecycle_of_word(name) {
+    Some(h) -> h
+    None    -> ChOp(name)
+  }
   let p1 = p_skip_newlines(p_advance(p))
   let bt = p_peek(p1)
   let rb = parse_block(p1, bt)
@@ -2136,13 +2140,13 @@ fn parse_lifecycle_clause(p: Parser, id_t: Token, acc: [HClause],
     None -> PClauses { p: rb.p, clauses: [], return_clause: None,
                        prelude: [], r: None }
     Some(body) ->
-      if lifecycle_clause_seen(acc, name) {
+      if lifecycle_clause_seen(acc, head) {
         PClauses { p: p_error(p, id_t,
                      string_concat("duplicate `",
                        string_concat(name, "` clause in handler"))),
                    clauses: [], return_clause: None, prelude: [], r: None }
       } else {
-        parse_handle_clauses(rb.p, [HC(name, [], body, id_t.line, id_t.col), ...acc],
+        parse_handle_clauses(rb.p, [HC(head, [], body, id_t.line, id_t.col), ...acc],
                              rret, prelude)
       }
   }
@@ -2157,7 +2161,7 @@ fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
 
   # `initially { }` fills the same handler-state slot as the `(init)`
   # form, so the two are mutually exclusive.
-  let init_cl = find_clause_named(cr.clauses, "initially")
+  let init_cl = find_initially_clause(cr.clauses)
   let dup_init = match init_cl { Some(_) -> init_r.has_init None -> false }
   if dup_init {
     err_e(p_error(p4, t, "a handler takes either `(init)` or `initially { }`, not both"))
@@ -2170,7 +2174,7 @@ fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
     }
     let handle_e = mk_expr(
       EHandle(body, eff_name, sym_none(), eff_tyargs, eff_init, alias,
-              drop_clause_named(cr.clauses, "initially"), cr.return_clause),
+              drop_initially_clauses(cr.clauses), cr.return_clause),
       t.line, t.col)
     # A `var` / `let` prelude lifts to a sibling block whose tail is the
     # handler; `desugar_var_block` then wraps each `SVar` in its own
@@ -2182,39 +2186,31 @@ fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: String,
   }
 }
 
-# A lifecycle clause is parsed with no params; an op clause always has at
-# least `resume`. The emptiness check is what keeps an effect free to
-# declare an op called `initially` / `finally`.
-fn list_is_empty_params(ps: [Param]) : Bool = match ps { [] -> true _ -> false }
-
-fn find_clause_named(cs: [HClause], name: String) : Option[HClause] {
-  match cs {
-    [] -> None
-    [c, ...rest] -> match c {
-      HC(n, ps, _, _, _) ->
-        if n == name and list_is_empty_params(ps) { Some(c) }
-        else { find_clause_named(rest, name) }
-    }
+fn find_initially_clause(cs: [HClause]) : Option[HClause] = match cs {
+  [] -> None
+  [c, ...rest] -> match c {
+    HC(ChInitially, _, _, _, _) -> Some(c)
+    _                           -> find_initially_clause(rest)
   }
 }
 
-fn drop_clause_named(cs: [HClause], name: String) : [HClause] {
-  match cs {
-    [] -> []
-    [c, ...rest] -> match c {
-      HC(n, ps, _, _, _) ->
-        if n == name and list_is_empty_params(ps) { drop_clause_named(rest, name) }
-        else { [c, ...drop_clause_named(rest, name)] }
-    }
+fn drop_initially_clauses(cs: [HClause]) : [HClause] = match cs {
+  [] -> []
+  [c, ...rest] -> match c {
+    HC(ChInitially, _, _, _, _) -> drop_initially_clauses(rest)
+    _                           -> [c, ...drop_initially_clauses(rest)]
   }
 }
 
-fn lifecycle_clause_seen(acc: [HClause], name: String) : Bool {
-  match acc {
-    [] -> false
-    [HC(n, _, _, _, _), ...rest] ->
-      if n == name { true } else { lifecycle_clause_seen(rest, name) }
-  }
+fn lifecycle_clause_seen(acc: [HClause], head: ClauseHead) : Bool = match acc {
+  [] -> false
+  [HC(h, _, _, _, _), ...rest] -> same_lifecycle(h, head) or lifecycle_clause_seen(rest, head)
+}
+
+fn same_lifecycle(a: ClauseHead, b: ClauseHead) : Bool = match a {
+  ChInitially -> match b { ChInitially -> true  _ -> false }
+  ChFinally   -> match b { ChFinally -> true  _ -> false }
+  ChOp(_)     -> false
 }
 
 fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
@@ -2237,11 +2233,10 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
   # call `region(x)`, a field `region.x`) falls through to the normal
   # EVar path, so user code that names something `region` is
   # unaffected. The block parses as a normal `EBlock`; the surface is
-  # lowered to the marker `ECall(EVar("region"), [block])` so the
-  # pre-typer region pass can recognise it by shape (mirroring how
-  # nursery is recognised as `ECall(EVar("nursery"), ...)`), record the
-  # region in a side table, run escape analysis, and unwrap the marker
-  # back to the bare block.
+  # lowered to the marker `ECall(EMark(MkRegion), [block])` so the
+  # pre-typer region pass can recognise it, record the region in a
+  # side table, run escape analysis, and unwrap the marker back to the
+  # bare block.
   else if name == "region" and p_at(p1, TkLbrace) {
     parse_region(p1, t)
   }
@@ -2334,14 +2329,14 @@ fn parse_variants_of(p: Parser, t: Token) : PExpr / Console {
 # Parse `region { ... }` or the named form `region { r -> ... }`. `p`
 # is positioned at the `{`; `t` is the original `region` token (line/col
 # key for the side table). The bare form parses as an ordinary `EBlock`
-# wrapped in the marker `ECall(EVar("region"), [block])` — the block is
+# wrapped in the marker `ECall(EMark(MkRegion), [block])` — the block is
 # the DIRECT single argument (NOT a thunk lambda), so it stays inline:
 # no closure capture, no codegen perturbation. The named form skolemizes
 # a fresh region `r` and wraps the block in `ELambda([Param(r)], block)`
 # inside the same marker, so the region pass can read the region's name
 # off the binder (the nursery rhyme: `nursery { n -> }` names a cap the
 # same way). The pre-typer region pass (compiler.region) recognises the
-# marker by shape, records the region and its name, runs escape
+# marker, records the region and its name, runs escape
 # analysis, and unwraps it back to the bare block — the typer and
 # emitter see a normal block; the `ELambda` never reaches them. `region`
 # is NOT a fn and NOT an effect — the marker exists only between parse
@@ -2357,7 +2352,7 @@ fn parse_region(p: Parser, t: Token) : PExpr / Console {
         Some(body) -> {
           let param = Param { pname: bres.name, ptype: None, pline: t.line, pcol: t.col, pborrow: false }
           let lam = mk_expr(ELambda([param], body), t.line, t.col)
-          let callee = mk_ref("region", t.line, t.col)
+          let callee = mk_expr(EMark(MkRegion), t.line, t.col)
           ok_e(body_r.p, mk_expr(ECall(callee, [lam]), t.line, t.col))
         }
       }
@@ -2367,7 +2362,7 @@ fn parse_region(p: Parser, t: Token) : PExpr / Console {
       match r.r {
         None -> err_e(r.p)
         Some(block) -> {
-          let callee = mk_ref("region", t.line, t.col)
+          let callee = mk_expr(EMark(MkRegion), t.line, t.col)
           ok_e(r.p, mk_expr(ECall(callee, [block]), t.line, t.col))
         }
       }
@@ -4160,12 +4155,12 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
     # Spread binder. `...` may stand alone (preferred form
     # `[h, ...]`) or be followed by `_` (uniform-with-`_` form
     # `[h, ..._]`); both discard the tail with no binding. The named
-    # form `[h, ...rest]` keeps the existing semantics. The rest slot
-    # stores the SOURCE spelling (`""` bare, `"_"` wildcard, or the
-    # name); `surface_lower_decls` replaces the anonymous spellings
-    # with a unique sentinel binder, preserving the spread-vs-no-spread
-    # distinction the typer needs for exhaustiveness while leaving the
-    # author's spelling recoverable by the writer.
+    # form `[h, ...rest]` keeps the existing semantics. The two
+    # anonymous forms parse as `PsAnonRest`; `surface_lower_decls`
+    # gives them a unique sentinel binder, preserving the
+    # spread-vs-no-spread distinction the typer needs for
+    # exhaustiveness while leaving the author's spelling recoverable
+    # by the writer.
     let p1 = p_advance(p)
     let id = p_peek(p1)
     if tk_is(id.kind, TkIdent) {
@@ -4179,12 +4174,12 @@ fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: T
     } else if tk_is(id.kind, TkUnderscore) {
       let p2 = p_skip_newlines(p_advance(p1))
       if p_at(p2, TkRbracket) {
-        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some("_")), t.line, t.col))
+        ok_p(p_advance(p2), mk_pat(PSurface(PsAnonRest(list_reverse(acc), true)), t.line, t.col))
       } else {
         err_p(p_error_here(p2, "expected `]` after spread pattern"))
       }
     } else if tk_is(id.kind, TkRbracket) {
-      ok_p(p_advance(p1), mk_pat(PList(list_reverse(acc), Some("")), t.line, t.col))
+      ok_p(p_advance(p1), mk_pat(PSurface(PsAnonRest(list_reverse(acc), false)), t.line, t.col))
     } else {
       err_p(p_error_here(p1, "expected identifier, `_`, or `]` after `...` in list pattern"))
     }
@@ -5909,11 +5904,9 @@ fn parse_kind_introducer(p: Parser, is_pub: Bool, name: String,
     if not tk_is(it.kind, TkIdent) {
       err_d(p_error_here(p, "expected an introducer word or a value domain after `with` (e.g. `with metric`, `with Int`)"))
     } else if is_upper_ident(p.src, it) {
-      let dom = tok_source(p.src, it)
-      if dom == "Int" or dom == "String" {
-        ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabDomain(dom), t.line, t.col, None))
-      } else {
-        err_d(p_error(p, it, "a value-habitant domain must be `Int` or `String`"))
+      match value_domain_of_name(tok_source(p.src, it)) {
+        Some(dom) -> ok_d(p_advance(p), DKind(is_pub, name, thy, over, HabDomain(dom), t.line, t.col, None))
+        None      -> err_d(p_error(p, it, "a value-habitant domain must be `Int` or `String`"))
       }
     } else {
       let word = tok_source(p.src, it)
