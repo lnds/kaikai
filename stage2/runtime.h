@@ -6784,6 +6784,33 @@ static inline void kai_reuse_free(KaiReuse at) {
 #endif
 }
 
+/* A flat arm takes apart the variant cell its pattern matched. A sole owner
+ * hands its children to the arm's binders: the pointer slots in `unbound`,
+ * which no binder took, are released, and the shell is freed with no
+ * cascade. A shared cell loses one reference and returns 0: the caller then
+ * dups the children it bound. The unique half stays out of line, so an
+ * arm's prologue is a refcount test. */
+__attribute__((noinline)) KAI_RT_SHARED void kai_arm_take_shell(KaiValue *v, uint32_t unbound) {
+    for (int i = 0; unbound != 0; ++i, unbound >>= 1) {
+        if (unbound & 1u) kai_decref(kai_var_slots(v)[i].ptr);
+    }
+    KAI_VAR_NAME_FREE(kai_variant_name_of(v->variant_tag));
+    kai_var_block_free(v, v->var_n_args);
+    kai_rc_count_free();
+#ifdef KAI_TRACE_RC
+    kai_rc_free_by_tag[(int) KAI_VARIANT]++;
+#endif
+}
+
+static inline int kai_arm_take(KaiValue *v, uint32_t unbound) {
+    if (kai_check_unique(v)) { kai_arm_take_shell(v, unbound); return 1; }
+    if (kai_is_ptr(v) && v->rc != INT32_MAX) {
+        KAI_RC_TRAFFIC_INC(kai_rc_decref_total);
+        v->rc -= 1;
+    }
+    return 0;
+}
+
 /* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
  * fused for the TRMC modulo-cons site). `_scr` is the variant cell the
  * enclosing `match` arm just consumed. When it is UNIQUE and has the
@@ -8695,6 +8722,17 @@ static KaiValue *kai_core_array_get(KaiValue *a, KaiValue *i) {
 static KaiValue *kai_core_array_get_borrow(KaiValue *a, KaiValue *i) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     return kai_array_get_impl(a, idx);
+}
+
+/* The element leaves with the slot's own reference and the slot holds
+ * unit until the write the compiler pairs this read with. */
+static KaiValue *kai_core_array_take(KaiValue *a, KaiValue *i) {
+    int64_t idx = kai_intf(i);
+    KaiValue *r = a->as.arr.items[idx];
+    a->as.arr.items[idx] = kai_unit();
+    kai_decref(a);
+    kai_decref(i);
+    return r;
 }
 
 static KaiValue *kai_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
@@ -11027,6 +11065,7 @@ static KaiValue *_kai_core_array_make_thunk(KaiValue *s, KaiValue **a, int n)   
 static KaiValue *_kai_core_array_empty_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_array_empty(); }
 static KaiValue *_kai_core_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_array_length(a[0]); }
 static KaiValue *_kai_core_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_get(a[0], a[1]); }
+static KaiValue *_kai_core_array_take_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_take(a[0], a[1]); }
 static KaiValue *_kai_core_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_set(a[0], a[1], a[2]); }
 static KaiValue *_kai_core_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_grow(a[0], a[1], a[2]); }
 static KaiValue *_kai_core_ref_make_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_ref_make(a[0]); }

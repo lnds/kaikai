@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.7 (2026-10-10)
+
+### Fixed
+
+- **closure_spec**: keep a pasted closure's names on their binders (#2679)
+- **parse**: an `if` with no `else` ends at its closing brace (#2678)
+- **perceus**: a holder releases its reference before the write that replaces it (#2676)
+- **perceus**: keep a container unique across a lend that ends before its write (#2672)
+- **perceus**: fused Vec accesses release what they own (#2673)
+
+### Changed
+
+- **perceus**: a flat arm takes its scrutinee apart (#2681)
+- **perceus**: look up a callee's borrowed slots only for a call that takes the binder (#2675)
+- **native**: link LLVM 22 (#2671)
+
 ## v0.139.6 (2026-10-10)
 
 ### Changed
