@@ -15,6 +15,10 @@ the scope chain answers from the module reading the name: a root `Pair`
 and `core.tuple.Pair` are both bare here, and only the reader's view
 tells which one it sees. Those answers are settled when the table is
 built, so the typer reads decisions, never the symbol table.
+
+A name no type declares may still be a nominal type: a union component
+named only by its constructor. Its identity is that constructor's, read
+from `component_ids`.
 """)]
 
 import compiler.ast
@@ -27,6 +31,8 @@ import compiler.scope_file
 import compiler.symtab_build
 import compiler.name_contest
 import compiler.infer_index
+import compiler.component_ids
+import compiler.scalar_ty
 
 #[doc("One nominal type declaration: the name it spells, the module declaring it, its identity, and the module symbol owning it (`sym_none()` when the table does not hold it).")]
 pub type TyHomeEntry = THE(String, Option[String], SymId, SymId)
@@ -34,20 +40,22 @@ pub type TyHomeEntry = THE(String, Option[String], SymId, SymId)
 #[doc("What a contested type name denotes from one reading module: the reader's home, the name, and the declaration the scope chain picks there (`sym_none()` when it picks none).")]
 pub type TyRes = TyRes(String, String, SymId)
 
-#[doc("The type-home table keyed by name, the settled readings of its contested names, the target module that owns untagged declarations, every function declaration keyed by its name, and the scope view of each file.")]
-pub type TyHomes = TyHomes(NameIndex[TyHomeEntry], [TyRes], String, NameIndex[NEnt], FileViews)
+#[doc("The type-home table keyed by name, the settled readings of its contested names, the target module that owns untagged declarations, every function declaration keyed by its name, the scope view of each file, and the constructors a component names.")]
+pub type TyHomes = TyHomes(NameIndex[TyHomeEntry], [TyRes], String, NameIndex[NEnt], FileViews, CompIds)
 
 #[doc("The declaring module and identity of every nominal type in `ds`, with each contested name resolved from every module of `ds` under `views`. Aliases are absent: they are expanded before a slot could be read.")]
 pub fn tsh_homes(ds: [Decl], tab: SymTab, views: FileViews, target: String) : TyHomes =
   match tsh_loop(ds, tab, target, THAcc([], [])) {
-    THAcc(es, contested) ->
+    THAcc(es, contested) -> {
+      let ents = nt_collect(ds, target)
       TyHomes(tsh_type_index(list_reverse(es), idx_empty()),
               tsh_settle(tab, views, tsh_readers(ds, target, [target]), contested, []), target,
-              tsh_fn_index(tsh_fn_ents(ds, target), idx_empty()), views)
+              tsh_fn_index(nt_only(ents, NCFn), idx_empty()), views, comp_ids(ents, views))
+    }
   }
 
 #[doc("A table with no declarations: every slot stays empty and every id is `sym_none()`.")]
-pub fn tsh_none() : TyHomes = TyHomes(idx_empty(), [], "", idx_empty(), fv_empty())
+pub fn tsh_none() : TyHomes = TyHomes(idx_empty(), [], "", idx_empty(), fv_empty(), comp_none())
 
 fn tsh_type_index(es: [TyHomeEntry], ix: NameIndex[TyHomeEntry]) : NameIndex[TyHomeEntry] = match es {
   []           -> ix
@@ -208,16 +216,29 @@ pub fn tsh_at(v: TyHomeView, cur: Option[String]) : TyHomeView =
 
 #[doc("The module slot a bare `nm` carries under `v`, empty when the view cannot name one declaration.")]
 pub fn tsh_slot(v: TyHomeView, nm: String) : Option[String] =
-  match v { THV(TyHomes(tx, _, _, _, _), _) -> tsh_home_of(idx_chain(tx, nm), nm) }
+  match v { THV(TyHomes(tx, _, _, _, _, _), _) -> tsh_home_of(idx_chain(tx, nm), nm) }
 
-#[doc("The declaration a bare `nm` denotes from the reading module of `v`, or `sym_none()` when none or several are visible.")]
+#[doc("The declaration a bare `nm` denotes from the reading module of `v`: a type, or the constructor of a component no type declares; `sym_none()` when it denotes neither.")]
 pub fn tsh_sym(v: TyHomeView, nm: String) : SymId = match v {
-  THV(TyHomes(tx, rs, target, _, _), cur) -> match tsh_named(idx_chain(tx, nm), nm, []) {
-    []  -> core_type_sym_or_none(nm)
-    [s] -> if is_core_type(nm) { tsh_core_reading(rs, tsh_reader(cur, target), nm) } else { s }
-    _   -> tsh_core_reading(rs, tsh_reader(cur, target), nm)
+  THV(TyHomes(tx, rs, target, _, _, comps), cur) -> {
+    let s = tsh_type_sym(tx, rs, tsh_reader(cur, target), nm)
+    if sym_raw(s) >= 0 or tsh_is_scalar(nm) { s } else { comp_sym(comps, tsh_reader(cur, target), nm) }
   }
 }
+
+# A scalar is never a component: a constructor spelled `Int` leaves the
+# type `Int` what it is.
+fn tsh_is_scalar(nm: String) : Bool = match scalar_ty_named(nm) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn tsh_type_sym(tx: NameIndex[TyHomeEntry], rs: [TyRes], reader: String, nm: String) : SymId =
+  match tsh_named(idx_chain(tx, nm), nm, []) {
+    []  -> core_type_sym_or_none(nm)
+    [s] -> if is_core_type(nm) { tsh_core_reading(rs, reader, nm) } else { s }
+    _   -> tsh_core_reading(rs, reader, nm)
+  }
 
 # What the reader sees under `nm`, or the core type when it sees no declaration.
 fn tsh_core_reading(rs: [TyRes], r: String, nm: String) : SymId = {
@@ -226,11 +247,11 @@ fn tsh_core_reading(rs: [TyRes], r: String, nm: String) : SymId = {
 }
 
 #[doc("The module that owns the table's untagged declarations: the root file's.")]
-pub fn tsh_target(hs: TyHomes) : String = match hs { TyHomes(_, _, t, _, _) -> t }
+pub fn tsh_target(hs: TyHomes) : String = match hs { TyHomes(_, _, t, _, _, _) -> t }
 
 #[doc("True when a bare `nm` read from module `reader` names one function: the reader declares one, or at most one module does.")]
 pub fn tsh_fn_settled(hs: TyHomes, nm: String, reader: String) : Bool = match hs {
-  TyHomes(_, _, _, fx, _) -> {
+  TyHomes(_, _, _, fx, _, _) -> {
     let homes = nt_homes(idx_chain(fx, nm), NCFn, nm)
     list_has(homes, reader) or list_length(homes) <= 1
   }
@@ -238,12 +259,12 @@ pub fn tsh_fn_settled(hs: TyHomes, nm: String, reader: String) : Bool = match hs
 
 #[doc("True when a bare `nm` read from module `reader` may reach the function module `home` declares: the reader's file declares, picks, opens or sees it as a core.")]
 pub fn tsh_fn_visible(hs: TyHomes, reader: String, home: String, nm: String) : Bool = match hs {
-  TyHomes(_, _, _, _, views) -> sv_reaches(fv_of(views, st_module_id(reader)), st_module_id(home), nm)
+  TyHomes(_, _, _, _, views, _) -> sv_reaches(fv_of(views, st_module_id(reader)), st_module_id(home), nm)
 }
 
 #[doc("The identity of the type `nm` declared by module `mo` (`None` is the root file), or `sym_none()` when it declares none.")]
 pub fn tsh_decl_sym(hs: TyHomes, mo: Option[String], nm: String) : SymId = match hs {
-  TyHomes(tx, _, _, _, _) -> match tsh_find(idx_chain(tx, nm), nm, mo) {
+  TyHomes(tx, _, _, _, _, _) -> match tsh_find(idx_chain(tx, nm), nm, mo) {
     Some(s) -> s
     None    -> sym_none()
   }
@@ -255,11 +276,11 @@ pub fn tsh_tycon(v: TyHomeView, nm: String, args: [Ty]) : Ty =
 
 #[doc("The module slot of the declaration `s` of the type named `nm`.")]
 pub fn tsh_sym_slot(v: TyHomeView, nm: String, s: SymId) : Option[String] =
-  match v { THV(TyHomes(es, _, _, _, _), _) -> tsh_home_by_sym(idx_chain(es, nm), s) }
+  match v { THV(TyHomes(es, _, _, _, _, _), _) -> tsh_home_by_sym(idx_chain(es, nm), s) }
 
 #[doc("True unless the table holds the declaration `s` of the type `nm` and a module other than the reading module of `v` owns it.")]
 pub fn tsh_reader_owns(v: TyHomeView, nm: String, s: SymId) : Bool = match v {
-  THV(TyHomes(es, _, target, _, _), cur) -> match tsh_owner_by_sym(idx_chain(es, nm), s) {
+  THV(TyHomes(es, _, target, _, _, _), cur) -> match tsh_owner_by_sym(idx_chain(es, nm), s) {
     Some(o) -> sym_raw(o) == sym_raw(st_module_id(tsh_reader(cur, target)))
     None    -> true
   }
