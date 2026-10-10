@@ -136,6 +136,17 @@ machinery below is needed to *use* the language; it is the toolchain for
   the equivalent for your distro. The build locates LLVM through
   `llvm-config`, so any reasonably recent version on `PATH` works.
 
+  No system LLVM at hand? `make llvm-prebuilt` downloads the static
+  libLLVM the released binaries link (macOS arm64 and Linux x86_64),
+  verifies its checksum and unpacks it under `stage0/third_party/llvm`.
+  On any other host, or after editing `mk/llvm.mk`, it compiles the
+  same archives from LLVM's source instead (needs `cmake` and `ninja`,
+  ~25 min). Point the build at it:
+  ```sh
+  make llvm-prebuilt
+  make KAI_LLVM=1 LLVM_CONFIG="$PWD/stage0/third_party/llvm/build/bin/llvm-config" kaic2
+  ```
+
 ## Building the compiler
 
 Everything builds from the repo root with `make`:
