@@ -3,30 +3,19 @@ Runtime head tags of user record and sum types, resolved by declaration.
 
 A user type's head tag is `20 +` its index among the record and sum
 declarations of the stream, so two declarations spelled alike get two
-tags. The runtime impl table and the variant-to-head map must agree on
-which declaration a row means: an impl row names its target by the name
-its symbol spells, the one the type is emitted under; a constructor
-names its sum by the module that declares it.
+tags. The runtime impl table and the variant-to-head map agree on which
+declaration a row means because each names it by id: an impl row by its
+target's, a constructor by its own.
 """)]
 
 import compiler.ast
-import compiler.written
-import compiler.symtab
-import compiler.rt_name
+import compiler.core_types
 
-# A record or sum declaration seen by the walk: its head tag and home.
-type HeadCand = HeadCand(Int, Option[String])
-
-#[doc("Head tag of the record or sum `tname` as an impl homed in `home` names it, or -1 when no declaration spells it.")]
-pub fn impl_target_head_tag(home: Option[String], tname: String, decls: [Decl], tab: SymTab) : Int =
-  match htd_cands(decls, tab, tname, 0, []) {
-    [] -> htd_respelled_root(home, tname, decls, tab)
-    cs -> htd_pick(cs, home)
-  }
-
-#[doc("Head tag of the sum that module `home` declares with constructor `ctor`, or -1 when none does. A `None` home takes the first declarer.")]
-pub fn ctor_owner_head_tag(home: Option[String], ctor: String, decls: [Decl], tab: SymTab) : Int =
-  htd_ctor_loop(decls, tab, home, ctor, 0)
+#[doc("Head tag of the type an impl targets: the fixed one of a type the runtime numbers, a user record or sum's by its declaration, -1 for any other.")]
+pub fn impl_head_tag(target: DeclRef, decls: [Decl]) : Int = match rt_head_of_ref(target) {
+  Some(h) -> rt_head_tag(h)
+  None    -> decl_head_tag(ref_sym(target), decls)
+}
 
 #[doc("Head tag of the record or sum the declaration `s` is, or -1 when `decls` holds no such declaration.")]
 pub fn decl_head_tag(s: SymId, decls: [Decl]) : Int =
@@ -40,66 +29,15 @@ fn htd_sym_loop(ds: [Decl], s: SymId, idx: Int) : Int = match ds {
   }
 }
 
-# The root file's declarations follow everything it imports, so of
-# several spellings the root's is the last. An impl the root file
-# declares carries no home.
-fn htd_pick(cs: [HeadCand], home: Option[String]) : Int = match home {
-  None    -> htd_last(cs, 0 - 1)
-  Some(_) -> match htd_homed(cs, home) {
-    Some(t) -> t
-    None    -> htd_first(cs)
-  }
-}
+#[doc("Head tag of the sum that declares the constructor `c`, or -1 when no declaration of `decls` does.")]
+pub fn ctor_owner_head_tag(c: SymId, decls: [Decl]) : Int =
+  if sym_raw(c) < 0 { 0 - 1 } else { htd_ctor_loop(decls, c, 0) }
 
-# A root impl whose symbol a core impl also mints is respelled
-# `<type>__<root module>`; its target is the root type before the `__`.
-fn htd_respelled_root(home: Option[String], tname: String, decls: [Decl], tab: SymTab) : Int = match home {
-  Some(_) -> 0 - 1
-  None -> {
-    let cut = htd_find(tname, "__", 0)
-    if cut >= string_length(tname) { 0 - 1 }
-    else { htd_last(htd_cands(decls, tab, string_slice(tname, 0, cut), 0, []), 0 - 1) }
-  }
-}
-
-# Candidates in declaration order.
-fn htd_cands(ds: [Decl], tab: SymTab, tname: String, idx: Int, acc: [HeadCand]) : [HeadCand] = match ds {
-  [] -> list_reverse(acc)
-  [d, ...rest] -> match htd_nominal(d) {
-    Some(s) ->
-      if rt_name(tab, s) == tname { htd_cands(rest, tab, tname, idx + 1, [HeadCand(20 + idx, htd_home(d)), ...acc]) }
-      else { htd_cands(rest, tab, tname, idx + 1, acc) }
-    None -> htd_cands(rest, tab, tname, idx, acc)
-  }
-}
-
-fn htd_homed(cs: [HeadCand], home: Option[String]) : Option[Int] = match cs {
-  [] -> None
-  [HeadCand(t, h), ...rest] -> if htd_same_home(h, home) { Some(t) } else { htd_homed(rest, home) }
-}
-
-fn htd_same_home(a: Option[String], b: Option[String]) : Bool = match a {
-  None    -> match b { None -> true  Some(_) -> false }
-  Some(x) -> match b { None -> false Some(y) -> x == y }
-}
-
-fn htd_first(cs: [HeadCand]) : Int = match cs {
-  []                    -> 0 - 1
-  [HeadCand(t, _), ..._] -> t
-}
-
-fn htd_last(cs: [HeadCand], acc: Int) : Int = match cs {
-  []                       -> acc
-  [HeadCand(t, _), ...rest] -> htd_last(rest, t)
-}
-
-fn htd_ctor_loop(ds: [Decl], tab: SymTab, home: Option[String], ctor: String, idx: Int) : Int = match ds {
+fn htd_ctor_loop(ds: [Decl], c: SymId, idx: Int) : Int = match ds {
   [] -> 0 - 1
   [d, ...rest] -> match htd_nominal(d) {
-    Some(_) ->
-      if htd_declares_ctor(d, tab, ctor) and ctor_home_matches(htd_home(d), home) { 20 + idx }
-      else { htd_ctor_loop(rest, tab, home, ctor, idx + 1) }
-    None -> htd_ctor_loop(rest, tab, home, ctor, idx)
+    Some(_) -> if htd_declares_ctor(d, c) { 20 + idx } else { htd_ctor_loop(rest, c, idx + 1) }
+    None    -> htd_ctor_loop(rest, c, idx)
   }
 }
 
@@ -119,26 +57,7 @@ fn htd_nominal(d: Decl) : Option[SymId] = match d {
   _ -> None
 }
 
-fn htd_home(d: Decl) : Option[String] = match d {
-  DType(_, _, _, _, _, _, mo, _) -> mo
-  _ -> None
-}
-
-fn htd_declares_ctor(d: Decl, tab: SymTab, ctor: String) : Bool = match d {
-  DType(_, _, _, TBSum(vs), _, _, _, _) -> htd_has_ctor(vs, tab, ctor)
+fn htd_declares_ctor(d: Decl, c: SymId) : Bool = match d {
+  DType(_, _, _, TBSum(vs), _, _, _, _) -> any(vs, (v) => match v { Var(k, _) -> sym_same(k, c) })
   _ -> false
-}
-
-fn htd_has_ctor(vs: [Variant], tab: SymTab, ctor: String) : Bool = match vs {
-  [] -> false
-  [Var(c, _), ...rest] -> if written_text(sym_name(tab, c)) == ctor { true } else { htd_has_ctor(rest, tab, ctor) }
-}
-
-# Index of the first `needle` in `hay` at or after `from`, or length(hay).
-fn htd_find(hay: String, needle: String, from: Int) : Int = {
-  let hn = string_length(hay)
-  let nn = string_length(needle)
-  if from + nn > hn { hn }
-  else if string_slice(hay, from, nn) == needle { from }
-  else { htd_find(hay, needle, from + 1) }
 }

@@ -1,12 +1,17 @@
 #[doc("""
 compiler.extern_fn_types — an `extern "C" fn` crosses the boundary in C types only.
 
-The parser admits any capitalised name in an extern signature because it
-cannot see which names are foreign. The names that are: the scalars, the
-fixed-width annotations, and the `extern "C" type` / `extern "C" opaque`
-declarations in the program. A signature naming anything else (an
-ordinary record, a sum type, an alias) has no C layout, so the check
-rejects it here instead of leaving the backend to fail.
+The parser admits any capitalised name in an extern signature or an
+extern struct field because it cannot see which names are foreign. The
+names that are: the scalars, the fixed-width annotations, and the
+`extern "C" type` / `extern "C" opaque` declarations in the program. A
+name denoting anything else (an ordinary record, a sum type, an alias)
+has no C layout, so the check rejects it here instead of leaving the
+backend to fail.
+
+Which declaration a written name denotes is read from the module that
+wrote it, with the resolver the typer types the signature with: a plain
+type spelled like another module's extern type is not that type.
 """)]
 
 import compiler.util
@@ -14,56 +19,145 @@ import compiler.ast
 import compiler.diag
 import compiler.diag_file
 import compiler.emit_shared
+import compiler.entry
 import compiler.ffi_v2
+import compiler.scope_file
 import compiler.written
 import compiler.symtab
 import compiler.decl_text
+import compiler.tycon_ref
+import compiler.tycon_scheme_home
 
-#[doc("Reject an `extern \"C\" fn` whose parameter or return type is not a scalar, a fixed-width annotation, or a declared `extern \"C\" type`/`opaque`.")]
-pub fn validate_extern_fn_types(decls: [Decl], tab: SymTab, df: DiagFiles) : [Diagnostic] / Console + File =
-  list_reverse(extern_types_loop(decls, tab, df, collect_extern_types(decls, tab), []))
+#[doc("What the boundary checks read a program's type names with: its table, every file's scope view, the root module and the compile's roots.")]
+pub type ExternScope = ExternScope(SymTab, FileViews, String, Roots)
 
-fn extern_types_loop(decls: [Decl], tab: SymTab, df: DiagFiles, reg: [ExternTypeReg],
-                     errs: [Diagnostic]) : [Diagnostic] / Console + File = match decls {
-  [] -> errs
-  [d, ...rest] -> extern_types_loop(rest, tab, df, reg, check_extern_fn(d, tab, df, reg, errs))
+fn xs_tab(x: ExternScope) : SymTab = match x { ExternScope(t, _, _, _) -> t }
+
+fn xs_homes(decls: [Decl], x: ExternScope) : TyHomes = match x {
+  ExternScope(tab, views, target, roots) -> tsh_homes(decls, tab, views, target, roots)
 }
 
-fn check_extern_fn(d: Decl, tab: SymTab, df: DiagFiles, reg: [ExternTypeReg], errs: [Diagnostic]) : [Diagnostic] / Console + File = match d {
-  DFn(_, fid, _, params, ret, _, body, l, c, _) -> match body.kind {
+#[doc("Every extern struct's field types settled to the declarations they name from the struct's own module. A program declaring no extern struct is returned as it is.")]
+pub fn settle_extern_structs(decls: [Decl], x: ExternScope) : [Decl] =
+  if any(decls, declares_extern_struct) {
+    let homes = xs_homes(decls, x)
+    map(decls, (d) => settle_struct_decl(d, homes))
+  } else { decls }
+
+fn declares_extern_struct(d: Decl) : Bool = match d {
+  DExternType(_, ETStruct(_), _, _, _) -> true
+  DDoc(_, _, inner, _, _)              -> declares_extern_struct(inner)
+  DAttr(_, inner, _, _)                -> declares_extern_struct(inner)
+  _                                    -> false
+}
+
+fn settle_struct_decl(d: Decl, homes: TyHomes) : Decl = match d {
+  DExternType(n, ETStruct(fs), l, c, mo) -> {
+    let v = tsh_view(homes, mo)
+    DExternType(n, ETStruct(map(fs, (f) => settle_field(f, v))), l, c, mo)
+  }
+  DDoc(a, b, inner, l, c) -> DDoc(a, b, settle_struct_decl(inner, homes), l, c)
+  DAttr(a, inner, l, c)   -> DAttr(a, settle_struct_decl(inner, homes), l, c)
+  _ -> d
+}
+
+fn settle_field(f: FieldDecl, v: TyHomeView) : FieldDecl = match f {
+  FD(is_pub, n, t, attrs) -> match t.tkind {
+    TyName(r, []) -> match ref_decl(v, r) {
+      Some(s) -> FD(is_pub, n, TypeExpr { tkind: TyName(DrSym(s), []), line: t.line, col: t.col }, attrs)
+      None    -> f
+    }
+    _ -> f
+  }
+}
+
+# The declaration a type reference names from the view's module; a
+# scalar or a width annotation names none.
+fn ref_decl(v: TyHomeView, r: DeclRef) : Option[SymId] = match tsh_tycon_at(v, r, []) {
+  TyCon(s, _) -> if sym_raw(s) >= 0 { Some(s) } else { None }
+  _           -> None
+}
+
+#[doc("Reject an `extern \"C\" fn` whose parameter or return type, or an `extern \"C\" type` whose field type, is not a scalar, a fixed-width annotation, or a declared `extern \"C\" type`/`opaque`.")]
+pub fn validate_extern_fn_types(decls: [Decl], x: ExternScope, df: DiagFiles) : [Diagnostic] / Console + File =
+  if any(decls, crosses_boundary) {
+    let cx = XtCx { tab: xs_tab(x), homes: xs_homes(decls, x), reg: collect_extern_types(decls, xs_tab(x)), df: df }
+    list_reverse(extern_types_loop(decls, cx, []))
+  } else { [] }
+
+type XtCx = { tab: SymTab, homes: TyHomes, reg: [ExternTypeReg], df: DiagFiles }
+
+fn crosses_boundary(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> match body.kind {
+    EExternBody(AbiC, _) -> true
+    _                    -> false
+  }
+  DExternType(_, ETStruct(_), _, _, _) -> true
+  DDoc(_, _, inner, _, _)              -> crosses_boundary(inner)
+  DAttr(_, inner, _, _)                -> crosses_boundary(inner)
+  _                                    -> false
+}
+
+fn extern_types_loop(decls: [Decl], cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match decls {
+  [] -> errs
+  [d, ...rest] -> extern_types_loop(rest, cx, check_extern_decl(d, cx, errs))
+}
+
+fn check_extern_decl(d: Decl, cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match d {
+  DFn(_, fid, _, params, ret, _, body, l, c, mo) -> match body.kind {
     EExternBody(AbiC, _) -> {
-      let name = written_text(sym_name(tab, fnid_sym(fid)))
-      let n = check_params(params, d, tab, df, name, l, c, reg, errs)
+      let at = XtAt { d: d, what: concat_all(["`extern \"C\" fn ", written_text(sym_name(cx.tab, fnid_sym(fid))), "`"]),
+                      line: l, col: c, view: tsh_view(cx.homes, mo) }
+      let n = check_params(params, at, cx, errs)
       match ret {
         Some(t) ->
-          if boundary_ok(t, true, tab, reg) { n }
-          else { [report_foreign_type(df, d, tab, name, l, c, "return type", t), ...n] }
+          if boundary_ok(t, true, at.view, cx) { n }
+          else { [report_foreign_type(cx, at, "return type", t), ...n] }
         None    -> n
       }
     }
     _ -> errs
   }
-  DDoc(_, _, inner, _, _) -> check_extern_fn(inner, tab, df, reg, errs)
-  DAttr(_, inner, _, _)   -> check_extern_fn(inner, tab, df, reg, errs)
+  DExternType(name, ETStruct(fs), l, c, mo) ->
+    check_fields(fs, XtAt { d: d, what: concat_all(["`extern \"C\" type ", name, "`"]), line: l, col: c,
+                            view: tsh_view(cx.homes, mo) }, cx, errs)
+  DDoc(_, _, inner, _, _) -> check_extern_decl(inner, cx, errs)
+  DAttr(_, inner, _, _)   -> check_extern_decl(inner, cx, errs)
   _ -> errs
 }
 
-fn check_params(params: [Param], d: Decl, tab: SymTab, df: DiagFiles, fname: String, l: Int, c: Int,
-                reg: [ExternTypeReg], errs: [Diagnostic]) : [Diagnostic] / Console + File = match params {
+# The declaration a diagnostic is about, how it names it, and the view
+# its written type names are read from.
+type XtAt = { d: Decl, what: String, line: Int, col: Int, view: TyHomeView }
+
+fn check_params(params: [Param], at: XtAt, cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match params {
   [] -> errs
   [p, ...rest] -> match p.ptype {
-    None -> check_params(rest, d, tab, df, fname, l, c, reg, errs)
+    None -> check_params(rest, at, cx, errs)
     Some(t) ->
-      if boundary_ok(t, false, tab, reg) { check_params(rest, d, tab, df, fname, l, c, reg, errs) }
+      if boundary_ok(t, false, at.view, cx) { check_params(rest, at, cx, errs) }
       else {
-        let e = report_foreign_type(df, d, tab, fname, l, c, concat_all(["parameter `", written_text(p.binder.name), "`"]), t)
-        check_params(rest, d, tab, df, fname, l, c, reg, [e, ...errs])
+        let e = report_foreign_type(cx, at, concat_all(["parameter `", written_text(p.binder.name), "`"]), t)
+        check_params(rest, at, cx, [e, ...errs])
       }
   }
 }
 
-fn boundary_ok(t: TypeExpr, is_return: Bool, tab: SymTab, reg: [ExternTypeReg]) : Bool = match t.tkind {
-  TyName(r, []) -> match ffi_kind_of_ty(t, tab) {
+# A field's type was settled when its struct was, so it is read by id.
+fn check_fields(fs: [FieldDecl], at: XtAt, cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match fs {
+  [] -> errs
+  [fd, ...rest] ->
+    if extern_field_has_layout(fd, cx.reg) { check_fields(rest, at, cx, errs) }
+    else { match fd {
+      FD(_, fname, t, _) -> {
+        let e = report_foreign_type(cx, at, concat_all(["field `", fname, "`"]), t)
+        check_fields(rest, at, cx, [e, ...errs])
+      }
+    } }
+}
+
+fn boundary_ok(t: TypeExpr, is_return: Bool, v: TyHomeView, cx: XtCx) : Bool = match t.tkind {
+  TyName(r, []) -> match ffi_kind_of_ty(t, cx.tab) {
     FfiRetUnit               -> is_return
     FfiRetInt                -> true
     FfiRetReal               -> true
@@ -71,28 +165,26 @@ fn boundary_ok(t: TypeExpr, is_return: Bool, tab: SymTab, reg: [ExternTypeReg]) 
     FfiRetChar               -> true
     FfiRetString             -> true
     FfiRetFixed(_)           -> true
-    FfiRetFixedVal(TyInt128) -> is_declared_foreign(reg, extern_ref_name(tab, r))
+    FfiRetFixedVal(TyInt128) -> names_foreign(cx.reg, v, r)
     FfiRetFixedVal(_)        -> true
-    _                        -> is_declared_foreign(reg, extern_ref_name(tab, r))
+    _                        -> names_foreign(cx.reg, v, r)
   }
   _ -> false
 }
 
-# The registry of foreign types is keyed by the name each was declared with.
-fn extern_ref_name(tab: SymTab, r: DeclRef) : String = match r {
-  DrWritten(_, n) -> written_text(n)
-  DrSym(s)        -> written_text(decl_name(tab, s))
+fn names_foreign(reg: [ExternTypeReg], v: TyHomeView, r: DeclRef) : Bool = match ref_decl(v, r) {
+  Some(s) -> match extern_type_of(reg, s) {
+    Some(_) -> true
+    None    -> false
+  }
+  None -> false
 }
 
-fn is_declared_foreign(reg: [ExternTypeReg], n: String) : Bool =
-  match extern_type_lookup(reg, n) { Some(_) -> true  None -> false }
-
-fn report_foreign_type(df: DiagFiles, d: Decl, tab: SymTab, fname: String, l: Int, c: Int,
-                       what: String, t: TypeExpr) : Diagnostic / Console + File = {
-  let file = decl_diag_file(d, df)
+fn report_foreign_type(cx: XtCx, at: XtAt, what: String, t: TypeExpr) : Diagnostic / Console + File = {
+  let file = decl_diag_file(at.d, cx.df)
   let help = "allowed: Int, Real, Bool, Char, String, Unit (return only), fixed-width U8..F32, Int32, UInt32, UInt64, or a declared `extern \"C\" type` / `extern \"C\" opaque`"
-  let msg = concat_all(["`extern \"C\" fn ", fname, "` ", what, " has type `", type_surface_name(tab, t), "`, which has no C layout"])
-  let diag = mk_diag(SevError, file, l, c, msg, [ri_help(file, l, c, help)])
+  let msg = concat_all([at.what, " ", what, " has type `", type_surface_name(cx.tab, t), "`, which has no C layout"])
+  let diag = mk_diag(SevError, file, at.line, at.col, msg, [ri_help(file, at.line, at.col, help)])
   render_diag(diag)
   diag
 }
@@ -102,4 +194,10 @@ fn type_surface_name(tab: SymTab, t: TypeExpr) : String = match t.tkind {
   TyName(r, targs) -> concat_all([extern_ref_name(tab, r), "[", join_with(map(targs, (a) => type_surface_name(tab, a)), ", "), "]"])
   TyList(inner)    -> concat_all(["[", type_surface_name(tab, inner), "]"])
   _                -> "?"
+}
+
+# How the diagnostic spells the type it rejects.
+fn extern_ref_name(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(_, n) -> written_text(n)
+  DrSym(s)        -> written_text(decl_name(tab, s))
 }
