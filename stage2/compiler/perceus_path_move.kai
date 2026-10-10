@@ -18,28 +18,27 @@ import compiler.expr_positions
 import compiler.infer
 import compiler.perceus_branch_plant
 import compiler.perceus_reads
-import compiler.sym_read
-import compiler.util
+import compiler.perceus_arg_reads
 
-type PpmCx = { uses: UseIx, skip: [String], borrowed: [String],
-               slots_ok: (String, Expr) -> Bool, bpos: (Expr) -> [Int] }
+type PpmCx = { uses: UseIx, skip: [Binder], borrowed: [Binder],
+               slots_ok: (Binder, Expr) -> Bool, bpos: (Expr) -> [Int] }
 
 #[doc("The arm binders of `body` read on several paths but at most once on each, that the branch payer can pay. `skip` names binders already moved; `bpos` gives a callee's borrowed positions.")]
-pub fn ppm_path_moves(body: Expr, uses: UseIx, skip: [String], borrowed: [String],
-                      slots_ok: (String, Expr) -> Bool, bpos: (Expr) -> [Int]) : [String] =
+pub fn ppm_path_moves(body: Expr, uses: UseIx, skip: [Binder], borrowed: [Binder],
+                      slots_ok: (Binder, Expr) -> Bool, bpos: (Expr) -> [Int]) : [Binder] =
   ppm_expr(body, PpmCx { uses: uses, skip: skip, borrowed: borrowed, slots_ok: slots_ok, bpos: bpos }, [])
 
-fn ppm_expr(e: Expr, cx: PpmCx, acc: [String]) : [String] = match e.kind {
+fn ppm_expr(e: Expr, cx: PpmCx, acc: [Binder]) : [Binder] = match e.kind {
   EMatch(s, arms) -> ppm_arms(arms, ppm_scr_owned(s, cx.borrowed), cx, ppm_expr(s, cx, acc))
   _               -> ppm_ps(xp_positions(e), cx, acc)
 }
 
-fn ppm_ps(ps: [XPos], cx: PpmCx, acc: [String]) : [String] = match ps {
+fn ppm_ps(ps: [XPos], cx: PpmCx, acc: [Binder]) : [Binder] = match ps {
   []                  -> acc
   [XP(r, c), ...rest] -> ppm_ps(rest, cx, if xrole_inline(r) { ppm_expr(c, cx, acc) } else { acc })
 }
 
-fn ppm_arms(arms: [Arm], owned: Bool, cx: PpmCx, acc: [String]) : [String] = match arms {
+fn ppm_arms(arms: [Arm], owned: Bool, cx: PpmCx, acc: [Binder]) : [Binder] = match arms {
   []                        -> acc
   [Arm(p, og, b), ...rest] -> {
     let acc1 = if owned { ppm_binders(prc_pat_bindings(p, []), og, b, cx, acc) } else { acc }
@@ -51,25 +50,25 @@ fn ppm_arms(arms: [Arm], owned: Bool, cx: PpmCx, acc: [String]) : [String] = mat
   }
 }
 
-fn ppm_binders(names: [String], og: Option[Expr], b: Expr, cx: PpmCx, acc: [String]) : [String] = match names {
+fn ppm_binders(names: [Binder], og: Option[Expr], b: Expr, cx: PpmCx, acc: [Binder]) : [Binder] = match names {
   []            -> acc
   [nm, ...rest] -> ppm_binders(rest, og, b, cx, if ppm_qualifies(nm, og, b, cx) { [nm, ...acc] } else { acc })
 }
 
-fn ppm_qualifies(nm: String, og: Option[Expr], b: Expr, cx: PpmCx) : Bool =
-  not list_has(cx.skip, nm) and
-  pcs_read_count(nm, cx.uses) >= 2 and not pcs_uses_have_in_lam(cx.uses, nm) and
+fn ppm_qualifies(nm: Binder, og: Option[Expr], b: Expr, cx: PpmCx) : Bool =
+  not pcs_has(cx.skip, nm.id) and
+  pcs_read_count(nm.id, cx.uses) >= 2 and not pcs_uses_have_in_lam(cx.uses, nm.id) and
   not ppm_guard_mentions(nm, og) and cx.slots_ok(nm, b) and
-  not ppm_borrowed_read(nm, b, cx.bpos) and pbl_plantable(nm, b)
+  not ppm_borrowed_read(nm.id, b, cx.bpos) and pbl_plantable(nm, b)
 
-fn ppm_guard_mentions(nm: String, og: Option[Expr]) : Bool = match og {
+fn ppm_guard_mentions(nm: Binder, og: Option[Expr]) : Bool = match og {
   Some(g) -> pcs_mentions(nm, g)
   None    -> false
 }
 
-fn ppm_scr_owned(s: Expr, borrowed: [String]) : Bool = match sym_read_kind(s.kind) {
-  EName(nm)    -> not list_has(borrowed, nm)
-  ECall(f, _) -> match sym_read_kind(f.kind) {
+fn ppm_scr_owned(s: Expr, borrowed: [Binder]) : Bool = match s.kind {
+  ELocal(l)   -> not pcs_has(borrowed, l)
+  ECall(f, _) -> match f.kind {
     EMark(MkBorrow) -> false
     _               -> true
   }
@@ -77,22 +76,17 @@ fn ppm_scr_owned(s: Expr, borrowed: [String]) : Bool = match sym_read_kind(s.kin
 }
 
 # A bare read in a borrowed slot hands nothing on: the callee takes no reference.
-fn ppm_borrowed_read(nm: String, e: Expr, bpos: (Expr) -> [Int]) : Bool = match e.kind {
+fn ppm_borrowed_read(nm: LocalId, e: Expr, bpos: (Expr) -> [Int]) : Bool = match e.kind {
   ECall(f, xs) -> ppm_bare_at(nm, xs, bpos(f), 0) or ppm_borrowed_read_ps(nm, xp_positions(e), bpos)
   _            -> ppm_borrowed_read_ps(nm, xp_positions(e), bpos)
 }
 
-fn ppm_borrowed_read_ps(nm: String, ps: [XPos], bpos: (Expr) -> [Int]) : Bool = match ps {
+fn ppm_borrowed_read_ps(nm: LocalId, ps: [XPos], bpos: (Expr) -> [Int]) : Bool = match ps {
   []                  -> false
   [XP(_, c), ...rest] -> ppm_borrowed_read(nm, c, bpos) or ppm_borrowed_read_ps(nm, rest, bpos)
 }
 
-fn ppm_bare_at(nm: String, xs: [Expr], positions: [Int], i: Int) : Bool = match xs {
+fn ppm_bare_at(nm: LocalId, xs: [Expr], positions: [Int], i: Int) : Bool = match xs {
   []           -> false
-  [x, ...rest] -> (contains(positions, i) and ppm_is_read(nm, x)) or ppm_bare_at(nm, rest, positions, i + 1)
-}
-
-fn ppm_is_read(nm: String, x: Expr) : Bool = match sym_read_kind(x.kind) {
-  EName(u) -> u == nm
-  _       -> false
+  [x, ...rest] -> (contains(positions, i) and pcs_is_bare(nm, x)) or ppm_bare_at(nm, rest, positions, i + 1)
 }

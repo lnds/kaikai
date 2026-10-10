@@ -9,53 +9,52 @@ element: a binder bound raw has none.
 """)]
 
 import compiler.ast
-import compiler.sym_read
 import compiler.expr_positions
-import compiler.handler_alias
 import compiler.infer
 import compiler.interp_span
 import compiler.parse
-import compiler.util
 import compiler.name_ix
 import compiler.int_cmp
 import compiler.perceus_reads
 import compiler.perceus_seg_request
+import compiler.perceus_span
 
 # Buckets of reads a collector fills, and what filling them performs.
 type UseAcc = Array[[Read]]
 type Collect = Console + Mutable
 
-#[doc("Every read of the names in `scope`, and of every binder the body introduces, anywhere in `body`, indexed by name.")]
-pub fn pcs_use_index(body: Expr, scope: [String]) : UseIx / Console = pcs_use_index_in(body, scope, [], prt_no_slots)
+#[doc("Every read of the binders in `scope`, and of every binder the body introduces, anywhere in `body`, indexed by binder.")]
+pub fn pcs_use_index(body: Expr, scope: [Binder]) : UseIx / Console = pcs_use_index_in(body, scope, [], prt_no_slots)
 
-#[doc("`pcs_use_index`, flagging the raw reads of the `boxed` names: an operand of a raw operator or an argument in a slot `slots` names raw.")]
-pub fn pcs_use_index_in(body: Expr, scope: [String], boxed: [String], slots: (Expr) -> [Int]) : UseIx / Console =
+#[doc("`pcs_use_index`, flagging the raw reads of the `boxed` binders: an operand of a raw operator or an argument in a slot `slots` names raw.")]
+pub fn pcs_use_index_in(body: Expr, scope: [Binder], boxed: [Binder], slots: (Expr) -> [Int]) : UseIx / Console =
   ni_wrap(prt_expr(body, scope, Prt { capt: [], in_lam: false, slots: slots, boxed: boxed, lent: [] }, ni_buckets()))
 
 fn prt_no_slots(f: Expr) : [Int] = []
 
-# `capt` holds the names a handler clause reads from outside it: a clause
+# `capt` holds the binders a handler clause reads from outside it: a clause
 # borrows what it captures from the handle's env, as a lambda does from
-# its closure, so those reads are captures. `lent` names are boxed too, but
+# its closure, so those reads are captures. `lent` binders are boxed too, but
 # only an operand of an operator lowered raw reads them raw: a boxed Int
 # comparison borrows its operands on C and consumes them on native.
-type Prt = { capt: [String], in_lam: Bool, slots: (Expr) -> [Int], boxed: [String], lent: [String] }
+# A scope lists the nearest binder first and a handle's state aliases last.
+type Prt = { capt: [Binder], in_lam: Bool, slots: (Expr) -> [Int], boxed: [Binder], lent: [Binder] }
 
 fn prt_lam(cx: Prt) : Prt = Prt { capt: cx.capt, in_lam: true, slots: cx.slots, boxed: cx.boxed, lent: cx.lent }
 
-fn prt_expr(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match sym_read_kind(e.kind) {
-  EName(nm) -> prt_read(e, nm, prt_is_raw(e), scope, cx, acc)
+fn prt_expr(e: Expr, scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match e.kind {
+  ELocal(l) -> prt_read(e, l, prt_is_raw(e) and pcs_has(cx.boxed, l), scope, cx, acc)
   EStr(span, t3) -> prt_interp(isp_parts(span, t3), scope, cx, acc)
   EMatch(s, arms) -> prt_arms(arms, scope, cx, prt_expr(s, scope, cx, acc))
-  ELambda(ps, body) -> prt_expr(body, list_append(scope, map(ps, (p) => p.pname)), prt_lam(cx), acc)
+  ELambda(ps, body) -> prt_expr(body, list_append(map(ps, (p) => p.binder), scope), prt_lam(cx), acc)
   EBlock(stmts, opt_tail) -> prt_block(stmts, opt_tail, scope, cx, acc)
-  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
     let a1 = prt_opt(init_opt, scope, cx, prt_expr(body, scope, cx, acc))
-    let aliases = handle_live_aliases(init_opt, scope)
-    let a2 = prt_clauses(clauses, scope, cx, aliases, init_opt, a1)
+    let aliases = pcs_handle_aliases(init_opt)
+    let a2 = prt_clauses(clauses, scope, cx, aliases, a1)
     match ret_opt {
       None -> a2
-      Some(HR(pname, body2, _, _)) -> prt_expr(body2, [pname, ...aliases, ...scope], prt_boxed(cx, pname), a2)
+      Some(HR(b, body2, _, _)) -> prt_expr(body2, [b, ...list_append(scope, aliases)], prt_boxed(cx, b), a2)
     }
   }
   # An `ELitUnit` inner is always a numeric literal.
@@ -64,7 +63,7 @@ fn prt_expr(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect =
 }
 
 # The forms whose operands may be read raw.
-fn prt_reader(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match e.kind {
+fn prt_reader(e: Expr, scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match e.kind {
   EBinop(op, x, y) ->
     if prt_is_raw(e) { prt_raw_operand(y, scope, cx, prt_raw_operand(x, scope, cx, acc)) }
     else if int_cmp_raw(op, x, y) { prt_operand(y, scope, cx, prt_operand(x, scope, cx, acc)) }
@@ -77,43 +76,44 @@ fn prt_reader(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect
   _ -> prt_ps(xp_positions(e), scope, cx, acc)
 }
 
-fn prt_boxed_var(x: Expr, boxed: [String]) : Bool = match sym_read_kind(x.kind) {
-  EName(nm) -> list_has(boxed, nm)
-  _        -> false
+fn prt_boxed_var(x: Expr, boxed: [Binder]) : Bool = match x.kind {
+  ELocal(l) -> pcs_has(boxed, l)
+  _         -> false
 }
 
-fn prt_read(e: Expr, nm: String, raw: Bool, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect =
-  if list_has(scope, nm) { ni_add(acc, nm, Rd(nm, e.line, e.col, cx.in_lam or list_has(cx.capt, nm), raw and list_has(cx.boxed, nm))) }
+# `raw` says the read copies the payload out of a box the binder holds.
+fn prt_read(e: Expr, l: LocalId, raw: Bool, scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect =
+  if pcs_has(scope, l) { ni_add_id(acc, local_raw(l), Rd(l, e.line, e.col, cx.in_lam or pcs_has(cx.capt, l), raw)) }
   else { acc }
 
 # An operand read raw copies the payload out whatever its own mode.
-fn prt_operand(x: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match sym_read_kind(x.kind) {
-  EName(nm) -> prt_read(x, nm, true, scope, cx, acc)
-  _        -> prt_expr(x, scope, cx, acc)
+fn prt_operand(x: Expr, scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match x.kind {
+  ELocal(l) -> prt_read(x, l, pcs_has(cx.boxed, l), scope, cx, acc)
+  _         -> prt_expr(x, scope, cx, acc)
 }
 
-fn prt_raw_operand(x: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match sym_read_kind(x.kind) {
-  EName(nm) -> prt_read(x, nm, true, scope, if list_has(cx.lent, nm) { prt_boxed(cx, nm) } else { cx }, acc)
-  _        -> prt_expr(x, scope, cx, acc)
+fn prt_raw_operand(x: Expr, scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match x.kind {
+  ELocal(l) -> prt_read(x, l, pcs_has(cx.boxed, l) or pcs_has(cx.lent, l), scope, cx, acc)
+  _         -> prt_expr(x, scope, cx, acc)
 }
 
-fn prt_args(xs: [Expr], raws: [Int], i: Int, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match xs {
+fn prt_args(xs: [Expr], raws: [Int], i: Int, scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match xs {
   []           -> acc
   [x, ...rest] ->
     prt_args(rest, raws, i + 1, scope, cx, if list_has_int(raws, i) { prt_operand(x, scope, cx, acc) } else { prt_expr(x, scope, cx, acc) })
 }
 
-fn prt_opt(oe: Option[Expr], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match oe {
+fn prt_opt(oe: Option[Expr], scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match oe {
   None    -> acc
   Some(e) -> prt_expr(e, scope, cx, acc)
 }
 
-fn prt_ps(ps: [XPos], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match ps {
+fn prt_ps(ps: [XPos], scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match ps {
   [] -> acc
   [XP(r, c), ...rest] -> prt_ps(rest, scope, cx, prt_expr(c, scope, match r { XLam -> prt_lam(cx)  _ -> cx }, acc))
 }
 
-fn prt_arms(arms: [Arm], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match arms {
+fn prt_arms(arms: [Arm], scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match arms {
   [] -> acc
   [Arm(pat, opt_g, body), ...rest] -> {
     let scope1 = prc_pat_bindings(pat, scope)
@@ -125,63 +125,70 @@ fn prt_arms(arms: [Arm], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Colle
 # A list cell holds each element boxed, so an element a list pattern binds
 # directly has a box; a variant slot may be bound raw.
 # A `return(x)` binder holds the handled result boxed.
-fn prt_boxed(cx: Prt, nm: String) : Prt = Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: [nm, ...cx.boxed], lent: cx.lent }
+fn prt_boxed(cx: Prt, b: Binder) : Prt = Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: [b, ...cx.boxed], lent: cx.lent }
 
 fn prt_arm_cx(p: Pattern, cx: Prt) : Prt = match p.pkind {
-  PList(_, _)       -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed), lent: cx.lent }
-  PVariant(_, _, _) -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed), lent: cx.lent }
-  _                 -> cx
+  PList(_, _)    -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed), lent: cx.lent }
+  PVariant(_, _) -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed), lent: cx.lent }
+  _              -> cx
 }
 
-fn prt_list_elems(p: Pattern, acc: [String]) : [String] = match p.pkind {
-  PList(subs, _)       -> prt_elems(subs, acc)
-  PVariant(_, _, subs) -> prt_nested(subs, acc)
-  PAs(_, sub)          -> prt_list_elems(sub, acc)
-  _                    -> acc
+fn prt_list_elems(p: Pattern, acc: [Binder]) : [Binder] = match p.pkind {
+  PList(subs, _)    -> prt_elems(subs, acc)
+  PVariant(_, subs) -> prt_nested(subs, acc)
+  PAs(_, sub)       -> prt_list_elems(sub, acc)
+  _                 -> acc
 }
 
-fn prt_elems(subs: [Pattern], acc: [String]) : [String] = match subs {
+fn prt_elems(subs: [Pattern], acc: [Binder]) : [Binder] = match subs {
   []           -> acc
   [q, ...rest] -> prt_elems(rest, match q.pkind {
-    PBind(nm) -> [nm, ...acc]
-    _         -> prt_list_elems(q, acc)
+    PBind(b) -> [b, ...acc]
+    _        -> prt_list_elems(q, acc)
   })
 }
 
-fn prt_nested(subs: [Pattern], acc: [String]) : [String] = match subs {
+fn prt_nested(subs: [Pattern], acc: [Binder]) : [Binder] = match subs {
   []           -> acc
   [q, ...rest] -> prt_nested(rest, prt_list_elems(q, acc))
 }
 
-fn prt_block(stmts: [Stmt], opt_tail: Option[Expr], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match stmts {
+fn prt_block(stmts: [Stmt], opt_tail: Option[Expr], scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match stmts {
   [] -> prt_opt(opt_tail, scope, cx, acc)
   [s, ...rest] -> match s {
-    SLet(pat, _, rhs)        -> prt_block(rest, opt_tail, prc_pat_bindings_skip_raw(pat, rhs, scope), cx, prt_expr(rhs, scope, cx, acc))
-    SVar(name, _, rhs, _, _) -> prt_block(rest, opt_tail, [name, ...scope], cx, prt_expr(rhs, scope, cx, acc))
-    _                        -> prt_block(rest, opt_tail, scope, cx, prt_exprs(stmt_exprs(s), scope, cx, acc))
+    SLet(pat, _, rhs)     -> prt_block(rest, opt_tail, prc_pat_bindings_skip_raw(pat, rhs, scope), cx, prt_expr(rhs, scope, cx, acc))
+    SVar(b, _, rhs, _, _) -> prt_block(rest, opt_tail, [b, ...scope], cx, prt_expr(rhs, scope, cx, acc))
+    _                     -> prt_block(rest, opt_tail, scope, cx, prt_exprs(stmt_exprs(s), scope, cx, acc))
   }
 }
 
-fn prt_exprs(es: [Expr], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match es {
+fn prt_exprs(es: [Expr], scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match es {
   []           -> acc
   [e, ...rest] -> prt_exprs(rest, scope, cx, prt_expr(e, scope, cx, acc))
 }
 
-fn prt_clauses(cs: [HClause], scope: [String], cx: Prt, aliases: [String], init_opt: Option[Expr], acc: UseAcc) : UseAcc / Collect = match cs {
+# A clause lends its op arguments and, in a stateful handle, every state
+# alias to raw operators, which read the payload and leave the box alone.
+fn prt_clauses(cs: [HClause], scope: [Binder], cx: Prt, aliases: [Binder], acc: UseAcc) : UseAcc / Collect = match cs {
   [] -> acc
   [HC(_, params, body, _, _), ...rest] -> {
-    let inner = list_append(scope, list_append(aliases, pcs_filter_non_resume(params)))
+    let own = pcs_filter_non_resume(params)
+    let inner = list_append(own, list_append(scope, aliases))
     let in_lam = pcs_clause_in_lam(cx.in_lam, params, body)
-    let lent = list_append(clause_lent_names(params, init_opt), cx.lent)
-    prt_clauses(rest, scope, cx, aliases, init_opt, prt_expr(body, inner, Prt { capt: scope, in_lam: in_lam, slots: cx.slots, boxed: cx.boxed, lent: lent }, acc))
+    let lent = list_append(list_append(own, aliases), cx.lent)
+    prt_clauses(rest, scope, cx, aliases, prt_expr(body, inner, Prt { capt: scope, in_lam: in_lam, slots: cx.slots, boxed: cx.boxed, lent: lent }, acc))
   }
 }
 
-fn prt_interp(parts: [IPart], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match parts {
+# A body is source text: its names are read as the binders in scope spell them.
+fn prt_interp(parts: [IPart], scope: [Binder], cx: Prt, acc: UseAcc) : UseAcc / Collect = match parts {
   [] -> acc
   [p, ...rest] -> prt_interp(rest, scope, cx, match p {
     IpLit(_, _) -> acc
-    IpExp(esrc) -> prt_opt(parse_interp_expr(esrc), scope, cx, acc)
+    IpExp(esrc) -> match parse_interp_expr(esrc) {
+      Some(parsed) -> prt_expr(pcs_span_expr(parsed, scope), scope, cx, acc)
+      None         -> acc
+    }
   })
 }
 
