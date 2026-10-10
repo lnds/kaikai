@@ -16,33 +16,43 @@ identity is taken to trap, so a homonym never inherits the verdict.
 """)]
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.spec_names
+import compiler.fnreg
+import compiler.ctor_ix
 import compiler.operators
 import compiler.marks
-import compiler.sym_read
 import compiler.util
 import compiler.expr_positions
 
-type TCand = TCand(FnId, String, Option[String], Option[[FnId]])
+type TCand = TCand(FnId, Option[String], Option[[FnId]])
 
 #[doc("The emitted symbols (`<mo>__<name>`, or the bare name at the root) of the functions that cannot trap.")]
-pub fn trapfree_syms(decls: [Decl]) : [String] = {
-  let cands = tf_cands(decls, [])
-  tf_syms(cands, tf_fix(cands, tf_seed(cands)))
+pub fn trapfree_syms(decls: [Decl], tab: SymTab, specs: SpecNames) : [String] = {
+  let cands = tf_cands(decls, tab, [])
+  tf_syms(cands, tf_fix(cands, tf_seed(cands)), tab, specs)
 }
 
-fn tf_cands(decls: [Decl], acc: [TCand]) : [TCand] = match decls {
+#[doc("The functions that cannot trap, by identity.")]
+pub fn trapfree_fns(decls: [Decl], tab: SymTab) : [FnId] = {
+  let cands = tf_cands(decls, tab, [])
+  tf_fix(cands, tf_seed(cands))
+}
+
+fn tf_cands(decls: [Decl], tab: SymTab, acc: [TCand]) : [TCand] = match decls {
   [] -> acc
   [d, ...rest] -> match d {
-    DFn(_, name, _, _, _, _, body, _, _, mo, id) ->
-      if sym_raw(fnid_sym(id)) < 0 { tf_cands(rest, acc) }
-      else { tf_cands(rest, [TCand(id, name, mo, tf_scan(body, Some([]))), ...acc]) }
-    _ -> tf_cands(rest, acc)
+    DFn(_, id, _, _, _, _, body, _, _, mo) ->
+      if sym_raw(fnid_sym(id)) < 0 { tf_cands(rest, tab, acc) }
+      else { tf_cands(rest, tab, [TCand(id, mo, tf_scan(body, tab, Some([]))), ...acc]) }
+    _ -> tf_cands(rest, tab, acc)
   }
 }
 
 fn tf_seed(cands: [TCand]) : [FnId] = match cands {
   [] -> []
-  [TCand(id, _, _, local), ...rest] -> match local { Some(_) -> [id, ...tf_seed(rest)] None -> tf_seed(rest) }
+  [TCand(id, _, local), ...rest] -> match local { Some(_) -> [id, ...tf_seed(rest)] None -> tf_seed(rest) }
 }
 
 fn tf_fix(cands: [TCand], free: [FnId]) : [FnId] = {
@@ -52,7 +62,7 @@ fn tf_fix(cands: [TCand], free: [FnId]) : [FnId] = {
 
 fn tf_keep(cands: [TCand], free: [FnId]) : [FnId] = match cands {
   [] -> []
-  [TCand(id, _, _, local), ...rest] ->
+  [TCand(id, _, local), ...rest] ->
     if tf_has(free, id) and tf_callees_free(local, free) { [id, ...tf_keep(rest, free)] }
     else { tf_keep(rest, free) }
 }
@@ -67,9 +77,11 @@ fn tf_has(ids: [FnId], id: FnId) : Bool = match ids {
   [i, ...rest] -> fnid_eq(i, id) or tf_has(rest, id)
 }
 
-fn tf_syms(cands: [TCand], free: [FnId]) : [String] = match cands {
+fn tf_syms(cands: [TCand], free: [FnId], tab: SymTab, specs: SpecNames) : [String] = match cands {
   [] -> []
-  [TCand(id, n, mo, _), ...rest] -> if tf_has(free, id) { [tf_sym(n, mo), ...tf_syms(rest, free)] } else { tf_syms(rest, free) }
+  [TCand(id, mo, _), ...rest] ->
+    if tf_has(free, id) { [tf_sym(written_text(fn_emit_name(tab, specs, id)), mo), ...tf_syms(rest, free, tab, specs)] }
+    else { tf_syms(rest, free, tab, specs) }
 }
 
 fn tf_sym(n: String, mo: Option[String]) : String = match mo {
@@ -79,30 +91,29 @@ fn tf_sym(n: String, mo: Option[String]) : String = match mo {
 
 # `Some(callees)` while nothing in `e` traps but its calls of `callees`;
 # `None` once something does.
-fn tf_scan(e: Expr, acc: Option[[FnId]]) : Option[[FnId]] = match acc {
+fn tf_scan(e: Expr, tab: SymTab, acc: Option[[FnId]]) : Option[[FnId]] = match acc {
   None -> None
-  Some(cs) -> match tf_node(e, cs) {
+  Some(cs) -> match tf_node(e, tab, cs) {
     None -> None
-    Some(cs1) -> tf_children(xp_positions(e), Some(cs1))
+    Some(cs1) -> tf_children(xp_positions(e), tab, Some(cs1))
   }
 }
 
-fn tf_children(ps: [XPos], acc: Option[[FnId]]) : Option[[FnId]] = match ps {
+fn tf_children(ps: [XPos], tab: SymTab, acc: Option[[FnId]]) : Option[[FnId]] = match ps {
   [] -> acc
   [XP(r, c), ...rest] -> match r {
-    XLam -> tf_children(rest, acc)
-    _    -> tf_children(rest, tf_scan(c, acc))
+    XLam -> tf_children(rest, tab, acc)
+    _    -> tf_children(rest, tab, tf_scan(c, tab, acc))
   }
 }
 
-fn tf_node(e: Expr, cs: [FnId]) : Option[[FnId]] = match sym_read_kind(e.kind) {
+fn tf_node(e: Expr, tab: SymTab, cs: [FnId]) : Option[[FnId]] = match e.kind {
   EBinop(op, _, _) -> if binop_is_division(op) { None } else { Some(cs) }
-  ECall(f, _) -> tf_head(f, cs)
+  ECall(f, _) -> tf_head(f, tab, cs)
   EBlock(ss, _) -> if all(ss, (s) => tf_stmt_clean(s)) { Some(cs) } else { None }
   EIndex(_, _) -> None
   EBang(_) -> None
-  EHandle(_, _, _, _, _, _, _, _) -> None
-  EModCall(_, n) -> if tf_is_ctor(n) { Some(cs) } else { None }
+  EHandle(_, _, _, _, _, _, _) -> None
   _ -> Some(cs)
 }
 
@@ -113,13 +124,11 @@ fn tf_stmt_clean(s: Stmt) : Bool = match s {
   _ -> false
 }
 
-# A call of a resolved fn adds its identity; a spelled-only callee is not
-# known, so it traps.
-fn tf_head(f: Expr, cs: [FnId]) : Option[[FnId]] = match f.kind {
-  ESym(s, inst, n) -> if tf_is_ctor(n) { Some(cs) } else if sym_raw(s) < 0 { None } else { Some([FnId(s, inst), ...cs]) }
-  EName(n) -> if tf_is_ctor(n) { Some(cs) } else { None }
+# A constructor builds a value; a call of a fn adds its identity; a
+# closure or an effect op is not known, so it traps.
+fn tf_head(f: Expr, tab: SymTab, cs: [FnId]) : Option[[FnId]] = match f.kind {
+  ESym(s, inst) -> if sym_is_ctor(tab, s) { Some(cs) } else if sym_raw(s) < 0 { None } else { Some([FnId(s, inst), ...cs]) }
   EMark(m) -> if tf_mark_clean(m) { Some(cs) } else { None }
-  EModCall(_, n) -> if tf_is_ctor(n) { Some(cs) } else { None }
   _ -> None
 }
 
@@ -128,9 +137,4 @@ fn tf_mark_clean(m: Mark) : Bool = match m {
   MkDup          -> true
   MkTcrecStep(_) -> true
   _              -> mark_is_reuse(m)
-}
-
-fn tf_is_ctor(n: String) : Bool = match char_at(n, 0) {
-  Some(c) -> c >= 'A' and c <= 'Z'
-  None -> false
 }

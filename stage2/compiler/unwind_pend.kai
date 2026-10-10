@@ -20,8 +20,8 @@ share a position keep the intersection of their names.
 
 import compiler.ast
 import compiler.util
+import compiler.local_names
 import compiler.emit_shared
-import compiler.emit_tcrec_live
 import compiler.unwind_cx
 import compiler.unwind_calls
 import compiler.unwind_walk
@@ -42,7 +42,7 @@ register holding the frame's fiber cache, absent until the lowering
 makes one. `traps` asks for the native landing pads; `pad` is the open
 one, if any.
 """)]
-pub type UnwFrame = { ucx: UnwCx, sites: [UnwSite], bound: [String], arms: [String], own: [String], scr: Bool, mstack: [UnwM], fib: Option[String], traps: Bool, pad: UnwPadOpen }
+pub type UnwFrame = { ucx: UnwCx, sites: [UnwSite], bound: [LocalId], arms: [LocalId], own: [LocalId], scr: Bool, mstack: [UnwM], fib: Option[String], traps: Bool, pad: UnwPadOpen }
 
 #[doc("An open landing pad: the register naming it and every register it releases, the enclosing pads' included; `pushed` are the registers the enclosing brackets hold; `flight` the owned operand values computed and not yet taken by their parent, which every pad opened meanwhile releases too.")]
 pub type UnwPadOpen = { reg: String, regs: [String], pushed: [String], flight: [String] }
@@ -75,48 +75,49 @@ fn up_blank(u: UnwFrame) : Bool = match u.fib {
 }
 
 #[doc("""
-The frame of fn `enc` declared with `row`, or `None` for one without a
-declaration: the typer holds a body to its row, so a fn whose row cannot
-unwind and that installs no handler makes no call that can.
+The frame of the fn emitted as `enc` and declared with `row`, or `None`
+for one without a declaration: the typer holds a body to its row, so a fn
+whose row cannot unwind and that installs no handler makes no call that
+can. `locals` names the binders of the declaration the frame is in.
 """)]
-pub fn unw_fn_frame(u: UnwFrame, enc: String, row: Option[RowExpr], seeds: [String], params: [String], body: Expr) : UnwFrame / Console =
+pub fn unw_fn_frame(u: UnwFrame, locals: LocalNames, enc: String, row: Option[RowExpr], seeds: [LocalId], params: [LocalId], body: Expr) : UnwFrame / Console =
   match row {
-    Some(r) -> if not u.traps and unw_row_class(r, u.ucx) == 0 and not list_has(u.ucx.handles, enc) { up_exits_only(u, seeds, params, body) }
-               else { unw_frame(u, seeds, params, body) }
-    None -> unw_frame(u, seeds, params, body)
+    Some(r) -> if not u.traps and unw_row_class(r, u.ucx) == 0 and not list_has(u.ucx.handles, enc) { up_exits_only(u, locals, seeds, params, body) }
+               else { unw_frame(u, locals, seeds, params, body) }
+    None -> unw_frame(u, locals, seeds, params, body)
   }
 
 # A frame that cannot unwind keeps only its early returns: its calls are
 # never bracketed.
-fn up_exits_only(u: UnwFrame, seeds: [String], params: [String], body: Expr) : UnwFrame =
+fn up_exits_only(u: UnwFrame, locals: LocalNames, seeds: [LocalId], params: [LocalId], body: Expr) : UnwFrame =
   if not unw_has_exit(body) { unw_blank(u) }
   else {
-    let f = unw_frame(u, seeds, params, body)
+    let f = unw_frame(u, locals, seeds, params, body)
     UnwFrame { ucx: f.ucx, sites: filter(f.sites, (s) => unw_is_exit(s)), bound: f.bound, arms: f.arms, own: f.own, scr: f.scr, mstack: f.mstack, fib: f.fib, traps: f.traps, pad: f.pad }
   }
 
-#[doc("The frame of `body` with owned entry binders `seeds` among its params `params`.")]
-pub fn unw_frame(u: UnwFrame, seeds: [String], params: [String], body: Expr) : UnwFrame =
+#[doc("The frame of `body` with owned entry binders `seeds` among its params `params`; `locals` names the binders of the declaration it is in.")]
+pub fn unw_frame(u: UnwFrame, locals: LocalNames, seeds: [LocalId], params: [LocalId], body: Expr) : UnwFrame =
   if not u.traps and not unw_scan(body, u.ucx) { unw_blank(u) }
   else {
     let ucx = u.ucx
     let bound = unw_binders(body, params)
     let banned = unw_dups(bound, [], [])
-    UnwFrame { ucx: ucx, sites: unw_walk(ucx, unw_minus(seeds, banned), bound, banned, params, body, u.traps), bound: bound,
+    UnwFrame { ucx: ucx, sites: unw_walk(ucx, locals, unw_minus(seeds, banned), bound, banned, params, body, u.traps), bound: bound,
                arms: unw_minus(unw_arm_binders(body, []), banned), own: [], scr: false, mstack: [], fib: None,
                traps: u.traps, pad: up_no_pad() }
   }
 
-#[doc("The names among `names` the emitter may register: a match-arm binder only once its arm owns it.")]
-pub fn unw_admit(u: UnwFrame, names: [String]) : [String] = match names {
+#[doc("The binders among `names` the emitter may register: a match-arm binder only once its arm owns it.")]
+pub fn unw_admit(u: UnwFrame, names: [LocalId]) : [LocalId] = match names {
   [] -> []
   [n, ...rest] ->
-    if list_has(u.arms, n) and not list_has(u.own, n) { unw_admit(u, rest) }
+    if unw_has(u.arms, n) and not unw_has(u.own, n) { unw_admit(u, rest) }
     else { [n, ...unw_admit(u, rest)] }
 }
 
 #[doc("`u` with the arm binders `names` owned by the arm being emitted.")]
-pub fn unw_owning(u: UnwFrame, names: [String]) : UnwFrame =
+pub fn unw_owning(u: UnwFrame, names: [LocalId]) : UnwFrame =
   if u.arms == [] { u } else { UnwFrame { ucx: u.ucx, sites: u.sites, bound: u.bound, arms: u.arms, own: list_append(names, u.own), scr: u.scr, mstack: u.mstack, fib: u.fib, traps: u.traps, pad: u.pad } }
 
 #[doc("`u` with its fiber held in native register `f`.")]
@@ -151,12 +152,12 @@ pub fn unw_mreg(u: UnwFrame, sd: String) : String = match u.mstack {
 }
 
 #[doc("The params a fn owns on entry: not borrowed, not raw under its unboxed signature, not a capability.")]
-pub fn unw_param_seeds(params: [Param], sig: Option[UFnSig], ucx: UnwCx) : [String] = match sig {
+pub fn unw_param_seeds(params: [Param], sig: Option[UFnSig], ucx: UnwCx) : [LocalId] = match sig {
   Some(US(_, _, mask)) -> uw_seeds_masked(params, mask, ucx)
   None                 -> uw_seeds_masked(params, [], ucx)
 }
 
-fn uw_seeds_masked(params: [Param], mask: [Bool], ucx: UnwCx) : [String] = match params {
+fn uw_seeds_masked(params: [Param], mask: [Bool], ucx: UnwCx) : [LocalId] = match params {
   [] -> []
   [p, ...rest] -> {
     let raw = match mask {
@@ -168,29 +169,29 @@ fn uw_seeds_masked(params: [Param], mask: [Bool], ucx: UnwCx) : [String] = match
       []        -> []
     }
     let tail = uw_seeds_masked(rest, mrest, ucx)
-    if raw or p.pborrow or unw_is_cap_param(ucx, p.ptype) { tail } else { [p.pname, ...tail] }
+    if raw or p.pborrow or unw_is_cap_param(ucx, p.ptype) { tail } else { [p.binder.id, ...tail] }
   }
 }
 
 #[doc("The params a handler clause owns: every op argument; the continuation is always last.")]
-pub fn unw_clause_seeds(c: ClauseInfo) : [String] = match c {
+pub fn unw_clause_seeds(c: ClauseInfo) : [LocalId] = match c {
   CI(_, _, _, _, cps, _, _, _, _, _, _) -> uw_all_but_last(cps)
 }
 
-fn uw_all_but_last(ps: [Param]) : [String] = match ps {
+fn uw_all_but_last(ps: [Param]) : [LocalId] = match ps {
   []           -> []
   [_]          -> []
-  [p, ...rest] -> [p.pname, ...uw_all_but_last(rest)]
+  [p, ...rest] -> [p.binder.id, ...uw_all_but_last(rest)]
 }
 
 #[doc("The binders registered at the call `x`, if it is a site; a call that cannot unwind never is, even where one that can shares its position and callee.")]
-pub fn unw_call_of(u: UnwFrame, x: Expr) : Option[[String]] = match u.sites {
+pub fn unw_call_of(u: UnwFrame, x: Expr) : Option[[LocalId]] = match u.sites {
   [] -> None
   _  -> if up_brackets(u, x) { unw_call_names(u.sites, x) } else { None }
 }
 
 #[doc("The binders the landing pad at `x` releases, if `x` has one; a call that can unwind is bracketed instead, never padded.")]
-pub fn unw_pad_of(u: UnwFrame, x: Expr) : Option[[String]] = match u.sites {
+pub fn unw_pad_of(u: UnwFrame, x: Expr) : Option[[LocalId]] = match u.sites {
   [] -> None
   _  -> if up_brackets(u, x) { None } else { unw_pad_names(u.sites, x) }
 }
@@ -201,7 +202,7 @@ fn up_brackets(u: UnwFrame, x: Expr) : Bool = match x.kind {
 }
 
 #[doc("The binders registered at the call `x` (an `ECall`), if it is a site.")]
-pub fn unw_call_names(sites: [UnwSite], x: Expr) : Option[[String]] = match sites {
+pub fn unw_call_names(sites: [UnwSite], x: Expr) : Option[[LocalId]] = match sites {
   [] -> None
   _  -> match x.kind {
     ECall(_, _) -> unw_call_at(sites, x.site)
