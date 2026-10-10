@@ -171,7 +171,9 @@ Conn`), a C-symbol override (`extern "C"("PQconnectdb") fn
 connect(...)`), and the fixed-width marshal types (`U8`–`I64`,
 `F32`) — is covered in `kai info ffi`.
 
-`main` is the program entry point. When it returns `Int`, that value is
+`main` is the program entry point. Only the root module's `main` is —
+the file the build was given; a `main` in an imported module is an
+ordinary function, with no implicit row. When it returns `Int`, that value is
 the process exit status (POSIX keeps the low 8 bits), so `Err(_) -> 1`
 signals failure to a shell, `set -e`, or a CI gate; any other return
 type exits 0. Buffered output is flushed on the way out — unlike

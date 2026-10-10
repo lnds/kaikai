@@ -128,7 +128,9 @@ per file, so a package is compiled once rather than once per file.
 Each file is first checked on its own, as the root it is when built
 alone, and a file that does not check fails with its own error, after
 the files before it ran. A file's run is exactly the blocks its own
-build would run, in the same order. Files that each check alone but
+build would run, in the same order. The runner is that binary's entry
+point: a test file's own `main` stays a function its blocks can call,
+typed as when the file is built alone. Files that each check alone but
 cannot build together fail the run with the shared build's error
 before any test runs: two test files declaring the same `impl`, for
 example. Move what they share into a module both import.
