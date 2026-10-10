@@ -30,16 +30,16 @@
 #     row helpers) and `param_ty` / `ty_is_unboxable_t` — the AST->Ty
 #     resolution the classifier needs to read declared param/return
 #     types.
-#   - `scan_uses_expr` + the `scan_uses_*` family and the `iscan_*`
-#     interpolation re-scanner — the free-variable use scanner that
-#     unbox / perceus consult to keep let-bindings boxed when their
-#     only read site is inside a captured lambda or a `#{...}` interp
-#     slot.
+#   - `scan_uses_expr` + the `scan_uses_*` family — the use scanner
+#     that unbox / perceus consult to keep let-bindings boxed when
+#     their only read site is inside a captured lambda.
+#   - the `iscan_*` scanner — splits an interpolation span for the
+#     passes that run before the lift.
 #
 # Bundle order: ... infer, fnreg, unbox, main. fnreg imports infer for
 # `Use` / `IPart` / `IScan` / `unit_canon` / `string_contains_dot`,
-# parse for `parse_interp_expr`, and ast + util for the shared AST
-# nodes and string helpers. It has zero upward references.
+# and ast + util for the shared AST nodes and string helpers. It has
+# zero upward references.
 
 import compiler.util
 import compiler.ast
@@ -50,8 +50,6 @@ import compiler.written
 import compiler.symtab
 import compiler.decl_text
 import compiler.spec_names
-import compiler.local_names
-import compiler.parse
 import compiler.infer
 import compiler.scalar_ty
 
@@ -593,27 +591,6 @@ pub fn starts_with_loop(s: String, prefix: String, i: Int) : Bool {
 }
 
 
-# ====================================================================
-# m12.8.x phase 2 (Bug 4): lift `"...#{x}..."` interpolation parts
-# into the pre-inference AST so the typer + protocol-call rewrite see
-# them. Without this the interp body is parsed at emit time and
-# routed through the universal `kai_to_string` runtime, which
-# bypasses any user-defined `impl Show for T`.
-# ====================================================================
-#
-# Run only when the program declares `protocol Show` (the
-# `op_names` list contains "show"); otherwise leave EStr nodes alone
-# so files that just use `#{int_to_string(x)}` and never load the
-# stdlib protocols continue to work via the legacy emit-time path.
-#
-# Lowering shape: a string `"prefix #{e1} mid #{e2} suffix"` becomes
-#
-#   string_concat_all(["prefix ", show(e1), " mid ", show(e2), " suffix"])
-#
-# Each interp body `e_i` is parsed using `parse_expr` (same parser
-# the emitter used to call lazily) and then recursively desugared so
-# nested interpolations also lift.
-
 pub fn row_empty() : Row = Row {
   labels:        [],
   tail:          None,
@@ -745,80 +722,46 @@ pub fn ty_is_unboxable_t(t: Ty) : Bool {
   }
 }
 
-#[doc("Every read of a binder of `ns` in `e`, in source order; `in_lam` marks a read inside a lambda or handler clause.")]
-pub fn scan_uses_expr(ns: LocalNames, e: Expr, in_lam: Bool) : [Use] / Console =
-  list_reverse(su_expr(ns, e, in_lam, []))
+#[doc("Every read of a local in `e`, in source order; `in_lam` marks a read inside a lambda or handler clause.")]
+pub fn scan_uses_expr(e: Expr, in_lam: Bool) : [Use] =
+  list_reverse(su_expr(e, in_lam, []))
 
 #[doc("`scan_uses_expr` over a statement list.")]
-pub fn scan_uses_in_stmts(ns: LocalNames, stmts: [Stmt], in_lam: Bool) : [Use] / Console =
-  scan_uses_expr(ns, mk_expr(EBlock(stmts, None), 0, 0), in_lam)
-
-#[doc("The reads of a binder of `ns` inside the `#{...}` slots of an interpolated string span.")]
-pub fn scan_uses_in_interp(ns: LocalNames, span: String, is_triple: Bool, in_lam: Bool) : [Use] / Console =
-  list_reverse(su_interp(ns, span, is_triple, in_lam, []))
+pub fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] =
+  scan_uses_expr(mk_expr(EBlock(stmts, None), 0, 0), in_lam)
 
 # Uses are consed onto `acc` in reverse; the public entries restore source order.
-fn su_expr(ns: LocalNames, e: Expr, in_lam: Bool, acc: [Use]) : [Use] / Console = match e.kind {
+fn su_expr(e: Expr, in_lam: Bool, acc: [Use]) : [Use] = match e.kind {
   ELocal(l) -> [U(l, e.line, e.col, in_lam), ...acc]
-  # Only a re-parsed span holds a written name: it reads every binder spelled so.
-  EName(w) -> su_spelled(ln_ids_named(ns, w), e, in_lam, acc)
-  # Interpolation reads live in the raw span, not in child nodes.
-  EStr(span, is_triple) -> su_interp(ns, span, is_triple, in_lam, acc)
   # An op clause compiles to its own function reading captures from a
   # boxed env, so its reads count as in-lambda; the return clause runs
   # inline, which the shared position table does not distinguish.
   EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-    let a1 = su_opt(ns, init_opt, in_lam, su_expr(ns, body, in_lam, acc))
-    let a2 = su_clauses(ns, clauses, su_opt_return(ns, ret_opt, in_lam, a1))
+    let a1 = su_opt(init_opt, in_lam, su_expr(body, in_lam, acc))
+    let a2 = su_clauses(clauses, su_opt_return(ret_opt, in_lam, a1))
     a2
   }
-  _ -> su_positions(ns, xp_positions(e), in_lam, acc)
+  _ -> su_positions(xp_positions(e), in_lam, acc)
 }
 
-fn su_spelled(ls: [LocalId], e: Expr, in_lam: Bool, acc: [Use]) : [Use] = match ls {
-  []          -> acc
-  [l, ...rest] -> su_spelled(rest, e, in_lam, [U(l, e.line, e.col, in_lam), ...acc])
-}
-
-fn su_positions(ns: LocalNames, ps: [XPos], in_lam: Bool, acc: [Use]) : [Use] / Console = match ps {
+fn su_positions(ps: [XPos], in_lam: Bool, acc: [Use]) : [Use] = match ps {
   [] -> acc
-  [XP(r, x), ...rest] -> su_positions(ns, rest, in_lam, su_expr(ns, x, in_lam or not xrole_inline(r), acc))
+  [XP(r, x), ...rest] -> su_positions(rest, in_lam, su_expr(x, in_lam or not xrole_inline(r), acc))
 }
 
-fn su_opt(ns: LocalNames, o: Option[Expr], in_lam: Bool, acc: [Use]) : [Use] / Console = match o {
+fn su_opt(o: Option[Expr], in_lam: Bool, acc: [Use]) : [Use] = match o {
   None -> acc
-  Some(x) -> su_expr(ns, x, in_lam, acc)
+  Some(x) -> su_expr(x, in_lam, acc)
 }
 
-fn su_opt_return(ns: LocalNames, o: Option[HReturn], in_lam: Bool, acc: [Use]) : [Use] / Console = match o {
+fn su_opt_return(o: Option[HReturn], in_lam: Bool, acc: [Use]) : [Use] = match o {
   None -> acc
-  Some(HR(_, b, _, _)) -> su_expr(ns, b, in_lam, acc)
+  Some(HR(_, b, _, _)) -> su_expr(b, in_lam, acc)
 }
 
-fn su_clauses(ns: LocalNames, cs: [HClause], acc: [Use]) : [Use] / Console = match cs {
+fn su_clauses(cs: [HClause], acc: [Use]) : [Use] = match cs {
   [] -> acc
-  [HC(_, _, b, _, _), ...rest] -> su_clauses(ns, rest, su_expr(ns, b, true, acc))
-}
-
-fn su_interp(ns: LocalNames, span: String, is_triple: Bool, in_lam: Bool, acc: [Use]) : [Use] / Console {
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end,
-                            IScan { parts: [], lit_start: body_start, i: body_start })
-  su_interp_parts(ns, parts, in_lam, acc)
-}
-
-fn su_interp_parts(ns: LocalNames, parts: [IPart], in_lam: Bool, acc: [Use]) : [Use] / Console = match parts {
-  [] -> acc
-  [IpLit(_, _), ...rest] -> su_interp_parts(ns, rest, in_lam, acc)
-  [IpExp(esrc), ...rest] -> {
-    let a1 = match parse_interp_expr(esrc) {
-      Some(e) -> su_expr(ns, e, in_lam, acc)
-      None -> acc
-    }
-    su_interp_parts(ns, rest, in_lam, a1)
-  }
+  [HC(_, _, b, _, _), ...rest] -> su_clauses(rest, su_expr(b, true, acc))
 }
 
 
