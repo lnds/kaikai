@@ -14,6 +14,7 @@
 # defence.
 
 import compiler.ast
+import compiler.sym_read
 
 # KAI_VEC_REC_MAX in the runtime.
 fn vr_rec_max() : Int = 8
@@ -40,26 +41,128 @@ fn vr_fields_all_scalar(fs: [FieldDecl]) : Bool = match fs {
 }
 
 #[doc("True iff `opt_t` is an element type the Vec runtime stores as an inline all-scalar record (the REC carrier): a known record of 1..8 concrete raw-scalar fields. Both backends gate the raw get/set/push fusion on this one verdict.")]
-pub fn vec_elem_is_rec_carrier(recs: [RecInfo], opt_t: Option[Ty]) : Bool = match opt_t {
-  Some(t) -> vr_rec_carrier_t(recs, t)
+pub fn vec_elem_is_rec_carrier(recs: [RecInfo], opt_t: Option[Ty]) : Bool = match vec_rec_arity(recs, opt_t) {
+  Some(_) -> true
   None    -> false
 }
 
-fn vr_rec_carrier_t(recs: [RecInfo], t: Ty) : Bool = match t {
+#[doc("Field count of a REC-carrier element type, which fixes its stride at 8 bytes per field. `None` for any other element type.")]
+pub fn vec_rec_arity(recs: [RecInfo], opt_t: Option[Ty]) : Option[Int] = match opt_t {
+  Some(t) -> vr_carrier_arity(recs, t)
+  None    -> None
+}
+
+fn vr_carrier_arity(recs: [RecInfo], t: Ty) : Option[Int] = match t {
   TyCon(_, cname, cargs, _) ->
     match rec_find_arity_loop(recs, cname, list_length(cargs), None) {
-      None     -> false
+      None     -> None
       Some(ri) -> match ri {
         RI(_, _, fs, _, _) -> {
           let n = list_length(fs)
-          n >= 1 and n <= vr_rec_max() and vr_fields_all_scalar(fs)
+          if n >= 1 and n <= vr_rec_max() and vr_fields_all_scalar(fs) { Some(n) } else { None }
         }
       }
     }
-  _ -> false
+  _ -> None
 }
 
 #[doc("Declaration-order column of `field` when `elem_t` is a REC-carrier record: the slot a fused `vec_get(v, i).field` loads raw. `None` keeps the unfused boxed path.")]
 pub fn vec_rec_field_slot(recs: [RecInfo], elem_t: Option[Ty], field: String) : Option[Int] =
   if vec_elem_is_rec_carrier(recs, elem_t) { field_index_of(recs, elem_t, field) }
   else { None }
+
+# ---- bare-word paths ------------------------------------------------
+#
+# An Int or Real payload can cross the buffer as its bare 8-byte word.
+# Only a value typed EXACTLY `Int` / `Real` qualifies: the runtime
+# guards trap when the buffer holds any other shape, so a wider static
+# verdict would turn a working boxed access into a trap.
+
+#[doc("How a fused Vec access moves one payload: a bare Int word or a bare Real word.")]
+pub type VecBits = VbInt | VbReal
+
+#[doc("The word kind of a value typed exactly `Int` or `Real`; `None` keeps the boxed path.")]
+pub fn vec_bits_of(opt_t: Option[Ty]) : Option[VecBits] = match opt_t {
+  Some(t) -> match t {
+    TyInt  -> Some(VbInt)
+    TyReal -> Some(VbReal)
+    _      -> None
+  }
+  None -> None
+}
+
+#[doc("The operands of a `vec_get(v, i)` call, and whether it borrows `v` instead of consuming it.")]
+pub type VecGet = { v: Expr, i: Expr, borrows: Bool }
+
+#[doc("The operands of a `vec_get` / `vec_get_borrow` call; `None` for any other expression.")]
+pub fn vec_get_call(k: ExprKind) : Option[VecGet] = match k {
+  ECall(f, cargs) -> match sym_read_kind(f.kind) {
+    EVar(callee) ->
+      if callee == "vec_get" or callee == "vec_get_borrow" {
+        match cargs {
+          [v, i] -> Some(VecGet { v: v, i: i, borrows: callee == "vec_get_borrow" })
+          _      -> None
+        }
+      } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+#[doc("Column and arity of a REC-carrier field read.")]
+pub type VecCol = VecCol(Int, Int)
+
+#[doc("A Vec read lowered to one bare word: `vec_get(v, i).f` on a REC carrier (`col` set) or `vec_get(v, i)` on a flat-scalar vec.")]
+pub type VecRawRead = { get: VecGet, col: Option[VecCol], bits: VecBits }
+
+#[doc("The bare-word read a node of kind `k` and type `opt_t` lowers to; `None` keeps the boxed path.")]
+pub fn vec_raw_read(recs: [RecInfo], k: ExprKind, opt_t: Option[Ty]) : Option[VecRawRead] = match vec_bits_of(opt_t) {
+  None       -> None
+  Some(bits) -> match k {
+    EField(base, fname) -> vr_field_read(recs, base, fname, bits)
+    ECall(_, _)         -> match vec_get_call(k) {
+      Some(g) -> Some(VecRawRead { get: g, col: None, bits: bits })
+      None    -> None
+    }
+    _ -> None
+  }
+}
+
+fn vr_field_read(recs: [RecInfo], base: Expr, fname: String, bits: VecBits) : Option[VecRawRead] = match vec_get_call(base.kind) {
+  None    -> None
+  Some(g) -> match vec_rec_field_slot(recs, base.ty, fname) {
+    None       -> None
+    Some(fidx) -> match vec_rec_arity(recs, base.ty) {
+      Some(n) -> Some(VecRawRead { get: g, col: Some(VecCol(fidx, n)), bits: bits })
+      None    -> None
+    }
+  }
+}
+
+#[doc("Whether a backend takes bare-word Vec reads, and the records its verdict consults.")]
+pub type VecRawCx = VrOff | VrOn([RecInfo])
+
+#[doc("True when the backend lowers this node to a bare-word Vec read, so its value is a raw scalar.")]
+pub fn vec_reads_raw(cx: VecRawCx, k: ExprKind, opt_t: Option[Ty]) : Bool = match cx {
+  VrOff      -> false
+  VrOn(recs) -> match vec_raw_read(recs, k, opt_t) {
+    Some(_) -> true
+    None    -> false
+  }
+}
+
+#[doc("The word kind of each field of a record literal stored into a REC carrier, in literal order. `None` unless the literal spells every field and each is exactly `Int` or `Real`.")]
+pub fn vec_rec_lit_bits(recs: [RecInfo], lit_t: Option[Ty], fis: [FieldInit]) : Option[[VecBits]] = match vec_rec_arity(recs, lit_t) {
+  None    -> None
+  Some(n) -> if list_length(fis) == n { vr_field_bits(fis, []) } else { None }
+}
+
+fn vr_field_bits(fis: [FieldInit], acc: [VecBits]) : Option[[VecBits]] = match fis {
+  []            -> Some(list_reverse(acc))
+  [fi, ...rest] -> match fi {
+    FI(_, e) -> match vec_bits_of(e.ty) {
+      Some(b) -> vr_field_bits(rest, [b, ...acc])
+      None    -> None
+    }
+  }
+}
