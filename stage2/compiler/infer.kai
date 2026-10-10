@@ -53,7 +53,6 @@ import compiler.entry
 import compiler.symtab
 import compiler.symtab_build
 import compiler.modules
-import compiler.module_table
 import compiler.loop_lower
 import compiler.doc_attr
 import compiler.native_prims
@@ -78,6 +77,9 @@ import compiler.infer_unit_alias
 import compiler.tycon_scheme_home
 import compiler.tycon_ref
 import compiler.scope_file
+import compiler.scope_view
+import compiler.core_modules
+import compiler.name_report
 import compiler.homonym
 import compiler.record_fields
 import compiler.field_privacy
@@ -1013,11 +1015,11 @@ fn inf_tycon_arg_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : St
     None      -> inf_ty_to_string_ow(tab, owners, t)
   }
 
-fn inf_head_owner_of(owners: [HeadOwnerEntry], s: SymId) : Option[String] =
+fn inf_head_owner_of(owners: [HeadOwnerEntry], s: SymId) : Option[SymId] =
   match owners {
     [] -> None
     [HOE(n, mods), ...rest] ->
-      if sym_same(n, s) { first_string(mods) }
+      if sym_same(n, s) { head(mods) }
       else { inf_head_owner_of(rest, s) }
   }
 
@@ -1025,14 +1027,9 @@ fn inf_head_owner_of(owners: [HeadOwnerEntry], s: SymId) : Option[String] =
 pub fn inf_tycon_display_ow(tab: SymTab, owners: [HeadOwnerEntry], s: SymId) : String = {
   let n = written_text(decl_name(tab, s))
   match inf_head_owner_of(owners, s) {
-    Some(own) -> if own != "" and st_valid(tab, s) and sym_contested(tab, s) { concat_all([own, ".", n]) } else { n }
+    Some(own) -> if st_valid(tab, own) and st_valid(tab, s) and sym_contested(tab, s) { "#{sym_name(tab, own)}.#{n}" } else { n }
     None      -> n
   }
-}
-
-fn first_string(xs: [String]) : Option[String] = match xs {
-  [] -> None
-  [x, ..._] -> Some(x)
 }
 
 #[doc("Render a resolved Ty as its surface display string (with a non-empty effect row suffix). Shared by the typed-AST dumps and consumers like kai lint.")]
@@ -2374,7 +2371,7 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: UnionTable,
                carriers: [SymId] }
 
 #[doc("infer: a nominal head and the modules that declare it.")]
-pub type HeadOwnerEntry = HOE(SymId, [String])
+pub type HeadOwnerEntry = HOE(SymId, [SymId])
 
 #[doc("infer: the empty typing environment.")]
 pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), tab: st_empty(), index: idx_empty(), vindex: vix_empty(), locals: idx_empty(), carriers: [] }
@@ -2537,22 +2534,18 @@ fn env_candidates(env: TyEnv, root: SymId, ss: [SymId], acc: [TyCandidate]) : [T
     } }
 }
 
-# The homonyms a bare `nm` may reach from the file under inference. A
-# module the file neither declares, picks, opens nor sees as a core is
-# out of its scope; when no candidate is in scope all of them stay, so
-# the use keeps the reading it had.
-fn st_visible_candidates(st: InferState, nm: String) : [TyCandidate] =
-  match ty_env_collect_candidates(st.env, nm) {
-    []  -> []
-    [c] -> [c]
-    all -> {
-      let reader = st_reader(st)
-      match filter(all, (c) => tsh_fn_visible(st.env.ty_homes, reader, written_text(sym_home(st.env.tab, c.sym)), nm)) {
-        []  -> all
-        vis -> vis
-      }
-    }
-  }
+# The functions a bare `nm` may reach from the file under inference:
+# those of a module the file declares, picks from, opens or sees as a
+# core. A module the reader never imported is out of its scope, whatever
+# the program loaded.
+fn st_visible_candidates(st: InferState, nm: String) : [TyCandidate] = {
+  let v = st_scope(st)
+  filter(ty_env_collect_candidates(st.env, nm), (c) => sv_reaches(v, sym_owner(st.env.tab, c.sym), nm))
+}
+
+# The functions a bare written callee may reach: what the first argument's
+# type narrows.
+fn bare_fn_candidates(st: InferState, w: Written) : [TyCandidate] = st_visible_candidates(st, written_text(w))
 
 # The names of the constructors the environment binds: what an unknown
 # variant is compared against for a suggestion.
@@ -2639,6 +2632,9 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
 
 # The id of a constructor the runtime builds, homed at the core.
 fn core_ctor_sym(name: String) : SymId = sym_derive(NCCtor, name, core_type_home())
+
+# The names of the constructors the runtime builds.
+fn core_ctor_names() : [String] = ["Some", "None", "Ok", "Err"]
 
 # ---- user-defined signatures ----
 #
@@ -3274,47 +3270,38 @@ fn names_excluding(xs: [String], drop: [String]) : [String] {
   }
 }
 
-fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String], homes: TyHomes) : TyEnv {
+fn add_variants_of_decl(env: TyEnv, d: Decl, homes: TyHomes) : TyEnv {
   match d {
     DType(_, tsym, tparams, body, _, _, mo, _) -> match body {
-      TBSum(vs) -> add_variants_loop(env, tsym, tparams, vs, top_names, tsh_view(homes, mo))
+      TBSum(vs) -> add_variants_loop(env, tsym, tparams, vs, homes, tsh_view(homes, mo))
       _ -> env
     }
     _ -> env
   }
 }
 
-# when a variant name `cname` shadows an already-declared
-# top-level type, skip the zero-arg constructor registration. The
-# pre-declared decl is the canonical handle; re-registering it as a
-# variant of `tname` would create a constructor scheme returning
-# `tname` — confusing for value-position lookups (a user typing
-# `Color` as an expression in a `Mixed`-expecting hole would resolve
-# to the ctor instead of failing cleanly). The component relationship
-# is still recorded in `env.unions` so `variants_of_type` and the D3
-# upcast keep working through `union_components_of`.
-# The skip only kicks in when the variant carries no payload; a
-# payload-bearing variant `Foo(Int)` still needs its constructor
-# scheme even if `Foo` is also a type, since pattern matching there
-# goes through the variant-as-callable path.
+# A nullary variant spelled like a type its own module declares refers
+# to that type and registers no constructor: the declaration is the
+# handle, and a second one returning the sum would compete with that
+# type's own constructor of the name. The component is still listed in
+# `env.unions`, and `component_tag` reads the variant as a value where no
+# constructor answers. A variant with a payload always builds, and so
+# does one named like the sum that declares it.
 fn add_variants_loop(env: TyEnv, tsym: SymId, tparams: [String],
-                       vs: [Variant], top_names: [String], hv: TyHomeView) : TyEnv {
+                       vs: [Variant], homes: TyHomes, hv: TyHomeView) : TyEnv {
   match vs {
     [] -> env
     [v, ...rest] -> match v {
       Var(csym, vargs) -> {
-        let cname = written_text(decl_name(env.tab, csym))
         let shadows = match vargs {
-          [] -> list_has(top_names, cname) and not sym_same(tsh_sym(hv, cname), tsym)
+          [] -> tsh_variant_has_type(homes, csym) and not sym_same(tsh_variant_sym(hv, csym), tsym)
           _  -> false
         }
         if shadows {
-          add_variants_loop(env, tsym, tparams, rest, top_names, hv)
+          add_variants_loop(env, tsym, tparams, rest, homes, hv)
         } else {
-          # One entry per constructor, under its own id: which one a
-          # written name means is settled before the lookup.
           add_variants_loop(env_bind_ctor(env, csym, scheme_of_variant(tsym, tparams, v, hv)),
-                            tsym, tparams, rest, top_names, hv)
+                            tsym, tparams, rest, homes, hv)
         }
       }
     }
@@ -3353,7 +3340,7 @@ fn collect_unions_loop(ds: [Decl], tab: SymTab, acc: [UnionInfo], hv: TyHomeView
       None -> match d {
         DType(_, tsym, _, body, line, col, mo, _) -> match body {
           TBSum(vs) -> {
-            let comps = variants_to_component_tys(vs, tab, tsh_at(hv, mo))
+            let comps = variants_to_component_tys(vs, tsh_at(hv, mo))
             collect_unions_loop(rest, tab, [UI(tsym, comps, line, col), ...acc], hv)
           }
           _ -> collect_unions_loop(rest, tab, acc, hv)
@@ -3377,7 +3364,7 @@ fn collect_union_rows_loop(ds: [Decl], tab: SymTab, acc: [UnionRow], hv: TyHomeV
       None -> match d {
         DType(_, tsym, _, body, line, col, mo, _) -> match body {
           TBSum(vs) -> {
-            let row = UnionRow(TyCon(tsym, []), variants_to_component_tys(vs, tab, tsh_at(hv, mo)), line, col)
+            let row = UnionRow(TyCon(tsym, []), variants_to_component_tys(vs, tsh_at(hv, mo)), line, col)
             collect_union_rows_loop(rest, tab, [row, ...acc], hv)
           }
           _ -> collect_union_rows_loop(rest, tab, acc, hv)
@@ -3394,12 +3381,11 @@ fn collect_union_rows_loop(ds: [Decl], tab: SymTab, acc: [UnionRow], hv: TyHomeV
 # the parent's TyCon-result is what makes payload-bearing variants
 # type-check. Singleton unions collapse to the bare component (per
 # `normalize_union`).
-fn variants_to_component_tys(vs: [Variant], tab: SymTab, hv: TyHomeView) : [Ty] {
+fn variants_to_component_tys(vs: [Variant], hv: TyHomeView) : [Ty] {
   match vs {
     [] -> []
     [v, ...rest] -> match v {
-      Var(csym, _) -> [tsh_tycon(hv, written_text(decl_name(tab, csym)), []),
-                       ...variants_to_component_tys(rest, tab, hv)]
+      Var(csym, _) -> [TyCon(tsh_variant_sym(hv, csym), []), ...variants_to_component_tys(rest, hv)]
     }
   }
 }
@@ -3419,26 +3405,6 @@ fn ty_names(tab: SymTab, ts: [Ty]) : [String] {
 # The names of the components the union `parent` declares.
 fn union_component_names(tab: SymTab, unions: UnionTable, parent: SymId) : [String] =
   ty_names(tab, ut_components(unions, parent))
-
-# Names of every top-level `DType` in the program. Record /
-# alias / effect-alias names count: pre-declaring `type Foo = { ... }`
-# and then writing `type A = Foo | Bar` is an explicit reference,
-# not an implicit declaration.
-#[doc("infer: names of every top-level type declaration in a program.")]
-pub fn collect_top_type_names(ds: [Decl], tab: SymTab) : [String] = collect_top_type_names_loop(ds, tab, [])
-
-fn collect_top_type_names_loop(ds: [Decl], tab: SymTab, acc: [String]) : [String] {
-  match ds {
-    [] -> list_reverse(acc)
-    [d, ...rest] -> match decl_transparent_inner(d) {
-      Some(inner) -> collect_top_type_names_loop([inner, ...rest], tab, acc)
-      None -> match d {
-        DType(_, tsym, _, _, _, _, _, _) -> collect_top_type_names_loop(rest, tab, [written_text(decl_name(tab, tsym)), ...acc])
-        _ -> collect_top_type_names_loop(rest, tab, acc)
-      }
-    }
-  }
-}
 
 # collect all distinct row-variable names appearing in the
 # row positions of a function declaration's signature: the outer
@@ -4008,7 +3974,7 @@ fn is_implicit_tparam_candidate(name: String) : Bool {
 # The type-home table stamps each signature's nominal types with their
 # declaring module as the scheme is built, not after the typer unified.
 fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
-                    top_names: [String], rk_table: [RowKindEntry],
+                    rk_table: [RowKindEntry],
                     homes: TyHomes) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
@@ -4021,7 +3987,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
         DType(_, _, _, _, _, _, _, _) ->
-          EnvWithArities { env: add_variants_of_decl(env, d, top_names, homes), arities: ar_acc }
+          EnvWithArities { env: add_variants_of_decl(env, d, homes), arities: ar_acc }
         DEffect(_, esym, tparams, ops, _, _, _, emo) -> {
           let r2 = add_effect_op_sigs(env, tparams, ops, esym, tsh_view(homes, emo))
           # merge per-effect arities into the running accumulator.
@@ -4038,20 +4004,20 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # as a bare `DFn` would be, then record its `type -> fn`
         # binding so `try_constructor_call` can desugar `Type(args)`.
         DProtoLaws(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop(env, ar_acc, [inner], top_names, rk_table, homes)
+          let r = add_decls_loop(env, ar_acc, [inner], rk_table, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DImplAxiom(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop(env, ar_acc, [inner], top_names, rk_table, homes)
+          let r = add_decls_loop(env, ar_acc, [inner], rk_table, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DConstructor(inner, cl, cc) -> {
-          let r = add_decls_loop(env, ar_acc, [inner], top_names, rk_table, homes)
+          let r = add_decls_loop(env, ar_acc, [inner], rk_table, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop(r.env, r.arities, rest, top_names, rk_table, homes)
+      add_decls_loop(r.env, r.arities, rest, rk_table, homes)
     }
   }
 }
@@ -4238,10 +4204,10 @@ pub type BuiltEnv = { env: TyEnv, core_len: Int, op_eff_arities: [OpEffArity] }
 # `build_ty_env_module(seed, all_decls)`, which is byte-identical
 # to the monolithic builder.
 #
-# `unions` and `top_names` are global properties of the entire
-# decl stream — collected once over the union of all modules and
-# threaded around the per-module fold rather than recomputed per
-# module. They are not part of `ModuleEnvDelta` under scope A.
+# `unions` is a global property of the entire decl stream — collected
+# once over the union of all modules and threaded around the per-module
+# fold rather than recomputed per module. It is not part of
+# `ModuleEnvDelta` under scope A.
 fn build_ty_env_seed() : BuiltEnv {
   let e0 = ty_env_empty()
   let e1 = add_core_sigs(e0)
@@ -4251,11 +4217,10 @@ fn build_ty_env_seed() : BuiltEnv {
 }
 
 fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: UnionTable,
-                        top_names: [String], tab: SymTab, homes: TyHomes) : BuiltEnv {
+                        tab: SymTab, homes: TyHomes) : BuiltEnv {
   let rk_table = compute_row_kind_slots(decls)
   let env_with_unions = TyEnv { ...seed.env, unions: unions, row_kind: rk_table, ty_homes: homes, tab: tab }
-  let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names,
-                         rk_table, homes)
+  let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, rk_table, homes)
   BuiltEnv { env: r.env, core_len: seed.core_len,
              op_eff_arities: r.arities }
 }
@@ -4267,7 +4232,7 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: UnionTable,
 # type declared in another module.
 fn build_ty_env_inherited(seed: BuiltEnv, inh: TyEnvParts, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: UnionTable,
-                            top_names: [String], rk_table: [RowKindEntry],
+                            rk_table: [RowKindEntry],
                             tab: SymTab, homes: TyHomes) : BuiltEnv {
   # `inh` already carries `inherited.ty_entries` on top of the seed, in
   # entries and indexes alike: the fold extends it module by module.
@@ -4280,7 +4245,7 @@ fn build_ty_env_inherited(seed: BuiltEnv, inh: TyEnvParts, inherited: ModuleEnvD
     }
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
-  let r = add_decls_loop(env_in, ar_in, decls, top_names, rk_table, homes)
+  let r = add_decls_loop(env_in, ar_in, decls, rk_table, homes)
   BuiltEnv { env: r.env, core_len: seed.core_len,
              op_eff_arities: r.arities }
 }
@@ -4293,10 +4258,7 @@ pub fn build_ty_env(decls: [Decl], tab: SymTab) : BuiltEnv {
   # `union_upcast_ok`, the collision diagnostic) sees the same data.
   let homes = tsh_homes(decls, tab, fv_empty(), "", roots_of("", []))
   let unions = ut_add(ut_empty(), collect_union_rows(decls, tab, tsh_view(homes, None)))
-  # pre-compute top-level type names so variant
-  # registration can skip ctor entries whose name shadows.
-  let top_names = collect_top_type_names(decls, tab)
-  build_ty_env_module(seed, decls, unions, top_names, tab, homes)
+  build_ty_env_module(seed, decls, unions, tab, homes)
 }
 
 # ---- env dump (debugging) ----
@@ -7442,18 +7404,39 @@ fn rigid_text(name: String, owner: String, what: String) : RigidWhy =
 # expression or a method call), so name extraction is optional and
 # we fall back to the generic message when nothing useful can be
 # said.
-fn callee_display_name(st: InferState, callee: Expr) : Option[String] = callee_name_in(st.env, callee)
-
-fn callee_name_in(env: TyEnv, callee: Expr) : Option[String] {
+fn callee_display_name(st: InferState, callee: Expr) : Option[String] = {
+  let env = st.env
   match callee.kind {
-    EName(n)       -> Some(written_text(n))
-    ESym(s, _)     -> Some(written_text(decl_name(env.tab, s)))
-    ELocal(l)      -> Some(written_text(local_name_in(env, l)))
+    EName(n)       -> Some("#{n}")
+    ESym(s, _)     -> Some(decl_shown(st, s))
+    ELocal(l)      -> Some("#{local_name_in(env, l)}")
     EOp(r)         -> Some("#{decl_name(env.tab, r.eff)}.#{r.op}")
     EModCall(m, n) -> Some("#{m}.#{n}")
     EField(_, f)   -> Some(f)
     _              -> None
   }
+}
+
+# A declaration as a diagnostic names it to the reader: by its name alone
+# when the reader's own module or the prelude declares it, under its
+# module otherwise, since a second module may declare the name too.
+fn decl_shown(st: InferState, s: SymId) : String = {
+  let tab = st.env.tab
+  let n = "#{decl_name(tab, s)}"
+  if not st_valid(tab, s) { n }
+  else {
+    let owner = sym_owner(tab, s)
+    let v = st_scope(st)
+    if not st_valid(tab, owner) or sym_same(owner, v.home) or sv_is_core(v, owner) { n }
+    else { "#{home_shown(st, owner)}.#{n}" }
+  }
+}
+
+# A module as the reader writes it: the qualifier its file binds the
+# module under, else the module's name.
+fn home_shown(st: InferState, m: SymId) : String = match sv_qualifier(st_scope(st), m) {
+  Some(q) -> q
+  None    -> "#{sym_name(st.env.tab, m)}"
 }
 
 # Walk `callee_ty` and `arg_tys` in lockstep; return the 1-indexed
@@ -7512,11 +7495,10 @@ fn call_sig_note_text(env: TyEnv, name_opt: Option[String], resolved: Ty,
 # Emit Template 1 trailing notes — should be called when the generic
 # unify has already errored. Suppresses if we cannot derive useful
 # context (no callee name AND no resolvable signature).
-fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
+fn emit_call_arg_notes(env: TyEnv, sub: Subst, name_opt: Option[String],
                          callee_ty: Ty, arg_tys: [Ty],
                          expected_shown: String) : Unit / Console + Mutable {
   let resolved = apply_ty(sub, callee_ty)
-  let name_opt = callee_name_in(env, callee)
   match first_failing_arg(env, sub, resolved, arg_tys) {
     Some(idx) -> match name_opt {
       Some(nm) -> diag_note("in argument #{int_to_string(idx)} of `#{nm}`")
@@ -7535,12 +7517,11 @@ fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
 # `unify_list` fails, plus the trailing notes from `emit_call_arg_notes`.
 # Pinned at the call-site (line, col); related infos cite the same span
 # because the typer does not (yet) track per-argument spans.
-fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, callee: Expr,
+fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, name_opt: Option[String],
                                    callee_ty: Ty, arg_tys: [Ty],
                                    file: String, line: Int, col: Int,
                                    expected_shown: String) : Diagnostic / Mutable {
   let resolved = apply_ty(sub, callee_ty)
-  let name_opt = callee_name_in(env, callee)
   let arg_notes = match first_failing_arg(env, sub, resolved, arg_tys) {
     Some(idx) -> match name_opt {
       Some(nm) -> [ri_note(file, line, col, "in argument #{int_to_string(idx)} of `#{nm}`")]
@@ -7585,7 +7566,7 @@ fn arity_mismatch_of(sub: Subst, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] {
 # line so users see exactly which arity was declared. When the callee
 # is anonymous, the notes omit the name but still surface the param
 # count + signature.
-fn emit_wrong_arity(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
+fn emit_wrong_arity(env: TyEnv, file: String, name_opt: Option[String], callee_ty: Ty,
                       arg_tys: [Ty], line: Int, col: Int) : Unit / Console + File {
 
   let np = match callee_ty {
@@ -7593,7 +7574,6 @@ fn emit_wrong_arity(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
     _ -> 0
   }
   let na = list_length(arg_tys)
-  let name_opt = callee_name_in(env, callee)
   match name_opt {
     Some(nm) -> diag_error(file, line, col, "wrong number of arguments to `#{nm}`")
     None     -> diag_error(file, line, col, "wrong number of arguments")
@@ -7619,14 +7599,13 @@ fn emit_wrong_arity(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
 # structured T4 Diagnostic builder. Mirrors the text emitted
 # by `emit_wrong_arity` exactly so an LSP client can rebuild the same
 # `error: / note: / help:` block from the collected value.
-fn build_wrong_arity_diag(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
+fn build_wrong_arity_diag(env: TyEnv, file: String, name_opt: Option[String], callee_ty: Ty,
                             arg_tys: [Ty], line: Int, col: Int) : Diagnostic {
   let np = match callee_ty {
     TyFnT(params, _, _) -> list_length(params)
     _ -> 0
   }
   let na = list_length(arg_tys)
-  let name_opt = callee_name_in(env, callee)
   let header = match name_opt {
     Some(nm) -> "wrong number of arguments to `#{nm}`"
     None     -> "wrong number of arguments"
@@ -7661,6 +7640,13 @@ fn build_wrong_arity_diag(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
 # (Template 5) when applicable.
 fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
                    arg_tys: [Ty], expected_fn_ty: Ty,
+                   line: Int, col: Int) : InferState / Console + File + Mutable =
+  st_unify_named(st, callee_display_name(st, callee), callee_ty, arg_tys, expected_fn_ty, line, col)
+
+# `st_unify_call` for a callee the notes name `who`: an operator has no
+# callee node, only the text the user wrote.
+fn st_unify_named(st: InferState, who: Option[String], callee_ty: Ty,
+                   arg_tys: [Ty], expected_fn_ty: Ty,
                    line: Int, col: Int) : InferState / Console + File + Mutable {
 
 
@@ -7672,9 +7658,9 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
   let resolved_callee = apply_ty(st.sub, callee_ty)
   match arity_mismatch_of(st.sub, callee_ty, arg_tys) {
     Some(_np) -> {
-      emit_wrong_arity(st.env, st.file, callee, resolved_callee, arg_tys, line, col)
+      emit_wrong_arity(st.env, st.file, who, resolved_callee, arg_tys, line, col)
       # T4 collected diagnostic.
-      let d = build_wrong_arity_diag(st.env, st.file, callee, resolved_callee, arg_tys, line, col)
+      let d = build_wrong_arity_diag(st.env, st.file, who, resolved_callee, arg_tys, line, col)
       st_bump_err(st_push_diag(st, d))
     }
     None -> {
@@ -7684,9 +7670,9 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
         # Mirrors the `expected:` note `st_unify` just printed, so the
         # trailing signature note can drop itself when it would repeat it.
         let expected_shown = inf_ty_to_string_ow(st1.env.tab, st1.env.head_owners, apply_ty(st1.sub, callee_ty))
-        emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys, expected_shown)
+        emit_call_arg_notes(st1.env, st1.sub, who, callee_ty, arg_tys, expected_shown)
         # The related notes mirror `emit_call_arg_notes`.
-        let d = build_call_type_mismatch_diag(st1.env, st1.sub, callee, callee_ty,
+        let d = build_call_type_mismatch_diag(st1.env, st1.sub, who, callee_ty,
                                               arg_tys, st1.file, line, col, expected_shown)
         st_refine_diag(st1, d)
       } else { st1 }
@@ -8148,8 +8134,23 @@ fn synth_sym_read(st: InferState, sy: SymId, e: Expr) : Inferred / Console + Fil
                 else { st_push_inst(r.st, CS(sy, e.line, e.col, r.fresh, r.unit_fresh, None)) }
       inferred_leaf(st2, r.ty, e)
     }
-    None -> inferred_leaf(st, TyAny, e)
+    None -> inferred_leaf(st, tag_union_ty(st, sy), e)
   }
+
+# The union a variant with no constructor tags: the one its module
+# declares listing the type the variant stands for. A generic union's
+# tag, and any other unbound declaration, is typed by its use.
+fn tag_union_ty(st: InferState, c: SymId) : Ty = {
+  let tab = st.env.tab
+  if not st_valid(tab, c) or not inf_is_ctor(tab, c) { TyAny }
+  else { match filter(ut_parents(st.env.unions, tsh_variant_sym(st_home_view(st), c)), (r) => sym_same_owner(tab, ut_row_sym(r), c)) {
+    [r] -> match ut_row_ty(r) {
+      TyCon(u, []) -> TyCon(u, [])
+      _            -> TyAny
+    }
+    _ -> TyAny
+  } }
+}
 
 fn names_clause_continuation(st: InferState, l: LocalId) : Bool = clause_cont_reaches(st.in_clause, l)
 
@@ -8201,51 +8202,138 @@ fn synth_op_read(st: InferState, r: OpRef, e: Expr) : Inferred / Console + File 
   }
 
 # A name the resolver left to the typer. Settled here, the node carries
-# the declaration's id; a name nothing declares stays as written.
+# the declaration's id; a name that settles to none is an error, so no
+# written name leaves the typer of a program that compiles.
 fn synth_name_read(st: InferState, w: Written, e: Expr) : Inferred / Console + File + Mutable =
-  match name_read_sym(st, written_text(w)) {
-    Some(s) -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
-    None    -> inferred_leaf(st, TyAny, e)
+  synth_settled(st, settle_name(st, None, w, TyAny, value_classes()), w, false, e)
+
+# The callee of a call is read the same way; its tie is reported as a call.
+fn synth_callee(st: InferState, callee: Expr) : Inferred / Console + File + Mutable = match callee.kind {
+  EName(w) -> synth_settled(st, settle_name(st, None, w, TyAny, value_classes()), w, true, callee)
+  _        -> synth(st, callee)
+}
+
+fn synth_settled(st: InferState, r: Settled, w: Written, called: Bool, e: Expr) : Inferred / Console + File + Mutable = match r {
+  SetOne(s)    -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
+  SetTie(ss)   -> inferred_leaf(report_name_tie(st, w, ss, called, e.line, e.col), TyAny, e)
+  SetOther(ss) -> inferred_leaf(report_no_value(st, w, ss, e.line, e.col), TyAny, e)
+  SetNone      -> inferred_leaf(report_no_declaration(st, w, e.line, e.col), TyAny, e)
+}
+
+# Nothing the reader's scope reaches declares the name.
+fn report_no_declaration(st: InferState, w: Written, line: Int, col: Int) : InferState / Console + File = {
+  let d = mk_diag(SevError, st.file, line, col, "cannot find `#{w}` in this scope", [])
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
+}
+
+# The name is declared, as something that is no value: one class says
+# what it is, several leave even that open.
+fn report_no_value(st: InferState, w: Written, ss: [SymId], line: Int, col: Int) : InferState / Console + File = {
+  let words = class_words(st.env.tab, ss, [])
+  let msg = match words {
+    [one] -> "`#{w}` is #{with_article(one)}, not a value"
+    _     -> "`#{w}` is ambiguous here: it names #{join_with(map(words, with_article), " and ")}, but no value"
   }
-
-# What an unsettled bare name reads as: the newest function spelled so,
-# else a constant, a constructor, or the core primitive of that name.
-fn name_read_sym(st: InferState, nm: String) : Option[SymId] = match ty_env_collect_candidates(st.env, nm) {
-  [c, ..._] -> Some(c.sym)
-  []        -> first_bound_sym(st.env, own_first(st, list_append(st_candidates(st.env.tab, NCConst, nm),
-                 list_append(st_candidates(st.env.tab, NCCtor, nm), [builtin_sym(nm)]))))
+  let d = mk_diag(SevError, st.file, line, col, msg, [])
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
 }
 
-# The reading file's own declarations ahead of every homonym.
-fn own_first(st: InferState, ss: [SymId]) : [SymId] = {
-  let reader = st_module_id(st_reader(st))
-  let own = filter(ss, (s) => sym_owned_by(st.env.tab, s, reader))
-  list_append(own, filter(ss, (s) => not sym_owned_by(st.env.tab, s, reader)))
-}
-
-fn first_bound_sym(env: TyEnv, ss: [SymId]) : Option[SymId] = match ss {
-  []           -> None
-  [s, ...rest] -> match env_sym(env, s) {
-    Some(_) -> Some(s)
-    None    -> first_bound_sym(env, rest)
+fn class_words(tab: SymTab, ss: [SymId], acc: [String]) : [String] = match ss {
+  [] -> list_reverse(acc)
+  [s, ...rest] -> {
+    let word = ncls_word(sym_class(tab, s))
+    class_words(tab, rest, if list_has(acc, word) { acc } else { [word, ...acc] })
   }
 }
 
-# What `m.f` denotes when the resolver left it: a function, constant or
-# constructor of the module `m`, a constructor of the sum `m`, else the
-# core primitive `f`.
-fn modcall_sym(st: InferState, m: String, f: String) : Option[SymId] = {
+fn with_article(word: String) : String = if starts_with(word, "e") { "an #{word}" } else { "a #{word}" }
+
+# The classes a bare value name may denote; they share one namespace.
+fn value_classes() : [NCls] = [NCFn, NCConst, NCCtor]
+
+# What a written name denotes: one declaration, several the scope cannot
+# tell apart, only declarations of a class the site did not ask for, or
+# none.
+type Settled = SetOne(SymId) | SetTie([SymId]) | SetOther([SymId]) | SetNone
+
+# The one place the typer turns a written value name into an id. Every
+# other site passes the name through and receives the declaration.
+#
+# A constructor is asked of the type first: when `expected` is a sum the
+# name is looked up among that sum's own constructors, so a variant of a
+# type the file never imports is reached and no homonym competes. A
+# qualifier names its module, or the sum, outright; one that names
+# neither leaves a constructor to the scope and a value to what the
+# runtime builds. A bare name climbs the reader's scope over the classes
+# `cs`: the nearest rung holding a candidate answers, alone or not at
+# all. With no class to climb for, the type is the only voice.
+fn settle_name(st: InferState, q: Option[Written], w: Written, expected: Ty, cs: [NCls]) : Settled = {
+  let name = written_text(w)
+  match settle_list(ctors_of_type(st.env, ut_ty_sym(apply_ty(st.sub, expected)), name, 4)) {
+    SetNone -> match q {
+      None    -> settle_bare(st, name, cs)
+      Some(m) -> match settle_qualified(st, written_text(m), name, cs) {
+        SetNone -> if ncls_in(cs, NCFn) { settle_list(bound_syms(st.env, [builtin_sym(name)])) }
+                   else { settle_bare(st, name, cs) }
+        r       -> r
+      }
+    }
+    r -> r
+  }
+}
+
+fn settle_list(ss: [SymId]) : Settled = match ss {
+  []  -> SetNone
+  [s] -> SetOne(s)
+  _   -> SetTie(ss)
+}
+
+fn ncls_in(cs: [NCls], c: NCls) : Bool = any(cs, (x) => ncls_same(x, c))
+
+fn bound_syms(env: TyEnv, ss: [SymId]) : [SymId] = filter(ss, (s) => is_some(env_sym(env, s)))
+
+# The constructors spelled `name` the sum `tsym` answers with: its own,
+# else those of the types it lists as components, `depth` levels down.
+fn ctors_of_type(env: TyEnv, tsym: SymId, name: String, depth: Int) : [SymId] =
+  if sym_raw(tsym) < 0 or depth == 0 { [] }
+  else { match own_ctor(env, tsym, name) {
+    Some(c) -> [c]
+    None    -> sym_list_unique(flat_map(ut_components(env.unions, tsym), (t) => component_ctors(env, tsym, ut_ty_sym(t), name, depth - 1)), [])
+  } }
+
+# A sum never answers through itself: a variant spelled like its own sum
+# is listed as a component of it.
+fn component_ctors(env: TyEnv, parent: SymId, comp: SymId, name: String, depth: Int) : [SymId] =
+  if sym_same(comp, parent) { [] } else { ctors_of_type(env, comp, name, depth) }
+
+# The constructor the sum `tsym` declares as `name`: the one its module
+# declares under that name, when it builds `tsym`. What the runtime
+# builds is no module's.
+fn own_ctor(env: TyEnv, tsym: SymId, name: String) : Option[SymId] = {
+  let c = if sym_is_core_sum(tsym) { Some(core_ctor_sym(name)) }
+          else { st_lookup(env.tab, NCCtor, name, sym_owner(env.tab, tsym)) }
+  match c {
+    Some(s) -> if ctor_builds(env, s, tsym) { Some(s) } else { None }
+    None    -> None
+  }
+}
+
+fn ctor_builds(env: TyEnv, c: SymId, tsym: SymId) : Bool =
+  any(vix_of_ctor(env.vindex, c), (e) => sym_same(scheme_ret_sym(e.scheme), tsym))
+
+# `m.name`: what the module `m` declares under the name, else the
+# constructor of the sum `m` names to the reader.
+fn settle_qualified(st: InferState, m: String, name: String, cs: [NCls]) : Settled = {
   let tab = st.env.tab
   let in_module = match st_module(tab, m) {
-    Some(ms) -> first_bound_sym(st.env, opt_syms([st_lookup(tab, NCFn, f, ms), st_lookup(tab, NCConst, f, ms), st_lookup(tab, NCCtor, f, ms)]))
-    None     -> None
+    Some(ms) -> bound_syms(st.env, opt_syms(map(cs, (c) => st_lookup(tab, c, name, ms))))
+    None     -> []
   }
   match in_module {
-    Some(s) -> Some(s)
-    None    -> match sum_ctor_named(st.env, tsh_sym(st_home_view(st), m), f) {
-      Some(c) -> Some(c)
-      None    -> first_bound_sym(st.env, [builtin_sym(f)])
-    }
+    [] -> settle_list(ctors_of_type(st.env, tsh_sym(st_home_view(st), m), name, 1))
+    ss -> settle_list(ss)
   }
 }
 
@@ -8255,13 +8343,155 @@ fn opt_syms(os: [Option[SymId]]) : [SymId] = match os {
   [None, ...rest]    -> opt_syms(rest)
 }
 
-# The constructor of the sum `tsym` spelled `cname`.
-fn sum_ctor_named(env: TyEnv, tsym: SymId, cname: String) : Option[SymId] =
-  if sym_raw(tsym) < 0 { None }
-  else { match find(env_ctors(env, tsym), (e) => written_text(decl_name(env.tab, env_key_sym(e.key))) == cname) {
-    Some(e) -> Some(env_key_sym(e.key))
-    None    -> None
+# A bare name on the scope ladder. A dispatcher the resolver left to the
+# type stands for one operation whichever home generated it, so the scope
+# has no tie to report about it. A name no declaration of the classes
+# answers may still be a union's tag, and past that it is whatever else
+# the scope declares under it.
+fn settle_bare(st: InferState, name: String, cs: [NCls]) : Settled = match settle_on_ladder(st, name, cs) {
+  SetOne(s) -> SetOne(s)
+  r         -> match shared_dispatcher(st, name, cs) {
+    Some(s) -> SetOne(s)
+    None    -> match r {
+      SetNone -> if list_is_empty(cs) { SetNone } else { settle_unanswered(st, name, cs) }
+      _       -> r
+    }
+  }
+}
+
+fn settle_unanswered(st: InferState, name: String, cs: [NCls]) : Settled = {
+  let tag = if ncls_in(cs, NCCtor) { component_tag(st, name) } else { SetNone }
+  match tag {
+    SetNone -> match other_declarations(st, name, cs) {
+      [] -> SetNone
+      ss -> SetOther(ss)
+    }
+    r -> r
+  }
+}
+
+# A union that lists a declared type as a component keeps a variant for
+# it, which registers no constructor: the type is the handle. Read as a
+# value where nothing else is named so, the name is that variant, the
+# union's own tag for the component.
+fn component_tag(st: InferState, name: String) : Settled = {
+  let tab = st.env.tab
+  let comp = tsh_sym(st_home_view(st), name)
+  if sym_raw(comp) < 0 { SetNone }
+  else { settle_list(sym_list_unique(opt_syms(map(ut_parents(st.env.unions, comp), (r) => st_lookup(tab, NCCtor, name, sym_owner(tab, ut_row_sym(r))))), [])) }
+}
+
+# What the reader's scope declares under `name` outside the classes `cs`
+# and outside what a call alone reaches.
+fn other_declarations(st: InferState, name: String, cs: [NCls]) : [SymId] = {
+  let tab = st.env.tab
+  let v = st_scope(st)
+  filter(st_by_name(tab, name), (s) => not ncls_in(cs, sym_class(tab, s)) and names_a_kind(sym_class(tab, s)) and sv_reaches(v, sym_owner(tab, s), name))
+}
+
+fn names_a_kind(c: NCls) : Bool = match c {
+  NCType       -> true
+  NCExternType -> true
+  NCEffect     -> true
+  NCProtocol   -> true
+  NCModule     -> true
+  _            -> false
+}
+
+# The dispatchers generated under `name`, whichever module holds the
+# protocol: the resolver reaches an operation through the protocol rung,
+# which sees past the reader's imports. They stand for one operation, and
+# the dispatch rewrite finds the impl from the receiver's type whichever
+# of them the call names.
+fn shared_dispatcher(st: InferState, name: String, cs: [NCls]) : Option[SymId] =
+  if not ncls_in(cs, NCFn) { None }
+  else { match filter(ty_env_collect_candidates(st.env, name), (c) => pid_is_disp(st.protos.ids, c.sym)) {
+    [c, ..._] -> Some(c.sym)
+    []        -> None
   } }
+
+# The scope's answer for `name`: the reader's own module, its picks, its
+# imports and the cores are climbed in that order, as the resolver climbs
+# them, and the first rung holding a declaration the environment binds
+# answers. What the runtime builds sits past the cores. A module the
+# reader never imported answers nothing, whatever the program loaded.
+fn settle_on_ladder(st: InferState, name: String, cs: [NCls]) : Settled = {
+  let bound = (s) => is_some(env_sym(st.env, s))
+  match settle_fit(sv_resolve_fit(st.env.tab, st_scope(st), [SvOwn, SvPicks, SvImports, SvCores], cs, name, bound)) {
+    SetNone -> settle_list(bound_syms(st.env, runtime_syms(name, cs)))
+    r       -> r
+  }
+}
+
+fn settle_fit(f: SvFit) : Settled = match f {
+  SvFit(SvSym(s), _)    -> SetOne(s)
+  SvFit(SvAmbig(ss), _) -> SetTie(ss)
+  SvFit(_, _)           -> SetNone
+}
+
+# What the runtime builds under `name`: a constructor of `Option` or
+# `Result`, a primitive.
+fn runtime_syms(name: String, cs: [NCls]) : [SymId] =
+  list_append(if ncls_in(cs, NCCtor) { [core_ctor_sym(name)] } else { [] },
+              if ncls_in(cs, NCFn) { [builtin_sym(name)] } else { [] })
+
+# The scope view of the file the declaration under inference is in.
+fn st_scope(st: InferState) : ScopeView = tsh_scope(st.env.ty_homes, st_reader(st))
+
+# Several declarations on one rung answer a written name, and nothing
+# picks among equals. The root file is told which modules export it, the
+# way every contested name is reported there; a module's own body is told
+# which types declare the constructor.
+fn report_name_tie(st: InferState, w: Written, ss: [SymId], called: Bool,
+                   line: Int, col: Int) : InferState / Console + File =
+  report_tie(st, "#{w}", ss, called, line, col)
+
+# `shown` is the name as the source spells it, for the message alone.
+fn report_tie(st: InferState, shown: String, ss: [SymId], called: Bool,
+              line: Int, col: Int) : InferState / Console + File = {
+  let d = if is_none(st.home) or not all(ss, (s) => inf_is_ctor(st.env.tab, s)) { tie_modules_diag(st, shown, ss, called, line, col) }
+          else { tie_types_diag(st, shown, ss, line, col) }
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
+}
+
+fn tie_modules_diag(st: InferState, w: String, ss: [SymId], called: Bool, line: Int, col: Int) : Diagnostic = {
+  let tab = st.env.tab
+  let cls = match ss {
+    [s, ..._] -> sym_class(tab, s)
+    []        -> NCFn
+  }
+  let suffix = if called and not ncls_same(cls, NCConst) { "(...)" } else { "" }
+  nr_ambiguous_diag(st.file, line, col, cls, w, tie_homes(st, ss, []), suffix, [])
+}
+
+# Each candidate's module as the reader writes it: the qualifier its file
+# binds the module under, else the module's name.
+fn tie_homes(st: InferState, ss: [SymId], acc: [String]) : [String] = match ss {
+  [] -> list_reverse(acc)
+  [s, ...rest] -> {
+    let h = home_shown(st, sym_owner(st.env.tab, s))
+    tie_homes(st, rest, if list_has(acc, h) { acc } else { [h, ...acc] })
+  }
+}
+
+fn tie_types_diag(st: InferState, w: String, ss: [SymId], line: Int, col: Int) : Diagnostic = {
+  let parents = sym_names(st.env.tab, ctor_sums(st.env, ss))
+  let cands = format_ctor_candidates(w, parents)
+  let first = ctor_first_parent(parents)
+  mk_diag(SevError, st.file, line, col, "ambiguous constructor '#{w}' — declared by more than one type",
+          [ri_note(st.file, line, col, "candidates: #{cands}"),
+           ri_help(st.file, line, col, "qualify the constructor, e.g. `#{first}.#{w}`")])
+}
+
+# The sum each constructor builds, in order.
+fn ctor_sums(env: TyEnv, cs: [SymId]) : [SymId] = match cs {
+  [] -> []
+  [c, ...rest] -> match ctor_entry(env, c) {
+    Some(CtorPick(_, e)) -> [scheme_ret_sym(e.scheme), ...ctor_sums(env, rest)]
+    None                 -> ctor_sums(env, rest)
+  }
+}
 
 fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 
@@ -8402,9 +8632,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       } }
     # A qualified reference the resolver left. Settled here, the node
     # carries the declaration's id.
-    EModCall(m, fname) -> match modcall_sym(st, written_text(m), written_text(fname)) {
-      Some(s) -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
-      None -> {
+    EModCall(m, fname) -> match settle_name(st, Some(m), fname, TyAny, value_classes()) {
+      SetOne(s)  -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
+      SetTie(ss) -> inferred_leaf(report_name_tie(st, fname, ss, false, e.line, e.col), TyAny, e)
+      _ -> {
         # The resolver only leaves a name the module exports, so the
         # table and the decl stream are out of sync: a diagnostic
         # rather than a panic, so the user sees a concrete location.
@@ -9592,7 +9823,7 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             None -> match try_bare_call_narrow(st_p, callee, args_, line, col) {
             Some(inf) -> inf
             None -> {
-            let rc = synth(st_p, callee)
+            let rc = synth_callee(st_p, callee)
             let callee_ty = apply_ty(rc.st.sub, rc.ty)
             match cont_parts(callee_ty) {
               Some(cp) -> synth_cont_call(rc, cp, args_, line, col)
@@ -9726,9 +9957,13 @@ fn constructor_mint_zip(args_: [Expr], param_tys: [Ty], bh: String) : [Expr] {
 fn try_record_type_call(st: InferState, callee: Expr, args_: [Expr],
                         line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
   let rec_opt = match callee.kind {
-    EName(nm) -> match name_read_sym(st, written_text(nm)) {
-      Some(_) -> None
-      None    -> rec_find(st.recs, callee_type_sym(st, callee))
+    EName(nm) -> match rec_find(st.recs, callee_type_sym(st, callee)) {
+      None    -> None
+      Some(r) -> match settle_name(st, None, nm, TyAny, value_classes()) {
+        SetOne(_) -> None
+        SetTie(_) -> None
+        _         -> Some(r)
+      }
     }
     _ -> None
   }
@@ -9755,34 +9990,31 @@ fn rec_fields_hint(fs: [FieldDecl]) : String = match fs {
   [f, ...rest] -> match f { FD(_, nm, _, _) -> concat_all([nm, ": ..., ", rec_fields_hint(rest)]) }
 }
 
-# when a bare-name callee resolves to multiple candidate
-# schemes (`option.map`, `list.map`, `result.map`, ...), narrow by
-# the type of the FIRST argument before instantiating. Without this
-# step the default arm calls `synth(callee)` which reads the newest
-# function of that name — which fails when the receiver/first-arg
-# type doesn't match.
+# when a bare-name callee has several candidate schemes
+# (`option.map`, `list.map`, `result.map`, ...), narrow by the type of
+# the FIRST argument before instantiating: the scope alone would call it
+# a tie.
 #
 # Returns Some only when:
 #   - callee is a name the resolver left unsettled,
-#   - `nm` has 2+ candidates in the env (otherwise the default arm
+#   - the name has 2+ candidates in the env (otherwise the default arm
 #     does the right thing already),
 #   - args_ is non-empty (we need a first-arg type to narrow on),
 #   - some candidate's first param unifies with the first arg's type.
-# Otherwise returns None and the caller falls through to the legacy
-# default arm so existing diagnostics for missing names / arity
-# mismatches keep firing unchanged.
+# Otherwise returns None and the caller falls through to the default
+# arm, where the scope settles the name and the diagnostics for missing
+# names / arity mismatches fire.
 fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                          line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
 
 
   match callee.kind {
     EName(w) -> {
-      let nm = written_text(w)
       # A declaration the resolver reached arrives stamped; a bare name
       # here is a contest it left to the type. The candidates are
       # functions only: a constructor is never a receiver-typed
       # dispatch target.
-      let candidates = st_visible_candidates(st, nm)
+      let candidates = bare_fn_candidates(st, w)
       let n_cand = list_length(candidates)
       if n_cand < 2 { None }
       else {
@@ -9791,13 +10023,17 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
           [first_arg, ...rest_args] -> {
             let r0 = synth(st, first_arg)
             let first_ty = apply_ty(r0.st.sub, r0.ty)
-            match hom_try_defer(r0.st, nm, candidates, first_ty, r0.expr,
+            match hom_try_defer(r0.st, w, candidates, first_ty, r0.expr,
                                  rest_args, callee, line, col) {
               Some(inf) -> Some(inf)
               None ->
             match pick_by_first_arg(r0.st, candidates, first_ty) {
-              None -> None
-              Some(pick) -> {
+              FaNone -> None
+              FaTie(st_t, ss) -> {
+                let st_e = report_name_tie(st_t, w, ss, true, callee.line, callee.col)
+                Some(mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(callee, [r0.expr, ...rest_args]), line, col), TyAny)))
+              }
+              FaOne(pick) -> {
                 let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
                   pick.st
                 } else {
@@ -9833,15 +10069,14 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
 }
 
 # A bare call several modules could answer, written where the first
-# argument's type is still a variable. Committing here is a guess — the
-# candidate that registered last with a concrete first parameter wins,
-# and the mismatch surfaces against a type the author never named. So
+# argument's type is still a variable. Nothing can be committed here: a
+# variable fits every candidate. So
 # record the call against its expected function type, stamp a fresh
 # result tyvar, and let `infer_decl` decide once the body has settled;
 # the worklist mirrors the deferred field accesses. Only a candidate set
 # an argument's head CAN decide is deferred, which leaves every other
 # bare call on the path it already took.
-fn hom_try_defer(st: InferState, nm: String, candidates: [TyCandidate],
+fn hom_try_defer(st: InferState, w: Written, candidates: [TyCandidate],
                   first_ty: Ty, first_expr: Expr, rest_args: [Expr],
                   callee: Expr, line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
   match hom_head(first_ty) {
@@ -9854,8 +10089,8 @@ fn hom_try_defer(st: InferState, nm: String, candidates: [TyCandidate],
       let st_fresh = st_set_sub(rv.st, fr.subst)
       let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
       let want = TyFnT([first_ty, ...ra.tys], rv.ty, expected_row)
-      let st1 = st_push_deferred_hom(st_fresh, DHom(nm, want, callee.line, callee.col))
-      let callee_node = with_ty(mk_name(nm, callee.line, callee.col), want)
+      let st1 = st_push_deferred_hom(st_fresh, DHom(w, want, callee.line, callee.col))
+      let callee_node = with_ty(callee, want)
       let root = with_ty(mk_expr(ECall(callee_node, [first_expr, ...ra.exprs]), line, col), rv.ty)
       Some(mk_inferred(st1, rv.ty, root))
     } }
@@ -9876,31 +10111,33 @@ type HomDrain = { st: InferState, picks: [HomPick] }
 
 # resolve every deferred bare call now that the body has settled: the
 # first argument's head names one candidate. A first argument still
-# without a head is the genuine ambiguity, left for the contested-name
-# report rather than answered here.
+# without a head leaves the name to the scope, which answers alone or
+# reports the tie.
 fn drain_deferred_homs(st: InferState, hs: [DeferredHom],
                         picks: [HomPick]) : HomDrain / Console + File + Mutable {
   match hs {
     [] -> HomDrain { st: st, picks: picks }
     [h, ...rest] -> match h {
-      DHom(nm, want, line, col) -> {
-        let r = drain_one_deferred_hom(st, nm, apply_ty(st.sub, want), line, col)
+      DHom(w, want, line, col) -> {
+        let r = drain_one_deferred_hom(st, w, apply_ty(st.sub, want), line, col)
         drain_deferred_homs(r.st, rest, list_append(picks, r.picks))
       }
     }
   }
 }
 
-fn drain_one_deferred_hom(st: InferState, nm: String, want: Ty,
+fn drain_one_deferred_hom(st: InferState, w: Written, want: Ty,
                            line: Int, col: Int) : HomDrain / Console + File + Mutable {
-  let cands = hom_cands_of(st_visible_candidates(st, nm))
+  let cands = hom_cands_of(bare_fn_candidates(st, w))
   match hom_first_param(want) {
     None      -> HomDrain { st: st, picks: [] }
     Some(arg) -> match hom_choose(cands, arg) {
       Some(s) -> hom_commit(st, s, want, line, col)
-      # Nothing decided it, so the callee stays bare and the
-      # contested-name report speaks to it.
-      None    -> HomDrain { st: st, picks: [] }
+      None    -> match settle_name(st, None, w, TyAny, value_classes()) {
+        SetOne(s)  -> hom_commit(st, s, want, line, col)
+        SetTie(ss) -> HomDrain { st: report_name_tie(st, w, ss, true, line, col), picks: [] }
+        _          -> HomDrain { st: st, picks: [] }
+      }
     }
   }
 }
@@ -10344,6 +10581,15 @@ fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
 type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
                     sym: SymId }
 
+# What the first argument's type decides among the candidates of one
+# name: the function, a tie the scope cannot break, or nothing.
+type FirstArg = FaOne(PickResult) | FaTie(InferState, [SymId]) | FaNone
+
+# One candidate whose first parameter unifies with the argument.
+type Probed = { pick: PickResult, concrete: Bool }
+
+type ProbeRun = { st: InferState, hits: [Probed] }
+
 # choose the candidate whose first parameter unifies
 # with `target_ty`, preferring CONCRETE-headed matches over
 # tyvar-headed ones.
@@ -10359,10 +10605,11 @@ type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int]
 #     win the race against `string.repeat` even though the intent
 #     is string.repeat.
 #
-# Walk strategy: a single pass that records two best candidates —
-# the first concrete-headed match and the first tyvar-headed match.
-# Concrete wins if any was found. Within each kind the most-recently-
-# registered match wins (candidates come newest first).
+# The concrete-headed matches are the pool when there is one, the
+# tyvar-headed ones otherwise. A pool of one is the answer. A larger
+# pool is the scope's to decide, as for any bare name: the nearest rung
+# holding one of them answers, alone or not at all; `tie_break` names
+# the two ties that are none.
 #
 # Each tried candidate bumps the inference state's fresh counter
 # (instantiation mints fresh tyvars). On a match the `sub` is *not*
@@ -10371,100 +10618,126 @@ type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int]
 # what records the receiver / arg constraints into the substitution.
 # So this helper only commits the instantiation, not the probe.
 fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
-                      target_ty: Ty) : Option[PickResult] / Mutable =
-  pick_by_first_arg_loop(st, candidates, target_ty, None, None)
+                      target_ty: Ty) : FirstArg / Mutable = {
+  let run = probe_first_arg(st, candidates, target_ty, [])
+  let concrete = filter(run.hits, (h) => h.concrete)
+  let pool = if list_is_empty(concrete) { run.hits } else { concrete }
+  match pool {
+    []  -> FaNone
+    [h] -> FaOne(pick_at(h.pick, run.st))
+    _   -> {
+      let syms = map(pool, (h) => h.pick.sym)
+      match pool_answer(st, target_ty, syms, sv_nearest(st.env.tab, st_scope(st), sv_rungs(), list_reverse(syms))) {
+        SetOne(s) -> match find(pool, (h) => sym_same(h.pick.sym, s)) {
+          Some(h) -> FaOne(pick_at(h.pick, run.st))
+          None    -> FaNone
+        }
+        SetTie(ss) -> FaTie(run.st, ss)
+        _          -> FaNone
+      }
+    }
+  }
+}
 
-# Two-pick walker: the first arg slot is for the leading concrete
-# match, the second for the leading tyvar match. After exhausting
-# the candidates, prefer concrete; fall back to tyvar.
+fn pool_answer(st: InferState, target_ty: Ty, pool: [SymId], r: SvRes) : Settled = match r {
+  SvSym(s)    -> SetOne(s)
+  SvAmbig(ss) -> match tie_break(st, target_ty, pool, ss) {
+    Some(s) -> SetOne(s)
+    None    -> SetTie(ss)
+  }
+  _ -> SetNone
+}
+
+# Two ties on one rung are no ambiguity. Cores restate one another's
+# functions over the same parameter (`char_unicode` over `char`), and
+# the prelude's order says which stands. Dispatchers of one operation
+# several protocols declare are told apart by the impl that serves the
+# argument's type; an argument no impl serves yet leaves the newest, and
+# the dispatch rewrite retargets the call once the type is known.
+fn tie_break(st: InferState, target_ty: Ty, pool: [SymId], ss: [SymId]) : Option[SymId] =
+  match later_core(st.env.tab, st_scope(st), ss) {
+    Some(s) -> Some(s)
+    None    -> if not all(ss, (s) => pid_is_disp(st.protos.ids, s)) { None }
+               else { match served_dispatcher(st.protos, target_ty, ss) {
+                 Some(s) -> Some(s)
+                 None    -> find(pool, (s) => any(ss, (x) => sym_same(x, s)))
+               } }
+  }
+
+# The dispatcher, among `ss`, of the protocol whose impl serves the head
+# of `t`.
+fn served_dispatcher(pv: ProtoView, t: Ty, ss: [SymId]) : Option[SymId] = match ss {
+  [] -> None
+  [s, ..._] -> match pid_disp(pv.ids, s) {
+    None    -> None
+    Some(d) -> match pipe_op_impl(pv.impls, t, disp_op(d)) {
+      None    -> None
+      Some(p) -> match pid_op_disp(pv.ids, pir_proto(p), disp_op(d)) {
+        Some(x) -> if any(ss, (y) => sym_same(x, y)) { Some(x) } else { None }
+        None    -> None
+      }
+    }
+  }
+}
+
+# The declaration of the core the prelude lists last, when every one of
+# `ss` is a core's.
+fn later_core(tab: SymTab, v: ScopeView, ss: [SymId]) : Option[SymId] =
+  if not all(ss, (s) => sv_is_core(v, sym_owner(tab, s))) { None }
+  else { later_core_loop(tab, v.cores, ss, None) }
+
+fn later_core_loop(tab: SymTab, cores: [SymId], ss: [SymId], found: Option[SymId]) : Option[SymId] = match cores {
+  [] -> found
+  [c, ...rest] -> match find(ss, (s) => sym_same(sym_owner(tab, s), c)) {
+    Some(s) -> later_core_loop(tab, rest, ss, Some(s))
+    None    -> later_core_loop(tab, rest, ss, found)
+  }
+}
+
+# Every candidate whose first parameter unifies with `target_ty`, in
+# candidate order, with the state past all of their instantiations.
 #
 # each iteration's `st_instantiate_report` advances the
 # inferencer's `env.fresh` and writes fresh tyvar slots. Subsequent
 # iterations' probe `unify_env` may extend the (mutable) `slots`
 # array with bindings — those bindings persist even though the
 # returned Subst is discarded, because kaikai's stage 2 substitution
-# arrays are opaque-mutable.
-#
-# Consequence: a `pick.st` captured early carries the stale
-# `env.fresh` from before later candidates were probed. When the
-# caller eventually allocates a fresh tyvar with `st_fresh_ty`, it
-# reuses a slot ID that a later candidate's discarded probe already
-# bound to a concrete type, and `apply_ty` returns that concrete
-# type instead of an unconstrained var. This previously caused
-# `loop.repeat`'s recursive call to be inferred as `Int` (leftover
-# from `list.repeat(x: a, n: Int)` whose `a` was probe-unified to
-# `Int`).
-#
-# Fix: after every iteration, refresh each pending pick's `st` to
-# carry the LATEST `env.fresh` and `Subst` counters. The pick keeps
-# its instantiation type (which only references slot IDs from its
-# own iteration), but its state is bumped past any later
-# instantiation. The caller's `st_fresh_ty` then never collides with
-# a discarded-probe-binding slot.
-fn pick_by_first_arg_loop(st: InferState, candidates: [TyCandidate],
-                            target_ty: Ty,
-                            best_concrete: Option[PickResult],
-                            best_tyvar: Option[PickResult]) : Option[PickResult] / Mutable {
-  match candidates {
-    [] -> match best_concrete {
-      Some(_) -> best_concrete
-      None    -> best_tyvar
-    }
-    [c, ...rest] -> {
-      let inst = st_instantiate_report(st, c.scheme)
-      let probe = match inst.ty {
-        TyFnT(params, _, _) -> match params {
-          [] -> ProbeNoMatch
-          [first, ..._rest_params] -> {
-            let head_concrete = first_param_head_is_concrete(first)
-            match unify_env(inst.st.env, first, target_ty, inst.st.sub) {
-              None    -> ProbeNoMatch
-              Some(_) -> if head_concrete { ProbeConcrete } else { ProbeTyvar }
-            }
+# arrays are opaque-mutable. So a pick's own `st` is stale once a later
+# candidate is probed: a fresh tyvar allocated from it would reuse a
+# slot a discarded probe already bound. The run's final `st` is past
+# every instantiation, and a pick is only used advanced to it.
+fn probe_first_arg(st: InferState, candidates: [TyCandidate], target_ty: Ty,
+                   acc: [Probed]) : ProbeRun / Mutable = match candidates {
+  [] -> ProbeRun { st: st, hits: list_reverse(acc) }
+  [c, ...rest] -> {
+    let inst = st_instantiate_report(st, c.scheme)
+    let probe = match inst.ty {
+      TyFnT(params, _, _) -> match params {
+        [] -> ProbeNoMatch
+        [first, ..._rest_params] -> {
+          let head_concrete = first_param_head_is_concrete(first)
+          match unify_env(inst.st.env, first, target_ty, inst.st.sub) {
+            None    -> ProbeNoMatch
+            Some(_) -> if head_concrete { ProbeConcrete } else { ProbeTyvar }
           }
         }
-        _ -> ProbeNoMatch
       }
-      let pick = PickResult { st: inst.st, inst_ty: inst.ty,
-                               fresh: inst.fresh, unit_fresh: inst.unit_fresh,
-                               sym: c.sym }
-      let new_concrete = match probe {
-        ProbeConcrete -> match best_concrete {
-          Some(_) -> Some(pick_advance_st(best_concrete, inst.st))
-          None    -> Some(pick)
-        }
-        _ -> match best_concrete {
-          Some(_) -> Some(pick_advance_st(best_concrete, inst.st))
-          None    -> best_concrete
-        }
-      }
-      let new_tyvar = match probe {
-        ProbeTyvar -> match best_tyvar {
-          Some(_) -> Some(pick_advance_st(best_tyvar, inst.st))
-          None    -> Some(pick)
-        }
-        _ -> match best_tyvar {
-          Some(_) -> Some(pick_advance_st(best_tyvar, inst.st))
-          None    -> best_tyvar
-        }
-      }
-      pick_by_first_arg_loop(inst.st, rest, target_ty, new_concrete, new_tyvar)
+      _ -> ProbeNoMatch
     }
+    let pick = PickResult { st: inst.st, inst_ty: inst.ty,
+                             fresh: inst.fresh, unit_fresh: inst.unit_fresh,
+                             sym: c.sym }
+    let acc1 = match probe {
+      ProbeNoMatch  -> acc
+      ProbeConcrete -> [Probed { pick: pick, concrete: true }, ...acc]
+      ProbeTyvar    -> [Probed { pick: pick, concrete: false }, ...acc]
+    }
+    probe_first_arg(inst.st, rest, target_ty, acc1)
   }
 }
 
-# replace a pending pick's `st` with `latest_st` so the
-# fresh-counters advance past every candidate's instantiation. The
-# pick's `inst_ty`, `fresh`, `unit_fresh`, and `sym` are preserved
-# unchanged. Returns the input verbatim when it's `None` (caller
-# only invokes this on `Some(_)`).
-fn pick_advance_st(p: Option[PickResult], latest_st: InferState) : PickResult {
-  match p {
-    None -> PickResult { st: latest_st, inst_ty: TyAny, fresh: [], unit_fresh: [], sym: sym_none() }
-    Some(pp) -> PickResult { st: latest_st, inst_ty: pp.inst_ty,
-                              fresh: pp.fresh, unit_fresh: pp.unit_fresh, sym: pp.sym }
-  }
-}
+# A pick carrying the state past every candidate's instantiation.
+fn pick_at(p: PickResult, latest: InferState) : PickResult = PickResult { ...p, st: latest }
 
 type ProbeOutcome = ProbeNoMatch | ProbeTyvar | ProbeConcrete
 
@@ -10512,8 +10785,12 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
 
 
   match ufcs_target(st, ident, obj_ty, line, col) {
-    None -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
-    Some(target) -> {
+    UfNone -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
+    UfTie(st_t, ss) -> {
+      let st_e = report_tie(st_t, ident, ss, true, line, col)
+      mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(field_root(obj_expr, ident, line, col, TyAny), args_), line, col), TyAny))
+    }
+    UfOne(target) -> {
       let st_inst = target.st
       let inst_ty = target.inst_ty
       match inst_ty {
@@ -10560,12 +10837,15 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
 # The function module `home` declares as `name`, when the env holds it.
 fn env_home_fn(env: TyEnv, home: String, name: String) : Option[SymId] = match st_module(env.tab, home) {
   None    -> None
-  Some(h) -> match st_lookup(env.tab, NCFn, name, h) {
+  Some(h) -> env_module_fn(env, h, name)
+}
+
+# The function the module `m` declares as `name`, when the env holds it.
+fn env_module_fn(env: TyEnv, m: SymId, name: String) : Option[SymId] = match st_lookup(env.tab, NCFn, name, m) {
+  None    -> None
+  Some(s) -> match env_sym(env, s) {
+    Some(_) -> Some(s)
     None    -> None
-    Some(s) -> match env_sym(env, s) {
-      Some(_) -> Some(s)
-      None    -> None
-    }
   }
 }
 
@@ -10593,6 +10873,10 @@ fn env_local_written(es: [TyEntry], name: String) : Option[Binder] = match es {
 # The callee of a UFCS call, instantiated, with the state past it.
 type UfcsTarget = { st: InferState, inst_ty: Ty, callee: Expr }
 
+# What `obj.ident(…)` reaches: a callee, several functions the receiver's
+# type and the scope cannot tell apart, or nothing.
+type UfcsFound = UfOne(UfcsTarget) | UfTie(InferState, [SymId]) | UfNone
+
 fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
                    line: Int, col: Int) : UfcsTarget {
   let st_inst = if fresh == [] and unit_fresh == [] { st }
@@ -10605,24 +10889,25 @@ fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fre
 # does: the innermost binder spelled so, else the root file's function,
 # else the builtin.
 fn ufcs_target(st: InferState, ident: String, obj_ty: Ty,
-               line: Int, col: Int) : Option[UfcsTarget] / Mutable =
+               line: Int, col: Int) : UfcsFound / Mutable =
   match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty) {
-    Some(p) -> Some(ufcs_sym_target(p.st, p.sym, p.inst_ty, p.fresh, p.unit_fresh, line, col))
-    None -> match env_local_written(st.env.entries, ident) {
+    FaOne(p)       -> UfOne(ufcs_sym_target(p.st, p.sym, p.inst_ty, p.fresh, p.unit_fresh, line, col))
+    FaTie(st_t, ss) -> UfTie(st_t, ss)
+    FaNone -> match env_local_written(st.env.entries, ident) {
       Some(b) -> match env_local(st.env, b.id) {
-        None -> None
+        None -> UfNone
         Some(sc) -> {
           let inst = st_instantiate_report(st, sc)
-          Some(UfcsTarget { st: inst.st, inst_ty: inst.ty, callee: mk_local(b.id, line, col) })
+          UfOne(UfcsTarget { st: inst.st, inst_ty: inst.ty, callee: mk_local(b.id, line, col) })
         }
       }
       None -> match ufcs_bare_sym(st.env, ident) {
-        None -> None
+        None -> UfNone
         Some(s) -> match env_sym(st.env, s) {
-          None -> None
+          None -> UfNone
           Some(sc) -> {
             let inst = st_instantiate_report(st, sc)
-            Some(ufcs_sym_target(inst.st, s, inst.ty, inst.fresh, inst.unit_fresh, line, col))
+            UfOne(ufcs_sym_target(inst.st, s, inst.ty, inst.fresh, inst.unit_fresh, line, col))
           }
         }
       }
@@ -11633,16 +11918,16 @@ fn synth_binop_proto(st: InferState, op: BinOp, le: Expr, lt: Ty,
 }
 
 # The dispatcher of the protocol an operator is sugar for, by its id. A
-# typer run with no registry names the operation's dispatcher bare.
+# typer run with no registry reaches the one the protocol's own module
+# generates.
 fn binop_dispatcher_ref(ids: ProtoIds, bp: BinopProto, line: Int, col: Int) : Expr = {
   let method = op_proto_method(bp)
-  let disp = match op_proto_core(bp) {
-    Some(cp) -> pid_op_ref(ids, core_proto_id(cp), method)
-    None     -> None
-  }
-  match disp {
-    Some(k) -> mk_expr(k, line, col)
-    None    -> mk_name(inf_proto_dispatcher_name(method), line, col)
+  match op_proto_core(bp) {
+    Some(cp) -> match pid_op_ref(ids, core_proto_id(cp), method) {
+      Some(k) -> mk_expr(k, line, col)
+      None    -> mk_sym(pid_fn_id(inf_proto_dispatcher_name(method), Some(core_proto_home(cp)), ""), line, col)
+    }
+    None -> panic("infer: an operator with no protocol was dispatched as one")
   }
 }
 
@@ -11668,16 +11953,15 @@ fn binop_check_against_impl(st: InferState, op: BinOp, lt0: Ty, rt0: Ty,
       None -> st
       Some(sc) -> {
         let inst = st_instantiate(st, sc)
-        # The notes cite the operator the user wrote, not the impl's
-        # function, which is never spelled in source.
-        let callee = mk_name(binop_text(op), line, col)
         let rv = st_fresh_ty(inst.st)
         let fr = subst_fresh_row(rv.st.sub)
         let st2 = st_set_sub(rv.st, fr.subst)
         let args = binop_args_for_impl(inst.ty, [lt, rt], st2.sub)
         let expected = TyFnT(args, rv.ty,
                              Row { labels: [], tail: Some(fr.id), display_alias: None })
-        st_unify_call(st2, callee, inst.ty, args, expected, line, col)
+        # The notes cite the operator the user wrote, not the impl's
+        # function, which is never spelled in source.
+        st_unify_named(st2, Some(binop_text(op)), inst.ty, args, expected, line, col)
       }
     }
   }
@@ -12197,40 +12481,35 @@ fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Infer
   }
 }
 
+# The callee of a pipe stage. A name the resolver left for the typer,
+# one several modules declare (`filter` of both `option` and `list`), is
+# narrowed by the piped value's type: under the pipe rewrite that value
+# is the callee's first argument. A settled callee, and one with a single
+# candidate, is read as any callee is.
+fn synth_pipe_callee(st: InferState, f: Expr, lhs_ty: Ty) : Inferred / Console + File + Mutable = match f.kind {
+  EName(nm) -> {
+    let candidates = bare_fn_candidates(st, nm)
+    if list_length(candidates) < 2 { synth_callee(st, f) }
+    else { match pick_by_first_arg(st, candidates, apply_ty(st.sub, lhs_ty)) {
+      FaNone -> synth_callee(st, f)
+      FaTie(st_t, ss) -> inferred_leaf(report_name_tie(st_t, nm, ss, true, f.line, f.col), TyAny, f)
+      FaOne(pick) -> {
+        let st_inst = if pick.fresh == [] and pick.unit_fresh == [] { pick.st }
+                      else { st_push_inst(pick.st, CS(pick.sym, f.line, f.col, pick.fresh, pick.unit_fresh, None)) }
+        mk_inferred(st_inst, pick.inst_ty, with_ty(mk_sym(pick.sym, f.line, f.col), pick.inst_ty))
+      }
+    } }
+  }
+  _ -> synth(st, f)
+}
+
 fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let rl = synth(st, lhs)
   let res = match rhs.kind {
     ECall(f, pa) -> {
-      # when the callee is a name the resolver left for the typer, one
-      # several modules declare (e.g. `filter` exported
-      # by both `option` and `list`), narrow by the LHS's type — the
-      # LHS becomes the callee's first argument under the pipe
-      # rewrite. Fall back to the `synth(f)` path when the
-      # callee is settled or has a single candidate.
-      let rf = match f.kind {
-        EName(nm) -> {
-          let candidates = st_visible_candidates(rl.st, written_text(nm))
-          if list_length(candidates) < 2 { synth(rl.st, f) }
-          else {
-            let lhs_ty = apply_ty(rl.st.sub, rl.ty)
-            match pick_by_first_arg(rl.st, candidates, lhs_ty) {
-              None -> synth(rl.st, f)
-              Some(pick) -> {
-                let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
-                  pick.st
-                } else {
-                  st_push_inst(pick.st, CS(pick.sym, f.line, f.col, pick.fresh, pick.unit_fresh, None))
-                }
-                let callee_node = with_ty(mk_sym(pick.sym, f.line, f.col), pick.inst_ty)
-                mk_inferred(st_inst, pick.inst_ty, callee_node)
-              }
-            }
-          }
-        }
-        _ -> synth(rl.st, f)
-      }
+      let rf = synth_pipe_callee(rl.st, f, rl.ty)
       let ra = synth_many(rf.st, pa)
       let rv = st_fresh_ty(ra.st)
       # same open-row trick `synth_call`
@@ -12248,7 +12527,7 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
       }
     }
     _ -> {
-      let rf = synth(rl.st, rhs)
+      let rf = synth_pipe_callee(rl.st, rhs, rl.ty)
       let rv = st_fresh_ty(rf.st)
       let fr = subst_fresh_row(rv.st.sub)
       let st_fresh = st_set_sub(rv.st, fr.subst)
@@ -12333,10 +12612,10 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
 # verbatim (missing module, missing op, ambiguous, signature mismatch
 # falls through to the standard call-inference path).
 type HeadLookup
-  = HLOk(String)
+  = HLOk(SymId)
   # Two or more modules declare `pub type Head`. The user must
   # disambiguate via a qualified annotation on the LHS.
-  | HLAmbiguous([String])
+  | HLAmbiguous([SymId])
   | HLNone
 
 fn find_head_owner_loop(es: [HeadOwnerEntry], head: SymId) : HeadLookup {
@@ -12358,21 +12637,11 @@ fn find_head_owner_loop(es: [HeadOwnerEntry], head: SymId) : HeadLookup {
 fn find_head_owner(env: TyEnv, head: SymId) : HeadLookup =
   find_head_owner_loop(env.head_owners, head)
 
-# Build the head-owner cache from a `[Decl]` post-`expand_imports`
-# stream paired with the module table the import resolver collected.
-# For each `pub type T`, find the module(s) that export `T` (i.e. the
-# `ModuleEntry` whose `exports` list contains the type name). Folding
-# the same `T` from two modules produces a multi-element entry so the
-# lookup can report ambiguity at the use site instead of silently
-# picking the first definer.
-#
-# `pub type T` declared in the root file (not associated with any
-# module entry) intentionally does NOT participate in pipe dispatch.
-# Pipes against root-file types fall through to the "no module
-# declaring type" diagnostic — which is the correct behaviour, since
-# the root file has no qualified surface that a pipe rewrite can
-# target. The user can extract the type into a module if they want
-# pipes to dispatch against it.
+# The head-owner cache maps each `pub type T` a module declares to that
+# module, the one its declaration is owned by. A type the root file
+# declares gets no entry: the root has no qualified surface a pipe
+# rewrite can target, so a pipe against it falls through to the "no
+# module declaring type" diagnostic.
 
 # `List` has no `pub type List` in any user-visible module, so no walk
 # over the module table discovers it. Every head-owner cache carries
@@ -12380,10 +12649,10 @@ fn find_head_owner(env: TyEnv, head: SymId) : HeadLookup =
 # it — otherwise `|`, `||` and `|?` over a list are rejected on code
 # the build accepts.
 #[doc("infer: the built-in head-owner seed — `List` maps to `list` in every scope.")]
-pub fn head_owner_seed() : [HeadOwnerEntry] = [HOE(core_ty_sym(CtList), ["list"])]
+pub fn head_owner_seed() : [HeadOwnerEntry] = [HOE(core_ty_sym(CtList), [core_module_id(CmList)])]
 
 #[doc("infer: `build_head_owner_map` — typer entry point invoked by the driver.")]
-pub fn build_head_owner_map(decls: [Decl], tab: SymTab, modules: [ModuleEntry],
+pub fn build_head_owner_map(decls: [Decl], tab: SymTab,
                          target_mod: String, edition: Edition) : [HeadOwnerEntry] {
   # gate the convention-based pipe dispatch on
   # edition >= hanga-roa. Pre-hanga-roa (tongariki) packages keep only
@@ -12394,20 +12663,10 @@ pub fn build_head_owner_map(decls: [Decl], tab: SymTab, modules: [ModuleEntry],
   let walk_user_types = edition_at_least(edition, EdHangaRoa)
   if walk_user_types {
     let pub_types = collect_pub_types(decls, [])
-    # Filter out the target file's ME from the dispatch search. The
-    # target ME's `exports` list is built over the post-`expand_imports`
-    # decl stream, which transitively includes every imported module's
-    # decls — so a `pub type T` exported by an imported module appears
-    # in BOTH the imported module's ME and the target ME. Without this
-    # filter every imported `pub type` would surface as ambiguously
-    # declared by `(<owning_module>, <target_basename>)`. Filtering
-    # preserves the cache's invariant that each entry's `mods`
-    # list contains only modules that genuinely own the `pub type`
-    # declaration. Pipes against `pub type` declared in the root file
-    # are intentionally not dispatchable — the rejection diagnostic
-    # ("no module declaring type `T` is in scope") is the design.
-    let modules_filtered = filter_out_target(modules, target_mod, [])
-    let from_decls = build_head_owner_loop(pub_types, tab, modules_filtered, [])
+    # Pipes against a `pub type` the root file declares are intentionally
+    # not dispatchable — the rejection diagnostic ("no module declaring
+    # type `T` is in scope") is the design.
+    let from_decls = build_head_owner_loop(pub_types, tab, st_module_id(target_mod), [])
     list_append(head_owner_seed(), list_append(from_decls, spelled_head_owners(decls, tab, [])))
   } else {
     # Tongariki: only the seeded built-in `List → list` participates.
@@ -12430,17 +12689,17 @@ pub fn spelled_head_owners(ds: [Decl], tab: SymTab, acc: [HeadOwnerEntry]) : [He
   [d, ...rest] -> match decl_transparent_inner(d) {
     Some(inner) -> spelled_head_owners([inner, ...rest], tab, acc)
     None -> match d {
-      DType(true, s, _, _, _, _, Some(m), _) ->
-        spelled_head_owners(rest, tab, spelled_owner(tab, s, m, acc))
-      DEffect(_, s, _, _, _, _, _, Some(m)) ->
-        spelled_head_owners(rest, tab, spelled_owner(tab, s, m, acc))
+      DType(true, s, _, _, _, _, Some(_), _) ->
+        spelled_head_owners(rest, tab, spelled_owner(tab, s, acc))
+      DEffect(_, s, _, _, _, _, _, Some(_)) ->
+        spelled_head_owners(rest, tab, spelled_owner(tab, s, acc))
       _ -> spelled_head_owners(rest, tab, acc)
     }
   }
 }
 
-fn spelled_owner(tab: SymTab, s: SymId, m: String, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
-  if decl_contested(tab, s) { [HOE(s, [m]), ...acc] } else { acc }
+fn spelled_owner(tab: SymTab, s: SymId, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
+  if decl_contested(tab, s) { [HOE(s, [sym_owner(tab, s)]), ...acc] } else { acc }
 
 fn decl_contested(tab: SymTab, s: SymId) : Bool = st_valid(tab, s) and sym_contested(tab, s)
 
@@ -12467,47 +12726,17 @@ fn sym_in(ss: [SymId], s: SymId) : Bool = match ss {
   [h, ...rest] -> sym_same(h, s) or sym_in(rest, s)
 }
 
-# A module's export list carries names, so the type is looked up in it
-# by the name it was declared with; a contested type, which no export
-# list tells apart, is left to its `spelled_head_owners` entry.
-fn build_head_owner_loop(tys: [SymId], tab: SymTab, modules: [ModuleEntry],
+# The owner of a type is the module its declaration belongs to; a
+# contested type is left to its `spelled_head_owners` entry.
+fn build_head_owner_loop(tys: [SymId], tab: SymTab, root: SymId,
                           acc: [HeadOwnerEntry]) : [HeadOwnerEntry] {
   match tys {
     [] -> acc
     [s, ...rest] -> {
-      let mods = if decl_contested(tab, s) { [] }
-                 else { modules_declaring_type(modules, written_text(decl_name(tab, s)), []) }
-      match mods {
-        [] -> build_head_owner_loop(rest, tab, modules, acc)
-        _  -> build_head_owner_loop(rest, tab, modules, [HOE(s, mods), ...acc])
-      }
-    }
-  }
-}
-
-fn filter_out_target(modules: [ModuleEntry], target: String,
-                      acc: [ModuleEntry]) : [ModuleEntry] {
-  match modules {
-    [] -> list_reverse(acc)
-    [me, ...rest] -> match me {
-      ME(mn, _, _, _) ->
-        if mn == target { filter_out_target(rest, target, acc) }
-        else { filter_out_target(rest, target, [me, ...acc]) }
-    }
-  }
-}
-
-fn modules_declaring_type(modules: [ModuleEntry], head: String,
-                          acc: [String]) : [String] {
-  match modules {
-    [] -> list_reverse(acc)
-    [me, ...rest] -> match me {
-      ME(mn, exports, _, _) ->
-        if list_has(exports, head) {
-          modules_declaring_type(rest, head, [mn, ...acc])
-        } else {
-          modules_declaring_type(rest, head, acc)
-        }
+      let owner = sym_owner(tab, s)
+      if decl_contested(tab, s) or sym_raw(owner) < 0 or sym_same(owner, root) {
+        build_head_owner_loop(rest, tab, root, acc)
+      } else { build_head_owner_loop(rest, tab, root, [HOE(s, [owner]), ...acc]) }
     }
   }
 }
@@ -12583,18 +12812,13 @@ fn pipe_op_impl_of(impls: [ProtoImplReg], h: DispHead, op: String) : Option[Prot
 }
 
 # The dispatcher of the protocol whose impl for the head of `t` supplies
-# `op`, by its id. An impl of a protocol that resolved to none leaves the
-# dispatcher's name unsettled.
-fn pipe_op_dispatcher(pv: ProtoView, t: Ty, op: String) : ExprKind = {
-  let disp = match pipe_op_impl(pv.impls, t, op) {
+# `op`, by its id; none when no impl does, or when its protocol resolved
+# to no declaration.
+fn pipe_op_dispatcher(pv: ProtoView, t: Ty, op: String) : Option[ExprKind] =
+  match pipe_op_impl(pv.impls, t, op) {
     Some(p) -> pid_op_ref(pv.ids, pir_proto(p), op)
     None    -> None
   }
-  match disp {
-    Some(k) -> k
-    None    -> EName(written(inf_proto_dispatcher_name(op)))
-  }
-}
 
 # `xs | f` where `f` takes the whole container instead of the element:
 # the pipe-stage parameter unifies with `lhs_ty` but not with its
@@ -12699,47 +12923,42 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
         HLAmbiguous(mods) -> {
           let perr = mk_diag(SevError, rl.st.file, line, col,
             concat_all(["ambiguous head type `", head, "` — ",
-              join_modules_for_diag(mods),
+              join_modules_for_diag(map(mods, (m) => "#{sym_name(rl.st.env.tab, m)}")),
               " all declare it. Use qualified type annotation."]), [])
           render_diag(perr)
           let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
           mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
         }
-        HLOk(module_name) -> {
+        HLOk(owner) -> {
           # call the module's own `op` when it declares one — that is
           # the dispatch-eligible case (the diagnostic surface
-          # `pipe_no_map` checks). When
-          # it declares none we fall back to the bare name, which
-          # reads as any bare `op` does; this preserves the earlier
-          # behaviour for the only seeded head, `List → list`, when
-          # invoked by harnesses that do not load `core/list.kai`
-          # as a core (the runtime `kai_core_map` /
-          # `kai_core_flat_map` / `kai_core_filter` stubs
-          # take over). For user-defined heads whose declaring
-          # module IS in scope but ships no canonical op, the
-          # bare-name fallback then triggers the standard
-          # call-inference signature mismatch — distinguishable
-          # from the seeded `List` case because the `from_decls`
-          # branch of `build_head_owner_map` only includes user
-          # heads that are actually module-resident, so reaching
-          # `HLOk` for a user head implies the module IS loaded
-          # and the missing qualified entry IS the user's bug.
-          let qualified = env_home_fn(rl.st.env, module_name, op)
+          # `pipe_no_map` checks). When it declares none the call
+          # reaches the runtime's primitive of that op: this is the
+          # seeded head, `List → list`, under a harness that does not
+          # load `core/list.kai` as a core. For a user-defined head
+          # whose declaring module ships no canonical op, the
+          # primitive then triggers the standard call-inference
+          # signature mismatch, after the diagnostic below.
+          let qualified = env_module_fn(rl.st.env, owner, op)
           # A `Shape`-protocol impl (`impl Sequence for Chain { map, ... }`)
           # provides the pipe op even when the head's module ships no
           # `map` function: call its dispatcher, which `resolve_protocol_calls`
           # retargets to `__pimpl_<P>_<head>_<op>` post-typing.
-          let head_proto_op = pipe_op_has_impl(rl.st.protos.impls, lhs_ty, op)
+          let proto_disp = pipe_op_dispatcher(rl.st.protos, lhs_ty, op)
+          let head_proto_op = is_some(proto_disp)
           let callee_kind = match qualified {
             Some(s) -> ESym(s, spec_none())
-            None    -> if head_proto_op { pipe_op_dispatcher(rl.st.protos, lhs_ty, op) } else { EName(written(op)) }
+            None    -> match proto_disp {
+              Some(k) -> k
+              None    -> ESym(builtin_sym(op), spec_none())
+            }
           }
           # emit the "module declares T but does not
           # export op" diagnostic only when the head was contributed
           # by the from_decls walk — i.e. a real user `pub type` —
           # AND the module ships no qualified op. The seeded
           # `List → list` case stays silent and routes through the
-          # bare-name fallback so existing test-sugars fixtures (no
+          # primitive so existing test-sugars fixtures (no
           # `--core core/list.kai`) continue to compile.
           let st_after_diag = match qualified {
             Some(_) -> rl.st
@@ -12747,8 +12966,7 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
               if core_ty_is(hsym, CtList) or head_proto_op { rl.st }
               else {
                 let perr = mk_diag(SevError, rl.st.file, line, col,
-                  concat_all(["module `", module_name, "` declares `", head,
-                    "` but does not export `", op, "`"]), [])
+                  "module `#{sym_name(rl.st.env.tab, owner)}` declares `#{head}` but does not export `#{op}`", [])
                 render_diag(perr)
                 st_bump_err(st_push_diag(rl.st, perr))
               }
@@ -12907,8 +13125,37 @@ fn fuse_owner_mismatch(ff: FusedFold, proto_foldl: Option[ExprKind], is_seq: Boo
   _               -> false
 }
 
-fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
-                          line: Int, col: Int) : FuseAttempt / Console + File + Mutable =
+# The terminal of a chain with the callee the resolver left written
+# settled, since the chain is recognised by the declaration its terminal
+# reaches. A name one declaration answers is read as any callee is. One
+# several functions share is read as applied to a list: the terminals
+# that fuse by name are list functions, and any other choice is left to
+# the call the unfused chain makes.
+fn terminal_settled(st: InferState, rhs: Expr) : Expr = match rhs.kind {
+  ECall(f, xs) -> Expr { ...rhs, kind: ECall(terminal_callee(st, f), xs) }
+  _            -> terminal_callee(st, rhs)
+}
+
+fn terminal_callee(st: InferState, f: Expr) : Expr = match f.kind {
+  EName(w) -> match terminal_fn(st, w) {
+    Some(s) -> Expr { ...f, kind: ESym(s, spec_none()) }
+    None    -> f
+  }
+  _ -> f
+}
+
+fn terminal_fn(st: InferState, w: Written) : Option[SymId] = {
+  let cs = bare_fn_candidates(st, w)
+  if list_length(cs) > 1 { hom_choose(hom_cands_of(cs), TyListT(TyAny)) }
+  else { match settle_name(st, None, w, TyAny, [NCFn]) {
+    SetOne(s) -> Some(s)
+    _         -> None
+  } }
+}
+
+fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs0: Expr,
+                          line: Int, col: Int) : FuseAttempt / Console + File + Mutable = {
+  let rhs = if pipe_fusion_head(lhs) { terminal_settled(st, rhs0) } else { rhs0 }
   match pipe_fusion_as_terminal_fold(st.protos.ids, lhs, rhs) {
     None -> FuseAttempt { st: st, fused: None }
     Some(ff) -> {
@@ -12934,6 +13181,7 @@ fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs: Expr,
       } else { FuseAttempt { st: g.st, fused: None } }
     }
   }
+}
 
 # A non-`List` source whose head type has a protocol `foldl` impl fuses
 # via the generic single-traversal rewrite, not the `list.map_foldl`
@@ -14349,14 +14597,10 @@ fn ctor_fresh_sig(env: TyEnv, c: Expr) : Ty = match c.kind {
   _ -> TyAny
 }
 
-# The constructor a callee names, as a diagnostic spells it: a settled
-# callee by its declaration, one the typer has yet to settle by the
-# constructors its written name can denote.
+# The constructor a typed callee names, as a diagnostic spells it.
 fn callee_ctor_name(tab: SymTab, callee: Expr) : Option[Written] = match callee.kind {
-  ESym(s, _)     -> if inf_is_ctor(tab, s) { Some(sym_name(tab, s)) } else { None }
-  EName(n)       -> if name_is_ctor(tab, n) { Some(n) } else { None }
-  EModCall(_, n) -> if name_is_ctor(tab, n) { Some(n) } else { None }
-  _              -> None
+  ESym(s, _) -> if inf_is_ctor(tab, s) { Some(sym_name(tab, s)) } else { None }
+  _          -> None
 }
 
 fn callee_is_ctor(tab: SymTab, callee: Expr) : Bool = match callee_ctor_name(tab, callee) {
@@ -14365,11 +14609,6 @@ fn callee_is_ctor(tab: SymTab, callee: Expr) : Bool = match callee_ctor_name(tab
 }
 
 fn inf_is_ctor(tab: SymTab, s: SymId) : Bool = st_valid(tab, s) and ncls_same(sym_class(tab, s), NCCtor)
-
-fn name_is_ctor(tab: SymTab, n: Written) : Bool = match st_candidates(tab, NCCtor, written_text(n)) {
-  [] -> false
-  _  -> true
-}
 
 fn coerce_args_to(st: InferState, args_: [Expr], arg_tys: [Ty], params: [Ty], what: String) : InferredList / Console + File + Mutable =
   match args_ {
@@ -14573,27 +14812,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
 
   match stmt {
     SLet(pat, ann, rhs) -> {
-      # bare-unannotated ctor ambiguity. Run the
-      # ambiguity diagnostic at SLet sites with NO annotation when the
-      # RHS is a bare ctor reference — that is the canonical
-      # "silently resolves to core" shape. With an annotation the
-      # ambiguity is resolved by the annotation context; with a more
-      # complex RHS the ctor is typically embedded in a typed
-      # surrounding context. Limiting the diagnostic to SLet-no-ann
-      # avoids spurious fires from core code whose `Ok(...)` is
-      # nested under typed handlers.
       let ann_label = if pat_binds_var_ann(pat) { "var annotation" } else { "let annotation" }
-      let amb_st = match ann {
-        None -> match rhs.kind {
-          ECall(c, _) -> match c.kind {
-            EName(nm) -> report_ctor_ambiguity_if_any(st, nm, c.line, c.col)
-            _ -> st
-          }
-          EName(nm) -> report_ctor_ambiguity_if_any(st, nm, rhs.line, rhs.col)
-          _ -> st
-        }
-        Some(_) -> st
-      }
       # when the let is annotated and the RHS is an
       # `EMatch`, drive the RHS in check-mode so the expected
       # type reaches every arm via `check_match`. The non-match
@@ -14604,47 +14823,47 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let rr = match ann {
         Some(te) -> match rhs.kind {
           EMatch(_, _) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EIf(_, _, _) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # Fix B: route EList through bidirectional check so element
           # literals can be retagged to Byte when expected is [Byte]
           # (and a Vec annotation mints the literal to a vec build).
           EList(_) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # a Vec-annotated map-pipe chain collects into the vec
           # (pre-sized when the head is a pure range).
           EMapPipe(_, _) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # route a call, a bare name and a local read with annotation
           # context through check_expr_against so a bare ctor the
           # annotation's type declares resolves to that constructor.
           ECall(_, _) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EName(_) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           ELocal(_) -> {
-            let exp_resolved = st_annot_ty(amb_st, te)
-            check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
+            let exp_resolved = st_annot_ty(st, te)
+            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # a bare numeric literal coins directly to the annotated carrier
           # from its source lexeme, before synth would stamp a default
           # type (or error on a textual `EIntLit`/`EDecimalLit`).
-          _ -> synth_let_rhs_or_mint(amb_st, rhs, te, pat.line, pat.col)
+          _ -> synth_let_rhs_or_mint(st, rhs, te, pat.line, pat.col)
         }
-        None -> synth(amb_st, rhs)
+        None -> synth(st, rhs)
       }
       # when the let binding is annotated, coin a numeric RHS literal to
       # the declared carrier: a point literal to an exact Decimal, an
@@ -14687,8 +14906,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let binding_ty = if ty_is_fixed_vec(binding_ty0) and not is_fixed_vec_lit(lower_pair.expr) {
         fixed_vec_unbrand(binding_ty0)
       } else { binding_ty0 }
-      let dup_st = check_pattern_no_dup_binds(binding_st, pat)
-      let after = check_pattern_stamped(dup_st, pat, binding_ty)
+      let after = check_pattern_stamped(binding_st, pat, binding_ty)
       OneStmt { st: after.st, stmt: SLet(after.pat, ann, lower_pair.expr) }
     }
     SAssert(cond, msg) -> {
@@ -14752,81 +14970,6 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
 }
 
 # ---- patterns ----
-
-# a single pattern that binds the same name
-# twice (e.g. `MkPair(x, x)`) is silently accepted today — the
-# second binding shadows the first within the same arm. Per
-# ML/Haskell-family convention this is a hard error: the user
-# almost certainly intended an equality check (`MkPair(x, y) if
-# x == y -> ...`). We walk the pattern once, gather every PBind
-# / PAs name, and report duplicates before typing the pattern.
-# Wildcards never collide; `_` is not a binding. Pattern holes
-# (`?` / `?name`) bind no value either and so are skipped here.
-fn pattern_collect_binds(pat: Pattern, acc: [Binder]) : [Binder] {
-  match pat.pkind {
-    PWild      -> acc
-    PHole(_)   -> acc
-    PLit(_)    -> acc
-    PRange(_, _) -> acc
-    PBind(b)   -> [b, ...acc]
-    PNarrow(b, _) -> [b, ...acc]
-    PAs(b, sub) -> pattern_collect_binds(sub, [b, ...acc])
-    PList(subs, rest_opt) -> {
-      let acc1 = pattern_collect_binds_list(subs, acc)
-      match rest_opt {
-        None     -> acc1
-        Some(rb) -> [rb, ...acc1]
-      }
-    }
-    PVariant(_, subs) -> pattern_collect_binds_list(subs, acc)
-    PVariantRecord(_, pfs) -> pattern_collect_binds_pfields(pfs, acc)
-    PRecord(pfs) -> pattern_collect_binds_pfields(pfs, acc)
-    PSurface(ps) -> pattern_collect_binds_list(patsurface_children(ps), acc)
-  }
-}
-
-fn pattern_collect_binds_list(ps: [Pattern], acc: [Binder]) : [Binder] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> pattern_collect_binds_list(rest, pattern_collect_binds(p, acc))
-  }
-}
-
-fn pattern_collect_binds_pfields(pfs: [PField], acc: [Binder]) : [Binder] {
-  match pfs {
-    [] -> acc
-    [pf, ...rest] -> match pf {
-      PField(_, sub, _) -> pattern_collect_binds_pfields(rest, pattern_collect_binds(sub, acc))
-    }
-  }
-}
-
-# The resolver numbers every binder apart, so a repeat is a name the
-# pattern spells twice.
-fn pattern_first_duplicate(bs: [Binder], seen: [String]) : Option[Binder] {
-  match bs {
-    [] -> None
-    [b, ...rest] -> if list_has(seen, written_text(b.name)) {
-      Some(b)
-    } else {
-      pattern_first_duplicate(rest, [written_text(b.name), ...seen])
-    }
-  }
-}
-
-fn check_pattern_no_dup_binds(st: InferState, pat: Pattern) : InferState / Console + File {
-  let binds = pattern_collect_binds(pat, [])
-  match pattern_first_duplicate(binds, []) {
-    None -> st
-    Some(b) -> {
-      let perr = mk_diag(SevError, st.file, pat.line, pat.col, "duplicate binding in pattern: `#{b.name}`", [])
-      render_diag(perr)
-      diag_note("binding `#{b.name}` already used elsewhere in this pattern")
-      diag_help("use a different name, or extract the equality with a guard: `MkPair(x, y) if x == y -> ...`")
-      st_bump_err(st_push_diag(st, perr))
-    }
-  }
-}
 
 # A pattern as the typer leaves it: its binders bound in `st`, and each
 # constructor it names settled to that constructor's id.
@@ -14998,33 +15141,35 @@ fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : PatsChecked / C
 # that constructor. A written one is decided by the scrutinee's type:
 # this is how a user variant `Response.Ok` shadows the core `Result.Ok`
 # in patterns matching a `Response`. A scrutinee whose type declares no
-# such constructor leaves the name to answer, in the module that
-# qualifies it when one does.
-fn pattern_ctor(st: InferState, r: DeclRef, expected: Ty) : Option[CtorPick] = match r {
-  DrSym(c)        -> ctor_entry(st.env, c)
-  DrWritten(q, w) -> match ctor_pick(st, expected, written_text(w)) {
-    Some(p) -> Some(p)
-    None    -> match pattern_name_sym(st, q, written_text(w)) {
-      Some(c) -> ctor_entry(st.env, c)
-      None    -> None
-    }
-  }
+# such constructor leaves the name to its qualifier, then to the scope.
+fn pattern_ctor(st: InferState, r: DeclRef, expected: Ty) : Settled = match r {
+  DrSym(c)        -> SetOne(c)
+  DrWritten(q, w) -> settle_name(st, q, w, expected, [NCCtor])
 }
 
-fn pattern_name_sym(st: InferState, q: Option[Written], cname: String) : Option[SymId] = match q {
-  Some(m) -> match modcall_sym(st, written_text(m), cname) {
-    Some(c) -> Some(c)
-    None    -> name_read_sym(st, cname)
+# A pattern head the scope cannot tell apart: reported, and its
+# sub-patterns typed against nothing.
+fn check_tied_pattern(st: InferState, r: DeclRef, ss: [SymId], subpats: [Pattern], line: Int, col: Int) : PatChecked / Console + File + Mutable = {
+  let st1 = match r {
+    DrWritten(_, w) -> report_name_tie(st, w, ss, not list_is_empty(subpats), line, col)
+    DrSym(_)        -> st
   }
-  None -> name_read_sym(st, cname)
+  let subs = check_unknown_subpats(st1, subpats)
+  PatChecked { st: subs.st, pat: mk_pat(PVariant(r, subs.pats), line, col) }
 }
 
 fn check_variant_pattern(st: InferState, r: DeclRef, subpats: [Pattern], expected: Ty, line: Int, col: Int) : PatChecked / Console + File + Mutable {
 
 
   let cname = ref_text(st.env.tab, r)
-  match pattern_ctor(st, r, expected) {
-    None -> {
+  let picked = match pattern_ctor(st, r, expected) {
+    SetOne(c)  -> PcOne(ctor_entry(st.env, c))
+    SetTie(ss) -> PcTie(ss)
+    _          -> PcOne(None)
+  }
+  match picked {
+    PcTie(ss) -> check_tied_pattern(st, r, ss, subpats, line, col)
+    PcOne(None) -> {
       let hint = match closest_name(cname, env_ctor_names(st.env)) {
         Some(sug) -> " (did you mean `#{sug}`?)"
         None      -> ""
@@ -15034,7 +15179,7 @@ fn check_variant_pattern(st: InferState, r: DeclRef, subpats: [Pattern], expecte
       let subs = check_unknown_subpats(st_bump_err(st_push_diag(st, perr)), subpats)
       PatChecked { st: subs.st, pat: mk_pat(PVariant(r, subs.pats), line, col) }
     }
-    Some(CtorPick(c, entry)) -> {
+    PcOne(Some(CtorPick(c, entry))) -> {
       let inst = st_instantiate(st, entry.scheme)
       match inst.ty {
         TyFnT(aps, ret, _) -> {
@@ -15059,6 +15204,10 @@ fn check_variant_pattern(st: InferState, r: DeclRef, subpats: [Pattern], expecte
     }
   }
 }
+
+# What a pattern head settled to: the constructor's entry when one
+# declaration answers and the environment binds it, or the tie.
+type PatCtor = PcOne(Option[CtorPick]) | PcTie([SymId])
 
 fn check_unknown_subpats(st: InferState, ps: [Pattern]) : PatsChecked / Console + File + Mutable {
 
@@ -15668,10 +15817,8 @@ fn vec_match_check_arms(st: InferState, arms: [Arm]) : VecMatchGate / Console + 
         }
         _ -> g1
       }
-      let dup_st = check_pattern_no_dup_binds(g2.st, p)
-      let g2b = VecMatchGate { st: dup_st, ok: g2.ok and dup_st.errs == g2.st.errs }
-      let gr = vec_match_check_arms(g2b.st, rest)
-      VecMatchGate { st: gr.st, ok: g2b.ok and gr.ok }
+      let gr = vec_match_check_arms(g2.st, rest)
+      VecMatchGate { st: gr.st, ok: g2.ok and gr.ok }
     }
   }
 
@@ -15712,8 +15859,7 @@ fn check_arms(st: InferState, arms: [Arm], scrut_ty: Ty, expected: Ty,
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> {
         let outer = st
-        let st_dup = check_pattern_no_dup_binds(st, pat)
-        let pc = check_pattern_stamped(st_dup, pat, scrut_ty)
+        let pc = check_pattern_stamped(st, pat, scrut_ty)
         let s_p = pc.st
         let guard_res = match guard {
           None -> InferredOptExpr { st: s_p, expr: None }
@@ -15883,23 +16029,16 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
   }
 }
 
-# The constructor a pattern or a site spelled `cname` names, decided by
-# the type `t` it builds.
-fn ctor_pick(st: InferState, t: Ty, cname: String) : Option[CtorPick] =
-  sum_ctor(st.env, ut_ty_sym(apply_ty(st.sub, t)), cname)
-
 # A bare constructor call under an expected type that declares the
 # constructor is rewritten to a call of that constructor: the
-# expected type names the sum, so a same-named one never wins and the
-# bare-unannotated ambiguity diagnostic of `synth_call` does not fire
-# (a user variant may shadow `Result.Ok` / `Option.Some`).
+# expected type names the sum, so a same-named one never wins (a user
+# variant may shadow `Result.Ok` / `Option.Some`).
 fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
                           expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match callee.kind {
-    EName(cname) -> match ctor_pick(st, expected, written_text(cname)) {
-      Some(CtorPick(c, _)) ->
-        synth(st, mk_expr(ECall(mk_sym(c, callee.line, callee.col), args_), line, col))
-      None -> synth(st, e)
+    EName(w) -> match settle_name(st, None, w, expected, []) {
+      SetOne(c) -> synth(st, mk_expr(ECall(mk_sym(c, callee.line, callee.col), args_), line, col))
+      _         -> synth(st, e)
     }
     _ -> synth(st, e)
   }
@@ -15908,12 +16047,17 @@ fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
 # reads that declaration's scheme.
 fn nullary_ctor_check_or_synth(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable =
   match e.kind {
-    EName(cname) -> match ctor_pick(st, expected, written_text(cname)) {
-      Some(CtorPick(c, entry)) ->
-        synth_scheme_read(st, entry.scheme, c, mk_sym(c, e.line, e.col))
-      None -> synth(st, e)
+    EName(w) -> match typed_ctor_entry(st, w, expected) {
+      Some(CtorPick(c, entry)) -> synth_scheme_read(st, entry.scheme, c, mk_sym(c, e.line, e.col))
+      None                     -> synth(st, e)
     }
     _ -> synth(st, e)
+  }
+
+fn typed_ctor_entry(st: InferState, w: Written, expected: Ty) : Option[CtorPick] =
+  match settle_name(st, None, w, expected, []) {
+    SetOne(c) -> ctor_entry(st.env, c)
+    _         -> None
   }
 
 # A read of the declaration `s`, whose scheme is `sc`, at `e`.
@@ -15924,82 +16068,7 @@ fn synth_scheme_read(st: InferState, sc: TyScheme, s: SymId, e: Expr) : Inferred
   inferred_leaf(st2, r.ty, e)
 }
 
-# The sums that declare a constructor spelled `cname`, the runtime's
-# `Result` and `Option` left out, newest declaration first.
-fn user_sums_declaring(env: TyEnv, cname: String) : [SymId] =
-  sums_of_ctors(env, list_reverse(st_candidates(env.tab, NCCtor, cname)), [])
-
-fn sums_of_ctors(env: TyEnv, cs: [SymId], acc: [SymId]) : [SymId] = match cs {
-  [] -> list_reverse(acc)
-  [c, ...rest] -> match ctor_entry(env, c) {
-    Some(CtorPick(_, e)) -> {
-      let t = scheme_ret_sym(e.scheme)
-      if sym_is_core_sum(t) or sym_list_has(acc, t) { sums_of_ctors(env, rest, acc) }
-      else { sums_of_ctors(env, rest, [t, ...acc]) }
-    }
-    None -> sums_of_ctors(env, rest, acc)
-  }
-}
-
 fn sym_names(tab: SymTab, ss: [SymId]) : [String] = map(ss, (s) => written_text(decl_name(tab, s)))
-
-# emit a diagnostic when a bare ctor name is
-# genuinely ambiguous (the core declares a Result/Option ctor of that
-# name AND at least one user type declares one too). Returns
-# the input state bumped by one error if the diagnostic fires;
-# otherwise the input state unchanged. Idempotent — the predicate is
-# pure and the diagnostic carries the call site.
-#
-# The cross-module shape (two foreign homes exporting the name) is the
-# unified resolver's alone: it warns under hanga-roa and errors from
-# orongo.
-fn report_ctor_ambiguity_if_any(st: InferState, cname: Written,
-                                   line: Int, col: Int) : InferState / Console + File {
-
-  let nm = written_text(cname)
-  let users = user_sums_declaring(st.env, nm)
-  match ctor_entry(st.env, core_ctor_sym(nm)) {
-    Some(CtorPick(_, core)) -> match sym_names(st.env.tab, users) {
-      [] -> st
-      user_parents -> {
-        let bare_parent = core_sum_name(scheme_ret_sym(core.scheme))
-        let perr = mk_diag(SevError, st.file, line, col,
-          concat_all(["ambiguous constructor '", nm,
-                      "' — matches both the core '",
-                      bare_parent, ".", nm,
-                      "' and user-declared variant(s)"]), [])
-        render_diag(perr)
-        diag_note(concat_all(["candidates: ", format_ctor_candidates(nm, [bare_parent, ...user_parents])]))
-        diag_help("annotate the binding with `let <name> : <Parent> = ...` to disambiguate")
-        st_bump_err(st_push_diag(st, perr))
-      }
-    }
-    None -> report_ctor_parents_if_ambiguous(st, nm, sym_names(st.env.tab, users), line, col)
-  }
-}
-
-# Two user sum types declaring one constructor name, reached with no
-# expected type to choose by. The candidates are equals — picking the
-# one that registered last is what let a use site read the other's
-# payload layout.
-#
-# Only a module's own body reports here: a root-file reference is the
-# whole-program name report's, which names the contesting modules
-# rather than the types.
-fn report_ctor_parents_if_ambiguous(st: InferState, cname: String, parents: [String],
-                                    line: Int, col: Int) : InferState / Console + File {
-  if list_length(parents) <= 1 or is_none(st.home) { st }
-  else {
-    let perr = mk_diag(SevError, st.file, line, col,
-      concat_all(["ambiguous constructor '", cname,
-                  "' — declared by more than one type"]), [])
-    render_diag(perr)
-    diag_note(concat_all(["candidates: ", format_ctor_candidates(cname, parents)]))
-    diag_help(concat_all(["qualify the constructor, e.g. `",
-                          ctor_first_parent(parents), ".", cname, "`"]))
-    st_bump_err(st_push_diag(st, perr))
-  }
-}
 
 fn ctor_first_parent(parents: [String]) : String = match parents {
   []        -> "<Type>"
@@ -16008,9 +16077,6 @@ fn ctor_first_parent(parents: [String]) : String = match parents {
 
 # The two sums whose constructors the runtime builds.
 fn sym_is_core_sum(s: SymId) : Bool = core_ty_is(s, CtResult) or core_ty_is(s, CtOption)
-
-fn core_sum_name(s: SymId) : String =
-  if core_ty_is(s, CtResult) { core_ty_name(CtResult) } else { core_ty_name(CtOption) }
 
 # Helper: render `Result.Ok, Response.Ok` for the ambiguity note.
 fn format_ctor_candidates(cname: String, parents: [String]) : String =
@@ -16614,23 +16680,6 @@ fn ctor_entry(env: TyEnv, c: SymId) : Option[CtorPick] = match vix_of_ctor(env.v
   []        -> None
 }
 
-# The constructor spelled `cname` of the sum `tsym` declares: a written
-# name is turned into the declarations that spell it, and the sum table
-# answers for the one `tsym` declares. The runtime's own are no module's
-# and are derived from the name.
-fn sum_ctor(env: TyEnv, tsym: SymId, cname: String) : Option[CtorPick] =
-  if sym_raw(tsym) < 0 { None }
-  else if sym_is_core_sum(tsym) { sum_ctor_among(env, tsym, [core_ctor_sym(cname)]) }
-  else { sum_ctor_among(env, tsym, st_candidates(env.tab, NCCtor, cname)) }
-
-fn sum_ctor_among(env: TyEnv, tsym: SymId, cs: [SymId]) : Option[CtorPick] = match cs {
-  [] -> None
-  [c, ...rest] -> match find(vix_of_ctor(env.vindex, c), (e) => sym_same(scheme_ret_sym(e.scheme), tsym)) {
-    Some(e) -> Some(CtorPick(c, e))
-    None    -> sum_ctor_among(env, tsym, rest)
-  }
-}
-
 # The names a diagnostic lists for the type `tsym` declares: its
 # constructors, then the components no constructor stands for (a
 # variant naming a declared type registers none).
@@ -16853,17 +16902,20 @@ fn x_ctor_scheme(env: TyEnv, c: SymId, scr_ty: Ty) : Option[TyScheme] = match ct
   None -> None
   Some(CtorPick(_, e)) ->
     if sym_same(scheme_ret_sym(e.scheme), ut_ty_sym(scr_ty)) and sym_raw(ut_ty_sym(scr_ty)) >= 0 { Some(e.scheme) }
-    else if x_ctor_ambiguous(env, written_text(decl_name(env.tab, c))) { None }
+    else if ctor_has_homonym(env.tab, c) { None }
     else { Some(e.scheme) }
 }
 
-fn x_ctor_ambiguous(env: TyEnv, cn: String) : Bool = {
-  let users = user_sums_declaring(env, cn)
-  match ctor_entry(env, core_ctor_sym(cn)) {
-    Some(_) -> not list_is_empty(users)
-    None    -> list_length(users) > 1
+# True when another type declares a constructor spelled like `c`: a
+# second declaration in the table, or one the runtime builds.
+fn ctor_has_homonym(tab: SymTab, c: SymId) : Bool =
+  match find(core_ctor_names(), (n) => sym_same(c, core_ctor_sym(n))) {
+    Some(n) -> any(st_candidates(tab, NCCtor, n), (s) => not sym_same(s, c))
+    None    -> sym_contested(tab, c) or any(core_ctor_names(), (n) => match st_lookup(tab, NCCtor, n, sym_owner(tab, c)) {
+      Some(s) -> sym_same(s, c)
+      None    -> false
+    })
   }
-}
 
 # A type with no variant list has the one constructor. A variant no
 # constructor is bound for is headed by a record pattern of its type.
@@ -17250,8 +17302,7 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> {
         let outer = st
-        let st_dup = check_pattern_no_dup_binds(st, pat)
-        let pc = check_pattern_stamped(st_dup, pat, scrut_ty)
+        let pc = check_pattern_stamped(st, pat, scrut_ty)
         let s_p = pc.st
         let guard_res = match guard {
           None -> InferredOptExpr { st: s_p, expr: None }
@@ -19138,9 +19189,8 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   let decls_a = expand_unit_aliases_decls(decls, aliases_all)
   let hview = tsh_view(sh.homes, None)
   let unions_all = ut_add(sh.unions, collect_union_rows(decls_a, tab, hview))
-  let top_names = collect_top_type_names(decls_a, tab)
   let built = build_ty_env_inherited(sh.seed, sh.inh, inherited, decls_a,
-                                       unions_all, top_names, sh.rk_table, tab,
+                                       unions_all, sh.rk_table, tab,
                                        sh.homes)
   let recs_here = collect_records(decls_a)
   let recs_all = list_append(recs_here, inherited.recs)
