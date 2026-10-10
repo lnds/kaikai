@@ -57,6 +57,7 @@ import compiler.refine_help
 import compiler.fmt_refine
 import compiler.expr_positions
 import compiler.written
+import compiler.refine_types
 
 # m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
 # alias. Centralised so the call-site builder and the post-parse
@@ -65,14 +66,16 @@ import compiler.written
 pub fn synth_refine_pred_fn_name(tyname: String) : String =
   string_concat("__ref_pred_", tyname)
 
-# What a predicate ranges over: a written name (a parameter before the
-# resolver, the `self` of a refinement inside a type) or a local binder.
+# What a predicate ranges over: a name as the parser wrote it, before
+# the resolver, or a local binder.
 type PredVar = PvName(Written) | PvLocal(LocalId)
 
-fn pv_self() : PredVar = PvName(written("self"))
+fn pv_self() : PredVar = PvLocal(pred_self())
 
-# Text decides only where no id exists: a name before the resolver, and a
-# name inside a type's refinement, which the resolver never reaches.
+# `self` as the parser wrote it.
+fn pv_written_self() : PredVar = PvName(pred_self_binder().name)
+
+# Text decides only before the resolver, where no id exists.
 fn name_is(w: Written, s: String) : Bool = written_text(w) == s
 
 fn pv_is(v: PredVar, e: Expr) : Bool = match e.kind {
@@ -247,8 +250,8 @@ fn pred_entailed_by_params(pred: Expr, param_preds: [ParamPred]) : Bool {
         if expr_struct_eq(pred, pp_expr) { true }
         else if regex_pred_subsumed(pred, pname, pp_expr) { true }
         else {
-          let canon_req = pred_canon(pred)
-          let canon_ref = pred_canon(subst_self_kind(pp_expr, EName(pname)))
+          let canon_req = canon(pred, true)
+          let canon_ref = canon(subst_written_self(pp_expr, pname), true)
           if expr_struct_eq(canon_req, canon_ref) { true }
           else if pred_entailed_by_refinement(canon_req, PvName(pname), canon_ref) { true }
           else { pred_entailed_by_params(pred, rest) }
@@ -287,7 +290,7 @@ fn regex_pred_subsumed(pred: Expr, pname: Written, param_pred: Expr) : Bool {
   # name. Param-side: the receiver is the parser-inserted `self`.
   match pred_regex_pattern_named(pred, PvName(pname)) {
     None -> false
-    Some(loose) -> match pred_regex_pattern_named(param_pred, pv_self()) {
+    Some(loose) -> match pred_regex_pattern_named(param_pred, pv_written_self()) {
       None -> false
       Some(strict) -> regex_pattern_contains(loose, strict)
     }
@@ -696,25 +699,28 @@ fn ac_contains(loose: AnchoredClass, strict: AnchoredClass) : Bool {
 
 # `self` is never rebound by `let` / lambda / match inside a
 # predicate, so no shadowing chase is needed.
-#[doc("Substitute every free `self` in a predicate Expr with a read of the local binder `l`.")]
-pub fn subst_self(e: Expr, l: LocalId) : Expr = subst_self_kind(e, ELocal(l))
+#[doc("Substitute every read of a resolved predicate's `self` with a read of the local binder `l`, each at the position of the read it replaces.")]
+pub fn subst_self(e: Expr, l: LocalId) : Expr = subst_self_kind(e, pv_self(), ELocal(l))
 
-#[doc("Substitute every free `self` in a predicate Expr with the given expression.")]
+#[doc("Substitute every read of a resolved predicate's `self` with the given expression.")]
 pub fn subst_self_with(e: Expr, to: Expr) : Expr = subst_var(e, pv_self(), to)
 
-# A node of kind `to` at the position of each `self` it replaces.
-fn subst_self_kind(e: Expr, to: ExprKind) : Expr = match e.kind {
-  EName(s) -> if name_is(s, "self") { mk_expr(to, e.line, e.col) } else { e }
-  EBinop(op, a, b) -> mk_expr(EBinop(op, subst_self_kind(a, to), subst_self_kind(b, to)), e.line, e.col)
-  EUnop(op, x) -> mk_expr(EUnop(op, subst_self_kind(x, to)), e.line, e.col)
-  ECall(f, xs) -> mk_expr(ECall(subst_self_kind(f, to), subst_self_list(xs, to)), e.line, e.col)
-  _ -> e
-}
+#[doc("`subst_self_with` before the resolver, where a predicate written in place still spells `self` and one copied from an alias already reads its binder.")]
+pub fn subst_self_unresolved(e: Expr, to: Expr) : Expr =
+  subst_var(subst_var(e, pv_self(), to), pv_written_self(), to)
 
-fn subst_self_list(es: [Expr], to: ExprKind) : [Expr] = match es {
-  [] -> []
-  [h, ...t] -> [subst_self_kind(h, to), ...subst_self_list(t, to)]
-}
+# Before the resolver: the parameter a refinement sits on, read by name,
+# for the `self` of its predicate.
+fn subst_written_self(e: Expr, pname: Written) : Expr = subst_self_kind(e, pv_written_self(), EName(pname))
+
+# A node of kind `to` at the position of each read of `v` it replaces.
+fn subst_self_kind(e: Expr, v: PredVar, to: ExprKind) : Expr =
+  if pv_is(v, e) { mk_expr(to, e.line, e.col) } else { match e.kind {
+    EBinop(op, a, b) -> mk_expr(EBinop(op, subst_self_kind(a, v, to), subst_self_kind(b, v, to)), e.line, e.col)
+    EUnop(op, x) -> mk_expr(EUnop(op, subst_self_kind(x, v, to)), e.line, e.col)
+    ECall(f, xs) -> mk_expr(ECall(subst_self_kind(f, v, to), map(xs, (x) => subst_self_kind(x, v, to))), e.line, e.col)
+    _ -> e
+  } }
 
 # Issue #83 sub-case 2: predicate canonicaliser. Normalises a
 # comparison Expr so structurally-different but semantically-equal
@@ -722,38 +728,42 @@ fn subst_self_list(es: [Expr], to: ExprKind) : [Expr] = match es {
 # `==` / `!=` argument order normalised lexicographically. Any
 # non-comparison Expr is recursed into so a top-level `and` / `or`
 # of comparisons is canonicalised arm-wise.
-fn pred_canon(e: Expr) : Expr = match e.kind {
+fn pred_canon(e: Expr) : Expr = canon(e, false)
+
+# `written` holds before the resolver, where two names are ordered by
+# their text.
+fn canon(e: Expr, written: Bool) : Expr = match e.kind {
   EBinop(op, a, b) -> {
-    let ca = pred_canon(a)
-    let cb = pred_canon(b)
+    let ca = canon(a, written)
+    let cb = canon(b, written)
     if binop_eq(op, BoLt) { mk_expr(EBinop(BoGt, cb, ca), e.line, e.col) }
     else if binop_eq(op, BoLe) { mk_expr(EBinop(BoGe, cb, ca), e.line, e.col) }
-    else if binop_is_equality(op) {
-      if cmp_lt(ca, cb) { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
-      else { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
-    }
-    else if binop_is_logical(op) {
-      mk_expr(EBinop(op, ca, cb), e.line, e.col)
-    }
+    else if binop_is_equality(op) and not cmp_lt(ca, cb, written) { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
     else { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
   }
-  EUnop(op, x) -> mk_expr(EUnop(op, pred_canon(x)), e.line, e.col)
+  EUnop(op, x) -> mk_expr(EUnop(op, canon(x, written)), e.line, e.col)
   _ -> e
 }
 
-# Total ordering used by `pred_canon` to break ties on symmetric
-# operators. Variables sort among themselves — written names by their
-# text, local binders by id, a written name before a binder — and
-# literals by value. A variable always sorts before an EInt so `x == 0`
-# canonicalises to `x == 0` (variable on the LHS).
-fn cmp_lt(a: Expr, b: Expr) : Bool = match a.kind {
+# The order `canon` puts the operands of a symmetric operator in: a
+# written name, then a local binder, then a declaration, then a literal.
+# Binders and declarations sort by id and literals by value; written
+# names sort by text before the resolver and are in no order after it,
+# where a name still written has no identity to order by.
+fn cmp_lt(a: Expr, b: Expr, written: Bool) : Bool = match a.kind {
   EName(an) -> match b.kind {
-    EName(bn) -> string_lt(written_text(an), written_text(bn))
+    EName(bn) -> written and string_lt(written_text(an), written_text(bn))
     _ -> true
   }
   ELocal(al) -> match b.kind {
     EName(_)   -> false
     ELocal(bl) -> local_raw(al) < local_raw(bl)
+    _ -> true
+  }
+  ESym(sa, _) -> match b.kind {
+    EName(_)    -> false
+    ELocal(_)   -> false
+    ESym(sb, _) -> sym_raw(sa) < sym_raw(sb)
     _ -> true
   }
   EInt(av, _) -> match b.kind {
@@ -1093,7 +1103,7 @@ pub fn classify_arg_vs_pred(req_pred: Expr, p: LocalId, arg: Expr,
                         caller_refs: [RefBinding]) : CallSiteStatus =
   classify_value(req_pred, PvLocal(p), arg, caller_refs)
 
-#[doc("`classify_arg_vs_pred` for a predicate still written over `self`, as a refinement inside a type is.")]
+#[doc("`classify_arg_vs_pred` for a predicate over its own `self`, as a refinement inside a type is.")]
 pub fn classify_self_vs_pred(req_pred: Expr, arg: Expr, caller_refs: [RefBinding]) : CallSiteStatus =
   classify_value(req_pred, pv_self(), arg, caller_refs)
 
