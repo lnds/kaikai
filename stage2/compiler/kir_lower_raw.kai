@@ -58,7 +58,6 @@
 import compiler.ast
 import compiler.operators
 import compiler.kir
-import compiler.util
 
 # True when an optional type is `Real` (stripping Dim/Refinement wrappers) —
 # the one scalar this module raw-promotes.
@@ -148,8 +147,8 @@ fn kir_ty_is_byte_t(t: Ty) : Bool = match t {
 # True iff an optional type is one of the raw fixed widths Int32/UInt32/
 # UInt64/Int128 (Byte has its own `kir_ty_is_byte`). Gates the raw literal/
 # var/arith forms and routes the box→raw border through the per-type
-# `<width>.unbox` prim. The op family carries signedness by name (`i32/`
-# signed, `u32/`/`u64/` unsigned; `i128/` signed). Int128 raw-izes only
+# `<width>.unbox` prim. The prim's scalar carries signedness (Int32 and
+# Int128 signed, UInt32 and UInt64 unsigned). Int128 raw-izes only
 # `+ - *` and the comparisons — its `/`/`%` stay boxed (`decide_mode_aware`).
 pub fn kir_ty_is_fixed_raw(opt_t: Option[Ty]) : Bool = match opt_t {
   Some(t) -> not is_none_ty(kir_fixed_raw_slot_t(t))
@@ -177,37 +176,19 @@ pub fn kir_fixed_raw_slot(opt_t: Option[Ty]) : KSlot = match opt_t {
   None    -> SBoxed
 }
 
-# The op-family / border-prim prefix for a raw fixed-width type: `i32`,
-# `u32`, or `u64`. The arith/cmp prims are `<pfx>+`…`<pfx>%`, `<pfx><`…; the
-# box/unbox borders are `<box>.box`/`<box>.unbox` via `kir_fixed_box_name`.
-fn kir_fixed_prim_prefix_t(t: Ty) : String = match t {
-  TyInt32             -> "i32"
-  TyUInt32            -> "u32"
-  TyUInt64            -> "u64"
-  TyInt128            -> "i128"
-  TyRefineT(inner, _) -> kir_fixed_prim_prefix_t(inner)
-  _                   -> "i32"
+fn kir_fixed_raw_scalar_t(t: Ty) : RawScalar = match t {
+  TyInt32             -> RwInt32
+  TyUInt32            -> RwUInt32
+  TyUInt64            -> RwUInt64
+  TyInt128            -> RwInt128
+  TyRefineT(inner, _) -> kir_fixed_raw_scalar_t(inner)
+  _                   -> RwInt32
 }
 
-pub fn kir_fixed_prim_prefix(opt_t: Option[Ty]) : String = match opt_t {
-  Some(t) -> kir_fixed_prim_prefix_t(t)
-  None    -> "i32"
-}
-
-# The box/unbox border-prim base name for a raw fixed-width type
-# (`int32`/`uint32`/`uint64`) — `<name>.box` → `kaix_<name>`.
-fn kir_fixed_box_name_t(t: Ty) : String = match t {
-  TyInt32             -> "int32"
-  TyUInt32            -> "uint32"
-  TyUInt64            -> "uint64"
-  TyInt128            -> "int128"
-  TyRefineT(inner, _) -> kir_fixed_box_name_t(inner)
-  _                   -> "int32"
-}
-
-pub fn kir_fixed_box_name(opt_t: Option[Ty]) : String = match opt_t {
-  Some(t) -> kir_fixed_box_name_t(t)
-  None    -> "int32"
+#[doc("The scalar of a raw fixed-width type, which its arith, comparison and border prims compute over.")]
+pub fn kir_fixed_raw_scalar(opt_t: Option[Ty]) : RawScalar = match opt_t {
+  Some(t) -> kir_fixed_raw_scalar_t(t)
+  None    -> RwInt32
 }
 
 # An Expr the KIR raw path handles. ONLY the natively-raw FORMS — a Real
@@ -280,13 +261,13 @@ fn kir_intrinsic_is_raw(i: Intrinsic) : Bool = match i {
 # The boxing prim a raw value crosses to boxed through, by RESULT type:
 # `real.box` (→ `kaix_real`) for a Real, `bool.box` (→ `kaix_bool`) for the
 # raw-Bool result of a Real comparison / logical. Mirror of `box_wrap`.
-pub fn kir_raw_box_prim(opt_t: Option[Ty]) : String =
-  if kir_ty_is_real(opt_t) { "real.box" }
-  else if kir_ty_is_int(opt_t) { "int.box" }
-  else if kir_ty_is_char(opt_t) { "char.box" }
-  else if kir_ty_is_byte(opt_t) { "byte.box" }
-  else if kir_ty_is_fixed_raw(opt_t) { cat2(kir_fixed_box_name(opt_t), ".box") }
-  else { "bool.box" }
+pub fn kir_raw_box_prim(opt_t: Option[Ty]) : PrimOp =
+  if kir_ty_is_real(opt_t) { KpBox(RwReal) }
+  else if kir_ty_is_int(opt_t) { KpBox(RwInt) }
+  else if kir_ty_is_char(opt_t) { KpBox(RwChar) }
+  else if kir_ty_is_byte(opt_t) { KpBox(RwByte) }
+  else if kir_ty_is_fixed_raw(opt_t) { KpBox(kir_fixed_raw_scalar(opt_t)) }
+  else { KpBox(RwBool) }
 
 # The `fbinop` opcode for a raw-Real arithmetic operator (matches the
 # runtime `kai_llvm_build_fbinop` switch: 0=fadd 1=fsub 2=fmul 3=fdiv).
@@ -367,33 +348,3 @@ pub fn kir_logical_op(op: BinOp) : Int = match op {
   _     -> 0
 }
 
-# The KIR prim NAME carrying a raw binary op. The native emitter
-# (`nemit_prim`) dispatches these to `llvm_build_fbinop` / `llvm_build_fcmp`
-# / `llvm_build_ibinop` / `llvm_build_icmp` / the i1 logical builder rather
-# than the boxed `kaix_*` helpers. The `f` prefix marks the raw-Real family,
-# `i` the raw-Int family; both keep them distinct from the boxed `+`/`<`
-# strings so a translator never confuses the two; logical `and`/`or` get a
-# `b` prefix (i1 domain).
-pub fn kir_raw_arith_prim(op: BinOp) : String = cat2("f", binop_text(op))
-pub fn kir_raw_cmp_prim(op: BinOp) : String = cat2("f", binop_text(op))
-pub fn kir_raw_logical_prim(op: BinOp) : String = cat2("b", binop_text(op))
-pub fn kir_raw_iarith_prim(op: BinOp) : String = cat2("i", binop_text(op))
-pub fn kir_raw_icmp_prim(op: BinOp) : String = cat2("i", binop_text(op))
-# The `u8` family: same operator set as the i-family, per-op 8-bit
-# masking (`+ - *` mask after the op; `/`/`%` widen into the checked i64
-# helper and truncate; cmp is an i32 `icmp` over the masked values).
-pub fn kir_raw_u8arith_prim(op: BinOp) : String = cat2("u8", binop_text(op))
-pub fn kir_raw_u8cmp_prim(op: BinOp) : String = cat2("u8", binop_text(op))
-# Bool and Char comparisons: both operands live in an i32 register, so the
-# compare is an `icmp` like the Byte family — never the f-family, whose
-# operands load through `kaix_real_field`. The prefixes stay clear of the
-# `b`-prefixed logicals (`band`/`bor`/`bnot`).
-pub fn kir_raw_boolcmp_prim(op: BinOp) : String = cat2("b1", binop_text(op))
-pub fn kir_raw_charcmp_prim(op: BinOp) : String = cat2("ch", binop_text(op))
-# The fixed-width families (`i32`/`u32`/`u64`): the same operator set as
-# the i-family with the prefix carrying the type. `+ - *` are one wrapping
-# `ibinop` at the register width (no mask — the width IS the register);
-# `/`/`%` widen into the checked helper (signed `kai_idiv_chk`, unsigned
-# `kai_udiv_chk`) and truncate; cmp is a signed/unsigned `icmp` per prefix.
-pub fn kir_raw_fixed_arith_prim(opt_t: Option[Ty], op: BinOp) : String = cat2(kir_fixed_prim_prefix(opt_t), binop_text(op))
-pub fn kir_raw_fixed_cmp_prim(opt_t: Option[Ty], op: BinOp) : String = cat2(kir_fixed_prim_prefix(opt_t), binop_text(op))

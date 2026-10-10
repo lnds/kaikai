@@ -8,14 +8,17 @@
 # imperative over `ctx: Handle` (no threaded state, no kaikai records — a
 # handle never enters the RC regime).
 #
-# Symbol resolution mirrors the mature emitters (NOT reinvented): a binop
-# `KPrim` maps through the same `+`→`kaix_add` table as `emit_llvm`'s
+# Symbol resolution mirrors the mature emitters (NOT reinvented): an
+# operator `KPrim` maps through the same `+`→`kaix_add` table as `emit_llvm`'s
 # `llvm_binop_helper`; a `kai_*` prim maps to its `kaix_*` runtime export;
 # any other `KCall` callee is already the symbol it links to. All boxed
 # (KIR is all-boxed).
 
 import compiler.util
+import compiler.ast
+import compiler.operators
 import compiler.kir
+import compiler.kir_prims
 import compiler.emit_native_fn
 import compiler.emit_native_slot
 import compiler.emit_native_fnix
@@ -25,29 +28,34 @@ import compiler.emit_native_call
 
 # --- KPrim / KCall symbol resolution -----------------------------------
 
-# The runtime symbol a binary/unary operator prim calls. Mirror of
-# emit_llvm's `llvm_binop_helper`. None → not an operator (a `kai_*` prim).
-fn nprim_op_sym(op: String) : Option[String] =
-  if op == "+" { Some("kaix_add") }
-  else if op == "-" { Some("kaix_sub") }
-  else if op == "*" { Some("kaix_mul") }
-  else if op == "/" { Some("kaix_div") }
-  else if op == "%" { Some("kaix_mod") }
-  else if op == "^" { Some("kaix_pow_int") }
-  else if op == "==" { Some("kaix_eq") }
-  else if op == "!=" { Some("kaix_ne") }
-  else if op == "<" { Some("kaix_lt") }
-  else if op == ">" { Some("kaix_gt") }
-  else if op == "<=" { Some("kaix_le") }
-  else if op == ">=" { Some("kaix_ge") }
-  else if op == "and" { Some("kaix_and") }
-  else if op == "or" { Some("kaix_or") }
-  else if op == "not" { Some("kaix_not") }
-  # Unary minus (the KIR lowering's `unop_prim` maps `-` → `neg` so it does
-  # NOT collide with the binary `-` → `kaix_sub` above). `kaix_neg` is the
-  # one-arg runtime helper (mirror of emit_c's `kai_op_neg`).
-  else if op == "neg" { Some("kaix_neg") }
-  else { None }
+# The runtime symbol a boxed binary operator prim calls. Mirror of
+# emit_llvm's `llvm_binop_helper`. `++` has no helper of its own: the
+# lowering resolves it to the list or the string one.
+fn nprim_binop_sym(op: BinOp) : String = match op {
+  BoAdd    -> "kaix_add"
+  BoSub    -> "kaix_sub"
+  BoMul    -> "kaix_mul"
+  BoDiv    -> "kaix_div"
+  BoMod    -> "kaix_mod"
+  BoPow    -> "kaix_pow_int"
+  BoEq     -> "kaix_eq"
+  BoNe     -> "kaix_ne"
+  BoLt     -> "kaix_lt"
+  BoGt     -> "kaix_gt"
+  BoLe     -> "kaix_le"
+  BoGe     -> "kaix_ge"
+  BoAnd    -> "kaix_and"
+  BoOr     -> "kaix_or"
+  BoConcat -> binop_text(op)
+}
+
+# The one-operand runtime helper of a boxed unary operator prim. Negation
+# has its own (mirror of emit_c's `kai_op_neg`), apart from the two-operand
+# `kaix_sub`.
+fn nprim_unop_sym(op: UnOp) : String = match op {
+  UoNeg -> "kaix_neg"
+  UoNot -> "kaix_not"
+}
 
 # A `kai_*` prim's `kaix_*` runtime export. The lowering plants a handful
 # of prims with their C-runtime `kai_` name (list spine, field read,
@@ -73,7 +81,7 @@ fn ncall_sym(callee: String) : String =
 # abort loudly and yield a null placeholder.
 pub fn nemit_op(ctx: Handle, op: KOp, fx: NFnIndex) : Handle / Console = match op {
   KLitOp(v)            -> nemit_atom(ctx, v)
-  KPrim(nm, cargs)     -> nemit_prim(ctx, nm, cargs)
+  KPrim(p, cargs)      -> nemit_prim(ctx, p, cargs)
   # P3: a direct call to a UFn with a raw signature passes each arg at its
   # param slot + boxes a raw return; everything else stays the boxed funnel.
   # The callee KFn (looked up by its mangled `sym` in `fx`) carries the
@@ -416,42 +424,41 @@ fn nbuf2(a: Handle, b: Handle) : Handle = {
 }
 fn nbuf1(a: Handle) : Handle = { let buf = llvm_buf_new(); llvm_buf_push(buf, a); buf }
 
-# A binop/unop prim, or a `kai_*` runtime prim. Operators route through
-# `nprim_op_sym`; everything else is a direct runtime call by name. Note
-# on `and`/`or`: the KIR lowering already flattened them to a STRICT
-# `prim and(a, b)` with both operands materialised (the short-circuit
-# was lowered away upstream). `kaix_and`/`kaix_or` are the strict boxed
-# form — behaviourally identical to the C-direct oracle whenever both
-# operands are pure (the core's uses: `c >= '0' and c <= '9'` etc.). A
-# divergence would only show if the RHS had observable effects, which is
-# a property of the KIR lowering, not this backend.
-fn nemit_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
+# One prim. A boxed operator calls its runtime helper; a raw op is a native
+# instruction; a runtime entry with a mixed signature has its own emitter;
+# every other one is an all-boxed runtime call by name. Note on `and`/`or`:
+# `kaix_and`/`kaix_or` are the strict boxed form, both operands
+# materialised — behaviourally identical to the C-direct oracle whenever
+# both operands are pure. A divergence would only show if the RHS had
+# observable effects, which is a property of the KIR lowering, not this
+# backend.
+fn nemit_prim(ctx: Handle, p: PrimOp, cargs: [KVal]) : Handle / Console = match p {
+  KpUnwPush  -> nemit_unw_push(ctx, cargs)
+  KpUnwFiber -> nemit_unw_fiber(ctx)
+  KpUnwPop   -> nemit_unw_pop(ctx, cargs)
   # `kai_op_field(rec, "name")` is NOT a uniform boxed call: the runtime
   # `kaix_field(KaiValue* rec, const char* name)` takes the field name as
   # a raw `i8*` (a global string), not a boxed String — the C-direct
   # oracle emits `kai_op_field(rec, "name")` with a C string literal.
   # Lower the record boxed, the name as a global string, mixed signature.
-  if nm == "kai_unw_push" { nemit_unw_push(ctx, cargs) }
-  else if nm == "kai_unw_fiber" { nemit_unw_fiber(ctx) }
-  else if nm == "kai_unw_pop" { nemit_unw_pop(ctx, cargs) }
-  else if nm == "kai_op_field" { nemit_field_read(ctx, "kaix_field", cargs) }
+  KpField    -> nemit_field_read(ctx, "kaix_field", cargs)
   # `kai_op_field_at(rec, i)` is the constant-index field read: `kaix_field_at
   # (KaiValue* rec, i32 i) -> ptr`, the same mixed (ptr, i32) shape as
   # `kaix_tag_eq`. The slot is a `KIntV` the lowering computed from the static
   # record type. Same incref-on-read contract as `kaix_field`.
-  else if nm == "kai_op_field_at" { nemit_field_at(ctx, cargs) }
+  KpFieldAt  -> nemit_field_at(ctx, cargs)
   # `kai_op_field_borrow` is the NON-consuming sibling the record-match
   # decision tree (kir_lower_rec.kai) reads a field through for its equality
   # tests — same mixed (ptr rec, i8* name) signature, the borrowing runtime
   # shim (no incref), so a failing arm leaks no field ref.
-  else if nm == "kai_op_field_borrow" { nemit_field_read(ctx, "kaix_field_borrow", cargs) }
+  KpFieldBorrow -> nemit_field_read(ctx, "kaix_field_borrow", cargs)
   # Vec raw element paths — fused inline-record column read / write
   # (kir_lower_walk plants these; classifier verdict in vec_raw.kai).
   # Mixed signatures, never the all-boxed fall-through.
-  else if nm == "kai_vec_get_field" { nemit_vec_get_field(ctx, "kaix_vec_get_field", cargs) }
-  else if nm == "kai_vec_get_field_borrow" { nemit_vec_get_field(ctx, "kaix_vec_get_field_borrow", cargs) }
-  else if nm == "kai_vec_push_rec_raw" { nemit_vec_push_rec(ctx, cargs) }
-  else if nm == "kai_vec_set_rec_raw" { nemit_vec_set_rec(ctx, cargs) }
+  KpVecGetField       -> nemit_vec_get_field(ctx, "kaix_vec_get_field", cargs)
+  KpVecGetFieldBorrow -> nemit_vec_get_field(ctx, "kaix_vec_get_field_borrow", cargs)
+  KpVecPushRecRaw     -> nemit_vec_push_rec(ctx, cargs)
+  KpVecSetRecRaw      -> nemit_vec_set_rec(ctx, cargs)
   # `kai_assert_check(cond, msg)` is NOT a uniform boxed call: the runtime
   # `kaix_assert_check(KaiValue* cond, const char* msg)` returns `void` and
   # takes the message as a raw `i8*` (a de-escaped global string), not a
@@ -459,189 +466,108 @@ fn nemit_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   # plants the message as a `KStrV` quote-wrapped span; materialise it via
   # `llvm_build_string_span` (strips quotes, decodes escapes). Mirror of
   # the C-direct oracle's `kai_assert_check(cond, "...")`.
-  else if nm == "kai_assert_check" { nemit_assert_check(ctx, cargs) }
-  else if nm == "kai_assert_check_with_value" { nemit_assert_check_with_value(ctx, cargs) }
+  KpAssertCheck          -> nemit_assert_check(ctx, cargs)
+  KpAssertCheckWithValue -> nemit_assert_check_with_value(ctx, cargs)
   # `kai_tag_eq(slot, tag)` is the variant-tag equality test the shared-tag
   # match decision tree (kir_lower_variant.kai) emits to distinguish arms
   # that share a top-level tag (`Branch(Red,..)` vs `Branch(Black,..)`).
   # NOT a uniform boxed call: `kaix_tag_eq(KaiValue* v, i32 tag) -> ptr`
   # takes a RAW i32 ctor tag (the `KIntV` operand the lowering planted),
   # not a boxed Int — same mixed (ptr, i32) shape as `kaix_variant`.
-  else if nm == "kai_tag_eq" { nemit_tag_eq(ctx, cargs) }
-  # Raw (unboxed) Real/Bool ops (KIR mode-slave, kir_lower_raw). These are
-  # native LLVM instructions, NOT boxed `kaix_*` calls: an `f`-prefixed
-  # arith/cmp maps to `fbinop`/`fcmp`, a `b`-prefixed logical to the i1
-  # `logical`/`lnot`, `fneg` to `fneg`, and the box/unbox borders to the
-  # scalar constructor / `as.r` borrow. No RC: a raw operand is never
+  KpTagEq -> nemit_tag_eq(ctx, cargs)
+  # Raw (unboxed) ops (KIR mode-slave, kir_lower_raw). These are native LLVM
+  # instructions, NOT boxed `kaix_*` calls, and the box/unbox borders are
+  # the scalar constructor / payload borrow. No RC: a raw operand is never
   # decref'd, so a multi-use Real never double-frees (the family's bug).
-  else if nprim_is_raw(nm) { nemit_raw_prim(ctx, nm, cargs) }
-  else {
-    let buf = nemit_atoms_buf(ctx, cargs)
-    match nprim_op_sym(nm) {
-      Some(sym) -> nemit_call_freeing(ctx, sym, buf)
-      None      -> nemit_call_freeing(ctx, nprim_runtime_sym(nm), buf)
-    }
-  }
-
-# A KIR raw-op prim name (the `f`/`i`/`b` family kir_lower_raw plants).
-# These never reach the boxed `kaix_*` dispatch — they emit native
-# instructions. `int.unbox` joins the box/unbox borders; the `i`-family
-# arith/cmp join the f-family.
-fn nprim_is_raw(nm: String) : Bool =
-  nm == "real.box" or nm == "bool.box" or nm == "int.box" or nm == "char.box" or nm == "byte.box" or
-  nm == "real.unbox" or nm == "int.unbox" or nm == "bool.unbox" or nm == "char.unbox" or nm == "byte.unbox" or
-  nprim_is_fixed_border(nm) or
-  nm == "fneg" or nm == "bnot" or nm == "band" or nm == "bor" or
-  nprim_raw_fbinop_op(nm) >= 0 or nprim_raw_fcmp_pred(nm) >= 0 or
-  nprim_raw_ibinop_op(nm) >= 0 or nprim_raw_icmp_pred(nm) >= 0 or
-  nprim_raw_u8binop_op(nm) >= 0 or nprim_raw_u8cmp_pred(nm) >= 0 or
-  nprim_is_i32cmp(nm) or
-  nprim_fixed_prefix(nm) != ""
-
-# The box/unbox border prims for the raw fixed widths.
-fn nprim_is_fixed_border(nm: String) : Bool =
-  nm == "int32.box"  or nm == "int32.unbox" or
-  nm == "uint32.box" or nm == "uint32.unbox" or
-  nm == "uint64.box" or nm == "uint64.unbox" or
-  nm == "int128.box" or nm == "int128.unbox"
-
-# The `i32`/`u32`/`u64`/`i128` prefix of a fixed-width arith/cmp prim, or ""
-# if the name is not one (a border prim returns "" too — it dispatches
-# separately). `i128` is checked before `i32` since both start with `i`.
-fn nprim_fixed_prefix(nm: String) : String =
-  if nprim_is_fixed_border(nm) { "" }
-  else if string_starts_with_q(nm, "i128") { "i128" }
-  else if string_starts_with_q(nm, "i32") { "i32" }
-  else if string_starts_with_q(nm, "u32") { "u32" }
-  else if string_starts_with_q(nm, "u64") { "u64" }
-  else { "" }
-
-# The `fbinop` opcode for a raw-Real arith prim (`f+`/`f-`/`f*`/`f/`), or -1.
-fn nprim_raw_fbinop_op(nm: String) : Int =
-  if nm == "f+" { 0 } else if nm == "f-" { 1 } else if nm == "f*" { 2 }
-  else if nm == "f/" { 3 } else { -1 }
-
-# The `fcmp` predicate for a raw-Real comparison prim, or -1.
-fn nprim_raw_fcmp_pred(nm: String) : Int =
-  if nm == "f<" { 0 } else if nm == "f>" { 1 } else if nm == "f<=" { 2 }
-  else if nm == "f>=" { 3 } else if nm == "f==" { 4 } else if nm == "f!=" { 5 }
-  else { -1 }
-
-# The `ibinop` opcode for a raw-Int arith prim (`i+`/`i-`/`i*`/`i/`/`i%`), or
-# -1. `nemit_raw_ibinop` turns opcode 3 (`i/`) and 4 (`i%`) into a call to the
-# checked helper `kai_idiv_chk`/`kai_imod_chk`, so div-by-zero and INT64_MIN/-1
-# trap instead of running the UB `sdiv`/`srem` would.
-fn nprim_raw_ibinop_op(nm: String) : Int =
-  if nm == "i+" { 0 } else if nm == "i-" { 1 } else if nm == "i*" { 2 }
-  else if nm == "i/" { 3 } else if nm == "i%" { 4 }
-  else { -1 }
-
-# The `icmp` predicate for a raw-Int comparison prim, or -1.
-fn nprim_raw_icmp_pred(nm: String) : Int =
-  if nm == "i<" { 0 } else if nm == "i>" { 1 } else if nm == "i<=" { 2 }
-  else if nm == "i>=" { 3 } else if nm == "i==" { 4 } else if nm == "i!=" { 5 }
-  else { -1 }
-
-# The `ibinop` opcode for a raw-Byte arith prim (`u8+`…`u8%`), or -1.
-# `nemit_raw_u8binop` masks 0/1/2 at 8 bits after the op and routes 3/4
-# through the checked i64 helper (widen, call, truncate).
-fn nprim_raw_u8binop_op(nm: String) : Int =
-  if nm == "u8+" { 0 } else if nm == "u8-" { 1 } else if nm == "u8*" { 2 }
-  else if nm == "u8/" { 3 } else if nm == "u8%" { 4 }
-  else { -1 }
-
-# The `icmp` predicate for a raw-Byte comparison prim, or -1. Operands
-# hold the masked 0..255 value in i32, so the signed compare is exact.
-fn nprim_raw_u8cmp_pred(nm: String) : Int =
-  if nm == "u8<" { 0 } else if nm == "u8>" { 1 } else if nm == "u8<=" { 2 }
-  else if nm == "u8>=" { 3 } else if nm == "u8==" { 4 } else if nm == "u8!=" { 5 }
-  else { -1 }
-
-# The i32-domain comparison families (`b1` Bool, `ch` Char): both hold a
-# non-negative value in an i32 register — the Bool 0/1 form, a Char codepoint
-# — so one signed `icmp` serves them and only the load slot differs.
-fn nprim_is_i32cmp(nm: String) : Bool =
-  (string_starts_with_q(nm, "b1") or string_starts_with_q(nm, "ch")) and
-  nprim_i32cmp_pred(nm) >= 0
-
-fn nprim_i32cmp_slot(nm: String) : KSlot =
-  if string_starts_with_q(nm, "b1") { SBool } else { SChar }
-
-# The `icmp` predicate of an i32-domain comparison prim, or -1. The prefix is
-# two chars in both families.
-fn nprim_i32cmp_pred(nm: String) : Int =
-  if string_length(nm) < 3 { -1 }
-  else { nprim_fixed_cmp_pred(string_slice(nm, 2, string_length(nm) - 2)) }
-
-# The op suffix of a fixed-width prim (`i32+` → `+`, `i128*` → `*`). The
-# prefix width varies (`i32`/`u32`/`u64` are 3 chars, `i128` is 4), so the
-# slice starts after the actual prefix, not a hard-coded offset.
-fn nprim_fixed_op_suffix(nm: String) : String {
-  let plen = string_length(nprim_fixed_prefix(nm))
-  string_slice(nm, plen, string_length(nm) - plen)
+  KpBox(s)        -> nemit_raw_box_prim(ctx, s, cargs)
+  KpUnbox(s)      -> nemit_raw_unbox_at(ctx, raw_scalar_slot(s), cargs)
+  KpRawUn(op)     -> nemit_raw_unary(ctx, op, cargs)
+  KpRawBin(s, op) -> nemit_raw_bin(ctx, s, op, cargs)
+  KpBin(op)       -> nemit_call_freeing(ctx, nprim_binop_sym(op), nemit_atoms_buf(ctx, cargs))
+  KpUn(op)        -> nemit_call_freeing(ctx, nprim_unop_sym(op), nemit_atoms_buf(ctx, cargs))
+  _               -> nemit_call_freeing(ctx, nprim_runtime_sym(kprim_text(p)), nemit_atoms_buf(ctx, cargs))
 }
 
-# The arith opcode (0=+ 1=- 2=* 3=/ 4=%) for a fixed-width arith op suffix,
-# or -1 (a cmp suffix). `/`/`%` route through the checked helper.
-fn nprim_fixed_arith_op(suf: String) : Int =
-  if suf == "+" { 0 } else if suf == "-" { 1 } else if suf == "*" { 2 }
-  else if suf == "/" { 3 } else if suf == "%" { 4 }
-  else { -1 }
+# The opcode of an arithmetic operator for the `ibinop` / `fbinop` builders
+# (0=+ 1=- 2=* 3=/ 4=%), or -1. The integer emitters turn 3 and 4 into a
+# call to the checked helper, so a zero divisor and INT64_MIN/-1 trap
+# instead of running the UB `sdiv`/`srem` would.
+fn nraw_arith_op(op: BinOp) : Int = match op {
+  BoAdd -> 0
+  BoSub -> 1
+  BoMul -> 2
+  BoDiv -> 3
+  BoMod -> 4
+  _     -> -1
+}
 
-# The cmp predicate (0=< 1=> 2=<= 3=>= 4=== 5=!=) for a fixed-width cmp op
-# suffix, or -1.
-fn nprim_fixed_cmp_pred(suf: String) : Int =
-  if suf == "<" { 0 } else if suf == ">" { 1 } else if suf == "<=" { 2 }
-  else if suf == ">=" { 3 } else if suf == "==" { 4 } else if suf == "!=" { 5 }
-  else { -1 }
+# The predicate of a comparison operator for the `icmp` / `fcmp` builders
+# (0=< 1=> 2=<= 3=>= 4=== 5=!=), or -1.
+fn nraw_cmp_pred(op: BinOp) : Int = match op {
+  BoLt -> 0
+  BoGt -> 1
+  BoLe -> 2
+  BoGe -> 3
+  BoEq -> 4
+  BoNe -> 5
+  _    -> -1
+}
 
-# Emit one raw op. Real arith yields an `f64`; Int arith yields an `i64`;
-# cmp yields a raw i32 (the `fcmp`/`icmp` i1 widened, so it stores in the
-# i32 `SBool` register); logical operates on the i32 0/1 form; the borders
-# box/unbox the scalar.
-fn nemit_raw_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
-  if nm == "real.box" { nemit_raw_box(ctx, "kaix_real", native_ctx_f64t(ctx), cargs) }
-  else if nm == "bool.box" { nemit_raw_box(ctx, "kaix_bool", native_ctx_i32t(ctx), cargs) }
-  else if nm == "int.box" { nemit_raw_box(ctx, "kaix_int", native_ctx_i64t(ctx), cargs) }
-  else if nm == "char.box" { nemit_raw_box(ctx, "kaix_char", native_ctx_i32t(ctx), cargs) }
-  else if nm == "byte.box" { nemit_raw_box(ctx, "kaix_byte", native_ctx_i32t(ctx), cargs) }
-  else if nm == "real.unbox" { nemit_raw_unbox_at(ctx, SReal, cargs) }
-  else if nm == "int.unbox" { nemit_raw_unbox_at(ctx, SInt64, cargs) }
-  else if nm == "bool.unbox" { nemit_raw_unbox_at(ctx, SBool, cargs) }
-  else if nm == "char.unbox" { nemit_raw_unbox_at(ctx, SChar, cargs) }
-  else if nm == "byte.unbox" { nemit_raw_unbox_at(ctx, SByte, cargs) }
-  else if nm == "int32.box"  { nemit_raw_fixed_box(ctx, "kaix_int32",  SInt32T, cargs) }
-  else if nm == "uint32.box" { nemit_raw_fixed_box(ctx, "kaix_uint32", SUInt32, cargs) }
-  else if nm == "uint64.box" { nemit_raw_fixed_box(ctx, "kaix_uint64", SUInt64, cargs) }
-  else if nm == "int128.box" { nemit_raw_fixed_box(ctx, "kaix_int128", SInt128, cargs) }
-  else if nm == "int32.unbox"  { nemit_raw_unbox_at(ctx, SInt32T, cargs) }
-  else if nm == "uint32.unbox" { nemit_raw_unbox_at(ctx, SUInt32, cargs) }
-  else if nm == "uint64.unbox" { nemit_raw_unbox_at(ctx, SUInt64, cargs) }
-  else if nm == "int128.unbox" { nemit_raw_unbox_at(ctx, SInt128, cargs) }
-  else if nm == "fneg" { nemit_raw_unary(ctx, "fneg", cargs) }
-  else if nm == "bnot" { nemit_raw_unary(ctx, "lnot", cargs) }
-  else if nm == "band" { nemit_raw_logical(ctx, 1, cargs) }
-  else if nm == "bor" { nemit_raw_logical(ctx, 0, cargs) }
-  else if nprim_fixed_prefix(nm) != "" { nemit_raw_fixed_prim(ctx, nm, cargs) }
-  else { nemit_raw_binfamily(ctx, nm, cargs) }
+fn nemit_raw_bad(ctx: Handle) : Handle / Console = {
+  nemit_unsupported(ctx, "raw op outside its scalar's family"); nemit_null(ctx)
+}
 
-# The raw binary families, each keyed by its own prim prefix: Real `f`, Int
-# `i`, Byte `u8`, and the i32-domain comparisons (`b1` Bool, `ch` Char). The
-# i-family is last because its predicate reader is the fallback — every name
-# reaching here is one of these.
-fn nemit_raw_binfamily(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console = {
-  let fop = nprim_raw_fbinop_op(nm)
-  let iop = nprim_raw_ibinop_op(nm)
-  let uop = nprim_raw_u8binop_op(nm)
-  let up = nprim_raw_u8cmp_pred(nm)
-  let fp = nprim_raw_fcmp_pred(nm)
-  if fop >= 0 { nemit_raw_fbinop(ctx, fop, cargs) }
-  else if iop >= 0 { nemit_raw_ibinop(ctx, iop, cargs) }
-  else if uop >= 0 { nemit_raw_u8binop(ctx, uop, cargs) }
-  else if up >= 0 { nemit_raw_u8cmp(ctx, up, cargs) }
-  else if nprim_is_i32cmp(nm) { nemit_raw_i32cmp(ctx, nprim_i32cmp_pred(nm), nprim_i32cmp_slot(nm), cargs) }
-  else if fp >= 0 { nemit_raw_fcmp(ctx, fp, cargs) }
-  else { nemit_raw_icmp(ctx, nprim_raw_icmp_pred(nm), cargs) }
+# The box border of a raw scalar: its runtime constructor over the register.
+fn nemit_raw_box_prim(ctx: Handle, s: RawScalar, cargs: [KVal]) : Handle / Console = match s {
+  RwReal   -> nemit_raw_box(ctx, "kaix_real", SReal, native_ctx_f64t(ctx), cargs)
+  RwBool   -> nemit_raw_box(ctx, "kaix_bool", SBool, native_ctx_i32t(ctx), cargs)
+  RwInt    -> nemit_raw_box(ctx, "kaix_int", SInt64, native_ctx_i64t(ctx), cargs)
+  RwChar   -> nemit_raw_box(ctx, "kaix_char", SChar, native_ctx_i32t(ctx), cargs)
+  RwByte   -> nemit_raw_box(ctx, "kaix_byte", SByte, native_ctx_i32t(ctx), cargs)
+  RwInt32  -> nemit_raw_fixed_box(ctx, "kaix_int32",  SInt32T, cargs)
+  RwUInt32 -> nemit_raw_fixed_box(ctx, "kaix_uint32", SUInt32, cargs)
+  RwUInt64 -> nemit_raw_fixed_box(ctx, "kaix_uint64", SUInt64, cargs)
+  RwInt128 -> nemit_raw_fixed_box(ctx, "kaix_int128", SInt128, cargs)
+}
+
+# One raw binary op over two registers of scalar `s`. Arithmetic yields the
+# scalar's own register; a comparison yields a raw i32 (the `fcmp`/`icmp` i1
+# widened, so it stores in the i32 `SBool` register); `and` / `or` operate on
+# the i32 0/1 form.
+fn nemit_raw_bin(ctx: Handle, s: RawScalar, op: BinOp, cargs: [KVal]) : Handle / Console =
+  if binop_is_arith(op) { nemit_raw_arith(ctx, s, nraw_arith_op(op), cargs) }
+  else if binop_is_comparison(op) { nemit_raw_cmp(ctx, s, nraw_cmp_pred(op), cargs) }
+  else { nemit_raw_bool_logical(ctx, s, op, cargs) }
+
+# Real has no `%` instruction and no arithmetic rides a Bool or a Char.
+fn nemit_raw_arith(ctx: Handle, s: RawScalar, aop: Int, cargs: [KVal]) : Handle / Console = match s {
+  RwReal -> if aop <= 3 { nemit_raw_fbinop(ctx, aop, cargs) } else { nemit_raw_bad(ctx) }
+  RwInt  -> nemit_raw_ibinop(ctx, aop, cargs)
+  RwByte -> nemit_raw_u8binop(ctx, aop, cargs)
+  RwBool -> nemit_raw_bad(ctx)
+  RwChar -> nemit_raw_bad(ctx)
+  _      -> nemit_raw_fixed_binop(ctx, s, aop, cargs)
+}
+
+# Bool and Char both hold a non-negative value in an i32 register — the Bool
+# 0/1 form, a Char codepoint — so one signed `icmp` serves them and only the
+# load slot differs.
+fn nemit_raw_cmp(ctx: Handle, s: RawScalar, pred: Int, cargs: [KVal]) : Handle / Console = match s {
+  RwReal -> nemit_raw_fcmp(ctx, pred, cargs)
+  RwInt  -> nemit_raw_icmp(ctx, pred, cargs)
+  RwByte -> nemit_raw_u8cmp(ctx, pred, cargs)
+  RwBool -> nemit_raw_i32cmp(ctx, pred, SBool, cargs)
+  RwChar -> nemit_raw_i32cmp(ctx, pred, SChar, cargs)
+  _      -> nemit_raw_fixed_cmp(ctx, s, pred, cargs)
+}
+
+fn nemit_raw_bool_logical(ctx: Handle, s: RawScalar, op: BinOp, cargs: [KVal]) : Handle / Console = match s {
+  RwBool -> match op {
+    BoAnd -> nemit_raw_logical(ctx, 1, cargs)
+    BoOr  -> nemit_raw_logical(ctx, 0, cargs)
+    _     -> nemit_raw_bad(ctx)
+  }
+  _ -> nemit_raw_bad(ctx)
 }
 
 # `<op>(a, b)` raw `f64` arithmetic → one `fbinop` instruction. Both atoms
@@ -737,21 +663,12 @@ fn nemit_raw_i32cmp(ctx: Handle, pred: Int, slot: KSlot, cargs: [KVal]) : Handle
 }
 
 # --- raw fixed-width (Int32/UInt32/UInt64/Int128) op family ---
-# The slot a fixed-width prefix's operands load at.
-fn nfixed_slot(pfx: String) : KSlot =
-  if pfx == "i32" { SInt32T } else if pfx == "u32" { SUInt32 }
-  else if pfx == "i128" { SInt128 } else { SUInt64 }
-# True iff the prefix is a SIGNED width (`i32`/`i128`). Drives sext-vs-zext
+# True iff the scalar is a SIGNED width (Int32 / Int128). Drives sext-vs-zext
 # on the div widen and signed-vs-unsigned `icmp`.
-fn nfixed_is_signed(pfx: String) : Bool = pfx == "i32" or pfx == "i128"
-
-# Dispatch a fixed-width arith/cmp prim by prefix + op suffix.
-fn nemit_raw_fixed_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console = {
-  let pfx = nprim_fixed_prefix(nm)
-  let suf = nprim_fixed_op_suffix(nm)
-  let aop = nprim_fixed_arith_op(suf)
-  if aop >= 0 { nemit_raw_fixed_binop(ctx, pfx, aop, cargs) }
-  else { nemit_raw_fixed_cmp(ctx, pfx, nprim_fixed_cmp_pred(suf), cargs) }
+fn nfixed_is_signed(s: RawScalar) : Bool = match s {
+  RwInt32  -> true
+  RwInt128 -> true
+  _        -> false
 }
 
 # `<op>(a, b)` raw fixed-width arithmetic at the native register width
@@ -761,16 +678,16 @@ fn nemit_raw_fixed_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Conso
 # checked i64 helper (signed `kaix_idiv_chk`, unsigned `kaix_udiv_chk`) so a
 # zero divisor traps identically on both backends, then truncate back to the
 # register width.
-fn nemit_raw_fixed_binop(ctx: Handle, pfx: String, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+fn nemit_raw_fixed_binop(ctx: Handle, s: RawScalar, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
   [a, b] -> {
-    let slot = nfixed_slot(pfx)
+    let slot = raw_scalar_slot(s)
     # Int128 `/`/`%` never reach the raw path (kept boxed upstream); its
     # register does not fit the i64 checked helper. Only `+ - *` and cmp
     # ride raw here.
     if (op == 3 or op == 4) and (match slot { SInt128 -> true _ -> false }) {
       nemit_unsupported(ctx, "raw i128 div/mod must stay boxed"); nemit_null(ctx)
     } else if op == 3 or op == 4 {
-      let signed = nfixed_is_signed(pfx)
+      let signed = nfixed_is_signed(s)
       let i64t = native_ctx_i64t(ctx)
       let av = nemit_atom_raw(ctx, a, slot)
       let bv = nemit_atom_raw(ctx, b, slot)
@@ -810,12 +727,12 @@ fn nfixed_narrow(ctx: Handle, v: Handle, slot: KSlot) : Handle / Console = match
 # `<cmp>(a, b)` raw fixed-width comparison → an `icmp` (signed for Int32,
 # unsigned for UInt32/UInt64) over the register-width operands, widened to
 # the i32 `SBool` register.
-fn nemit_raw_fixed_cmp(ctx: Handle, pfx: String, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+fn nemit_raw_fixed_cmp(ctx: Handle, s: RawScalar, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
   [a, b] -> {
-    let slot = nfixed_slot(pfx)
+    let slot = raw_scalar_slot(s)
     let av = nemit_atom_raw(ctx, a, slot)
     let bv = nemit_atom_raw(ctx, b, slot)
-    let i1v = if nfixed_is_signed(pfx) { llvm_build_icmp(native_ctx_b(ctx), pred, av, bv) }
+    let i1v = if nfixed_is_signed(s) { llvm_build_icmp(native_ctx_b(ctx), pred, av, bv) }
               else { llvm_build_ucmp(native_ctx_b(ctx), pred, av, bv) }
     llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
   }
@@ -860,20 +777,19 @@ fn nemit_raw_logical(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = m
 }
 
 # A raw unary instruction (`fneg` over f64, `lnot` over i32).
-fn nemit_raw_unary(ctx: Handle, which: String, cargs: [KVal]) : Handle / Console = match cargs {
-  [a] -> if which == "fneg" { llvm_build_fneg(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SReal)) }
-         else { llvm_build_lnot(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SBool)) }
+fn nemit_raw_unary(ctx: Handle, op: UnOp, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> match op {
+    UoNeg -> llvm_build_fneg(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SReal))
+    UoNot -> llvm_build_lnot(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SBool))
+  }
   _   -> { nemit_unsupported(ctx, "raw unary arity"); nemit_null(ctx) }
 }
 
 # Box a raw scalar: `kaix_real(f64)` / `kaix_bool(i32)`. The raw→boxed
 # border the `lower_expr` guard inserts (`box_wrap` in the oracle). The
 # param type is the raw scalar's (`f64`/`i32`); result is a boxed `ptr`.
-fn nemit_raw_box(ctx: Handle, sym: String, pty: Handle, cargs: [KVal]) : Handle / Console = match cargs {
-  [a] -> {
-    let bslot = if sym == "kaix_real" { SReal } else if sym == "kaix_int" { SInt64 } else if sym == "kaix_char" { SChar } else if sym == "kaix_byte" { SByte } else { SBool }
-    ncall_sig1(ctx, sym, native_ctx_ptrt(ctx), pty, nemit_atom_raw(ctx, a, bslot))
-  }
+fn nemit_raw_box(ctx: Handle, sym: String, bslot: KSlot, pty: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> ncall_sig1(ctx, sym, native_ctx_ptrt(ctx), pty, nemit_atom_raw(ctx, a, bslot))
   _   -> { nemit_unsupported(ctx, "raw box arity"); nemit_null(ctx) }
 }
 
@@ -1453,8 +1369,10 @@ fn nemit_apply_call_sym(ctx: Handle, sym: String, clo: Handle, argvalbuf: Handle
 }
 
 #[doc("A segment handle's runtime call: `kaix_seg_handle(body, ret, n, clauses)` or `kaix_seg_request(op, n, args)`.")]
-pub fn nemit_seg_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
-  if nm == "kai_seg_handle" { seg_handle_call(ctx, cargs) } else { seg_request_call(ctx, cargs) }
+pub fn nemit_seg_prim(ctx: Handle, p: PrimOp, cargs: [KVal]) : Handle / Console = match p {
+  KpSegHandle -> seg_handle_call(ctx, cargs)
+  _           -> seg_request_call(ctx, cargs)
+}
 
 fn seg_handle_call(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
   [body, ret, ...cls] -> {

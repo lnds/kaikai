@@ -53,8 +53,8 @@ import compiler.effect_instance
 
 # Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
 # `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
-# `None` for any other call. The element mangle rides the prim name (the
-# emitter recovers the scalar LLVM type + box constructor from it, mirroring
+# `None` for any other call. The element scalar rides the prim (the
+# emitter picks the scalar LLVM type + box constructor from it, mirroring
 # the C `KaiFixedVec_<elem>_<n>` typedef), so the aggregate op carries its
 # full type without a KOp variant. `__fixed_vec_lit(e0..en)` binds the flat
 # aggregate at a `SBoxed` handle slot (the alloca pointer, no RC); a static
@@ -68,8 +68,8 @@ fn lower_fixed_vec_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[L
   }
 
 # `[e0, ..., en]` typed `Vec[elem]<n>` → each element lowered raw at the
-# element scalar slot, then a `__fixed_vec_lit@<elem>@<n>` prim binding the
-# flat aggregate at a handle slot. `<elem>@<n>` is the aggregate shape the
+# element scalar slot, then a `KpFixedVecLit(elem, n)` prim binding the
+# flat aggregate at a handle slot. `(elem, n)` is the aggregate shape the
 # emitter rebuilds the `[n x elem]` LLVM type from (LLVM dedups it with the
 # read side's).
 fn lower_fixed_vec_lit(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = {
@@ -78,20 +78,20 @@ fn lower_fixed_vec_lit(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let eslot = kslot_of_raw_ty(elem)
   let re = lower_fixed_vec_elems(cargs, eslot, st, [])
   match re { LRes2(raws, st1) ->
-    bind_op_slot(st1, KPrim(fixed_vec_prim("__fixed_vec_lit@", elem, list_length(cargs)), raws), SBoxed, kpos_of(x)) }
+    bind_op_slot(st1, KPrim(KpFixedVecLit(fixed_vec_elem_scalar(elem), list_length(cargs)), raws), SBoxed, kpos_of(x)) }
 }
 
 # `__fixed_vec_get(v, i)` → the base handle atom + a static-index prim,
 # re-boxed at the element's box constructor. `i` is a compile-time literal
-# (the typer proved it in range and elided the bounds check). The `<n>` in
-# the prim name comes from the base's fixed-vec type so the emitter rebuilds
-# the same `[n x elem]` type the write side alloca'd.
+# (the typer proved it in range and elided the bounds check). The prim's
+# length comes from the base's fixed-vec type so the emitter rebuilds the
+# same `[n x elem]` type the write side alloca'd.
 #
 # The inline `[n x elem]` aggregate is the representation of a binder the
 # unbox pass marked `MUnboxed`. A fixed-vec-TYPED base that is boxed (a
 # parameter, a call result) already crossed the border and is a dynamic
 # heap vec: GEPing into it would read through the `KaiValue *` header and
-# return garbage, so it takes the `dget` prim, which reaches the slot
+# return garbage, so it takes the `heap` read, which reaches the slot
 # through the runtime. Neither form touches RC — what Perceus assumes for
 # this read.
 fn lower_fixed_vec_get(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
@@ -99,32 +99,30 @@ fn lower_fixed_vec_get(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Con
     [v, i] -> {
       let elem = match x.ty { Some(t) -> t  None -> TyReal }
       let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
-      let prefix = concat_all([fixed_vec_read_stem(v.mode), "@"])
       let rv = lower_expr_boxed(v, st)
       match rv { LRes(vv, st1) ->
-        Some(bind_op_slot(st1, KPrim(fixed_vec_prim(prefix, elem, n), [vv, fixed_vec_idx_atom(i)]), SBoxed, kpos_of(x))) }
+        Some(bind_op_slot(st1, KPrim(fixed_vec_get_prim(v.mode, false, false, elem, n), [vv, fixed_vec_idx_atom(i)]), SBoxed, kpos_of(x))) }
     }
     _ -> None
   }
 
 # `__fixed_vec_get_dyn(v, i)` → the base handle atom plus the index lowered
-# RAW at `SInt64`: the emitter gates it against the static `<n>` before the
+# RAW at `SInt64`: the emitter gates it against the static length before the
 # GEP, so the index must reach it as a machine word, not a boxed value.
 fn lower_fixed_vec_get_dyn(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
   match cargs {
     [v, i] -> {
       let elem = match x.ty { Some(t) -> t  None -> TyReal }
       let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
-      let prefix = concat_all([fixed_vec_read_stem(v.mode), "_dyn@"])
       match lower_expr_boxed(v, st) { LRes(vv, st1) ->
         match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
-          Some(bind_op_slot(st2, KPrim(fixed_vec_prim(prefix, elem, n), [vv, iv]), SBoxed, kpos_of(x))) } }
+          Some(bind_op_slot(st2, KPrim(fixed_vec_get_prim(v.mode, false, true, elem, n), [vv, iv]), SBoxed, kpos_of(x))) } }
     }
     _ -> None
   }
 
 # A fixed-vec element read in RAW position: the same GEP+load, bound at the
-# element's scalar slot with no re-box. The `raw` prefix tells the emitter to
+# element's scalar slot with no re-box. The read's `raw` tells the emitter to
 # stop at the loaded word. Only the reads qualify — a fixed-vec LITERAL is an
 # aggregate pointer, never a raw scalar.
 #
@@ -132,58 +130,54 @@ fn lower_fixed_vec_get_dyn(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] /
 # changes what the loaded word becomes, never where it lives.
 fn lower_fixed_vec_read_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
   match f.kind {
-    EMark(MkFixedVecGet)    -> lower_fixed_vec_get_at(x, cargs, "raw@", false, st)
-    EMark(MkFixedVecGetDyn) -> lower_fixed_vec_get_at(x, cargs, "raw_dyn@", true, st)
+    EMark(MkFixedVecGet)    -> lower_fixed_vec_get_at(x, cargs, false, st)
+    EMark(MkFixedVecGetDyn) -> lower_fixed_vec_get_at(x, cargs, true, st)
     _                       -> None
   }
 
-fn lower_fixed_vec_get_at(x: Expr, cargs: [Expr], suffix: String, dyn: Bool,
-                          st: LowerSt) : Option[LRes] / Console =
+fn lower_fixed_vec_get_at(x: Expr, cargs: [Expr], dyn: Bool, st: LowerSt) : Option[LRes] / Console =
   match cargs {
     [v, i] -> {
       let elem = match x.ty { Some(t) -> t  None -> TyReal }
       let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
-      let prefix = concat_all([fixed_vec_read_stem(v.mode), suffix])
       match lower_expr_boxed(v, st) { LRes(vv, st1) -> {
         let ri = if dyn { lower_expr_raw_at(i, SInt64, st1) } else { LRes(fixed_vec_idx_atom(i), st1) }
         match ri { LRes(iv, st2) ->
-          Some(bind_op_slot(st2, KPrim(fixed_vec_prim(prefix, elem, n), [vv, iv]),
+          Some(bind_op_slot(st2, KPrim(fixed_vec_get_prim(v.mode, true, dyn, elem, n), [vv, iv]),
                             kslot_of_raw_ty(elem), kpos_of(x))) }
       } }
     }
     _ -> None
   }
 
-# The prim-name stem a read takes for a base in `mode`: an inline `[n x elem]`
-# aggregate (what the unbox pass marks `MUnboxed`) is GEP'd directly; anything
-# else already crossed the boxed border and is a dynamic heap vec, whose slot
-# is reached through the runtime.
-fn fixed_vec_read_stem(mode: ValueMode) : String = match mode {
-  MUnboxed -> "__fixed_vec_get"
-  _        -> "__fixed_vec_dget"
+# The read prim for a base in `mode`: an inline `[n x elem]` aggregate (what
+# the unbox pass marks `MUnboxed`) is GEP'd directly; anything else already
+# crossed the boxed border and is a dynamic heap vec, whose slot is reached
+# through the runtime.
+fn fixed_vec_get_prim(mode: ValueMode, raw: Bool, dyn: Bool, elem: Ty, n: Int) : PrimOp = {
+  let heap = match mode {
+    MUnboxed -> false
+    _        -> true
+  }
+  KpFixedVecGet(KVecRead { heap: heap, raw: raw, dyn: dyn }, fixed_vec_elem_scalar(elem), n)
 }
-
-# `<prefix><elem-tag>@<n>` — the aggregate shape rides the prim name.
-fn fixed_vec_prim(prefix: String, elem: Ty, n: Int) : String =
-  concat_all([prefix, fixed_vec_elem_tag(elem), "@", int_to_string(n)])
 
 fn fixed_vec_idx_atom(i: Expr) : KVal = match i.kind {
   EInt(k, _) -> KIntV(k)
   _       -> KIntV(0)
 }
 
-# The scalar-element tag carried in a fixed-vec prim name — the same short
-# mangle the C typedef uses (`Real`/`Int`/`Bool`/`Char`/`Byte`/…).
-fn fixed_vec_elem_tag(t: Ty) : String = match t {
-  TyReal   -> "Real"
-  TyInt    -> "Int"
-  TyBool   -> "Bool"
-  TyChar   -> "Char"
-  TyByte   -> "Byte"
-  TyInt32  -> "Int32"
-  TyUInt32 -> "UInt32"
-  TyUInt64 -> "UInt64"
-  _        -> "Int"
+# The element scalar a fixed-vec prim carries.
+fn fixed_vec_elem_scalar(t: Ty) : RawScalar = match t {
+  TyReal   -> RwReal
+  TyInt    -> RwInt
+  TyBool   -> RwBool
+  TyChar   -> RwChar
+  TyByte   -> RwByte
+  TyInt32  -> RwInt32
+  TyUInt32 -> RwUInt32
+  TyUInt64 -> RwUInt64
+  _        -> RwInt
 }
 
 fn lower_fixed_vec_elems(es: [Expr], eslot: KSlot, st: LowerSt, acc: [KVal]) : LRes2 / Console = match es {
@@ -265,7 +259,7 @@ fn lower_fixed_vec_materialize(x: Expr, st: LowerSt) : LRes / Console = {
   let elem = fixed_vec_elem(vty)
   let n = fixed_vec_n(vty)
   match lower_expr_boxed(x, st) { LRes(vv, st1) ->
-    bind_op_slot(st1, KPrim(fixed_vec_prim("__fixed_vec_materialize@", elem, n), [vv]), SBoxed, kpos_of(x)) }
+    bind_op_slot(st1, KPrim(KpFixedVecMaterialize(fixed_vec_elem_scalar(elem), n), [vv]), SBoxed, kpos_of(x)) }
 }
 
 # The boxed-position dispatch (the original `lower_expr` body). Reached
@@ -323,8 +317,8 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
       let rb = lower_expr(base, st)
       match rb { LRes(bv, st1) ->
         match field_index_of(st1.recs, base.ty, fname) {
-          Some(n) -> lower_field_read(st1, KPrim("kai_op_field_at", [bv, KIntV(n)]), bv, kpos_of(x))
-          None    -> lower_field_read(st1, KPrim("kai_op_field", [bv, KStrV(fname)]), bv, kpos_of(x))
+          Some(n) -> lower_field_read(st1, KPrim(KpFieldAt, [bv, KIntV(n)]), bv, kpos_of(x))
+          None    -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(fname)]), bv, kpos_of(x))
         } }
     }
   }
@@ -359,7 +353,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   }
   EUnop(op, a)       -> {
     let ra = lower_expr(a, st)
-    match ra { LRes(av, st1) -> bind_op(st1, KPrim(unop_prim(op), [av]), kpos_of(x)) }
+    match ra { LRes(av, st1) -> bind_op(st1, KPrim(KpUn(op), [av]), kpos_of(x)) }
   }
 
   EIf(c, t, e_opt)   -> lower_if(x, c, t, e_opt, st)
@@ -536,24 +530,24 @@ fn border_slot_of(opt_t: Option[Ty]) : KSlot =
   else if kir_ty_is_fixed_raw(opt_t) { kir_fixed_raw_slot(opt_t) }
   else { SReal }
 
-fn border_unbox_prim(slot: KSlot) : Option[String] = match slot {
-  SInt64  -> Some("int.unbox")
-  SReal   -> Some("real.unbox")
-  SBool   -> Some("bool.unbox")
-  SChar   -> Some("char.unbox")
-  SByte   -> Some("byte.unbox")
-  SInt32T -> Some("int32.unbox")
-  SUInt32 -> Some("uint32.unbox")
-  SUInt64 -> Some("uint64.unbox")
-  SInt128 -> Some("int128.unbox")
+fn border_unbox_prim(slot: KSlot) : Option[PrimOp] = match slot {
+  SInt64  -> Some(KpUnbox(RwInt))
+  SReal   -> Some(KpUnbox(RwReal))
+  SBool   -> Some(KpUnbox(RwBool))
+  SChar   -> Some(KpUnbox(RwChar))
+  SByte   -> Some(KpUnbox(RwByte))
+  SInt32T -> Some(KpUnbox(RwInt32))
+  SUInt32 -> Some(KpUnbox(RwUInt32))
+  SUInt64 -> Some(KpUnbox(RwUInt64))
+  SInt128 -> Some(KpUnbox(RwInt128))
   _       -> None
 }
 
-fn lower_unbox_border(x: Expr, prim: String, slot: KSlot, st: LowerSt) : LRes / Console =
+fn lower_unbox_border(x: Expr, prim: PrimOp, slot: KSlot, st: LowerSt) : LRes / Console =
   lower_unbox_at(x, prim, slot, raw_border_owns(x), st)
 
 # Unbox `x`'s boxed form through `prim`, releasing the box when it is owned.
-fn lower_unbox_at(x: Expr, prim: String, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
+fn lower_unbox_at(x: Expr, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
   match lower_expr_boxed(x, st) { LRes(bv, st1) ->
     match bind_op_slot(st1, KPrim(prim, [bv]), slot, kpos_of(x)) {
       LRes(rv, st2) -> if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
@@ -586,26 +580,26 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # routes by OPERAND type (its result is Bool, not the scalar).
   EBinop(op, a, b) ->
     if kir_ty_is_real(x.ty) and kir_op_is_raw_freal_arith(op) {
-      lower_raw_binop(x, kir_raw_arith_prim(op), SReal, a, b, st)
+      lower_raw_binop(x, KpRawBin(RwReal, op), SReal, a, b, st)
     }
     else if kir_ty_is_int(x.ty) and kir_op_is_raw_iint_arith(op) {
-      lower_raw_binop(x, kir_raw_iarith_prim(op), SInt64, a, b, st)
+      lower_raw_binop(x, KpRawBin(RwInt, op), SInt64, a, b, st)
     }
     else if kir_ty_is_byte(x.ty) and kir_op_is_raw_iint_arith(op) {
-      lower_raw_binop(x, kir_raw_u8arith_prim(op), SByte, a, b, st)
+      lower_raw_binop(x, KpRawBin(RwByte, op), SByte, a, b, st)
     }
     else if kir_ty_is_fixed_raw(x.ty) and kir_op_is_raw_iint_arith(op) {
-      lower_raw_binop(x, kir_raw_fixed_arith_prim(x.ty, op), kir_fixed_raw_slot(x.ty), a, b, st)
+      lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(x.ty), op), kir_fixed_raw_slot(x.ty), a, b, st)
     }
     else if kir_op_is_raw_cmp(op) {
-      if kir_ty_is_int(a.ty) { lower_raw_binop(x, kir_raw_icmp_prim(op), SBool, a, b, st) }
-      else if kir_ty_is_byte(a.ty) { lower_raw_binop(x, kir_raw_u8cmp_prim(op), SBool, a, b, st) }
-      else if kir_ty_is_bool(a.ty) { lower_raw_binop(x, kir_raw_boolcmp_prim(op), SBool, a, b, st) }
-      else if kir_ty_is_char(a.ty) { lower_raw_binop(x, kir_raw_charcmp_prim(op), SBool, a, b, st) }
-      else if kir_ty_is_fixed_raw(a.ty) { lower_raw_binop(x, kir_raw_fixed_cmp_prim(a.ty, op), SBool, a, b, st) }
-      else { lower_raw_binop(x, kir_raw_cmp_prim(op), SBool, a, b, st) }
+      if kir_ty_is_int(a.ty) { lower_raw_binop(x, KpRawBin(RwInt, op), SBool, a, b, st) }
+      else if kir_ty_is_byte(a.ty) { lower_raw_binop(x, KpRawBin(RwByte, op), SBool, a, b, st) }
+      else if kir_ty_is_bool(a.ty) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
+      else if kir_ty_is_char(a.ty) { lower_raw_binop(x, KpRawBin(RwChar, op), SBool, a, b, st) }
+      else if kir_ty_is_fixed_raw(a.ty) { lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(a.ty), op), SBool, a, b, st) }
+      else { lower_raw_binop(x, KpRawBin(RwReal, op), SBool, a, b, st) }
     }
-    else if kir_op_is_raw_logical(op) { lower_raw_binop(x, kir_raw_logical_prim(op), SBool, a, b, st) }
+    else if kir_op_is_raw_logical(op) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
     else { lower_scalar_unbox_border(x, st) }
   # Unary `-` is raw ONLY for Real (`fneg` over f64); an Int `-x` has no raw
   # `ineg` form in v1, so it crosses the box→raw border (boxed `kaix_neg`
@@ -617,11 +611,11 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
     UoNeg ->
       if kir_ty_is_real(x.ty) {
         match lower_expr_raw(a, st) {
-          LRes(av, st1) -> bind_op_slot(st1, KPrim("fneg", [av]), SReal, kpos_of(x))
+          LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNeg), [av]), SReal, kpos_of(x))
         }
       } else { lower_scalar_unbox_border(x, st) }
     UoNot -> match lower_expr_raw(a, st) {
-      LRes(av, st1) -> bind_op_slot(st1, KPrim("bnot", [av]), SBool, kpos_of(x))
+      LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNot), [av]), SBool, kpos_of(x))
     }
   }
   # A call in raw position (`fib(n-1) + fib(n-2)` — each call is an arith
@@ -693,10 +687,10 @@ fn cell_slot_of_ty(opt_t: Option[Ty]) : KSlot =
   else if kir_ty_is_bool(opt_t) { SBool }
   else { SInt64 }
 
-fn cell_unbox_prim(slot: KSlot) : String = match slot {
-  SReal -> "real.unbox"
-  SBool -> "bool.unbox"
-  _     -> "int.unbox"
+fn cell_unbox_prim(slot: KSlot) : PrimOp = match slot {
+  SReal -> KpUnbox(RwReal)
+  SBool -> KpUnbox(RwBool)
+  _     -> KpUnbox(RwInt)
 }
 
 # A promoted var cell's write: store the raw value into the cell's
@@ -775,10 +769,10 @@ fn lower_loop_repeat(x: Expr, n: Expr, body: Expr, st: LowerSt) : LRes / Console
       let st3 = ls_emit(st2, KLet(reg, SInt64, KLitOp(nv), kpos_of(x)))
       match three_labels(st3) { LSL3(lcond, lbody, lcont, st4) -> {
         let st5 = ls_seal(st4, KBr(lcond, kpos_of(x)), lcond)
-        match bind_op_slot(st5, KPrim("i>", [KVar(reg), KIntV(0)]), SBool, kpos_of(x)) { LRes(cv, st6) -> {
+        match bind_op_slot(st5, KPrim(KpRawBin(RwInt, BoGt), [KVar(reg), KIntV(0)]), SBool, kpos_of(x)) { LRes(cv, st6) -> {
           let st7 = ls_seal(st6, KCondBr(cv, lbody, lcont, kpos_of(x)), lbody)
           let st8 = lower_loop_body(body, st7)
-          match bind_op_slot(st8, KPrim("i-", [KVar(reg), KIntV(1)]), SInt64, kpos_of(x)) { LRes(dv, st9) -> {
+          match bind_op_slot(st8, KPrim(KpRawBin(RwInt, BoSub), [KVar(reg), KIntV(1)]), SInt64, kpos_of(x)) { LRes(dv, st9) -> {
             let st10 = ls_emit(st9, KStore(reg, dv, kpos_of(x)))
             LRes(KUnitV, ls_seal(st10, KBr(lcond, kpos_of(x)), lcont))
           } }
@@ -824,7 +818,7 @@ fn lower_loop_body(body: Expr, st: LowerSt) : LowerSt / Console =
 fn lower_loop_count(n: Expr, st: LowerSt) : LRes / Console = match n.mode {
   MUnboxed -> lower_expr_raw(n, st)
   _ -> match lower_expr_boxed(n, st) {
-    LRes(bv, st1) -> match bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(n)) {
+    LRes(bv, st1) -> match bind_op_slot(st1, KPrim(KpUnbox(RwInt), [bv]), SInt64, kpos_of(n)) {
       LRes(rv, st2) -> LRes(rv, ls_emit(st2, KRC(KDrop(bv), kpos_of(n))))
     }
   }
@@ -835,7 +829,7 @@ fn lower_loop_count(n: Expr, st: LowerSt) : LRes / Console = match n.mode {
 # register carries `slot` (SReal for arith, SBool for cmp/logical). No
 # boxed `kaix_*` consume, so a multi-use operand never double-frees (the
 # family's root bug).
-fn lower_raw_binop(x: Expr, prim: String, slot: KSlot, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
+fn lower_raw_binop(x: Expr, prim: PrimOp, slot: KSlot, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
   match lower_expr_raw(a, st) { LRes(av, st1) ->
     match lower_expr_raw(b, st1) { LRes(bv, st2) ->
       bind_op_slot(st2, KPrim(prim, [av, bv]), slot, kpos_of(x))
@@ -970,28 +964,28 @@ fn tcrec_mask_of(sig: Option[UFnSig]) : [Bool] = match sig {
 # is lowered before the tail to keep left-to-right evaluation order. Inside
 # a region the cons cells bump-allocate: `kai_cons` becomes `kai_arena_cons`.
 fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = match elems {
-  [] -> bind_op(st, KPrim("kai_nil", []), pos)
+  [] -> bind_op(st, KPrim(KpNil, []), pos)
   [el] -> lower_list_last(el, pos, st)
   [el, ...rest] -> match el {
     ElPlain(x)  -> lower_list_cons(x, rest, region_cons_prim(st), pos, st)
-    ElSpread(x) -> lower_list_cons(x, rest, "kai_core_list_append", pos, st)
+    ElSpread(x) -> lower_list_cons(x, rest, KpListAppend, pos, st)
   }
 }
 
 # The cons prim for the current allocation context: the bump-arena ctor
 # inside a region, the RC-heap ctor otherwise.
-fn region_cons_prim(st: LowerSt) : String = if st.in_region { "kai_arena_cons" } else { "kai_cons" }
+fn region_cons_prim(st: LowerSt) : PrimOp = if st.in_region { KpArenaCons } else { KpCons }
 
 fn lower_list_last(el: ListElem, pos: KPos, st: LowerSt) : LRes / Console = match el {
   ElPlain(x) -> match lower_expr(x, st) { LRes(hdv, st1) ->
-    match bind_op(st1, KPrim("kai_nil", []), pos) { LRes(nilv, st2) ->
+    match bind_op(st1, KPrim(KpNil, []), pos) { LRes(nilv, st2) ->
       bind_op(st2, KPrim(region_cons_prim(st2), [hdv, nilv]), pos) } }
   ElSpread(x) -> lower_expr(x, st)
 }
 
 # A head (plain or spread) joined to the lowered rest by `prim`
 # (`kai_cons` for a plain head, `kai_core_list_append` for a spread).
-fn lower_list_cons(x: Expr, rest: [ListElem], prim: String, pos: KPos, st: LowerSt) : LRes / Console =
+fn lower_list_cons(x: Expr, rest: [ListElem], prim: PrimOp, pos: KPos, st: LowerSt) : LRes / Console =
   match lower_expr(x, st) { LRes(hdv, st1) ->
     match lower_list(rest, pos, lower_flight_add(x, hdv, st1)) { LRes(tlv, st2) ->
       bind_op(lower_flight_end(st, st2), KPrim(prim, [hdv, tlv]), pos) } }
@@ -1002,7 +996,7 @@ fn lower_list_cons(x: Expr, rest: [ListElem], prim: String, pos: KPos, st: Lower
 # the match-non-exhaustive fallback shape). `msg` is an ALREADY-QUOTED
 # source span (so `KStrV` round-trips it like a literal).
 pub fn lower_panic_stub(msg: String, st: LowerSt) : LRes / Console =
-  bind_op(st, KPrim("kai_core_panic", [KStrV(msg)]), KNoPos)
+  bind_op(st, KPrim(KpPanic, [KStrV(msg)]), KNoPos)
 
 # Wrap a plain string in source-span quotes so `KStrV` treats it as a
 # literal (the dumper / translator strip the quotes back off).
@@ -1020,12 +1014,12 @@ fn kir_hole_message(nm_opt: Option[String], x: Expr) : String {
 # `variants[T]()` → a cons spine of nullary constructors, one `KCon` per
 # resolved name. Built tail-first so evaluation order matches emit_c.
 fn lower_variants_of(names: [String], pos: KPos, st: LowerSt) : LRes / Console = match names {
-  [] -> bind_op(st, KPrim("kai_nil", []), pos)
+  [] -> bind_op(st, KPrim(KpNil, []), pos)
   [n, ...rest] -> {
     let tag = ls_variant_tag(st, n)
     match bind_op(st, KCon(n, tag, 0, [], false), pos) { LRes(hdv, st1) ->
       match lower_variants_of(rest, pos, st1) { LRes(tlv, st2) ->
-        bind_op(st2, KPrim("kai_cons", [hdv, tlv]), pos) } }
+        bind_op(st2, KPrim(KpCons, [hdv, tlv]), pos) } }
   }
 }
 
@@ -1052,9 +1046,9 @@ fn lower_field_inits_flying(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : 
 fn lower_range(lo: Expr, hi: Expr, stp: Option[Expr], pos: KPos, st: LowerSt) : LRes / Console =
   match lower_expr(lo, st) { LRes(lov, st1) -> match lower_expr(hi, st1) { LRes(hiv, st2) ->
     match stp {
-      None -> bind_op(st2, KPrim("kai_range", [lov, hiv]), pos)
+      None -> bind_op(st2, KPrim(KpRange, [lov, hiv]), pos)
       Some(se) -> match lower_expr(se, st2) { LRes(sv, st3) ->
-        bind_op(st3, KPrim("kai_range_step", [lov, hiv, sv]), pos) }
+        bind_op(st3, KPrim(KpRangeStep, [lov, hiv, sv]), pos) }
     } } }
 
 # A qualified name as a value: a nullary ctor → the ctor value; a const →
@@ -1301,8 +1295,8 @@ fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : 
         match vec_rec_field_slot(st.recs, base.ty, fname) {
           Some(fidx) -> match cargs {
             [v, i] -> {
-              let prim = if callee == "vec_get_borrow" { "kai_vec_get_field_borrow" }
-                         else { "kai_vec_get_field" }
+              let prim = if callee == "vec_get_borrow" { KpVecGetFieldBorrow }
+                         else { KpVecGetField }
               let rv = lower_expr(v, st)
               match rv { LRes(vv, st1) -> {
                 let ri = lower_expr(i, st1)
@@ -1338,7 +1332,7 @@ fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Opt
                 match lower_vec_rec_pairs(fis, st1, []) {
                   LResMany(pvs, st2) ->
                     Some(bind_op(st2,
-                      KPrim("kai_vec_push_rec_raw", [vv, KIntV(list_length(fis)), ...pvs]),
+                      KPrim(KpVecPushRecRaw, [vv, KIntV(list_length(fis)), ...pvs]),
                       kpos_of(x)))
                 } }
             } else { None }
@@ -1358,7 +1352,7 @@ fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Opt
                   match lower_vec_rec_vals(fis, st2, []) {
                     LResMany(fvs, st3) ->
                       Some(bind_op(st3,
-                        KPrim("kai_vec_set_rec_raw", [vv, iv, KIntV(list_length(fis)), ...fvs]),
+                        KPrim(KpVecSetRecRaw, [vv, iv, KIntV(list_length(fis)), ...fvs]),
                         kpos_of(x)))
                   } }
               } }
@@ -1444,7 +1438,7 @@ fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
 fn lower_assert(cond: Expr, opt_msg: Option[Expr], st: LowerSt) : LowerSt / Console = match assert_reported_binding(cond, opt_msg) {
   Some(CtrId(ident, idnode, _)) -> lower_assert_with_value(cond, kir_assert_msg(opt_msg), ident, idnode, st)
   None -> match lower_expr(cond, st) {
-    LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert_check", [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
+    LRes(v, st1) -> ls_emit(st1, KDo(KPrim(KpAssertCheck, [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
   }
 }
 
@@ -1455,7 +1449,7 @@ fn lower_assert_with_value(cond: Expr, msg: String, ident: String, idnode: Expr,
   match lower_expr(idnode, st) { LRes(iv, st1) -> {
     let st2 = if kir_node_is_raw(idnode) { st1 } else { ls_emit(st1, KRC(KDup(iv), KNoPos)) }
     match lower_expr(cond, st2) { LRes(cv, st3) ->
-      ls_emit(st3, KDo(KPrim("kai_assert_check_with_value",
+      ls_emit(st3, KDo(KPrim(KpAssertCheckWithValue,
                              [cv, KStrV(msg), KStrV(reported_binding_span(ident)), iv]), KNoPos)) }
   } }
 
@@ -1764,7 +1758,7 @@ fn lower_bang(x: Expr, inner: Expr, st: LowerSt) : LRes / Console =
 fn lower_bang_split(x: Expr, bv: KVal, ctor: String, st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(join, st1) -> {
     let st2 = ls_emit(st1, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
-    match bind_op(st2, KPrim("kai_tag_eq", [bv, KIntV(ls_variant_tag(st2, ctor))]), kpos_of(x)) { LRes(cond, st3) ->
+    match bind_op(st2, KPrim(KpTagEq, [bv, KIntV(ls_variant_tag(st2, ctor))]), kpos_of(x)) { LRes(cond, st3) ->
       match three_labels(st3) { LSL3(lok, lfail, lcont, st4) -> {
         # condbr seals the current block and opens `lfail` as the cursor.
         let st5 = ls_seal(st4, KCondBr(cond, lok, lfail, kpos_of(x)), lfail)
@@ -1914,7 +1908,7 @@ fn match_finish_tok(owned: Bool, sd: String, free_tok: Bool, r: LRes) : LRes =
 fn kir_unw_scr_push(want: Bool, sd: String, x: Expr, st: LowerSt) : LowerSt =
   if want {
     match ls_fresh_reg(st) { LSReg(f, st1) -> {
-      let st2 = ls_emit(st1, KLet(f, SBoxed, KPrim("kai_unw_push_reg", [KStrV(sd), KVar(unw_fib(st1.unw))]), kpos_of(x)))
+      let st2 = ls_emit(st1, KLet(f, SBoxed, KPrim(KpUnwPushReg, [KStrV(sd), KVar(unw_fib(st1.unw))]), kpos_of(x)))
       ls_with_unw(ls_set_tcpend(st2, list_append(st2.tcpend, [tcl_unw_entry(f)])), unw_mpush(st2.unw, sd, f))
     } }
   } else { st }
@@ -1924,7 +1918,7 @@ fn kir_unw_scr_pop(sd: String, r: LRes) : LRes = match r {
     let f = unw_mreg(st.unw, sd)
     if f == "" { r }
     else {
-      let st1 = ls_emit(ls_with_unw(st, unw_mpop(st.unw, sd)), KDo(KPrim("kai_unw_pop", [KVar(f)]), KNoPos))
+      let st1 = ls_emit(ls_with_unw(st, unw_mpop(st.unw, sd)), KDo(KPrim(KpUnwPop, [KVar(f)]), KNoPos))
       LRes(v, ls_set_tcpend(st1, tcl_drop_unw(st1.tcpend, f)))
     }
   }
@@ -2053,7 +2047,7 @@ fn tcp_goto_drops(args: [Expr], st: LowerSt) : LowerSt = match st.tcpend {
 fn tcp_drop_entries(es: [String], st: LowerSt) : LowerSt = match es {
   [] -> st
   [e, ...rest] -> if tcl_is_unw(e) {
-    tcp_drop_entries(rest, ls_emit(st, KDo(KPrim("kai_unw_pop", [KVar(tcl_unw_reg(e))]), KNoPos)))
+    tcp_drop_entries(rest, ls_emit(st, KDo(KPrim(KpUnwPop, [KVar(tcl_unw_reg(e))]), KNoPos)))
   } else if tcl_is_tok(e) {
     tcp_drop_entries(rest, ls_emit(st, KRC(KArmTokenFree, KNoPos)))
   } else {
@@ -2827,7 +2821,7 @@ fn kir_unw_handle_vars(uw: Option[[String]], x: Expr, st: LowerSt) : UnwOpen / C
   Some(ns) -> match unw_admit(st.unw, ns) {
     [] -> UnwOpen { pops: [], st: st }
     held -> match ls_fresh_reg(st) { LSReg(fr, st1) ->
-      UnwOpen { pops: [fr], st: ls_emit(st1, KLet(fr, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st1.unw)), ...map(held, (m) => KVar(ls_reg_of(st1, m)))]), kpos_of(x))) } }
+      UnwOpen { pops: [fr], st: ls_emit(st1, KLet(fr, SBoxed, KPrim(KpUnwPush, [KVar(unw_fib(st1.unw)), ...map(held, (m) => KVar(ls_reg_of(st1, m)))]), kpos_of(x))) } }
   }
   None -> UnwOpen { pops: [], st: st }
 }
@@ -2838,7 +2832,7 @@ fn kir_unw_handle_state(uw: Option[[String]], init_opt: Option[Expr], sym: Strin
   match uw {
     Some(_) -> match init_opt {
       Some(_) -> match ls_fresh_reg(st) { LSReg(fr, st1) ->
-        UnwOpen { pops: [fr], st: ls_emit(st1, KLet(fr, SBoxed, KPrim("kai_unw_push_state", [KStrV(sym), KVar(unw_fib(st1.unw))]), kpos_of(x))) } }
+        UnwOpen { pops: [fr], st: ls_emit(st1, KLet(fr, SBoxed, KPrim(KpUnwPushState, [KStrV(sym), KVar(unw_fib(st1.unw))]), kpos_of(x))) } }
       None -> UnwOpen { pops: [], st: st }
     }
     None -> UnwOpen { pops: [], st: st }
@@ -2919,12 +2913,12 @@ fn lower_handle_ret(eff: String, sym: String, result: String, fork: HandleFork,
   }
 
 fn lower_handle_frames(sym: String, result: String, frames: Bool, st: LowerSt) : LRes / Console =
-  if frames { bind_op(st, KPrim("kai_resume_frames_run", [KStrV(sym), KVar(result)]), KNoPos) }
+  if frames { bind_op(st, KPrim(KpResumeFramesRun, [KStrV(sym), KVar(result)]), KNoPos) }
   else { LRes(KVar(result), st) }
 
 fn kir_unw_pops(pops: [String], st: LowerSt) : LowerSt / Console = match pops {
   [] -> st
-  [p, ...rest] -> kir_unw_pops(rest, ls_emit(st, KDo(KPrim("kai_unw_pop", [KVar(p)]), KNoPos)))
+  [p, ...rest] -> kir_unw_pops(rest, ls_emit(st, KDo(KPrim(KpUnwPop, [KVar(p)]), KNoPos)))
 }
 
 # The Ev owns its final state: both exits (normal and discard) meet in
@@ -2997,12 +2991,12 @@ fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
 # the call and the operand values in flight across it.
 fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], regs: [String], st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(fr, st0) -> {
-      let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st0.unw)), ...map(regs, (r) => KVar(r))]), kpos_of(x)))
+      let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim(KpUnwPush, [KVar(unw_fib(st0.unw)), ...map(regs, (r) => KVar(r))]), kpos_of(x)))
       let r = match lower_bracket_begin(x, regs, st1) { PadB(outer, sb) ->
         match lower_call_in_bracket(x, f, cargs, clo, sb) { LRes(v, se) -> LRes(v, lower_bracket_end(outer, se)) }
       }
       match r { LRes(v, st2) -> {
-        let st3 = ls_emit(st2, KDo(KPrim("kai_unw_pop", [KVar(fr)]), kpos_of(x)))
+        let st3 = ls_emit(st2, KDo(KPrim(KpUnwPop, [KVar(fr)]), kpos_of(x)))
         match clo {
           Some(UkTransfer(n)) -> LRes(v, ls_emit(st3, KRC(KDrop(KVar(ls_reg_of(st3, n))), kpos_of(x))))
           _                   -> LRes(v, st3)
@@ -3601,7 +3595,7 @@ fn reuse_neutralise_exit_drop(st: LowerSt, pos: KPos) : LowerSt =
 # (`Cons` is the builtin list ctor, not a registered variant), a variant
 # ctor otherwise.
 fn reuse_fresh_op(rk: KReuseKind, hm: Option[String], cn: String, avs: [KVal], st: LowerSt) : KOp = match rk {
-  RkCons -> KPrim("kai_cons", avs)
+  RkCons -> KPrim(KpCons, avs)
   _      -> KCon(cn, ls_variant_tag_in(st, hm, cn), ls_ctor_mask_in(st, hm, cn), typed_inits_in(avs, hm, cn, st), st.in_region)
 }
 
@@ -3782,7 +3776,7 @@ fn ob_held(x: Expr, cargs: [Expr], avs: [KVal], st: LowerSt) : ObHeld = match un
   Some(_) -> match ob_marked_vals(cargs, avs) {
     [] -> ObHeld { reg: "", st: st }
     vs -> match ls_fresh_reg(st) { LSReg(f, st0) ->
-      ObHeld { reg: f, st: ls_emit(st0, KLet(f, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st0.unw)), ...vs]), kpos_of(x))) } }
+      ObHeld { reg: f, st: ls_emit(st0, KLet(f, SBoxed, KPrim(KpUnwPush, [KVar(unw_fib(st0.unw)), ...vs]), kpos_of(x))) } }
   }
 }
 
@@ -3792,7 +3786,7 @@ fn ob_renames(c: Expr) : Bool = match c.kind {
 }
 
 fn ob_release(h: ObHeld, r: LRes) : LRes = match r {
-  LRes(v, st) -> if h.reg == "" { r } else { LRes(v, ls_emit(st, KDo(KPrim("kai_unw_pop", [KVar(h.reg)]), KNoPos))) }
+  LRes(v, st) -> if h.reg == "" { r } else { LRes(v, ls_emit(st, KDo(KPrim(KpUnwPop, [KVar(h.reg)]), KNoPos))) }
 }
 
 fn ob_marked_vals(cargs: [Expr], avs: [KVal]) : [KVal] = match (cargs, avs) {
@@ -3886,7 +3880,7 @@ fn lower_callee_dispatch(x: Expr, callee: String, csym: FnId, cargs: [Expr], st:
 # there is none) and one closure per op clause, each consumed by the runtime.
 fn lower_seg_handle(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
   [_, _, body, ret, ...cls] -> match lower_exprs([body, ret, ...cls], st, []) {
-    LResMany(vs, st1) -> bind_op(st1, KPrim("kai_seg_handle", vs), kpos_of(x))
+    LResMany(vs, st1) -> bind_op(st1, KPrim(KpSegHandle, vs), kpos_of(x))
   }
   _ -> lower_unhandled(x, st)
 }
@@ -3895,7 +3889,7 @@ fn lower_seg_handle(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = matc
 fn lower_seg_request(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
   [ix, ...xs] -> match ix.kind {
     EInt(i, _) -> match lower_exprs(xs, st, []) {
-      LResMany(vs, st1) -> bind_op(st1, KPrim("kai_seg_request", [KIntV(i), ...vs]), kpos_of(x))
+      LResMany(vs, st1) -> bind_op(st1, KPrim(KpSegRequest, [KIntV(i), ...vs]), kpos_of(x))
     }
     _ -> lower_unhandled(x, st)
   }
@@ -3904,7 +3898,7 @@ fn lower_seg_request(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = mat
 
 fn lower_resume_frame(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
   [f] -> match lower_expr(f, st) {
-    LRes(fv, st1) -> bind_op(st1, KPrim("kai_resume_frame_push", [fv]), kpos_of(x))
+    LRes(fv, st1) -> bind_op(st1, KPrim(KpResumeFramePush, [fv]), kpos_of(x))
   }
   _ -> lower_unhandled(x, st)
 }
@@ -4047,5 +4041,5 @@ fn trmc_apply_leaf_reuses_scr(leaf: Expr) : Bool = match leaf.kind {
 pub fn kir_unw_enter(st: LowerSt) : LowerSt / Console = match st.unw.sites {
   [] -> st
   _  -> match ls_fresh_reg(st) { LSReg(f, st1) ->
-    ls_with_unw(ls_emit(st1, KLet(f, SBoxed, KPrim("kai_unw_fiber", []), KNoPos)), unw_with_fib(st1.unw, f)) }
+    ls_with_unw(ls_emit(st1, KLet(f, SBoxed, KPrim(KpUnwFiber, []), KNoPos)), unw_with_fib(st1.unw, f)) }
 }
