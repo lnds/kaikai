@@ -7231,28 +7231,7 @@ static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
  * the same bet the constant-index record read (kai_op_field_at)
  * already makes; ekind/arity/tag are checked and trap on mismatch. */
 
-static KaiValue *kai_vec_get_field_impl(KaiValue *v, KaiValue *i, int32_t fidx) {
-    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
-    kai_vec_bounds(v, idx, "vec_get");
-    KaiVecMeta *m = kai_vec_meta(v);
-    if (m->ekind != KAI_VEC_EK_REC || fidx < 0 || fidx >= m->n_fields)
-        kai_trap_abort("vec: fused field read on a non-inline-record vec");
-    int64_t bits;
-    memcpy(&bits, kai_vec_elems(v) + (size_t) idx * (size_t) m->stride
-                  + (size_t) fidx * 8, 8);
-    return kai_vec_scalar_box(m->field_tags[fidx], bits);
-}
-
-/* Consuming / borrowing pair, mirroring kai_core_array_get(_borrow). */
-static KaiValue *kai_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx) {
-    KaiValue *r = kai_vec_get_field_impl(v, i, fidx);
-    if (v) kai_decref(v);
-    if (i) kai_decref(i);
-    return r;
-}
-static KaiValue *kai_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) {
-    return kai_vec_get_field_impl(v, i, fidx);
-}
+static void kai_index_check_owned(int64_t len, int64_t i, KaiValue *c, KaiValue *x);
 
 /* Store `n` unpacked scalar fields into one REC slot; consumes each x. */
 static void kai_vec_store_rec_fields(KaiVecMeta *m, char *slot, int64_t n,
@@ -7321,6 +7300,10 @@ static KaiValue *kai_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n,
                                      KaiValue **xs) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     if (i) kai_decref(i);
+    if (kai_is_ptr(v) && v->tag == KAI_VEC && (uint64_t) idx >= (uint64_t) v->as.vec.len) {
+        for (int64_t k = 0; k < n; ++k) kai_decref(xs[k]);
+        kai_index_check_owned(v->as.vec.len, idx, v, NULL);
+    }
     kai_vec_bounds(v, idx, "vec_set");
     v = kai_vec_ensure_unique(v, v->as.vec.cap);
     KaiVecMeta *m = kai_vec_meta(v);
@@ -7352,8 +7335,6 @@ static const KaiValue kai_vec_null = {
 KAI_VEC_FAST int kai_vec_is_node(KaiValue *v) {
     return v != NULL && !kai_is_value(v) && v->tag == KAI_VEC;
 }
-
-static void kai_index_check_owned(int64_t len, int64_t i, KaiValue *c, KaiValue *x);
 
 /* A trapping read that consumes its vec pays that reference first: the
  * unwind skips the release the caller planted after the read. */
@@ -7427,6 +7408,36 @@ KAI_VEC_FAST const char *kai_vec_scalar_at(KaiValue *v, int64_t i, int tag, int 
     return r.elems + (size_t) i * 8;
 }
 
+/* Column `fidx` of element `i` of an inline-record vec, boxed by the tag
+ * the buffer holds for it. `owned` as in the raw reads: a trap pays `v`. */
+static KaiValue *kai_vec_field_boxed(KaiValue *v, int64_t i, int32_t fidx, int owned) {
+    if (__builtin_expect(!kai_vec_is_node(v) || (uint64_t) i >= (uint64_t) v->as.vec.len, 0))
+        kai_vec_read_index_trap(v, i, owned);
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (__builtin_expect(m->ekind != KAI_VEC_EK_REC || fidx < 0 || fidx >= m->n_fields, 0))
+        kai_vec_read_shape_trap(v, "vec: fused field read on a non-inline-record vec", owned);
+    int64_t bits;
+    memcpy(&bits, kai_vec_elems(v) + (size_t) i * (size_t) m->stride + (size_t) fidx * 8, 8);
+    return kai_vec_scalar_box(m->field_tags[fidx], bits);
+}
+
+/* The C backend's fused `vec_get(v, i).f`: consumes v and i. */
+static KaiValue *kai_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (i) kai_decref(i);
+    KaiValue *r = kai_vec_field_boxed(v, idx, fidx, 1);
+    kai_decref(v);
+    return r;
+}
+
+/* The borrowing form. `owned` marks a vec no binder holds: the read
+ * releases it. */
+static KaiValue *kai_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx, int owned) {
+    KaiValue *r = kai_vec_field_boxed(v, (kai_is_int(i)) ? kai_intf(i) : 0, fidx, owned);
+    if (owned) kai_decref(v);
+    return r;
+}
+
 /* `owned` says the read consumes `v`; the release itself is the caller's. */
 KAI_VEC_FAST int64_t kai_vec_field_i64(KaiValue *v, int64_t i, int32_t fidx, int32_t n,
                                        int owned) {
@@ -7482,7 +7493,6 @@ static KAI_RC_NOINLINE KaiValue *kai_vec_push_rec_bits_slow(
 static KAI_RC_NOINLINE KaiValue *kai_vec_set_rec_bits_slow(
         KaiValue *v, int64_t i, int64_t n, const int64_t *bits, const char *kinds) {
     KaiValue *xs[KAI_VEC_REC_MAX];
-    if (kai_vec_is_node(v)) kai_index_check_owned(v->as.vec.len, i, v, NULL);
     kai_vec_box_rec_bits(n, bits, kinds, xs);
     return kai_vec_set_rec_raw(v, kai_int(i), n, xs);
 }

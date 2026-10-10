@@ -6975,7 +6975,7 @@ test-perceus-1135-vec-value-native: $(TARGET) bin-kai build
 #   3. the stdlib-module map shape: a module-qualified self-call must
 #      still tcrec-rewrite to the goto (over-release + stack growth
 #      without it) — gated by output diff incl. a 200k-deep map.
-PERCEUS_1135_RAW_FIXTURES := vec_rec_raw_fusion_1135 vec_stdlib_map_qualified_tco_1135 vec_bare_words
+PERCEUS_1135_RAW_FIXTURES := vec_rec_raw_fusion_1135 vec_stdlib_map_qualified_tco_1135 vec_bare_words vec_fused_read_owned_row
 
 test-perceus-1135-vec-raw: $(TARGET) build
 	@set -e; \
@@ -7014,7 +7014,7 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	       grep vec_ build/s2-vec_bare_words-n.rc || true; exit 1; }; \
 	KAI_NATIVE_DUMP_IR=build/s2-vec_bare_words-n.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/vec_bare_words.kai -o build/s2-vec_bare_words-ir 2> build/s2-vec_bare_words-ir.err \
 	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: whole-program build errored)"; cat build/s2-vec_bare_words-ir.err; exit 1; }; \
-	for sym in kaix_vec_field_i64 kaix_vec_field_f64 kaix_vec_get_i64 kaix_vec_get_f64 kaix_vec_push_rec_bits kaix_vec_set_rec_bits kaix_vec_push_i64 kaix_vec_push_f64 kaix_vec_set_i64 kaix_vec_set_f64; do \
+	for sym in kaix_vec_field_boxed kaix_vec_field_i64 kaix_vec_field_f64 kaix_vec_get_i64 kaix_vec_get_f64 kaix_vec_push_rec_bits kaix_vec_set_rec_bits kaix_vec_push_i64 kaix_vec_push_f64 kaix_vec_set_i64 kaix_vec_set_f64; do \
 	  grep -q "@$$sym(" build/s2-vec_bare_words-n.ll \
 	    || { echo "perceus-1135-vec-raw-native FAIL (bare words: no $$sym in the IR — the access fell back to a box)"; exit 1; }; \
 	done; \
@@ -11985,9 +11985,9 @@ endif
 
 # A trap or a failed assertion leaves through the unwinder, and each native
 # landing pad on the way releases what its frame owned: the failed asserts
-# leak nothing, and both trap fixtures stay correct at every thread count.
+# leak nothing, and the trap fixtures stay correct at every thread count.
 # Their per-run ledger is pinned by rc-leak-gate.
-TRAP_PAD_FIXTURES := trap_releases_pending trap_through_runtime_callback
+TRAP_PAD_FIXTURES := trap_releases_pending trap_through_runtime_callback trap_vec_fused_access trap_vec_read_index_in_flight trap_vec_write_operand_in_flight
 ifeq ($(KAI_LLVM),1)
 test-trap-pads-native: $(TARGET) bin-kai build
 	@set -e; \
@@ -12013,14 +12013,14 @@ test-trap-pads-native:
 endif
 
 # Native ASAN sibling: a pad and the trap's unwind never release the same
-# reference. On Linux LeakSanitizer also runs on the fixture whose frames are
+# reference. On Linux LeakSanitizer also runs on the fixtures whose frames are
 # all kaikai; the callback fixture leaks what its C frames held, by design.
 TRAP_PAD_LSAN := $(if $(filter Linux,$(shell uname -s)),1,0)
 test-trap-pads-asan-native: $(TARGET) bin-kai build
 	@mv ../stage0/runtime_llvm.bc ../stage0/runtime_llvm.bc.hidtp 2>/dev/null || true; \
 	mv ../stage0/runtime_inline.bc ../stage0/runtime_inline.bc.hidtp 2>/dev/null || true; \
 	st=0; \
-	for spec in trap_releases_pending:$(TRAP_PAD_LSAN) trap_through_runtime_callback:0; do \
+	for spec in trap_releases_pending:$(TRAP_PAD_LSAN) trap_through_runtime_callback:0 trap_vec_fused_access:$(TRAP_PAD_LSAN) trap_vec_read_index_in_flight:$(TRAP_PAD_LSAN) trap_vec_write_operand_in_flight:$(TRAP_PAD_LSAN); do \
 	  name=$${spec%%:*}; leaks=$${spec##*:}; \
 	  CFLAGS="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable" \
 	    KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/tp-$$name-asan-n 2> build/tp-$$name-asan-n.err \

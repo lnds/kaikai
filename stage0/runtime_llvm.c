@@ -1307,8 +1307,7 @@ KaiValue *kaix_core_vec_reserve(KaiValue *n)                          { return k
 KaiValue *kaix_core_vec_from_list(KaiValue *xs)                       { return kai_core_vec_from_list(xs); }
 /* Vec raw element paths (compiler-fused): field read without record
  * rebuild, push/set of an unpacked record literal. */
-KaiValue *kaix_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx)        { return kai_vec_get_field(v, i, fidx); }
-KaiValue *kaix_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) { return kai_vec_get_field_borrow(v, i, fidx); }
+KaiValue *kaix_vec_field_boxed(KaiValue *v, int64_t i, int32_t fidx, int32_t owned) { return kai_vec_field_boxed(v, i, fidx, owned); }
 KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names) { return kai_vec_push_rec_raw(v, n, xs, names); }
 KaiValue *kaix_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n, KaiValue **xs) { return kai_vec_set_rec_raw(v, i, n, xs); }
 /* Vec raw scalar paths: always inlined, so a loop over a read keeps its
