@@ -5,23 +5,55 @@ A read of a local carries the binder's id and nothing else. A pass that
 must spell that local — an emitter writing a C identifier, a dump, a
 diagnostic — asks here: the map is built once from the declaration, by
 walking every place a binder is declared.
+
+An emitter writes one local per binder, whatever the binders are named:
+it asks for the binder's emitted text, the name followed by the binder's
+place among the declaration's binders. The place depends on the
+declaration alone, so nothing outside it can change the text.
 """)]
 
 import compiler.ast
 import compiler.written
 import compiler.expr_positions
 
-#[doc("A declaration's binders by id: a search tree over ids, which are counters or hashes and so arrive in no order that keeps it balanced or unbalances it for long.")]
-pub type LocalNames = LnLeaf | LnNode(LocalNames, Int, Written, LocalNames)
+#[doc("A declaration's binders by id, and how many of them a node declares.")]
+pub type LocalNames = { tree: LnTree, count: Int }
+
+#[doc("A search tree over ids, which are counters or hashes and so arrive in no order that keeps it balanced or unbalances it for long.")]
+pub type LnTree = LnLeaf | LnNode(LnTree, Int, LnRow, LnTree)
+
+#[doc("A binder's row: the name it was declared with and the text it is emitted under.")]
+pub type LnRow = { name: Written, text: String }
+
+#[doc("The text a local binder is emitted under. Two binders of one declaration never share it.")]
+pub type Emitted = Emitted(String)
+
+#[doc("The text of `e`.")]
+pub fn emitted_text(e: Emitted) : String = match e { Emitted(s) -> s }
 
 #[doc("No binders.")]
-pub fn ln_empty() : LocalNames = LnLeaf
+pub fn ln_empty() : LocalNames = LocalNames { tree: LnLeaf, count: 0 }
+
+#[doc("True when `ns` holds no binder.")]
+pub fn ln_is_empty(ns: LocalNames) : Bool = match ns.tree {
+  LnLeaf -> true
+  _      -> false
+}
 
 #[doc("The binders `d` declares anywhere inside it: parameters, patterns, `var`s, handler aliases and clause parameters.")]
-pub fn ln_of_decl(d: Decl) : LocalNames = ln_decl(d, LnLeaf)
+pub fn ln_of_decl(d: Decl) : LocalNames = ln_decl(d, ln_empty())
 
 #[doc("The name the binder `l` was declared with; the empty name when `ns` holds no such binder.")]
-pub fn ln_text(ns: LocalNames, l: LocalId) : Written = ln_get(ns, local_raw(l))
+pub fn ln_text(ns: LocalNames, l: LocalId) : Written = match ln_get(ns.tree, local_raw(l)) {
+  Some(r) -> r.name
+  None    -> written("")
+}
+
+#[doc("The text the binder `l` is emitted under: its name, then its place among the binders of its declaration.")]
+pub fn ln_emitted(ns: LocalNames, l: LocalId) : Emitted = match ln_get(ns.tree, local_raw(l)) {
+  Some(r) -> Emitted(r.text)
+  None    -> panic(string_concat("identity: no binder declares the local ", int_to_string(local_raw(l))))
+}
 
 #[doc("`ns` with the binders the parameters `ps` declare.")]
 pub fn ln_with_params(ns: LocalNames, ps: [Param]) : LocalNames = ln_params(ps, ns)
@@ -30,22 +62,43 @@ pub fn ln_with_params(ns: LocalNames, ps: [Param]) : LocalNames = ln_params(ps, 
 pub fn ln_with_expr(ns: LocalNames, e: Expr) : LocalNames = ln_expr(e, ns)
 
 #[doc("`ns` with the binder `b`, for a local no node declares.")]
-pub fn ln_with_binder(ns: LocalNames, b: Binder) : LocalNames = ln_binder(b, ns)
-
-fn ln_get(t: LocalNames, k: Int) : Written = match t {
-  LnLeaf -> written("")
-  LnNode(lo, key, w, hi) -> if k == key { w } else if k < key { ln_get(lo, k) } else { ln_get(hi, k) }
+pub fn ln_with_binder(ns: LocalNames, b: Binder) : LocalNames = match ln_get(ns.tree, local_raw(b.id)) {
+  Some(_) -> ns
+  None    -> LocalNames { tree: ln_put(ns.tree, local_raw(b.id), LnRow { name: b.name, text: ln_implicit_text(written_text(b.name)) }), count: ns.count }
 }
 
-fn ln_put(t: LocalNames, k: Int, w: Written) : LocalNames = match t {
-  LnLeaf -> LnNode(LnLeaf, k, w, LnLeaf)
+#[doc("The text the binder minted under `key`, which no node declares, is emitted under in every declaration.")]
+pub fn ln_implicit(key: String) : Emitted = Emitted(ln_implicit_text(key))
+
+fn ln_get(t: LnTree, k: Int) : Option[LnRow] = match t {
+  LnLeaf -> None
+  LnNode(lo, key, r, hi) -> if k == key { Some(r) } else if k < key { ln_get(lo, k) } else { ln_get(hi, k) }
+}
+
+fn ln_put(t: LnTree, k: Int, r: LnRow) : LnTree = match t {
+  LnLeaf -> LnNode(LnLeaf, k, r, LnLeaf)
   LnNode(lo, key, v, hi) ->
     if k == key { t }
-    else if k < key { LnNode(ln_put(lo, k, w), key, v, hi) }
-    else { LnNode(lo, key, v, ln_put(hi, k, w)) }
+    else if k < key { LnNode(ln_put(lo, k, r), key, v, hi) }
+    else { LnNode(lo, key, v, ln_put(hi, k, r)) }
 }
 
-fn ln_binder(b: Binder, t: LocalNames) : LocalNames = ln_put(t, local_raw(b.id), b.name)
+# A node's binder ends in its place, a number; a binder no node declares
+# is one per name and ends in a letter. Neither can spell the other.
+fn ln_placed_text(name: Written, place: Int) : String =
+  string_concat(written_text(name), string_concat("_", int_to_string(place)))
+
+fn ln_implicit_text(key: String) : String = string_concat(key, "_i")
+
+# A binder the resolver has not numbered is no binder a read can reach,
+# and several share that id: none takes a row.
+fn ln_binder(b: Binder, t: LocalNames) : LocalNames = if local_raw(b.id) == 0 { t } else { ln_numbered(b, t) }
+
+fn ln_numbered(b: Binder, t: LocalNames) : LocalNames = match ln_get(t.tree, local_raw(b.id)) {
+  Some(_) -> t
+  None    -> LocalNames { tree: ln_put(t.tree, local_raw(b.id), LnRow { name: b.name, text: ln_placed_text(b.name, t.count) }),
+                          count: t.count + 1 }
+}
 
 fn ln_opt_binder(o: Option[Binder], t: LocalNames) : LocalNames = match o {
   Some(b) -> ln_binder(b, t)

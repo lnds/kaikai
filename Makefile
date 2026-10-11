@@ -361,9 +361,9 @@ test-rboxed-prim-scope: kaic1 kaic2
 	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	$(KAIC2) --path stdlib examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
-	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag)' $$tmp/s2.c \
+	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag_[0-9][0-9]*)' $$tmp/s2.c \
 	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
-	if grep -q 'kai_op_ne_v(kaiv_ntag,' $$tmp/s2.c; then \
+	if grep -q 'kai_op_ne_v(kaiv_ntag_[0-9][0-9]*,' $$tmp/s2.c; then \
 	  echo "rboxed-prim FAIL kaic2: raw llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"
