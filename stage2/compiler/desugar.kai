@@ -85,6 +85,7 @@ import compiler.symtab
 import compiler.decl_text
 import compiler.scope_view
 import compiler.scope_file
+import compiler.record_head
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule)
@@ -369,8 +370,37 @@ pub fn desugar_pos_records_decls(ds: [Decl], tab: SymTab, views: FileViews, root
 # The record table and the scope a literal's head is settled in.
 type RecScope = { recs: [RecInfo], sc: DsgScope }
 
-# The record a literal's head names, if it names one.
-fn rec_of_head(rs: RecScope, rh: DeclRef) : Option[RecInfo] = rec_find(rs.recs, dsg_type_sym(rs.sc, rh))
+# The record a literal's head names, if it names one. No type is known
+# here, so a written name climbs the file's scope over the records of
+# that name; one no record answers is read as a type name is.
+fn rec_of_head(rs: RecScope, rh: DeclRef) : Option[RecInfo] = match rh {
+  DrSym(s)        -> rec_find(rs.recs, s)
+  DrWritten(_, n) -> match rh_on_ladder(rs.sc.tab, fv_of(rs.sc.views, st_module_id(rs.sc.home)), rs.recs, written_text(n)) {
+    SvSym(s)   -> rec_find(rs.recs, s)
+    SvAmbig(_) -> None
+    _          -> rec_find(rs.recs, dsg_type_sym(rs.sc, rh))
+  }
+}
+
+# The head of a literal whose fields were read off `ri` here. A bare name
+# becomes that record, so no later reading of the name pairs those fields
+# with another record's.
+fn head_settled(rh: DeclRef, ri: RecInfo) : DeclRef = match rh {
+  DrWritten(None, _) -> match ri { RI(s, _, _, _) -> DrSym(s) }
+  _                  -> rh
+}
+
+# A positional literal's head, settled to the record that named its fields.
+fn pos_head(rs: RecScope, rh: DeclRef, fis: [FieldInit]) : DeclRef = match fis {
+  [] -> rh
+  [FI(_, v), ..._] ->
+    if field_is_pos(v) {
+      match rec_of_head(rs, rh) {
+        Some(ri) -> head_settled(rh, ri)
+        None     -> rh
+      }
+    } else { rh }
+}
 
 # A literal's head as a diagnostic spells it.
 fn rec_head_text(rs: RecScope, rh: DeclRef) : String = match rh {
@@ -563,13 +593,9 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: RecScope, file: String, errs
         DPRKind { expr: r.expr, errs: r.errs }
       } else {
         let renamed = dpr_record_lit(rh, rfis.fields, line, col, recs, file, rfis.errs)
-        # Canonicalise the field order to the record's declaration order so
-        # the runtime layout is a global property of the type, not of how
-        # each literal was written. A literal already in declaration order
-        # passes through unchanged; an out-of-order one becomes a let-block
-        # that evaluates fields in SOURCE order then assembles in
-        # DECLARATION order (preserving observable effect order).
-        DPRKind { expr: dpr_record_canon(rh, renamed.fields, line, col, recs), errs: renamed.errs }
+        # Named fields keep the order written: the typer lays them in the
+        # order of the record it settles the head to.
+        DPRKind { expr: mk_expr(ERecordLit(pos_head(recs, rh, rfis.fields), renamed.fields), line, col), errs: renamed.errs }
       }
     }
     EBlock(stmts, tail) -> {
@@ -773,77 +799,6 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
   }
 }
 
-# Canonicalise a named record literal to DECLARATION order. A literal whose
-# fields already follow declaration order (the overwhelming common case)
-# returns unchanged. An out-of-order literal becomes a let-block: each field
-# value is bound to a fresh temp IN SOURCE ORDER, then the record is
-# assembled in declaration order from those temps. This keeps the observable
-# effect order (source order) while making the physical layout a global
-# property of the type — the invariant the constant-index field read relies
-# on. An unknown record type, or a field set that is not exactly the
-# declared one, passes through untouched so the typer reports it.
-fn dpr_record_canon(rh: DeclRef, fis: [FieldInit], line: Int, col: Int,
-                    recs: RecScope) : Expr {
-  match rec_of_head(recs, rh) {
-    None -> mk_expr(ERecordLit(rh, fis), line, col)
-    Some(ri) -> match ri {
-      RI(_, _, fds, _) ->
-        if not is_field_permutation(fis, fds) or fields_in_decl_order(fis, fds) {
-          mk_expr(ERecordLit(rh, fis), line, col)
-        } else {
-          let binds = canon_field_binds(fis, line, col, 0, [])
-          let assembled = canon_assemble(fds, fis, line, col, 0, [])
-          mk_expr(EBlock(binds, Some(mk_expr(ERecordLit(rh, assembled), line, col))), line, col)
-        }
-    }
-  }
-}
-
-# Same length and every declared field named: each declared field exactly once.
-fn is_field_permutation(fis: [FieldInit], fds: [FieldDecl]) : Bool =
-  list_length(fis) == list_length(fds)
-    and all(fds, (fd) => match fd { FD(_, dnm, _, _) -> field_init_index(fis, dnm, 0) >= 0 })
-
-# True iff the literal's field names follow declaration order; the caller has
-# established the field set is a permutation of the declared one.
-fn fields_in_decl_order(fis: [FieldInit], fds: [FieldDecl]) : Bool = match fis {
-  [] -> true
-  [FI(fnm, _), ...frest] -> match fds {
-    [] -> true
-    [FD(_, dnm, _, _), ...drest] -> if fnm == dnm { fields_in_decl_order(frest, drest) } else { false }
-  }
-}
-
-# `let __rf_<l>_<c>_<i> = <value>` for each field, in SOURCE order.
-fn canon_field_binds(fis: [FieldInit], line: Int, col: Int, i: Int, acc: [Stmt]) : [Stmt] = match fis {
-  [] -> list_reverse(acc)
-  [FI(_, val), ...rest] -> {
-    let pat = mk_pat(PBind(binder_minted(canon_temp_name(line, col, i))), line, col)
-    canon_field_binds(rest, line, col, i + 1, [SLet(pat, None, val), ...acc])
-  }
-}
-
-# Assemble `[FI(declared_name, EName(temp))]` in DECLARATION order: for each
-# declared field, find its source-order index and reference that temp.
-fn canon_assemble(fds: [FieldDecl], fis: [FieldInit], line: Int, col: Int,
-                  _i: Int, acc: [FieldInit]) : [FieldInit] = match fds {
-  [] -> list_reverse(acc)
-  [FD(_, dnm, _, _), ...drest] -> {
-    let si = field_init_index(fis, dnm, 0)
-    let ref = mk_name(canon_temp_name(line, col, si), line, col)
-    canon_assemble(drest, fis, line, col, _i + 1, [FI(dnm, ref), ...acc])
-  }
-}
-
-# Source-order index of the field named `target` in `fis`.
-fn field_init_index(fis: [FieldInit], target: String, i: Int) : Int = match fis {
-  [] -> -1
-  [FI(nm, _), ...rest] -> if nm == target { i } else { field_init_index(rest, target, i + 1) }
-}
-
-fn canon_temp_name(line: Int, col: Int, i: Int) : String =
-  concat_all(["__rf_", int_to_string(line), "_", int_to_string(col), "_", int_to_string(i), "__"])
-
 # Expand `T { ...src, x: 10, y: 20 }` into a let-block:
 #
 #     {
@@ -895,6 +850,7 @@ fn dpr_record_spread(
                 DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs1 }
               } else {
                 let var_name = spread_src_var_name(line, col)
+                let head = head_settled(rh, ri)
                 let bind_pat = mk_pat(PBind(binder_minted(var_name)), line, col)
                 # Annotate the let with `T` for non-generic records so
                 # the existing nominal let-annotation check fires when
@@ -905,13 +861,13 @@ fn dpr_record_spread(
                 # tuple, so we let the typer infer and rely on its
                 # field-by-field check instead.
                 let ann_opt = match tparams {
-                  []           -> Some(mk_ty(TyName(rh, []), line, col))
+                  []           -> Some(mk_ty(TyName(head, []), line, col))
                   [_, ..._rest] -> None
                 }
                 let bind_stmt = SLet(bind_pat, ann_opt, src)
                 let var_ref = mk_name(var_name, line, col)
                 let expanded = expand_spread_fields(fds, overrides, var_ref, line, col)
-                let lit = mk_expr(ERecordLit(rh, expanded), line, col)
+                let lit = mk_expr(ERecordLit(head, expanded), line, col)
                 DPRSpread { expr: mk_expr(EBlock([bind_stmt], Some(lit)), line, col), errs: errs1 }
               }
             }
