@@ -20,7 +20,7 @@
 set -eu
 
 # Keep in step with the pin in .github/workflows/tier1.yml.
-KIMUN_VERSION=0.24.0
+KIMUN_VERSION=0.32.0
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
