@@ -1,0 +1,321 @@
+#[doc("""
+How a single reference settles: qualified calls, method calls, effect
+heads, operation bases and handler aliases, and the diagnostics of a
+name that settles nowhere.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.effect_alias_scope
+import compiler.symtab
+import compiler.resolve_state
+import compiler.scope_chain
+import compiler.handler_alias
+import compiler.resolve_callee
+import compiler.decl_names
+import compiler.resolve_use
+import compiler.scope_view
+import compiler.written
+import compiler.resolve_env
+
+#[doc("True when the file's scope view reaches the declaration `s` under `name`.")]
+pub fn reached_in_view(rs: ResState, s: SymId, name: String) : Bool =
+  sym_raw(s) >= 0 and sv_reaches(rs.view, sym_owner(rs.tab, s), name)
+
+#[doc("""
+The qualifier already names the home, so the function, constant or
+constructor it reaches is one declaration. A name the table does not
+hold keeps the qualified spelling.
+""")]
+pub fn chk_modcall(e: Env, m: String, f: String, k: ExprKind) : ExprKind =
+  if rs_recording(e.rs) {
+    match rs_qualified_fn(e.rs, m, f) {
+      Some(s) -> ESym(s, spec_none())
+      None    -> match qualified_value(e.rs.tab, [NCConst, NCCtor], m, f) {
+        Some(s) -> ESym(s, spec_none())
+        None    -> k
+      }
+    }
+  } else { k }
+
+fn qualified_value(tab: SymTab, cs: [NCls], m: String, f: String) : Option[SymId] = match cs {
+  [] -> None
+  [c, ...rest] -> match ru_qualified_class(tab, c, m, f) {
+    URSym(i) -> Some(SymId(i))
+    _        -> qualified_value(tab, rest, m, f)
+  }
+}
+
+# From here on a string is a literal, in an expression or in a pattern:
+# every pass downstream reads `#{` as two characters. A span the lift
+# left as text would lose its interpolation without a word, so it stops
+# the build instead.
+#[doc("Reports a string literal that still holds an interpolation: the lift should have removed it.")]
+pub fn chk_literal_str(e: Env, x: Expr) : Env / Console + File = match x.kind {
+  EStr(span, _) -> if has_interp(span, 0, string_length(span)) { chk_unlifted_interp(e, x) } else { e }
+  _             -> e
+}
+
+fn chk_unlifted_interp(e: Env, x: Expr) : Env / Console + File {
+  let msg = "internal: an interpolated string reached name resolution as text"
+  diag_error(e.file, x.line, x.col, msg)
+  env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, [])))
+}
+
+#[doc("""
+Canonical Rust/Elm-style diagnostic. The error line stays terse; the
+did-you-mean suggestion moves to a separate `help:` line and is
+suppressed when no name is within Levenshtein distance 3.
+""")]
+pub fn chk_unbound(e: Env, name: String, x: Expr) : Env / Console + File {
+  let msg = "cannot find `#{name}` in this scope"
+  if env_reported(e.diags, e.file, x.line, x.col, msg) { e } else {
+    diag_error(e.file, x.line, x.col, msg)
+    let hint = unbound_hint(e, name)
+    match hint {
+      Some(h) -> diag_help(h)
+      None    -> ()
+    }
+    let related = match hint {
+      Some(h) -> [ri_help(e.file, x.line, x.col, h)]
+      None    -> []
+    }
+    env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related)))
+  }
+}
+
+#[doc("The message of a diagnostic.")]
+pub fn diag_text(d: Diagnostic) : String = match d { D(_, _, _, _, m, _) -> m }
+
+#[doc("""
+A predicate is read where its type is written and again wherever a
+check of it was planted, so one mistake in it is reported once.
+""")]
+pub fn env_reported(ds: [Diagnostic], file: String, line: Int, col: Int, msg: String) : Bool = match ds {
+  [] -> false
+  [D(_, f, l, c, m, _), ...rest] ->
+    (l == line and c == col and f == file and m == msg) or env_reported(rest, file, line, col, msg)
+}
+
+# A name that appears as a bare alias right-hand side has no
+# constructor precisely because the declaration is an alias; the
+# leading bar is what would have made it a sum. `region` is a keyword
+# of the block form only. Anything else falls back to the did-you-mean,
+# which stays silent past distance 3.
+fn unbound_hint(e: Env, name: String) : Option[String] =
+  if list_has(e.alias_heads, name) {
+    Some("`type ... = #{name}` declares an alias, so `#{name}` is not a constructor — write `type ... = | #{name}` for a one-member sum")
+  } else if name == "region" {
+    Some("`region` is a block form, not a function — write `region { ... }`")
+  } else {
+    match closest_name(name, env_all_names(e)) {
+      Some(s) -> Some("a similar name exists in scope: `#{s}` (did you mean this?)")
+      None    -> None
+    }
+  }
+
+#[doc("The environment after a list of expressions was resolved.")]
+pub fn rx_envs(r: RExprs) : Env = match r { RExprs(e, _) -> e }
+
+#[doc("The argument position a piped value takes: `0` when the stage writes `_`, else `1`.")]
+pub fn piped_slot(xs: [Expr]) : Int = match xs {
+  [] -> 1
+  [x, ...rest] -> match x.kind { EUnder -> 0  _ -> piped_slot(rest) }
+}
+
+# ---- calls ----
+
+#[doc("What resolving a callee reads from the environment.")]
+pub fn env_call_cx(e: Env) : CallCx = CallCx(e.chain, e.rs, e.callees, e.larity)
+
+#[doc("A call written `recv.op(xs)`: the protocol operation `op` applied to `recv` when one takes that many arguments, else the call as written.")]
+pub fn method_call(e: Env, f: Expr, xs: [Expr]) : RKind / Console + File = match f.kind {
+  EField(recv, op) ->
+    if names_effect(e, recv) { RKind(e, ECall(f, xs)) }
+    else { match method_proto(env_call_cx(e), op, list_length(xs) + 1) {
+      Some(d) -> RKind(e, ECall(at(disp_ref(d), f), [recv, ...xs]))
+      None    -> RKind(e, ECall(f, xs))
+    } }
+  _ -> RKind(e, ECall(f, xs))
+}
+
+fn names_effect(e: Env, recv: Expr) : Bool = match recv.kind {
+  ESym(s, _) -> if not rs_recording(e.rs) { false }
+                else { match sym_class(e.rs.tab, s) { NCEffect -> true  _ -> false } }
+  _          -> false
+}
+
+#[doc("""
+A dispatcher the type settles among several homes stays the written
+name every one of them answers to.
+""")]
+pub fn disp_ref(d: Disp) : ExprKind = match d {
+  DispSym(s)        -> ESym(s, spec_none())
+  DispWritten(name) -> EName(written(name))
+}
+
+#[doc("""
+A name the core rung answered: the builtin's own row when the table
+declares one, else the name as written.
+""")]
+pub fn core_ref(e: Env, name: String, x: Expr) : Expr = match rs_builtin(e.rs, name) {
+  Some(s) -> sym_ref(s, x)
+  None    -> x
+}
+
+#[doc("An expression of kind `k` at the position and with the type of `x`.")]
+pub fn at(k: ExprKind, x: Expr) : Expr = Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site }
+
+#[doc("A reference to the declaration `s`, standing where `x` stood.")]
+pub fn sym_ref(s: SymId, x: Expr) : Expr = at(ESym(s, spec_none()), x)
+
+#[doc("Warns once, with a hint to rename or qualify, about a call the resolver left as written.")]
+pub fn warn_skip(e: Env, x: Expr, msg: String) : Env / Console + File =
+  if env_reported(e.diags, e.file, x.line, x.col, msg) { e } else {
+    let help = "rename one of the two, or qualify the call to name the one it means"
+    diag_warning(e.file, x.line, x.col, msg)
+    diag_help(help)
+    env_push_diag(e, mk_diag(SevWarning, e.file, x.line, x.col, msg, [ri_help(e.file, x.line, x.col, help)]))
+  }
+
+#[doc("""
+The effect a reference names. A qualifier picks the module outright;
+a bare name climbs the scope view like any other class. A reference
+already settled keeps its declaration.
+""")]
+pub fn chk_effect_sym(e: Env, r: DeclRef) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(q, n) -> if rs_recording(e.rs) { rs_effect_sym(e.rs, ref_text(q, n)) } else { sym_none() }
+}
+
+#[doc("A reference as written: `q.n`, or `n` alone.")]
+pub fn ref_text(q: Option[Written], n: Written) : String = match q {
+  Some(m) -> cat3(written_text(m), ".", written_text(n))
+  None    -> written_text(n)
+}
+
+#[doc("""
+The effect heading an op call `Eff.op` is settled the way a handler
+head is. A name the value lookup left bare is not a value, and a local
+binder of that name keeps it.
+""")]
+pub fn chk_op_base(e: Env, b: Expr, op: String) : Expr = match b.kind {
+  EName(n) -> if env_shadowed(e, written_text(n)) { b } else {
+    match chk_op_head(e, written_text(n), op) {
+      None    -> b
+      Some(s) -> sym_ref(s, b)
+    }
+  }
+  _ -> b
+}
+
+# Written on a row alias, the head is the component that declares the
+# op: a row label and an evidence key must name an atomic effect.
+fn chk_op_head(e: Env, head: String, op: String) : Option[SymId] = {
+  let direct = chk_effect_sym(e, ref_written(head))
+  if sym_raw(direct) >= 0 { Some(direct) }
+  else {
+    # A component was settled where the alias was written, so its own id
+    # stands; only an unsettled one is resolved from here.
+    match alias_op_owner(e.eff_ops, alias_components(e.row_aliases, head, 0), op) {
+      None -> None
+      Some(RL(r, _)) -> {
+        let s = chk_effect_sym(e, r)
+        if sym_raw(s) >= 0 { Some(s) } else { None }
+      }
+    }
+  }
+}
+
+#[doc("A handler alias, if one was written, and the environment after it is bound.")]
+pub type RAlias = RAlias(Env, Option[Binder])
+
+# Every alias names the same evidence slot: `state` is the `State[T]`
+# spelling, `log` the accumulator spelling used by `Writer[W]`, and the
+# `var` cell alias is the one no user binding can take over.
+#[doc("The handler-state alias names a stateful handler binds inside its clause bodies.")]
+pub fn handler_state_aliases() : [String] = list_append(user_state_aliases(), [var_cell_alias()])
+
+#[doc("""
+A user alias is bound only when the surrounding scope has no binding of
+that name: an outer `log` array must stay reachable from the clause
+rather than being silently replaced by the state slot. No node declares
+an alias, so its binder is the one minted under its name.
+""")]
+pub fn bind_state_aliases(e: Env, outer: Env) : Env =
+  bind_minted(e, clause_state_aliases((nm) => env_has(outer, nm)))
+
+fn bind_minted(e: Env, keys: [String]) : Env = match keys {
+  []             -> e
+  [key, ...rest] -> bind_minted(env_with_chain(e, ch_bind_local(e.chain, key, local_minted(key))), rest)
+}
+
+#[doc("""
+Announce every alias a clause reads that the enclosing scope takes
+over, so the alias going dark is never a silent surprise. Emitted once
+per handler, at the `handle` site, not once per clause.
+""")]
+pub fn warn_shadowed_aliases(e: Env, names: [String], line: Int, col: Int) : Unit / Console + File {
+  match names {
+    [] -> ()
+    [nm, ...rest] -> {
+      if env_has(e, nm) {
+        diag_warning(e.file, line, col,
+          "`#{nm}` inside this handler's clauses is the enclosing binding, not the handler state")
+        diag_note("a stateful handler binds `#{nm}` as an alias of its state slot; an enclosing binding of that name takes precedence")
+        diag_help("rename the enclosing binding to reach the handler state under `#{nm}`")
+      } else { () }
+      warn_shadowed_aliases(e, rest, line, col)
+    }
+  }
+}
+
+#[doc("Resolved handler clauses, and the environment after them.")]
+pub type RClauses = RClauses(Env, [HClause])
+
+#[doc("Resolved parameters, and the environment with them bound.")]
+pub type RParams = RParams(Env, [Param])
+
+#[doc("`ps` bound in `e`, in order.")]
+pub fn add_params(e: Env, ps: [Param]) : RParams = add_params_loop(e, ps, [])
+
+fn add_params_loop(e: Env, ps: [Param], acc: [Param]) : RParams = match ps {
+  [] -> RParams(e, list_reverse(acc))
+  [p, ...rest] -> match env_bind(e, p.binder) {
+    RBinder(e1, b1) ->
+      add_params_loop(note_bound_arity(e1, b1.id, binder_arity(None, p.ptype)), rest, [Param { ...p, binder: b1 }, ...acc])
+  }
+}
+
+#[doc("The local id of each parameter.")]
+pub fn param_ids(ps: [Param]) : [LocalId] = map(ps, (p) => p.binder.id)
+
+#[doc("""
+A binder whose definition fixes its arity records it, so a call of
+another arity passes it over for the next binding of its name.
+""")]
+pub fn note_arity(e: Env, pat: Pattern, a: Option[Int]) : Env = match pat.pkind {
+  PBind(b) -> note_bound_arity(e, b.id, a)
+  _        -> e
+}
+
+fn note_bound_arity(e: Env, l: LocalId, a: Option[Int]) : Env = match a {
+  None    -> e
+  Some(n) -> Env { ...e, larity: [LocalArity(l, n), ...e.larity] }
+}
+
+# ---- refinement predicates ----
+
+# A refinement's predicate is an expression of the scope its type is
+# written in, where `self` is the value the type constrains: a binder of
+# the predicate, whatever the scope calls `self`.
+
+#[doc("Resolved type expressions, and the environment after them.")]
+pub type RTys = RTys(Env, [TypeExpr])
+
+#[doc("A resolved optional type annotation, and the environment after it.")]
+pub type ROptTy = ROptTy(Env, Option[TypeExpr])
+
+#[doc("Resolved effect operations, and the environment after them.")]
+pub type REffOps = REffOps(Env, [EffectOp])
