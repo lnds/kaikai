@@ -144,6 +144,9 @@ import compiler.local_names
 import compiler.spec_names
 import compiler.ast_map
 import compiler.handler_alias
+import compiler.tbinder
+import compiler.fmt_names
+import compiler.tparam_bind
 
 # ====================================================================
 
@@ -9767,7 +9770,9 @@ fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : 
 # qualified-call resolver reads `pa.Node` against the module table and
 # a local `pa` that shadows module `pa` loses its projection.
 type InterpCtx = { file: String, cs: CSCtx, show: Option[ExprKind],
-                   ts: Option[TSCtx], es: Option[ESCtx], locals: [String] }
+                   ts: Option[TSCtx], es: Option[ESCtx], locals: [String],
+                   # the type parameters of the declaration the spans sit in
+                   tps: [TBinder] }
 
 #[doc("Emit-layer entry point desugar_interp_decls. `show` names the dispatcher of the core `Show` every `#{...}` calls: user code reaches it through its home, so only that home's protocols answer; `None` leaves the op a bare name. `cores` names the core modules, whose own interpolations reach it bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
 pub fn desugar_interp_decls(ds: [Decl],
@@ -9800,7 +9805,7 @@ fn desugar_interp_decls_loop(ds: [Decl],
                                else { Some(ts_ctx(ts_coll, home, target, cores, scopes, global_mt, imps, [])) },
                            es: if list_length(es_coll) == 0 { None }
                                else { Some(es_ctx(home, target, scopes, global_mt, tab, views)) },
-                           locals: [] }
+                           locals: [], tps: [] }
       desugar_interp_decls_loop(rest, global_mt, scopes,
                                 coll, ts_coll, es_coll, tab, views, imps,
                                 target, file, show, cores, home,
@@ -9813,7 +9818,12 @@ fn desugar_interp_decls_loop(ds: [Decl],
 fn interp_bind(cx: InterpCtx, names: [String]) : InterpCtx =
   InterpCtx { file: cx.file,
               cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
-              locals: list_append(names, cx.locals) }
+              locals: list_append(names, cx.locals), tps: cx.tps }
+
+fn interp_in_fn(cx: InterpCtx, tps: [TBinder], ps: [Param]) : InterpCtx =
+  InterpCtx { file: cx.file,
+              cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
+              locals: list_append(interp_param_names(ps), cx.locals), tps: tps }
 
 # The lift runs on parser output, where a binder is the name it was
 # written with.
@@ -9833,7 +9843,7 @@ fn desugar_interp_leaf(d: Decl, cx: InterpCtx) : Decl / Console + File {
       DConst(p, s, ty, desugar_interp_expr(body, cx), mo, l, c)
     DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
       DFn(p, fid, tps, ps, ret, row,
-          desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), l, c, mo)
+          desugar_interp_expr(body, interp_in_fn(cx, tps, ps)), l, c, mo)
     DTest(desc, body, l, c, mo) ->
       DTest(desc, desugar_interp_expr(body, cx), l, c, mo)
     DBench(desc, body, l, c, mo) ->
@@ -10077,8 +10087,10 @@ fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos, cx: InterpCtx,
   }
 }
 
-# Effect scoping runs before type scoping, mirroring the driver order.
-fn interp_scope_frag(e: Expr, cx: InterpCtx) : Expr = {
+# Type parameters are bound first, then effect scoping runs before type
+# scoping, mirroring the driver order.
+fn interp_scope_frag(e0: Expr, cx: InterpCtx) : Expr = {
+  let e = tparam_bind_expr(e0, cx.tps)
   let e1 = match cx.es { Some(esc) -> es_expr_scoped(e, esc)  None -> e }
   let e2 = match cx.ts { Some(tsc) -> ts_expr_scoped(e1, tsc)  None -> e1 }
   # A qualified handler head (`with m.E`) reaches the typer bare, the
@@ -10648,7 +10660,7 @@ pub fn expand_aliases_in_decls(decls: [Decl], tab: SymTab, aliases: [AliasResult
 # written can therefore only name a root or a core alias, which is what
 # keeps a module's alias from expanding a homonym another file writes.
 #[doc("A transparent type alias: its declaration, its type parameters, the type it expands to, and whether a reference still written can name it (the root's and a core's can; any other is reached by its id alone).")]
-pub type TAEntry = TAE(SymId, [String], TypeExpr, Bool)
+pub type TAEntry = TAE(SymId, [TBinder], TypeExpr, Bool)
 
 # The entries and the table their names are read from.
 type TAScope = { tab: SymTab, entries: [TAEntry] }
@@ -10742,9 +10754,9 @@ fn ta_lookup_in(es: [TAEntry], ids: [SymId], nargs: Int, spelled: Bool) : Option
 # Substitute tparams in a body TypeExpr with the supplied args. The
 # tparam map associates each declared tparam name with the
 # instantiation TypeExpr at the use site.
-type TPSubst = TPS(String, TypeExpr)
+type TPSubst = TPS(TBinder, TypeExpr)
 
-fn build_tp_subst(tparams: [String], args: [TypeExpr]) : [TPSubst] {
+fn build_tp_subst(tparams: [TBinder], args: [TypeExpr]) : [TPSubst] {
   match tparams {
     [] -> []
     [p, ...prest] -> match args {
@@ -10754,37 +10766,32 @@ fn build_tp_subst(tparams: [String], args: [TypeExpr]) : [TPSubst] {
   }
 }
 
-fn tp_subst_lookup(subst: [TPSubst], name: String) : Option[TypeExpr] {
+fn tp_subst_lookup(subst: [TPSubst], id: TLocalId) : Option[TypeExpr] {
   match subst {
     [] -> None
     [s, ...rest] -> match s {
-      TPS(n, te) -> if n == name { Some(te) } else { tp_subst_lookup(rest, name) }
+      TPS(n, te) -> if tlocal_eq(n.id, id) { Some(te) } else { tp_subst_lookup(rest, id) }
     }
   }
 }
 
-# A type parameter has no declaration: a reference names one by what it
-# writes.
-fn tp_subst_ref(subst: [TPSubst], r: DeclRef) : Option[TypeExpr] = match r {
-  DrWritten(None, n) -> tp_subst_lookup(subst, written_text(n))
-  _                  -> None
-}
-
 fn apply_tp_subst_te(te: TypeExpr, subst: [TPSubst]) : TypeExpr {
   match te.tkind {
-    TyName(r, targs) -> {
+    TyName(r, targs) ->
+      TypeExpr { tkind: TyName(r, apply_tp_subst_te_list(targs, subst)), line: te.line, col: te.col }
+    TyParam(p, targs) -> {
       let targs1 = apply_tp_subst_te_list(targs, subst)
-      match tp_subst_ref(subst, r) {
+      match tp_subst_lookup(subst, p) {
         Some(rep) -> if targs1 == [] { rep }
                      else {
                        # `Predicate[T] = (T) -> Bool` instantiated with
-                       # `Predicate[Int]` plain-name lookup substitutes
-                       # `T` itself, not a TyName-with-args. Higher-kinded
+                       # `Predicate[Int]` substitutes `T` itself, not a
+                       # parameter with arguments. Higher-kinded
                        # aliases are out of scope; the type-args-on-tparam
                        # case is not supported and falls through.
-                       TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
+                       TypeExpr { tkind: TyParam(p, targs1), line: te.line, col: te.col }
                      }
-        None -> TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
+        None -> TypeExpr { tkind: TyParam(p, targs1), line: te.line, col: te.col }
       }
     }
     TyList(inner) ->
@@ -10822,7 +10829,8 @@ fn apply_tp_subst_unit(u: UnitExprT, subst: [TPSubst]) : UnitExprT {
   match u {
     UOne -> u
     UVar(_) -> u
-    USym(s) -> match tp_subst_unit_lookup(subst, s) {
+    USym(_) -> u
+    UParam(p) -> match tp_subst_unit_lookup(subst, p) {
       Some(rep) -> rep
       None -> u
     }
@@ -10841,17 +10849,20 @@ fn apply_tp_subst_units(us: [UnitExprT], subst: [TPSubst]) : [UnitExprT] {
   }
 }
 
-fn tp_subst_unit_lookup(subst: [TPSubst], sym: String) : Option[UnitExprT] {
+# The argument of a unit-kind slot is a habitant the source wrote, or a
+# unit parameter of the use site.
+fn tp_subst_unit_lookup(subst: [TPSubst], p: TLocalId) : Option[UnitExprT] {
   match subst {
     [] -> None
     [s, ...rest] -> match s {
       TPS(stored, te) ->
-        if tp_kind_is_unit(stored) and tp_strip_kind(stored) == sym {
+        if tb_is_unit(stored) and tlocal_eq(stored.id, p) {
           match te.tkind {
             TyName(DrWritten(None, arg), []) -> Some(USym(written_text(arg)))
+            TyParam(q, []) -> Some(UParam(q))
             _ -> None
           }
-        } else { tp_subst_unit_lookup(rest, sym) }
+        } else { tp_subst_unit_lookup(rest, p) }
     }
   }
 }
@@ -10898,17 +10909,19 @@ fn apply_tp_subst_row(r: RowExpr, subst: [TPSubst]) : RowExpr {
     RClosed(labels) -> RClosed(apply_tp_subst_rls(labels, subst))
     ROpen(rv, labels) -> {
       let labels1 = apply_tp_subst_rls(labels, subst)
-      match tp_subst_lookup(subst, rv) {
+      match tp_subst_lookup(subst, tail_id(rv)) {
         None -> ROpen(rv, labels1)
         Some(rep) -> match rep.tkind {
-          # A row variable is written lowercase; anything else names an
-          # effect.
+          # A parameter of the use site is its row variable.
+          TyParam(q, []) -> ROpen(TpId(q), labels1)
+          # A row variable nothing bound is written lowercase; anything
+          # else names an effect.
           TyName(r, []) -> match r {
             DrWritten(None, nm) ->
               if name_first_is_upper(written_text(nm)) {
                 RClosed(label_concat_rls(labels1, [RL(r, [])]))
               } else {
-                ROpen(written_text(nm), labels1)
+                ROpen(TpWritten(nm), labels1)
               }
             _ -> RClosed(label_concat_rls(labels1, [RL(r, [])]))
           }
@@ -11002,6 +11015,9 @@ fn expand_ta_te(te: TypeExpr, table: TAScope, aliases: [AliasResult], fuel: Int)
                   line: te.line, col: te.col }
     TySurface(ts) ->
       TypeExpr { tkind: TySurface(tysurface_rebuild(ts, expand_ta_te_list(tysurface_children(ts), table, aliases, fuel))),
+                  line: te.line, col: te.col }
+    TyParam(p, targs) ->
+      TypeExpr { tkind: TyParam(p, expand_ta_te_list(targs, table, aliases, fuel)),
                   line: te.line, col: te.col }
   } }
 }
@@ -11508,6 +11524,9 @@ fn mangle_te(te: TypeExpr, entries: PrivTys, home_mod: String) : TypeExpr {
     TySurface(ts) ->
       TypeExpr { tkind: TySurface(tysurface_rebuild(ts, mangle_te_list(tysurface_children(ts), entries, home_mod))),
                   line: te.line, col: te.col }
+    TyParam(p, targs) ->
+      TypeExpr { tkind: TyParam(p, mangle_te_list(targs, entries, home_mod)),
+                  line: te.line, col: te.col }
   }
 }
 
@@ -11975,7 +11994,7 @@ fn dump_decl_type(d: Decl, tab: SymTab) : Unit / Console {
       let pub_s = if is_pub { "pub " } else { "" }
       let tps = match tparams {
         [] -> ""
-        _ -> concat_all(["[", join_with(tparams, ", "), "]"])
+        _ -> concat_all(["[", join_with(map(tparams, fmt_tparam), ", "), "]"])
       }
       print("#{pub_s}type #{written_text(decl_name(tab, tsym))}#{tps} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
@@ -12478,7 +12497,7 @@ fn tcrec_is_pcs_ret_wrap(body: Expr) : Bool {
 }
 
 fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, fid: FnId,
-                              tparams: [String], params: [Param],
+                              tparams: [TBinder], params: [Param],
                               opt_ret: Option[TypeExpr], row: RowExpr,
                               body: Expr, stmts: [Stmt],
                               ln: Int, cl: Int, mo: Option[String],

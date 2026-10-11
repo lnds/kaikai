@@ -16,24 +16,36 @@ import compiler.kinds
 import compiler.written
 import compiler.symtab
 import compiler.decl_text
+import compiler.tbinder
 
-#[doc("Render a type for a reader, effect rows of arrow types included.")]
-pub fn type_text(tab: SymTab, t: TypeExpr) : String = tt_type(t, TtFmt { tab: tab, sym: kind_sym_bare })
+#[doc("Render a type for a reader, effect rows of arrow types included. A type parameter prints as `_`: `type_text_in` names it.")]
+pub fn type_text(tab: SymTab, t: TypeExpr) : String = type_text_in(tab, [], t)
 
-#[doc("Render a type as an identity key: `type_text` with kind-qualified unit symbols kept distinct.")]
-pub fn type_key(tab: SymTab, t: TypeExpr) : String = tt_type(t, TtFmt { tab: tab, sym: kind_sym_mangle })
+#[doc("`type_text` under the type parameters `tps` in scope: each prints by the name its binder carries.")]
+pub fn type_text_in(tab: SymTab, tps: [TBinder], t: TypeExpr) : String =
+  tt_type(t, TtFmt { tab: tab, sym: kind_sym_bare, param: (id) => tparam_display(tps, id) })
+
+#[doc("Render a type as an identity key: `type_text` with kind-qualified unit symbols kept distinct and a type parameter spelled from its id.")]
+pub fn type_key(tab: SymTab, t: TypeExpr) : String = tt_type(t, TtFmt { tab: tab, sym: kind_sym_mangle, param: tt_param_key })
 
 #[doc("Render an effect row's labels and tail as `A + B[T] + e`, without the leading ` / `.")]
-pub fn row_text(tab: SymTab, r: RowExpr) : String = tt_row(r, TtFmt { tab: tab, sym: kind_sym_bare })
+pub fn row_text(tab: SymTab, r: RowExpr) : String = row_text_in(tab, [], r)
+
+#[doc("`row_text` under the type parameters `tps` in scope.")]
+pub fn row_text_in(tab: SymTab, tps: [TBinder], r: RowExpr) : String =
+  tt_row(r, TtFmt { tab: tab, sym: kind_sym_bare, param: (id) => tparam_display(tps, id) })
 
 #[doc("Render one effect-row label with its type arguments, `E` or `E[T, U]`.")]
-pub fn row_label_text(tab: SymTab, l: RowLabel) : String = tt_label(l, TtFmt { tab: tab, sym: kind_sym_bare })
+pub fn row_label_text(tab: SymTab, l: RowLabel) : String =
+  tt_label(l, TtFmt { tab: tab, sym: kind_sym_bare, param: (id) => tparam_display([], id) })
 
 #[doc("Render a unit expression for a reader, e.g. `kg m/s^2`.")]
-pub fn unit_text(u: UnitExprT) : String = tt_unit(u, kind_sym_bare)
+pub fn unit_text(u: UnitExprT) : String = tt_unit(u, kind_sym_bare, (id) => tparam_display([], id))
 
 #[doc("Render a unit expression as an identity key, kind qualifiers kept C-safe.")]
-pub fn unit_key(u: UnitExprT) : String = tt_unit(u, kind_sym_mangle)
+pub fn unit_key(u: UnitExprT) : String = tt_unit(u, kind_sym_mangle, tt_param_key)
+
+fn tt_param_key(id: TLocalId) : String = string_concat("tparam", int_to_string(tlocal_raw(id)))
 
 #[doc("How a reference prints: its declaration's name once it is settled, the name the source wrote, qualifier included, before.")]
 pub fn ref_display(tab: SymTab, r: DeclRef) : String = match r {
@@ -48,16 +60,19 @@ pub fn ref_decl_name(tab: SymTab, r: DeclRef) : String = match r {
   DrWritten(_, n) -> written_text(n)
 }
 
-# The table a settled name is read from, and how a unit symbol is spelled.
-type TtFmt = { tab: SymTab, sym: (String) -> String }
+# The table a settled name is read from, how a unit symbol is spelled,
+# and how a type parameter is.
+type TtFmt = { tab: SymTab, sym: (String) -> String, param: (TLocalId) -> String }
 
 fn tt_type(t: TypeExpr, f: TtFmt) : String =
   match t.tkind {
     TyName(r, [])      -> ref_display(f.tab, r)
     TyName(r, ts)      -> concat_all([ref_display(f.tab, r), "[", tt_types(ts, f), "]"])
+    TyParam(id, [])    -> tt_param(f, id)
+    TyParam(id, ts)    -> concat_all([tt_param(f, id), "[", tt_types(ts, f), "]"])
     TyList(inner)      -> concat_all(["[", tt_type(inner, f), "]"])
     TyFn(ps, ret, row) -> concat_all(["(", tt_types(ps, f), ") -> ", tt_ret(ret, row, f)])
-    TyDim(base, u)     -> concat_all([tt_type(base, f), "<", tt_unit(u, f.sym), ">"])
+    TyDim(base, u)     -> concat_all([tt_type(base, f), "<", tt_unit(u, f.sym, f.param), ">"])
     TyRefine(base, _)  -> concat_all([tt_type(base, f), " where <pred>"])
     TyRow(row)         -> tt_row(row, f)
     TySurface(ts)      -> match ts {
@@ -65,6 +80,16 @@ fn tt_type(t: TypeExpr, f: TtFmt) : String =
       TsUnitSpan(_, inner) -> tt_type(inner, f)
     }
   }
+
+fn tt_param(f: TtFmt, id: TLocalId) : String = {
+  let p = f.param
+  p(id)
+}
+
+fn tt_tail(f: TtFmt, t: TParamRef) : String = match t {
+  TpId(id) -> tt_param(f, id)
+  _        -> tail_written_text(t)
+}
 
 fn tt_types(ts: [TypeExpr], f: TtFmt) : String =
   join_with(map(ts, (t) => tt_type(t, f)), ", ")
@@ -93,8 +118,8 @@ fn tt_row(r: RowExpr, f: TtFmt) : String =
   match r {
     REmpty              -> ""
     RClosed(labels)     -> tt_labels(labels, f)
-    ROpen(tail, [])     -> tail
-    ROpen(tail, labels) -> concat_all([tt_labels(labels, f), " + ", tail])
+    ROpen(tail, [])     -> tt_tail(f, tail)
+    ROpen(tail, labels) -> concat_all([tt_labels(labels, f), " + ", tt_tail(f, tail)])
   }
 
 fn tt_labels(ls: [RowLabel], f: TtFmt) : String =
@@ -108,28 +133,29 @@ fn tt_label(l: RowLabel, f: TtFmt) : String =
 
 # Multiplication renders as a space (`kg m`), division as `/` with no
 # spaces (`m/s`), powers as `^n`; `UOne` factors are dropped.
-fn tt_unit(u: UnitExprT, sym: (String) -> String) : String =
+fn tt_unit(u: UnitExprT, sym: (String) -> String, par: (TLocalId) -> String) : String =
   match u {
     UOne        -> "1"
     USym(s)     -> sym(s)
-    UMul(a, b)  -> tt_unit_mul(a, b, sym)
-    UInv(a)     -> concat_all(["1/", tt_unit(a, sym)])
-    UPow(a, n)  -> concat_all([tt_unit(a, sym), "^", int_to_string(n)])
-    UJoin(a, b) -> concat_all([tt_unit(a, sym), " + ", tt_unit(b, sym)])
+    UParam(p)   -> par(p)
+    UMul(a, b)  -> tt_unit_mul(a, b, sym, par)
+    UInv(a)     -> concat_all(["1/", tt_unit(a, sym, par)])
+    UPow(a, n)  -> concat_all([tt_unit(a, sym, par), "^", int_to_string(n)])
+    UJoin(a, b) -> concat_all([tt_unit(a, sym, par), " + ", tt_unit(b, sym, par)])
     UVar(n)     -> cat2("?u", int_to_string(n))
-    UDims(us)   -> join_with(map(us, (x) => tt_unit(x, sym)), ", ")
+    UDims(us)   -> join_with(map(us, (x) => tt_unit(x, sym, par)), ", ")
   }
 
-fn tt_unit_mul(a: UnitExprT, b: UnitExprT, sym: (String) -> String) : String =
+fn tt_unit_mul(a: UnitExprT, b: UnitExprT, sym: (String) -> String, par: (TLocalId) -> String) : String =
   match b {
     UInv(b_inner) -> match a {
-      UOne -> concat_all(["1/", tt_unit(b_inner, sym)])
-      _    -> concat_all([tt_unit(a, sym), "/", tt_unit(b_inner, sym)])
+      UOne -> concat_all(["1/", tt_unit(b_inner, sym, par)])
+      _    -> concat_all([tt_unit(a, sym, par), "/", tt_unit(b_inner, sym, par)])
     }
-    UOne -> tt_unit(a, sym)
+    UOne -> tt_unit(a, sym, par)
     _ -> match a {
-      UOne          -> tt_unit(b, sym)
-      UInv(a_inner) -> concat_all([tt_unit(b, sym), "/", tt_unit(a_inner, sym)])
-      _             -> concat_all([tt_unit(a, sym), " ", tt_unit(b, sym)])
+      UOne          -> tt_unit(b, sym, par)
+      UInv(a_inner) -> concat_all([tt_unit(b, sym, par), "/", tt_unit(a_inner, sym, par)])
+      _             -> concat_all([tt_unit(a, sym, par), " ", tt_unit(b, sym, par)])
     }
   }
