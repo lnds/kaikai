@@ -19,4 +19,11 @@ printf 'fn main() : Int = 0\n' > "$WORK/main.kai"
   echo "core-full: FAIL — the full core does not type or emit"; exit 1; }
 cc -std=c99 -w -c -I "$ROOT/stage2" -I "$ROOT/stage0" "$WORK/main.c" -o "$WORK/main.o" || {
   echo "core-full: FAIL — the full core's C does not compile"; exit 1; }
+
+# A typecheck-only run cuts the core like a build does, and --full-core
+# still types all of it.
+(cd "$WORK" && "$KAIC2" --core-cache-stats --check main.kai 2>&1) | grep -q 'core-prune: dropped' || {
+  echo "core-full: FAIL — a typecheck-only run types the whole core"; exit 1; }
+(cd "$WORK" && "$KAIC2" --full-core --core-cache-stats --check main.kai 2>&1) | grep -q 'core-prune: off' || {
+  echo "core-full: FAIL — --full-core does not reach a typecheck-only run"; exit 1; }
 echo "core-full OK"
