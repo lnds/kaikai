@@ -1,0 +1,211 @@
+#[doc("""
+The names a refinement's predicate leaves to its type.
+
+A predicate stored in a type is never typed in place: it is compared,
+copied and substituted as it stands. Scope alone settles most of its
+names. Two kinds wait for a type, and the predicate has one in hand, the
+type it refines:
+
+- a constructor, which is the one the refined type's own sum declares
+  under that name before it is anyone else's;
+- a function several modules declare on one rung: the one whose first
+  parameter is the type of the call's first argument, when that is the
+  refined value or a call of a function that declares its result.
+
+Both are read off the declarations, so a predicate holds identities
+before any environment exists, and two copies of one predicate are the
+same expression wherever they land.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.util
+import compiler.symtab
+import compiler.symtab_build
+import compiler.decl_names
+import compiler.decl_text
+import compiler.scope_view
+import compiler.scope_file
+import compiler.refine_types
+
+#[doc("What the settle reads: the symbol table, every file's scope, and the declarations, which say what each sum constructs and what each function takes first.")]
+pub type PredCx = { tab: SymTab, views: FileViews, decls: [Decl] }
+
+#[doc("A context that settles nothing: no declaration answers.")]
+pub fn pn_none() : PredCx = PredCx { tab: st_empty(), views: fv_empty(), decls: [] }
+
+#[doc("`pred`, a predicate refining `base` written in the file `v` views, with the names scope left written settled where the declarations decide them. A name they do not decide stays written.")]
+pub fn pn_settle(pred: Expr, base: TypeExpr, v: ScopeView, cx: PredCx) : Expr =
+  walk(pred, At { cx: cx, v: v, base: type_sym(cx.tab, v, base) })
+
+#[doc("`pn_settle` over the predicates `ps` of some types and the bases `bs` they refine, both in `tys_preds` order.")]
+pub fn pn_settle_all(ps: [Expr], bs: [TypeExpr], v: ScopeView, cx: PredCx) : [Expr] = match ps {
+  []           -> []
+  [p, ...rest] -> match bs {
+    [b, ...more] -> [pn_settle(p, b, v, cx), ...pn_settle_all(rest, more, v, cx)]
+    []           -> ps
+  }
+}
+
+# One predicate's position: the file it is written in and the type it refines.
+type At = { cx: PredCx, v: ScopeView, base: SymId }
+
+# Only the forms that bind nothing are walked, so every name met is free
+# in the predicate.
+fn walk(e: Expr, at: At) : Expr = match e.kind {
+  EName(w)         -> read(e, written_text(w), at)
+  ECall(f, xs)     -> call(e, f, map(xs, (x) => walk(x, at)), at)
+  EBinop(op, a, b) -> with_kind(e, EBinop(op, walk(a, at), walk(b, at)))
+  EUnop(op, x)     -> with_kind(e, EUnop(op, walk(x, at)))
+  EField(b, f)     -> with_kind(e, EField(walk(b, at), f))
+  EIndex(a, b)     -> with_kind(e, EIndex(walk(a, at), walk(b, at)))
+  _                -> e
+}
+
+# The arguments are settled first: a tied callee reads their types.
+fn call(e: Expr, f: Expr, xs: [Expr], at: At) : Expr = with_kind(e, ECall(callee(f, xs, at), xs))
+
+fn with_kind(e: Expr, k: ExprKind) : Expr = Expr { ...e, kind: k }
+
+fn settled(e: Expr, s: SymId) : Expr = with_kind(e, ESym(s, spec_none()))
+
+# A name read as a value: the refined type's own constructor, else the
+# one declaration on the nearest rung.
+fn read(e: Expr, name: String, at: At) : Expr = match own_ctor(at, name) {
+  Some(c) -> settled(e, c)
+  None    -> match on_ladder(at, name) {
+    SvSym(s) -> settled(e, s)
+    _        -> e
+  }
+}
+
+# A bare callee settles as a read does; a tie between functions is
+# broken by the type of the first argument.
+fn callee(f: Expr, xs: [Expr], at: At) : Expr = match f.kind {
+  EName(w) -> match own_ctor(at, written_text(w)) {
+    Some(c) -> settled(f, c)
+    None    -> match on_ladder(at, written_text(w)) {
+      SvSym(s)    -> settled(f, s)
+      SvAmbig(ss) -> match taking_first(ss, xs, at) {
+        Some(s) -> settled(f, s)
+        None    -> f
+      }
+      _ -> f
+    }
+  }
+  _ -> walk(f, at)
+}
+
+fn on_ladder(at: At, name: String) : SvRes =
+  match sv_resolve_fit(at.cx.tab, at.v, [SvOwn, SvPicks, SvImports, SvCores], [NCFn, NCConst, NCCtor], name, (_s) => true) {
+    SvFit(r, _) -> r
+  }
+
+# ---- the refined type's constructors ----
+
+fn own_ctor(at: At, name: String) : Option[SymId] =
+  if sym_raw(at.base) < 0 { None }
+  else if is_core(at.base, CtOption) { core_ctor(name, ["Some", "None"]) }
+  else if is_core(at.base, CtResult) { core_ctor(name, ["Ok", "Err"]) }
+  else { find(sum_ctors(at.cx.decls, at.base), (c) => written_text(decl_name(at.cx.tab, c)) == name) }
+
+fn is_core(t: SymId, c: CoreTy) : Bool = sym_same(t, core_ty_sym(c))
+
+fn core_ctor(name: String, declared: [String]) : Option[SymId] =
+  if list_has(declared, name) { Some(sym_derive(NCCtor, name, core_type_home())) } else { None }
+
+# The constructors the declaration of the sum `t` lists.
+fn sum_ctors(ds: [Decl], t: SymId) : [SymId] = match ds {
+  []           -> []
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> sum_ctors([inner, ...rest], t)
+    None        -> match d {
+      DType(_, s, _, TBSum(vs), _, _, _, _) ->
+        if sym_same(s, t) { map(vs, (v) => match v { Var(c, _) -> c }) } else { sum_ctors(rest, t) }
+      _ -> sum_ctors(rest, t)
+    }
+  }
+}
+
+# ---- a function tie, broken by its first argument ----
+
+# The one of `ss` whose first parameter is the type of the call's first
+# argument. Core modules restating one function leave the last the core
+# set lists.
+fn taking_first(ss: [SymId], xs: [Expr], at: At) : Option[SymId] = match xs {
+  [x, ..._] -> {
+    let t = arg_type(x, at)
+    if sym_raw(t) < 0 { None } else {
+      match filter(ss, (s) => sym_same(first_param(at.cx, s), t)) {
+        [s] -> Some(s)
+        fit -> sv_last_listed_core(at.cx.tab, at.v, fit)
+      }
+    }
+  }
+  [] -> None
+}
+
+# The type of an argument as far as the declarations say it: the refined
+# value has the refined type, a call the result its function declares.
+fn arg_type(x: Expr, at: At) : SymId = match x.kind {
+  ELocal(l)   -> if local_eq(l, pred_self()) { at.base } else { sym_none() }
+  ECall(f, _) -> match f.kind {
+    ESym(s, _) -> result_type(at.cx, s)
+    _          -> sym_none()
+  }
+  _ -> sym_none()
+}
+
+# The type the function `f` takes first, read from the file that
+# declares it; none when it takes nothing or names no declared type.
+fn first_param(cx: PredCx, f: SymId) : SymId = match fn_decl(cx.decls, f) {
+  Some(DFn(_, _, _, ps, _, _, _, _, _, _)) -> match ps {
+    [p, ..._] -> opt_type_sym(cx, f, p.ptype)
+    []        -> sym_none()
+  }
+  _ -> sym_none()
+}
+
+fn result_type(cx: PredCx, f: SymId) : SymId = match fn_decl(cx.decls, f) {
+  Some(DFn(_, _, _, _, ret, _, _, _, _, _)) -> opt_type_sym(cx, f, ret)
+  _ -> sym_none()
+}
+
+fn opt_type_sym(cx: PredCx, f: SymId, t: Option[TypeExpr]) : SymId = match t {
+  Some(te) -> type_sym(cx.tab, fv_of(cx.views, sym_owner(cx.tab, f)), te)
+  None     -> sym_none()
+}
+
+fn fn_decl(ds: [Decl], f: SymId) : Option[Decl] = match ds {
+  []           -> None
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> fn_decl([inner, ...rest], f)
+    None        -> match d {
+      DFn(_, id, _, _, _, _, _, _, _, _) -> if sym_same(fnid_sym(id), f) { Some(d) } else { fn_decl(rest, f) }
+      _ -> fn_decl(rest, f)
+    }
+  }
+}
+
+# ---- the type a type expression names ----
+
+# The declaration `t` names from the view `v`: a builtin is named by
+# its own spelling, a list by the list type, a refinement or a
+# dimensioned type by its carrier.
+fn type_sym(tab: SymTab, v: ScopeView, t: TypeExpr) : SymId = match t.tkind {
+  TyName(DrSym(s), _)               -> s
+  TyName(DrWritten(Some(q), n), _)  -> sv_sym(sv_qualified(tab, NCType, written_text(q), written_text(n)))
+  TyName(DrWritten(None, n), _)     -> declared_or_builtin(sv_sym(sv_resolve(tab, v, NCType, written_text(n))), written_text(n))
+  TyList(_)      -> core_ty_sym(CtList)
+  TyRefine(b, _) -> type_sym(tab, v, b)
+  TyDim(b, _)    -> type_sym(tab, v, b)
+  _              -> sym_none()
+}
+
+fn declared_or_builtin(s: SymId, name: String) : SymId =
+  if sym_raw(s) >= 0 { s } else { core_type_sym_or_none(name) }
+
+fn sv_sym(r: SvRes) : SymId = match r {
+  SvSym(s) -> s
+  _        -> sym_none()
+}
