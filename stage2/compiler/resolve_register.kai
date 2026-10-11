@@ -1,0 +1,120 @@
+#[doc("""
+The names a declaration and an import put in scope before bodies are
+read.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.effect_alias_scope
+import compiler.decl_names
+import compiler.written
+import compiler.decl_text
+import compiler.resolve_env
+import compiler.resolve_pats
+import compiler.resolve_names
+
+#[doc("`e` with the names the declaration `d` declares.")]
+pub fn register_one(e: Env, d: Decl) : Env {
+  match d {
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> env_add_decl(e, fnid_sym(fid))
+    DType(_, tsym, _, body, _, _, _, _) -> {
+      let e1 = env_add_decl(e, tsym)
+      match body {
+        TBSum(variants) -> register_variants_env(e1, variants)
+        TBAlias(t) -> match t.tkind {
+          TyName(r, []) -> env_note_alias_head(e1, type_ref_text(e1, r))
+          _ -> e1
+        }
+        TBEffectAlias(labels) ->
+          if list_is_empty(labels) { e1 }
+          else { Env { ...e1, row_aliases: [RA(env_sym_text(e1, tsym), map(labels, (l) => settle_label(e1, l))), ...e1.row_aliases] } }
+        _ -> e1
+      }
+    }
+    DTest(_, _, _, _, _) -> e
+    DBench(_, _, _, _, _) -> e
+    DCheck(_, _, _, _, _, _) -> e
+    DImport(ik, _, _) -> register_import(e, ik)
+    DEffect(_, esym, _, ops, _, _, _, _) -> {
+      let e1 = env_add_decl(e, esym)
+      Env { ...e1, eff_ops: [EO(esym, eff_op_names(ops, [])), ...e1.eff_ops] }
+    }
+    # stripped pre-resolve; never reaches register_one in practice.
+    # No-op for completeness so the match stays exhaustive.
+    DProtocol(_, _, _, _, _, _, _) -> e
+    DImpl(_, _, _, _, _, _, _, _) -> e
+    DDerive(_, _, _, _) -> e
+    DUnstable(_, _, _) -> e
+    DProtoLaws(_, inner, _, _, _) -> register_one(e, inner)  # stripped pre-resolve; defensive
+    DImplAxiom(_, inner, _, _, _) -> register_one(e, inner)
+    DConstructor(inner, _, _) -> register_one(e, inner)   # bind the marked fn name
+    DUnit(_, _, _, _, _, _, _) -> e            # unit names live in their own namespace, validated at type-resolve time
+    DUse(_, _, _) -> e                       # stripped by desugar_use_decls before register_one runs
+    DUseKind(_, _, _, _) -> e                # stripped by the kind-resolution pass before register_one runs
+    DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name, NCFn)  # also rewritten to DFn by lower_axioms; case kept for completeness
+    DConst(_, csym, _, _, _, _, _) -> env_add_decl(e, csym)
+    DExternType(name, _, _, _, _) -> env_add(e, name, NCExternType)   # FFI v2: register the foreign type name so its references resolve
+    DDoc(_, _, inner, _, _) -> register_one(e, inner)   # register the documented decl
+    DAttr(_, inner, _, _) -> register_one(e, inner)
+    DModuleDoc(_, _, _, _) -> e                          # doc text only, no names
+    DTheory(_, _, _, _, _) -> e                             # catalog decl: no value binding
+    DKind(_, _, _, _, _, _, _, _) -> e                         # catalog decl: no value binding
+  }
+}
+
+fn register_variants_env(e: Env, vs: [Variant]) : Env {
+  match vs {
+    [] -> e
+    [v, ...rest] -> match v {
+      Var(csym, _) -> register_variants_env(env_add_decl(e, csym), rest)
+    }
+  }
+}
+
+# The name an alias's right-hand side spells, for the hint an unbound
+# use of it earns.
+fn type_ref_text(e: Env, r: DeclRef) : String = match r {
+  DrWritten(q, n) -> ref_text(q, n)
+  DrSym(s)        -> written_text(decl_name(e.rs.tab, s))
+}
+
+# A component that names an effect is settled from the alias's own
+# home; one that names another alias stays written.
+fn settle_label(e: Env, l: RowLabel) : RowLabel = match l {
+  RL(DrWritten(q, n), ts) -> {
+    let s = chk_effect_sym(e, DrWritten(q, n))
+    if sym_raw(s) >= 0 { RL(DrSym(s), ts) } else { l }
+  }
+  _ -> l
+}
+
+# For imports we add just the surface name: the last segment of the
+# dotted path, the alias, or each selected name. Stage 0 does the
+# same; deeper module resolution is a stage 2 concern.
+#[doc("Last dotted segment of an import path (`a.b.c` -> `c`).")]
+pub fn last_segment(path: String) : String {
+  last_segment_loop(path, string_length(path) - 1, string_length(path))
+}
+
+fn last_segment_loop(s: String, i: Int, end: Int) : String {
+  if i < 0 { string_slice(s, 0, end) }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { string_slice(s, i + 1, end - i - 1) }
+                 else { last_segment_loop(s, i - 1, end) }
+      None -> string_slice(s, 0, end)
+    }
+  }
+}
+
+fn register_import(e: Env, ik: ImportKind) : Env {
+  match ik {
+    IkPath(path) -> env_add(e, last_segment(path), NCModule)
+    IkAlias(_, alias) -> env_add(e, alias, NCModule)
+    IkSelective(_, names) -> add_all(e, names)
+    # import holes don't bind anything in the value namespace — they
+    # are diagnostic-only. Skip for env-binding purposes; the
+    # symbol-index pass handles the diagnostic.
+    IkHole(_) -> e
+  }
+}

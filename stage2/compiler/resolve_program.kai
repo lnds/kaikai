@@ -1,0 +1,127 @@
+#[doc("""
+Name resolution of a whole program: declarations registered, each
+resolved in its file's scope, rows checked.
+""")]
+
+import compiler.diag
+import compiler.ast
+import compiler.diag_file
+import compiler.modules_homes
+import compiler.symtab
+import compiler.resolve_state
+import compiler.scope_file
+import compiler.resolve_callee
+import compiler.kai_builtin
+import compiler.refine_names
+import compiler.resolve_env
+import compiler.resolve_pats
+import compiler.resolve
+import compiler.resolve_register
+import compiler.resolve_rows
+
+#[doc("A walked declaration list: the env after it, and the rewritten declarations.")]
+pub type RDecls = RDecls(Env, [Decl])
+
+#[doc("Walk a decl list with the resolver, threading the scope env left to right and stamping every resolved name.")]
+pub fn chk_decls(e: Env, ds: [Decl]) : RDecls / Console + File = chk_decls_loop(e, ds, [])
+
+fn chk_decls_loop(e: Env, ds: [Decl], acc: [Decl]) : RDecls / Console + File = match ds {
+  [] -> RDecls(e, list_reverse(acc))
+  [d, ...rest] -> match chk_decl(e, d) {
+    RDecl(e1, d1) -> chk_decls_loop(e1, rest, [d1, ...acc])
+  }
+}
+
+# ---- top-level pre-registration ----
+
+#[doc("Pre-register every top-level decl's name into the env so forward references resolve.")]
+pub fn register_decls(e: Env, ds: [Decl], target: String) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> register_decls(register_one(env_at_decl(e, d, target), d), rest, target)
+  }
+}
+
+# The home follows the decl stream, in registration and in the walk
+# alike. An untagged decl belongs to the root file and resets to
+# `target`; inheriting the previous decl's home would resolve a root
+# body from inside the last core module.
+fn env_at_decl(e: Env, d: Decl, target: String) : Env =
+  if rs_recording(e.rs) {
+    env_with_rs(e, rs_at_home(e.rs, decl_home_hint_reset(d, rs_home_name(e.rs), target)))
+  } else { e }
+
+# ---- entry point ----
+
+#[doc("Resolve a program against `tab`: seed core, pre-register decls, walk them, then fold in row-label, refinement, and unbound-tyvar checks. Each diagnostic names the file that declares the decl it is in. Returns 1 if any check failed.")]
+pub fn check_program(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Int / Console + File =
+  resolve_program_with(df, decls, tab, target).errs
+
+#[doc("Resolve `decls` against `tab` and hand back the tree with every resolved name written as its identity, or the original stream when resolution failed.")]
+pub fn resolve_decls(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : ResolvedDecls / Console + File {
+  let r = resolve_program_with(df, decls, tab, target)
+  ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags, params: r.params }
+}
+
+#[doc("Resolve `decls` whose files resolve under `views`, against the table `tab` those views index.")]
+pub fn resolve_decls_views(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File {
+  let r = resolve_program_views(df, decls, views, tab, target, ops)
+  ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags, params: r.params }
+}
+
+#[doc("`resolve_decls_views`: a reference to a core builtin carries its id on every path.")]
+pub fn resolve_decls_stamped(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File =
+  resolve_decls_views(df, decls, views, tab, target, ops)
+
+#[doc("A resolved decl stream: the resolver's error count, the declarations downstream passes consume, the table their ids index, and the diagnostics the walk collected.")]
+pub type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagnostic], params: [ParamIds] }
+
+#[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site resolved against `tab`.")]
+pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
+  resolve_run(df, decls, rs_on(tab, target), tab, [])
+
+#[doc("Resolve a program whose files resolve under `views`: a bare name climbs the file's own imports, picks and cores, not its home alone.")]
+pub fn resolve_program_views(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : Resolution / Console + File =
+  resolve_run(df, decls, rs_on_views(tab, views, target, kai_unshadowed(core_names(), decls, tab)), tab, ops)
+
+fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
+      ops: [ProtoRung]) : Resolution / Console + File {
+  let file = df_root(df)
+  let target = rs_home_name(rs0)
+  let e0 = Env { ...env_with_rs(env_new(file), rs0), callees: ct_build(decls, target, ops),
+                 preds: PredCx { tab: tab, views: rs0.views, decls: decls } }
+  let e1 = add_all(e0, core_names())
+  let e2 = register_decls(e1, decls, target)
+  let walked = chk_decls_files(e2, decls, df, target)
+  let e3 = rds_env(walked)
+  let out = rds_decls(walked)
+  let arities = collect_effect_arities(decls)
+  let checks = list_append(check_row_labels(decls, df, tab, arities), check_unbound_tyvars(decls, df, tab))
+  Resolution { errs: if e3.had_error or checks != [] { 1 } else { 0 },
+               decls: out, tab: tab, diags: list_append(finalize_diags(e3.diags), checks), params: e3.params }
+}
+
+#[doc("The env a decl walk ended in.")]
+pub fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
+
+fn rds_decls(r: RDecls) : [Decl] = match r { RDecls(_, ds) -> ds }
+
+# The env's file follows the decl being walked, so an error inside an
+# imported module's body is anchored in that module's file.
+fn chk_decls_files(e: Env, ds: [Decl], df: DiagFiles,
+      target: String) : RDecls / Console + File =
+  chk_files_loop(e, ds, df, target, [])
+
+fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles, target: String,
+      acc: [Decl]) : RDecls / Console + File = match ds {
+  [] -> RDecls(e, list_reverse(acc))
+  [d, ...rest] -> {
+    let at = env_at_decl(env_with_file(Env { ...e, larity: [] }, decl_diag_file(d, df)), d, target)
+    match chk_decl(at, d) {
+      RDecl(e1, d1) -> chk_files_loop(e1, rest, df, target, [d1, ...acc])
+    }
+  }
+}

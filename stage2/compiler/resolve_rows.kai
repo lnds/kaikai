@@ -1,0 +1,250 @@
+#[doc("""
+Checks on effect rows and type variables: each label names an effect at
+its arity, and no signature leaves a type variable unbound.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.diag_file
+import compiler.symtab
+import compiler.decl_names
+import compiler.written
+import compiler.decl_text
+import compiler.tbinder
+import compiler.tparam_uses
+import compiler.resolve_names
+
+#[doc("""
+Arity table built from every DEffect in the program. Effects are
+declared in stdlib source and loaded before this runs, so every
+effect a row can name is here; effect aliases (`Console`) expand to
+their atomic labels before the row-label check, so they need no
+entry of their own.
+""")]
+pub type EffArity = EA(SymId, Int)
+
+#[doc("Each declared effect with the number of type parameters it takes.")]
+pub fn collect_effect_arities(decls: [Decl]) : [EffArity] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, esym, tparams, _, _, _, _, _) ->
+        [EA(esym, list_length(tparams)), ...collect_effect_arities(rest)]
+      _ -> collect_effect_arities(rest)
+    }
+  }
+}
+
+fn lookup_arity(arities: [EffArity], target: SymId) : Option[Int] {
+  match arities {
+    [] -> None
+    [a, ...rest] -> match a {
+      EA(s, k) -> if sym_raw(s) == sym_raw(target) { Some(k) } else { lookup_arity(rest, target) }
+    }
+  }
+}
+
+# ---- name resolution for effect labels in rows ----
+# Every label that appears in a `T / Eff + ...` suffix must refer to
+# a declared effect. Anything else is a compile error.
+
+#[doc("Every declared effect of the program (every DEffect's id).")]
+pub fn collect_effect_ids(decls: [Decl]) : [SymId] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, esym, _, _, _, _, _, _) -> [esym, ...collect_effect_ids(rest)]
+      _ -> collect_effect_ids(rest)
+    }
+  }
+}
+
+#[doc("The diagnostics of every row label that names no effect, or one at the wrong arity.")]
+pub fn check_row_labels(decls: [Decl], df: DiagFiles, tab: SymTab,
+                     arities: [EffArity]) : [Diagnostic] / Console + File {
+  match decls {
+    [] -> []
+    [d, ...rest] ->
+      list_append(check_decl_row_labels(d, decl_diag_file(d, df), tab, arities),
+                  check_row_labels(rest, df, tab, arities))
+  }
+}
+
+fn check_decl_row_labels(d: Decl, file: String, tab: SymTab,
+                          arities: [EffArity]) : [Diagnostic] / Console + File {
+  match d {
+    DFn(_, _, _, _, _, rexpr, _, line, col, _) ->
+      check_row_expr(rexpr, file, line, col, tab, arities)
+    _ -> []
+  }
+}
+
+fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
+                   tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  match re {
+    REmpty -> []
+    RClosed(labels) -> check_row_labels_loop(labels, file, line, col, tab, arities)
+    # row variables in tail position carry the same labels;
+    # apply the same name + arity check.
+    ROpen(_, labels) -> check_row_labels_loop(labels, file, line, col, tab, arities)
+  }
+}
+
+fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
+                          tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  match labels {
+    [] -> []
+    [RL(r, ts), ...rest] ->
+      list_append(check_row_label(r, list_length(ts), file, line, col, tab, arities),
+                  check_row_labels_loop(rest, file, line, col, tab, arities))
+  }
+}
+
+# The arity of the effect a label names: its declaration's when the label
+# is settled, else that of the first effect declared under the name it
+# writes. `None` when no effect is declared for it.
+fn label_arity(tab: SymTab, arities: [EffArity], r: DeclRef) : Option[Int] = match r {
+  DrSym(s)              -> lookup_arity(arities, s)
+  DrWritten(None, n)    -> first_arity(arities, st_candidates(tab, NCEffect, written_text(n)))
+  DrWritten(Some(_), _) -> None
+}
+
+fn first_arity(arities: [EffArity], cands: [SymId]) : Option[Int] = match cands {
+  [] -> None
+  [s, ...rest] -> match lookup_arity(arities, s) {
+    Some(k) -> Some(k)
+    None    -> first_arity(arities, rest)
+  }
+}
+
+fn label_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(q, n) -> ref_text(q, n)
+}
+
+# Per-label name + arity check. Unknown effect → "unknown effect: X".
+# Arity mismatch → "effect 'X' expects N type argument(s), got M".
+fn check_row_label(r: DeclRef, got: Int, file: String, line: Int, col: Int,
+                    tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  let name = label_text(tab, r)
+  match label_arity(tab, arities, r) {
+    None ->
+      rs_report(mk_diag(SevError, file, line, col, "unknown effect: #{name}",
+        [ri_note(file, line, col, "only declared `effect Foo { ... }` names and the catalog (Console, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row"),
+         ri_help(file, line, col, "declare `effect #{name} { ... }` first, or fix the spelling")]))
+    Some(want) ->
+      if want == got { [] }
+      else {
+        let help = if got > want {
+            concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
+          } else {
+            concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
+          }
+        rs_report(mk_diag(SevError, file, line, col,
+          concat_all(["effect '", name, "' expects ", int_to_string(want),
+                      " type argument(s), got ", int_to_string(got)]),
+          [ri_note(file, line, col, "the parametric label must match the effect's `[...]` declaration"),
+           ri_help(file, line, col, help)]))
+      }
+  }
+}
+
+#[doc("""
+====================================================================
+Unbound type variable in signature.
+====================================================================
+
+A lowercase name a signature uses without declaring it is an implicit
+type parameter, so `fn f(x: a) : a = x` works without `[a]`. In
+`fn coerce(x: a) : b = x`, `b` appears only in the return type and
+has no value-level binding site: the caller cannot constrain it, the
+body cannot witness it, and the value silently masquerades as
+whatever the call site expects.
+
+So an implicit parameter the return type or the row labels use must
+also be used by a parameter type. One listed in `[…]` is always
+legal — the user opted in deliberately.
+""")]
+pub fn check_unbound_tyvars(decls: [Decl], df: DiagFiles, tab: SymTab) : [Diagnostic] / Console + File {
+  match decls {
+    [] -> []
+    [d, ...rest] ->
+      list_append(check_decl_unbound_tyvars(d, decl_diag_file(d, df), tab), check_unbound_tyvars(rest, df, tab))
+  }
+}
+
+fn is_compiler_synth_name(n: String) : Bool {
+  if string_length(n) < 2 { false }
+  else { match char_at(n, 0) {
+    Some(c1) -> if c1 == '_' { match char_at(n, 1) {
+      Some(c2) -> c2 == '_'
+      None -> false
+    } } else { false }
+    None -> false
+  } }
+}
+
+fn check_decl_unbound_tyvars(d: Decl, file: String, tab: SymTab) : [Diagnostic] / Console + File {
+  match d {
+    DFn(_, fid, tps, params, opt_ret, rexpr, _, line, col, _) -> {
+      let fname = written_text(sym_name(tab, fnid_sym(fid)))
+      # Synthetic compiler-generated fns (`__proto_*`, `__deriv_*`,
+      # etc.) come from desugar and may legitimately have tyvars in
+      # return-only position by construction (protocol `Self` lives
+      # only on the right of `:`). Skip them; their soundness is the
+      # desugar pass's responsibility.
+      if is_compiler_synth_name(fname) { [] }
+      else { unbound_tyvars(tps, params, opt_ret, rexpr, fname, file, line, col) }
+    }
+    DAxiom(_, _, fname, _, tps, params, ret, rexpr, line, col) ->
+      if is_compiler_synth_name(fname) { [] }
+      else { unbound_tyvars(tps, params, Some(ret), rexpr, fname, file, line, col) }
+    _ -> []
+  }
+}
+
+# Constructor-style fns whose parameters mention no implicit type
+# parameter (`pub fn empty() : Map[k, v] = ...`) are caller-elects: the
+# caller picks the return's at the use site. Only a fn that already binds
+# an implicit one through a parameter can suffer the silent-shadow shape.
+fn unbound_tyvars(tps: [TBinder], params: [Param], ret: Option[TypeExpr], row: RowExpr,
+                  fname: String, file: String, line: Int, col: Int) : [Diagnostic] / Console + File = {
+  let in_params = filter(sig_param_ids(params, None, REmpty), (id) => match tbs_find(tps, id) {
+    Some(b) -> b.implicit
+    None    -> false
+  })
+  if in_params == [] { [] } else {
+    let ret_errs = report_unbound_tyvars_in_set(sig_param_ids([], ret, REmpty), tps, in_params, fname, file, line, col, [])
+    let row_errs = report_unbound_tyvars_in_set(sig_param_ids([], None, row), tps, in_params, fname, file, line, col, [])
+    list_append(ret_errs, row_errs)
+  }
+}
+
+# A parameter the source listed is always legal; one a signature only
+# uses must be used by a parameter.
+fn report_unbound_tyvars_in_set(found: [TLocalId], tps: [TBinder], in_params: [TLocalId],
+                                 fname: String, file: String, line: Int, col: Int,
+                                 acc: [Diagnostic]) : [Diagnostic] / Console + File {
+  match found {
+    [] -> acc
+    [id, ...rest] -> {
+      let here = match tbs_find(tps, id) {
+        None    -> []
+        Some(b) -> if not b.implicit or tids_has(in_params, id) { [] } else {
+          let n = tb_text(b)
+          rs_report(mk_diag(SevError, file, line, col, "unbound type variable: `#{n}`",
+            [ri_note(file, line, col, "type variable `#{n}` appears in the return type or effect row of `fn #{fname}` but not in any parameter"),
+             ri_help(file, line, col, "introduce it as an explicit tparam (e.g. `fn #{fname}[#{n}](...) : ...`)")]))
+        }
+      }
+      report_unbound_tyvars_in_set(rest, tps, in_params, fname, file, line, col, list_append(acc, here))
+    }
+  }
+}
+
+#[doc("Render a resolver-check diagnostic and return it as the check's verdict.")]
+pub fn rs_report(d: Diagnostic) : [Diagnostic] / Console + File = {
+  render_diag(d)
+  [d]
+}
