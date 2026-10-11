@@ -332,11 +332,10 @@ test-decl-symid-survives:
 # After the resolver a declaration, a type, an effect or a local is its
 # id: no type holds a name beside it, a written name's characters leave
 # only in listed functions, a reference by text is built only before the
-# resolver, and no `==` compares a value holding a written name. A site
-# that still decides by text is a row of
-# tools/symid-census/pending-written.txt; `--final` fails while it has one.
+# resolver, and no `==` compares a value holding a written name. `--final`
+# also fails on any row of tools/symid-census/pending-written.txt.
 test-symid-names: kaic2
-	@./tools/symid-names-gate.sh
+	@./tools/symid-names-gate.sh --final
 
 # A contested declaration's emitted name is spelled by one function, from
 # its id: a second file minting a home spelling is a second rule, and the
