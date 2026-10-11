@@ -14,9 +14,12 @@ pad, which the lowering asserts in both directions.
 """)]
 
 import compiler.ast
+import compiler.operators
+import compiler.marks
 import compiler.util
 import compiler.kir
 import compiler.kir_lower
+import compiler.core_builtins
 import compiler.unwind_pend
 import compiler.emit_shared
 import compiler.unwind_pads
@@ -25,7 +28,7 @@ import compiler.unwind_pads
 pub type PadB = PadB(Option[UnwPadOpen], LowerSt)
 
 #[doc("Opens, before lowering `x`, a landing pad releasing the admitted binders among `names` not already released.")]
-pub fn lower_pad_begin(x: Expr, names: [String], st: LowerSt) : PadB = {
+pub fn lower_pad_begin(x: Expr, names: [LocalId], st: LowerSt) : PadB = {
   let outer = st.unw.pad
   let own = filter(lp_union(map(unw_admit(st.unw, names), (n) => ls_reg_of(st, n)), outer.flight), (r) => not list_has(outer.regs, r))
   match own {
@@ -34,7 +37,7 @@ pub fn lower_pad_begin(x: Expr, names: [String], st: LowerSt) : PadB = {
       lp_disjoint(own, outer.pushed, "a pad releases a register a bracket holds", x, st)
       let regs = lp_union(outer.regs, own)
       match ls_fresh_reg(st) { LSReg(pr, st1) -> {
-        let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim("kai_pad_open", map(regs, (r) => KVar(r))), kpos_of(x)))
+        let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim(KpPadOpen, map(regs, (r) => KVar(r))), kpos_of(x)))
         PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed, flight: outer.flight })))
       } }
     }
@@ -46,7 +49,7 @@ pub fn lower_pad_end(x: Expr, outer: Option[UnwPadOpen], st: LowerSt) : LowerSt 
   None -> st
   Some(o) -> {
     let back = if o.reg == "" { [] } else { [KVar(o.reg)] }
-    let st1 = ls_emit(st, KDo(KPrim("kai_pad_close", back), kpos_of(x)))
+    let st1 = ls_emit(st, KDo(KPrim(KpPadClose, back), kpos_of(x)))
     ls_with_unw(st1, unw_with_pad(st1.unw, o))
   }
 }
@@ -81,20 +84,17 @@ pub fn lower_flight_free(st: LowerSt) : [String] = {
 }
 
 #[doc("Opens, before the operator `op` of `x` runs, a landing pad that also releases the operand references it consumes, when it compares values that are not scalars: the runtime holds them while the type's own implementation runs, and a trap there leaves through no pad of its own.")]
-pub fn lower_consumed_pad(x: Expr, op: String, operands: [(Expr, KVal)], st: LowerSt) : PadB = match lp_consumed(operands, st) {
+pub fn lower_consumed_pad(x: Expr, op: BinOp, operands: [(Expr, KVal)], st: LowerSt) : PadB = match lp_consumed(operands, st) {
   [] -> PadB(None, st)
-  extra -> if lp_compares(op) and st.unw.traps and unw_op_traps(op, lp_first(operands, x)) {
+  extra -> if binop_is_comparison(op) and st.unw.traps and unw_op_traps(op, lp_first(operands, x)) {
     let outer = st.unw.pad
     match ls_fresh_reg(st) { LSReg(pr, st1) -> {
       let regs = list_append(lp_union(outer.regs, lp_minus(outer.flight, outer.pushed)), extra)
-      let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim("kai_pad_open", map(regs, (r) => KVar(r))), kpos_of(x)))
+      let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim(KpPadOpen, map(regs, (r) => KVar(r))), kpos_of(x)))
       PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed, flight: outer.flight })))
     } }
   } else { PadB(None, st) }
 }
-
-fn lp_compares(op: String) : Bool =
-  op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">="
 
 fn lp_first(operands: [(Expr, KVal)], dflt: Expr) : Expr = match operands {
   [(e, _), ..._] -> e
@@ -113,8 +113,8 @@ fn lp_consumed(operands: [(Expr, KVal)], st: LowerSt) : [String] = match operand
 
 fn lp_is_dup(e: Expr) : Bool = match e.kind {
   ECall(f, [_]) -> match f.kind {
-    EVar(n) -> match classify_callee(n) { CkDup -> true  _ -> false }
-    _ -> false
+    EMark(MkDup) -> true
+    _            -> false
   }
   _ -> false
 }
@@ -147,34 +147,35 @@ fn lp_owned_temp(x: Expr, st: LowerSt) : Bool = match x.mode {
 fn lp_fresh(x: Expr, st: LowerSt) : Bool = match x.kind {
   ECall(f, xs)          -> lp_owning_call(f, xs, st)
   EBinop(_, _, _)       -> true
-  ERecordLit(_, _, _)   -> not st.in_region
+  ERecordLit(_, _)      -> not st.in_region
   EList([_, ..._])      -> not st.in_region
   _                     -> false
 }
 
 fn lp_owning_call(f: Expr, xs: [Expr], st: LowerSt) : Bool = match f.kind {
-  EVar(n)        -> lp_owning_kind(classify_callee(n))
-  ESym(_, _, _)  -> true
-  EModCall(_, _) -> true
+  ELocal(_)      -> true
+  EOp(_)         -> true
+  ESym(s, _)     -> match builtin_of(s) {
+    Some(b) -> lp_owning_kind(classify_builtin(b))
+    None    -> true
+  }
   EMark(MkOwnedBorrow) -> match xs {
     [inner] -> lp_fresh(inner, st)
     _       -> false
   }
+  EMark(m)       -> mark_is_reuse(m) or mark_is_prim(m)
   _              -> false
 }
 
 fn lp_owning_kind(k: CalleeKind) : Bool = match k {
   CkDirect -> true
-  CkCtor   -> true
-  CkResume -> true
-  CkReuse  -> true
   _        -> false
 }
 
 fn lp_disjoint(a: [String], b: [String], what: String, x: Expr, st: LowerSt) : Unit = match a {
   [] -> ()
   [r, ...rest] -> if list_has(b, r) {
-    panic(concat_all(["kir: ", what, ": ", r, " in fn ", st.enc_fn, " at ", int_to_string(x.line), ":", int_to_string(x.col)]))
+    panic(concat_all(["kir: ", what, ": ", r, " in fn ", st.enc_fn.sym, " at ", int_to_string(x.line), ":", int_to_string(x.col)]))
   } else { lp_disjoint(rest, b, what, x, st) }
 }
 

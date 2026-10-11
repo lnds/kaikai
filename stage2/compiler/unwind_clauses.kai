@@ -1,44 +1,36 @@
 #[doc("""
 Which handler clauses can finish without resuming: those make their
 effect one that unwinds. A clause resumes only when every path through
-its body calls its continuation; a runtime default handler resumes.
+its body calls its continuation; a runtime default handler resumes. A
+clause that forwards its op to a segment handle does not: that handle
+may drop the continuation.
 """)]
 
 import compiler.ast
-import compiler.util
 import compiler.emit_shared
 import compiler.effect_default
 import compiler.expr_positions
-import compiler.sym_read
+import compiler.expr_exists
+import compiler.handler_alias
 
 #[doc("Every op clause of the program: its handlers' and its effects' default blocks.")]
 pub fn unw_clauses(cs: [ClauseInfo], decls: [Decl]) : [UnwClause] = list_append(ue_clauses(cs), ue_default_clauses(decls, []))
 
-#[doc("True when one of the effects `names` is in `set`.")]
-pub fn unw_any_effect_in(names: [String], set: [String]) : Bool = match names {
+#[doc("A handler clause: the effect it handles, its continuation's binder and its body.")]
+pub type UnwClause = UnwC(SymId, LocalId, Expr)
+
+#[doc("True when the effect declaration `s` is in `set`; an unresolved id is in none.")]
+pub fn unw_has_id(set: [Int], s: SymId) : Bool = sym_raw(s) >= 0 and unw_int_in(set, sym_raw(s))
+
+fn unw_int_in(set: [Int], x: Int) : Bool = match set {
   [] -> false
-  [n, ...rest] -> list_has(set, unw_bare_effect(n)) or unw_any_effect_in(rest, set)
+  [y, ...rest] -> y == x or unw_int_in(rest, x)
 }
-
-#[doc("The effect `e` names without its module qualifier.")]
-pub fn unw_bare_effect(e: String) : String = {
-  let d = unw_last_dot(e)
-  if d < 0 { e } else { string_slice(e, d + 1, string_length(e) - d - 1) }
-}
-
-#[doc("Index of the last `.` in `s`, or -1.")]
-pub fn unw_last_dot(s: String) : Int = ue_dot_before(s, string_length(s) - 1)
-
-fn ue_dot_before(s: String, i: Int) : Int =
-  if i < 0 or string_byte_at_int(s, i) == 46 { i } else { ue_dot_before(s, i - 1) }
-
-#[doc("A handler clause: its effect, its continuation's name and its body.")]
-pub type UnwClause = UnwC(String, String, Expr)
 
 fn ue_clauses(cs: [ClauseInfo]) : [UnwClause] = match cs {
   [] -> []
-  [CI(_, _, eff, _, params, body, _, _, _, _, _), ...rest] -> match ue_resume_name(params) {
-    Some(k) -> [UnwC(unw_bare_effect(eff), k, body), ...ue_clauses(rest)]
+  [CI(_, _, _, _, params, body, _, _, _, _, esym), ...rest] -> match ue_continuation(params) {
+    Some(k) -> [UnwC(esym, k, body), ...ue_clauses(rest)]
     None    -> ue_clauses(rest)
   }
 }
@@ -49,11 +41,11 @@ pub fn unw_handle_clauses(decls: [Decl]) : [UnwClause] = ue_default_clauses(decl
 fn ue_decls_handles(decls: [Decl], acc: [UnwClause]) : [UnwClause] = match decls {
   [] -> acc
   [d, ...rest] -> ue_decls_handles(rest, match d {
-    DFn(_, _, _, _, _, _, body, _, _, _, _) -> ue_handles(body, acc)
+    DFn(_, _, _, _, _, _, body, _, _, _) -> ue_handles(body, acc)
     DTest(_, body, _, _, _)     -> ue_handles(body, acc)
     DBench(_, body, _, _, _)    -> ue_handles(body, acc)
     DCheck(_, _, body, _, _, _) -> ue_handles(body, acc)
-    DConst(_, _, _, init, _, _, _, _) -> ue_handles(init, acc)
+    DConst(_, _, _, init, _, _, _) -> ue_handles(init, acc)
     DImpl(_, _, _, inner, _, _, _, _) -> ue_decls_handles(inner, acc)
     _ -> acc
   })
@@ -61,7 +53,7 @@ fn ue_decls_handles(decls: [Decl], acc: [UnwClause]) : [UnwClause] = match decls
 
 fn ue_handles(e: Expr, acc: [UnwClause]) : [UnwClause] = {
   let here = match e.kind {
-    EHandle(_, eff, _, _, _, _, hcs, _) -> ue_hclauses(eff, hcs, acc)
+    EHandle(_, eff, _, _, _, hcs, _) -> ue_hclauses(ref_sym(eff), hcs, acc)
     _ -> acc
   }
   ue_handles_in(xp_positions(e), here)
@@ -75,44 +67,59 @@ fn ue_handles_in(ps: [XPos], acc: [UnwClause]) : [UnwClause] = match ps {
 fn ue_default_clauses(decls: [Decl], acc: [UnwClause]) : [UnwClause] = match decls {
   [] -> acc
   [d, ...rest] -> match d {
-    DEffect(_, name, _, _, Some(DBlk(hcs, _, _, _)), _, _, _, _) ->
-      ue_default_clauses(rest, ue_hclauses(name, hcs, acc))
+    DEffect(_, esym, _, _, Some(DBlk(hcs, _, _, _)), _, _, _) ->
+      ue_default_clauses(rest, ue_hclauses(esym, hcs, acc))
     _ -> ue_default_clauses(rest, acc)
   }
 }
 
-fn ue_hclauses(eff: String, hcs: [HClause], acc: [UnwClause]) : [UnwClause] = match hcs {
+fn ue_hclauses(es: SymId, hcs: [HClause], acc: [UnwClause]) : [UnwClause] = match hcs {
   [] -> acc
-  [HC(_, params, body, _, _), ...rest] -> match ue_resume_name(params) {
-    Some(k) -> ue_hclauses(eff, rest, [UnwC(unw_bare_effect(eff), k, body), ...acc])
-    None    -> ue_hclauses(eff, rest, acc)
+  [HC(_, params, body, _, _), ...rest] -> match ue_continuation(params) {
+    Some(k) -> ue_hclauses(es, rest, [UnwC(es, k, body), ...acc])
+    None    -> ue_hclauses(es, rest, acc)
   }
 }
 
 # An op clause's continuation is its last parameter; `finally { }` has none.
-fn ue_resume_name(ps: [Param]) : Option[String] = match ps {
+fn ue_continuation(ps: [Param]) : Option[LocalId] = match ps {
   []           -> None
-  [p]          -> Some(p.pname)
-  [_, ...rest] -> ue_resume_name(rest)
+  [p]          -> Some(p.binder.id)
+  [_, ...rest] -> ue_continuation(rest)
 }
 
-#[doc("`acc` plus every effect one of the clauses `hs` can finish without resuming.")]
-pub fn unw_abandoning(hs: [UnwClause], acc: [String]) : [String] = match hs {
+#[doc("True when `f` reads the continuation `k` of the clause it is in: the clause's own binder, or the binder every settled continuation call carries.")]
+pub fn unw_reads_continuation(f: Expr, k: LocalId) : Bool = match f.kind {
+  ELocal(l) -> local_eq(l, k) or local_eq(l, local_minted(canonical_continuation()))
+  _         -> false
+}
+
+#[doc("`acc` plus the id of every effect one of the clauses `hs` can finish without resuming.")]
+pub fn unw_abandoning(hs: [UnwClause], acc: [Int]) : [Int] = match hs {
   [] -> acc
   [UnwC(eff, k, body), ...rest] ->
-    if list_has(acc, eff) or ue_resumes(body, k) { unw_abandoning(rest, acc) }
-    else { unw_abandoning(rest, [eff, ...acc]) }
+    if sym_raw(eff) < 0 or unw_has_id(acc, eff) or ue_clause_resumes(body, k) { unw_abandoning(rest, acc) }
+    else { unw_abandoning(rest, [sym_raw(eff), ...acc]) }
+}
+
+# A segment request may never come back: the body it suspends unwinds
+# there when the handle drops the continuation.
+fn ue_clause_resumes(body: Expr, k: LocalId) : Bool = not xp_exists(body, true, ue_is_request) and ue_resumes(body, k)
+
+fn ue_is_request(e: Expr) : Bool = match e.kind {
+  EIntrinsic(InSegRequest, _) -> true
+  _ -> false
 }
 
 # Every path through `e` calls the continuation `k`. A runtime default
 # handler resumes; the one that does not, `Cancel`'s, is counted apart.
-fn ue_resumes(e: Expr, k: String) : Bool = match extern_handler_c_symbol(e) {
+fn ue_resumes(e: Expr, k: LocalId) : Bool = match extern_handler_c_symbol(e) {
   Some(_) -> true
   None    -> ue_resumes_kind(e, k)
 }
 
-fn ue_resumes_kind(e: Expr, k: String) : Bool = match e.kind {
-  ECall(f, xs) -> (match sym_read_kind(f.kind) { EVar(n) -> n == k _ -> false }) or ue_any_resumes(xs, k)
+fn ue_resumes_kind(e: Expr, k: LocalId) : Bool = match e.kind {
+  ECall(f, xs) -> unw_reads_continuation(f, k) or ue_any_resumes(xs, k)
   EBlock(ss, ot) -> ue_stmts_resume(ss, k) or (match ot { Some(t) -> ue_resumes(t, k) None -> false })
   EIf(c, t, oe) -> ue_resumes(c, k) or (match oe {
     Some(el) -> ue_resumes(t, k) and ue_resumes(el, k)
@@ -122,12 +129,12 @@ fn ue_resumes_kind(e: Expr, k: String) : Bool = match e.kind {
   _ -> false
 }
 
-fn ue_any_resumes(xs: [Expr], k: String) : Bool = match xs {
+fn ue_any_resumes(xs: [Expr], k: LocalId) : Bool = match xs {
   [] -> false
   [x, ...rest] -> ue_resumes(x, k) or ue_any_resumes(rest, k)
 }
 
-fn ue_stmts_resume(ss: [Stmt], k: String) : Bool = match ss {
+fn ue_stmts_resume(ss: [Stmt], k: LocalId) : Bool = match ss {
   [] -> false
   [s, ...rest] -> (match s {
     SLet(_, _, rhs) -> ue_resumes(rhs, k)
@@ -136,7 +143,7 @@ fn ue_stmts_resume(ss: [Stmt], k: String) : Bool = match ss {
   }) or ue_stmts_resume(rest, k)
 }
 
-fn ue_arms_resume(arms: [Arm], k: String) : Bool = match arms {
+fn ue_arms_resume(arms: [Arm], k: LocalId) : Bool = match arms {
   [] -> true
   [Arm(_, _, b), ...rest] -> ue_resumes(b, k) and ue_arms_resume(rest, k)
 }

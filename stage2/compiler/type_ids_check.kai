@@ -13,44 +13,57 @@ import compiler.ast
 import compiler.expr_positions
 import compiler.effect_instance
 import compiler.util
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.scalar_ty
 
 #[doc("Report each unstamped written name of a declared type; the exit status is the number found.")]
-pub fn check_type_ids(decls: [Decl]) : Int / Console = {
-  let declared = tic_declared(decls, [])
-  let found = tic_decls(decls, declared)
+pub fn check_type_ids(decls: [Decl], tab: SymTab) : Int / Console = {
+  let declared = tic_declared(decls, tab, [])
+  let found = tic_decls(decls, tab, declared)
   each(found, (m) => eprint(m))
   list_length(found)
 }
 
-fn tic_declared(ds: [Decl], acc: [String]) : [String] = match ds {
+# The names a written type could still spell a declaration with.
+fn tic_declared(ds: [Decl], tab: SymTab, acc: [String]) : [String] = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> tic_declared([inner, ...rest], acc)
+    Some(inner) -> tic_declared([inner, ...rest], tab, acc)
     None -> match d {
-      DType(_, nm, _, body, _, _, _, _, _) -> match body {
-        TBAlias(_)       -> tic_declared(rest, acc)
-        TBEffectAlias(_) -> tic_declared(rest, acc)
-        _                -> tic_declared(rest, [nm, ...acc])
+      DType(_, s, _, body, _, _, _, _) -> match body {
+        TBAlias(_)       -> tic_declared(rest, tab, acc)
+        TBEffectAlias(_) -> tic_declared(rest, tab, acc)
+        _                -> tic_declared(rest, tab, [written_text(decl_name(tab, s)), ...acc])
       }
-      _ -> tic_declared(rest, acc)
+      _ -> tic_declared(rest, tab, acc)
     }
   }
 }
 
-fn tic_decls(ds: [Decl], declared: [String]) : [String] = match ds {
+fn tic_decls(ds: [Decl], tab: SymTab, declared: [String]) : [String] = match ds {
   [] -> []
-  [d, ...rest] -> list_append(tic_decl(d, declared), tic_decls(rest, declared))
+  [d, ...rest] -> list_append(tic_decl(d, tab, declared), tic_decls(rest, tab, declared))
 }
 
-fn tic_decl(d: Decl, declared: [String]) : [String] = match d {
-  DFn(_, nm, _, _, _, row, body, _, _, _, _) -> {
-    let cx = TicCx { fname: nm, declared: declared, tparams: decl_tparams(d) }
-    list_append(tic_row(row, cx), tic_expr(body, cx))
+fn tic_decl(d: Decl, tab: SymTab, declared: [String]) : [String] = match d {
+  DFn(_, fid, _, ps, ret, row, body, _, _, _) -> {
+    let cx = TicCx { fname: written_text(decl_name(tab, fnid_sym(fid))), declared: declared, tparams: decl_tparams(d) }
+    list_append(tic_sig(ps, ret, cx), list_append(tic_row(row, cx), tic_expr(body, cx)))
   }
   _ -> []
 }
 
 type TicCx = { fname: String, declared: [String], tparams: [String] }
+
+fn tic_sig(ps: [Param], ret: Option[TypeExpr], cx: TicCx) : [String] =
+  list_append(flat_map(ps, (p) => tic_opt(p.ptype, cx)), tic_opt(ret, cx))
+
+fn tic_opt(o: Option[TypeExpr], cx: TicCx) : [String] = match o {
+  Some(te) -> tic_te(te, cx)
+  None     -> []
+}
 
 fn tic_row(row: RowExpr, cx: TicCx) : [String] = match row {
   REmpty       -> []
@@ -59,24 +72,26 @@ fn tic_row(row: RowExpr, cx: TicCx) : [String] = match row {
 }
 
 fn tic_label(l: RowLabel, cx: TicCx) : [String] = match l {
-  RL(_, args, _) -> flat_map(args, (a) => tic_te(a, cx))
+  RL(_, args) -> flat_map(args, (a) => tic_te(a, cx))
 }
 
 fn tic_te(te: TypeExpr, cx: TicCx) : [String] = match te.tkind {
-  TyName(r, n, args) -> list_append(tic_name(r, n, te, cx), flat_map(args, (a) => tic_te(a, cx)))
+  TyName(r, args)    -> list_append(tic_name(r, te, cx), flat_map(args, (a) => tic_te(a, cx)))
   TyList(inner)      -> tic_te(inner, cx)
   TyFn(ps, ret, row) -> list_append(flat_map(ps, (p) => tic_te(p, cx)), list_append(tic_te(ret, cx), tic_row(row, cx)))
   TyDim(b, _)        -> tic_te(b, cx)
   _                  -> []
 }
 
-fn tic_name(r: TyRef, n: String, te: TypeExpr, cx: TicCx) : [String] =
-  if sym_raw(ty_ref_sym(r)) >= 0 or not list_has(cx.declared, n) or list_has(cx.tparams, n) { [] }
+fn tic_name(r: DeclRef, te: TypeExpr, cx: TicCx) : [String] = {
+  let n = ref_spelled(r)
+  if ref_resolved(r) or not list_has(cx.declared, n) or list_has(cx.tparams, n) { [] }
   else { [concat_all(["unstamped type ", n, " in ", cx.fname, " at line ", int_to_string(te.line)])] }
+}
 
 fn tic_expr(e: Expr, cx: TicCx) : [String] = {
   let own = match e.kind {
-    EHandle(_, _, _, tas, _, _, _, _) -> flat_map(tas, (a) => tic_te(a, cx))
+    EHandle(_, _, tas, _, _, _, _) -> flat_map(tas, (a) => tic_te(a, cx))
     _ -> []
   }
   list_append(own, flat_map(xp_positions(e), (p) => match p { XP(_, c) -> tic_expr(c, cx) }))

@@ -4,7 +4,8 @@
 
 import compiler.ast
 import compiler.modules
-import compiler.home_spell
+import compiler.symtab
+import compiler.written
 
 #[doc("""
 One privacy-table entry: a top-level symbol, its home module, its
@@ -15,37 +16,57 @@ implicitly-bound type variables fall through to the table and would
 match a same-named `fn` of another module.
 """)]
 pub type PaEntry = { name: String, home: String, is_pub: Bool,
-      is_ty: Bool, kind: String }
+      is_ty: Bool, kind: PaKind }
+
+#[doc("What a privacy-table entry declares.")]
+pub type PaKind = PkFn | PkConst | PkType | PkEffect | PkProtocol | PkUnit
+  | PkCtor | PkOp | PkMethod
+
+#[doc("The word a diagnostic names an entry's kind by.")]
+pub fn pa_kind_word(k: PaKind) : String = match k {
+  PkFn       -> "fn"
+  PkConst    -> "const"
+  PkType     -> "type"
+  PkEffect   -> "effect"
+  PkProtocol -> "protocol"
+  PkUnit     -> "unit"
+  PkCtor     -> "ctor"
+  PkOp       -> "op"
+  PkMethod   -> "method"
+}
 
 type PaProtoVis = PPV(String, Bool)
 
 #[doc("The privacy table for the given segments, in source order.")]
-pub fn pa_table(segs: [CoreSegment]) : [PaEntry] =
-  list_reverse(pa_entries_segs(segs, pa_protos_segs(segs, []), []))
+pub fn pa_table(segs: [CoreSegment], tab: SymTab) : [PaEntry] =
+  list_reverse(pa_entries_segs(segs, tab, pa_protos_segs(segs, tab, []), []))
 
 # ==== table ====
 
-fn pa_protos_segs(segs: [CoreSegment], acc: [PaProtoVis]) : [PaProtoVis] =
+fn pa_protos_segs(segs: [CoreSegment], tab: SymTab, acc: [PaProtoVis]) : [PaProtoVis] =
   match segs {
     [] -> acc
-    [PSeg(_, ds), ...rest] -> pa_protos_segs(rest, pa_protos_decls(ds, acc))
+    [PSeg(_, ds), ...rest] -> pa_protos_segs(rest, tab, pa_protos_decls(ds, tab, acc))
   }
 
-fn pa_protos_decls(ds: [Decl], acc: [PaProtoVis]) : [PaProtoVis] = match ds {
+fn pa_protos_decls(ds: [Decl], tab: SymTab, acc: [PaProtoVis]) : [PaProtoVis] = match ds {
   [] -> acc
-  [d, ...rest] -> pa_protos_decls(rest, pa_proto_one(d, acc))
+  [d, ...rest] -> pa_protos_decls(rest, tab, pa_proto_one(d, tab, acc))
 }
 
-fn pa_proto_one(d: Decl, acc: [PaProtoVis]) : [PaProtoVis] = match d {
-  DProtocol(is_pub, name, _, _, _, _, _, _) -> [PPV(name, is_pub), ...acc]
-  DDerive(_, inner, _, _)    -> pa_proto_one(inner, acc)
-  DUnstable(inner, _, _)     -> pa_proto_one(inner, acc)
-  DProtoLaws(_, inner, _, _, _) -> pa_proto_one(inner, acc)
-  DImplAxiom(_, inner, _, _, _) -> pa_proto_one(inner, acc)
-  DConstructor(inner, _, _)  -> pa_proto_one(inner, acc)
-  DDoc(_, _, inner, _, _)    -> pa_proto_one(inner, acc)
+fn pa_proto_one(d: Decl, tab: SymTab, acc: [PaProtoVis]) : [PaProtoVis] = match d {
+  DProtocol(is_pub, s, _, _, _, _, _) -> [PPV(pa_name(tab, s), is_pub), ...acc]
+  DDerive(_, inner, _, _)    -> pa_proto_one(inner, tab, acc)
+  DUnstable(inner, _, _)     -> pa_proto_one(inner, tab, acc)
+  DProtoLaws(_, inner, _, _, _) -> pa_proto_one(inner, tab, acc)
+  DImplAxiom(_, inner, _, _, _) -> pa_proto_one(inner, tab, acc)
+  DConstructor(inner, _, _)  -> pa_proto_one(inner, tab, acc)
+  DDoc(_, _, inner, _, _)    -> pa_proto_one(inner, tab, acc)
   _ -> acc
 }
+
+# The name the table keys a declaration by: the one it was written with.
+fn pa_name(tab: SymTab, s: SymId) : String = written_text(sym_name(tab, s))
 
 # `pub` wins across same-name protocols; an unknown protocol keeps
 # its impl methods visible (the impl itself is diagnosed separately).
@@ -61,85 +82,83 @@ fn pa_proto_pub_loop(protos: [PaProtoVis], name: String,
     else { pa_proto_pub_loop(rest, name, false, true) }
 }
 
-fn pa_entries_segs(segs: [CoreSegment], protos: [PaProtoVis],
+fn pa_entries_segs(segs: [CoreSegment], tab: SymTab, protos: [PaProtoVis],
       acc: [PaEntry]) : [PaEntry] = match segs {
   [] -> acc
   [PSeg(mod_name, ds), ...rest] ->
-    pa_entries_segs(rest, protos, pa_entries_decls(ds, mod_name, protos, acc))
+    pa_entries_segs(rest, tab, protos, pa_entries_decls(ds, tab, mod_name, protos, acc))
 }
 
-fn pa_entries_decls(ds: [Decl], home: String, protos: [PaProtoVis],
+fn pa_entries_decls(ds: [Decl], tab: SymTab, home: String, protos: [PaProtoVis],
       acc: [PaEntry]) : [PaEntry] = match ds {
   [] -> acc
-  [d, ...rest] -> pa_entries_decls(rest, home, protos,
-      pa_entry_one(d, home, protos, acc))
+  [d, ...rest] -> pa_entries_decls(rest, tab, home, protos,
+      pa_entry_one(d, tab, home, protos, acc))
 }
 
 fn pa_entry(name: String, home: String, is_pub: Bool, is_ty: Bool,
-      kind: String) : PaEntry =
+      kind: PaKind) : PaEntry =
   PaEntry { name: name, home: home, is_pub: is_pub, is_ty: is_ty, kind: kind }
 
-fn pa_entry_one(d: Decl, home: String, protos: [PaProtoVis],
+fn pa_entry_one(d: Decl, tab: SymTab, home: String, protos: [PaProtoVis],
       acc: [PaEntry]) : [PaEntry] = match d {
-  DFn(is_pub, name, _, _, _, _, _, _, _, _, _) ->
-    [pa_entry(name, home, is_pub, false, "fn"), ...acc]
+  DFn(is_pub, fid, _, _, _, _, _, _, _, _) ->
+    [pa_entry(pa_name(tab, fnid_sym(fid)), home, is_pub, false, PkFn), ...acc]
   DAxiom(is_pub, _, name, _, _, _, _, _, _, _) ->
-    [pa_entry(name, home, is_pub, false, "fn"), ...acc]
-  DConst(is_pub, name, _, _, _, _, _, _) ->
-    [pa_entry(name, home, is_pub, false, "const"), ...acc]
+    [pa_entry(name, home, is_pub, false, PkFn), ...acc]
+  DConst(is_pub, s, _, _, _, _, _) ->
+    [pa_entry(pa_name(tab, s), home, is_pub, false, PkConst), ...acc]
   # A sum type's variant ctors share the type's `pub`-ness. Ctors sit
   # in both namespaces (`Some(x)` in expressions, reachable through
   # the type in signatures) — registered as type entries so both
   # resolution modes see them.
-  DType(is_pub, name, _, body, _, _, mo, _, _) ->
-    pa_type_entries(name, body, home, is_pub, mo, acc)
-  DEffect(is_pub, name, _, _, _, _, _, _, _) ->
-    [pa_entry(name, home, is_pub, true, "effect"), ...acc]
+  DType(is_pub, s, _, body, _, _, _, _) ->
+    pa_type_entries(tab, s, body, home, is_pub, acc)
+  DEffect(is_pub, s, _, _, _, _, _, _) ->
+    [pa_entry(pa_name(tab, s), home, is_pub, true, PkEffect), ...acc]
   # Protocol ops are callable by bare name through the dispatcher, so
   # each op is a value entry carrying the protocol's `pub`-ness.
-  DProtocol(is_pub, name, _, ops, _, _, _, _) ->
+  DProtocol(is_pub, s, _, ops, _, _, _) ->
     pa_op_entries(ops, home, is_pub,
-      [pa_entry(name, home, is_pub, true, "protocol"), ...acc])
+      [pa_entry(pa_name(tab, s), home, is_pub, true, PkProtocol), ...acc])
   DUnit(is_pub, name, _, _, _, _, _) ->
-    [pa_entry(name, home, is_pub, true, "unit"), ...acc]
+    [pa_entry(name, home, is_pub, true, PkUnit), ...acc]
   # Impl methods dispatch cross-module through the protocol; they are
   # as visible as the protocol they implement.
-  DImpl(pname, _, _, subs, _, _, _, _) ->
-    pa_method_entries(subs, home, pa_proto_pub(protos, pname), acc)
-  DDerive(_, inner, _, _)    -> pa_entry_one(inner, home, protos, acc)
-  DUnstable(inner, _, _)     -> pa_entry_one(inner, home, protos, acc)
-  DProtoLaws(_, inner, _, _, _) -> pa_entry_one(inner, home, protos, acc)
-  DImplAxiom(_, inner, _, _, _) -> pa_entry_one(inner, home, protos, acc)
-  DConstructor(inner, _, _)  -> pa_entry_one(inner, home, protos, acc)
-  DDoc(_, _, inner, _, _)    -> pa_entry_one(inner, home, protos, acc)
+  DImpl(proto, _, _, subs, _, _, _, _) ->
+    pa_method_entries(subs, tab, home, pa_impl_pub(protos, tab, proto), acc)
+  DDerive(_, inner, _, _)    -> pa_entry_one(inner, tab, home, protos, acc)
+  DUnstable(inner, _, _)     -> pa_entry_one(inner, tab, home, protos, acc)
+  DProtoLaws(_, inner, _, _, _) -> pa_entry_one(inner, tab, home, protos, acc)
+  DImplAxiom(_, inner, _, _, _) -> pa_entry_one(inner, tab, home, protos, acc)
+  DConstructor(inner, _, _)  -> pa_entry_one(inner, tab, home, protos, acc)
+  DDoc(_, _, inner, _, _)    -> pa_entry_one(inner, tab, home, protos, acc)
   _ -> acc
 }
 
-fn pa_type_entries(name: String, body: TypeBody, home: String,
-      is_pub: Bool, mo: Option[String], acc: [PaEntry]) : [PaEntry] = {
-  # A transparent alias is home-spelled at birth, but an out-of-module
-  # reference to a private one stays bare (the ladder only spells legal
-  # refs) — register the display spelling too, or a privacy violation
-  # against a private alias in another module goes unseen.
-  let a0 = match body {
-    TBAlias(_) ->
-      if hs_display(name, mo) == name { acc }
-      else { [pa_entry(hs_display(name, mo), home, is_pub, true, "type"), ...acc] }
-    _ -> acc
-  }
-  let a1 = [pa_entry(name, home, is_pub, true, "type"), ...a0]
+# The protocol an impl names: a settled head answers for its declaration,
+# a bare one by name, and a qualified one keeps its methods visible.
+fn pa_impl_pub(protos: [PaProtoVis], tab: SymTab, proto: DeclRef) : Bool = match proto {
+  DrSym(s)              -> not st_valid(tab, s) or sym_exported(tab, s)
+  DrWritten(Some(_), _) -> true
+  DrWritten(None, n)    -> pa_proto_pub(protos, written_text(n))
+}
+
+fn pa_type_entries(tab: SymTab, s: SymId, body: TypeBody, home: String,
+      is_pub: Bool, acc: [PaEntry]) : [PaEntry] = {
+  let a1 = [pa_entry(pa_name(tab, s), home, is_pub, true, PkType), ...acc]
   match body {
-    TBSum(vs) -> pa_ctor_entries(vs, home, is_pub, a1)
+    TBSum(vs) -> pa_ctor_entries(vs, tab, home, is_pub, a1)
     _ -> a1
   }
 }
 
-fn pa_ctor_entries(vs: [Variant], home: String, is_pub: Bool,
+fn pa_ctor_entries(vs: [Variant], tab: SymTab, home: String, is_pub: Bool,
       acc: [PaEntry]) : [PaEntry] = match vs {
   [] -> acc
-  [Var(cname, _), ...rest] ->
-    pa_ctor_entries(rest, home, is_pub,
-      [pa_entry(cname, home, is_pub, true, "ctor"), ...acc])
+  [Var(c, _), ...rest] ->
+    pa_ctor_entries(rest, tab, home, is_pub,
+      [pa_entry(pa_name(tab, c), home, is_pub, true, PkCtor), ...acc])
 }
 
 fn pa_op_entries(ops: [ProtoOp], home: String, is_pub: Bool,
@@ -147,17 +166,17 @@ fn pa_op_entries(ops: [ProtoOp], home: String, is_pub: Bool,
   [] -> acc
   [POp(name, _, _, _, _, _), ...rest] ->
     pa_op_entries(rest, home, is_pub,
-      [pa_entry(name, home, is_pub, false, "op"), ...acc])
+      [pa_entry(name, home, is_pub, false, PkOp), ...acc])
 }
 
-fn pa_method_entries(ms: [Decl], home: String, is_pub: Bool,
+fn pa_method_entries(ms: [Decl], tab: SymTab, home: String, is_pub: Bool,
       acc: [PaEntry]) : [PaEntry] = match ms {
   [] -> acc
   [m, ...rest] -> match m {
-    DFn(_, name, _, _, _, _, _, _, _, _, _) ->
-      pa_method_entries(rest, home, is_pub,
-      [pa_entry(name, home, is_pub, false, "method"), ...acc])
-    _ -> pa_method_entries(rest, home, is_pub, acc)
+    DFn(_, fid, _, _, _, _, _, _, _, _) ->
+      pa_method_entries(rest, tab, home, is_pub,
+      [pa_entry(pa_name(tab, fnid_sym(fid)), home, is_pub, false, PkMethod), ...acc])
+    _ -> pa_method_entries(rest, tab, home, is_pub, acc)
   }
 }
 

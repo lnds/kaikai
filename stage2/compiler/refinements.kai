@@ -50,11 +50,14 @@
 import compiler.util
 import compiler.chars
 import compiler.ast
+import compiler.operators
+import compiler.marks
 import compiler.intervals
 import compiler.refine_help
-import compiler.fmt
 import compiler.fmt_refine
 import compiler.expr_positions
+import compiler.written
+import compiler.refine_types
 
 # m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
 # alias. Centralised so the call-site builder and the post-parse
@@ -62,6 +65,30 @@ import compiler.expr_positions
 #[doc("Mint the synthesised predicate-fn name for a refinement-type alias (`__ref_pred_<Type>`).")]
 pub fn synth_refine_pred_fn_name(tyname: String) : String =
   string_concat("__ref_pred_", tyname)
+
+# What a predicate ranges over: a name as the parser wrote it, before
+# the resolver, or a local binder.
+type PredVar = PvName(Written) | PvLocal(LocalId)
+
+fn pv_self() : PredVar = PvLocal(pred_self())
+
+# `self` as the parser wrote it.
+fn pv_written_self() : PredVar = PvName(pred_self_binder().name)
+
+# Text decides only before the resolver, where no id exists.
+fn name_is(w: Written, s: String) : Bool = written_text(w) == s
+
+fn pv_is(v: PredVar, e: Expr) : Bool = match e.kind {
+  EName(w) -> match v {
+    PvName(n)  -> written_text(w) == written_text(n)
+    PvLocal(_) -> false
+  }
+  ELocal(l) -> match v {
+    PvLocal(k) -> local_eq(l, k)
+    PvName(_)  -> false
+  }
+  _ -> false
+}
 
 # m12.6.b: desugar contracts into asserts inside the body. The
 # semantics are:
@@ -74,11 +101,11 @@ pub fn synth_refine_pred_fn_name(tyname: String) : String =
 # returned unchanged so functions without contracts cost nothing.
 #[doc("Desugar a fn body, wrapping it in requires/ensures asserts; returns the body unchanged when both contract lists are empty.")]
 pub fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
-                       params: [Param], fn_name: String,
+                       params: [Param], fn_name: Written,
                        line: Int, col: Int) : Expr {
   if reqs == [] and enss == [] { body } else {
     let pp = collect_param_preds(params, [])
-    let req_stmts = preds_to_asserts(reqs, [], "requires", pp, fn_name, params)
+    let req_stmts = preds_to_asserts(reqs, [], CkRequires, pp, fn_name, params)
     if enss == [] {
       if req_stmts == [] { body }
       else { mk_expr(EBlock(req_stmts, Some(body)), line, col) }
@@ -86,12 +113,12 @@ pub fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
       # m12.6.c: bind `result` to the body's value so `ensures`
       # predicates can reference it. The shape is
       #   { req_asserts; let result = body; ens_asserts; result }
-      let bind_pat = mk_pat(PBind("result"), line, col)
+      let bind_pat = mk_pat(PBind(binder_written("result")), line, col)
       let bind = SLet(bind_pat, None, body)
-      let ens_stmts = preds_to_asserts(enss, [], "ensures", pp, fn_name, params)
+      let ens_stmts = preds_to_asserts(enss, [], CkEnsures, pp, fn_name, params)
       if req_stmts == [] and ens_stmts == [] { body }
       else {
-        let res_var = mk_ref("result", line, col)
+        let res_var = mk_name("result", line, col)
         let stmts = list_append(req_stmts, [bind, ...ens_stmts])
         mk_expr(EBlock(stmts, Some(res_var)), line, col)
       }
@@ -99,8 +126,17 @@ pub fn wrap_with_contracts(body: Expr, reqs: [Expr], enss: [Expr],
   }
 }
 
-fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
-                     param_preds: [ParamPred], fn_name: String,
+#[doc("The contract clause an assert was lowered from.")]
+pub type ContractKind = CkRequires | CkEnsures
+
+#[doc("The keyword a contract clause is written with.")]
+pub fn contract_kind_word(k: ContractKind) : String = match k {
+  CkRequires -> "requires"
+  CkEnsures  -> "ensures"
+}
+
+fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: ContractKind,
+                     param_preds: [ParamPred], fn_name: Written,
                      params: [Param]) : [Stmt] {
   match preds {
     [] -> list_reverse(acc)
@@ -143,13 +179,13 @@ fn preds_to_asserts(preds: [Expr], acc: [Stmt], kind: String,
 # `"requires violated` / `"ensures violated` prefix is kept so the
 # detectors at extract_requires_asserts / contract_assert_kind still
 # classify the assert as contract-derived.
-fn build_violation_msg_span(kind: String, fn_name: String, p: Expr,
+fn build_violation_msg_span(kind: ContractKind, fn_name: Written, p: Expr,
                             params: [Param]) : String {
-  let pred_text = escape_str_body_for_c(fmt_expr_text(p))
-  let fn_text = escape_str_body_for_c(fn_name)
+  let ptext = escape_str_body_for_c(pred_text(p))
+  let fn_text = escape_str_body_for_c(written_text(fn_name))
   concat_all([
-    "\"", kind, " violated in `", fn_text, "`",
-    "\\nrequired: ", pred_text,
+    "\"", contract_kind_word(kind), " violated in `", fn_text, "`",
+    "\\nrequired: ", ptext,
     "\\ndeclared at line ", int_to_string(p.line),
     ", col ", int_to_string(p.col),
     violation_help_suffix(kind, p, params), "\""
@@ -163,12 +199,12 @@ fn build_violation_msg_span(kind: String, fn_name: String, p: Expr,
 # param, so they never match and fall through to "". The base type comes
 # from the offending param's declared annotation (see refine_help.kai),
 # so an unannotated param also yields "" — piece-1 with no regression.
-fn violation_help_suffix(kind: String, p: Expr, params: [Param]) : String {
-  if kind != "requires" { "" }
-  else { match contract_single_ident(p) {
+fn violation_help_suffix(kind: ContractKind, p: Expr, params: [Param]) : String = match kind {
+  CkEnsures  -> ""
+  CkRequires -> match contract_single_ident(p) {
     None -> ""
     Some(ident) -> requires_help_line(ident, p, params)
-  } }
+  }
 }
 
 # m12.6.x #2: collect every refinement predicate that appears on a
@@ -179,7 +215,7 @@ fn violation_help_suffix(kind: String, p: Expr, params: [Param]) : String {
 # back to the user-written param name on the requires side, and lets
 # Issue #83's alpha + operator + interval entailment rewrite `self`
 # to the param name on the fly before comparing canonical forms.
-type ParamPred = PPair(String, Expr)
+type ParamPred = PPair(Written, Expr)
 #                       ^pname  ^pred ast
 
 fn collect_param_preds(params: [Param], acc: [ParamPred]) : [ParamPred] {
@@ -187,7 +223,7 @@ fn collect_param_preds(params: [Param], acc: [ParamPred]) : [ParamPred] {
     [] -> list_reverse(acc)
     [p, ...rest] -> match p.ptype {
       Some(t) -> match t.tkind {
-        TyRefine(_, pred) -> collect_param_preds(rest, [PPair(p.pname, pred), ...acc])
+        TyRefine(_, pred) -> collect_param_preds(rest, [PPair(p.binder.name, pred), ...acc])
         _ -> collect_param_preds(rest, acc)
       }
       None -> collect_param_preds(rest, acc)
@@ -214,10 +250,10 @@ fn pred_entailed_by_params(pred: Expr, param_preds: [ParamPred]) : Bool {
         if expr_struct_eq(pred, pp_expr) { true }
         else if regex_pred_subsumed(pred, pname, pp_expr) { true }
         else {
-          let canon_req = pred_canon(pred)
-          let canon_ref = pred_canon(subst_self(pp_expr, pname))
+          let canon_req = canon(pred, true)
+          let canon_ref = canon(subst_written_self(pp_expr, pname), true)
           if expr_struct_eq(canon_req, canon_ref) { true }
-          else if pred_entailed_by_refinement(canon_req, pname, canon_ref) { true }
+          else if pred_entailed_by_refinement(canon_req, PvName(pname), canon_ref) { true }
           else { pred_entailed_by_params(pred, rest) }
         }
       }
@@ -249,12 +285,12 @@ fn pred_entailed_by_params(pred: Expr, param_preds: [ParamPred]) : Bool {
 # structural matcher does no NFA->DFA construction, the bound never
 # fires in v1 — but the entry point keeps the same fail-closed
 # contract: `false` (= keep the assert) when in doubt.
-fn regex_pred_subsumed(pred: Expr, pname: String, param_pred: Expr) : Bool {
+fn regex_pred_subsumed(pred: Expr, pname: Written, param_pred: Expr) : Bool {
   # Requires-side: the user-written receiver must equal the parameter
   # name. Param-side: the receiver is the parser-inserted `self`.
-  match pred_regex_pattern_named(pred, pname) {
+  match pred_regex_pattern_named(pred, PvName(pname)) {
     None -> false
-    Some(loose) -> match pred_regex_pattern_named(param_pred, "self") {
+    Some(loose) -> match pred_regex_pattern_named(param_pred, pv_written_self()) {
       None -> false
       Some(strict) -> regex_pattern_contains(loose, strict)
     }
@@ -269,16 +305,13 @@ fn regex_pred_subsumed(pred: Expr, pname: String, param_pred: Expr) : Bool {
 # function has multiple refined parameters: a param-side `self`
 # refinement on `x` only entails a requires-side `matches(x, …)`,
 # never `matches(y, …)`.
-fn pred_regex_pattern_named(e: Expr, expected_recv: String) : Option[String] {
+fn pred_regex_pattern_named(e: Expr, expected_recv: PredVar) : Option[String] {
   match e.kind {
     ECall(callee, cargs) -> match callee.kind {
-      EVar(name) ->
-        if name == "matches" {
+      EName(name) ->
+        if name_is(name, "matches") {
           match cargs {
-            [recv, re] -> match recv.kind {
-              EVar(rn) -> if rn == expected_recv { extract_regex_literal(re) } else { None }
-              _ -> None
-            }
+            [recv, re] -> if pv_is(expected_recv, recv) { extract_regex_literal(re) } else { None }
             _ -> None
           }
         } else { None }
@@ -296,7 +329,7 @@ fn extract_regex_literal(re: Expr) : Option[String] {
   match re.kind {
     ECall(callee, cargs) -> match callee.kind {
       EModCall(mod, fname) ->
-        if mod == "regexp" and fname == "compile_or_panic" {
+        if name_is(mod, "regexp") and name_is(fname, "compile_or_panic") {
           match cargs {
             [arg0] -> match arg0.kind {
               EStr(span, false) -> Some(decode_regex_str_span(span))
@@ -666,19 +699,28 @@ fn ac_contains(loose: AnchoredClass, strict: AnchoredClass) : Bool {
 
 # `self` is never rebound by `let` / lambda / match inside a
 # predicate, so no shadowing chase is needed.
-#[doc("Substitute every free `self` in a predicate Expr with `EVar(name)`.")]
-pub fn subst_self(e: Expr, name: String) : Expr = match e.kind {
-  EVar(s) -> if s == "self" { mk_ref(name, e.line, e.col) } else { e }
-  EBinop(op, a, b) -> mk_expr(EBinop(op, subst_self(a, name), subst_self(b, name)), e.line, e.col)
-  EUnop(op, x) -> mk_expr(EUnop(op, subst_self(x, name)), e.line, e.col)
-  ECall(f, xs) -> mk_expr(ECall(subst_self(f, name), subst_self_list(xs, name)), e.line, e.col)
-  _ -> e
-}
+#[doc("Substitute every read of a resolved predicate's `self` with a read of the local binder `l`, each at the position of the read it replaces.")]
+pub fn subst_self(e: Expr, l: LocalId) : Expr = subst_self_kind(e, pv_self(), ELocal(l))
 
-fn subst_self_list(es: [Expr], name: String) : [Expr] = match es {
-  [] -> []
-  [h, ...t] -> [subst_self(h, name), ...subst_self_list(t, name)]
-}
+#[doc("Substitute every read of a resolved predicate's `self` with the given expression.")]
+pub fn subst_self_with(e: Expr, to: Expr) : Expr = subst_var(e, pv_self(), to)
+
+#[doc("`subst_self_with` before the resolver, where a predicate written in place still spells `self` and one copied from an alias already reads its binder.")]
+pub fn subst_self_unresolved(e: Expr, to: Expr) : Expr =
+  subst_var(subst_var(e, pv_self(), to), pv_written_self(), to)
+
+# Before the resolver: the parameter a refinement sits on, read by name,
+# for the `self` of its predicate.
+fn subst_written_self(e: Expr, pname: Written) : Expr = subst_self_kind(e, pv_written_self(), EName(pname))
+
+# A node of kind `to` at the position of each read of `v` it replaces.
+fn subst_self_kind(e: Expr, v: PredVar, to: ExprKind) : Expr =
+  if pv_is(v, e) { mk_expr(to, e.line, e.col) } else { match e.kind {
+    EBinop(op, a, b) -> mk_expr(EBinop(op, subst_self_kind(a, v, to), subst_self_kind(b, v, to)), e.line, e.col)
+    EUnop(op, x) -> mk_expr(EUnop(op, subst_self_kind(x, v, to)), e.line, e.col)
+    ECall(f, xs) -> mk_expr(ECall(subst_self_kind(f, v, to), map(xs, (x) => subst_self_kind(x, v, to))), e.line, e.col)
+    _ -> e
+  } }
 
 # Issue #83 sub-case 2: predicate canonicaliser. Normalises a
 # comparison Expr so structurally-different but semantically-equal
@@ -686,38 +728,48 @@ fn subst_self_list(es: [Expr], name: String) : [Expr] = match es {
 # `==` / `!=` argument order normalised lexicographically. Any
 # non-comparison Expr is recursed into so a top-level `and` / `or`
 # of comparisons is canonicalised arm-wise.
-fn pred_canon(e: Expr) : Expr = match e.kind {
+fn pred_canon(e: Expr) : Expr = canon(e, false)
+
+# `written` holds before the resolver, where two names are ordered by
+# their text.
+fn canon(e: Expr, written: Bool) : Expr = match e.kind {
   EBinop(op, a, b) -> {
-    let ca = pred_canon(a)
-    let cb = pred_canon(b)
-    if op == "<" { mk_expr(EBinop(">", cb, ca), e.line, e.col) }
-    else if op == "<=" { mk_expr(EBinop(">=", cb, ca), e.line, e.col) }
-    else if op == "==" or op == "!=" {
-      if cmp_lt(ca, cb) { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
-      else { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
-    }
-    else if op == "and" or op == "or" {
-      mk_expr(EBinop(op, ca, cb), e.line, e.col)
-    }
+    let ca = canon(a, written)
+    let cb = canon(b, written)
+    if binop_eq(op, BoLt) { mk_expr(EBinop(BoGt, cb, ca), e.line, e.col) }
+    else if binop_eq(op, BoLe) { mk_expr(EBinop(BoGe, cb, ca), e.line, e.col) }
+    else if binop_is_equality(op) and not cmp_lt(ca, cb, written) { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
     else { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
   }
-  EUnop(op, x) -> mk_expr(EUnop(op, pred_canon(x)), e.line, e.col)
+  EUnop(op, x) -> mk_expr(EUnop(op, canon(x, written)), e.line, e.col)
   _ -> e
 }
 
-# Total ordering used by `pred_canon` to break ties on symmetric
-# operators. Variables sort by name; literals sort by value. An
-# EVar always sorts before an EInt so `x == 0` canonicalises to
-# `x == 0` (variable on the LHS), and two variables sort
-# alphabetically.
-fn cmp_lt(a: Expr, b: Expr) : Bool = match a.kind {
-  EVar(an) -> match b.kind {
-    EVar(bn) -> string_lt(an, bn)
+# The order `canon` puts the operands of a symmetric operator in: a
+# written name, then a local binder, then a declaration, then a literal.
+# Binders and declarations sort by id and literals by value; written
+# names sort by text before the resolver and are in no order after it,
+# where a name still written has no identity to order by.
+fn cmp_lt(a: Expr, b: Expr, written: Bool) : Bool = match a.kind {
+  EName(an) -> match b.kind {
+    EName(bn) -> written and string_lt(written_text(an), written_text(bn))
+    _ -> true
+  }
+  ELocal(al) -> match b.kind {
+    EName(_)   -> false
+    ELocal(bl) -> local_raw(al) < local_raw(bl)
+    _ -> true
+  }
+  ESym(sa, _) -> match b.kind {
+    EName(_)    -> false
+    ELocal(_)   -> false
+    ESym(sb, _) -> sym_raw(sa) < sym_raw(sb)
     _ -> true
   }
   EInt(av, _) -> match b.kind {
-    EVar(_) -> false
-    ESym(_, _, _) -> false
+    EName(_) -> false
+    ELocal(_) -> false
+    ESym(_, _) -> false
     EInt(bv, _) -> av < bv
     _ -> true
   }
@@ -730,7 +782,7 @@ fn cmp_lt(a: Expr, b: Expr) : Bool = match a.kind {
 # `x != 0` ⊢ `x != 0` (already covered by struct_eq), etc. Both
 # inputs are in canonical form (variable on the LHS for ordered
 # comparisons).
-fn pred_entailed_by_refinement(req: Expr, pname: String, ref_pred: Expr) : Bool {
+fn pred_entailed_by_refinement(req: Expr, pname: PredVar, ref_pred: Expr) : Bool {
   match interval_of_pred(ref_pred, pname) {
     None -> false
     Some(iv) -> match check_pred_with_interval(req, pname, iv) {
@@ -744,29 +796,27 @@ fn pred_entailed_by_refinement(req: Expr, pname: String, ref_pred: Expr) : Bool 
 # the closed shapes we care about — `pname OP literal` — produce
 # a non-trivial interval; anything else collapses to `None` so the
 # caller falls back to structural matching.
-fn interval_of_pred(e: Expr, pname: String) : Option[Interval] = match e.kind {
-  EBinop(op, a, b) -> match a.kind {
-    EVar(n) -> if n == pname {
+fn interval_of_pred(e: Expr, pname: PredVar) : Option[Interval] = match e.kind {
+  EBinop(op, a, b) ->
+    if pv_is(pname, a) {
       match try_eval_int(b) {
         None -> None
         Some(k) -> interval_from_cmp(op, k)
       }
     } else { None }
-    _ -> None
-  }
   _ -> None
 }
 
 # Turn `x OP k` into the tightest Int interval that satisfies it.
 # `!=` is not expressible as a single closed interval; we return
 # `None` so the caller defers to structural / call-site checks.
-fn interval_from_cmp(op: String, k: Int) : Option[Interval] {
-  if op == ">"  { Some(Ival(k + 1, ival_int_max_const())) }
-  else if op == ">=" { Some(Ival(k, ival_int_max_const())) }
-  else if op == "<"  { Some(Ival(ival_int_min_const(), k - 1)) }
-  else if op == "<=" { Some(Ival(ival_int_min_const(), k)) }
-  else if op == "==" { Some(Ival(k, k)) }
-  else { None }
+fn interval_from_cmp(op: BinOp, k: Int) : Option[Interval] = match op {
+  BoGt -> Some(Ival(k + 1, ival_int_max_const()))
+  BoGe -> Some(Ival(k, ival_int_max_const()))
+  BoLt -> Some(Ival(ival_int_min_const(), k - 1))
+  BoLe -> Some(Ival(ival_int_min_const(), k))
+  BoEq -> Some(Ival(k, k))
+  _    -> None
 }
 
 # Saturating sentinels for the interval lattice. The lattice does
@@ -782,25 +832,25 @@ fn ival_int_min_const() : Int = 0 - 9223372036854775807 - 1
 # treats it as "not entailed" — a `false` requires would have been
 # rejected at parse time), and `None` when the predicate's shape
 # escapes our analysis.
-fn check_pred_with_interval(req: Expr, pname: String, iv: Interval) : Option[Bool] = match req.kind {
-  EBinop(op, a, b) -> match a.kind {
-    EVar(n) -> if n == pname {
+fn check_pred_with_interval(req: Expr, pname: PredVar, iv: Interval) : Option[Bool] = match req.kind {
+  EBinop(op, a, b) ->
+    if pv_is(pname, a) {
       match try_eval_int(b) {
         None -> None
         Some(k) -> {
           let kiv = Ival(k, k)
-          if op == ">"  { ival_gt(iv, kiv) }
-          else if op == ">=" { ival_ge(iv, kiv) }
-          else if op == "<"  { ival_lt(iv, kiv) }
-          else if op == "<=" { ival_le(iv, kiv) }
-          else if op == "==" { ival_eq(iv, kiv) }
-          else if op == "!=" { ival_ne(iv, kiv) }
-          else { None }
+          match op {
+            BoGt -> ival_gt(iv, kiv)
+            BoGe -> ival_ge(iv, kiv)
+            BoLt -> ival_lt(iv, kiv)
+            BoLe -> ival_le(iv, kiv)
+            BoEq -> ival_eq(iv, kiv)
+            BoNe -> ival_ne(iv, kiv)
+            _    -> None
+          }
         }
       }
     } else { None }
-    _ -> None
-  }
   _ -> None
 }
 
@@ -820,13 +870,16 @@ pub fn expr_struct_eq(a: Expr, b: Expr) : Bool {
     EChar(av) -> match b.kind { EChar(bv) -> av == bv _ -> false }
     EStr(av, _) -> match b.kind { EStr(bv, _) -> av == bv _ -> false }
     EUnit -> match b.kind { EUnit -> true _ -> false }
-    EVar(an) -> match b.kind { EVar(bn) -> an == bn _ -> false }
+    EName(an) -> match b.kind { EName(bn) -> written_text(an) == written_text(bn) _ -> false }
+    ESym(sa, ia) -> match b.kind { ESym(sb, ib) -> sym_raw(sa) >= 0 and sym_raw(sa) == sym_raw(sb) and ia == ib _ -> false }
+    ELocal(la) -> match b.kind { ELocal(lb) -> local_eq(la, lb) _ -> false }
+    EMark(am) -> match b.kind { EMark(bm) -> mark_eq(am, bm) _ -> false }
     EBinop(aop, al, ar) -> match b.kind {
-      EBinop(bop, bl, br) -> aop == bop and expr_struct_eq(al, bl) and expr_struct_eq(ar, br)
+      EBinop(bop, bl, br) -> binop_eq(aop, bop) and expr_struct_eq(al, bl) and expr_struct_eq(ar, br)
       _ -> false
     }
     EUnop(aop, ai) -> match b.kind {
-      EUnop(bop, bi) -> aop == bop and expr_struct_eq(ai, bi)
+      EUnop(bop, bi) -> unop_eq(aop, bop) and expr_struct_eq(ai, bi)
       _ -> false
     }
     EField(ab, an) -> match b.kind {
@@ -861,26 +914,25 @@ fn expr_list_struct_eq(a: [Expr], b: [Expr]) : Bool {
 pub fn try_eval_pred(e: Expr) : Option[Bool] {
   match e.kind {
     EBool(b) -> Some(b)
-    EUnop(op, x) -> if op == "not" {
-      match try_eval_pred(x) {
+    EUnop(op, x) -> match op {
+      UoNot -> match try_eval_pred(x) {
         Some(b) -> Some(not b)
         None    -> None
       }
-    } else { None }
-    EBinop(op, a, b) -> {
-      if op == "and" {
-        match try_eval_pred(a) {
-          Some(false) -> Some(false)
-          Some(true)  -> try_eval_pred(b)
-          None        -> None
-        }
-      } else if op == "or" {
-        match try_eval_pred(a) {
-          Some(true)  -> Some(true)
-          Some(false) -> try_eval_pred(b)
-          None        -> None
-        }
-      } else if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+      UoNeg -> None
+    }
+    EBinop(op, a, b) -> match op {
+      BoAnd -> match try_eval_pred(a) {
+        Some(false) -> Some(false)
+        Some(true)  -> try_eval_pred(b)
+        None        -> None
+      }
+      BoOr -> match try_eval_pred(a) {
+        Some(true)  -> Some(true)
+        Some(false) -> try_eval_pred(b)
+        None        -> None
+      }
+      _ -> if binop_is_comparison(op) {
         match try_eval_int(a) {
           None    -> try_eval_real_cmp(op, a, b)
           Some(ai) -> match try_eval_int(b) {
@@ -899,12 +951,13 @@ pub fn try_eval_pred(e: Expr) : Option[Bool] {
 pub fn try_eval_int(e: Expr) : Option[Int] {
   match e.kind {
     EInt(n, _) -> Some(n)
-    EUnop(op, x) -> if op == "-" {
-      match try_eval_int(x) {
+    EUnop(op, x) -> match op {
+      UoNeg -> match try_eval_int(x) {
         Some(v) -> Some(0 - v)
         None    -> None
       }
-    } else { None }
+      UoNot -> None
+    }
     EBinop(op, a, b) -> match try_eval_int(a) {
       None    -> None
       Some(av) -> match try_eval_int(b) {
@@ -916,29 +969,29 @@ pub fn try_eval_int(e: Expr) : Option[Int] {
   }
 }
 
-fn eval_int_op(op: String, a: Int, b: Int) : Option[Int] {
-  if op == "+" { Some(a + b) }
-  else if op == "-" { Some(a - b) }
-  else if op == "*" { Some(a * b) }
-  else if op == "/" { if b == 0 { None } else { Some(a / b) } }
-  else if op == "%" { if b == 0 { None } else { Some(a % b) } }
-  else { None }
+fn eval_int_op(op: BinOp, a: Int, b: Int) : Option[Int] = match op {
+  BoAdd -> Some(a + b)
+  BoSub -> Some(a - b)
+  BoMul -> Some(a * b)
+  BoDiv -> if b == 0 { None } else { Some(a / b) }
+  BoMod -> if b == 0 { None } else { Some(a % b) }
+  _     -> None
 }
 
-fn eval_int_cmp(op: String, a: Int, b: Int) : Bool {
-  if op == "==" { a == b }
-  else if op == "!=" { a != b }
-  else if op == "<" { a < b }
-  else if op == "<=" { a <= b }
-  else if op == ">" { a > b }
-  else if op == ">=" { a >= b }
-  else { false }
+fn eval_int_cmp(op: BinOp, a: Int, b: Int) : Bool = match op {
+  BoEq -> a == b
+  BoNe -> a != b
+  BoLt -> a < b
+  BoLe -> a <= b
+  BoGt -> a > b
+  BoGe -> a >= b
+  _    -> false
 }
 
 # Real fallback for the comparison arms of `try_eval_pred`. Fires only
 # when at least one side is a genuine Real literal — an all-Int
 # comparison already folded exactly via `try_eval_int`.
-fn try_eval_real_cmp(op: String, a: Expr, b: Expr) : Option[Bool] {
+fn try_eval_real_cmp(op: BinOp, a: Expr, b: Expr) : Option[Bool] {
   match try_eval_real(a) {
     None -> None
     Some(ar) -> match try_eval_real(b) {
@@ -953,12 +1006,13 @@ pub fn try_eval_real(e: Expr) : Option[Real] {
   match e.kind {
     EReal(r, _) -> Some(r)
     EInt(n, _) -> Some(int_to_real(n))
-    EUnop(op, x) -> if op == "-" {
-      match try_eval_real(x) {
+    EUnop(op, x) -> match op {
+      UoNeg -> match try_eval_real(x) {
         Some(v) -> Some(0.0 - v)
         None    -> None
       }
-    } else { None }
+      UoNot -> None
+    }
     EBinop(op, a, b) -> match try_eval_real(a) {
       None    -> None
       Some(av) -> match try_eval_real(b) {
@@ -970,39 +1024,39 @@ pub fn try_eval_real(e: Expr) : Option[Real] {
   }
 }
 
-fn eval_real_op(op: String, a: Real, b: Real) : Option[Real] {
-  if op == "+" { Some(a + b) }
-  else if op == "-" { Some(a - b) }
-  else if op == "*" { Some(a * b) }
-  else { None }
+fn eval_real_op(op: BinOp, a: Real, b: Real) : Option[Real] = match op {
+  BoAdd -> Some(a + b)
+  BoSub -> Some(a - b)
+  BoMul -> Some(a * b)
+  _     -> None
 }
 
-fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
-  if op == "==" { a == b }
-  else if op == "!=" { a != b }
-  else if op == "<" { a < b }
-  else if op == "<=" { a <= b }
-  else if op == ">" { a > b }
-  else if op == ">=" { a >= b }
-  else { false }
+fn eval_real_cmp(op: BinOp, a: Real, b: Real) : Bool = match op {
+  BoEq -> a == b
+  BoNe -> a != b
+  BoLt -> a < b
+  BoLe -> a <= b
+  BoGt -> a > b
+  BoGe -> a >= b
+  _    -> false
 }
 
 
 # Refinement bindings visible inside a function body: each entry
-# pairs a binding name with its self-substituted refinement predicate.
+# pairs a binder with its self-substituted refinement predicate.
 # `let` bindings without explicit refinement annotations contribute
 # nothing (interval inference is the lattice's job, not this analysis).
-#[doc("A binding name paired with its self-substituted refinement predicate.")]
-pub type RefBinding = RBind(String, Expr)
+#[doc("A local binder paired with its refinement predicate, `self` already a read of that binder.")]
+pub type RefBinding = RBind(LocalId, Expr)
 
-#[doc("Collect the refinement predicates of a param list as RefBindings (self already substituted to the param name).")]
+#[doc("Collect the refinement predicates of a resolved param list as RefBindings (self already substituted to a read of the param).")]
 pub fn collect_caller_refinements(params: [Param], acc: [RefBinding]) : [RefBinding] {
   match params {
     [] -> list_reverse(acc)
     [p, ...rest] -> match p.ptype {
       Some(t) -> match t.tkind {
         TyRefine(_, pred) ->
-          collect_caller_refinements(rest, [RBind(p.pname, subst_self(pred, p.pname)), ...acc])
+          collect_caller_refinements(rest, [RBind(p.binder.id, subst_self(pred, p.binder.id)), ...acc])
         _ -> collect_caller_refinements(rest, acc)
       }
       None -> collect_caller_refinements(rest, acc)
@@ -1010,51 +1064,71 @@ pub fn collect_caller_refinements(params: [Param], acc: [RefBinding]) : [RefBind
   }
 }
 
-fn lookup_caller_refinement(refs: [RefBinding], name: String) : Option[Expr] {
+fn lookup_caller_refinement(refs: [RefBinding], l: LocalId) : Option[Expr] {
   match refs {
     [] -> None
     [r, ...rest] -> match r {
-      RBind(n, p) -> if n == name { Some(p) } else { lookup_caller_refinement(rest, name) }
+      RBind(n, p) -> if local_eq(n, l) { Some(p) } else { lookup_caller_refinement(rest, l) }
     }
   }
 }
 
+# The predicate reads the callee's binders and the caller's refinement
+# the caller's: whoever reports the refutation holds both declarations'
+# names, so the reason is kept as what it is about.
+#[doc("Why a discharge is refuted: a literal that violates the predicate (literal, predicate), literal arguments that violate a clause, or a caller refinement that does not entail the predicate (refinement, predicate).")]
+pub type LooseWhy = LwLiteral(Expr, Expr) | LwArgs(Expr) | LwCaller(Expr, Expr)
+
+#[doc("The message of a refuted discharge. `req` prints the callee's predicate, `own` an expression of the calling body.")]
+pub fn loose_text(w: LooseWhy, req: (Expr) -> String, own: (Expr) -> String) : String = match w {
+  LwLiteral(lit, pred) -> concat_all(["literal ", own(lit), " violates `", req(pred), "`"])
+  LwArgs(pred) -> concat_all(["literal args violate `", req(pred), "`"])
+  LwCaller(caller_pred, pred) -> concat_all([
+    "caller refinement `", own(caller_pred),
+    "` does not entail callee precondition `", req(pred), "`"])
+}
+
 # Fixtures pin these via `--dump-call-elision`.
 #[doc("Classification of a predicate discharge attempt: elided (proven), runtime (undecided), or loose (statically refuted, with reason).")]
-pub type CallSiteStatus = CSElided | CSRuntime | CSLoose(String)
+pub type CallSiteStatus = CSElided | CSRuntime | CSLoose(LooseWhy)
 
 # Classify one (callee_param, caller_arg) discharge attempt.
 #
-# `req_pred` is the callee's predicate with the formal parameter
-# name baked in (already substituted from `self`). `arg` is the AST
-# expression at the call site. `caller_refs` is the refinement
-# environment built from the enclosing fn's parameters.
+# `req_pred` is the callee's predicate over its parameter `p` (already
+# substituted from `self`). `arg` is the resolved expression at the call
+# site. `caller_refs` is the refinement environment built from the
+# enclosing fn's parameters.
 #[doc("Classify one predicate-vs-value discharge: CSElided when provable, CSLoose when a closed value refutes it, CSRuntime otherwise.")]
-pub fn classify_arg_vs_pred(req_pred: Expr, pname: String, arg: Expr,
-                        caller_refs: [RefBinding]) : CallSiteStatus {
+pub fn classify_arg_vs_pred(req_pred: Expr, p: LocalId, arg: Expr,
+                        caller_refs: [RefBinding]) : CallSiteStatus =
+  classify_value(req_pred, PvLocal(p), arg, caller_refs)
+
+#[doc("`classify_arg_vs_pred` for a predicate over its own `self`, as a refinement inside a type is.")]
+pub fn classify_self_vs_pred(req_pred: Expr, arg: Expr, caller_refs: [RefBinding]) : CallSiteStatus =
+  classify_value(req_pred, pv_self(), arg, caller_refs)
+
+fn classify_value(req_pred: Expr, v: PredVar, arg: Expr,
+                  caller_refs: [RefBinding]) : CallSiteStatus {
   match try_eval_num_lit(arg) {
     Some(lit) -> {
-      let folded = pred_canon(subst_var(req_pred, pname, lit))
+      let folded = pred_canon(subst_var(req_pred, v, lit))
       match try_eval_pred(folded) {
         Some(true) -> CSElided
-        Some(false) -> CSLoose(concat_all(["literal ", fmt_expr_text(lit), " violates `", fmt_expr_text(req_pred), "`"]))
+        Some(false) -> CSLoose(LwLiteral(lit, req_pred))
         None -> CSRuntime
       }
     }
     None -> match arg.kind {
-      EVar(arg_name) -> match lookup_caller_refinement(caller_refs, arg_name) {
+      ELocal(arg_l) -> match lookup_caller_refinement(caller_refs, arg_l) {
         Some(caller_pred) -> {
-          # Substitute both predicates to talk about the same name
-          # (the arg's name) so structural / interval entailment
-          # works without per-pair alpha matching.
-          let req_in_arg = pred_canon(subst_var(req_pred, pname, mk_var(arg_name, arg.line, arg.col)))
+          # Substitute both predicates to talk about the same binder
+          # (the arg's) so structural / interval entailment works
+          # without per-pair alpha matching.
+          let req_in_arg = pred_canon(subst_var(req_pred, v, mk_local(arg_l, arg.line, arg.col)))
           let caller_in_arg = pred_canon(caller_pred)
           if expr_struct_eq(req_in_arg, caller_in_arg) { CSElided }
-          else if pred_entailed_by_refinement(req_in_arg, arg_name, caller_in_arg) { CSElided }
-          else { CSLoose(concat_all([
-                  "caller refinement `", fmt_expr_text(caller_pred),
-                  "` does not entail callee precondition `",
-                  fmt_expr_text(req_pred), "`"])) }
+          else if pred_entailed_by_refinement(req_in_arg, PvLocal(arg_l), caller_in_arg) { CSElided }
+          else { CSLoose(LwCaller(caller_pred, req_pred)) }
         }
         None -> CSRuntime
       }
@@ -1064,7 +1138,6 @@ pub fn classify_arg_vs_pred(req_pred: Expr, pname: String, arg: Expr,
 }
 
 fn mk_int(n: Int, line: Int, col: Int) : Expr = mk_expr(mk_int_synth(n), line, col)
-fn mk_var(s: String, line: Int, col: Int) : Expr = mk_ref(s, line, col)
 
 # Fold a closed numeric value to a literal node for substitution into
 # a predicate: exact Int when possible, Real when a Real literal
@@ -1079,18 +1152,18 @@ fn try_eval_num_lit(e: Expr) : Option[Expr] {
   }
 }
 
-# Mirrors `subst_self` but for an arbitrary name. Used to push a
-# literal / binding into a callee's predicate before discharging it.
-#[doc("Substitute every free EVar(from) in a predicate Expr with the given expression.")]
-pub fn subst_var(e: Expr, from: String, to: Expr) : Expr = match e.kind {
-  EVar(s) -> if s == from { to } else { e }
-  EBinop(op, a, b) -> mk_expr(EBinop(op, subst_var(a, from, to), subst_var(b, from, to)), e.line, e.col)
-  EUnop(op, x) -> mk_expr(EUnop(op, subst_var(x, from, to)), e.line, e.col)
-  ECall(f, xs) -> mk_expr(ECall(subst_var(f, from, to), subst_var_list(xs, from, to)), e.line, e.col)
-  _ -> e
-}
+# Substitute every free read of `from` in a predicate Expr with the given
+# expression. Used to push a literal / binding into a callee's predicate
+# before discharging it.
+fn subst_var(e: Expr, from: PredVar, to: Expr) : Expr =
+  if pv_is(from, e) { to } else { match e.kind {
+    EBinop(op, a, b) -> mk_expr(EBinop(op, subst_var(a, from, to), subst_var(b, from, to)), e.line, e.col)
+    EUnop(op, x) -> mk_expr(EUnop(op, subst_var(x, from, to)), e.line, e.col)
+    ECall(f, xs) -> mk_expr(ECall(subst_var(f, from, to), subst_var_list(xs, from, to)), e.line, e.col)
+    _ -> e
+  } }
 
-fn subst_var_list(es: [Expr], from: String, to: Expr) : [Expr] = match es {
+fn subst_var_list(es: [Expr], from: PredVar, to: Expr) : [Expr] = match es {
   [] -> []
   [h, ...t] -> [subst_var(h, from, to), ...subst_var_list(t, from, to)]
 }
@@ -1108,9 +1181,9 @@ fn subst_var_list(es: [Expr], from: String, to: Expr) : [Expr] = match es {
 # RC).
 #
 # A matched simple-shape predicate carries two nodes:
-#   - the ident EVar node — its `mode` is the *repr oracle*. The emitter
+#   - the ident node — its `mode` is the *repr oracle*. The emitter
 #     mirrors exactly what `emit_expr` would do for this same node: a
-#     raw-unboxed EVar reads from `kair_<name>`, a boxed one from
+#     raw-unboxed read comes from `kair_<name>`, a boxed one from
 #     `kai_<name>`. Using the ident node's own mode (not the literal's)
 #     guarantees the emitter and `emit_expr` agree on which C local
 #     name exists — the local's repr is a property of the *binding*,
@@ -1118,26 +1191,19 @@ fn subst_var_list(es: [Expr], from: String, to: Expr) : [Expr] = match es {
 #   - the literal node — its `ty` is the *box-type oracle* for the raw
 #     case (Perceus never rewrites a literal, so its `ty` is always
 #     present, whereas a dup-wrapped ident node's `ty` may be blank).
-pub type ContractIdent = CtrId(String, Expr, Expr)
-#                              ^name  ^ident ^literal
+pub type ContractIdent = CtrId(LocalId, Expr, Expr)
+#                              ^binder ^ident ^literal
 
-pub fn contract_single_ident(pred: Expr) : Option[String] =
-  match contract_single_ident_node(pred) {
-    Some(ci) -> match ci { CtrId(nm, _, _) -> Some(nm) }
-    None -> None
-  }
+# The operands of a simple-shape predicate: the ident node and the literal.
+type IdentLit = IdLit(Expr, Expr)
 
-# Simple-shape detector for the C / LLVM emitters: returns the binding
-# name, the ident node (repr oracle), and the comparison literal (box-ty
-# oracle) so they can attach the binding's runtime value to a
-# contract-violation panic.
-pub fn contract_single_ident_node(pred: Expr) : Option[ContractIdent] = match pred.kind {
+fn single_ident_operands(pred: Expr) : Option[IdentLit] = match pred.kind {
   EBinop(op, a, b) ->
-    if pred_op_is_cmp(op) {
+    if binop_is_comparison(op) {
       match expr_pred_ident_node(a) {
-        Some(na) -> if expr_pred_is_scalar_lit(b) { Some(CtrId(ci_name(na), na, b)) } else { None }
+        Some(na) -> if expr_pred_is_scalar_lit(b) { Some(IdLit(na, b)) } else { None }
         None -> match expr_pred_ident_node(b) {
-          Some(nb) -> if expr_pred_is_scalar_lit(a) { Some(CtrId(ci_name(nb), nb, a)) } else { None }
+          Some(nb) -> if expr_pred_is_scalar_lit(a) { Some(IdLit(nb, a)) } else { None }
           None -> None
         }
       }
@@ -1145,7 +1211,26 @@ pub fn contract_single_ident_node(pred: Expr) : Option[ContractIdent] = match pr
   _ -> None
 }
 
-fn ci_name(e: Expr) : String = match e.kind { EVar(s) -> s _ -> "?" }
+# Before the resolver: the name the single ident is written with.
+fn contract_single_ident(pred: Expr) : Option[Written] = match single_ident_operands(pred) {
+  Some(IdLit(n, _)) -> match n.kind {
+    EName(w) -> Some(w)
+    _        -> None
+  }
+  None -> None
+}
+
+# Simple-shape detector for the C / LLVM emitters: returns the binding,
+# the ident node (repr oracle), and the comparison literal (box-ty
+# oracle) so they can attach the binding's runtime value to a
+# contract-violation panic. Only a local binding has a value to report.
+pub fn contract_single_ident_node(pred: Expr) : Option[ContractIdent] = match single_ident_operands(pred) {
+  Some(IdLit(n, lit)) -> match n.kind {
+    ELocal(l) -> Some(CtrId(l, n, lit))
+    _         -> None
+  }
+  None -> None
+}
 
 # Both backends decide here which asserts report a binding's value, so
 # their panic text cannot drift apart.
@@ -1186,11 +1271,11 @@ fn callee_at_xps(xps: [XPos], line: Int, col: Int) : Option[Expr] = match xps {
 }
 
 #[doc("The contract clause (`requires` or `ensures`) an assert was lowered from, or None for a user-written assert.")]
-pub fn contract_assert_kind(opt_msg: Option[Expr]) : Option[String] = match opt_msg {
+pub fn contract_assert_kind(opt_msg: Option[Expr]) : Option[ContractKind] = match opt_msg {
   Some(m) -> match m.kind {
     EStr(span, false) ->
-      if assert_span_is_requires(span) { Some("requires") }
-      else if assert_span_prefix_loop(span, "\"ensures violated", 0) { Some("ensures") }
+      if assert_span_is_requires(span) { Some(CkRequires) }
+      else if assert_span_prefix_loop(span, "\"ensures violated", 0) { Some(CkEnsures) }
       else { None }
     _ -> None
   }
@@ -1209,25 +1294,20 @@ fn assert_span_prefix_loop(s: String, prefix: String, i: Int) : Bool {
   } }
 }
 
-fn pred_op_is_cmp(op: String) : Bool =
-  op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">="
-
 # Recover the bare ident node behind a predicate operand. By emit time
-# the Perceus pass may have wrapped a non-last read as
-# `__perceus_dup(<ident>)`; unwrap that one layer so the simple-shape
+# the Perceus pass may have wrapped a non-last read in a dup; unwrap
+# that one layer so the simple-shape
 # detector still fires on `b != 0.0` whether or not `b` is read again
 # later in the body. The returned node carries the `mode`/`ty` the
 # emitter needs to pick boxed vs raw repr; the emitter only references
 # the bound local, never re-emits this sub-expression.
 fn expr_pred_ident_node(e: Expr) : Option[Expr] = match e.kind {
-  EVar(_) -> Some(e)
-  ESym(_, _, _) -> Some(e)
+  EName(_) -> Some(e)
+  ELocal(_) -> Some(e)
   ECall(callee, cargs) -> match callee.kind {
-    EVar(dn) -> if dn == "__perceus_dup" {
-      match cargs { [a] -> expr_pred_ident_node(a) _ -> None }
-    } else { None }
     # An RC mark wraps the read it accounts for; the predicate is about
     # the read, so look through it.
+    EMark(MkDup)       -> match cargs { [a] -> expr_pred_ident_node(a)  _ -> None }
     EMark(MkGuardDrop) -> match cargs { [a] -> expr_pred_ident_node(a)  _ -> None }
     EMark(MkDrop)      -> match cargs { [a] -> expr_pred_ident_node(a)  _ -> None }
     _ -> None
@@ -1247,30 +1327,27 @@ fn expr_pred_is_scalar_lit(e: Expr) : Bool = match e.kind {
 }
 
 # A `requires` predicate may mention any param; substitute each param
-# name with the corresponding arg expression (literal or refined
-# binding) and either fold or check entailment.
+# with the corresponding arg expression (literal or refined binding)
+# and either fold or check entailment.
 #[doc("Classify a `requires` predicate against a call's arguments: substitute every parameter, then fold or check entailment by a refined caller binding.")]
-pub fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
+pub fn classify_requires_clause(pred: Expr, pnames: [LocalId], call_args: [Expr],
                              caller_refs: [RefBinding]) : CallSiteStatus {
   let subst = subst_params(pred, pnames, call_args)
   let folded = pred_canon(subst)
   match try_eval_pred(folded) {
     Some(true) -> CSElided
-    Some(false) -> CSLoose(concat_all(["literal args violate `", fmt_expr_text(pred), "`"]))
+    Some(false) -> CSLoose(LwArgs(pred))
     None -> {
       # Try refinement-based discharge: if the substituted predicate
       # is a comparison whose only free var is a refined caller
       # binding, ask the lattice.
       match free_var_of_pred(folded) {
-        Some(vname) -> match lookup_caller_refinement(caller_refs, vname) {
+        Some(v) -> match lookup_caller_refinement(caller_refs, v) {
           Some(caller_pred) -> {
             let caller_canon = pred_canon(caller_pred)
             if expr_struct_eq(folded, caller_canon) { CSElided }
-            else if pred_entailed_by_refinement(folded, vname, caller_canon) { CSElided }
-            else { CSLoose(concat_all([
-                    "caller refinement `", fmt_expr_text(caller_pred),
-                    "` does not entail callee precondition `",
-                    fmt_expr_text(pred), "`"])) }
+            else if pred_entailed_by_refinement(folded, PvLocal(v), caller_canon) { CSElided }
+            else { CSLoose(LwCaller(caller_pred, pred)) }
           }
           None -> CSRuntime
         }
@@ -1280,43 +1357,43 @@ pub fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
   }
 }
 
-# Simultaneous: an argument that mentions another parameter's name is
-# never substituted again.
-#[doc("Substitute each parameter name in an expression by the call argument in its position, in one pass.")]
-pub fn subst_params(pred: Expr, pnames: [String], call_args: [Expr]) : Expr = match pred.kind {
-  EVar(s) -> match arg_for_param(pnames, call_args, s) { Some(a) -> a  None -> pred }
+# Simultaneous: an argument that reads another parameter is never
+# substituted again.
+#[doc("Substitute each read of a parameter in an expression by the call argument in its position, in one pass.")]
+pub fn subst_params(pred: Expr, pnames: [LocalId], call_args: [Expr]) : Expr = match pred.kind {
+  ELocal(l) -> match arg_for_param(pnames, call_args, l) { Some(a) -> a  None -> pred }
   EBinop(op, a, b) -> mk_expr(EBinop(op, subst_params(a, pnames, call_args), subst_params(b, pnames, call_args)), pred.line, pred.col)
   EUnop(op, x) -> mk_expr(EUnop(op, subst_params(x, pnames, call_args)), pred.line, pred.col)
   ECall(f, xs) -> mk_expr(ECall(subst_params(f, pnames, call_args), subst_params_list(xs, pnames, call_args)), pred.line, pred.col)
   _ -> pred
 }
 
-fn subst_params_list(es: [Expr], pnames: [String], call_args: [Expr]) : [Expr] = match es {
+fn subst_params_list(es: [Expr], pnames: [LocalId], call_args: [Expr]) : [Expr] = match es {
   [] -> []
   [h, ...t] -> [subst_params(h, pnames, call_args), ...subst_params_list(t, pnames, call_args)]
 }
 
-#[doc("The call argument bound to the parameter named `target`, by position.")]
-pub fn arg_for_param(pnames: [String], call_args: [Expr], target: String) : Option[Expr] = match pnames {
+#[doc("The call argument bound to the parameter `target`, by position.")]
+pub fn arg_for_param(pnames: [LocalId], call_args: [Expr], target: LocalId) : Option[Expr] = match pnames {
   [] -> None
   [n, ...rest_n] -> match call_args {
     [] -> None
-    [a, ...rest_a] -> if n == target { Some(a) } else { arg_for_param(rest_n, rest_a, target) }
+    [a, ...rest_a] -> if local_eq(n, target) { Some(a) } else { arg_for_param(rest_n, rest_a, target) }
   }
 }
 
 # Find the unique free variable of a comparison predicate, or None
 # if it has zero or more than one. Used by classify_requires_clause
 # to decide which caller refinement to consult.
-fn free_var_of_pred(e: Expr) : Option[String] = match e.kind {
+fn free_var_of_pred(e: Expr) : Option[LocalId] = match e.kind {
   EBinop(_, a, b) -> match free_var_of_pred(a) {
     Some(an) -> match free_var_of_pred(b) {
-      Some(bn) -> if an == bn { Some(an) } else { None }
+      Some(bn) -> if local_eq(an, bn) { Some(an) } else { None }
       None -> Some(an)
     }
     None -> free_var_of_pred(b)
   }
   EUnop(_, x) -> free_var_of_pred(x)
-  EVar(s) -> Some(s)
+  ELocal(l) -> Some(l)
   _ -> None
 }

@@ -5,42 +5,40 @@ A capability parameter carries evidence: a pointer into the handler's
 frame with no refcount header. It must never enter the Perceus scope,
 since any dup or drop derived for it corrupts the caller's stack.
 
-A parameter is a capability when its annotation names an effect, and
-which declaration a name names is the resolver's question: the
-annotation climbs the scope view of the file that declares the
-function, over effects and types together, and the class of the
-declaration it reaches decides. A user effect spelled like a core type
+A parameter is a capability when its annotation names an effect: the
+class of the declaration the annotation resolved to decides. A
+declaration the symbol table has no row for answers from the
+declarations themselves, which carry its id.
+
+An annotation the resolver left as written is the resolver's question
+still: it climbs the scope view of the file that declares the function,
+over effects and types together. A user effect spelled like a core type
 is then the effect its own file sees, not the type another module
 declares.
-
-A respelled name (`E__home`) is not a spelling the symbol table holds,
-since the table indexes declarations by their display name. For those
-alone the answer comes from the declarations as written, where a
-respelled name is unique by construction.
 """)]
 
 import compiler.ast
+import compiler.written
 import compiler.decl_names
 import compiler.symtab
 import compiler.symtab_build
 import compiler.scope_view
 import compiler.scope_file
-import compiler.util
 
-#[doc("What the capability test resolves against: the program's symbol table, its per-file views, the root module, and the effect and type names as the declarations spell them.")]
+#[doc("What the capability test resolves against: the program's symbol table, its per-file views, the root module, and the effects and types the declarations declare.")]
 pub type CapScope = { tab: SymTab, views: FileViews, root: String,
-                      effects: [String], types: [String] }
+                      effects: [SymId], types: [SymId] }
 
 #[doc("The capability scope of `decls`, resolved against `tab` under `views`; untagged declarations belong to `root`.")]
 pub fn pcap_scope(decls: [Decl], tab: SymTab, views: FileViews,
       root: String) : CapScope =
   CapScope { tab: tab, views: views, root: root,
-             effects: pcap_spelled(decls, true, []),
-             types: pcap_spelled(decls, false, []) }
+             effects: pcap_declared(decls, true, []),
+             types: pcap_declared(decls, false, []) }
 
-#[doc("The names of the capability parameters among `params`, for a declaration homed in `mo` (`None` is the root file).")]
+#[doc("The binders of the capability parameters among `params`, for a declaration homed in `mo` (`None` is the root file).")]
 pub fn pcap_param_names(c: CapScope, mo: Option[String],
-      params: [Param]) : [String] =
+      params: [Param]) : [Binder] =
   pcap_names(c, fv_of(c.views, st_module_id(pcap_home(c, mo))), params)
 
 fn pcap_home(c: CapScope, mo: Option[String]) : String = match mo {
@@ -48,30 +46,34 @@ fn pcap_home(c: CapScope, mo: Option[String]) : String = match mo {
   None    -> c.root
 }
 
-fn pcap_names(c: CapScope, v: ScopeView, params: [Param]) : [String] =
+fn pcap_names(c: CapScope, v: ScopeView, params: [Param]) : [Binder] =
   match params {
     [] -> []
     [p, ...rest] ->
-      if pcap_is_cap(c, v, p.ptype) { [p.pname, ...pcap_names(c, v, rest)] }
+      if pcap_is_cap(c, v, p.ptype) { [p.binder, ...pcap_names(c, v, rest)] }
       else { pcap_names(c, v, rest) }
   }
 
 fn pcap_is_cap(c: CapScope, v: ScopeView, t: Option[TypeExpr]) : Bool =
   match t {
     Some(te) -> match te.tkind {
-      TyName(_, n, _) -> pcap_names_effect(c, v, n)
+      TyName(r, _) -> pcap_names_effect(c, v, r)
       _            -> false
     }
     None -> false
   }
 
-fn pcap_names_effect(c: CapScope, v: ScopeView, n: String) : Bool =
-  match sv_resolve_any(c.tab, v, [NCEffect, NCType], n) {
+fn pcap_names_effect(c: CapScope, v: ScopeView, r: DeclRef) : Bool = match r {
+  DrSym(s) ->
+    if st_valid(c.tab, s) { pcap_effect(c.tab, s) }
+    else { pcap_has(c.effects, s) and not pcap_has(c.types, s) }
+  DrWritten(_, n) -> match sv_resolve_any(c.tab, v, [NCEffect, NCType], written_text(n)) {
     SvSym(s)     -> pcap_effect(c.tab, s)
     SvPrivate(s) -> pcap_effect(c.tab, s)
     SvAmbig(ss)  -> pcap_all_effects(c.tab, ss)
-    SvNone       -> list_has(c.effects, n) and not list_has(c.types, n)
+    SvNone       -> false
   }
+}
 
 fn pcap_effect(t: SymTab, s: SymId) : Bool = ncls_same(sym_class(t, s), NCEffect)
 
@@ -82,14 +84,19 @@ fn pcap_all_effects(t: SymTab, ss: [SymId]) : Bool = match ss {
   [s, ...rest] -> pcap_effect(t, s) and pcap_all_effects(t, rest)
 }
 
-fn pcap_spelled(decls: [Decl], effects: Bool, acc: [String]) : [String] =
+fn pcap_has(ss: [SymId], s: SymId) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> (sym_raw(s) >= 0 and sym_same(h, s)) or pcap_has(rest, s)
+}
+
+fn pcap_declared(decls: [Decl], effects: Bool, acc: [SymId]) : [SymId] =
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
-      DEffect(_, n, _, _, _, _, _, _, _) ->
-        pcap_spelled(rest, effects, if effects { [n, ...acc] } else { acc })
-      DType(_, n, _, _, _, _, _, _, _) ->
-        pcap_spelled(rest, effects, if effects { acc } else { [n, ...acc] })
-      _ -> pcap_spelled(rest, effects, acc)
+      DEffect(_, s, _, _, _, _, _, _) ->
+        pcap_declared(rest, effects, if effects { [s, ...acc] } else { acc })
+      DType(_, s, _, _, _, _, _, _) ->
+        pcap_declared(rest, effects, if effects { acc } else { [s, ...acc] })
+      _ -> pcap_declared(rest, effects, acc)
     }
   }

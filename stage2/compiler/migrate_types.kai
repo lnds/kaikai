@@ -11,6 +11,7 @@ unchanged.
 """)]
 
 import compiler.ast
+import compiler.written
 
 #[doc("Rewrite one type annotation, flipping the two arguments of every `Result[a, b]` (recursively through lists, functions, dimensioned, refinement, and row-argument types).")]
 pub fn mig_ty(t: TypeExpr) : TypeExpr =
@@ -23,12 +24,9 @@ fn with_tkind(t: TypeExpr, k: TyKind) : TypeExpr = mk_ty(k, t.line, t.col)
 # corrupts under kaic1 (bundle miscompile), so `mig_result_args` runs
 # the `[a, b]` match on the already-`map`ped fresh list right here.
 fn mig_tykind(k: TyKind) : TyKind = match k {
-  TyName(th, name, targs) ->
-    if name == "Result" {
-      TyName(ty_ref_none(), "Result", mig_result_args(map(targs, mig_ty)))
-    } else {
-      TyName(th, name, map(targs, mig_ty))
-    }
+  TyName(r, targs) ->
+    if ref_is_result(r) { TyName(r, mig_result_args(map(targs, mig_ty))) }
+    else { TyName(r, map(targs, mig_ty)) }
   TyList(el) -> TyList(mig_ty(el))
   TyFn(ps, ret, row) -> TyFn(map(ps, mig_ty), mig_ty(ret), mig_row(row))
   TyDim(base, u) -> TyDim(mig_ty(base), u)
@@ -38,6 +36,13 @@ fn mig_tykind(k: TyKind) : TyKind = match k {
     TsTuple(tys) -> TySurface(TsTuple(map(tys, mig_ty)))
     TsUnitSpan(raw, inner) -> TySurface(TsUnitSpan(raw, mig_ty(inner)))
   }
+}
+
+# Parser output spells a type; only a resolved reference has an id to ask.
+fn ref_is_result(r: DeclRef) : Bool = match r {
+  DrWritten(None, n)    -> written_text(n) == "Result"
+  DrWritten(Some(_), _) -> false
+  DrSym(s)              -> core_ty_is(s, CtResult)
 }
 
 # Flip a two-element list; any other arity passes through. The input is
@@ -54,7 +59,7 @@ fn mig_row(row: RowExpr) : RowExpr = match row {
 }
 
 fn mig_row_label(l: RowLabel) : RowLabel = match l {
-  RL(name, targs, s) -> RL(name, map(targs, mig_ty), s)
+  RL(r, targs) -> RL(r, map(targs, mig_ty))
 }
 
 #[doc("Flip Result in an optional type annotation, leaving `None` untouched.")]
@@ -67,7 +72,7 @@ pub fn mig_ty_opt(to: Option[TypeExpr]) : Option[TypeExpr] = match to {
 pub fn mig_params(ps: [Param]) : [Param] = map(ps, mig_param)
 
 fn mig_param(p: Param) : Param =
-  Param { pname: p.pname, ptype: mig_ty_opt(p.ptype),
+  Param { binder: p.binder, ptype: mig_ty_opt(p.ptype),
           pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
 
 #[doc("Flip Result in an optional annotation when the source edition calls for it, otherwise pass it through untouched.")]
@@ -99,7 +104,7 @@ fn mig_variant(v: Variant) : Variant = match v {
 
 #[doc("Flip Result in an effect op's parameter and return types.")]
 pub fn mig_effect_op(op: EffectOp) : EffectOp = match op {
-  EOp(name, tps, ps, ret, l, c) -> EOp(name, tps, mig_params(ps), mig_ty(ret), l, c)
+  EffOp(name, tps, ps, ret, l, c) -> EffOp(name, tps, mig_params(ps), mig_ty(ret), l, c)
 }
 
 #[doc("Flip Result in a protocol op's parameter and return types.")]
@@ -116,7 +121,7 @@ pub fn mig_proto_op(op: ProtoOp) : ProtoOp = match op {
 pub fn mig_ty_flips(t: TypeExpr) : Int = mig_tykind_flips(t.tkind)
 
 fn mig_tykind_flips(k: TyKind) : Int = match k {
-  TyName(_, name, targs) -> add_int(result_here(name, targs), sum_flips(map(targs, mig_ty_flips)))
+  TyName(r, targs) -> add_int(result_here(r, targs), sum_flips(map(targs, mig_ty_flips)))
   TyList(el) -> mig_ty_flips(el)
   TyFn(ps, ret, row) -> add_int(add_int(sum_flips(map(ps, mig_ty_flips)), mig_ty_flips(ret)), mig_row_flips(row))
   TyDim(base, _) -> mig_ty_flips(base)
@@ -128,8 +133,8 @@ fn mig_tykind_flips(k: TyKind) : Int = match k {
   }
 }
 
-fn result_here(name: String, targs: [TypeExpr]) : Int =
-  if name == "Result" { if list_length(targs) == 2 { 1 } else { 0 } } else { 0 }
+fn result_here(r: DeclRef, targs: [TypeExpr]) : Int =
+  if ref_is_result(r) { if list_length(targs) == 2 { 1 } else { 0 } } else { 0 }
 
 fn mig_row_flips(row: RowExpr) : Int = match row {
   REmpty -> 0
@@ -138,7 +143,7 @@ fn mig_row_flips(row: RowExpr) : Int = match row {
 }
 
 fn mig_row_label_flips(l: RowLabel) : Int = match l {
-  RL(_, targs, _) -> sum_flips(map(targs, mig_ty_flips))
+  RL(_, targs) -> sum_flips(map(targs, mig_ty_flips))
 }
 
 fn add_int(a: Int, b: Int) : Int = a + b
@@ -174,7 +179,7 @@ pub fn expr_flip_count(e: Expr) : Int = match e.kind {
   EMapPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
   EFlatMapPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
   EFilterPipe(l, r) -> add_int(expr_flip_count(l), expr_flip_count(r))
-  ERecordLit(_, _, fields) -> sum_flips(map(fields, field_init_flip_count))
+  ERecordLit(_, fields) -> sum_flips(map(fields, field_init_flip_count))
   EList(elems) -> sum_flips(map(elems, elem_flip_count))
   ERange(lo, hi, step) -> add_int(add_int(expr_flip_count(lo), expr_flip_count(hi)), opt_flip_count(step))
   ELitUnit(inner, _) -> expr_flip_count(inner)

@@ -1,10 +1,7 @@
-#[doc("The binders a frame introduces and the small name-set operations the unwind analysis runs on them.")]
+#[doc("The binders a frame introduces and the small binder-set operations the unwind analysis runs on them.")]
 
 import compiler.ast
-import compiler.util
 import compiler.expr_positions
-import compiler.sym_read
-import compiler.fnreg
 import compiler.modules
 
 #[doc("True when a match on `s` owns its scrutinee (it is not a borrow).")]
@@ -16,14 +13,24 @@ pub fn unw_scr_owned(s: Expr) : Bool = match s.kind {
   _ -> true
 }
 
-#[doc("The names among `xs` that bind a local (`_`-prefixed ones do not).")]
-pub fn unw_rc_names(xs: [String]) : [String] = match xs {
+#[doc("True when `xs` holds the binder `l`.")]
+pub fn unw_has(xs: [LocalId], l: LocalId) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> local_eq(x, l) or unw_has(rest, l)
+}
+
+# A binder a pattern still holds binds a local whatever its name: one
+# nothing reads is a wildcard by the time a frame is built.
+#[doc("The locals the binders `bs` bind, each holding a reference of its own.")]
+pub fn unw_rc_binders(bs: [Binder]) : [LocalId] = ub_ids(bs)
+
+fn ub_ids(bs: [Binder]) : [LocalId] = match bs {
   [] -> []
-  [x, ...rest] -> if string_starts_with_q(x, "_") { unw_rc_names(rest) } else { [x, ...unw_rc_names(rest)] }
+  [b, ...rest] -> [b.id, ...ub_ids(rest)]
 }
 
 #[doc("The binders of every owned match's arms and destructuring `let` in `e`, after `acc`.")]
-pub fn unw_arm_binders(e: Expr, acc: [String]) : [String] = match e.kind {
+pub fn unw_arm_binders(e: Expr, acc: [LocalId]) : [LocalId] = match e.kind {
   EMatch(s, arms) -> uw_arm_binders_arms(arms, unw_scr_owned(s), unw_arm_binders(s, acc))
   EBlock(ss, _) -> uw_arm_binders_ps(xp_positions(e), list_append(uw_let_binders(ss), acc))
   ELambda(_, _) -> acc
@@ -32,34 +39,34 @@ pub fn unw_arm_binders(e: Expr, acc: [String]) : [String] = match e.kind {
   _ -> uw_arm_binders_ps(xp_positions(e), acc)
 }
 
-fn uw_arm_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
+fn uw_arm_binders_ps(ps: [XPos], acc: [LocalId]) : [LocalId] = match ps {
   [] -> acc
   [XP(r, c), ...rest] -> uw_arm_binders_ps(rest, if xrole_inline(r) { unw_arm_binders(c, acc) } else { acc })
 }
 
-fn uw_arm_binders_arms(arms: [Arm], owned: Bool, acc: [String]) : [String] = match arms {
+fn uw_arm_binders_arms(arms: [Arm], owned: Bool, acc: [LocalId]) : [LocalId] = match arms {
   [] -> acc
   [Arm(pat, og, b), ...rest] -> {
-    let own = if owned { list_append(unw_rc_names(pat_binders(pat, [])), acc) } else { acc }
+    let own = if owned { list_append(unw_rc_binders(pat_binders(pat, [])), acc) } else { acc }
     let a1 = match og { None -> own Some(g) -> unw_arm_binders(g, own) }
     uw_arm_binders_arms(rest, owned, unw_arm_binders(b, a1))
   }
 }
 
-fn uw_let_binders(ss: [Stmt]) : [String] = match ss {
+fn uw_let_binders(ss: [Stmt]) : [LocalId] = match ss {
   [] -> []
   [SLet(pat, _, _), ...rest] -> list_append(unw_destructured(pat), uw_let_binders(rest))
   [_, ...rest] -> uw_let_binders(rest)
 }
 
 #[doc("The binders a destructuring `let` pattern owns, each bound with a reference of its own; none for a plain binder or `_`.")]
-pub fn unw_destructured(pat: Pattern) : [String] = match pat.pkind {
+pub fn unw_destructured(pat: Pattern) : [LocalId] = match pat.pkind {
   PBind(_) -> []
   PWild    -> []
-  _        -> unw_rc_names(pat_binders(pat, []))
+  _        -> unw_rc_binders(pat_binders(pat, []))
 }
 
-fn uw_arm_binders_loop(xs: [Expr], acc: [String]) : [String] = match xs {
+fn uw_arm_binders_loop(xs: [Expr], acc: [LocalId]) : [LocalId] = match xs {
   [] -> acc
   [x, ...rest] -> {
     let b = match x.kind { ELambda(_, body) -> body _ -> x }
@@ -67,38 +74,42 @@ fn uw_arm_binders_loop(xs: [Expr], acc: [String]) : [String] = match xs {
   }
 }
 
-#[doc("True when `name` is a loop intrinsic whose lambda body is pasted inline.")]
-pub fn unw_is_loop(name: String) : Bool =
-  name == "__loop_while" or name == "__loop_until" or name == "__loop_repeat"
+#[doc("True when `i` is a loop intrinsic whose lambda body is pasted inline.")]
+pub fn unw_is_loop(i: Intrinsic) : Bool = match i {
+  InLoopWhile  -> true
+  InLoopUntil  -> true
+  InLoopRepeat -> true
+  _            -> false
+}
 
 #[doc("Every binder `e` introduces, after `acc`, repeats kept; lambda bodies other than pasted loop bodies are other frames.")]
-pub fn unw_binders(e: Expr, acc: [String]) : [String] = match e.kind {
+pub fn unw_binders(e: Expr, acc: [LocalId]) : [LocalId] = match e.kind {
   EBlock(ss, ot) -> uw_binders_opt(ot, uw_binders_stmts(ss, acc))
   EMatch(s, arms) -> uw_binders_arms(arms, unw_binders(s, acc))
   ELambda(_, _) -> acc
   EIntrinsic(name, xs) ->
     if unw_is_loop(name) { uw_binders_loop(xs, acc) } else { uw_binders_ps(xp_positions(e), acc) }
-  EHandle(body, _, _, _, oi, _, _, oret) -> {
+  EHandle(body, _, _, oi, _, _, oret) -> {
     let a1 = unw_binders(body, uw_binders_opt(oi, acc))
     match oret {
       None -> a1
-      Some(HR(p, b, _, _)) -> unw_binders(b, [p, ...a1])
+      Some(HR(p, b, _, _)) -> unw_binders(b, [p.id, ...a1])
     }
   }
   _ -> uw_binders_ps(xp_positions(e), acc)
 }
 
-fn uw_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
+fn uw_binders_ps(ps: [XPos], acc: [LocalId]) : [LocalId] = match ps {
   [] -> acc
   [XP(r, c), ...rest] -> if xrole_inline(r) { uw_binders_ps(rest, unw_binders(c, acc)) } else { uw_binders_ps(rest, acc) }
 }
 
-fn uw_binders_opt(o: Option[Expr], acc: [String]) : [String] = match o {
+fn uw_binders_opt(o: Option[Expr], acc: [LocalId]) : [LocalId] = match o {
   None    -> acc
   Some(x) -> unw_binders(x, acc)
 }
 
-fn uw_binders_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+fn uw_binders_stmts(ss: [Stmt], acc: [LocalId]) : [LocalId] = match ss {
   [] -> acc
   [s, ...rest] -> {
     let inner = uw_binders_ps(xp_positions(Expr { kind: EBlock([s], None), line: 0, col: 0, ty: None, mode: MUnknown , site: 0 }), acc)
@@ -106,69 +117,71 @@ fn uw_binders_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
   }
 }
 
-fn uw_binders_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+fn uw_binders_arms(arms: [Arm], acc: [LocalId]) : [LocalId] = match arms {
   [] -> acc
   [Arm(pat, og, b), ...rest] ->
-    uw_binders_arms(rest, unw_binders(b, uw_binders_opt(og, list_append(pat_binders(pat, []), acc))))
+    uw_binders_arms(rest, unw_binders(b, uw_binders_opt(og, list_append(ub_ids(pat_binders(pat, [])), acc))))
 }
 
-fn uw_binders_loop(xs: [Expr], acc: [String]) : [String] = match xs {
+fn uw_binders_loop(xs: [Expr], acc: [LocalId]) : [LocalId] = match xs {
   [] -> acc
   [x, ...rest] -> match x.kind {
-    ELambda(ps, b) -> uw_binders_loop(rest, unw_binders(b, list_append(map(ps, (p) => p.pname), acc)))
+    ELambda(ps, b) -> uw_binders_loop(rest, unw_binders(b, list_append(map(ps, (p) => p.binder.id), acc)))
     _ -> uw_binders_loop(rest, unw_binders(x, acc))
   }
 }
 
-#[doc("The names `xs` holds more than once.")]
-pub fn unw_dups(xs: [String], seen: [String], acc: [String]) : [String] = match xs {
+#[doc("The binders `xs` holds more than once.")]
+pub fn unw_dups(xs: [LocalId], seen: [LocalId], acc: [LocalId]) : [LocalId] = match xs {
   [] -> acc
   [x, ...rest] ->
-    if list_has(seen, x) { unw_dups(rest, seen, if list_has(acc, x) { acc } else { [x, ...acc] }) }
+    if unw_has(seen, x) { unw_dups(rest, seen, if unw_has(acc, x) { acc } else { [x, ...acc] }) }
     else { unw_dups(rest, [x, ...seen], acc) }
 }
 
-#[doc("The names of `xs` not in `ys`, in order.")]
-pub fn unw_minus(xs: [String], ys: [String]) : [String] = if ub_meets(xs, ys) { ub_minus(xs, ys) } else { xs }
+#[doc("The binders of `xs` not in `ys`, in order.")]
+pub fn unw_minus(xs: [LocalId], ys: [LocalId]) : [LocalId] = if ub_meets(xs, ys) { ub_minus(xs, ys) } else { xs }
 
-fn ub_minus(xs: [String], ys: [String]) : [String] = match xs {
+fn ub_minus(xs: [LocalId], ys: [LocalId]) : [LocalId] = match xs {
   [] -> []
-  [x, ...rest] -> if list_has(ys, x) { ub_minus(rest, ys) } else { [x, ...ub_minus(rest, ys)] }
+  [x, ...rest] -> if unw_has(ys, x) { ub_minus(rest, ys) } else { [x, ...ub_minus(rest, ys)] }
 }
 
-fn ub_meets(xs: [String], ys: [String]) : Bool = match xs {
+fn ub_meets(xs: [LocalId], ys: [LocalId]) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> list_has(ys, x) or ub_meets(rest, ys)
+  [x, ...rest] -> unw_has(ys, x) or ub_meets(rest, ys)
 }
 
-fn ub_within(xs: [String], ys: [String]) : Bool = match xs {
+fn ub_within(xs: [LocalId], ys: [LocalId]) : Bool = match xs {
   [] -> true
-  [x, ...rest] -> list_has(ys, x) and ub_within(rest, ys)
+  [x, ...rest] -> unw_has(ys, x) and ub_within(rest, ys)
 }
 
-#[doc("The names of `xs` also in `ys`, in order.")]
-pub fn unw_inter(xs: [String], ys: [String]) : [String] = if ub_within(xs, ys) { xs } else { ub_inter(xs, ys) }
+#[doc("The binders of `xs` also in `ys`, in order.")]
+pub fn unw_inter(xs: [LocalId], ys: [LocalId]) : [LocalId] = if ub_within(xs, ys) { xs } else { ub_inter(xs, ys) }
 
-fn ub_inter(xs: [String], ys: [String]) : [String] = match xs {
+fn ub_inter(xs: [LocalId], ys: [LocalId]) : [LocalId] = match xs {
   [] -> []
-  [x, ...rest] -> if list_has(ys, x) { [x, ...ub_inter(rest, ys)] } else { ub_inter(rest, ys) }
+  [x, ...rest] -> if unw_has(ys, x) { [x, ...ub_inter(rest, ys)] } else { ub_inter(rest, ys) }
 }
 
-#[doc("`xs` plus the names of `ys` it lacks.")]
-pub fn unw_union(xs: [String], ys: [String]) : [String] = match ys {
+#[doc("`xs` plus the binders of `ys` it lacks.")]
+pub fn unw_union(xs: [LocalId], ys: [LocalId]) : [LocalId] = match ys {
   [] -> xs
-  [y, ...rest] -> if list_has(xs, y) { unw_union(xs, rest) } else { unw_union([y, ...xs], rest) }
+  [y, ...rest] -> if unw_has(xs, y) { unw_union(xs, rest) } else { unw_union([y, ...xs], rest) }
 }
 
-#[doc("The names statement `s` binds.")]
-pub fn unw_stmt_binders(s: Stmt) : [String] = match s {
-  SLet(pat, _, _)        -> pat_binders(pat, [])
-  SVar(n, _, _, _, _)    -> [n]
+#[doc("The binders statement `s` binds.")]
+pub fn unw_stmt_binders(s: Stmt) : [LocalId] = match s {
+  SLet(pat, _, _)        -> ub_ids(pat_binders(pat, []))
+  SVar(b, _, _, _, _)    -> [b.id]
   _                      -> []
 }
 
 #[doc("True when `e` reads a variable as is: the frame holds that reference until the construct reading it runs.")]
-pub fn unw_bare_read(e: Expr) : Bool = match sym_read_kind(e.kind) {
-  EVar(_) -> true
-  _       -> false
+pub fn unw_bare_read(e: Expr) : Bool = match e.kind {
+  ELocal(_)  -> true
+  ESym(_, _) -> true
+  EOp(_)     -> true
+  _          -> false
 }

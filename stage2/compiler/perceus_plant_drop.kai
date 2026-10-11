@@ -11,18 +11,15 @@
 # never attempted.
 
 import compiler.ast
-import compiler.util
-import compiler.sym_read
-import compiler.fnreg
-import compiler.sym_read
 import compiler.perceus_reads
 import compiler.self_call
+import compiler.ret_slots
 
-pub fn ppd_plant(e: Expr, self_name: SelfRef, names: [String]) : Option[Expr] =
+pub fn ppd_plant(e: Expr, self_name: SelfRef, names: [Binder]) : Option[Expr] =
   if not ppd_has_self_call(e, self_name) { Some(ppd_wrap_leaf(e, names)) }
   else { ppd_plant_kind(e, self_name, names) }
 
-fn ppd_plant_kind(e: Expr, self_name: SelfRef, names: [String]) : Option[Expr] = match e.kind {
+fn ppd_plant_kind(e: Expr, self_name: SelfRef, names: [Binder]) : Option[Expr] = match e.kind {
   ECall(f, xs)    -> Some(ppd_hoist_call(e, f, xs, names))
   EIf(c, t, oe)   -> ppd_plant_if(e, c, t, oe, self_name, names)
   EMatch(s, arms) -> match ppd_plant_arms(arms, self_name, names, []) {
@@ -34,14 +31,14 @@ fn ppd_plant_kind(e: Expr, self_name: SelfRef, names: [String]) : Option[Expr] =
 }
 
 fn ppd_plant_if(e: Expr, c: Expr, t: Expr, oe: Option[Expr],
-                self_name: SelfRef, names: [String]) : Option[Expr] = match oe {
+                self_name: SelfRef, names: [Binder]) : Option[Expr] = match oe {
   None     -> None
   Some(e2) -> ppd_both(ppd_plant(t, self_name, names), ppd_plant(e2, self_name, names),
                        (t2, e22) => ppd_rekind(e, EIf(c, t2, Some(e22))))
 }
 
 fn ppd_plant_block(e: Expr, bstmts: [Stmt], obt: Option[Expr],
-                   self_name: SelfRef, names: [String]) : Option[Expr] = match obt {
+                   self_name: SelfRef, names: [Binder]) : Option[Expr] = match obt {
   None -> None
   Some(bt) ->
     # An inner planting already hoisted this call's args: every read is
@@ -54,7 +51,7 @@ fn ppd_plant_block(e: Expr, bstmts: [Stmt], obt: Option[Expr],
                    (bt2) => ppd_rekind(e, EBlock(bstmts, Some(bt2)))) }
 }
 
-fn ppd_plant_arms(arms: [Arm], self_name: SelfRef, names: [String],
+fn ppd_plant_arms(arms: [Arm], self_name: SelfRef, names: [Binder],
                   acc: [Arm]) : Option[[Arm]] = match arms {
   [] -> Some(list_reverse(acc))
   [a, ...rest] -> match a {
@@ -78,12 +75,12 @@ fn ppd_both(a: Option[Expr], b: Option[Expr], f: (Expr, Expr) -> Expr) : Option[
 fn ppd_rekind(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-fn ppd_wrap_leaf(e: Expr, names: [String]) : Expr = ppd_bind_then(e, ppd_drops(names, e.line, e.col))
+fn ppd_wrap_leaf(e: Expr, names: [Binder]) : Expr = ppd_bind_then(e, ppd_drops(names, e.line, e.col))
 
 #[doc("Bind `e`, run `stmts`, yield the value. The read keeps `e`'s type and mode, so an unboxed value binds a raw local.")]
 pub fn ppd_bind_then(e: Expr, stmts: [Stmt]) : Expr = {
-  let ret_let = SLet(mk_pat(PBind("__pcs_tret"), e.line, e.col), None, e)
-  let ret_var = Expr { kind: EVar("__pcs_tret"), line: e.line, col: e.col,
+  let ret_let = SLet(mk_pat(PBind(ret_slot_binder(RsTail)), e.line, e.col), None, e)
+  let ret_var = Expr { kind: ELocal(ret_slot_local(RsTail)), line: e.line, col: e.col,
                        ty: e.ty, mode: e.mode,  site: e.site }
   ppd_rekind(e, EBlock([ret_let, ...stmts], Some(ret_var)))
 }
@@ -94,17 +91,17 @@ pub fn ppd_hoist_then(call: Expr, stmts: [Stmt]) : Expr = match call.kind {
   _            -> call
 }
 
-#[doc("True when `d` is no drop, or drops a name in `names`.")]
-pub fn ppd_drop_among(d: Stmt, names: [String]) : Bool = match ppd_drop_name(d) {
-  Some(nm) -> list_has(names, nm)
-  None     -> true
+#[doc("True when `d` is no drop, or drops a binder in `names`.")]
+pub fn ppd_drop_among(d: Stmt, names: [Binder]) : Bool = match ppd_drop_name(d) {
+  Some(l) -> pcs_has(names, l)
+  None    -> true
 }
 
 
 # Bind the args left-to-right (evaluation order unchanged), drop after
 # that last read, re-issue the call as the block tail. Each read carries
 # the argument's type and mode — an unboxed argument binds a raw local.
-fn ppd_hoist_call(e: Expr, f: Expr, xs: [Expr], names: [String]) : Expr =
+fn ppd_hoist_call(e: Expr, f: Expr, xs: [Expr], names: [Binder]) : Expr =
   ppd_hoist_with(e, f, xs, ppd_drops(names, e.line, e.col))
 
 fn ppd_hoist_with(e: Expr, f: Expr, xs: [Expr], stmts: [Stmt]) : Expr {
@@ -114,18 +111,16 @@ fn ppd_hoist_with(e: Expr, f: Expr, xs: [Expr], stmts: [Stmt]) : Expr {
 
 fn ppd_hoist_lets(xs: [Expr], i: Int) : [Stmt] = match xs {
   []           -> []
-  [a, ...rest] -> [SLet(mk_pat(PBind(ppd_tmp(i)), a.line, a.col), None, a),
+  [a, ...rest] -> [SLet(mk_pat(PBind(ret_slot_binder(RsTailArg(i))), a.line, a.col), None, a),
                    ...ppd_hoist_lets(rest, i + 1)]
 }
 
 fn ppd_hoist_reads(xs: [Expr], i: Int) : [Expr] = match xs {
   []           -> []
-  [a, ...rest] -> [Expr { kind: EVar(ppd_tmp(i)), line: a.line, col: a.col,
+  [a, ...rest] -> [Expr { kind: ELocal(ret_slot_local(RsTailArg(i))), line: a.line, col: a.col,
                           ty: a.ty, mode: a.mode,  site: a.site },
                    ...ppd_hoist_reads(rest, i + 1)]
 }
-
-fn ppd_tmp(i: Int) : String = string_concat("__pcs_ta", int_to_string(i))
 
 # A block the planting pass built around a self-call: arg temps, drops,
 # then the call as tail. Consumers that reason about "reads in the tail"
@@ -133,21 +128,18 @@ fn ppd_tmp(i: Int) : String = string_concat("__pcs_ta", int_to_string(i))
 pub fn ppd_is_hoist_block(stmts: [Stmt]) : Bool = match stmts {
   []           -> false
   [s, ...rest] -> match s {
-    SLet(pat, _, _) -> match pat.pkind {
-      PBind(nm) -> string_starts_with_q(nm, "__pcs_ta") or ppd_is_hoist_block(rest)
-      _         -> ppd_is_hoist_block(rest)
-    }
-    _ -> ppd_is_hoist_block(rest)
+    SLet(pat, _, _) -> ret_slot_binds_tail_arg(pat, 0) or ppd_is_hoist_block(rest)
+    _               -> ppd_is_hoist_block(rest)
   }
 }
 
-pub fn ppd_drops(names: [String], ln: Int, cl: Int) : [Stmt] = match names {
-  []            -> []
-  [nm, ...rest] -> [ppd_drop_stmt(nm, ln, cl), ...ppd_drops(rest, ln, cl)]
+pub fn ppd_drops(names: [Binder], ln: Int, cl: Int) : [Stmt] = match names {
+  []           -> []
+  [b, ...rest] -> [ppd_drop_stmt(b.id, ln, cl), ...ppd_drops(rest, ln, cl)]
 }
 
-#[doc("The names a statement list binds, for shadowing checks.")]
-pub fn ppd_let_names(stmts: [Stmt]) : [String] = match stmts {
+#[doc("The binders a statement list declares, for shadowing checks.")]
+pub fn ppd_let_names(stmts: [Stmt]) : [Binder] = match stmts {
   []           -> []
   [s, ...rest] -> match s {
     SLet(pat, _, _)     -> prc_pat_bindings(pat, ppd_let_names(rest))
@@ -157,9 +149,9 @@ pub fn ppd_let_names(stmts: [Stmt]) : [String] = match stmts {
 }
 
 #[doc("The binder a `__perceus_drop` statement releases, or `None` for any other statement.")]
-pub fn ppd_drop_name(s: Stmt) : Option[String] = match s {
+pub fn ppd_drop_name(s: Stmt) : Option[LocalId] = match s {
   SExprStmt(e) -> match e.kind {
-    ECall(callee, args_) -> match sym_read_kind(callee.kind) {
+    ECall(callee, args_) -> match callee.kind {
       EMark(MkDrop) -> ppd_sole_var(args_)
       _             -> None
     }
@@ -168,17 +160,17 @@ pub fn ppd_drop_name(s: Stmt) : Option[String] = match s {
   _ -> None
 }
 
-fn ppd_sole_var(args_: [Expr]) : Option[String] = match args_ {
-  [a] -> match sym_read_kind(a.kind) {
-    EVar(nm) -> Some(nm)
-    _        -> None
+fn ppd_sole_var(args_: [Expr]) : Option[LocalId] = match args_ {
+  [a] -> match a.kind {
+    ELocal(l) -> Some(l)
+    _         -> None
   }
   _ -> None
 }
 
-fn ppd_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
+fn ppd_drop_stmt(b: LocalId, ln: Int, cl: Int) : Stmt =
   SExprStmt(mk_expr(
-    ECall(mk_expr(EMark(MkDrop), ln, cl), [mk_ref(nm, ln, cl)]),
+    ECall(mk_expr(EMark(MkDrop), ln, cl), [mk_local(b, ln, cl)]),
     ln, cl))
 
 # A self-call anywhere in tail position, however deep the tails nest.

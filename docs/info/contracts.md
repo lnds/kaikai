@@ -58,6 +58,14 @@ fn clamp_low(n: NonNeg) : NonNeg = n
 fn main() : Int = clamp_low(3)
 ```
 
+A predicate's names are read where the refinement is written. An
+alias's predicate sees what the module declaring the alias sees,
+wherever the alias is used: a function it calls is never replaced by a
+binder or a function of the using module that shares its name. `self`
+is always the refined value, also beside a parameter named `self`. A
+parameter's refinement may name the parameter instead (`x: Int where
+x > 0`): it is the same predicate as `self > 0`.
+
 A refinement is a subtype of its base: passing a `NonNeg` where an
 `Int` is expected is free (upcast). Going the other way (a plain `Int`
 into a `NonNeg`) is a downcast — the predicate is checked, statically

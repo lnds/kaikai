@@ -14,8 +14,8 @@ shapes it always saw:
   - `SfEnsure(value, pred)`         -> `{ let self = value;
     if pred { Some(self) } else { None } }`.
   - `SAssign(lhs, v)`               -> `lhs.set(v)` statement.
-  - `PList` rest spelling `""`/`"_"` -> unique `__list_rest_L_C__`
-    sentinel binder.
+  - `PsAnonRest(pats, _)`           -> `PList` with a unique
+    `__list_rest_L_C__` sentinel binder.
   - `DImpl` tparams                 -> prepended (bounds stripped) to
     each method's own tparams; the raw slot stays for the writer.
   - `DFn` tparams                   -> protocol bounds stripped; the
@@ -36,61 +36,68 @@ survives it.
 
 import compiler.util
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.ast_map
 import compiler.parse
 import compiler.refinements
+import compiler.interp_pattern
 import compiler.underscore_binders
 import compiler.tparam_bounds
+import compiler.core_effects
 
 #[doc("Lower every surface-fidelity node in the decl list; the result is the AST the rest of the pipeline consumes.")]
-pub fn surface_lower_decls(ds: [Decl]) : [Decl] = map(ds, (d) => sfl_decl(d))
+pub fn surface_lower_decls(ds: [Decl], tab: SymTab) : [Decl] = map(ds, (d) => sfl_decl(d, tab))
 
 # String-interpolation content is parsed after the decl-level pass ran,
 # so that late parse re-enters lowering through this entry point.
 #[doc("Lower the surface-fidelity nodes of one expression parsed after the decl pass.")]
 pub fn surface_lower_expr(e: Expr) : Expr = sfl_expr(e)
 
-fn sfl_decl(d: Decl) : Decl = match d {
-  DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(is_pub, name, map(tps, tp_strip_bounds), sfl_params(ps),
-        sfl_ty_opt(ret), sfl_row(row), sfl_fn_body(body, ps, name), l, c, mo, fsym)
+fn sfl_decl(d: Decl, tab: SymTab) : Decl = match d {
+  DFn(is_pub, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, fid, map(tps, tp_strip_bounds), sfl_params(ps),
+        sfl_ty_opt(ret), sfl_row(row), sfl_fn_body(body, ps, tab, fid), l, c, mo)
   DImpl(pn, pargs, tgt, ms, l, c, impl_tps, isym) ->
     DImpl(pn, map(pargs, (x) => sfl_ty(x)), sfl_ty(tgt),
-          sfl_impl_methods(impl_tps, ms), l, c, impl_tps, isym)
-  DType(is_pub, name, tps, body, l, c, mo, slots, tsym) ->
-    DType(is_pub, name, tps, sfl_type_body(body), l, c, mo, slots, tsym)
+          sfl_impl_methods(impl_tps, ms, tab), l, c, impl_tps, isym)
+  DType(is_pub, tsym, tps, body, l, c, mo, slots) ->
+    DType(is_pub, tsym, tps, sfl_type_body(body), l, c, mo, slots)
   DTest(label, body, l, c, mo)      -> DTest(label, sfl_expr(body), l, c, mo)
   DBench(label, body, l, c, mo)     -> DBench(label, sfl_expr(body), l, c, mo)
   DCheck(label, ps, body, l, c, mo) -> DCheck(label, sfl_params(ps), sfl_expr(body), l, c, mo)
-  DConst(is_pub, name, ty, body, mo, l, c, csym) ->
-    DConst(is_pub, name, sfl_ty(ty), sfl_expr(body), mo, l, c, csym)
-  DEffect(is_pub, name, tps, ops, default_opt, l, c, mo, esym) ->
-    DEffect(is_pub, name, tps, map(ops, (op) => sfl_effect_op(op)),
-            sfl_default(default_opt), l, c, mo, esym)
-  DProtocol(is_pub, name, tps, ops, l, c, mo, psym) ->
-    DProtocol(is_pub, name, tps, map(ops, (op) => sfl_proto_op(op)), l, c, mo, psym)
+  DConst(is_pub, csym, ty, body, mo, l, c) ->
+    DConst(is_pub, csym, sfl_ty(ty), sfl_expr(body), mo, l, c)
+  DEffect(is_pub, esym, tps, ops, default_opt, l, c, mo) ->
+    DEffect(is_pub, esym, tps, map(ops, (op) => sfl_effect_op(op)),
+            sfl_default(default_opt), l, c, mo)
+  DProtocol(is_pub, psym, tps, ops, l, c, mo) ->
+    DProtocol(is_pub, psym, tps, map(ops, (op) => sfl_proto_op(op)), l, c, mo)
   DAxiom(ec, ov, name, sym, tps, ps, ret, row, l, c) ->
     DAxiom(ec, ov, name, sym, tps, sfl_params(ps), sfl_ty(ret), sfl_row(row), l, c)
   DExternType(name, body, l, c, mo) -> DExternType(name, sfl_extern_body(body), l, c, mo)
-  DDerive(names, inner, l, c)   -> DDerive(names, sfl_decl(inner), l, c)
-  DUnstable(inner, l, c)        -> DUnstable(sfl_decl(inner), l, c)
-  DConstructor(inner, l, c)     -> DConstructor(sfl_decl(inner), l, c)
-  DProtoLaws(thy, inner, l, c, mo)  -> DProtoLaws(thy, sfl_decl(inner), l, c, mo)
-  DImplAxiom(thy, inner, l, c, mo)  -> DImplAxiom(thy, sfl_decl(inner), l, c, mo)
-  DDoc(raw, syn, inner, l, c)   -> DDoc(raw, syn, sfl_decl(inner), l, c)
+  DDerive(names, inner, l, c)   -> DDerive(names, sfl_decl(inner, tab), l, c)
+  DUnstable(inner, l, c)        -> DUnstable(sfl_decl(inner, tab), l, c)
+  DConstructor(inner, l, c)     -> DConstructor(sfl_decl(inner, tab), l, c)
+  DProtoLaws(thy, inner, l, c, mo)  -> DProtoLaws(thy, sfl_decl(inner, tab), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo)  -> DImplAxiom(thy, sfl_decl(inner, tab), l, c, mo)
+  DDoc(raw, syn, inner, l, c)   -> DDoc(raw, syn, sfl_decl(inner, tab), l, c)
   # Attribute wrappers are dissolved by the doc strip before lowering
   # runs; dissolve here too so a stray one cannot leak downstream.
-  DAttr(_, inner, _, _)         -> sfl_decl(inner)
+  DAttr(_, inner, _, _)         -> sfl_decl(inner, tab)
   _ -> d
 }
 
 # Contract clauses are legal only at the top of a fn body, where the
-# owning decl supplies the params and name their lowering needs.
-fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kind {
+# owning decl supplies the params their lowering needs and the name
+# their violation message spells.
+fn sfl_fn_body(body: Expr, ps: [Param], tab: SymTab, owner: FnId) : Expr = match body.kind {
   ESurface(sf) -> match sf {
     SfContract(reqs, enss, inner) ->
       wrap_with_contracts(sfl_expr(inner), map(reqs, (e) => sfl_expr(e)),
-                          map(enss, (e) => sfl_expr(e)), ps, fn_name,
+                          map(enss, (e) => sfl_expr(e)), ps,
+                          decl_name(tab, fnid_sym(owner)),
                           body.line, body.col)
     SfEnsure(_, _) -> sfl_expr(body)
     SfLamBlock(_, _) -> sfl_expr(body)
@@ -102,6 +109,7 @@ fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kin
     SfRefMake(_) -> sfl_expr(body)
     SfDeref(_) -> sfl_expr(body)
     SfMultiMatch(_, _) -> sfl_expr(body)
+    SfFieldPun(_) -> sfl_expr(body)
     # `case`-arms discriminate on the owning fn's params: one param
     # lowers to a plain match, several to the multi-match chain.
     SfCaseBlock(arms) -> {
@@ -119,7 +127,7 @@ fn sfl_fn_body(body: Expr, ps: [Param], fn_name: String) : Expr = match body.kin
 
 fn sfl_mmarm(a: MMArm) : MMArm = match a {
   MMArm(pats, guard, body) ->
-    MMArm(map(pats, (x) => sfl_pat(x)), sfl_opt(guard), sfl_expr(body))
+    ipat_mmarm(MMArm(map(pats, (x) => sfl_pat(x)), sfl_opt(guard), sfl_expr(body)))
 }
 
 fn sfl_mmarm_to_arm(a: MMArm) : Arm = match a {
@@ -129,18 +137,18 @@ fn sfl_mmarm_to_arm(a: MMArm) : Arm = match a {
   }
 }
 
-fn sfl_param_var(pm: Param) : Expr = mk_ref(pm.pname, pm.pline, pm.pcol)
+fn sfl_param_var(pm: Param) : Expr = mk_expr(EName(pm.binder.name), pm.pline, pm.pcol)
 
 # Prepend the impl-level tparams to each method's own tparams. Bounds
 # are stripped: the pipeline uses these strings as plain ident keys.
-fn sfl_impl_methods(impl_tps: [String], ms: [Decl]) : [Decl] {
+fn sfl_impl_methods(impl_tps: [String], ms: [Decl], tab: SymTab) : [Decl] {
   let stripped = map(impl_tps, tp_strip_bounds)
-  map(ms, (m) => sfl_impl_method(stripped, m))
+  map(ms, (m) => sfl_impl_method(stripped, m, tab))
 }
 
-fn sfl_impl_method(stripped: [String], m: Decl) : Decl = match sfl_decl(m) {
-  DFn(is_pub, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(is_pub, n, list_append(stripped, tps), ps, ret, row, body, l, c, mo, fsym)
+fn sfl_impl_method(stripped: [String], m: Decl, tab: SymTab) : Decl = match sfl_decl(m, tab) {
+  DFn(is_pub, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, fid, list_append(stripped, tps), ps, ret, row, body, l, c, mo)
   other -> other
 }
 
@@ -156,21 +164,24 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
     SfContract(_, _, _) -> panic("surface_lower: contract clauses outside a fn body")
     SfLamBlock(lam, _) -> sfl_expr(lam)
     SfTuple(elems) ->
-      mk_expr(ERecordLit(sfl_tuple_ref(list_length(elems)), sfl_tuple_name(list_length(elems)),
+      mk_expr(ERecordLit(sfl_tuple_ref(list_length(elems)),
                          build_tuple_field_inits(map(elems, (x) => sfl_expr(x)), 0, [])),
               e.line, e.col)
     SfHandleInit(init) -> sfl_expr(init)
     SfBigIntLit(digits) -> sfl_bigint(digits, e.line, e.col)
     SfRefMake(inner) ->
-      sfl_coll_call("Mutable", "ref_make", [sfl_expr(inner)], e.line, e.col)
-    # A bare `@ident` lowers to the sentinel `ident.__deref()` — a
-    # reserved name the user cannot spell — so the cell-read lowering
-    # can tell a `@`-deref from a literal `ident.get()`. A dotted
-    # `@r.field` cannot be a cell, so it lowers straight to `.get()`.
+      mk_expr(ECall(mk_expr(EField(sfl_core_effect(CeMutable, e.line, e.col), "ref_make"), e.line, e.col),
+                    [sfl_expr(inner)]), e.line, e.col)
+    # A bare `@ident` lowers to a `MkDeref` call on the reference, so
+    # the cell-read lowering can tell a `@`-deref from a literal
+    # `ident.get()`. A dotted `@r.field` cannot be a cell, so it lowers
+    # straight to `.get()`.
     SfDeref(target) -> {
       let tgt = sfl_expr(target)
-      let sentinel = match tgt.kind { EVar(_) -> "__deref" _ -> "get" }
-      mk_expr(ECall(mk_expr(EField(tgt, sentinel), e.line, e.col), []), e.line, e.col)
+      match tgt.kind {
+        EName(_) -> mk_expr(ECall(mk_expr(EMark(MkDeref), e.line, e.col), [tgt]), e.line, e.col)
+        _       -> mk_expr(ECall(mk_expr(EField(tgt, "get"), e.line, e.col), []), e.line, e.col)
+      }
     }
     SfMultiMatch(scruts, arms) ->
       desugar_multi_match(map(scruts, (x) => sfl_expr(x)),
@@ -179,33 +190,24 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
     SfCaseBlock(_) -> panic("surface_lower: case-block outside a fn body")
     SfMapLit(spread, flat) -> sfl_map_lit(sfl_spread(spread), sfl_pairs(flat), e.line, e.col)
     SfSetLit(spread, elems) -> sfl_set_lit(sfl_spread(spread), map(elems, (x) => sfl_expr(x)), e.line, e.col)
+    SfFieldPun(value) -> sfl_expr(value)
   }
   # EMatch and EBlock carry patterns / statement shapes the generic
   # child-mapper does not rewrite; ELambda / EHandle / EVariantsOf
   # carry type annotations it does not reach. They recurse here.
   EMatch(scrut, arms) ->
-    sfl_rebuild(e, EMatch(sfl_expr(scrut), map(arms, (a) => ub_arm(sfl_arm(a)))))
+    sfl_rebuild(e, EMatch(sfl_expr(scrut), map(arms, (a) => ub_arm(ipat_arm(sfl_arm(a))))))
   EBlock(stmts, tail) -> {
     let t = sfl_opt(tail)
     sfl_rebuild(e, EBlock(ub_block(map(stmts, (st) => sfl_stmt(st)), t), t))
   }
   ELambda(ps, body) -> sfl_rebuild(e, ELambda(sfl_params(ps), sfl_expr(body)))
-  EHandle(body, eff, hsym, tyargs, init, alias, cs, ret) ->
-    sfl_rebuild(e, EHandle(sfl_expr(body), eff, hsym, map(tyargs, (x) => sfl_ty(x)),
+  EHandle(body, eff, tyargs, init, alias, cs, ret) ->
+    sfl_rebuild(e, EHandle(sfl_expr(body), eff, map(tyargs, (x) => sfl_ty(x)),
                            sfl_opt(init), alias, map(cs, (cl) => sfl_hclause(cl)),
                            sfl_hreturn_opt(ret)))
   EVariantsOf(t, names) -> sfl_rebuild(e, EVariantsOf(sfl_ty(t), names))
-  # Pun markers normalise to the plain field name; the spread and
-  # positional sentinels stay for the record desugar downstream.
-  ERecordLit(rh, name, fields) ->
-    sfl_rebuild(e, ERecordLit(rh, name, map(fields, (f) => sfl_field_init(f))))
   _ -> sfl_rebuild(e, prc_map_expr_kind(e.kind, (x) => sfl_expr(x)))
-}
-
-fn sfl_field_init(f: FieldInit) : FieldInit = match f {
-  FI(n, v) ->
-    if is_pun_field_marker(n) { FI(pun_field_name(n), sfl_expr(v)) }
-    else { FI(n, sfl_expr(v)) }
 }
 
 fn sfl_rebuild(e: Expr, k: ExprKind) : Expr =
@@ -220,16 +222,16 @@ fn sfl_opt(o: Option[Expr]) : Option[Expr] = match o {
 # the predicate (which conventionally reads `self`) sees a regular
 # local.
 fn sfl_ensure(value: Expr, pred: Expr, line: Int, col: Int) : Expr {
-  let self_let = SLet(mk_pat(PBind("self"), line, col), None, value)
-  let some_call = mk_expr(ECall(mk_ref("Some", line, col),
-                                [mk_ref("self", line, col)]), line, col)
+  let self_let = SLet(mk_pat(PBind(binder_written("self")), line, col), None, value)
+  let some_call = mk_expr(ECall(mk_name("Some", line, col),
+                                [mk_name("self", line, col)]), line, col)
   let if_expr = mk_expr(EIf(pred, some_call,
-                            Some(mk_ref("None", line, col))), line, col)
+                            Some(mk_name("None", line, col))), line, col)
   mk_expr(EBlock([self_let], Some(if_expr)), line, col)
 }
 
 # `123n` expansion: `bigint.from_literal("123")`. The callee is
-# `EField(EVar("bigint"), ..)` so the qualified-call resolver rewrites
+# `EField(EName("bigint"), ..)` so the qualified-call resolver rewrites
 # it to an `EModCall` once the module is imported, as the numeric
 # literal sugars do.
 fn sfl_bigint(digits: String, line: Int, col: Int) : Expr {
@@ -237,10 +239,15 @@ fn sfl_bigint(digits: String, line: Int, col: Int) : Expr {
   sfl_coll_call("bigint", "from_literal", [s_e], line, col)
 }
 
-# `EField(EVar(mod), fn)`: the unresolved qualified callee the
+# A core effect as the base of an op call, already settled: a user
+# effect of the same name is another declaration.
+fn sfl_core_effect(c: CoreEffect, line: Int, col: Int) : Expr =
+  mk_sym(core_effect_id(c), line, col)
+
+# `EField(EName(mod), fn)`: the unresolved qualified callee the
 # qualified-call resolver rewrites into an `EModCall`.
 fn sfl_coll_call(mod: String, fn_name: String, args: [Expr], line: Int, col: Int) : Expr {
-  let callee = mk_expr(EField(mk_ref(mod, line, col), fn_name), line, col)
+  let callee = mk_expr(EField(mk_name(mod, line, col), fn_name), line, col)
   mk_expr(ECall(callee, args), line, col)
 }
 
@@ -267,7 +274,7 @@ fn sfl_map_lit(spread: Option[Expr], flat: [Expr], line: Int, col: Int) : Expr =
 fn sfl_pair_elems(flat: [Expr], acc: [ListElem]) : [ListElem] = match flat {
   [] -> list_reverse(acc)
   [k, v, ...rest] ->
-    sfl_pair_elems(rest, [ElPlain(mk_expr(ERecordLit(sfl_tuple_ref(2), "Pair", [FI("fst", k), FI("snd", v)]),
+    sfl_pair_elems(rest, [ElPlain(mk_expr(ERecordLit(sfl_tuple_ref(2), [FI("fst", k), FI("snd", v)]),
                                           k.line, k.col)), ...acc])
   _ -> panic("surface_lower: map literal with an odd entry list")
 }
@@ -302,7 +309,7 @@ fn sfl_stmt(st: Stmt) : Stmt = match st {
     let setter = mk_expr(EField(sfl_expr(lhs), "set"), l, c)
     SExprStmt(mk_expr(ECall(setter, [sfl_expr(v)]), l, c))
   }
-  SLet(pat, ty, e)            -> SLet(sfl_pat(pat), sfl_ty_opt(ty), sfl_expr(e))
+  SLet(pat, ty, e)            -> SLet(ipat_let(sfl_pat(pat)), sfl_ty_opt(ty), sfl_expr(e))
   SAssert(e, msg)             -> SAssert(sfl_expr(e), sfl_opt(msg))
   SExprStmt(e)                -> SExprStmt(sfl_expr(e))
   SIndexAssign(b, i, v, l, c) -> SIndexAssign(sfl_expr(b), sfl_expr(i), sfl_expr(v), l, c)
@@ -318,7 +325,7 @@ fn sfl_arm(a: Arm) : Arm = match a {
   Arm(pat, guard, body) -> match pat.pkind {
     PSurface(ps) -> match ps {
       PsRefine(name, ty) ->
-        Arm(mk_pat(PBind(name), pat.line, pat.col),
+        Arm(mk_pat(PBind(binder_written(name)), pat.line, pat.col),
             Some(sfl_weld_guard(sfl_refine_guard(name, ty, pat.line, pat.col),
                                 sfl_opt(guard))),
             sfl_expr(body))
@@ -331,8 +338,8 @@ fn sfl_arm(a: Arm) : Arm = match a {
 fn sfl_refine_guard(name: String, ty: TypeExpr, line: Int, col: Int) : Expr =
   match ty.tkind {
     TyRefine(_, pred) -> {
-      let self_let = SLet(mk_pat(PBind("self"), line, col), None,
-                          mk_ref(name, line, col))
+      let self_let = SLet(mk_pat(PBind(binder_written("self")), line, col), None,
+                          mk_name(name, line, col))
       mk_expr(EBlock([self_let], Some(sfl_expr(pred))), line, col)
     }
     _ -> panic("surface_lower: PsRefine without a refinement type")
@@ -340,7 +347,7 @@ fn sfl_refine_guard(name: String, ty: TypeExpr, line: Int, col: Int) : Expr =
 
 fn sfl_weld_guard(narrow: Expr, user: Option[Expr]) : Expr = match user {
   None -> narrow
-  Some(u) -> mk_expr(EBinop("and", narrow, u), narrow.line, narrow.col)
+  Some(u) -> mk_expr(EBinop(BoAnd, narrow, u), narrow.line, narrow.col)
 }
 
 fn sfl_hclause(cl: HClause) : HClause = match cl {
@@ -355,32 +362,36 @@ fn sfl_hreturn_opt(o: Option[HReturn]) : Option[HReturn] = match o {
 fn sfl_pat(p: Pattern) : Pattern = match p.pkind {
   PSurface(ps) -> match ps {
     PsTuple(pats) ->
-      mk_pat(PVariantRecord(sfl_tuple_ref(list_length(pats)), sfl_tuple_name(list_length(pats)),
+      mk_pat(PVariantRecord(sfl_tuple_ref(list_length(pats)),
                             build_tuple_pfields(map(pats, (x) => sfl_pat(x)), 0, [])),
              p.line, p.col)
     PsQualified(q, sub) -> sfl_qualified(q, sfl_pat(sub), p.line, p.col)
-    PsAs(n, sub) -> mk_pat(PAs(n, sfl_pat(sub)), p.line, p.col)
+    PsAs(n, sub) -> mk_pat(PAs(binder_written(n), sfl_pat(sub)), p.line, p.col)
     # Only legal as an arm's top-level pattern; sfl_arm dissolves it.
     PsRefine(_, _) -> panic("surface_lower: PsRefine outside a match arm")
+    # The owning pattern's position makes the binder unique: two rests
+    # can never share a `[` token.
+    PsAnonRest(subs, _) ->
+      mk_pat(PList(map(subs, (x) => sfl_pat(x)), Some(ub_rest_sentinel(p.line, p.col))),
+             p.line, p.col)
   }
   PList(subs, rest) ->
-    mk_pat(PList(map(subs, (x) => sfl_pat(x)), sfl_rest(rest, p.line, p.col)),
-           p.line, p.col)
-  PVariant(home, n, subs) ->
-    mk_pat(PVariant(home, n, map(subs, (x) => sfl_pat(x))), p.line, p.col)
-  PVariantRecord(home, n, fs) ->
-    mk_pat(PVariantRecord(home, n, map(fs, (f) => sfl_pfield(f))), p.line, p.col)
+    mk_pat(PList(map(subs, (x) => sfl_pat(x)), rest), p.line, p.col)
+  PVariant(r, subs) ->
+    mk_pat(PVariant(r, map(subs, (x) => sfl_pat(x))), p.line, p.col)
+  PVariantRecord(r, fs) ->
+    mk_pat(PVariantRecord(r, map(fs, (f) => sfl_pfield(f))), p.line, p.col)
   PRecord(fs) -> mk_pat(PRecord(map(fs, (f) => sfl_pfield(f))), p.line, p.col)
   PAs(n, sub) -> mk_pat(PAs(n, sfl_pat(sub)), p.line, p.col)
   PNarrow(n, ty) -> mk_pat(PNarrow(n, sfl_ty(ty)), p.line, p.col)
   _ -> p
 }
 
-# The qualifier lands in the variant's home slot, positional or
+# The qualifier lands in the written reference, positional or
 # record-shaped alike; any other pattern shape has nothing to qualify.
 fn sfl_qualified(q: String, sub: Pattern, line: Int, col: Int) : Pattern = match sub.pkind {
-  PVariant(_, n, subs) -> mk_pat(PVariant(Some(q), n, subs), line, col)
-  PVariantRecord(_, n, fs) -> mk_pat(PVariantRecord(ty_ref_qualified(q), n, fs), line, col)
+  PVariant(DrWritten(_, n), subs)     -> mk_pat(PVariant(DrWritten(Some(written(q)), n), subs), line, col)
+  PVariantRecord(DrWritten(_, n), fs) -> mk_pat(PVariantRecord(DrWritten(Some(written(q)), n), fs), line, col)
   _ -> sub
 }
 
@@ -388,24 +399,16 @@ fn sfl_pfield(f: PField) : PField = match f {
   PField(name, sub, is_short) -> PField(name, sfl_pat(sub), is_short)
 }
 
-# The anonymous rest spellings (`""` for `...`, `"_"` for `..._`) get a
-# binder the pipeline can key on. The owning PList's position makes it
-# unique: two rest binders can never share a `[` token.
-fn sfl_rest(rest: Option[String], line: Int, col: Int) : Option[String] = match rest {
-  Some(sp) -> if sp == "" or sp == "_" { Some(ub_rest_sentinel(line, col)) } else { rest }
-  None -> None
-}
-
 # ---- type walk ------------------------------------------------------
 
 fn sfl_ty(t: TypeExpr) : TypeExpr = match t.tkind {
   TySurface(ts) -> match ts {
     TsTuple(tys) ->
-      mk_ty(TyName(sfl_tuple_ref(list_length(tys)), sfl_tuple_name(list_length(tys)), map(tys, (x) => sfl_ty(x))),
+      mk_ty(TyName(sfl_tuple_ref(list_length(tys)), map(tys, (x) => sfl_ty(x))),
             t.line, t.col)
     TsUnitSpan(_, inner) -> sfl_ty(inner)
   }
-  TyName(th, n, tys)    -> mk_ty(TyName(th, n, map(tys, (x) => sfl_ty(x))), t.line, t.col)
+  TyName(th, tys)   -> mk_ty(TyName(th, map(tys, (x) => sfl_ty(x))), t.line, t.col)
   TyList(inner)     -> mk_ty(TyList(sfl_ty(inner)), t.line, t.col)
   TyFn(ps, ret, row) ->
     mk_ty(TyFn(map(ps, (x) => sfl_ty(x)), sfl_ty(ret), sfl_row(row)), t.line, t.col)
@@ -426,13 +429,13 @@ fn sfl_row(r: RowExpr) : RowExpr = match r {
 }
 
 fn sfl_row_label(rl: RowLabel) : RowLabel = match rl {
-  RL(n, tys, s) -> RL(n, map(tys, (x) => sfl_ty(x)), s)
+  RL(n, tys) -> RL(n, map(tys, (x) => sfl_ty(x)))
 }
 
 fn sfl_params(ps: [Param]) : [Param] = map(ps, (pm) => sfl_param(pm))
 
 fn sfl_param(pm: Param) : Param =
-  Param { pname: pm.pname, ptype: sfl_ty_opt(pm.ptype), pline: pm.pline,
+  Param { binder: pm.binder, ptype: sfl_ty_opt(pm.ptype), pline: pm.pline,
           pcol: pm.pcol, pborrow: pm.pborrow }
 
 fn sfl_type_body(b: TypeBody) : TypeBody = match b {
@@ -456,7 +459,7 @@ fn sfl_extern_body(b: ExternTypeBody) : ExternTypeBody = match b {
 }
 
 fn sfl_effect_op(op: EffectOp) : EffectOp = match op {
-  EOp(n, tps, ps, ret, l, c) -> EOp(n, tps, sfl_params(ps), sfl_ty(ret), l, c)
+  EffOp(n, tps, ps, ret, l, c) -> EffOp(n, tps, sfl_params(ps), sfl_ty(ret), l, c)
 }
 
 fn sfl_proto_op(op: ProtoOp) : ProtoOp = match op {
@@ -465,7 +468,7 @@ fn sfl_proto_op(op: ProtoOp) : ProtoOp = match op {
 
 # The tuple sugar of arity `n` denotes the core tuple declaration, whatever
 # the file declares under the same name.
-fn sfl_tuple_ref(n: Int) : TyRef = tuple_type_ref(sfl_tuple_name(n))
+fn sfl_tuple_ref(n: Int) : DeclRef = tuple_type_ref(sfl_tuple_name(n))
 
 # Parse rejects tuple arities outside 2..4, so the lookup cannot miss.
 fn sfl_tuple_name(n: Int) : String = match tuple_type_for_arity(n) {

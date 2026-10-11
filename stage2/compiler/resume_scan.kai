@@ -6,6 +6,8 @@ from one is the typer's to reject.
 
 import compiler.util
 import compiler.ast
+import compiler.written
+import compiler.core_modules
 import compiler.expr_positions
 import compiler.interp_span
 import compiler.infer
@@ -33,7 +35,7 @@ pub fn rs_at(e: Expr) : Expr = match e.kind {
 
 #[doc("True when `e` is a call of the continuation `k`.")]
 pub fn rs_is_k_call(e: Expr, k: String) : Bool = match e.kind {
-  ECall(f, _) -> match f.kind { EVar(n) -> n == k  _ -> false }
+  ECall(f, _) -> match f.kind { EName(n) -> written_text(n) == k  _ -> false }
   _           -> false
 }
 
@@ -42,7 +44,7 @@ pub fn rs_find_k(e: Expr, k: String) : Option[Expr] =
   if rs_is_k_call(e, k) { Some(e) }
   else { match e.kind {
     ELambda(_, _) -> None
-    EHandle(_, _, _, _, _, _, _, _) -> None
+    EHandle(_, _, _, _, _, _, _) -> None
     _ -> rs_find_k_in(rs_children(e), k)
   } }
 
@@ -76,7 +78,7 @@ pub fn rs_closes_over(e: Expr, names: [String]) : Bool = match e.kind {
 
 #[doc("A reference to one of `names` in `e`, at any depth.")]
 pub fn rs_find_ref(e: Expr, names: [String]) : Option[Expr] = match e.kind {
-  EVar(n) -> if list_has(names, n) { Some(e) } else { None }
+  EName(n) -> if list_has(names, written_text(n)) { Some(e) } else { None }
   _       -> rs_find_ref_in(rs_children(e), names)
 }
 
@@ -98,7 +100,7 @@ handler), inside a loop body (it would run again on the next turn), or
 inside a string interpolation (parsed only after this pass).
 """)]
 pub fn rs_unsplittable(e: Expr, k: String) : Option[RsBad] = match e.kind {
-  EHandle(_, _, _, _, _, _, _, _) -> match rs_deep_k(e, k) {
+  EHandle(_, _, _, _, _, _, _) -> match rs_deep_k(e, k) {
     Some(c) -> Some(RsBad("`resume` is called inside a `handle` nested in its clause",
                           "the resumed body would have to run under the inner handler; call `resume` outside it", rs_at(c).line, rs_at(c).col))
     None    -> None
@@ -134,9 +136,9 @@ fn interp_calls(ip: IPart, k: String) : Bool = match ip {
 
 #[doc("True when `f` names a loop whose lambda arguments run inline, in the caller's frame.")]
 pub fn rs_is_loop_callee(f: Expr) : Bool = match f.kind {
-  EVar(n)        -> rs_is_loop_name(n)
-  EModCall(q, n) -> q == "loop" and rs_is_loop_name(n)
-  EField(b, n)   -> match b.kind { EVar(q) -> q == "loop" and rs_is_loop_name(n)  _ -> false }
+  EName(n)       -> rs_is_loop_name(written_text(n))
+  EModCall(q, n) -> home_is(written_text(q), CmLoop) and rs_is_loop_name(written_text(n))
+  EField(b, n)   -> match b.kind { EName(q) -> written_text(q) == "loop" and rs_is_loop_name(n)  _ -> false }
   _              -> false
 }
 
@@ -147,8 +149,8 @@ fn rs_is_loop_name(n: String) : Bool = n == "while" or n == "until" or n == "rep
 fn rs_deep_k(e: Expr, k: String) : Option[Expr] =
   if rs_is_k_call(e, k) { Some(e) }
   else { match e.kind {
-    ELambda(ps, b) -> if any(ps, (p) => p.pname == k) { None } else { rs_deep_k(b, k) }
-    EHandle(body, _, _, _, init, _, cs, ret) ->
+    ELambda(ps, b) -> if any(ps, (p) => written_text(p.binder.name) == k) { None } else { rs_deep_k(b, k) }
+    EHandle(body, _, _, init, _, cs, ret) ->
       rs_deep_k_in([body, ...opt_list(init), ...rs_clauses_keeping(cs, k), ...opt_list(ret_body(ret))], k)
     _ -> rs_deep_k_in(rs_children(e), k)
   } }
@@ -156,7 +158,7 @@ fn rs_deep_k(e: Expr, k: String) : Option[Expr] =
 fn rs_clauses_keeping(cs: [HClause], k: String) : [Expr] = match cs {
   [] -> []
   [HC(_, ps, b, _, _), ...rest] ->
-    if any(ps, (p) => p.pname == k) { rs_clauses_keeping(rest, k) } else { [b, ...rs_clauses_keeping(rest, k)] }
+    if any(ps, (p) => written_text(p.binder.name) == k) { rs_clauses_keeping(rest, k) } else { [b, ...rs_clauses_keeping(rest, k)] }
 }
 
 fn rs_deep_k_in(es: [Expr], k: String) : Option[Expr] = match es {
@@ -172,8 +174,9 @@ pub fn rs_clauses_push_frames(cs: [HClause]) : Bool = any(cs, (c) => rs_pushes_f
 
 # A nested handle's frames are its own; a lambda never pushes one.
 fn rs_pushes_frame(e: Expr) : Bool = match e.kind {
-  EIntrinsic(n, xs) -> n == "resume_frame" or any(xs, rs_pushes_frame)
-  EHandle(_, _, _, _, _, _, _, _) -> false
+  EIntrinsic(InResumeFrame, _) -> true
+  EIntrinsic(_, xs) -> any(xs, rs_pushes_frame)
+  EHandle(_, _, _, _, _, _, _) -> false
   ELambda(_, _) -> false
   _ -> any(rs_children(e), rs_pushes_frame)
 }
@@ -226,7 +229,7 @@ pub fn rs_unsplittable_at(at: Expr) : RsBad =
 #[doc("A clause `var` read after a non-tail `resume`.")]
 pub fn rs_var_after(v: Expr) : RsBad = {
   let name = match v.kind {
-    EVar(n) -> string_concat(string_concat("`", n), "`")
+    EName(n) -> string_concat(string_concat("`", written_text(n)), "`")
     _       -> "a name"
   }
   RsBad(string_concat(name, " is a `var` of the clause, read after a non-tail `resume`"),
@@ -241,7 +244,7 @@ pub fn rs_default_nontail(l: Int, c: Int) : RsBad =
 
 #[doc("The `$resume_bad(message, help)` marker the typer reports a shape by.")]
 pub fn rs_bad_marker(b: RsBad) : Expr = match b {
-  RsBad(msg, help, l, c) -> mk_expr(EIntrinsic("resume_bad", [rs_quoted(msg, l, c), rs_quoted(help, l, c)]), l, c)
+  RsBad(msg, help, l, c) -> mk_expr(EIntrinsic(InResumeBad, [rs_quoted(msg, l, c), rs_quoted(help, l, c)]), l, c)
 }
 
 fn rs_quoted(s: String, l: Int, c: Int) : Expr = mk_expr(EStr(string_concat(string_concat("\"", s), "\""), false), l, c)

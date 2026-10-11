@@ -17,8 +17,10 @@ Canonicalization (the soundness contract):
   builds. Before hashing, every var id is remapped to its
   first-appearance index under a fixed structural walk. Logically-equal
   interfaces then share a byte-identical canonical form.
-- **Table order.** Each of the 8 tables is sorted by its stable name
-  key before hashing, so insertion order never perturbs the hash.
+- **Table order.** Each of the 8 tables is sorted by its entries' key
+  before hashing, so insertion order never perturbs the hash. A key is
+  the entry's declaration id, which moves only when the declaration is
+  renamed or rehomed.
 
 Canonicalization is applied for the *hash only*. The serialized blob a
 cache hit restores keeps original ids (round-trip fidelity for the
@@ -29,6 +31,7 @@ never a stale hit), which is the sound side.
 """)]
 
 import compiler.ast
+import compiler.written
 import compiler.util
 import compiler.cache
 import compiler.infer
@@ -78,8 +81,8 @@ fn canon_ty(t: Ty, vr: VarRemap) : CanonTy = match t {
   TyVarT(id) -> match vr_index(vr, id) { CV(ci, vr2) -> CT(TyVarT(ci), vr2) }
   TyListT(inner) -> match canon_ty(inner, vr) { CT(ci, vr2) -> CT(TyListT(ci), vr2) }
   TyFnT(as_, ret, row) -> canon_ty_fn(as_, ret, row, vr)
-  TyCon(mo, nm, targs, sid) -> match canon_ty_list(map(targs, (a) => a), vr) {
-    CTL(cargs, vr2) -> CT(TyCon(mo, nm, cargs, sid), vr2)
+  TyCon(s, targs) -> match canon_ty_list(map(targs, (a) => a), vr) {
+    CTL(cargs, vr2) -> CT(TyCon(s, cargs), vr2)
   }
   TyDimT(inner, u) -> match canon_ty(inner, vr) { CT(ci, vr2) -> CT(TyDimT(ci, u), vr2) }
   TyRefineT(base, pred) -> match canon_ty(base, vr) {
@@ -190,21 +193,23 @@ fn canon_int_list(xs: [Int], vr: VarRemap) : CanonIntL = match xs {
 
 # ---- interface hash ---------------------------------------------------
 # The hash covers a canonical rendering of the delta: each table's
-# elements sorted by name, var ids renumbered, their encodings folded in
+# elements sorted by key, var ids renumbered, their encodings folded in
 # a fixed table order through the FNV-1a digest the user cache uses.
 
-fn tyentry_key(e: TyEntry) : String = e.name
-fn unioninfo_key(u: UnionInfo) : String = match u { UI(nm, _, _, _) -> nm }
-fn opeffarity_key(a: OpEffArity) : String = match a { OEA(nm, _) -> nm }
-fn recinfo_key(r: RecInfo) : String = match r { RI(nm, _, _, _, _) -> nm }
-fn suminfo_key(s: SumInfo) : String = match s { SI(nm, _, _, _) -> nm }
+fn cd_sym_key(s: SymId) : String = int_to_string(sym_raw(s))
+
+fn tyentry_key(e: TyEntry) : String = env_key_ord(e.key)
+fn unioninfo_key(u: UnionInfo) : String = match u { UI(s, _, _, _) -> cd_sym_key(s) }
+fn opeffarity_key(a: OpEffArity) : String = match a { OEA(eff, op, _) -> joined_key(cd_sym_key(eff), written_text(op)) }
+fn recinfo_key(r: RecInfo) : String = match r { RI(s, _, _, _) -> cd_sym_key(s) }
+fn suminfo_key(s: SumInfo) : String = match s { SI(sy, _, _, _) -> cd_sym_key(sy) }
 # Compound keys length-prefix the first field so `(a, bc)` and `(ab, c)`
 # never collide without depending on a separator byte in the alphabet.
 fn joined_key(a: String, b: String) : String =
   concat_all([int_to_string(string_length(a)), ":", a, b])
-fn optoeff_key(o: OpToEff) : String = match o { OEFP(op, eff) -> joined_key(op, eff) }
+fn optoeff_key(o: OpToEff) : String = match o { OEFP(op, eff) -> joined_key(written_text(op), cd_sym_key(eff)) }
 fn ualias_key(u: UAliasEntry) : String = match u { UAE(nm, _) -> nm }
-fn ctorentry_key(c: CtorEntry) : String = match c { CtorE(ty, _, fn_) -> joined_key(ty, fn_) }
+fn ctorentry_key(c: CtorEntry) : String = match c { CtorE(ty, fn_) -> joined_key(cd_sym_key(ty), cd_sym_key(fn_)) }
 
 #[doc("One table entry reduced to its sort key and its canonical encoding.")]
 pub type KV = KV(String, Array[Byte])
@@ -276,7 +281,7 @@ fn kv_merge(a: [KV], b: [KV], acc: [KV]) : [KV] = match a {
 pub fn tyentry_pairs(xs: [TyEntry], acc: [KV]) : [KV] = match xs {
   [] -> acc
   [e, ...t] -> tyentry_pairs(t, [KV(tyentry_key(e),
-                   to_bytes(TyEntry { name: e.name, scheme: canon_scheme(e.scheme) })),
+                   to_bytes(TyEntry { key: e.key, scheme: canon_scheme(e.scheme) })),
                 ...acc])
 }
 
@@ -331,7 +336,7 @@ pub fn ctorentry_pairs(xs: [CtorEntry], acc: [KV]) : [KV] = match xs {
   [c, ...t] -> ctorentry_pairs(t, [KV(ctorentry_key(c), to_bytes(c)), ...acc])
 }
 
-#[doc("Interface hash of a `ModuleEnvDelta`, as 16 hex chars over its canonical form: each of the 8 tables sorted by name with var ids renumbered to appearance rank. The `name` field is excluded — a module's interface identity is its exported shapes, not its own name. Stable across inference order; a source edit that leaves the interface unchanged yields the same hash, so importers are not invalidated.")]
+#[doc("Interface hash of a `ModuleEnvDelta`, as 16 hex chars over its canonical form: each of the 8 tables sorted by key with var ids renumbered to appearance rank. The `name` field is excluded — a module's interface identity is its exported shapes, not its own name. Stable across inference order; a source edit that leaves the interface unchanged yields the same hash, so importers are not invalidated.")]
 pub fn mdelta_iface_hash(d: ModuleEnvDelta) : String = {
   let t0 = table_texts(tyentry_pairs(d.ty_entries, []), [])
   let t1 = table_texts(unioninfo_pairs(d.unions, []), t0)

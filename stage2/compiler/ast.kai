@@ -51,6 +51,8 @@
 # AST types
 # ====================================================================
 
+import compiler.written
+
 # Expressions carry their source position on the wrapper, so variants
 # stay compact. Pattern matching on expressions therefore destructures
 # the record to reach `.kind`, then matches the sum.
@@ -79,39 +81,10 @@ pub type ValueMode
 # can seed `MUnboxed` for the sub-PBind binders that read them. The slot
 # kind classification lives in the emit layer (the variant table), which
 # sits AFTER unbox in the bundle, so the driver pre-computes this map (it
-# can reach both layers) and hands it to `unbox_pass`. Each `CIS(home,
-# ctor, is_int)` lists, in slot order, whether slot i is a kind-1 Int
-# field. The home keys the entry so two modules declaring the same ctor
-# name cannot inherit each other's slot kinds — reading a boxed slot raw
-# is a segfault.
-pub type CtorIntSlots = CIS(Option[String], String, [Bool])
-
-#[doc("True when an entry declared by `entry_home` answers a lookup asking for `want`; either side being homeless matches.")]
-pub fn ctor_home_matches(entry_home: Option[String], want: Option[String]) : Bool =
-  match want {
-    None    -> true
-    Some(w) -> match entry_home {
-      None    -> true
-      Some(e) -> e == w
-    }
-  }
-
-#[doc("The kind-1 Int-slot flags of ctor `target` as declared by `home`, or None if unregistered.")]
-pub fn ctor_int_slots_lookup_in(m: [CtorIntSlots], home: Option[String],
-                                   target: String) : Option[[Bool]] {
-  match m {
-    [] -> None
-    [h, ...rest] -> match h {
-      CIS(hm, n, flags) ->
-        if n == target and ctor_home_matches(hm, home) { Some(flags) }
-        else { ctor_int_slots_lookup_in(rest, home, target) }
-    }
-  }
-}
-
-#[doc("The kind-1 Int-slot flags for a ctor, or None if unregistered.")]
-pub fn ctor_int_slots_lookup(m: [CtorIntSlots], target: String) : Option[[Bool]] =
-  ctor_int_slots_lookup_in(m, None, target)
+# can reach both layers) and hands it to `unbox_pass`. Each `CIS(ctor,
+# is_int)` lists, in slot order, whether slot i is a kind-1 Int field.
+# Reading a boxed slot raw is a segfault.
+pub type CtorIntSlots = CIS(SymId, [Bool])
 
 # A match-arm variant Int sub-binder the native backend seeds raw (`MUnboxed`),
 # keyed by its `PBind` source position. The verdict is decided ONCE pre-perceus
@@ -121,15 +94,31 @@ pub fn ctor_int_slots_lookup(m: [CtorIntSlots], target: String) : Option[[Bool]]
 # re-derive. The position is the stable key — a `PBind`'s line/col survive both
 # passes untouched — so the rawness verdict never desyncs across phases the way
 # a body re-scan does when perceus drops a binder's `MUnboxed` reads (#1229).
-pub type RawArmBinder = RAB(String, Int, Int)
+pub type RawArmBinder = RAB(LocalId, Int, Int)
 
 #[doc("An opaque per-declaration identity. Distinct declarations get distinct ids regardless of spelling.")]
 #[derive(BinSerialize)]
 pub type SymId = SymId(Int)
 
-#[doc("What a written type or record name refers to: the qualifier text the source wrote, if any, and the declaration it resolves to (`sym_none()` until the typer stamps it).")]
+#[doc("A reference to a declaration: what the source wrote (an optional qualifier and a name) until it is resolved, the declaration's id after. A resolved reference keeps no text.")]
 #[derive(BinSerialize)]
-pub type TyRef = TyRef(Option[String], SymId)
+pub type DeclRef = DrWritten(Option[Written], Written) | DrSym(SymId)
+
+#[doc("The identity of a local binder. The resolver numbers the binders a program writes from 1 up; a binder the compiler mints is numbered from its mint key, below zero; 0 is a binder not numbered yet.")]
+#[derive(BinSerialize)]
+pub type LocalId = LocalId(Int)
+
+#[doc("A local binder where it is declared: its identity, and the name it was written or minted with.")]
+#[derive(BinSerialize)]
+pub type Binder = { id: LocalId, name: Written }
+
+#[doc("Which handler instance a perform reaches: the ambient one, the one a `with … as a` alias names, or the capability a receiver parameter holds.")]
+#[derive(BinSerialize)]
+pub type OpVia = ViaAmbient | ViaAlias(LocalId) | ViaRecv(LocalId)
+
+#[doc("A resolved effect operation: the effect's declaration, the operation's label inside it, and the instance it goes through.")]
+#[derive(BinSerialize)]
+pub type OpRef = { eff: SymId, op: Written, via: OpVia }
 
 #[doc("The integer behind a `SymId`. Only the symbol table indexes with it.")]
 pub fn sym_raw(s: SymId) : Int = match s { SymId(i) -> i }
@@ -223,13 +212,22 @@ fn core_type_sym_at(i: Int) : Int = match i {
 #[doc("The name the core type `c` is spelled with.")]
 pub fn core_ty_name(c: CoreTy) : String = core_type_name_at(core_ty_index(c))
 
+#[doc("The spelling of the core type whose identity is `s`, if `s` is one.")]
+pub fn core_type_name_of(s: SymId) : Option[String] = core_type_name_scan(sym_raw(s), 0)
+
+fn core_type_name_scan(id: Int, i: Int) : Option[String] =
+  if i > 8 { None }
+  else if core_type_sym_at(i) == id { Some(core_type_name_at(i)) }
+  else { core_type_name_scan(id, i + 1) }
+
 #[doc("The identity of the core type `c`.")]
 pub fn core_ty_sym(c: CoreTy) : SymId = SymId(core_type_sym_at(core_ty_index(c)))
 
-#[doc("True when the nominal head `n` (identity `s`) is the core type `c`: by identity whenever it carries one.")]
-pub fn tycon_is(n: String, s: SymId, c: CoreTy) : Bool =
-  if sym_raw(s) >= 0 { sym_raw(s) == core_type_sym_at(core_ty_index(c)) }
-  else { core_type_index(n) == core_ty_index(c) }
+#[doc("The core type `c` applied to `args`.")]
+pub fn core_ty_con(c: CoreTy, args: [Ty]) : Ty = TyCon(core_ty_sym(c), args)
+
+#[doc("True when the identity `s` is the core type `c`. An absent identity is no core type.")]
+pub fn core_ty_is(s: SymId, c: CoreTy) : Bool = sym_raw(s) == core_type_sym_at(core_ty_index(c))
 
 #[doc("The identity of the always-available type `name`, homed at the reserved core home.")]
 pub fn core_type_sym(name: String) : SymId = {
@@ -250,29 +248,48 @@ pub fn core_type_sym_or_none(name: String) : SymId = {
 pub fn core_type_sym_derived(name: String) : SymId = SymId(sym_raw(sym_derive_word("type", name, core_type_home())) / 2)
 
 
-#[doc("A written name the source left unqualified and nothing has resolved yet.")]
-pub fn ty_ref_none() : TyRef = TyRef(None, sym_none())
+#[doc("An unqualified reference as the source wrote it.")]
+pub fn ref_written(n: String) : DeclRef = DrWritten(None, written(n))
 
-#[doc("A written name the source qualified with `q`, not resolved yet.")]
-pub fn ty_ref_qualified(q: String) : TyRef = TyRef(Some(q), sym_none())
+#[doc("A reference the source qualified with `q`.")]
+pub fn ref_qualified(q: String, n: String) : DeclRef = DrWritten(Some(written(q)), written(n))
 
-#[doc("A name already known to denote the declaration `s`.")]
-pub fn ty_ref_decl(s: SymId) : TyRef = TyRef(None, s)
+#[doc("The declaration a reference resolved to, `sym_none()` while it is still written text.")]
+pub fn ref_sym(r: DeclRef) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(_, _) -> sym_none()
+}
 
-#[doc("The qualifier text a reference was written with.")]
-pub fn ty_ref_qual(r: TyRef) : Option[String] = match r { TyRef(q, _) -> q }
+#[doc("True once the reference names a declaration.")]
+pub fn ref_resolved(r: DeclRef) : Bool = sym_raw(ref_sym(r)) >= 0
 
-#[doc("The declaration a reference resolves to, `sym_none()` while unresolved.")]
-pub fn ty_ref_sym(r: TyRef) : SymId = match r { TyRef(_, s) -> s }
+#[doc("The integer behind a `LocalId`.")]
+pub fn local_raw(l: LocalId) : Int = match l { LocalId(i) -> i }
 
-#[doc("True when the reference is already resolved or carries the qualifier it was written with.")]
-pub fn ty_ref_written(r: TyRef) : Bool = match r { TyRef(Some(_), _) -> true  TyRef(None, s) -> sym_raw(s) >= 0 }
+#[doc("The id of a binder the resolver has not numbered yet.")]
+pub fn local_none() : LocalId = LocalId(0)
 
-#[doc("`r` resolved to the declaration `s`, keeping the text it was written with.")]
-pub fn ty_ref_stamp(r: TyRef, s: SymId) : TyRef = match r { TyRef(q, _) -> TyRef(q, s) }
+#[doc("True when both ids name the same numbered binder.")]
+pub fn local_eq(a: LocalId, b: LocalId) : Bool = local_raw(a) != 0 and local_raw(a) == local_raw(b)
 
-#[doc("True when `s` names a local binder: local ids count down from `-2`, below `sym_none()`, and never index the symbol table.")]
-pub fn sym_is_local(s: SymId) : Bool = sym_raw(s) < 0 - 1
+#[doc("The id of the binder a pass mints under `key`: one key, one binder, and no key collides with a binder the resolver numbered.")]
+pub fn local_minted(key: String) : LocalId = {
+  let h = string_hash(key)
+  LocalId(if h >= 0 { 0 - 1 - h } else { h })
+}
+
+#[doc("True when `l` is a binder the compiler minted rather than one the source declares.")]
+pub fn local_is_minted(l: LocalId) : Bool = local_raw(l) < 0
+
+#[doc("A binder as the source wrote it, not numbered yet.")]
+pub fn binder_written(n: String) : Binder = Binder { id: local_none(), name: written(n) }
+
+#[doc("The binder a pass mints under `key`, which is also the name it is spelled with.")]
+pub fn binder_minted(key: String) : Binder = Binder { id: local_minted(key), name: written(key) }
+
+#[doc("`b` numbered `id`.")]
+pub fn binder_numbered(b: Binder, id: LocalId) : Binder = Binder { id: id, name: b.name }
+
 
 #[doc("The instance index of a reference to a declaration itself rather than to one of its specialisations.")]
 pub fn spec_none() : Int = 0 - 1
@@ -308,10 +325,81 @@ pub fn fnid_eq(a: FnId, b: FnId) : Bool =
 pub fn sym_compat(a: SymId, b: SymId) : Bool =
   sym_raw(a) < 0 or sym_raw(b) < 0 or sym_raw(a) == sym_raw(b)
 
+#[doc("True when two nominal types carry the same identity. The absent id is one identity, an error placeholder's: it equals only itself.")]
+pub fn sym_same(a: SymId, b: SymId) : Bool = sym_raw(a) == sym_raw(b)
+
+#[doc("What a self tail call carries to its jump: the function whose entry label it targets, the bit set of parameters released before the rebind, and the parameters in declaration order.")]
+#[derive(BinSerialize)]
+pub type TcrecStep = { fid: FnId, dropmask: Int, params: [String] }
+
+#[doc("The cell a modulo-cons step builds: a builtin cons, a builtin cons whose step also releases the scrutinee it consumed, or a variant of a constructor.")]
+#[derive(BinSerialize)]
+pub type TrmcSpine = TsCons | TsConsScr | TsCtor(SymId)
+
+#[doc("What a modulo-cons step carries to its jump: the fields of a `TcrecStep`, the cell it builds and the slot of that cell the self call fills.")]
+#[derive(BinSerialize)]
+pub type TrmcStep = { fid: FnId, hole: Int, spine: TrmcSpine, dropmask: Int, params: [String] }
+
 #[doc("A mark the compiler plants in a body and reads back downstream. The set is closed because this compiler plants every one of them; `compiler.marks` holds the spelling each carries into the backend.")]
 #[derive(BinSerialize)]
 pub type Mark = MkFuseMissing | MkScrutinee | MkGuardDrop | MkBorrow
   | MkApplyBorrow | MkTrmcApply | MkOwnedBorrow | MkDrop
+  | MkDup | MkReuseCons | MkReuseVariant | MkReuseRecord
+  | MkFixedVecLit | MkFixedVecGet | MkFixedVecGetDyn
+  | MkTcrecStep(TcrecStep) | MkTrmcStep(TrmcStep)
+  # A `region { }` block as the parser read it: called on the block, or
+  # on a one-parameter lambda that names the region.
+  | MkRegion
+  # A record literal's field written without a name: a positional value,
+  # and the `...src` a spread copies from. Called on the value, in the
+  # field's slot, until the record desugar gives every field its name.
+  | MkFieldPos | MkFieldSpread
+  # `@x` on a bare name, called on that reference: the cell-read lowering
+  # decides whether `x` is a `Ref` to read or a cell that reads naked.
+  | MkDeref
+  # A `var` lowered to a one-cell slot, naming the var: stands for the
+  # call that allocates the slot, called on that call's callee and
+  # arguments, until the cell-read relowering has sent every late read
+  # of the var to the slot.
+  | MkVarSlot(String)
+  # The collection of an index read while the read is typed: bound in the
+  # typing environment only, and replaced by the typed collection after.
+  | MkIndexColl
+
+#[doc("A compiler-internal operation, written `$name(args)`. The set is closed because this compiler implements every one of them; `compiler.intrinsics` holds the spelling each has after the `$`.")]
+#[derive(BinSerialize)]
+pub type Intrinsic
+  # A default clause body bridging to a C symbol.
+  = InExternHandler
+  # A promoted var cell: its init, a read, a write. The read and the
+  # write name the cell by their first argument.
+  | InCellInit | InCellGet | InCellSet
+  # A loop combinator call pasted inline: the original callee, then the
+  # combinator's arguments.
+  | InLoopWhile | InLoopUntil | InLoopRepeat
+  # The clause tail deferred past a non-tail `resume`, and the report of
+  # a `resume` shape the split cannot express.
+  | InResumeFrame | InResumeBad
+  # A handle on a stack segment, a forwarding clause's request to it,
+  # and `$seg_state(s, body)` binding a stateful clause's state aliases
+  # to `s`.
+  | InSegHandle | InSegRequest | InSegState
+  # The value a fused call passes in a slot its target does not take: it
+  # types as any type, is the unit value boxed and a zero raw, and is
+  # never read.
+  | InAbsent
+  # A name that denotes no intrinsic; the typer rejects the node.
+  | InUnknown(String)
+
+#[doc("The operator of an `EBinop`. The set is closed because the parser accepts no other; `compiler.operators` holds the spelling of each.")]
+#[derive(BinSerialize)]
+pub type BinOp = BoAdd | BoSub | BoMul | BoDiv | BoMod | BoPow | BoConcat
+  | BoEq | BoNe | BoLt | BoGt | BoLe | BoGe
+  | BoAnd | BoOr
+
+#[doc("The operator of an `EUnop`: arithmetic negation or logical `not`.")]
+#[derive(BinSerialize)]
+pub type UnOp = UoNeg | UoNot
 
 #[derive(BinSerialize)]
 pub type ExprKind
@@ -349,7 +437,7 @@ pub type ExprKind
   | EChar(Char)
   | EStr(String, Bool)                      # raw source span (includes quotes), is_triple
   | EUnit
-  | EVar(String)
+  | EName(Written)
   # A value reference the resolver has already decided: the id of the
   # declaration it names. `EVar` is what the parser produces and what a
   # synthesised reference is minted as; `ESym` is what survives resolve,
@@ -358,24 +446,24 @@ pub type ExprKind
   # and for the emitters that spell a C identifier, never as the thing
   # that is looked up. The Int is the instance (see `FnId`); the name of a
   # specialisation is emission text, never read back to recover which one.
-  | ESym(SymId, Int, String)
+  | ESym(SymId, Int)
   | EUnder                                  # `_`; survives parsing only as a `|>` arg, else the typer rejects it
   | EPlaceholder                            # `.` placeholder (stage 1 extension; stage 0 rejects)
   | ECall(Expr, [Expr])
   | EField(Expr, String)
   | EIndex(Expr, Expr)
-  | EBinop(String, Expr, Expr)
-  | EUnop(String, Expr)                     # "-" or "not"
+  | EBinop(BinOp, Expr, Expr)
+  | EUnop(UnOp, Expr)
   | EIf(Expr, Expr, Option[Expr])
   | EMatch(Expr, [Arm])
   | ELambda([Param], Expr)
-  | ERecordLit(TyRef, String, [FieldInit])
+  | ERecordLit(DeclRef, [FieldInit])
   | EList([ListElem])
   | ERange(Expr, Expr, Option[Expr])
   | EBlock([Stmt], Option[Expr])
   | EPipe(Expr, Expr)
   # issue #201: `xs | f` — map-pipe. Until #201 the parser desugared
-  # `|` straight to `ECall(EVar("map"), [xs, f])`. The new shape keeps
+  # `|` straight to `ECall(EName("map"), [xs, f])`. The new shape keeps
   # the surface visible to the typer so `|` and `||` can dispatch by
   # the LHS's head type via the head-type-to-module map. The typer
   # rewrites `EMapPipe` into `ECall(EModCall(<module>, "map"), …)` once
@@ -436,7 +524,7 @@ pub type ExprKind
   # effect before anything downstream could tell them apart.
   # `sym_none()` until the resolver settles it — a core effect, or any
   # path that runs without a whole-program table.
-  | EHandle(Expr, String, SymId, [TypeExpr], Option[Expr], Option[String], [HClause], Option[HReturn])
+  | EHandle(Expr, DeclRef, [TypeExpr], Option[Expr], Option[Binder], [HClause], Option[HReturn])
   # m12.5: numeric literal annotated with a unit, e.g. `1.50<USD>` or
   # `42<UserId>`. The inner Expr is always EInt or EReal; the
   # UnitExprT comes from the source between the angle brackets.
@@ -457,21 +545,20 @@ pub type ExprKind
   # T has been validated as a nullary-only sum. The emitter consumes
   # the list directly — it has no env access to look the names up
   # itself.
-  | EVariantsOf(TypeExpr, [String])
+  | EVariantsOf(TypeExpr, [SymId])
   # A reference spelled by its home module. `mod.f` becomes this when
   # `mod` is an imported module no local shadows; the resolver then
   # turns a function it names into an `ESym`, so what survives is a
   # constructor, a constant, or a name the symbol table does not hold.
   # Below the resolver it is also the spelling a settled contest takes
   # where the bare name would reach another declaration.
-  | EModCall(String, String)
-  # Issue #556: `$<ident>(args)` — a compiler intrinsic call. Reserved
-  # sigil; user code cannot define new intrinsics. The first field is
-  # the intrinsic name (without the `$`), the second is the arg list.
-  # The typer enforces per-intrinsic shape rules (e.g. `$extern_handler`
-  # takes exactly one string-literal arg and is only valid inside a
-  # clause body that lives in a `default { }` block).
-  | EIntrinsic(String, [Expr])
+  | EModCall(Written, Written)
+  # `$<ident>(args)`: a compiler intrinsic call. Reserved sigil; user
+  # code cannot define new intrinsics. The typer enforces per-intrinsic
+  # shape rules (e.g. `$extern_handler` takes exactly one string-literal
+  # arg and is only valid inside a clause body that lives in a
+  # `default { }` block).
+  | EIntrinsic(Intrinsic, [Expr])
   # A surface form the parser preserves verbatim so `kai fmt` prints
   # what the author wrote. `surface_lower_decls` dissolves every
   # ESurface before resolution; passes downstream of it treat the node
@@ -486,6 +573,11 @@ pub type ExprKind
   # Declared last on purpose: a constructor inserted mid-list renumbers
   # every variant after it.
   | EMark(Mark)
+  # A local binder read: the binder's id, which the resolver numbers and
+  # a minting pass derives from its key.
+  | ELocal(LocalId)
+  # An effect operation as a callee, settled by the typer.
+  | EOp(OpRef)
 
 # The surface forms behind `ESurface`. Each variant is one parse-time
 # sugar whose lowering would otherwise erase the author's spelling.
@@ -525,6 +617,10 @@ pub type SurfaceForm
   # A `case`-block fn body: `{ case p (when g)? -> body ... }`. The
   # scrutinees are the owning fn's params, supplied at lowering.
   | SfCaseBlock([MMArm])
+  # A punned record field `{ x }`. Wraps the value in the field's
+  # `FieldInit` slot, a reference to the name the field shares; legal
+  # nowhere else.
+  | SfFieldPun(Expr)
 
 # Surface forms in type position, wrapped by `TySurface`. Same
 # discipline as `SurfaceForm`: exhaustive matches force a printer arm
@@ -558,6 +654,9 @@ pub type PatSurface
   # A match-arm narrowing `name : Base where pred`; dissolves to
   # `PBind(name)` plus a guard evaluating the refinement's predicate.
   | PsRefine(String, TypeExpr)
+  # A list pattern whose rest binds nothing: `[a, ...]`, or `[a, ..._]`
+  # when the flag is set. Lowering names the rest with a unique binder.
+  | PsAnonRest([Pattern], Bool)
 
 #[doc("Child types of a type-surface form; order is shared with `tysurface_rebuild`.")]
 pub fn tysurface_children(ts: TypeSurface) : [TypeExpr] = match ts {
@@ -580,6 +679,7 @@ pub fn patsurface_children(ps: PatSurface) : [Pattern] = match ps {
   PsQualified(_, sub)  -> [sub]
   PsAs(_, sub)         -> [sub]
   PsRefine(_, _)       -> []
+  PsAnonRest(pats, _)  -> pats
 }
 
 #[doc("Rebuild a pattern-surface form from a transformed child list in `patsurface_children` order.")]
@@ -594,6 +694,7 @@ pub fn patsurface_rebuild(ps: PatSurface, xs: [Pattern]) : PatSurface = match ps
     _           -> panic("patsurface_rebuild: child list does not match the form")
   }
   PsRefine(_, _) -> ps
+  PsAnonRest(_, wild) -> PsAnonRest(xs, wild)
 }
 
 #[doc("Child expressions of a surface form, left to right; order is shared with `surface_rebuild`.")]
@@ -616,6 +717,7 @@ pub fn surface_children(sf: SurfaceForm) : [Expr] = match sf {
   SfDeref(target)              -> [target]
   SfMultiMatch(scruts, arms)   -> list_append(scruts, mmarms_children(arms))
   SfCaseBlock(arms)            -> mmarms_children(arms)
+  SfFieldPun(value)            -> [value]
 }
 
 fn mmarms_children(arms: [MMArm]) : [Expr] = match arms {
@@ -695,6 +797,10 @@ pub fn surface_rebuild(sf: SurfaceForm, xs: [Expr]) : SurfaceForm = match sf {
     SfMultiMatch(sf_take(xs, n), mmarms_rebuild(arms, sf_drop(xs, n)))
   }
   SfCaseBlock(arms) -> SfCaseBlock(mmarms_rebuild(arms, xs))
+  SfFieldPun(_) -> match xs {
+    [value, ..._] -> SfFieldPun(value)
+    _             -> panic("surface_rebuild: child list does not match the form")
+  }
 }
 
 # Pure `f` only (kaic1 cannot compile a row-generic fn); an effectful
@@ -713,6 +819,7 @@ pub fn surface_map(sf: SurfaceForm, f: (Expr) -> Expr) : SurfaceForm = match sf 
   SfDeref(target)              -> SfDeref(f(target))
   SfMultiMatch(scruts, arms)   -> SfMultiMatch(map(scruts, f), map(arms, (a) => mmarm_map(a, f)))
   SfCaseBlock(arms)            -> SfCaseBlock(map(arms, (a) => mmarm_map(a, f)))
+  SfFieldPun(value)            -> SfFieldPun(f(value))
 }
 
 fn sf_opt_map(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] = match o {
@@ -748,7 +855,7 @@ pub type Arm = Arm(Pattern, Option[Expr], Expr)
 pub type FieldInit = FI(String, Expr)
 
 #[derive(BinSerialize)]
-pub type Param = { pname: String, ptype: Option[TypeExpr], pline: Int, pcol: Int, pborrow: Bool }
+pub type Param = { binder: Binder, ptype: Option[TypeExpr], pline: Int, pcol: Int, pborrow: Bool }
 
 #[derive(BinSerialize)]
 pub type Stmt
@@ -771,7 +878,7 @@ pub type Stmt
   # form (Doc B §`State[T]` *Syntax note*, Doc C §m7b #5). SVar
   # therefore never reaches the resolver. The line/col point at the
   # `var` keyword.
-  | SVar(String, Option[TypeExpr], Expr, Int, Int)
+  | SVar(Binder, Option[TypeExpr], Expr, Int, Int)
   # m7e §25: `use Effect` at block scope — opens the effect's ops
   # for bare-name resolution in the rest of the enclosing block.
   # Same desugar pass as DUse handles both file-scope and block-
@@ -789,19 +896,18 @@ pub type PatKind
   # desugar pass rewrites it to `PBind(fresh)` + a `fresh >= lo and
   # fresh <= hi` guard before the typer, so nothing past desugar handles it.
   | PRange(Expr, Expr)
-  | PBind(String)
-  # Fixed sub-patterns plus optional rest binder. The rest slot stores
-  # the SOURCE spelling: `Some("")` for bare `...`, `Some("_")` for
-  # `..._`, `Some(name)` for `...name`, `None` for no rest.
-  # `surface_lower_decls` replaces the two anonymous spellings with a
-  # unique `__list_rest_<line>_<col>__` sentinel, so every pass after
-  # it sees a real binder name.
-  | PList([Pattern], Option[String])
+  | PBind(Binder)
+  # Fixed sub-patterns plus optional rest binder: `Some(name)` for
+  # `...name`, `None` for no rest. An anonymous rest (`...`, `..._`)
+  # parses as `PsAnonRest`; `surface_lower_decls` gives it a unique
+  # `__list_rest_<line>_<col>__` binder, so every pass after it sees
+  # a real binder name.
+  | PList([Pattern], Option[Binder])
   # Home slot: the module the pattern was qualified with, `None` when
   # written bare. Kept through every pass so a written qualifier is
   # never dissolved before it can be validated.
-  | PVariant(Option[String], String, [Pattern])
-  | PVariantRecord(TyRef, String, [PField])
+  | PVariant(DeclRef, [Pattern])
+  | PVariantRecord(DeclRef, [PField])
   | PRecord([PField])
   | PHole(Option[String])                   # `?` or `?name` in pattern position
   # m7d §14: `name @ pattern` — bind the whole scrutinee to `name`
@@ -809,7 +915,7 @@ pub type PatKind
   # be a fresh identifier; the inner pattern's bindings (if any)
   # remain visible in the arm body. Disjoint from m7b §2's prefix
   # `@cap` (an expression), which never appears in pattern position.
-  | PAs(String, Pattern)
+  | PAs(Binder, Pattern)
   # A pattern spelling the parser preserves verbatim so `kai fmt`
   # prints what the author wrote. `surface_lower_decls` dissolves it
   # before resolution; downstream passes treat it as unreachable.
@@ -822,7 +928,7 @@ pub type PatKind
   # the alias case back into `PBind` + `__ref_pred_t(name)` guard so
   # m12.6.x semantics are preserved. What survives into the typer is
   # always a non-refinement narrowing over a union component.
-  | PNarrow(String, TypeExpr)
+  | PNarrow(Binder, TypeExpr)
 
 #[derive(BinSerialize)]
 pub type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
@@ -832,7 +938,7 @@ pub type TypeExpr = { tkind: TyKind, line: Int, col: Int }
 
 #[derive(BinSerialize)]
 pub type TyKind
-  = TyName(TyRef, String, [TypeExpr])              # Name or Name[T1, T2, ...]
+  = TyName(DeclRef, [TypeExpr])                      # Name or Name[T1, T2, ...]
   | TyList(TypeExpr)
   | TyFn([TypeExpr], TypeExpr, RowExpr)
   # m12.5: dimensioned numeric type, e.g. `Real<USD>` or `Int<m/sec>`.
@@ -874,19 +980,11 @@ pub type TyKind
 #[derive(BinSerialize)]
 pub type RowExpr = REmpty | RClosed([RowLabel]) | ROpen(String, [RowLabel])
 #[derive(BinSerialize)]
-pub type RowLabel = RL(String, [TypeExpr], SymId)
+pub type RowLabel = RL(DeclRef, [TypeExpr])
 
-#[doc("The effect name a row label spells.")]
-pub fn rl_name(l: RowLabel) : String = match l { RL(n, _, _) -> n }
+#[doc("The effect declaration a row label names, `sym_none()` while it is still written text.")]
+pub fn rl_sym(l: RowLabel) : SymId = match l { RL(r, _) -> ref_sym(r) }
 
-#[doc("The effect names a list of row labels spells, in order.")]
-pub fn rl_names(ls: [RowLabel]) : [String] = map(ls, (l) => rl_name(l))
-
-# m12.5: units of measure. UnitExprT is a tree of unit operations.
-# The canonicaliser flattens it to a sorted vector of (sym, exponent).
-# UVar appears only at the semantic level — the parser produces only
-# the other shapes; UVar is allocated by the unifier for unit
-# inference variables (parallel to TyVarT).
 #[derive(BinSerialize)]
 pub type UnitExprT
   = UOne                                    # the dimensionless unit "1"
@@ -937,16 +1035,34 @@ pub fn tp_shape_suffix() : String = "#Shape"
 #[doc("Name of the built-in abelian kind (`Measure`) that the `unit` keyword introduces habitants into.")]
 pub fn measure_kind_name() : String = "Measure"
 
-# Handler clause (op): `op_name(args..., resume) -> body`. The
-# resume binding is conventionally the last param; m7a #4d will
-# validate. m7a #4b stores the param list verbatim.
+# Handler clause: `op_name(args..., resume) -> body`, the resume
+# binding conventionally the last param, or a lifecycle clause
+# `finally { body }`, which carries no params.
 #[derive(BinSerialize)]
-pub type HClause = HC(String, [Param], Expr, Int, Int)
+pub type HClause = HC(ClauseHead, [Param], Expr, Int, Int)
+
+#[doc("What a handler clause handles: an operation of the effect, by name, or one end of the handler's own lifetime. The parser decides which, so an effect stays free to declare an op called `initially` or `finally`.")]
+#[derive(BinSerialize)]
+pub type ClauseHead = ChOp(String) | ChInitially | ChFinally
+
+#[doc("The word a clause is headed by: the operation's name, or the lifecycle keyword.")]
+pub fn clause_head_word(h: ClauseHead) : String = match h {
+  ChOp(n)     -> n
+  ChInitially -> "initially"
+  ChFinally   -> "finally"
+}
+
+#[doc("The lifecycle clause a keyword opens, or `None` for any other word.")]
+pub fn clause_lifecycle_of_word(w: String) : Option[ClauseHead] = match w {
+  "initially" -> Some(ChInitially)
+  "finally"   -> Some(ChFinally)
+  _           -> None
+}
 
 # Optional `return(x) -> expr` clause inside a handle. `pname` is
 # the parameter name bound inside `body`.
 #[derive(BinSerialize)]
-pub type HReturn = HR(String, Expr, Int, Int)
+pub type HReturn = HR(Binder, Expr, Int, Int)
 
 # Issue #533: user-declared default handler clauses attached to an
 # `effect E { ops; default { clauses } }` declaration. Carries the
@@ -978,7 +1094,7 @@ pub type Decl
   # stamps it.
   # `SymId` last, as on the other declaration forms: the identity the
   # symbol table minted, which the module tag cannot supply.
-  = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int, Option[String], FnId)
+  = DFn(Bool, FnId, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int, Option[String])
   # Hanga Roa: trailing `Option[String]` is the *module origin*,
   # mirroring `DFn`. None for decls authored in the root file; the
   # surface name of the owning module for decls coming through
@@ -999,7 +1115,7 @@ pub type Decl
   # `SymId` last, as on `DEffect`: the declaration's own identity, which
   # the module tag cannot supply — a root declaration and an untagged one
   # both spell `None`.
-  | DType(Bool, String, [String], TypeBody, Int, Int, Option[String], [String], SymId)
+  | DType(Bool, SymId, [String], TypeBody, Int, Int, Option[String], [String])
   | DTest(String, Expr, Int, Int, Option[String])
   # bench v1 (issue #40): mirrors DTest but the runner times the body.
   # Fields: description (raw quoted span), body, line, col.
@@ -1020,7 +1136,7 @@ pub type Decl
   # The `SymId` after the module tag is the declaration's own identity.
   # A module tag alone cannot tell a root declaration from an untagged
   # one, and both spell `None`.
-  | DEffect(Bool, String, [String], [EffectOp], Option[DefaultBlock], Int, Int, Option[String], SymId)
+  | DEffect(Bool, SymId, [String], [EffectOp], Option[DefaultBlock], Int, Int, Option[String])
   # m12.8: `protocol P { op_decls }` — single-dispatch ad-hoc
   # polymorphism. Each ProtoOp carries a parameter list using `Self`
   # as the first-position dispatch type. Defaults are not parsed in
@@ -1030,7 +1146,7 @@ pub type Decl
   # impl-table key remains `(P, Self)` — `Ai` resolve at impl-site.
   # The trailing `Option[String]` is the declaring module's origin,
   # stamped at the import boundary like DType/DEffect; `None` = root.
-  | DProtocol(Bool, String, [String], [ProtoOp], Int, Int, Option[String], SymId)
+  | DProtocol(Bool, SymId, [String], [ProtoOp], Int, Int, Option[String])
   # m12.8: `impl P for T { fn op(args) = body ... }` — supplies the
   # ops of protocol `pname` for the concrete type `target`. The body
   # decls live as ordinary DFns whose name is the op name (no
@@ -1046,7 +1162,7 @@ pub type Decl
   # prepends them (bounds stripped) to each method's own tparams; the
   # slot itself survives so `kai fmt` can print the impl head — no
   # other pass reads it after lowering.
-  | DImpl(String, [TypeExpr], TypeExpr, [Decl], Int, Int, [String], SymId)
+  | DImpl(DeclRef, [TypeExpr], TypeExpr, [Decl], Int, Int, [String], SymId)
   # m12.8: `#derive(P, ...) type T = ...` — opt-in structural impl
   # generator. The lower-protocols pass walks the type body and
   # synthesises one DImpl per derived protocol. The parser keeps the
@@ -1115,8 +1231,8 @@ pub type Decl
   | DUnit(Bool, String, UnitBody, String, Int, Int, Option[String])
   # m7e §25: `use Effect` at file scope — opens the effect's ops
   # for bare-name resolution in every fn body of the file. The
-  # resolver desugar_use_decls expands every `EVar(name)` matching
-  # an opened op into `EField(EVar(eff), name)`. Ambiguity (two
+  # resolver desugar_use_decls expands every `EName(name)` matching
+  # an opened op into `EField(EName(eff), name)`. Ambiguity (two
   # opened effects expose the same op name) is a hard error.
   # `use` does NOT remove the cap from the row — the effect still
   # appears in any caller's row annotation.
@@ -1150,7 +1266,7 @@ pub type Decl
   # load (or inlined literal), never a function call. `module_origin`
   # carries the home module so `pub` enforcement (issue #510) sees a
   # const's home directly, with NO lowering to a disguised zero-arg fn.
-  | DConst(Bool, String, TypeExpr, Expr, Option[String], Int, Int, SymId)
+  | DConst(Bool, SymId, TypeExpr, Expr, Option[String], Int, Int)
   # A foreign type declared by `extern "C" type Name = { fields }` (a C
   # struct passed by value) or `extern "C" opaque Name` (an opaque C
   # handle kaikai threads through but never inspects). Fields: name,
@@ -1210,8 +1326,25 @@ pub type UnitBody = UBNone | UBAlias(UnitExprT) | UBMeasure(String)
 pub type KindHab
   = HabNone
   | HabIntro(String)
-  | HabDomain(String)
+  | HabDomain(ValueDomain)
   | HabClosed(String, [String])
+
+#[doc("The domain of a value-habitant kind: its habitants are the literals of this type, written directly in `<>`.")]
+#[derive(BinSerialize)]
+pub type ValueDomain = VdInt | VdString
+
+#[doc("The value domain a type name spells after a kind's `with`, or `None` when it spells none.")]
+pub fn value_domain_of_name(n: String) : Option[ValueDomain] = match n {
+  "Int"    -> Some(VdInt)
+  "String" -> Some(VdString)
+  _        -> None
+}
+
+#[doc("The type name a value domain is written as.")]
+pub fn value_domain_name(d: ValueDomain) : String = match d {
+  VdInt    -> "Int"
+  VdString -> "String"
+}
 
 #[doc("The introducer word a `KindHab` registers for habitant declarations, or empty when the form declares none (`HabNone`, `HabDomain`).")]
 pub fn kind_hab_intro(h: KindHab) : String = match h {
@@ -1253,7 +1386,7 @@ pub type ProtoOp = POp(String, [String], [Param], TypeExpr, Int, Int)
 # ops; non-empty when the op signature itself quantifies over
 # types (Doc B §`Mutable`'s `array_get[T]`, etc.).
 #[derive(BinSerialize)]
-pub type EffectOp = EOp(String, [String], [Param], TypeExpr, Int, Int)
+pub type EffectOp = EffOp(String, [String], [Param], TypeExpr, Int, Int)
 
 # TBEffectAlias holds a closed sum of effect labels, e.g.
 # `type Io = Console + Stdin + Env + File` (m7b #1). The body is a
@@ -1276,7 +1409,7 @@ pub type FieldDecl = FD(Bool, String, TypeExpr, [FieldAttr])
 #[derive(BinSerialize)]
 pub type FieldAttr = FAJsonRename(String) | FAJsonDefault(Expr) | FAJsonSkip
 #[derive(BinSerialize)]
-pub type Variant = Var(String, [TypeExpr])
+pub type Variant = Var(SymId, [TypeExpr])
 
 #[derive(BinSerialize)]
 pub type ImportKind
@@ -1306,8 +1439,14 @@ it just bound, or a specialisation it just created — so it carries no
 id; the passes that mint a reference to something already resolved
 build an `ESym` instead.
 """)]
-pub fn mk_ref(name: String, line: Int, col: Int) : Expr =
-  mk_expr(EVar(name), line, col)
+pub fn mk_name(name: String, line: Int, col: Int) : Expr =
+  mk_expr(EName(written(name)), line, col)
+
+#[doc("A read of the local binder `l`.")]
+pub fn mk_local(l: LocalId, line: Int, col: Int) : Expr = mk_expr(ELocal(l), line, col)
+
+#[doc("A reference to the declaration `s` itself.")]
+pub fn mk_sym(s: SymId, line: Int, col: Int) : Expr = mk_expr(ESym(s, spec_none()), line, col)
 
 #[doc("The expressions a statement evaluates, in order.")]
 pub fn stmt_exprs(s: Stmt) : [Expr] = match s {
@@ -1329,6 +1468,15 @@ pub fn mk_int_synth(v: Int) : ExprKind = EInt(v, "")
 #[doc("The fresh binder a destructuring block-lambda parameter is bound to, keyed by the pattern's position.")]
 pub fn lam_pat_binder_name(line: Int, col: Int) : String =
   string_concat_all(["__lam_pat_", int_to_string(line), "_", int_to_string(col), "__"])
+
+#[doc("The binder a point-free section's receiver is bound to. Only the parser mints it, and a parameter has no slot for its kind, so the kind is this binder's identity.")]
+pub fn point_free_binder() : Binder = binder_minted("__pl")
+
+#[doc("True when `ps` are the parameters of a point-free section, a lambda the author wrote with a leading dot.")]
+pub fn params_point_free(ps: [Param]) : Bool = match ps {
+  [p] -> local_eq(p.binder.id, point_free_binder().id)
+  _   -> false
+}
 
 #[doc("Render an integer literal: the author's spelling when there is one, else the decimal value.")]
 pub fn int_lit_text(v: Int, span: String) : String =
@@ -1398,7 +1546,7 @@ pub type Ty
   # identity is `sym_none()` where no declaration is known, as for a
   # builtin nominal type. The identity indexes the symbol table the typer
   # was given, not any other table built in the same compilation.
-  | TyCon(Option[String], String, [Ty], SymId)
+  | TyCon(SymId, [Ty])
   | TyVarT(Int)                         # unification variable
   | TyAny                               # placeholder for "not yet resolved"
   # m12.5: resolved dimensioned type. Inner Ty is always TyInt / TyReal
@@ -1445,7 +1593,9 @@ pub type Ty
 # carries an empty row.
 #[derive(BinSerialize)]
 # `sym` is the declaration the label names, `sym_none()` while unsettled.
-pub type Label = { eff: String, ty_args: [Ty], sym: SymId }
+# `cell` tells two instances of one effect apart: the alias binder of the
+# `with Eff as a` that owns the label, `local_none()` for the ambient one.
+pub type Label = { sym: SymId, ty_args: [Ty], cell: LocalId }
 
 #[derive(BinSerialize)]
 pub type Row = {
@@ -1458,51 +1608,71 @@ pub type Row = {
 # row variable id within the enclosing function declaration.
 pub type RVBind = RVB(String, Int)
 
-# Synthetic field-name markers (issue #326). The parser injects these
-# sentinel names into anonymous-record / positional-tuple FieldInit
-# lists; downstream passes (record-literal desugar, codegen) branch on
-# them. They are an AST-shape convention shared between the parser and
-# its consumers, so they live with the AST model rather than inside the
-# parser. Real field names cannot start with `__`, so the sentinels are
-# unambiguous.
-pub fn pos_field_marker(i: Int) : String =
-  string_concat("__pos_", string_concat(int_to_string(i), "__"))
+# A record literal's field is written four ways: `...base`, a positional
+# value, a pun (`x`), and `name: value`. The first two have no name, so
+# their slot holds "" and their value is called by a mark; a pun wraps
+# its value in `SfFieldPun`.
 
-pub fn spread_field_marker() : String = "__spread__"
+#[doc("The init of a positional field: no name, its value called by `MkFieldPos`.")]
+pub fn mk_field_pos(value: Expr) : FieldInit = FI("", field_marked(MkFieldPos, value))
 
-pub fn is_spread_field_marker(s: String) : Bool = s == "__spread__"
+#[doc("The init a `...src` spread occupies: no name, its source called by `MkFieldSpread`.")]
+pub fn mk_field_spread(src: Expr) : FieldInit = FI("", field_marked(MkFieldSpread, src))
 
-# Pun shorthand marker: `{ x, y }` parses as `FI("__pun__x", EVar x)`
-# so the writer can restore the shorthand; `surface_lower_decls`
-# normalises it back to the plain field name before any other pass.
-pub fn pun_field_marker(name: String) : String = string_concat("__pun__", name)
+fn field_marked(m: Mark, value: Expr) : Expr =
+  mk_expr(ECall(mk_expr(EMark(m), value.line, value.col), [value]), value.line, value.col)
 
-pub fn is_pun_field_marker(s: String) : Bool =
-  string_length(s) > 7 and string_slice(s, 0, 7) == "__pun__"
+#[doc("The value of a positional field, or None when the field is of any other kind.")]
+pub fn field_pos_value(value: Expr) : Option[Expr] = match value.kind {
+  ECall(f, [inner]) -> match f.kind {
+    EMark(MkFieldPos) -> Some(inner)
+    _ -> None
+  }
+  _ -> None
+}
 
-pub fn pun_field_name(s: String) : String =
-  string_slice(s, 7, string_length(s) - 7)
+#[doc("The source a spread field copies from, or None when the field is of any other kind.")]
+pub fn field_spread_value(value: Expr) : Option[Expr] = match value.kind {
+  ECall(f, [inner]) -> match f.kind {
+    EMark(MkFieldSpread) -> Some(inner)
+    _ -> None
+  }
+  _ -> None
+}
 
-pub fn is_pos_field_marker(s: String) : Bool {
-  let n = string_length(s)
-  if n < 8 { false }
-  else {
-    match char_at(s, 0) { Some(c0) -> if c0 != '_' { false } else {
-      match char_at(s, 1) { Some(c1) -> if c1 != '_' { false } else {
-        match char_at(s, 2) { Some(c2) -> if c2 != 'p' { false } else {
-          match char_at(s, 3) { Some(c3) -> if c3 != 'o' { false } else {
-            match char_at(s, 4) { Some(c4) -> if c4 != 's' { false } else {
-              match char_at(s, 5) { Some(c5) -> c5 == '_'
-                None -> false
-              }
-              } None -> false }
-            } None -> false }
-          } None -> false }
-        } None -> false }
-      } None -> false }
+#[doc("True when a field's value is a positional one.")]
+pub fn field_is_pos(value: Expr) : Bool = match field_pos_value(value) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("True when a field's value is the source of a spread.")]
+pub fn field_is_spread(value: Expr) : Bool = match field_spread_value(value) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("The expression the author wrote in a field's slot: a positional value or a spread source from under its mark, any other value as it is.")]
+pub fn field_written(value: Expr) : Expr = match field_spread_value(value) {
+  Some(src) -> src
+  None      -> match field_pos_value(value) {
+    Some(v) -> v
+    None    -> value
   }
 }
 
+#[doc("The init of a punned field `{ x }`: the field's own name, its value wrapped in `SfFieldPun` so the writer can restore the shorthand.")]
+pub fn mk_field_pun(name: String, value: Expr) : FieldInit =
+  FI(name, mk_expr(ESurface(SfFieldPun(value)), value.line, value.col))
+
+#[doc("The reference a punned field's value wraps, or None when the field was written out as `name: value`.")]
+pub fn field_pun_value(value: Expr) : Option[Expr] = match value.kind {
+  ESurface(sf) -> match sf {
+    SfFieldPun(inner) -> Some(inner)
+    _ -> None
+  }
+  _ -> None
+}
 
 # ====================================================================
 # Record table (issue #648) — moved from main.kai under issue #677
@@ -1510,128 +1680,23 @@ pub fn is_pos_field_marker(s: String) : Bool {
 # type: the positional-record desugar (compiler.desugar) consumes
 # [RecInfo] in its pass signatures, and the typer threads the same
 # table through inference. ast.kai is the only home both import
-# without a lateral arrow. The typer-only rerank / module-slot
-# helpers (rerank_recs_*, option_str_eq, module_slot_compat) and the
-# arity-only rec_find_arity wrapper stay in main.kai.
+# without a lateral arrow. The typer-only rerank helpers
+# (rerank_recs_*, option_str_eq) and the arity-only rec_find_arity
+# wrapper stay in main.kai.
 # ====================================================================
 
 #[doc("Record-table entry: type name, type params, field decls, module origin, declaration id. Built by collect_records, consumed by the positional-record desugar (compiler.desugar) and the typer; an AST-adjacent shared type.")]
 #[derive(BinSerialize)]
-pub type RecInfo = RI(String, [String], [FieldDecl], Option[String], SymId)
+pub type RecInfo = RI(SymId, [String], [FieldDecl], Option[String])
 
-# Issue #648 — arity-aware record lookup. Two layers, mirroring the
-# variant-side `variants_of_type_loop_arity` (issue #643):
-#
-# 1. **Arity match**. Caller passes `arity = list_length(args)` from
-#    its `TyCon(_, name, args)` scrutinee; we prefer a `RI` whose
-#    `tparams` length matches. Discriminates `Tree[k, v]` (arity 2)
-#    from `Tree` (arity 0).
-#
-# 2. **Field-set tie-break** for same-(name, arity) collisions. The
-#    record-side analog of the variant-side same-arity limitation:
-#    `stdlib/regexp.kai` declares `type Thread = { state_id, captures }`
-#    (private) and a user re-declares `type Thread = { id, name }`.
-#    Both have arity 0. The core code (which the typer must also
-#    re-check) accesses `t.state_id`; the user code accesses `t.name`.
-#    Resolving by arity alone hands one or the other the wrong field
-#    set. `rec_find_with_field` (used by field-access call sites)
-#    prefers a `RI` that actually declares the requested field —
-#    that suffices to keep BOTH the user's `t.name` and the core's
-#    `t.state_id` resolving to their respective declarations.
-#
-# `arity = -1` is the "caller does not know the arity" sentinel —
-# all matches by bare name are accepted and the first one wins, which
-# reproduces the legacy `rec_find` semantics over the newest-first
-# list.
+#[doc("The record `s` declares, if the table holds one.")]
+pub fn rec_find(rs: [RecInfo], s: SymId) : Option[RecInfo] =
+  if sym_raw(s) < 0 { None } else { rec_find_loop(rs, sym_raw(s)) }
 
-pub fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
-                          fallback: Option[RecInfo]) : Option[RecInfo] {
-  match rs {
-    [] -> fallback
-    [r, ...rest] -> match r {
-      RI(nm, tps, _, _, _) ->
-        if nm == target {
-          if arity < 0 {
-            Some(r)
-          } else if list_length(tps) == arity {
-            Some(r)
-          } else {
-            let fb = match fallback {
-              Some(_) -> fallback
-              None    -> Some(r)
-            }
-            rec_find_arity_loop(rest, target, arity, fb)
-          }
-        } else {
-          rec_find_arity_loop(rest, target, arity, fallback)
-        }
-    }
-  }
-}
-
-pub fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
-  rec_find_arity_loop(rs, target, -1, None)
-
-#[doc("Bare-name record lookup (no arity discrimination); newest-first so a later same-name record shadows an earlier one.")]
-pub fn rec_find(rs: [RecInfo], target: String) : Option[RecInfo] = rec_find_loop(rs, target)
-
-#[doc("The record `target` whose declaration is `s`; `None` when `s` is unresolved, leaving the choice to the name lookups.")]
-pub fn rec_find_decl(rs: [RecInfo], target: String, s: SymId) : Option[RecInfo] =
-  if sym_raw(s) < 0 { None } else { rec_find_decl_loop(rs, target, sym_raw(s)) }
-
-fn rec_find_decl_loop(rs: [RecInfo], target: String, id: Int) : Option[RecInfo] = match rs {
+fn rec_find_loop(rs: [RecInfo], id: Int) : Option[RecInfo] = match rs {
   [] -> None
   [r, ...rest] -> match r {
-    RI(nm, _, _, _, ds) -> if sym_raw(ds) == id and nm == target { Some(r) } else { rec_find_decl_loop(rest, target, id) }
-  }
-}
-
-# Issue #648 — field-aware record lookup. When the caller knows the
-# field being accessed (or the field-set being constructed), prefer
-# an arity-matched `RI` that declares the requested field. This is
-# the record-side same-arity tie-breaker that the variant-side fix
-# left unresolved (`SplitN` / `NB_FragR` skip-list in issue #643).
-# A user `type Thread = { id, name }` and a private core `type
-# Thread = { state_id, captures }` collide on name + arity 0; the
-# walker hands the user's record back when the access site reads
-# `name`, and the core's when the access site reads `state_id`.
-
-#[doc("Field-aware record lookup: among same-(name, arity) records, prefer the one declaring the requested field. Issue #648.")]
-pub fn rec_find_with_field(rs: [RecInfo], target: String, arity: Int,
-                          field: String) : Option[RecInfo] =
-  rec_find_with_field_loop(rs, target, arity, field, None, None)
-
-pub fn rec_find_with_field_loop(rs: [RecInfo], target: String, arity: Int,
-                                field: String, by_field: Option[RecInfo],
-                                by_arity: Option[RecInfo]) : Option[RecInfo] {
-  match rs {
-    [] -> match by_field {
-      Some(_) -> by_field
-      None    -> by_arity
-    }
-    [r, ...rest] -> match r {
-      RI(nm, tps, fs, _, _) ->
-        if nm == target {
-          let arity_ok = arity < 0 or list_length(tps) == arity
-          if arity_ok {
-            if field_decl_list_has(fs, field) {
-              # First arity-matched record that declares `field`
-              # wins outright — no further walking needed.
-              Some(r)
-            } else {
-              let ba = match by_arity {
-                Some(_) -> by_arity
-                None    -> Some(r)
-              }
-              rec_find_with_field_loop(rest, target, arity, field, by_field, ba)
-            }
-          } else {
-            rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
-          }
-        } else {
-          rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
-        }
-    }
+    RI(ds, _, _, _) -> if sym_raw(ds) == id { Some(r) } else { rec_find_loop(rest, id) }
   }
 }
 
@@ -1682,29 +1747,27 @@ fn field_decl_index_loop(fs: [FieldDecl], target: String, i: Int) : Int = match 
   }
 }
 
-#[doc("Shared field-index oracle: the declaration-order slot of `field` on record `target`, or `None` for an unknown/polymorphic type. Single source of truth for the canonical layout — field reads, record assembly, and reuse all index through it so they never drift.")]
-pub fn rec_field_index(rs: [RecInfo], target: String, arity: Int,
-                       field: String) : Option[Int] =
-  match rec_find_with_field(rs, target, arity, field) {
-    None     -> None
-    Some(ri) -> match ri {
-      RI(_, _, fs, _, _) -> match field_decl_index(fs, field) {
-        -1 -> None
-        n  -> Some(n)
-      }
+#[doc("The declaration-order slot of `field` on the record `s` declares, or `None` when it declares no such record or field.")]
+pub fn rec_field_index(rs: [RecInfo], s: SymId, field: String) : Option[Int] = match rec_find(rs, s) {
+  None     -> None
+  Some(ri) -> match ri {
+    RI(_, _, fs, _) -> match field_decl_index(fs, field) {
+      -1 -> None
+      n  -> Some(n)
     }
   }
+}
 
-#[doc("The declaration-order slot of `field` when `opt_t` is a known record type, else `None`. The `EField` read site of both backends calls this to choose a constant-index load over the `kai_op_field` strcmp; `None` (unknown / polymorphic / non-record base) keeps the strcmp fallback.")]
+#[doc("The declaration-order slot of `field` when `opt_t` is a known record type, else `None`.")]
 pub fn field_index_of(recs: [RecInfo], opt_t: Option[Ty], field: String) : Option[Int] = match opt_t {
   Some(t) -> field_index_of_t(recs, t, field)
   None    -> None
 }
 
 fn field_index_of_t(recs: [RecInfo], t: Ty, field: String) : Option[Int] = match t {
-  TyCon(_, cname, cargs, _) -> rec_field_index(recs, cname, list_length(cargs), field)
-  TyRefineT(inner, _)    -> field_index_of_t(recs, inner, field)
-  _                      -> None
+  TyCon(s, _)         -> rec_field_index(recs, s, field)
+  TyRefineT(inner, _) -> field_index_of_t(recs, inner, field)
+  _                   -> None
 }
 
 #[doc("The wrapped decl of an annotation-only wrapper, None for a bare decl.")]
@@ -1736,8 +1799,8 @@ pub fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
     [d, ...rest] -> match decl_transparent_inner(d) {
       Some(inner) -> collect_records_loop([inner, ...rest], acc)
       None -> match d {
-        DType(_, nm, tps, body, _, _, mo, _, dsym) -> match body {
-          TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs, mo, dsym), ...acc])
+        DType(_, dsym, tps, body, _, _, mo, _) -> match body {
+          TBRecord(fs) -> collect_records_loop(rest, [RI(dsym, tps, fs, mo), ...acc])
           _ -> collect_records_loop(rest, acc)
         }
         _ -> collect_records_loop(rest, acc)
@@ -1754,17 +1817,17 @@ pub fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
 # import downward instead of laterally. The ops/impls/origins themselves
 # are populated by fns that stay in main.kai for now.
 
-#[doc("Registered protocol operation: (proto, op_name, params, ret, line, col, home). `home` is the declaring protocol's module origin, `None` for the root file.")]
-pub type ProtoOpReg = POR(String, String, [Param], TypeExpr, Int, Int, Option[String])
-#                         proto    op_name params  ret      line col  home
+#[doc("Registered protocol operation: (proto, op_name, params, ret, line, col, home, protocol identity). `home` is the declaring protocol's module origin, `None` for the root file.")]
+pub type ProtoOpReg = POR(SymId, Written, [Param], TypeExpr, Int, Int, Option[String])
+#                         protocol op      params  ret      line col  home
 
 # Issue #180: ProtoTPReg lets `find_proto_impl_for_args` know whether
 # a protocol declared `[A]` parameters. When empty, only the legacy
 # (Self,Self) homogeneous match is valid — `pow_int(self: Self, exp:
 # Int)`'s second argument is not a proto-arg.
-#[doc("Protocol type-parameter registry: (proto, [tparam names], home).")]
-pub type ProtoTPReg = PTPR(String, [String], Option[String])
-#                         proto    tparam names  home
+#[doc("Protocol type-parameter registry: (proto, [tparam names], home, protocol identity).")]
+pub type ProtoTPReg = PTPR(SymId, [String], Option[String])
+#                         protocol tparam names home
 
 #[doc("One free-fn protocol-bound obligation: type-kind tparam index (aligned with a monomorphised call's concrete `tys`) and its declared protocol bounds.")]
 pub type FnTPBound = FTB(Int, [String])
@@ -1774,9 +1837,14 @@ pub type FnTPBound = FTB(Int, [String])
 pub type FnBoundsRec = FBR(String, Option[String], [FnTPBound])
 #                          name    module_origin    per-tparam bounds
 
-#[doc("Protocol impl registry: (proto, type, op_name, impl_fn_name, [proto_arg_names], ret_head, impl home, target identity).")]
-pub type ProtoImplReg = PIR(String, String, String, String, [String], String, Option[String], SymId)
-#                          proto    type    op_name impl_fn_name [proto_arg_names] ret_head impl_home target
+#[doc("Protocol impl registry: (proto key, type, op_name, impl_fn_name, [proto_arg_names], ret_head, impl home, target identity, protocol identity).")]
+pub type ProtoImplReg = PIR(SymId, DeclRef, Written, SymId, [DeclRef], DeclRef, Option[String])
+#                          protocol target op      impl fn [protocol args] ret head impl home
+# `protocol` is the declaration the impl's written protocol name denotes
+# from the impl's module: which protocol an entry belongs to is decided
+# by it. `proto` is that protocol's dispatch key, the spelling the impl
+# function's symbol carries. `sym_none()` when the name resolved to no
+# protocol, which `lower_protocols` has reported.
 # `target` is the identity of the type the impl is for, read from the
 # symbol table the typer is given, so it compares with a `TyCon`'s id;
 # `sym_none()` for a type with no declaration (a builtin) and until the
@@ -1795,36 +1863,45 @@ pub type ProtoImplReg = PIR(String, String, String, String, [String], String, Op
 # One entry per declared protocol — the identity table protocol-name
 # resolution scopes against. Two modules may each
 # declare a protocol `P`; each gets its own entry.
-#[doc("Protocol origin registry: (proto, module_origin, is_pub). `None` origin = root file.")]
-pub type ProtoOriginReg = PrOR(String, Option[String], Bool)
-#                             proto   module_origin    is_pub
+#[doc("Protocol origin registry: (proto, module_origin, is_pub, protocol identity). `None` origin = root file.")]
+pub type ProtoOriginReg = PrOR(SymId, Option[String], Bool)
+#                             protocol module_origin  is_pub
 
-# The dispatch layer (impl mangling, `PIR` keys, rewrite lookups)
-# identifies a protocol by this spelling, not by its bare name: a
-# name declared by two modules would otherwise share one impl table
-# and one mangled symbol space.
-#[doc("Dispatch identity of one declared protocol: (proto, module_origin, key). The key is the bare name, module-qualified when the name is contested across modules.")]
-pub type ProtoKey = PKey(String, Option[String], String)
-#                       proto   module_origin    dispatch key
+# Impl mangling spells a protocol with this key, not its bare name: a
+# name declared by two modules would otherwise share one mangled symbol
+# space. Lookups decide by the protocol's identity, never by the key.
+#[doc("Dispatch spelling of one declared protocol: (proto, module_origin, key, protocol identity). The key is the bare name, module-qualified when the name is contested across modules.")]
+pub type ProtoKey = PKey(SymId, Option[String], Written)
+#                       protocol module_origin  dispatch key
 
 # O(1) view over the immutable `impls` list, built once at the
 # `lower_protocols` boundary. `by_key` buckets every `PIR` by a hash of
 # `(proto, type)`; each bucket keeps its entries in `impls` order so a
 # bucket scan returns the same first-match as a full linear scan.
-# `by_sym` buckets by `impl_fn_name` for the return-head lookup.
 # `nbuckets == 0` marks the unbuilt placeholder: lookups fall back to
 # the linear scan over `impls`, so the index is purely additive.
-#[doc("Hash index over a ProtocolReg's impl table: (proto, type) and impl-fn-name buckets.")]
+#[doc("Hash index over a ProtocolReg's impl table: (proto, type) buckets.")]
 pub type ImplIndex = { by_key: Array[[ProtoImplReg]],
-                       by_sym: Array[[ProtoImplReg]],
                        nbuckets: Int }
+
+#[doc("What the lowering knows of a dispatcher it generated, filed under the dispatcher's id: the name it is declared with, the operation it stands for, its home (`None` for the root file), that operation's arity, and whether only the protocols of its home answer it.")]
+pub type DispInfo = DispInfo(String, String, Option[String], Int, Bool)
+
+#[doc("A protocol and the dispatcher one of its operations lowered to: `ProtoDisp(protocol, dispatcher)`.")]
+pub type ProtoDisp = ProtoDisp(SymId, SymId)
+
+#[doc("A map from a symbol's raw id to a row: a search tree over ids, which are hashes and so arrive in no order that could unbalance it.")]
+pub type IdTree[a] = IdLeaf | IdNode(IdTree[a], Int, a, IdTree[a])
+
+#[doc("The functions the protocol lowering generates, found by id: the dispatchers by id, each protocol with the dispatchers its operations share, each dispatcher's homed twin by the dispatcher's id, and the impl methods' registry entries by id.")]
+pub type ProtoIds = { disps: IdTree[DispInfo], shared: [ProtoDisp], homed: IdTree[SymId], impls: IdTree[ProtoImplReg] }
 
 #[doc("The tagged module names one file imports directly: `MImp(importer, imports)`, importer `\"\"` for the root file.")]
 pub type ModImports = MImp(String, [String])
 
-#[doc("Aggregate protocol registry: ops, impls, op_names, tparams, origins, dispatch keys, impl_index, plus what protocol resolution scopes by — the stdlib core module names and each file's direct imports.")]
+#[doc("Aggregate protocol registry: ops, impls, op_names, tparams, origins, dispatch keys, impl_index, plus what protocol resolution scopes by — the stdlib core module names and each file's direct imports — and the generated functions by id.")]
 pub type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg],
                          op_names: [String], tparams: [ProtoTPReg],
                          origins: [ProtoOriginReg], dkeys: [ProtoKey],
                          impl_index: ImplIndex, cores: [String],
-                         imports: [ModImports], root: String }
+                         imports: [ModImports], root: String, ids: ProtoIds }

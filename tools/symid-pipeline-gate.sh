@@ -248,10 +248,11 @@ out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
 need '^perceus main reverse#[0-9]+ reverse@main$'
 need '^perceus main reverse#[0-9]+ reverse@list$'
 
-# Whether a UFCS callee carries an id depends on which modules declare its
-# name, so `ma`'s cached typed blob must not travel between a program where
-# its pick is uncontested and one where it is contested, in either order.
-# Both programs carry byte-identical copies of `ma` and `mc`.
+# A UFCS callee carries the id of the declaration its receiver's type
+# picked whether or not another module declares the name, so `ma`'s cached
+# typed blob serves a program where the pick is uncontested and one where
+# it is contested, in either order. Both programs carry byte-identical
+# copies of `ma` and `mc`.
 CUT="$ROOT/examples/ufcs/contest_cut"
 CUTCACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE"' EXIT
@@ -261,10 +262,9 @@ cut_ids() {
     | grep -cE '^perceus run twice#[0-9]+ twice@mc$' || true
 }
 for step in two one two one; do
-  want=0; [ "$step" = one ] && want=1
   got=$(cut_ids --path "$CUT/$step" "$CUT/$step/main.kai")
-  out="step $step: $got id line(s), want $want"
-  [ "$got" = "$want" ] || fail "a cached typed blob carried a UFCS callee's form across programs"
+  out="step $step: $got id line(s), want 1"
+  [ "$got" = 1 ] || fail "a UFCS callee lost its id across programs sharing a cached typed blob"
 done
 
 # A constructor's home is its identity: an arm tests, and a construction
@@ -284,12 +284,12 @@ for pass in cold warm; do
   if [ "$pass" = cold ]; then out=$ctor_cold; else out=$ctor_warm; fi
   need '^ctor pat pa Tok#[0-9]+ Tok@ma$'
   need '^ctor pat pb Tok#[0-9]+ Tok@mb$'
-  need '^ctor mod main Tok#[0-9]+ Tok@ma$'
-  need '^ctor mod main Tok#[0-9]+ Tok@mb$'
+  need '^ctor sym main Tok#[0-9]+ Tok@ma$'
+  need '^ctor sym main Tok#[0-9]+ Tok@mb$'
   printf '%s\n' "$out" | grep -q ' Tok#none$' && fail "$pass: a constructor site reached unbox with no home"
   [ "$(id_of '^ctor pat pa Tok#')" != "$(id_of '^ctor pat pb Tok#')" ] \
     || fail "$pass: two modules' homonymous constructors carry one id"
-  [ "$(id_of '^ctor pat pa Tok#')" = "$(id_of '^ctor mod main Tok#[0-9]+ Tok@ma$')" ] \
+  [ "$(id_of '^ctor pat pa Tok#')" = "$(id_of '^ctor sym main Tok#[0-9]+ Tok@ma$')" ] \
     || fail "$pass: the arm and the construction of one constructor carry different ids"
 done
 [ "$ctor_cold" = "$ctor_warm" ] || fail "a warm build's constructor ids differ from a cold build's"

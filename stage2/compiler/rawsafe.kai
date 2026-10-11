@@ -20,8 +20,7 @@
 # `PBind` would break dozens of mechanical matches across resolve /
 # infer / fmt / refinements and pollute every bind in the language. A
 # side table keyed by source position is the established project pattern
-# for lateral analyses (`Use = U(name,line,col,in_lambda)`,
-# `LUAt(name,line,col)`); byte-identity becomes tautological.
+# for lateral analyses (`Use`, `LU`); byte-identity becomes tautological.
 #
 # THE 4TH-DEAD-END ANTIDOTE: the head is marked `RSRaw` ONLY when its
 # type is an unboxable integral scalar AND *every* consumer accepts a
@@ -50,11 +49,12 @@
 # compiler.unbox for the raw-op classifiers + ty_is_integral_raw.
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.util
 import compiler.infer
-import compiler.fnreg
 import compiler.unbox
-import compiler.sym_read
 
 # A raw-safe verdict for one cons-head site.
 pub type RawSafe
@@ -63,7 +63,7 @@ pub type RawSafe
   | RSBoxed     # forced boxed (type not unboxable, or a boxed consumer)
 
 # One row of the side table.
-#   fn_name : the enclosing top-level fn (scope of the analysis)
+#   fn      : the enclosing top-level fn (scope of the analysis)
 #   line/col: source position of the wrapped Expr (store) or the
 #             enclosing match arm (load); read from the Expr/pattern
 #   nth     : ordinal of this site in the deterministic walk of the fn,
@@ -72,9 +72,9 @@ pub type RawSafe
 #             bug-class). Inert (0) when there is no collision.
 #   site    : "load" (cons-head pattern bind) or "store" (list-cons head)
 #   verdict : the RawSafe verdict
-pub type RSMark = RSM(String, Int, Int, Int, String, RawSafe)
+pub type RSMark = RSM(FnId, Int, Int, Int, String, RawSafe)
 
-pub fn rsmark_fn(m: RSMark) : String = match m { RSM(f, _, _, _, _, _) -> f }
+pub fn rsmark_fn(m: RSMark) : FnId = match m { RSM(f, _, _, _, _, _) -> f }
 pub fn rsmark_verdict(m: RSMark) : RawSafe = match m { RSM(_, _, _, _, _, v) -> v }
 
 # ---- entry point ---------------------------------------------------
@@ -92,10 +92,10 @@ fn rs_decls_loop(decls: [Decl], acc: [RSMark]) : [RSMark] / Console {
 
 fn rs_decl(d: Decl) : [RSMark] / Console {
   match d {
-    DFn(_, name, _, _, _, _, body, _, _, _, _) ->
+    DFn(_, fid, _, _, _, _, body, _, _, _) ->
       # The walk is seeded with nth=0; rs_expr threads the counter so
       # every site gets a unique ordinal within the fn.
-      rs_st_marks(rs_walk(name, body, RSWalk([], 0)))
+      rs_st_marks(rs_walk(fid, body, RSWalk([], 0)))
     _ -> []
   }
 }
@@ -111,7 +111,7 @@ fn rs_st_nth(w: RSWalk) : Int = match w { RSWalk(_, n) -> n }
 
 # Append a mark built from the current site ordinal, then bump the
 # counter. The caller supplies everything but `nth`; we stamp it here.
-fn rs_emit(w: RSWalk, fnm: String, line: Int, col: Int, site: String, verdict: RawSafe) : RSWalk = match w {
+fn rs_emit(w: RSWalk, fnm: FnId, line: Int, col: Int, site: String, verdict: RawSafe) : RSWalk = match w {
   RSWalk(ms, n) -> RSWalk(list_append(ms, [RSM(fnm, line, col, n, site, verdict)]), n + 1)
 }
 
@@ -122,7 +122,7 @@ fn rs_emit(w: RSWalk, fnm: String, line: Int, col: Int, site: String, verdict: R
 #   - EList with an integral element type           -> analyse STORE
 # It recurses into every sub-Expr so nested constructions are covered.
 
-fn rs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
+fn rs_walk(fnm: FnId, e: Expr, w: RSWalk) : RSWalk / Console {
   match e.kind {
     EMatch(scr, arms) -> {
       let w1 = rs_walk(fnm, scr, w)
@@ -147,7 +147,7 @@ fn rs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
       match eo { None -> w1  Some(e2) -> rs_walk(fnm, e2, w1) }
     }
     ELambda(_, body) -> rs_walk(fnm, body, w)
-    ERecordLit(_, _, fis) -> rs_walk_field_inits(fnm, fis, w)
+    ERecordLit(_, fis) -> rs_walk_field_inits(fnm, fis, w)
     EBlock(stmts, tail) -> {
       let w1 = rs_walk_stmts(fnm, stmts, w)
       match tail { None -> w1  Some(e2) -> rs_walk(fnm, e2, w1) }
@@ -166,14 +166,14 @@ fn rs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
   }
 }
 
-fn rs_walk_exprs(fnm: String, es: [Expr], w: RSWalk) : RSWalk / Console {
+fn rs_walk_exprs(fnm: FnId, es: [Expr], w: RSWalk) : RSWalk / Console {
   match es {
     [] -> w
     [h, ...rest] -> rs_walk_exprs(fnm, rest, rs_walk(fnm, h, w))
   }
 }
 
-fn rs_walk_list_elems(fnm: String, es: [ListElem], w: RSWalk) : RSWalk / Console {
+fn rs_walk_list_elems(fnm: FnId, es: [ListElem], w: RSWalk) : RSWalk / Console {
   match es {
     [] -> w
     [h, ...rest] -> {
@@ -183,7 +183,7 @@ fn rs_walk_list_elems(fnm: String, es: [ListElem], w: RSWalk) : RSWalk / Console
   }
 }
 
-fn rs_walk_field_inits(fnm: String, fis: [FieldInit], w: RSWalk) : RSWalk / Console {
+fn rs_walk_field_inits(fnm: FnId, fis: [FieldInit], w: RSWalk) : RSWalk / Console {
   match fis {
     [] -> w
     [h, ...rest] -> match h {
@@ -192,14 +192,14 @@ fn rs_walk_field_inits(fnm: String, fis: [FieldInit], w: RSWalk) : RSWalk / Cons
   }
 }
 
-fn rs_walk_stmts(fnm: String, stmts: [Stmt], w: RSWalk) : RSWalk / Console {
+fn rs_walk_stmts(fnm: FnId, stmts: [Stmt], w: RSWalk) : RSWalk / Console {
   match stmts {
     [] -> w
     [h, ...rest] -> rs_walk_stmts(fnm, rest, rs_walk_stmt(fnm, h, w))
   }
 }
 
-fn rs_walk_stmt(fnm: String, s: Stmt, w: RSWalk) : RSWalk / Console {
+fn rs_walk_stmt(fnm: FnId, s: Stmt, w: RSWalk) : RSWalk / Console {
   match s {
     SLet(_, _, e) -> rs_walk(fnm, e, w)
     SVar(_, _, e, _, _) -> rs_walk(fnm, e, w)
@@ -214,14 +214,14 @@ fn rs_walk_stmt(fnm: String, s: Stmt, w: RSWalk) : RSWalk / Console {
 
 # ---- match arms: LOAD sites ----------------------------------------
 
-fn rs_walk_arms(fnm: String, arms: [Arm], w: RSWalk) : RSWalk / Console {
+fn rs_walk_arms(fnm: FnId, arms: [Arm], w: RSWalk) : RSWalk / Console {
   match arms {
     [] -> w
     [a, ...rest] -> rs_walk_arms(fnm, rest, rs_walk_arm(fnm, a, w))
   }
 }
 
-fn rs_walk_arm(fnm: String, a: Arm, w: RSWalk) : RSWalk / Console {
+fn rs_walk_arm(fnm: FnId, a: Arm, w: RSWalk) : RSWalk / Console {
   match a {
     Arm(pat, _guard, body) -> {
       # If this arm's pattern binds a cons head, classify it as a LOAD
@@ -236,7 +236,7 @@ fn rs_walk_arm(fnm: String, a: Arm, w: RSWalk) : RSWalk / Console {
 # Find a cons-head bind in the pattern (the first fixed sub-pattern of a
 # `PList` that is a `PBind`), and if found, mark it raw-safe iff its
 # type is integral AND every use in the arm body is raw-capable.
-fn rs_load_site(fnm: String, pat: Pattern, body: Expr, w: RSWalk) : RSWalk / Console {
+fn rs_load_site(fnm: FnId, pat: Pattern, body: Expr, w: RSWalk) : RSWalk / Console {
   match pat.pkind {
     PList(subs, _rest) -> match subs {
       [first, ..._] -> match first.pkind {
@@ -263,7 +263,7 @@ fn rs_load_site(fnm: String, pat: Pattern, body: Expr, w: RSWalk) : RSWalk / Con
 # (first `ElPlain`) is a STORE site: raw-safe iff the head expr's type
 # is unboxable and the expr is raw-computable (built only from raw
 # arithmetic / literals / raw-capable vars, no boxed boundary).
-fn rs_store_site(fnm: String, e: Expr, elems: [ListElem], w: RSWalk) : RSWalk / Console {
+fn rs_store_site(fnm: FnId, e: Expr, elems: [ListElem], w: RSWalk) : RSWalk / Console {
   if not rs_list_elem_ty_integral(e.ty) { w }
   else {
     match rs_first_plain(elems) {
@@ -308,37 +308,37 @@ fn rs_expr_raw_computable(e: Expr) : Bool {
     EInt(_, _)  -> true
     EBool(_) -> true
     EChar(_) -> true
-    EVar(_)  -> true
-    ESym(_, _, _)  -> true
+    ELocal(_)  -> true
+    ESym(_, _) -> true
     EBinop(op, a, b) ->
       (op_is_raw_arith(op) or op_is_raw_cmp(op)) and
       rs_expr_raw_computable(a) and rs_expr_raw_computable(b)
-    EUnop(op, x) -> (op == "-" or op == "not") and rs_expr_raw_computable(x)
+    EUnop(_, x) -> rs_expr_raw_computable(x)
     _ -> false
   }
 }
 
-# Does EVERY use of `name` inside `body` occur in a raw-capable
+# Does EVERY use of the binder `hb` inside `body` occur in a raw-capable
 # consumer position? A use is raw-capable when it is a direct operand
 # of a raw arithmetic/comparison binop (or raw unop), or the head of an
 # integral list literal. Any other context (call arg, field, index,
 # interpolation, lambda capture, record field, spread) is NOT
 # raw-capable. We compute this by walking the body and checking each
-# `EVar(name)` against its enclosing consumer; if any use is not
+# read of `hb` against its enclosing consumer; if any use is not
 # raw-capable, the whole binding is RSBoxed.
-fn rs_all_uses_raw(name: String, body: Expr) : Bool / Console =
+fn rs_all_uses_raw(hb: Binder, body: Expr) : Bool / Console =
   # `cap` = "the enclosing consumer accepts a raw scalar". At the fn-body
   # root the binding is not yet inside any consumer, so a bare reference
   # there (e.g. the arm body IS just `h`) is treated as boxed (the arm
   # returns it, a boxed boundary) — only references nested inside a raw
   # consumer count as raw.
-  rs_uses_raw_in(name, body, false)
+  rs_uses_raw_in(hb, body, false)
 
-# Returns true iff every occurrence of `name` in `e` sits in a
+# Returns true iff every occurrence of `hb` in `e` sits in a
 # raw-capable consumer. `cap` says whether `e`'s own slot is raw-capable.
-fn rs_uses_raw_in(name: String, e: Expr, cap: Bool) : Bool / Console {
+fn rs_uses_raw_in(hb: Binder, e: Expr, cap: Bool) : Bool / Console {
   match e.kind {
-    EVar(n) -> if n == name { cap } else { true }
+    ELocal(l) -> if local_eq(l, hb.id) { cap } else { true }
     EInt(_, _)  -> true
     EReal(_, _) -> true
     EIntLit(_) -> true
@@ -346,136 +346,114 @@ fn rs_uses_raw_in(name: String, e: Expr, cap: Bool) : Bool / Console {
     EFixed(_, _) -> true
     EBool(_) -> true
     EChar(_) -> true
-    EStr(span, is_triple) ->
-      # An interpolation `#{name}` is a boxed consumer. If the binding
-      # is read inside any interp slot, it is not raw-capable.
-      not interp_reads_name(name, span, is_triple)
+    EStr(_, _) -> true
     EUnit -> true
     EBinop(op, a, b) -> {
       let raw = op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op)
-      rs_uses_raw_in(name, a, raw) and rs_uses_raw_in(name, b, raw)
+      rs_uses_raw_in(hb, a, raw) and rs_uses_raw_in(hb, b, raw)
     }
-    EUnop(op, x) -> {
-      let raw = (op == "-" or op == "not")
-      rs_uses_raw_in(name, x, raw)
-    }
+    EUnop(_, x) -> rs_uses_raw_in(hb, x, true)
     # A raw list literal head is a raw consumer; the rest (spread tail,
     # non-head plains) are boxed slots. Conservatively: only the first
     # plain element of an integral list is a raw consumer.
-    EList(elems) -> rs_uses_raw_in_list(name, elems, rs_list_elem_ty_integral(e.ty))
+    EList(elems) -> rs_uses_raw_in_list(hb, elems, rs_list_elem_ty_integral(e.ty))
     # Every other shape is a boxed consumer slot for its children: the
     # binding may appear inside, but it would be boxed there.
-    ECall(f, xs) -> rs_uses_raw_in(name, f, false) and rs_uses_raw_in_exprs(name, xs, false)
-    EField(x, _) -> rs_uses_raw_in(name, x, false)
-    EIndex(a, b) -> rs_uses_raw_in(name, a, false) and rs_uses_raw_in(name, b, false)
+    ECall(f, xs) -> rs_uses_raw_in(hb, f, false) and rs_uses_raw_in_exprs(hb, xs, false)
+    EField(x, _) -> rs_uses_raw_in(hb, x, false)
+    EIndex(a, b) -> rs_uses_raw_in(hb, a, false) and rs_uses_raw_in(hb, b, false)
     EIf(c, t, eo) -> {
-      let p = rs_uses_raw_in(name, c, false) and rs_uses_raw_in(name, t, cap)
-      match eo { None -> p  Some(e2) -> p and rs_uses_raw_in(name, e2, cap) }
+      let p = rs_uses_raw_in(hb, c, false) and rs_uses_raw_in(hb, t, cap)
+      match eo { None -> p  Some(e2) -> p and rs_uses_raw_in(hb, e2, cap) }
     }
     EMatch(scr, arms) ->
-      rs_uses_raw_in(name, scr, false) and rs_uses_raw_in_arms(name, arms, cap)
+      rs_uses_raw_in(hb, scr, false) and rs_uses_raw_in_arms(hb, arms, cap)
     ELambda(_, b) ->
       # Capture into a lambda forces a box.
-      rs_uses_raw_in(name, b, false)
-    ERecordLit(_, _, fis) -> rs_uses_raw_in_fields(name, fis, false)
+      rs_uses_raw_in(hb, b, false)
+    ERecordLit(_, fis) -> rs_uses_raw_in_fields(hb, fis, false)
     EBlock(stmts, tail) -> {
-      let p = rs_uses_raw_in_stmts(name, stmts)
-      match tail { None -> p  Some(e2) -> p and rs_uses_raw_in(name, e2, cap) }
+      let p = rs_uses_raw_in_stmts(hb, stmts)
+      match tail { None -> p  Some(e2) -> p and rs_uses_raw_in(hb, e2, cap) }
     }
     ERange(lo, hi, by) -> {
-      let p = rs_uses_raw_in(name, lo, false) and rs_uses_raw_in(name, hi, false)
-      match by { None -> p  Some(e2) -> p and rs_uses_raw_in(name, e2, false) }
+      let p = rs_uses_raw_in(hb, lo, false) and rs_uses_raw_in(hb, hi, false)
+      match by { None -> p  Some(e2) -> p and rs_uses_raw_in(hb, e2, false) }
     }
-    EPipe(l, r)        -> rs_uses_raw_in(name, l, false) and rs_uses_raw_in(name, r, false)
-    EMapPipe(l, r)     -> rs_uses_raw_in(name, l, false) and rs_uses_raw_in(name, r, false)
-    EFlatMapPipe(l, r) -> rs_uses_raw_in(name, l, false) and rs_uses_raw_in(name, r, false)
-    EFilterPipe(l, r)  -> rs_uses_raw_in(name, l, false) and rs_uses_raw_in(name, r, false)
-    EIntrinsic(_, xs)  -> rs_uses_raw_in_exprs(name, xs, false)
-    ESurface(sf)  -> rs_uses_raw_in_exprs(name, surface_children(sf), false)
+    EPipe(l, r)        -> rs_uses_raw_in(hb, l, false) and rs_uses_raw_in(hb, r, false)
+    EMapPipe(l, r)     -> rs_uses_raw_in(hb, l, false) and rs_uses_raw_in(hb, r, false)
+    EFlatMapPipe(l, r) -> rs_uses_raw_in(hb, l, false) and rs_uses_raw_in(hb, r, false)
+    EFilterPipe(l, r)  -> rs_uses_raw_in(hb, l, false) and rs_uses_raw_in(hb, r, false)
+    EIntrinsic(_, xs)  -> rs_uses_raw_in_exprs(hb, xs, false)
+    ESurface(sf)  -> rs_uses_raw_in_exprs(hb, surface_children(sf), false)
     _ -> true
   }
 }
 
-fn rs_uses_raw_in_exprs(name: String, es: [Expr], cap: Bool) : Bool / Console {
+fn rs_uses_raw_in_exprs(hb: Binder, es: [Expr], cap: Bool) : Bool / Console {
   match es {
     [] -> true
-    [h, ...rest] -> rs_uses_raw_in(name, h, cap) and rs_uses_raw_in_exprs(name, rest, cap)
+    [h, ...rest] -> rs_uses_raw_in(hb, h, cap) and rs_uses_raw_in_exprs(hb, rest, cap)
   }
 }
 
-fn rs_uses_raw_in_list(name: String, es: [ListElem], integral: Bool) : Bool / Console {
+fn rs_uses_raw_in_list(hb: Binder, es: [ListElem], integral: Bool) : Bool / Console {
   # First plain element is a raw consumer iff the list is integral; all
   # others (and any spread) are boxed slots.
-  rs_uses_raw_in_list_at(name, es, integral, true)
+  rs_uses_raw_in_list_at(hb, es, integral, true)
 }
 
-fn rs_uses_raw_in_list_at(name: String, es: [ListElem], integral: Bool, is_first: Bool) : Bool / Console {
+fn rs_uses_raw_in_list_at(hb: Binder, es: [ListElem], integral: Bool, is_first: Bool) : Bool / Console {
   match es {
     [] -> true
     [h, ...rest] -> match h {
       ElPlain(e) -> {
         let cap = integral and is_first
-        rs_uses_raw_in(name, e, cap) and rs_uses_raw_in_list_at(name, rest, integral, false)
+        rs_uses_raw_in(hb, e, cap) and rs_uses_raw_in_list_at(hb, rest, integral, false)
       }
-      ElSpread(e) -> rs_uses_raw_in(name, e, false) and rs_uses_raw_in_list_at(name, rest, integral, is_first)
+      ElSpread(e) -> rs_uses_raw_in(hb, e, false) and rs_uses_raw_in_list_at(hb, rest, integral, is_first)
     }
   }
 }
 
-fn rs_uses_raw_in_arms(name: String, arms: [Arm], cap: Bool) : Bool / Console {
+fn rs_uses_raw_in_arms(hb: Binder, arms: [Arm], cap: Bool) : Bool / Console {
   match arms {
     [] -> true
     [a, ...rest] -> match a {
       Arm(_, guard, body) -> {
-        let g = match guard { None -> true  Some(gx) -> rs_uses_raw_in(name, gx, false) }
-        g and rs_uses_raw_in(name, body, cap) and rs_uses_raw_in_arms(name, rest, cap)
+        let g = match guard { None -> true  Some(gx) -> rs_uses_raw_in(hb, gx, false) }
+        g and rs_uses_raw_in(hb, body, cap) and rs_uses_raw_in_arms(hb, rest, cap)
       }
     }
   }
 }
 
-fn rs_uses_raw_in_fields(name: String, fis: [FieldInit], cap: Bool) : Bool / Console {
+fn rs_uses_raw_in_fields(hb: Binder, fis: [FieldInit], cap: Bool) : Bool / Console {
   match fis {
     [] -> true
     [h, ...rest] -> match h {
-      FI(_, e) -> rs_uses_raw_in(name, e, cap) and rs_uses_raw_in_fields(name, rest, cap)
+      FI(_, e) -> rs_uses_raw_in(hb, e, cap) and rs_uses_raw_in_fields(hb, rest, cap)
     }
   }
 }
 
-fn rs_uses_raw_in_stmts(name: String, stmts: [Stmt]) : Bool / Console {
+fn rs_uses_raw_in_stmts(hb: Binder, stmts: [Stmt]) : Bool / Console {
   match stmts {
     [] -> true
-    [h, ...rest] -> rs_uses_raw_in_stmt(name, h) and rs_uses_raw_in_stmts(name, rest)
+    [h, ...rest] -> rs_uses_raw_in_stmt(hb, h) and rs_uses_raw_in_stmts(hb, rest)
   }
 }
 
-fn rs_uses_raw_in_stmt(name: String, s: Stmt) : Bool / Console {
+fn rs_uses_raw_in_stmt(hb: Binder, s: Stmt) : Bool / Console {
   match s {
-    SLet(_, _, e) -> rs_uses_raw_in(name, e, false)
-    SVar(_, _, e, _, _) -> rs_uses_raw_in(name, e, false)
+    SLet(_, _, e) -> rs_uses_raw_in(hb, e, false)
+    SVar(_, _, e, _, _) -> rs_uses_raw_in(hb, e, false)
     SAssert(e, mo) -> {
-      let p = rs_uses_raw_in(name, e, false)
-      match mo { None -> p  Some(e2) -> p and rs_uses_raw_in(name, e2, false) }
+      let p = rs_uses_raw_in(hb, e, false)
+      match mo { None -> p  Some(e2) -> p and rs_uses_raw_in(hb, e2, false) }
     }
-    SExprStmt(e) -> rs_uses_raw_in(name, e, false)
+    SExprStmt(e) -> rs_uses_raw_in(hb, e, false)
     _ -> true
-  }
-}
-
-# Does `name` appear as an EVar read inside any `#{...}` slot of the
-# interpolated string span? Reuses the fnreg interp scanner.
-fn interp_reads_name(name: String, span: String, is_triple: Bool) : Bool / Console = {
-  let uses = scan_uses_in_interp(span, is_triple, false)
-  rs_uses_mentions(name, uses)
-}
-
-fn rs_uses_mentions(name: String, uses: [Use]) : Bool {
-  match uses {
-    [] -> false
-    [u, ...rest] -> match u {
-      U(n, _, _, _) -> if n == name { true } else { rs_uses_mentions(name, rest) }
-    }
   }
 }
 
@@ -511,8 +489,8 @@ fn rs_uses_mentions(name: String, uses: [Use]) : Bool {
 # before a goto; borrow there is gated off (see emit_match_arm).
 
 # If `pat` binds a cons head as a plain `PBind` and that head is
-# borrow-safe in `body`, return its name. Otherwise None.
-pub fn bs_head_borrow_safe(pat: Pattern, body: Expr) : Option[String] / Console {
+# borrow-safe in `body`, return its binder. Otherwise None.
+pub fn bs_head_borrow_safe(pat: Pattern, body: Expr) : Option[Binder] / Console {
   match pat.pkind {
     PList(subs, _rest) -> match subs {
       [first, ..._] -> match first.pkind {
@@ -527,14 +505,14 @@ pub fn bs_head_borrow_safe(pat: Pattern, body: Expr) : Option[String] / Console 
   }
 }
 
-# Returns true iff every occurrence of `name` in `e` is a scalar READ,
+# Returns true iff every occurrence of `hb` in `e` is a scalar READ,
 # never the object pointer propagated. `cap` = "the enclosing slot reads
 # the scalar value" (raw binop/unop operand). Differs from
 # rs_uses_raw_in only in EList: here a list slot NEVER reads the scalar
-# of `name` — it stores the object — so cap=false for every element.
-fn bs_uses_borrow(name: String, e: Expr, cap: Bool) : Bool / Console {
+# of `hb` — it stores the object — so cap=false for every element.
+fn bs_uses_borrow(hb: Binder, e: Expr, cap: Bool) : Bool / Console {
   match e.kind {
-    EVar(n) -> if n == name { cap } else { true }
+    ELocal(l) -> if local_eq(l, hb.id) { cap } else { true }
     EInt(_, _)  -> true
     EReal(_, _) -> true
     EIntLit(_) -> true
@@ -542,104 +520,99 @@ fn bs_uses_borrow(name: String, e: Expr, cap: Bool) : Bool / Console {
     EFixed(_, _) -> true
     EBool(_) -> true
     EChar(_) -> true
-    EStr(span, is_triple) ->
-      # `#{name}` formats the object → propagates the pointer.
-      not interp_reads_name(name, span, is_triple)
+    EStr(_, _) -> true
     EUnit -> true
     EBinop(op, a, b) -> {
       let raw = op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op)
-      bs_uses_borrow(name, a, raw) and bs_uses_borrow(name, b, raw)
+      bs_uses_borrow(hb, a, raw) and bs_uses_borrow(hb, b, raw)
     }
-    EUnop(op, x) -> {
-      let raw = (op == "-" or op == "not")
-      bs_uses_borrow(name, x, raw)
-    }
+    EUnop(_, x) -> bs_uses_borrow(hb, x, true)
     # A list literal STORES the object in every slot — never a scalar
     # read. cap=false for all elements: `[h, ...]` propagates `h`.
-    EList(elems) -> bs_uses_borrow_list(name, elems)
-    ECall(f, xs) -> bs_uses_borrow(name, f, false) and bs_uses_borrow_exprs(name, xs, false)
-    EField(x, _) -> bs_uses_borrow(name, x, false)
-    EIndex(a, b) -> bs_uses_borrow(name, a, false) and bs_uses_borrow(name, b, false)
+    EList(elems) -> bs_uses_borrow_list(hb, elems)
+    ECall(f, xs) -> bs_uses_borrow(hb, f, false) and bs_uses_borrow_exprs(hb, xs, false)
+    EField(x, _) -> bs_uses_borrow(hb, x, false)
+    EIndex(a, b) -> bs_uses_borrow(hb, a, false) and bs_uses_borrow(hb, b, false)
     EIf(c, t, eo) -> {
-      let p = bs_uses_borrow(name, c, false) and bs_uses_borrow(name, t, cap)
-      match eo { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, cap) }
+      let p = bs_uses_borrow(hb, c, false) and bs_uses_borrow(hb, t, cap)
+      match eo { None -> p  Some(e2) -> p and bs_uses_borrow(hb, e2, cap) }
     }
     EMatch(scr, arms) ->
-      bs_uses_borrow(name, scr, false) and bs_uses_borrow_arms(name, arms, cap)
-    ELambda(_, b) -> bs_uses_borrow(name, b, false)
-    ERecordLit(_, _, fis) -> bs_uses_borrow_fields(name, fis, false)
+      bs_uses_borrow(hb, scr, false) and bs_uses_borrow_arms(hb, arms, cap)
+    ELambda(_, b) -> bs_uses_borrow(hb, b, false)
+    ERecordLit(_, fis) -> bs_uses_borrow_fields(hb, fis, false)
     EBlock(stmts, tail) -> {
-      let p = bs_uses_borrow_stmts(name, stmts)
-      match tail { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, cap) }
+      let p = bs_uses_borrow_stmts(hb, stmts)
+      match tail { None -> p  Some(e2) -> p and bs_uses_borrow(hb, e2, cap) }
     }
     ERange(lo, hi, by) -> {
-      let p = bs_uses_borrow(name, lo, false) and bs_uses_borrow(name, hi, false)
-      match by { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, false) }
+      let p = bs_uses_borrow(hb, lo, false) and bs_uses_borrow(hb, hi, false)
+      match by { None -> p  Some(e2) -> p and bs_uses_borrow(hb, e2, false) }
     }
-    EPipe(l, r)        -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
-    EMapPipe(l, r)     -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
-    EFlatMapPipe(l, r) -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
-    EFilterPipe(l, r)  -> bs_uses_borrow(name, l, false) and bs_uses_borrow(name, r, false)
-    EIntrinsic(_, xs)  -> bs_uses_borrow_exprs(name, xs, false)
-    ESurface(sf)  -> bs_uses_borrow_exprs(name, surface_children(sf), false)
+    EPipe(l, r)        -> bs_uses_borrow(hb, l, false) and bs_uses_borrow(hb, r, false)
+    EMapPipe(l, r)     -> bs_uses_borrow(hb, l, false) and bs_uses_borrow(hb, r, false)
+    EFlatMapPipe(l, r) -> bs_uses_borrow(hb, l, false) and bs_uses_borrow(hb, r, false)
+    EFilterPipe(l, r)  -> bs_uses_borrow(hb, l, false) and bs_uses_borrow(hb, r, false)
+    EIntrinsic(_, xs)  -> bs_uses_borrow_exprs(hb, xs, false)
+    ESurface(sf)  -> bs_uses_borrow_exprs(hb, surface_children(sf), false)
     _ -> true
   }
 }
 
-fn bs_uses_borrow_exprs(name: String, es: [Expr], cap: Bool) : Bool / Console {
+fn bs_uses_borrow_exprs(hb: Binder, es: [Expr], cap: Bool) : Bool / Console {
   match es {
     [] -> true
-    [h, ...rest] -> bs_uses_borrow(name, h, cap) and bs_uses_borrow_exprs(name, rest, cap)
+    [h, ...rest] -> bs_uses_borrow(hb, h, cap) and bs_uses_borrow_exprs(hb, rest, cap)
   }
 }
 
-fn bs_uses_borrow_list(name: String, es: [ListElem]) : Bool / Console {
+fn bs_uses_borrow_list(hb: Binder, es: [ListElem]) : Bool / Console {
   match es {
     [] -> true
     [h, ...rest] -> {
       let inner = match h { ElPlain(e) -> e  ElSpread(e) -> e }
-      bs_uses_borrow(name, inner, false) and bs_uses_borrow_list(name, rest)
+      bs_uses_borrow(hb, inner, false) and bs_uses_borrow_list(hb, rest)
     }
   }
 }
 
-fn bs_uses_borrow_arms(name: String, arms: [Arm], cap: Bool) : Bool / Console {
+fn bs_uses_borrow_arms(hb: Binder, arms: [Arm], cap: Bool) : Bool / Console {
   match arms {
     [] -> true
     [a, ...rest] -> match a {
       Arm(_, guard, body) -> {
-        let g = match guard { None -> true  Some(gx) -> bs_uses_borrow(name, gx, false) }
-        g and bs_uses_borrow(name, body, cap) and bs_uses_borrow_arms(name, rest, cap)
+        let g = match guard { None -> true  Some(gx) -> bs_uses_borrow(hb, gx, false) }
+        g and bs_uses_borrow(hb, body, cap) and bs_uses_borrow_arms(hb, rest, cap)
       }
     }
   }
 }
 
-fn bs_uses_borrow_fields(name: String, fis: [FieldInit], cap: Bool) : Bool / Console {
+fn bs_uses_borrow_fields(hb: Binder, fis: [FieldInit], cap: Bool) : Bool / Console {
   match fis {
     [] -> true
     [h, ...rest] -> match h {
-      FI(_, e) -> bs_uses_borrow(name, e, cap) and bs_uses_borrow_fields(name, rest, cap)
+      FI(_, e) -> bs_uses_borrow(hb, e, cap) and bs_uses_borrow_fields(hb, rest, cap)
     }
   }
 }
 
-fn bs_uses_borrow_stmts(name: String, stmts: [Stmt]) : Bool / Console {
+fn bs_uses_borrow_stmts(hb: Binder, stmts: [Stmt]) : Bool / Console {
   match stmts {
     [] -> true
-    [h, ...rest] -> bs_uses_borrow_stmt(name, h) and bs_uses_borrow_stmts(name, rest)
+    [h, ...rest] -> bs_uses_borrow_stmt(hb, h) and bs_uses_borrow_stmts(hb, rest)
   }
 }
 
-fn bs_uses_borrow_stmt(name: String, s: Stmt) : Bool / Console {
+fn bs_uses_borrow_stmt(hb: Binder, s: Stmt) : Bool / Console {
   match s {
-    SLet(_, _, e) -> bs_uses_borrow(name, e, false)
-    SVar(_, _, e, _, _) -> bs_uses_borrow(name, e, false)
+    SLet(_, _, e) -> bs_uses_borrow(hb, e, false)
+    SVar(_, _, e, _, _) -> bs_uses_borrow(hb, e, false)
     SAssert(e, mo) -> {
-      let p = bs_uses_borrow(name, e, false)
-      match mo { None -> p  Some(e2) -> p and bs_uses_borrow(name, e2, false) }
+      let p = bs_uses_borrow(hb, e, false)
+      match mo { None -> p  Some(e2) -> p and bs_uses_borrow(hb, e2, false) }
     }
-    SExprStmt(e) -> bs_uses_borrow(name, e, false)
+    SExprStmt(e) -> bs_uses_borrow(hb, e, false)
     _ -> true
   }
 }
@@ -662,7 +635,7 @@ fn bs_decls_loop(decls: [Decl], acc: [RSMark]) : [RSMark] / Console {
 
 fn bs_decl(d: Decl) : [RSMark] / Console {
   match d {
-    DFn(_, name, _, _, _, _, body, _, _, _, _) -> bs_st_marks(bs_walk(name, body, RSWalk([], 0)))
+    DFn(_, fid, _, _, _, _, body, _, _, _) -> bs_st_marks(bs_walk(fid, body, RSWalk([], 0)))
     _ -> []
   }
 }
@@ -672,7 +645,7 @@ fn bs_st_marks(w: RSWalk) : [RSMark] = match w { RSWalk(ms, _) -> ms }
 # Walk Exprs looking for EMatch arms whose pattern binds a cons head;
 # emit the borrow verdict for each. Recurses into every sub-Expr so
 # nested matches are covered. Shares RSWalk for the nth counter.
-fn bs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
+fn bs_walk(fnm: FnId, e: Expr, w: RSWalk) : RSWalk / Console {
   match e.kind {
     EMatch(scr, arms) -> bs_walk_arms(fnm, arms, bs_walk(fnm, scr, w))
     EList(elems)       -> bs_walk_list_elems(fnm, elems, w)
@@ -686,7 +659,7 @@ fn bs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
       match eo { None -> w1  Some(e2) -> bs_walk(fnm, e2, w1) }
     }
     ELambda(_, body)   -> bs_walk(fnm, body, w)
-    ERecordLit(_, _, fis) -> bs_walk_fields(fnm, fis, w)
+    ERecordLit(_, fis) -> bs_walk_fields(fnm, fis, w)
     EBlock(stmts, tail) -> {
       let w1 = bs_walk_stmts(fnm, stmts, w)
       match tail { None -> w1  Some(e2) -> bs_walk(fnm, e2, w1) }
@@ -705,14 +678,14 @@ fn bs_walk(fnm: String, e: Expr, w: RSWalk) : RSWalk / Console {
   }
 }
 
-fn rs_walk_exprs_via(fnm: String, es: [Expr], w: RSWalk) : RSWalk / Console {
+fn rs_walk_exprs_via(fnm: FnId, es: [Expr], w: RSWalk) : RSWalk / Console {
   match es {
     [] -> w
     [h, ...rest] -> rs_walk_exprs_via(fnm, rest, bs_walk(fnm, h, w))
   }
 }
 
-fn bs_walk_list_elems(fnm: String, es: [ListElem], w: RSWalk) : RSWalk / Console {
+fn bs_walk_list_elems(fnm: FnId, es: [ListElem], w: RSWalk) : RSWalk / Console {
   match es {
     [] -> w
     [h, ...rest] -> {
@@ -722,7 +695,7 @@ fn bs_walk_list_elems(fnm: String, es: [ListElem], w: RSWalk) : RSWalk / Console
   }
 }
 
-fn bs_walk_fields(fnm: String, fis: [FieldInit], w: RSWalk) : RSWalk / Console {
+fn bs_walk_fields(fnm: FnId, fis: [FieldInit], w: RSWalk) : RSWalk / Console {
   match fis {
     [] -> w
     [h, ...rest] -> match h {
@@ -731,14 +704,14 @@ fn bs_walk_fields(fnm: String, fis: [FieldInit], w: RSWalk) : RSWalk / Console {
   }
 }
 
-fn bs_walk_stmts(fnm: String, stmts: [Stmt], w: RSWalk) : RSWalk / Console {
+fn bs_walk_stmts(fnm: FnId, stmts: [Stmt], w: RSWalk) : RSWalk / Console {
   match stmts {
     [] -> w
     [h, ...rest] -> bs_walk_stmts(fnm, rest, bs_walk_stmt(fnm, h, w))
   }
 }
 
-fn bs_walk_stmt(fnm: String, s: Stmt, w: RSWalk) : RSWalk / Console {
+fn bs_walk_stmt(fnm: FnId, s: Stmt, w: RSWalk) : RSWalk / Console {
   match s {
     SLet(_, _, e) -> bs_walk(fnm, e, w)
     SVar(_, _, e, _, _) -> bs_walk(fnm, e, w)
@@ -751,14 +724,14 @@ fn bs_walk_stmt(fnm: String, s: Stmt, w: RSWalk) : RSWalk / Console {
   }
 }
 
-fn bs_walk_arms(fnm: String, arms: [Arm], w: RSWalk) : RSWalk / Console {
+fn bs_walk_arms(fnm: FnId, arms: [Arm], w: RSWalk) : RSWalk / Console {
   match arms {
     [] -> w
     [a, ...rest] -> bs_walk_arms(fnm, rest, bs_walk_arm(fnm, a, w))
   }
 }
 
-fn bs_walk_arm(fnm: String, a: Arm, w: RSWalk) : RSWalk / Console {
+fn bs_walk_arm(fnm: FnId, a: Arm, w: RSWalk) : RSWalk / Console {
   match a {
     Arm(pat, _guard, body) -> {
       let w1 = match bs_head_borrow_safe(pat, body) {
@@ -771,7 +744,7 @@ fn bs_walk_arm(fnm: String, a: Arm, w: RSWalk) : RSWalk / Console {
 }
 
 # Emit a borrow=raw mark at the head bind's position.
-fn bs_emit_at(w: RSWalk, fnm: String, pat: Pattern, hn: String) : RSWalk =
+fn bs_emit_at(w: RSWalk, fnm: FnId, pat: Pattern, hn: Binder) : RSWalk =
   match pat.pkind {
     PList(subs, _) -> match subs {
       [first, ..._] -> rs_emit(w, fnm, first.line, first.col, "borrow", RSRaw)
@@ -782,7 +755,7 @@ fn bs_emit_at(w: RSWalk, fnm: String, pat: Pattern, hn: String) : RSWalk =
 
 # Emit a borrow=boxed mark for a cons-head that exists but is not
 # borrow-safe (so the dump shows the negative cases too).
-fn bs_emit_boxed(w: RSWalk, fnm: String, pat: Pattern) : RSWalk =
+fn bs_emit_boxed(w: RSWalk, fnm: FnId, pat: Pattern) : RSWalk =
   match pat.pkind {
     PList(subs, _) -> match subs {
       [first, ..._] -> match first.pkind {
@@ -795,10 +768,11 @@ fn bs_emit_boxed(w: RSWalk, fnm: String, pat: Pattern) : RSWalk =
   }
 
 # `--dump-borrowsafe`: print one borrow mark per cons-head bind.
-pub fn dump_borrowsafe(file: String, decls: [Decl]) : Int / Console + File = {
-  let r = infer_program(file, decls, false)
-  let marks = borrowsafe_analyze(sym_locals_read_decls(r.decls))
-  rs_dump_loop(marks)
+pub fn dump_borrowsafe(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable = {
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
+  let marks = borrowsafe_analyze(r.decls)
+  rs_dump_loop(tab, marks)
   r.errs
 }
 
@@ -808,26 +782,27 @@ pub fn dump_borrowsafe(file: String, decls: [Decl]) : Int / Console + File = {
 # print one line per mark in deterministic walk order, so a fixture's
 # `.out.expected` pins the analysis exactly. Mirrors `dump_typed`'s
 # re-inference shape (infer.kai) so the dump path is self-contained.
-pub fn dump_rawsafe(file: String, decls: [Decl]) : Int / Console + File = {
-  let r = infer_program(file, decls, false)
-  let marks = rawsafe_analyze(sym_locals_read_decls(r.decls))
-  rs_dump_loop(marks)
+pub fn dump_rawsafe(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable = {
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
+  let marks = rawsafe_analyze(r.decls)
+  rs_dump_loop(tab, marks)
   r.errs
 }
 
-fn rs_dump_loop(marks: [RSMark]) : Unit / Console {
+fn rs_dump_loop(tab: SymTab, marks: [RSMark]) : Unit / Console {
   match marks {
     [] -> ()
     [m, ...rest] -> {
-      print(rs_mark_line(m))
-      rs_dump_loop(rest)
+      print(rs_mark_line(tab, m))
+      rs_dump_loop(tab, rest)
     }
   }
 }
 
-fn rs_mark_line(m: RSMark) : String = match m {
+fn rs_mark_line(tab: SymTab, m: RSMark) : String = match m {
   RSM(fnm, line, col, nth, site, verdict) ->
-    concat_all([fnm, " ", site, " @", int_to_string(line), ":", int_to_string(col),
+    concat_all([written_text(decl_name(tab, fnid_sym(fnm))), " ", site, " @", int_to_string(line), ":", int_to_string(col),
                 "#", int_to_string(nth), " -> ", rs_verdict_str(verdict)])
 }
 

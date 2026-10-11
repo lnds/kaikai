@@ -10,60 +10,65 @@ the donor's.
 
 import compiler.ast
 import compiler.emit_shared
+import compiler.ctor_ix
 
 #[doc("A boxed child of an inner cell, by slot: a binder, a slot no binder names, or a deeper cell.")]
-pub type CellKid = KidBind(Int, String) | KidDrop(Int) | KidCell(Int, ReuseCell)
+pub type CellKid = KidBind(Int, LocalId) | KidDrop(Int) | KidCell(Int, ReuseCell)
 
 #[doc("An inner cell: its arity and its boxed children in slot order.")]
 pub type ReuseCell = ReuseCell(Int, [CellKid])
 
 #[doc("True when sub-pattern `sp` over a slot of kind `k` deconstructs an inner cell.")]
 pub fn reuse_is_cell(sp: Pattern, k: Int) : Bool = k == 0 and match sp.pkind {
-  PVariant(_, _, isubs) -> isubs != []
-  _                     -> false
+  PVariant(_, isubs) -> isubs != []
+  _                  -> false
 }
 
-#[doc("The slot kinds of the ctor a sub-pattern names, [] when it is not registered.")]
-pub fn reuse_ctor_kinds(hm: Option[String], vname: String, isubs: [Pattern], vs: [VariantEntry]) : [Int] =
-  match evar_slot_kinds_arity(vs, hm, vname, list_length(isubs)) { Some(ks) -> ks None -> [] }
+# A layout of another arity is worse than none: the kinds are walked in
+# lockstep with the sub-patterns.
+#[doc("The slot kinds of the constructor a sub-pattern names, [] when it is not registered.")]
+pub fn reuse_ctor_kinds(ctors: CtorIx, r: DeclRef, isubs: [Pattern]) : [Int] = match ctor_ix_row(ctors, ref_sym(r)) {
+  Some(EV(_, _, _, ks, _, _)) -> if list_length(ks) == list_length(isubs) { ks } else { [] }
+  None                     -> []
+}
 
 #[doc("The inner cells the slots `subs` (of kinds `ks`) deconstruct, each with its slot index.")]
-pub fn reuse_slot_cells(subs: [Pattern], ks: [Int], vs: [VariantEntry]) : [(Int, ReuseCell)] =
-  rc_slots(subs, ks, 0, vs)
+pub fn reuse_slot_cells(subs: [Pattern], ks: [Int], ctors: CtorIx) : [(Int, ReuseCell)] =
+  rc_slots(subs, ks, 0, ctors)
 
 #[doc("The inner cells a reuse arm's pattern deconstructs below its donor.")]
-pub fn reuse_pattern_cells(p: Pattern, vs: [VariantEntry]) : [(Int, ReuseCell)] = match p.pkind {
-  PVariant(hm, cname, subs) -> rc_slots(subs, reuse_ctor_kinds(hm, cname, subs, vs), 0, vs)
-  _                         -> []
+pub fn reuse_pattern_cells(p: Pattern, ctors: CtorIx) : [(Int, ReuseCell)] = match p.pkind {
+  PVariant(r, subs) -> rc_slots(subs, reuse_ctor_kinds(ctors, r, subs), 0, ctors)
+  _                 -> []
 }
 
-fn rc_slots(subs: [Pattern], ks: [Int], i: Int, vs: [VariantEntry]) : [(Int, ReuseCell)] = match subs {
+fn rc_slots(subs: [Pattern], ks: [Int], i: Int, ctors: CtorIx) : [(Int, ReuseCell)] = match subs {
   []            -> []
   [sp, ...rest] -> {
-    let tl = rc_slots(rest, ks, i + 1, vs)
-    match rc_cell(sp, kind_at(ks, i), vs) { Some(c) -> [(i, c), ...tl] None -> tl }
+    let tl = rc_slots(rest, ks, i + 1, ctors)
+    match rc_cell(sp, kind_at(ks, i), ctors) { Some(c) -> [(i, c), ...tl] None -> tl }
   }
 }
 
-fn rc_cell(sp: Pattern, k: Int, vs: [VariantEntry]) : Option[ReuseCell] =
+fn rc_cell(sp: Pattern, k: Int, ctors: CtorIx) : Option[ReuseCell] =
   if not reuse_is_cell(sp, k) { None }
   else { match sp.pkind {
-    PVariant(hm, vname, isubs) ->
-      Some(ReuseCell(list_length(isubs), rc_kids(isubs, reuse_ctor_kinds(hm, vname, isubs, vs), 0, vs)))
+    PVariant(r, isubs) ->
+      Some(ReuseCell(list_length(isubs), rc_kids(isubs, reuse_ctor_kinds(ctors, r, isubs), 0, ctors)))
     _ -> None
   } }
 
 # Only boxed slots carry a reference to settle.
-fn rc_kids(isubs: [Pattern], ks: [Int], j: Int, vs: [VariantEntry]) : [CellKid] = match isubs {
+fn rc_kids(isubs: [Pattern], ks: [Int], j: Int, ctors: CtorIx) : [CellKid] = match isubs {
   []            -> []
   [sp, ...rest] -> {
     let k = kind_at(ks, j)
-    let tl = rc_kids(rest, ks, j + 1, vs)
+    let tl = rc_kids(rest, ks, j + 1, ctors)
     if k != 0 { tl }
-    else { match rc_cell(sp, k, vs) {
+    else { match rc_cell(sp, k, ctors) {
       Some(c) -> [KidCell(j, c), ...tl]
       None    -> match sp.pkind {
-        PBind(nm) -> [KidBind(j, nm), ...tl]
+        PBind(b)  -> [KidBind(j, b.id), ...tl]
         _         -> [KidDrop(j), ...tl]
       }
     } }

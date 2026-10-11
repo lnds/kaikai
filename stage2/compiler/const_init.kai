@@ -1,0 +1,77 @@
+#[doc("""
+A constant's initialiser that is a body of its own.
+
+A constant has no storage: every read evaluates its initialiser and owns
+the value it builds. An initialiser that binds nothing is pasted at the
+read. One that declares a local or holds a lambda cannot be: its binders
+are numbered within the constant, not within the reader, and their
+ownership is a function body's. So it becomes one — a function of no
+parameters beside the constant — and the initialiser left to paste is
+the call.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.decl_names
+import compiler.local_names
+import compiler.expr_positions
+import compiler.fnreg
+
+#[doc("The declarations with every such initialiser moved into a function, and the table rows of the functions minted.")]
+pub type ConstInits = { decls: [Decl], rows: [NEnt] }
+
+#[doc("Move each constant initialiser that declares a local or holds a lambda into a function homed beside the constant; `target` homes the root file's.")]
+pub fn const_init_fns(decls: [Decl], tab: SymTab, target: String) : ConstInits =
+  ci_loop(decls, tab, target, [], [])
+
+fn ci_loop(ds: [Decl], tab: SymTab, target: String, out: [Decl], rows: [NEnt]) : ConstInits = match ds {
+  [] -> ConstInits { decls: list_reverse(out), rows: list_reverse(rows) }
+  [d, ...rest] -> match d {
+    DConst(is_pub, s, ty, body, mo, l, c) ->
+      if ci_is_body(body) {
+        let row = NEnt(NCFn, ci_name(written_text(decl_name(tab, s))), ci_home(mo, target), is_pub, NmHelper)
+        let init = fnid_decl(nent_sym(row))
+        let fun = DFn(is_pub, init, [], [], Some(ty), REmpty, body, l, c, mo)
+        ci_loop(rest, tab, target, [fun, DConst(is_pub, s, ty, ci_call(init, body), mo, l, c), ...out], [row, ...rows])
+      } else { ci_loop(rest, tab, target, [d, ...out], rows) }
+    _ -> ci_loop(rest, tab, target, [d, ...out], rows)
+  }
+}
+
+# The function is spelled after its constant, so its symbol moves only
+# when the constant is renamed. No source identifier spells the prefix,
+# and a module declares a constant's name once.
+fn ci_name(const_name: String) : String = string_concat("__kai_const_", const_name)
+
+fn ci_home(mo: Option[String], target: String) : String = match mo {
+  Some(m) -> m
+  None    -> target
+}
+
+fn ci_is_body(e: Expr) : Bool = match ln_with_expr(ln_empty(), e) {
+  LnLeaf -> ci_has_lambda(e)
+  _      -> true
+}
+
+fn ci_has_lambda(e: Expr) : Bool = match e.kind {
+  ELambda(_, _) -> true
+  _             -> ci_any_lambda(xp_positions(e))
+}
+
+fn ci_any_lambda(ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> ci_has_lambda(c) or ci_any_lambda(rest)
+}
+
+# The call stands where the body stood: same position, type and mode.
+fn ci_call(init: FnId, body: Expr) : Expr = {
+  let fty = match body.ty {
+    Some(t) -> Some(TyFnT([], t, row_empty()))
+    None    -> None
+  }
+  let callee = Expr { kind: ESym(fnid_sym(init), spec_none()), line: body.line, col: body.col,
+                      ty: fty, mode: body.mode, site: body.site }
+  Expr { kind: ECall(callee, []), line: body.line, col: body.col, ty: body.ty, mode: body.mode, site: body.site }
+}

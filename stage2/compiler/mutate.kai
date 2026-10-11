@@ -15,6 +15,9 @@
 # expression, delegating to the shared expression walker.
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.type_text
 import compiler.mutate_ops
 import compiler.infer
@@ -49,40 +52,49 @@ pub fn ms_scope(s: MutSite) : String = match s { MS(_, _, _, _, _, d) -> d }
 
 # --- decl walk --------------------------------------------------------
 
-#[doc("Collect every mutation site in a parsed program, in source order.")]
-pub fn mutate_sites(decls: [Decl]) : [MutSite] = mut_decls_in(decls, "")
+#[doc("Collect every mutation site in a parsed program, in source order. `tab` names the declarations a site's scope spells.")]
+pub fn mutate_sites(decls: [Decl], tab: SymTab) : [MutSite] = mut_decls_in(decls, tab, "")
 
-fn mut_decls_in(decls: [Decl], q: String) : [MutSite] =
-  reduce(map(decls, (d) => mut_decl_sites(d, q)), [], cat_sites)
+fn mut_decls_in(decls: [Decl], tab: SymTab, q: String) : [MutSite] =
+  reduce(map(decls, (d) => mut_decl_sites(d, tab, q)), [], cat_sites)
 
 fn cat_sites(a: [MutSite], b: [MutSite]) : [MutSite] = list_append(a, b)
 
 # Only decls that own an expression can host a mutation. `test` and
 # `check` bodies are deliberately excluded: mutating the oracle is not
 # a measurement of the oracle.
-fn mut_decl_sites(d: Decl, q: String) : [MutSite] = match d {
-  DFn(_, name, _, ps, _, _, body, _, _, _, _) ->
-    mut_scoped(mut_expr(body), concat_all([q, name, "/", int_to_string(list_length(ps))]))
-  DConst(_, name, _, body, _, _, _, _) -> mut_scoped(mut_expr(body), string_concat(q, name))
-  DImpl(p, pargs, ty, ds, _, _, _, _) -> mut_decls_in(ds, mut_impl_scope(p, pargs, ty))
-  DDerive(_, inner, _, _) -> mut_decl_sites(inner, q)
-  DUnstable(inner, _, _) -> mut_decl_sites(inner, q)
-  DProtoLaws(_, inner, _, _, _) -> mut_decl_sites(inner, q)
-  DImplAxiom(_, inner, _, _, _) -> mut_decl_sites(inner, q)
-  DConstructor(inner, _, _) -> mut_decl_sites(inner, q)
-  DDoc(_, _, inner, _, _) -> mut_decl_sites(inner, q)
-  DAttr(_, inner, _, _) -> mut_decl_sites(inner, q)
+fn mut_decl_sites(d: Decl, tab: SymTab, q: String) : [MutSite] = match d {
+  DFn(_, f, _, ps, _, _, body, _, _, _) ->
+    mut_scoped(mut_expr(body), concat_all([q, mut_sym_text(tab, fnid_sym(f)), "/", int_to_string(list_length(ps))]))
+  DConst(_, s, _, body, _, _, _) -> mut_scoped(mut_expr(body), string_concat(q, mut_sym_text(tab, s)))
+  DImpl(p, pargs, ty, ds, _, _, _, _) -> mut_decls_in(ds, tab, mut_impl_scope(tab, p, pargs, ty))
+  DDerive(_, inner, _, _) -> mut_decl_sites(inner, tab, q)
+  DUnstable(inner, _, _) -> mut_decl_sites(inner, tab, q)
+  DProtoLaws(_, inner, _, _, _) -> mut_decl_sites(inner, tab, q)
+  DImplAxiom(_, inner, _, _, _) -> mut_decl_sites(inner, tab, q)
+  DConstructor(inner, _, _) -> mut_decl_sites(inner, tab, q)
+  DDoc(_, _, inner, _, _) -> mut_decl_sites(inner, tab, q)
+  DAttr(_, inner, _, _) -> mut_decl_sites(inner, tab, q)
   _ -> []
+}
+
+fn mut_sym_text(tab: SymTab, s: SymId) : String = written_text(decl_name(tab, s))
+
+# The protocol an impl head names, as the source spells it.
+fn mut_ref_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(None, n)    -> written_text(n)
+  DrWritten(Some(m), n) -> concat_all([written_text(m), ".", written_text(n)])
+  DrSym(s)              -> mut_sym_text(tab, s)
 }
 
 # An impl method is qualified by its impl head, parenthesised so the
 # dots a type may carry never read as a path separator.
-fn mut_impl_scope(p: String, pargs: [TypeExpr], ty: TypeExpr) : String =
-  concat_all(["(", mut_proto_head(p, pargs), " for ", type_text(ty), ")."])
+fn mut_impl_scope(tab: SymTab, p: DeclRef, pargs: [TypeExpr], ty: TypeExpr) : String =
+  concat_all(["(", mut_proto_head(tab, p, pargs), " for ", type_text(tab, ty), ")."])
 
-fn mut_proto_head(p: String, pargs: [TypeExpr]) : String =
-  if list_length(pargs) == 0 { p }
-  else { concat_all([p, "[", join_with(map(pargs, type_text), ", "), "]"]) }
+fn mut_proto_head(tab: SymTab, p: DeclRef, pargs: [TypeExpr]) : String =
+  if list_length(pargs) == 0 { mut_ref_text(tab, p) }
+  else { concat_all([mut_ref_text(tab, p), "[", join_with(map(pargs, (t) => type_text(tab, t)), ", "), "]"]) }
 
 fn mut_scoped(sites: [MutSite], scope: String) : [MutSite] =
   map(sites, (s) => mut_with_scope(s, scope))
@@ -116,7 +128,7 @@ fn mut_here(e: Expr) : [MutSite] = match e.kind {
 
 # A binop contributes a boundary shift or a connective swap, never
 # both: the two rules are disjoint on the operator token.
-fn mut_binop_site(op: String, line: Int, col: Int) : [MutSite] =
+fn mut_binop_site(op: BinOp, line: Int, col: Int) : [MutSite] =
   match mut_compare_swap(op) {
     Some(to) -> [MS(MOpCompare, line, col, "", to, "")]
     None -> match mut_connect_swap(op) {
@@ -136,7 +148,7 @@ fn mut_binop_site(op: String, line: Int, col: Int) : [MutSite] =
 # is the identity, an equivalent mutant that would only inflate the
 # survivor count.
 fn mut_cond_site(c: Expr, then_e: Expr) : [MutSite] = match c.kind {
-  EUnop(op, _) -> if op == "not" { [] } else { [mut_negate_at(c, then_e)] }
+  EUnop(UoNot, _) -> []
   _ -> [mut_negate_at(c, then_e)]
 }
 
@@ -232,9 +244,11 @@ fn mut_children(e: Expr) : [MutSite] = match e.kind {
   EChar(_) -> []
   EStr(_, _) -> []
   EUnit -> []
-  EVar(_) -> []
+  EName(_) -> []
   EMark(_) -> []
-  ESym(_, _, _) -> []
+  ESym(_, _) -> []
+  ELocal(_) -> []
+  EOp(_) -> []
   EUnder -> []
   EPlaceholder -> []
   EHole(_) -> []
@@ -251,7 +265,7 @@ fn mut_children(e: Expr) : [MutSite] = match e.kind {
   EIf(c, t, eo) -> list_append(mut_expr(c), list_append(mut_expr(t), mut_opt(eo)))
   EMatch(scr, arms) -> list_append(mut_expr(scr), flatten_sites(map(arms, mut_arm_exprs)))
   ELambda(_, b) -> mut_expr(b)
-  ERecordLit(_, _, fs) -> flatten_sites(map(fs, mut_field))
+  ERecordLit(_, fs) -> flatten_sites(map(fs, mut_field))
   EList(els) -> flatten_sites(map(els, mut_elem))
   ERange(a, b, st) -> list_append(mut_expr(a), list_append(mut_expr(b), mut_opt(st)))
   EBlock(stmts, tail) -> list_append(flatten_sites(map(stmts, mut_stmt)), mut_opt(tail))
@@ -259,7 +273,7 @@ fn mut_children(e: Expr) : [MutSite] = match e.kind {
   EMapPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
   EFlatMapPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
   EFilterPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
-  EHandle(body, _, _, _, init, _, clauses, ret) ->
+  EHandle(body, _, _, init, _, clauses, ret) ->
     list_append(mut_expr(body),
                 list_append(mut_opt(init),
                             list_append(flatten_sites(map(clauses, mut_clause)),
@@ -282,7 +296,7 @@ fn mut_arm_exprs(a: Arm) : [MutSite] = match a {
 }
 
 fn mut_field(fi: FieldInit) : [MutSite] = match fi {
-  FI(_, x) -> mut_expr(x)
+  FI(_, x) -> mut_expr(field_written(x))
 }
 
 fn mut_elem(el: ListElem) : [MutSite] = match el {

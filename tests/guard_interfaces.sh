@@ -2,8 +2,8 @@
 # tests/guard_interfaces.sh — the `kai test` guard memo keys on interfaces.
 #
 # 1. Every part of a module another module checks against moves its
-#    `kaic2 --guard-interfaces` digest; an edit to a plain function's body
-#    or to a comment does not.
+#    `kaic2 --guard-interfaces` digest, the body of a `main` with no row
+#    among them; an edit to a plain function's body or to a comment does not.
 # 2. A body error in a module only a test imports fails `kai test` and is
 #    reported once; once fixed, the run passes again (a failure is never
 #    replayed from the memo).
@@ -57,6 +57,7 @@ mutate moves generic-body       's/\[h, ..._\] -> Some(h)/[h, ..._] -> Some(h) |
 mutate moves generic-position   's/^pub const LIMIT/\
 pub const LIMIT/'
 mutate moves contract           's/requires b != 0/requires b > 0/'
+mutate moves unrowed-main-body  's/^fn main() : Int = 0/fn main() : Int = 1/'
 mutate stays plain-body         's/x: p.x + 1/x: p.x + 2/'
 mutate stays plain-body-line    's/^  Blue -> "blue"/  Blue ->\
     "blue"/'
@@ -78,5 +79,5 @@ fi
 cp "$FX/gpkg/gpkg/geo.kai" "$WORK/gpkg/gpkg/geo.kai"
 run || { echo "guard-interfaces FAIL (the fixed package still fails)"; cat "$WORK/out"; fail=1; }
 
-[ "$fail" = 0 ] && echo "guard-interfaces OK (17 interface edits move the digest, 4 body or comment edits do not; an imported body error fails once and clears)"
+[ "$fail" = 0 ] && echo "guard-interfaces OK (18 interface edits move the digest, 4 body or comment edits do not; an imported body error fails once and clears)"
 exit "$fail"

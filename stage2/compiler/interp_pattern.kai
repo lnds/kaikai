@@ -1,0 +1,96 @@
+#[doc("""
+Interpolated strings in pattern position.
+
+`"…#{e}…"` has one meaning, the string it builds. As a pattern it
+matches that string: the literal becomes a fresh binder and the arm
+gains an equality guard on it. The guard is an ordinary expression, so
+the interpolation is lifted with every other one and reads the binders
+of its own pattern like any guard does.
+""")]
+
+import compiler.util
+import compiler.ast
+
+# One rewritten pattern and the equality tests it handed to the guard.
+type IPat = IPat(Pattern, [Expr])
+
+type IPats = IPats([Pattern], [Expr])
+
+type IFields = IFields([PField], [Expr])
+
+#[doc("The arm with every interpolated string pattern turned into a binder its guard compares.")]
+pub fn ipat_arm(a: Arm) : Arm = match a {
+  Arm(pat, guard, body) -> match ipat_split(pat) {
+    IPat(pat2, tests) -> Arm(pat2, ipat_weld(tests, guard), body)
+  }
+}
+
+#[doc("`ipat_arm` over the patterns of a multi-scrutinee arm.")]
+pub fn ipat_mmarm(a: MMArm) : MMArm = match a {
+  MMArm(pats, guard, body) -> match ipat_pats(pats) {
+    IPats(pats2, tests) -> MMArm(pats2, ipat_weld(tests, guard), body)
+  }
+}
+
+#[doc("A `let` pattern with its interpolated strings as binders nothing reads: a `let` tests no literal.")]
+pub fn ipat_let(p: Pattern) : Pattern = match ipat_split(p) {
+  IPat(p2, _) -> p2
+}
+
+# The user's guard runs last: a binder it reads already passed its test.
+fn ipat_weld(tests: [Expr], user: Option[Expr]) : Option[Expr] = match tests {
+  [] -> user
+  [t, ...rest] -> match ipat_weld(rest, user) {
+    None    -> Some(t)
+    Some(r) -> Some(mk_expr(EBinop(BoAnd, t, r), t.line, t.col))
+  }
+}
+
+fn ipat_is_interp(lit: Expr) : Bool = match lit.kind {
+  EStr(span, _) -> has_interp(span, 0, string_length(span))
+  _             -> false
+}
+
+# The binder is compiler-internal and unique per pattern position.
+fn ipat_split(p: Pattern) : IPat = match p.pkind {
+  PLit(lit) ->
+    if ipat_is_interp(lit) {
+      let name = concat_all(["__sp_", int_to_string(p.line), "_", int_to_string(p.col)])
+      IPat(mk_pat(PBind(binder_written(name)), p.line, p.col),
+           [mk_expr(EBinop(BoEq, mk_name(name, p.line, p.col), lit), p.line, p.col)])
+    } else { IPat(p, []) }
+  PList(subs, rest) -> match ipat_pats(subs) {
+    IPats(subs2, ts) -> IPat(mk_pat(PList(subs2, rest), p.line, p.col), ts)
+  }
+  PVariant(r, subs) -> match ipat_pats(subs) {
+    IPats(subs2, ts) -> IPat(mk_pat(PVariant(r, subs2), p.line, p.col), ts)
+  }
+  PVariantRecord(r, fs) -> match ipat_fields(fs) {
+    IFields(fs2, ts) -> IPat(mk_pat(PVariantRecord(r, fs2), p.line, p.col), ts)
+  }
+  PRecord(fs) -> match ipat_fields(fs) {
+    IFields(fs2, ts) -> IPat(mk_pat(PRecord(fs2), p.line, p.col), ts)
+  }
+  PAs(b, inner) -> match ipat_split(inner) {
+    IPat(inner2, ts) -> IPat(mk_pat(PAs(b, inner2), p.line, p.col), ts)
+  }
+  _ -> IPat(p, [])
+}
+
+fn ipat_pats(ps: [Pattern]) : IPats = match ps {
+  [] -> IPats([], [])
+  [p, ...rest] -> match ipat_split(p) {
+    IPat(p2, ts) -> match ipat_pats(rest) {
+      IPats(rest2, ts2) -> IPats([p2, ...rest2], list_append(ts, ts2))
+    }
+  }
+}
+
+fn ipat_fields(fs: [PField]) : IFields = match fs {
+  [] -> IFields([], [])
+  [PField(name, sub, short), ...rest] -> match ipat_split(sub) {
+    IPat(sub2, ts) -> match ipat_fields(rest) {
+      IFields(rest2, ts2) -> IFields([PField(name, sub2, short), ...rest2], list_append(ts, ts2))
+    }
+  }
+}

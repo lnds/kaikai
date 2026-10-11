@@ -8,6 +8,9 @@ import compiler.diag
 import compiler.ast
 import compiler.infer
 import compiler.infer_type_collisions
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 
 
 # Reject two declarations sharing a
@@ -35,8 +38,23 @@ import compiler.infer_type_collisions
 # forcing either into this mould would drag their special logic into the
 # generic path.
 
-# A name claimed by a decl at a source position. `NS(name, line, col)`.
-type NameSite = NS(String, Int, Int)
+# What a declaration claims in its module: its id, which a second
+# declaration of its class and name in that module derives too; an
+# axiom carries no id and claims its name.
+type NameKey = NkSym(SymId) | NkName(String)
+
+# A claim at a source position.
+type NameSite = NS(NameKey, Int, Int)
+
+fn name_key_same(a: NameKey, b: NameKey) : Bool = match a {
+  NkSym(x)  -> match b { NkSym(y) -> sym_raw(x) >= 0 and sym_raw(x) == sym_raw(y)  NkName(_) -> false }
+  NkName(x) -> match b { NkName(y) -> x == y  NkSym(_) -> false }
+}
+
+fn name_key_text(tab: SymTab, k: NameKey) : String = match k {
+  NkSym(s)  -> written_text(decl_name(tab, s))
+  NkName(n) -> n
+}
 
 # The three words of diagnostic text that vary per entity kind:
 #   word   — noun in the error line ("function" / "effect" / ...)
@@ -45,11 +63,11 @@ type NameSite = NS(String, Int, Int)
 type EntitySpec = ES(String, String, String)
 
 # Parametric same-module duplicate-name walker. `extract` returns
-# `Some(NS(name, line, col))` for the decls this entity owns and `None`
+# `Some(NS(key, line, col))` for the decls this entity owns and `None`
 # for every other decl kind; `spec` supplies the varying diagnostic
 # words. Linear scan accumulating seen claims (prepend; order does not
 # affect the count) and an error tally.
-fn validate_name_collisions_walk(remaining: [Decl], file: String,
+fn validate_name_collisions_walk(remaining: [Decl], tab: SymTab, file: String,
     extract: (Decl) -> Option[NameSite],
     spec: EntitySpec,
     seen: [NameSite],
@@ -59,26 +77,26 @@ fn validate_name_collisions_walk(remaining: [Decl], file: String,
     [] -> list_reverse(errs)
     [d, ...rest] -> match extract(d) {
       Some(site) -> match site {
-        NS(name, line, col) -> match find_name_site(seen, name) {
+        NS(key, line, col) -> match find_name_site(seen, key) {
           Some(prev) -> {
-            let d = report_dup_name_decl(file, name, line, col, prev, spec)
-            validate_name_collisions_walk(rest, file, extract, spec, seen, [d, ...errs])
+            let d = report_dup_name_decl(file, name_key_text(tab, key), line, col, prev, spec)
+            validate_name_collisions_walk(rest, tab, file, extract, spec, seen, [d, ...errs])
           }
           None ->
-            validate_name_collisions_walk(rest, file, extract, spec,
-          [NS(name, line, col), ...seen], errs)
+            validate_name_collisions_walk(rest, tab, file, extract, spec,
+          [NS(key, line, col), ...seen], errs)
         }
       }
-      None -> validate_name_collisions_walk(rest, file, extract, spec, seen, errs)
+      None -> validate_name_collisions_walk(rest, tab, file, extract, spec, seen, errs)
     }
   }
 }
 
-fn find_name_site(seen: [NameSite], name: String) : Option[NameSite] {
+fn find_name_site(seen: [NameSite], key: NameKey) : Option[NameSite] {
   match seen {
     [] -> None
     [c, ...rest] -> match c {
-      NS(n, _, _) -> if n == name { Some(c) } else { find_name_site(rest, name) }
+      NS(k, _, _) -> if name_key_same(k, key) { Some(c) } else { find_name_site(rest, key) }
     }
   }
 }
@@ -103,15 +121,15 @@ fn report_dup_name_decl(file: String, name: String, line: Int, col: Int,
 }
 
 fn extract_fn_site(d: Decl) : Option[NameSite] = match d {
-  DFn(_, name, _, _, _, _, _, line, col, _, _) -> Some(NS(name, line, col))
+  DFn(_, fid, _, _, _, _, _, line, col, _) -> Some(NS(NkSym(fnid_sym(fid)), line, col))
   _ -> None
 }
 
 #[doc("infer: `validate_fn_name_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_fn_name_collisions_decls(root_decls: [Decl],
+pub fn validate_fn_name_collisions_decls(root_decls: [Decl], tab: SymTab,
     file: String) : [Diagnostic] / Console + File {
 
-  validate_name_collisions_walk(root_decls, file, extract_fn_site,
+  validate_name_collisions_walk(root_decls, tab, file, extract_fn_site,
       ES("function", "fn", "(...)"), [], [])
 }
 
@@ -121,15 +139,15 @@ pub fn validate_fn_name_collisions_decls(root_decls: [Decl],
 # DFn / DType walkers above; shares `validate_name_collisions_walk`.
 
 fn extract_effect_site(d: Decl) : Option[NameSite] = match d {
-  DEffect(_, name, _, _, _, line, col, _, _) -> Some(NS(name, line, col))
+  DEffect(_, s, _, _, _, line, col, _) -> Some(NS(NkSym(s), line, col))
   _ -> None
 }
 
 #[doc("infer: `validate_effect_name_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_effect_name_collisions_decls(root_decls: [Decl],
+pub fn validate_effect_name_collisions_decls(root_decls: [Decl], tab: SymTab,
     file: String) : [Diagnostic] / Console + File {
 
-  validate_name_collisions_walk(root_decls, file, extract_effect_site,
+  validate_name_collisions_walk(root_decls, tab, file, extract_effect_site,
       ES("effect", "effect", " { ... }"), [], [])
 }
 
@@ -138,15 +156,15 @@ pub fn validate_effect_name_collisions_decls(root_decls: [Decl],
 # prepend pattern; shares `validate_name_collisions_walk`.
 
 fn extract_const_site(d: Decl) : Option[NameSite] = match d {
-  DConst(_, name, _, _, _, line, col, _) -> Some(NS(name, line, col))
+  DConst(_, s, _, _, _, line, col) -> Some(NS(NkSym(s), line, col))
   _ -> None
 }
 
 #[doc("infer: `validate_const_name_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_const_name_collisions_decls(root_decls: [Decl],
+pub fn validate_const_name_collisions_decls(root_decls: [Decl], tab: SymTab,
     file: String) : [Diagnostic] / Console + File {
 
-  validate_name_collisions_walk(root_decls, file, extract_const_site,
+  validate_name_collisions_walk(root_decls, tab, file, extract_const_site,
       ES("const", "const", " = ..."), [], [])
 }
 
@@ -158,15 +176,15 @@ pub fn validate_const_name_collisions_decls(root_decls: [Decl],
 # decls so DAxiom still appears.
 
 fn extract_axiom_site(d: Decl) : Option[NameSite] = match d {
-  DAxiom(_, _, name, _, _, _, _, _, line, col) -> Some(NS(name, line, col))
+  DAxiom(_, _, name, _, _, _, _, _, line, col) -> Some(NS(NkName(name), line, col))
   _ -> None
 }
 
 #[doc("infer: `validate_axiom_name_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_axiom_name_collisions_decls(root_decls: [Decl],
+pub fn validate_axiom_name_collisions_decls(root_decls: [Decl], tab: SymTab,
     file: String) : [Diagnostic] / Console + File {
 
-  validate_name_collisions_walk(root_decls, file, extract_axiom_site,
+  validate_name_collisions_walk(root_decls, tab, file, extract_axiom_site,
       ES("axiom", "axiom", "(...)"), [], [])
 }
 
@@ -193,12 +211,12 @@ pub fn validate_axiom_name_collisions_decls(root_decls: [Decl],
 #     decision; see `validate_one_type_decl` comments). This walker
 #     only catches same-file same-name pairs.
 #[doc("infer: `validate_module_same_module_collisions` — typer entry point invoked by the driver.")]
-pub fn validate_module_same_module_collisions(decls: [Decl], file: String)
+pub fn validate_module_same_module_collisions(decls: [Decl], tab: SymTab, file: String)
     : Int / Console + File {
-  let e_fn     = validate_fn_name_collisions_decls(decls, file)
-  let e_type   = validate_type_name_collisions_decls(decls, file)
-  let e_effect = validate_effect_name_collisions_decls(decls, file)
-  let e_const  = validate_const_name_collisions_decls(decls, file)
-  let e_axiom  = validate_axiom_name_collisions_decls(decls, file)
+  let e_fn     = validate_fn_name_collisions_decls(decls, tab, file)
+  let e_type   = validate_type_name_collisions_decls(decls, tab, file)
+  let e_effect = validate_effect_name_collisions_decls(decls, tab, file)
+  let e_const  = validate_const_name_collisions_decls(decls, tab, file)
+  let e_axiom  = validate_axiom_name_collisions_decls(decls, tab, file)
   list_length(e_fn) + list_length(e_type) + list_length(e_effect) + list_length(e_const) + list_length(e_axiom)
 }

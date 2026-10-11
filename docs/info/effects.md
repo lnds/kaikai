@@ -164,6 +164,10 @@ fn main() : Unit / MyConsole = {
 }
 ```
 
+`main` here is the entry point, the root module's: an imported
+module's `main` gets no default installed and takes each effect from
+its caller, like any function.
+
 `$extern_handler("c_symbol")` is the compiler intrinsic that bridges
 a default clause to a runtime C entry — the only form codegen
 currently accepts inside `default { }`. Kaikai-bodied default

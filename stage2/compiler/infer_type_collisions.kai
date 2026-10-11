@@ -13,60 +13,67 @@ import compiler.module_table
 import compiler.emit_shared
 import compiler.cont_type
 import compiler.home_dup
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.type_text
 
-type TypeNameClaim = TNC(String, Int, Int)
+# A type declaration at a source position: a second declaration of its
+# name in its module derives the same id.
+type TypeNameClaim = TNC(SymId, Int, Int)
 
 #[doc("infer: `validate_type_name_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_type_name_collisions_decls(root_decls: [Decl], file: String) : [Diagnostic] / Console + File {
+pub fn validate_type_name_collisions_decls(root_decls: [Decl], tab: SymTab, file: String) : [Diagnostic] / Console + File {
 
-  list_reverse(validate_type_name_collisions_loop(root_decls, file, [], []))
+  list_reverse(validate_type_name_collisions_loop(root_decls, tab, file, [], []))
 }
 
-fn validate_type_name_collisions_loop(remaining: [Decl], file: String,
+fn validate_type_name_collisions_loop(remaining: [Decl], tab: SymTab, file: String,
     claims: [TypeNameClaim],
     errs: [Diagnostic]) : [Diagnostic] / Console + File {
 
   match remaining {
     [] -> errs
     [d, ...rest] -> match d {
-      DType(_, name, _, _, line, col, _, _, _) ->
-        validate_one_type_decl(rest, file, claims, errs, name, line, col)
+      DType(_, s, _, _, line, col, _, _) ->
+        validate_one_type_decl(rest, tab, file, claims, errs, s, line, col)
       DDerive(_, inner, _, _) -> match inner {
-        DType(_, name, _, _, line, col, _, _, _) ->
-          validate_one_type_decl(rest, file, claims, errs, name, line, col)
-        _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
+        DType(_, s, _, _, line, col, _, _) ->
+          validate_one_type_decl(rest, tab, file, claims, errs, s, line, col)
+        _ -> validate_type_name_collisions_loop(rest, tab, file, claims, errs)
       }
       DUnstable(inner, _, _) -> match inner {
-        DType(_, name, _, _, line, col, _, _, _) ->
-          validate_one_type_decl(rest, file, claims, errs, name, line, col)
-        _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
+        DType(_, s, _, _, line, col, _, _) ->
+          validate_one_type_decl(rest, tab, file, claims, errs, s, line, col)
+        _ -> validate_type_name_collisions_loop(rest, tab, file, claims, errs)
       }
-      DProtoLaws(_, inner, _, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
-      DImplAxiom(_, inner, _, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
-      DConstructor(inner, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
-      _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
+      DProtoLaws(_, inner, _, _, _) -> validate_type_name_collisions_loop(rest, tab, file, claims, errs)
+      DImplAxiom(_, inner, _, _, _) -> validate_type_name_collisions_loop(rest, tab, file, claims, errs)
+      DConstructor(inner, _, _) -> validate_type_name_collisions_loop(rest, tab, file, claims, errs)
+      _ -> validate_type_name_collisions_loop(rest, tab, file, claims, errs)
     }
   }
 }
 
-fn validate_one_type_decl(rest: [Decl], file: String,
+fn validate_one_type_decl(rest: [Decl], tab: SymTab, file: String,
     claims: [TypeNameClaim], errs: [Diagnostic],
-    name: String, line: Int, col: Int) : [Diagnostic] / Console + File {
+    s: SymId, line: Int, col: Int) : [Diagnostic] / Console + File {
 
+  let name = written_text(decl_name(tab, s))
   if list_has(reserved_builtin_type_names(), name) {
     let help = concat_all(["rename the local type (e.g. '", name, "2'); '", name, "' is reserved by the language"])
     let d = mk_diag(SevError, file, line, col,
       concat_all(["type '", name, "' is a reserved builtin type name and cannot be redeclared"]),
       [ri_help(file, line, col, help)])
     render_diag(d)
-    validate_type_name_collisions_loop(rest, file,
-        [TNC(name, line, col), ...claims],
+    validate_type_name_collisions_loop(rest, tab, file,
+        [TNC(s, line, col), ...claims],
         [d, ...errs])
   } else {
-  match find_type_name_claim(claims, name) {
+  match find_type_name_claim(claims, s) {
     Some(prev) -> {
       let d = report_dup_type_decl(file, name, line, col, prev)
-      validate_type_name_collisions_loop(rest, file, claims, [d, ...errs])
+      validate_type_name_collisions_loop(rest, tab, file, claims, [d, ...errs])
     }
     # Hanga Roa: cross-module type-name "collision" with a core /
     # core / imported module is NOT an error — it is shadowing,
@@ -83,8 +90,8 @@ fn validate_one_type_decl(rest: [Decl], file: String,
     # separate bug. Local duplicates inside the same file (the case
     # `Some(prev)` above) remain an error — that ambiguity has no
     # disambiguator.
-    None -> validate_type_name_collisions_loop(rest, file,
-        [TNC(name, line, col), ...claims],
+    None -> validate_type_name_collisions_loop(rest, tab, file,
+        [TNC(s, line, col), ...claims],
         errs)
   }
   }
@@ -108,11 +115,11 @@ fn me_list_has_name(mes: [ModuleEntry], name: String) : Bool {
   }
 }
 
-fn find_type_name_claim(claims: [TypeNameClaim], name: String) : Option[TypeNameClaim] {
+fn find_type_name_claim(claims: [TypeNameClaim], s: SymId) : Option[TypeNameClaim] {
   match claims {
     [] -> None
     [c, ...rest] -> match c {
-      TNC(n, _, _) -> if n == name { Some(c) } else { find_type_name_claim(rest, name) }
+      TNC(t, _, _) -> if sym_raw(s) >= 0 and sym_raw(t) == sym_raw(s) { Some(c) } else { find_type_name_claim(rest, s) }
     }
   }
 }
@@ -136,36 +143,36 @@ fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
 }
 
 #[doc("infer: `validate_constructor_uniqueness_decls` — reject a second `#[constructor]` for the same type. The claim is keyed by the declaring module: two modules each with their own type and its own constructor are distinct claims, not a collision.")]
-pub fn validate_constructor_uniqueness_decls(decls: [Decl], df: DiagFiles) : Int / Console + File {
+pub fn validate_constructor_uniqueness_decls(decls: [Decl], tab: SymTab, df: DiagFiles) : Int / Console + File {
 
-  validate_constructor_uniqueness_loop(decls, df, [], 0)
+  validate_constructor_uniqueness_loop(decls, tab, df, [], 0)
 }
 
-fn validate_constructor_uniqueness_loop(remaining: [Decl], df: DiagFiles,
+fn validate_constructor_uniqueness_loop(remaining: [Decl], tab: SymTab, df: DiagFiles,
     claims: [HomedDecl],
     errs: Int) : Int / Console + File {
   match remaining {
     [] -> errs
-    [d, ...rest] -> match constructor_decl_type(d) {
+    [d, ...rest] -> match constructor_decl_type(d, tab) {
       Some(claim) -> match homed_find(claims, hd_home(claim), hd_name(claim)) {
         Some(prev) -> {
           report_dup_constructor(decl_diag_file(d, df), claim, prev)
-          validate_constructor_uniqueness_loop(rest, df, claims, errs + 1)
+          validate_constructor_uniqueness_loop(rest, tab, df, claims, errs + 1)
         }
-        None -> validate_constructor_uniqueness_loop(rest, df, [claim, ...claims], errs)
+        None -> validate_constructor_uniqueness_loop(rest, tab, df, [claim, ...claims], errs)
       }
-      None -> validate_constructor_uniqueness_loop(rest, df, claims, errs)
+      None -> validate_constructor_uniqueness_loop(rest, tab, df, claims, errs)
     }
   }
 }
 
 # The `(home, type)` claim of a `#[constructor]` wrapper whose inner fn
 # returns a named type; None for any other decl.
-fn constructor_decl_type(d: Decl) : Option[HomedDecl] = match d {
-  DConstructor(DFn(_, _, _, _, Some(ret_te), _, _, _, _, mo, _), l, c) ->
-    match constructor_type_name(ret_te) {
-      Some(tname) -> Some(HD(mo, tname, l, c))
-      None        -> None
+fn constructor_decl_type(d: Decl, tab: SymTab) : Option[HomedDecl] = match d {
+  DConstructor(DFn(_, _, _, _, Some(ret_te), _, _, _, _, mo), l, c) ->
+    match ret_te.tkind {
+      TyName(r, _) -> Some(HD(mo, ref_decl_name(tab, r), l, c))
+      _            -> None
     }
   _ -> None
 }
@@ -179,11 +186,11 @@ fn report_dup_constructor(file: String, claim: HomedDecl,
 }
 
 #[doc("Reject a program declaring more variant constructors than the constructor tag space holds, the count the emitters register.")]
-pub fn validate_variant_capacity(decls: [Decl], df: DiagFiles) : Int / Console + File {
-  let n = variant_ctor_excess(decls)
+pub fn validate_variant_capacity(decls: [Decl], tab: SymTab, df: DiagFiles) : Int / Console + File {
+  let n = variant_ctor_excess(decls, tab)
   if n == 0 { 0 } else {
     match largest_sum(decls, None) {
-      Some(d) -> report_variant_capacity(decl_diag_file(d, df), d, n)
+      Some(d) -> report_variant_capacity(decl_diag_file(d, df), tab, d, n)
       None    -> ()
     }
     1
@@ -197,7 +204,7 @@ fn largest_sum(ds: [Decl], best: Option[Decl]) : Option[Decl] = match ds {
 }
 
 fn sum_width(d: Decl) : Int = match d {
-  DType(_, _, _, TBSum(vs), _, _, _, _, _) -> list_length(vs)
+  DType(_, _, _, TBSum(vs), _, _, _, _) -> list_length(vs)
   _ -> 0
 }
 
@@ -206,11 +213,11 @@ fn opt_sum_width(d: Option[Decl]) : Int = match d {
   None    -> 0
 }
 
-fn report_variant_capacity(file: String, d: Decl, n: Int) : Unit / Console + File = match d {
-  DType(_, name, _, _, l, c, _, _, _) -> {
+fn report_variant_capacity(file: String, tab: SymTab, d: Decl, n: Int) : Unit / Console + File = match d {
+  DType(_, s, _, _, l, c, _, _) -> {
     diag_error(file, l, c, concat_all(["the program declares ", int_to_string(n),
       " variant constructors; at most ", int_to_string(variant_ctor_limit()), " fit the constructor tag space"]))
-    diag_help(concat_all(["`", name, "` is the widest sum type (", int_to_string(sum_width(d)), " constructors); split it, or carry its cases as data"]))
+    diag_help(concat_all(["`", written_text(decl_name(tab, s)), "` is the widest sum type (", int_to_string(sum_width(d)), " constructors); split it, or carry its cases as data"]))
   }
   _ -> ()
 }

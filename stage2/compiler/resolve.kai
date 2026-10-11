@@ -4,24 +4,23 @@
 # What this module owns
 #
 # - The resolver scope environment (the immutable `Env` record:
-#   a stack of `[[String]]` scopes plus an error flag, the source
-#   file name, and a `[Diagnostic]` accumulator for the structured
-#   T3 `cannot find <name>` diagnostics).
+#   the scope chain plus an error flag, the source file name, and a
+#   `[Diagnostic]` accumulator for the structured T3
+#   `cannot find <name>` diagnostics).
 # - Env algebra: env_new / env_push / env_pop / env_add / env_has /
-#   env_all_names / env_mark_err / env_push_diag, plus the scope
-#   primitives scopes_has / concat_scopes and the chk_error emit
-#   helper.
+#   env_all_names / env_mark_err / env_push_diag and the chk_error
+#   emit helper.
 # - Core seeding (`core_names`) — the canonical list of
 #   built-in value names pre-bound in every program's outermost
 #   scope, kept in sync with stage 0's PRELUDE.
 # - The pattern-binding walker (bind_pat + bind_pats_loop /
-#   bind_pfields_loop / bind_pfield) that adds a pattern's bound
-#   names into the current scope.
+#   bind_pfields_loop) that numbers a pattern's binders and adds
+#   them into the current scope.
 # - The expression / statement / declaration scope walkers
 #   (chk_expr / chk_stmt / chk_decl and their list/arm/clause
 #   helpers) that push and pop a scope per block, match arm, lambda,
 #   handler clause, and function body, reporting `cannot find` for
-#   any unbound EVar.
+#   any unbound name.
 # - Top-level pre-registration (register_decls / register_one /
 #   register_variants_env / register_import + last_segment) so
 #   forward references between top-level decls resolve.
@@ -42,7 +41,7 @@
 # `check_program`, the driver-seeding helpers `env_new` / `add_all`
 # / `core_names` / `register_decls` / `chk_decls`, the import
 # path helper `last_segment` (used by the module resolver), and
-# `collect_effect_names` (used by the effect-injection and typer
+# `collect_effect_ids` (used by the effect-injection and typer
 # paths). `Env` / `Diagnostic` flow through pub signatures so `Env`
 # is pub too. Everything else (the walkers, the arity table, the
 # tyvar helpers) is private to this file.
@@ -56,7 +55,6 @@ import compiler.native_prims
 import compiler.core_prims
 import compiler.modules
 import compiler.symtab
-import compiler.symtab_build
 import compiler.resolve_state
 import compiler.name_hidden
 import compiler.scope_file
@@ -67,6 +65,10 @@ import compiler.kai_builtin
 import compiler.decl_names
 import compiler.resolve_use
 import compiler.scope_view
+import compiler.written
+import compiler.decl_text
+import compiler.refine_types
+import compiler.refine_slots
 
 # ====================================================================
 # checker: name resolution
@@ -93,7 +95,6 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
               # that declares the op (`effect_alias_scope`).
               row_aliases: [RowAlias],
               eff_ops: [EffOps],
-              eff_spellings: [EffSpelling],
               # Structured diagnostic collection for T3
               # (`cannot find <name> in this scope`). Mirrors
               # `InferState.diags` semantics (reverse order, flipped at
@@ -106,13 +107,13 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
               larity: [LocalArity],
               params: [ParamIds] }
 
-#[doc("The local ids a function's parameters were bound to, in parameter order.")]
-pub type ParamIds = ParamIds(SymId, [SymId])
+#[doc("The local ids a function's parameters were numbered with, in parameter order.")]
+pub type ParamIds = ParamIds(SymId, [LocalId])
 
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
 pub fn env_new(file: String) : Env =
   Env { chain: ch_new(), had_error: false, file: file, alias_heads: [],
-        row_aliases: [], eff_ops: [], eff_spellings: [], diags: [], rs: rs_off(),
+        row_aliases: [], eff_ops: [], diags: [], rs: rs_off(),
         callees: ct_empty(), larity: [], params: [] }
 
 fn env_with_chain(e: Env, c: ScopeChain) : Env =
@@ -127,46 +128,61 @@ fn env_pop(e: Env) : Env = env_with_chain(e, ch_pop(e.chain))
 # use reaches depends on the home the walk is inside when the use is
 # read. Binding it to a symbol at registration time would freeze the
 # first home's answer for every reader.
-# The chain binds `name` to the identity `rs` already knows: the id
-# `st_build` minted for the declaration this walk is registering, when
-# the class matches and the current home owns it. Not yet recording (a
-# lint, a test helper with no table) or a class the table cannot
-# distinguish this way binds `sym_none()`, same as before — the chain
-# still shadows correctly, it just carries no identity to stamp.
+# A declaration that carries its name instead of an id binds the id the
+# table holds for it in the current home, `sym_none()` when it holds
+# none: the chain still shadows correctly.
 fn env_add(e: Env, name: String, cls: NCls) : Env =
-  env_with_chain(e, ch_bind(e.chain, name, env_decl_owner_sym(e, cls, name)))
+  env_with_chain(e, ch_bind(e.chain, name, BDecl(env_decl_owner_sym(e, cls, name))))
 
 fn env_decl_owner_sym(e: Env, cls: NCls, name: String) : SymId =
   if rs_recording(e.rs) { rs_decl_owner_sym(e.rs, cls, name) } else { sym_none() }
+
+# The name the declaration `s` was written with. Registration is where
+# the resolver learns it: nothing in the tree spells it.
+fn env_sym_text(e: Env, s: SymId) : String = written_text(sym_name(e.rs.tab, s))
+
+# A declaration the table holds no row for has no name to register.
+fn env_add_decl(e: Env, s: SymId) : Env =
+  if st_valid(e.rs.tab, s) { env_with_chain(e, ch_bind(e.chain, env_sym_text(e, s), BDecl(s))) } else { e }
 
 # A binding with no declared class of its own: the core names `add_all`
 # seeds the root scope with, and a selective import's picked names,
 # which are already declarations elsewhere and get their identity from
 # the ORIGIN's registration, not a second one here.
 fn env_add_untyped(e: Env, name: String) : Env =
-  env_with_chain(e, ch_bind(e.chain, name, sym_none()))
+  env_with_chain(e, ch_bind(e.chain, name, BDecl(sym_none())))
+
+type RBinder = RBinder(Env, Binder)
 
 # A binder takes a fresh local id: `let map = ...` shadows the core
-# `map` and must never be stamped as it.
-fn env_bind_local(e: Env, name: String) : Env =
-  env_with_chain(e, ch_declare_local(e.chain, name))
+# `map` and must never be read as it. One that already carries an id,
+# minted or numbered by an earlier walk, keeps it.
+fn env_bind(e: Env, b: Binder) : RBinder = {
+  let name = written_text(b.name)
+  if local_raw(b.id) != 0 { RBinder(env_with_chain(e, ch_bind_local(e.chain, name, b.id)), b) }
+  else { RBinder(env_with_chain(e, ch_declare_local(e.chain, name)), binder_numbered(b, ch_next_local(e.chain))) }
+}
 
 fn env_has(e: Env, name: String) : Bool = ch_has(e.chain, name)
 
 # What a name reaches: a binder answers with its own id, a declaration
 # with whatever the symbol table resolves for the home the walk is in.
 #
-# NOT the id the chain bound at registration, even though `env_add` now
-# mints one. A core name is bound once for the whole program, but which
+# NOT the id the chain bound at registration. A core name is bound once
+# for the whole program, but which
 # declaration it reaches depends on the home the walk is inside when
 # the use is read — `map` is exported by `option`, `result` and `list`,
 # and answering with the registration's id turns every bare `map` into
 # a contested name. The chain's id says a name was declared; the table
 # says which declaration this reader reaches.
-fn env_lookup(e: Env, name: String) : Option[SymId] =
+fn env_lookup(e: Env, name: String) : Option[Bound] =
   match ch_lookup(e.chain, name) {
-    Some(s) -> if ch_is_local(s) { Some(s) } else { env_decl_sym(e, name) }
-    None    -> None
+    Some(BLocal(l)) -> Some(BLocal(l))
+    Some(BDecl(_))  -> match env_decl_sym(e, name) {
+      Some(s) -> Some(BDecl(s))
+      None    -> None
+    }
+    None -> None
   }
 
 fn env_decl_sym(e: Env, name: String) : Option[SymId] =
@@ -200,76 +216,102 @@ fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
 pub fn core_names() : [String] =
   list_append(core_builtin_names(), list_append(core_reserved_names(), native_prim_names()))
 
-#[doc("`core_names` and the runtime calls a pass mints once the typer is done. No scope binds those, so no program can name them; the emitters must still know them for calls.")]
-pub fn core_emit_names() : [String] = ["array_take", ...core_names()]
-
 # Names no program declares but every scope must know, so the closure-capture
-# analyser never takes one for a free variable: the core constructors and the
-# calls passes synthesise after inference.
-fn core_reserved_names() : [String] = [
-  "Some", "None", "Ok", "Err",
-  "__perceus_dup", "__perceus_drop",
-  "__perceus_reuse_cons", "__perceus_reuse_record", "__perceus_reuse_variant",
-  "__fixed_vec_lit", "__fixed_vec_get", "__fixed_vec_get_dyn"
-]
+# analyser never takes one for a free variable: the core constructors.
+fn core_reserved_names() : [String] = ["Some", "None", "Ok", "Err"]
 
 #[doc("Add every name in `names` to the current (top) scope of `e`.")]
 pub fn add_all(e: Env, names: [String]) : Env =
   reduce(names, e, (acc, n) => env_add_untyped(acc, n))
 
-# ---- pattern bindings: walk a pattern and add its bound names ----
+# ---- pattern bindings: number a pattern's binders and bind their names ----
 
-fn bind_pat(e: Env, pat: Pattern) : Env {
-  match pat.pkind {
-    PWild -> e
-    PLit(_) -> e
-    PRange(_, _) -> e
-    PBind(name) -> env_bind_local(e, name)
-    PList(pats, opt_rest) -> {
-      let e1 = bind_pats_loop(e, pats)
-      match opt_rest {
-        Some(rname) -> env_bind_local(e1, rname)
-        None -> e1
+type RPat = RPat(Env, Pattern)
+
+type RPatKind = RPatKind(Env, PatKind)
+
+type RPats = RPats(Env, [Pattern])
+
+type RPFields = RPFields(Env, [PField])
+
+fn bind_pat(e: Env, pat: Pattern) : RPat / Console + File = match bind_pat_kind(e, pat.pkind) {
+  RPatKind(e1, k) -> RPat(e1, Pattern { pkind: k, line: pat.line, col: pat.col })
+}
+
+fn bind_pat_kind(e: Env, k: PatKind) : RPatKind / Console + File {
+  match k {
+    PWild -> RPatKind(e, k)
+    PLit(lit) -> RPatKind(chk_literal_str(e, lit), k)
+    PRange(_, _) -> RPatKind(e, k)
+    PBind(b) -> match env_bind(e, b) { RBinder(e1, b1) -> RPatKind(e1, PBind(b1)) }
+    PList(pats, opt_rest) -> match bind_pats_loop(e, pats, []) {
+      RPats(e1, ps1) -> match opt_rest {
+        Some(r) -> match env_bind(e1, r) { RBinder(e2, r1) -> RPatKind(e2, PList(ps1, Some(r1))) }
+        None -> RPatKind(e1, PList(ps1, None))
       }
     }
-    PVariant(_, _, subs) -> bind_pats_loop(e, subs)
-    PVariantRecord(_, _, fields) -> bind_pfields_loop(e, fields)
-    PRecord(fields) -> bind_pfields_loop(e, fields)
-    PHole(_) -> e
-    PAs(name, sub) -> bind_pat(env_bind_local(e, name), sub)
-    PNarrow(name, _) -> env_bind_local(e, name)
-    PSurface(sp) -> bind_pats_loop(e, patsurface_children(sp))
+    PVariant(r, subs) -> match bind_pats_loop(e, subs, []) {
+      RPats(e1, ps1) -> RPatKind(e1, PVariant(r, ps1))
+    }
+    PVariantRecord(r, fields) -> match bind_pfields_loop(e, fields, []) {
+      RPFields(e1, fs1) -> RPatKind(e1, PVariantRecord(r, fs1))
+    }
+    PRecord(fields) -> match bind_pfields_loop(e, fields, []) {
+      RPFields(e1, fs1) -> RPatKind(e1, PRecord(fs1))
+    }
+    PHole(_) -> RPatKind(e, k)
+    PAs(b, sub) -> match env_bind(e, b) {
+      RBinder(e1, b1) -> match bind_pat(e1, sub) { RPat(e2, s1) -> RPatKind(e2, PAs(b1, s1)) }
+    }
+    PNarrow(b, t) -> match env_bind(e, b) { RBinder(e1, b1) -> RPatKind(e1, PNarrow(b1, t)) }
+    PSurface(sp) -> match bind_pats_loop(e, patsurface_children(sp), []) {
+      RPats(e1, ps1) -> RPatKind(e1, PSurface(patsurface_rebuild(sp, ps1)))
+    }
   }
 }
 
-fn bind_pats_loop(e: Env, ps: [Pattern]) : Env {
+fn bind_pats_loop(e: Env, ps: [Pattern], acc: [Pattern]) : RPats / Console + File {
   match ps {
-    [] -> e
-    [p, ...rest] -> bind_pats_loop(bind_pat(e, p), rest)
+    [] -> RPats(e, list_reverse(acc))
+    [p, ...rest] -> match bind_pat(e, p) { RPat(e1, p1) -> bind_pats_loop(e1, rest, [p1, ...acc]) }
   }
 }
 
-fn bind_pfields_loop(e: Env, fs: [PField]) : Env {
+# Shorthand `{ x }` binds `x` directly; the parser already builds the
+# equivalent of `{ x: x }` so bind_pat handles both cases uniformly.
+fn bind_pfields_loop(e: Env, fs: [PField], acc: [PField]) : RPFields / Console + File {
   match fs {
-    [] -> e
-    [pf, ...rest] -> bind_pfields_loop(bind_pfield(e, pf), rest)
+    [] -> RPFields(e, list_reverse(acc))
+    [PField(n, sub, short), ...rest] -> match bind_pat(e, sub) {
+      RPat(e1, s1) -> bind_pfields_loop(e1, rest, [PField(n, s1, short), ...acc])
+    }
   }
 }
 
-fn bind_pfield(e: Env, pf: PField) : Env {
-  match pf {
-    # Shorthand `{ x }` binds `x` directly; the parser already builds the
-    # equivalent of `{ x: x }` so bind_pat handles both cases uniformly.
-    PField(_, sub, _) -> bind_pat(e, sub)
+# A pattern binds a name once: a second binder of it would shadow the
+# first with no equality checked between the two.
+fn chk_pat_repeats(e: Env, p: Pattern) : Env / Console + File = match first_repeat(pat_binder_names(p, []), []) {
+  None    -> e
+  Some(n) -> {
+    let d = mk_diag(SevError, e.file, p.line, p.col, "duplicate binding in pattern: `#{n}`",
+                    [ri_note(e.file, p.line, p.col, "binding `#{n}` already used elsewhere in this pattern"),
+                     ri_help(e.file, p.line, p.col, "use a different name, or extract the equality with a guard: `MkPair(x, y) if x == y -> ...`")])
+    render_diag(d)
+    env_mark_err(env_push_diag(e, d))
   }
+}
+
+fn first_repeat(names: [String], seen: [String]) : Option[String] = match names {
+  [] -> None
+  [n, ...rest] -> if list_has(seen, n) { Some(n) } else { first_repeat(rest, [n, ...seen]) }
 }
 
 # ---- expression walker ----
 #
 # Every walker returns the env AND the tree it walked. Rewriting here
 # is what makes the resolver's decision survive: a use site the chain
-# resolved becomes an `ESym` carrying the id, so no later pass re-reads
-# the spelling to decide what the name meant.
+# resolved becomes an `ELocal` or an `ESym` carrying the id, so no later
+# pass re-reads the spelling to decide what the name meant.
 
 #[doc("A walked expression: the env after it, and the tree with its resolved names stamped.")]
 pub type RExpr = RExpr(Env, Expr)
@@ -298,15 +340,17 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
     EFixed(_, _)  -> rk_same(e, x.kind)
     EBool(_)   -> rk_same(e, x.kind)
     EChar(_)   -> rk_same(e, x.kind)
-    EStr(_, _) -> rk_same(e, x.kind)
+    EStr(_, _) -> rk_same(chk_literal_str(e, x), x.kind)
     EUnit      -> rk_same(e, x.kind)
     EUnder     -> rk_same(e, x.kind)
     EPlaceholder -> rk_same(e, x.kind)
-    # Already resolved: the walk stamped it on an earlier pass over this
-    # tree, and re-deciding it here is exactly what identity exists to
-    # prevent. Recorded again so the ordinals stay in step.
-    ESym(_, _, _) -> rk_same(e, x.kind)
-    EVar(name) -> chk_var(e, name, x)
+    # Already resolved: an earlier walk over this tree, or the pass that
+    # minted the node, settled it, and re-deciding it here is exactly
+    # what identity exists to prevent.
+    ESym(_, _) -> rk_same(e, x.kind)
+    ELocal(_)  -> rk_same(e, x.kind)
+    EOp(_)     -> rk_same(e, x.kind)
+    EName(name) -> chk_var(e, written_text(name), x)
     EMark(_) -> rk_same(e, x.kind)
     ECall(f, xs) -> chk_call(e, f, xs, list_length(xs))
     EField(base, fname) -> match chk_expr(e, base) {
@@ -340,14 +384,13 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
         RArms(e2, as1) -> RKind(e2, EMatch(s1, as1))
       }
     }
-    ELambda(params, body) -> {
-      let e1 = add_params(env_push(e), params)
-      match chk_expr(e1, body) {
-        RExpr(e2, b1) -> RKind(env_pop(e2), ELambda(params, b1))
+    ELambda(params, body) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RKind(env_pop(e2), ELambda(ps1, b1))
       }
     }
-    ERecordLit(rh, tn, fields) -> match chk_field_inits(e, fields) {
-      RFields(e1, fs1) -> RKind(e1, ERecordLit(rh, tn, fs1))
+    ERecordLit(r, fields) -> match chk_field_inits(e, fields) {
+      RFields(e1, fs1) -> RKind(e1, ERecordLit(r, fs1))
     }
     EList(elems) -> match chk_list_elems(e, elems) {
       RElems(e1, es1) -> RKind(e1, EList(es1))
@@ -382,8 +425,9 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
     EBang(inner) -> match chk_expr(e, inner) {   # scope-walk the operand
       RExpr(e1, i1) -> RKind(e1, EBang(i1))
     }
-    EHandle(body, en, hs, ta, init_opt, alias_opt, clauses, ret_opt) ->
-      chk_handle(e, x, body, en, hs, ta, init_opt, alias_opt, clauses, ret_opt)
+    EHandle(body, eff, ta, init_opt, alias_opt, clauses, ret_opt) -> match chk_tys(e, ta) {
+      RTys(e1, ta1) -> chk_handle(e1, x, body, eff, ta1, init_opt, alias_opt, clauses, ret_opt)
+    }
     # literal carrying a unit annotation. Recurse into the inner
     # numeric literal; the unit symbols themselves are validated at
     # type-resolution time, not here.
@@ -394,14 +438,12 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
     # The TypeExpr is validated by the resolver (sum + nullary-only)
     # in a later pass, not here.
     EVariantsOf(_, _) -> rk_same(e, x.kind)
-    EModCall(m, f) -> RKind(e, chk_modcall(e, m, f, x.kind))
+    EModCall(m, f) -> RKind(e, chk_modcall(e, written_text(m), written_text(f), x.kind))
     # intrinsic args are ordinary sub-expressions (a loop intrinsic
     # carries its original callee plus the loop's lambdas); walk them so
     # name-binding issues surface exactly as in the pre-lowering call.
-    EIntrinsic(nm, args_) -> match args_ {
-      [s, body] -> if nm == seg_state_intrinsic() { chk_seg_state(e, s, body, x) } else { chk_intrinsic(e, nm, args_) }
-      _ -> chk_intrinsic(e, nm, args_)
-    }
+    EIntrinsic(InSegState, [s, body]) -> chk_seg_state(e, s, body, x)
+    EIntrinsic(nm, args_) -> chk_intrinsic(e, nm, args_)
     # A surface node's children are walked for their diagnostics; the
     # node itself is rebuilt from the original, since the surface forms
     # are lowered before any consumer of identity runs.
@@ -409,22 +451,22 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
   }
 }
 
-# The one place a bare name becomes an identity. A binder carries its
-# local id, so no pass can take it for a declaration that shares its
-# spelling; a declaration carries the id the ladder reached. An unbound
-# name is reported and left as written, so the diagnostics downstream
-# still read a spelling.
+# The one place a bare name becomes an identity. A read of a binder is
+# its local id, so no pass can take it for a declaration that shares its
+# spelling; a declaration is the id the ladder reached. An unbound name
+# is reported and left as written, as is a name only the type settles.
 fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File =
   match value_proto(env_call_cx(e), name) {
-    Some(d) -> RKind(e, disp_ref(e, d))
+    Some(d) -> RKind(e, disp_ref(d))
     None    -> chk_name(e, name, x)
   }
 
 fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
   if env_has(e, name) {
     match env_lookup(e, name) {
-      Some(s) -> RKind(chk_hidden(e, name, x, s), ESym(s, spec_none(), name))
-      None    -> RKind(chk_hidden(e, name, x, sym_none()), x.kind)
+      Some(BLocal(l)) -> RKind(e, ELocal(l))
+      Some(BDecl(s))  -> RKind(chk_hidden(e, name, x, s), ESym(s, spec_none()))
+      None            -> RKind(chk_hidden(e, name, x, sym_none()), x.kind)
     }
   } else { RKind(chk_unbound(e, name, x), x.kind) }
 }
@@ -433,62 +475,105 @@ fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
 # another file's import loaded is bound here too; the file's own view
 # says whether it may be written bare. A builtin answers before any
 # hidden declaration, and a minted `__` name is no user's to import.
-# `reached` is what resolution settled on: a local, or a declaration on
-# one of the file's rungs, hides nothing. Every use passes through here,
-# so the rarer reasons to stay silent are asked only once a hidden
+# `reached` is the declaration resolution settled on: one on a rung of
+# the file hides nothing. Every use that is not a local passes through
+# here, so the rarer reasons to stay silent are asked only once a hidden
 # declaration exists.
 fn chk_hidden(e: Env, name: String, x: Expr, reached: SymId) : Env / Console + File =
-  if sym_is_local(reached) or not rs_recording(e.rs) or reached_in_view(e.rs, reached, name) { e }
+  if not rs_recording(e.rs) or reached_in_view(e.rs, reached, name) { e }
   else { match sv_hidden(e.rs.tab, e.rs.view, ru_value_classes(), name) {
     [] -> e
     ss ->
       if env_shadowed(e, name) or starts_with(name, "__") or list_has(e.rs.prelude, name) { e }
       else {
         let d = nh_diag(e.rs.tab, e.rs.view, ss, e.file, x.line, x.col, name)
-        render_diag(d)
-        env_mark_err(env_push_diag(e, d))
+        if env_reported(e.diags, e.file, x.line, x.col, diag_text(d)) { e } else {
+          render_diag(d)
+          env_mark_err(env_push_diag(e, d))
+        }
       }
   } }
 
 fn reached_in_view(rs: ResState, s: SymId, name: String) : Bool =
   sym_raw(s) >= 0 and sv_reaches(rs.view, sym_owner(rs.tab, s), name)
 
-# The qualifier already names the home, so the function it reaches is
-# one declaration. A constructor, a constant, or a name the table does
-# not hold keeps the qualified spelling.
+# The qualifier already names the home, so the function, constant or
+# constructor it reaches is one declaration. A name the table does not
+# hold keeps the qualified spelling.
 fn chk_modcall(e: Env, m: String, f: String, k: ExprKind) : ExprKind =
   if rs_recording(e.rs) {
     match rs_qualified_fn(e.rs, m, f) {
-      Some(s) -> ESym(s, spec_none(), f)
-      None    -> k
+      Some(s) -> ESym(s, spec_none())
+      None    -> match qualified_value(e.rs.tab, [NCConst, NCCtor], m, f) {
+        Some(s) -> ESym(s, spec_none())
+        None    -> k
+      }
     }
   } else { k }
+
+fn qualified_value(tab: SymTab, cs: [NCls], m: String, f: String) : Option[SymId] = match cs {
+  [] -> None
+  [c, ...rest] -> match ru_qualified_class(tab, c, m, f) {
+    URSym(i) -> Some(SymId(i))
+    _        -> qualified_value(tab, rest, m, f)
+  }
+}
+
+# From here on a string is a literal, in an expression or in a pattern:
+# every pass downstream reads `#{` as two characters. A span the lift
+# left as text would lose its interpolation without a word, so it stops
+# the build instead.
+fn chk_literal_str(e: Env, x: Expr) : Env / Console + File = match x.kind {
+  EStr(span, _) -> if has_interp(span, 0, string_length(span)) { chk_unlifted_interp(e, x) } else { e }
+  _             -> e
+}
+
+fn chk_unlifted_interp(e: Env, x: Expr) : Env / Console + File {
+  let msg = "internal: an interpolated string reached name resolution as text"
+  diag_error(e.file, x.line, x.col, msg)
+  env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, [])))
+}
 
 # Canonical Rust/Elm-style diagnostic. The error line stays terse; the
 # did-you-mean suggestion moves to a separate `help:` line and is
 # suppressed when no name is within Levenshtein distance 3.
 fn chk_unbound(e: Env, name: String, x: Expr) : Env / Console + File {
-  diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
   let msg = "cannot find `#{name}` in this scope"
-  let hint = unbound_hint(e, name)
-  match hint {
-    Some(h) -> diag_help(h)
-    None    -> ()
+  if env_reported(e.diags, e.file, x.line, x.col, msg) { e } else {
+    diag_error(e.file, x.line, x.col, msg)
+    let hint = unbound_hint(e, name)
+    match hint {
+      Some(h) -> diag_help(h)
+      None    -> ()
+    }
+    let related = match hint {
+      Some(h) -> [ri_help(e.file, x.line, x.col, h)]
+      None    -> []
+    }
+    env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related)))
   }
-  let related = match hint {
-    Some(h) -> [ri_help(e.file, x.line, x.col, h)]
-    None    -> []
-  }
-  env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related)))
+}
+
+fn diag_text(d: Diagnostic) : String = match d { D(_, _, _, _, m, _) -> m }
+
+# A predicate is read where its type is written and again wherever a
+# check of it was planted, so one mistake in it is reported once.
+fn env_reported(ds: [Diagnostic], file: String, line: Int, col: Int, msg: String) : Bool = match ds {
+  [] -> false
+  [D(_, f, l, c, m, _), ...rest] ->
+    (l == line and c == col and f == file and m == msg) or env_reported(rest, file, line, col, msg)
 }
 
 # A name that appears as a bare alias right-hand side has no
 # constructor precisely because the declaration is an alias; the
-# leading bar is what would have made it a sum. Anything else falls
-# back to the did-you-mean, which stays silent past distance 3.
+# leading bar is what would have made it a sum. `region` is a keyword
+# of the block form only. Anything else falls back to the did-you-mean,
+# which stays silent past distance 3.
 fn unbound_hint(e: Env, name: String) : Option[String] =
   if list_has(e.alias_heads, name) {
     Some("`type ... = #{name}` declares an alias, so `#{name}` is not a constructor — write `type ... = | #{name}` for a one-member sum")
+  } else if name == "region" {
+    Some("`region` is a block form, not a function — write `region { ... }`")
   } else {
     match closest_name(name, env_all_names(e)) {
       Some(s) -> Some("a similar name exists in scope: `#{s}` (did you mean this?)")
@@ -508,8 +593,8 @@ fn chk_pipe(e: Env, a: Expr, b: Expr,
   }
 
 fn chk_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
-  EVar(name) -> chk_callee(e, name, b, 1)
-  _          -> chk_expr(e, b)
+  EName(name) -> chk_callee(e, written_text(name), b, 1)
+  _           -> chk_expr(e, b)
 }
 
 # `x |> f(a, b)` calls `f(x, a, b)`; a `_` among the arguments is the
@@ -538,8 +623,8 @@ fn env_call_cx(e: Env) : CallCx = CallCx(e.chain, e.rs, e.callees, e.larity)
 # protocol operation when nothing nearer answers that arity.
 fn chk_call(e: Env, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = {
   let rf = match f.kind {
-    EVar(name) -> chk_callee(e, name, f, n)
-    _          -> chk_expr(e, f)
+    EName(name) -> chk_callee(e, written_text(name), f, n)
+    _           -> chk_expr(e, f)
   }
   match rf {
     RExpr(e1, f1) -> match chk_exprs(e1, xs) {
@@ -552,16 +637,16 @@ fn method_call(e: Env, f: Expr, xs: [Expr]) : RKind / Console + File = match f.k
   EField(recv, op) ->
     if names_effect(e, recv) { RKind(e, ECall(f, xs)) }
     else { match method_proto(env_call_cx(e), op, list_length(xs) + 1) {
-      Some(d) -> RKind(e, ECall(at(disp_ref(e, d), f), [recv, ...xs]))
+      Some(d) -> RKind(e, ECall(at(disp_ref(d), f), [recv, ...xs]))
       None    -> RKind(e, ECall(f, xs))
     } }
   _ -> RKind(e, ECall(f, xs))
 }
 
 fn names_effect(e: Env, recv: Expr) : Bool = match recv.kind {
-  ESym(s, _, _) -> if sym_is_local(s) or not rs_recording(e.rs) { false }
-                   else { match sym_class(e.rs.tab, s) { NCEffect -> true  _ -> false } }
-  _             -> false
+  ESym(s, _) -> if not rs_recording(e.rs) { false }
+                else { match sym_class(e.rs.tab, s) { NCEffect -> true  _ -> false } }
+  _          -> false
 }
 
 # A bare callee: the binding the ladder reaches at this arity, or, when
@@ -575,125 +660,136 @@ fn chk_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = 
     None      -> e
   }
   match h {
-    Hit(RLocal(s), _) -> RExpr(e1, sym_ref(s, name, x))
-    Hit(RDecl(s), _)  -> RExpr(chk_hidden(e1, name, x, s), sym_ref(s, name, x))
-    Hit(RProto(d), _) -> RExpr(e1, at(disp_ref(e1, d), x))
+    Hit(RLocal(l), _) -> RExpr(e1, at(ELocal(l), x))
+    Hit(RDecl(s), _)  -> RExpr(chk_hidden(e1, name, x, s), sym_ref(s, x))
+    Hit(RProto(d), _) -> RExpr(e1, at(disp_ref(d), x))
     Hit(RBare, _)     -> RExpr(chk_hidden(e1, name, x, sym_none()), x)
+    Hit(RCore, _)     -> RExpr(chk_hidden(e1, name, x, sym_none()), core_ref(e1, name, x))
     Hit(RNone, _)     -> chk_expr_named(e1, name, x)
   }
 }
 
-# A dispatcher carries its identity: two modules may each declare a
-# protocol with an operation of one name.
-fn disp_ref(e: Env, d: Disp) : ExprKind = match d {
-  Disp(Some(s), name) -> if rs_recording(e.rs) and st_valid(e.rs.tab, s) { ESym(s, spec_none(), name) }
-                         else { EVar(name) }
-  Disp(None, name)    -> EVar(name)
+# A dispatcher the type settles among several homes stays the written
+# name every one of them answers to.
+fn disp_ref(d: Disp) : ExprKind = match d {
+  DispSym(s)        -> ESym(s, spec_none())
+  DispWritten(name) -> EName(written(name))
+}
+
+# A name the core rung answered: the builtin's own row when the table
+# declares one, else the name as written.
+fn core_ref(e: Env, name: String, x: Expr) : Expr = match rs_builtin(e.rs, name) {
+  Some(s) -> sym_ref(s, x)
+  None    -> x
 }
 
 fn at(k: ExprKind, x: Expr) : Expr = Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site }
 
-fn sym_ref(s: SymId, name: String, x: Expr) : Expr =
-  Expr { kind: ESym(s, spec_none(), name), line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site }
+fn sym_ref(s: SymId, x: Expr) : Expr = at(ESym(s, spec_none()), x)
 
 fn chk_expr_named(e: Env, name: String, x: Expr) : RExpr / Console + File =
   match chk_name(e, name, x) {
     RKind(e1, k) -> RExpr(e1, Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site })
   }
 
-fn warn_skip(e: Env, x: Expr, msg: String) : Env / Console + File = {
-  let help = "rename one of the two, or qualify the call to name the one it means"
-  diag_warning(e.file, x.line, x.col, msg)
-  diag_help(help)
-  env_push_diag(e, mk_diag(SevWarning, e.file, x.line, x.col, msg, [ri_help(e.file, x.line, x.col, help)]))
+fn warn_skip(e: Env, x: Expr, msg: String) : Env / Console + File =
+  if env_reported(e.diags, e.file, x.line, x.col, msg) { e } else {
+    let help = "rename one of the two, or qualify the call to name the one it means"
+    diag_warning(e.file, x.line, x.col, msg)
+    diag_help(help)
+    env_push_diag(e, mk_diag(SevWarning, e.file, x.line, x.col, msg, [ri_help(e.file, x.line, x.col, help)]))
+  }
+
+# The effect a reference names. A qualifier picks the module outright;
+# a bare name climbs the scope view like any other class. A reference
+# already settled keeps its declaration.
+fn chk_effect_sym(e: Env, r: DeclRef) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(q, n) -> if rs_recording(e.rs) { rs_effect_sym(e.rs, ref_text(q, n)) } else { sym_none() }
 }
 
-# `Eff as log` makes `log` a binding that names the capability inside
-# the body, so it is pushed in a scope of its own and disappears with
-# it. The init expression (`with State[T](init)`) lives in the outer
-# scope — its free vars are the surrounding env.
-# The effect a handler head names. A qualifier picks the module
-# outright; a bare name climbs the scope view like any other class.
-fn chk_handle_sym(e: Env, en: String) : SymId =
-  if rs_recording(e.rs) {
-    let s = rs_effect_sym(e.rs, en)
-    if sym_raw(s) >= 0 { s } else { es_lookup(e.eff_spellings, en) }
-  } else { sym_none() }
+fn ref_text(q: Option[Written], n: Written) : String = match q {
+  Some(m) -> cat3(written_text(m), ".", written_text(n))
+  None    -> written_text(n)
+}
 
 # The effect heading an op call `Eff.op` is settled the way a handler
 # head is. A name the value lookup left bare is not a value, and a local
 # binder of that name keeps it.
 fn chk_op_base(e: Env, b: Expr, op: String) : Expr = match b.kind {
-  EVar(n) -> if env_shadowed(e, n) { b } else {
-    let h = chk_op_head(e, n, op)
-    match h {
-      None -> b
-      Some(OpHead(s, eff)) -> Expr { kind: ESym(s, spec_none(), eff), line: b.line,
-                                 col: b.col, ty: b.ty, mode: b.mode,  site: b.site }
+  EName(n) -> if env_shadowed(e, written_text(n)) { b } else {
+    match chk_op_head(e, written_text(n), op) {
+      None    -> b
+      Some(s) -> sym_ref(s, b)
     }
   }
   _ -> b
 }
 
-# The identity of a stamped op head, with the effect name that id belongs
-# to: written on a row alias the two differ, and the atomic component's
-# name is what the row label and the evidence key must carry.
-type HeadSym = OpHead(SymId, String)
-
-fn chk_op_head(e: Env, head: String, op: String) : Option[HeadSym] = {
-  let direct = chk_handle_sym(e, head)
-  if sym_raw(direct) >= 0 { Some(OpHead(direct, head)) }
+# Written on a row alias, the head is the component that declares the
+# op: a row label and an evidence key must name an atomic effect.
+fn chk_op_head(e: Env, head: String, op: String) : Option[SymId] = {
+  let direct = chk_effect_sym(e, ref_written(head))
+  if sym_raw(direct) >= 0 { Some(direct) }
   else {
     # A component was settled where the alias was written, so its own id
     # stands; only an unsettled one is resolved from here.
     match alias_op_owner(e.eff_ops, alias_components(e.row_aliases, head, 0), op) {
       None -> None
-      Some(RL(eff, _, cs)) -> {
-        let s = if sym_raw(cs) >= 0 { cs } else { chk_handle_sym(e, eff) }
-        if sym_raw(s) >= 0 { Some(OpHead(s, eff)) } else { None }
+      Some(RL(r, _)) -> {
+        let s = chk_effect_sym(e, r)
+        if sym_raw(s) >= 0 { Some(s) } else { None }
       }
     }
   }
 }
 
-fn chk_handle(e: Env, x: Expr, body: Expr, en: String, hs: SymId, ta: [TypeExpr],
-      init_opt: Option[Expr], alias_opt: Option[String], clauses: [HClause],
+type RAlias = RAlias(Env, Option[Binder])
+
+# `Eff as log` makes `log` a binding that names the capability inside
+# the body, so it is pushed in a scope of its own and disappears with
+# it. The init expression (`with State[T](init)`) lives in the outer
+# scope — its free vars are the surrounding env.
+fn chk_handle(e: Env, x: Expr, body: Expr, eff: DeclRef, ta: [TypeExpr],
+      init_opt: Option[Expr], alias_opt: Option[Binder], clauses: [HClause],
       ret_opt: Option[HReturn]) : RKind / Console + File {
   let stateful = match init_opt { Some(_) -> true None -> false }
-  # The effect this head handles, settled once: the effect pass stamped it
-  # while a `with m.E` still carried its qualifier, and only a head that
-  # pass never saw is resolved here.
-  let esym = if sym_raw(hs) >= 0 { hs } else { chk_handle_sym(e, en) }
+  # A head an earlier pass settled while it still carried its qualifier
+  # keeps that declaration; one the resolver cannot settle stays written.
+  let esym = chk_effect_sym(e, eff)
+  let eff1 = if sym_raw(esym) >= 0 { DrSym(esym) } else { eff }
   let after = match init_opt {
     Some(ie) -> match chk_expr(e, ie) { RExpr(e1, i1) -> RExpr(e1, i1) }
     None     -> RExpr(e, x)
   }
   let init1 = match init_opt { Some(_) -> match after { RExpr(_, i) -> Some(i) } None -> None }
   let e0 = rx_env(after)
-  let body_env = match alias_opt {
-    Some(alias) -> env_bind_local(env_push(e0), alias)
-    None        -> e0
+  let aliased = match alias_opt {
+    Some(alias) -> match env_bind(env_push(e0), alias) { RBinder(ea, a1) -> RAlias(ea, Some(a1)) }
+    None        -> RAlias(e0, None)
   }
-  match chk_expr(body_env, body) {
-    RExpr(eb, body1) -> {
-      let restored = match alias_opt { Some(_) -> env_pop(eb) None -> eb }
-      if stateful {
-        warn_shadowed_aliases(restored, aliases_read_by_clauses(user_state_aliases(), clauses, ret_opt),
-                              x.line, x.col)
-      } else { () }
-      match chk_handler_clauses(restored, clauses, stateful) {
-        RClauses(ec, cs1) -> match ret_opt {
-          Some(r) -> match chk_handler_return(ec, r, stateful) {
-            RRet(er, r1) -> RKind(er, EHandle(body1, en, esym, ta, init1, alias_opt, cs1, Some(r1)))
+  match aliased {
+    RAlias(body_env, alias1) -> match chk_expr(body_env, body) {
+      RExpr(eb, body1) -> {
+        let restored = match alias_opt { Some(_) -> env_pop(eb) None -> eb }
+        if stateful {
+          warn_shadowed_aliases(restored, aliases_read_by_clauses(user_state_aliases(), clauses, ret_opt),
+                                x.line, x.col)
+        } else { () }
+        match chk_handler_clauses(restored, clauses, stateful) {
+          RClauses(ec, cs1) -> match ret_opt {
+            Some(r) -> match chk_handler_return(ec, r, stateful) {
+              RRet(er, r1) -> RKind(er, EHandle(body1, eff1, ta, init1, alias1, cs1, Some(r1)))
+            }
+            None -> RKind(ec, EHandle(body1, eff1, ta, init1, alias1, cs1, None))
           }
-          None -> RKind(ec, EHandle(body1, en, esym, ta, init1, alias_opt, cs1, None))
         }
       }
     }
   }
 }
 
-fn chk_intrinsic(e: Env, nm: String, args_: [Expr]) : RKind / Console + File = match chk_exprs(e, args_) {
+fn chk_intrinsic(e: Env, nm: Intrinsic, args_: [Expr]) : RKind / Console + File = match chk_exprs(e, args_) {
   RExprs(e1, as1) -> RKind(e1, EIntrinsic(nm, as1))
 }
 
@@ -714,13 +810,14 @@ pub fn handler_state_aliases() : [String] = list_append(user_state_aliases(), [v
 
 # A user alias is bound only when the surrounding scope has no binding of
 # that name: an outer `log` array must stay reachable from the clause
-# rather than being silently replaced by the state slot.
+# rather than being silently replaced by the state slot. No node declares
+# an alias, so its binder is the one minted under its name.
 fn bind_state_aliases(e: Env, outer: Env) : Env =
-  bind_locals(e, clause_state_aliases((nm) => env_has(outer, nm)))
+  bind_minted(e, clause_state_aliases((nm) => env_has(outer, nm)))
 
-fn bind_locals(e: Env, names: [String]) : Env = match names {
-  []            -> e
-  [nm, ...rest] -> bind_locals(env_bind_local(e, nm), rest)
+fn bind_minted(e: Env, keys: [String]) : Env = match keys {
+  []             -> e
+  [key, ...rest] -> bind_minted(env_with_chain(e, ch_bind_local(e.chain, key, local_minted(key))), rest)
 }
 
 # Announce every alias a clause reads that the enclosing scope takes
@@ -752,8 +849,10 @@ fn chk_clauses_loop(e: Env, cs: [HClause], stateful: Bool,
   [HC(nm, params, body, l, c), ...rest] -> {
     let e1 = env_push(e)
     let e1s = if stateful { bind_state_aliases(e1, e) } else { e1 }
-    match chk_expr(add_params(e1s, params), body) {
-      RExpr(e2, b1) -> chk_clauses_loop(env_pop(e2), rest, stateful, [HC(nm, params, b1, l, c), ...acc])
+    match bind_params(e1s, params) {
+      RParams(e2, ps1) -> match chk_expr(e2, body) {
+        RExpr(e3, b1) -> chk_clauses_loop(env_pop(e3), rest, stateful, [HC(nm, ps1, b1, l, c), ...acc])
+      }
     }
   }
 }
@@ -762,11 +861,12 @@ type RRet = RRet(Env, HReturn)
 
 fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : RRet / Console + File {
   match r {
-    HR(name, body, l, c) -> {
-      let e2 = env_bind_local(env_push(e), name)
-      let e2s = if stateful { bind_state_aliases(e2, e) } else { e2 }
-      match chk_expr(e2s, body) {
-        RExpr(e3, b1) -> RRet(env_pop(e3), HR(name, b1, l, c))
+    HR(b, body, l, c) -> match env_bind(env_push(e), b) {
+      RBinder(e2, b1) -> {
+        let e2s = if stateful { bind_state_aliases(e2, e) } else { e2 }
+        match chk_expr(e2s, body) {
+          RExpr(e3, r1) -> RRet(env_pop(e3), HR(b1, r1, l, c))
+        }
       }
     }
   }
@@ -816,11 +916,10 @@ fn chk_arms(e: Env, arms: [Arm]) : RArms / Console + File = chk_arms_loop(e, arm
 
 fn chk_arms_loop(e: Env, arms: [Arm], acc: [Arm]) : RArms / Console + File = match arms {
   [] -> RArms(e, list_reverse(acc))
-  [Arm(pat, guard, body), ...rest] -> {
-    let e2 = bind_pat(env_push(e), pat)
-    match chk_guard(e2, guard) {
+  [Arm(pat, guard, body), ...rest] -> match bind_pat(env_push(e), pat) {
+    RPat(e2, p1) -> match chk_guard(chk_pat_repeats(e2, p1), guard) {
       RGuard(e3, g1) -> match chk_expr(e3, body) {
-        RExpr(e4, b1) -> chk_arms_loop(env_pop(e4), rest, [Arm(pat, g1, b1), ...acc])
+        RExpr(e4, b1) -> chk_arms_loop(env_pop(e4), rest, [Arm(p1, g1, b1), ...acc])
       }
     }
   }
@@ -849,7 +948,11 @@ type RStmt = RStmt(Env, Stmt)
 fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
   match s {
     SLet(pat, ta, rhs) -> match chk_expr(e, rhs) {
-      RExpr(e1, r1) -> RStmt(note_arity(bind_pat(e1, pat), pat, binder_arity(Some(rhs), ta)), SLet(pat, ta, r1))
+      RExpr(e1, r1) -> match chk_opt_ty(e1, ta) {
+        ROptTy(e1t, ta1) -> match bind_pat(e1t, pat) {
+          RPat(e2, p1) -> RStmt(note_arity(chk_pat_repeats(e2, p1), p1, binder_arity(Some(rhs), ta)), SLet(p1, ta1, r1))
+        }
+      }
     }
     SAssert(cond, opt_msg) -> match chk_expr(e, cond) {
       RExpr(e1, c1) -> match opt_msg {
@@ -880,8 +983,10 @@ fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
     # if a future debug mode skips the desugar, treat the binding like
     # `let` so the match stays exhaustive and follow-on resolution
     # still produces useful diagnostics.
-    SVar(name, ta, rhs, line, col) -> match chk_expr(e, rhs) {
-      RExpr(e1, r1) -> RStmt(env_bind_local(e1, name), SVar(name, ta, r1, line, col))
+    SVar(b, ta, rhs, line, col) -> match chk_expr(e, rhs) {
+      RExpr(e1, r1) -> match env_bind(e1, b) {
+        RBinder(e2, b1) -> RStmt(e2, SVar(b1, ta, r1, line, col))
+      }
     }
     # `use Effect` stmt is stripped by desugar_use_decls before chk
     # runs. Arm kept so the match is exhaustive in case of a future
@@ -890,31 +995,92 @@ fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
   }
 }
 
-# `add_params` binds the parameters first and in order, so they take
-# consecutive ids from the chain's next one down.
-fn consecutive_ids(from: Int, n: Int) : [SymId] =
-  if n <= 0 { [] } else { [SymId(from), ...consecutive_ids(from - 1, n - 1)] }
+type RParams = RParams(Env, [Param])
 
-fn add_params(e: Env, ps: [Param]) : Env {
-  match ps {
-    [] -> e
-    [p, ...rest] -> add_params(note_bound_arity(env_bind_local(e, p.pname), p.pname, binder_arity(None, p.ptype)), rest)
+fn add_params(e: Env, ps: [Param]) : RParams = add_params_loop(e, ps, [])
+
+fn add_params_loop(e: Env, ps: [Param], acc: [Param]) : RParams = match ps {
+  [] -> RParams(e, list_reverse(acc))
+  [p, ...rest] -> match env_bind(e, p.binder) {
+    RBinder(e1, b1) ->
+      add_params_loop(note_bound_arity(e1, b1.id, binder_arity(None, p.ptype)), rest, [Param { ...p, binder: b1 }, ...acc])
   }
 }
+
+fn param_ids(ps: [Param]) : [LocalId] = map(ps, (p) => p.binder.id)
 
 # A binder whose definition fixes its arity records it, so a call of
 # another arity passes it over for the next binding of its name.
 fn note_arity(e: Env, pat: Pattern, a: Option[Int]) : Env = match pat.pkind {
-  PBind(name) -> note_bound_arity(e, name, a)
-  _           -> e
+  PBind(b) -> note_bound_arity(e, b.id, a)
+  _        -> e
 }
 
-fn note_bound_arity(e: Env, name: String, a: Option[Int]) : Env = match a {
+fn note_bound_arity(e: Env, l: LocalId, a: Option[Int]) : Env = match a {
   None    -> e
-  Some(n) -> match ch_locals(e.chain, name) {
-    [s, ..._] -> Env { ...e, larity: [LocalArity(s, n), ...e.larity] }
-    []        -> e
+  Some(n) -> Env { ...e, larity: [LocalArity(l, n), ...e.larity] }
+}
+
+# ---- refinement predicates ----
+
+# A refinement's predicate is an expression of the scope its type is
+# written in, where `self` is the value the type constrains: a binder of
+# the predicate, whatever the scope calls `self`.
+
+type RTys = RTys(Env, [TypeExpr])
+
+type ROptTy = ROptTy(Env, Option[TypeExpr])
+
+type REffOps = REffOps(Env, [EffectOp])
+
+fn chk_tys(e: Env, ts: [TypeExpr]) : RTys / Console + File =
+  if not tys_refined(ts) { RTys(e, ts) }
+  else { match chk_preds(e, tys_preds(ts), []) {
+    RExprs(e1, ps) -> RTys(e1, tys_with_preds(ts, ps))
+  } }
+
+fn chk_preds(e: Env, ps: [Expr], acc: [Expr]) : RExprs / Console + File = match ps {
+  [] -> RExprs(e, list_reverse(acc))
+  [p, ...rest] -> match env_bind(env_push(e), pred_self_binder()) {
+    RBinder(inner, _) -> match chk_expr(inner, p) {
+      RExpr(e1, p1) -> chk_preds(env_pop(e1), rest, [p1, ...acc])
+    }
   }
+}
+
+fn chk_opt_ty(e: Env, t: Option[TypeExpr]) : ROptTy / Console + File = match t {
+  None    -> ROptTy(e, None)
+  Some(x) -> match chk_tys(e, [x]) {
+    RTys(e1, [x1, ..._]) -> ROptTy(e1, Some(x1))
+    RTys(e1, [])         -> ROptTy(e1, t)
+  }
+}
+
+# Parameters are bound before their annotations are read: a parameter's
+# refinement may name any of them.
+fn bind_params(e: Env, ps: [Param]) : RParams / Console + File = match add_params(e, ps) {
+  RParams(e1, ps1) -> {
+    let ts = params_types(ps1)
+    if not tys_refined(ts) { RParams(e1, ps1) }
+    else { match chk_tys(e1, ts) { RTys(e2, ts1) -> RParams(e2, params_with_types(ps1, ts1)) } }
+  }
+}
+
+fn op_refined(op: EffectOp) : Bool = match op {
+  EffOp(_, _, ps, ret, _, _) -> tys_refined([ret, ...params_types(ps)])
+}
+
+# An operation's parameters are in scope of its own signature only.
+fn chk_effect_ops(e: Env, ops: [EffectOp], acc: [EffectOp]) : REffOps / Console + File = match ops {
+  [] -> REffOps(e, list_reverse(acc))
+  [op, ...rest] -> if not op_refined(op) { chk_effect_ops(e, rest, [op, ...acc]) } else { match op {
+    EffOp(nm, tps, ps, ret, l, c) -> match bind_params(env_push(e), ps) {
+      RParams(e1, ps1) -> match chk_tys(e1, [ret]) {
+        RTys(e2, [ret1, ..._]) -> chk_effect_ops(env_pop(e2), rest, [EffOp(nm, tps, ps1, ret1, l, c), ...acc])
+        RTys(e2, [])           -> chk_effect_ops(env_pop(e2), rest, [EffOp(nm, tps, ps1, ret, l, c), ...acc])
+      }
+    }
+  } }
 }
 
 # ---- declaration walkers ----
@@ -929,36 +1095,38 @@ fn rd_env(r: RDecl) : Env = match r { RDecl(e, _) -> e }
 
 fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
   match d {
-    DFn(p, n, tp, params, rt, row, body, l, c, mo, _) -> {
-      let e1 = add_params(env_push(e), params)
-      let fsym = env_decl_owner_sym(e, NCFn, n)
-      let ids = ParamIds(fsym, consecutive_ids(e.chain.next_local, list_length(params)))
-      match chk_expr(e1, body) {
-        RExpr(e2, b1) -> RDecl(Env { ...env_pop(e2), params: [ids, ...e2.params] },
-                               DFn(p, n, tp, params, rt, row, b1, l, c, mo, fnid_decl(fsym)))
+    DFn(p, fid, tp, params, rt, row, body, l, c, mo) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_opt_ty(e1, rt) {
+        ROptTy(e1t, rt1) -> match chk_expr(e1t, body) {
+          RExpr(e2, b1) -> RDecl(Env { ...env_pop(e2), params: [ParamIds(fnid_sym(fid), param_ids(ps1)), ...e2.params] },
+                                 DFn(p, fid, tp, ps1, rt1, row, b1, l, c, mo))
+        }
       }
     }
-    DType(p_, n, tps, body, l, c, mo, slots, s0) ->
-      RDecl(e, DType(p_, n, tps, body, l, c, mo, slots,
-                     if sym_raw(s0) >= 0 { s0 } else { env_decl_owner_sym(e, NCType, n) }))
+    DType(pb, t, tps, body, l, c, mo, xs) -> {
+      let ts = body_types(body)
+      if not tys_refined(ts) { RDecl(e, d) }
+      else { match chk_tys(e, ts) {
+        RTys(e1, ts1) -> RDecl(e1, DType(pb, t, tps, body_with_types(body, ts1), l, c, mo, xs))
+      } }
+    }
     DTest(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
       RExpr(e1, b1) -> RDecl(e1, DTest(nm, b1, l, c, mo))
     }
     DBench(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
       RExpr(e1, b1) -> RDecl(e1, DBench(nm, b1, l, c, mo))
     }
-    DCheck(nm, params, body, l, c, mo) -> {
-      let e1 = add_params(env_push(e), params)
-      match chk_expr(e1, body) {
-        RExpr(e2, b1) -> RDecl(env_pop(e2), DCheck(nm, params, b1, l, c, mo))
+    DCheck(nm, params, body, l, c, mo) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RDecl(env_pop(e2), DCheck(nm, ps1, b1, l, c, mo))
       }
     }
     DImport(_, _, _) -> RDecl(e, d)
-    # A contested declaration arrives stamped where its spelling was
-    # minted; any other takes the id the table holds under its name.
-    DEffect(p_, n, tps, ops, dblk, l, c, mo, esym) ->
-      RDecl(e, DEffect(p_, n, tps, ops, dblk, l, c, mo,
-                       if sym_raw(esym) >= 0 { esym } else { env_decl_owner_sym(e, NCEffect, n) }))
+    DEffect(p, esym, tps, ops, dblk, l, c, mo) ->
+      if not any(ops, op_refined) { RDecl(e, d) }
+      else { match chk_effect_ops(e, ops, []) {
+        REffOps(e1, ops1) -> RDecl(e1, DEffect(p, esym, tps, ops1, dblk, l, c, mo))
+      } }
     # protocol / impl / derive decls are stripped by `lower_protocols`
     # before `check_program` runs, so reaching one here means the
     # pipeline was driven directly into `chk_decl` (e.g. via `--check`
@@ -966,9 +1134,7 @@ fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
     # to lower first). Treat as a no-op rather than a fatal error so
     # the selfhost path continues to validate the post-lowering decl
     # stream.
-    DProtocol(p_, n, tps, ops, l, c, mo, _) ->
-      RDecl(e, DProtocol(p_, n, tps, ops, l, c, mo,
-                         env_decl_owner_sym(e, NCProtocol, n)))
+    DProtocol(_, _, _, _, _, _, _) -> RDecl(e, d)
     DImpl(_, _, _, _, _, _, _, _) -> RDecl(e, d)
     DDerive(_, _, _, _) -> RDecl(e, d)
     DUnstable(_, _, _) -> RDecl(e, d)
@@ -985,9 +1151,11 @@ fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
     DUse(_, _, _) -> RDecl(e, d)               # stripped by desugar_use_decls before chk runs
     DUseKind(_, _, _, _) -> RDecl(e, d)        # stripped by the kind-resolution pass before chk runs
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> RDecl(e, d)  # rewritten to DFn by lower_axioms before chk runs
-    DConst(p, name, ta, body, mo, l, c, _) -> match chk_expr(env_add(e, name, NCConst), body) {
-      RExpr(e1, b1) -> RDecl(e1, DConst(p, name, ta, b1, mo, l, c,
-                                        env_decl_owner_sym(e1, NCConst, name)))
+    DConst(p, csym, ta, body, mo, l, c) -> match chk_expr(env_add_decl(e, csym), body) {
+      RExpr(e1, b1) -> match chk_tys(e1, [ta]) {
+        RTys(e2, [ta1, ..._]) -> RDecl(e2, DConst(p, csym, ta1, b1, mo, l, c))
+        RTys(e2, [])          -> RDecl(e2, DConst(p, csym, ta, b1, mo, l, c))
+      }
     }
     DExternType(_, _, _, _, _) -> RDecl(e, d)  # FFI v2: a foreign type binds no value
     DDoc(ds, dl, inner, l, c) -> match chk_decl(e, inner) {
@@ -1038,20 +1206,18 @@ fn env_at_decl(e: Env, d: Decl, target: String) : Env =
 
 fn register_one(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, name, _, _, _, _, _, _, _, _, _) ->
-      if starts_with(name, "__proto_") { env_add_untyped(e, name) }
-      else { env_add(e, name, NCFn) }
-    DType(_, name, _, body, _, _, _, _, _) -> {
-      let e1 = env_add(e, name, NCType)
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> env_add_decl(e, fnid_sym(fid))
+    DType(_, tsym, _, body, _, _, _, _) -> {
+      let e1 = env_add_decl(e, tsym)
       match body {
         TBSum(variants) -> register_variants_env(e1, variants)
         TBAlias(t) -> match t.tkind {
-          TyName(_, head, []) -> env_note_alias_head(e1, head)
+          TyName(r, []) -> env_note_alias_head(e1, type_ref_text(e1, r))
           _ -> e1
         }
         TBEffectAlias(labels) ->
           if list_is_empty(labels) { e1 }
-          else { Env { ...e1, row_aliases: [RA(name, labels), ...e1.row_aliases] } }
+          else { Env { ...e1, row_aliases: [RA(env_sym_text(e1, tsym), map(labels, (l) => settle_label(e1, l))), ...e1.row_aliases] } }
         _ -> e1
       }
     }
@@ -1059,15 +1225,13 @@ fn register_one(e: Env, d: Decl) : Env {
     DBench(_, _, _, _, _) -> e
     DCheck(_, _, _, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
-    DEffect(_, name, _, ops, _, _, _, _, esym) -> {
-      let e1 = env_add(e, name, NCEffect)
-      let id = if sym_raw(esym) >= 0 { esym } else { rs_decl_owner_sym(e.rs, NCEffect, name) }
-      Env { ...e1, eff_ops: [EO(name, id, eff_op_names(ops, [])), ...e1.eff_ops],
-                   eff_spellings: es_note(e1.eff_spellings, name, esym) }
+    DEffect(_, esym, _, ops, _, _, _, _) -> {
+      let e1 = env_add_decl(e, esym)
+      Env { ...e1, eff_ops: [EO(esym, eff_op_names(ops, [])), ...e1.eff_ops] }
     }
     # stripped pre-resolve; never reaches register_one in practice.
     # No-op for completeness so the match stays exhaustive.
-    DProtocol(_, _, _, _, _, _, _, _) -> e
+    DProtocol(_, _, _, _, _, _, _) -> e
     DImpl(_, _, _, _, _, _, _, _) -> e
     DDerive(_, _, _, _) -> e
     DUnstable(_, _, _) -> e
@@ -1078,7 +1242,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DUse(_, _, _) -> e                       # stripped by desugar_use_decls before register_one runs
     DUseKind(_, _, _, _) -> e                # stripped by the kind-resolution pass before register_one runs
     DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name, NCFn)  # also rewritten to DFn by lower_axioms; case kept for completeness
-    DConst(_, name, _, _, _, _, _, _) -> env_add(e, name, NCConst)
+    DConst(_, csym, _, _, _, _, _) -> env_add_decl(e, csym)
     DExternType(name, _, _, _, _) -> env_add(e, name, NCExternType)   # FFI v2: register the foreign type name so its references resolve
     DDoc(_, _, inner, _, _) -> register_one(e, inner)   # register the documented decl
     DAttr(_, inner, _, _) -> register_one(e, inner)
@@ -1092,9 +1256,26 @@ fn register_variants_env(e: Env, vs: [Variant]) : Env {
   match vs {
     [] -> e
     [v, ...rest] -> match v {
-      Var(name, _) -> register_variants_env(env_add_untyped(e, name), rest)
+      Var(csym, _) -> register_variants_env(env_add_decl(e, csym), rest)
     }
   }
+}
+
+# The name an alias's right-hand side spells, for the hint an unbound
+# use of it earns.
+fn type_ref_text(e: Env, r: DeclRef) : String = match r {
+  DrWritten(q, n) -> ref_text(q, n)
+  DrSym(s)        -> written_text(decl_name(e.rs.tab, s))
+}
+
+# A component that names an effect is settled from the alias's own
+# home; one that names another alias stays written.
+fn settle_label(e: Env, l: RowLabel) : RowLabel = match l {
+  RL(DrWritten(q, n), ts) -> {
+    let s = chk_effect_sym(e, DrWritten(q, n))
+    if sym_raw(s) >= 0 { RL(DrSym(s), ts) } else { l }
+  }
+  _ -> l
 }
 
 # For imports we add just the surface name: the last segment of the
@@ -1130,13 +1311,13 @@ fn register_import(e: Env, ik: ImportKind) : Env {
 
 # ---- entry point ----
 
-#[doc("Resolve a program: seed core, pre-register decls, walk them, then fold in row-label, refinement, and unbound-tyvar checks. Each diagnostic names the file that declares the decl it is in. Returns 1 if any check failed.")]
-pub fn check_program(df: DiagFiles, decls: [Decl], target: String) : Int / Console + File =
-  resolve_program(df, decls, target).errs
+#[doc("Resolve a program against `tab`: seed core, pre-register decls, walk them, then fold in row-label, refinement, and unbound-tyvar checks. Each diagnostic names the file that declares the decl it is in. Returns 1 if any check failed.")]
+pub fn check_program(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Int / Console + File =
+  resolve_program_with(df, decls, tab, target).errs
 
-#[doc("Resolve `decls` and hand back the tree with every resolved name stamped, or the original stream when resolution failed.")]
-pub fn resolve_decls(df: DiagFiles, decls: [Decl], target: String) : ResolvedDecls / Console + File {
-  let r = resolve_program(df, decls, target)
+#[doc("Resolve `decls` against `tab` and hand back the tree with every resolved name written as its identity, or the original stream when resolution failed.")]
+pub fn resolve_decls(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : ResolvedDecls / Console + File {
+  let r = resolve_program_with(df, decls, tab, target)
   ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags, params: r.params }
 }
 
@@ -1147,21 +1328,22 @@ pub fn resolve_decls_views(df: DiagFiles, decls: [Decl], views: FileViews,
   ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags, params: r.params }
 }
 
-#[doc("A resolved decl stream: the resolver's error count, the declarations downstream passes consume, the table their stamped ids index, and the diagnostics the walk collected.")]
+#[doc("`resolve_decls_views`: a reference to a core builtin carries its id on every path.")]
+pub fn resolve_decls_stamped(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File =
+  resolve_decls_views(df, decls, views, tab, target, ops)
+
+#[doc("A resolved decl stream: the resolver's error count, the declarations downstream passes consume, the table their ids index, and the diagnostics the walk collected.")]
 pub type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagnostic], params: [ParamIds] }
 
-#[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site recorded against `tab`.")]
+#[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site resolved against `tab`.")]
 pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
   resolve_run(df, decls, rs_on(tab, target), tab, [])
-
-#[doc("Resolve a program against the symbol table its own declarations build.")]
-pub fn resolve_program(df: DiagFiles, decls: [Decl], target: String) : Resolution / Console + File =
-  resolve_program_with(df, decls, st_build(decls, target), target)
 
 #[doc("Resolve a program whose files resolve under `views`: a bare name climbs the file's own imports, picks and cores, not its home alone.")]
 pub fn resolve_program_views(df: DiagFiles, decls: [Decl], views: FileViews,
       tab: SymTab, target: String, ops: [ProtoRung]) : Resolution / Console + File =
-  resolve_run(df, decls, rs_on_views(tab, views, target, kai_unshadowed(core_names(), decls)), tab, ops)
+  resolve_run(df, decls, rs_on_views(tab, views, target, kai_unshadowed(core_names(), decls, tab)), tab, ops)
 
 fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
       ops: [ProtoRung]) : Resolution / Console + File {
@@ -1173,14 +1355,13 @@ fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
   let walked = chk_decls_files(e2, decls, df, target)
   let e3 = rds_env(walked)
   let out = rds_decls(walked)
-  let eff_names = collect_effect_names(decls)
   let arities = collect_effect_arities(decls)
-  let checks = list_append(check_row_labels(decls, df, eff_names, arities), check_unbound_tyvars(decls, df))
+  let checks = list_append(check_row_labels(decls, df, tab, arities), check_unbound_tyvars(decls, df, tab))
   Resolution { errs: if e3.had_error or checks != [] { 1 } else { 0 },
                decls: out, tab: tab, diags: list_append(finalize_diags(e3.diags), checks), params: e3.params }
 }
 
-#[doc("What a resolver run produced: the error count `check_program` reports, the declarations with every resolved name stamped, the table those ids index, and the diagnostics the walk collected. A consumer holding a stamped id resolves it here rather than deciding the name again.")]
+#[doc("What a resolver run produced: the error count `check_program` reports, the declarations with every resolved name written as its identity, the table those ids index, and the diagnostics the walk collected.")]
 pub type Resolution = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagnostic], params: [ParamIds] }
 
 #[doc("The env a decl walk ended in.")]
@@ -1217,27 +1398,24 @@ fn env_with_file(e: Env, file: String) : Env =
 # effect a row can name is here; effect aliases (`Console`) expand to
 # their atomic labels before the row-label check, so they need no
 # entry of their own.
-type EffArity = EA(String, Int)
+type EffArity = EA(SymId, Int)
 
-fn collect_effect_arities(decls: [Decl]) : [EffArity] =
-  collect_effect_arities_loop(decls)
-
-fn collect_effect_arities_loop(decls: [Decl]) : [EffArity] {
+fn collect_effect_arities(decls: [Decl]) : [EffArity] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, tparams, _, _, _, _, _, _) ->
-        [EA(name, list_length(tparams)), ...collect_effect_arities_loop(rest)]
-      _ -> collect_effect_arities_loop(rest)
+      DEffect(_, esym, tparams, _, _, _, _, _) ->
+        [EA(esym, list_length(tparams)), ...collect_effect_arities(rest)]
+      _ -> collect_effect_arities(rest)
     }
   }
 }
 
-fn lookup_arity(arities: [EffArity], target: String) : Option[Int] {
+fn lookup_arity(arities: [EffArity], target: SymId) : Option[Int] {
   match arities {
     [] -> None
     [a, ...rest] -> match a {
-      EA(n, k) -> if n == target { Some(k) } else { lookup_arity(rest, target) }
+      EA(s, k) -> if sym_raw(s) == sym_raw(target) { Some(k) } else { lookup_arity(rest, target) }
     }
   }
 }
@@ -1246,114 +1424,103 @@ fn lookup_arity(arities: [EffArity], target: String) : Option[Int] {
 # Every label that appears in a `T / Eff + ...` suffix must refer to
 # a declared effect. Anything else is a compile error.
 
-#[doc("All declared effect names in the program (every DEffect's name).")]
-pub fn collect_effect_names(decls: [Decl]) : [String] {
+#[doc("Every declared effect of the program (every DEffect's id).")]
+pub fn collect_effect_ids(decls: [Decl]) : [SymId] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, _, _, _, _, _, _) -> [name, ...collect_effect_names(rest)]
-      _ -> collect_effect_names(rest)
+      DEffect(_, esym, _, _, _, _, _, _) -> [esym, ...collect_effect_ids(rest)]
+      _ -> collect_effect_ids(rest)
     }
   }
 }
 
-# Look up the in-scope decl for an effect by name and return its
-# op-name list. None if no DEffect with that name is present.
-fn lookup_effect_op_names(decls: [Decl], name: String) : Option[[String]] {
-  match decls {
-    [] -> None
-    [d, ...rest] -> match d {
-      DEffect(_, dname, _, ops, _, _, _, _, _) ->
-        if dname == name { Some(effect_op_names(ops)) }
-        else { lookup_effect_op_names(rest, name) }
-      _ -> lookup_effect_op_names(rest, name)
-    }
-  }
-}
-
-fn effect_op_names(ops: [EffectOp]) : [String] {
-  match ops {
-    [] -> []
-    [o, ...rest] -> match o {
-      EOp(n, _, _, _, _, _) -> [n, ...effect_op_names(rest)]
-    }
-  }
-}
-
-fn check_row_labels(decls: [Decl], df: DiagFiles, eff_names: [String],
+fn check_row_labels(decls: [Decl], df: DiagFiles, tab: SymTab,
                      arities: [EffArity]) : [Diagnostic] / Console + File {
-
-
   match decls {
     [] -> []
     [d, ...rest] ->
-      list_append(check_decl_row_labels(d, decl_diag_file(d, df), eff_names, arities),
-                  check_row_labels(rest, df, eff_names, arities))
+      list_append(check_decl_row_labels(d, decl_diag_file(d, df), tab, arities),
+                  check_row_labels(rest, df, tab, arities))
   }
 }
 
-fn check_decl_row_labels(d: Decl, file: String, eff_names: [String],
+fn check_decl_row_labels(d: Decl, file: String, tab: SymTab,
                           arities: [EffArity]) : [Diagnostic] / Console + File {
-
-
   match d {
-    DFn(_, _, _, _, _, rexpr, _, line, col, _, _) ->
-      check_row_expr(rexpr, file, line, col, eff_names, arities)
+    DFn(_, _, _, _, _, rexpr, _, line, col, _) ->
+      check_row_expr(rexpr, file, line, col, tab, arities)
     _ -> []
   }
 }
 
 fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
-                   eff_names: [String], arities: [EffArity]) : [Diagnostic] / Console + File {
-
-
+                   tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
   match re {
     REmpty -> []
-    RClosed(labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
+    RClosed(labels) -> check_row_labels_loop(labels, file, line, col, tab, arities)
     # row variables in tail position carry the same labels;
     # apply the same name + arity check.
-    ROpen(_, labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
+    ROpen(_, labels) -> check_row_labels_loop(labels, file, line, col, tab, arities)
   }
+}
+
+fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
+                          tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  match labels {
+    [] -> []
+    [RL(r, ts), ...rest] ->
+      list_append(check_row_label(r, list_length(ts), file, line, col, tab, arities),
+                  check_row_labels_loop(rest, file, line, col, tab, arities))
+  }
+}
+
+# The arity of the effect a label names: its declaration's when the label
+# is settled, else that of the first effect declared under the name it
+# writes. `None` when no effect is declared for it.
+fn label_arity(tab: SymTab, arities: [EffArity], r: DeclRef) : Option[Int] = match r {
+  DrSym(s)              -> lookup_arity(arities, s)
+  DrWritten(None, n)    -> first_arity(arities, st_candidates(tab, NCEffect, written_text(n)))
+  DrWritten(Some(_), _) -> None
+}
+
+fn first_arity(arities: [EffArity], cands: [SymId]) : Option[Int] = match cands {
+  [] -> None
+  [s, ...rest] -> match lookup_arity(arities, s) {
+    Some(k) -> Some(k)
+    None    -> first_arity(arities, rest)
+  }
+}
+
+fn label_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(q, n) -> ref_text(q, n)
 }
 
 # Per-label name + arity check. Unknown effect → "unknown effect: X".
 # Arity mismatch → "effect 'X' expects N type argument(s), got M".
-fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
-                          eff_names: [String], arities: [EffArity]) : [Diagnostic] / Console + File {
-
-
-  match labels {
-    [] -> []
-    [l, ...rest] -> match l {
-      RL(name, ts, _) -> {
-        let got = list_length(ts)
-        let here =
-          if not list_has(eff_names, name) {
-            rs_report(mk_diag(SevError, file, line, col, "unknown effect: #{name}",
-              [ri_note(file, line, col, "only declared `effect Foo { ... }` names and the catalog (Console, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row"),
-               ri_help(file, line, col, "declare `effect #{name} { ... }` first, or fix the spelling")]))
+fn check_row_label(r: DeclRef, got: Int, file: String, line: Int, col: Int,
+                    tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  let name = label_text(tab, r)
+  match label_arity(tab, arities, r) {
+    None ->
+      rs_report(mk_diag(SevError, file, line, col, "unknown effect: #{name}",
+        [ri_note(file, line, col, "only declared `effect Foo { ... }` names and the catalog (Console, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row"),
+         ri_help(file, line, col, "declare `effect #{name} { ... }` first, or fix the spelling")]))
+    Some(want) ->
+      if want == got { [] }
+      else {
+        let help = if got > want {
+            concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
           } else {
-            match lookup_arity(arities, name) {
-              None -> []     # declared without arity — should not happen given collect_effect_arities covers all
-              Some(want) ->
-                if want == got { [] }
-                else {
-                  let help = if got > want {
-                      concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
-                    } else {
-                      concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
-                    }
-                  rs_report(mk_diag(SevError, file, line, col,
-                    concat_all(["effect '", name, "' expects ", int_to_string(want),
-                                " type argument(s), got ", int_to_string(got)]),
-                    [ri_note(file, line, col, "the parametric label must match the effect's `[...]` declaration"),
-                     ri_help(file, line, col, help)]))
-                }
-            }
+            concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
           }
-        list_append(here, check_row_labels_loop(rest, file, line, col, eff_names, arities))
+        rs_report(mk_diag(SevError, file, line, col,
+          concat_all(["effect '", name, "' expects ", int_to_string(want),
+                      " type argument(s), got ", int_to_string(got)]),
+          [ri_note(file, line, col, "the parametric label must match the effect's `[...]` declaration"),
+           ri_help(file, line, col, help)]))
       }
-    }
   }
 }
 
@@ -1396,9 +1563,13 @@ fn lc_add(names: [String], name: String) : [String] {
 
 fn collect_tyvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
   match t.tkind {
-    TyName(_, name, tas) -> {
+    # A type variable is never a declaration, so it is always written.
+    TyName(r, tas) -> {
       let acc1 = collect_tyvars_in_typeexprs(tas, acc)
-      if is_lc_tyvar_name(name) { lc_add(acc1, name) } else { acc1 }
+      match r {
+        DrWritten(None, n) -> if is_lc_tyvar_name(written_text(n)) { lc_add(acc1, written_text(n)) } else { acc1 }
+        _                  -> acc1
+      }
     }
     TyList(inner) -> collect_tyvars_in_typeexpr(inner, acc)
     TyFn(ps, ret, rexpr) -> {
@@ -1439,7 +1610,7 @@ fn collect_tyvars_in_row_labels(labels: [RowLabel], acc: [String]) : [String] {
   match labels {
     [] -> acc
     [l, ...rest] -> match l {
-      RL(_, tas, _) -> collect_tyvars_in_row_labels(rest, collect_tyvars_in_typeexprs(tas, acc))
+      RL(_, tas) -> collect_tyvars_in_row_labels(rest, collect_tyvars_in_typeexprs(tas, acc))
     }
   }
 }
@@ -1452,11 +1623,11 @@ fn collect_tyvars_in_row(re: RowExpr, acc: [String]) : [String] {
   }
 }
 
-fn check_unbound_tyvars(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console + File {
+fn check_unbound_tyvars(decls: [Decl], df: DiagFiles, tab: SymTab) : [Diagnostic] / Console + File {
   match decls {
     [] -> []
     [d, ...rest] ->
-      list_append(check_decl_unbound_tyvars(d, decl_diag_file(d, df)), check_unbound_tyvars(rest, df))
+      list_append(check_decl_unbound_tyvars(d, decl_diag_file(d, df), tab), check_unbound_tyvars(rest, df, tab))
   }
 }
 
@@ -1471,9 +1642,10 @@ fn is_compiler_synth_name(n: String) : Bool {
   } }
 }
 
-fn check_decl_unbound_tyvars(d: Decl, file: String) : [Diagnostic] / Console + File {
+fn check_decl_unbound_tyvars(d: Decl, file: String, tab: SymTab) : [Diagnostic] / Console + File {
   match d {
-    DFn(_, fname, declared, params, opt_ret, rexpr, _, line, col, _, _) -> {
+    DFn(_, fid, declared, params, opt_ret, rexpr, _, line, col, _) -> {
+      let fname = written_text(sym_name(tab, fnid_sym(fid)))
       # Synthetic compiler-generated fns (`__proto_*`, `__deriv_*`,
       # etc.) come from desugar and may legitimately have tyvars in
       # return-only position by construction (protocol `Self` lives

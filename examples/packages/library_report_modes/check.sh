@@ -117,4 +117,13 @@ bad_run bare lint . >/dev/null
 out="$(ok_run lib typecheck ops.kai)"
 missing "does not exist" "$out" "'kai typecheck <file>' regressed"
 
+# 9 — a private `main` nothing calls is dead code in a module, and says
+# why; the same file linted as the root keeps it: there it is the entry point.
+printf 'pub fn zero() : Int = 0\n\nfn main() : Int = 1\n' > "$TMP/app/util.kai"
+out="$(ok_run app lint main.kai)"
+saw "util.kai:3:1: warning: private function \`main\` is never used.*this file is imported here" "$out" "'kai lint <file>' did not report a module's unused private main"
+missing "main.kai:3:1: warning: private function \`main\`" "$out" "'kai lint <file>' reported the root's own main as dead code"
+out="$(ok_run app lint util.kai)"
+missing "private function \`main\`" "$out" "'kai lint <file>' reported a root file's main as dead code"
+
 echo "library_report_modes: ok"

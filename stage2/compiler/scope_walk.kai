@@ -1,34 +1,32 @@
 # compiler/scope_walk.kai — the scope-aware expression rewrite the
-# name-scoping passes share. `sh` accumulates the lexically bound
-# names; a pass decides what a free name means through `lf`, which
-# sees every `EVar` / `EField` node and either replaces it whole or
-# yields to the generic descent. `tyf` rewrites each annotation the
-# walk crosses and `hdf` each handler head.
+# name-scoping passes share. It runs before the resolver, so `sh`
+# accumulates the lexically bound names as written; a pass decides what
+# a free name means through `lf`, which sees every `EName` / `EField`
+# node and either replaces it whole or yields to the generic descent.
+# `tyf` rewrites each annotation the walk crosses and `hdf` each handler
+# head.
 
 import compiler.ast
-import compiler.modules
 import compiler.util
+import compiler.written
 
 #[doc("Names bound by a param list, prepended onto `acc`.")]
 pub fn sw_params(ps: [Param], acc: [String]) : [String] = match ps {
   [] -> acc
-  [p, ...rest] -> sw_params(rest, [p.pname, ...acc])
+  [p, ...rest] -> sw_params(rest, [written_text(p.binder.name), ...acc])
 }
 
 fn sw_re(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-#[doc("A handler head after a walk: the effect name it spells and the declaration it names.")]
-pub type SwHead = SwHead(String, SymId)
-
 #[doc("The head hook that leaves a handler head as it was.")]
-pub fn sw_head_same(n: String, s: SymId) : SwHead = SwHead(n, s)
+pub fn sw_head_same(r: DeclRef) : DeclRef = r
 
-#[doc("Rewrite one expression; `sh` holds the names already bound in scope. `lf` answers for a free `EVar`/`EField` (None = descend), `tyf` maps each annotation, `hdf` each `with E` head.")]
+#[doc("Rewrite one expression; `sh` holds the names already bound in scope. `lf` answers for a free `EName`/`EField` (None = descend), `tyf` maps each annotation, `hdf` each `with E` head.")]
 pub fn sw_expr(e: Expr, sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : Expr = match e.kind {
-  EVar(_) -> match lf(e, sh) { Some(r) -> r  None -> e }
-  ESym(_, _, _) -> match lf(e, sh) { Some(r) -> r  None -> e }
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Expr = match e.kind {
+  EName(_) -> match lf(e, sh) { Some(r) -> r  None -> e }
+  ESym(_, _) -> match lf(e, sh) { Some(r) -> r  None -> e }
   EField(obj, f) -> match lf(e, sh) {
     Some(r) -> r
     None -> sw_re(e, EField(sw_expr(obj, sh, lf, tyf, hdf), f))
@@ -47,8 +45,8 @@ pub fn sw_expr(e: Expr, sh: [String], lf: (Expr, [String]) -> Option[Expr],
   ELambda(ps, body) ->
     sw_re(e, ELambda(sw_typed_params(ps, tyf),
                      sw_expr(body, sw_params(ps, sh), lf, tyf, hdf)))
-  ERecordLit(rh, n, fis) ->
-    sw_re(e, ERecordLit(rh, sw_ref_name(rh, n, e.line, e.col, tyf), sw_fis(fis, sh, lf, tyf, hdf)))
+  ERecordLit(r, fis) ->
+    sw_re(e, ERecordLit(sw_type_ref(r, e.line, e.col, tyf), sw_fis(fis, sh, lf, tyf, hdf)))
   EVariantsOf(t, ns) -> sw_re(e, EVariantsOf(tyf(t), ns))
   EList(els) -> sw_re(e, EList(sw_elems(els, sh, lf, tyf, hdf)))
   ERange(a, b, stp) ->
@@ -66,35 +64,33 @@ pub fn sw_expr(e: Expr, sh: [String], lf: (Expr, [String]) -> Option[Expr],
     sw_re(e, EFilterPipe(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf)))
   EBang(x) -> sw_re(e, EBang(sw_expr(x, sh, lf, tyf, hdf)))
   ELitUnit(x, u) -> sw_re(e, ELitUnit(sw_expr(x, sh, lf, tyf, hdf), u))
-  EHandle(body, eff, hs, tas, init, alias, hcs, ret) -> {
-    let shb = match alias { Some(a) -> [a, ...sh]  None -> sh }
-    match hdf(eff, hs) {
-      SwHead(eff1, hs1) ->
-        sw_re(e, EHandle(sw_expr(body, shb, lf, tyf, hdf), eff1, hs1, map(tas, tyf),
-                         sw_expr_opt(init, sh, lf, tyf, hdf), alias,
-                         sw_hclauses(hcs, sh, lf, tyf, hdf),
-                         sw_hreturn_opt(ret, sh, lf, tyf, hdf)))
-    }
+  EHandle(body, eff, tas, init, alias, hcs, ret) -> {
+    let shb = match alias { Some(a) -> [written_text(a.name), ...sh]  None -> sh }
+    sw_re(e, EHandle(sw_expr(body, shb, lf, tyf, hdf), hdf(eff), map(tas, tyf),
+                     sw_expr_opt(init, sh, lf, tyf, hdf), alias,
+                     sw_hclauses(hcs, sh, lf, tyf, hdf),
+                     sw_hreturn_opt(ret, sh, lf, tyf, hdf)))
   }
   EIntrinsic(n, args_) -> sw_re(e, EIntrinsic(n, sw_exprs(args_, sh, lf, tyf, hdf)))
   _ -> e
 }
 
-# A name already resolved to its declaration keeps its spelling.
-fn sw_ref_name(r: TyRef, n: String, l: Int, c: Int, tyf: (TypeExpr) -> TypeExpr) : String =
-  if sym_raw(ty_ref_sym(r)) >= 0 { n } else { sw_type_name(n, l, c, tyf) }
-
-# A record literal names its type; the annotation hook sees it as one.
-fn sw_type_name(n: String, l: Int, c: Int, tyf: (TypeExpr) -> TypeExpr) : String = {
-  let t = tyf(TypeExpr { tkind: TyName(ty_ref_none(), n, []), line: l, col: c })
-  match t.tkind {
-    TyName(_, n1, _) -> n1
-    _ -> n
+# A record literal names its type; the annotation hook sees a reference
+# still written as one, and what it hands back is the reference. One
+# already resolved to its declaration is left alone.
+fn sw_type_ref(r: DeclRef, l: Int, c: Int, tyf: (TypeExpr) -> TypeExpr) : DeclRef = match r {
+  DrSym(_)        -> r
+  DrWritten(_, _) -> {
+    let t = tyf(TypeExpr { tkind: TyName(r, []), line: l, col: c })
+    match t.tkind {
+      TyName(r1, _) -> r1
+      _ -> r
+    }
   }
 }
 
 fn sw_typed_params(ps: [Param], tyf: (TypeExpr) -> TypeExpr) : [Param] =
-  map(ps, (p) => Param { pname: p.pname, ptype: sw_ty_opt(p.ptype, tyf),
+  map(ps, (p) => Param { binder: p.binder, ptype: sw_ty_opt(p.ptype, tyf),
                          pline: p.pline, pcol: p.pcol, pborrow: p.pborrow })
 
 fn sw_ty_opt(o: Option[TypeExpr], tyf: (TypeExpr) -> TypeExpr) : Option[TypeExpr] = match o {
@@ -103,26 +99,26 @@ fn sw_ty_opt(o: Option[TypeExpr], tyf: (TypeExpr) -> TypeExpr) : Option[TypeExpr
 }
 
 fn sw_exprs(es: [Expr], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : [Expr] = match es {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [Expr] = match es {
   [] -> []
   [x, ...rest] -> [sw_expr(x, sh, lf, tyf, hdf), ...sw_exprs(rest, sh, lf, tyf, hdf)]
 }
 
 fn sw_expr_opt(o: Option[Expr], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : Option[Expr] = match o {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Option[Expr] = match o {
   None -> None
   Some(x) -> Some(sw_expr(x, sh, lf, tyf, hdf))
 }
 
 fn sw_fis(fis: [FieldInit], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : [FieldInit] = match fis {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [FieldInit] = match fis {
   [] -> []
   [FI(f, x), ...rest] ->
     [FI(f, sw_expr(x, sh, lf, tyf, hdf)), ...sw_fis(rest, sh, lf, tyf, hdf)]
 }
 
 fn sw_elems(els: [ListElem], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : [ListElem] = match els {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [ListElem] = match els {
   [] -> []
   [el, ...rest] -> {
     let el1 = match el {
@@ -134,10 +130,10 @@ fn sw_elems(els: [ListElem], sh: [String], lf: (Expr, [String]) -> Option[Expr],
 }
 
 fn sw_arms(arms: [Arm], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : [Arm] = match arms {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [Arm] = match arms {
   [] -> []
   [Arm(p, g, body), ...rest] -> {
-    let shb = pat_binders(p, sh)
+    let shb = sw_pat_names(p, sh)
     [Arm(sw_pat(p, tyf), sw_expr_opt(g, shb, lf, tyf, hdf), sw_expr(body, shb, lf, tyf, hdf)),
      ...sw_arms(rest, sh, lf, tyf, hdf)]
   }
@@ -145,21 +141,15 @@ fn sw_arms(arms: [Arm], sh: [String], lf: (Expr, [String]) -> Option[Expr],
 
 # A narrowing pattern names a type, and so does the head of a
 # record-shaped ctor pattern whenever that head is a record alias
-# (`P { x: a }` over `type P = { x: Int }`) — the scrutinee's type
-# respells with its declaration, so the head must follow or the arm
-# tests a name nothing is spelled by any more. A head that respells
-# carries its module in the spelling, so the written home has nothing
-# left to disambiguate and is dropped; a head that does not respell
-# is a real sum-type ctor and keeps both.
+# (`P { x: a }` over `type P = { x: Int }`): the head goes through the
+# annotation hook with the qualifier it was written with, so `m.P { ... }`
+# picks `m`'s declaration exactly as `m.P` does in type position. A head
+# the hook leaves as written is a sum-type ctor.
 fn sw_pat(p: Pattern, tyf: (TypeExpr) -> TypeExpr) : Pattern = {
   let k = match p.pkind {
     PNarrow(n, t) -> PNarrow(n, tyf(t))
-    PVariant(h, n, subs) -> PVariant(h, n, map(subs, (x) => sw_pat(x, tyf)))
-    PVariantRecord(home, n, fs) -> {
-      let spelled = if sym_raw(ty_ref_sym(home)) >= 0 { n } else { sw_ctor_head(ty_ref_qual(home), n, p.line, p.col, tyf) }
-      let home1 = if spelled == n { home } else { ty_ref_decl(ty_ref_sym(home)) }
-      PVariantRecord(home1, spelled, sw_pfields(fs, tyf))
-    }
+    PVariant(r, subs) -> PVariant(r, map(subs, (x) => sw_pat(x, tyf)))
+    PVariantRecord(r, fs) -> PVariantRecord(sw_type_ref(r, p.line, p.col, tyf), sw_pfields(fs, tyf))
     PRecord(fs) -> PRecord(sw_pfields(fs, tyf))
     PList(subs, rest) -> PList(map(subs, (x) => sw_pat(x, tyf)), rest)
     PAs(n, inner) -> PAs(n, sw_pat(inner, tyf))
@@ -170,17 +160,30 @@ fn sw_pat(p: Pattern, tyf: (TypeExpr) -> TypeExpr) : Pattern = {
   Pattern { pkind: k, line: p.line, col: p.col }
 }
 
-# The written home is folded into the dotted spelling `tyf` already
-# understands, so `m.P { ... }` picks `m`'s declaration exactly as
-# `m.P` does in type position.
-fn sw_ctor_head(home: Option[String], n: String, l: Int, c: Int,
-      tyf: (TypeExpr) -> TypeExpr) : String = match home {
-  None -> sw_type_name(n, l, c, tyf)
-  Some(m) -> {
-    let dotted = cat3(m, ".", n)
-    let spelled = sw_type_name(dotted, l, c, tyf)
-    if spelled == dotted { n } else { spelled }
+# The names a pattern binds, as written, prepended onto `acc`.
+fn sw_pat_names(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PBind(b)              -> [written_text(b.name), ...acc]
+  PAs(b, inner)         -> sw_pat_names(inner, [written_text(b.name), ...acc])
+  PNarrow(b, _)         -> [written_text(b.name), ...acc]
+  PList(subs, rest)     -> {
+    let acc1 = sw_pats_names(subs, acc)
+    match rest { Some(b) -> [written_text(b.name), ...acc1]  None -> acc1 }
   }
+  PVariant(_, subs)     -> sw_pats_names(subs, acc)
+  PVariantRecord(_, fs) -> sw_pfield_names(fs, acc)
+  PRecord(fs)           -> sw_pfield_names(fs, acc)
+  PSurface(sp)          -> sw_pats_names(patsurface_children(sp), acc)
+  _                     -> acc
+}
+
+fn sw_pats_names(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> sw_pats_names(rest, sw_pat_names(p, acc))
+}
+
+fn sw_pfield_names(fs: [PField], acc: [String]) : [String] = match fs {
+  []                           -> acc
+  [PField(_, sub, _), ...rest] -> sw_pfield_names(rest, sw_pat_names(sub, acc))
 }
 
 fn sw_pfields(fs: [PField], tyf: (TypeExpr) -> TypeExpr) : [PField] = match fs {
@@ -190,7 +193,7 @@ fn sw_pfields(fs: [PField], tyf: (TypeExpr) -> TypeExpr) : [PField] = match fs {
 
 #[doc("Rewrite the bodies of a handler-clause list; each clause binds its op params and `resume`.")]
 pub fn sw_hclauses(hcs: [HClause], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : [HClause] = match hcs {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [HClause] = match hcs {
   [] -> []
   [HC(op, ps, body, l, c), ...rest] -> {
     let shc = ["resume", ...sw_params(ps, sh)]
@@ -201,9 +204,9 @@ pub fn sw_hclauses(hcs: [HClause], sh: [String], lf: (Expr, [String]) -> Option[
 
 #[doc("Rewrite a handler `return(x)` clause body; `x` is bound inside it.")]
 pub fn sw_hreturn_opt(o: Option[HReturn], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : Option[HReturn] = match o {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Option[HReturn] = match o {
   None -> None
-  Some(HR(x, body, l, c)) -> Some(HR(x, sw_expr(body, [x, ...sh], lf, tyf, hdf), l, c))
+  Some(HR(x, body, l, c)) -> Some(HR(x, sw_expr(body, [written_text(x.name), ...sh], lf, tyf, hdf), l, c))
 }
 
 # A statement list threads its binders forward: a `let` / `var` name
@@ -211,14 +214,14 @@ pub fn sw_hreturn_opt(o: Option[HReturn], sh: [String], lf: (Expr, [String]) -> 
 type SwStmts = SWS([Stmt], [String])
 
 fn sw_stmts(ss: [Stmt], sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead, acc: [Stmt]) : SwStmts = match ss {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef, acc: [Stmt]) : SwStmts = match ss {
   [] -> SWS(list_reverse(acc), sh)
   [s, ...rest] ->
     sw_stmts(rest, sw_stmt_binders(s, sh), lf, tyf, hdf, [sw_stmt(s, sh, lf, tyf, hdf), ...acc])
 }
 
 fn sw_stmt(s: Stmt, sh: [String], lf: (Expr, [String]) -> Option[Expr],
-      tyf: (TypeExpr) -> TypeExpr, hdf: (String, SymId) -> SwHead) : Stmt = match s {
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Stmt = match s {
   SLet(p, t, x) -> SLet(sw_pat(p, tyf), sw_ty_opt(t, tyf), sw_expr(x, sh, lf, tyf, hdf))
   SAssert(x, mo) -> SAssert(sw_expr(x, sh, lf, tyf, hdf), sw_expr_opt(mo, sh, lf, tyf, hdf))
   SExprStmt(x) -> SExprStmt(sw_expr(x, sh, lf, tyf, hdf))
@@ -227,11 +230,19 @@ fn sw_stmt(s: Stmt, sh: [String], lf: (Expr, [String]) -> Option[Expr],
                  sw_expr(c, sh, lf, tyf, hdf), l, cc)
   SAssign(a, b, l, c) -> SAssign(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf), l, c)
   SVar(n, t, x, l, c) -> SVar(n, sw_ty_opt(t, tyf), sw_expr(x, sh, lf, tyf, hdf), l, c)
-  SUse(n, l, c) -> match hdf(n, sym_none()) { SwHead(n1, _) -> SUse(n1, l, c) }
+  SUse(n, l, c) -> SUse(sw_use_name(hdf(ref_written(n)), n), l, c)
+}
+
+# A `use` names its effect in text; a head the hook settled keeps the
+# name the source wrote.
+fn sw_use_name(r: DeclRef, n: String) : String = match r {
+  DrWritten(None, w)    -> written_text(w)
+  DrWritten(Some(q), w) -> cat3(written_text(q), ".", written_text(w))
+  DrSym(_)              -> n
 }
 
 fn sw_stmt_binders(s: Stmt, sh: [String]) : [String] = match s {
-  SLet(p, _, _)       -> pat_binders(p, sh)
-  SVar(n, _, _, _, _) -> [n, ...sh]
+  SLet(p, _, _)       -> sw_pat_names(p, sh)
+  SVar(n, _, _, _, _) -> [written_text(n.name), ...sh]
   _ -> sh
 }

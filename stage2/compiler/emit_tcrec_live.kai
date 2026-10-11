@@ -7,106 +7,154 @@ of every enclosing match statement-expression, skipping their trailing
 bind-increfs. The emit threads a ledger of those pending releases down
 to the goto site, which emits them just before the jump.
 
-Ledger entries are strings: `@scr:<cvar>` names a C alias of an
-enclosing owned match scrutinee (always released at the goto); `@tok:`
-is an arm-top reuse token a goto out of its arm frees, null-safely, since
-the arm's own free runs after the arm; any other entry is a kaikai
-pattern-binder name whose bind-incref is released at the goto unless the
+A scrutinee entry names a C alias of an enclosing owned match scrutinee
+(always released at the goto); the token entry is an arm-top reuse token
+a goto out of its arm frees, null-safely, since the arm's own free runs
+after the arm; an unwind entry is a push the goto pops; a binder entry
+is a pattern binder whose bind-incref is released at the goto unless the
 goto path already consumed it.
 
 Consumption is judged syntactically over the post-perceus AST: a bare
-`EVar(name)` read transfers the binding's ref (Perceus discipline), a
-`__perceus_dup(name)` or `__perceus_borrow(name)` wrap does not, and
-neither does a lambda capture — building the closure increfs each
-capture. The scan is otherwise conservative — any mention that MIGHT
-consume (interpolation span, either branch of an already-evaluated
-conditional) counts as consumed, so a stale entry can only
-under-release (a bounded leak), never over-release (a double-free).
+read of the binder transfers the binding's ref (Perceus discipline), a
+`__perceus_dup` or `__perceus_borrow` wrap does not, and neither does a
+lambda capture — building the closure increfs each capture. The scan is
+otherwise conservative — any mention that MIGHT consume (either branch
+of an already-evaluated conditional) counts as consumed, so a stale entry
+can only under-release (a bounded leak), never over-release (a
+double-free).
 """)]
 
 import compiler.ast
+import compiler.written
+import compiler.local_names
 import compiler.expr_positions
 import compiler.expr_exists
 import compiler.util
 import compiler.modules
 import compiler.emit_shared
 
+#[doc("A pending release: an owned-scrutinee C alias, the arm-top reuse token, an unwind-stack push under a fiber local, or a pattern binder's bind-incref.")]
+pub type TclEntry = TclScr(String) | TclTok | TclUnw(String) | TclBinder(LocalId)
+
 #[doc("Ledger entry for an owned-scrutinee C alias `cvar`.")]
-pub fn tcl_scr_entry(cvar: String) : String = cat2("@scr:", cvar)
+pub fn tcl_scr_entry(cvar: String) : TclEntry = TclScr(cvar)
 
 #[doc("True when a ledger entry names a scrutinee alias (never filtered).")]
-pub fn tcl_is_scr(e: String) : Bool = tcl_tagged(e, 115)
+pub fn tcl_is_scr(e: TclEntry) : Bool = match e {
+  TclScr(_) -> true
+  _         -> false
+}
 
 #[doc("Ledger entry for the arm-top reuse token `_arm_ru`: the goto frees it when still held.")]
-pub fn tcl_tok_entry() : String = "@tok:_arm_ru"
+pub fn tcl_tok_entry() : TclEntry = TclTok
 
 #[doc("True when a ledger entry is the arm-top reuse token (never filtered).")]
-pub fn tcl_is_tok(e: String) : Bool = tcl_tagged(e, 116)
+pub fn tcl_is_tok(e: TclEntry) : Bool = match e {
+  TclTok -> true
+  _      -> false
+}
 
 #[doc("`pend` without the token entry: a TRMC step or apply consumes or frees the token itself.")]
-pub fn tcl_without_tok(pend: [String]) : [String] = filter(pend, (p) => not tcl_is_tok(p))
+pub fn tcl_without_tok(pend: [TclEntry]) : [TclEntry] = filter(pend, (p) => not tcl_is_tok(p))
 
 # Scrutinee, unwind and token entries are released by every jump, never filtered.
-fn tcl_pinned(e: String) : Bool = tcl_is_scr(e) or tcl_is_unw(e) or tcl_is_tok(e)
+fn tcl_pinned(e: TclEntry) : Bool = match e {
+  TclBinder(_) -> false
+  _            -> true
+}
 
 #[doc("Ledger entry for an unwind-stack push under fiber local `f`: the goto pops it.")]
-pub fn tcl_unw_entry(f: String) : String = cat2("@unw:", f)
+pub fn tcl_unw_entry(f: String) : TclEntry = TclUnw(f)
 
 #[doc("`pend` holding the temp `t` registered under fiber local `f`: a jump pops the registration and releases the temp.")]
-pub fn tcl_hold(pend: [String], f: String, t: String) : [String] = list_append(pend, [tcl_unw_entry(f), tcl_scr_entry(t)])
+pub fn tcl_hold(pend: [TclEntry], f: String, t: String) : [TclEntry] = list_append(pend, [tcl_unw_entry(f), tcl_scr_entry(t)])
 
 #[doc("`pend` without what `tcl_hold` added for `f` and `t`.")]
-pub fn tcl_unhold(pend: [String], f: String, t: String) : [String] = tcl_remove(tcl_drop_unw(pend, f), tcl_scr_entry(t))
+pub fn tcl_unhold(pend: [TclEntry], f: String, t: String) : [TclEntry] = tcl_remove(tcl_drop_unw(pend, f), tcl_scr_entry(t))
 
 #[doc("True when a ledger entry is an unwind-stack push (never filtered).")]
-pub fn tcl_is_unw(e: String) : Bool = tcl_tagged(e, 117)
+pub fn tcl_is_unw(e: TclEntry) : Bool = match e {
+  TclUnw(_) -> true
+  _         -> false
+}
 
-# `@?..:` with `?` the byte `b`: a binder never starts with `@`.
-fn tcl_tagged(e: String, b: Int) : Bool =
-  string_byte_at_int(e, 0) == 64 and string_byte_at_int(e, 1) == b and string_byte_at_int(e, 4) == 58
-
-#[doc("The fiber local an unwind ledger entry pops through.")]
-pub fn tcl_unw_reg(e: String) : String = string_slice(e, 5, string_length(e) - 5)
+#[doc("The fiber local an unwind ledger entry pops through; empty for any other entry.")]
+pub fn tcl_unw_reg(e: TclEntry) : String = match e {
+  TclUnw(f) -> f
+  _         -> ""
+}
 
 #[doc("`pend` without the unwind entry for `f`.")]
-pub fn tcl_drop_unw(pend: [String], f: String) : [String] = tcl_remove(pend, tcl_unw_entry(f))
+pub fn tcl_drop_unw(pend: [TclEntry], f: String) : [TclEntry] = tcl_remove(pend, tcl_unw_entry(f))
 
-#[doc("The bare name a ledger entry releases: the scrutinee register, or the binder name.")]
-pub fn tcl_reg(e: String) : String =
-  if tcl_is_scr(e) { string_slice(e, 5, string_length(e) - 5) } else { e }
+#[doc("The register a scrutinee entry releases; empty for any other entry.")]
+pub fn tcl_reg(e: TclEntry) : String = match e {
+  TclScr(r) -> r
+  _         -> ""
+}
 
-#[doc("The C lvalue a ledger entry releases: the alias itself, or `kaiv_<binder>`.")]
-pub fn tcl_cname(e: String) : String =
-  if tcl_is_scr(e) { tcl_reg(e) } else { c_local(e) }
+#[doc("The binder a binder entry releases; `local_none()` for any other entry.")]
+pub fn tcl_local(e: TclEntry) : LocalId = match e {
+  TclBinder(l) -> l
+  _            -> local_none()
+}
+
+#[doc("The C lvalue a ledger entry releases: the alias itself, or the binder's local as `ns` names it.")]
+pub fn tcl_cname(ns: LocalNames, e: TclEntry) : String = match e {
+  TclBinder(l) -> c_local(written_text(ln_text(ns, l)))
+  _            -> tcl_reg(e)
+}
 
 #[doc("Number of scrutinee-alias entries in the ledger — the next alias suffix.")]
-pub fn tcl_scr_count(pend: [String]) : Int = tcl_scr_count_loop(pend, 0)
+pub fn tcl_scr_count(pend: [TclEntry]) : Int = tcl_scr_count_loop(pend, 0)
 
-fn tcl_scr_count_loop(pend: [String], acc: Int) : Int = match pend {
+fn tcl_scr_count_loop(pend: [TclEntry], acc: Int) : Int = match pend {
   [] -> acc
   [e, ...rest] -> tcl_scr_count_loop(rest, if tcl_is_scr(e) { acc + 1 } else { acc })
 }
 
-#[doc("Append binder entries, dropping same-name earlier entries a new binder shadows.")]
-pub fn tcl_push_binders(pend: [String], names: [String]) : [String] = match names {
+#[doc("Append binder entries, dropping an earlier entry of a binder bound again: the two are one local.")]
+pub fn tcl_push_binders(pend: [TclEntry], ls: [LocalId]) : [TclEntry] = match ls {
   [] -> pend
-  [n, ...rest] -> tcl_push_binders(list_append(tcl_remove(pend, n), [n]), rest)
+  [l, ...rest] ->
+    tcl_push_binders(list_append(filter(pend, (e) => not tcl_binds(e, l)), [TclBinder(l)]), rest)
 }
 
-fn tcl_remove(pend: [String], n: String) : [String] = match pend {
+fn tcl_binds(e: TclEntry, l: LocalId) : Bool = match e {
+  TclBinder(x) -> local_eq(x, l)
+  _            -> false
+}
+
+fn tcl_same(a: TclEntry, b: TclEntry) : Bool = match a {
+  TclScr(x) -> match b {
+    TclScr(y) -> x == y
+    _         -> false
+  }
+  TclTok -> tcl_is_tok(b)
+  TclUnw(x) -> match b {
+    TclUnw(y) -> x == y
+    _         -> false
+  }
+  TclBinder(x) -> match b {
+    TclBinder(y) -> local_eq(x, y)
+    _            -> false
+  }
+}
+
+fn tcl_remove(pend: [TclEntry], n: TclEntry) : [TclEntry] = match pend {
   [] -> []
-  [e, ...rest] -> if e == n { tcl_remove(rest, n) } else { [e, ...tcl_remove(rest, n)] }
+  [e, ...rest] -> if tcl_same(e, n) { tcl_remove(rest, n) } else { [e, ...tcl_remove(rest, n)] }
 }
 
-fn tcl_remove_all(pend: [String], names: [String]) : [String] = match names {
+fn tcl_remove_all(pend: [TclEntry], bs: [Binder]) : [TclEntry] = match bs {
   [] -> pend
-  [n, ...rest] -> tcl_remove_all(tcl_remove(pend, n), rest)
+  [b, ...rest] -> tcl_remove_all(tcl_remove(pend, TclBinder(b.id)), rest)
 }
 
 #[doc("Drop the binder entries that expression `e` consumes (or might consume).")]
-pub fn tcl_filter(pend: [String], e: Expr) : [String] = tcl_filter_from(pend, e, tcl_first_consumed(pend, e, 0))
+pub fn tcl_filter(pend: [TclEntry], e: Expr) : [TclEntry] = tcl_filter_from(pend, e, tcl_first_consumed(pend, e, 0))
 
-fn tcl_filter_from(pend: [String], e: Expr, i: Int) : [String] = match pend {
+fn tcl_filter_from(pend: [TclEntry], e: Expr, i: Int) : [TclEntry] = match pend {
   [] -> []
   [p, ...rest] ->
     if i < 0 { pend }
@@ -115,20 +163,23 @@ fn tcl_filter_from(pend: [String], e: Expr, i: Int) : [String] = match pend {
 }
 
 # Index of the first entry `e` consumes, or -1: the entries before it are kept as they are.
-fn tcl_first_consumed(pend: [String], e: Expr, i: Int) : Int = match pend {
+fn tcl_first_consumed(pend: [TclEntry], e: Expr, i: Int) : Int = match pend {
   [] -> 0 - 1
   [p, ...rest] -> if tcl_drops(p, e) { i } else { tcl_first_consumed(rest, e, i + 1) }
 }
 
-fn tcl_drops(p: String, e: Expr) : Bool = not tcl_pinned(p) and tcl_consumes(e, p)
+fn tcl_drops(p: TclEntry, e: Expr) : Bool = match p {
+  TclBinder(l) -> tcl_consumes(e, l)
+  _            -> false
+}
 
 #[doc("`tcl_filter` over a statement list, also dropping entries a `let`/`var` rebinds.")]
-pub fn tcl_filter_stmts(pend: [String], stmts: [Stmt]) : [String] = match stmts {
+pub fn tcl_filter_stmts(pend: [TclEntry], stmts: [Stmt]) : [TclEntry] = match stmts {
   [] -> pend
   [s, ...rest] -> tcl_filter_stmts(tcl_filter_stmt(pend, s), rest)
 }
 
-fn tcl_filter_stmt(pend: [String], s: Stmt) : [String] = match s {
+fn tcl_filter_stmt(pend: [TclEntry], s: Stmt) : [TclEntry] = match s {
   SLet(pat, _, rhs)        -> tcl_remove_all(tcl_filter(pend, rhs), pat_binders(pat, []))
   SAssert(c, om)           -> match om {
     Some(m) -> tcl_filter(tcl_filter(pend, c), m)
@@ -137,7 +188,7 @@ fn tcl_filter_stmt(pend: [String], s: Stmt) : [String] = match s {
   SExprStmt(e)             -> tcl_filter(pend, e)
   SIndexAssign(a, i, v, _, _) -> tcl_filter(tcl_filter(tcl_filter(pend, a), i), v)
   SAssign(a, v, _, _)      -> tcl_filter(tcl_filter(pend, a), v)
-  SVar(n, _, init, _, _)   -> tcl_remove(tcl_filter(pend, init), n)
+  SVar(b, _, init, _, _)   -> tcl_remove(tcl_filter(pend, init), TclBinder(b.id))
   SUse(_, _, _)            -> pend
 }
 
@@ -145,75 +196,62 @@ fn tcl_filter_stmt(pend: [String], s: Stmt) : [String] = match s {
 Ledger entries the goto site must release: every scrutinee entry, plus
 every binder entry the tail-call arguments do not themselves consume.
 """)]
-pub fn tcl_goto_entries(pend: [String], args: [Expr]) : [String] = match pend {
+pub fn tcl_goto_entries(pend: [TclEntry], args: [Expr]) : [TclEntry] = match pend {
   [] -> []
   [p, ...rest] ->
-    if tcl_pinned(p) or not tcl_args_consume(args, p) { [p, ...tcl_goto_entries(rest, args)] }
-    else { tcl_goto_entries(rest, args) }
+    if tcl_args_consume(args, p) { tcl_goto_entries(rest, args) }
+    else { [p, ...tcl_goto_entries(rest, args)] }
 }
 
 #[doc("C release statements for the goto site: a decref per `tcl_goto_entries` entry, a pop per unwind entry.")]
-pub fn tcl_goto_drops(pend: [String], args: [Expr]) : String =
-  concat_all(map(tcl_goto_entries(pend, args), tcl_goto_release))
+pub fn tcl_goto_drops(ns: LocalNames, pend: [TclEntry], args: [Expr]) : String =
+  concat_all(map(tcl_goto_entries(pend, args), (p) => tcl_goto_release(ns, p)))
 
-fn tcl_goto_release(p: String) : String =
-  if tcl_is_tok(p) { "if (_arm_ru != kai_reuse_null) { kai_reuse_free(_arm_ru); _arm_ru = kai_reuse_null; } " }
-  else { tcl_ref_release(p) }
+fn tcl_goto_release(ns: LocalNames, p: TclEntry) : String = match p {
+  TclTok    -> "if (_arm_ru != kai_reuse_null) { kai_reuse_free(_arm_ru); _arm_ru = kai_reuse_null; } "
+  TclUnw(f) -> concat_all(["kai_unw_pop(", f, "); "])
+  _         -> concat_all(["kai_decref(", tcl_cname(ns, p), "); "])
+}
 
-fn tcl_ref_release(p: String) : String =
-  if tcl_is_unw(p) { concat_all(["kai_unw_pop(", tcl_unw_reg(p), "); "]) }
-  else { concat_all(["kai_decref(", tcl_cname(p), "); "]) }
-
-fn tcl_args_consume(args: [Expr], nm: String) : Bool = match args {
+# A pinned entry is consumed by no argument.
+fn tcl_args_consume(args: [Expr], p: TclEntry) : Bool = match args {
   [] -> false
-  [a, ...rest] -> tcl_consumes(a, nm) or tcl_args_consume(rest, nm)
+  [a, ...rest] -> tcl_drops(p, a) or tcl_args_consume(rest, p)
 }
 
 #[doc("""
-True when evaluating `e` consumes (or might consume) binder `nm`'s ref:
-a bare `EVar(nm)` read anywhere in `e` outside a lambda body, or a
-mention in an interpolation span. A `__perceus_dup(nm)` wrap or a
-closure capture alone does not consume. Shadowing inside `e` is
-ignored — that only biases toward "consumed", the safe direction.
+True when evaluating `e` consumes (or might consume) the ref of binder
+`l`: a bare read of it anywhere in `e` outside a lambda body. A
+`__perceus_dup` wrap or a closure capture alone does not consume.
 """)]
-pub fn tcl_consumes(e: Expr, nm: String) : Bool = match e.kind {
-  EVar(n)       -> n == nm
-  ECall(f, xs)  -> tcl_consumes_call(f, xs, nm)
-  EStr(span, _) -> has_interp(span, 0, string_length(span)) and tcl_span_mentions(span, nm)
-  _             -> tcl_consumes_ps(xp_positions(e), nm)
+pub fn tcl_consumes(e: Expr, l: LocalId) : Bool = match e.kind {
+  ELocal(x)    -> local_eq(x, l)
+  ECall(f, xs) -> tcl_consumes_call(f, xs, l)
+  _            -> tcl_consumes_ps(xp_positions(e), l)
 }
 
-fn tcl_consumes_ps(ps: [XPos], nm: String) : Bool = match ps {
+fn tcl_consumes_ps(ps: [XPos], l: LocalId) : Bool = match ps {
   [] -> false
   [XP(r, c), ...rest] ->
-    (match r { XLam -> false _ -> tcl_consumes(c, nm) }) or tcl_consumes_ps(rest, nm)
+    (match r { XLam -> false _ -> tcl_consumes(c, l) }) or tcl_consumes_ps(rest, l)
 }
 
 # A bare callee read of the binder (a closure held in a local) consumes
-# like any EVar. A guard-fail drop runs only on a guard's falsy edge,
-# which never shares a path with the body's goto — filtering its binder
-# here would starve the success-path goto release. A borrow-marked read
-# is lent to the call and leaves the binder's ref to the goto.
-fn tcl_consumes_call(f: Expr, xs: [Expr], nm: String) : Bool = match f.kind {
-  EVar(cn) -> if cn == "__perceus_dup" { false } else { cn == nm or tcl_consumes_list(xs, nm) }
+# like any other read. A guard-fail drop runs only on a guard's falsy
+# edge, which never shares a path with the body's goto — filtering its
+# binder here would starve the success-path goto release. A borrow-marked
+# read is lent to the call and leaves the binder's ref to the goto.
+fn tcl_consumes_call(f: Expr, xs: [Expr], l: LocalId) : Bool = match f.kind {
+  EMark(MkDup) -> false
   EMark(MkGuardDrop) -> false
   EMark(MkBorrow) -> false
-  _ -> tcl_consumes(f, nm) or tcl_consumes_list(xs, nm)
+  _ -> tcl_consumes(f, l) or tcl_consumes_list(xs, l)
 }
 
-fn tcl_consumes_list(xs: [Expr], nm: String) : Bool = match xs {
+fn tcl_consumes_list(xs: [Expr], l: LocalId) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> tcl_consumes(x, nm) or tcl_consumes_list(rest, nm)
+  [x, ...rest] -> tcl_consumes(x, l) or tcl_consumes_list(rest, l)
 }
-
-#[doc("True when an interpolation span might read `nm`: the span is raw source, so a substring hit is the conservative stand-in.")]
-pub fn tcl_span_mentions(span: String, nm: String) : Bool =
-  tcl_contains_loop(span, nm, 0, string_length(span), string_length(nm))
-
-fn tcl_contains_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bool =
-  if i + nn > hn { false }
-  else if string_slice(hay, i, nn) == needle { true }
-  else { tcl_contains_loop(hay, needle, i + 1, hn, nn) }
 
 #[doc("""
 True when `body` contains a tcrec/TRMC goto sentinel anywhere — the gate
@@ -229,15 +267,17 @@ pub fn tcl_has_exit(body: Expr) : Bool = tcl_jump_scan(body, true)
 pub fn tcl_has_bang(e: Expr) : Bool = xp_exists(e, true, xp_is_bang)
 
 #[doc("The entries an early return releases on top of the frame's pending binders: the enclosing scrutinees and unwind pushes.")]
-pub fn tcl_exit_entries(pend: [String]) : [String] = filter(pend, tcl_pinned)
+pub fn tcl_exit_entries(pend: [TclEntry]) : [TclEntry] = filter(pend, tcl_pinned)
 
+# No pinned entry is spelled from a binder's name.
 #[doc("C release statements for an early return: `tcl_exit_entries` released as a goto releases them.")]
-pub fn tcl_exit_drops(pend: [String]) : String = concat_all(map(tcl_exit_entries(pend), tcl_goto_release))
+pub fn tcl_exit_drops(pend: [TclEntry]) : String =
+  concat_all(map(tcl_exit_entries(pend), (p) => tcl_goto_release(ln_empty(), p)))
 
 fn tcl_jump_scan(e: Expr, apply: Bool) : Bool = match e.kind {
   ECall(f, xs) -> match f.kind {
-    EVar(callee) ->
-      es_tcrec_is_sentinel(callee) or es_trmc_is_step_sentinel(callee) or tcl_jump_scan_exprs(xs, apply)
+    EMark(MkTcrecStep(_)) -> true
+    EMark(MkTrmcStep(_))  -> true
     EMark(MkTrmcApply) -> apply or tcl_jump_scan_exprs(xs, apply)
     _ -> tcl_jump_scan(f, apply) or tcl_jump_scan_exprs(xs, apply)
   }

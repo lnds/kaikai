@@ -14,54 +14,55 @@ one that cannot leaves its frame's references to leak on that jump.
 """)]
 
 import compiler.ast
-import compiler.util
 import compiler.emit_shared
+import compiler.enc_unit
 import compiler.unwind_clauses
 import compiler.unwind_carriers
 import compiler.unwind_cx
 import compiler.unwind_calls
 import compiler.borrow_view
+import compiler.core_effects
 
 #[doc("The unwind context of a program: its decls and every handler clause in them.")]
 pub fn unw_cx(decls: [Decl], clauses: [ClauseInfo]) : UnwCx = {
   let c = ue_cx_of(decls, unw_clauses(clauses, decls))
-  UnwCx { effs: c.effs, fns: c.fns, unw: c.unw, all: c.all, carriers: c.carriers, handles: ue_handle_fns(clauses, []) }
+  UnwCx { ...c, handles: ue_handle_fns(clauses, []) }
 }
 
 #[doc("The unwind context of `decls` before their clauses are lifted: each `handle` brings its own; no fn is marked as installing one.")]
 pub fn unw_cx_decls(decls: [Decl]) : UnwCx = ue_cx_of(decls, unw_handle_clauses(decls))
 
 fn ue_cx_of(decls: [Decl], hs: [UnwClause]) : UnwCx = {
-  let effs = ue_effect_names(decls, [])
   let all = ue_rows_cancel(decls)
   let carriers = unw_carriers(decls)
-  let unw = if all { [] } else { ue_fix(hs, decls, effs, carriers, unw_abandoning(hs, ["Cancel"])) }
-  ue_cx(decls, effs, carriers, unw, all)
+  let unw = if all { [] } else { ue_fix(hs, decls, carriers, unw_abandoning(hs, [sym_raw(core_effect_id(CeCancel))])) }
+  ue_cx(decls, carriers, unw, all)
 }
 
-fn ue_cx(decls: [Decl], effs: [String], carriers: [String], unw: [String], all: Bool) : UnwCx = {
-  let base = UnwCx { effs: effs, fns: array_make(1, []), unw: unw, all: all, carriers: carriers, handles: [] }
-  UnwCx { effs: effs, unw: unw, all: all, carriers: carriers, fns: ue_table(decls, base), handles: [] }
+fn ue_cx(decls: [Decl], carriers: [Int], unw: [Int], all: Bool) : UnwCx = {
+  let base = UnwCx { eff_ids: ue_effect_ids(decls, []), fns: array_make(1, []), unw: unw,
+                     all: all, carriers: carriers, handles: [] }
+  UnwCx { ...base, fns: ue_table(decls, base) }
 }
 
-fn ue_handle_fns(cs: [ClauseInfo], acc: [String]) : [String] = match cs {
-  [] -> acc
-  [CI(_, _, _, _, _, _, _, enc, _, _, _), ...rest] -> ue_handle_fns(rest, if list_has(acc, enc) { acc } else { [enc, ...acc] })
-}
-
-fn ue_effect_names(decls: [Decl], acc: [String]) : [String] = match decls {
+fn ue_effect_ids(decls: [Decl], acc: [Int]) : [Int] = match decls {
   [] -> acc
   [d, ...rest] -> match d {
-    DEffect(_, name, _, _, _, _, _, _, _) -> ue_effect_names(rest, [name, ...acc])
-    _ -> ue_effect_names(rest, acc)
+    DEffect(_, s, _, _, _, _, _, _) -> ue_effect_ids(rest, if sym_raw(s) >= 0 { [sym_raw(s), ...acc] } else { acc })
+    _ -> ue_effect_ids(rest, acc)
   }
+}
+
+fn ue_handle_fns(cs: [ClauseInfo], acc: [EncUnit]) : [EncUnit] = match cs {
+  [] -> acc
+  [CI(_, _, _, _, _, _, _, enc, _, _, _), ...rest] -> ue_handle_fns(rest, if unit_in(acc, enc.unit) { acc } else { [enc.unit, ...acc] })
 }
 
 fn ue_table(decls: [Decl], ucx: UnwCx) : Array[[UnwFn]] = {
   let t = array_make(1024, [])
   foreach(decls, (d) => match d {
-    DFn(_, _, _, ps, _, row, _, _, _, _, fsym) -> {
-      let k = bv_fid_key(fsym)
+    DFn(_, fid, _, ps, _, row, _, _, _, _) -> {
+      let k = bv_fid_key(fid)
       let b = unw_bucket(k, 1024)
       t[b] := [UF(k, unw_row_class(row, ucx), ue_borrowed(ps, 0)), ...t[b]]
     }
@@ -81,40 +82,38 @@ fn ue_borrowed(ps: [Param], i: Int) : [Int] = match ps {
 fn ue_rows_cancel(decls: [Decl]) : Bool = match decls {
   [] -> false
   [d, ...rest] -> match d {
-    DFn(_, _, _, _, _, row, _, _, _, _, _) -> ue_row_cancels(row) or ue_rows_cancel(rest)
+    DFn(_, _, _, _, _, row, _, _, _, _) -> ue_row_cancels(row) or ue_rows_cancel(rest)
     _ -> ue_rows_cancel(rest)
   }
 }
 
 fn ue_row_cancels(row: RowExpr) : Bool = match row {
   REmpty       -> false
-  RClosed(ls)  -> ue_cancel_label(rl_names(ls))
-  ROpen(_, ls) -> ue_cancel_label(rl_names(ls))
+  RClosed(ls)  -> ue_cancel_label(ls)
+  ROpen(_, ls) -> ue_cancel_label(ls)
 }
 
-fn ue_cancel_label(ns: [String]) : Bool = unw_any_effect_in(ns, ["Spawn", "Link"])
+fn ue_cancel_label(ls: [RowLabel]) : Bool =
+  any(ls, (l) => effect_is_any(rl_sym(l), [CeSpawn, CeLink]))
 
 # Adds every effect one of whose clauses can unwind, until none is added.
-fn ue_fix(hs: [UnwClause], decls: [Decl], effs: [String], carriers: [String], unw: [String]) : [String] = {
-  let ucx = ue_cx(decls, effs, carriers, unw, false)
+fn ue_fix(hs: [UnwClause], decls: [Decl], carriers: [Int], unw: [Int]) : [Int] = {
+  let ucx = ue_cx(decls, carriers, unw, false)
   let more = ue_unwinding_clauses(hs, ucx, unw)
-  if list_length(more) == list_length(unw) { unw } else { ue_fix(hs, decls, effs, carriers, more) }
+  if list_length(more) == list_length(unw) { unw } else { ue_fix(hs, decls, carriers, more) }
 }
 
-fn ue_unwinding_clauses(hs: [UnwClause], ucx: UnwCx, acc: [String]) : [String] = match hs {
+fn ue_unwinding_clauses(hs: [UnwClause], ucx: UnwCx, acc: [Int]) : [Int] = match hs {
   [] -> acc
   [UnwC(eff, k, body), ...rest] ->
-    if list_has(acc, eff) or not ue_clause_unwinds(body, k, ucx) { ue_unwinding_clauses(rest, ucx, acc) }
-    else { ue_unwinding_clauses(rest, ucx, [eff, ...acc]) }
+    if sym_raw(eff) < 0 or unw_has_id(acc, eff) or not ue_clause_unwinds(body, k, ucx) { ue_unwinding_clauses(rest, ucx, acc) }
+    else { ue_unwinding_clauses(rest, ucx, [sym_raw(eff), ...acc]) }
 }
 
 # A clause's resume in tail position returns into the perform: only its
 # arguments can unwind there.
-fn ue_clause_unwinds(e: Expr, k: String, ucx: UnwCx) : Bool = match e.kind {
-  ECall(f, xs) -> match f.kind {
-    EVar(n) -> if n == k { ue_any_scan(xs, ucx) } else { unw_scan(e, ucx) }
-    _       -> unw_scan(e, ucx)
-  }
+fn ue_clause_unwinds(e: Expr, k: LocalId, ucx: UnwCx) : Bool = match e.kind {
+  ECall(f, xs) -> if unw_reads_continuation(f, k) { ue_any_scan(xs, ucx) } else { unw_scan(e, ucx) }
   EBlock(ss, Some(t)) -> ue_stmts_scan(ss, ucx) or ue_clause_unwinds(t, k, ucx)
   EIf(c, t, Some(el)) -> unw_scan(c, ucx) or ue_clause_unwinds(t, k, ucx) or ue_clause_unwinds(el, k, ucx)
   _ -> unw_scan(e, ucx)

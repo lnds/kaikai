@@ -19,6 +19,8 @@
 # obligation ever travels.
 
 import compiler.ast
+import compiler.core_types
+import compiler.call_site_target
 
 # `Int128` positive maximum, `2^127 - 1` (39 digits). A minted magnitude
 # above this overflows the `Decimal`/`Int128` carrier.
@@ -40,7 +42,7 @@ pub fn mint_literal(value: Expr, target: Ty, bh: String) : MintResult =
     EInt(n, _) -> mint_int(n, value, target, bh)
     EIntLit(span)  -> mint_big_int(span, value, target, bh)
     EReal(_, span) -> mint_point(span, value, target, bh)
-    EDecimalLit(span) -> mint_decimal_suffix(span, value, target)
+    EDecimalLit(span) -> mint_decimal_suffix(span, value)
     _ -> MintNone
   }
 
@@ -55,15 +57,16 @@ fn mint_int(n: Int, value: Expr, target: Ty, bh: String) : MintResult =
     TyInt128 -> MintOk(mk_fixed(int_to_dec_string(n), TyInt128, value))
     TyByte   -> mint_byte(n, value)
     TyReal   -> MintOk(mk_real(int_to_real(n), int_to_dec_string(n), value))
-    TyCon(_, name, _, _) -> mint_int_carrier(n, name, value, target, bh)
+    TyCon(s, _) -> mint_int_carrier(n, core_decl_ty_of(s), value, bh)
     _ -> MintNone
   }
 
-fn mint_int_carrier(n: Int, name: String, value: Expr, cty: Ty, bh: String) : MintResult =
-  if name == "Decimal" { MintOk(mk_decimal_lit(int_to_dec_string(n), 0, value, cty)) }
-  else if name == "DecimalBig" { MintOk(mk_decimal_big_lit(int_to_dec_string(n), 0, value, cty, bh)) }
-  else if name == "BigInt" { MintOk(mk_bigint_lit(int_to_dec_string(n), value, cty, bh)) }
-  else { MintNone }
+fn mint_int_carrier(n: Int, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult = match c {
+  Some(CdDecimal)    -> MintOk(mk_decimal_lit(int_to_dec_string(n), 0, value))
+  Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(int_to_dec_string(n), 0, value, bh))
+  Some(CdBigInt)     -> MintOk(mk_bigint_lit(int_to_dec_string(n), value, bh))
+  None               -> MintNone
+}
 
 fn mint_byte(n: Int, value: Expr) : MintResult =
   if n >= 0 and n <= 255 { MintOk(with_ty(mk_expr(mk_int_synth(n), value.line, value.col), TyByte)) }
@@ -75,15 +78,16 @@ fn mint_byte(n: Int, value: Expr) : MintResult =
 fn mint_big_int(span: String, value: Expr, target: Ty, bh: String) : MintResult =
   match target {
     TyInt128 -> mint_int128_span(span, value)
-    TyCon(_, name, _, _) -> mint_big_carrier(span, name, value, target, bh)
+    TyCon(s, _) -> mint_big_carrier(span, core_decl_ty_of(s), value, bh)
     _ -> MintErr(lit_mint_int_range_error(span))
   }
 
-fn mint_big_carrier(span: String, name: String, value: Expr, cty: Ty, bh: String) : MintResult =
-  if name == "BigInt" { MintOk(mk_bigint_lit(span, value, cty, bh)) }
-  else if name == "DecimalBig" { MintOk(mk_decimal_big_lit(span, 0, value, cty, bh)) }
-  else if name == "Decimal" { mint_decimal_span(span, 0, value, cty) }
-  else { MintErr(lit_mint_int_range_error(span)) }
+fn mint_big_carrier(span: String, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult = match c {
+  Some(CdBigInt)     -> MintOk(mk_bigint_lit(span, value, bh))
+  Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(span, 0, value, bh))
+  Some(CdDecimal)    -> mint_decimal_span(span, 0, value)
+  None               -> MintErr(lit_mint_int_range_error(span))
+}
 
 fn mint_int128_span(span: String, value: Expr) : MintResult =
   if dec_overflows_int128(span) { MintErr(int128_range_error()) }
@@ -95,7 +99,7 @@ fn mint_int128_span(span: String, value: Expr) : MintResult =
 fn mint_point(span: String, value: Expr, target: Ty, bh: String) : MintResult =
   match target {
     TyReal -> MintOk(with_ty(value, TyReal))
-    TyCon(_, name, _, _) -> mint_point_carrier(span, name, value, target, bh)
+    TyCon(s, _) -> mint_point_carrier(span, core_decl_ty_of(s), value, bh)
     TyInt    -> MintErr(int_from_point_error())
     TyInt32  -> MintErr(int_from_point_error())
     TyUInt32 -> MintErr(int_from_point_error())
@@ -105,34 +109,32 @@ fn mint_point(span: String, value: Expr, target: Ty, bh: String) : MintResult =
     _ -> MintNone
   }
 
-fn mint_point_carrier(span: String, name: String, value: Expr, cty: Ty, bh: String) : MintResult = {
+fn mint_point_carrier(span: String, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult = {
   let parts = dec_parts_of_span(span)
-  if name == "Decimal" { mint_decimal_span(parts.raw, parts.scale, value, cty) }
-  else if name == "DecimalBig" { MintOk(mk_decimal_big_lit(parts.raw, parts.scale, value, cty, bh)) }
-  else { MintNone }
+  match c {
+    Some(CdDecimal)    -> mint_decimal_span(parts.raw, parts.scale, value)
+    Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(parts.raw, parts.scale, value, bh))
+    _                  -> MintNone
+  }
 }
 
-# The `d` suffix (`19.99d`, `42d`) always targets `Decimal`. The suffix
-# supplies the carrier locally; an expected type only lends its identity.
-fn mint_decimal_suffix(span: String, value: Expr, target: Ty) : MintResult = {
+# The `d` suffix (`19.99d`, `42d`) always targets `Decimal`: the suffix
+# supplies the carrier, whatever type is expected.
+fn mint_decimal_suffix(span: String, value: Expr) : MintResult = {
   let parts = dec_parts_of_span(span)
-  mint_decimal_span(parts.raw, parts.scale, value, target)
+  mint_decimal_span(parts.raw, parts.scale, value)
 }
 
 # Build a `Decimal { raw, scale }` from a raw-digit magnitude string,
 # erroring when the magnitude overflows the `Int128` carrier.
-fn mint_decimal_span(raw_digits: String, scale: Int, value: Expr, cty: Ty) : MintResult =
+fn mint_decimal_span(raw_digits: String, scale: Int, value: Expr) : MintResult =
   if dec_overflows_int128(raw_digits) { MintErr(decimal_range_error()) }
-  else { MintOk(mk_decimal_lit(raw_digits, scale, value, cty)) }
+  else { MintOk(mk_decimal_lit(raw_digits, scale, value)) }
 
 # ---- carrier node builders ----
 
-# The identity a minted carrier inherits from the type it was minted
-# against. Only a same-named carrier lends one.
-fn carrier_sym(cty: Ty, name: String) : SymId = match cty {
-  TyCon(_, n, _, s) -> if n == name { s } else { sym_none() }
-  _ -> sym_none()
-}
+# The carrier `c` as a minted literal's type: its declaration, by id.
+fn carrier_ty(c: CoreDeclTy) : Ty = TyCon(core_decl_ty_id(c), [])
 
 fn mk_fixed(digits: String, ty: Ty, value: Expr) : Expr =
   with_ty(mk_expr(EFixed(digits, ty), value.line, value.col), ty)
@@ -142,33 +144,33 @@ fn mk_real(r: Real, span: String, value: Expr) : Expr =
 
 # `Decimal { raw: <Int128>, scale: <Int> }`. The raw rides an EFixed so
 # a magnitude above 2^63 survives the 64-bit decode.
-fn mk_decimal_lit(raw_digits: String, scale: Int, value: Expr, cty: Ty) : Expr = {
+fn mk_decimal_lit(raw_digits: String, scale: Int, value: Expr) : Expr = {
   let raw = mk_fixed(raw_digits, TyInt128, value)
   let scale_lit = mk_expr(mk_int_synth(scale), value.line, value.col)
   let fields = [FI("raw", raw), FI("scale", scale_lit)]
-  with_ty(mk_expr(ERecordLit(ty_ref_none(), "Decimal", fields), value.line, value.col),
-          TyCon(None, "Decimal", [], carrier_sym(cty, "Decimal")))
+  with_ty(mk_expr(ERecordLit(DrSym(core_decl_ty_id(CdDecimal)), fields), value.line, value.col),
+          carrier_ty(CdDecimal))
 }
 
 # `DecimalBig { raw: <BigInt>, scale: <Int> }`. The raw is a
 # `bigint.from_literal` call so an unbounded magnitude folds exactly.
-fn mk_decimal_big_lit(raw_digits: String, scale: Int, value: Expr, cty: Ty, bh: String) : Expr = {
+fn mk_decimal_big_lit(raw_digits: String, scale: Int, value: Expr, bh: String) : Expr = {
   let raw = mk_bigint_call(raw_digits, value, bh)
   let scale_lit = mk_expr(mk_int_synth(scale), value.line, value.col)
   let fields = [FI("raw", raw), FI("scale", scale_lit)]
-  with_ty(mk_expr(ERecordLit(ty_ref_none(), "DecimalBig", fields), value.line, value.col),
-          TyCon(None, "DecimalBig", [], carrier_sym(cty, "DecimalBig")))
+  with_ty(mk_expr(ERecordLit(DrSym(core_decl_ty_id(CdDecimalBig)), fields), value.line, value.col),
+          carrier_ty(CdDecimalBig))
 }
 
-fn mk_bigint_lit(digits: String, value: Expr, cty: Ty, bh: String) : Expr =
-  with_ty(mk_bigint_call(digits, value, bh), TyCon(None, "BigInt", [], carrier_sym(cty, "BigInt")))
+fn mk_bigint_lit(digits: String, value: Expr, bh: String) : Expr =
+  with_ty(mk_bigint_call(digits, value, bh), carrier_ty(CdBigInt))
 
 # `from_literal("<digits>")` of the module `bh` that declares `BigInt`,
 # the same call the `n` suffix desugars to. Minting runs after the
-# resolver, so the callee is the resolved `EModCall`, keyed by that home.
+# resolver, so the callee is that home's declaration, by id.
 fn mk_bigint_call(digits: String, value: Expr, bh: String) : Expr = {
   let s_lit = mk_expr(EStr(quote_digits(digits), false), value.line, value.col)
-  let callee = mk_expr(EModCall(bh, "from_literal"), value.line, value.col)
+  let callee = mk_expr(home_fn_ref(bh, "from_literal"), value.line, value.col)
   mk_expr(ECall(callee, [s_lit]), value.line, value.col)
 }
 

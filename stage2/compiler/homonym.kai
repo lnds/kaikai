@@ -26,35 +26,44 @@ The rule is single-dispatch on the first argument's head type over a
 closed set: one comparison per candidate, no search and no backtracking.
 """)]
 
-import compiler.util
 import compiler.ast
 import compiler.ast_map
+import compiler.written
 
-#[doc("One candidate for a contested bare name: the module that declares it, and the function type it declares.")]
-pub type HomCand = HCand(String, Ty)
+#[doc("One candidate for a contested bare name: the function that declares it, and the function type it declares.")]
+pub type HomCand = HCand(SymId, Ty)
 
-#[doc("A bare call whose candidates the argument's type had not settled yet: the name, the call's expected function type, and the call site.")]
-pub type DeferredHom = DHom(String, Ty, Int, Int)
+#[doc("A bare call whose candidates the argument's type had not settled yet: the name as written, the call's expected function type, and the call site.")]
+pub type DeferredHom = DHom(Written, Ty, Int, Int)
 
-#[doc("The module a drained call resolved to, keyed by the callee's source position.")]
-pub type HomPick = HPick(Int, Int, String)
+#[doc("The function a drained call resolved to, keyed by the callee's source position.")]
+pub type HomPick = HPick(Int, Int, SymId)
 
-#[doc("The head constructor of `t` as a comparable name, or `None` while `t` is still a variable — the one case an argument cannot decide by.")]
-pub fn hom_head(t: Ty) : Option[String] = match t {
-  TyInt          -> Some("Int")
-  TyReal         -> Some("Real")
-  TyBool         -> Some("Bool")
-  TyString       -> Some("String")
-  TyChar         -> Some("Char")
-  TyUnit         -> Some("Unit")
-  TyByte         -> Some("Byte")
-  TyInt32        -> Some("Int32")
-  TyUInt32       -> Some("UInt32")
-  TyUInt64       -> Some("UInt64")
-  TyInt128       -> Some("Int128")
-  TyListT(_)     -> Some("[]")
-  TyFnT(_, _, _) -> Some("fn")
-  TyCon(_, n, _, _) -> Some(n)
+#[doc("The head of a type as two candidates' first parameters are told apart by it: a type the language builds in, by its fixed tag, or a declared type, by its declaration.")]
+pub type HomHead = HhBuiltin(String) | HhDecl(SymId)
+
+#[doc("True when two heads are the same type constructor.")]
+pub fn hom_head_same(a: HomHead, b: HomHead) : Bool = match a {
+  HhBuiltin(x) -> match b { HhBuiltin(y) -> x == y  HhDecl(_) -> false }
+  HhDecl(s)    -> match b { HhDecl(t) -> sym_raw(s) == sym_raw(t)  HhBuiltin(_) -> false }
+}
+
+#[doc("The head constructor of `t`, or `None` while `t` is still a variable — the one case an argument cannot decide by.")]
+pub fn hom_head(t: Ty) : Option[HomHead] = match t {
+  TyInt          -> Some(HhBuiltin("Int"))
+  TyReal         -> Some(HhBuiltin("Real"))
+  TyBool         -> Some(HhBuiltin("Bool"))
+  TyString       -> Some(HhBuiltin("String"))
+  TyChar         -> Some(HhBuiltin("Char"))
+  TyUnit         -> Some(HhBuiltin("Unit"))
+  TyByte         -> Some(HhBuiltin("Byte"))
+  TyInt32        -> Some(HhBuiltin("Int32"))
+  TyUInt32       -> Some(HhBuiltin("UInt32"))
+  TyUInt64       -> Some(HhBuiltin("UInt64"))
+  TyInt128       -> Some(HhBuiltin("Int128"))
+  TyListT(_)     -> Some(HhBuiltin("[]"))
+  TyFnT(_, _, _) -> Some(HhBuiltin("fn"))
+  TyCon(s, _)    -> Some(HhDecl(s))
   TyRefineT(b, _) -> hom_head(b)
   _              -> None
 }
@@ -69,18 +78,18 @@ pub fn hom_first_param(t: Ty) : Option[Ty] = match t {
 }
 
 #[doc("The distinct heads the candidates' first parameters carry, or `[]` when any candidate is effectful, argument-less, or headed by a variable — none of which an argument's type can decide between.")]
-pub fn hom_heads(cs: [HomCand]) : [String] = hom_heads_loop(cs, [])
+pub fn hom_heads(cs: [HomCand]) : [HomHead] = hom_heads_loop(cs, [])
 
 #[doc("True when the argument's type decides the set: two or more distinct first-parameter heads, every candidate pure. Such a call is resolved by the type, never by which module registered last.")]
 pub fn hom_decidable(cs: [HomCand]) : Bool = list_length(hom_heads(cs)) >= 2
 
-#[doc("The one candidate module whose first parameter has `arg`'s head, or `None` when `arg` is still a variable or no single candidate matches.")]
-pub fn hom_choose(cs: [HomCand], arg: Ty) : Option[String] = match hom_head(arg) {
+#[doc("The one candidate whose first parameter has `arg`'s head, or `None` when `arg` is still a variable or no single candidate matches.")]
+pub fn hom_choose(cs: [HomCand], arg: Ty) : Option[SymId] = match hom_head(arg) {
   None    -> None
   Some(h) -> hom_unique(cs, h, None)
 }
 
-#[doc("Retarget the calls the drain resolved: a callee at a recorded position becomes a call to its module, so codegen and the contested-name report both see one declaration.")]
+#[doc("Retarget the calls the drain resolved: a callee at a recorded position becomes a reference to the function picked, so codegen and the contested-name report both see one declaration.")]
 pub fn hom_retarget(e: Expr, picks: [HomPick]) : Expr = match picks {
   []  -> e
   _   -> hom_retarget_walk(e, picks)
@@ -90,20 +99,20 @@ pub fn hom_retarget(e: Expr, picks: [HomPick]) : Expr = match picks {
 
 # `[]` is the "cannot decide" answer, so a candidate that rules the set
 # out short-circuits rather than contributing nothing.
-fn hom_heads_loop(cs: [HomCand], acc: [String]) : [String] = match cs {
+fn hom_heads_loop(cs: [HomCand], acc: [HomHead]) : [HomHead] = match cs {
   [] -> list_reverse(acc)
   [HCand(_, t), ...rest] ->
     if hom_pure(t) { hom_heads_add(hom_cand_head(t), rest, acc) } else { [] }
 }
 
-fn hom_heads_add(h: Option[String], rest: [HomCand], acc: [String]) : [String] =
+fn hom_heads_add(h: Option[HomHead], rest: [HomCand], acc: [HomHead]) : [HomHead] =
   match h {
     None    -> []
-    Some(x) -> if list_has(acc, x) { hom_heads_loop(rest, acc) }
+    Some(x) -> if any(acc, (y) => hom_head_same(x, y)) { hom_heads_loop(rest, acc) }
                else { hom_heads_loop(rest, [x, ...acc]) }
   }
 
-fn hom_cand_head(t: Ty) : Option[String] = match hom_first_param(t) {
+fn hom_cand_head(t: Ty) : Option[HomHead] = match hom_first_param(t) {
   None    -> None
   Some(p) -> hom_head(p)
 }
@@ -119,19 +128,19 @@ fn hom_pure(t: Ty) : Bool = match t {
   _ -> false
 }
 
-fn hom_unique(cs: [HomCand], head: String, found: Option[String]) : Option[String] =
+fn hom_unique(cs: [HomCand], head: HomHead, found: Option[SymId]) : Option[SymId] =
   match cs {
     [] -> found
     [HCand(m, t), ...rest] -> match hom_cand_head(t) {
-      Some(h) -> if h == head { hom_unique_first(rest, head, found, m) }
+      Some(h) -> if hom_head_same(h, head) { hom_unique_first(rest, head, found, m) }
                  else { hom_unique(rest, head, found) }
       None    -> hom_unique(rest, head, found)
     }
   }
 
 # A second candidate with the same head is a tie no rule breaks.
-fn hom_unique_first(rest: [HomCand], head: String, found: Option[String],
-      m: String) : Option[String] = match found {
+fn hom_unique_first(rest: [HomCand], head: HomHead, found: Option[SymId],
+      m: SymId) : Option[SymId] = match found {
   None    -> hom_unique(rest, head, Some(m))
   Some(_) -> None
 }
@@ -148,14 +157,14 @@ fn hom_retarget_walk(e: Expr, picks: [HomPick]) : Expr {
 
 fn hom_retarget_call(e: Expr, c: Expr, call_args: [Expr], picks: [HomPick]) : Expr =
   match c.kind {
-    EVar(nm) -> match hom_pick_at(picks, c.line, c.col) {
+    EName(_) -> match hom_pick_at(picks, c.line, c.col) {
       None    -> e
-      Some(m) -> hom_with_kind(e, ECall(hom_with_kind(c, EModCall(m, nm)), call_args))
+      Some(s) -> hom_with_kind(e, ECall(hom_with_kind(c, ESym(s, spec_none())), call_args))
     }
     _ -> e
   }
 
-fn hom_pick_at(picks: [HomPick], line: Int, col: Int) : Option[String] = match picks {
+fn hom_pick_at(picks: [HomPick], line: Int, col: Int) : Option[SymId] = match picks {
   [] -> None
   [HPick(l, c, m), ...rest] ->
     if l == line and c == col { Some(m) } else { hom_pick_at(rest, line, col) }

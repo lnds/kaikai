@@ -24,7 +24,8 @@
 #   rendering for `--doc-json` and `kai info builtins --json`.
 #
 # Cross-module dependencies: ast (Decl shapes), diag (typed errors),
-# util (string helpers + JSON escaping). No parse / infer import —
+# util (string helpers + JSON escaping), symtab / decl_text (the names
+# the declarations carry by id). No parse / infer import —
 # parse.kai and infer.kai both import THIS module, so it stays a leaf.
 #
 # Single-line `#[doc(...)]` only in this file — kaic1 consumes the
@@ -35,6 +36,9 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.kinds
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 
 # ---- doc text helpers ----
 
@@ -88,12 +92,22 @@ pub fn doc_text_normalize(s: String) : String {
 
 # ---- side table ----
 
+#[doc("What a doc item shows of its declaration: the id or the text that names it and the pieces of its signature, never its body.")]
+pub type DocHead
+  = DocDecl(SymId)
+  | DocFn(SymId, [Param], Option[TypeExpr], RowExpr)
+  | DocAxiom(String)
+  # The protocol, the target and the members in order.
+  | DocImpl(DeclRef, TypeExpr, [DocHead])
+  # An impl member that is not a bare `fn`: it renders as nothing.
+  | DocOpaque
+
 # One top-level named declaration, documented or not. Undocumented
 # items still get an entry (doc: None) so doc_for_line can use them
-# as boundaries and the JSON dumps can report coverage. `sig` is the
-# rendered surface signature — `(p: T, ...) -> R / Eff` for a `fn`,
-# None for the other kinds (issue #774 follow-up: `kai doc` shows it).
-pub type DocItem = { kind: String, name: String, line: Int, is_pub: Bool, doc: Option[String], sig: Option[String] }
+# as boundaries and the JSON dumps can report coverage. The name and
+# the signature are spelled from `head`, through the symbol table,
+# where the JSON is rendered.
+pub type DocItem = { kind: String, line: Int, is_pub: Bool, doc: Option[String], head: DocHead }
 
 # Result of the post-parse strip walk.
 pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem], errs: Int, diags: [Diagnostic] }
@@ -101,13 +115,13 @@ pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem
 #[doc("DocItem for a named declaration, seeing through DUnstable / DDerive / DDoc wrappers. None for unnamed decls (tests, imports...).")]
 pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
   match d {
-    DFn(p, nm, _, ps, rt, ef, _, ln, _, _, _) -> Some(doc_item(p, "fn", nm, ln, doc, Some(doc_sig(ps, rt, ef))))
-    DType(p, nm, _, _, ln, _, _, _, _)           -> Some(doc_item(p, "type", nm, ln, doc, None))
-    DEffect(p, nm, _, _, _, ln, _, _, _)      -> Some(doc_item(p, "effect", nm, ln, doc, None))
-    DProtocol(p, nm, _, _, ln, _, _, _)       -> Some(doc_item(p, "protocol", nm, ln, doc, None))
-    DAxiom(p, _, nm, _, _, _, _, _, ln, _) -> Some(doc_item(p, "axiom", nm, ln, doc, None))
-    DConst(p, nm, _, _, _, ln, _, _)          -> Some(doc_item(p, "const", nm, ln, doc, None))
-    DImpl(pname, _, target, ms, ln, _, _, _)     -> Some(doc_item(true, "impl", doc_impl_name(pname, target), ln, doc, Some(doc_impl_sig(ms))))
+    DFn(p, f, _, ps, rt, ef, _, ln, _, _)  -> Some(doc_item(p, "fn", ln, doc, DocFn(fnid_sym(f), ps, rt, ef)))
+    DType(p, s, _, _, ln, _, _, _)         -> Some(doc_item(p, "type", ln, doc, DocDecl(s)))
+    DEffect(p, s, _, _, _, ln, _, _)       -> Some(doc_item(p, "effect", ln, doc, DocDecl(s)))
+    DProtocol(p, s, _, _, ln, _, _)        -> Some(doc_item(p, "protocol", ln, doc, DocDecl(s)))
+    DAxiom(p, _, nm, _, _, _, _, _, ln, _) -> Some(doc_item(p, "axiom", ln, doc, DocAxiom(nm)))
+    DConst(p, s, _, _, _, ln, _)           -> Some(doc_item(p, "const", ln, doc, DocDecl(s)))
+    DImpl(proto, _, target, ms, ln, _, _, _) -> Some(doc_item(true, "impl", ln, doc, DocImpl(proto, target, map(ms, doc_method_head))))
     DUnstable(inner, _, _)                 -> doc_item_of(inner, doc)
     DProtoLaws(_, inner, _, _, _)             -> doc_item_of(inner, doc)
     DImplAxiom(_, inner, _, _, _)             -> doc_item_of(inner, doc)
@@ -119,6 +133,43 @@ pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
   }
 }
 
+fn doc_method_head(d: Decl) : DocHead =
+  match d {
+    DFn(_, f, _, ps, rt, ef, _, _, _, _) -> DocFn(fnid_sym(f), ps, rt, ef)
+    _ -> DocOpaque
+  }
+
+fn doc_item(is_pub: Bool, kind: String, line: Int, doc: Option[String], head: DocHead) : DocItem =
+  DocItem { kind: kind, line: line, is_pub: is_pub, doc: doc, head: head }
+
+fn doc_sym_text(tab: SymTab, s: SymId) : String = written_text(decl_name(tab, s))
+
+# A reference as the source spells it, or the name of the declaration
+# it resolved to.
+fn doc_ref_text(r: DeclRef, tab: SymTab) : String = match r {
+  DrWritten(None, n)    -> written_text(n)
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+  DrSym(s)              -> doc_sym_text(tab, s)
+}
+
+fn doc_head_name(h: DocHead, tab: SymTab) : String =
+  match h {
+    DocDecl(s)                -> doc_sym_text(tab, s)
+    DocFn(s, _, _, _)         -> doc_sym_text(tab, s)
+    DocAxiom(nm)              -> nm
+    DocImpl(proto, target, _) -> doc_impl_name(doc_ref_text(proto, tab), target, tab)
+    DocOpaque                 -> ""
+  }
+
+# `(p: T, ...) -> R / Eff` for a `fn`, the member list for an `impl`,
+# None for the other kinds.
+fn doc_head_sig(h: DocHead, tab: SymTab) : Option[String] =
+  match h {
+    DocFn(_, ps, rt, ef) -> Some(doc_sig(ps, rt, ef, tab))
+    DocImpl(_, _, ms)    -> Some(doc_impl_sig(ms, tab))
+    _ -> None
+  }
+
 # Drill-down key for an impl, e.g. `Add_for_Decimal` — mirrors the
 # (protocol, type) identity pair ProtocolReg already uses (ast.kai
 # ~1077), punctuated for a shell-safe, unquoted `kai doc mod.name` arg.
@@ -126,13 +177,14 @@ pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
 # import-aliased target (`dec.Decimal`) would otherwise leave the
 # alias prefix in the key (`kai doc mod.name` splits on the LAST dot,
 # so a dot inside the key breaks resolution).
-fn doc_impl_name(pname: String, target: TypeExpr) : String =
-  concat_all([pname, "_for_", doc_unqualify(doc_target_head(target))])
+fn doc_impl_name(pname: String, target: TypeExpr, tab: SymTab) : String =
+  concat_all([pname, "_for_", doc_unqualify(doc_target_head(target, tab))])
 
-fn doc_target_head(t: TypeExpr) : String =
+fn doc_target_head(t: TypeExpr, tab: SymTab) : String =
   match t.tkind {
-    TyName(_, n, _) -> n
-    _ -> doc_te(t)
+    TyName(DrWritten(_, n), _) -> written_text(n)
+    TyName(DrSym(s), _)        -> doc_sym_text(tab, s)
+    _ -> doc_te(t, tab)
   }
 
 fn doc_unqualify(s: String) : String =
@@ -152,18 +204,14 @@ fn doc_rindex_dot(s: String, i: Int) : Option[Int] {
 }
 
 # One line per method: `op(args) -> R / Eff`, joined with `; `.
-fn doc_impl_sig(methods: [Decl]) : String =
-  join_with(map(methods, doc_impl_method_sig), "; ")
+fn doc_impl_sig(methods: [DocHead], tab: SymTab) : String =
+  join_with(map(methods, (m) => doc_impl_method_sig(m, tab)), "; ")
 
-fn doc_impl_method_sig(d: Decl) : String =
-  match d {
-    DFn(_, nm, _, ps, rt, ef, _, _, _, _, _) -> concat_all([nm, doc_sig(ps, rt, ef)])
+fn doc_impl_method_sig(h: DocHead, tab: SymTab) : String =
+  match h {
+    DocFn(s, ps, rt, ef) -> concat_all([doc_sym_text(tab, s), doc_sig(ps, rt, ef, tab)])
     _ -> ""
   }
-
-fn doc_item(is_pub: Bool, kind: String, name: String, line: Int,
-            doc: Option[String], sig: Option[String]) : DocItem =
-  DocItem { kind: kind, name: name, line: line, is_pub: is_pub, doc: doc, sig: sig }
 
 # ---- signature rendering ----
 #
@@ -171,41 +219,43 @@ fn doc_item(is_pub: Bool, kind: String, name: String, line: Int,
 # Lives here so doc_attr stays a leaf (parse.kai + infer.kai import it).
 
 #[doc("Render a fn's params, return type and effect row as `(p: T, ...) -> R / Eff`.")]
-pub fn doc_sig(params: [Param], ret: Option[TypeExpr], eff: RowExpr) : String =
-  concat_all(["(", join_with(map(params, doc_param), ", "), ")", doc_ret(ret, eff)])
+pub fn doc_sig(params: [Param], ret: Option[TypeExpr], eff: RowExpr, tab: SymTab) : String =
+  concat_all(["(", join_with(map(params, (p) => doc_param(p, tab)), ", "), ")", doc_ret(ret, eff, tab)])
 
-fn doc_param(p: Param) : String =
+fn doc_param(p: Param, tab: SymTab) : String =
   match p.ptype {
-    None    -> p.pname
-    Some(t) -> concat_all([p.pname, ": ", doc_te(t)])
+    None    -> written_text(p.binder.name)
+    Some(t) -> concat_all([written_text(p.binder.name), ": ", doc_te(t, tab)])
   }
 
-fn doc_ret(ret: Option[TypeExpr], eff: RowExpr) : String =
+fn doc_ret(ret: Option[TypeExpr], eff: RowExpr, tab: SymTab) : String =
   match ret {
-    None    -> if doc_row_prints(eff) { concat_all([" / ", doc_row(eff)]) } else { "" }
-    Some(t) -> concat_all([" -> ", doc_te_row(t, eff)])
+    None    -> if doc_row_prints(eff) { concat_all([" / ", doc_row(eff, tab)]) } else { "" }
+    Some(t) -> concat_all([" -> ", doc_te_row(t, eff, tab)])
   }
+
+fn doc_tes(ts: [TypeExpr], tab: SymTab) : String = join_with(map(ts, (t) => doc_te(t, tab)), ", ")
 
 #[doc("Render a surface type as its declaration spells it, effect rows of arrow types included.")]
-pub fn doc_te(t: TypeExpr) : String =
+pub fn doc_te(t: TypeExpr, tab: SymTab) : String =
   match t.tkind {
-    TyName(_, n, targs) ->
-      if list_length(targs) == 0 { n }
-      else { concat_all([n, "[", join_with(map(targs, doc_te), ", "), "]"]) }
-    TyList(inner)     -> concat_all(["[", doc_te(inner), "]"])
-    TyFn(ps, r, row)  -> concat_all(["(", join_with(map(ps, doc_te), ", "), ") -> ", doc_te_row(r, row)])
-    TyDim(base, _)    -> doc_te(base)
-    TyRefine(base, _) -> doc_te(base)
-    TyRow(row)        -> doc_row(row)
+    TyName(r, targs) ->
+      if list_length(targs) == 0 { doc_ref_text(r, tab) }
+      else { concat_all([doc_ref_text(r, tab), "[", doc_tes(targs, tab), "]"]) }
+    TyList(inner)     -> concat_all(["[", doc_te(inner, tab), "]"])
+    TyFn(ps, r, row)  -> concat_all(["(", doc_tes(ps, tab), ") -> ", doc_te_row(r, row, tab)])
+    TyDim(base, _)    -> doc_te(base, tab)
+    TyRefine(base, _) -> doc_te(base, tab)
+    TyRow(row)        -> doc_row(row, tab)
     TySurface(ts)     -> match ts {
-      TsTuple(tys) -> concat_all(["(", join_with(map(tys, doc_te), ", "), ")"])
-      TsUnitSpan(_, inner) -> doc_te(inner)
+      TsTuple(tys) -> concat_all(["(", doc_tes(tys, tab), ")"])
+      TsUnitSpan(_, inner) -> doc_te(inner, tab)
     }
   }
 
-fn doc_te_row(t: TypeExpr, row: RowExpr) : String =
-  if doc_row_prints(row) { concat_all([doc_te_grouped(t), " / ", doc_row(row)]) }
-  else { doc_te(t) }
+fn doc_te_row(t: TypeExpr, row: RowExpr, tab: SymTab) : String =
+  if doc_row_prints(row) { concat_all([doc_te_grouped(t, tab), " / ", doc_row(row, tab)]) }
+  else { doc_te(t, tab) }
 
 fn doc_row_prints(row: RowExpr) : Bool =
   match row {
@@ -216,27 +266,29 @@ fn doc_row_prints(row: RowExpr) : Bool =
 
 # An arrow's return extends to the end of the type: a row after it binds
 # to that inner arrow unless the arrow is grouped.
-fn doc_te_grouped(t: TypeExpr) : String =
+fn doc_te_grouped(t: TypeExpr, tab: SymTab) : String =
   match t.tkind {
-    TyFn(_, _, _)     -> concat_all(["(", doc_te(t), ")"])
-    TyRefine(base, _) -> doc_te_grouped(base)
-    _                 -> doc_te(t)
+    TyFn(_, _, _)     -> concat_all(["(", doc_te(t, tab), ")"])
+    TyRefine(base, _) -> doc_te_grouped(base, tab)
+    _                 -> doc_te(t, tab)
   }
 
-fn doc_row(r: RowExpr) : String =
+fn doc_labels(labels: [RowLabel], tab: SymTab) : String = join_with(map(labels, (l) => doc_label(l, tab)), " + ")
+
+fn doc_row(r: RowExpr, tab: SymTab) : String =
   match r {
     REmpty            -> ""
-    RClosed(labels)   -> join_with(map(labels, doc_label), " + ")
+    RClosed(labels)   -> doc_labels(labels, tab)
     ROpen(tail, labels) ->
       if list_length(labels) == 0 { tail }
-      else { concat_all([join_with(map(labels, doc_label), " + "), " + ", tail]) }
+      else { concat_all([doc_labels(labels, tab), " + ", tail]) }
   }
 
-fn doc_label(l: RowLabel) : String =
+fn doc_label(l: RowLabel, tab: SymTab) : String =
   match l {
-    RL(n, targs, _) ->
-      if list_length(targs) == 0 { n }
-      else { concat_all([n, "[", join_with(map(targs, doc_te), ", "), "]"]) }
+    RL(r, targs) ->
+      if list_length(targs) == 0 { doc_ref_text(r, tab) }
+      else { concat_all([doc_ref_text(r, tab), "[", doc_tes(targs, tab), "]"]) }
   }
 
 
@@ -409,23 +461,23 @@ fn json_opt_str(o: Option[String]) : String {
 fn json_bool(b: Bool) : String = if b { "true" } else { "false" }
 
 #[doc("One DocItem as a stable JSON object: kind, name, line, pub, sig, doc (sig/doc null when absent).")]
-pub fn doc_item_json(it: DocItem) : String =
+pub fn doc_item_json(it: DocItem, tab: SymTab) : String =
   concat_all([
     "{\"kind\": ", json_quote(it.kind),
-    ", \"name\": ", json_quote(it.name),
+    ", \"name\": ", json_quote(doc_head_name(it.head, tab)),
     ", \"line\": ", int_to_string(it.line),
     ", \"pub\": ", json_bool(it.is_pub),
-    ", \"sig\": ", json_opt_str(it.sig),
+    ", \"sig\": ", json_opt_str(doc_head_sig(it.head, tab)),
     ", \"doc\": ", json_opt_str(it.doc),
     "}"
   ])
 
-#[doc("One module's doc tree as JSON: module name, module_doc, items array.")]
-pub fn doc_module_json(module: String, module_doc: Option[String], items: [DocItem]) : String =
+#[doc("One module's doc tree as JSON: module name, module_doc, items array. `tab` names the declarations the items hold.")]
+pub fn doc_module_json(module: String, module_doc: Option[String], items: [DocItem], tab: SymTab) : String =
   concat_all([
     "{\"module\": ", json_quote(module),
     ", \"module_doc\": ", json_opt_str(module_doc),
-    ", \"items\": [", join_with(map(items, doc_item_json), ", "), "]",
+    ", \"items\": [", join_with(map(items, (it) => doc_item_json(it, tab)), ", "), "]",
     "}"
   ])
 

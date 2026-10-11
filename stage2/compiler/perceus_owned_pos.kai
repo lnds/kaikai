@@ -8,20 +8,20 @@ dup'd. The owned positions are a `let` value, the fn's return value, a list
 element or spread operand, a record field, and a call argument in a slot its
 callee does not borrow (a ctor, an effect op, a closure call, a prim, or a
 fn slot outside the callee's borrow map). A position yields its value
-through `if`, `match` and block tails, and through perceus's own `__`-named
-wrap of a tail value. No other read is touched.
+through `if`, `match` and block tails, and through the slot perceus binds
+a tail value to. No other read is touched.
 """)]
 
 import compiler.ast
-import compiler.sym_read
+import compiler.perceus_reads
 import compiler.ast_map
-import compiler.fnreg
-import compiler.util
+import compiler.ret_slots
+import compiler.core_builtins
 
-type PopCx = { borrowed: [String], slots: (Expr) -> [Int] }
+type PopCx = { borrowed: [Binder], slots: (Expr) -> [Int] }
 
 #[doc("Dup every bare read of a `borrowed` binder that an owned position of `body` yields; `slots` gives a callee's borrowed argument positions.")]
-pub fn pop_own_positions(body: Expr, borrowed: [String], slots: (Expr) -> [Int]) : Expr = match borrowed {
+pub fn pop_own_positions(body: Expr, borrowed: [Binder], slots: (Expr) -> [Int]) : Expr = match borrowed {
   []         -> body
   [_, ...__] -> {
     let cx = PopCx { borrowed: borrowed, slots: slots }
@@ -34,18 +34,25 @@ fn pop_expr(e: Expr, cx: PopCx) : Expr =
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn pop_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
-  EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => pop_stmt(s, cx)), tail)
+  EBlock(stmts, tail)  -> EBlock(pop_stmts(stmts, 0, cx), tail)
   EList(els)           -> EList(map(els, (el) => pop_elem(el, cx)))
-  ERecordLit(rh, nm, fis)  -> ERecordLit(rh, nm, map(fis, (fi) => pop_field(fi, cx)))
+  ERecordLit(rh, fis)  -> ERecordLit(rh, map(fis, (fi) => pop_field(fi, cx)))
   ECall(f, args_)      -> if pop_is_sentinel(f) { k } else { ECall(f, pop_args(args_, cx.slots(f), 0, cx)) }
   _                    -> k
 }
 
-# A `__`-named `let` is perceus's own wrap of a tail value: it passes the
-# value through, so its rhs is owned only where the block's value is.
-fn pop_stmt(s: Stmt, cx: PopCx) : Stmt = match s {
-  SLet(pat, ann, rhs) -> if pop_is_wrap(pat) { s } else { SLet(pat, ann, pop_value(rhs, cx)) }
-  _                   -> s
+# A slot passes its value through, so its rhs is owned only where the
+# block's value is. `next` is the hoisted tail-call argument the block
+# binds next.
+fn pop_stmts(ss: [Stmt], next: Int, cx: PopCx) : [Stmt] = match ss {
+  []           -> []
+  [s, ...rest] -> match s {
+    SLet(pat, ann, rhs) ->
+      if ret_slot_binds_tail_arg(pat, next) { [s, ...pop_stmts(rest, next + 1, cx)] }
+      else if pop_is_wrap(pat) { [s, ...pop_stmts(rest, next, cx)] }
+      else { [SLet(pat, ann, pop_value(rhs, cx)), ...pop_stmts(rest, next, cx)] }
+    _ -> [s, ...pop_stmts(rest, next, cx)]
+  }
 }
 
 fn pop_elem(el: ListElem, cx: PopCx) : ListElem = match el {
@@ -65,51 +72,55 @@ fn pop_args(args_: [Expr], borrowed_slots: [Int], i: Int, cx: PopCx) : [Expr] = 
   }
 }
 
-# Perceus's own calls (`__perceus_dup`, drop marks) manage their operands.
-fn pop_is_sentinel(f: Expr) : Bool = match sym_read_kind(f.kind) {
-  EVar(nm)       -> string_starts_with_q(nm, "__")
-  EModCall(_, _) -> false
-  _              -> true
+# Perceus's own marks manage their operands, and a unit coercion hands
+# its operand through. A call of a declaration, of a closure a local
+# holds or of an effect operation is an ordinary call.
+fn pop_is_sentinel(f: Expr) : Bool = match f.kind {
+  ESym(_, _) -> pop_is_coercion(f)
+  ELocal(_)  -> false
+  EOp(_)     -> false
+  _          -> true
+}
+
+fn pop_is_coercion(f: Expr) : Bool = match builtin_ref(f) {
+  Some(b) -> builtin_is_unit_coercion(b)
+  None    -> false
 }
 
 fn pop_is_wrap(pat: Pattern) : Bool = match pat.pkind {
-  PBind(nm) -> string_starts_with_q(nm, "__")
-  _         -> false
+  PBind(b) -> ret_slot_id_is_value(b.id)
+  _        -> false
 }
 
-fn pop_value(e: Expr, cx: PopCx) : Expr = match sym_read_kind(e.kind) {
-  EVar(nm) -> if list_has(cx.borrowed, nm) { pop_dup(e) } else { e }
-  _        -> Expr { kind: pop_value_kind(e.kind, cx), line: e.line, col: e.col,
-                     ty: e.ty, mode: e.mode,  site: e.site }
+fn pop_value(e: Expr, cx: PopCx) : Expr = match e.kind {
+  ELocal(l) -> if pcs_has(cx.borrowed, l) { pop_dup(e) } else { e }
+  _         -> Expr { kind: pop_value_kind(e.kind, cx), line: e.line, col: e.col,
+                      ty: e.ty, mode: e.mode,  site: e.site }
 }
 
 fn pop_value_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
   EIf(c, t, oe)       -> EIf(c, pop_value(t, cx), prc_map_opt_expr(oe, (x) => pop_value(x, cx)))
   EMatch(scr, arms)   -> EMatch(scr, map(arms, (a) => match a { Arm(p, g, b) -> Arm(p, g, pop_value(b, cx)) }))
   EBlock(stmts, tail) -> match tail {
-    Some(t) -> EBlock(pop_wrapped(stmts, pop_tail_wrap(t), cx), Some(pop_value(t, cx)))
+    Some(t) -> EBlock(pop_wrapped(stmts, t, cx), Some(pop_value(t, cx)))
     None    -> k
   }
   _ -> k
 }
 
-# The wrap a block tail names, if the tail is a bare `__` binder.
-fn pop_tail_wrap(t: Expr) : String = match sym_read_kind(t.kind) {
-  EVar(nm) -> if string_starts_with_q(nm, "__") { nm } else { "" }
-  _        -> ""
-}
-
-fn pop_wrapped(stmts: [Stmt], wrap: String, cx: PopCx) : [Stmt] = match wrap {
-  "" -> stmts
-  _  -> map(stmts, (s) => match s {
+# The wrap a block tail names, if the tail is a bare result slot: its rhs
+# is owned where the block's value is.
+fn pop_wrapped(stmts: [Stmt], tail: Expr, cx: PopCx) : [Stmt] = match tail.kind {
+  ELocal(l) -> map(stmts, (s) => match s {
     SLet(pat, ann, rhs) -> match pat.pkind {
-      PBind(nm) -> if nm == wrap { SLet(pat, ann, pop_value(rhs, cx)) } else { s }
-      _         -> s
+      PBind(b) -> if local_eq(b.id, l) and ret_slot_id_is_value(l) { SLet(pat, ann, pop_value(rhs, cx)) } else { s }
+      _        -> s
     }
     _ -> s
   })
+  _ -> stmts
 }
 
 fn pop_dup(a: Expr) : Expr =
-  Expr { kind: ECall(mk_ref("__perceus_dup", a.line, a.col), [a]),
+  Expr { kind: ECall(mk_expr(EMark(MkDup), a.line, a.col), [a]),
          line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }

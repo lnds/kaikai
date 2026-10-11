@@ -1,40 +1,46 @@
 #[doc("""The part of a hole's scope a user can write at the hole.
 
-A hole's scope is the typer's environment, which also keys entries for its
-own lookups: an effect operation under its identity (`#<id>.op`), type- and
-module-qualified keys (`Color::Red`, `os::Exit::Signaled`, the
-`T::__type_decl_arity_<N>__` sentinel), and compiler-generated helpers
-(`__proto_show`). Source spells a qualifier with `.`, never `::`, so none of
-these can be pasted. Nor can a top-level name private to a foreign module.
+A hole's scope is the typer's environment, which also binds what the
+compiler declared for its own use (a protocol dispatcher, a hoisted
+temporary): a user cannot write those. Nor can a top-level name private
+to a foreign module.
 """)]
 
-import compiler.util
+import compiler.ast
+import compiler.symtab
+import compiler.handler_alias
 import compiler.infer
 
-#[doc("The hole's scope minus internal keys and the top-level names the root file cannot reach; `hidden` lists the latter.")]
-pub fn hole_visible_scope(scope: [TyEntry], toplevel_len: Int, hidden: [String]) : [TyEntry] =
-  hvs_loop(scope, list_length(scope) - toplevel_len, hidden, [])
+#[doc("The hole's scope minus what the compiler declared for itself and the top-level declarations the root file cannot reach; `hidden` lists the latter, `tab` says who declared an entry.")]
+pub fn hole_visible_scope(tab: SymTab, scope: [TyEntry], toplevel_len: Int, hidden: [SymId]) : [TyEntry] =
+  hvs_loop(tab, scope, list_length(scope) - toplevel_len, hidden, [])
 
-#[doc("The hole's local bindings (parameters and lets), minus internal keys.")]
-pub fn hole_local_scope(scope: [TyEntry], toplevel_len: Int) : [TyEntry] =
-  filter(drop_last_entries(scope, toplevel_len), (te) => env_key_is_source(te.name))
+#[doc("The hole's local bindings (parameters and lets), minus the compiler's own.")]
+pub fn hole_local_scope(tab: SymTab, scope: [TyEntry], toplevel_len: Int) : [TyEntry] =
+  filter(drop_last_entries(scope, toplevel_len), (te) => key_is_source(tab, te.key))
 
 # Locals come first; the trailing `toplevel_len` entries are the top level.
-fn hvs_loop(es: [TyEntry], n_local: Int, hidden: [String], acc: [TyEntry]) : [TyEntry] =
+fn hvs_loop(tab: SymTab, es: [TyEntry], n_local: Int, hidden: [SymId], acc: [TyEntry]) : [TyEntry] =
   match es {
     [] -> list_reverse(acc)
     [te, ...rest] -> {
-      let keep = env_key_is_source(te.name) and (n_local > 0 or not list_has(hidden, te.name))
-      hvs_loop(rest, n_local - 1, hidden, if keep { [te, ...acc] } else { acc })
+      let keep = key_is_source(tab, te.key) and (n_local > 0 or not key_hidden(hidden, te.key))
+      hvs_loop(tab, rest, n_local - 1, hidden, if keep { [te, ...acc] } else { acc })
     }
   }
 
-fn env_key_is_source(name: String) : Bool =
-  not (char_at_or_zero(name, 0) == '#'
-       or (char_at_or_zero(name, 0) == '_' and char_at_or_zero(name, 1) == '_')
-       or env_key_has_qualifier(name, 0, string_length(name)))
+# A minted binder is the compiler's, but for the handler aliases a
+# clause reads by the name the language gives them.
+fn key_is_source(tab: SymTab, k: EnvKey) : Bool = match k {
+  KSym(s)   -> not sym_internal(tab, s)
+  KCtor(s)  -> not sym_internal(tab, s)
+  KOp(s, _) -> not sym_internal(tab, s)
+  KLocal(b) -> not local_is_minted(b.id) or clause_alias_is_written(b.id)
+}
 
-fn env_key_has_qualifier(name: String, i: Int, n: Int) : Bool =
-  if i + 1 >= n { false }
-  else if char_at_or_zero(name, i) == ':' and char_at_or_zero(name, i + 1) == ':' { true }
-  else { env_key_has_qualifier(name, i + 1, n) }
+fn key_hidden(hidden: [SymId], k: EnvKey) : Bool = match k {
+  KSym(s)   -> any(hidden, (h) => sym_same(h, s))
+  KCtor(s)  -> any(hidden, (h) => sym_same(h, s))
+  KOp(_, _) -> false
+  KLocal(_) -> false
+}

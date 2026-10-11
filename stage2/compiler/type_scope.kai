@@ -1,12 +1,12 @@
 # compiler/type_scope.kai — module scoping for type names.
 #
-# Every declaration, annotation, record literal and type-qualified
-# constructor path of a contested type name is respelled per its
-# declaring module (type_scope_table); transparent aliases respell
-# unconditionally, gated on use-site arity so a 0-argument alias never
-# captures a generic use. Runs on the parsed stream before the
-# qualifier passes: a qualified `m.T` picks the home here, and the
-# unscoped forms are left for those passes to validate and strip.
+# Every annotation, record literal and type-qualified constructor path
+# of a contested type name is settled to the declaration its module
+# means (type_scope_table); transparent aliases settle unconditionally,
+# gated on use-site arity so a 0-argument alias never captures a generic
+# use. Runs on the parsed stream before the qualifier passes: a
+# qualified `m.T` picks the home here, and the unscoped forms are left
+# for those passes to validate and strip.
 
 import compiler.util
 import compiler.ast
@@ -14,12 +14,11 @@ import compiler.modules
 import compiler.module_table
 import compiler.scope_walk
 import compiler.type_scope_table
-import compiler.decl_names
-import compiler.symtab_build
 import compiler.decl_map
 import compiler.name_contest
+import compiler.written
 
-#[doc("Respell the contested type names of each import segment under its own module's viewpoint; the decls past the marks are the root file's. `sels` carries every file's selective imports, which outrank the plain import list on a contested bare name.")]
+#[doc("Settle the contested type names of each import segment under its own module's viewpoint; the decls past the marks are the root file's. `sels` carries every file's selective imports, which outrank the plain import list on a contested bare name.")]
 pub fn ts_segmented(segs: [ImportSeg], decls: [Decl], coll: [TSEntry],
       scopes: [ModScope], global: [ModuleEntry], target: String,
       cores: [String], sels: [SelImport]) : [Decl] =
@@ -31,8 +30,7 @@ fn ts_seg_loop(segs: [ImportSeg], decls: [Decl], coll: [TSEntry],
       scopes: [ModScope], global: [ModuleEntry], target: String,
       cores: [String], imps: [ModImports], sels: [SelImport]) : [Decl] = match segs {
   [] -> ts_decls(decls, ts_ctx(coll, target, target, cores, scopes, global, imps, sels))
-  [ISeg(mod_name, n), ...rest] -> {
-    let home = if mod_name == "" { target } else { mod_name }
+  [ISeg(home, n), ...rest] -> {
     list_append(ts_decls(seg_take(decls, n),
                          ts_ctx(coll, home, target, cores, scopes, global, imps, sels)),
                 ts_seg_loop(rest, seg_drop(decls, n), coll, scopes, global, target, cores,
@@ -63,21 +61,18 @@ fn ts_decls(ds: [Decl], cx: TSCtx) : [Decl] = match ds {
 fn ts_decl(d: Decl, cx: TSCtx) : Decl = decl_map_inner(d, (x) => ts_decl_leaf(x, cx))
 
 fn ts_decl_leaf(d: Decl, cx: TSCtx) : Decl = match d {
-  DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(p, n, tps, ts_params(ps, cx), ts_ty_opt(ret, cx), ts_row(row, cx),
-        ts_expr(body, sw_params(ps, []), cx), l, c, mo, fsym)
-  DType(p, n, tps, body, l, c, mo, slots, tsym) -> {
-    let spelled = ts_decl_name(n, body, cx)
-    DType(p, spelled, tps, ts_tbody(body, cx), l, c, mo, slots, ts_decl_sym(tsym, spelled, n, cx))
-  }
-  DEffect(p, n, tps, ops, dblk, l, c, mo, esym) ->
-    DEffect(p, n, tps, map(ops, (o) => ts_eop(o, cx)), ts_dblk(dblk, cx), l, c, mo, esym)
-  DConst(p, n, ty, body, mo, l, c, csym) -> DConst(p, n, ts_ty(ty, cx), ts_expr(body, [], cx), mo, l, c, csym)
+  DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, fid, tps, ts_params(ps, cx), ts_ty_opt(ret, cx), ts_row(row, cx),
+        ts_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DType(p, s, tps, body, l, c, mo, slots) -> DType(p, s, tps, ts_tbody(body, cx), l, c, mo, slots)
+  DEffect(p, s, tps, ops, dblk, l, c, mo) ->
+    DEffect(p, s, tps, map(ops, (o) => ts_eop(o, cx)), ts_dblk(dblk, cx), l, c, mo)
+  DConst(p, s, ty, body, mo, l, c) -> DConst(p, s, ts_ty(ty, cx), ts_expr(body, [], cx), mo, l, c)
   DTest(n, body, l, c, mo)  -> DTest(n, ts_expr(body, [], cx), l, c, mo)
   DBench(n, body, l, c, mo) -> DBench(n, ts_expr(body, [], cx), l, c, mo)
   DCheck(n, ps, body, l, c, mo) ->
     DCheck(n, ts_params(ps, cx), ts_expr(body, sw_params(ps, []), cx), l, c, mo)
-  DProtocol(p, n, tps, ops, l, c, mo, psym) -> DProtocol(p, n, tps, map(ops, (o) => ts_pop(o, cx)), l, c, mo, psym)
+  DProtocol(p, s, tps, ops, l, c, mo) -> DProtocol(p, s, tps, map(ops, (o) => ts_pop(o, cx)), l, c, mo)
   DImpl(pn, tas, fty, subs, l, c, ss, isym) ->
     DImpl(pn, map(tas, (t) => ts_ty(t, cx)), ts_ty(fty, cx), ts_decls(subs, cx), l, c, ss, isym)
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
@@ -85,22 +80,8 @@ fn ts_decl_leaf(d: Decl, cx: TSCtx) : Decl = match d {
   _ -> d
 }
 
-# Records, sums and transparent aliases spell when contested; effect
-# alias rows keep their name for the effect machinery.
-# A respelled declaration keeps the identity of the name it was declared
-# with: the table keys it by that name, not by the respelling.
-fn ts_decl_sym(s: SymId, spelled: String, n: String, cx: TSCtx) : SymId =
-  if sym_raw(s) >= 0 or spelled == n { s } else { sym_derive(NCType, n, cx.home) }
-
-fn ts_decl_name(n: String, body: TypeBody, cx: TSCtx) : String = match body {
-  TBRecord(_) -> ts_spell(cx, n, cx.home)
-  TBSum(_)    -> ts_spell(cx, n, cx.home)
-  TBAlias(_)  -> ts_spell(cx, n, cx.home)
-  _           -> n
-}
-
 fn ts_eop(o: EffectOp, cx: TSCtx) : EffectOp = match o {
-  EOp(n, tps, ps, ret, l, c) -> EOp(n, tps, ts_params(ps, cx), ts_ty(ret, cx), l, c)
+  EffOp(n, tps, ps, ret, l, c) -> EffOp(n, tps, ts_params(ps, cx), ts_ty(ret, cx), l, c)
 }
 
 fn ts_pop(o: ProtoOp, cx: TSCtx) : ProtoOp = match o {
@@ -110,8 +91,8 @@ fn ts_pop(o: ProtoOp, cx: TSCtx) : ProtoOp = match o {
 fn ts_dblk(o: Option[DefaultBlock], cx: TSCtx) : Option[DefaultBlock] = match o {
   None -> None
   Some(DBlk(hcs, ret, l, c)) ->
-    Some(DBlk(sw_hclauses(hcs, [], (x, s) => ts_leaf(x, s, cx), (t) => ts_ty(t, cx), (n, hs) => sw_head_same(n, hs)),
-              sw_hreturn_opt(ret, [], (x, s) => ts_leaf(x, s, cx), (t) => ts_ty(t, cx), (n, hs) => sw_head_same(n, hs)),
+    Some(DBlk(sw_hclauses(hcs, [], (x, s) => ts_leaf(x, s, cx), (t) => ts_ty(t, cx), (r) => sw_head_same(r)),
+              sw_hreturn_opt(ret, [], (x, s) => ts_leaf(x, s, cx), (t) => ts_ty(t, cx), (r) => sw_head_same(r)),
               l, c))
 }
 
@@ -126,31 +107,22 @@ fn ts_field(f: FieldDecl, cx: TSCtx) : FieldDecl = match f {
   FD(p, n, t, attrs) -> FD(p, n, ts_ty(t, cx), attrs)
 }
 
-# A bare member is a fresh constructor and keeps its spelling; a
-# qualified one names a declared type, so it respells like any head.
 fn ts_variant(v: Variant, cx: TSCtx) : Variant = match v {
-  Var(n, ts) -> {
-    let n1 = match split_dotted_qualifier(n) {
-      None -> n
-      Some(_) -> ts_head(n, 0, cx)
-    }
-    Var(n1, map(ts, (t) => ts_ty(t, cx)))
-  }
+  Var(c, ts) -> Var(c, map(ts, (t) => ts_ty(t, cx)))
 }
 
 fn ts_params(ps: [Param], cx: TSCtx) : [Param] =
-  map(ps, (p) => Param { pname: p.pname, ptype: ts_ty_opt(p.ptype, cx),
-                         pline: p.pline, pcol: p.pcol, pborrow: p.pborrow })
+  map(ps, (p) => Param { ...p, ptype: ts_ty_opt(p.ptype, cx) })
 
 fn ts_ty_opt(o: Option[TypeExpr], cx: TSCtx) : Option[TypeExpr] = match o {
   None -> None
   Some(t) -> Some(ts_ty(t, cx))
 }
 
-#[doc("Respell the nominal type names inside a type.")]
+#[doc("Settle the nominal type names inside a type.")]
 pub fn ts_ty(t: TypeExpr, cx: TSCtx) : TypeExpr = {
   let k = match t.tkind {
-    TyName(th, n, ts) -> ts_name(th, n, map(ts, (x) => ts_ty(x, cx)), cx)
+    TyName(r, ts) -> TyName(ts_ref(r, list_length(ts), cx), map(ts, (x) => ts_ty(x, cx)))
     TyList(x) -> TyList(ts_ty(x, cx))
     TyFn(ps, r, row) -> TyFn(map(ps, (x) => ts_ty(x, cx)), ts_ty(r, cx), ts_row(row, cx))
     TyDim(x, u) -> TyDim(ts_ty(x, cx), u)
@@ -168,46 +140,42 @@ fn ts_row(r: RowExpr, cx: TSCtx) : RowExpr = match r {
 }
 
 fn ts_label(l: RowLabel, cx: TSCtx) : RowLabel = match l {
-  RL(n, ts, s) -> RL(n, map(ts, (x) => ts_ty(x, cx)), s)
+  RL(r, ts) -> RL(r, map(ts, (x) => ts_ty(x, cx)))
 }
 
-# A name whose home the source fixed keeps it and its spelling; a qualified
-# `m.T` the scope settles records `m`'s module as the home.
-fn ts_name(home: TyRef, n: String, args: [TypeExpr], cx: TSCtx) : TyKind =
-  if ty_ref_written(home) { TyName(home, n, args) }
-  else { match split_dotted_qualifier(n) {
-    Some(QSplit(m, bare)) -> match ts_resolve_qualified(cx, m, bare, list_length(args)) {
-      Some(s) -> TyName(ty_ref_qualified(mt_member_home(cx.mt, m, bare)), s, args)
-      None    -> TyName(ty_ref_none(), n, args)
-    }
-    None -> TyName(ty_ref_none(), ts_resolve(cx, n, list_length(args)), args)
+# A type head taking `nargs` type arguments: `m.T` picks the home, a bare
+# `T` follows the ladder, and a head neither settles stays as written. A
+# head already settled keeps its declaration.
+fn ts_ref(r: DeclRef, nargs: Int, cx: TSCtx) : DeclRef = match r {
+  DrSym(_)              -> r
+  DrWritten(Some(m), n) -> ts_ref_qualified(r, written_text(m), written_text(n), nargs, cx)
+  DrWritten(None, n)    -> match split_dotted_qualifier(written_text(n)) {
+    Some(QSplit(m, bare)) -> ts_ref_qualified(r, m, bare, nargs, cx)
+    None                  -> ts_ref_of(r, ts_resolve(cx, written_text(n), nargs))
   }
 }
 
-# A type head: `m.T` picks the home, a bare `T` follows the ladder.
-# Nullary use sites (record literal and constructor paths) arrive with
-# `nargs = 0`.
-fn ts_head(n: String, nargs: Int, cx: TSCtx) : String = match split_dotted_qualifier(n) {
-  None -> ts_resolve(cx, n, nargs)
-  Some(q) -> match q { QSplit(m, bare) -> match ts_resolve_qualified(cx, m, bare, nargs) {
-    Some(s) -> s
-    None -> n
-  } }
-}
+fn ts_ref_qualified(r: DeclRef, m: String, bare: String, nargs: Int, cx: TSCtx) : DeclRef =
+  match ts_resolve_qualified(cx, m, bare, nargs) {
+    Some(s) -> DrSym(s)
+    None    -> r
+  }
+
+fn ts_ref_of(r: DeclRef, s: SymId) : DeclRef = if sym_raw(s) < 0 { r } else { DrSym(s) }
 
 fn ts_expr(e: Expr, sh: [String], cx: TSCtx) : Expr =
-  sw_expr(e, sh, (x, s) => ts_leaf(x, s, cx), (t) => ts_ty(t, cx), (n, hs) => sw_head_same(n, hs))
+  sw_expr(e, sh, (x, s) => ts_leaf(x, s, cx), (t) => ts_ty(t, cx), (r) => sw_head_same(r))
 
-#[doc("Respell the contested type names of one free-standing expression under the context's viewpoint; interpolation fragments surface after the decl-level pass ran.")]
+#[doc("Settle the contested type names of one free-standing expression under the context's viewpoint; interpolation fragments surface after the decl-level pass ran.")]
 pub fn ts_expr_scoped(e: Expr, cx: TSCtx) : Expr = ts_expr(e, [], cx)
 
 # A type-qualified constructor path: `T.Ctor` with `T` free and not a
 # module, or `m.T.Ctor` with `m` free.
 fn ts_leaf(e: Expr, sh: [String], cx: TSCtx) : Option[Expr] = match e.kind {
   EField(obj, f) -> match obj.kind {
-    EVar(n) ->
-      if list_has(sh, n) or ts_is_module(cx, n) { None }
-      else { ts_bare_path(e, obj, n, f, cx) }
+    EName(w) ->
+      if list_has(sh, written_text(w)) or ts_is_module(cx, written_text(w)) { None }
+      else { ts_bare_path(e, obj, written_text(w), f, cx) }
     EField(inner, mid) -> ts_qualified_path(e, inner, mid, f, sh, cx)
     _ -> None
   }
@@ -215,17 +183,17 @@ fn ts_leaf(e: Expr, sh: [String], cx: TSCtx) : Option[Expr] = match e.kind {
 }
 
 fn ts_bare_path(e: Expr, obj: Expr, n: String, f: String, cx: TSCtx) : Option[Expr] = {
-  let spelled = ts_resolve(cx, n, 0)
-  if spelled == n { None }
-  else { Some(ts_re(e, EField(ts_re(obj, EVar(spelled)), f))) }
+  let s = ts_resolve(cx, n, 0)
+  if sym_raw(s) < 0 { None }
+  else { Some(ts_re(e, EField(ts_re(obj, ESym(s, spec_none())), f))) }
 }
 
 fn ts_qualified_path(e: Expr, inner: Expr, mid: String, f: String,
       sh: [String], cx: TSCtx) : Option[Expr] = match inner.kind {
-    EVar(m) ->
-    if list_has(sh, m) { None }
-    else { match ts_resolve_qualified(cx, m, mid, 0) {
-      Some(s) -> Some(ts_re(e, EField(ts_re(inner, EVar(s)), f)))
+  EName(w) ->
+    if list_has(sh, written_text(w)) { None }
+    else { match ts_resolve_qualified(cx, written_text(w), mid, 0) {
+      Some(s) -> Some(ts_re(e, EField(ts_re(inner, ESym(s, spec_none())), f)))
       None -> None
     } }
   _ -> None
