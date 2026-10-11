@@ -44,61 +44,49 @@ pub fn dpr_record_spread(
   recs: RecScope,
   file: String,
   errs: Int
-) : DPRSpread / Console + File {
-
-  # Split: head FI is the spread field carrying `src`; rest are
-  # named overrides (parser already rejected pun / positional /
-  # second-spread, so each FI here pairs a real field name with an
-  # already-recursed expression).
-  match fis {
-    [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs }
-    [head, ...overrides] -> match head {
-      FI(_, marked) -> {
-        let src = field_written(marked)
-        match rec_of_head(recs, rh) {
-          None -> {
-            diag_error(file, line, col,
-              concat_all(["unknown record type `", rec_head_text(recs, rh),
-                          "` in `...` spread; declare the type before constructing it"]))
-            DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs + 1 }
-          }
-          Some(ri) -> match ri {
-            RI(_, tparams, fds, _) -> {
-              # Diagnose duplicate overrides (same field listed twice).
-              let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, 0)
-              # Diagnose overrides naming a field not declared on `T`.
-              let bad_errs = check_spread_unknown_overrides(overrides, fds, rec_head_text(recs, rh), file, line, col, 0)
-              let errs1 = errs + dup_errs + bad_errs
-              if dup_errs + bad_errs > 0 {
-                DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs1 }
-              } else {
-                let var_name = spread_src_var_name(line, col)
-                let head = head_settled(rh, ri)
-                let bind_pat = mk_pat(PBind(binder_minted(var_name)), line, col)
-                # Annotate the let with `T` for non-generic records so
-                # the existing nominal let-annotation check fires when
-                # `src : Q` with `Q != T` — spec's "spread source must
-                # match record type" reusing the typer's normal error
-                # path. Skipped for generic records: `T[a, b]` cannot
-                # be spelled without committing to a concrete arg
-                # tuple, so we let the typer infer and rely on its
-                # field-by-field check instead.
-                let ann_opt = match tparams {
-                  []           -> Some(mk_ty(TyName(head, []), line, col))
-                  [_, ..._rest] -> None
-                }
-                let bind_stmt = SLet(bind_pat, ann_opt, src)
-                let var_ref = mk_name(var_name, line, col)
-                let expanded = expand_spread_fields(fds, overrides, var_ref, line, col)
-                let lit = mk_expr(ERecordLit(head, expanded), line, col)
-                DPRSpread { expr: mk_expr(EBlock([bind_stmt], Some(lit)), line, col), errs: errs1 }
-              }
-            }
-          }
-        }
-      }
+) : DPRSpread / Console + File = match fis {
+  # The head field is the spread carrying the source; the rest are named
+  # overrides, each pairing a real field name with an already-recursed
+  # expression (the parser rejected every other shape).
+  [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs }
+  [FI(_, marked), ...overrides] -> match rec_of_head(recs, rh) {
+    None -> {
+      diag_error(file, line, col,
+        concat_all(["unknown record type `", rec_head_text(recs, rh),
+                    "` in `...` spread; declare the type before constructing it"]))
+      DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs + 1 }
     }
+    Some(ri) -> dpr_spread_of(rh, ri, fis, field_written(marked), overrides, line, col, recs, file, errs)
   }
+}
+
+fn dpr_spread_of(rh: DeclRef, ri: RecInfo, fis: [FieldInit], src: Expr, overrides: [FieldInit], line: Int,
+                 col: Int, recs: RecScope, file: String, errs: Int) : DPRSpread / Console + File = match ri {
+  RI(_, tparams, fds, _) -> {
+    # An override listed twice, or naming a field the record does not declare.
+    let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, 0)
+    let bad_errs = check_spread_unknown_overrides(overrides, fds, rec_head_text(recs, rh), file, line, col, 0)
+    let errs1 = errs + dup_errs + bad_errs
+    if dup_errs + bad_errs > 0 { DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs1 } }
+    else { DPRSpread { expr: dpr_spread_block(head_settled(rh, ri), tparams, fds, src, overrides, line, col), errs: errs1 } }
+  }
+}
+
+# `{ let v: T = src; T { f: override or v.f, ... } }`. The annotation
+# makes a source of another record type fail the ordinary let check. A
+# generic record has none: `T[a, b]` cannot be spelled without committing
+# to its arguments, so the typer's field-by-field check stands alone.
+fn dpr_spread_block(head: DeclRef, tparams: [TBinder], fds: [FieldDecl], src: Expr, overrides: [FieldInit],
+                    line: Int, col: Int) : Expr = {
+  let var_name = spread_src_var_name(line, col)
+  let bind_pat = mk_pat(PBind(binder_minted(var_name)), line, col)
+  let ann_opt = match tparams {
+    []            -> Some(mk_ty(TyName(head, []), line, col))
+    [_, ..._rest] -> None
+  }
+  let bind_stmt = SLet(bind_pat, ann_opt, src)
+  let expanded = expand_spread_fields(fds, overrides, mk_name(var_name, line, col), line, col)
+  mk_expr(EBlock([bind_stmt], Some(mk_expr(ERecordLit(head, expanded), line, col))), line, col)
 }
 
 #[doc("`e` with each read of a cell of `caps` lowered to a get of that cell.")]
@@ -226,44 +214,7 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
     # `caps` are capability binders, so a resolved reference is never
     # one and needs no cell read.
     ESym(_, _) -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
-    ECall(callee, args_) -> match callee.kind {
-      EMark(MkDeref) -> match args_ {
-        [x] -> lcr_deref(callee, x, caps, reject_at, line, col, file, errs)
-        _   -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
-      }
-      # A var's slot: every late read of the var is sent to it by the
-      # enclosing block, so it becomes the allocation it stood for.
-      EMark(MkVarSlot(_)) -> {
-        let ra = lcr_exprs(args_, caps, reject_at, file, errs)
-        VLExpr { expr: mk_expr(var_slot_call(k, ra.exprs), line, col), errs: ra.errs }
-      }
-      EField(base, fname) -> match base.kind {
-        EName(w) ->
-          if list_has(caps, written_text(w)) and (fname == "get" or fname == "set") {
-            # A real State op on the cell: `n.get()` (also what a naked
-            # read lowers to) or `n.set(v)` (also what `n := v` lowers
-            # to). Legal — recurse into the args only, NOT the callee,
-            # whose `EName(n)` base would re-lower to `n.get()` and yield
-            # `n.get().get()`. Escape is rejected separately.
-            let ra = lcr_exprs(args_, caps, reject_at, file, errs)
-            VLExpr { expr: mk_expr(ECall(callee, ra.exprs), line, col), errs: ra.errs }
-          } else {
-            let rc = lcr_expr(callee, caps, reject_at, file, errs)
-            let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
-            VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
-          }
-        _ -> {
-          let rc = lcr_expr(callee, caps, reject_at, file, errs)
-          let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
-          VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
-        }
-      }
-      _ -> {
-        let rc = lcr_expr(callee, caps, reject_at, file, errs)
-        let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
-        VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
-      }
-    }
+    ECall(callee, args_) -> lcr_call(k, callee, args_, caps, reject_at, line, col, file, errs)
     EBlock(stmts, tail) -> {
       let r = lcr_block(stmts, tail, caps, reject_at, file, errs)
       VLExpr { expr: mk_expr(EBlock(r.stmts, r.opt), line, col), errs: r.errs }
@@ -278,37 +229,8 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
       let ra = lcr_arms(arms, caps, reject_at, file, rs.errs)
       VLExpr { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
     }
-    EHandle(body, eff, tys, init_opt, alias_opt, clauses, ret_opt) -> {
-      let ri = lcr_opt(init_opt, caps, reject_at, file, errs)
-      let body_caps = match alias_opt {
-        Some(a) ->
-          if eff_is_cell(ref_sym(eff)) { [written_text(a.name), ...caps_remove_name(caps, written_text(a.name))] }
-          else { caps_remove_name(caps, written_text(a.name)) }
-        None -> caps
-      }
-      let rb = lcr_expr(body, body_caps, reject_at, file, ri.errs)
-      # A `with Eff as a` capability — a `var`/State/Reader cell OR a §6 named
-      # instance — may not outlive the handle that installed it: its evidence
-      # node is torn down at the closing brace. The same positional escape check
-      # (a closure that captures `a` and survives the block) applies to both.
-      let esc = match alias_opt {
-        Some(a) -> lcr_escape_in_value(rb.expr, written_text(a.name), file)
-        None -> 0
-      }
-      let rc = lcr_clauses(clauses, caps, reject_at, file, rb.errs + esc)
-      let rr = match ret_opt {
-        Some(HR(p, rbody, hl, hc)) -> {
-          let r = lcr_expr(rbody, caps_remove_name(caps, written_text(p.name)), reject_at, file, rc.errs)
-          VLExpr { expr: r.expr, errs: r.errs }
-        }
-        None -> VLExpr { expr: mk_expr(EUnit, line, col), errs: rc.errs }
-      }
-      let ret_opt1 = match ret_opt {
-        Some(HR(p, _, hl, hc)) -> Some(HR(p, rr.expr, hl, hc))
-        None -> None
-      }
-      VLExpr { expr: mk_expr(EHandle(rb.expr, eff, tys, ri.opt, alias_opt, rc.clauses, ret_opt1), line, col), errs: rr.errs }
-    }
+    EHandle(body, eff, tys, init_opt, alias_opt, clauses, ret_opt) ->
+      lcr_handle(body, eff, tys, init_opt, alias_opt, clauses, ret_opt, caps, reject_at, line, col, file, errs)
     EField(base, nm) -> {
       let r = lcr_expr(base, caps, reject_at, file, errs)
       VLExpr { expr: mk_expr(EField(r.expr, nm), line, col), errs: r.errs }
@@ -384,6 +306,74 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
     }
     _ -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
   }
+}
+
+fn lcr_call(k: ExprKind, callee: Expr, args_: [Expr], caps: [String], reject_at: Bool, line: Int, col: Int,
+            file: String, errs: Int) : VLExpr / Console + File = match callee.kind {
+  EMark(MkDeref) -> match args_ {
+    [x] -> lcr_deref(callee, x, caps, reject_at, line, col, file, errs)
+    _   -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
+  }
+  # A var's slot: every late read of the var is sent to it by the
+  # enclosing block, so it becomes the allocation it stood for.
+  EMark(MkVarSlot(_)) -> {
+    let ra = lcr_exprs(args_, caps, reject_at, file, errs)
+    VLExpr { expr: mk_expr(var_slot_call(k, ra.exprs), line, col), errs: ra.errs }
+  }
+  _ ->
+    if lcr_is_cell_op(callee, caps) {
+      # A State op on the cell: only the args recurse. The callee's
+      # base would re-lower to `n.get()` and yield `n.get().get()`;
+      # escape is rejected separately.
+      let ra = lcr_exprs(args_, caps, reject_at, file, errs)
+      VLExpr { expr: mk_expr(ECall(callee, ra.exprs), line, col), errs: ra.errs }
+    } else {
+      let rc = lcr_expr(callee, caps, reject_at, file, errs)
+      let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
+      VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
+    }
+}
+
+# `n.get` (also what a naked read lowers to) or `n.set` (also what
+# `n := v` lowers to) on a cell in `caps`.
+fn lcr_is_cell_op(callee: Expr, caps: [String]) : Bool = match callee.kind {
+  EField(base, fname) -> match base.kind {
+    EName(w) -> list_has(caps, written_text(w)) and (fname == "get" or fname == "set")
+    _        -> false
+  }
+  _ -> false
+}
+
+fn lcr_handle(body: Expr, eff: DeclRef, tys: [TypeExpr], init_opt: Option[Expr], alias_opt: Option[Binder],
+              clauses: [HClause], ret_opt: Option[HReturn], caps: [String], reject_at: Bool, line: Int, col: Int,
+              file: String, errs: Int) : VLExpr / Console + File = {
+  let ri = lcr_opt(init_opt, caps, reject_at, file, errs)
+  let rb = lcr_expr(body, lcr_handle_caps(eff, alias_opt, caps), reject_at, file, ri.errs)
+  # A `with Eff as a` capability — a cell or a named instance — may not
+  # outlive the handle that installed it: its evidence node is torn
+  # down at the closing brace.
+  let esc = match alias_opt {
+    Some(a) -> lcr_escape_in_value(rb.expr, written_text(a.name), file)
+    None    -> 0
+  }
+  let rc = lcr_clauses(clauses, caps, reject_at, file, rb.errs + esc)
+  match ret_opt {
+    Some(HR(p, rbody, hl, hc)) -> {
+      let rr = lcr_expr(rbody, caps_remove_name(caps, written_text(p.name)), reject_at, file, rc.errs)
+      VLExpr { expr: mk_expr(EHandle(rb.expr, eff, tys, ri.opt, alias_opt, rc.clauses, Some(HR(p, rr.expr, hl, hc))), line, col), errs: rr.errs }
+    }
+    None -> VLExpr { expr: mk_expr(EHandle(rb.expr, eff, tys, ri.opt, alias_opt, rc.clauses, None), line, col), errs: rc.errs }
+  }
+}
+
+# The cells a handle's body sees: its alias shadows an outer cell of the
+# same name, and is itself one when the effect is a cell.
+fn lcr_handle_caps(eff: DeclRef, alias_opt: Option[Binder], caps: [String]) : [String] = match alias_opt {
+  Some(a) -> {
+    let n = written_text(a.name)
+    if eff_is_cell(ref_sym(eff)) { [n, ...caps_remove_name(caps, n)] } else { caps_remove_name(caps, n) }
+  }
+  None -> caps
 }
 
 fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool, file: String, errs: Int) : VLStmts / Console + File {
@@ -491,34 +481,21 @@ pub fn body_escapes(name: String, e: Expr) : Bool {
     EOp(_) -> false
     # A mark is planted after this pass; nothing it stands for can escape.
     EMark(_) -> false
-    ECall(callee, args_) -> {
-      let callee_is_get_set = match callee.kind {
-        EField(base, fname) -> match base.kind {
-          EName(n) ->
-            if written_text(n) == name and (fname == "get" or fname == "set") { true }
-            else { false }
-          _ -> false
-        }
-        _ -> false
-      }
-      let callee_escape =
-        if callee_is_get_set { false } else { body_escapes(name, callee) }
-      callee_escape or args_escape(name, args_)
-    }
+    ECall(callee, args_) -> callee_escapes(name, callee) or args_escape(name, args_)
     EField(base, _) -> body_escapes(name, base)
-    EIndex(a, b) -> body_escapes(name, a) or body_escapes(name, b)
-    EBinop(_, a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EIndex(a, b) -> either_escapes(name, a, b)
+    EBinop(_, a, b) -> either_escapes(name, a, b)
     EUnop(_, x) -> body_escapes(name, x)
-    EIf(c, t_, eo) -> body_escapes(name, c) or body_escapes(name, t_) or opt_escapes(name, eo)
+    EIf(c, t_, eo) -> either_escapes(name, c, t_) or opt_escapes(name, eo)
     EBlock(stmts, tail) -> stmts_escape(name, stmts) or opt_escapes(name, tail)
-    EPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
-    EMapPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
-    EFlatMapPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
-    EFilterPipe(a, b) -> body_escapes(name, a) or body_escapes(name, b)
+    EPipe(a, b) -> either_escapes(name, a, b)
+    EMapPipe(a, b) -> either_escapes(name, a, b)
+    EFlatMapPipe(a, b) -> either_escapes(name, a, b)
+    EFilterPipe(a, b) -> either_escapes(name, a, b)
     EMatch(scr, arms) -> body_escapes(name, scr) or arms_escape(name, arms)
     ELambda(_, _) -> contains_var(name, e)
     EList(elems) -> elems_escape(name, elems)
-    ERange(a, b, opt_step) -> body_escapes(name, a) or body_escapes(name, b) or opt_escapes(name, opt_step)
+    ERange(a, b, opt_step) -> either_escapes(name, a, b) or opt_escapes(name, opt_step)
     ERecordLit(_, fields) -> fields_escape(name, fields)
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
     EBang(inner) -> body_escapes(name, inner)
@@ -533,12 +510,27 @@ pub fn body_escapes(name: String, e: Expr) : Bool {
     # pastes their bodies into an inline loop in the enclosing frame), so
     # a cell name under them is judged by the get/set-only rule, not the
     # closure-capture rule — the whole point of the loop lowering.
-    EIntrinsic(nm, args_) ->
-      if is_loop_intrinsic(nm) { loop_args_escape(name, args_) }
-      else { args_escape(name, args_) }
+    EIntrinsic(nm, args_) -> intrinsic_args_escape(name, nm, args_)
     ESurface(sf) -> args_escape(name, surface_children(sf))
   }
 }
+
+# The cell's own `name.get` / `name.set` is a use of the cell, not an escape.
+fn callee_escapes(name: String, callee: Expr) : Bool =
+  if is_cell_op_callee(name, callee) { false } else { body_escapes(name, callee) }
+
+fn is_cell_op_callee(name: String, callee: Expr) : Bool = match callee.kind {
+  EField(base, fname) -> match base.kind {
+    EName(n) -> written_text(n) == name and (fname == "get" or fname == "set")
+    _        -> false
+  }
+  _ -> false
+}
+
+fn either_escapes(name: String, a: Expr, b: Expr) : Bool = body_escapes(name, a) or body_escapes(name, b)
+
+fn intrinsic_args_escape(name: String, nm: Intrinsic, args_: [Expr]) : Bool =
+  if is_loop_intrinsic(nm) { loop_args_escape(name, args_) } else { args_escape(name, args_) }
 
 fn loop_args_escape(name: String, es: [Expr]) : Bool {
   match es {
@@ -647,52 +639,47 @@ pub fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 }
 
-fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col: Int) : ExprKind {
-  match k {
-    # The only kind that needs special handling: a call site that
-    # matches `name.get()` or `name.set(v)` gets lowered to
-    # `array_get(slot, 0)` / `array_set(slot, 0, v)`. All other
-    # kinds (and non-matching ECalls) recurse purely structurally.
-    ECall(callee, args_) -> {
-      let getset = match callee.kind {
-        EField(base, fname) -> match base.kind {
-          EName(n) ->
-            if written_text(n) == name and fname == "get" { Some(VsGet) }
-            else if written_text(n) == name and fname == "set" { Some(VsSet) }
-            else { None }
-          _ -> None
-        }
-        _ -> None
-      }
-      match getset {
-        Some(op) -> {
-          let slot_e = mk_name(slot_name, line, col)
-          let zero = mk_expr(mk_int_synth(0), line, col)
-          match op {
-            VsGet -> ECall(builtin_mk(CbArrayGet, line, col), [slot_e, zero])
-            # `name.set(v)`: emit `{ let _ = array_set(slot, 0, v); () }`
-            # so the result type stays Unit (matches the canonical clause).
-            VsSet -> {
-              let v = match args_ {
-                [a, ..._ignore] -> specialise_body(name, slot_name, a)
-                [] -> mk_expr(EUnit, line, col)
-              }
-              let set_call = mk_expr(
-                ECall(builtin_mk(CbArraySet, line, col), [slot_e, zero, v]),
-                line, col)
-              let let_pat = mk_pat(PWild, line, col)
-              let let_stmt = SLet(let_pat, None, set_call)
-              EBlock([let_stmt], Some(mk_expr(EUnit, line, col)))
-            }
-          }
-        }
-        None ->
-          ECall(specialise_body(name, slot_name, callee),
-                map(args_, (a) => specialise_body(name, slot_name, a)))
-      }
-    }
-    _ -> dsg_map_expr_kind(k, (sub) => specialise_body(name, slot_name, sub))
+fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col: Int) : ExprKind = match k {
+  # Only a call of `name.get()` or `name.set(v)` is rewritten; every
+  # other kind recurses structurally.
+  ECall(callee, args_) -> match slot_op_of(name, callee) {
+    Some(VsGet) -> slot_read(slot_name, line, col)
+    Some(VsSet) -> slot_write(name, slot_name, args_, line, col)
+    None ->
+      ECall(specialise_body(name, slot_name, callee),
+            map(args_, (a) => specialise_body(name, slot_name, a)))
   }
+  _ -> dsg_map_expr_kind(k, (sub) => specialise_body(name, slot_name, sub))
+}
+
+fn slot_op_of(name: String, callee: Expr) : Option[VarSlotOp] = match callee.kind {
+  EField(base, fname) -> match base.kind {
+    EName(n) ->
+      if written_text(n) != name { None }
+      else if fname == "get" { Some(VsGet) }
+      else if fname == "set" { Some(VsSet) }
+      else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn slot_read(slot_name: String, line: Int, col: Int) : ExprKind = {
+  let slot_e = mk_name(slot_name, line, col)
+  let zero = mk_expr(mk_int_synth(0), line, col)
+  ECall(builtin_mk(CbArrayGet, line, col), [slot_e, zero])
+}
+
+# `{ let _ = array_set(slot, 0, v); () }`, so the result type stays Unit.
+fn slot_write(name: String, slot_name: String, args_: [Expr], line: Int, col: Int) : ExprKind = {
+  let slot_e = mk_name(slot_name, line, col)
+  let zero = mk_expr(mk_int_synth(0), line, col)
+  let v = match args_ {
+    [a, ..._ignore] -> specialise_body(name, slot_name, a)
+    []              -> mk_expr(EUnit, line, col)
+  }
+  let set_call = mk_expr(ECall(builtin_mk(CbArraySet, line, col), [slot_e, zero, v]), line, col)
+  EBlock([SLet(mk_pat(PWild, line, col), None, set_call)], Some(mk_expr(EUnit, line, col)))
 }
 
 #[doc("`e` with each call on a nursery capability of `s` rewritten to the operation it performs.")]
@@ -713,88 +700,15 @@ pub fn rewrite_nursery_caps_expr(e: Expr, s: NCapStack, file: String,
 fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
                                bw: BrandWalk, line: Int, col: Int) : NurseryRwKind {
   match k {
-    ECall(callee, args_) -> {
-      # Detect three shapes:
-      #   (a) `nursery { n -> body }` — the cap-binding scope.
-      #   (b) `n.<op>(args)` where `n` is an active cap binder —
-      #       rewrite the callee + record the (line, col, brand) so
-      #       the post-rewrite brand-mismatch check can attribute
-      #       this call to its scope.
-      #   (c) anything else — recurse structurally.
-      match callee.kind {
-        EName(callee_name) ->
-          if written_text(callee_name) == "nursery" {
-            rewrite_nursery_call(callee, args_, s, file, bw, line, col)
-          } else {
-            let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
-            let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
-            NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
-          }
-        EField(base, op_name) -> match base.kind {
-          EName(name) -> {
-            if is_nursery_cap_op(op_name) {
-              match ncs_lookup(s, written_text(name)) {
-                Some(bid) -> {
-                  # Record this call site's brand attribution.
-                  let bw1 = bw_record_call(bw, file, line, col, bid, op_name)
-                  let ar = rewrite_nursery_caps_exprs(args_, s, file, bw1, [])
-                  let new_callee = mk_expr(
-                    EField(spawn_ref(base.line, base.col), op_name),
-                    callee.line, callee.col)
-                  NurseryRwKind { kind: ECall(new_callee, ar.exprs), bw: ar.bw }
-                }
-                None -> {
-                  let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
-                  let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
-                  NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
-                }
-              }
-            } else {
-              let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
-              let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
-              NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
-            }
-          }
-          _ -> {
-            let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
-            let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
-            NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
-          }
-        }
-        _ -> {
-          let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
-          let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
-          NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
-        }
-      }
-    }
-    EField(base, op_name) -> {
-      # Bare `n.op` (without call): rewrite to `Spawn.op` if `n` is
-      # an active cap. The typer rejects bare effect ops at use
-      # sites, so this branch is mostly defensive; we still rewrite
-      # so the diagnostic surface is consistent.
-      match base.kind {
-        EName(name) -> {
-          if is_nursery_cap_op(op_name) {
-            match ncs_lookup(s, written_text(name)) {
-              Some(_) ->
-                NurseryRwKind {
-                  kind: EField(spawn_ref(base.line, base.col), op_name),
-                  bw: bw }
-              None -> {
-                let br = rewrite_nursery_caps_expr(base, s, file, bw)
-                NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
-              }
-            }
-          } else {
-            let br = rewrite_nursery_caps_expr(base, s, file, bw)
-            NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
-          }
-        }
-        _ -> {
-          let br = rewrite_nursery_caps_expr(base, s, file, bw)
-          NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
-        }
+    ECall(callee, args_) -> rewrite_nursery_caps_call(callee, args_, s, file, bw, line, col)
+    # A bare `n.op` on an active capability: the typer rejects a bare
+    # effect op at its use site, and the rewrite keeps that diagnostic
+    # on the same surface as a call's.
+    EField(base, op_name) -> match nursery_cap_brand(base, op_name, s) {
+      Some(_) -> NurseryRwKind { kind: EField(spawn_ref(base.line, base.col), op_name), bw: bw }
+      None    -> {
+        let br = rewrite_nursery_caps_expr(base, s, file, bw)
+        NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
       }
     }
     ELambda(ps, body) -> {
@@ -893,6 +807,41 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
     # Leaves and forms with no sub-Exprs.
     _ -> NurseryRwKind { kind: k, bw: bw }
   }
+}
+
+# Three shapes: `nursery { n -> body }`, the scope that binds a
+# capability; `n.<op>(args)` on an active capability, whose callee is
+# rewritten and whose site is recorded so the brand check can attribute
+# the call to its scope; and any other call, which recurses.
+fn rewrite_nursery_caps_call(callee: Expr, args_: [Expr], s: NCapStack, file: String, bw: BrandWalk,
+                             line: Int, col: Int) : NurseryRwKind = match callee.kind {
+  EName(callee_name) ->
+    if written_text(callee_name) == "nursery" { rewrite_nursery_call(callee, args_, s, file, bw, line, col) }
+    else { rewrite_nursery_plain_call(callee, args_, s, file, bw) }
+  EField(base, op_name) -> match nursery_cap_brand(base, op_name, s) {
+    Some(bid) -> {
+      let bw1 = bw_record_call(bw, file, line, col, bid, op_name)
+      let ar = rewrite_nursery_caps_exprs(args_, s, file, bw1, [])
+      let new_callee = mk_expr(EField(spawn_ref(base.line, base.col), op_name), callee.line, callee.col)
+      NurseryRwKind { kind: ECall(new_callee, ar.exprs), bw: ar.bw }
+    }
+    None -> rewrite_nursery_plain_call(callee, args_, s, file, bw)
+  }
+  _ -> rewrite_nursery_plain_call(callee, args_, s, file, bw)
+}
+
+fn rewrite_nursery_plain_call(callee: Expr, args_: [Expr], s: NCapStack, file: String,
+                              bw: BrandWalk) : NurseryRwKind = {
+  let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+  let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+  NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+}
+
+# The brand of the active capability `base` names, when `op_name` is one
+# of its operations.
+fn nursery_cap_brand(base: Expr, op_name: String, s: NCapStack) : Option[Int] = match base.kind {
+  EName(name) -> if is_nursery_cap_op(op_name) { ncs_lookup(s, written_text(name)) } else { None }
+  _           -> None
 }
 
 fn rewrite_nursery_caps_exprs(es: [Expr], s: NCapStack, file: String,
@@ -1123,64 +1072,42 @@ don't take a fiber).
 """)]
 pub fn check_brand_consume(op_name: String, args_: [Expr], expected_bid: Int,
                         env: BrandEnv, file: String, calls: [BrandCall],
-                        brs: [BrandRec], errs: Int) : Int / Console + File {
+                        brs: [BrandRec], errs: Int) : Int / Console + File = match args_ {
+  [arg, ..._other_args] ->
+    if op_name == "await" or op_name == "cancel" {
+      check_brand_arg(arg, op_name, expected_bid, env, file, calls, brs, errs)
+    } else if op_name == "select" {
+      check_brand_select_arg(arg, expected_bid, env, file, calls, brs, errs)
+    } else { errs }
+  _ -> errs
+}
 
-  if op_name == "await" or op_name == "cancel" {
-    match args_ {
-      [arg, ..._other_args] -> match expr_brand(arg, env, calls) {
-        Some(found) ->
-          if found == expected_bid { errs }
-          else {
-            emit_brand_mismatch(file, arg.line, arg.col,
-                                  expected_bid, found, brs, op_name)
-            errs + 1
-          }
-        None -> errs
+# `errs`, plus one when `arg` carries a brand other than `expected_bid`.
+fn check_brand_arg(arg: Expr, op_name: String, expected_bid: Int, env: BrandEnv, file: String,
+                   calls: [BrandCall], brs: [BrandRec], errs: Int) : Int / Console + File =
+  match expr_brand(arg, env, calls) {
+    Some(found) ->
+      if found == expected_bid { errs }
+      else {
+        emit_brand_mismatch(file, arg.line, arg.col, expected_bid, found, brs, op_name)
+        errs + 1
       }
-      _ -> errs
-    }
-  } else if op_name == "select" {
-    match args_ {
-      [arg, ..._other_args] -> match arg.kind {
-        EList(els) -> check_brand_select_elems(els, expected_bid, env, file, calls, brs, errs)
-        _ -> match expr_brand(arg, env, calls) {
-          Some(found) ->
-            if found == expected_bid { errs }
-            else {
-              emit_brand_mismatch(file, arg.line, arg.col,
-                                    expected_bid, found, brs, op_name)
-              errs + 1
-            }
-          None -> errs
-        }
-      }
-      _ -> errs
-    }
-  } else { errs }
+    None -> errs
+  }
+
+fn check_brand_select_arg(arg: Expr, expected_bid: Int, env: BrandEnv, file: String,
+                          calls: [BrandCall], brs: [BrandRec], errs: Int) : Int / Console + File = match arg.kind {
+  EList(els) -> check_brand_select_elems(els, expected_bid, env, file, calls, brs, errs)
+  _          -> check_brand_arg(arg, "select", expected_bid, env, file, calls, brs, errs)
 }
 
 fn check_brand_select_elems(els: [ListElem], expected_bid: Int,
                               env: BrandEnv, file: String,
                               calls: [BrandCall], brs: [BrandRec],
-                              errs: Int) : Int / Console + File {
-
-  match els {
-    [] -> errs
-    [el, ...rest] -> {
-      let e1 = match el {
-        ElPlain(x) -> match expr_brand(x, env, calls) {
-          Some(found) ->
-            if found == expected_bid { errs }
-            else {
-              emit_brand_mismatch(file, x.line, x.col,
-                                    expected_bid, found, brs, "select")
-              errs + 1
-            }
-          None -> errs
-        }
-        ElSpread(_) -> errs
-      }
-      check_brand_select_elems(rest, expected_bid, env, file, calls, brs, e1)
-    }
-  }
+                              errs: Int) : Int / Console + File = match els {
+  [] -> errs
+  [ElPlain(x), ...rest] ->
+    check_brand_select_elems(rest, expected_bid, env, file, calls, brs,
+                             check_brand_arg(x, "select", expected_bid, env, file, calls, brs, errs))
+  [ElSpread(_), ...rest] -> check_brand_select_elems(rest, expected_bid, env, file, calls, brs, errs)
 }
