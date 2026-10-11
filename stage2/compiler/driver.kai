@@ -1525,7 +1525,9 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], core
 # `errs` is the count of import-resolution failures so
 # `compile_source` can fold it into the exit code even when nothing
 # downstream references a name from the missing module.
-type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int, Verdict, [ImportSeg], [ModScope], [SelImport], [NEnt])
+# The last slot is the import check's ledger: its verdict waits for the
+# derives, whose expansions mention names no token of a file spells.
+type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int, Verdict, [ImportSeg], [ModScope], [SelImport], [NEnt], ImportLedger)
 
 # Re-key the root file's fn-bounds records (parser-supplied `mo = None`)
 # to the target module, matching how `tag_target_decls_module_origin`
@@ -1579,11 +1581,11 @@ fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], sea
                                  process_imports(base_dir, root_decls, search_paths, cores, "", cache_dir, rs0))
   let rs1 = rs_scan_imports(rs_roots, canon_root, root_path, root_src, root_tokens, root_decls, "")
   # A grouped build's own diagnostics come from each test file built alone.
-  if list_is_empty(test_roots) { report_imports(rs1.imports, canon_root) }
+  let ledger = if list_is_empty(test_roots) { rs1.imports } else { ledger_new([]) }
   let imports = rs_decls(rs1)
   let n_imports = list_length(imports)
   let all_decls = list_append(imports, non_import_decls(root_decls))
-  EP_Mod(all_decls, rs_modules(rs1), n_imports, Verdict(rs1.errs, list_reverse(rs1.diags)), rs_segs(rs1), rs1.scopes, rs_sels(rs1), rs_rows(rs1))
+  EP_Mod(all_decls, rs_modules(rs1), n_imports, Verdict(rs1.errs, list_reverse(rs1.diags)), rs_segs(rs1), rs1.scopes, rs_sels(rs1), rs_rows(rs1), ledger)
 }
 
 # Each test root loads as if the root file imported it, after its own imports.
@@ -4413,7 +4415,7 @@ fn mut_site_at(sites: [MutSite], i: Int) : Option[MutSite] {
 # reached, and so everything `kai lint` may report on. Core is excluded
 # because a unit merges the stdlib into the same decl stream.
 fn lint_owned_mods(expanded: ExpandedProgram) : [String] =
-  core_mod_names(match expanded { EP_Mod(_, mt, _, _, _, _, _, _) -> mt }, [])
+  core_mod_names(match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }, [])
 
 # Pruning makes the core program-dependent, so it runs only where the
 # compile writes no cache entry keyed without the program.
@@ -4749,7 +4751,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                           if user_cache { tcut_cache_dir(core_cache.proj_dir, path) } else { "" },
                                           test_roots)
             match expanded {
-              EP_Mod(_, mods, _, _, _, scopes, _, _) ->
+              EP_Mod(_, mods, _, _, _, scopes, _, _, _) ->
                 if test_plan != "" { let _w = write_file(test_plan, tplan_text(scopes, mods)) }
             }
             # Dissolve the parser's surface-fidelity nodes (contract
@@ -4761,13 +4763,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # Kept un-lowered for `--ast`: the dump must show the
             # surface forms (tparam bounds, block lambdas, contracts)
             # or an AST-equality gate over it is blind to their loss.
-            let surface_decls = match expanded { EP_Mod(ds, _, _, _, _, _, _, _) -> ds }
+            let surface_decls = match expanded { EP_Mod(ds, _, _, _, _, _, _, _, _) -> ds }
             # The program's one symbol table: the rows the parser minted
             # for every loaded file, with the core builtins. A pass that
             # mints declarations hands its rows up and the table is
             # extended; ids are derived, so none moves.
             let tab0 = st_program(list_append(core_rows,
-              list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows) -> rows }, parsed.names)),
+              list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _) -> rows }, parsed.names)),
               target_mod_name, core_mod_names(core_mods, []))
             # Bounds are stripped by the lowering below; keep them for the
             # monomorphiser, keyed by declaration once the symbols exist.
@@ -4780,11 +4782,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # the wrapper variant.
             let stripped_laws = strip_law_wrappers(expanded_decls_raw0)
             let expanded_decls_raw = strip_sl_decls(stripped_laws)
-            let n_imports_raw = match expanded { EP_Mod(_, _, n, _, _, _, _, _) -> n }
+            let n_imports_raw = match expanded { EP_Mod(_, _, n, _, _, _, _, _, _) -> n }
             # Count of import-resolution failures (e.g.
             # `import nothing_here` whose file is missing on the search
             # path). Folded into the exit-code aggregator below.
-            let import_resolve_vd = match expanded { EP_Mod(_, _, _, v, _, _, _, _) -> v }
+            let import_resolve_vd = match expanded { EP_Mod(_, _, _, v, _, _, _, _, _) -> v }
             let import_resolve_errs = match import_resolve_vd { Verdict(n, _) -> n }
             # Register the target file itself in the module table under
             # its own basename, mirroring what `load_core_file` does for
@@ -4820,7 +4822,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # any same-named core (intentional: the file is
             # "itself").
             let module_table = list_append(
-              list_append(core_mods, match expanded { EP_Mod(_, mt, _, _, _, _, _, _) -> mt }),
+              list_append(core_mods, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }),
               [target_me])
             # The pre-typer passes walk one flat stream holding every
             # imported module's decls, so a diagnostic takes its file
@@ -4853,12 +4855,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # binding the same module under another name cannot displace
             # it. `module_table` stays the fallback for the names every
             # file sees without importing them (auto-loaded cores).
-            let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc, _, _) -> sc }
-            let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _) -> sg }
+            let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc, _, _, _) -> sc }
+            let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _) -> sg }
             let mod_tabs = mtabs_build(mod_scopes, module_table)
             let mod_imps = scope_imports(mod_scopes, module_table)
             let core_decls_l = tparam_bind_decls(surface_lower_decls(core_decls, tab0))
-            let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si, _) -> si },
+            let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si, _, _) -> si },
                                              mod_scopes, module_table, expanded_decls, tab0, target_mod_name)
             let sym_views = fv_build(mod_imps,
                                      sel_imports, mod_scopes, module_table,
@@ -4973,7 +4975,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # Segment views of the post-rqc streams: core segment
             # lengths come from `core_segs` (rqc rewrites decls
             # 1:1), import boundaries from the resolver's marks.
-            let import_seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _) -> sg }
+            let import_seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _) -> sg }
             let pa_segs = list_append(
               pa_reseg(core_segs, qualified_core),
               list_append(
@@ -5019,7 +5021,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # the file each declaration was read from: the root by its own
             # path, an import by its entry's, never through a module name a
             # user file can share with a core module.
-            let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _, _) -> mt }, []), path)
+            let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }, []), path)
             let kai_decl_vd = vd_render(list_append(
               kai_builtin_decl_diags(qualified_core_mangled, tab1, diag_files(module_files(core_mods, []), path), is_core_path),
               kai_builtin_decl_diags(qualified_decls, tab1, import_files, is_core_path)))
@@ -5255,6 +5257,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                           core_mod_names(core_mods, []),
                                           mod_imps,
                                           PScope(tab3, sym_views, target_mod_name))
+            report_imports(ledger_note_derived(match expanded { EP_Mod(_, _, _, _, _, _, _, _, l) -> l }, lowered.minted, diag_ctx),
+                           abspath(path))
             # The dispatchers, lowered impl methods and derived functions
             # the lowering minted. The passes below take this binding, not
             # the same table read back out of a resolver result: `Mutable`

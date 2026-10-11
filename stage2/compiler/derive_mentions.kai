@@ -1,0 +1,141 @@
+#[doc("""
+compiler.derive_mentions - the names a derived declaration leaves written.
+
+A derive's expansion is source nobody typed. Its bodies name the derived
+type and the library functions they call by id; everything else is
+written text the resolver settles in the scope of the file that wrote
+the derive, so that file's imports must bring it. The import check
+reads a file's tokens and never sees these names: it counts them as
+mentions through here.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.written
+
+#[doc("Every name `d` leaves written, a qualified one as its qualifier: what the file `d` is homed in must have in scope.")]
+pub fn derive_mentions(d: Decl) : [String] = dm_decl(d, [])
+
+fn dm_decl(d: Decl, acc: [String]) : [String] = match d {
+  DImpl(p, pargs, target, ms, _, _, tps, _) ->
+    dm_decls(ms, dm_tparams(tps, dm_types([target, ...pargs], dm_ref(p, acc))))
+  DFn(_, _, tps, ps, ret, row, body, _, _, _) ->
+    dm_expr(body, dm_row(row, dm_opt_type(ret, dm_params(ps, dm_tparams(tps, acc)))))
+  _ -> acc
+}
+
+fn dm_decls(ds: [Decl], acc: [String]) : [String] = match ds {
+  []           -> acc
+  [d, ...rest] -> dm_decls(rest, dm_decl(d, acc))
+}
+
+# A reference by id needs no import; a qualified one needs its qualifier.
+fn dm_ref(r: DeclRef, acc: [String]) : [String] = match r {
+  DrSym(_)              -> acc
+  DrWritten(None, n)    -> [written_text(n), ...acc]
+  DrWritten(Some(q), _) -> [written_text(q), ...acc]
+}
+
+fn dm_refs(rs: [DeclRef], acc: [String]) : [String] = match rs {
+  []           -> acc
+  [r, ...rest] -> dm_refs(rest, dm_ref(r, acc))
+}
+
+fn dm_tparams(tps: [TBinder], acc: [String]) : [String] = match tps {
+  []            -> acc
+  [tp, ...rest] -> dm_tparams(rest, dm_refs(tp.bounds, acc))
+}
+
+fn dm_params(ps: [Param], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> dm_params(rest, dm_opt_type(p.ptype, acc))
+}
+
+fn dm_opt_type(ot: Option[TypeExpr], acc: [String]) : [String] = match ot {
+  None    -> acc
+  Some(t) -> dm_type(t, acc)
+}
+
+fn dm_types(ts: [TypeExpr], acc: [String]) : [String] = match ts {
+  []           -> acc
+  [t, ...rest] -> dm_types(rest, dm_type(t, acc))
+}
+
+fn dm_type(t: TypeExpr, acc: [String]) : [String] = match t.tkind {
+  TyName(r, args)  -> dm_types(args, dm_ref(r, acc))
+  TyList(inner)    -> dm_type(inner, acc)
+  TyFn(ps, r, row) -> dm_row(row, dm_type(r, dm_types(ps, acc)))
+  TyDim(b, _)      -> dm_type(b, acc)
+  TyRefine(b, e)   -> dm_expr(e, dm_type(b, acc))
+  TyRow(row)       -> dm_row(row, acc)
+  TyParam(_, args) -> dm_types(args, acc)
+  TySurface(_)     -> acc
+}
+
+fn dm_row(row: RowExpr, acc: [String]) : [String] = match row {
+  REmpty        -> acc
+  RClosed(ls)   -> dm_labels(ls, acc)
+  ROpen(_, ls)  -> dm_labels(ls, acc)
+}
+
+fn dm_labels(ls: [RowLabel], acc: [String]) : [String] = match ls {
+  []                     -> acc
+  [RL(r, args), ...rest] -> dm_labels(rest, dm_types(args, dm_ref(r, acc)))
+}
+
+fn dm_expr(e: Expr, acc: [String]) : [String] = dm_positions(xp_positions(e), dm_node(e.kind, acc))
+
+fn dm_positions(ps: [XPos], acc: [String]) : [String] = match ps {
+  []                 -> acc
+  [XP(_, x), ...rest] -> dm_positions(rest, dm_expr(x, acc))
+}
+
+# What a node names beside its sub-expressions: a head, a pattern or an
+# annotation is no position. A string an expansion builds is a literal,
+# with no interpolation to read.
+fn dm_node(k: ExprKind, acc: [String]) : [String] = match k {
+  EName(w)                        -> [written_text(w), ...acc]
+  EModCall(q, _)                  -> [written_text(q), ...acc]
+  ERecordLit(r, _)                -> dm_ref(r, acc)
+  EVariantsOf(t, _)               -> dm_type(t, acc)
+  EMatch(_, arms)                 -> dm_arms(arms, acc)
+  ELambda(ps, _)                  -> dm_params(ps, acc)
+  EBlock(ss, _)                   -> dm_stmts(ss, acc)
+  EHandle(_, r, tys, _, _, cs, _) -> dm_clauses(cs, dm_types(tys, dm_ref(r, acc)))
+  _                               -> acc
+}
+
+fn dm_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []                      -> acc
+  [Arm(p, _, _), ...rest] -> dm_arms(rest, dm_pat(p, acc))
+}
+
+fn dm_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []                         -> acc
+  [SLet(p, ot, _), ...rest]  -> dm_stmts(rest, dm_opt_type(ot, dm_pat(p, acc)))
+  [_, ...rest]               -> dm_stmts(rest, acc)
+}
+
+fn dm_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []                            -> acc
+  [HC(_, ps, _, _, _), ...rest] -> dm_clauses(rest, dm_params(ps, acc))
+}
+
+fn dm_pats(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> dm_pats(rest, dm_pat(p, acc))
+}
+
+fn dm_pat(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PVariant(r, subs)     -> dm_pats(subs, dm_ref(r, acc))
+  PVariantRecord(r, fs) -> dm_pfields(fs, dm_ref(r, acc))
+  PRecord(fs)           -> dm_pfields(fs, acc)
+  PList(ps, _)          -> dm_pats(ps, acc)
+  PAs(_, inner)         -> dm_pat(inner, acc)
+  _                     -> acc
+}
+
+fn dm_pfields(fs: [PField], acc: [String]) : [String] = match fs {
+  []                           -> acc
+  [PField(_, p, _), ...rest]   -> dm_pfields(rest, dm_pat(p, acc))
+}
