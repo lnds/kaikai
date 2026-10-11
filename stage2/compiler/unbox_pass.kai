@@ -1,0 +1,73 @@
+#[doc("""
+The unboxing pass: every expression node of the monomorphised program is
+given a representation mode.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.spec_names
+import compiler.fnreg
+import compiler.fn_index
+import compiler.unbox
+import compiler.unbox_walk
+
+#
+# Sits between monomorphisation and perceus_pass. Walks every
+# top-level fn / test body and rewrites each `Expr.mode` from the
+# parser default (`MUnknown`) to either `MBoxed` (the current
+# everywhere behaviour) or `MUnboxed` (raw C scalar — `int64_t`
+# for `Int`, `int` for `Bool`, `uint32_t` for `Char`).
+#
+# The pass is local: it does not propagate across fn boundaries.
+# Function parameters and return values stay `MBoxed` per
+# Phase 2 non-goal #1; the call boundary is the cheapest place
+# to keep boxed.
+#
+# M3 (this commit): activates the analysis for `let x = <int-arith>`
+# style expressions. Local `let` bindings whose RHS is a numeric
+# `Int` arithmetic tree (`+ - * / // % ^`) collapse to raw
+# `int64_t` storage; subsequent reads stay raw inside other
+# arithmetic, and box at the call/return boundary. The emitter's
+# manual box/unbox dance for the bit-ops intrinsics
+# (`emit_call_value` lines ~7920–8060) collapses naturally because
+# the operands now carry `MUnboxed` straight through.
+#
+# Subsequent milestones extend the analysis to comparisons, EIf
+# cond, and match scrutinees.
+pub fn unbox_pass(decls: [Decl], tab: SymTab, specs: SpecNames, cis: [CtorIntSlots], nat: Bool, entry: SymId) : [Decl] / Console = {
+  let fx = fnx_with_raw_prims(fnx_with_effects(fnx_build(register_fn_decls(decls, tab, specs, entry)), decls))
+  let fns = if nat { fnx_with_vec_raw(fx, decls) } else { fx }
+  map(decls, (d) => unbox_decl(d, fns, cis, nat))
+}
+
+fn unbox_decl(d: Decl, fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Decl / Console {
+
+  match d {
+    DFn(is_pub, fsym, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
+      # Phase 3 unboxing: when this DFn is itself a UFn, seed the
+      # local-binding env with each parameter marked MUnboxed so
+      # reads of the param in the body resolve to the raw alias
+      # `kair_<pname>` (planted by emit_fn_body) instead of the
+      # boxed `kai_<pname>`. The body's tail return inherits its
+      # mode from the body itself; emit_fn_body emits the raw
+      # `return <raw>;` form when the fn is UFn.
+      let env0 = match fnx_decl_sig(fns, fsym) {
+        Some(US(_, _, mask)) -> ufn_param_env(params, mask, [])
+        None    -> []
+      }
+      let body1 = unbox_expr_aware(body, env0, fns, cis, nat)
+      DFn(is_pub, fsym, tparams, params, opt_ret, row, body1, ln, cl, mo)
+    }
+    DTest(desc, body, ln, cl, mo) -> DTest(desc, unbox_expr_aware(body, [], fns, cis, nat), ln, cl, mo)
+    DBench(desc, body, ln, cl, mo) -> DBench(desc, unbox_expr_aware(body, [], fns, cis, nat), ln, cl, mo)
+    DCheck(desc, ps, body, ln, cl, mo) -> DCheck(desc, ps, unbox_expr_aware(body, [], fns, cis, nat), ln, cl, mo)
+    DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
+      DImpl(name, proto_args, ty, map(sub_decls, (sd) => unbox_decl(sd, fns, cis, nat)), l, c, tps, isym)
+    DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner, fns, cis, nat), l, c)
+    DUnstable(inner, l, c) -> DUnstable(unbox_decl(inner, fns, cis, nat), l, c)
+    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, unbox_decl(inner, fns, cis, nat), l, c, mo)
+    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, unbox_decl(inner, fns, cis, nat), l, c, mo)
+    DConstructor(inner, l, c) -> DConstructor(unbox_decl(inner, fns, cis, nat), l, c)
+    _ -> d
+  }
+}
