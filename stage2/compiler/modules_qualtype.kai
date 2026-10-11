@@ -1,0 +1,369 @@
+#[doc("""
+The qualified-type rewrite inside signatures, expressions and patterns:
+a `mod.Type` head resolved against the module table.
+""")]
+
+import compiler.ast
+import compiler.module_table
+import compiler.written
+import compiler.modules_dotted
+
+#[doc("""
+The name a reported qualified type is left with. A type name starts
+uppercase, so no declaration can answer it: the typer fails on it and
+the build stops. Nothing reads it back.
+""")]
+pub fn qualtype_unresolvable() : String = "__qualtype_bad__"
+
+#[doc("A type expression with every `mod.Type` head resolved against the module table.")]
+pub fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Console + File = match te.tkind {
+
+  TyName(r, targs) -> {
+    let targs1 = qualtype_te_list(targs, mt, file)
+    match r {
+      DrWritten(Some(q), n) -> {
+        let mod = written_text(q)
+        let ty = written_text(n)
+        match mt_lookup_member_at(mt, mod, ty, file, te.line, te.col) {
+          None -> {
+            let _ = qt_diag_unknown_mod(mod, ty, file, te.line, te.col)
+            TypeExpr { tkind: TyName(ref_written(qualtype_unresolvable()), []), line: te.line, col: te.col }
+          }
+          Some(me) ->
+            if me_has_export(me, ty) {
+              TypeExpr { tkind: TyName(ref_qualified(mt_member_home(mt, mod, ty), ty), targs1), line: te.line, col: te.col }
+            } else {
+              let exports = match me { ME(_, exs, _, _) -> exs }
+              let _ = qt_diag_missing_type(mod, ty, exports, file, te.line, te.col)
+              TypeExpr { tkind: TyName(ref_written(qualtype_unresolvable()), []), line: te.line, col: te.col }
+            }
+        }
+      }
+      _ -> TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
+    }
+  }
+  TyList(inner) ->
+    TypeExpr { tkind: TyList(qualtype_te(inner, mt, file)), line: te.line, col: te.col }
+  TyFn(ps, ret, row) ->
+    TypeExpr { tkind: TyFn(qualtype_te_list(ps, mt, file),
+                            qualtype_te(ret, mt, file),
+                            qualtype_row(row, mt, file)),
+                line: te.line, col: te.col }
+  TyDim(base, u) ->
+    TypeExpr { tkind: TyDim(qualtype_te(base, mt, file), u), line: te.line, col: te.col }
+  TyRefine(base, pred) ->
+    TypeExpr { tkind: TyRefine(qualtype_te(base, mt, file), qualtype_expr(pred, mt, file)),
+                line: te.line, col: te.col }
+  # A compound-row type argument (`Stream[Int, Stdout + Fail]`).
+  # Rewrite any qualified labels it carries; the carrier is dissolved
+  # later by alias substitution.
+  TyRow(row) ->
+    TypeExpr { tkind: TyRow(qualtype_row(row, mt, file)), line: te.line, col: te.col }
+  TySurface(ts) ->
+    TypeExpr { tkind: TySurface(tysurface_rebuild(ts, qualtype_te_list(tysurface_children(ts), mt, file))),
+                line: te.line, col: te.col }
+  TyParam(p, targs) ->
+    TypeExpr { tkind: TyParam(p, qualtype_te_list(targs, mt, file)), line: te.line, col: te.col }
+}
+
+#[doc("`qualtype_te` over a list.")]
+pub fn qualtype_te_list(tes: [TypeExpr], mt: [ModuleEntry], file: String) : [TypeExpr] / Console + File = match tes {
+
+  [] -> []
+  [t, ...rest] -> [qualtype_te(t, mt, file), ...qualtype_te_list(rest, mt, file)]
+}
+
+#[doc("An effect row with the types inside its labels resolved.")]
+pub fn qualtype_row(re: RowExpr, mt: [ModuleEntry], file: String) : RowExpr / Console + File = match re {
+
+  REmpty -> REmpty
+  RClosed(labels) -> RClosed(qualtype_rls(labels, mt, file))
+  ROpen(rv, labels) -> ROpen(rv, qualtype_rls(labels, mt, file))
+}
+
+fn qualtype_rls(ls: [RowLabel], mt: [ModuleEntry], file: String) : [RowLabel] / Console + File = match ls {
+
+  [] -> []
+  [rl, ...rest] -> match rl {
+    RL(r, ts) -> [RL(r, qualtype_te_list(ts, mt, file)), ...qualtype_rls(rest, mt, file)]
+  }
+}
+
+fn qualtype_param(pm: Param, mt: [ModuleEntry], file: String) : Param / Console + File =
+
+  Param { binder: pm.binder,
+          ptype: match pm.ptype {
+            None -> None
+            Some(te) -> Some(qualtype_te(te, mt, file))
+          },
+          pline: pm.pline, pcol: pm.pcol, pborrow: pm.pborrow }
+
+#[doc("A parameter list with its type annotations resolved.")]
+pub fn qualtype_params(ps: [Param], mt: [ModuleEntry], file: String) : [Param] / Console + File = match ps {
+
+  [] -> []
+  [p, ...rest] -> [qualtype_param(p, mt, file), ...qualtype_params(rest, mt, file)]
+}
+
+#[doc("""
+Walk the (rare) TypeExprs that live inside expression bodies:
+`let x : T = e` annotations and `p : T` match-arm narrows.
+""")]
+pub fn qualtype_expr(e: Expr, mt: [ModuleEntry], file: String) : Expr / Console + File =
+
+  Expr { kind: qualtype_expr_kind_at(e.kind, mt, file, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+# Qualtype rewrite at the kind level needs source position
+# for module-export diagnostics on a qualified `ERecordLit`. Routes
+# through here so the wrapping `Expr` can supply line/col; all other
+# arms forward to `qualtype_expr_kind` unchanged.
+fn qualtype_expr_kind_at(k: ExprKind, mt: [ModuleEntry], file: String, line: Int, col: Int) : ExprKind / Console + File = match k {
+
+  ERecordLit(r, fs) -> {
+    let fs1 = qualtype_fields_init(fs, mt, file)
+    match r {
+      DrWritten(Some(q), n) -> {
+        let mod = written_text(q)
+        let ty = written_text(n)
+        match mt_lookup_member_at(mt, mod, ty, file, line, col) {
+          None -> {
+            let _ = qt_diag_unknown_mod(mod, ty, file, line, col)
+            ERecordLit(ref_written(qualtype_unresolvable()), fs1)
+          }
+          Some(me) ->
+            if me_has_export(me, ty) {
+              ERecordLit(ref_qualified(mt_member_home(mt, mod, ty), ty), fs1)
+            } else {
+              let exports = match me { ME(_, exs, _, _) -> exs }
+              let _ = qt_diag_missing_type(mod, ty, exports, file, line, col)
+              ERecordLit(ref_written(qualtype_unresolvable()), fs1)
+            }
+        }
+      }
+      _ -> ERecordLit(r, fs1)
+    }
+  }
+  _ -> qualtype_expr_kind(k, mt, file)
+}
+
+fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind / Console + File = match k {
+
+  EBlock(stmts, opt_final) ->
+    EBlock(qualtype_stmts(stmts, mt, file),
+           match opt_final {
+             None -> None
+             Some(fe) -> Some(qualtype_expr(fe, mt, file))
+           })
+  EMatch(scrut, arms) ->
+    EMatch(qualtype_expr(scrut, mt, file), qualtype_arms(arms, mt, file))
+  EVariantsOf(te, _) ->
+    EVariantsOf(qualtype_te(te, mt, file), [])
+  ELambda(ps, body) ->
+    ELambda(qualtype_params(ps, mt, file), qualtype_expr(body, mt, file))
+  EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+    EHandle(qualtype_expr(body, mt, file), eff,
+             qualtype_ty_list_opt(ty_args, mt, file),
+             match init_opt { None -> None Some(ie) -> Some(qualtype_expr(ie, mt, file)) },
+             alias_opt,
+             qualtype_hclauses(clauses, mt, file),
+             match ret_opt {
+               None -> None
+               Some(r) -> Some(qualtype_hreturn(r, mt, file))
+             })
+  # Leaves
+  EInt(_, _)        -> k
+  EReal(_, _)       -> k
+  EIntLit(_)        -> k
+  EDecimalLit(_)    -> k
+  EFixed(_, _)      -> k
+  EBool(_)       -> k
+  EChar(_)       -> k
+  EStr(_, _)     -> k
+  EUnit          -> k
+  EName(_)        -> k
+  EMark(_)        -> k
+  ESym(_, _)      -> k
+  ELocal(_)       -> k
+  EOp(_)          -> k
+  EUnder         -> k
+  EPlaceholder   -> k
+  EHole(_)       -> k
+  ETodo(_)       -> k
+  EExternBody(_, _) -> k
+  EModCall(_, _) -> k
+  EIntrinsic(name, args_) ->
+    EIntrinsic(name, qualtype_expr_list(args_, mt, file))
+  ESurface(sf) ->
+    ESurface(surface_rebuild(sf, qualtype_expr_list(surface_children(sf), mt, file)))
+  # Composites with sub-Exprs (mirrors `map_expr_kind` but with
+  # `qualtype_expr` called directly so the effect row propagates).
+  ECall(callee, args_) ->
+    ECall(qualtype_expr(callee, mt, file),
+          qualtype_expr_list(args_, mt, file))
+  EField(base, name)   -> EField(qualtype_expr(base, mt, file), name)
+  EIndex(a, b)         -> EIndex(qualtype_expr(a, mt, file),
+                                  qualtype_expr(b, mt, file))
+  EBinop(op, a, b)     -> EBinop(op, qualtype_expr(a, mt, file),
+                                      qualtype_expr(b, mt, file))
+  EUnop(op, x)         -> EUnop(op, qualtype_expr(x, mt, file))
+  EIf(c, t_, eo)       -> EIf(qualtype_expr(c, mt, file),
+                                qualtype_expr(t_, mt, file),
+                                qualtype_expr_opt(eo, mt, file))
+  ERecordLit(r, fs)    -> ERecordLit(r, qualtype_fields_init(fs, mt, file))
+  EList(els)           -> EList(qualtype_list_elems(els, mt, file))
+  ERange(a, b, opt_step) -> ERange(qualtype_expr(a, mt, file),
+                                     qualtype_expr(b, mt, file),
+                                     qualtype_expr_opt(opt_step, mt, file))
+  EPipe(a, b)          -> EPipe(qualtype_expr(a, mt, file),
+                                  qualtype_expr(b, mt, file))
+  EMapPipe(a, b)       -> EMapPipe(qualtype_expr(a, mt, file),
+                                     qualtype_expr(b, mt, file))
+  EFlatMapPipe(a, b)   -> EFlatMapPipe(qualtype_expr(a, mt, file),
+                                          qualtype_expr(b, mt, file))
+  EFilterPipe(a, b)    -> EFilterPipe(qualtype_expr(a, mt, file),
+                                         qualtype_expr(b, mt, file))
+  ELitUnit(inner, u)   -> ELitUnit(qualtype_expr(inner, mt, file), u)
+  EBang(inner)         -> EBang(qualtype_expr(inner, mt, file))
+}
+
+# Helpers used by the inlined `_ -> map_expr_kind` expansion above.
+# `map_expr_kind` cannot accept an effectful callback
+# without row polymorphism in function-param types (which stage 1 does
+# not parse), so each effectful traversal walks `ExprKind` directly
+# with these specialised helpers.
+fn qualtype_expr_opt(opt: Option[Expr], mt: [ModuleEntry], file: String) : Option[Expr] / Console + File = match opt {
+  None    -> None
+  Some(e) -> Some(qualtype_expr(e, mt, file))
+}
+
+fn qualtype_expr_list(es: [Expr], mt: [ModuleEntry], file: String) : [Expr] / Console + File = match es {
+  []           -> []
+  [h, ...rest] -> [qualtype_expr(h, mt, file), ...qualtype_expr_list(rest, mt, file)]
+}
+
+fn qualtype_list_elems(els: [ListElem], mt: [ModuleEntry], file: String) : [ListElem] / Console + File = match els {
+  []           -> []
+  [h, ...rest] -> [qualtype_list_elem(h, mt, file), ...qualtype_list_elems(rest, mt, file)]
+}
+
+fn qualtype_list_elem(el: ListElem, mt: [ModuleEntry], file: String) : ListElem / Console + File = match el {
+  ElPlain(e)  -> ElPlain(qualtype_expr(e, mt, file))
+  ElSpread(e) -> ElSpread(qualtype_expr(e, mt, file))
+}
+
+fn qualtype_fields_init(fs: [FieldInit], mt: [ModuleEntry], file: String) : [FieldInit] / Console + File = match fs {
+
+  [] -> []
+  [fi, ...rest] -> match fi {
+    FI(n, v) -> [FI(n, qualtype_expr(v, mt, file)), ...qualtype_fields_init(rest, mt, file)]
+  }
+}
+
+fn qualtype_ty_list_opt(ts: [TypeExpr], mt: [ModuleEntry], file: String) : [TypeExpr] / Console + File =
+
+  qualtype_te_list(ts, mt, file)
+
+fn qualtype_arms(arms: [Arm], mt: [ModuleEntry], file: String) : [Arm] / Console + File = match arms {
+
+  [] -> []
+  [a, ...rest] -> [qualtype_arm(a, mt, file), ...qualtype_arms(rest, mt, file)]
+}
+
+fn qualtype_arm(a: Arm, mt: [ModuleEntry], file: String) : Arm / Console + File = match a {
+
+  Arm(pat, opt_guard, body) ->
+    Arm(qualtype_pat(pat, mt, file),
+        match opt_guard {
+          None -> None
+          Some(g) -> Some(qualtype_expr(g, mt, file))
+        },
+        qualtype_expr(body, mt, file))
+}
+
+fn qualtype_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Console + File = match pat.pkind {
+
+  PNarrow(name, te) ->
+    Pattern { pkind: PNarrow(name, qualtype_te(te, mt, file)), line: pat.line, col: pat.col }
+  PVariant(r, subs) ->
+    Pattern { pkind: PVariant(r, qualtype_pat_list(subs, mt, file)),
+               line: pat.line, col: pat.col }
+  PVariantRecord(r, fs) ->
+    Pattern { pkind: PVariantRecord(r, qualtype_pfields(fs, mt, file)),
+               line: pat.line, col: pat.col }
+  PRecord(fs) ->
+    Pattern { pkind: PRecord(qualtype_pfields(fs, mt, file)),
+               line: pat.line, col: pat.col }
+  PList(subs, rest) ->
+    Pattern { pkind: PList(qualtype_pat_list(subs, mt, file), rest),
+               line: pat.line, col: pat.col }
+  PAs(name, inner) ->
+    Pattern { pkind: PAs(name, qualtype_pat(inner, mt, file)),
+               line: pat.line, col: pat.col }
+  _ -> pat
+}
+
+fn qualtype_pat_list(ps: [Pattern], mt: [ModuleEntry], file: String) : [Pattern] / Console + File = match ps {
+
+  [] -> []
+  [p, ...rest] -> [qualtype_pat(p, mt, file), ...qualtype_pat_list(rest, mt, file)]
+}
+
+fn qualtype_pfields(fs: [PField], mt: [ModuleEntry], file: String) : [PField] / Console + File = match fs {
+
+  [] -> []
+  [f, ...rest] -> match f {
+    PField(name, sub, sh) -> [PField(name, qualtype_pat(sub, mt, file), sh),
+                               ...qualtype_pfields(rest, mt, file)]
+  }
+}
+
+fn qualtype_stmts(ss: [Stmt], mt: [ModuleEntry], file: String) : [Stmt] / Console + File = match ss {
+
+  [] -> []
+  [s, ...rest] -> [qualtype_stmt(s, mt, file), ...qualtype_stmts(rest, mt, file)]
+}
+
+fn qualtype_stmt(s: Stmt, mt: [ModuleEntry], file: String) : Stmt / Console + File = match s {
+
+  SLet(pat, ty_opt, e) ->
+    SLet(qualtype_pat(pat, mt, file),
+         match ty_opt {
+           None -> None
+           Some(te) -> Some(qualtype_te(te, mt, file))
+         },
+         qualtype_expr(e, mt, file))
+  SVar(name, ty_opt, init, l, c) ->
+    SVar(name,
+         match ty_opt {
+           None -> None
+           Some(te) -> Some(qualtype_te(te, mt, file))
+         },
+         qualtype_expr(init, mt, file), l, c)
+  SAssert(e, om) ->
+    SAssert(qualtype_expr(e, mt, file),
+            match om { None -> None Some(m) -> Some(qualtype_expr(m, mt, file)) })
+  SExprStmt(e) -> SExprStmt(qualtype_expr(e, mt, file))
+  SIndexAssign(t, ix, v, l, c) ->
+    SIndexAssign(qualtype_expr(t, mt, file),
+                  qualtype_expr(ix, mt, file),
+                  qualtype_expr(v, mt, file), l, c)
+  SAssign(t, v, l, c) ->
+    SAssign(qualtype_expr(t, mt, file), qualtype_expr(v, mt, file), l, c)
+  SUse(eff, l, c) -> SUse(eff, l, c)
+}
+
+fn qualtype_hclauses(cs: [HClause], mt: [ModuleEntry], file: String) : [HClause] / Console + File = match cs {
+
+  [] -> []
+  [c, ...rest] -> match c {
+    HC(name, ps, body, l, col) ->
+      [HC(name, qualtype_params(ps, mt, file), qualtype_expr(body, mt, file), l, col),
+       ...qualtype_hclauses(rest, mt, file)]
+  }
+}
+
+fn qualtype_hreturn(r: HReturn, mt: [ModuleEntry], file: String) : HReturn / Console + File = match r {
+
+  HR(name, body, l, c) -> HR(name, qualtype_expr(body, mt, file), l, c)
+}

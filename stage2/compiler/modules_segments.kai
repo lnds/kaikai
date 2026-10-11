@@ -1,0 +1,161 @@
+#[doc("""
+The rewrites and checks run per import segment: each module's
+declarations against its own imports.
+""")]
+
+import compiler.ast
+import compiler.diag_file
+import compiler.module_table
+import compiler.expr_positions
+import compiler.written
+import compiler.symtab
+import compiler.module_tables
+import compiler.modules_qualtype_decl
+import compiler.modules_qtchk
+import compiler.modules
+
+# The per-file `(mod_name, decls)` split. The driver's core loader
+# builds one `PSeg` per core file so the privacy validator can treat
+# each file as its own home module — without it the flat decl append
+# loses the boundary between files and a decl at the head of one file
+# inherits the previous file's module.
+pub type CoreSegment = PSeg(String, [Decl])
+
+# A (module, decl-count) mark the import resolver records as each
+# imported module's decls join the flat stream, so the privacy
+# validator can slice the stream back into per-module segments. The
+# root file's own decls follow the last mark.
+pub type ImportSeg = ISeg(String, Int)
+
+# Segment-aware variants of the qualifier passes. The flat decl stream
+# mixes modules, and a qualifier only means what the file that wrote it
+# declared, so each segment resolves under its own module's imports
+# instead of one shared table.
+pub fn rqc_segmented(segs: [ImportSeg], decls: [Decl], tabs: ModTables, fx: [RqcFx], df: DiagFiles)
+      : [Decl] / Console + File = match segs {
+  # Past the marks lie the root file's own decls, which resolve
+  # through the root scope (recorded under "").
+  [] -> rqc_decls(decls, mtabs_of(tabs, "").entries, fx, df)
+  [ISeg(home, n), ...rest] -> {
+    let mt = mtabs_of(tabs, home).entries
+    list_append(rqc_decls(seg_take(decls, n), mt, fx, df),
+                rqc_segmented(rest, seg_drop(decls, n), tabs, fx, df))
+  }
+}
+
+pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, tabs: ModTables, df: DiagFiles)
+      : QualTyped / Console + File = match segs {
+  [] -> qualtype_decls(decls, tab, mtabs_of(tabs, "").entries, df)
+  [ISeg(home, n), ...rest] -> {
+    let mt = mtabs_of(tabs, home).entries
+    let here = qualtype_decls(seg_take(decls, n), tab, mt, df)
+    let more = qualtype_segmented(rest, seg_drop(decls, n), tab, tabs, df)
+    QualTyped { decls: list_append(here.decls, more.decls), rows: list_append(here.rows, more.rows) }
+  }
+}
+
+# Only `EMatch` arms and `EBlock` lets carry patterns after lowering;
+# every other position descends through `xp_positions`.
+#[doc("Count qualified variant patterns whose module is not imported or does not export the constructor, so the exit code reflects the diagnostics `rqc_pat` emits.")]
+pub fn pqchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
+  [] -> 0
+  [d, ...rest] -> pqchk_decl(d, mt) + pqchk_decls(rest, mt)
+}
+
+fn pqchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> pqchk_expr(body, mt)
+  DTest(_, body, _, _, _)              -> pqchk_expr(body, mt)
+  DBench(_, body, _, _, _)             -> pqchk_expr(body, mt)
+  DCheck(_, _, body, _, _, _)          -> pqchk_expr(body, mt)
+  DImpl(_, _, _, subs, _, _, _, _)        -> pqchk_decls(subs, mt)
+  DDerive(_, inner, _, _)              -> pqchk_decl(inner, mt)
+  DUnstable(inner, _, _)               -> pqchk_decl(inner, mt)
+  DProtoLaws(_, inner, _, _, _)        -> pqchk_decl(inner, mt)
+  DImplAxiom(_, inner, _, _, _)        -> pqchk_decl(inner, mt)
+  DConstructor(inner, _, _)            -> pqchk_decl(inner, mt)
+  _ -> 0
+}
+
+fn pqchk_expr(e: Expr, mt: [ModuleEntry]) : Int = {
+  let own = match e.kind {
+    EMatch(_, arms)  -> pqchk_arms(arms, mt)
+    EBlock(stmts, _) -> pqchk_stmts(stmts, mt)
+    _ -> 0
+  }
+  own + pqchk_positions(xp_positions(e), mt)
+}
+
+fn pqchk_positions(ps: [XPos], mt: [ModuleEntry]) : Int = match ps {
+  [] -> 0
+  [XP(_, e), ...rest] -> pqchk_expr(e, mt) + pqchk_positions(rest, mt)
+}
+
+fn pqchk_arms(arms: [Arm], mt: [ModuleEntry]) : Int = match arms {
+  [] -> 0
+  [Arm(pat, _, _), ...rest] -> pqchk_pat(pat, mt) + pqchk_arms(rest, mt)
+}
+
+fn pqchk_stmts(stmts: [Stmt], mt: [ModuleEntry]) : Int = match stmts {
+  [] -> 0
+  [SLet(pat, _, _), ...rest] -> pqchk_pat(pat, mt) + pqchk_stmts(rest, mt)
+  [_, ...rest] -> pqchk_stmts(rest, mt)
+}
+
+fn pqchk_pat(pat: Pattern, mt: [ModuleEntry]) : Int = match pat.pkind {
+  PVariant(r, subs)     -> pqchk_ref(r, mt) + pqchk_pats(subs, mt)
+  PVariantRecord(r, fs) -> pqchk_ref(r, mt) + pqchk_pfields(fs, mt)
+  PRecord(fs)           -> pqchk_pfields(fs, mt)
+  PList(subs, _)        -> pqchk_pats(subs, mt)
+  PAs(_, inner)         -> pqchk_pat(inner, mt)
+  _ -> 0
+}
+
+fn pqchk_ref(r: DeclRef, mt: [ModuleEntry]) : Int = match r {
+  DrWritten(Some(q), n) -> if pat_qualifier_ok(written_text(q), written_text(n), mt) { 0 } else { 1 }
+  _                     -> 0
+}
+
+fn pqchk_pats(ps: [Pattern], mt: [ModuleEntry]) : Int = match ps {
+  [] -> 0
+  [p, ...rest] -> pqchk_pat(p, mt) + pqchk_pats(rest, mt)
+}
+
+fn pqchk_pfields(fs: [PField], mt: [ModuleEntry]) : Int = match fs {
+  [] -> 0
+  [PField(_, sub, _), ...rest] -> pqchk_pat(sub, mt) + pqchk_pfields(rest, mt)
+}
+
+#[doc("`pqchk_decls` over an import-segmented stream, each segment against its own module table.")]
+pub fn pqchk_segmented(segs: [ImportSeg], decls: [Decl], tabs: ModTables) : Int = match segs {
+  [] -> pqchk_decls(decls, mtabs_of(tabs, "").entries)
+  [ISeg(home, n), ...rest] -> {
+    let mt = mtabs_of(tabs, home).entries
+    pqchk_decls(seg_take(decls, n), mt) +
+      pqchk_segmented(rest, seg_drop(decls, n), tabs)
+  }
+}
+
+pub fn qtchk_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, tabs: ModTables) : Int = match segs {
+  [] -> qtchk_decls(decls, tab, mtabs_of(tabs, "").entries)
+  [ISeg(home, n), ...rest] -> {
+    let mt = mtabs_of(tabs, home).entries
+    qtchk_decls(seg_take(decls, n), tab, mt) +
+      qtchk_segmented(rest, seg_drop(decls, n), tab, tabs)
+  }
+}
+
+#[doc("The first `n` decls of an import segment.")]
+pub fn seg_take(ds: [Decl], n: Int) : [Decl] =
+  if n <= 0 { [] }
+  else { match ds {
+    [] -> []
+    [d, ...rest] -> [d, ...seg_take(rest, n - 1)]
+  } }
+
+#[doc("The decls after an import segment's first `n`.")]
+pub fn seg_drop(ds: [Decl], n: Int) : [Decl] =
+  if n <= 0 { ds }
+  else { match ds {
+    [] -> []
+    [_, ...rest] -> seg_drop(rest, n - 1)
+  } }

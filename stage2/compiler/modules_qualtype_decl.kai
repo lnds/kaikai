@@ -1,0 +1,150 @@
+#[doc("""
+The qualified-type rewrite over declarations, and the table rows of the
+members it resolves.
+""")]
+
+import compiler.ast
+import compiler.diag_file
+import compiler.module_table
+import compiler.decl_names
+import compiler.symtab
+import compiler.modules_qualtype
+import compiler.modules_qtchk
+
+fn qualtype_variants(vs: [Variant], tab: SymTab, mt: [ModuleEntry], file: String, line: Int, col: Int) : [Variant] / Console + File = match vs {
+
+  [] -> []
+  [v, ...rest] -> match v {
+    Var(c, vargs) -> [Var(qualtype_member(c, tab, mt, file, line, col), qualtype_te_list(vargs, mt, file)),
+                       ...qualtype_variants(rest, tab, mt, file, line, col)]
+  }
+}
+
+fn qualtype_rows(ds: [Decl], tab: SymTab, mt: [ModuleEntry], acc: [NEnt]) : [NEnt] = match ds {
+  [] -> acc
+  [d, ...rest] -> qualtype_rows(rest, tab, mt, qualtype_decl_rows(d, tab, mt, acc))
+}
+
+fn qualtype_decl_rows(d: Decl, tab: SymTab, mt: [ModuleEntry], acc: [NEnt]) : [NEnt] = match decl_transparent_inner(d) {
+  Some(inner) -> qualtype_decl_rows(inner, tab, mt, acc)
+  None -> match d {
+    DType(_, _, _, TBSum(vs), _, _, _, _) -> qualtype_variant_rows(vs, tab, mt, acc)
+    _ -> acc
+  }
+}
+
+fn qualtype_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String) : [FieldDecl] / Console + File = match fs {
+
+  [] -> []
+  [f, ...rest] -> match f {
+    FD(is_pub, name, te, attrs) -> [FD(is_pub, name, qualtype_te(te, mt, file), attrs), ...qualtype_fields(rest, mt, file)]
+  }
+}
+
+fn qualtype_body(tb: TypeBody, tab: SymTab, mt: [ModuleEntry], file: String, line: Int, col: Int) : TypeBody / Console + File = match tb {
+
+  TBAlias(te) -> TBAlias(qualtype_te(te, mt, file))
+  TBRecord(fs) -> TBRecord(qualtype_fields(fs, mt, file))
+  TBSum(vs) -> TBSum(qualtype_variants(vs, tab, mt, file, line, col))
+  TBEffectAlias(ls) -> TBEffectAlias(ls)
+}
+
+fn qualtype_eops(ops: [EffectOp], mt: [ModuleEntry], file: String) : [EffectOp] / Console + File = match ops {
+
+  [] -> []
+  [op, ...rest] -> match op {
+    EffOp(name, tps, ps, ret, l, c) ->
+      [EffOp(name, tps, qualtype_params(ps, mt, file), qualtype_te(ret, mt, file), l, c),
+       ...qualtype_eops(rest, mt, file)]
+  }
+}
+
+fn qualtype_pops(ops: [ProtoOp], mt: [ModuleEntry], file: String) : [ProtoOp] / Console + File = match ops {
+
+  [] -> []
+  [op, ...rest] -> match op {
+    POp(name, tps, ps, ret, l, c) ->
+      [POp(name, tps, qualtype_params(ps, mt, file), qualtype_te(ret, mt, file), l, c),
+       ...qualtype_pops(rest, mt, file)]
+  }
+}
+
+fn qualtype_decl(d: Decl, tab: SymTab, mt: [ModuleEntry], file: String) : Decl / Console + File = match d {
+
+  DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo) ->
+    DFn(p, n, tps, qualtype_params(ps, mt, file),
+        match ret_opt { None -> None Some(te) -> Some(qualtype_te(te, mt, file)) },
+        qualtype_row(row, mt, file),
+        qualtype_expr(body, mt, file), l, c, mo)
+  DType(p, n, tps, body, l, c, mo, slots) ->
+    DType(p, n, tps, qualtype_body(body, tab, mt, file, l, c), l, c, mo, slots)
+  DEffect(p, n, tps, ops, defblk, l, c, mo) ->
+    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c, mo)
+  DProtocol(p, n, tps, ops, l, c, mo) ->
+    DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c, mo)
+  DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
+    DImpl(name, map(proto_args, (te) => qualtype_te(te, mt, file)),
+          qualtype_te(ty, mt, file),
+          qualtype_sub_decls(sub_decls, tab, mt, file), l, c, tps, isym)
+  DDerive(ps, inner, l, c) ->
+    DDerive(ps, qualtype_decl(inner, tab, mt, file), l, c)
+  DUnstable(inner, l, c) ->
+    DUnstable(qualtype_decl(inner, tab, mt, file), l, c)
+  DProtoLaws(thy, inner, l, c, mo) ->
+    DProtoLaws(thy, qualtype_decl(inner, tab, mt, file), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) ->
+    DImplAxiom(thy, qualtype_decl(inner, tab, mt, file), l, c, mo)
+  DConstructor(inner, l, c) ->
+    DConstructor(qualtype_decl(inner, tab, mt, file), l, c)
+  DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+    DAxiom(p, sm, n, cso, tps, qualtype_params(ps, mt, file),
+            qualtype_te(ret, mt, file), qualtype_row(row, mt, file), l, c)
+  # Rewrite the declared type's qualifiers and the body
+  # expression. `lower_consts` runs before this in the driver, but
+  # the arm exists for completeness so any pre-lowering caller (e.g.
+  # `--ast` of a future entry point) does not blow up. Mirrors what
+  # the DFn arm above does for the body + return type.
+  DConst(p, n, ty, body, mo, l, c) ->
+    DConst(p, n, qualtype_te(ty, mt, file),
+            qualtype_expr(body, mt, file), mo, l, c)
+  DTest(n, body, l, c, mo) -> DTest(n, qualtype_expr(body, mt, file), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, qualtype_expr(body, mt, file), l, c, mo)
+  DCheck(n, ps, body, l, c, mo) ->
+    DCheck(n, qualtype_params(ps, mt, file), qualtype_expr(body, mt, file), l, c, mo)
+  DImport(ik, l, c) -> DImport(ik, l, c)
+  DUnit(p, n, opt, intro, l, c, mo) -> DUnit(p, n, opt, intro, l, c, mo)
+  DUse(eff, l, c) -> DUse(eff, l, c)
+  DUseKind(k, l, c, mo) -> DUseKind(k, l, c, mo)
+  # The root file's module-doc carrier rides the stream
+  # until the typer lifts it into TypedProgram.module_doc; it has no
+  # types to qualify.
+  DDoc(raw, text, inner, l, c) -> DDoc(raw, text, qualtype_decl(inner, tab, mt, file), l, c)
+  DAttr(raw, inner, l, c) -> DAttr(raw, qualtype_decl(inner, tab, mt, file), l, c)
+  DModuleDoc(raw, text, l, c) -> DModuleDoc(raw, text, l, c)
+  # FFI v2: a foreign type's fields are fixed-width / nested foreign
+  # names that resolve nominally — nothing to qualify.
+  DExternType(name, body, l, c, mo) -> DExternType(name, body, l, c, mo)
+  # catalog decls carry no qualifiable type heads; stripped pre-resolve.
+  DTheory(n, props, l, c, mo) -> DTheory(n, props, l, c, mo)
+  DKind(p, n, th, ov, intro, l, c, mo) -> DKind(p, n, th, ov, intro, l, c, mo)
+}
+
+#[doc("A decl stream with its qualified type heads validated and re-qualified, and the symbol-table rows of the constructors its qualified union members were re-pointed to.")]
+pub type QualTyped = { decls: [Decl], rows: [NEnt] }
+
+#[doc("Validate and re-qualify every qualified type head of `decls` against `mt`. `tab` holds the rows of `decls`; the caller extends it with the rows returned.")]
+pub fn qualtype_decls(decls: [Decl], tab: SymTab, mt: [ModuleEntry], df: DiagFiles) : QualTyped / Console + File =
+  QualTyped { decls: qualtype_top_decls(decls, tab, mt, df), rows: qualtype_rows(decls, tab, mt, []) }
+
+fn qualtype_top_decls(decls: [Decl], tab: SymTab, mt: [ModuleEntry], df: DiagFiles) : [Decl] / Console + File = match decls {
+
+  [] -> []
+  [d, ...rest] -> [qualtype_decl(d, tab, mt, decl_diag_file(d, df)), ...qualtype_top_decls(rest, tab, mt, df)]
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn qualtype_sub_decls(decls: [Decl], tab: SymTab, mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+  [] -> []
+  [d, ...rest] -> [qualtype_decl(d, tab, mt, file), ...qualtype_sub_decls(rest, tab, mt, file)]
+}

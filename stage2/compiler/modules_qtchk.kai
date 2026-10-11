@@ -1,0 +1,192 @@
+#[doc("""
+A qualified type head checked against the module table: the qualifier is
+an imported module and exports the type.
+""")]
+
+import compiler.ast
+import compiler.module_table
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.modules_dotted
+import compiler.modules_qualtype
+
+#[doc("""
+A qualified union member has no reference to hold its qualifier: its
+constructor is declared under the dotted spelling. It validates like a
+type head, and the variant is re-pointed to the constructor the bare
+member declares. A bare one is a constructor and passes through
+untouched.
+""")]
+pub fn qualtype_member(c: SymId, tab: SymTab, mt: [ModuleEntry], file: String, line: Int, col: Int) : SymId / Console + File =
+  match split_dotted_qualifier(written_text(sym_name(tab, c))) {
+    None -> c
+    Some(parts) -> match parts {
+      QSplit(mod, ty) -> {
+        match mt_lookup_member_at(mt, mod, ty, file, line, col) {
+          None -> qt_diag_unknown_mod(mod, ty, file, line, col)
+          Some(me) ->
+            if me_has_export(me, ty) { () }
+            else {
+              let exports = match me { ME(_, exs, _, _) -> exs }
+              qt_diag_missing_type(mod, ty, exports, file, line, col)
+            }
+        }
+        match qualtype_member_row(mod, ty, c, tab, mt) {
+          NEnt(cls, name, home, _, _) -> sym_derive(cls, name, home)
+        }
+      }
+    }
+  }
+
+# The row of the constructor the union member `mod.ty` is re-pointed to:
+# the bare member homed at the module it names, so two members spelled
+# alike under different qualifiers stay two constructors and each leads
+# to its own module's type. A member `mod` does not export goes under the
+# unresolvable name in the union's own module.
+fn qualtype_member_row(mod: String, ty: String, c: SymId, tab: SymTab, mt: [ModuleEntry]) : NEnt =
+  if qtchk_qualified(mod, ty, mt) == 0 { NEnt(NCCtor, ty, mt_member_home(mt, mod, ty), sym_exported(tab, c), sym_mint(tab, c)) }
+  else { NEnt(NCCtor, qualtype_unresolvable(), written_text(sym_home(tab, c)), sym_exported(tab, c), sym_mint(tab, c)) }
+
+#[doc("The table rows of the constructors written with a module qualifier, pushed onto `acc`.")]
+pub fn qualtype_variant_rows(vs: [Variant], tab: SymTab, mt: [ModuleEntry], acc: [NEnt]) : [NEnt] = match vs {
+  [] -> acc
+  [Var(c, _), ...rest] -> match split_dotted_qualifier(written_text(sym_name(tab, c))) {
+    Some(QSplit(mod, ty)) -> qualtype_variant_rows(rest, tab, mt, [qualtype_member_row(mod, ty, c, tab, mt), ...acc])
+    None                  -> qualtype_variant_rows(rest, tab, mt, acc)
+  }
+}
+
+# Validation pass: counts how many qualified type heads
+# fail validation against the module table. Errors were already
+# emitted as part of the rewrite pass (qualtype_te); this counter
+# pass mirrors the same traversal so the caller can fold the count
+# into the program's exit status.
+fn qtchk_te(te: TypeExpr, mt: [ModuleEntry]) : Int = match te.tkind {
+  TyName(r, targs) -> {
+    let inner = qtchk_te_list(targs, mt)
+    match r {
+      DrWritten(Some(q), n) -> inner + qtchk_qualified(written_text(q), written_text(n), mt)
+      _                     -> inner
+    }
+  }
+  TyList(inner) -> qtchk_te(inner, mt)
+  TyFn(ps, ret, row) -> qtchk_te_list(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
+  TyDim(base, _) -> qtchk_te(base, mt)
+  TyRefine(base, _) -> qtchk_te(base, mt)
+  # A compound-row type argument (`Stream[Int, Stdout + Fail]`).
+  # Validate any qualified labels it carries before alias substitution
+  # dissolves the carrier.
+  TyRow(row) -> qtchk_row(row, mt)
+  TySurface(ts) -> qtchk_te_list(tysurface_children(ts), mt)
+  TyParam(_, targs) -> qtchk_te_list(targs, mt)
+}
+
+fn qtchk_te_list(tes: [TypeExpr], mt: [ModuleEntry]) : Int = match tes {
+  [] -> 0
+  [t, ...rest] -> qtchk_te(t, mt) + qtchk_te_list(rest, mt)
+}
+
+fn qtchk_row(re: RowExpr, mt: [ModuleEntry]) : Int = match re {
+  REmpty -> 0
+  RClosed(ls) -> qtchk_rls(ls, mt)
+  ROpen(_, ls) -> qtchk_rls(ls, mt)
+}
+
+fn qtchk_rls(ls: [RowLabel], mt: [ModuleEntry]) : Int = match ls {
+  [] -> 0
+  [rl, ...rest] -> match rl {
+    RL(_, ts) -> qtchk_te_list(ts, mt) + qtchk_rls(rest, mt)
+  }
+}
+
+fn qtchk_params(ps: [Param], mt: [ModuleEntry]) : Int = match ps {
+  [] -> 0
+  [p, ...rest] -> {
+    let here = match p.ptype { None -> 0 Some(te) -> qtchk_te(te, mt) }
+    here + qtchk_params(rest, mt)
+  }
+}
+
+fn qtchk_variants(vs: [Variant], tab: SymTab, mt: [ModuleEntry]) : Int = match vs {
+  [] -> 0
+  [v, ...rest] -> match v {
+    Var(c, vargs) -> qtchk_member(c, tab, mt) + qtchk_te_list(vargs, mt) + qtchk_variants(rest, tab, mt)
+  }
+}
+
+fn qtchk_member(c: SymId, tab: SymTab, mt: [ModuleEntry]) : Int = match split_dotted_qualifier(written_text(sym_name(tab, c))) {
+  None -> 0
+  Some(parts) -> match parts {
+    QSplit(mod, ty) -> qtchk_qualified(mod, ty, mt)
+  }
+}
+
+# 1 when `mod` is not imported or does not export `ty`, else 0.
+fn qtchk_qualified(mod: String, ty: String, mt: [ModuleEntry]) : Int = match mt_lookup_member(mt, mod, ty) {
+  None -> 1
+  Some(me) -> if me_has_export(me, ty) { 0 } else { 1 }
+}
+
+fn qtchk_fields(fs: [FieldDecl], mt: [ModuleEntry]) : Int = match fs {
+  [] -> 0
+  [f, ...rest] -> match f {
+    FD(_, _, te, _) -> qtchk_te(te, mt) + qtchk_fields(rest, mt)
+  }
+}
+
+fn qtchk_body(tb: TypeBody, tab: SymTab, mt: [ModuleEntry]) : Int = match tb {
+  TBAlias(te) -> qtchk_te(te, mt)
+  TBRecord(fs) -> qtchk_fields(fs, mt)
+  TBSum(vs) -> qtchk_variants(vs, tab, mt)
+  TBEffectAlias(_) -> 0
+}
+
+fn qtchk_eops(ops: [EffectOp], mt: [ModuleEntry]) : Int = match ops {
+  [] -> 0
+  [op, ...rest] -> match op {
+    EffOp(_, _, ps, ret, _, _) -> qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_eops(rest, mt)
+  }
+}
+
+fn qtchk_pops(ops: [ProtoOp], mt: [ModuleEntry]) : Int = match ops {
+  [] -> 0
+  [op, ...rest] -> match op {
+    POp(_, _, ps, ret, _, _) -> qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_pops(rest, mt)
+  }
+}
+
+# Decl-only counter: walks every TypeExpr that appears at decl
+# boundaries (fn params/return/row, type-body fields/variants/aliases,
+# effect/protocol op signatures, impl target, axiom signatures).
+# Body expressions are not walked — the rewrite pass already replaces
+# bad qualifiers with the bare-name fallback so cascade-typer noise
+# stays bounded; the counter only needs to detect ONE bad use to
+# fail the build.
+fn qtchk_decl(d: Decl, tab: SymTab, mt: [ModuleEntry]) : Int = match d {
+  DFn(_, _, _, ps, ret_opt, row, _, _, _, _) ->
+    qtchk_params(ps, mt) +
+    (match ret_opt { None -> 0 Some(te) -> qtchk_te(te, mt) }) +
+    qtchk_row(row, mt)
+  DType(_, _, _, body, _, _, _, _) -> qtchk_body(body, tab, mt)
+  DEffect(_, _, _, ops, _, _, _, _) -> qtchk_eops(ops, mt)
+  DProtocol(_, _, _, ops, _, _, _) -> qtchk_pops(ops, mt)
+  DImpl(_, proto_args, ty, sub_decls, _, _, _, _) ->
+    qtchk_te_list(proto_args, mt) +
+    qtchk_te(ty, mt) + qtchk_decls(sub_decls, tab, mt)
+  DDerive(_, inner, _, _) -> qtchk_decl(inner, tab, mt)
+  DUnstable(inner, _, _) -> qtchk_decl(inner, tab, mt)
+  DProtoLaws(_, inner, _, _, _) -> qtchk_decl(inner, tab, mt)
+  DImplAxiom(_, inner, _, _, _) -> qtchk_decl(inner, tab, mt)
+  DConstructor(inner, _, _) -> qtchk_decl(inner, tab, mt)
+  DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
+    qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
+  DCheck(_, ps, _, _, _, _) -> qtchk_params(ps, mt)
+  _ -> 0
+}
+
+pub fn qtchk_decls(ds: [Decl], tab: SymTab, mt: [ModuleEntry]) : Int = match ds {
+  [] -> 0
+  [d, ...rest] -> qtchk_decl(d, tab, mt) + qtchk_decls(rest, tab, mt)
+}

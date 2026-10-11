@@ -321,7 +321,8 @@ def cmd_apply(path, plan):
         used = words(text)
         need = ["import %s.%s" % (pkg, m) for m in mods if exported[m] & used]
         if re.search(r"\b%s\.[a-z_]" % old, mask(text)): print("QUALIFIED use of %s in %s" % (old, full))
-        open(full, "w").write(re.sub(r"^import %s\.%s$" % (pkg, old), "\n".join(need), text, flags=re.M))
+        line = r"^import %s\.%s\n" % (pkg, old)
+        open(full, "w").write(re.sub(line, "".join(n + "\n" for n in need), text, flags=re.M))
         print("re-pointed %s -> %d imports" % (os.path.basename(full), len(need)))
 
     move_ledgers(old, items, where, texts)
