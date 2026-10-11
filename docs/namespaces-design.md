@@ -76,6 +76,20 @@ everything a program writes. It settles calls and nothing else — read as
 a value, with no argument to fit, such a name is still an ambiguity
 error.
 
+A protocol operation is the one name whose tie waits for a type. Two
+modules on one rung may each declare a protocol with the same operation,
+and the type that receives the operation says which protocol answers:
+the one with an impl for it. Where that type is not known yet, nothing
+is chosen. The reference stays between the candidates and is settled
+when the receiver has a type — where the rest of the declaration fixes
+it, or in each specialisation of a generic body. An operation read as a value is the
+function that calls it, so the same rule covers it. A reference whose
+receiver can never get a type is an error naming the protocols.
+
+Dispatch is static, so this is decided at compile time or not at all: a
+generic body run without being specialised has no protocol to ask, and
+reaching such an operation there is a panic that names the candidates.
+
 Step 5 is the whole point. Never first-wins, never last-wins, never
 import-order, never declaration-order. The kind-system doc already
 justifies this — *"order-of-declaration must NOT change a program's

@@ -30,6 +30,7 @@ import compiler.core_refs
 import compiler.core_protos
 import compiler.impl_identity
 import compiler.proto_ids
+import compiler.proto_contest
 import compiler.exhaust
 import compiler.effect_default
 import compiler.type_text
@@ -8154,9 +8155,92 @@ fn synth_callee(st: InferState, callee: Expr) : Inferred / Console + File + Muta
 
 fn synth_settled(st: InferState, r: Settled, w: Written, called: Bool, e: Expr) : Inferred / Console + File + Mutable = match r {
   SetOne(s)    -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
-  SetTie(ss)   -> inferred_leaf(report_name_tie(st, w, ss, called, e.line, e.col), TyAny, e)
+  SetTie(ss)   -> if op_tie(st, ss) { synth_op_ref(st, w, ss, called, e) }
+                  else { inferred_leaf(report_name_tie(st, w, ss, called, e.line, e.col), TyAny, e) }
   SetOther(ss) -> inferred_leaf(report_no_value(st, w, ss, e.line, e.col), TyAny, e)
   SetNone      -> inferred_leaf(report_no_declaration(st, w, e.line, e.col), TyAny, e)
+}
+
+# True when the tie is between dispatchers alone: one operation, declared
+# by several protocols.
+fn op_tie(st: InferState, ss: [SymId]) : Bool = all(ss, (s) => pid_is_disp(st.protos.ids, s))
+
+# An operation several protocols declare, read where nothing tells them
+# apart. Called, the reference stays between its dispatchers and the
+# dispatch rewrite settles it by the receiver. Read as a value it is the
+# function that calls it, so the same holds of that call.
+fn synth_op_ref(st: InferState, w: Written, ss: [SymId], called: Bool, e: Expr) : Inferred / Console + File + Mutable =
+  if called {
+    let c = op_unsettled(st, ss, e.line, e.col)
+    match c.ty {
+      Some(t) -> inferred_leaf(c.st, t, Expr { ...e, kind: EMark(MkProtoOp(ss)) })
+      None    -> inferred_leaf(report_name_tie(c.st, w, ss, true, e.line, e.col), TyAny, e)
+    }
+  }
+  else { match contest_arity(st.protos.ids, ss) {
+    Some(n) -> synth(st, contest_as_function(e, n))
+    None    -> inferred_leaf(report_name_tie(st, w, ss, false, e.line, e.col), TyAny, e)
+  } }
+
+# A reference left between dispatchers, with the state past it: the type
+# it has, or none when the dispatchers share no type.
+type OpTyped = { st: InferState, ty: Option[Ty] }
+
+# The type is the one every dispatcher of `ss` has, so the call is typed
+# whichever protocol answers. The end of the declaration is told of it.
+fn op_unsettled(st: InferState, ss: [SymId], line: Int, col: Int) : OpTyped / Mutable = {
+  let c = op_common(st, ss, None)
+  match c.ty {
+    Some(t) -> OpTyped { st: st_push_deferred_hom(c.st, DOp(ss, t, line, col)), ty: c.ty }
+    None    -> c
+  }
+}
+
+# Each dispatcher's own type, unified. The state is past every
+# instantiation whatever the answer.
+fn op_common(st: InferState, ss: [SymId], ty: Option[Ty]) : OpTyped / Mutable = match ss {
+  [] -> OpTyped { st: st, ty: ty }
+  [s, ...rest] -> match env_sym(st.env, s) {
+    None     -> OpTyped { st: st, ty: None }
+    Some(sc) -> {
+      let inst = st_instantiate_report(st, sc)
+      match ty {
+        None    -> op_common(inst.st, rest, Some(inst.ty))
+        Some(t) -> match unify_env(inst.st.env, t, inst.ty, inst.st.sub) {
+          Some(sub) -> op_common(st_set_sub(inst.st, sub), rest, ty)
+          None      -> OpTyped { st: inst.st, ty: None }
+        }
+      }
+    }
+  }
+}
+
+# An operation left between dispatchers waits for the type that receives
+# it. One whose parameter or result is still a variable the declaration's
+# own signature `sig` does not mention has nothing left to wait for.
+fn report_stranded_ops(st: InferState, hs: [DeferredHom], sig: [Ty]) : InferState / Console + File = match hs {
+  [] -> st
+  [h, ...rest] -> match h {
+    DOp(ss, want, line, col) ->
+      report_stranded_ops(if op_stranded(st, apply_ty(st.sub, want), sig) { report_op_stranded(st, ss, line, col) } else { st }, rest, sig)
+    DHom(_, _, _, _) -> report_stranded_ops(st, rest, sig)
+  }
+}
+
+fn op_stranded(st: InferState, want: Ty, sig: [Ty]) : Bool = match want {
+  TyFnT(ps, ret, _) -> any([ret, ...ps], (t) => match t {
+    TyVarT(v) -> not occurs_any(v, sig, st.sub)
+    _         -> false
+  })
+  _ -> false
+}
+
+fn report_op_stranded(st: InferState, ss: [SymId], line: Int, col: Int) : InferState / Console + File = {
+  let tab = st.env.tab
+  let shown = map(contest_protocols(st.protos.ids, ss), (p) => "`#{decl_name(tab, p)}` of #{home_shown(st, sym_owner(tab, p))}")
+  let d = contest_stranded_diag(st.file, line, col, st.protos.ids, ss, shown)
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
 }
 
 # Nothing the reader's scope reaches declares the name.
@@ -8282,19 +8366,20 @@ fn opt_syms(os: [Option[SymId]]) : [SymId] = match os {
   [None, ...rest]    -> opt_syms(rest)
 }
 
-# A bare name on the scope ladder. A dispatcher the resolver left to the
-# type stands for one operation whichever home generated it, so the scope
-# has no tie to report about it. A name no declaration of the classes
+# A bare name on the scope ladder. Dispatchers the resolver left to the
+# type stand for one operation whichever home generated them: one is the
+# answer, several are a tie the receiver's type settles. A name no
+# declaration of the classes
 # answers may still be a union's tag, and past that it is whatever else
 # the scope declares under it.
 fn settle_bare(st: InferState, name: String, cs: [NCls]) : Settled = match settle_on_ladder(st, name, cs) {
   SetOne(s) -> SetOne(s)
-  r         -> match shared_dispatcher(st, name, cs) {
-    Some(s) -> SetOne(s)
-    None    -> match r {
+  r         -> match op_dispatchers(st, name, cs, r) {
+    [] -> match r {
       SetNone -> if list_is_empty(cs) { SetNone } else { settle_unanswered(st, name, cs) }
       _       -> r
     }
+    ss -> settle_list(ss)
   }
 }
 
@@ -8337,17 +8422,20 @@ fn names_a_kind(c: NCls) : Bool = match c {
   _            -> false
 }
 
-# The dispatchers generated under `name`, whichever module holds the
-# protocol: the resolver reaches an operation through the protocol rung,
-# which sees past the reader's imports. They stand for one operation, and
-# the dispatch rewrite finds the impl from the receiver's type whichever
-# of them the call names.
-fn shared_dispatcher(st: InferState, name: String, cs: [NCls]) : Option[SymId] =
-  if not ncls_in(cs, NCFn) { None }
-  else { match filter(ty_env_collect_candidates(st.env, name), (c) => pid_is_disp(st.protos.ids, c.sym)) {
-    [c, ..._] -> Some(c.sym)
-    []        -> None
+# The dispatchers `name` is left between. A tie the scope found among
+# dispatchers alone is that set. Otherwise it is every dispatcher
+# generated under the name, whichever module holds the protocol: the
+# resolver reaches an operation through the protocol rung, which sees
+# past the reader's imports.
+fn op_dispatchers(st: InferState, name: String, cs: [NCls], r: Settled) : [SymId] =
+  if not ncls_in(cs, NCFn) { [] }
+  else { match r {
+    SetTie(ss) -> if op_tie(st, ss) { ss } else { env_dispatchers(st, name) }
+    _          -> env_dispatchers(st, name)
   } }
+
+fn env_dispatchers(st: InferState, name: String) : [SymId] =
+  sym_list_unique(map(filter(ty_env_collect_candidates(st.env, name), (c) => pid_is_disp(st.protos.ids, c.sym)), (c) => c.sym), [])
 
 # The scope's answer for `name`: the reader's own module, its picks, its
 # imports and the cores are climbed in that order, as the resolver climbs
@@ -9986,18 +10074,14 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                                  rest_args, callee, line, col) {
               Some(inf) -> Some(inf)
               None ->
-            match pick_by_first_arg(r0.st, candidates, first_ty) {
+            match pick_by_first_arg(r0.st, candidates, first_ty, callee.line, callee.col) {
               FaNone -> None
               FaTie(st_t, ss) -> {
                 let st_e = report_name_tie(st_t, w, ss, true, callee.line, callee.col)
                 Some(mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(callee, [r0.expr, ...rest_args]), line, col), TyAny)))
               }
               FaOne(pick) -> {
-                let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
-                  pick.st
-                } else {
-                  st_push_inst(pick.st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
-                }
+                let st_inst = pick_inst(pick, line, col)
                 let ra_rest = synth_many_expecting(st_inst, rest_args, params_after_first(fn_param_tys(st_inst, pick.inst_ty)))
                 let all_arg_tys = [first_ty, ...ra_rest.tys]
                 let all_arg_exprs = [r0.expr, ...ra_rest.exprs]
@@ -10011,8 +10095,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st2 = st_propagate_capability_labels(st_unif,
                             apply_ty(st_unif.sub, pick.inst_ty), line, col)
                 let ty = apply_ty(st2.sub, rv.ty)
-                # A settled contest carries the id of the declaration it picked.
-                let callee_node = with_ty(mk_sym(pick.sym, callee.line, callee.col), pick.inst_ty)
+                let callee_node = with_ty(pick_ref(pick, callee.line, callee.col), pick.inst_ty)
                 match refine_call(st2, callee, pick.inst_ty, all_arg_exprs, all_arg_tys, ty) {
                   RefCall(st3, ty3) -> Some(mk_inferred(st3, ty3, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty3)))
                 }
@@ -10081,6 +10164,7 @@ fn drain_deferred_homs(st: InferState, hs: [DeferredHom],
         let r = drain_one_deferred_hom(st, w, apply_ty(st.sub, want), line, col)
         drain_deferred_homs(r.st, rest, list_append(picks, r.picks))
       }
+      DOp(_, _, _, _) -> drain_deferred_homs(st, rest, picks)
     }
   }
 }
@@ -10535,17 +10619,34 @@ fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
 # result of `pick_by_first_arg`. The picked scheme has
 # already been instantiated (state's `fresh` and `sub` advanced); the
 # caller proceeds with the standard unify-arg-then-emit pipeline.
-# `sym` is the picked function, which the caller makes the callee: the
-# identity of the settled contest.
+# `target` is what the caller makes the callee.
 type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
-                    sym: SymId }
+                    target: PickTarget }
+
+# A function, the identity of the settled contest; or an operation left
+# between the dispatchers of the protocols declaring it.
+type PickTarget = PtDecl(SymId) | PtOp([SymId])
+
+# The picked callee, at a position.
+fn pick_ref(p: PickResult, line: Int, col: Int) : Expr = match p.target {
+  PtDecl(s) -> mk_sym(s, line, col)
+  PtOp(ss)  -> mk_expr(EMark(MkProtoOp(ss)), line, col)
+}
+
+# The state with the pick's instantiation recorded against the call at a
+# position. An operation left between dispatchers records none.
+fn pick_inst(p: PickResult, line: Int, col: Int) : InferState = match p.target {
+  PtDecl(s) -> if p.fresh == [] and p.unit_fresh == [] { p.st }
+               else { st_push_inst(p.st, CS(s, line, col, p.fresh, p.unit_fresh, None)) }
+  PtOp(_)   -> p.st
+}
 
 # What the first argument's type decides among the candidates of one
 # name: the function, a tie the scope cannot break, or nothing.
 type FirstArg = FaOne(PickResult) | FaTie(InferState, [SymId]) | FaNone
 
 # One candidate whose first parameter unifies with the argument.
-type Probed = { pick: PickResult, concrete: Bool }
+type Probed = { pick: PickResult, sym: SymId, concrete: Bool }
 
 type ProbeRun = { st: InferState, hits: [Probed] }
 
@@ -10577,7 +10678,7 @@ type ProbeRun = { st: InferState, hits: [Probed] }
 # what records the receiver / arg constraints into the substitution.
 # So this helper only commits the instantiation, not the probe.
 fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
-                      target_ty: Ty) : FirstArg / Mutable = {
+                      target_ty: Ty, line: Int, col: Int) : FirstArg / Mutable = {
   let run = probe_first_arg(st, candidates, target_ty, [])
   let concrete = filter(run.hits, (h) => h.concrete)
   let pool = if list_is_empty(concrete) { run.hits } else { concrete }
@@ -10585,22 +10686,32 @@ fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
     []  -> FaNone
     [h] -> FaOne(pick_at(h.pick, run.st))
     _   -> {
-      let syms = map(pool, (h) => h.pick.sym)
-      match pool_answer(st, target_ty, syms, sv_nearest(st.env.tab, st_scope(st), sv_rungs(), list_reverse(syms))) {
-        SetOne(s) -> match find(pool, (h) => sym_same(h.pick.sym, s)) {
+      let syms = map(pool, (h) => h.sym)
+      match pool_answer(st, target_ty, sv_nearest(st.env.tab, st_scope(st), sv_rungs(), list_reverse(syms))) {
+        SetOne(s) -> match find(pool, (h) => sym_same(h.sym, s)) {
           Some(h) -> FaOne(pick_at(h.pick, run.st))
           None    -> FaNone
         }
-        SetTie(ss) -> FaTie(run.st, ss)
+        SetTie(ss) -> if op_tie(st, ss) { op_pick(run.st, ss, line, col) } else { FaTie(run.st, ss) }
         _          -> FaNone
       }
     }
   }
 }
 
-fn pool_answer(st: InferState, target_ty: Ty, pool: [SymId], r: SvRes) : Settled = match r {
+# The pick of an operation no impl serves the argument for yet: the
+# reference stays between its dispatchers, typed as all of them are.
+fn op_pick(st: InferState, ss: [SymId], line: Int, col: Int) : FirstArg / Mutable = {
+  let c = op_unsettled(st, ss, line, col)
+  match c.ty {
+    Some(t) -> FaOne(PickResult { st: c.st, inst_ty: t, fresh: [], unit_fresh: [], target: PtOp(ss) })
+    None    -> FaTie(c.st, ss)
+  }
+}
+
+fn pool_answer(st: InferState, target_ty: Ty, r: SvRes) : Settled = match r {
   SvSym(s)    -> SetOne(s)
-  SvAmbig(ss) -> match tie_break(st, target_ty, pool, ss) {
+  SvAmbig(ss) -> match tie_break(st, target_ty, ss) {
     Some(s) -> SetOne(s)
     None    -> SetTie(ss)
   }
@@ -10611,16 +10722,11 @@ fn pool_answer(st: InferState, target_ty: Ty, pool: [SymId], r: SvRes) : Settled
 # functions over the same parameter (`char_unicode` over `char`), and
 # the core set's order says which stands. Dispatchers of one operation
 # several protocols declare are told apart by the impl that serves the
-# argument's type; an argument no impl serves yet leaves the newest, and
-# the dispatch rewrite retargets the call once the type is known.
-fn tie_break(st: InferState, target_ty: Ty, pool: [SymId], ss: [SymId]) : Option[SymId] =
+# argument's type; an argument no impl serves yet leaves the tie.
+fn tie_break(st: InferState, target_ty: Ty, ss: [SymId]) : Option[SymId] =
   match sv_last_listed_core(st.env.tab, st_scope(st), ss) {
     Some(s) -> Some(s)
-    None    -> if not all(ss, (s) => pid_is_disp(st.protos.ids, s)) { None }
-               else { match served_dispatcher(st.protos, target_ty, ss) {
-                 Some(s) -> Some(s)
-                 None    -> find(pool, (s) => any(ss, (x) => sym_same(x, s)))
-               } }
+    None    -> if op_tie(st, ss) { served_dispatcher(st.protos, target_ty, ss) } else { None }
   }
 
 # The dispatcher, among `ss`, of the protocol whose impl serves the head
@@ -10671,11 +10777,11 @@ fn probe_first_arg(st: InferState, candidates: [TyCandidate], target_ty: Ty,
     }
     let pick = PickResult { st: inst.st, inst_ty: inst.ty,
                              fresh: inst.fresh, unit_fresh: inst.unit_fresh,
-                             sym: c.sym }
+                             target: PtDecl(c.sym) }
     let acc1 = match probe {
       ProbeNoMatch  -> acc
-      ProbeConcrete -> [Probed { pick: pick, concrete: true }, ...acc]
-      ProbeTyvar    -> [Probed { pick: pick, concrete: false }, ...acc]
+      ProbeConcrete -> [Probed { pick: pick, sym: c.sym, concrete: true }, ...acc]
+      ProbeTyvar    -> [Probed { pick: pick, sym: c.sym, concrete: false }, ...acc]
     }
     probe_first_arg(inst.st, rest, target_ty, acc1)
   }
@@ -10835,8 +10941,8 @@ fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fre
 # else the builtin.
 fn ufcs_target(st: InferState, ident: String, obj_ty: Ty,
                line: Int, col: Int) : UfcsFound / Mutable =
-  match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty) {
-    FaOne(p)       -> UfOne(ufcs_sym_target(p.st, p.sym, p.inst_ty, p.fresh, p.unit_fresh, line, col))
+  match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty, line, col) {
+    FaOne(p)       -> UfOne(UfcsTarget { st: pick_inst(p, line, col), inst_ty: p.inst_ty, callee: pick_ref(p, line, col) })
     FaTie(st_t, ss) -> UfTie(st_t, ss)
     FaNone -> match env_local_written(st.env.entries, ident) {
       Some(b) -> match env_local(st.env, b.id) {
@@ -12435,14 +12541,10 @@ fn synth_pipe_callee(st: InferState, f: Expr, lhs_ty: Ty) : Inferred / Console +
   EName(nm) -> {
     let candidates = bare_fn_candidates(st, nm)
     if list_length(candidates) < 2 { synth_callee(st, f) }
-    else { match pick_by_first_arg(st, candidates, apply_ty(st.sub, lhs_ty)) {
+    else { match pick_by_first_arg(st, candidates, apply_ty(st.sub, lhs_ty), f.line, f.col) {
       FaNone -> synth_callee(st, f)
       FaTie(st_t, ss) -> inferred_leaf(report_name_tie(st_t, nm, ss, true, f.line, f.col), TyAny, f)
-      FaOne(pick) -> {
-        let st_inst = if pick.fresh == [] and pick.unit_fresh == [] { pick.st }
-                      else { st_push_inst(pick.st, CS(pick.sym, f.line, f.col, pick.fresh, pick.unit_fresh, None)) }
-        mk_inferred(st_inst, pick.inst_ty, with_ty(mk_sym(pick.sym, f.line, f.col), pick.inst_ty))
-      }
+      FaOne(pick) -> mk_inferred(pick_inst(pick, f.line, f.col), pick.inst_ty, with_ty(pick_ref(pick, f.line, f.col), pick.inst_ty))
     } }
   }
   _ -> synth(st, f)
@@ -17778,7 +17880,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # tells apart drain after the fields: a call on `b.field` needs
       # the field's own receiver resolved first.
       let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
-      let st2 = hd.st
+      let st2 = report_stranded_ops(hd.st, st2f.deferred_homs, [declared_ret, ...added.tys])
       let _ = if verbose {
         print_inferred_fn(env.tab, nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
         print_row_ids(env.tab, nm, st2.row)
@@ -17944,7 +18046,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
     test_non_absorbed_labels(rb.st, rb.st.row, all_decls),
     [], [], line, col)
   let hd = drain_deferred_homs(st2pre, list_reverse(st2pre.deferred_homs), [])
-  let st2 = hd.st
+  let st2 = report_stranded_ops(hd.st, st2pre.deferred_homs, [])
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
   let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner, HRowLabels([], [], true))
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, rb.expr), hd.picks)
@@ -17989,7 +18091,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
                 else { refine_coerce(minted, declared, concat_all(["const `", cname, "`"]), cbody.line, cbody.col) }
   let st2c = st_unify(coerced.st, declared, coerced.pair.ty, "const annotation", line, col)
   let hd = drain_deferred_homs(st2c, list_reverse(st2c.deferred_homs), [])
-  let st2 = hd.st
+  let st2 = report_stranded_ops(hd.st, st2c.deferred_homs, [])
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, coerced.pair.expr), hd.picks)
   TypedDecl {
