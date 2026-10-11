@@ -1868,7 +1868,7 @@ page the way they are written.
     swaps it for `[]` while walking the body, then restores the
     snapshot — same pattern as `synth_handle`. The captured body
     row becomes the closed `Row` attached to the `TyFnT` lambda
-    type via a new `labels_to_closed_row` helper. Callers get the
+    type. Callers get the
     effect through normal call-site row propagation (`EApp` of a
     fn-typed value already merges the callee's row into the
     enclosing scope), so no codegen change was needed; the runtime

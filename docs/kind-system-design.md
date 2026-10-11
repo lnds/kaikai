@@ -99,11 +99,11 @@ claimed more engines than exist. The truth, and the target:
 |---|---|---|
 | `HindleyMilner` (`Type`) | real — the core structural unifier | keep |
 | `EffectRow` (`Effect`) | real — row unification (`unify_row`) | keep |
-| `AbelianGroup` (`Measure`) | real — Kennedy 1996 (`unify_abelian`) | keep |
+| `AbelianGroup` (`Measure`) | real — Kennedy 1996 (`unify_dim`) | keep |
 | shape engine (`Shape`) | real — witness-binding of arity-1 constructors (`shape_bind`/`shape_witness_of`, a dedicated `TyShapeApp` node) | **shipped** as its own theory `ConstructorApp`; the `Structural` label is dissolved |
 | `Module` (`Currency`) | **real** — `unify_dim` dispatches by theory; Module kinds unify by nominal atom equality (`unify_nominal`) with structural formation (no products/powers), and `scale` lives in operation signatures, not the kind algebra | keep |
 | `Composition` (`Layout`) | **real** — `unify_dim` dispatches Composition kinds to the nominal slot verdict (`unify_nominal`, shared with Module) with structural formation (no products/powers); load-bearing order and the summed measure are formation invariants of the composed type, not part of the slot's unification identity | keep |
-| `Region` (theory `Nominal`) | **no engine yet** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_abelian` | catalog is honest (`Nominal`, its own theory, no longer sharing `Shape`'s label); the engine itself is still to **build** |
+| `Region` (theory `Nominal`) | **no engine yet** — no `TyRegion`/`TyBranded` node; region identity reuses `TyDim` and falls into `unify_dim` | catalog is honest (`Nominal`, its own theory, no longer sharing `Shape`'s label); the engine itself is still to **build** |
 | `Dim` (engine = the HM core) | **real** — `unify_dim` dispatches first-order kinds (Module, `Dim`) to identity-plus-binding; positional `<m, n>` lists (`UDims`) unify point to point and never touch the abelian table | **shipped** — the typer half; the fixed-width `Vec[t]<n>` representation is the codegen follow-up |
 | `Functorial` (protocol laws) | **not a unification engine at all** — `law_checks.kai` synthesizes `check` blocks, reparses, runs them as property tests | **shipped** — no longer a theory; a *protocol-law set* in its own namespace, verified by generated property checks |
 
