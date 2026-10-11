@@ -1,0 +1,142 @@
+#[doc("""
+The set of specialisations discovered so far, each with its instance
+index.
+""")]
+
+import compiler.ast
+import compiler.type_text
+import compiler.infer
+import compiler.infer_index
+import compiler.inst_index
+import compiler.effect_instance_canon
+import compiler.tbinder
+import compiler.monomorph
+import compiler.monomorph_subst
+import compiler.monomorph_polys
+import compiler.monomorph_specialise
+
+#[doc("True when both are the same specialisation: same generic, equal types and units.")]
+pub fn tuple_eq(a: MonoTuple, b: MonoTuple) : Bool =
+  match a { MT(ag, atys, aus) -> match b { MT(bg, btys, bus) ->
+    sym_same(ag, bg) and ty_list_eq(atys, btys) and unit_list_eq(aus, bus)
+  }}
+
+#[doc("True when two unit lists are equal element by element.")]
+pub fn unit_list_eq(a: [UnitExprT], b: [UnitExprT]) : Bool =
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> if unit_eq(ah, bh) { unit_list_eq(arest, brest) } else { false }
+    }
+  }
+
+# Structural equality on canonical units. Both sides are canonicalised
+# first so `m * sec` and `sec * m` collapse to the same shape.
+fn unit_eq(a: UnitExprT, b: UnitExprT) : Bool {
+  let ca = unit_canon(a)
+  let cb = unit_canon(b)
+  unit_key(ca) == unit_key(cb)
+}
+
+fn tuple_in(tuples: [MonoTuple], t: MonoTuple) : Bool {
+  match tuples {
+    [] -> false
+    [h, ...rest] -> if tuple_eq(h, t) { true } else { tuple_in(rest, t) }
+  }
+}
+
+#[doc("""
+The growing spec set carried through the fixpoint, with an index by
+generic beside the list: a bucket holds one generic's distinct tuples.
+
+Each distinct tuple is numbered among its generic's instances, in the
+order it first joins the set; that number is the instance index of
+the spec's `FnId`. A number never changes once given.
+""")]
+pub type TupleSet = { items: [MonoTuple], idx: NameIndex[TupleAt] }
+
+#[doc("A specialisation and its instance index.")]
+pub type TupleAt = TA(MonoTuple, Int)
+
+fn ts_empty() : TupleSet = TupleSet { items: [], idx: idx_empty() }
+
+fn ts_add(ts: TupleSet, t: MonoTuple) : TupleSet = {
+  let known = idx_chain_sym(ts.idx, mt_sym(t))
+  if ta_find(known, t) != spec_none() { TupleSet { items: [t, ...ts.items], idx: ts.idx } }
+  else { TupleSet { items: [t, ...ts.items], idx: idx_prepend_sym(ts.idx, mt_sym(t), TA(t, list_length(known))) } }
+}
+
+#[doc("`ts` with each of `ts_new` added.")]
+pub fn ts_add_all(ts: TupleSet, ts_new: [MonoTuple]) : TupleSet = match ts_new {
+  []           -> ts
+  [h, ...rest] -> ts_add_all(ts_add(ts, h), rest)
+}
+
+#[doc("The set holding `xs`.")]
+pub fn ts_of(xs: [MonoTuple]) : TupleSet = ts_add_all(ts_empty(), xs)
+
+#[doc("True when the set holds `t`.")]
+pub fn ts_mem(ts: TupleSet, t: MonoTuple) : Bool = ts_inst(ts, t) != spec_none()
+
+#[doc("The instance index of `t` among its generic's tuples, or `spec_none()`.")]
+pub fn ts_inst(ts: TupleSet, t: MonoTuple) : Int = ta_find(idx_chain_sym(ts.idx, mt_sym(t)), t)
+
+fn ta_find(chain: [TupleAt], t: MonoTuple) : Int = match chain {
+  []           -> spec_none()
+  [h, ...rest] -> match h { TA(u, k) -> if tuple_eq(u, t) { k } else { ta_find(rest, t) } }
+}
+
+#[doc("""
+Reduce `tp.insts` to the distinct tuples that instantiate a
+polymorphic DFn. Tuples containing unresolved `TyVarT` slots or
+`UVar` units are filtered out — specialisation requires concrete
+types.
+""")]
+pub fn collect_distinct_tuples(insts: InstIndex, polys: PolyIx,
+                           acc: [MonoTuple]) : [MonoTuple] =
+  collect_distinct_loop(iix_all(insts), polys, acc)
+
+fn collect_distinct_loop(insts: [ResolvedCS], polys: PolyIx,
+                         acc: [MonoTuple]) : [MonoTuple] {
+  match insts {
+    [] -> list_reverse(acc)
+    [cs, ...rest] -> match cs {
+      RCS(s, _, _, tys0, units, _) -> match lookup_poly_fn_sym(poly_ix_fns(polys), s) {
+        None -> collect_distinct_loop(rest, polys, acc)
+        Some(_) -> {
+          let tys = inst_spec_tys(polys, s, tys0)
+          let any_slot = list_length(tys) > 0 or list_length(units) > 0
+          let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
+          let mt = MT(s, tys, units)
+          if concrete and not tuple_in(acc, mt) {
+            collect_distinct_loop(rest, polys, [mt, ...acc])
+          } else {
+            collect_distinct_loop(rest, polys, acc)
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("""
+A generic whose `handle` takes a type parameter as its instance is
+specialised per instance even when another slot stays free: the handler's
+evidence label is that instance. The free slots that are not instances
+erase to `Any`.
+""")]
+pub fn inst_spec_tys(polys: PolyIx, s: SymId, tys: [Ty]) : [Ty] =
+  if tuple_concrete(tys) { tys }
+  else { match lookup_poly_fn_sym(poly_ix_inst(polys), s) {
+    Some(d) -> erase_free_slots(sig_type_names(d), tys, handle_instance_tparams(d))
+    None    -> tys
+  } }
+
+fn erase_free_slots(names: [TBinder], tys: [Ty], inst: [TBinder]) : [Ty] = match tys {
+  []           -> []
+  [t, ...rest] -> match names {
+    []            -> tys
+    [n, ...nrest] -> [if tbs_has(inst, n.id) or ty_concrete(t) { t } else { TyAny }, ...erase_free_slots(nrest, rest, inst)]
+  }
+}

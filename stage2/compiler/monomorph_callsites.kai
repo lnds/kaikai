@@ -1,0 +1,132 @@
+#[doc("""
+Call sites rewritten to name the spec they reach, self calls included.
+""")]
+
+import compiler.ast
+import compiler.inst_index
+import compiler.monomorph_map
+import compiler.monomorph_subst
+import compiler.monomorph_polys
+import compiler.monomorph_tuples
+import compiler.monomorph_discover
+import compiler.monomorph_insts
+
+#[doc("""
+Retarget a spec body's calls to its own generic onto the spec. A
+reference to the generic outside callee position (function-as-value)
+is left alone, so the polymorphic surface stays for partial
+application and higher-order use.
+""")]
+pub fn retarget_self_calls_decl(d: Decl) : Decl = match d {
+  DFn(p, fid, tp, ps, rt, row, body, ln, cl, mo) ->
+    DFn(p, fid, tp, ps, rt, row, retarget_self_calls_expr(body, fid), ln, cl, mo)
+  _ -> d
+}
+
+fn retarget_self_calls_expr(e: Expr, me: FnId) : Expr =
+  Expr { kind: retarget_self_calls_kind(e.kind, me),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn retarget_self_calls_kind(k: ExprKind, me: FnId) : ExprKind {
+  match k {
+    ECall(callee, args_) -> {
+      let new_args = map(args_, (a) => retarget_self_calls_expr(a, me))
+      if rsc_is_self(callee.kind, me) { ECall(spec_callee(callee, me), new_args) }
+      else { ECall(retarget_self_calls_expr(callee, me), new_args) }
+    }
+    _ -> mono_map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, me))
+  }
+}
+
+# A callee already naming an instance is a sibling spec (an impl
+# recursing on its own type at another instantiation), never the generic.
+fn rsc_is_self(callee: ExprKind, me: FnId) : Bool =
+  match callee {
+    ESym(s, k) -> sym_raw(s) >= 0 and sym_same(s, fnid_sym(me)) and k == spec_none()
+    _          -> false
+  }
+
+#[doc("""
+rewrite_callsites_decl with an explicit SubstMap. Pre-mono uses
+`subst_map_empty()`; per-spec uses the spec's own map. Subst is
+applied to the looked-up `(tys, units)` at each call site so that
+internal polymorphic-flow-through calls retarget to their specs.
+""")]
+pub fn rewrite_callsites_decl_sm(d: Decl, insts: InstIndex,
+                              tuples: TupleSet, polys: PolyIx,
+                              sm: SubstMap) : Decl {
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row,
+          rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
+    DTest(desc, body, l, c, mo) ->
+      DTest(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
+    DBench(desc, body, l, c, mo) ->
+      DBench(desc, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
+    DCheck(desc, ps, body, l, c, mo) ->
+      DCheck(desc, ps, rewrite_callsites_expr_sm(body, insts, tuples, polys, sm), l, c, mo)
+    _ -> d
+  }
+}
+
+fn rewrite_callsites_expr_sm(e: Expr, insts: InstIndex,
+                              tuples: TupleSet, polys: PolyIx,
+                              sm: SubstMap) : Expr =
+  Expr { kind: rewrite_callsites_kind_sm(e.kind, e.ty, insts, tuples, polys, sm),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn rewrite_callsites_kind_sm(k: ExprKind, ret_ty: Option[Ty], insts: InstIndex,
+                              tuples: TupleSet, polys: PolyIx,
+                              sm: SubstMap) : ExprKind {
+  match k {
+    ECall(callee, args_) -> {
+      let new_args = map(args_, (a) => rewrite_callsites_expr_sm(a, insts, tuples, polys, sm))
+      match lookup_poly_fn_at(polys, callee) {
+        Some(d) -> rewrite_poly_call(d, callee, new_args, ret_ty, insts, tuples, polys, sm)
+        None    -> ECall(rewrite_callsites_expr_sm(callee, insts, tuples, polys, sm), new_args)
+      }
+    }
+    _ -> mono_map_expr_kind(k, (sub) => rewrite_callsites_expr_sm(sub, insts, tuples, polys, sm))
+  }
+}
+
+# Retarget a call to the generic `d` to the spec of the tuple it
+# instantiates, when that tuple has one.
+fn rewrite_poly_call(d: Decl, callee: Expr, new_args: [Expr], ret_ty: Option[Ty],
+                      insts: InstIndex, tuples: TupleSet, polys: PolyIx,
+                      sm: SubstMap) : ExprKind =
+  match resolve_call_inst(insts, polys, d, callee, new_args, ret_ty, sm) {
+    Some(MIPair(tys, units)) -> {
+      let inst = ts_inst(tuples, MT(poly_decl_sym(d), tys, units))
+      if inst == spec_none() { ECall(callee, new_args) }
+      else { ECall(spec_callee(callee, FnId(poly_decl_sym(d), inst)), new_args) }
+    }
+    None -> ECall(callee, new_args)
+  }
+
+#[doc("""
+---- m4c Phase 2 — call-site rewrite ----
+
+Walk every DFn / DTest body and rewrite each call to a generic whose
+`(id, callee.line, callee.col)` matches a `ResolvedCS` with concrete
+tys+units that produced a specialisation in `tuples`. The rewritten
+callee names the spec by its identity at the same source position;
+args recurse under the same walker.
+
+Keying is `(id, line, col)` against insts because the typer pushes
+one call site per polymorphic instantiation, at the reference's
+position.
+
+A reference to a generic outside callee position (function-as-value,
+partial application) is left untouched: the polymorphic original stays
+in the decl list specifically to support those uses.
+Pre-mono rewrite over the whole program. Delegates to the SM-aware
+rewriter with an empty SubstMap, so call sites whose recorded tys/
+units are already concrete retarget to their specs; ones
+whose tuples still contain `TyVarT` / `UVar` (polymorphic flow-
+through) leave the callee alone — those become concrete only inside
+specs, where `rewrite_callsites_decl_sm` runs with the spec's map.
+""")]
+pub fn rewrite_callsites_decls_full(ds: [Decl], insts: InstIndex,
+                                 tuples: TupleSet, polys: PolyIx) : [Decl] =
+  map(ds, (d) => rewrite_callsites_decl_sm(d, insts, tuples, polys, subst_map_empty()))

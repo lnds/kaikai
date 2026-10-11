@@ -1,0 +1,158 @@
+#[doc("""
+A generic declaration's signature rewritten at concrete types: the
+specialised declaration.
+""")]
+
+import compiler.ast
+import compiler.effect_instance_canon
+import compiler.tbinder
+import compiler.monomorph_map
+
+# A spec's signature must read concrete: `subst_decl` only rewrites
+# the body, leaving `Param.ptype` / `opt_ret` at the written
+# type parameter. The unbox classifier reads the SIGNATURE, so an
+# unconcreted one keeps the spec boxed (lost int64 ABI on every
+# scalar `fn[T:P]`). These helpers concrete the syntactic signature
+# by mapping each type-kind tparam name to its actual TypeExpr.
+
+# Reverse of resolve_ty for the slots that matter to unboxing.
+# Primitives become bare TyName so the classifier sees Int/Real/Bool/
+# Char; compound types reconstruct structurally (a boxed param either
+# way, but kept faithful for the rest of the signature walk).
+fn ty_to_typeexpr(t: Ty) : TypeExpr {
+  let k = match t {
+    TyInt    -> TyName(ref_written("Int"), [])
+    TyReal   -> TyName(ref_written("Real"), [])
+    TyBool   -> TyName(ref_written("Bool"), [])
+    TyString -> TyName(ref_written("String"), [])
+    TyChar   -> TyName(ref_written("Char"), [])
+    TyUnit   -> TyName(ref_written("Unit"), [])
+    TyByte   -> TyName(ref_written("Byte"), [])
+    TyInt32  -> TyName(ref_written("Int32"), [])
+    TyUInt32 -> TyName(ref_written("UInt32"), [])
+    TyUInt64 -> TyName(ref_written("UInt64"), [])
+    TyInt128 -> TyName(ref_written("Int128"), [])
+    TyHandle -> TyName(ref_written("Handle"), [])
+    TyAny    -> TyName(ref_written("Any"), [])
+    TyListT(inner) -> TyList(ty_to_typeexpr(inner))
+    TyFnT(ps, ret, _) -> TyFn(map(ps, ty_to_typeexpr), ty_to_typeexpr(ret), REmpty)
+    TyCon(csym, tas) -> TyName(DrSym(csym), map(tas, ty_to_typeexpr))
+    TyVarT(_) -> TyName(ref_written("Any"), [])
+    # a resolved shape app is erased before this conversion; an
+    # unresolved one has no surface constructor, like a bare tvar.
+    TyShapeApp(_, _) -> TyName(ref_written("Any"), [])
+    TyDimT(base, u) -> TyDim(ty_to_typeexpr(base), u)
+    TyRefineT(base, p) -> TyRefine(ty_to_typeexpr(base), p)
+    TyUnion(parts) -> union_head_tkind(parts)
+  }
+  mk_ty(k, 0, 0)
+}
+
+fn union_head_tkind(parts: [Ty]) : TyKind = match parts {
+  [p, ..._] -> {
+    let te = ty_to_typeexpr(p)
+    te.tkind
+  }
+  [] -> TyName(ref_written("Any"), [])
+}
+
+type SigSubst = SS(TLocalId, TypeExpr)
+
+# Pair the decl's type-kind tparams (unit-kind dropped, matching the
+# `tys` alignment) with their concrete TypeExprs, in the ordering
+# build_subst_map uses.
+fn build_sig_subst(d: Decl, tys: [Ty]) : [SigSubst] = zip_sig_subst(sig_type_names(d), tys)
+
+#[doc("The type parameters of a function, unit parameters left out, in declaration order.")]
+pub fn sig_type_names(d: Decl) : [TBinder] = match d {
+  DFn(_, _, tparams, _, _, _, _, _, _, _) ->
+    filter(tbs_positional(tparams), (n) => not tb_is_unit(n))
+  _ -> []
+}
+
+fn zip_sig_subst(names: [TBinder], tys: [Ty]) : [SigSubst] {
+  match names {
+    [] -> []
+    [n, ...nrest] -> match tys {
+      [] -> []
+      [t, ...trest] -> [SS(n.id, ty_to_typeexpr(t)), ...zip_sig_subst(nrest, trest)]
+    }
+  }
+}
+
+# The concrete form of the type parameter `id`.
+fn sig_subst_of(subst: [SigSubst], id: TLocalId) : Option[TypeExpr] = match subst {
+  [] -> None
+  [SS(n, te), ...rest] -> if tlocal_eq(n, id) { Some(te) } else { sig_subst_of(rest, id) }
+}
+
+# Rewrite a TypeExpr, replacing each use of a type parameter with its
+# concrete form.
+fn apply_sig_subst_te(te: TypeExpr, subst: [SigSubst]) : TypeExpr {
+  let k = match te.tkind {
+    TyName(r, targs) -> TyName(r, map(targs, (a) => apply_sig_subst_te(a, subst)))
+    TyParam(p, targs) -> {
+      let targs1 = map(targs, (a) => apply_sig_subst_te(a, subst))
+      match sig_subst_of(subst, p) {
+        Some(rep) -> if targs1 == [] { rep.tkind } else { TyParam(p, targs1) }
+        None -> TyParam(p, targs1)
+      }
+    }
+    TyList(inner) -> TyList(apply_sig_subst_te(inner, subst))
+    TyFn(ps, ret, row) -> TyFn(map(ps, (p) => apply_sig_subst_te(p, subst)),
+                                apply_sig_subst_te(ret, subst), row)
+    TyDim(base, u) -> TyDim(apply_sig_subst_te(base, subst), u)
+    TyRefine(base, p) -> TyRefine(apply_sig_subst_te(base, subst), p)
+    TyRow(row) -> TyRow(row)
+    TySurface(ts) -> TySurface(tysurface_rebuild(ts, map(tysurface_children(ts), (c) => apply_sig_subst_te(c, subst))))
+  }
+  mk_ty(k, te.line, te.col)
+}
+
+fn subst_param_sig(p: Param, subst: [SigSubst]) : Param =
+  match p.ptype {
+    None -> p
+    Some(te) -> Param { binder: p.binder, ptype: Some(apply_sig_subst_te(te, subst)),
+                        pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
+  }
+
+#[doc("The spec of `d` at `tys`: instance `inst` of the generic's id.")]
+pub fn specialise_decl(d: Decl, tys: [Ty], inst: Int) : Decl {
+  match d {
+    DFn(is_pub, fid, _, params, opt_ret, row, body, ln, cl, mo) -> {
+      let subst = build_sig_subst(d, tys)
+      let params1 = map(params, (p) => subst_param_sig(p, subst))
+      let opt_ret1 = match opt_ret {
+        None -> None
+        Some(te) -> Some(apply_sig_subst_te(te, subst))
+      }
+      let body1 = if handle_instance_tparams(d) == [] { body } else { subst_handle_sig(body, subst) }
+      DFn(is_pub, FnId(fnid_sym(fid), inst), [], params1, opt_ret1, subst_row_sig(row, subst), body1,
+          ln, cl, mo)
+    }
+    _ -> d
+  }
+}
+
+# A spec's row labels and `handle` type arguments name its instances, which
+# evidence selection keys on, so they read concrete too.
+fn subst_row_sig(r: RowExpr, subst: [SigSubst]) : RowExpr = match r {
+  REmpty       -> REmpty
+  RClosed([])  -> r
+  RClosed(ls)  -> RClosed(map(ls, (l) => subst_label_sig(l, subst)))
+  ROpen(t, ls) -> ROpen(t, map(ls, (l) => subst_label_sig(l, subst)))
+}
+
+fn subst_label_sig(l: RowLabel, subst: [SigSubst]) : RowLabel = match l {
+  RL(r, ts) -> RL(r, map(ts, (t) => apply_sig_subst_te(t, subst)))
+}
+
+fn subst_handle_sig(e: Expr, subst: [SigSubst]) : Expr = {
+  let k = mono_map_expr_kind(e.kind, (sub) => subst_handle_sig(sub, subst))
+  let k1 = match k {
+    EHandle(body, eff, tas, init, alias, cls, ret) ->
+      EHandle(body, eff, map(tas, (t) => apply_sig_subst_te(t, subst)), init, alias, cls, ret)
+    _ -> k
+  }
+  Expr { kind: k1, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+}

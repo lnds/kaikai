@@ -1,0 +1,184 @@
+#[doc("""
+The type and unit arguments a call inside a generic selects, read off
+its formals against the argument and return types.
+""")]
+
+import compiler.ast
+import compiler.infer
+import compiler.monomorph_subst
+
+#[doc("The type and unit arguments bound so far, by type-parameter id.")]
+pub type SubstBindings = { tvars: [SubstPairTy], uvars: [SubstPairUnit] }
+
+#[doc("`b` extended with what each formal binds against its argument's type.")]
+pub fn extract_bindings_args(formals: [Ty], args_: [Expr],
+                          b: SubstBindings) : SubstBindings {
+  match formals {
+    [] -> b
+    [f, ...frest] -> match args_ {
+      [] -> b
+      [a, ...arest] -> match a.ty {
+        Some(at) -> extract_bindings_args(frest, arest, extract_bindings_ty(f, at, b))
+        None     -> extract_bindings_args(frest, arest, b)
+      }
+    }
+  }
+}
+
+#[doc("""
+Add the binding a RETURN-ONLY tparam gets from the call site's resolved
+return type. Only tparams absent from every parameter qualify: a tparam a
+parameter mentions is the args' job to pin, and if the arg type did not
+unify (`sum(tree)` against `list.sum[T](xs: [T]): T`) the call is not this
+generic — grounding it from the return would steal a same-named local
+fn's call site (#748 shadowing). Skips an absent or tyvar `ret_ty`
+(nothing to add) — the whole step stays additive.
+""")]
+pub fn extract_bindings_from_ret(formal_ret: Ty, formal_pts: [Ty], ret_ty: Option[Ty], b: SubstBindings) : SubstBindings =
+  match ret_ty {
+    None    -> b
+    Some(t) -> if ty_concrete(t) {
+                 let param_ids = collect_ty_tvar_ids_list(formal_pts, [])
+                 extract_ret_only_bindings(formal_ret, t, param_ids, b)
+               } else { b }
+  }
+
+# Like extract_bindings_ty but records a binding only for a TyVarT whose id
+# is NOT mentioned in any parameter — a genuine return-only tparam.
+fn extract_ret_only_bindings(formal: Ty, actual: Ty, param_ids: [Int], b: SubstBindings) : SubstBindings {
+  match formal {
+    TyVarT(id) -> if list_has_int(param_ids, id) { b }
+                  else { SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars } }
+    TyListT(fi) -> match actual {
+      TyListT(ai) -> extract_ret_only_bindings(fi, ai, param_ids, b)
+      _ -> b
+    }
+    TyCon(_, fas) -> match actual {
+      TyCon(_, aas) -> extract_ret_only_bindings_list(fas, aas, param_ids, b)
+      _ -> b
+    }
+    _ -> b
+  }
+}
+
+fn extract_ret_only_bindings_list(fs: [Ty], a_s: [Ty], param_ids: [Int], b: SubstBindings) : SubstBindings {
+  match fs {
+    [] -> b
+    [f, ...frest] -> match a_s {
+      [] -> b
+      [a, ...arest] -> extract_ret_only_bindings_list(frest, arest, param_ids,
+                         extract_ret_only_bindings(f, a, param_ids, b))
+    }
+  }
+}
+
+# Every TyVarT id appearing anywhere in a list of formal parameter types.
+fn collect_ty_tvar_ids_list(ts: [Ty], acc: [Int]) : [Int] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_ty_tvar_ids_list(rest, collect_ty_tvar_ids(t, acc))
+  }
+}
+
+fn collect_ty_tvar_ids(t: Ty, acc: [Int]) : [Int] {
+  match t {
+    TyVarT(id)       -> if list_has_int(acc, id) { acc } else { [id, ...acc] }
+    TyListT(inner)   -> collect_ty_tvar_ids(inner, acc)
+    TyFnT(ps, r, _)  -> collect_ty_tvar_ids(r, collect_ty_tvar_ids_list(ps, acc))
+    TyCon(_, as_)    -> collect_ty_tvar_ids_list(as_, acc)
+    TyDimT(base, _)  -> collect_ty_tvar_ids(base, acc)
+    TyRefineT(base, _) -> collect_ty_tvar_ids(base, acc)
+    _ -> acc
+  }
+}
+
+fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings {
+  # A refinement on the actual side hides the shape a formal reads.
+  let a = match formal {
+    TyRefineT(_, _) -> actual
+    _               -> ty_unrefined(actual)
+  }
+  match formal {
+    TyVarT(id) -> SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars }
+    TyListT(fi) -> match a {
+      TyListT(ai) -> extract_bindings_ty(fi, ai, b)
+      _ -> b
+    }
+    TyFnT(fps, fret, _) -> match a {
+      TyFnT(aps, aret, _) -> extract_bindings_ty(fret, aret,
+                              extract_bindings_tys(fps, aps, b))
+      _ -> b
+    }
+    TyCon(_, fas) -> match a {
+      TyCon(_, aas) -> extract_bindings_tys(fas, aas, b)
+      _ -> b
+    }
+    # `s[A]` against a concrete arity-1 type binds the shape var to the
+    # constructor witness and recurses into the argument — the mono
+    # mirror of the first-order shape-app unification rule.
+    TyShapeApp(sv, fa) -> match shape_witness_of(a) {
+      Some(wit) -> extract_bindings_ty(fa, shape_arg_of(a),
+                     SubstBindings { tvars: [STP(sv, wit), ...b.tvars], uvars: b.uvars })
+      None -> b
+    }
+    TyDimT(fb, fu) -> match a {
+      TyDimT(ab, au) -> extract_bindings_unit(fu, au,
+                          extract_bindings_ty(fb, ab, b))
+      _ -> b
+    }
+    TyRefineT(fb, _) -> match a {
+      TyRefineT(ab, _) -> extract_bindings_ty(fb, ab, b)
+      _ -> extract_bindings_ty(fb, a, b)
+    }
+    _ -> b
+  }
+}
+
+fn extract_bindings_tys(fs: [Ty], a_s: [Ty], b: SubstBindings) : SubstBindings {
+  match fs {
+    [] -> b
+    [f, ...frest] -> match a_s {
+      [] -> b
+      [a, ...arest] -> extract_bindings_tys(frest, arest, extract_bindings_ty(f, a, b))
+    }
+  }
+}
+
+fn extract_bindings_unit(formal: UnitExprT, actual: UnitExprT,
+                          b: SubstBindings) : SubstBindings {
+  let f_canon = unit_canon(formal)
+  match f_canon {
+    UVar(id) -> SubstBindings { tvars: b.tvars,
+                                uvars: [SUP(id, unit_canon(actual)), ...b.uvars] }
+    _ -> b
+  }
+}
+
+#[doc("""
+Resolve each type-tparam id to its bound type. Returns None if any
+id is left unbound — the generic's formal shape did not unify with
+the call, so no instantiation should be synthesised.
+""")]
+pub fn collect_subst_tys(ids: [Int], pairs: [SubstPairTy]) : Option[[Ty]] {
+  match ids {
+    [] -> Some([])
+    [i, ...rest] -> match subst_pairs_lookup_ty(pairs, i) {
+      Some(t) -> match collect_subst_tys(rest, pairs) {
+        Some(ts) -> Some([t, ...ts])
+        None     -> None
+      }
+      None    -> None
+    }
+  }
+}
+
+#[doc("The unit bound to each id of `ids`, in order; `UOne` for an unbound one.")]
+pub fn collect_subst_units(ids: [Int], pairs: [SubstPairUnit]) : [UnitExprT] {
+  match ids {
+    [] -> []
+    [i, ...rest] -> match subst_pairs_lookup_unit(pairs, i) {
+      Some(u) -> [u, ...collect_subst_units(rest, pairs)]
+      None    -> [UOne, ...collect_subst_units(rest, pairs)]
+    }
+  }
+}

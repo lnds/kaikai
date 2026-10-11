@@ -371,7 +371,7 @@ done
 
 # A specialised callee is named by its spec's identity; a callee minted
 # from the mangled spelling alone would reach every later pass with no id.
-grep -nE 'EVar\(mangled\)|EModCall\([a-z]+, mangled\)' "$ROOT/stage2/compiler/monomorph.kai" \
+grep -nE 'EVar\(mangled\)|EModCall\([a-z]+, mangled\)' "$ROOT"/stage2/compiler/monomorph*.kai \
   && fail "monomorph mints a spec callee from its mangled name"
 
 # A cell perform names the core `State`/`Reader`: the native backend finds

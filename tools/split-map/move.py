@@ -309,6 +309,8 @@ def cmd_apply(path, plan):
     if problems and "--draft" not in sys.argv: sys.exit("no doc for: " + " ".join(problems))
     if problems: print("no doc for: " + " ".join(problems))
 
+    taken = [m for m in mods if m != old and os.path.exists(os.path.join(src, m + ".kai"))]
+    if taken: sys.exit("these modules already exist: " + " ".join(taken))
     if old not in mods: os.remove(path)
     for m, text in texts.items(): open(os.path.join(src, m + ".kai"), "w").write(text)
 
