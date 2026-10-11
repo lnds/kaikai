@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.140.2 (2026-10-11)
+
+### Changed
+
+- **compiler**: each module's qualifier table is built once per program (#2695)
+- **compiler**: a module's scope context is built once, not per declaration (#2694)
+- **compiler**: the unused-import scan looks a word up in a name index (#2693)
+
 ## v0.140.1 (2026-10-11)
 
 ### Fixed
