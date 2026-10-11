@@ -1,0 +1,315 @@
+#[doc("""
+The check that a nursery capability is used only inside the nursery that
+made it.
+""")]
+
+import compiler.ast
+import compiler.diag_file
+import compiler.brand_transp
+import compiler.written
+import compiler.symtab
+import compiler.desugar_pat_names
+import compiler.desugar
+import compiler.desugar_brand_env
+
+# Top-level entry — one error count for the whole program.
+#[doc("Brand-mismatch validator over the post-rewrite AST; rejects sibling-nursery cap confusion at consume sites. Depends on the brand registry produced by rewrite_nursery_caps_decls. `tab` names every function of `ds`.")]
+pub fn check_nursery_brand_mismatch_decls(ds: [Decl], tab: SymTab, df: DiagFiles,
+                                        calls: [BrandCall],
+                                        brs: [BrandRec]) : Int / Console + File {
+
+  check_brand_decls_loop(ds, df, calls, brs, 0,
+                           benv_with_transp(brand_transp_index(brand_transp_decls(ds, tab))))
+}
+
+fn check_brand_decls_loop(ds: [Decl], df: DiagFiles, calls: [BrandCall],
+                            brs: [BrandRec], errs: Int,
+                            seed: BrandEnv) : Int / Console + File {
+
+  match ds {
+    [] -> errs
+    [d, ...rest] -> {
+      let e1 = check_brand_decl(d, decl_diag_file(d, df), calls, brs, errs, seed)
+      check_brand_decls_loop(rest, df, calls, brs, e1, seed)
+    }
+  }
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn check_brand_sub_decls(ds: [Decl], file: String, calls: [BrandCall],
+                           brs: [BrandRec], errs: Int,
+                           seed: BrandEnv) : Int / Console + File {
+  match ds {
+    [] -> errs
+    [d, ...rest] ->
+      check_brand_sub_decls(rest, file, calls, brs,
+                              check_brand_decl(d, file, calls, brs, errs, seed), seed)
+  }
+}
+
+fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
+                      brs: [BrandRec], errs: Int,
+                      seed: BrandEnv) : Int / Console + File {
+
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      check_brand_expr(body, seed, file, calls, brs, errs)
+    DTest(_, body, _, _, _) ->
+      check_brand_expr(body, seed, file, calls, brs, errs)
+    DBench(_, body, _, _, _) ->
+      check_brand_expr(body, seed, file, calls, brs, errs)
+    DCheck(_, _, body, _, _, _) ->
+      check_brand_expr(body, seed, file, calls, brs, errs)
+    DImpl(_, _, _, ms, _, _, _, isym) ->
+      check_brand_sub_decls(ms, file, calls, brs, errs, seed)
+    DDerive(_, inner, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs, seed)
+    DUnstable(inner, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs, seed)
+    DProtoLaws(_, inner, _, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs, seed)
+    DImplAxiom(_, inner, _, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs, seed)
+    DConstructor(inner, _, _) ->
+      check_brand_decl(inner, file, calls, brs, errs, seed)
+    _ -> errs
+  }
+}
+
+fn check_brand_expr(e: Expr, env: BrandEnv, file: String,
+                      calls: [BrandCall], brs: [BrandRec],
+                      errs: Int) : Int / Console + File {
+
+  check_brand_kind(e.kind, env, file, calls, brs, errs, e.line, e.col)
+}
+
+fn check_brand_opt(o: Option[Expr], env: BrandEnv, file: String,
+                     calls: [BrandCall], brs: [BrandRec],
+                     errs: Int) : Int / Console + File {
+
+  match o {
+    None -> errs
+    Some(e) -> check_brand_expr(e, env, file, calls, brs, errs)
+  }
+}
+
+fn check_brand_exprs(es: [Expr], env: BrandEnv, file: String,
+                       calls: [BrandCall], brs: [BrandRec],
+                       errs: Int) : Int / Console + File {
+
+  match es {
+    [] -> errs
+    [h, ...rest] -> {
+      let e1 = check_brand_expr(h, env, file, calls, brs, errs)
+      check_brand_exprs(rest, env, file, calls, brs, e1)
+    }
+  }
+}
+
+fn check_brand_kind(k: ExprKind, env: BrandEnv, file: String,
+                      calls: [BrandCall], brs: [BrandRec],
+                      errs: Int, line: Int, col: Int) : Int / Console + File {
+
+  match k {
+    ECall(callee, args_) -> {
+      # Recognise rewritten cap-binding op calls by their registry
+      # entry. For consume ops, cross-check the arg's brand.
+      match brand_call_first_at(calls, line, col) {
+        Some(bid) -> {
+          # Look up the actual op name to pick the right arg index.
+          let op = call_op_name(calls, line, col)
+          let e1 = check_brand_consume(op, args_, bid, env, file, calls, brs, errs)
+          check_brand_exprs(args_, env, file, calls, brs, e1)
+        }
+        None -> {
+          warn_brand_opaque_call(callee, args_, env, file, calls, brs)
+          let e1 = check_brand_expr(callee, env, file, calls, brs, errs)
+          check_brand_exprs(args_, env, file, calls, brs, e1)
+        }
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let r = check_brand_stmts(stmts, env, file, calls, brs, errs)
+      check_brand_opt(tail, r.env, file, calls, brs, r.errs)
+    }
+    EMatch(scr, arms) -> {
+      let e1 = check_brand_expr(scr, env, file, calls, brs, errs)
+      check_brand_arms(arms, env, file, calls, brs, e1)
+    }
+    EIf(c, t_, eo) -> {
+      let e1 = check_brand_expr(c, env, file, calls, brs, errs)
+      let e2 = check_brand_expr(t_, env, file, calls, brs, e1)
+      check_brand_opt(eo, env, file, calls, brs, e2)
+    }
+    EBinop(_, a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EUnop(_, x) -> check_brand_expr(x, env, file, calls, brs, errs)
+    EField(base, _) -> check_brand_expr(base, env, file, calls, brs, errs)
+    EIndex(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EMapPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    EFilterPipe(a, b) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      check_brand_expr(b, env, file, calls, brs, e1)
+    }
+    ELambda(ps, body) -> {
+      let pnames = map(ps, (p) => written_text(p.binder.name))
+      check_brand_expr(body, benv_remove_all(env, pnames), file, calls, brs, errs)
+    }
+    ERecordLit(_, fs) -> check_brand_fields(fs, env, file, calls, brs, errs)
+    EList(els) -> check_brand_elems(els, env, file, calls, brs, errs)
+    ERange(a, b, opt_step) -> {
+      let e1 = check_brand_expr(a, env, file, calls, brs, errs)
+      let e2 = check_brand_expr(b, env, file, calls, brs, e1)
+      check_brand_opt(opt_step, env, file, calls, brs, e2)
+    }
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let e1 = check_brand_expr(body, env, file, calls, brs, errs)
+      let e2 = check_brand_opt(init_opt, env, file, calls, brs, e1)
+      let e3 = check_brand_clauses(clauses, env, file, calls, brs, e2)
+      check_brand_opt_return(ret_opt, env, file, calls, brs, e3)
+    }
+    ELitUnit(inner, _) -> check_brand_expr(inner, env, file, calls, brs, errs)
+    EBang(inner) -> check_brand_expr(inner, env, file, calls, brs, errs)
+    _ -> errs
+  }
+}
+
+fn check_brand_stmts(ss: [Stmt], env: BrandEnv, file: String,
+                       calls: [BrandCall], brs: [BrandRec],
+                       errs: Int) : BrandStmtsRes / Console + File {
+
+
+  match ss {
+    [] -> BrandStmtsRes { env: env, errs: errs }
+    [stmt, ...rest] -> match stmt {
+      SLet(pat, _, rhs) -> {
+        let e1 = check_brand_expr(rhs, env, file, calls, brs, errs)
+        let env1 = bind_brand_pat(pat, rhs, env, calls)
+        check_brand_stmts(rest, env1, file, calls, brs, e1)
+      }
+      SVar(n, _, rhs, _, _) -> {
+        let e1 = check_brand_expr(rhs, env, file, calls, brs, errs)
+        let env1 = benv_remove(env, written_text(n.name))
+        check_brand_stmts(rest, env1, file, calls, brs, e1)
+      }
+      SAssert(c, m) -> {
+        let e1 = check_brand_expr(c, env, file, calls, brs, errs)
+        let e2 = check_brand_opt(m, env, file, calls, brs, e1)
+        check_brand_stmts(rest, env, file, calls, brs, e2)
+      }
+      SExprStmt(x) -> {
+        let e1 = check_brand_expr(x, env, file, calls, brs, errs)
+        check_brand_stmts(rest, env, file, calls, brs, e1)
+      }
+      SAssign(b, v, _, _) -> {
+        let e1 = check_brand_expr(b, env, file, calls, brs, errs)
+        let e3 = check_brand_expr(v, env, file, calls, brs, e1)
+        check_brand_stmts(rest, env, file, calls, brs, e3)
+      }
+      SIndexAssign(b, i, v, _, _) -> {
+        let e1 = check_brand_expr(b, env, file, calls, brs, errs)
+        let e2 = check_brand_expr(i, env, file, calls, brs, e1)
+        let e3 = check_brand_expr(v, env, file, calls, brs, e2)
+        check_brand_stmts(rest, env, file, calls, brs, e3)
+      }
+      SUse(_, _, _) -> check_brand_stmts(rest, env, file, calls, brs, errs)
+    }
+  }
+}
+
+fn check_brand_arms(arms: [Arm], env: BrandEnv, file: String,
+                      calls: [BrandCall], brs: [BrandRec],
+                      errs: Int) : Int / Console + File {
+
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> {
+        let env1 = benv_remove_all(env, dsg_pat_bindings(p, []))
+        let e1 = check_brand_opt(g, env1, file, calls, brs, errs)
+        let e2 = check_brand_expr(b, env1, file, calls, brs, e1)
+        check_brand_arms(rest, env, file, calls, brs, e2)
+      }
+    }
+  }
+}
+
+fn check_brand_clauses(cs: [HClause], env: BrandEnv, file: String,
+                        calls: [BrandCall], brs: [BrandRec],
+                        errs: Int) : Int / Console + File {
+
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, ps, b, _, _) -> {
+        let pnames = map(ps, (pm) => written_text(pm.binder.name))
+        let env1 = benv_remove_all(env, pnames)
+        let e1 = check_brand_expr(b, env1, file, calls, brs, errs)
+        check_brand_clauses(rest, env, file, calls, brs, e1)
+      }
+    }
+  }
+}
+
+fn check_brand_opt_return(opt: Option[HReturn], env: BrandEnv, file: String,
+                            calls: [BrandCall], brs: [BrandRec],
+                            errs: Int) : Int / Console + File {
+
+  match opt {
+    None -> errs
+    Some(r) -> match r {
+      HR(p, b, _, _) -> {
+        let env1 = benv_remove(env, written_text(p.name))
+        check_brand_expr(b, env1, file, calls, brs, errs)
+      }
+    }
+  }
+}
+
+fn check_brand_fields(fs: [FieldInit], env: BrandEnv, file: String,
+                        calls: [BrandCall], brs: [BrandRec],
+                        errs: Int) : Int / Console + File {
+
+  match fs {
+    [] -> errs
+    [f, ...rest] -> match f {
+      FI(_, v) -> {
+        let e1 = check_brand_expr(v, env, file, calls, brs, errs)
+        check_brand_fields(rest, env, file, calls, brs, e1)
+      }
+    }
+  }
+}
+
+fn check_brand_elems(els: [ListElem], env: BrandEnv, file: String,
+                       calls: [BrandCall], brs: [BrandRec],
+                       errs: Int) : Int / Console + File {
+
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x) -> check_brand_expr(x, env, file, calls, brs, errs)
+        ElSpread(x) -> check_brand_expr(x, env, file, calls, brs, errs)
+      }
+      check_brand_elems(rest, env, file, calls, brs, e1)
+    }
+  }
+}

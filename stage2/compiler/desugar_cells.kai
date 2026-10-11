@@ -1,0 +1,96 @@
+#[doc("""
+Cell reads lowered over a program's declarations.
+""")]
+
+import compiler.ast
+import compiler.diag_file
+import compiler.desugar_rename
+import compiler.desugar
+import compiler.desugar_nursery_types
+
+# Naked-cell-read lowering + escape veto. Walks every fn / test body
+# tracking the set `caps` of names currently bound as a mutable cell —
+# either by an enclosing `var name := init` (an SVar not yet rewritten
+# into a State[T] handler) or by a user-written `with State[T] as name`
+# / `with Reader[T] as name`. A bare `EName(name)` for such a name is
+# lowered here to `name.get()`; the parser already lowered the write
+# `name := v` to `name.set(v)`. Doing the read lowering at this layer
+# (where the scope of each cell is known) keeps it out of the parser,
+# which cannot tell a cell read from an ordinary local read.
+#
+# Escape veto: a cell cannot be read or written from a closure whose
+# VALUE reaches the block's exit (tail / returned / stored in the exit
+# value), because the State[T] handler is torn down when the block
+# exits (the runtime is dynamic-scoping) — such a closure run later
+# reads a dead frame. A closure that is applied inside the block, or
+# passed as a call argument (applied eagerly), is sound and allowed.
+# The veto is a separate forward-taint walk (lcr_escape_check), not part
+# of the read lowering.
+#
+# Scope rules: SLet, lambda params, match arm patterns, fn params,
+# nested SVar with the same name, and non-cell handler `as` aliases all
+# shadow a cell binder; cell reads under those scopes are ordinary
+# locals, left untouched.
+pub type VarLow = { decls: [Decl], errs: Int }
+
+#[doc("Lower naked reads of mutable cells to `cell.get()` and reject cell access that escapes its block; the entry point used before the SVar rewrite, where `@cell` is rejected.")]
+pub fn lower_cell_reads_decls(ds: [Decl], df: DiagFiles) : VarLow / Console + File =
+  lcr_decls_loop(ds, true, df, [], 0)
+
+#[doc("Re-run of the cell-read lowering after string-interp lifting; `reject_at` is false because reads were already lowered, so `@cell` is no longer distinguishable from a generated `cell.get()`.")]
+pub fn relower_cell_reads_decls(ds: [Decl], df: DiagFiles) : VarLow / Console + File =
+  lcr_decls_loop(ds, false, df, [], 0)
+
+fn lcr_decls_loop(ds: [Decl], reject_at: Bool, df: DiagFiles, acc: [Decl], errs: Int) : VarLow / Console + File {
+
+  match ds {
+    [] -> VarLow { decls: list_reverse(acc), errs: errs }
+    [d, ...rest] -> {
+      let r = lcr_decl(d, reject_at, decl_diag_file(d, df), errs)
+      lcr_decls_loop(rest, reject_at, df, [r.decl, ...acc], r.errs)
+    }
+  }
+}
+
+type VLDecl = { decl: Decl, errs: Int }
+
+fn lcr_decl(d: Decl, reject_at: Bool, file: String, errs: Int) : VLDecl / Console + File {
+
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> {
+      let pnames = dsg_rename_param_names(ps, [])
+      let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
+      VLDecl { decl: DFn(pub_, fid, tps, ps, ret, row, r.expr, l, c, mo), errs: r.errs }
+    }
+    DTest(desc, body, l, c, mo) -> {
+      let r = lcr_expr(body, [], reject_at, file, errs)
+      VLDecl { decl: DTest(desc, r.expr, l, c, mo), errs: r.errs }
+    }
+    DBench(desc, body, l, c, mo) -> {
+      let r = lcr_expr(body, [], reject_at, file, errs)
+      VLDecl { decl: DBench(desc, r.expr, l, c, mo), errs: r.errs }
+    }
+    DCheck(desc, ps, body, l, c, mo) -> {
+      let pnames = dsg_rename_param_names(ps, [])
+      let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
+      VLDecl { decl: DCheck(desc, ps, r.expr, l, c, mo), errs: r.errs }
+    }
+    DUnstable(inner, l, c) -> {
+      let r = lcr_decl(inner, reject_at, file, errs)
+      VLDecl { decl: DUnstable(r.decl, l, c), errs: r.errs }
+    }
+    DProtoLaws(thy, inner, l, c, mo) -> {
+      let r = lcr_decl(inner, reject_at, file, errs)
+      VLDecl { decl: DProtoLaws(thy, r.decl, l, c, mo), errs: r.errs }
+    }
+    DImplAxiom(thy, inner, l, c, mo) -> {
+      let r = lcr_decl(inner, reject_at, file, errs)
+      VLDecl { decl: DImplAxiom(thy, r.decl, l, c, mo), errs: r.errs }
+    }
+    DConstructor(inner, l, c) -> {
+      let r = lcr_decl(inner, reject_at, file, errs)
+      VLDecl { decl: DConstructor(r.decl, l, c), errs: r.errs }
+    }
+    _ -> VLDecl { decl: d, errs: errs }
+  }
+}

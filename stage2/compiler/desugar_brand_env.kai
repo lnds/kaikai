@@ -1,0 +1,316 @@
+#[doc("""
+Brands: the binders in scope with the nursery brand each carries, and
+the diagnostics of a brand used opaquely.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.brand_transp
+import compiler.core_effects
+import compiler.written
+import compiler.desugar_pat_names
+
+# A brand record carries everything `--dump-brands` and the brand-
+# mismatch diagnostic need to surface. `bid` is the unique brand id;
+# `cap_name` is the source-level name the user wrote (`n`, `outer`,
+# etc.); `file/line/col` point at the lambda's `{` token (where the
+# cap binder appears).
+#[doc("A minted nursery brand (brand id, cap name, file, line, col) produced by the cap-binding rewrite.")]
+pub type BrandRec = BR(Int, String, String, Int, Int)
+
+# Per-call attribution: every `n.<op>(args)` rewritten by this pass
+# records its (file, line, col, brand_id, op_name) so the post-rewrite
+# brand-mismatch check can tell which scope each call belongs to. The
+# same registry feeds `--dump-brands`.
+#[doc("A recorded nursery-cap consume site (file, line, col, brand id, op name) for brand-mismatch checking.")]
+pub type BrandCall = BC(String, Int, Int, Int, String)
+
+# Lookup: did this call get rewritten by the cap-binding pass?
+# Returns `Some((bid, op_name))` keyed on (file, line, col).
+fn brand_call_lookup(calls: [BrandCall], file: String,
+                       line: Int, col: Int) : Option[BrandCall] {
+  match calls {
+    [] -> None
+    [c, ...rest] -> match c {
+      BC(cf, cl, cc, _, _) ->
+        if cf == file and cl == line and cc == col { Some(c) }
+        else { brand_call_lookup(rest, file, line, col) }
+    }
+  }
+}
+
+#[doc("The record of the brand `bid`.")]
+pub fn brand_rec_lookup(brs: [BrandRec], bid: Int) : Option[BrandRec] {
+  match brs {
+    [] -> None
+    [b, ...rest] -> match b {
+      BR(b_id, _, _, _, _) ->
+        if b_id == bid { Some(b) } else { brand_rec_lookup(rest, bid) }
+    }
+  }
+}
+
+#[doc("""
+Brand environment: a list of (binding name, brand id) pairs.
+Innermost entries first so shadowing works naturally.
+""")]
+pub type BrandBinding = BB(String, Int)
+
+#[doc("""
+The bindings plus the program-wide brand-transparency table, which
+`expr_brand` consults to follow a brand through a pass-through
+helper call.
+""")]
+pub type BrandEnv = BEnv([BrandBinding], BrandTranspIndex)
+
+fn benv_empty() : BrandEnv = BEnv([], brand_transp_index([]))
+
+#[doc("An environment with no binding and the brand-transparency table `ts`.")]
+pub fn benv_with_transp(ts: BrandTranspIndex) : BrandEnv = BEnv([], ts)
+
+fn benv_transp(e: BrandEnv) : BrandTranspIndex {
+  match e { BEnv(_, ts) -> ts }
+}
+
+fn benv_push(e: BrandEnv, name: String, bid: Int) : BrandEnv {
+  match e { BEnv(xs, ts) -> BEnv([BB(name, bid), ...xs], ts) }
+}
+
+#[doc("`e` without the binding of `name`.")]
+pub fn benv_remove(e: BrandEnv, name: String) : BrandEnv {
+  match e { BEnv(xs, ts) -> BEnv(benv_remove_loop(xs, name, []), ts) }
+}
+
+fn benv_remove_loop(xs: [BrandBinding], name: String,
+                      acc: [BrandBinding]) : [BrandBinding] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      BB(n, _) ->
+        if n == name { benv_remove_loop(rest, name, acc) }
+        else        { benv_remove_loop(rest, name, [h, ...acc]) }
+    }
+  }
+}
+
+#[doc("`e` without the bindings of `names`.")]
+pub fn benv_remove_all(e: BrandEnv, names: [String]) : BrandEnv {
+  match names {
+    [] -> e
+    [h, ...rest] -> benv_remove_all(benv_remove(e, h), rest)
+  }
+}
+
+fn benv_lookup(e: BrandEnv, name: String) : Option[Int] {
+  match e { BEnv(xs, _) -> benv_lookup_loop(xs, name) }
+}
+
+fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...rest] -> match h {
+      BB(n, b) -> if n == name { Some(b) } else { benv_lookup_loop(rest, name) }
+    }
+  }
+}
+
+#[doc("""
+Look up the brand attribution of an expression. Recognises:
+  - A rewritten `Spawn.spawn(args)` call (looks the call up in
+    the registry by line:col).
+  - A bare `EName(name)` binding (looks `name` up in the env).
+  - Otherwise the expression has no brand attribution.
+
+Returns `Some(bid)` when the brand can be determined statically.
+The `None` case is intentionally permissive — a fiber that lost
+its brand through a non-let path (e.g., a list element retrieved
+by index, a record field) is treated as unbranded.
+""")]
+pub fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
+  match e.kind {
+    EName(name) -> benv_lookup(env, written_text(name))
+    ECall(callee, args_) -> match callee.kind {
+      EField(base, op_name) -> match base.kind {
+        ESym(eff_sym, _) ->
+          if effect_is(eff_sym, CeSpawn) and op_name == "spawn" {
+            match brand_call_lookup(calls, "", e.line, e.col) {
+              Some(BC(_, _, _, bid, _)) -> Some(bid)
+              # The registry stores file as recorded at rewrite. Try
+              # without filtering on file (the brand check runs per
+              # decl, all from the same source file).
+              None -> brand_call_first_at(calls, e.line, e.col)
+            }
+          } else { None }
+        _ -> None
+      }
+      # A call to a brand-transparent helper carries the brand of the
+      # argument it returns, so `let g = id(f)` keeps `f`'s brand.
+      EName(fname) -> transp_call_brand(written_text(fname), args_, env, calls)
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+fn transp_call_brand(fname: String, args_: [Expr], env: BrandEnv,
+                       calls: [BrandCall]) : Option[Int] {
+  match brand_transp_lookup(benv_transp(env), fname) {
+    None -> None
+    Some(t) -> match transp_passthrough_arg(t, args_) {
+      None -> None
+      Some(arg) -> expr_brand(arg, env, calls)
+    }
+  }
+}
+
+#[doc("""
+Match a call by (line, col) regardless of file — every call in
+the registry comes from the file currently being checked.
+""")]
+pub fn brand_call_first_at(calls: [BrandCall], line: Int, col: Int) : Option[Int] {
+  match calls {
+    [] -> None
+    [c, ...rest] -> match c {
+      BC(_, cl, cc, bid, _) ->
+        if cl == line and cc == col { Some(bid) }
+        else { brand_call_first_at(rest, line, col) }
+    }
+  }
+}
+
+# `--dump-brands`: print the brand registry plus per-call
+# attributions in a deterministic, grep-friendly form. Mirrors
+# `--dump-intervals`'s shape (one record per line, fixed column
+# order) so fixtures can pin the output as a golden file.
+#[doc("Debug dump of the nursery brand registry and call sites (driven by a dump flag in the driver).")]
+pub fn dump_brands(brs: [BrandRec], calls: [BrandCall]) : Unit / Console {
+  print("# kaic2 --dump-brands")
+  print("# brand allocations (one per `nursery { n -> ... }` site):")
+  dump_brand_recs(brs)
+  print("# call attributions (one per rewritten `n.<op>` site):")
+  dump_brand_calls(calls)
+}
+
+fn dump_brand_recs(brs: [BrandRec]) : Unit / Console {
+  match brs {
+    [] -> ()
+    [b, ...rest] -> match b {
+      BR(bid, name, file, line, col) -> {
+        print(concat_all(["brand ", int_to_string(bid),
+                            " cap=", name,
+                            " at=", file, ":",
+                            int_to_string(line), ":",
+                            int_to_string(col)]))
+        dump_brand_recs(rest)
+      }
+    }
+  }
+}
+
+fn dump_brand_calls(calls: [BrandCall]) : Unit / Console {
+  match calls {
+    [] -> ()
+    [c, ...rest] -> match c {
+      BC(file, line, col, bid, op_name) -> {
+        print(concat_all(["call op=", op_name,
+                            " brand=", int_to_string(bid),
+                            " at=", file, ":",
+                            int_to_string(line), ":",
+                            int_to_string(col)]))
+        dump_brand_calls(rest)
+      }
+    }
+  }
+}
+
+#[doc("""
+A branded fiber flowing into a call the checker cannot follow is
+where brand tracking ends. Saying so turns a silent false negative
+into an announced one: sibling-nursery misuse past this point is
+not detected. Brand-transparent helpers are followed, so they do
+not warn.
+""")]
+pub fn warn_brand_opaque_call(callee: Expr, args_: [Expr], env: BrandEnv,
+                            file: String, calls: [BrandCall],
+                            brs: [BrandRec]) : Unit / Console + File {
+
+  match callee.kind {
+    EName(fname) -> match brand_transp_lookup(benv_transp(env), written_text(fname)) {
+      Some(BTParam(_)) -> ()
+      _ -> warn_branded_args(written_text(fname), args_, env, file, calls, brs)
+    }
+    _ -> ()
+  }
+}
+
+fn warn_branded_args(fname: String, args_: [Expr], env: BrandEnv,
+                       file: String, calls: [BrandCall],
+                       brs: [BrandRec]) : Unit / Console + File {
+
+  match args_ {
+    [] -> ()
+    [a, ...rest] -> {
+      match expr_brand(a, env, calls) {
+        Some(bid) -> emit_brand_opaque_warning(file, a.line, a.col, bid, fname, brs)
+        None -> ()
+      }
+      warn_branded_args(fname, rest, env, file, calls, brs)
+    }
+  }
+}
+
+fn emit_brand_opaque_warning(file: String, line: Int, col: Int, bid: Int,
+                               fname: String, brs: [BrandRec]) : Unit / Console + File {
+
+  diag_warning(file, line, col,
+    concat_all(["branded fiber escapes brand tracking through `", fname, "`"]))
+  match brand_rec_lookup(brs, bid) {
+    Some(b) -> match b {
+      BR(_, name, bf, bl, bc) ->
+        diag_note(concat_all(["fiber carries brand from nursery `", name,
+                                "` at ", bf, ":", int_to_string(bl), ":",
+                                int_to_string(bc)]))
+    }
+    None -> ()
+  }
+  diag_help(concat_all(["`", fname,
+    "` does not return one of its parameters unchanged, so sibling-nursery misuse of the result is not detected"]))
+}
+
+#[doc("The operation of the call recorded at `line:col`, empty when none is.")]
+pub fn call_op_name(calls: [BrandCall], line: Int, col: Int) : String {
+  match calls {
+    [] -> ""
+    [c, ...rest] -> match c {
+      BC(_, cl, cc, _, op) ->
+        if cl == line and cc == col { op } else { call_op_name(rest, line, col) }
+    }
+  }
+}
+
+#[doc("""
+Statement walk. SLet propagates brand attribution from RHS to
+the bound name when the RHS expression has a brand. Other
+binders (SVar, lambda params, match patterns) do not carry
+brands today.
+""")]
+pub type BrandStmtsRes = { env: BrandEnv, errs: Int }
+
+#[doc("""
+Bind a pattern's name(s) with brand attribution lifted from the
+RHS. Today only PBind directly carries the brand; other patterns
+strip the brand (matches consumer behaviour).
+""")]
+pub fn bind_brand_pat(pat: Pattern, rhs: Expr, env: BrandEnv,
+                    calls: [BrandCall]) : BrandEnv {
+  let names = dsg_pat_bindings(pat, [])
+  let env1 = benv_remove_all(env, names)
+  match pat.pkind {
+    PBind(n) -> match expr_brand(rhs, env, calls) {
+      Some(bid) -> benv_push(env1, written_text(n.name), bid)
+      None -> env1
+    }
+    _ -> env1
+  }
+}

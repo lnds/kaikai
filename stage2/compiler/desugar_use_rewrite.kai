@@ -1,0 +1,430 @@
+#[doc("""
+The `use` rewrite over an expression: a bare call of an operation of an
+opened effect becomes a perform on that effect.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_text
+import compiler.desugar_map
+import compiler.desugar_pat_names
+import compiler.desugar_use_scope
+import compiler.desugar_use_types
+
+#[doc("`e` with each bare call of an operation of an opened effect written as a perform on that effect.")]
+pub fn use_rewrite_expr(e: Expr, ux: UseScope, opens: [SymId],
+                      bound: [String], file: String, errs: Int) : UseRw / Console + File {
+
+
+  let r = use_rewrite_kind(e.kind, ux, opens, bound, file, errs,
+                            e.line, e.col)
+  UseRw { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col,
+                       ty: e.ty, mode: e.mode,  site: e.site },
+          errs: r.errs }
+}
+
+fn use_rewrite_kind(k: ExprKind, ux: UseScope, opens: [SymId],
+                      bound: [String], file: String, errs: Int,
+                      line: Int, col: Int) : UseRw / Console + File {
+
+
+  match k {
+    EName(w) -> {
+      let name = written_text(w)
+      if list_has(bound, name) {
+        UseRw { expr: mk_name(name, line, col), errs: errs }
+      } else {
+        let owners = use_owners_of(ux.ops, opens, name)
+        match owners {
+          []        -> UseRw { expr: mk_name(name, line, col), errs: errs }
+          [eff]     -> {
+            # The op of the one effect that owns it: `Eff.name`, on
+            # that effect's declaration.
+            let base = mk_sym(eff, line, col)
+            UseRw { expr: mk_expr(EField(base, name), line, col), errs: errs }
+          }
+          [e1, e2, ...___] -> {
+            let eff1 = decl_name(ux.sc.tab, e1)
+            let eff2 = decl_name(ux.sc.tab, e2)
+            diag_error(file, line, col,
+              "ambiguous bare name `#{name}`: opened by both `#{eff1}` and `#{eff2}`")
+            diag_help("qualify explicitly (e.g. `#{eff1}.#{name}` or `#{eff2}.#{name}`) or remove one of the `use` declarations")
+            UseRw { expr: mk_name(name, line, col), errs: errs + 1 }
+          }
+        }
+      }
+    }
+    ELambda(ps, body) -> {
+      let pn = use_param_names(ps, [])
+      let body_bound = list_append(bound, pn)
+      let rb = use_rewrite_expr(body, ux, opens, body_bound, file, errs)
+      UseRw { expr: mk_expr(ELambda(ps, rb.expr), line, col), errs: rb.errs }
+    }
+    EBlock(stmts, tail) -> {
+      let r = use_rewrite_block(stmts, tail, ux, opens, bound, file, errs,
+                                  [], opens)
+      UseRw { expr: mk_expr(EBlock(r.stmts, r.tail), line, col), errs: r.errs }
+    }
+    EMatch(scr, arms) -> {
+      let rs = use_rewrite_expr(scr, ux, opens, bound, file, errs)
+      let ra = use_rewrite_arms(arms, ux, opens, bound, file, rs.errs)
+      UseRw { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
+    }
+    EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
+      let rb = use_rewrite_expr(body, ux, opens,
+                                 use_alias_bound(alias, bound), file, errs)
+      let ri = match init_opt {
+        None    -> UseRw { expr: mk_expr(EUnit, line, col), errs: rb.errs }
+        Some(e) -> use_rewrite_expr(e, ux, opens, bound, file, rb.errs)
+      }
+      let init_out = match init_opt { None -> None Some(_) -> Some(ri.expr) }
+      let rc = use_rewrite_clauses(clauses, ux, opens, bound, file, ri.errs)
+      let rr = use_rewrite_opt_return(ret_opt, ux, opens, bound, file, rc.errs)
+      UseRw {
+        expr: mk_expr(EHandle(rb.expr, eff, eff_tas, init_out, alias,
+                                rc.clauses, rr.ret),
+                       line, col),
+        errs: rr.errs
+      }
+    }
+    _ -> {
+      let _st = UseRw { expr: mk_expr(k, line, col), errs: errs }
+      let rk = dsg_map_expr_kind(k, (sub) => sub)   # placeholder to avoid recursion
+      let _ = rk
+      let mapped = use_rewrite_kind_default(k, ux, opens, bound, file,
+                                              errs, line, col)
+      mapped
+    }
+  }
+}
+
+fn use_rewrite_kind_default(k: ExprKind, ux: UseScope, opens: [SymId],
+                              bound: [String], file: String, errs: Int,
+                              line: Int, col: Int) : UseRw / Console + File {
+
+
+  # Build a closure-with-mutable-counter via record-based helper
+  # functions. `acc_ref` is updated in-place by hooking through the
+  # recursion.
+  let acc0 = UseRwAcc { errs: errs }
+  let pair = use_rewrite_recurse(k, ux, opens, bound, file, acc0)
+  UseRw { expr: mk_expr(pair.kind, line, col), errs: pair.acc.errs }
+}
+
+fn use_rewrite_recurse(k: ExprKind, ux: UseScope, opens: [SymId],
+                         bound: [String], file: String,
+                         acc: UseRwAcc) : UseKindAcc / Console + File {
+
+
+  match k {
+    EInt(_, _)        -> UseKindAcc { kind: k, acc: acc }
+    EReal(_, _)       -> UseKindAcc { kind: k, acc: acc }
+    EIntLit(_)        -> UseKindAcc { kind: k, acc: acc }
+    EDecimalLit(_)    -> UseKindAcc { kind: k, acc: acc }
+    EFixed(_, _)      -> UseKindAcc { kind: k, acc: acc }
+    EBool(_)       -> UseKindAcc { kind: k, acc: acc }
+    EChar(_)       -> UseKindAcc { kind: k, acc: acc }
+    EStr(_, _)     -> UseKindAcc { kind: k, acc: acc }
+    EUnit          -> UseKindAcc { kind: k, acc: acc }
+    EName(_)        -> UseKindAcc { kind: k, acc: acc }
+    EMark(_)        -> UseKindAcc { kind: k, acc: acc }
+    ESym(_, _)        -> UseKindAcc { kind: k, acc: acc }
+    ELocal(_)       -> UseKindAcc { kind: k, acc: acc }
+    EOp(_)          -> UseKindAcc { kind: k, acc: acc }
+    EUnder         -> UseKindAcc { kind: k, acc: acc }
+    EPlaceholder   -> UseKindAcc { kind: k, acc: acc }
+    EHole(_)       -> UseKindAcc { kind: k, acc: acc }
+    ETodo(_)       -> UseKindAcc { kind: k, acc: acc }
+    EExternBody(_, _) -> UseKindAcc { kind: k, acc: acc }
+    EVariantsOf(_, _) -> UseKindAcc { kind: k, acc: acc }
+    # Qualified module call has no sub-Exprs to recurse into and binds
+    # no names — pass through unchanged.
+    EModCall(_, _) -> UseKindAcc { kind: k, acc: acc }
+    EIntrinsic(name, args_) -> {
+      let ra = use_rewrite_exprs(args_, ux, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: EIntrinsic(name, ra.exprs), acc: UseRwAcc { errs: ra.errs } }
+    }
+    ESurface(sf) -> {
+      let ra = use_rewrite_exprs(surface_children(sf), ux, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: ESurface(surface_rebuild(sf, ra.exprs)), acc: UseRwAcc { errs: ra.errs } }
+    }
+    ECall(callee, args_) -> {
+      let rc = use_rewrite_expr(callee, ux, opens, bound, file, acc.errs)
+      let ra = use_rewrite_exprs(args_, ux, opens, bound, file, rc.errs, [])
+      UseKindAcc { kind: ECall(rc.expr, ra.exprs), acc: UseRwAcc { errs: ra.errs } }
+    }
+    EField(base, name) -> {
+      let rb = use_rewrite_expr(base, ux, opens, bound, file, acc.errs)
+      UseKindAcc { kind: EField(rb.expr, name), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EIndex(a, b) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EIndex(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EBinop(op, a, b) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EBinop(op, ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EUnop(op, x) -> {
+      let r = use_rewrite_expr(x, ux, opens, bound, file, acc.errs)
+      UseKindAcc { kind: EUnop(op, r.expr), acc: UseRwAcc { errs: r.errs } }
+    }
+    EIf(c, t_, eo) -> {
+      let rc = use_rewrite_expr(c, ux, opens, bound, file, acc.errs)
+      let rt = use_rewrite_expr(t_, ux, opens, bound, file, rc.errs)
+      let re = use_rewrite_opt(eo, ux, opens, bound, file, rt.errs)
+      UseKindAcc { kind: EIf(rc.expr, rt.expr, re.expr), acc: UseRwAcc { errs: re.errs } }
+    }
+    EList(els) -> {
+      let r = use_rewrite_elems(els, ux, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: EList(r.elems), acc: UseRwAcc { errs: r.errs } }
+    }
+    ERecordLit(rh, fis) -> {
+      let r = use_rewrite_fields(fis, ux, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: ERecordLit(rh, r.fields), acc: UseRwAcc { errs: r.errs } }
+    }
+    ERange(a, b, opt_step) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      let rs = use_rewrite_opt(opt_step, ux, opens, bound, file, rb.errs)
+      UseKindAcc { kind: ERange(ra.expr, rb.expr, rs.expr), acc: UseRwAcc { errs: rs.errs } }
+    }
+    EPipe(a, b) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EMapPipe(a, b) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EMapPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EFlatMapPipe(a, b) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EFlatMapPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    EFilterPipe(a, b) -> {
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      UseKindAcc { kind: EFilterPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
+    }
+    ELitUnit(inner, u) -> {
+      let r = use_rewrite_expr(inner, ux, opens, bound, file, acc.errs)
+      UseKindAcc { kind: ELitUnit(r.expr, u), acc: UseRwAcc { errs: r.errs } }
+    }
+    EBang(inner) -> {
+      let r = use_rewrite_expr(inner, ux, opens, bound, file, acc.errs)
+      UseKindAcc { kind: EBang(r.expr), acc: UseRwAcc { errs: r.errs } }
+    }
+    ELambda(_, _) -> UseKindAcc { kind: k, acc: acc }   # handled outer
+    EBlock(_, _)  -> UseKindAcc { kind: k, acc: acc }   # handled outer
+    EMatch(_, _)  -> UseKindAcc { kind: k, acc: acc }   # handled outer
+    EHandle(_, _, _, _, _, _, _) -> UseKindAcc { kind: k, acc: acc }   # handled outer
+  }
+}
+
+fn use_rewrite_opt(o: Option[Expr], ux: UseScope, opens: [SymId],
+                     bound: [String], file: String, errs: Int) : UseRwOpt / Console + File {
+
+
+  match o {
+    None -> UseRwOpt { expr: None, errs: errs }
+    Some(e) -> {
+      let r = use_rewrite_expr(e, ux, opens, bound, file, errs)
+      UseRwOpt { expr: Some(r.expr), errs: r.errs }
+    }
+  }
+}
+
+fn use_rewrite_exprs(es: [Expr], ux: UseScope, opens: [SymId],
+                       bound: [String], file: String, errs: Int,
+                       acc: [Expr]) : UseRwExprs / Console + File {
+
+
+  match es {
+    [] -> UseRwExprs { exprs: list_reverse(acc), errs: errs }
+    [h, ...rest] -> {
+      let r = use_rewrite_expr(h, ux, opens, bound, file, errs)
+      use_rewrite_exprs(rest, ux, opens, bound, file, r.errs, [r.expr, ...acc])
+    }
+  }
+}
+
+fn use_rewrite_elems(els: [ListElem], ux: UseScope, opens: [SymId],
+                       bound: [String], file: String, errs: Int,
+                       acc: [ListElem]) : UseRwElems / Console + File {
+
+
+  match els {
+    [] -> UseRwElems { elems: list_reverse(acc), errs: errs }
+    [el, ...rest] -> {
+      let r1 = match el {
+        ElPlain(x)  -> {
+          let r = use_rewrite_expr(x, ux, opens, bound, file, errs)
+          UseRwElems { elems: [ElPlain(r.expr)], errs: r.errs }
+        }
+        ElSpread(x) -> {
+          let r = use_rewrite_expr(x, ux, opens, bound, file, errs)
+          UseRwElems { elems: [ElSpread(r.expr)], errs: r.errs }
+        }
+      }
+      let head = match r1.elems { [h, ..._t] -> h _ -> ElPlain(mk_expr(EUnit, 0, 0)) }
+      use_rewrite_elems(rest, ux, opens, bound, file, r1.errs, [head, ...acc])
+    }
+  }
+}
+
+fn use_rewrite_fields(fs: [FieldInit], ux: UseScope, opens: [SymId],
+                        bound: [String], file: String, errs: Int,
+                        acc: [FieldInit]) : UseRwFields / Console + File {
+
+
+  match fs {
+    [] -> UseRwFields { fields: list_reverse(acc), errs: errs }
+    [fi, ...rest] -> match fi {
+      FI(n, v) -> {
+        let r = use_rewrite_expr(v, ux, opens, bound, file, errs)
+        use_rewrite_fields(rest, ux, opens, bound, file, r.errs, [FI(n, r.expr), ...acc])
+      }
+    }
+  }
+}
+
+fn use_rewrite_arms(arms: [Arm], ux: UseScope, opens: [SymId],
+                      bound: [String], file: String, errs: Int) : UseRwArms / Console + File {
+
+
+  use_rewrite_arms_loop(arms, ux, opens, bound, file, errs, [])
+}
+
+fn use_rewrite_arms_loop(arms: [Arm], ux: UseScope, opens: [SymId],
+                           bound: [String], file: String, errs: Int,
+                           acc: [Arm]) : UseRwArms / Console + File {
+
+
+  match arms {
+    [] -> UseRwArms { arms: list_reverse(acc), errs: errs }
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> {
+        let arm_bound = list_append(bound, dsg_pat_bindings(p, []))
+        let rg = use_rewrite_opt(g, ux, opens, arm_bound, file, errs)
+        let rb = use_rewrite_expr(b, ux, opens, arm_bound, file, rg.errs)
+        use_rewrite_arms_loop(rest, ux, opens, bound, file, rb.errs,
+                                [Arm(p, rg.expr, rb.expr), ...acc])
+      }
+    }
+  }
+}
+
+fn use_rewrite_clauses(cs: [HClause], ux: UseScope, opens: [SymId],
+                         bound: [String], file: String, errs: Int) : UseRwClauses / Console + File {
+
+
+  use_rewrite_clauses_loop(cs, ux, opens, bound, file, errs, [])
+}
+
+fn use_rewrite_clauses_loop(cs: [HClause], ux: UseScope, opens: [SymId],
+                              bound: [String], file: String, errs: Int,
+                              acc: [HClause]) : UseRwClauses / Console + File {
+
+
+  match cs {
+    [] -> UseRwClauses { clauses: list_reverse(acc), errs: errs }
+    [c, ...rest] -> match c {
+      HC(n, ps, b, l, co) -> {
+        let body_bound = list_append(bound, use_param_names(ps, []))
+        let r = use_rewrite_expr(b, ux, opens, body_bound, file, errs)
+        use_rewrite_clauses_loop(rest, ux, opens, bound, file, r.errs,
+                                   [HC(n, ps, r.expr, l, co), ...acc])
+      }
+    }
+  }
+}
+
+fn use_rewrite_opt_return(ret_opt: Option[HReturn], ux: UseScope,
+                            opens: [SymId], bound: [String],
+                            file: String, errs: Int) : UseRwRet / Console + File {
+
+
+  match ret_opt {
+    None -> UseRwRet { ret: None, errs: errs }
+    Some(r) -> match r {
+      HR(p, b, l, c) -> {
+        let body_bound = [written_text(p.name), ...bound]
+        let rb = use_rewrite_expr(b, ux, opens, body_bound, file, errs)
+        UseRwRet { ret: Some(HR(p, rb.expr, l, c)), errs: rb.errs }
+      }
+    }
+  }
+}
+
+fn use_rewrite_block(stmts: [Stmt], tail: Option[Expr], ux: UseScope,
+                       outer_opens: [SymId], bound: [String],
+                       file: String, errs: Int,
+                       acc: [Stmt], opens: [SymId]) : UseRwBlock / Console + File {
+
+
+  match stmts {
+    [] -> {
+      let rt = use_rewrite_opt(tail, ux, opens, bound, file, errs)
+      UseRwBlock { stmts: list_reverse(acc), tail: rt.expr, errs: rt.errs }
+    }
+    [s, ...rest] -> match s {
+      SUse(name, _, _) -> {
+        # Extend opens for the rest of the block. The SUse itself
+        # is stripped from the output.
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
+                            file, errs, acc, use_open(ux, name, opens))
+      }
+      SLet(p, ann, rhs) -> {
+        let rr = use_rewrite_expr(rhs, ux, opens, bound, file, errs)
+        let bound1 = list_append(bound, dsg_pat_bindings(p, []))
+        use_rewrite_block(rest, tail, ux, outer_opens, bound1,
+                            file, rr.errs,
+                            [SLet(p, ann, rr.expr), ...acc], opens)
+      }
+      SVar(n, ty, rhs, l, c) -> {
+        let rr = use_rewrite_expr(rhs, ux, opens, bound, file, errs)
+        let bound1 = [written_text(n.name), ...bound]
+        use_rewrite_block(rest, tail, ux, outer_opens, bound1,
+                            file, rr.errs,
+                            [SVar(n, ty, rr.expr, l, c), ...acc], opens)
+      }
+      SAssert(c, m) -> {
+        let rc = use_rewrite_expr(c, ux, opens, bound, file, errs)
+        let rm = use_rewrite_opt(m, ux, opens, bound, file, rc.errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
+                            file, rm.errs,
+                            [SAssert(rc.expr, rm.expr), ...acc], opens)
+      }
+      SExprStmt(x) -> {
+        let r = use_rewrite_expr(x, ux, opens, bound, file, errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
+                            file, r.errs,
+                            [SExprStmt(r.expr), ...acc], opens)
+      }
+      SIndexAssign(b, i, v, l, c) -> {
+        let rb = use_rewrite_expr(b, ux, opens, bound, file, errs)
+        let ri = use_rewrite_expr(i, ux, opens, bound, file, rb.errs)
+        let rv = use_rewrite_expr(v, ux, opens, bound, file, ri.errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
+                            file, rv.errs,
+                            [SIndexAssign(rb.expr, ri.expr, rv.expr, l, c),
+                             ...acc], opens)
+      }
+      SAssign(b, v, l, c) -> {
+        let rb = use_rewrite_expr(b, ux, opens, bound, file, errs)
+        let rv = use_rewrite_expr(v, ux, opens, bound, file, rb.errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
+                            file, rv.errs,
+                            [SAssign(rb.expr, rv.expr, l, c),
+                             ...acc], opens)
+      }
+    }
+  }
+}

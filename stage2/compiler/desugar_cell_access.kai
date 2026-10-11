@@ -1,0 +1,172 @@
+#[doc("""
+Cell access: the slot a `var` lowers to, the get that reads it, whether
+an expression reads a cell, and the result shapes of the lowering.
+""")]
+
+import compiler.ast
+import compiler.core_effects
+import compiler.written
+
+#[doc("A lowered expression and the error count so far.")]
+pub type VLExpr = { expr: Expr, errs: Int }
+#[doc("A lowered optional expression and the error count so far.")]
+pub type VLOpt  = { opt: Option[Expr], errs: Int }
+#[doc("Lowered expressions and the error count so far.")]
+pub type VLExprs = { exprs: [Expr], errs: Int }
+#[doc("Lowered list elements and the error count so far.")]
+pub type VLElems = { elems: [ListElem], errs: Int }
+#[doc("Lowered field initialisers and the error count so far.")]
+pub type VLFields = { fields: [FieldInit], errs: Int }
+#[doc("Lowered arms and the error count so far.")]
+pub type VLArms = { arms: [Arm], errs: Int }
+#[doc("Lowered handler clauses and the error count so far.")]
+pub type VLClauses = { clauses: [HClause], errs: Int }
+#[doc("Lowered statements with their tail, and the error count so far.")]
+pub type VLStmts = { stmts: [Stmt], opt: Option[Expr], errs: Int }
+
+#[doc("""
+A user-written `with State[T] as name` / `with Reader[T] as name`
+binds `name` as a readable cell, the same as a desugared `var`. Other
+effects' aliases (`with Console as c`) are ordinary capability values,
+not cells, so their alias shadows rather than seeds the cell set.
+""")]
+pub fn eff_is_cell(s: SymId) : Bool = effect_is(s, CeState) or effect_is(s, CeReader)
+
+#[doc("""
+Lower the naked cell read `EName(name)` to `name.get()` (a `State.get`
+call the alias rewrite later maps to `Reader.ask` for Reader cells).
+""")]
+pub fn mk_cell_get(n: String, line: Int, col: Int) : ExprKind {
+  let cap = mk_name(n, line, col)
+  let getter = mk_expr(EField(cap, "get"), line, col)
+  ECall(getter, [])
+}
+
+#[doc("""
+`n.get()` or `n.set(...)` appears anywhere in `e` — the lowered shape
+of a naked read or a `n := v` write of the cell.
+""")]
+pub fn contains_cell_access(e: Expr, n: String) : Bool {
+  match e.kind {
+    ECall(callee, args_) -> {
+      let here = match callee.kind {
+        EField(base, fname) -> match base.kind {
+          EName(m) -> written_text(m) == n and (fname == "get" or fname == "set")
+          _ -> false
+        }
+        _ -> false
+      }
+      here or contains_cell_access(callee, n) or any_contains_cell_access(args_, n)
+    }
+    ELambda(_, body) -> contains_cell_access(body, n)
+    EField(base, _) -> contains_cell_access(base, n)
+    EIndex(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EBinop(_, a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EUnop(_, x) -> contains_cell_access(x, n)
+    EIf(c, t_, eo) -> contains_cell_access(c, n) or contains_cell_access(t_, n) or
+      (match eo { Some(x) -> contains_cell_access(x, n)  None -> false })
+    EBlock(ss, t) -> stmts_contain_cell_access(ss, n) or
+      (match t { Some(x) -> contains_cell_access(x, n)  None -> false })
+    EMatch(scr, arms) -> contains_cell_access(scr, n) or arms_contain_cell_access(arms, n)
+    EList(elems) -> elems_contain_cell_access(elems, n)
+    ERecordLit(_, fields) -> fields_contain_cell_access(fields, n)
+    ERange(a, b, os) -> contains_cell_access(a, n) or contains_cell_access(b, n) or
+      (match os { Some(x) -> contains_cell_access(x, n)  None -> false })
+    EPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EMapPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EFlatMapPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EFilterPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
+    EBang(inner) -> contains_cell_access(inner, n)
+    ELitUnit(inner, _) -> contains_cell_access(inner, n)
+    _ -> false
+  }
+}
+
+fn any_contains_cell_access(es: [Expr], n: String) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if contains_cell_access(h, n) { true } else { any_contains_cell_access(rest, n) }
+  }
+}
+
+fn stmts_contain_cell_access(ss: [Stmt], n: String) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> contains_cell_access(rhs, n)
+        SExprStmt(x) -> contains_cell_access(x, n)
+        SAssert(c, m) -> contains_cell_access(c, n) or (match m { Some(x) -> contains_cell_access(x, n)  None -> false })
+        SIndexAssign(b, i, v, _, _) -> contains_cell_access(b, n) or contains_cell_access(i, n) or contains_cell_access(v, n)
+        SAssign(b, v, _, _) -> contains_cell_access(b, n) or contains_cell_access(v, n)
+        SVar(_, _, rhs, _, _) -> contains_cell_access(rhs, n)
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { stmts_contain_cell_access(rest, n) }
+    }
+  }
+}
+
+fn arms_contain_cell_access(arms: [Arm], n: String) : Bool {
+  match arms {
+    [] -> false
+    [Arm(_, g, b), ...rest] -> {
+      let here = (match g { Some(x) -> contains_cell_access(x, n)  None -> false }) or contains_cell_access(b, n)
+      if here { true } else { arms_contain_cell_access(rest, n) }
+    }
+  }
+}
+
+fn elems_contain_cell_access(es: [ListElem], n: String) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> {
+      let here = match el { ElPlain(x) -> contains_cell_access(x, n)  ElSpread(x) -> contains_cell_access(x, n) }
+      if here { true } else { elems_contain_cell_access(rest, n) }
+    }
+  }
+}
+
+fn fields_contain_cell_access(fs: [FieldInit], n: String) : Bool {
+  match fs {
+    [] -> false
+    [FI(_, v), ...rest] -> if contains_cell_access(v, n) { true } else { fields_contain_cell_access(rest, n) }
+  }
+}
+
+#[doc("""
+Specialise a body: rewrite every `name.get()` to
+`array_get(slot_var, 0)` and every `name.set(v)` to a unit-typed
+block `{ let _ = array_set(slot_var, 0, v); () }`. The slot_var
+name is `<name>__slot`. Other expressions pass through.
+""")]
+pub type VarSlot = VarSlot(String, String)
+
+#[doc("""
+The `let` a var's slot lowering mints: its var's name and the slot's.
+Its value is a `MkVarSlot` call on the allocation's callee and
+arguments until the cell-read relowering turns it into that call.
+""")]
+pub fn var_slot_of(p: Pattern, rhs: Expr) : Option[VarSlot] = match p.pkind {
+  PBind(s) -> match rhs.kind {
+    ECall(f, _) -> match f.kind {
+      EMark(MkVarSlot(n)) -> Some(VarSlot(n, written_text(s.name)))
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+#[doc("""
+The call a var's slot stands for, from the operands of its mark: the
+callee, then the arguments. `k` is the marked node itself.
+""")]
+pub fn var_slot_call(k: ExprKind, operands: [Expr]) : ExprKind = match operands {
+  [f, ...xs] -> ECall(f, xs)
+  []         -> k
+}
+
+#[doc("The effect a rewritten cap call performs on: the core `Spawn`, already settled.")]
+pub fn spawn_ref(line: Int, col: Int) : Expr =
+  mk_sym(core_effect_id(CeSpawn), line, col)

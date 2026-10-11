@@ -1,0 +1,167 @@
+#[doc("""
+The state the nursery-capability rewrite threads: the stack of
+capability binders, the brand walk, and its result shapes.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.desugar_brand_env
+
+#[doc("`caps` without `n`.")]
+pub fn caps_remove_name(caps: [String], n: String) : [String] {
+  match caps {
+    [] -> []
+    [h, ...rest] ->
+      if h == n { caps_remove_name(rest, n) }
+      else      { [h, ...caps_remove_name(rest, n)] }
+  }
+}
+
+#[doc("`caps` without `names`.")]
+pub fn caps_minus_names(caps: [String], names: [String]) : [String] {
+  match names {
+    [] -> caps
+    [n, ...rest] -> caps_minus_names(caps_remove_name(caps, n), rest)
+  }
+}
+
+# Set of Spawn ops legal on a NurseryCap. Mirrors the `Spawn` effect
+# in stdlib/effects/concurrent.kai. Update both lists in lockstep when
+# a new Spawn op lands.
+fn nursery_cap_op_names() : [String] =
+  ["spawn", "await", "select", "cancel", "yield", "set_trap_exit", "cancel_all"]
+
+#[doc("True when `name` is an operation a nursery capability offers.")]
+pub fn is_nursery_cap_op(name: String) : Bool =
+  list_has(nursery_cap_op_names(), name)
+
+#[doc("Stack of active cap binders. Innermost first.")]
+pub type NCapStack = NCS([NCapBinding])
+#[doc("A capability binder and the brand of its nursery.")]
+pub type NCapBinding = NCB(String, Int)   # (cap_name, brand_id)
+
+#[doc("A stack with no capability binder.")]
+pub fn ncs_empty() : NCapStack = NCS([])
+
+#[doc("`s` with the binder `name` of brand `bid` innermost.")]
+pub fn ncs_push(s: NCapStack, name: String, bid: Int) : NCapStack {
+  match s { NCS(xs) -> NCS([NCB(name, bid), ...xs]) }
+}
+
+#[doc("""
+A `let name = ...` (or other binder) that re-binds the cap name
+shadows the outer entry. Drop the head occurrence of `name`.
+""")]
+pub fn ncs_remove(s: NCapStack, name: String) : NCapStack {
+  match s { NCS(xs) -> NCS(ncs_remove_loop(xs, name, [])) }
+}
+
+fn ncs_remove_loop(xs: [NCapBinding], name: String,
+                     acc: [NCapBinding]) : [NCapBinding] {
+  match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      NCB(n, _) ->
+        if n == name { ncs_remove_loop(rest, name, acc) }
+        else        { ncs_remove_loop(rest, name, [h, ...acc]) }
+    }
+  }
+}
+
+#[doc("`s` without the binders `names`.")]
+pub fn ncs_remove_all(s: NCapStack, names: [String]) : NCapStack {
+  match names {
+    [] -> s
+    [h, ...rest] -> ncs_remove_all(ncs_remove(s, h), rest)
+  }
+}
+
+#[doc("""
+Look up the innermost active brand id for `name`. None when no
+binding matches.
+""")]
+pub fn ncs_lookup(s: NCapStack, name: String) : Option[Int] {
+  match s { NCS(xs) -> ncs_lookup_loop(xs, name) }
+}
+
+fn ncs_lookup_loop(xs: [NCapBinding], name: String) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...rest] -> match h {
+      NCB(n, b) -> if n == name { Some(b) } else { ncs_lookup_loop(rest, name) }
+    }
+  }
+}
+
+#[doc("""
+The walker threads a brand counter so each visit produces a fresh
+id. Side-effecting registry accumulation happens by returning the
+growing list alongside the rewritten expression. `calls` records
+per-call attributions so the post-rewrite brand-mismatch check can
+tell which scope each `Spawn.<op>` call originated in.
+""")]
+pub type BrandWalk = { bnext: Int, registry: [BrandRec], calls: [BrandCall] }
+
+#[doc("The walk after a brand was allocated, and that brand.")]
+pub type BrandAlloc = { bw: BrandWalk, bid: Int }
+
+#[doc("A fresh brand for the binder `name`, recorded in the walk.")]
+pub fn bw_alloc(bw: BrandWalk, name: String, file: String,
+             line: Int, col: Int) : BrandAlloc {
+  let bid = bw.bnext
+  BrandAlloc { bw: BrandWalk { bnext: bid + 1,
+                    registry: [BR(bid, name, file, line, col),
+                                ...bw.registry],
+                    calls: bw.calls },
+                bid: bid }
+}
+
+#[doc("The walk with the call at `line:col` attributed to the brand `bid`.")]
+pub fn bw_record_call(bw: BrandWalk, file: String, line: Int, col: Int,
+                   bid: Int, op_name: String) : BrandWalk {
+  BrandWalk { bnext: bw.bnext,
+              registry: bw.registry,
+              calls: [BC(file, line, col, bid, op_name), ...bw.calls] }
+}
+
+#[doc("A rewritten expression and the walk after it.")]
+pub type NurseryRwExpr = { expr: Expr, bw: BrandWalk }
+
+#[doc("A rewritten expression kind and the walk after it.")]
+pub type NurseryRwKind = { kind: ExprKind, bw: BrandWalk }
+
+#[doc("Rewritten expressions and the walk after them.")]
+pub type NurseryRwExprs   = { exprs: [Expr], bw: BrandWalk }
+#[doc("A rewritten optional expression and the walk after it.")]
+pub type NurseryRwOpt     = { expr: Option[Expr], bw: BrandWalk }
+#[doc("Rewritten statements, the capability stack they leave, and the walk after them.")]
+pub type NurseryRwStmts   = { stmts: [Stmt], s: NCapStack, bw: BrandWalk }
+#[doc("Rewritten arms and the walk after them.")]
+pub type NurseryRwArms    = { arms: [Arm], bw: BrandWalk }
+#[doc("Rewritten handler clauses and the walk after them.")]
+pub type NurseryRwClauses = { clauses: [HClause], bw: BrandWalk }
+#[doc("A rewritten handler return and the walk after it.")]
+pub type NurseryRwRet     = { ret: Option[HReturn], bw: BrandWalk }
+#[doc("Rewritten field initialisers and the walk after them.")]
+pub type NurseryRwFields  = { fields: [FieldInit], bw: BrandWalk }
+#[doc("Rewritten list elements and the walk after them.")]
+pub type NurseryRwElems   = { elems: [ListElem], bw: BrandWalk }
+
+#[doc("An argument list split at its last argument.")]
+pub type SplitLast = NoLast | HasLast([Expr], Expr)
+
+#[doc("`args_` as all but the last argument, and the last.")]
+pub fn split_last_arg(args_: [Expr]) : SplitLast {
+  match args_ {
+    [] -> NoLast
+    _  -> split_last_loop(args_, [])
+  }
+}
+
+fn split_last_loop(args_: [Expr], acc: [Expr]) : SplitLast {
+  match args_ {
+    [] -> NoLast
+    [h] -> HasLast(list_reverse(acc), h)
+    [h, ...rest] -> split_last_loop(rest, [h, ...acc])
+  }
+}
