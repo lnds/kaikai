@@ -348,6 +348,9 @@ land in each module's own spec when implemented.
   modes (top-level module: `decimal.add`, `decimal.from_string`, …).
   `dec_div(a, b, target_scale)` returns `Option[Decimal]`: `None` on
   division by zero, `Some(q)` otherwise *(closes #363)*.
+  The type `Decimal` carries decimal literals, so the compiler loads the
+  module with the core set and every file reads the type without an
+  import; the functions still need `import decimal`.
 
 ### array (pure, stage 2 — shipped via #366)
 

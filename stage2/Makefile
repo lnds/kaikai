@@ -5251,7 +5251,6 @@ test-sugars-fixture-%: $(TARGET) build core-cache-warm
 	  shape_kind_*) extra_flags="--path ../stdlib" ;; \
 	  kinds_dim_*) extra_flags="--path ../stdlib" ;; \
 	  kinds_module_lit_carrier) extra_flags="--path ../stdlib" ;; \
-	  kinds_over_domain|m12_5_uom_record_field) extra_flags="--path ../stdlib" ;; \
 	  *) extra_flags="" ;; \
 	esac; \
 	if [ -f $$exp_err ]; then \
@@ -14139,6 +14138,22 @@ test-kir: $(TARGET) build
 # user file. RED if any user file shifts (or breaks) core's typed AST —
 # the standing proof the root_fns + lower_protocols cuts hold. Drives
 # tools/independence-oracle.sh against the just-built $(TARGET).
+# A report mode accepts what the build accepts: a bare call an imported
+# module settles through its own imports, and a protocol operation two
+# imported modules declare.
+REPORT_MODES := --infer --dump-typed --dump-typed-core --dump-last-use --dump-intervals --dump-rawsafe --dump-borrowsafe --dump-mono --dump-call-elision
+test-report-modes-imports: $(TARGET) build
+	@set -e; \
+	for m in $(REPORT_MODES); do \
+	  $(KAIC2) --path ../stdlib --path ../examples/oracle/lane1/lib $$m ../examples/oracle/lane1/benign.kai \
+	      > build/s2-report-imports.out 2> build/s2-report-imports.err \
+	    || { echo "report-modes-imports FAIL $$m (imported bare call)"; head -5 build/s2-report-imports.err; exit 1; }; \
+	  $(KAIC2) --path ../stdlib $$m ../examples/modules-qualified/protocol_dispatch_home/main.kai \
+	      > build/s2-report-imports.out 2> build/s2-report-imports.err \
+	    || { echo "report-modes-imports FAIL $$m (homonymous protocol operation)"; head -5 build/s2-report-imports.err; exit 1; }; \
+	done; \
+	echo "report-modes-imports OK ($(words $(REPORT_MODES)) modes)"
+
 test-independence-oracle: $(TARGET)
 	@KAIC2="$$(pwd)/$(TARGET)" bash ../tools/independence-oracle.sh
 
