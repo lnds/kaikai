@@ -1,0 +1,366 @@
+#[doc("""
+The post-inference rewrite: every call of a dispatcher whose arguments
+have a concrete head becomes a direct call of the matching impl
+function. A call no impl matches keeps the dispatcher.
+""")]
+
+import compiler.ast
+import compiler.operators
+import compiler.core_refs
+import compiler.core_protos
+import compiler.impl_identity
+import compiler.proto_ids
+import compiler.infer
+import compiler.protos_find_impl
+import compiler.protos_call_rewrite
+
+# AST-functor family mirror (`proto_map_*`) — copied verbatim from the
+# `inf_map_*` family in compiler/infer.kai.
+fn proto_map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, proto_map_opt_expr(g, f), f(b))
+  }
+}
+
+fn proto_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
+  }
+}
+
+fn proto_map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(f(x))
+    ElSpread(x) -> ElSpread(f(x))
+  }
+}
+
+fn proto_map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, f(v))
+  }
+}
+
+fn proto_map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(f(e))
+    None    -> None
+  }
+}
+
+fn proto_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(proto_map_return_exprs(r, f))
+    None    -> None
+  }
+}
+
+fn proto_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, f(b), l, c)
+  }
+}
+
+fn proto_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
+  match s {
+    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
+    SAssert(c, m)               -> SAssert(f(c), proto_map_opt_expr(m, f))
+    SExprStmt(x)                -> SExprStmt(f(x))
+    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SAssign(b, v, l, c) -> SAssign(f(b), f(v), l, c)
+    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
+    SUse(n, l, c)               -> SUse(n, l, c)
+  }
+}
+
+fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
+  match k {
+    EInt(_, _)        -> k
+    EReal(_, _)       -> k
+    EIntLit(_)        -> k
+    EDecimalLit(_)    -> k
+    EFixed(_, _)      -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EName(_)        -> k
+    EMark(_)        -> k
+    ESym(_, _)      -> k
+    ELocal(_)       -> k
+    EOp(_)          -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    EExternBody(_, _) -> k
+    EVariantsOf(_, _) -> k
+    EModCall(_, _) -> k
+    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    ESurface(sf) -> ESurface(surface_map(sf, f))
+    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
+    EField(base, name)   -> EField(f(base), name)
+    EIndex(a, b)         -> EIndex(f(a), f(b))
+    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
+    EUnop(op, x)         -> EUnop(op, f(x))
+    EIf(c, t_, eo)       -> EIf(f(c), f(t_), proto_map_opt_expr(eo, f))
+    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => proto_map_arm_exprs(a, f)))
+    ELambda(ps, b)       -> ELambda(ps, f(b))
+    ERecordLit(rh, fs)   -> ERecordLit(rh, map(fs, (fi) => proto_map_field_exprs(fi, f)))
+    EList(els)           -> EList(map(els, (el) => proto_map_elem_exprs(el, f)))
+    ERange(a, b, opt_step) -> ERange(f(a), f(b), proto_map_opt_expr(opt_step, f))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => proto_map_stmt_exprs(s, f)),
+                                    proto_map_opt_expr(tail, f))
+    EPipe(a, b)          -> EPipe(f(a), f(b))
+    EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
+    EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
+    EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff, eff_tyargs,
+              proto_map_opt_expr(init_opt, f), alias_opt,
+              map(clauses, (c) => proto_map_clause_exprs(c, f)),
+              proto_map_opt_return_exprs(ret_opt, f))
+    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
+    EBang(inner)         -> EBang(f(inner))
+  }
+}
+
+#[doc("Pass B: rewrite every resolved `op(x, ...)` to its matching impl fn across the typed program.")]
+pub fn resolve_protocol_calls(typed: TypedProgram, reg: ProtocolReg) : TypedProgram {
+  TypedProgram {
+    decls: map(typed.decls, (d) => resolve_protocol_calls_decl(d, reg)),
+    errs: typed.errs,
+    insts: typed.insts,
+    holes: typed.holes,
+    row_holes: typed.row_holes,
+    core_len: typed.core_len,
+    toplevel_len: typed.toplevel_len,
+    module_doc: typed.module_doc,
+    diags: typed.diags,
+    op_res: typed.op_res
+  }
+}
+
+#[doc("Per-decl hook of pass B; the N2 monomorph lane imports this to rewrite during monomorphisation.")]
+pub fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
+  # The decl's own module scopes which protocols its calls may
+  # dispatch against (`proto_visible_from`); tests and benches are
+  # root-file constructs and see everything.
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row,
+          resolve_protocol_calls_expr(body, reg, mo), l, c, mo)
+    DTest(desc, body, l, c, mo) ->
+      DTest(desc, resolve_protocol_calls_expr(body, reg, None), l, c, mo)
+    DBench(desc, body, l, c, mo) ->
+      DBench(desc, resolve_protocol_calls_expr(body, reg, None), l, c, mo)
+    DCheck(desc, ps, body, l, c, mo) ->
+      DCheck(desc, ps, resolve_protocol_calls_expr(body, reg, None), l, c, mo)
+    DConst(pub_, s, ty, body, mo, l, c) ->
+      DConst(pub_, s, ty, resolve_protocol_calls_expr(body, reg, mo), mo, l, c)
+    _ -> d
+  }
+}
+
+fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg,
+                                 cm: Option[String]) : Expr {
+  let new_kind = resolve_protocol_calls_kind(e.kind, reg, cm,
+                                               e.ty, e.line, e.col)
+  # Issue #180: a `Real + Complex` binop was typed by the generic
+  # dispatcher as `Self` (the LHS head, Real) — wrong, the heterogeneous
+  # `impl Add[Complex] for Real` returns `Complex`. The rewrite above
+  # has now redirected the call to that impl's `__pimpl_*` symbol; read
+  # the impl's declared return head and, when it differs from the node's
+  # dispatcher-derived type, correct it. This runs before unboxing, so
+  # the unbox pass then sees `Complex` (boxed) instead of `Real`
+  # (unboxed) and emits a `KaiValue*` record load rather than reading
+  # the Complex record as a raw `double`. The impl's return IS the
+  # promotion target (Int -> Real -> Complex); no type hierarchy is
+  # needed beyond what the impl already declares.
+  let new_ty = proto_rewrite_corrected_ty(new_kind, e.ty, reg)
+  Expr { kind: new_kind, line: e.line, col: e.col, ty: new_ty, mode: e.mode,  site: e.site }
+}
+
+# When `kind` is a call of an impl that declares a return head differing
+# from `cur_ty`, return the impl's return type. Otherwise return `cur_ty`
+# unchanged.
+fn proto_rewrite_corrected_ty(kind: ExprKind, cur_ty: Option[Ty], reg: ProtocolReg) : Option[Ty] {
+  match kind {
+    ECall(callee, _) -> match prc_callee_impl(callee, reg) {
+      None -> cur_ty
+      Some(p) -> if prc_ret_is(p, cur_ty) { cur_ty } else { pir_ret_ty(p) }
+    }
+    _ -> cur_ty
+  }
+}
+
+# True when `cur` is headed by the impl method's declared return head.
+fn prc_ret_is(p: ProtoImplReg, cur: Option[Ty]) : Bool = match p {
+  PIR(_, _, _, _, _, rh, _) -> match cur {
+    Some(t) -> match ty_disp_head(t) {
+      Some(h) -> dh_ref_is(rh, h)
+      None    -> false
+    }
+    None -> false
+  }
+}
+
+# The impl a callee names: the entry its id was generated from.
+fn prc_callee_impl(callee: Expr, reg: ProtocolReg) : Option[ProtoImplReg] = match callee.kind {
+  ESym(s, _) -> pid_impl(reg.ids, s)
+  _          -> None
+}
+
+fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
+                                cm: Option[String],
+                                ret_ty: Option[Ty],
+                                line: Int, col: Int) : ExprKind {
+  match k {
+    # The only kind that needs special handling: a typed `ECall` whose
+    # callee resolves to a registered protocol op + args[0].ty matches
+    # a registered impl gets rewritten to `__pimpl_<P>_<T>_<op>`. All
+    # other kinds recurse purely structurally — there is no scope
+    # bookkeeping at this stage.
+    ECall(callee, args_) -> {
+      let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg, cm))
+      let new_callee = resolve_protocol_calls_expr(callee, reg, cm)
+      # Issue #180: pass the call's inferred return type so dispatchers
+      # whose only Self informant is the return position (e.g.
+      # `from(x) : Self` against a `let x : T = from(...)` annotation)
+      # can resolve `Self` from that pin.
+      let rewritten = try_rewrite_proto_call_with_ret(new_callee, new_args,
+                                                       reg, cm, ret_ty)
+      match rewritten {
+        Some(rk) -> rk
+        None     -> ECall(new_callee, new_args)
+      }
+    }
+    # Binops are sugar for Eq.eq / Ord.cmp / the operator protocols. In a
+    # generic body the typer leaves them as the builtin EBinop; here, with
+    # concrete operand types (post-monomorph per spec), rewrite to the
+    # custom impl when the left operand's type carries one. Fully
+    # structural types (no custom impl — the common case, e.g. the
+    # compiler's own Expr/Stmt) keep the builtin EBinop unchanged.
+    EBinop(op, l, r) -> {
+      let nl = resolve_protocol_calls_expr(l, reg, cm)
+      let nr = resolve_protocol_calls_expr(r, reg, cm)
+      prc_rewrite_cmp_binop(op, nl, nr, reg)
+    }
+    _ -> proto_map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, cm))
+  }
+}
+
+# Rewrite a binop to a custom-impl call when the left operand's type has
+# one. `==`/`!=` → Eq.eq (`!=` wraps in `not`); `<`/`>`/`<=`/`>=` →
+# Ord.cmp reduced to Bool against 0; `+ - * / %` → the operator
+# protocol's op. An operand type with no custom impl keeps the builtin
+# EBinop (which lowers to kai_op_eq_v / direct compare / arithmetic).
+fn prc_op_impl(reg: ProtocolReg, bp: BinopProto, t: Option[Ty]) : Option[ProtoImplReg] =
+  match op_proto_core(bp) {
+    Some(cp) -> prc_cmp_impl(reg, cp, op_proto_method(bp), t)
+    None     -> None
+  }
+
+fn prc_rewrite_cmp_binop(op: BinOp, l: Expr, r: Expr, reg: ProtocolReg) : ExprKind {
+  if binop_is_equality(op) {
+    match prc_op_impl(reg, BpEq, l.ty) {
+      None -> EBinop(op, l, r)
+      Some(p) -> {
+        let call = ECall(pimpl_ref(p, l), [l, r])
+        if binop_eq(op, BoEq) { call } else { EUnop(UoNot, prc_mk_ty(call, l.line, l.col, Some(TyBool))) }
+      }
+    }
+  } else if binop_is_ordering(op) {
+    match prc_op_impl(reg, BpOrd, l.ty) {
+      None -> EBinop(op, l, r)
+      Some(p) -> {
+        let cmpcall = prc_mk_ty(ECall(pimpl_ref(p, l), [l, r]), l.line, l.col, Some(TyInt))
+        let zero = prc_mk_ty(mk_int_synth(0), l.line, l.col, Some(TyInt))
+        EBinop(op, cmpcall, zero)
+      }
+    }
+  } else {
+    match prc_arith_impl(reg, binop_proto(op), l.ty, r.ty) {
+      Some(p) -> ECall(pimpl_ref(p, l), [l, r])
+      None    -> EBinop(op, l, r)
+    }
+  }
+}
+
+# The operator protocol's impl a generic arithmetic binop reaches once
+# monomorphisation made its operands concrete: both operands share a head
+# with a custom impl of the homogeneous protocol (`impl Add for T` or
+# `impl Add[T] for T`). A primitive operand has no head and keeps the
+# builtin; a mixed-type binop was already rewritten by the typer.
+fn prc_arith_impl(reg: ProtocolReg, bp: BinopProto, lt: Option[Ty], rt: Option[Ty]) : Option[ProtoImplReg] =
+  match bp {
+    BpEq   -> None
+    BpOrd  -> None
+    BpNone -> None
+    _ -> match prc_con_head(lt) {
+      None -> None
+      Some(s) -> if not prc_same_head(rt, s) { None } else { match op_proto_core(bp) {
+        None     -> None
+        Some(cp) -> {
+          let proto = core_proto_id(cp)
+          find(impl_pool(reg, proto, DhSym(s)), (p) => prc_homogeneous(p, proto, op_proto_method(bp), DhSym(s)))
+        }
+      } }
+    }
+  }
+
+fn prc_con_head(t: Option[Ty]) : Option[SymId] = match t {
+  Some(TyCon(s, _)) -> Some(s)
+  _                 -> None
+}
+
+fn prc_same_head(t: Option[Ty], s: SymId) : Bool = match t {
+  Some(TyCon(ts, _)) -> sym_raw(s) >= 0 and sym_raw(ts) == sym_raw(s)
+  _                  -> false
+}
+
+fn prc_homogeneous(p: ProtoImplReg, proto: SymId, opname: String, h: DispHead) : Bool = match p {
+  PIR(_, _, op, _, args, _, _) ->
+    pir_of_proto(p, proto) and prc_label_is(op, opname) and pir_serves(p, h) and is_homogeneous_args(args, h)
+}
+
+# Build an Expr with an explicit type annotation. `mk_expr` defaults
+# `ty` to None; the cmp rewrite pins TyBool / TyInt so downstream
+# passes see concrete types.
+fn prc_mk_ty(k: ExprKind, line: Int, col: Int, ty: Option[Ty]) : Expr =
+  Expr { kind: k, line: line, col: col, ty: ty, mode: MUnknown , site: 0 }
+
+# The `impl proto` entry serving the operand's root type, by the type's
+# identity. `None` when the type is fully structural (no custom impl)
+# or unresolved → keep the builtin. v1 checks the root type only; a
+# contained field with a custom impl is a documented follow-up (the
+# compiler's own comparisons are all fully structural, so root-only
+# suffices for self-host correctness).
+fn prc_cmp_impl(reg: ProtocolReg, cp: CoreProto, opname: String,
+                ty: Option[Ty]) : Option[ProtoImplReg] = match ty {
+  None -> None
+  Some(t) -> match t {
+    TyCon(s, _) -> {
+      let proto = core_proto_id(cp)
+      find_impl_for(impl_pool(reg, proto, DhSym(s)), proto, DhSym(s), opname)
+    }
+    _ -> None
+  }
+}
+
+# True iff `reg` holds an `impl proto for head` entry. The index
+# narrows the scan to the `(proto, head)` bucket; the same membership
+# predicate then runs over that short list (or the full table when the
+# index is the unbuilt placeholder), so the answer is unchanged.
+#[doc("True iff `reg` holds an `impl proto` entry for the receiver `h` (user or derive-synthesised); O(1) via the impl index when built.")]
+pub fn prc_reg_has_impl(reg: ProtocolReg, proto: SymId, h: DispHead) : Bool =
+  prc_impls_has(impl_pool(reg, proto, h), proto, h)
+
+fn prc_impls_has(impls: [ProtoImplReg], proto: SymId, h: DispHead) : Bool {
+  match impls {
+    [] -> false
+    [pir, ...rest] ->
+      if pir_of_proto(pir, proto) and pir_serves(pir, h) { true }
+      else { prc_impls_has(rest, proto, h) }
+  }
+}

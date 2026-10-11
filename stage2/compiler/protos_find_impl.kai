@@ -1,0 +1,360 @@
+#[doc("""
+The registry's impls matched against the dispatch heads of a call's
+arguments.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.util
+import compiler.fnreg
+import compiler.impl_index
+import compiler.impl_identity
+import compiler.proto_contest
+import compiler.infer
+import compiler.scalar_ty
+import compiler.tbinder
+import compiler.protos_registry
+
+#[doc("""
+An operation is a label inside its protocol: the rows compared are
+already one protocol's.
+""")]
+pub fn prc_label_is(label: Written, op: String) : Bool = written_text(label) == op
+
+#[doc("The impl function a dispatched call reaches, by its identity.")]
+pub fn pimpl_ref(p: ProtoImplReg, at: Expr) : Expr = mk_sym(pir_sym(p), at.line, at.col)
+
+#[doc("""
+True when the arguments carry no dispatch information: `Self` (or the
+protocol's `Shape` carrier) appears in the return position alone, or
+the op takes no arguments at all. Such ops resolve against the
+surrounding expected type. An op with arguments that names `Self`
+nowhere dispatches on them like any other.
+""")]
+pub fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
+                                carriers: [TLocalId]) : Bool {
+  let in_params = list_any(params, (p) => match p.ptype {
+    Some(te) -> te_mentions_self_or_carrier(te, carriers)
+    None -> false
+  })
+  not in_params and (te_mentions_self_or_carrier(ret, carriers) or list_length(params) == 0)
+}
+
+#[doc("""
+A protocol's `Shape`-kind tparams — the dispatch
+carriers whose applied form `s[A]` a call resolves against, mirroring
+how `Self` informs an ordinary protocol's dispatch.
+Two same-named protocols may declare different tparam lists, so a
+dispatch candidate reads its own, never the first-registered
+homonym's.
+""")]
+pub fn proto_shape_carriers_at(tps: [ProtoTPReg], psym: SymId) : [TLocalId] =
+  tbs_ids(filter(proto_scope_tparams(tps, psym), tb_is_shape))
+
+#[doc("""
+True when a protocol quantifies over a `Shape` carrier — dispatch is
+single on the container, so a two-arg op is not heterogeneous.
+""")]
+pub fn proto_is_shape_carrier_at(tps: [ProtoTPReg], psym: SymId) : Bool =
+  match proto_shape_carriers_at(tps, psym) { [] -> false _ -> true }
+
+#[doc("True when the protocol `psym` declares type parameters.")]
+pub fn proto_has_tparams_at(tps: [ProtoTPReg], psym: SymId) : Bool =
+  match proto_scope_tparams(tps, psym) { [] -> false _ -> true }
+
+fn list_any(xs: [Param], f: (Param) -> Bool) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> if f(x) { true } else { list_any(rest, f) }
+}
+
+fn te_mentions_self(te: TypeExpr) : Bool = te_kind_mentions_self(te.tkind)
+
+fn te_kind_mentions_self(k: TyKind) : Bool {
+  match k {
+    TyName(_, targs) -> te_list_mentions_self(targs)
+    TyParam(id, targs) ->
+      if tlocal_is_self(id) { true }
+      else { te_list_mentions_self(targs) }
+    TyList(inner) -> te_mentions_self(inner)
+    TyFn(ps, r, _) -> te_list_mentions_self(ps) or te_mentions_self(r)
+    TyDim(base, _) -> te_mentions_self(base)
+    TyRefine(base, _) -> te_mentions_self(base)
+    # issue #772: a compound row carries effect labels, never `Self`.
+    TyRow(_) -> false
+    TySurface(ts) -> te_list_mentions_self(tysurface_children(ts))
+  }
+}
+
+# As `te_mentions_self` but also treats a `Shape`-carrier head as a
+# dispatch informant: `xs: s[A]` with `s` the protocol carrier makes the
+# op arg-dispatched, exactly as `xs: Self` would.
+fn te_mentions_self_or_carrier(te: TypeExpr, carriers: [TLocalId]) : Bool =
+  te_kind_mentions_self_or_carrier(te.tkind, carriers)
+
+fn te_kind_mentions_self_or_carrier(k: TyKind, carriers: [TLocalId]) : Bool {
+  match k {
+    TyName(_, targs) -> te_list_mentions_self_or_carrier(targs, carriers)
+    TyParam(id, targs) ->
+      if tlocal_is_self(id) or tids_has(carriers, id) { true }
+      else { te_list_mentions_self_or_carrier(targs, carriers) }
+    TyList(inner) -> te_mentions_self_or_carrier(inner, carriers)
+    TyFn(ps, r, _) -> te_list_mentions_self_or_carrier(ps, carriers) or
+                      te_mentions_self_or_carrier(r, carriers)
+    TyDim(base, _) -> te_mentions_self_or_carrier(base, carriers)
+    TyRefine(base, _) -> te_mentions_self_or_carrier(base, carriers)
+    TyRow(_) -> false
+    TySurface(ts) -> te_list_mentions_self_or_carrier(tysurface_children(ts), carriers)
+  }
+}
+
+fn te_list_mentions_self_or_carrier(tes: [TypeExpr], carriers: [TLocalId]) : Bool = match tes {
+  [] -> false
+  [t, ...rest] -> if te_mentions_self_or_carrier(t, carriers) { true }
+                  else { te_list_mentions_self_or_carrier(rest, carriers) }
+}
+
+fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
+  [] -> false
+  [t, ...rest] -> if te_mentions_self(t) { true } else { te_list_mentions_self(rest) }
+}
+
+#[doc("""
+Issue #180: walk the impl table looking for the impl whose
+(receiver, [arg names]) matches the typed argument expressions.
+Pass 1 honours the proto-arg list on the impl entry — this catches
+both the homogeneous default (arg_names=[] treated as [recv]) AND
+heterogeneous matches (`impl Add[Real] for Complex`). Pass 2 (only
+for 2-arg binops) flips the receiver and tries the mirror impl.
+Beyond two args (single-dispatch ops with multiple non-receiver
+parameters like `pow_int(self, exp)`), only Pass 1 with
+`arg_names_match` against [recv] applies — `find_impl_legacy`
+does that. The legacy `find_impl_for` (no arg-name filter) is
+kept around for unrelated callers.
+The impl candidates a `(proto, recv)` lookup must consider: the
+`(proto, recv)` bucket when the index is built, else the whole table.
+Every `find_impl_*` filter keys on the receiver, so the bucket holds
+exactly the entries the linear scan would not skip, in the same order.
+""")]
+pub fn impl_pool(reg: ProtocolReg, proto: SymId, recv: DispHead) : [ProtoImplReg] =
+  if ii_built(reg.impl_index) { ii_key_bucket(reg.impl_index, proto, recv) }
+  else { reg.impls }
+
+#[doc("""
+The dispatch head of the first argument that carries a concrete type
+constructor (a container), skipping function-typed and unresolved
+args. This is the dispatch receiver for a `Shape`-carrier op.
+""")]
+pub fn first_container_head(args_: [Expr]) : Option[DispHead] = match args_ {
+  [] -> None
+  [e, ...rest] -> match e.ty {
+    Some(ty) -> match ty_disp_head(ty) {
+      Some(h) -> Some(h)
+      None    -> first_container_head(rest)
+    }
+    None -> first_container_head(rest)
+  }
+}
+
+#[doc("""
+Find the impl entry whose `arg_names` is empty (legacy default) or
+is exactly `[recv]` (homogeneous parametrised form). Heterogeneous
+entries are skipped.
+""")]
+pub fn find_impl_homogeneous(impls: [ProtoImplReg], pname: SymId,
+                          opname: String, recv: DispHead) : Option[ProtoImplReg] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(_, _, o, _, ans, _, _) ->
+        if pir_of_proto(it, pname) and prc_label_is(o, opname) and pir_serves(it, recv) and
+           is_homogeneous_args(ans, recv) {
+          Some(it)
+        } else {
+          find_impl_homogeneous(rest, pname, opname, recv)
+        }
+    }
+  }
+}
+
+#[doc("True when an impl takes no type arguments, or the receiver alone.")]
+pub fn is_homogeneous_args(reg_args: [DeclRef], recv: DispHead) : Bool = match reg_args {
+  [] -> true
+  [a] -> dh_ref_is(a, recv)
+  _ -> false
+}
+
+#[doc("The dispatch head of every argument, or None when any is unresolved.")]
+pub fn args_disp_heads(args_: [Expr]) : Option[[DispHead]] = match args_ {
+  [] -> Some([])
+  [e, ...rest] -> match e.ty {
+    None -> None
+    Some(ty) -> match ty_disp_head(ty) {
+      None -> None
+      Some(h) -> match args_disp_heads(rest) {
+        None -> None
+        Some(hs) -> Some([h, ...hs])
+      }
+    }
+  }
+}
+
+#[doc("The receiver decides the impl by identity, and so does each proto-arg.")]
+pub fn find_impl_with_args(impls: [ProtoImplReg], pname: SymId, opname: String,
+                        recv: DispHead, args: [DispHead]) : Option[ProtoImplReg] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(_, _, o, _, ans, _, _) ->
+        if pir_of_proto(it, pname) and prc_label_is(o, opname) and pir_serves(it, recv) and
+           arg_names_match(ans, recv, args) {
+          Some(it)
+        } else {
+          find_impl_with_args(rest, pname, opname, recv, args)
+        }
+    }
+  }
+}
+
+#[doc("""
+Issue #341 Form 1: receiver-only impl lookup for a return-typed op
+whose Self lives in the return position (`from_string(s) : Result[
+Self, String]`). `find_impl_with_args` cannot serve here — its
+`arg_names_match` treats the lone non-Self argument as the receiver
+(so `String` would have to be the receiver `Int`, which never
+holds). The op's params are genuine non-Self arguments already
+unified by the typer; single-dispatch v1 keys each impl uniquely on
+`(protocol, op, Self-type)`, so matching on those three is sound.
+""")]
+pub fn find_impl_by_recv(impls: [ProtoImplReg], pname: SymId, opname: String,
+                      recv: DispHead) : Option[ProtoImplReg] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(_, _, o, _, _, _, _) ->
+        if pir_of_proto(it, pname) and prc_label_is(o, opname) and pir_serves(it, recv) { Some(it) }
+        else { find_impl_by_recv(rest, pname, opname, recv) }
+    }
+  }
+}
+
+#[doc("""
+Stable partition: candidates homed in the calling module first,
+everyone else in their existing order. Only reorders when the
+caller's module itself declares the op's protocol.
+""")]
+pub fn proto_cands_own_first(cands: [ProtoOpReg],
+                         cm: Option[String]) : [ProtoOpReg] = match cm {
+  None -> cands
+  Some(_) ->
+    list_append(pcof_matching(cands, cm), pcof_rest(cands, cm))
+}
+
+#[doc("The candidates declared in the module `cm`, in order.")]
+pub fn pcof_matching(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
+  match cands {
+    [] -> []
+    [po, ...rest] -> match po {
+      POR(_, _, _, _, _, _, pmo, _) ->
+        if mo_eq(pmo, cm) { [po, ...pcof_matching(rest, cm)] }
+        else { pcof_matching(rest, cm) }
+    }
+  }
+
+fn pcof_rest(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
+  match cands {
+    [] -> []
+    [po, ...rest] -> match po {
+      POR(_, _, _, _, _, _, pmo, _) ->
+        if mo_eq(pmo, cm) { pcof_rest(rest, cm) }
+        else { [po, ...pcof_rest(rest, cm)] }
+    }
+  }
+
+# A nominal type dispatches on its declaration, a list on the core
+# list, a scalar on itself; a unit or a refinement is transparent. A
+# variable, an unresolved shape application, a function or a union has
+# no head, and dispatch declines.
+#[doc("The dispatch receiver a type presents: the declaration its head names, or the scalar it is; `None` for a type with no single head.")]
+pub fn ty_disp_head(t: Ty) : Option[DispHead] = match t {
+  TyCon(s, _)        -> Some(DhSym(s))
+  TyListT(_)         -> Some(DhSym(core_ty_sym(CtList)))
+  TyDimT(base, _)    -> ty_disp_head(base)
+  TyRefineT(base, _) -> ty_disp_head(base)
+  _ -> match scalar_ty_name(t) {
+    Some(_) -> Some(DhScalar(t))
+    None    -> None
+  }
+}
+
+#[doc("How a diagnostic names the head of `t`; `None` for a type with no single head. What a type dispatches on is `ty_disp_head`.")]
+pub fn ty_head_name(tab: SymTab, t: Ty) : Option[String] = match ty_disp_head(t) {
+  Some(h) -> Some(dh_text(tab, h))
+  None    -> None
+}
+
+#[doc("""
+Collision-aware: `opname` may be declared by several protocols
+(`add` by `Add[a]` and a user `Ring`). Returns an impl when ANY
+declaring protocol VISIBLE from `cm` has one for `tname`, so the
+post-rewrite validator does not fix the protocol to the wrong one
+and flag a spurious "no impl". Returns the owning protocol
+alongside.
+""")]
+pub fn find_impl_any_proto(reg: ProtocolReg, opname: String,
+                        recv: DispHead, cm: Option[String]) : Option[ImplHit] =
+  find_impl_any_proto_loop(proto_ops_lookup_all(reg, opname), reg, opname, recv, cm)
+
+#[doc("A resolved impl hit: the owning protocol and the impl function.")]
+pub type ImplHit = ImplHit(SymId, SymId)
+
+fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
+                             opname: String, recv: DispHead,
+                             cm: Option[String]) : Option[ImplHit] {
+  match cands {
+    [] -> None
+    [po, ...rest] -> match po {
+      POR(pkey, _, _, _, _, _, pmo, _) -> {
+        if not proto_visible_from(reg.origins, pkey, pmo, cm) {
+          find_impl_any_proto_loop(rest, reg, opname, recv, cm)
+        } else {
+          match find_impl_for(impl_pool(reg, pkey, recv), pkey, recv, opname) {
+            Some(p) -> Some(ImplHit(pkey, pir_sym(p)))
+            None -> find_impl_any_proto_loop(rest, reg, opname, recv, cm)
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("""
+How a "no impl" report names the protocols a call could have reached:
+those an unsettled reference stood between, else the first declaring
+the operation.
+""")]
+pub fn unserved_protos(reg: ProtocolReg, tab: SymTab, callee: Expr, opname: String) : String = match contest_of(callee) {
+  [] -> first_proto_of_op(reg, tab, opname)
+  ss -> join_with(map(contest_protocols(reg.ids, ss), (p) => written_text(sym_name(tab, p))), "` or `")
+}
+
+#[doc("First protocol name declaring `opname` (for diagnostics only).")]
+pub fn first_proto_of_op(reg: ProtocolReg, tab: SymTab, opname: String) : String {
+  match proto_ops_lookup_all(reg, opname) {
+    [] -> "?"
+    [po, ..._rest] -> match po { POR(psym, _, _, _, _, _, _, _) -> written_text(sym_name(tab, psym)) }
+  }
+}
+
+#[doc("The impl of the operation `opname` of the protocol `pname` that serves the receiver head `recv`.")]
+pub fn find_impl_for(impls: [ProtoImplReg], pname: SymId, recv: DispHead,
+                  opname: String) : Option[ProtoImplReg] {
+  match impls {
+    [] -> None
+    [it, ...rest] -> match it {
+      PIR(_, _, op, _, _, _, _) ->
+        if pir_of_proto(it, pname) and prc_label_is(op, opname) and pir_serves(it, recv) { Some(it) }
+        else { find_impl_for(rest, pname, recv, opname) }
+    }
+  }
+}

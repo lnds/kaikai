@@ -1,0 +1,105 @@
+#[doc("""
+A type head as the file that wrote it reads it: settled through that
+file's scope to the declaration it denotes, and spelled as the symbol
+piece an impl is keyed by.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.rt_name
+import compiler.scope_view
+import compiler.proto_resolve
+import compiler.decl_names
+import compiler.scalar_ty
+import compiler.protos_names
+
+#[doc("The name a derive's diagnostics spell the type `tsym` with.")]
+pub fn vdv_type_name(ps: PScope, tsym: SymId) : String = written_text(sym_name(ps_tab(ps), tsym))
+
+#[doc("""
+What a derive validator reads a field's type with: the scope, and the
+file that declares the deriving type (`None` = root file).
+""")]
+pub type VdvCx = { ps: PScope, from: Option[String] }
+
+# A written type head, settled to the declaration it denotes from the
+# file homed at `from`: the type its scope reaches, else the core type
+# of that name. A scalar and a type parameter have no declaration and
+# stay written.
+fn vdv_settle(ps: PScope, r: DeclRef, from: Option[String]) : DeclRef = match r {
+  DrSym(_)              -> r
+  DrWritten(Some(m), n) -> match sv_qualified(ps_tab(ps), NCType, written_text(m), written_text(n)) {
+    SvSym(s) -> DrSym(s)
+    _        -> r
+  }
+  DrWritten(None, n) -> match scalar_ty_named(written_text(n)) {
+    Some(_) -> r
+    None    -> match sv_resolve(ps_tab(ps), ps_view(ps, from), NCType, written_text(n)) {
+      SvSym(s) -> DrSym(s)
+      SvNone   -> if is_core_type(written_text(n)) { DrSym(core_type_sym(written_text(n))) } else { r }
+      _        -> r
+    }
+  }
+}
+
+#[doc("""
+Where a type head is read from: the scope, and the home of the file
+that wrote it.
+""")]
+pub type HeadScope = HeadScope(PScope, Option[String])
+
+#[doc("""
+A type head as a generated symbol spells it. The head is settled from
+the file that wrote it first, so the piece is its declaration's emitted
+name whether or not a scope pass had settled the reference: the symbol
+an impl is declared under and the one a derived body calls agree.
+""")]
+pub fn head_spell(hs: HeadScope, te: TypeExpr) : String = match hs {
+  HeadScope(ps, from) -> rt_ref_name(ps_tab(ps), vdv_head(ps, te, from))
+}
+
+#[doc("The symbol piece of the declaration the reference `r` denotes in the scope `hs`.")]
+pub fn head_ref_spell(hs: HeadScope, r: DeclRef) : String = match hs {
+  HeadScope(ps, from) -> rt_ref_name(ps_tab(ps), vdv_settle(ps, r, from))
+}
+
+#[doc("""
+A type body as its file reads it: every head of a field's type settled
+to the declaration it denotes there. A type parameter is no head to
+settle.
+""")]
+pub fn heads_body(hs: HeadScope, body: TypeBody) : TypeBody = match body {
+  TBRecord(fields) -> TBRecord(map(fields, (f) => match f {
+    FD(p, name, te, attrs) -> FD(p, name, heads_type(hs, te), attrs)
+  }))
+  TBSum(variants) -> TBSum(map(variants, (v) => match v {
+    Var(c, args) -> Var(c, map(args, (a) => heads_type(hs, a)))
+  }))
+  _ -> body
+}
+
+fn heads_type(hs: HeadScope, te: TypeExpr) : TypeExpr = match te.tkind {
+  TyName(r, args) -> {
+    let head = match hs { HeadScope(ps, from) -> vdv_settle(ps, r, from) }
+    mk_ty(TyName(head, map(args, (a) => heads_type(hs, a))), te.line, te.col)
+  }
+  TyParam(id, args) -> mk_ty(TyParam(id, map(args, (a) => heads_type(hs, a))), te.line, te.col)
+  TyList(elem) -> mk_ty(TyList(heads_type(hs, elem)), te.line, te.col)
+  _            -> te
+}
+
+#[doc("The single-dispatch head of a type written in the file homed at `from`.")]
+pub fn vdv_head(ps: PScope, te: TypeExpr, from: Option[String]) : DeclRef = match te.tkind {
+  TyName(r, _)      -> vdv_settle(ps, r, from)
+  TyList(_)         -> DrSym(core_ty_sym(CtList))
+  TyDim(base, _)    -> vdv_head(ps, base, from)
+  TyRefine(base, _) -> vdv_head(ps, base, from)
+  _                 -> proto_type_ref(te)
+}
+
+#[doc("True when `head` is one of the `providers`.")]
+pub fn vdv_provided(tab: SymTab, providers: [DeclRef], head: DeclRef) : Bool = match providers {
+  []           -> false
+  [p, ...rest] -> refs_same(tab, p, head) or vdv_provided(tab, rest, head)
+}

@@ -1,0 +1,101 @@
+#[doc("""
+A protocol call rewritten to the impl its arguments, or its expected
+return type, select.
+""")]
+
+import compiler.ast
+import compiler.proto_ids
+import compiler.proto_rank
+import compiler.protos_registry
+import compiler.protos
+import compiler.protos_find_impl
+
+#[doc("""
+Issue #180: variant accepting the call's surrounding return type so
+`from(x) : Self`-style ops can resolve Self via the expected type
+rather than the (absent) Self argument. Falls back to the legacy
+arg-driven dispatch when ret_ty is None or Self is informed by args.
+
+Issue #341 Form 1: Self may sit NESTED in the return type
+(`from_string(s) : Result[Self, String]`), so the candidate-specific
+Self head is recovered per op via `self_head_in_ret` rather than from
+the outermost `ty_head_name(ret_ty)` (which would read `Result`).
+""")]
+pub fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
+                                     reg: ProtocolReg,
+                                     cm: Option[String],
+                                     ret_ty: Option[Ty]) : Option[ExprKind] {
+  match try_rewrite_proto_call(callee, args_, reg, cm) {
+    Some(rk) -> Some(rk)
+    None -> {
+      # Last-ditch: recover Self from the return type's Self position.
+      match ret_ty {
+        None -> None
+        Some(ty) -> match pid_bare_disp(reg.ids, callee) {
+          Some(row) -> {
+            let opname = disp_op(row)
+            # Issue #546: a return-typed op (`from(x) : Self`) may
+            # also be declared by more than one protocol. Try each
+            # candidate against its own return-derived Self type.
+            # Decline while any argument's type is still unresolved
+            # (no head) — dispatching then would be premature.
+            match args_disp_heads(args_) {
+              None -> None
+              Some(_) ->
+                try_rewrite_ret_candidates(proto_call_cands(reg, row, cm), callee, args_, reg, cm, opname, ty)
+            }
+          }
+          None -> None
+        }
+      }
+    }
+  }
+}
+
+# Only a dispatcher is dispatched: the resolver turned every use that
+# reaches a protocol operation into one, so a local or a declaration
+# that shares an operation's spelling never reaches the impl table.
+fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
+                            reg: ProtocolReg,
+                            cm: Option[String]) : Option[ExprKind] {
+  # With heterogeneous P[A] dispatch the receiver is not always args[0]:
+  # every argument is a candidate Self, and the impl is the one whose
+  # arg-name list matches the others.
+  match pid_bare_disp(reg.ids, callee) {
+    Some(row) -> try_rewrite_proto_candidates(proto_call_cands(reg, row, cm), callee, args_, reg, cm, disp_op(row))
+    None      -> None
+  }
+}
+
+# The protocols a call of the dispatcher `row` may reach. A homed twin is
+# answered by its home's protocols only: the interpolation sugar's `show`
+# never reaches a user protocol that declares a `show`. Any other
+# dispatcher stands for its operation in every protocol declaring it,
+# since a bare call carries no protocol and the receiver's type decides;
+# the caller's own protocols rank first, as the scope chain ranks them.
+fn proto_call_cands(reg: ProtocolReg, row: DispInfo, cm: Option[String]) : [ProtoOpReg] = {
+  let all = proto_ops_lookup_all(reg, disp_op(row))
+  if disp_homed(row) { pcof_matching(all, disp_home(row)) } else { proto_cands_own_first(all, cm) }
+}
+
+# Issue #546: try each protocol declaring `opname` in registry order,
+# returning the first whose impl table has an entry for the receiver
+# type. Candidates whose Self appears only in the return position carry
+# no arg-borne Self information, so they are skipped here and left to
+# the `_with_ret` wrapper. Returning `None` when no candidate matches
+# preserves the prior single-protocol behaviour (residual dispatcher
+# kept for the polymorphic / no-impl paths).
+fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
+                                 args_: [Expr], reg: ProtocolReg,
+                                 cm: Option[String],
+                                 opname: String) : Option[ExprKind] = {
+  let ms = proto_matches_for(cands, args_, reg, cm, opname)
+  # Two homes serving the same receiver at the head tier: the call
+  # stays a dispatcher and `validate_proto_call_at` names them.
+  if proto_matches_ambiguous(ms) { None }
+  else { match ms {
+    [] -> None
+    [PMatch(_, _, p), ..._] ->
+      Some(ECall(pimpl_ref(p, callee), args_))
+  } }
+}

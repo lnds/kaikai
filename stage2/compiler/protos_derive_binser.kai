@@ -1,0 +1,145 @@
+#[doc("""
+The derived `BinSerialize` impl: the declarations it mints around the
+writer and the reader.
+""")]
+
+import compiler.ast
+import compiler.core_protos
+import compiler.util
+import compiler.decl_names
+import compiler.symtab_build
+import compiler.core_effects
+import compiler.protos_names
+import compiler.protos_derived
+import compiler.protos_derive_binser_put
+import compiler.protos_derive_binser_decode
+
+#[doc("""
+`#[derive(BinSerialize)]` for records and sum types: the impl, the
+type's writer, and a top-level `<lower(tname)>_from_bytes` shim.
+Decoding calls `__pimpl_BinSerialize_<Head>_from_bytes` directly:
+single dispatch picks the impl from the first argument, which for
+`from_bytes(buf, pos)` is the buffer.
+""")]
+pub fn derive_binserialize_impl(dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let put = derive_binser_put_record(dt.heads, mk_name("buf", line, col), fields, 0, dt.writers, line, col)
+      let from_b = derive_binser_record_from_bytes(dt.heads, dt.tsym, fields, line, col)
+      derive_binser_decls(dt, put, from_b, line, col)
+    }
+    TBSum(variants) -> {
+      let put = derive_binser_put_sum(dt.heads, variants, dt.writers, line, col)
+      let from_b = derive_binser_sum_from_bytes(dt.heads, dt_name(dt), variants, line, col)
+      derive_binser_decls(dt, put, from_b, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_binser_decls(dt: DerivedType, put: Expr, from_b: Expr,
+                        line: Int, col: Int) : Derived =
+  Derived { decls: [make_binser_impl(dt, derive_binser_to_bytes(dt_rt_name(dt), line, col), from_b, line, col),
+                    derive_binser_put_fn(dt, put, line, col),
+                    derive_binser_shim(dt, line, col)],
+            rows: list_append(derived_method_rows(dt, CpBinSerialize, ["to_bytes", "from_bytes"]),
+                              [NEnt(NCFn, binser_put_name(dt_rt_name(dt)), dt.home, false, NmBinWriter),
+                               NEnt(NCFn, binser_shim_name(dt_name(dt)), dt.home, true, NmDerived)]) }
+
+# `bin_buf_bytes(<writer>(bin_buf_new(), self))`: the writer over a fresh
+# buffer. The masking pass keeps this pure because a derived writer
+# mutates only its buffer (`writes_only_first_arg`).
+fn derive_binser_to_bytes(tname: String, line: Int, col: Int) : Expr {
+  let fresh = binser_lib("bin_buf_new", [], line, col)
+  let put = binser_call(binser_put_name(tname), [fresh, mk_name("self", line, col)], line, col)
+  binser_lib("bin_buf_bytes", [put], line, col)
+}
+
+# `fn <writer>(buf: BinBuf, self: T) : BinBuf / Mutable` appends `self`
+# to `buf`. Nested derived values are written into the same buffer, so
+# encoding a recursive value is linear in its size.
+fn derive_binser_put_fn(dt: DerivedType, body: Expr, line: Int, col: Int) : Decl {
+  let buf_ty = mk_ty(TyName(ref_written("BinBuf"), []), line, col)
+  let self_ty = derived_self_ty(dt, line, col)
+  let params = [Param { binder: binder_written("buf"), ptype: Some(buf_ty), pline: line, pcol: col, pborrow: false },
+                Param { binder: binder_written("self"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }]
+  DFn(false, fnid_decl(sym_derive(NCFn, binser_put_name(dt_rt_name(dt)), dt.home)), [], params, Some(buf_ty),
+      RClosed([core_effect_row_label(CeMutable)]), body, line, col, None)
+}
+
+# `impl BinSerialize for T { fn to_bytes ... fn from_bytes ... }`
+#
+# Uses `Array[Byte]` for the buffer carrier so `from_bytes` reads land
+# on O(1) `array_get` — the substrate the Phase A cache (#452)
+# requires, per the #487 refactor. `Byte` is a first-class nominal
+# primitive after Lane 4 + PR #476; the previous `Byte = Int`
+# transparent alias is gone. `byte_to_int` / `int_to_byte` are the
+# explicit conversions when interoperating with `Int` data.
+fn make_binser_impl(dt: DerivedType, to_b: Expr, from_b: Expr,
+                     line: Int, col: Int) : Decl {
+  let self_ty = derived_self_ty(dt, line, col)
+  let byte_arr = mk_ty(TyName(ref_written("Array"), [mk_ty(TyName(ref_written("Byte"), []), line, col)]), line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
+  let str_ty = mk_ty(TyName(ref_written("String"), []), line, col)
+  let cur_ty = mk_ty(TyName(ref_written("BinCursor"), [self_ty]), line, col)
+  let res_ty = mk_ty(TyName(ref_written("Result"), [cur_ty, str_ty]), line, col)
+  let to_params = [Param { binder: binder_written("self"), ptype: Some(self_ty),
+                            pline: line, pcol: col, pborrow: false }]
+  let from_params = [Param { binder: binder_written("buf"), ptype: Some(byte_arr),
+                              pline: line, pcol: col, pborrow: false },
+                     Param { binder: binder_written("pos"), ptype: Some(int_ty),
+                              pline: line, pcol: col, pborrow: false }]
+  let to_method = derived_method(dt, CpBinSerialize, "to_bytes", to_params, byte_arr, to_b, line, col)
+  let from_method = derived_method(dt, CpBinSerialize, "from_bytes", from_params, res_ty, from_b, line, col)
+  DImpl(DrSym(core_proto_id(CpBinSerialize)), [], self_ty, [to_method, from_method], line, col, [], sym_none())
+}
+
+# `fn <lower(tname)>_from_bytes(buf: Array[Byte], pos: Int)
+#       : Result[BinCursor[T], String]`
+# wrapping the mangled per-impl name. The shim decouples the user's
+# call site from the dispatcher's first-arg constraint and gives the
+# diagnostic stack a stable function name when the decode fails.
+fn derive_binser_shim(dt: DerivedType, line: Int, col: Int) : Decl {
+  let self_ty = derived_self_ty(dt, line, col)
+  let byte_arr = mk_ty(TyName(ref_written("Array"), [mk_ty(TyName(ref_written("Byte"), []), line, col)]), line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
+  let str_ty = mk_ty(TyName(ref_written("String"), []), line, col)
+  let cur_ty = mk_ty(TyName(ref_written("BinCursor"), [self_ty]), line, col)
+  let res_ty = mk_ty(TyName(ref_written("Result"), [cur_ty, str_ty]), line, col)
+  let params = [Param { binder: binder_written("buf"), ptype: Some(byte_arr),
+                         pline: line, pcol: col, pborrow: false },
+                Param { binder: binder_written("pos"), ptype: Some(int_ty),
+                         pline: line, pcol: col, pborrow: false }]
+  let mangled = proto_mangled_fn("BinSerialize", dt_rt_name(dt), "from_bytes")
+  let body = mk_expr(ECall(mk_name(mangled, line, col),
+                            [mk_name("buf", line, col),
+                             mk_name("pos", line, col)]),
+                     line, col)
+  DFn(true, fnid_decl(sym_derive(NCFn, binser_shim_name(dt_name(dt)), dt.home)),
+      [], params, Some(res_ty), REmpty, body, line, col, None)
+}
+
+fn binser_shim_name(tname: String) : String = concat_all([string_to_lower_ascii(tname), "_from_bytes"])
+
+# Lowercase every ASCII byte of `tname` so the shim name
+# (`<lower(tname)>_from_bytes`) is a valid all-lowercase identifier
+# even for types like `Point`, `MyAST`, or `IntMaybe`. We do NOT
+# insert underscores between cased segments — the simple form
+# `intmaybe_from_bytes`, `myast_from_bytes` is unambiguous and
+# avoids tangling with the snake_case convention enforced
+# elsewhere by the resolver. Non-ASCII bytes pass through.
+#[doc("ASCII-only lowercaser; used by the emitter to fold effect names.")]
+pub fn string_to_lower_ascii(s: String) : String =
+  string_to_lower_ascii_loop(s, 0, string_length(s), "")
+
+fn string_to_lower_ascii_loop(s: String, i: Int, n: Int, acc: String) : String = {
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let nc = char_to_int(c)
+      let lc = if nc >= 65 and nc <= 90 { int_to_char(nc + 32) } else { c }
+      string_to_lower_ascii_loop(s, i + 1, n, string_concat(acc, "#{lc}"))
+    }
+  } }
+}

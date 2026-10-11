@@ -1,0 +1,254 @@
+#[doc("""
+The walk that, after the rewrite, finds every call still reaching a
+dispatcher.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.diag_file
+import compiler.diag
+import compiler.infer
+import compiler.protos
+
+# m12.8.x phase 2 (Bug 5): post-rewrite validation. After
+# `resolve_protocol_calls` has rewritten every dispatchable
+# `__proto_<op>(receiver, ...)` call into the matching
+# `__pimpl_<P>_<T>_<op>` direct call, walk the typed AST and report
+# any *remaining* dispatcher-shaped calls whose receiver type is
+# concrete but has no impl. This is the compile-time error the
+# `m12_8_y_postfix_no_impl` and similar negative fixtures expect.
+# Calls whose receiver is still a TyVar (the polymorphic-helper
+# fallthrough case the m12.8 v1 deliberately allowed) keep the
+# dispatcher panic at runtime.
+#[doc("Post-rewrite static-coherence check over the whole typed program.")]
+pub fn validate_resolved_protocols(typed: TypedProgram, tab: SymTab, reg: ProtocolReg,
+                                df: DiagFiles) : [Diagnostic] / Console + File =
+  finalize_diags(validate_resolved_decls(typed.decls, tab, reg, df, []))
+
+#[doc("Post-rewrite static-coherence check over a decl list (used after monomorphisation). Each diagnostic names the file that declares its decl.")]
+pub fn validate_resolved_decls(ds: [Decl], tab: SymTab, reg: ProtocolReg,
+                            df: DiagFiles, errs: [Diagnostic]) : [Diagnostic] / Console + File {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> {
+      let file = decl_diag_file(d, df)
+      # The decl's module scopes which protocols may clear its
+      # residual dispatcher calls, mirroring the rewrite.
+      let e1 = match d {
+        DFn(_, _, _, _, _, _, body, _, _, mo) ->
+          validate_resolved_expr(body, reg, tab, mo, file, errs)
+        DTest(_, body, _, _, _) ->
+          validate_resolved_expr(body, reg, tab, None, file, errs)
+        DBench(_, body, _, _, _) ->
+          validate_resolved_expr(body, reg, tab, None, file, errs)
+        DCheck(_, _, body, _, _, _) ->
+          validate_resolved_expr(body, reg, tab, None, file, errs)
+        _ -> errs
+      }
+      validate_resolved_decls(rest, tab, reg, df, e1)
+    }
+  }
+}
+
+fn validate_resolved_expr(e: Expr, reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
+                           errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  let e1 = validate_proto_call_at(e, reg, tab, cm, file, errs)
+  validate_resolved_kind(e.kind, reg, tab, cm, file, e1)
+}
+
+fn validate_resolved_opt(o: Option[Expr], reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
+                          errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match o {
+    Some(e) -> validate_resolved_expr(e, reg, tab, cm, file, errs)
+    None    -> errs
+  }
+}
+
+fn validate_resolved_exprs(es: [Expr], reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
+                            errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match es {
+    [] -> errs
+    [e, ...rest] -> {
+      let e1 = validate_resolved_expr(e, reg, tab, cm, file, errs)
+      validate_resolved_exprs(rest, reg, tab, cm, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_arms(arms: [Arm], reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
+                           errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match arms {
+    [] -> errs
+    [a, ...rest] -> match a {
+      Arm(_, g, b) -> {
+        let e1 = validate_resolved_opt(g, reg, tab, cm, file, errs)
+        let e2 = validate_resolved_expr(b, reg, tab, cm, file, e1)
+        validate_resolved_arms(rest, reg, tab, cm, file, e2)
+      }
+    }
+  }
+}
+
+fn validate_resolved_stmts(ss: [Stmt], reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
+                            errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match ss {
+    [] -> errs
+    [s, ...rest] -> {
+      let e1 = match s {
+        SLet(_, _, rhs) -> validate_resolved_expr(rhs, reg, tab, cm, file, errs)
+        SAssert(c, m) -> {
+          let x = validate_resolved_expr(c, reg, tab, cm, file, errs)
+          validate_resolved_opt(m, reg, tab, cm, file, x)
+        }
+        SExprStmt(x) -> validate_resolved_expr(x, reg, tab, cm, file, errs)
+        SIndexAssign(b, i, v, _, _) -> {
+          let x = validate_resolved_expr(b, reg, tab, cm, file, errs)
+          let y = validate_resolved_expr(i, reg, tab, cm, file, x)
+          validate_resolved_expr(v, reg, tab, cm, file, y)
+        }
+        SAssign(b, v, _, _) -> {
+          let x = validate_resolved_expr(b, reg, tab, cm, file, errs)
+          validate_resolved_expr(v, reg, tab, cm, file, x)
+        }
+        SVar(_, _, rhs, _, _) -> validate_resolved_expr(rhs, reg, tab, cm, file, errs)
+        # m7e §25: SUse has no expression to validate.
+        SUse(_, _, _) -> errs
+      }
+      validate_resolved_stmts(rest, reg, tab, cm, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_clauses(cs: [HClause], reg: ProtocolReg, tab: SymTab, cm: Option[String],
+                              file: String, errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match cs {
+    [] -> errs
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> {
+        let e1 = validate_resolved_expr(b, reg, tab, cm, file, errs)
+        validate_resolved_clauses(rest, reg, tab, cm, file, e1)
+      }
+    }
+  }
+}
+
+fn validate_resolved_opt_return(o: Option[HReturn], reg: ProtocolReg, tab: SymTab, cm: Option[String],
+                                 file: String, errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match o {
+    Some(r) -> match r { HR(_, b, _, _) -> validate_resolved_expr(b, reg, tab, cm, file, errs) }
+    None -> errs
+  }
+}
+
+fn validate_resolved_fields(fs: [FieldInit], reg: ProtocolReg, tab: SymTab, cm: Option[String],
+                             file: String, errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match fs {
+    [] -> errs
+    [f, ...rest] -> match f {
+      FI(_, v) -> {
+        let e1 = validate_resolved_expr(v, reg, tab, cm, file, errs)
+        validate_resolved_fields(rest, reg, tab, cm, file, e1)
+      }
+    }
+  }
+}
+
+fn validate_resolved_list_elems(els: [ListElem], reg: ProtocolReg, tab: SymTab, cm: Option[String],
+                                 file: String, errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match els {
+    [] -> errs
+    [el, ...rest] -> {
+      let e1 = match el {
+        ElPlain(x)  -> validate_resolved_expr(x, reg, tab, cm, file, errs)
+        ElSpread(x) -> validate_resolved_expr(x, reg, tab, cm, file, errs)
+      }
+      validate_resolved_list_elems(rest, reg, tab, cm, file, e1)
+    }
+  }
+}
+
+fn validate_resolved_kind(k: ExprKind, reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
+                           errs: [Diagnostic]) : [Diagnostic] / Console + File {
+
+
+  match k {
+    ECall(c, args_) -> {
+      let e1 = validate_resolved_expr(c, reg, tab, cm, file, errs)
+      validate_resolved_exprs(args_, reg, tab, cm, file, e1)
+    }
+    EBlock(ss, t) -> {
+      let e1 = validate_resolved_stmts(ss, reg, tab, cm, file, errs)
+      validate_resolved_opt(t, reg, tab, cm, file, e1)
+    }
+    EIf(c, t_, eo) -> {
+      let e1 = validate_resolved_expr(c, reg, tab, cm, file, errs)
+      let e2 = validate_resolved_expr(t_, reg, tab, cm, file, e1)
+      validate_resolved_opt(eo, reg, tab, cm, file, e2)
+    }
+    EBinop(_, a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      validate_resolved_expr(b, reg, tab, cm, file, e1)
+    }
+    EUnop(_, x) -> validate_resolved_expr(x, reg, tab, cm, file, errs)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let e1 = validate_resolved_expr(body, reg, tab, cm, file, errs)
+      let e2 = validate_resolved_opt(init_opt, reg, tab, cm, file, e1)
+      let e3 = validate_resolved_clauses(clauses, reg, tab, cm, file, e2)
+      validate_resolved_opt_return(ret_opt, reg, tab, cm, file, e3)
+    }
+    ELambda(_, b) -> validate_resolved_expr(b, reg, tab, cm, file, errs)
+    EMatch(scr, arms) -> {
+      let e1 = validate_resolved_expr(scr, reg, tab, cm, file, errs)
+      validate_resolved_arms(arms, reg, tab, cm, file, e1)
+    }
+    EPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      validate_resolved_expr(b, reg, tab, cm, file, e1)
+    }
+    EMapPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      validate_resolved_expr(b, reg, tab, cm, file, e1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      validate_resolved_expr(b, reg, tab, cm, file, e1)
+    }
+    EFilterPipe(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      validate_resolved_expr(b, reg, tab, cm, file, e1)
+    }
+    EField(base, _) -> validate_resolved_expr(base, reg, tab, cm, file, errs)
+    EIndex(a, b) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      validate_resolved_expr(b, reg, tab, cm, file, e1)
+    }
+    ERecordLit(_, fields) -> validate_resolved_fields(fields, reg, tab, cm, file, errs)
+    EList(elems) -> validate_resolved_list_elems(elems, reg, tab, cm, file, errs)
+    ERange(a, b, opt_step) -> {
+      let e1 = validate_resolved_expr(a, reg, tab, cm, file, errs)
+      let e2 = validate_resolved_expr(b, reg, tab, cm, file, e1)
+      validate_resolved_opt(opt_step, reg, tab, cm, file, e2)
+    }
+    EBang(inner) -> validate_resolved_expr(inner, reg, tab, cm, file, errs)
+    ELitUnit(inner, _) -> validate_resolved_expr(inner, reg, tab, cm, file, errs)
+    _ -> errs
+  }
+}

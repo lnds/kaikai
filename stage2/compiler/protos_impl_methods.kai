@@ -1,0 +1,195 @@
+#[doc("""
+The pieces of the impl-method check: the operations an impl leaves out,
+and a method's signature against the operation it supplies.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.type_text
+import compiler.diag
+import compiler.util
+import compiler.tbinder
+import compiler.protos_names
+import compiler.protos_sig
+
+#[doc("The labels of `ops`, pushed onto `acc` in reverse.")]
+pub fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
+  match ops {
+    [] -> acc
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _, _, _) -> proto_op_names(rest, [written_text(name), ...acc])
+    }
+  }
+}
+
+#[doc("Shape 1: every protocol op must have a matching method in the impl.")]
+pub fn check_missing_methods(tab: SymTab, proto_ops: [ProtoOpReg], methods: [Decl],
+                         pname: String, tname: String,
+                         all_op_names: [String],
+                         file: String, line: Int, col: Int,
+                         acc: [Diagnostic]) : [Diagnostic] {
+  match proto_ops {
+    [] -> acc
+    [op, ...rest] -> match op {
+      POR(_, oplbl, _, _, _, _, _, _) -> {
+        let opname = written_text(oplbl)
+        let acc1 =
+          if impl_has_method(tab, methods, opname) { acc }
+          else {
+            [mk_diag(SevError, file, line, col,
+               concat_all(["impl `", pname, " for ", tname,
+                           "` is missing required method `", opname, "`"]),
+               [ri_note(file, line, col,
+                  concat_all(["protocol `", pname, "` declares operations: ",
+                              proto_join_with(all_op_names, ", ")]))]), ...acc]
+          }
+        check_missing_methods(tab, rest, methods, pname, tname, all_op_names,
+                              file, line, col, acc1)
+      }
+    }
+  }
+}
+
+fn impl_has_method(tab: SymTab, methods: [Decl], opname: String) : Bool {
+  match methods {
+    [] -> false
+    [d, ...rest] -> match d {
+      DFn(_, fid, _, _, _, _, _, _, _, _) ->
+        if impl_method_op(tab, fid) == opname { true } else { impl_has_method(tab, rest, opname) }
+      _ -> impl_has_method(tab, rest, opname)
+    }
+  }
+}
+
+#[doc("The operation of `ops` labelled `target`.")]
+pub fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
+  match ops {
+    [] -> None
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _, _, _) ->
+        if op_label_is(name, target) { Some(op) } else { find_proto_op(rest, target) }
+    }
+  }
+}
+
+#[doc("""
+Compare an impl signature against the protocol's. `Self` in the
+protocol substitutes to the impl target; each protocol tparam `Ai`
+substitutes to `arg_heads[i]` (or the target when `arg_heads == []`,
+the homogeneous default per the lower_impls rule). `tname` is the
+target's head as a diagnostic shows it. Parameters are
+compared structurally, so two instantiations of one constructor are
+distinguished; the return below compares head names only, except a
+function type, which has no meaningful head and compares structurally.
+Unannotated impl params (`ptype == None`) are not checked — the
+typer infers them; a pre-typer pass has no signal to compare against.
+`shown` holds every type parameter either signature may mention, for
+the diagnostics.
+""")]
+pub fn check_sig_heads(tab: SymTab, impl_params: [Param], proto_params: [Param],
+                   impl_ret_opt: Option[TypeExpr], proto_ret: TypeExpr,
+                   op_name: String, pname: String, tname: String,
+                   target: TypeExpr,
+                   proto_tps: [TBinder], arg_heads: [DeclRef], shown: [TBinder],
+                   file: String, line: Int, col: Int,
+                   acc: [Diagnostic]) : [Diagnostic] {
+  let e_params = check_sig_param_heads(tab, impl_params, proto_params, tname, target,
+                                        proto_tps, arg_heads, shown,
+                                        op_name, pname, file, acc)
+  # Return-type check applies only when the impl is homogeneous w.r.t.
+  # the protocol's tparams. Heterogeneous impls (`impl P[Other] for T`
+  # with Other != T) often produce a *promoted* result type that the
+  # protocol's `Self` return cannot express — stdlib's
+  # `impl Add[Complex] for Real { fn add(...) : Complex }` is the
+  # canonical case. Validating the return there requires a protocol-
+  # level `Result` tparam or HKT, both out of scope for v1. The
+  # parameter-position checks above still catch genuine signature
+  # drift (wrong `self`/`rhs` types) — the leak here is only when
+  # the impl rewrites the return shape for a known good reason.
+  if heterogeneous_impl(tab, arg_heads, proto_type_ref(target)) { e_params }
+  else { match impl_ret_opt {
+    None -> e_params
+    Some(impl_ret) -> {
+      let ok = match proto_ret.tkind {
+        TyFn(_, _, _) -> sig_type_matches(tab, impl_ret, sig_subst(proto_ret, target, proto_tps, arg_heads))
+        _ ->
+          if sig_free_param(proto_ret, proto_tps) { sig_free_param(impl_ret, []) }
+          else { refs_same(tab, proto_type_ref(impl_ret), sig_head_subst(proto_ret, target, proto_tps, arg_heads)) }
+      }
+      if ok { e_params }
+      else {
+        [proto_err(file, line, col,
+           concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
+                       "` returns `", type_text_in(tab, shown, impl_ret),
+                       "` but protocol declares return type `",
+                       sig_ret_display(tab, proto_ret, target, proto_tps, arg_heads, shown), "`"])),
+         ...e_params]
+      }
+    }
+  } }
+}
+
+# A parameter the impl head settles nothing about: one of the op's own,
+# which any parameter of the impl method answers.
+fn sig_free_param(t: TypeExpr, proto_tps: [TBinder]) : Bool = match t.tkind {
+  TyParam(id, _) -> not tlocal_is_self(id) and not tbs_has(proto_tps, id)
+  _              -> false
+}
+
+fn sig_ret_display(tab: SymTab, t: TypeExpr, target: TypeExpr,
+                   proto_tps: [TBinder], arg_heads: [DeclRef], shown: [TBinder]) : String =
+  match t.tkind {
+    TyFn(_, _, _) -> type_text_in(tab, shown, sig_subst(t, target, proto_tps, arg_heads))
+    _ ->
+      if sig_free_param(t, proto_tps) { type_text_in(tab, shown, t) }
+      else { ref_text(tab, sig_head_subst(t, target, proto_tps, arg_heads)) }
+  }
+
+# An impl is heterogeneous iff it carries explicit bracket args and
+# at least one of them differs from the target head. Legacy un-
+# parametrised impls (`arg_heads == []`) are homogeneous by
+# definition. Same-as-target args (`impl Add[Complex] for Complex`)
+# round-trip through the homogeneous default, so they are not
+# heterogeneous either.
+fn heterogeneous_impl(tab: SymTab, arg_heads: [DeclRef], target: DeclRef) : Bool {
+  match arg_heads {
+    [] -> false
+    [h, ...rest] -> if not refs_same(tab, h, target) { true } else { heterogeneous_impl(tab, rest, target) }
+  }
+}
+
+fn check_sig_param_heads(tab: SymTab, impl_ps: [Param], proto_ps: [Param], tname: String,
+                         target: TypeExpr,
+                         proto_tps: [TBinder], arg_heads: [DeclRef], shown: [TBinder],
+                         op_name: String, pname: String,
+                         file: String, acc: [Diagnostic]) : [Diagnostic] {
+  match impl_ps {
+    [] -> acc
+    [ip, ...irest] -> match proto_ps {
+      [] -> acc
+      [pp, ...prest] -> {
+        let acc1 = match ip.ptype {
+          None -> acc
+          Some(it) -> match pp.ptype {
+            None -> acc
+            Some(pt) -> {
+              let ps = sig_subst(pt, target, proto_tps, arg_heads)
+              if sig_type_matches(tab, it, ps) { acc }
+              else {
+                [proto_err(file, ip.pline, ip.pcol,
+                   concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
+                               "`: parameter `", written_text(ip.binder.name),
+                               "` has type `", type_text_in(tab, shown, it),
+                               "` but protocol declares `", type_text_in(tab, shown, ps), "`"])), ...acc]
+              }
+            }
+          }
+        }
+        check_sig_param_heads(tab, irest, prest, tname, target,
+                              proto_tps, arg_heads, shown,
+                              op_name, pname, file, acc1)
+      }
+    }
+  }
+}
