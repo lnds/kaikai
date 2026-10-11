@@ -1,0 +1,70 @@
+#[doc("""
+Character and regex literals.
+""")]
+
+import compiler.escapes
+import compiler.lex_tokens
+import compiler.lex_bytes
+import compiler.lex_cursor
+import compiler.lex_strings
+
+#[doc("`l` sits on the `~`; the pattern opens after `~r/`.")]
+pub fn lex_regex(l: Lexer) : LexStep = lex_str_step(l, lex_regex_body(l.src, l.pos + 3, false), TkRegex)
+
+# `in_class` is true inside a `[...]` character class, where `/` and `]`
+# swap their meaning relative to the outer state.
+fn lex_regex_body(src: String, i: Int, in_class: Bool) : StrResult {
+  let b = byte_at(src, i)
+  if b < 0 { StrErr(i, "unterminated regex literal") }
+  else if b == B_BACKSLASH {
+    if byte_at(src, i + 1) < 0 { StrErr(i + 1, "unterminated regex literal") }
+    else { lex_regex_body(src, i + 2, in_class) }
+  }
+  else if b == B_NL { StrErr(i, "unterminated regex literal (newline before closing `/`)") }
+  else if in_class { lex_regex_body(src, i + 1, b != B_RBRACKET) }
+  else if b == B_SLASH { StrOk(i + 1) }
+  else { lex_regex_body(src, i + 1, b == B_LBRACKET) }
+}
+
+# Past the UTF-8 continuation bytes (0b10xxxxxx) after a lead byte, so
+# `'á'` scans as one char; `decode_char` reads the codepoint later.
+fn utf8_continuation_end(src: String, i: Int) : Int {
+  let b = byte_at(src, i)
+  if b >= 128 and b < 192 { utf8_continuation_end(src, i + 1) } else { i }
+}
+
+#[doc("The token of the character literal at the cursor.")]
+pub fn lex_char(l: Lexer) : LexStep {
+  let body = l.pos + 1
+  if byte_at(l.src, body) < 0 {
+    lex_str_step(l, StrErr(body, "unterminated char literal"), TkChar)
+  } else {
+    match lex_char_scan_body(l.src, body) {
+      StrOk(j) ->
+        if byte_at(l.src, j) == B_SQUOTE { lex_str_step(l, StrOk(j + 1), TkChar) }
+        else { lex_str_step(l, StrErr(j, "unterminated char literal"), TkChar) }
+      err -> lex_str_step(l, err, TkChar)
+    }
+  }
+}
+
+# The body of a char literal: an escape through the shared table, or a
+# codepoint with its continuation bytes.
+fn lex_char_scan_body(src: String, i: Int) : StrResult {
+  if byte_at(src, i) != B_BACKSLASH { StrOk(utf8_continuation_end(src, i + 1)) }
+  else {
+    match esc_decode_at(src, i, i + 1, string_length(src)) {
+      # Skip to the closing quote so a bad escape yields one diagnostic
+      # rather than a cascade from the leftover cursor.
+      EscBad(msg, _) -> StrErr(lex_char_skip_to_quote(src, i), msg)
+      EscOk(_, next) -> StrOk(next)
+    }
+  }
+}
+
+fn lex_char_skip_to_quote(src: String, i: Int) : Int {
+  let b = byte_at(src, i)
+  if b < 0 or b == B_NL { i }
+  else if b == B_SQUOTE { i + 1 }
+  else { lex_char_skip_to_quote(src, i + 1) }
+}

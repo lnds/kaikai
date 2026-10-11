@@ -1,0 +1,151 @@
+#[doc("""
+Number literals: decimal, hexadecimal and binary, with their width and
+kind suffixes.
+""")]
+
+import compiler.lex_tokens
+import compiler.lex_bytes
+import compiler.lex_cursor
+
+fn lex_scan_digits(l: Lexer) : Lexer = lex_move(l, digits_end(l.src, l.pos))
+
+# Recognise `0x[0-9a-fA-F_]+` and `0b[01_]+` as TkInt, then hand off to
+# the shared suffix path so a width suffix (`0xFFi32`) attaches on every
+# base. `_` is a digit separator, as in decimal, so a run of only
+# separators (`0x_`) carries no digits and stays an error.
+fn lex_hex_or_bin_int(l: Lexer, is_hex: Bool, sl: Int, sc: Int, start: Int) : LexStep {
+  let digits = l.pos + 2
+  let end = if is_hex { hex_digits_end(l.src, digits) } else { bin_digits_end(l.src, digits) }
+  let l_end = lex_move(l, end)
+  if lex_span_has_digit(l.src, digits, end) {
+    lex_maybe_complex_suffix(l_end, sl, sc, start, TkInt)
+  } else {
+    let msg = if is_hex { "malformed number: expected hex digits after 0x" }
+              else { "malformed number: expected binary digits after 0b" }
+    Step(l_end, tok(TkError(msg), sl, sc, start, end))
+  }
+}
+
+#[doc("The token of the number literal at the cursor.")]
+pub fn lex_number(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  # Hex (`0x`/`0X`) and binary (`0b`/`0B`) literals branch off here so
+  # they share TkInt with decimal and skip the float/exponent path below.
+  if lex_peek_is(l, '0') and (lex_peek2_is(l, 'x') or lex_peek2_is(l, 'X')) {
+    lex_hex_or_bin_int(l, true, sl, sc, start)
+  } else if lex_peek_is(l, '0') and (lex_peek2_is(l, 'b') or lex_peek2_is(l, 'B')) {
+    lex_hex_or_bin_int(l, false, sl, sc, start)
+  } else {
+    lex_number_decimal(l, sl, sc, start)
+  }
+}
+
+fn lex_number_decimal(l: Lexer, sl: Int, sc: Int, start: Int) : LexStep {
+  let l1 = lex_scan_digits(l)
+  # Fractional part: only when `.` is followed by a digit. `x..y` (range)
+  # and `x.field` (access) must be left alone.
+  let is_real1 = lex_peek_is(l1, '.') and b_is_digit(lex_peek_at(l1, 1))
+  let l2 = if is_real1 { lex_move(l1, digits_end(l1.src, l1.pos + 2)) } else { l1 }
+  # Exponent part: `e` or `E`, optional sign, digits.
+  if lex_peek_is(l2, 'e') or lex_peek_is(l2, 'E') {
+    let l3 = lex_advance(l2)
+    let l4 = if lex_peek_is(l3, '+') or lex_peek_is(l3, '-') { lex_advance(l3) } else { l3 }
+    if b_is_digit(lex_peek(l4)) {
+      lex_maybe_complex_suffix(lex_scan_digits(l4), sl, sc, start, TkReal)
+    } else {
+      Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                   sl, sc, start, l4.pos))
+    }
+  } else {
+    let kind = if is_real1 { TkReal } else { TkInt }
+    lex_maybe_complex_suffix(l2, sl, sc, start, kind)
+  }
+}
+
+# A matched fixed-width suffix: the width token and the lexer advanced
+# past the suffix characters.
+type WidthSuffix = WS(TokKind, Lexer)
+
+# Try to consume a fixed-width suffix (`i32`/`u32`/`u64`/`i128`) starting
+# at `l`. Only valid on an integer base, so the caller gates on
+# `fallback == TkInt`. `i64` is intentionally NOT a suffix (the base
+# `Int` IS i64); it is rejected so a stray `42i64` surfaces as a lex
+# error rather than silently becoming complex `42i` + `64`.
+fn lex_width_suffix(l: Lexer, fallback: TokKind) : Option[WidthSuffix] {
+  let is_int = match fallback { TkInt -> true _ -> false }
+  if not is_int { None }
+  else if lex_peek_is(l, 'i') { lex_width_after_i(lex_advance(l)) }
+  else if lex_peek_is(l, 'u') { lex_width_after_u(lex_advance(l)) }
+  else { None }
+}
+
+# After the leading `i`: `32` is Int32, `128` is Int128. Anything else
+# (including a bare `i`, which is complex) returns None.
+fn lex_width_after_i(l: Lexer) : Option[WidthSuffix] {
+  if lex_match_str(l, "32") { Some(WS(TkInt32, lex_advance_n(l, 2))) }
+  else if lex_match_str(l, "128") { Some(WS(TkInt128, lex_advance_n(l, 3))) }
+  else { None }
+}
+
+# After the leading `u`: `8` is Byte, `32` is UInt32, `64` is UInt64.
+fn lex_width_after_u(l: Lexer) : Option[WidthSuffix] {
+  if lex_match_str(l, "8") { Some(WS(TkUInt8, lex_advance_n(l, 1))) }
+  else if lex_match_str(l, "32") { Some(WS(TkUInt32, lex_advance_n(l, 2))) }
+  else if lex_match_str(l, "64") { Some(WS(TkUInt64, lex_advance_n(l, 2))) }
+  else { None }
+}
+
+# True when `s` matches the source at `l.pos` AND the char immediately
+# after is not alphanumeric (so `42u32x` does not match `u32`).
+fn lex_match_str(l: Lexer, s: String) : Bool = word_at(l.src, l.pos, s)
+
+# After a complete numeric scan, peek for an *immediately adjacent*
+# typed suffix. Three outcomes:
+#  - a fixed-width suffix (`i32`/`u32`/`u64`/`i128`) gives the matching
+#    width token, span covering digits + suffix (parser strips it);
+#  - a lone `i` not starting a width suffix gives TkComplex, its span
+#    covering the digits + `i`;
+#  - nothing adjacent gives the integer/real `fallback`.
+# Whitespace before the suffix already terminates the numeric scan, so
+# `3 + i` and `for i in ...` keep lexing `i` as TkIdent. The width path
+# only fires on the *integer* fallback; a Real base never reaches it
+# (`lex_width_suffix` returns None), so `1.0i` stays complex.
+fn lex_maybe_complex_suffix(l: Lexer, sl: Int, sc: Int, start: Int, fallback: TokKind) : LexStep {
+  match lex_width_suffix(l, fallback) {
+    Some(WS(kind, l_after)) -> Step(l_after, tok(kind, sl, sc, start, l_after.pos))
+    None ->
+      # `<num>d` is a Decimal literal — on either base (`42d`, `19.99d`),
+      # only when no identifier char follows (so `42d` lexes but `42down`
+      # keeps `42` then `down`).
+      if lex_is_decimal_suffix(l) {
+        let l_after = lex_advance(l)
+        Step(l_after, tok(TkDecimal, sl, sc, start, l_after.pos))
+      }
+      # `<int>n` is a BigInt literal — only on an integer base, and only
+      # when no identifier char follows (so `99n` lexes but `99name`
+      # keeps `99` then `name`).
+      else if lex_is_bigint_suffix(l, fallback) {
+        let l_after = lex_advance(l)
+        Step(l_after, tok(TkBigInt, sl, sc, start, l_after.pos))
+      } else if lex_peek_is(l, 'i') {
+        let l_after = lex_advance(l)
+        Step(l_after, tok(TkComplex, sl, sc, start, l_after.pos))
+      } else {
+        Step(l, tok(fallback, sl, sc, start, l.pos))
+      }
+  }
+}
+
+# True when `l` is at a `d` that ends a numeric literal (`<num>d`) and is
+# not the start of an identifier. Fires on both integer and real bases.
+fn lex_is_decimal_suffix(l: Lexer) : Bool =
+  lex_peek_is(l, 'd') and not b_is_alnum(lex_peek_at(l, 1))
+
+# True when `l` is at an `n` that ends an integer literal (`<int>n`) and
+# is not the start of an identifier.
+fn lex_is_bigint_suffix(l: Lexer, fallback: TokKind) : Bool = {
+  let is_int = match fallback { TkInt -> true _ -> false }
+  is_int and lex_peek_is(l, 'n') and not b_is_alnum(lex_peek_at(l, 1))
+}
