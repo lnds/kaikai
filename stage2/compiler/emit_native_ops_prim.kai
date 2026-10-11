@@ -1,0 +1,90 @@
+#[doc("""
+A `KPrim` lowered: the operators and prims with an inline form, and the
+runtime call for the rest.
+""")]
+
+import compiler.kir
+import compiler.kir_prims
+import compiler.emit_native_fn
+import compiler.emit_native_vec
+import compiler.emit_native_ops_syms
+import compiler.emit_native_ops_calls
+import compiler.emit_native_ops_raw
+import compiler.emit_native_ops_inline
+
+# A fresh 2-element buffer (handles never ride a kaikai list).
+fn nbuf2(a: Handle, b: Handle) : Handle = {
+  let buf = llvm_buf_new(); llvm_buf_push(buf, a); llvm_buf_push(buf, b); buf
+}
+fn nbuf1(a: Handle) : Handle = { let buf = llvm_buf_new(); llvm_buf_push(buf, a); buf }
+
+#[doc("""
+One prim. A boxed operator calls its runtime helper; a raw op is a native
+instruction; a runtime entry with a mixed signature has its own emitter;
+every other one is an all-boxed runtime call by name. Note on `and`/`or`:
+`kaix_and`/`kaix_or` are the strict boxed form, both operands
+materialised — behaviourally identical to the C-direct oracle whenever
+both operands are pure. A divergence would only show if the RHS had
+observable effects, which is a property of the KIR lowering, not this
+backend.
+""")]
+pub fn nemit_prim(ctx: Handle, p: PrimOp, cargs: [KVal]) : Handle / Console = match p {
+  KpUnwPush  -> nemit_unw_push(ctx, cargs)
+  KpUnwFiber -> nemit_unw_fiber(ctx)
+  KpUnwPop   -> nemit_unw_pop(ctx, cargs)
+  # `kai_op_field(rec, "name")` is NOT a uniform boxed call: the runtime
+  # `kaix_field(KaiValue* rec, const char* name)` takes the field name as
+  # a raw `i8*` (a global string), not a boxed String — the C-direct
+  # oracle emits `kai_op_field(rec, "name")` with a C string literal.
+  # Lower the record boxed, the name as a global string, mixed signature.
+  KpField    -> nemit_field_read(ctx, "kaix_field", cargs)
+  # `kai_op_field_at(rec, i)` is the constant-index field read: `kaix_field_at
+  # (KaiValue* rec, i32 i) -> ptr`, the same mixed (ptr, i32) shape as
+  # `kaix_tag_eq`. The slot is a `KIntV` the lowering computed from the static
+  # record type. Same incref-on-read contract as `kaix_field`.
+  KpFieldAt  -> nemit_field_at(ctx, cargs)
+  # `kai_op_field_borrow` is the NON-consuming sibling the record-match
+  # decision tree (kir_lower_rec.kai) reads a field through for its equality
+  # tests — same mixed (ptr rec, i8* name) signature, the borrowing runtime
+  # shim (no incref), so a failing arm leaks no field ref.
+  KpFieldBorrow -> nemit_field_read(ctx, "kaix_field_borrow", cargs)
+  # Vec raw element paths — fused inline-record column read / write
+  # (kir_lower_walk plants these; classifier verdict in vec_raw.kai).
+  # Mixed signatures, never the all-boxed fall-through.
+  KpVecPushRecRaw     -> nemit_vec_push_rec(ctx, cargs)
+  KpVecSetRecRaw      -> nemit_vec_set_rec(ctx, cargs)
+  KpVecRead(_)        -> nemit_vec_raw_prim(ctx, p, cargs)
+  KpVecReadField(_)   -> nemit_vec_raw_prim(ctx, p, cargs)
+  KpVecReadFieldBoxed -> nemit_vec_raw_prim(ctx, p, cargs)
+  KpVecPush(_)        -> nemit_vec_raw_prim(ctx, p, cargs)
+  KpVecSet(_)         -> nemit_vec_raw_prim(ctx, p, cargs)
+  KpVecPushRec        -> nemit_vec_raw_prim(ctx, p, cargs)
+  KpVecSetRec         -> nemit_vec_raw_prim(ctx, p, cargs)
+  # `kai_assert_check(cond, msg)` is NOT a uniform boxed call: the runtime
+  # `kaix_assert_check(KaiValue* cond, const char* msg)` returns `void` and
+  # takes the message as a raw `i8*` (a de-escaped global string), not a
+  # boxed String — same mixed shape as the field reads. The KIR lowering
+  # plants the message as a `KStrV` quote-wrapped span; materialise it via
+  # `llvm_build_string_span` (strips quotes, decodes escapes). Mirror of
+  # the C-direct oracle's `kai_assert_check(cond, "...")`.
+  KpAssertCheck          -> nemit_assert_check(ctx, cargs)
+  KpAssertCheckWithValue -> nemit_assert_check_with_value(ctx, cargs)
+  # `kai_tag_eq(slot, tag)` is the variant-tag equality test the shared-tag
+  # match decision tree (kir_lower_variant.kai) emits to distinguish arms
+  # that share a top-level tag (`Branch(Red,..)` vs `Branch(Black,..)`).
+  # NOT a uniform boxed call: `kaix_tag_eq(KaiValue* v, i32 tag) -> ptr`
+  # takes a RAW i32 ctor tag (the `KIntV` operand the lowering planted),
+  # not a boxed Int — same mixed (ptr, i32) shape as `kaix_variant`.
+  KpTagEq -> nemit_tag_eq(ctx, cargs)
+  # Raw (unboxed) ops (KIR mode-slave, kir_lower_raw). These are native LLVM
+  # instructions, NOT boxed `kaix_*` calls, and the box/unbox borders are
+  # the scalar constructor / payload borrow. No RC: a raw operand is never
+  # decref'd, so a multi-use Real never double-frees (the family's bug).
+  KpBox(s)        -> nemit_raw_box_prim(ctx, s, cargs)
+  KpUnbox(s)      -> nemit_raw_unbox_at(ctx, raw_scalar_slot(s), cargs)
+  KpRawUn(op)     -> nemit_raw_unary(ctx, op, cargs)
+  KpRawBin(s, op) -> nemit_raw_bin(ctx, s, op, cargs)
+  KpBin(op)       -> nemit_call_freeing(ctx, nprim_binop_sym(op), nemit_atoms_buf(ctx, cargs))
+  KpUn(op)        -> nemit_call_freeing(ctx, nprim_unop_sym(op), nemit_atoms_buf(ctx, cargs))
+  _               -> nemit_call_freeing(ctx, nprim_runtime_sym(kprim_text(p)), nemit_atoms_buf(ctx, cargs))
+}

@@ -1,0 +1,94 @@
+#[doc("""
+Segment prims and closure calls, with the pointer arrays their arguments
+travel in.
+""")]
+
+import compiler.kir
+import compiler.emit_native_fn
+import compiler.emit_native_call
+
+#[doc("A segment handle's runtime call: `kaix_seg_handle(body, ret, n, clauses)` or `kaix_seg_request(op, n, args)`.")]
+pub fn nemit_seg_prim(ctx: Handle, p: PrimOp, cargs: [KVal]) : Handle / Console = match p {
+  KpSegHandle -> seg_handle_call(ctx, cargs)
+  _           -> seg_request_call(ctx, cargs)
+}
+
+fn seg_handle_call(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [body, ret, ...cls] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i32t = native_ctx_i32t(ctx)
+    ncall_sig4(ctx, "kaix_seg_handle", p, p, p, i32t, p, nemit_atom(ctx, body), nemit_atom(ctx, ret),
+               llvm_const_i32(i32t, list_length(cls)), seg_array(ctx, cls))
+  }
+  _ -> { nemit_unsupported(ctx, "kai_seg_handle takes a body and a return"); nemit_null(ctx) }
+}
+
+fn seg_request_call(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [KIntV(op), ...args] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i32t = native_ctx_i32t(ctx)
+    ncall_sig3(ctx, "kaix_seg_request", p, i32t, i32t, p, llvm_const_i32(i32t, op),
+               llvm_const_i32(i32t, list_length(args)), seg_array(ctx, args))
+  }
+  _ -> { nemit_unsupported(ctx, "kai_seg_request takes a constant op index"); nemit_null(ctx) }
+}
+
+fn seg_array(ctx: Handle, vs: [KVal]) : Handle / Console = {
+  let buf = nemit_atoms_buf(ctx, vs)
+  let arr = nemit_ptr_array(ctx, buf)
+  llvm_buf_free(buf)
+  arr
+}
+
+#[doc("""
+`kaix_closure(ptr thunk, i32 arity, i32 ncaps, ptr* caps) -> ptr`. The
+thunk's address is the lifted-lambda fn (thunk ABI `ptr (ptr, ptr*,
+i32)`), declared on demand. `capbuf` carries the materialised captures.
+""")]
+pub fn nemit_closure_call(ctx: Handle, sym: String, ar: Int, capbuf: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let tptb = llvm_buf_new(); llvm_buf_push(tptb, p); llvm_buf_push(tptb, p); llvm_buf_push(tptb, i32t)
+  let thunkty = llvm_fn_type_n(p, tptb); llvm_buf_free(tptb)
+  let thunk = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, thunkty)
+  let n = llvm_buf_len(capbuf)
+  let caparr = nemit_ptr_array(ctx, capbuf)
+  llvm_buf_free(capbuf)
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, thunk); llvm_buf_push(ab, llvm_const_i32(i32t, ar)); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, caparr)
+  ncall_finish(ctx, "kaix_closure", p, ptb, ab)
+}
+
+#[doc("""
+Materialise a `KaiValue*[]` on the stack from the handles in the C
+buffer `hbuf`: `alloca [n x ptr]`, store each, return the array base
+pointer. n==0 yields a null `ptr` (the ctors take n==0 as "no args"
+and never deref). `hbuf` is read here but NOT freed (the caller owns it).
+
+The `[n x ptr]` storage is allocated in the ENTRY block
+(`llvm_build_alloca_entry`), NOT the current block: a call inside a
+`tcrec`/TRMC goto-loop body would otherwise re-execute the alloca every
+iteration, growing the stack N times and overflowing a fiber's 64 KiB stack
+(issue #668 — `list.map`'s `kaix_apply` over 40 K elements in a fiber). `n`
+is a compile-time constant per call-site, so one fixed-size slot per site is
+reused across iterations, exactly like the C-direct oracle's frame-scoped
+`KaiValue *args[n]`. The stores stay in the current (loop) block — the values
+are loop-variant.
+""")]
+pub fn nemit_ptr_array(ctx: Handle, hbuf: Handle) : Handle / Console = {
+  let n = llvm_buf_len(hbuf)
+  if n == 0 { llvm_const_null(native_ctx_ptrt(ctx)) }
+  else {
+    let arrty = llvm_array_type(native_ctx_ptrt(ctx), n)
+    let arr = llvm_build_alloca_entry(ctx, arrty, "args")
+    nemit_store_array(ctx, arr, arrty, hbuf, 0, n); arr
+  }
+}
+
+fn nemit_store_array(ctx: Handle, arr: Handle, arrty: Handle, hbuf: Handle, i: Int, n: Int) : Unit / Console =
+  if i >= n { () }
+  else {
+    let slot = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), i))
+    llvm_build_store(native_ctx_b(ctx), llvm_buf_get(hbuf, i), slot)
+    nemit_store_array(ctx, arr, arrty, hbuf, i + 1, n)
+  }
