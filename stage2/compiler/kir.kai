@@ -240,7 +240,7 @@ pub type KOp
   | KResume2Op(KVal, KVal, KVal)                # cont, arg, new_state — 2-arg stateful resume as a call
   | KLitOp(KVal)                                 # a bare atom as an op RHS (e.g. `let t = 3`)
 
-#[doc("Which evidence a perform dispatches through: the enclosing fn's frame slot or the innermost handler; the innermost handler alone, for a perform under a `handle` of its instance in the same fn; the cell an alias names, by the alias's written name; or the node a register holds.")]
+#[doc("Which evidence a perform dispatches through: the enclosing fn's frame slot or the innermost handler; the innermost handler alone, for a perform under a `handle` of its instance in the same fn; the cell an alias names, by the register the alias was bound to; or the node a register holds.")]
 pub type KVia = KvAmbient | KvLexical | KvAlias(String) | KvRecv(String)
 
 #[doc("The instance key of the effect `s` at the type arguments `targs`: what a frame slot and an evidence lookup are keyed by.")]
@@ -268,12 +268,17 @@ pub type KStmt
   | KRC(KRCOp, KPos)                 # explicit Perceus op
   | KStore(String, KVal, KPos)       # slot mutation (TCO/TRMC loop assigns, Array writes / Mutable)
   # Effect handler frame markers (design §4.7 effects). `KInstall` pushes
-  # the evidence for `eff` (handler decl `sym`, optional state `init` /
-  # `as`-alias) before the handle body runs; `KPop` pops it on the normal
-  # exit path. They are EXPLICIT markers (not folded into one opaque node)
-  # so the setjmp split lives as an ordinary `KCondBr` both backends read
-  # identically (asu review — the frontier-bug the KIR exists to kill).
-  | KInstall(String, String, Option[KVal], Option[String], KPos)
+  # the evidence for `eff` (handler decl `sym`, optional state `init`)
+  # before the handle body runs; `KPop` pops it on the normal exit path.
+  # They are EXPLICIT markers (not folded into one opaque node) so the
+  # setjmp split lives as an ordinary `KCondBr` both backends read
+  # identically.
+  # The alias is the register its `as` binder was bound to: it holds the
+  # evidence node, and `kir_alias_id_reg` of it the handler id. The env is
+  # one slot per capture of the handle's clauses, in union order: the
+  # register the captured binder lives in at this site, or none when the
+  # binder is not in scope here.
+  | KInstall(String, String, Option[KVal], Option[String], [Option[String]], KPos)
   | KPop(String, String, KPos)       # pop the evidence for `eff` (install-site sym names its frame)
   # Bind a stateful handler's state into the registers its aliases
   # (`state`, `log`, the var cell) were given. Each register is the alias's
@@ -403,7 +408,7 @@ pub type KFnKind = KFnNormal | KFnLambda | KFnClause | KFnCleanup
 # `PCapture` vs `PEnvCapture` is a deliberate split, not an overload: the
 # two read from DIFFERENT physical locations (closure-captures array vs the
 # Ev `env` slot at byte 8) and index DIFFERENT lists (the lambda's own
-# capture order vs the handle's cross-clause union `env_caps`). Encoding
+# capture order vs the handle's cross-clause union). Encoding
 # the physical address in the constructor — not inferred from `KFnKind` at
 # the backend — keeps a KIR reader from conflating the two index spaces.
 pub type KParamOrigin = PDirect(Int) | PCapture(Int) | PEnvCapture(Int) | PResume
@@ -529,15 +534,11 @@ pub type KDefault = KDef(SymId, [KDefOp])
 pub type KDefOp = KDOp(String, String, Int)   # op name → runtime forwarder sym, its param count
 
 # A handler declaration: the effect it handles, its clause-body thunk
-# symbols (one per op), an optional return-clause thunk symbol, and
-# `env_caps` — the cross-clause union of every clause's surface captures
-# (mirror of emit_c's `handle_captures_at`), in the stable order both the
-# install (which fills the Ev `env` array) and the clause prologue (which
-# indexes it via `PEnvCapture`) must agree on. Computed once at lowering
-# so neither backend re-derives it (§5). Empty when no clause captures.
+# symbols (one per op) and an optional return-clause thunk symbol. What
+# the clauses capture rides the install (`KInstall`'s env), resolved at
+# the site that fills it.
 pub type KHandlerDecl = { eff_sym: SymId, sym: String,
-                          op_thunks: [KOpThunk], ret_thunk: Option[String],
-                          env_caps: [String] }
+                          op_thunks: [KOpThunk], ret_thunk: Option[String] }
 
 pub type KOpThunk = KOT(String, String, Int)   # op name → thunk sym, its param count (0: defined in this module)
 
@@ -549,7 +550,7 @@ pub fn kir_op_text(op: String, via: KVia) : String = match via {
   KvRecv(r)  -> string_concat(op, string_concat("#", r))
 }
 
-#[doc("Register an aliased install stashes its handler id under; an aliased perform, and a closure capturing the alias, read it back.")]
+#[doc("Register an aliased install stashes its handler id under, `a` being the register its alias was bound to; an aliased perform, and a closure capturing the alias, read it back.")]
 pub fn kir_alias_id_reg(a: String) : String = string_concat("__alias_id__", a)
 
 #[doc("Register a clause body reads its continuation from — kept outside the user identifier space so a clause-register alloca can never be clobbered by a user binder (e.g. a match payload `Dot(k)`).")]

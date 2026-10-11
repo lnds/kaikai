@@ -24,6 +24,7 @@ import compiler.fn_index
 import compiler.core_prims
 import compiler.fn_csym
 import compiler.emit_shared
+import compiler.handle_caps
 import compiler.enc_unit
 import compiler.emit_reuse_donate
 import compiler.ffi_v2
@@ -52,7 +53,7 @@ pub fn lower_to_kir(raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: Proto
   # The lifted-lambda table is the SAME analysis the emitters run
   # (`collect_decls` over the global-name set) — reused, not re-derived.
   let lc      = collect_decls(raw_decls, lc_new(tab, specs))
-  let st0     = ls_with_unw(ls_new(fns, fnx_build_decls(raw_decls, fns), variants, ctors, lc.lams,
+  let st0     = ls_with_unw(ls_new(fns, fnx_build_decls(raw_decls, fns), variants, ctors, lc.lams, lc.clauses,
                                    kir_const_decls(raw_decls, []), ffi_extern_syms(raw_decls, []),
                                    collect_records(raw_decls), rec_stamps(raw_decls, stamp_ids), regions, raw_binders, target_origin,
                                    tab, specs),
@@ -80,7 +81,7 @@ pub fn lower_to_kir(raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: Proto
   let rs = lower_runner_decls(raw_decls, target_origin, st0, freg)
   KProgram { types: types,
              fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
-             handlers: canon_handler_op_order(lower_handler_decls(lc.clauses, lc.clauses, []), raw_decls),
+             handlers: canon_handler_op_order(lower_handler_decls(lc.clauses), raw_decls),
              install_order: kir_install_order(raw_decls, tab, entry),
              defaults: kir_default_handlers(raw_decls, entry),
              runner_defaults: kir_runner_default_handlers(raw_decls),
@@ -430,26 +431,20 @@ fn lower_captures(caps: [Capture], locals: LocalNames, j: Int, acc: [KParam]) : 
   [c, ...rest] -> lower_captures(rest, locals, j + 1, list_append(acc, [capture_param(kir_capture_name(locals, c), j)]))
 }
 
-# The registers a lambda or clause reads its captures from, in capture order.
-fn capture_names(caps: [Capture], locals: LocalNames) : [String] = map(caps, (c) => kir_capture_name(locals, c))
-
 # A clause's captures become `PEnvCapture(j)` params, where `j` is the
-# capture's index in the HANDLE's cross-clause union (`env_caps`), NOT in
-# the clause's own caps list. The Ev `env` array the install fills is
-# laid out in union order, shared by every clause of the handle, so a
-# clause that captures a subset must still index by the union position.
-# `caps` are the clause's own capture registers; `env_caps` the handle
-# union (resolved for the INDEX).
-fn lower_env_captures(caps: [String], env_caps: [String], acc: [KParam]) : [KParam] / Console = match caps {
+# capture's position in the HANDLE's cross-clause union, NOT in the
+# clause's own caps list: the env the install fills is laid out in union
+# order and shared by every clause of the handle. The position is found by
+# the captured binder's id; the param is named as the clause's body reads it.
+fn lower_env_captures(caps: [Capture], locals: LocalNames, env: [Capture], acc: [KParam]) : [KParam] / Console = match caps {
   [] -> acc
   [c, ...rest] -> {
-    let j = list_index_of_str(env_caps, c, 0)
-    # The clause's caps are a subset of the handle union by construction
-    # (`kir_merge_str_set` unions every clause's caps), so a miss is a
-    # lowering invariant break — fail loud rather than emit `PEnvCapture(-1)`
-    # (an out-of-bounds env read the backend would silently corrupt on).
-    let _ = if j < 0 { eprint(cat2("kir: clause capture not in handle union: ", c)) } else { () }
-    lower_env_captures(rest, env_caps, list_append(acc, [env_capture_param(c, j)]))
+    let j = capture_index(env, c)
+    # A clause's captures are a subset of its handle's union by construction,
+    # so a miss is a lowering invariant break: fail loud rather than emit an
+    # out-of-bounds env read.
+    let _ = if j < 0 { eprint(cat2("kir: clause capture not in handle union: ", kir_capture_name(locals, c))) } else { () }
+    lower_env_captures(rest, locals, env, list_append(acc, [env_capture_param(kir_capture_name(locals, c), j)]))
   }
 }
 
@@ -458,42 +453,6 @@ fn lower_env_captures(caps: [String], env_caps: [String], acc: [KParam]) : [KPar
 # every read and the enclosing scope releases it.
 fn env_capture_param(name: String, j: Int) : KParam =
   KParam { name: name, slot: SBoxed, mode: KBorrow, origin: PEnvCapture(j) }
-
-# Index of `s` in `xs`, or -1 if absent. Local mirror to keep this off
-# the util import surface (the clause caps are always a subset of the
-# handle union, so the -1 is a should-not-happen defensive fallback).
-fn list_index_of_str(xs: [String], s: String, i: Int) : Int = match xs {
-  [] -> 0 - 1
-  [h, ...rest] -> if h == s { i } else { list_index_of_str(rest, s, i + 1) }
-}
-
-# The cross-clause union of every clause's captures for the handle at a
-# position inside the unit `enc` — mirror of emit_c's `handle_captures_at`.
-# The enclosing unit is part of the key: position alone merges the captures
-# of two unrelated handles that happen to share a line and column. Stable
-# "first-occurrence-wins" order, shared by the install (env fill) and the
-# clause prologue (env index) so both agree by construction.
-fn kir_handle_captures_at(cls: [ClauseInfo], enc: EncFn, hline: Int, hcol: Int) : [String] = match cls {
-  [] -> []
-  [c, ...rest] -> match c {
-    CI(line, col, _, _, _, _, _, enc_fn, caps, _, _) ->
-      if line == hline and col == hcol and enc_same(enc_fn, enc) {
-        kir_merge_str_set(capture_names(caps, kir_body_locals(clause_locals(c))), kir_handle_captures_at(rest, enc, hline, hcol))
-      } else {
-        kir_handle_captures_at(rest, enc, hline, hcol)
-      }
-  }
-}
-
-# Stable-order union of two string lists (mirror of emit_c's
-# `merge_string_set`): every element of `a` not already in `b`, prepended
-# in order, then `b`. Field order MUST match across install/read.
-fn kir_merge_str_set(a: [String], b: [String]) : [String] = match a {
-  [] -> b
-  [h, ...rest] ->
-    if list_has(b, h) { kir_merge_str_set(rest, b) }
-    else { [h, ...kir_merge_str_set(rest, b)] }
-}
 
 fn param_ids(params: [Param]) : [LocalId] = map(params, (p) => p.binder.id)
 
@@ -519,15 +478,14 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt, body_fns:
     let is_fin = is_lifecycle_clause(head)
     let sym = clause_sym(c)
     let locals = kir_body_locals(clause_locals(c))
-    let cnames = capture_names(caps, locals)
     let owned = if is_fin { [] } else { unw_clause_seeds(c) }
     let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, clause_unit(c), entry_params(params, entry_captures(caps, locals)), locals, body_fns),
                                        unw_frame(st0.unw, owned, owned, body)))
     # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
-    let env_caps = kir_handle_captures_at(all_cls, enc_fn, line, col)
+    let env = handle_captures_at(all_cls, enc_fn, line, col)
     # A `finally` has no surface params and never resumes: captures only.
     let own_params = if is_fin { [] } else { lower_clause_params(params) }
-    let kparams = list_append(own_params, lower_env_captures(cnames, env_caps, []))
+    let kparams = list_append(own_params, lower_env_captures(caps, locals, env, []))
     match lower_expr(body, if stateful { bind_self_state(st) } else { st }) { LRes(val, st1) -> {
       let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
       check_resume_one_shot(sym, blocks)
@@ -654,37 +612,36 @@ fn find_op_thunk(thunks: [KOpThunk], op: String) : Option[KOpThunk] = match thun
   [KOT(nm, sym, n), ...rest] -> if nm == op { Some(KOT(nm, sym, n)) } else { find_op_thunk(rest, op) }
 }
 
-# One `KHandlerDecl` per (effect, handler-site) the clauses belong to.
-# Groups clauses by their (line, col) handler key, mapping each op to its
-# clause-thunk symbol so a `KInstall` resolves the right clause set. Each
-# decl carries `env_caps` (the handle's cross-clause capture union) so the
-# native install fills the Ev `env` array in the order the clause prologue
-# (`PEnvCapture`) indexes. `all_cls` is the whole program's clause list
-# (the union must see every clause of the handle, not just the head).
-fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
+# One `KHandlerDecl` per handle the clauses belong to. A handle is the unit
+# it sits in and its position; its clauses are gathered by that site, and
+# each op maps to its clause-thunk symbol so a `KInstall` resolves the
+# right clause set.
+fn lower_handler_decls(clauses: [ClauseInfo]) : [KHandlerDecl] = map(handler_sites(clauses, []), (h) => h.decl)
+
+# A handle's decl under construction, and the site it belongs to.
+type HandlerSite = { enc: EncFn, line: Int, col: Int, decl: KHandlerDecl }
+
+fn handler_sites(clauses: [ClauseInfo], acc: [HandlerSite]) : [HandlerSite] = match clauses {
   [] -> acc
   [CI(line, col, _, head, _, _, _, enc_fn, _, _, esym), ...rest] ->
     # `finally` carries no Ev field — it is armed on the evidence node, not
     # stored as an op thunk — so it never joins `op_thunks`.
-    if is_lifecycle_clause(head) {
-      lower_handler_decls(rest, all_cls, acc)
-    } else {
+    if is_lifecycle_clause(head) { handler_sites(rest, acc) }
+    else {
       let op = clause_head_word(head)
-      let sym = user_handler_sym(enc_fn.sym, line, col)
-      let ot  = KOT(op, user_clause_sym(enc_fn.sym, line, col, op), 0)
-      let ecaps = kir_handle_captures_at(all_cls, enc_fn, line, col)
-      lower_handler_decls(rest, all_cls, hdecl_add(acc, esym, sym, ot, ecaps))
+      let ot = KOT(op, user_clause_sym(enc_fn.sym, line, col, op), 0)
+      handler_sites(rest, site_add(acc, enc_fn, line, col, esym, ot))
     }
 }
 
-# Add an op-thunk to the matching handler decl, or create the decl. The
-# `env_caps` of the first clause that opens the decl wins (all clauses of
-# one handle resolve the same union, so later ops carry the same list).
-fn hdecl_add(acc: [KHandlerDecl], esym: SymId, sym: String, ot: KOpThunk, ecaps: [String]) : [KHandlerDecl] = match acc {
-  [] -> [KHandlerDecl { eff_sym: esym, sym: sym, op_thunks: [ot], ret_thunk: None, env_caps: ecaps }]
+# Add an op-thunk to the decl of its site, or open the site's decl.
+fn site_add(acc: [HandlerSite], enc: EncFn, line: Int, col: Int, esym: SymId, ot: KOpThunk) : [HandlerSite] = match acc {
+  [] -> [HandlerSite { enc: enc, line: line, col: col,
+                       decl: KHandlerDecl { eff_sym: esym, sym: user_handler_sym(enc.sym, line, col), op_thunks: [ot], ret_thunk: None } }]
   [h, ...rest] ->
-    if h.sym == sym { [KHandlerDecl { ...h, op_thunks: list_append(h.op_thunks, [ot]) }, ...rest] }
-    else { [h, ...hdecl_add(rest, esym, sym, ot, ecaps)] }
+    if h.line == line and h.col == col and enc_same(h.enc, enc) {
+      [HandlerSite { ...h, decl: KHandlerDecl { ...h.decl, op_thunks: list_append(h.decl.op_thunks, [ot]) } }, ...rest]
+    } else { [h, ...site_add(rest, enc, line, col, esym, ot)] }
 }
 
 

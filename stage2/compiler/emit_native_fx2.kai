@@ -26,25 +26,27 @@ import compiler.emit_native_call
 # alloca'd, then `kaix_evidence_push_with_jmp(node, eff, ev, jmp, discard)`
 # so the op site can find the landing pad on a discard. `handlers` threads
 # the program's handler decls so the op→clause-thunk map resolves.
-pub fn nemit_install(ctx: Handle, eff: String, sym: String, init: Option[KVal], alias: Option[String], handlers: [KHandlerDecl]) : Unit / Console =
+pub fn nemit_install(ctx: Handle, eff: String, sym: String, init: Option[KVal], alias: Option[String],
+                     env: [Option[String]], handlers: [KHandlerDecl]) : Unit / Console =
   match nfx_find_handler(handlers, sym) {
     None -> nemit_unsupported(ctx, cat2("KInstall: no handler decl for ", sym))
-    Some(h) -> nemit_install_with(ctx, eff, sym, init, alias, h)
+    Some(h) -> nemit_install_with(ctx, eff, sym, init, alias, env, h)
   }
 
 # `eff` names the effect (the global string the runtime keys by-name lookups
 # on); `sym` names the install SITE (which entry-block alloca holds THIS
 # frame's Ev/node/jmp_buf/env). Two nested same-effect handles share `eff`
 # but never `sym`, so each pushes its own KaiEvidence node (no #789 cycle).
-fn nemit_install_with(ctx: Handle, eff: String, sym: String, init: Option[KVal], alias: Option[String], h: KHandlerDecl) : Unit / Console = {
+fn nemit_install_with(ctx: Handle, eff: String, sym: String, init: Option[KVal], alias: Option[String],
+                      env: [Option[String]], h: KHandlerDecl) : Unit / Console = {
   let ev = native_ctx_find_reg(ctx, nfx_ev_reg(sym))
   # handler_id = kaix_fresh_handler_id() : i64; store into Ev field 0.
   # (i64-returning — NOT the all-boxed `ptr()` `nemit_call0` assumes.)
   let hid = ncall_sig0(ctx, "kaix_fresh_handler_id", native_ctx_i64t(ctx))
   let _h0 = ncall_sig2(ctx, "kaix_ev_set_handler_id", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_i64t(ctx), ev, hid)
-  # Aliased install (`with Eff as a`): box the handler_id and stash it
-  # under `__alias_id__<a>` so an `op@a` perform resolves to THIS instance
-  # by id. Mirrors emit_llvm's sentinel local + the C `kai_alias_<a>_id`.
+  # Aliased install (`with Eff as a`): box the handler_id and stash it in
+  # the alias's id register so an `op@a` perform resolves to THIS instance
+  # by id.
   nemit_install_alias(ctx, alias, hid)
   # Stateful handler: seed the `state` slot (Ev field 2, byte 16) with the
   # `with Eff(init)` value. `kaix_clause_state_set(ev, init)` writes the
@@ -52,10 +54,10 @@ fn nemit_install_with(ctx: Handle, eff: String, sym: String, init: Option[KVal],
   # handlers carry no `init` — the slot stays NULL (subset 2a unchanged).
   nemit_install_state(ctx, ev, init)
   # Clause-capture env: fill the env array (one slot per handle-union
-  # capture, loaded by surface name from the install frame's locals) and
-  # point Ev field 1 (byte 8) at it. No captures => leave env NULL, the
-  # clause prologue never reads it (mirror of emit_c's empty-env path).
-  nemit_install_env(ctx, sym, ev, h.env_caps)
+  # capture, loaded from the register the install names for it) and point
+  # Ev field 1 (byte 8) at it. No captures => leave env NULL, the clause
+  # prologue never reads it.
+  nemit_install_env(ctx, sym, ev, env)
   # Each op fn-ptr at field (nfx_op_base + i): declare the clause thunk,
   # store its address with kaix_ev_set_op(ev, field, fn).
   nemit_install_ops(ctx, ev, h.op_thunks, 0)
@@ -91,39 +93,29 @@ fn nemit_install_state(ctx: Handle, ev: Handle, init: Option[KVal]) : Unit / Con
 }
 
 # Fill the clause-capture env array and point Ev field 1 at it. One slot
-# per handle-union capture (`env_caps`, the order the clause prologue's
-# `PEnvCapture(j)` indexes), each loaded by surface NAME from the install
-# frame's locals. The slot index MUST stay 1:1 with the union position the
-# clause reads, so we iterate the FULL union with an incrementing index and
-# write a slot for EVERY entry — a NULL for a name not in scope at the
-# install (the emit_c parity: its env struct's typedef carries the whole
-# union, the install's `{0}` zero-init leaves an out-of-scope field NULL,
-# and the read side never observes the gap because no clause that omits the
-# capture reads that slot). The alloca holds exactly the union. No
-# captures => leave Ev field 1 NULL (the clause prologue never reads it).
-fn nemit_install_env(ctx: Handle, sym: String, ev: Handle, env_caps: [String]) : Unit / Console = match env_caps {
+# per handle-union capture, in the order the clause prologue's
+# `PEnvCapture(j)` indexes: slot `j` takes the register the install names
+# for capture `j`, a BORROW (the dup lives on the clause read), or NULL
+# for a capture not in scope at the install, which no clause that runs
+# from here reads. No captures => leave Ev field 1 NULL.
+fn nemit_install_env(ctx: Handle, sym: String, ev: Handle, slots: [Option[String]]) : Unit / Console = match slots {
   [] -> ()
   _  -> {
     let env = native_ctx_find_reg(ctx, nfx_env_reg(sym))
-    nemit_install_env_fill(ctx, env, env_caps, 0)
+    nemit_install_env_fill(ctx, env, slots, 0)
     # `kaix_ev_set_env(ev, env)` writes byte 8 (Ev field 1).
     let _s = ncall_sig2(ctx, "kaix_ev_set_env", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), ev, env)
     ()
   }
 }
 
-# Stamp each union capture into env slot `j` (j = its union position, so
-# install and the clause `PEnvCapture(j)` read agree by index). The value
-# is the install frame's local register for that surface name — a BORROW
-# (no dup here; emit_c's `_env.kai_<c> = kai_<c>` is likewise a plain field
-# copy, the dup lives on the clause read). A name NOT bound at the install
-# (out of scope here — emit_c filters it via `list_filter_in(.., lcs)` and
-# leaves the env field zero) gets a NULL slot, keeping the index aligned
-# without emitting a load from a non-existent register.
-fn nemit_install_env_fill(ctx: Handle, env: Handle, caps: [String], j: Int) : Unit / Console = match caps {
+fn nemit_install_env_fill(ctx: Handle, env: Handle, slots: [Option[String]], j: Int) : Unit / Console = match slots {
   [] -> ()
   [c, ...rest] -> {
-    let v = if native_ctx_reg_slot(ctx, c) < 0 { llvm_const_null(native_ctx_ptrt(ctx)) } else { nemit_load_reg(ctx, c) }
+    let v = match c {
+      Some(reg) -> nemit_load_reg(ctx, reg)
+      None      -> llvm_const_null(native_ctx_ptrt(ctx))
+    }
     let _s = ncall_sig3(ctx, "kaix_env_set", native_ctx_voidt(ctx),
                         native_ctx_ptrt(ctx), native_ctx_i64t(ctx), native_ctx_ptrt(ctx),
                         env, llvm_const_int(native_ctx_i64t(ctx), j), v)
@@ -131,7 +123,7 @@ fn nemit_install_env_fill(ctx: Handle, env: Handle, caps: [String], j: Int) : Un
   }
 }
 
-# Box the freshly-minted handler_id and store it under `__alias_id__<a>`
+# Box the freshly-minted handler_id and store it in the alias's id register
 # (the alloca reserved by `nfx_reserve_alias`) for an aliased install. An
 # `op@a` perform unboxes it to resolve THIS instance by id. No alias = skip.
 fn nemit_install_alias(ctx: Handle, alias: Option[String], hid: Handle) : Unit / Console = match alias {
