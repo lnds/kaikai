@@ -17,9 +17,9 @@
 # releasing it would over-free.
 
 import compiler.ast
-import compiler.util
 import compiler.infer
 import compiler.perceus_reads
+import compiler.ret_slots
 
 #[doc("What a binder's reads do with its birth reference: nothing reads it, the last read hands it on, or every read dups and it stays owed.")]
 pub type PcsFate = FUnread | FTransfer | FResidual
@@ -32,23 +32,23 @@ pub type PcsPayer
   | PyExit
   | PyInline
 
-#[doc("The name sets a param's payer depends on: reads that hand the reference on, and reads forced to dup.")]
-pub type PcsParamSets = { moved: [String], forced: [String] }
+#[doc("The binder sets a param's payer depends on: reads that hand the reference on, and reads forced to dup.")]
+pub type PcsParamSets = { moved: [Binder], forced: [Binder] }
 
 #[doc("Classify a binder's reads from its last-use class. `forced` dups every read; `moved` hands the reference on at the last read whatever the count. A raw read leaves the box alone, so a binder whose last read is raw never hands it on.")]
-pub fn pcs_fate(lu: LU, nm: String, uses: UseIx, moved: Bool, forced: Bool) : PcsFate = match lu {
-  LUUnused(_)   -> FUnread
-  LUBlocked(_)  -> FResidual
-  LUAt(_, l, c) ->
-    if forced or pcs_read_raw_at(nm, uses, l, c) { FResidual }
+pub fn pcs_fate(lu: LastUse, b: LocalId, uses: UseIx, moved: Bool, forced: Bool) : PcsFate = match lu {
+  LuUnused   -> FUnread
+  LuBlocked  -> FResidual
+  LuAt(l, c) ->
+    if forced or pcs_read_raw_at(b, uses, l, c) { FResidual }
     else if moved { FTransfer }
-    else if pcs_read_count(nm, uses) >= 2 { FResidual }
+    else if pcs_read_count(b, uses) >= 2 { FResidual }
     else { FTransfer }
 }
 
-#[doc("`pcs_fate` of a name over a use table.")]
-pub fn pcs_fate_of(nm: String, uses: UseIx, moved: Bool, forced: Bool) : PcsFate =
-  pcs_fate(last_use_for(nm, uses), nm, uses, moved, forced)
+#[doc("`pcs_fate` of a binder over a use table.")]
+pub fn pcs_fate_of(b: LocalId, uses: UseIx, moved: Bool, forced: Bool) : PcsFate =
+  pcs_fate(last_use_for(b, uses), b, uses, moved, forced)
 
 #[doc("True when every read dups and the birth reference stays owed.")]
 pub fn pcs_fate_residual(f: PcsFate) : Bool = match f {
@@ -62,16 +62,16 @@ pub fn pcs_fate_transfers(f: PcsFate) : Bool = match f {
   _         -> false
 }
 
-#[doc("True when `nm` is never read in `uses`.")]
-pub fn pcs_unread(nm: String, uses: UseIx) : Bool = match last_use_for(nm, uses) {
-  LUUnused(_) -> true
-  _           -> false
+#[doc("True when `b` is never read in `uses`.")]
+pub fn pcs_unread(b: LocalId, uses: UseIx) : Bool = match last_use_for(b, uses) {
+  LuUnused -> true
+  _        -> false
 }
 
 #[doc("True when `lu` puts the last read at `(line, col)`.")]
-pub fn pcs_lu_at(lu: LU, line: Int, col: Int) : Bool = match lu {
-  LUAt(_, ll, lc) -> ll == line and lc == col
-  _               -> false
+pub fn pcs_lu_at(lu: LastUse, line: Int, col: Int) : Bool = match lu {
+  LuAt(ll, lc) -> ll == line and lc == col
+  _            -> false
 }
 
 fn pcs_payer_tag(p: PcsPayer) : Int = match p {
@@ -86,24 +86,24 @@ fn pcs_payer_tag(p: PcsPayer) : Int = match p {
 pub fn pcs_pays(p: PcsPayer, want: PcsPayer) : Bool = pcs_payer_tag(p) == pcs_payer_tag(want)
 
 #[doc("The payer of a param's birth reference. A never-read param pays on entry even when the owned-in-scope move selected it.")]
-pub fn pcs_param_payer(nm: String, uses: UseIx, sets: PcsParamSets) : PcsPayer =
-  match pcs_fate_of(nm, uses, list_has(sets.moved, nm), list_has(sets.forced, nm)) {
+pub fn pcs_param_payer(b: LocalId, uses: UseIx, sets: PcsParamSets) : PcsPayer =
+  match pcs_fate_of(b, uses, pcs_has(sets.moved, b), pcs_has(sets.forced, b)) {
     FUnread   -> PyEntry
     FResidual -> PyExit
     FTransfer -> PyRead
   }
 
 #[doc("The payer of a block `let`'s birth reference. A never-read `let` is paid inline by the emitter exactly when `pcs_let_paid_inline` holds for its rhs, and at block exit otherwise.")]
-pub fn pcs_let_payer(nm: String, rhs: Expr, uses: UseIx, moved: Bool, forced: Bool) : PcsPayer =
-  match pcs_fate_of(nm, uses, moved, forced) {
+pub fn pcs_let_payer(b: LocalId, rhs: Expr, uses: UseIx, moved: Bool, forced: Bool) : PcsPayer =
+  match pcs_fate_of(b, uses, moved, forced) {
     FUnread   -> if pcs_let_paid_inline(rhs) { PyInline } else { PyExit }
     FResidual -> PyExit
     FTransfer -> PyRead
   }
 
 #[doc("The payer of a match-arm binder's bind-time incref; `moved` when the rewrite moves its reads, `forced` when it dups every read.")]
-pub fn pcs_arm_payer(nm: String, uses: UseIx, moved: Bool, forced: Bool) : PcsPayer =
-  match pcs_fate_of(nm, uses, moved, forced) {
+pub fn pcs_arm_payer(b: LocalId, uses: UseIx, moved: Bool, forced: Bool) : PcsPayer =
+  match pcs_fate_of(b, uses, moved, forced) {
     FUnread   -> PyExit
     FResidual -> PyExit
     FTransfer -> PyRead
@@ -122,7 +122,7 @@ pub fn pcs_let_paid_inline(rhs: Expr) : Bool = match rhs.kind {
   EUnit            -> true
   ECall(_, _)      -> true
   EList(_)         -> true
-  ERecordLit(_, _, _) -> true
+  ERecordLit(_, _) -> true
   ERange(_, _, _)  -> true
   ELambda(_, _)    -> true
   EBinop(_, _, _)  -> true
@@ -130,12 +130,12 @@ pub fn pcs_let_paid_inline(rhs: Expr) : Bool = match rhs.kind {
   _                -> false
 }
 
-#[doc("The names in `names` whose birth reference `want` pays.")]
-pub fn pcs_names_paid_by(names: [String], uses: UseIx, sets: PcsParamSets, want: PcsPayer) : [String] = match names {
-  []            -> []
-  [nm, ...rest] -> {
+#[doc("The binders in `names` whose birth reference `want` pays.")]
+pub fn pcs_names_paid_by(names: [Binder], uses: UseIx, sets: PcsParamSets, want: PcsPayer) : [Binder] = match names {
+  []           -> []
+  [b, ...rest] -> {
     let tl = pcs_names_paid_by(rest, uses, sets, want)
-    if pcs_pays(pcs_param_payer(nm, uses, sets), want) { [nm, ...tl] } else { tl }
+    if pcs_pays(pcs_param_payer(b.id, uses, sets), want) { [b, ...tl] } else { tl }
   }
 }
 
@@ -144,8 +144,8 @@ pub fn pcs_param_drops(params: [Param], uses: UseIx, sets: PcsParamSets, want: P
   []           -> []
   [p, ...rest] -> {
     let tl = pcs_param_drops(rest, uses, sets, want)
-    if pcs_pays(pcs_param_payer(p.pname, uses, sets), want) {
-      [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...tl]
+    if pcs_pays(pcs_param_payer(p.binder.id, uses, sets), want) {
+      [pcs_make_drop_stmt(p.binder.id, p.pline, p.pcol), ...tl]
     } else { tl }
   }
 }
@@ -172,12 +172,12 @@ fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
                  ty: body.ty, mode: body.mode,  site: body.site }
     [_, ...__] -> {
       let ret_let = SLet(
-        Pattern { pkind: PBind("__pcs_ret"), line: body.line, col: body.col },
+        Pattern { pkind: PBind(ret_slot_binder(RsFn)), line: body.line, col: body.col },
         None,
         body
       )
       let stmts = list_append(entry, [ret_let, ...exit_])
-      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col,
+      let tail = Expr { kind: ELocal(ret_slot_local(RsFn)), line: body.line, col: body.col,
                         ty: body.ty, mode: body.mode,  site: body.site }
       Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col,
              ty: body.ty, mode: body.mode,  site: body.site }
@@ -185,13 +185,13 @@ fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
   }
 }
 
-#[doc("A `__perceus_drop(nm)` statement.")]
-pub fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
+#[doc("A `__perceus_drop(b)` statement.")]
+pub fn pcs_make_drop_stmt(b: LocalId, ln: Int, cl: Int) : Stmt =
   SExprStmt(Expr {
     kind: ECall(
       Expr { kind: EMark(MkDrop), line: ln, col: cl,
              ty: None, mode: MUnknown , site: 0 },
-      [Expr { kind: EVar(nm), line: ln, col: cl,
+      [Expr { kind: ELocal(b), line: ln, col: cl,
               ty: None, mode: MUnknown , site: 0 }]
     ),
     line: ln, col: cl, ty: None, mode: MUnknown

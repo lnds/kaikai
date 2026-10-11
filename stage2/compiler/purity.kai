@@ -6,9 +6,8 @@ LOWERED body. A row-pure function may still allocate boxes and touch
 refcounts — both are memory writes — so stamping `memory(none)` from the
 row alone would be a lie and a miscompile. The confirmation therefore
 reads the lowered body directly and never trusts the row: post-perceus
-the RC ops are explicit `__perceus_dup` / `__perceus_drop` calls, the
-reuse-alloc marks are `__perceus_reuse_*`, and constructors / list /
-record / range literals are the box allocations.
+the RC ops and the reuse-allocs are explicit mark calls, and constructors /
+list / record / range literals are the box allocations.
 
 A function earns `PConst` (→ LLVM `memory(none)`, C `__attribute__((const))`)
 iff its lowered body performs NO memory access at all — no allocation, no
@@ -41,51 +40,51 @@ walk total.
 """)]
 
 import compiler.ast
-import compiler.sym_read
-import compiler.util
+import compiler.written
+import compiler.symtab
+import compiler.spec_names
+import compiler.entry
 import compiler.fnreg
+import compiler.core_builtins
 
 #[doc("Confirmed purity level of a function's lowered body. `PImpure` is the bottom: it allocates, touches RC, performs an effect, mutates, reads through a pointer, or calls something not confirmed `PConst`. `PConst` reads no memory at all — its result depends only on its raw scalar arguments, so it maps to LLVM `memory(none)` / C `__attribute__((const))`.")]
 pub type Purity = PImpure | PConst
 
-#[doc("One row of the purity side table: the function's declared name, its module origin, and the confirmed verdict. Keyed by (name, mo) so a cross-module lookup matches the emitter's symbol identity.")]
-pub type PurityMark = PM(String, Option[String], Purity)
+#[doc("One row of the purity side table: the function's identity, its module origin, and the confirmed verdict.")]
+pub type PurityMark = PM(FnId, Option[String], Purity)
 
-pub fn pmark_name(m: PurityMark) : String = match m { PM(n, _, _) -> n }
+#[doc("The function a purity mark is about.")]
+pub fn pmark_fn(m: PurityMark) : FnId = match m { PM(f, _, _) -> f }
 pub fn pmark_mo(m: PurityMark) : Option[String] = match m { PM(_, mo, _) -> mo }
 pub fn pmark_verdict(m: PurityMark) : Purity = match m { PM(_, _, v) -> v }
 
 # ---- entry point ---------------------------------------------------
 
-#[doc("Confirm the purity of every top-level function in `decls`, returning the side table both backends read to stamp attributes. Runs the intraprocedural body scan once per fn, then iterates the interprocedural call-graph constraint to a least fixed point.")]
-pub fn purity_analyze(decls: [Decl]) : [PurityMark] {
-  let cands = pty_collect_candidates(decls, [])
+#[doc("Confirm the purity of every top-level function in `decls`, returning the side table both backends read to stamp attributes. Runs the intraprocedural body scan once per fn, then iterates the interprocedural call-graph constraint to a least fixed point. `entry` is the program's entry point.")]
+pub fn purity_analyze(decls: [Decl], entry: SymId) : [PurityMark] {
+  let cands = pty_collect_candidates(decls, entry, [])
   pty_purity_fixpoint(cands, pty_seed_verdicts(cands, []))
 }
 
-#[doc("Print one grep-friendly line per ROOT-FILE purity mark (`<name> -> const|impure`), the golden format the `--dump-purity` fixtures pin. Stdlib marks (module origin `Some`) are omitted so a fixture pins only the functions it declares.")]
-pub fn dump_purity_marks(marks: [PurityMark]) : Unit / Console = match marks {
+#[doc("Print one grep-friendly line per ROOT-FILE purity mark (`<name> -> const|impure`), the golden format the `--dump-purity` fixtures pin. Stdlib marks (module origin `Some`) are omitted so a fixture pins only the functions it declares. The name is the one the function is emitted under.")]
+pub fn dump_purity_marks(marks: [PurityMark], tab: SymTab, specs: SpecNames) : Unit / Console = match marks {
   [] -> ()
-  [m, ...rest] -> { pty_dump_one(m); dump_purity_marks(rest) }
+  [m, ...rest] -> { pty_dump_one(m, tab, specs); dump_purity_marks(rest, tab, specs) }
   _ -> ()
 }
 
-fn pty_dump_one(m: PurityMark) : Unit / Console = match m {
-  PM(_, None, _)    -> print(pty_purity_mark_line(m))
+fn pty_dump_one(m: PurityMark, tab: SymTab, specs: SpecNames) : Unit / Console = match m {
+  PM(f, None, v)    -> print("#{fn_emit_name(tab, specs, f)} -> #{pty_purity_str(v)}")
   PM(_, Some(_), _) -> ()
-}
-
-fn pty_purity_mark_line(m: PurityMark) : String = match m {
-  PM(n, _, v) -> concat_all([n, " -> ", pty_purity_str(v)])
 }
 
 fn pty_purity_str(v: Purity) : String = match v { PConst -> "const"  PImpure -> "impure" }
 
-#[doc("Look up the confirmed purity of `(name, mo)` in the table; `PImpure` when absent (the conservative default for anything the pass did not confirm).")]
-pub fn purity_of(marks: [PurityMark], name: String, mo: Option[String]) : Purity {
+#[doc("Look up the confirmed purity of the function `f` in the table; `PImpure` when absent (the conservative default for anything the pass did not confirm).")]
+pub fn purity_of(marks: [PurityMark], f: FnId) : Purity {
   match marks {
     [] -> PImpure
-    [PM(n, m, v), ...rest] -> if n == name and mo_eq(m, mo) { v } else { purity_of(rest, name, mo) }
+    [PM(g, _, v), ...rest] -> if fnid_eq(f, g) { v } else { purity_of(rest, f) }
     _ -> PImpure
   }
 }
@@ -94,21 +93,11 @@ pub fn purity_of(marks: [PurityMark], name: String, mo: Option[String]) : Purity
 # variant inside the cons pattern: the native backend miscompiles that
 # nested-tag shape (both arms match), which here would stamp every fn
 # const — a silent miscompile of every downstream program.
-#[doc("The emitted C symbols (`c_sym(name, mo)`) of every `PConst` function, the set both backends test to stamp `memory(none)` / `__attribute__((const))`. Keying by the shared symbol lets the native backend (which holds only `KFn.sym`) and the C backend (which holds name + mo) test the same identity.")]
-pub fn purity_const_syms(marks: [PurityMark]) : [String] = match marks {
+#[doc("Every `PConst` function, by identity.")]
+pub fn purity_const_fns(marks: [PurityMark]) : [FnId] = match marks {
   [] -> []
-  [PM(n, mo, v), ...rest] ->
-    if pty_is_const(v) { [pty_c_sym(n, mo), ...purity_const_syms(rest)] }
-    else { purity_const_syms(rest) }
+  [PM(f, _, v), ...rest] -> if pty_is_const(v) { [f, ...purity_const_fns(rest)] } else { purity_const_fns(rest) }
   _ -> []
-}
-
-# Mirror of `emit_shared.c_sym` (which the bundle orders AFTER this file,
-# so it cannot be imported): the emitted symbol is the bare name at the
-# root module, else `<mo>__<name>`.
-fn pty_c_sym(name: String, mo: Option[String]) : String = match mo {
-  None    -> name
-  Some(m) -> string_concat(m, string_concat("__", name))
 }
 
 # ---- candidate collection ------------------------------------------
@@ -116,29 +105,29 @@ fn pty_c_sym(name: String, mo: Option[String]) : String = match mo {
 # A candidate carries the fn identity, whether its ABI is all-raw
 # (`classify_unbox_sig` returned an all-raw signature), and the local
 # body scan result: `LImpure` (a memory access the scan found directly)
-# or `LConst(callees)` (const iff every named callee confirms `PConst`).
-type Candidate = Cand(String, Option[String], Bool, Local)
-type Local = LImpure | LConst([String])
+# or `LConst(callees)` (const iff every callee confirms `PConst`).
+type Candidate = Cand(FnId, Option[String], Bool, Local)
+type Local = LImpure | LConst([FnId])
 
-fn pty_collect_candidates(decls: [Decl], acc: [Candidate]) : [Candidate] =
-  list_reverse(pty_collect_candidates_rev(decls, acc))
+fn pty_collect_candidates(decls: [Decl], entry: SymId, acc: [Candidate]) : [Candidate] =
+  list_reverse(pty_collect_candidates_rev(decls, entry, acc))
 
-fn pty_collect_candidates_rev(decls: [Decl], acc: [Candidate]) : [Candidate] {
+fn pty_collect_candidates_rev(decls: [Decl], entry: SymId, acc: [Candidate]) : [Candidate] {
   match decls {
     [] -> acc
-    [d, ...rest] -> match pty_cand_of_decl(d) {
-      Some(c) -> pty_collect_candidates_rev(rest, [c, ...acc])
-      None    -> pty_collect_candidates_rev(rest, acc)
+    [d, ...rest] -> match pty_cand_of_decl(d, entry) {
+      Some(c) -> pty_collect_candidates_rev(rest, entry, [c, ...acc])
+      None    -> pty_collect_candidates_rev(rest, entry, acc)
     }
     _ -> acc
   }
 }
 
-fn pty_cand_of_decl(d: Decl) : Option[Candidate] {
+fn pty_cand_of_decl(d: Decl, entry: SymId) : Option[Candidate] {
   match d {
-    DFn(_, name, tparams, params, opt_ret, row, body, _, _, mo, _) -> {
-      let raw = pty_sig_is_all_raw(name, mo, tparams, params, opt_ret, row, body)
-      Some(Cand(name, mo, raw, pty_scan_body(body)))
+    DFn(_, fid, tparams, params, opt_ret, row, body, _, _, mo) -> {
+      let raw = pty_sig_is_all_raw(is_entry(entry, fid), tparams, params, opt_ret, row, body)
+      Some(Cand(fid, mo, raw, pty_scan_body(body)))
     }
     _ -> None
   }
@@ -149,9 +138,9 @@ fn pty_cand_of_decl(d: Decl) : Option[Candidate] {
 # The return being raw is implied by the classification's scalar-return
 # branch; we re-check the param mask so a boxed-param raw-return fn
 # (which reads its pointer param) is excluded.
-fn pty_sig_is_all_raw(name: String, mo: Option[String], tparams: [String], params: [Param],
+fn pty_sig_is_all_raw(entry: Bool, tparams: [String], params: [Param],
                   opt_ret: Option[TypeExpr], row: RowExpr, body: Expr) : Bool {
-  match classify_unbox_sig(name, mo, tparams, params, opt_ret, row, body) {
+  match classify_unbox_sig(entry, tparams, params, opt_ret, row, body) {
     None -> false
     Some(US(_, ret_t, mask)) -> ty_is_unboxable_t(ret_t) and pty_all_true(mask) and list_length(mask) > 0
   }
@@ -166,21 +155,22 @@ fn pty_all_true(bs: [Bool]) : Bool = match bs {
 # ---- intraprocedural body scan -------------------------------------
 
 # Scan a lowered body into `LImpure` (a direct memory access / effect /
-# mutation the scan found) or `LConst(callees)` — the set of user-fn
-# names it calls, which the fixpoint must confirm `PConst`. A ctor call,
+# mutation the scan found) or `LConst(callees)` — the set of functions
+# it calls, which the fixpoint must confirm `PConst`. A ctor call,
 # a literal that allocates, a perceus RC/reuse mark, an effect op, an
 # index/field pointer read, a lambda, or an indirect call is a direct
 # `LImpure`. Arithmetic, comparison, and literals over scalars are pure.
 fn pty_scan_body(e: Expr) : Local = pty_scan_kind(e.kind)
 
 fn pty_scan_kind(k: ExprKind) : Local {
-  match sym_read_kind(k) {
+  match k {
     EInt(_, _)  -> LConst([])
     EReal(_, _) -> LConst([])
     EBool(_) -> LConst([])
     EChar(_) -> LConst([])
     EUnit    -> LConst([])
-    EVar(nm) -> if pty_var_is_impure(nm) { LImpure } else { LConst([]) }
+    ELocal(_)  -> LConst([])
+    ESym(s, _) -> if pty_is_mutable_builtin(s) { LImpure } else { LConst([]) }
     EBinop(op, a, b) -> if pty_binop_reads_memory(op) { LImpure } else { pty_merge2(pty_scan_body(a), pty_scan_body(b)) }
     EUnop(_, x) -> pty_scan_body(x)
     ECall(callee, cargs) -> pty_scan_call(callee, cargs)
@@ -189,33 +179,25 @@ fn pty_scan_kind(k: ExprKind) : Local {
     EBlock(stmts, tail) -> pty_merge2(pty_scan_stmts(stmts), pty_scan_opt(tail))
     ELitUnit(inner, _) -> pty_scan_body(inner)
     EBang(_) -> LImpure
-    EHandle(_, _, _, _, _, _, _, _) -> LImpure
+    EHandle(_, _, _, _, _, _, _) -> LImpure
     # A shim's runtime call is opaque: its row speaks to the typer only.
     EExternBody(_, _) -> LImpure
-    # Every remaining kind either allocates (constructor via `EModCall`
-    # with an uppercase head, `ERecordLit`, `EList`, `ERange`, `ELambda`,
-    # intrinsics), reads memory (`EField`, `EIndex`), or is an effectful
-    # pipe / hole — all `LImpure`. The exhaustive default is conservative
-    # by construction: an unrecognised node never confirms pure.
+    # Every remaining kind either allocates (`ERecordLit`, `EList`,
+    # `ERange`, `ELambda`, intrinsics), reads memory (`EField`, `EIndex`),
+    # or is an effect op, an effectful pipe or a hole — all `LImpure`.
+    # The default is conservative by construction: an unrecognised node
+    # never confirms pure.
     _ -> LImpure
   }
 }
 
-# A bare `EVar` callee/reference is impure when it names a perceus RC or
-# reuse mark (`__perceus_dup` / `__perceus_drop` / `__perceus_reuse_*`)
-# or a Mutable-slot intrinsic (`array_*` / `ref_*`, including the borrow
-# variants). Every other bare name is a value read, which is pure.
-fn pty_var_is_impure(nm: String) : Bool =
-  pty_is_perceus_rc_name(nm) or is_mutable_intrinsic_name(nm)
-
-fn pty_is_perceus_rc_name(nm: String) : Bool = pty_name_in([
-  "__perceus_dup", "__perceus_drop",
-  "__perceus_reuse_cons", "__perceus_reuse_record", "__perceus_reuse_variant"], nm)
-
-fn pty_name_in(xs: [String], t: String) : Bool = match xs {
-  [] -> false
-  [h, ...rest] -> if h == t { true } else { pty_name_in(rest, t) }
-  _ -> false
+# A reference is impure when it is a Mutable-slot builtin (`array_*`, the
+# lending forms included). Every other reference is a value read, which
+# is pure. An RC or reuse mark is no reference: it takes the scan's
+# conservative default.
+fn pty_is_mutable_builtin(s: SymId) : Bool = match builtin_of(s) {
+  Some(b) -> builtin_is_mutable_intrinsic(b)
+  None    -> false
 }
 
 # `/` and `%` lower to the checked `kai_idiv_chk` / `kai_imod_chk`
@@ -224,49 +206,27 @@ fn pty_name_in(xs: [String], t: String) : Bool = match xs {
 # divide does NOT force `LImpure`. Every other binop is inline scalar
 # arithmetic or comparison. Left as a named predicate (returning false)
 # so the trap-vs-memory distinction stays documented at the call site.
-fn pty_binop_reads_memory(op: String) : Bool = false
+fn pty_binop_reads_memory(op: BinOp) : Bool = false
 
-# A call is pure iff its callee is a named user function (added to the
-# `LConst` callee set for the fixpoint) or a whitelisted memory-clean
-# runtime builtin. A constructor (uppercase head) allocates; an indirect
-# call (a non-`EVar` / non-`EModCall` callee) is opaque; a lowercase
-# `EModCall` is an effect op — all `LImpure`. Argument sub-expressions
-# are scanned too: a pure call with an allocating argument is impure.
+# A call is pure iff its callee is a declaration the fixpoint confirms
+# (added to the `LConst` callee set): a constructor allocates and a
+# builtin is opaque, and neither is ever confirmed. An indirect call (a
+# local, any other expression) is opaque and an effect op performs — both
+# `LImpure`. Argument sub-expressions are scanned too: a pure call with
+# an allocating argument is impure.
 fn pty_scan_call(callee: Expr, args: [Expr]) : Local =
   pty_merge2(pty_call_head(callee), pty_scan_args(args))
 
 fn pty_call_head(callee: Expr) : Local {
-  match sym_read_kind(callee.kind) {
-    EVar(nm) ->
-      if pty_is_perceus_rc_name(nm) or is_mutable_intrinsic_name(nm) { LImpure }
-      # A `__kai_tcrec|<sym>|...` self-tail-call sentinel (planted by
-      # tcrec_rewrite_decls post-perceus) is a recursive call to THIS fn:
-      # it introduces no new memory effect, so it is benign for purity. The
-      # embedded sym is the fn's own, which the fixpoint already covers via
-      # its own verdict. A `__kai_trmc|` step, by contrast, allocates cons
-      # cells and falls through to impure below.
-      else if string_starts_with_q(nm, "__kai_tcrec|") { LConst([]) }
-      else if pty_name_is_ctor(nm) { LImpure }
-      else if pty_is_pure_builtin(nm) { LConst([]) }
-      else { LConst([nm]) }
-    # A qualified call: an effect op (lowercase) is impure; a constructor
-    # (uppercase) allocates, also impure.
-    EModCall(_, _) -> LImpure
+  match callee.kind {
+    ESym(s, inst) -> if pty_is_mutable_builtin(s) { LImpure } else { LConst([FnId(s, inst)]) }
+    # A self-tail step is a recursive call to THIS fn: it introduces no
+    # new memory effect, and the fixpoint already covers the fn through
+    # its own verdict. A modulo-cons step allocates: it takes the default.
+    EMark(MkTcrecStep(_)) -> LConst([])
     _ -> LImpure
   }
 }
-
-fn pty_name_is_ctor(nm: String) : Bool = match char_at(nm, 0) {
-  Some(c) -> c >= 'A' and c <= 'Z'
-  None    -> false
-}
-
-# The closed whitelist of runtime builtins that touch no memory: the
-# raw-scalar unbox accessors a pure body lowers to. It is deliberately
-# small — asu review: `kai_op_field` increfs its result and
-# `kaix_nullary_fast` immortalises, both memory writes with no AST RC
-# node, so anything not proven memory-clean stays impure.
-fn pty_is_pure_builtin(nm: String) : Bool = pty_name_in(["kai_intf", "kai_realf", "kai_boolf"], nm)
 
 # ---- scan combinators ----------------------------------------------
 
@@ -315,7 +275,7 @@ fn pty_scan_stmt(s: Stmt) : Local = match s {
 
 # Seed every all-raw candidate at `PConst` and every other at `PImpure`,
 # then iterate: a candidate stays `PConst` only while its local scan is
-# `LConst` AND every named callee is currently `PConst`. Because the
+# `LConst` AND every callee is currently `PConst`. Because the
 # update only ever demotes (`PConst` → `PImpure`, never the reverse),
 # the iteration is a monotone descent to a least fixed point — one full
 # no-change pass proves convergence.
@@ -357,62 +317,20 @@ fn pty_refine_one(c: Candidate, marks: [PurityMark]) : PurityMark = match c {
   Cand(n, mo, raw, loc) -> {
     let keep = raw and (match loc {
       LImpure -> false
-      LConst(callees) -> pty_all_callees_const(callees, mo, marks)
+      LConst(callees) -> pty_all_callees_const(callees, marks)
     })
     PM(n, mo, if keep { PConst } else { PImpure })
   }
 }
 
-# A bare `EVar(name)` callee carries no module, so it resolves against
-# the CALLER's module first — the "locals shadow imports" rule (§rule B):
-# `quad` (mo `None`) calling `add` means the root `add`, not a stdlib
-# homonym. If no same-module `add` exists the call is an import; it then
-# confirms const only when EXACTLY ONE table entry named `add` is const
-# and NONE is impure — any homonym ambiguity is resolved conservatively
-# to impure, since the pass cannot pin which `add` the emitter binds.
-fn pty_all_callees_const(callees: [String], caller_mo: Option[String], marks: [PurityMark]) : Bool {
+# A callee the table does not hold (a constructor, a builtin, a function
+# with no declaration here) is never confirmed.
+fn pty_all_callees_const(callees: [FnId], marks: [PurityMark]) : Bool {
   match callees {
     [] -> true
-    [nm, ...rest] -> if pty_callee_const(nm, caller_mo, marks) { pty_all_callees_const(rest, caller_mo, marks) } else { false }
+    [f, ...rest] -> if pty_is_const(purity_of(marks, f)) { pty_all_callees_const(rest, marks) } else { false }
     _ -> true
   }
-}
-
-fn pty_callee_const(nm: String, caller_mo: Option[String], marks: [PurityMark]) : Bool {
-  match pty_lookup_same_module(nm, caller_mo, marks) {
-    Some(v) -> pty_is_const(v)
-    None    -> pty_unique_const_across_modules(nm, marks)
-  }
-}
-
-# The verdict of the `(nm, caller_mo)` entry, or `None` when the caller's
-# own module declares no `nm` (the call is then an import).
-fn pty_lookup_same_module(nm: String, caller_mo: Option[String], marks: [PurityMark]) : Option[Purity] {
-  match marks {
-    [] -> None
-    [PM(n, m, v), ...rest] -> if n == nm and mo_eq(m, caller_mo) { Some(v) } else { pty_lookup_same_module(nm, caller_mo, rest) }
-    _ -> None
-  }
-}
-
-# An imported `nm` confirms const only when every table entry named `nm`
-# is const (so whichever the emitter binds, the attribute holds). One
-# impure homonym makes the resolution ambiguous → conservative impure.
-fn pty_unique_const_across_modules(nm: String, marks: [PurityMark]) : Bool {
-  let total = pty_count_named(nm, marks)
-  total > 0 and pty_count_named_const(nm, marks) == total
-}
-
-fn pty_count_named(nm: String, marks: [PurityMark]) : Int = match marks {
-  [] -> 0
-  [PM(n, _, _), ...rest] -> (if n == nm { 1 } else { 0 }) + pty_count_named(nm, rest)
-  _ -> 0
-}
-
-fn pty_count_named_const(nm: String, marks: [PurityMark]) : Int = match marks {
-  [] -> 0
-  [PM(n, _, v), ...rest] -> (if n == nm and pty_is_const(v) { 1 } else { 0 }) + pty_count_named_const(nm, rest)
-  _ -> 0
 }
 
 fn pty_is_const(v: Purity) : Bool = match v { PConst -> true  PImpure -> false }

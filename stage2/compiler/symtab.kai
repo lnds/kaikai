@@ -25,16 +25,20 @@ declaration is an integer comparison.
 
 import compiler.ast
 import compiler.decl_names
+import compiler.written
 
-#[doc("Symbol table keyed by `SymId`: one slot buffer per field, plus a hash index from bare name to ids.")]
+#[doc("Symbol table keyed by `SymId`: one slot buffer per field, plus a hash index from bare name to ids. `root` is the module symbol of the program's root file and `cores` those of its core modules; a table built for no program holds neither.")]
 pub type SymTab = { count: Int,
                     cap: Int,
                     ids: Array[Int],
-                    names: Array[String],
+                    names: Array[Written],
                     owners: Array[Int],
                     classes: Array[NCls],
                     exported: Array[Bool],
-                    buckets: Array[[Int]] }
+                    mints: Array[NMint],
+                    buckets: Array[[Int]],
+                    root: SymId,
+                    cores: [SymId] }
 
 #[doc("""
 The empty table: no symbols, and no slots either.
@@ -45,16 +49,22 @@ inert table — a resolver walking with recording off — pays nothing.
 """)]
 pub fn st_empty() : SymTab = st_with_cap(0)
 
-#[doc("A table with `cap` empty slots and no symbols. `cap` is zero or a power of two.")]
-pub fn st_with_cap(cap: Int) : SymTab =
+#[doc("A table with `cap` empty slots and no symbols, of no program. `cap` is zero or a power of two.")]
+pub fn st_with_cap(cap: Int) : SymTab = st_fresh(cap, sym_none(), [])
+
+#[doc("A table with `cap` empty slots and no symbols, of the program whose root file is the module `root` and whose core modules are `cores`.")]
+pub fn st_fresh(cap: Int, root: SymId, cores: [SymId]) : SymTab =
   SymTab { count: 0,
            cap: cap,
            ids: array_make(cap, 0 - 1),
-           names: array_make(cap, ""),
+           names: array_make(cap, written("")),
            owners: array_make(cap, 0 - 1),
            classes: array_make(cap, NCFn),
            exported: array_make(cap, false),
-           buckets: array_make(cap, []) }
+           mints: array_make(cap, NmSource),
+           buckets: array_make(cap, []),
+           root: root,
+           cores: cores }
 
 #[doc("How many symbols the table holds.")]
 pub fn st_count(t: SymTab) : Int = t.count
@@ -79,10 +89,10 @@ pub fn st_probe(t: SymTab, id: Int, i: Int) : Int {
   if k == id or k < 0 { i } else { st_probe(t, id, (i + 1) % t.cap) }
 }
 
-#[doc("The declared name of `s`, or the empty string when `t` does not hold `s`.")]
-pub fn sym_name(t: SymTab, s: SymId) : String {
+#[doc("The declared name of `s`, or the empty name when `t` does not hold `s`.")]
+pub fn sym_name(t: SymTab, s: SymId) : Written {
   let i = st_row(t, s)
-  if i >= 0 { array_get(t.names, i) } else { "" }
+  if i >= 0 { array_get(t.names, i) } else { written("") }
 }
 
 #[doc("The module symbol that owns `s`. A module owns nothing, so its own owner is `sym_none()`.")]
@@ -91,8 +101,8 @@ pub fn sym_owner(t: SymTab, s: SymId) : SymId {
   if i >= 0 { SymId(array_get(t.owners, i)) } else { sym_none() }
 }
 
-#[doc("The home module that declares `s`, or the empty string when `t` does not hold `s` or nothing owns it.")]
-pub fn sym_home(t: SymTab, s: SymId) : String = sym_name(t, sym_owner(t, s))
+#[doc("The home module that declares `s`, or the empty name when `t` does not hold `s` or nothing owns it.")]
+pub fn sym_home(t: SymTab, s: SymId) : Written = sym_name(t, sym_owner(t, s))
 
 #[doc("True when `a` and `b` are owned by the same module symbol.")]
 pub fn sym_same_owner(t: SymTab, a: SymId, b: SymId) : Bool =
@@ -101,6 +111,18 @@ pub fn sym_same_owner(t: SymTab, a: SymId, b: SymId) : Bool =
 #[doc("True when the module symbol `m` owns `s`.")]
 pub fn sym_owned_by(t: SymTab, s: SymId, m: SymId) : Bool =
   sym_raw(sym_owner(t, s)) == sym_raw(m)
+
+#[doc("True when the root file's module declares `s`. A table of no program has no root.")]
+pub fn sym_in_root(t: SymTab, s: SymId) : Bool =
+  sym_raw(t.root) >= 0 and sym_owned_by(t, s, t.root)
+
+#[doc("True when a core module declares `s`.")]
+pub fn sym_in_core(t: SymTab, s: SymId) : Bool = st_among(t.cores, sym_raw(sym_owner(t, s)))
+
+fn st_among(ms: [SymId], m: Int) : Bool = match ms {
+  []           -> false
+  [h, ...rest] -> sym_raw(h) == m or st_among(rest, m)
+}
 
 #[doc("The name class of `s`. An absent id reports `NCFn`, which no caller reaches without first checking `st_valid`.")]
 pub fn sym_class(t: SymTab, s: SymId) : NCls {
@@ -112,6 +134,23 @@ pub fn sym_class(t: SymTab, s: SymId) : NCls {
 pub fn sym_exported(t: SymTab, s: SymId) : Bool {
   let i = st_row(t, s)
   if i >= 0 { array_get(t.exported, i) } else { false }
+}
+
+#[doc("Who declared `s`: the source, or the pass that minted it. An absent id reports the source.")]
+pub fn sym_mint(t: SymTab, s: SymId) : NMint {
+  let i = st_row(t, s)
+  if i >= 0 { array_get(t.mints, i) } else { NmSource }
+}
+
+#[doc("True when the compiler declared `s` for its own use, so no source text names it.")]
+pub fn sym_internal(t: SymTab, s: SymId) : Bool = mint_internal(sym_mint(t, s))
+
+#[doc("The row of `s` as an entry: its class, its name, the module that owns it, whether it is exported, who declared it. `None` when `t` does not hold `s`.")]
+pub fn st_ent(t: SymTab, s: SymId) : Option[NEnt] {
+  let i = st_row(t, s)
+  if i < 0 { None }
+  else { Some(NEnt(array_get(t.classes, i), written_text(array_get(t.names, i)),
+                   written_text(sym_home(t, s)), array_get(t.exported, i), array_get(t.mints, i))) }
 }
 
 #[doc("Every id the table holds, in slot order.")]
@@ -140,7 +179,7 @@ pub fn st_by_name(t: SymTab, name: String) : [SymId] =
 fn st_filter_name(t: SymTab, chain: [Int], name: String, acc: [SymId]) : [SymId] = match chain {
   [] -> acc
   [id, ...rest] ->
-    if sym_name(t, SymId(id)) == name { st_filter_name(t, rest, name, [SymId(id), ...acc]) }
+    if written_text(sym_name(t, SymId(id))) == name { st_filter_name(t, rest, name, [SymId(id), ...acc]) }
     else { st_filter_name(t, rest, name, acc) }
 }
 
@@ -168,6 +207,17 @@ fn st_pick(t: SymTab, cands: [SymId], cls: NCls, owner: SymId) : Option[SymId] =
 #[doc("The ids declaring `name` in class `cls`, across every home. More than one means the bare use is contested.")]
 pub fn st_candidates(t: SymTab, cls: NCls, name: String) : [SymId] =
   st_keep_class(t, st_by_name(t, name), cls)
+
+#[doc("The declarations of the class of `s` that share its name, in any home, `s` among them.")]
+pub fn sym_homonyms(t: SymTab, s: SymId) : [SymId] =
+  st_candidates(t, sym_class(t, s), written_text(sym_name(t, s)))
+
+#[doc("True when a second declaration of the class of `s` shares its name, in any home.")]
+pub fn sym_contested(t: SymTab, s: SymId) : Bool =
+  match sym_homonyms(t, s) {
+    [_, _, ..._] -> true
+    _            -> false
+  }
 
 fn st_keep_class(t: SymTab, cands: [SymId], cls: NCls) : [SymId] = match cands {
   [] -> []

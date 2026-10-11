@@ -1,10 +1,10 @@
 # compiler/effect_scope.kai — module scoping for effect names.
 #
 # Every row label and handler head is settled here to the declaration it
-# names, by the scope ladder, and stamped with its id; a contested name is
-# also respelled per its declaring module (effect_scope_table). Runs on the
-# parsed stream before the qualifier passes, while a head still carries its
-# `m.E` and a perform its `m.E.op`: past them the qualifier is gone.
+# names, by the scope ladder; so is a perform on a qualified or a contested
+# effect (effect_scope_table). Runs on the parsed stream before the
+# qualifier passes, while a head still carries its `m.E` and a perform its
+# `m.E.op`: past them the qualifier is gone.
 
 import compiler.util
 import compiler.ast
@@ -14,29 +14,28 @@ import compiler.scope_walk
 import compiler.effect_scope_table
 import compiler.effect_scope_ids
 import compiler.effect_scope_types
-import compiler.decl_names
 import compiler.symtab_build
 import compiler.symtab
 import compiler.scope_file
 import compiler.decl_map
+import compiler.written
 
-#[doc("Settle every effect reference of each import segment under its own file's view: stamp the declaration it names and respell a contested one; the decls past the marks are the root file's.")]
-pub fn es_segmented(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
+#[doc("Settle every effect reference of each import segment under its own file's view to the declaration it names; the decls past the marks are the root file's.")]
+pub fn es_segmented(segs: [ImportSeg], decls: [Decl],
       scopes: [ModScope], global: [ModuleEntry], target: String,
-      cores: [String], tab: SymTab, views: FileViews) : [Decl] = match segs {
-  [] -> es_decls(decls, es_ctx(coll, target, target, cores, scopes, global, tab, views))
-  [ISeg(mod_name, n), ...rest] -> {
-    let home = if mod_name == "" { target } else { mod_name }
-    list_append(es_decls(seg_take(decls, n), es_ctx(coll, home, target, cores, scopes, global, tab, views)),
-                es_segmented(rest, seg_drop(decls, n), coll, scopes, global, target, cores, tab, views))
+      tab: SymTab, views: FileViews) : [Decl] = match segs {
+  [] -> es_decls(decls, es_ctx(target, target, scopes, global, tab, views))
+  [ISeg(home, n), ...rest] -> {
+    list_append(es_decls(seg_take(decls, n), es_ctx(home, target, scopes, global, tab, views)),
+                es_segmented(rest, seg_drop(decls, n), scopes, global, target, tab, views))
   }
 }
 
-#[doc("One module's viewpoint: its home, the root's, the cores, its qualifier table, and the symbol table with the file's scope view.")]
-pub fn es_ctx(coll: [ESEntry], home: String, target: String, cores: [String],
+#[doc("The viewpoint of the module `home` in a program whose root is `target`: its qualifier table, and the symbol table with the file's scope view.")]
+pub fn es_ctx(home: String, target: String,
       scopes: [ModScope], global: [ModuleEntry], tab: SymTab, views: FileViews) : ESCtx = {
   let owner = if home == target { "" } else { home }
-  ESCtx { coll: coll, home: home, target: target, cores: cores,
+  ESCtx { home: home,
           mt: ms_table(scopes, owner, global), tab: tab, view: fv_of(views, st_module_id(home)) }
 }
 
@@ -49,36 +48,27 @@ fn es_decls(ds: [Decl], cx: ESCtx) : [Decl] = match ds {
 pub fn es_decl(d: Decl, cx: ESCtx) : Decl = decl_map_inner(d, (x) => es_decl_leaf(x, cx))
 
 fn es_decl_leaf(d: Decl, cx: ESCtx) : Decl = match d {
-  DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(p, n, tps, es_params(ps, cx), es_ty_opt(ret, cx), es_row(row, cx),
-        es_expr(body, sw_params(ps, []), cx), l, c, mo, fsym)
-  DEffect(p, n, tps, ops, dblk, l, c, mo, esym) -> {
-    let spelled = es_spell(cx, n, cx.home)
-    DEffect(p, spelled, tps, map(ops, (o) => es_eop(o, cx)),
-            es_dblk(dblk, cx), l, c, mo, es_decl_sym(spelled, n, cx.home, esym))
-  }
-  DType(p, n, tps, body, l, c, mo, slots, tsym) -> DType(p, n, tps, es_tbody(body, cx), l, c, mo, slots, tsym)
-  DConst(p, n, ty, body, mo, l, c, csym) -> DConst(p, n, es_ty(ty, cx), es_expr(body, [], cx), mo, l, c, csym)
+  DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, fid, tps, es_params(ps, cx), es_ty_opt(ret, cx), es_row(row, cx),
+        es_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DEffect(p, s, tps, ops, dblk, l, c, mo) ->
+    DEffect(p, s, tps, map(ops, (o) => es_eop(o, cx)), es_dblk(dblk, cx), l, c, mo)
+  DType(p, s, tps, body, l, c, mo, slots) -> DType(p, s, tps, es_tbody(body, cx), l, c, mo, slots)
+  DConst(p, s, ty, body, mo, l, c) -> DConst(p, s, es_ty(ty, cx), es_expr(body, [], cx), mo, l, c)
   DTest(n, body, l, c, mo)  -> DTest(n, es_expr(body, [], cx), l, c, mo)
   DBench(n, body, l, c, mo) -> DBench(n, es_expr(body, [], cx), l, c, mo)
   DCheck(n, ps, body, l, c, mo) ->
     DCheck(n, es_params(ps, cx), es_expr(body, sw_params(ps, []), cx), l, c, mo)
-  DProtocol(p, n, tps, ops, l, c, mo, psym) -> DProtocol(p, n, tps, map(ops, (o) => es_pop(o, cx)), l, c, mo, psym)
+  DProtocol(p, s, tps, ops, l, c, mo) -> DProtocol(p, s, tps, map(ops, (o) => es_pop(o, cx)), l, c, mo)
   DImpl(pn, tas, fty, subs, l, c, ss, isym) ->
     DImpl(pn, map(tas, (t) => es_ty(t, cx)), es_ty(fty, cx), es_decls(subs, cx), l, c, ss, isym)
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
     DAxiom(p, sm, n, cso, tps, es_params(ps, cx), es_ty(ret, cx), es_row(row, cx), l, c)
-  DUse(eff, l, c) -> DUse(es_resolve(cx, eff), l, c)
   _ -> d
 }
 
-# A respelled declaration no longer carries the name the symbol table keys
-# it by, so it takes its id here, where that name and its home are known.
-fn es_decl_sym(spelled: String, n: String, home: String, esym: SymId) : SymId =
-  if spelled == n { esym } else { sym_derive(NCEffect, n, home) }
-
 fn es_eop(o: EffectOp, cx: ESCtx) : EffectOp = match o {
-  EOp(n, tps, ps, ret, l, c) -> EOp(n, tps, es_params(ps, cx), es_ty(ret, cx), l, c)
+  EffOp(n, tps, ps, ret, l, c) -> EffOp(n, tps, es_params(ps, cx), es_ty(ret, cx), l, c)
 }
 
 fn es_pop(o: ProtoOp, cx: ESCtx) : ProtoOp = match o {
@@ -88,46 +78,44 @@ fn es_pop(o: ProtoOp, cx: ESCtx) : ProtoOp = match o {
 fn es_dblk(o: Option[DefaultBlock], cx: ESCtx) : Option[DefaultBlock] = match o {
   None -> None
   Some(DBlk(hcs, ret, l, c)) ->
-    Some(DBlk(sw_hclauses(hcs, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n, hs) => es_head(n, hs, cx)),
-              sw_hreturn_opt(ret, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n, hs) => es_head(n, hs, cx)),
+    Some(DBlk(sw_hclauses(hcs, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (r) => es_ref(cx, r)),
+              sw_hreturn_opt(ret, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (r) => es_ref(cx, r)),
               l, c))
 }
 
 fn es_expr(e: Expr, sh: [String], cx: ESCtx) : Expr =
-  sw_expr(e, sh, (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n, hs) => es_head(n, hs, cx))
+  sw_expr(e, sh, (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (r) => es_ref(cx, r))
 
-#[doc("Respell the contested effect names of one free-standing expression under the context's viewpoint; interpolation fragments surface after the decl-level pass ran.")]
+#[doc("Settle the effect references of one free-standing expression under the context's viewpoint; interpolation fragments surface after the decl-level pass ran.")]
 pub fn es_expr_scoped(e: Expr, cx: ESCtx) : Expr = es_expr(e, [], cx)
-
-# A handler head: `m.E` picks the home, a bare `E` follows the ladder. An
-# id already stamped is kept: the qualifier that chose it is gone.
-fn es_head(n: String, hs: SymId, cx: ESCtx) : SwHead =
-  SwHead(es_resolve_ref(cx, n), if sym_raw(hs) >= 0 { hs } else { es_ref_sym(cx, n) })
 
 # A perform: `E.op` with `E` free, or `m.E.op` with `m` free.
 fn es_leaf(e: Expr, sh: [String], cx: ESCtx) : Option[Expr] = match e.kind {
   EField(obj, op) -> match obj.kind {
-    EVar(n) -> if list_has(sh, n) { None } else { es_bare_perform(e, obj, n, op, cx) }
+    EName(w) -> if list_has(sh, written_text(w)) { None } else { es_bare_perform(e, obj, written_text(w), op, cx) }
     EField(inner, mid) -> es_qualified_perform(e, inner, mid, op, sh, cx)
     _ -> None
   }
   _ -> None
 }
 
+# An uncontested effect is left for the resolver to settle; a contested one
+# takes its declaration here, where the file's ladder decides which is meant.
 fn es_bare_perform(e: Expr, obj: Expr, n: String, op: String, cx: ESCtx) : Option[Expr] = {
-  let spelled = es_resolve(cx, n)
-  if spelled == n { None }
-  else { Some(es_re(e, EField(es_re(obj, EVar(spelled)), op))) }
+  let s = es_settle(cx, n)
+  if sym_raw(s) < 0 or not es_spelled_apart(cx, s) { None }
+  else { Some(es_re(e, EField(es_re(obj, ESym(s, spec_none())), op))) }
 }
 
 fn es_qualified_perform(e: Expr, inner: Expr, mid: String, op: String,
       sh: [String], cx: ESCtx) : Option[Expr] = match inner.kind {
-  EVar(m) ->
+  EName(w) -> {
+    let m = written_text(w)
     if list_has(sh, m) { None }
-    else { match es_resolve_qualified(cx, m, mid) {
-      Some(s) -> Some(es_re(e, EField(es_re(inner, es_qualified_base(cx, m, mid, s)), op)))
-      None -> None
-    } }
+    else if es_qualified_exports(cx, m, mid) {
+      Some(es_re(e, EField(es_re(inner, es_qualified_base(cx, m, mid)), op)))
+    } else { None }
+  }
   _ -> None
 }
 

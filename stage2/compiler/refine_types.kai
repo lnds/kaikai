@@ -1,0 +1,156 @@
+#[doc("""
+The refinement predicates a type expression holds.
+
+A predicate is an expression sitting in a type's position, so the walk
+that resolves names reaches it through these: the predicates of a type
+in the order they are written, and the same type rebuilt around them
+once they are resolved.
+
+`self`, the value a predicate constrains, is one binder for every
+predicate. Two refinements written alike are therefore the same
+predicate wherever they sit, and none of them reads a binder the
+program declares under that name.
+""")]
+
+import compiler.ast
+
+fn pred_self_key() : String = "self"
+
+#[doc("The identity of the `self` a refinement predicate reads.")]
+pub fn pred_self() : LocalId = local_minted(pred_self_key())
+
+#[doc("The binder of a refinement predicate's `self`.")]
+pub fn pred_self_binder() : Binder = binder_minted(pred_self_key())
+
+#[doc("True when one of `ts` holds a refinement predicate anywhere inside it.")]
+pub fn tys_refined(ts: [TypeExpr]) : Bool = match ts {
+  []           -> false
+  [t, ...rest] -> ty_refined(t) or tys_refined(rest)
+}
+
+fn ty_refined(t: TypeExpr) : Bool = match t.tkind {
+  TyName(_, targs) -> tys_refined(targs)
+  TyList(x)        -> ty_refined(x)
+  TyFn(ps, r, row) -> tys_refined(ps) or ty_refined(r) or tys_refined(row_types(row))
+  TyDim(b, _)      -> ty_refined(b)
+  TyRefine(_, _)   -> true
+  TyRow(row)       -> tys_refined(row_types(row))
+  TySurface(ts)    -> tys_refined(tysurface_children(ts))
+}
+
+fn row_labels(r: RowExpr) : [RowLabel] = match r {
+  REmpty       -> []
+  RClosed(ls)  -> ls
+  ROpen(_, ls) -> ls
+}
+
+fn row_types(r: RowExpr) : [TypeExpr] = flat_map(row_labels(r), (l) => match l { RL(_, targs) -> targs })
+
+fn row_with_types(r: RowExpr, ts: [TypeExpr]) : RowExpr = match r {
+  REmpty       -> REmpty
+  RClosed(ls)  -> RClosed(labels_with_types(ls, ts))
+  ROpen(v, ls) -> ROpen(v, labels_with_types(ls, ts))
+}
+
+fn labels_with_types(ls: [RowLabel], ts: [TypeExpr]) : [RowLabel] = match ls {
+  []                    -> []
+  [RL(r, own), ...rest] -> {
+    let n = list_length(own)
+    [RL(r, types_take(ts, n)), ...labels_with_types(rest, types_drop(ts, n))]
+  }
+}
+
+#[doc("The first `n` of `ts`.")]
+pub fn types_take(ts: [TypeExpr], n: Int) : [TypeExpr] = match ts {
+  []           -> []
+  [t, ...rest] -> if n <= 0 { [] } else { [t, ...types_take(rest, n - 1)] }
+}
+
+#[doc("`ts` past its first `n`.")]
+pub fn types_drop(ts: [TypeExpr], n: Int) : [TypeExpr] = match ts {
+  []           -> []
+  [_, ...rest] -> if n <= 0 { ts } else { types_drop(rest, n - 1) }
+}
+
+# The types a type is written from: a function's parameters, its result,
+# then its row's arguments.
+fn kids(k: TyKind) : [TypeExpr] = match k {
+  TyName(_, targs) -> targs
+  TyList(x)        -> [x]
+  TyFn(ps, r, row) -> list_append(ps, [r, ...row_types(row)])
+  TyDim(b, _)      -> [b]
+  TyRefine(b, _)   -> [b]
+  TyRow(row)       -> row_types(row)
+  TySurface(ts)    -> tysurface_children(ts)
+}
+
+# `k` written from `xs`, which holds as many types as `kids(k)`.
+fn with_kids(k: TyKind, xs: [TypeExpr]) : TyKind = match k {
+  TyName(r, _)     -> TyName(r, xs)
+  TyFn(ps, _, row) -> fn_with_kids(types_take(xs, list_length(ps)), types_drop(xs, list_length(ps)), row, k)
+  TyRow(row)       -> TyRow(row_with_types(row, xs))
+  TySurface(ts)    -> TySurface(tysurface_rebuild(ts, xs))
+  _                -> match xs {
+    [x, ..._] -> with_kid(k, x)
+    []        -> k
+  }
+}
+
+fn with_kid(k: TyKind, x: TypeExpr) : TyKind = match k {
+  TyList(_)      -> TyList(x)
+  TyDim(_, u)    -> TyDim(x, u)
+  TyRefine(_, p) -> TyRefine(x, p)
+  _              -> k
+}
+
+fn fn_with_kids(ps: [TypeExpr], rest: [TypeExpr], row: RowExpr, k: TyKind) : TyKind = match rest {
+  [r, ...targs] -> TyFn(ps, r, row_with_types(row, targs))
+  []            -> k
+}
+
+#[doc("The predicates of `ts` in the order they are written: a refinement's base before its own predicate.")]
+pub fn tys_preds(ts: [TypeExpr]) : [Expr] = list_reverse(preds_tys(ts, []))
+
+fn preds_tys(ts: [TypeExpr], acc: [Expr]) : [Expr] = match ts {
+  []           -> acc
+  [t, ...rest] -> preds_tys(rest, preds_ty(t, acc))
+}
+
+fn preds_ty(t: TypeExpr, acc: [Expr]) : [Expr] =
+  if not ty_refined(t) { acc }
+  else { match t.tkind {
+    TyRefine(b, p) -> [p, ...preds_ty(b, acc)]
+    k              -> preds_tys(kids(k), acc)
+  } }
+
+# A rebuilt piece and the predicates the rest of the walk still places.
+type Filled[a] = Filled(a, [Expr])
+
+#[doc("`ts` with the predicates `ps` in the place of their own, taken in `tys_preds` order.")]
+pub fn tys_with_preds(ts: [TypeExpr], ps: [Expr]) : [TypeExpr] = match fill_tys(ts, ps) {
+  Filled(out, _) -> out
+}
+
+fn fill_tys(ts: [TypeExpr], ps: [Expr]) : Filled[[TypeExpr]] = match ts {
+  []           -> Filled([], ps)
+  [t, ...rest] -> match fill_ty(t, ps) {
+    Filled(t1, ps1) -> match fill_tys(rest, ps1) {
+      Filled(rest1, ps2) -> Filled([t1, ...rest1], ps2)
+    }
+  }
+}
+
+fn fill_ty(t: TypeExpr, ps: [Expr]) : Filled[TypeExpr] =
+  if not ty_refined(t) { Filled(t, ps) }
+  else { match fill_tys(kids(t.tkind), ps) {
+    Filled(xs, rest) -> fill_own(t, with_kids(t.tkind, xs), rest)
+  } }
+
+# A refinement takes the next predicate once its base took its own.
+fn fill_own(t: TypeExpr, k: TyKind, ps: [Expr]) : Filled[TypeExpr] = match k {
+  TyRefine(b, _) -> match ps {
+    [p, ...rest] -> Filled(TypeExpr { tkind: TyRefine(b, p), line: t.line, col: t.col }, rest)
+    []           -> Filled(TypeExpr { tkind: k, line: t.line, col: t.col }, [])
+  }
+  _ -> Filled(TypeExpr { tkind: k, line: t.line, col: t.col }, ps)
+}

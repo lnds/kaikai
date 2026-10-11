@@ -1,33 +1,51 @@
 #[doc("""
-Every name a declaration stream introduces, with the class it competes
-in and the module that declares it.
+Every name a program declares, with the class it competes in and the
+module that declares it.
 
-One walker knows every declaration form and every name class a form
-contributes — a `type` contributes the habitant AND its constructors,
-a `kind` contributes the kind AND, through the habitants declared
-against it, their own class. Teaching a new form here teaches every
-consumer at once.
+A declaration node holds its id and no name. The parser, which reads the
+name, files one entry per declaration and per constructor; the symbol
+table is built from those entries, and a name is read back from it.
 
 Names enter as the user wrote them: a declaration's identity is the
 module that owns it, so two modules declaring `Item` contribute two
 entries under ONE name rather than one entry under two names — which is
 what lets a contested bare use be recognised as contested at all.
-
-While the type and effect scope passes still respell a contested
-declaration ahead of this walk, the written name has to be recovered
-from the spelling. That strip goes when the respelling does.
 """)]
 
 import compiler.ast
-import compiler.modules
-import compiler.home_spell
 
 #[doc("The namespace a name competes in. Two entries collide only when their class matches — `type Log` and `effect Log` are distinct habitants.")]
+#[derive(BinSerialize)]
 pub type NCls = NCFn | NCType | NCEffect | NCConst | NCProtocol
-              | NCCtor | NCKind | NCExternType | NCUnit | NCModule
+              | NCCtor | NCKind | NCExternType | NCUnit | NCModule | NCBuiltin
+              | NCMethod
 
-#[doc("One declared name: `NEnt(class, name, home, exported)`. Root-file declarations carry the target module as home.")]
-pub type NEnt = NEnt(NCls, String, String, Bool)
+#[doc("Who declares a name: the source, or the compiler, by what it declared it for.")]
+#[derive(BinSerialize)]
+pub type NMint
+  = NmSource
+  # A function a derive declares for the program to call by name.
+  | NmDerived
+  # A protocol operation's dispatcher, an impl method lowered to a
+  # function, a derived `BinSerialize` writer, a closure specialisation.
+  | NmDispatcher | NmImpl | NmBinWriter | NmSpec
+  # Any other declaration a pass makes for its own use.
+  | NmHelper
+
+#[doc("True when no source text can name the declaration: the compiler declared it for its own use.")]
+pub fn mint_internal(m: NMint) : Bool = match m {
+  NmSource     -> false
+  NmDerived    -> false
+  NmDispatcher -> true
+  NmImpl       -> true
+  NmBinWriter  -> true
+  NmSpec       -> true
+  NmHelper     -> true
+}
+
+#[doc("One declared name: `NEnt(class, name, home, exported, mint)`. Root-file declarations carry the target module as home; an impl method carries its impl block's scope.")]
+#[derive(BinSerialize)]
+pub type NEnt = NEnt(NCls, String, String, Bool, NMint)
 
 #[doc("The English word for a class, as it appears in a diagnostic.")]
 pub fn ncls_word(c: NCls) : String = match c {
@@ -41,111 +59,48 @@ pub fn ncls_word(c: NCls) : String = match c {
   NCExternType -> "extern type"
   NCUnit       -> "unit"
   NCModule     -> "module"
+  NCBuiltin    -> "builtin"
+  NCMethod     -> "method"
 }
 
 #[doc("True when two name classes are the same namespace.")]
 pub fn ncls_same(a: NCls, b: NCls) : Bool = ncls_word(a) == ncls_word(b)
 
-#[doc("Every name `decls` declares, in stream order. `target` is the root file's module name, the home of every untagged declaration.")]
-pub fn nt_collect(decls: [Decl], target: String) : [NEnt] =
-  nt_loop(decls, target, target, [])
-
-fn nt_loop(ds: [Decl], cur: String, target: String, acc: [NEnt]) : [NEnt] =
-  match ds {
-    [] -> list_reverse(acc)
-    [d, ...rest] -> {
-      let home = nt_home(d, cur, target)
-      nt_loop(rest, home, target, nt_one(d, home, acc))
-    }
-  }
-
-# A decl's home. Every form that carries its own origin slot is read
-# directly: the streaming reset only sees the two forms it was written
-# for, so a `type`/`effect`/`kind` between two functions would inherit
-# whichever home streamed last.
-fn nt_home(d: Decl, cur: String, target: String) : String = match d {
-  DConst(_, _, _, _, mo, _, _, _)     -> nt_mo(mo, target)
-  DType(_, _, _, _, _, _, mo, _, _)   -> nt_mo(mo, target)
-  DEffect(_, _, _, _, _, _, _, mo, _) -> nt_mo(mo, target)
-  DKind(_, _, _, _, _, _, _, mo)   -> nt_mo(mo, target)
-  DUnit(_, _, _, _, _, _, mo)      -> nt_mo(mo, target)
-  DExternType(_, _, _, _, mo)      -> nt_mo(mo, target)
-  DDoc(_, _, inner, _, _) -> nt_home(inner, cur, target)
-  DAttr(_, inner, _, _)   -> nt_home(inner, cur, target)
-  _ -> decl_home_hint_reset(d, cur, target)
+#[doc("The id a symbol table gives the entry `e`.")]
+pub fn nent_sym(e: NEnt) : SymId = match e {
+  NEnt(cls, name, home, _, _) -> sym_derive_word(ncls_word(cls), name, home)
 }
 
-fn nt_mo(mo: Option[String], target: String) : String = match mo {
-  Some(m) -> m
-  None    -> target
-}
+# No module home holds a '#', so a scope never spells a module and the
+# module is everything before the first one.
+fn impl_scope_mark() : String = "#impl:"
 
-fn nt_one(d: Decl, home: String, acc: [NEnt]) : [NEnt] = match d {
-  DFn(p, n, _, _, _, _, _, _, _, _, _)    -> [NEnt(NCFn, n, home, p), ...acc]
-  DConst(p, n, _, _, _, _, _, _)          -> [NEnt(NCConst, n, home, p), ...acc]
-  DEffect(p, n, _, _, _, _, _, _, _)      -> [NEnt(NCEffect, hs_display(n, Some(home)), home, p), ...acc]
-  DProtocol(p, n, _, _, _, _, _, _)       -> [NEnt(NCProtocol, n, home, p), ...acc]
-  DKind(p, n, _, _, _, _, _, _)        -> [NEnt(NCKind, n, home, p), ...acc]
-  DUnit(p, n, _, _, _, _, _)           -> [NEnt(NCUnit, n, home, p), ...acc]
-  DExternType(n, _, _, _, _)           -> [NEnt(NCExternType, n, home, true), ...acc]
-  DAxiom(p, _, n, _, _, _, _, _, _, _) -> [NEnt(NCFn, n, home, p), ...acc]
-  # A `type` contributes the habitant AND every constructor it
-  # introduces: one declaration form, two name classes.
-  DType(p, n, _, body, _, _, mo, _, _) ->
-    nt_variants(body, home, p, [NEnt(NCType, hs_display(n, mo), home, p), ...acc])
-  DDerive(_, inner, _, _)       -> nt_one(inner, home, acc)
-  DUnstable(inner, _, _)        -> nt_one(inner, home, acc)
-  DProtoLaws(_, inner, _, _, _) -> nt_one(inner, home, acc)
-  DImplAxiom(_, inner, _, _, _) -> nt_one(inner, home, acc)
-  DConstructor(inner, _, _)     -> nt_one(inner, home, acc)
-  DDoc(_, _, inner, _, _)       -> nt_one(inner, home, acc)
-  DAttr(_, inner, _, _)         -> nt_one(inner, home, acc)
-  _ -> acc
-}
+#[doc("The scope the methods of an impl block are declared in: the block's module and `key`, which no other impl block of that module carries.")]
+pub fn impl_scope_keyed(home: String, key: String) : String =
+  string_concat(string_concat(home, impl_scope_mark()), key)
 
-fn nt_variants(b: TypeBody, home: String, p: Bool, acc: [NEnt]) : [NEnt] =
-  match b {
-    TBSum(vs) -> nt_variant_loop(vs, home, p, acc)
-    _ -> acc
-  }
+#[doc("The scope of the impl block written at `line`:`col` of the module `home`.")]
+pub fn impl_scope(home: String, line: Int, col: Int) : String =
+  impl_scope_keyed(home, string_concat(string_concat(int_to_string(line), ":"), int_to_string(col)))
 
-fn nt_variant_loop(vs: [Variant], home: String, p: Bool, acc: [NEnt]) : [NEnt] =
-  match vs {
-    [] -> acc
-    [v, ...rest] -> match v {
-      Var(n, _) -> nt_variant_loop(rest, home, p, [NEnt(NCCtor, n, home, p), ...acc])
-    }
-  }
+#[doc("The module an impl scope belongs to.")]
+pub fn impl_scope_module(scope: String) : String = scope_module_at(scope, 0, string_length(scope))
 
-#[doc("A type declaration as the stream spells it, the name its source wrote, and its home.")]
-pub type TypeSpelling = TSp(String, String, String)
+fn scope_module_at(scope: String, i: Int, n: Int) : String =
+  if i >= n { scope }
+  else if string_byte_at_int(scope, i) == 35 { string_slice(scope, 0, i) }
+  else { scope_module_at(scope, i + 1, n) }
 
-#[doc("Every type `decls` declares. A contested type reaches later passes home-spelled; this maps that exact spelling back to its declaration's home and written name.")]
-pub fn nt_type_spellings(decls: [Decl], target: String) : [TypeSpelling] = match decls {
-  [] -> []
-  [d, ...rest] -> list_append(nt_type_spelling(d, target), nt_type_spellings(rest, target))
-}
+#[doc("The id of the method `op` of the impl block whose scope is `scope`.")]
+pub fn method_sym(op: String, scope: String) : SymId = sym_derive_word(ncls_word(NCMethod), op, scope)
 
-fn nt_type_spelling(d: Decl, target: String) : [TypeSpelling] = match d {
-  DType(_, n, _, _, _, _, mo, _, _) -> [TSp(n, hs_display(n, mo), nt_mo(mo, target))]
-  DDerive(_, inner, _, _)       -> nt_type_spelling(inner, target)
-  DUnstable(inner, _, _)        -> nt_type_spelling(inner, target)
-  DProtoLaws(_, inner, _, _, _) -> nt_type_spelling(inner, target)
-  DImplAxiom(_, inner, _, _, _) -> nt_type_spelling(inner, target)
-  DConstructor(inner, _, _)     -> nt_type_spelling(inner, target)
-  DDoc(_, _, inner, _, _)       -> nt_type_spelling(inner, target)
-  DAttr(_, inner, _, _)         -> nt_type_spelling(inner, target)
-  _ -> []
-}
-
-#[doc("The protocol entries a stream declares, recovered for a consumer that only sees the stream after the lowering replaced each `DProtocol` with dispatchers.")]
-pub fn nt_protocols(decls: [Decl], target: String) : [NEnt] =
-  nt_only(nt_collect(decls, target), NCProtocol)
+#[doc("The entry of the method `op` of the impl block whose scope is `scope`.")]
+pub fn method_ent(op: String, scope: String) : NEnt = NEnt(NCMethod, op, scope, false, NmSource)
 
 #[doc("Only the entries of class `cls`.")]
 pub fn nt_only(t: [NEnt], cls: NCls) : [NEnt] = match t {
   [] -> []
-  [NEnt(c, n, h, p), ...rest] ->
-    if ncls_same(c, cls) { [NEnt(c, n, h, p), ...nt_only(rest, cls)] }
-    else { nt_only(rest, cls) }
+  [e, ...rest] -> match e {
+    NEnt(c, _, _, _, _) -> if ncls_same(c, cls) { [e, ...nt_only(rest, cls)] } else { nt_only(rest, cls) }
+  }
 }

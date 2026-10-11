@@ -9,7 +9,9 @@ import compiler.util
 import compiler.chars
 import compiler.symtab_build
 import compiler.decl_names
+import compiler.decl_text
 import compiler.symtab
+import compiler.written
 
 # A specialisable functional argument: a syntactic lambda, or a bare
 # reference to a top-level fn resolved to its decl. Both have empty
@@ -23,14 +25,6 @@ pub type ClosureArg
 # inline, and the closure's `closure_disc`, which keys the emitted spec.
 pub type CSpecReq = CSReq(Decl, Int, ClosureArg, String)
 
-#[doc("The program a specialisation is decided against: its declarations, and the table their references resolve in.")]
-pub type CsProg = CsProg([Decl], SymTab)
-
-#[doc("The body a closure argument runs: the lambda's, or the named function's.")]
-pub fn cs_closure_body(ca: ClosureArg) : Expr = match ca {
-  CaLambda(_, b) -> b
-  CaNamedFn(d)   -> decl_body(d)
-}
 
 
 pub fn remap(e: Expr, k: ExprKind) : Expr =
@@ -51,7 +45,7 @@ pub fn cspec_kids(e: Expr) : [Expr] =
     EIf(c, t_, eo)         -> [c, t_, ...cs_opt_list(eo)]
     EMatch(scr, arms)      -> [scr, ...cs_arm_exprs(arms)]
     ELambda(_, b)          -> [b]
-    ERecordLit(_, _, fs)      -> cs_field_exprs(fs)
+    ERecordLit(_, fs)      -> cs_field_exprs(fs)
     EList(els)             -> cs_elem_exprs(els)
     ERange(a, b, os)       -> [a, b, ...cs_opt_list(os)]
     EBlock(ss, t)          -> list_append(cs_stmt_exprs(ss), cs_opt_list(t))
@@ -63,7 +57,7 @@ pub fn cspec_kids(e: Expr) : [Expr] =
     EBang(inner)           -> [inner]
     EIntrinsic(_, args_)   -> args_
     ESurface(sf)   -> surface_children(sf)
-    EHandle(body, _, _, _, io, _, cls, ro) ->
+    EHandle(body, _, _, io, _, cls, ro) ->
       [body, ...cs_opt_list(io), ...clause_exprs(cls), ...ret_exprs(ro)]
     _ -> []
   }
@@ -117,26 +111,34 @@ fn ret_exprs(ro: Option[HReturn]) : [Expr] =
   match ro { Some(HR(_, b, _, _)) -> [b]  None -> [] }
 
 
-#[doc("The retargeted callee: the spec `nm`, homed at the root module `target` whatever module the original callee had.")]
-pub fn retarget_callee(callee: Expr, nm: String, target: String) : Expr =
-  remap(callee, cspec_ref(nm, target))
+#[doc("The retargeted callee: the spec `s`, whatever module the original callee had.")]
+pub fn retarget_callee(callee: Expr, s: SymId) : Expr = remap(callee, cspec_ref(s))
 
-#[doc("A reference to the spec `nm` homed at `target`, by the id its declaration carries.")]
-pub fn cspec_ref(nm: String, target: String) : ExprKind = ESym(cspec_sym(nm, target), spec_none(), nm)
+#[doc("A reference to the spec `s`.")]
+pub fn cspec_ref(s: SymId) : ExprKind = ESym(s, spec_none())
 
 #[doc("The id of the spec `nm` homed at `target`.")]
 pub fn cspec_sym(nm: String, target: String) : SymId = sym_derive(NCFn, nm, target)
 
-pub fn cs_param_names(ps: [Param]) : [String] =
+#[doc("The binders the parameters `ps` declare, by id.")]
+pub fn cs_param_ids(ps: [Param]) : [LocalId] =
   match ps {
     [] -> []
-    [p, ...rest] -> [p.pname, ...cs_param_names(rest)]
+    [p, ...rest] -> [p.binder.id, ...cs_param_ids(rest)]
   }
 
-pub fn param_name_at(ps: [Param], n: Int) : String =
+#[doc("The binder of the `n`-th parameter; the unnumbered id past the end.")]
+pub fn param_id_at(ps: [Param], n: Int) : LocalId =
   match ps {
-    [] -> ""
-    [p, ...rest] -> if n == 0 { p.pname } else { param_name_at(rest, n - 1) }
+    [] -> local_none()
+    [p, ...rest] -> if n == 0 { p.binder.id } else { param_id_at(rest, n - 1) }
+  }
+
+#[doc("True when `xs` holds the binder `l`.")]
+pub fn cs_has(xs: [LocalId], l: LocalId) : Bool =
+  match xs {
+    [] -> false
+    [x, ...rest] -> local_eq(x, l) or cs_has(rest, l)
   }
 
 pub fn drop_param_at(ps: [Param], n: Int) : [Param] =
@@ -169,57 +171,62 @@ pub fn cdr_args(xs: [Expr]) : [Expr] =
     [] -> []
   }
 
-pub fn index_of(xs: [String], target: String, i: Int) : Option[Int] =
+pub fn index_of(xs: [LocalId], target: LocalId, i: Int) : Option[Int] =
   match xs {
     [] -> None
-    [x, ...rest] -> if x == target { Some(i) } else { index_of(rest, target, i + 1) }
+    [x, ...rest] -> if local_eq(x, target) { Some(i) } else { index_of(rest, target, i + 1) }
   }
 
 pub fn map_opt(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] =
   match o { Some(x) -> Some(f(x))  None -> None }
 
-pub fn cs_pat_binders(p: Pattern, acc: [String]) : [String] =
+#[doc("The binders a pattern declares, by id, ahead of `acc`.")]
+pub fn cs_pat_binders(p: Pattern, acc: [LocalId]) : [LocalId] =
   match p.pkind {
-    PBind(n)              -> [n, ...acc]
-    PAs(n, sub)           -> cs_pat_binders(sub, [n, ...acc])
+    PBind(b)              -> [b.id, ...acc]
+    PAs(b, sub)           -> cs_pat_binders(sub, [b.id, ...acc])
     PList(subs, rest)     -> pats_binders(subs, opt_bind(rest, acc))
-    PVariant(_, _, subs)     -> pats_binders(subs, acc)
-    PVariantRecord(_, _, fs) -> pfields_binders(fs, acc)
+    PVariant(_, subs)     -> pats_binders(subs, acc)
+    PVariantRecord(_, fs) -> pfields_binders(fs, acc)
     PRecord(fs)           -> pfields_binders(fs, acc)
-    PNarrow(n, _)         -> [n, ...acc]
+    PNarrow(b, _)         -> [b.id, ...acc]
     _                     -> acc
   }
 
-fn opt_bind(o: Option[String], acc: [String]) : [String] =
-  match o { Some(n) -> [n, ...acc]  None -> acc }
+fn opt_bind(o: Option[Binder], acc: [LocalId]) : [LocalId] =
+  match o { Some(b) -> [b.id, ...acc]  None -> acc }
 
-fn pats_binders(ps: [Pattern], acc: [String]) : [String] =
+fn pats_binders(ps: [Pattern], acc: [LocalId]) : [LocalId] =
   match ps {
     [] -> acc
     [p, ...rest] -> pats_binders(rest, cs_pat_binders(p, acc))
   }
 
-fn pfields_binders(fs: [PField], acc: [String]) : [String] =
+fn pfields_binders(fs: [PField], acc: [LocalId]) : [LocalId] =
   match fs {
     [] -> acc
     [PField(_, sub, _), ...rest] -> pfields_binders(rest, cs_pat_binders(sub, acc))
   }
 
-pub fn cs_decl_name(d: Decl) : String =
-  match d { DFn(_, n, _, _, _, _, _, _, _, _, _) -> n  _ -> "" }
+#[doc("The name a function declaration is spelled with in `tab`; empty for any other decl.")]
+pub fn cs_decl_text(tab: SymTab, d: Decl) : String = written_text(decl_name(tab, cs_decl_sym(d)))
 
 pub fn decl_body(d: Decl) : Expr =
-  match d { DFn(_, _, _, _, _, _, b, _, _, _, _) -> b  _ -> mk_expr(EUnit, 0, 0) }
+  match d { DFn(_, _, _, _, _, _, b, _, _, _) -> b  _ -> mk_expr(EUnit, 0, 0) }
 
 pub fn decl_params(d: Decl) : [Param] =
-  match d { DFn(_, _, _, ps, _, _, _, _, _, _, _) -> ps  _ -> [] }
+  match d { DFn(_, _, _, ps, _, _, _, _, _, _) -> ps  _ -> [] }
 
 #[doc("The symbol a function declaration was minted under, or `sym_none()` for any other decl.")]
 pub fn cs_decl_sym(d: Decl) : SymId =
-  match d { DFn(_, _, _, _, _, _, _, _, _, _, s) -> fnid_sym(s)  _ -> sym_none() }
+  match d { DFn(_, f, _, _, _, _, _, _, _, _) -> fnid_sym(f)  _ -> sym_none() }
+
+#[doc("The identity of a function declaration, or `fnid_none()` for any other decl.")]
+pub fn cs_decl_fid(d: Decl) : FnId =
+  match d { DFn(_, f, _, _, _, _, _, _, _, _) -> f  _ -> fnid_none() }
 
 pub fn cs_decl_mo(d: Decl) : Option[String] =
-  match d { DFn(_, _, _, _, _, _, _, _, _, mo, _) -> mo  _ -> None }
+  match d { DFn(_, _, _, _, _, _, _, _, _, mo) -> mo  _ -> None }
 
 pub fn mo_is(mo: Option[String], modn: String) : Bool =
   match mo { Some(m) -> m == modn  None -> false }
@@ -246,12 +253,13 @@ pub fn cspec_name(mo: Option[String], name: String, disc: String) : String =
 # callee's inner lambdas at the same position, each beta-reduced on a
 # different closure. The module is part of a named fn's because two
 # modules may each pass their own homonymous fn to one callee.
-pub fn closure_disc(host: String, ca: ClosureArg) : String =
+pub fn closure_disc(tab: SymTab, host: SymId, ca: ClosureArg) : String =
   match ca {
-    CaLambda(_, b) -> concat_all(["L", int_to_string(b.line), "_", int_to_string(b.col), "_", host])
+    CaLambda(_, b) ->
+      concat_all(["L", int_to_string(b.line), "_", int_to_string(b.col), "_", written_text(decl_name(tab, host))])
     CaNamedFn(d)   -> match cs_decl_mo(d) {
-      Some(m) -> concat_all(["F", m, "__", cs_decl_name(d)])
-      None    -> concat_all(["F", cs_decl_name(d)])
+      Some(m) -> concat_all(["F", m, "__", cs_decl_text(tab, d)])
+      None    -> concat_all(["F", cs_decl_text(tab, d)])
     }
   }
 
@@ -282,18 +290,20 @@ pub fn row_te_names(r: RowExpr) : [String] = match r {
 
 fn labels_te_names(ls: [RowLabel], acc: [String]) : [String] = match ls {
   [] -> acc
-  [RL(_, tas, _), ...rest] -> labels_te_names(rest, tes_names(tas, acc))
+  [RL(_, tas), ...rest] -> labels_te_names(rest, tes_names(tas, acc))
 }
 
 pub fn opt_te_names(o: Option[TypeExpr]) : [String] =
   match o { Some(te) -> te_names(te, [])  None -> [] }
 
-# Every `TyName(n, ...)` leaf name in a type expression — a superset of
-# the tparam names, which is fine: pruning keeps a name that appears,
-# and a concrete type name never matches a tparam string anyway.
+# Every name a type expression still writes — a superset of the tparam
+# names, which is fine: pruning keeps a name that appears, and a scalar's
+# name never matches a tparam string anyway. A declared type is its id
+# and writes none.
 fn te_names(te: TypeExpr, acc: [String]) : [String] =
   match te.tkind {
-    TyName(_, n, tas)    -> tes_names(tas, [n, ...acc])
+    TyName(DrWritten(_, n), tas) -> tes_names(tas, [written_text(n), ...acc])
+    TyName(DrSym(_), tas)        -> tes_names(tas, acc)
     TyList(inner)     -> te_names(inner, acc)
     TyFn(pts, r, _)   -> te_names(r, tes_names(pts, acc))
     TyDim(b, _)       -> te_names(b, acc)
@@ -308,12 +318,8 @@ fn tes_names(tes: [TypeExpr], acc: [String]) : [String] =
     [t, ...rest] -> tes_names(rest, te_names(t, acc))
   }
 
-# A name that resolves without an environment: a capital-initial EVar is
-# a type ctor or nullary variant, never a captured local. Everything else
-# — including a `__`-prefixed compiler-synthesised binder like a pipe-
-# fusion `__fusev_*` stage — is treated as a possible capture, so a
-# lambda closing over one declines specialisation rather than beta-
-# reducing into a dangling reference.
+# A capital-initial name a type still writes is a scalar, never a type
+# variable.
 pub fn name_is_global(n: String) : Bool =
   match char_at(n, 0) {
     Some(c) -> ch_is_upper(c)

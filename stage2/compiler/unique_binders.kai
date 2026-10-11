@@ -1,62 +1,69 @@
 #[doc("""
-Local binder names made unique within each function body.
+Local binders made unique within each body, in two independent ways.
 
-A name bound more than once in a body — sibling match arms, a `let` or
-lambda param that shadows another binder — is respelled at every binding
-site but a parameter's, as `name__LINE_COL` (the binding position), and
-every read follows its binder. From here on a local name identifies one
-binder, so the ownership passes can key their read tables on it.
+An id bound at more than one site — code a pass cloned or inlined —
+is renumbered: each site but a parameter's takes an id of its own, made
+from the id and the binding position, and every read follows its
+binder. The ownership passes key their read tables on the id.
 
-Reads inside `#{...}` spans are respelled in the raw text. A binder
-introduced inside an interpolation body keeps its name there.
-The handler aliases (`state`, `log`, `resume`, a `with ... as` name) are
-bound implicitly and keep their names too.
+A name bound more than once — sibling match arms, a `let` or lambda
+param that shadows another binder, a binder named like a handler-state
+alias beside a stateful handler — is respelled at every binding site
+but a parameter's, as `name__LINE_COL`. That spelling is the name the
+local is emitted under and nothing else: an emitter writes one local
+per binder, and two binders in scope together never share a spelling.
+No id is made from a spelling.
 """)]
 
 import compiler.ast
-import compiler.sym_read
 import compiler.ast_map
 import compiler.expr_positions
-import compiler.handler_alias
-import compiler.infer
-import compiler.interp_span
-import compiler.parse
 import compiler.util
+import compiler.written
+import compiler.handler_alias
 
-# A `#{...}` body parsed once up front, so the rename walk stays pure.
-type UbBody = UbBody(String, Option[Expr])
+# A binder in scope: the id it was declared with, and the binder it is now.
+type UbBind = UbBind(LocalId, Binder)
 
-# `fresh` is false inside an interpolation body: its own binders shadow
-# without a new spelling.
-type UbCx = { env: [(String, String)], multi: [String], taken: [String],
-              bodies: [UbBody], fresh: Bool }
+# `multi` holds the spellings bound more than once, `dups` the ids, and
+# `taken` every spelling a binder of the body already has.
+type UbCx = { env: [UbBind], multi: [String], dups: [LocalId], taken: [String] }
 
-#[doc("Respell every function, test, bench and check body so no two of its local binders share a name.")]
-pub fn unique_binders_decls(ds: [Decl]) : [Decl] / Console = match ds {
+#[doc("Respell and renumber the binders of every function, test, bench and check body so no two of them share a name or an id.")]
+pub fn unique_binders_decls(ds: [Decl]) : [Decl] = match ds {
   []           -> []
   [d, ...rest] -> [ub_decl(d), ...unique_binders_decls(rest)]
 }
 
-fn ub_decl(d: Decl) : Decl / Console = match d {
-  DFn(p, n, tps, ps, r, row, body, ln, cl, mo, sym) ->
-    DFn(p, n, tps, ps, r, row, ub_body(body, map(ps, (x) => x.pname)), ln, cl, mo, sym)
+fn ub_decl(d: Decl) : Decl = match d {
+  DFn(p, fid, tps, ps, r, row, body, ln, cl, mo) ->
+    DFn(p, fid, tps, ps, r, row, ub_body(body, map(ps, (x) => x.binder)), ln, cl, mo)
   DTest(desc, body, ln, cl, mo)      -> DTest(desc, ub_body(body, []), ln, cl, mo)
   DBench(desc, body, ln, cl, mo)     -> DBench(desc, ub_body(body, []), ln, cl, mo)
-  DCheck(desc, ps, body, ln, cl, mo) -> DCheck(desc, ps, ub_body(body, map(ps, (x) => x.pname)), ln, cl, mo)
+  DCheck(desc, ps, body, ln, cl, mo) -> DCheck(desc, ps, ub_body(body, map(ps, (x) => x.binder)), ln, cl, mo)
   _ -> d
 }
 
-fn ub_body(body: Expr, pnames: [String]) : Expr / Console = {
-  let multi = ub_repeated(list_append(pnames, ub_binders(body, [])), [], [])
-  match multi {
-    []         -> body
-    [_, ...__] -> {
-      let bodies = ub_interp_bodies(body, [])
-      let taken = ub_reads(body, bodies, ub_binders(body, pnames))
-      ub_expr(body, UbCx { env: map(pnames, (p) => (p, p)), multi: multi, taken: taken,
-                           bodies: bodies, fresh: true })
-    }
+fn ub_body(body: Expr, params: [Binder]) : Expr = {
+  let binders = list_append(params, ub_binders(body, []))
+  let multi = ub_repeated(list_append(ub_implicit(body), map(binders, ub_text)), [], [])
+  let dups = ub_repeated_ids(map(binders, (b) => b.id), [], [])
+  if list_is_empty(multi) and list_is_empty(dups) { body }
+  else {
+    ub_expr(body, UbCx { env: map(params, (b) => UbBind(b.id, b)), multi: multi, dups: dups,
+                         taken: map(ub_binders(body, params), ub_text) })
   }
+}
+
+fn ub_text(b: Binder) : String = written_text(b.name)
+
+# The names a stateful handler binds in its clauses with no binder of
+# their own: a binder of the body spelled like one is a second binding.
+fn ub_implicit(body: Expr) : [String] = if ub_has_state(body) { user_state_aliases() } else { [] }
+
+fn ub_has_state(e: Expr) : Bool = match e.kind {
+  EHandle(_, _, _, Some(_), _, _, _) -> true
+  _ -> any(xp_positions(e), (p) => match p { XP(_, c) -> ub_has_state(c) })
 }
 
 fn ub_repeated(names: [String], seen: [String], acc: [String]) : [String] = match names {
@@ -66,129 +73,79 @@ fn ub_repeated(names: [String], seen: [String], acc: [String]) : [String] = matc
     else { ub_repeated(rest, [nm, ...seen], acc) }
 }
 
+fn ub_repeated_ids(ids: [LocalId], seen: [LocalId], acc: [LocalId]) : [LocalId] = match ids {
+  []          -> acc
+  [l, ...rest] ->
+    if ub_has_id(seen, l) and not ub_has_id(acc, l) { ub_repeated_ids(rest, seen, [l, ...acc]) }
+    else { ub_repeated_ids(rest, [l, ...seen], acc) }
+}
+
+fn ub_has_id(ids: [LocalId], l: LocalId) : Bool = match ids {
+  []          -> false
+  [h, ...rest] -> local_eq(h, l) or ub_has_id(rest, l)
+}
+
 # ---- pre-scans ----
 
-# Every binding site's name, repeats kept. Interpolation bodies are left
-# out: their binders are never respelled.
-fn ub_binders(e: Expr, acc: [String]) : [String] = {
+# Every binding site's binder, repeats kept.
+fn ub_binders(e: Expr, acc: [Binder]) : [Binder] = {
   let here = match e.kind {
-    ELambda(ps, _)  -> list_append(map(ps, (p) => p.pname), acc)
+    ELambda(ps, _)  -> list_append(map(ps, (p) => p.binder), acc)
     EBlock(ss, _)   -> ub_stmt_binders(ss, acc)
     EMatch(_, arms) -> ub_arm_binders(arms, acc)
-    EHandle(_, _, _, _, _, _, cls, oret) -> ub_handle_binders(cls, oret, acc)
+    EHandle(_, _, _, _, _, cls, oret) -> ub_handle_binders(cls, oret, acc)
     _ -> acc
   }
   ub_binders_ps(xp_positions(e), here)
 }
 
-fn ub_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
+fn ub_binders_ps(ps: [XPos], acc: [Binder]) : [Binder] = match ps {
   []                  -> acc
   [XP(_, c), ...rest] -> ub_binders_ps(rest, ub_binders(c, acc))
 }
 
-fn ub_stmt_binders(ss: [Stmt], acc: [String]) : [String] = match ss {
+fn ub_stmt_binders(ss: [Stmt], acc: [Binder]) : [Binder] = match ss {
   []           -> acc
   [s, ...rest] -> ub_stmt_binders(rest, match s {
-    SLet(p, _, _)        -> ub_pat_names(p, acc)
-    SVar(nm, _, _, _, _) -> [nm, ...acc]
-    _                    -> acc
+    SLet(p, _, _)       -> ub_pat_binders(p, acc)
+    SVar(b, _, _, _, _) -> [b, ...acc]
+    _                   -> acc
   })
 }
 
-fn ub_arm_binders(arms: [Arm], acc: [String]) : [String] = match arms {
+fn ub_arm_binders(arms: [Arm], acc: [Binder]) : [Binder] = match arms {
   []                      -> acc
-  [Arm(p, _, _), ...rest] -> ub_arm_binders(rest, ub_pat_names(p, acc))
+  [Arm(p, _, _), ...rest] -> ub_arm_binders(rest, ub_pat_binders(p, acc))
 }
 
-fn ub_handle_binders(cls: [HClause], oret: Option[HReturn], acc: [String]) : [String] = {
-  let a1 = match oret { Some(HR(nm, _, _, _)) -> [nm, ...acc] None -> acc }
+fn ub_handle_binders(cls: [HClause], oret: Option[HReturn], acc: [Binder]) : [Binder] = {
+  let a1 = match oret { Some(HR(b, _, _, _)) -> [b, ...acc] None -> acc }
   ub_clause_binders(cls, a1)
 }
 
-fn ub_clause_binders(cls: [HClause], acc: [String]) : [String] = match cls {
+fn ub_clause_binders(cls: [HClause], acc: [Binder]) : [Binder] = match cls {
   []                            -> acc
-  [HC(_, ps, _, _, _), ...rest] -> ub_clause_binders(rest, list_append(map(ps, (p) => p.pname), acc))
+  [HC(_, ps, _, _, _), ...rest] -> ub_clause_binders(rest, list_append(map(ps, (p) => p.binder), acc))
 }
 
-fn ub_pat_names(p: Pattern, acc: [String]) : [String] = match p.pkind {
-  PBind(nm)                -> [nm, ...acc]
-  PAs(nm, inner)           -> ub_pat_names(inner, [nm, ...acc])
-  PNarrow(nm, _)           -> [nm, ...acc]
-  PList(ps, rest)          -> ub_pats_names(ps, match rest { Some(nm) -> [nm, ...acc] None -> acc })
-  PVariant(_, _, ps)       -> ub_pats_names(ps, acc)
-  PVariantRecord(_, _, fs) -> ub_pats_names(map(fs, ub_pfield_pat), acc)
-  PRecord(fs)              -> ub_pats_names(map(fs, ub_pfield_pat), acc)
-  PSurface(sp)             -> ub_pats_names(patsurface_children(sp), acc)
-  _                        -> acc
+fn ub_pat_binders(p: Pattern, acc: [Binder]) : [Binder] = match p.pkind {
+  PBind(b)              -> [b, ...acc]
+  PAs(b, inner)         -> ub_pat_binders(inner, [b, ...acc])
+  PNarrow(b, _)         -> [b, ...acc]
+  PList(ps, rest)       -> ub_pats_binders(ps, match rest { Some(b) -> [b, ...acc] None -> acc })
+  PVariant(_, ps)       -> ub_pats_binders(ps, acc)
+  PVariantRecord(_, fs) -> ub_pats_binders(map(fs, ub_pfield_pat), acc)
+  PRecord(fs)           -> ub_pats_binders(map(fs, ub_pfield_pat), acc)
+  PSurface(sp)          -> ub_pats_binders(patsurface_children(sp), acc)
+  _                     -> acc
 }
 
-fn ub_pats_names(ps: [Pattern], acc: [String]) : [String] = match ps {
+fn ub_pats_binders(ps: [Pattern], acc: [Binder]) : [Binder] = match ps {
   []           -> acc
-  [p, ...rest] -> ub_pats_names(rest, ub_pat_names(p, acc))
+  [p, ...rest] -> ub_pats_binders(rest, ub_pat_binders(p, acc))
 }
 
 fn ub_pfield_pat(f: PField) : Pattern = match f { PField(_, p, _) -> p }
-
-# Every name read anywhere in the body, interpolations included: a new
-# spelling must not capture a global or a user binder.
-fn ub_reads(e: Expr, bodies: [UbBody], acc: [String]) : [String] = {
-  let here = match sym_read_kind(e.kind) {
-    EVar(nm)      -> [nm, ...acc]
-    EStr(span, t3) -> ub_reads_interp(ub_span_bodies(span, t3, bodies), bodies, acc)
-    _             -> acc
-  }
-  ub_reads_ps(xp_positions(e), bodies, here)
-}
-
-fn ub_reads_ps(ps: [XPos], bodies: [UbBody], acc: [String]) : [String] = match ps {
-  []                  -> acc
-  [XP(_, c), ...rest] -> ub_reads_ps(rest, bodies, ub_reads(c, bodies, acc))
-}
-
-fn ub_reads_interp(es: [Expr], bodies: [UbBody], acc: [String]) : [String] = match es {
-  []           -> acc
-  [e, ...rest] -> ub_reads_interp(rest, bodies, ub_reads(e, bodies, acc))
-}
-
-fn ub_interp_bodies(e: Expr, acc: [UbBody]) : [UbBody] / Console = {
-  let here = match e.kind {
-    EStr(span, t3) -> ub_parse_parts(isp_parts(span, t3), acc)
-    _              -> acc
-  }
-  ub_interp_bodies_ps(xp_positions(e), here)
-}
-
-fn ub_interp_bodies_ps(ps: [XPos], acc: [UbBody]) : [UbBody] / Console = match ps {
-  []                  -> acc
-  [XP(_, c), ...rest] -> ub_interp_bodies_ps(rest, ub_interp_bodies(c, acc))
-}
-
-fn ub_parse_parts(parts: [IPart], acc: [UbBody]) : [UbBody] / Console = match parts {
-  []           -> acc
-  [p, ...rest] -> ub_parse_parts(rest, match p {
-    IpExp(src) -> [UbBody(src, parse_interp_expr(src)), ...acc]
-    IpLit(_, _) -> acc
-  })
-}
-
-fn ub_body_of(src: String, bodies: [UbBody]) : Option[Expr] = match bodies {
-  []                        -> None
-  [UbBody(s, oe), ...rest] -> if s == src { oe } else { ub_body_of(src, rest) }
-}
-
-fn ub_span_bodies(span: String, t3: Bool, bodies: [UbBody]) : [Expr] =
-  ub_part_exprs(isp_parts(span, t3), bodies)
-
-fn ub_part_exprs(parts: [IPart], bodies: [UbBody]) : [Expr] = match parts {
-  []           -> []
-  [p, ...rest] -> match p {
-    IpExp(src) -> match ub_body_of(src, bodies) {
-      Some(e) -> [e, ...ub_part_exprs(rest, bodies)]
-      None    -> ub_part_exprs(rest, bodies)
-    }
-    IpLit(_, _) -> ub_part_exprs(rest, bodies)
-  }
-}
 
 # ---- the rename walk ----
 
@@ -196,46 +153,61 @@ fn ub_expr(e: Expr, cx: UbCx) : Expr =
   Expr { kind: ub_kind(e.kind, cx), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn ub_kind(k: ExprKind, cx: UbCx) : ExprKind = match k {
-  EVar(nm)        -> EVar(ub_lookup(cx.env, nm))
+  ELocal(l)       -> ELocal(ub_lookup_id(cx.env, l))
+  EOp(r)          -> EOp(OpRef { eff: r.eff, op: r.op, via: ub_via(r.via, cx.env) })
   EIntrinsic(inm, xs) -> EIntrinsic(inm, map(xs, (c) => ub_expr(c, cx)))
-  EStr(span, t3)  -> EStr(ub_span(span, t3, cx), t3)
   ELambda(ps, b)  -> {
     let ps1 = map(ps, (p) => ub_param(p, cx))
     ELambda(ps1, ub_expr(b, ub_bind_params(ps, ps1, cx)))
   }
   EBlock(ss, ot)  -> ub_block(ss, ot, cx, [])
   EMatch(s, arms) -> EMatch(ub_expr(s, cx), map(arms, (a) => ub_arm(a, cx)))
-  EHandle(body, eff, hsym, tas, init, alias, cls, oret) -> {
-    let benv = match alias { Some(a) -> ub_keep([a], cx) None -> cx }
-    EHandle(ub_expr(body, benv), eff, hsym, tas, prc_map_opt_expr(init, (x) => ub_expr(x, cx)),
-            alias, map(cls, (c) => ub_clause(c, handle_live_aliases(init, map(cx.env, (b) => b.fst)), cx)), ub_return(oret, cx))
+  EHandle(body, eff, tas, init, alias, cls, oret) -> {
+    let benv = match alias { Some(a) -> ub_bind(cx, a, a) None -> cx }
+    EHandle(ub_expr(body, benv), eff, tas, prc_map_opt_expr(init, (x) => ub_expr(x, cx)),
+            alias, map(cls, (c) => ub_clause(c, cx)), ub_return(oret, cx))
   }
   _ -> prc_map_expr_kind(k, (c) => ub_expr(c, cx))
 }
 
-fn ub_lookup(env: [(String, String)], nm: String) : String = match env {
-  []                -> nm
-  [(s, t), ...rest] -> if s == nm { t } else { ub_lookup(rest, nm) }
+fn ub_via(v: OpVia, env: [UbBind]) : OpVia = match v {
+  ViaAmbient  -> v
+  ViaAlias(l) -> ViaAlias(ub_lookup_id(env, l))
+  ViaRecv(l)  -> ViaRecv(ub_lookup_id(env, l))
+}
+
+fn ub_lookup_id(env: [UbBind], l: LocalId) : LocalId = match env {
+  []                        -> l
+  [UbBind(id, to), ...rest] -> if local_eq(id, l) { to.id } else { ub_lookup_id(rest, l) }
 }
 
 # The spelling a binder takes at `(line, col)`.
 fn ub_name(nm: String, line: Int, col: Int, cx: UbCx) : String =
-  if not cx.fresh or not list_has(cx.multi, nm) { nm }
+  if not list_has(cx.multi, nm) { nm }
   else { ub_fresh(concat_all([nm, "__", int_to_string(line), "_", int_to_string(col)]), cx.taken) }
 
 fn ub_fresh(cand: String, taken: [String]) : String =
   if list_has(taken, cand) { ub_fresh(concat_all([cand, "_"]), taken) } else { cand }
 
-fn ub_bind(cx: UbCx, nm: String, to: String) : UbCx =
-  UbCx { env: [(nm, to), ...cx.env], multi: cx.multi, taken: cx.taken, bodies: cx.bodies, fresh: cx.fresh }
-
-fn ub_keep(names: [String], cx: UbCx) : UbCx = match names {
-  []            -> cx
-  [nm, ...rest] -> ub_keep(rest, ub_bind(cx, nm, nm))
+# The binder a binding site at `(line, col)` declares: respelled when its
+# name is bound more than once, renumbered when its id is.
+fn ub_rebound(b: Binder, line: Int, col: Int, cx: UbCx) : Binder = {
+  let nm = ub_text(b)
+  let to = ub_name(nm, line, col, cx)
+  let dup = ub_has_id(cx.dups, b.id)
+  if to == nm and not dup { b }
+  else { Binder { id: if dup { ub_site_id(b.id, line, col) } else { b.id }, name: written(to) } }
 }
 
+# The id a binder takes at one of the sites its id is bound at.
+fn ub_site_id(l: LocalId, line: Int, col: Int) : LocalId =
+  local_minted(concat_all(["#", int_to_string(local_raw(l)), "@", int_to_string(line), ":", int_to_string(col)]))
+
+fn ub_bind(cx: UbCx, b: Binder, to: Binder) : UbCx =
+  UbCx { env: [UbBind(b.id, to), ...cx.env], multi: cx.multi, dups: cx.dups, taken: cx.taken }
+
 fn ub_param(p: Param, cx: UbCx) : Param =
-  Param { pname: ub_name(p.pname, p.pline, p.pcol, cx), ptype: p.ptype,
+  Param { binder: ub_rebound(p.binder, p.pline, p.pcol, cx), ptype: p.ptype,
           pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
 
 # A clause's continuation keeps its name: the typer already rewrote every
@@ -249,7 +221,7 @@ fn ub_clause_params(ps: [Param], cx: UbCx) : [Param] = match ps {
 fn ub_bind_params(ps: [Param], ps1: [Param], cx: UbCx) : UbCx = match ps {
   []           -> cx
   [p, ...rest] -> match ps1 {
-    [q, ...rest1] -> ub_bind_params(rest, rest1, ub_bind(cx, p.pname, q.pname))
+    [q, ...rest1] -> ub_bind_params(rest, rest1, ub_bind(cx, p.binder, q.binder))
     []            -> cx
   }
 }
@@ -261,9 +233,9 @@ fn ub_block(ss: [Stmt], ot: Option[Expr], cx: UbCx, acc: [Stmt]) : ExprKind = ma
       let pr = ub_pat(p, cx)
       ub_block(rest, ot, pr.cx, [SLet(pr.pat, ann, ub_expr(rhs, cx)), ...acc])
     }
-    SVar(nm, ann, rhs, ln, cl) -> {
-      let to = ub_name(nm, ln, cl, cx)
-      ub_block(rest, ot, ub_bind(cx, nm, to), [SVar(to, ann, ub_expr(rhs, cx), ln, cl), ...acc])
+    SVar(b, ann, rhs, ln, cl) -> {
+      let to = ub_rebound(b, ln, cl, cx)
+      ub_block(rest, ot, ub_bind(cx, b, to), [SVar(to, ann, ub_expr(rhs, cx), ln, cl), ...acc])
     }
     _ -> ub_block(rest, ot, cx, [prc_map_stmt_exprs(s, (x) => ub_expr(x, cx)), ...acc])
   }
@@ -276,19 +248,18 @@ fn ub_arm(a: Arm, cx: UbCx) : Arm = match a {
   }
 }
 
-fn ub_clause(c: HClause, aliases: [String], cx: UbCx) : HClause = match c {
+fn ub_clause(c: HClause, cx: UbCx) : HClause = match c {
   HC(op, ps, body, ln, cl) -> {
     let ps1 = ub_clause_params(ps, cx)
-    let cx1 = ub_bind_params(ps, ps1, ub_keep([canonical_continuation(), ...aliases], cx))
-    HC(op, ps1, ub_expr(body, cx1), ln, cl)
+    HC(op, ps1, ub_expr(body, ub_bind_params(ps, ps1, cx)), ln, cl)
   }
 }
 
 fn ub_return(oret: Option[HReturn], cx: UbCx) : Option[HReturn] = match oret {
   None -> None
-  Some(HR(nm, body, ln, cl)) -> {
-    let to = ub_name(nm, ln, cl, cx)
-    Some(HR(to, ub_expr(body, ub_bind(cx, nm, to)), ln, cl))
+  Some(HR(b, body, ln, cl)) -> {
+    let to = ub_rebound(b, ln, cl, cx)
+    Some(HR(to, ub_expr(body, ub_bind(cx, b, to)), ln, cl))
   }
 }
 
@@ -304,36 +275,36 @@ fn ub_pat(p: Pattern, cx: UbCx) : UbPat = {
 type UbPk = { kind: PatKind, cx: UbCx }
 
 fn ub_pat_kind(k: PatKind, line: Int, col: Int, cx: UbCx) : UbPk = match k {
-  PBind(nm) -> {
-    let to = ub_name(nm, line, col, cx)
-    UbPk { kind: PBind(to), cx: ub_bind(cx, nm, to) }
+  PBind(b) -> {
+    let to = ub_rebound(b, line, col, cx)
+    UbPk { kind: PBind(to), cx: ub_bind(cx, b, to) }
   }
-  PAs(nm, inner) -> {
-    let to = ub_name(nm, line, col, cx)
-    let r = ub_pat(inner, ub_bind(cx, nm, to))
+  PAs(b, inner) -> {
+    let to = ub_rebound(b, line, col, cx)
+    let r = ub_pat(inner, ub_bind(cx, b, to))
     UbPk { kind: PAs(to, r.pat), cx: r.cx }
   }
-  PNarrow(nm, t) -> {
-    let to = ub_name(nm, line, col, cx)
-    UbPk { kind: PNarrow(to, t), cx: ub_bind(cx, nm, to) }
+  PNarrow(b, t) -> {
+    let to = ub_rebound(b, line, col, cx)
+    UbPk { kind: PNarrow(to, t), cx: ub_bind(cx, b, to) }
   }
   PList(ps, rest) -> {
     let r = ub_pats(ps, cx, [])
     match rest {
-      Some(nm) -> {
-        let to = ub_name(nm, line, col, r.cx)
-        UbPk { kind: PList(r.pats, Some(to)), cx: ub_bind(r.cx, nm, to) }
+      Some(b) -> {
+        let to = ub_rebound(b, line, col, r.cx)
+        UbPk { kind: PList(r.pats, Some(to)), cx: ub_bind(r.cx, b, to) }
       }
       None -> UbPk { kind: PList(r.pats, None), cx: r.cx }
     }
   }
-  PVariant(h, c, ps) -> {
+  PVariant(c, ps) -> {
     let r = ub_pats(ps, cx, [])
-    UbPk { kind: PVariant(h, c, r.pats), cx: r.cx }
+    UbPk { kind: PVariant(c, r.pats), cx: r.cx }
   }
-  PVariantRecord(h, c, fs) -> {
+  PVariantRecord(c, fs) -> {
     let r = ub_pats(map(fs, ub_pfield_pat), cx, [])
-    UbPk { kind: PVariantRecord(h, c, ub_refield(fs, r.pats)), cx: r.cx }
+    UbPk { kind: PVariantRecord(c, ub_refield(fs, r.pats)), cx: r.cx }
   }
   PRecord(fs) -> {
     let r = ub_pats(map(fs, ub_pfield_pat), cx, [])
@@ -361,46 +332,5 @@ fn ub_refield(fs: [PField], ps: [Pattern]) : [PField] = match fs {
   [PField(n, _, sh), ...rest] -> match ps {
     [p, ...prest] -> [PField(n, p, sh), ...ub_refield(rest, prest)]
     []            -> []
-  }
-}
-
-# ---- interpolation spans ----
-
-fn ub_span(span: String, t3: Bool, cx: UbCx) : String = match isp_parts(span, t3) {
-  []         -> span
-  [_, ...__] -> isp_rebuild(t3, map(isp_parts(span, t3), (p) => ub_part(p, cx)))
-}
-
-fn ub_part(p: IPart, cx: UbCx) : IPart = match p {
-  IpLit(_, _) -> p
-  IpExp(src)  -> match ub_body_of(src, cx.bodies) {
-    None    -> p
-    Some(e) -> {
-      let inner = UbCx { env: cx.env, multi: cx.multi, taken: cx.taken, bodies: cx.bodies, fresh: false }
-      IpExp(isp_render(src, ub_edits(ub_var_marks(e, []), ub_var_marks(ub_expr(e, inner), []), [])))
-    }
-  }
-}
-
-fn ub_var_marks(e: Expr, acc: [IdentEdit]) : [IdentEdit] = {
-  let here = match sym_read_kind(e.kind) {
-    EVar(nm) -> [IdentEdit(e.line, e.col, nm), ...acc]
-    _        -> acc
-  }
-  ub_var_marks_ps(xp_positions(e), here)
-}
-
-fn ub_var_marks_ps(ps: [XPos], acc: [IdentEdit]) : [IdentEdit] = match ps {
-  []                  -> acc
-  [XP(_, c), ...rest] -> ub_var_marks_ps(rest, ub_var_marks(c, acc))
-}
-
-# The renamed reads, paired with the originals in walk order.
-fn ub_edits(before: [IdentEdit], after: [IdentEdit], acc: [IdentEdit]) : [IdentEdit] = match before {
-  [] -> acc
-  [IdentEdit(_, _, a), ...brest] -> match after {
-    [IdentEdit(l, c, b), ...arest] ->
-      ub_edits(brest, arest, if a == b { acc } else { [IdentEdit(l, c, b), ...acc] })
-    [] -> acc
   }
 }

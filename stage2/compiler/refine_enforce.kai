@@ -4,14 +4,18 @@
 # Every other place a value flows into a refined type is decided by the
 # typer (`refine_coerce`), which knows each position's expected type.
 #
-# `__ref_pred_*` fns are skipped: match-arm narrowing calls them to
-# TEST a predicate, so an inserted check would turn a false guard into
-# a panic.
+# The predicate fn a refinement alias is given is skipped: match-arm
+# narrowing calls it to TEST a predicate, so an inserted check would
+# turn a false guard into a panic.
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.refinements
 import compiler.desugar
 import compiler.refine_coerce
+import compiler.local_names
 
 # ---- shared helpers ----
 
@@ -20,8 +24,13 @@ fn renf_preds_of(t: TypeExpr) : [Expr] = match t.tkind {
   _ -> []
 }
 
-fn renf_skip_fn(name: String) : Bool =
-  string_length(name) >= 11 and string_slice(name, 0, 11) == "__ref_pred_"
+# True when `f` is one of the predicate fns `preds`.
+fn renf_skip_fn(f: FnId, preds: [SymId]) : Bool = renf_has(preds, sym_raw(fnid_sym(f)))
+
+fn renf_has(xs: [SymId], id: Int) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> sym_raw(x) == id or renf_has(rest, id)
+}
 
 # A refinement over a dimensioned base (`Real<USD> where >= 0.0`)
 # checks the bare numeric value: the inserted assert compares
@@ -33,47 +42,53 @@ fn renf_ty_is_dim(t: TypeExpr) : Bool = match t.tkind {
   _ -> false
 }
 
-fn renf_asserts_for(name: String, preds: [Expr], ctx: String, strip: Bool) : [Stmt] =
-  map(preds, (p) => rc_assert(name, p, ctx, strip))
+fn renf_asserts_for(b: Binder, preds: [Expr], cx: RenfCx, strip: Bool) : [Stmt] =
+  map(preds, (p) => rc_assert(b, p, cx.ctx, strip, cx.tab, ln_empty()))
 
-#[doc("Check every refined fn and lambda parameter on entry.")]
-pub fn enforce_refinements_decls(decls: [Decl]) : [Decl] =
-  map(decls, renf_decl)
+# The decl a violated refinement reports, and the table that names what
+# a predicate copied from an alias refers to.
+type RenfCx = { ctx: String, tab: SymTab }
 
-fn renf_decl(d: Decl) : Decl = match d {
-  DFn(p, n, tps, params, ret, row, body, l, c, mo, fsym) ->
-    if renf_skip_fn(n) { d } else {
-      DFn(p, n, tps, params, ret, row, renf_add_param_checks(params, renf_walk(body, n), n), l, c, mo, fsym)
+#[doc("Check every refined fn and lambda parameter on entry. `tab` names the function a violated refinement reports; `pred_fns` are the predicate fns the refinement aliases were given, left unchecked.")]
+pub fn enforce_refinements_decls(decls: [Decl], tab: SymTab, pred_fns: [SymId]) : [Decl] =
+  map(decls, (d) => renf_decl(d, tab, pred_fns))
+
+fn renf_decl(d: Decl, tab: SymTab, preds: [SymId]) : Decl = match d {
+  DFn(p, f, tps, params, ret, row, body, l, c, mo) ->
+    if renf_skip_fn(f, preds) { d } else {
+      let n = written_text(decl_name(tab, fnid_sym(f)))
+      let cx = RenfCx { ctx: n, tab: tab }
+      DFn(p, f, tps, params, ret, row, renf_add_param_checks(params, renf_walk(body, cx), cx), l, c, mo)
     }
-  DTest(desc, body, l, c, mo) -> DTest(desc, renf_walk(body, desc), l, c, mo)
-  DBench(desc, body, l, c, mo) -> DBench(desc, renf_walk(body, desc), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, renf_walk(body, desc), l, c, mo)
-  DUnstable(inner, l, c) -> DUnstable(renf_decl(inner), l, c)
-  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, renf_decl(inner), l, c, mo)
-  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, renf_decl(inner), l, c, mo)
-  DConstructor(inner, l, c) -> DConstructor(renf_decl(inner), l, c)
+  DTest(desc, body, l, c, mo) -> DTest(desc, renf_walk(body, RenfCx { ctx: desc, tab: tab }), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, renf_walk(body, RenfCx { ctx: desc, tab: tab }), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, renf_walk(body, RenfCx { ctx: desc, tab: tab }), l, c, mo)
+  DUnstable(inner, l, c) -> DUnstable(renf_decl(inner, tab, preds), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, renf_decl(inner, tab, preds), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, renf_decl(inner, tab, preds), l, c, mo)
+  DConstructor(inner, l, c) -> DConstructor(renf_decl(inner, tab, preds), l, c)
   _ -> d
 }
 
-fn renf_walk(e: Expr, ctx: String) : Expr = match e.kind {
-  ELambda(ps, b) -> mk_expr(ELambda(ps, renf_add_param_checks(ps, renf_walk(b, ctx), ctx)), e.line, e.col)
-  _ -> mk_expr(dsg_map_expr_kind(e.kind, (s) => renf_walk(s, ctx)), e.line, e.col)
+fn renf_walk(e: Expr, cx: RenfCx) : Expr = match e.kind {
+  ELambda(ps, b) -> mk_expr(ELambda(ps, renf_add_param_checks(ps, renf_walk(b, cx), cx)), e.line, e.col)
+  _ -> mk_expr(dsg_map_expr_kind(e.kind, (s) => renf_walk(s, cx)), e.line, e.col)
 }
 
-fn renf_add_param_checks(params: [Param], body: Expr, fnname: String) : Expr {
-  let asserts = renf_param_asserts(params, fnname)
+fn renf_add_param_checks(params: [Param], body: Expr, cx: RenfCx) : Expr {
+  let asserts = renf_param_asserts(params, cx)
   if asserts == [] { body } else { renf_insert_after_requires(body, asserts) }
 }
 
-fn renf_param_asserts(params: [Param], fnname: String) : [Stmt] = match params {
+fn renf_param_asserts(params: [Param], cx: RenfCx) : [Stmt] = match params {
   [] -> []
   [p, ...rest] -> match p.ptype {
     Some(t) -> {
       let live = renf_drop_trivial(renf_preds_of(t))
-      list_append(renf_asserts_for(p.pname, live, fnname, renf_ty_is_dim(t)),
-                  renf_param_asserts(rest, fnname))
+      list_append(renf_asserts_for(p.binder, live, cx, renf_ty_is_dim(t)),
+                  renf_param_asserts(rest, cx))
     }
-    None -> renf_param_asserts(rest, fnname)
+    None -> renf_param_asserts(rest, cx)
   }
 }
 

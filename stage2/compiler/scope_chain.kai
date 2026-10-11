@@ -1,23 +1,21 @@
 #[doc("""
-The resolver's scope chain: a stack of scopes, each binding a name to
-the symbol it declares.
+The resolver's scope chain: a stack of scopes, each binding a written
+name to what it declares.
 
-A scope holds `(name, SymId)` pairs, not names. That is the whole
+A scope holds `(name, Bound)` pairs, not names. That is the whole
 difference from a stack of name lists: a lookup answers *which*
-declaration a name reaches, so the walker that finds it can stamp the
-identity into the tree instead of re-deriving it in every pass
+declaration or binder a name reaches, so the walker that finds it can
+write the identity into the tree instead of re-deriving it in every pass
 downstream.
 
-Ids are minted at the moment of declaring, by the scope that declares.
-A local binder is a declaration like any other — the same `declare`
-that a top-level function goes through — so no consumer needs a
-separate rule for locals.
+A name is bound to one of two things: a declaration the symbol table
+holds, or a local binder. The two are different types, so no consumer
+can take one for the other. The name itself is the resolver's lookup
+key and lives nowhere else.
 
-Local ids are negative and count down from `-2`, so they never index
-the module symbol table and no consumer can confuse the two: a
-positive id is a declaration the table knows, a negative one is a
-binder that lives and dies inside this walk. `sym_none()` is `-1`, so
-counting from `-2` keeps it distinct from every binder.
+Local ids are minted at the moment of declaring, counting up from 1
+across the whole walk. A binder that already carries an id keeps it,
+and the counter steps past it.
 
 The outermost scope holds every top-level name of the program, so it
 is not scanned: once it has grown, pushing the first inner scope folds
@@ -29,20 +27,23 @@ the newest binding of a name still wins.
 import compiler.ast
 import compiler.symtab
 
-#[doc("One binding: the name as written, and the symbol it declares.")]
-pub type ChBind = ChBind(String, SymId)
+#[doc("What a scope binds a name to: a declaration, or a local binder.")]
+pub type Bound = BDecl(SymId) | BLocal(LocalId)
+
+#[doc("One binding: the name as written, and what it declares.")]
+pub type ChBind = ChBind(String, Bound)
 
 #[doc("The outermost scope's folded bindings: newest first in `all`, and bucketed by name.")]
 pub type ChIndex = { all: [ChBind], buckets: Array[[ChBind]], nb: Int }
 
-#[doc("A stack of scopes, innermost first, the outermost scope's folded bindings, and the counter that mints local ids.")]
+#[doc("A stack of scopes, innermost first, the outermost scope's folded bindings, and the next local id to mint.")]
 pub type ScopeChain = { scopes: [[ChBind]], root: ChIndex, next_local: Int }
 
 #[doc("A chain with one empty scope and no locals minted yet.")]
 pub fn ch_new() : ScopeChain =
   ScopeChain { scopes: [[]],
                root: ChIndex { all: [], buckets: array_make(0, []), nb: 0 },
-               next_local: 0 - 2 }
+               next_local: 1 }
 
 #[doc("The same chain with a fresh innermost scope.")]
 pub fn ch_push(c: ScopeChain) : ScopeChain = match c.scopes {
@@ -90,53 +91,62 @@ pub fn ch_pop(c: ScopeChain) : ScopeChain = match c.scopes {
   [] -> c
 }
 
-#[doc("Bind `name` to `s` in the innermost scope, shadowing whatever the outer scopes bind it to.")]
-pub fn ch_bind(c: ScopeChain, name: String, s: SymId) : ScopeChain = match c.scopes {
+#[doc("Bind `name` to `b` in the innermost scope, shadowing whatever the outer scopes bind it to.")]
+pub fn ch_bind(c: ScopeChain, name: String, b: Bound) : ScopeChain = match c.scopes {
   [top, ...rest] ->
-    ScopeChain { scopes: [[ChBind(name, s), ...top], ...rest], root: c.root,
+    ScopeChain { scopes: [[ChBind(name, b), ...top], ...rest], root: c.root,
                  next_local: c.next_local }
   [] -> c
 }
 
+#[doc("The id the next `ch_declare_local` binds.")]
+pub fn ch_next_local(c: ScopeChain) : LocalId = LocalId(c.next_local)
+
 #[doc("Declare `name` as a local binder: mint a fresh id and bind it in the innermost scope.")]
 pub fn ch_declare_local(c: ScopeChain, name: String) : ScopeChain =
-  ch_bind(ScopeChain { scopes: c.scopes, root: c.root, next_local: c.next_local - 1 },
-          name, SymId(c.next_local))
+  ch_bind(ScopeChain { scopes: c.scopes, root: c.root, next_local: c.next_local + 1 },
+          name, BLocal(LocalId(c.next_local)))
 
-#[doc("The symbol `name` reaches, walking innermost scope outward, or `None` when nothing binds it.")]
-pub fn ch_lookup(c: ScopeChain, name: String) : Option[SymId] = match ch_walk(c.scopes, name) {
-  Some(s) -> Some(s)
+#[doc("Bind `name` to the binder `l`, which already carries its id. The counter steps past a numbered one, so no later binder takes the same id.")]
+pub fn ch_bind_local(c: ScopeChain, name: String, l: LocalId) : ScopeChain = {
+  let next = if local_raw(l) >= c.next_local { local_raw(l) + 1 } else { c.next_local }
+  ch_bind(ScopeChain { scopes: c.scopes, root: c.root, next_local: next }, name, BLocal(l))
+}
+
+#[doc("What `name` reaches, walking innermost scope outward, or `None` when nothing binds it.")]
+pub fn ch_lookup(c: ScopeChain, name: String) : Option[Bound] = match ch_walk(c.scopes, name) {
+  Some(b) -> Some(b)
   None    -> ch_probe(c.root, name)
 }
 
-fn ch_walk(ss: [[ChBind]], name: String) : Option[SymId] = match ss {
+fn ch_walk(ss: [[ChBind]], name: String) : Option[Bound] = match ss {
   [] -> None
   [top, ...rest] -> match ch_in(top, name) {
-    Some(s) -> Some(s)
+    Some(b) -> Some(b)
     None    -> ch_walk(rest, name)
   }
 }
 
-fn ch_in(bs: [ChBind], name: String) : Option[SymId] = match bs {
+fn ch_in(bs: [ChBind], name: String) : Option[Bound] = match bs {
   [] -> None
-  [ChBind(n, s), ...rest] -> if n == name { Some(s) } else { ch_in(rest, name) }
+  [ChBind(n, b), ...rest] -> if n == name { Some(b) } else { ch_in(rest, name) }
 }
 
-fn ch_probe(ix: ChIndex, name: String) : Option[SymId] =
+fn ch_probe(ix: ChIndex, name: String) : Option[Bound] =
   if ix.nb == 0 { None } else { ch_in(array_get(ix.buckets, st_slot(name, ix.nb)), name) }
 
 #[doc("Every local binder of `name` in scope, innermost first.")]
-pub fn ch_locals(c: ScopeChain, name: String) : [SymId] = ch_locals_in(c.scopes, name)
+pub fn ch_locals(c: ScopeChain, name: String) : [LocalId] = ch_locals_in(c.scopes, name)
 
-fn ch_locals_in(ss: [[ChBind]], name: String) : [SymId] = match ss {
+fn ch_locals_in(ss: [[ChBind]], name: String) : [LocalId] = match ss {
   [] -> []
   [top, ...rest] -> list_append(ch_locals_of(top, name), ch_locals_in(rest, name))
 }
 
-fn ch_locals_of(bs: [ChBind], name: String) : [SymId] = match bs {
+fn ch_locals_of(bs: [ChBind], name: String) : [LocalId] = match bs {
   [] -> []
-  [ChBind(n, s), ...rest] ->
-    if n == name and ch_is_local(s) { [s, ...ch_locals_of(rest, name)] } else { ch_locals_of(rest, name) }
+  [ChBind(n, BLocal(l)), ...rest] -> if n == name { [l, ...ch_locals_of(rest, name)] } else { ch_locals_of(rest, name) }
+  [_, ...rest] -> ch_locals_of(rest, name)
 }
 
 #[doc("True when `name` is bound anywhere in the chain.")]
@@ -145,13 +155,10 @@ pub fn ch_has(c: ScopeChain, name: String) : Bool = match ch_lookup(c, name) {
   None    -> false
 }
 
-#[doc("True when `s` is a local binder rather than a declaration the symbol table holds.")]
-pub fn ch_is_local(s: SymId) : Bool = sym_is_local(s)
-
 #[doc("True when a local binder shadows `name`. A declaration bound in the outermost scope does not shadow itself.")]
 pub fn ch_shadows(c: ScopeChain, name: String) : Bool = match ch_lookup(c, name) {
-  Some(s) -> ch_is_local(s)
-  None    -> false
+  Some(BLocal(_)) -> true
+  _               -> false
 }
 
 #[doc("Every name the chain binds, innermost first. Only the did-you-mean suggestion reads this.")]

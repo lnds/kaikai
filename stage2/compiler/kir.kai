@@ -14,16 +14,12 @@
 #
 # The two structural promotions this file encodes (design §2, §4.7):
 #
-#   1. The TCO/TRMC sentinels — today pipe-encoded strings planted as the
-#      callee (`__kai_tcrec|<sym>|<dropmask>|<p0>|...`,
-#      `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...`) and
-#      decoded separately by each backend (`tcrec_split_pipe` /
-#      `es_tcrec_split_pipe`) — become typed terminators
-#      (`KTcrecGoto` / `KTrmcStep` / `KTrmcApply`). No string parser survives.
+#   1. The TCO/TRMC steps — in the AST a call whose callee is a
+#      `MkTcrecStep` / `MkTrmcStep` / `MkTrmcApply` mark — become typed
+#      terminators (`KTcrecGoto` / `KTrmcStep` / `KTrmcApply`).
 #
-#   2. Perceus marks — today magic-name `ECall(EVar("__perceus_dup"), …)`
-#      indistinguishable from a real call until each backend compares the
-#      callee string — become first-class `KRCOp` statements ordered in the
+#   2. Perceus marks — in the AST a call whose callee is a mark — become
+#      first-class `KRCOp` statements ordered in the
 #      block's statement list (design §4.7). Order is list position; the
 #      translator prints in order with zero reconstruction. `borrow` is not
 #      a node: it is the `KBorrow` mode of a `KParam` plus the absence of a
@@ -35,6 +31,11 @@
 # It is metadata threaded alongside, never a node in the ~28-node match.
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.spec_names
+import compiler.rt_name
+import compiler.effect_instance
 
 # --- Position metadata (Risk 7) ----------------------------------------
 
@@ -65,7 +66,7 @@ pub type KPos = KNoPos | KAt(Int, Int)
 # `SInt32T`/`SUInt32`/`SUInt64` are the raw fixed-width registers (Int32
 # and UInt32 on i32, UInt64 on i64), one slot per TYPE so the box border
 # picks the right constructor (`kaix_int32`/`kaix_uint32`/`kaix_uint64`);
-# signedness rides the op name, not the slot. `SInt32T` is distinct from
+# signedness rides the prim's scalar, not the slot. `SInt32T` is distinct from
 # `SInt32` (the variant-tag register).
 # `SInt128` is the raw Int128 register (i128 LLVM storage), boxed via
 # `kaix_int128` through the alignment-safe halves; only `+ - *` and the
@@ -133,13 +134,73 @@ pub type KFieldInit = KFI(String, KVal)
 # move. The single-body (unforked) variant reuse keeps `RkVariant`.
 pub type KReuseKind = RkVariant | RkCons | RkTokenVariant | RkDonorVariant | RkVariantMove
 
+# --- Primitives: what a `KPrim` applies ---------------------------------
+
+#[doc("The scalar a raw primitive computes over, one per raw register slot.")]
+pub type RawScalar = RwReal | RwInt | RwBool | RwChar | RwByte | RwInt32 | RwUInt32 | RwUInt64 | RwInt128
+
+#[doc("How a fixed-width vec read reaches its element: `heap` through the runtime slot of a boxed base instead of the inline aggregate, `raw` leaving the loaded word unboxed, `dyn` gating the index against the static length.")]
+pub type KVecRead = { heap: Bool, raw: Bool, dyn: Bool }
+
+#[doc("How a fused Vec access moves one payload: a bare Int word or a bare Real word.")]
+pub type VecBits = VbInt | VbReal
+
+#[doc("Which primitive a `KPrim` applies. `kir_prims` holds the spelling the dump prints.")]
+pub type PrimOp
+  = KpBin(BinOp)                  # boxed operator helper
+  | KpUn(UnOp)                    # boxed negation / `not` helper
+  | KpRawBin(RawScalar, BinOp)    # raw arithmetic or comparison; over Bool also `and` / `or`
+  | KpRawUn(UnOp)                 # raw Real negation / raw Bool `not`
+  | KpBox(RawScalar)              # raw register → a fresh box
+  | KpUnbox(RawScalar)            # box → its raw payload, borrowing the box
+  | KpField                       # record field read by name
+  | KpFieldAt                     # record field read by constant index
+  | KpFieldBorrow                 # record field read by name, as a view
+  | KpEqRaw                       # literal-pattern equality, borrowing both operands
+  | KpTagEq                       # variant tag test against a constant tag
+  | KpNil
+  | KpCons
+  | KpArenaCons                   # cons cell bump-allocated in the ambient region
+  | KpIsCons
+  | KpIsNil
+  | KpListAppend
+  | KpStringConcat
+  | KpPanic
+  | KpRange
+  | KpRangeStep
+  | KpVecRead(VecBits)            # `vec_get(v, i)` on a flat-scalar vec, as a bare word
+  | KpVecReadField(VecBits)       # `vec_get(v, i).f` on an inline-record vec, as a bare word
+  | KpVecReadFieldBoxed           # the same column, as the box its buffer tag builds
+  | KpVecPush(VecBits)            # `vec_push(v, x)` of a bare word
+  | KpVecSet(VecBits)
+  | KpVecPushRec                  # `vec_push(v, Rec{..})` over bare-word fields
+  | KpVecSetRec
+  | KpVecPushRecRaw               # the record writes over boxed field values
+  | KpVecSetRecRaw
+  | KpAssertCheck
+  | KpAssertCheckWithValue
+  | KpResumeFramesRun
+  | KpResumeFramePush
+  | KpSegHandle
+  | KpSegRequest
+  | KpUnwFiber                    # the current fiber, for the unwind frames below
+  | KpUnwPush                     # unwind frame holding registers
+  | KpUnwPushReg                  # unwind frame holding one named register
+  | KpUnwPushState                # unwind frame holding a handler site's state
+  | KpUnwPop
+  | KpPadOpen                     # open a landing pad releasing the operand registers
+  | KpPadClose                    # close it, reopening the operand pad if any
+  | KpFixedVecLit(RawScalar, Int)             # element scalar, static length
+  | KpFixedVecMaterialize(RawScalar, Int)     # inline aggregate → a dynamic vec
+  | KpFixedVecGet(KVecRead, RawScalar, Int)
+
 # --- Ops: the RHS of a binding; all operands are atoms (design §4.4) ----
 
 pub type KOp
   = KCall(String, [KVal])                       # direct call to a known fn (symbol resolved)
   | KCallIndirect(KVal, [KVal])                 # closure / function value
   | KCallIndirectBorrow(KVal, [KVal])           # borrowing indirect call (#1130): invokes without consuming the closure
-  | KPrim(String, [KVal])                       # inline builtins (+, -, ==, kai_intf, ...)
+  | KPrim(PrimOp, [KVal])                       # a primitive: an operator helper, a raw instruction, a runtime entry
   | KCon(String, Int, Int, [KSlotInit], Bool)   # constructor: ctor name, tag, slot mask, slot inits, in-region (bump-allocate in the ambient arena)
   | KRecord([KFieldInit], Bool, Int)            # record literal: (field name, value) pairs, in-region, head tag (0 = none)
   | KConReuse(KReuseKind, KVal, String, Int, [KSlotInit])   # variant/cons reuse-in-place: kind, donor, ctor, tag, inits (ex __perceus_reuse_{variant,cons})
@@ -164,13 +225,7 @@ pub type KOp
   | KProjKind(KVal, Int, Int)                   # read typed slot i at its static kind (native fast path)
   | KTagOf(KVal)                                # read the variant tag (scrutinee for KSwitch)
   | KClosure(String, Int, [KVal])               # thunk sym + arity + precomputed captures (what fv_* resolves today)
-  # The `SymId` after the effect name is the declaration the perform
-  # reaches. The name alone cannot say WHICH `Emit` is performed when
-  # two modules declare one, and this is the boundary where that was
-  # lost: everything downstream of KIR — both emitters, the handler
-  # lookup, the evidence frame — had only the string.
-  # `sym_none()` when the lowering had no id to carry.
-  | KPerform(String, SymId, String, [KVal])     # effect, effect id, op, args (raises to handler)
+  | KPerform(SymId, [Ty], String, KVia, [KVal])  # effect, the instance's type arguments, op label, evidence route, args (raises to handler)
   | KSetjmp(String, String)                     # set a handler landing pad: effect, install-site sym; yields i32 (0 = body path, !=0 = longjmp return)
   # `resume(v)` is an EXPRESSION-call (`kai_cont_resume(k, v)`), NOT a block
   # terminator — the exact shape the C-direct oracle emits (emit_c.kai). The
@@ -184,6 +239,12 @@ pub type KOp
   | KResumeOp(KVal, KVal)                       # cont, arg — one-shot resume as a call (= kai_cont_resume)
   | KResume2Op(KVal, KVal, KVal)                # cont, arg, new_state — 2-arg stateful resume as a call
   | KLitOp(KVal)                                 # a bare atom as an op RHS (e.g. `let t = 3`)
+
+#[doc("Which evidence a perform dispatches through: the enclosing fn's frame slot or the innermost handler; the innermost handler alone, for a perform under a `handle` of its instance in the same fn; the cell an alias names, by the alias's written name; or the node a register holds.")]
+pub type KVia = KvAmbient | KvLexical | KvAlias(String) | KvRecv(String)
+
+#[doc("The instance key of the effect `s` at the type arguments `targs`: what a frame slot and an evidence lookup are keyed by.")]
+pub fn kir_eff_key(tab: SymTab, s: SymId, targs: [Ty]) : String = key_of(rt_name(tab, s), map(targs, ty_text))
 
 # --- Perceus RC ops (design §4.7) — first-class, NOT annotations --------
 
@@ -234,19 +295,21 @@ pub type KStmt
 # which old params drop INSIDE the re-loop.
 pub type KAssign = KAsg(Int, KVal)
 
+#[doc("The cell a modulo-cons step builds: the builtin cons, carrying the spelling the dump prints, or a user variant by constructor name.")]
+pub type KSpine = KSpineCons(String) | KSpineCtor(String)
+
 # Note vs design §4.2: the single `KTrmcGoto` is split into `KTrmcStep`
-# (the modulo-cons site, `__kai_trmc|...`) and `KTrmcApply` (the terminal
-# leaf plug, `__kai_trmc_apply`, surfaced by emit_c.kai:1991). Both are
-# real sentinels today; one terminator each keeps the translator's match
-# exhaustive without a malformed-string fallback.
+# (the modulo-cons site, `MkTrmcStep`) and `KTrmcApply` (the terminal
+# leaf plug, `MkTrmcApply`): one terminator each keeps the translator's
+# match exhaustive.
 pub type KTerm
   = KRet(KVal, KPos)
   | KBr(String, KPos)                                  # unconditional branch to a label
   | KCondBr(KVal, String, String, KPos)                # cond, then-label, else-label
   | KSwitch(KVal, [KCase], String, KPos)               # switch on a tag atom, cases, default label
   | KTcrecGoto(String, [KAssign], Int, KPos)           # ex __kai_tcrec: loop label, reloop assigns, dropmask
-  | KTrmcStep(String, Int, String, Int, Int, Int, [KVal], [KAssign], Bool, KPos)
-                                                       # ex __kai_trmc: loop label, hole slot, cname, ctor tag,
+  | KTrmcStep(String, Int, KSpine, Int, Int, Int, [KVal], [KAssign], Bool, KPos)
+                                                       # ex __kai_trmc: loop label, hole slot, spine, ctor tag,
                                                        # slot_mask (the full variant_slot_mask of the ctor — the
                                                        # native spine step lays each slot at its kind),
                                                        # dropmask, head_vals (non-hole ctor args, build the cell),
@@ -254,8 +317,8 @@ pub type KTerm
                                                        # in_region (a region-branded body's spine step bump-allocates
                                                        # its fresh cell in the arena — the token is always null there).
                                                        # The tag is the variant ctor tag (resolved at lower time, as
-                                                       # KCon carries it); -1 for the builtin-cons spine (cname
-                                                       # `__kai_cons`), whose backend path needs no tag. The
+                                                       # KCon carries it); -1 for the builtin-cons spine
+                                                       # (`KSpineCons`), whose backend path needs no tag. The
                                                        # self-call is NEVER lowered as a value — it is the
                                                        # back-edge, mirroring KTcrecGoto. See lower_trmc_step.
   | KTrmcApply(KVal, KPos)                             # ex __kai_trmc_apply: plug leaf into open cctx hole
@@ -375,9 +438,17 @@ pub type KParam = { name: String, slot: KSlot, mode: KMode, origin: KParamOrigin
 # leftover at exit. The C backend derives the same set independently
 # (`emit_reuse_donate`); the KIR carries it so signatures and call sites
 # agree across every native partition.
+#
+# `entry` marks the program's entry point: the one fn the runtime calls
+# by a fixed symbol, decided where the declaration was in hand. No fn is
+# in a build that starts its runner.
+#
+# `fid` is the declaration a fn was lowered from, the unresolved identity
+# for a lifted lambda, a clause and a runner: a table about declared fns
+# is asked by it, never by `sym`.
 pub type KFn = { sym: String, kind: KFnKind, params: [KParam], ret: KSlot,
                  blocks: [KBlock], region_id: Option[Int], stateful: Bool,
-                 mo: Option[String], donor: Bool }
+                 mo: Option[String], donor: Bool, entry: Bool, fid: FnId }
 
 # --- Type declarations (design §4.1) -----------------------------------
 
@@ -394,10 +465,8 @@ pub type KRegion = KRgn(Int, String)   # region id, descriptive name
 
 # --- The top-level program (design §4.1) -------------------------------
 
-# `install_order` is the default-handler installation order (today the
-# C-only `builtin_default_install_order` + install loop — the #1 reason
-# effects diverged between backends). Promoting it to a `KProgram` field
-# makes it the single source of truth both translators read.
+# `install_order` is the default-handler installation order, as labels:
+# the one list both translators read.
 #
 # `defaults` resolves each effect in `install_order` (that carries an
 # all-`$extern_handler` default block) to its op→runtime-symbol map.
@@ -425,11 +494,18 @@ pub type KRegion = KRgn(Int, String)   # region id, descriptive name
 # handler, not a dispatch shape (a separate burn-down).
 # `runner_defaults` replaces `defaults` in a test / bench entry, whose
 # blocks have no row and may perform any default-handled effect.
+# `entry` is what the binary starts, a declaration or the runner of a
+# test / bench entry, for the tables a backend still builds from the
+# declarations.
+# `tab` is the symbol table the program's ids index: a dump or an emitter
+# spells a declaration's name from it. `ids` says which functions the
+# protocol lowering generated.
 pub type KProgram = { types: [KTypeDecl], fns: [KFn],
                       handlers: [KHandlerDecl], install_order: [String],
                       defaults: [KDefault], runner_defaults: [KDefault],
                       synth_defaults: [KDefault],
-                      regions: [KRegion], runners: [KRunner] }
+                      regions: [KRegion], runners: [KRunner],
+                      entry: SymId, tab: SymTab, specs: SpecNames, ids: ProtoIds, reuse_tags: [Int] }
 
 # One test / bench / check block lowered as a runner. `sym` names the
 # emitted body fn (a `KFn` in `KProgram.fns` returning the block's final
@@ -444,12 +520,12 @@ pub type KProgram = { types: [KTypeDecl], fns: [KFn],
 pub type KRunnerKind = KRTest | KRBench | KRCheck([String])
 pub type KRunner = { sym: String, desc: String, kind: KRunnerKind, line: Int, home: String }
 
-# One installable default handler: the effect name and its ops in
+# One installable default handler: the effect and its ops in
 # declaration order (field index = `nfx_op_base` + position). Each op
 # carries the runtime forwarder symbol the install stores into the Ev
 # blob (the `kaix_default_<eff>_<op>` mirror of the `$extern_handler`
 # C symbol; see `lvm_kaix_symbol`).
-pub type KDefault = KDef(String, SymId, [KDefOp])
+pub type KDefault = KDef(SymId, [KDefOp])
 pub type KDefOp = KDOp(String, String, Int)   # op name → runtime forwarder sym, its param count
 
 # A handler declaration: the effect it handles, its clause-body thunk
@@ -459,11 +535,22 @@ pub type KDefOp = KDOp(String, String, Int)   # op name → runtime forwarder sy
 # install (which fills the Ev `env` array) and the clause prologue (which
 # indexes it via `PEnvCapture`) must agree on. Computed once at lowering
 # so neither backend re-derives it (§5). Empty when no clause captures.
-pub type KHandlerDecl = { eff: String, eff_sym: SymId, sym: String,
+pub type KHandlerDecl = { eff_sym: SymId, sym: String,
                           op_thunks: [KOpThunk], ret_thunk: Option[String],
                           env_caps: [String] }
 
 pub type KOpThunk = KOT(String, String, Int)   # op name → thunk sym, its param count (0: defined in this module)
+
+#[doc("The op of a perform as a dump prints it: the label, then `@alias`, `#receiver`, or `!` for a handler of this fn.")]
+pub fn kir_op_text(op: String, via: KVia) : String = match via {
+  KvAmbient  -> op
+  KvLexical  -> string_concat(op, "!")
+  KvAlias(a) -> string_concat(op, string_concat("@", a))
+  KvRecv(r)  -> string_concat(op, string_concat("#", r))
+}
+
+#[doc("Register an aliased install stashes its handler id under; an aliased perform, and a closure capturing the alias, read it back.")]
+pub fn kir_alias_id_reg(a: String) : String = string_concat("__alias_id__", a)
 
 #[doc("Register a clause body reads its continuation from — kept outside the user identifier space so a clause-register alloca can never be clobbered by a user binder (e.g. a match payload `Dot(k)`).")]
 pub fn kir_resume_reg() : String = "__k"

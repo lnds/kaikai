@@ -17,7 +17,8 @@
 # file sizes — contained.
 
 import compiler.ast
-import compiler.fnreg
+import compiler.written
+import compiler.marks
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_lower_ptest
@@ -70,10 +71,10 @@ pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
   # whole scrutinee in the matched body. Mirror of the oracle's `emit_pat_test`
   # delegating to the inner (`PAs(_, sub) -> emit_pat_test(sub)`) plus its
   # `emit_pat_binds` binding the as-name to the scrutinee.
-  PAs(name, inner) -> match inner.pkind {
+  PAs(b, inner) -> match inner.pkind {
     PList(pats, opt_rest) -> match lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, reuse_arm, st) {
       LMArm(st_body, fail_lbl) ->
-        LMArm(lm_bind_name(name, KLitOp(scrv), p, st_body), fail_lbl)
+        LMArm(lm_bind_name(b, KLitOp(scrv), p, st_body), fail_lbl)
     }
     _ -> lm_emit_catchall_arm(p, scrv, body_lbl, st)
   }
@@ -82,7 +83,7 @@ pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
 
 # Emit the cons/nil discrimination + head/tail binds for one list arm,
 # sealing into `body_lbl` on a match and a fresh fail label on a mismatch.
-fn lm_emit_list_arm(pats: [Pattern], opt_rest: Option[String], scrv: KVal,
+fn lm_emit_list_arm(pats: [Pattern], opt_rest: Option[Binder], scrv: KVal,
                     body_lbl: String, p: Pattern, reuse_arm: Bool, st: LowerSt) : LMArm / Console =
   match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
     let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, reuse_arm, st1)
@@ -101,9 +102,9 @@ fn lm_emit_catchall_arm(p: Pattern, scrv: KVal, body_lbl: String,
 # Bind a catch-all arm's name (a whole-list binder or as-pattern) to the
 # scrutinee. PWild / PHole bind nothing.
 fn lm_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind {
-  PBind(name)  -> lm_bind_name(name, KLitOp(scrv), p, st)
-  PAs(name, _) -> lm_bind_name(name, KLitOp(scrv), p, st)
-  _            -> st
+  PBind(b)  -> lm_bind_name(b, KLitOp(scrv), p, st)
+  PAs(b, _) -> lm_bind_name(b, KLitOp(scrv), p, st)
+  _         -> st
 }
 
 # Walk the N fixed cons cells of a list arm, then close on the tail. Each
@@ -115,7 +116,7 @@ fn lm_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind 
 # its discriminating sub-patterns (mismatch → `fail_lbl`), then BINDS — the
 # head test runs BEFORE the bind (the oracle's `emit_pat_test` precedes
 # `emit_pat_binds`), so `r` only binds once `snd` is confirmed `JReal`.
-pub fn lm_emit_cells(pats: [Pattern], opt_rest: Option[String], cur: KVal,
+pub fn lm_emit_cells(pats: [Pattern], opt_rest: Option[Binder], cur: KVal,
                  body_lbl: String, fail_lbl: String, reuse_arm: Bool, st: LowerSt) : LowerSt / Console =
   match pats {
     [] -> lm_close_tail(opt_rest, cur, body_lbl, fail_lbl, st)
@@ -156,7 +157,7 @@ fn lm_emit_head(hp: Pattern, cur: KVal, fail_lbl: String, st: LowerSt) : LowerSt
 # cells, not exit the arm — so we hand it a fresh `cont` label and reopen there,
 # the same `ls_fresh_label` + `reopen` shape `pt_test` uses for a
 # discriminating variant head. A mismatch routes to the shared `fail_lbl`.
-fn lm_emit_head_list(pats: [Pattern], opt_rest: Option[String], headv: KVal,
+fn lm_emit_head_list(pats: [Pattern], opt_rest: Option[Binder], headv: KVal,
                      fail_lbl: String, st: LowerSt) : LowerSt / Console =
   match ls_fresh_label(st) { LSLabel(cont, st1) -> {
     let st2 = lm_emit_cells(pats, opt_rest, headv, cont, fail_lbl, false, st1)
@@ -165,10 +166,10 @@ fn lm_emit_head_list(pats: [Pattern], opt_rest: Option[String], headv: KVal,
 
 # After the fixed heads: a rest binder accepts any tail (bind it, branch to
 # the body); no rest binder demands the tail be `KAI_NIL` (exact length).
-fn lm_close_tail(opt_rest: Option[String], cur: KVal, body_lbl: String,
+fn lm_close_tail(opt_rest: Option[Binder], cur: KVal, body_lbl: String,
                  fail_lbl: String, st: LowerSt) : LowerSt / Console = match opt_rest {
-  Some(name) -> {
-    let st1 = lm_bind_name(name, KLitOp(cur), mk_pat(PWild, 0, 0), st)
+  Some(b) -> {
+    let st1 = lm_bind_name(b, KLitOp(cur), mk_pat(PWild, 0, 0), st)
     ls_seal(st1, KBr(body_lbl, KNoPos), fail_lbl)
   }
   None -> ls_seal(pt_cell_test(cur, pt_is_nil(), fail_lbl, st), KBr(body_lbl, KNoPos), fail_lbl)
@@ -181,11 +182,11 @@ fn lm_close_tail(opt_rest: Option[String], cur: KVal, body_lbl: String,
 # record's named fields), now safe because `pt_test` tested every
 # discriminating tag first. PWild / PHole / PLit bind nothing.
 fn lm_bind_head_value(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console = match hp.pkind {
-  PBind(name)          -> lm_bind_name(name, KLitOp(headv), hp, st)
-  PAs(name, _)         -> lm_bind_head_as(hp, name, headv, st)
+  PBind(b)             -> lm_bind_name(b, KLitOp(headv), hp, st)
+  PAs(b, _)            -> lm_bind_head_as(hp, b, headv, st)
   PRecord(_)           -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
-  PVariant(_, _, _)       -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
-  PVariantRecord(_, _, _) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
+  PVariant(_, _)       -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
+  PVariantRecord(_, _) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
   PList(_, _)          -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
   _                    -> st
 }
@@ -193,14 +194,14 @@ fn lm_bind_head_value(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console
 # The common case: a simple head binder reads slot 0 directly (`KLet name =
 # proj cur 0`), no intermediate register. PWild / PHole read nothing.
 fn lm_bind_head(hp: Pattern, cur: KVal, st: LowerSt) : LowerSt = match hp.pkind {
-  PBind(name) -> lm_bind_name(name, KProj(cur, 0), hp, st)
-  _           -> st
+  PBind(b) -> lm_bind_name(b, KProj(cur, 0), hp, st)
+  _        -> st
 }
 
 # An as-pattern head (`name @ inner`): bind the whole head to `name`, then
 # bind the inner pattern against the same head value.
-fn lm_bind_head_as(hp: Pattern, name: String, headv: KVal, st: LowerSt) : LowerSt / Console = {
-  let st1 = lm_bind_name(name, KLitOp(headv), hp, st)
+fn lm_bind_head_as(hp: Pattern, b: Binder, headv: KVal, st: LowerSt) : LowerSt / Console = {
+  let st1 = lm_bind_name(b, KLitOp(headv), hp, st)
   lm_bind_head_value(as_inner(hp), headv, st1)
 }
 
@@ -209,8 +210,8 @@ fn lm_bind_head_as(hp: Pattern, name: String, headv: KVal, st: LowerSt) : LowerS
 # exactly the set `pat_ubinds` collected, so perceus's already-placed KRC
 # nodes stay balanced. The variant `bind_sub_binders` binds unconditionally
 # for the same reason; KIR `KLet` never increfs (refcounting is KRC nodes).
-fn lm_bind_name(name: String, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
-  ls_emit(st, KLet(name, SBoxed, op, KAt(p.line, p.col)))
+fn lm_bind_name(b: Binder, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
+  ls_let(st, b, SBoxed, op, KAt(p.line, p.col))
 
 # --- issue #858: structural incref of OWNED-match alias binders ----------
 #
@@ -244,7 +245,7 @@ fn lm_bind_name(name: String, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
 # increfs the OUTER register — on a path where that one is never stored,
 # a load of undefined memory the optimiser folds away with the branch
 # guarding it. Resolve like any other body read.
-pub fn lm_dup_alias_binders(names: [String], pos: KPos, st: LowerSt) : LowerSt = match names {
+pub fn lm_dup_alias_binders(names: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match names {
   []           -> st
   [n, ...rest] -> lm_dup_alias_binders(rest, pos, ls_emit(st, KRC(KDup(KVar(ls_reg_of(st, n))), pos)))
 }
@@ -275,7 +276,7 @@ fn arm_reuse_kind(k: ExprKind) : Bool = match k {
   EMatch(s, _arms) -> arm_body_uses_reuse(s)
   EBlock(stmts, tail) -> arm_reuse_stmts(stmts) or
                          match tail { None -> false Some(e) -> arm_body_uses_reuse(e) }
-  ERecordLit(_, _, fs) -> arm_reuse_field_inits(fs)
+  ERecordLit(_, fs) -> arm_reuse_field_inits(fs)
   EList(elems)      -> arm_reuse_list_elems(elems)
   EBinop(_, a, b)   -> arm_body_uses_reuse(a) or arm_body_uses_reuse(b)
   EUnop(_, a)       -> arm_body_uses_reuse(a)
@@ -287,7 +288,7 @@ fn arm_reuse_kind(k: ExprKind) : Bool = match k {
 }
 
 fn arm_reuse_call_head(cf: Expr) : Bool = match cf.kind {
-  EVar(nm) -> string_starts_with_q(nm, "__perceus_reuse_")
+  EMark(m) -> mark_is_reuse(m)
   _        -> false
 }
 

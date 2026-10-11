@@ -213,36 +213,6 @@ pub fn nemit_resume_frames_run(ctx: Handle, cargs: [KVal]) : Handle / Console = 
   _ -> { nemit_unsupported(ctx, "kai_resume_frames_run takes the install site and a value"); nemit_null(ctx) }
 }
 
-# Split an `<op>@<alias>` tag (the resolver's per-instance dispatch
-# marker). `nfx_op_before_at` returns the bare op; `nfx_op_alias` returns
-# the alias as `Some` when tagged. A local `@`-scan keeps this off the
-# infer module (`string_index_of_at` lives there — importing it would
-# cycle); mirrors emit_c's split semantics (emit_c.kai:2333).
-fn nfx_at_index(s: String) : Int = nfx_at_loop(s, 0, string_length(s))
-fn nfx_at_loop(s: String, i: Int, n: Int) : Int =
-  if i >= n { 0 - 1 }
-  else { if char_at_or_zero(s, i) == '@' { i } else { nfx_at_loop(s, i + 1, n) } }
-fn nfx_op_before_at(op: String) : String = {
-  let at = nfx_at_index(op)
-  if at >= 0 { string_slice(op, 0, at) } else { op }
-}
-fn nfx_op_alias(op: String) : Option[String] = {
-  let at = nfx_at_index(op)
-  if at >= 0 { Some(string_slice(op, at + 1, string_length(op))) } else { None }
-}
-
-# Split an `<op>#<recv>` tag (§6 named instances): the bare op resolves the
-# clause field; the receiver names the register holding the evidence node the
-# perform dispatches through. Mirrors emit_c's `#` split (emit_c.kai:2409).
-fn nfx_op_before_hash(op: String) : String = {
-  let h = string_index_of_char(op, '#')
-  if h >= 0 { string_slice(op, 0, h) } else { op }
-}
-fn nfx_op_recv(op: String) : Option[String] = {
-  let h = string_index_of_char(op, '#')
-  if h >= 0 { Some(string_slice(op, h + 1, string_length(op))) } else { None }
-}
-
 # The evidence node a perform dispatches through. By-id for an aliased op
 # (resolve THIS handler instance via the `__alias_id__<a>` sentinel). Else,
 # when the enclosing fn's frame carries this effect, read its slot from `__evf`
@@ -294,8 +264,8 @@ fn nemit_perform_walk_node(ctx: Handle, key: String) : Handle / Console = {
     # be a zeroed node minted for a fiber-local effect that has no real default
     # (its handler slot is NULL). Guard the or_default result so such a node
     # reports `effect not handled in fiber` instead of segfaulting on the deref,
-    # matching the C backend (which guards by `effect_has_default_block`, not the
-    # global's presence).
+    # matching the C backend (which guards by the effect declaring a default, not
+    # the global's presence).
     let node = ncall_sig2(ctx, "kaix_evidence_lookup_or_default", p, p, p, effname, g)
     ncall_sig2(ctx, "kaix_evidence_require", p, p, p, node, effname)
   }
@@ -322,23 +292,17 @@ fn nemit_evf_load_slot(ctx: Handle, cur_fn: String, slot: Int) : Handle / Consol
 # guard, indirect-call the op fn-ptr at its field index, restore the
 # guard, then `kaix_op_finish` (the folded discard test + unwind — on a
 # discard it longjmps and does not return; otherwise yields the op result).
-pub fn nemit_perform(ctx: Handle, cur_fn: String, eff: String, esym: SymId, op: String, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console = {
-  # Two dispatch tags can ride the op name. `<op>#<recv>` (§6 named instances):
-  # the evidence is the register `recv` (a capability param or `with..as` value).
-  # `<op>@<alias>`: the legacy by-id lookup for a `var`/State/Reader cell. The
-  # bare op (stripped of both) resolves the clause field.
-  # A trailing `!` marks a perform inside a `handle` of `eff` in this fn: its
-  # evidence is that handler, so the frame slot is not consulted.
-  let lex = string_ends_with_bang(op)
-  let op0 = if lex { string_slice(op, 0, string_length(op) - 1) } else { op }
-  let recv = nfx_op_recv(op0)
-  let no_hash = nfx_op_before_hash(op0)
-  let bare = nfx_op_before_at(no_hash)
-  let alias = nfx_op_alias(no_hash)
-  let slot_fn = if lex { "" } else { cur_fn }
+pub fn nemit_perform(ctx: Handle, cur_fn: String, eff: String, esym: SymId, op: String, via: KVia, cargs: [KVal], handlers: [KHandlerDecl]) : Handle / Console = {
+  # A receiver is the register holding the evidence (a capability param or a
+  # `with..as` value); an alias is the by-id lookup for a `var`/State/Reader
+  # cell. A perform inside a `handle` of `eff` in this fn has that handler
+  # for evidence, so the frame slot is not consulted.
+  let slot_fn = match via { KvLexical -> ""  _ -> cur_fn }
+  let alias = match via { KvAlias(a) -> Some(a)  _ -> None }
+  let recv = match via { KvRecv(r) -> Some(r)  _ -> None }
   match nfx_find_handler_by_eff(handlers, esym) {
     None -> { nemit_unsupported(ctx, cat2("KPerform: no handler for effect ", eff)); nemit_null(ctx) }
-    Some(h) -> nemit_perform_with(ctx, slot_fn, eff, bare, alias, recv, cargs, h)
+    Some(h) -> nemit_perform_with(ctx, slot_fn, eff, op, alias, recv, cargs, h)
   }
 }
 
@@ -440,9 +404,4 @@ pub fn nemit_resume2(ctx: Handle, k: KVal, v: KVal, ns: KVal) : Handle / Console
   let kv = nemit_atom(ctx, k)
   let vv = nemit_atom(ctx, v)
   ncall_sig2(ctx, "kaix_cont_resume", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), kv, vv)
-}
-
-fn string_ends_with_bang(s: String) : Bool = {
-  let n = string_length(s)
-  n > 0 and string_slice(s, n - 1, n) == "!"
 }

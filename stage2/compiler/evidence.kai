@@ -19,7 +19,7 @@
 # Instance identity is the alias the surface attaches to a handler
 # (`with State[Int](0) as c1` → `State@c1`); two `State@c1` / `State@c2`
 # are two obligations, one `State@c1` performed twice is one. A bare
-# (unaliased) handler keys on the effect name alone — the by-name
+# (unaliased) handler keys on the effect alone — the by-name
 # dynamic dispatch the redesign retires, and the seam the collision
 # lives in.
 #
@@ -33,32 +33,37 @@
 
 import compiler.util
 import compiler.ast
-import compiler.sym_read
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.local_names
+import compiler.entry
 import compiler.infer
 import compiler.evidence_scan
 
 # How an obligation is satisfied at the demanding function.
 pub type Supplier
-  = SupLexical(String)   # an enclosing in-body `handle` (its instance label)
+  = SupLexical(OblFrame) # an enclosing in-body `handle` (its instance)
   | SupForward           # the function's own row carries it on to the caller
   | SupDefault           # a builtin / `default {}` effect installed at startup
   | SupCollision(String) # op-name collision: no honest evidence (the note)
 
-# One demanded effect-instance and the supplier that discharges it. `eff`
-# is the full instance label (`State@c1` or bare `State`); `op` is the
-# op whose call raised the demand (the site that proves the obligation).
-pub type Obligation = Obl(String, String, Supplier)
+# One demanded effect-instance and the supplier that discharges it: the
+# instance, the op whose call raised the demand (the site that proves the
+# obligation), the receiver that call went through (`local_none()` when
+# none), the supplier.
+pub type Obligation = Obl(OblFrame, Written, LocalId, Supplier)
 
-# A live handler frame: the handled effect plus its instance identity
-# (the `as <alias>` name), so two cells of one effect stay distinct.
-pub type OblFrame = OF(String, Option[String])
+# An effect instance: the effect plus the `as <alias>` binder of the
+# handler that owns it, so two cells of one effect stay distinct.
+pub type OblFrame = OF(SymId, Option[Binder])
 
 #[doc("evidence: per-effect extern-handlerable `default {}` op names, rebuilt from the decls.")]
-pub fn obl_default_ops(decls: [Decl], eff: String) : [String] = match decls {
+pub fn obl_default_ops(decls: [Decl], eff: SymId) : [String] = match decls {
   []           -> []
   [d, ...rest] -> match d {
-    DEffect(_, n, _, _, defblk, _, _, _, _) ->
-      if n == eff { obl_defblk_extern_ops(defblk) } else { obl_default_ops(rest, eff) }
+    DEffect(_, s, _, _, defblk, _, _, _) ->
+      if sym_same(s, eff) { obl_defblk_extern_ops(defblk) } else { obl_default_ops(rest, eff) }
     _ -> obl_default_ops(rest, eff)
   }
 }
@@ -71,30 +76,30 @@ fn obl_defblk_extern_ops(defblk: Option[DefaultBlock]) : [String] = match defblk
 fn obl_extern_clause_ops(cs: [HClause]) : [String] = match cs {
   []           -> []
   [c, ...rest] -> match c {
-    HC(name, _, body, _, _) ->
-      if obl_body_is_extern_handler(body) { [name, ...obl_extern_clause_ops(rest)] }
+    HC(h, _, body, _, _) ->
+      if obl_body_is_extern_handler(body) { [clause_head_word(h), ...obl_extern_clause_ops(rest)] }
       else { obl_extern_clause_ops(rest) }
   }
 }
 
 fn obl_body_is_extern_handler(body: Expr) : Bool = match body.kind {
-  EIntrinsic(name, _) -> name == "extern_handler"
-  _                   -> false
+  EIntrinsic(InExternHandler, _) -> true
+  _                              -> false
 }
 
-fn obl_is_effect_declared(eff: String, decls: [Decl]) : Bool = match decls {
+fn obl_is_effect_declared(eff: SymId, decls: [Decl]) : Bool = match decls {
   []           -> false
   [d, ...rest] -> match d {
-    DEffect(_, n, _, _, _, _, _, _, _) -> if n == eff { true } else { obl_is_effect_declared(eff, rest) }
+    DEffect(_, s, _, _, _, _, _, _) -> if sym_raw(eff) >= 0 and sym_same(s, eff) { true } else { obl_is_effect_declared(eff, rest) }
     _ -> obl_is_effect_declared(eff, rest)
   }
 }
 
-# Innermost frame discharging `eff_name` (bare effect, by name).
-fn obl_top_frame(stack: [OblFrame], eff_name: String) : Option[OblFrame] = match stack {
+# Innermost frame discharging `eff` (the effect alone, whatever its alias).
+fn obl_top_frame(stack: [OblFrame], eff: SymId) : Option[OblFrame] = match stack {
   []           -> None
   [f, ...rest] -> match f {
-    OF(n, _) -> if n == eff_name { Some(f) } else { obl_top_frame(rest, eff_name) }
+    OF(s, _) -> if sym_same(s, eff) { Some(f) } else { obl_top_frame(rest, eff) }
   }
 }
 
@@ -103,51 +108,47 @@ fn obl_top_frame(stack: [OblFrame], eff_name: String) : Option[OblFrame] = match
 # op-name COLLISION is NOT decided here: it is the typer's resolution
 # record (see `obl_render_collisions`), which observes the decision where
 # it is made and is not blinded by an op call erased into a label or an
-# interpolation span. `key` is the callee `EVar` payload (`Eff.op`, or
-# `Eff.op@alias` when alias-tagged). The three suppliers of §3:
+# interpolation span. `r` is the callee's operation; the alias a call is
+# tagged with does not pick the instance, the enclosing handle does. The
+# three suppliers of §3:
 #   - an enclosing in-body `handle` discharges it → the handle's evidence;
 #   - no handle but the fn is `main` and a `default {}` covers it → the
 #     startup default;
 #   - otherwise the demand escapes to the caller → forward its param.
-fn obl_classify(decls: [Decl], fname: String, key: String,
-                stack: [OblFrame]) : Option[Obligation] {
-  let bare = obl_strip_alias(key)
-  let eff_name = dotted_prefix(bare)
-  let op_name  = dotted_suffix(bare)
-  if not string_contains_dot(bare) or not obl_is_effect_declared(eff_name, decls) { None }
-  else { Some(obl_supplier(decls, fname, eff_name, op_name, stack)) }
+fn obl_classify(decls: [Decl], entry: Bool, r: OpRef,
+                stack: [OblFrame]) : Option[Obligation] =
+  if not obl_is_effect_declared(r.eff, decls) { None }
+  else { Some(obl_supplier(decls, entry, r.eff, r.op, obl_receiver(r.via), stack)) }
+
+fn obl_receiver(via: OpVia) : LocalId = match via {
+  ViaRecv(x) -> x
+  _          -> local_none()
 }
 
 # The supplier of a structural op call: its enclosing handle's evidence,
 # else (at `main`) a startup default, else the caller's forwarded param.
-fn obl_supplier(decls: [Decl], fname: String, eff_name: String,
-                op_name: String, stack: [OblFrame]) : Obligation = match obl_top_frame(stack, eff_name) {
-  Some(f) -> match f {
-    OF(_, alias_opt) ->
-      Obl(obl_label(eff_name, alias_opt), op_name, SupLexical(obl_label(eff_name, alias_opt)))
-  }
-  None -> obl_unhandled_supplier(decls, fname, eff_name, op_name)
+fn obl_supplier(decls: [Decl], entry: Bool, eff: SymId,
+                op: Written, recv: LocalId, stack: [OblFrame]) : Obligation = match obl_top_frame(stack, eff) {
+  Some(f) -> Obl(f, op, recv, SupLexical(f))
+  None    -> obl_unhandled_supplier(decls, entry, eff, op, recv)
 }
 
-fn obl_unhandled_supplier(decls: [Decl], fname: String, eff_name: String, op_name: String) : Obligation =
-  if fname != "main" { Obl(eff_name, op_name, SupForward) }
-  else if list_has(obl_default_ops(decls, eff_name), op_name) { Obl(eff_name, op_name, SupDefault) }
-  else { Obl(eff_name, op_name, SupCollision("no handler, no startup default")) }
+fn obl_unhandled_supplier(decls: [Decl], entry: Bool, eff: SymId, op: Written, recv: LocalId) : Obligation =
+  if not entry { Obl(OF(eff, None), op, recv, SupForward) }
+  else if list_has(obl_default_ops(decls, eff), written_text(op)) { Obl(OF(eff, None), op, recv, SupDefault) }
+  else { Obl(OF(eff, None), op, recv, SupCollision("no handler, no startup default")) }
 
-fn obl_label(eff: String, alias_opt: Option[String]) : String = match alias_opt {
-  None    -> eff
-  Some(a) -> string_concat(eff, string_concat("@", a))
+fn obl_label(tab: SymTab, f: OblFrame) : String = match f {
+  OF(eff, None)    -> written_text(decl_name(tab, eff))
+  OF(eff, Some(a)) -> concat_all([written_text(decl_name(tab, eff)), "@", written_text(a.name)])
 }
 
-# Strip a trailing `@alias` dispatch tag from a callee key.
-fn obl_strip_alias(key: String) : String = obl_strip_alias_loop(key, 0, string_length(key))
-
-fn obl_strip_alias_loop(key: String, i: Int, n: Int) : String {
-  if i >= n { key }
-  else {
-    match char_at(key, i) {
-      Some(c) -> if c == '@' { string_slice(key, 0, i) } else { obl_strip_alias_loop(key, i + 1, n) }
-      None    -> key
+#[doc("evidence: true when two frames are one effect instance: one effect, and one alias binder or none on both.")]
+pub fn obl_frame_same(a: OblFrame, b: OblFrame) : Bool = match a {
+  OF(ae, aa) -> match b {
+    OF(be, ba) -> sym_same(ae, be) and match aa {
+      Some(x) -> match ba { Some(y) -> local_eq(x.id, y.id) None -> false }
+      None    -> match ba { Some(_) -> false None -> true }
     }
   }
 }
@@ -169,64 +170,66 @@ fn obl_seen(acc: [Obligation], o: Obligation) : Bool = match acc {
   [h, ...rest] -> if obl_same(h, o) { true } else { obl_seen(rest, o) }
 }
 
+# An op has no id of its own: inside one effect its label is its identity.
 fn obl_same(a: Obligation, b: Obligation) : Bool = match a {
-  Obl(ae, ao, asup) -> match b {
-    Obl(be, bo, bsup) -> ae == be and ao == bo and obl_sup_same(asup, bsup)
+  Obl(ae, ao, ar, asup) -> match b {
+    Obl(be, bo, br, bsup) ->
+      obl_frame_same(ae, be) and written_text(ao) == written_text(bo) and local_raw(ar) == local_raw(br) and obl_sup_same(asup, bsup)
   }
 }
 
 fn obl_sup_same(a: Supplier, b: Supplier) : Bool = match a {
-  SupLexical(x)   -> match b { SupLexical(y) -> x == y _ -> false }
+  SupLexical(x)   -> match b { SupLexical(y) -> obl_frame_same(x, y) _ -> false }
   SupForward      -> match b { SupForward -> true _ -> false }
   SupDefault      -> match b { SupDefault -> true _ -> false }
   SupCollision(_) -> match b { SupCollision(_) -> true _ -> false }
 }
 
-#[doc("evidence: accumulate a body's distinct effect-instance obligations, deduped by (instance, op, supplier).")]
-pub fn obl_walk(decls: [Decl], fname: String,
+#[doc("evidence: accumulate a body's distinct effect-instance obligations, deduped by (instance, op, supplier). `entry` says the body is the program's entry point, where a startup default supplies an unhandled op.")]
+pub fn obl_walk(decls: [Decl], entry: Bool,
             e: Expr, stack: [OblFrame], acc: [Obligation]) : [Obligation] = match e.kind {
   ECall(callee, args_) -> {
-    let acc1 = match sym_read_kind(callee.kind) {
-      EVar(key) -> match obl_classify(decls, fname, key, stack) {
+    let acc1 = match callee.kind {
+      EOp(r) -> match obl_classify(decls, entry, r, stack) {
         Some(o) -> obl_add(acc, o)
         None    -> acc
       }
       _ -> acc
     }
-    obl_walk_list(decls, fname, args_, stack, obl_walk(decls, fname, callee, stack, acc1))
+    obl_walk_list(decls, entry, args_, stack, obl_walk(decls, entry, callee, stack, acc1))
   }
-  EIntrinsic(_, args_) -> obl_walk_list(decls, fname, args_, stack, acc)
-  ESurface(sf) -> obl_walk_list(decls, fname, surface_children(sf), stack, acc)
-  EField(base, _)      -> obl_walk(decls, fname, base, stack, acc)
-  EIndex(a, b)         -> obl_walk2(decls, fname, a, b, stack, acc)
-  EBinop(_, a, b)      -> obl_walk2(decls, fname, a, b, stack, acc)
-  EPipe(a, b)          -> obl_walk2(decls, fname, a, b, stack, acc)
-  EMapPipe(a, b)       -> obl_walk2(decls, fname, a, b, stack, acc)
-  EFlatMapPipe(a, b)   -> obl_walk2(decls, fname, a, b, stack, acc)
-  EFilterPipe(a, b)    -> obl_walk2(decls, fname, a, b, stack, acc)
-  EUnop(_, x)          -> obl_walk(decls, fname, x, stack, acc)
-  EBang(inner)         -> obl_walk(decls, fname, inner, stack, acc)
-  ELitUnit(inner, _)   -> obl_walk(decls, fname, inner, stack, acc)
-  EIf(c, t, eo)        -> obl_walk_opt(decls, fname, eo, stack, obl_walk2(decls, fname, c, t, stack, acc))
-  ERange(a, b, opt)    -> obl_walk_opt(decls, fname, opt, stack, obl_walk2(decls, fname, a, b, stack, acc))
-  EMatch(scr, arms)    -> obl_walk_arms(decls, fname, arms, stack, obl_walk(decls, fname, scr, stack, acc))
-  ERecordLit(_, _, fs)    -> obl_walk_fields(decls, fname, fs, stack, acc)
-  EList(els)           -> obl_walk_elems(decls, fname, els, stack, acc)
-  EBlock(stmts, tail)  -> obl_walk_opt(decls, fname, tail, stack, obl_walk_stmts(decls, fname, stmts, stack, acc))
-  EHandle(body, eff_name, _, _, init_opt, alias_opt, clauses, ret_opt) ->
-    obl_walk_handle(decls, fname, body, eff_name, init_opt, alias_opt, clauses, ret_opt, stack, acc)
+  EIntrinsic(_, args_) -> obl_walk_list(decls, entry, args_, stack, acc)
+  ESurface(sf) -> obl_walk_list(decls, entry, surface_children(sf), stack, acc)
+  EField(base, _)      -> obl_walk(decls, entry, base, stack, acc)
+  EIndex(a, b)         -> obl_walk2(decls, entry, a, b, stack, acc)
+  EBinop(_, a, b)      -> obl_walk2(decls, entry, a, b, stack, acc)
+  EPipe(a, b)          -> obl_walk2(decls, entry, a, b, stack, acc)
+  EMapPipe(a, b)       -> obl_walk2(decls, entry, a, b, stack, acc)
+  EFlatMapPipe(a, b)   -> obl_walk2(decls, entry, a, b, stack, acc)
+  EFilterPipe(a, b)    -> obl_walk2(decls, entry, a, b, stack, acc)
+  EUnop(_, x)          -> obl_walk(decls, entry, x, stack, acc)
+  EBang(inner)         -> obl_walk(decls, entry, inner, stack, acc)
+  ELitUnit(inner, _)   -> obl_walk(decls, entry, inner, stack, acc)
+  EIf(c, t, eo)        -> obl_walk_opt(decls, entry, eo, stack, obl_walk2(decls, entry, c, t, stack, acc))
+  ERange(a, b, opt)    -> obl_walk_opt(decls, entry, opt, stack, obl_walk2(decls, entry, a, b, stack, acc))
+  EMatch(scr, arms)    -> obl_walk_arms(decls, entry, arms, stack, obl_walk(decls, entry, scr, stack, acc))
+  ERecordLit(_, fs)    -> obl_walk_fields(decls, entry, fs, stack, acc)
+  EList(els)           -> obl_walk_elems(decls, entry, els, stack, acc)
+  EBlock(stmts, tail)  -> obl_walk_opt(decls, entry, tail, stack, obl_walk_stmts(decls, entry, stmts, stack, acc))
+  EHandle(body, head, _, init_opt, alias_opt, clauses, ret_opt) ->
+    obl_walk_handle(decls, entry, body, ref_sym(head), init_opt, alias_opt, clauses, ret_opt, stack, acc)
   _ -> acc
 }
 
 # walk two sub-expressions left-to-right.
-fn obl_walk2(decls: [Decl], fname: String, a: Expr, b: Expr,
+fn obl_walk2(decls: [Decl], entry: Bool, a: Expr, b: Expr,
              stack: [OblFrame], acc: [Obligation]) : [Obligation] =
-  obl_walk(decls, fname, b, stack, obl_walk(decls, fname, a, stack, acc))
+  obl_walk(decls, entry, b, stack, obl_walk(decls, entry, a, stack, acc))
 
 # walk an optional sub-expression (else-arm, range step, block tail).
-fn obl_walk_opt(decls: [Decl], fname: String, eo: Option[Expr],
+fn obl_walk_opt(decls: [Decl], entry: Bool, eo: Option[Expr],
                 stack: [OblFrame], acc: [Obligation]) : [Obligation] = match eo {
-  Some(e) -> obl_walk(decls, fname, e, stack, acc)
+  Some(e) -> obl_walk(decls, entry, e, stack, acc)
   None    -> acc
 }
 
@@ -234,85 +237,85 @@ fn obl_walk_opt(decls: [Decl], fname: String, eo: Option[Expr],
 # and return bodies run OUTSIDE the `with`, so they walk under the outer
 # stack — the reason a `@cap` read inside an unrelated clause loses its
 # alias and collides by op name.
-fn obl_walk_handle(decls: [Decl], fname: String, body: Expr, eff_name: String,
-                   init_opt: Option[Expr], alias_opt: Option[String],
+fn obl_walk_handle(decls: [Decl], entry: Bool, body: Expr, eff: SymId,
+                   init_opt: Option[Expr], alias_opt: Option[Binder],
                    clauses: [HClause], ret_opt: Option[HReturn],
                    stack: [OblFrame], acc: [Obligation]) : [Obligation] {
-  let frame = OF(eff_name, alias_opt)
-  let a1 = obl_walk_opt(decls, fname, init_opt, stack, acc)
-  let a2 = obl_walk_clauses(decls, fname, clauses, stack, a1)
+  let frame = OF(eff, alias_opt)
+  let a1 = obl_walk_opt(decls, entry, init_opt, stack, acc)
+  let a2 = obl_walk_clauses(decls, entry, clauses, stack, a1)
   let a3 = match ret_opt {
-    Some(r) -> match r { HR(_, b, _, _) -> obl_walk(decls, fname, b, stack, a2) }
+    Some(r) -> match r { HR(_, b, _, _) -> obl_walk(decls, entry, b, stack, a2) }
     None    -> a2
   }
-  obl_walk(decls, fname, body, [frame, ...stack], a3)
+  obl_walk(decls, entry, body, [frame, ...stack], a3)
 }
 
-fn obl_walk_list(decls: [Decl], fname: String,
+fn obl_walk_list(decls: [Decl], entry: Bool,
                  es: [Expr], stack: [OblFrame], acc: [Obligation]) : [Obligation] = match es {
   []           -> acc
-  [h, ...rest] -> obl_walk_list(decls, fname, rest, stack, obl_walk(decls, fname, h, stack, acc))
+  [h, ...rest] -> obl_walk_list(decls, entry, rest, stack, obl_walk(decls, entry, h, stack, acc))
 }
 
-fn obl_walk_arms(decls: [Decl], fname: String,
+fn obl_walk_arms(decls: [Decl], entry: Bool,
                  arms: [Arm], stack: [OblFrame], acc: [Obligation]) : [Obligation] = match arms {
   []           -> acc
   [a, ...rest] -> match a {
     Arm(_, og, body) -> {
-      let a1 = match og { Some(g) -> obl_walk(decls, fname, g, stack, acc) None -> acc }
-      obl_walk_arms(decls, fname, rest, stack, obl_walk(decls, fname, body, stack, a1))
+      let a1 = match og { Some(g) -> obl_walk(decls, entry, g, stack, acc) None -> acc }
+      obl_walk_arms(decls, entry, rest, stack, obl_walk(decls, entry, body, stack, a1))
     }
   }
 }
 
-fn obl_walk_fields(decls: [Decl], fname: String,
+fn obl_walk_fields(decls: [Decl], entry: Bool,
                    fs: [FieldInit], stack: [OblFrame], acc: [Obligation]) : [Obligation] = match fs {
   []           -> acc
   [f, ...rest] -> match f {
-    FI(_, ex) -> obl_walk_fields(decls, fname, rest, stack, obl_walk(decls, fname, ex, stack, acc))
+    FI(_, ex) -> obl_walk_fields(decls, entry, rest, stack, obl_walk(decls, entry, ex, stack, acc))
   }
 }
 
-fn obl_walk_elems(decls: [Decl], fname: String,
+fn obl_walk_elems(decls: [Decl], entry: Bool,
                   els: [ListElem], stack: [OblFrame], acc: [Obligation]) : [Obligation] = match els {
   []            -> acc
   [el, ...rest] -> match el {
-    ElPlain(ex)  -> obl_walk_elems(decls, fname, rest, stack, obl_walk(decls, fname, ex, stack, acc))
-    ElSpread(ex) -> obl_walk_elems(decls, fname, rest, stack, obl_walk(decls, fname, ex, stack, acc))
+    ElPlain(ex)  -> obl_walk_elems(decls, entry, rest, stack, obl_walk(decls, entry, ex, stack, acc))
+    ElSpread(ex) -> obl_walk_elems(decls, entry, rest, stack, obl_walk(decls, entry, ex, stack, acc))
   }
 }
 
-fn obl_walk_stmts(decls: [Decl], fname: String,
+fn obl_walk_stmts(decls: [Decl], entry: Bool,
                   ss: [Stmt], stack: [OblFrame], acc: [Obligation]) : [Obligation] = match ss {
   []           -> acc
   [s, ...rest] -> match s {
-    SLet(_, _, ex)        -> obl_walk_stmts(decls, fname, rest, stack, obl_walk(decls, fname, ex, stack, acc))
-    SVar(_, _, ex, _, _)  -> obl_walk_stmts(decls, fname, rest, stack, obl_walk(decls, fname, ex, stack, acc))
-    SExprStmt(ex)         -> obl_walk_stmts(decls, fname, rest, stack, obl_walk(decls, fname, ex, stack, acc))
+    SLet(_, _, ex)        -> obl_walk_stmts(decls, entry, rest, stack, obl_walk(decls, entry, ex, stack, acc))
+    SVar(_, _, ex, _, _)  -> obl_walk_stmts(decls, entry, rest, stack, obl_walk(decls, entry, ex, stack, acc))
+    SExprStmt(ex)         -> obl_walk_stmts(decls, entry, rest, stack, obl_walk(decls, entry, ex, stack, acc))
     SAssert(ex, og)       -> {
-      let a1 = obl_walk(decls, fname, ex, stack, acc)
-      let a2 = match og { Some(g) -> obl_walk(decls, fname, g, stack, a1) None -> a1 }
-      obl_walk_stmts(decls, fname, rest, stack, a2)
+      let a1 = obl_walk(decls, entry, ex, stack, acc)
+      let a2 = match og { Some(g) -> obl_walk(decls, entry, g, stack, a1) None -> a1 }
+      obl_walk_stmts(decls, entry, rest, stack, a2)
     }
     SIndexAssign(a, b, c, _, _) ->
-      obl_walk_stmts(decls, fname, rest, stack,
-                     obl_walk(decls, fname, c, stack,
-                              obl_walk(decls, fname, b, stack,
-                                       obl_walk(decls, fname, a, stack, acc))))
+      obl_walk_stmts(decls, entry, rest, stack,
+                     obl_walk(decls, entry, c, stack,
+                              obl_walk(decls, entry, b, stack,
+                                       obl_walk(decls, entry, a, stack, acc))))
     SAssign(a, c, _, _) ->
-      obl_walk_stmts(decls, fname, rest, stack,
-                     obl_walk(decls, fname, c, stack,
-                              obl_walk(decls, fname, a, stack, acc)))
-    SUse(_, _, _)         -> obl_walk_stmts(decls, fname, rest, stack, acc)
+      obl_walk_stmts(decls, entry, rest, stack,
+                     obl_walk(decls, entry, c, stack,
+                              obl_walk(decls, entry, a, stack, acc)))
+    SUse(_, _, _)         -> obl_walk_stmts(decls, entry, rest, stack, acc)
   }
 }
 
-fn obl_walk_clauses(decls: [Decl], fname: String,
+fn obl_walk_clauses(decls: [Decl], entry: Bool,
                     cs: [HClause], stack: [OblFrame], acc: [Obligation]) : [Obligation] = match cs {
   []           -> acc
   [c, ...rest] -> match c {
     HC(_, _, body, _, _) ->
-      obl_walk_clauses(decls, fname, rest, stack, obl_walk(decls, fname, body, stack, acc))
+      obl_walk_clauses(decls, entry, rest, stack, obl_walk(decls, entry, body, stack, acc))
   }
 }
 
@@ -320,44 +323,50 @@ fn obl_walk_clauses(decls: [Decl], fname: String,
 # Dump: per function, the demanded obligations and their suppliers.
 # ----------------------------------------------------------------------
 
-fn obl_sup_render(s: Supplier) : String = match s {
-  SupLexical(label) -> string_concat("lexical-handle ", label)
+fn obl_sup_render(tab: SymTab, s: Supplier) : String = match s {
+  SupLexical(f)     -> string_concat("lexical-handle ", obl_label(tab, f))
   SupForward        -> "forwarded-caller-param"
   SupDefault        -> "startup-default"
   SupCollision(why) -> string_concat("NONE (collision: ", string_concat(why, ")"))
 }
 
-fn obl_render_one(o: Obligation) : Unit / Console = match o {
-  Obl(eff, op, sup) -> print(concat_all(["  ", eff, "  (via ", op, ")  -> ", obl_sup_render(sup)]))
+# `ns` names the binders of the function the obligation was found in.
+fn obl_render_one(tab: SymTab, ns: LocalNames, o: Obligation) : Unit / Console = match o {
+  Obl(f, op, recv, sup) ->
+    print(concat_all(["  ", obl_label(tab, f), "  (via ", obl_op_text(ns, op, recv), ")  -> ", obl_sup_render(tab, sup)]))
 }
 
-fn obl_render_list(os: [Obligation]) : Unit / Console = match os {
+fn obl_op_text(ns: LocalNames, op: Written, recv: LocalId) : String =
+  if local_raw(recv) == 0 { written_text(op) }
+  else { concat_all([written_text(op), "#", written_text(ln_text(ns, recv))]) }
+
+fn obl_render_list(tab: SymTab, ns: LocalNames, os: [Obligation]) : Unit / Console = match os {
   []           -> ()
-  [o, ...rest] -> { obl_render_one(o); obl_render_list(rest) }
+  [o, ...rest] -> { obl_render_one(tab, ns, o); obl_render_list(tab, ns, rest) }
 }
 
 # `add(c1: Cell, c2: Cell, dst: Cell)` and its kin need the L6
 # capability-as-parameter op-call surface to typecheck; their bodies do
 # not survive inference today. Surface the row demand as pending rather
 # than simulate the unbuilt surface (that would be false-green).
-fn obl_render_pending_params(ps: [Param], decls: [Decl]) : Unit / Console = match ps {
+fn obl_render_pending_params(ps: [Param], decls: [Decl], tab: SymTab) : Unit / Console = match ps {
   []           -> ()
   [p, ...rest] -> {
     match p.ptype {
       Some(t) -> match obl_param_cap_eff(t, decls) {
-        Some(eff) -> print(concat_all(["  ", eff, "  (param ", p.pname, ")  -> PENDING-L6 (capability-as-parameter surface)"]))
+        Some(eff) -> print(concat_all(["  ", written_text(decl_name(tab, eff)), "  (param ", written_text(p.binder.name), ")  -> PENDING-L6 (capability-as-parameter surface)"]))
         None      -> ()
       }
       None -> ()
     }
-    obl_render_pending_params(rest, decls)
+    obl_render_pending_params(rest, decls, tab)
   }
 }
 
 # A parameter whose declared type names a declared effect is a capability
 # parameter (`c: Cell`) — its op calls are the L6 surface.
-fn obl_param_cap_eff(t: TypeExpr, decls: [Decl]) : Option[String] = match t.tkind {
-  TyName(_, n, _) -> if obl_is_effect_declared(n, decls) { Some(n) } else { None }
+fn obl_param_cap_eff(t: TypeExpr, decls: [Decl]) : Option[SymId] = match t.tkind {
+  TyName(r, _) -> if obl_is_effect_declared(ref_sym(r), decls) { Some(ref_sym(r)) } else { None }
   _            -> None
 }
 
@@ -408,25 +417,25 @@ pub fn obl_is_collision(o: OpResolution, decls: [Decl]) : Bool = match o {
 
 # The cross-effect case needs a backed sibling for the perform to divert
 # to; two unbacked effects sharing an op name are dead code, not a collision.
-fn obl_sibling_backed(decls: [Decl], cands: [String], chosen: String) : Bool = match cands {
+fn obl_sibling_backed(decls: [Decl], cands: [SymId], chosen: SymId) : Bool = match cands {
   []           -> false
-  [c, ...rest] -> (not (c == chosen) and obl_eff_backed(decls, c)) or obl_sibling_backed(decls, rest, chosen)
+  [c, ...rest] -> (not sym_same(c, chosen) and obl_eff_backed(decls, c)) or obl_sibling_backed(decls, rest, chosen)
 }
 
-# Render the real collisions attributed to function `fname` (an
+# Render the real collisions attributed to function `f` (an
 # obligation with NO supplier). The clean obligations are unused here —
 # the discharge-backed test reads the declarations, not the per-fn walk.
-fn obl_render_collisions(ors: [OpResolution], decls: [Decl], fname: String) : Unit / Console = match ors {
+fn obl_render_collisions(ors: [OpResolution], decls: [Decl], tab: SymTab, f: FnId) : Unit / Console = match ors {
   []           -> ()
   [o, ...rest] -> {
     match o {
-      OPR(fn_name, op, cands, chosen, _, _, _, _) ->
-        if fn_name == fname and obl_is_collision(o, decls) {
-          print(concat_all(["  ", chosen, "  (via ", op, ")  -> NONE (collision: `", op,
-                            "` shared by ", obl_join(cands, ", "), "; by-name dispatch binds the wrong instance)"]))
+      OPR(owner, op, cands, chosen, _, _, _, _) ->
+        if fnid_eq(owner, f) and obl_is_collision(o, decls) {
+          print(concat_all(["  ", written_text(decl_name(tab, chosen)), "  (via ", written_text(op), ")  -> NONE (collision: `", written_text(op),
+                            "` shared by ", obl_join(map(cands, (c) => written_text(decl_name(tab, c))), ", "), "; by-name dispatch binds the wrong instance)"]))
         } else { () }
     }
-    obl_render_collisions(rest, decls, fname)
+    obl_render_collisions(rest, decls, tab, f)
   }
 }
 
@@ -438,43 +447,44 @@ pub fn obl_join(xs: [String], sep: String) : String = match xs {
 }
 
 #[doc("evidence: run the obligation analysis and dump it per function; analysis-only, emits nothing codegen reads.")]
-pub fn dump_evidence_obligations(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_evidence_obligations(file: String, decls: [Decl], tin: TyperIn, entry: SymId) : Int / Console + File + Mutable {
   # Run inference to anchor op-call callees and capture the per-call-site
   # resolution record. The structural walk reports the clean obligations
   # (op calls that survive as nodes in the typed AST); the resolution
   # record reports the collisions, which the typer decides but which can
   # be erased before the typed AST (a `@cap` read buried in a string
   # interpolation never survives as a structural op-call node).
-  let r = infer_program(file, decls, false)
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
   print("# evidence-obligations")
-  dump_evidence_loop(r.decls, r.op_res, r.decls)
+  dump_evidence_loop(tab, r.decls, r.op_res, r.decls, entry)
   0
 }
 
 # Core auto-load surfaces every stdlib DFn alongside the target file's;
 # keep only root-file decls (module-origin `None`), matching the
 # sibling dumps' scoping.
-fn dump_evidence_loop(all: [Decl], ors: [OpResolution], ds: [Decl]) : Unit / Console = match ds {
+fn dump_evidence_loop(tab: SymTab, all: [Decl], ors: [OpResolution], ds: [Decl], entry: SymId) : Unit / Console = match ds {
   []           -> ()
   [d, ...rest] -> {
     match d {
-      DFn(_, fname, _, ps, _, _, body, _, _, mo, _) -> match mo {
+      DFn(_, fid, _, ps, _, _, body, _, _, mo) -> match mo {
         None -> {
-          print(concat_all(["fn ", fname]))
-          let obls = list_reverse(obl_walk(all, fname, body, [], []))
+          print(concat_all(["fn ", written_text(decl_name(tab, fnid_sym(fid)))]))
+          let obls = list_reverse(obl_walk(all, is_entry(entry, fid), body, [], []))
           match obls {
-            [] -> obl_render_pending_params(ps, all)
-            _  -> obl_render_list(obls)
+            [] -> obl_render_pending_params(ps, all, tab)
+            _  -> obl_render_list(tab, ln_of_decl(d), obls)
           }
-          # collisions attributed to this fn by name, from the resolution
+          # collisions attributed to this fn, from the resolution
           # record (catches op calls erased before the typed AST); the
           # discharge-backed test reads the declarations.
-          obl_render_collisions(ors, all, fname)
+          obl_render_collisions(ors, all, tab, fid)
         }
         Some(_) -> ()
       }
       _ -> ()
     }
-    dump_evidence_loop(all, ors, rest)
+    dump_evidence_loop(tab, all, ors, rest, entry)
   }
 }

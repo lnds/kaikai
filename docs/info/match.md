@@ -54,6 +54,10 @@ A record LITERAL in expression position needs the type prefix
 (`Point { x: 3, y: 4 }`). Only patterns and `let`-destructure allow
 the prefix-less form.
 
+A string pattern interpolates like any other string: `"id-#{n}"` matches
+the value the interpolation builds, and may read a binder of its own
+pattern (`Pair(k, "v#{k}")`).
+
 ## Examples
 
 ```kaikai

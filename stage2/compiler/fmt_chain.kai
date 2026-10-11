@@ -8,50 +8,59 @@
 # here emits.
 
 import compiler.ast
+import compiler.operators
 import compiler.fmt_shape
 import compiler.fmt_refine
 
 # The ladder, tightest last. `-` and `%` share their levels but never
 # lead a continuation line (both can open an expression).
-#[doc("Binding level of a binary operator, higher binds tighter; 0 for an operator the ladder does not know.")]
-pub fn binop_prec(op: String) : Int =
-  if op == "or" { 1 }
-  else if op == "and" { 2 }
-  else if binop_is_cmp(op) { 3 }
-  else if op == "++" { 4 }
-  else if (op == "+") or (op == "-") { 5 }
-  else if ((op == "*") or (op == "/")) or (op == "%") { 6 }
-  else if op == "^" { 7 }
-  else { 0 }
+#[doc("Binding level of a binary operator, higher binds tighter.")]
+pub fn binop_prec(op: BinOp) : Int = match op {
+  BoOr     -> 1
+  BoAnd    -> 2
+  BoEq     -> 3
+  BoNe     -> 3
+  BoLt     -> 3
+  BoGt     -> 3
+  BoLe     -> 3
+  BoGe     -> 3
+  BoConcat -> 4
+  BoAdd    -> 5
+  BoSub    -> 5
+  BoMul    -> 6
+  BoDiv    -> 6
+  BoMod    -> 6
+  BoPow    -> 7
+}
 
-fn binop_is_cmp(op: String) : Bool =
-  (((op == "==") or (op == "!=")) or ((op == "<") or (op == ">"))) or ((op == "<=") or (op == ">="))
-
-fn binop_right_assoc(op: String) : Bool = (op == "++") or (op == "^")
+fn binop_right_assoc(op: BinOp) : Bool = match op {
+  BoConcat -> true
+  BoPow    -> true
+  _        -> false
+}
 
 #[doc("True when a `child` operator's expression must be parenthesised as the left or right operand of `parent`.")]
-pub fn binop_operand_needs_parens(parent: String, child: String, is_right: Bool) : Bool {
+pub fn binop_operand_needs_parens(parent: BinOp, child: BinOp, is_right: Bool) : Bool {
   let pp = binop_prec(parent)
   let cp = binop_prec(child)
-  if (pp == 0) or (cp == 0) { true }
-  else if cp != pp { cp < pp }
-  else if binop_is_cmp(parent) { true }
+  if cp != pp { cp < pp }
+  else if binop_is_comparison(parent) { true }
   else if binop_right_assoc(parent) { not is_right }
   else { is_right }
 }
 
 #[doc("An operator chain flattened from a nest of same-level operators: the first operand and each following (operator, operand) link.")]
-pub type Chain = Chain(Expr, [ChainOp])
+pub type Chain[o] = Chain(Expr, [ChainOp[o]])
 
-#[doc("One link of a chain: the operator's text, its source position, and its right operand.")]
-pub type ChainOp = ChainOp(String, Int, Int, Expr)
+#[doc("One link of a chain: the operator (a `BinOp`, or a pipe's text), its source position, and its right operand.")]
+pub type ChainOp[o] = ChainOp(o, Int, Int, Expr)
 
 # Same level and same associativity flatten; a comparison never chains.
-fn binop_same_level(op: String, other: String) : Bool =
-  ((binop_prec(op) == binop_prec(other)) and (not binop_is_cmp(op))) and (binop_right_assoc(op) == binop_right_assoc(other))
+fn binop_same_level(op: BinOp, other: BinOp) : Bool =
+  ((binop_prec(op) == binop_prec(other)) and (not binop_is_comparison(op))) and (binop_right_assoc(op) == binop_right_assoc(other))
 
 #[doc("The chain a binary node heads: a left-associative nest flattens down its left spine, a right-associative one down its right spine.")]
-pub fn binop_chain(op: String, l: Expr, r: Expr, line: Int, col: Int) : Chain =
+pub fn binop_chain(op: BinOp, l: Expr, r: Expr, line: Int, col: Int) : Chain[BinOp] =
   if binop_right_assoc(op) { Chain(l, binop_right_spine(op, r, line, col)) }
   else {
     match binop_left_spine(op, l) {
@@ -59,7 +68,7 @@ pub fn binop_chain(op: String, l: Expr, r: Expr, line: Int, col: Int) : Chain =
     }
   }
 
-fn binop_left_spine(op: String, l: Expr) : Chain = match l.kind {
+fn binop_left_spine(op: BinOp, l: Expr) : Chain[BinOp] = match l.kind {
   EBinop(op2, l2, r2) ->
     if binop_same_level(op, op2) {
       match binop_left_spine(op2, l2) {
@@ -69,7 +78,7 @@ fn binop_left_spine(op: String, l: Expr) : Chain = match l.kind {
   _ -> Chain(l, [])
 }
 
-fn binop_right_spine(op: String, r: Expr, line: Int, col: Int) : [ChainOp] = match r.kind {
+fn binop_right_spine(op: BinOp, r: Expr, line: Int, col: Int) : [ChainOp[BinOp]] = match r.kind {
   EBinop(op2, l2, r2) ->
     if binop_same_level(op, op2) { [ChainOp(op, line, col, l2), ...binop_right_spine(op2, r2, r.line, r.col)] }
     else { [ChainOp(op, line, col, r)] }
@@ -77,16 +86,22 @@ fn binop_right_spine(op: String, r: Expr, line: Int, col: Int) : [ChainOp] = mat
 }
 
 #[doc("True when a chain holding `-` or `%` must trail its operators: neither may open a continuation line.")]
-pub fn chain_trails(links: [ChainOp]) : Bool = match links {
+pub fn chain_trails(links: [ChainOp[BinOp]]) : Bool = match links {
   [] -> false
-  [ChainOp(op, _, _, _), ...rest] -> ((op == "-") or (op == "%")) or chain_trails(rest)
+  [ChainOp(op, _, _, _), ...rest] -> binop_trails(op) or chain_trails(rest)
+}
+
+fn binop_trails(op: BinOp) : Bool = match op {
+  BoSub -> true
+  BoMod -> true
+  _     -> false
 }
 
 # The four pipes share one level and one associativity; the placeholder
 # desugar (`lhs |> f(_, y)`) reaches the writer as a call and joins the
 # spine like any other stage.
 #[doc("The pipe chain a pipe node heads, flattened down its left spine; the operand of each link is the stage as the author wrote it.")]
-pub fn pipe_chain(e: Expr) : Chain = match e.kind {
+pub fn pipe_chain(e: Expr) : Chain[String] = match e.kind {
   EPipe(l, r) -> pipe_extend(l, "|>", e, r)
   EMapPipe(l, r) -> pipe_extend(l, "|", e, r)
   EFlatMapPipe(l, r) -> pipe_extend(l, "||", e, r)
@@ -98,7 +113,7 @@ pub fn pipe_chain(e: Expr) : Chain = match e.kind {
   _ -> Chain(e, [])
 }
 
-fn pipe_extend(l: Expr, op: String, at: Expr, r: Expr) : Chain = match pipe_chain(l) {
+fn pipe_extend(l: Expr, op: String, at: Expr, r: Expr) : Chain[String] = match pipe_chain(l) {
   Chain(first, links) -> Chain(first, list_append(links, [ChainOp(op, at.line, at.col, r)]))
 }
 
@@ -135,9 +150,9 @@ pub fn fmt_pipe_under(callee: Expr, call_args: [Expr]) : Option[PipeUnder] =
   match callee.kind {
     ELambda(params, body) -> match params {
       [prm] ->
-        if prm.pname == "__pipe" {
+        if local_eq(prm.binder.id, local_minted("__pipe")) {
           match call_args {
-            [lhs] -> Some(PU(lhs, fmt_subst_var(body, "__pipe", EUnder)))
+            [lhs] -> Some(PU(lhs, fmt_subst_var(body, prm.binder.id, EUnder)))
             _     -> None
           }
         } else { None }

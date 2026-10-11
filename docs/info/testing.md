@@ -128,10 +128,13 @@ per file, so a package is compiled once rather than once per file.
 Each file is first checked on its own, as the root it is when built
 alone, and a file that does not check fails with its own error, after
 the files before it ran. A file's run is exactly the blocks its own
-build would run, in the same order. Files that each check alone but
-cannot build together fail the run with the shared build's error
-before any test runs: two test files declaring the same `impl`, for
-example. Move what they share into a module both import.
+build would run, in the same order. As in every test build, the runner
+is the binary's entry point: a test file's own `main` stays a function
+its blocks can call, typed as when the file is built as a program.
+Files that each check alone but cannot build together fail the run
+with the shared build's error before any test runs: two test files
+declaring the same `impl`, for example. Move what they share into a
+module both import.
 
 `kai test` runs these builds in parallel — one per CPU by default,
 `-j <n>` (`--jobs <n>`) to bound it — and runs the binaries one at a
@@ -169,9 +172,9 @@ kai test .             # runs main.kai's blocks + tests/*.kai
 
 Files inside `tests/` follow the same rules as a top-level test
 file: at least one `test "..." { ... }` block plus an
-`fn main() : Int = 0` placeholder (the `--test` driver replaces
-`main` with the test runner). Non-`*.kai` files (fixtures, golden
-files) under `tests/` are ignored by the runner.
+`fn main() : Int = 0` placeholder (a test build starts the test
+runner, not `main`, which a block may still call). Non-`*.kai` files
+(fixtures, golden files) under `tests/` are ignored by the runner.
 
 ## Machine-readable results
 

@@ -6,19 +6,25 @@ Backs `--infer`, `--dump-typed`, `--dump-typed-core`, `--dump-last-use`,
 
 import compiler.util
 import compiler.ast
+import compiler.operators
 import compiler.type_text
 import compiler.marks
+import compiler.intrinsics
 import compiler.intervals
 import compiler.infer
 import compiler.hole_scope
 import compiler.fnreg
-import compiler.sym_read
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.local_names
+import compiler.handler_alias
 
 #[doc("infer: --infer dump of inferred top-level signatures.")]
-pub fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_infer(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
 
 
-  let r = infer_program(file, decls, true)
+  let r = infer_program(file, decls, tin, true)
   r.errs
 }
 
@@ -30,14 +36,39 @@ pub fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
 # carry a `Some(ty)`, so a `?` in the output indicates a missed
 # rebuild path.
 
-fn ty_tag(e: Expr) : String {
+# What a dump line reads names from: the program's declarations, and the
+# binders of the declaration being printed.
+type DumpCx = { tab: SymTab, locals: LocalNames }
+
+# A declaration's binders, and the ones no node declares: a clause's
+# continuation and the handler-state aliases.
+fn dump_locals(d: Decl) : LocalNames =
+  dump_minted([canonical_continuation(), var_cell_alias(), ...user_state_aliases()], ln_of_decl(d))
+
+fn dump_minted(keys: [String], ns: LocalNames) : LocalNames = match keys {
+  []           -> ns
+  [k, ...rest] -> dump_minted(rest, ln_with_binder(ns, binder_minted(k)))
+}
+
+fn ty_tag(cx: DumpCx, e: Expr) : String {
   match e.ty {
-    Some(t) -> string_concat(" : ", inf_ty_to_string(t))
+    Some(t) -> string_concat(" : ", inf_ty_to_string(cx.tab, t))
     None    -> " : ?"
   }
 }
 
-fn tag_of_kind(k: ExprKind) : String {
+# An op callee prints the key the typer settled it under: `Eff.op`, then
+# `@alias` or `#receiver` for the instance it goes through.
+fn op_tag(cx: DumpCx, r: OpRef) : String = {
+  let via = match r.via {
+    ViaAmbient  -> ""
+    ViaAlias(a) -> cat2("@", written_text(ln_text(cx.locals, a)))
+    ViaRecv(x)  -> cat2("#", written_text(ln_text(cx.locals, x)))
+  }
+  concat_all(["sym#", int_to_string(sym_raw(r.eff)), " ", written_text(decl_name(cx.tab, r.eff)), ".", written_text(r.op), via])
+}
+
+fn tag_of_kind(cx: DumpCx, k: ExprKind) : String {
   match k {
     EInt(n, _) -> concat_all(["int ", int_to_string(n)])
     EFixed(span, _)   -> concat_all(["fixed ", span])
@@ -48,21 +79,22 @@ fn tag_of_kind(k: ExprKind) : String {
     EChar(_)       -> "char"
     EStr(_, _)     -> "string"
     EUnit          -> "unit"
-    EVar(nm)       -> concat_all(["ident ", nm])
+    EName(nm)      -> concat_all(["ident ", written_text(nm)])
+    ELocal(l)      -> concat_all(["ident ", written_text(ln_text(cx.locals, l))])
     EMark(m)       -> concat_all(["mark ", mark_name(m)])
-    ESym(i, _, nm)       -> if sym_is_local(i) { concat_all(["ident ", nm]) }
-                            else { concat_all(["sym#", int_to_string(sym_raw(i)), " ", nm]) }
+    ESym(i, _)     -> concat_all(["sym#", int_to_string(sym_raw(i)), " ", written_text(decl_name(cx.tab, i))])
+    EOp(r)         -> op_tag(cx, r)
     EUnder         -> "_"
     EPlaceholder   -> "."
     ECall(_, _)    -> "call"
     EField(_, nm)  -> concat_all(["field .", nm])
     EIndex(_, _)   -> "index"
-    EBinop(op, _, _) -> concat_all(["binop ", op])
-    EUnop(op, _)   -> concat_all(["unop ", op])
+    EBinop(op, _, _) -> concat_all(["binop ", binop_text(op)])
+    EUnop(op, _)   -> concat_all(["unop ", unop_text(op)])
     EIf(_, _, _)   -> "if"
     EMatch(_, _)   -> "match"
     ELambda(_, _)  -> "lambda"
-    ERecordLit(_, nm, _) -> concat_all(["record ", nm])
+    ERecordLit(r, _) -> concat_all(["record ", ref_decl_name(cx.tab, r)])
     EList(_)       -> "list"
     ERange(_, _, _) -> "range"
     EBlock(_, _)   -> "block"
@@ -77,20 +109,20 @@ fn tag_of_kind(k: ExprKind) : String {
     ETodo(msg)     -> concat_all(["todo \"", msg, "\""])
     EExternBody(abi, sym) -> concat_all(["extern-body ", extern_abi_literal(abi), " \"", sym, "\""])
     EBang(_)       -> "bang"
-    EHandle(_, eff_name, _, _, _, _, _, _) -> concat_all(["handle ", eff_name])
+    EHandle(_, r, _, _, _, _, _) -> concat_all(["handle ", ref_decl_name(cx.tab, r)])
     ELitUnit(_, u) -> concat_all(["lit-unit <", inf_unit_canon_display(u), ">"])
-    EVariantsOf(ty, _) -> concat_all(["variants-of ", type_text(ty)])
+    EVariantsOf(ty, _) -> concat_all(["variants-of ", type_text(cx.tab, ty)])
     # qualified module call dump label.
-    EModCall(m, fname) -> concat_all(["modcall ", m, ".", fname])
-    EIntrinsic(name, _) -> concat_all(["intrinsic $", name])
+    EModCall(m, fname) -> concat_all(["modcall ", written_text(m), ".", written_text(fname)])
+    EIntrinsic(name, _) -> concat_all(["intrinsic $", intrinsic_name(name)])
     ESurface(_) -> "surface"
   }
 }
 
-fn dump_typed_expr(e: Expr, depth: Int) : Unit / Console {
+fn dump_typed_expr(cx: DumpCx, e: Expr, depth: Int) : Unit / Console {
 
-  inf_emit_line(depth, concat_all([tag_of_kind(e.kind), ty_tag(e)]))
-  dump_typed_subexprs(e.kind, depth + 1)
+  inf_emit_line(depth, concat_all([tag_of_kind(cx, e.kind), ty_tag(cx, e)]))
+  dump_typed_subexprs(cx, e.kind, depth + 1)
 }
 
 # Note: stage 1's capture analyser doesn't recognise pattern bindings
@@ -100,15 +132,15 @@ fn dump_typed_expr(e: Expr, depth: Int) : Unit / Console {
 # this dumper therefore uses explicit recursive helpers with pattern
 # matching at top level rather than inline lambdas.
 
-fn dump_typed_exprs(xs: [Expr], depth: Int) : Unit / Console {
+fn dump_typed_exprs(cx: DumpCx, xs: [Expr], depth: Int) : Unit / Console {
 
   match xs {
     [] -> ()
-    [x, ...rest] -> { dump_typed_expr(x, depth) dump_typed_exprs(rest, depth) }
+    [x, ...rest] -> { dump_typed_expr(cx, x, depth) dump_typed_exprs(cx, rest, depth) }
   }
 }
 
-fn dump_typed_arms(arms: [Arm], depth: Int) : Unit / Console {
+fn dump_typed_arms(cx: DumpCx, arms: [Arm], depth: Int) : Unit / Console {
 
   match arms {
     [] -> ()
@@ -116,121 +148,121 @@ fn dump_typed_arms(arms: [Arm], depth: Int) : Unit / Console {
       match a {
         Arm(_, g, body) -> {
           match g {
-            Some(gx) -> dump_typed_expr(gx, depth)
+            Some(gx) -> dump_typed_expr(cx, gx, depth)
             None -> ()
           }
-          dump_typed_expr(body, depth)
+          dump_typed_expr(cx, body, depth)
         }
       }
-      dump_typed_arms(rest, depth)
+      dump_typed_arms(cx, rest, depth)
     }
   }
 }
 
-fn dump_typed_fis(fis: [FieldInit], depth: Int) : Unit / Console {
+fn dump_typed_fis(cx: DumpCx, fis: [FieldInit], depth: Int) : Unit / Console {
 
   match fis {
     [] -> ()
     [fi, ...rest] -> {
-      match fi { FI(_, v) -> dump_typed_expr(v, depth) }
-      dump_typed_fis(rest, depth)
+      match fi { FI(_, v) -> dump_typed_expr(cx, v, depth) }
+      dump_typed_fis(cx, rest, depth)
     }
   }
 }
 
-fn dump_typed_elems(els: [ListElem], depth: Int) : Unit / Console {
+fn dump_typed_elems(cx: DumpCx, els: [ListElem], depth: Int) : Unit / Console {
 
   match els {
     [] -> ()
     [el, ...rest] -> {
       match el {
-        ElPlain(x)  -> dump_typed_expr(x, depth)
-        ElSpread(x) -> dump_typed_expr(x, depth)
+        ElPlain(x)  -> dump_typed_expr(cx, x, depth)
+        ElSpread(x) -> dump_typed_expr(cx, x, depth)
       }
-      dump_typed_elems(rest, depth)
+      dump_typed_elems(cx, rest, depth)
     }
   }
 }
 
-fn dump_typed_stmts(ss: [Stmt], depth: Int) : Unit / Console {
+fn dump_typed_stmts(cx: DumpCx, ss: [Stmt], depth: Int) : Unit / Console {
 
   match ss {
     [] -> ()
-    [s, ...rest] -> { dump_typed_stmt(s, depth) dump_typed_stmts(rest, depth) }
+    [s, ...rest] -> { dump_typed_stmt(cx, s, depth) dump_typed_stmts(cx, rest, depth) }
   }
 }
 
-fn dump_typed_subexprs(k: ExprKind, depth: Int) : Unit / Console {
+fn dump_typed_subexprs(cx: DumpCx, k: ExprKind, depth: Int) : Unit / Console {
 
   match k {
     ECall(callee, xs) -> {
-      dump_typed_expr(callee, depth)
-      dump_typed_exprs(xs, depth)
+      dump_typed_expr(cx, callee, depth)
+      dump_typed_exprs(cx, xs, depth)
     }
-    EField(base, _)   -> dump_typed_expr(base, depth)
-    EIndex(a, b)      -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
-    EBinop(_, a, b)   -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
-    EUnop(_, x)       -> dump_typed_expr(x, depth)
+    EField(base, _)   -> dump_typed_expr(cx, base, depth)
+    EIndex(a, b)      -> { dump_typed_expr(cx, a, depth) dump_typed_expr(cx, b, depth) }
+    EBinop(_, a, b)   -> { dump_typed_expr(cx, a, depth) dump_typed_expr(cx, b, depth) }
+    EUnop(_, x)       -> dump_typed_expr(cx, x, depth)
     EIf(c, a, eo)     -> {
-      dump_typed_expr(c, depth)
-      dump_typed_expr(a, depth)
-      match eo { Some(b) -> dump_typed_expr(b, depth) None -> () }
+      dump_typed_expr(cx, c, depth)
+      dump_typed_expr(cx, a, depth)
+      match eo { Some(b) -> dump_typed_expr(cx, b, depth) None -> () }
     }
     EMatch(scr, arms) -> {
-      dump_typed_expr(scr, depth)
-      dump_typed_arms(arms, depth)
+      dump_typed_expr(cx, scr, depth)
+      dump_typed_arms(cx, arms, depth)
     }
-    ELambda(_, body)  -> dump_typed_expr(body, depth)
-    ERecordLit(_, _, fis) -> dump_typed_fis(fis, depth)
-    EList(els) -> dump_typed_elems(els, depth)
+    ELambda(_, body)  -> dump_typed_expr(cx, body, depth)
+    ERecordLit(_, fis) -> dump_typed_fis(cx, fis, depth)
+    EList(els) -> dump_typed_elems(cx, els, depth)
     ERange(a, b, so) -> {
-      dump_typed_expr(a, depth)
-      dump_typed_expr(b, depth)
-      match so { Some(s) -> dump_typed_expr(s, depth) None -> () }
+      dump_typed_expr(cx, a, depth)
+      dump_typed_expr(cx, b, depth)
+      match so { Some(s) -> dump_typed_expr(cx, s, depth) None -> () }
     }
     EBlock(ss, tail) -> {
-      dump_typed_stmts(ss, depth)
-      match tail { Some(t) -> dump_typed_expr(t, depth) None -> () }
+      dump_typed_stmts(cx, ss, depth)
+      match tail { Some(t) -> dump_typed_expr(cx, t, depth) None -> () }
     }
-    EPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
-    EMapPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
-    EFlatMapPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
-    EFilterPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
-    EBang(inner) -> dump_typed_expr(inner, depth)
+    EPipe(a, b) -> { dump_typed_expr(cx, a, depth) dump_typed_expr(cx, b, depth) }
+    EMapPipe(a, b) -> { dump_typed_expr(cx, a, depth) dump_typed_expr(cx, b, depth) }
+    EFlatMapPipe(a, b) -> { dump_typed_expr(cx, a, depth) dump_typed_expr(cx, b, depth) }
+    EFilterPipe(a, b) -> { dump_typed_expr(cx, a, depth) dump_typed_expr(cx, b, depth) }
+    EBang(inner) -> dump_typed_expr(cx, inner, depth)
     _ -> ()
   }
 }
 
-fn dump_typed_stmt(s: Stmt, depth: Int) : Unit / Console {
+fn dump_typed_stmt(cx: DumpCx, s: Stmt, depth: Int) : Unit / Console {
 
   match s {
-    SLet(_, _, rhs)  -> { inf_emit_line(depth, "let") dump_typed_expr(rhs, depth + 1) }
+    SLet(_, _, rhs)  -> { inf_emit_line(depth, "let") dump_typed_expr(cx, rhs, depth + 1) }
     SAssert(c, mo)   -> {
       inf_emit_line(depth, "assert")
-      dump_typed_expr(c, depth + 1)
-      match mo { Some(m) -> dump_typed_expr(m, depth + 1) None -> () }
+      dump_typed_expr(cx, c, depth + 1)
+      match mo { Some(m) -> dump_typed_expr(cx, m, depth + 1) None -> () }
     }
-    SExprStmt(ex)    -> dump_typed_expr(ex, depth)
+    SExprStmt(ex)    -> dump_typed_expr(cx, ex, depth)
     SIndexAssign(b, i, v, _, _) -> {
       inf_emit_line(depth, "index-assign")
-      dump_typed_expr(b, depth + 1)
-      dump_typed_expr(i, depth + 1)
-      dump_typed_expr(v, depth + 1)
+      dump_typed_expr(cx, b, depth + 1)
+      dump_typed_expr(cx, i, depth + 1)
+      dump_typed_expr(cx, v, depth + 1)
     }
     SAssign(b, v, _, _) -> {
       inf_emit_line(depth, "assign")
-      dump_typed_expr(b, depth + 1)
-      dump_typed_expr(v, depth + 1)
+      dump_typed_expr(cx, b, depth + 1)
+      dump_typed_expr(cx, v, depth + 1)
     }
-    SVar(n, _, rhs, _, _) -> {
-      inf_emit_line(depth, "var #{n}")
-      dump_typed_expr(rhs, depth + 1)
+    SVar(b, _, rhs, _, _) -> {
+      inf_emit_line(depth, "var #{b.name}")
+      dump_typed_expr(cx, rhs, depth + 1)
     }
     SUse(n, _, _) -> inf_emit_line(depth, "use #{n}")
   }
 }
 
-fn dump_typed_decl(d: Decl) : Unit / Console {
+fn dump_typed_decl(d: Decl, tab: SymTab) : Unit / Console {
   match d {
     # Hanga Roa: with core auto-loaded, `all_decls` carries both the
     # root file and the entire core set. Only dump decls authored in
@@ -238,10 +270,10 @@ fn dump_typed_decl(d: Decl) : Unit / Console {
     # have `Some(mod)`. This keeps the --dump-typed output focused on
     # what the user actually wrote — the same scope the legacy
     # behaviour gave before core became implicit.
-    DFn(_, nm, _, _, _, _, body, line, col, mo, _) -> match mo {
+    DFn(_, fid, _, _, _, _, body, line, col, mo) -> match mo {
       None -> {
-        print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
-        dump_typed_expr(body, 1)
+        print("fn #{decl_name(tab, fnid_sym(fid))} @#{int_to_string(line)}:#{int_to_string(col)}")
+        dump_typed_expr(DumpCx { tab: tab, locals: dump_locals(d) }, body, 1)
       }
       Some(_) -> ()
     }
@@ -250,17 +282,18 @@ fn dump_typed_decl(d: Decl) : Unit / Console {
 }
 
 #[doc("infer: --dump-typed dump of the fully typed AST.")]
-pub fn dump_typed(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_typed(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
 
-  let r = infer_program(file, decls, false)
-  dump_typed_loop(r.decls)
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
+  dump_typed_loop(r.decls, tab)
   r.errs
 }
 
-fn dump_typed_loop(ds: [Decl]) : Unit / Console {
+fn dump_typed_loop(ds: [Decl], tab: SymTab) : Unit / Console {
   match ds {
     [] -> ()
-    [d, ...rest] -> { dump_typed_decl(d) dump_typed_loop(rest) }
+    [d, ...rest] -> { dump_typed_decl(d, tab) dump_typed_loop(rest, tab) }
   }
 }
 
@@ -269,12 +302,12 @@ fn dump_typed_loop(ds: [Decl]) : Unit / Console {
 # Some) are printed, the root file (None) is hidden. Diffing this dump
 # across two runs that share the same core but differ only in the user
 # file proves whether the user contaminated core's typed AST.
-fn dump_typed_core_decl(d: Decl) : Unit / Console {
+fn dump_typed_core_decl(d: Decl, tab: SymTab) : Unit / Console {
   match d {
-    DFn(_, nm, _, _, _, _, body, line, col, mo, _) -> match mo {
+    DFn(_, fid, _, _, _, _, body, line, col, mo) -> match mo {
       Some(m) -> {
-        print("fn #{m}.#{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
-        dump_typed_expr(body, 1)
+        print("fn #{m}.#{decl_name(tab, fnid_sym(fid))} @#{int_to_string(line)}:#{int_to_string(col)}")
+        dump_typed_expr(DumpCx { tab: tab, locals: dump_locals(d) }, body, 1)
       }
       None -> ()
     }
@@ -283,17 +316,18 @@ fn dump_typed_core_decl(d: Decl) : Unit / Console {
 }
 
 #[doc("infer: --dump-typed-core dump of the typed AST of core / imported modules only (the independence oracle's probe).")]
-pub fn dump_typed_core(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_typed_core(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
 
-  let r = infer_program(file, decls, false)
-  dump_typed_core_loop(r.decls)
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
+  dump_typed_core_loop(r.decls, tab)
   r.errs
 }
 
-fn dump_typed_core_loop(ds: [Decl]) : Unit / Console {
+fn dump_typed_core_loop(ds: [Decl], tab: SymTab) : Unit / Console {
   match ds {
     [] -> ()
-    [d, ...rest] -> { dump_typed_core_decl(d) dump_typed_core_loop(rest) }
+    [d, ...rest] -> { dump_typed_core_decl(d, tab) dump_typed_core_loop(rest, tab) }
   }
 }
 
@@ -304,18 +338,18 @@ fn dump_typed_core_loop(ds: [Decl]) : Unit / Console {
 # ====================================================================
 
 fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit / Console {
-  let lu = inf_last_use_for(p.pname, uses)
-  match lu {
-    LUAt(nm, ln, cl) -> print("  param #{nm}: last-use at #{int_to_string(ln)}:#{int_to_string(cl)}")
-    LUBlocked(nm)    -> print("  param #{nm}: blocked by a read inside a lambda or loop body")
-    LUUnused(nm)     -> print("  param #{nm}: never used")
+  let nm = p.binder.name
+  match inf_last_use_for(p.binder.id, uses) {
+    LUAt(_, ln, cl) -> print("  param #{nm}: last-use at #{int_to_string(ln)}:#{int_to_string(cl)}")
+    LUBlocked(_)    -> print("  param #{nm}: blocked by a read inside a lambda or loop body")
+    LUUnused(_)     -> print("  param #{nm}: never used")
   }
 }
 
-fn dump_last_use_for_decl(d: Decl) : Unit / Console {
+fn dump_last_use_for_decl(d: Decl, tab: SymTab) : Unit / Console {
   match d {
-    DFn(_, nm, _, params, _, _, body, ln, _, _, _) -> {
-      print("fn #{nm}@#{int_to_string(ln)}:")
+    DFn(_, fid, _, params, _, _, body, ln, _, _) -> {
+      print("fn #{decl_name(tab, fnid_sym(fid))}@#{int_to_string(ln)}:")
       let uses = scan_uses_expr(body, false)
       params |> each((p) => dump_last_use_for_param(p, uses))
     }
@@ -324,11 +358,12 @@ fn dump_last_use_for_decl(d: Decl) : Unit / Console {
 }
 
 #[doc("infer: --dump-last-use Perceus last-use diagnostic over typed decls.")]
-pub fn dump_last_use(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_last_use(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
 
 
-  let r = infer_program(file, decls, false)
-  sym_locals_read_decls(r.decls) |> each(dump_last_use_for_decl)
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
+  r.decls |> each((d) => dump_last_use_for_decl(d, tab))
   r.errs
 }
 
@@ -338,23 +373,24 @@ pub fn dump_last_use(file: String, decls: [Decl]) : Int / Console + File {
 # pinning the lattice's behaviour in fixtures before the unifier
 # reshape consumes it.
 #[doc("infer: --dump-intervals refinement-interval dump.")]
-pub fn dump_intervals(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_intervals(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
 
-  let r = infer_program(file, decls, false)
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
   # Hanga Roa: core auto-load surfaces every stdlib DFn alongside the
   # target file's. The dump's pre-Hanga shape pinned one line per
   # target-file fn; without the filter, the dump explodes to ~320
   # lines mixing core helpers with the target. Keep only decls whose
   # module-origin is `None` — the root file's own declarations.
-  sym_locals_read_decls(r.decls) |> each(dump_intervals_for_decl)
+  r.decls |> each((d) => dump_intervals_for_decl(d, tab))
   r.errs
 }
 
-fn dump_intervals_for_decl(d: Decl) : Unit / Console = match d {
-  DFn(_, name, _, _, _, _, _, _, _, mo, _) -> match mo {
+fn dump_intervals_for_decl(d: Decl, tab: SymTab) : Unit / Console = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, mo) -> match mo {
     None    -> {
       let iv = ival_of_decl(d)
-      print("#{name}: #{ival_show(iv)}")
+      print("#{decl_name(tab, fnid_sym(fid))}: #{ival_show(iv)}")
     }
     Some(_) -> ()
   }
@@ -368,8 +404,8 @@ fn dump_intervals_for_decl(d: Decl) : Unit / Console = match d {
 # that point, and the candidates that fit. Output mirrors the example
 # in docs/typed-holes.md.
 
-fn dump_scope_entry(te: TyEntry) : Unit / Console =
-  print("    #{te.name} : #{scheme_to_string(te.scheme)}")
+fn dump_scope_entry(tab: SymTab, te: TyEntry) : Unit / Console =
+  print("    #{env_key_text(tab, te.key)} : #{scheme_to_string(tab, te.scheme)}")
 
 fn dump_hole_candidate(c: String) : Unit / Console =
   print("    #{c}")
@@ -377,29 +413,29 @@ fn dump_hole_candidate(c: String) : Unit / Console =
 # The default report lists only the hole's LOCAL bindings (params +
 # lets); the surrounding top-level scope — hundreds of stdlib entries
 # — is summarised as a count and dumped only under `--holes-scope`.
-fn dump_hole_report(file: String, rh: ResolvedHole, tp: TypedProgram,
-                    hidden: [String], full: Bool) : Unit / Console {
+fn dump_hole_report(file: String, rh: ResolvedHole, tp: TypedProgram, tab: SymTab,
+                    hidden: [SymId], full: Bool) : Unit / Console {
   let core_len = tp.core_len
   let toplevel_len = tp.toplevel_len
   match rh {
     RH(kind, line, col, ty, scope, env_fresh, owner, hr) -> {
       let label = hole_kind_label(kind)
-      let user_scope = hole_visible_scope(drop_last_entries(scope, core_len),
+      let user_scope = hole_visible_scope(tab, drop_last_entries(scope, core_len),
                                           toplevel_len - core_len, hidden)
       let shown = if full { user_scope }
-                  else { hole_local_scope(scope, toplevel_len) }
+                  else { hole_local_scope(tab, scope, toplevel_len) }
       let elided = list_length(user_scope) - list_length(shown)
-      let cands = synth_candidates(hole_visible_scope(scope, toplevel_len, hidden), ty, env_fresh, owner, hr, tp.decls)
+      let cands = synth_candidates(tab, hole_visible_scope(tab, scope, toplevel_len, hidden), ty, env_fresh, owner, hr, tp.decls)
       print("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: type hole #{label}")
       print("")
-      print("  expected: #{inf_ty_to_string(ty)}")
+      print("  expected: #{inf_ty_to_string(tab, ty)}")
       print("")
       let scope_label = if full { "  in scope:" } else { "  in scope (local):" }
       match shown {
         [] -> { print(if full { "  in scope: (empty)" } else { "  in scope (local): (empty)" }) print("") }
         _  -> {
           print(scope_label)
-          shown |> each(dump_scope_entry)
+          shown |> each((te) => dump_scope_entry(tab, te))
           print("")
         }
       }
@@ -447,22 +483,22 @@ pub fn hole_kind_label(k: HoleKind) : String {
   }
 }
 
-fn dump_holes_loop(file: String, hs: [ResolvedHole], tp: TypedProgram,
-                   hidden: [String], full: Bool) : Unit / Console {
+fn dump_holes_loop(file: String, hs: [ResolvedHole], tp: TypedProgram, tab: SymTab,
+                   hidden: [SymId], full: Bool) : Unit / Console {
   match hs {
     [] -> ()
     [h, ...rest] -> {
-      dump_hole_report(file, h, tp, hidden, full)
-      dump_holes_loop(file, rest, tp, hidden, full)
+      dump_hole_report(file, h, tp, tab, hidden, full)
+      dump_holes_loop(file, rest, tp, tab, hidden, full)
     }
   }
 }
 
-#[doc("infer: --holes human-readable typed-hole report over the build front-end's typed program. `hidden` names the top-level bindings the root file cannot reach; `full` lists every reachable binding instead of the hole's locals.")]
-pub fn dump_holes(file: String, tp: TypedProgram, hidden: [String], full: Bool) : Int / Console + File {
+#[doc("infer: --holes human-readable typed-hole report over the build front-end's typed program. `tab` names its declarations; `hidden` holds the top-level declarations the root file cannot reach; `full` lists every reachable binding instead of the hole's locals.")]
+pub fn dump_holes(file: String, tp: TypedProgram, tab: SymTab, hidden: [SymId], full: Bool) : Int / Console + File {
   match tp.holes {
     [] -> { print("(no typed holes)") tp.errs }
-    _  -> { dump_holes_loop(file, tp.holes, tp, hidden, full) tp.errs }
+    _  -> { dump_holes_loop(file, tp.holes, tp, tab, hidden, full) tp.errs }
   }
 }
 

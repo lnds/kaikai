@@ -12,7 +12,6 @@
 import compiler.util
 import compiler.ast
 import compiler.decl_map
-import compiler.sym_read
 import compiler.expr_positions
 import compiler.modules
 import compiler.module_table
@@ -20,14 +19,17 @@ import compiler.scope_walk
 import compiler.kinds
 import compiler.decl_names
 import compiler.symtab
+import compiler.symtab_build
+import compiler.proto_ids
+import compiler.written
 import compiler.name_contest
 import compiler.infer_index
 
 #[doc("One contested reference: `NUse(class, name, line, col, op)`. `op` is the operation a protocol was reached through, else empty.")]
 pub type NUse = NUse(NCls, String, Int, Int, String)
 
-#[doc("A protocol dispatcher name paired with its protocol: `NDisp(\"__proto_op\", op, protocol)`. The lowering leaves the dispatcher where the source named the operation.")]
-pub type NDisp = NDisp(String, String, String)
+#[doc("A protocol dispatcher paired with its protocol: `NDisp(dispatcher, op, protocol)`. The lowering leaves the dispatcher where the source named the operation.")]
+pub type NDisp = NDisp(SymId, String, SymId)
 
 #[doc("Every reference in the root file's declarations to a name contested in its class, under the selective imports it wrote. `t` is the whole-program table; `target` the root module; `ds` the protocol dispatchers; `core` the core homes, outranked by the user's; a picked name is settled and never reported.")]
 pub fn nu_scan_picks(decls: [Decl], t: [NEnt], target: String, ds: [NDisp],
@@ -41,17 +43,23 @@ pub fn nu_scan_tab(decls: [Decl], t: [NEnt], target: String, ds: [NDisp],
     NuCx { t: nt_index(t), target: target, ds: ds, core: core, picks: picks, tps: [],
            tab: tab }, []))
 
-#[doc("The contested constant references of the root file, under the selective imports it wrote. Scanned before module scoping keys them: a keyed read no longer shows its bare spelling.")]
-pub fn nu_scan_consts(decls: [Decl], target: String, picks: [NPick]) : [NUse] =
-  nu_scan_picks(decls, nt_only(nt_collect(decls, target), NCConst), target, [], [], picks)
+#[doc("The contested constant references of the root file, under the selective imports it wrote. Scanned before module scoping keys them: a keyed read no longer shows its bare spelling. `tab` names the constants `decls` declares.")]
+pub fn nu_scan_consts(decls: [Decl], tab: SymTab, target: String, picks: [NPick]) : [NUse] =
+  nu_scan_picks(decls, nt_only(nt_collect(decls, tab, target), NCConst), target, [], [], picks)
 
 #[doc("The dispatchers of a lowered protocol registry.")]
-pub fn nu_dispatchers(reg: ProtocolReg) : [NDisp] = nu_disp_build(reg.ops, [])
+pub fn nu_dispatchers(reg: ProtocolReg) : [NDisp] = nu_disp_build(reg.ops, reg.ids, [])
 
-fn nu_disp_build(ops: [ProtoOpReg], acc: [NDisp]) : [NDisp] = match ops {
+# An operation with no dispatcher was never lowered and has no use to report.
+fn nu_disp_build(ops: [ProtoOpReg], ids: ProtoIds, acc: [NDisp]) : [NDisp] = match ops {
   [] -> acc
-  [POR(proto, op, _, _, _, _, _), ...rest] ->
-    nu_disp_build(rest, [NDisp(concat_all(["__proto_", op]), op, proto), ...acc])
+  [POR(proto, op, params, _, _, _, _), ...rest] -> {
+    let label = written_text(op)
+    match pid_op_disp_at(ids, proto, label, list_length(params)) {
+      Some(d) -> nu_disp_build(rest, ids, [NDisp(d, label, proto), ...acc])
+      None    -> nu_disp_build(rest, ids, acc)
+    }
+  }
 }
 
 #[doc("`a` followed by the uses of `b` not already reported in `a`.")]
@@ -81,7 +89,7 @@ fn nu_decls(ds: [Decl], cx: NuCx, acc: [NUse]) : [NUse] =
 # Only root-authored decls are scanned; an imported decl's uses belong
 # to its own home, where they resolve.
 fn nu_decl(d: Decl, cx: NuCx, acc: [NUse]) : [NUse] = match d {
-  DFn(_, _, tps, ps, ret, row, body, _, _, mo, _) -> match mo {
+  DFn(_, _, tps, ps, ret, row, body, _, _, mo) -> match mo {
     Some(_) -> acc
     None    -> {
       let sig = nu_bind(cx, tps)
@@ -89,7 +97,7 @@ fn nu_decl(d: Decl, cx: NuCx, acc: [NUse]) : [NUse] = match d {
               nu_row(row, sig, nu_ret(ret, sig, nu_params(ps, sig, acc))))
     }
   }
-  DConst(_, _, ty, body, mo, _, _, _) -> match mo {
+  DConst(_, _, ty, body, mo, _, _) -> match mo {
     Some(_) -> acc
     None    -> nu_expr(body, cx, nu_ty(ty, cx, acc))
   }
@@ -121,16 +129,22 @@ fn nu_ret(r: Option[TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] =
 
 fn nu_ty(ty: TypeExpr, cx: NuCx, acc: [NUse]) : [NUse] =
   match ty.tkind {
-    TyName(_, n, targs) ->
-      nu_ty_list(targs, cx,
-        if list_has(cx.tps, n) { acc }
-        else { nu_hit(NCType, n, ty.line, ty.col, cx, acc) })
+    TyName(r, targs) -> nu_ty_list(targs, cx, nu_ty_ref(r, ty, cx, acc))
     TyList(inner)      -> nu_ty(inner, cx, acc)
     TyFn(ps, r, row)   -> nu_row(row, cx, nu_ty(r, cx, nu_ty_list(ps, cx, acc)))
     TyDim(base, _)     -> nu_ty(base, cx, acc)
     TyRefine(base, _)  -> nu_ty(base, cx, acc)
     _ -> acc
   }
+
+# Only a name written bare can be contested: a qualifier names its
+# module, and a settled reference its declaration.
+fn nu_ty_ref(r: DeclRef, ty: TypeExpr, cx: NuCx, acc: [NUse]) : [NUse] = match r {
+  DrWritten(None, n) ->
+    if list_has(cx.tps, written_text(n)) { acc }
+    else { nu_hit(NCType, written_text(n), ty.line, ty.col, cx, acc) }
+  _ -> acc
+}
 
 fn nu_ty_list(tys: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] =
   match tys {
@@ -148,10 +162,15 @@ fn nu_row(r: RowExpr, cx: NuCx, acc: [NUse]) : [NUse] =
 fn nu_labels(ls: [RowLabel], cx: NuCx, acc: [NUse]) : [NUse] =
   match ls {
     [] -> acc
-    [RL(n, targs, _), ...rest] ->
+    [RL(r, targs), ...rest] ->
       nu_labels(rest, cx,
-                nu_ty_list(targs, cx, nu_row_hit(n, targs, cx, acc)))
+                nu_ty_list(targs, cx, nu_row_ref(r, targs, cx, acc)))
   }
+
+fn nu_row_ref(r: DeclRef, targs: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] = match r {
+  DrWritten(None, n) -> nu_row_hit(written_text(n), targs, cx, acc)
+  _                  -> acc
+}
 
 # A row label carries no position of its own; borrow the first type
 # argument's, falling back to the declaration site the caller reports.
@@ -167,11 +186,11 @@ fn nu_row_hit(n: String, targs: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] = ma
 # its own reporter.
 fn nu_expr(e: Expr, cx: NuCx, acc: [NUse]) : [NUse] = {
   let here = match e.kind {
-    EVar(n)     -> nu_name_hit(n, e.line, e.col, false, cx, acc)
-    ESym(s, _, n)  -> nu_sym_hit(s, n, e.line, e.col, false, cx, acc)
+    EName(n)    -> nu_name_hit(written_text(n), e.line, e.col, false, cx, acc)
+    ESym(s, _)  -> nu_sym_hit(s, e.line, e.col, cx, acc)
     ECall(c, _) -> match c.kind {
-      EVar(n)    -> nu_name_hit(n, c.line, c.col, true, cx, acc)
-      ESym(s, _, n) -> nu_sym_hit(s, n, c.line, c.col, true, cx, acc)
+      EName(n)   -> nu_name_hit(written_text(n), c.line, c.col, true, cx, acc)
+      ESym(s, _) -> nu_sym_hit(s, c.line, c.col, cx, acc)
       _          -> acc
     }
     _ -> acc
@@ -182,15 +201,29 @@ fn nu_expr(e: Expr, cx: NuCx, acc: [NUse]) : [NUse] = {
 # An id names the one declaration the use reaches, so the use is settled
 # whatever else shares its spelling; only a dispatcher still stands for
 # its protocol's contest.
-fn nu_sym_hit(s: SymId, name: String, line: Int, col: Int, called: Bool,
-      cx: NuCx, acc: [NUse]) : [NUse] =
-  if sym_is_local(s) { acc }
-  else if st_valid(cx.tab, s) {
-    match nu_disp_find(cx.ds, name) {
-      Some(NDisp(_, op, proto)) -> nu_hit_op(NCProtocol, proto, line, col, op, cx, acc)
+fn nu_sym_hit(s: SymId, line: Int, col: Int, cx: NuCx, acc: [NUse]) : [NUse] =
+  if st_valid(cx.tab, s) {
+    match nu_disp_of(cx.ds, s) {
+      Some(NDisp(_, op, proto)) -> nu_hit_proto(proto, line, col, op, cx, acc)
       None -> acc
     }
-  } else { nu_name_hit(name, line, col, called, cx, acc) }
+  } else { acc }
+
+fn nu_disp_of(ds: [NDisp], s: SymId) : Option[NDisp] = match ds {
+  [] -> None
+  [d, ...rest] -> match d {
+    NDisp(ds_, _, _) -> if sym_raw(ds_) == sym_raw(s) { Some(d) } else { nu_disp_of(rest, s) }
+  }
+}
+
+# A protocol reached through a dispatcher is a candidate for the report
+# when another protocol is declared under its name; the report, which
+# knows the reader's picks, has the last word and prints that name.
+fn nu_hit_proto(proto: SymId, line: Int, col: Int, op: String, cx: NuCx, acc: [NUse]) : [NUse] = {
+  let name = "#{sym_name(cx.tab, proto)}"
+  if not sym_contested(cx.tab, proto) or nu_seen(acc, NCProtocol, name) { acc }
+  else { [NUse(NCProtocol, name, line, col, op), ...acc] }
+}
 
 fn nu_positions(ps: [XPos], cx: NuCx, acc: [NUse]) : [NUse] =
   match ps {
@@ -202,13 +235,13 @@ fn nu_positions(ps: [XPos], cx: NuCx, acc: [NUse]) : [NUse] =
 # list. The help text spells the qualified form the reader must type, and
 # a nullary constructor read as a plain reference has no `(...)` to show.
 #
-# A local binder carries its id, so a bare name here is never one: a
+# A local read is its binder's id, so a written name here is never one: a
 # function left unsettled is contested in value position as much as in a
 # call.
 fn nu_name_hit(name: String, line: Int, col: Int, called: Bool, cx: NuCx,
       acc: [NUse]) : [NUse] =
-  match nu_disp_find(cx.ds, name) {
-    Some(NDisp(_, op, proto)) -> nu_hit_op(NCProtocol, proto, line, col, op, cx, acc)
+  match nu_disp_named(cx, name) {
+    Some(NDisp(_, op, proto)) -> nu_hit_proto(proto, line, col, op, cx, acc)
     None ->
       if list_length(nt_homes(idx_chain(cx.t, name), NCCtor, name)) > 0 {
         nu_hit_call(NCCtor, name, line, col, called, cx, acc)
@@ -219,19 +252,19 @@ fn nu_name_hit(name: String, line: Int, col: Int, called: Bool, cx: NuCx,
       }
   }
 
-# Dispatchers all start with `__`; anything else skips the list.
-fn nu_disp_find(ds: [NDisp], name: String) : Option[NDisp] =
-  if nu_internal(name) { nu_disp_loop(ds, name) } else { None }
-
-fn nu_internal(name: String) : Bool = match char_at(name, 0) {
-  Some(c0) -> c0 == '_' and match char_at(name, 1) { Some(c1) -> c1 == '_'  None -> false }
-  None -> false
+# A name left written is one several declarations answer to. When those
+# are dispatchers the contest is their protocol's, and the first of them
+# stands for it as a settled use would.
+fn nu_disp_named(cx: NuCx, name: String) : Option[NDisp] = match cx.ds {
+  [] -> None
+  _  -> nu_disp_among(cx.ds, st_candidates(cx.tab, NCFn, name))
 }
 
-fn nu_disp_loop(ds: [NDisp], name: String) : Option[NDisp] = match ds {
+fn nu_disp_among(ds: [NDisp], cands: [SymId]) : Option[NDisp] = match cands {
   [] -> None
-  [d, ...rest] -> match d {
-    NDisp(dn, _, _) -> if dn == name { Some(d) } else { nu_disp_loop(rest, name) }
+  [s, ...rest] -> match nu_disp_of(ds, s) {
+    Some(d) -> Some(d)
+    None    -> nu_disp_among(ds, rest)
   }
 }
 
@@ -272,16 +305,16 @@ fn nu_seen(acc: [NUse], cls: NCls, name: String) : Bool = match acc {
 pub type CSCtx = { coll: [NEnt], home: String, target: String,
                    free: Bool, mt: [ModuleEntry] }
 
-#[doc("The const collisions of `decls`: consts whose name another home also declares, in stream order (boundary-stamped homes).")]
-pub fn nu_const_coll(decls: [Decl], target: String) : [NEnt] {
-  let all = nt_collect(decls, target)
+#[doc("The const collisions of `decls`: consts whose name another home also declares, in stream order (boundary-stamped homes). `tab` names them.")]
+pub fn nu_const_coll(decls: [Decl], tab: SymTab, target: String) : [NEnt] {
+  let all = nt_collect(decls, tab, target)
   nu_keep_collided(all, all, [])
 }
 
 fn nu_keep_collided(all: [NEnt], todo: [NEnt], acc: [NEnt]) : [NEnt] = match todo {
   [] -> list_reverse(acc)
   [e, ...rest] -> match e {
-    NEnt(NCConst, n, h, _) ->
+    NEnt(NCConst, n, h, _, _) ->
       if nu_other_home(all, n, h) { nu_keep_collided(all, rest, [e, ...acc]) }
       else { nu_keep_collided(all, rest, acc) }
     _ -> nu_keep_collided(all, rest, acc)
@@ -290,14 +323,19 @@ fn nu_keep_collided(all: [NEnt], todo: [NEnt], acc: [NEnt]) : [NEnt] = match tod
 
 fn nu_other_home(t: [NEnt], name: String, home: String) : Bool = match t {
   [] -> false
-  [NEnt(c, n, h, _), ...rest] ->
-    if ncls_word(c) == "constant" and n == name and h != home { true }
+  [NEnt(c, n, h, _, _), ...rest] ->
+    if nu_is_const(c) and n == name and h != home { true }
     else { nu_other_home(rest, name, home) }
+}
+
+fn nu_is_const(c: NCls) : Bool = match c {
+  NCConst -> true
+  _       -> false
 }
 
 #[doc("A decl's home for both reading and streaming: a DConst carries its own `module_origin` (None marks the root); everything else follows the streaming reset.")]
 pub fn nu_reader_home(d: Decl, cur: String, target: String) : String = match d {
-  DConst(_, _, _, _, mo, _, _, _) -> match mo { Some(m) -> m  None -> target }
+  DConst(_, _, _, _, mo, _, _) -> match mo { Some(m) -> m  None -> target }
   DDoc(_, _, inner, _, _) -> nu_reader_home(inner, cur, target)
   DAttr(_, inner, _, _)   -> nu_reader_home(inner, cur, target)
   _ -> decl_home_hint_reset(d, cur, target)
@@ -311,16 +349,16 @@ pub fn nu_const_owner(cx: CSCtx, name: String) : Option[String] =
 fn nu_const_foreign_pub(t: [NEnt], name: String, home: String,
       target: String) : Option[String] = match t {
   [] -> None
-  [NEnt(c, n, h, p), ...rest] ->
-    if ncls_word(c) == "constant" and n == name and p and h != home and h != target { Some(h) }
+  [NEnt(c, n, h, p, _), ...rest] ->
+    if nu_is_const(c) and n == name and p and h != home and h != target { Some(h) }
     else { nu_const_foreign_pub(rest, name, home, target) }
 }
 
 #[doc("True when `home` declares a pub const `name` in the collision table.")]
 pub fn nu_is_pub_const(t: [NEnt], name: String, home: String) : Bool = match t {
   [] -> false
-  [NEnt(c, n, h, p), ...rest] ->
-    if ncls_word(c) == "constant" and n == name and h == home and p { true }
+  [NEnt(c, n, h, p, _), ...rest] ->
+    if nu_is_const(c) and n == name and h == home and p { true }
     else { nu_is_pub_const(rest, name, home) }
 }
 
@@ -331,26 +369,29 @@ fn nu_scope_params(ps: [Param], acc: [String]) : [String] = sw_params(ps, acc)
 
 #[doc("Rewrite the free reads of colliding const names in one expression; `sh` holds the names already bound in scope.")]
 pub fn nu_const_expr(e: Expr, sh: [String], cx: CSCtx) : Expr =
-  sw_expr(e, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n, hs) => sw_head_same(n, hs))
+  sw_expr(e, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, sw_head_same)
 
 # `mod.NAME` where NAME is a colliding pub const of `mod`: key it
 # here — rqc collapses an uppercase qualified export to a bare
-# `EVar` (the variant-ctor rule), which would lose the module. The
+# name (the variant-ctor rule), which would lose the module. The
 # qualifier maps through `mt` first: an aliased import collides
 # under its tagged name, not the name the file wrote.
 # Private consts fall through so rqc / pub-access still diagnose.
-fn nu_const_leaf(e: Expr, sh: [String], cx: CSCtx) : Option[Expr] = match sym_read_kind(e.kind) {
-  EVar(nm) ->
+fn nu_const_leaf(e: Expr, sh: [String], cx: CSCtx) : Option[Expr] = match e.kind {
+  EName(w) -> {
+    let nm = written_text(w)
     if not cx.free or list_has(sh, nm) { Some(e) }
     else { match nu_const_owner(cx, nm) {
-      Some(m) -> if m == cx.target { Some(e) } else { Some(nu_const_re(e, EModCall(m, nm))) }
+      Some(m) -> if m == cx.target { Some(e) } else { Some(nu_const_re(e, EModCall(written(m), w))) }
       None    -> Some(e)
     } }
+  }
   EField(obj, f) -> match obj.kind {
-    EVar(m) -> {
+    EName(w) -> {
+      let m = written_text(w)
       let tm = mt_tagged_name(cx.mt, m)
       if not list_has(sh, m) and nu_is_pub_const(cx.coll, f, tm) {
-        Some(nu_const_re(e, EModCall(tm, f)))
+        Some(nu_const_re(e, EModCall(written(tm), written(f))))
       } else { None }
     }
     _ -> None
@@ -359,10 +400,10 @@ fn nu_const_leaf(e: Expr, sh: [String], cx: CSCtx) : Option[Expr] = match sym_re
 }
 
 fn nu_const_hclauses(hcs: [HClause], sh: [String], cx: CSCtx) : [HClause] =
-  sw_hclauses(hcs, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n, hs) => sw_head_same(n, hs))
+  sw_hclauses(hcs, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, sw_head_same)
 
 fn nu_const_hreturn_opt(o: Option[HReturn], sh: [String], cx: CSCtx) : Option[HReturn] =
-  sw_hreturn_opt(o, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n, hs) => sw_head_same(n, hs))
+  sw_hreturn_opt(o, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, sw_head_same)
 
 #[doc("Rewrite free reads of colliding const names to `EModCall(home, name)`, resolving each against the reading decl's own module first. Runs before rqc: a qualified `mod.CONST` read is keyed here, before the uppercase collapse can drop its module. `scopes`/`global_mt` give each decl its segment module table, so a qualifier written as a per-file import alias keys under its tagged name; pass empty tables when the stream's qualifiers are already tagged.")]
 pub fn nu_scope_const_decls(decls: [Decl], coll: [NEnt], target: String,
@@ -390,18 +431,18 @@ fn nu_const_sub_decls(ds: [Decl], cx: CSCtx) : [Decl] = match ds {
 fn nu_const_decl(d: Decl, cx: CSCtx) : Decl = decl_map_inner(d, (x) => nu_const_decl_leaf(x, cx))
 
 fn nu_const_decl_leaf(d: Decl, cx: CSCtx) : Decl = match d {
-  DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(p, n, tps, ps, ret, row, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo, fsym)
-  DConst(p, n, ty, body, mo, l, c, csym) -> DConst(p, n, ty, nu_const_expr(body, [], cx), mo, l, c, csym)
+  DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, fid, tps, ps, ret, row, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo)
+  DConst(p, csym, ty, body, mo, l, c) -> DConst(p, csym, ty, nu_const_expr(body, [], cx), mo, l, c)
   DTest(n, body, l, c, mo)  -> DTest(n, nu_const_expr(body, [], cx), l, c, mo)
   DBench(n, body, l, c, mo) -> DBench(n, nu_const_expr(body, [], cx), l, c, mo)
   DCheck(n, ps, body, l, c, mo) ->
     DCheck(n, ps, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo)
-  DEffect(p, n, tps, ops, dblk, l, c, mo, esym) -> match dblk {
+  DEffect(p, esym, tps, ops, dblk, l, c, mo) -> match dblk {
     Some(DBlk(hcs, ret, bl, bc)) ->
-      DEffect(p, n, tps, ops,
+      DEffect(p, esym, tps, ops,
               Some(DBlk(nu_const_hclauses(hcs, [], cx), nu_const_hreturn_opt(ret, [], cx), bl, bc)),
-              l, c, mo, esym)
+              l, c, mo)
     None -> d
   }
   DImpl(pn, tas, fty, subs, l, c, ss, isym) -> DImpl(pn, tas, fty, nu_const_sub_decls(subs, cx), l, c, ss, isym)

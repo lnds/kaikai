@@ -13,7 +13,7 @@ import compiler.decl_names
 import compiler.name_contest
 import compiler.name_uses
 import compiler.symtab
-import compiler.home_spell
+import compiler.symtab_build
 import compiler.infer_index
 import compiler.modules
 import compiler.module_table
@@ -33,8 +33,17 @@ pub fn nr_ambiguous_diag(file: String, line: Int, col: Int, cls: NCls,
 }
 
 fn nr_ambiguous_msg(name: String, homes: [String]) : String =
-  concat_all(["bare name '", name, "' is exported by multiple modules: ",
-              join_with(homes, ", ")])
+  concat_all([nr_ambiguous_head(name), join_with(homes, ", ")])
+
+fn nr_ambiguous_head(name: String) : String =
+  concat_all(["bare name '", name, "' is exported by multiple modules: "])
+
+# True when `d` is this report, already made, for the use `u`.
+fn nr_tells(d: Diagnostic, u: NUse) : Bool = match d {
+  D(_, _, line, col, msg, _) -> match u {
+    NUse(_, name, ul, uc, _) -> line == ul and col == uc and starts_with(msg, nr_ambiguous_head(name))
+  }
+}
 
 fn nr_ambiguous_notes(cls: NCls, name: String, homes: [String], suffix: String) : [String] =
   [concat_all(["note: ", ncls_word(cls), " candidates: ", nr_candidates(name, homes)]),
@@ -59,21 +68,16 @@ fn nr_first(homes: [String]) : String = match homes {
   [h, ..._] -> h
 }
 
-#[doc("Report once for every contested bare name the root file references, and once for every effect two non-core modules both export; returns the number of errors. The single entry point: build the table, scan the uses, report each. `early` carries uses scanned before a pass keyed them; `core` names the modules whose collisions are theirs to resolve; `pre` is the stream before the protocol lowering, which is where the `DProtocol` decls still are.")]
-pub fn nr_report_program(df: DiagFiles, decls: [Decl], target: String,
-      reg: ProtocolReg, early: [NUse], core: [String],
-      pre: [Decl], picks: [NPick]) : Int / Console + File =
-  list_length(nr_report_program_tab(df, decls, target, reg, early, core, pre, picks, st_empty(), []))
-
-#[doc("`nr_report_program` against the resolver's table: a reference carrying an id names one declaration, so it is settled and never reported.")]
+#[doc("Report once for every contested bare name the root file references, and once for every effect two non-core modules both export; returns the errors. The single entry point: read the names `tab` holds for the declarations, scan the uses, report each. A reference carrying an id names one declaration, so it is settled and never reported, and neither is a use `told` already reports as contested. `early` carries uses scanned before a pass keyed them; `core` names the modules whose collisions are theirs to resolve; `pre` is the stream before the protocol lowering, which is where the `DProtocol` decls still are.")]
 pub fn nr_report_program_tab(df: DiagFiles, decls: [Decl], target: String,
       reg: ProtocolReg, early: [NUse], core: [String],
-      pre: [Decl], picks: [NPick], tab: SymTab, mt: [ModuleEntry]) : [Diagnostic] / Console + File {
-  let t = list_append(nt_collect(decls, target), nt_protocols(pre, target))
-  let uses = nu_merge(nu_scan_tab(decls, t, target, nu_dispatchers(reg), core, picks, tab), early)
+      pre: [Decl], picks: [NPick], tab: SymTab, mt: [ModuleEntry], told: [Diagnostic]) : [Diagnostic] / Console + File {
+  let t = list_append(nt_collect(decls, tab, target), nt_protocols(pre, tab, target))
+  let scanned = nu_merge(nu_scan_tab(decls, t, target, nu_dispatchers(reg), core, picks, tab), early)
+  let uses = filter(scanned, (u) => not any(told, (d) => nr_tells(d, u)))
   let ix = nt_index(t)
   let errs = list_reverse(nr_each(df_root(df), uses, ix, target, core, picks, mt, []))
-  nr_effects(df, decls, nt_collisions(t, NCEffect), ix, target, core, picks)
+  nr_effects(df, decls, tab, nt_collisions(t, NCEffect), ix, target, core, picks)
   errs
 }
 
@@ -124,15 +128,15 @@ fn nr_call_suffix(op: String) : String =
 # whether or not the root names it; core keeps its own names. A
 # selective import naming the effect is that choice, so the root has
 # nothing left to disambiguate and the warning would be false.
-fn nr_effects(df: DiagFiles, decls: [Decl], names: [String], t: NameIndex[NEnt],
+fn nr_effects(df: DiagFiles, decls: [Decl], tab: SymTab, names: [String], t: NameIndex[NEnt],
       target: String, core: [String], picks: [NPick]) : Unit / Console + File = match names {
   [] -> ()
   [n, ...rest] -> {
     let homes = nr_non_core(nt_homes(idx_chain(t, n), NCEffect, n), core)
     if list_length(homes) > 1 and list_length(nt_contested_in(idx_chain(t, n), picks, NCEffect, n, target, core)) > 0 {
-      nr_effect_warn(df, decls, n, homes, target)
+      nr_effect_warn(df, decls, tab, n, homes)
     } else { () }
-    nr_effects(df, decls, rest, t, target, core, picks)
+    nr_effects(df, decls, tab, rest, t, target, core, picks)
   }
 }
 
@@ -143,13 +147,13 @@ fn nr_non_core(homes: [String], core: [String]) : [String] = match homes {
 }
 
 # Anchored at the last colliding declaration, in its own file.
-fn nr_effect_warn(df: DiagFiles, decls: [Decl], name: String,
-      homes: [String], target: String) : Unit / Console + File = {
+fn nr_effect_warn(df: DiagFiles, decls: [Decl], tab: SymTab, name: String,
+      homes: [String]) : Unit / Console + File = {
   let msg = concat_all(["effect '", name, "' is exported by multiple modules: ",
                         join_with(homes, ", ")])
-  match nr_effect_decl(decls, name, nr_last(homes), target) {
+  match nr_effect_decl(decls, nr_effect_sym(tab, name, nr_last(homes))) {
     Some(d) -> match d {
-      DEffect(_, _, _, _, _, l, c, _, _) -> diag_warning(decl_diag_file(d, df), l, c, msg)
+      DEffect(_, _, _, _, _, l, c, _) -> diag_warning(decl_diag_file(d, df), l, c, msg)
       _ -> diag_warning(df_root(df), 0, 0, msg)
     }
     None -> diag_warning(df_root(df), 0, 0, msg)
@@ -158,22 +162,23 @@ fn nr_effect_warn(df: DiagFiles, decls: [Decl], name: String,
   diag_help("a bare reference cannot choose between them; qualify the handler head or the operation (`m.E`, `m.E.op(...)`)")
 }
 
-fn nr_effect_decl(decls: [Decl], name: String, home: String,
-      target: String) : Option[Decl] = match decls {
+# The effect `home` declares under `name`, `sym_none()` when the table holds none.
+fn nr_effect_sym(tab: SymTab, name: String, home: String) : SymId =
+  match st_lookup(tab, NCEffect, name, st_module_id(home)) {
+    Some(s) -> s
+    None    -> sym_none()
+  }
+
+fn nr_effect_decl(decls: [Decl], s: SymId) : Option[Decl] = match decls {
   [] -> None
   [d, ...rest] -> match d {
-    DEffect(_, n, _, _, _, _, _, mo, _) ->
-      if hs_display(n, mo) == name and nr_home(mo, target) == home { Some(d) }
-      else { nr_effect_decl(rest, name, home, target) }
-    DDoc(_, _, inner, _, _) -> nr_effect_decl([inner, ...rest], name, home, target)
-    DAttr(_, inner, _, _)   -> nr_effect_decl([inner, ...rest], name, home, target)
-    _ -> nr_effect_decl(rest, name, home, target)
+    DEffect(_, esym, _, _, _, _, _, _) ->
+      if sym_raw(s) >= 0 and sym_raw(esym) == sym_raw(s) { Some(d) }
+      else { nr_effect_decl(rest, s) }
+    DDoc(_, _, inner, _, _) -> nr_effect_decl([inner, ...rest], s)
+    DAttr(_, inner, _, _)   -> nr_effect_decl([inner, ...rest], s)
+    _ -> nr_effect_decl(rest, s)
   }
-}
-
-fn nr_home(mo: Option[String], target: String) : String = match mo {
-  Some(m) -> m
-  None    -> target
 }
 
 fn nr_last(xs: [String]) : String = match xs {

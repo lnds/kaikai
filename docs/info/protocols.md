@@ -88,6 +88,13 @@ A derived protocol may be module-qualified — `#[derive(pa.Show)]` —
 which selects that module's protocol when two imports export the same
 name; a bare name exported by two imports is an error naming both.
 
+A protocol of your own derives through what it declares, never through
+its name: one that declares exactly the operations of Show, Eq, Ord or
+Hash — same labels, same arities — is derived the way that protocol is.
+Its derived impl calls the operation bare, so a field answers through
+any protocol that declares it. Any other protocol has no generator, and
+deriving it is an error.
+
 `#[derive(Json)]` binds a record to the JSON DOM: it generates
 `to_json(self) : JsonValue` and a `<lower(T)>_of_json(v, path) :
 Result[T, JsonError]` entry point. The DOM and the readers the derived

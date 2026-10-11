@@ -19,13 +19,14 @@ hash. Two properties, each a `pub` entry the driver runs behind
 """)]
 
 import compiler.ast
+import compiler.written
 import compiler.infer
 import compiler.cache
 import compiler.cache_ast
 import compiler.cache_delta
 import compiler.cache_iface_acc
 import compiler.cache_module_test
-import compiler.protos
+import compiler.bang_hoist
 import compiler.util
 
 # ---- Ty/Scheme round-trip ---------------------------------------------
@@ -52,9 +53,9 @@ fn scheme_roundtrip_ok(s: TyScheme) : Bool {
 # element (or reading it back out via a list walk) corrupts it under the
 # stage1 bootstrap compiler, so the codec is exercised value-by-value.
 fn tys_roundtrip_ok() : Bool {
-  let vopt = TyCon(Some("option"), "Option", [TyVarT(3)], sym_none())
-  let vlocal = TyCon(None, "Local", [TyVarT(1), TyVarT(2)], sym_none())
-  let lbl = Label { eff: "Console", ty_args: [], sym: sym_none() }
+  let vopt = TyCon(test_sym("type", "Option", "option"), [TyVarT(3)])
+  let vlocal = TyCon(test_sym("type", "Local", "m"), [TyVarT(1), TyVarT(2)])
+  let lbl = Label { sym: test_sym("effect", "Console", "io"), ty_args: [], cell: local_none() }
   let row = Row { labels: [lbl], tail: Some(7), display_alias: None }
   let fnty = TyFnT([TyInt, vopt], TyBool, row)
   let uni = TyUnion([TyInt, TyString])
@@ -66,8 +67,11 @@ fn tys_roundtrip_ok() : Bool {
   tyr_roundtrip_ok(uni)
 }
 
+# The id the table gives the declaration `nm` of class `word` in `home`.
+fn test_sym(word: String, nm: String, home: String) : SymId = sym_derive_word(word, nm, home)
+
 fn sample_scheme() : TyScheme {
-  let ret = TyCon(Some("option"), "Option", [TyVarT(3)], sym_none())
+  let ret = TyCon(test_sym("type", "Option", "option"), [TyVarT(3)])
   let row = Row { labels: [], tail: Some(7), display_alias: None }
   let body = TyFnT([TyVarT(3), TyVarT(5)], ret, row)
   Scheme([3, 5], [7], [], ["Measure"], body)
@@ -77,7 +81,7 @@ fn sample_scheme() : TyScheme {
 # Build a delta with two ty_entries; a permuted-and-renumbered twin that
 # is logically equal; and a mutated twin whose scheme differs.
 
-fn mk_entry(nm: String, s: TyScheme) : TyEntry = TyEntry { name: nm, scheme: s }
+fn mk_entry(nm: String, s: TyScheme) : TyEntry = TyEntry { key: KSym(test_sym("function", nm, "m")), scheme: s }
 
 fn delta_of(entries: [TyEntry]) : ModuleEnvDelta = ModuleEnvDelta {
   name: Some("m"), ty_entries: entries, unions: [], op_eff_arities: [],
@@ -105,7 +109,7 @@ fn scheme_pair(a: Int, b: Int) : TyScheme {
 # original — the shape that broke the per-module cut for any importer of a
 # module exporting an effectful function.
 fn effrow_scheme() : TyScheme {
-  let lbl = Label { eff: "Stdout", ty_args: [], sym: sym_none() }
+  let lbl = Label { sym: test_sym("effect", "Stdout", "io"), ty_args: [], cell: local_none() }
   let row = Row { labels: [lbl], tail: None, display_alias: None }
   Scheme([], [], [], [], TyFnT([TyString], TyUnit, row))
 }
@@ -115,7 +119,7 @@ fn effrow_scheme() : TyScheme {
 # two vars. Its restored form exercises the `TyCon` arg-slot walk under
 # canonicalization, the sibling of the effect-label case.
 fn tycon_args_scheme() : TyScheme {
-  let pair = TyCon(Some("tuple"), "Pair", [TyVarT(1), TyVarT(2)], sym_none())
+  let pair = TyCon(test_sym("type", "Pair", "tuple"), [TyVarT(1), TyVarT(2)])
   Scheme([1, 2], [], [], [], TyFnT([TyVarT(1), TyVarT(2)], pair, empty_row()))
 }
 
@@ -166,15 +170,16 @@ fn effrow_iface_survives_roundtrip() : Bool =
 # `non-exhaustive match` (the warm-build failure of the per-module cut).
 fn decl_stream_survives_roundtrip() : Bool / Console + File {
   let e = mk_expr(mk_int_synth(7), 1, 1)
-  let call = mk_expr(ECall(mk_expr(EModCall("a", "shout"), 2, 3),
-                           [mk_ref("s", 2, 9)]), 2, 3)
+  let call = mk_expr(ECall(mk_expr(EModCall(written("a"), written("shout")), 2, 3),
+                           [mk_name("s", 2, 9)]), 2, 3)
   let body = mk_expr(EBlock([SExprStmt(call)], Some(e)), 2, 1)
-  let stdout_te = mk_ty(TyName(ty_ref_none(), "String", []), 1, 1)
-  let dfn = DFn(true, "twice", [], [Param { pname: "s", ptype: Some(stdout_te), pline: 1, pcol: 1, pborrow: false }],
-                Some(mk_ty(TyName(ty_ref_none(), "Unit", []), 1, 1)), REmpty, body, 2, 1, Some("b"), fnid_none())
-  let dtype = DType(true, "Rec", [],
-                    TBRecord([FD(true, "x", mk_ty(TyName(ty_ref_none(), "Int", []), 1, 1), [])]),
-                    1, 1, Some("b"), [], sym_none())
+  let stdout_te = mk_ty(TyName(ref_written("String"), []), 1, 1)
+  let dfn = DFn(true, fnid_decl(test_sym("function", "twice", "b")), [],
+                [Param { binder: binder_written("s"), ptype: Some(stdout_te), pline: 1, pcol: 1, pborrow: false }],
+                Some(mk_ty(TyName(ref_written("Unit"), []), 1, 1)), REmpty, body, 2, 1, Some("b"))
+  let dtype = DType(true, test_sym("type", "Rec", "b"), [],
+                    TBRecord([FD(true, "x", mk_ty(TyName(ref_written("Int"), []), 1, 1), [])]),
+                    1, 1, Some("b"), [])
   let blob = cache_decls_bytes([dtype, dfn])
   match cache_decls_from_bytes(blob, 0) {
     # Byte round-trip AND a consumer walk over the restored decls: the
@@ -185,12 +190,8 @@ fn decl_stream_survives_roundtrip() : Bool / Console + File {
   }
 }
 
-fn decl_stream_consumable(ds: [Decl]) : Bool / Console + File = {
-  let tp = TypedProgram {
-    decls: ds, errs: 0, insts: [], holes: [], row_holes: [],
-    core_len: 0, toplevel_len: 0, module_doc: None, diags: [], op_res: []
-  }
-  let _e = validate_typer_invariants(tp, "<selftest>")
+fn decl_stream_consumable(ds: [Decl]) : Bool = {
+  let _walked = bang_hoist_decls(ds)
   true
 }
 
@@ -252,8 +253,8 @@ fn pinned_fold_hash() : String {
 }
 
 fn pinned_digests_ok() : Bool {
-  fnv_vectors_ok() and pinned_iface_hash() == "e1144957adb22459" and
-  pinned_fold_hash() == "b52921f38738b4f5"
+  fnv_vectors_ok() and pinned_iface_hash() == "f7d02fcb4be01afa" and
+  pinned_fold_hash() == "b1befc767b1e3cc8"
 }
 
 #[doc("Run the typed-codec + interface-hash gates. Returns \"OK ...\" on success or \"FAIL: ...\" on the first failing property. The driver maps a leading 'O' to exit 0.")]

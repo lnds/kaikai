@@ -20,13 +20,13 @@
 # `compiler.ast` + the fn registry (`compiler.fnreg`), and `unbox` imports IT.
 
 import compiler.ast
-import compiler.sym_read
+import compiler.operators
 import compiler.fnreg
 import compiler.fn_index
 
 # True iff EVERY use of the kind-1 Int arm binder `nm` in `e` is a shape the
 # native backend lowers raw-safe: an operand of a raw-arith / comparison
-# `EBinop` whose SIBLING operand is itself a raw-Int form (an `EVar` or an Int
+# `EBinop` whose SIBLING operand is itself a raw-Int form (a reference or an Int
 # literal), so the emitter lowers the WHOLE binop raw (`icmp`/`iadd` over two
 # raw i64), never the tagged `kaix_eq` shim that would read `nm` as a
 # `KaiValue *`. This is the READ-side use that drives the rb-tree descent win
@@ -48,13 +48,14 @@ import compiler.fn_index
 # binder stays boxed. Conservative by exclusion: an unmodelled form forces
 # boxed. STRICTER than the C oracle's mode-slave seeding, which the
 # native's non-total load-border cannot match.
-pub fn native_arm_binder_raw_safe(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
+pub fn native_arm_binder_raw_safe(nm: LocalId, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
   EUnit -> false
   _     -> nab_uses_ok(nm, e, cis, fns)
 }
 
-fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match sym_read_kind(e.kind) {
-  EVar(n)          -> n != nm
+fn nab_uses_ok(nm: LocalId, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
+  ELocal(n)        -> not local_eq(n, nm)
+  ESym(_, _)       -> true
   EInt(_, _)       -> true
   EReal(_, _)      -> true
   EBinop(op, l, r) ->
@@ -66,7 +67,7 @@ fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / 
   EBlock(ss, tl)   -> nab_stmts(nm, ss, cis, fns) and nab_opt(nm, tl, cis, fns)
   ECall(f, xs)     -> match nab_ctor_flags(f, cis) {
     Some(flags) -> nab_ctor_args_ok(nm, flags, xs, cis, fns)
-    None        -> match nab_callee_raw_mask(nm, f, fns) {
+    None        -> match nab_callee_raw_mask(f, fns) {
       Some(mask) -> nab_call_args_ok(nm, mask, xs, cis, fns)
       None       -> not nab_mentions(nm, e)
     }
@@ -78,7 +79,7 @@ fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / 
 # (the `SIInt64` init stores the register raw); any other position recurses
 # (and forces boxed on an unmodelled shape as usual). `flags` is consumed in
 # lockstep with the args, so each arg sees its own slot's flag.
-fn nab_ctor_args_ok(nm: String, flags: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match xs {
+fn nab_ctor_args_ok(nm: LocalId, flags: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match xs {
   []           -> true
   [x, ...rest] -> match flags {
     [f, ...fr] -> {
@@ -95,7 +96,7 @@ fn nab_ctor_args_ok(nm: String, flags: [Bool], xs: [Expr], cis: [CtorIntSlots], 
 # call site passes the register at the param slot, no box mint); a boxed
 # position or a non-var arg recurses. Mask and args walk in lockstep,
 # mirroring `nab_ctor_args_ok`.
-fn nab_call_args_ok(nm: String, mask: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match xs {
+fn nab_call_args_ok(nm: LocalId, mask: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match xs {
   []           -> true
   [x, ...rest] -> match mask {
     [m, ...mr] -> {
@@ -112,51 +113,51 @@ fn nab_call_args_ok(nm: String, mask: [Bool], xs: [Expr], cis: [CtorIntSlots], f
 # (conservative). A raw binder feeding a call the KIR later takes
 # indirect is still sound: the boxed-arg border re-boxes the raw register
 # at the call, it just stops paying off.
-fn nab_callee_raw_mask(nm: String, f: Expr, fns: FnIndex) : Option[[Bool]] = match sym_read_kind(f.kind) {
-  EVar(n) ->
-    if n == nm { None }
-    else { match fnx_callee_sig(fns, f) {
-      Some(US(_, _, mask)) -> Some(mask)
-      None -> None
-    } }
+fn nab_callee_raw_mask(f: Expr, fns: FnIndex) : Option[[Bool]] = match f.kind {
+  ESym(_, _) -> match fnx_callee_sig(fns, f) {
+    Some(US(_, _, mask)) -> Some(mask)
+    None -> None
+  }
   _ -> None
 }
 
-# The Int-slot flags of a constructor call head, bare or spelled by its home,
-# resolved through the same `CtorIntSlots` registry the seeding reads, so the
-# permit and the ctor's write layout share one source. A callee with no entry
-# (a fn) keeps the conservative path.
-fn nab_ctor_flags(f: Expr, cis: [CtorIntSlots]) : Option[[Bool]] = match sym_read_kind(f.kind) {
-  EVar(n)        -> ctor_int_slots_lookup_in(cis, None, n)
-  EModCall(m, n) -> ctor_int_slots_lookup_in(cis, Some(m), n)
-  _              -> None
+# The Int-slot flags of a constructor call head, resolved through the same
+# `CtorIntSlots` registry the seeding reads, so the permit and the ctor's
+# write layout share one source. A callee with no entry (a fn) keeps the
+# conservative path.
+fn nab_ctor_flags(f: Expr, cis: [CtorIntSlots]) : Option[[Bool]] = match f.kind {
+  ESym(s, _) -> nab_flags_of_sym(cis, s)
+  _          -> None
+}
+
+fn nab_flags_of_sym(cis: [CtorIntSlots], s: SymId) : Option[[Bool]] = match cis {
+  [] -> None
+  [CIS(c, flags), ...rest] -> if sym_raw(s) >= 0 and sym_same(c, s) { Some(flags) } else { nab_flags_of_sym(rest, s) }
 }
 
 # The arith / comparison operators the native lowers to a raw `i`-family op
 # over raw operands. Kept local (not imported from `unbox`) so the import graph
 # stays acyclic — `unbox` imports this module, not the reverse.
-fn nab_op_is_raw(op: String) : Bool =
-  op == "+" or op == "-" or op == "*" or op == "/" or op == "%" or
-  op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
+fn nab_op_is_raw(op: BinOp) : Bool = binop_is_arith(op) or binop_is_comparison(op)
 
-# A binop operand: `EVar(nm)` (the raw use) is safe iff its SIBLING is a
+# A binop operand: a read of `nm` (the raw use) is safe iff its SIBLING is a
 # raw-Int form; a non-`nm` operand must be a raw-Int form too (var / Int lit)
 # for the whole binop to lower raw. Anything else keeps the binder boxed.
-fn nab_operand(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
-  EVar(_)    -> true
-  ESym(_, _, _)    -> true
+fn nab_operand(nm: LocalId, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
+  ELocal(_)  -> true
+  ESym(_, _) -> true
   EInt(_, _) -> true
   EIntLit(_) -> true
   _          -> nab_uses_ok(nm, e, cis, fns)
 }
 
-fn nab_is_var(nm: String, e: Expr) : Bool = match sym_read_kind(e.kind) { EVar(n) -> n == nm _ -> false }
-fn nab_opt(nm: String, oe: Option[Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e, cis, fns) }
-fn nab_stmts(nm: String, ss: [Stmt], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match ss {
+fn nab_is_var(nm: LocalId, e: Expr) : Bool = match e.kind { ELocal(n) -> local_eq(n, nm) _ -> false }
+fn nab_opt(nm: LocalId, oe: Option[Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e, cis, fns) }
+fn nab_stmts(nm: LocalId, ss: [Stmt], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match ss {
   []           -> true
   [s, ...rest] -> nab_stmt(nm, s, cis, fns) and nab_stmts(nm, rest, cis, fns)
 }
-fn nab_stmt(nm: String, s: Stmt, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match s {
+fn nab_stmt(nm: LocalId, s: Stmt, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match s {
   SExprStmt(e)    -> nab_uses_ok(nm, e, cis, fns)
   SLet(_, _, rhs) -> nab_uses_ok(nm, rhs, cis, fns)
   _               -> not nab_stmt_mentions(nm, s)
@@ -166,8 +167,8 @@ fn nab_stmt(nm: String, s: Stmt, cis: [CtorIntSlots], fns: FnIndex) : Bool / Con
 # conservative catch-all for a form `nab_uses_ok` does not model. Unlike
 # `scan_uses_expr` this descends into arm patterns, so a binder read in a
 # nested match pattern still forces boxed.
-fn nab_mentions(nm: String, e: Expr) : Bool / Console = match sym_read_kind(e.kind) {
-  EVar(n)              -> n == nm
+fn nab_mentions(nm: LocalId, e: Expr) : Bool / Console = match e.kind {
+  ELocal(n)            -> local_eq(n, nm)
   ECall(f, xs)         -> nab_mentions(nm, f) or nab_mentions_list(nm, xs)
   EIntrinsic(_, xs)    -> nab_mentions_list(nm, xs)
   ESurface(sf)    -> nab_mentions_list(nm, surface_children(sf))
@@ -180,7 +181,7 @@ fn nab_mentions(nm: String, e: Expr) : Bool / Console = match sym_read_kind(e.ki
   EIf(c, t, oe)        -> nab_mentions(nm, c) or nab_mentions(nm, t) or nab_mentions_opt(nm, oe)
   EMatch(s, arms)      -> nab_mentions(nm, s) or nab_mentions_arms(nm, arms)
   ELambda(_, b)        -> nab_mentions(nm, b)
-  ERecordLit(_, _, fis)   -> nab_mentions_fields(nm, fis)
+  ERecordLit(_, fis)   -> nab_mentions_fields(nm, fis)
   EList(els)           -> nab_mentions_elems(nm, els)
   ERange(a, b, ob)     -> nab_mentions(nm, a) or nab_mentions(nm, b) or nab_mentions_opt(nm, ob)
   EBlock(ss, tl)       -> nab_mentions_stmts(nm, ss) or nab_mentions_opt(nm, tl)
@@ -190,31 +191,31 @@ fn nab_mentions(nm: String, e: Expr) : Bool / Console = match sym_read_kind(e.ki
   EFilterPipe(a, b)    -> nab_mentions(nm, a) or nab_mentions(nm, b)
   _                    -> false
 }
-fn nab_mentions_list(nm: String, es: [Expr]) : Bool / Console = match es {
+fn nab_mentions_list(nm: LocalId, es: [Expr]) : Bool / Console = match es {
   []        -> false
   [e, ...r] -> nab_mentions(nm, e) or nab_mentions_list(nm, r)
 }
-fn nab_mentions_opt(nm: String, oe: Option[Expr]) : Bool / Console = match oe {
+fn nab_mentions_opt(nm: LocalId, oe: Option[Expr]) : Bool / Console = match oe {
   None    -> false
   Some(e) -> nab_mentions(nm, e)
 }
-fn nab_mentions_arms(nm: String, arms: [Arm]) : Bool / Console = match arms {
+fn nab_mentions_arms(nm: LocalId, arms: [Arm]) : Bool / Console = match arms {
   []        -> false
   [a, ...r] -> (match a { Arm(p, g, b) -> nab_pat(nm, p) or nab_mentions_opt(nm, g) or nab_mentions(nm, b) }) or nab_mentions_arms(nm, r)
 }
-fn nab_mentions_fields(nm: String, fis: [FieldInit]) : Bool / Console = match fis {
+fn nab_mentions_fields(nm: LocalId, fis: [FieldInit]) : Bool / Console = match fis {
   []        -> false
   [f, ...r] -> (match f { FI(_, e) -> nab_mentions(nm, e) }) or nab_mentions_fields(nm, r)
 }
-fn nab_mentions_elems(nm: String, els: [ListElem]) : Bool / Console = match els {
+fn nab_mentions_elems(nm: LocalId, els: [ListElem]) : Bool / Console = match els {
   []         -> false
   [el, ...r] -> (match el { ElPlain(e) -> nab_mentions(nm, e) ElSpread(e) -> nab_mentions(nm, e) }) or nab_mentions_elems(nm, r)
 }
-fn nab_mentions_stmts(nm: String, ss: [Stmt]) : Bool / Console = match ss {
+fn nab_mentions_stmts(nm: LocalId, ss: [Stmt]) : Bool / Console = match ss {
   []        -> false
   [s, ...r] -> nab_stmt_mentions(nm, s) or nab_mentions_stmts(nm, r)
 }
-fn nab_stmt_mentions(nm: String, s: Stmt) : Bool / Console = match s {
+fn nab_stmt_mentions(nm: LocalId, s: Stmt) : Bool / Console = match s {
   SExprStmt(e)                -> nab_mentions(nm, e)
   SLet(p, _, rhs)             -> nab_pat(nm, p) or nab_mentions(nm, rhs)
   SVar(_, _, rhs, _, _)       -> nab_mentions(nm, rhs)
@@ -223,22 +224,22 @@ fn nab_stmt_mentions(nm: String, s: Stmt) : Bool / Console = match s {
   SAssign(b, v, _, _) -> nab_mentions(nm, b) or nab_mentions(nm, v)
   _                           -> false
 }
-fn nab_pat(nm: String, p: Pattern) : Bool / Console = match p.pkind {
-  PBind(n)              -> n == nm
+fn nab_pat(nm: LocalId, p: Pattern) : Bool / Console = match p.pkind {
+  PBind(n)              -> local_eq(n.id, nm)
   PLit(e)               -> nab_mentions(nm, e)
-  PList(subs, orest)    -> nab_pats(nm, subs) or (match orest { Some(n) -> n == nm None -> false })
-  PVariant(_, _, subs)     -> nab_pats(nm, subs)
-  PVariantRecord(_, _, fs) -> nab_pfields(nm, fs)
+  PList(subs, orest)    -> nab_pats(nm, subs) or (match orest { Some(n) -> local_eq(n.id, nm) None -> false })
+  PVariant(_, subs)     -> nab_pats(nm, subs)
+  PVariantRecord(_, fs) -> nab_pfields(nm, fs)
   PRecord(fs)           -> nab_pfields(nm, fs)
-  PAs(n, inner)         -> n == nm or nab_pat(nm, inner)
-  PNarrow(n, _)         -> n == nm
+  PAs(n, inner)         -> local_eq(n.id, nm) or nab_pat(nm, inner)
+  PNarrow(n, _)         -> local_eq(n.id, nm)
   _                     -> false
 }
-fn nab_pats(nm: String, ps: [Pattern]) : Bool / Console = match ps {
+fn nab_pats(nm: LocalId, ps: [Pattern]) : Bool / Console = match ps {
   []        -> false
   [p, ...r] -> nab_pat(nm, p) or nab_pats(nm, r)
 }
-fn nab_pfields(nm: String, fs: [PField]) : Bool / Console = match fs {
+fn nab_pfields(nm: LocalId, fs: [PField]) : Bool / Console = match fs {
   []        -> false
   [f, ...r] -> (match f { PField(_, sub, _) -> nab_pat(nm, sub) }) or nab_pfields(nm, r)
 }

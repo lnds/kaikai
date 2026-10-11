@@ -1,71 +1,70 @@
-# compiler/variant_index.kai -- return-tycon index over the typing
-# environment's variant entries.
-#
-# `TyEnv.index` buckets an entry by the last `::`-segment of its NAME,
-# which is the CONSTRUCTOR (`Red`, `Color::Red` and `m::Color::Red` all
-# bucket under `Red`). The exhaustiveness walker asks the opposite
-# question -- "which entries construct `Color`?" -- so that index cannot
-# serve it, and the walker used to scan the whole entry list per query.
-#
-# This index buckets the same entries by their scheme's RETURN tycon,
-# which is exactly the walker's query key. Membership is the only thing
-# narrowed: the returned chain is the entries-order subsequence of
-# candidates, and the walker re-applies its full predicate (uppercase,
-# dot/`::` shape, arity pin, sentinel boundary) over it, so the accepted
-# set is unchanged.
-#
-# The payload is generic so this module stays below `infer.kai`, which
-# owns `TyEntry`; the caller supplies each entry's bucket key.
+#[doc("""
+The constructors of each sum, keyed by declaration.
 
+`TyEnv.index` buckets an entry by the last `::`-segment of its name,
+which is the constructor (`Red`, `Color::Red` and `m::Color::Red` all
+bucket under `Red`). The exhaustiveness walker and the constructor
+disambiguation ask the opposite question — "which constructors does
+this type declare?" — so that index cannot serve them.
+
+This index buckets a constructor under the declaration id of the type
+it builds, and again under its own. A bucket holds one declaration, so
+two types spelled alike never share one and no reader re-filters by
+name or arity.
+
+The typing environment stores entries by name, and a module's delta
+serialises them that way, so a constructor is recognised here by the
+key it was registered under: `<Type>::<Constructor>`. The payload is
+generic so this module stays below `infer.kai`, which owns the entry.
+""")]
+
+import compiler.ast
 import compiler.infer_index
 
-#[doc("Index from a return-tycon name to the entries constructing it.")]
-pub type VariantIndex[a] = { ix: NameIndex[a] }
+#[doc("The constructors of every sum, newest first under the sum's declaration, and each under its own.")]
+pub type VariantIndex[a] = { by_sum: NameIndex[a], by_ctor: NameIndex[a] }
 
 #[doc("The empty variant index.")]
-pub fn vix_empty() : VariantIndex[a] = VariantIndex { ix: idx_empty() }
+pub fn vix_empty() : VariantIndex[a] = VariantIndex { by_sum: idx_empty(), by_ctor: idx_empty() }
 
-#[doc("Index `payload` under the type its scheme constructs.")]
-pub fn vix_prepend(vx: VariantIndex[a], key: Option[String], payload: a) : VariantIndex[a] =
-  match key {
-    Some(k) -> VariantIndex { ix: idx_prepend(vx.ix, k, payload) }
-    None    -> vx
-  }
+#[doc("Index `payload` under the sum `sum` declares and under the constructor `ctor`; an absent `ctor` is reachable through its sum alone.")]
+pub fn vix_prepend(vx: VariantIndex[a], sum: SymId, ctor: SymId, payload: a) : VariantIndex[a] =
+  VariantIndex { by_sum: idx_prepend_sym(vx.by_sum, sum, payload),
+                 by_ctor: if sym_raw(ctor) < 0 { vx.by_ctor } else { idx_prepend_sym(vx.by_ctor, ctor, payload) } }
 
-#[doc("Entries whose return tycon is `tycon`, newest-first.")]
-pub fn vix_chain(vx: VariantIndex[a], tycon: String) : [a] =
-  idx_chain(vx.ix, tycon)
+#[doc("The constructors of the sum `sum` declares, newest first; empty for an absent id.")]
+pub fn vix_chain(vx: VariantIndex[a], sum: SymId) : [a] =
+  if sym_raw(sum) < 0 { [] } else { idx_chain_sym(vx.by_sum, sum) }
 
-#[doc("Type name closed by a `<tname>::__type_decl_arity_<N>__` sentinel.")]
-pub fn vix_marker_target(name: String) : Option[String] = {
-  let i = vix_marker_sep(name, 0)
-  if i < 0 { None } else { Some(string_slice(name, 0, i)) }
-}
+#[doc("What is registered under the constructor `ctor`, newest first; empty for an absent id.")]
+pub fn vix_of_ctor(vx: VariantIndex[a], ctor: SymId) : [a] =
+  if sym_raw(ctor) < 0 { [] } else { idx_chain_sym(vx.by_ctor, ctor) }
 
-# Index of the `::` opening the arity-marker suffix, or -1. Matching the
-# whole tag (not just a `::__` prefix) keeps an unrelated `Mod::__helper`
-# key out of the type's bucket.
-fn vix_marker_sep(name: String, i: Int) : Int = {
+#[doc("The two parts of a `<Type>::<Constructor>` key.")]
+pub type CtorKey = CtorKey(String, String)
+
+#[doc("The parts of `name` when it is a constructor's type-qualified key: exactly one `::`, both parts capitalised, no `.` in the last. `None` for any other spelling: a module qualifier is lowercase, and an effect op is dotted.")]
+pub fn vix_ctor_key(name: String) : Option[CtorKey] = {
   let n = string_length(name)
-  if i + 2 >= n { -1 }
-  else if vix_marker_starts_at(name, i, n) { i }
-  else { vix_marker_sep(name, i + 1) }
+  let i = vix_last_sep(name, n - 1)
+  if i < 1 or vix_last_sep(name, i - 1) >= 0 { None }
+  else if not vix_upper(name, 0) or not vix_upper(name, i + 2) or vix_has_dot(name, i + 2, n) { None }
+  else { Some(CtorKey(string_slice(name, 0, i), string_slice(name, i + 2, n - (i + 2)))) }
 }
 
-fn vix_marker_starts_at(name: String, i: Int, n: Int) : Bool = {
-  let sep = vix_at(name, i) == ':' and vix_at(name, i + 1) == ':'
-  if sep { vix_is_marker_tag(string_slice(name, i + 2, n - (i + 2))) } else { false }
+# Index of the `:` that opens the last `::` at or before `from`, or -1.
+fn vix_last_sep(name: String, from: Int) : Int =
+  if from < 1 { -1 }
+  else if vix_at(name, from - 1) == ':' and vix_at(name, from) == ':' { from - 1 }
+  else { vix_last_sep(name, from - 1) }
+
+fn vix_upper(name: String, i: Int) : Bool = {
+  let c = vix_at(name, i)
+  c >= 'A' and c <= 'Z'
 }
 
-# `__type_decl_arity_<N>__`, with at least one digit.
-fn vix_is_marker_tag(tag: String) : Bool = {
-  let head = "__type_decl_arity_"
-  let hn = string_length(head)
-  let tn = string_length(tag)
-  if tn < hn + 3 { false }
-  else if string_slice(tag, 0, hn) != head { false }
-  else { string_slice(tag, tn - 2, 2) == "__" }
-}
+fn vix_has_dot(name: String, i: Int, n: Int) : Bool =
+  i < n and (vix_at(name, i) == '.' or vix_has_dot(name, i + 1, n))
 
 fn vix_at(s: String, i: Int) : Char = {
   let b = string_byte_at_int(s, i)

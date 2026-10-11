@@ -5,10 +5,12 @@ An op takes one owned reference from each atom it consumes, and its result
 is owned, a view into an operand, or a value with no count to track.
 """)]
 
+import compiler.ast
+import compiler.operators
 import compiler.kir
+import compiler.kir_prims
 import compiler.util
 import compiler.name_ix
-import compiler.fnreg
 import compiler.kir_lin_cfg
 
 #[doc("What an op's result holds: an owned reference, a borrowed view, an untracked value, or another register's object.")]
@@ -33,13 +35,13 @@ pub fn klo_fx(op: KOp, fns: LinFns) : LinFx = match op {
   KCall(sym, xs)             -> LinFx(klo_call_takes(sym, xs, 0, fns), [], if klo_borrow_call(sym) { LrImm } else { LrOwn })
   KCallIndirect(f, xs)       -> LinFx([(f, "call_ind-closure"), ...klo_all(xs, "call_ind-arg")], [], LrOwn)
   KCallIndirectBorrow(_, xs) -> LinFx(klo_all(xs, "call_ind-arg"), [], LrOwn)
-  KPrim(nm, xs)              -> LinFx(klo_prim_takes(nm, xs, 0), klo_prim_untracks(nm, xs), klo_prim_res(nm))
+  KPrim(p, xs)               -> LinFx(klo_prim_takes(p, xs, 0), klo_prim_untracks(p, xs), klo_prim_res(p))
   KCon(_, _, _, inits, _)    -> match inits {
     [] -> LinFx([], [], LrImm)
     _  -> LinFx(klo_all(map(inits, klc_init_val), "con"), [], LrOwn)
   }
   KRecord(fs, _, _)          -> LinFx(klo_all(map(fs, (fi) => match fi { KFI(_, v) -> v }), "record"), [], LrOwn)
-  KPerform(_, _, _, xs)      -> LinFx(klo_all(xs, "perform"), [], LrOwn)
+  KPerform(_, _, _, _, xs)   -> LinFx(klo_all(xs, "perform"), [], LrOwn)
   KResumeOp(_, a)            -> LinFx([(a, "resume")], [], LrOwn)
   KResume2Op(_, a, s)        -> LinFx([(a, "resume"), (s, "resume")], [], LrOwn)
   KProjKind(_, _, k)         -> LinFx([], [], if k == 2 { LrOwn } else { LrImm })
@@ -106,40 +108,85 @@ fn klo_borrow_call(sym: String) : Bool =
 
 # --- prims ---------------------------------------------------------------
 
-fn klo_prim_takes(nm: String, xs: [KVal], i: Int) : [(KVal, String)] = match xs {
+fn klo_prim_takes(p: PrimOp, xs: [KVal], i: Int) : [(KVal, String)] = match xs {
   []           -> []
   [x, ...rest] -> {
-    let tl = klo_prim_takes(nm, rest, i + 1)
-    let takes = not klo_prim_borrows(nm) or (klo_ends(nm, "_borrow") and i > 0)
-    if takes { [(x, cat2("prim:", nm)), ...tl] } else { tl }
+    let tl = klo_prim_takes(p, rest, i + 1)
+    let takes = not klo_prim_borrows(p) or (klo_prim_borrows_base_only(p) and i > 0)
+    if takes { [(x, cat2("prim:", kprim_text(p))), ...tl] } else { tl }
   }
 }
 
 # Unboxing a scalar ends its count: the payload is all that is read on.
-fn klo_prim_untracks(nm: String, xs: [KVal]) : [KVal] =
-  if nm == "int.unbox" or nm == "bool.unbox" or nm == "char.unbox" or nm == "byte.unbox" {
+fn klo_prim_untracks(p: PrimOp, xs: [KVal]) : [KVal] =
+  if klo_prim_unboxes_untracked(p) {
     match xs {
       [x, ..._] -> [x]
       []        -> []
     }
   } else { [] }
 
-fn klo_prim_borrows(nm: String) : Bool =
-  klo_ends(nm, "_borrow") or klo_ends(nm, "_b") or klo_ends(nm, ".unbox") or
-  nm == "kai_op_field" or nm == "kai_op_field_at" or
-  nm == "kai_tag_eq" or nm == "kai_eq_raw" or string_starts_with_q(nm, "vec.read.") or
-  string_starts_with_q(nm, "__fixed_vec_get") or string_starts_with_q(nm, "kai_unw_") or string_starts_with_q(nm, "kai_pad_")
+fn klo_prim_unboxes_untracked(p: PrimOp) : Bool = match p {
+  KpUnbox(RwInt)  -> true
+  KpUnbox(RwBool) -> true
+  KpUnbox(RwChar) -> true
+  KpUnbox(RwByte) -> true
+  _               -> false
+}
 
-fn klo_prim_res(nm: String) : LinRes =
-  if nm == "kai_op_field_borrow" { LrView }
-  else if klo_prim_imm(nm) { LrImm }
-  else { LrOwn }
+# A read of the inline aggregate borrows it; a read of a heap vec owns its base.
+fn klo_prim_borrows(p: PrimOp) : Bool = match p {
+  KpFieldBorrow           -> true
+  KpVecRead(_)            -> true
+  KpVecReadField(_)       -> true
+  KpVecReadFieldBoxed     -> true
+  KpIsCons                -> true
+  KpIsNil                 -> true
+  KpUnbox(_)              -> true
+  KpField                 -> true
+  KpFieldAt               -> true
+  KpTagEq                 -> true
+  KpEqRaw                 -> true
+  KpFixedVecGet(r, _, _)  -> not r.heap
+  _                       -> klo_prim_is_marker(p)
+}
 
-fn klo_prim_imm(nm: String) : Bool =
-  string_starts_with_q(nm, "kai_unw_") or string_starts_with_q(nm, "kai_pad_") or klo_ends(nm, "_b") or
-  (klo_ends(nm, ".box") and nm != "real.box") or string_starts_with_q(nm, "__fixed_vec_lit@") or
-  nm == "kai_nil" or nm == "==" or nm == "!=" or nm == "<" or nm == ">" or nm == "<=" or nm == ">=" or
-  nm == "not" or nm == "kai_eq_raw" or nm == "kai_tag_eq"
+# The unwind-frame and landing-pad markers name registers without owning them.
+fn klo_prim_is_marker(p: PrimOp) : Bool = match p {
+  KpUnwFiber     -> true
+  KpUnwPush      -> true
+  KpUnwPushReg   -> true
+  KpUnwPushState -> true
+  KpUnwPop       -> true
+  KpPadOpen      -> true
+  KpPadClose     -> true
+  _              -> false
+}
+
+# The borrowing reads whose operands after the base are taken.
+fn klo_prim_borrows_base_only(p: PrimOp) : Bool = match p {
+  KpFieldBorrow -> true
+  _             -> false
+}
+
+fn klo_prim_res(p: PrimOp) : LinRes = match p {
+  KpFieldBorrow -> LrView
+  _             -> if klo_prim_imm(p) { LrImm } else { LrOwn }
+}
+
+fn klo_prim_imm(p: PrimOp) : Bool = match p {
+  KpIsCons            -> true
+  KpIsNil             -> true
+  KpBox(RwReal)       -> false
+  KpBox(_)            -> true
+  KpFixedVecLit(_, _) -> true
+  KpNil               -> true
+  KpBin(op)           -> binop_is_comparison(op)
+  KpUn(UoNot)         -> true
+  KpEqRaw             -> true
+  KpTagEq             -> true
+  _                   -> klo_prim_is_marker(p)
+}
 
 fn klo_ends(s: String, suffix: String) : Bool = {
   let sl = string_length(s)

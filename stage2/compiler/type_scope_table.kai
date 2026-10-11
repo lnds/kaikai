@@ -1,21 +1,20 @@
 # compiler/type_scope_table.kai — which type names carry per-home
 # identity, and what a name means from one module's viewpoint.
 #
-# Two modules may each declare `type Item`. Everything downstream — the
-# record and variant tables, the impl table, the head tag, the
-# `__pimpl_` symbol — keys a nominal type on its spelling alone, so a
-# contested name is given a home-spelled one per declaring module
-# (`Item__da`) before any of that runs. Transparent aliases respell
-# unconditionally (they disappear at expansion; nothing downstream keys
-# them), so the alias table is globally name-unique and expansion needs
-# no per-module filter. Core and root declarations keep the bare
-# spelling.
+# Two modules may each declare `type Item`. A reference to a contested
+# name is settled here to the declaration its module means, before
+# anything downstream reads it. Transparent aliases settle
+# unconditionally, so expansion needs no per-module filter. A reference
+# to a core or root declaration stays as written.
 
 import compiler.util
 import compiler.ast
 import compiler.module_table
-import compiler.home_spell
 import compiler.name_contest
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.written
 
 #[doc("One scoped type declaration: `TSE(name, home, pub, arity, is_alias)`. Nominal entries exist only when contested; alias entries always. Root declarations carry the target module as home.")]
 pub type TSEntry = TSE(String, String, Bool, Int, Bool)
@@ -25,23 +24,23 @@ pub type TSCtx = { coll: [TSEntry], home: String, target: String, cores: [String
                    imports: [String], picks: [NPick], mt: [ModuleEntry] }
 
 #[doc("The type declarations of `decls` that carry per-home identity: contested nominals and aliases, plus every remaining transparent alias. Single-name bodies resolving to effects stay with the effect-alias machinery.")]
-pub fn ts_collect(decls: [Decl], target: String, effs: [String]) : [TSEntry] = {
-  let all = ts_entries(decls, target, effs, [])
+pub fn ts_collect(decls: [Decl], tab: SymTab, target: String, effs: [String]) : [TSEntry] = {
+  let all = ts_entries(decls, tab, target, effs, [])
   let kept = ts_keep_contested(all, all, [])
   ts_add_uncontested_aliases(all, kept, kept)
 }
 
-fn ts_entries(ds: [Decl], target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match ds {
+fn ts_entries(ds: [Decl], tab: SymTab, target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match ds {
   [] -> list_reverse(acc)
-  [d, ...rest] -> ts_entries(rest, target, effs, ts_entry(d, target, effs, acc))
+  [d, ...rest] -> ts_entries(rest, tab, target, effs, ts_entry(d, tab, target, effs, acc))
 }
 
-fn ts_entry(d: Decl, target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match decl_transparent_inner(d) {
-  Some(inner) -> ts_entry(inner, target, effs, acc)
+fn ts_entry(d: Decl, tab: SymTab, target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match decl_transparent_inner(d) {
+  Some(inner) -> ts_entry(inner, tab, target, effs, acc)
   None -> match d {
-    DType(p, n, tps, body, _, _, mo, _, _) ->
+    DType(p, s, tps, body, _, _, mo, _) ->
       if ts_scoped_body(body, effs) {
-        [TSE(n, match mo { Some(m) -> m  None -> target }, p,
+        [TSE(written_text(sym_name(tab, s)), match mo { Some(m) -> m  None -> target }, p,
              list_length(tps), ts_is_alias_body(body)), ...acc]
       } else { acc }
     _ -> acc
@@ -61,7 +60,7 @@ fn ts_is_alias_body(body: TypeBody) : Bool = match body {
 }
 
 fn ts_effect_named(t: TypeExpr, effs: [String]) : Bool = match t.tkind {
-  TyName(_, n, []) -> list_has(effs, n)
+  TyName(DrWritten(None, n), []) -> list_has(effs, written_text(n))
   _ -> false
 }
 
@@ -80,7 +79,7 @@ fn ts_other_home(t: [TSEntry], name: String, home: String) : Bool = match t {
     if n == name and h != home { true } else { ts_other_home(rest, name, home) }
 }
 
-# An uncontested alias still spells always, so its name can never be
+# An uncontested alias still settles always, so its name can never be
 # captured by an unrelated module at expansion time.
 fn ts_add_uncontested_aliases(all: [TSEntry], kept: [TSEntry], acc: [TSEntry]) : [TSEntry] =
   match all {
@@ -93,12 +92,14 @@ fn ts_add_uncontested_aliases(all: [TSEntry], kept: [TSEntry], acc: [TSEntry]) :
     }
   }
 
-#[doc("The spelling of type `name` declared by `home`: home-spelled when the entry carries per-home identity and is neither core nor root, else bare.")]
-pub fn ts_spell(cx: TSCtx, name: String, home: String) : String =
-  if home == cx.target or list_has(cx.cores, home) { name }
+# The declaration `name` of `home` is, when the scope tells it from its
+# homonyms: an entry of a module that is neither core nor root.
+# `sym_none()` otherwise, and the name stays as written.
+fn ts_scoped_sym(cx: TSCtx, name: String, home: String) : SymId =
+  if home == cx.target or list_has(cx.cores, home) { sym_none() }
   else { match ts_entry_of(cx.coll, name, home) {
-    Some(_) -> hs_spell(name, home)
-    None    -> name
+    Some(_) -> sym_derive(NCType, name, home)
+    None    -> sym_none()
   } }
 
 fn ts_entry_of(t: [TSEntry], name: String, home: String) : Option[TSEntry] =
@@ -124,11 +125,11 @@ fn ts_arity_ok(e: TSEntry, nargs: Int) : Bool = match e {
   TSE(_, _, _, arity, is_alias) -> not is_alias or arity == nargs
 }
 
-#[doc("The spelling a bare `name` taking `nargs` type arguments denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it, else the bare name (core, root, ambiguous or unknown).")]
-pub fn ts_resolve(cx: TSCtx, name: String, nargs: Int) : String =
+#[doc("The declaration a bare `name` taking `nargs` type arguments denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it. `sym_none()` leaves the name as written: core, root, ambiguous or unknown.")]
+pub fn ts_resolve(cx: TSCtx, name: String, nargs: Int) : SymId =
   match ts_entry_of(cx.coll, name, cx.home) {
     Some(e) ->
-      if ts_arity_ok(e, nargs) { ts_spell(cx, name, cx.home) }
+      if ts_arity_ok(e, nargs) { ts_scoped_sym(cx, name, cx.home) }
       else { ts_resolve_imported(cx, name, nargs) }
     None -> ts_resolve_imported(cx, name, nargs)
   }
@@ -136,12 +137,12 @@ pub fn ts_resolve(cx: TSCtx, name: String, nargs: Int) : String =
 # A selective import naming the type outranks the plain import list:
 # `import m.{T}` says which `T` the file means, so it decides even when
 # a second import also exports one.
-fn ts_resolve_imported(cx: TSCtx, name: String, nargs: Int) : String =
+fn ts_resolve_imported(cx: TSCtx, name: String, nargs: Int) : SymId =
   match ts_imported(cx.coll, name, nargs, nt_pick_homes(cx.picks, name, []), []) {
-    [h] -> ts_spell(cx, name, h)
+    [h] -> ts_scoped_sym(cx, name, h)
     _   -> match ts_imported(cx.coll, name, nargs, cx.imports, []) {
-      [h] -> ts_spell(cx, name, h)
-      _   -> name
+      [h] -> ts_scoped_sym(cx, name, h)
+      _   -> sym_none()
     }
   }
 
@@ -158,8 +159,8 @@ fn ts_imported(t: [TSEntry], name: String, nargs: Int, imports: [String],
   }
 }
 
-#[doc("The spelling a qualified `mod.name` taking `nargs` type arguments denotes, when `mod` is a visible module exporting a scoped `name`; None leaves the qualifier for the qualifier passes.")]
-pub fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String, nargs: Int) : Option[String] =
+#[doc("The declaration a qualified `mod.name` taking `nargs` type arguments denotes, when `mod` is a visible module exporting a scoped `name`; None leaves the qualifier for the qualifier passes.")]
+pub fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String, nargs: Int) : Option[SymId] =
   match mt_lookup_member(cx.mt, mod, name) {
     None -> None
     Some(me) -> {
@@ -168,7 +169,7 @@ pub fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String, nargs: Int) : 
         None -> None
         Some(e) ->
           if me_has_export(me, name) and ts_arity_ok(e, nargs) {
-            Some(ts_spell(cx, name, home))
+            Some(sym_derive(NCType, name, home))
           } else { None }
       }
     }

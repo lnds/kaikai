@@ -6,8 +6,11 @@ import compiler.ast
 import compiler.util
 import compiler.parse
 
+#[doc("The constructor a row head tests: a record, the unit value, the empty list, a cons cell, a Bool literal, or a variant by its constructor's id (a named record or tuple pattern: its type's).")]
+pub type XKey = XKRecord | XKUnit | XKNil | XKCons | XKTrue | XKFalse | XKVariant(SymId)
+
 #[doc("A row head: a wildcard, a constructor key with its sub-patterns, a literal of an unbounded type, or an unmodelled shape.")]
-pub type XHead = XAny | XCon(String, XSubs) | XLit | XOdd
+pub type XHead = XAny | XCon(XKey, XSubs) | XLit | XOdd
 
 #[doc("A constructor's sub-patterns, positional or by field name.")]
 pub type XSubs = XPos([Pattern]) | XNamed([PField])
@@ -18,31 +21,46 @@ pub fn xh_head(p: Pattern) : XHead = match p.pkind {
   PBind(_)                  -> XAny
   PHole(_)                  -> XAny
   PAs(_, inner)             -> xh_head(inner)
-  PVariant(_, cn, subs)     -> XCon(xh_variant_key(cn), XPos(subs))
-  PVariantRecord(_, cn, fs) -> XCon(xh_variant_key(cn), XNamed(fs))
-  PRecord(fs)               -> XCon("{}", XNamed(fs))
+  PVariant(r, subs)         -> xh_named_head(r, XPos(subs))
+  PVariantRecord(r, fs)     -> xh_named_head(r, XNamed(fs))
+  PRecord(fs)               -> XCon(XKRecord, XNamed(fs))
   PList(pats, rest)         -> xh_list_head(pats, rest, p)
   PLit(lit)                 -> xh_lit_head(lit)
   _                         -> XOdd
 }
 
-fn xh_list_head(pats: [Pattern], rest: Option[String], p: Pattern) : XHead = match pats {
-  [] -> match rest { Some(_) -> XAny  None -> XCon("[]", XPos([])) }
-  [h, ...t] -> XCon("::", XPos([h, Pattern { pkind: PList(t, rest), line: p.line, col: p.col }]))
+# A reference nothing settled names no constructor the table could place.
+fn xh_named_head(r: DeclRef, subs: XSubs) : XHead =
+  if ref_resolved(r) { XCon(XKVariant(ref_sym(r)), subs) } else { XOdd }
+
+fn xh_list_head(pats: [Pattern], rest: Option[Binder], p: Pattern) : XHead = match pats {
+  [] -> match rest { Some(_) -> XAny  None -> XCon(XKNil, XPos([])) }
+  [h, ...t] -> XCon(XKCons, XPos([h, Pattern { pkind: PList(t, rest), line: p.line, col: p.col }]))
 }
 
 fn xh_lit_head(lit: Expr) : XHead = match lit.kind {
-  EBool(true)  -> XCon("true", XPos([]))
-  EBool(false) -> XCon("false", XPos([]))
-  EUnit        -> XCon("()", XPos([]))
+  EBool(true)  -> XCon(XKTrue, XPos([]))
+  EBool(false) -> XCon(XKFalse, XPos([]))
+  EUnit        -> XCon(XKUnit, XPos([]))
   _            -> XLit
 }
 
-#[doc("The key of the variant constructor `cn`.")]
-pub fn xh_variant_key(cn: String) : String = concat_all(["v:", cn])
+#[doc("True when `a` and `b` are the same key.")]
+pub fn xk_eq(a: XKey, b: XKey) : Bool = match a {
+  XKRecord     -> match b { XKRecord -> true  _ -> false }
+  XKUnit       -> match b { XKUnit -> true  _ -> false }
+  XKNil        -> match b { XKNil -> true  _ -> false }
+  XKCons       -> match b { XKCons -> true  _ -> false }
+  XKTrue       -> match b { XKTrue -> true  _ -> false }
+  XKFalse      -> match b { XKFalse -> true  _ -> false }
+  XKVariant(x) -> match b { XKVariant(y) -> sym_raw(x) == sym_raw(y)  _ -> false }
+}
 
-#[doc("The constructor name of a variant key.")]
-pub fn xh_key_name(k: String) : String = string_slice(k, 2, string_length(k))
+#[doc("True when `k` is one of `keys`.")]
+pub fn xk_has(keys: [XKey], k: XKey) : Bool = match keys {
+  []           -> false
+  [h, ...rest] -> xk_eq(h, k) or xk_has(rest, k)
+}
 
 #[doc("The head of a row's first column; an empty row is a wildcard.")]
 pub fn xh_row_head(row: [Pattern]) : XHead = match row {
@@ -63,12 +81,12 @@ pub fn xh_is_odd(h: XHead) : Bool = match h { XOdd -> true  _ -> false }
 pub fn xh_is_lit(h: XHead) : Bool = match h { XLit -> true  _ -> false }
 
 #[doc("Every field name the rows headed by `k` name, in first-seen order; empty for a positional key.")]
-pub fn xh_column_fields(k: String, rows: [[Pattern]]) : [String] = list_reverse(xh_fields_acc(k, rows, []))
+pub fn xh_column_fields(k: XKey, rows: [[Pattern]]) : [String] = list_reverse(xh_fields_acc(k, rows, []))
 
-fn xh_fields_acc(k: String, rows: [[Pattern]], acc: [String]) : [String] = match rows {
+fn xh_fields_acc(k: XKey, rows: [[Pattern]], acc: [String]) : [String] = match rows {
   [] -> acc
   [r, ...rest] -> match xh_row_head(r) {
-    XCon(k2, XNamed(fs)) -> xh_fields_acc(k, rest, if k2 == k { xh_add_fields(fs, acc) } else { acc })
+    XCon(k2, XNamed(fs)) -> xh_fields_acc(k, rest, if xk_eq(k2, k) { xh_add_fields(fs, acc) } else { acc })
     _                    -> xh_fields_acc(k, rest, acc)
   }
 }
@@ -79,11 +97,11 @@ fn xh_add_fields(fs: [PField], acc: [String]) : [String] = match fs {
 }
 
 #[doc("How many sub-columns key `k` opens: its field count when named, its payload length when positional, -1 when its rows disagree.")]
-pub fn xh_arity(k: String, rows: [[Pattern]], names: [String]) : Int = match rows {
+pub fn xh_arity(k: XKey, rows: [[Pattern]], names: [String]) : Int = match rows {
   [] -> list_length(names)
   [r, ...rest] -> match xh_row_head(r) {
     XCon(k2, XPos(ps)) ->
-      if k2 != k { xh_arity(k, rest, names) }
+      if not xk_eq(k2, k) { xh_arity(k, rest, names) }
       else if list_is_empty(names) { list_length(ps) }
       else { 0 - 1 }
     _ -> xh_arity(k, rest, names)
@@ -91,12 +109,12 @@ pub fn xh_arity(k: String, rows: [[Pattern]], names: [String]) : Int = match row
 }
 
 #[doc("The rows headed by `k` or a wildcard, the head replaced by its `arity` sub-patterns.")]
-pub fn xh_specialize(k: String, arity: Int, names: [String], rows: [[Pattern]]) : [[Pattern]] = match rows {
+pub fn xh_specialize(k: XKey, arity: Int, names: [String], rows: [[Pattern]]) : [[Pattern]] = match rows {
   [] -> []
   [r, ...rest] -> match xh_row_head(r) {
     XAny -> [list_append(xh_wilds(arity), xh_row_tail(r)), ...xh_specialize(k, arity, names, rest)]
     XCon(k2, subs) ->
-      if k2 == k { [list_append(xh_subs(subs, names), xh_row_tail(r)), ...xh_specialize(k, arity, names, rest)] }
+      if xk_eq(k2, k) { [list_append(xh_subs(subs, names), xh_row_tail(r)), ...xh_specialize(k, arity, names, rest)] }
       else { xh_specialize(k, arity, names, rest) }
     _ -> xh_specialize(k, arity, names, rest)
   }
@@ -128,21 +146,25 @@ pub fn xh_drop(xs: [String], n: Int) : [String] = match xs {
   []           -> []
 }
 
-#[doc("The source spelling of key `k` over the witnesses of its sub-columns.")]
-pub fn xh_spell(k: String, names: [String], ws: [String]) : String =
-  if k == "::" { xh_spell_cons(ws) }
-  else if k == "{}" { xh_spell_fields("", names, ws) }
-  else if string_slice(k, 0, 2) == "v:" { xh_spell_variant(xh_key_name(k), names, ws) }
-  else { k }
+#[doc("The source spelling of key `k` over the witnesses of its sub-columns; `cn` is the name a variant key's constructor is written with.")]
+pub fn xh_spell(k: XKey, cn: String, names: [String], ws: [String]) : String = match k {
+  XKCons        -> xh_spell_cons(ws)
+  XKRecord      -> xh_spell_fields("", names, ws)
+  XKVariant(c)  -> xh_spell_variant(c, cn, names, ws)
+  XKUnit        -> "()"
+  XKNil         -> "[]"
+  XKTrue        -> "true"
+  XKFalse       -> "false"
+}
 
-fn xh_spell_variant(cn: String, names: [String], ws: [String]) : String =
-  if xh_is_tuple(cn, ws) and not list_is_empty(names) { concat_all(["(", join_with(ws, ", "), ")"]) }
+fn xh_spell_variant(c: SymId, cn: String, names: [String], ws: [String]) : String =
+  if xh_is_tuple(c, ws) and not list_is_empty(names) { concat_all(["(", join_with(ws, ", "), ")"]) }
   else if not list_is_empty(names) { xh_spell_fields(concat_all([cn, " "]), names, ws) }
   else if list_is_empty(ws) { cn }
   else { concat_all([cn, "(", join_with(ws, ", "), ")"]) }
 
-fn xh_is_tuple(cn: String, ws: [String]) : Bool = match tuple_type_for_arity(list_length(ws)) {
-  Some(t) -> t == cn
+fn xh_is_tuple(c: SymId, ws: [String]) : Bool = match tuple_type_for_arity(list_length(ws)) {
+  Some(t) -> sym_raw(ref_sym(tuple_type_ref(t))) == sym_raw(c)
   None    -> false
 }
 

@@ -16,6 +16,7 @@ fit is returned untouched.
 """)]
 
 import compiler.ast
+import compiler.symtab
 import compiler.ast_map
 import compiler.decl_map
 import compiler.deep_measure
@@ -23,16 +24,18 @@ import compiler.deep_outline
 import compiler.util
 
 #[doc("Every declaration of `ds` with its nesting bounded for the C backend.")]
-pub fn deep_hoist_decls(ds: [Decl]) : [Decl] = map(ds, (d) => decl_map_named_bodies(d, dh_body))
+pub fn deep_hoist_decls(ds: [Decl], tab: SymTab) : [Decl] =
+  map(ds, (d) => decl_map_named_bodies(d, (owner, body) => dh_body(tab, owner, body)))
 
 # A past-i64 literal takes its type from the annotation around it, which a
 # `let` of its own would not carry, so a body holding one stays as written.
-fn dh_body(fname: String, body: Expr) : Expr =
+fn dh_body(tab: SymTab, owner: FnId, body: Expr) : Expr =
   if dh_height(body) <= dh_max() and do_depth(body) <= do_budget() or dh_has_wide_lit(body) { body }
-  else { dh_top(DhCx { fname: fname, outline: do_outlines_in(body) }, body) }
+  else { dh_top(DhCx { tab: tab, owner: owner, outline: do_outlines_in(body) }, body) }
 
-# The function being rewritten, and whether its branches may be outlined.
-type DhCx = { fname: String, outline: Bool }
+# The table the function's name is read from, the function being rewritten,
+# and whether its branches may be outlined.
+type DhCx = { tab: SymTab, owner: FnId, outline: Bool }
 
 # Bindings to run first, the expression reading them, and its operand height.
 type DhOut = DhOut([Stmt], Expr, Int)
@@ -62,7 +65,7 @@ fn dh_arm(cx: DhCx, a: Arm) : Arm = match a {
 
 fn dh_branch(cx: DhCx, weight: Int, x: Expr) : Expr = {
   let x1 = dh_top(cx, x)
-  if cx.outline { do_branch(cx.fname, weight, x1) } else { x1 }
+  if cx.outline { do_branch(cx.tab, cx.owner, weight, x1) } else { x1 }
 }
 
 fn dh_with(e: Expr, k: ExprKind) : Expr = Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
@@ -78,7 +81,7 @@ fn dh_stmt(cx: DhCx, s: Stmt) : [Stmt] = match s {
   _              -> [prc_map_stmt_exprs(s, (x) => dh_top(cx, x))]
 }
 
-fn dh_outlined(cx: DhCx, x: Expr) : Expr = if cx.outline { do_branch(cx.fname, 1, x) } else { x }
+fn dh_outlined(cx: DhCx, x: Expr) : Expr = if cx.outline { do_branch(cx.tab, cx.owner, 1, x) } else { x }
 
 # Operands up to the last one that is too tall or brings bindings of its
 # own are settled in order: the tall ones and the ones that evaluate
@@ -104,9 +107,9 @@ fn dh_binds(i: Int, last: Int, x: Expr, h: Int) : Bool =
 
 fn dh_bound(lets: [Stmt], r: Expr, ys: [Expr], hr: Int) : DhSettle = DhSettle(lets, [r, ...ys], dh_hi(1, hr))
 
-fn dh_let(x: Expr, h: Int) : Stmt = SLet(mk_pat(PBind(dh_temp(x, h)), x.line, x.col), None, x)
+fn dh_let(x: Expr, h: Int) : Stmt = SLet(mk_pat(PBind(binder_minted(dh_temp(x, h))), x.line, x.col), None, x)
 
-fn dh_ref(x: Expr, h: Int) : Expr = mk_ref(dh_temp(x, h), x.line, x.col)
+fn dh_ref(x: Expr, h: Int) : Expr = mk_name(dh_temp(x, h), x.line, x.col)
 
 # Unique per operand: a nested binding sits at another position or height.
 fn dh_temp(x: Expr, h: Int) : String =
@@ -132,7 +135,7 @@ fn dh_kind(cx: DhCx, k: ExprKind, xs: [Expr]) : ExprKind {
 
 fn dh_literal_kind(k: ExprKind, xs: [Expr]) : ExprKind = match k {
   EList(els)           -> EList(dh_elems(els, xs))
-  ERecordLit(rh, name, fs) -> ERecordLit(rh, name, dh_fields(fs, xs))
+  ERecordLit(rh, fs)   -> ERecordLit(rh, dh_fields(fs, xs))
   _                    -> k
 }
 
@@ -160,8 +163,9 @@ fn dh_pipe_fn(cx: DhCx, f: Expr) : Expr = match f.kind {
 
 # A name or a literal: it evaluates nothing, so it may stay behind a binding.
 fn dh_inert(x: Expr) : Bool = match x.kind {
-  EVar(_)        -> true
-  ESym(_, _, _)  -> true
+  EName(_)       -> true
+  ESym(_, _)     -> true
+  ELocal(_)      -> true
   EModCall(_, _) -> true
   _              -> dh_literal(x)
 }

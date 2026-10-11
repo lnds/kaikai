@@ -7,13 +7,16 @@ and an unread `..._t` rest becomes the anonymous rest. This runs once, as
 patterns are lowered, so every later pass reads "unused" from the pattern's
 shape and never from a name. A read binder stays bound whatever its name.
 
-A read is anything `pcs_mentions` sees, lambdas and interpolations
-included; an over-count only keeps a binder bound, which is always sound.
+The pass runs on parser output, so a read is a name still written like
+the binder, lambdas and interpolations included; an over-count only
+keeps a binder bound, which is always sound.
 """)]
 
 import compiler.ast
-import compiler.perceus_reads
+import compiler.interp_span
+import compiler.expr_positions
 import compiler.util
+import compiler.written
 
 #[doc("True when `name` asks for the unused warning to stay silent: one leading `_`. A `__` prefix marks a compiler-internal name, which is exempt.")]
 pub fn ub_silenced_name(name: String) : Bool = match char_at(name, 0) {
@@ -25,8 +28,8 @@ pub fn ub_silenced_name(name: String) : Bool = match char_at(name, 0) {
 }
 
 #[doc("The binder an anonymous list rest takes at the `[` of `(line, col)`. Unique per pattern, since two rests never share a `[`.")]
-pub fn ub_rest_sentinel(line: Int, col: Int) : String =
-  concat_all(["__list_rest_", int_to_string(line), "_", int_to_string(col), "__"])
+pub fn ub_rest_sentinel(line: Int, col: Int) : Binder =
+  binder_written(concat_all(["__list_rest_", int_to_string(line), "_", int_to_string(col), "__"]))
 
 #[doc("The arm with its pattern's unread `_`-prefixed binders made wildcards. The guard and the body are the binders' scope.")]
 pub fn ub_arm(a: Arm) : Arm = match a {
@@ -44,38 +47,53 @@ fn ub_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr]) : Stmt = match s {
   _              -> s
 }
 
-fn ub_read_in_arm(n: String, g: Option[Expr], b: Expr) : Bool =
-  pcs_mentions(n, b) or match g {
-    Some(ge) -> pcs_mentions(n, ge)
+fn ub_read_in_arm(n: Binder, g: Option[Expr], b: Expr) : Bool =
+  ub_mentions(n, b) or match g {
+    Some(ge) -> ub_mentions(n, ge)
     None     -> false
   }
 
-fn ub_read_after(n: String, rest: [Stmt], tail: Option[Expr]) : Bool =
-  pcs_mentions(n, mk_expr(EBlock(rest, tail), 0, 0))
+fn ub_read_after(n: Binder, rest: [Stmt], tail: Option[Expr]) : Bool =
+  ub_mentions(n, mk_expr(EBlock(rest, tail), 0, 0))
 
-fn ub_pat(p: Pattern, read: (String) -> Bool) : Pattern = match p.pkind {
-  PBind(n) -> if ub_silenced_name(n) and not read(n) { mk_pat(PWild, p.line, p.col) } else { p }
-  PList(ps, rest) ->
-    mk_pat(PList(ub_pats(ps, read), ub_rest(rest, read, p.line, p.col)), p.line, p.col)
-  PVariant(h, n, ps)        -> mk_pat(PVariant(h, n, ub_pats(ps, read)), p.line, p.col)
-  PVariantRecord(h, n, fs)  -> mk_pat(PVariantRecord(h, n, ub_fields(fs, read)), p.line, p.col)
-  PRecord(fs)               -> mk_pat(PRecord(ub_fields(fs, read)), p.line, p.col)
-  PAs(n, sub)               -> mk_pat(PAs(n, ub_pat(sub, read)), p.line, p.col)
-  _                         -> p
+# No name is resolved yet, so a read of the binder is the name it was
+# written with: as an expression, or as a token of an interpolation.
+fn ub_mentions(n: Binder, e: Expr) : Bool = match e.kind {
+  EName(u)       -> written_text(u) == written_text(n.name)
+  EStr(span, t3) -> isp_ident_count(written_text(n.name), span, t3) > 0
+  _              -> ub_mentions_ps(n, xp_positions(e))
 }
 
-fn ub_pats(ps: [Pattern], read: (String) -> Bool) : [Pattern] = match ps {
+fn ub_mentions_ps(n: Binder, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> ub_mentions(n, c) or ub_mentions_ps(n, rest)
+}
+
+fn ub_silenced(n: Binder) : Bool = ub_silenced_name(written_text(n.name))
+
+fn ub_pat(p: Pattern, read: (Binder) -> Bool) : Pattern = match p.pkind {
+  PBind(n) -> if ub_silenced(n) and not read(n) { mk_pat(PWild, p.line, p.col) } else { p }
+  PList(ps, rest) ->
+    mk_pat(PList(ub_pats(ps, read), ub_rest(rest, read, p.line, p.col)), p.line, p.col)
+  PVariant(r, ps)        -> mk_pat(PVariant(r, ub_pats(ps, read)), p.line, p.col)
+  PVariantRecord(r, fs)  -> mk_pat(PVariantRecord(r, ub_fields(fs, read)), p.line, p.col)
+  PRecord(fs)            -> mk_pat(PRecord(ub_fields(fs, read)), p.line, p.col)
+  PAs(n, sub)            -> mk_pat(PAs(n, ub_pat(sub, read)), p.line, p.col)
+  _                      -> p
+}
+
+fn ub_pats(ps: [Pattern], read: (Binder) -> Bool) : [Pattern] = match ps {
   [] -> []
   [p, ...rest] -> [ub_pat(p, read), ...ub_pats(rest, read)]
 }
 
-fn ub_fields(fs: [PField], read: (String) -> Bool) : [PField] = match fs {
+fn ub_fields(fs: [PField], read: (Binder) -> Bool) : [PField] = match fs {
   [] -> []
   [PField(name, sub, short), ...rest] -> [PField(name, ub_pat(sub, read), short), ...ub_fields(rest, read)]
 }
 
-fn ub_rest(rest: Option[String], read: (String) -> Bool, line: Int, col: Int) : Option[String] =
+fn ub_rest(rest: Option[Binder], read: (Binder) -> Bool, line: Int, col: Int) : Option[Binder] =
   match rest {
-    Some(r) -> if ub_silenced_name(r) and not read(r) { Some(ub_rest_sentinel(line, col)) } else { rest }
+    Some(r) -> if ub_silenced(r) and not read(r) { Some(ub_rest_sentinel(line, col)) } else { rest }
     None    -> None
   }

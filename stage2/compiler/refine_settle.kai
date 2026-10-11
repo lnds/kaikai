@@ -1,0 +1,140 @@
+#[doc("""
+A refinement alias's predicate, settled in the module that declares it.
+
+`type Short = String where short_enough(self)` is copied to every place
+that names `Short`, and each copy is read in the scope of the place it
+landed in. So before the copies are made the alias's own predicate gives
+its names the identities its module sees: `self` becomes the predicate's
+binder, and a name the module's ladder answers becomes that declaration.
+A copy then carries ids, and no binder or function of the module that
+uses the alias can stand in for them.
+
+The ladder is the resolver's, asked from the alias's home. What it
+cannot answer this early stays written, and each copy settles it where
+it lands: a protocol operation, whose dispatcher is not declared yet, a
+name the type decides, and anything under a binder of the predicate's
+own.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.util
+import compiler.decl_map
+import compiler.symtab
+import compiler.scope_file
+import compiler.scope_view
+import compiler.resolve
+import compiler.resolve_state
+import compiler.resolve_callee
+import compiler.kai_builtin
+import compiler.refine_types
+
+# The alias's home, every function's arity, and the operations a
+# protocol declares: one of those outranks a core function of its name.
+type SettleCx = { rs: ResState, ct: CalleeTab, ops: [String] }
+
+#[doc("`decls` with the predicate of every refinement alias settled in the alias's home. `tab` holds the declarations, `views` what each file sees, `target` names the root module.")]
+pub fn settle_alias_refinements(decls: [Decl], tab: SymTab, views: FileViews, target: String) : [Decl] =
+  if not any(decls, is_refined_alias) { decls }
+  else {
+    let cx = SettleCx { rs: rs_on_views(tab, views, target, kai_unshadowed(core_names(), decls, tab)),
+                        ct: ct_build(decls, target, []), ops: proto_op_labels(decls, []) }
+    map(decls, (d) => decl_map_inner(d, (x) => settle_decl(x, cx)))
+  }
+
+fn is_refined_alias(d: Decl) : Bool = match decl_transparent_inner(d) {
+  Some(inner) -> is_refined_alias(inner)
+  None        -> match d {
+    DType(_, _, _, TBAlias(t), _, _, _, _) -> tys_refined([t])
+    _                                      -> false
+  }
+}
+
+fn proto_op_labels(ds: [Decl], acc: [String]) : [String] = match ds {
+  []           -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> proto_op_labels([inner, ...rest], acc)
+    None        -> match d {
+      DProtocol(_, _, _, ops, _, _, _) ->
+        proto_op_labels(rest, list_append(map(ops, (o) => match o { POp(n, _, _, _, _, _) -> n }), acc))
+      _ -> proto_op_labels(rest, acc)
+    }
+  }
+}
+
+fn settle_decl(d: Decl, cx: SettleCx) : Decl = match d {
+  DType(pb, t, tps, TBAlias(te), l, c, mo, xs) ->
+    if not tys_refined([te]) { d }
+    else {
+      let at = SettleCx { ...cx, rs: rs_at_home(cx.rs, written_text(sym_home(cx.rs.tab, t))) }
+      match tys_with_preds([te], map(tys_preds([te]), (p) => settle(p, at))) {
+        [te1, ..._] -> DType(pb, t, tps, TBAlias(te1), l, c, mo, xs)
+        []          -> d
+      }
+    }
+  _ -> d
+}
+
+# Only the forms that bind nothing are walked, so every name met here is
+# free in the predicate.
+fn settle(e: Expr, cx: SettleCx) : Expr = match e.kind {
+  EName(w)         -> settle_read(e, written_text(w), cx)
+  ECall(f, xs)     -> settled(e, ECall(settle_callee(f, list_length(xs), cx), map(xs, (x) => settle(x, cx))))
+  EBinop(op, a, b) -> settled(e, EBinop(op, settle(a, cx), settle(b, cx)))
+  EUnop(op, x)     -> settled(e, EUnop(op, settle(x, cx)))
+  EField(b, f)     -> settled(e, EField(settle(b, cx), f))
+  EIndex(a, b)     -> settled(e, EIndex(settle(a, cx), settle(b, cx)))
+  _                -> e
+}
+
+fn settled(e: Expr, k: ExprKind) : Expr = Expr { ...e, kind: k }
+
+fn sym_read(e: Expr, s: SymId) : Expr = settled(e, ESym(s, spec_none()))
+
+fn is_self(name: String) : Bool = name == written_text(pred_self_binder().name)
+
+fn near(cx: SettleCx, name: String, fits: (SymId) -> Bool) : RsCall =
+  rs_call_sym(cx.rs, name, sv_near_rungs(), fits)
+
+# A name read as a value: the nearest declaration of it, unless a
+# protocol operation outranks the far rungs.
+fn settle_read(e: Expr, name: String, cx: SettleCx) : Expr =
+  if is_self(name) { settled(e, ELocal(pred_self())) }
+  else if list_has(cx.ops, name) and not near_answers(near(cx, name, (s) => true)) { e }
+  else { match rs_decl_sym(cx.rs, name) {
+    Some(s) -> sym_read(e, s)
+    None    -> e
+  } }
+
+fn near_answers(c: RsCall) : Bool = match c {
+  RsCall(RcNone, _) -> false
+  _                 -> true
+}
+
+# A bare callee climbs the ladder with the call's arity.
+fn settle_callee(f: Expr, n: Int, cx: SettleCx) : Expr = match f.kind {
+  EName(w) -> {
+    let name = written_text(w)
+    if is_self(name) { settle_read(f, name, cx) }
+    else { settle_call(f, name, (s) => ct_fits(cx.ct, s, n), cx) }
+  }
+  _ -> settle(f, cx)
+}
+
+fn settle_call(f: Expr, name: String, fits: (SymId) -> Bool, cx: SettleCx) : Expr =
+  match near(cx, name, fits) {
+    RsCall(RcSym(s), _) -> sym_read(f, s)
+    RsCall(RcNone, _)   ->
+      if list_has(cx.ops, name) { f }
+      else { settle_far(f, name, rs_call_sym(cx.rs, name, [SvCores, SvAny], fits), cx) }
+    _ -> f
+  }
+
+fn settle_far(f: Expr, name: String, c: RsCall, cx: SettleCx) : Expr = match c {
+  RsCall(RcSym(s), _) -> sym_read(f, s)
+  RsCall(RcCore, _)   -> match rs_builtin(cx.rs, name) {
+    Some(s) -> sym_read(f, s)
+    None    -> f
+  }
+  _ -> f
+}

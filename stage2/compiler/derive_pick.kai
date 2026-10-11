@@ -1,0 +1,210 @@
+#[doc("""
+What a `#[derive(P)]` entry picks.
+
+The entry is a reference to a protocol, written in the file that
+declares the type and resolved from there the way an impl head is. The
+generator is chosen by the declaration the entry resolves to. A core
+protocol that has a generator picks it. Any other protocol picks a
+generator by what it declares: the one whose core protocol declares
+exactly the same operations, label for label and arity for arity. Only
+the generators that build an impl out of the protocol's own operations
+serve another protocol this way; the ones that lean on the core runtime
+(`BinSerialize`, `Layout`, `Json`) serve their own protocol alone.
+
+An impl provides for a generator the same way: by the protocol its head
+resolves to, from the impl's own file.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.diag
+import compiler.modules
+import compiler.decl_names
+import compiler.core_protos
+import compiler.proto_resolve
+import compiler.name_report
+
+#[doc("True when `#[derive]` has a generator for the core protocol `g`.")]
+pub fn core_proto_derivable(g: CoreProto) : Bool = match g {
+  CpShow         -> true
+  CpEq           -> true
+  CpOrd          -> true
+  CpHash         -> true
+  CpBinSerialize -> true
+  CpLayout       -> true
+  CpJson         -> true
+  _              -> false
+}
+
+# The generators whose impl calls nothing but the derived protocol's operations.
+fn structural_gens() : [CoreProto] = [CpShow, CpEq, CpOrd, CpHash]
+
+# One declared operation: its label and its arity.
+type OpShape = OpShape(String, Int)
+
+type ProtoShape = ProtoShape(SymId, [OpShape])
+
+# A structural generator with the operations its core protocol declares.
+type GenModel = GenModel(CoreProto, [OpShape])
+
+#[doc("A protocol that is no core one, and the generator its operations pick.")]
+pub type ShapedGen = ShapedGen(SymId, CoreProto)
+
+#[doc("The generator each protocol of a program picks by the operations it declares.")]
+pub type ShapedGens = ShapedGens([ShapedGen])
+
+#[doc("The generator each protocol declared in `ds` picks by its operations: a structural generator's, when the protocol declares exactly the operations of that generator's core protocol. A core protocol picks by identity and has no entry.")]
+pub fn shaped_gens(ds: [Decl]) : ShapedGens = {
+  let shapes = proto_shapes(ds, [])
+  ShapedGens(shaped_loop(shapes, gen_models(structural_gens(), shapes), []))
+}
+
+fn proto_shapes(ds: [Decl], acc: [ProtoShape]) : [ProtoShape] = match ds {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DProtocol(_, psym, _, ops, _, _, _) ->
+      proto_shapes(rest, [ProtoShape(psym, map(ops, op_shape)), ...acc])
+    _ -> match decl_transparent_inner(d) {
+      Some(inner) -> proto_shapes([inner, ...rest], acc)
+      None        -> proto_shapes(rest, acc)
+    }
+  }
+}
+
+fn op_shape(op: ProtoOp) : OpShape = match op {
+  POp(label, _, params, _, _, _) -> OpShape(label, list_length(params))
+}
+
+fn gen_models(gs: [CoreProto], shapes: [ProtoShape]) : [GenModel] = match gs {
+  []           -> []
+  [g, ...rest] -> match shape_of(shapes, core_proto_id(g)) {
+    Some(ops) -> [GenModel(g, ops), ...gen_models(rest, shapes)]
+    None      -> gen_models(rest, shapes)
+  }
+}
+
+fn shape_of(shapes: [ProtoShape], p: SymId) : Option[[OpShape]] = match shapes {
+  [] -> None
+  [ProtoShape(s, ops), ...rest] -> if sym_raw(s) == sym_raw(p) { Some(ops) } else { shape_of(rest, p) }
+}
+
+fn shaped_loop(shapes: [ProtoShape], models: [GenModel], acc: [ShapedGen]) : [ShapedGen] = match shapes {
+  [] -> acc
+  [ProtoShape(p, ops), ...rest] -> match core_proto_of(p) {
+    Some(_) -> shaped_loop(rest, models, acc)
+    None    -> match model_for(models, ops) {
+      Some(g) -> shaped_loop(rest, models, [ShapedGen(p, g), ...acc])
+      None    -> shaped_loop(rest, models, acc)
+    }
+  }
+}
+
+fn model_for(models: [GenModel], ops: [OpShape]) : Option[CoreProto] = match models {
+  [] -> None
+  [GenModel(g, want), ...rest] -> if ops_same(ops, want) { Some(g) } else { model_for(rest, ops) }
+}
+
+# An operation has no id of its own: within a protocol, the label and
+# the arity are the operation.
+fn ops_same(a: [OpShape], b: [OpShape]) : Bool =
+  list_length(a) == list_length(b) and all(a, (o) => has_op(b, o)) and all(b, (o) => has_op(a, o))
+
+fn has_op(ops: [OpShape], o: OpShape) : Bool = match ops {
+  [] -> false
+  [OpShape(label, arity), ...rest] -> match o {
+    OpShape(l, n) -> (label == l and arity == n) or has_op(rest, o)
+  }
+}
+
+#[doc("The generator the protocol `p` picks: its own when it is a core protocol that has one, else the one its operations pick in `sg`.")]
+pub fn proto_gen(sg: ShapedGens, p: SymId) : Option[CoreProto] = match core_proto_of(p) {
+  Some(g) -> if core_proto_derivable(g) { Some(g) } else { None }
+  None    -> match sg { ShapedGens(rows) -> shaped_find(rows, p) }
+}
+
+fn shaped_find(rows: [ShapedGen], p: SymId) : Option[CoreProto] = match rows {
+  [] -> None
+  [ShapedGen(s, g), ...rest] ->
+    if sym_raw(p) >= 0 and sym_raw(s) == sym_raw(p) { Some(g) } else { shaped_find(rest, p) }
+}
+
+#[doc("A `#[derive]` entry that picked a generator: the protocol it resolved to, and the generator.")]
+pub type DeriveGen = DeriveGen(SymId, CoreProto)
+
+#[doc("What the protocol reference `pspell` picks, resolved from the file homed at `from` (`None` = root file); `None` when it resolves to no protocol that picks a generator.")]
+pub fn derive_gen(ps: PScope, sg: ShapedGens, pspell: String, from: Option[String]) : Option[DeriveGen] = {
+  let p = ps_proto_sym(ps, pspell, from)
+  match proto_gen(sg, p) {
+    Some(g) -> Some(DeriveGen(p, g))
+    None    -> None
+  }
+}
+
+#[doc("The entries of `names`, written in the file homed at `from`, that pick a generator.")]
+pub fn derive_gens(ps: PScope, sg: ShapedGens, names: [String], from: Option[String]) : [DeriveGen] = match names {
+  []           -> []
+  [n, ...rest] -> match derive_gen(ps, sg, n, from) {
+    Some(d) -> [d, ...derive_gens(ps, sg, rest, from)]
+    None    -> derive_gens(ps, sg, rest, from)
+  }
+}
+
+#[doc("True when one of the `#[derive]` entries `names`, written in the file homed at `from`, picks the generator `g`.")]
+pub fn derives_gen(ps: PScope, sg: ShapedGens, names: [String], from: Option[String], g: CoreProto) : Bool =
+  any(derive_gens(ps, sg, names, from), (d) => match d { DeriveGen(_, p) -> core_proto_same(p, g) })
+
+#[doc("True when one of the `#[derive]` entries `names`, written in the file homed at `from`, is the core protocol `g` itself: what picks a generator that serves its own protocol alone.")]
+pub fn derives_core(ps: PScope, names: [String], from: Option[String], g: CoreProto) : Bool = match names {
+  []           -> false
+  [n, ...rest] -> proto_is(ps_proto_sym(ps, n, from), g) or derives_core(ps, rest, from, g)
+}
+
+#[doc("The errors of the `#[derive]` entries `names` at `file:line:col`, written in the file homed at `from`: an entry that resolves to no single protocol, reported the way an impl head is, and an entry whose protocol picks no generator. Prepended to `acc`.")]
+pub fn derive_pick_diags(ps: PScope, sg: ShapedGens, names: [String], from: Option[String], file: String,
+                         line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] = match names {
+  []           -> acc
+  [n, ...rest] -> {
+    let acc1 = match derive_gen(ps, sg, n, from) {
+      Some(_) -> acc
+      None    -> [dp_error(ps, n, ps_resolve(ps, n, from), file, line, col), ...acc]
+    }
+    derive_pick_diags(ps, sg, rest, from, file, line, col, acc1)
+  }
+}
+
+fn dp_error(ps: PScope, pspell: String, res: PkRes, file: String, line: Int, col: Int) : Diagnostic = {
+  let pname = dotted_bare(pspell)
+  match res {
+    PkHome(home) -> mk_diag(SevError, file, line, col,
+      concat_all(["no derive generator for protocol `", dp_spelled(home, pname), "`"]),
+      dp_core_help(pname, file, line, col))
+    PkPrivate(m) -> mk_diag(SevError, file, line, col,
+      concat_all(["protocol `", pname, "` is declared in module `", m, "` but is not `pub`"]), [])
+    PkUnknown -> mk_diag(SevError, file, line, col,
+      concat_all(["unknown protocol `", pname, "` in `#[derive]`"]), [])
+    PkAmbiguous(cands) ->
+      nr_ambiguous_diag(file, line, col, NCProtocol, pname, map(cands, (c) => dp_home_name(c, ps_root(ps))), "", [])
+  }
+}
+
+# A protocol as a diagnostic names it: through its module, bare for the root file's own.
+fn dp_spelled(home: Option[String], pname: String) : String = match home {
+  Some(m) -> concat_all([m, ".", pname])
+  None    -> pname
+}
+
+fn dp_home_name(home: Option[String], root: String) : String = match home {
+  Some(m) -> m
+  None    -> root
+}
+
+# The entry is spelled like a core protocol that has a generator, and is not it.
+fn dp_core_help(pname: String, file: String, line: Int, col: Int) : [RelatedInfo] =
+  match core_proto_named(pname) {
+    Some(g) ->
+      if core_proto_derivable(g) {
+        [ri_help(file, line, col, concat_all(["to derive the core protocol, write `#[derive(",
+                                              core_proto_home(g), ".", pname, ")]`"]))]
+      } else { [] }
+    None -> []
+  }
