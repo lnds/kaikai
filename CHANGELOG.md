@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.140.1 (2026-10-11)
+
+### Fixed
+
+- **typer**: a constructor claim and a type's habitant slots are keyed by the type's declaration
+- **typer**: the expected type reaches a record head wherever it is in hand
+- **typer**: a stored refinement predicate holds identities, and is compared by them
+- **typer**: Decimal is read without an import again (#2687)
+- **perceus**: a moved arm binder passed to an unboxed parameter is released after the call (#2689)
+- **kir**: a handler alias, a clause capture and the Ffi slot are found by id (#2688)
+
+### Changed
+
+- **compiler**: no decision by a name's text after the resolver; names gate final in tier0 (#2690)
+- **typer**: a constructor claim's site is a value of its own
+
 ## v0.140.0 (2026-10-10)
 
 ### BREAKING CHANGE
