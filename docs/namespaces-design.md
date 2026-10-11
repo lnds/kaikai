@@ -58,6 +58,12 @@ that file only, and the core declaration stays reachable qualified
 names follow the same ladder as every other class, so a bare `Log` means
 the same declaration in a row, a `handle` head and a perform.
 
+One core module is closed. `decimal` is loaded for every program because
+its `Decimal` carries decimal literals, and it puts that one name on the
+core rung: a file reads the type bare, and reaches the module's functions
+by importing it or through the `decimal.` qualifier. A type the file
+declares or imports under that name outranks it like any core name.
+
 Step 5 is the whole point. Never first-wins, never last-wins, never
 import-order, never declaration-order. The kind-system doc already
 justifies this — *"order-of-declaration must NOT change a program's
