@@ -7533,7 +7533,7 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [TBinder], sl
       let nxt = p_peek1(p)
       if tk_is(nxt.kind, TkPlus) {
         let nm = tok_source(p.src, hd)
-        parse_effect_alias_body(p_advance(p_advance(p)), [nm], is_pub, name, tparams, slots, t)
+        parse_effect_alias_body(p_advance(p_advance(p)), [RL(ref_written(nm), [])], is_pub, name, tparams, slots, t)
       } else {
         let is_sum = looks_like_sum(p)
         if is_sum {
@@ -7542,7 +7542,12 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [TBinder], sl
           let rt = parse_type(p)
           match rt.r {
             None -> err_d(rt.p)
-            Some(aliased) -> ok_dn(rt.p, DType(is_pub, p_sym(p, NCType, name), tparams, TBAlias(aliased), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
+            # A `+` after a parameterised head (`Actor[Msg] + ...`) is
+            # the same signal: the head was an effect label, not a type.
+            Some(aliased) -> match effect_alias_head(rt.p, aliased) {
+              Some(l) -> parse_effect_alias_body(p_advance(rt.p), [l], is_pub, name, tparams, slots, t)
+              None    -> ok_dn(rt.p, DType(is_pub, p_sym(p, NCType, name), tparams, TBAlias(aliased), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
+            }
           }
         }
       }
@@ -7748,25 +7753,41 @@ fn parse_json_attr_close(p: Parser, a: FieldAttr) : PFAttr / Console {
 
 # Closed effect-alias body. Caller has consumed the first label and
 # the `+` separator; `acc` holds the labels parsed so far in reverse
-# order. Subsequent labels must be uppercase idents separated by `+`.
-# Validation that each label refers to a declared effect, plus cycle
-# detection, happens at resolve time.
-fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
+# order. Subsequent labels are uppercase idents, each with optional
+# `[T1, T2]` arguments, separated by `+`. Validation that each label
+# refers to a declared effect, plus cycle detection, happens at
+# resolve time.
+fn parse_effect_alias_body(p: Parser, acc: [RowLabel], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
 
   let hd = p_peek(p)
   if not tk_is(hd.kind, TkIdent) or not is_upper_ident(p.src, hd) {
     err_d(p_error(p, hd, "expected uppercase effect name in effect alias"))
   } else {
-    let nm = tok_source(p.src, hd)
     let p1 = p_advance(p)
-    let acc1 = [nm, ...acc]
-    if p_at(p1, TkPlus) {
-      parse_effect_alias_body(p_advance(p1), acc1, is_pub, name, tparams, slots, t)
-    } else {
-      ok_dn(p1, DType(is_pub, p_sym(p, NCType, name), tparams, TBEffectAlias(map(list_reverse(acc1), (n) => RL(ref_written(n), []))), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
+    let args_r =
+      if p_at(p1, TkLbracket) { parse_row_label_args(p_skip_newlines(p_advance(p1)), []) }
+      else { PRowArgs { p: p1, r: Some([]) } }
+    match args_r.r {
+      None -> err_d(args_r.p)
+      Some(targs) -> {
+        let acc1 = [RL(ref_written(tok_source(p.src, hd)), targs), ...acc]
+        if p_at(args_r.p, TkPlus) {
+          parse_effect_alias_body(p_advance(args_r.p), acc1, is_pub, name, tparams, slots, t)
+        } else {
+          ok_dn(args_r.p, DType(is_pub, p_sym(p, NCType, name), tparams, TBEffectAlias(list_reverse(acc1)), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
+        }
+      }
     }
   }
 }
+
+# The label a parsed alias body turns out to head, when a `+` follows it.
+fn effect_alias_head(p: Parser, ty: TypeExpr) : Option[RowLabel] =
+  if not p_at(p, TkPlus) { None }
+  else { match ty.tkind {
+    TyName(DrWritten(None, n), targs) -> Some(RL(DrWritten(None, n), targs))
+    _                                 -> None
+  } }
 
 # `mod.Type` in member position. A constructor never carries a module
 # qualifier, so this spelling only ever reads as a union over a
