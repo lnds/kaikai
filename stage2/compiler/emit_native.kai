@@ -25,6 +25,7 @@
 import compiler.util
 import compiler.ast
 import compiler.kir
+import compiler.kir_syms
 import compiler.fnreg
 import compiler.purity
 import compiler.purity_traps
@@ -90,7 +91,8 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [V
   let const_fns = purity_const_fns(purity_analyze(decls, kp.entry))
   let free_fns = trapfree_fns(decls, kp.tab)
   # Declare every program fn first (forward + cross-TU references).
-  nemit_declare_fns(ctx, all_fns, const_fns, free_fns)
+  let nm = kp_names(kp)
+  nemit_declare_fns(ctx, nm, all_fns, const_fns, free_fns)
   # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one per
   # default-block effect so `nemit_perform` resolves the op's field index.
   # DISPATCH uses `synth_defaults` (the SUPERSET) because a dead fn's
@@ -104,7 +106,7 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [V
   # finds every shape.
   nemit_declare_default_globals_for(ctx, kp.tab, kp.synth_defaults, role)
   # Walk only this TU's fns; `all_fns` stays the stable P3 call-site lookup.
-  let fx = nfnx_build(all_fns, kp.tab, kp.ids, frames)
+  let fx = nfnx_build(all_fns, nm, kp.ids, frames)
   nemit_walk_fns(ctx, define_fns, all_handlers, fx)
   # The whole-program singletons live in exactly one TU (the owner, which also
   # owns the runtime): the fn thunks, the proto impl-table init, the default
@@ -132,7 +134,7 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [V
   # The split core's share of the P3 boxed adapters (the split root registers
   # every row and resolves these extern).
   let _a = match role {
-    NModSplitCore -> nproto_emit_adapters_of(ctx, decls, kp.tab, kp.ids, fns, nemit_syms_of(define_fns))
+    NModSplitCore -> nproto_emit_adapters_of(ctx, decls, kp.tab, kp.ids, fns, nemit_decls_of(define_fns))
     _             -> ()
   }
   # Resolve DWARF temporaries before verify (a no-op when DI is off).
@@ -142,15 +144,12 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [V
 # The adapter share of a singleton-owning TU: the split root defines only its
 # own partition's adapters; whole-program and the modular root define all.
 fn nadapters_for(role: NModRole, define_fns: [KFn]) : NAdapters = match role {
-  NModSplitRoot -> NAdaptOnly(nemit_syms_of(define_fns))
+  NModSplitRoot -> NAdaptOnly(nemit_decls_of(define_fns))
   _             -> NAdaptAll
 }
 
-fn nemit_syms_of(fns: [KFn]) : [String] = nemit_syms_loop(fns, [])
-fn nemit_syms_loop(fns: [KFn], acc: [String]) : [String] = match fns {
-  [] -> list_reverse(acc)
-  [f, ...rest] -> nemit_syms_loop(rest, [f.sym, ...acc])
-}
+# The declarations among `fns`: an impl row is matched against them.
+fn nemit_decls_of(fns: [KFn]) : [FnId] = map(fns, kfn_fid)
 
 # Replay the AST-derived evidence-frame table into the ctx, one slot per
 # `add_frame_slot` call in canonical order: each declared fn's frame under
@@ -176,7 +175,7 @@ fn nframes_register_slots(ctx: Handle, sym: String, slots: [String]) : Unit = ma
 # Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
 # front so a call/install site resolves the symbol even when the definition
 # comes later in the list. (Lambda thunks declare lazily at their use.)
-fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_fns: [FnId], free_fns: [FnId]) : Unit = match fns {
+fn nemit_declare_fns(ctx: Handle, nm: KNames, fns: [KFn], const_fns: [FnId], free_fns: [FnId]) : Unit = match fns {
   [] -> ()
   [f, ...rest] -> match f.kind {
     # `KFnFfi` shares the all-boxed declaration: its callers invoke the
@@ -184,8 +183,8 @@ fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_fns: [FnId], free_fns: [FnId
     # only its body differs (a synthesised unbox→extern→re-box shim). No
     # purity attribute: the shim calls into arbitrary C.
     KFnFfi(_, _, _) -> {
-      let _f = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
-      nemit_declare_fns(ctx, rest, const_fns, free_fns)
+      let _f = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(nm, f), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
     }
     KFnNormal -> {
       # Bind the declaration handle in a `let` (the handle-binder
@@ -202,28 +201,29 @@ fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_fns: [FnId], free_fns: [FnId
       # bind two distinct functions. `nfn_llvm_type` returns the legacy
       # boxed `ptr (ptr × n)` for a fully-boxed fn, so non-UFn decls are
       # unchanged.
-      let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f), nfn_llvm_type(ctx, f))
+      let sym = nfn_sym(nm, f)
+      let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, nfn_llvm_type(ctx, sym, f))
       # `memory(none)` only when the confirmation table proved the body
       # memory-clean; `nounwind` only when nothing in it can trap, since a
       # trap unwinds through these frames.
-      let _nu = if nfn_present(free_fns, f.fid) { llvm_add_nounwind(_d) } else { () }
-      let _mn = if nfn_present(const_fns, f.fid) { llvm_add_memory_none(_d) } else { () }
-      nemit_declare_fns(ctx, rest, const_fns, free_fns)
+      let _nu = if nfn_present(free_fns, kfn_fid(f)) { llvm_add_nounwind(_d) } else { () }
+      let _mn = if nfn_present(const_fns, kfn_fid(f)) { llvm_add_memory_none(_d) } else { () }
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
     }
     # A clause thunk is referenced by the install (`kaix_ev_set_op` stores
     # its address) before its own definition is walked, so forward-declare
     # it with the clause ABI `ptr (ptr self, <args>, ptr k)`.
     KFnClause -> {
-      let _c = nemit_declare_clause(ctx, f.sym, f.params)
-      nemit_declare_fns(ctx, rest, const_fns, free_fns)
+      let _c = nemit_declare_clause(ctx, kfn_sym(nm, f), f.params)
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
     }
     # The install arms the cleanup thunk's address before its own definition
     # is walked, so forward-declare it with the `void (ptr self)` ABI.
     KFnCleanup -> {
-      let _c = nemit_declare_cleanup(ctx, f.sym)
-      nemit_declare_fns(ctx, rest, const_fns, free_fns)
+      let _c = nemit_declare_cleanup(ctx, kfn_sym(nm, f))
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
     }
-    _ -> nemit_declare_fns(ctx, rest, const_fns, free_fns)
+    _ -> nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
   }
 }
 

@@ -17,6 +17,7 @@
 
 import compiler.ast
 import compiler.kir
+import compiler.kir_syms
 import compiler.proto_ids
 import compiler.emit_shared
 import compiler.emit_native_di
@@ -48,7 +49,7 @@ pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fx: NFnIndex) : U
   KFnCleanup -> nemit_fn_with(ctx, f, NFnCleanup, handlers, fx)
   # An `extern "C" fn` carries no lowered body — the shim is synthesised
   # here from the marshalling kinds the KIR classified (emit_native_ffi.kai).
-  KFnFfi(csym, pks, rk) -> nemit_ffi_fn(ctx, f, csym, pks, rk)
+  KFnFfi(csym, pks, rk) -> nemit_ffi_fn(ctx, nfn_sym(fx.nm, f), f, csym, pks, rk)
 }
 
 # The native frame ABI a KFn emits — distinct from `KFnKind` so this file
@@ -80,7 +81,7 @@ fn nfn_internalize_private(f: KFn, abi: NFnAbi, fnval: Handle, fx: NFnIndex) : U
   _ -> ()
 }
 
-fn nfn_link_visible(f: KFn, fx: NFnIndex) : Bool = f.entry or pid_is_impl(fx.ids, fnid_sym(f.fid))
+fn nfn_link_visible(f: KFn, fx: NFnIndex) : Bool = f.entry or pid_is_impl(fx.ids, fnid_sym(kfn_fid(f)))
 
 # The prim returns a handle-typed placeholder under kaic1's minimal typer, so
 # bind-and-discard (the `let _x = <prim>` shape the attribute stamps use) keeps
@@ -92,14 +93,15 @@ fn nfn_mark_internal(fnval: Handle) : Unit = { let _il = llvm_set_internal_linka
 # takes `ptr (ptr self, <args ptr>, ptr k)`. The block-building + alloca
 # prologue are identical; only the LLVM signature + the param seed differ.
 fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = {
-  let fnval = nemit_declare_for_abi(ctx, f, abi)
+  let sym = nfn_sym(fx.nm, f)
+  let fnval = nemit_declare_for_abi(ctx, sym, f, abi)
   nfn_internalize_private(f, abi, fnval, fx)
   native_ctx_begin_fn(ctx, fnval)
   # DWARF (#500): open this fn's DISubprogram (the location scope every
   # statement attaches to) at the fn's first source line. A no-op when DI
   # is off. The prologue (allocas / param seed / entry br) carries no
   # location; the first KAt statement sets it.
-  ndi_subprogram(ctx, fnval, nfn_sym(f), ndi_fn_line(f.blocks))
+  ndi_subprogram(ctx, fnval, sym, ndi_fn_line(f.blocks))
   let aentry = llvm_append_block(native_ctx_m(ctx), fnval, "alloca.entry")
   nemit_make_blocks(ctx, fnval, f.blocks)
   let first_kblock = native_ctx_first_block(ctx)
@@ -116,41 +118,41 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fx:
   nemit_donor_alloca(ctx, f)
   # Reserve the `__evf` register in the entry head when the fn carries a
   # frame, so the seed can bind LLVM param 0 and a perform can load a slot.
-  nemit_evf_alloca(ctx, f)
-  nemit_seed_for_abi(ctx, f, abi, fnval)
+  nemit_evf_alloca(ctx, sym)
+  nemit_seed_for_abi(ctx, sym, f, abi, fnval)
   llvm_build_br(native_ctx_b(ctx), first_kblock)
   # P3: pass the fn's return slot so a `KRet` returns the raw scalar
   # matching the signature. Lambda / clause ABIs always carry `SBoxed`
   # ret, so they keep the boxed return.
-  nemit_fill_blocks(ctx, nfn_sym(f), f.blocks, handlers, f.ret, fx)
+  nemit_fill_blocks(ctx, sym, f.blocks, handlers, f.ret, fx)
   native_ctx_end_fn(ctx)
 }
 
 # Reserve the `__evf` register (a `ptr` to the evidence frame array) in the
-# entry head when this fn carries a frame; no-op otherwise.
-fn nemit_evf_alloca(ctx: Handle, f: KFn) : Unit / Console =
-  if native_ctx_frame_slot_count(ctx, nfn_sym(f)) > 0 { nfx_reserve_named(ctx, "__evf") }
+# entry head when the fn emitted as `sym` carries a frame; no-op otherwise.
+fn nemit_evf_alloca(ctx: Handle, sym: String) : Unit / Console =
+  if native_ctx_frame_slot_count(ctx, sym) > 0 { nfx_reserve_named(ctx, "__evf") }
   else { () }
 
 # Declare the fn with the signature its ABI needs. Normal = all-boxed
 # `ptr (ptr × n)`; lambda + clause = the thunk-shaped declarer (a clause's
 # precise arity is materialised at the call site through the loaded op
 # fn-ptr, so the declaration only needs a stable address).
-fn nemit_declare_for_abi(ctx: Handle, f: KFn, abi: NFnAbi) : Handle = match abi {
-  NFnNormal -> llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f), nfn_llvm_type(ctx, f))
-  NFnLambda -> nemit_declare_thunk(ctx, f.sym)
-  NFnClause -> nemit_declare_clause(ctx, f.sym, f.params)
-  NFnCleanup -> nemit_declare_cleanup(ctx, f.sym)
+fn nemit_declare_for_abi(ctx: Handle, sym: String, f: KFn, abi: NFnAbi) : Handle = match abi {
+  NFnNormal -> llvm_get_or_declare_fn(native_ctx_m(ctx), sym, nfn_llvm_type(ctx, sym, f))
+  NFnLambda -> nemit_declare_thunk(ctx, sym)
+  NFnClause -> nemit_declare_clause(ctx, sym, f.params)
+  NFnCleanup -> nemit_declare_cleanup(ctx, sym)
 }
 
 # Seed the params for the ABI: normal stores each arg into its alloca;
 # lambda reads `args[i]` / captures; clause reads `args[i]` directly +
 # `k` (the last LLVM param) for `PResume` + captures/evidence from `self`.
-fn nemit_seed_for_abi(ctx: Handle, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / Console = match abi {
+fn nemit_seed_for_abi(ctx: Handle, sym: String, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / Console = match abi {
   # A frame-carrying fn takes the evidence frame as LLVM param 0; bind it
   # into `__evf` and shift each user param's index by one.
   NFnNormal -> {
-    let evf_off = nfn_evf_extra(native_ctx_frame_slot_count(ctx, nfn_sym(f)))
+    let evf_off = nfn_evf_extra(native_ctx_frame_slot_count(ctx, sym))
     if evf_off > 0 { nemit_store_reg(ctx, "__evf", llvm_get_param(fnval, 0)) } else { () }
     nemit_seed_params(ctx, f.params, fnval, evf_off)
     # The hidden donor token is the trailing LLVM param.
@@ -701,9 +703,9 @@ pub fn nemit_fn_thunks(ctx: Handle, fns: [KFn], fx: NFnIndex) : Unit / Console =
 # in via `args[]`; the call to `f` adapts each arg to `f`'s param slot and
 # re-boxes a raw return.
 fn nemit_one_fn_thunk(ctx: Handle, f: KFn, fx: NFnIndex) : Unit / Console = {
-  let sym = f.sym
+  let callee = nfn_sym(fx.nm, f)
   let arity = list_length(f.params)
-  let tsym = c_user_thunk_sym(sym)
+  let tsym = c_user_thunk_sym(kfn_sym(fx.nm, f))
   let thunkv = nemit_declare_thunk(ctx, tsym)
   let entry = llvm_append_block(native_ctx_m(ctx), thunkv, "entry")
   llvm_position_at_end(native_ctx_b(ctx), entry)
@@ -718,13 +720,13 @@ fn nemit_one_fn_thunk(ctx: Handle, f: KFn, fx: NFnIndex) : Unit / Console = {
   # A frame-carrying fn reached through its thunk has no caller frame; fill
   # the callee frame from the live walk, prepended before the user args, so
   # the call matches the definition's leading `ptr __evf`.
-  nemit_evf_call_push(ctx, nfn_sym(f), f, fx, ptb, ab)
+  nemit_evf_call_push(ctx, callee, f, fx, ptb, ab)
   nemit_thunk_adapt_args(ctx, f.params, boxbuf, 0, ptb, ab)
   llvm_buf_free(boxbuf)
   # A donation-capable target takes the trailing token; the thunk has no
   # arm token to move, so it passes null (the runtime fresh-allocs).
   if f.donor { let p = native_ctx_ptrt(ctx); llvm_buf_push(ptb, p); llvm_buf_push(ab, llvm_const_null(p)) } else { () }
-  let r = ncall_finish(ctx, nfn_sym(f), nslot_type(ctx, f.ret), ptb, ab)
+  let r = ncall_finish(ctx, callee, nslot_type(ctx, f.ret), ptb, ab)
   llvm_build_ret(native_ctx_b(ctx), nthunk_box_ret(ctx, r, f.ret))
   ()
 }
