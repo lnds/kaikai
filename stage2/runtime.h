@@ -3347,6 +3347,12 @@ struct KaiFiber {
      * must re-park when it resumes with this still 0 and its own predicate
      * unmet, never conclude its deadline or event fired. */
     int reactor_fired;
+    /* Nonzero while the fiber waits on a mailbox waiter chain, where a
+     * cancel must wake it: no reactor event ever will. The fiber sets it
+     * and then reads cancel_requested; the canceller sets cancel_requested
+     * and then reads it. One of the two always sees the other, so the
+     * cancel is never slept through. */
+    _Atomic int cancel_wake;
     /* F2 — per-thread pending-commit stack link. `kai_sched_park` pushes a
      * reactor-parking fiber here before swapping to the root; the root
      * drains the stack post-swap and commits each. A stack (not a single
@@ -3501,6 +3507,7 @@ struct KaiNursery {
     0,                   /* wake_pending */                              \
     0,                   /* pending_park — not a reactor park */          \
     0,                   /* reactor_fired */                              \
+    0,                   /* cancel_wake */                                \
     NULL,                /* commit_next */                               \
     NULL,                /* tsan_fiber — bound on this thread's first switch */ \
     NULL,                /* exit_rec */                                  \
@@ -4206,6 +4213,15 @@ static void kai_check_cancel_yield_point(void);
  * Cancel` handler on this fiber. Does not return when one is in scope;
  * returns 0 when there is none. Body sits beside the yield-point hook. */
 static int kai_cancel_dispatch_user_handler(void);
+/* kai_sched_park without the cancel check on resume, for a site linked
+ * into a chain it must leave before it unwinds. */
+static void kai_sched_park_linked(void);
+/* True when a requested cancellation can be delivered to `f` now. */
+static inline int kai_cancel_due(KaiFiber *f) {
+    return f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set;
+}
+static void kai_cancel_deliver(KaiFiber *f);
+static void kai_fiber_request_cancel(KaiFiber *f);
 /* Splice a fiber off whatever reactor waiter list holds it; defined with
  * the reactor below, needed above by the select loser-cancel walk. */
 static int kai_reactor_detach_fiber(KaiFiber *target);
@@ -4527,6 +4543,24 @@ static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
     if (waiter) kai_sched_remote_unpark(waiter);
 }
 
+/* Park `me` on the waiter chain it is already linked into. Returns 0 on an
+ * ordinary resume, which is a hint the caller re-checks. Returns 1 when a
+ * cancel is due: `me` is off the chain, so no later send can wake a fiber
+ * that has unwound, and the caller delivers the cancel once it has released
+ * what it holds. */
+static int kai_mailbox_park(KaiMailbox *mb, KaiFiber **head, KaiFiber **tail, KaiFiber *me) {
+    atomic_store(&me->cancel_wake, 1);
+    if (!kai_cancel_due(me)) kai_sched_park_linked();
+    atomic_store(&me->cancel_wake, 0);
+    if (!kai_cancel_due(me)) return 0;
+    kai_mbox_lock(mb);
+    kai_mailbox_waiter_remove(head, tail, me);
+    kai_mbox_unlock(mb);
+    return 1;
+}
+
+/* Returns NULL when a cancel is due instead of a message: the caller
+ * releases its references and delivers it. */
 static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
     /* Phase 4: park the calling fiber until a sender enqueues. The
      * loop handles the case where another receiver took the slot
@@ -4559,7 +4593,8 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
         kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
                                     &mb->recv_waiter_tail, me);
         kai_mbox_unlock(mb);
-        kai_sched_park();
+        if (kai_mailbox_park(mb, &mb->recv_waiter_head,
+                             &mb->recv_waiter_tail, me)) return NULL;
     }
 }
 
@@ -9735,6 +9770,8 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv(KaiValue *pid)
      * helper is callee-consumes-clean. */
     KaiValue *msg = kai_mailbox_pop(pid->as.mb);
     kai_decref(pid);
+    /* A due cancel unwinds from here: the call does not return. */
+    if (!msg) kai_cancel_deliver(kai_current_fiber());
     return msg;
 }
 #endif
@@ -17338,7 +17375,7 @@ static void kai_drain_requeue_stack(KaiWorker *w) {
  * until an event promotes someone, then redequeue. Deadlock is now
  * `ready queue empty AND reactor empty` — only that combination
  * means no path to forward progress. */
-static void kai_sched_park(void) {
+static void kai_sched_park_linked(void) {
     KaiWorker *w = kai_worker_here();
     KaiFiber *current = w->active;
     /* Any prior park's fired stamp is history; the sites read it only for
@@ -17383,7 +17420,6 @@ static void kai_sched_park(void) {
             if (kai_reactor_detach_fiber(current))
                 kai_park_trace(current, "self-detach");
         }
-        kai_check_cancel_yield_point();
         return;
     }
 
@@ -17413,11 +17449,6 @@ static void kai_sched_park(void) {
          * unwind the parked accounting we just bumped. */
         current->state = KAI_FIBER_RUNNING;
         w->parked_count--;
-        /* Issue #679: also observe a sibling-triggered cancel here.
-         * The unpark path from `kai_default_spawn_cancel`'s reactor
-         * detach lands here when the canceller is on the same OS
-         * thread frame as the reactor wake. */
-        kai_check_cancel_yield_point();
         return;
     }
     next->state = KAI_FIBER_RUNNING;
@@ -17425,13 +17456,13 @@ static void kai_sched_park(void) {
     KAI_TSAN_SWITCH_TO(next);
     swapcontext(&current->ctx, &next->ctx);
     kai_drain_pending_free(current->worker);
-    /* Issue #679: every reactor-driven park resumes here. If a
-     * sibling fiber called Spawn.cancel(self) while we were parked,
-     * the reactor detach + unpark wakes us and we must observe the
-     * cancel before retrying the syscall the park site wrapped.
-     * The yield-point check longjmps to `cancel_pad` if the flag is
-     * set; otherwise the park site's syscall retry loop continues
-     * normally. */
+}
+
+/* Every resume is a yield point: a fiber cancelled while parked was woken
+ * to observe it here, before the site retries what the park wrapped. The
+ * check longjmps to the cancel pad when the cancel is due. */
+static void kai_sched_park(void) {
+    kai_sched_park_linked();
     kai_check_cancel_yield_point();
 }
 
@@ -18275,15 +18306,13 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
      * every child at scope exit, so a loser left running would stall the
      * scope on work whose result nobody can observe. Delivery is the
      * ordinary cooperative path: the flag lands and the fiber unwinds at
-     * its next yield point; a loser parked on the reactor gets detached and
-     * unparked so it reaches that point instead of sleeping until an
-     * external event it no longer needs. */
+     * its next yield point; a parked loser is woken to reach that point
+     * instead of sleeping on an event it no longer needs. */
     for (int i = 0; i < n; i++) {
         KaiFiber *f = fibs[i];
         if (f == winner) continue;
         if (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED) continue;
-        f->cancel_requested = 1;
-        if (kai_reactor_detach_fiber(f)) kai_sched_unpark(f);
+        kai_fiber_request_cancel(f);
     }
 
     KaiValue *res = kai_fiber_result_for_awaiter(winner);
@@ -18346,6 +18375,20 @@ static int kai_reactor_detach_fiber(KaiFiber *target) {
     return found;
 }
 
+/* Request `f`'s cancellation and get it to a yield point. The flag alone
+ * reaches a runnable fiber at its next op. A parked one never reaches an
+ * op: on a reactor waiter list no event may ever come, and on a mailbox
+ * chain no message may. Splice it off the reactor, or let its mailbox park
+ * unlink itself, and unpark it; the resume observes the flag and unwinds.
+ * A fiber parked on an await or a nursery join keeps waiting: what it
+ * waits for must end before it unwinds. */
+static void kai_fiber_request_cancel(KaiFiber *f) {
+    atomic_store(&f->cancel_requested, 1);
+    if (kai_reactor_detach_fiber(f) || atomic_load(&f->cancel_wake)) {
+        kai_sched_unpark(f);
+    }
+}
+
 KAI_SCHED_FN KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k)
 #if KAI_SCHED_DECL_ONLY
 ;
@@ -18353,32 +18396,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, Kai
 {
     (void) self;
     if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
-        KaiFiber *target = fib_v->as.fib;
-        target->cancel_requested = 1;
-        /* Issue #679: if the target is parked on a reactor waiter
-         * list (e.g. NetTcp.accept blocked on the listener fd, recv
-         * blocked on read-ready, timer waiting for a deadline), the
-         * flag alone is not enough — the reactor would never wake
-         * the fiber until external activity arrived, and the cancel
-         * delivery point is the next op-call boundary, which the
-         * parked fiber never reaches. Detach the target from its
-         * waiter list and unpark it. On resume the syscall retry
-         * loop at the park site (or the next op-call lookup
-         * prologue) observes `cancel_requested` and unwinds via
-         * the Cancel discipline.
-         *
-         * Detach is a no-op when the target is already runnable /
-         * DONE / parked outside the reactor — the cancel flag still
-         * lands and is observed at the next op boundary the
-         * existing pre-#679 path. */
-        if (kai_reactor_detach_fiber(target)) {
-            kai_sched_unpark(target);
-        }
-        /* Delivery (inject Cancel.raise() at the target's next
-         * op-call boundary) lands in Phase 3 via the lookup-prologue
-         * hook in kai_evidence_lookup_node. The flag-only behaviour
-         * is the contract Spawn.cancel commits to; only the *visible
-         * effect* changes when Phase 3 lands. */
+        kai_fiber_request_cancel(fib_v->as.fib);
     }
     return kai_cont_resume(k, kai_unit());
 }
@@ -18446,8 +18464,8 @@ static void kai_nursery_join_child(KaiFiber *child) {
 }
 
 /* Cancel every not-yet-terminated child still on the scope list: set
- * the flag, and if the child is parked on the reactor, detach + unpark
- * so the cancel is delivered at its next op boundary. Idempotent, so
+ * the flag and wake a parked child, so the cancel is delivered at its
+ * next op boundary. Idempotent, so
  * the eager walk and the scope_exit walk may both visit a sibling.
  * `skip` excludes the failing child itself, which is mid-trampoline
  * and must not be flagged as a requested cancellation. */
@@ -18457,10 +18475,7 @@ static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
             || c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
             continue;
         }
-        c->cancel_requested = 1;
-        if (kai_reactor_detach_fiber(c)) {
-            kai_sched_unpark(c);
-        }
+        kai_fiber_request_cancel(c);
     }
 }
 
@@ -19931,9 +19946,7 @@ static int kai_cancel_dispatch_user_handler(void) {
  * proceeds normally; a later `Cancel.raise()` still reaches the default
  * handler. */
 static __attribute__((noinline)) void kai_cancel_deliver(KaiFiber *f) {
-    if (!(f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set)) {
-        return;
-    }
+    if (!kai_cancel_due(f)) return;
 
     /* Delivered marker is flipped *before* invoking the clause. The
      * clause body may call into ops that re-enter

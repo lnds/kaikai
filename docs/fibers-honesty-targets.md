@@ -353,6 +353,29 @@ through its mailbox. That is deliberate — OTP-style layered supervision
 would not compose otherwise — and is specified in `docs/actors.md`
 §*Trap-exit semantics* (issue #103).
 
+### 5. Cancel reaches a fiber parked on its mailbox (shipped)
+
+A fiber parked in `Actor.receive()` on an empty mailbox is woken by a
+cancel, the way a fiber parked on the reactor is. No message may ever
+arrive, so the flag alone would leave it parked and the program would
+end as a deadlock. The parked fiber marks itself as waiting on a
+mailbox; the canceller reads the mark after setting the flag and
+unparks it; the fiber takes itself off the mailbox's waiter chain and
+unwinds, running each `finally` and `with Cancel` on the way. All three
+requests go through it: `Spawn.cancel`, a nursery's cancel-on-fail
+walk, and the loser cancel of `Spawn.select`.
+
+Measured identically on both backends at `KAI_THREADS=1` and above.
+Coverage: `examples/effects/cancel_wakes_mailbox_receive.kai`.
+
+Two parks are still not woken by a cancel; the flag is observed when
+the park ends on its own:
+
+- a sender parked on a full `BlockSender` mailbox, which resumes when
+  the receiver frees a slot or its mailbox closes;
+- a fiber parked in `Spawn.await` or in a nursery join, which resumes
+  when the fiber it waits for terminates.
+
 ## Sequencing recommendation
 
 Right after m4c body subst (`r4-m4c-body-subst` lane in flight as
