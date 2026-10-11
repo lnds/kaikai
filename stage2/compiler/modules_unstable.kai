@@ -1,0 +1,231 @@
+#[doc("""
+Uses of an `#[unstable]` export, reported as warnings.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.diag_file
+import compiler.module_table
+import compiler.written
+import compiler.modules_paths
+
+# Walk every Decl body's EModCall sites and emit a
+# diagnostic for any call to a `#unstable` export from a package
+# the consumer has not opted into. Pure post-pass — runs AFTER
+# `rqc_decls` has lifted `EField(EName(mod), fn)` into
+# `EModCall(mod, fname)` so we have a uniform shape to scan.
+#
+# Suppression rules:
+#   1. `mod == pkg` — the consumer is touching their own module;
+#      never warn on self-imports.
+#   2. `mod ∈ optins` — the consumer added `mod = true` under
+#      `[unstable]` in their kai.toml.
+#   3. The module is unknown to `mt` (corner case — should not
+#      happen by the time rqc runs, but be defensive). Skip.
+#   4. The fname is not in the module's `unstable_exports` list.
+#      The vast majority of imports.
+#
+# Otherwise emit a warning anchored at the call site, naming the
+# `<mod>.<fname>` pair and the opt-in instruction. The diagnostic
+# is non-fatal; downstream codegen proceeds as usual.
+pub fn unstable_check_decls(ds: [Decl], mt: [ModuleEntry],
+                          pkg: String, optins: [String], df: DiagFiles)
+                          : Unit / Console + File = match ds {
+  [] -> ()
+  [d, ...rest] -> {
+    unstable_check_decl(d, mt, pkg, optins, decl_diag_file(d, df))
+    unstable_check_decls(rest, mt, pkg, optins, df)
+  }
+}
+
+# The `DImpl` arm re-enters the walk for the methods, which already
+# resolved their file from the enclosing decl.
+fn unstable_check_sub_decls(ds: [Decl], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String)
+                          : Unit / Console + File = match ds {
+  [] -> ()
+  [d, ...rest] -> {
+    unstable_check_decl(d, mt, pkg, optins, file)
+    unstable_check_sub_decls(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_decl(d: Decl, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DTest(_, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DBench(_, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DCheck(_, _, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DImpl(_, _, _, subs, _, _, _, _) -> unstable_check_sub_decls(subs, mt, pkg, optins, file)
+  DDerive(_, inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DUnstable(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DProtoLaws(_, inner, _, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DImplAxiom(_, inner, _, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  DConstructor(inner, _, _) -> unstable_check_decl(inner, mt, pkg, optins, file)
+  _ -> ()
+}
+
+fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match e.kind {
+  EModCall(m, f) -> {
+    let mod = written_text(m)
+    let fname = written_text(f)
+    if mod == pkg { () }
+    else if list_has(optins, mod) { () }
+    else {
+      match mt_lookup(mt, mod) {
+        None -> ()
+        Some(me) ->
+          if me_export_is_unstable(me, fname) {
+            mods_diag_warning(file, e.line, e.col,
+              concat_all([mod, ".", fname,
+                          " is #[unstable] — API may change between versions without an edition bump. ",
+                          "Add '", mod, " = true' under [unstable] in kai.toml to acknowledge."]))
+          } else { () }
+      }
+    }
+  }
+  EField(b, _) -> unstable_check_expr(b, mt, pkg, optins, file)
+  EIntrinsic(_, args_) -> unstable_check_exprs(args_, mt, pkg, optins, file)
+  ESurface(sf) -> unstable_check_exprs(surface_children(sf), mt, pkg, optins, file)
+  ECall(callee, args_) -> {
+    unstable_check_expr(callee, mt, pkg, optins, file)
+    unstable_check_exprs(args_, mt, pkg, optins, file)
+  }
+  EIndex(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EBinop(_, a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EUnop(_, x) -> unstable_check_expr(x, mt, pkg, optins, file)
+  EIf(c, t_, eo) -> {
+    unstable_check_expr(c, mt, pkg, optins, file)
+    unstable_check_expr(t_, mt, pkg, optins, file)
+    unstable_check_expr_opt(eo, mt, pkg, optins, file)
+  }
+  ERecordLit(_, fs) -> unstable_check_fields_init(fs, mt, pkg, optins, file)
+  EList(els) -> unstable_check_list_elems(els, mt, pkg, optins, file)
+  ERange(a, b, opt_step) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(b, mt, pkg, optins, file)
+    unstable_check_expr_opt(opt_step, mt, pkg, optins, file)
+  }
+  EPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EMapPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EFlatMapPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  EFilterPipe(a, b) -> { unstable_check_expr(a, mt, pkg, optins, file); unstable_check_expr(b, mt, pkg, optins, file) }
+  ELitUnit(inner, _) -> unstable_check_expr(inner, mt, pkg, optins, file)
+  EBang(inner) -> unstable_check_expr(inner, mt, pkg, optins, file)
+  ELambda(_, body) -> unstable_check_expr(body, mt, pkg, optins, file)
+  EMatch(scrut, arms) -> {
+    unstable_check_expr(scrut, mt, pkg, optins, file)
+    unstable_check_arms(arms, mt, pkg, optins, file)
+  }
+  EHandle(body, _, _, init_opt, _, cs, ret_opt) -> {
+    unstable_check_expr(body, mt, pkg, optins, file)
+    unstable_check_expr_opt(init_opt, mt, pkg, optins, file)
+    unstable_check_hclauses(cs, mt, pkg, optins, file)
+    unstable_check_hreturn_opt(ret_opt, mt, pkg, optins, file)
+  }
+  EBlock(stmts, opt_final) -> {
+    unstable_check_stmts(stmts, mt, pkg, optins, file)
+    unstable_check_expr_opt(opt_final, mt, pkg, optins, file)
+  }
+  _ -> ()
+}
+
+fn unstable_check_exprs(es: [Expr], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String) : Unit / Console + File = match es {
+  [] -> ()
+  [x, ...rest] -> {
+    unstable_check_expr(x, mt, pkg, optins, file)
+    unstable_check_exprs(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_expr_opt(opt: Option[Expr], mt: [ModuleEntry], pkg: String,
+                             optins: [String], file: String) : Unit / Console + File = match opt {
+  None -> ()
+  Some(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+}
+
+fn unstable_check_fields_init(fs: [FieldInit], mt: [ModuleEntry], pkg: String,
+                                optins: [String], file: String) : Unit / Console + File = match fs {
+  [] -> ()
+  [f, ...rest] -> match f {
+    FI(_, e) -> {
+      unstable_check_expr(e, mt, pkg, optins, file)
+      unstable_check_fields_init(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_list_elems(els: [ListElem], mt: [ModuleEntry], pkg: String,
+                               optins: [String], file: String) : Unit / Console + File = match els {
+  [] -> ()
+  [el, ...rest] -> {
+    match el {
+      ElPlain(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+      ElSpread(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+    }
+    unstable_check_list_elems(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_arms(arms: [Arm], mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match arms {
+  [] -> ()
+  [a, ...rest] -> match a {
+    Arm(_, guard_opt, body) -> {
+      unstable_check_expr_opt(guard_opt, mt, pkg, optins, file)
+      unstable_check_expr(body, mt, pkg, optins, file)
+      unstable_check_arms(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_hclauses(cs: [HClause], mt: [ModuleEntry], pkg: String,
+                             optins: [String], file: String) : Unit / Console + File = match cs {
+  [] -> ()
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> {
+      unstable_check_expr(body, mt, pkg, optins, file)
+      unstable_check_hclauses(rest, mt, pkg, optins, file)
+    }
+  }
+}
+
+fn unstable_check_hreturn_opt(opt: Option[HReturn], mt: [ModuleEntry], pkg: String,
+                                optins: [String], file: String) : Unit / Console + File = match opt {
+  None -> ()
+  Some(r) -> match r {
+    HR(_, body, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_stmts(ss: [Stmt], mt: [ModuleEntry], pkg: String,
+                          optins: [String], file: String) : Unit / Console + File = match ss {
+  [] -> ()
+  [s, ...rest] -> {
+    unstable_check_stmt(s, mt, pkg, optins, file)
+    unstable_check_stmts(rest, mt, pkg, optins, file)
+  }
+}
+
+fn unstable_check_stmt(s: Stmt, mt: [ModuleEntry], pkg: String,
+                         optins: [String], file: String) : Unit / Console + File = match s {
+  SLet(_, _, e) -> unstable_check_expr(e, mt, pkg, optins, file)
+  SAssert(e, eo) -> {
+    unstable_check_expr(e, mt, pkg, optins, file)
+    unstable_check_expr_opt(eo, mt, pkg, optins, file)
+  }
+  SExprStmt(e) -> unstable_check_expr(e, mt, pkg, optins, file)
+  SIndexAssign(a, b, c, _, _) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(b, mt, pkg, optins, file)
+    unstable_check_expr(c, mt, pkg, optins, file)
+  }
+  SAssign(a, c, _, _) -> {
+    unstable_check_expr(a, mt, pkg, optins, file)
+    unstable_check_expr(c, mt, pkg, optins, file)
+  }
+  SVar(_, _, e, _, _) -> unstable_check_expr(e, mt, pkg, optins, file)
+  _ -> ()
+}
