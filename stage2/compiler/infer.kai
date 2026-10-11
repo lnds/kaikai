@@ -115,17 +115,6 @@ fn inf_collect_op_to_eff(decls: [Decl]) : [OpToEff] {
 }
 
 
-fn inf_eff_has_op(eff: SymId, op_name: String, op_to_eff: [OpToEff]) : Bool {
-  match op_to_eff {
-    [] -> false
-    [oe, ...rest] -> match oe {
-      OEFP(o, e) ->
-        if sym_same(e, eff) and written_text(o) == op_name { true }
-        else { inf_eff_has_op(eff, op_name, rest) }
-    }
-  }
-}
-
 # Alias-aware op-call resolution lives inside `try_op_call` rather than in
 # a standalone walker: a separate pre-pass blew the selfhost stack on the
 # compiler's own deep AST.
@@ -142,16 +131,6 @@ pub fn inf_emit_line(depth: Int, s: String) : Unit / Console = print("#{inf_inde
 # Substitute every alias name in `labels` with its expanded form.
 # Effect names pass through unchanged. Duplicates introduced by
 # expansion are removed by the caller.
-
-fn inf_find_eff_for_alias_op(components: [RowLabel], op_to_eff: [OpToEff], op_name: String) : Option[RowLabel] {
-  match components {
-    [] -> None
-    [c, ...rest] ->
-      if inf_eff_has_op(rl_sym(c), op_name, op_to_eff) { Some(c) }
-      else { inf_find_eff_for_alias_op(rest, op_to_eff, op_name) }
-  }
-}
-
 
 # Op-level coverage walker.
 #
@@ -185,73 +164,10 @@ fn inf_find_eff_for_alias_op(components: [RowLabel], op_to_eff: [OpToEff], op_na
 # level check still propagates labels through helper signatures and
 # bites where they bubble up.
 
-fn inf_finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] {
-  if st.lit_start < end {
-    let piece = string_slice(span, st.lit_start, end - st.lit_start)
-    [IpLit(piece, inf_raw_lit_for_c(piece)), ...st.parts]
-  } else {
-    st.parts
-  }
-}
-
-
 # Emit an LLVM global string constant and return both the textual
 # declaration and the total byte count (including null terminator),
 # so callers can size their `getelementptr` with the same N the
 # declaration uses.
-
-#[doc("infer: split an interpolation span into its literal and expression parts.")]
-pub fn inf_iscan_collect(span: String, end: Int, st: IScan) : [IPart] =
-  list_reverse(inf_iscan_collect_rev(span, end, st))
-
-
-fn inf_iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
-  if st.i >= end { inf_finish_iscan_rev(span, end, st) }
-  else {
-    match char_at(span, st.i) {
-      None -> inf_finish_iscan_rev(span, end, st)
-      Some(c) -> {
-        let nxt = match char_at(span, st.i + 1) { Some(c2) -> c2 None -> ' ' }
-        if c == '#' and nxt == '{' and st.i + 1 < end {
-          let with_lit =
-            if st.i > st.lit_start {
-              let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
-              [IpLit(piece, inf_raw_lit_for_c(piece)), ...st.parts]
-            } else { st.parts }
-          let expr_start = st.i + 2
-          let expr_end = inf_iscan_expr_end(span, expr_start, end, 1)
-          let expr_src = string_slice(span, expr_start, expr_end - expr_start)
-          let new_parts = [IpExp(expr_src), ...with_lit]
-          let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
-          inf_iscan_collect_rev(span, end, IScan { parts: new_parts, lit_start: next_i, i: next_i })
-        } else {
-          inf_iscan_collect_rev(span, end, IScan { parts: st.parts, lit_start: st.lit_start, i: st.i + 1 })
-        }
-      }
-    }
-  }
-}
-
-
-fn inf_iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
-  if depth == 0 or i >= end { i }
-  else {
-    match char_at(span, i) {
-      None -> i
-      Some(c) -> {
-        match c {
-          '{' -> inf_iscan_expr_end(span, i + 1, end, depth + 1)
-          '}' -> {
-            if depth == 1 { i }
-            else { inf_iscan_expr_end(span, i + 1, end, depth - 1) }
-          }
-          _ -> inf_iscan_expr_end(span, i + 1, end, depth)
-        }
-      }
-    }
-  }
-}
-
 
 #[doc("infer: join strings with a separator, the typer-side alias of `string_join`.")]
 pub fn inf_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
@@ -578,12 +494,6 @@ fn inf_proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 # `decl_home_hint_reset` algorithm `validate_pub_access` uses. The
 # result `proto_origins` table feeds `make_dispatcher_fn` so each
 # synthesised dispatcher inherits the originating module's tag.
-
-fn inf_raw_lit_for_c(piece: String) : String =
-  cat3("\"", escape_str_body_for_c(piece), "\"")
-
-# `st.parts` accumulates in REVERSE here for O(1) prepend; the public
-# inf_iscan_collect entry point reverses once at the end.
 
 # Each nominal head's module slot comes from `hv`, so an annotation
 # agrees with the constructor scheme and the record table on which
@@ -912,16 +822,6 @@ fn inf_ty_head_name(tab: SymTab, t: Ty) : Option[String] {
     # back to the diagnostic path.
     TyUnion(_)     -> None
   }
-}
-
-# The declaration at the head of a nominal type, through a unit or a
-# refinement; a scalar has none.
-fn inf_ty_head_sym(t: Ty) : Option[SymId] = match t {
-  TyCon(s, _)        -> Some(s)
-  TyListT(_)         -> Some(core_ty_sym(CtList))
-  TyDimT(base, _)    -> inf_ty_head_sym(base)
-  TyRefineT(base, _) -> inf_ty_head_sym(base)
-  _                  -> None
 }
 
 # Walks the registry's impl table for a (protocol-op, type-name)
@@ -4447,7 +4347,7 @@ fn subst_fresh_unit(s: Subst) : FreshUnit {
 #      shape and a canonical (sym, exponent) / (uvar, exponent) table.
 #   2. unit_canon — normal form: alphabetically-sorted symbols, grouped
 #      exponents, no factor-of-1 noise.
-#   3. unify_abelian — abelian-group unification (Stuckey/Kennedy): solve
+#   3. unify_dim — abelian-group unification (Stuckey/Kennedy): solve
 #      `u1 = u2` by reducing `u1 * u2^-1 = 1` to a substitution.
 #
 # Aliases (`unit Newton = kg * m / sec^2`) are expanded by the *resolver*
@@ -4974,23 +4874,6 @@ fn utable_varexps(t: UTable) : [VarExp] = uve_to_varexps(t.vars)
 fn uve_to_varexps(xs: [UVarEntry]) : [VarExp] = match xs {
   [] -> []
   [h, ...rest] -> match h { UVE(v, n) -> [VEx(v, n), ...uve_to_varexps(rest)] }
-}
-
-# Unify two unit expressions under `s`. The classic equational view:
-# `u1 ≡ u2` iff `u1 * u2^-1 ≡ 1`. We solve the homogeneous form by
-# repeatedly picking the unit-var with the smallest |exponent| and
-# isolating it. Polynomial in the size of the input — Kennedy 1996.
-#
-# Stop guard: this function only ever recurses through utable bookkeeping
-# and a single substitution + retry. If the lane ever needs to introduce
-# a real Smith-normal-form pass, that is a sign the design is being
-# pushed past the docs/units-of-measure.md "polynomial" promise — call
-# it out before extending.
-fn unify_abelian(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
-  let t1 = unit_to_table_resolved(u1, s)
-  let t2 = unit_to_table_resolved(u2, s)
-  let diff = utable_diff(t1, t2)
-  unify_abelian_diff(diff, s)
 }
 
 fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
@@ -5655,9 +5538,6 @@ fn ty_eq_shape_concrete(a: Ty, b: Ty) : Bool {
   }
 }
 
-fn partition_labels(a: [Label], b: [Label]) : LabelPartition =
-  partition_walk(a, b, [], [], subst_empty())
-
 fn partition_labels_sub(a: [Label], b: [Label], s: Subst) : LabelPartition =
   partition_walk(a, b, [], [], s)
 
@@ -5869,7 +5749,7 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     # also occurs inside the argument.
     TyShapeApp(sv, arg) -> v == sv or occurs(v, arg, s)
     # TyDimT carries a base Ty to recurse into; the unit side
-    # has its own occurs_unit guard inside unify_abelian.
+    # has its own occurs_unit guard inside unify_dim.
     TyDimT(base, _) -> occurs(v, base, s)
     # predicates carry value-level identifiers, not Ty
     # vars; only the base contributes to occurs.
@@ -6365,66 +6245,6 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
 # The record a use names: the one `decl` declares.
 fn rec_pick(rs: [RecInfo], decl: SymId) : Option[RecInfo] = rec_find(rs, decl)
 
-# Hanga Roa: reorder a `[RecInfo]` so the records visible to a decl
-# from module `home_mod` resolve correctly under `rec_find`.
-#
-# Semantics: library code from module M sees its own records first,
-# then records from OTHER library modules, but NEVER records from
-# the consumer's root file. Root code sees everything in its
-# natural newest-first order (its own redecls win for the root's
-# own scope). `root_mod` is the basename of the root file, used
-# to identify and drop root-tagged records when home != root.
-fn rerank_recs_for(rs: [RecInfo], home_mod: Option[String], root_mod: String) : [RecInfo] = {
-  let is_root_home = match home_mod {
-    None     -> true
-    Some(hm) -> hm == root_mod
-  }
-  if is_root_home {
-    rs
-  } else {
-    rerank_recs_loop(rs, home_mod, root_mod, [], [], [])
-  }
-}
-
-fn rerank_recs_loop(rs: [RecInfo], hm: Option[String], root_mod: String,
-                       home: [RecInfo], other_mods: [RecInfo],
-                       root: [RecInfo]) : [RecInfo] =
-  match rs {
-    [] -> list_append(list_reverse(home),
-            list_append(list_reverse(other_mods), list_reverse(root)))
-    [r, ...rs2] -> match r {
-      RI(_, _, _, mo) -> {
-        let is_root_rec = match mo {
-          None     -> false
-          Some(rm) -> rm == root_mod
-        }
-        if is_root_rec {
-          # Drop: library code never sees consumer-root records.
-          rerank_recs_loop(rs2, hm, root_mod, home, other_mods, root)
-        } else if option_str_eq(mo, hm) {
-          rerank_recs_loop(rs2, hm, root_mod, [r, ...home], other_mods, root)
-        } else { match mo {
-          None    -> rerank_recs_loop(rs2, hm, root_mod, home, other_mods, [r, ...root])
-          Some(_) -> rerank_recs_loop(rs2, hm, root_mod, home, [r, ...other_mods], root)
-        } }
-      }
-    }
-  }
-
-fn option_str_eq(a: Option[String], b: Option[String]) : Bool = match a {
-  None    -> match b { None -> true Some(_) -> false }
-  Some(x) -> match b { None -> false Some(y) -> x == y }
-}
-
-fn field_init_list_has(fs: [FieldInit], target: String) : Bool {
-  match fs {
-    [] -> false
-    [f, ...rest] -> match f {
-      FI(nm, _) -> if nm == target { true } else { field_init_list_has(rest, target) }
-    }
-  }
-}
-
 #[derive(BinSerialize)]
 pub type SumInfo = SI(SymId, [TBinder], [Variant], Option[String])
               # declaration, tparams, variants, module_origin (None = root file)
@@ -6440,44 +6260,6 @@ fn sum_find_loop(ss: [SumInfo], target: Int) : Option[SumInfo] {
 
 fn sum_find(ss: [SumInfo], s: SymId) : Option[SumInfo] =
   if sym_raw(s) < 0 { None } else { sum_find_loop(ss, sym_raw(s)) }
-
-# SumInfo analog of `rerank_recs_for`. Same semantics: library
-# code never sees the consumer's root sums.
-fn rerank_sums_for(ss: [SumInfo], home_mod: Option[String], root_mod: String) : [SumInfo] = {
-  let is_root_home = match home_mod {
-    None     -> true
-    Some(hm) -> hm == root_mod
-  }
-  if is_root_home {
-    ss
-  } else {
-    rerank_sums_loop(ss, home_mod, root_mod, [], [], [])
-  }
-}
-
-fn rerank_sums_loop(ss: [SumInfo], hm: Option[String], root_mod: String,
-                       home: [SumInfo], other_mods: [SumInfo],
-                       root: [SumInfo]) : [SumInfo] =
-  match ss {
-    [] -> list_append(list_reverse(home),
-            list_append(list_reverse(other_mods), list_reverse(root)))
-    [s, ...ss2] -> match s {
-      SI(_, _, _, mo) -> {
-        let is_root_sum = match mo {
-          None     -> false
-          Some(rm) -> rm == root_mod
-        }
-        if is_root_sum {
-          rerank_sums_loop(ss2, hm, root_mod, home, other_mods, root)
-        } else if option_str_eq(mo, hm) {
-          rerank_sums_loop(ss2, hm, root_mod, [s, ...home], other_mods, root)
-        } else { match mo {
-          None    -> rerank_sums_loop(ss2, hm, root_mod, home, other_mods, [s, ...root])
-          Some(_) -> rerank_sums_loop(ss2, hm, root_mod, home, [s, ...other_mods], root)
-        } }
-      }
-    }
-  }
 
 fn collect_sums_loop(ds: [Decl], acc: [SumInfo]) : [SumInfo] {
   match ds {
@@ -6747,13 +6529,6 @@ type InferredStmts = { st: InferState, stmts: [Stmt] }
 type InferredArms  = { st: InferState, arms: [Arm] }
 type InferredElems = { st: InferState, elems: [ListElem] }
 type InferredFInits = { st: InferState, fis: [FieldInit] }
-
-fn infer_state_new(file: String, env: TyEnv, core_len: Int, recs: [RecInfo]) : InferState =
-  infer_state_new_full(file, env, core_len, recs, [])
-
-fn infer_state_new_full(file: String, env: TyEnv, core_len: Int,
-                        recs: [RecInfo], op_eff_arities: [OpEffArity]) : InferState =
-  infer_state_new_full_aliases(file, env, core_len, recs, op_eff_arities, [], [], [])
 
 # variant carrying type aliases + op-to-eff catalog
 # so `try_op_call` can resolve `Aliasname.opname` against alias
@@ -7856,13 +7631,6 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
   }
 }
 
-# Re-walk from `st` after a discarded probe. The substitution's slot
-# arrays are mutated in place, so the probe's bindings outlive its state:
-# keep its fresh counter and substitution or the re-walk re-mints ids
-# the probe already bound.
-fn st_past_probe(st: InferState, probe: InferState) : InferState =
-  st_set_sub(st_set_env(st, advance_fresh(st.env, probe.env.fresh - st.env.fresh)), probe.sub)
-
 # Lexically scope a sub-walk: entries added during `inner` are dropped,
 # but the fresh counter, substitution, record registry, and error
 # counter propagate back to the caller.
@@ -7903,9 +7671,6 @@ fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
     None     -> st_fresh_ty(st)
   }
 }
-
-fn param_ty_or_fresh_with_rvbinds(st: InferState, pm: Param, rbinds: [RVBind]) : TyRes =
-  param_ty_or_fresh_with_binds(st, pm, [], rbinds)
 
 # variant that also resolves type names against the fn-level
 # tparams declared on the surrounding decl.
@@ -7959,10 +7724,6 @@ fn add_infer_params_with_binds_loop(st: InferState, ps: [Param],
 fn add_infer_params_with_binds(st: InferState, ps: [Param],
                                tpbinds: [TPBind], rbinds: [RVBind]) : InferredParams =
   add_infer_params_with_binds_loop(st, ps, tpbinds, rbinds, [])
-
-fn add_infer_params_with_rvbinds(st: InferState, ps: [Param],
-                                 rbinds: [RVBind]) : InferredParams =
-  add_infer_params_with_binds(st, ps, [], rbinds)
 
 # ---- record instantiation ----
 
@@ -11172,35 +10933,6 @@ fn resolve_fresh_ids(ids: [Int], sub: Subst) : [Ty] {
   }
 }
 
-# Extract `Eff` from `Eff.op`.
-#[doc("infer: `dotted_prefix` — typer entry point invoked by the driver.")]
-pub fn dotted_prefix(s: String) : String =
-  dotted_prefix_loop(s, 0, string_length(s))
-
-fn dotted_prefix_loop(s: String, i: Int, n: Int) : String {
-  if i >= n { s }
-  else if string_byte_at_int(s, i) == char_to_int('.') { string_slice(s, 0, i) }
-  else { dotted_prefix_loop(s, i + 1, n) }
-}
-
-# pair to dotted_prefix. Extract `op` from `Eff.op`.
-#[doc("infer: `dotted_suffix` — typer entry point invoked by the driver.")]
-pub fn dotted_suffix(s: String) : String =
-  dotted_suffix_loop(s, 0, string_length(s))
-
-fn dotted_suffix_loop(s: String, i: Int, n: Int) : String {
-  if i >= n { s }
-  else if string_byte_at_int(s, i) == char_to_int('.') { string_slice(s, i + 1, n) }
-  else { dotted_suffix_loop(s, i + 1, n) }
-}
-
-#[doc("infer: `string_contains_dot` — typer entry point invoked by the driver.")]
-pub fn string_contains_dot(s: String) : Bool =
-  string_contains_dot_loop(s, 0, string_length(s))
-
-fn string_contains_dot_loop(s: String, i: Int, n: Int) : Bool =
-  i < n and (string_byte_at_int(s, i) == char_to_int('.') or string_contains_dot_loop(s, i + 1, n))
-
 # render a Real value as a C/LLVM floating-point
 # literal. `real_to_string(9.0)` gives `"9"` (no trailing `.0`
 # when the value is integer-valued); emitting that bare into C
@@ -11226,18 +10958,6 @@ fn real_lit_is_float_typed(s: String, i: Int, n: Int) : Bool {
       None -> false
     }
   }
-}
-
-# The byte index of the first `@` in `s`, or -1 when it has none.
-#[doc("infer: `string_index_of_at` — typer entry point invoked by the driver.")]
-pub fn string_index_of_at(s: String) : Int = string_index_of_at_loop(s, 0, string_length(s))
-
-fn string_index_of_at_loop(s: String, i: Int, n: Int) : Int {
-  if i >= n { -1 }
-  else { match char_at(s, i) {
-    Some(c) -> if c == '@' { i } else { string_index_of_at_loop(s, i + 1, n) }
-    None    -> -1
-  } }
 }
 
 # The callee of a settled perform: the effect, the operation, and the
@@ -12456,13 +12176,6 @@ fn join_tails(st: InferState, tail: Int, us: [TailUse], line: Int, col: Int) : I
     join_tails(st1, tail, rest, line, col)
   }
 }
-
-# build a closed Row from a labels list, dropping any
-# duplicates that survived the body-row accumulator. Used by
-# `synth_lambda` to attach the body's effect set to the lambda
-# type itself.
-fn labels_to_closed_row(labels: [Label]) : Row =
-  Row { labels: labels, tail: None, display_alias: None }
 
 fn synth_list_expr(st: InferState, els: [ListElem], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
@@ -17740,14 +17453,9 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
         [] -> body
         us -> map_units_expr(body, (u) => unit_named(u, us))
       }
-      # Hanga Roa modular typecheck: the per-module fold in
-      # `typecheck_program_loop` already feeds this decl's typer
-      # only the records / sums its bucket inherits from
-      # upstream modules. The legacy `rerank_recs_for` /
-      # `rerank_sums_for` parches (which dropped consumer-root
-      # records when typing core bodies) are no longer load-
-      # bearing: a core module's recs simply never see the
-      # target's recs in the same `RecInfo[]`.
+      # The per-module fold in `typecheck_program_loop` feeds this
+      # decl's typer only the records / sums its bucket inherits from
+      # upstream modules.
       let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
                                                     op_eff_arities, type_aliases, op_to_eff,
                                                     kind_theories)
@@ -17767,7 +17475,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let phantom_extra = if elaborate_phantom_row(row, entry) { 1 } else { 0 }
       let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: rbinds }, list_length(rbinds) + phantom_extra)
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
-      # infer_state_new starts env.fresh at 0 too. Without bumping the
+      # the fresh state starts env.fresh at 0 too. Without bumping the
       # counter past the tparam ids, the first fresh ty-var minted in
       # the body (e.g., the result of synth_op_call_with_scheme inside
       # `pub fn spawn.spawn[T, e](...) = Spawn.spawn(f)`) aliases `T`,
@@ -19559,8 +19267,7 @@ pub fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
 #
 # The partition is structural — once it runs, the typer can no
 # longer see a core module's records leaking into the target
-# (or vice versa). The legacy `rerank_recs_for` patch is no longer
-# load-bearing once every call site goes through this partition.
+# (or vice versa).
 #[doc("infer: partition a post-cascade flat decl stream into per-module sub-streams, attributing each decl to its declaring module.")]
 pub fn partition_decls_by_home(decls: [Decl], target_mod: String) : [ModuleDecls] =
   target_bucket_last(partition_by_homes_loop(decls, target_mod, []), target_mod)
@@ -19672,36 +19379,6 @@ fn decl_has_origin_slot(d: Decl) : Bool = match d {
   DImplAxiom(_, inner, _, _, _)        -> decl_has_origin_slot(inner)
   DConstructor(inner, _, _)            -> decl_has_origin_slot(inner)
   _ -> true
-}
-
-fn opt_str_is_some(o: Option[String]) : Bool = match o {
-  None -> false
-  Some(_) -> true
-}
-
-# Decide a decl's home module from its own `module_origin` field,
-# falling back to `target_mod` when the field is absent. The
-# DAttribPure / DDerive / DUnstable wrappers delegate to the inner
-# decl; DImpl peeks at its first method (the post-`lower_protocols`
-# stream never contains DImpl, but we cover it defensively).
-fn partition_home_for(d: Decl, target_mod: String) : String = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo) -> home_or_target(mo, target_mod)
-  DType(_, _, _, _, _, _, mo, _)     -> home_or_target(mo, target_mod)
-  DDerive(_, inner, _, _)         -> partition_home_for(inner, target_mod)
-  DUnstable(inner, _, _)          -> partition_home_for(inner, target_mod)
-  DProtoLaws(_, inner, _, _, _)      -> partition_home_for(inner, target_mod)
-  DImplAxiom(_, inner, _, _, _)      -> partition_home_for(inner, target_mod)
-  DConstructor(inner, _, _)       -> partition_home_for(inner, target_mod)
-  DImpl(_, _, _, sub, _, _, _, _)       -> match sub {
-    [] -> target_mod
-    [m, ..._] -> partition_home_for(m, target_mod)
-  }
-  _ -> target_mod
-}
-
-fn home_or_target(mo: Option[String], target_mod: String) : String = match mo {
-  Some(m) -> m
-  None    -> target_mod
 }
 
 # A bucket under construction. BOTH axes are held reversed —

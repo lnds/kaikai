@@ -1,7 +1,6 @@
 #[doc("""
 The mode a node is given: unboxed when its type is a raw scalar and
-every operand it composes is raw. Also the post-pass that widens a call
-of a function taking raw parameters.
+every operand it composes is raw.
 """)]
 
 import compiler.ast
@@ -38,68 +37,6 @@ pub fn ufn_param_env(params: [Param], mask: [Bool], acc: [LocBind]) : [LocBind] 
   }
 }
 
-# Phase 3 unboxing: post-walk that flips the mode of every ECall
-# whose callee resolves to a UFn (Some(US(...)) in the EFn table)
-# and whose own `ty` is unboxable. The unbox_pass's main walk
-# already left every node with a defensible mode; this second
-# pass only widens MBoxed→MUnboxed at unbox-aware call sites.
-#
-# The promotion is *aware* but conservative:
-#   - Only a callee naming a declaration is considered;
-#     `kai_apply` indirect calls keep boxed conventions.
-#   - The result ty must be unboxable; otherwise the called fn's
-#     return is materially boxed (e.g. String).
-#   - The args themselves can stay any mode — `emit_kind_raw`'s
-#     ECall arm will call `emit_expr_raw` on each arg, which falls
-#     back to the boxed-then-unbox boundary tactic when the child
-#     is MBoxed (matches the existing M3 / M4 handling).
-fn ufn_promote_calls(e: Expr, fns: FnIndex) : Expr {
-  let kind1 = ufn_promote_calls_kind(e.kind, fns)
-  # Phase 3 — promote ECall to MUnboxed when callee resolves UFn
-  # and result type is unboxable. Promote EIf to MUnboxed when
-  # both arms are already MUnboxed (post-promotion) and the cond
-  # is raw — this lets the emit_kind_raw EIf branch lower to a C
-  # ternary rather than the box-and-unwrap fallback. EBlock is
-  # promoted similarly when its tail is MUnboxed and there are no
-  # interleaved boxed-side-effect statements (conservative: only
-  # when stmts is empty, i.e. pure tail expression — covers the
-  # post-perceus shape for raw-only bodies).
-  let mode1 = match kind1 {
-    ECall(callee, _) -> {
-      if (call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee, fns)) and ty_is_unboxable(e.ty) { MUnboxed }
-      else { e.mode }
-    }
-    EIf(cnd, ath, Some(eth)) -> {
-      if ty_is_unboxable(e.ty) and child_is_raw(cnd) and child_is_raw(ath) and child_is_raw(eth) {
-        MUnboxed
-      } else { e.mode }
-    }
-    EBlock(stmts, Some(tail)) -> {
-      match stmts {
-        [] -> if ty_is_unboxable(e.ty) and child_is_raw(tail) { MUnboxed } else { e.mode }
-        # issue #779 — mirror the main-walk `decide_mode_aware` rule: a
-        # multi-statement block with a raw tail and RC-only statements
-        # forwards the raw tail. (This post-pass is currently unwired,
-        # but kept consistent so a future re-wire behaves identically.)
-        _ -> if ty_is_unboxable(e.ty) and child_is_raw(tail) and block_stmts_rc_safe(stmts) { MUnboxed }
-             else { e.mode }
-      }
-    }
-    # Promote a `match` whose result is unboxable and whose every arm
-    # body is already raw (post-promotion, bottom-up). The scrutinee is
-    # an ORTHOGONAL axis — it may stay boxed (a variant) while the
-    # result is raw; only the arm bodies decide result-rawness. The
-    # emitter's `emit_match_raw` then lowers each arm without a
-    # `kai_int(...)` box. Exhaustivity (a raw `_r` cannot be left
-    # uninitialised) is the emitter's gate; here we only mark.
-    EMatch(_, arms) -> {
-      if ty_is_unboxable(e.ty) and arms_all_raw(arms) { MUnboxed } else { e.mode }
-    }
-    _ -> e.mode
-  }
-  Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1,  site: e.site }
-}
-
 # True iff every arm body is raw (MUnboxed) OR divergent. A divergent
 # arm (a `panic` / `exit` call — typically the `_ -> panic(...)`
 # catch-all the native backend's KIR-node matches use) never produces a
@@ -112,98 +49,6 @@ fn arms_all_raw(arms: [Arm]) : Bool = match arms {
   [a, ...rest] -> match a { Arm(_, _, body) ->
     if child_is_raw(body) or arm_body_diverges(body) { arms_all_raw(rest) } else { false } }
 }
-
-fn ufn_promote_calls_kind(k: ExprKind, fns: FnIndex) : ExprKind {
-  match k {
-    ECall(callee, args_) -> ECall(ufn_promote_calls(callee, fns),
-                                   map(args_, (a) => ufn_promote_calls(a, fns)))
-    EField(base, name)   -> EField(ufn_promote_calls(base, fns), name)
-    EIndex(a, b)         -> EIndex(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EBinop(op, a, b)     -> EBinop(op, ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EUnop(op, x)         -> EUnop(op, ufn_promote_calls(x, fns))
-    EIf(c, t_, eo)       -> EIf(ufn_promote_calls(c, fns), ufn_promote_calls(t_, fns),
-                                 ufn_promote_calls_opt(eo, fns))
-    EMatch(scr, arms)    -> EMatch(ufn_promote_calls(scr, fns),
-                                    map(arms, (a) => ufn_promote_calls_arm(a, fns)))
-    ELambda(ps, b)       -> ELambda(ps, ufn_promote_calls(b, fns))
-    ERecordLit(rh, fs)   -> ERecordLit(rh, map(fs, (fi) => ufn_promote_calls_field(fi, fns)))
-    EList(els)           -> EList(map(els, (el) => ufn_promote_calls_elem(el, fns)))
-    ERange(a, b, opt_step) -> ERange(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns),
-                                       ufn_promote_calls_opt(opt_step, fns))
-    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => ufn_promote_calls_stmt(s, fns)),
-                                    ufn_promote_calls_opt(tail, fns))
-    EPipe(a, b)          -> EPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EMapPipe(a, b)       -> EMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EFilterPipe(a, b)    -> EFilterPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(ufn_promote_calls(body, fns), eff, eff_tyargs,
-              ufn_promote_calls_opt(init_opt, fns), alias_opt,
-              map(clauses, (c) => ufn_promote_calls_clause(c, fns)),
-              ufn_promote_calls_opt_return(ret_opt, fns))
-    ELitUnit(inner, u)   -> ELitUnit(ufn_promote_calls(inner, fns), u)
-    EBang(inner)         -> EBang(ufn_promote_calls(inner, fns))
-    _ -> k
-  }
-}
-
-fn ufn_promote_calls_opt(opt: Option[Expr], fns: FnIndex) : Option[Expr] {
-  match opt {
-    Some(e) -> Some(ufn_promote_calls(e, fns))
-    None    -> None
-  }
-}
-
-fn ufn_promote_calls_arm(a: Arm, fns: FnIndex) : Arm {
-  match a {
-    Arm(p, g, b) -> Arm(p, ufn_promote_calls_opt(g, fns), ufn_promote_calls(b, fns))
-  }
-}
-
-fn ufn_promote_calls_field(fi: FieldInit, fns: FnIndex) : FieldInit {
-  match fi {
-    FI(n, v) -> FI(n, ufn_promote_calls(v, fns))
-  }
-}
-
-fn ufn_promote_calls_elem(el: ListElem, fns: FnIndex) : ListElem {
-  match el {
-    ElPlain(x)  -> ElPlain(ufn_promote_calls(x, fns))
-    ElSpread(x) -> ElSpread(ufn_promote_calls(x, fns))
-  }
-}
-
-fn ufn_promote_calls_stmt(s: Stmt, fns: FnIndex) : Stmt {
-  match s {
-    SLet(p, ann, rhs) -> SLet(p, ann, ufn_promote_calls(rhs, fns))
-    SVar(n, ty, rhs, l, c) -> SVar(n, ty, ufn_promote_calls(rhs, fns), l, c)
-    SAssert(cond, m) -> SAssert(ufn_promote_calls(cond, fns), ufn_promote_calls_opt(m, fns))
-    SExprStmt(x) -> SExprStmt(ufn_promote_calls(x, fns))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(ufn_promote_calls(b, fns), ufn_promote_calls(i, fns),
-                    ufn_promote_calls(v, fns), l, c)
-    SAssign(b, v, l, c) ->
-      SAssign(ufn_promote_calls(b, fns), ufn_promote_calls(v, fns), l, c)
-    SUse(n, l, c) -> SUse(n, l, c)
-  }
-}
-
-fn ufn_promote_calls_clause(c: HClause, fns: FnIndex) : HClause {
-  match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, ufn_promote_calls(b, fns), l, co)
-  }
-}
-
-fn ufn_promote_calls_opt_return(opt: Option[HReturn], fns: FnIndex) : Option[HReturn] {
-  match opt {
-    Some(r) -> match r {
-      HR(p, b, l, c) -> Some(HR(p, ufn_promote_calls(b, fns), l, c))
-    }
-    None -> None
-  }
-}
-
-fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode = decide_mode_aware(k, opt_ty, env, fnx_empty())
 
 #[doc("The mode of a node of kind `k` and type `opt_ty`, given the modes of the binders in scope.")]
 pub fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnIndex) : ValueMode {

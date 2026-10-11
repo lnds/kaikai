@@ -147,7 +147,7 @@ matter, not part of this surface.
 
 - `docs/perceus-honesty-targets.md` — RC discipline tiers this extends.
 - `stage2/compiler/perceus.kai` — `pcs_build_borrow_views`,
-  `pcs_strip_borrow_args`, the conservative `pcs_borrow_params` rule.
+  `pcs_strip_borrow_args`.
 - `stage2/compiler/borrow_view.kai` — `BorrowEntry` and the per-module views.
 - Koka source: `src/Core/Borrowed.hs`, `src/Backend/C/Parc.hs`
   (`parcBorrowApp`), `lib/std/core/vector.kk` / `list.kk` (`^` usage).
