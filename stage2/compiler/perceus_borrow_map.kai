@@ -1,0 +1,87 @@
+#[doc("""
+Which parameters a function borrows, inferred from the bodies or read
+back from what Perceus stamped.
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.borrow_infer
+import compiler.borrow_view
+import compiler.borrow_map
+import compiler.perceus_reads
+import compiler.self_call
+import compiler.symtab
+import compiler.perceus_arm_tails
+
+#[doc("Interprocedural borrow map inferred from the bodies, keyed by function identity.")]
+pub fn pcs_build_borrow_map(decls: [Decl], seed: [BorrowEntry], tab: SymTab) : BorrowMap =
+  bv_build(pcs_borrow_decls(decls, tab, []), seed)
+
+#[doc("The borrow map Perceus planned, read from the `pborrow` it stamped on post-Perceus decls.")]
+pub fn pcs_planned_borrow_map(decls: [Decl]) : BorrowMap =
+  bv_build(pcs_planned_decls(decls, []), [])
+
+fn pcs_borrow_decls(decls: [Decl], tab: SymTab, acc: [BorrowDecl]) : [BorrowDecl] = match decls {
+  []           -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(is_pub, fsym, _, params, _, _, body, _, _, _) ->
+      pcs_borrow_decls(rest, tab, [BD(fsym, pcs_borrowed_positions(is_pub, SelfRef(fsym), params, body, tab)), ...acc])
+    _ -> pcs_borrow_decls(rest, tab, acc)
+  }
+}
+
+fn pcs_planned_decls(decls: [Decl], acc: [BorrowDecl]) : [BorrowDecl] = match decls {
+  []           -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, fsym, _, params, _, _, _, _, _, _) -> {
+      let pos = pcs_borrow_positions(map(params, (p) => p.binder), pcs_explicit_borrow_names(params), 0)
+      pcs_planned_decls(rest, [BD(fsym, pos), ...acc])
+    }
+    _ -> pcs_planned_decls(rest, acc)
+  }
+}
+
+# An extern shim's marker body references no param, which the inspection
+# walk would read as "borrowed"; the shim consumes every input.
+fn pcs_borrowed_positions(is_pub: Bool, me: SelfRef, params: [Param], body: Expr, tab: SymTab) : [Int] =
+  if body_is_extern(body) { [] }
+  else {
+    let pnames = map(params, (p) => p.binder)
+    pcs_borrow_positions(pnames, pcs_borrow_params_hybrid(is_pub, me, params, pnames, body, tab), 0)
+  }
+
+# Hybrid borrow decision (issue #1127). A `pub` function's borrow-ness is
+# ABI: only the parameters explicitly marked `^` are borrowed, never
+# inferred — no silent public-boundary flip. A non-`pub` function borrows
+# the union of its explicit `^` marks and the relaxed inference
+# (borrow_infer_params), the whole-bundle view making inference safe.
+#
+# CLOSURE params now participate in the EFFECTIVE (codegen) borrow set
+# (issue #1130): a `f(args)` through a borrowed function-typed param routes
+# to `kai_apply_borrow` / `kaix_apply_borrow`, which invoke without
+# consuming the closure, so borrowing a called closure is sound (the caller
+# keeps the ref and drops after last use, per rule 1). Before #1130 the
+# runtime call variant did not exist, so `pcs_closure_param_names` was
+# subtracted here to keep the closure owned — that subtraction is gone.
+pub fn pcs_borrow_params_hybrid(is_pub: Bool, me: SelfRef, params: [Param],
+                            pnames: [Binder], body: Expr, tab: SymTab) : [Binder] = {
+  let explicit = pcs_explicit_borrow_names(params)
+  if is_pub { explicit }
+  else { pcs_list_union(explicit, borrow_infer_params(tab, me, pnames, body)) }
+}
+
+#[doc("The params marked borrowed: by `^`, or by Perceus once it has run.")]
+pub fn pcs_explicit_borrow_names(params: [Param]) : [Binder] = match params {
+  []           -> []
+  [p, ...rest] ->
+    if p.pborrow { [p.binder, ...pcs_explicit_borrow_names(rest)] }
+    else { pcs_explicit_borrow_names(rest) }
+}
+
+#[doc("The positions, counted from `i`, of the parameters that are in `bset`.")]
+pub fn pcs_borrow_positions(pnames: [Binder], bset: [Binder], i: Int) : [Int] = match pnames {
+  []           -> []
+  [p, ...rest] ->
+    if pcs_has(bset, p.id) { [i, ...pcs_borrow_positions(rest, bset, i + 1)] }
+    else { pcs_borrow_positions(rest, bset, i + 1) }
+}

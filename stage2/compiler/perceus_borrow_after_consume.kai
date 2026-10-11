@@ -1,0 +1,109 @@
+#[doc("""
+A borrowed-slot read of a binder after a read that consumed it on the
+same path: the case that keeps the dup.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.consume_index
+import compiler.borrow_map
+import compiler.perceus_arg_reads
+import compiler.symtab
+import compiler.perceus_borrow_strip
+import compiler.perceus_max_paths
+import compiler.perceus_linear
+
+# Borrow-aware variant: the max-path count discounts uses of a binder that
+# land in a borrowed callee slot (is_red(l) does not consume l). This is
+# what lets the rb-tree Black arm's l/r pass `mp <= 1` — without it, the
+# is_red(l) + insert_loop(l) uses sum to 2 on the descent path. `bmap` is
+# the global borrow map; pass [] for the borrow-unaware behaviour.
+pub fn pcs_branch_aware_skip_locals_b(binders: [Binder], body: Expr, bmap: BorrowMap, cmap: ConsumeIndex, borrowed: [Binder], tab: SymTab) : [Binder] = match binders {
+  []           -> []
+  [h, ...rest] -> {
+    let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap, cmap, borrowed, tab)
+    if pcs_local_moves_raw(h, body, bmap, cmap, tab) { [h, ...rest_skip] } else { rest_skip }
+  }
+}
+
+# Every arg-slot use of h lands in a consuming slot or a declared borrow
+# that runs before the consuming read. Any other non-consuming slot
+# (a field-read callee) would free h under the callee. Ctor slots, match
+# scrutinees and returns consume by construction. A borrow is no
+# consumer, so the consumed check must not count one either.
+fn pcs_local_moves_raw(h: Binder, body: Expr, bmap: BorrowMap, cmap: ConsumeIndex, tab: SymTab) : Bool =
+  pcs_max_paths_b_expr(h, body, bmap) <= 1 and
+  pcs_consumed_b_expr(h, body, bmap) and
+  pcs_all_consumers_linear(h, body) and
+  pcs_uses_only_consuming_slots(h, body, cmap, bmap, tab) and
+  not pcs_borrow_after_consume(h, body, bmap, tab)
+
+# A borrowed-slot read of `nm` after, on the same path, a read that consumed
+# it. Moving every read of `nm` would hand the borrow a value the consuming
+# callee may already have freed. A read stored into a constructor, list or
+# record stays pending until the call that receives it returns, or its
+# statement ends. Source order stands in for evaluation order, which only
+# errs toward keeping the dup.
+fn pcs_borrow_after_consume(nm: Binder, e: Expr, bmap: BorrowMap, tab: SymTab) : Bool =
+  pcs_bac(nm, e, bmap, pcs_bac_st(false, false, false), tab).bad
+
+# A violation seen; `nm` consumed by now; `nm` read into a value not yet consumed.
+type PcsBac = { bad: Bool, done: Bool, pending: Bool }
+
+fn pcs_bac_st(bad: Bool, done: Bool, pending: Bool) : PcsBac = PcsBac { bad: bad, done: done, pending: pending }
+
+fn pcs_bac(nm: Binder, e: Expr, bmap: BorrowMap, st: PcsBac, tab: SymTab) : PcsBac = match e.kind {
+  ELocal(u)       -> pcs_bac_st(st.bad, st.done, st.pending or local_eq(u, nm.id))
+  ECall(f, xs)    -> {
+    let a = pcs_bac_args(nm, xs, pcs_lent_slots(nm.id, f, xs, bmap), 0, bmap,
+                         pcs_bac_st(st.bad, st.done, false), tab)
+    if pcs_callee_is_ctor(tab, f) { pcs_bac_st(a.bad, a.done, st.pending or a.pending) }
+    else { pcs_bac_st(a.bad, a.done or a.pending, st.pending) }
+  }
+  EIf(c, t, oe)   -> {
+    let sc = pcs_bac(nm, c, bmap, st, tab)
+    pcs_bac_join(pcs_bac(nm, t, bmap, sc, tab), match oe { Some(x) -> pcs_bac(nm, x, bmap, sc, tab) None -> sc })
+  }
+  EMatch(s, arms) -> pcs_bac_arms(nm, arms, bmap, pcs_bac(nm, s, bmap, st, tab), pcs_bac_st(false, false, false), tab)
+  EBlock(ss, ot)  -> {
+    let s1 = pcs_bac_stmts(nm, ss, bmap, st, tab)
+    match ot { Some(t) -> pcs_bac(nm, t, bmap, s1, tab) None -> s1 }
+  }
+  _               -> pcs_bac_ps(nm, xp_positions(e), bmap, st, tab)
+}
+
+fn pcs_bac_join(a: PcsBac, b: PcsBac) : PcsBac =
+  pcs_bac_st(a.bad or b.bad, a.done or b.done, a.pending or b.pending)
+
+fn pcs_bac_ps(nm: Binder, ps: [XPos], bmap: BorrowMap, st: PcsBac, tab: SymTab) : PcsBac = match ps {
+  []                  -> st
+  [XP(r, c), ...rest] ->
+    pcs_bac_ps(nm, rest, bmap, if xrole_inline(r) { pcs_bac(nm, c, bmap, st, tab) } else { st }, tab)
+}
+
+# A statement's value is gone when it ends: whatever it read is spent.
+fn pcs_bac_stmts(nm: Binder, ss: [Stmt], bmap: BorrowMap, st: PcsBac, tab: SymTab) : PcsBac = match ss {
+  [] -> st
+  [s, ...rest] -> {
+    let a = pcs_bac_ps(nm, map(stmt_exprs(s), (x) => XP(XAll, x)), bmap, st, tab)
+    pcs_bac_stmts(nm, rest, bmap, pcs_bac_st(a.bad, a.done or a.pending, false), tab)
+  }
+}
+
+fn pcs_bac_arms(nm: Binder, arms: [Arm], bmap: BorrowMap, st: PcsBac, acc: PcsBac, tab: SymTab) : PcsBac = match arms {
+  [] -> acc
+  [Arm(_, og, b), ...rest] -> {
+    let sg = match og { Some(g) -> pcs_bac(nm, g, bmap, st, tab) None -> st }
+    pcs_bac_arms(nm, rest, bmap, st, pcs_bac_join(acc, pcs_bac(nm, b, bmap, sg, tab)), tab)
+  }
+}
+
+fn pcs_bac_args(nm: Binder, xs: [Expr], borrowed: [Int], i: Int, bmap: BorrowMap, st: PcsBac, tab: SymTab) : PcsBac =
+  match xs {
+    [] -> st
+    [a, ...rest] -> {
+      let st1 = if pcs_is_bare(nm.id, a) and pcs_has_int(borrowed, i) { pcs_bac_st(st.bad or st.done, st.done, st.pending) }
+                else { pcs_bac(nm, a, bmap, st, tab) }
+      pcs_bac_args(nm, rest, borrowed, i + 1, bmap, st1, tab)
+    }
+  }

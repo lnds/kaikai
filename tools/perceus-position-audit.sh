@@ -19,17 +19,13 @@ set -u
 cd "$(dirname "$0")/.."
 
 BASELINE=tools/perceus-position-baseline.txt
-FILES="stage2/compiler/perceus.kai stage2/compiler/perceus_tail_drop.kai \
-stage2/compiler/perceus_plant_drop.kai stage2/compiler/perceus_owned_pos.kai \
-stage2/compiler/perceus_payer.kai \
-stage2/compiler/perceus_reads.kai stage2/compiler/perceus_branch_pay.kai \
-stage2/compiler/emit_tcrec_live.kai"
+FILES="$(echo stage2/compiler/perceus*.kai) stage2/compiler/emit_tcrec_live.kai"
 
 observed=$(mktemp)
 for f in $FILES; do
   [ -f "$f" ] || continue
   grep -n 'EMapPipe(\|EFlatMapPipe(\|EFilterPipe(' "$f" | cut -d: -f1 | while read -r ln; do
-    awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
+    awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=($1=="pub")?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
   done | sort -u | sed "s|^|$(basename "$f") |"
 done | sort > "$observed"
 

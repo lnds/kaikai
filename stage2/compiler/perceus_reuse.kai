@@ -1,0 +1,325 @@
+#[doc("""
+Reuse: a match arm that rebuilds the shape it took apart writes into the
+scrutinee's cell.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.perceus_reads
+import compiler.symtab
+import compiler.perceus_borrow_strip
+import compiler.perceus_dups
+
+# Two types of one runtime shape. Units and refinements are erased, a
+# nominal type is its declaration, and an unresolved one equals none.
+fn prc_same_ty(a0: Ty, b0: Ty) : Bool = {
+  let a = prc_erased_ty(a0)
+  let b = prc_erased_ty(b0)
+  match a {
+    TyListT(x)       -> match b { TyListT(y) -> prc_same_ty(x, y)  _ -> false }
+    TyFnT(ps, r, _)  -> match b { TyFnT(qs, q, _) -> prc_same_tys(ps, qs) and prc_same_ty(r, q)  _ -> false }
+    TyCon(s, xs)     -> match b { TyCon(t, ys) -> sym_raw(s) >= 0 and sym_same(s, t) and prc_same_tys(xs, ys)  _ -> false }
+    TyShapeApp(_, x) -> match b { TyShapeApp(_, y) -> prc_same_ty(x, y)  _ -> false }
+    TyUnion(xs)      -> match b { TyUnion(ys) -> prc_same_tys(xs, ys)  _ -> false }
+    _                -> prc_leaf_ty(a) >= 0 and prc_leaf_ty(a) == prc_leaf_ty(b)
+  }
+}
+
+fn prc_same_tys(xs: [Ty], ys: [Ty]) : Bool = match xs {
+  []           -> match ys { [] -> true  _ -> false }
+  [x, ...rest] -> match ys {
+    []            -> false
+    [y, ...yrest] -> prc_same_ty(x, y) and prc_same_tys(rest, yrest)
+  }
+}
+
+fn prc_erased_ty(t: Ty) : Ty = match t {
+  TyDimT(base, _)    -> prc_erased_ty(base)
+  TyRefineT(base, _) -> prc_erased_ty(base)
+  _                  -> t
+}
+
+fn prc_leaf_ty(t: Ty) : Int = match t {
+  TyInt     -> 0
+  TyReal    -> 1
+  TyBool    -> 2
+  TyString  -> 3
+  TyChar    -> 4
+  TyUnit    -> 5
+  TyByte    -> 6
+  TyInt32   -> 7
+  TyUInt32  -> 8
+  TyUInt64  -> 9
+  TyInt128  -> 10
+  TyHandle  -> 11
+  TyVarT(_) -> 12
+  TyAny     -> 13
+  _         -> 0 - 1
+}
+
+#[doc("""
+`borrowed` names the params that are borrowed in THIS fn: a match over one
+of them must NOT reuse its scrutinee cell (issue #1127 rule 5 — the cell is
+the caller's, reuse-in-place would corrupt it). Threading the set here
+marks such a scrutinee not-owned so the recogniser skips reuse, mirroring
+what the `__perceus_borrow` wrap does downstream (the wrap runs AFTER this
+pass, so the recogniser cannot see it and must consult `borrowed` directly).
+""")]
+pub fn pcs_recognise_reuse_expr_b(e: Expr, borrowed: [Binder], tab: SymTab) : Expr =
+  Expr { kind: pcs_recognise_reuse_kind_b(e.kind, e.line, e.col, borrowed, tab),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pcs_recognise_reuse_kind_b(k: ExprKind, line: Int, col: Int, borrowed: [Binder], tab: SymTab) : ExprKind {
+  match k {
+    EMatch(scr, arms) -> {
+      # The scrutinee's resolved type is the typer-aware shape
+      # predicate's anchor for variant + record arms (issue #210):
+      # a same-shape rebuild must produce a value whose
+      # `mangle_ty` matches the scrutinee's. `scr.ty` is populated
+      # by the typer + monomorphiser before perceus runs.
+      let new_scr = pcs_recognise_reuse_expr_b(scr, borrowed, tab)
+      let owned = pcs_scr_owned(new_scr) and not pcs_scr_is_borrowed_var(new_scr, borrowed)
+      EMatch(new_scr, pcs_recognise_reuse_arms_b(new_scr.ty, owned, arms, borrowed, tab))
+    }
+    _ -> prc_map_expr_kind(k, (sub) => pcs_recognise_reuse_expr_b(sub, borrowed, tab))
+  }
+}
+
+# Reuse donation is sound only for a scrutinee whose ownership the RC
+# discipline COUNTS: a var (every non-last read is dup'd) or a call
+# result (callees return an owned ref). A projection scrutinee
+# (`match e.kind`, `match xs[i]`) is a borrow — the live parent's claim
+# is invisible to the runtime rc==1 guard, so donating that cell rewrites
+# a value another owner still holds (a double-free once any legitimate
+# drop of the parent lands; a leak without it).
+fn pcs_scr_owned(scr: Expr) : Bool = match scr.kind {
+  ELocal(_)   -> true
+  ESym(_, _)  -> true
+  ECall(_, _) -> true
+  _           -> false
+}
+
+# A bare-var scrutinee that names a borrowed param — reuse must skip it
+# (rule 5: the cell belongs to the caller).
+fn pcs_scr_is_borrowed_var(scr: Expr, borrowed: [Binder]) : Bool = match scr.kind {
+  ELocal(l) -> pcs_has(borrowed, l)
+  _         -> false
+}
+
+fn pcs_recognise_reuse_arms_b(scr_ty: Option[Ty], scr_owned: Bool, arms: [Arm], borrowed: [Binder], tab: SymTab) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        # Recurse into the body first so nested matches also get
+        # rewritten, then attempt the same-shape recognition on the
+        # outermost form. Guards disable recognition (the body might
+        # not run); a non-owned scrutinee disables it too (donation
+        # needs a counted owner, see pcs_scr_owned).
+        let body1 = pcs_recognise_reuse_expr_b(body, borrowed, tab)
+        let body2 = match opt_g {
+          None    -> if scr_owned { pcs_try_reuse_arm(scr_ty, pat, body1, tab) } else { body1 }
+          Some(_) -> body1
+        }
+        [Arm(pat, opt_g, body2),
+         ...pcs_recognise_reuse_arms_b(scr_ty, scr_owned, rest, borrowed, tab)]
+      }
+    }
+  }
+}
+
+# The reuse recogniser hands the scrutinee to the emitter through this
+# mark; the emitter lowers a `__perceus_reuse_*` first argument to its
+# match-local `_scr` without reading the argument.
+fn pcs_mk_scr(line: Int, col: Int) : Expr =
+  Expr { kind: EMark(MkScrutinee), line: line, col: col,
+         ty: None, mode: MUnknown , site: 0 }
+
+fn pcs_mk_call(m: Mark, args: [Expr], line: Int, col: Int) : Expr =
+  Expr { kind: ECall(
+            Expr { kind: EMark(m), line: line, col: col,
+                   ty: None, mode: MUnknown , site: 0 },
+            args),
+         line: line, col: col, ty: None, mode: MUnknown , site: 0 }
+
+fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr, tab: SymTab) : Expr {
+  match pat.pkind {
+    # Cons rebuild — `[h, ...t] -> [g(h), ...recur(t)]`. Only the
+    # single-head shape (one fixed sub-pattern + a rest binder) is
+    # in v1 scope; multi-head spines fall through to the normal
+    # `kai_cons` allocator.
+    PList(pats, opt_rest) -> {
+      match opt_rest {
+        Some(_) -> match pats {
+          [_] -> pcs_try_reuse_cons(body)
+          _   -> body
+        }
+        None -> body
+      }
+    }
+    # Variant rebuild — `Some(d) -> Some(g(d))`. Issue #210: the
+    # shape predicate compares the resolved scrutinee type to the
+    # rebuild expression's resolved type. Both must be `TyCon`s
+    # with the same head name and tparams (equal `mangle_ty`); a
+    # rebuild like `Some(d) -> Some(false)` over `Maybe[Int]`
+    # produces `Maybe[Bool]` and is rejected.
+    # Slot shapes the reuse lowering can bind: flat (PBind / PWild) and
+    # nested variant sub-patterns (see pcs_sub_is_flat). Any other shape
+    # falls through to the fresh `kai_variant_u` allocator.
+    PVariant(_, ps) -> {
+      let flat_ok = pcs_all_flat_subs(ps)
+      let shape_ok = pcs_shape_matches(scr_ty, body.ty)
+      # kai_variant_reuse_at has move semantics: donate the cell, write
+      # the new slots, do NOT decref the donor's old children (the arm
+      # extracted them without incref). Sound — including non-diagonal
+      # rebuilds — only when the match uniquely owns the donated cell:
+      # the counted-owner scrutinee gate (pcs_scr_owned) plus the
+      # runtime rc==1 guard establish that together.
+      if flat_ok and shape_ok {
+        pcs_try_reuse_variant(body, list_length(ps), prc_pat_bindings(pat, []), tab)
+      } else { body }
+    }
+    # Record rebuild — `{ a, b } -> Rec { a: f(a), b }`. Same shape
+    # predicate as variants; field count must also match (already
+    # enforced inside `pcs_try_reuse_record`).
+    PRecord(pfs) ->
+      if pcs_shape_matches(scr_ty, body.ty) {
+        pcs_try_reuse_record(body, list_length(pfs), prc_pat_bindings(pat, []))
+      } else { body }
+    _ -> body
+  }
+}
+
+# Issue #210 typer-aware shape predicate. Both the scrutinee and the
+# rebuild expression must have a resolved type, and the canonical
+# `mangle_ty` must match (head TyCon name + tparams). This blocks
+# the original lexical-predicate failure mode (`Some(d) -> Some(false)`
+# over `Maybe[Int]` rebuilds a `Maybe[Bool]` cell) without depending
+# on lexer-level heuristics. Conservative on `None` / unresolved
+# types (`TyAny`, `TyVarT`): no reuse fires when the typer didn't
+# pin a concrete shape.
+fn pcs_shape_matches(t1: Option[Ty], t2: Option[Ty]) : Bool {
+  match t1 {
+    None -> false
+    Some(a) -> match t2 {
+      None -> false
+      Some(b) -> {
+        if pcs_ty_concrete(a) and pcs_ty_concrete(b) {
+          prc_same_ty(a, b)
+        } else { false }
+      }
+    }
+  }
+}
+
+fn pcs_ty_concrete(t: Ty) : Bool {
+  match t {
+    TyVarT(_) -> false
+    TyAny     -> false
+    _         -> true
+  }
+}
+
+fn pcs_try_reuse_cons(body: Expr) : Expr {
+  match body.kind {
+    EList(elems) -> match elems {
+      [e1, e2] -> match e1 {
+        ElPlain(h_new) -> match e2 {
+          ElSpread(t_new) ->
+            pcs_mk_call(MkReuseCons,
+                        [pcs_mk_scr(body.line, body.col), h_new, t_new],
+                        body.line, body.col)
+          _ -> body
+        }
+        _ -> body
+      }
+      _ -> body
+    }
+    _ -> body
+  }
+}
+
+fn pcs_try_reuse_variant(body: Expr, expected_arity: Int, binders: [Binder], tab: SymTab) : Expr {
+  match body.kind {
+    # The shape predicate confirms the rebuild produces the scrutinee's
+    # type, but it does not tell a constructor from a function call that
+    # returns that type (`fn make_some(x: Int) : Maybe[Int]`): the callee
+    # must be a constructor.
+    ECall(callee, cargs) ->
+      if list_length(cargs) == expected_arity and pcs_callee_is_ctor(tab, callee) {
+        pcs_mk_call(MkReuseVariant,
+                    [pcs_mk_scr(body.line, body.col),
+                     pcs_reuse_rebuild(body, callee, pcs_reuse_strip_dups(cargs, binders))],
+                    body.line, body.col)
+      } else { body }
+    _ -> body
+  }
+}
+
+fn pcs_reuse_rebuild(body: Expr, callee: Expr, cargs: [Expr]) : Expr =
+  Expr { kind: ECall(callee, cargs),
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+
+# A slot sub-pattern is "flat" if the reuse-in-place emit can bind it
+# without descending: a bare binder or a wildcard. Anything else
+# (nested variant / list / record / literal) binds inner names the
+# 1:1 reuse lowering does not declare, so such arms must not be
+# recognised as reusable.
+fn pcs_sub_is_flat(p: Pattern) : Bool =
+  match p.pkind {
+    PBind(_) -> true
+    PWild    -> true
+    # A nested variant sub-pattern, at any depth: the reuse emit borrows
+    # the binders beneath each inner cell and settles the cell once.
+    PVariant(_, isubs) -> pcs_all_flat_subs(isubs)
+    # The reuse emit descends only variant inner cells.
+    _        -> false
+  }
+
+fn pcs_all_flat_subs(ps: [Pattern]) : Bool =
+  match ps {
+    []          -> true
+    [p, ...rest] -> if pcs_sub_is_flat(p) { pcs_all_flat_subs(rest) } else { false }
+  }
+
+fn pcs_try_reuse_record(body: Expr, expected_n: Int, binders: [Binder]) : Expr {
+  match body.kind {
+    ERecordLit(rh, fis) ->
+      if list_length(fis) == expected_n {
+        let body2 = Expr { kind: ERecordLit(rh, pcs_strip_dup_fields(fis, binders)),
+                           line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+        pcs_mk_call(MkReuseRecord,
+                    [pcs_mk_scr(body.line, body.col), body2],
+                    body.line, body.col)
+      } else { body }
+    _ -> body
+  }
+}
+
+# ---- sentinel arg normalisation: restore move-at-last-use ---------------
+#
+# The reuse paths consume exactly ONE incoming reference per rebuild slot
+# and no arm-exit payer runs after a sentinel body, so a pattern binder
+# whose every rebuild read is a `__perceus_dup` wrap leaves its extraction
+# reference unpaid — one leaked cell per reuse, both backends. Unwrapping the LAST
+# top-level dup hands that reference to its slot: the raw last-use move
+# the accounting already balances. Conservative: the unwrap fires only
+# when the binder appears NOWHERE outside top-level dup wraps (no raw
+# read to double-consume, no call-nested read whose C argument evaluation
+# order is unspecified).
+
+fn pcs_reuse_strip_dups(es: [Expr], binders: [Binder]) : [Expr] = match binders {
+  []           -> es
+  [b, ...rest] -> pcs_reuse_strip_dups(pcs_strip_one_binder(es, b), rest)
+}
+
+fn pcs_strip_dup_fields(fis: [FieldInit], binders: [Binder]) : [FieldInit] =
+  pcs_zip_fields(fis, pcs_reuse_strip_dups(map(fis, (fi) => match fi { FI(_, v) -> v }), binders))
+
+fn pcs_zip_fields(fis: [FieldInit], vals: [Expr]) : [FieldInit] = match fis {
+  []            -> []
+  [fi, ...frest] -> match vals {
+    [v, ...vrest] -> match fi { FI(n, _) -> [FI(n, v), ...pcs_zip_fields(frest, vrest)] }
+    []            -> []
+  }
+}

@@ -32,7 +32,7 @@ audit() {
   observed=$(mktemp)
   for f in "$ROOT"/stage2/compiler/*.kai; do
     grep -n 'pcs_use_index(' "$f" | grep -v 'pub fn pcs_use_index' | cut -d: -f1 | while read -r ln; do
-      awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
+      awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=($1=="pub")?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
     done | sort -u | sed "s|^|$(basename "$f") |"
   done | sort > "$observed"
   local new gone

@@ -1,0 +1,392 @@
+#[doc("""
+Whether every read of a binder is a linear consumer, and which
+parameters and locals move raw on every path.
+""")]
+
+import compiler.ast
+import compiler.marks
+import compiler.ret_slots
+import compiler.expr_positions
+import compiler.perceus_branch_plant
+import compiler.consume_index
+import compiler.borrow_map
+import compiler.perceus_arg_reads
+import compiler.perceus_reads
+import compiler.symtab
+import compiler.perceus_preds
+import compiler.perceus_borrow_strip
+import compiler.perceus_max_paths
+
+# Issue #599 — branch-aware max-path count for a single name in a
+# function body. Returns the maximum number of non-lambda reads of
+# `nm` on ANY linear execution path through the body, taking the max
+# over `EMatch` arms and `EIf` branches (mutually-exclusive sites)
+# and the sum over sequential composition (`EBlock`, `ECall` args,
+# `EBinop`, …).
+#
+# When the result is <= 1 the binding is read at most once on every
+# path, so the conservative-dup wrap can be skipped: the last (and
+# only) read on the executed path can transfer ownership raw.
+#
+# Lambdas contribute 0 because closure captures are RC'd separately
+# via `kai_closure`'s incref; this matches the in_lam-skip convention
+# of `pcs_count_non_lam_uses` and keeps the rule sound for
+# LUBlocked bindings.
+#
+# This function is read-only and pure (no Console effect needed) so
+# it can be called from any rewrite site without threading a new
+# parameter through every `pcs_rewrite_*` helper. It is invoked
+# lazily from `pcs_is_non_last` only for top-level fn params; per-fn
+# bodies are small enough that the O(body-size) walk per param is
+# cheap compared with the rest of the perceus pass.
+# Back-compat wrapper: the borrow-unaware count (used by the params path
+# and other call sites that have no borrow map in scope).
+pub fn pcs_max_paths_in_expr(nm: Binder, e: Expr) : Int =
+  pcs_max_paths_b_expr(nm, e, bm_empty())
+
+# Compute the branch-aware skip-set for a fn body: every top-level
+# fn param whose reads can safely transfer ownership raw on every
+# execution path. The three conditions for safety:
+#
+#   1. `pcs_max_paths_in_expr <= 1` — the binding is read at most
+#      once on any single execution path (no path doubles a wrap).
+#   2. `pcs_consumed_on_every_path` — every path through the body
+#      actually consumes the binding (no exit-drop needed; the
+#      single read on the executed path transfers ownership).
+#   3. `pcs_all_consumers_linear` — every consumer of the binding
+#      is a linear consumer: a call to a user-defined fn (which
+#      pcs_pass made linear by construction) or a variant/record
+#      that owns the slot. Non-linear consumers (intrinsics,
+#      capability ops, raw field access on a borrowed record)
+#      internally incref their arg, and a raw transfer would leak or
+#      double-free.
+#[doc("Params that transfer raw on every path. A read in a borrowed callee slot of `bmap` consumes nothing, so such a param keeps its drop. Pub: tco consults it.")]
+pub fn pcs_branch_aware_skip_params(pnames: [Binder], body: Expr,
+                                    bmap: BorrowMap) : [Binder] = match pnames {
+  []           -> []
+  [h, ...rest] -> {
+    # Borrowed reads still count here: the branch planter assumes one read
+    # per path, and a lent read ahead of the move is a second one.
+    let rest_skip = pcs_branch_aware_skip_params(rest, body, bmap)
+    if pcs_param_moves_raw(h, body, bmap) { [h, ...rest_skip] } else { rest_skip }
+  }
+}
+
+# Each condition walks the body, so a failing one spares the rest.
+fn pcs_param_moves_raw(h: Binder, body: Expr, bmap: BorrowMap) : Bool =
+  pcs_max_paths_in_expr(h, body) <= 1 and pcs_param_consumed_linear(h, body, bmap)
+
+fn pcs_param_consumed_linear(h: Binder, body: Expr, bmap: BorrowMap) : Bool =
+  pcs_consumed_b_expr(h, body, bmap) and pcs_all_consumers_linear(h, body)
+
+# A param read twice on some path that every path hands over at one owning
+# read, after its lends. `held` names the params that hold no reference.
+fn pcs_param_lends_then_moves(h: Binder, body: Expr, uses: UseIx, held: [Binder], bmap: BorrowMap) : Bool =
+  not pcs_has(held, h.id) and not pcs_uses_have_in_lam(uses, h.id) and
+  pcs_lends_end_first(h, body, bmap) and
+  pcs_all_consumers_linear(h, body) and
+  pcs_consumed_b_expr(h, body, bmap)
+
+#[doc("""
+The params Perceus moves raw. One read per path decides as the TCO pass
+does; only a param read twice on some path is walked for lends. The TCO
+pass needs no copy of that second rule: it widens its skip-set with every
+param the rewrite left bare in an owned position. The branch planter
+declines a lent read ahead of the move as a second read, and has nothing
+to plant for a param every path consumes.
+""")]
+pub fn pcs_params_moved_raw(pnames: [Binder], body: Expr, uses: UseIx, bmap: BorrowMap, held: [Binder]) : [Binder] =
+  filter(pnames, (h) => pcs_param_moves(h, body, uses, bmap, held))
+
+fn pcs_param_moves(h: Binder, body: Expr, uses: UseIx, bmap: BorrowMap, held: [Binder]) : Bool =
+  if pcs_max_paths_in_expr(h, body) <= 1 { pcs_param_consumed_linear(h, body, bmap) }
+  else { pcs_param_lends_then_moves(h, body, uses, held, bmap) }
+
+#[doc("""
+Returns `true` if every read of `nm` in `e` is a linear consumer
+context — either:
+  - direct arg to `ECall(EName(<user_fn>), ...)` — call to a
+    user-defined fn (pcs_pass makes those linear by construction);
+  - direct slot of `EVariantsOf` / variant-constructor `ECall` /
+    `ERecordLit` field init — the constructor takes ownership of
+    the slot.
+Any other context (intrinsic, capability op like `EField(EName(eff),
+op)` invoked, raw `EField` read of `nm` for record projection,
+`EIndex`, binop, unop on non-numeric types) is non-linear and
+requires the conservative dup wrap.
+""")]
+pub fn pcs_all_consumers_linear(nm: Binder, e: Expr) : Bool =
+  pcs_consumers_linear_kind(nm, e.kind)
+
+fn pcs_consumers_linear_kind(nm: Binder, k: ExprKind) : Bool = match k {
+  ELocal(_)           -> true   # a bare read is "in linear position"
+  ESym(_, _)          -> true
+                                 # — it's either the body's tail (return
+                                 # transfer, linear), or recursed into
+                                 # from an arg/field that already classified
+                                 # the call/ctor as linear or not.
+  EStr(_, _)          -> true
+  ECall(f, xs)        -> pcs_call_consumers_linear(nm, f, xs)
+  EIntrinsic(_, xs)   -> {
+    # Intrinsics are runtime primitives — non-linear if `nm` appears
+    # as an arg.
+    if pcs_any_arg_is_var(nm.id, xs) { false }
+    else { pcs_all_args_consumers_linear(nm, xs) }
+  }
+  EField(x, _)        -> {
+    # Field access reads the record raw and incref's the field.
+    # If `nm == x` (bare ref), this is non-linear (borrow-only on nm).
+    match x.kind {
+      ELocal(u) -> not local_eq(u, nm.id)    # bare `nm.field` = borrow → false
+      _         -> pcs_all_consumers_linear(nm, x)
+    }
+  }
+  EIndex(a, b)        -> {
+    # Same as EField: index borrows the array.
+    let a_ok = match a.kind {
+      ELocal(u) -> not local_eq(u, nm.id)
+      _         -> pcs_all_consumers_linear(nm, a)
+    }
+    a_ok and pcs_all_consumers_linear(nm, b)
+  }
+  EMatch(s, arms)     -> {
+    # The scrutinee is consumed by `match` (kai_decref at end of
+    # the match block). A bare read of `nm` as scrutinee is therefore
+    # linear; but if `nm` appears INSIDE the scrutinee expression
+    # (e.g. `match opts.path { ... }`), we recurse.
+    let s_ok = pcs_is_leaf_ref(s) or pcs_all_consumers_linear(nm, s)   # a bare scrutinee is linear by match semantics
+    s_ok and pcs_consumers_linear_arms(nm, arms)
+  }
+  EList(els)          -> pcs_consumers_linear_elems(nm, els)
+  # Everything else checks its inline positions; deferred bodies
+  # (lambda closures, handler clauses) are handled separately.
+  _ -> pcs_consumers_linear_ps(nm, xp_positions_kind(k))
+}
+
+fn pcs_consumers_linear_ps(nm: Binder, ps: [XPos]) : Bool = match ps {
+  []                  -> true
+  [XP(r, c), ...rest] ->
+    (not xrole_inline(r) or pcs_all_consumers_linear(nm, c)) and
+    pcs_consumers_linear_ps(nm, rest)
+}
+
+# Check whether a call expression `f(xs...)` with `nm` possibly
+# appearing as an arg is linear-safe. Rules:
+#   - If callee `f` is an RC mark → non-linear (an RC primitive should
+#     never see a skipped read).
+#   - If callee `f` is a bare name, treat as user-defined linear fn.
+#   - If callee is anything else (EField on capability, intrinsic,
+#     apply on closure value), assume non-linear unless `nm` does
+#     not appear in args.
+# A bare callee needs no "does an arg mention `nm`" pre-pass: an arg that
+# never reads `nm` is linear for it by construction, so the arg walk
+# alone answers. That pre-pass re-walked every arg at every call level.
+fn pcs_call_consumers_linear(nm: Binder, f: Expr, xs: [Expr]) : Bool = match f.kind {
+  # A primitive mark consumes its arguments like a named function.
+  EMark(m) -> if pcs_is_rc_primitive(m) { not pcs_any_arg_mentions(nm, xs) }
+              else if mark_is_prim(m) { pcs_all_args_consumers_linear(nm, xs) }
+              else { pcs_call_consumers_linear_via(nm, f, xs) }
+  _        -> if pcs_callee_is_ref(f) { pcs_all_args_consumers_linear(nm, xs) }
+              else { pcs_call_consumers_linear_via(nm, f, xs) }
+}
+
+fn pcs_call_consumers_linear_via(nm: Binder, f: Expr, xs: [Expr]) : Bool = {
+  let nm_in_args = pcs_any_arg_is_var(nm.id, xs) or pcs_any_arg_mentions(nm, xs)
+  if not nm_in_args {
+    # `nm` only appears inside the callee expression (rare); recurse.
+    pcs_all_consumers_linear(nm, f)
+  } else {
+    # On a post-perceus body the callee may be wrapped in a dup
+    # (`step(initial, ev1)` becomes `(dup(step))(initial, ev1)`). Look
+    # through the wrap so the linearity analysis matches the pre-perceus
+    # body: a param that qualifies for the skip set in one view and not
+    # the other gets a goto-block drop without the matching dup.
+    let effective_f = pcs_strip_dup_wrap(f)
+    # A call of a reference is linear by construction: a fn consumes its
+    # slots, a constructor owns them. `nm` must not also appear in the
+    # callee. A call through anything else is assumed non-linear.
+    if pcs_callee_is_ref(effective_f) {
+      pcs_all_consumers_linear(nm, effective_f) and pcs_all_args_consumers_linear(nm, xs)
+    } else { false }
+  }
+}
+
+# Recurse into each arg.
+fn pcs_all_args_consumers_linear(nm: Binder, xs: [Expr]) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> pcs_all_consumers_linear(nm, h) and
+                   pcs_all_args_consumers_linear(nm, rest)
+}
+
+# The RC marks the linearity analysis treats as non-linear consumers.
+fn pcs_is_rc_primitive(m: Mark) : Bool = match m {
+  MkDup -> true
+  _     -> mark_is_reuse(m)
+}
+
+fn pcs_consumers_linear_arms(nm: Binder, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let gp = match opt_g {
+        None    -> true
+        Some(g) -> pcs_all_consumers_linear(nm, g)
+      }
+      gp and pcs_all_consumers_linear(nm, body) and
+      pcs_consumers_linear_arms(nm, rest)
+    }
+  }
+}
+
+fn pcs_consumers_linear_elems(nm: Binder, els: [ListElem]) : Bool = match els {
+  []           -> true
+  [h, ...rest] -> {
+    let e = match h { ElPlain(x) -> x ElSpread(x) -> x }
+    pcs_all_consumers_linear(nm, e) and pcs_consumers_linear_elems(nm, rest)
+  }
+}
+
+#[doc("""
+Borrow-aware witness. A read landing in a BORROWED parameter slot of the
+callee does not take ownership, so it cannot witness consumption: the
+caller still holds the ref the callee never released. Counting it as a
+consumer is what leaves a self-tail-call's parameter undropped across the
+`goto` — the slot is rebound over a value nobody freed.
+""")]
+pub fn pcs_consumed_b_expr(nm: Binder, e: Expr, bmap: BorrowMap) : Bool = match e.kind {
+  ELocal(u)        -> local_eq(u, nm.id)
+  EIf(c, t, opt_e) -> {
+    if pcs_consumed_b_expr(nm, c, bmap) { true }
+    else {
+      match opt_e {
+        None    -> false   # missing-else path leaves the binding alive
+        Some(e2) -> pcs_consumed_b_expr(nm, t, bmap) and
+                    pcs_consumed_b_expr(nm, e2, bmap)
+      }
+    }
+  }
+  EMatch(s, arms)  -> {
+    if pcs_consumed_b_expr(nm, s, bmap) { true }
+    else { pcs_consumed_b_arms(nm, arms, bmap) }
+  }
+  ECall(f, xs)     -> {
+    if pcs_consumed_b_expr(nm, f, bmap) { true }
+    else { pcs_consumed_b_args(nm, xs, pcs_lent_slots(nm.id, f, xs, bmap), 0, bmap) }
+  }
+  _                -> pcs_consumed_b_ps(nm, xp_positions(e), bmap)
+}
+
+# A bare `nm` in a borrowed slot is a borrow, not a consumer; any other
+# slot keeps the owned reading. Sub-expressions are scanned either way.
+fn pcs_consumed_b_args(nm: Binder, xs: [Expr], positions: [Int], i: Int,
+                       bmap: BorrowMap) : Bool = match xs {
+  []           -> false
+  [a, ...rest] -> {
+    let here = if pcs_has_int(positions, i) {
+      if pcs_is_leaf_ref(a) { false } else { pcs_consumed_b_expr(nm, a, bmap) }
+    } else { pcs_consumed_b_expr(nm, a, bmap) }
+    here or pcs_consumed_b_args(nm, rest, positions, i + 1, bmap)
+  }
+}
+
+fn pcs_consumed_b_ps(nm: Binder, ps: [XPos], bmap: BorrowMap) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] ->
+    (match r { XAll -> pcs_consumed_b_expr(nm, c, bmap) _ -> false }) or
+    pcs_consumed_b_ps(nm, rest, bmap)
+}
+
+fn pcs_consumed_b_arms(nm: Binder, arms: [Arm], bmap: BorrowMap) : Bool = match arms {
+  []           -> true   # no arms = no paths = vacuously consumed
+                          # (but EMatch with zero arms is invalid anyway)
+  [a, ...rest] -> match a {
+    Arm(_, _, body) ->
+      pcs_consumed_b_expr(nm, body, bmap) and pcs_consumed_b_arms(nm, rest, bmap)
+  }
+}
+
+#[doc("""
+---- Koka Parc `ownedInScope`: owned sibling-param move + branch-drop ----
+
+An owned param read exactly once per path (e.g. `r` in
+`balance_left(l,k,v,r) = match l { ...arms rebuild with r...; RBLeaf }`)
+hits the whole-body `count_non_lam_uses >= 2` fallback because it appears
+in several mutually-exclusive arms: it is dup'd at every read + dropped at
+fn exit. Parc nets this to zero on the consuming path (move at the single
+use, no exit drop) and drops the param only in the branch that never reads
+it (`ownedInScope`, Parc.hs:984-990). This selects such params so the
+rewriter moves them (skip-set) and `pbp_branch_drops` releases them on the
+paths that skip the read.
+
+Safety fence (matches Parc's Borrowed dual + the arm-binder path's
+`pcs_uses_only_consuming_slots` guard, adversarially reviewed):
+  1. `mp_borrow_aware(p) <= 1` — no path reads p twice.
+  2. `all_consumers_linear(p)` — every real consumer is linear.
+  3. `uses_only_consuming_slots(p, cmap)` — no borrowed-slot use (a
+     borrow does not transfer ownership; moving there would UAF).
+  4. every arm of the top-level match EITHER consumes p once at a
+     linear last use OR reads p zero times — no arm reads-without-
+     consuming, no arm reads twice.
+  5. no arm guard mentions p — a guard can fall through, so a guard
+     read can neither consume nor host the branch drop soundly.
+  6. every path that skips the read can take an entry drop.
+A never-read param may be selected: its payer is still the entry drop
+(`pcs_param_payer`), so no branch drop is planted for it.
+Narrow shape only: the fn body is a single top-level EMatch (possibly
+under the `__pcs_ret` exit wrap) whose scrutinee does not mention p.
+A missed selection is a missed optimisation, never a bug.
+""")]
+pub fn pcs_owned_scope_move_params(pnames: [Binder], body: Expr, skip: [Binder],
+                                bmap: BorrowMap, cmap: ConsumeIndex, borrowed: [Binder], tab: SymTab) : [Binder] =
+  match pnames {
+    [] -> []
+    [p, ...rest] -> {
+      let rest_sel = pcs_owned_scope_move_params(rest, body, skip, bmap, cmap, borrowed, tab)
+      if pcs_has(skip, p.id) { rest_sel }
+      else {
+        if pcs_owned_param_moves(p, body, bmap, cmap, tab) { [p, ...rest_sel] } else { rest_sel }
+      }
+    }
+  }
+
+# The narrow-shape check for condition 4+5: `body` must be a top-level match
+# (peeling the exit wrap) whose scrutinee omits `p`, and every arm either
+# reads `p` zero times or consumes it exactly once with no guard read.
+fn pcs_param_arms_move_safe(p: Binder, body: Expr) : Bool =
+  match pcs_peel_ret_wrap(body).kind {
+    EMatch(scr, arms) ->
+      not pcs_name_in_expr(p, scr) and pcs_param_each_arm_move_safe(p, arms)
+    _ -> false
+  }
+
+fn pcs_param_each_arm_move_safe(p: Binder, arms: [Arm]) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let guard_reads = match opt_g { None -> false Some(g) -> pcs_name_in_expr(p, g) }
+      let n = pcs_max_paths_in_expr(p, body)
+      let arm_ok = not guard_reads and (n == 0 or n == 1)
+      arm_ok and pcs_param_each_arm_move_safe(p, rest)
+    }
+  }
+}
+
+fn pcs_owned_param_moves(p: Binder, body: Expr, bmap: BorrowMap, cmap: ConsumeIndex, tab: SymTab) : Bool =
+  pcs_max_paths_b_expr(p, body, bmap) <= 1 and
+  pcs_all_consumers_linear(p, body) and
+  pcs_uses_only_consuming_slots(p, body, cmap, bm_empty(), tab) and
+  pcs_param_arms_move_safe(p, body) and
+  pbl_plantable(p, body)
+
+# Peel the `EBlock([SLet(__pcs_ret, m), ...drops], Some(__pcs_ret))` exit wrap
+# so the top-level match is visible. No wrap ⇒ returns `body` unchanged.
+fn pcs_peel_ret_wrap(body: Expr) : Expr = match body.kind {
+  EBlock(stmts, _) -> match stmts {
+    [SLet(pat, _, rhs), ..._] -> match pat.pkind {
+      PBind(b) -> if ret_slot_id_is_fn(b.id) { rhs } else { body }
+      _         -> body
+    }
+    _ -> body
+  }
+  _ -> body
+}

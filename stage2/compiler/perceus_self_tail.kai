@@ -1,0 +1,246 @@
+#[doc("""
+Self calls in tail position: bodies that end in one, modulo a
+constructor or not, and the parameters such a loop may move.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.borrow_map
+import compiler.perceus_reads
+import compiler.self_call
+import compiler.symtab
+import compiler.perceus_borrow_strip
+import compiler.perceus_max_paths
+import compiler.perceus_linear
+
+#[doc("""
+Issue #1126 — a boxed param whose reads are a borrow
+(`array_get_borrow(a, i)`, discounted by `bmap`) PLUS a single
+consuming re-thread through a self-tail-call (`read(a, ...)`). The
+borrow read inflates the flat non-lam count to >= 2, so the
+`pcs_is_non_last` fallback dups the param; the goto then re-binds it to
+itself without dropping the original, leaking one container ref per
+iteration (the bulk read loop pins its array forever).
+
+Gates (each param `nm`):
+  - flat count >= 2 (the fallback would dup) while borrow-aware
+    max-paths == 1 (exactly one real consumer; borrow reads discounted).
+    == 0 is the borrow-only case (consuming reclaim, no move).
+  - the body has a self-tail-call (`tcrec` lowers it to a goto, moving
+    the exit-drop wrap OUT of the recursive path).
+  - `nm` never appears in a tail that is NOT a self-call. This makes the
+    sole consumer the re-thread: base arms neither read nor consume
+    `nm`, so the exit-drop on the base path is the only release and
+    transferring the re-thread raw double-frees nothing.
+    Base-path BLOCK STATEMENTS are `nm`-free too: a read there (an
+    operator operand, a consuming call) takes a ref while the exit
+    wrap still drops `nm` on that path — two releases of one.
+Excludes `borrowed` (never dup'd) and `skip_set` (already moves on
+every use, exit drop suppressed).
+""")]
+pub fn pcs_collect_borrow_move_last_params(self_name: SelfRef, pnames: [Binder], body: Expr, uses: UseIx,
+                                       bmap: BorrowMap, borrowed: [Binder],
+                                       skip_set: [Binder]) : [Binder] / Console = {
+  if not pcs_body_has_tail_self_call(self_name, body) { [] }
+  else { pcs_bmlp_loop(self_name, pnames, body, uses, bmap, borrowed, skip_set) }
+}
+
+# True iff SOME tail position of `e` is a direct self-call — the
+# base-plus-recursive shape (`if i>=n { acc } else { read(...) }`) that
+# `tcrec` lowers to a goto loop, moving the exit-drop wrap OUT of the
+# recursive path. The `and` variant above demands EVERY tail recurse
+# (map/filter); this `or` variant fits a fn with a non-recursing base
+# arm. Descends only tail positions (blocks flow to their tail).
+fn pcs_body_has_tail_self_call(self_name: SelfRef, e: Expr) : Bool = pcs_bhtsc_kind(self_name, e.kind)
+
+fn pcs_bhtsc_kind(self_name: SelfRef, k: ExprKind) : Bool = match k {
+  ECall(f, _) -> is_self_callee(f, self_name)
+  EIf(_, t, opt_e) ->
+    pcs_body_has_tail_self_call(self_name, t) or
+    (match opt_e { None -> false Some(e2) -> pcs_body_has_tail_self_call(self_name, e2) })
+  EMatch(_, arms) -> pcs_bhtsc_arms(self_name, arms)
+  EBlock(_, opt_tail) -> match opt_tail {
+    None    -> false
+    Some(t) -> pcs_body_has_tail_self_call(self_name, t)
+  }
+  _ -> false
+}
+
+fn pcs_bhtsc_arms(self_name: SelfRef, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] ->
+    pcs_body_has_tail_self_call(self_name, b) or pcs_bhtsc_arms(self_name, rest)
+}
+
+#[doc("""
+True iff `body` contains a self-recursive call `self_name(...)` sitting in a
+constructor-rebuild slot OR a tail-recursive position — i.e. the Okasaki
+modulo-cons shape (`RBNode(Red, self(l,...), ...)`) that tcrec lowers to a
+TRMC step. This is the arm shape for which emit applies the borrow-model
+shell dispose; only there is moving a deconstructed child sound.
+""")]
+pub fn pcs_arm_self_modulo_cons(self_name: SelfRef, e: Expr, tab: SymTab) : Bool =
+  pcs_smc_kind(self_name, e.kind, tab)
+
+fn pcs_smc_kind(self_name: SelfRef, k: ExprKind, tab: SymTab) : Bool = match k {
+  # ONLY the modulo-cons shape: a CONSTRUCTOR rebuild one of whose slots is a
+  # self-call `self_name(...)`. A bare self tail-call (`r = self(...)` bound to
+  # a let, then matched — as in stdlib/regexp compile_repeat_optional) is
+  # plain recursion, NOT modulo-cons, and tcrec does NOT lower it to a TRMC
+  # step in a constructor slot; moving binders there is unsound (it keeps the
+  # legacy emit). So we require the self-call to sit in a ctor slot.
+  ECall(f, xs) ->
+    if pcs_callee_is_ctor(tab, f) { pcs_smc_any_arg_is_self(self_name, xs, tab) }
+    else { pcs_smc_seq(self_name, xs, tab) }
+  EIf(c, t, opt_e) ->
+    pcs_smc_kind(self_name, c.kind, tab) or pcs_smc_kind(self_name, t.kind, tab) or
+    (match opt_e { None -> false Some(e2) -> pcs_smc_kind(self_name, e2.kind, tab) })
+  EBlock(stmts, tail) ->
+    pcs_smc_stmts(self_name, stmts, tab) or
+    (match tail { None -> false Some(e) -> pcs_smc_kind(self_name, e.kind, tab) })
+  EMatch(s, arms) ->
+    pcs_smc_kind(self_name, s.kind, tab) or pcs_smc_arms(self_name, arms, tab)
+  _ -> false
+}
+
+# True iff any direct arg of a ctor call is a self-call (the modulo-cons hole)
+# or recursively contains the modulo-cons shape.
+fn pcs_smc_any_arg_is_self(self_name: SelfRef, xs: [Expr], tab: SymTab) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> {
+    let here = match h.kind {
+      ECall(f, _) -> is_self_callee(f, self_name)
+      _ -> pcs_smc_kind(self_name, h.kind, tab)
+    }
+    here or pcs_smc_any_arg_is_self(self_name, rest, tab)
+  }
+}
+
+fn pcs_smc_seq(self_name: SelfRef, xs: [Expr], tab: SymTab) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_smc_kind(self_name, h.kind, tab) or pcs_smc_seq(self_name, rest, tab)
+}
+
+fn pcs_smc_stmts(self_name: SelfRef, stmts: [Stmt], tab: SymTab) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_smc_kind(self_name, e.kind, tab)
+      SVar(_, _, e, _, _) -> pcs_smc_kind(self_name, e.kind, tab)
+      SExprStmt(e)        -> pcs_smc_kind(self_name, e.kind, tab)
+      _                   -> false
+    }
+    here or pcs_smc_stmts(self_name, rest, tab)
+  }
+}
+
+fn pcs_smc_arms(self_name: SelfRef, arms: [Arm], tab: SymTab) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a { Arm(_, _, b) -> pcs_smc_kind(self_name, b.kind, tab) or pcs_smc_arms(self_name, rest, tab) }
+}
+
+# Returns `true` if every execution path through `body` consumes
+# `nm` exactly once on a non-lambda read. Only a position that runs
+# whenever its parent runs (`XAll`) can witness consumption: a branch
+# position (`XBr` — if/match alternatives, a short-circuited `and`/`or`
+# RHS) or an assert message (`XMsg`) may never evaluate, and deferred
+# bodies (`XLam`/`XCl`) run elsewhere. `EIf`/`EMatch` keep explicit
+# arms because their branch positions are alternatives of each other —
+# all must consume — which the flat position list cannot express.
+fn pcs_consumed_on_every_path(nm: Binder, e: Expr) : Bool =
+  pcs_consumed_b_expr(nm, e, bm_empty())
+
+#[doc("""
+A single-use owned param whose only read sits on some-but-not-all
+execution paths would transfer raw at the read with no exit drop —
+every path that skips the read leaks the birth ref. Select such
+params so the rewriter dups their read (via force_set) and the exit
+drop releases the original unconditionally.
+Self-recursive fns are excluded: the goto/TRMC rewrites bypass the
+exit wrap per iteration and their site dropmask mirrors the flat
+use-count criterion, so forcing a dup there would unbalance the
+loop. The exclusion over-approximates (any reference to the fn outside
+lambdas); a false hit merely withholds the treatment.
+""")]
+pub fn pcs_branchy_single_use_params(fn_name: SelfRef, fid: FnId, pnames: [Binder],
+                                 body: Expr, uses: UseIx, skip: [Binder], tab: SymTab) : [Binder] =
+  if pcs_body_has_tail_self_call(fn_name, body) or
+     pcs_arm_self_modulo_cons(fn_name, body, tab) or
+     pcs_body_has_cons_self_tail(fn_name, body) or
+     pcs_fn_named_in(fid, body) { [] }
+  else { pcs_branchy_single_loop(pnames, body, uses, skip) }
+
+# A reference to the fn `fid` outside lambdas.
+fn pcs_fn_named_in(fid: FnId, e: Expr) : Bool = match e.kind {
+  ESym(s, inst) -> fnid_eq(FnId(s, inst), fid)
+  _             -> pcs_fn_named_ps(fid, xp_positions_kind(e.kind))
+}
+
+fn pcs_fn_named_ps(fid: FnId, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] -> (match r { XLam -> false  _ -> pcs_fn_named_in(fid, c) }) or pcs_fn_named_ps(fid, rest)
+}
+
+# The builtin-cons TRMC tail (`[h, ...self(t)]`): a tail-position list
+# one of whose elements is a self-call. Goto-lowered like the ctor
+# modcons shape, so it joins the self-recursion fence above.
+fn pcs_body_has_cons_self_tail(self_name: SelfRef, e: Expr) : Bool =
+  pcs_bhcst_kind(self_name, e.kind)
+
+fn pcs_bhcst_kind(self_name: SelfRef, k: ExprKind) : Bool = match k {
+  EList(els) -> pcs_bhcst_els(self_name, els)
+  EIf(_, t, opt_e) ->
+    pcs_body_has_cons_self_tail(self_name, t) or
+    (match opt_e { None -> false Some(e2) -> pcs_body_has_cons_self_tail(self_name, e2) })
+  EMatch(_, arms) -> pcs_bhcst_arms(self_name, arms)
+  EBlock(_, opt_tail) -> match opt_tail {
+    None    -> false
+    Some(t) -> pcs_body_has_cons_self_tail(self_name, t)
+  }
+  _ -> false
+}
+
+fn pcs_bhcst_els(self_name: SelfRef, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    let hit = match inner.kind {
+      ECall(f, _) -> is_self_callee(f, self_name)
+      _ -> false
+    }
+    hit or pcs_bhcst_els(self_name, rest)
+  }
+}
+
+fn pcs_bhcst_arms(self_name: SelfRef, arms: [Arm]) : Bool = match arms {
+  []                      -> false
+  [Arm(_, _, b), ...rest] ->
+    pcs_body_has_cons_self_tail(self_name, b) or pcs_bhcst_arms(self_name, rest)
+}
+
+fn pcs_branchy_single_loop(pnames: [Binder], body: Expr, uses: UseIx,
+                           skip: [Binder]) : [Binder] = match pnames {
+  []           -> []
+  [p, ...rest] -> {
+    let r = pcs_branchy_single_loop(rest, body, uses, skip)
+    if pcs_has(skip, p.id) { r }
+    else if pcs_read_count(p.id, uses) != 1 { r }
+    else {
+      match last_use_for(p.id, uses) {
+        LuAt(_, _) ->
+          if pcs_consumed_on_every_path(p, body) { r } else { [p, ...r] }
+        _ -> r
+      }
+    }
+  }
+}
+
+#[doc("""
+A leaf the TRMC rewrite lowers to a goto step: a cons or constructor
+rebuild with a self-call in one slot.
+""")]
+pub fn pcs_is_modcons_leaf(e: Expr, fn_name: SelfRef, tab: SymTab) : Bool = match e.kind {
+  EList(_)    -> pcs_body_has_cons_self_tail(fn_name, e)
+  ECall(_, _) -> pcs_arm_self_modulo_cons(fn_name, e, tab)
+  _           -> false
+}

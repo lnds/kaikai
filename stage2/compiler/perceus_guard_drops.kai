@@ -1,0 +1,56 @@
+#[doc("""
+A guard that fails after its arm's binders took their references: the
+drops that close those births.
+""")]
+
+import compiler.ast
+import compiler.perceus_arm_drops
+
+#[doc("""
+A guard evaluates AFTER the arm's binders take their birth refs but can
+still reject the arm: on the falsy edge control falls to the next arm
+without running the body or any of its exits. Close that edge inside the
+guard itself — `g or { __perceus_guard_drop(b); ...; false }` — so both
+backends inherit the payment from the shared AST (`or` short-circuits:
+a truthy guard never reaches the drops). A binder the guard's own
+evaluation may consume (a bare read anywhere in it) is skipped: dropping
+it again would over-release. The sentinel decrefs like `__perceus_drop`
+but is invisible to the tcrec ledger scan — the falsy edge never shares
+a path with the body's goto, and the ledger must keep releasing the
+binder there.
+""")]
+pub fn pcs_guard_close_births(g: Expr, bound: [Binder]) : Expr {
+  let drops = pcs_guard_fail_drops(bound, g, [])
+  match drops {
+    [] -> g
+    [_, ...__] -> {
+      let f = Expr { kind: EBool(false), line: g.line, col: g.col,
+                     ty: g.ty, mode: MBoxed,  site: g.site }
+      let blk = Expr { kind: EBlock(drops, Some(f)), line: g.line, col: g.col,
+                       ty: g.ty, mode: MBoxed,  site: g.site }
+      Expr { kind: EBinop(BoOr, g, blk), line: g.line, col: g.col,
+             ty: g.ty, mode: MBoxed,  site: g.site }
+    }
+  }
+}
+
+fn pcs_guard_fail_drops(bound: [Binder], g: Expr, acc: [Stmt]) : [Stmt] = match bound {
+  [] -> list_reverse(acc)
+  [nm, ...rest] -> {
+    let acc1 =
+      if pcs_has_bare_read(nm, g) { acc }
+      else { [pcs_make_guard_drop_stmt(nm.id, g.line, g.col), ...acc] }
+    pcs_guard_fail_drops(rest, g, acc1)
+  }
+}
+
+fn pcs_make_guard_drop_stmt(l: LocalId, ln: Int, cl: Int) : Stmt =
+  SExprStmt(Expr {
+    kind: ECall(
+      Expr { kind: EMark(MkGuardDrop), line: ln, col: cl,
+             ty: None, mode: MUnknown , site: 0 },
+      [Expr { kind: ELocal(l), line: ln, col: cl,
+              ty: None, mode: MUnknown , site: 0 }]
+    ),
+    line: ln, col: cl, ty: None, mode: MUnknown
+  , site: 0 })

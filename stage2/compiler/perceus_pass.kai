@@ -1,0 +1,119 @@
+#[doc("""
+The Perceus pass: reference counting made explicit over the
+monomorphised program, one declaration at a time.
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.consume_index
+import compiler.fn_index
+import compiler.borrow_map
+import compiler.entry
+import compiler.core_builtins
+import compiler.core_builtin_sets
+import compiler.perceus_cap
+import compiler.scope_file
+import compiler.symtab
+import compiler.spec_names
+import compiler.perceus_decl
+import compiler.perceus_borrow_map
+import compiler.perceus_consume_map
+
+# ---- m5 — basic Perceus (m5 #1, walker scaffold) ----
+#
+# Walks the post-mono `[Decl]` and (eventually) inserts `kai_dup` /
+# `kai_decref` calls at non-last / last-use positions per the Koka
+# Perceus paper. m5 #1 wires the slot; the body is identity. m5 #2
+# computes per-binding last-use positions; m5 #3 emits drops at
+# end-of-scope; m5 #4 emits dups at non-last uses; m5 #5 measures.
+#
+# Operates on values, not types. Under uniform boxing every
+# `KaiValue *` has the same RC shape, so a single drop/dup discipline
+# applies across instantiations — the m4c retrofit blocking real
+# monomorphisation does not block this pass.
+#
+# Reads the source AST as the IR. The emitter consumes whatever this
+# function returns; selfhost convergence remains the gate.
+
+# For each `DFn` the pass collects the in-scope reads once (`pcs_use_index`),
+# then rewrites the body so every read that does not hand its binder's birth
+# ref on is wrapped in `__perceus_dup`. The drops that release what no read
+# hands on are planted where `compiler.perceus_payer` names the payer.
+
+
+#[doc("Entry point: scope-aware Perceus RC pass over the post-mono [Decl] (dup at non-last uses, drop unused params at entry). Pipeline position monomorphise -> unbox -> perceus_pass_in -> tco -> emit. `tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites; `specs` names the specialisations; `views` are the per-file scope views the resolver climbed; `root` names the root file's module; `entry` is what the binary starts.")]
+pub fn perceus_pass_in(decls: [Decl], tab: SymTab, specs: SpecNames, views: FileViews,
+      root: String, entry: SymId) : [Decl] / Console {
+
+  let fns = fnx_build(register_fn_decls(decls, tab, specs, entry))
+  # Borrow inference pre-pass (Koka pre-Parc): per-fn borrowed param
+  # positions, consumed by BOTH sides of the flip (callee wraps the
+  # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
+  # decref; caller strips the __perceus_dup on args in borrowed slots).
+  # Read-only prims (array_get/array_length) join the borrow map so the
+  # caller strips the container dup and the path counter charges 0 —
+  # reusing the whole borrow pipeline. A prim is keyed by its row's
+  # identity like any declaration, so a user fn spelled like a prim never
+  # reads the prim's row; the same entry gates the callee rename.
+  let prim_bmap = pcs_seed_prim_borrows()
+  let bmap = pcs_build_borrow_map(decls, prim_bmap, tab)
+  # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
+  # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
+  # callee like regexp nb_add_transition) must keep the caller's ref.
+  let cmap = pcs_build_consume_map(decls, cix_empty(), tab)
+  # The `extern "C" fn` shims whose return type is an opaque handle.
+  # A `let h = f(...)` with such an `f` binds a handle box that must move
+  # at its last consuming use (the shim there decrefs the box); otherwise
+  # it is dup'd at every use and the birth ref never reaches zero.
+  let opaque_names = pcs_collect_opaque_names(decls, [])
+  let opaque_ret_fns = pcs_collect_opaque_ret_fns(decls, opaque_names, [])
+  let caps = pcap_scope(decls, tab, views, root)
+  let prim_bm = bm_of(prim_bmap)
+  let cores = bound_builtin_syms()
+  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, prim_bm, caps, cores, tab))
+}
+
+# The `extern "C" fn` shims whose return type is an opaque handle.
+fn pcs_collect_opaque_ret_fns(decls: [Decl], opaque_names: [SymId], acc: [FnId]) : [FnId] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, fsym, _, _, opt_ret, _, body, _, _, _) ->
+      if body_is_ffi_extern(body) and pcs_ret_is_opaque(opt_ret, opaque_names) {
+        pcs_collect_opaque_ret_fns(rest, opaque_names, [fsym, ...acc])
+      } else { pcs_collect_opaque_ret_fns(rest, opaque_names, acc) }
+    _ -> pcs_collect_opaque_ret_fns(rest, opaque_names, acc)
+  }
+}
+
+fn pcs_ret_is_opaque(opt_ret: Option[TypeExpr], opaque_names: [SymId]) : Bool = match opt_ret {
+  Some(t) -> match t.tkind { TyName(r, _) -> pcs_has_sym(opaque_names, ref_sym(r)) _ -> false }
+  None    -> false
+}
+
+fn pcs_has_sym(ss: [SymId], s: SymId) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> (sym_raw(s) >= 0 and sym_same(h, s)) or pcs_has_sym(rest, s)
+}
+
+# The types declared `extern "C" opaque`, recovered from the
+# one-`__ffi_handle`-field records they lower to. Every boxed FFI input
+# is consumed (the shim decrefs each after the extern returns).
+fn pcs_collect_opaque_names(decls: [Decl], acc: [SymId]) : [SymId] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DType(_, tsym, _, TBRecord(fields), _, _, _, _) ->
+      if pcs_is_ffi_opaque_record(fields) { pcs_collect_opaque_names(rest, [tsym, ...acc]) }
+      else { pcs_collect_opaque_names(rest, acc) }
+    _ -> pcs_collect_opaque_names(rest, acc)
+  }
+}
+
+fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
+  [FD(_, fname, _, _)] -> fname == "__ffi_handle"
+  _ -> false
+}
+
+# Seed the borrow map with the read-only prims. One map entry gates BOTH
+# the caller-dup strip and the callee rename, so a strip-without-rename
+# (double free) or rename-without-strip (leak) is impossible.
+fn pcs_seed_prim_borrows() : [BorrowEntry] = map(lending_builtins(), (b) => BwE(fnid_decl(builtin_id(b)), [0]))
