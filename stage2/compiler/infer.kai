@@ -30,6 +30,7 @@ import compiler.core_refs
 import compiler.core_protos
 import compiler.impl_identity
 import compiler.proto_ids
+import compiler.proto_contest
 import compiler.exhaust
 import compiler.effect_default
 import compiler.type_text
@@ -87,6 +88,8 @@ import compiler.effect_alias
 import compiler.core_effects
 import compiler.scalar_ty
 import compiler.core_types
+import compiler.tbinder
+import compiler.unit_walk
 import compiler.record_head
 
 # ====================================================================
@@ -593,6 +596,7 @@ fn inf_resolve_ty(t: TypeExpr, hv: TyHomeView) : Ty {
         if ref_is_cont(th) { tsh_tycon_at(hv, th, cont_full_args(th, inf_resolve_args_rk(targs, [2], 0, [], hv))) }
         else { tsh_tycon_at(hv, th, inf_resolve_ty_list(targs, hv)) }
     }
+    TyParam(id, targs) -> tparam_use([], id, inf_resolve_ty_list(targs, hv))
     TyList(inner) -> TyListT(inf_resolve_ty(inner, hv))
     TyFn(fps, fret, rexpr) -> TyFnT(inf_resolve_ty_list(fps, hv), inf_resolve_ty(fret, hv), inf_row_of_expr(rexpr, hv))
     # dimensioned base type. The unit goes through unit_canon
@@ -745,11 +749,11 @@ fn inf_row_suffix_ow(tab: SymTab, owners: [HeadOwnerEntry], r: Row) : String {
 # by `--types`; does not attempt to infer bodies, just surfaces what
 # the user wrote.
 
-fn inf_rvbind_lookup(binds: [RVBind], name: String) : Option[Int] {
+fn inf_rvbind_lookup(binds: [RVBind], id: TLocalId) : Option[Int] {
   match binds {
     [] -> None
     [b, ...rest] -> match b {
-      RVB(n, i) -> if n == name { Some(i) } else { inf_rvbind_lookup(rest, name) }
+      RVB(n, i) -> if tlocal_eq(n, id) { Some(i) } else { inf_rvbind_lookup(rest, id) }
     }
   }
 }
@@ -2642,19 +2646,22 @@ fn core_ctor_names() : [String] = ["Some", "None", "Ok", "Err"]
 # For each DFn decl add its signature; for each DType of sum-shape add a
 # scheme per variant that produces the sum's `TyCon` over its tparams.
 
-fn tparam_ids_loop(tparams: [String], i: Int, acc: [Int]) : [Int] {
+# A row variable a signature never listed holds no position: every walk
+# below that numbers a parameter list steps over it.
+fn tparam_ids_loop(tparams: [TBinder], i: Int, acc: [Int]) : [Int] {
   match tparams {
     [] -> list_reverse(acc)
-    [_, ...rest] -> tparam_ids_loop(rest, i + 1, [i, ...acc])
+    [b, ...rest] -> if tb_is_row(b) { tparam_ids_loop(rest, i, acc) }
+                    else { tparam_ids_loop(rest, i + 1, [i, ...acc]) }
   }
 }
 
-fn tparam_ids(tparams: [String]) : [Int] = tparam_ids_loop(tparams, 0, [])
+fn tparam_ids(tparams: [TBinder]) : [Int] = tparam_ids_loop(tparams, 0, [])
 
 # same as tparam_ids but starts numbering from `start` so a
 # nested set of tparams (op-level on top of effect-level) gets a
 # disjoint id range.
-fn tparam_ids_from(tparams: [String], start: Int) : [Int] = tparam_ids_loop(tparams, start, [])
+fn tparam_ids_from(tparams: [TBinder], start: Int) : [Int] = tparam_ids_loop(tparams, start, [])
 
 # split the tparam list into separate type-var and unit-var ID
 # lists. Mirrors the kind-aware allocation in mk_tpbinds — bound_vars
@@ -2663,39 +2670,18 @@ fn tparam_ids_from(tparams: [String], start: Int) : [Int] = tparam_ids_loop(tpar
 pub type TParamSplit = { tvars: [Int], uvars: [Int] }
 
 #[doc("infer: `tparam_id_split` — typer entry point invoked by the driver.")]
-pub fn tparam_id_split(tparams: [String]) : TParamSplit =
-  tparam_id_split_loop(tparams, 0, 0, [], [])
+pub fn tparam_id_split(tparams: [TBinder]) : TParamSplit =
+  tparam_id_split_loop(tbs_positional(tparams), 0, 0, [], [])
 
 # Count how many tparams in `tparams` are unit-kind. Used by
 # `infer_decl` to advance the inferencer's unit_fresh counter past
 # the impl-level bound uvar ids so freshly minted uvars during body
 # type-checking do not alias them.
-fn tparam_unit_count(tparams: [String]) : Int =
-  tparam_unit_count_loop(tparams, 0)
-
-fn tparam_unit_count_loop(tparams: [String], acc: Int) : Int {
-  match tparams {
-    [] -> acc
-    [n, ...rest] -> {
-      let next = if tp_kind_is_unit(n) { acc + 1 } else { acc }
-      tparam_unit_count_loop(rest, next)
-    }
-  }
-}
+fn tparam_unit_count(tparams: [TBinder]) : Int = list_length(filter(tparams, tb_is_unit))
 
 # The kind each unit tparam ranges over, in tparam order — parallel
 # to `tparam_id_split`'s uvars, so uvar id i has kind element i.
-fn tparam_unit_kinds(tparams: [String]) : [String] =
-  tparam_unit_kinds_loop(tparams, [])
-
-fn tparam_unit_kinds_loop(tparams: [String], acc: [String]) : [String] {
-  match tparams {
-    [] -> list_reverse(acc)
-    [n, ...rest] ->
-      if tp_kind_is_unit(n) { tparam_unit_kinds_loop(rest, [tp_kind_name(n), ...acc]) }
-      else { tparam_unit_kinds_loop(rest, acc) }
-  }
-}
+fn tparam_unit_kinds(tparams: [TBinder]) : [String] = map(filter(tparams, tb_is_unit), tb_unit_kind)
 
 # build a `[(endpoint_id, bound_id)]` redirect map for
 # uvar canonicalisation. For each bound uvar id, chase the
@@ -2806,6 +2792,7 @@ fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
   match u {
     UOne        -> u
     USym(_)     -> u
+    UParam(_)   -> u
     UVar(n)     -> match intpair_lookup(m, n) {
       Some(b) -> UVar(b)
       None    -> u
@@ -2897,12 +2884,12 @@ fn canon_resolved_css(css: [ResolvedCS], tv_map: [IntPair],
   }
 }
 
-fn tparam_id_split_loop(tparams: [String], ti: Int, ui: Int,
+fn tparam_id_split_loop(tparams: [TBinder], ti: Int, ui: Int,
                         tacc: [Int], uacc: [Int]) : TParamSplit {
   match tparams {
     [] -> TParamSplit { tvars: list_reverse(tacc), uvars: list_reverse(uacc) }
     [n, ...rest] -> {
-      if tp_kind_is_unit(n) {
+      if tb_is_unit(n) {
         tparam_id_split_loop(rest, ti, ui + 1, tacc, [ui, ...uacc])
       } else {
         tparam_id_split_loop(rest, ti + 1, ui, [ti, ...tacc], uacc)
@@ -2912,18 +2899,18 @@ fn tparam_id_split_loop(tparams: [String], ti: Int, ui: Int,
 }
 
 # The type-var ids assigned (by `tparam_id_split`'s numbering) to the
-# tparams named in `targets`. Used to drop row-kind tparams from the
+# tparams among `targets`. Used to drop row-kind tparams from the
 # generalised type-var set.
-fn tparam_type_ids_of(tparams: [String], targets: [String]) : [Int] =
-  tparam_type_ids_of_loop(tparams, targets, 0, [])
+fn tparam_type_ids_of(tparams: [TBinder], targets: [TLocalId]) : [Int] =
+  tparam_type_ids_of_loop(tbs_positional(tparams), targets, 0, [])
 
-fn tparam_type_ids_of_loop(tparams: [String], targets: [String], ti: Int, acc: [Int]) : [Int] {
+fn tparam_type_ids_of_loop(tparams: [TBinder], targets: [TLocalId], ti: Int, acc: [Int]) : [Int] {
   match tparams {
     [] -> list_reverse(acc)
     [n, ...rest] ->
-      if tp_kind_is_unit(n) { tparam_type_ids_of_loop(rest, targets, ti, acc) }
+      if tb_is_unit(n) { tparam_type_ids_of_loop(rest, targets, ti, acc) }
       else {
-        let acc1 = if list_has(targets, n) { [ti, ...acc] } else { acc }
+        let acc1 = if tids_has(targets, n.id) { [ti, ...acc] } else { acc }
         tparam_type_ids_of_loop(rest, targets, ti + 1, acc1)
       }
   }
@@ -2937,49 +2924,83 @@ fn remove_ints(xs: [Int], drop: [Int]) : [Int] = match xs {
     else { [x, ...remove_ints(rest, drop)] }
 }
 
-# Resolve a TypeExpr under a mapping from tparam name to its TyVarT id.
-# The mapping is itself an association list for now.
-#[doc("infer: a type-parameter binding (name -> fresh id).")]
-pub type TPBind = TPB(String, Int)
+# Resolve a TypeExpr under a mapping from a type parameter to its TyVarT
+# id. The mapping is itself an association list for now.
+#[doc("infer: a type-parameter binding (the parameter -> the id of its type or unit variable).")]
+pub type TPBind = TPB(TBinder, Int)
 
-fn tpbind_lookup(binds: [TPBind], name: String) : Option[Int] {
+# A use in type position reaches a type-kind parameter only: a unit or
+# shape parameter has its own lookup.
+fn tpbind_lookup(binds: [TPBind], id: TLocalId) : Option[Int] {
   match binds {
     [] -> None
     [b, ...rest] -> match b {
-      TPB(n, i) -> if n == name { Some(i) } else { tpbind_lookup(rest, name) }
+      TPB(n, i) -> if tlocal_eq(n.id, id) and tb_is_type(n) { Some(i) } else { tpbind_lookup(rest, id) }
     }
+  }
+}
+
+fn tpbind_any(binds: [TPBind], id: TLocalId) : Option[Int] = match binds {
+  [] -> None
+  [TPB(n, i), ...rest] -> if tlocal_eq(n.id, id) { Some(i) } else { tpbind_any(rest, id) }
+}
+
+fn binds_of(binds: [TPBind]) : [TBinder] = map(binds, (b) => match b { TPB(n, _) -> n })
+
+# Where a unit tparam has no variable — a record field read without unit
+# bindings, a function's own body — it is the unit symbol it is named.
+fn unit_named(u: UnitExprT, tps: [TBinder]) : UnitExprT = match u {
+  UParam(p) -> match tbs_find(tps, p) {
+    Some(b) -> USym(tb_text(b))
+    None    -> u
+  }
+  UMul(a, b)  -> UMul(unit_named(a, tps), unit_named(b, tps))
+  UInv(a)     -> UInv(unit_named(a, tps))
+  UPow(a, n)  -> UPow(unit_named(a, tps), n)
+  UJoin(a, b) -> UJoin(unit_named(a, tps), unit_named(b, tps))
+  UDims(us)   -> UDims(map(us, (x) => unit_named(x, tps)))
+  UOne        -> u
+  USym(_)     -> u
+  UVar(_)     -> u
+}
+
+# A unit tparam no binding reached keeps an atom of its own, spelled
+# from its id: it equals only itself.
+fn unit_param_atom(p: TLocalId) : String = string_concat("'", int_to_string(tlocal_raw(p)))
+
+# A use of the type parameter `id` applied to `tas`: a shape carrier
+# applied to its one argument is `s[A]`, any other bound parameter is
+# its variable. One the binding does not hold is a name no declaration
+# answers.
+fn tparam_use(binds: [TPBind], id: TLocalId, tas: [Ty]) : Ty = match shape_tparam_lookup(binds, id) {
+  Some(sid) -> match tas {
+    [arg] -> TyShapeApp(sid, arg)
+    _     -> tv(sid)
+  }
+  None -> match tpbind_lookup(binds, id) {
+    Some(i) -> tv(i)
+    None    -> TyCon(sym_none(), tas)
   }
 }
 
 #[doc("infer: resolve a type under a tparam binding, each nominal head stamped from `hv`.")]
 pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind], hv: TyHomeView) : Ty {
   match t.tkind {
-    TyName(th, tas) -> {
-      let name = ref_name(th)
-      match shape_tparam_lookup(binds, name) {
-        Some(sid) -> match tas {
-          [arg] -> TyShapeApp(sid, resolve_ty_with_tparams(arg, binds, hv))
-          _ -> tv(sid)
-        }
-        None -> match tpbind_lookup(binds, name) {
-        Some(i) -> tv(i)
-        None -> match undeclared_ty_named(name, SnValue) {
-          Some(t) -> t
-          None ->
-            if ref_is_cont(th) { tsh_tycon_at(hv, th, cont_full_args(th, resolve_cont_tas_with(tas, binds, hv))) }
-            else { tsh_tycon_at(hv, th, resolve_tas_with(tas, binds, hv)) }
-        }
-      }
-      }
+    TyParam(id, tas) -> tparam_use(binds, id, resolve_tas_with(tas, binds, hv))
+    TyName(th, tas) -> match undeclared_ty_named(ref_name(th), SnValue) {
+      Some(t) -> t
+      None ->
+        if ref_is_cont(th) { tsh_tycon_at(hv, th, cont_full_args(th, resolve_cont_tas_with(tas, binds, hv))) }
+        else { tsh_tycon_at(hv, th, resolve_tas_with(tas, binds, hv)) }
     }
     TyList(inner) -> list_ty(resolve_ty_with_tparams(inner, binds, hv))
     TyFn(ps, ret, rexpr) -> TyFnT(map(ps, (p) => resolve_ty_with_tparams(p, binds, hv)),
                                   resolve_ty_with_tparams(ret, binds, hv),
                                   closed_row_with_tparams(rexpr, binds, hv))
     # dimensioned types in this lighter resolver — without unit
-    # tparam bindings — leave UVar references as USym holdovers. Real
+    # variables — leave a unit tparam as the symbol it is named. Real
     # generic-unit resolution lives in resolve_ty_with_binds below.
-    TyDim(base, u) -> dim_collapse(resolve_ty_with_tparams(base, binds, hv), unit_canon(u))
+    TyDim(base, u) -> dim_collapse(resolve_ty_with_tparams(base, binds, hv), unit_canon(unit_named(u, binds_of(binds))))
     # preserve refinement on the semantic side.
     TyRefine(base, p) -> TyRefineT(resolve_ty_with_tparams(base, binds, hv), p)
     # a compound row reaching *type* position (not dissolved
@@ -3018,11 +3039,13 @@ fn cont_full_args(r: DeclRef, args: [Ty]) : [Ty] = match args {
 # pools (type-var pool for KType, unit-var pool for KUnit). Without
 # this split a `[u: Unit, T]` decl would conflate type-var 1 with
 # unit-var 1 across instantiation passes.
-fn mk_tpbinds_loop(tparams: [String], ti: Int, ui: Int, acc: [TPBind]) : [TPBind] {
+fn mk_tpbinds_loop(tparams: [TBinder], ti: Int, ui: Int, acc: [TPBind]) : [TPBind] {
   match tparams {
     [] -> list_reverse(acc)
     [n, ...rest] -> {
-      if tp_kind_is_unit(n) {
+      if tb_is_row(n) {
+        mk_tpbinds_loop(rest, ti, ui, acc)
+      } else if tb_is_unit(n) {
         mk_tpbinds_loop(rest, ti, ui + 1, [TPB(n, ui), ...acc])
       } else {
         mk_tpbinds_loop(rest, ti + 1, ui, [TPB(n, ti), ...acc])
@@ -3031,12 +3054,12 @@ fn mk_tpbinds_loop(tparams: [String], ti: Int, ui: Int, acc: [TPBind]) : [TPBind
   }
 }
 
-fn mk_tpbinds(tparams: [String]) : [TPBind] = mk_tpbinds_loop(tparams, 0, 0, [])
+fn mk_tpbinds(tparams: [TBinder]) : [TPBind] = mk_tpbinds_loop(tparams, 0, 0, [])
 
 # same as mk_tpbinds but starts ids at `start`. Used to
 # combine effect-level and op-level tparams into a single binding
 # context with disjoint ids.
-fn mk_tpbinds_from(tparams: [String], start: Int) : [TPBind] = mk_tpbinds_loop(tparams, start, 0, [])
+fn mk_tpbinds_from(tparams: [TBinder], start: Int) : [TPBind] = mk_tpbinds_loop(tparams, start, 0, [])
 
 fn append_tpbinds(a: [TPBind], b: [TPBind]) : [TPBind] {
   match a {
@@ -3096,21 +3119,21 @@ fn row_kind_entry_of(d: Decl) : Option[RowKindEntry] = match d {
   _ -> None
 }
 
-# Names a type body uses in row position across all its ctor fields.
-fn row_names_of_typebody(b: TypeBody) : [String] = match b {
+# The parameters a type body uses in row position across all its ctor fields.
+fn row_names_of_typebody(b: TypeBody) : [TLocalId] = match b {
   TBSum(vs)    -> row_names_of_variants(vs, [])
   TBRecord(fs) -> row_names_of_fields(fs, [])
   _            -> []
 }
 
-fn row_names_of_variants(vs: [Variant], acc: [String]) : [String] = match vs {
+fn row_names_of_variants(vs: [Variant], acc: [TLocalId]) : [TLocalId] = match vs {
   [] -> acc
   [v, ...rest] -> match v {
     Var(_, vargs) -> row_names_of_variants(rest, cont_row_names_all(vargs, collect_rvars_in_typeexprs(vargs, acc)))
   }
 }
 
-fn row_names_of_fields(fs: [FieldDecl], acc: [String]) : [String] = match fs {
+fn row_names_of_fields(fs: [FieldDecl], acc: [TLocalId]) : [TLocalId] = match fs {
   [] -> acc
   [f, ...rest] -> match f {
     FD(_, _, te, _) -> row_names_of_fields(rest, cont_row_names(te, collect_rvars_in_typeexpr(te, acc)))
@@ -3118,17 +3141,15 @@ fn row_names_of_fields(fs: [FieldDecl], acc: [String]) : [String] = match fs {
 }
 
 # Row variables a type passes as a continuation's row: `e` in `Cont[T, S, e]`.
-fn cont_row_names(t: TypeExpr, acc: [String]) : [String] = match t.tkind {
+fn cont_row_names(t: TypeExpr, acc: [TLocalId]) : [TLocalId] = match t.tkind {
   TyName(n, tas) -> cont_row_names_all(tas, match tas {
     [_, _, r] -> if ref_is_cont(n) { match r.tkind {
-      TyName(rr, []) -> {
-        let rn = ref_name(rr)
-        if is_implicit_tparam_candidate(rn) and not list_has(acc, rn) { [rn, ...acc] } else { acc }
-      }
+      TyParam(rn, []) -> if not tids_has(acc, rn) { [rn, ...acc] } else { acc }
       _ -> acc
     } } else { acc }
     _ -> acc
   })
+  TyParam(_, tas) -> cont_row_names_all(tas, acc)
   TyList(inner) -> cont_row_names(inner, acc)
   TyFn(ps, ret, _) -> cont_row_names_all([ret, ...ps], acc)
   TyDim(base, _) -> cont_row_names(base, acc)
@@ -3137,18 +3158,56 @@ fn cont_row_names(t: TypeExpr, acc: [String]) : [String] = match t.tkind {
   TySurface(ts) -> cont_row_names_all(tysurface_children(ts), acc)
 }
 
-fn cont_row_names_all(ts: [TypeExpr], acc: [String]) : [String] = match ts {
+fn cont_row_names_all(ts: [TypeExpr], acc: [TLocalId]) : [TLocalId] = match ts {
   [] -> acc
   [t, ...rest] -> cont_row_names_all(rest, cont_row_names(t, acc))
 }
 
-# The zero-based positions in `tparams` whose name appears in `row_names`.
-fn row_kind_indices(tparams: [String], row_names: [String], i: Int) : [Int] = match tparams {
+# The zero-based positions in `tparams` of the parameters among `row_names`.
+fn row_kind_indices(tparams: [TBinder], row_names: [TLocalId], i: Int) : [Int] = match tparams {
   [] -> []
   [n, ...rest] ->
-    if list_has(row_names, n) { [i, ...row_kind_indices(rest, row_names, i + 1)] }
+    if tids_has(row_names, n.id) { [i, ...row_kind_indices(rest, row_names, i + 1)] }
     else { row_kind_indices(rest, row_names, i + 1) }
 }
+
+# The row variables a type body opens a row with and no parameter of the
+# type binds: a tail, or a continuation's row, still written.
+fn unbound_row_names(b: TypeBody) : [String] = match b {
+  TBSum(vs)    -> unbound_rows_tes(flat_map(vs, (v) => match v { Var(_, vargs) -> vargs }), [])
+  TBRecord(fs) -> unbound_rows_tes(map(fs, (f) => match f { FD(_, _, te, _) -> te }), [])
+  _            -> []
+}
+
+fn unbound_rows_tes(ts: [TypeExpr], acc: [String]) : [String] = match ts {
+  [] -> acc
+  [t, ...rest] -> unbound_rows_tes(rest, unbound_rows_te(t, acc))
+}
+
+fn unbound_rows_te(t: TypeExpr, acc: [String]) : [String] = match t.tkind {
+  TyName(n, tas) -> unbound_rows_tes(tas, match tas {
+    [_, _, r] -> if ref_is_cont(n) { match r.tkind {
+      TyName(rr, []) -> if is_implicit_tparam_candidate(ref_name(rr)) { unbound_row_add(acc, ref_name(rr)) } else { acc }
+      _ -> acc
+    } } else { acc }
+    _ -> acc
+  })
+  TyParam(_, tas)   -> unbound_rows_tes(tas, acc)
+  TyList(inner)     -> unbound_rows_te(inner, acc)
+  TyFn(ps, ret, row) -> unbound_rows_row(row, unbound_rows_te(ret, unbound_rows_tes(ps, acc)))
+  TyDim(base, _)    -> unbound_rows_te(base, acc)
+  TyRefine(base, _) -> unbound_rows_te(base, acc)
+  TyRow(row)        -> unbound_rows_row(row, acc)
+  TySurface(ts)     -> unbound_rows_tes(tysurface_children(ts), acc)
+}
+
+fn unbound_rows_row(r: RowExpr, acc: [String]) : [String] = match r {
+  ROpen(TpWritten(w), _) -> unbound_row_add(acc, written_text(w))
+  _                      -> acc
+}
+
+fn unbound_row_add(acc: [String], n: String) : [String] =
+  if list_has(acc, n) { acc } else { list_append(acc, [n]) }
 
 # The row-kind slots of the type `r` names from `hv`, or [] if it
 # declares none: a homonym declared elsewhere has slots of its own. The
@@ -3184,8 +3243,8 @@ fn validate_nominal_row_vars_loop(decls: [Decl], df: DiagFiles, errs: [Diagnosti
 fn validate_nominal_row_vars_decl(d: Decl, file: String) : [Diagnostic] / Console + File = match decl_transparent_inner(d) {
   Some(inner) -> validate_nominal_row_vars_decl(inner, file)
   None -> match d {
-    DType(_, _, tparams, body, line, col, _, _) -> {
-      let free = names_excluding(row_names_of_typebody(body), tparams)
+    DType(_, _, _, body, line, col, _, _) -> {
+      let free = unbound_row_names(body)
       match free {
         [] -> []
         [name, ...__] -> {
@@ -3205,7 +3264,7 @@ fn validate_nominal_row_vars_decl(d: Decl, file: String) : [Diagnostic] / Consol
 # The constructed type and its fields are stamped from `hv`, the same
 # view the annotation side uses: a stamped head only meets an unstamped
 # one by the permissive rule, so both sides have to share it.
-fn scheme_of_variant(tsym: SymId, tparams: [String], v: Variant,
+fn scheme_of_variant(tsym: SymId, tparams: [TBinder], v: Variant,
                      hv: TyHomeView) : TyScheme {
   match v {
     Var(_ctor, vargs) -> {
@@ -3218,7 +3277,7 @@ fn scheme_of_variant(tsym: SymId, tparams: [String], v: Variant,
       # position become `rbinds` (resolved via `resolve_ty_with_binds`,
       # which preserves `TyFn` rows); the rest stay type-level `binds`.
       let rvar_names = cont_row_names_all(vargs, collect_rvars_in_typeexprs(vargs, []))
-      let tvar_names = names_excluding(tparams, rvar_names)
+      let tvar_names = names_excluding(tbs_ids(tparams), rvar_names)
       let binds = mk_tpbinds(tparams)
       # The row-var binds REUSE the ids `mk_tpbinds` already assigned to
       # each name (rather than re-numbering from zero with `mk_rvbinds`):
@@ -3250,23 +3309,23 @@ fn scheme_of_variant(tsym: SymId, tparams: [String], v: Variant,
   }
 }
 
-# Look up the type-var id assigned to a tparam name in its TPBind list.
-# A miss is a compiler bug: every name passed here comes from `tparams`,
+# Look up the type-var id assigned to a tparam in its TPBind list.
+# A miss is a compiler bug: every id passed here comes from `tparams`,
 # which `mk_tpbinds` binds in full — so panic rather than fabricate a
 # bogus id that would leak an ungeneralised type-var into the scheme.
-fn tpbind_id_of(binds: [TPBind], name: String) : Int =
-  match tpbind_lookup(binds, name) {
+fn tpbind_id_of(binds: [TPBind], id: TLocalId) : Int =
+  match tpbind_any(binds, id) {
     Some(i) -> i
-    None    -> panic("tpbind_id_of: tparam not in binds: #{name}")
+    None    -> panic("tpbind_id_of: tparam not in binds: #{tlocal_raw(id)}")
   }
 
-# Return the names in `xs` that are not present in `drop` (order-preserving).
+# Return the ids in `xs` that are not present in `drop` (order-preserving).
 # Used to separate a ctor's type-kind tparams from its row-kind ones.
-fn names_excluding(xs: [String], drop: [String]) : [String] {
+fn names_excluding(xs: [TLocalId], drop: [TLocalId]) : [TLocalId] {
   match xs {
     [] -> []
     [h, ...rest] ->
-      if list_has(drop, h) { names_excluding(rest, drop) }
+      if tids_has(drop, h) { names_excluding(rest, drop) }
       else { [h, ...names_excluding(rest, drop)] }
   }
 }
@@ -3288,7 +3347,7 @@ fn add_variants_of_decl(env: TyEnv, d: Decl, homes: TyHomes) : TyEnv {
 # `env.unions`, and `component_tag` reads the variant as a value where no
 # constructor answers. A variant with a payload always builds, and so
 # does one named like the sum that declares it.
-fn add_variants_loop(env: TyEnv, tsym: SymId, tparams: [String],
+fn add_variants_loop(env: TyEnv, tsym: SymId, tparams: [TBinder],
                        vs: [Variant], homes: TyHomes, hv: TyHomeView) : TyEnv {
   match vs {
     [] -> env
@@ -3412,7 +3471,7 @@ fn union_component_names(tab: SymTab, unions: UnionTable, parent: SymId) : [Stri
 # return-row plus every nested `TyFn` row inside parameter types and
 # the return type. Order of first occurrence is preserved so each
 # decl gets a stable assignment of bound row-var ids.
-fn collect_decl_rvars(d: Decl) : [String] {
+fn collect_decl_rvars(d: Decl) : [TLocalId] {
   match d {
     DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
       let acc0 = collect_rvars_in_row(rexpr, [])
@@ -3426,15 +3485,15 @@ fn collect_decl_rvars(d: Decl) : [String] {
   }
 }
 
-fn collect_rvars_in_row(re: RowExpr, acc: [String]) : [String] {
+# A tail no signature bound names no row variable.
+fn collect_rvars_in_row(re: RowExpr, acc: [TLocalId]) : [TLocalId] {
   match re {
-    REmpty -> acc
-    RClosed(_) -> acc
-    ROpen(rv, _) -> if list_has(acc, rv) { acc } else { list_append(acc, [rv]) }
+    ROpen(TpId(rv), _) -> tids_add(acc, rv)
+    _ -> acc
   }
 }
 
-fn collect_rvars_in_params(ps: [Param], acc: [String]) : [String] {
+fn collect_rvars_in_params(ps: [Param], acc: [TLocalId]) : [TLocalId] {
   match ps {
     [] -> acc
     [p, ...rest] -> {
@@ -3451,83 +3510,71 @@ fn collect_rvars_in_params(ps: [Param], acc: [String]) : [String] {
 # type (`e` in `from_list(...) : Stream[t, e]`), consulting the
 # per-type row-kind table. These join `collect_decl_rvars` so the row
 # var is bound + generalised even when it never appears after a `/`.
-fn collect_rowkind_args_decl(d: Decl, table: [RowKindEntry], hv: TyHomeView) : [String] = match d {
-  DFn(_, _, tparams, params, opt_ret, _, _, _, _, _) -> {
-    let a0 = collect_rowkind_args_params(params, table, tparams, [], hv)
+fn collect_rowkind_args_decl(d: Decl, table: [RowKindEntry], hv: TyHomeView) : [TLocalId] = match d {
+  DFn(_, _, _, params, opt_ret, _, _, _, _, _) -> {
+    let a0 = collect_rowkind_args_params(params, table, [], hv)
     match opt_ret {
-      Some(rty) -> collect_rowkind_args_te(rty, table, tparams, a0, hv)
+      Some(rty) -> collect_rowkind_args_te(rty, table, a0, hv)
       None      -> a0
     }
   }
   _ -> []
 }
 
-fn collect_rowkind_args_params(ps: [Param], table: [RowKindEntry], tparams: [String], acc: [String], hv: TyHomeView) : [String] = match ps {
+fn collect_rowkind_args_params(ps: [Param], table: [RowKindEntry], acc: [TLocalId], hv: TyHomeView) : [TLocalId] = match ps {
   [] -> acc
   [p, ...rest] -> {
     let a1 = match p.ptype {
-      Some(te) -> collect_rowkind_args_te(te, table, tparams, acc, hv)
+      Some(te) -> collect_rowkind_args_te(te, table, acc, hv)
       None     -> acc
     }
-    collect_rowkind_args_params(rest, table, tparams, a1, hv)
+    collect_rowkind_args_params(rest, table, a1, hv)
   }
 }
 
-fn collect_rowkind_args_te(t: TypeExpr, table: [RowKindEntry], tparams: [String], acc: [String], hv: TyHomeView) : [String] = match t.tkind {
+fn collect_rowkind_args_te(t: TypeExpr, table: [RowKindEntry], acc: [TLocalId], hv: TyHomeView) : [TLocalId] = match t.tkind {
   TyName(r, tas) -> {
-    let here = collect_rowkind_args_at(tas, row_kind_slots_of(table, r, hv), 0, tparams, acc)
-    collect_rowkind_args_tes(tas, table, tparams, here, hv)
+    let here = collect_rowkind_args_at(tas, row_kind_slots_of(table, r, hv), 0, acc)
+    collect_rowkind_args_tes(tas, table, here, hv)
   }
-  TyList(inner) -> collect_rowkind_args_te(inner, table, tparams, acc, hv)
-  TyFn(ps, ret, _) -> collect_rowkind_args_te(ret, table, tparams, collect_rowkind_args_tes(ps, table, tparams, acc, hv), hv)
-  TyDim(base, _) -> collect_rowkind_args_te(base, table, tparams, acc, hv)
-  TyRefine(base, _) -> collect_rowkind_args_te(base, table, tparams, acc, hv)
+  TyParam(_, tas) -> collect_rowkind_args_tes(tas, table, acc, hv)
+  TyList(inner) -> collect_rowkind_args_te(inner, table, acc, hv)
+  TyFn(ps, ret, _) -> collect_rowkind_args_te(ret, table, collect_rowkind_args_tes(ps, table, acc, hv), hv)
+  TyDim(base, _) -> collect_rowkind_args_te(base, table, acc, hv)
+  TyRefine(base, _) -> collect_rowkind_args_te(base, table, acc, hv)
   TyRow(_) -> acc
-  TySurface(ts) -> collect_rowkind_args_tes(tysurface_children(ts), table, tparams, acc, hv)
+  TySurface(ts) -> collect_rowkind_args_tes(tysurface_children(ts), table, acc, hv)
 }
 
-fn collect_rowkind_args_tes(ts: [TypeExpr], table: [RowKindEntry], tparams: [String], acc: [String], hv: TyHomeView) : [String] = match ts {
+fn collect_rowkind_args_tes(ts: [TypeExpr], table: [RowKindEntry], acc: [TLocalId], hv: TyHomeView) : [TLocalId] = match ts {
   [] -> acc
-  [t, ...rest] -> collect_rowkind_args_tes(rest, table, tparams, collect_rowkind_args_te(t, table, tparams, acc, hv), hv)
+  [t, ...rest] -> collect_rowkind_args_tes(rest, table, collect_rowkind_args_te(t, table, acc, hv), hv)
 }
 
-# For each slot index in `idxs`, if that slot is a bare written name `n`,
-# collect `n` when it names a row *variable*. A row-kind slot also
-# accepts a concrete effect (`Box[Log]`), which must NOT be bound here:
-# binding it would generalise the scheme over it, and every call site
-# would instantiate a fresh free row that unifies with any other row —
+# For each slot index in `idxs`, collect the slot's argument when it is
+# a type parameter: a row *variable*. A row-kind slot also accepts a
+# concrete effect (`Box[Log]`), which must NOT be bound here: binding it
+# would generalise the scheme over it, and every call site would
+# instantiate a fresh free row that unifies with any other row —
 # `Box[Beep]` would pass where `Box[Log]` is expected.
-#
-# A name is a row variable when the signature declares it as a tparam,
-# or when it qualifies as an implicit one (the lowercase rule the
-# sibling implicit-tparam collector applies). Anything else names a
-# declared effect and stays rigid.
 fn collect_rowkind_args_at(tas: [TypeExpr], idxs: [Int], i: Int,
-                           tparams: [String], acc: [String]) : [String] = match tas {
+                           acc: [TLocalId]) : [TLocalId] = match tas {
   [] -> acc
   [a, ...rest] -> {
     let a1 = if list_has_int(idxs, i) {
       match a.tkind {
-        TyName(r, []) -> {
-          let n = ref_name(r)
-          if is_rowkind_slot_var(n, tparams) and not list_has(acc, n) { list_append(acc, [n]) }
-          else { acc }
-        }
+        TyParam(n, []) -> tids_add(acc, n)
         _ -> acc
       }
     } else { acc }
-    collect_rowkind_args_at(rest, idxs, i + 1, tparams, a1)
+    collect_rowkind_args_at(rest, idxs, i + 1, a1)
   }
 }
 
-# Does `n`, sitting in a row-kind slot, name a row variable rather than
-# a concrete effect?
-fn is_rowkind_slot_var(n: String, tparams: [String]) : Bool =
-  list_has(tparams, n) or is_implicit_tparam_candidate(n)
-
-fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
+fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [TLocalId]) : [TLocalId] {
   match t.tkind {
     TyName(_, tas) -> collect_rvars_in_typeexprs(tas, acc)
+    TyParam(_, tas) -> collect_rvars_in_typeexprs(tas, acc)
     TyList(inner)  -> collect_rvars_in_typeexpr(inner, acc)
     TyFn(ps, ret, rexpr) -> {
       let acc1 = collect_rvars_in_typeexprs(ps, acc)
@@ -3548,21 +3595,21 @@ fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
   }
 }
 
-fn collect_rvars_in_typeexprs(ts: [TypeExpr], acc: [String]) : [String] {
+fn collect_rvars_in_typeexprs(ts: [TypeExpr], acc: [TLocalId]) : [TLocalId] {
   match ts {
     [] -> acc
     [t, ...rest] -> collect_rvars_in_typeexprs(rest, collect_rvars_in_typeexpr(t, acc))
   }
 }
 
-fn mk_rvbinds_loop(names: [String], i: Int, acc: [RVBind]) : [RVBind] {
+fn mk_rvbinds_loop(names: [TLocalId], i: Int, acc: [RVBind]) : [RVBind] {
   match names {
     [] -> list_reverse(acc)
     [n, ...rest] -> mk_rvbinds_loop(rest, i + 1, [RVB(n, i), ...acc])
   }
 }
 
-fn mk_rvbinds(names: [String]) : [RVBind] = mk_rvbinds_loop(names, 0, [])
+fn mk_rvbinds(names: [TLocalId]) : [RVBind] = mk_rvbinds_loop(names, 0, [])
 
 fn rvbind_ids_loop(binds: [RVBind], acc: [Int]) : [Int] {
   match binds {
@@ -3588,25 +3635,14 @@ fn rvbind_ids(binds: [RVBind]) : [Int] = rvbind_ids_loop(binds, [])
 # `TyCon` carries the same home the record table gives a literal.
 fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : Ty {
   match t.tkind {
-    TyName(th, tas) -> {
-      let name = ref_name(th)
-      match shape_tparam_lookup(tpbinds, name) {
-        # A shape tparam applied to its single type argument forms `s[A]`.
-        # A bare `s` (no args) is the unapplied shape variable. More than
-        # one arg is an arity violation caught by the formation validator.
-        Some(sid) -> match tas {
-          [arg] -> TyShapeApp(sid, resolve_ty_with_binds(arg, tpbinds, rbinds, rk, hv))
-          _ -> tv(sid)
-        }
-        None -> match tpbind_lookup(tpbinds, name) {
-        Some(i) -> tv(i)
-        None -> match undeclared_ty_named(name, SnValue) {
-          Some(t) -> t
-          None -> tsh_tycon_at(hv, th,
-                               cont_full_args(th, resolve_tycon_args(tas, row_kind_slots_of(rk, th, hv), 0, tpbinds, rbinds, rk, hv)))
-        }
-      }
-      }
+    # A shape tparam applied to its single type argument forms `s[A]`.
+    # A bare `s` (no args) is the unapplied shape variable. More than
+    # one arg is an arity violation caught by the formation validator.
+    TyParam(id, tas) -> tparam_use(tpbinds, id, map(tas, (a) => resolve_ty_with_binds(a, tpbinds, rbinds, rk, hv)))
+    TyName(th, tas) -> match undeclared_ty_named(ref_name(th), SnValue) {
+      Some(t) -> t
+      None -> tsh_tycon_at(hv, th,
+                           cont_full_args(th, resolve_tycon_args(tas, row_kind_slots_of(rk, th, hv), 0, tpbinds, rbinds, rk, hv)))
     }
     TyList(inner) -> TyListT(resolve_ty_with_binds(inner, tpbinds, rbinds, rk, hv))
     TyFn(fps, fret, rexpr) ->
@@ -3614,8 +3650,8 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [
             resolve_ty_with_binds(fret, tpbinds, rbinds, rk, hv),
             row_of_expr_with_binds(rexpr, tpbinds, rbinds, hv))
     # dimensioned base — resolve the inner Ty against tpbinds,
-    # then walk the unit and rewrite any symbol that names a unit
-    # tparam (`[u: Measure]` → name "u#Unit") to UVar(id).
+    # then walk the unit and rewrite each use of a unit tparam
+    # (`[u: Measure]`) to UVar(id).
     TyDim(base, u) ->
       dim_collapse(resolve_ty_with_binds(base, tpbinds, rbinds, rk, hv),
                    unit_canon(unit_resolve_tparams(u, tpbinds)))
@@ -3652,29 +3688,27 @@ fn resolve_tycon_args(tas: [TypeExpr], idxs: [Int], i: Int,
 # same generalised row var.
 fn resolve_tycon_arg(t: TypeExpr, is_row: Bool, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : Ty {
   match t.tkind {
-    TyName(r, tas) ->
-      match tas {
-        [] -> match inf_rvbind_lookup(rbinds, ref_name(r)) {
-          Some(id) -> row_arg_carrier(row_with_tail(id))
-          None     -> if is_row { inf_resolve_row_arg(t, hv) }
-                      else { resolve_ty_with_binds(t, tpbinds, rbinds, rk, hv) }
-        }
-        _ -> resolve_ty_with_binds(t, tpbinds, rbinds, rk, hv)
-      }
+    TyParam(p, []) -> match inf_rvbind_lookup(rbinds, p) {
+      Some(id) -> row_arg_carrier(row_with_tail(id))
+      None     -> if is_row { inf_resolve_row_arg(t, hv) }
+                  else { resolve_ty_with_binds(t, tpbinds, rbinds, rk, hv) }
+    }
+    TyName(_, []) ->
+      if is_row { inf_resolve_row_arg(t, hv) }
+      else { resolve_ty_with_binds(t, tpbinds, rbinds, rk, hv) }
     TyRow(rexpr) -> row_arg_carrier(row_of_expr_with_binds(rexpr, tpbinds, rbinds, hv))
     _ -> resolve_ty_with_binds(t, tpbinds, rbinds, rk, hv)
   }
 }
 
-# walk a UnitExprT and replace USym("u") with UVar(id) when "u"
-# matches a unit-kind tparam. Type-kind tparams are left alone — they
-# would be a category error in unit position; we surface that as a
-# unification failure later if necessary, not as a parser/resolve error.
+# walk a UnitExprT and replace each use of a unit-kind tparam the
+# binding holds with its UVar(id). One it does not hold stays as it is.
 fn unit_resolve_tparams(u: UnitExprT, tpbinds: [TPBind]) : UnitExprT {
   match u {
     UOne -> u
     UVar(_) -> u
-    USym(s) -> match unit_tparam_lookup(tpbinds, s) {
+    USym(_) -> u
+    UParam(p) -> match unit_tparam_lookup(tpbinds, p) {
       Some(id) -> UVar(id)
       None     -> u
     }
@@ -3691,40 +3725,31 @@ fn units_resolve_tparams(us: [UnitExprT], tpbinds: [TPBind]) : [UnitExprT] = mat
   [u, ...rest] -> [unit_resolve_tparams(u, tpbinds), ...units_resolve_tparams(rest, tpbinds)]
 }
 
-# Look up a unit-kind tparam by its surface name. The tparam list
-# stores names with the "#Unit" suffix for unit-kind params; the
-# resolver compares the bare surface name against the suffix-stripped
-# stored name.
-fn unit_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
+# The unit variable of the unit-kind tparam `p`, if the binding holds it.
+fn unit_tparam_lookup(binds: [TPBind], p: TLocalId) : Option[Int] {
   match binds {
     [] -> None
     [b, ...rest] -> match b {
       TPB(stored, id) -> {
-        if tp_kind_is_unit(stored) and tp_strip_kind(stored) == surface { Some(id) }
-        else { unit_tparam_lookup(rest, surface) }
+        if tb_is_unit(stored) and tlocal_eq(stored.id, p) { Some(id) }
+        else { unit_tparam_lookup(rest, p) }
       }
     }
   }
 }
 
-# Look up a shape-kind tparam by its surface name. Shape params store a
-# `#Shape` suffix, so the surface name in constructor position (`s` in
-# `s[A]`) is matched against the stripped stored name.
-fn shape_tparam_lookup(binds: [TPBind], surface: String) : Option[Int] {
+# The variable of the shape-kind tparam `p`, if the binding holds it.
+fn shape_tparam_lookup(binds: [TPBind], p: TLocalId) : Option[Int] {
   match binds {
     [] -> None
     [b, ...rest] -> match b {
       TPB(stored, id) -> {
-        if tp_kind_is_shape(stored) and tp_strip_kind(stored) == surface { Some(id) }
-        else { shape_tparam_lookup(rest, surface) }
+        if tb_is_shape(stored) and tlocal_eq(stored.id, p) { Some(id) }
+        else { shape_tparam_lookup(rest, p) }
       }
     }
   }
 }
-
-# tp_unit_suffix lives in compiler/ast.kai; tp_make lives in
-# compiler/parse.kai; the kind decoders (tp_kind_is_unit / tp_kind_of /
-# tp_strip_kind / tp_kind_name) live in compiler/kinds.kai.
 
 # The binder the `var` desugar mints to pin a declared cell type.
 fn pat_binds_var_ann(p: Pattern) : Bool = pat_is_var_ann(p)
@@ -3749,7 +3774,7 @@ fn row_of_expr_with_binds(re: RowExpr, tpbinds: [TPBind], rbinds: [RVBind], hv: 
     }
     ROpen(rv, labels) -> Row {
       labels: row_labels_of_rls_with_binds(labels, tpbinds, rbinds, hv),
-      tail: match inf_rvbind_lookup(rbinds, rv) {
+      tail: match inf_rvbind_lookup(rbinds, tail_id(rv)) {
         Some(id) -> Some(id)
         None     -> Some(-1)
       },
@@ -3803,8 +3828,7 @@ pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
       let rk_names = collect_rowkind_args_decl(d, row_kind_table, hv)
       let names = list_append(collect_decl_rvars(d), rk_names)
       let rbinds = mk_rvbinds(names)
-      let implicit = collect_implicit_tparams_in_decl(d, tparams)
-      let effective_tparams = list_append(tparams, implicit)
+      let effective_tparams = tbs_positional(tparams)
       let tpbinds = mk_tpbinds(effective_tparams)
       let pts = map(params, (p) => param_ty_with_binds(p, tpbinds, rbinds, row_kind_table, hv))
       let ret = match opt_ret {
@@ -3873,93 +3897,6 @@ fn decl_types_as_entry(hs: TyHomes, f: FnId) : Bool =
 # an imported module's `main` gets none of the entry point's.
 fn unrowed_notes(st: InferState, f: FnId) : [String] =
   if is_imported_main(tsh_roots(st.env.ty_homes), st_mo(st), f) { [imported_main_note()] } else { [] }
-
-# walk a decl's signature for lowercase identifiers in type
-# position, appending them in first-seen order. Skip names already
-# declared in the explicit `[…]` tparam list, builtin primitive
-# names (which start uppercase anyway, but defensive), and the empty
-# string. Used by `fn_scheme_of_decl` and `infer_decl` to make
-# implicit polymorphism work the way earlier code (and the stdlib)
-# already assumed.
-#[doc("infer: `collect_implicit_tparams_in_decl` — typer entry point invoked by the driver.")]
-pub fn collect_implicit_tparams_in_decl(d: Decl, declared: [String]) : [String] {
-  match d {
-    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
-      let acc0 = collect_implicit_in_params(params, declared, [])
-      let acc1 = match opt_ret {
-        Some(rty) -> collect_implicit_in_typeexpr(rty, declared, acc0)
-        None      -> acc0
-      }
-      collect_implicit_in_row(rexpr, declared, acc1)
-    }
-    _ -> []
-  }
-}
-
-fn collect_implicit_in_params(ps: [Param], declared: [String], acc: [String]) : [String] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> {
-      let acc1 = match p.ptype {
-        Some(te) -> collect_implicit_in_typeexpr(te, declared, acc)
-        None     -> acc
-      }
-      collect_implicit_in_params(rest, declared, acc1)
-    }
-  }
-}
-
-fn collect_implicit_in_typeexpr(t: TypeExpr, declared: [String], acc: [String]) : [String] {
-  match t.tkind {
-    TyName(r, tas) -> {
-      let name = ref_name(r)
-      let acc1 = collect_implicit_in_typeexprs(tas, declared, acc)
-      if is_implicit_tparam_candidate(name) and not list_has(declared, name) and not list_has(acc1, name) { list_append(acc1, [name]) } else { acc1 }
-    }
-    TyList(inner) -> collect_implicit_in_typeexpr(inner, declared, acc)
-    TyFn(ps, ret, rexpr) -> {
-      let acc1 = collect_implicit_in_typeexprs(ps, declared, acc)
-      let acc2 = collect_implicit_in_typeexpr(ret, declared, acc1)
-      collect_implicit_in_row(rexpr, declared, acc2)
-    }
-    # implicit-tparam collection for dimensioned types — recurse
-    # into the base ty; unit-vars are NOT implicitly generalised, the
-    # user must declare them via `[u: Measure]`.
-    TyDim(base, _) -> collect_implicit_in_typeexpr(base, declared, acc)
-    # refinements stay transparent; only the base type
-    # contributes implicit type parameters.
-    TyRefine(base, _) -> collect_implicit_in_typeexpr(base, declared, acc)
-    # a compound row as a type argument — recurse into any
-    # parameterised labels it carries (`Reader[t]`) for implicit tparams.
-    TyRow(row) -> collect_implicit_in_row(row, declared, acc)
-    TySurface(ts) -> collect_implicit_in_typeexprs(tysurface_children(ts), declared, acc)
-  }
-}
-
-fn collect_implicit_in_typeexprs(ts: [TypeExpr], declared: [String], acc: [String]) : [String] {
-  match ts {
-    [] -> acc
-    [t, ...rest] -> collect_implicit_in_typeexprs(rest, declared, collect_implicit_in_typeexpr(t, declared, acc))
-  }
-}
-
-fn collect_implicit_in_row(re: RowExpr, declared: [String], acc: [String]) : [String] {
-  match re {
-    REmpty -> acc
-    RClosed(labels) -> collect_implicit_in_row_labels(labels, declared, acc)
-    ROpen(_, labels) -> collect_implicit_in_row_labels(labels, declared, acc)
-  }
-}
-
-fn collect_implicit_in_row_labels(labels: [RowLabel], declared: [String], acc: [String]) : [String] {
-  match labels {
-    [] -> acc
-    [l, ...rest] -> match l {
-      RL(_, tas) -> collect_implicit_in_row_labels(rest, declared,
-                       collect_implicit_in_typeexprs(tas, declared, acc))
-    }
-  }
-}
 
 # A name is an implicit-tparam candidate if it begins with a
 # lowercase letter. Builtin primitives (Int, Real, Bool, …) all
@@ -4089,7 +4026,7 @@ fn append_op_arities(a: [OpEffArity], b: [OpEffArity]) : [OpEffArity] {
 # and treats the call as an op invocation.
 type EnvWithArities = { env: TyEnv, arities: [OpEffArity] }
 
-fn add_effect_op_sigs(env: TyEnv, tparams: [String],
+fn add_effect_op_sigs(env: TyEnv, tparams: [TBinder],
                        ops: [EffectOp], esym: SymId, hv: TyHomeView) : EnvWithArities {
   let binds = mk_tpbinds(tparams)
   let ids = tparam_ids(tparams)
@@ -4154,7 +4091,7 @@ fn add_effect_op_sigs_loop(env: TyEnv, binds: [TPBind],
 # directly. The op's outer row is always empty (ops run inside a
 # handler context), so only nested TyFn rows in param / ret types
 # can introduce row variables.
-fn collect_op_rvars(params: [Param], ret: TypeExpr) : [String] {
+fn collect_op_rvars(params: [Param], ret: TypeExpr) : [TLocalId] {
   let acc0 = collect_rvars_in_params(params, [])
   collect_rvars_in_typeexpr(ret, acc0)
 }
@@ -4164,7 +4101,7 @@ fn collect_op_rvars(params: [Param], ret: TypeExpr) : [String] {
 # so the offset is 0 today; the parameter exists for symmetry with
 # `mk_tpbinds_from` and to avoid silent breakage if effect-level
 # row generics ever land.
-fn mk_rvbinds_from(names: [String], start: Int) : [RVBind] =
+fn mk_rvbinds_from(names: [TLocalId], start: Int) : [RVBind] =
   mk_rvbinds_loop(names, start, [])
 
 # variant of `param_tys_with_binds` that resolves
@@ -4361,8 +4298,8 @@ type Subst = {
   rigid: [RigidTv]
 }
 
-#[doc("infer: a declared type parameter's var id, its name and the fn declaring it, rigid inside that fn's body.")]
-pub type RigidTv = RigidTv(Int, String, String)
+#[doc("infer: a declared type parameter's var id, its binder (none for an op's own parameter, unnamed in its clause) and the fn declaring it, rigid inside that fn's body.")]
+pub type RigidTv = RigidTv(Int, Option[TBinder], String)
 
 #[doc("infer: a (unit-var id, kind name) constraint entry.")]
 pub type UVKind = UVK(Int, String)
@@ -4577,6 +4514,7 @@ fn unit_to_table_at(u: UnitExprT, scale: Int, t: UTable) : UTable {
   match u {
     UOne -> t
     USym(s) -> UTable { syms: usym_insert(t.syms, s, scale), vars: t.vars }
+    UParam(p) -> UTable { syms: usym_insert(t.syms, unit_param_atom(p), scale), vars: t.vars }
     UVar(v) -> UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
     UMul(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
     UInv(a) -> unit_to_table_at(a, 0 - scale, t)
@@ -4608,6 +4546,7 @@ fn unit_resolve_to_at(u: UnitExprT, scale: Int, t: UTable, s: Subst, seen: [Int]
   match u {
     UOne -> t
     USym(sm) -> UTable { syms: usym_insert(t.syms, sm, scale), vars: t.vars }
+    UParam(p) -> UTable { syms: usym_insert(t.syms, unit_param_atom(p), scale), vars: t.vars }
     UVar(v) -> {
       if list_has_int(seen, v) {
         UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
@@ -6022,20 +5961,21 @@ fn st_annot_labels(st: InferState, ls: [RowLabel]) : [Label] = match rigid_binds
 # An op's own type parameter is rigid in its clause but unnamed there.
 fn rigid_binds(rs: [RigidTv]) : [TPBind] = match rs {
   [] -> []
-  [RigidTv(i, n, _), ...rest] -> if n == "" { rigid_binds(rest) } else { [TPB(n, i), ...rigid_binds(rest)] }
+  [RigidTv(i, Some(b), _), ...rest] -> [TPB(b, i), ...rigid_binds(rest)]
+  [_, ...rest] -> rigid_binds(rest)
 }
 
-fn rigid_tparams(binds: [TPBind], declared: [String], owner: String) : [RigidTv] =
-  rigid_first_each(binds, declared, owner, [])
+# The declared type-kind parameters among `binds`.
+fn rigid_tparams(binds: [TPBind], owner: String) : [RigidTv] = match binds {
+  [] -> []
+  [TPB(b, i), ...rest] ->
+    if tb_is_type(b) and not b.implicit { [RigidTv(i, Some(b), owner), ...rigid_tparams(rest, owner)] }
+    else { rigid_tparams(rest, owner) }
+}
 
-# A name bound twice keeps its first id, the one the body's lookups find.
-fn rigid_first_each(binds: [TPBind], declared: [String], owner: String, acc: [RigidTv]) : [RigidTv] = match binds {
-  [] -> list_reverse(acc)
-  [TPB(n, i), ...rest] ->
-    if list_has(declared, n) and not tp_kind_is_unit(n) and not tp_kind_is_shape(n)
-       and not any(acc, (r) => match r { RigidTv(_, m, _) -> m == tp_strip_kind(n) }) {
-      rigid_first_each(rest, declared, owner, [RigidTv(i, tp_strip_kind(n), owner), ...acc])
-    } else { rigid_first_each(rest, declared, owner, acc) }
+fn rigid_name(o: Option[TBinder]) : String = match o {
+  Some(b) -> tb_text(b)
+  None    -> ""
 }
 
 fn subst_with_rigid(s: Subst, rs: [RigidTv]) : Subst =
@@ -6486,7 +6426,7 @@ fn field_init_list_has(fs: [FieldInit], target: String) : Bool {
 }
 
 #[derive(BinSerialize)]
-pub type SumInfo = SI(SymId, [String], [Variant], Option[String])
+pub type SumInfo = SI(SymId, [TBinder], [Variant], Option[String])
               # declaration, tparams, variants, module_origin (None = root file)
 
 fn sum_find_loop(ss: [SumInfo], target: Int) : Option[SumInfo] {
@@ -7369,20 +7309,20 @@ fn rigid_forced(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = mat
 
 fn rigid_first_bound(st: InferState, rs: [RigidTv], all: [RigidTv], s2: Subst) : Option[RigidWhy] = match rs {
   [] -> None
-  [RigidTv(i, n, owner), ...rest] -> match apply_ty(s2, TyVarT(i)) {
+  [RigidTv(i, b, owner), ...rest] -> match apply_ty(s2, TyVarT(i)) {
     TyVarT(j) -> match rigid_named(all, j, i) {
-      Some("") -> Some(rigid_text(n, owner, "another type parameter"))
-      Some(o)  -> Some(rigid_text(n, owner, concat_all(["`", o, "`"])))
+      Some("") -> Some(rigid_text(rigid_name(b), owner, "another type parameter"))
+      Some(o)  -> Some(rigid_text(rigid_name(b), owner, concat_all(["`", o, "`"])))
       None    -> rigid_first_bound(st, rest, all, s2)
     }
-    t -> Some(rigid_text(n, owner, concat_all(["`", inf_ty_to_string_ow(st.env.tab, st.env.head_owners, t), "`"])))
+    t -> Some(rigid_text(rigid_name(b), owner, concat_all(["`", inf_ty_to_string_ow(st.env.tab, st.env.head_owners, t), "`"])))
   }
 }
 
 # Another rigid parameter `j` resolves to, other than `self`.
 fn rigid_named(rs: [RigidTv], j: Int, self: Int) : Option[String] = match rs {
   [] -> None
-  [RigidTv(i, n, _), ...rest] -> if i == j and i != self { Some(n) } else { rigid_named(rest, j, self) }
+  [RigidTv(i, b, _), ...rest] -> if i == j and i != self { Some(rigid_name(b)) } else { rigid_named(rest, j, self) }
 }
 
 fn rigid_text(name: String, owner: String, what: String) : RigidWhy =
@@ -8030,7 +7970,7 @@ type FTy = FT(String, Ty)
 
 type RecInst = { st: InferState, result_ty: Ty, fields: [FTy] }
 
-fn rec_tpbinds_loop(tps: [String], start: Int, i: Int, acc: [TPBind]) : [TPBind] {
+fn rec_tpbinds_loop(tps: [TBinder], start: Int, i: Int, acc: [TPBind]) : [TPBind] {
   match tps {
     [] -> list_reverse(acc)
     [n, ...rest] -> rec_tpbinds_loop(rest, start, i + 1, [TPB(n, start + i), ...acc])
@@ -8058,21 +7998,21 @@ type RecRows = { binds: [RVBind], sub: Subst }
 
 # One fresh row var per row-kind tparam, per instantiation: a shared id
 # would let two instances' rows unify with each other.
-fn rec_row_binds(tps: [String], row_names: [String], s: Subst, acc: [RVBind]) : RecRows {
+fn rec_row_binds(tps: [TBinder], row_names: [TLocalId], s: Subst, acc: [RVBind]) : RecRows {
   match tps {
     [] -> RecRows { binds: list_reverse(acc), sub: s }
     [n, ...rest] ->
-      if list_has(row_names, n) {
+      if tids_has(row_names, n.id) {
         let fr = subst_fresh_row(s)
-        rec_row_binds(rest, row_names, fr.subst, [RVB(n, fr.id), ...acc])
+        rec_row_binds(rest, row_names, fr.subst, [RVB(n.id, fr.id), ...acc])
       } else { rec_row_binds(rest, row_names, s, acc) }
   }
 }
 
-fn rec_head_slots(tps: [String], binds: [TPBind], rbinds: [RVBind]) : [Ty] =
-  map(tps, (n) => match inf_rvbind_lookup(rbinds, n) {
+fn rec_head_slots(tps: [TBinder], binds: [TPBind], rbinds: [RVBind]) : [Ty] =
+  map(tps, (n) => match inf_rvbind_lookup(rbinds, n.id) {
     Some(id) -> row_arg_carrier(row_with_tail(id))
-    None     -> tv(tpbind_id_of(binds, n))
+    None     -> tv(tpbind_id_of(binds, n.id))
   })
 
 fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
@@ -8215,9 +8155,92 @@ fn synth_callee(st: InferState, callee: Expr) : Inferred / Console + File + Muta
 
 fn synth_settled(st: InferState, r: Settled, w: Written, called: Bool, e: Expr) : Inferred / Console + File + Mutable = match r {
   SetOne(s)    -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
-  SetTie(ss)   -> inferred_leaf(report_name_tie(st, w, ss, called, e.line, e.col), TyAny, e)
+  SetTie(ss)   -> if op_tie(st, ss) { synth_op_ref(st, w, ss, called, e) }
+                  else { inferred_leaf(report_name_tie(st, w, ss, called, e.line, e.col), TyAny, e) }
   SetOther(ss) -> inferred_leaf(report_no_value(st, w, ss, e.line, e.col), TyAny, e)
   SetNone      -> inferred_leaf(report_no_declaration(st, w, e.line, e.col), TyAny, e)
+}
+
+# True when the tie is between dispatchers alone: one operation, declared
+# by several protocols.
+fn op_tie(st: InferState, ss: [SymId]) : Bool = all(ss, (s) => pid_is_disp(st.protos.ids, s))
+
+# An operation several protocols declare, read where nothing tells them
+# apart. Called, the reference stays between its dispatchers and the
+# dispatch rewrite settles it by the receiver. Read as a value it is the
+# function that calls it, so the same holds of that call.
+fn synth_op_ref(st: InferState, w: Written, ss: [SymId], called: Bool, e: Expr) : Inferred / Console + File + Mutable =
+  if called {
+    let c = op_unsettled(st, ss, e.line, e.col)
+    match c.ty {
+      Some(t) -> inferred_leaf(c.st, t, Expr { ...e, kind: EMark(MkProtoOp(ss)) })
+      None    -> inferred_leaf(report_name_tie(c.st, w, ss, true, e.line, e.col), TyAny, e)
+    }
+  }
+  else { match contest_arity(st.protos.ids, ss) {
+    Some(n) -> synth(st, contest_as_function(e, n))
+    None    -> inferred_leaf(report_name_tie(st, w, ss, false, e.line, e.col), TyAny, e)
+  } }
+
+# A reference left between dispatchers, with the state past it: the type
+# it has, or none when the dispatchers share no type.
+type OpTyped = { st: InferState, ty: Option[Ty] }
+
+# The type is the one every dispatcher of `ss` has, so the call is typed
+# whichever protocol answers. The end of the declaration is told of it.
+fn op_unsettled(st: InferState, ss: [SymId], line: Int, col: Int) : OpTyped / Mutable = {
+  let c = op_common(st, ss, None)
+  match c.ty {
+    Some(t) -> OpTyped { st: st_push_deferred_hom(c.st, DOp(ss, t, line, col)), ty: c.ty }
+    None    -> c
+  }
+}
+
+# Each dispatcher's own type, unified. The state is past every
+# instantiation whatever the answer.
+fn op_common(st: InferState, ss: [SymId], ty: Option[Ty]) : OpTyped / Mutable = match ss {
+  [] -> OpTyped { st: st, ty: ty }
+  [s, ...rest] -> match env_sym(st.env, s) {
+    None     -> OpTyped { st: st, ty: None }
+    Some(sc) -> {
+      let inst = st_instantiate_report(st, sc)
+      match ty {
+        None    -> op_common(inst.st, rest, Some(inst.ty))
+        Some(t) -> match unify_env(inst.st.env, t, inst.ty, inst.st.sub) {
+          Some(sub) -> op_common(st_set_sub(inst.st, sub), rest, ty)
+          None      -> OpTyped { st: inst.st, ty: None }
+        }
+      }
+    }
+  }
+}
+
+# An operation left between dispatchers waits for the type that receives
+# it. One whose parameter or result is still a variable the declaration's
+# own signature `sig` does not mention has nothing left to wait for.
+fn report_stranded_ops(st: InferState, hs: [DeferredHom], sig: [Ty]) : InferState / Console + File = match hs {
+  [] -> st
+  [h, ...rest] -> match h {
+    DOp(ss, want, line, col) ->
+      report_stranded_ops(if op_stranded(st, apply_ty(st.sub, want), sig) { report_op_stranded(st, ss, line, col) } else { st }, rest, sig)
+    DHom(_, _, _, _) -> report_stranded_ops(st, rest, sig)
+  }
+}
+
+fn op_stranded(st: InferState, want: Ty, sig: [Ty]) : Bool = match want {
+  TyFnT(ps, ret, _) -> any([ret, ...ps], (t) => match t {
+    TyVarT(v) -> not occurs_any(v, sig, st.sub)
+    _         -> false
+  })
+  _ -> false
+}
+
+fn report_op_stranded(st: InferState, ss: [SymId], line: Int, col: Int) : InferState / Console + File = {
+  let tab = st.env.tab
+  let shown = map(contest_protocols(st.protos.ids, ss), (p) => "`#{decl_name(tab, p)}` of #{home_shown(st, sym_owner(tab, p))}")
+  let d = contest_stranded_diag(st.file, line, col, st.protos.ids, ss, shown)
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
 }
 
 # Nothing the reader's scope reaches declares the name.
@@ -8343,19 +8366,20 @@ fn opt_syms(os: [Option[SymId]]) : [SymId] = match os {
   [None, ...rest]    -> opt_syms(rest)
 }
 
-# A bare name on the scope ladder. A dispatcher the resolver left to the
-# type stands for one operation whichever home generated it, so the scope
-# has no tie to report about it. A name no declaration of the classes
+# A bare name on the scope ladder. Dispatchers the resolver left to the
+# type stand for one operation whichever home generated them: one is the
+# answer, several are a tie the receiver's type settles. A name no
+# declaration of the classes
 # answers may still be a union's tag, and past that it is whatever else
 # the scope declares under it.
 fn settle_bare(st: InferState, name: String, cs: [NCls]) : Settled = match settle_on_ladder(st, name, cs) {
   SetOne(s) -> SetOne(s)
-  r         -> match shared_dispatcher(st, name, cs) {
-    Some(s) -> SetOne(s)
-    None    -> match r {
+  r         -> match op_dispatchers(st, name, cs, r) {
+    [] -> match r {
       SetNone -> if list_is_empty(cs) { SetNone } else { settle_unanswered(st, name, cs) }
       _       -> r
     }
+    ss -> settle_list(ss)
   }
 }
 
@@ -8398,17 +8422,20 @@ fn names_a_kind(c: NCls) : Bool = match c {
   _            -> false
 }
 
-# The dispatchers generated under `name`, whichever module holds the
-# protocol: the resolver reaches an operation through the protocol rung,
-# which sees past the reader's imports. They stand for one operation, and
-# the dispatch rewrite finds the impl from the receiver's type whichever
-# of them the call names.
-fn shared_dispatcher(st: InferState, name: String, cs: [NCls]) : Option[SymId] =
-  if not ncls_in(cs, NCFn) { None }
-  else { match filter(ty_env_collect_candidates(st.env, name), (c) => pid_is_disp(st.protos.ids, c.sym)) {
-    [c, ..._] -> Some(c.sym)
-    []        -> None
+# The dispatchers `name` is left between. A tie the scope found among
+# dispatchers alone is that set. Otherwise it is every dispatcher
+# generated under the name, whichever module holds the protocol: the
+# resolver reaches an operation through the protocol rung, which sees
+# past the reader's imports.
+fn op_dispatchers(st: InferState, name: String, cs: [NCls], r: Settled) : [SymId] =
+  if not ncls_in(cs, NCFn) { [] }
+  else { match r {
+    SetTie(ss) -> if op_tie(st, ss) { ss } else { env_dispatchers(st, name) }
+    _          -> env_dispatchers(st, name)
   } }
+
+fn env_dispatchers(st: InferState, name: String) : [SymId] =
+  sym_list_unique(map(filter(ty_env_collect_candidates(st.env, name), (c) => pid_is_disp(st.protos.ids, c.sym)), (c) => c.sym), [])
 
 # The scope's answer for `name`: the reader's own module, its picks, its
 # imports and the cores are climbed in that order, as the resolver climbs
@@ -9052,7 +9079,7 @@ fn bind_clause_env_typed(st: InferState, eff: SymId, op_name: String,
       # clause must handle every choice: rigid for the clause body.
       let op_rigid = drop(inst.fresh, eff_arity)
       let st_rigid = st_set_sub(st_unified, subst_with_rigid(st_unified.sub,
-                       list_append(map(op_rigid, (i) => RigidTv(i, "", key)), st_unified.sub.rigid)))
+                       list_append(map(op_rigid, (i) => RigidTv(i, None, key)), st_unified.sub.rigid)))
       match inst.ty {
         TyFnT(arg_tys, ret_ty, _) -> {
           let bound = bind_params_with_sig_typed(st_rigid, params, arg_tys, ret_ty,
@@ -9739,7 +9766,7 @@ fn synth_threaded_arg(st: InferState, x: Expr,
       Some(et) ->
         if arg_wants_vec_context(x, et) {
           check_expr_against(st, x, et, "argument", x.line, x.col)
-        } else { synth(st, x) }
+        } else { synth_expecting(st, x, et) }
       None -> synth(st, x)
     }
   }
@@ -9786,6 +9813,25 @@ fn synth_many_vec_args(st: InferState, es: [Expr],
                      exprs: [lowered.expr, ...rr.exprs] }
     }
   }
+}
+
+# `synth_many` with each argument's declared parameter in hand, where no
+# other context rule applies: a record literal's head is asked of it.
+fn synth_many_expecting(st: InferState, es: [Expr], param_tys: [Ty]) : InferredList / Console + File + Mutable = match es {
+  [] -> InferredList { st: st, tys: [], exprs: [] }
+  [x, ...rest] -> {
+    let r = match param_tys {
+      [pt, ..._] -> synth_expecting(st, x, apply_ty(st.sub, pt))
+      []         -> synth(st, x)
+    }
+    let rr = synth_many_expecting(r.st, rest, params_after_first(param_tys))
+    InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+  }
+}
+
+fn params_after_first(ps: [Ty]) : [Ty] = match ps {
+  [_, ...rest] -> rest
+  []           -> []
 }
 
 # A `@x` the cell-read lowering never reached (a `const` initialiser has
@@ -10028,19 +10074,15 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                                  rest_args, callee, line, col) {
               Some(inf) -> Some(inf)
               None ->
-            match pick_by_first_arg(r0.st, candidates, first_ty) {
+            match pick_by_first_arg(r0.st, candidates, first_ty, callee.line, callee.col) {
               FaNone -> None
               FaTie(st_t, ss) -> {
                 let st_e = report_name_tie(st_t, w, ss, true, callee.line, callee.col)
                 Some(mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(callee, [r0.expr, ...rest_args]), line, col), TyAny)))
               }
               FaOne(pick) -> {
-                let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
-                  pick.st
-                } else {
-                  st_push_inst(pick.st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
-                }
-                let ra_rest = synth_many(st_inst, rest_args)
+                let st_inst = pick_inst(pick, line, col)
+                let ra_rest = synth_many_expecting(st_inst, rest_args, params_after_first(fn_param_tys(st_inst, pick.inst_ty)))
                 let all_arg_tys = [first_ty, ...ra_rest.tys]
                 let all_arg_exprs = [r0.expr, ...ra_rest.exprs]
                 let rv = st_fresh_ty(ra_rest.st)
@@ -10053,8 +10095,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st2 = st_propagate_capability_labels(st_unif,
                             apply_ty(st_unif.sub, pick.inst_ty), line, col)
                 let ty = apply_ty(st2.sub, rv.ty)
-                # A settled contest carries the id of the declaration it picked.
-                let callee_node = with_ty(mk_sym(pick.sym, callee.line, callee.col), pick.inst_ty)
+                let callee_node = with_ty(pick_ref(pick, callee.line, callee.col), pick.inst_ty)
                 match refine_call(st2, callee, pick.inst_ty, all_arg_exprs, all_arg_tys, ty) {
                   RefCall(st3, ty3) -> Some(mk_inferred(st3, ty3, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty3)))
                 }
@@ -10123,6 +10164,7 @@ fn drain_deferred_homs(st: InferState, hs: [DeferredHom],
         let r = drain_one_deferred_hom(st, w, apply_ty(st.sub, want), line, col)
         drain_deferred_homs(r.st, rest, list_append(picks, r.picks))
       }
+      DOp(_, _, _, _) -> drain_deferred_homs(st, rest, picks)
     }
   }
 }
@@ -10577,17 +10619,34 @@ fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
 # result of `pick_by_first_arg`. The picked scheme has
 # already been instantiated (state's `fresh` and `sub` advanced); the
 # caller proceeds with the standard unify-arg-then-emit pipeline.
-# `sym` is the picked function, which the caller makes the callee: the
-# identity of the settled contest.
+# `target` is what the caller makes the callee.
 type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
-                    sym: SymId }
+                    target: PickTarget }
+
+# A function, the identity of the settled contest; or an operation left
+# between the dispatchers of the protocols declaring it.
+type PickTarget = PtDecl(SymId) | PtOp([SymId])
+
+# The picked callee, at a position.
+fn pick_ref(p: PickResult, line: Int, col: Int) : Expr = match p.target {
+  PtDecl(s) -> mk_sym(s, line, col)
+  PtOp(ss)  -> mk_expr(EMark(MkProtoOp(ss)), line, col)
+}
+
+# The state with the pick's instantiation recorded against the call at a
+# position. An operation left between dispatchers records none.
+fn pick_inst(p: PickResult, line: Int, col: Int) : InferState = match p.target {
+  PtDecl(s) -> if p.fresh == [] and p.unit_fresh == [] { p.st }
+               else { st_push_inst(p.st, CS(s, line, col, p.fresh, p.unit_fresh, None)) }
+  PtOp(_)   -> p.st
+}
 
 # What the first argument's type decides among the candidates of one
 # name: the function, a tie the scope cannot break, or nothing.
 type FirstArg = FaOne(PickResult) | FaTie(InferState, [SymId]) | FaNone
 
 # One candidate whose first parameter unifies with the argument.
-type Probed = { pick: PickResult, concrete: Bool }
+type Probed = { pick: PickResult, sym: SymId, concrete: Bool }
 
 type ProbeRun = { st: InferState, hits: [Probed] }
 
@@ -10619,7 +10678,7 @@ type ProbeRun = { st: InferState, hits: [Probed] }
 # what records the receiver / arg constraints into the substitution.
 # So this helper only commits the instantiation, not the probe.
 fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
-                      target_ty: Ty) : FirstArg / Mutable = {
+                      target_ty: Ty, line: Int, col: Int) : FirstArg / Mutable = {
   let run = probe_first_arg(st, candidates, target_ty, [])
   let concrete = filter(run.hits, (h) => h.concrete)
   let pool = if list_is_empty(concrete) { run.hits } else { concrete }
@@ -10627,22 +10686,32 @@ fn pick_by_first_arg(st: InferState, candidates: [TyCandidate],
     []  -> FaNone
     [h] -> FaOne(pick_at(h.pick, run.st))
     _   -> {
-      let syms = map(pool, (h) => h.pick.sym)
-      match pool_answer(st, target_ty, syms, sv_nearest(st.env.tab, st_scope(st), sv_rungs(), list_reverse(syms))) {
-        SetOne(s) -> match find(pool, (h) => sym_same(h.pick.sym, s)) {
+      let syms = map(pool, (h) => h.sym)
+      match pool_answer(st, target_ty, sv_nearest(st.env.tab, st_scope(st), sv_rungs(), list_reverse(syms))) {
+        SetOne(s) -> match find(pool, (h) => sym_same(h.sym, s)) {
           Some(h) -> FaOne(pick_at(h.pick, run.st))
           None    -> FaNone
         }
-        SetTie(ss) -> FaTie(run.st, ss)
+        SetTie(ss) -> if op_tie(st, ss) { op_pick(run.st, ss, line, col) } else { FaTie(run.st, ss) }
         _          -> FaNone
       }
     }
   }
 }
 
-fn pool_answer(st: InferState, target_ty: Ty, pool: [SymId], r: SvRes) : Settled = match r {
+# The pick of an operation no impl serves the argument for yet: the
+# reference stays between its dispatchers, typed as all of them are.
+fn op_pick(st: InferState, ss: [SymId], line: Int, col: Int) : FirstArg / Mutable = {
+  let c = op_unsettled(st, ss, line, col)
+  match c.ty {
+    Some(t) -> FaOne(PickResult { st: c.st, inst_ty: t, fresh: [], unit_fresh: [], target: PtOp(ss) })
+    None    -> FaTie(c.st, ss)
+  }
+}
+
+fn pool_answer(st: InferState, target_ty: Ty, r: SvRes) : Settled = match r {
   SvSym(s)    -> SetOne(s)
-  SvAmbig(ss) -> match tie_break(st, target_ty, pool, ss) {
+  SvAmbig(ss) -> match tie_break(st, target_ty, ss) {
     Some(s) -> SetOne(s)
     None    -> SetTie(ss)
   }
@@ -10651,18 +10720,13 @@ fn pool_answer(st: InferState, target_ty: Ty, pool: [SymId], r: SvRes) : Settled
 
 # Two ties on one rung are no ambiguity. Cores restate one another's
 # functions over the same parameter (`char_unicode` over `char`), and
-# the prelude's order says which stands. Dispatchers of one operation
+# the core set's order says which stands. Dispatchers of one operation
 # several protocols declare are told apart by the impl that serves the
-# argument's type; an argument no impl serves yet leaves the newest, and
-# the dispatch rewrite retargets the call once the type is known.
-fn tie_break(st: InferState, target_ty: Ty, pool: [SymId], ss: [SymId]) : Option[SymId] =
-  match later_core(st.env.tab, st_scope(st), ss) {
+# argument's type; an argument no impl serves yet leaves the tie.
+fn tie_break(st: InferState, target_ty: Ty, ss: [SymId]) : Option[SymId] =
+  match sv_last_listed_core(st.env.tab, st_scope(st), ss) {
     Some(s) -> Some(s)
-    None    -> if not all(ss, (s) => pid_is_disp(st.protos.ids, s)) { None }
-               else { match served_dispatcher(st.protos, target_ty, ss) {
-                 Some(s) -> Some(s)
-                 None    -> find(pool, (s) => any(ss, (x) => sym_same(x, s)))
-               } }
+    None    -> if op_tie(st, ss) { served_dispatcher(st.protos, target_ty, ss) } else { None }
   }
 
 # The dispatcher, among `ss`, of the protocol whose impl serves the head
@@ -10678,20 +10742,6 @@ fn served_dispatcher(pv: ProtoView, t: Ty, ss: [SymId]) : Option[SymId] = match 
         None    -> None
       }
     }
-  }
-}
-
-# The declaration of the core the prelude lists last, when every one of
-# `ss` is a core's.
-fn later_core(tab: SymTab, v: ScopeView, ss: [SymId]) : Option[SymId] =
-  if not all(ss, (s) => sv_is_core(v, sym_owner(tab, s))) { None }
-  else { later_core_loop(tab, v.cores, ss, None) }
-
-fn later_core_loop(tab: SymTab, cores: [SymId], ss: [SymId], found: Option[SymId]) : Option[SymId] = match cores {
-  [] -> found
-  [c, ...rest] -> match find(ss, (s) => sym_same(sym_owner(tab, s), c)) {
-    Some(s) -> later_core_loop(tab, rest, ss, Some(s))
-    None    -> later_core_loop(tab, rest, ss, found)
   }
 }
 
@@ -10727,11 +10777,11 @@ fn probe_first_arg(st: InferState, candidates: [TyCandidate], target_ty: Ty,
     }
     let pick = PickResult { st: inst.st, inst_ty: inst.ty,
                              fresh: inst.fresh, unit_fresh: inst.unit_fresh,
-                             sym: c.sym }
+                             target: PtDecl(c.sym) }
     let acc1 = match probe {
       ProbeNoMatch  -> acc
-      ProbeConcrete -> [Probed { pick: pick, concrete: true }, ...acc]
-      ProbeTyvar    -> [Probed { pick: pick, concrete: false }, ...acc]
+      ProbeConcrete -> [Probed { pick: pick, sym: c.sym, concrete: true }, ...acc]
+      ProbeTyvar    -> [Probed { pick: pick, sym: c.sym, concrete: false }, ...acc]
     }
     probe_first_arg(inst.st, rest, target_ty, acc1)
   }
@@ -10891,8 +10941,8 @@ fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fre
 # else the builtin.
 fn ufcs_target(st: InferState, ident: String, obj_ty: Ty,
                line: Int, col: Int) : UfcsFound / Mutable =
-  match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty) {
-    FaOne(p)       -> UfOne(ufcs_sym_target(p.st, p.sym, p.inst_ty, p.fresh, p.unit_fresh, line, col))
+  match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty, line, col) {
+    FaOne(p)       -> UfOne(UfcsTarget { st: pick_inst(p, line, col), inst_ty: p.inst_ty, callee: pick_ref(p, line, col) })
     FaTie(st_t, ss) -> UfTie(st_t, ss)
     FaNone -> match env_local_written(st.env.entries, ident) {
       Some(b) -> match env_local(st.env, b.id) {
@@ -11009,7 +11059,7 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
 fn synth_op_call_provided(st: InferState, sc: TyScheme, args_: [Expr],
                            recv: LocalId, esym: SymId, op: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
   let inst = st_instantiate_report(st, sc)
-  let ra = synth_many(inst.st, args_)
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "cap op call ", esym, op), line, col)
@@ -11042,7 +11092,7 @@ fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
   let eff_fresh = take_first(inst.fresh, eff_tparam_arity(st.op_eff_arities, esym))
   # Read before unifying: the substitution's slots mutate in place.
   let pinned = map(eff_fresh, (id) => occurs(id, inst.ty, inst.st.sub))
-  let ra = synth_many(inst.st, args_)
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "op call ", esym, op), line, col)
@@ -12491,14 +12541,10 @@ fn synth_pipe_callee(st: InferState, f: Expr, lhs_ty: Ty) : Inferred / Console +
   EName(nm) -> {
     let candidates = bare_fn_candidates(st, nm)
     if list_length(candidates) < 2 { synth_callee(st, f) }
-    else { match pick_by_first_arg(st, candidates, apply_ty(st.sub, lhs_ty)) {
+    else { match pick_by_first_arg(st, candidates, apply_ty(st.sub, lhs_ty), f.line, f.col) {
       FaNone -> synth_callee(st, f)
       FaTie(st_t, ss) -> inferred_leaf(report_name_tie(st_t, nm, ss, true, f.line, f.col), TyAny, f)
-      FaOne(pick) -> {
-        let st_inst = if pick.fresh == [] and pick.unit_fresh == [] { pick.st }
-                      else { st_push_inst(pick.st, CS(pick.sym, f.line, f.col, pick.fresh, pick.unit_fresh, None)) }
-        mk_inferred(st_inst, pick.inst_ty, with_ty(mk_sym(pick.sym, f.line, f.col), pick.inst_ty))
-      }
+      FaOne(pick) -> mk_inferred(pick_inst(pick, f.line, f.col), pick.inst_ty, with_ty(pick_ref(pick, f.line, f.col), pick.inst_ty))
     } }
   }
   _ -> synth(st, f)
@@ -12511,7 +12557,7 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
   let res = match rhs.kind {
     ECall(f, pa) -> {
       let rf = synth_pipe_callee(rl.st, f, rl.ty)
-      let ra = synth_many(rf.st, pa)
+      let ra = synth_many_expecting(rf.st, pa, params_after_first(fn_param_tys(rf.st, rf.ty)))
       let rv = st_fresh_ty(ra.st)
       # same open-row trick `synth_call`
       # uses — let the callee's row tail bind to a fresh row var so
@@ -13374,7 +13420,7 @@ fn carrier_shapes(v: TyHomeView, recs: [RecInfo], sums: [SumInfo]) : [CarrierSha
   list_append(map(recs, (r) => record_shape(v, r)), map(sums, (s) => sum_carrier_shape(v, s)))
 
 fn sum_carrier_shape(v: TyHomeView, s: SumInfo) : CarrierShape = match s {
-  SI(sum, tps, vs, mo) -> sum_shape(v, sum, tps, vs, mo)
+  SI(sum, _, vs, mo) -> sum_shape(v, sum, vs, mo)
 }
 
 fn ty_env_with_carriers(env: TyEnv, cs: [SymId]) : TyEnv = TyEnv { ...env, carriers: cs }
@@ -14214,19 +14260,55 @@ fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], expected: Ty,
       mk_inferred(r.st, named, root)
     }
     Some(ri) -> match ri {
-      RI(rsym, _, fds, _) ->
-        if rh_out_of_order(fis, fds) { synth(head.st, rh_in_declared_order(DrSym(rsym), fis, fds, line, col)) }
-        else {
-          let inst = rec_instantiate(head.st, ri)
-          let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
-          let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
-          let ty = apply_ty(st1.sub, inst.result_ty)
-          let root = with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)
-          mk_inferred(st1, ty, root)
-        }
+      RI(rsym, _, fds, _) -> {
+        let inst = rec_instantiate(head.st, ri)
+        let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
+        let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
+        let ty = apply_ty(st1.sub, inst.result_ty)
+        if rh_out_of_order(fis, fds) { lay_in_declared_order(head.st, st1, rsym, fds, r.fis, ty, line, col) }
+        else { mk_inferred(st1, ty, with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)) }
+      }
     }
   }
 }
+
+# A literal written in another order than its record declares, as a
+# block: each typed value bound in the order written, the record laid
+# from those bindings in the declared order. Evaluation keeps the source
+# order; `outer` is the state the bindings are scoped out to.
+fn lay_in_declared_order(outer: InferState, st: InferState, rsym: SymId, fds: [FieldDecl], vals: [FieldInit],
+                         ty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let bound = bind_written_fields(st, vals, line, col, 0)
+  let laid = read_declared_fields(bound.st, fds, vals, line, col)
+  let lit = with_ty(mk_expr(ERecordLit(DrSym(rsym), laid.fis), line, col), ty)
+  mk_inferred(st_restore_entries(outer, laid.st), ty, with_ty(mk_expr(EBlock(bound.stmts, Some(lit)), line, col), ty))
+}
+
+fn bind_written_fields(st: InferState, vals: [FieldInit], line: Int, col: Int, i: Int) : InferredStmts / Console + File + Mutable = match vals {
+  [] -> InferredStmts { st: st, stmts: [] }
+  [FI(_, v), ...rest] -> {
+    let pat = mk_pat(PBind(rh_temp_binder(line, col, i)), line, col)
+    let after = check_pattern_stamped(st, pat, let_binder_ty(typed_ty_or(v, TyAny), v))
+    let rr = bind_written_fields(after.st, rest, line, col, i + 1)
+    InferredStmts { st: rr.st, stmts: [SLet(after.pat, None, v), ...rr.stmts] }
+  }
+}
+
+fn read_declared_fields(st: InferState, fds: [FieldDecl], vals: [FieldInit], line: Int, col: Int) : InferredFInits / Console + File + Mutable = match fds {
+  [] -> InferredFInits { st: st, fis: [] }
+  [FD(_, dnm, _, _), ...rest] -> {
+    let r = synth(st, mk_local(rh_temp_binder(line, col, rh_written_at(vals, dnm)).id, line, col))
+    let rr = read_declared_fields(r.st, rest, vals, line, col)
+    InferredFInits { st: rr.st, fis: [FI(dnm, r.expr), ...rr.fis] }
+  }
+}
+
+# The type a `let` binder takes from a value of type `t`. The fixed-width
+# inline representation belongs to a LITERAL: a `<n>`-typed value from
+# anything else is a dynamic heap `Vec` at run time, so its binder
+# de-brands to `Vec[e]`.
+fn let_binder_ty(t: Ty, rhs: Expr) : Ty =
+  if ty_is_fixed_vec(t) and not is_fixed_vec_lit(rhs) { fixed_vec_unbrand(t) } else { t }
 
 fn check_record_lit_fields(st: InferState, rsym: SymId, fis: [FieldInit], fields: [FTy],
                            line: Int, col: Int) : InferState / Console + File {
@@ -14715,10 +14797,21 @@ fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 # `e` where a type is expected: a record literal's head is asked of that
-# type first; any other shape is synthesised.
+# type first, as is one written as an element of a list literal; any
+# other shape is synthesised.
 fn synth_expecting(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = match e.kind {
   ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
-  _                   -> synth(st, e)
+  EList(els) -> match apply_ty(st.sub, expected) {
+    TyListT(elem_ty) -> if any(els, elem_is_record_lit) { check_list_elems_against(st, els, elem_ty, e.line, e.col) }
+                        else { synth(st, e) }
+    _ -> synth(st, e)
+  }
+  _ -> synth(st, e)
+}
+
+fn elem_is_record_lit(el: ListElem) : Bool = match el {
+  ElPlain(x)  -> is_record_lit(x)
+  ElSpread(_) -> false
 }
 
 fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
@@ -14923,15 +15016,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
         None -> lower_pair.ty
         Some(te) -> st_annot_ty(rr.st, te)
       }
-      # The fixed-width inline representation is an optimisation of a
-      # LITERAL: a `let x : Vec[e]<n> = [ ... ]` binds a flat aggregate.
-      # A `<n>`-typed value that came from anything else (a function
-      # return, a field) is a dynamic heap `Vec` at runtime, so the
-      # binder de-brands to `Vec[e]` — otherwise codegen would cast a
-      # boxed value into a fixed struct.
-      let binding_ty = if ty_is_fixed_vec(binding_ty0) and not is_fixed_vec_lit(lower_pair.expr) {
-        fixed_vec_unbrand(binding_ty0)
-      } else { binding_ty0 }
+      let binding_ty = let_binder_ty(binding_ty0, lower_pair.expr)
       let after = check_pattern_stamped(binding_st, pat, binding_ty)
       OneStmt { st: after.st, stmt: SLet(after.pat, ann, lower_pair.expr) }
     }
@@ -16015,11 +16100,11 @@ fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Co
         }
         EName(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
         ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
-        _ -> synth(st, br)
+        _ -> if is_record_lit(te) { check_expr_against(st, br, expected, "if branch", br.line, br.col) } else { synth(st, br) }
       }
       None -> synth(st, br)
     }
-    _ -> synth(st, br)
+    _ -> synth_expecting(st, br, expected)
   }
 }
 
@@ -16467,7 +16552,7 @@ fn check_elem_against(st: InferState, ex: Expr, elem_ty: Ty,
 
 fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
                     line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let r0 = synth(st, ex)
+  let r0 = synth_expecting(st, ex, elem_ty)
   let r = if not (rc_mentions(elem_ty) or rc_mentions_in(r0.st.sub, r0.ty)) { r0 } else {
     let m = refine_coerce(MintedExpr { st: r0.st, pair: ExprTy { expr: r0.expr, ty: r0.ty } }, elem_ty, "list element", ex.line, ex.col)
     mk_inferred(m.st, m.pair.ty, m.pair.expr)
@@ -16533,25 +16618,9 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
         # disambiguation can pick a user variant over the core builtin. Other
         # tail shapes keep synthing the whole body as before to avoid
         # regressions in non-ctor expression types.
-        ECall(_, _) -> {
-          let outer = st
-          let is_ = synth_stmts(st, stmts)
-          let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
-          let st2 = st_restore_entries(outer, r.st)
-          let ty = apply_ty(st2.sub, r.ty)
-          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
-          mk_inferred(st2, ty, root)
-        }
-        EName(_) -> {
-          let outer = st
-          let is_ = synth_stmts(st, stmts)
-          let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
-          let st2 = st_restore_entries(outer, r.st)
-          let ty = apply_ty(st2.sub, r.ty)
-          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
-          mk_inferred(st2, ty, root)
-        }
-        _ -> synth(st, body)
+        ECall(_, _) -> check_block_tail(st, stmts, te, expected, what, body)
+        EName(_)    -> check_block_tail(st, stmts, te, expected, what, body)
+        _ -> if is_record_lit(te) { check_block_tail(st, stmts, te, expected, what, body) } else { synth(st, body) }
       }
       None -> synth(st, body)
     }
@@ -16564,6 +16633,21 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
     ESym(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     _ -> synth_expecting(st, body, expected)
   }
+}
+
+# The block `{ stmts; te }` with its tail checked against `expected`.
+fn check_block_tail(st: InferState, stmts: [Stmt], te: Expr, expected: Ty,
+                    what: String, body: Expr) : Inferred / Console + File + Mutable = {
+  let is_ = synth_stmts(st, stmts)
+  let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
+  let st2 = st_restore_entries(st, r.st)
+  let ty = apply_ty(st2.sub, r.ty)
+  mk_inferred(st2, ty, with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty))
+}
+
+fn is_record_lit(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _) -> true
+  _                -> false
 }
 
 # walk arms and rewrite `PVariantRecord(name, fields)` to
@@ -17509,124 +17593,40 @@ pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int, HoleOwner, Ho
 #[derive(BinSerialize)]
 pub type ResolvedRowHole = RRH(Option[String], Int, Int, SymId, Row, [SymId])
 
-# Parse an internal row-hole placeholder name back into its
-# components. Mirrors the format minted by parse_row_labels:
-#   - `__rowhole__anon_<line>_<col>` for `?`     → (None, line, col)
-#   - `__rowhole_<name>_<line>_<col>` for `?nm`  → (Some(name), line, col)
-# Anything else returns None — defensive in case a non-hole rvar
-# gets passed in by mistake.
-type RowHoleSplit = { name: Option[String], line: Int, col: Int }
-
-fn split_row_hole_name(s: String) : Option[RowHoleSplit] {
-  if not inf_string_starts_with_q(s, "__rowhole_") { None }
-  else {
-    let n = string_length(s)
-    # Find the last `_` (between line and col).
-    match find_last_underscore(s, n - 1) {
-      None -> None
-      Some(p_col) -> {
-        # Find the second-to-last `_` (between name and line).
-        match find_last_underscore(s, p_col - 1) {
-          None -> None
-          Some(p_line) -> {
-            let col_s  = substring_range(s, p_col + 1, n)
-            let line_s = substring_range(s, p_line + 1, p_col)
-            let name_part = substring_range(s, 10, p_line)
-            # 10 = length of "__rowhole_"; remaining is either "_anon"
-            # (anonymous `?`) or the user-written name (`e`, `eff`, …).
-            let nm = if name_part == "_anon" { None } else { Some(name_part) }
-            match parse_decimal(line_s) {
-              None -> None
-              Some(line) -> match parse_decimal(col_s) {
-                None -> None
-                Some(col) ->
-                  Some(RowHoleSplit { name: nm, line: line, col: col })
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-fn find_last_underscore(s: String, from: Int) : Option[Int] {
-  if from < 0 { None }
-  else {
-    match char_at(s, from) {
-      Some(c) -> if c == '_' { Some(from) } else { find_last_underscore(s, from - 1) }
-      None    -> find_last_underscore(s, from - 1)
-    }
-  }
-}
-
-fn substring_range(s: String, lo: Int, hi: Int) : String =
-  substring_loop(s, lo, hi, "")
-
-fn substring_loop(s: String, i: Int, hi: Int, acc: String) : String {
-  if i >= hi { acc }
-  else {
-    match char_at(s, i) {
-      Some(c) -> substring_loop(s, i + 1, hi, string_concat(acc, int_to_byte_string(char_to_int(c))))
-      None    -> acc
-    }
-  }
-}
-
-fn parse_decimal(s: String) : Option[Int] = parse_decimal_loop(s, 0, string_length(s), 0, false)
-
-fn parse_decimal_loop(s: String, i: Int, n: Int, acc: Int, any: Bool) : Option[Int] {
-  if i >= n { if any { Some(acc) } else { None } }
-  else {
-    match char_at(s, i) {
-      None -> None
-      Some(c) -> {
-        let d = char_to_int(c) - char_to_int('0')
-        if d < 0 or d > 9 { None }
-        else { parse_decimal_loop(s, i + 1, n, acc * 10 + d, true) }
-      }
-    }
-  }
-}
-
-# Build the [ResolvedRowHole] for one decl. For each rvar name in the
-# decl that matches the row-hole placeholder format, look up its
+# Build the [ResolvedRowHole] for one decl. For each row hole the
+# decl binds, look up its
 # allocated id in `rbinds`, resolve `Row { tail: Some(id) }` under the
 # final substitution, and emit one entry. Non-hole row variables (the
 # user-written tail `e` in `... / Io + e`) are skipped — they are not
 # typed-hole resolutions and belong to a different reporter.
 fn extract_row_holes(d: Decl, rbinds: [RVBind], sub: Subst, body_row: [Label]) : [ResolvedRowHole] {
   match d {
-    DFn(_, fid, _, _, _, _, _, _, _, _) -> {
-      let names = collect_decl_rvars(d)
+    DFn(_, fid, tps, _, _, _, _, _, _, _) -> {
       let body_labels = map(apply_labels(sub, body_row), (l) => l.sym)
-      extract_row_holes_loop(names, fnid_sym(fid), rbinds, sub, body_labels, [])
+      extract_row_holes_loop(filter(tps, tb_is_hole), fnid_sym(fid), rbinds, sub, body_labels, [])
     }
     _ -> []
   }
 }
 
-fn extract_row_holes_loop(names: [String], fn_name: SymId,
+fn extract_row_holes_loop(holes: [TBinder], fn_name: SymId,
                            rbinds: [RVBind], sub: Subst,
                            body_labels: [SymId],
                            acc: [ResolvedRowHole]) : [ResolvedRowHole] {
-  match names {
+  match holes {
     [] -> list_reverse(acc)
-    [n, ...rest] -> {
-      match split_row_hole_name(n) {
+    [b, ...rest] -> match b.kind {
+      KRowHole(hl, hc) -> match inf_rvbind_lookup(rbinds, b.id) {
         None -> extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, acc)
-        Some(split) -> {
-          match inf_rvbind_lookup(rbinds, n) {
-            None -> extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, acc)
-            Some(id) -> {
-              let r = apply_row(sub, Row { labels: [], tail: Some(id),
-                                             display_alias: None })
-              let entry = RRH(split.name, split.line, split.col, fn_name, r, body_labels)
-              extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, [entry, ...acc])
-            }
-          }
+        Some(id) -> {
+          let r = apply_row(sub, Row { labels: [], tail: Some(id),
+                                         display_alias: None })
+          let nm = if tb_text(b) == "" { None } else { Some(tb_text(b)) }
+          let entry = RRH(nm, hl, hc, fn_name, r, body_labels)
+          extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, [entry, ...acc])
         }
       }
+      _ -> extract_row_holes_loop(rest, fn_name, rbinds, sub, body_labels, acc)
     }
   }
 }
@@ -17729,12 +17729,17 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # match the registered scheme's; consult `env.row_kind`.
       let rbinds = mk_rvbinds(list_append(collect_decl_rvars(d),
                                           collect_rowkind_args_decl(d, env.row_kind, env_home_view(env, mo))))
-      # pick up implicit lowercase tparams the
-      # signature uses but did not declare in `[…]`, matching the
-      # set fn_scheme_of_decl built into the registered scheme.
-      let implicit = collect_implicit_tparams_in_decl(d, tparams)
-      let effective_tparams = list_append(tparams, implicit)
+      # the parameters the signature binds without listing them are
+      # among `tparams`, matching the set fn_scheme_of_decl built into
+      # the registered scheme.
+      let effective_tparams = tbs_positional(tparams)
       let tpbinds = mk_tpbinds(effective_tparams)
+      # Inside its own body a unit parameter is the symbol it is named:
+      # its variable binds to that symbol once the body mentions it.
+      let body = match filter(tparams, tb_is_unit) {
+        [] -> body
+        us -> map_units_expr(body, (u) => unit_named(u, us))
+      }
       # Hanga Roa modular typecheck: the per-module fold in
       # `typecheck_program_loop` already feeds this decl's typer
       # only the records / sums its bucket inherits from
@@ -17792,7 +17797,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
         st_set_sub(st0b0, subst_add_unit_kinds(st0b0.sub,
           range_ids(0, unit_tpcount), tparam_unit_kinds(effective_tparams)))
       } else { st0b0 }
-      let st0r = st_set_sub(st0b, subst_with_rigid(st0b.sub, rigid_tparams(tpbinds, tparams, nm)))
+      let st0r = st_set_sub(st0b, subst_with_rigid(st0b.sub, rigid_tparams(tpbinds, nm)))
       let added = add_infer_params_with_binds(st0r, ps, tpbinds, rbinds)
       # when the user omits the return-type
       # annotation, infer it from the body's actual type. The
@@ -17857,7 +17862,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # `mask_local_mutable_demand` and is a no-op when `Mutable`
       # is not in the row to begin with.
       let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr)
-      let st2pre = check_body_row(st1c, nm, entry, fid, row, rbinds, line, col, all_decls)
+      let st2pre = check_body_row(st1c, nm, entry, fid, row, rbinds, tparams, line, col, all_decls)
       # drain the deferred field-access constraints now that
       # the body's tyvars have settled — `check_body_row` above unified
       # the inferred effect row against the declared one, so a generic
@@ -17875,7 +17880,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # tells apart drain after the fields: a call on `b.field` needs
       # the field's own receiver resolved first.
       let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
-      let st2 = hd.st
+      let st2 = report_stranded_ops(hd.st, st2f.deferred_homs, [declared_ret, ...added.tys])
       let _ = if verbose {
         print_inferred_fn(env.tab, nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
         print_row_ids(env.tab, nm, st2.row)
@@ -18041,7 +18046,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
     test_non_absorbed_labels(rb.st, rb.st.row, all_decls),
     [], [], line, col)
   let hd = drain_deferred_homs(st2pre, list_reverse(st2pre.deferred_homs), [])
-  let st2 = hd.st
+  let st2 = report_stranded_ops(hd.st, st2pre.deferred_homs, [])
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
   let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner, HRowLabels([], [], true))
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, rb.expr), hd.picks)
@@ -18086,7 +18091,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
                 else { refine_coerce(minted, declared, concat_all(["const `", cname, "`"]), cbody.line, cbody.col) }
   let st2c = st_unify(coerced.st, declared, coerced.pair.ty, "const annotation", line, col)
   let hd = drain_deferred_homs(st2c, list_reverse(st2c.deferred_homs), [])
-  let st2 = hd.st
+  let st2 = report_stranded_ops(hd.st, st2c.deferred_homs, [])
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, coerced.pair.expr), hd.picks)
   TypedDecl {
@@ -18367,6 +18372,7 @@ fn ty_expr_find_handle(hv: TyHomeView, hsym: SymId, t: TypeExpr,
     # Fiber/Pid handle type — no breach to find.
     TyRow(_) -> None
     TySurface(ts) -> ty_expr_list_find_handle(hv, hsym, tysurface_children(ts), sums, visited)
+    TyParam(_, tas) -> ty_expr_list_find_handle(hv, hsym, tas, sums, visited)
   }
 }
 
@@ -18415,44 +18421,44 @@ fn payload_find_handle(hv: TyHomeView, hsym: SymId, payload: [TypeExpr],
 # type-args than the type declares (rare, but possible on a not-yet-
 # fully-applied alias), the missing entries are skipped — the walker
 # treats the unbound name as opaque (no Fiber/Pid hidden behind it).
-type TParamMapEntry = TPM(String, TypeExpr)
+type TParamMapEntry = TPM(TLocalId, TypeExpr)
 
-fn build_tparam_mapping(tps: [String], tas: [TypeExpr]) : [TParamMapEntry] {
+fn build_tparam_mapping(tps: [TBinder], tas: [TypeExpr]) : [TParamMapEntry] {
   match tps {
     [] -> []
     [tp, ...tps_rest] -> match tas {
       [] -> []
-      [ta, ...tas_rest] -> [TPM(tp, ta), ...build_tparam_mapping(tps_rest, tas_rest)]
+      [ta, ...tas_rest] -> [TPM(tp.id, ta), ...build_tparam_mapping(tps_rest, tas_rest)]
     }
   }
 }
 
-fn tparam_lookup(mapping: [TParamMapEntry], name: String) : Option[TypeExpr] {
+fn tparam_lookup(mapping: [TParamMapEntry], id: TLocalId) : Option[TypeExpr] {
   match mapping {
     [] -> None
     [m, ...rest] -> match m {
-      TPM(n, te) -> if n == name { Some(te) } else { tparam_lookup(rest, name) }
+      TPM(n, te) -> if tlocal_eq(n, id) { Some(te) } else { tparam_lookup(rest, id) }
     }
   }
 }
 
 # substitute tparam references in a payload TypeExpr
-# with their concrete TypeExpr at the use site. Only a written name
-# with no arguments is a candidate for substitution — a higher-arity
-# name is a real type constructor, not a tparam reference. The substitution
+# with their concrete TypeExpr at the use site. Only a parameter
+# with no arguments is a candidate for substitution. The substitution
 # is purely structural; positions are preserved.
 fn subst_tparams_te(t: TypeExpr, mapping: [TParamMapEntry]) : TypeExpr {
   match t.tkind {
-    TyName(th, tas) -> {
+    TyParam(p, tas) -> {
       if list_length(tas) == 0 {
-        match tparam_lookup(mapping, ref_name(th)) {
+        match tparam_lookup(mapping, p) {
           Some(replacement) -> replacement
           None              -> t
         }
       } else {
-        mk_ty(TyName(th, subst_tparams_tes(tas, mapping)), t.line, t.col)
+        mk_ty(TyParam(p, subst_tparams_tes(tas, mapping)), t.line, t.col)
       }
     }
+    TyName(th, tas) -> mk_ty(TyName(th, subst_tparams_tes(tas, mapping)), t.line, t.col)
     TyList(inner) ->
       mk_ty(TyList(subst_tparams_te(inner, mapping)), t.line, t.col)
     TyFn(ps, ret, row) ->
@@ -18484,20 +18490,20 @@ fn subst_tparams_tes(ts: [TypeExpr], mapping: [TParamMapEntry]) : [TypeExpr] {
 # row variable it performs, must appear in the declared row. Row
 # variables resolve only once the body is typed, so they are checked here.
 fn check_body_row(st: InferState, fname: String, entry: Bool, f: FnId, declared: RowExpr, rbinds: [RVBind],
-                  line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable =
-  if declares_row_hole(declared) { st }
+                  tps: [TBinder], line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable =
+  if declares_row_hole(declared, tps) { st }
   else {
     let st1 = check_body_labels(st_add_tail_labels(st, st.row_tails), fname, entry, f, declared, line, col, decls)
     match rbinds {
       [] -> st1
-      _  -> check_body_tails(st1, fname, declared_root(st.sub, declared, rbinds), rbinds, st.row_tails)
+      _  -> check_body_tails(st1, fname, declared_root(st.sub, declared, rbinds), rbinds, tps, st.row_tails)
     }
   }
 
 # A row hole (`/ ?e`) asks for the row to be inferred, so it absorbs.
-fn declares_row_hole(declared: RowExpr) : Bool = match declared {
-  ROpen(n, _) -> inf_string_starts_with_q(n, "__rowhole_")
-  _           -> false
+fn declares_row_hole(declared: RowExpr, tps: [TBinder]) : Bool = match declared {
+  ROpen(TpId(id), _) -> any(tps, (b) => tb_is_hole(b) and tlocal_eq(b.id, id))
+  _                  -> false
 }
 
 fn st_add_tail_labels(st: InferState, us: [TailUse]) : InferState / Mutable = match us {
@@ -18519,18 +18525,18 @@ fn st_add_bound_labels(st: InferState, t: Int, line: Int, col: Int) : InferState
   }
 }
 
-fn check_body_tails(st: InferState, fname: String, declared: Int, rbinds: [RVBind],
+fn check_body_tails(st: InferState, fname: String, declared: Int, rbinds: [RVBind], tps: [TBinder],
                     us: [TailUse]) : InferState / Console + File + Mutable = match us {
   [] -> st
   [TU(t, l, c), ...rest] -> {
     let root = row_root(st.sub, t)
     let st1 = if root < 0 or root == declared { st } else {
       match sig_row_var_at(st.sub, rbinds, root) {
-        Some(n) -> report_row_var_unhandled(st, fname, n, l, c)
+        Some(n) -> report_row_var_unhandled(st, fname, tbs_text_of(tps, n), l, c)
         None    -> st
       }
     }
-    check_body_tails(st1, fname, declared, rbinds, rest)
+    check_body_tails(st1, fname, declared, rbinds, tps, rest)
   }
 }
 
@@ -18549,13 +18555,13 @@ fn is_sig_row(s: Subst, rbinds: [RVBind], root: Int) : Bool = match sig_row_var_
 }
 
 # The signature row variable that `root` stands for, if any.
-fn sig_row_var_at(s: Subst, rbinds: [RVBind], root: Int) : Option[String] = match rbinds {
+fn sig_row_var_at(s: Subst, rbinds: [RVBind], root: Int) : Option[TLocalId] = match rbinds {
   [] -> None
   [RVB(n, id), ...rest] -> if row_root(s, id) == root { Some(n) } else { sig_row_var_at(s, rest, root) }
 }
 
 fn declared_root(s: Subst, declared: RowExpr, rbinds: [RVBind]) : Int = match declared {
-  ROpen(n, _) -> match inf_rvbind_lookup(rbinds, n) {
+  ROpen(n, _) -> match inf_rvbind_lookup(rbinds, tail_id(n)) {
     Some(id) -> row_root(s, id)
     None     -> -1
   }

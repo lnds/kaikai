@@ -332,11 +332,10 @@ test-decl-symid-survives:
 # After the resolver a declaration, a type, an effect or a local is its
 # id: no type holds a name beside it, a written name's characters leave
 # only in listed functions, a reference by text is built only before the
-# resolver, and no `==` compares a value holding a written name. A site
-# that still decides by text is a row of
-# tools/symid-census/pending-written.txt; `--final` fails while it has one.
+# resolver, and no `==` compares a value holding a written name. `--final`
+# also fails on any row of tools/symid-census/pending-written.txt.
 test-symid-names: kaic2
-	@./tools/symid-names-gate.sh
+	@./tools/symid-names-gate.sh --final
 
 # A contested declaration's emitted name is spelled by one function, from
 # its id: a second file minting a home spelling is a second rule, and the
@@ -361,9 +360,9 @@ test-rboxed-prim-scope: kaic1 kaic2
 	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	$(KAIC2) --path stdlib examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
-	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag)' $$tmp/s2.c \
+	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag_[0-9][0-9]*)' $$tmp/s2.c \
 	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
-	if grep -q 'kai_op_ne_v(kaiv_ntag,' $$tmp/s2.c; then \
+	if grep -q 'kai_op_ne_v(kaiv_ntag_[0-9][0-9]*,' $$tmp/s2.c; then \
 	  echo "rboxed-prim FAIL kaic2: raw llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"

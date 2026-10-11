@@ -86,7 +86,7 @@ pub fn lower_to_kir(raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: Proto
              defaults: kir_default_handlers(raw_decls, entry),
              runner_defaults: kir_runner_default_handlers(raw_decls),
              synth_defaults: kir_synth_handler_effects(raw_decls, tab),
-             regions: lower_regions(regions, []), runners: rs.runners, entry: entry, tab: tab, specs: specs, ids: ids,
+             regions: lower_regions(regions, []), runners: rs.runners, entry: entry, tab: tab, specs: specs, reg: st0.fx.sx, ids: ids,
              reuse_tags: reusable_tags(raw_decls, ids, ctors, entry) }
 }
 
@@ -201,10 +201,9 @@ type FnHead = { name: String, enc: EncFn, usig: Option[UFnSig], locals: LocalNam
 fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option[RowExpr],
             body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg], dn: Bool, ent: Bool) : KFn / Console {
   let name = head.name
-  let sym = head.enc.sym
   # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
   # module) by the cached `lower_fns` loop.
-  let st1 = ls_enter_fn_with(st0, head.enc, entry_params(params, entry_captures([], head.locals)), head.locals, body_fns)
+  let st1 = ls_enter_fn_with(st0, head.enc, entry_params(params, head.locals, entry_captures([], head.locals)), head.locals, body_fns)
   # P3 raw scalar params: resolve this fn's UFnSig (the classifier already
   # applied the no-tparams / no-FFI / no-effect-row gates and computed the
   # per-param `raw_mask`). A `Some(US(...))` lowers each raw param to its
@@ -216,7 +215,7 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
   let usig = head.usig
   let st = kir_unw_enter(ls_with_unw(st1, unw_fn_frame(st1.unw, head.enc.unit, row, unw_param_seeds(params, usig, st1.unw.ucx),
                                                         param_ids(params), body)))
-  let kparams = lower_params_sig(params, usig)
+  let kparams = lower_params_sig(params, head.locals, usig)
   # An `extern "C" fn` (issue #260) lowers to a DFn whose body is the magic
   # `ETodo("__kai_ffi__"[:override])` tag. C / LLVM-text intercept it in
   # `emit_fn_body` and synthesise an unbox→extern-call→re-box shim from the
@@ -236,9 +235,9 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
     # they never clashed — this mangling brings the FFI wrapper into line
     # WITHOUT prefixing the whole native backend (a separate concern).
     let c_symbol = ffi_extern_symbol_of(body, name)
-    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg, st.tab), kffi_kind_of_ret(ret_ty, freg, st.tab)),
+    KFn { unit: head.enc.unit, kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg, st.tab), kffi_kind_of_ret(ret_ty, freg, st.tab)),
           params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
-          region_id: None, stateful: false, mo: mo, donor: false, entry: false, fid: enc_fn_id(head.enc) }
+          region_id: None, stateful: false, mo: mo, donor: false, entry: false }
   } else {
     # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
     # lowering would otherwise reduce to a panic stub (the native path then
@@ -265,9 +264,9 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
     } else if is_some(body_kai_builtin(body)) { lower_kai_forwarder(body, name, params, stb) }
     else { lower_fn_body_at(body, ret_slot, stb) }
     match r {
-      LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
+      LRes(val, st1) -> KFn { unit: head.enc.unit, kind: KFnNormal, params: kparams,
                               ret: ret_slot, blocks: ls_finish(st1, KRet(val, kpos_of(body))),
-                              region_id: None, stateful: false, mo: mo, donor: dn, entry: ent, fid: enc_fn_id(head.enc) }
+                              region_id: None, stateful: false, mo: mo, donor: dn, entry: ent }
     }
   }
 }
@@ -368,7 +367,7 @@ fn lower_proto_dispatch(parts: ProtoDispatchParts, params: [Param],
     } else {
       let shim = cat2("kaix_proto_dispatch", int_to_string(arity))
       let args = [KIntV(pdp_proto_id_int(parts)), KIntV(pdp_op_id_int(parts)),
-                  KStrV(kir_quote(pname)), KStrV(kir_quote(opname)), ...proto_dispatch_arg_vals(params)]
+                  KStrV(kir_quote(pname)), KStrV(kir_quote(opname)), ...proto_dispatch_arg_vals(params, st)]
       bind_op(st, KCall(shim, args), pos)
     }
   }
@@ -376,9 +375,9 @@ fn lower_proto_dispatch(parts: ProtoDispatchParts, params: [Param],
 
 # The dispatcher's params as `KVar` atoms in declaration order (the op's
 # receiver first), the boxed args the shim forwards to the resolved impl.
-fn proto_dispatch_arg_vals(params: [Param]) : [KVal] = match params {
+fn proto_dispatch_arg_vals(params: [Param], st: LowerSt) : [KVal] = match params {
   []           -> []
-  [p, ...rest] -> [KVar(written_text(p.binder.name)), ...proto_dispatch_arg_vals(rest)]
+  [p, ...rest] -> [KVar(ls_reg_of(st, p.binder.id)), ...proto_dispatch_arg_vals(rest, st)]
 }
 
 # --- Lambdas: lifted bodies as top-level `KFnLambda`s -------------------
@@ -398,12 +397,11 @@ fn lower_lam_fns(lams: [LamInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = 
 
 fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = match l {
   LamInfo(_, _, _, _, params, caps, body, _) -> {
-    let sym = lam_symbol(l)
     let locals = kir_body_locals(lam_locals(l))
     let pids = param_ids(params)
-    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, lam_unit(l), entry_params(params, entry_captures(caps, locals)), locals, body_fns),
+    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, lam_unit(l), entry_params(params, locals, entry_captures(caps, locals)), locals, body_fns),
                                        unw_frame(st0.unw, pids, pids, body)))
-    let kparams = list_append(lower_params(params, []), lower_captures(caps, locals, 0, []))
+    let kparams = list_append(lower_params(params, locals, []), lower_captures(caps, locals, 0, []))
     match lower_expr(body, st) { LRes(val, st1) -> {
       # Each param is owned per-invocation yet the closure body only DUPs
       # its reads (`in_lam` forces a dup on every read), so the birth ref
@@ -412,15 +410,15 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = mat
       # them (released in its destructor); a per-call drop would UAF after
       # the first invocation. All lambda params are `SBoxed` (`lower_params`).
       let st2 = lam_drop_params(params, st1)
-      KFn { sym: sym, kind: KFnLambda, params: kparams, ret: SBoxed,
+      KFn { unit: lam_unit(l).unit, kind: KFnLambda, params: kparams, ret: SBoxed,
             blocks: ls_finish(st2, KRet(val, kpos_of(body))), region_id: None,
-            stateful: false, mo: None, donor: false, entry: false, fid: fnid_none() } } }
+            stateful: false, mo: None, donor: false, entry: false } } }
   }
 }
 
 fn lam_drop_params(params: [Param], st: LowerSt) : LowerSt / Console = match params {
   []           -> st
-  [p, ...rest] -> lam_drop_params(rest, ls_emit(st, KRC(KDrop(KVar(written_text(p.binder.name))), KNoPos)))
+  [p, ...rest] -> lam_drop_params(rest, ls_emit(st, KRC(KDrop(KVar(ls_reg_of(st, p.binder.id))), KNoPos)))
 }
 
 # Each capture becomes a `PCapture(j)` param read from `self->as.clo`
@@ -479,35 +477,35 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt, body_fns:
     let sym = clause_sym(c)
     let locals = kir_body_locals(clause_locals(c))
     let owned = if is_fin { [] } else { unw_clause_seeds(c) }
-    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, clause_unit(c), entry_params(params, entry_captures(caps, locals)), locals, body_fns),
+    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, clause_unit(c), entry_params(params, locals, entry_captures(caps, locals)), locals, body_fns),
                                        unw_frame(st0.unw, owned, owned, body)))
     # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
     let env = handle_captures_at(all_cls, enc_fn, line, col)
     # A `finally` has no surface params and never resumes: captures only.
-    let own_params = if is_fin { [] } else { lower_clause_params(params) }
+    let own_params = if is_fin { [] } else { lower_clause_params(params, locals) }
     let kparams = list_append(own_params, lower_env_captures(caps, locals, env, []))
     match lower_expr(body, if stateful { bind_self_state(st) } else { st }) { LRes(val, st1) -> {
       let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
       check_resume_one_shot(sym, blocks)
-      KFn { sym: sym, kind: if is_fin { KFnCleanup } else { KFnClause },
+      KFn { unit: clause_unit(c).unit, kind: if is_fin { KFnCleanup } else { KFnClause },
             params: kparams, ret: SBoxed,
-            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false, entry: false, fid: fnid_none() }
+            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false, entry: false }
     } }
   }
 }
 
 # A clause's surface params: all but the last are ordinary args
 # (`PDirect`); the last is the `resume` continuation (`PResume`).
-fn lower_clause_params(params: [Param]) : [KParam] = {
+fn lower_clause_params(params: [Param], locals: LocalNames) : [KParam] = {
   let n = list_length(params)
-  lower_clause_params_idx(params, 0, n, [])
+  lower_clause_params_idx(params, locals, 0, n, [])
 }
 
-fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KParam] = match params {
+fn lower_clause_params_idx(params: [Param], locals: LocalNames, i: Int, n: Int, acc: [KParam]) : [KParam] = match params {
   [] -> acc
   [p, ...rest] -> {
     let origin = if i == n - 1 { PResume } else { PDirect(i) }
-    lower_clause_params_idx(rest, i + 1, n, list_append(acc, [KParam { name: written_text(p.binder.name), slot: SBoxed, mode: kparam_mode(p), origin: origin }]))
+    lower_clause_params_idx(rest, locals, i + 1, n, list_append(acc, [KParam { name: kir_local_reg(locals, p.binder.id), slot: SBoxed, mode: kparam_mode(p), origin: origin }]))
   }
 }
 

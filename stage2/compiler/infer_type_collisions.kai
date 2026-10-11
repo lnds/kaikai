@@ -12,11 +12,10 @@ import compiler.infer
 import compiler.module_table
 import compiler.emit_shared
 import compiler.cont_type
-import compiler.home_dup
 import compiler.written
 import compiler.symtab
 import compiler.decl_text
-import compiler.type_text
+import compiler.proto_resolve
 
 # A type declaration at a source position: a second declaration of its
 # name in its module derives the same id.
@@ -142,46 +141,68 @@ fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
   }
 }
 
-#[doc("infer: `validate_constructor_uniqueness_decls` — reject a second `#[constructor]` for the same type. The claim is keyed by the declaring module: two modules each with their own type and its own constructor are distinct claims, not a collision.")]
-pub fn validate_constructor_uniqueness_decls(decls: [Decl], tab: SymTab, df: DiagFiles) : Int / Console + File {
+#[doc("infer: `validate_constructor_uniqueness_decls` — reject a second `#[constructor]` for the same type. The claim is the type's declaration: two modules each with their own type and its own constructor are distinct claims, not a collision.")]
+pub fn validate_constructor_uniqueness_decls(decls: [Decl], ps: PScope, df: DiagFiles) : Int / Console + File {
 
-  validate_constructor_uniqueness_loop(decls, tab, df, [], 0)
+  validate_constructor_uniqueness_loop(decls, ps, df, [], 0)
 }
 
-fn validate_constructor_uniqueness_loop(remaining: [Decl], tab: SymTab, df: DiagFiles,
-    claims: [HomedDecl],
+# A `#[constructor]` claim: the type it builds, by declaration, and where
+# the wrapper stands.
+type CtorClaim = CtorClaim(SymId, ClaimSite)
+
+# Where a wrapper stands: its file and position.
+type ClaimSite = ClaimSite(String, Int, Int)
+
+fn validate_constructor_uniqueness_loop(remaining: [Decl], ps: PScope, df: DiagFiles,
+    claims: [CtorClaim],
     errs: Int) : Int / Console + File {
   match remaining {
     [] -> errs
-    [d, ...rest] -> match constructor_decl_type(d, tab) {
-      Some(claim) -> match homed_find(claims, hd_home(claim), hd_name(claim)) {
+    [d, ...rest] -> match constructor_decl_type(d, ps, decl_diag_file(d, df)) {
+      Some(claim) -> match find(claims, (c) => claim_type(c) == claim_type(claim)) {
         Some(prev) -> {
-          report_dup_constructor(decl_diag_file(d, df), claim, prev)
-          validate_constructor_uniqueness_loop(rest, tab, df, claims, errs + 1)
+          report_dup_constructor(ps_tab(ps), claim, prev)
+          validate_constructor_uniqueness_loop(rest, ps, df, claims, errs + 1)
         }
-        None -> validate_constructor_uniqueness_loop(rest, tab, df, [claim, ...claims], errs)
+        None -> validate_constructor_uniqueness_loop(rest, ps, df, [claim, ...claims], errs)
       }
-      None -> validate_constructor_uniqueness_loop(rest, tab, df, claims, errs)
+      None -> validate_constructor_uniqueness_loop(rest, ps, df, claims, errs)
     }
   }
 }
 
-# The `(home, type)` claim of a `#[constructor]` wrapper whose inner fn
-# returns a named type; None for any other decl.
-fn constructor_decl_type(d: Decl, tab: SymTab) : Option[HomedDecl] = match d {
+fn claim_type(c: CtorClaim) : Int = match c { CtorClaim(s, _) -> sym_raw(s) }
+
+# The claim of a `#[constructor]` wrapper whose inner fn returns a
+# declared type, read from the wrapper's own file; None for any other
+# decl and for a return type no declaration answers.
+fn constructor_decl_type(d: Decl, ps: PScope, file: String) : Option[CtorClaim] = match d {
   DConstructor(DFn(_, _, _, _, Some(ret_te), _, _, _, _, mo), l, c) ->
     match ret_te.tkind {
-      TyName(r, _) -> Some(HD(mo, ref_decl_name(tab, r), l, c))
-      _            -> None
+      TyName(r, _) -> {
+        let s = ps_type_sym(ps, r, mo)
+        if sym_raw(s) < 0 { None } else { Some(CtorClaim(s, ClaimSite(file, l, c))) }
+      }
+      _ -> None
     }
   _ -> None
 }
 
-fn report_dup_constructor(file: String, claim: HomedDecl,
-    prev: HomedDecl) : Unit / Console + File {
-  diag_error(file, hd_line(claim), hd_col(claim),
-    concat_all(["type '", hd_name(claim), "' already has a `#[constructor]` (earlier at ",
-                file, ":", int_to_string(hd_line(prev)), ":", int_to_string(hd_col(prev)), ")"]))
+fn report_dup_constructor(tab: SymTab, claim: CtorClaim,
+    prev: CtorClaim) : Unit / Console + File = match claim {
+  CtorClaim(s, ClaimSite(file, l, c)) -> match prev {
+    CtorClaim(_, earlier) -> report_dup_constructor_at(file, "#{decl_name(tab, s)}", l, c, earlier)
+  }
+}
+
+fn report_dup_constructor_at(file: String, name: String, l: Int, c: Int, earlier: ClaimSite) : Unit / Console + File = match earlier {
+  ClaimSite(pfile, pl, pc) -> report_dup_constructor_text(file, name, l, c, concat_all([pfile, ":", int_to_string(pl), ":", int_to_string(pc)]))
+}
+
+fn report_dup_constructor_text(file: String, name: String, l: Int, c: Int, earlier: String) : Unit / Console + File {
+  diag_error(file, l, c,
+    concat_all(["type '", name, "' already has a `#[constructor]` (earlier at ", earlier, ")"]))
   diag_help(concat_all(["a type has at most one `#[constructor]`; keep one and make the other a named `pub fn` (overloading is out — Tier 1 #3)"]))
 }
 

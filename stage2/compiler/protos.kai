@@ -84,13 +84,13 @@ import compiler.core_protos
 import compiler.type_text
 import compiler.diag_file
 import compiler.home_dup
-import compiler.kinds
 import compiler.diag
 import compiler.util
 import compiler.fnreg
 import compiler.impl_index
 import compiler.impl_identity
 import compiler.proto_ids
+import compiler.proto_contest
 import compiler.scope_view
 import compiler.modules
 import compiler.proto_key
@@ -114,6 +114,8 @@ import compiler.resolve_callee
 import compiler.symtab_build
 import compiler.mutation_carriers
 import compiler.core_effects
+import compiler.tbinder
+import compiler.tparam_uses
 
 # ====================================================================
 # Law wrappers (`laws <Theory>` / `axiom <Theory>`).
@@ -340,8 +342,13 @@ pub fn proto_type_ref(te: TypeExpr) : DeclRef {
     # A compound row is never a dispatch head: a name no `impl` matches.
     TyRow(_) -> ref_written("Row")
     TySurface(_) -> panic("proto_type_ref: surface type not lowered")
+    TyParam(id, _) -> tparam_head(id)
   }
 }
+
+# A type parameter is no declaration: its head is spelled from its id, so
+# two parameters never share one and no declared type answers to it.
+fn tparam_head(id: TLocalId) : DeclRef = ref_written(tparam_key(id))
 
 #[doc("The single-dispatch head name of a `TypeExpr`, as a diagnostic shows it.")]
 pub fn proto_type_name(tab: SymTab, te: TypeExpr) : String = ref_text(tab, proto_type_ref(te))
@@ -359,12 +366,6 @@ fn refs_same(tab: SymTab, a: DeclRef, b: DeclRef) : Bool =
   if ref_resolved(a) and ref_resolved(b) { sym_raw(ref_sym(a)) == sym_raw(ref_sym(b)) }
   else { rt_ref_name(tab, a) == rt_ref_name(tab, b) }
 
-# The bare name an unqualified reference still spells: where `Self` and
-# a type parameter, which no declaration stands behind, are recognised.
-fn ref_bare_text(r: DeclRef) : Option[String] = match r {
-  DrWritten(None, n) -> Some(written_text(n))
-  _                  -> None
-}
 
 # A protocol head as the scope chain takes it: `m.P`, or `P`.
 fn proto_ref_spell(tab: SymTab, r: DeclRef) : String = match r {
@@ -372,9 +373,8 @@ fn proto_ref_spell(tab: SymTab, r: DeclRef) : String = match r {
   _                     -> ref_text(tab, r)
 }
 
-# The protocol a head denotes from the file homed at `from`; `sym_none()`
-# when it resolves to no single reachable protocol.
-fn proto_ref_sym(ps: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
+#[doc("The protocol a head denotes from the file homed at `from`; `sym_none()` when it resolves to no single reachable protocol.")]
+pub fn proto_ref_sym(ps: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
   DrSym(s)        -> s
   DrWritten(_, _) -> ps_proto_sym(ps, proto_ref_spell(ps_tab(ps), r), from)
 }
@@ -485,8 +485,8 @@ fn register_proto_ops(reg: ProtocolReg, mo: Option[String],
   match ops {
     [] -> reg
     [op, ...rest] -> match op {
-      POp(opname, _, params, ret, line, col) -> {
-        let entry = POR(psym, written(opname), params, ret, line, col, mo)
+      POp(opname, op_tps, params, ret, line, col) -> {
+        let entry = POR(psym, written(opname), params, ret, line, col, mo, op_tps)
         let names1 =
           if list_has(reg.op_names, opname) { reg.op_names }
           else { [opname, ...reg.op_names] }
@@ -514,7 +514,7 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _, _) ->
         if op_label_is(name, target) { Some(op) } else { proto_op_lookup_loop(rest, target) }
     }
   }
@@ -558,7 +558,7 @@ fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _, _) ->
         if op_label_is(name, target) { [op, ...proto_ops_lookup_all_loop(rest, target)] }
         else { proto_ops_lookup_all_loop(rest, target) }
     }
@@ -756,7 +756,7 @@ fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) -> proto_op_names(rest, [written_text(name), ...acc])
+      POR(_, name, _, _, _, _, _, _) -> proto_op_names(rest, [written_text(name), ...acc])
     }
   }
 }
@@ -770,7 +770,7 @@ fn check_missing_methods(tab: SymTab, proto_ops: [ProtoOpReg], methods: [Decl],
   match proto_ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, oplbl, _, _, _, _, _) -> {
+      POR(_, oplbl, _, _, _, _, _, _) -> {
         let opname = written_text(oplbl)
         let acc1 =
           if impl_has_method(tab, methods, opname) { acc }
@@ -805,12 +805,12 @@ fn impl_has_method(tab: SymTab, methods: [Decl], opname: String) : Bool {
 # protocol op are reported as unknown.
 fn check_impl_methods(tab: SymTab, methods: [Decl], proto_ops: [ProtoOpReg],
                       pname: String, tname: String, target: TypeExpr,
-                      proto_tps: [String], arg_heads: [DeclRef],
+                      proto_tps: [TBinder], arg_heads: [DeclRef],
                       file: String, acc: [Diagnostic]) : [Diagnostic] {
   match methods {
     [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, fid, _, params, ret_opt, _, _, line, col, _) -> {
+      DFn(_, fid, mtps, params, ret_opt, _, _, line, col, _) -> {
         let op_name = impl_method_op(tab, fid)
         let acc1 = match find_proto_op(proto_ops, op_name) {
           None ->
@@ -819,7 +819,8 @@ fn check_impl_methods(tab: SymTab, methods: [Decl], proto_ops: [ProtoOpReg],
                            "` declares method `", op_name,
                            "` which is not an operation of protocol `", pname, "`"])), ...acc]
           Some(op) -> match op {
-            POR(_, _, proto_params, proto_ret, _, _, _) -> {
+            POR(_, _, proto_params, proto_ret, _, _, _, op_tps) -> {
+              let shown = list_append(mtps, list_append(proto_tps, op_tps))
               let pa = list_length(params)
               let pp = list_length(proto_params)
               let e_ar =
@@ -833,7 +834,7 @@ fn check_impl_methods(tab: SymTab, methods: [Decl], proto_ops: [ProtoOpReg],
               if pa == pp {
                 check_sig_heads(tab, params, proto_params, ret_opt, proto_ret,
                                 op_name, pname, tname, target,
-                                proto_tps, arg_heads,
+                                proto_tps, arg_heads, shown,
                                 file, line, col, e_ar)
               } else { e_ar }
             }
@@ -852,7 +853,7 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _, _) ->
         if op_label_is(name, target) { Some(op) } else { find_proto_op(rest, target) }
     }
   }
@@ -868,15 +869,17 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
 # function type, which has no meaningful head and compares structurally.
 # Unannotated impl params (`ptype == None`) are not checked — the
 # typer infers them; a pre-typer pass has no signal to compare against.
+# `shown` holds every type parameter either signature may mention, for
+# the diagnostics.
 fn check_sig_heads(tab: SymTab, impl_params: [Param], proto_params: [Param],
                    impl_ret_opt: Option[TypeExpr], proto_ret: TypeExpr,
                    op_name: String, pname: String, tname: String,
                    target: TypeExpr,
-                   proto_tps: [String], arg_heads: [DeclRef],
+                   proto_tps: [TBinder], arg_heads: [DeclRef], shown: [TBinder],
                    file: String, line: Int, col: Int,
                    acc: [Diagnostic]) : [Diagnostic] {
   let e_params = check_sig_param_heads(tab, impl_params, proto_params, tname, target,
-                                        proto_tps, arg_heads,
+                                        proto_tps, arg_heads, shown,
                                         op_name, pname, file, acc)
   # Return-type check applies only when the impl is homogeneous w.r.t.
   # the protocol's tparams. Heterogeneous impls (`impl P[Other] for T`
@@ -894,26 +897,37 @@ fn check_sig_heads(tab: SymTab, impl_params: [Param], proto_params: [Param],
     Some(impl_ret) -> {
       let ok = match proto_ret.tkind {
         TyFn(_, _, _) -> sig_type_matches(tab, impl_ret, sig_subst(proto_ret, target, proto_tps, arg_heads))
-        _ -> refs_same(tab, proto_type_ref(impl_ret), sig_head_subst(proto_ret, target, proto_tps, arg_heads))
+        _ ->
+          if sig_free_param(proto_ret, proto_tps) { sig_free_param(impl_ret, []) }
+          else { refs_same(tab, proto_type_ref(impl_ret), sig_head_subst(proto_ret, target, proto_tps, arg_heads)) }
       }
       if ok { e_params }
       else {
         [proto_err(file, line, col,
            concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
-                       "` returns `", type_text(tab, impl_ret),
+                       "` returns `", type_text_in(tab, shown, impl_ret),
                        "` but protocol declares return type `",
-                       sig_ret_display(tab, proto_ret, target, proto_tps, arg_heads), "`"])),
+                       sig_ret_display(tab, proto_ret, target, proto_tps, arg_heads, shown), "`"])),
          ...e_params]
       }
     }
   } }
 }
 
+# A parameter the impl head settles nothing about: one of the op's own,
+# which any parameter of the impl method answers.
+fn sig_free_param(t: TypeExpr, proto_tps: [TBinder]) : Bool = match t.tkind {
+  TyParam(id, _) -> not tlocal_is_self(id) and not tbs_has(proto_tps, id)
+  _              -> false
+}
+
 fn sig_ret_display(tab: SymTab, t: TypeExpr, target: TypeExpr,
-                   proto_tps: [String], arg_heads: [DeclRef]) : String =
+                   proto_tps: [TBinder], arg_heads: [DeclRef], shown: [TBinder]) : String =
   match t.tkind {
-    TyFn(_, _, _) -> type_text(tab, sig_subst(t, target, proto_tps, arg_heads))
-    _ -> ref_text(tab, sig_head_subst(t, target, proto_tps, arg_heads))
+    TyFn(_, _, _) -> type_text_in(tab, shown, sig_subst(t, target, proto_tps, arg_heads))
+    _ ->
+      if sig_free_param(t, proto_tps) { type_text_in(tab, shown, t) }
+      else { ref_text(tab, sig_head_subst(t, target, proto_tps, arg_heads)) }
   }
 
 # An impl is heterogeneous iff it carries explicit bracket args and
@@ -931,7 +945,7 @@ fn heterogeneous_impl(tab: SymTab, arg_heads: [DeclRef], target: DeclRef) : Bool
 
 fn check_sig_param_heads(tab: SymTab, impl_ps: [Param], proto_ps: [Param], tname: String,
                          target: TypeExpr,
-                         proto_tps: [String], arg_heads: [DeclRef],
+                         proto_tps: [TBinder], arg_heads: [DeclRef], shown: [TBinder],
                          op_name: String, pname: String,
                          file: String, acc: [Diagnostic]) : [Diagnostic] {
   match impl_ps {
@@ -950,14 +964,14 @@ fn check_sig_param_heads(tab: SymTab, impl_ps: [Param], proto_ps: [Param], tname
                 [proto_err(file, ip.pline, ip.pcol,
                    concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
                                "`: parameter `", written_text(ip.binder.name),
-                               "` has type `", type_text(tab, it),
-                               "` but protocol declares `", type_text(tab, ps), "`"])), ...acc]
+                               "` has type `", type_text_in(tab, shown, it),
+                               "` but protocol declares `", type_text_in(tab, shown, ps), "`"])), ...acc]
               }
             }
           }
         }
         check_sig_param_heads(tab, irest, prest, tname, target,
-                              proto_tps, arg_heads,
+                              proto_tps, arg_heads, shown,
                               op_name, pname, file, acc1)
       }
     }
@@ -986,6 +1000,12 @@ fn sig_type_matches(tab: SymTab, impl_t: TypeExpr, proto_t: TypeExpr) : Bool {
     TyFn(pps, pret, prow) -> match impl_t.tkind {
       TyFn(ips, iret, irow) ->
         sig_types_match(tab, ips, pps) and sig_type_matches(tab, iret, pret) and sig_rows_match(tab, irow, prow)
+      _ -> false
+    }
+    # A parameter the substitution left in place is one the impl method
+    # answers with a parameter of its own.
+    TyParam(_, pargs) -> match impl_t.tkind {
+      TyParam(_, iargs) -> pargs == [] or iargs == [] or sig_types_match(tab, iargs, pargs)
       _ -> false
     }
     _ -> refs_same(tab, proto_type_ref(impl_t), proto_type_ref(proto_t))
@@ -1043,21 +1063,19 @@ fn sig_types_match(tab: SymTab, its: [TypeExpr], pts: [TypeExpr]) : Bool {
 # with `s := Chain`) substitutes at the head and keeps its arguments,
 # yielding `Chain[Int]` — the Shape-carrier form.
 fn sig_subst(t: TypeExpr, target: TypeExpr,
-             proto_tps: [String], arg_heads: [DeclRef]) : TypeExpr {
+             proto_tps: [TBinder], arg_heads: [DeclRef]) : TypeExpr {
   match t.tkind {
-    TyName(r, targs) -> {
+    TyName(r, targs) ->
+      mk_ty(TyName(r, map(targs, (a) => sig_subst(a, target, proto_tps, arg_heads))), t.line, t.col)
+    TyParam(id, targs) -> {
       let sargs = map(targs, (a) => sig_subst(a, target, proto_tps, arg_heads))
-      match ref_bare_text(r) {
-        None    -> mk_ty(TyName(r, sargs), t.line, t.col)
-        Some(n) ->
-          if n == "Self" {
-            match targs { [] -> target  _ -> mk_ty(TyName(proto_type_ref(target), sargs), t.line, t.col) }
-          } else {
-            match tparam_subst(n, proto_tps, arg_heads, proto_type_ref(target)) {
-              Some(h) -> mk_ty(TyName(h, sargs), t.line, t.col)
-              None    -> mk_ty(TyName(r, sargs), t.line, t.col)
-            }
-          }
+      if tlocal_is_self(id) {
+        match targs { [] -> target  _ -> mk_ty(TyName(proto_type_ref(target), sargs), t.line, t.col) }
+      } else {
+        match tparam_subst(id, proto_tps, arg_heads, proto_type_ref(target)) {
+          Some(h) -> mk_ty(TyName(h, sargs), t.line, t.col)
+          None    -> mk_ty(TyParam(id, sargs), t.line, t.col)
+        }
       }
     }
     TyList(inner) -> mk_ty(TyList(sig_subst(inner, target, proto_tps, arg_heads)), t.line, t.col)
@@ -1071,7 +1089,7 @@ fn sig_subst(t: TypeExpr, target: TypeExpr,
 }
 
 fn sig_subst_row(r: RowExpr, target: TypeExpr,
-                 proto_tps: [String], arg_heads: [DeclRef]) : RowExpr {
+                 proto_tps: [TBinder], arg_heads: [DeclRef]) : RowExpr {
   let sub = (l: RowLabel) => match l {
     RL(eff, args) -> RL(eff, map(args, (a) => sig_subst(a, target, proto_tps, arg_heads)))
   }
@@ -1088,17 +1106,14 @@ fn sig_subst_row(r: RowExpr, target: TypeExpr,
 # through to the standard `proto_type_ref` collapse — head
 # comparison is intentionally permissive about unresolved variables.
 fn sig_head_subst(t: TypeExpr, target: TypeExpr,
-                  proto_tps: [String], arg_heads: [DeclRef]) : DeclRef {
+                  proto_tps: [TBinder], arg_heads: [DeclRef]) : DeclRef {
   match t.tkind {
-    TyName(r, _) -> match ref_bare_text(r) {
-      None    -> r
-      Some(n) ->
-        if n == "Self" { proto_type_ref(target) }
-        else { match tparam_subst(n, proto_tps, arg_heads, proto_type_ref(target)) {
-          Some(h) -> h
-          None    -> r
-        } }
-    }
+    TyParam(id, _) ->
+      if tlocal_is_self(id) { proto_type_ref(target) }
+      else { match tparam_subst(id, proto_tps, arg_heads, proto_type_ref(target)) {
+        Some(h) -> h
+        None    -> proto_type_ref(t)
+      } }
     _ -> proto_type_ref(t)
   }
 }
@@ -1106,17 +1121,16 @@ fn sig_head_subst(t: TypeExpr, target: TypeExpr,
 # Position-aligned lookup: `proto_tps[i]` -> `arg_heads[i]`. When
 # `arg_heads == []` (legacy un-parametrised impl), every protocol
 # tparam falls back to the target head — the homogeneous default
-# encoded in `lower_impls`. A tparam's stored name may carry a kind
-# marker (`s#Shape`); the surface name is compared, so a `[s: Shape]`
-# carrier binds `s := <target head>` exactly as a bare `[a]` does.
-fn tparam_subst(n: String, tps: [String], heads: [DeclRef],
+# encoded in `lower_impls`. A `[s: Shape]` carrier binds
+# `s := <target head>` exactly as a bare `[a]` does.
+fn tparam_subst(n: TLocalId, tps: [TBinder], heads: [DeclRef],
                 target: DeclRef) : Option[DeclRef] {
   match tps {
     [] -> None
     [t, ...trest] -> match heads {
-      [] -> if tp_strip_kind(t) == n { Some(target) } else { tparam_subst(n, trest, [], target) }
+      [] -> if tlocal_eq(t.id, n) { Some(target) } else { tparam_subst(n, trest, [], target) }
       [h, ...hrest] ->
-        if tp_strip_kind(t) == n { Some(h) } else { tparam_subst(n, trest, hrest, target) }
+        if tlocal_eq(t.id, n) { Some(h) } else { tparam_subst(n, trest, hrest, target) }
     }
   }
 }
@@ -1245,20 +1259,21 @@ fn lower_impl_methods(tab: SymTab, root: String, head: ImplHead, methods: [Decl]
 # core's basename so a cache loader can partition post-cascade
 # decls back into their original core/user segments.
 fn generate_dispatchers(reg: ProtocolReg, tab: SymTab) : DispGen =
-  generate_dispatchers_loop(reg.ops, op_arities_from_ops(reg.ops), tab, reg.root,
+  generate_dispatchers_loop(reg.ops, reg.tparams, op_arities_from_ops(reg.ops), tab, reg.root,
                             DispGen { decls: [], ids: pid_empty(), rows: [] })
 
 # The dispatchers, the id table that records each one as it is minted,
 # and the table row of each.
 type DispGen = { decls: [Decl], ids: ProtoIds, rows: [NEnt] }
 
-fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], tab: SymTab, root: String,
+fn generate_dispatchers_loop(ops: [ProtoOpReg], ptps: [ProtoTPReg], arities: [OpAr], tab: SymTab, root: String,
                                 acc: DispGen) : DispGen {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(psym, oplbl, params, ret, line, col, mo) -> {
+      POR(psym, oplbl, params, ret, line, col, mo, op_tps) -> {
         let opname = written_text(oplbl)
+        let tps = dispatcher_tparams(psym, proto_scope_tparams(ptps, psym), op_tps, params, ret)
         # An arity-ambiguous op (`f/1` + `f/2`) yields two dispatcher
         # names, so both survive. One dispatcher per (name, home): every
         # protocol of a home declaring the op at that arity shares it,
@@ -1268,13 +1283,13 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], tab: SymTab, ro
         let dsym = pid_fn_id(disp, mo, root)
         let already = pid_is_disp(acc.ids, dsym)
         let ids = pid_note_disp(acc.ids, disp, opname, mo, list_length(params), psym, root)
-        if already { generate_dispatchers_loop(rest, arities, tab, root, DispGen { decls: acc.decls, ids: ids, rows: acc.rows }) }
+        if already { generate_dispatchers_loop(rest, ptps, arities, tab, root, DispGen { decls: acc.decls, ids: ids, rows: acc.rows }) }
         else {
           let pname = written_text(sym_name(tab, psym))
-          let stub = make_dispatcher_fn(pname, opname, dsym, params, ret, line, col, mo)
+          let stub = make_dispatcher_fn(pname, opname, dsym, tps, params, ret, line, col, mo)
           let open = DispGen { decls: [stub, ...acc.decls], ids: ids,
                                rows: [NEnt(NCFn, disp, proto_home_name(mo, root), true, NmDispatcher), ...acc.rows] }
-          generate_dispatchers_loop(rest, arities, tab, root, with_homed_twin(open, pname, opname, disp, params, ret, line, col, mo, root))
+          generate_dispatchers_loop(rest, ptps, arities, tab, root, with_homed_twin(open, pname, opname, disp, tps, params, ret, line, col, mo, root))
         }
       }
     }
@@ -1284,12 +1299,12 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], tab: SymTab, ro
 # A module's dispatcher gains its homed twin: the same stub under a name
 # of its own, which only that module's protocols answer. The root file
 # has none: nothing names its dispatchers through a home.
-fn with_homed_twin(g: DispGen, pname: String, opname: String, disp: String, params: [Param], ret: TypeExpr,
+fn with_homed_twin(g: DispGen, pname: String, opname: String, disp: String, tps: [TBinder], params: [Param], ret: TypeExpr,
                    line: Int, col: Int, mo: Option[String], root: String) : DispGen = match mo {
   None    -> g
   Some(_) -> {
     let twin = proto_homed_name(disp)
-    let stub = make_dispatcher_fn(pname, opname, pid_fn_id(twin, mo, root), params, ret, line, col, mo)
+    let stub = make_dispatcher_fn(pname, opname, pid_fn_id(twin, mo, root), tps, params, ret, line, col, mo)
     DispGen { decls: [stub, ...g.decls], ids: pid_note_homed(g.ids, disp, twin, mo, root),
               rows: [NEnt(NCFn, twin, proto_home_name(mo, root), true, NmDispatcher), ...g.rows] }
   }
@@ -1303,14 +1318,25 @@ fn proto_homed_name(disp: String) : String = concat_all(["__homed", disp])
 # (which may carry an `__a<N>` suffix); `opname` is the original op name,
 # kept for the dispatch tag so the post-inference rewrite and emit
 # resolve the impl by the protocol's true op name.
-fn make_dispatcher_fn(pname: String, opname: String, dsym: SymId,
+fn make_dispatcher_fn(pname: String, opname: String, dsym: SymId, tps: [TBinder],
                        params: [Param], ret: TypeExpr, line: Int, col: Int,
                        mo: Option[String]) : Decl {
-  let new_params = map(params, dispatcher_substitute_self_param)
-  let new_ret = substitute_self_in_type(ret)
-  let body = make_dispatcher_body(pname, opname, new_ret, line, col)
-  DFn(true, fnid_decl(dsym), [], new_params, Some(new_ret),
+  let body = make_dispatcher_body(pname, opname, ret, line, col)
+  DFn(true, fnid_decl(dsym), tps, params, Some(ret),
       REmpty, body, line, col, mo)
+}
+
+# A dispatcher is generic over everything its operation's signature
+# mentions: `Self`, the protocol's parameters and the operation's own,
+# in the order the signature first uses them. Each ranges over types
+# there, whatever kind the protocol gave it, and none is rigid.
+fn dispatcher_tparams(psym: SymId, proto_tps: [TBinder], op_tps: [TBinder],
+                      params: [Param], ret: TypeExpr) : [TBinder] = {
+  let self_b = TBinder { id: tlocal_self(psym), name: written("Self"), kind: KType, bounds: [], implicit: true }
+  let scope = [self_b, ...list_append(proto_tps, op_tps)]
+  list_append(map(sig_used_binders(scope, params, Some(ret), REmpty),
+                  (b) => TBinder { id: b.id, name: b.name, kind: KType, bounds: [], implicit: true }),
+              filter(op_tps, tb_is_row))
 }
 
 # Synthesises an `ETodo` body tagged `__kai_proto_dispatch__:<P>:<op>`.
@@ -1327,51 +1353,6 @@ fn make_dispatcher_fn(pname: String, opname: String, dsym: SymId,
 fn make_dispatcher_body(pname: String, opname: String, ret: TypeExpr,
                           line: Int, col: Int) : Expr =
   proto_mk_dispatch_body(pname, opname, line, col)
-
-fn dispatcher_substitute_self_param(p: Param) : Param {
-  match p.ptype {
-    None -> p
-    Some(te) -> Param { binder: p.binder, ptype: Some(substitute_self_in_type(te)),
-                         pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
-  }
-}
-
-fn substitute_self_in_type(te: TypeExpr) : TypeExpr {
-  TypeExpr {
-    tkind: substitute_self_in_kind(te.tkind),
-    line: te.line, col: te.col
-  }
-}
-
-fn substitute_self_in_kind(k: TyKind) : TyKind {
-  match k {
-    # `targs` (not `args`) — `args` is a core function name and the
-    # stage-1 resolver does not let the pattern binding shadow the
-    # core reference inside the body.
-    TyName(r, targs) -> {
-      let r1 = match ref_bare_text(r) {
-        Some(n) -> if n == "Self" { ref_written("proto_self") } else { r }
-        None    -> r
-      }
-      TyName(r1, map(targs, substitute_self_in_type))
-    }
-    TyList(inner) -> TyList(substitute_self_in_type(inner))
-    TyFn(ps, ret, row) ->
-      TyFn(map(ps, substitute_self_in_type), substitute_self_in_type(ret), row)
-    # m12.5: substitute under the dimensioned base; the unit
-    # expression is leaf data with no `Self` reference (units come
-    # from the global unit table, not from the protocol's tparam).
-    TyDim(base, u) -> TyDim(substitute_self_in_type(base), u)
-    # m12.6.a: predicates do not contain TypeExpr nodes that mention
-    # Self, so the predicate is left intact.
-    TyRefine(base, p) -> TyRefine(substitute_self_in_type(base), p)
-    # issue #772: a compound row carries effect labels, not `Self` —
-    # passed through unchanged, matching the `TyFn` row above.
-    TyRow(row) -> TyRow(row)
-    TySurface(ts) ->
-      TySurface(tysurface_rebuild(ts, map(tysurface_children(ts), substitute_self_in_type)))
-  }
-}
 
 # Validate, before expansion, that every `#[derive(P)]` of Eq, Hash or
 # Show can be discharged: each field type must reach an impl that answers
@@ -1391,8 +1372,8 @@ fn collect_impl_reach(ps: PScope, sg: ShapedGens, ds: [Decl], acc: [ImplReach]) 
         let from = impl_home_of(ms)
         let p = proto_ref_sym(ps, pref, from)
         let acc1 = if gen_reach_checked(proto_gen(sg, p)) {
-          [impl_reach(p, head_tree(ps, from, reach_params(tps), target), tps,
-                      (b) => psc_same(ps_proto_sym(ps, b, from), p)), ...acc]
+          [impl_reach(p, head_tree(ps, from, tps, target), tps,
+                      (b) => psc_same(proto_ref_sym(ps, b, from), p)), ...acc]
         } else { acc }
         collect_impl_reach(ps, sg, rest, acc1)
       }
@@ -1416,18 +1397,27 @@ fn collect_impl_reach(ps: PScope, sg: ShapedGens, ds: [Decl], acc: [ImplReach]) 
 }
 
 # A type as the file homed at `from` reads it, head by head: a type
-# parameter of the declaration, one of `params`, stays written, and any
-# other head is settled to the declaration it denotes there.
-fn head_tree(ps: PScope, from: Option[String], params: [String], te: TypeExpr) : HeadTree =
+# parameter of the declaration, one of `params`, is filed under its
+# binder's name, and any other head is settled to the declaration it
+# denotes there.
+fn head_tree(ps: PScope, from: Option[String], params: [TBinder], te: TypeExpr) : HeadTree =
   HT(reach_head(ps, from, params, te), map(te_type_args(te), (a) => head_tree(ps, from, params, a)))
 
-fn reach_head(ps: PScope, from: Option[String], params: [String], te: TypeExpr) : DeclRef = {
-  let r = proto_type_ref(te)
-  if prc_ref_tparam(r, params) { r } else { vdv_head(ps, te, from) }
+fn reach_head(ps: PScope, from: Option[String], params: [TBinder], te: TypeExpr) : DeclRef =
+  match te_param_of(te, params) {
+    Some(b) -> param_head(b)
+    None    -> vdv_head(ps, te, from)
+  }
+
+# The parameter among `params` a type is a use of, if it is one.
+fn te_param_of(te: TypeExpr, params: [TBinder]) : Option[TBinder] = match te.tkind {
+  TyParam(id, _) -> tbs_find(params, id)
+  _              -> None
 }
 
 fn te_type_args(te: TypeExpr) : [TypeExpr] = match te.tkind {
   TyName(_, args)   -> args
+  TyParam(_, args)  -> args
   TyList(elem)      -> [elem]
   TyDim(base, _)    -> te_type_args(base)
   TyRefine(base, _) -> te_type_args(base)
@@ -1509,7 +1499,7 @@ type DeriveSite = DS(String, Int, Int)
 
 # What a derive's fields are read with: the scope, the file and the type
 # parameters of the deriving type, its name, and where it reports.
-type ReachRead = { ps: PScope, from: Option[String], params: [String], tname: String, site: DeriveSite }
+type ReachRead = { ps: PScope, from: Option[String], params: [TBinder], tname: String, site: DeriveSite }
 
 fn validate_derive_decl(ps: PScope, sg: ShapedGens, names: [String], inner: Decl, site: DeriveSite,
                         reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
@@ -1518,7 +1508,7 @@ fn validate_derive_decl(ps: PScope, sg: ShapedGens, names: [String], inner: Decl
     let from = derive_from(ps, inner)
     let gens = reach_gens(ps, sg, names, from)
     let own = list_append(map(gens, (g) => derived_reach(gen_proto(g), tsym, tps)), param_reaches(gens, tps))
-    let rd = ReachRead { ps: ps, from: from, params: reach_params(tps), tname: ref_text(tab, DrSym(tsym)), site: site }
+    let rd = ReachRead { ps: ps, from: from, params: tps, tname: ref_text(tab, DrSym(tsym)), site: site }
     validate_derive_protos(rd, sg, gens, derive_field_types(tab, body), list_append(own, reach), errs)
   }
   _ -> errs
@@ -1536,7 +1526,7 @@ fn gen_reach_checked(picked: Option[CoreProto]) : Bool = match picked {
 }
 
 # A field typed by a parameter the derive bounds is covered by that bound.
-fn param_reaches(gens: [DeriveGen], tps: [String]) : [ImplReach] = match gens {
+fn param_reaches(gens: [DeriveGen], tps: [TBinder]) : [ImplReach] = match gens {
   []          -> []
   [g, ...rest] ->
     list_append(map(derive_bound_params(tps), (tp) => param_reach(gen_proto(g), tp)), param_reaches(rest, tps))
@@ -1598,7 +1588,10 @@ fn validate_derive_fields(rd: ReachRead, d: DeriveGen, reach: ReachCx, fields: [
   [f, ...rest] -> match f {
     DFld(what, te) -> {
       let tab = ps_tab(rd.ps)
-      let path = map(missing_path(reach, head_tree(rd.ps, rd.from, rd.params, te)), (r) => ref_text(tab, r))
+      let path = map(missing_path(reach, head_tree(rd.ps, rd.from, rd.params, te)), (r) => match head_param(rd.params, r) {
+        Some(b) -> tb_text(b)
+        None    -> ref_text(tab, r)
+      })
       let errs1 = match path {
         [] -> errs
         _  -> [report_derive_missing(ref_text(tab, DrSym(gen_proto(d))), rd.tname, what, path, rd.site), ...errs]
@@ -1712,7 +1705,7 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # its home unless a core module derives. `home` is the module the derived
 # functions are declared in, `tab` names the type and its constructors,
 # and `heads` spells a field's type.
-type DerivedType = { tsym: SymId, tps: [String], body: TypeBody, writers: [String], proto: SymId,
+type DerivedType = { tsym: SymId, tps: [TBinder], body: TypeBody, writers: [String], proto: SymId,
                      ids: ProtoIds, homed: Bool, home: String, tab: SymTab, heads: HeadScope }
 
 # The name the user wrote: what a derived `show` and a runtime message
@@ -1817,7 +1810,7 @@ fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) 
       Derived { decls: m.decls, rows: m.rows }
     }
     CpJson         -> {
-      let m = derive_json_impl(dt.tab, dt.tsym, heads_body(dt.heads, reach_params(dt.tps), dt.body),
+      let m = derive_json_impl(dt.tab, dt.tsym, heads_body(dt.heads, dt.body),
                                (r) => head_ref_spell(dt.heads, r), line, col)
       Derived { decls: m.decls, rows: m.rows }
     }
@@ -3057,24 +3050,25 @@ fn head_ref_spell(hs: HeadScope, r: DeclRef) : String = match hs {
 }
 
 # A type body as its file reads it: every head of a field's type settled
-# to the declaration it denotes there. A type parameter of the type, one
-# of `params`, stays written.
-fn heads_body(hs: HeadScope, params: [String], body: TypeBody) : TypeBody = match body {
+# to the declaration it denotes there. A type parameter is no head to
+# settle.
+fn heads_body(hs: HeadScope, body: TypeBody) : TypeBody = match body {
   TBRecord(fields) -> TBRecord(map(fields, (f) => match f {
-    FD(p, name, te, attrs) -> FD(p, name, heads_type(hs, params, te), attrs)
+    FD(p, name, te, attrs) -> FD(p, name, heads_type(hs, te), attrs)
   }))
   TBSum(variants) -> TBSum(map(variants, (v) => match v {
-    Var(c, args) -> Var(c, map(args, (a) => heads_type(hs, params, a)))
+    Var(c, args) -> Var(c, map(args, (a) => heads_type(hs, a)))
   }))
   _ -> body
 }
 
-fn heads_type(hs: HeadScope, params: [String], te: TypeExpr) : TypeExpr = match te.tkind {
+fn heads_type(hs: HeadScope, te: TypeExpr) : TypeExpr = match te.tkind {
   TyName(r, args) -> {
-    let head = if prc_ref_tparam(r, params) { r } else { match hs { HeadScope(ps, from) -> vdv_settle(ps, r, from) } }
-    mk_ty(TyName(head, map(args, (a) => heads_type(hs, params, a))), te.line, te.col)
+    let head = match hs { HeadScope(ps, from) -> vdv_settle(ps, r, from) }
+    mk_ty(TyName(head, map(args, (a) => heads_type(hs, a))), te.line, te.col)
   }
-  TyList(elem) -> mk_ty(TyList(heads_type(hs, params, elem)), te.line, te.col)
+  TyParam(id, args) -> mk_ty(TyParam(id, map(args, (a) => heads_type(hs, a))), te.line, te.col)
+  TyList(elem) -> mk_ty(TyList(heads_type(hs, elem)), te.line, te.col)
   _            -> te
 }
 
@@ -3373,7 +3367,7 @@ fn validate_derive_json_loop(ps: PScope, decls: [Decl], df: DiagFiles,
         DType(_, tsym, tps, body, line, col, _, _) ->
           if derives_core(ps, names, derive_from(ps, inner), CpJson) {
             let file = decl_diag_file(d, df)
-            let settled = heads_body(HeadScope(ps, derive_from(ps, inner)), reach_params(tps), body)
+            let settled = heads_body(HeadScope(ps, derive_from(ps, inner)), body)
             let errs1 = validate_derive_json_body(ps_tab(ps), file, vdv_type_name(ps, tsym), settled, line, col, errs)
             validate_derive_json_loop(ps, rest, df, errs1)
           } else {
@@ -3633,7 +3627,7 @@ fn validate_derive_ord_loop(ps: PScope, sg: ShapedGens, decls: [Decl], df: DiagF
 # `params` names the type parameters the derive bounds by `Ord`: a
 # field typed by one of them is covered by that bound.
 fn validate_derive_ord_body(cx: VdvCx, file: String, tname: String, body: TypeBody,
-                              params: [String], providers: [DeclRef], line: Int, col: Int,
+                              params: [TBinder], providers: [DeclRef], line: Int, col: Int,
                               errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match body {
@@ -3649,7 +3643,7 @@ fn validate_derive_ord_body(cx: VdvCx, file: String, tname: String, body: TypeBo
 }
 
 fn validate_derive_ord_fields(cx: VdvCx, file: String, tname: String,
-                                fields: [FieldDecl], params: [String], providers: [DeclRef],
+                                fields: [FieldDecl], params: [TBinder], providers: [DeclRef],
                                 line: Int, col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match fields {
@@ -3665,7 +3659,7 @@ fn validate_derive_ord_fields(cx: VdvCx, file: String, tname: String,
 }
 
 fn validate_derive_ord_variants(cx: VdvCx, file: String, tname: String,
-                                  variants: [Variant], params: [String], providers: [DeclRef],
+                                  variants: [Variant], params: [TBinder], providers: [DeclRef],
                                   line: Int, col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match variants {
@@ -3683,7 +3677,7 @@ fn validate_derive_ord_variants(cx: VdvCx, file: String, tname: String,
 
 fn validate_derive_ord_payload(cx: VdvCx, file: String, tname: String, vname: String,
                                  vargs: [TypeExpr], idx: Int,
-                                 params: [String], providers: [DeclRef], line: Int, col: Int,
+                                 params: [TBinder], providers: [DeclRef], line: Int, col: Int,
                                  errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match vargs {
@@ -3700,11 +3694,11 @@ fn validate_derive_ord_payload(cx: VdvCx, file: String, tname: String, vname: St
 
 fn validate_derive_ord_one(cx: VdvCx, file: String, tname: String, fname: String,
                              kind: String, ftype: TypeExpr,
-                             params: [String], providers: [DeclRef], line: Int, col: Int,
+                             params: [TBinder], providers: [DeclRef], line: Int, col: Int,
                              errs: [Diagnostic]) : [Diagnostic] / Console {
   let tab = ps_tab(cx.ps)
   let href = vdv_head(cx.ps, ftype, cx.from)
-  if prc_ref_tparam(href, params) {
+  if is_some(te_param_of(ftype, params)) {
     errs
   } else if vdv_provided(tab, providers, href) {
     errs
@@ -3850,7 +3844,7 @@ pub type OpAr = OpAr(String, Int)
 pub fn proto_rungs(reg: ProtocolReg) : [ProtoRung] = {
   let ars = op_arities_from_ops(reg.ops)
   map(reg.ops, (op) => match op {
-    POR(psym, name, params, _, _, _, mo) -> {
+    POR(psym, name, params, _, _, _, mo, _) -> {
       let n = list_length(params)
       let label = written_text(name)
       ProtoRung(label, n, proto_dispatcher_name_at(ars, label, n), mo, psc_is_pub(reg.origins, psym))
@@ -3863,7 +3857,7 @@ pub fn op_arities_from_ops(ops: [ProtoOpReg]) : [OpAr] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, params, _, _, _, _) ->
+      POR(_, name, params, _, _, _, _, _) ->
         [OpAr(written_text(name), list_length(params)), ...op_arities_from_ops(rest)]
     }
   }
@@ -4439,7 +4433,7 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, tab: SymTab, cm: Option[Str
               Some(h) -> match find_impl_any_proto(reg, opname, h, cm) {
                 Some(_) -> validate_dispatch_unique(e, args_, reg, tab, cm, opname, file, errs)
                 None -> {
-                  let pname = first_proto_of_op(reg, tab, opname)
+                  let pname = unserved_protos(reg, tab, callee, opname)
                   let d = mk_diag(SevError, file, e.line, e.col,
                     concat_all(["no impl of `", pname,
                                 "` for type `", dh_text(tab, h),
@@ -4503,8 +4497,9 @@ fn te_self_count(te: TypeExpr) : Int = te_kind_self_count(te.tkind)
 
 fn te_kind_self_count(k: TyKind) : Int {
   match k {
-    TyName(r, targs) ->
-      (if prc_ref_self(r) { 1 } else { 0 }) + te_list_self_count(targs)
+    TyName(_, targs) -> te_list_self_count(targs)
+    TyParam(id, targs) ->
+      (if tlocal_is_self(id) { 1 } else { 0 }) + te_list_self_count(targs)
     TyList(inner) -> te_self_count(inner)
     TyFn(ps, r, _) -> te_list_self_count(ps) + te_self_count(r)
     TyDim(base, _) -> te_self_count(base)
@@ -4520,18 +4515,6 @@ fn te_list_self_count(tes: [TypeExpr]) : Int = match tes {
   [t, ...rest] -> te_self_count(t) + te_list_self_count(rest)
 }
 
-# `Self` names no declaration: a protocol's signatures write it, and it
-# is read as written.
-fn prc_ref_self(r: DeclRef) : Bool = match r {
-  DrWritten(None, n) -> written_text(n) == "Self"
-  _                  -> false
-}
-
-# A type parameter is a name of its declaration's own scope.
-fn prc_ref_tparam(r: DeclRef, tparams: [String]) : Bool = match r {
-  DrWritten(None, n) -> list_has(tparams, written_text(n))
-  _                  -> false
-}
 
 # Parallel walk of a declared TypeExpr (carrying `Self`) against the
 # inferred concrete Ty, returning `ty_head_name` of the inferred type
@@ -4541,8 +4524,9 @@ fn prc_ref_tparam(r: DeclRef, tparams: [String]) : Bool = match r {
 # on the `Self` leaf.
 fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[DispHead] {
   match declared.tkind {
-    TyName(r, targs) ->
-      if prc_ref_self(r) { ty_disp_head(inferred) }
+    TyName(_, targs) -> align_self_in_args(targs, ty_con_args(inferred))
+    TyParam(id, targs) ->
+      if tlocal_is_self(id) { ty_disp_head(inferred) }
       else { align_self_in_args(targs, ty_con_args(inferred)) }
     TyList(inner) -> {
       match inferred {
@@ -4657,7 +4641,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pkey, _, params, ret_te, _, _, pmo) ->
+      POR(pkey, _, params, ret_te, _, _, pmo, _) ->
         # Arity guard: skip a candidate whose arity differs from the
         # call (an arity-ambiguous name reaches both protocols' POR).
         if list_length(params) != list_length(args_) {
@@ -4759,7 +4743,7 @@ fn proto_matches_for(cands: [ProtoOpReg], args_: [Expr], reg: ProtocolReg,
 
 fn proto_serves(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg,
                 cm: Option[String], opname: String) : Option[ProtoImplReg] = match po {
-  POR(psym, _, params, ret, _, _, pmo) -> {
+  POR(psym, _, params, ret, _, _, pmo, _) -> {
     let skip = list_length(params) != list_length(args_) or
                not proto_visible_from(reg.origins, psym, pmo, cm) or
                proto_op_self_only_in_return(params, ret,
@@ -4775,7 +4759,7 @@ fn proto_serves(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg,
 # surrounding expected type. An op with arguments that names `Self`
 # nowhere dispatches on them like any other.
 fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
-                                carriers: [String]) : Bool {
+                                carriers: [TLocalId]) : Bool {
   let in_params = list_any(params, (p) => match p.ptype {
     Some(te) -> te_mentions_self_or_carrier(te, carriers)
     None -> false
@@ -4783,14 +4767,14 @@ fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
   not in_params and (te_mentions_self_or_carrier(ret, carriers) or list_length(params) == 0)
 }
 
-# The surface names of a protocol's `Shape`-kind tparams — the dispatch
+# A protocol's `Shape`-kind tparams — the dispatch
 # carriers whose applied form `s[A]` a call resolves against, mirroring
 # how `Self` informs an ordinary protocol's dispatch.
 # Two same-named protocols may declare different tparam lists, so a
 # dispatch candidate reads its own, never the first-registered
 # homonym's.
-fn proto_shape_carriers_at(tps: [ProtoTPReg], psym: SymId) : [String] =
-  shape_carrier_names(proto_scope_tparams(tps, psym), [])
+fn proto_shape_carriers_at(tps: [ProtoTPReg], psym: SymId) : [TLocalId] =
+  tbs_ids(filter(proto_scope_tparams(tps, psym), tb_is_shape))
 
 # True when a protocol quantifies over a `Shape` carrier — dispatch is
 # single on the container, so a two-arg op is not heterogeneous.
@@ -4800,12 +4784,6 @@ fn proto_is_shape_carrier_at(tps: [ProtoTPReg], psym: SymId) : Bool =
 fn proto_has_tparams_at(tps: [ProtoTPReg], psym: SymId) : Bool =
   match proto_scope_tparams(tps, psym) { [] -> false _ -> true }
 
-fn shape_carrier_names(names: [String], acc: [String]) : [String] = match names {
-  [] -> list_reverse(acc)
-  [n, ...rest] ->
-    if tp_kind_is_shape(n) { shape_carrier_names(rest, [tp_strip_kind(n), ...acc]) }
-    else { shape_carrier_names(rest, acc) }
-}
 
 fn list_any(xs: [Param], f: (Param) -> Bool) : Bool = match xs {
   [] -> false
@@ -4816,8 +4794,9 @@ fn te_mentions_self(te: TypeExpr) : Bool = te_kind_mentions_self(te.tkind)
 
 fn te_kind_mentions_self(k: TyKind) : Bool {
   match k {
-    TyName(r, targs) ->
-      if prc_ref_self(r) { true }
+    TyName(_, targs) -> te_list_mentions_self(targs)
+    TyParam(id, targs) ->
+      if tlocal_is_self(id) { true }
       else { te_list_mentions_self(targs) }
     TyList(inner) -> te_mentions_self(inner)
     TyFn(ps, r, _) -> te_list_mentions_self(ps) or te_mentions_self(r)
@@ -4832,13 +4811,14 @@ fn te_kind_mentions_self(k: TyKind) : Bool {
 # As `te_mentions_self` but also treats a `Shape`-carrier head as a
 # dispatch informant: `xs: s[A]` with `s` the protocol carrier makes the
 # op arg-dispatched, exactly as `xs: Self` would.
-fn te_mentions_self_or_carrier(te: TypeExpr, carriers: [String]) : Bool =
+fn te_mentions_self_or_carrier(te: TypeExpr, carriers: [TLocalId]) : Bool =
   te_kind_mentions_self_or_carrier(te.tkind, carriers)
 
-fn te_kind_mentions_self_or_carrier(k: TyKind, carriers: [String]) : Bool {
+fn te_kind_mentions_self_or_carrier(k: TyKind, carriers: [TLocalId]) : Bool {
   match k {
-    TyName(r, targs) ->
-      if prc_ref_self(r) or prc_ref_tparam(r, carriers) { true }
+    TyName(_, targs) -> te_list_mentions_self_or_carrier(targs, carriers)
+    TyParam(id, targs) ->
+      if tlocal_is_self(id) or tids_has(carriers, id) { true }
       else { te_list_mentions_self_or_carrier(targs, carriers) }
     TyList(inner) -> te_mentions_self_or_carrier(inner, carriers)
     TyFn(ps, r, _) -> te_list_mentions_self_or_carrier(ps, carriers) or
@@ -4850,7 +4830,7 @@ fn te_kind_mentions_self_or_carrier(k: TyKind, carriers: [String]) : Bool {
   }
 }
 
-fn te_list_mentions_self_or_carrier(tes: [TypeExpr], carriers: [String]) : Bool = match tes {
+fn te_list_mentions_self_or_carrier(tes: [TypeExpr], carriers: [TLocalId]) : Bool = match tes {
   [] -> false
   [t, ...rest] -> if te_mentions_self_or_carrier(t, carriers) { true }
                   else { te_list_mentions_self_or_carrier(rest, carriers) }
@@ -5043,7 +5023,7 @@ fn pcof_matching(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
   match cands {
     [] -> []
     [po, ...rest] -> match po {
-      POR(_, _, _, _, _, _, pmo) ->
+      POR(_, _, _, _, _, _, pmo, _) ->
         if mo_eq(pmo, cm) { [po, ...pcof_matching(rest, cm)] }
         else { pcof_matching(rest, cm) }
     }
@@ -5053,7 +5033,7 @@ fn pcof_rest(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
   match cands {
     [] -> []
     [po, ...rest] -> match po {
-      POR(_, _, _, _, _, _, pmo) ->
+      POR(_, _, _, _, _, _, pmo, _) ->
         if mo_eq(pmo, cm) { pcof_rest(rest, cm) }
         else { [po, ...pcof_rest(rest, cm)] }
     }
@@ -5100,7 +5080,7 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pkey, _, _, _, _, _, pmo) -> {
+      POR(pkey, _, _, _, _, _, pmo, _) -> {
         if not proto_visible_from(reg.origins, pkey, pmo, cm) {
           find_impl_any_proto_loop(rest, reg, opname, recv, cm)
         } else {
@@ -5114,11 +5094,19 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
   }
 }
 
+# How a "no impl" report names the protocols a call could have reached:
+# those an unsettled reference stood between, else the first declaring
+# the operation.
+fn unserved_protos(reg: ProtocolReg, tab: SymTab, callee: Expr, opname: String) : String = match contest_of(callee) {
+  [] -> first_proto_of_op(reg, tab, opname)
+  ss -> join_with(map(contest_protocols(reg.ids, ss), (p) => written_text(sym_name(tab, p))), "` or `")
+}
+
 # First protocol name declaring `opname` (for diagnostics only).
 fn first_proto_of_op(reg: ProtocolReg, tab: SymTab, opname: String) : String {
   match proto_ops_lookup_all(reg, opname) {
     [] -> "?"
-    [po, ..._rest] -> match po { POR(psym, _, _, _, _, _, _) -> written_text(sym_name(tab, psym)) }
+    [po, ..._rest] -> match po { POR(psym, _, _, _, _, _, _, _) -> written_text(sym_name(tab, psym)) }
   }
 }
 
@@ -5149,15 +5137,15 @@ fn psc_ops_loop(ops: [ProtoOpReg], psym: SymId,
                 acc: [ProtoOpReg]) : [ProtoOpReg] = match ops {
   [] -> acc
   [op, ...rest] -> match op {
-    POR(s, _, _, _, _, _, _) ->
+    POR(s, _, _, _, _, _, _, _) ->
       if psc_same(s, psym) {
         psc_ops_loop(rest, psym, [op, ...acc])
       } else { psc_ops_loop(rest, psym, acc) }
   }
 }
 
-#[doc("The tparam names of the protocol `psym`; `[]` for monomorphic protocols.")]
-pub fn proto_scope_tparams(tps: [ProtoTPReg], psym: SymId) : [String] = match tps {
+#[doc("The type parameters of the protocol `psym`; `[]` for monomorphic protocols.")]
+pub fn proto_scope_tparams(tps: [ProtoTPReg], psym: SymId) : [TBinder] = match tps {
   [] -> []
   [PTPR(s, names, _), ...rest] ->
     if psc_same(s, psym) { names }

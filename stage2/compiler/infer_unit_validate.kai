@@ -6,13 +6,13 @@ semilattice unit shapes are well formed.
 """)]
 
 import compiler.ast
-import compiler.kinds
 import compiler.kind_resolve
 import compiler.infer
 import compiler.infer_unit_habitant
 import compiler.infer_unit_expr
 import compiler.diag_file
-import compiler.symtab
+import compiler.proto_resolve
+import compiler.modules
 
 # Unit hygiene: walk the decl stream collecting every name
 # introduced by a `unit <Name>` declaration (atomic or aliased). The
@@ -77,26 +77,32 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
 #   - Unit-kind tparams (`impl[u: Measure] ...`) extend the visible
 #     set for the duration of a single decl; that scoping is handled
 #     in `validate_unit_refs_decl` itself.
-#[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver; `tab` names a type head already settled.")]
-pub fn validate_unit_refs_decls(decls: [Decl], tab: SymTab, scope: UnitScope,
+#[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver; `ps` settles a type head from the file that writes it.")]
+pub fn validate_unit_refs_decls(decls: [Decl], ps: PScope, scope: UnitScope,
                               df: DiagFiles) : Int / Console + File =
-  validate_unit_refs_decls_loop(decls, UnitCx { units: scope, tab: tab }, df, 0)
+  validate_unit_refs_decls_loop(decls, UnitCx { units: scope, ps: ps, home: None }, df, 0)
 
-# The unit scope in force, and the table a settled type head is named from.
-type UnitCx = { units: UnitScope, tab: SymTab }
+# The unit scope in force, and where a type head is settled from: the
+# program's scopes and the home of the declaration being walked.
+type UnitCx = { units: UnitScope, ps: PScope, home: Option[String] }
 
-fn unit_cx_add_locals(cx: UnitCx, names: [String]) : UnitCx =
-  UnitCx { units: unit_scope_add_locals(cx.units, names), tab: cx.tab }
 
 fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitCx,
                                     df: DiagFiles, errs: Int) : Int / Console + File {
   match decls {
     [] -> errs
     [d, ...rest] -> {
-      let e1 = errs + validate_unit_refs_decl(d, scope, decl_diag_file(d, df))
+      let here = UnitCx { ...scope, home: decl_slot(d, ps_root(scope.ps)) }
+      let e1 = errs + validate_unit_refs_decl(d, here, decl_diag_file(d, df))
       validate_unit_refs_decls_loop(rest, scope, df, e1)
     }
   }
+}
+
+# The home a declaration is filed under: `None` for the root file's.
+fn decl_slot(d: Decl, root: String) : Option[String] = {
+  let h = decl_home_hint_reset(d, root, root)
+  if h == root { None } else { Some(h) }
 }
 
 # The `DImpl` arm re-enters the walk for the methods, which already
@@ -112,23 +118,15 @@ fn validate_unit_refs_sub_decls(decls: [Decl], scope: UnitCx,
 }
 
 fn validate_unit_refs_decl(d: Decl, scope: UnitCx, file: String) : Int / Console + File = match d {
-  DFn(_, _, tparams, ps, ret, _, body, _, _, _) -> {
-    # Extend the scope with this fn's unit-kind tparams (parametric
-    # impls like `impl[u: Measure] Show for Real<u>` introduce `u` as
-    # a unit symbol valid only inside this body).
-    let local_scope = unit_cx_add_locals(scope, collect_unit_tparam_names(tparams))
-    let e0 = validate_unit_refs_params(ps, local_scope, file, 0)
+  DFn(_, _, _, ps, ret, _, body, _, _, _) -> {
+    let e0 = validate_unit_refs_params(ps, scope, file, 0)
     let e1 = match ret {
-      Some(te) -> e0 + validate_unit_refs_te(te, local_scope, file)
+      Some(te) -> e0 + validate_unit_refs_te(te, scope, file)
       None -> e0
     }
-    e1 + validate_unit_refs_expr(body, local_scope, file)
+    e1 + validate_unit_refs_expr(body, scope, file)
   }
-  # a type decl's unit-kind tparams scope over its body
-  # (`type Money[c: Currency] = Decimal<c>`), same as fn tparams.
-  DType(_, _, tparams, body, _, _, _, _) ->
-    validate_unit_refs_typebody(body,
-      unit_cx_add_locals(scope, collect_unit_tparam_names(tparams)), file)
+  DType(_, _, _, body, _, _, _, _) -> validate_unit_refs_typebody(body, scope, file)
   # a unit alias body is shape-checked at its declaration —
   # expansion happens after this pass, so a Module-kind product could
   # otherwise ride in through the alias name.
@@ -152,23 +150,6 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitCx, file: String) : Int / Console
   _ -> 0
 }
 
-# Strip the `#Unit` suffix from every unit-kind tparam name and
-# return the surface names (the lexically valid identifiers the
-# user wrote in `impl[u: Measure] ...`).
-fn collect_unit_tparam_names(tparams: [String]) : [String] =
-  collect_unit_tparam_names_loop(tparams, [])
-
-fn collect_unit_tparam_names_loop(tparams: [String], acc: [String]) : [String] {
-  match tparams {
-    [] -> acc
-    [n, ...rest] ->
-      if tp_kind_is_unit(n) {
-        collect_unit_tparam_names_loop(rest, [tp_strip_kind(n), ...acc])
-      } else {
-        collect_unit_tparam_names_loop(rest, acc)
-      }
-  }
-}
 
 fn validate_unit_refs_params(ps: [Param], scope: UnitCx, file: String,
                                 acc: Int) : Int / Console + File = match ps {
@@ -225,6 +206,7 @@ fn validate_unit_refs_variants(vs: [Variant], scope: UnitCx, file: String,
 
 fn validate_unit_refs_te(te: TypeExpr, scope: UnitCx, file: String) : Int / Console + File = match te.tkind {
   TyName(_, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
+  TyParam(_, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
   TyList(inner) -> validate_unit_refs_te(inner, scope, file)
   TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, scope, file, 0) +
                        validate_unit_refs_te(ret, scope, file)
@@ -232,7 +214,7 @@ fn validate_unit_refs_te(te: TypeExpr, scope: UnitCx, file: String) : Int / Cons
                      validate_unit_expr(u, scope.units, file, te.line, te.col) +
                      validate_module_unit_shape(u, scope.units, file, te.line, te.col) +
                      validate_semilattice_unit_shape(u, scope.units, file, te.line, te.col) +
-                     validate_habitant_slots(scope.tab, base, u, scope.units, file, te.line, te.col)
+                     validate_habitant_slots(scope.ps, scope.home, base, u, scope.units, file, te.line, te.col)
   TyRefine(base, _) -> validate_unit_refs_te(base, scope, file)
   # a compound row as a type argument — validate units
   # inside any parameterised labels it carries (`Reader[Int<m>]`).

@@ -1,0 +1,218 @@
+#[doc("""
+Type parameters get their identity.
+
+Runs once on the lowered parse, before any name is settled. Each
+declaration's `[...]` list is numbered from the declaration's own id;
+every use of one of its parameters, in the signature or the body,
+becomes `TyParam`, a numbered row tail or `UParam`; `Self` inside a
+protocol becomes the protocol's own parameter. An impl's parameters are
+bound in its head and handed to each method, which lists them before
+its own. Past this pass a type parameter is never matched by spelling:
+a name still written in type position names a type.
+
+A function or protocol-operation signature also binds what it never
+listed: a lowercase name in type position, and a row variable in tail
+position. They join the list marked `implicit`. An effect operation
+binds only its row variables that way.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.util
+import compiler.tbinder
+import compiler.ast_map
+import compiler.scope_walk
+import compiler.decl_map
+import compiler.tparam_scope
+
+#[doc("Number every type parameter of `ds` and rewrite each use to the parameter's id.")]
+pub fn tparam_bind_decls(ds: [Decl]) : [Decl] = map(ds, (d) => decl_map_inner(d, tpb_leaf))
+
+fn tpb_leaf(d: Decl) : Decl = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> tpb_fn(d, [], 0)
+  DAxiom(p, abi, name, sym, tps, ps, ret, row, l, c) -> {
+    let sig = tpb_sig(tsc_empty(), tps, string_hash(name), 1, true, ps, Some(ret), row)
+    DAxiom(p, abi, name, sym, sig.bs, sig.ps, tpb_ty(ret, sig.sc), sig.row, l, c)
+  }
+  DType(p, s, tps, body, l, c, mo, slots) -> {
+    let n = tsc_number(tps, sym_raw(s), 1)
+    DType(p, s, n.bs, tpb_tbody(body, tsc_of(n.bs)), l, c, mo, slots)
+  }
+  DEffect(p, s, tps, ops, dblk, l, c, mo) -> {
+    let n = tsc_number(tps, sym_raw(s), 1)
+    let sc = tsc_of(n.bs)
+    DEffect(p, s, n.bs, tpb_eops(ops, sc, sym_raw(s), n.next, []), tpb_dblk(dblk, sc), l, c, mo)
+  }
+  DProtocol(p, s, tps, ops, l, c, mo) -> {
+    let n = tsc_number(tps, sym_raw(s), 1)
+    let sc = tsc_with_self(tsc_of(n.bs), tlocal_self(s))
+    DProtocol(p, s, n.bs, tpb_pops(ops, sc, sym_raw(s), n.next, []), l, c, mo)
+  }
+  DImpl(pn, tas, target, subs, l, c, tps, isym) -> {
+    let home = impl_seed(subs, l, c)
+    let n = tsc_number(tps, home, 1)
+    let sc = tsc_of(n.bs)
+    let outer = map(n.bs, tb_unbounded)
+    DImpl(pn, map(tas, (t) => tpb_ty(t, sc)), tpb_ty(target, sc),
+          map(subs, (m) => decl_map_inner(m, (x) => tpb_fn(x, outer, home))), l, c, n.bs, isym)
+  }
+  _ -> d
+}
+
+# An impl has no id of its own yet. Its methods' ids carry their module
+# and its position tells it from the module's other impls.
+fn impl_seed(ms: [Decl], l: Int, c: Int) : Int =
+  string_hash(concat_all(["impl@", int_to_string(l), ":", int_to_string(c), "@", int_to_string(first_method(ms))]))
+
+fn first_method(ms: [Decl]) : Int = match ms {
+  []           -> 0
+  [m, ...rest] -> match decl_transparent_inner(m) {
+    Some(inner) -> first_method([inner, ...rest])
+    None        -> match m {
+      DFn(_, fid, _, _, _, _, _, _, _, _) -> sym_raw(fnid_sym(fid))
+      _                                   -> first_method(rest)
+    }
+  }
+}
+
+# `outer` holds the parameters of the impl a method sits in: the method
+# lists them ahead of its own. `home` is that impl's seed, 0 outside
+# one: every impl of a module names its method for an operation alike,
+# so a method is told apart by the impl it sits in.
+fn tpb_fn(d: Decl, outer: [TBinder], home: Int) : Decl = match d {
+  DFn(p, fid, tps, ps, ret, row, body, l, c, mo) -> {
+    let own = sym_raw(fnid_sym(fid))
+    let seed = if home == 0 { own } else { string_hash(concat_all([int_to_string(home), "/", int_to_string(own)])) }
+    let sig = tpb_sig(tsc_of(outer), tps, seed, 1, true, ps, ret, row)
+    DFn(p, fid, list_append(outer, sig.bs), sig.ps, tpb_ty_opt(ret, sig.sc), sig.row,
+        tpb_body(body, sig.sc), l, c, mo)
+  }
+  _ -> tpb_leaf(d)
+}
+
+type Sig = { bs: [TBinder], sc: TScope, ps: [Param], row: RowExpr, next: Int }
+
+# Number a signature's own parameters from `from`, then the ones it
+# binds without listing, and rewrite its parameter types and row.
+fn tpb_sig(outer: TScope, own: [TBinder], seed: Int, from: Int, types: Bool,
+           ps: [Param], ret: Option[TypeExpr], row: RowExpr) : Sig = {
+  let n1 = tsc_number(own, seed, from)
+  let sc1 = tsc_add(outer, n1.bs)
+  let names = if types { tsc_free_names(ps, ret, row, sc1) } else { [] }
+  let n2 = tsc_number(map(names, tsc_implicit_type), seed, n1.next)
+  let sc2 = tsc_add(sc1, n2.bs)
+  let n3 = tsc_number(tsc_tail_binders(ps, ret, row, sc2), seed, n2.next)
+  let sc3 = tsc_add(sc2, n3.bs)
+  Sig { bs: list_append(n1.bs, list_append(n2.bs, n3.bs)), sc: sc3,
+        ps: tpb_params(ps, sc3), row: tpb_row(row, sc3), next: n3.next }
+}
+
+fn tpb_eops(ops: [EffectOp], sc: TScope, seed: Int, from: Int, acc: [EffectOp]) : [EffectOp] = match ops {
+  [] -> list_reverse(acc)
+  [EffOp(n, tps, ps, ret, l, c), ...rest] -> {
+    let sig = tpb_sig(sc, tps, seed, from, false, ps, Some(ret), REmpty)
+    tpb_eops(rest, sc, seed, sig.next, [EffOp(n, sig.bs, sig.ps, tpb_ty(ret, sig.sc), l, c), ...acc])
+  }
+}
+
+fn tpb_pops(ops: [ProtoOp], sc: TScope, seed: Int, from: Int, acc: [ProtoOp]) : [ProtoOp] = match ops {
+  [] -> list_reverse(acc)
+  [POp(n, tps, ps, ret, l, c), ...rest] -> {
+    let sig = tpb_sig(sc, tps, seed, from, true, ps, Some(ret), REmpty)
+    tpb_pops(rest, sc, seed, sig.next, [POp(n, sig.bs, sig.ps, tpb_ty(ret, sig.sc), l, c), ...acc])
+  }
+}
+
+fn tpb_dblk(o: Option[DefaultBlock], sc: TScope) : Option[DefaultBlock] = match o {
+  None -> None
+  Some(DBlk(hcs, ret, l, c)) ->
+    if tsc_is_empty(sc) { o }
+    else {
+      Some(DBlk(sw_hclauses(hcs, [], (x, s) => None, (t) => tpb_ty(t, sc), sw_head_same),
+                sw_hreturn_opt(ret, [], (x, s) => None, (t) => tpb_ty(t, sc), sw_head_same), l, c))
+    }
+}
+
+fn tpb_tbody(b: TypeBody, sc: TScope) : TypeBody = match b {
+  TBAlias(t)        -> TBAlias(tpb_ty(t, sc))
+  TBRecord(fs)      -> TBRecord(map(fs, (f) => match f { FD(p, n, t, attrs) -> FD(p, n, tpb_ty(t, sc), attrs) }))
+  TBSum(vs)         -> TBSum(map(vs, (v) => match v { Var(s, ts) -> Var(s, map(ts, (t) => tpb_ty(t, sc))) }))
+  TBEffectAlias(ls) -> TBEffectAlias(map(ls, (rl) => tpb_label(rl, sc)))
+}
+
+# A body mentions a type parameter only through its declaration's scope:
+# in an annotation, or in the unit of a literal.
+fn tpb_body(body: Expr, sc: TScope) : Expr =
+  if tsc_is_empty(sc) { body }
+  else {
+    let annotated = sw_expr(body, [], (x, s) => None, (t) => tpb_ty(t, sc), sw_head_same)
+    if tsc_binds_unit(sc) { tpb_lit_units(annotated, sc) } else { annotated }
+  }
+
+fn tpb_lit_units(e: Expr, sc: TScope) : Expr = {
+  let k = match e.kind {
+    ELitUnit(x, u) -> ELitUnit(tpb_lit_units(x, sc), tpb_unit(u, sc))
+    other          -> prc_map_expr_kind(other, (c) => tpb_lit_units(c, sc))
+  }
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: e.site }
+}
+
+#[doc("One expression parsed after the pass ran, under the parameters `tps` of the declaration it sits in.")]
+pub fn tparam_bind_expr(e: Expr, tps: [TBinder]) : Expr = tpb_body(e, tsc_of(tps))
+
+fn tpb_params(ps: [Param], sc: TScope) : [Param] =
+  if tsc_is_empty(sc) { ps } else { map(ps, (p) => Param { binder: p.binder, ptype: tpb_ty_opt(p.ptype, sc),
+                         pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }) }
+
+fn tpb_ty_opt(o: Option[TypeExpr], sc: TScope) : Option[TypeExpr] = match o {
+  None    -> None
+  Some(t) -> Some(tpb_ty(t, sc))
+}
+
+#[doc("`t` with every use of a parameter `sc` binds written as that parameter's id.")]
+pub fn tpb_ty(t: TypeExpr, sc: TScope) : TypeExpr = if tsc_is_empty(sc) { t } else { tpb_ty_in(t, sc) }
+
+fn tpb_ty_in(t: TypeExpr, sc: TScope) : TypeExpr = {
+  let k = match t.tkind {
+    TyName(r, tas) -> {
+      let args = map(tas, (x) => tpb_ty(x, sc))
+      match tsc_ref(sc, r) {
+        Some(id) -> TyParam(id, args)
+        None     -> TyName(r, args)
+      }
+    }
+    TyParam(id, tas)   -> TyParam(id, map(tas, (x) => tpb_ty(x, sc)))
+    TyList(x)          -> TyList(tpb_ty(x, sc))
+    TyFn(ps, r, row)   -> TyFn(map(ps, (x) => tpb_ty(x, sc)), tpb_ty(r, sc), tpb_row(row, sc))
+    TyDim(x, u)        -> TyDim(tpb_ty(x, sc), tpb_unit(u, sc))
+    TyRefine(x, pred)  -> TyRefine(tpb_ty(x, sc), pred)
+    TyRow(row)         -> TyRow(tpb_row(row, sc))
+    TySurface(_)       -> t.tkind
+  }
+  TypeExpr { tkind: k, line: t.line, col: t.col }
+}
+
+fn tpb_row(r: RowExpr, sc: TScope) : RowExpr = if tsc_is_empty(sc) { r } else { match r {
+  REmpty         -> REmpty
+  RClosed(ls)    -> RClosed(map(ls, (l) => tpb_label(l, sc)))
+  ROpen(tail, ls) -> ROpen(tsc_tail(sc, tail), map(ls, (l) => tpb_label(l, sc)))
+} }
+
+fn tpb_label(l: RowLabel, sc: TScope) : RowLabel = match l {
+  RL(r, ts) -> RL(r, map(ts, (x) => tpb_ty(x, sc)))
+}
+
+fn tpb_unit(u: UnitExprT, sc: TScope) : UnitExprT = match u {
+  USym(s) -> match tsc_unit(sc, s) {
+    Some(id) -> UParam(id)
+    None     -> u
+  }
+  UMul(a, b)  -> UMul(tpb_unit(a, sc), tpb_unit(b, sc))
+  UInv(a)     -> UInv(tpb_unit(a, sc))
+  UPow(a, n)  -> UPow(tpb_unit(a, sc), n)
+  UJoin(a, b) -> UJoin(tpb_unit(a, sc), tpb_unit(b, sc))
+  UDims(us)   -> UDims(map(us, (x) => tpb_unit(x, sc)))
+  UOne        -> u
+  UVar(_)     -> u
+  UParam(_)   -> u
+}

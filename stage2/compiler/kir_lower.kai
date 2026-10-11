@@ -36,6 +36,7 @@ import compiler.core_effects
 import compiler.region
 import compiler.reuse_cells
 import compiler.kir
+import compiler.kir_syms
 import compiler.rt_name
 import compiler.enc_unit
 import compiler.effect_instance
@@ -232,28 +233,30 @@ pub fn ls_enter_fn_with(st: LowerSt, enc_fn: EncFn, entry: EntryRegs, locals: Lo
 #[doc("What a body starts with: the register each param and capture is read from, and the names of the registers they take.")]
 pub type EntryRegs = { scope: [Rename], regs: [String] }
 
-#[doc("The entry registers of a parameter list on top of `captured`: each param is read from the register its name spells.")]
-pub fn entry_params(params: [Param], captured: EntryRegs) : EntryRegs = match params {
+#[doc("The register of the local `l`, one per binder of the declaration `locals` lists.")]
+pub fn kir_local_reg(locals: LocalNames, l: LocalId) : String = emitted_text(ln_emitted(locals, l))
+
+#[doc("The entry registers of a parameter list on top of `captured`: each param is read from its binder's register.")]
+pub fn entry_params(params: [Param], locals: LocalNames, captured: EntryRegs) : EntryRegs = match params {
   [] -> captured
   [p, ...rest] -> {
-    let reg = written_text(p.binder.name)
-    entry_params(rest, EntryRegs { scope: [Rn(p.binder.id, reg), ...captured.scope], regs: [reg, ...captured.regs] })
+    let reg = kir_local_reg(locals, p.binder.id)
+    entry_params(rest, locals, EntryRegs { scope: [Rn(p.binder.id, reg), ...captured.scope], regs: [reg, ...captured.regs] })
   }
 }
 
-#[doc("The entry registers of a lambda's or clause's captures: a captured binder is read from the register its name spells; an alias is known by its name, which names no register of its own here, and takes the register holding its handler id.")]
+#[doc("The entry registers of a lambda's or clause's captures: a captured binder is read from its register; an alias is known by its register, which holds nothing here, and takes the register holding its handler id.")]
 pub fn entry_captures(caps: [Capture], locals: LocalNames) : EntryRegs = match caps {
   [] -> EntryRegs { scope: [], regs: [] }
   [c, ...rest] -> {
-    let name = written_text(ln_text(locals, capture_local(c)))
+    let name = kir_local_reg(locals, capture_local(c))
     let more = entry_captures(rest, locals)
     EntryRegs { scope: [Rn(capture_local(c), name), ...more.scope], regs: list_append(capture_taken(c, name), more.regs) }
   }
 }
 
-# The register names a capture spelled `name` takes: a local its own, an
-# alias the one holding its handler id and its bare name too, so a binder
-# of the body never shares the pair.
+# The registers the capture of the binder at `name` takes: a local its
+# own, an alias the one holding its handler id beside it.
 fn capture_taken(c: Capture, name: String) : [String] = match c {
   CapLocal(_) -> [name]
   CapAlias(_) -> [kir_alias_id_reg(name), name]
@@ -265,8 +268,8 @@ fn capture_local(c: Capture) : LocalId = match c {
 }
 
 # The continuation every clause body reads is declared by no node: it is
-# read from the register its key spells.
-fn implicit_scope() : [Rename] = [Rn(local_minted(canonical_continuation()), canonical_continuation())]
+# read from the register a clause's continuation param is stored in.
+fn implicit_scope() : [Rename] = [Rn(local_minted(canonical_continuation()), kir_resume_reg())]
 
 #[doc("`ns` with the binders a body reads and no node declares: the handler-state aliases and the continuation, each minted under its key.")]
 pub fn kir_body_locals(ns: LocalNames) : LocalNames =
@@ -317,17 +320,15 @@ pub fn ls_set_rnested(st: LowerSt, rn: ReusePlan) : LowerSt = LowerSt { ...st, r
 
 # --- The register scope ----------------------------------------------------
 
-#[doc("Bind `b` to its register, chosen once: the one its name spells, or a fresh one when a live register already has that name. The caller emits the statement that defines it.")]
+#[doc("Bind `b` to its register, the one of its id. The caller emits the statement that defines it.")]
 pub fn ls_bind(st: LowerSt, b: Binder) : LSReg = {
-  let name = written_text(b.name)
-  if ls_reg_bound(st, name) {
-    match ls_fresh_reg(st) { LSReg(reg, st1) -> LSReg(reg, ls_scope_put(st1, b.id, reg)) }
-  } else { LSReg(name, ls_scope_put(ls_bind_reg(st, name), b.id, name)) }
+  let reg = kir_local_reg(st.locals, b.id)
+  LSReg(reg, ls_scope_put(ls_bind_reg(st, reg), b.id, reg))
 }
 
-#[doc("Bind the alias `b` of an install to its register: the node lives there and the handler id in `kir_alias_id_reg` of it, a pair no live register shares.")]
+#[doc("Bind the alias `b` of an install to its register: the node lives there and the handler id in `kir_alias_id_reg` of it.")]
 pub fn ls_bind_alias(st: LowerSt, b: Binder) : LSReg = match ls_bind(st, b) {
-  LSReg(reg, st1) -> LSReg(reg, ls_bind_reg(ls_bind_reg(st1, reg), kir_alias_id_reg(reg)))
+  LSReg(reg, st1) -> LSReg(reg, ls_bind_reg(st1, kir_alias_id_reg(reg)))
 }
 
 #[doc("Bind `b` to its register and define it as `op` at `slot`.")]
@@ -362,10 +363,10 @@ pub fn ls_local_name(st: LowerSt, l: LocalId) : String = {
   if w == "" { panic(concat_all(["identity: the name of local ", int_to_string(local_raw(l)), " of ", st.enc_fn.sym, " in ls_local_name"])) } else { w }
 }
 
-#[doc("The register a lambda or clause reads the capture `c` from inside its own body: the captured binder's written name, or the register holding the alias's handler id.")]
+#[doc("The register a lambda or clause reads the capture `c` from inside its own body: the captured binder's, or the one holding the alias's handler id.")]
 pub fn kir_capture_name(locals: LocalNames, c: Capture) : String = match c {
-  CapLocal(l) -> written_text(ln_text(locals, l))
-  CapAlias(a) -> kir_alias_id_reg(written_text(ln_text(locals, a)))
+  CapLocal(l) -> kir_local_reg(locals, l)
+  CapAlias(a) -> kir_alias_id_reg(kir_local_reg(locals, a))
 }
 
 #[doc("True when `l` is one of `xs`.")]
@@ -468,16 +469,16 @@ fn ls_cursor_dead(st: LowerSt) : Bool =
 #[doc("A constructor as the lowering lays it out: the name the dump prints, its head tag, the declared kind of each payload slot (0 boxed, 1 Int, 2 Real, 3 enum) and their 2-bit-per-slot mask. A builtin's kinds are empty and its mask 0: the runtime owns its layout.")]
 pub type CtorLay = { name: String, tag: Int, kinds: [Int], mask: Int }
 
-#[doc("The layout of the constructor `row` lays out.")]
-pub fn ctor_lay(row: VariantEntry) : CtorLay = match row {
-  EV(_, name, _, ks, tag, _) ->
-    if tag < user_variant_tag_base() { CtorLay { name: name, tag: tag, kinds: [], mask: 0 } }
-    else { CtorLay { name: name, tag: tag, kinds: ks, mask: variant_slot_mask(ks) } }
+#[doc("The layout of the constructor `row` lays out; `tab` names it.")]
+pub fn ctor_lay(tab: SymTab, row: VariantEntry) : CtorLay = match row {
+  EV(_, ks, tag, c) ->
+    if tag < user_variant_tag_base() { CtorLay { name: ctor_cell_name(tab, c), tag: tag, kinds: [], mask: 0 } }
+    else { CtorLay { name: ctor_cell_name(tab, c), tag: tag, kinds: ks, mask: variant_slot_mask(ks) } }
 }
 
 #[doc("The layout of the constructor `s`, or None when `s` is the id of no constructor.")]
 pub fn ls_ctor_lay(st: LowerSt, s: SymId) : Option[CtorLay] = match ctor_ix_row(st.ctor_ix, s) {
-  Some(row) -> Some(ctor_lay(row))
+  Some(row) -> Some(ctor_lay(st.tab, row))
   None      -> None
 }
 
@@ -574,7 +575,7 @@ fn efn_module_of(st: LowerSt, fid: FnId) : Option[String] = match ls_callee(st, 
 # The C / LLVM-text oracles can use `kai_` because their resolvers never run
 # the `kai_`→`kaix_` rewrite — that rewrite is native-only.
 pub fn ffi_wrapper_sym(name: String, mo: Option[String]) : String =
-  cat2("__ffi_", c_sym(name, mo))
+  ffi_wrapper_of(c_sym(name, mo))
 
 # A first-class function value: a reference to a top-level fn lowers to a
 # closure over the fn's thunk symbol. Returns the closure descriptor
@@ -795,14 +796,14 @@ pub fn kparam_mode(p: Param) : KMode = if p.pborrow { KBorrow } else { KOwn }
 # Lower a fn / lambda parameter list. Each param is a `PDirect(i)` — the
 # i-th argument under whichever calling kind the enclosing `KFn` carries
 # (a normal fn's direct param, or a lambda/clause's `args[i]`).
-pub fn lower_params(ps: [Param], acc: [KParam]) : [KParam] =
-  lower_params_idx(ps, list_length(acc), acc)
+pub fn lower_params(ps: [Param], locals: LocalNames, acc: [KParam]) : [KParam] =
+  lower_params_idx(ps, locals, list_length(acc), acc)
 
-fn lower_params_idx(ps: [Param], i: Int, acc: [KParam]) : [KParam] = match ps {
+fn lower_params_idx(ps: [Param], locals: LocalNames, i: Int, acc: [KParam]) : [KParam] = match ps {
   [] -> acc
   [p, ...rest] ->
-    lower_params_idx(rest, i + 1,
-      list_append(acc, [KParam { name: written_text(p.binder.name), slot: SBoxed, mode: kparam_mode(p), origin: PDirect(i) }]))
+    lower_params_idx(rest, locals, i + 1,
+      list_append(acc, [KParam { name: kir_local_reg(locals, p.binder.id), slot: SBoxed, mode: kparam_mode(p), origin: PDirect(i) }]))
 }
 
 # Build a capture param: the j-th closure capture, read from `self`.
@@ -862,12 +863,12 @@ pub fn ret_slot_of_sig(sig: Option[UFnSig]) : KSlot = match sig {
 # KIR slot), else stays `SBoxed`. `None` (no raw signature) is identical to
 # the all-boxed `lower_params`. The `param_tys` carry each param's real Ty,
 # indexed positionally — the same list `emit_fn_signature_unboxed` reads.
-pub fn lower_params_sig(ps: [Param], sig: Option[UFnSig]) : [KParam] = match sig {
-  Some(US(pts, _, mask)) -> lower_params_sig_idx(ps, pts, mask, 0, [])
-  None                   -> lower_params(ps, [])
+pub fn lower_params_sig(ps: [Param], locals: LocalNames, sig: Option[UFnSig]) : [KParam] = match sig {
+  Some(US(pts, _, mask)) -> lower_params_sig_idx(ps, locals, pts, mask, 0, [])
+  None                   -> lower_params(ps, locals, [])
 }
 
-fn lower_params_sig_idx(ps: [Param], pts: [Ty], mask: [Bool], i: Int, acc: [KParam]) : [KParam] = match ps {
+fn lower_params_sig_idx(ps: [Param], locals: LocalNames, pts: [Ty], mask: [Bool], i: Int, acc: [KParam]) : [KParam] = match ps {
   [] -> acc
   [p, ...rest] -> {
     let slot = param_slot_for(pts, mask)
@@ -879,8 +880,8 @@ fn lower_params_sig_idx(ps: [Param], pts: [Ty], mask: [Bool], i: Int, acc: [KPar
       [_, ...r] -> r
       [] -> []
     }
-    lower_params_sig_idx(rest, trest, mrest, i + 1,
-      list_append(acc, [KParam { name: written_text(p.binder.name), slot: slot, mode: kparam_mode(p), origin: PDirect(i) }]))
+    lower_params_sig_idx(rest, locals, trest, mrest, i + 1,
+      list_append(acc, [KParam { name: kir_local_reg(locals, p.binder.id), slot: slot, mode: kparam_mode(p), origin: PDirect(i) }]))
   }
 }
 

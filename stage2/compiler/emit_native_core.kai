@@ -21,9 +21,12 @@
 import compiler.util
 import compiler.ast
 import compiler.kir
+import compiler.enc_unit
+import compiler.kir_syms
 import compiler.kir_reach
 import compiler.user_cache
 import compiler.fnreg
+import compiler.fn_index
 import compiler.emit_shared
 import compiler.emit_native_modkey
 import compiler.emit_native_fn
@@ -42,7 +45,8 @@ pub fn build_native_core_split(kp: KProgram, decls: [Decl], variants: [VariantEn
                                core_names: [String]) : [String] / Console + File = {
   let emit_fns = kp.fns
   let stems = ncore_stems(core_names)
-  let core_fns = ncore_core_fns(emit_fns, stems)
+  let nm = kp_names(kp)
+  let core_fns = ncore_core_fns(nm, emit_fns, stems)
   if list_length(core_fns) == 0 {
     ncore_whole(kp, decls, variants, fns, bmode, obj_path, src_path)
   } else if cfg.tag == "" {
@@ -59,7 +63,7 @@ pub fn build_native_core_split(kp: KProgram, decls: [Decl], variants: [VariantEn
     match ncore_obtain(kp, decls, variants, fns, bmode, src_path, core_fns, cfg) {
       None -> ncore_whole(kp, decls, variants, fns, bmode, obj_path, src_path)
       Some(co) -> ncore_emit_user(kp, decls, variants, fns, bmode, src_path,
-                                  ncore_user_fns(emit_fns, stems), obj_path, co)
+                                  ncore_user_fns(nm, emit_fns, stems), obj_path, co)
     }
   }
 }
@@ -69,7 +73,7 @@ pub fn build_native_core_reuse(kp: KProgram, decls: [Decl], variants: [VariantEn
     bmode: BuildMode, obj_path: String, src_path: String, core_obj: String, core_names: [String],
     stats: Bool) : [String] / Console = {
   ncore_note(stats, "kaic2: native-core-obj: hit (core pruned)")
-  let user = ncore_user_fns(kp.fns, ncore_stems(core_names))
+  let user = ncore_user_fns(kp_names(kp), kp.fns, ncore_stems(core_names))
   ncore_emit_user(kp, decls, variants, fns, bmode, src_path, user, obj_path, core_obj)
 }
 
@@ -79,26 +83,30 @@ pub fn ncore_prune_unreachable(kp: KProgram, decls: [Decl], fns: [EFn], bmode: B
   let stems = ncore_stems(core_names)
   let runners = ncore_runner_syms(kp.runners)
   let live_runners = if nemit_is_runner_mode(bmode) { runners } else { [] }
-  kir_reachable(kp, (f) => ncore_is_core(f, stems) or ncore_is_own(f, runners),
-                list_append(ncore_pimpl_syms(collect_pimpl_rows(decls, fns, kp.tab, kp.ids, [])), live_runners))
+  let fx = fnx_build(fns)
+  let nm = kp_names(kp)
+  kir_reachable(kp, (f) => ncore_is_core(nm, f, stems) or ncore_is_own(nm, f),
+                list_append(ncore_pimpl_syms(fx, collect_pimpl_rows(decls, fx, kp.ids, [])), live_runners))
 }
 
 # A root-module fn the user wrote (not a lambda, clause, mono instance or
 # runner body, which are reached through their referrers), or an FFI wrapper
 # from any module.
-fn ncore_is_own(f: KFn, runners: [String]) : Bool = match f.kind {
+fn ncore_is_own(nm: KNames, f: KFn) : Bool = match f.kind {
   KFnFfi(_, _, _) -> true
   KFnNormal -> match f.mo {
-    None    -> not (ncore_is_mono(f.sym)) and not (list_has(runners, f.sym))
+    None    -> ncore_is_decl(f.unit) and not (ncore_is_mono(kfn_sym(nm, f)))
     Some(_) -> false
   }
   _ -> false
 }
 
-fn ncore_pimpl_syms(rows: [PimplRow]) : [String] = match rows {
-  [] -> []
-  [PR(csym, _, _, _, _, _, _), ...rest] -> [csym, ...ncore_pimpl_syms(rest)]
+fn ncore_is_decl(u: EncUnit) : Bool = match u {
+  EuFn(_) -> true
+  _       -> false
 }
+
+fn ncore_pimpl_syms(fx: FnIndex, rows: [PimplRow]) : [String] = map(rows, (pr) => pimpl_csym(fx, pr))
 
 fn ncore_runner_syms(rs: [KRunner]) : [String] = match rs {
   [] -> []
@@ -176,11 +184,11 @@ fn ncore_dots(s: String, i: Int, n: Int, acc: String) : String =
     ncore_dots(s, i + 1, n, cat2(acc, if c == "." { "_" } else { c }))
   }
 
-fn ncore_core_fns(fns: [KFn], stems: [String]) : [KFn] =
-  filter(fns, (f) => ncore_is_core(f, stems))
+fn ncore_core_fns(nm: KNames, fns: [KFn], stems: [String]) : [KFn] =
+  filter(fns, (f) => ncore_is_core(nm, f, stems))
 
-fn ncore_user_fns(fns: [KFn], stems: [String]) : [KFn] =
-  filter(fns, (f) => not (ncore_is_core(f, stems)))
+fn ncore_user_fns(nm: KNames, fns: [KFn], stems: [String]) : [KFn] =
+  filter(fns, (f) => not (ncore_is_core(nm, f, stems)))
 
 # A fn belongs to the core partition when it homes to a core module, or when
 # it is a lambda lifted from a core fn — a lambda's `mo` is None, but its
@@ -192,12 +200,14 @@ fn ncore_user_fns(fns: [KFn], stems: [String]) : [KFn] =
 # in the partition would fork the core key per program. They ride the user
 # object instead (the baseline core carries essentially none, so the user
 # partition stays small and the core object is program-invariant).
-fn ncore_is_core(f: KFn, stems: [String]) : Bool =
-  if ncore_is_mono(f.sym) { false }
+fn ncore_is_core(nm: KNames, f: KFn, stems: [String]) : Bool = ncore_sym_is_core(kfn_sym(nm, f), f, stems)
+
+fn ncore_sym_is_core(sym: String, f: KFn, stems: [String]) : Bool =
+  if ncore_is_mono(sym) { false }
   else { match f.mo {
     Some(m) -> list_has(stems, ncore_dots(m, 0, string_length(m), ""))
     None -> match f.kind {
-      KFnLambda -> ncore_lam_is_core(f.sym, stems)
+      KFnLambda -> ncore_lam_is_core(sym, stems)
       _         -> false
     }
   } }
