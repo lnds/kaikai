@@ -51,130 +51,105 @@ fn arms_all_raw(arms: [Arm]) : Bool = match arms {
 }
 
 #[doc("The mode of a node of kind `k` and type `opt_ty`, given the modes of the binders in scope.")]
-pub fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnIndex) : ValueMode {
-  # A fixed-width `Vec[e]<n>` is a flat by-value C aggregate with no boxed
-  # form, but ONLY at its origin — the `__fixed_vec_lit` literal — and at
-  # a read of a binder that already holds one (env mode). A
-  # fixed-vec-TYPED value from anything else (a function return) is a
-  # dynamic heap vec at runtime and stays MBoxed; the let-site de-brands
-  # its binder so the two never disagree.
-  if ty_is_fixed_vec_opt(opt_ty) {
-    match k {
-      ECall(callee, _) -> match callee.kind {
-        EMark(MkFixedVecLit) -> MUnboxed
-        _                    -> MBoxed
-      }
-      ELocal(l) -> lb_lookup(env, l)
-      _ -> MBoxed
-    }
-  }
+pub fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnIndex) : ValueMode =
+  if ty_is_fixed_vec_opt(opt_ty) { fixed_vec_mode(k, env) }
   else if not ty_is_unboxable(opt_ty) { MBoxed }
-  else {
-    match k {
-      EInt(_, _)  -> MUnboxed
-      EReal(_, _) -> MUnboxed
-      EIntLit(_) -> MUnboxed
-      EDecimalLit(_) -> MUnboxed
-      EFixed(_, _) -> MUnboxed
-      EBool(_) -> MUnboxed
-      EChar(_) -> MUnboxed
-      ELocal(l) -> lb_lookup(env, l)
-      ESym(_, _) -> MBoxed
-      # Phase 3 unboxing — when the callee resolves to a UFn entry
-      # and the call result type is unboxable, mark the call as
-      # MUnboxed. The emitter (`emit_kind_raw` ECall arm) then
-      # lowers to `<callee>(<raw args>)` directly; without this
-      # promotion the call would round-trip through `kai_<T>`
-      # boxing.
-      ECall(callee, _) ->
-        if call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee, fns) or call_is_fixed_vec_get(callee) { MUnboxed }
-        else if vec_reads_raw(fns.vraw, k, opt_ty) { MUnboxed }
-        else { MBoxed }
-      EField(_, _) -> if vec_reads_raw(fns.vraw, k, opt_ty) { MUnboxed } else { MBoxed }
-      # Conservative: only mark composite raw when both operands are
-      # already raw. Mixing a boxed operand into a raw arithmetic
-      # node would force the emitter to unbox via `(...)->as.i`,
-      # which leaks the boxed allocation (no decref). Keeping the
-      # whole node MBoxed routes through `kai_op_add` etc. which
-      # consume their args correctly.
-      EBinop(op, a, b) ->
-        # `%` (modulo) has no C-native form on `double`; for `Real`
-        # operands the binop stays boxed and routes through `kai_op_mod`.
-        # `+` `-` `*` `/` are valid for both `int64_t` and `double`.
-        # Int128 `/`/`%` stay boxed: no i128 checked-div helper exists (the
-        # 128-bit operand does not fit the i64/u64 helper), so they route
-        # through `kai_fixed_div`/`kai_op_mod` which trap the zero divisor.
-        if op_is_raw_arith(op) and child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns) {
-          if binop_eq(op, BoMod) and not ty_is_integral_raw(opt_ty) { MBoxed }
-          else if binop_is_division(op) and ty_is_int128_opt(opt_ty) { MBoxed }
-          else { MUnboxed }
-        }
-        # Issue #90 — `^` (integer power) was previously routed
-        # through `kai_op_pow_int` even when both operands were raw.
-        # Lift it inline when the exponent is a compile-time literal
-        # in `[0, 64]` and the result type is integral-raw. The
-        # emitter unrolls the loop into `(b * b * ... * b)` — no
-        # statement-expression, no loop construct, identical IR shape
-        # on both backends. Other shapes (Real base, non-literal
-        # exponent, negative exponent, or `n > 64`) keep the boxed
-        # path through `kai_op_pow_int`. (Issue #315: integer division
-        # no longer needs a dedicated branch — raw-Int `/` is already
-        # handled by the `op_is_raw_arith` arm above.)
-        # `^` unrolls to bare multiplications with no per-op masking, so a
-        # fixed-width `^` must stay boxed — the unroll would skip its width wrap.
-        else if binop_eq(op, BoPow) and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and not ty_is_fixed_width_opt(opt_ty) and pow_exp_is_inlinable(b) { MUnboxed }
-        # M4 — comparisons and short-circuiting booleans collapse to
-        # native C operators when both operands are raw. The result
-        # is a raw `int` (0/1) which the boundary tactic re-boxes
-        # via `kai_bool` if a consumer wants `KaiValue *`.
-        else if op_is_raw_cmp(op) and child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns) { MUnboxed }
-        else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) and rhs_is_trap_free(b) { MUnboxed }
-        else { MBoxed }
-      EUnop(op, x) -> match op {
-        UoNeg -> if child_is_raw_operand(x, env, fns) { MUnboxed } else { MBoxed }
-        UoNot -> if child_is_raw(x) { MUnboxed } else { MBoxed }
-      }
-      # Phase 3 unboxing — `if cond { a } else { b }` lowers to a C
-      # ternary when every operand is raw. The cond must be a raw
-      # bool; both arms must be raw scalars of the result ty.
-      EIf(cnd, ath, Some(eth)) ->
-        if child_is_raw(cnd) and child_is_raw(ath) and child_is_raw(eth) { MUnboxed }
-        else { MBoxed }
-      # Phase 3 unboxing — a single-tail EBlock (no preceding stmts)
-      # forwards its tail's mode. Issue #779: a multi-statement block
-      # whose tail is raw and whose statements are RC-only (SLet /
-      # SExprStmt — the post-perceus `__pcs_ret` wrap shape) also
-      # forwards the raw tail. The statements run for effects only (the
-      # block's value is the tail), so the emitter (`emit_block_raw`)
-      # threads the Perceus drops unchanged and emits only the tail raw.
-      # Any other statement form (SAssert / dead SVar/SUse/SIndexAssign)
-      # keeps the block boxed — conservative.
-      EBlock(stmts, Some(tail)) ->
-        match stmts {
-          [] -> tail.mode
-          _  -> if child_is_raw(tail) and block_stmts_rc_safe(stmts) { MUnboxed }
-                else { MBoxed }
-        }
-      # match-raw unboxing (asu design): a `match` whose result is
-      # unboxable (guaranteed by the `ty_is_unboxable(opt_ty)` gate
-      # above) and whose every arm body is already raw lowers with a
-      # raw `_r` — `emit_match_raw` drops the per-arm `kai_int(...)`
-      # box. The scrutinee axis is orthogonal: it stays boxed (a
-      # variant); only the arm bodies decide result-rawness. The
-      # arms are walked bottom-up by `unbox_kind_aware`, so their
-      # `.mode` is final here. Exhaustivity (a raw `_r` cannot be left
-      # uninitialised) is the emitter's gate.
-      EMatch(_, arms) -> if arms_all_raw(arms) { MUnboxed } else { MBoxed }
-      # A promoted var cell (`cell_promote`): the init and every read
-      # are raw by construction — the cell's type is a raw scalar and
-      # the emitters own both border directions.
-      EIntrinsic(inm, _) -> match inm {
-        InCellInit -> MUnboxed
-        InCellGet  -> MUnboxed
-        InAbsent   -> MUnboxed
-        _          -> MBoxed
-      }
-      _ -> MBoxed
-    }
-  }
+  else { scalar_mode(k, opt_ty, env, fns) }
+
+fn raw_if(raw: Bool) : ValueMode = if raw { MUnboxed } else { MBoxed }
+
+# A fixed-width `Vec[e]<n>` is a flat by-value C aggregate with no boxed
+# form, but only at its origin — the fixed-vec literal — and at a read of
+# a binder that already holds one. A fixed-vec-typed value from anything
+# else (a function return) is a dynamic heap vec at runtime and stays
+# boxed; the let-site de-brands its binder so the two never disagree.
+fn fixed_vec_mode(k: ExprKind, env: [LocBind]) : ValueMode = match k {
+  ECall(callee, _) -> raw_if(is_fixed_vec_lit(callee))
+  ELocal(l)        -> lb_lookup(env, l)
+  _                -> MBoxed
+}
+
+fn is_fixed_vec_lit(callee: Expr) : Bool = match callee.kind {
+  EMark(MkFixedVecLit) -> true
+  _                    -> false
+}
+
+# A node of raw scalar type is raw when every operand it composes is. A
+# match's arms and a block's tail are walked bottom-up, so their modes
+# are final here; a match's scrutinee is an orthogonal axis and may stay
+# boxed.
+fn scalar_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnIndex) : ValueMode = match k {
+  EInt(_, _)     -> MUnboxed
+  EReal(_, _)    -> MUnboxed
+  EIntLit(_)     -> MUnboxed
+  EDecimalLit(_) -> MUnboxed
+  EFixed(_, _)   -> MUnboxed
+  EBool(_)       -> MUnboxed
+  EChar(_)       -> MUnboxed
+  ELocal(l)      -> lb_lookup(env, l)
+  ESym(_, _)     -> MBoxed
+  ECall(callee, _)   -> raw_if(call_is_raw(callee, fns) or vec_reads_raw(fns.vraw, k, opt_ty))
+  EField(_, _)       -> raw_if(vec_reads_raw(fns.vraw, k, opt_ty))
+  EBinop(op, a, b)   -> raw_if(binop_is_raw(op, a, b, opt_ty, env, fns))
+  EUnop(op, x)       -> raw_if(unop_is_raw(op, x, env, fns))
+  EIf(cnd, ath, Some(eth))  -> raw_if(child_is_raw(cnd) and child_is_raw(ath) and child_is_raw(eth))
+  EBlock(stmts, Some(tail)) -> block_mode(stmts, tail)
+  EMatch(_, arms)    -> raw_if(arms_all_raw(arms))
+  EIntrinsic(inm, _) -> raw_if(intrinsic_is_raw(inm))
+  _ -> MBoxed
+}
+
+# A call whose callee takes and returns raw scalars lowers to a direct
+# call on raw arguments, with no round trip through a box.
+fn call_is_raw(callee: Expr, fns: FnIndex) : Bool =
+  call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee, fns) or call_is_fixed_vec_get(callee)
+
+# A composite node is raw only when both operands already are: a boxed
+# operand unboxed in place would leak its allocation, where the boxed
+# operator consumes it. The result of a raw comparison or logical
+# operator is a raw 0/1 the boundary re-boxes on demand.
+fn binop_is_raw(op: BinOp, a: Expr, b: Expr, opt_ty: Option[Ty], env: [LocBind], fns: FnIndex) : Bool =
+  if op_is_raw_arith(op) and both_raw_operands(a, b, env, fns) { arith_has_raw_form(op, opt_ty) }
+  else if pow_is_unrolled(op, a, b, opt_ty) { true }
+  else if op_is_raw_cmp(op) and both_raw_operands(a, b, env, fns) { true }
+  else { op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) and rhs_is_trap_free(b) }
+
+fn both_raw_operands(a: Expr, b: Expr, env: [LocBind], fns: FnIndex) : Bool =
+  child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns)
+
+# `%` has no C-native form on `double`, and no checked-division helper
+# takes a 128-bit operand: both stay boxed and route through the runtime
+# operator, which traps the zero divisor.
+fn arith_has_raw_form(op: BinOp, opt_ty: Option[Ty]) : Bool =
+  if binop_eq(op, BoMod) and not ty_is_integral_raw(opt_ty) { false }
+  else if binop_is_division(op) and ty_is_int128_opt(opt_ty) { false }
+  else { true }
+
+# An integer `^` with a small literal exponent unrolls to bare
+# multiplications. The unroll has no per-op masking, so a fixed-width
+# `^` stays boxed to keep its width wrap.
+fn pow_is_unrolled(op: BinOp, a: Expr, b: Expr, opt_ty: Option[Ty]) : Bool =
+  binop_eq(op, BoPow) and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and
+  not ty_is_fixed_width_opt(opt_ty) and pow_exp_is_inlinable(b)
+
+fn unop_is_raw(op: UnOp, x: Expr, env: [LocBind], fns: FnIndex) : Bool = match op {
+  UoNeg -> child_is_raw_operand(x, env, fns)
+  UoNot -> child_is_raw(x)
+}
+
+# A block forwards its tail's mode. Its statements run for effects only,
+# so a raw tail stays raw past statements that are RC-only; any other
+# statement form keeps the block boxed.
+fn block_mode(stmts: [Stmt], tail: Expr) : ValueMode = match stmts {
+  [] -> tail.mode
+  _  -> raw_if(child_is_raw(tail) and block_stmts_rc_safe(stmts))
+}
+
+# A promoted var cell's init and reads are raw by construction: the
+# cell's type is a raw scalar and the emitters own both borders.
+fn intrinsic_is_raw(inm: Intrinsic) : Bool = match inm {
+  InCellInit -> true
+  InCellGet  -> true
+  InAbsent   -> true
+  _          -> false
 }
