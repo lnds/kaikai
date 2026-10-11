@@ -1,0 +1,171 @@
+#[doc("""
+Structural match between a protocol operation's signature and an impl
+method's, after substituting `Self` and the protocol's type parameters.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.protos_names
+
+#[doc("""
+Structural comparison of an impl parameter against its substituted
+protocol counterpart. Arguments are compared at depth, so two
+instantiations of the same constructor (`Pair[String, Bool]` vs
+`Pair[Int, Bool]`) do not compare equal. Either side left
+argument-free stays permissive and matches on the head alone,
+preserving the pre-existing tolerance for unresolved variables.
+""")]
+pub fn sig_type_matches(tab: SymTab, impl_t: TypeExpr, proto_t: TypeExpr) : Bool {
+  match proto_t.tkind {
+    TyName(pn, pargs) -> match impl_t.tkind {
+      TyName(inm, iargs) ->
+        if not refs_same(tab, pn, inm) { false }
+        else if pargs == [] or iargs == [] { true }
+        else { sig_types_match(tab, iargs, pargs) }
+      _ -> refs_same(tab, proto_type_ref(impl_t), pn)
+    }
+    TyList(pinner) -> match impl_t.tkind {
+      TyList(iinner) -> sig_type_matches(tab, iinner, pinner)
+      _ -> false
+    }
+    TyFn(pps, pret, prow) -> match impl_t.tkind {
+      TyFn(ips, iret, irow) ->
+        sig_types_match(tab, ips, pps) and sig_type_matches(tab, iret, pret) and sig_rows_match(tab, irow, prow)
+      _ -> false
+    }
+    # A parameter the substitution left in place is one the impl method
+    # answers with a parameter of its own.
+    TyParam(_, pargs) -> match impl_t.tkind {
+      TyParam(_, iargs) -> pargs == [] or iargs == [] or sig_types_match(tab, iargs, pargs)
+      _ -> false
+    }
+    _ -> refs_same(tab, proto_type_ref(impl_t), proto_type_ref(proto_t))
+  }
+}
+
+# Two closed rows match when their label sets do.
+fn sig_rows_match(tab: SymTab, ir: RowExpr, pr: RowExpr) : Bool =
+  # Compatibility with an open row is undecided, so it is not rejected.
+  row_is_open(ir) or row_is_open(pr)
+    or (sig_labels_within(tab, row_labels_of(ir), row_labels_of(pr), true)
+      and sig_labels_within(tab, row_labels_of(pr), row_labels_of(ir), false))
+
+fn row_is_open(r: RowExpr) : Bool = match r { ROpen(_, _) -> true  _ -> false }
+
+fn row_labels_of(r: RowExpr) : [RowLabel] =
+  match r { REmpty -> []  RClosed(ls) -> ls  ROpen(_, ls) -> ls }
+
+# Every label of `xs` has a counterpart in `ys`; `xs_impl` says which side is the impl's.
+fn sig_labels_within(tab: SymTab, xs: [RowLabel], ys: [RowLabel], xs_impl: Bool) : Bool =
+  match xs {
+    [] -> true
+    [x, ...rest] -> sig_label_in(tab, x, ys, xs_impl) and sig_labels_within(tab, rest, ys, xs_impl)
+  }
+
+fn sig_label_in(tab: SymTab, x: RowLabel, ys: [RowLabel], x_impl: Bool) : Bool =
+  match ys {
+    [] -> false
+    [y, ...rest] ->
+      (if x_impl { sig_label_matches(tab, x, y) } else { sig_label_matches(tab, y, x) })
+        or sig_label_in(tab, x, rest, x_impl)
+  }
+
+fn sig_label_matches(tab: SymTab, i: RowLabel, p: RowLabel) : Bool =
+  match i {
+    RL(ieff, iargs) -> match p {
+      RL(peff, pargs) ->
+        refs_same(tab, ieff, peff) and (pargs == [] or iargs == [] or sig_types_match(tab, iargs, pargs))
+    }
+  }
+
+fn sig_types_match(tab: SymTab, its: [TypeExpr], pts: [TypeExpr]) : Bool {
+  match pts {
+    [] -> match its { [] -> true  _ -> false }
+    [p, ...prest] -> match its {
+      [] -> false
+      [i, ...irest] -> if sig_type_matches(tab, i, p) { sig_types_match(tab, irest, prest) } else { false }
+    }
+  }
+}
+
+#[doc("""
+Structural counterpart of `sig_head_subst`: `Self` becomes the whole
+impl target (arguments included), and a protocol tparam becomes its
+aligned bracket argument. A tparam applied to arguments (`s[Int]`
+with `s := Chain`) substitutes at the head and keeps its arguments,
+yielding `Chain[Int]` — the Shape-carrier form.
+""")]
+pub fn sig_subst(t: TypeExpr, target: TypeExpr,
+             proto_tps: [TBinder], arg_heads: [DeclRef]) : TypeExpr {
+  match t.tkind {
+    TyName(r, targs) ->
+      mk_ty(TyName(r, map(targs, (a) => sig_subst(a, target, proto_tps, arg_heads))), t.line, t.col)
+    TyParam(id, targs) -> {
+      let sargs = map(targs, (a) => sig_subst(a, target, proto_tps, arg_heads))
+      if tlocal_is_self(id) {
+        match targs { [] -> target  _ -> mk_ty(TyName(proto_type_ref(target), sargs), t.line, t.col) }
+      } else {
+        match tparam_subst(id, proto_tps, arg_heads, proto_type_ref(target)) {
+          Some(h) -> mk_ty(TyName(h, sargs), t.line, t.col)
+          None    -> mk_ty(TyParam(id, sargs), t.line, t.col)
+        }
+      }
+    }
+    TyList(inner) -> mk_ty(TyList(sig_subst(inner, target, proto_tps, arg_heads)), t.line, t.col)
+    TyFn(ps, ret, row) -> {
+      let sps = map(ps, (p) => sig_subst(p, target, proto_tps, arg_heads))
+      let sret = sig_subst(ret, target, proto_tps, arg_heads)
+      mk_ty(TyFn(sps, sret, sig_subst_row(row, target, proto_tps, arg_heads)), t.line, t.col)
+    }
+    _ -> t
+  }
+}
+
+fn sig_subst_row(r: RowExpr, target: TypeExpr,
+                 proto_tps: [TBinder], arg_heads: [DeclRef]) : RowExpr {
+  let sub = (l: RowLabel) => match l {
+    RL(eff, args) -> RL(eff, map(args, (a) => sig_subst(a, target, proto_tps, arg_heads)))
+  }
+  match r {
+    REmpty -> REmpty
+    RClosed(ls) -> RClosed(map(ls, sub))
+    ROpen(tail, ls) -> ROpen(tail, map(ls, sub))
+  }
+}
+
+#[doc("""
+Substitute `Self` and protocol tparams against the impl target +
+bracket args, then collapse to the head. Anything that doesn't
+bind (free tparam outside the protocol's own list, etc.) falls
+through to the standard `proto_type_ref` collapse — head
+comparison is intentionally permissive about unresolved variables.
+""")]
+pub fn sig_head_subst(t: TypeExpr, target: TypeExpr,
+                  proto_tps: [TBinder], arg_heads: [DeclRef]) : DeclRef {
+  match t.tkind {
+    TyParam(id, _) ->
+      if tlocal_is_self(id) { proto_type_ref(target) }
+      else { match tparam_subst(id, proto_tps, arg_heads, proto_type_ref(target)) {
+        Some(h) -> h
+        None    -> proto_type_ref(t)
+      } }
+    _ -> proto_type_ref(t)
+  }
+}
+
+# Position-aligned lookup: `proto_tps[i]` -> `arg_heads[i]`. When
+# `arg_heads == []` (legacy un-parametrised impl), every protocol
+# tparam falls back to the target head — the homogeneous default
+# encoded in `lower_impls`. A `[s: Shape]` carrier binds
+# `s := <target head>` exactly as a bare `[a]` does.
+fn tparam_subst(n: TLocalId, tps: [TBinder], heads: [DeclRef],
+                target: DeclRef) : Option[DeclRef] {
+  match tps {
+    [] -> None
+    [t, ...trest] -> match heads {
+      [] -> if tlocal_eq(t.id, n) { Some(target) } else { tparam_subst(n, trest, [], target) }
+      [h, ...hrest] ->
+        if tlocal_eq(t.id, n) { Some(h) } else { tparam_subst(n, trest, hrest, target) }
+    }
+  }
+}

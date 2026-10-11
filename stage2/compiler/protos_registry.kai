@@ -1,0 +1,110 @@
+#[doc("""
+Reads of the protocol registry: the operations declared under a label,
+and what the registry holds for a protocol known by its identity.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.fnreg
+import compiler.protos_names
+
+fn proto_op_lookup(reg: ProtocolReg, name: String) : Option[ProtoOpReg] {
+  proto_op_lookup_loop(reg.ops, name)
+}
+
+fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
+  match ops {
+    [] -> None
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _, _, _) ->
+        if op_label_is(name, target) { Some(op) } else { proto_op_lookup_loop(rest, target) }
+    }
+  }
+}
+
+#[doc("""
+Issue #546: two protocols may declare an op with the same name
+(`protocol Speak { sound(x: Self) }` + `protocol Move { sound(x: Self) }`).
+kaikai resolves protocol ops by bare name, so the call site `sound(x)`
+carries no protocol — only the receiver's type disambiguates. The
+single-result `proto_op_lookup` above fixes the protocol to whichever
+was declared first, which makes the static rewrite search impls in the
+wrong protocol and leave a misdispatched residual. `proto_ops_lookup_all`
+returns EVERY POR matching the name (registry order) so the rewrite can
+try each candidate protocol and pick the one with an impl for the
+receiver type.
+""")]
+pub fn proto_ops_lookup_all(reg: ProtocolReg, name: String) : [ProtoOpReg] =
+  proto_ops_lookup_all_loop(reg.ops, name)
+
+fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      POR(_, name, _, _, _, _, _, _) ->
+        if op_label_is(name, target) { [op, ...proto_ops_lookup_all_loop(rest, target)] }
+        else { proto_ops_lookup_all_loop(rest, target) }
+    }
+  }
+}
+
+# Which protocol a call may dispatch against, and what the registry
+# holds for the one it picked. These read the registry's own tables by
+# the protocol's identity, which the scope chain decided. An absent
+# identity is no protocol and matches no row.
+
+#[doc("True when both are the same protocol; an absent identity matches nothing.")]
+pub fn psc_same(a: SymId, b: SymId) : Bool = sym_raw(a) >= 0 and sym_raw(a) == sym_raw(b)
+
+#[doc("The ops of the protocol `psym`, in declaration order.")]
+pub fn proto_scope_ops(ops: [ProtoOpReg], psym: SymId) : [ProtoOpReg] =
+  psc_ops_loop(ops, psym, [])
+
+fn psc_ops_loop(ops: [ProtoOpReg], psym: SymId,
+                acc: [ProtoOpReg]) : [ProtoOpReg] = match ops {
+  [] -> acc
+  [op, ...rest] -> match op {
+    POR(s, _, _, _, _, _, _, _) ->
+      if psc_same(s, psym) {
+        psc_ops_loop(rest, psym, [op, ...acc])
+      } else { psc_ops_loop(rest, psym, acc) }
+  }
+}
+
+#[doc("The type parameters of the protocol `psym`; `[]` for monomorphic protocols.")]
+pub fn proto_scope_tparams(tps: [ProtoTPReg], psym: SymId) : [TBinder] = match tps {
+  [] -> []
+  [PTPR(s, names, _), ...rest] ->
+    if psc_same(s, psym) { names }
+    else { proto_scope_tparams(rest, psym) }
+}
+
+#[doc("The dispatch key the protocol `psym` spells its impl symbols with; `pname` when no protocol answers to `psym`.")]
+pub fn proto_key_of(dkeys: [ProtoKey], pname: String, psym: SymId) : String = match dkeys {
+  [] -> pname
+  [PKey(s, _, k), ...rest] ->
+    if psc_same(s, psym) { written_text(k) }
+    else { proto_key_of(rest, pname, psym) }
+}
+
+# A module sees its own protocols, root-file ones, and exported foreign
+# ones. The root file sees every protocol.
+#[doc("True when the protocol `psym`, declared by `home`, is a legal dispatch candidate for a call inside module `cm` (`None` = root file).")]
+pub fn proto_visible_from(origins: [ProtoOriginReg], psym: SymId,
+                          home: Option[String],
+                          cm: Option[String]) : Bool = match cm {
+  None -> true
+  Some(_) -> match home {
+    None -> true
+    Some(_) ->
+      if mo_eq(home, cm) { true } else { psc_is_pub(origins, psym) }
+  }
+}
+
+#[doc("True when the protocol `psym` is declared `pub`.")]
+pub fn psc_is_pub(origins: [ProtoOriginReg], psym: SymId) : Bool = match origins {
+  [] -> false
+  [PrOR(s, _, p), ...rest] ->
+    if psc_same(s, psym) { p }
+    else { psc_is_pub(rest, psym) }
+}

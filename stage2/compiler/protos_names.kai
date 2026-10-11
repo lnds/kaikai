@@ -1,0 +1,198 @@
+#[doc("""
+How the protocol passes spell things: a type's dispatch head, a written
+reference, the symbol of an impl method and of a dispatcher, and a home
+as a diagnostic names it.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.rt_name
+import compiler.diag
+import compiler.util
+import compiler.scope_view
+import compiler.proto_resolve
+import compiler.decl_names
+import compiler.symtab_build
+import compiler.tbinder
+
+#[doc("`xs` joined with `sep`.")]
+pub fn proto_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
+
+#[doc("""
+Mirror of `mk_proto_dispatch_body` (main) — builds the ETodo
+dispatcher marker. The `"__kai_proto_dispatch__:"` prefix MUST stay
+byte-identical: the desugar + emitter sides read it back.
+""")]
+pub fn proto_mk_dispatch_body(pname: String, opname: String, line: Int, col: Int) : Expr =
+  mk_expr(ETodo(concat_all(["__kai_proto_dispatch__:", pname, ":", opname])), line, col)
+
+# m12.8: the type-mangling used in the impl-fn name. Walks a
+# TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
+# `Money[USD]`, and `Money` all map to `Money`). Lists collapse to
+# `List`. This gives a single impl per type-constructor — polymorphic
+# impls cover all instantiations, mirroring the spec's "monomorphises
+# per concrete instantiation just like any generic function" note.
+#[doc("The single-dispatch head of a `TypeExpr` as a reference (`Money[USD]` → `Money`, `[T]` → `List`): what the source wrote, or the declaration once resolved.")]
+pub fn proto_type_ref(te: TypeExpr) : DeclRef {
+  match te.tkind {
+    TyName(r, _)    -> r
+    TyList(_)       -> ref_written("List")
+    TyFn(_, _, _)   -> ref_written("Fn")
+    # A unit annotation is invisible to dispatch: `Decimal<USD>` is `Decimal`.
+    TyDim(base, _)  -> proto_type_ref(base)
+    # A refinement dispatches as its base: `Int where >= 0` is `Int`.
+    TyRefine(base, _) -> proto_type_ref(base)
+    # A compound row is never a dispatch head: a name no `impl` matches.
+    TyRow(_) -> ref_written("Row")
+    TySurface(_) -> panic("proto_type_ref: surface type not lowered")
+    TyParam(id, _) -> tparam_head(id)
+  }
+}
+
+# A type parameter is no declaration: its head is spelled from its id, so
+# two parameters never share one and no declared type answers to it.
+fn tparam_head(id: TLocalId) : DeclRef = ref_written(tparam_key(id))
+
+#[doc("The single-dispatch head name of a `TypeExpr`, as a diagnostic shows it.")]
+pub fn proto_type_name(tab: SymTab, te: TypeExpr) : String = ref_text(tab, proto_type_ref(te))
+
+#[doc("""
+A reference's name as a diagnostic shows it: the declaration's once
+resolved, the written one until then.
+""")]
+pub fn ref_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
+}
+
+#[doc("""
+One declaration when both are resolved, one emitted name while either is
+still written: a homonym another module declares is never spelled bare.
+""")]
+pub fn refs_same(tab: SymTab, a: DeclRef, b: DeclRef) : Bool =
+  if ref_resolved(a) and ref_resolved(b) { sym_raw(ref_sym(a)) == sym_raw(ref_sym(b)) }
+  else { rt_ref_name(tab, a) == rt_ref_name(tab, b) }
+
+#[doc("A protocol head as the scope chain takes it: `m.P`, or `P`.")]
+pub fn proto_ref_spell(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+  _                     -> ref_text(tab, r)
+}
+
+#[doc("The protocol a head denotes from the file homed at `from`; `sym_none()` when it resolves to no single reachable protocol.")]
+pub fn proto_ref_sym(ps: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(_, _) -> ps_proto_sym(ps, proto_ref_spell(ps_tab(ps), r), from)
+}
+
+#[doc("What a head resolves to, as the home the registry keys by.")]
+pub fn proto_ref_res(ps: PScope, r: DeclRef, from: Option[String]) : PkRes = match r {
+  DrSym(s)        -> PkHome(proto_sym_home(ps, s))
+  DrWritten(_, _) -> ps_resolve(ps, proto_ref_spell(ps_tab(ps), r), from)
+}
+
+fn proto_sym_home(ps: PScope, s: SymId) : Option[String] = {
+  let owner = sym_owner(ps_tab(ps), s)
+  if sym_raw(owner) == sym_raw(st_module_id(ps_root(ps))) { None }
+  else { Some(written_text(sym_name(ps_tab(ps), owner))) }
+}
+
+#[doc("""
+An operation label has no id of its own: within a protocol, the label
+is the operation.
+""")]
+pub fn op_label_is(lbl: Written, name: String) : Bool = written_text(lbl) == name
+
+#[doc("The operation an impl method supplies: the label its row was declared with.")]
+pub fn impl_method_op(tab: SymTab, fid: FnId) : String = written_text(sym_name(tab, fnid_sym(fid)))
+
+#[doc("The symbol of the impl function of `op`, from a protocol piece and a type piece.")]
+pub fn proto_mangled_fn(proto: String, type_name: String, op: String) : String =
+  concat_all(["__pimpl_", proto, "_", type_name, "_", op])
+
+#[doc("""
+Issue #180: heterogeneous-aware mangling. The legacy un-parametrised
+form `impl Show for Int` (arg_names == []) keeps the original
+`__pimpl_<P>_<T>_<op>` symbol. The homogeneous parametrised form
+`impl Add[Complex] for Complex` (arg_names == [type_name]) also keeps
+it (so it stays interchangeable with the un-parametrised form). Only
+heterogeneous impls (e.g. `impl Add[Real] for Complex`) get a
+`__a_<arg_name>...` suffix that disambiguates the dispatch table.
+""")]
+pub fn proto_impl_mangled_with_args(proto: String, type_name: String,
+                                  op: String, arg_names: [String]) : String {
+  let needs_suffix = match arg_names {
+    [] -> false
+    [a] -> a != type_name
+    _  -> true
+  }
+  if needs_suffix {
+    concat_all(["__pimpl_", proto, "_", type_name, "_", op,
+                "__a_", arg_names_mangle(arg_names)])
+  } else {
+    proto_mangled_fn(proto, type_name, op)
+  }
+}
+
+#[doc("The type arguments of an impl joined into one symbol piece.")]
+pub fn arg_names_mangle(args: [String]) : String = match args {
+  [] -> ""
+  [a] -> a
+  [a, ...rest] -> concat_all([a, "_", arg_names_mangle(rest)])
+}
+
+# m12.8: kaikai-side name for the *dispatcher* function the lower
+# pass synthesises for each protocol op. Prefixing with `__proto_`
+# keeps the emitted C symbol (`kai___proto_<op>`) clear of runtime
+# helpers like `kai_op_eq`, `kai_to_string`, `kai_op_lt` etc. that share
+# common short names with protocol ops.
+#[doc("kaikai name of the polymorphic dispatcher DFn for protocol op `op` (`__proto_<op>`).")]
+pub fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
+
+#[doc("""
+A decl's home canonicalised the way the registry stores it: the
+root file's module name becomes `None`, matching the rest of the
+root file's untagged decls.
+""")]
+pub fn proto_mo_of(home: String, target_mod: String) : Option[String] =
+  if home == target_mod { None } else { Some(home) }
+
+#[doc("An error diagnostic at `file:line:col`.")]
+pub fn proto_err(file: String, line: Int, col: Int, msg: String) : Diagnostic =
+  mk_diag(SevError, file, line, col, msg, [])
+
+#[doc("A registry home as a diagnostic names it: the root file by its module name.")]
+pub fn proto_home_name(mo: Option[String], target_mod: String) : String = match mo {
+  Some(m) -> m
+  None    -> target_mod
+}
+
+#[doc("""
+The declaration a duplicate check compares: what the impl's module
+sees under the target's name. Every impl resolves in the same table,
+so the ids compare with each other; they never meet a `TyCon`'s.
+""")]
+pub fn impl_target_key(ps: PScope, tname: String, target: DeclRef, from: Option[String]) : String = {
+  let s = match target {
+    DrSym(d)        -> d
+    DrWritten(_, _) -> match sv_resolve(ps_tab(ps), ps_view(ps, from), NCType, tname) {
+      SvSym(d) -> d
+      _        -> sym_none()
+    }
+  }
+  if sym_raw(s) >= 0 { concat_all([tname, "#", int_to_string(sym_raw(s))]) } else { tname }
+}
+
+#[doc("""
+Root-file types are stamped with the target module; root fns are
+not. The synthesised fns follow the fn convention.
+""")]
+pub fn decl_type_home(d: Decl, target_mod: String) : Option[String] = match d {
+  DType(_, _, _, _, _, _, mo, _) -> match mo {
+    Some(m) -> proto_mo_of(m, target_mod)
+    None    -> None
+  }
+  _ -> None
+}

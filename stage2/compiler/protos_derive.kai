@@ -1,0 +1,179 @@
+#[doc("""
+Expansion of `#[derive(P)]` into `impl P for T`, one generator per core
+protocol.
+""")]
+
+import compiler.ast
+import compiler.core_protos
+import compiler.util
+import compiler.proto_resolve
+import compiler.decl_names
+import compiler.layout_derive
+import compiler.json_derive
+import compiler.derive_generic
+import compiler.derive_pick
+import compiler.derive_mint
+import compiler.protos_names
+import compiler.protos_derived
+import compiler.protos_derive_show_eq_hash
+import compiler.protos_derive_ord
+import compiler.protos_derive_binser
+import compiler.protos_heads
+import compiler.protos_check_providers
+
+#[doc("""
+Phase 1: expand each `DDerive(names, type_decl)` into its wrapped
+DType followed by one synthetic DImpl per derived protocol.
+DProtocol and ordinary DImpl decls pass through unchanged so the
+next pass can collect them.
+The decl stream with every `#[derive]` expanded, the impls the
+derives minted on their own, and the table row of every function the
+derives declared.
+""")]
+pub type Expanded = Expanded([Decl], [Decl], [NEnt])
+
+#[doc("""
+What an expansion resolves and mints against: the protocol scope, the
+generator each protocol picks, the dispatchers by id, and the core
+modules.
+""")]
+pub type DeriveCx = { ps: PScope, gens: ShapedGens, ids: ProtoIds, cores: [String] }
+
+#[doc("Every `#[derive]` of `ds` expanded into the impls it generates.")]
+pub fn expand_derives(dx: DeriveCx, ds: [Decl], target_mod: String) : Expanded =
+  expand_derives_loop(dx, ds, target_mod, collect_binser_types(dx.ps, ds, false, []), [], [], [])
+
+# `writers` names every type deriving BinSerialize: a field of one of
+# them is encoded by its writer instead of a fresh `to_bytes` array.
+fn expand_derives_loop(dx: DeriveCx, ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl],
+                       rows: [NEnt]) : Expanded {
+  match ds {
+    [] -> Expanded(list_reverse(acc), minted, rows)
+    [d, ...rest] -> match d {
+      DDerive(names, inner, l, c) -> {
+        let home = decl_type_home(inner, target_mod)
+        let dv = derive_impls_for(dx, names, inner, home, writers)
+        let derived = map(dv.decls, (dd) => stamp_derived_home(dd, home, l, c))
+        expand_derives_loop(dx, rest, target_mod, writers,
+                            list_append([inner, ...list_reverse(derived)], acc),
+                            list_append(derived, minted), list_append(dv.rows, rows))
+      }
+      DUnstable(inner, _, _) ->
+        expand_derives_loop(dx, [inner, ...rest], target_mod, writers, acc, minted, rows)
+      # Every other wrapper stays: the `#[constructor]` registry is
+      # collected in the typer, so unwrapping it would lose it.
+      _ -> expand_derives_loop(dx, rest, target_mod, writers, [d, ...acc], minted, rows)
+    }
+  }
+}
+
+#[doc("""
+Phase 2: drop every DProtocol / DImpl from the decl stream after
+the impl-lowering pass has copied their content into ordinary
+DFns. DDerive nodes have already been replaced by `expand_derives`.
+""")]
+pub fn strip_protocols(ds: [Decl]) : [Decl] = strip_protocols_loop(ds, [])
+
+fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DProtocol(_, _, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
+      DImpl(_, _, _, _, _, _, _, isym)     -> strip_protocols_loop(rest, acc)
+      DDerive(_, _, _, _)      -> strip_protocols_loop(rest, acc)
+      _ -> strip_protocols_loop(rest, [d, ...acc])
+    }
+  }
+}
+
+fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String], writers: [String]) : Derived {
+  match dt {
+    DType(_, tsym, tps, body, line, col, _, _) -> {
+      let tab = ps_tab(dx.ps)
+      let homed = derive_homed(dx.cores, home)
+      let of = (p: SymId) => DerivedType { tsym: tsym, tps: tps,
+                                           body: body, writers: writers, proto: p, ids: dx.ids,
+                                           homed: homed,
+                                           home: proto_home_name(home, ps_root(dx.ps)), tab: tab,
+                                           heads: HeadScope(dx.ps, home) }
+      derive_impls_loop(dx, home, names, of, line, col, derived_none())
+    }
+    _ -> derived_none()
+  }
+}
+
+# A core module's own derive reaches a dispatcher bare, as its
+# interpolations do.
+fn derive_homed(cores: [String], home: Option[String]) : Bool = match home {
+  Some(m) -> not list_has(cores, m)
+  None    -> true
+}
+
+# The protocol an entry resolves to, from the type's file, picks the
+# generator and heads the impl. `of` is the derived type for a protocol.
+fn derive_impls_loop(dx: DeriveCx, home: Option[String], names: [String], of: (SymId) -> DerivedType,
+                     line: Int, col: Int, acc: Derived) : Derived {
+  match names {
+    [] -> Derived { decls: list_reverse(acc.decls), rows: acc.rows }
+    [pspell, ...rest] -> {
+      let dv = match derive_gen(dx.ps, dx.gens, pspell, home) {
+        Some(DeriveGen(p, g)) -> {
+          let dt = of(p)
+          let m = derive_impl_for_protocol(g, dt, line, col)
+          Derived { decls: map(m.decls, (dd) => derive_generalize(impl_with_proto(dd, p), pspell, dt.tsym, dt.tps)),
+                    rows: m.rows }
+        }
+        None -> derived_none()
+      }
+      derive_impls_loop(dx, home, rest, of, line, col,
+                        Derived { decls: list_append(list_reverse(dv.decls), acc.decls),
+                                  rows: list_append(dv.rows, acc.rows) })
+    }
+  }
+}
+
+fn impl_with_proto(d: Decl, psym: SymId) : Decl = match d {
+  DImpl(_, pargs, target, ms, l, c, tps, isym) -> DImpl(DrSym(psym), pargs, target, ms, l, c, tps, isym)
+  _ -> d
+}
+
+# Everything a derive synthesises — the impl's methods and any
+# top-level shim — belongs to the module declaring the type, exactly
+# as if written there by hand. The impl itself sits at the attribute,
+# where a diagnostic about it points.
+fn stamp_derived_home(d: Decl, mo: Option[String], al: Int, ac: Int) : Decl = match d {
+  DImpl(p, pargs, target, ms, _, _, tps, isym) ->
+    DImpl(p, pargs, target, map(ms, (m) => stamp_derived_home(m, mo, al, ac)), al, ac, tps, isym)
+  DFn(p, fid, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo)
+  _ -> d
+}
+
+# Synthesise zero or more decls for `#derive(P) type T = ...`. v1
+# supports `Show`, `Eq`, `Hash`, `Ord`, and `BinSerialize` on records
+# and sum types. Nothing is declared when the (P, body)
+# combination is unsupported (the resolver / typer surfaces that as
+# "no impl"). Most protocols return a single `DImpl`; `BinSerialize`
+# additionally returns a top-level `<tname>_from_bytes` shim because
+# v1 single-dispatch cannot route a return-type-only call (issue
+# #459 §"Two design routes" + the `Serialize` prologue in
+# `stdlib/protocols.kai`).
+fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) : Derived {
+  match g {
+    CpShow         -> derive_show_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "show"), dt, line, col)
+    CpEq           -> derive_eq_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "eq"), dt, line, col)
+    CpHash         -> derive_hash_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "hash"), dt, line, col)
+    CpOrd          -> derive_ord_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "cmp"), dt, line, col)
+    CpBinSerialize -> derive_binserialize_impl(dt, line, col)
+    CpLayout       -> {
+      let m = derive_layout_impl(dt.tab, dt.tsym, dt.body, line, col)
+      Derived { decls: m.decls, rows: m.rows }
+    }
+    CpJson         -> {
+      let m = derive_json_impl(dt.tab, dt.tsym, heads_body(dt.heads, dt.body),
+                               (r) => head_ref_spell(dt.heads, r), line, col)
+      Derived { decls: m.decls, rows: m.rows }
+    }
+    _              -> derived_none()
+  }
+}

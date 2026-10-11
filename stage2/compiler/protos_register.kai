@@ -1,0 +1,137 @@
+#[doc("""
+The protocol registry as `lower_protocols` builds it: every declared
+operation recorded, then the tables later passes read attached.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.core_protos
+import compiler.util
+import compiler.impl_index
+import compiler.proto_ids
+import compiler.proto_key
+import compiler.proto_resolve
+
+#[doc("A registry holding no protocol.")]
+pub fn proto_reg_empty() : ProtocolReg =
+  ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [],
+                dkeys: [], impl_index: impl_index_empty(), cores: [], imports: [], root: "",
+                ids: pid_empty() }
+
+#[doc("""
+Register every DProtocol decl the program declares. The op list
+becomes the universe of "names that look like ordinary fn calls but
+really need protocol dispatch". Each entry carries its declaring
+module's `module_origin` stamp so two same-named protocols never
+share one identity.
+""")]
+pub fn collect_proto_decls(ds: [Decl], reg: ProtocolReg, ps: PScope) : ProtocolReg {
+  match ds {
+    [] -> reg
+    [d, ...rest] -> match d {
+      DProtocol(is_pub, psym, tparams, ops, _, _, mo) -> {
+        let reg1 = ProtocolReg {
+          ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+          tparams: [PTPR(psym, tparams, mo), ...reg.tparams],
+          origins: [PrOR(psym, mo, is_pub), ...reg.origins],
+          dkeys: reg.dkeys,
+          impl_index: reg.impl_index,
+          cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
+        }
+        collect_proto_decls(rest, register_proto_ops(reg1, mo, psym, ops), ps)
+      }
+      DDerive(_, inner, _, _) ->
+        collect_proto_decls([inner, ...rest], reg, ps)
+      DUnstable(inner, _, _) ->
+        collect_proto_decls([inner, ...rest], reg, ps)
+      DProtoLaws(_, inner, _, _, _) ->
+        collect_proto_decls([inner, ...rest], reg, ps)
+      DImplAxiom(_, inner, _, _, _) ->
+        collect_proto_decls([inner, ...rest], reg, ps)
+      DConstructor(inner, _, _) ->
+        collect_proto_decls([inner, ...rest], reg, ps)
+      _ -> collect_proto_decls(rest, reg, ps)
+    }
+  }
+}
+
+# `psym` is the protocol's own identity: an impl's written protocol name
+# resolves to the same id.
+fn register_proto_ops(reg: ProtocolReg, mo: Option[String],
+                      psym: SymId, ops: [ProtoOp]) : ProtocolReg {
+  match ops {
+    [] -> reg
+    [op, ...rest] -> match op {
+      POp(opname, op_tps, params, ret, line, col) -> {
+        let entry = POR(psym, written(opname), params, ret, line, col, mo, op_tps)
+        let names1 =
+          if list_has(reg.op_names, opname) { reg.op_names }
+          else { [opname, ...reg.op_names] }
+        let reg1 = ProtocolReg {
+          ops: [entry, ...reg.ops],
+          impls: reg.impls,
+          op_names: names1,
+          tparams: reg.tparams,
+          origins: reg.origins,
+          dkeys: reg.dkeys,
+          impl_index: reg.impl_index,
+          cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
+        }
+        register_proto_ops(reg1, mo, psym, rest)
+      }
+    }
+  }
+}
+
+#[doc("How a `#{...}` names the dispatcher of the core `Show`: through its home, as user code does, and bare, as a core module does.")]
+pub type ShowRef = ShowRef(ExprKind, ExprKind)
+
+#[doc("The references to the dispatcher of the core `Show`'s `show`, or `None` when no core module declares that protocol. The interpolation sugar binds `#{...}` to it, never to a user protocol that happens to declare `show`.")]
+pub fn proto_core_show(reg: ProtocolReg, cores: [String]) : Option[ShowRef] =
+  match pid_op_disp(reg.ids, core_proto_id(CpShow), "show") {
+    None    -> None
+    Some(s) -> match pid_disp(reg.ids, s) {
+      None    -> None
+      Some(d) -> match disp_home(d) {
+        Some(h) -> if list_has(cores, h) { show_ref(pid_disp_homed_ref(reg.ids, s), s) } else { None }
+        None    -> None
+      }
+    }
+  }
+
+fn show_ref(homed: Option[ExprKind], s: SymId) : Option[ShowRef] = match homed {
+  Some(k) -> Some(ShowRef(k, ESym(s, spec_none())))
+  None    -> None
+}
+
+#[doc("""
+Attach a freshly-built `ImplIndex` to a finalised registry. The impl
+table is immutable past this point, so the index built here serves
+every subsequent lookup.
+""")]
+pub fn reg_with_impl_index(reg: ProtocolReg) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins,
+                dkeys: reg.dkeys,
+                impl_index: build_impl_index(reg.impls), cores: reg.cores,
+                imports: reg.imports, root: reg.root, ids: reg.ids }
+
+#[doc("""
+The id of every function the lowering generated: the dispatchers as
+they were minted, the impl methods under their final symbols.
+""")]
+pub fn reg_with_ids(reg: ProtocolReg, disps: ProtoIds) : ProtocolReg =
+  ProtocolReg { ...reg, ids: pid_with_impls(disps, reg.impls, reg.root) }
+
+#[doc("""
+Dispatch identity comes from the symbol table: the protocols the
+stream declares, keyed by whether the table holds a second home for
+the same name.
+""")]
+pub fn reg_with_scope(reg: ProtocolReg, cores: [String],
+                  imports: [ModImports], ps: PScope) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins,
+                dkeys: pk_table(ps_tab(ps), ps_view(ps, None), ps_root(ps)),
+                impl_index: reg.impl_index, cores: cores, imports: imports, root: ps_root(ps),
+                ids: reg.ids }

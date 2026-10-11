@@ -1,0 +1,299 @@
+#[doc("""
+Checks on `#[derive]` before expansion: each entry picks a generator,
+and every field's type reaches an impl of the derived protocol.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.core_protos
+import compiler.diag_file
+import compiler.diag
+import compiler.util
+import compiler.proto_resolve
+import compiler.scalar_ty
+import compiler.derive_generic
+import compiler.derive_reach
+import compiler.derive_pick
+import compiler.tbinder
+import compiler.protos_names
+import compiler.protos_registry
+import compiler.protos_lower_impls
+import compiler.protos_heads
+
+#[doc("""
+Validate, before expansion, that every `#[derive(P)]` of Eq, Hash or
+Show can be discharged: each field type must reach an impl that answers
+the derive (explicit, derived, or builtin) through every type argument a
+container impl bounds by its protocol, so `[(Int, String)]` needs one on
+`List` and on `Pair`.
+""")]
+pub fn validate_derives(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
+  list_reverse(validate_derives_loop(ps, sg, ds, df, collect_impl_reach(ps, sg, ds, []), []))
+
+# Every impl, written or derived, of a protocol whose generator's fields
+# are checked here.
+fn collect_impl_reach(ps: PScope, sg: ShapedGens, ds: [Decl], acc: [ImplReach]) : [ImplReach] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DImpl(pref, _, target, ms, _, _, tps, _) -> {
+        let from = impl_home_of(ms)
+        let p = proto_ref_sym(ps, pref, from)
+        let acc1 = if gen_reach_checked(proto_gen(sg, p)) {
+          [impl_reach(p, head_tree(ps, from, tps, target), tps,
+                      (b) => psc_same(proto_ref_sym(ps, b, from), p)), ...acc]
+        } else { acc }
+        collect_impl_reach(ps, sg, rest, acc1)
+      }
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tsym, tps, _, _, _, _, _) ->
+          collect_impl_reach(ps, sg, rest, list_append(map(reach_gens(ps, sg, names, derive_from(ps, inner)),
+                                                       (g) => derived_reach(gen_proto(g), tsym, tps)), acc))
+        _ -> collect_impl_reach(ps, sg, rest, acc)
+      }
+      DUnstable(inner, _, _) ->
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
+      DProtoLaws(_, inner, _, _, _) ->
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
+      DImplAxiom(_, inner, _, _, _) ->
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
+      DConstructor(inner, _, _) ->
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
+      _ -> collect_impl_reach(ps, sg, rest, acc)
+    }
+  }
+}
+
+# A type as the file homed at `from` reads it, head by head: a type
+# parameter of the declaration, one of `params`, is filed under its
+# binder's name, and any other head is settled to the declaration it
+# denotes there.
+fn head_tree(ps: PScope, from: Option[String], params: [TBinder], te: TypeExpr) : HeadTree =
+  HT(reach_head(ps, from, params, te), map(te_type_args(te), (a) => head_tree(ps, from, params, a)))
+
+fn reach_head(ps: PScope, from: Option[String], params: [TBinder], te: TypeExpr) : DeclRef =
+  match te_param_of(te, params) {
+    Some(b) -> param_head(b)
+    None    -> vdv_head(ps, te, from)
+  }
+
+#[doc("The parameter among `params` a type is a use of, if it is one.")]
+pub fn te_param_of(te: TypeExpr, params: [TBinder]) : Option[TBinder] = match te.tkind {
+  TyParam(id, _) -> tbs_find(params, id)
+  _              -> None
+}
+
+fn te_type_args(te: TypeExpr) : [TypeExpr] = match te.tkind {
+  TyName(_, args)   -> args
+  TyParam(_, args)  -> args
+  TyList(elem)      -> [elem]
+  TyDim(base, _)    -> te_type_args(base)
+  TyRefine(base, _) -> te_type_args(base)
+  _                 -> []
+}
+
+# Builtin impls bundled with kaikai for primitive types, kept in
+# sync with stdlib/protocols.kai. The validator treats these as
+# always available so users do not have to redeclare `impl Eq for
+# Int` in every fixture that derives Eq on a sum carrying Ints.
+#[doc("True iff kaikai bundles a structural builtin impl of the core protocol `p` for primitive head `tname` (Eq/Show/Ord/Hash over Int/Real/String/... and fixed-width ints).")]
+pub fn derive_builtin_impl(p: CoreProto, tname: String) : Bool = match p {
+  CpEq ->
+    list_has(["Int", "Real", "Bool", "String", "Char", "Unit"], tname) or is_fixed_width_name(tname)
+  CpHash ->
+    list_has(["Int", "Real", "String", "Bool", "Char"], tname) or is_fixed_width_name(tname)
+  CpShow ->
+    list_has(["Int", "Real", "Bool", "String", "Unit", "Char"], tname) or is_fixed_width_name(tname)
+  CpOrd -> is_fixed_width_name(tname)
+  _     -> false
+}
+
+# Only a scalar has a builtin impl, and a scalar head stays as written.
+fn head_builtin_impl(g: CoreProto, h: DeclRef) : Bool = match h {
+  DrWritten(None, _) -> derive_builtin_impl(g, ref_spelled(h))
+  _                  -> false
+}
+
+#[doc("The file a derive's entries are written in: the one declaring the type.")]
+pub fn derive_from(ps: PScope, inner: Decl) : Option[String] = decl_type_home(inner, ps_root(ps))
+
+fn gen_proto(d: DeriveGen) : SymId = match d { DeriveGen(p, _) -> p }
+
+#[doc("True when the generator a derive picked is the core protocol `g`.")]
+pub fn gen_is(picked: Option[CoreProto], g: CoreProto) : Bool = match picked {
+  Some(p) -> core_proto_same(p, g)
+  None    -> false
+}
+
+#[doc("What each `#[derive]` entry fails to pick, in declaration order.")]
+pub fn derive_entry_diags(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DDerive(names, inner, line, col) ->
+      derive_entry_diags(ps, sg, rest, df,
+        derive_pick_diags(ps, sg, names, derive_from(ps, inner), decl_diag_file(d, df), line, col, acc))
+    DUnstable(inner, _, _)        -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    DProtoLaws(_, inner, _, _, _) -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    DImplAxiom(_, inner, _, _, _) -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    DConstructor(inner, _, _)     -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    _ -> derive_entry_diags(ps, sg, rest, df, acc)
+  }
+}
+
+fn validate_derives_loop(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles, reach: [ImplReach],
+                         errs: [Diagnostic]) : [Diagnostic] / Console {
+  match ds {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, line, col) -> {
+        let site = DS(decl_diag_file(d, df), line, col)
+        let errs1 = validate_derive_decl(ps, sg, names, inner, site, reach, errs)
+        validate_derives_loop(ps, sg, rest, df, reach, errs1)
+      }
+      DUnstable(inner, _, _) ->
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+      DProtoLaws(_, inner, _, _, _) ->
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+      DImplAxiom(_, inner, _, _, _) ->
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+      DConstructor(inner, _, _) ->
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+      _ -> validate_derives_loop(ps, sg, rest, df, reach, errs)
+    }
+  }
+}
+
+# Where a derive reports: the file and position of its declaration.
+type DeriveSite = DS(String, Int, Int)
+
+# What a derive's fields are read with: the scope, the file and the type
+# parameters of the deriving type, its name, and where it reports.
+type ReachRead = { ps: PScope, from: Option[String], params: [TBinder], tname: String, site: DeriveSite }
+
+fn validate_derive_decl(ps: PScope, sg: ShapedGens, names: [String], inner: Decl, site: DeriveSite,
+                        reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
+  DType(_, tsym, tps, body, _, _, _, _) -> {
+    let tab = ps_tab(ps)
+    let from = derive_from(ps, inner)
+    let gens = reach_gens(ps, sg, names, from)
+    let own = list_append(map(gens, (g) => derived_reach(gen_proto(g), tsym, tps)), param_reaches(gens, tps))
+    let rd = ReachRead { ps: ps, from: from, params: tps, tname: ref_text(tab, DrSym(tsym)), site: site }
+    validate_derive_protos(rd, sg, gens, derive_field_types(tab, body), list_append(own, reach), errs)
+  }
+  _ -> errs
+}
+
+# The entries whose generator's fields are checked here.
+fn reach_gens(ps: PScope, sg: ShapedGens, names: [String], from: Option[String]) : [DeriveGen] =
+  filter(derive_gens(ps, sg, names, from), (d) => match d { DeriveGen(_, g) -> gen_reach_checked(Some(g)) })
+
+fn gen_reach_checked(picked: Option[CoreProto]) : Bool = match picked {
+  Some(CpEq)   -> true
+  Some(CpHash) -> true
+  Some(CpShow) -> true
+  _            -> false
+}
+
+# A field typed by a parameter the derive bounds is covered by that bound.
+fn param_reaches(gens: [DeriveGen], tps: [TBinder]) : [ImplReach] = match gens {
+  []          -> []
+  [g, ...rest] ->
+    list_append(map(derive_bound_params(tps), (tp) => param_reach(gen_proto(g), tp)), param_reaches(rest, tps))
+}
+
+# Each field a derived impl reads, labelled the way a diagnostic names it.
+type DeriveField = DFld(String, TypeExpr)
+
+fn derive_field_types(tab: SymTab, body: TypeBody) : [DeriveField] = match body {
+  TBSum(variants)  -> variant_fields(tab, variants)
+  TBRecord(fields) -> map(fields, record_field)
+  _                -> []
+}
+
+fn variant_fields(tab: SymTab, vs: [Variant]) : [DeriveField] = match vs {
+  []           -> []
+  [v, ...rest] -> match v {
+    Var(vsym, vargs) ->
+      list_append(variant_args(written_text(sym_name(tab, vsym)), vargs, 0), variant_fields(tab, rest))
+  }
+}
+
+fn variant_args(vname: String, vargs: [TypeExpr], i: Int) : [DeriveField] = match vargs {
+  []            -> []
+  [te, ...rest] ->
+    [DFld(concat_all(["variant `", vname, "` field #", int_to_string(i)]), te),
+     ...variant_args(vname, rest, i + 1)]
+}
+
+fn record_field(f: FieldDecl) : DeriveField = match f {
+  FD(_, fname, te, _) -> DFld(concat_all(["field `", fname, "`"]), te)
+}
+
+fn validate_derive_protos(rd: ReachRead, sg: ShapedGens, gens: [DeriveGen], fields: [DeriveField],
+                          impls: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console = match gens {
+  []           -> errs
+  [d, ...rest] ->
+    validate_derive_protos(rd, sg, rest, fields, impls,
+                           validate_derive_fields(rd, d, derive_reach_of(rd.ps, sg, d, impls), fields, errs))
+}
+
+# An impl of the derived protocol answers the derive. A core protocol's
+# derived body names its operation through the core home, so nothing else
+# does; any other protocol's names it bare, so an impl of every protocol
+# that picks the same generator answers too.
+fn derive_reach_of(ps: PScope, sg: ShapedGens, d: DeriveGen, impls: [ImplReach]) : ReachCx = match d {
+  DeriveGen(p, g) -> {
+    let tab = ps_tab(ps)
+    ReachCx { impls: impls,
+              serves: (q) => psc_same(q, p) or (not proto_is(p, g) and gen_is(proto_gen(sg, q), g)),
+              same: (a, b) => refs_same(tab, a, b),
+              builtin: (h) => head_builtin_impl(g, h) }
+  }
+}
+
+fn validate_derive_fields(rd: ReachRead, d: DeriveGen, reach: ReachCx, fields: [DeriveField],
+                          errs: [Diagnostic]) : [Diagnostic] / Console = match fields {
+  []           -> errs
+  [f, ...rest] -> match f {
+    DFld(what, te) -> {
+      let tab = ps_tab(rd.ps)
+      let path = map(missing_path(reach, head_tree(rd.ps, rd.from, rd.params, te)), (r) => match head_param(rd.params, r) {
+        Some(b) -> tb_text(b)
+        None    -> ref_text(tab, r)
+      })
+      let errs1 = match path {
+        [] -> errs
+        _  -> [report_derive_missing(ref_text(tab, DrSym(gen_proto(d))), rd.tname, what, path, rd.site), ...errs]
+      }
+      validate_derive_fields(rd, d, reach, rest, errs1)
+    }
+  }
+}
+
+fn last_head(path: [String]) : String = match path {
+  []           -> ""
+  [h]          -> h
+  [_, ...rest] -> last_head(rest)
+}
+
+#[doc("A derive error, printed on the single line the derive diagnostics use.")]
+pub fn derive_error(file: String, line: Int, col: Int, msg: String) : Diagnostic / Console = {
+  eprint(concat_all([file, ":", int_to_string(line), ":", int_to_string(col), ": error: ", msg]))
+  mk_diag(SevError, file, line, col, msg, [])
+}
+
+fn report_derive_missing(pname: String, tname: String, what: String, path: [String],
+                         site: DeriveSite) : Diagnostic / Console = match site {
+  DS(file, line, col) -> {
+    let head = last_head(path)
+    let lacks = concat_all(["no `impl ", pname, " for ", head, "` in this compilation unit"])
+    let tail = match path {
+      [_] -> concat_all([" which has ", lacks])
+      _   -> concat_all(["; `", head, "` has ", lacks])
+    }
+    derive_error(file, line, col, concat_all([
+      "cannot derive `", pname, "` for `", tname, "`: ", what,
+      " has type `", path_type(path), "`", tail]))
+  }
+}

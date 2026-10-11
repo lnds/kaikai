@@ -1,0 +1,156 @@
+#[doc("""
+`#[derive(Ord)]` is rejected on a field or payload whose type has no
+`Ord` impl.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.core_protos
+import compiler.diag_file
+import compiler.diag
+import compiler.util
+import compiler.proto_resolve
+import compiler.derive_generic
+import compiler.derive_pick
+import compiler.protos_names
+import compiler.protos_derive_check
+import compiler.protos_heads
+import compiler.protos_check_providers
+
+#[doc("""
+m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
+decl stream once to collect every type that has — or will have
+after derivation — an `Ord` impl, then rejects any
+`#derive(Ord) type T` whose fields/payloads reference a type that
+does not appear in that set. The `T` itself is one of them, which
+allows recursive types. Parametric type heads (`List`, `Option`,
+`Result`, `Fn`) collapse to their constructor via `proto_type_ref`,
+so a field of type `[Int]` is headed by `List` — and unless
+`impl Ord for List` is declared, the derive is rejected.
+""")]
+pub fn validate_derive_ord(ps: PScope, sg: ShapedGens, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
+
+  let providers = collect_ord_providers(ps, sg, decls, [])
+  list_reverse(validate_derive_ord_loop(ps, sg, decls, df, providers, []))
+}
+
+fn validate_derive_ord_loop(ps: PScope, sg: ShapedGens, decls: [Decl], df: DiagFiles,
+                              providers: [DeclRef], errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tsym, tps, body, line, col, _, _) ->
+          if derives_gen(ps, sg, names, derive_from(ps, inner), CpOrd) {
+            let file = decl_diag_file(d, df)
+            let cx = VdvCx { ps: ps, from: derive_from(ps, inner) }
+            let errs1 = validate_derive_ord_body(cx, file, vdv_type_name(ps, tsym), body,
+                                                  derive_bound_params(tps), providers,
+                                                  line, col, errs)
+            validate_derive_ord_loop(ps, sg, rest, df, providers, errs1)
+          } else {
+            validate_derive_ord_loop(ps, sg, rest, df, providers, errs)
+          }
+        _ -> validate_derive_ord_loop(ps, sg, rest, df, providers, errs)
+      }
+      DUnstable(inner, _, _) ->
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
+      DProtoLaws(_, inner, _, _, _) ->
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
+      DImplAxiom(_, inner, _, _, _) ->
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
+      DConstructor(inner, _, _) ->
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
+      _ -> validate_derive_ord_loop(ps, sg, rest, df, providers, errs)
+    }
+  }
+}
+
+# `params` names the type parameters the derive bounds by `Ord`: a
+# field typed by one of them is covered by that bound.
+fn validate_derive_ord_body(cx: VdvCx, file: String, tname: String, body: TypeBody,
+                              params: [TBinder], providers: [DeclRef], line: Int, col: Int,
+                              errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match body {
+    TBRecord(fields) -> validate_derive_ord_fields(cx, file, tname, fields,
+                                                     params, providers, line, col, errs)
+    TBSum(variants) -> validate_derive_ord_variants(cx, file, tname, variants,
+                                                      params, providers, line, col, errs)
+    # Aliases / effect-aliases never reach derive — `derive_ord_impl`
+    # returns None for them and the existing pipeline handles the
+    # resulting "no impl" surface elsewhere. Nothing to validate here.
+    _ -> errs
+  }
+}
+
+fn validate_derive_ord_fields(cx: VdvCx, file: String, tname: String,
+                                fields: [FieldDecl], params: [TBinder], providers: [DeclRef],
+                                line: Int, col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match fields {
+    [] -> errs
+    [fd, ...rest] -> match fd {
+      FD(_, fname, ftype, _) -> {
+        let errs1 = validate_derive_ord_one(cx, file, tname, fname, "field",
+                                              ftype, params, providers, line, col, errs)
+        validate_derive_ord_fields(cx, file, tname, rest, params, providers, line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_ord_variants(cx: VdvCx, file: String, tname: String,
+                                  variants: [Variant], params: [TBinder], providers: [DeclRef],
+                                  line: Int, col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match variants {
+    [] -> errs
+    [v, ...rest] -> match v {
+      Var(vsym, vargs) -> {
+        let vname = written_text(sym_name(ps_tab(cx.ps), vsym))
+        let errs1 = validate_derive_ord_payload(cx, file, tname, vname, vargs, 0,
+                                                  params, providers, line, col, errs)
+        validate_derive_ord_variants(cx, file, tname, rest, params, providers, line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_ord_payload(cx: VdvCx, file: String, tname: String, vname: String,
+                                 vargs: [TypeExpr], idx: Int,
+                                 params: [TBinder], providers: [DeclRef], line: Int, col: Int,
+                                 errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match vargs {
+    [] -> errs
+    [vt, ...rest] -> {
+      let label = concat_all([vname, " payload #", int_to_string(idx)])
+      let errs1 = validate_derive_ord_one(cx, file, tname, label, "variant",
+                                            vt, params, providers, line, col, errs)
+      validate_derive_ord_payload(cx, file, tname, vname, rest, idx + 1,
+                                    params, providers, line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_ord_one(cx: VdvCx, file: String, tname: String, fname: String,
+                             kind: String, ftype: TypeExpr,
+                             params: [TBinder], providers: [DeclRef], line: Int, col: Int,
+                             errs: [Diagnostic]) : [Diagnostic] / Console {
+  let tab = ps_tab(cx.ps)
+  let href = vdv_head(cx.ps, ftype, cx.from)
+  if is_some(te_param_of(ftype, params)) {
+    errs
+  } else if vdv_provided(tab, providers, href) {
+    errs
+  } else {
+    let head = ref_text(tab, href)
+    let derr = derive_error(file, line, col, concat_all(["cannot `#[derive(Ord)]` for `", tname,
+      "`: no `Ord` impl for ", kind, " `", fname, "` of type `", head,
+      "` (declare `impl Ord for ", head, "` or `#[derive(Ord)]` on `", head, "`)"]))
+    [derr, ...errs]
+  }
+}

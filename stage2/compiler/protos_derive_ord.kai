@@ -1,0 +1,258 @@
+#[doc("""
+The derived `Ord` impl: lexicographic over a record's fields; over a
+sum, by constructor order and then by payload.
+""")]
+
+import compiler.ast
+import compiler.core_protos
+import compiler.util
+import compiler.protos_derived
+
+#[doc("""
+m12.8.z: `#derive(Ord)` synthesises three methods to satisfy the
+stdlib `protocol Ord { cmp, min, max }`:
+
+  - `cmp(a, b) : Int` — the load-bearing comparator. Records are
+    lexicographic (compare each field in declaration order, return
+    the first non-zero); sum types are variants-by-position with a
+    payload-lexicographic tie-breaker inside the same variant.
+  - `min(a, b) : Self` — `if cmp(a, b) <= 0 { a } else { b }`,
+    derived from the synthesised `cmp` above.
+  - `max(a, b) : Self` — `if cmp(a, b) >= 0 { a } else { b }`.
+
+`cmp` delegates to each field/payload's own `cmp`, so the typer
+transitively rejects the derive if any sub-component lacks an
+`Ord` impl — naming the missing call site in the diagnostic.
+`min` and `max` only call the just-synthesised `cmp`, so they
+carry no extra requirement on sub-types.
+""")]
+pub fn derive_ord_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) ->
+      derive_ord_make_impl(opk, dt, derive_ord_record_body(opk, fields, line, col), line, col)
+    TBSum(variants) ->
+      derive_ord_make_impl(opk, dt, derive_ord_sum_body(opk, variants, line, col), line, col)
+    _ -> derived_none()
+  }
+}
+
+# Build the three-method `impl Ord for T` given a ready-to-use `cmp`
+# body expression. Factored out so the record / sum arms above share
+# the impl assembly, and so `min` / `max` are produced in one place.
+fn derive_ord_make_impl(opk: ExprKind, dt: DerivedType, cmp_body: Expr, line: Int, col: Int) : Derived {
+  let self_ty = derived_self_ty(dt, line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
+  let params2 = [
+    Param { binder: binder_written("a"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false },
+    Param { binder: binder_written("b"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }
+  ]
+  let cmp_method = derived_method(dt, CpOrd, "cmp", params2, int_ty, cmp_body, line, col)
+  # Body of min: `if cmp(a, b) <= 0 { a } else { b }`.
+  # Body of max: `if cmp(a, b) >= 0 { a } else { b }`.
+  let a_var = mk_name("a", line, col)
+  let b_var = mk_name("b", line, col)
+  let zero = mk_expr(mk_int_synth(0), line, col)
+  let cmp_call_min = mk_expr(ECall(mk_expr(opk, line, col),
+                                       [a_var, b_var]), line, col)
+  let cmp_call_max = mk_expr(ECall(mk_expr(opk, line, col),
+                                       [a_var, b_var]), line, col)
+  let min_body = mk_expr(EIf(
+    mk_expr(EBinop(BoLe, cmp_call_min, zero), line, col),
+    a_var, Some(b_var)), line, col)
+  let max_body = mk_expr(EIf(
+    mk_expr(EBinop(BoGe, cmp_call_max, zero), line, col),
+    a_var, Some(b_var)), line, col)
+  let min_method = derived_method(dt, CpOrd, "min", params2, self_ty, min_body, line, col)
+  let max_method = derived_method(dt, CpOrd, "max", params2, self_ty, max_body, line, col)
+  Derived { decls: [DImpl(DrSym(core_proto_id(CpOrd)), [], self_ty, [cmp_method, min_method, max_method],
+                          line, col, [], sym_none())],
+            rows: derived_method_rows(dt, CpOrd, ["cmp", "min", "max"]) }
+}
+
+fn derive_ord_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    [fd, ...rest] -> derive_ord_record_chain(opk, fd, rest, 0, line, col)
+  }
+}
+
+fn derive_ord_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], idx: Int,
+                            line: Int, col: Int) : Expr {
+  match head {
+    FD(_, name, _, _) -> {
+      let l_access = mk_expr(EField(mk_name("a", line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_name("b", line, col), name), line, col)
+      let cmp_call = mk_expr(ECall(mk_expr(opk, line, col),
+                                    [l_access, r_access]),
+                             line, col)
+      match rest {
+        [] -> cmp_call
+        [next, ...more] -> {
+          let cvar = concat_all(["c", int_to_string(idx)])
+          let pat = mk_pat(PBind(binder_written(cvar)), line, col)
+          let let_stmt = SLet(pat, None, cmp_call)
+          let cond = mk_expr(EBinop(BoNe, mk_name(cvar, line, col),
+                                          mk_expr(mk_int_synth(0), line, col)),
+                             line, col)
+          let then_e = mk_name(cvar, line, col)
+          let else_e = derive_ord_record_chain(opk, next, more, idx + 1, line, col)
+          let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+          mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
+        }
+      }
+    }
+  }
+}
+
+fn derive_ord_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("a", line, col)
+  let arms = derive_ord_sum_outer_arms(opk, variants, variants, 0, line, col)
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+fn derive_ord_sum_outer_arms(opk: ExprKind, remaining: [Variant], all_variants: [Variant],
+                              idx: Int, line: Int, col: Int) : [Arm] {
+  match remaining {
+    [] -> []
+    [v, ...rest] -> {
+      let arm = derive_ord_sum_outer_arm(opk, v, all_variants, idx, line, col)
+      [arm, ...derive_ord_sum_outer_arms(opk, rest, all_variants, idx + 1, line, col)]
+    }
+  }
+}
+
+fn derive_ord_sum_outer_arm(opk: ExprKind, outer_v: Variant, all_variants: [Variant],
+                             outer_idx: Int, line: Int, col: Int) : Arm {
+  match outer_v {
+    Var(vsym, vargs) -> {
+      let outer_pat_subs = derive_ord_sum_pat_subs(vargs, "a", 0, line, col)
+      let outer_pat = mk_pat(PVariant(DrSym(vsym), outer_pat_subs), line, col)
+      let inner = derive_ord_sum_inner_match(opk, outer_v, outer_idx,
+                                              all_variants, line, col)
+      Arm(outer_pat, None, inner)
+    }
+  }
+}
+
+# Like `derive_sum_pat_subs`, but lets the caller pick the binder
+# prefix so the inner match can use `b0/b1/...` instead of `a0/a1/...`.
+fn derive_ord_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
+                            line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
+       ...derive_ord_sum_pat_subs(rest, prefix, i + 1, line, col)]
+  }
+}
+
+fn derive_ord_sum_inner_match(opk: ExprKind, outer_v: Variant, outer_idx: Int,
+                               all_variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("b", line, col)
+  let arms = derive_ord_sum_inner_arms(opk, outer_v, outer_idx, all_variants,
+                                        0, line, col)
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+# Generates the inner-match arms for one outer variant. For each
+# variant in the type's declaration, with index `idx`:
+#   - idx <  outer_idx → that variant comes earlier in declaration
+#                         order, so `cmp(outer, that) == 1`. Emit an
+#                         explicit `Variant(_, _, ...) -> 1` arm.
+#   - idx == outer_idx → same variant: emit `Variant(b0, b1, ...) ->
+#                         <payload chain>`. After the self arm, fold
+#                         every later variant under a single
+#                         `_ -> -1` wildcard and stop.
+fn derive_ord_sum_inner_arms(opk: ExprKind, outer_v: Variant, outer_idx: Int,
+                              variants: [Variant], idx: Int,
+                              line: Int, col: Int) : [Arm] {
+  match variants {
+    [] -> []
+    [v, ...rest] -> {
+      if idx < outer_idx {
+        let arm = derive_ord_sum_wild_arm(v, 1, line, col)
+        [arm, ...derive_ord_sum_inner_arms(opk, outer_v, outer_idx, rest,
+                                            idx + 1, line, col)]
+      } else if idx == outer_idx {
+        let self_arm = derive_ord_sum_self_arm(opk, outer_v, line, col)
+        match rest {
+          [] -> [self_arm]
+          _  -> [self_arm, derive_ord_sum_default_arm(-1, line, col)]
+        }
+      } else {
+        # Defensive: outer_idx is always within bounds, so this
+        # branch is unreachable. Returning [] keeps the recursion
+        # well-typed without an extra `panic`.
+        []
+      }
+    }
+  }
+}
+
+# `Variant(_, _, ...) -> <int>` — used for variants on the "wrong"
+# side of the outer-vs-inner comparison.
+fn derive_ord_sum_wild_arm(v: Variant, ret: Int, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pats = derive_ord_sum_wild_pats(vargs, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pats), line, col)
+      Arm(pat, None, mk_expr(mk_int_synth(ret), line, col))
+    }
+  }
+}
+
+fn derive_ord_sum_wild_pats(vargs: [TypeExpr], line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PWild, line, col),
+       ...derive_ord_sum_wild_pats(rest, line, col)]
+  }
+}
+
+# `_ -> <int>` — covers every variant after the outer's position.
+fn derive_ord_sum_default_arm(ret: Int, line: Int, col: Int) : Arm {
+  Arm(mk_pat(PWild, line, col), None, mk_expr(mk_int_synth(ret), line, col))
+}
+
+# `Variant(b0, b1, ...) -> <payload chain>` — the same-variant case.
+# Payloads are compared field-by-field in declaration order; the
+# first non-zero `cmp` wins.
+fn derive_ord_sum_self_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let inner_pat_subs = derive_ord_sum_pat_subs(vargs, "b", 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), inner_pat_subs), line, col)
+      let body = derive_ord_payload_chain(opk, vargs, 0, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_ord_payload_chain(opk: ExprKind, vargs: [TypeExpr], idx: Int,
+                             line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    [_, ...rest] -> {
+      let av = mk_name(concat_all(["a", int_to_string(idx)]), line, col)
+      let bv = mk_name(concat_all(["b", int_to_string(idx)]), line, col)
+      let cmp_call = mk_expr(ECall(mk_expr(opk, line, col), [av, bv]),
+                             line, col)
+      match rest {
+        [] -> cmp_call
+        _  -> {
+          let cvar = concat_all(["p", int_to_string(idx)])
+          let pat = mk_pat(PBind(binder_written(cvar)), line, col)
+          let let_stmt = SLet(pat, None, cmp_call)
+          let cond = mk_expr(EBinop(BoNe, mk_name(cvar, line, col),
+                                          mk_expr(mk_int_synth(0), line, col)),
+                             line, col)
+          let then_e = mk_name(cvar, line, col)
+          let else_e = derive_ord_payload_chain(opk, rest, idx + 1, line, col)
+          let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+          mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,213 @@
+#[doc("""
+`#[derive(BinSerialize)]` is rejected on a field or payload whose type
+has no `BinSerialize` impl.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.core_protos
+import compiler.diag_file
+import compiler.diag
+import compiler.util
+import compiler.fnreg
+import compiler.proto_resolve
+import compiler.derive_pick
+import compiler.protos_names
+import compiler.protos_derive_check
+import compiler.protos_derive_binser_put
+import compiler.protos_heads
+import compiler.protos_check_providers
+
+#[doc("""
+Pre-expansion validator for `#derive(BinSerialize)`. Same shape as
+`validate_derive_ord`: collect every type that has — or will have —
+a BinSerialize impl, then reject any derive whose fields/payloads
+reference a type outside that set. The type itself is one of them
+(recursive types are legal). The user gets a typer-time message
+pointing at the offending field instead of the dispatcher's
+generic runtime panic.
+""")]
+pub fn validate_derive_binserialize(ps: PScope, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
+
+  let providers = binser_type_refs(ps, decls, true, [])
+  list_reverse(validate_derive_binser_loop(ps, decls, df, providers, []))
+}
+
+fn validate_derive_binser_loop(ps: PScope, decls: [Decl], df: DiagFiles,
+                                 providers: [DeclRef], errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match decls {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tsym, _, body, line, col, _, _) ->
+          if derives_core(ps, names, derive_from(ps, inner), CpBinSerialize) {
+            let file = decl_diag_file(d, df)
+            let cx = VdvCx { ps: ps, from: derive_from(ps, inner) }
+            let errs1 = validate_derive_binser_body(cx, file, vdv_type_name(ps, tsym), body,
+                                                     providers, line, col, errs)
+            validate_derive_binser_loop(ps, rest, df, providers, errs1)
+          } else {
+            validate_derive_binser_loop(ps, rest, df, providers, errs)
+          }
+        _ -> validate_derive_binser_loop(ps, rest, df, providers, errs)
+      }
+      DUnstable(inner, _, _) ->
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
+      DProtoLaws(_, inner, _, _, _) ->
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
+      DImplAxiom(_, inner, _, _, _) ->
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
+      DConstructor(inner, _, _) ->
+        validate_derive_binser_loop(ps, [inner, ...rest], df, providers, errs)
+      _ -> validate_derive_binser_loop(ps, rest, df, providers, errs)
+    }
+  }
+}
+
+fn validate_derive_binser_body(cx: VdvCx, file: String, tname: String, body: TypeBody,
+                                 providers: [DeclRef], line: Int, col: Int,
+                                 errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match body {
+    TBRecord(fields) -> validate_derive_binser_fields(cx, file, tname, fields,
+                                                        providers, line, col, errs)
+    TBSum(variants) -> validate_derive_binser_variants(cx, file, tname, variants,
+                                                         providers, line, col, errs)
+    _ -> errs
+  }
+}
+
+fn validate_derive_binser_fields(cx: VdvCx, file: String, tname: String,
+                                   fields: [FieldDecl], providers: [DeclRef],
+                                   line: Int, col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match fields {
+    [] -> errs
+    [fd, ...rest] -> match fd {
+      FD(_, fname, ftype, _) -> {
+        let errs1 = validate_derive_binser_one(cx, file, tname, fname, "field",
+                                                 ftype, providers, line, col, errs)
+        validate_derive_binser_fields(cx, file, tname, rest, providers,
+                                        line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_binser_variants(cx: VdvCx, file: String, tname: String,
+                                     variants: [Variant], providers: [DeclRef],
+                                     line: Int, col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match variants {
+    [] -> errs
+    [v, ...rest] -> match v {
+      Var(vsym, vargs) -> {
+        let vname = written_text(sym_name(ps_tab(cx.ps), vsym))
+        let errs1 = validate_derive_binser_payload(cx, file, tname, vname, vargs, 0,
+                                                     providers, line, col, errs)
+        validate_derive_binser_variants(cx, file, tname, rest, providers,
+                                          line, col, errs1)
+      }
+    }
+  }
+}
+
+fn validate_derive_binser_payload(cx: VdvCx, file: String, tname: String, vname: String,
+                                    vargs: [TypeExpr], idx: Int,
+                                    providers: [DeclRef], line: Int, col: Int,
+                                    errs: [Diagnostic]) : [Diagnostic] / Console {
+
+  match vargs {
+    [] -> errs
+    [vt, ...rest] -> {
+      let label = concat_all([vname, " payload #", int_to_string(idx)])
+      let errs1 = validate_derive_binser_one(cx, file, tname, label, "variant",
+                                               vt, providers, line, col, errs)
+      validate_derive_binser_payload(cx, file, tname, vname, rest, idx + 1,
+                                       providers, line, col, errs1)
+    }
+  }
+}
+
+fn validate_derive_binser_one(cx: VdvCx, file: String, tname: String, fname: String,
+                                kind: String, ftype: TypeExpr,
+                                providers: [DeclRef], line: Int, col: Int,
+                                errs: [Diagnostic]) : [Diagnostic] / Console {
+  let tab = ps_tab(cx.ps)
+  let href = vdv_head(cx.ps, ftype, cx.from)
+  if vdv_provided(tab, providers, href) {
+    errs
+  } else if binser_builtin_impl(ftype) {
+    errs
+  } else if binser_collection_head(ftype) {
+    # `List` and `Option` route through `bin_list_*` / `bin_option_*`
+    # combinators emitted by the derive. Validate that the element
+    # type still has a usable impl/derive, recursively.
+    validate_derive_binser_collection_elem(cx, file, tname, fname, kind, ftype,
+                                             ref_text(tab, href), providers, line, col, errs)
+  } else {
+    let head = ref_text(tab, href)
+    let derr = derive_error(file, line, col, concat_all(["cannot `#[derive(BinSerialize)]` for `", tname,
+      "`: no `BinSerialize` impl for ", kind, " `", fname, "` of type `", head,
+      "` (declare `impl BinSerialize for ", head,
+      "` or `#[derive(BinSerialize)]` on `", head, "`)"]))
+    [derr, ...errs]
+  }
+}
+
+fn binser_collection_head(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve_ty(ftype)) {
+  TyListT(_)  -> true
+  TyCon(s, _) -> core_ty_is(s, CtList) or core_ty_is(s, CtOption)
+  _           -> false
+}
+
+# `TyList(elem)` and `Option[elem]` are valid only when `elem` is
+# itself a builtin, a collection (recursive case for `[[Foo]]`), or a
+# provider in scope. Anything else is reported as missing — but the
+# message names the *element* type, not the outer `List`/`Option`,
+# because the user's mental model is "BinSerialize for Foo is what
+# I need to add".
+fn validate_derive_binser_collection_elem(cx: VdvCx, file: String, tname: String,
+                                            fname: String, kind: String,
+                                            ftype: TypeExpr, head: String,
+                                            providers: [DeclRef], line: Int,
+                                            col: Int, errs: [Diagnostic]) : [Diagnostic] / Console {
+  let elem_opt = binser_collection_elem(ftype)
+  match elem_opt {
+    None -> {
+      # `Option` without a type arg, or other malformed shape. Report
+      # against the outer head so the user knows the shape is wrong.
+      let derr = derive_error(file, line, col, concat_all(["cannot `#[derive(BinSerialize)]` for `", tname,
+        "`: ", kind, " `", fname, "` has shape `", head,
+        "` without an element type"]))
+      [derr, ...errs]
+    }
+    Some(elem) -> validate_derive_binser_one(cx, file, tname, fname, kind, elem,
+                                                providers, line, col, errs)
+  }
+}
+
+fn binser_collection_elem(ftype: TypeExpr) : Option[TypeExpr] {
+  match ftype.tkind {
+    TyList(elem) -> Some(elem)
+    _            -> binser_option_elem(ftype)
+  }
+}
+
+# Atomic types with hand-written impls in stdlib/protocols.kai.
+# Mirrors `derive_builtin_impl` for Eq/Hash/Show; kept separate to
+# avoid coupling BinSerialize's whitelist to the protocols that
+# pre-existed it. `Byte` rides the `Int` impl by virtue of Lane 4's
+# nominal-but-byte-castable design. `Char` rides a hand-written
+# `bin_char_*` pair the derive routes to directly.
+fn binser_builtin_impl(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve_ty(ftype)) {
+  TyInt    -> true
+  TyReal   -> true
+  TyBool   -> true
+  TyString -> true
+  TyByte   -> true
+  TyChar   -> true
+  _        -> false
+}

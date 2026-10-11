@@ -1,0 +1,191 @@
+#[doc("""
+The writer half of a derived `BinSerialize`: `put` of a record, of a
+sum, and of each field by its type. The calls both halves build live
+here too.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.derive_mint
+import compiler.core_modules
+import compiler.mutation_carriers
+import compiler.protos_names
+import compiler.protos_heads
+
+#[doc("The name of the derived writer of the type `tname`.")]
+pub fn binser_put_name(tname: String) : String = concat_all([derived_writer_prefix(), tname])
+
+#[doc("A call of the function `name`, by its written name.")]
+pub fn binser_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_name(name, line, col), args), line, col)
+
+#[doc("A call of a function the core module of `BinSerialize` declares.")]
+pub fn binser_lib(name: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(derive_lib_ref(CmProtocols, name, line, col), args), line, col)
+
+# --- field writers / decoders ---------------------------------------
+#
+# A field of a derived type is written by that type's writer; `[T]`,
+# `Option[T]` and `Char` go through the `bin_buf_*` combinators (their
+# heads have no usable single-dispatch impl); anything else appends its
+# `to_bytes`. Decoding mirrors this through
+# `__pimpl_BinSerialize_<Head>_from_bytes` and the `bin_*_from_bytes`
+# combinators, recursing into element types so `[[Int]]` stacks lambdas.
+#
+# The lambda lifter keys each lambda by its `(line, col)` and a derive
+# only has the type's position, so every synthesised lambda gets its own
+# column: 16 per field (callers), 8 per nesting depth, and offsets 1 / 5
+# for writer / decoder lambdas.
+fn derive_binser_put(hs: HeadScope, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+                      line: Int, col: Int) : Expr =
+  derive_binser_put_at(hs, acc, v, ftype, writers, line, col, 0)
+
+fn derive_binser_put_at(hs: HeadScope, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+                         line: Int, col: Int, depth: Int) : Expr {
+  match ftype.tkind {
+    TyList(elem) -> derive_binser_put_via(hs, "bin_buf_put_list", acc, v, elem, writers, line, col, depth)
+    _ -> match binser_option_elem(ftype) {
+      Some(elem) -> derive_binser_put_via(hs, "bin_buf_put_option", acc, v, elem, writers, line, col, depth)
+      None       -> derive_binser_put_leaf(hs, acc, v, ftype, writers, line, col)
+    }
+  }
+}
+
+#[doc("The element of a written `Option[elem]`.")]
+pub fn binser_option_elem(ftype: TypeExpr) : Option[TypeExpr] = match ftype.tkind {
+  TyName(_, [elem]) -> match resolve_ty(ftype) {
+    TyCon(s, _) -> if core_ty_is(s, CtOption) { Some(elem) } else { None }
+    _           -> None
+  }
+  _ -> None
+}
+
+#[doc("What a field dispatches on: its resolved type under any unit or refinement.")]
+pub fn binser_leaf_ty(t: Ty) : Ty = match t {
+  TyDimT(b, _)    -> binser_leaf_ty(b)
+  TyRefineT(b, _) -> binser_leaf_ty(b)
+  _               -> t
+}
+
+# `<comb>(acc, v, (__bw, __bx) => <write __bx of type elem into __bw>)`.
+fn derive_binser_put_via(hs: HeadScope, comb: String, acc: Expr, v: Expr, elem: TypeExpr, writers: [String],
+                          line: Int, col: Int, depth: Int) : Expr {
+  let lcol = col + depth * 8 + 1
+  let bw = Param { binder: binder_written("__bw"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+  let bx = Param { binder: binder_written("__bx"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+  let body = derive_binser_put_at(hs, mk_name("__bw", line, lcol), mk_name("__bx", line, lcol),
+                                  elem, writers, line, col, depth + 1)
+  binser_lib(comb, [acc, v, mk_expr(ELambda([bw, bx], body), line, lcol)], line, col)
+}
+
+# A primitive leaf is written straight into the buffer. Any other head
+# appends its mangled per-type encoder, not the `to_bytes` dispatcher:
+# inside a combinator's lambda the monomorpher does not carry the
+# instantiated type to the dispatcher call.
+fn derive_binser_put_leaf(hs: HeadScope, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+                           line: Int, col: Int) : Expr {
+  let head = head_spell(hs, ftype)
+  if list_has(writers, head) {
+    binser_call(binser_put_name(head), [acc, v], line, col)
+  } else {
+    match binser_prim_writer(binser_leaf_ty(resolve_ty(ftype))) {
+      Some(w) -> binser_lib(w, [acc, v], line, col)
+      None    -> {
+        let enc = proto_mangled_fn("BinSerialize", head, "to_bytes")
+        binser_lib("bin_buf_put", [acc, binser_call(enc, [v], line, col)], line, col)
+      }
+    }
+  }
+}
+
+fn binser_prim_writer(leaf: Ty) : Option[String] = match leaf {
+  TyInt    -> Some("bin_buf_put_int")
+  TyString -> Some("bin_buf_put_string")
+  TyBool   -> Some("bin_buf_put_bool")
+  TyReal   -> Some("bin_buf_put_real")
+  TyChar   -> Some("bin_buf_put_char")
+  _        -> None
+}
+
+#[doc("""
+--- record writer --------------------------------------------------
+
+Each field's writer receives the buffer the previous field's returned.
+""")]
+pub fn derive_binser_put_record(hs: HeadScope, acc: Expr, fields: [FieldDecl], idx: Int, writers: [String],
+                             line: Int, col: Int) : Expr {
+  match fields {
+    [] -> acc
+    [fd, ...rest] -> match fd {
+      FD(_, name, ftype, _) -> {
+        let fcol = col + idx * 16
+        let v = mk_expr(EField(mk_name("self", line, fcol), name), line, fcol)
+        derive_binser_put_record(hs, derive_binser_put(hs, acc, v, ftype, writers, line, fcol),
+                                 rest, idx + 1, writers, line, col)
+      }
+    }
+  }
+}
+
+#[doc("""
+--- sum writer -----------------------------------------------------
+
+`match self { Vk(p0, ..) -> <payload written after bin_buf_byte(buf, k)> }`:
+the variant's declaration index as a one-byte tag, then its payload.
+""")]
+pub fn derive_binser_put_sum(hs: HeadScope, variants: [Variant], writers: [String], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_name("buf", line, col)
+    _  -> mk_expr(EMatch(mk_name("self", line, col),
+                         derive_binser_put_arms(hs, variants, 0, writers, line, col)), line, col)
+  }
+}
+
+fn derive_binser_put_arms(hs: HeadScope, variants: [Variant], idx: Int, writers: [String],
+                           line: Int, col: Int) : [Arm] {
+  match variants {
+    [] -> []
+    [v, ...rest] ->
+      [derive_binser_put_arm(hs, v, idx, writers, line, col),
+       ...derive_binser_put_arms(hs, rest, idx + 1, writers, line, col)]
+  }
+}
+
+# Each variant takes a 256-column window so lambdas in different
+# variants land at distinct positions.
+fn derive_binser_put_arm(hs: HeadScope, v: Variant, idx: Int, writers: [String],
+                          line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat = mk_pat(PVariant(DrSym(vsym), derive_binser_sum_pat_subs(vargs, "p", 0, line, col)),
+                       line, col)
+      let tag = binser_lib("bin_buf_byte", [mk_name("buf", line, col),
+                                             mk_expr(mk_int_synth(idx), line, col)], line, col)
+      Arm(pat, None, derive_binser_put_payload(hs, tag, vargs, 0, writers, line, col + idx * 256))
+    }
+  }
+}
+
+fn derive_binser_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
+                                line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
+       ...derive_binser_sum_pat_subs(rest, prefix, i + 1, line, col)]
+  }
+}
+
+fn derive_binser_put_payload(hs: HeadScope, acc: Expr, vargs: [TypeExpr], i: Int, writers: [String],
+                              line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> acc
+    [vt, ...rest] -> {
+      let fcol = col + i * 16
+      let v = mk_name(concat_all(["p", int_to_string(i)]), line, fcol)
+      derive_binser_put_payload(hs, derive_binser_put(hs, acc, v, vt, writers, line, fcol),
+                                rest, i + 1, writers, line, col)
+    }
+  }
+}

@@ -1,0 +1,338 @@
+#[doc("""
+The derived `Show`, `Eq` and `Hash` impls for records and sums.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.core_protos
+import compiler.util
+import compiler.derive_mint
+import compiler.protos_derived
+
+#[doc("The derived `Show` impl of `dt`.")]
+pub fn derive_show_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let body_expr = derive_show_record_body(opk, dt_name(dt), fields, line, col)
+      make_derived_impl(CpShow, dt, "show",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("String"), []), line, col),
+        body_expr, line, col)
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_show_sum_body(opk, dt.tab, variants, line, col)
+      make_derived_impl(CpShow, dt, "show",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("String"), []), line, col),
+        body_expr, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_show_record_body(opk: ExprKind, tname: String, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  let parts = derive_show_record_parts(opk, tname, fields, line, col)
+  mk_expr(ECall(derive_builtin_ref("string_concat_all", line, col),
+                [mk_expr(EList(map(parts, (e: Expr) => ElPlain(e))), line, col)]),
+          line, col)
+}
+
+fn derive_show_record_parts(opk: ExprKind, tname: String, fields: [FieldDecl], line: Int, col: Int) : [Expr] {
+  let head = mk_expr(EStr(concat_all(["\"", tname, " { \""]), false), line, col)
+  let body_parts = derive_show_field_parts(opk, fields, line, col, true)
+  let tail = mk_expr(EStr("\" }\"", false), line, col)
+  list_append([head, ...body_parts], [tail])
+}
+
+fn derive_show_field_parts(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int, first: Bool) : [Expr] {
+  match fields {
+    [] -> []
+    [fd, ...rest] -> match fd {
+      FD(_, name, _, _) -> {
+        let prefix_s = if first { concat_all(["\"", name, ": \""]) }
+                       else { concat_all(["\", ", name, ": \""]) }
+        let prefix = mk_expr(EStr(prefix_s, false), line, col)
+        let access = mk_expr(EField(mk_name("x", line, col), name), line, col)
+        let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
+        list_append([prefix, call], derive_show_field_parts(opk, rest, line, col, false))
+      }
+    }
+  }
+}
+
+fn derive_show_sum_body(opk: ExprKind, tab: SymTab, variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("x", line, col)
+  let arms = map(variants, (v) => derive_show_sum_arm(opk, tab, v, line, col))
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+fn derive_show_sum_arm(opk: ExprKind, tab: SymTab, v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat_subs = derive_sum_pat_subs(vargs, 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let body = derive_show_sum_arm_body(opk, written_text(sym_name(tab, vsym)), vargs, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_sum_pat_subs(vargs: [TypeExpr], i: Int, line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all(["a", int_to_string(i)]))), line, col),
+       ...derive_sum_pat_subs(rest, i + 1, line, col)]
+  }
+}
+
+fn derive_show_sum_arm_body(opk: ExprKind, name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EStr(concat_all(["\"", name, "\""]), false), line, col)
+    _  -> {
+      let head = mk_expr(EStr(concat_all(["\"", name, "(\""]), false), line, col)
+      let tail = mk_expr(EStr("\")\"", false), line, col)
+      let calls = derive_sum_arg_show_calls(opk, vargs, 0, line, col, true)
+      let parts = list_append([head, ...calls], [tail])
+      mk_expr(ECall(derive_builtin_ref("string_concat_all", line, col),
+                    [mk_expr(EList(map(parts, (e: Expr) => ElPlain(e))), line, col)]),
+              line, col)
+    }
+  }
+}
+
+fn derive_sum_arg_show_calls(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int, col: Int, first: Bool) : [Expr] {
+  match vargs {
+    [] -> []
+    [_, ...rest] -> {
+      let prefix = if first { mk_expr(EStr("\"\"", false), line, col) }
+                   else { mk_expr(EStr("\", \"", false), line, col) }
+      let av = mk_name(concat_all(["a", int_to_string(i)]), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [av]), line, col)
+      list_append([prefix, call], derive_sum_arg_show_calls(opk, rest, i + 1, line, col, false))
+    }
+  }
+}
+
+#[doc("The derived `Eq` impl of `dt`.")]
+pub fn derive_eq_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let body_expr = derive_eq_record_body(opk, fields, line, col)
+      make_derived_impl(CpEq, dt, "eq",
+        [Param { binder: binder_written("a"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false },
+         Param { binder: binder_written("b"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Bool"), []), line, col),
+        body_expr, line, col)
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_eq_sum_body(opk, variants, line, col)
+      make_derived_impl(CpEq, dt, "eq",
+        [Param { binder: binder_written("a"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false },
+         Param { binder: binder_written("b"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Bool"), []), line, col),
+        body_expr, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_eq_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(EBool(true), line, col)
+    [fd, ...rest] -> derive_eq_record_chain(opk, fd, rest, line, col)
+  }
+}
+
+fn derive_eq_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
+  match head {
+    FD(_, name, _, _) -> {
+      let l_access = mk_expr(EField(mk_name("a", line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_name("b", line, col), name), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [l_access, r_access]),
+                         line, col)
+      match rest {
+        [] -> call
+        [next, ...more] -> {
+          let tail_e = derive_eq_record_chain(opk, next, more, line, col)
+          mk_expr(EBinop(BoAnd, call, tail_e), line, col)
+        }
+      }
+    }
+  }
+}
+
+# m12.8.x: `#derive(Eq)` on a sum type. Outer-match on `a`, one arm
+# per variant; each arm rematches `b` for the same variant
+# (returning `eq(la_0, lb_0) and eq(la_1, lb_1) and ...`) with a
+# wildcard arm returning `false`. Empty sums (no variants) are
+# defensive; the parser does not produce them today.
+fn derive_eq_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(EBool(false), line, col)
+    _  -> {
+      let scrut = mk_name("a", line, col)
+      let arms = map(variants, (v) => derive_eq_sum_outer_arm(opk, v, line, col))
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_eq_sum_outer_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat_subs = derive_eq_sum_pat_subs("la_", vargs, 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let inner = derive_eq_sum_inner_match(opk, vsym, vargs, line, col)
+      Arm(pat, None, inner)
+    }
+  }
+}
+
+fn derive_eq_sum_inner_match(opk: ExprKind, vsym: SymId, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+  let scrut = mk_name("b", line, col)
+  let pat_subs = derive_eq_sum_pat_subs("lb_", vargs, 0, line, col)
+  let match_pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+  let body = derive_eq_sum_field_chain(opk, vargs, 0, line, col)
+  let arm_match = Arm(match_pat, None, body)
+  let arm_wild  = Arm(mk_pat(PWild, line, col), None,
+                      mk_expr(EBool(false), line, col))
+  mk_expr(EMatch(scrut, [arm_match, arm_wild]), line, col)
+}
+
+fn derive_eq_sum_pat_subs(prefix: String, vargs: [TypeExpr], i: Int,
+                           line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
+       ...derive_eq_sum_pat_subs(prefix, rest, i + 1, line, col)]
+  }
+}
+
+fn derive_eq_sum_field_chain(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EBool(true), line, col)
+    [_, ...rest] -> {
+      let l = mk_name(concat_all(["la_", int_to_string(i)]), line, col)
+      let r = mk_name(concat_all(["lb_", int_to_string(i)]), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [l, r]), line, col)
+      match rest {
+        [] -> call
+        _  -> {
+          let tail = derive_eq_sum_field_chain(opk, rest, i + 1, line, col)
+          mk_expr(EBinop(BoAnd, call, tail), line, col)
+        }
+      }
+    }
+  }
+}
+
+#[doc("The derived `Hash` impl of `dt`.")]
+pub fn derive_hash_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let body_expr = derive_hash_record_body(opk, fields, line, col)
+      make_derived_impl(CpHash, dt, "hash",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Int"), []), line, col),
+        body_expr, line, col)
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_hash_sum_body(opk, variants, line, col)
+      make_derived_impl(CpHash, dt, "hash",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Int"), []), line, col),
+        body_expr, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_hash_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    [fd, ...rest] -> derive_hash_record_chain(opk, fd, rest, line, col)
+  }
+}
+
+fn derive_hash_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
+  match head {
+    FD(_, name, _, _) -> {
+      let access = mk_expr(EField(mk_name("x", line, col), name), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
+      match rest {
+        [] -> call
+        [next, ...more] -> {
+          let tail_e = derive_hash_record_chain(opk, next, more, line, col)
+          let mul = mk_expr(EBinop(BoMul, call, mk_expr(mk_int_synth(31), line, col)), line, col)
+          mk_expr(EBinop(BoAdd, mul, tail_e), line, col)
+        }
+      }
+    }
+  }
+}
+
+# m12.8.x: `#derive(Hash)` on a sum type. Match on the value, one arm
+# per variant; each arm seeds the running accumulator with the
+# variant's 1-based tag and folds in `hash(field)` using the same
+# `acc * 31 + h` combination the record helper uses, so two values
+# that are eq via the derived Eq hash to the same Int.
+fn derive_hash_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    _  -> {
+      let scrut = mk_name("x", line, col)
+      let arms = derive_hash_sum_arms(opk, variants, 1, line, col)
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_hash_sum_arms(opk: ExprKind, vs: [Variant], tag: Int, line: Int, col: Int) : [Arm] {
+  match vs {
+    [] -> []
+    [v, ...rest] ->
+      [derive_hash_sum_arm(opk, v, tag, line, col),
+       ...derive_hash_sum_arms(opk, rest, tag + 1, line, col)]
+  }
+}
+
+fn derive_hash_sum_arm(opk: ExprKind, v: Variant, tag: Int, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat_subs = derive_eq_sum_pat_subs("h_", vargs, 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let body = derive_hash_sum_arm_body(opk, vargs, tag, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_hash_sum_arm_body(opk: ExprKind, vargs: [TypeExpr], tag: Int, line: Int, col: Int) : Expr {
+  let head = mk_expr(mk_int_synth(tag), line, col)
+  derive_hash_sum_chain(opk, head, vargs, 0, line, col)
+}
+
+fn derive_hash_sum_chain(opk: ExprKind, acc: Expr, vargs: [TypeExpr], i: Int,
+                          line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> acc
+    [_, ...rest] -> {
+      let v = mk_name(concat_all(["h_", int_to_string(i)]), line, col)
+      let h = mk_expr(ECall(mk_expr(opk, line, col), [v]), line, col)
+      let mul = mk_expr(EBinop(BoMul, acc, mk_expr(mk_int_synth(31), line, col)), line, col)
+      let next = mk_expr(EBinop(BoAdd, mul, h), line, col)
+      derive_hash_sum_chain(opk, next, rest, i + 1, line, col)
+    }
+  }
+}

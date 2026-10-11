@@ -1,0 +1,129 @@
+#[doc("""
+Where `Self` sits in an operation's return type, aligned against the
+type a call site expects, so a call can dispatch on its result.
+""")]
+
+import compiler.ast
+import compiler.impl_identity
+import compiler.protos_find_impl
+
+#[doc("""
+Issue #341 Form 1: recover the concrete dispatch head from a
+return-typed op against the inferred return `Ty`. Three cases by how
+many times `Self` occurs in the declared return:
+
+  0 — the op's declared return is a concrete type (`op() : Int` for a
+      `protocol P { op() : Int }` whose impl target is keyed by that
+      head). The dispatch head is the inferred return's head directly,
+      preserving the pre-#341 `ty_head_name(ret_ty)` behaviour.
+  1 — `Self` appears once, possibly NESTED: `default() : Self` reads
+      the inferred head; `from_string(s) : Result[Self, String]` aligns
+      `Result[Self, String]` against `Result[Int, String]` and reads
+      the head at Self's position (`Int`).
+  >1 — a multi-Self return (`(Self, Self)`) has no single dispatch
+      head, so we decline and leave the runtime dispatcher in place.
+
+Returns None when the shapes do not align (the inferred return is
+still a tyvar, or a structural mismatch the unifier would have
+already rejected).
+""")]
+pub fn self_head_in_ret(declared: TypeExpr, inferred: Ty) : Option[DispHead] {
+  let n = te_self_count(declared)
+  if n == 0 { ty_disp_head(inferred) }
+  else if n == 1 { align_self_head(declared, inferred) }
+  else { None }
+}
+
+# Count the `Self` mentions in a declared return TypeExpr. Used to gate
+# `self_head_in_ret` to the single-Self case.
+fn te_self_count(te: TypeExpr) : Int = te_kind_self_count(te.tkind)
+
+fn te_kind_self_count(k: TyKind) : Int {
+  match k {
+    TyName(_, targs) -> te_list_self_count(targs)
+    TyParam(id, targs) ->
+      (if tlocal_is_self(id) { 1 } else { 0 }) + te_list_self_count(targs)
+    TyList(inner) -> te_self_count(inner)
+    TyFn(ps, r, _) -> te_list_self_count(ps) + te_self_count(r)
+    TyDim(base, _) -> te_self_count(base)
+    TyRefine(base, _) -> te_self_count(base)
+    # issue #772: a compound row carries effect labels, never `Self`.
+    TyRow(_) -> 0
+    TySurface(ts) -> te_list_self_count(tysurface_children(ts))
+  }
+}
+
+fn te_list_self_count(tes: [TypeExpr]) : Int = match tes {
+  [] -> 0
+  [t, ...rest] -> te_self_count(t) + te_list_self_count(rest)
+}
+
+# Parallel walk of a declared TypeExpr (carrying `Self`) against the
+# inferred concrete Ty, returning `ty_head_name` of the inferred type
+# at the position the declared shape names `Self`. The two shapes are
+# the same constructor at every step (the typer already unified them),
+# so the walk pairs children positionally and recurses until it lands
+# on the `Self` leaf.
+fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[DispHead] {
+  match declared.tkind {
+    TyName(_, targs) -> align_self_in_args(targs, ty_con_args(inferred))
+    TyParam(id, targs) ->
+      if tlocal_is_self(id) { ty_disp_head(inferred) }
+      else { align_self_in_args(targs, ty_con_args(inferred)) }
+    TyList(inner) -> {
+      match inferred {
+        TyListT(elem) -> align_self_head(inner, elem)
+        _             -> None
+      }
+    }
+    TyDim(base, _)    -> align_self_head(base, ty_strip_dim(inferred))
+    TyRefine(base, _) -> align_self_head(base, ty_strip_refine(inferred))
+    TyFn(_, _, _)     -> None
+    # issue #772: a compound row is never a `Self`-bearing position.
+    TyRow(_)          -> None
+    TySurface(_)      -> panic("align_self_head: surface type not lowered")
+  }
+}
+
+# Walk paired declared/inferred argument lists; the one carrying `Self`
+# (guaranteed unique by the `te_self_count == 1` gate) yields the head.
+fn align_self_in_args(decls: [TypeExpr], infs: [Ty]) : Option[DispHead] {
+  match decls {
+    [] -> None
+    [d, ...drest] -> {
+      match infs {
+        []           -> None
+        [i, ...irest] ->
+          if te_self_count(d) == 1 { align_self_head(d, i) }
+          else { align_self_in_args(drest, irest) }
+      }
+    }
+  }
+}
+
+# The type arguments of a constructor-headed inferred Ty, in the same
+# positional order the declared `TyName(_, targs)` enumerates them.
+# Non-constructor types (a still-unresolved tyvar) yield `[]`, so the
+# paired walk runs dry and the caller declines.
+# `tas` (not `args`): a binding named `args` resolves to the core
+# `args()` CLI-arguments builtin, not the bound pattern variable
+# (the param-shadow trap), silently returning a closure here.
+fn ty_con_args(t: Ty) : [Ty] {
+  match t {
+    TyCon(_, tas)      -> tas
+    TyListT(elem)      -> [elem]
+    TyDimT(base, _)    -> ty_con_args(base)
+    TyRefineT(base, _) -> ty_con_args(base)
+    _                  -> []
+  }
+}
+
+fn ty_strip_dim(t: Ty) : Ty = match t {
+  TyDimT(base, _) -> base
+  _               -> t
+}
+
+fn ty_strip_refine(t: Ty) : Ty = match t {
+  TyRefineT(base, _) -> base
+  _                  -> t
+}
