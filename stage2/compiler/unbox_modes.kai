@@ -1,0 +1,323 @@
+#[doc("""
+What a mode decision reads: the modes of the local binders, which types
+and operators are raw, and which calls and right-hand sides stay raw.
+""")]
+
+import compiler.ast
+import compiler.operators
+import compiler.refinements
+import compiler.fnreg
+import compiler.core_builtins
+import compiler.unbox_native_raw
+import compiler.fn_index
+import compiler.unbox_arm_binders
+
+# True iff an arm body never produces a value — a `panic` / `exit`
+# call (directly, or as the tail of a single-tail block). Such an arm
+# does not constrain the match's result-rawness: it aborts before any
+# `_r` assignment. Conservative: only the bare divergent-core call
+# (or its block-tail) qualifies; anything else must be raw.
+pub fn arm_body_diverges(e: Expr) : Bool = match e.kind {
+  ECall(callee, _) -> match builtin_ref(callee) {
+    Some(b) -> builtin_never_returns(b)
+    None    -> false
+  }
+  EBlock(_, Some(tail)) -> arm_body_diverges(tail)
+  _ -> false
+}
+
+#[doc("""
+Decide whether the callee Expr resolves to a UFn entry. Only a callee
+naming a declaration is considered; anything else (a local, a builtin,
+a lambda) keeps the boxed convention.
+""")]
+pub fn call_resolves_to_ufn(callee: Expr, fns: FnIndex) : Bool = match fnx_callee_sig(fns, callee) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("""
+KIR Lane 1: a call to an in-process libLLVM C-API prim crosses raw
+(a `TyHandle` is a `void *`, never boxed). It is not a UFn (no EFn
+entry), so it must be recognised here too: a raw-core call whose
+result type is unboxable is marked `MUnboxed`, so the `let` binding
+is a raw `void *` / `int64_t` and the next prim receives it raw —
+never via `(...)->as.i` over a boxed cell (which would corrupt the
+pointer). Dead on any program that names no C-API prim.
+""")]
+pub fn call_is_raw_core(callee: Expr, fns: FnIndex) : Bool = match callee.kind {
+  ESym(s, _) -> fnx_is_raw_prim(fns, s)
+  _          -> false
+}
+
+#[doc("""
+The `__fixed_vec_get` intrinsics read one element out of a fixed vec as
+a bare struct field load — always a raw scalar, so they ride MUnboxed.
+""")]
+pub fn call_is_fixed_vec_get(callee: Expr) : Bool {
+  match callee.kind {
+    EMark(MkFixedVecGet)    -> true
+    EMark(MkFixedVecGetDyn) -> true
+    _                       -> false
+  }
+}
+
+#[doc("""
+`LocBind` records the chosen mode for a local binder so its reads
+resolve to the binding's mode. Function parameters and unknown
+binders default to MBoxed (Phase 2 non-goal #1).
+`LBLent` is a boxed binder whose scalar payload a raw operator may read
+without taking the box: a handler clause's op argument or state alias.
+""")]
+pub type LocBind = LB(LocalId, ValueMode) | LBLent(LocalId)
+
+#[doc("The mode of the local `nm`; boxed when it is unbound or lent.")]
+pub fn lb_lookup(env: [LocBind], nm: LocalId) : ValueMode {
+  match env {
+    [] -> MBoxed
+    [LB(n, m), ...rest] -> if local_eq(n, nm) { m } else { lb_lookup(rest, nm) }
+    [LBLent(n), ...rest] -> if local_eq(n, nm) { MBoxed } else { lb_lookup(rest, nm) }
+  }
+}
+
+fn lb_lent(env: [LocBind], nm: LocalId) : Bool {
+  match env {
+    [] -> false
+    [LB(n, _), ...rest] -> if local_eq(n, nm) { false } else { lb_lent(rest, nm) }
+    [LBLent(n), ...rest] -> local_eq(n, nm) or lb_lent(rest, nm)
+  }
+}
+
+#[doc("""
+`ty_is_unboxable` decides whether the runtime representation can
+be a raw C scalar. `Int`, `Bool`, `Char` lower to integral
+(`int64_t` / `int` / `uint32_t`); `Real` lowers to `double` (Tongariki
+Real-unboxing extension). `String` stays boxed (no unboxed form
+exists for length-prefixed bytes). Wrapper types (refinement, dim)
+strip to their inner before checking.
+""")]
+pub fn ty_is_unboxable(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_unboxable_t(t)
+    None    -> false
+  }
+}
+
+pub fn ty_is_integral_raw(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_integral_raw_t(t)
+    None    -> false
+  }
+}
+
+fn ty_is_integral_raw_t(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyBool -> true
+    TyChar -> true
+    TyByte -> true
+    TyInt32  -> true
+    TyUInt32 -> true
+    TyUInt64 -> true
+    TyInt128 -> true
+    TyDimT(inner, _)    -> ty_is_integral_raw_t(inner)
+    TyRefineT(inner, _) -> ty_is_integral_raw_t(inner)
+    _ -> false
+  }
+}
+
+# Numeric binops whose raw form is a single C operator on `int64_t`.
+# `^` (integer power) is not a native C operator, so it stays boxed
+# for now and routes through `kai_op_pow_int` (M3 v1 conservative;
+# follow-up if hot). Integer division on `Int / Int` lowers to native
+# C `/` directly (issue #315 retired the dedicated `//` operator).
+pub fn op_is_raw_arith(op: BinOp) : Bool = binop_is_arith(op)
+
+# Tier 2.5 M4 — comparison operators that produce a raw `int`
+# (0 or 1) from two raw operands. Equality / inequality on raw
+# `int64_t` reduce to native C `==` / `!=`.
+pub fn op_is_raw_cmp(op: BinOp) : Bool = binop_is_comparison(op)
+
+# Tier 2.5 M4 — short-circuiting boolean operators. `and` / `or`
+# in kaikai mirror C `&&` / `||` (short-circuit, evaluate left
+# first).
+pub fn op_is_raw_logical(op: BinOp) : Bool = binop_is_logical(op)
+
+#[doc("""
+Can the RHS of an `and`/`or` be evaluated unconditionally? Marking the
+node raw materialises BOTH operands: the C backend still emits `&&`, but
+the native backend emits `LLVMBuildAnd`, which is strict — so `f != 0 and
+n % f == 0` divides by zero on the very path the short-circuit exists to
+protect. Raw is only sound when the RHS cannot fault.
+Deliberately conservative: anything not obviously total stays boxed and
+keeps its branch.
+""")]
+pub fn rhs_is_trap_free(x: Expr) : Bool = match x.kind {
+  EInt(_, _)         -> true
+  EReal(_, _)        -> true
+  EFixed(_, _)       -> true
+  EChar(_)           -> true
+  ELocal(_)          -> true
+  ESym(_, _)         -> true
+  ELitUnit(inner, _) -> rhs_is_trap_free(inner)
+  # `/` and `%` trap on a zero divisor unless the divisor is a nonzero
+  # literal; the other raw binops over raw operands are total.
+  EBinop(op, a, b)   ->
+    rhs_is_trap_free(a) and rhs_is_trap_free(b) and
+    (if binop_is_division(op) { is_nonzero_literal(b) } else { true })
+  EUnop(_, a)        -> rhs_is_trap_free(a)
+  _                  -> false
+}
+
+fn is_nonzero_literal(x: Expr) : Bool = match x.kind {
+  EInt(n, _)  -> n != 0
+  EReal(r, _) -> r != 0.0
+  _           -> false
+}
+
+pub fn raw_op_str(op: BinOp) : String = match op {
+  BoAnd -> "&&"
+  BoOr  -> "||"
+  _     -> binop_text(op)
+}
+
+#[doc("True when the node was given the unboxed mode.")]
+pub fn child_is_raw(e: Expr) : Bool {
+  match e.mode { MUnboxed -> true _ -> false }
+}
+
+#[doc("""
+A raw operator may also take a perform of a scalar op: its owned boxed
+result crosses into the operator through the box->raw border, which
+releases the box. A lent binder's read borrows its payload.
+""")]
+pub fn child_is_raw_operand(e: Expr, env: [LocBind], fns: FnIndex) : Bool =
+  child_is_raw(e) or (ty_is_unboxable(e.ty) and (expr_is_perform(e, fns) or expr_is_lent(e, env)))
+
+fn expr_is_lent(e: Expr, env: [LocBind]) : Bool = match e.kind {
+  ELocal(l) -> lb_lent(env, l)
+  _         -> false
+}
+
+fn expr_is_perform(e: Expr, fns: FnIndex) : Bool = match e.kind {
+  ECall(callee, _) -> match callee.kind {
+    EOp(r) -> fnx_is_effect(fns, r.eff)
+    _      -> false
+  }
+  _ -> false
+}
+
+#[doc("""
+The pow-unroll has no per-op width wrap, so every fixed-width integer
+(Byte/Int32/UInt32/UInt64/Int128) must stay boxed for `^` — the unroll
+would skip the width masking `+`/`-`/`*` apply at each op.
+""")]
+pub fn ty_is_fixed_width_opt(opt_t: Option[Ty]) : Bool {
+  match opt_t {
+    Some(t) -> ty_is_fixed_width_t(t)
+    None    -> false
+  }
+}
+
+fn ty_is_fixed_width_t(t: Ty) : Bool = match t {
+  TyByte -> true    TyInt32 -> true   TyUInt32 -> true
+  TyUInt64 -> true  TyInt128 -> true
+  TyRefineT(inner, _) -> ty_is_fixed_width_t(inner)
+  _ -> false
+}
+
+#[doc("""
+Int128 specifically — its `/`/`%` route boxed (no i128 checked-div helper),
+unlike the narrower widths whose div widens into the i64/u64 helper.
+""")]
+pub fn ty_is_int128_opt(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(TyInt128) -> true
+  Some(TyRefineT(inner, _)) -> match inner { TyInt128 -> true _ -> false }
+  _ -> false
+}
+
+#[doc("""
+issue #779 — a multi-statement block is safe to lower with a raw tail
+only when every interleaved statement is RC-only: a `SLet` (its binding
+carries its own RC discipline — the emitter drops unused bindings and
+threads dup/drops) or a `SExprStmt` (a value-producing statement whose
+result is decref'd in place, including the Perceus `__perceus_drop`
+exit drops of the `__pcs_ret` wrap). The block's VALUE is the tail
+alone, so these statements never contribute to it; making the tail raw
+moves no drop. `SAssert` and the dead `SVar` / `SUse` / `SIndexAssign`
+forms (which should have desugared away) keep the block boxed —
+conservative, correctness over the optimisation.
+""")]
+pub fn block_stmts_rc_safe(stmts: [Stmt]) : Bool = match stmts {
+  [] -> true
+  [s, ...rest] -> match s {
+    SLet(_, _, _) -> block_stmts_rc_safe(rest)
+    SExprStmt(_)  -> block_stmts_rc_safe(rest)
+    _             -> false
+  }
+}
+
+#[doc("""
+Issue #90 — `^` raw-inline gate. The C / LLVM emitters unroll
+`b ^ n` into `n` repeated multiplications when `n` is a small
+compile-time-known non-negative Int. Larger or non-literal `n`
+would require a runtime loop (statement-expression in C, basic
+blocks in LLVM); v1 keeps those boxed. The unbox pass excludes
+function calls from raw operands, so the base `b` is pure and
+safe to duplicate `n` times in the emitted code without
+observable side effects.
+
+Bound at 64: an int64 base raised to an exponent above 63 is
+guaranteed to overflow except for trivial bases (0, 1, -1), and
+64 multiplications keep the emitted expression well under the
+size threshold the C compiler / LLVM optimizer handles cheaply.
+""")]
+pub fn pow_exp_is_inlinable(e: Expr) : Bool {
+  match try_eval_int(e) {
+    Some(n) -> n >= 0 and n <= 64
+    None    -> false
+  }
+}
+
+#[doc("""
+Seed MUnboxed for every sub-PBind of `ctor` that binds a kind-1 Int
+slot (per `cis`) and is safe to read raw in `body` (no interp / lambda
+use). Recurses into nested PVariant sub-patterns. Slot order matches
+the ctor's payload order, so the i-th sub-pattern reads the i-th flag.
+""")]
+pub fn seed_variant_int_binders(ctor: DeclRef, subs: [Pattern], body: Expr,
+                            cis: [CtorIntSlots], nat: Bool, env: [LocBind], fns: FnIndex) : [LocBind] / Console =
+  seed_variant_int_loop(subs, ctor_int_flags(cis, ref_sym(ctor)), 0, body, cis, nat, env, fns)
+
+fn seed_variant_int_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr,
+                         cis: [CtorIntSlots], nat: Bool, env: [LocBind], fns: FnIndex) : [LocBind] / Console {
+  match subs {
+    [] -> env
+    [sp, ...rest] -> {
+      let slot_is_int = match list_nth_bool(flags, i) { Some(b) -> b None -> false }
+      let env1 = match sp.pkind {
+        PBind(nm) ->
+          # The C oracle's mode-slave border is TOTAL, so it seeds a kind-1
+          # Int binder MUnboxed whenever it is not read via interp / a lambda
+          # capture. The NATIVE load-border is NOT total: it re-boxes a raw
+          # register only where a value flows through `nemit_load_reg_boxed`,
+          # not at every tagged consumer. So under `nat` the binder is raw
+          # ONLY in the shapes the native lowers raw-safe — a raw-op operand
+          # or a same-ctor reuse-in-place slot (`native_arm_binder_raw_safe`).
+          # This is the SINGLE rawness verdict: it governs the mode here, and
+          # `bind_slot_kslot` reads that mode for the KSlot, so mode and KSlot
+          # can never diverge (#1110).
+          {
+            let boxed_free = slot_is_int and not expr_captures(body, nm)
+            let native_ok = not nat or native_arm_binder_raw_safe(nm.id, body, cis, fns)
+            if boxed_free and native_ok { [LB(nm.id, MUnboxed), ...env] } else { env }
+          }
+        # Nested variant: its own sub-PBind binders may read kind-1 slots.
+        PVariant(inner_ctor, inner_subs) ->
+          seed_variant_int_binders(inner_ctor, inner_subs, body, cis, nat, env, fns)
+        _ -> env
+      }
+      seed_variant_int_loop(rest, flags, i + 1, body, cis, nat, env1, fns)
+    }
+  }
+}
