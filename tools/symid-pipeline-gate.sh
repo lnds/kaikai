@@ -57,10 +57,10 @@ need '^kperform spoken Loud\.say#[0-9]+ Loud@main$'
 # A capability passed as a value carries the same identity: the parameter's
 # annotation is a `TyCon` naming the effect, so the op dispatched against
 # that binder's evidence node must name the declaration the others do.
-need '^kperform through_cap Loud\.say#l#[0-9]+ Loud@main$'
+need '^kperform through_cap Loud\.say#l_[0-9]+#[0-9]+ Loud@main$'
 # A named instance used inside its handle body dispatches against that
 # handle's evidence node and names the effect its head resolved to.
-need '^kperform named Loud\.say#n#[0-9]+ Loud@main$'
+need '^kperform named Loud\.say#n_[0-9]+#[0-9]+ Loud@main$'
 
 # Every way of writing the op names one declaration: on the row alias, on
 # the effect, through a capability parameter, and through a named instance.
@@ -387,14 +387,14 @@ cell_core() {
   return 0
 }
 out=$(cell_dump cell_perform_ids)
-need '^kperform _kaiu_stacked__clause_[0-9_]+_push State\.[a-z]+@xs#[0-9]+ State@concurrent$'
-need '^kperform reads Reader\.ask@env#[0-9]+ Reader@concurrent$'
-need '^kperform _kaiu_lam_reads_[0-9_]+ Reader\.ask@env#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
+need '^kperform reads Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_lam_reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
 cell_core cell_perform_ids
 out=$(cell_dump cell_perform_ids_stdlib)
-need '^kperform _kaiu_lam_captured_[0-9_]+ State\.[a-z]+(@c)?#[0-9]+ State@concurrent$'
-need '^kperform stream__count State\.[a-z]+(@[a-z_]+)?#[0-9]+ State@concurrent$'
-need '^kperform math__bigint_limbs__mag_mul State\.[a-z]+(@[a-z_]+)?#[0-9]+ State@concurrent$'
+need '^kperform _kaiu_lam_captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
+need '^kperform stream__count State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
+need '^kperform math__bigint_limbs__mag_mul State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
 cell_core cell_perform_ids_stdlib
 out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
   | grep -v /negative/ \
