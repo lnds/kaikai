@@ -1,0 +1,298 @@
+#[doc("""
+Substitution of a spec's type and unit arguments through types, rows,
+units and bodies, and whether a type is concrete.
+""")]
+
+import compiler.ast
+import compiler.infer
+import compiler.monomorph_map
+
+#[doc("The type-parameter ids a substitution binds.")]
+pub fn subst_map_tvar_ids(sm: SubstMap) : [Int] =
+  match sm { SM(tvars, _) -> stp_ids(tvars, []) }
+
+fn stp_ids(ps: [SubstPairTy], acc: [Int]) : [Int] {
+  match ps {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      STP(i, _) -> stp_ids(rest, [i, ...acc])
+    }
+  }
+}
+
+#[doc("The unit-parameter ids a substitution binds.")]
+pub fn subst_map_uvar_ids(sm: SubstMap) : [Int] =
+  match sm { SM(_, uvars) -> sup_ids(uvars, []) }
+
+fn sup_ids(ps: [SubstPairUnit], acc: [Int]) : [Int] {
+  match ps {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> match h {
+      SUP(i, _) -> sup_ids(rest, [i, ...acc])
+    }
+  }
+}
+
+#[doc("A type with its refinements stripped.")]
+pub fn ty_unrefined(t: Ty) : Ty = match t {
+  TyRefineT(base, _) -> ty_unrefined(base)
+  _                  -> t
+}
+
+#[doc("True when no type of the list holds a type or unit variable.")]
+pub fn tuple_concrete(tys: [Ty]) : Bool {
+  match tys {
+    [] -> true
+    [t, ...rest] -> if ty_concrete(t) { tuple_concrete(rest) } else { false }
+  }
+}
+
+#[doc("True when a type holds no type or unit variable.")]
+pub fn ty_concrete(t: Ty) : Bool {
+  match t {
+    TyVarT(_) -> false
+    TyListT(inner) -> ty_concrete(inner)
+    TyFnT(ps, r, _) -> tuple_concrete(ps) and ty_concrete(r)
+    TyCon(_, tas) -> tuple_concrete(tas)
+    TyDimT(b, u) -> ty_concrete(b) and unit_concrete(u)
+    TyRefineT(b, _) -> ty_concrete(b)
+    # issue #187 phase 1: a union is concrete iff every component
+    # is — same rule as TyCon's tuple. Lets the monomorphisation
+    # pipeline classify a union'd return type the same way it
+    # classifies a record return.
+    TyUnion(parts) -> tuple_concrete(parts)
+    _ -> true   # primitive types and TyAny are concrete
+  }
+}
+
+#[doc("True when no unit of the list holds a unit variable.")]
+pub fn units_concrete(us: [UnitExprT]) : Bool {
+  match us {
+    [] -> true
+    [u, ...rest] -> if unit_concrete(u) { units_concrete(rest) } else { false }
+  }
+}
+
+fn unit_concrete(u: UnitExprT) : Bool {
+  let cu = unit_canon(u)
+  match cu {
+    UVar(_)    -> false
+    UOne       -> true
+    USym(_)    -> true
+    UParam(_)  -> true
+    UMul(a, b) -> unit_concrete(a) and unit_concrete(b)
+    UInv(a)    -> unit_concrete(a)
+    UPow(a, _) -> unit_concrete(a)
+    UJoin(a, b) -> unit_concrete(a) and unit_concrete(b)
+    UDims(us)  -> units_concrete(us)
+  }
+}
+
+#[doc("""
+---- m4c Phase 3 — body type / unit substitution ----
+
+A SubstMap binds the original DFn's tparam ids to the concrete
+tys and units selected for one specialisation. `tvars` lists
+`(TyVarT id, Ty)` pairs; `uvars` lists `(UVar id, UnitExprT)`
+pairs. Both ids come from `tparam_id_split(effective_tparams)`,
+which is the same allocation order the inferencer used to type
+the body (so a body's `TyVarT(0)` is the first tvar tparam, etc.).
+""")]
+pub type SubstPairTy = STP(Int, Ty)
+#[doc("A unit-parameter id and the unit it is bound to.")]
+pub type SubstPairUnit = SUP(Int, UnitExprT)
+#[doc("The types and units one specialisation binds its declaration's parameters to.")]
+pub type SubstMap = SM([SubstPairTy], [SubstPairUnit])
+
+#[doc("A substitution binding nothing.")]
+pub fn subst_map_empty() : SubstMap = SM([], [])
+
+fn subst_map_lookup_ty(sm: SubstMap, id: Int) : Option[Ty] {
+  match sm { SM(tvars, _) -> subst_pairs_lookup_ty(tvars, id) }
+}
+
+#[doc("The type bound to the id `id`.")]
+pub fn subst_pairs_lookup_ty(ps: [SubstPairTy], id: Int) : Option[Ty] {
+  match ps {
+    [] -> None
+    [h, ...rest] -> match h {
+      STP(i, t) -> if i == id { Some(t) } else { subst_pairs_lookup_ty(rest, id) }
+    }
+  }
+}
+
+fn subst_map_lookup_unit(sm: SubstMap, id: Int) : Option[UnitExprT] {
+  match sm { SM(_, uvars) -> subst_pairs_lookup_unit(uvars, id) }
+}
+
+#[doc("The unit bound to the id `id`.")]
+pub fn subst_pairs_lookup_unit(ps: [SubstPairUnit], id: Int) : Option[UnitExprT] {
+  match ps {
+    [] -> None
+    [h, ...rest] -> match h {
+      SUP(i, u) -> if i == id { Some(u) } else { subst_pairs_lookup_unit(rest, id) }
+    }
+  }
+}
+
+#[doc("""
+Build the SubstMap for a DFn given a concrete `(tys, units)` tuple.
+Numbers the same parameters the inferencer did, so the id allocation in
+`tparam_id_split` agrees with the body's `TyVarT` / `UVar` ids.
+""")]
+pub fn build_subst_map(d: Decl, tys: [Ty], units: [UnitExprT]) : SubstMap {
+  match d {
+    DFn(_, _, tparams, _, _, _, _, _, _, _) -> {
+      let split = tparam_id_split(tparams)
+      SM(zip_int_ty(split.tvars, tys),
+         zip_int_unit(split.uvars, units))
+    }
+    _ -> subst_map_empty()
+  }
+}
+
+fn zip_int_ty(ids: [Int], tys: [Ty]) : [SubstPairTy] {
+  match ids {
+    [] -> []
+    [i, ...irest] -> match tys {
+      [] -> []
+      [t, ...trest] -> [STP(i, t), ...zip_int_ty(irest, trest)]
+    }
+  }
+}
+
+fn zip_int_unit(ids: [Int], us: [UnitExprT]) : [SubstPairUnit] {
+  match ids {
+    [] -> []
+    [i, ...irest] -> match us {
+      [] -> []
+      [u, ...urest] -> [SUP(i, u), ...zip_int_unit(irest, urest)]
+    }
+  }
+}
+
+#[doc("""
+Walker `subst_ty(t, sm)` — exhaustive over every Ty constructor.
+`TyVarT(id)` substitutes via `sm.tvars`; `TyDimT(base, u)` recurses
+into the base AND substitutes the unit (which may be a UVar matching
+`sm.uvars`). Adding a new Ty variant fails compilation here rather
+than slipping through.
+""")]
+pub fn subst_ty(t: Ty, sm: SubstMap) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyChar   -> t
+    TyString -> t
+    TyUnit   -> t
+    TyByte     -> t
+    TyInt32    -> t
+    TyUInt32   -> t
+    TyUInt64   -> t
+    TyInt128   -> t
+    TyHandle   -> t
+    TyAny    -> t
+    TyVarT(n) -> match subst_map_lookup_ty(sm, n) {
+      Some(t2) -> t2
+      None     -> t
+    }
+    TyListT(inner) -> TyListT(subst_ty(inner, sm))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => subst_ty(p, sm)),
+                                  subst_ty(ret, sm), subst_row(row, sm))
+    TyCon(sid, tas) -> TyCon(sid, map(tas, (a) => subst_ty(a, sm)))
+    # a shape var resolved at this specialisation reconstructs the
+    # concrete applied type; unresolved, only the argument is walked.
+    TyShapeApp(sv, arg) -> match subst_map_lookup_ty(sm, sv) {
+      Some(wit) -> shape_reapply(subst_ty(wit, sm), subst_ty(arg, sm))
+      None      -> TyShapeApp(sv, subst_ty(arg, sm))
+    }
+    # A `Dim` habitant written as a variable (`Vec[Real]<n>` in a
+    # polymorphic signature) instantiates to a DYNAMIC vec, not a fixed
+    # one: the callee's body detaches and treats it as `Vec[Real]`. Only
+    # a habitant written as a literal (`<3>`) keeps the fixed inline
+    # layout. So a `UVar` habitant erases its brand once instantiated;
+    # every other unit substitutes and re-collapses as before.
+    TyDimT(base, u) -> match u {
+      UVar(_) -> if ty_vec_headed(base) { subst_ty(base, sm) }
+                 else { dim_collapse(subst_ty(base, sm), unit_canon(subst_unit(u, sm))) }
+      _       -> dim_collapse(subst_ty(base, sm), unit_canon(subst_unit(u, sm)))
+    }
+    # issue #187 phase 1: same shape as `apply_ty` — substitute
+    # inside each component and re-normalise.
+    TyUnion(parts) -> normalize_union(map(parts, (p) => subst_ty(p, sm)))
+    TyRefineT(base, p) -> TyRefineT(subst_ty(base, sm), p)
+  }
+}
+
+# Subst through a Row's effect-label `ty_args` (which carry resolved
+# Ty per parametric effect — `State[T]`, `Reader[T]`, ...). Tails
+# (row vars) live in their own namespace and pass through unchanged.
+fn subst_row(r: Row, sm: SubstMap) : Row {
+  Row {
+    labels: map(r.labels, (l) => subst_label(l, sm)),
+    tail: r.tail,
+    display_alias: r.display_alias
+  }
+}
+
+fn subst_label(l: Label, sm: SubstMap) : Label =
+  Label { ...l, ty_args: map(l.ty_args, (a) => subst_ty(a, sm)) }
+
+#[doc("""
+Walker `subst_unit(u, sm)` — recurses through every UnitExprT
+constructor. `UVar(id)` substitutes via `sm.uvars` (canonicalised
+at TyDimT level via `dim_collapse` above).
+""")]
+pub fn subst_unit(u: UnitExprT, sm: SubstMap) : UnitExprT {
+  match u {
+    UOne        -> u
+    USym(_)     -> u
+    UParam(_)   -> u
+    UVar(n)     -> match subst_map_lookup_unit(sm, n) {
+      Some(u2) -> u2
+      None     -> u
+    }
+    UMul(a, b)  -> UMul(subst_unit(a, sm), subst_unit(b, sm))
+    UInv(a)     -> UInv(subst_unit(a, sm))
+    UPow(a, n)  -> UPow(subst_unit(a, sm), n)
+    UJoin(a, b) -> UJoin(subst_unit(a, sm), subst_unit(b, sm))
+    UDims(us)   -> UDims(subst_units(us, sm))
+  }
+}
+
+fn subst_units(us: [UnitExprT], sm: SubstMap) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [subst_unit(u, sm), ...subst_units(rest, sm)]
+}
+
+# Walker `subst_expr(e, sm)` rewrites every `Expr.ty` via subst_ty
+# and recurses through mono_map_expr_kind. No name rewriting happens here
+# — call-site rewrite is a separate walker that runs post-subst.
+fn subst_expr(e: Expr, sm: SubstMap) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(subst_ty(t, sm))
+    None    -> None
+  }
+  Expr { kind: subst_kind(e.kind, sm), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode,  site: e.site }
+}
+
+fn subst_kind(k: ExprKind, sm: SubstMap) : ExprKind {
+  mono_map_expr_kind(k, (sub) => subst_expr(sub, sm))
+}
+
+#[doc("A declaration with the substitution applied to its body.")]
+pub fn subst_decl(d: Decl, sm: SubstMap) : Decl {
+  match d {
+    DFn(is_pub, fid, tps, ps, ret, row, body, ln, cl, mo) ->
+      DFn(is_pub, fid, tps, ps, ret, row, subst_expr(body, sm), ln, cl, mo)
+    DTest(desc, body, ln, cl, mo) ->
+      DTest(desc, subst_expr(body, sm), ln, cl, mo)
+    DBench(desc, body, ln, cl, mo) ->
+      DBench(desc, subst_expr(body, sm), ln, cl, mo)
+    DCheck(desc, ps, body, ln, cl, mo) ->
+      DCheck(desc, ps, subst_expr(body, sm), ln, cl, mo)
+    _ -> d
+  }
+}

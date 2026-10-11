@@ -1,0 +1,277 @@
+#[doc("""
+The walk over a spec body that finds the specialisations its calls need.
+""")]
+
+import compiler.ast
+import compiler.inst_index
+import compiler.monomorph_subst
+import compiler.monomorph_polys
+import compiler.monomorph_tuples
+import compiler.monomorph_insts
+
+# Pre-mono pass: walk every decl looking for calls to a generic whose
+# tuple isn't in the typer's `tp.insts` (an impl function a dispatcher
+# call was retargeted to) and synthesise the per-call tuple via
+# `synthesize_inst_for_decl`. With no SubstMap the resolver returns
+# the actual call-site tuple; only concrete tuples enter the spec
+# worklist. This is what gives `print("...#{x}...#{y}...")` distinct
+# specialisations of `show` even though the interpolation desugar
+# collapses every show callee onto the enclosing print's source position.
+#[doc("The specialisations the impl-side calls of `ds` need that `existing` does not hold.")]
+pub fn collect_impl_tuples_in_decls(ds: [Decl], polys: PolyIx,
+                                 existing: TupleSet) : [MonoTuple] {
+  let r = collect_impl_tuples_in_decls_loop(ds, polys, existing, [])
+  list_reverse(r)
+}
+
+fn collect_impl_tuples_in_decls_loop(ds: [Decl], polys: PolyIx,
+                                      existing: TupleSet,
+                                      acc: [MonoTuple]) : [MonoTuple] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DFn(_, _, _, _, _, _, body, _, _, _) ->
+          discover_new_tuples_expr(body, iix_empty(), polys, existing, subst_map_empty(), acc)
+        DTest(_, body, _, _, _) ->
+          discover_new_tuples_expr(body, iix_empty(), polys, existing, subst_map_empty(), acc)
+        DBench(_, body, _, _, _) ->
+          discover_new_tuples_expr(body, iix_empty(), polys, existing, subst_map_empty(), acc)
+        DCheck(_, _, body, _, _, _) ->
+          discover_new_tuples_expr(body, iix_empty(), polys, existing, subst_map_empty(), acc)
+        _ -> acc
+      }
+      collect_impl_tuples_in_decls_loop(rest, polys, existing, acc1)
+    }
+  }
+}
+
+#[doc("""
+Walk a decl's body collecting concrete poly tuples introduced by
+applying `sm` to each call site's recorded `(tys, units)`.
+""")]
+pub fn discover_new_tuples_decl(d: Decl, insts: InstIndex, polys: PolyIx,
+                             existing: TupleSet, sm: SubstMap) : [MonoTuple] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    DTest(_, body, _, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    DBench(_, body, _, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    DCheck(_, _, body, _, _, _) ->
+      list_reverse(discover_new_tuples_expr(body, insts, polys, existing, sm, []))
+    _ -> []
+  }
+}
+
+fn discover_new_tuples_expr(e: Expr, insts: InstIndex, polys: PolyIx,
+                             existing: TupleSet, sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc)
+  match e.kind {
+    ECall(callee, args_) -> match lookup_poly_fn_at(polys, callee) {
+      Some(d) -> discover_call_tuple(d, callee, args_, e.ty, insts, polys, existing, sm, acc1)
+      None    -> acc1
+    }
+    _ -> acc1
+  }
+}
+
+# The tuple a call to the generic `d` instantiates, when it is concrete
+# and not known yet.
+fn discover_call_tuple(d: Decl, callee: Expr, args_: [Expr],
+                        ret_ty: Option[Ty], insts: InstIndex, polys: PolyIx,
+                        existing: TupleSet, sm: SubstMap,
+                        acc1: [MonoTuple]) : [MonoTuple] =
+  match resolve_call_inst(insts, polys, d, callee, args_, ret_ty, sm) {
+    Some(MIPair(tys, units)) -> {
+      let any_slot = list_length(tys) > 0 or list_length(units) > 0
+      let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
+      let mt = MT(poly_decl_sym(d), tys, units)
+      let is_new = concrete and not ts_mem(existing, mt) and not mt_in_acc(acc1, mt)
+      if is_new { [mt, ...acc1] } else { acc1 }
+    }
+    None -> acc1
+  }
+
+fn mt_in_acc(acc: [MonoTuple], t: MonoTuple) : Bool {
+  match acc {
+    [] -> false
+    [h, ...rest] -> if tuple_eq(h, t) { true } else { mt_in_acc(rest, t) }
+  }
+}
+
+# Recurse through every direct sub-Expr inside an ExprKind so the
+# discovery walker can find calls in nested positions. Uses
+# mono_map_expr_kind shape but with a fold accumulator.
+fn discover_new_tuples_kind(k: ExprKind, insts: InstIndex, polys: PolyIx,
+                             existing: TupleSet, sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  match k {
+    EInt(_, _)        -> acc
+    EReal(_, _)       -> acc
+    EIntLit(_)        -> acc
+    EDecimalLit(_)    -> acc
+    EFixed(_, _)      -> acc
+    EBool(_)       -> acc
+    EChar(_)       -> acc
+    EStr(_, _)     -> acc
+    EUnit          -> acc
+    EName(_)        -> acc
+    EMark(_)        -> acc
+    ESym(_, _)      -> acc
+    ELocal(_)       -> acc
+    EOp(_)          -> acc
+    EUnder         -> acc
+    EPlaceholder   -> acc
+    EHole(_)       -> acc
+    ETodo(_)       -> acc
+    EExternBody(_, _) -> acc
+    EVariantsOf(_, _) -> acc
+    EModCall(_, _) -> acc
+    EIntrinsic(_, args_) -> discover_new_tuples_args(args_, insts, polys, existing, sm, acc)
+    ESurface(sf) -> discover_new_tuples_args(surface_children(sf), insts, polys, existing, sm, acc)
+    ECall(callee, args_) -> {
+      let acc1 = discover_new_tuples_expr(callee, insts, polys, existing, sm, acc)
+      discover_new_tuples_args(args_, insts, polys, existing, sm, acc1)
+    }
+    EField(base, _)   -> discover_new_tuples_expr(base, insts, polys, existing, sm, acc)
+    EIndex(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EBinop(_, a, b)   -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                          discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EUnop(_, x)       -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+    EIf(c, t_, eo)    -> {
+      let a1 = discover_new_tuples_expr(c, insts, polys, existing, sm, acc)
+      let a2 = discover_new_tuples_expr(t_, insts, polys, existing, sm, a1)
+      match eo { Some(eb) -> discover_new_tuples_expr(eb, insts, polys, existing, sm, a2) None -> a2 }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = discover_new_tuples_expr(scr, insts, polys, existing, sm, acc)
+      discover_new_tuples_arms(arms, insts, polys, existing, sm, a1)
+    }
+    ELambda(_, b)     -> discover_new_tuples_expr(b, insts, polys, existing, sm, acc)
+    ERecordLit(_, fs) -> discover_new_tuples_fields(fs, insts, polys, existing, sm, acc)
+    EList(els)        -> discover_new_tuples_elems(els, insts, polys, existing, sm, acc)
+    ERange(a, b, opt_step) -> {
+      let a1 = discover_new_tuples_expr(a, insts, polys, existing, sm, acc)
+      let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1)
+      match opt_step { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a2) None -> a2 }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = discover_new_tuples_stmts(stmts, insts, polys, existing, sm, acc)
+      match tail { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
+    }
+    EPipe(a, b)      -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EMapPipe(a, b)   -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                         discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EFlatMapPipe(a, b) -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                            discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EFilterPipe(a, b) -> discover_new_tuples_expr(b, insts, polys, existing, sm,
+                           discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = discover_new_tuples_expr(body, insts, polys, existing, sm, acc)
+      let a2 = match init_opt { Some(e3) -> discover_new_tuples_expr(e3, insts, polys, existing, sm, a1) None -> a1 }
+      let a3 = discover_new_tuples_clauses(clauses, insts, polys, existing, sm, a2)
+      match ret_opt { Some(r) -> match r { HR(_, b, _, _) -> discover_new_tuples_expr(b, insts, polys, existing, sm, a3) } None -> a3 }
+    }
+    ELitUnit(inner, _) -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc)
+    EBang(inner)       -> discover_new_tuples_expr(inner, insts, polys, existing, sm, acc)
+  }
+}
+
+fn discover_new_tuples_args(args: [Expr], insts: InstIndex, polys: PolyIx,
+                             existing: TupleSet, sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  match args {
+    [] -> acc
+    [a, ...rest] -> discover_new_tuples_args(rest, insts, polys, existing, sm,
+                      discover_new_tuples_expr(a, insts, polys, existing, sm, acc))
+  }
+}
+
+fn discover_new_tuples_arms(arms: [Arm], insts: InstIndex, polys: PolyIx,
+                             existing: TupleSet, sm: SubstMap,
+                             acc: [MonoTuple]) : [MonoTuple] {
+  match arms {
+    [] -> acc
+    [arm, ...rest] -> match arm {
+      Arm(_, g, b) -> {
+        let a1 = match g { Some(ge) -> discover_new_tuples_expr(ge, insts, polys, existing, sm, acc) None -> acc }
+        let a2 = discover_new_tuples_expr(b, insts, polys, existing, sm, a1)
+        discover_new_tuples_arms(rest, insts, polys, existing, sm, a2)
+      }
+    }
+  }
+}
+
+fn discover_new_tuples_fields(fs: [FieldInit], insts: InstIndex, polys: PolyIx,
+                               existing: TupleSet, sm: SubstMap,
+                               acc: [MonoTuple]) : [MonoTuple] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, v) -> discover_new_tuples_fields(rest, insts, polys, existing, sm,
+                    discover_new_tuples_expr(v, insts, polys, existing, sm, acc))
+    }
+  }
+}
+
+fn discover_new_tuples_elems(els: [ListElem], insts: InstIndex, polys: PolyIx,
+                              existing: TupleSet, sm: SubstMap,
+                              acc: [MonoTuple]) : [MonoTuple] {
+  match els {
+    [] -> acc
+    [el, ...rest] -> {
+      let acc1 = match el {
+        ElPlain(x)  -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+        ElSpread(x) -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+      }
+      discover_new_tuples_elems(rest, insts, polys, existing, sm, acc1)
+    }
+  }
+}
+
+fn discover_new_tuples_stmts(stmts: [Stmt], insts: InstIndex, polys: PolyIx,
+                              existing: TupleSet, sm: SubstMap,
+                              acc: [MonoTuple]) : [MonoTuple] {
+  match stmts {
+    [] -> acc
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(_, _, rhs)            -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc)
+        SAssert(c, m)              -> match m { Some(me) -> discover_new_tuples_expr(me, insts, polys, existing, sm, discover_new_tuples_expr(c, insts, polys, existing, sm, acc)) None -> discover_new_tuples_expr(c, insts, polys, existing, sm, acc) }
+        SExprStmt(x)               -> discover_new_tuples_expr(x, insts, polys, existing, sm, acc)
+        SIndexAssign(b, i, v, _, _)-> discover_new_tuples_expr(v, insts, polys, existing, sm,
+                                        discover_new_tuples_expr(i, insts, polys, existing, sm,
+                                          discover_new_tuples_expr(b, insts, polys, existing, sm, acc)))
+        SAssign(b, v, _, _)        -> discover_new_tuples_expr(v, insts, polys, existing, sm,
+                                        discover_new_tuples_expr(b, insts, polys, existing, sm, acc))
+        SVar(_, _, rhs, _, _)      -> discover_new_tuples_expr(rhs, insts, polys, existing, sm, acc)
+        SUse(_, _, _)              -> acc
+      }
+      discover_new_tuples_stmts(rest, insts, polys, existing, sm, acc1)
+    }
+  }
+}
+
+fn discover_new_tuples_clauses(cs: [HClause], insts: InstIndex, polys: PolyIx,
+                                existing: TupleSet, sm: SubstMap,
+                                acc: [MonoTuple]) : [MonoTuple] {
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> discover_new_tuples_clauses(rest, insts, polys, existing, sm,
+                            discover_new_tuples_expr(b, insts, polys, existing, sm, acc))
+    }
+  }
+}
+
+#[doc("""
+The retargeted callee of a call: the spec by its identity, at the
+callee's own position.
+""")]
+pub fn spec_callee(callee: Expr, fid: FnId) : Expr =
+  Expr { kind: ESym(fnid_sym(fid), fnid_inst(fid)), line: callee.line, col: callee.col, ty: callee.ty, mode: callee.mode,  site: callee.site }

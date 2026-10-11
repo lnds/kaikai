@@ -1,0 +1,218 @@
+#[doc("""
+The name a specialisation is emitted under, and a type as a leak
+diagnostic shows it.
+""")]
+
+import compiler.ast
+import compiler.type_text
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.rt_name
+import compiler.kinds
+import compiler.util
+import compiler.infer
+
+fn mono_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
+
+#[doc("The name of the specialisation of `name` at `tys` and `units`.")]
+pub fn mono_mangle_name(tab: SymTab, name: String, tys: [Ty], units: [UnitExprT]) : String {
+  let ty_part = match tys {
+    [] -> ""
+    [_h, ..._rest] -> concat_all(["__mono__", mono_join_with(map(tys, (t) => mono_mangle_ty(tab, t)), "__")])
+  }
+  # m4c Phase 3: encode the unit-tparam tuple after the type-tparam
+  # tuple. Empty units means no per-unit specialisation (the common
+  # case). For `impl[u: Measure] Show for Real<u>` and friends, two
+  # specs binding `u` to USD and EUR mangle distinctly via
+  # `__umono__USD` / `__umono__EUR`. The rendering uses the same
+  # canonical-unit display as `unit_name(x)` so emit and rewrite
+  # agree on the suffix string.
+  let u_part = match units {
+    [] -> ""
+    [_h, ..._rest] -> concat_all(["__umono__", mono_join_with(map(units, mono_mangle_unit), "__")])
+  }
+  if string_length(ty_part) == 0 and string_length(u_part) == 0 {
+    name
+  } else {
+    concat_all([name, ty_part, u_part])
+  }
+}
+
+fn mono_mangle_ty(tab: SymTab, t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
+    TyHandle   -> "Handle"
+    TyListT(inner) -> concat_all(["L_", mono_mangle_ty(tab, inner), "_E"])
+    TyFnT(ps, ret, _) -> concat_all([
+      "F_", mono_join_with(map(ps, (p) => mono_mangle_ty(tab, p)), "_"),
+      "_R_", mono_mangle_ty(tab, ret), "_E"
+    ])
+    TyCon(s, tas) -> {
+      match tas {
+        [] -> rt_name(tab, s)
+        [_h, ..._rest] -> concat_all([rt_name(tab, s), "_O_",
+                                    mono_join_with(map(tas, (a) => mono_mangle_ty(tab, a)), "_"),
+                                    "_C"])
+      }
+    }
+    TyVarT(_) -> "TVAR"
+    # a resolved shape app never reaches the mangler (apply/subst erase
+    # it to the concrete constructor); an unresolved one in a key is a
+    # bug, flagged like `TVAR`.
+    TyShapeApp(_, arg) -> concat_all(["SVAR_", mono_mangle_ty(tab, arg)])
+    TyAny     -> "Any"
+    # m12.5: units are erased at codegen time. The mangled name for a
+    # dimensioned type is the same as its base type's mangle — so a
+    # call like `f(1.0<USD>)` and a call `f(1.0)` mangle into the same
+    # specialisation. This is the codegen-erasure invariant manifest
+    # at the mangler level. A fixed-width `Vec[e]<n>` is the exception:
+    # its inline layout differs per `n`, so it keeps a `_D<n>` suffix
+    # (lockstep with `mangle_ty` in emit_c) that splits its spec from
+    # the dynamic `Vec` and from every other length.
+    TyDimT(base, u) -> if ty_is_fixed_vec(t) {
+      concat_all([mono_mangle_ty(tab, base), "_D", int_to_string(fixed_vec_n(t))])
+    } else { mono_mangle_ty(tab, base) }
+    # m12.6.x #1: refinements erase like units. `Int where >= 0` and
+    # `Int` mangle the same — they share monomorphisations and
+    # protocol-impl dispatch entries.
+    TyRefineT(base, _) -> mono_mangle_ty(tab, base)
+    # issue #187 phase 1: mangle a union as `U_<part1>_<part2>_..._E`
+    # using the canonical component order. The leading `U_` and
+    # trailing `_E` bracket the spec the same way `L_..._E` brackets
+    # a list, so distinct unions never collide with each other or
+    # with primitive mangles even when their component manglings
+    # rearrange. Phase 1 never invokes the mangler on a `TyUnion` in
+    # selfhost (no resolver path constructs one) so this arm is dead
+    # until Phase 2 wires it up; the implementation is provided now
+    # to keep the walker exhaustive without `_` fallbacks that would
+    # mask future bugs.
+    TyUnion(parts) -> concat_all(["U_",
+                                  mono_join_with(map(parts, (p) => mono_mangle_ty(tab, p)), "_"),
+                                  "_E"])
+  }
+}
+
+fn mono_mangle_unit(u: UnitExprT) : String {
+  let cu = unit_canon(u)
+  match cu {
+    UVar(_) -> "TUVAR"
+    UOne    -> "1"
+    _       -> mono_mangle_unit_ident(unit_key(cu))
+  }
+}
+
+fn mono_mangle_unit_ident(s: String) : String =
+  mono_mangle_unit_ident_loop(s, 0, string_length(s), [])
+
+fn mono_mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : String {
+  if i >= n { concat_all(list_reverse(acc)) }
+  else {
+    let c = match char_at(s, i) {
+      Some(ch) -> ch
+      None     -> ' '
+    }
+    let piece = match c {
+      '*' -> "_x_"
+      '/' -> "_d_"
+      '^' -> "_p_"
+      '(' -> "_l_"
+      ')' -> "_r_"
+      ' ' -> "_s_"
+      _   -> string_slice(s, i, 1)
+    }
+    mono_mangle_unit_ident_loop(s, i + 1, n, [piece, ...acc])
+  }
+}
+
+fn mono_ty_string_list(tab: SymTab, ts: [Ty]) : [String] = map(ts, (t) => mono_ty_to_string(tab, t))
+
+#[doc("A type as a diagnostic shows it.")]
+pub fn mono_ty_to_string(tab: SymTab, t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
+    TyHandle   -> "Handle"
+    TyListT(inner) -> cat3("[", mono_ty_to_string(tab, inner), "]")
+    # m7b #11k: render the function type's effect row alongside the
+    # arrow when non-empty, with each label printed as `Eff` or
+    # `Eff[T1, T2]` so parametric-effect mismatches (Reader[Int] vs
+    # Reader[String]) are visible in `expected/found` notes.
+    TyFnT(ps, ret, row) -> concat_all([
+      "(", mono_join_with(mono_ty_string_list(tab, ps), ", "), ") -> ",
+      mono_ty_to_string(tab, ret),
+      mono_row_to_string_suffix(tab, row)
+    ])
+    TyCon(s, tas) -> {
+      let cname = written_text(decl_name(tab, s))
+      match tas {
+        [] -> cname
+        _ -> concat_all([cname, "[", mono_join_with(mono_ty_string_list(tab, tas), ", "), "]"])
+      }
+    }
+    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyAny -> "?"
+    # m12.5: render dimensioned base types as `Real<u>` / `Int<u>`.
+    # The unit goes through unit_canon so the printed form matches
+    # what the unifier compares against — same shape on every side.
+    TyDimT(base, u) -> concat_all([mono_ty_to_string(tab, base), "<", mono_unit_canon_display(u), ">"])
+    # m12.6.x #1: render `T where ...` for diagnostics. The predicate
+    # is left as `<pred>` to keep the line short; full predicate text
+    # lands with the diagnostics-quality pass (m12.6.x #8).
+    TyRefineT(base, _) -> concat_all([mono_ty_to_string(tab, base), " where <pred>"])
+    TyShapeApp(sv, arg) -> concat_all(["?s", int_to_string(sv), "[", mono_ty_to_string(tab, arg), "]"])
+    # issue #187 phase 1: render unions inline as `A | B | C` to match
+    # surface syntax. Components are already in canonical order when
+    # the walker receives them via `normalize_union`.
+    TyUnion(parts) -> mono_join_with(mono_ty_string_list(tab, parts), " | ")
+  }
+}
+
+fn mono_unit_canon_display(u: UnitExprT) : String = unit_key(unit_canon(u))
+
+fn mono_row_to_string_suffix(tab: SymTab, r: Row) : String {
+  # Issue #645: a row with no labels is treated as "pure" in display
+  # form, whether its tail is None (truly closed empty) or Some(_)
+  # (a free row var with no demand on it — the phantom that
+  # `fn_scheme_of_decl` inserts for REmpty signatures, or any fresh
+  # row var introduced by instantiation and never constrained). The
+  # tail variable is internal bookkeeping; showing `?eN` to users
+  # mis-suggests they need to annotate the function. Diagnostics for
+  # actual row mismatches still print the `expected` and `found`
+  # rows in full (those rows carry labels by the time the mismatch
+  # is reported).
+  let body =
+    if labels_empty(r.labels) {
+      ""
+    } else {
+      let lbs = mono_join_with(map(r.labels, (l) => label_to_string(tab, l)), " + ")
+      let tail_s = match r.tail {
+        None -> ""
+        Some(v) -> {
+          let pre = if string_length(lbs) > 0 { " + " } else { "" }
+          concat_all([pre, "?e", int_to_string(v)])
+        }
+      }
+      concat_all([" / ", lbs, tail_s])
+    }
+  body
+}

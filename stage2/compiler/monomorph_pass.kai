@@ -1,0 +1,179 @@
+#[doc("""
+Monomorphisation: every generic declaration specialised once per
+`(declaration, types, units)` it is instantiated at, to a fixed point,
+and every call retargeted to its spec. `monomorphise` is the pass.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.spec_names
+import compiler.fn_bounds
+import compiler.util
+import compiler.infer
+import compiler.inst_index
+import compiler.protos_calls
+import compiler.proto_resolve
+import compiler.monomorph
+import compiler.monomorph_mangle
+import compiler.monomorph_subst
+import compiler.monomorph_bounds
+import compiler.monomorph_polys
+import compiler.monomorph_tuples
+import compiler.monomorph_callsites
+import compiler.monomorph_discover
+import compiler.monomorph_specialise
+
+#[doc("Result of the monomorphisation pass: the fully specialised decl list, the name each specialisation is emitted under, the leak records (empty = clean), and any fn protocol-bound violations found at concrete instantiations.")]
+pub type MonoOutput = MonoOut([Decl], SpecNames, [MLeakRecord], [BoundViolation])
+
+#[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), one spec per (declaration, tys, units) tuple: a spec is `FnId(<the generic's id>, <instance>)`, and the name it is emitted under rides in the returned table. Also returns the leak records and the fn-bound violations at concrete instantiations. The table of `ps` holds the row of every generic. With `check_only` the non-spec decls come back unrewritten: only a verdict is wanted.")]
+pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBounds],
+                  ps: PScope, target_mod: String, check_only: Bool) : MonoOutput {
+  let polys = collect_poly_fns(tp.decls, target_mod)
+  # `resolve_protocol_calls` retargets a dispatcher call to its impl
+  # function AFTER `infer_program` has populated tp.insts, so no inst
+  # names the impl. Discover the impl-side tuples by walking the decl
+  # bodies and synthesising one MonoTuple per such call site (using
+  # `synthesize_inst_for_decl` to unify formal vs actual types). The
+  # rewrite walker uses the same path inline so each call site
+  # retargets to its own per-(tys, units) specialisation, even when
+  # multiple calls share a (line, col) under string interpolation.
+  let insts_ix = iix_build(tp.insts)
+  let typer_tuples = collect_distinct_tuples(insts_ix, polys, [])
+  let impl_tuples = collect_impl_tuples_in_decls(tp.decls, polys, ts_of(typer_tuples))
+  let initial_tuples = list_append(typer_tuples, impl_tuples)
+  let initial_ts = ts_of(initial_tuples)
+  # Retargets only calls to poly fns, keeping every type and position;
+  # a dispatcher has no tparams, so the dispatch check reads the same calls either way.
+  let rewritten = if check_only { tp.decls } else { rewrite_callsites_decls_full(tp.decls, insts_ix, initial_ts, polys) }
+  # Iterate spec generation to fixpoint. Per-spec body subst can
+  # promote previously-polymorphic flow-through call sites to
+  # concrete tuples (the spec of `f` at `Int` calls `g(x : Int)`);
+  # those new tuples enter the worklist and produce additional specs.
+  # Each spec also accumulates a per-spec leak record.
+  let r = generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg)
+  match r {
+    GenSpecsOut(specs, all_items, leaks) -> {
+      # Every concrete instantiation (direct + transitive) surfaces as a
+      # tuple in `all_items`; check each against the callee's declared
+      # bounds. A tuple whose type-kind slot is still a tyvar never
+      # reaches here (it isn't concrete), so a generic caller forwarding
+      # its own tparam defers to its own instantiation — no constraint
+      # propagation.
+      let viols = check_fn_bounds(all_items, fn_bounds, insts_ix, polys, reg, ps, [])
+      let ordered = spec_sort(specs)
+      MonoOut(list_append(rewritten, map(ordered, spec_decl_of)), spec_names_of(map(ordered, spec_name_row)), leaks, viols)
+    }
+  }
+}
+
+# A spec and the name it is emitted under.
+type Spec = Spec(Decl, String)
+
+fn spec_decl_of(sp: Spec) : Decl = match sp { Spec(d, _) -> d }
+
+fn spec_emitted(sp: Spec) : String = match sp { Spec(_, n) -> n }
+
+fn spec_name_row(sp: Spec) : SpecName = match sp { Spec(d, n) -> SpecName(poly_decl_fid(d), written(n)) }
+
+# Emit-stable spec order: sorted by emitted name, not worklist discovery
+# order — a new call site in one module must not permute the spec
+# sequence emitted into another module's TU.
+fn spec_sort(ds: [Spec]) : [Spec] = match ds {
+  [] -> []
+  [h, ...rest] -> spec_insert(h, spec_sort(rest))
+}
+
+fn spec_insert(d: Spec, sorted: [Spec]) : [Spec] = match sorted {
+  [] -> [d]
+  [h, ...rest] ->
+    if string_lt(spec_emitted(d), spec_emitted(h)) { [d, h, ...rest] }
+    else { [h, ...spec_insert(d, rest)] }
+}
+
+type GenSpecsResult = GenSpecsOut([Spec], [MonoTuple], [MLeakRecord])
+
+# Per-spec body emission: build SubstMap, substitute the body, run
+# the call-site rewrite walker with the substitution map applied
+# inline at each call site (so internal polymorphic-flow-through
+# calls retarget to their specs), and return the rewritten DFn
+# alongside the list of newly-discovered tuples.
+type SpecEmitOut = SEO(Spec, [MonoTuple], [MLeakRecord])
+
+fn emit_spec(tab: SymTab, d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
+              all_tuples: TupleSet, reg: ProtocolReg) : SpecEmitOut {
+  match mt { MT(_, tys, units) -> {
+    let sm = build_subst_map(d, tys, units)
+    let spec0 = specialise_decl(d, tys, ts_inst(all_tuples, mt))
+    let spec1a = subst_decl(spec0, sm)
+    # Post-subst, the spec body's `Expr.ty` annotations are concrete.
+    # Re-run the protocol-call resolver so a dispatcher call inside the
+    # spec body retargets to the matching impl function. Without this
+    # step polymorphic impls that recurse on the type parameter (e.g.
+    # `impl[T: Show] Show for [T]` calling `show(x: T)` per element)
+    # leave the dispatcher in place and panic at runtime.
+    let spec1 = resolve_protocol_calls_decl(spec1a, reg)
+    # Discover transitive tuples introduced by body subst: for each call
+    # to a generic inside the spec body, look up the original CS, apply
+    # sm, and collect concrete poly tuples not yet known.
+    let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
+    let updated_tuples = ts_add_all(all_tuples, new_tuples)
+    let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
+    # A self-recursive call must name the spec itself: left on the
+    # generic, TCO never fires on the spec (the loop lives in the
+    # generic) and every recursion bounces spec -> generic.
+    let spec3 = retarget_self_calls_decl(spec2)
+    let name = mono_mangle_name(tab, written_text(decl_name(tab, poly_decl_sym(d))), tys, units)
+    # Invariant: no TyVarT/UVar of `sm`'s domain survives in the spec
+    # body. Out-of-domain ids belong to unrelated free typer tyvars.
+    let atv = subst_map_tvar_ids(sm)
+    let auv = subst_map_uvar_ids(sm)
+    let leaks = match spec3 {
+      DFn(_, _, _, _, _, _, sbody, _, _, _) ->
+        match first_spec_leak(sbody, atv, auv) {
+          Some(LeakTy(line, col, t)) ->
+            [MLeakRec(name, count_spec_leaks(sbody, atv, auv), Some(MLeakAt(line, col, mono_ty_to_string(tab, t))))]
+          None -> []
+        }
+      _ -> []
+    }
+    SEO(Spec(spec3, name), new_tuples, leaks)
+  } }
+}
+
+# Iterate spec emission to fixpoint. `worklist` holds tuples not yet
+# emitted; `all_tuples` is the running set used by per-spec rewrite to
+# know which retargets are reachable.
+fn generate_specs_iter(tab: SymTab, polys: PolyIx, worklist: [MonoTuple],
+                        insts: InstIndex, specs_acc: [Spec],
+                        all_tuples: TupleSet,
+                        leaks_acc: [MLeakRecord],
+                        reg: ProtocolReg) : GenSpecsResult {
+  match worklist {
+    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples.items, list_reverse(leaks_acc))
+    [t, ...rest] -> match lookup_poly_fn_sym(poly_ix_fns(polys), mt_sym(t)) {
+      None -> generate_specs_iter(tab, polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg)
+      Some(d) -> {
+        let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg)
+        match r {
+          SEO(spec, new_ts, new_leaks) -> {
+            let next_worklist = list_append(rest, new_ts)
+            let next_all = ts_add_all(all_tuples, new_ts)
+            let next_leaks = prepend_leaks(new_leaks, leaks_acc)
+            generate_specs_iter(tab, polys, next_worklist, insts,
+                                 [spec, ...specs_acc], next_all, next_leaks, reg)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn prepend_leaks(xs: [MLeakRecord], acc: [MLeakRecord]) : [MLeakRecord] {
+  match xs {
+    [] -> acc
+    [h, ...rest] -> prepend_leaks(rest, [h, ...acc])
+  }
+}

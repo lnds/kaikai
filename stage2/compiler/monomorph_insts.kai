@@ -1,0 +1,124 @@
+#[doc("""
+The instantiation a call site resolves to: the typer's, or one
+synthesised from the enclosing spec's substitution.
+""")]
+
+import compiler.ast
+import compiler.infer
+import compiler.inst_index
+import compiler.monomorph
+import compiler.monomorph_subst
+import compiler.monomorph_polys
+import compiler.monomorph_tuples
+
+# Collect every RCS recorded for the generic `s` at one `(line, col)`
+# source position. A position is shared by more than one instantiation
+# when distinct `#{...}` interpolation bodies reparse to call sites that
+# all start at the slice-local `(1,1)` — the lexer restarts each
+# `#{...}` reparse at line 1, col 1, so the callee of every
+# interpolated `f(...)` lands at the same coordinate.
+fn find_mono_insts_at(insts: InstIndex, s: SymId,
+                       line: Int, col: Int) : [MonoInstPair] =
+  mono_insts_at_loop(iix_chain(insts, s), line, col)
+
+fn mono_insts_at_loop(insts: [ResolvedCS], line: Int, col: Int) : [MonoInstPair] {
+  match insts {
+    [] -> []
+    [r, ...rest] -> match r {
+      RCS(_, rl, rc, tys, units, _) ->
+        if rl == line and rc == col {
+          [MIPair(tys, units), ...mono_insts_at_loop(rest, line, col)]
+        } else {
+          mono_insts_at_loop(rest, line, col)
+        }
+    }
+  }
+}
+
+# True when two or more recorded instantiations share a position but
+# disagree on (tys, units) — the position cannot pick a single spec by
+# first-match, so the call site's actual arg types must disambiguate.
+fn mono_insts_collide(pairs: [MonoInstPair]) : Bool {
+  match pairs {
+    [] -> false
+    [_] -> false
+    [MIPair(t0, u0), ...rest] -> mono_insts_collide_rest(t0, u0, rest)
+  }
+}
+
+fn mono_insts_collide_rest(t0: [Ty], u0: [UnitExprT], rest: [MonoInstPair]) : Bool {
+  match rest {
+    [] -> false
+    [MIPair(ti, ui), ...more] ->
+      if ty_list_eq(t0, ti) and unit_list_eq(u0, ui) {
+        mono_insts_collide_rest(t0, u0, more)
+      } else { true }
+  }
+}
+
+# Resolve the (tys, units) tuple of a call to the generic `d`, applying
+# `sm`. The lookup prefers the typer-recorded RCS at the callee's
+# position when it exists; it falls back to inline synthesis from
+# `args`' types when no inst was recorded (an impl function a
+# dispatcher call was retargeted to AFTER tp.insts was populated). The
+# inline synth path uses `synthesize_inst_for_decl` to extract
+# bindings by unifying the polymorphic DFn's formal param types
+# with the actual arg types. This also disambiguates multiple impl
+# calls that coalesce onto one source position under string
+# interpolation (each `#{x}` becomes a `show` impl call at the same
+# outer (line, col) for distinct `x.ty`).
+#
+# A bare `fn[T:P]` instantiated at >=2 types inside `#{...}` records
+# several distinct-type RCS at one slice-local position; first-match
+# would resolve every such site to the first spec (wrong ABI). When
+# the position collides, synthesise from the call's actual arg types
+# so each site retargets its own spec.
+#[doc("The types and units a call of the generic `d` is instantiated at, or `None` when they cannot be settled.")]
+pub fn resolve_call_inst(insts: InstIndex, polys: PolyIx, d: Decl,
+                      callee: Expr, args_: [Expr], ret_ty: Option[Ty],
+                      sm: SubstMap) : Option[MonoInstPair] =
+  match resolve_call_inst_raw(insts, d, callee, args_, ret_ty, sm) {
+    Some(MIPair(tys, units)) -> Some(MIPair(inst_spec_tys(polys, poly_decl_sym(d), tys), units))
+    None                     -> None
+  }
+
+fn resolve_call_inst_raw(insts: InstIndex, d: Decl,
+                         callee: Expr, args_: [Expr], ret_ty: Option[Ty],
+                         sm: SubstMap) : Option[MonoInstPair] {
+  let at_pos = find_mono_insts_at(insts, poly_decl_sym(d), callee.line, callee.col)
+  if mono_insts_collide(at_pos) {
+    match synth_inst_pair(d, callee, args_, ret_ty, sm) {
+      Some(p) -> Some(p)
+      None -> resolve_call_inst_first(at_pos, d, callee, args_, ret_ty, sm)
+    }
+  } else {
+    resolve_call_inst_first(at_pos, d, callee, args_, ret_ty, sm)
+  }
+}
+
+fn resolve_call_inst_first(at_pos: [MonoInstPair], d: Decl,
+                            callee: Expr, args_: [Expr], ret_ty: Option[Ty],
+                            sm: SubstMap) : Option[MonoInstPair] {
+  match at_pos {
+    [MIPair(tys0, units0), ..._] -> {
+      let tys = map(tys0, (t) => subst_ty(t, sm))
+      let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+      Some(MIPair(tys, units))
+    }
+    [] -> synth_inst_pair(d, callee, args_, ret_ty, sm)
+  }
+}
+
+fn synth_inst_pair(d: Decl, callee: Expr,
+                    args_: [Expr], ret_ty: Option[Ty], sm: SubstMap) : Option[MonoInstPair] =
+  match synthesize_inst_for_decl(d, args_, ret_ty, callee.line, callee.col) {
+    Some(RCS(_, _, _, tys0, units0, _)) -> {
+      let tys = map(tys0, (t) => subst_ty(t, sm))
+      let units = map(units0, (u) => unit_canon(subst_unit(u, sm)))
+      Some(MIPair(tys, units))
+    }
+    None -> None
+  }
+
+#[doc("The types and units of one instantiation.")]
+pub type MonoInstPair = MIPair([Ty], [UnitExprT])

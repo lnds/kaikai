@@ -1,0 +1,214 @@
+#[doc("""
+Type and unit variables of a spec's own substitution domain that are
+still present in a body, counted.
+""")]
+
+import compiler.ast
+import compiler.infer
+
+#[doc("`acc` plus the allowed type and unit variables still present in `e`.")]
+pub fn count_tyvar_in_expr(e: Expr, allowed_tvars: [Int], allowed_uvars: [Int],
+                        acc: Int) : Int {
+  let n_self = match e.ty {
+    Some(t) -> count_tyvar_in_ty(t, allowed_tvars, allowed_uvars)
+    None    -> 0
+  }
+  let n_kind = count_tyvar_in_kind(e.kind, allowed_tvars, allowed_uvars)
+  acc + n_self + n_kind
+}
+
+#[doc("How many of the allowed type and unit variables a type still holds.")]
+pub fn count_tyvar_in_ty(t: Ty, atv: [Int], auv: [Int]) : Int {
+  match t {
+    TyVarT(n) -> if list_has_int(atv, n) { 1 } else { 0 }
+    TyListT(inner) -> count_tyvar_in_ty(inner, atv, auv)
+    TyFnT(ps, ret, row) -> {
+      let np = sum_count_tyvar_tys(ps, atv, auv)
+      let nr = count_tyvar_in_ty(ret, atv, auv)
+      let nrow = count_tyvar_in_row(row, atv, auv)
+      np + nr + nrow
+    }
+    TyCon(_, tas) -> sum_count_tyvar_tys(tas, atv, auv)
+    TyDimT(b, u) -> count_tyvar_in_ty(b, atv, auv) + count_tyvar_in_unit(u, auv)
+    TyRefineT(b, _) -> count_tyvar_in_ty(b, atv, auv)
+    # issue #187 phase 1: count contributions from each component
+    # — same shape as the TyCon arm, since a union is structurally
+    # a list of types and each one can carry tvars independently.
+    TyUnion(parts) -> sum_count_tyvar_tys(parts, atv, auv)
+    _ -> 0
+  }
+}
+
+fn count_tyvar_in_row(r: Row, atv: [Int], auv: [Int]) : Int =
+  sum_count_tyvar_labels(r.labels, atv, auv)
+
+fn sum_count_tyvar_labels(ls: [Label], atv: [Int], auv: [Int]) : Int {
+  match ls {
+    [] -> 0
+    [l, ...rest] -> {
+      let here = sum_count_tyvar_tys(l.ty_args, atv, auv)
+      let after = sum_count_tyvar_labels(rest, atv, auv)
+      here + after
+    }
+  }
+}
+
+fn sum_count_tyvar_tys(ts: [Ty], atv: [Int], auv: [Int]) : Int {
+  match ts {
+    [] -> 0
+    [h, ...rest] -> {
+      let here = count_tyvar_in_ty(h, atv, auv)
+      let after = sum_count_tyvar_tys(rest, atv, auv)
+      here + after
+    }
+  }
+}
+
+fn count_tyvar_in_unit(u: UnitExprT, auv: [Int]) : Int {
+  match u {
+    UVar(n) -> if list_has_int(auv, n) { 1 } else { 0 }
+    UMul(a, b) -> count_tyvar_in_unit(a, auv) + count_tyvar_in_unit(b, auv)
+    UInv(a) -> count_tyvar_in_unit(a, auv)
+    UPow(a, _) -> count_tyvar_in_unit(a, auv)
+    UJoin(a, b) -> count_tyvar_in_unit(a, auv) + count_tyvar_in_unit(b, auv)
+    UDims(us) -> count_tyvar_in_units(us, auv)
+    _ -> 0
+  }
+}
+
+fn count_tyvar_in_units(us: [UnitExprT], auv: [Int]) : Int = match us {
+  [] -> 0
+  [u, ...rest] -> count_tyvar_in_unit(u, auv) + count_tyvar_in_units(rest, auv)
+}
+
+fn count_tyvar_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Int {
+  match k {
+    EInt(_, _)        -> 0
+    EReal(_, _)       -> 0
+    EIntLit(_)        -> 0
+    EDecimalLit(_)    -> 0
+    EFixed(_, _)      -> 0
+    EBool(_)       -> 0
+    EChar(_)       -> 0
+    EStr(_, _)     -> 0
+    EUnit          -> 0
+    EName(_)        -> 0
+    EMark(_)        -> 0
+    ESym(_, _)      -> 0
+    ELocal(_)       -> 0
+    EOp(_)          -> 0
+    EUnder         -> 0
+    EPlaceholder   -> 0
+    EHole(_)       -> 0
+    ETodo(_)       -> 0
+    EExternBody(_, _) -> 0
+    EVariantsOf(_, _) -> 0
+    EModCall(_, _) -> 0
+    EIntrinsic(_, args_) -> sum_count_tyvar_args(args_, atv, auv)
+    ESurface(sf) -> sum_count_tyvar_args(surface_children(sf), atv, auv)
+    ECall(callee, args_) -> count_tyvar_in_expr(callee, atv, auv, 0) + sum_count_tyvar_args(args_, atv, auv)
+    EField(base, _)   -> count_tyvar_in_expr(base, atv, auv, 0)
+    EIndex(a, b)      -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EBinop(_, a, b)   -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EUnop(_, x)       -> count_tyvar_in_expr(x, atv, auv, 0)
+    EIf(c, t_, eo)    -> {
+      let n0 = count_tyvar_in_expr(c, atv, auv, 0) + count_tyvar_in_expr(t_, atv, auv, 0)
+      match eo { Some(eb) -> n0 + count_tyvar_in_expr(eb, atv, auv, 0) None -> n0 }
+    }
+    EMatch(scr, arms) -> count_tyvar_in_expr(scr, atv, auv, 0) + sum_count_tyvar_arms(arms, atv, auv)
+    ELambda(_, b)     -> count_tyvar_in_expr(b, atv, auv, 0)
+    ERecordLit(_, fs) -> sum_count_tyvar_fields(fs, atv, auv)
+    EList(els)        -> sum_count_tyvar_elems(els, atv, auv)
+    ERange(a, b, opt_step) -> {
+      let n0 = count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+      match opt_step { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+    }
+    EBlock(stmts, tail) -> {
+      let n0 = sum_count_tyvar_stmts(stmts, atv, auv)
+      match tail { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+    }
+    EPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EMapPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EFlatMapPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EFilterPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let n0 = count_tyvar_in_expr(body, atv, auv, 0)
+      let n1 = match init_opt { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+      let n2 = n1 + sum_count_tyvar_clauses(clauses, atv, auv)
+      match ret_opt {
+        Some(r) -> match r { HR(_, b, _, _) -> n2 + count_tyvar_in_expr(b, atv, auv, 0) }
+        None -> n2
+      }
+    }
+    ELitUnit(inner, _) -> count_tyvar_in_expr(inner, atv, auv, 0)
+    EBang(inner)       -> count_tyvar_in_expr(inner, atv, auv, 0)
+  }
+}
+
+fn sum_count_tyvar_args(args: [Expr], atv: [Int], auv: [Int]) : Int {
+  match args {
+    [] -> 0
+    [a, ...rest] -> count_tyvar_in_expr(a, atv, auv, 0) + sum_count_tyvar_args(rest, atv, auv)
+  }
+}
+
+fn sum_count_tyvar_arms(arms: [Arm], atv: [Int], auv: [Int]) : Int {
+  match arms {
+    [] -> 0
+    [arm, ...rest] -> match arm {
+      Arm(_, g, b) -> {
+        let ng = match g { Some(ge) -> count_tyvar_in_expr(ge, atv, auv, 0) None -> 0 }
+        ng + count_tyvar_in_expr(b, atv, auv, 0) + sum_count_tyvar_arms(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn sum_count_tyvar_fields(fs: [FieldInit], atv: [Int], auv: [Int]) : Int {
+  match fs {
+    [] -> 0
+    [f, ...rest] -> match f {
+      FI(_, v) -> count_tyvar_in_expr(v, atv, auv, 0) + sum_count_tyvar_fields(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_elems(els: [ListElem], atv: [Int], auv: [Int]) : Int {
+  match els {
+    [] -> 0
+    [el, ...rest] -> {
+      let n = match el {
+        ElPlain(x)  -> count_tyvar_in_expr(x, atv, auv, 0)
+        ElSpread(x) -> count_tyvar_in_expr(x, atv, auv, 0)
+      }
+      n + sum_count_tyvar_elems(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_stmts(stmts: [Stmt], atv: [Int], auv: [Int]) : Int {
+  match stmts {
+    [] -> 0
+    [s, ...rest] -> {
+      let n = match s {
+        SLet(_, _, rhs)             -> count_tyvar_in_expr(rhs, atv, auv, 0)
+        SAssert(c, m)               -> match m { Some(me) -> count_tyvar_in_expr(c, atv, auv, 0) + count_tyvar_in_expr(me, atv, auv, 0) None -> count_tyvar_in_expr(c, atv, auv, 0) }
+        SExprStmt(x)                -> count_tyvar_in_expr(x, atv, auv, 0)
+        SIndexAssign(b, i, v, _, _) -> count_tyvar_in_expr(b, atv, auv, 0) + count_tyvar_in_expr(i, atv, auv, 0) + count_tyvar_in_expr(v, atv, auv, 0)
+        SAssign(b, v, _, _)         -> count_tyvar_in_expr(b, atv, auv, 0) + count_tyvar_in_expr(v, atv, auv, 0)
+        SVar(_, _, rhs, _, _)       -> count_tyvar_in_expr(rhs, atv, auv, 0)
+        SUse(_, _, _)               -> 0
+      }
+      n + sum_count_tyvar_stmts(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Int {
+  match cs {
+    [] -> 0
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> count_tyvar_in_expr(b, atv, auv, 0) + sum_count_tyvar_clauses(rest, atv, auv)
+    }
+  }
+}
