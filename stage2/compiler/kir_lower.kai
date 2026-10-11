@@ -75,9 +75,10 @@ pub fn reuse_plan_none() : ReusePlan = ReusePlan { rot: RNInone, flat: [], cells
 # block label, current block's reversed statement list, the EFn symbol
 # table, the core builtins' rows keyed by id, the variant→tag table and
 # its rows keyed by constructor id, the lifted-lambda table (`find_lam`),
-# and the enclosing unit the lambda lookup is scoped by.
+# the lifted clauses (a handle reads its env layout from them), and the
+# enclosing unit both lookups are scoped by.
 pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
-                     fns: [EFn], fx: FnIndex, core_ix: CoreIx, ctor_ix: CtorIx, vs: [VariantEntry], lams: [LamInfo], enc_fn: EncFn,
+                     fns: [EFn], fx: FnIndex, core_ix: CoreIx, ctor_ix: CtorIx, vs: [VariantEntry], lams: [LamInfo], cls: [ClauseInfo], enc_fn: EncFn,
                      consts: [Decl],
                      # `regs` is the names of the registers live in the
                      # current lexical scope: params, captures, and every
@@ -206,11 +207,11 @@ pub type RecPlan = RecPlan([KFieldInit], LowerSt)
 # An optional lowered value (handler state init) + threaded state.
 pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
-pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], ctors: CtorIx, lams: [LamInfo],
+pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], ctors: CtorIx, lams: [LamInfo], cls: [ClauseInfo],
               consts: [Decl], ffi: [SymId], recs: [RecInfo], stamps: [RecStamp], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String],
               tab: SymTab, specs: SpecNames) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, core_ix: core_ix_build(), ctor_ix: ctors, vs: variants,
-            lams: lams, enc_fn: enc_none(), consts: consts, regs: [], ffi: ffi, scope: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
+            lams: lams, cls: cls, enc_fn: enc_none(), consts: consts, regs: [], ffi: ffi, scope: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
             tab: tab, specs: specs, locals: ln_empty() }
 
 #[doc("`st` with the arm-top token marked held (or released).")]
@@ -240,10 +241,23 @@ pub fn entry_params(params: [Param], captured: EntryRegs) : EntryRegs = match pa
   }
 }
 
-#[doc("The entry registers of a lambda's or clause's captures: a captured binder is read from the register its name spells, an alias is known by its name and takes the register holding its handler id.")]
-pub fn entry_captures(caps: [Capture], locals: LocalNames) : EntryRegs =
-  EntryRegs { scope: map(caps, (c) => Rn(capture_local(c), written_text(ln_text(locals, capture_local(c))))),
-              regs: map(caps, (c) => kir_capture_name(locals, c)) }
+#[doc("The entry registers of a lambda's or clause's captures: a captured binder is read from the register its name spells; an alias is known by its name, which names no register of its own here, and takes the register holding its handler id.")]
+pub fn entry_captures(caps: [Capture], locals: LocalNames) : EntryRegs = match caps {
+  [] -> EntryRegs { scope: [], regs: [] }
+  [c, ...rest] -> {
+    let name = written_text(ln_text(locals, capture_local(c)))
+    let more = entry_captures(rest, locals)
+    EntryRegs { scope: [Rn(capture_local(c), name), ...more.scope], regs: list_append(capture_taken(c, name), more.regs) }
+  }
+}
+
+# The register names a capture spelled `name` takes: a local its own, an
+# alias the one holding its handler id and its bare name too, so a binder
+# of the body never shares the pair.
+fn capture_taken(c: Capture, name: String) : [String] = match c {
+  CapLocal(_) -> [name]
+  CapAlias(_) -> [kir_alias_id_reg(name), name]
+}
 
 fn capture_local(c: Capture) : LocalId = match c {
   CapLocal(l) -> l
@@ -311,6 +325,11 @@ pub fn ls_bind(st: LowerSt, b: Binder) : LSReg = {
   } else { LSReg(name, ls_scope_put(ls_bind_reg(st, name), b.id, name)) }
 }
 
+#[doc("Bind the alias `b` of an install to its register: the node lives there and the handler id in `kir_alias_id_reg` of it, a pair no live register shares.")]
+pub fn ls_bind_alias(st: LowerSt, b: Binder) : LSReg = match ls_bind(st, b) {
+  LSReg(reg, st1) -> LSReg(reg, ls_bind_reg(ls_bind_reg(st1, reg), kir_alias_id_reg(reg)))
+}
+
 #[doc("Bind `b` to its register and define it as `op` at `slot`.")]
 pub fn ls_let(st: LowerSt, b: Binder, slot: KSlot, op: KOp, pos: KPos) : LowerSt =
   match ls_bind(st, b) { LSReg(reg, st1) -> ls_emit(st1, KLet(reg, slot, op, pos)) }
@@ -343,7 +362,7 @@ pub fn ls_local_name(st: LowerSt, l: LocalId) : String = {
   if w == "" { panic(concat_all(["identity: the name of local ", int_to_string(local_raw(l)), " of ", st.enc_fn.sym, " in ls_local_name"])) } else { w }
 }
 
-#[doc("The register a lambda or clause reads the capture `c` from: the captured binder's written name, or the register holding the alias's handler id.")]
+#[doc("The register a lambda or clause reads the capture `c` from inside its own body: the captured binder's written name, or the register holding the alias's handler id.")]
 pub fn kir_capture_name(locals: LocalNames, c: Capture) : String = match c {
   CapLocal(l) -> written_text(ln_text(locals, l))
   CapAlias(a) -> kir_alias_id_reg(written_text(ln_text(locals, a)))

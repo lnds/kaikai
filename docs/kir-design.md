@@ -185,7 +185,7 @@ similarities:
 > | `resume` is a terminator `KResume(cont, arg, tail)` | `resume` is an **op**: `KResumeOp` / `KResume2Op` (stateful 2-arg) — body must run both `resume()`s | `kir.kai:115` |
 > | install/pop is an op `KInstallHandler` | install/pop/state-bind are **statements**: `KInstall` / `KPop` / `KBindEvState`; every `KStmt`/`KTerm` also carries a `KPos` | `kir.kai:144,180` |
 > | one TRMC terminator `KTrmcGoto(…)` | split into `KTrmcStep(…)` (modulo-cons site) + `KTrmcApply(leaf)` | `kir.kai:180` |
-> | `KProgram { …, regions }` | `+ defaults`, `+ synth_defaults` (`KDefault`); `KHandlerDecl` is defined (op_thunks/ret_thunk/env_caps) | `kir.kai:326,346` |
+> | `KProgram { …, regions }` | `+ defaults`, `+ synth_defaults` (`KDefault`); `KHandlerDecl` is defined (op_thunks/ret_thunk); the registers a handle's clauses capture ride its `KInstall` | `kir.kai:326,346` |
 > | `KSlot = SBoxed \| SInt64 \| SReal \| SBool` | `+ SInt32` (variant-tag width for the native `switch`) | `kir.kai:57` |
 > | (absent) | **`UFnSig = US([Ty], Ty, [Bool])`** — P3's per-param raw-scalar mask; the third `[Bool]` is the `raw_mask` | `fnreg.kai:78` |
 >

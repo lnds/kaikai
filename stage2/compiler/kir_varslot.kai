@@ -13,8 +13,9 @@
 # var cell is addressable only through its alias id (`op@a` + the
 # `__alias_id__a` register), never by an unaliased State perform from
 # user code; any unaliased State perform in the program disables the
-# pass. It also skips a same-name sibling install, a non-get/set use of
-# the alias, and an alias id a handler env carries into its clauses.
+# pass. It also skips a sibling install bound to the same register, a
+# non-get/set use of the alias, and an alias id an install's env carries
+# into its clauses.
 
 import compiler.util
 import compiler.kir
@@ -32,7 +33,7 @@ pub fn kvs_program(kp: KProgram) : KProgram = {
   match canon {
     [] -> kp
     _  -> KProgram { types: kp.types,
-                     fns: kvs_fn_loop(kp.fns, canon, kvs_env_alias_caps(kp.handlers, []), []),
+                     fns: kvs_fn_loop(kp.fns, canon, []),
                      handlers: kp.handlers,
                      install_order: kp.install_order,
                      defaults: kp.defaults,
@@ -53,12 +54,10 @@ pub fn kvs_program(kp: KProgram) : KProgram = {
 fn kvs_canonical_sites(hs: [KHandlerDecl], fns: [KFn], acc: [String]) : [String] = match hs {
   []           -> acc
   [h, ...rest] -> kvs_canonical_sites(rest, fns,
-    if effect_is(h.eff_sym, CeState) and kvs_no_env_caps(h) and kvs_ops_canonical(h.op_thunks, fns) {
+    if effect_is(h.eff_sym, CeState) and kvs_ops_canonical(h.op_thunks, fns) {
       [h.sym, ...acc]
     } else { acc })
 }
-
-fn kvs_no_env_caps(h: KHandlerDecl) : Bool = match h.env_caps { [] -> true _ -> false }
 
 fn kvs_ops_canonical(ops: [KOpThunk], fns: [KFn]) : Bool = match ops {
   [KOT(a, fa, _), KOT(b, fb, _)] ->
@@ -121,13 +120,13 @@ fn kvs_ret_is(t: KTerm, nm: String) : Bool = match t {
 
 # --- Per-fn rewrite -------------------------------------------------------
 
-fn kvs_fn_loop(fs: [KFn], canon: [String], captured: [String], acc: [KFn]) : [KFn] = match fs {
+fn kvs_fn_loop(fs: [KFn], canon: [String], acc: [KFn]) : [KFn] = match fs {
   []           -> list_reverse(acc)
-  [f, ...rest] -> kvs_fn_loop(rest, canon, captured, [kvs_fn(f, canon, captured), ...acc])
+  [f, ...rest] -> kvs_fn_loop(rest, canon, [kvs_fn(f, canon), ...acc])
 }
 
-fn kvs_fn(f: KFn, canon: [String], captured: [String]) : KFn = {
-  let cells = kvs_admissible_cells(f.blocks, canon, captured)
+fn kvs_fn(f: KFn, canon: [String]) : KFn = {
+  let cells = kvs_admissible_cells(f.blocks, canon)
   match cells {
     [] -> f
     _  -> KFn { sym: f.sym, kind: f.kind, params: f.params, ret: f.ret,
@@ -136,12 +135,12 @@ fn kvs_fn(f: KFn, canon: [String], captured: [String]) : KFn = {
   }
 }
 
-# The fn's rewritable cells: a canonical install whose alias is unique
-# among ALL of the fn's aliased installs, whose alias register is never
-# read as an atom, and whose `@alias` performs are all get/0 or set/1
-# shapes.
-fn kvs_admissible_cells(bs: [KBlock], canon: [String], captured: [String]) : [KvsCell] =
-  kvs_filter_cells(kvs_installs(bs, []), bs, canon, captured, [])
+# The fn's rewritable cells: a canonical install with no env, whose alias
+# is unique among ALL of the fn's aliased installs, whose alias id register
+# is never read as an atom (a closure capture, an install's env), and whose
+# `@alias` performs are all get/0 or set/1 shapes.
+fn kvs_admissible_cells(bs: [KBlock], canon: [String]) : [KvsCell] =
+  kvs_filter_cells(kvs_installs(bs, []), bs, canon, [])
 
 fn kvs_installs(bs: [KBlock], acc: [KvsCell]) : [KvsCell] = match bs {
   []           -> acc
@@ -151,29 +150,21 @@ fn kvs_installs(bs: [KBlock], acc: [KvsCell]) : [KvsCell] = match bs {
 fn kvs_installs_stmts(ss: [KStmt], acc: [KvsCell]) : [KvsCell] = match ss {
   []           -> acc
   [s, ...rest] -> kvs_installs_stmts(rest, match s {
-    KInstall(_, site, Some(_), Some(a), _) -> [KVC(site, a), ...acc]
+    KInstall(_, site, Some(_), Some(a), [], _) -> [KVC(site, a), ...acc]
     _                                      -> acc
   })
 }
 
-fn kvs_filter_cells(installs: [KvsCell], bs: [KBlock], canon: [String], captured: [String], acc: [KvsCell]) : [KvsCell] = match installs {
+fn kvs_filter_cells(installs: [KvsCell], bs: [KBlock], canon: [String], acc: [KvsCell]) : [KvsCell] = match installs {
   [] -> acc
-  [KVC(site, a), ...rest] -> kvs_filter_cells(rest, bs, canon, captured,
-    if kvs_cell_admissible(site, a, rest, acc, bs, canon, captured) { [KVC(site, a), ...acc] } else { acc })
+  [KVC(site, a), ...rest] -> kvs_filter_cells(rest, bs, canon,
+    if kvs_cell_admissible(site, a, rest, acc, bs, canon) { [KVC(site, a), ...acc] } else { acc })
 }
 
-fn kvs_cell_admissible(site: String, a: String, rest: [KvsCell], acc: [KvsCell], bs: [KBlock], canon: [String], captured: [String]) : Bool = {
+fn kvs_cell_admissible(site: String, a: String, rest: [KvsCell], acc: [KvsCell], bs: [KBlock], canon: [String]) : Bool = {
   let unique = kvs_alias_count(rest, a) == 0 and kvs_alias_count(acc, a) == 0
-  let reg = cat2("__alias_id__", a)
-  let clean = not kvs_alias_reg_used(bs, reg) and not list_has(captured, reg)
+  let clean = not kvs_alias_reg_used(bs, kir_alias_id_reg(a))
   list_has(canon, site) and unique and clean and kvs_performs_ok(bs, a)
-}
-
-# Every name a handler env carries; an `__alias_id__<a>` among them is a
-# cell its clauses perform on by id from outside the installing fn.
-fn kvs_env_alias_caps(hs: [KHandlerDecl], acc: [String]) : [String] = match hs {
-  []           -> acc
-  [h, ...rest] -> kvs_env_alias_caps(rest, list_append(h.env_caps, acc))
 }
 
 fn kvs_alias_count(cells: [KvsCell], a: String) : Int = match cells {
@@ -317,7 +308,7 @@ fn kvs_rewrite_stmts(ss: [KStmt], cells: [KvsCell], sjregs: [String], acc: [KStm
   [KBindEvState(_, site, [r], _), KRC(KDrop(KVar(c)), _), ...rest] if c == r and kvs_site_rewritten(cells, site) ->
     kvs_rewrite_stmts(rest, cells, sjregs, acc)
   [s, ...rest] -> kvs_rewrite_stmts(rest, cells, sjregs, match s {
-    KInstall(_, site, Some(init), Some(_), p) -> match kvs_cell_of_site(cells, site) {
+    KInstall(_, site, Some(init), Some(_), _, p) -> match kvs_cell_of_site(cells, site) {
       Some(_) -> [KLet(kvs_cell_reg(site), SBoxed, KLitOp(init), p), ...acc]
       None    -> [s, ...acc]
     }
