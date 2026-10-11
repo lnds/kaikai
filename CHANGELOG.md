@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.140.0 (2026-10-10)
+
+### BREAKING CHANGE
+
+- names that resolved only by spelling now resolve by id or are rejected.
+- A type that nothing declares is an error (`type E = X` is an alias, and its target must exist).
+- A bare name exported by two imports at the same rung is an ambiguity error.
+- A `derive` of a non-core protocol is chosen structurally, by the protocol's operations.
+- `Decimal` currently needs `import decimal`; this is being reverted.
+
+### Changed
+
+- **compiler**: identity by declaration id only, names confined to the resolver and diagnostics (#2682)
+
 ## v0.139.7 (2026-10-10)
 
 ### Fixed
