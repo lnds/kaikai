@@ -9739,7 +9739,7 @@ fn synth_threaded_arg(st: InferState, x: Expr,
       Some(et) ->
         if arg_wants_vec_context(x, et) {
           check_expr_against(st, x, et, "argument", x.line, x.col)
-        } else { synth(st, x) }
+        } else { synth_expecting(st, x, et) }
       None -> synth(st, x)
     }
   }
@@ -9786,6 +9786,25 @@ fn synth_many_vec_args(st: InferState, es: [Expr],
                      exprs: [lowered.expr, ...rr.exprs] }
     }
   }
+}
+
+# `synth_many` with each argument's declared parameter in hand, where no
+# other context rule applies: a record literal's head is asked of it.
+fn synth_many_expecting(st: InferState, es: [Expr], param_tys: [Ty]) : InferredList / Console + File + Mutable = match es {
+  [] -> InferredList { st: st, tys: [], exprs: [] }
+  [x, ...rest] -> {
+    let r = match param_tys {
+      [pt, ..._] -> synth_expecting(st, x, apply_ty(st.sub, pt))
+      []         -> synth(st, x)
+    }
+    let rr = synth_many_expecting(r.st, rest, params_after_first(param_tys))
+    InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+  }
+}
+
+fn params_after_first(ps: [Ty]) : [Ty] = match ps {
+  [_, ...rest] -> rest
+  []           -> []
 }
 
 # A `@x` the cell-read lowering never reached (a `const` initialiser has
@@ -10040,7 +10059,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 } else {
                   st_push_inst(pick.st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
                 }
-                let ra_rest = synth_many(st_inst, rest_args)
+                let ra_rest = synth_many_expecting(st_inst, rest_args, params_after_first(fn_param_tys(st_inst, pick.inst_ty)))
                 let all_arg_tys = [first_ty, ...ra_rest.tys]
                 let all_arg_exprs = [r0.expr, ...ra_rest.exprs]
                 let rv = st_fresh_ty(ra_rest.st)
@@ -10656,7 +10675,7 @@ fn pool_answer(st: InferState, target_ty: Ty, pool: [SymId], r: SvRes) : Settled
 # argument's type; an argument no impl serves yet leaves the newest, and
 # the dispatch rewrite retargets the call once the type is known.
 fn tie_break(st: InferState, target_ty: Ty, pool: [SymId], ss: [SymId]) : Option[SymId] =
-  match last_listed_core(st.env.tab, st_scope(st), ss) {
+  match sv_last_listed_core(st.env.tab, st_scope(st), ss) {
     Some(s) -> Some(s)
     None    -> if not all(ss, (s) => pid_is_disp(st.protos.ids, s)) { None }
                else { match served_dispatcher(st.protos, target_ty, ss) {
@@ -10678,20 +10697,6 @@ fn served_dispatcher(pv: ProtoView, t: Ty, ss: [SymId]) : Option[SymId] = match 
         None    -> None
       }
     }
-  }
-}
-
-# Between core modules only, the core set's order is a rung order: the
-# declaration of the module it lists last, by module id.
-fn last_listed_core(tab: SymTab, v: ScopeView, ss: [SymId]) : Option[SymId] =
-  if not all(ss, (s) => sv_is_core(v, sym_owner(tab, s))) { None }
-  else { last_listed_loop(tab, v.cores, ss, None) }
-
-fn last_listed_loop(tab: SymTab, cores: [SymId], ss: [SymId], found: Option[SymId]) : Option[SymId] = match cores {
-  [] -> found
-  [c, ...rest] -> match find(ss, (s) => sym_same(sym_owner(tab, s), c)) {
-    Some(s) -> last_listed_loop(tab, rest, ss, Some(s))
-    None    -> last_listed_loop(tab, rest, ss, found)
   }
 }
 
@@ -11009,7 +11014,7 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
 fn synth_op_call_provided(st: InferState, sc: TyScheme, args_: [Expr],
                            recv: LocalId, esym: SymId, op: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
   let inst = st_instantiate_report(st, sc)
-  let ra = synth_many(inst.st, args_)
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "cap op call ", esym, op), line, col)
@@ -11042,7 +11047,7 @@ fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
   let eff_fresh = take_first(inst.fresh, eff_tparam_arity(st.op_eff_arities, esym))
   # Read before unifying: the substitution's slots mutate in place.
   let pinned = map(eff_fresh, (id) => occurs(id, inst.ty, inst.st.sub))
-  let ra = synth_many(inst.st, args_)
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "op call ", esym, op), line, col)
@@ -12511,7 +12516,7 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
   let res = match rhs.kind {
     ECall(f, pa) -> {
       let rf = synth_pipe_callee(rl.st, f, rl.ty)
-      let ra = synth_many(rf.st, pa)
+      let ra = synth_many_expecting(rf.st, pa, params_after_first(fn_param_tys(rf.st, rf.ty)))
       let rv = st_fresh_ty(ra.st)
       # same open-row trick `synth_call`
       # uses — let the callee's row tail bind to a fresh row var so
@@ -14214,19 +14219,55 @@ fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], expected: Ty,
       mk_inferred(r.st, named, root)
     }
     Some(ri) -> match ri {
-      RI(rsym, _, fds, _) ->
-        if rh_out_of_order(fis, fds) { synth(head.st, rh_in_declared_order(DrSym(rsym), fis, fds, line, col)) }
-        else {
-          let inst = rec_instantiate(head.st, ri)
-          let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
-          let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
-          let ty = apply_ty(st1.sub, inst.result_ty)
-          let root = with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)
-          mk_inferred(st1, ty, root)
-        }
+      RI(rsym, _, fds, _) -> {
+        let inst = rec_instantiate(head.st, ri)
+        let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
+        let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
+        let ty = apply_ty(st1.sub, inst.result_ty)
+        if rh_out_of_order(fis, fds) { lay_in_declared_order(head.st, st1, rsym, fds, r.fis, ty, line, col) }
+        else { mk_inferred(st1, ty, with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)) }
+      }
     }
   }
 }
+
+# A literal written in another order than its record declares, as a
+# block: each typed value bound in the order written, the record laid
+# from those bindings in the declared order. Evaluation keeps the source
+# order; `outer` is the state the bindings are scoped out to.
+fn lay_in_declared_order(outer: InferState, st: InferState, rsym: SymId, fds: [FieldDecl], vals: [FieldInit],
+                         ty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let bound = bind_written_fields(st, vals, line, col, 0)
+  let laid = read_declared_fields(bound.st, fds, vals, line, col)
+  let lit = with_ty(mk_expr(ERecordLit(DrSym(rsym), laid.fis), line, col), ty)
+  mk_inferred(st_restore_entries(outer, laid.st), ty, with_ty(mk_expr(EBlock(bound.stmts, Some(lit)), line, col), ty))
+}
+
+fn bind_written_fields(st: InferState, vals: [FieldInit], line: Int, col: Int, i: Int) : InferredStmts / Console + File + Mutable = match vals {
+  [] -> InferredStmts { st: st, stmts: [] }
+  [FI(_, v), ...rest] -> {
+    let pat = mk_pat(PBind(rh_temp_binder(line, col, i)), line, col)
+    let after = check_pattern_stamped(st, pat, let_binder_ty(typed_ty_or(v, TyAny), v))
+    let rr = bind_written_fields(after.st, rest, line, col, i + 1)
+    InferredStmts { st: rr.st, stmts: [SLet(after.pat, None, v), ...rr.stmts] }
+  }
+}
+
+fn read_declared_fields(st: InferState, fds: [FieldDecl], vals: [FieldInit], line: Int, col: Int) : InferredFInits / Console + File + Mutable = match fds {
+  [] -> InferredFInits { st: st, fis: [] }
+  [FD(_, dnm, _, _), ...rest] -> {
+    let r = synth(st, mk_local(rh_temp_binder(line, col, rh_written_at(vals, dnm)).id, line, col))
+    let rr = read_declared_fields(r.st, rest, vals, line, col)
+    InferredFInits { st: rr.st, fis: [FI(dnm, r.expr), ...rr.fis] }
+  }
+}
+
+# The type a `let` binder takes from a value of type `t`. The fixed-width
+# inline representation belongs to a LITERAL: a `<n>`-typed value from
+# anything else is a dynamic heap `Vec` at run time, so its binder
+# de-brands to `Vec[e]`.
+fn let_binder_ty(t: Ty, rhs: Expr) : Ty =
+  if ty_is_fixed_vec(t) and not is_fixed_vec_lit(rhs) { fixed_vec_unbrand(t) } else { t }
 
 fn check_record_lit_fields(st: InferState, rsym: SymId, fis: [FieldInit], fields: [FTy],
                            line: Int, col: Int) : InferState / Console + File {
@@ -14715,10 +14756,21 @@ fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 # `e` where a type is expected: a record literal's head is asked of that
-# type first; any other shape is synthesised.
+# type first, as is one written as an element of a list literal; any
+# other shape is synthesised.
 fn synth_expecting(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = match e.kind {
   ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
-  _                   -> synth(st, e)
+  EList(els) -> match apply_ty(st.sub, expected) {
+    TyListT(elem_ty) -> if any(els, elem_is_record_lit) { check_list_elems_against(st, els, elem_ty, e.line, e.col) }
+                        else { synth(st, e) }
+    _ -> synth(st, e)
+  }
+  _ -> synth(st, e)
+}
+
+fn elem_is_record_lit(el: ListElem) : Bool = match el {
+  ElPlain(x)  -> is_record_lit(x)
+  ElSpread(_) -> false
 }
 
 fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
@@ -14923,15 +14975,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
         None -> lower_pair.ty
         Some(te) -> st_annot_ty(rr.st, te)
       }
-      # The fixed-width inline representation is an optimisation of a
-      # LITERAL: a `let x : Vec[e]<n> = [ ... ]` binds a flat aggregate.
-      # A `<n>`-typed value that came from anything else (a function
-      # return, a field) is a dynamic heap `Vec` at runtime, so the
-      # binder de-brands to `Vec[e]` — otherwise codegen would cast a
-      # boxed value into a fixed struct.
-      let binding_ty = if ty_is_fixed_vec(binding_ty0) and not is_fixed_vec_lit(lower_pair.expr) {
-        fixed_vec_unbrand(binding_ty0)
-      } else { binding_ty0 }
+      let binding_ty = let_binder_ty(binding_ty0, lower_pair.expr)
       let after = check_pattern_stamped(binding_st, pat, binding_ty)
       OneStmt { st: after.st, stmt: SLet(after.pat, ann, lower_pair.expr) }
     }
@@ -16015,11 +16059,11 @@ fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Co
         }
         EName(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
         ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
-        _ -> synth(st, br)
+        _ -> if is_record_lit(te) { check_expr_against(st, br, expected, "if branch", br.line, br.col) } else { synth(st, br) }
       }
       None -> synth(st, br)
     }
-    _ -> synth(st, br)
+    _ -> synth_expecting(st, br, expected)
   }
 }
 
@@ -16467,7 +16511,7 @@ fn check_elem_against(st: InferState, ex: Expr, elem_ty: Ty,
 
 fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
                     line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let r0 = synth(st, ex)
+  let r0 = synth_expecting(st, ex, elem_ty)
   let r = if not (rc_mentions(elem_ty) or rc_mentions_in(r0.st.sub, r0.ty)) { r0 } else {
     let m = refine_coerce(MintedExpr { st: r0.st, pair: ExprTy { expr: r0.expr, ty: r0.ty } }, elem_ty, "list element", ex.line, ex.col)
     mk_inferred(m.st, m.pair.ty, m.pair.expr)
@@ -16533,25 +16577,9 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
         # disambiguation can pick a user variant over the core builtin. Other
         # tail shapes keep synthing the whole body as before to avoid
         # regressions in non-ctor expression types.
-        ECall(_, _) -> {
-          let outer = st
-          let is_ = synth_stmts(st, stmts)
-          let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
-          let st2 = st_restore_entries(outer, r.st)
-          let ty = apply_ty(st2.sub, r.ty)
-          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
-          mk_inferred(st2, ty, root)
-        }
-        EName(_) -> {
-          let outer = st
-          let is_ = synth_stmts(st, stmts)
-          let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
-          let st2 = st_restore_entries(outer, r.st)
-          let ty = apply_ty(st2.sub, r.ty)
-          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
-          mk_inferred(st2, ty, root)
-        }
-        _ -> synth(st, body)
+        ECall(_, _) -> check_block_tail(st, stmts, te, expected, what, body)
+        EName(_)    -> check_block_tail(st, stmts, te, expected, what, body)
+        _ -> if is_record_lit(te) { check_block_tail(st, stmts, te, expected, what, body) } else { synth(st, body) }
       }
       None -> synth(st, body)
     }
@@ -16564,6 +16592,21 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
     ESym(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     _ -> synth_expecting(st, body, expected)
   }
+}
+
+# The block `{ stmts; te }` with its tail checked against `expected`.
+fn check_block_tail(st: InferState, stmts: [Stmt], te: Expr, expected: Ty,
+                    what: String, body: Expr) : Inferred / Console + File + Mutable = {
+  let is_ = synth_stmts(st, stmts)
+  let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
+  let st2 = st_restore_entries(st, r.st)
+  let ty = apply_ty(st2.sub, r.ty)
+  mk_inferred(st2, ty, with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty))
+}
+
+fn is_record_lit(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _) -> true
+  _                -> false
 }
 
 # walk arms and rewrite `PVariantRecord(name, fields)` to
