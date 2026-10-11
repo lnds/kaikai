@@ -1,0 +1,122 @@
+#[doc("""
+An operation left between the protocols that declare it.
+
+Two modules on one rung of a reader's scope may each declare a protocol
+with the same operation. A bare use of it names a set of dispatchers, and
+only the type that receives the operation says which protocol answers.
+Where that type is not known yet the reference is kept as the set
+itself, `MkProtoOp`, and the dispatch rewrite settles it once the
+receiver has a type: at the call, or in each specialisation of a generic
+body.
+
+This module owns what is said and done about a reference nothing
+settled: the report when no type can ever arrive, and the form such a
+call takes in a body that is never specialised.
+
+Dispatch is static. A dispatcher called at run time answers for the
+protocols of its own home, so an unspecialised body has no dispatcher to
+call for an operation left between several, and the call is a panic that
+names them.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.decl_map
+import compiler.diag
+import compiler.util
+import compiler.written
+import compiler.symtab
+import compiler.core_builtins
+import compiler.proto_ids
+
+#[doc("The dispatchers the reference `f` stands between; `[]` for any other reference.")]
+pub fn contest_of(f: Expr) : [SymId] = match f.kind {
+  EMark(MkProtoOp(ss)) -> ss
+  _                    -> []
+}
+
+#[doc("The protocols behind the dispatchers `ss`, each once.")]
+pub fn contest_protocols(ids: ProtoIds, ss: [SymId]) : [SymId] = protocols_of(ids, ss, [])
+
+fn protocols_of(ids: ProtoIds, ss: [SymId], acc: [SymId]) : [SymId] = match ss {
+  []           -> list_reverse(acc)
+  [s, ...rest] -> protocols_of(ids, rest, add_each(pid_protos_of(ids, s), acc))
+}
+
+fn add_each(ps: [SymId], acc: [SymId]) : [SymId] = match ps {
+  []           -> acc
+  [p, ...rest] -> add_each(rest, if any(acc, (x) => sym_raw(x) == sym_raw(p)) { acc } else { [p, ...acc] })
+}
+
+#[doc("The arity every dispatcher of `ss` declares, or `None` when they differ.")]
+pub fn contest_arity(ids: ProtoIds, ss: [SymId]) : Option[Int] = match ss {
+  []           -> None
+  [s, ...rest] -> match pid_disp(ids, s) {
+    None    -> None
+    Some(d) -> if all(rest, (x) => arity_is(ids, x, disp_arity(d))) { Some(disp_arity(d)) } else { None }
+  }
+}
+
+fn arity_is(ids: ProtoIds, s: SymId, n: Int) : Bool = match pid_disp(ids, s) {
+  Some(d) -> disp_arity(d) == n
+  None    -> false
+}
+
+#[doc("The reference `f` as the function of `n` parameters that calls it: an operation read as a value is settled at that call.")]
+pub fn contest_as_function(f: Expr, n: Int) : Expr = {
+  let bs = param_binders(f, 0, n)
+  let ps = map(bs, (b) => Param { binder: b, ptype: None, pline: f.line, pcol: f.col, pborrow: false })
+  let call = mk_expr(ECall(f, map(bs, (b) => mk_local(b.id, f.line, f.col))), f.line, f.col)
+  mk_expr(ELambda(ps, call), f.line, f.col)
+}
+
+fn param_binders(f: Expr, i: Int, n: Int) : [Binder] =
+  if i >= n { [] }
+  else { [binder_minted("__op_#{f.line}_#{f.col}_#{i}__"), ...param_binders(f, i + 1, n)] }
+
+#[doc("The report for an operation no type can settle: its name, and every protocol declaring it as `shown` spells them.")]
+pub fn contest_stranded_diag(file: String, line: Int, col: Int, ids: ProtoIds, ss: [SymId], shown: [String]) : Diagnostic = {
+  let at = (msg) => DR(file, line, col, msg)
+  mk_diag(SevError, file, line, col,
+    concat_all(["cannot tell which protocol's `", op_text(ids, ss), "` this is: the type that receives it is never known here"]),
+    map([concat_all(["note: protocol candidates: ", join_with(shown, ", ")]),
+         "help: annotate the receiver, so its type is known where the operation is used"], at))
+}
+
+# The operation the dispatchers stand for: one name, whichever is asked.
+fn op_text(ids: ProtoIds, ss: [SymId]) : String = match ss {
+  []       -> ""
+  [s, ..._] -> match pid_disp(ids, s) {
+    Some(d) -> disp_op(d)
+    None    -> ""
+  }
+}
+
+#[doc("`ds` with every call no specialisation settled turned into the panic that names its protocols. A program where no operation has two dispatchers is returned as it is.")]
+pub fn contest_strand_decls(ds: [Decl], tab: SymTab, ids: ProtoIds) : [Decl] =
+  if not pid_any_contest(ids) { ds }
+  else { map(ds, (d) => decl_map_bodies(d, (b) => strand(b, tab, ids))) }
+
+fn strand(e: Expr, tab: SymTab, ids: ProtoIds) : Expr = {
+  let mapped = Expr { ...e, kind: prc_map_expr_kind(e.kind, (x) => strand(x, tab, ids)) }
+  match mapped.kind {
+    ECall(f, _) -> match contest_of(f) {
+      [] -> mapped
+      ss -> stranded_call(mapped, tab, ids, ss)
+    }
+    _ -> mapped
+  }
+}
+
+fn stranded_call(e: Expr, tab: SymTab, ids: ProtoIds, ss: [SymId]) : Expr = {
+  let ret = match e.ty {
+    Some(t) -> t
+    None    -> TyAny
+  }
+  let names = map(contest_protocols(ids, ss), (p) => written_text(sym_name(tab, p)))
+  let text = concat_all(["`", op_text(ids, ss), "` reached a receiver whose type was never known; ",
+                         join_with(names, ", "), " declare it"])
+  let msg = with_ty(mk_expr(EStr(concat_all(["\"", text, "\""]), false), e.line, e.col), TyString)
+  let panic_ty = TyFnT([TyString], ret, Row { labels: [], tail: None, display_alias: None })
+  Expr { ...e, kind: ECall(with_ty(builtin_mk(CbPanic, e.line, e.col), panic_ty), [msg]) }
+}
