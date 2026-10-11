@@ -1,0 +1,155 @@
+#[doc("""
+The names parameters and patterns bind, and whether a task body touches
+a cell.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.written
+
+#[doc("`acc` with the names the parameters bind.")]
+pub fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> dsg_rename_param_names(rest, [written_text(p.binder.name), ...acc])
+  }
+}
+
+# Names introduced by a single pattern. Mirrors `bind_pat` but
+# accumulates into a `[String]` rather than a resolver Env.
+
+#[doc("`acc` with the names the pattern binds.")]
+pub fn dsg_rename_pat_names(p: Pattern, acc: [String]) : [String] {
+  match p.pkind {
+    PWild         -> acc
+    PLit(_)       -> acc
+    PRange(_, _)  -> acc
+    PBind(b)      -> [written_text(b.name), ...acc]
+    PList(pats, opt_rest) -> {
+      let a = dsg_rename_pats_names(pats, acc)
+      match opt_rest { Some(r) -> [written_text(r.name), ...a] None -> a }
+    }
+    PVariant(_, subs)     -> dsg_rename_pats_names(subs, acc)
+    PVariantRecord(_, fs) -> dsg_rename_pfields_names(fs, acc)
+    PRecord(fs)              -> dsg_rename_pfields_names(fs, acc)
+    PHole(_)                 -> acc
+    PAs(b, sub)              -> dsg_rename_pat_names(sub, [written_text(b.name), ...acc])
+    PNarrow(b, _)            -> [written_text(b.name), ...acc]
+    PSurface(sp)             -> dsg_rename_pats_names(patsurface_children(sp), acc)
+  }
+}
+
+fn dsg_rename_pats_names(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> dsg_rename_pats_names(rest, dsg_rename_pat_names(p, acc))
+  }
+}
+
+fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [pf, ...rest] -> match pf {
+      PField(_, sub, _) -> dsg_rename_pfields_names(rest, dsg_rename_pat_names(sub, acc))
+    }
+  }
+}
+
+#[doc("`s` introduces a fresh binder named `n`, shadowing the cell from here on.")]
+pub fn stmt_rebinds_cell(s: Stmt, n: String) : Bool =
+  match s {
+    SVar(m, _, _, _, _) -> written_text(m.name) == n
+    SLet(p, _, _) -> list_has(dsg_rename_pat_names(p, []), n)
+    _ -> false
+  }
+
+#[doc("""
+Does the spawn task `e` touch the cell `n` (read/write directly, or apply a
+tainted closure that captured it)? Shadow-aware: a nested binder that rebinds
+`n` masks the cell from that point on, so the inner `n` is its own fiber's.
+""")]
+pub fn task_touches_cell(e: Expr, n: String, tainted: [String]) : Bool =
+  match e.kind {
+    ECall(callee, args_) -> {
+      let direct = match callee.kind {
+        EField(base, fname) -> match base.kind {
+          EName(m) -> written_text(m) == n and (fname == "get" or fname == "set")
+          _ -> false
+        }
+        _ -> false
+      }
+      let applied = match callee.kind { EName(f) -> list_has(tainted, written_text(f))  _ -> false }
+      direct or applied or task_touches_cell(callee, n, tainted) or task_args_touch_cell(args_, n, tainted)
+    }
+    ELambda(ps, body) ->
+      if list_has(dsg_rename_param_names(ps, []), n) { false } else { task_touches_cell(body, n, tainted) }
+    EField(base, _) -> task_touches_cell(base, n, tainted)
+    EIndex(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EBinop(_, a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EUnop(_, x) -> task_touches_cell(x, n, tainted)
+    EIf(c, t_, eo) -> task_touches_cell(c, n, tainted) or task_touches_cell(t_, n, tainted) or
+      (match eo { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+    EBlock(ss, t) -> task_stmts_touch_cell(ss, n, tainted, t)
+    EMatch(scr, arms) -> task_touches_cell(scr, n, tainted) or task_arms_touch_cell(arms, n, tainted)
+    EList(elems) -> task_elems_touch_cell(elems, n, tainted)
+    ERange(a, b, os) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted) or
+      (match os { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+    EPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EMapPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EFlatMapPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EFilterPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
+    EBang(inner) -> task_touches_cell(inner, n, tainted)
+    ELitUnit(inner, _) -> task_touches_cell(inner, n, tainted)
+    _ -> false
+  }
+
+fn task_args_touch_cell(es: [Expr], n: String, tainted: [String]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if task_touches_cell(h, n, tainted) { true } else { task_args_touch_cell(rest, n, tainted) }
+  }
+}
+
+# A nested `var n` / `let n` rebinds the cell for the rest of the block.
+fn task_stmts_touch_cell(ss: [Stmt], n: String, tainted: [String], tail: Option[Expr]) : Bool {
+  match ss {
+    [] -> match tail { Some(x) -> task_touches_cell(x, n, tainted)  None -> false }
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> task_touches_cell(rhs, n, tainted)
+        SExprStmt(x) -> task_touches_cell(x, n, tainted)
+        SVar(_, _, rhs, _, _) -> task_touches_cell(rhs, n, tainted)
+        SIndexAssign(b, i, v, _, _) -> task_touches_cell(b, n, tainted) or
+          task_touches_cell(i, n, tainted) or task_touches_cell(v, n, tainted)
+        SAssign(b, v, _, _) -> task_touches_cell(b, n, tainted) or
+          task_touches_cell(v, n, tainted)
+        SAssert(c, m) -> task_touches_cell(c, n, tainted) or
+          (match m { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+        _ -> false
+      }
+      if here { true }
+      else if stmt_rebinds_cell(s, n) { false }
+      else { task_stmts_touch_cell(rest, n, tainted, tail) }
+    }
+  }
+}
+
+fn task_arms_touch_cell(arms: [Arm], n: String, tainted: [String]) : Bool {
+  match arms {
+    [] -> false
+    [Arm(p, _, b), ...rest] -> {
+      let here = if list_has(dsg_rename_pat_names(p, []), n) { false } else { task_touches_cell(b, n, tainted) }
+      here or task_arms_touch_cell(rest, n, tainted)
+    }
+  }
+}
+
+fn task_elems_touch_cell(es: [ListElem], n: String, tainted: [String]) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> {
+      let here = match el { ElPlain(x) -> task_touches_cell(x, n, tainted)  ElSpread(x) -> task_touches_cell(x, n, tainted) }
+      here or task_elems_touch_cell(rest, n, tainted)
+    }
+  }
+}

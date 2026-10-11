@@ -1,0 +1,166 @@
+#[doc("""
+`use Eff`: the effects each declaration opens, and the rewrite driven
+over a program.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.scope_file
+import compiler.desugar_record_lit
+import compiler.desugar_use_scope
+import compiler.desugar_use_types
+import compiler.desugar_use_rewrite
+
+fn use_collect_eff_ops(decls: [Decl]) : [EffOps] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, eff, _, ops, _, _, _, _) ->
+        [EffOps(eff, use_op_names(ops, [])), ...use_collect_eff_ops(rest)]
+      _ -> use_collect_eff_ops(rest)
+    }
+  }
+}
+
+fn use_op_names(ops: [EffectOp], acc: [String]) : [String] {
+  match ops {
+    [] -> list_reverse(acc)
+    [op, ...rest] -> match op {
+      EffOp(n, _, _, _, _, _) -> use_op_names(rest, [n, ...acc])
+    }
+  }
+}
+
+# Collect file-level DUse names; everything else passes through.
+# Returns (file_opens, decls_without_DUse).
+type UseSplit = { file_opens: [String], decls: [Decl] }
+
+fn use_split_decls(decls: [Decl], opens: [String], acc: [Decl]) : UseSplit {
+  match decls {
+    [] -> UseSplit { file_opens: list_reverse(opens), decls: list_reverse(acc) }
+    [d, ...rest] -> match d {
+      DUse(name, _, _) -> use_split_decls(rest, [name, ...opens], acc)
+      _                -> use_split_decls(rest, opens, [d, ...acc])
+    }
+  }
+}
+
+#[doc("Result of the `use Effect` desugar: the rewritten decls plus an error count.")]
+pub type UseRwProgram = { decls: [Decl], errs: Int }
+
+#[doc("Strip file-level `use Effect` decls and rewrite bare op references inside their scope to `Eff.op` on the effect's declaration. A `use` name is settled against `tab` under the view of the `root` file.")]
+pub fn desugar_use_decls(decls: [Decl], tab: SymTab, views: FileViews, root: String, file: String) : UseRwProgram / Console + File {
+
+
+  let split = use_split_decls(decls, [], [])
+  let ux = UseScope { ops: use_collect_eff_ops(split.decls), sc: DsgScope { tab: tab, views: views, home: root } }
+  let opened = use_file_opens(split.file_opens, ux, file, [], 0)
+  use_rewrite_program(split.decls, ux, opened.opens, file, opened.errs, [])
+}
+
+# A file-level `use Eff` opens bare op names only for the bodies the
+# user wrote in THIS file — never for the auto-loaded stdlib decls in
+# the same stream. A stdlib body (`println(s) = print(s)`, the `Stdout`
+# default block) carries a `Some(module)` origin and must be left
+# untouched; rewriting it would re-point its bare `print` at the user's
+# opened op. Only root-origin (`None`) decls are rewritten.
+fn use_decl_is_root(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo)    -> mo_is_none(mo)
+  DTest(_, _, _, _, _)                     -> true
+  DBench(_, _, _, _, _)                    -> true
+  DCheck(_, _, _, _, _, _)                 -> true
+  DImpl(_, _, _, _, _, _, _, isym)               -> true
+  DDerive(_, inner, _, _)               -> use_decl_is_root(inner)
+  DUnstable(inner, _, _)                -> use_decl_is_root(inner)
+  DProtoLaws(_, inner, _, _, _)            -> use_decl_is_root(inner)
+  DImplAxiom(_, inner, _, _, _)            -> use_decl_is_root(inner)
+  DConstructor(inner, _, _)             -> use_decl_is_root(inner)
+  DDoc(_, _, inner, _, _)               -> use_decl_is_root(inner)
+  _                                     -> true
+}
+
+fn mo_is_none(mo: Option[String]) : Bool = match mo { None -> true  Some(_) -> false }
+
+fn use_rewrite_program(decls: [Decl], ux: UseScope, file_opens: [SymId],
+                         file: String, errs: Int, acc: [Decl]) : UseRwProgram / Console + File {
+
+
+  match decls {
+    [] -> UseRwProgram { decls: list_reverse(acc), errs: errs }
+    [d, ...rest] -> {
+      let r = if use_decl_is_root(d) {
+        use_rewrite_decl(d, ux, file_opens, file, errs)
+      } else {
+        UseRwDecl { decl: d, errs: errs }
+      }
+      use_rewrite_program(rest, ux, file_opens, file, r.errs, [r.decl, ...acc])
+    }
+  }
+}
+
+type UseRwDecl = { decl: Decl, errs: Int }
+
+fn use_rewrite_decl(d: Decl, ux: UseScope, file_opens: [SymId],
+                      file: String, errs: Int) : UseRwDecl / Console + File {
+
+
+  match d {
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) -> {
+      let bound = use_param_names(ps, [])
+      let r = use_rewrite_expr(body, ux, file_opens, bound, file, errs)
+      UseRwDecl { decl: DFn(p, fid, tps, ps, ret, row, r.expr, l, c, mo),
+                  errs: r.errs }
+    }
+    DTest(desc, body, l, c, mo) -> {
+      let r = use_rewrite_expr(body, ux, file_opens, [], file, errs)
+      UseRwDecl { decl: DTest(desc, r.expr, l, c, mo), errs: r.errs }
+    }
+    DBench(desc, body, l, c, mo) -> {
+      let r = use_rewrite_expr(body, ux, file_opens, [], file, errs)
+      UseRwDecl { decl: DBench(desc, r.expr, l, c, mo), errs: r.errs }
+    }
+    DCheck(desc, ps, body, l, c, mo) -> {
+      let r = use_rewrite_expr(body, ux, file_opens, [], file, errs)
+      UseRwDecl { decl: DCheck(desc, ps, r.expr, l, c, mo), errs: r.errs }
+    }
+    DImpl(pname, proto_args, target, ms, l, c, tps, isym) -> {
+      let rms = use_rewrite_decls(ms, ux, file_opens, file, errs, [])
+      UseRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c, tps, isym),
+                  errs: rms.errs }
+    }
+    DDerive(names, inner, l, c) -> {
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
+      UseRwDecl { decl: DDerive(names, r.decl, l, c), errs: r.errs }
+    }
+    DUnstable(inner, l, c) -> {
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
+      UseRwDecl { decl: DUnstable(r.decl, l, c), errs: r.errs }
+    }
+    DProtoLaws(thy, inner, l, c, mo) -> {
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
+      UseRwDecl { decl: DProtoLaws(thy, r.decl, l, c, mo), errs: r.errs }
+    }
+    DImplAxiom(thy, inner, l, c, mo) -> {
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
+      UseRwDecl { decl: DImplAxiom(thy, r.decl, l, c, mo), errs: r.errs }
+    }
+    DConstructor(inner, l, c) -> {
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
+      UseRwDecl { decl: DConstructor(r.decl, l, c), errs: r.errs }
+    }
+    _ -> UseRwDecl { decl: d, errs: errs }
+  }
+}
+
+fn use_rewrite_decls(decls: [Decl], ux: UseScope, file_opens: [SymId],
+                       file: String, errs: Int, acc: [Decl]) : UseRwProgram / Console + File {
+
+
+  match decls {
+    [] -> UseRwProgram { decls: list_reverse(acc), errs: errs }
+    [d, ...rest] -> {
+      let r = use_rewrite_decl(d, ux, file_opens, file, errs)
+      use_rewrite_decls(rest, ux, file_opens, file, r.errs, [r.decl, ...acc])
+    }
+  }
+}

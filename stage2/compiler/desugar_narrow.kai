@@ -1,0 +1,85 @@
+#[doc("""
+Pattern narrowing: an arm over a refined alias lowered to the predicate
+that decides it.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.scope_file
+import compiler.desugar_map
+import compiler.desugar_record_lit
+import compiler.desugar_refine_pred
+
+#[doc("Lower `PNarrow(name, alias)` patterns into a binder plus a predicate guard against the alias's synthesised pred fn. A written narrow head is settled against `tab` under the view of its file; `root` is the target module.")]
+pub fn lower_pattern_narrow_decls(decls: [Decl], tab: SymTab, views: FileViews, root: String, aliases: [SymId]) : [Decl] =
+  map(decls, (d) => lower_narrow_decl(d, NarrowScope { sc: dsg_scope_of(d, tab, views, root), aliases: aliases }))
+
+# The refinement aliases and the scope a narrow's head is settled in.
+type NarrowScope = { sc: DsgScope, aliases: [SymId] }
+
+fn lower_narrow_decl(d: Decl, ns: NarrowScope) : Decl {
+  match d {
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, fid, tps, ps, ret, row, lower_narrow_expr(body, ns), l, c, mo)
+    DTest(desc, body, l, c, mo) -> DTest(desc, lower_narrow_expr(body, ns), l, c, mo)
+    DBench(desc, body, l, c, mo) -> DBench(desc, lower_narrow_expr(body, ns), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, lower_narrow_expr(body, ns), l, c, mo)
+    # See through the transparent `#[unstable]` wrapper so a
+    # `p : RefineAlias` narrow inside an unstable fn body still lowers to
+    # a binder + predicate guard instead of reaching the typer as a raw
+    # `PNarrow` ("requires a union scrutinee").
+    DUnstable(inner, l, c) -> DUnstable(lower_narrow_decl(inner, ns), l, c)
+    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, lower_narrow_decl(inner, ns), l, c, mo)
+    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, lower_narrow_decl(inner, ns), l, c, mo)
+    DConstructor(inner, l, c) -> DConstructor(lower_narrow_decl(inner, ns), l, c)
+    _ -> d
+  }
+}
+
+fn lower_narrow_expr(e: Expr, ns: NarrowScope) : Expr {
+  match e.kind {
+    EMatch(scr, arms) -> {
+      let scr2 = lower_narrow_expr(scr, ns)
+      let arms2 = map(arms, (a) => lower_narrow_arm(a, ns))
+      mk_expr(EMatch(scr2, arms2), e.line, e.col)
+    }
+    _ -> {
+      let new_kind = dsg_map_expr_kind(e.kind, (sub) => lower_narrow_expr(sub, ns))
+      mk_expr(new_kind, e.line, e.col)
+    }
+  }
+}
+
+fn lower_narrow_arm(a: Arm, ns: NarrowScope) : Arm {
+  match a {
+    Arm(pat, guard, body) -> {
+      let body1 = lower_narrow_expr(body, ns)
+      let guard1 = match guard {
+        None -> None
+        Some(g) -> Some(lower_narrow_expr(g, ns))
+      }
+      match pat.pkind {
+        PNarrow(b, ty) -> match ty.tkind {
+          TyName(r, []) -> {
+            let t = dsg_type_sym(ns.sc, r)
+            if dsg_sym_in(ns.aliases, t) {
+              # Restore the bind + synthesised pred call shape.
+              let var_e = mk_expr(EName(b.name), pat.line, pat.col)
+              let pred_fn = mk_sym(refine_pred_sym(ns.sc.tab, t), pat.line, pat.col)
+              let call = mk_expr(ECall(pred_fn, [var_e]), pat.line, pat.col)
+              let new_guard = match guard1 {
+                None -> Some(call)
+                Some(g) -> Some(mk_expr(EBinop(BoAnd, call, g), call.line, call.col))
+              }
+              Arm(mk_pat(PBind(b), pat.line, pat.col), new_guard, body1)
+            } else {
+              Arm(pat, guard1, body1)
+            }
+          }
+          _ -> Arm(pat, guard1, body1)
+        }
+        _ -> Arm(pat, guard1, body1)
+      }
+    }
+  }
+}

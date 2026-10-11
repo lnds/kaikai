@@ -1,0 +1,176 @@
+#[doc("""
+Predicate functions synthesised for refined aliases, and the lowering of
+extern opaques and axioms.
+""")]
+
+import compiler.ast
+import compiler.modules_homes
+import compiler.refinements
+import compiler.decl_names
+import compiler.symtab_build
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+
+#[doc("A lowered stream and the table rows of the declarations the lowering minted.")]
+pub type DsgMinted = { decls: [Decl], rows: [NEnt] }
+
+# Rewrite every `axiom name(params) : T / row` into a regular
+# `fn name(params) : T / row = todo!("axiom <name> not bound")`. The
+# `todo!` body inherits "any type fits" inference and a runtime
+# `kai_core_panic`, so calling an unbound axiom at runtime aborts.
+# The typer / monomorphiser / emitter therefore see only ordinary fns
+# and need no DAxiom-specific handling.
+#[doc("Rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function. `home` is the module the stream's axioms are declared in.")]
+pub fn lower_axioms(ds: [Decl], home: String) : [Decl] = map(ds, (d) => lower_axiom_one(d, home))
+
+# Lower an `extern "C" opaque T` to a one-phantom-field nominal record
+# so Perceus reference-counts the handle box (dup before
+# each consuming use, drop once at end of scope). Without a field
+# Perceus treats the type as a non-heap scalar and emits no drop — the
+# `KAI_FOREIGN` box would then leak. The phantom field is never read or
+# constructed on the kaikai side (the only source is an FFI return, the
+# only sinks are FFI calls), and at runtime the value is a `KAI_FOREIGN`
+# box whose decref frees the box without touching any field — so the
+# record shape is a pure typer/RC fiction that never has to match the
+# box. An `extern "C" type` STRUCT is left untouched: it already works
+# as an ordinary structural record (constructed + field-accessed).
+#[doc("Lower every `extern \"C\" opaque` to a one-field nominal record so Perceus RC-tracks the handle box. The record is a type of its module (the `root` when it carries no origin), returned with its table row.")]
+pub fn lower_extern_opaques(ds: [Decl], root: String) : DsgMinted = lower_extern_opaques_loop(ds, root, [], [])
+
+fn lower_extern_opaques_loop(ds: [Decl], root: String, acc: [Decl], rows: [NEnt]) : DsgMinted = match ds {
+  [] -> DsgMinted { decls: list_reverse(acc), rows: list_reverse(rows) }
+  [d, ...rest] -> match d {
+    DExternType(name, ETOpaque, l, c, mo) -> {
+      let home = match mo { Some(m) -> m  None -> root }
+      let body = TBRecord([FD(false, "__ffi_handle", mk_ty(TyName(ref_written("Int"), []), l, c), [])])
+      lower_extern_opaques_loop(rest, root,
+        [DType(false, sym_derive(NCType, name, home), [], body, l, c, mo, []), ...acc],
+        [NEnt(NCType, name, home, false, NmSource), ...rows])
+    }
+    _ -> lower_extern_opaques_loop(rest, root, [d, ...acc], rows)
+  }
+}
+
+#[doc("The `DFn` a `DAxiom` lowers to, declared in the module `home`; any other declaration unchanged.")]
+pub fn lower_axiom_one(d: Decl, home: String) : Decl {
+  match d {
+    DAxiom(is_pub, abi, name, sym, tparams, params, ret_ty, row, l, c) -> {
+      # An extern fn lowers to a DFn whose body is an `EExternBody`
+      # marker the backends replace with a shim; a plain axiom keeps the
+      # unbound-panic `ETodo`.
+      let body = match abi {
+        Some(a) -> mk_expr(EExternBody(a, sym), l, c)
+        None    -> mk_expr(ETodo(string_concat("axiom ", string_concat(name, " not bound"))), l, c)
+      }
+      DFn(is_pub, fnid_decl(sym_derive(NCFn, name, home)), tparams, params, Some(ret_ty), row, body, l, c, None)
+    }
+    _ -> d
+  }
+}
+
+# Synthesise a refinement-predicate fn for every `type X = Base where
+# pred` alias. The fn is named `__ref_pred_X(self: Base) : Bool`, is
+# declared in the alias's own module, and carries the same predicate
+# expression the user wrote. It has an empty effect row, so a contract
+# predicate may call it.
+#
+# `target_mod` is threaded so each synthesised fn takes the module
+# origin of the originating `DType`: `mo = Some("foo")` for an alias of
+# `stdlib/foo.kai`, `mo = None` for a root-file one.
+#[doc("Synthesise the predicate fn backing each `type T = base where pred` refinement alias; returns the stream with them and their table rows.")]
+pub fn synthesize_refine_pred_fns(decls: [Decl], tab: SymTab, target_mod: String) : DsgMinted =
+  synth_refine_loop(decls, tab, target_mod, target_mod, [], [])
+
+#[doc("The identity of each predicate fn `synthesize_refine_pred_fns` mints for `decls`.")]
+pub fn refine_pred_fn_syms(decls: [Decl], tab: SymTab) : [SymId] =
+  map(collect_refine_alias_ids(decls), (t) => refine_pred_sym(tab, t))
+
+#[doc("""
+The predicate fn of the refinement alias `t`: `__ref_pred_<T>` in the
+module that declares `t`.
+""")]
+pub fn refine_pred_sym(tab: SymTab, t: SymId) : SymId =
+  sym_derive(NCFn, refine_pred_name(tab, t), written_text(decl_home(tab, t)))
+
+fn refine_pred_name(tab: SymTab, t: SymId) : String =
+  synth_refine_pred_fn_name(written_text(decl_name(tab, t)))
+
+fn synth_refine_loop(decls: [Decl], tab: SymTab, target_mod: String, cur_mod: String,
+                       acc: [Decl], rows: [NEnt]) : DsgMinted {
+  match decls {
+    [] -> DsgMinted { decls: list_reverse(acc), rows: list_reverse(rows) }
+    [d, ...rest] -> {
+      let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+      let parent_mo =
+        if next_mod == target_mod { None } else { Some(next_mod) }
+      let extra = synth_refine_for_decl(d, tab, parent_mo)
+      synth_refine_loop(rest, tab, target_mod, next_mod,
+                        list_append(extra.decls, [d, ...acc]), list_append(extra.rows, rows))
+    }
+  }
+}
+
+fn synth_refine_for_decl(d: Decl, tab: SymTab, parent_mo: Option[String]) : DsgMinted {
+  # A refinement alias under a transparent wrapper still needs its
+  # `__ref_pred_X` fn, else the narrow guard references a fn that was
+  # never emitted.
+  match decl_transparent_inner(d) {
+    Some(inner) -> synth_refine_for_decl(inner, tab, parent_mo)
+    None -> match d {
+      DType(_, t, _, body, l, c, _, _) -> match body {
+        TBAlias(te) -> match te.tkind {
+          TyRefine(base, pred) -> build_refine_pred_fn(tab, t, base, pred, l, c, parent_mo)
+          _ -> DsgMinted { decls: [], rows: [] }
+        }
+        _ -> DsgMinted { decls: [], rows: [] }
+      }
+      _ -> DsgMinted { decls: [], rows: [] }
+    }
+  }
+}
+
+fn build_refine_pred_fn(tab: SymTab, t: SymId, base: TypeExpr, pred: Expr,
+                          l: Int, c: Int, mo: Option[String]) : DsgMinted {
+  let self_param = Param { binder: binder_written("self"), ptype: Some(base),
+                            pline: l, pcol: c, pborrow: false }
+  let ret_ty = mk_ty(TyName(ref_written("Bool"), []), l, c)
+  # Empty effect row marks the synthesised predicate fn as pure, so a
+  # refinement-alias narrow used in a contract resolves as effect-pure.
+  DsgMinted {
+    decls: [DFn(false, fnid_decl(refine_pred_sym(tab, t)), [], [self_param], Some(ret_ty),
+                REmpty, pred, l, c, mo)],
+    rows: [NEnt(NCFn, refine_pred_name(tab, t), written_text(decl_home(tab, t)), false, NmHelper)]
+  }
+}
+
+# Lower `PNarrow(name, TyName(t, []))` whose `t` is a refinement-type
+# alias back into the shape `PBind(name) + guard __ref_pred_t(name)`.
+# The parser emits
+# `PNarrow` uniformly because at parse time we can't tell whether
+# `t` names a refinement alias or a union-component nominal type;
+# this pass disambiguates after `synthesize_refine_pred_fns` has
+# populated the alias namespace. Non-refinement narrowings stay as
+# `PNarrow` for the typer's union-component check.
+#[doc("Collect the refinement-alias types so the pattern-narrow lowering knows which `PNarrow` heads are refinement checks.")]
+pub fn collect_refine_alias_ids(decls: [Decl]) : [SymId] =
+  collect_refine_alias_loop(decls, [])
+
+fn collect_refine_alias_loop(decls: [Decl], acc: [SymId]) : [SymId] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match decl_transparent_inner(d) {
+      Some(inner) -> collect_refine_alias_loop([inner, ...rest], acc)
+      None -> match d {
+        DType(_, t, _, body, _, _, _, _) -> match body {
+          TBAlias(te) -> match te.tkind {
+            TyRefine(_, _) -> collect_refine_alias_loop(rest, [t, ...acc])
+            _ -> collect_refine_alias_loop(rest, acc)
+          }
+          _ -> collect_refine_alias_loop(rest, acc)
+        }
+        _ -> collect_refine_alias_loop(rest, acc)
+      }
+    }
+  }
+}

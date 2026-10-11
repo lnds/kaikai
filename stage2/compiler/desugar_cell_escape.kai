@@ -1,0 +1,299 @@
+#[doc("""
+A cell or capability escaping its scope: returned, captured by an
+escaping closure, or passed to a spawned task.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.desugar_rename
+import compiler.desugar_cell_access
+
+#[doc("""
+Escape check for a cell `n` over its block (the `stmts` + `tail` the
+`State[n]` handler wraps). A closure that accesses `n` is legal as
+long as its VALUE never reaches the block's exit; once the block
+exits the handler is gone, so such a closure run later reads a dead
+frame. Forward-taint each `let f = <value carrying such a closure>`,
+then test whether the block's exit value carries one. Applying a
+tainted binder (`f()`) consumes the closure — its result, not `f`,
+flows on — which is what keeps `let f = () => n; let r = f()` legal.
+""")]
+pub fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], n: String, file: String) : Int / Console + File {
+
+  let tainted = lcr_taint_stmts(stmts, n, [])
+  # A bare `n` in tail position returns the capability itself out of its handle
+  # (escape vector 3). A capability may only appear as a call argument or an op
+  # receiver, never as a return value — reject it directly.
+  let direct = match tail {
+    Some(t) -> match t.kind { EName(v) -> if written_text(v) == n { report_cap_return(n, t.line, t.col, file) } else { 0 } _ -> 0 }
+    None    -> 0
+  }
+  # A `spawn(task)` anywhere in the block defers `task` to another fiber
+  # where the cell's evidence does not exist — a distinct escape from the
+  # value-reaching-exit one above, caught over the whole block, not just
+  # the tail.
+  let spawned = match spawn_block_escape_pos(stmts, tail, n, tainted) {
+    Some(p) -> report_cell_escape(n, p, file)
+    None    -> 0
+  }
+  let valued = match escaping_closure_opt(tail, n, tainted) {
+    Some(p) -> report_cell_escape(n, p, file)
+    None    -> 0
+  }
+  direct + spawned + valued
+}
+
+fn report_cap_return(n: String, line: Int, col: Int, file: String) : Int / Console + File {
+  diag_error(file, line, col, concat_all([
+    "the capability `", n, "` cannot be returned from its `handle`"
+  ]))
+  diag_help(concat_all([
+    "a capability bound by `as` is second-class — it may only be passed down as a call argument or used as an op receiver, not returned or stored; a value that must outlive its scope is a `Ref[T]` under `Mutable`"
+  ]))
+  1
+}
+
+fn report_cell_escape(n: String, p: CellPos, file: String) : Int / Console + File {
+  diag_error(file, p.line, p.col, concat_all([
+    "a closure that accesses the mutable cell `", n, "` escapes its block"
+  ]))
+  diag_help(concat_all([
+    "the handler for `", n, "` is fiber-local: it is torn down when its block exits and does not cross a `spawn`; a `var`/State/Reader cell or a capability bound by `as` cannot outlive its `handle` — pass its value down as a call argument, or model shared mutable state across fibers as an actor"
+  ]))
+  1
+}
+
+#[doc("""
+A single exit value (a handle body that is not a block). Same rule
+with no preceding statements to taint.
+""")]
+pub fn lcr_escape_in_value(e: Expr, n: String, file: String) : Int / Console + File {
+
+  match e.kind {
+    EBlock(stmts, tail) -> lcr_escape_check(stmts, tail, n, file)
+    _ -> match escaping_closure_pos(e, n, []) {
+           Some(p) -> report_cell_escape(n, p, file)
+           None    -> 0
+         }
+  }
+}
+
+# Forward pass: a `let f = rhs` taints `f` when `rhs` (in value
+# position) carries a closure accessing `n`. Only `let`-bound names
+# are tracked — other statements introduce no exit-reaching binder.
+fn lcr_taint_stmts(stmts: [Stmt], n: String, tainted: [String]) : [String] {
+
+  match stmts {
+    [] -> tainted
+    [s, ...rest] -> match s {
+      SLet(p, _, rhs) -> {
+        let t1 = match p.pkind {
+          PBind(f) -> match escaping_closure_pos(rhs, n, tainted) { Some(_) -> [written_text(f.name), ...tainted]  None -> tainted }
+          _ -> tainted
+        }
+        lcr_taint_stmts(rest, n, t1)
+      }
+      _ -> lcr_taint_stmts(rest, n, tainted)
+    }
+  }
+}
+
+# The source position of the escaping closure, for the diagnostic.
+type CellPos = { line: Int, col: Int }
+
+# If the value of `e` carries a closure that accesses cell `n` and has
+# not been applied, return the closure's position; else None. The access
+# `n.get()`/`n.set()` itself is fine (consumed in place); a bare lambda
+# or a tainted binder is the escaping value; applying either consumes
+# it. Call arguments are not followed — a lambda passed as an argument
+# runs eagerly inside the block.
+fn escaping_closure_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos] {
+
+  match e.kind {
+    ELambda(_, body) -> if contains_cell_access(body, n) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    EName(f) -> if list_has(tainted, written_text(f)) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    ECall(callee, _) -> match callee.kind {
+      # `f(...)` / `(\...)(...)` — applying consumes the closure; the
+      # value is the call result, never the closure itself.
+      EName(_) -> None
+      ESym(_, _) -> None
+      ELambda(_, _) -> None
+      # Any other callee (a field access, a nested call) might itself
+      # carry the closure; the arguments do not.
+      _ -> escaping_closure_pos(callee, n, tainted)
+    }
+    EIf(_, t_, eo) -> first_pos(escaping_closure_pos(t_, n, tainted),
+                                escaping_closure_opt(eo, n, tainted))
+    EMatch(_, arms) -> arms_escaping_pos(arms, n, tainted)
+    EBlock(ss, t) -> {
+      let inner = lcr_taint_stmts(ss, n, tainted)
+      escaping_closure_opt(t, n, inner)
+    }
+    EList(elems) -> elems_escaping_pos(elems, n, tainted)
+    ERecordLit(_, fields) -> fields_escaping_pos(fields, n, tainted)
+    EField(base, _) -> escaping_closure_pos(base, n, tainted)
+    EBang(inner) -> escaping_closure_pos(inner, n, tainted)
+    ELitUnit(inner, _) -> escaping_closure_pos(inner, n, tainted)
+    _ -> None
+  }
+}
+
+# Walk a block's stmts + tail for a `spawn(task)` whose task touches the
+# cell `n` in the child fiber. Unlike the value-reaching-exit check, this
+# follows into eager lambdas (a `nursery { n -> ... }` body runs in place
+# but may itself spawn), so the whole block is scanned.
+fn spawn_block_escape_pos(stmts: [Stmt], tail: Option[Expr], n: String, tainted: [String]) : Option[CellPos] =
+  first_pos(spawn_stmts_escape_pos(stmts, n, tainted),
+            match tail { Some(t) -> spawn_escape_pos(t, n, tainted)  None -> None })
+
+fn spawn_stmts_escape_pos(stmts: [Stmt], n: String, tainted: [String]) : Option[CellPos] {
+  match stmts {
+    [] -> None
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> spawn_escape_pos(rhs, n, tainted)
+        SExprStmt(x) -> spawn_escape_pos(x, n, tainted)
+        SVar(_, _, rhs, _, _) -> spawn_escape_pos(rhs, n, tainted)
+        SIndexAssign(b, i, v, _, _) -> first_pos(spawn_escape_pos(b, n, tainted),
+          first_pos(spawn_escape_pos(i, n, tainted), spawn_escape_pos(v, n, tainted)))
+        SAssign(b, v, _, _) -> first_pos(spawn_escape_pos(b, n, tainted),
+          spawn_escape_pos(v, n, tainted))
+        SAssert(c, m) -> first_pos(spawn_escape_pos(c, n, tainted),
+          match m { Some(x) -> spawn_escape_pos(x, n, tainted)  None -> None })
+        _ -> None
+      }
+      # A binder that rebinds `n` (a nested `var n`, or a `let` whose pattern
+      # binds `n`) shadows the cell for the rest of the block: a `counter`
+      # under it is the inner one, on the fiber that declared it. Stop tracking.
+      if stmt_rebinds_cell(s, n) { here }
+      else { first_pos(here, spawn_stmts_escape_pos(rest, n, tainted)) }
+    }
+  }
+}
+
+# A `<recv>.spawn(task)` defers `task` to another fiber, so a `task` that
+# touches the cell escapes its handler. Recurse the whole expression to
+# reach spawns nested under eager lambdas; at each spawn call, test its
+# arguments with `spawn_arg_escape_pos`.
+fn spawn_escape_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos] =
+  match e.kind {
+    ECall(callee, args_) -> {
+      let at_spawn = match callee.kind {
+        EField(_, "spawn") -> spawn_args_escape_pos(args_, n, tainted)
+        _ -> None
+      }
+      first_pos(at_spawn, first_pos(spawn_escape_pos(callee, n, tainted),
+                                    spawn_escape_args(args_, n, tainted)))
+    }
+    # A lambda param named `n` shadows the cell inside the body; only descend
+    # when it does not, so the inner `n` is left to its own fiber's handler.
+    ELambda(ps, body) ->
+      if list_has(dsg_rename_param_names(ps, []), n) { None }
+      else { spawn_escape_pos(body, n, tainted) }
+    EBlock(ss, t) -> spawn_block_escape_pos(ss, t, n, tainted)
+    EIf(c, t_, eo) -> first_pos(spawn_escape_pos(c, n, tainted),
+      first_pos(spawn_escape_pos(t_, n, tainted),
+                match eo { Some(x) -> spawn_escape_pos(x, n, tainted)  None -> None }))
+    EMatch(scr, arms) -> first_pos(spawn_escape_pos(scr, n, tainted), spawn_escape_arms(arms, n, tainted))
+    EField(base, _) -> spawn_escape_pos(base, n, tainted)
+    EBang(inner) -> spawn_escape_pos(inner, n, tainted)
+    ELitUnit(inner, _) -> spawn_escape_pos(inner, n, tainted)
+    EList(elems) -> spawn_escape_elems(elems, n, tainted)
+    EBinop(_, a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EUnop(_, x) -> spawn_escape_pos(x, n, tainted)
+    EPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EMapPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EFlatMapPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    EFilterPipe(a, b) -> first_pos(spawn_escape_pos(a, n, tainted), spawn_escape_pos(b, n, tainted))
+    _ -> None
+  }
+
+fn spawn_escape_args(es: [Expr], n: String, tainted: [String]) : Option[CellPos] {
+  match es {
+    [] -> None
+    [h, ...rest] -> first_pos(spawn_escape_pos(h, n, tainted), spawn_escape_args(rest, n, tainted))
+  }
+}
+
+fn spawn_escape_arms(arms: [Arm], n: String, tainted: [String]) : Option[CellPos] {
+  match arms {
+    [] -> None
+    [Arm(p, _, b), ...rest] -> {
+      # An arm pattern binding `n` shadows the cell in that arm's body.
+      let here = if list_has(dsg_rename_pat_names(p, []), n) { None }
+                 else { spawn_escape_pos(b, n, tainted) }
+      first_pos(here, spawn_escape_arms(rest, n, tainted))
+    }
+  }
+}
+
+fn spawn_escape_elems(es: [ListElem], n: String, tainted: [String]) : Option[CellPos] {
+  match es {
+    [] -> None
+    [el, ...rest] -> {
+      let here = match el { ElPlain(x) -> spawn_escape_pos(x, n, tainted)  ElSpread(x) -> spawn_escape_pos(x, n, tainted) }
+      first_pos(here, spawn_escape_elems(rest, n, tainted))
+    }
+  }
+}
+
+# A `spawn(task)` argument escapes when the deferred task touches the cell
+# in the child fiber. The task may touch it directly (`n.get`/`n.set`), apply a
+# closure that captured it (a tainted binder), or BE such a captured closure
+# passed straight through (`spawn(reader)`). A bare mention that only forwards
+# the closure onward is not an escape here — the spawn that runs it is.
+fn spawn_args_escape_pos(args_: [Expr], n: String, tainted: [String]) : Option[CellPos] {
+  match args_ {
+    [] -> None
+    [a, ...rest] -> first_pos(spawn_arg_escape_pos(a, n, tainted),
+                              spawn_args_escape_pos(rest, n, tainted))
+  }
+}
+
+fn spawn_arg_escape_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos] =
+  match e.kind {
+    ELambda(ps, body) ->
+      # A param named `n` shadows the cell inside the task body.
+      if list_has(dsg_rename_param_names(ps, []), n) { None }
+      else if task_touches_cell(body, n, tainted) { Some(CellPos { line: e.line, col: e.col }) }
+      else { None }
+    EName(f) -> if list_has(tainted, written_text(f)) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    _ -> None
+  }
+
+fn first_pos(a: Option[CellPos], b: Option[CellPos]) : Option[CellPos] =
+  match a { Some(_) -> a  None -> b }
+
+fn escaping_closure_opt(o: Option[Expr], n: String, tainted: [String]) : Option[CellPos] =
+  match o { Some(e) -> escaping_closure_pos(e, n, tainted)  None -> None }
+
+fn arms_escaping_pos(arms: [Arm], n: String, tainted: [String]) : Option[CellPos] {
+  match arms {
+    [] -> None
+    [Arm(_, _, b), ...rest] ->
+      first_pos(escaping_closure_pos(b, n, tainted), arms_escaping_pos(rest, n, tainted))
+  }
+}
+
+fn elems_escaping_pos(es: [ListElem], n: String, tainted: [String]) : Option[CellPos] {
+  match es {
+    [] -> None
+    [el, ...rest] -> {
+      let here = match el {
+        ElPlain(x)  -> escaping_closure_pos(x, n, tainted)
+        ElSpread(x) -> escaping_closure_pos(x, n, tainted)
+      }
+      first_pos(here, elems_escaping_pos(rest, n, tainted))
+    }
+  }
+}
+
+fn fields_escaping_pos(fs: [FieldInit], n: String, tainted: [String]) : Option[CellPos] {
+  match fs {
+    [] -> None
+    [FI(_, v), ...rest] ->
+      first_pos(escaping_closure_pos(v, n, tainted), fields_escaping_pos(rest, n, tainted))
+  }
+}

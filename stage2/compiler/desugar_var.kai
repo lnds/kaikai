@@ -1,0 +1,246 @@
+#[doc("""
+`var` desugared: each one becomes a one-slot cell that its reads and
+writes go through.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.refine_coerce
+import compiler.handler_alias
+import compiler.core_effects
+import compiler.core_builtins
+import compiler.written
+import compiler.desugar_map
+import compiler.desugar
+
+#[doc("Pre-resolve desugar of `var name [: T] = init` into a Ref-cell let plus get/set rewrites; the per-program entry point.")]
+pub fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
+
+fn desugar_var_decl(d: Decl) : Decl {
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row, desugar_var_expr(body), l, c, mo)
+    DTest(desc, body, l, c, mo) -> DTest(desc, desugar_var_expr(body), l, c, mo)
+    DBench(desc, body, l, c, mo) -> DBench(desc, desugar_var_expr(body), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, desugar_var_expr(body), l, c, mo)
+    # `#[unstable]` wraps a `pub fn`; the wrapper is transparent, so
+    # recurse into the inner decl and rewrap. Without
+    # this, a `var` in an unstable fn body never lowers to State and the
+    # `.get`/`.set` receiver fails to resolve.
+    DUnstable(inner, l, c) -> DUnstable(desugar_var_decl(inner), l, c)
+    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, desugar_var_decl(inner), l, c, mo)
+    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, desugar_var_decl(inner), l, c, mo)
+    DConstructor(inner, l, c) -> DConstructor(desugar_var_decl(inner), l, c)
+    _ -> d
+  }
+}
+
+fn desugar_var_expr(e: Expr) : Expr =
+  Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn desugar_var_opt(opt: Option[Expr]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(desugar_var_expr(e))
+    None    -> None
+  }
+}
+
+# Recurse into a non-block stmt's expressions. Used for stmts that
+# appear *before* the head SVar of a block — they cannot reference the
+# cell the var introduces, but their inner blocks (lambdas, ifs, match
+# arms, etc.) may declare their own `var`s.
+fn desugar_var_stmt(s: Stmt) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_var_expr(rhs))
+    SAssert(c, m) -> SAssert(desugar_var_expr(c), desugar_var_opt(m))
+    SExprStmt(x) -> SExprStmt(desugar_var_expr(x))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(desugar_var_expr(b), desugar_var_expr(i),
+                   desugar_var_expr(v), l, c)
+    SAssign(b, v, l, c) ->
+      SAssign(desugar_var_expr(b), desugar_var_expr(v), l, c)
+    # SVar at this site means it sits at non-head position relative to
+    # the wrapping pass. desugar_var_block consumes head-position SVars;
+    # any residual one here is rewritten to a `let` so the resolver does
+    # not see a stray SVar (defensive — should not occur in well-formed
+    # input).
+    SVar(n, _, rhs, _, _) -> SLet(mk_pat(PBind(n), 0, 0), None,
+                                   desugar_var_expr(rhs))
+    # SUse pass through.
+    SUse(n, l, c) -> SUse(n, l, c)
+  }
+}
+
+# Build the canonical `with State[?T](init) as name { ... }` clauses
+# for a `var` lowering. They read the slot through the var-cell alias,
+# which no enclosing binding takes over the way it takes over `state`.
+#
+# The alias is a borrowed read of the slot, so Perceus dups it for the
+# resume in `get`. `set`'s `resume(unit, v)` stores `v` into the slot,
+# which then owns it.
+fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
+  let p_resume = Param { binder: binder_written("resume"), ptype: None, pline: line, pcol: col, pborrow: false }
+  let p_v      = Param { binder: binder_written("v"),      ptype: None, pline: line, pcol: col, pborrow: false }
+  let resume_e = mk_name("resume", line, col)
+  let cell_e   = mk_name(var_cell_alias(), line, col)
+  let unit_e   = mk_expr(EUnit,           line, col)
+  let v_e      = mk_name("v",       line, col)
+  let get_body = mk_expr(ECall(resume_e, [cell_e]), line, col)
+  let set_body = mk_expr(ECall(resume_e, [unit_e, v_e]), line, col)
+  [
+    HC(ChOp("get"), [p_resume], get_body, line, col),
+    HC(ChOp("set"), [p_v, p_resume], set_body, line, col)
+  ]
+}
+
+fn var_canonical_return(line: Int, col: Int) : HReturn {
+  HR(binder_written("x"), mk_name("x", line, col), line, col)
+}
+
+# Variable specialisation: a `var x := init; x; x := v` block compiles
+# to a stack slot, not a chain of handler invocations. The specialised
+# form replaces the canonical `with State[T] as x` handler with:
+#   let x_slot = array_make(1, init)
+#   { rest_with_n.get() → array_get(x_slot, 0)
+#         and n.set(v)   → { let _ = array_set(x_slot, 0, v); () } }
+# Trigger conditions:
+#   1. canonical handler shape (always true — emitted by us);
+#   2. no multi-shot resume (always true — canonical clauses);
+#   3. `name` only appears as `name.get()` / `name.set(v)` callee
+#      (no escape into a closure or argument);
+#   4. `init` is a "normal expression" — no op calls.
+# Conditions 1 and 2 hold by construction; this section adds the
+# conservative checks for 3 and 4 plus the rewrite.
+
+# Trigger 4: init is a normal expression. Conservative subset:
+# literals, a reference (to a local or global value), core
+# arithmetic / unary, calls whose callee is such a reference.
+# Anything else (op call, lambda, handle, match, if, block, list,
+# record, etc.) is rejected so the canonical handler runs instead.
+fn init_is_safe(e: Expr) : Bool {
+  match e.kind {
+    EInt(_, _)  -> true
+    EReal(_, _) -> true
+    EIntLit(_) -> true
+    EDecimalLit(_) -> true
+    EFixed(_, _) -> true
+    EBool(_) -> true
+    EChar(_) -> true
+    EStr(_, _) -> true
+    EUnit -> true
+    EName(_) -> true
+    ESym(_, _) -> true
+    ELocal(_) -> true
+    EBinop(_, a, b) -> init_is_safe(a) and init_is_safe(b)
+    EUnop(_, x) -> init_is_safe(x)
+    ECall(callee, args_) -> {
+      let callee_ok = match callee.kind {
+        EName(_) -> true
+        ESym(_, _) -> true
+        ELocal(_) -> true
+        _ -> false
+      }
+      callee_ok and init_args_safe(args_)
+    }
+    _ -> false
+  }
+}
+
+fn init_args_safe(es: [Expr]) : Bool {
+  match es {
+    [] -> true
+    [h, ...rest] -> if init_is_safe(h) { init_args_safe(rest) } else { false }
+  }
+}
+
+fn var_slot_name(name: String) : String = string_concat(name, "__slot")
+
+# The slot's binder is the desugar's own: spelled after its var, and
+# identified by where the var is declared.
+fn var_slot_binder(name: String, line: Int, col: Int) : Binder =
+  Binder { id: local_minted(concat_all(["__var_slot@", int_to_string(line), ":", int_to_string(col)])),
+           name: written(var_slot_name(name)) }
+
+# Walk a block's stmts looking for the first SVar. Returns the rewritten
+# (stmts, tail) pair: every stmt before the first SVar is structurally
+# desugared (so lambdas / inner blocks inside their expressions still
+# get their own `var`s rewritten), and from the SVar onward the rest
+# of the block becomes the body of a fresh `with State[T](init) as name`
+# handler. If no SVar is present, recursion proceeds structurally.
+fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
+  match stmts {
+    [] -> EBlock([], desugar_var_opt(tail))
+    [s, ...rest] -> match s {
+      SVar(b, ty, init, line, col) -> {
+        let name = written_text(b.name)
+        let init_d0 = desugar_var_expr(init)
+        # A declared `: T` binds the cell, so it must be checked against
+        # the initialiser. Neither lowering below carries the annotation
+        # (the slot drops it; the handler's `[T]` types the capability,
+        # not the state), so pin it here with an annotated `let` and feed
+        # its binder to both — the annotation check is the authority.
+        let ann = var_ann_binder(name, line, col)
+        let ann_pre = match ty {
+          Some(t) -> [SLet(mk_pat(PBind(ann), line, col), Some(t), init_d0)]
+          None -> []
+        }
+        let init_d = match ty {
+          Some(_) -> mk_expr(EName(ann.name), line, col)
+          None -> init_d0
+        }
+        let inner_kind = desugar_var_block(rest, tail)
+        let inner_expr = rc_check_var_writes(b.name, ty, mk_expr(inner_kind, line, col))
+        # Try variable specialisation first. When all
+        # trigger conditions hold, lower the var to a 1-element
+        # array slot (core `array_*`, no `Mutable` row) instead
+        # of the canonical State[T] handler. The conditions:
+        #   * init is a "normal expression" (init_is_safe)
+        #   * `name` only appears as `name.get`/`name.set` callee
+        #     in the body (body_escapes is false)
+        # When either fails, fall back to the canonical handler so
+        # captures, escapes, and complex inits still work.
+        if init_is_safe(init_d) and not body_escapes(name, inner_expr) {
+          let slot_name = var_slot_name(name)
+          let slot_init = mk_expr(
+            ECall(mk_expr(EMark(MkVarSlot(name)), line, col),
+                  [builtin_mk(CbArrayMake, line, col),
+                   mk_expr(mk_int_synth(1), line, col), init_d]),
+            line, col)
+          let let_pat = mk_pat(PBind(var_slot_binder(name, line, col)), line, col)
+          let let_stmt = SLet(let_pat, None, slot_init)
+          let body_spec = specialise_body(name, slot_name, inner_expr)
+          EBlock(list_append(ann_pre, [let_stmt]), Some(body_spec))
+        } else {
+          let tyargs = match ty { Some(t) -> [t] None -> [] }
+          let clauses = var_canonical_clauses(line, col)
+          let ret = var_canonical_return(line, col)
+          let handle_kind = EHandle(inner_expr, DrSym(core_effect_id(CeState)), tyargs,
+                                     Some(init_d), Some(b),
+                                     clauses, Some(ret))
+          EBlock(ann_pre, Some(mk_expr(handle_kind, line, col)))
+        }
+      }
+      _ -> {
+        let s_d = desugar_var_stmt(s)
+        let inner_kind = desugar_var_block(rest, tail)
+        match inner_kind {
+          EBlock(rest_stmts, rest_tail) ->
+            EBlock([s_d, ...rest_stmts], rest_tail)
+          _ -> EBlock([s_d], Some(mk_expr(inner_kind, 0, 0)))
+        }
+      }
+    }
+  }
+}
+
+fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
+  match k {
+    # EBlock is the only kind that needs special handling: a head
+    # SVar inside the block lifts to a fresh `with State[T](init)`
+    # handler, which `desugar_var_block` builds. Stmts before the
+    # head SVar still recurse into their inner expressions.
+    EBlock(stmts, tail) -> desugar_var_block(stmts, tail)
+    _ -> dsg_map_expr_kind(k, desugar_var_expr)
+  }
+}
