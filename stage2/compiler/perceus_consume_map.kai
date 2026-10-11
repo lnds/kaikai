@@ -1,0 +1,128 @@
+#[doc("""
+Which parameters a function consumes: what a caller reads to decide
+whether moving a binder into a call is sound.
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.expr_positions
+import compiler.consume_index
+import compiler.perceus_arg_reads
+import compiler.perceus_reads
+import compiler.symtab
+import compiler.perceus_borrow_strip
+
+# ---------- Consume-map (Koka Borrowed dual: which params a fn CONSUMES) ---
+#
+# A param is CONSUMED by its fn iff the fn deconstructs it (match scrutinee
+# whose arm binds children) or stores it (ctor/record/list slot) — i.e. the fn
+# takes ownership and the cell is reclaimed/reused inside. A param that is
+# only FIELD-READ (`b.states`, `b.next_id`) or passed to another fn that does
+# not consume it (the stdlib/regexp `nb_add_transition`/`nb_set_transitions`
+# field-read chain) is NOT consumed — the caller keeps the obligation. This is
+# the bit a caller needs to decide whether MOVING a binder into `f(binder)` is
+# sound: move only into CONSUMING slots; a non-consuming slot must keep the
+# caller's ref (dup), else the value's life after the call reads freed memory
+# (the regexp UAF). Keyed by function identity, like the borrow map.
+
+#[doc("`acc` with the consumed positions of every function of `decls`.")]
+pub fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex, tab: SymTab) : ConsumeIndex = match decls {
+  []           -> acc
+  [d, ...rest] -> pcs_build_consume_map(rest, pcs_consume_entry_of(d, acc, tab), tab)
+}
+
+fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex, tab: SymTab) : ConsumeIndex = match d {
+  DFn(_, fsym, _, params, _, _, body, _, _, _) -> {
+    let pnames = map(params, (p) => p.binder)
+    # An FFI shim's body is opaque to the consuming-use walk, so a normal
+    # scan finds nothing consumed. The shim decrefs every boxed input, so
+    # mark each (a Unit param carries no boxed value and is skipped); else
+    # a value passed to two shim calls is double-freed.
+    let positions = if body_is_extern(body) { pcs_ffi_consumed_positions(params, 0) }
+                    else { pcs_consumed_positions(pnames, body, 0, tab) }
+    cix_add(acc, CE(fsym, positions))
+  }
+  _ -> acc
+}
+
+fn pcs_ffi_consumed_positions(params: [Param], i: Int) : [Int] = match params {
+  [] -> []
+  [p, ...rest] ->
+    if pcs_param_is_unit(p) { pcs_ffi_consumed_positions(rest, i + 1) }
+    else { [i, ...pcs_ffi_consumed_positions(rest, i + 1)] }
+}
+
+fn pcs_param_is_unit(p: Param) : Bool = match p.ptype {
+  Some(t) -> match resolve_ty(t) {
+    TyUnit -> true
+    _      -> false
+  }
+  None    -> false
+}
+
+fn pcs_consumed_positions(pnames: [Binder], body: Expr, i: Int, tab: SymTab) : [Int] = match pnames {
+  []           -> []
+  [p, ...rest] ->
+    if pcs_param_consumes(p.id, body, tab) { [i, ...pcs_consumed_positions(rest, body, i + 1, tab)] }
+    else { pcs_consumed_positions(rest, body, i + 1, tab) }
+}
+
+# A param p is CONSUMED iff it appears as a deconstructing match scrutinee
+# (arm binds a child = ownership taken) OR in a ctor/record/list slot (stored).
+# A field-read-only param (regexp nb_*) is NOT consumed. Only the storing
+# forms keep explicit arms; everything else descends through the table's
+# inline positions (a deferred `XLam`/`XCl` body runs elsewhere and cannot
+# witness a consuming use of the caller's ref — the closure capture is
+# RC'd separately, matching the lambda rule the analysis always had).
+fn pcs_param_consumes(p: LocalId, body: Expr, tab: SymTab) : Bool = pcs_consumes_expr(p, body, tab)
+
+fn pcs_consumes_expr(p: LocalId, e: Expr, tab: SymTab) : Bool = match e.kind {
+  EMatch(s, arms) -> {
+    let scr = pcs_is_bare(p, s) and pcs_arms_bind_children(arms)
+    scr or pcs_consumes_ps(p, xp_positions(e), tab)
+  }
+  ECall(f, xs) ->
+    (pcs_any_bare_var(p, xs) and pcs_callee_is_ctor(tab, f)) or pcs_consumes_ps(p, xp_positions(e), tab)
+  ERecordLit(_, fis) -> pcs_fields_bare_var(p, fis) or pcs_consumes_ps(p, xp_positions(e), tab)
+  EList(els)         -> pcs_elems_bare_var(p, els) or pcs_consumes_ps(p, xp_positions(e), tab)
+  _                  -> pcs_consumes_ps(p, xp_positions(e), tab)
+}
+
+fn pcs_consumes_ps(p: LocalId, ps: [XPos], tab: SymTab) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] ->
+    (xrole_inline(r) and pcs_consumes_expr(p, c, tab)) or pcs_consumes_ps(p, rest, tab)
+}
+
+fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(pat, _, _) -> match prc_pat_bindings(pat, []) { [] -> pcs_arms_bind_children(rest) _ -> true }
+  }
+}
+
+fn pcs_any_bare_var(p: LocalId, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_is_bare(p, h) or pcs_any_bare_var(p, rest)
+}
+
+fn pcs_fields_bare_var(p: LocalId, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_is_bare(p, e) or pcs_fields_bare_var(p, rest)
+  }
+}
+
+# A plain slot and a trailing spread store the ref; a middle spread copies
+# the spine out and releases it.
+fn pcs_elems_bare_var(p: LocalId, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let stores = match h { ElPlain(e) -> Some(e) ElSpread(e) -> match rest { [] -> Some(e) _ -> None } }
+    let here = match stores {
+      Some(e) -> pcs_is_bare(p, e)
+      None    -> false
+    }
+    here or pcs_elems_bare_var(p, rest)
+  }
+}

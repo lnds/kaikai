@@ -1,0 +1,80 @@
+#[doc("""
+The callee side of a borrow: a scrutinee and a closure call over a
+borrowed parameter are marked as lending it.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.perceus_reads
+
+#[doc("""
+Callee side: wrap `match p { ... }` as `match __perceus_borrow(p) {...}`
+for each borrowed param `p` whose scrutinee is the bare param —
+emit_match then skips the exit decref (the value is borrowed, owned up
+the stack). Walks the whole body.
+""")]
+pub fn pcs_wrap_borrow_scrutinees(e: Expr, borrowed: [Binder]) : Expr =
+  Expr { kind: pcs_wrap_borrow_kind(e.kind, borrowed),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pcs_wrap_borrow_kind(k: ExprKind, borrowed: [Binder]) : ExprKind = match k {
+  EMatch(scr, arms) -> {
+    let scr2 = match scr.kind {
+      ELocal(l) ->
+        if pcs_has(borrowed, l) {
+          Expr { kind: ECall(
+                   Expr { kind: EMark(MkBorrow), line: scr.line, col: scr.col,
+                          ty: None, mode: MUnknown,  site: scr.site },
+                   [scr]),
+                 line: scr.line, col: scr.col, ty: scr.ty, mode: scr.mode , site: 0 }
+        } else { pcs_wrap_borrow_scrutinees(scr, borrowed) }
+      _ -> pcs_wrap_borrow_scrutinees(scr, borrowed)
+    }
+    EMatch(scr2, pcs_wrap_borrow_arms(arms, borrowed))
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_scrutinees(sub, borrowed))
+}
+
+fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [Binder]) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(p, g, b) -> [Arm(p, g, pcs_wrap_borrow_scrutinees(b, borrowed)),
+                     ...pcs_wrap_borrow_arms(rest, borrowed)]
+  }
+}
+
+#[doc("""
+Callee side, closure. A direct call `f(args)` where `f` is a borrowed
+function-typed param routes to the borrowing indirect call. The closure ref stays with the
+caller (it is in the skip-set, never dup'd; its exit drop frees it once),
+so the per-call incref/decref pair collapses. `bc` is the borrowed set
+restricted to function-typed params — a value-typed borrowed param is
+never a callee, so this only fires on closures. Args keep the owned
+convention and are walked so nested calls also flip.
+""")]
+pub fn pcs_wrap_borrow_calls(e: Expr, bc: [Binder]) : Expr =
+  Expr { kind: pcs_wrap_borrow_call_kind(e.kind, bc),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pcs_wrap_borrow_call_kind(k: ExprKind, bc: [Binder]) : ExprKind = match k {
+  ECall(callee, args_) -> match callee.kind {
+    ELocal(l) ->
+      if pcs_has(bc, l) {
+        let args2 = map(args_, (a) => pcs_wrap_borrow_calls(a, bc))
+        pcs_apply_borrow_call(callee, args2)
+      } else {
+        ECall(pcs_wrap_borrow_calls(callee, bc),
+              map(args_, (a) => pcs_wrap_borrow_calls(a, bc)))
+      }
+    _ -> ECall(pcs_wrap_borrow_calls(callee, bc),
+               map(args_, (a) => pcs_wrap_borrow_calls(a, bc)))
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_calls(sub, bc))
+}
+
+# Build the borrowing indirect call from a closure callee expr and its
+# already-walked call args.
+fn pcs_apply_borrow_call(clo: Expr, args2: [Expr]) : ExprKind =
+  ECall(Expr { kind: EMark(MkApplyBorrow), line: clo.line,
+               col: clo.col, ty: None, mode: MUnknown,  site: clo.site },
+        [clo, ...args2])

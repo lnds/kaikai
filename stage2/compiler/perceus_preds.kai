@@ -1,0 +1,79 @@
+#[doc("""
+Small predicates the Perceus analyses share: reference callees, owned
+rvalues, reference-counted types, raw parameters.
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.fn_index
+import compiler.core_builtins
+import compiler.perceus_reads
+import compiler.kinds
+
+#[doc("""
+The names of the RAW params of a (mixed-sig) fn — those whose mask bit
+is true. They carry no rc, so they go in the Perceus skip-set and are
+excluded from unused-param drops. Non-UFn fns return [] (no raw param).
+""")]
+pub fn prc_raw_param_names(fns: FnIndex, fid: FnId, params: [Param]) : [Binder] {
+  match fnx_decl_sig(fns, fid) {
+    Some(US(_, _, mask)) -> prc_raw_names_zip(params, mask)
+    None                 -> []
+  }
+}
+
+fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [Binder] = match params {
+  [] -> []
+  [p, ...prest] -> match mask {
+    [] -> []
+    [m, ...mrest] ->
+      if m { [p.binder, ...prc_raw_names_zip(prest, mrest)] }
+      else { prc_raw_names_zip(prest, mrest) }
+  }
+}
+
+#[doc("""
+A callee that is a reference: a declaration, a local holding a closure,
+an effect operation.
+""")]
+pub fn pcs_callee_is_ref(f: Expr) : Bool = match f.kind {
+  ESym(_, _) -> true
+  ELocal(_)  -> true
+  EOp(_)     -> true
+  _          -> false
+}
+
+#[doc("""
+A fresh rvalue in a borrowed slot: a call's result, a field read, a lambda
+or a literal is an owned ref no binder holds, and the borrowing callee never consumes
+it — without a drop-after-call the whole value leaks. Perceus marks are
+transparent or manage their own RC, so a call of one is never wrapped;
+neither is an unboxable value (no rc to drop) nor an untyped one
+(ownership unprovable).
+""")]
+pub fn pcs_arg_is_owned_rvalue(a: Expr) : Bool = match a.kind {
+  ELambda(_, _) -> true
+  ECall(callee, _) ->
+    if pcs_callee_is_ref(callee) and not pcs_is_unit_coercion(callee) { pcs_ty_is_rc(a.ty) } else { false }
+  EField(_, _)     -> pcs_ty_is_rc(a.ty)
+  EStr(_, _)       -> pcs_ty_is_rc(a.ty)
+  ERecordLit(_, _) -> pcs_ty_is_rc(a.ty)
+  EList(els)       -> pcs_ty_is_rc(a.ty) and not any(els, (el) => match el { ElSpread(_) -> true  ElPlain(_) -> false })
+  _ -> false
+}
+
+# A unit coercion hands its argument through: its result is no fresh value.
+fn pcs_is_unit_coercion(callee: Expr) : Bool = match builtin_ref(callee) {
+  Some(b) -> builtin_is_unit_coercion(b)
+  None    -> false
+}
+
+fn pcs_ty_is_rc(ty: Option[Ty]) : Bool = match ty {
+  Some(t) -> not (ty_is_unboxable_t(t) or ty_is_fixed_vec(t))
+  None    -> false
+}
+
+fn pcs_strs_union(xs: [Binder], ys: [Binder]) : [Binder] = match ys {
+  []           -> xs
+  [h, ...rest] -> if pcs_has(xs, h.id) { pcs_strs_union(xs, rest) } else { pcs_strs_union([h, ...xs], rest) }
+}

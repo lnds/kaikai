@@ -1,0 +1,167 @@
+#[doc("""
+The most reads of a binder one path reaches, a read in a borrowed slot
+counted as none, and the parameters a tail self call may take raw.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.perceus_plant_drop
+import compiler.borrow_map
+import compiler.perceus_arg_reads
+import compiler.perceus_reads
+import compiler.self_call
+import compiler.perceus_borrow_strip
+
+#[doc("The parameters of `pnames`, neither borrowed nor skipped, whose last read a tail self call takes.")]
+pub fn pcs_bmlp_loop(self_name: SelfRef, pnames: [Binder], body: Expr, uses: UseIx,
+                 bmap: BorrowMap, borrowed: [Binder], skip_set: [Binder]) : [Binder] / Console = match pnames {
+  []           -> []
+  [nm, ...rest] -> {
+    let more = pcs_bmlp_loop(self_name, rest, body, uses, bmap, borrowed, skip_set)
+    if pcs_has(borrowed, nm.id) or pcs_has(skip_set, nm.id) { more }
+    else {
+      match last_use_for(nm.id, uses) {
+        LuAt(_, _) ->
+          if pcs_read_count(nm.id, uses) >= 2 and
+             pcs_max_paths_b_expr(nm, body, bmap) == 1 and
+             pcs_nm_absent_from_nonrec_tails(self_name, nm, body, bmap) {
+            [nm, ...more]
+          } else { more }
+        _ -> more
+      }
+    }
+  }
+}
+
+# True iff `nm` appears in no tail position that is not a self-call —
+# i.e. every base arm is `nm`-free. A tail self-call is skipped (that is
+# where the re-thread lives); any other tail is scanned for `nm`.
+# A block whose tail holds NO self-call is a pure base path: its
+# STATEMENTS must be `nm`-free too — a read there (an operator operand,
+# a consuming call) takes a ref while the exit wrap still drops `nm` on
+# that path, two releases of one. Statements ahead of a re-threading
+# tail stay allowed: they are the discounted prefix of the re-thread.
+fn pcs_nm_absent_from_nonrec_tails(self_name: SelfRef, nm: Binder, e: Expr, bmap: BorrowMap) : Bool / Console =
+  pcs_nmant_kind(self_name, nm, e.kind, bmap)
+
+fn pcs_nmant_kind(self_name: SelfRef, nm: Binder, k: ExprKind, bmap: BorrowMap) : Bool / Console = match k {
+  # A base-path call may lend `nm` to a borrowed slot: that read takes no ref.
+  ECall(f, _) -> is_self_callee(f, self_name) or pcs_max_paths_b_expr(nm, mk_expr(k, 0, 0), bmap) == 0
+  # The condition evaluates on EVERY path through the if, including the
+  # base ones: a CONSUMING read of `nm` there spends the ref the exit
+  # wrap still drops. A borrow-discounted read (a borrowed callee slot,
+  # e.g. the vec-length probe a Vec match desugars to) keeps no ref and
+  # stays allowed — the max-path count with `bmap` charges only real
+  # consumers.
+  EIf(c, t, opt_e) ->
+    pcs_max_paths_b_expr(nm, c, bmap) == 0 and
+    pcs_nm_absent_from_nonrec_tails(self_name, nm, t, bmap) and
+    (match opt_e { None -> true Some(e2) -> pcs_nm_absent_from_nonrec_tails(self_name, nm, e2, bmap) })
+  # The scrutinee is part of the tail: `match consume(nm) { ... }` in a base
+  # tail spends the ref the exit wrap still drops.
+  EMatch(s, arms) -> not pcs_name_in_expr(nm, s) and
+                      pcs_nmant_arms(self_name, nm, arms, bmap)
+  EBlock(stmts, opt_tail) -> match opt_tail {
+    None    -> not pcs_name_in_stmts(nm, stmts)
+    Some(t) ->
+      if ppd_has_self_call(t, self_name) { pcs_nm_absent_from_nonrec_tails(self_name, nm, t, bmap) }
+      else { not pcs_name_in_stmts(nm, stmts) and pcs_nm_absent_from_nonrec_tails(self_name, nm, t, bmap) }
+  }
+  # Every other form has no self-call carve-out: the whole node is
+  # base-path material, so the derivation holds only when a whole-node
+  # scan (riding the position table via the use collector) finds no
+  # read of `nm`. Conservative for any new variant: a read anywhere
+  # simply withholds the optimisation.
+  _ -> not pcs_mentions(nm, mk_expr(k, 0, 0))
+}
+
+fn pcs_name_in_stmts(nm: Binder, stmts: [Stmt]) : Bool / Console =
+  pcs_mentions(nm, mk_expr(EBlock(stmts, None), 0, 0))
+
+# A guard evaluates before its arm is chosen — a consuming read of `nm`
+# there lands on base paths too; borrow-discounted reads stay allowed.
+fn pcs_nmant_arms(self_name: SelfRef, nm: Binder, arms: [Arm], bmap: BorrowMap) : Bool / Console = match arms {
+  []           -> true
+  [Arm(_, opt_g, b), ...rest] ->
+    (match opt_g { None -> true Some(g) -> pcs_max_paths_b_expr(nm, g, bmap) == 0 }) and
+    pcs_nm_absent_from_nonrec_tails(self_name, nm, b, bmap) and pcs_nmant_arms(self_name, nm, rest, bmap)
+}
+
+#[doc("""
+Borrow-aware path count (Koka Parc: a use of `nm` that lands in a
+BORROWED parameter slot of the callee does NOT consume `nm`, so it must
+NOT count toward the dup decision — the canonical case is `is_red(l)`,
+which inspects `l` without taking ownership. Without this, `l`'s use in
+`is_red(l)` plus its use in `insert_loop(l)` sum to 2 on the same path →
+the binder fails the `mp <= 1` skip check → a spurious dup keeps the
+descent tree shared → the rb-tree spine leaks. `bmap` is the calling
+module's view of the borrow map. The arg-position filter mirrors
+pcs_strip_borrow_args exactly.)
+""")]
+pub fn pcs_max_paths_b_expr(nm: Binder, e: Expr, bmap: BorrowMap) : Int =
+  pcs_max_paths_b_kind(nm, e.kind, bmap)
+
+fn pcs_max_paths_b_kind(nm: Binder, k: ExprKind, bmap: BorrowMap) : Int = match k {
+  ELocal(u)           -> if local_eq(u, nm.id) { 1 } else { 0 }
+  ECall(f, xs)        -> {
+    # Discount args that land in a borrowed slot of the callee: those uses
+    # of `nm` are borrows, not consumers, and do not count. The slots are
+    # looked up only for a call that takes `nm` bare.
+    let positions = if pcs_any_arg_bare(nm.id, xs) { pcs_borrow_slots(bmap, f) } else { [] }
+    pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, 0, bmap)
+  }
+  # Branch positions are alternatives of each other — the count takes
+  # the MAX across them — which the flat position list cannot express;
+  # both keep explicit arms.
+  EIf(c, t, opt_e)    -> pcs_max_paths_b_expr(nm, c, bmap) +
+                          pcs_max_paths_b_alt2(nm, t, opt_e, bmap)
+  EMatch(s, arms)     -> pcs_max_paths_b_expr(nm, s, bmap) +
+                          pcs_max_paths_b_arms(nm, arms, 0, bmap)
+  # Everything else sums its inline positions; a lambda body contributes
+  # 0 (closure captures are RC'd separately).
+  _ -> pcs_max_paths_b_ps(nm, xp_positions_kind(k), bmap)
+}
+
+fn pcs_max_paths_b_ps(nm: Binder, ps: [XPos], bmap: BorrowMap) : Int = match ps {
+  []                  -> 0
+  [XP(r, c), ...rest] ->
+    (match r { XLam -> 0 _ -> pcs_max_paths_b_expr(nm, c, bmap) }) +
+    pcs_max_paths_b_ps(nm, rest, bmap)
+}
+
+# Walk args, charging 0 for any arg whose index is a borrowed slot of the
+# callee (the use is a borrow, not a consume). The discount applies ONLY
+# to a bare-var arg (`is_red(l)`), seen through a unit coercion, which is
+# identity at runtime: the callee borrows `l` itself. A
+# compound arg (`origin_eq(home_tu(d), mo)` slot 0) consumes its interior
+# reads while EVALUATING the arg — the callee borrows only the resulting
+# value — so those reads must count in full; discounting them starves the
+# dup insertion and the inner call frees the binder's only ref.
+fn pcs_max_paths_b_args(nm: Binder, es: [Expr], positions: [Int], i: Int, bmap: BorrowMap) : Int = match es {
+  []           -> 0
+  [h, ...rest] -> {
+    let bare = pcs_is_leaf_ref(prc_peel_unit(h))
+    let here = if pcs_has_int(positions, i) and bare { 0 }
+               else { pcs_max_paths_b_expr(nm, h, bmap) }
+    here + pcs_max_paths_b_args(nm, rest, positions, i + 1, bmap)
+  }
+}
+
+fn pcs_max_paths_b_alt2(nm: Binder, t: Expr, opt_e: Option[Expr], bmap: BorrowMap) : Int = {
+  let tp = pcs_max_paths_b_expr(nm, t, bmap)
+  let ep = match opt_e { None -> 0 Some(e) -> pcs_max_paths_b_expr(nm, e, bmap) }
+  if tp > ep { tp } else { ep }
+}
+
+fn pcs_max_paths_b_arms(nm: Binder, arms: [Arm], best: Int, bmap: BorrowMap) : Int = match arms {
+  [] -> best
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, body) -> {
+      let gp = match opt_g { None -> 0 Some(g) -> pcs_max_paths_b_expr(nm, g, bmap) }
+      let bp = pcs_max_paths_b_expr(nm, body, bmap)
+      let armp = gp + bp
+      let nb = if armp > best { armp } else { best }
+      pcs_max_paths_b_arms(nm, rest, nb, bmap)
+    }
+  }
+}

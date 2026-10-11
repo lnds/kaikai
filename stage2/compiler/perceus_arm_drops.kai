@@ -1,0 +1,360 @@
+#[doc("""
+The drops an arm owes its binders: collected, placed before the tail or
+distributed to the paths that leave a binder dead.
+""")]
+
+import compiler.ast
+import compiler.ret_slots
+import compiler.expr_positions
+import compiler.perceus_payer
+import compiler.perceus_branch_plant
+import compiler.perceus_plant_drop
+import compiler.borrow_map
+import compiler.perceus_reads
+import compiler.self_call
+import compiler.symtab
+import compiler.perceus_borrow_strip
+import compiler.perceus_self_tail
+
+#[doc("""
+The arm binders' payers. An arm binder takes its birth ref at bind time
+(`kai_incref` in `emit_pat_binds`); when no read hands it on, a drop
+between the body's statements and its tail releases it. A binder read in
+the tail cannot take that drop — it would fire before the read — and a
+non-block body that is itself a self-tail-call cannot be wrapped without
+hiding the call from `tcrec_rewrite_decls`.
+
+Runs after `pcs_rewrite_expr`, so it sees the dup-wrapped reads, and
+before `pcs_recognise_reuse_expr`, so the reuse rewrite sees the drops.
+The read table plus the binders the rewrite moves on every read. A
+move-at-last-use binder is not one: the paths that skip its last read
+still owe a drop. A forced binder's dup'd read is paid
+by the guard-fail and goto planters, never here: an arm drop planted for it
+would read, to the branch payer, as its single read.
+`boxed_bpos` gates the after-args drop: a boxed argument bound in a
+borrowed self slot would lose the borrow strip's view of it.
+`borrow_only` binders are released on arm entry (`perceus_rethread`); an
+arm re-checks its own, since two scopes may bind one name.
+""")]
+pub type PcsArmCx = { uses: UseIx, moved: [Binder], boxed_bpos: [Int], borrow_only: [Binder],
+                  borrowed: [Binder], bmap: BorrowMap, forced: [Binder] }
+
+#[doc("""
+Build a `[Stmt]` list of `__perceus_drop(nm)` calls for the arm's
+pattern-introduced bindings that need a drop. Order is reverse-of-
+bound (head-first accumulation + `pcs_inject_arm_drops` appends).
+`opt_g` is the arm's rewritten guard: a bare read there is a move
+that pays the binder on both guard edges, so no drop may run here.
+The tcrec goto ledger reads a planted drop as a consume and does not pay again.
+""")]
+pub fn pcs_collect_arm_drops(bound: [Binder], ln: Int, cl: Int, body: Expr, opt_g: Option[Expr],
+                         cx: PcsArmCx, pre_tail: Bool, acc: [Stmt]) : [Stmt] = match bound {
+  [] -> list_reverse(acc)
+  [nm, ...rest] -> {
+    let acc1 =
+      if pre_tail and pcs_name_in_body_tail(nm, body) { acc }
+      else if pcs_guard_has_bare_read(nm, opt_g) { acc }
+      else if pcs_pays(pcs_arm_payer(nm.id, cx.uses, pcs_has(cx.moved, nm.id), pcs_has(cx.forced, nm.id)), PyExit) {
+        [pcs_make_drop_stmt(nm.id, ln, cl), ...acc]
+      } else { acc }
+    pcs_collect_arm_drops(rest, ln, cl, body, opt_g, cx, pre_tail, acc1)
+  }
+}
+
+fn pcs_guard_has_bare_read(nm: Binder, opt_g: Option[Expr]) : Bool = match opt_g {
+  None    -> false
+  Some(g) -> pcs_has_bare_read(nm, g)
+}
+
+#[doc("""
+Binders whose reads sit in a block's tail cannot take the pre-tail drop.
+A tail hosting a self-tail-call has each goto path closed at its leaf
+(the goto skips every exit); any other tail is ret-wrapped, so the drops
+run after its value. A binder with a bare read is left alone, so a moved
+read is never followed by a release. Lambda-captured binders are skipped
+— the goto ledger releases them after the args have built their closures.
+""")]
+pub fn pcs_arm_tail_drop_body(body: Expr, bound: [Binder], ln: Int, cl: Int,
+                          opt_g: Option[Expr], uses: UseIx, fn_name: SelfRef, owed_ok: Bool, tab: SymTab) : Expr =
+  match body.kind {
+    EBlock(stmts, opt_tail) -> match opt_tail {
+      Some(t) -> match pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, uses, []) {
+        []    -> body
+        drops -> {
+          let t1 = if pcs_is_self_tail_call(t, fn_name) { pcs_distribute_dead_drops(t, drops, fn_name, owed_ok, [], bound, tab) }
+                   else { pcs_arm_ret_wrap(t, drops) }
+          Expr { kind: EBlock(stmts, Some(t1)), line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+        }
+      }
+      None -> body
+    }
+    _ -> body
+  }
+
+fn pcs_collect_arm_tail_drops(bound: [Binder], ln: Int, cl: Int, body: Expr,
+                              opt_g: Option[Expr], uses: UseIx, acc: [Stmt]) : [Stmt] =
+  match bound {
+    [] -> list_reverse(acc)
+    [nm, ...rest] -> {
+      let acc1 =
+        if not pcs_name_in_body_tail(nm, body) { acc }
+        # A bare read anywhere in the arm is a move: it pays the birth ref
+        # on its own path, so a distributed drop would release it twice.
+        # Only a binder whose every read keeps its dup is orphaned. A bare
+        # guard read is the same move one edge earlier.
+        else if pcs_has_bare_read(nm, body) { acc }
+        else if pcs_guard_has_bare_read(nm, opt_g) { acc }
+        else if pcs_read_count(nm.id, uses) >= 1 and not pcs_uses_have_in_lam(uses, nm.id) {
+          [pcs_make_drop_stmt(nm.id, ln, cl), ...acc]
+        } else { acc }
+      pcs_collect_arm_tail_drops(rest, ln, cl, body, opt_g, uses, acc1)
+    }
+  }
+
+#[doc("""
+A read of `nm` not wrapped in `__perceus_dup` — the post-rewrite spelling
+of a move. Lambda bodies count conservatively: their reads cannot be
+attributed, so the binder is left alone. The
+descend rides `xp_positions`; only the payment-relevant forms are
+special-cased here.
+""")]
+pub fn pcs_has_bare_read(nm: Binder, e: Expr) : Bool = match e.kind {
+  ELocal(u)             -> local_eq(u, nm.id)
+  ECall(f, xs)          -> match f.kind {
+    EMark(MkDup) -> false
+    _ -> pcs_has_bare_read(nm, f) or pcs_hbr_list(nm, xs)
+  }
+  ELambda(_, body)      -> pcs_name_in_expr(nm, body)
+  _                     -> pcs_hbr_ps(nm, xp_positions(e))
+}
+
+fn pcs_hbr_ps(nm: Binder, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> pcs_has_bare_read(nm, c) or pcs_hbr_ps(nm, rest)
+}
+
+fn pcs_hbr_list(nm: Binder, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_has_bare_read(nm, h) or pcs_hbr_list(nm, rest)
+}
+
+#[doc("""
+Insert drops into the arm body. A block body takes them between its
+statements and its tail. A body whose tail leaves include a self-tail-call
+cannot be wrapped, since the wrap would hide the call from TCO, so each
+leaf pays on its own path. Any other body is wrapped: its value is bound,
+the drops run, the value is yielded. TRMC replants the wrap's drops.
+""")]
+pub fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, who: [Binder], tab: SymTab) : Expr {
+  match body.kind {
+    EBlock(stmts, opt_tail) ->
+      Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
+             line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+    _ -> {
+      if pcs_is_self_tail_call(body, fn_name) {
+        pcs_distribute_dead_drops(body, drops, fn_name, owed_ok, [], who, tab)
+      }
+      else { pcs_arm_ret_wrap(body, drops) }
+    }
+  }
+}
+
+#[doc("""
+A `return(x)` binder owns the handled result, as an arm binder owns its
+projection, and is paid the same way.
+""")]
+pub fn pcs_return_binder_paid(nm: Binder, body: Expr, uses: UseIx, forced: [Binder], ln: Int, cl: Int) : Expr =
+  if pcs_pays(pcs_arm_payer(nm.id, uses, false, pcs_has(forced, nm.id)), PyExit) {
+    pcs_arm_ret_wrap(body, [pcs_make_drop_stmt(nm.id, ln, cl)])
+  } else { body }
+
+# `{ let __pcs_arm_ret = body; drops; __pcs_arm_ret }`: the TRMC rewrite
+# peels this exact shape and replants its drops.
+fn pcs_arm_ret_wrap(body: Expr, drops: [Stmt]) : Expr = {
+  let ret_let = SLet(Pattern { pkind: PBind(ret_slot_binder(RsArm)), line: body.line, col: body.col }, None, body)
+  let tail = Expr { kind: ELocal(ret_slot_local(RsArm)), line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+  Expr { kind: EBlock([ret_let, ...drops], Some(tail)), line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+}
+
+# Close each tail leaf of `body` for `drops`: the goto skips every exit.
+# A self-tail-call leaf drops a binder it never mentions before the call,
+# and one it reads only through dups after the hoisted args (`owed_ok`),
+# since the borrow strip may later turn a dup into a bare read the goto
+# ledger takes for a move; a binder with a bare read pays on its own path.
+# A modulo-cons leaf is left to the TRMC rewrite. A value leaf releases,
+# after its value is built, every binder it does not move except those in
+# `held`, the binders a nested scope declares. `who` lists the binders the
+# drops release.
+fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : Expr =
+  Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name, owed_ok, held, who, tab),
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
+
+fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: SelfRef,
+               owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : ExprKind {
+  match k {
+    EIf(c, t, opt_e) ->
+      EIf(c, pcs_distribute_dead_drops(t, drops, fn_name, owed_ok, held, who, tab),
+          match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, owed_ok, held, who, tab)) })
+    EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, owed_ok, held, who, tab))
+    EBlock(stmts, opt_tail) -> match opt_tail {
+      Some(t) ->
+        if ppd_is_hoist_block(stmts) { pcs_dd_hoisted(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode , site: 0 }, drops, owed_ok, who) }
+        else { EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, owed_ok, held, ppd_let_names(stmts), who, tab))) }
+      None    -> k
+    }
+    _ -> pcs_dd_leaf(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode , site: 0 }, drops, fn_name, owed_ok, held, who, tab)
+  }
+}
+
+fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : ExprKind =
+  if pcs_is_self_tail_call(leaf, fn_name) { pcs_dd_goto_leaf(leaf, drops, owed_ok, who) }
+  else if pcs_is_modcons_leaf(leaf, fn_name, tab) { leaf.kind }
+  else {
+    match filter(pcs_unmoved_names(drops, leaf, who), (nm) => not pcs_has(held, nm.id)) {
+      []    -> leaf.kind
+      names -> ppd_bind_then(leaf, ppd_drops(names, leaf.line, leaf.col)).kind
+    }
+  }
+
+fn pcs_dd_goto_leaf(leaf0: Expr, drops: [Stmt], owed_ok: Bool, who: [Binder]) : ExprKind = {
+  let leaf = pcs_dd_pay_paths(drops, leaf0, who)
+  let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, leaf, who)) } else { [] }
+  let paid = match owed { [] -> leaf  _ -> ppd_hoist_then(leaf, owed) }
+  match pcs_drops_dead_in(drops, leaf, who) {
+    []   -> paid.kind
+    dead -> EBlock(dead, Some(paid))
+  }
+}
+
+fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) ->
+      [Arm(pat, opt_g, pcs_dd_scoped(body, drops, fn_name, owed_ok, held, prc_pat_bindings(pat, []), who, tab)),
+       ...pcs_dd_arms(rest, drops, fn_name, owed_ok, held, who, tab)]
+  }
+}
+
+# The binder a drop releases, of those in `who`: the statement names it by
+# identity alone.
+fn pcs_drop_binder(d: Stmt, who: [Binder]) : Option[Binder] = match ppd_drop_name(d) {
+  Some(l) -> pcs_binder_of(who, l)
+  None    -> None
+}
+
+fn pcs_binder_of(bs: [Binder], l: LocalId) : Option[Binder] = match bs {
+  []           -> None
+  [b, ...rest] -> if local_eq(b.id, l) { Some(b) } else { pcs_binder_of(rest, l) }
+}
+
+# The binders of `drops` the leaf does not move.
+fn pcs_unmoved_names(drops: [Stmt], leaf: Expr, who: [Binder]) : [Binder] = match drops {
+  []           -> []
+  [d, ...rest] -> {
+    let tl = pcs_unmoved_names(rest, leaf, who)
+    match pcs_drop_binder(d, who) {
+      Some(nm) -> if pcs_has_bare_read(nm, leaf) { tl } else { [nm, ...tl] }
+      None     -> tl
+    }
+  }
+}
+
+# Under a scope binding `names`: a rebound name would make a leaf read the
+# inner binder, not the dropped one, so no drop moves past the leaf's reads.
+fn pcs_dd_scoped(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder],
+                 names: [Binder], who: [Binder], tab: SymTab) : Expr =
+  pcs_distribute_dead_drops(body, drops, fn_name, owed_ok and not any(drops, (d) => ppd_drop_among(d, names)),
+                            list_append(names, held), who, tab)
+
+# A self-call whose arguments an inner scope already hoisted: the argument
+# lets are part of the leaf, so its reads there count, and an owed drop
+# runs after the last of them.
+fn pcs_dd_hoisted(blk: Expr, drops: [Stmt], owed_ok: Bool, who: [Binder]) : ExprKind = {
+  let paid = pcs_dd_pay_paths(drops, blk, who)
+  let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, paid, who)) } else { [] }
+  let after = match paid.kind {
+    EBlock(ss, t) -> EBlock(list_append(ss, owed), t)
+    k             -> k
+  }
+  match pcs_drops_dead_in(drops, paid, who) {
+    []   -> after
+    dead -> EBlock(dead, Some(Expr { kind: after, line: blk.line, col: blk.col, ty: blk.ty, mode: blk.mode,  site: blk.site }))
+  }
+}
+
+# A binder the leaf moves on some of its paths only: the alternatives inside
+# the leaf that skip the move release it on entry.
+fn pcs_dd_pay_paths(drops: [Stmt], leaf: Expr, who: [Binder]) : Expr = match drops {
+  []           -> leaf
+  [d, ...rest] -> pcs_dd_pay_paths(rest, match pcs_drop_binder(d, who) {
+    Some(nm) -> if pcs_has_bare_read(nm, leaf) { pbl_paid(nm, leaf) } else { leaf }
+    None     -> leaf
+  }, who)
+}
+
+fn pcs_drop_owed_in(d: Stmt, leaf: Expr, who: [Binder]) : Bool = match pcs_drop_binder(d, who) {
+  Some(nm) -> pcs_mentions(nm, leaf) and not pcs_has_bare_read(nm, leaf)
+  None     -> false
+}
+
+# Drops whose binder the leaf never mentions, closure captures included —
+# only those may run before the leaf's argument evaluation.
+fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr, who: [Binder]) : [Stmt] = match drops {
+  [] -> []
+  [d, ...rest] -> {
+    let tl = pcs_drops_dead_in(rest, leaf, who)
+    match pcs_drop_binder(d, who) {
+      Some(nm) -> if pcs_mentions(nm, leaf) { tl } else { [d, ...tl] }
+      None     -> tl
+    }
+  }
+}
+
+#[doc("True when `e` is a call of the function itself, or a tail leaf of `e` is one.")]
+pub fn pcs_is_self_tail_call(e: Expr, fn_name: SelfRef) : Bool {
+  match e.kind {
+    ECall(callee, _) -> is_self_callee(callee, fn_name)
+    # A `match`, `if`, or `block` body may itself host a self-tail-call
+    # in a tail-leaf position. Wrapping such a body in `__pcs_arm_ret`
+    # would hide that call from `tcrec_rewrite_decls` and emit a real
+    # recursive C call — same regression #342 worked around. Recurse
+    # into tail-leaves and decline to wrap when any leaf is a
+    # self-tail-call.
+    EMatch(_, arms) -> pcs_arms_have_self_tail(arms, fn_name)
+    EIf(_, t, opt_e) -> {
+      if pcs_is_self_tail_call(t, fn_name) { true }
+      else {
+        match opt_e {
+          None -> false
+          Some(e2) -> pcs_is_self_tail_call(e2, fn_name)
+        }
+      }
+    }
+    EBlock(_, opt_tail) -> match opt_tail {
+      None -> false
+      Some(t) -> pcs_is_self_tail_call(t, fn_name)
+    }
+    _ -> false
+  }
+}
+
+fn pcs_arms_have_self_tail(arms: [Arm], fn_name: SelfRef) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, body) ->
+        if pcs_is_self_tail_call(body, fn_name) { true }
+        else { pcs_arms_have_self_tail(rest, fn_name) }
+    }
+  }
+}
+
+# True iff `nm` appears in the part of `body` a pre-tail drop would precede:
+# the tail of a block (the whole block when a self-call hoist built it —
+# its temps carry the call's args), or all of a non-block body.
+fn pcs_name_in_body_tail(nm: Binder, body: Expr) : Bool = match body.kind {
+  EBlock(stmts, opt_tail) ->
+    if ppd_is_hoist_block(stmts) { pcs_mentions(nm, body) }
+    else { match opt_tail { None -> false  Some(t) -> pcs_mentions(nm, t) } }
+  _ -> pcs_mentions(nm, body)
+}

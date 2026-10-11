@@ -1,0 +1,202 @@
+#[doc("""
+Drops at a block's exit for the lets it binds, and the pattern binders
+nothing reads, elided.
+""")]
+
+import compiler.ast
+import compiler.ret_slots
+import compiler.perceus_payer
+import compiler.perceus_reads
+
+#[doc("""
+Append a `__perceus_drop(h)` to the block scope of each `let h = ...`
+that binds an opaque handle in `opaque_lets`. Each shim call consumed a
+dup of the handle; this releases the birth ref once. Placed as the last
+block statement (after the final use), so it never double-frees a use.
+""")]
+pub fn pcs_force_opaque_exit_drops(e: Expr, opaque_lets: [Binder], uses: UseIx) : Expr / Console = match opaque_lets {
+  [] -> e
+  _  -> Expr { kind: pcs_fed_kind(e.kind, opaque_lets, uses), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+}
+
+fn pcs_fed_kind(k: ExprKind, opaque_lets: [Binder], uses: UseIx) : ExprKind / Console = match k {
+  EBlock(stmts, tail) -> {
+    # The normal exit-drop pass already drops a handle whose last use is
+    # in the block (not the tail) and read >= 2 times. The handles left
+    # without a drop are exactly those whose last use is in the tail OR
+    # read once — those get a drop here, complementary, never doubled.
+    let bound = pcs_fed_block_handles(stmts, opaque_lets, tail, uses, [])
+    let drops = pcs_fed_make_drops(bound)
+    match tail {
+      Some(t) -> {
+        # A handle's last use may be in the tail; bind the tail value, drop
+        # the handles, then return it.
+        match drops {
+          [] -> EBlock(pcs_fed_stmts(stmts, opaque_lets, uses), Some(pcs_force_opaque_exit_drops(t, opaque_lets, uses)))
+          _  -> {
+            let t1 = pcs_force_opaque_exit_drops(t, opaque_lets, uses)
+            let ret_let = SLet(mk_pat(PBind(ret_slot_binder(RsOpaque)), t1.line, t1.col), None, t1)
+            # The read carries the tail's type and mode: an unboxed tail binds a
+            # raw local, and a `ty: None` read would emit the boxed name for it.
+            let ret_var = Expr { kind: ELocal(ret_slot_local(RsOpaque)), line: t1.line, col: t1.col,
+                                 ty: t1.ty, mode: t1.mode,  site: t1.site }
+            EBlock(list_append(pcs_fed_stmts(stmts, opaque_lets, uses), list_append([ret_let], drops)), Some(ret_var))
+          }
+        }
+      }
+      None -> EBlock(list_append(pcs_fed_stmts(stmts, opaque_lets, uses), drops), None)
+    }
+  }
+  EIf(c, t, oe) -> EIf(c, pcs_force_opaque_exit_drops(t, opaque_lets, uses),
+                       match oe { None -> None Some(e2) -> Some(pcs_force_opaque_exit_drops(e2, opaque_lets, uses)) })
+  _ -> k
+}
+
+# Handles bound by a `let` in these stmts that the normal exit-drop pass
+# leaves undropped — i.e. last-use-in-tail or read-once. (A handle read
+# >= 2 times whose last use is NOT in the tail already gets the normal
+# exit-drop, so it is excluded to avoid a double-free.)
+fn pcs_fed_block_handles(stmts: [Stmt], opaque_lets: [Binder], tail: Option[Expr], uses: UseIx, acc: [Binder]) : [Binder] / Console = match stmts {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(pat, _, _) -> match pat.pkind {
+      PBind(nm) ->
+        if pcs_has(opaque_lets, nm.id) and pcs_fed_needs_drop(nm, tail, uses) {
+          pcs_fed_block_handles(rest, opaque_lets, tail, uses, [nm, ...acc])
+        } else { pcs_fed_block_handles(rest, opaque_lets, tail, uses, acc) }
+      _ -> pcs_fed_block_handles(rest, opaque_lets, tail, uses, acc)
+    }
+    _ -> pcs_fed_block_handles(rest, opaque_lets, tail, uses, acc)
+  }
+}
+
+# A handle needs the force-drop here iff it is read >= 2 times AND its
+# last use is in the tail. That is the one shape the normal exit-drop
+# skips (for TCO) while still dup'ing every read — leaving the birth ref
+# orphaned. A read-once handle is moved raw into its single shim call (the
+# shim consumes the birth ref), so it needs no drop.
+fn pcs_fed_needs_drop(nm: Binder, tail: Option[Expr], uses: UseIx) : Bool / Console =
+  pcs_read_count(nm.id, uses) >= 2 and pcs_name_in_tail(nm, tail)
+
+fn pcs_fed_make_drops(names: [Binder]) : [Stmt] = match names {
+  []           -> []
+  [nm, ...rest] -> [pcs_make_drop_stmt(nm.id, 0, 0), ...pcs_fed_make_drops(rest)]
+}
+
+# Recurse into each statement's sub-expressions (handles bound in inner
+# blocks get their own drop there).
+fn pcs_fed_stmts(stmts: [Stmt], opaque_lets: [Binder], uses: UseIx) : [Stmt] / Console = match stmts {
+  []           -> []
+  [s, ...rest] -> [pcs_fed_stmt(s, opaque_lets, uses), ...pcs_fed_stmts(rest, opaque_lets, uses)]
+}
+
+fn pcs_fed_stmt(s: Stmt, opaque_lets: [Binder], uses: UseIx) : Stmt / Console = match s {
+  SLet(p, t, e)       -> SLet(p, t, pcs_force_opaque_exit_drops(e, opaque_lets, uses))
+  SExprStmt(e)        -> SExprStmt(pcs_force_opaque_exit_drops(e, opaque_lets, uses))
+  _                   -> s
+}
+
+#[doc("""
+Block-exit drops for the `let`s this block binds whose payer is the exit
+(`pcs_let_payer`). A binding read in the tail is left to
+`ptd_tail_exit_drops`, which releases after the tail value exists. Raw
+locals carry no rc.
+""")]
+pub fn pcs_collect_block_let_exit_drops(stmts: [Stmt], uses: UseIx, opt_tail: Option[Expr],
+                                     move_last_set: [Binder], force_set: [Binder],
+                                     acc: [Stmt]) : [Stmt] {
+  match stmts {
+    [] -> list_reverse(acc)
+    [s, ...rest] -> {
+      let acc1 = match s {
+        SLet(pat, _, rhs) -> match pat.pkind {
+          PBind(nm) -> {
+            let in_block = pcs_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm.id)
+            let payer = pcs_let_payer(nm.id, rhs, uses, pcs_has(move_last_set, nm.id), pcs_has(force_set, nm.id))
+            if in_block and pcs_pays(payer, PyExit) and not pcs_name_in_tail(nm, opt_tail) {
+              [pcs_make_drop_stmt(nm.id, pat.line, pat.col), ...acc]
+            } else { acc }
+          }
+          PWild -> acc
+          _ -> pcs_drop_stmts(pcs_let_exit_paid(pcs_let_pat_elide(pat, uses), uses, opt_tail, move_last_set, force_set),
+                              pat.line, pat.col, acc)
+        }
+        _ -> acc
+      }
+      pcs_collect_block_let_exit_drops(rest, uses, opt_tail, move_last_set, force_set, acc1)
+    }
+  }
+}
+
+#[doc("""
+A destructuring `let` binds each name with its own reference, as an arm
+does: a never-read plain binder is elided to `_`, so it takes none.
+""")]
+pub fn pcs_let_pat_elide(pat: Pattern, uses: UseIx) : Pattern = match pat.pkind {
+  PBind(_) -> pat
+  _        -> pcs_pat_elide(pat, pcs_arm_elide_names(pat, uses, []))
+}
+
+# The binders of a destructuring `let` the block exit pays: each holds a
+# bind-time reference, owed like an arm binder's.
+fn pcs_let_exit_paid(pat: Pattern, uses: UseIx, opt_tail: Option[Expr],
+                     move_last_set: [Binder], force_set: [Binder]) : [Binder] =
+  filter(prc_pat_bindings(pat, []), (nm) => {
+    pcs_pays(pcs_arm_payer(nm.id, uses, pcs_has(move_last_set, nm.id), pcs_has(force_set, nm.id)), PyExit)
+      and not pcs_name_in_tail(nm, opt_tail)
+  })
+
+fn pcs_drop_stmts(names: [Binder], ln: Int, cl: Int, acc: [Stmt]) : [Stmt] = match names {
+  [] -> acc
+  [nm, ...rest] -> pcs_drop_stmts(rest, ln, cl, [pcs_make_drop_stmt(nm.id, ln, cl), ...acc])
+}
+
+fn pcs_name_in_tail(nm: Binder, opt_tail: Option[Expr]) : Bool = match opt_tail {
+  None    -> false
+  Some(e) -> pcs_mentions(nm, e)
+}
+
+#[doc("""
+Plain `PBind` names of the arm's pattern that nothing reads. Rest, `@`
+and narrowing binders never qualify.
+""")]
+pub fn pcs_arm_elide_names(pat: Pattern, uses: UseIx, acc: [Binder]) : [Binder] = match pat.pkind {
+  PBind(nm) ->
+    if not pcs_unread(nm.id, uses) { acc } else { [nm, ...acc] }
+  PList(ps, _)             -> pcs_aen_list(ps, uses, acc)
+  PVariant(_, ps)          -> pcs_aen_list(ps, uses, acc)
+  PVariantRecord(_, fs)    -> pcs_aen_list(map(fs, (f) => match f { PField(_, p, _) -> p }), uses, acc)
+  PRecord(fs)              -> pcs_aen_list(map(fs, (f) => match f { PField(_, p, _) -> p }), uses, acc)
+  PAs(_, inner)            -> pcs_arm_elide_names(inner, uses, acc)
+  _                        -> acc
+}
+
+fn pcs_aen_list(ps: [Pattern], uses: UseIx, acc: [Binder]) : [Binder] = match ps {
+  []           -> acc
+  [p, ...rest] -> pcs_aen_list(rest, uses, pcs_arm_elide_names(p, uses, acc))
+}
+
+#[doc("`pat` with each binder of `elide` turned into a wildcard.")]
+pub fn pcs_pat_elide(pat: Pattern, elide: [Binder]) : Pattern = match elide {
+  []         -> pat
+  [_, ...__] -> Pattern { pkind: pcs_pat_elide_kind(pat.pkind, elide),
+                          line: pat.line, col: pat.col }
+}
+
+fn pcs_pat_elide_kind(k: PatKind, elide: [Binder]) : PatKind = match k {
+  PBind(nm)             -> if pcs_has(elide, nm.id) { PWild } else { k }
+  PList(ps, rest)       -> PList(map(ps, (p) => pcs_pat_elide(p, elide)), rest)
+  PVariant(cn, ps)      -> PVariant(cn, map(ps, (p) => pcs_pat_elide(p, elide)))
+  PVariantRecord(cn, fs) -> PVariantRecord(cn, pcs_pe_fields(fs, elide))
+  PRecord(fs)           -> PRecord(pcs_pe_fields(fs, elide))
+  PAs(nm, inner)        -> PAs(nm, pcs_pat_elide(inner, elide))
+  PWild                 -> k
+  PLit(_)               -> k
+  PRange(_, _)          -> k
+  PHole(_)              -> k
+  PNarrow(_, _)         -> k
+  PSurface(_)           -> k
+}
+
+fn pcs_pe_fields(fs: [PField], elide: [Binder]) : [PField] =
+  map(fs, (f) => match f { PField(n, p, sh) -> PField(n, pcs_pat_elide(p, elide), sh) })
