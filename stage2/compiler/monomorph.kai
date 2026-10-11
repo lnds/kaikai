@@ -50,7 +50,7 @@
 # `report_mono_leaks` stays in main), compiler.util for `concat_all` /
 # `cat2` / `cat3` / string joins, compiler.infer for the typer result
 # types (`TypedProgram` / `ResolvedCS` / `TyScheme`) and the pub typer
-# helpers it reuses (`fn_scheme_of_decl`, `collect_implicit_tparams_in_decl`,
+# helpers it reuses (`fn_scheme_of_decl`,
 # `tparam_id_split`, `unit_canon`, `dim_collapse`, `normalize_union`,
 # `labels_empty`, `label_to_string`), and
 # compiler.protos for `OpAr` + `resolve_protocol_calls_decl`.
@@ -87,6 +87,7 @@ import compiler.protos
 import compiler.proto_resolve
 import compiler.core_protos
 import compiler.effect_instance_canon
+import compiler.tbinder
 
 # ==================================================================
 # Leak-report value types (pub: main's `report_mono_leaks` reads them).
@@ -1043,7 +1044,7 @@ fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], callee: SymId,
   }
 }
 
-fn check_protos_for_head(protos: [String], head: DispHead, callee: SymId,
+fn check_protos_for_head(protos: [DeclRef], head: DispHead, callee: SymId,
                          fmo: Option[String],
                          ty: Ty, reg: ProtocolReg, loc: LineCol,
                          ps: PScope, acc: [BoundViolation]) : [BoundViolation] {
@@ -1053,7 +1054,7 @@ fn check_protos_for_head(protos: [String], head: DispHead, callee: SymId,
       let acc1 = if head_satisfies_proto(reg, p, fmo, head, ps) { acc }
                  else {
                    let msg = concat_all(["type `", mono_ty_to_string(ps_tab(ps), ty),
-                     "` does not satisfy the bound `", p,
+                     "` does not satisfy the bound `", ref_display(ps_tab(ps), p),
                      "` on a type parameter of `", written_text(decl_name(ps_tab(ps), callee)), "`"])
                    match loc { MoLC(l, c) -> [BV(msg, l, c), ...acc] }
                  }
@@ -1068,10 +1069,10 @@ fn check_protos_for_head(protos: [String], head: DispHead, callee: SymId,
 # Eq/Show/Ord/Hash).
 # The bound's name resolves from the declaring fn's module, so a
 # contested protocol name checks against its own impl table.
-fn head_satisfies_proto(reg: ProtocolReg, proto: String,
+fn head_satisfies_proto(reg: ProtocolReg, proto: DeclRef,
                         fmo: Option[String], head: DispHead,
                         ps: PScope) : Bool {
-  let psym = ps_proto_sym(ps, proto, fmo)
+  let psym = proto_ref_sym(ps, proto, fmo)
   prc_reg_has_impl(reg, psym, head) or match core_proto_of(psym) {
     Some(cp) -> head_has_builtin_impl(cp, head)
     None     -> false
@@ -1122,9 +1123,7 @@ fn synthesize_inst_for_decl(d: Decl, args_: [Expr], ret_ty: Option[Ty], line: In
             # decline.
             if list_length(formal_pts) != list_length(args_) { None }
             else {
-              let implicit = collect_implicit_tparams_in_decl(d, tparams)
-              let effective = list_append(tparams, implicit)
-              let split = tparam_id_split(effective)
+              let split = tparam_id_split(tparams)
               # Ground a return-only tparam (a collect's element type in
               # `Vec[b]`) from the call site's resolved return type: unify
               # the formal return against `ret_ty` in the SAME binding set
@@ -1352,7 +1351,7 @@ fn collect_poly_fns_loop(ds: [Decl]) : [PolyFn] {
       # An extern shim takes boxed values whatever its type arguments, so
       # its calls keep naming the one declaration.
       DFn(_, fid, tparams, _, _, _, body, _, _, _) ->
-        if list_length(tparams) > 0 and not body_is_extern(body) {
+        if tbs_declared(tparams) != [] and not body_is_extern(body) {
           [PFn(fnid_sym(fid), d), ...collect_poly_fns_loop(rest)]
         } else {
           collect_poly_fns_loop(rest)
@@ -1583,6 +1582,7 @@ fn unit_concrete(u: UnitExprT) : Bool {
     UVar(_)    -> false
     UOne       -> true
     USym(_)    -> true
+    UParam(_)  -> true
     UMul(a, b) -> unit_concrete(a) and unit_concrete(b)
     UInv(a)    -> unit_concrete(a)
     UPow(a, _) -> unit_concrete(a)
@@ -1632,15 +1632,12 @@ fn subst_pairs_lookup_unit(ps: [SubstPairUnit], id: Int) : Option[UnitExprT] {
 }
 
 # Build the SubstMap for a DFn given a concrete `(tys, units)` tuple.
-# Re-derives the same effective_tparams the inferencer used (declared
-# tparams ++ implicit lowercase tparams) so the id allocation in
+# Numbers the same parameters the inferencer did, so the id allocation in
 # `tparam_id_split` agrees with the body's `TyVarT` / `UVar` ids.
 fn build_subst_map(d: Decl, tys: [Ty], units: [UnitExprT]) : SubstMap {
   match d {
     DFn(_, _, tparams, _, _, _, _, _, _, _) -> {
-      let implicit = collect_implicit_tparams_in_decl(d, tparams)
-      let effective = list_append(tparams, implicit)
-      let split = tparam_id_split(effective)
+      let split = tparam_id_split(tparams)
       SM(zip_int_ty(split.tvars, tys),
          zip_int_unit(split.uvars, units))
     }
@@ -1741,6 +1738,7 @@ fn subst_unit(u: UnitExprT, sm: SubstMap) : UnitExprT {
   match u {
     UOne        -> u
     USym(_)     -> u
+    UParam(_)   -> u
     UVar(n)     -> match subst_map_lookup_unit(sm, n) {
       Some(u2) -> u2
       None     -> u
@@ -2378,16 +2376,16 @@ fn union_head_tkind(parts: [Ty]) : TyKind = match parts {
   [] -> TyName(ref_written("Any"), [])
 }
 
-type SigSubst = SS(String, TypeExpr)
+type SigSubst = SS(TLocalId, TypeExpr)
 
 # Pair the decl's type-kind tparams (unit-kind dropped, matching the
-# `tys` alignment) with their concrete TypeExprs. Declared ++ implicit
-# tparams, same ordering build_subst_map uses.
+# `tys` alignment) with their concrete TypeExprs, in the ordering
+# build_subst_map uses.
 fn build_sig_subst(d: Decl, tys: [Ty]) : [SigSubst] = zip_sig_subst(sig_type_names(d), tys)
 
-fn sig_type_names(d: Decl) : [String] = match d {
+fn sig_type_names(d: Decl) : [TBinder] = match d {
   DFn(_, _, tparams, _, _, _, _, _, _, _) ->
-    filter(list_append(tparams, collect_implicit_tparams_in_decl(d, tparams)), (n) => not tp_name_is_unit(n))
+    filter(tbs_positional(tparams), (n) => not tb_is_unit(n))
   _ -> []
 }
 
@@ -2402,53 +2400,40 @@ fn inst_spec_tys(polys: PolyIx, s: SymId, tys: [Ty]) : [Ty] =
     None    -> tys
   } }
 
-fn erase_free_slots(names: [String], tys: [Ty], inst: [String]) : [Ty] = match tys {
+fn erase_free_slots(names: [TBinder], tys: [Ty], inst: [TBinder]) : [Ty] = match tys {
   []           -> []
   [t, ...rest] -> match names {
     []            -> tys
-    [n, ...nrest] -> [if list_has(inst, n) or ty_concrete(t) { t } else { TyAny }, ...erase_free_slots(nrest, rest, inst)]
+    [n, ...nrest] -> [if tbs_has(inst, n.id) or ty_concrete(t) { t } else { TyAny }, ...erase_free_slots(nrest, rest, inst)]
   }
 }
 
-fn tp_name_is_unit(stored: String) : Bool = mono_str_ends_with(stored, tp_unit_suffix())
-
-fn mono_str_ends_with(s: String, suffix: String) : Bool {
-  let sl = string_length(s)
-  let xl = string_length(suffix)
-  if xl > sl { false } else { string_slice(s, sl - xl, xl) == suffix }
-}
-
-fn zip_sig_subst(names: [String], tys: [Ty]) : [SigSubst] {
+fn zip_sig_subst(names: [TBinder], tys: [Ty]) : [SigSubst] {
   match names {
     [] -> []
     [n, ...nrest] -> match tys {
       [] -> []
-      [t, ...trest] -> [SS(n, ty_to_typeexpr(t)), ...zip_sig_subst(nrest, trest)]
+      [t, ...trest] -> [SS(n.id, ty_to_typeexpr(t)), ...zip_sig_subst(nrest, trest)]
     }
   }
 }
 
-fn sig_subst_lookup(subst: [SigSubst], name: String) : Option[TypeExpr] = match subst {
+# The concrete form of the type parameter `id`.
+fn sig_subst_of(subst: [SigSubst], id: TLocalId) : Option[TypeExpr] = match subst {
   [] -> None
-  [SS(n, te), ...rest] -> if n == name { Some(te) } else { sig_subst_lookup(rest, name) }
+  [SS(n, te), ...rest] -> if tlocal_eq(n, id) { Some(te) } else { sig_subst_of(rest, id) }
 }
 
-# The concrete form of a type parameter. A type parameter is no
-# declaration: a reference to one stays written, bare.
-fn sig_subst_of(subst: [SigSubst], r: DeclRef) : Option[TypeExpr] = match r {
-  DrWritten(None, n) -> sig_subst_lookup(subst, written_text(n))
-  _                  -> None
-}
-
-# Rewrite a TypeExpr, replacing each reference to a type parameter with
-# its concrete form.
+# Rewrite a TypeExpr, replacing each use of a type parameter with its
+# concrete form.
 fn apply_sig_subst_te(te: TypeExpr, subst: [SigSubst]) : TypeExpr {
   let k = match te.tkind {
-    TyName(r, targs) -> {
+    TyName(r, targs) -> TyName(r, map(targs, (a) => apply_sig_subst_te(a, subst)))
+    TyParam(p, targs) -> {
       let targs1 = map(targs, (a) => apply_sig_subst_te(a, subst))
-      match sig_subst_of(subst, r) {
-        Some(rep) -> if targs1 == [] { rep.tkind } else { TyName(r, targs1) }
-        None -> TyName(r, targs1)
+      match sig_subst_of(subst, p) {
+        Some(rep) -> if targs1 == [] { rep.tkind } else { TyParam(p, targs1) }
+        None -> TyParam(p, targs1)
       }
     }
     TyList(inner) -> TyList(apply_sig_subst_te(inner, subst))

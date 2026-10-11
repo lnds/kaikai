@@ -6,9 +6,8 @@ a type parameter of the declaration that names it.
 
 import compiler.util
 import compiler.ast
-import compiler.kinds
+import compiler.tbinder
 import compiler.diag_file
-import compiler.scalar_ty
 
 # ----------------------------------------------------------------------
 # Shape-application formation pass.
@@ -42,7 +41,7 @@ fn validate_shape_refs_sub_decls(decls: [Decl], file: String, errs: Int) : Int /
 
 fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = match d {
   DFn(_, _, tparams, ps, ret, _, _, _, _, _) -> {
-    let shapes = collect_shape_tparam_names(tparams)
+    let shapes = filter(tparams, tb_is_shape)
     let e0 = validate_shape_refs_params(ps, shapes, file, 0)
     match ret {
       Some(te) -> e0 + validate_shape_refs_te(te, shapes, file)
@@ -50,7 +49,7 @@ fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = matc
     }
   }
   DProtocol(_, _, tparams, ops, _, _, _) -> {
-    let shapes = collect_shape_tparam_names(tparams)
+    let shapes = filter(tparams, tb_is_shape)
     validate_shape_refs_protoops(ops, shapes, file, 0)
   }
   DEffect(_, _, _, ops, _, _, _, _) -> validate_shape_refs_eops(ops, [], file, 0)
@@ -63,19 +62,8 @@ fn validate_shape_refs_decl(d: Decl, file: String) : Int / Console + File = matc
   _ -> 0
 }
 
-# The surface names of a decl's `Shape`-kind tparams (the applied
-# constructor variables valid in its signature).
-fn collect_shape_tparam_names(tparams: [String]) : [String] =
-  collect_shape_tparam_names_loop(tparams, [])
 
-fn collect_shape_tparam_names_loop(tparams: [String], acc: [String]) : [String] = match tparams {
-  [] -> list_reverse(acc)
-  [n, ...rest] ->
-    if tp_kind_is_shape(n) { collect_shape_tparam_names_loop(rest, [tp_strip_kind(n), ...acc]) }
-    else { collect_shape_tparam_names_loop(rest, acc) }
-}
-
-fn validate_shape_refs_params(ps: [Param], shapes: [String], file: String,
+fn validate_shape_refs_params(ps: [Param], shapes: [TBinder], file: String,
                               acc: Int) : Int / Console + File = match ps {
   [] -> acc
   [p, ...rest] -> {
@@ -87,7 +75,7 @@ fn validate_shape_refs_params(ps: [Param], shapes: [String], file: String,
   }
 }
 
-fn validate_shape_refs_protoops(ops: [ProtoOp], shapes: [String], file: String,
+fn validate_shape_refs_protoops(ops: [ProtoOp], shapes: [TBinder], file: String,
                                 acc: Int) : Int / Console + File = match ops {
   [] -> acc
   [POp(_, _, ps, ret, _, _), ...rest] -> {
@@ -97,7 +85,7 @@ fn validate_shape_refs_protoops(ops: [ProtoOp], shapes: [String], file: String,
   }
 }
 
-fn validate_shape_refs_eops(ops: [EffectOp], shapes: [String], file: String,
+fn validate_shape_refs_eops(ops: [EffectOp], shapes: [TBinder], file: String,
                             acc: Int) : Int / Console + File = match ops {
   [] -> acc
   [EffOp(_, _, ps, ret, _, _), ...rest] -> {
@@ -107,14 +95,15 @@ fn validate_shape_refs_eops(ops: [EffectOp], shapes: [String], file: String,
   }
 }
 
-# Walk a signature TypeExpr; a `TyName(s, args)` whose head is a shape
-# variable must apply it to exactly one argument, and that argument may
-# not be a bare shape variable (composition). Nested positions recurse.
-fn validate_shape_refs_te(te: TypeExpr, shapes: [String], file: String) : Int / Console + File =
+# Walk a signature TypeExpr; a use of a shape parameter must apply it to
+# exactly one argument, and that argument may not be a bare shape
+# variable (composition). Nested positions recurse.
+fn validate_shape_refs_te(te: TypeExpr, shapes: [TBinder], file: String) : Int / Console + File =
   match te.tkind {
-    TyName(r, targs) -> {
-      let name = ref_spelled(r)
-      if list_has(shapes, name) {
+    TyName(_, targs) -> validate_shape_refs_te_composition(targs, shapes, file, 0)
+    TyParam(id, targs) -> {
+      if tbs_has(shapes, id) {
+        let name = tbs_text_of(shapes, id)
         let e_arity = if list_length(targs) == 1 { 0 } else {
           eprint(concat_all([file, ":", int_to_string(te.line), ":", int_to_string(te.col),
             ": error: shape `", name, "` must be applied to exactly one type argument (`",
@@ -140,14 +129,14 @@ fn validate_shape_refs_te(te: TypeExpr, shapes: [String], file: String) : Int / 
 
 # The argument of a shape application must not be a bare shape variable:
 # `s[t[Int]]` with `t` a shape var is composition, rejected at formation.
-fn validate_shape_refs_te_list(tes: [TypeExpr], shapes: [String], file: String,
+fn validate_shape_refs_te_list(tes: [TypeExpr], shapes: [TBinder], file: String,
                                acc: Int) : Int / Console + File = match tes {
   [] -> acc
   [t, ...rest] -> {
     let e_comp = match t.tkind {
-      TyName(r, _) -> {
-        let hn = ref_spelled(r)
-        if list_has(shapes, hn) {
+      TyParam(id, _) -> {
+        let hn = tbs_text_of(shapes, id)
+        if tbs_has(shapes, id) {
           eprint(concat_all([file, ":", int_to_string(t.line), ":", int_to_string(t.col),
             ": error: shape composition `s[t[..]]` is not supported: `", hn,
             "` is a shape variable and may not stand under another shape application"]))
@@ -160,7 +149,7 @@ fn validate_shape_refs_te_list(tes: [TypeExpr], shapes: [String], file: String,
   }
 }
 
-fn validate_shape_refs_te_composition(tes: [TypeExpr], shapes: [String], file: String,
+fn validate_shape_refs_te_composition(tes: [TypeExpr], shapes: [TBinder], file: String,
                                       acc: Int) : Int / Console + File = match tes {
   [] -> acc
   [t, ...rest] ->

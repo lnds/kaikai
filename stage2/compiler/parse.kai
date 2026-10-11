@@ -20,7 +20,6 @@
 #   parse_contracts_loop, check_pred_not_false, maybe_wrap_pure. The
 #   pure desugar half lives in compiler/refinements.kai.
 # - extern "C" ABI validation (validate_extern_c_decl + helpers).
-# - Type-param kind/bounds encoding (tp_make / tp_*_bounds).
 # - Program entry: parse_program / parse_program_loop / PParser.
 #
 # Public surface (4 pub fns + 2 pub types)
@@ -28,8 +27,6 @@
 # - parse_program — the driver entry point: file + src + tokens -> AST.
 # - parse_interp_expr — parse a single `#{...}` interpolation body;
 #   used by the lift and the checks that run before it.
-# - tp_bounds_of / tp_has_bounds / tp_strip_bounds — type-param bounds
-#   decoders, read by the typer's bound renderer.
 # - PParser — parse_program's result record. Parser is pub only
 #   because PParser carries `p: Parser`; nothing else reaches for it.
 #
@@ -62,7 +59,7 @@ import compiler.kinds
 import compiler.refinements
 import compiler.doc_attr
 import compiler.nest_limit
-import compiler.tparam_bounds
+import compiler.tbinder
 
 # ====================================================================
 # parser state
@@ -4426,16 +4423,13 @@ fn parse_row_suffix(p: Parser) : PRow / Console {
 fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow / Console {
 
   let t = p_peek(p)
-  # `?e` or `?` in row tail position. Treated as an
-  # anonymous row variable with a prefix-marked name so the reporter
-  # can identify it as a user-supplied hole vs an ordinary row var.
+  # `?e` or `?` in row tail position: a row variable the reporter
+  # tells from an ordinary one by its `TpHole` tail.
   # Must be the last item in the row — `?e + Stdout` is rejected
   # for the same reason `e + Stdout` is.
   if tk_is(t.kind, TkHole) {
     let p1 = p_advance(p)
-    let placeholder = concat_all(["__rowhole__anon_",
-                                    int_to_string(t.line), "_",
-                                    int_to_string(t.col)])
+    let placeholder = TpHole(None, t.line, t.col)
     if p_at(p1, TkPlus) {
       let pe = p_error(p1, p_peek(p1),
         "row hole must be the last item in the row")
@@ -4449,9 +4443,7 @@ fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow / Console {
       TkHoleName(n) -> n
       _             -> "anon"
     }
-    let placeholder = concat_all(["__rowhole_", nm, "_",
-                                    int_to_string(t.line), "_",
-                                    int_to_string(t.col)])
+    let placeholder = TpHole(Some(nm), t.line, t.col)
     if p_at(p1, TkPlus) {
       let pe = p_error(p1, p_peek(p1),
         "row hole must be the last item in the row")
@@ -4483,9 +4475,9 @@ fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow / Console {
       if p_at(p1, TkPlus) {
         let pe = p_error(p1, p_peek(p1),
           "row variable must be the last item in the row")
-        PRow { p: pe, r: ROpen(name, list_reverse(acc)) }
+        PRow { p: pe, r: ROpen(TpWritten(written(name)), list_reverse(acc)) }
       } else {
-        PRow { p: p1, r: ROpen(name, list_reverse(acc)) }
+        PRow { p: p1, r: ROpen(TpWritten(written(name)), list_reverse(acc)) }
       }
     }
   }
@@ -5469,6 +5461,7 @@ fn type_surface(t: TypeExpr) : String {
       TsTuple(tys) -> concat_all(["(", type_args_surface(tys), ")"])
       TsUnitSpan(_, inner) -> type_surface(inner)
     }
+    TyParam(_, _) -> "_"
   }
 }
 
@@ -5479,8 +5472,8 @@ fn row_surface(r: RowExpr) : String {
     REmpty -> ""
     RClosed(labels) -> row_labels_surface(labels)
     ROpen(tail, labels) ->
-      if labels == [] { tail }
-      else { concat_all([row_labels_surface(labels), " + ", tail]) }
+      if labels == [] { tail_written_text(tail) }
+      else { concat_all([row_labels_surface(labels), " + ", tail_written_text(tail)]) }
   }
 }
 
@@ -6830,9 +6823,7 @@ fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
   let imp_tps_r =
     if p_at(p, TkLbracket) {
       # Impl-site tparams accept protocol bounds (`[T : Show + Eq, U]`)
-      # in addition to the `Measure` kind annotation. Bounds are
-      # encoded as `T#b:Show,Eq` in the stored tparam string; see
-      # `tp_bounds_of` / `tp_strip_bounds`.
+      # in addition to the `Measure` kind annotation.
       parse_impl_type_params_loop(p_skip_newlines(p_advance(p)), [])
     } else {
       PTParams { p: p, r: Some([]) }
@@ -7386,9 +7377,9 @@ fn parse_habitant_slots_loop(p: Parser, acc: [String]) : PHSlots / Console {
   }
 }
 
-type PTParams = { p: Parser, r: Option[[String]] }
+type PTParams = { p: Parser, r: Option[[TBinder]] }
 
-fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams / Console {
+fn parse_type_params_loop(p: Parser, acc: [TBinder]) : PTParams / Console {
 
   let t = p_peek(p)
   if not tk_is(t.kind, TkIdent) {
@@ -7397,10 +7388,8 @@ fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams / Console {
     let raw_name = tok_source(p.src, t)
     let p1 = p_skip_newlines(p_advance(p))
     # Optional `: Measure` (or `: Type`) kind annotation.
-    # Stored by suffixing the param name with "#Unit" for measure-kind
-    # params (legacy internal name; the surface keyword is `Measure`).
     let kr = parse_optional_kind_annotation(p1)
-    let stored = tp_make(raw_name, kr.kind, kr.kind_name)
+    let stored = tbinder_written(raw_name, kr.kind, [])
     let p2 = p_skip_newlines(kr.p)
     if p_at(p2, TkComma) {
       parse_type_params_loop(p_skip_newlines(p_advance(p2)), [stored, ...acc])
@@ -7414,11 +7403,8 @@ fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams / Console {
 
 # Impl-site variant of parse_type_params_loop. Accepts the
 # `Measure` kind annotation AND, additionally, a list
-# of uppercase protocol-name bounds: `T : Show`, `T : Show + Eq`. The
-# bound list is encoded as a `#b:Name1,Name2` suffix in the stored
-# tparam string. The `#` is collision-free against kaikai identifiers
-# (lexer rejects `#` inside ident).
-fn parse_impl_type_params_loop(p: Parser, acc: [String]) : PTParams / Console {
+# of uppercase protocol-name bounds: `T : Show`, `T : Show + Eq`.
+fn parse_impl_type_params_loop(p: Parser, acc: [TBinder]) : PTParams / Console {
 
   let t = p_peek(p)
   if not tk_is(t.kind, TkIdent) {
@@ -7427,7 +7413,7 @@ fn parse_impl_type_params_loop(p: Parser, acc: [String]) : PTParams / Console {
     let raw_name = tok_source(p.src, t)
     let p1 = p_skip_newlines(p_advance(p))
     let kbr = parse_optional_kind_or_bounds(p1)
-    let stored = tp_make_with_bounds(raw_name, kbr.kind, kbr.kind_name, kbr.bounds)
+    let stored = tbinder_written(raw_name, kbr.kind, map(kbr.bounds, ref_written))
     let p2 = p_skip_newlines(kbr.p)
     if p_at(p2, TkComma) {
       parse_impl_type_params_loop(p_skip_newlines(p_advance(p2)), [stored, ...acc])
@@ -7446,7 +7432,7 @@ fn parse_impl_type_params_loop(p: Parser, acc: [String]) : PTParams / Console {
 #   `: Show + Eq + Ord`      → multi-bound list
 # Mixing kinds and bounds is rejected: `: Measure + Show` makes no
 # sense since `Measure` is a kind, not a protocol.
-type PKindBounds = { p: Parser, kind: Kind, kind_name: String, bounds: [String] }
+type PKindBounds = { p: Parser, kind: Kind, bounds: [String] }
 
 fn parse_optional_kind_or_bounds(p: Parser) : PKindBounds / Console {
 
@@ -7455,30 +7441,30 @@ fn parse_optional_kind_or_bounds(p: Parser) : PKindBounds / Console {
     let t = p_peek(p1)
     if not tk_is(t.kind, TkIdent) {
       PKindBounds { p: p_error_here(p1, "expected protocol name, `Type`, or `Measure` after `:` in type parameter"),
-                    kind: KType, kind_name: "", bounds: [] }
+                    kind: KType, bounds: [] }
     } else {
       let kw = tok_source(p1.src, t)
       let p2 = p_advance(p1)
-      if kw == "Measure" { PKindBounds { p: p2, kind: KUnit, kind_name: measure_kind_name(), bounds: [] } }
-      else if kw == "Type" { PKindBounds { p: p2, kind: KType, kind_name: "", bounds: [] } }
-      else if kw == "Shape" { PKindBounds { p: p2, kind: KShape, kind_name: "Shape", bounds: [] } }
+      if kw == "Measure" { PKindBounds { p: p2, kind: KUnit(measure_kind_name()), bounds: [] } }
+      else if kw == "Type" { PKindBounds { p: p2, kind: KType, bounds: [] } }
+      else if kw == "Shape" { PKindBounds { p: p2, kind: KShape, bounds: [] } }
       else if kw == "Unit" {
         PKindBounds { p: p_error(p1, t, "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"),
-                      kind: KType, kind_name: "", bounds: [] }
+                      kind: KType, bounds: [] }
       # A declared kind wins over the protocol-bound reading (`[u: Metric]`
       # is a kind annotation, not a `Metric` bound).
       } else if kind_reg_has_kind(p.kind_reg, kw) {
-        PKindBounds { p: p2, kind: KUnit, kind_name: kw, bounds: [] }
+        PKindBounds { p: p2, kind: KUnit(kw), bounds: [] }
       } else if is_upper_ident(p1.src, t) {
         # First bound — accumulate further `+ Bound` entries.
         parse_more_bounds_loop(p2, [kw])
       } else {
         PKindBounds { p: p_error(p1, t, "type-parameter annotation must be `Type`, `Measure`, or an uppercase protocol name"),
-                      kind: KType, kind_name: "", bounds: [] }
+                      kind: KType, bounds: [] }
       }
     }
   } else {
-    PKindBounds { p: p, kind: KType, kind_name: "", bounds: [] }
+    PKindBounds { p: p, kind: KType, bounds: [] }
   }
 }
 
@@ -7490,78 +7476,41 @@ fn parse_more_bounds_loop(p: Parser, acc: [String]) : PKindBounds / Console {
     let t = p_peek(p1)
     if not tk_is(t.kind, TkIdent) or not is_upper_ident(p1.src, t) {
       PKindBounds { p: p_error_here(p1, "expected uppercase protocol name after `+` in bound list"),
-                    kind: KType, kind_name: "", bounds: list_reverse(acc) }
+                    kind: KType, bounds: list_reverse(acc) }
     } else {
       let nm = tok_source(p1.src, t)
       parse_more_bounds_loop(p_advance(p1), [nm, ...acc])
     }
   } else {
-    PKindBounds { p: p, kind: KType, kind_name: "", bounds: list_reverse(acc) }
+    PKindBounds { p: p, kind: KType, bounds: list_reverse(acc) }
   }
-}
-
-# Encode a tparam name plus optional protocol bound list into the
-# `String` slot. Format:
-#   "T"               (no kind, no bounds)
-#   "T#Unit"          (kind = Measure, no bounds)
-#   "T#b:Show"        (no kind, single bound)
-#   "T#b:Show,Eq"     (no kind, multi-bound)
-# Kind and bounds never coexist (parser rejects the combo), so a
-# tparam string contains at most one of `#Unit` or `#b:...`.
-fn tp_make_with_bounds(name: String, k: Kind, kind_name: String, bounds: [String]) : String {
-  let with_kind = tp_make(name, k, kind_name)
-  match bounds {
-    [] -> with_kind
-    _  -> concat_all([with_kind, "#b:", tp_bounds_join(bounds)])
-  }
-}
-
-fn tp_bounds_join(bs: [String]) : String = match bs {
-  [] -> ""
-  [b] -> b
-  [b, ...rest] -> concat_all([b, ",", tp_bounds_join(rest)])
 }
 
 # Collect the protocol bounds of each type-kind tparam, keyed by its
 # position among the type-kind tparams (unit-kind tparams excluded, so
 # the index aligns with a monomorphised call's concrete `tys`).
 #[doc("Protocol bounds of each type-kind tparam of a fn, keyed by position among the type-kind tparams.")]
-pub fn fn_tp_bounds_of(tparams_raw: [String]) : [FnTPBound] =
-  fn_tp_bounds_loop(tparams_raw, 0, [])
+pub fn fn_tp_bounds_of(tps: [TBinder]) : [FnTPBound] =
+  fn_tp_bounds_loop(tps, 0, [])
 
-fn fn_tp_bounds_loop(tps: [String], idx: Int, acc: [FnTPBound]) : [FnTPBound] {
+fn fn_tp_bounds_loop(tps: [TBinder], idx: Int, acc: [FnTPBound]) : [FnTPBound] {
   match tps {
     [] -> list_reverse(acc)
     [tp, ...rest] ->
-      if tp_kind_is_unit_raw(tp) {
+      if tb_is_unit(tp) {
         fn_tp_bounds_loop(rest, idx, acc)
       } else {
-        let bs = tp_bounds_of(tp)
-        let acc1 = match bs { [] -> acc  _ -> [FTB(idx, bs), ...acc] }
+        let acc1 = match tp.bounds { [] -> acc  bs -> [FTB(idx, bs), ...acc] }
         fn_tp_bounds_loop(rest, idx + 1, acc1)
       }
   }
-}
-
-# A raw tparam string carries `#Unit` (Measure) or `#Unit:Kind` (user
-# kind) XOR `#b:...` (bounds); the sentinel may be a suffix (`#Unit`) or
-# a mid-string marker (`#Unit:Metric`), so scan for it as a substring.
-fn tp_kind_is_unit_raw(stored: String) : Bool = {
-  let suf = tp_unit_suffix()
-  tp_unit_raw_scan(stored, suf, 0, string_length(stored) - string_length(suf))
-}
-
-fn tp_unit_raw_scan(s: String, marker: String, i: Int, last: Int) : Bool {
-  if i > last { false }
-  else if string_slice(s, i, string_length(marker)) == marker { true }
-  else { tp_unit_raw_scan(s, marker, i + 1, last) }
 }
 
 # Helper — consume an optional `: Type` / `: Measure` kind suffix.
 # Defaults to KType when absent. The surface keyword is `Measure`;
 # the legacy `Unit` produces a targeted diagnostic distinguishing it
 # from `Unit` the void-return type.
-type PKind = { p: Parser, kind: Kind, kind_name: String }
+type PKind = { p: Parser, kind: Kind }
 
 fn parse_optional_kind_annotation(p: Parser) : PKind / Console {
 
@@ -7569,23 +7518,23 @@ fn parse_optional_kind_annotation(p: Parser) : PKind / Console {
     let p1 = p_skip_newlines(p_advance(p))
     let t = p_peek(p1)
     if not tk_is(t.kind, TkIdent) {
-      PKind { p: p_error_here(p1, "expected `Type` or `Measure` after `:` in type parameter"), kind: KType, kind_name: "" }
+      PKind { p: p_error_here(p1, "expected `Type` or `Measure` after `:` in type parameter"), kind: KType }
     } else {
       let kw = tok_source(p1.src, t)
       let p2 = p_advance(p1)
-      if kw == "Measure" { PKind { p: p2, kind: KUnit, kind_name: measure_kind_name() } }
-      else if kw == "Type" { PKind { p: p2, kind: KType, kind_name: "" } }
-      else if kw == "Shape" { PKind { p: p2, kind: KShape, kind_name: "Shape" } }
-      else if kw == "Unit" { PKind { p: p_error(p1, t, "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"), kind: KType, kind_name: "" } }
-      else if kind_reg_has_kind(p.kind_reg, kw) { PKind { p: p2, kind: KUnit, kind_name: kw } }
-      else { PKind { p: p_error(p1, t, concat_all(["type-parameter kind must be `Type`, `Measure`, or a declared kind — `", kw, "` is not a kind"])), kind: KType, kind_name: "" } }
+      if kw == "Measure" { PKind { p: p2, kind: KUnit(measure_kind_name()) } }
+      else if kw == "Type" { PKind { p: p2, kind: KType } }
+      else if kw == "Shape" { PKind { p: p2, kind: KShape } }
+      else if kw == "Unit" { PKind { p: p_error(p1, t, "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"), kind: KType } }
+      else if kind_reg_has_kind(p.kind_reg, kw) { PKind { p: p2, kind: KUnit(kw) } }
+      else { PKind { p: p_error(p1, t, concat_all(["type-parameter kind must be `Type`, `Measure`, or a declared kind — `", kw, "` is not a kind"])), kind: KType } }
     }
   } else {
-    PKind { p: p, kind: KType, kind_name: "" }
+    PKind { p: p, kind: KType }
   }
 }
 
-fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
+fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
 
   if p_at(p, TkLbrace) {
     let p1 = p_skip_newlines(p_advance(p))
@@ -7682,7 +7631,7 @@ fn looks_like_sum_after_nl(toks: [Token]) : Bool {
   }
 }
 
-fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
+fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
 
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
@@ -7834,7 +7783,7 @@ fn parse_json_attr_close(p: Parser, a: FieldAttr) : PFAttr / Console {
 # order. Subsequent labels must be uppercase idents separated by `+`.
 # Validation that each label refers to a declared effect, plus cycle
 # detection, happens at resolve time.
-fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
+fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
 
   let hd = p_peek(p)
   if not tk_is(hd.kind, TkIdent) or not is_upper_ident(p.src, hd) {
@@ -7859,7 +7808,7 @@ fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String,
 fn at_qualified_member(p: Parser, t: Token) : Bool =
   (not is_upper_ident(p.src, t)) and tk_is(p_peek1(p).kind, TkDot) and tk_is(p_peek2(p).kind, TkIdent) and is_upper_ident(p.src, p_peek2(p))
 
-fn parse_sum_body(p: Parser, acc: [Variant], racc: [NEnt], is_pub: Bool, name: String, tparams: [String], slots: [String], t: Token) : PDecl / Console {
+fn parse_sum_body(p: Parser, acc: [Variant], racc: [NEnt], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
 
   let p0 = p_skip_newlines(p)
   let vt = p_peek(p0)
@@ -8163,23 +8112,5 @@ pub fn parse_program(file: String, src: String, toks: [Token], home: String) : P
       None -> r
       Some(e) -> PParser { p: p_fail_at(r.p, e.line, e.col, nest_msg()), decls: None, fn_bounds: [], names: [] }
     }
-  }
-}
-
-# tp_make: encode a type-param name with its kind. A `KUnit` over the
-# built-in Measure encodes as the bare `#Unit` suffix (byte-identical to
-# every existing program); a `KUnit` over a user kind appends the kind
-# name (`u#Unit:Metric`). The decoders (tp_kind_of / tp_strip_kind /
-# tp_kind_name) read these back.
-fn tp_make(name: String, k: Kind, kind_name: String) : String {
-  match k {
-    KType -> name
-    KUnit ->
-      if kind_name == "" or kind_name == measure_kind_name() {
-        string_concat(name, tp_unit_suffix())
-      } else {
-        concat_all([name, tp_unit_suffix(), tp_unit_kind_sep(), kind_name])
-      }
-    KShape -> string_concat(name, tp_shape_suffix())
   }
 }

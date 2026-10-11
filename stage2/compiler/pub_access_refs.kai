@@ -6,11 +6,8 @@
 # catch-all arm on purpose: a new AST form fails this file's compile
 # until its privacy story is decided.
 
-import compiler.util
 import compiler.chars
 import compiler.ast
-import compiler.kinds
-import compiler.tparam_bounds
 import compiler.written
 
 #[doc("What a reference names: the bare name the source wrote, or the declaration a scope pass settled it to.")]
@@ -48,44 +45,33 @@ fn pa_dotted_loop(n: String, i: Int, len: Int) : Bool =
   else if string_slice(n, i, 1) == "." { true }
   else { pa_dotted_loop(n, i + 1, len) }
 
-# Stored tparam names carry kind / bound markers (`u#Unit:Metric`,
-# `T#b:Show`); the skip list wants the surface names.
-#[doc("Surface names of a stored tparam list, kind / bound markers stripped.")]
-pub fn pa_tparam_names(tps0: [String]) : [String] = match tps0 {
-  [] -> []
-  [t, ...rest] -> [tp_strip_bounds(tp_strip_kind(t)), ...pa_tparam_names(rest)]
-}
-
-# A bound (`T: Sneaky`) references the protocol by name.
-#[doc("Type-namespace refs for every protocol bound carried in a stored tparam list.")]
-pub fn pa_bound_refs(tps0: [String], line: Int, col: Int,
+# A bound (`T: Sneaky`) references the protocol.
+#[doc("Type-namespace refs for every protocol bound a type-parameter list carries.")]
+pub fn pa_bound_refs(tps0: [TBinder], line: Int, col: Int,
       acc: [PaRef]) : [PaRef] = match tps0 {
   [] -> acc
-  [t, ...rest] ->
-    if tp_has_bounds(t) {
-      pa_bound_refs(rest, line, col,
-      pa_bound_names(tp_bounds_of(t), line, col, acc))
-    } else { pa_bound_refs(rest, line, col, acc) }
+  [t, ...rest] -> pa_bound_refs(rest, line, col, pa_bound_names(t.bounds, line, col, acc))
 }
 
-#[doc("Type-namespace refs for a plain list of bound names.")]
-pub fn pa_bound_names(bs: [String], line: Int, col: Int,
+#[doc("Type-namespace refs for a list of protocol bounds.")]
+pub fn pa_bound_names(bs: [DeclRef], line: Int, col: Int,
       acc: [PaRef]) : [PaRef] = match bs {
   [] -> acc
-  [b, ...rest] -> pa_bound_names(rest, line, col,
-      [pa_ref(b, true, true, true, line, col), ...acc])
+  [DrSym(s), ...rest] -> pa_bound_names(rest, line, col,
+      [pa_ref_sym(s, true, true, true, line, col), ...acc])
+  [DrWritten(_, n), ...rest] -> pa_bound_names(rest, line, col,
+      [pa_ref(written_text(n), true, true, true, line, col), ...acc])
 }
 
-fn pa_te_name(n: String, tps: [String], in_sig: Bool, leakable: Bool,
+fn pa_te_name(n: String, tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] =
-  if list_has(tps, n) or pa_dotted(n) { acc }
+  if pa_dotted(n) { acc }
   else { [pa_ref(n, true, in_sig, leakable, line, col), ...acc] }
 
-# A lowercase name in TyName position is a type variable bound to the
-# signature (the typer's implicit-tparam rule), never a reference to a
-# global symbol. Unit symbols and row labels resolve nominally and do
-# not take this rule.
-fn pa_ty_ref(n: String, tps: [String], in_sig: Bool, leakable: Bool,
+# A lowercase name still written in type position is one no signature
+# bound, never a reference to a global symbol. Unit symbols and row
+# labels resolve nominally and do not take this rule.
+fn pa_ty_ref(n: String, tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] =
   if pa_lower_start(n) { acc }
   else { pa_te_name(n, tps, in_sig, leakable, line, col, acc) }
@@ -97,22 +83,22 @@ fn pa_lower_start(n: String) : Bool = match char_at(n, 0) {
 
 # A type head: a settled one is checked on its declaration, a written
 # one on its name.
-fn pa_ty_head(r: DeclRef, tps: [String], in_sig: Bool, leakable: Bool,
+fn pa_ty_head(r: DeclRef, tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
   DrWritten(_, n) -> pa_ty_ref(written_text(n), tps, in_sig, leakable, line, col, acc)
   DrSym(s)        -> [pa_ref_sym(s, true, in_sig, leakable, line, col), ...acc]
 }
 
 # A row label. A qualified one was gated by the qualified resolver.
-fn pa_label_ref(r: DeclRef, tps: [String], in_sig: Bool, leakable: Bool,
+fn pa_label_ref(r: DeclRef, tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
   DrWritten(None, n)    -> pa_te_name(written_text(n), tps, in_sig, leakable, line, col, acc)
   DrWritten(Some(_), _) -> acc
   DrSym(s)              -> [pa_ref_sym(s, true, in_sig, leakable, line, col), ...acc]
 }
 
-#[doc("Type-namespace refs of a type expression, skipping the in-scope tparams.")]
-pub fn par_te(te: TypeExpr, tps: [String], in_sig: Bool, leakable: Bool,
+#[doc("Type-namespace refs of a type expression. `tps` are the type parameters in scope, for a fragment parsed on the way.")]
+pub fn par_te(te: TypeExpr, tps: [TBinder], in_sig: Bool, leakable: Bool,
       acc: [PaRef]) : [PaRef] = match te.tkind {
   TyName(r, targs) ->
     par_te_list(targs, tps, in_sig, leakable,
@@ -132,10 +118,11 @@ pub fn par_te(te: TypeExpr, tps: [String], in_sig: Bool, leakable: Bool,
   TyRefine(base, _) -> par_te(base, tps, in_sig, leakable, acc)
   TyRow(row) -> par_row(row, tps, in_sig, leakable, te.line, te.col, acc)
   TySurface(ts) -> par_te_list(tysurface_children(ts), tps, in_sig, leakable, acc)
+  TyParam(_, targs) -> par_te_list(targs, tps, in_sig, leakable, acc)
 }
 
 #[doc("Type-namespace refs of a type-expression list.")]
-pub fn par_te_list(ts: [TypeExpr], tps: [String], in_sig: Bool, leakable: Bool,
+pub fn par_te_list(ts: [TypeExpr], tps: [TBinder], in_sig: Bool, leakable: Bool,
       acc: [PaRef]) : [PaRef] = match ts {
   [] -> acc
   [t, ...rest] -> par_te_list(rest, tps, in_sig, leakable,
@@ -143,14 +130,14 @@ pub fn par_te_list(ts: [TypeExpr], tps: [String], in_sig: Bool, leakable: Bool,
 }
 
 #[doc("Effect-label refs of a row expression.")]
-pub fn par_row(row: RowExpr, tps: [String], in_sig: Bool, leakable: Bool,
+pub fn par_row(row: RowExpr, tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] = match row {
   REmpty -> acc
   RClosed(ls)  -> par_row_labels(ls, tps, in_sig, leakable, line, col, acc)
   ROpen(_, ls) -> par_row_labels(ls, tps, in_sig, leakable, line, col, acc)
 }
 
-fn par_row_labels(ls: [RowLabel], tps: [String], in_sig: Bool, leakable: Bool,
+fn par_row_labels(ls: [RowLabel], tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] = match ls {
   [] -> acc
   [RL(r, targs), ...rest] ->
@@ -160,7 +147,7 @@ fn par_row_labels(ls: [RowLabel], tps: [String], in_sig: Bool, leakable: Bool,
 }
 
 #[doc("Unit-symbol refs of a unit expression.")]
-pub fn par_uexpr(u: UnitExprT, tps: [String], in_sig: Bool, leakable: Bool,
+pub fn par_uexpr(u: UnitExprT, tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] = match u {
   UOne    -> acc
   UVar(_) -> acc
@@ -172,9 +159,10 @@ pub fn par_uexpr(u: UnitExprT, tps: [String], in_sig: Bool, leakable: Bool,
   UJoin(a, b) -> par_uexpr(b, tps, in_sig, leakable, line, col,
       par_uexpr(a, tps, in_sig, leakable, line, col, acc))
   UDims(us)   -> par_uexprs(us, tps, in_sig, leakable, line, col, acc)
+  UParam(_)   -> acc
 }
 
-fn par_uexprs(us: [UnitExprT], tps: [String], in_sig: Bool, leakable: Bool,
+fn par_uexprs(us: [UnitExprT], tps: [TBinder], in_sig: Bool, leakable: Bool,
       line: Int, col: Int, acc: [PaRef]) : [PaRef] = match us {
   [] -> acc
   [u, ...rest] -> par_uexprs(rest, tps, in_sig, leakable, line, col,
