@@ -1,0 +1,318 @@
+#[doc("""
+Raw scalar arithmetic and comparison: integer, real, byte and fixed-
+width operands computed unboxed, boxed only at the border.
+""")]
+
+import compiler.ast
+import compiler.operators
+import compiler.kir
+import compiler.kir_prims
+import compiler.emit_native_fn
+import compiler.emit_native_call
+
+# The opcode of an arithmetic operator for the `ibinop` / `fbinop` builders
+# (0=+ 1=- 2=* 3=/ 4=%), or -1. The integer emitters turn 3 and 4 into a
+# call to the checked helper, so a zero divisor and INT64_MIN/-1 trap
+# instead of running the UB `sdiv`/`srem` would.
+fn nraw_arith_op(op: BinOp) : Int = match op {
+  BoAdd -> 0
+  BoSub -> 1
+  BoMul -> 2
+  BoDiv -> 3
+  BoMod -> 4
+  _     -> -1
+}
+
+# The predicate of a comparison operator for the `icmp` / `fcmp` builders
+# (0=< 1=> 2=<= 3=>= 4=== 5=!=), or -1.
+fn nraw_cmp_pred(op: BinOp) : Int = match op {
+  BoLt -> 0
+  BoGt -> 1
+  BoLe -> 2
+  BoGe -> 3
+  BoEq -> 4
+  BoNe -> 5
+  _    -> -1
+}
+
+fn nemit_raw_bad(ctx: Handle) : Handle / Console = {
+  nemit_unsupported(ctx, "raw op outside its scalar's family"); nemit_null(ctx)
+}
+
+#[doc("The box border of a raw scalar: its runtime constructor over the register.")]
+pub fn nemit_raw_box_prim(ctx: Handle, s: RawScalar, cargs: [KVal]) : Handle / Console = match s {
+  RwReal   -> nemit_raw_box(ctx, "kaix_real", SReal, native_ctx_f64t(ctx), cargs)
+  RwBool   -> nemit_raw_box(ctx, "kaix_bool", SBool, native_ctx_i32t(ctx), cargs)
+  RwInt    -> nemit_raw_box(ctx, "kaix_int", SInt64, native_ctx_i64t(ctx), cargs)
+  RwChar   -> nemit_raw_box(ctx, "kaix_char", SChar, native_ctx_i32t(ctx), cargs)
+  RwByte   -> nemit_raw_box(ctx, "kaix_byte", SByte, native_ctx_i32t(ctx), cargs)
+  RwInt32  -> nemit_raw_fixed_box(ctx, "kaix_int32",  SInt32T, cargs)
+  RwUInt32 -> nemit_raw_fixed_box(ctx, "kaix_uint32", SUInt32, cargs)
+  RwUInt64 -> nemit_raw_fixed_box(ctx, "kaix_uint64", SUInt64, cargs)
+  RwInt128 -> nemit_raw_fixed_box(ctx, "kaix_int128", SInt128, cargs)
+}
+
+#[doc("""
+One raw binary op over two registers of scalar `s`. Arithmetic yields the
+scalar's own register; a comparison yields a raw i32 (the `fcmp`/`icmp` i1
+widened, so it stores in the i32 `SBool` register); `and` / `or` operate on
+the i32 0/1 form.
+""")]
+pub fn nemit_raw_bin(ctx: Handle, s: RawScalar, op: BinOp, cargs: [KVal]) : Handle / Console =
+  if binop_is_arith(op) { nemit_raw_arith(ctx, s, nraw_arith_op(op), cargs) }
+  else if binop_is_comparison(op) { nemit_raw_cmp(ctx, s, nraw_cmp_pred(op), cargs) }
+  else { nemit_raw_bool_logical(ctx, s, op, cargs) }
+
+# Real has no `%` instruction and no arithmetic rides a Bool or a Char.
+fn nemit_raw_arith(ctx: Handle, s: RawScalar, aop: Int, cargs: [KVal]) : Handle / Console = match s {
+  RwReal -> if aop <= 3 { nemit_raw_fbinop(ctx, aop, cargs) } else { nemit_raw_bad(ctx) }
+  RwInt  -> nemit_raw_ibinop(ctx, aop, cargs)
+  RwByte -> nemit_raw_u8binop(ctx, aop, cargs)
+  RwBool -> nemit_raw_bad(ctx)
+  RwChar -> nemit_raw_bad(ctx)
+  _      -> nemit_raw_fixed_binop(ctx, s, aop, cargs)
+}
+
+# Bool and Char both hold a non-negative value in an i32 register — the Bool
+# 0/1 form, a Char codepoint — so one signed `icmp` serves them and only the
+# load slot differs.
+fn nemit_raw_cmp(ctx: Handle, s: RawScalar, pred: Int, cargs: [KVal]) : Handle / Console = match s {
+  RwReal -> nemit_raw_fcmp(ctx, pred, cargs)
+  RwInt  -> nemit_raw_icmp(ctx, pred, cargs)
+  RwByte -> nemit_raw_u8cmp(ctx, pred, cargs)
+  RwBool -> nemit_raw_i32cmp(ctx, pred, SBool, cargs)
+  RwChar -> nemit_raw_i32cmp(ctx, pred, SChar, cargs)
+  _      -> nemit_raw_fixed_cmp(ctx, s, pred, cargs)
+}
+
+fn nemit_raw_bool_logical(ctx: Handle, s: RawScalar, op: BinOp, cargs: [KVal]) : Handle / Console = match s {
+  RwBool -> match op {
+    BoAnd -> nemit_raw_logical(ctx, 1, cargs)
+    BoOr  -> nemit_raw_logical(ctx, 0, cargs)
+    _     -> nemit_raw_bad(ctx)
+  }
+  _ -> nemit_raw_bad(ctx)
+}
+
+# `<op>(a, b)` raw `f64` arithmetic → one `fbinop` instruction. Both atoms
+# load raw (the registers are `f64`). No buffer, no call, no RC.
+fn nemit_raw_fbinop(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> llvm_build_fbinop(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SReal), nemit_atom_raw(ctx, b, SReal))
+  _      -> { nemit_unsupported(ctx, "raw fbinop arity"); nemit_null(ctx) }
+}
+
+# `<cmp>(a, b)` raw `f64` comparison → `fcmp` (i1) widened to i32, so the
+# result stores in the i32 `SBool` register and feeds `kaix_bool` / a
+# logical op uniformly.
+fn nemit_raw_fcmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_fcmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, SReal), nemit_atom_raw(ctx, b, SReal))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw fcmp arity"); nemit_null(ctx) }
+}
+
+# A divisor whose value makes both `sdiv`/`srem` traps statically
+# impossible: a literal that is neither `0` (divide by zero) nor `-1`
+# (the `INT64_MIN / -1` overflow). Anything else — including a
+# non-literal — must keep the checked helper.
+fn ndiv_trapless(b: KVal) : Bool = match b {
+  KIntV(n) -> n != 0 and n != -1
+  _        -> false
+}
+
+# `<op>(a, b)` raw `i64` arithmetic. `+`/`-`/`*` (op 0/1/2) are one wrapping
+# `ibinop` instruction (NO nsw/nuw). `/`/`%` (op 3/4) call the checked helper
+# `kai_idiv_chk`/`kai_imod_chk` so a zero divisor or INT64_MIN/-1 traps clean
+# instead of running the UB `sdiv`/`srem` would — EXCEPT against a trapless
+# literal divisor, where neither trap can fire and the direct `sdiv`/`srem`
+# lets LLVM strength-reduce it to multiply-shift. The helper is an opaque
+# external call here (the C backend gets it inlined by `cc`), so keeping it
+# in a hot loop costs a call per iteration. Both atoms load raw at `SInt64`.
+# No RC: a raw `i64` has no refcount, so a multi-use Int operand never
+# double-frees (the `let`-binder family's bug, here for arith).
+fn nemit_raw_ibinop(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] ->
+    if (op == 3 or op == 4) and not ndiv_trapless(b) {
+      let sym = if op == 3 { "kaix_idiv_chk" } else { "kaix_imod_chk" }
+      let i64t = native_ctx_i64t(ctx)
+      ncall_sig2(ctx, sym, i64t, i64t, i64t, nemit_atom_raw(ctx, a, SInt64), nemit_atom_raw(ctx, b, SInt64))
+    } else {
+      llvm_build_ibinop(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SInt64), nemit_atom_raw(ctx, b, SInt64))
+    }
+  _      -> { nemit_unsupported(ctx, "raw ibinop arity"); nemit_null(ctx) }
+}
+
+# `<op>(a, b)` raw Byte arithmetic over i32 registers (invariant: operands
+# hold 0..255). `+`/`-`/`*` are one wrapping `ibinop` masked with `& 255`
+# — two's-complement in i32 then mask gives the exact `uint8_t` wrap the C
+# oracle computes (`(uint8_t)(x - y)` underflow included). `/`/`%` widen
+# into the checked i64 helper (zero divisor traps identically on both
+# backends) and truncate back; the result is already in 0..255.
+fn nemit_raw_u8binop(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] ->
+    if op == 3 or op == 4 {
+      let sym = if op == 3 { "kaix_idiv_chk" } else { "kaix_imod_chk" }
+      let i64t = native_ctx_i64t(ctx)
+      let aw = llvm_build_zext(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SByte), i64t)
+      let bw = llvm_build_zext(native_ctx_b(ctx), nemit_atom_raw(ctx, b, SByte), i64t)
+      llvm_build_trunc(native_ctx_b(ctx), ncall_sig2(ctx, sym, i64t, i64t, i64t, aw, bw), native_ctx_i32t(ctx))
+    } else {
+      let r = llvm_build_ibinop(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SByte), nemit_atom_raw(ctx, b, SByte))
+      llvm_build_logical(native_ctx_b(ctx), 1, r, llvm_const_i32(native_ctx_i32t(ctx), 255))
+    }
+  _ -> { nemit_unsupported(ctx, "raw u8 binop arity"); nemit_null(ctx) }
+}
+
+# `<cmp>(a, b)` raw Byte comparison → i32 `icmp` (masked 0..255 operands,
+# so the signed predicate is exact) widened to the i32 `SBool` register.
+fn nemit_raw_u8cmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_icmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, SByte), nemit_atom_raw(ctx, b, SByte))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw u8 cmp arity"); nemit_null(ctx) }
+}
+
+# `<cmp>(a, b)` over two operands already in an i32 register (Bool 0/1, Char
+# codepoint) → `icmp` widened to the i32 `SBool` register. The slot is the
+# OPERAND's, not the result's — loading these at `SReal` is what routes a
+# Bool through `kaix_real_field`.
+fn nemit_raw_i32cmp(ctx: Handle, pred: Int, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_icmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, slot), nemit_atom_raw(ctx, b, slot))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw i32 cmp arity"); nemit_null(ctx) }
+}
+
+# --- raw fixed-width (Int32/UInt32/UInt64/Int128) op family ---
+# True iff the scalar is a SIGNED width (Int32 / Int128). Drives sext-vs-zext
+# on the div widen and signed-vs-unsigned `icmp`.
+fn nfixed_is_signed(s: RawScalar) : Bool = match s {
+  RwInt32  -> true
+  RwInt128 -> true
+  _        -> false
+}
+
+# `<op>(a, b)` raw fixed-width arithmetic at the native register width
+# (i32 for Int32/UInt32, i64 for UInt64). `+`/`-`/`*` are one wrapping
+# `ibinop` — the register width IS the type width, so two's-complement wraps
+# exactly with no mask. `/`/`%` widen (sext signed, zext unsigned) into the
+# checked i64 helper (signed `kaix_idiv_chk`, unsigned `kaix_udiv_chk`) so a
+# zero divisor traps identically on both backends, then truncate back to the
+# register width.
+fn nemit_raw_fixed_binop(ctx: Handle, s: RawScalar, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let slot = raw_scalar_slot(s)
+    # Int128 `/`/`%` never reach the raw path (kept boxed upstream); its
+    # register does not fit the i64 checked helper. Only `+ - *` and cmp
+    # ride raw here.
+    if (op == 3 or op == 4) and (match slot { SInt128 -> true _ -> false }) {
+      nemit_unsupported(ctx, "raw i128 div/mod must stay boxed"); nemit_null(ctx)
+    } else if op == 3 or op == 4 {
+      let signed = nfixed_is_signed(s)
+      let i64t = native_ctx_i64t(ctx)
+      let av = nemit_atom_raw(ctx, a, slot)
+      let bv = nemit_atom_raw(ctx, b, slot)
+      let aw = nfixed_widen(ctx, av, slot, signed)
+      let bw = nfixed_widen(ctx, bv, slot, signed)
+      let sym = nfixed_div_sym(signed, op)
+      let r64 = ncall_sig2(ctx, sym, i64t, i64t, i64t, aw, bw)
+      nfixed_narrow(ctx, r64, slot)
+    } else {
+      llvm_build_ibinop(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, slot), nemit_atom_raw(ctx, b, slot))
+    }
+  }
+  _ -> { nemit_unsupported(ctx, "raw fixed binop arity"); nemit_null(ctx) }
+}
+
+# The checked div/mod helper for a fixed width: signed `kaix_idiv_chk`/
+# `kaix_imod_chk`, unsigned `kaix_udiv_chk`/`kaix_umod_chk`.
+fn nfixed_div_sym(signed: Bool, op: Int) : String =
+  if signed { if op == 3 { "kaix_idiv_chk" } else { "kaix_imod_chk" } }
+  else { if op == 3 { "kaix_udiv_chk" } else { "kaix_umod_chk" } }
+
+# Widen a register value to i64 for the div helper — sext for a signed
+# width, zext for unsigned. A UInt64 (already i64) passes through.
+fn nfixed_widen(ctx: Handle, v: Handle, slot: KSlot, signed: Bool) : Handle / Console = match slot {
+  SUInt64 -> v
+  _       -> if signed { llvm_build_sext(native_ctx_b(ctx), v, native_ctx_i64t(ctx)) }
+             else { llvm_build_zext(native_ctx_b(ctx), v, native_ctx_i64t(ctx)) }
+}
+
+# Narrow an i64 div result back to the register width (trunc for i32, pass
+# through for i64/UInt64).
+fn nfixed_narrow(ctx: Handle, v: Handle, slot: KSlot) : Handle / Console = match slot {
+  SUInt64 -> v
+  _       -> llvm_build_trunc(native_ctx_b(ctx), v, native_ctx_i32t(ctx))
+}
+
+# `<cmp>(a, b)` raw fixed-width comparison → an `icmp` (signed for Int32,
+# unsigned for UInt32/UInt64) over the register-width operands, widened to
+# the i32 `SBool` register.
+fn nemit_raw_fixed_cmp(ctx: Handle, s: RawScalar, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let slot = raw_scalar_slot(s)
+    let av = nemit_atom_raw(ctx, a, slot)
+    let bv = nemit_atom_raw(ctx, b, slot)
+    let i1v = if nfixed_is_signed(s) { llvm_build_icmp(native_ctx_b(ctx), pred, av, bv) }
+              else { llvm_build_ucmp(native_ctx_b(ctx), pred, av, bv) }
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw fixed cmp arity"); nemit_null(ctx) }
+}
+
+# A fixed-width box: widen the register value to i64 (sext/zext) and call
+# the ctor (`kaix_int32`/`kaix_uint32` take an i64; `kaix_uint64` too, its
+# i64 register passes straight through). Int128 rides an i128 register whose
+# ctor (`kaix_int128`) takes the i128 directly — no widen, i128t arg.
+fn nemit_raw_fixed_box(ctx: Handle, sym: String, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> match slot {
+    SInt128 -> ncall_sig1(ctx, sym, native_ctx_ptrt(ctx), native_ctx_i128t(ctx), nemit_atom_raw(ctx, a, slot))
+    _       -> {
+      let v = nemit_atom_raw(ctx, a, slot)
+      let arg = nfixed_widen(ctx, v, slot, nfixed_box_is_signed(slot))
+      ncall_sig1(ctx, sym, native_ctx_ptrt(ctx), native_ctx_i64t(ctx), arg)
+    }
+  }
+  _ -> { nemit_unsupported(ctx, "raw fixed box arity"); nemit_null(ctx) }
+}
+
+fn nfixed_box_is_signed(slot: KSlot) : Bool = match slot { SInt32T -> true _ -> false }
+
+# `<cmp>(a, b)` raw `i64` SIGNED comparison → `icmp` (i1) widened to i32, so
+# the result stores in the i32 `SBool` register and feeds `kaix_bool` / a
+# condbr uniformly (mirror of `nemit_raw_fcmp`). Operands load raw at
+# `SInt64`.
+fn nemit_raw_icmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_icmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, SInt64), nemit_atom_raw(ctx, b, SInt64))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw icmp arity"); nemit_null(ctx) }
+}
+
+# `and`/`or` over two raw i32 0/1 booleans → the i1-domain `logical`
+# builder (op 1=and, 0=or). Operands + result are i32 0/1.
+fn nemit_raw_logical(ctx: Handle, op: Int, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> llvm_build_logical(native_ctx_b(ctx), op, nemit_atom_raw(ctx, a, SBool), nemit_atom_raw(ctx, b, SBool))
+  _      -> { nemit_unsupported(ctx, "raw logical arity"); nemit_null(ctx) }
+}
+
+#[doc("A raw unary instruction (`fneg` over f64, `lnot` over i32).")]
+pub fn nemit_raw_unary(ctx: Handle, op: UnOp, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> match op {
+    UoNeg -> llvm_build_fneg(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SReal))
+    UoNot -> llvm_build_lnot(native_ctx_b(ctx), nemit_atom_raw(ctx, a, SBool))
+  }
+  _   -> { nemit_unsupported(ctx, "raw unary arity"); nemit_null(ctx) }
+}
+
+# Box a raw scalar: `kaix_real(f64)` / `kaix_bool(i32)`. The raw→boxed
+# border the `lower_expr` guard inserts (`box_wrap` in the oracle). The
+# param type is the raw scalar's (`f64`/`i32`); result is a boxed `ptr`.
+fn nemit_raw_box(ctx: Handle, sym: String, bslot: KSlot, pty: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> ncall_sig1(ctx, sym, native_ctx_ptrt(ctx), pty, nemit_atom_raw(ctx, a, bslot))
+  _   -> { nemit_unsupported(ctx, "raw box arity"); nemit_null(ctx) }
+}

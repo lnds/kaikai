@@ -1,0 +1,216 @@
+#[doc("""
+Prims lowered inline rather than as a plain runtime call: field reads,
+vector record pushes, assertion checks, unwind registration and tag
+tests.
+""")]
+
+import compiler.kir
+import compiler.emit_native_fn
+import compiler.emit_native_call
+import compiler.emit_native_ops_seg
+
+#[doc("""
+The raw payload of an atom at `slot`: a register already at that slot loads
+directly and a boxed one unbox-borrows its field (no decref). A raw register
+never re-boxes for the read.
+""")]
+pub fn nemit_raw_unbox_at(ctx: Handle, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [a] -> match a {
+    KVar(_) -> nemit_atom_raw(ctx, a, slot)
+    _       -> nemit_unbox_field(ctx, nemit_atom(ctx, a), slot)
+  }
+  _   -> { nemit_unsupported(ctx, "raw unbox arity"); nemit_null(ctx) }
+}
+
+#[doc("""
+`<sym>(ptr rec, i8* name) -> ptr` (`kaix_field` owned / `kaix_field_borrow`
+non-consuming). The name KVal is a `KStrV` the field-read lowering planted;
+materialise it as a global string, not a boxed `kaix_str`. Args +
+param-types go through C buffers (no [Handle]).
+""")]
+pub fn nemit_field_read(ctx: Handle, sym: String, cargs: [KVal]) : Handle / Console = match cargs {
+  [rec, KStrV(name)] -> {
+    let p = native_ctx_ptrt(ctx)
+    let rh = nemit_atom(ctx, rec)
+    let gname = llvm_build_global_string(native_ctx_b(ctx), name)
+    ncall_sig2(ctx, sym, p, p, p, rh, gname)
+  }
+  _ -> { nemit_unsupported(ctx, "record field read with non-literal field name"); nemit_null(ctx) }
+}
+
+#[doc("""
+`kaix_field_at(ptr rec, i32 i) -> ptr` — constant-index field read, the
+`(ptr, i32)` sibling of `kaix_field`. The index KVal is a `KIntV` the
+lowering computed from the static record type. Same incref-on-read shape.
+""")]
+pub fn nemit_field_at(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [rec, KIntV(i)] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i32t = native_ctx_i32t(ctx)
+    let rh = nemit_atom(ctx, rec)
+    ncall_sig2(ctx, "kaix_field_at", p, p, i32t, rh, llvm_const_i32(i32t, i))
+  }
+  _ -> { nemit_unsupported(ctx, "kai_op_field_at with non-literal index"); nemit_null(ctx) }
+}
+
+#[doc("""
+`kaix_vec_push_rec_raw(ptr vec, i64 n, ptr* xs, i8** names) -> ptr`.
+The KIR op carries (value, KStrV name) pairs after the arity; split
+them into the two arrays kaix_record-style.
+""")]
+pub fn nemit_vec_push_rec(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, KIntV(n), ...pairs] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i64t = native_ctx_i64t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let vals = llvm_buf_new()
+    let names = llvm_buf_new()
+    nemit_vec_rec_pairs(ctx, vals, names, pairs)
+    let farr = nemit_ptr_array(ctx, vals)
+    let narr = nemit_ptr_array(ctx, names)
+    llvm_buf_free(vals); llvm_buf_free(names)
+    let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+    let ab = llvm_buf_new(); llvm_buf_push(ab, vh); llvm_buf_push(ab, llvm_const_int(i64t, n)); llvm_buf_push(ab, farr); llvm_buf_push(ab, narr)
+    ncall_finish(ctx, "kaix_vec_push_rec_raw", p, ptb, ab)
+  }
+  _ -> { nemit_unsupported(ctx, "vec_push_rec_raw with malformed args"); nemit_null(ctx) }
+}
+
+# The (value, KStrV name) pair walk. Handle-binder `let`s keep the LLVM
+# handles out of Perceus (the nemit_push_fields trap).
+fn nemit_vec_rec_pairs(ctx: Handle, vals: Handle, names: Handle, pairs: [KVal]) : Unit / Console = match pairs {
+  [] -> ()
+  [x, KStrV(nm), ...rest] -> {
+    let xh = nemit_atom(ctx, x)
+    let nh = llvm_build_global_string(native_ctx_b(ctx), nm)
+    llvm_buf_push(vals, xh)
+    llvm_buf_push(names, nh)
+    nemit_vec_rec_pairs(ctx, vals, names, rest)
+  }
+  _ -> nemit_unsupported(ctx, "vec_push_rec_raw with malformed field pairs")
+}
+
+#[doc("""
+`kaix_vec_set_rec_raw(ptr vec, ptr i, i64 n, ptr* xs) -> ptr` — the
+slot is already classified, so only the values travel.
+""")]
+pub fn nemit_vec_set_rec(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, i, KIntV(n), ...xs] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i64t = native_ctx_i64t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let ih = nemit_atom(ctx, i)
+    let vals = llvm_buf_new()
+    nemit_vec_rec_vals(ctx, vals, xs)
+    let farr = nemit_ptr_array(ctx, vals)
+    llvm_buf_free(vals)
+    let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, p)
+    let ab = llvm_buf_new(); llvm_buf_push(ab, vh); llvm_buf_push(ab, ih); llvm_buf_push(ab, llvm_const_int(i64t, n)); llvm_buf_push(ab, farr)
+    ncall_finish(ctx, "kaix_vec_set_rec_raw", p, ptb, ab)
+  }
+  _ -> { nemit_unsupported(ctx, "vec_set_rec_raw with malformed args"); nemit_null(ctx) }
+}
+
+fn nemit_vec_rec_vals(ctx: Handle, vals: Handle, xs: [KVal]) : Unit / Console = match xs {
+  [] -> ()
+  [x, ...rest] -> {
+    let xh = nemit_atom(ctx, x)
+    llvm_buf_push(vals, xh)
+    nemit_vec_rec_vals(ctx, vals, rest)
+  }
+}
+
+#[doc("""
+`kaix_assert_check(ptr cond, i8* msg) -> void`. The message is a `KStrV`
+span decoded to its literal bytes, then materialised via
+`llvm_build_string_span`. The call returns `void`; it only ever appears as a `KDo` (the
+discarded result is fine). Mixed signature, same shape as the field
+reads — never the all-boxed `nemit_prim` fall-through.
+""")]
+pub fn nemit_assert_check(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [cond, KStrV(msg)] -> {
+    let p = native_ctx_ptrt(ctx)
+    let ch = nemit_atom(ctx, cond)
+    let gmsg = llvm_build_string_span(native_ctx_b(ctx), nemit_decode_span(msg))
+    ncall_sig2(ctx, "kaix_assert_check", native_ctx_voidt(ctx), p, p, ch, gmsg)
+  }
+  _ -> { nemit_unsupported(ctx, "kai_assert_check with non-literal message"); nemit_null(ctx) }
+}
+
+#[doc("""
+`kaix_unw_push(ptr slots, i64 n) -> ptr fiber` over the boxed registers
+among the atoms; a raw register holds no reference and is left out. The
+slots live in an entry alloca, valid for the whole call it brackets.
+The frame's fiber cache: a stack slot read on the first push, so a path
+that never pushes never looks the fiber up.
+""")]
+pub fn nemit_unw_fiber(ctx: Handle) : Handle = {
+  let p = native_ctx_ptrt(ctx)
+  let slot = llvm_build_alloca_entry(ctx, p, "unw.fiber")
+  llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), slot)
+  slot
+}
+
+#[doc("`kaix_unw_push_f(fiber, slots, n)`: registers the boxed registers among the atoms for release on unwind.")]
+pub fn nemit_unw_push(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [fib, ...regs] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i64t = native_ctx_i64t(ctx)
+    let buf = llvm_buf_new()
+    nemit_unw_boxed_regs(ctx, buf, regs)
+    let n = llvm_buf_len(buf)
+    let arr = nemit_ptr_array(ctx, buf)
+    llvm_buf_free(buf)
+    ncall_sig3(ctx, "kaix_unw_push_f", p, p, p, i64t, nemit_atom(ctx, fib), arr, llvm_const_int(i64t, n))
+  }
+  [] -> { nemit_unsupported(ctx, "kai_unw_push takes the frame's fiber"); nemit_null(ctx) }
+}
+
+fn nemit_unw_boxed_regs(ctx: Handle, buf: Handle, vs: [KVal]) : Unit / Console = match vs {
+  [] -> ()
+  [v, ...rest] -> {
+    match v {
+      KVar(n) -> if native_ctx_reg_slot(ctx, n) == 0 { llvm_buf_push(buf, nemit_load_reg(ctx, n)) }
+      _       -> ()
+    }
+    nemit_unw_boxed_regs(ctx, buf, rest)
+  }
+}
+
+#[doc("`kaix_unw_pop(fiber)`: drops the registration the matching push made.")]
+pub fn nemit_unw_pop(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [f] -> ncall_sig1(ctx, "kaix_unw_pop", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), nemit_atom(ctx, f))
+  _   -> { nemit_unsupported(ctx, "kai_unw_pop takes the pushing fiber"); nemit_null(ctx) }
+}
+
+#[doc("""
+`kaix_assert_check_with_value(ptr cond, i8* msg, i8* ident, ptr val) -> void`;
+both strings arrive as `KStrV` spans, like `kaix_assert_check`'s message.
+""")]
+pub fn nemit_assert_check_with_value(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [cond, KStrV(msg), KStrV(ident), val] -> {
+    let p = native_ctx_ptrt(ctx)
+    let ch = nemit_atom(ctx, cond)
+    let gmsg = llvm_build_string_span(native_ctx_b(ctx), nemit_decode_span(msg))
+    let gid = llvm_build_string_span(native_ctx_b(ctx), nemit_decode_span(ident))
+    ncall_sig4(ctx, "kaix_assert_check_with_value", native_ctx_voidt(ctx), p, p, p, p, ch, gmsg, gid, nemit_atom(ctx, val))
+  }
+  _ -> { nemit_unsupported(ctx, "kai_assert_check_with_value with non-literal strings"); nemit_null(ctx) }
+}
+
+#[doc("""
+`kaix_tag_eq(ptr slot, i32 tag) -> ptr` (boxed Bool). The slot value is
+boxed; the tag is the `KIntV` the lowering planted, materialised as a
+raw `i32` constant (NOT a boxed Int — the runtime reads the tag word
+directly, mirroring the oracle's `slot->variant_tag == t`). Mixed
+signature, same shape as the field reads / `kaix_assert_check`.
+""")]
+pub fn nemit_tag_eq(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [slot, KIntV(tag)] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i32t = native_ctx_i32t(ctx)
+    let sh = nemit_atom(ctx, slot)
+    ncall_sig2(ctx, "kaix_tag_eq", p, p, i32t, sh, llvm_const_i32(i32t, tag))
+  }
+  _ -> { nemit_unsupported(ctx, "kai_tag_eq with non-literal tag"); nemit_null(ctx) }
+}

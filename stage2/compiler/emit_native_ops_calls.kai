@@ -1,0 +1,252 @@
+#[doc("""
+Calls: direct, raw-argument and evidence-passing, with the donor token
+and the boxed return.
+""")]
+
+import compiler.util
+import compiler.kir
+import compiler.emit_native_fn
+import compiler.emit_native_fnix
+import compiler.effect_instance
+import compiler.core_effects
+import compiler.rt_name
+import compiler.symtab
+import compiler.fnreg
+import compiler.emit_native_call
+import compiler.emit_native_ops_syms
+
+#[doc("""
+Call `sym` (boxed sig) over `argbuf`, then free the buffer. The funnel
+for every boxed call whose args were just materialised into a fresh buf.
+""")]
+pub fn nemit_call_freeing(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
+  let r = nemit_call_boxed(ctx, sym, argbuf); llvm_buf_free(argbuf); r
+}
+
+# --- P3: direct call to a (possibly raw) UFn ---------------------------
+#
+# A `KCall(sym, cargs)` is a direct call to a known symbol (the KIR already
+# decided direct-vs-indirect via `callee_is_direct`, honouring the
+# locals-shadow rule). When that symbol resolves to a user fn whose KFn
+# carries a raw signature (`nfn_has_raw_slot`), the call is emitted RAW:
+# each arg is materialised at its PARAM slot (a raw param gets a raw arg
+# directly; a boxed param gets the boxed atom; a raw param fed a boxed atom
+# unbox-borrows at the slot, all via `nemit_atom_raw`), the call uses the
+# raw LLVM signature (`nfn_llvm_type`), and a raw return is RE-BOXED ONLY when
+# the destination register is boxed (`dst == SBoxed`).
+#
+# `dst` is the KLet's destination slot (`SBoxed` from the value-discarding
+# `nemit_op` / KDo paths). When `lower_direct_call` bound the call result at
+# the callee's raw RETURN slot — its register's alloca is then `i64`/`f64`/`i1`
+# — `dst` is that raw slot and the raw return flows in WITHOUT a `kaix_int`
+# box: a consuming `i+` reads the register directly. A boxed `dst` over a raw
+# return boxes once at the border (the prior unconditional behaviour, the
+# oracle's `box_wrap`). Mirror of emit_c's `emit_ufn_boxed_call` /
+# `emit_ufn_raw_call` split (box at a boxed use, raw at a raw use).
+#
+# A symbol with no raw KFn (a core builtin, a runtime prim, a fully
+# boxed user fn) takes the legacy all-boxed funnel unchanged.
+pub fn nemit_call_direct(ctx: Handle, sym: String, cargs: [KVal], fx: NFnIndex, dst: KSlot) : Handle / Console =
+  match nfnx_by_sym(fx, sym) {
+    Some(f) -> if nfn_has_raw_slot(f) { nemit_call_raw(ctx, sym, cargs, f, fx, dst) }
+               else { nemit_call_boxed_evf(ctx, sym, cargs, f, fx) }
+    None    -> if string_starts_with_q(sym, "kaix_proto_dispatch") { nemit_proto_dispatch(ctx, sym, cargs) }
+               else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
+  }
+
+# `kaix_proto_dispatch<N>(i64 pid, i64 op, i8* pname, i8* opname, ptr × N)`: the
+# ids are immediates and the names constant strings, so a dispatch allocates
+# nothing; the receiver and the op args stay boxed.
+fn nemit_proto_dispatch(ctx: Handle, sym: String, cargs: [KVal]) : Handle / Console = match cargs {
+  [KIntV(pid), KIntV(op), KStrV(pn), KStrV(on), ...args] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i64t = native_ctx_i64t(ctx)
+    let ptb = llvm_buf_new(); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+    let ab = llvm_buf_new()
+    llvm_buf_push(ab, llvm_const_int(i64t, pid)); llvm_buf_push(ab, llvm_const_int(i64t, op))
+    llvm_buf_push(ab, llvm_build_string_span(native_ctx_b(ctx), nemit_decode_span(pn)))
+    llvm_buf_push(ab, llvm_build_string_span(native_ctx_b(ctx), nemit_decode_span(on)))
+    nemit_push_boxed_params(ptb, p, list_length(args))
+    nemit_push_atoms(ctx, ab, args)
+    ncall_finish(ctx, sym, p, ptb, ab)
+  }
+  _ -> { nemit_unsupported(ctx, cat2(sym, " with non-literal metadata")); nemit_null(ctx) }
+}
+
+fn nemit_push_boxed_params(ptb: Handle, p: Handle, n: Int) : Unit =
+  if n <= 0 { () } else { llvm_buf_push(ptb, p); nemit_push_boxed_params(ptb, p, n - 1) }
+
+#[doc("""
+The reuse token a call to a donation-capable callee fills its hidden
+trailing param with: the caller's live `_arm_ru` MOVED out of its slot
+(read + null, so the arm epilogue free and any later donation see null),
+or a null token when this fn never captures one. The move is always sound
+— whichever consumer runs first wins, the rest fresh-alloc.
+""")]
+fn ndonate_token(ctx: Handle) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  if native_ctx_reg_slot(ctx, ntrmc_armru_reg()) < 0 { llvm_const_null(p) }
+  else {
+    let t = nemit_load_reg(ctx, ntrmc_armru_reg())
+    nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(p))
+    t
+  }
+}
+
+#[doc("Reserve + null-seed the hidden donor register for a donation-capable fn (entry-block alloca; the param seed overwrites it).")]
+pub fn nemit_donor_alloca(ctx: Handle, f: KFn) : Unit / Console =
+  if f.donor {
+    let p = native_ctx_ptrt(ctx)
+    let a = llvm_build_alloca(native_ctx_b(ctx), p, cat2(ndonor_reg(), ".addr"))
+    native_ctx_add_reg(ctx, ndonor_reg(), a, 0)
+    let _z = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), a)
+    ()
+  } else { () }
+
+#[doc("Free an unconsumed cross-call donor token on a fn exit path (null-safe shell-only free); a fn with no donor channel is a no-op.")]
+pub fn nemit_donor_free(ctx: Handle) : Unit / Console =
+  if native_ctx_reg_slot(ctx, ndonor_reg()) < 0 { () }
+  else {
+    let _d = ncall_sig1(ctx, "kaix_reuse_free", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), nemit_load_reg(ctx, ndonor_reg()))
+    nemit_store_reg(ctx, ndonor_reg(), llvm_const_null(native_ctx_ptrt(ctx)))
+  }
+
+# The all-boxed direct call with the evidence frame prepended when the
+# callee carries one and the donor token appended when it takes one; a
+# frameless, donor-less callee reduces to the legacy buffer. The frame
+# `ptr` is pushed first so it lands in the signature's leading slot.
+fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal], f: KFn, fx: NFnIndex) : Handle / Console = {
+  let dn = f.donor
+  let n = native_ctx_frame_slot_count(ctx, sym)
+  if n > 0 or dn {
+    let buf = llvm_buf_new()
+    if n > 0 { let frame = nemit_evf_build_frame(ctx, sym, f, fx, n); llvm_buf_push(buf, frame) } else { () }
+    nemit_push_atoms(ctx, buf, cargs)
+    if dn { let tok = ndonate_token(ctx); llvm_buf_push(buf, tok) } else { () }
+    let r = nemit_call_boxed(ctx, ncall_sym(sym), buf); llvm_buf_free(buf); r
+  } else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
+}
+
+# Emit the raw direct call: build the param-type buffer + the arg buffer in
+# lockstep (each arg materialised at its param slot), declare + call the fn
+# at its raw type. A raw return is re-boxed ONLY for a boxed destination — a
+# raw `dst` (a register whose alloca matches the raw return) keeps the bare
+# `i64`/`f64`/`i1`, so the consumer reads it directly (no box+unbox round-
+# trip). `nemit_box_ret` is a no-op on a `SBoxed` return regardless of `dst`.
+fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, fx: NFnIndex, dst: KSlot) : Handle / Console = {
+  let ptb = llvm_buf_new()
+  let ab = llvm_buf_new()
+  # Prepend the evidence frame when the callee carries one, so the call type
+  # matches the definition's leading `ptr __evf`.
+  nemit_evf_call_push(ctx, sym, f, fx, ptb, ab)
+  nemit_raw_args(ctx, f.params, cargs, ptb, ab)
+  # A donation-capable callee takes the trailing reuse token.
+  if f.donor { llvm_buf_push(ptb, native_ctx_ptrt(ctx)); let tok = ndonate_token(ctx); llvm_buf_push(ab, tok) } else { () }
+  let r = ncall_finish(ctx, sym, nslot_type(ctx, f.ret), ptb, ab)
+  match dst {
+    SBoxed -> nemit_box_ret(ctx, r, f.ret)
+    _      -> r
+  }
+}
+
+# Push the callee's evidence-frame arg (a `ptr` to a `[N x ptr]` of slots,
+# each filled by the live walk) + its type, when the callee carries a frame.
+#[doc("Push the walk-filled evidence frame of the callee `f`, emitted as `callee`, and its type onto the buffers when it carries a frame.")]
+pub fn nemit_evf_call_push(ctx: Handle, callee: String, f: KFn, fx: NFnIndex, ptb: Handle, ab: Handle) : Unit / Console = {
+  let n = native_ctx_frame_slot_count(ctx, callee)
+  if n > 0 {
+    let frame = nemit_evf_build_frame(ctx, callee, f, fx, n)
+    llvm_buf_push(ptb, native_ctx_ptrt(ctx))
+    llvm_buf_push(ab, frame)
+  } else { () }
+}
+
+# Build the `[N x ptr]` evidence frame for `callee`: alloca it in the entry
+# head, store each slot's node at its index, return the array pointer. The
+# perform reads slot j. The slots are the callee's instances, one per slot
+# its symbol was registered with.
+fn nemit_evf_build_frame(ctx: Handle, callee: String, f: KFn, fx: NFnIndex, n: Int) : Handle / Console = {
+  let arrty = llvm_array_type(native_ctx_ptrt(ctx), n)
+  let frame = llvm_build_alloca_entry(ctx, arrty, "__evf_frame")
+  let keys = nfnx_frame_keys(fx, f)
+  if list_length(keys) == n { nemit_evf_fill_slots(ctx, fx.tab, keys, arrty, frame, 0) }
+  else { nemit_unsupported(ctx, cat2("evidence frame: the slots of the symbol are not the frame of ", callee)) }
+  frame
+}
+
+fn nemit_evf_fill_slots(ctx: Handle, tab: SymTab, keys: [InstKey], arrty: Handle, frame: Handle, j: Int) : Unit / Console = match keys {
+  [] -> ()
+  [k, ...rest] -> {
+    let node = nemit_evf_slot_node(ctx, tab, k)
+    let idx = llvm_const_int(native_ctx_i64t(ctx), j)
+    let slotptr = llvm_build_array_gep(native_ctx_b(ctx), arrty, frame, idx)
+    let _s = llvm_build_store(native_ctx_b(ctx), node, slotptr)
+    nemit_evf_fill_slots(ctx, tab, rest, arrty, frame, j + 1)
+  }
+}
+
+# The node a caller fills a slot with: a lexical handler on the stack wins,
+# falling back to the minted default node for a default-bearing effect. Either
+# result is guarded by `kaix_evidence_require` so a NULL node (no handler on
+# this fiber — the walk crossed a spawn) or a zeroed synth-default node whose
+# handler slot is NULL (a fiber-local/user effect with no real default) reports
+# `effect not handled in fiber` instead of being stored as a slot the perform
+# derefs to a segfault.
+fn nemit_evf_slot_node(ctx: Handle, tab: SymTab, k: InstKey) : Handle / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let key = inst_key_text(tab, k)
+  let effname = llvm_build_global_string(native_ctx_b(ctx), key)
+  let g = llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", rt_name(tab, k.eff)))
+  let node =
+    if llvm_handle_is_null(g) == 1 {
+      ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
+    } else {
+      ncall_sig2(ctx, "kaix_evidence_lookup_or_default", p, p, p, effname, g)
+    }
+  # `Ffi` declares no ops and is routed around the dispatcher, so its slot node
+  # legitimately carries a NULL handler the FFI shim never dereferences.
+  if effect_is(k.eff, CeFfi) { node }
+  else { ncall_sig2(ctx, "kaix_evidence_require", p, p, p, node, effname) }
+}
+
+# Materialise each arg at its param's slot, pushing the param TYPE into
+# `ptb` and the arg VALUE into `ab` in the same order. A raw param slot
+# (`SInt64`/`SReal`/`SBool`) materialises the arg raw (`nemit_atom_raw`
+# adapts a boxed atom down at the slot); a boxed param keeps the boxed
+# atom. The two buffers stay aligned, so `ncall_finish` builds a matching
+# `(rawslot...) -> ret` signature. A length mismatch is a lowering bug —
+# the param list and `cargs` are the same arity by construction.
+fn nemit_raw_args(ctx: Handle, ps: [KParam], cargs: [KVal], ptb: Handle, ab: Handle) : Unit / Console = match ps {
+  [] -> ()
+  [p, ...prest] -> match cargs {
+    [a, ...arest] -> {
+      llvm_buf_push(ptb, nslot_type(ctx, p.slot))
+      llvm_buf_push(ab, nemit_arg_at_slot(ctx, a, p.slot))
+      nemit_raw_args(ctx, prest, arest, ptb, ab)
+    }
+    [] -> { nemit_unsupported(ctx, "raw call arity mismatch (fewer args than params)"); () }
+  }
+}
+
+# An arg at a param slot: raw slots use `nemit_atom_raw` (raw literal /
+# raw register / boxed→raw border), a boxed slot the plain boxed atom.
+fn nemit_arg_at_slot(ctx: Handle, a: KVal, slot: KSlot) : Handle / Console = match slot {
+  SBoxed -> nemit_atom(ctx, a)
+  _      -> nemit_atom_raw(ctx, a, slot)
+}
+
+# Re-box a raw return into the boxed `KaiValue *` the result register
+# holds. A boxed return (slot `SBoxed`) passes through. Mirror of
+# `ufn_call_result`'s `box_wrap` (only boxes when the return is raw).
+fn nemit_box_ret(ctx: Handle, r: Handle, ret: KSlot) : Handle / Console = match ret {
+  SInt64 -> ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), r)
+  SReal  -> ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), r)
+  SBool  -> ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), r)
+  SChar  -> ncall_sig1(ctx, "kaix_char", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), r)
+  SByte  -> ncall_sig1(ctx, "kaix_byte", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), r)
+  SInt32T -> ncall_sig1(ctx, "kaix_int32",  native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, r, 1))
+  SUInt32 -> ncall_sig1(ctx, "kaix_uint32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, r, 0))
+  SUInt64 -> ncall_sig1(ctx, "kaix_uint64", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), r)
+  SInt128 -> ncall_sig1(ctx, "kaix_int128", native_ctx_ptrt(ctx), native_ctx_i128t(ctx), r)
+  _      -> r
+}
