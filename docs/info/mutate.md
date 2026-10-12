@@ -158,8 +158,8 @@ $ kai mutate --list --json --module greet.kai --operator compare
   it, `""` for a deletion (an `arm` site's span is the whole arm).
 - `enclosing` — the declaration the site lives in: `module.fn/arity`,
   `module.CONST`, or `module.(Show for Color).show/1` for an impl
-  method, where `module` is the file's module path in its package
-  (`a/util.kai` under the directory holding `kai.toml` is `a.util`), or
+  method, where `module` is the name the file is imported by in its
+  package (`a/util.kai` beside the manifest's `entry` is `a.util`), or
   the file's name without `.kai` outside a package.
 - `ordinal` — 1-based rank among the sites sharing `enclosing`,
   `operator` and `original`, in source order.

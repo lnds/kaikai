@@ -5,7 +5,8 @@
 # beside the entry, and a test wherever it sits imports the package's
 # modules as the entry does. `kai build`, `kai run` and `kai typecheck`
 # of a file that is not the entry resolve the same way, and so does a
-# package that depends on this one by path.
+# package that depends on this one by path. `kai mutate` names a module
+# as those imports do.
 
 set -eu
 
@@ -15,10 +16,11 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 
 pkg="$work/demo"
-mkdir -p "$pkg/src/demo/core" "$pkg/src/tests" "$pkg/tests"
+mkdir -p "$pkg/src/demo/core" "$pkg/src/tests" "$pkg/tests" "$pkg/bench"
 printf 'name = "demo"\nversion = "0.1.0"\nentry = "src/main.kai"\n' > "$pkg/kai.toml"
 printf '#[doc("Doubles.")]\npub fn twice(n: Int) : Int = n * 2\n' > "$pkg/src/demo/core/math.kai"
 printf 'import demo.core.math\n\nfn main() : Int / Stdout {\n  Stdout.print("#{twice(21)}")\n  0\n}\n' > "$pkg/src/main.kai"
+printf '#[doc("Halves.")]\npub fn half(n: Int) : Int = n / 2\n' > "$pkg/bench/half.kai"
 printf 'import demo.core.math\n\ntest "beside the manifest" {\n  assert twice(2) == 4\n}\n' > "$pkg/tests/math_test.kai"
 printf 'import demo.core.math\n\ntest "beside the entry" {\n  assert twice(3) == 6\n}\n' > "$pkg/src/tests/entry_side.kai"
 printf 'import demo.core.math\n\ntest "beside the module" {\n  assert twice(4) == 8\n}\n' > "$pkg/src/demo/core/math_test.kai"
@@ -55,6 +57,10 @@ check "test, file beside the manifest" '1/1 tests passed' test tests/math_test.k
 check "test, file beside the entry" '1/1 tests passed' test src/tests/entry_side.kai
 check "test, file beside the module" '1/1 tests passed' test src/demo/core/math_test.kai
 check "typecheck, a test file" '' typecheck tests/math_test.kai
+check "mutate, a module is named as it is imported" '"enclosing": "demo.core.math.twice/1"' \
+  mutate --list --json --module src/demo/core/math.kai
+check "mutate, a module outside the entry's directory is named from the package" '"enclosing": "bench.half.half/1"' \
+  mutate --list --json --module bench/half.kai
 
 check "dependent, run from the dependency" '^100$' run ./tool
 check_in "$tool" "dependent, run" '^100$' run .
