@@ -121,6 +121,7 @@ for f in "$work"/core/*/bins/*/bin; do
   [ -f "$f" ] && head -c 100 "$f" > "$f.cut" && mv "$f.cut" "$f"
 done
 scenario truncated-entries 1 "$solo" -- main.kai
+scenario truncated-replaced 0 "$solo" -- main.kai
 
 # The first run in a package builds the package tools it reports on.
 run pkg-warmup 0 "$pkg" -- main.kai
