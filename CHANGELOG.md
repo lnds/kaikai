@@ -84,6 +84,28 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.144.0 (2026-10-12)
+
+### BREAKING CHANGE
+
+- `lazy` is a reserved word. A binding, function or field
+named `lazy` must be renamed.
+
+### Added
+
+- **parse**: `lazy [...]` writes a `Seq`, and list patterns read one (#2727)
+- **stdlib**: seq, lazy sequences over a runtime cell evaluated at most once (#2726)
+
+### Fixed
+
+- **kai**: the binary memo keys on the sources the compile read, and no lookup starts the compiler (#2729)
+- **kai**: a package that depends on one whose entry sits in a subdirectory resolves its modules (#2730)
+- **kai**: evicting memo entries leaves the digests kept beside them (#2725)
+
+### Changed
+
+- **kai**: a kai build with nothing changed builds nothing (#2729)
+
 ## v0.143.0 (2026-10-12)
 
 ### Added
