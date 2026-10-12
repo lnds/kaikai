@@ -674,6 +674,35 @@ pass `last` (`[1, 3..10]` is 1, 3, 5, 7, 9). The sign of the step gives
 the direction (`[10, 8..0]` descends). A step of zero is an error: at
 compile time when the two elements fix it, at run time otherwise.
 
+`lazy [...]` writes a `Seq`, a lazy sequence whose cells are evaluated
+when read and at most once. The bracket is a list or a range, and here
+alone a range may have no end; a spread is the rest of the sequence and
+comes last. Everything inside is pure. The type lives in the `seq`
+module, which the file imports; `kai info seq` has the full treatment.
+
+```kaikai
+import seq
+
+fn main() : Unit / Stdout = {
+  let abc = lazy [1, 2, 3]                     # a Seq of three cells
+  let more = lazy [0, ...abc]                  # spread: the rest, last
+  let nat = lazy [0..]                         # endless: 0, 1, 2, …
+  let odd = lazy [1, 3..]                      # endless, stepped
+  let few = lazy [2, 4..10]                    # a range with an end
+  Stdout.print(show(to_list(more)) ++ show(to_list(few)))
+  Stdout.print(show(to_list(take(nat, 3))) ++ show(to_list(take(odd, 3))))
+}
+```
+
+A range with no end is legal only after `lazy`:
+
+```kaikai-neg
+fn main() : Int = {
+  let nat = [0..]                              # error: a list has an end;
+  0                                            #   write `lazy [0..]`
+}
+```
+
 List-PATTERN destructuring (`[head, ...tail]`) parses where a pattern
 is expected — `match` arms, `let` LHS (`let [h, ...t] = xs`), fn
 parameters. In EXPRESSION position `...` is the list spread:
