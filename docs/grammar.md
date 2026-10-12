@@ -735,7 +735,8 @@ record literals (mixing the two sugars is out of scope for v1).
 list_lit    ::= '[' list_body? ']'
 list_body   ::= range_body
               | spread_or_expr (',' spread_or_expr)*
-range_body  ::= expr '..' expr ('..' expr)?            (* [start..end..step] *)
+range_body  ::= expr '..' expr                         (* [first..last] *)
+              | expr ',' expr '..' expr                (* [first, second..last]; step = second - first *)
 spread_or_expr ::= '...' expr | expr
 ```
 

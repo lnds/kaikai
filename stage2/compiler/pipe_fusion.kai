@@ -115,13 +115,12 @@ pub fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Optio
     # Only a RANGE head earns the zero-stage rewrite: for a plain list,
     # `sum(xs)` beats `map_sum(xs, identity)` (monomorphised static loop
     # vs a closure call per element).
-    ERange(_, _, _) ->
+    _ ->
       if not pipe_fusion_head(lhs) { None }
       else { match pipe_fusion_as_terminal(ids, rhs) {
         Some(term) -> Some(FusedFold { source: lhs, stages: [], term: term })
         None -> None
       } }
-    _ -> None
   }
 
 #[doc("True when `lhs` can head a terminal fusion: a `map`-pipe chain, or a range the counting loops may walk.")]
@@ -132,7 +131,21 @@ pub fn pipe_fusion_head(lhs: Expr) : Bool = match lhs.kind {
     Some(k) -> k > 0
     None    -> true
   }
+  EBlock(_, Some(tail)) -> match tail.kind {
+    ERange(_, _, _) -> pipe_fusion_head(tail)
+    _               -> false
+  }
   _ -> false
+}
+
+# A block that only binds ahead of a range fuses as that range: its
+# statements stay ahead of the rewritten call.
+fn under_binds(source: Expr, rewrite: (Expr) -> Expr) : Expr = match source.kind {
+  EBlock(stmts, Some(tail)) -> match tail.kind {
+    ERange(_, _, _) -> Expr { ...source, kind: EBlock(stmts, Some(rewrite(tail))) }
+    _               -> rewrite(source)
+  }
+  _ -> rewrite(source)
 }
 
 fn pipe_fusion_as_terminal(ids: ProtoIds, rhs: Expr) : Option[FoldTerminal] =
@@ -262,6 +275,9 @@ fn pipe_fusion_apply(f: Expr, args_: [Expr]) : Expr = mk_expr(ECall(f, args_), f
 
 #[doc("Rewrite a recognised terminal to the matching non-materialising stdlib call.")]
 pub fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr =
+  under_binds(ff.source, (src) => fold_rewrite_over(FusedFold { ...ff, source: src }, line, col))
+
+fn fold_rewrite_over(ff: FusedFold, line: Int, col: Int) : Expr =
   match ff.term {
     TermLength               -> pipe_fusion_length_call(ff.source, line, col)
     TermFoldl(init, combine) -> pipe_fusion_stage_fold(ff, CfMapFoldl, [init, combine], line, col)
@@ -455,11 +471,20 @@ pub fn pipe_fusion_as_collect(e: Expr) : Option[FusedCollect] =
 #[doc("Rewrite a pure range-headed collect chain to the pre-sized `range_map_collect_vec` combinator; `None` when the head's length is not statically countable.")]
 pub fn pipe_fusion_collect_rewrite(fc: FusedCollect, line: Int, col: Int) : Option[Expr] =
   match fc.source.kind {
+    EBlock(stmts, Some(tail)) -> match collect_over(tail, fc.stages, line, col) {
+      Some(call) -> Some(Expr { ...fc.source, kind: EBlock(stmts, Some(call)) })
+      None       -> None
+    }
+    _ -> collect_over(fc.source, fc.stages, line, col)
+  }
+
+fn collect_over(source: Expr, stages: [Expr], line: Int, col: Int) : Option[Expr] =
+  match source.kind {
     ERange(a, b, None) ->
-      Some(pipe_fusion_collect_call(CfRangeMapCollectVec, [a, b], fc.stages, line, col))
+      Some(pipe_fusion_collect_call(CfRangeMapCollectVec, [a, b], stages, line, col))
     ERange(a, b, Some(step)) ->
-      if not pipe_fusion_head(fc.source) { None }
-      else { Some(pipe_fusion_collect_call(CfRangeStepMapCollectVec, [a, b, step], fc.stages, line, col)) }
+      if not pipe_fusion_head(source) { None }
+      else { Some(pipe_fusion_collect_call(CfRangeStepMapCollectVec, [a, b, step], stages, line, col)) }
     _ -> None
   }
 

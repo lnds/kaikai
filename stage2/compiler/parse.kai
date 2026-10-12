@@ -2910,36 +2910,95 @@ fn parse_first_list_elem(p: Parser, t: Token) : PExpr / Console {
     match r.r {
       None -> err_e(r.p)
       Some(first) -> {
-        # Range: `[ a .. b ]` or `[ a .. b .. step ]`.
         let p1 = p_skip_newlines(r.p)
-        if p_at(p1, TkDotDot) {
-          let r2 = parse_expr(p_skip_newlines(p_advance(p1)))
-          match r2.r {
-            None -> err_e(r2.p)
-            Some(to) -> {
-              let p2 = p_skip_newlines(r2.p)
-              if p_at(p2, TkDotDot) {
-                let r3 = parse_expr(p_skip_newlines(p_advance(p2)))
-                match r3.r {
-                  None -> err_e(r3.p)
-                  Some(step) -> {
-                    let p3 = p_skip_newlines(r3.p)
-                    if p_at(p3, TkRbracket) {
-                      ok_e(p_advance(p3), mk_expr(ERange(first, to, Some(step)), t.line, t.col))
-                    } else { err_e(p_error_here(p3, "expected `]` at end of range")) }
-                  }
-                }
-              } else if p_at(p2, TkRbracket) {
-                ok_e(p_advance(p2), mk_expr(ERange(first, to, None), t.line, t.col))
-              } else { err_e(p_error_here(p2, "expected `]` at end of range")) }
-            }
-          }
-        } else {
-          parse_list_rest(p1, [ElPlain(first)], t)
-        }
+        if p_at(p1, TkDotDot) { parse_range_end(p, p1, first, t) }
+        else { parse_list_rest(p1, [ElPlain(first)], t) }
       }
     }
   }
+}
+
+# `[first..last]`. `p0` is at `first` and `p1` at the `..` after it.
+fn parse_range_end(p0: Parser, p1: Parser, first: Expr, t: Token) : PExpr / Console {
+  let r = parse_expr(p_skip_newlines(p_advance(p1)))
+  match r.r {
+    None -> err_e(r.p)
+    Some(last) -> {
+      let p2 = p_skip_newlines(r.p)
+      if p_at(p2, TkRbracket) {
+        ok_e(p_advance(p2), mk_expr(ERange(first, last, None), t.line, t.col))
+      } else if p_at(p2, TkDotDot) { err_e(reject_trailing_step(p0, p1, p2, first))
+      } else { err_e(p_error_here(p2, "expected `]` at end of range")) }
+    }
+  }
+}
+
+# `[from..to..step]` is not a form: the error spells the stepped range the
+# author meant, from the source text of the three operands.
+fn reject_trailing_step(p0: Parser, p1: Parser, p2: Parser, first: Expr) : Parser / Console {
+  let r = parse_expr(p_skip_newlines(p_advance(p2)))
+  match r.r {
+    None -> r.p
+    Some(step) -> {
+      let form = "a stepped range is written `[first, second..last]`, its step being `second - first`"
+      let from = src_between(p0, p1, 0)
+      let spelled = concat_all([from, " + ", src_between(p2, r.p, 2)])
+      let second = match try_int_literal(first) {
+        Some(a) -> match try_int_literal(step) {
+          Some(d) -> int_to_string(a + d)
+          None    -> spelled
+        }
+        None -> spelled
+      }
+      p_error_here(p2, concat_all([form, " — write `[", from, ", ", second, "..", src_between(p1, p2, 2), "]`"]))
+    }
+  }
+}
+
+# The source between the token at `a`, less its first `skip` bytes, and the token at `b`.
+fn src_between(a: Parser, b: Parser, skip: Int) : String {
+  let lo = p_peek(a).start + skip
+  trim(string_slice(a.src, lo, p_peek(b).start - lo))
+}
+
+#[doc("The step of a stepped range whose leading elements fix it: both literals, or `second` written as the name `first` plus a literal.")]
+pub fn literal_step(first: Expr, second: Expr) : Option[Int] = match try_int_literal(first) {
+  Some(a) -> match try_int_literal(second) {
+    Some(b) -> Some(b - a)
+    None    -> None
+  }
+  None -> match second.kind {
+    EBinop(BoAdd, base, k) -> if same_name(first, base) { try_int_literal(k) } else { None }
+    _                      -> None
+  }
+}
+
+fn same_name(a: Expr, b: Expr) : Bool = match a.kind {
+  EName(x) -> match b.kind {
+    EName(y) -> written_text(x) == written_text(y)
+    _        -> false
+  }
+  _ -> false
+}
+
+# `[first, second..last]`. `p` is at the `..`; `acc` holds the elements
+# before it, newest first.
+fn parse_stepped_range(p: Parser, acc: [ListElem], t: Token) : PExpr / Console = match acc {
+  [ElPlain(second), ElPlain(first)] -> {
+    let r = parse_expr(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(last) -> {
+        let p1 = p_skip_newlines(r.p)
+        if not p_at(p1, TkRbracket) { err_e(p_error_here(p1, "expected `]` at end of range")) }
+        else { match literal_step(first, second) {
+          Some(0) -> err_e(p_error(p1, t, "the first two elements of a stepped range must differ: their difference is the step, and a step of zero never ends"))
+          _       -> ok_e(p_advance(p1), mk_expr(ESurface(SfSteppedRange(first, second, last)), t.line, t.col))
+        } }
+      }
+    }
+  }
+  _ -> err_e(p_error_here(p, "a stepped range takes exactly two elements before `..` — write `[first, second..last]`"))
 }
 
 # After an index's first expr: `..` turns it into a range index
@@ -2970,6 +3029,8 @@ fn parse_list_rest(p: Parser, acc: [ListElem], t: Token) : PExpr / Console {
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbracket) {
     ok_e(p_advance(p0), mk_expr(EList(list_reverse(acc)), t.line, t.col))
+  } else if p_at(p0, TkDotDot) {
+    parse_stepped_range(p0, acc, t)
   } else if p_at(p0, TkComma) {
     let p1 = p_skip_newlines(p_advance(p0))
     if p_at(p1, TkRbracket) {

@@ -646,7 +646,8 @@ fn main() : Unit / Stdout = {
   let s = "hello, #{n}"         # interpolation
   let xs = [1, 2, 3]                           # list
   let r1 = [1..10]                             # range
-  let r2 = [1..10..2]                          # range w/ step
+  let r2 = [1, 3..10]                          # stepped range: the
+                                               #   step is 3 - 1
   let opt = Some(42)                           # variant
   let combined = [1, 2] ++ [3, 4]              # ++ concat (right-assoc)
   let all = variants[Color]()                  # enumerate ctors of a
@@ -661,6 +662,12 @@ fn main() : Unit / Stdout = {
 
 A trailing comma is allowed in list, tuple, record, map, and set
 literals (`[1, 2, 3,]`).
+
+A stepped range shows its first two elements: `[first, second..last]`
+steps by `second - first` and stops at the last element that does not
+pass `last` (`[1, 3..10]` is 1, 3, 5, 7, 9). The sign of the step gives
+the direction (`[10, 8..0]` descends). A step of zero is an error: at
+compile time when the two elements fix it, at run time otherwise.
 
 List-PATTERN destructuring (`[head, ...tail]`) parses where a pattern
 is expected — `match` arms, `let` LHS (`let [h, ...t] = xs`), fn
@@ -1322,6 +1329,10 @@ These look plausible but DO NOT EXIST. Do not write them.
 
 ```kaikai-neg
 fn main() : Int = (\x -> x + 1)(5)            # Haskell lambda
+```
+
+```kaikai-neg
+fn main() : [Int] = [1..10..2]                # no trailing step: [1, 3..10]
 ```
 
 ```kaikai-neg
