@@ -763,31 +763,16 @@ fn pipe_elem_ty(pe: Option[PipeElem]) : Option[Ty] = match pe {
   None           -> None
 }
 
-# A point-free section the parser synthesised has a single
-# `__pl`-named placeholder parameter. Recognise it so only those
-# lambdas get the up-front receiver-threading — user-written lambdas
-# keep the unchanged synth path.
-fn is_point_free_lambda(rhs: Expr) : Bool =
-  match rhs.kind {
-    ELambda(ps, _) -> params_point_free(ps)
-    _              -> false
-  }
-
-# Infer a pipe / combinator function argument. A point-free section
-# gets its `__pl` receiver pinned to the stage's element type up front
-# (so `.length()` resolves its UFCS dispatch); everything else takes
-# the plain synth path unchanged.
+# Infer a pipe / combinator function argument: a lambda's parameter takes
+# the stage's element type before its body is walked.
 fn synth_pipe_rhs(st: InferState, rhs: Expr, elem: Option[Ty]) : Inferred / Console + File + Mutable =
-  if is_point_free_lambda(rhs) {
-    match elem {
-      Some(et) -> match rhs.kind {
-        ELambda(ps, body) ->
-          synth_lambda_threaded(st, ps, body, Some(et), rhs.line, rhs.col)
-        _ -> synth(st, rhs)
-      }
-      None -> synth(st, rhs)
+  match rhs.kind {
+    ELambda(ps, body) -> match elem {
+      Some(et) -> synth_lambda_expecting(st, ps, body, [et], rhs.line, rhs.col)
+      None     -> synth(st, rhs)
     }
-  } else { synth(st, rhs) }
+    _ -> synth(st, rhs)
+  }
 
 fn inf_ty_head_name(tab: SymTab, t: Ty) : Option[String] {
   match t {
@@ -9474,20 +9459,9 @@ fn synth_many(st: InferState, es: [Expr]) : InferredList / Console + File + Muta
   }
 }
 
-# The domain of a function type's first parameter, if any — the
-# element type a combinator passes a point-free section's `__pl`.
-fn fn_first_dom(t: Ty) : Option[Ty] = match t {
-  TyFnT([dom, ...], _, _) -> Some(dom)
-  _                       -> None
-}
-
 # Like `synth_many`, but each argument is paired with the declared
-# parameter type at the same position (`param_tys`). A point-free
-# section gets its `__pl` receiver pinned to that parameter's function
-# domain before its body is walked, so `o.map(.length())` resolves the
-# UFCS dispatch the same way the pipe forms do. Every other argument
-# takes the plain synth path; a missing or non-function expected type
-# is a no-op.
+# parameter type at the same position (`param_tys`), which it is
+# synthesised against; a missing expected type is a no-op.
 fn synth_many_threaded(st: InferState, es: [Expr],
                         param_tys: [Ty]) : InferredList / Console + File + Mutable {
   match es {
@@ -9504,26 +9478,12 @@ fn synth_many_threaded(st: InferState, es: [Expr],
 
 fn synth_threaded_arg(st: InferState, x: Expr,
                        exp: Option[Ty]) : Inferred / Console + File + Mutable =
-  if is_point_free_lambda(x) {
-    match exp {
-      Some(et) -> match fn_first_dom(et) {
-        Some(dom) -> match x.kind {
-          ELambda(ps, body) ->
-            synth_lambda_threaded(st, ps, body, Some(dom), x.line, x.col)
-          _ -> synth(st, x)
-        }
-        None -> synth(st, x)
-      }
-      None -> synth(st, x)
-    }
-  } else {
-    match exp {
-      Some(et) ->
-        if arg_wants_vec_context(x, et) {
-          check_expr_against(st, x, et, "argument", x.line, x.col)
-        } else { synth_expecting(st, x, et) }
-      None -> synth(st, x)
-    }
+  match exp {
+    Some(et) ->
+      if arg_wants_vec_context(x, et) {
+        check_expr_against(st, x, et, "argument", x.line, x.col)
+      } else { synth_expecting(st, x, et) }
+    None -> synth(st, x)
   }
 
 # A list literal / map-pipe chain in a Vec-typed parameter slot takes
@@ -12045,20 +12005,29 @@ fn synth_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr], line: Int, col:
 }
 
 fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
-  synth_lambda_threaded(st, ps, body, None, line, col)
+  synth_lambda_pinned(st, ps, body, [], "", line, col)
 
-# Like `synth_lambda`, but when `expected_first` is `Some(et)` the
-# first parameter's type is unified with `et` BEFORE the body is
-# walked. Point-free sections (`.method()`, `.a.b`) need the receiver
-# pinned from the combinator's element type up front: the body's UFCS
-# dispatch (`__pl.length()`) cannot defer the way a bare field access
-# can, so the receiver must already be concrete when synth reaches it.
-fn synth_lambda_threaded(st: InferState, ps: [Param], body: Expr,
-                          expected_first: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
-  match expected_first {
-    Some(et) -> synth_lambda_pinned(st, ps, body, [et], "point-free receiver", line, col)
-    None     -> synth_lambda_pinned(st, ps, body, [], "", line, col)
+# A lambda where a function over `doms` is expected: each parameter takes
+# the domain at its position BEFORE the body is walked. A method call in
+# the body is chosen by its receiver's type there and then; it cannot
+# defer the way a bare field access can, so a parameter it reaches must
+# already be typed.
+fn synth_lambda_expecting(st: InferState, ps: [Param], body: Expr, doms: [Ty],
+                          line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_lambda_pinned(st, ps, body, expected_pins(st, ps, doms), "lambda parameter", line, col)
+
+# An annotated parameter pins to its own type: a clash with the domain is
+# the call's to report.
+fn expected_pins(st: InferState, ps: [Param], doms: [Ty]) : [Ty] = match ps {
+  [] -> []
+  [pm, ...rest] -> match doms {
+    [] -> []
+    [d, ...more] -> {
+      let pin = match pm.ptype { Some(te) -> st_annot_ty(st, te)  None -> d }
+      [pin, ...expected_pins(st, rest, more)]
+    }
   }
+}
 
 # A lambda whose leading parameters take `pins` before its body is walked.
 fn synth_lambda_pinned(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String,
@@ -14548,10 +14517,14 @@ fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 # `e` where a type is expected: a record literal's head is asked of that
-# type first, as is one written as an element of a list literal; any
-# other shape is synthesised.
+# type first, as is one written as an element of a list literal, and a
+# lambda's parameters take its domains; any other shape is synthesised.
 fn synth_expecting(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = match e.kind {
   ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
+  ELambda(ps, body) -> match apply_ty(st.sub, expected) {
+    TyFnT(doms, _, _) -> synth_lambda_expecting(st, ps, body, doms, e.line, e.col)
+    _                 -> synth(st, e)
+  }
   EList(els) -> match apply_ty(st.sub, expected) {
     TyListT(elem_ty) -> if any(els, elem_is_record_lit) { check_list_elems_against(st, els, elem_ty, e.line, e.col) }
                         else { synth(st, e) }
