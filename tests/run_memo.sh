@@ -123,6 +123,19 @@ done
 scenario truncated-entries 1 "$solo" -- main.kai
 scenario truncated-replaced 0 "$solo" -- main.kai
 
+# A module's imports resolve from the entry's directory, not from its
+# own: the file the compile read is the input, whatever sits beside the
+# importer under the same name.
+mkdir -p "$solo/deep"
+printf 'import deep.mid\n\nfn main() : Unit / Stdout = Stdout.print(mid.who())\n' > "$solo/nested.kai"
+printf 'import leaf\n\n#[doc("Who.")]\npub fn who() : String = leaf.name()\n' > "$solo/deep/mid.kai"
+printf '#[doc("Name.")]\npub fn name() : String = "one"\n' > "$solo/leaf.kai"
+printf '#[doc("Name.")]\npub fn name() : String = "beside"\n' > "$solo/deep/leaf.kai"
+scenario nested-cold 1 "$solo" -- nested.kai
+printf '#[doc("Name.")]\npub fn name() : String = "two"\n' > "$solo/leaf.kai"
+scenario nested-edited 1 "$solo" -- nested.kai
+grep -q '^two$' "$work/nested-edited-memo.out" || { echo "  FAIL nested-edited: a hit ran the binary of the old module"; fail=$((fail + 1)); }
+
 # Past the entries the memo keeps, the oldest entry goes and the digests
 # kept beside the entries stay: a warm run still asks the compiler nothing.
 many="$work/many"

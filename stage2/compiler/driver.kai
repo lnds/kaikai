@@ -915,6 +915,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, line:
       # fails (e.g. file does not exist), so the missing-file branch
       # below still fires with a useful candidate path.
       let abs_path = abspath(raw_path)
+      let rs = if opt_src.is_some() { rs_tried(rs, MTry(base_dir, mod_path, raw_path, abs_path)) } else { rs }
       # An `abs_path` that is already on the in_progress stack means
       # resolution looped back to a module
       # whose load has not yet returned — an import cycle. Emit the
@@ -1076,7 +1077,7 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], core
 # concatenating the same module a second time and producing a
 # duplicate-symbol C output (`import encoding.toml` against the
 # core-loaded `stdlib/encoding/toml.kai` was the trigger).
-fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], search_paths: [String], root_decls: [Decl], core_paths: [String], core_mods: [ModuleEntry], core_segs: [CoreSegment], cache_dir: String, test_roots: [String]) : ExpandedProgram / Console + File {
+fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], search_paths: [String], root_decls: [Decl], core_paths: [String], core_mods: [ModuleEntry], core_segs: [CoreSegment], cache_dir: String, test_roots: [String], inputs_out: String) : ExpandedProgram / Console + File {
 
 
   let base_dir = dir_of(root_path)
@@ -1095,10 +1096,11 @@ fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], sea
   # the importer wrote) but never accumulate into `rev_modules` — the
   # caller supplies the core table separately.
   let cores = canon_module_origins(core_mods)
-  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [] }
+  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [], rev_tried: [] }
   let rs_roots = load_test_roots(base_dir, test_roots, search_paths, cores, cache_dir,
                                  process_imports(base_dir, root_decls, search_paths, cores, "", cache_dir, rs0))
   let rs1 = rs_scan_imports(rs_roots, canon_root, root_path, root_src, root_tokens, root_decls, "")
+  if inputs_out != "" { let _w = write_file(inputs_out, string_join(rs_inputs(rs1, search_paths), "\n")) }
   # A grouped build's own diagnostics come from each test file built alone.
   let ledger = if list_is_empty(test_roots) { rs1.imports } else { ledger_new([]) }
   let imports = rs_decls(rs1)
@@ -1318,6 +1320,14 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MEmitCoreCache))
       } else if a == "--batch-list" {
         parse_cli_loop(more, cli_with_mode(opts, MBatchList))
+      } else if a == "--inputs-out" {
+        match more {
+          [f, ...rest2] -> parse_cli_loop(rest2, CliOptions { ...opts, inputs_out: f })
+          [] -> {
+            eprint("kaic2: --inputs-out requires a file argument")
+            cli_with_mode(opts, MUsageError)
+          }
+        }
       } else if a == "--guard-inputs" {
         parse_cli_loop(more, cli_with_mode(opts, MGuardInputs))
       } else if a == "--guard-interfaces" {
@@ -1421,7 +1431,7 @@ pub fn parse_cli(argv: [String]) : CliOptions / Console {
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
                                     edition: None, user_cache: false, core_cache: cc_opt_off(),
-                                    test_roots: [], test_plan: "", kir_verify: "" })
+                                    test_roots: [], test_plan: "", kir_verify: "", inputs_out: "" })
 }
 
 # Load the core module set: every program gets `core/*` + protocols +
@@ -1636,7 +1646,7 @@ fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymT
   }
 }
 
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], core_rows: [NEnt], package_name: String, unstable_optins: [String], edition: Option[Edition], user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String, kir_verify: String) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], core_rows: [NEnt], package_name: String, unstable_optins: [String], edition: Option[Edition], user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String, kir_verify: String, inputs_out: String) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lexed = lex_diags(path, src, tokens)
@@ -1739,7 +1749,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let core_paths = collect_module_origins(core_mods, [])
             let expanded = expand_imports(path, src, tokens, search_paths, own_decls_no_holes, core_paths, core_mods, core_segs,
                                           if user_cache { tcut_cache_dir(core_cache.proj_dir, path) } else { "" },
-                                          test_roots)
+                                          test_roots, inputs_out)
             match expanded {
               EP_Mod(_, mods, _, _, _, scopes, _, _, _) ->
                 if test_plan != "" { let _w = write_file(test_plan, tplan_text(scopes, mods)) }
@@ -2533,7 +2543,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   early_cut_note(core_cache.stats, core_cut_names(sym_tab, missed))
                   compile_source(path, mode, backend, strict_holes, search_paths, src, core_decls_whole, core_mods,
                                  core_segs_whole, core_rows, package_name, unstable_optins, edition, user_cache, batch_out,
-                                 CoreCacheOpt { ...core_cache, early_cut: EcOff }, test_roots, test_plan, kir_verify)
+                                 CoreCacheOpt { ...core_cache, early_cut: EcOff }, test_roots, test_plan, kir_verify, inputs_out)
                 }
                 else {
                   # Build the per-compile head-owner cache once from the
@@ -2905,7 +2915,7 @@ fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
                                  opts.search_paths, src, pds, pmods, psegs, prows,
                                  opts.package_name, opts.unstable_optins,
                                  opts.edition, opts.user_cache, Some(outp),
-                                 opts.core_cache, [], "", "")
+                                 opts.core_cache, [], "", "", "")
     }
     let nfail1 = if rc == 0 { nfail } else { nfail + 1 }
     batch_compile_loop(rest, pds, pmods, psegs, prows, opts, nfail1)
@@ -2997,7 +3007,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs, prows) -> match read_file(p) {
-              Ok(src) -> close_front(opts.mode, p, compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, prows, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_plan, opts.kir_verify))
+              Ok(src) -> close_front(opts.mode, p, compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, prows, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_plan, opts.kir_verify, opts.inputs_out))
               Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
             }
           }
