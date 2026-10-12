@@ -84,6 +84,34 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.140.3 (2026-10-11)
+
+### Fixed
+
+- **imports**: an import a derive's expansion needs is not reported as unused (#2706)
+- **runtime**: a cancel wakes a fiber parked in Actor.receive (#2703)
+- **effects**: an effect with no operations can be handled, and an effect alias takes parameterised labels (#2702)
+
+### Changed
+
+- **lex**: keywords and punctuation read as one case per function (#2710)
+- **compiler**: patterns and the unbox passes find a constructor's row by its id (#2709)
+- **perceus**: the read-role predicates share their tests (#2708)
+- **compiler**: a typecheck-only run cuts the core like a build does (#2704)
+- **compiler**: per-function lookups go through an id index (#2707)
+- **modules**: the qualified-name rule of rqc_kind is its own functions (#2705)
+- **unbox**: decide_mode_aware reads as one function per node shape (#2701)
+- **compiler**: delete 228 unreachable declarations (#2699)
+- **compiler**: split desugar.kai into 22 modules (#2692)
+- **compiler**: split perceus.kai into 23 modules (#2692)
+- **compiler**: split emit_native_ops.kai into 8 modules (#2692)
+- **compiler**: split lex.kai into 7 modules (#2692)
+- **compiler**: split unbox.kai into 5 modules (#2692)
+- **compiler**: split resolve.kai into 7 modules (#2692)
+- **compiler**: split modules.kai into 11 modules (#2692)
+- **compiler**: split monomorph.kai into 14 modules (#2692)
+- **compiler**: split protos.kai into 27 modules (#2692)
+
 ## v0.140.2 (2026-10-11)
 
 ### Changed
