@@ -617,7 +617,11 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # Adding a phase to `tier1` means adding it to a shard.
 TIER1_LIGHT_SLICES := 8
 TIER1_SELFHOSTS ?= 1
-tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES) TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)
+# A fixture's C build is almost all clang optimising the runtime and the
+# core it includes, and a test needs its program to run, not to run fast.
+# The daily run sets -O2, so the emitted C still meets the optimiser.
+TIER1_LIGHT_OPT ?= -O0
+tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES) TIER1_SELFHOSTS=$(TIER1_SELFHOSTS) LIGHT_OPT=$(TIER1_LIGHT_OPT)
 tier1-shard-start = @date +%s > stage2/build/tier1-shard.start
 tier1-shard-wall = @echo "tier1-shard-wall $(1) $$(( $$(date +%s) - $$(cat stage2/build/tier1-shard.start) )) selfhosts=$(TIER1_SELFHOSTS)"
 TIER1_CLI_TAIL := test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
