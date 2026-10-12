@@ -33,7 +33,7 @@ pub fn ub_rest_sentinel(line: Int, col: Int) : Binder =
 
 #[doc("The arm with its pattern's unread `_`-prefixed binders made wildcards. The guard and the body are the binders' scope.")]
 pub fn ub_arm(a: Arm) : Arm = match a {
-  Arm(p, g, b) -> Arm(ub_pat(p, (n) => ub_read_in_arm(n, g, b)), g, b)
+  Arm(p, g, b) -> Arm(ub_pat(p, (n) => not ub_silenced(n) or ub_read_in_arm(n, g, b)), g, b)
 }
 
 #[doc("The block's statements with each `let` pattern's unread `_`-prefixed binders made wildcards. A `let` binds for the statements after it and the tail.")]
@@ -43,7 +43,7 @@ pub fn ub_block(ss: [Stmt], tail: Option[Expr]) : [Stmt] = match ss {
 }
 
 fn ub_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr]) : Stmt = match s {
-  SLet(p, ty, e) -> SLet(ub_pat(p, (n) => ub_read_after(n, rest, tail)), ty, e)
+  SLet(p, ty, e) -> SLet(ub_pat(p, (n) => not ub_silenced(n) or ub_read_after(n, rest, tail)), ty, e)
   _              -> s
 }
 
@@ -58,7 +58,8 @@ fn ub_read_after(n: Binder, rest: [Stmt], tail: Option[Expr]) : Bool =
 
 # No name is resolved yet, so a read of the binder is the name it was
 # written with: as an expression, or as a token of an interpolation.
-fn ub_mentions(n: Binder, e: Expr) : Bool = match e.kind {
+#[doc("True when `e` reads the binder `n`, before any name is resolved.")]
+pub fn ub_mentions(n: Binder, e: Expr) : Bool = match e.kind {
   EName(u)       -> written_text(u) == written_text(n.name)
   EStr(span, t3) -> isp_ident_count(written_text(n.name), span, t3) > 0
   _              -> ub_mentions_ps(n, xp_positions(e))
@@ -71,29 +72,32 @@ fn ub_mentions_ps(n: Binder, ps: [XPos]) : Bool = match ps {
 
 fn ub_silenced(n: Binder) : Bool = ub_silenced_name(written_text(n.name))
 
-fn ub_pat(p: Pattern, read: (Binder) -> Bool) : Pattern = match p.pkind {
-  PBind(n) -> if ub_silenced(n) and not read(n) { mk_pat(PWild, p.line, p.col) } else { p }
+#[doc("The pattern binding only the binders `keep` accepts: any other becomes a wildcard, the anonymous rest, or the bare sub-pattern of an `@`.")]
+pub fn ub_pat(p: Pattern, keep: (Binder) -> Bool) : Pattern = match p.pkind {
+  PBind(n) -> if keep(n) { p } else { mk_pat(PWild, p.line, p.col) }
   PList(ps, rest) ->
-    mk_pat(PList(ub_pats(ps, read), ub_rest(rest, read, p.line, p.col)), p.line, p.col)
-  PVariant(r, ps)        -> mk_pat(PVariant(r, ub_pats(ps, read)), p.line, p.col)
-  PVariantRecord(r, fs)  -> mk_pat(PVariantRecord(r, ub_fields(fs, read)), p.line, p.col)
-  PRecord(fs)            -> mk_pat(PRecord(ub_fields(fs, read)), p.line, p.col)
-  PAs(n, sub)            -> mk_pat(PAs(n, ub_pat(sub, read)), p.line, p.col)
+    mk_pat(PList(ub_pats(ps, keep), ub_rest(rest, keep, p.line, p.col)), p.line, p.col)
+  PVariant(r, ps)        -> mk_pat(PVariant(r, ub_pats(ps, keep)), p.line, p.col)
+  PVariantRecord(r, fs)  -> mk_pat(PVariantRecord(r, ub_fields(fs, keep)), p.line, p.col)
+  PRecord(fs)            -> mk_pat(PRecord(ub_fields(fs, keep)), p.line, p.col)
+  PAs(n, sub)            -> if keep(n) { mk_pat(PAs(n, ub_pat(sub, keep)), p.line, p.col) } else { ub_pat(sub, keep) }
+  # A narrowing cannot lose its binder, so an unkept one takes a silent name.
+  PNarrow(n, t)          -> if keep(n) or ub_silenced(n) { p } else { mk_pat(PNarrow(binder_written("_unread"), t), p.line, p.col) }
   _                      -> p
 }
 
-fn ub_pats(ps: [Pattern], read: (Binder) -> Bool) : [Pattern] = match ps {
+fn ub_pats(ps: [Pattern], keep: (Binder) -> Bool) : [Pattern] = match ps {
   [] -> []
-  [p, ...rest] -> [ub_pat(p, read), ...ub_pats(rest, read)]
+  [p, ...rest] -> [ub_pat(p, keep), ...ub_pats(rest, keep)]
 }
 
-fn ub_fields(fs: [PField], read: (Binder) -> Bool) : [PField] = match fs {
+fn ub_fields(fs: [PField], keep: (Binder) -> Bool) : [PField] = match fs {
   [] -> []
-  [PField(name, sub, short), ...rest] -> [PField(name, ub_pat(sub, read), short), ...ub_fields(rest, read)]
+  [PField(name, sub, short), ...rest] -> [PField(name, ub_pat(sub, keep), short), ...ub_fields(rest, keep)]
 }
 
-fn ub_rest(rest: Option[Binder], read: (Binder) -> Bool, line: Int, col: Int) : Option[Binder] =
+fn ub_rest(rest: Option[Binder], keep: (Binder) -> Bool, line: Int, col: Int) : Option[Binder] =
   match rest {
-    Some(r) -> if ub_silenced(r) and not read(r) { Some(ub_rest_sentinel(line, col)) } else { rest }
+    Some(r) -> if keep(r) { rest } else { Some(ub_rest_sentinel(line, col)) }
     None    -> None
   }

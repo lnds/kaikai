@@ -3709,10 +3709,6 @@ fn parse_match(p: Parser, t: Token) : PExpr / Console {
     Some(scrut1) -> {
       # Comma after the first scrutinee opens multi-scrutinee
       # match — `match e1, e2, ..., eN { p1, p2, ..., pN -> body | ... }`.
-      # Parser-only sugar: desugars to nested EMatch over each column,
-      # with fall-through to the remaining arms duplicated at the
-      # column-1 wildcard branch. For N=1 (the original form), the
-      # behaviour is unchanged.
       let r_more = parse_more_scruts(rs.p, [scrut1])
       let p2 = p_skip_newlines(p_with_record_lit(p_with_trailing_lambda(r_more.p, prev_atl), prev_arl))
       if not p_at(p2, TkLbrace) {
@@ -3845,147 +3841,6 @@ fn parse_n_patterns(p: Parser, n: Int, acc: [Pattern]) : PPatN / Console {
     }
   }
 }
-
-# Build the desugared AST. The shape is:
-#
-#   {
-#     let __mm_s_0 = e0
-#     let __mm_s_1 = e1
-#     ...
-#     match __mm_s_0 {
-#       p0_arm0 -> match __mm_s_1 { p1_arm0 -> ... pN_arm0 -> body_arm0 | _ -> fall_arm1 }
-#       _       -> fall_arm1
-#     }
-#   }
-#
-# where `fall_arm1` is the same shape recursively built over arm 1.
-# The base case (no arms left) is a panic. Bodies
-# are duplicated only structurally — kaikai bodies are immutable
-# Exprs, so the duplication does not cost runtime evaluation, only
-# emitted-code size. For typical demo arities (N=2, K=3) the blow-up
-# is bounded.
-#[doc("Expand a multi-scrutinee arm list into the nested single-match chain; invoked by `surface_lower`.")]
-pub fn desugar_multi_match(scruts: [Expr], arms: [MMArm], line: Int, col: Int) : Expr {
-  let stmts = build_scrut_lets(scruts, 0, [])
-  let scrut_vars = make_scrut_var_exprs(scruts, 0, line, col)
-  let body = build_multi_match_chain(scrut_vars, arms, line, col)
-  mk_expr(EBlock(list_reverse(stmts), Some(body)), line, col)
-}
-
-# Emit `let __mm_s_i = scrut_i` statements, in the order
-# they appear; returned reversed so the desugar wraps them with
-# `list_reverse` to restore source order.
-fn build_scrut_lets(scruts: [Expr], i: Int, acc: [Stmt]) : [Stmt] {
-  match scruts {
-    [] -> acc
-    [e, ...rest] -> {
-      let nm = scrut_var_name(i)
-      let pat = mk_pat(PBind(binder_minted(nm)), e.line, e.col)
-      build_scrut_lets(rest, i + 1, [SLet(pat, None, e), ...acc])
-    }
-  }
-}
-
-fn make_scrut_var_exprs(scruts: [Expr], i: Int, line: Int, col: Int) : [Expr] {
-  match scruts {
-    [] -> []
-    [_, ...rest] -> [
-      mk_local(local_minted(scrut_var_name(i)), line, col),
-      ...make_scrut_var_exprs(rest, i + 1, line, col)
-    ]
-  }
-}
-
-fn scrut_var_name(i: Int) : String =
-  string_concat("__mm_s_", int_to_string(i))
-
-# Recursive builder for the arm chain. At each arm,
-# constructs an EMatch over scrut_var_0 with two arms:
-#   - column-1 pattern -> nested match on remaining columns
-#   - wildcard         -> fall-through to next arm
-# Both branches reference the same fall-through subtree, which is
-# computed once but referenced twice (the AST is shared structurally
-# since `Expr` values are immutable). When `arms` is empty, returns
-# a panic via an abort-style trap.
-fn build_multi_match_chain(scrut_vars: [Expr], arms: [MMArm], line: Int, col: Int) : Expr {
-  match arms {
-    [] -> non_exhaustive_trap(line, col)
-    [head, ...rest] -> {
-      let fall = build_multi_match_chain(scrut_vars, rest, line, col)
-      build_one_marm(scrut_vars, head, fall, line, col)
-    }
-  }
-}
-
-# Lower one MMArm into the nested-EMatch chain it stands for,
-# wiring the failing-pattern branch to `fall`. The guard, when present,
-# is attached to the innermost arm (last column).
-fn build_one_marm(scrut_vars: [Expr], arm: MMArm, fall: Expr, line: Int, col: Int) : Expr {
-  match arm {
-    MMArm(pats, guard, body) -> build_marm_columns(scrut_vars, pats, guard, body, fall, line, col)
-  }
-}
-
-fn build_marm_columns(scrut_vars: [Expr], pats: [Pattern], guard: Option[Expr],
-                       body: Expr, fall: Expr, line: Int, col: Int) : Expr {
-  match scrut_vars {
-    [] -> body
-    [sv, ...rest_svs] -> match pats {
-      [] -> body
-      [p, ...rest_ps] -> {
-        # The guard, when present, only attaches to the innermost
-        # column (last pattern); interior columns always carry None.
-        let inner_guard = match rest_ps { [] -> guard  _ -> None }
-        let inner = match rest_ps {
-          [] -> Arm(p, guard, body)
-          _  -> Arm(p, None, build_marm_columns(rest_svs, rest_ps, guard, body, fall, line, col))
-        }
-        # When this column's pattern is irrefutable (PWild / PBind /
-        # nested PAs) AND the arm in this position carries no guard
-        # that could fail, the `_ -> fall` sibling is unreachable.
-        # Emitting it anyway produces two `default:` cases in the same
-        # C `switch`. Drop the dead wildcard so
-        # the match collapses to a single irrefutable arm; the fall
-        # subtree stays reachable through the recursion's own `fall`.
-        if pat_is_irrefutable(p) and guard_cannot_fail_here(inner_guard) {
-          mk_expr(EMatch(sv, [inner]), line, col)
-        } else {
-          let wild = mk_pat(PWild, line, col)
-          mk_expr(EMatch(sv, [inner, Arm(wild, None, fall)]), line, col)
-        }
-      }
-    }
-  }
-}
-
-# A multi-arg-match column pattern is irrefutable when it always
-# binds without testing the scrutinee — a
-# wildcard, a name binding, or an `@`-alias whose inner pattern is also
-# irrefutable. Such a column needs no fall-through sibling.
-fn pat_is_irrefutable(p: Pattern) : Bool {
-  match p.pkind {
-    PWild        -> true
-    PBind(_)     -> true
-    PAs(_, inner) -> pat_is_irrefutable(inner)
-    _            -> false
-  }
-}
-
-# A column's arm can still fall through when it carries a guard, since a
-# false guard re-routes control to the next arm. No guard means an
-# irrefutable column always commits, so the wildcard sibling is dead.
-fn guard_cannot_fail_here(g: Option[Expr]) : Bool {
-  match g {
-    None    -> true
-    Some(_) -> false
-  }
-}
-
-# Trap for "no arm matched". Uses `todo!` which behaves like a panic
-# at runtime and matches any expected type in inference, without
-# forcing the surrounding fn to declare the effect's row.
-fn non_exhaustive_trap(line: Int, col: Int) : Expr =
-  mk_expr(ETodo("non-exhaustive multi-arg match"), line, col)
 
 fn parse_match_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr / Console {
 
@@ -6328,9 +6183,8 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
 # single pattern (reuses `parse_match_arms`). For an N-arg fn (N>=2)
 # the scrutinee tuple is `(arg1, ..., argN)` represented as N parallel
 # scrutinees and arms carry N comma-separated patterns (reuses
-# `parse_multi_match_arms`). After collection the result is an
-# `EMatch` indistinguishable from a hand-written `match` body, so the
-# typer / codegen / perceus see no new shape.
+# `parse_multi_match_arms`). `surface_lower` turns the collected arms
+# into plain `EMatch`es, so the typer / codegen / perceus see no new shape.
 #
 # Pure-block rule: if any non-`case` token appears between arms, the
 # arm-collection loop fails with "expected `case` or `}`" and the
@@ -6344,9 +6198,7 @@ fn parse_clause_block(p: Parser, params: [Param], t: Token) : PExpr / Console {
     # on. Reject explicitly so the diagnostic points at the keyword.
     err_e(p_error_here(p, "case-block requires at least one parameter to discriminate on"))
   } else if n > 4 {
-    # The multi-arg match cap also bounds the desugared tuple here;
-    # raising it requires re-evaluating the nested-match blowup as in
-    # `parse_match`.
+    # The cap of a multi-arg `match`, whose lowering this shares.
     err_e(p_error_here(p, "case-block supports up to 4 parameters"))
   } else {
     parse_case_multi_arms(p, [], n, t)
