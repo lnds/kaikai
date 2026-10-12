@@ -754,6 +754,7 @@ test-kai-cli: kaic2
 	@tests/bin_memo.sh
 	@tests/run_memo.sh
 	@tests/src_entry.sh
+	@tests/build_memo.sh
 	@tests/path_specs.sh
 
 # Operand evaluation order under gcc on x86_64, which evaluates call

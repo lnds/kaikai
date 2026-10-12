@@ -18,8 +18,10 @@ FX="$ROOT/examples/multi-module/issue-963-cross-module-mono"
 work="$(mktemp -d)"
 trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT INT TERM
 
+# Every build here has to emit: the memo of binaries would hand back the
+# one an earlier build of the same sources left.
 build() {
-  KAI_NATIVE_JOBS="$1" KAI_NATIVE_MODULAR_CACHE_DIR="$work/nm-$1" \
+  KAI_BIN_MEMO=0 KAI_NATIVE_JOBS="$1" KAI_NATIVE_MODULAR_CACHE_DIR="$work/nm-$1" \
     KAI_CORE_CACHE_DIR="$work/core-$1" \
     "$KAI" build --backend=native "$FX/main.kai" -o "$work/bin-$1" 2>"$work/err-$1"
 }
