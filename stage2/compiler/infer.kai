@@ -12184,25 +12184,81 @@ fn synth_list_elems(st: InferState, els: [ListElem], elem: Ty, line: Int, col: I
 }
 
 fn synth_range(st: InferState, lo: Expr, hi: Expr, stp: Option[Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
   let rl = synth(st, lo)
-  let s1 = st_unify(rl.st, rl.ty, TyInt, "range start", line, col)
-  let rh = synth(s1, hi)
-  let s2 = st_unify(rh.st, rh.ty, TyInt, "range end", line, col)
-  match stp {
-    None -> {
-      let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, None), line, col), TyListT(TyInt))
-      mk_inferred(s2, TyListT(TyInt), root)
-    }
-    Some(se) -> {
-      let rs_ = synth(s2, se)
-      let s3 = st_unify(rs_.st, rs_.ty, TyInt, "range step", line, col)
-      let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, Some(rs_.expr)), line, col), TyListT(TyInt))
-      mk_inferred(s3, TyListT(TyInt), root)
+  if range_of_chars(apply_ty(rl.st.sub, rl.ty), hi) { synth_char_range(st, rl, lo, hi, stp, line, col) }
+  else {
+    let s1 = st_unify(rl.st, TyInt, rl.ty, "range start", line, col)
+    let rh = synth(s1, hi)
+    let s2 = st_unify(rh.st, TyInt, rh.ty, "range end", line, col)
+    match stp {
+      None -> {
+        let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, None), line, col), TyListT(TyInt))
+        mk_inferred(s2, TyListT(TyInt), root)
+      }
+      Some(se) -> {
+        let rs_ = synth(s2, se)
+        let s3 = st_unify(rs_.st, TyInt, rs_.ty, "range step", line, col)
+        let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, Some(rs_.expr)), line, col), TyListT(TyInt))
+        mk_inferred(s3, TyListT(TyInt), root)
+      }
     }
   }
 }
+
+# A range walks Int or Char, and its start says which. A start the typer
+# has yet to settle follows a Char literal end; any other range is Int.
+fn range_of_chars(start: Ty, hi: Expr) : Bool = match start {
+  TyChar -> true
+  TyInt  -> false
+  _      -> match hi.kind {
+    EChar(_) -> true
+    _        -> false
+  }
+}
+
+# A range of Chars is the range of their code points, each mapped back:
+# `map([code(lo)..code(hi)], int_to_char)`. The three elements are held to
+# Char first, so a mix is reported against the range and not against the
+# rewrite; `peek` is the start, already read once to choose this path.
+fn synth_char_range(st: InferState, peek: Inferred, lo: Expr, hi: Expr, stp: Option[Expr],
+                    line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let s1 = st_unify(peek.st, TyChar, peek.ty, "range start", line, col)
+  let rh = synth(s1, hi)
+  let s2 = st_unify(rh.st, TyChar, rh.ty, "range end", line, col)
+  let s3 = char_range_second(s2, stp, line, col)
+  if s3.errs > st.errs { inferred_leaf(s3, TyListT(TyChar), mk_expr(EList([]), line, col)) }
+  else {
+    let codes = mk_expr(ERange(char_code(lo), char_code(hi), char_range_step(stp)), line, col)
+    let back = mk_sym(builtin_sym("int_to_char"), line, col)
+    synth(st_restore_deferred_fields(s3, st.deferred_fields, st.deferred_homs),
+          mk_expr(ECall(mk_sym(builtin_sym("map"), line, col), [codes, back]), line, col))
+  }
+}
+
+# The step a stepped range lowers to is `second - first`: between two
+# Chars, the distance of their code points.
+fn char_range_second(st: InferState, stp: Option[Expr], line: Int, col: Int) : InferState / Console + File + Mutable =
+  match stp {
+    Some(step) -> match step.kind {
+      EBinop(BoSub, second, _) -> {
+        let r = synth(st, second)
+        st_unify(r.st, TyChar, r.ty, "the second element of a Char range", line, col)
+      }
+      _ -> st
+    }
+    None -> st
+  }
+
+fn char_range_step(stp: Option[Expr]) : Option[Expr] = match stp {
+  Some(step) -> match step.kind {
+    EBinop(BoSub, second, first) -> Some(Expr { ...step, kind: EBinop(BoSub, char_code(second), char_code(first)) })
+    _                            -> stp
+  }
+  None -> None
+}
+
+fn char_code(c: Expr) : Expr =
+  mk_expr(ECall(mk_sym(builtin_sym("char_to_int"), c.line, c.col), [c]), c.line, c.col)
 
 # `x |> f(y, z)` pipes `x` into `f` as its first argument: the typed
 # result is the call `f(x, y, z)`, so no pass after the typer sees `EPipe`.
@@ -12909,10 +12965,11 @@ fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs0: Expr,
         # continue from the RETURNED state (`peek.0`), not `g.st` — reusing
         # the old counter re-mints the peek's already-bound ids (#1186).
         let peek = fuse_source_is_protocol_seq(g.st, ff)
-        let st_after = match peek { FSP(s, _) -> s }
-        let is_seq = match peek { FSP(_, b) -> b }
+        let st_after = match peek { FSP(s, _, _) -> s }
+        let is_seq = match peek { FSP(_, b, _) -> b }
+        let of_chars = match peek { FSP(_, _, c) -> c }
         let proto_foldl = pipe_fusion_proto_foldl(st.protos.ids, rhs)
-        if fuse_owner_mismatch(ff, proto_foldl, is_seq) { FuseAttempt { st: st_after, fused: None } }
+        if of_chars or fuse_owner_mismatch(ff, proto_foldl, is_seq) { FuseAttempt { st: st_after, fused: None } }
         else {
           let rewrite = if is_seq {
             pipe_fusion_generic_fold_rewrite(ff, proto_foldl, line, col)
@@ -12937,13 +12994,25 @@ fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs0: Expr,
 # "annotation needed", #1186). Deferred fields ARE rolled back: head
 # detection needs no field resolution, and the peek's orphan receiver must
 # not leak into the worklist.
-type FuseSeqPeek = FSP(InferState, Bool)
+# What a peek at a fusion source finds: whether its type folds through a
+# protocol, and whether it is a range of Chars, which the counting loops,
+# all over Int, do not walk.
+type FuseSeqPeek = FSP(InferState, Bool, Bool)
 
-fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : FuseSeqPeek / Console + File + Mutable {
-  let r = synth(st, ff.source)
+fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : FuseSeqPeek / Console + File + Mutable =
+  fuse_source_peek(st, ff.source)
+
+fn fuse_source_peek(st: InferState, source: Expr) : FuseSeqPeek / Console + File + Mutable {
+  let r = synth(st, source)
   let src_ty = apply_ty(r.st.sub, r.ty)
   let head_ok = not core_ty_is(ty_head_sym(src_ty), CtList) and pipe_op_has_impl(st.protos.impls, src_ty, "foldl")
-  FSP(st_restore_deferred_fields(r.st, st.deferred_fields, st.deferred_homs), head_ok)
+  let of_chars = pipe_fusion_head(source) and ty_is_char_list(src_ty)
+  FSP(st_restore_deferred_fields(r.st, st.deferred_fields, st.deferred_homs), head_ok, of_chars)
+}
+
+fn ty_is_char_list(t: Ty) : Bool = match t {
+  TyListT(TyChar) -> true
+  _               -> false
 }
 
 # An explicit `foldl` keeps the Mutable-masked purity gate — its stage
@@ -16100,8 +16169,11 @@ fn check_map_pipe_vec_collect(st: InferState, e: Expr,
       let g = fuse_all_raw(st, fc.stages, false)
       if g.ok {
         match pipe_fusion_collect_rewrite(fc, line, col) {
-          Some(rewritten) -> synth(g.st, rewritten)
-          None            -> synth(g.st, vec_collect_via_list(e, line, col))
+          Some(rewritten) -> match fuse_source_peek(g.st, fc.source) {
+            FSP(s, _, true)  -> synth(s, vec_collect_via_list(e, line, col))
+            FSP(s, _, false) -> synth(s, rewritten)
+          }
+          None -> synth(g.st, vec_collect_via_list(e, line, col))
         }
       } else { synth(g.st, vec_collect_via_list(e, line, col)) }
     }
