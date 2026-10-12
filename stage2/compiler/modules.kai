@@ -117,73 +117,7 @@ fn rqc_habitant_qualifier(inner: Expr, mid: String, locals: [String],
 }
 
 fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : ExprKind / Console + File = match e.kind {
-
-  # The rewrite rule itself: only `EField(EName(mod), fn)` is a
-  # candidate. Every other shape just recurses with the same scope.
-  EField(base, fname) -> match base.kind {
-    EName(w) -> {
-      let name = written_text(w)
-      if list_has(locals, name) {
-        # Rule B: local in scope. Treat as record projection.
-        EField(rqc_expr(base, locals, mt, fx, file), fname)
-      } else if name == "bit" {
-        # Dotted bit.* surface. The bit operations are compiler
-        # intrinsics — `bit_and`, `bit_or`, `bit_xor`, `bit_not`,
-        # `bit_shl`, `bit_shr`, `bit_ushr`, `bit_count`, `bit_test`,
-        # `bit_set`, `bit_clear`, `bit_toggle` — registered in the
-        # typer's intrinsic table (`add_core_sigs`) and lowered
-        # inline by `emit_call_expr`'s else-if chain. The dotted
-        # method carries a leading underscore (`bit._and`) so reserved
-        # words (`and`, `or`, `not`, `test`) never appear as a field
-        # name; the rewrite drops the prefix dot and joins to the flat
-        # `bit_<op>` intrinsic (`bit` ++ `_and` = `bit_and`). An
-        # unknown `bit_X` surfaces as an unbound identifier, the right
-        # diagnostic for a typo like `bit._adn`.
-        EName(written(string_concat("bit", fname)))
-      } else {
-        match mt_lookup_member_at(mt, name, fname, file, e.line, e.col) {
-          Some(me) ->
-            # Prefix-fallback — `list.take` resolves to the
-            # actual export `list_take` when the bare form is not
-            # exported. EModCall carries the real name for codegen.
-            #
-            # A qualified constructor keeps its module: `mod.Ctor`
-            # becomes `EModCall(mod, Ctor)`, never a bare `EVar`, so
-            # the qualifier the user wrote survives to the typer.
-            if name_starts_upper(fname) and me_has_export(me, fname) {
-              EModCall(written(me_emit_name(mt, me, name)), written(fname))
-             } else { match me_lookup_export(me, fname) {
-               Some(actual) -> EModCall(written(me_emit_name(mt, me, name)), written(actual))
-               None -> {
-                 # The module table is consulted first. When it loses
-                 # but an effect of the same name owns the op, the
-                 # qualified name belongs to the effect class: leave it
-                 # to the typer instead of reporting a missing export.
-                 if rqc_fx_has_op(fx, name, fname) {
-                   EField(rqc_expr(base, locals, mt, fx, file), fname)
-                 } else {
-                   # Kept qualified so no pass reads `mod` as a value;
-                   # `missing_export` reports it.
-                   EModCall(w, written(fname))
-                 }
-               }
-             } }
-           None -> EField(rqc_expr(base, locals, mt, fx, file), fname)
-         }
-       }
-    }
-    # `m.E.op` — a module-qualified effect operation. The qualifier
-    # names the effect's home; the operation itself dispatches on the
-    # bare effect, so the rewrite drops the module and leaves the
-    # two-segment shape every later pass already folds. A local
-    # receiver never reaches here (Rule B rewrote the inner node),
-    # which is what keeps `user.address.city` a projection.
-    EField(inner, mid) -> match rqc_habitant_qualifier(inner, mid, locals, mt) {
-      Some(hab) -> EField(mk_name(hab, base.line, base.col), fname)
-      None -> EField(rqc_expr(base, locals, mt, fx, file), fname)
-    }
-    _ -> EField(rqc_expr(base, locals, mt, fx, file), fname)
-  }
+  EField(base, fname) -> rqc_field(e, base, fname, locals, mt, fx, file)
   # Scope-introducing shapes: lambda, match arms, handle, block.
   ELambda(params, body) ->
     ELambda(params,
@@ -193,32 +127,16 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
            rqc_arms(arms, locals, mt, fx, file))
   EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) -> {
     let body1 = rqc_expr(body, locals, mt, fx, file)
-    let init_opt1 = match init_opt {
-      Some(ie) -> Some(rqc_expr(ie, locals, mt, fx, file))
-      None -> None
-    }
-    # The handle alias (`as name`) and `with State[T](init) as
-    # name` introduce a binding visible only inside the clauses
-    # and the return clause, not the body. The body sees the
-    # original locals.
-    let inner = match alias_opt { Some(a) -> [written_text(a.name), ...locals] None -> locals }
+    let init_opt1 = rqc_expr_opt(init_opt, locals, mt, fx, file)
+    let inner = rqc_alias_scope(alias_opt, locals)
     let clauses1 = rqc_hclauses(clauses, inner, mt, fx, file)
-    let ret_opt1 = match ret_opt {
-      Some(r) -> Some(rqc_hreturn(r, inner, mt, fx, file))
-      None -> None
-    }
-    EHandle(body1, eff, ty_args, init_opt1, alias_opt, clauses1, ret_opt1)
+    EHandle(body1, eff, ty_args, init_opt1, alias_opt, clauses1, rqc_hreturn_opt(ret_opt, inner, mt, fx, file))
   }
   EBlock(stmts, opt_final) -> {
-    # Scope grows monotonically through the block. Each SLet /
-    # SVar / SUse contributes new bindings to `inner`.
+    # Scope grows monotonically through the block: each binding
+    # statement adds to what the final expression sees.
     let res = rqc_block_stmts(stmts, locals, mt, fx, file, [])
-    let inner = res.bound
-    let final1 = match opt_final {
-      Some(fe) -> Some(rqc_expr(fe, inner, mt, fx, file))
-      None -> None
-    }
-    EBlock(res.stmts, final1)
+    EBlock(res.stmts, rqc_expr_opt(opt_final, res.bound, mt, fx, file))
   }
   # Everything else: inlined from `map_expr_kind` to allow the
   # effect row to propagate. Stage 1 cannot parse row
@@ -276,6 +194,74 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
                                          rqc_expr(b, locals, mt, fx, file))
   ELitUnit(inner, u)   -> ELitUnit(rqc_expr(inner, locals, mt, fx, file), u)
   EBang(inner)         -> EBang(rqc_expr(inner, locals, mt, fx, file))
+}
+
+# Only `mod.name` is a rewrite candidate; every other receiver recurses
+# with the same scope.
+fn rqc_field(e: Expr, base: Expr, fname: String, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : ExprKind / Console + File = match base.kind {
+  EName(w) -> rqc_qualified(e, base, w, fname, locals, mt, fx, file)
+  # `m.E.op` — a module-qualified effect operation. The qualifier
+  # names the effect's home; the operation itself dispatches on the
+  # bare effect, so the rewrite drops the module and leaves the
+  # two-segment shape every later pass already folds. A local
+  # receiver never reaches here (its inner node is a projection),
+  # which is what keeps `user.address.city` a projection.
+  EField(inner, mid) -> match rqc_habitant_qualifier(inner, mid, locals, mt) {
+    Some(hab) -> EField(mk_name(hab, base.line, base.col), fname)
+    None -> EField(rqc_expr(base, locals, mt, fx, file), fname)
+  }
+  _ -> EField(rqc_expr(base, locals, mt, fx, file), fname)
+}
+
+# `name.fname` with a bare receiver. A local in scope makes it a record
+# projection. `bit.<op>` is the dotted surface of the bit intrinsics: the
+# method carries a leading underscore (`bit._and`) so a reserved word is
+# never a field name, and joining the two gives the flat `bit_<op>`; an
+# unknown one surfaces as an unbound identifier.
+fn rqc_qualified(e: Expr, base: Expr, w: Written, fname: String, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : ExprKind / Console + File = {
+  let name = written_text(w)
+  if list_has(locals, name) { EField(rqc_expr(base, locals, mt, fx, file), fname) }
+  else if name == "bit" { EName(written(string_concat("bit", fname))) }
+  else {
+    match mt_lookup_member_at(mt, name, fname, file, e.line, e.col) {
+      Some(me) -> rqc_member(me, base, w, name, fname, locals, mt, fx, file)
+      None     -> EField(rqc_expr(base, locals, mt, fx, file), fname)
+    }
+  }
+}
+
+# A member of the module `me` that `name` names. A qualified constructor
+# keeps its module, so the qualifier the user wrote survives to the
+# typer; a function carries the name the module actually exports, which
+# may be the prefixed one (`list.take` for `list_take`).
+fn rqc_member(me: ModuleEntry, base: Expr, w: Written, name: String, fname: String, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : ExprKind / Console + File =
+  if name_starts_upper(fname) and me_has_export(me, fname) {
+    EModCall(written(me_emit_name(mt, me, name)), written(fname))
+  } else {
+    match me_lookup_export(me, fname) {
+      Some(actual) -> EModCall(written(me_emit_name(mt, me, name)), written(actual))
+      None         -> rqc_unexported(base, w, name, fname, locals, mt, fx, file)
+    }
+  }
+
+# The module table is consulted first. When it loses but an effect of
+# the same name owns the op, the qualified name belongs to the effect
+# class and is left to the typer. Otherwise it stays qualified so no
+# pass reads `mod` as a value, and `missing_export` reports it.
+fn rqc_unexported(base: Expr, w: Written, name: String, fname: String, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : ExprKind / Console + File =
+  if rqc_fx_has_op(fx, name, fname) { EField(rqc_expr(base, locals, mt, fx, file), fname) }
+  else { EModCall(w, written(fname)) }
+
+# A handle's alias (`as name`) is visible only inside the clauses and
+# the return clause; the body sees the original locals.
+fn rqc_alias_scope(alias_opt: Option[Binder], locals: [String]) : [String] = match alias_opt {
+  Some(a) -> [written_text(a.name), ...locals]
+  None    -> locals
+}
+
+fn rqc_hreturn_opt(opt: Option[HReturn], locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : Option[HReturn] / Console + File = match opt {
+  None    -> None
+  Some(r) -> Some(rqc_hreturn(r, locals, mt, fx, file))
 }
 
 fn rqc_expr_opt(opt: Option[Expr], locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : Option[Expr] / Console + File = match opt {
