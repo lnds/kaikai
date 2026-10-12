@@ -40,7 +40,7 @@ clean() {
 }
 
 for f in seq_sieve seq_shared_once seq_pipes seq_defer_root_lambda seq_region_border seq_trap_in_fiber \
-         seq_const_fibs seq_const_shared seq_const_per_fiber; do
+         seq_const_fibs seq_const_shared seq_const_per_fiber seq_filter_stages; do
   build "$f"
   run "$exe" > "$exe.out" 2> "$exe.err" || { cat "$exe.err"; fail "$f exited non-zero"; }
   clean "$exe.err" "$f"
@@ -58,6 +58,7 @@ panics() {
 panics seq_nth_out_of_range "seq.nth: index out of range"
 panics seq_const_reads_itself "constant depends on itself"
 panics seq_reads_itself "sequence depends on itself"
+panics seq_filter_reads_itself "sequence depends on itself"
 
 if [ "$mode" != native ]; then
   t="$OUT/seq-$mode-cell-test"
