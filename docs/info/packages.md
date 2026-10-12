@@ -220,8 +220,9 @@ mypackage/
 
 The sources may sit in a subdirectory instead, with `entry` pointing
 into it. The package's modules then resolve from the directory of the
-entry for every file the package owns, and `kai test` runs the
-`tests/` beside `kai.toml` as well as one beside the entry:
+entry for every file the package owns and for every package that
+depends on it, and `kai test` runs the `tests/` beside `kai.toml` as
+well as one beside the entry:
 
 ```text
 mypackage/

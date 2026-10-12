@@ -4,7 +4,8 @@
 # for the entry alone: `kai test` finds `tests/` beside the manifest and
 # beside the entry, and a test wherever it sits imports the package's
 # modules as the entry does. `kai build`, `kai run` and `kai typecheck`
-# of a file that is not the entry resolve the same way.
+# of a file that is not the entry resolve the same way, and so does a
+# package that depends on this one by path.
 
 set -eu
 
@@ -22,12 +23,21 @@ printf 'import demo.core.math\n\ntest "beside the manifest" {\n  assert twice(2)
 printf 'import demo.core.math\n\ntest "beside the entry" {\n  assert twice(3) == 6\n}\n' > "$pkg/src/tests/entry_side.kai"
 printf 'import demo.core.math\n\ntest "beside the module" {\n  assert twice(4) == 8\n}\n' > "$pkg/src/demo/core/math_test.kai"
 
+tool="$pkg/tool"
+mkdir -p "$tool/tests"
+printf 'name = "tool"\nversion = "0.1.0"\nentry = "main.kai"\n\n[dependencies]\ndemo = { path = ".." }\n' > "$tool/kai.toml"
+printf 'import demo.core.math\n\nfn main() : Int / Stdout {\n  Stdout.print("#{twice(50)}")\n  0\n}\n' > "$tool/main.kai"
+printf 'import demo.core.math\n\ntest "from a dependent" {\n  assert twice(5) == 10\n}\n' > "$tool/tests/dep_test.kai"
+
 fail=0
 # check <label> <expected substring> <kai args...>, run from the package
-check() {
-  label="$1"; want="$2"; shift 2
+check() { check_in "$pkg" "$@"; }
+
+# check_in <dir> <label> <expected substring> <kai args...>
+check_in() {
+  dir="$1"; label="$2"; want="$3"; shift 3
   rc=0
-  (cd "$pkg" && env KAI_BACKEND=c KAI_CORE_CACHE_DIR="$work/core" "$KAI" "$@") > "$work/out" 2>&1 || rc=$?
+  (cd "$dir" && env KAI_BACKEND=c KAI_CORE_CACHE_DIR="$work/core" "$KAI" "$@") > "$work/out" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ] || { [ -n "$want" ] && ! grep -q "$want" "$work/out"; }; then
     echo "  FAIL $label (status $rc, expected '$want')"; sed 's/^/    /' "$work/out" | tail -8
     fail=$((fail + 1))
@@ -45,6 +55,12 @@ check "test, file beside the manifest" '1/1 tests passed' test tests/math_test.k
 check "test, file beside the entry" '1/1 tests passed' test src/tests/entry_side.kai
 check "test, file beside the module" '1/1 tests passed' test src/demo/core/math_test.kai
 check "typecheck, a test file" '' typecheck tests/math_test.kai
+
+check "dependent, run from the dependency" '^100$' run ./tool
+check_in "$tool" "dependent, run" '^100$' run .
+check_in "$tool" "dependent, build" '' build -o "$work/tool-bin"
+[ "$("$work/tool-bin" 2> /dev/null)" = 100 ] || { echo "  FAIL dependent, build: the binary does not print 100"; fail=$((fail + 1)); }
+check_in "$tool" "dependent, test" 'ok   from a dependent' test
 
 if [ "$fail" -ne 0 ]; then
   echo "src-entry FAIL ($fail)"
