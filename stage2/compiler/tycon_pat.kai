@@ -15,13 +15,28 @@ import compiler.symtab_build
 import compiler.scalar_ty
 import compiler.type_home
 import compiler.tbinder
+import compiler.infer_index
 
 #[doc("A declared payload shape: a constructor's slots, or a record type's fields, with the type parameters they mention and the module declaring them.")]
 pub type TPay = TPV(SymId, [TBinder], [TypeExpr], Option[String])
               | TPR(SymId, [TBinder], [FieldDecl], Option[String])
 
+#[doc("The payload shapes of a program, each under the id of the constructor or the record type that declares it.")]
+pub type TPays = { ctors: NameIndex[TPay], recs: NameIndex[TPay] }
+
 #[doc("The payload shapes of every sum constructor and record type in `ds`, plus the builtin constructors no declaration carries.")]
-pub fn tpay_table(ds: [Decl]) : [TPay] = tp_collect(ds, tp_builtins())
+pub fn tpay_table(ds: [Decl]) : TPays =
+  tp_index(list_reverse(tp_collect(ds, tp_builtins())), TPays { ctors: idx_empty(), recs: idx_empty() })
+
+# Indexed from the last shape back, so a chain's head is the shape a
+# declaration gave, ahead of a builtin's.
+fn tp_index(rev: [TPay], ix: TPays) : TPays = match rev {
+  [] -> ix
+  [x, ...rest] -> match x {
+    TPV(c, _, _, _) -> tp_index(rest, TPays { ...ix, ctors: idx_prepend_sym(ix.ctors, c, x) })
+    TPR(t, _, _, _) -> tp_index(rest, TPays { ...ix, recs: idx_prepend_sym(ix.recs, t, x) })
+  }
+}
 
 fn tp_builtins() : [TPay] = {
   let a = tbinder_minted("Option.a")
@@ -52,7 +67,7 @@ fn tp_variants(vs: [Variant], mo: Option[String], tps: [TBinder], acc: [TPay]) :
 }
 
 #[doc("`p` with every constructor pattern it holds that still spells its constructor naming the one its expected type `ty` decides.")]
-pub fn tp_pat(p: Pattern, ty: Option[Ty], hs: TyHomeTab, pays: [TPay]) : Pattern = {
+pub fn tp_pat(p: Pattern, ty: Option[Ty], hs: TyHomeTab, pays: TPays) : Pattern = {
   let k = match p.pkind {
     PVariant(r, subs) -> {
       let c = tp_ctor(hs.tab, r, ty)
@@ -67,7 +82,7 @@ pub fn tp_pat(p: Pattern, ty: Option[Ty], hs: TyHomeTab, pays: [TPay]) : Pattern
   Pattern { pkind: k, line: p.line, col: p.col }
 }
 
-fn tp_each(ps: [Pattern], ty: Option[Ty], hs: TyHomeTab, pays: [TPay]) : [Pattern] = match ps {
+fn tp_each(ps: [Pattern], ty: Option[Ty], hs: TyHomeTab, pays: TPays) : [Pattern] = match ps {
   [] -> []
   [p, ...rest] -> [tp_pat(p, ty, hs, pays), ...tp_each(rest, ty, hs, pays)]
 }
@@ -121,7 +136,7 @@ fn tp_elem(t: Option[Ty]) : Option[Ty] = match t {
   _                -> None
 }
 
-fn tp_subs(ps: [Pattern], tys: [Option[Ty]], hs: TyHomeTab, pays: [TPay]) : [Pattern] = match ps {
+fn tp_subs(ps: [Pattern], tys: [Option[Ty]], hs: TyHomeTab, pays: TPays) : [Pattern] = match ps {
   [] -> []
   [p, ...rest] -> match tys {
     []           -> [tp_pat(p, None, hs, pays), ...tp_subs(rest, [], hs, pays)]
@@ -129,7 +144,7 @@ fn tp_subs(ps: [Pattern], tys: [Option[Ty]], hs: TyHomeTab, pays: [TPay]) : [Pat
   }
 }
 
-fn tp_fields(fs: [PField], ty: Option[Ty], hs: TyHomeTab, pays: [TPay]) : [PField] = match fs {
+fn tp_fields(fs: [PField], ty: Option[Ty], hs: TyHomeTab, pays: TPays) : [PField] = match fs {
   [] -> []
   [PField(fname, p, sh), ...rest] ->
     [PField(fname, tp_pat(p, tp_field_ty(pays, hs, ty, fname), hs, pays), sh), ...tp_fields(rest, ty, hs, pays)]
@@ -137,21 +152,21 @@ fn tp_fields(fs: [PField], ty: Option[Ty], hs: TyHomeTab, pays: [TPay]) : [PFiel
 
 # A slot's type is only known when the constructor is; anything else
 # leaves the slot untyped.
-fn tp_slot_tys(pays: [TPay], hs: TyHomeTab, c: SymId, ty: Option[Ty]) : [Option[Ty]] =
+fn tp_slot_tys(pays: TPays, hs: TyHomeTab, c: SymId, ty: Option[Ty]) : [Option[Ty]] =
   match tp_find_ctor(pays, c) {
     Some(TPV(_, tps, tes, mo)) -> map(tes, (te) => tp_te(te, tps, tp_args(ty), mo, hs))
     _                          -> []
   }
 
-fn tp_find_ctor(pays: [TPay], c: SymId) : Option[TPay] = match pays {
-  [] -> None
-  [x, ...rest] -> match x {
-    TPV(d, _, _, _) -> if sym_raw(c) >= 0 and sym_raw(d) == sym_raw(c) { Some(x) } else { tp_find_ctor(rest, c) }
-    _               -> tp_find_ctor(rest, c)
-  }
+fn tp_find_ctor(pays: TPays, c: SymId) : Option[TPay] =
+  if sym_raw(c) < 0 { None } else { tp_head(idx_chain_sym(pays.ctors, c)) }
+
+fn tp_head(chain: [TPay]) : Option[TPay] = match chain {
+  []        -> None
+  [x, ..._] -> Some(x)
 }
 
-fn tp_field_ty(pays: [TPay], hs: TyHomeTab, ty: Option[Ty], fname: String) : Option[Ty] = match ty {
+fn tp_field_ty(pays: TPays, hs: TyHomeTab, ty: Option[Ty], fname: String) : Option[Ty] = match ty {
   Some(TyCon(t, args)) -> match tp_find_rec(pays, t) {
     Some(TPR(_, tps, fds, dmo)) -> match tp_fd(fds, fname) {
       Some(te) -> tp_te(te, tps, args, dmo, hs)
@@ -162,13 +177,8 @@ fn tp_field_ty(pays: [TPay], hs: TyHomeTab, ty: Option[Ty], fname: String) : Opt
   _ -> None
 }
 
-fn tp_find_rec(pays: [TPay], t: SymId) : Option[TPay] = match pays {
-  [] -> None
-  [x, ...rest] -> match x {
-    TPR(d, _, _, _) -> if sym_raw(t) >= 0 and sym_raw(d) == sym_raw(t) { Some(x) } else { tp_find_rec(rest, t) }
-    _               -> tp_find_rec(rest, t)
-  }
-}
+fn tp_find_rec(pays: TPays, t: SymId) : Option[TPay] =
+  if sym_raw(t) < 0 { None } else { tp_head(idx_chain_sym(pays.recs, t)) }
 
 fn tp_fd(fds: [FieldDecl], fname: String) : Option[TypeExpr] = match fds {
   [] -> None
