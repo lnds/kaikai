@@ -52,79 +52,97 @@ fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
 fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                        reg: ProtocolReg, target_mod: String,
                        ps: PScope, os: OrphanScope, seen: [String],
-                       acc: [Diagnostic]) : [Diagnostic] {
-  match ds {
+                       acc: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> acc
+  [d, ...rest] -> match homes {
     [] -> acc
-    [d, ...rest] -> match homes {
-      [] -> acc
-      [h, ...hrest] -> match d {
-      DImpl(pref, proto_args, target, _, line, col, _, isym) -> {
-        let tab = ps_tab(ps)
-        let file = decl_diag_file(d, df)
-        let tname = proto_type_name(tab, target)
-        let pspell = proto_ref_spell(tab, pref)
-        let pname = dotted_bare(pspell)
-        let from = proto_mo_of(ha_home(h), target_mod)
-        let res = proto_ref_res(ps, pref, from)
-        # Issue #180: duplicate-impl key includes the proto-arg names so
-        # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
-        # coexist. Legacy `impl P for T` (proto_args == []) maps to the
-        # homogeneous default `[T]` for keying. The resolved protocol's
-        # home leads the key: two modules implementing their own `P`
-        # for same-named types are not duplicates.
-        let arg_names = match proto_args {
-          [] -> [head_spell(HeadScope(ps, from), target)]
-          _  -> map(proto_args, (a) => head_spell(HeadScope(ps, from), a))
-        }
-        let mo_key = match res {
-          PkHome(Some(m)) -> m
-          _ -> ""
-        }
-        let key = concat_all([mo_key, "!", pname, "/", impl_target_key(ps, tname, proto_type_ref(target), from), "[",
-                              arg_names_mangle(arg_names), "]"])
-        let proto_home = match res {
-          PkHome(ph) -> Some(proto_home_name(ph, target_mod))
-          _ -> None
-        }
-        let orphan = OrphanImpl { pspell: pspell, proto_home: proto_home, args: proto_args,
-                                  target: target, from: from,
-                                  impl_mod: proto_home_name(from, target_mod) }
-        let acc1 = match orphan_error(os, orphan) {
-          Some(msg) -> [proto_err(file, line, col, msg), ...acc]
-          None -> acc
-        }
-        let acc2 =
-          if list_has(seen, key) {
-            [proto_err(file, line, col, concat_all(["duplicate impl: `impl ", pname, " for ", tname,
-                             "` already exists in this compilation unit"])), ...acc1]
-          } else { acc1 }
-        let acc3 = match res {
-          PkHome(_) -> acc2
-          PkPrivate(m) ->
-            [proto_err(file, line, col, concat_all(["protocol `", pname, "` is declared in module `", m,
-                             "` but is not `pub`"])), ...acc2]
-          PkUnknown -> [proto_err(file, line, col, concat_all(["unknown protocol `", pname, "` in `impl`"])), ...acc2]
-          PkAmbiguous(cands) ->
-            [nr_ambiguous_diag(file, line, col, NCProtocol, pname,
-                               map(cands, (c) => proto_home_name(c, target_mod)), "", []), ...acc2]
-        }
-        let seen1 = if list_has(seen, key) { seen } else { [key, ...seen] }
-        validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen1, acc3)
-      }
-      DDerive(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
-      DUnstable(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
-      DProtoLaws(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
-      DImplAxiom(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
-      DConstructor(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
-      _ -> validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen, acc)
+    [h, ...hrest] -> match wrapped_decl(d) {
+      Some(inner) -> validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
+      None -> {
+        let st = validate_impl(d, h, df, target_mod, ps, os, seen, acc)
+        validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, st.seen, st.acc)
       }
     }
   }
+}
+
+# The declaration a wrapper carries. A wrapper shares its home with what
+# it wraps, so the walk steps into it without advancing the homes.
+fn wrapped_decl(d: Decl) : Option[Decl] = match d {
+  DDerive(_, inner, _, _)       -> Some(inner)
+  DUnstable(inner, _, _)        -> Some(inner)
+  DProtoLaws(_, inner, _, _, _) -> Some(inner)
+  DImplAxiom(_, inner, _, _, _) -> Some(inner)
+  DConstructor(inner, _, _)     -> Some(inner)
+  _                             -> None
+}
+
+type ImplSeen = { seen: [String], acc: [Diagnostic] }
+
+fn validate_impl(d: Decl, h: HomeAnchor, df: DiagFiles, target_mod: String, ps: PScope, os: OrphanScope,
+                 seen: [String], acc: [Diagnostic]) : ImplSeen = match d {
+  DImpl(pref, proto_args, target, _, line, col, _, _) -> {
+    let tab = ps_tab(ps)
+    let file = decl_diag_file(d, df)
+    let tname = proto_type_name(tab, target)
+    let pspell = proto_ref_spell(tab, pref)
+    let pname = dotted_bare(pspell)
+    let from = proto_mo_of(ha_home(h), target_mod)
+    let res = proto_ref_res(ps, pref, from)
+    let key = impl_dup_key(ps, res, pname, tname, target, proto_args, from)
+    let orphan = OrphanImpl { pspell: pspell, proto_home: res_proto_home(res, target_mod), args: proto_args,
+                              target: target, from: from,
+                              impl_mod: proto_home_name(from, target_mod) }
+    let acc1 = match orphan_error(os, orphan) {
+      Some(msg) -> [proto_err(file, line, col, msg), ...acc]
+      None -> acc
+    }
+    let dup = list_has(seen, key)
+    let acc2 =
+      if dup {
+        [proto_err(file, line, col, concat_all(["duplicate impl: `impl ", pname, " for ", tname,
+                         "` already exists in this compilation unit"])), ...acc1]
+      } else { acc1 }
+    ImplSeen { seen: if dup { seen } else { [key, ...seen] },
+               acc: impl_res_diags(res, pname, target_mod, file, line, col, acc2) }
+  }
+  _ -> ImplSeen { seen: seen, acc: acc }
+}
+
+# The duplicate-impl key includes the proto-arg names, so `impl Add[Real]
+# for Complex` and `impl Add[Complex] for Complex` coexist; `impl P for
+# T` keys as the homogeneous default `[T]`. The resolved protocol's home
+# leads the key: two modules implementing their own `P` for same-named
+# types are not duplicates.
+fn impl_dup_key(ps: PScope, res: PkRes, pname: String, tname: String, target: TypeExpr,
+                proto_args: [TypeExpr], from: Option[String]) : String = {
+  let arg_names = match proto_args {
+    [] -> [head_spell(HeadScope(ps, from), target)]
+    _  -> map(proto_args, (a) => head_spell(HeadScope(ps, from), a))
+  }
+  let mo_key = match res {
+    PkHome(Some(m)) -> m
+    _ -> ""
+  }
+  concat_all([mo_key, "!", pname, "/", impl_target_key(ps, tname, proto_type_ref(target), from), "[",
+              arg_names_mangle(arg_names), "]"])
+}
+
+fn res_proto_home(res: PkRes, target_mod: String) : Option[String] = match res {
+  PkHome(ph) -> Some(proto_home_name(ph, target_mod))
+  _ -> None
+}
+
+fn impl_res_diags(res: PkRes, pname: String, target_mod: String, file: String, line: Int, col: Int,
+                  acc: [Diagnostic]) : [Diagnostic] = match res {
+  PkHome(_) -> acc
+  PkPrivate(m) ->
+    [proto_err(file, line, col, concat_all(["protocol `", pname, "` is declared in module `", m,
+                     "` but is not `pub`"])), ...acc]
+  PkUnknown -> [proto_err(file, line, col, concat_all(["unknown protocol `", pname, "` in `impl`"])), ...acc]
+  PkAmbiguous(cands) ->
+    [nr_ambiguous_diag(file, line, col, NCProtocol, pname,
+                       map(cands, (c) => proto_home_name(c, target_mod)), "", []), ...acc]
 }
 
 # Issue #535 — impl method validation against protocol declaration.
@@ -166,57 +184,44 @@ fn validate_impl_methods(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
 
 fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                               reg: ProtocolReg, target_mod: String,
-                              ps: PScope, acc: [Diagnostic]) : [Diagnostic] {
-  match ds {
+                              ps: PScope, acc: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> acc
+  [d, ...rest] -> match homes {
     [] -> acc
-    [d, ...rest] -> match homes {
-      [] -> acc
-      [h, ...hrest] -> match d {
-      DImpl(pref, proto_args, target, methods, line, col, _, isym) -> {
-        let tab = ps_tab(ps)
-        let file = decl_diag_file(d, df)
-        let tname = proto_type_name(tab, target)
-        let pname = dotted_bare(proto_ref_spell(tab, pref))
-        # The impl checks against the protocol its own module resolves
-        # `pname` to — never a same-named protocol of an unrelated
-        # module. Unresolved names were already reported by
-        # `validate_impls`; skip them here.
-        let from = proto_mo_of(ha_home(h), target_mod)
-        let psym = proto_ref_sym(ps, pref, from)
-        let proto_ops = proto_scope_ops(reg.ops, psym)
-        if proto_ops == [] {
-          validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, acc)
-        } else {
-          # Protocol tparams substitute against the impl's bracket
-          # arguments. Legacy `impl P for T` (`proto_args == []`) is
-          # treated as the homogeneous default: every protocol tparam
-          # collapses to the target head. Heterogeneous
-          # `impl P[Real, Int] for T` aligns positionally.
-          let proto_tps = proto_scope_tparams(reg.tparams, psym)
-          let arg_heads = map(proto_args, proto_type_ref)
-          let all_op_names = proto_op_names(proto_ops, [])
-          let e1 = check_missing_methods(tab, proto_ops, methods, pname, tname,
-                                         all_op_names,
-                                         file, line, col, acc)
-          let e2 = check_impl_methods(tab, methods, proto_ops, pname, tname, target,
-                                       proto_tps, arg_heads, file, e1)
-          validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, e2)
-        }
-      }
-      DDerive(_, inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
-      DUnstable(inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
-      DProtoLaws(_, inner, _, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
-      DImplAxiom(_, inner, _, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
-      DConstructor(inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
-      _ -> validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, acc)
-      }
+    [h, ...hrest] -> match wrapped_decl(d) {
+      Some(inner) -> validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
+      None -> validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps,
+                                         impl_method_diags(d, h, df, reg, target_mod, ps, acc))
     }
   }
+}
+
+# The impl checks against the protocol its own module resolves the name
+# to, never a same-named protocol of an unrelated module. An unresolved
+# name has no ops and was reported by `validate_impls`. Protocol tparams
+# substitute against the impl's bracket arguments, positionally; `impl P
+# for T` is the homogeneous default, every tparam being the target head.
+fn impl_method_diags(d: Decl, h: HomeAnchor, df: DiagFiles, reg: ProtocolReg, target_mod: String, ps: PScope,
+                     acc: [Diagnostic]) : [Diagnostic] = match d {
+  DImpl(pref, proto_args, target, methods, line, col, _, _) -> {
+    let tab = ps_tab(ps)
+    let file = decl_diag_file(d, df)
+    let tname = proto_type_name(tab, target)
+    let pname = dotted_bare(proto_ref_spell(tab, pref))
+    let psym = proto_ref_sym(ps, pref, proto_mo_of(ha_home(h), target_mod))
+    let proto_ops = proto_scope_ops(reg.ops, psym)
+    if proto_ops == [] { acc }
+    else {
+      let proto_tps = proto_scope_tparams(reg.tparams, psym)
+      let arg_heads = map(proto_args, proto_type_ref)
+      let e1 = check_missing_methods(tab, proto_ops, methods, pname, tname,
+                                     proto_op_names(proto_ops, []),
+                                     file, line, col, acc)
+      check_impl_methods(tab, methods, proto_ops, pname, tname, target,
+                         proto_tps, arg_heads, file, e1)
+    }
+  }
+  _ -> acc
 }
 
 # Shapes 2 + 3: walk each impl method; if it matches a protocol op,
@@ -225,45 +230,38 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
 fn check_impl_methods(tab: SymTab, methods: [Decl], proto_ops: [ProtoOpReg],
                       pname: String, tname: String, target: TypeExpr,
                       proto_tps: [TBinder], arg_heads: [DeclRef],
-                      file: String, acc: [Diagnostic]) : [Diagnostic] {
-  match methods {
-    [] -> acc
-    [d, ...rest] -> match d {
-      DFn(_, fid, mtps, params, ret_opt, _, _, line, col, _) -> {
-        let op_name = impl_method_op(tab, fid)
-        let acc1 = match find_proto_op(proto_ops, op_name) {
-          None ->
-            [proto_err(file, line, col,
-               concat_all(["impl `", pname, " for ", tname,
-                           "` declares method `", op_name,
-                           "` which is not an operation of protocol `", pname, "`"])), ...acc]
-          Some(op) -> match op {
-            POR(_, _, proto_params, proto_ret, _, _, _, op_tps) -> {
-              let shown = list_append(mtps, list_append(proto_tps, op_tps))
-              let pa = list_length(params)
-              let pp = list_length(proto_params)
-              let e_ar =
-                if pa == pp { acc }
-                else {
-                  [proto_err(file, line, col,
-                     concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
-                                 "` has arity ", int_to_string(pa),
-                                 " but protocol declares arity ", int_to_string(pp)])), ...acc]
-                }
-              if pa == pp {
-                check_sig_heads(tab, params, proto_params, ret_opt, proto_ret,
-                                op_name, pname, tname, target,
-                                proto_tps, arg_heads, shown,
-                                file, line, col, e_ar)
-              } else { e_ar }
-            }
-          }
-        }
-        check_impl_methods(tab, rest, proto_ops, pname, tname, target,
-                           proto_tps, arg_heads, file, acc1)
-      }
-      _ -> check_impl_methods(tab, rest, proto_ops, pname, tname, target,
-                              proto_tps, arg_heads, file, acc)
+                      file: String, acc: [Diagnostic]) : [Diagnostic] = match methods {
+  [] -> acc
+  [DFn(_, fid, mtps, params, ret_opt, _, _, line, col, _), ...rest] ->
+    check_impl_methods(tab, rest, proto_ops, pname, tname, target, proto_tps, arg_heads, file,
+                       check_impl_method(tab, impl_method_op(tab, fid), mtps, params, ret_opt, line, col,
+                                         proto_ops, pname, tname, target, proto_tps, arg_heads, file, acc))
+  [_, ...rest] -> check_impl_methods(tab, rest, proto_ops, pname, tname, target,
+                                     proto_tps, arg_heads, file, acc)
+}
+
+fn check_impl_method(tab: SymTab, op_name: String, mtps: [TBinder], params: [Param], ret_opt: Option[TypeExpr],
+                     line: Int, col: Int, proto_ops: [ProtoOpReg], pname: String, tname: String,
+                     target: TypeExpr, proto_tps: [TBinder], arg_heads: [DeclRef], file: String,
+                     acc: [Diagnostic]) : [Diagnostic] = match find_proto_op(proto_ops, op_name) {
+  None ->
+    [proto_err(file, line, col,
+       concat_all(["impl `", pname, " for ", tname,
+                   "` declares method `", op_name,
+                   "` which is not an operation of protocol `", pname, "`"])), ...acc]
+  Some(POR(_, _, proto_params, proto_ret, _, _, _, op_tps)) -> {
+    let pa = list_length(params)
+    let pp = list_length(proto_params)
+    if pa != pp {
+      [proto_err(file, line, col,
+         concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
+                     "` has arity ", int_to_string(pa),
+                     " but protocol declares arity ", int_to_string(pp)])), ...acc]
+    } else {
+      check_sig_heads(tab, params, proto_params, ret_opt, proto_ret,
+                      op_name, pname, tname, target,
+                      proto_tps, arg_heads, list_append(mtps, list_append(proto_tps, op_tps)),
+                      file, line, col, acc)
     }
   }
 }
@@ -371,44 +369,42 @@ fn reg_without_impls(reg: ProtocolReg) : ProtocolReg =
 
 #[doc("The diagnostics of a dispatcher call that survived the rewrite: no impl serves it, or more than one protocol does.")]
 pub fn validate_proto_call_at(e: Expr, reg: ProtocolReg, tab: SymTab, cm: Option[String], file: String,
-                           errs: [Diagnostic]) : [Diagnostic] / Console + File {
+                           errs: [Diagnostic]) : [Diagnostic] / Console + File = match e.kind {
+  # Only a call that survived the rewrite as a dispatcher call is
+  # inspected.
+  ECall(callee, args_) -> match pid_ref_disp(reg.ids, callee) {
+    Some(row) -> validate_disp_call(e, callee, args_, disp_op(row), reg, tab, cm, file, errs)
+    None      -> errs
+  }
+  _ -> errs
+}
 
-
-  match e.kind {
-    # Only a call that survived the rewrite as a dispatcher call is
-    # inspected.
-    ECall(callee, args_) -> match pid_ref_disp(reg.ids, callee) {
-      Some(row) -> {
-        let opname = disp_op(row)
-        match args_ {
-          [] -> errs
-          [self_arg, ..._rest_args] -> match self_arg.ty {
-            None -> errs
-            Some(ty) -> match ty_disp_head(ty) {
-              None -> errs
-              # Collision-aware: an impl under ANY protocol declaring
-              # `opname` clears the call (the bare name carries no
-              # protocol, so `Ring.add` and `Add.add` are both valid
-              # targets for `add`).
-              Some(h) -> match find_impl_any_proto(reg, opname, h, cm) {
-                Some(_) -> validate_dispatch_unique(e, args_, reg, tab, cm, opname, file, errs)
-                None -> {
-                  let pname = unserved_protos(reg, tab, callee, opname)
-                  let d = mk_diag(SevError, file, e.line, e.col,
-                    concat_all(["no impl of `", pname,
-                                "` for type `", dh_text(tab, h),
-                                "` (operation `", opname, "`)"]), [])
-                  render_diag(d)
-                  push_diag(errs, d)
-                }
-              }
-            }
-          }
-        }
-      }
-      None -> errs
+# Collision-aware: an impl under any protocol declaring `opname` clears
+# the call (the bare name carries no protocol, so `Ring.add` and
+# `Add.add` are both valid targets for `add`).
+fn validate_disp_call(e: Expr, callee: Expr, args_: [Expr], opname: String, reg: ProtocolReg, tab: SymTab,
+                      cm: Option[String], file: String,
+                      errs: [Diagnostic]) : [Diagnostic] / Console + File = match self_arg_head(args_) {
+  None    -> errs
+  Some(h) -> match find_impl_any_proto(reg, opname, h, cm) {
+    Some(_) -> validate_dispatch_unique(e, args_, reg, tab, cm, opname, file, errs)
+    None -> {
+      let pname = unserved_protos(reg, tab, callee, opname)
+      let d = mk_diag(SevError, file, e.line, e.col,
+        concat_all(["no impl of `", pname,
+                    "` for type `", dh_text(tab, h),
+                    "` (operation `", opname, "`)"]), [])
+      render_diag(d)
+      push_diag(errs, d)
     }
-    _ -> errs
+  }
+}
+
+fn self_arg_head(args_: [Expr]) : Option[DispHead] = match args_ {
+  []                        -> None
+  [self_arg, ..._rest_args] -> match self_arg.ty {
+    None     -> None
+    Some(ty) -> ty_disp_head(ty)
   }
 }
 
@@ -438,48 +434,34 @@ the prior behaviour.
 pub fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
                                args_: [Expr], reg: ProtocolReg,
                                cm: Option[String],
-                               opname: String, ret_ty: Ty) : Option[ExprKind] {
-  match cands {
-    [] -> None
-    [po, ...rest] -> match po {
-      POR(pkey, _, params, ret_te, _, _, pmo, _) ->
-        # Arity guard: skip a candidate whose arity differs from the
-        # call (an arity-ambiguous name reaches both protocols' POR).
-        if list_length(params) != list_length(args_) {
-          try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
-        }
-        # A protocol the calling module cannot see is not a dispatch
-        # candidate for its bare calls.
-        else if not proto_visible_from(reg.origins, pkey, pmo, cm) {
-          try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
-        }
-        # Only ops whose Self is informed SOLELY by the return position
-        # are dispatched here. When Self also appears in a parameter
-        # (`show(x: Self) : String`), arg-driven dispatch in
-        # `try_rewrite_proto_call` owns it; second-guessing via the
-        # return head would misroute a no-impl receiver (e.g. `Bare`
-        # with no `impl Show`) onto an unrelated impl whose head happens
-        # to equal the concrete return head (`String`).
-        else if not proto_op_self_only_in_return(params, ret_te,
-                       proto_shape_carriers_at(reg.tparams, pkey)) {
-          try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
-        } else {
-          match self_head_in_ret(ret_te, ret_ty) {
-            None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
-                                               opname, ret_ty)
-            Some(self_head) ->
-              match find_impl_by_recv(impl_pool(reg, pkey, self_head), pkey, opname, self_head) {
-                Some(p) -> {
-                  let new_callee = pimpl_ref(p, callee)
-                  Some(ECall(new_callee, args_))
-                }
-                None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
-                                                   opname, ret_ty)
-              }
-          }
-        }
-    }
+                               opname: String, ret_ty: Ty) : Option[ExprKind] = match cands {
+  [] -> None
+  [po, ...rest] -> match ret_candidate_impl(po, args_, reg, cm, opname, ret_ty) {
+    Some(p) -> Some(ECall(pimpl_ref(p, callee), args_))
+    None    -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
   }
+}
+
+# The impl `po` dispatches the call to through its return type, if it is
+# a candidate at all. Its arity must be the call's (an arity-ambiguous
+# name reaches both protocols' ops) and its protocol visible from the
+# calling module. Only an op whose Self is informed solely by the return
+# position is dispatched here: when Self also appears in a parameter,
+# argument-driven dispatch owns it, and second-guessing through the
+# return head would route a receiver with no impl onto an unrelated one
+# whose head happens to equal the concrete return head.
+fn ret_candidate_impl(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg, cm: Option[String], opname: String,
+                      ret_ty: Ty) : Option[ProtoImplReg] = match po {
+  POR(pkey, _, params, ret_te, _, _, pmo, _) ->
+    if list_length(params) != list_length(args_) { None }
+    else if not proto_visible_from(reg.origins, pkey, pmo, cm) { None }
+    else if not proto_op_self_only_in_return(params, ret_te, proto_shape_carriers_at(reg.tparams, pkey)) { None }
+    else {
+      match self_head_in_ret(ret_te, ret_ty) {
+        None            -> None
+        Some(self_head) -> find_impl_by_recv(impl_pool(reg, pkey, self_head), pkey, opname, self_head)
+      }
+    }
 }
 
 #[doc("""
@@ -509,56 +491,51 @@ fn proto_serves(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg,
 # protocol's own tparam list — a contested name must not read a
 # homonym's.
 fn find_proto_impl_for_args(reg: ProtocolReg, pkey: SymId, opname: String,
-                             args_: [Expr]) : Option[ProtoImplReg] {
+                             args_: [Expr]) : Option[ProtoImplReg] =
   # A `Shape`-carrier protocol dispatches single, on the container arg;
   # its ops carry ordinary function parameters (`map(xs, f)`) whose types
-  # have no dispatch head. Read the head from the first container-typed
-  # argument and ignore the rest, so a function arg does not veto the
-  # lookup the way `args_disp_heads` (all-or-nothing) would.
+  # have no dispatch head. The head is read from the first
+  # container-typed argument and the rest ignored, so a function arg
+  # does not veto the lookup the way the all-or-nothing heads would.
   if proto_is_shape_carrier_at(reg.tparams, pkey) {
     match first_container_head(args_) {
-      None -> None
+      None    -> None
       Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
     }
   } else {
-  match args_disp_heads(args_) {
-    None -> None
-    Some(ns) -> match ns {
-      [] -> None
-      [a] -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
-      [a, b] -> {
-        # A `Shape` carrier is the single dispatch container, NOT a
-        # heterogeneous proto-arg — its ops (`map(xs, f)`) take an
-        # ordinary function as the second parameter, so dispatch stays
-        # single on the container `a`.
-        let proto_takes_args = proto_has_tparams_at(reg.tparams, pkey) and
-                               not proto_is_shape_carrier_at(reg.tparams, pkey)
-        if not proto_takes_args {
-          # Single-dispatch op whose second parameter is part of the
-          # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
-          # homogeneous (recv=a) lookup applies; the second arg is
-          # not a proto-arg.
-          find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
-        } else {
-          # Pass 1a: heterogeneous (recv=a, proto_args=[b]) — covers
-          #          `impl Add[Real] for Complex` for Complex + Real.
-          # Pass 1b: homogeneous (recv=a) — covers `impl Add for
-          #          Complex` for Complex + Complex.
-          match find_impl_with_args(impl_pool(reg, pkey, a), pkey, opname, a, [b]) {
-            Some(hit) -> Some(hit)
-            None -> {
-              match find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a) {
-                Some(hit) ->
-                  if dh_same(a, b) { Some(hit) }
-                  else { find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a]) }
-                None -> find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a])
-              }
-            }
-          }
-        }
-      }
-      [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
+    match args_disp_heads(args_) {
+      None             -> None
+      Some([])         -> None
+      Some([a, b])     -> find_impl_for_pair(reg, pkey, opname, a, b)
+      Some([a, ..._r]) -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
     }
   }
+
+# A single-dispatch op whose second parameter is part of the op's shape
+# (`Numeric.pow_int(Self, Int)`) only has the homogeneous lookup on the
+# receiver. A protocol with its own parameters is tried heterogeneous
+# first (`impl Add[Real] for Complex` for Complex + Real), then
+# homogeneous (`impl Add for Complex` for Complex + Complex).
+fn find_impl_for_pair(reg: ProtocolReg, pkey: SymId, opname: String, a: DispHead,
+                      b: DispHead) : Option[ProtoImplReg] = {
+  let proto_takes_args = proto_has_tparams_at(reg.tparams, pkey) and
+                         not proto_is_shape_carrier_at(reg.tparams, pkey)
+  if not proto_takes_args { find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a) }
+  else {
+    match find_impl_with_args(impl_pool(reg, pkey, a), pkey, opname, a, [b]) {
+      Some(hit) -> Some(hit)
+      None      -> find_impl_mirrored(reg, pkey, opname, a, b)
+    }
   }
 }
+
+# The homogeneous impl on `a` serves the pair only when both heads are
+# the same; otherwise the pair is served from `b`'s side.
+fn find_impl_mirrored(reg: ProtocolReg, pkey: SymId, opname: String, a: DispHead,
+                      b: DispHead) : Option[ProtoImplReg] =
+  match find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a) {
+    Some(hit) ->
+      if dh_same(a, b) { Some(hit) }
+      else { find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a]) }
+    None -> find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a])
+  }
