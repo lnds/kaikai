@@ -40,7 +40,7 @@ clean() {
 }
 
 for f in seq_sieve seq_shared_once seq_pipes seq_defer_root_lambda seq_region_border seq_trap_in_fiber \
-         seq_const_fibs seq_const_shared seq_const_per_fiber seq_filter_stages; do
+         seq_const_fibs seq_const_shared seq_const_per_fiber seq_filter_stages seq_deep_in_fiber; do
   build "$f"
   run "$exe" > "$exe.out" 2> "$exe.err" || { cat "$exe.err"; fail "$f exited non-zero"; }
   clean "$exe.err" "$f"
