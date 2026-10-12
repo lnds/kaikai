@@ -7,6 +7,9 @@
 #    each built cold in its own cache, produce the same core object.
 # 2. A warm build of each prunes the core and still prints its golden,
 #    including core generics instantiated at the program's own types.
+# 3. Run as a user runs it, a build of a second program finds the core
+#    object the first left: it writes nothing to the cache, so it builds
+#    against a read-only one.
 
 set -eu
 KAI="$1"
@@ -15,7 +18,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 A="$ROOT/examples/effects/handler_wide_frames"
 B="$ROOT/examples/stdlib/core_hit_mono"
 
-rm -rf "$WORK"; mkdir -p "$WORK/a" "$WORK/b"
+[ -d "$WORK" ] && chmod -R u+w "$WORK"
+rm -rf "$WORK"; mkdir -p "$WORK/a" "$WORK/b" "$WORK/c"
 
 # Every run compiles: a memoised binary would skip the warm build the gate checks.
 run() { # cache-dir program out
@@ -43,4 +47,20 @@ for p in A B; do
 done
 grep -l "native-core-index: conflict" "$WORK"/*.err > /dev/null 2>&1 && {
   echo "ncore-prekey: FAIL — a pre-key recorded two core objects"; exit 1; }
-echo "ncore-prekey OK — one core object for both programs; warm builds prune and match their goldens"
+
+build() { # program out
+  KAI_CORE_CACHE_DIR="$WORK/c" "$KAI" build "$1.kai" -o "$2" > "$2.out" 2> "$2.err"
+}
+build "$A" "$WORK/c-first" || {
+  echo "ncore-prekey: FAIL — the build that fills the cache failed"; cat "$WORK/c-first.err"; exit 1; }
+chmod -R a-w "$WORK/c"
+rc=0; build "$B" "$WORK/c-second" || rc=$?
+chmod -R u+w "$WORK/c"
+[ "$rc" = 0 ] && [ ! -s "$WORK/c-second.err" ] || {
+  echo "ncore-prekey: FAIL — a second program does not build against a read-only cache (exit $rc)"
+  cat "$WORK/c-second.err"; exit 1; }
+"$WORK/c-second" > "$WORK/c-second.run" 2>&1
+cmp -s "$B.out.expected" "$WORK/c-second.run" || {
+  echo "ncore-prekey: FAIL — the build against a read-only cache diverges from its golden"
+  diff "$B.out.expected" "$WORK/c-second.run" | head -20; exit 1; }
+echo "ncore-prekey OK — one core object for both programs; warm builds prune and match their goldens; a read-only cache builds"
