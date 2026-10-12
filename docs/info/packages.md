@@ -192,9 +192,8 @@ through a `pub` signature.
 
 The Hanga Roa "core" set is loaded automatically — no import
 needed for: Stdin/Stdout/Stderr, File, Env, Console, Option, Result,
-List ops, Array, String, Char, Int/Real basics, protocols, complex,
-and the type `Decimal` (the carrier of decimal literals).
-Everything else (decimal's functions, money, math/int, regexp,
+List ops, Array, String, Char, Int/Real basics, protocols, complex.
+Everything else (decimal, money, math/int, math/bigint, regexp,
 collections/*, encoding/*, crypto/*, random, fx, uuid, path) is
 opt-in via `import <name>`.
 

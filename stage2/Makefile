@@ -5251,6 +5251,7 @@ test-sugars-fixture-%: $(TARGET) build core-cache-warm
 	  shape_kind_*) extra_flags="--path ../stdlib" ;; \
 	  kinds_dim_*) extra_flags="--path ../stdlib" ;; \
 	  kinds_module_lit_carrier) extra_flags="--path ../stdlib" ;; \
+	  kinds_over_domain|m12_5_uom_record_field) extra_flags="--path ../stdlib" ;; \
 	  *) extra_flags="" ;; \
 	esac; \
 	if [ -f $$exp_err ]; then \
