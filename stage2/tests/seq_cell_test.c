@@ -1,9 +1,11 @@
 /* The lazy cell's states, driven from C: a shared cell runs its thunk
  * once and keeps the step, an unshared one is freed before its thunk
  * runs, an exit past a running cell gives it its thunk back, and a cell
- * read by its own thunk panics.
+ * read by its own thunk panics. A constant of a lazy type is built once
+ * per fiber, and an exit past its initialiser leaves it unbuilt.
  *
- * `seq_cell_test self` runs the last case alone: it ends the process.
+ * `seq_cell_test self` runs the self-reading cell alone: it ends the
+ * process.
  */
 
 #include "runtime.h"
@@ -80,6 +82,47 @@ static void exit_restores_the_thunk(void) {
     check("the next read runs the thunk again", runs == 2 && kai_intf(a) == 7);
 }
 
+static KaiValue *build(KaiValue *self, KaiValue **args, int n) {
+    (void) self; (void) args; (void) n;
+    runs++;
+    if (bail) longjmp(out, 1);
+    return cell();
+}
+
+static KaiValue *constant(void) {
+    return kai_seq_once(kai_closure(build, 0, 0, NULL));
+}
+
+static void constant_is_built_once(void) {
+    runs = 0;
+    KaiValue *a = constant();
+    KaiValue *b = constant();
+    check("two reads of a constant build it once", runs == 1 && a == b);
+    kai_decref(a);
+    kai_decref(b);
+    kai_fiber_consts_drop(kai_current_fiber());
+}
+
+static void exit_leaves_the_constant_unbuilt(void) {
+    runs = 0;
+    bail = 1;
+    KaiFiber *f = kai_current_fiber();
+    uint32_t mark = f->unw_top;
+    if (setjmp(out) == 0) {
+        constant();
+        check("the initialiser left through the jump", 0);
+    } else {
+        kai_unw_release_to(f, mark);
+    }
+    check("a constant left while it is built is unbuilt again", f->const_n == 0);
+    bail = 0;
+    KaiValue *a = constant();
+    check("the next read builds it", runs == 2 && f->const_n == 1);
+    kai_decref(a);
+    kai_fiber_consts_drop(f);
+    check("a fiber's constants go when it ends", f->const_n == 0 && f->consts == NULL);
+}
+
 static void depends_on_itself(void) {
     KaiValue *s = kai_seq_defer(kai_unit());
     s->as.seq.slot = kai_closure(reads_itself, 0, 1, &s);
@@ -94,5 +137,7 @@ int main(int argc, char **argv) {
     shared_runs_once();
     unshared_is_freed_first();
     exit_restores_the_thunk();
+    constant_is_built_once();
+    exit_leaves_the_constant_unbuilt();
     return failed;
 }

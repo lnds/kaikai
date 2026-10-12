@@ -428,7 +428,8 @@ every later read returns the same `SeqStep[t] = SeqEnd | SeqCons(t,
 Seq[t])`, so a sequence bound to a name and read twice is computed
 once. A function a stage keeps must be pure; the sinks may perform
 effects. A `Seq` stays on the fiber that made it. Unlike a `Gen` it is
-shared, and unlike a `Stream` it is not rerun.
+shared, and unlike a `Stream` it is not rerun. A `const` whose type
+holds a `Seq` is evaluated once per fiber *(shipped via PR #2731)*.
 
 - cell: `defer`, `delay`, `force` *(shipped)*
 - sources: `from`, `from_step`, `range` *(shipped)*
