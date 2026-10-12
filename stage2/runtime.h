@@ -349,7 +349,8 @@ typedef enum {
 
 /* The state of a KAI_SEQ, kept in `variant_tag`: its slot is the thunk
  * that computes the step, that thunk while it runs, or the step. */
-enum { KAI_SEQ_THUNK = 0, KAI_SEQ_RUNNING = 1, KAI_SEQ_DONE = 2 };
+enum { KAI_SEQ_THUNK = 0, KAI_SEQ_RUNNING = 1, KAI_SEQ_DONE = 2,
+       KAI_SEQ_FILTER = 3, KAI_SEQ_FILTERING = 4 };
 
 /* Head-type tags — single-dispatch protocol dispatch key.
  * See docs/variant-tags.md "Head-type tags — protocol dispatch key".
@@ -759,7 +760,7 @@ struct KaiValue {
         /* KAI_CONT: the suspended segment, NULL once resumed or discontinued. */
         KaiSegment *seg;
         /* KAI_SEQ: the thunk or the step, by the state in `variant_tag`. */
-        struct { KaiValue *slot; } seq;
+        struct { KaiValue *slot; KaiValue *pred; } seq;
     } as;
     /* Variant slots overlap the union `as` (a variant uses none of the
      * union's named members), so a node is `8 B header + n*8 slots` = 48 B
@@ -5062,6 +5063,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             break;
         case KAI_SEQ:
             kai_drop_child(v->as.seq.slot, depth, st);
+            kai_drop_child(v->as.seq.pred, depth, st);
             break;
         case KAI_BYTE:
             /* Unreachable: every Byte is an immortal kai_byte_cache cell. */
@@ -6349,7 +6351,9 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             if (mode != KAI_COPY_REGION) kai_trap_abort("a sequence cannot leave its fiber");
             KaiValue *c = kai_alloc(KAI_SEQ);
             c->as.seq.slot = kai_deep_copy(v->as.seq.slot, mode);
-            c->variant_tag = v->variant_tag == KAI_SEQ_DONE ? KAI_SEQ_DONE : KAI_SEQ_THUNK;
+            if (v->as.seq.pred != NULL) c->as.seq.pred = kai_deep_copy(v->as.seq.pred, mode);
+            c->variant_tag = v->variant_tag == KAI_SEQ_DONE ? KAI_SEQ_DONE
+                           : v->variant_tag >= KAI_SEQ_FILTER ? KAI_SEQ_FILTER : KAI_SEQ_THUNK;
             return c;
         }
 
@@ -9016,7 +9020,7 @@ static KaiValue *kai_seq_defer(KaiValue *thunk) {
 /* An exit past a running cell: the cell holds its thunk again, and the
  * reference of the frame that was evaluating it goes. */
 static void kai_seq_abandon(KaiValue *s) {
-    s->variant_tag = KAI_SEQ_THUNK;
+    s->variant_tag = s->variant_tag == KAI_SEQ_FILTERING ? KAI_SEQ_FILTER : KAI_SEQ_THUNK;
     kai_decref(s);
 }
 
@@ -9061,10 +9065,168 @@ static KaiValue *kai_seq_run(KaiValue *s) {
     return kai_seq_take(s);
 }
 
+static KaiValue *kai_seq_filter_run(KaiValue *c);
+
 /* Read a cell: its step, computed at most once; consumes `s`. */
 static KaiValue *kai_seq_force(KaiValue *s) {
     if (s->variant_tag == KAI_SEQ_DONE) return kai_seq_take(s);
+    if (s->variant_tag >= KAI_SEQ_FILTER) return kai_seq_filter_run(s);
     return kai_seq_run(s);
+}
+
+/* A filter stage: the cell holds its source and its predicate where
+ * another holds a thunk. Consumes both. */
+static KaiValue *kai_seq_filter(KaiValue *s, KaiValue *p) {
+    KaiValue *c = kai_alloc(KAI_SEQ);
+    c->as.seq.slot = s;
+    c->as.seq.pred = p;
+    c->variant_tag = KAI_SEQ_FILTER;
+    return c;
+}
+
+/* The predicates of a filter stage: one closure, or an array of them in
+ * the order they apply once stages have merged. */
+static inline int64_t kai_seq_preds_n(KaiValue *ps) {
+    return ps->tag == KAI_ARRAY ? ps->as.arr.len : 1;
+}
+
+static inline KaiValue **kai_seq_preds_at(KaiValue **ps) {
+    return (*ps)->tag == KAI_ARRAY ? (*ps)->as.arr.items : ps;
+}
+
+/* `first` then `then` as one list with room for `want`; consumes both. */
+static KaiValue *kai_seq_preds_join(KaiValue *first, KaiValue *then, int64_t want) {
+    int64_t nf = kai_seq_preds_n(first), nt = kai_seq_preds_n(then);
+    int64_t room = (nf + nt) * 2 > want ? (nf + nt) * 2 : want;
+    KaiValue *out = first;
+    if (first->tag != KAI_ARRAY || !kai_check_unique(first)) {
+        out = kai_alloc(KAI_ARRAY);
+        out->as.arr.cap = room;
+        out->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) room * sizeof(KaiValue *));
+        KaiValue **from = kai_seq_preds_at(&first);
+        for (int64_t i = 0; i < nf; i++) out->as.arr.items[i] = kai_incref(from[i]);
+        out->as.arr.len = nf;
+        kai_decref(first);
+    } else if (nf + nt > out->as.arr.cap) {
+        out->as.arr.items = (KaiValue **) kai_heap_realloc(out->as.arr.items,
+            (size_t) out->as.arr.cap * sizeof(KaiValue *), (size_t) room * sizeof(KaiValue *));
+        out->as.arr.cap = room;
+    }
+    KaiValue **from = kai_seq_preds_at(&then);
+    for (int64_t i = 0; i < nt; i++) out->as.arr.items[nf + i] = kai_incref(from[i]);
+    out->as.arr.len = nf + nt;
+    kai_decref(then);
+    return out;
+}
+
+/* The filter stages under `own` that nobody else reads become part of
+ * it: `own` takes the source of the lowest and applies their predicates
+ * first, lowest first. A chain of stages is then one stage, read in a
+ * loop instead of one frame per stage. The chain is walked down with its
+ * links reversed and back up along them, so its length costs no stack. */
+static KaiValue *kai_seq_filter_absorb(KaiValue *own, KaiValue *s) {
+    KaiValue *below = NULL;
+    int64_t n = kai_seq_preds_n(own->as.seq.pred);
+    while (s->variant_tag == KAI_SEQ_FILTER && s->as.seq.slot != NULL && kai_check_unique(s)) {
+        KaiValue *next = s->as.seq.slot;
+        n += kai_seq_preds_n(s->as.seq.pred);
+        s->as.seq.slot = below;
+        below = s;
+        s = next;
+    }
+    KaiValue *preds = NULL;
+    while (below != NULL) {
+        KaiValue *up = below->as.seq.slot;
+        preds = preds == NULL ? below->as.seq.pred : kai_seq_preds_join(preds, below->as.seq.pred, n);
+        below->as.seq.slot = NULL;
+        below->as.seq.pred = NULL;
+        kai_decref(below);
+        below = up;
+    }
+    if (preds != NULL) own->as.seq.pred = kai_seq_preds_join(preds, own->as.seq.pred, n);
+    return s;
+}
+
+/* The first step of `s` whose head satisfies every predicate, with the
+ * rest filtered in turn; consumes `s`, borrows the predicates. `own` is
+ * the stage being read when the reader holds its only reference: it
+ * becomes the stage over the rest, and an unshared step is rewritten in
+ * place, so a read then allocates nothing. */
+static KaiValue *kai_seq_filter_step(KaiValue *s, KaiValue **preds, KaiValue *own) {
+    KaiValue *held[2] = { own, NULL };
+    KaiFiber *uf = kai_unw_push(held, 2);
+    for (;;) {
+        if (own != NULL) s = kai_seq_filter_absorb(own, s);
+        KaiValue *step = kai_seq_force(s);
+        if (step->var_n_args == 0) {
+            kai_unw_pop(uf);
+            if (own != NULL) kai_decref(own);
+            return step;
+        }
+        held[1] = step;
+        uint32_t mask = kai_slot_mask_of(step->variant_tag);
+        int boxed = mask == 0 || kai_var_slot_kind(mask, 0) == KAI_VAR_SLOT_PTR;
+        int64_t n = kai_seq_preds_n(*preds);
+        KaiValue **ps = kai_seq_preds_at(preds);
+        int keep = 1;
+        for (int64_t i = 0; i < n && keep; i++) {
+            KaiValue *x = boxed ? kai_incref(kai_var_slots(step)[0].ptr) : kai_variant_slot_box(step, 0);
+            keep = kai_apply_borrow(ps[i], 1, &x) == &kai_singleton_true;
+        }
+        held[1] = NULL;
+        KaiValue *xs = kai_var_slots(step)[1].ptr;
+        if (!keep) {
+            s = kai_incref(xs);
+            kai_decref(step);
+            continue;
+        }
+        kai_unw_pop(uf);
+        int unique = kai_check_unique(step);
+        if (!unique) kai_incref(xs);
+        KaiValue *rest;
+        if (own != NULL) { own->as.seq.slot = xs; rest = own; }
+        else rest = kai_seq_filter(xs, kai_incref(*preds));
+        if (unique) {
+            kai_var_slots(step)[1].ptr = rest;
+            return step;
+        }
+        KaiValue *cons = kai_alloc_var(2);
+        cons->variant_tag = step->variant_tag;
+        cons->var_n_args = 2;
+        kai_var_slots(cons)[0] = kai_var_slots(step)[0];
+        if (boxed) kai_incref(kai_var_slots(cons)[0].ptr);
+        kai_var_slots(cons)[1].ptr = rest;
+        kai_decref(step);
+        return cons;
+    }
+}
+
+/* Read a filter stage; consumes `c`. The source leaves the stage while
+ * it is read, so the stages below stay unshared; an exit past the read
+ * leaves a shared stage without one, and reading it again panics. */
+__attribute__((noinline))
+static KaiValue *kai_seq_filter_run(KaiValue *c) {
+    if (c->variant_tag == KAI_SEQ_FILTERING) {
+        kai_decref(c);
+        return kai_core_panic(kai_str("sequence depends on itself"));
+    }
+    KaiValue *s = c->as.seq.slot;
+    if (s == NULL) {
+        kai_decref(c);
+        return kai_core_panic(kai_str("sequence read again after a read that did not finish"));
+    }
+    c->as.seq.slot = NULL;
+    if (kai_check_unique(c)) return kai_seq_filter_step(s, &c->as.seq.pred, c);
+    c->variant_tag = KAI_SEQ_FILTERING;
+    KaiFiber *uf = kai_unw_push((KaiValue **) c, KAI_UNW_SEQ);
+    KaiValue *step = kai_seq_filter_step(s, &c->as.seq.pred, NULL);
+    kai_unw_pop(uf);
+    KaiValue *p = c->as.seq.pred;
+    c->as.seq.slot = step;
+    c->as.seq.pred = NULL;
+    c->variant_tag = KAI_SEQ_DONE;
+    kai_decref(p);
+    return kai_seq_take(c);
 }
 
 /* ---------- constants of a lazy type ---------- */
