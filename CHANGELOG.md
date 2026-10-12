@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.146.0 (2026-10-12)
+
+### Added
+
+- **typer**: a lazy range walks Chars as well as Ints (#2745)
+
+### Fixed
+
+- **kai**: a build finds the cached core object again, so it builds against a read-only cache (#2749)
+- **runtime**: the variant name and slot-mask table spans the tag space and never grows (#2735)
+
 ## v0.145.0 (2026-10-12)
 
 ### Added
