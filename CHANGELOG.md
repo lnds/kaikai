@@ -84,6 +84,22 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.143.0 (2026-10-12)
+
+### Added
+
+- **typer**: a range walks Chars as well as Ints (#2722)
+
+### Fixed
+
+- **kai**: a package whose entry sits in a subdirectory resolves its modules for its tests too (#2724)
+- **kai**: a damaged memo entry is replaced by the next build (#2720)
+
+### Changed
+
+- **compiler**: split driver.kai into 14 modules (#2721)
+- **kai**: a warm kai run asks the compiler nothing and reads no core source or runtime header (#2720)
+
 ## v0.142.0 (2026-10-12)
 
 ### BREAKING CHANGE
