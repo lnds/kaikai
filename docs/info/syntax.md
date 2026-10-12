@@ -798,7 +798,9 @@ compile-time error. Byte arithmetic (`+ - * / %`) wraps at 8 bits
 divisor; Byte literals also match as patterns (`match b { 0u8 -> … }`).
 The `d` suffix writes a `Decimal` (`19.99d`, `42d`),
 folding the exact `{ raw, scale }` from the source digits; past the
-`Int128` carrier it errors, pointing at `DecimalBig`.
+`Int128` carrier it errors, pointing at `DecimalBig`. `Decimal` is a
+stdlib type, so a file that writes it — by suffix or by name — has
+`import decimal` (under any name: `import decimal as dec` works).
 
 ### Context-driven minting
 
@@ -823,7 +825,8 @@ another type at such a call, annotate or use a suffix (`f(5u8)`).
 
 `BigInt` (`stdlib/math/bigint.kai`) is an arbitrary-precision signed
 integer — pure kaikai, no external dependency. It is an opt-in stdlib
-type, so reach for it with `import math.bigint`. The `n` literal suffix
+type, so reach for it with `import math.bigint`; the `n` suffix needs
+that import too, under any name. The `n` literal suffix
 builds a `BigInt` from the digits directly: `99n` is `99`, and the
 suffix folds the digit string exactly, so literals of any magnitude
 work — `340282366920938463463374607431768211456n` is the exact value,

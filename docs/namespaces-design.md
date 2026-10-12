@@ -58,11 +58,10 @@ that file only, and the core declaration stays reachable qualified
 names follow the same ladder as every other class, so a bare `Log` means
 the same declaration in a row, a `handle` head and a perform.
 
-One core module is closed. `decimal` is loaded for every program because
-its `Decimal` carries decimal literals, and it puts that one name on the
-core rung: a file reads the type bare, and reaches the module's functions
-by importing it or through the `decimal.` qualifier. A type the file
-declares or imports under that name outranks it like any core name.
+A literal suffix that writes a stdlib type does not make that type a core
+name. `19.99d` is a `Decimal` and `99n` a `BigInt`; the file that writes
+either imports the module (`decimal`, `math.bigint`) in any form, and one
+that does not is told which import to add.
 
 Inside the core rung alone, order is part of the language. The core set
 is a fixed, ordered list of modules, and a later one may restate a
