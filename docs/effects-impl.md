@@ -2225,6 +2225,11 @@ the entries above each skipped node's mark before running that node's
 `finally` cleanup, so the releases interleave innermost-first with the
 cleanups. A cancellation or a trap-exit bypass releases the whole stack.
 
+An entry with a negative `n` names what `base` is instead of a run of
+slots: a handle's node, whose pending resume frames are dropped, or a
+lazy cell (`Seq`) whose thunk was running, which goes back to holding
+that thunk and loses the reference of the frame that was evaluating it.
+
 The analysis lives in `stage2/compiler/unwind_*.kai`, shared by both
 emitters:
 

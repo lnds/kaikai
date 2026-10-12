@@ -339,10 +339,17 @@ typedef enum {
                        * time via kai_seq_norm; a KAI_RANGE must never reach
                        * an `as.cons` access un-normalised. No interior
                        * pointers: dup/drop are plain. */
-    KAI_CONT          /* A one-shot continuation: names a suspended stack
+    KAI_CONT,         /* A one-shot continuation: names a suspended stack
                        * segment until a resume or discontinue empties it.
                        * Dropping a full box discontinues the segment. */
+    KAI_SEQ           /* Seq[t]: a lazy cell. One slot holding the thunk that
+                       * computes its step, then the step; `variant_tag`
+                       * says which. Never leaves the fiber that made it. */
 } KaiTag;
+
+/* The state of a KAI_SEQ, kept in `variant_tag`: its slot is the thunk
+ * that computes the step, that thunk while it runs, or the step. */
+enum { KAI_SEQ_THUNK = 0, KAI_SEQ_RUNNING = 1, KAI_SEQ_DONE = 2 };
 
 /* Head-type tags — single-dispatch protocol dispatch key.
  * See docs/variant-tags.md "Head-type tags — protocol dispatch key".
@@ -751,6 +758,8 @@ struct KaiValue {
         void *foreign_ptr;
         /* KAI_CONT: the suspended segment, NULL once resumed or discontinued. */
         KaiSegment *seg;
+        /* KAI_SEQ: the thunk or the step, by the state in `variant_tag`. */
+        struct { KaiValue *slot; } seq;
     } as;
     /* Variant slots overlap the union `as` (a variant uses none of the
      * union's named members), so a node is `8 B header + n*8 slots` = 48 B
@@ -905,6 +914,7 @@ KAI_RT_SHARED_INLINE int32_t kai_head_tag(KaiValue *v) {
         case KAI_PID:     return KAI_HEAD_PID;
         case KAI_FOREIGN: return KAI_HEAD_ANON;  /* opaque handle is not protocol-dispatchable (#417) */
         case KAI_CONT:    return KAI_HEAD_ANON;
+        case KAI_SEQ:     return KAI_HEAD_ANON;
         case KAI_BYTE:    return KAI_HEAD_BYTE;
         /* Fixed-width integers dispatch protocols at compile time (the
          * typer resolves Show/Eq/Ord against the static type), so the
@@ -1276,6 +1286,7 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_INT128:    return "Int128";
         case KAI_RANGE:     return "range";
         case KAI_CONT:      return "continuation";
+        case KAI_SEQ:       return "seq";
         default:          return "?";
     }
 }
@@ -3136,8 +3147,12 @@ typedef enum {
 
 typedef struct KaiFiber   KaiFiber;
 /* `n` consecutive slots a frame owns across a call that can unwind; a
- * non-local exit that skips the frame releases each non-NULL slot. */
+ * non-local exit that skips the frame releases each non-NULL slot. A
+ * negative `n` names what `base` is instead: a handle's node, or a lazy
+ * cell whose thunk is running. */
 typedef struct { KaiValue **base; intptr_t n; } KaiUnwEntry;
+#define KAI_UNW_HANDLE (-1)
+#define KAI_UNW_SEQ    (-2)
 /* What an op clause runs after a non-tail `resume`, waiting for the exit
  * of the handle whose node it names. */
 typedef struct { KaiEvidence *node; KaiValue *clo; } KaiResumeFrame;
@@ -5057,6 +5072,9 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
         case KAI_CONT:
             kai_seg_cont_drop(v);
             break;
+        case KAI_SEQ:
+            kai_drop_child(v->as.seq.slot, depth, st);
+            break;
         case KAI_BYTE:
             /* Unreachable: every Byte is an immortal kai_byte_cache cell. */
             break;
@@ -6363,6 +6381,17 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             if (mode == KAI_COPY_REGION) return kai_incref(v);
             kai_trap_abort("a continuation cannot leave its fiber");
             return v;
+
+        /* A lazy cell is written in place by the fiber that reads it. The
+         * region border copies it, since the step it holds may sit in the
+         * arena; a cell caught running leaves as its thunk. */
+        case KAI_SEQ: {
+            if (mode != KAI_COPY_REGION) kai_trap_abort("a sequence cannot leave its fiber");
+            KaiValue *c = kai_alloc(KAI_SEQ);
+            c->as.seq.slot = kai_deep_copy(v->as.seq.slot, mode);
+            c->variant_tag = v->variant_tag == KAI_SEQ_DONE ? KAI_SEQ_DONE : KAI_SEQ_THUNK;
+            return c;
+        }
 
         /* A Ref is one mutable cell. The region border shares it — the block
          * must hand back the cell it wrote through. The thread border copies
@@ -7972,6 +8001,7 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
         case KAI_FOREIGN: return a->as.foreign_ptr == b->as.foreign_ptr; /* identity (#417) */
         case KAI_CONT:    return a == b;
+        case KAI_SEQ:     return a == b;
         case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
         case KAI_INT32:     return a->as.i32 == b->as.i32;
         case KAI_UINT32:    return a->as.u32 == b->as.u32;
@@ -8114,6 +8144,7 @@ KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v) {
         case KAI_PID:     return kai_str("<pid>");
         case KAI_FOREIGN: return kai_str("<foreign>");
         case KAI_CONT:    return kai_str("<continuation>");
+        case KAI_SEQ:     return kai_str("<seq>");
         case KAI_BYTE:                                       /* Lane 4 (#473) */
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
             return kai_str_dyn(buf);
@@ -9013,6 +9044,68 @@ static KaiValue *kai_core_list_reverse(KaiValue *xs) {
  * on holds NULL. */
 static inline KaiFiber *kai_unw_push(KaiValue **base, intptr_t n);
 static inline void kai_unw_pop(KaiFiber *f);
+
+/* ---------- Seq: the lazy cell ---------- */
+
+static KaiValue *kai_seq_defer(KaiValue *thunk) {
+    KaiValue *s = kai_alloc(KAI_SEQ);
+    s->as.seq.slot = thunk;
+    return s;
+}
+
+/* An exit past a running cell: the cell holds its thunk again, and the
+ * reference of the frame that was evaluating it goes. */
+static void kai_seq_abandon(KaiValue *s) {
+    s->variant_tag = KAI_SEQ_THUNK;
+    kai_decref(s);
+}
+
+/* The step of an evaluated cell; consumes `s`. */
+static inline KaiValue *kai_seq_take(KaiValue *s) {
+    KaiValue *step = s->as.seq.slot;
+    if (kai_check_unique(s)) s->as.seq.slot = NULL;
+    else kai_incref(step);
+    kai_decref(s);
+    return step;
+}
+
+/* Run the thunk of `s`. An unshared cell has no other reader, so it is
+ * freed before the thunk runs and the step is never written. A shared one
+ * is marked while it runs and then holds the step in place of the thunk;
+ * the thunk is released only after, since dropping it can run a `finally`
+ * that reads the cell. */
+__attribute__((noinline))
+static KaiValue *kai_seq_run(KaiValue *s) {
+    if (s->variant_tag == KAI_SEQ_RUNNING) {
+        kai_decref(s);
+        return kai_core_panic(kai_str("sequence depends on itself"));
+    }
+    KaiValue *thunk = s->as.seq.slot;
+    if (kai_check_unique(s)) {
+        s->as.seq.slot = NULL;
+        kai_decref(s);
+        KaiValue *held[1] = { thunk };
+        KaiFiber *uf = kai_unw_push(held, 1);
+        KaiValue *step = kai_apply_borrow(thunk, 0, NULL);
+        kai_unw_pop(uf);
+        kai_decref(thunk);
+        return step;
+    }
+    s->variant_tag = KAI_SEQ_RUNNING;
+    KaiFiber *uf = kai_unw_push((KaiValue **) s, KAI_UNW_SEQ);
+    KaiValue *step = kai_apply_borrow(thunk, 0, NULL);
+    kai_unw_pop(uf);
+    s->as.seq.slot = step;
+    s->variant_tag = KAI_SEQ_DONE;
+    kai_decref(thunk);
+    return kai_seq_take(s);
+}
+
+/* Read a cell: its step, computed at most once; consumes `s`. */
+static KaiValue *kai_seq_force(KaiValue *s) {
+    if (s->variant_tag == KAI_SEQ_DONE) return kai_seq_take(s);
+    return kai_seq_run(s);
+}
 
 static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
     KaiValue *held[3] = { xs, f, kai_nil() };
@@ -18971,12 +19064,14 @@ static inline void kai_unw_pop(KaiFiber *f) { f->unw_top--; }
 
 static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node);
 
-/* Release every slot above `mark`, innermost frame first. An entry with
- * `n < 0` is a handle draining its resume frames: `base` is its node. */
+/* Release every slot above `mark`, innermost frame first. A handle's
+ * entry drops the resume frames it was draining; a lazy cell's gives the
+ * cell its thunk back. */
 KAI_RT_SHARED void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
     while (f->unw_top > mark) {
         KaiUnwEntry e = f->unw_buf[--f->unw_top];
-        if (e.n < 0) kai_resume_frames_drop(f, (KaiEvidence *) e.base);
+        if (e.n == KAI_UNW_HANDLE) kai_resume_frames_drop(f, (KaiEvidence *) e.base);
+        else if (e.n == KAI_UNW_SEQ) kai_seq_abandon((KaiValue *) e.base);
         for (intptr_t i = 0; i < e.n; i++) {
             if (e.base[i] != NULL) kai_decref(e.base[i]);
         }
@@ -19281,7 +19376,7 @@ static int kai_resume_frames_pending(KaiFiber *f, KaiEvidence *node) {
 static KaiValue *kai_resume_frames_run(KaiEvidence *node, KaiValue *v) {
     KaiFiber *f = kai_current_fiber();
     if (!kai_resume_frames_pending(f, node)) return v;
-    KaiFiber *uf = kai_unw_push_on(f, (KaiValue **) node, -1);
+    KaiFiber *uf = kai_unw_push_on(f, (KaiValue **) node, KAI_UNW_HANDLE);
     for (;;) {
         /* Re-read: a frame may park and resume on another thread. */
         KaiValue *clo = kai_resume_frame_take(kai_current_fiber(), node);
