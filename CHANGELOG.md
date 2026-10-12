@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.142.0 (2026-10-12)
+
+### BREAKING CHANGE
+
+- `[from..to..step]` no longer parses. Write the first
+two elements instead: `[from, from + step..to]`.
+
+### Added
+
+- **parse**: a stepped range is written `[first, second..last]` (#2718)
+
+### Fixed
+
+- **typer**: a fused pipe over a stepped range honours the sign of its step (#2718)
+
+### Changed
+
+- **compiler**: a core function the program cannot name is emptied before the front end walks it (#2719)
+
 ## v0.141.0 (2026-10-12)
 
 ### BREAKING CHANGE
