@@ -154,7 +154,7 @@ closure VALUES, keeps the ordinary closure-calling combinator.
 ## NOT IN KAIKAI
 
 - `break` / `continue` statements.
-- C-style `for (init; cond; step)`. Use `[start..end..step] |> each(...)`.
+- C-style `for (init; cond; step)`. Use `[start, next..end] |> each(...)`.
 - `for x in xs { ... }`. No for-in loop. Use a pipe.
 - `do { ... } while (cond)`. Use `var x := ...; while { cond } { ... }`.
 - List comprehensions `[x*2 for x in xs]`. Use `xs | (x => x * 2)`.

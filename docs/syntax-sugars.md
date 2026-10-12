@@ -1133,8 +1133,11 @@ pure: `xs | f | g` lowers to `map(xs, x => g(f(x)))` — one result list,
 no intermediates. A `|`-chain into a terminal `foldl` fuses further, to a
 single accumulating loop that builds no list at all; and a range literal
 at the head (`[a..b] | f |> foldl(...)`) becomes a counting loop that
-never materialises the range. Fusion is invisible — it changes only time
-and allocation, never a value.
+never materialises the range. A stepped head (`[a, b..c]`) takes the
+counting loop when it walks upward: a positive literal step is known at
+compile time, any other step is tested where the range is built, and a
+range that descends is folded as the value it is. Fusion is invisible —
+it changes only time and allocation, never a value.
 
 Purity is the license: fusion reorders stage execution per element, which
 is observable only if a stage has effects. The typer reads each stage's
