@@ -10940,7 +10940,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
     TyCon(tsym, _) -> match rec_pick(r.st.recs, tsym) {
-      None -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
+      None -> field_non_record_or_partial_app(r.st, r.expr, applied, fnm, line, col)
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
         let st1 = st_unify(inst.st, inst.result_ty, r.ty, "record field access", line, col)
@@ -10974,7 +10974,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
       let st1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, res_id, line, col, false))
       mk_inferred(st1, fr.ty, field_root(r.expr, fnm, line, col, fr.ty))
     }
-    _ -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
+    _ -> field_non_record_or_partial_app(r.st, r.expr, applied, fnm, line, col)
   }
 }
 
@@ -11107,11 +11107,7 @@ fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
           }
         }
       }
-      None -> {
-        let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}", [])
-        render_diag(perr)
-        st_bump_err(st_push_diag(st, perr))
-      }
+      None -> field_absent_error(st, recv, fnm, line, col)
     }
     TyVarT(_) -> {
       let perr = mk_diag(SevError, st.file, line, col,
@@ -11120,13 +11116,20 @@ fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
       render_diag(perr)
       st_bump_err(st_push_diag(st, perr))
     }
-    _ -> {
-      let perr = mk_diag(SevError, st.file, line, col,
-        concat_all(["`.", fnm, "` is a field access on a non-record value"]), [])
-      render_diag(perr)
-      st_bump_err(st_push_diag(st, perr))
-    }
+    _ -> field_absent_error(st, recv, fnm, line, col)
   }
+}
+
+# A type that is not a record has no field to read: a nominal type is
+# named, any other is called what it is.
+fn field_absent_error(st: InferState, recv: Ty, fnm: String, line: Int, col: Int) : InferState / Console + File {
+  let msg = match recv {
+    TyCon(tsym, _) -> "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}"
+    _              -> "`.#{fnm}` is a field access on a non-record value"
+  }
+  let perr = mk_diag(SevError, st.file, line, col, msg, [])
+  render_diag(perr)
+  st_bump_err(st_push_diag(st, perr))
 }
 
 # When `EField(obj, fnm)` reaches `synth_field` with
@@ -11140,18 +11143,30 @@ fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
 # We still stamp TyAny so cascade is graceful and downstream emit
 # passes don't crash (they would otherwise emit `kai_op_field`,
 # which crashes at runtime).
-fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
+fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, recv: Ty, fnm: String,
                                      line: Int, col: Int) : Inferred / Console + File {
-
-
+  let root = field_root(obj_expr, fnm, line, col, TyAny)
   if ufcs_reaches(st, fnm) {
     let perr = mk_diag(SevError, st.file, line, col,
       concat_all(["`", fnm, "` is a function in scope, not a field. ",
                   "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
                   "not a bare `expr.", fnm, "`."]), [])
     render_diag(perr)
-    mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
-  } else { mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny)) }
+    mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root)
+  } else if field_less(st, recv) {
+    mk_inferred(field_absent_error(st, recv, fnm, line, col), TyAny, root)
+  } else { mk_inferred(st, TyAny, root) }
+}
+
+# Whether `recv` is a sum, which carries no field; a unit or a refinement
+# over one is the same value. Any other receiver is left to the generic
+# read, which is how a record under a unit and an `extern "C"` one get
+# their fields.
+fn field_less(st: InferState, recv: Ty) : Bool = match recv {
+  TyCon(tsym, _)      -> is_some(sum_find(st.sums, tsym)) or core_ty_is(tsym, CtOption) or core_ty_is(tsym, CtResult)
+  TyDimT(inner, _)    -> field_less(st, inner)
+  TyRefineT(inner, _) -> field_less(st, inner)
+  _                   -> false
 }
 
 # Whether a UFCS call could reach something under `ident`.
