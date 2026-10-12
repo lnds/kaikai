@@ -10,6 +10,8 @@
 # 3. Run as a user runs it, a build of a second program finds the core
 #    object the first left: it writes nothing to the cache, so it builds
 #    against a read-only one.
+# 4. So does a build the read-only cache holds no core object for: its
+#    core object goes beside the program and the cache gains nothing.
 
 set -eu
 KAI="$1"
@@ -63,4 +65,17 @@ chmod -R u+w "$WORK/c"
 cmp -s "$B.out.expected" "$WORK/c-second.run" || {
   echo "ncore-prekey: FAIL — the build against a read-only cache diverges from its golden"
   diff "$B.out.expected" "$WORK/c-second.run" | head -20; exit 1; }
+rm -f "$WORK"/c/*/ncore-*
+chmod -R a-w "$WORK/c"
+rc=0; build "$B" "$WORK/c-bare" || rc=$?
+chmod -R u+w "$WORK/c"
+[ "$rc" = 0 ] && [ ! -s "$WORK/c-bare.err" ] || {
+  echo "ncore-prekey: FAIL — a build does not get by without writing its core object to the cache (exit $rc)"
+  cat "$WORK/c-bare.err"; exit 1; }
+"$WORK/c-bare" > "$WORK/c-bare.run" 2>&1
+cmp -s "$B.out.expected" "$WORK/c-bare.run" || {
+  echo "ncore-prekey: FAIL — the build with its core object beside it diverges from its golden"
+  diff "$B.out.expected" "$WORK/c-bare.run" | head -20; exit 1; }
+[ -z "$(ls "$WORK"/c/*/ 2>/dev/null | grep '^ncore-')" ] || {
+  echo "ncore-prekey: FAIL — a read-only cache gained a core object"; exit 1; }
 echo "ncore-prekey OK — one core object for both programs; warm builds prune and match their goldens; a read-only cache builds"
