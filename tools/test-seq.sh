@@ -2,9 +2,9 @@
 # Usage: test-seq.sh c|native|asan
 #
 # The lazy sequence fixtures (examples/perceus/seq_*.kai) on one backend:
-# each prints its golden, and the ones that read past the end or define a
-# constant through its own value panic with their message after printing
-# what came before. `c` also drives
+# each prints its golden, and the ones that read past the end, define a
+# constant through its own value or read a cell from its own thunk panic
+# with their message after printing what came before. `c` also drives
 # the cell's states from C (stage2/tests/seq_cell_test.c); `asan` runs
 # both under ASAN+UBSan.
 set -u
@@ -57,6 +57,7 @@ panics() {
 }
 panics seq_nth_out_of_range "seq.nth: index out of range"
 panics seq_const_reads_itself "constant depends on itself"
+panics seq_reads_itself "sequence depends on itself"
 
 if [ "$mode" != native ]; then
   t="$OUT/seq-$mode-cell-test"

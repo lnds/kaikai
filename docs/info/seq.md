@@ -52,9 +52,9 @@ a list or a range, with two differences from a list literal:
   holding it is read — that is what lets a sequence be defined in terms
   of itself.
 
-Range elements are `Int`: a `Char` bound is an error at the literal
-(a list range walks `Char`; walk the code points and map them back,
-`lazy [char_to_int('a')..] | int_to_char`). A stepped range follows the
+A range walks `Int` or `Char`, as a list range does, and its start says
+which: `lazy ['a'..'e']` is a `Seq[Char]`, by code point, and
+`lazy ['a'..]` goes on from `'a'`. A stepped range follows the
 list rule: the step is `second - first`, its sign gives the direction,
 and a step the two elements fix at zero is a compile-time error.
 
@@ -68,6 +68,7 @@ lazy [a..]         seq.from(a)
 lazy [a, b..]      seq.from_step(a, b - a)
 lazy [a..hi]       seq.range(a, hi, 1)
 lazy [a, b..hi]    seq.range(a, hi, b - a)
+lazy ['a'..]       seq.map(seq.from(char_to_int('a')), int_to_char)
 ```
 
 ## Purity
