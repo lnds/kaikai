@@ -88,6 +88,7 @@ import compiler.effect_alias
 import compiler.core_effects
 import compiler.scalar_ty
 import compiler.core_types
+import compiler.seq_match
 import compiler.tbinder
 import compiler.unit_walk
 import compiler.record_head
@@ -9595,6 +9596,10 @@ fn synth_call_site(st: InferState, callee: Expr, args_: [Expr], line: Int, col: 
     [x] -> synth_call(st, mk_expr(EField(x, mark_name(MkDeref)), callee.line, callee.col), [], line, col)
     _   -> synth_call(st, callee, args_, line, col)
   }
+  EMark(MkLazy(_)) -> match args_ {
+    [x] -> synth_lazy_part(st, x)
+    _   -> synth_call(st, callee, args_, line, col)
+  }
   _ -> synth_call(st, callee, args_, line, col)
 }
 
@@ -12052,7 +12057,14 @@ fn synth_lambda_threaded(st: InferState, ps: [Param], body: Expr,
 
 # A lambda whose leading parameters take `pins` before its body is walked.
 fn synth_lambda_pinned(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String,
-                       line: Int, col: Int) : Inferred / Console + File + Mutable {
+                       line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_lambda_rows(st, ps, body, pins, why, false, line, col)
+
+# `every_tail` ties the lambda's row to every open row its body calls
+# through, not only the enclosing signature's: closing the lambda's row
+# then closes them all.
+fn synth_lambda_rows(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String, every_tail: Bool,
+                     line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let outer = st
@@ -12118,7 +12130,7 @@ fn synth_lambda_pinned(st: InferState, ps: [Param], body: Expr, pins: [Ty], why:
   # via Rémy-style tail unification — the row variable absorbs
   # whatever residual labels each arg performs.
   let fr = subst_fresh_row(st2.sub)
-  let st3 = join_tails(st_set_sub(st2, fr.subst), fr.id, rb_masked.row_tails, line, col)
+  let st3 = join_tails(st_set_sub(st2, fr.subst), fr.id, rb_masked.row_tails, every_tail, line, col)
   let lam_row = Row { labels: lambda_row_labels,
                        tail: Some(fr.id),
                        display_alias: None }
@@ -12141,13 +12153,13 @@ fn pin_params(st: InferState, tys: [Ty], pins: [Ty], why: String, line: Int, col
 # A signature row variable the lambda body performs is part of the
 # lambda's own row. An inference variable is not joined: it may still
 # bind to labels the lambda already carries, and rows keep duplicates.
-fn join_tails(st: InferState, tail: Int, us: [TailUse], line: Int, col: Int) : InferState / Console + File + Mutable = match us {
+fn join_tails(st: InferState, tail: Int, us: [TailUse], every: Bool, line: Int, col: Int) : InferState / Console + File + Mutable = match us {
   [] -> st
   [TU(t, _, _), ...rest] -> {
     let root = row_root(st.sub, t)
-    let st1 = if root < 0 or root == row_root(st.sub, tail) or not is_sig_row(st.sub, st.sig_rows, root) { st }
+    let st1 = if root < 0 or root == row_root(st.sub, tail) or not (every or is_sig_row(st.sub, st.sig_rows, root)) { st }
               else { st_unify(st, row_arg_carrier(row_with_tail(tail)), row_arg_carrier(row_with_tail(root)), "lambda effect row", line, col) }
-    join_tails(st1, tail, rest, line, col)
+    join_tails(st1, tail, rest, every, line, col)
   }
 }
 
@@ -15557,6 +15569,8 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
     synth_fixed_vec_match(rs_.st, rs_.expr, arms, scr_ty0, None, line, col)
   } else if vec_match_route(scr_ty0, arms) {
     synth_vec_match(rs_.st, scr, arms, None, line, col)
+  } else if seq_match_route(scr_ty0, arms) {
+    synth_seq_match(rs_.st, scr, arms, None, line, col)
   } else {
   let rv = st_fresh_ty(rs_.st)
   let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
@@ -15610,6 +15624,8 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
     synth_fixed_vec_match(rs_.st, rs_.expr, arms, scr_ty0, Some(expected), line, col)
   } else if vec_match_route(scr_ty0, arms) {
     synth_vec_match(rs_.st, scr, arms, Some(expected), line, col)
+  } else if seq_match_route(scr_ty0, arms) {
+    synth_seq_match(rs_.st, scr, arms, Some(expected), line, col)
   } else {
   # walk arms via `check_arms` so the expected type
   # propagates into nested EMatch / EIf / EBlock-tailed-by-match
@@ -15752,6 +15768,98 @@ fn synth_vec_match(st: InferState, scr: Expr, arms: [Arm], expected: Option[Ty],
   } else {
     mk_inferred(g.st, TyAny, with_ty(mk_expr(EMatch(scr, arms), line, col), TyAny))
   }
+}
+
+# A list-pattern match on a `Seq`, typed as the match over the read cell
+# it is rewritten to. The scrutinee was synthesised to learn its type;
+# the rewrite re-synthesises the raw node under that same state.
+fn synth_seq_match(st: InferState, scr: Expr, arms: [Arm], expected: Option[Ty],
+                   line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match seq_match_fault(arms, line, col) {
+    Some(f) -> {
+      let d = mk_diag(SevError, st.file, f.line, f.col, f.msg, [ri_help(st.file, f.line, f.col, f.help)])
+      render_diag(d)
+      mk_inferred(st_bump_err(st_push_diag(st, d)), TyAny, with_ty(mk_expr(EMatch(scr, arms), line, col), TyAny))
+    }
+    None -> {
+      let read = seq_match_build(scr, arms, line, col)
+      match expected {
+        None    -> synth(st, read)
+        Some(t) -> check_expr_against(st, read, t, "match arm", line, col)
+      }
+    }
+  }
+
+# A part of a `lazy [...]` performs nothing. A thunk's effects are its
+# lambda's row: a label it holds, or a row of the enclosing signature it
+# is tied to; a row still open is closed with it, so a function the
+# thunk calls is pure wherever it comes from. A range bound's are what
+# it adds where the literal stands.
+fn synth_lazy_part(st: InferState, x: Expr) : Inferred / Console + File + Mutable = match x.kind {
+  ELambda(ps, body) -> {
+    let r = synth_lambda_rows(st, ps, body, [], "", true, x.line, x.col)
+    match r.ty {
+      TyFnT(ps, ret, row) -> {
+        let pure_ty = TyFnT(ps, ret, Row { labels: [], tail: None, display_alias: None })
+        let tied = match row.tail { Some(t) -> is_sig_row(r.st.sub, r.st.sig_rows, row_root(r.st.sub, t)) None -> false }
+        match row.labels {
+          [] -> if tied { mk_inferred(lazy_impure(r.st, [], body), pure_ty, with_ty(r.expr, pure_ty)) }
+                else { mk_inferred(st_unify(r.st, r.ty, pure_ty, "lazy sequence", x.line, x.col), pure_ty, r.expr) }
+          ls -> mk_inferred(lazy_impure(r.st, ls, body), pure_ty, with_ty(r.expr, pure_ty))
+        }
+      }
+      _ -> r
+    }
+  }
+  _ -> {
+    let r = synth(InferState { ...st, row: [], row_tails: [] }, x)
+    let st1 = st_add_tail_labels(r.st, r.st.row_tails)
+    let st2 = match st1.row {
+      [] -> lazy_close_tails(st1, st1.row_tails, x)
+      ls -> lazy_impure(st1, ls, x)
+    }
+    let st3 = InferState { ...st2, row: st.row, row_tails: st.row_tails }
+    match apply_ty(st3.sub, r.ty) {
+      TyChar -> mk_inferred(lazy_char_bound(st3, x), TyInt, with_ty(r.expr, TyInt))
+      _      -> mk_inferred(st3, r.ty, r.expr)
+    }
+  }
+}
+
+# A list range walks Chars; the progressions a lazy range is built from
+# count Ints, and the mismatch would name a call the author never wrote.
+fn lazy_char_bound(st: InferState, at: Expr) : InferState / Console + File = {
+  let d = mk_diag(SevError, st.file, at.line, at.col, "a `lazy` range takes `Int` bounds, and this one is a `Char`",
+                  [ri_help(st.file, at.line, at.col, "walk the code points and map them back: `lazy [char_to_int('a')..] | int_to_char`")])
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
+}
+
+# The open rows a range bound calls through: one of the enclosing
+# signature is an effect, any other is closed.
+fn lazy_close_tails(st: InferState, us: [TailUse], at: Expr) : InferState / Console + File + Mutable = match us {
+  [] -> st
+  [TU(t, _, _), ...rest] -> {
+    let root = row_root(st.sub, t)
+    let st1 = if root < 0 { st }
+              else if is_sig_row(st.sub, st.sig_rows, root) { lazy_impure(st, [], at) }
+              else { st_unify(st, row_arg_carrier(row_with_tail(root)), row_arg_carrier(Row { labels: [], tail: None, display_alias: None }),
+                              "lazy sequence", at.line, at.col) }
+    lazy_close_tails(st1, rest, at)
+  }
+}
+
+# `ls` is what the part at `at` performs; empty when it is a row of the
+# enclosing signature.
+fn lazy_impure(st: InferState, ls: [Label], at: Expr) : InferState / Console + File = {
+  let what = match ls {
+    [] -> "the effects of the function around it"
+    _  -> "`#{inf_join_with(map(ls, (l) => label_diag_display(st, l)), " + ")}`"
+  }
+  let d = mk_diag(SevError, st.file, at.line, at.col, "everything inside `lazy [...]` is pure, and this performs #{what}",
+                  [ri_help(st.file, at.line, at.col, "a producer that performs effects is a generator: write it with `gen.generate`")])
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
 }
 
 # bidirectional walker over match arms. Mirrors

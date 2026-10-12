@@ -99,10 +99,10 @@ identifiers):
 and       as        assert    axiom     bench     case
 check     const     effect    else      ensures   extern
 false     fn        for       handle    if        impl
-import    let       match     not       or        priv
-protocol  pub       requires  test      todo      true
-type      unit      use       var       when      where
-with
+import    lazy      let       match     not       or
+priv      protocol  pub       requires  test      todo
+true      type      unit      use       var       when
+where     with
 ```
 
 Plus the special tokens:
@@ -738,7 +738,19 @@ list_body   ::= range_body
 range_body  ::= expr '..' expr                         (* [first..last] *)
               | expr ',' expr '..' expr                (* [first, second..last]; step = second - first *)
 spread_or_expr ::= '...' expr | expr
+
+lazy_lit    ::= 'lazy' '[' lazy_body? ']'
+lazy_body   ::= range_body
+              | expr '..'                              (* lazy [first..]; no end *)
+              | expr ',' expr '..'                     (* lazy [first, second..]; no end *)
+              | expr (',' expr)* (',' '...' expr)?     (* a spread is the rest: last *)
+              | '...' expr
 ```
+
+`lazy` is a reserved word and must be followed by `[`. A range with no
+end is a `lazy_body` only: written as a `list_body` it is an error that
+spells the lazy sequence. The literal builds a `Seq` of the `seq`
+module (`docs/syntax-sugars.md` §13).
 
 #### Tuples / parens
 

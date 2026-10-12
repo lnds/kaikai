@@ -203,6 +203,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkIf         -> match b { TkIf -> true _ -> false }
     TkImpl       -> match b { TkImpl -> true _ -> false }
     TkImport     -> match b { TkImport -> true _ -> false }
+    TkLazy       -> match b { TkLazy -> true _ -> false }
     TkLet        -> match b { TkLet -> true _ -> false }
     TkMatch      -> match b { TkMatch -> true _ -> false }
     TkNot        -> match b { TkNot -> true _ -> false }
@@ -1744,7 +1745,8 @@ fn parse_primary(p: Parser) : PExpr / Console {
     # literal is unambiguous: re-enable it for the interior even inside
     # an `if`/`match` cond, then restore the caller's flag on return.
     TkLparen -> restore_rl(p.allow_record_lit, parse_paren_or_lambda(p_with_record_lit(p, true), t))
-    TkLbracket -> restore_rl(p.allow_record_lit, parse_list_or_range(p_with_record_lit(p, true), t))
+    TkLbracket -> restore_rl(p.allow_record_lit, reject_endless(p, parse_list_or_range(p_with_record_lit(p, true), t)))
+    TkLazy -> parse_lazy(p, t)
     TkLbrace -> restore_rl(p.allow_record_lit, parse_brace_primary(p_with_record_lit(p, true), t))
     TkIf -> parse_if(p, t)
     TkMatch -> parse_match(p, t)
@@ -2918,9 +2920,43 @@ fn parse_first_list_elem(p: Parser, t: Token) : PExpr / Console {
   }
 }
 
+# `lazy [...]`. `p` is at `lazy`; the bracket is read as any list or
+# range, and an endless range is legal here alone.
+fn parse_lazy(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  if not p_at(p1, TkLbracket) { err_e(p_error_here(p1, "`lazy` opens a lazy sequence and takes a list or a range — write `lazy [...]`")) }
+  else {
+    let r = restore_rl(p.allow_record_lit, parse_list_or_range(p_with_record_lit(p1, true), p_peek(p1)))
+    match r.r {
+      None          -> r
+      Some(bracket) ->
+        if spread_before_last(bracket) { err_e(p_error(r.p, t, "a spread in `lazy [...]` is the rest of the sequence, so it comes last — write `lazy [a, ...rest]`")) }
+        else { ok_e(r.p, mk_expr(ESurface(SfLazy(bracket)), t.line, t.col)) }
+    }
+  }
+}
+
+fn spread_before_last(bracket: Expr) : Bool = match bracket.kind {
+  EList(elems) -> any(drop(list_reverse(elems), 1), (el) => match el { ElSpread(_) -> true ElPlain(_) -> false })
+  _            -> false
+}
+
+# A list has an end: `r` is the bracket `p` opens, and a range without
+# one is an error that spells the lazy sequence it is.
+fn reject_endless(p: Parser, r: PExpr) : PExpr / Console = match r.r {
+  None    -> r
+  Some(e) -> match e.kind {
+    ESurface(SfEndlessRange(_, _)) ->
+      err_e(p_error(r.p, p_peek(p), concat_all(["a list has an end; a range without one is a lazy sequence — write `lazy ", src_between(p, r.p, 0), "`"])))
+    _ -> r
+  }
+}
+
 # `[first..last]`. `p0` is at `first` and `p1` at the `..` after it.
 fn parse_range_end(p0: Parser, p1: Parser, first: Expr, t: Token) : PExpr / Console {
-  let r = parse_expr(p_skip_newlines(p_advance(p1)))
+  let pe = p_skip_newlines(p_advance(p1))
+  if p_at(pe, TkRbracket) { ok_e(p_advance(pe), mk_expr(ESurface(SfEndlessRange(first, None)), t.line, t.col)) } else {
+  let r = parse_expr(pe)
   match r.r {
     None -> err_e(r.p)
     Some(last) -> {
@@ -2930,6 +2966,7 @@ fn parse_range_end(p0: Parser, p1: Parser, first: Expr, t: Token) : PExpr / Cons
       } else if p_at(p2, TkDotDot) { err_e(reject_trailing_step(p0, p1, p2, first))
       } else { err_e(p_error_here(p2, "expected `]` at end of range")) }
     }
+  }
   }
 }
 
@@ -2992,20 +3029,29 @@ fn same_name(a: Expr, b: Expr) : Bool = match a.kind {
 # before it, newest first.
 fn parse_stepped_range(p: Parser, acc: [ListElem], t: Token) : PExpr / Console = match acc {
   [ElPlain(second), ElPlain(first)] -> {
-    let r = parse_expr(p_skip_newlines(p_advance(p)))
+    let pe = p_skip_newlines(p_advance(p))
+    if p_at(pe, TkRbracket) { stepped_range_at(pe, first, second, None, t) } else {
+    let r = parse_expr(pe)
     match r.r {
       None -> err_e(r.p)
       Some(last) -> {
         let p1 = p_skip_newlines(r.p)
         if not p_at(p1, TkRbracket) { err_e(p_error_here(p1, "expected `]` at end of range")) }
-        else { match literal_step(first, second) {
-          Some(0) -> err_e(p_error(p1, t, "the first two elements of a stepped range must differ: their difference is the step, and a step of zero never ends"))
-          _       -> ok_e(p_advance(p1), mk_expr(ESurface(SfSteppedRange(first, second, last)), t.line, t.col))
-        } }
+        else { stepped_range_at(p1, first, second, Some(last), t) }
       }
+    }
     }
   }
   _ -> err_e(p_error_here(p, "a stepped range takes exactly two elements before `..` — write `[first, second..last]`"))
+}
+
+# `p` is at the `]` closing a stepped range; with no `last` it is endless.
+fn stepped_range_at(p: Parser, first: Expr, second: Expr, last: Option[Expr], t: Token) : PExpr / Console = match literal_step(first, second) {
+  Some(0) -> err_e(p_error(p, t, "the first two elements of a stepped range must differ: their difference is the step, and a step of zero never ends"))
+  _       -> ok_e(p_advance(p), mk_expr(ESurface(match last {
+    Some(hi) -> SfSteppedRange(first, second, hi)
+    None     -> SfEndlessRange(first, Some(second))
+  }), t.line, t.col))
 }
 
 # After an index's first expr: `..` turns it into a range index

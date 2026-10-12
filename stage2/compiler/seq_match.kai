@@ -1,0 +1,134 @@
+#[doc("""
+List patterns on a `Seq` scrutinee.
+
+A `Seq` is an opaque cell, so `[]` and `[first, ...rest]` cannot test
+it the way they test a list. The typer, which knows the scrutinee's
+type, rewrites the match into one over what reading the cell yields:
+
+    match s { [] -> a   [x, ...xs] -> b }
+    match force(s) { SeqEnd -> a   SeqCons(x, xs) -> b }
+
+A catch-all that binds the sequence needs it after the read, so the
+scrutinee is bound first and the arm binds its name to that.
+
+Reading one cell decides one element, so an arm takes at most one
+before the rest; a body reads further by matching `rest` again.
+""")]
+
+import compiler.ast
+import compiler.core_types
+import compiler.lazy_seq
+
+#[doc("True when a match of `arms` on a scrutinee of type `scr_ty` is rewritten here: the type is `Seq` and an arm writes a list pattern.")]
+pub fn seq_match_route(scr_ty: Ty, arms: [Arm]) : Bool = match scr_ty {
+  TyCon(s, _) -> ty_is(s, CdSeq) and not all(arms, (a) => sm_is(a, SmOther))
+  _           -> false
+}
+
+#[doc("What is wrong with a match on a `Seq`, where to report it and how to fix it.")]
+pub type SeqFault = { line: Int, col: Int, msg: String, help: String }
+
+#[doc("The first fault in `arms`, the arms of the match at `line:col` on a `Seq`: a pattern the rewrite does not read, or values no arm covers. `None` when the match can be rewritten.")]
+pub fn seq_match_fault(arms: [Arm], line: Int, col: Int) : Option[SeqFault] =
+  match find(arms, (a) => sm_is(a, SmUnread)) {
+    Some(Arm(p, _, _)) ->
+      Some(SeqFault { line: p.line, col: p.col,
+                      msg: "a `Seq` is matched by `[]`, by `[first, ...rest]`, or by a catch-all",
+                      help: "reading a cell decides one element: match `rest` in the arm's body to read further" })
+    None -> sm_uncovered(arms, line, col)
+  }
+
+fn sm_uncovered(arms: [Arm], line: Int, col: Int) : Option[SeqFault] = {
+  let open = filter(arms, sm_unguarded)
+  let ends = any(open, (a) => sm_is(a, SmEnd))
+  let conses = any(open, (a) => sm_is(a, SmCons))
+  if (ends and conses) or any(open, sm_catches) { None }
+  else {
+    Some(SeqFault { line: line, col: col,
+                    msg: "non-exhaustive match on a `Seq`: missing #{sm_missing(ends, conses)}",
+                    help: "cover both `[]` and `[first, ...rest]`, or add a wildcard `_` arm" })
+  }
+}
+
+# A guarded arm covers nothing on its own.
+fn sm_unguarded(a: Arm) : Bool = match a {
+  Arm(_, None, _) -> true
+  _               -> false
+}
+
+fn sm_catches(a: Arm) : Bool = sm_is(a, SmCatch) or sm_is(a, SmBinds)
+
+fn sm_missing(ends: Bool, conses: Bool) : String =
+  if ends { "sequences with a first element (`[_, ...rest]`)" }
+  else if conses { "the empty sequence `[]`" }
+  else { "the empty sequence `[]` and sequences with a first element (`[_, ...rest]`)" }
+
+#[doc("The match at `line:col` of `arms` on the `Seq` `scr`, rewritten over what reading `scr` yields. `arms` has no fault.")]
+pub fn seq_match_build(scr: Expr, arms: [Arm], line: Int, col: Int) : Expr =
+  if any(arms, (a) => sm_is(a, SmBinds)) {
+    let held = binder_minted(string_concat_all(["__seq_scr_", int_to_string(line), "_", int_to_string(col), "__"]))
+    let read = sm_match(mk_local(held.id, line, col), map(arms, (a) => sm_arm(a, Some(held))), line, col)
+    mk_expr(EBlock([SLet(mk_pat(PBind(held), line, col), None, scr)], Some(read)), line, col)
+  } else { sm_match(scr, map(arms, (a) => sm_arm(a, None)), line, col) }
+
+fn sm_match(seq: Expr, arms: [Arm], line: Int, col: Int) : Expr =
+  mk_expr(EMatch(mk_expr(ECall(mk_sym(seq_fn_id(SqForce), line, col), [seq]), line, col), arms), line, col)
+
+# How an arm reads the sequence: not at all, as exhausted, as a first
+# element and the rest, bound whole to a name, or in a way one read
+# cannot decide.
+type SmKind = SmCatch | SmEnd | SmCons | SmBinds | SmUnread | SmOther
+
+fn sm_is(a: Arm, k: SmKind) : Bool = sm_rank(sm_kind(a)) == sm_rank(k)
+
+fn sm_rank(k: SmKind) : Int = match k {
+  SmCatch  -> 0
+  SmEnd    -> 1
+  SmCons   -> 2
+  SmBinds  -> 3
+  SmUnread -> 4
+  SmOther  -> 5
+}
+
+fn sm_kind(a: Arm) : SmKind = match a {
+  Arm(p, _, _) -> match p.pkind {
+    PWild               -> SmCatch
+    PBind(_)            -> SmBinds
+    PList([], None)     -> SmEnd
+    PList([_], Some(_)) -> SmCons
+    PList(_, _)         -> SmUnread
+    PAs(_, _)           -> SmUnread
+    _                   -> SmOther
+  }
+}
+
+# `held` is the binder the scrutinee was bound to, present when some arm
+# binds the sequence whole.
+fn sm_arm(a: Arm, held: Option[Binder]) : Arm = match a {
+  Arm(p, guard, body) -> match p.pkind {
+    PList([], None)            -> Arm(sm_step(p, seq_end_id(), []), guard, body)
+    PList([first], Some(rest)) -> Arm(sm_step(p, seq_cons_id(), [first, mk_pat(PBind(rest), p.line, p.col)]), guard, body)
+    PBind(name)                -> sm_whole(a, name, held)
+    _                          -> a
+  }
+}
+
+fn sm_step(p: Pattern, ctor: SymId, subs: [Pattern]) : Pattern =
+  mk_pat(PVariant(DrSym(ctor), subs), p.line, p.col)
+
+# The arm that binds the sequence whole reads nothing: it binds its name
+# to the held scrutinee, in the guard and in the body.
+fn sm_whole(a: Arm, name: Binder, held: Option[Binder]) : Arm = match a {
+  Arm(p, guard, body) -> match held {
+    Some(h) -> Arm(mk_pat(PWild, p.line, p.col), sm_opt(guard, (g) => sm_bound(name, h, g)), sm_bound(name, h, body))
+    None    -> a
+  }
+}
+
+fn sm_bound(name: Binder, held: Binder, e: Expr) : Expr =
+  mk_expr(EBlock([SLet(mk_pat(PBind(name), e.line, e.col), None, mk_local(held.id, e.line, e.col))], Some(e)), e.line, e.col)
+
+fn sm_opt(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] = match o {
+  None    -> None
+  Some(e) -> Some(f(e))
+}

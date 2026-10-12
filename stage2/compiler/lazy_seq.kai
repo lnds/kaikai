@@ -1,0 +1,112 @@
+#[doc("""
+The `lazy [...]` literal: what its bracket becomes, and the
+declarations of the `seq` module it is built from.
+
+A literal builds a `Seq` out of cells. Each cell is a call of the
+module's `defer` on a thunk, so nothing inside the bracket runs until
+the cell is read:
+
+  - `lazy []`           -> `defer(() => SeqEnd)`
+  - `lazy [a, b]`       -> `defer(() => SeqCons(a, defer(() => SeqCons(b, defer(() => SeqEnd)))))`
+  - `lazy [a, ...e]`    -> `defer(() => SeqCons(a, delay(() => e)))`
+  - `lazy [a..]`        -> `from(a)`
+  - `lazy [a, b..]`     -> `from_step(a, b - a)`
+  - `lazy [a..hi]`      -> `range(a, hi, 1)`
+  - `lazy [a, b..hi]`   -> `range(a, hi, b - a)`
+
+Every function and constructor is named by its declaration's id, so the
+qualifier a file binds the module under does not matter. Each thunk and
+each range bound is wrapped in a `MkLazy` call, which the typer holds to
+an empty effect row. The one that opens the literal stands for it where
+a file is checked for the module's import.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+import compiler.symtab_build
+import compiler.core_types
+import compiler.parse
+
+#[doc("A function of the `seq` module the compiler calls for a `lazy [...]` literal or a `Seq` pattern.")]
+pub type SeqFn = SqDefer | SqDelay | SqForce | SqFrom | SqFromStep | SqRange
+
+#[doc("The name the function `f` is declared with.")]
+pub fn seq_fn_name(f: SeqFn) : String = match f {
+  SqDefer    -> "defer"
+  SqDelay    -> "delay"
+  SqForce    -> "force"
+  SqFrom     -> "from"
+  SqFromStep -> "from_step"
+  SqRange    -> "range"
+}
+
+#[doc("The identity of the function `f`: the id the symbol table gives its declaration.")]
+pub fn seq_fn_id(f: SeqFn) : SymId = sym_derive(NCFn, seq_fn_name(f), core_decl_ty_home(CdSeq))
+
+#[doc("The identity of `SeqEnd`, what reading an exhausted sequence yields.")]
+pub fn seq_end_id() : SymId = sym_derive(NCCtor, "SeqEnd", core_decl_ty_home(CdSeq))
+
+#[doc("The identity of `SeqCons`, what reading a sequence with a first element yields.")]
+pub fn seq_cons_id() : SymId = sym_derive(NCCtor, "SeqCons", core_decl_ty_home(CdSeq))
+
+#[doc("The calls the literal `lazy <bracket>` at `line:col` stands for. `bracket` is the list or range the parser read, its children already lowered.")]
+pub fn lazy_lower(bracket: Expr, line: Int, col: Int) : Expr = match bracket.kind {
+  EList(elems)      -> lz_cells(elems, true, line, col)
+  ERange(lo, hi, _) ->
+    lz_call(SqRange, [lz_part(lo, true, line, col), lz_part(hi, false, line, col), lz_int(1, line, col)], line, col)
+  ESurface(sf)      -> match sf {
+    SfSteppedRange(first, second, last) -> lz_stepped(first, second, Some(last), line, col)
+    SfEndlessRange(first, second)       -> match second {
+      Some(s) -> lz_stepped(first, s, None, line, col)
+      None    -> lz_call(SqFrom, [lz_part(first, true, line, col)], line, col)
+    }
+    _ -> panic("lazy_lower: the bracket is not a list or a range")
+  }
+  _ -> panic("lazy_lower: the bracket is not a list or a range")
+}
+
+# One cell per element; a spread is the rest of the sequence, so it
+# closes the chain. `head` is true on the cell that opens the literal.
+fn lz_cells(elems: [ListElem], head: Bool, line: Int, col: Int) : Expr = match elems {
+  []                   -> lz_cell(SqDefer, mk_sym(seq_end_id(), line, col), head, line, col)
+  [ElSpread(e), ..._]  -> lz_cell(SqDelay, e, head, line, col)
+  [ElPlain(a), ...rest] -> {
+    let cons = mk_expr(ECall(mk_sym(seq_cons_id(), a.line, a.col), [a, lz_cells(rest, false, line, col)]), a.line, a.col)
+    lz_cell(SqDefer, cons, head, line, col)
+  }
+}
+
+# The thunk sits at its body's position: a lifted lambda is keyed by its
+# position inside the unit around it, and each cell nests in the last.
+fn lz_cell(f: SeqFn, body: Expr, head: Bool, line: Int, col: Int) : Expr =
+  lz_call(f, [lz_part(mk_expr(ELambda([], body), body.line, body.col), head, line, col)], line, col)
+
+# A step the leading elements fix is a literal. Otherwise both are bound
+# ahead of the call, in source order, so `first` is read once.
+fn lz_stepped(first: Expr, second: Expr, last: Option[Expr], line: Int, col: Int) : Expr = match literal_step(first, second) {
+  Some(k) -> lz_progression(lz_part(first, true, line, col), lz_int(k, line, col), last, line, col)
+  None    -> {
+    let at = string_concat_all(["_", int_to_string(line), "_", int_to_string(col), "__"])
+    let f = string_concat("__lazy_first", at)
+    let s = string_concat("__lazy_second", at)
+    let step = mk_expr(EBinop(BoSub, mk_name(s, line, col), mk_name(f, line, col)), line, col)
+    let binds = [SLet(mk_pat(PBind(binder_written(f)), line, col), None, lz_part(first, true, line, col)),
+                 SLet(mk_pat(PBind(binder_written(s)), line, col), None, lz_part(second, false, line, col))]
+    mk_expr(EBlock(binds, Some(lz_progression(mk_name(f, line, col), step, last, line, col))), line, col)
+  }
+}
+
+fn lz_progression(first: Expr, step: Expr, last: Option[Expr], line: Int, col: Int) : Expr = match last {
+  Some(hi) -> lz_call(SqRange, [first, lz_part(hi, false, line, col), step], line, col)
+  None     -> lz_call(SqFromStep, [first, step], line, col)
+}
+
+fn lz_call(f: SeqFn, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_sym(seq_fn_id(f), line, col), args), line, col)
+
+fn lz_part(x: Expr, head: Bool, line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_expr(EMark(MkLazy(head)), line, col), [x]), line, col)
+
+fn lz_int(k: Int, line: Int, col: Int) : Expr =
+  if k < 0 { mk_expr(EUnop(UoNeg, mk_expr(mk_int_synth(0 - k), line, col)), line, col) }
+  else { mk_expr(mk_int_synth(k), line, col) }

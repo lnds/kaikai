@@ -435,6 +435,8 @@ shared, and unlike a `Stream` it is not rerun.
 - stages: `map`, `flat_map`, `filter` (pipe-canonical), `take`,
   `take_while`, `drop` *(shipped)*
 - sinks: `nth`, `to_list`, `each`, `foldl` *(shipped)*
+- surface: the `lazy [...]` literal builds one, and the list patterns
+  `[]` / `[first, ...rest]` read one *(shipped)* — `kai info seq`
 
 ### gen (effect `Yield[t]`, stage 2)
 

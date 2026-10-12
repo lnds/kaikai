@@ -1243,6 +1243,107 @@ precise anchor for the "expected `case` or `}`" diagnostic.
 - `examples/sugars/case_block_mixed_stmt.kai` — pure-block rule
   rejects `let` interleaved with `case`.
 
+## 13. Lazy sequences — `lazy [...]`
+
+`lazy [...]` builds a `Seq[t]`: a pure sequence whose cells are
+evaluated when read, at most once, and shared by every holder. The
+motivating program is the unbounded sieve:
+
+```kaikai
+import seq
+
+fn sieve(xs: Seq[Int]) : Seq[Int] = match xs {
+  []           -> lazy []
+  [p, ...rest] -> lazy [p, ...sieve(rest |? (x) => x % p != 0)]
+}
+
+fn main() : Unit / Stdout = {
+  let primes = sieve(lazy [2..])
+  primes |> take_while((p) => p <= 97) |> each((p) => Stdout.print("#{p}"))
+}
+```
+
+### Rule
+
+- `lazy` is a reserved word, legal only before `[` (LL(1): after
+  `lazy` a `[` is required).
+- The bracket is a list or a range. A range may omit its end only
+  here: `lazy [2..]`, `lazy [0, 5..]`. A list has an end, so a bare
+  `[2..]` is an error whose fix-it spells `lazy [2..]`.
+- A spread is the rest of the sequence, so it comes last:
+  `lazy [a, b, ...rest]`. `...` keeps its one meaning, spread/rest.
+- `Seq` is declared by the `seq` module, not built in. The file that
+  writes the literal imports the module in any form; without it the
+  literal is an error naming the import, as a `d` or `n` literal suffix
+  is for `decimal` and `math.bigint`.
+
+### Desugar shape
+
+| Form | Becomes |
+|---|---|
+| `lazy []` | `seq.defer(() => SeqEnd)` |
+| `lazy [a, b]` | `seq.defer(() => SeqCons(a, seq.defer(() => SeqCons(b, seq.defer(() => SeqEnd)))))` |
+| `lazy [a, ...e]` | `seq.defer(() => SeqCons(a, seq.delay(() => e)))` |
+| `lazy [a..]` | `seq.from(a)` |
+| `lazy [a, b..]` | `seq.from_step(a, b - a)` |
+| `lazy [a..hi]` | `seq.range(a, hi, 1)` |
+| `lazy [a, b..hi]` | `seq.range(a, hi, b - a)` |
+
+The calls name `seq`'s declarations by identity, so the qualifier a
+file binds the module under does not matter, and a local `defer` does
+not capture the literal. Each spread is its own deferred cell: `e` runs
+only when that tail is read, which keeps a self-referential sequence
+and `nth` from forcing one element too many. A stepped range reads
+`first` once: unless both elements are literals they are bound ahead
+of the call, in source order.
+
+### Purity
+
+Everything inside the bracket is checked against an empty effect row —
+elements, the spread, range bounds. Divergence, `panic` and `todo!` are
+allowed. The check reads each cell's own row, so a `Ref` the enclosing
+function created does not get around it: a cell that reads it performs
+`Mutable`. The error points to `gen.generate` for an effectful
+producer.
+
+### Patterns
+
+`[]` and `[first, ...rest]` match a `Seq` scrutinee. The typer decides
+by the scrutinee's type and rewrites the match over what reading the
+cell yields:
+
+```text
+match s { [] -> a   [x, ...xs] -> b }
+match seq.force(s) { SeqEnd -> a   SeqCons(x, xs) -> b }
+```
+
+Exhaustiveness is checked as for a list. One read decides one element,
+so an arm takes at most one before the rest; a body reads further by
+matching `rest`.
+
+### Lazy carriers
+
+Three types defer work, one intent each:
+
+| Carrier | Intent |
+|---|---|
+| `Stream` | Push-based; owns its resource; reruns from the start when consumed again. |
+| `Gen` | Effectful; pulled once. |
+| `Seq` | Pure; shared. |
+
+### Fixtures
+
+- `examples/stdlib/seq_lazy_sieve.kai` — the sieve above.
+- `examples/stdlib/seq_lazy_literal.kai` — every form of the bracket,
+  and cells that are never read.
+- `examples/stdlib/seq_lazy_match.kai` — list patterns on a `Seq`.
+- `examples/stdlib/seq_lazy_self_ref.kai` — sequences defined in terms
+  of themselves.
+- `examples/stdlib/seq_lazy_*.err.expected` — the rejected forms: a
+  bare endless range, a missing import, an effectful element, bound or
+  enclosing row, a captured `Ref`, a spread before the end, patterns
+  one read cannot decide.
+
 ## Cross-sugar interaction
 
 All five sugars compose without ambiguity because their grammar

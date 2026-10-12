@@ -922,9 +922,10 @@ test-issue-1969-typer-diag-file: $(TARGET) build
 # runs. Skips the native legs on a cc-only kaic2.
 # An import its file never mentions is reported as unused only when the
 # unit can lose it; one the unit needs names the file that uses it, and an
-# import its file does use is never reported. Each fixture's warning and
+# import its file does use is never reported, a `lazy [...]` counting as
+# a use of the module that declares `Seq`. Each fixture's warning and
 # help lines must equal its golden exactly, on both backends.
-IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-used-bare derive-uses-import
+IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-used-bare derive-uses-import lazy-uses-import
 
 test-import-verdicts: $(TARGET) bin-kai build
 	@set -e; \
