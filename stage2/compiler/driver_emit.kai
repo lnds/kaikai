@@ -1,0 +1,146 @@
+#[doc("""
+The key a cached modular emit is stored under, the core sources a native
+build reads, and the single-object native emit.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.symtab
+import compiler.spec_names
+import compiler.resolve_env
+import compiler.user_cache
+import compiler.edition
+import compiler.fnreg
+import compiler.home_tu
+import compiler.emit_shared
+import compiler.emit_cache
+import compiler.kir
+import compiler.emit_native
+import compiler.emit_native_core
+import compiler.decl_names
+import compiler.driver_policy
+import compiler.driver_core_load
+import compiler.driver_exports
+import compiler.driver_cli
+
+#[doc("""
+The joined core source hashes the native core object is keyed by; empty
+when that cache is not in play.
+""")]
+pub fn native_core_srcs(backend: Backend, cc: CoreCacheOpt, core_names: [String]) : String / Console + File =
+  match backend {
+    BkNative ->
+      if native_core_cached(cc) and list_length(core_names) > 0 {
+        match core_src_hexes(core_module_paths(), []) {
+          None -> ""
+          Some(hx) -> string_join(hx, "\n")
+        }
+      } else { "" }
+    _ -> ""
+  }
+
+#[doc("""
+The single-TU native emit: link a core object the cache holds, emit and
+cache the core object, or emit the whole program as one object. Prints
+one object path per line for the wrapper to link.
+""")]
+pub fn native_single_emit(kp: KProgram, decls: [Decl], vs: [VariantEntry], fns: [EFn], bmode: BuildMode,
+                      obj: String, path: String, core_names: [String], reuse: Option[String],
+                      cfg: NCoreCfg) : Int / Console + File = match reuse {
+  Some(co) -> print_objects(build_native_core_reuse(kp, decls, vs, fns, bmode, obj, path, co, core_names, cfg.stats))
+  None ->
+    if cfg.srcs_hex != "" { print_objects(build_native_core_split(kp, decls, vs, fns, bmode, obj, path, cfg, core_names)) }
+    else {
+      let rc = build_native_object(kp, decls, vs, fns, bmode, obj, path)
+      if rc == 0 { print(obj); 0 } else { rc }
+    }
+}
+
+fn print_objects(objs: [String]) : Int / Console = match objs {
+  [] -> 1
+  _ -> { print(string_join(objs, "\n")); 0 }
+}
+
+# Content hexes of the core sources, in load order. None on any read
+# failure, which disables the emit cache for this invocation.
+fn core_src_hexes(paths: [String], acc: [String]) : Option[[String]] / Console + File = match paths {
+  [] -> Some(list_reverse(acc))
+  [p, ...rest] -> match read_file(p) {
+    Err(_) -> None
+    Ok(s) -> core_src_hexes(rest, [uc_content_hex(s), ...acc])
+  }
+}
+
+# Span-free identity of one decl for the emit-cache key. Core TU
+# emission is fn-body-independent (a user body only shapes the root
+# TU), but the program's NAME-LEVEL surface — types, impls (as their
+# lowered `__pimpl_*` fn names), protocols, effects, units, fn
+# name/arity pairs — can perturb synthetic decls or renames attributed
+# to a core TU. Names and arities capture that surface without spans,
+# so a plain body edit keeps the key while any surface change is a
+# safe miss.
+# The target file's basename is NOT part of the surface: a root pub
+# fn (and an impl's lowered `__pimpl_*` method) carries the target
+# module as its origin, and keying on it would make an identical
+# program under a different filename miss.
+fn ec_key_mo(mo: Option[String], target: String) : String = match mo {
+  None -> ""
+  Some(m) -> if m == target { "" } else { m }
+}
+
+fn ec_key_decl_id(d: Decl, tab: SymTab, specs: SpecNames, target: String) : String = match d {
+  DFn(_, f, _, ps, _, _, _, _, _, mo) ->
+    concat_all(["fn ", "#{fn_emit_name(tab, specs, f)}", "/", int_to_string(list_length(ps)), "@", ec_key_mo(mo, target)])
+  DType(_, s, _, _, _, _, mo, _) -> concat_all(["type ", export_name(tab, s), "@", ec_key_mo(mo, target)])
+  DEffect(_, s, _, _, _, _, _, mo) -> concat_all(["effect ", export_name(tab, s), "@", ec_key_mo(mo, target)])
+  DProtocol(_, s, _, _, _, _, _) -> concat_all(["protocol ", export_name(tab, s)])
+  DImpl(p, _, _, _, _, _, _, _) -> concat_all(["impl ", dump_ref_shown(tab, p)])
+  DUnit(_, n, _, _, _, _, _) -> concat_all(["unit ", n])
+  DConst(_, s, _, _, mo, _, _) -> concat_all(["const ", export_name(tab, s), "@", ec_key_mo(mo, target)])
+  DUse(n, _, _) -> concat_all(["use ", n])
+  _ -> "."
+}
+
+# A per-call-site closure-spec decl is derived and root-homed; its name
+# carries a lambda body's `line`/`col`, so admitting it would let a plain
+# body edit that adds, removes, or moves a specialisable HOF call re-key
+# the core surface. It cannot perturb a core TU, so it stays out.
+fn ec_decl_is_cspec(d: Decl, tab: SymTab) : Bool = match d {
+  DFn(_, f, _, _, _, _, _, _, _, _) -> match sym_mint(tab, fnid_sym(f)) { NmSpec -> true  _ -> false }
+  _ -> false
+}
+
+fn ec_key_user_ids(decls: [Decl], tab: SymTab, specs: SpecNames, core_names: [String], target: String, acc: [String]) : [String] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let is_core = match home_tu(d) {
+      None -> false
+      Some(m) -> list_has(core_names, m)
+    }
+    if is_core or ec_decl_is_cspec(d, tab) { ec_key_user_ids(rest, tab, specs, core_names, target, acc) }
+    else { ec_key_user_ids(rest, tab, specs, core_names, target, [ec_key_decl_id(d, tab, specs, target), ...acc]) }
+  }
+}
+
+fn ec_key_surface_hex(decls: [Decl], tab: SymTab, specs: SpecNames, core_names: [String], target: String) : String =
+  uc_content_hex(string_join(ec_key_user_ids(decls, tab, specs, core_names, target, []), "\n"))
+
+#[doc("""
+The emit-cache entry key: content hash over the format tag, the
+toolchain id, the edition, every core source, and the program's
+type-level surface. "" means the cache does not participate; a
+missing toolchain id disables it so a rebuilt dev compiler can never
+splice another build's C.
+""")]
+pub fn core_emit_key(cc: CoreCacheOpt, edition: Option[Edition], decls: [Decl], tab: SymTab, specs: SpecNames,
+                 core_names: [String], target: String) : String / Console + File =
+  if cc.dir == "" or cc.toolchain == "" { "" }
+  else {
+    match core_src_hexes(core_module_paths(), []) {
+      None -> ""
+      Some(hexes) -> uc_content_hex(concat_all([
+        ec_format_tag(), "\n", cc.toolchain, "\n", edition_key_text(edition), "\n",
+        ec_key_surface_hex(decls, tab, specs, core_names, target), "\n",
+        string_join(hexes, "\n")]))
+    }
+  }

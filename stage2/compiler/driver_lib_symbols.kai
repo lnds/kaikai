@@ -1,0 +1,187 @@
+#[doc("""
+The symbol and completion listings of library mode, as JSON.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.symtab
+import compiler.infer
+import compiler.emit_shared
+import compiler.doc_attr
+import compiler.infer_json_base
+import compiler.driver_exports
+
+#[doc("""
+documentSymbol. Walk the raw decls and emit a JSON entry per
+top-level decl authored in the root file — the editor only wants
+the user's own declarations in the outline panel. Root membership
+follows the origin stamps where the decl kind carries one; kinds
+without an origin slot (DUnit, DTest, DBench) attribute to the
+walk's running anchor, mirroring partition_by_homes_walk: they
+live in the same physical file as the surrounding stamped decls.
+""")]
+pub fn lib_collect_symbols(ds: [Decl], tab: SymTab, root_mod: String) : [String] =
+  list_reverse(lib_collect_symbols_loop(ds, tab, root_mod, false, []))
+
+fn lib_collect_symbols_loop(ds: [Decl], tab: SymTab, root_mod: String, in_root: Bool,
+                            acc: [String]) : [String] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> {
+      let root1 = lib_symbol_in_root(d, root_mod, in_root)
+      match lib_decl_to_symbol(d, tab, root1) {
+        None    -> lib_collect_symbols_loop(rest, tab, root_mod, root1, acc)
+        Some(s) -> lib_collect_symbols_loop(rest, tab, root_mod, root1, [s, ...acc])
+      }
+    }
+  }
+}
+
+# The root file's own pub DFns and DTypes carry `Some(<root basename>)`
+# (tag_target_decl), so root membership is canon_mo-style: untagged or
+# tagged with the root's own name.
+fn lib_origin_is_root(mo: Option[String], root_mod: String) : Bool =
+  match mo { None -> true  Some(m) -> m == root_mod }
+
+fn lib_symbol_in_root(d: Decl, root_mod: String, in_root: Bool) : Bool {
+  match d {
+    DFn(_, _, _, _, _, _, _, _, _, mo)      -> lib_origin_is_root(mo, root_mod)
+    DEffect(_, _, _, _, _, _, _, mo)        -> lib_origin_is_root(mo, root_mod)
+    DProtocol(_, _, _, _, _, _, mo)         -> lib_origin_is_root(mo, root_mod)
+    DConst(_, _, _, _, mo, _, _)            -> lib_origin_is_root(mo, root_mod)
+    DType(_, _, _, _, _, _, mo, _)          ->
+      match mo { Some(m) -> m == root_mod  None -> in_root }
+    DDerive(_, inner, _, _)              -> lib_symbol_in_root(inner, root_mod, in_root)
+    DUnstable(inner, _, _)               -> lib_symbol_in_root(inner, root_mod, in_root)
+    DProtoLaws(_, inner, _, _, _)           -> lib_symbol_in_root(inner, root_mod, in_root)
+    DImplAxiom(_, inner, _, _, _)           -> lib_symbol_in_root(inner, root_mod, in_root)
+    DConstructor(inner, _, _)            -> lib_symbol_in_root(inner, root_mod, in_root)
+    _ -> in_root
+  }
+}
+
+fn lib_decl_to_symbol(d: Decl, tab: SymTab, in_root: Bool) : Option[String] {
+  if not in_root { None }
+  else { match d {
+    DFn(_, f, _, _, _, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Function", export_name(tab, fnid_sym(f)), line, col)) } else { None }
+    DConst(_, s, _, _, _, line, col) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Constant", export_name(tab, s), line, col)) } else { None }
+    DType(_, s, _, _, line, col, _, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Class", export_name(tab, s), line, col)) } else { None }
+    DEffect(_, s, _, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Interface", export_name(tab, s), line, col)) } else { None }
+    DProtocol(_, s, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Interface", export_name(tab, s), line, col)) } else { None }
+    DUnit(_, n, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Variable", n, line, col)) } else { None }
+    DTest(name, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Method", name, line, col)) } else { None }
+    DBench(name, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Method", name, line, col)) } else { None }
+    DDerive(_, inner, _, _) -> lib_decl_to_symbol(inner, tab, in_root)
+    DUnstable(inner, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    DProtoLaws(_, inner, _, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    DImplAxiom(_, inner, _, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    DConstructor(inner, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    _ -> None
+  } }
+}
+
+# Compiler-injected decls (builtin effects, root core, anonymous
+# axioms) carry line/col = 0 to mark their non-source origin. A
+# decl with a real source position has line ≥ 1.
+fn is_user_pos(line: Int, col: Int) : Bool = line >= 1
+
+# The "kind" string maps to LSP SymbolKind names. The LSP wire
+# protocol uses integer codes, but the LSP shim layer decodes the
+# string to the right code so the kaic2 surface stays human-readable.
+fn lib_symbol_json(kind: String, name: String, line: Int, col: Int) : String =
+  concat_all([
+    "{\"kind\": ", json_str(kind),
+    ", \"name\": ", json_str(name),
+    ", \"line\": ", int_to_string(line),
+    ", \"col\": ", int_to_string(col),
+    "}"
+  ])
+
+#[doc("""
+----- completion -----
+
+Enumerate every top-level decl visible from the cursor: user decls
+(origin = None) followed by core / stdlib decls (origin != None).
+Each entry carries the decl kind so the LSP shim can map it to the
+right LSP CompletionItemKind, plus a render-friendly "detail" string
+the editor shows next to the candidate.
+""")]
+pub fn lib_collect_completions(ds: [Decl], tab: SymTab) : [String] = {
+  let user_and_stdlib = list_reverse(lib_collect_completions_loop(ds, tab, []))
+  let core = lib_collect_core_completions(tab)
+  list_append(user_and_stdlib, core)
+}
+
+# Builtins injected by `add_core_sigs` do NOT live as DFn in the
+# typed-module decl list — they're TyEntry rows added directly to the
+# initial type env. We synthesise CompletionItem-shaped JSON for them
+# from the same env shape, so editors see `print`, `int_to_string`,
+# `read_line`, etc. alongside the user-authored and stdlib decls.
+fn lib_collect_core_completions(tab: SymTab) : [String] = {
+  let env = add_core_sigs(ty_env_empty())
+  core_entries_to_completions(env.entries, tab, [])
+}
+
+fn core_entries_to_completions(entries: [TyEntry], tab: SymTab, acc: [String]) : [String] {
+  match entries {
+    []           -> list_reverse(acc)
+    [e, ...rest] -> {
+      let ty_str = match e.scheme {
+        Scheme(_, _, _, _, t) -> ty_to_string(tab, t)
+      }
+      let item = lib_completion_json("Function", env_key_text(tab, e.key), ty_str)
+      core_entries_to_completions(rest, tab, [item, ...acc])
+    }
+  }
+}
+
+fn lib_collect_completions_loop(ds: [Decl], tab: SymTab, acc: [String]) : [String] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> match lib_decl_to_completion(d, tab) {
+      None    -> lib_collect_completions_loop(rest, tab, acc)
+      Some(s) -> lib_collect_completions_loop(rest, tab, [s, ...acc])
+    }
+  }
+}
+
+fn lib_decl_to_completion(d: Decl, tab: SymTab) : Option[String] {
+  match d {
+    DFn(_, f, tps, params, ret, eff, _, _, _, _) ->
+      Some(lib_completion_json("Function", export_name(tab, fnid_sym(f)), doc_sig(params, ret, eff, tab, tps)))
+    DConst(_, s, ty, _, _, _, _) ->
+      Some(lib_completion_json("Constant", export_name(tab, s), doc_te(ty, tab, [])))
+    DType(_, s, _, _, _, _, _, _) ->
+      Some(lib_completion_json("Class", export_name(tab, s), ""))
+    DEffect(_, s, _, _, _, _, _, _) ->
+      Some(lib_completion_json("Interface", export_name(tab, s), ""))
+    DProtocol(_, s, _, _, _, _, _) ->
+      Some(lib_completion_json("Interface", export_name(tab, s), ""))
+    DUnit(_, n, _, _, _, _, _) ->
+      Some(lib_completion_json("Variable", n, ""))
+    DAxiom(_, _, _, n, tps, params, ret, eff, _, _) ->
+      Some(lib_completion_json("Function", n, doc_sig(params, Some(ret), eff, tab, tps)))
+    DDerive(_, inner, _, _)  -> lib_decl_to_completion(inner, tab)
+    DUnstable(inner, _, _)   -> lib_decl_to_completion(inner, tab)
+    DProtoLaws(_, inner, _, _, _)   -> lib_decl_to_completion(inner, tab)
+    DImplAxiom(_, inner, _, _, _)   -> lib_decl_to_completion(inner, tab)
+    DConstructor(inner, _, _)   -> lib_decl_to_completion(inner, tab)
+    _ -> None
+  }
+}
+
+fn lib_completion_json(kind: String, name: String, detail: String) : String =
+  concat_all([
+    "{\"kind\": ", json_str(kind),
+    ", \"name\": ", json_str(name),
+    ", \"detail\": ", json_str(detail),
+    "}"
+  ])

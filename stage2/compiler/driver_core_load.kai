@@ -1,0 +1,256 @@
+#[doc("""
+Lexing and parsing one core module into its declarations and its module
+entry, and the files the core is made of.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.lex_tokens
+import compiler.lex
+import compiler.ast
+import compiler.parse
+import compiler.symtab_build
+import compiler.modules_paths
+import compiler.modules_segments
+import compiler.module_table
+import compiler.core_cache
+import compiler.infer_name_collisions
+import compiler.doc_attr
+import compiler.decl_names
+import compiler.driver_exports
+
+#[doc("Every `TkError` token, reported to stderr in source order.")]
+pub fn lex_diags(path: String, src: String, ts: [Token]) : [Diagnostic] / Console = lex_diags_loop(path, src, ts, [])
+
+fn lex_diags_loop(path: String, src: String, ts: [Token], acc: [Diagnostic]) : [Diagnostic] / Console = match ts {
+  [] -> finalize_diags(acc)
+  [t, ...rest] -> match t.kind {
+    TkError(msg) -> {
+      diag_error_from_src(path, src, t.line, t.col, msg)
+      lex_diags_loop(path, src, rest, push_diag(acc, mk_diag(SevError, path, t.line, t.col, msg, [])))
+    }
+    _ -> lex_diags_loop(path, src, rest, acc)
+  }
+}
+
+#[doc("Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).")]
+pub fn report_errors(path: String, src: String, tokens: [Token]) : Int / Console =
+  if list_is_empty(lex_diags(path, src, tokens)) { 0 } else { 1 }
+
+#[doc("""
+A core file's contribution to compile_source — its decls
+(concat'd into the global flat list) and a `ModuleEntry`
+registering its public surface under its file's
+basename so user code can call `list.take(xs, n)` without an
+explicit `import list`. Without this, qualified calls into the
+stdlib would error with "module 'list' is not imported". The rows are
+the table rows of those decls.
+""")]
+pub type CoreLoaded = CoreL([Decl], ModuleEntry, [NEnt])
+
+#[doc("""
+Parse a core module file and return its decl list paired with a
+ModuleEntry. On any error report to stderr and return None.
+
+Every `DTest` / `DBench` / `DCheck` block authored in a core module
+file is dropped here. Without this filter `kai test
+<user.kai>` would also run every stdlib test block, since core
+modules are parsed and concatenated into the same flat decl stream
+the test runner walks — testing one file must never run another
+module's tests. The kaikai project's own intrinsic-test gate is
+unaffected: it passes the stdlib file as the *target* (which keeps
+its own test blocks intact through `compile_source`) and only the
+OTHER core modules are loaded as context.
+""")]
+pub fn load_core_file(path: String) : Option[CoreLoaded] / Console + File {
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      let errs = report_errors(path, src, tokens)
+      if errs != 0 { None }
+      else {
+        let mod_name = module_name_of_path(path)
+        let parsed = parse_program(path, src, tokens, mod_name)
+        match parsed.decls {
+          None -> None
+          Some(ds_raw) -> {
+            # Strip `#[doc(...)]` wrappers (and the module doc) at load
+            # time — core decls join the global stream doc-free.
+            # `kai doc` collects core docs on its own dedicated path.
+            let pre_docs = doc_strip_all(path, src, ds_raw)
+            if pre_docs.errs > 0 { None } else {
+            let ds = pre_docs.decls
+            let ftab = st_of_entries(parsed.names)
+            let kept = strip_core_tests(ds, [])
+            # Validate same-module name collisions before the module's
+            # decls join the global stream. Without this, a duplicate
+            # `fn foo` inside a stdlib module silently overwrites the
+            # first and surfaces as a cc-time "redefinition of …" deep
+            # in generated code (see `validate_module_same_module_collisions`
+            # for the json_hex_digit case study).
+            let mod_errs = validate_module_same_module_collisions(kept, ftab, path)
+            if mod_errs > 0 { None }
+            else {
+              let exports = collect_pub_exports(kept, ftab, [])
+              let unstable_exports = collect_unstable_exports(kept, ftab, [])
+              # Tag every DFn coming from this core file with
+              # `module_origin = Some(<basename>)` so the codegen mints
+              # `kai_<basename>__<name>` for it. Decls authored in the
+              # root file keep `None` (set by the parser).
+              let tagged = tag_decls_module_origin(kept, mod_name)
+              Some(CoreL(tagged, ME(mod_name, exports, path, unstable_exports), parsed.names))
+            }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("""
+Drop every `test`/`bench`/`check` block from a core file's
+parsed decls. Public exports, types, effects, protocols,
+imports etc. all pass through untouched. Tail-recursive accumulator
+keeps the original order.
+""")]
+pub fn strip_core_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DTest(_, _, _, _, _)         -> strip_core_tests(rest, acc)
+    DBench(_, _, _, _, _)        -> strip_core_tests(rest, acc)
+    DCheck(_, _, _, _, _, _)     -> strip_core_tests(rest, acc)
+    _                          -> strip_core_tests(rest, [d, ...acc])
+  }
+}
+
+#[doc("""
+`segments` retains the per-file `(mod_name, decls)` split so the
+pub-access validator can treat each core as its own home module.
+Without this, the flat `decls` append loses the boundary between
+core files and a DType / DEffect at the head of one core
+inherits the previous core's tagged module via the streaming
+hint.
+""")]
+pub type CoresLoaded = PLS([Decl], [ModuleEntry], [CoreSegment], [NEnt])
+
+# `CoreSegment` lives in compiler/modules.kai: it is the
+# per-core-file `(mod_name, decls)` split the pub-access validator
+# (also in modules.kai) consumes. The driver constructs `PSeg` values
+# here and passes them downward into `validate_pub_access`.
+
+#[doc("""
+Load every core file in `paths`, concatenating their decls in
+argument order and accumulating one ModuleEntry per file. Returns
+None if any single load fails. Empty list yields Some(PLS([], [])).
+
+`caches` is parallel to `paths`. Each slot holds a cache .kab file
+path, or "" to force a full parse. A non-empty cache path is tried
+first; on header / payload mismatch the loader falls back to
+re-parsing the source.
+Core module set. Hard-coded in the compiler: `stdlib_path()`
+returns the absolute path baked at compile time via
+-DKAI_STDLIB_PATH. Every kaikai program receives this set
+automatically — no flags, no driver assistance, no escape hatch
+beyond rebuilding the compiler with a different KAI_STDLIB_PATH.
+""")]
+pub fn core_module_files() : [String] = [
+  # Modular typecheck: order matters. Each module is typed
+  # against the inherited deltas of every preceding module — a type
+  # or fn declared in module M only becomes visible to typecheckers
+  # of modules that load AFTER M. Topologically ordered by their
+  # cross-module references:
+  #   char       — leaf (Char is builtin, no kaikai-side deps)
+  #   io         — uses String (builtin)
+  #   tuple      — declares Pair/Triple/Quad (load BEFORE list)
+  #   option     — Option is builtin; defines helpers over it
+  #   result     — Result is builtin; defines helpers over it
+  #   list       — uses Pair (tuple), Option (option), Result (result)
+  #   string     — uses Option (option) for to_int / find / etc.
+  #   numeric    — leaf (over Int/Real builtins)
+  #   complex    — declares Complex; uses Real
+  #   effects    — currently empty (placeholder for runtime helpers)
+  #   protocols  — defines Show/Eq/Ord/Hash impls — depends on every
+  #                core module's types
+  #   array      — uses Array builtin + list helpers
+  "core/char.kai",
+  "core/char_unicode.kai",
+  "core/io.kai",
+  "core/tuple.kai",
+  "core/option.kai",
+  "core/result.kai",
+  "core/list.kai",
+  "core/string.kai",
+  "math/numeric.kai",
+  "math/complex.kai",
+  "effects.kai",
+  "protocols.kai",
+  "array.kai",
+  "effects/concurrent.kai",
+  "effects/os.kai"
+]
+
+#[doc("""
+Build the full absolute path list for the core module set,
+anchored at the compile-time `stdlib_path()`.
+""")]
+pub fn core_module_paths() : [String] = {
+  let root = stdlib_path()
+  core_module_paths_loop(core_module_files(), root, [])
+}
+
+fn core_module_paths_loop(rels: [String], root: String, acc: [String]) : [String] = match rels {
+  [] -> list_reverse(acc)
+  [r, ...rest] -> core_module_paths_loop(rest, root,
+                    [string_concat(root, string_concat("/", r)), ...acc])
+}
+
+#[doc("""
+Decided by the resolved file, never by module name: any file can be
+named like a core module.
+""")]
+pub fn is_core_path(path: String) : Bool = list_has(map(core_module_paths(), abspath), abspath(path))
+
+#[doc("""
+A core module loaded through the cache, tagged with whether the blob
+hit (true: deserialised, lex+parse skipped) or the source was parsed.
+""")]
+pub type CoreCacheLoaded = CclLoaded(CoreLoaded, Bool)
+
+#[doc("""
+Load one core module through the post-parse cache. A header-valid
+blob whose name matches the source content hash is deserialised
+(skipping lex+parse); any miss (absent blob, version/format drift,
+corruption, or a content edit that changed the hash) falls back to
+a full parse and writes the fresh blob. The decls a hit reconstructs
+and the decls a miss parses are identical (the write stores exactly
+load_core_file's post-parse output), so the merged stream - and the C
+the cascade+typer emit from it - is byte-identical warm vs cold.
+""")]
+pub fn load_core_module(path: String, cache_dir: String)
+                    : Option[CoreCacheLoaded] / Console + File =
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
+    Ok(src) -> match cc_lookup(cache_dir, src) {
+      CcHit(decls, rows) -> {
+        # Reconstruct the ModuleEntry from the cached decls. The blob
+        # already holds the doc- and test-stripped, origin-tagged decls
+        # load_core_file produces, so only the export tables are rebuilt.
+        let mod_name = module_name_of_path(path)
+        let ftab = st_of_entries(rows)
+        let exports = collect_pub_exports(decls, ftab, [])
+        let unstable_exports = collect_unstable_exports(decls, ftab, [])
+        Some(CclLoaded(CoreL(decls, ME(mod_name, exports, path, unstable_exports), rows), true))
+      }
+      CcMiss(content_hex) -> match load_core_file(path) {
+        None -> None
+        Some(pl) -> match pl {
+          CoreL(ds, _, rows) -> {
+            let _w = cc_write(cache_dir, content_hex, ds, rows)
+            Some(CclLoaded(pl, false))
+          }
+        }
+      }
+    }
+  }

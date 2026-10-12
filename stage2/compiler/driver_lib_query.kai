@@ -1,0 +1,242 @@
+#[doc("""
+Library-mode probes: reading a probe's position and answering it against
+the typed module.
+""")]
+
+import compiler.util
+import compiler.chars
+import compiler.ast
+import compiler.symtab
+import compiler.modules_paths
+import compiler.emit_shared
+import compiler.infer_json_base
+import compiler.driver_enclosing
+import compiler.driver_enc_call
+import compiler.driver_def
+import compiler.driver_lib_symbols
+
+#[doc("A single probe parsed out of the source.")]
+pub type LibProbe = LbP(String, Int, Int)   # kind, line, col
+
+# Tiny non-negative integer parser. Consumes leading digits only;
+# stops at the first non-digit. Returns Some(Int) when at least one
+# digit was consumed, None otherwise. Used by probe-comment parsing.
+fn lib_parse_uint_loop(s: String, i: Int, n: Int, acc: Int, any: Bool) : Option[Int] {
+  if i >= n {
+    if any { Some(acc) } else { None }
+  } else {
+    match char_at(s, i) {
+      None    -> if any { Some(acc) } else { None }
+      Some(c) -> if ch_is_digit(c) {
+                   lib_parse_uint_loop(s, i + 1, n, acc * 10 + (char_to_int(c) - char_to_int('0')), true)
+                 } else if any { Some(acc) } else { None }
+    }
+  }
+}
+
+fn lib_parse_uint(s: String) : Option[Int] =
+  lib_parse_uint_loop(s, 0, string_length(s), 0, false)
+
+#[doc("""
+Parse "<line>:<col>" → Some((line, col)).
+""")]
+pub type LineColPair = LC(Int, Int)
+
+#[doc("Parse a `line:col` pair.")]
+pub fn lib_parse_linecol(s: String) : Option[LineColPair] {
+  let n = string_length(s)
+  let colon = lib_find_char(s, 0, n, ':')
+  if colon < 0 { None }
+  else {
+    let l_str = string_slice(s, 0, colon)
+    let c_str = string_slice(s, colon + 1, n - (colon + 1))
+    match lib_parse_uint(l_str) {
+      None    -> None
+      Some(l) -> match lib_parse_uint(c_str) {
+                   None    -> None
+                   Some(c) -> Some(LC(l, c))
+                 }
+    }
+  }
+}
+
+#[doc("The index of the first `want` in `s` from `i` up to `n`, or -1.")]
+pub fn lib_find_char(s: String, i: Int, n: Int, want: Char) : Int {
+  if i >= n { 0 - 1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == want { i } else { lib_find_char(s, i + 1, n, want) }
+      None    -> 0 - 1
+    }
+  }
+}
+
+#[doc("""
+Skip ASCII spaces / tabs starting at i; return the first non-space
+offset (or n if EOL).
+""")]
+pub fn lib_skip_ws(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ' ' or c == '\t' { lib_skip_ws(s, i + 1, n) } else { i }
+      None    -> i
+    }
+  }
+}
+
+#[doc("Scan to the next ASCII whitespace boundary (space, tab, newline, EOL).")]
+pub fn lib_scan_token_end(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ' ' or c == '\t' or c == '\n' or c == '\r' { i }
+                 else { lib_scan_token_end(s, i + 1, n) }
+      None    -> i
+    }
+  }
+}
+
+#[doc("Scan to the next newline; return its offset (or n if no newline).")]
+pub fn lib_scan_to_eol(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '\n' { i } else { lib_scan_to_eol(s, i + 1, n) }
+      None    -> i
+    }
+  }
+}
+
+#[doc("""
+Match a literal substring at offset i. Returns true when the next
+`|sub|` chars equal `sub`.
+""")]
+pub fn lib_match_at(s: String, i: Int, sub: String) : Bool {
+  let m = string_length(sub)
+  let n = string_length(s)
+  if i + m > n { false }
+  else { string_slice(s, i, m) == sub }
+}
+
+# ---------------- JSON serialization ----------------
+
+fn lib_json_pos(line: Int, col: Int) : String =
+  concat_all([
+    "\"line\": ", int_to_string(line),
+    ", \"col\": ", int_to_string(col)
+  ])
+
+fn lib_json_enc(opt: Option[EncResult]) : String {
+  match opt {
+    None -> "{\"node_kind\": null}"
+    Some(ER(kn, l, c, _)) ->
+      concat_all([
+        "{\"node_kind\": ", json_str(kn),
+        ", \"node_line\": ", int_to_string(l),
+        ", \"node_col\": ", int_to_string(c),
+        "}"
+      ])
+  }
+}
+
+fn lib_json_type(tab: SymTab, opt: Option[Ty]) : String {
+  match opt {
+    None    -> "null"
+    Some(t) -> json_str(ty_to_string(tab, t))
+  }
+}
+
+fn lib_run_probe(tm: TypedModule, tab: SymTab, raw_decls: [Decl], p: LibProbe) : String {
+  match p {
+    LbP(kind, line, col) -> {
+      let head = concat_all([
+        "{\"kind\": ", json_str(kind),
+        ", ", lib_json_pos(line, col)
+      ])
+      if kind == "type" {
+        let enc = enclosing_node(tm, line, col)
+        let ty = type_at(tm, line, col)
+        concat_all([head,
+          ", \"enclosing\": ", lib_json_enc(enc),
+          ", \"type\": ", lib_json_type(tab, ty),
+          "}"])
+      } else if kind == "enc" {
+        let enc = enclosing_node(tm, line, col)
+        concat_all([head,
+          ", \"enclosing\": ", lib_json_enc(enc),
+          "}"])
+      } else if kind == "def" {
+        let hit = def_hit_at(tm.tm_decls, tab, line, col)
+        let nm_field = match hit { None -> json_null()  Some(DH(s, _)) -> json_str(s) }
+        let dl = match hit { None -> None  Some(DH(_, loc)) -> loc }
+        concat_all([head,
+          ", \"identifier\": ", nm_field,
+          ", \"def\": ", lib_json_def(tm.tm_file, dl),
+          "}"])
+      } else if kind == "complete" {
+        # LSP completion. Enumerate every callable name in scope at
+        # the cursor: top-level decls in the root file plus core /
+        # stdlib decls (origin != None). Local bindings are out of
+        # scope — covering 90% of editor autocomplete cases.
+        #
+        # Each entry: {name, kind, signature}. The shim layer adds
+        # LSP CompletionItem fields (kind code, sortText, ...).
+        let comps = lib_collect_completions(tm.tm_decls, tab)
+        concat_all([head,
+          ", \"completions\": [", join_with(comps, ", "), "]",
+          "}"])
+      } else if kind == "sig" {
+        # LSP signatureHelp. Walk to the innermost ECall whose
+        # argument list contains the cursor; emit the callee's
+        # type so the editor can render the parameter hints. Falls
+        # back to `null` when the cursor isn't inside any call.
+        let sig = lib_signature_at(tm, tab, line, col)
+        concat_all([head,
+          ", \"signature\": ", sig,
+          "}"])
+      } else if kind == "symbols" {
+        # LSP documentSymbol support. Lists every top-level decl
+        # authored in the root file (module_origin =
+        # None). Line/col on the probe are ignored — symbols is a
+        # whole-file query, not positional.
+        #
+        # We walk the pre-elaboration `raw_decls` (parser shape) so
+        # DType / DConst survive — the typer drops DType and reshapes
+        # DConst into DAttribPure(DFn), neither of which carries the
+        # parser-visible identity.
+        let syms = lib_collect_symbols(raw_decls, tab, module_name_of_path(tm.tm_file))
+        concat_all([head,
+          ", \"symbols\": [", join_with(syms, ", "), "]",
+          "}"])
+      } else {
+        # Unknown kind — surface the input so fixture authors can
+        # spot the typo without having to grep the source.
+        concat_all([head,
+          ", \"error\": \"unknown probe kind\"",
+          "}"])
+      }
+    }
+  }
+}
+
+#[doc("The JSON answer to each probe, in order.")]
+pub fn lib_run_probes(tm: TypedModule, tab: SymTab, raw_decls: [Decl], ps: [LibProbe]) : [String] =
+  map(ps, (p) => lib_run_probe(tm, tab, raw_decls, p))
+
+# ----- signature help -----
+#
+# Walk the typed module looking for the innermost ECall — the one starting
+# last at or before the cursor. Emit the callee's inferred type so
+# the shim can render the parameter hints. Returns the JSON literal
+# "null" when no enclosing call is found.
+fn lib_signature_at(tm: TypedModule, tab: SymTab, line: Int, col: Int) : String =
+  match find_enc_call(tm.tm_decls, line, col, None) {
+    None -> "null"
+    Some(EC(callee, d, _, _)) ->
+      concat_all([
+        "{\"name\": ", json_str(call_name_of(callee, tab, d)),
+        ", \"type\": ", lib_json_type(tab, callee.ty),
+        "}"
+      ])
+  }

@@ -67,9 +67,9 @@ boot_platform() {
 # The stdlib core modules a kaic2 auto-loads; their effect declarations are
 # emitted into the C, so they are inputs of a kaic2-class boot.
 core_files() {
-  files="$(sed -n '/^fn core_module_files()/,/^]/s/^ *"\([^"]*\.kai\)",*$/\1/p' \
-    "$STAGE2/compiler/driver.kai")"
-  [ -n "$files" ] || die "core module set not found in stage2/compiler/driver.kai"
+  files="$(sed -n '/^pub fn core_module_files()/,/^]/s/^ *"\([^"]*\.kai\)",*$/\1/p' \
+    "$STAGE2/compiler/driver_core_load.kai")"
+  [ -n "$files" ] || die "core module set not found in stage2/compiler/driver_core_load.kai"
   echo "$files"
 }
 
