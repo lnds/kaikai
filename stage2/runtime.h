@@ -3148,11 +3148,16 @@ typedef enum {
 typedef struct KaiFiber   KaiFiber;
 /* `n` consecutive slots a frame owns across a call that can unwind; a
  * non-local exit that skips the frame releases each non-NULL slot. A
- * negative `n` names what `base` is instead: a handle's node, or a lazy
- * cell whose thunk is running. */
+ * negative `n` names what `base` is instead: a handle's node, a lazy
+ * cell whose thunk is running, or the initialiser of a constant being
+ * evaluated. */
 typedef struct { KaiValue **base; intptr_t n; } KaiUnwEntry;
 #define KAI_UNW_HANDLE (-1)
 #define KAI_UNW_SEQ    (-2)
+#define KAI_UNW_CONST  (-3)
+/* A constant this fiber evaluated, keyed by its initialiser; not `ready`
+ * while the initialiser runs. */
+typedef struct { KaiFn init; KaiValue *value; int ready; } KaiConstCell;
 /* What an op clause runs after a non-tail `resume`, waiting for the exit
  * of the handle whose node it names. */
 typedef struct { KaiEvidence *node; KaiValue *clo; } KaiResumeFrame;
@@ -3408,6 +3413,11 @@ struct KaiFiber {
     /* Cells pending reclamation in this fiber's free drain, allocated on
      * its first drain. */
     struct KaiFreeStack *free_stack;
+    /* The constants of a lazy type this fiber has read, each evaluated
+     * once and kept until the fiber ends. */
+    KaiConstCell *consts;
+    uint32_t      const_n;
+    uint32_t      const_cap;
 };
 
 /* The per-context half of a fiber's state. A segment switch exchanges it, so
@@ -9105,6 +9115,88 @@ static KaiValue *kai_seq_run(KaiValue *s) {
 static KaiValue *kai_seq_force(KaiValue *s) {
     if (s->variant_tag == KAI_SEQ_DONE) return kai_seq_take(s);
     return kai_seq_run(s);
+}
+
+/* ---------- constants of a lazy type ---------- */
+
+static KaiConstCell *kai_const_find(KaiFiber *f, KaiFn init) {
+    for (uint32_t i = 0; i < f->const_n; i++) {
+        if (f->consts[i].init == init) return &f->consts[i];
+    }
+    return NULL;
+}
+
+/* An exit past a constant's initialiser: the constant is unevaluated
+ * again, and the evaluating frame's reference to `init` goes. */
+static void kai_const_abandon(KaiFiber *f, KaiValue *init) {
+    KaiConstCell *c = kai_const_find(f, init->as.clo.fn);
+    if (c != NULL) *c = f->consts[--f->const_n];
+    kai_decref(init);
+}
+
+/* Release a sequence nothing will read again, emptying each cell of its
+ * spine on the way. A sequence defined through itself ends in a cycle (the
+ * cell not yet read holds, in its thunk, cells that lead back to it), which
+ * a plain release would leave behind; an emptied cell ends every cycle that
+ * passes through it. Consumes `s`. */
+static void kai_seq_unravel(KaiValue *s) {
+    while (kai_is_ptr(s) && s->tag == KAI_SEQ && s->as.seq.slot != NULL) {
+        KaiValue *held = s->as.seq.slot;
+        KaiValue *rest = NULL;
+        if (s->variant_tag == KAI_SEQ_DONE && kai_is_ptr(held) && held->tag == KAI_VARIANT
+            && held->var_n_args > 0) {
+            int last = held->var_n_args - 1;
+            uint32_t mask = kai_slot_mask_of(held->variant_tag);
+            if (mask == 0 || kai_var_slot_kind(mask, last) == KAI_VAR_SLOT_PTR) {
+                rest = kai_incref(kai_var_slots(held)[last].ptr);
+            }
+        }
+        s->as.seq.slot = NULL;
+        s->variant_tag = KAI_SEQ_DONE;
+        kai_decref(held);
+        kai_decref(s);
+        s = rest;
+    }
+    kai_decref(s);
+}
+
+/* What the fiber kept for its constants goes when it ends. Newest first:
+ * a release can run a `finally` that reads a constant. */
+static void kai_fiber_consts_drop(KaiFiber *f) {
+    while (f->const_n > 0) kai_seq_unravel(f->consts[--f->const_n].value);
+    free(f->consts);
+    f->consts = NULL;
+    f->const_cap = 0;
+}
+
+/* The value the initialiser `init` builds, built once by the fiber that
+ * asks: every later read by that fiber shares it. A read that arrives
+ * while `init` runs is the constant reading itself. Consumes `init`. */
+static KaiValue *kai_seq_once(KaiValue *init) {
+    KaiFiber *f = kai_current_fiber();
+    KaiFn key = init->as.clo.fn;
+    KaiConstCell *c = kai_const_find(f, key);
+    if (c != NULL) {
+        kai_decref(init);
+        if (!c->ready) return kai_core_panic(kai_str("constant depends on itself"));
+        return kai_incref(c->value);
+    }
+    if (f->const_n == f->const_cap) {
+        uint32_t cap = f->const_cap ? f->const_cap * 2 : 4;
+        KaiConstCell *buf = (KaiConstCell *) realloc(f->consts, (size_t) cap * sizeof(KaiConstCell));
+        if (buf == NULL) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        f->consts = buf;
+        f->const_cap = cap;
+    }
+    f->consts[f->const_n++] = (KaiConstCell) { key, NULL, 0 };
+    kai_unw_push((KaiValue **) init, KAI_UNW_CONST);
+    KaiValue *v = kai_apply_borrow(init, 0, NULL);
+    kai_unw_pop(f);
+    c = kai_const_find(f, key);
+    c->value = v;
+    c->ready = 1;
+    kai_decref(init);
+    return kai_incref(v);
 }
 
 static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
@@ -17676,6 +17768,9 @@ static void kai_fiber_trampoline(void) {
         /* Borrowed: a cancel longjmps past any release after the call. */
         self->result = kai_apply_borrow(self->thunk, 0, NULL);
         self->cancel_pad_set = 0;
+        /* Before the terminal state: once it is stored another thread
+         * may read the result, which can share cells with a constant. */
+        kai_fiber_consts_drop(self);
         self->state  = KAI_FIBER_DONE;
     } else {
         /* Cancel or trap landing: the yield-point hook, the default
@@ -17686,6 +17781,7 @@ static void kai_fiber_trampoline(void) {
          * the store is what lets the nursery owner join this fiber,
          * finish its drain, and free the scope. */
         self->cancel_pad_set = 0;
+        kai_fiber_consts_drop(self);
         kai_nursery_propagate_failure(self);
         self->state = KAI_FIBER_CANCELLED;
     }
@@ -17874,6 +17970,15 @@ static int kai_read_rc_runs(void) {
     return n < 1 ? 1 : (int) n;
 }
 
+/* main, as many times as the ledger asks, on the fiber that is current;
+ * what that fiber kept for its constants goes with the last run. */
+static KaiValue *kai_main_runs(KaiValue *(*user_main)(void)) {
+    for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(user_main());
+    KaiValue *r = user_main();
+    kai_fiber_consts_drop(kai_current_fiber());
+    return r;
+}
+
 #if defined(__APPLE__) || defined(__clang__)
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -17887,8 +17992,7 @@ static void kai_bootstrap_trampoline(void) {
     KaiFiber *self = w->active;
     kai_drain_pending_free(w);
     self->state = KAI_FIBER_RUNNING;
-    for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(kai_user_main_fn());
-    kai_user_main_result = kai_user_main_fn();
+    kai_user_main_result = kai_main_runs(kai_user_main_fn);
     self->state = KAI_FIBER_DONE;
     /* Program is over: flip the shutdown flag. kai_sched_bootstrap wakes
      * the parked workers and the reactor once thread 0's loop sees it. */
@@ -17903,8 +18007,7 @@ static void kai_bootstrap_trampoline(void) {
 
 #if defined(KAI_MAIN_STACK_SIZE)
 static void kai_sized_main_trampoline(void) {
-    for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(kai_user_main_fn());
-    kai_user_main_result = kai_user_main_fn();
+    kai_user_main_result = kai_main_runs(kai_user_main_fn);
 }
 
 /* One thread, main on a stack of KAI_MAIN_STACK_SIZE instead of the OS
@@ -18044,8 +18147,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
 #if defined(KAI_MAIN_STACK_SIZE)
         return kai_run_main_on_sized_stack(user_main);
 #endif
-        for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(user_main());
-        return user_main();
+        return kai_main_runs(user_main);
     }
 
     kai_user_main_fn = user_main;
@@ -19064,14 +19166,22 @@ static inline void kai_unw_pop(KaiFiber *f) { f->unw_top--; }
 
 static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node);
 
-/* Release every slot above `mark`, innermost frame first. A handle's
- * entry drops the resume frames it was draining; a lazy cell's gives the
- * cell its thunk back. */
+/* An entry that names something other than slots: a handle's drops the
+ * resume frames it was draining, a lazy cell's gives the cell its thunk
+ * back, a constant's leaves it unevaluated. Out of line, so the loop that
+ * releases slots pays one test for all three. */
+__attribute__((noinline))
+static void kai_unw_release_named(KaiFiber *f, KaiUnwEntry e) {
+    if (e.n == KAI_UNW_HANDLE) kai_resume_frames_drop(f, (KaiEvidence *) e.base);
+    else if (e.n == KAI_UNW_SEQ) kai_seq_abandon((KaiValue *) e.base);
+    else kai_const_abandon(f, (KaiValue *) e.base);
+}
+
+/* Release every slot above `mark`, innermost frame first. */
 KAI_RT_SHARED void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
     while (f->unw_top > mark) {
         KaiUnwEntry e = f->unw_buf[--f->unw_top];
-        if (e.n == KAI_UNW_HANDLE) kai_resume_frames_drop(f, (KaiEvidence *) e.base);
-        else if (e.n == KAI_UNW_SEQ) kai_seq_abandon((KaiValue *) e.base);
+        if (e.n < 0) kai_unw_release_named(f, e);
         for (intptr_t i = 0; i < e.n; i++) {
             if (e.base[i] != NULL) kai_decref(e.base[i]);
         }

@@ -2,8 +2,9 @@
 # Usage: test-seq.sh c|native|asan
 #
 # The lazy sequence fixtures (examples/perceus/seq_*.kai) on one backend:
-# each prints its golden, and the one that reads past the end panics with
-# the library's message after printing what came before. `c` also drives
+# each prints its golden, and the ones that read past the end or define a
+# constant through its own value panic with their message after printing
+# what came before. `c` also drives
 # the cell's states from C (stage2/tests/seq_cell_test.c); `asan` runs
 # both under ASAN+UBSan.
 set -u
@@ -38,19 +39,24 @@ clean() {
   fi
 }
 
-for f in seq_sieve seq_shared_once seq_pipes seq_defer_root_lambda seq_region_border seq_trap_in_fiber; do
+for f in seq_sieve seq_shared_once seq_pipes seq_defer_root_lambda seq_region_border seq_trap_in_fiber \
+         seq_const_fibs seq_const_shared seq_const_per_fiber; do
   build "$f"
   run "$exe" > "$exe.out" 2> "$exe.err" || { cat "$exe.err"; fail "$f exited non-zero"; }
   clean "$exe.err" "$f"
   diff -u "$FIX/$f.out.expected" "$exe.out" || fail "$f output"
 done
 
-f=seq_nth_out_of_range
-build "$f"
-if run "$exe" > "$exe.out" 2> "$exe.err"; then fail "$f read past the end without a panic"; fi
-clean "$exe.err" "$f"
-grep -q "seq.nth: index out of range" "$exe.err" || { cat "$exe.err"; fail "$f panic message"; }
-diff -u "$FIX/$f.out.expected" "$exe.out" || fail "$f output"
+# panics <fixture> <message>
+panics() {
+  build "$1"
+  if run "$exe" > "$exe.out" 2> "$exe.err"; then fail "$1 did not panic"; fi
+  clean "$exe.err" "$1"
+  grep -q "$2" "$exe.err" || { cat "$exe.err"; fail "$1 panic message"; }
+  diff -u "$FIX/$1.out.expected" "$exe.out" || fail "$1 output"
+}
+panics seq_nth_out_of_range "seq.nth: index out of range"
+panics seq_const_reads_itself "constant depends on itself"
 
 if [ "$mode" != native ]; then
   t="$OUT/seq-$mode-cell-test"

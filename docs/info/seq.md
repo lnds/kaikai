@@ -158,6 +158,40 @@ seq.range(a, hi, step)    Seq[Int]   a, a + step, … up to hi
 `to_list`, `each` and `foldl` on an endless sequence do not return: cut
 it first with `take` or `take_while`.
 
+## Constants
+
+A `const` whose type holds a `Seq` is evaluated once by each fiber that
+reads it and kept until that fiber ends. Every read shares its cells,
+so the constant may appear in its own initialiser: a sequence defined
+in terms of itself.
+
+```kaikai
+import seq
+
+fn sum2(a: Seq[Int], b: Seq[Int]) : Seq[Int] = match a {
+  []         -> lazy []
+  [x, ...xs] -> match b {
+    []         -> lazy []
+    [y, ...ys] -> lazy [x + y, ...sum2(xs, ys)]
+  }
+}
+
+const FIBS : Seq[Int] = lazy [0, 1, ...sum2(FIBS, drop(FIBS, 1))]
+
+fn main() : Unit / Stdout = {
+  Stdout.print(show(to_list(take(FIBS, 10))))   # [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+  Stdout.print(show(nth(FIBS, 80)))             # 23416728348467685
+}
+```
+
+The rule follows the type: a `const` of a record or a sum with a `Seq`
+inside is kept the same way, and any other `const` is still evaluated
+at each read. The constant holds the cells it has computed for the life
+of its fiber, and each fiber builds its own. A constant read while its
+own initialiser runs has no value yet: `const LOOP : Seq[Int] =
+drop(LOOP, 1)` panics with `constant depends on itself`. Reading it
+inside a `...spread` or a stage is fine, since that runs later.
+
 ## Lazy carriers
 
 Three types defer work, one intent each:
@@ -172,12 +206,10 @@ Seq[t]         pure; shared; evaluated at most once      (import seq)
 ## Notes
 
 - **Sharing goes through a name.** A sequence bound with `let`, passed
-  as an argument or returned from a function is one chain of cells, and
-  every reader sees what the others computed. A `const` is not such a
-  name: its initialiser runs at every read, so a `const` of type `Seq`
-  is a fresh sequence each time and shares nothing. A function that
-  defines a sequence through a call to itself likewise builds new cells
-  per call.
+  as an argument, returned from a function or named by a `const` is one
+  chain of cells, and every reader sees what the others computed. A
+  function that defines a sequence through a call to itself builds new
+  cells per call.
 - Holding the first cell keeps every cell computed after it. Walk a
   long sequence through a name that is not used afterwards, and the
   cells behind the walk are freed as it goes.

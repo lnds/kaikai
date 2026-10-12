@@ -239,12 +239,22 @@ noted): the 1,000-prime sieve of `examples/perceus/seq_sieve.kai`
 allocates 1,558,313 cells and frees all but the `SeqEnd` singleton,
 peak 5,013 live.
 
+A `const` whose type holds a `Seq` is the one constant with storage.
+Every other constant is re-evaluated at each read; this one is built
+once by each fiber that reads it (`kai_seq_once`, a table on the fiber
+keyed by the constant's initialiser) and kept until the fiber ends, so
+its reads share one value and it may name itself in its own
+initialiser. It retains the prefix it has computed for the fiber's
+life, like a CAF. A sequence defined through itself ends in a cycle:
+the cell not yet read holds, in its thunk, cells that lead back to it.
+When the fiber ends the runtime empties each cell of the constant's
+spine before releasing it, which ends every such cycle, so
+`examples/perceus/seq_const_fibs.kai` frees everything but the `SeqEnd`
+singleton. A constant read while its own initialiser runs panics with
+`constant depends on itself`.
+
 What does NOT hold yet:
 
-- **A `const` of type `Seq` shares nothing.** A constant has no
-  storage (`compiler/const_init.kai`): every read evaluates its
-  initialiser, so each read builds a fresh cell and a sequence defined
-  through a `const` in terms of itself recomputes without bound.
 - **Force depth is the number of stages.** Each stage of a chain is a
   call frame while the innermost cell is read. On the main stack the
   1,000-prime sieve runs; in a spawned fiber (64 KiB stack) it
