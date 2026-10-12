@@ -80,6 +80,15 @@ happen** — "make test clean" as prose is not the same as
 The 3-level gate's "Level 2 invariant verifier + audit" and most of
 "Level 3 demo gate" map onto Tier 1.
 
+**Fixture optimisation level.** On a PR the light slices compile each
+fixture's emitted C at `-O0` (`TIER1_LIGHT_OPT` in the root `Makefile`,
+passed to `test-light-shard` as `LIGHT_OPT`). A fixture's C build is
+almost all clang optimising the runtime and the core it includes, and a
+test needs its program to run, not to run fast. The phases outside the
+light slices — the self-compiles, the RC ledger, the namespace axes, the
+sanitizer shards — keep the flags their recipes set. Running
+`make -C stage2 <target>` by hand still uses `-O2`.
+
 ## Negative-space discipline (issue #511)
 
 Positive tests assert "this valid program compiles and runs". They do
@@ -531,7 +540,9 @@ reach zero**, exactly like the skip-list in `tests/fmt_selfhost.sh`.
 
 ## Tier 2 — `make daily` (end of day / cron)
 
-Runs once a day on `main` HEAD, not on each PR.
+Runs once a day on `main` HEAD, not on each PR. Its shards run with
+`TIER1_LIGHT_OPT=-O2`, so every light fixture's emitted C still goes
+through the optimiser once a day.
 
 ```
 make tier1

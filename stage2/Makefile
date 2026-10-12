@@ -14016,11 +14016,15 @@ SHARD  ?= 1
 SHARDS ?= 1
 TIER1_LIGHT_PLAN = ../tools/tier1-light-plan.sh
 TIER1_SELFHOSTS ?= 1
+# The optimisation level the slice's fixtures are compiled at; the slice's
+# own prerequisites keep $(CFLAGS).
+LIGHT_OPT ?= -O2
+LIGHT_CFLAGS = $(patsubst -O2,$(LIGHT_OPT),$(CFLAGS))
 test-light-shard: $(TARGET) bin-kai build core-cache-warm
 	@slice=$$(TIER1_SELFHOSTS=$(TIER1_SELFHOSTS) sh $(TIER1_LIGHT_PLAN) $(SHARD) $(SHARDS) $(TEST_LIGHT_TARGETS)) || exit 1; \
 	echo "test-light-shard $(SHARD)/$(SHARDS): $$(echo $$slice | wc -w | tr -d ' ') targets"; \
 	start=$$(date +%s); rc=0; \
-	[ -z "$$slice" ] || $(MAKE) -j$(TEST_JOBS) $$(printf ' tier1-light-timed-%s' $$slice) || rc=$$?; \
+	[ -z "$$slice" ] || $(MAKE) -j$(TEST_JOBS) CFLAGS='$(LIGHT_CFLAGS)' $$(printf ' tier1-light-timed-%s' $$slice) || rc=$$?; \
 	echo "tier1-light-slice $(SHARD) $$(( $$(date +%s) - start ))"; \
 	exit $$rc
 
