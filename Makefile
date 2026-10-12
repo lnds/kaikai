@@ -579,15 +579,16 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #  shard 3 — partition + BinSerialize linearity, core text, HTTP redirects,
 #            fmt meaning-preservation corpus part 1/3, and the two C-modular
 #            axes of the namespace-collision corpus.
-#  shard 4 — the whole-compiler modular self-host.
+#  shard 4 — the whole-compiler modular self-host, and the first half of
+#            the Perceus RC leak ledger.
 #  shard 5 — fmt fixtures + fmt self-hosting, packages, editions, kai info.
 #  shard 6 — the modular-escape gate, fmt meaning-preservation part 2/3.
 #  shard 7 — the CLI/tooling tail.
-#  shard 8 — fmt meaning-preservation part 3/3 + the demos baseline.
+#  shard 8 — fmt meaning-preservation part 3/3.
 #
-# The Perceus RC leak ledger is split in two (KAI_LEAK_SHARD): the tier0 CI
-# job runs the first half after its gates, shard 1 the second. It is not
-# part of `tier0` locally.
+# The Perceus RC leak ledger is split in two (KAI_LEAK_SHARD): shard 4 runs
+# the first half, shard 1 the second. The demos baseline is a tier0 gate, so
+# no shard repeats it; `tier1-unsharded` carries it for the daily run.
 #
 # The two modular self-hosts (shards 4 and 6) only detect regressions in the
 # sources they compile, so CI passes TIER1_SELFHOSTS=0 on PRs that touch no
@@ -599,7 +600,7 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
 #     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
-#     light(1/8) .. light(8/8), test-fmt-property, demos-no-regression,
+#     light(1/8) .. light(8/8), test-fmt-property,
 #     test-fmt, test-fmt-package, test-fmt-width, test-fmt-selfhost,
 #     test-fmt-help-scope, test-bench, test-check, test-typecheck,
 #     test-check-parity, test-library-mode, test-lsp,
@@ -611,7 +612,8 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #     test-release-platforms, test-kaic-boot, test-cli-flags, test-kai-cli,
 #     test-partition-linearity, test-binserialize-linearity,
 #     test-core-text, test-http-redirects }
-# plus both halves of rc-leak-gate cover the prerequisites of `tier1` (the
+# plus both halves of rc-leak-gate and tier0's demos-no-regression cover the
+# prerequisites of `tier1` (the
 # light slices union to TEST_LIGHT_TARGETS, asserted by
 # `test-light-partition` in tier0).
 # Adding a phase to `tier1` means adding it to a shard.
@@ -672,9 +674,10 @@ tier1-shard-4: kaic2
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-modular-selfhost
 endif
+	KAI_LEAK_SHARD=1/2 $(MAKE) rc-leak-gate
 	$(call tier1-light-slice,4)
 	$(call tier1-shard-wall,4)
-	@echo "tier1-shard-4 OK — whole-compiler c-modular link (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 4/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-4 OK — whole-compiler c-modular link (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + Perceus RC leak ledger (first half) + light slice 4/$(TIER1_LIGHT_SLICES)"
 
 tier1-shard-5: kaic2
 	$(tier1-shard-start)
@@ -703,10 +706,9 @@ tier1-shard-7: kaic2
 tier1-shard-8: kaic2
 	$(tier1-shard-start)
 	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=3/3
-	$(MAKE) demos-no-regression
 	$(call tier1-light-slice,8)
 	$(call tier1-shard-wall,8)
-	@echo "tier1-shard-8 OK — fmt meaning-preservation (corpus part 3/3) + demos baseline + light slice 8/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-8 OK — fmt meaning-preservation (corpus part 3/3) + light slice 8/$(TIER1_LIGHT_SLICES)"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
@@ -1459,8 +1461,8 @@ daily-tail: selfhost stress-fixtures coverage-probe rc-budget test-binserialize-
 	@echo "daily-tail OK — C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
 # The `tier1` prerequisites that no tier1-shard-N runs.
-tier1-unsharded: test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit rc-leak-gate
-	@echo "tier1-unsharded OK — stage0/stage1 tests + phase4 demos + multi-module/import probes + migrate + M:N determinism + runtime-global audit + Perceus RC leak ledger"
+tier1-unsharded: demos-no-regression test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit rc-leak-gate
+	@echo "tier1-unsharded OK — demos baseline + stage0/stage1 tests + phase4 demos + multi-module/import probes + migrate + M:N determinism + runtime-global audit + Perceus RC leak ledger"
 
 # Stress fixtures: closed regressions that exercise patterns the
 # per-feature suite does not — R3 scrutinee-reuse RC
