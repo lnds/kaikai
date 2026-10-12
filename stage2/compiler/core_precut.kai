@@ -1,0 +1,192 @@
+#[doc("""
+The core functions a program cannot name, emptied before any pass walks them.
+
+Every pass between the parser and the reachability cut walks the whole
+core, though a program reaches a small part of it. This empties the body
+of each core function no kept declaration spells: a name written in the
+program, in a core declaration that is not a function, or in a kept core
+function. The declaration stays, with its name, its place and its
+signature, and the symbol table is left whole, so every name resolves to
+what it always did and every diagnostic outside those bodies is unchanged.
+The reachability cut then drops what was emptied; a function it keeps
+after all means this cut was wrong, and the compile starts over without it.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.core_refs
+import compiler.core_modules
+import compiler.derive_mint
+import compiler.core_reach
+import compiler.chars
+
+type PcSt = { tab: SymTab, fns: NameIndex[Decl], live: NameIndex[String], work: [Decl] }
+
+#[doc("The core functions a program can name: the ones something in `user`, in a declaration of `core` that is not a function, or in another of them spells.")]
+pub type PreCut = { tab: SymTab, live: NameIndex[String] }
+
+#[doc("How much of the core the early cut empties: what the program cannot name, every function, or nothing.")]
+pub type EarlyCut = EcReached | EcAll | EcOff
+
+#[doc("The cut that empties every core function.")]
+pub fn precut_all(tab: SymTab) : PreCut = PreCut { tab: tab, live: idx_empty() }
+
+#[doc("True when the cut can save more than it costs: it walks all of `user` to spare the front end at most all of `core`.")]
+pub fn precut_pays(core: [Decl], user: [Decl]) : Bool = list_length(user) < list_length(core)
+
+#[doc("The cut of `core` for the program `user`. `tab` names the declarations of both.")]
+pub fn core_precut(core: [Decl], user: [Decl], tab: SymTab) : PreCut = {
+  let st0 = PcSt { tab: tab, fns: pc_index(core, tab, idx_empty()), live: idx_empty(), work: [] }
+  let all = list_append(user, core)
+  let lib = if any(all, pc_derives) { pc_lib_names(core, tab) } else { [] }
+  let seeded = pc_names(lib, pc_fields(all, pc_names(map(variants[CoreFn](), core_fn_name), st0)))
+  let st = pc_drain(pc_decls(filter(core, (d) => not pc_is_fn(d)), pc_decls(user, seeded)))
+  PreCut { tab: tab, live: st.live }
+}
+
+#[doc("The functions of `core` the cut `pc` empties.")]
+pub fn precut_emptied(pc: PreCut, core: [Decl]) : [SymId] =
+  map(filter(core, (d) => pc_is_fn(d) and not pc_live(pc.live, pc_fn_name(d, pc.tab))), pc_fn_sym)
+
+#[doc("`core` with the body of each function the cut `pc` empties replaced by the unit value.")]
+pub fn precut_decls(pc: PreCut, core: [Decl]) : [Decl] =
+  map(core, (d) => if not pc_is_fn(d) or pc_live(pc.live, pc_fn_name(d, pc.tab)) { d } else { pc_stub(d) })
+
+fn pc_stub(d: Decl) : Decl = match d {
+  DDoc(a, b, inner, l, c) -> DDoc(a, b, pc_stub(inner), l, c)
+  DAttr(a, inner, l, c)   -> DAttr(a, pc_stub(inner), l, c)
+  DFn(p, id, tbs, ps, ret, row, body, l, c, m) ->
+    DFn(p, id, tbs, ps, ret, row, mk_expr(EUnit, body.line, body.col), l, c, m)
+  _ -> d
+}
+
+# A derive's expansion reads the fields of its type and calls into the
+# derive library, and none of that is written in the program.
+fn pc_derives(d: Decl) : Bool = match d {
+  DDerive(_, _, _, _)     -> true
+  DDoc(_, _, inner, _, _) -> pc_derives(inner)
+  DAttr(_, inner, _, _)   -> pc_derives(inner)
+  _ -> false
+}
+
+fn pc_lib_names(core: [Decl], tab: SymTab) : [String] = match st_module(tab, core_module_name(derive_lib_module())) {
+  None      -> []
+  Some(lib) -> map(filter(core, (d) => pc_is_fn(d) and sym_owned_by(tab, pc_fn_sym(d), lib)), (d) => pc_fn_name(d, tab))
+}
+
+fn pc_fields(ds: [Decl], st: PcSt) : PcSt = match ds {
+  [] -> st
+  [d, ...rest] -> pc_fields(rest, match pc_typed(d) {
+    DType(_, _, _, TBRecord(fs), _, _, _, _) -> pc_names(map(fs, (f) => match f { FD(_, n, _, _) -> n }), st)
+    _ -> st
+  })
+}
+
+fn pc_typed(d: Decl) : Decl = match d {
+  DDerive(_, inner, _, _) -> pc_typed(inner)
+  DDoc(_, _, inner, _, _) -> pc_typed(inner)
+  DAttr(_, inner, _, _)   -> pc_typed(inner)
+  _ -> d
+}
+
+fn pc_index(ds: [Decl], tab: SymTab, ix: NameIndex[Decl]) : NameIndex[Decl] = match ds {
+  [] -> ix
+  [d, ...rest] -> pc_index(rest, tab, if pc_is_fn(d) { idx_prepend(ix, pc_fn_name(d, tab), d) } else { ix })
+}
+
+fn pc_is_fn(d: Decl) : Bool = match pc_bare(d) {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+fn pc_fn_name(d: Decl, tab: SymTab) : String = match pc_bare(d) {
+  DFn(_, id, _, _, _, _, _, _, _, _) -> written_text(sym_name(tab, fnid_sym(id)))
+  _ -> ""
+}
+
+fn pc_fn_sym(d: Decl) : SymId = match pc_bare(d) {
+  DFn(_, id, _, _, _, _, _, _, _, _) -> fnid_sym(id)
+  _ -> sym_none()
+}
+
+# Only a function the reachability cut can drop is emptied: one under a
+# marker that outlives the front end stays whole.
+fn pc_bare(d: Decl) : Decl = match d {
+  DDoc(_, _, inner, _, _) -> pc_bare(inner)
+  DAttr(_, inner, _, _)   -> pc_bare(inner)
+  _ -> d
+}
+
+fn pc_live(live: NameIndex[String], n: String) : Bool = match idx_chain(live, n) {
+  [] -> false
+  _  -> true
+}
+
+fn pc_drain(st: PcSt) : PcSt = match st.work {
+  [] -> st
+  [d, ...rest] -> pc_drain(pc_decl(d, PcSt { ...st, work: rest }))
+}
+
+fn pc_decls(ds: [Decl], st: PcSt) : PcSt = match ds {
+  [] -> st
+  [d, ...rest] -> pc_decls(rest, pc_decl(d, st))
+}
+
+fn pc_decl(d: Decl, st: PcSt) : PcSt = pc_exprs(pc_bodies(d), st)
+
+fn pc_bodies(d: Decl) : [Expr] = match d {
+  DDoc(_, _, inner, _, _)          -> pc_bodies(inner)
+  DAttr(_, inner, _, _)            -> pc_bodies(inner)
+  DDerive(_, inner, _, _)          -> pc_bodies(inner)
+  DProtoLaws(_, inner, _, _, _)    -> pc_bodies(inner)
+  DImplAxiom(_, inner, _, _, _)    -> pc_bodies(inner)
+  DImpl(_, _, _, subs, _, _, _, _) -> flat_map(subs, pc_bodies)
+  _ -> cr_decl_exprs(d)
+}
+
+fn pc_exprs(es: [Expr], st: PcSt) : PcSt = match es {
+  [] -> st
+  [e, ...rest] -> pc_exprs(rest, pc_expr(e, st))
+}
+
+fn pc_expr(e: Expr, st: PcSt) : PcSt = match e.kind {
+  EName(n)       -> pc_name(written_text(n), st)
+  ESym(s, _)     -> pc_name(written_text(sym_name(st.tab, s)), st)
+  EModCall(_, n) -> pc_name(written_text(n), st)
+  EField(_, n)   -> pc_positions(xp_positions(e), pc_name(n, st))
+  EStr(s, _)     -> if string_contains(s, "\x23{") { pc_names(pc_words(chars(s), [], []), st) } else { st }
+  _              -> pc_positions(xp_positions(e), st)
+}
+
+fn pc_positions(ps: [XPos], st: PcSt) : PcSt = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> pc_positions(rest, pc_expr(x, st))
+}
+
+# An interpolation hole is parsed later, so every word of the literal
+# stands for a name it may hold.
+fn pc_words(cs: [Char], cur: [Char], acc: [String]) : [String] = match cs {
+  [] -> pc_flush(cur, acc)
+  [c, ...rest] -> if ch_is_alnum(c) { pc_words(rest, [c, ...cur], acc) }
+                  else { pc_words(rest, [], pc_flush(cur, acc)) }
+}
+
+fn pc_flush(cur: [Char], acc: [String]) : [String] = match cur {
+  [] -> acc
+  _  -> [from_chars(list_reverse(cur)), ...acc]
+}
+
+fn pc_names(ns: [String], st: PcSt) : PcSt = match ns {
+  [] -> st
+  [n, ...rest] -> pc_names(rest, pc_name(n, st))
+}
+
+fn pc_name(n: String, st: PcSt) : PcSt =
+  if pc_live(st.live, n) { st }
+  else { match idx_chain(st.fns, n) {
+    [] -> st
+    ds -> PcSt { ...st, live: idx_prepend(st.live, n, n), work: list_append(ds, st.work) }
+  } }

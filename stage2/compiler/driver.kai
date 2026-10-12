@@ -171,6 +171,7 @@ import compiler.emit_native_modular
 import compiler.lint
 import compiler.law_checks
 import compiler.core_reach
+import compiler.core_precut
 import compiler.ncore_index
 import compiler.cache_ast
 import compiler.doc_attr
@@ -1848,11 +1849,11 @@ pub type Backend = BkC | BkNative | BkCModular | BkNativeModular
 # cannot reach. `inputs` are the arguments and environment a cached native
 # core object may depend on (`ncore_build_inputs`).
 pub type CoreCacheOpt = { dir: String, toolchain: String, stats: Bool, proj_dir: String, nmod_dir: String,
-                           full_core: Bool, inputs: String }
+                           full_core: Bool, early_cut: EarlyCut, inputs: String }
 
 fn cc_opt_off() : CoreCacheOpt =
   CoreCacheOpt { dir: "", toolchain: "", stats: false, proj_dir: "", nmod_dir: "", full_core: false,
-                 inputs: "" }
+                 early_cut: EcReached, inputs: "" }
 
 pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], cores: [String],
                     core_caches: [String], cache_sha: String,
@@ -1922,6 +1923,9 @@ fn cli_with_cc_opt_stats(opts: CliOptions) : CliOptions =
 
 fn cli_with_full_core(opts: CliOptions) : CliOptions =
   cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, full_core: true })
+
+fn cli_with_early_cut(opts: CliOptions, ec: EarlyCut) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, early_cut: ec })
 
 fn cli_with_user_cache_dir(opts: CliOptions, d: String) : CliOptions =
   cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, proj_dir: d })
@@ -2135,6 +2139,12 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
       } else if a == "--full-core" {
         # Type and emit the whole core, not only what the program reaches.
         parse_cli_loop(more, cli_with_full_core(opts))
+      } else if a == "--no-early-cut" {
+        # Walk every core body through the front end; the reachability cut still runs.
+        parse_cli_loop(more, cli_with_early_cut(opts, EcOff))
+      } else if a == "--early-cut-all" {
+        # Empty every core body, so each one the program reaches forces the whole-core retry.
+        parse_cli_loop(more, cli_with_early_cut(opts, EcAll))
       } else if a == "--user-cache" {
         # Opt-in user-file incremental cache.
         parse_cli_loop(more, cli_with_user_cache(opts))
@@ -4409,19 +4419,19 @@ fn lint_owned_mods(expanded: ExpandedProgram) : [String] =
 # Pruning makes the core program-dependent, so it runs only where the
 # compile writes no cache entry keyed without the program. The report
 # modes stay whole: they list what is in scope, reached or not.
-fn core_prunes(mode: Mode, backend: Backend, cc: CoreCacheOpt, core_hit: Option[String]) : Bool = {
-  let cuts = match mode {
-    MDefault   -> true
-    MTest      -> true
-    MBench     -> true
-    MPropCheck -> true
-    MBatchList -> true
-    MCheck     -> true
-    MDiagsJson -> true
-    _          -> false
-  }
-  cuts and not cc.full_core
+fn core_prunes(mode: Mode, backend: Backend, cc: CoreCacheOpt, core_hit: Option[String]) : Bool =
+  core_cut_mode(mode) and not cc.full_core
     and (not core_cache_writes(backend, cc) or core_hit_reusable(backend, core_hit))
+
+fn core_cut_mode(mode: Mode) : Bool = match mode {
+  MDefault   -> true
+  MTest      -> true
+  MBench     -> true
+  MPropCheck -> true
+  MBatchList -> true
+  MCheck     -> true
+  MDiagsJson -> true
+  _          -> false
 }
 
 # Whether this compile writes a core artifact keyed by the core sources and
@@ -4448,7 +4458,7 @@ fn typed_cut_dir(mode: Mode, user_cache: Bool, cc: CoreCacheOpt, path: String) :
 fn prune_note(stats: Bool, prunes: Bool, cut: CoreCut) : Unit / Console =
   if not stats { () }
   else if not prunes { eprint("kaic2: core-prune: off") }
-  else { match cut { CoreCut(_, d) -> eprint("kaic2: core-prune: dropped #{list_length(d)} core functions") } }
+  else { match cut { CoreCut(_, d, _) -> eprint("kaic2: core-prune: dropped #{list_length(d)} core functions") } }
 
 # A native build whose core object the cache already holds writes nothing.
 fn core_hit_reusable(backend: Backend, core_hit: Option[String]) : Bool = match backend {
@@ -4506,6 +4516,17 @@ fn native_core_hit(cc: CoreCacheOpt, pre: String) : Option[String] / File =
 
 fn native_core_cached(cc: CoreCacheOpt) : Bool =
   cc.dir != "" and cc.toolchain != "" and llvm_backend_tag() != ""
+
+fn early_cut(ec: EarlyCut, core: [Decl], user: [Decl], tab: SymTab) : Option[PreCut] = match ec {
+  EcOff     -> None
+  EcReached -> if precut_pays(core, user) { Some(core_precut(core, user, tab)) } else { None }
+  EcAll     -> Some(precut_all(tab))
+}
+
+# The early cut emptied a function the program reaches after all; the
+# compile starts over with every core body in place.
+fn early_cut_note(stats: Bool, names: [String]) : Unit / Console =
+  if stats { eprint("kaic2: core-precut: retried whole (#{string_join(names, ", ")})") } else { () }
 
 fn core_cut_fail(what: String, names: [String]) : Int / Console = {
   eprint(concat_all(["kaic2: internal error: the compile ", what, if list_length(names) == 0 { "" } else { ": " ++ string_join(names, ", ") }]))
@@ -4763,6 +4784,20 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let tab0 = st_program(list_append(core_rows,
               list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _) -> rows }, parsed.names)),
               target_mod_name, core_mod_names(core_mods, []))
+            let nsrcs = native_core_srcs(backend, core_cache, core_mod_names(core_mods, []))
+            let npre = native_core_pre(core_cache, edition, nsrcs)
+            let core_hit = native_core_hit(core_cache, npre)
+            let prunes = core_prunes(mode, backend, core_cache, core_hit)
+            let core_decls_whole = core_decls
+            let core_segs_whole = core_segs
+            let pcut = if prunes { early_cut(core_cache.early_cut, core_decls, surface_decls, tab0) } else { None }
+            let emptied = match pcut { Some(pc) -> precut_emptied(pc, core_decls)  None -> [] }
+            let _pn = if core_cache.stats and is_some(pcut) { eprint("kaic2: core-precut: emptied #{list_length(emptied)} core functions") } else { () }
+            let core_decls = match pcut { Some(pc) -> precut_decls(pc, core_decls)  None -> core_decls }
+            let core_segs = match pcut {
+              Some(pc) -> map(core_segs, (s) => match s { PSeg(m, ds) -> PSeg(m, precut_decls(pc, ds)) })
+              None     -> core_segs
+            }
             # Bounds are stripped by the lowering below; keep them for the
             # monomorphiser, keyed by declaration once the symbols exist.
             let surface_fn_bounds = list_append(collect_surface_bounds(core_decls, tab0),
@@ -5512,7 +5547,17 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 let stamped = stamped_registry(front, proto_reg, all_decls, sym_tab)
                 let proto_reg = stamped.reg
                 let stamp_ids = stamp_targets(proto_reg.impls, lowered.derived, core_mod_names(core_mods, []))
+                let cut = if chk == 0 and prunes {
+                            core_reach(all_decls, sym_tab, core_mod_names(core_mods, []), proto_reg, emptied)
+                          } else { CoreCut(all_decls, [], []) }
+                let missed = match cut { CoreCut(_, _, m) -> m }
                 if chk != 0 { vd_exit(json, [Verdict(chk, rd.diags)]) }
+                else if list_length(missed) > 0 {
+                  early_cut_note(core_cache.stats, core_cut_names(sym_tab, missed))
+                  compile_source(path, mode, backend, strict_holes, search_paths, src, core_decls_whole, core_mods,
+                                 core_segs_whole, core_rows, package_name, unstable_optins, edition, user_cache, batch_out,
+                                 CoreCacheOpt { ...core_cache, early_cut: EcOff }, test_roots, test_plan, kir_verify)
+                }
                 else {
                   # Build the per-compile head-owner cache once from the
                   # post-`expand_imports` decl stream + the
@@ -5523,16 +5568,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # `map / flat_map / filter` participates in `|`, `||`,
                   # `|?` automatically — no compiler change required when
                   # a downstream package adds a new pipe-eligible type.
-                  let nsrcs = native_core_srcs(backend, core_cache, core_mod_names(core_mods, []))
-                  let npre = native_core_pre(core_cache, edition, nsrcs)
-                  let core_hit = native_core_hit(core_cache, npre)
-                  let prunes = core_prunes(mode, backend, core_cache, core_hit)
-                  let cut = if prunes {
-                              core_reach(all_decls, sym_tab, core_mod_names(core_mods, []), proto_reg)
-                            } else { CoreCut(all_decls, []) }
                   prune_note(core_cache.stats, prunes, cut)
-                  let all_decls = match cut { CoreCut(kept, _) -> kept }
-                  let dropped = match cut { CoreCut(_, d) -> d }
+                  let all_decls = match cut { CoreCut(kept, _, _) -> kept }
+                  let dropped = match cut { CoreCut(_, d, _) -> d }
                   let pruned = match dropped { [] -> false _ -> true }
                   # The typed blobs follow the sources, so an explicit
                   # project directory wins over the entry's own: the

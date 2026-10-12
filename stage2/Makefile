@@ -14112,6 +14112,12 @@ test-user-cache: $(TARGET)
 test-core-ops: $(TARGET)
 	@../tools/core-ops-gate.sh
 
+# The early cut cannot read what a derive writes; every fixture carrying
+# one compiles the same with the cut, without it, and with every core
+# body emptied.
+test-core-early-cut: $(TARGET)
+	@../tools/core-early-cut-gate.sh
+
 test-core-cache: $(TARGET) bin-kai
 	@set -e; \
 	for f in ../examples/cache/corec_*.sh ../examples/cache/emitc_*.sh ../examples/cache/wrapper_*.sh ../examples/cache/ncoreobj_*.sh ../examples/cache/nmodular_*.sh; do \
