@@ -648,11 +648,12 @@ fn main() : Unit / Stdout = {
   let r1 = [1..10]                             # range
   let r2 = [1, 3..10]                          # stepped range: the
                                                #   step is 3 - 1
+  let r3 = ['a'..'e']                          # a range of Chars
   let opt = Some(42)                           # variant
   let combined = [1, 2] ++ [3, 4]              # ++ concat (right-assoc)
   let all = variants[Color]()                  # enumerate ctors of a
                                                #   nullary sum type
-  Stdout.print("n=#{n} s=#{s} xs len=#{xs.length()} r1 len=#{r1.length()} r2 len=#{r2.length()} combined len=#{combined.length()} colors=#{all.length()}")
+  Stdout.print("n=#{n} s=#{s} xs len=#{xs.length()} r1 len=#{r1.length()} r2 len=#{r2.length()} r3 len=#{r3.length()} combined len=#{combined.length()} colors=#{all.length()}")
   match opt {
     Some(v) -> Stdout.print("v=#{v}")
     None    -> Stdout.print("none")
@@ -662,6 +663,10 @@ fn main() : Unit / Stdout = {
 
 A trailing comma is allowed in list, tuple, record, map, and set
 literals (`[1, 2, 3,]`).
+
+A range walks `Int` or `Char`, and every element it names has that one
+type: `['a'..'e']` is `[Char]`, by code point, and `['a', 'c'..'k']`
+steps by two. `['a'..5]` is a type error.
 
 A stepped range shows its first two elements: `[first, second..last]`
 steps by `second - first` and stops at the last element that does not
