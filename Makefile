@@ -1346,6 +1346,7 @@ TIER1_ASAN_LEGS_B := \
 	test-perceus-1153-modcall-linear-asan \
 	test-perceus-1150-vec-surface-asan \
 	test-perceus-1180-range-lazy-asan \
+	test-seq-asan \
 	test-perceus-1295-borrow-slot-nested-arg-asan \
 	test-perceus-1303-single-use-branch-leak-asan \
 	test-perceus-1315-borrowed-match-release-asan \

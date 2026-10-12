@@ -1,0 +1,161 @@
+#[doc("""
+Lazy sequences: a `Seq[t]` is a pure list computed on demand, each cell
+at most once.
+
+A cell holds the thunk that computes its step, `SeqEnd` or
+`SeqCons(head, tail)`. The first `force` runs the thunk; every later
+read of the same cell returns the step it produced, so a sequence
+bound to a name and read twice is computed once, and a sequence may be
+defined in terms of itself. A cell read while its own thunk runs
+panics with `sequence depends on itself`.
+
+Holding a sequence's first cell retains every cell computed from it:
+walk a long sequence through a name that is not used afterwards, and
+the cells behind the walk are freed as it goes.
+
+A function a stage keeps (`map`, `flat_map`, `filter`, `take_while`,
+the thunk of `defer`) runs when a cell is read, so it must be pure. The
+sinks (`each`, `foldl`) run in the consumer and may perform effects.
+`map` / `flat_map` / `filter` carry the canonical signatures, so `|`,
+`||`, `|?` dispatch on `Seq` (`kai info pipes`).
+
+A `Seq` stays on the fiber that made it: send `to_list` of the part
+another fiber needs. For a producer that performs effects use `gen`;
+for one that owns a resource, `stream`. `import seq`.
+""")]
+
+#[doc("A lazy sequence of `t`: a cell computed on its first read and shared by every later one.")]
+pub type Seq[t] = { priv thunk: () -> SeqStep[t] }
+
+#[doc("What reading a cell yields: the end of the sequence, or its head and the cell of the rest.")]
+pub type SeqStep[t] = SeqEnd | SeqCons(t, Seq[t])
+
+#[doc("A cell whose first read runs `f`.")]
+extern "kai"("kai_seq_defer") pub fn defer[t](f: () -> SeqStep[t]) : Seq[t]
+
+#[doc("Reads a cell: its step, computed at most once and shared by every reader.")]
+extern "kai"("kai_seq_force") pub fn force[t](s: Seq[t]) : SeqStep[t]
+
+#[doc("A cell standing for the sequence `f` returns, which is built on the first read.")]
+pub fn delay[t](f: () -> Seq[t]) : Seq[t] = defer(() => force(f()))
+
+# -- sources -----------------------------------------------------------
+
+#[doc("The integers from `a` upwards: `a`, `a + 1`, `a + 2`, and so on without end.")]
+pub fn from(a: Int) : Seq[Int] = from_step(a, 1)
+
+#[doc("The progression `a`, `a + step`, `a + 2 * step`, and so on without end. Panics on a zero `step`.")]
+pub fn from_step(a: Int, step: Int) : Seq[Int] =
+  if step == 0 { panic("zero step in range") }
+  else { defer(() => SeqCons(a, from_step(a + step, step))) }
+
+#[doc("The progression from `a` by `step` up to the last element that does not pass `hi`; descending when `step` is negative. Panics on a zero `step`.")]
+pub fn range(a: Int, hi: Int, step: Int) : Seq[Int] =
+  if step == 0 { panic("zero step in range") }
+  else { defer(() => range_step(a, hi, step)) }
+
+fn range_step(a: Int, hi: Int, step: Int) : SeqStep[Int] =
+  if (step > 0 and a > hi) or (step < 0 and a < hi) { SeqEnd }
+  else { SeqCons(a, range(a + step, hi, step)) }
+
+# -- stages ------------------------------------------------------------
+
+#[doc("Maps `f` over every element, lazily. Canonical `map`: participates in the `|` pipe.")]
+pub fn map[a, b](s: Seq[a], f: (a) -> b) : Seq[b] =
+  defer(() => match force(s) {
+    SeqEnd         -> SeqEnd
+    SeqCons(x, xs) -> SeqCons(f(x), map(xs, f))
+  })
+
+#[doc("Maps `f` to a sequence per element and yields each in turn, lazily. Canonical `flat_map`: participates in the `||` pipe.")]
+pub fn flat_map[a, b](s: Seq[a], f: (a) -> Seq[b]) : Seq[b] =
+  defer(() => flat_step(s, f))
+
+fn flat_step[a, b](s: Seq[a], f: (a) -> Seq[b]) : SeqStep[b] =
+  match force(s) {
+    SeqEnd         -> SeqEnd
+    SeqCons(x, xs) -> inner_step(f(x), xs, f)
+  }
+
+# The step of `inner`, then of the sequences `f` gives for `rest`.
+fn inner_step[a, b](inner: Seq[b], rest: Seq[a], f: (a) -> Seq[b]) : SeqStep[b] =
+  match force(inner) {
+    SeqEnd         -> flat_step(rest, f)
+    SeqCons(y, ys) -> SeqCons(y, defer(() => inner_step(ys, rest, f)))
+  }
+
+#[doc("Keeps the elements satisfying `p`, lazily. Canonical `filter`: participates in the `|?` pipe.")]
+pub fn filter[t](s: Seq[t], p: (t) -> Bool) : Seq[t] =
+  defer(() => filter_step(s, p))
+
+fn filter_step[t](s: Seq[t], p: (t) -> Bool) : SeqStep[t] =
+  match force(s) {
+    SeqEnd         -> SeqEnd
+    SeqCons(x, xs) ->
+      if p(x) { SeqCons(x, filter(xs, p)) }
+      else { filter_step(xs, p) }
+  }
+
+#[doc("The first `n` elements, lazily; the whole sequence when it is shorter.")]
+pub fn take[t](s: Seq[t], n: Int) : Seq[t] =
+  defer(() => if n <= 0 { SeqEnd } else { take_step(s, n) })
+
+fn take_step[t](s: Seq[t], n: Int) : SeqStep[t] =
+  match force(s) {
+    SeqEnd         -> SeqEnd
+    SeqCons(x, xs) -> SeqCons(x, take(xs, n - 1))
+  }
+
+#[doc("The elements up to, and excluding, the first that fails `p`, lazily.")]
+pub fn take_while[t](s: Seq[t], p: (t) -> Bool) : Seq[t] =
+  defer(() => match force(s) {
+    SeqEnd         -> SeqEnd
+    SeqCons(x, xs) ->
+      if p(x) { SeqCons(x, take_while(xs, p)) }
+      else { SeqEnd }
+  })
+
+#[doc("The sequence without its first `n` elements; they are skipped when the result is first read.")]
+pub fn drop[t](s: Seq[t], n: Int) : Seq[t] =
+  defer(() => force(skip(s, n)))
+
+fn skip[t](s: Seq[t], n: Int) : Seq[t] =
+  if n <= 0 { s }
+  else {
+    match force(s) {
+      SeqEnd         -> defer(() => SeqEnd)
+      SeqCons(_, xs) -> skip(xs, n - 1)
+    }
+  }
+
+# -- sinks (read the sequence) -----------------------------------------
+
+#[doc("The element at zero-based index `i`. Panics when `i` is negative or the sequence ends before it.")]
+pub fn nth[t](s: Seq[t], i: Int) : t =
+  if i < 0 { past_end() }
+  else {
+    match force(skip(s, i)) {
+      SeqEnd        -> past_end()
+      SeqCons(x, _) -> x
+    }
+  }
+
+fn past_end[t]() : t = panic("seq.nth: index out of range")
+
+#[doc("Every element in a list. Does not return on an endless sequence.")]
+pub fn to_list[t](s: Seq[t]) : [t] =
+  reverse(foldl(s, [], (acc, x) => [x, ...acc]))
+
+#[doc("Runs `f` for its effect on every element, in order.")]
+pub fn each[t, e](s: Seq[t], ^f: (t) -> Unit / e) : Unit / e =
+  match force(s) {
+    SeqEnd         -> ()
+    SeqCons(x, xs) -> { f(x); each(xs, f) }
+  }
+
+#[doc("Folds `f` over every element left to right from `init`.")]
+pub fn foldl[t, a, e](s: Seq[t], init: a, ^f: (a, t) -> a / e) : a / e =
+  match force(s) {
+    SeqEnd         -> init
+    SeqCons(x, xs) -> foldl(xs, f(init, x), f)
+  }

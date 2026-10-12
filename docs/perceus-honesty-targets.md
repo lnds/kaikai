@@ -206,6 +206,53 @@ walk lives in `compiler/borrow_escape.kai`. This is decided whole-program
 but is sound per-function (bounded to what the RC pass guarantees), so it
 survives the sep-comp oracle that the pre-gate revert (#1129) did not.
 
+### Lazy cells (`Seq`): a write no program can observe
+
+`stdlib/seq.kai` is the one place a pure value is written after it is
+built. A `Seq[t]` is a runtime node of its own (`KAI_SEQ`): one slot
+holding the thunk that computes the cell's step, then the step, with
+the state in the header. `force` reads it:
+
+- **Shared cell (`rc > 1`)**: the thunk runs once and the cell is
+  overwritten in place with its step; the thunk is released after the
+  write. Every other holder of the cell then reads the step. The write
+  replaces a computation by its value, and the thunk is pure, so no
+  program can tell the cell from one that held the step all along —
+  the same argument as Perceus reuse, which also writes memory a pure
+  program still names.
+- **Unshared cell (`rc == 1`)**: nobody else can read it, so the cell
+  is freed before its thunk runs and nothing is written back.
+- **While the thunk runs** the cell is marked; a read that reaches it
+  again panics with `sequence depends on itself` instead of recursing.
+  An exit past the evaluation (a trap, a cancellation, an abandoned
+  `resume`) gives the cell its thunk back through the fiber's unwind
+  stack, so a later read evaluates it again.
+
+The rc and the write are plain, not atomic: a cell never leaves the
+fiber that made it. The typer rejects a `Seq` in a fiber's result, in
+an actor message and in a thunk run on another fiber, as it does a
+continuation, and `kai_deep_copy` traps on one at the thread border.
+The region border copies the cell with its step.
+
+Measured (mac arm64, `KAI_THREADS=1`, both backends alike unless
+noted): the 1,000-prime sieve of `examples/perceus/seq_sieve.kai`
+allocates 1,558,313 cells and frees all but the `SeqEnd` singleton,
+peak 5,013 live.
+
+What does NOT hold yet:
+
+- **A `const` of type `Seq` shares nothing.** A constant has no
+  storage (`compiler/const_init.kai`): every read evaluates its
+  initialiser, so each read builds a fresh cell and a sequence defined
+  through a `const` in terms of itself recomputes without bound.
+- **Force depth is the number of stages.** Each stage of a chain is a
+  call frame while the innermost cell is read. On the main stack the
+  1,000-prime sieve runs; in a spawned fiber (64 KiB stack) it
+  overflows once the chain passes 336 filter stages on the C backend
+  and 212 on native.
+- **The head is boxed and the step is its own node**: a cell, its
+  thunk and its `SeqCons` are three allocations per element.
+
 ### The one remaining lever, and what is NOT the lever
 
 The gap to Koka is now a **constant factor**, not a chasm, and the

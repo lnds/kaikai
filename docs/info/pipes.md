@@ -62,6 +62,7 @@ so they dispatch through `|` / `||` / `|?`:
 [T]                  element a            (core/list)
 Stream[t, e]         element t            (stream)
 Gen[t, e]            element t            (gen)
+Seq[t]               element t            (seq, pure-only functions)
 Map[k, v]            element Pair[k, v]   (collections/map)
 HashMap[k, v]        element Pair[k, v]   (collections/hashmap, / Mutable)
 Set[a]               element a            (collections/set)

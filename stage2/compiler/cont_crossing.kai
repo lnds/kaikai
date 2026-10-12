@@ -1,7 +1,8 @@
 #[doc("""
 A continuation belongs to the fiber whose stack segment it suspended, and
-needs the handlers of the effects its body performs. This walk over a typed
-body finds where one would reach another fiber: a thunk handed to a call that
+needs the handlers of the effects its body performs. A lazy sequence is
+evaluated in place by the fiber that made it. This walk over a typed body
+finds where either would reach another fiber: a thunk handed to a call that
 yields a `Fiber` or `Pid` capturing one, such a call's result holding one, or
 a call that takes a `Pid` passing one along. It also finds a handle whose
 value holds a continuation that performs the effect the handle discharges.
@@ -13,15 +14,25 @@ import compiler.symtab
 import compiler.decl_text
 import compiler.expr_positions
 import compiler.modules_binders
+import compiler.core_types
 
-#[doc("Where a continuation would leave its fiber or its handlers: message, help, position.")]
+#[doc("Where a value would leave its fiber, or a continuation its handlers: message, help, position.")]
 pub type Crossing = Crossing(String, String, Int, Int)
 
-#[doc("Every crossing in `e`; `tab` names an effect in a message, `res` resolves a type, `holds` says whether a value of it holds a continuation and `needs` whether it holds one performing the given effect.")]
-pub fn cont_crossings(e: Expr, tab: SymTab, res: (Ty) -> Ty, holds: (Ty) -> Bool, needs: (Ty, SymId) -> Bool) : [Crossing] =
-  list_reverse(cc(e, Cc { tab: tab, res: res, holds: holds, needs: needs }, []))
+#[doc("A value that stays on the fiber that made it.")]
+pub type FiberBound = FbCont | FbSeq
 
-type Cc = { tab: SymTab, res: (Ty) -> Ty, holds: (Ty) -> Bool, needs: (Ty, SymId) -> Bool }
+#[doc("What a value of `t` holds that stays on its fiber; `holds` says whether it holds one of the type `h`.")]
+pub fn fiber_bound(t: Ty, holds: (SymId, Ty) -> Bool) : Option[FiberBound] =
+  if holds(core_ty_sym(CtCont), t) { Some(FbCont) }
+  else if holds(core_decl_ty_id(CdSeq), t) { Some(FbSeq) }
+  else { None }
+
+#[doc("Every crossing in `e`; `tab` names an effect in a message, `res` resolves a type, `bound` says what a value of it holds that stays on its fiber and `needs` whether it holds a continuation performing the given effect.")]
+pub fn cont_crossings(e: Expr, tab: SymTab, res: (Ty) -> Ty, bound: (Ty) -> Option[FiberBound], needs: (Ty, SymId) -> Bool) : [Crossing] =
+  list_reverse(cc(e, Cc { tab: tab, res: res, bound: bound, needs: needs }, []))
+
+type Cc = { tab: SymTab, res: (Ty) -> Ty, bound: (Ty) -> Option[FiberBound], needs: (Ty, SymId) -> Bool }
 
 # Every typed body runs through this walk, so it reads each node once and
 # allocates only for a crossing it finds.
@@ -151,45 +162,68 @@ fn at_call(call: Expr, xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] = match 
 
 fn fiber_call(call: Expr, fiber: Bool, targs: [Ty], xs: [Expr], c: Cc) : [Crossing] = {
   let what = if fiber { "a fiber's result" } else { "an actor's message" }
-  let result = if any(targs, (t) => c.holds(c.res(t))) {
-    [Crossing("#{what} cannot hold a continuation", fiber_help(), call.line, call.col)]
-  } else { [] }
-  [...result, ...flat_map(xs, (x) => thunk_captures(x, c.res, c.holds))]
+  let result = match first_bound(targs, c) {
+    Some(b) -> [Crossing("#{what} cannot hold #{bound_noun(b)}", fiber_help(b), call.line, call.col)]
+    None    -> []
+  }
+  [...result, ...flat_map(xs, (x) => thunk_captures(x, c.res, c.bound))]
+}
+
+fn first_bound(ts: [Ty], c: Cc) : Option[FiberBound] = match ts {
+  []           -> None
+  [t, ...rest] -> match c.bound(c.res(t)) {
+    Some(b) -> Some(b)
+    None    -> first_bound(rest, c)
+  }
 }
 
 fn message_crossings(xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] =
-  if any(xs, (x) => is_pid(peek(x, c))) {
-    foldl(xs, acc, (a, x) => {
-      let t = c.res(ty_of(x))
-      if not is_pid(t) and c.holds(t) { [Crossing("a message cannot hold a continuation", fiber_help(), x.line, x.col), ...a] } else { a }
-    })
-  } else { acc }
+  if any(xs, (x) => is_pid(peek(x, c))) { foldl(xs, acc, (a, x) => message_crossing(x, c, a)) } else { acc }
 
-fn fiber_help() : String = "a continuation can only be resumed by the fiber that created it"
+fn message_crossing(x: Expr, c: Cc, acc: [Crossing]) : [Crossing] = {
+  let t = c.res(ty_of(x))
+  if is_pid(t) { acc } else { match c.bound(t) {
+    Some(b) -> [Crossing("a message cannot hold #{bound_noun(b)}", fiber_help(b), x.line, x.col), ...acc]
+    None    -> acc
+  } }
+}
+
+fn bound_noun(b: FiberBound) : String = match b {
+  FbCont -> "a continuation"
+  FbSeq  -> "a lazy sequence"
+}
+
+fn fiber_help(b: FiberBound) : String = match b {
+  FbCont -> "a continuation can only be resumed by the fiber that created it"
+  FbSeq  -> "a `Seq` is evaluated in place by the fiber that created it; send its elements as a list"
+}
 
 fn is_pid(t: Ty) : Bool = match t {
   TyCon(tcs, _) -> core_ty_is(tcs, CtPid)
   _ -> false
 }
 
-fn thunk_captures(x: Expr, res: (Ty) -> Ty, holds: (Ty) -> Bool) : [Crossing] = match x.kind {
-  ELambda(ps, b) -> match outer_ref(b, binders(b, map(ps, (p) => p.binder.id)), res, holds) {
-    Some(r) -> [Crossing("a thunk run on another fiber cannot capture a continuation", fiber_help(), r.line, r.col)]
+fn thunk_captures(x: Expr, res: (Ty) -> Ty, bound: (Ty) -> Option[FiberBound]) : [Crossing] = match x.kind {
+  ELambda(ps, b) -> match outer_ref(b, binders(b, map(ps, (p) => p.binder.id)), res, bound) {
+    Some(c) -> [c]
     None    -> []
   }
   _ -> []
 }
 
-# A read of a local `e` does not bind itself, whose value holds a continuation.
-fn outer_ref(e: Expr, local: [LocalId], res: (Ty) -> Ty, holds: (Ty) -> Bool) : Option[Expr] = {
-  let mine = match e.kind {
-    ELocal(l) -> if not any(local, (x) => local_eq(x, l)) and holds(res(ty_of(e))) { Some(e) } else { None }
-    _         -> None
+# The crossing at a read of a local `e` does not bind itself, whose value stays on its fiber.
+fn outer_ref(e: Expr, local: [LocalId], res: (Ty) -> Ty, bound: (Ty) -> Option[FiberBound]) : Option[Crossing] =
+  match own_ref(e, local, res, bound) {
+    Some(c) -> Some(c)
+    None    -> first_some(xp_positions(e), (p) => match p { XP(_, x) -> outer_ref(x, local, res, bound) })
   }
-  match mine {
-    Some(r) -> Some(r)
-    None    -> first_some(xp_positions(e), (p) => match p { XP(_, x) -> outer_ref(x, local, res, holds) })
-  }
+
+fn own_ref(e: Expr, local: [LocalId], res: (Ty) -> Ty, bound: (Ty) -> Option[FiberBound]) : Option[Crossing] = match e.kind {
+  ELocal(l) -> if any(local, (x) => local_eq(x, l)) { None } else { match bound(res(ty_of(e))) {
+    Some(b) -> Some(Crossing("a thunk run on another fiber cannot capture #{bound_noun(b)}", fiber_help(b), e.line, e.col))
+    None    -> None
+  } }
+  _ -> None
 }
 
 # Every binder declared anywhere inside `e`, after `acc`.
@@ -224,7 +258,7 @@ fn ty_of(e: Expr) : Ty = match e.ty {
   None    -> TyAny
 }
 
-fn first_some(ps: [XPos], f: (XPos) -> Option[Expr]) : Option[Expr] = match ps {
+fn first_some(ps: [XPos], f: (XPos) -> Option[Crossing]) : Option[Crossing] = match ps {
   [] -> None
   [p, ...rest] -> match f(p) {
     Some(x) -> Some(x)

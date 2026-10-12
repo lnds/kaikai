@@ -259,6 +259,7 @@ stdlib/
   rational.kai   pure, stage 2 (top-level module; exact num/den over BigInt, gcd-normalised — shipped)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
   gen.kai        effect: Yield[t] (top-level module: pull generators on a kept continuation — shipped via PR #2627)
+  seq.kai        pure, stage 2 (top-level module: lazy sequences over a memoised runtime cell — shipped via PR #2726)
   reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
   io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)
@@ -418,6 +419,22 @@ with the Tier 2 principle "few visible concepts, layered" and
 with Doc CLAUDE.md's stance that ordinary stdlib functions are
 preferable to language-level control structures when the row
 machinery suffices.
+
+### seq (pure, stage 2)
+
+Lazy sequences *(shipped via PR #2726)*. A `Seq[t]` is a cell the
+runtime owns: its first `force` runs the thunk it was built with and
+every later read returns the same `SeqStep[t] = SeqEnd | SeqCons(t,
+Seq[t])`, so a sequence bound to a name and read twice is computed
+once. A function a stage keeps must be pure; the sinks may perform
+effects. A `Seq` stays on the fiber that made it. Unlike a `Gen` it is
+shared, and unlike a `Stream` it is not rerun.
+
+- cell: `defer`, `delay`, `force` *(shipped)*
+- sources: `from`, `from_step`, `range` *(shipped)*
+- stages: `map`, `flat_map`, `filter` (pipe-canonical), `take`,
+  `take_while`, `drop` *(shipped)*
+- sinks: `nth`, `to_list`, `each`, `foldl` *(shipped)*
 
 ### gen (effect `Yield[t]`, stage 2)
 

@@ -1404,6 +1404,8 @@ KaiValue *kaix_core_int128_to_int(KaiValue *v)     { return kai_core_int128_to_i
 KaiValue *kaix_core_ref_make(KaiValue *init)                          { return kai_core_ref_make(init); }
 KaiValue *kaix_core_ref_get(KaiValue *r)                              { return kai_core_ref_get(r); }
 KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v)                 { return kai_core_ref_set(r, v); }
+KaiValue *kaix_core_defer(KaiValue *thunk)                            { return kai_seq_defer(thunk); }
+KaiValue *kaix_core_force(KaiValue *s)                                { return kai_seq_force(s); }
 /* `unit_name(x)` is a COMPILE-TIME intrinsic in the C-direct backend
  * (emit_c resolves it to the value's unit-of-measure name as a string
  * literal). The native backend lowers it as a plain call, so it needs a
