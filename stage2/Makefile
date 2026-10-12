@@ -10764,14 +10764,16 @@ test-perceus-1180-range-lazy: $(TARGET) build
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-1180-range-lazy FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
-	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/range_step_zero_1180.kai > build/s2-1180-step0.c; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1180-step0.c -o build/s2-1180-step0 $(LDLIBS_M); \
-	if ./build/s2-1180-step0 > /dev/null 2> build/s2-1180-step0.err; then \
-	  echo "perceus-1180-range-lazy FAIL (zero step did not trap)"; exit 1; \
-	fi; \
-	grep -q "zero step in range" build/s2-1180-step0.err \
-	  || { echo "perceus-1180-range-lazy FAIL (zero-step trap message missing)"; cat build/s2-1180-step0.err; exit 1; }; \
-	echo "perceus-1180-range-lazy OK (range value correct through every consumer; zero step traps)"
+	for z in range_step_zero_1180 range_step_zero_fused; do \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$z.kai > build/s2-$$z.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$z.c -o build/s2-$$z $(LDLIBS_M); \
+	  if ./build/s2-$$z > /dev/null 2> build/s2-$$z.err; then \
+	    echo "perceus-1180-range-lazy FAIL ($$z: zero step did not trap)"; exit 1; \
+	  fi; \
+	  grep -q "zero step in range" build/s2-$$z.err \
+	    || { echo "perceus-1180-range-lazy FAIL ($$z: zero-step trap message missing)"; cat build/s2-$$z.err; exit 1; }; \
+	done; \
+	echo "perceus-1180-range-lazy OK (range value correct through every consumer; zero step traps, built or fused)"
 
 test-perceus-1180-range-lazy-native: $(TARGET) bin-kai build
 	@set -e; \
@@ -10780,8 +10782,17 @@ test-perceus-1180-range-lazy-native: $(TARGET) bin-kai build
 	  || { echo "perceus-1180-range-lazy-native FAIL (native build errored)"; cat build/s2-$$name-nat.err; exit 1; }; \
 	./build/s2-$$name-nat > build/s2-$$name-nat.out; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out > /dev/null \
-	  && echo "perceus-1180-range-lazy-native OK (range value correct through every consumer, native)" \
-	  || { echo "perceus-1180-range-lazy-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out; exit 1; }
+	  || { echo "perceus-1180-range-lazy-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out; exit 1; }; \
+	for z in range_step_zero_1180 range_step_zero_fused; do \
+	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$z.kai -o build/s2-$$z-nat 2> build/s2-$$z-nat.err \
+	    || { echo "perceus-1180-range-lazy-native FAIL ($$z: native build errored)"; cat build/s2-$$z-nat.err; exit 1; }; \
+	  if ./build/s2-$$z-nat > /dev/null 2> build/s2-$$z-nat.err; then \
+	    echo "perceus-1180-range-lazy-native FAIL ($$z: zero step did not trap)"; exit 1; \
+	  fi; \
+	  grep -q "zero step in range" build/s2-$$z-nat.err \
+	    || { echo "perceus-1180-range-lazy-native FAIL ($$z: zero-step trap message missing)"; cat build/s2-$$z-nat.err; exit 1; }; \
+	done; \
+	echo "perceus-1180-range-lazy-native OK (range value correct through every consumer; zero step traps, built or fused, native)"
 
 test-perceus-1180-range-lazy-asan: $(TARGET) build
 	@set -e; \

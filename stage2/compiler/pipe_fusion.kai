@@ -6,6 +6,7 @@ import compiler.decl_names
 import compiler.symtab_build
 import compiler.util
 import compiler.core_effects
+import compiler.core_builtins
 import compiler.proto_ids
 
 # Map-pipe deforestation (issue #1134). `map g . map f = map (g . f)`
@@ -114,18 +115,24 @@ pub fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Optio
     # Only a RANGE head earns the zero-stage rewrite: for a plain list,
     # `sum(xs)` beats `map_sum(xs, identity)` (monomorphised static loop
     # vs a closure call per element).
-    ERange(_, _, _) -> match pipe_fusion_as_terminal(ids, rhs) {
-      Some(term) -> Some(FusedFold { source: lhs, stages: [], term: term })
-      None -> None
-    }
+    ERange(_, _, _) ->
+      if not pipe_fusion_head(lhs) { None }
+      else { match pipe_fusion_as_terminal(ids, rhs) {
+        Some(term) -> Some(FusedFold { source: lhs, stages: [], term: term })
+        None -> None
+      } }
     _ -> None
   }
 
-#[doc("True when `lhs` can head a terminal fusion: a `map`-pipe chain, or a range.")]
+#[doc("True when `lhs` can head a terminal fusion: a `map`-pipe chain, or a range the counting loops may walk.")]
 pub fn pipe_fusion_head(lhs: Expr) : Bool = match lhs.kind {
-  EMapPipe(_, _)  -> true
-  ERange(_, _, _) -> true
-  _               -> false
+  EMapPipe(_, _)           -> true
+  ERange(_, _, None)       -> true
+  ERange(_, _, Some(step)) -> match try_int_literal(step) {
+    Some(k) -> k > 0
+    None    -> true
+  }
+  _ -> false
 }
 
 fn pipe_fusion_as_terminal(ids: ProtoIds, rhs: Expr) : Option[FoldTerminal] =
@@ -342,7 +349,8 @@ fn pipe_fusion_stage_fold(ff: FusedFold, cf: CoreFn, extra: [Expr],
     ERange(a, b, None) ->
       fold_call(range_fold(cf, false), [a, b, bound.stage, ...extra], line, col)
     ERange(a, b, Some(step)) ->
-      fold_call(range_fold(cf, true), [a, b, step, bound.stage, ...extra], line, col)
+      pipe_fusion_stepped(range_fold(cf, true), [a, b, step], [bound.stage, ...extra],
+                          (xs) => fold_call(cf, xs, line, col), ff.source, line, col)
     _ ->
       fold_call(cf, [ff.source, bound.stage, ...extra], line, col)
   }
@@ -357,9 +365,64 @@ fn pipe_fusion_stage_fold(ff: FusedFold, cf: CoreFn, extra: [Expr],
 fn pipe_fusion_length_call(source: Expr, line: Int, col: Int) : Expr =
   match source.kind {
     ERange(a, b, None)       -> fold_call(CfRangeLength, [a, b], line, col)
-    ERange(a, b, Some(step)) -> fold_call(CfRangeStepLength, [a, b, step], line, col)
+    ERange(a, b, Some(step)) ->
+      pipe_fusion_stepped(CfRangeStepLength, [a, b, step], [],
+                          (xs) => fold_call(CfListLength, xs, line, col), source, line, col)
     _                        -> fold_call(CfListLength, [source], line, col)
   }
+
+# The stepped loops only walk upward. A literal step says at compile time
+# whether `up` applies; any other is bound and tested where the range is
+# built. A step that is not positive leaves the fold to `plain` over the
+# range value, which knows its direction and traps on zero. Every operand
+# is bound once, so the two arms of the test share them.
+fn pipe_fusion_stepped(up: CoreFn, head: [Expr], rest: [Expr], plain: ([Expr]) -> Expr,
+                       source: Expr, line: Int, col: Int) : Expr = match step_literal(head) {
+  Some(k) ->
+    if k > 0 { fold_call(up, list_append(head, rest), line, col) }
+    else { plain([source, ...rest]) }
+  None -> {
+    let h = pipe_fusion_bind_all(list_append(head, rest), 0, line, col)
+    match h.refs {
+      [from, to, step, ...args] -> {
+        let range = mk_expr(ERange(from, to, Some(step)), line, col)
+        let cond = mk_expr(EBinop(BoGt, step, mk_expr(mk_int_synth(0), line, col)), line, col)
+        let guarded = EIf(cond, fold_call(up, h.refs, line, col), Some(plain([range, ...args])))
+        mk_expr(EBlock(h.binds, Some(mk_expr(guarded, line, col))), line, col)
+      }
+      _ -> mk_expr(EMark(MkFuseMissing), line, col)
+    }
+  }
+}
+
+fn step_literal(head: [Expr]) : Option[Int] = match head {
+  [_, _, step] -> try_int_literal(step)
+  _            -> None
+}
+
+# Bind each of `es` to a local, in order; a literal or a name is its own
+# reference.
+fn pipe_fusion_bind_all(es: [Expr], i: Int, line: Int, col: Int) : HoistedStages = match es {
+  [] -> HoistedStages { binds: [], refs: [] }
+  [e, ...more] -> {
+    let r = pipe_fusion_bind_all(more, i + 1, line, col)
+    if reads_free(e) { HoistedStages { binds: r.binds, refs: [e, ...r.refs] } }
+    else {
+      let name = concat_all(["__fuser_", int_to_string(line), "_", int_to_string(col), "_", int_to_string(i)])
+      let pat = Pattern { pkind: PBind(binder_minted(name)), line: line, col: col }
+      HoistedStages { binds: [SLet(pat, None, e), ...r.binds],
+                      refs: [mk_local(local_minted(name), line, col), ...r.refs] }
+    }
+  }
+}
+
+fn reads_free(e: Expr) : Bool = match e.kind {
+  EInt(_, _)   -> true
+  EName(_)     -> true
+  ESym(_, _)   -> true
+  ELocal(_)    -> true
+  _            -> false
+}
 
 # The range-headed counterpart of a list fold.
 fn range_fold(cf: CoreFn, stepped: Bool) : CoreFn = match cf {
@@ -395,16 +458,28 @@ pub fn pipe_fusion_collect_rewrite(fc: FusedCollect, line: Int, col: Int) : Opti
     ERange(a, b, None) ->
       Some(pipe_fusion_collect_call(CfRangeMapCollectVec, [a, b], fc.stages, line, col))
     ERange(a, b, Some(step)) ->
-      Some(pipe_fusion_collect_call(CfRangeStepMapCollectVec, [a, b, step], fc.stages, line, col))
+      if not pipe_fusion_head(fc.source) { None }
+      else { Some(pipe_fusion_collect_call(CfRangeStepMapCollectVec, [a, b, step], fc.stages, line, col)) }
     _ -> None
   }
 
 fn pipe_fusion_collect_call(cf: CoreFn, head: [Expr], stages: [Expr],
                             line: Int, col: Int) : Expr {
   let bound = pipe_fusion_bind_stages(stages, line, col)
-  let call = fold_call(cf, [...head, bound.stage], line, col)
+  let call = match head {
+    [_, _, _] -> pipe_fusion_stepped(cf, head, [bound.stage], (xs) => collect_via_list(xs, line, col),
+                                     mk_expr(EMark(MkFuseMissing), line, col), line, col)
+    _         -> fold_call(cf, [...head, bound.stage], line, col)
+  }
   match bound.binds {
     [] -> call
     _  -> mk_expr(EBlock(bound.binds, Some(call)), line, col)
   }
+}
+
+# `vec_from_list(range | stage)`: the list pipeline, converted once.
+fn collect_via_list(xs: [Expr], line: Int, col: Int) : Expr = match xs {
+  [range, stage] ->
+    mk_expr(ECall(builtin_mk(CbVecFromList, line, col), [mk_expr(EMapPipe(range, stage), line, col)]), line, col)
+  _ -> mk_expr(EMark(MkFuseMissing), line, col)
 }
