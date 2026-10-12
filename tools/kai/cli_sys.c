@@ -53,6 +53,24 @@ int kaicli_settled(const char *path) {
     return stat(path, &st) == 0 && st.st_mtime + 2 < now && st.st_ctime + 2 < now;
 }
 
+/* True when the file was last written and last changed strictly before
+   `mark` was written. A file whose clock keeps whole seconds is compared
+   by the second, so a write in the mark's own second counts as later. */
+int kaicli_before(const char *path, const char *mark) {
+    struct stat st, mk;
+    if (stat(path, &st) != 0 || stat(mark, &mk) != 0) return 0;
+#ifdef __APPLE__
+    long long mn = st.st_mtimespec.tv_nsec, cn = st.st_ctimespec.tv_nsec, kn = mk.st_mtimespec.tv_nsec;
+#else
+    long long mn = st.st_mtim.tv_nsec, cn = st.st_ctim.tv_nsec, kn = mk.st_mtim.tv_nsec;
+#endif
+    long long ms = st.st_mtime, cs = st.st_ctime, ks = mk.st_mtime;
+    int ctime_later = cs > ms || (cs == ms && cn > mn);
+    long long s = ctime_later ? cs : ms, n = ctime_later ? cn : mn;
+    if (mn == 0 && cn == 0) return s < ks;
+    return s < ks || (s == ks && n < kn);
+}
+
 /* True when both files hold the same bytes. */
 int kaicli_same_bytes(const char *a, const char *b) {
     struct stat sa, sb;

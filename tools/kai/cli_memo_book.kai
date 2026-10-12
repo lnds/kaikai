@@ -1,0 +1,111 @@
+#[doc("""
+The sources the builds of one command were found to read.
+
+Which sources a build reads is the compiler's to say, and it says so
+while it compiles (`kaic2 --inputs-out`). A book keeps, newest first,
+what the last builds of one command read and the memo key that came of
+each, so a later run finds its entry by reading those sources again and
+asks the compiler nothing. A build is told by the state of every path
+its compile tried: the content of each file it read, and the absence of
+each file it tried ahead of one. While the disk shows the same, the
+compiler would read the same again.
+""")]
+
+import cli_fs
+import cli_memo_key
+import cli_sys
+
+# Builds kept per book.
+const KEPT : Int = 8
+
+#[doc("One build of a command: its memo key and the state of each path its compile tried, sorted by path.")]
+pub type Known = { key: String, inputs: [String] }
+
+#[doc("The book, under `dir`, of the command whose inputs besides its sources digest to `fixed`.")]
+pub fn path(dir: String, fixed: String) : String = "#{dir}/#{fixed}.inputs"
+
+#[doc("True when `name` names a book.")]
+pub fn is_book(name: String) : Bool = string.ends_with(name, ".inputs")
+
+#[doc("The builds `book` keeps, newest first.")]
+pub fn known(book: String) : [Known] / File =
+  string.split(cli_fs.read_or_empty(book), "\n\n") || (block => match cli_memo_key.lines(block) {
+    [key, ...inputs] -> [Known { key: key, inputs: inputs }]
+    [] -> []
+  })
+
+#[doc("The listing a compile wrote as `text`, each path absolute and listed once: a file read, or after a `-` one tried and not there.")]
+pub fn listed(text: String) : [String] / Ffi =
+  once(list.sort(cli_memo_key.lines(text) | (l => match string.drop_prefix(l, "-") {
+    Some(p) -> "-#{cli_fs.absolute(p)}"
+    None -> cli_fs.absolute(l)
+  })))
+
+fn once(sorted: [String]) : [String] =
+  match sorted {
+    [a, b, ...rest] -> if a == b { once([b, ...rest]) } else { [a, ...once([b, ...rest])] }
+    _ -> sorted
+  }
+
+# The line that stands for the entry: a build is told by its content, and
+# a grouped build writes a new one for every run.
+const ENTRY : String = "<entry>"
+
+#[doc("The state of the entry `file` now: its content, wherever it sits.")]
+pub fn entry(file: String) : String / Ffi = "#{ENTRY}\t#{digest(file)}"
+
+#[doc("The state `entry` and that of each of `paths` now, sorted: the path, a tab, and the digest of the file there or `-` when there is none.")]
+pub fn state(entry: String, paths: [String]) : [String] / Ffi =
+  list.sort([entry, ...(once(list.sort(paths)) | (p => "#{p}\t#{if cli_sys.is_file(p) { digest(p) } else { "-" }}"))])
+
+fn digest(file: String) : String / Ffi {
+  cli_sys.sha_reset()
+  cli_memo_key.field(int_to_string(cli_sys.size(file)))
+  let _ = cli_sys.sha_file(file)
+  cli_sys.sha_hex()
+}
+
+#[doc("Every path the builds in `known` tried, the entry aside.")]
+pub fn paths(known: [Known]) : [String] = known || (k => tried(k))
+
+fn tried(k: Known) : [String] = k.inputs | (l => path_of(l)) |? (p => p != ENTRY)
+
+fn path_of(line: String) : String =
+  match string.index_of(line, "\t") {
+    Some(i) -> string_slice(line, 0, i)
+    None -> line
+  }
+
+#[doc("True when each of `inputs` is one of `now`, both sorted: the disk still shows what that build read.")]
+pub fn within(inputs: [String], now: [String]) : Bool =
+  match (inputs, now) {
+    ([], _) -> true
+    (_, []) -> false
+    ([l, ...ls], [s, ...ss]) -> if l == s { within(ls, ss) } else { s < l and within(inputs, ss) }
+  }
+
+#[doc("""
+The state of a build whose entry was in state `entry` and whose compile
+`listed` what it read, or none when the disk no longer shows what that
+compile saw: a file it read was written since the file `mark` was, or is
+gone, or a file it did not find is there. The state is taken before the
+files are checked, so a write in between is caught.
+""")]
+pub fn seen(entry: String, listed: [String], mark: String) : Option[[String]] / Ffi {
+  let now = state(entry, listed | (l => string.drop_prefix(l, "-").unwrap_or(l)))
+  let same = listed |> list.all(l => match string.drop_prefix(l, "-") {
+    Some(p) -> not cli_sys.exists(p)
+    None -> cli_sys.is_file(l) and cli_sys.before(l, mark)
+  })
+  if same { Some(now) } else { None }
+}
+
+#[doc("Put `k` first in `book`, in place of an older build of the same key, and drop all past the newest kept.")]
+pub fn note(book: String, k: Known) : Unit / File + Ffi {
+  let builds = list.take([k, ...(known(book) |? (o => o.key != k.key))], KEPT)
+  let part = "#{book}.#{cli_sys.getpid()}.part"
+  let text = string.join(builds | (o => string.join([o.key, ...o.inputs], "\n")), "\n\n")
+  if not (write_file(part, text).is_ok() and file_rename(part, book).is_ok()) {
+    let _ = file_delete(part)
+  }
+}
