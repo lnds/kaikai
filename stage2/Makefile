@@ -924,7 +924,7 @@ test-issue-1969-typer-diag-file: $(TARGET) build
 # unit can lose it; one the unit needs names the file that uses it, and an
 # import its file does use is never reported. Each fixture's warning and
 # help lines must equal its golden exactly, on both backends.
-IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-used-bare
+IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-used-bare derive-uses-import
 
 test-import-verdicts: $(TARGET) bin-kai build
 	@set -e; \
