@@ -21,13 +21,37 @@ import compiler.symtab
 
 # ---- discard_pure_value ----------------------------------------------
 
-#[doc("Run every lint over the decls a unit owns; returns each finding paired with the file that declares it. `src` is the pre-lowering AST, which the dead-code lint reads to tell a user-declared fn from a synthesised one.")]
+#[doc("Run every lint over the decls a unit owns; returns each finding paired with the file that declares it. `src` is the pre-lowering AST, which the dead-code lint reads to tell a user-declared fn from a synthesised one; `written` is the AST before surface lowering, where a form is still the one the source spells.")]
 pub fn lint_program(df: DiagFiles, owned_mods: [String], decls: [Decl],
-                    src: [Decl], tab: SymTab) : [FileFinding] {
+                    src: [Decl], written: [Decl], tab: SymTab) : [FileFinding] {
   let root_mod = module_name_of_path(df_root(df))
   let owned = lint_owned(decls, root_mod, owned_mods, [])
+  let spelled = lint_owned(written_fns(written), root_mod, owned_mods, [])
   list_append(lint_walk_decls(owned, tab, df, []),
-              lint_program_wide(owned, decls, tab, df, src, root_mod))
+              list_append(lint_walk_written(spelled, df, []),
+                          lint_program_wide(owned, decls, tab, df, src, root_mod)))
+}
+
+# An `impl`'s methods are fns the user wrote too; the annotation wrappers
+# are transparent.
+fn written_fns(ds: [Decl]) : [Decl] = flat_map(ds, written_fns_of)
+
+fn written_fns_of(d: Decl) : [Decl] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> [d]
+  DImpl(_, _, _, ms, _, _, _, _)    -> written_fns(ms)
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> written_fns_of(inner)
+    None        -> []
+  }
+}
+
+fn lint_walk_written(ds: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileFinding] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      lint_walk_written(rest, df, prepend_tagged(catchall_findings(body), decl_diag_file(d, df), acc))
+    _ -> lint_walk_written(rest, df, acc)
+  }
 }
 
 # A unit merges every imported module into one decl stream, so linting it
@@ -294,15 +318,15 @@ fn lint_ty_name(e: Expr, tab: SymTab) : String {
 
 # ---- reporting -------------------------------------------------------
 
-#[doc("Run lints over a typed program and print human-readable findings; returns 0 (lints never block a build) unless a call statically violates a contract. `src` is the AST before protocol lowering.")]
+#[doc("Run lints over a typed program and print human-readable findings; returns 0 (lints never block a build) unless a call statically violates a contract. `src` is the AST before protocol lowering, `written` the AST before surface lowering.")]
 pub fn run_lint(file: String, owned_mods: [String], decls: [Decl],
-                 src: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
+                 src: [Decl], written: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
   let df = tin.df
   let tab = tin.tab
   let r = infer_program(file, decls, tin, false)
   let contract_errs = check_call_site_refinements(file, r.decls, tab)
   if contract_errs != 0 { contract_errs }
-  else { lint_report_text(lint_program(df, owned_mods, r.decls, src, tab)); 0 }
+  else { lint_report_text(lint_program(df, owned_mods, r.decls, src, written, tab)); 0 }
 }
 
 fn lint_report_text(findings: [FileFinding]) : Unit / Console {
@@ -322,15 +346,15 @@ fn lint_finding_text(file: String, f: LintFinding) : String {
   }
 }
 
-#[doc("Run lints over a typed program and print findings as a JSON array; returns 0 (lints never block a build) unless a call statically violates a contract. `src` is the AST before protocol lowering.")]
+#[doc("Run lints over a typed program and print findings as a JSON array; returns 0 (lints never block a build) unless a call statically violates a contract. `src` is the AST before protocol lowering, `written` the AST before surface lowering.")]
 pub fn run_lint_json(file: String, owned_mods: [String],
-                      decls: [Decl], src: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
+                      decls: [Decl], src: [Decl], written: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
   let df = tin.df
   let tab = tin.tab
   let r = infer_program(file, decls, tin, false)
   let contract_errs = check_call_site_refinements(file, r.decls, tab)
   if contract_errs != 0 { contract_errs }
-  else { print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, r.decls, src, tab)), "]"])); 0 }
+  else { print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, r.decls, src, written, tab)), "]"])); 0 }
 }
 
 fn lint_json_body(findings: [FileFinding]) : String =

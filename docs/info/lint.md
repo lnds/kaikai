@@ -199,7 +199,10 @@ fn main() : Int = 0
 
 `match e { _ -> body }` is `body`; `match e { x -> body }` is
 `let x = e ... body`. A destructuring pattern, a guard, or more than one
-arm means the match does real work and is left alone.
+arm means the match does real work and is left alone. Only a `match`
+written in the source is judged: a clause-block function (`case n, Up ->
+...`) and a multi-scrutinee `match a, b { ... }` need a pattern per
+column in every arm, so a column that only binds is not reported.
 
 ### list_concat_literal_to_spread
 
