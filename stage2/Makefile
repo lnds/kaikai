@@ -1357,6 +1357,27 @@ test-numeric-div-by-zero-traps-native: $(TARGET) bin-kai build
 	    || { echo "div-trap FAIL $$name (native, want 'trap: divide by zero' on stderr)"; cat build/$$name-nat.err; exit 1; }; \
 	done
 
+# A NaN `Real` is unordered with every `Real`: `!=` is the one comparison
+# that holds for it, whether the operands are raw, boxed or feed a branch.
+test-numeric-real-nan: $(TARGET) build
+	@set -e; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/numeric/real_nan_comparisons.kai > build/real_nan_comparisons.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/real_nan_comparisons.c -o build/real_nan_comparisons $(LDLIBS_M); \
+	./build/real_nan_comparisons > build/real_nan_comparisons.out; \
+	diff ../examples/numeric/real_nan_comparisons.out.expected build/real_nan_comparisons.out \
+	  && echo "real-nan OK (C backend)" \
+	  || { echo "real-nan DIFF (C backend)"; exit 1; }
+
+.PHONY: test-numeric-real-nan-native
+test-numeric-real-nan-native: $(TARGET) bin-kai build
+	@set -e; \
+	KAI_BACKEND=native ../bin/kai build ../examples/numeric/real_nan_comparisons.kai -o build/real_nan_comparisons-nat 2> build/real_nan_comparisons-nat.buildlog \
+	  || { echo "real-nan FAIL (native build errored)"; cat build/real_nan_comparisons-nat.buildlog; exit 1; }; \
+	./build/real_nan_comparisons-nat > build/real_nan_comparisons-nat.out; \
+	diff ../examples/numeric/real_nan_comparisons.out.expected build/real_nan_comparisons-nat.out \
+	  && echo "real-nan OK (native)" \
+	  || { echo "real-nan DIFF (native)"; exit 1; }
+
 # Issue #1637 — `Int.MIN / -1` and `Int.MIN % -1` have no representable
 # result; both must trap "divide overflow" (same discipline as the raw
 # checked helper) instead of running hardware `sdiv`/`srem` UB.
