@@ -131,6 +131,27 @@ scenario pkg-warm 0 "$pkg" -- main.kai
 ls -d "$pkg"/.kai-cache/*/bins/* > /dev/null 2>&1 \
   || { echo "  FAIL pkg: no entry in the package's user cache"; fail=$((fail + 1)); }
 
+# The manifest and the runtime header are link inputs whose digests are
+# kept under their state on disk. An edit to either rebuilds, and so does
+# a second edit of the same size straight after the first, which a coarse
+# clock would not show.
+printf 'name = "runmemo"\nentry = "main.kai"\n# a\n' > "$pkg/kai.toml"
+scenario manifest-edited 1 "$pkg" -- main.kai
+printf 'name = "runmemo"\nentry = "main.kai"\n# b\n' > "$pkg/kai.toml"
+scenario manifest-same-size 1 "$pkg" -- main.kai
+scenario manifest-warm 0 "$pkg" -- main.kai
+printf 'name = "runmemo"\nentry = "main.kai"\n# a\n' > "$pkg/kai.toml"
+scenario manifest-reverted 0 "$pkg" -- main.kai
+
+rm "$lay/stage2/runtime.h"
+cp "$ROOT/stage2/runtime.h" "$lay/stage2/runtime.h"
+printf '/* a */\n' >> "$lay/stage2/runtime.h"
+scenario runtime-edited 1 "$solo" -- main.kai
+scenario runtime-warm 0 "$solo" -- main.kai
+rm "$lay/stage2/runtime.h"
+ln -s "$ROOT/stage2/runtime.h" "$lay/stage2/runtime.h"
+scenario runtime-restored 0 "$solo" -- main.kai
+
 run off 0 "$solo" -- main.kai
 if [ "$(cat "$work/off.n")" -lt 1 ]; then
   echo "  FAIL off: KAI_BIN_MEMO=0 reused a binary"; fail=$((fail + 1))

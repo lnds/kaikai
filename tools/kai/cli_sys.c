@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 int64_t kaicli_mtime(const char *path) {
@@ -24,6 +25,93 @@ int64_t kaicli_mtime(const char *path) {
 int64_t kaicli_size(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 ? (int64_t) st.st_size : -1;
+}
+
+/* What tells one state of a file from the next without reading it: size,
+   modification and change times to the nanosecond, and inode. Empty when
+   it cannot be stat'ed. */
+const char *kaicli_stat_id(const char *path) {
+    static char buf[128];
+    struct stat st;
+    if (stat(path, &st) != 0) return "";
+#ifdef __APPLE__
+    long long mn = st.st_mtimespec.tv_nsec, cn = st.st_ctimespec.tv_nsec;
+#else
+    long long mn = st.st_mtim.tv_nsec, cn = st.st_ctim.tv_nsec;
+#endif
+    snprintf(buf, sizeof(buf), "%lld %lld.%09lld %lld.%09lld %llu", (long long) st.st_size,
+             (long long) st.st_mtime, mn, (long long) st.st_ctime, cn, (unsigned long long) st.st_ino);
+    return buf;
+}
+
+/* True when the file was last written and last changed more than two
+   seconds ago: a later write then shows in its times on any filesystem,
+   however coarse its clock. */
+int kaicli_settled(const char *path) {
+    struct stat st;
+    time_t now = time(NULL);
+    return stat(path, &st) == 0 && st.st_mtime + 2 < now && st.st_ctime + 2 < now;
+}
+
+/* True when both files hold the same bytes. */
+int kaicli_same_bytes(const char *a, const char *b) {
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0 || sa.st_size != sb.st_size) return 0;
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb;
+    char ba[65536], bb[65536];
+    while (same) {
+        size_t na = fread(ba, 1, sizeof(ba), fa), nb = fread(bb, 1, sizeof(bb), fb);
+        if (na != nb || memcmp(ba, bb, na) != 0) same = 0;
+        if (na == 0) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
+/* Copy `from` to `to` with its mode, through a sibling renamed into place:
+   a reader sees the old file or the new one, and a binary that already
+   ran is never rewritten under its inode. */
+int kaicli_copy_file(const char *from, const char *to) {
+    struct stat st;
+    char part[4096];
+    if (stat(from, &st) != 0 || snprintf(part, sizeof(part), "%s.%ld.part", to, (long) getpid()) >= (int) sizeof(part)) return 0;
+    int in = open(from, O_RDONLY);
+    if (in < 0) return 0;
+    int out = open(part, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
+    if (out < 0) { close(in); return 0; }
+    char buf[65536];
+    ssize_t n;
+    int ok = 1;
+    while (ok && (n = read(in, buf, sizeof(buf))) > 0) {
+        for (ssize_t off = 0; ok && off < n; ) {
+            ssize_t w = write(out, buf + off, (size_t) (n - off));
+            if (w < 0) ok = 0; else off += w;
+        }
+    }
+    if (n < 0) ok = 0;
+    close(in);
+    if (fchmod(out, st.st_mode & 0777) != 0) ok = 0;
+    if (close(out) != 0) ok = 0;
+    if (ok && rename(part, to) != 0) ok = 0;
+    if (!ok) unlink(part);
+    return ok;
+}
+
+/* `ln -f from to`. */
+int kaicli_link_file(const char *from, const char *to) {
+    char part[4096];
+    if (snprintf(part, sizeof(part), "%s.%ld.part", to, (long) getpid()) >= (int) sizeof(part)) return 0;
+    unlink(part);
+    if (link(from, part) != 0) return 0;
+    if (rename(part, to) != 0) { unlink(part); return 0; }
+    return 1;
+}
+
+/* Set the file's times to now, as `touch` on a file that exists. */
+int kaicli_touch(const char *path) {
+    return utimensat(AT_FDCWD, path, NULL, 0) == 0;
 }
 
 int kaicli_exists(const char *path) {
