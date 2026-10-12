@@ -59,6 +59,7 @@ import compiler.home_tu
 import compiler.loop_lower
 import compiler.cell_promote
 import compiler.purity
+import compiler.fn_set
 import compiler.escapes
 import compiler.diag
 import compiler.util
@@ -7490,7 +7491,7 @@ fn emit_param_list_masked(params: [Param], tys: [Ty], mask: [Bool], acc: [String
   }
 }
 
-fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, capable: [FnId], const_fns: [FnId]) : String {
+fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, capable: [FnId], const_fns: FnSet) : String {
   match d {
     DFn(_, fid, _, params, _, _, body, _, _, mo) -> {
       let sym = c_sym(emit_fn_text(tab, specs, fid), mo)
@@ -7511,8 +7512,8 @@ fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: 
 # else empty. The prefix must be IDENTICAL on the forward decl and the
 # definition (both go through this helper on the same fn), so `cc`
 # never sees a mismatched declaration.
-fn purity_const_prefix(fid: FnId, const_fns: [FnId]) : String =
-  if any(const_fns, (f) => fnid_eq(f, fid)) { "KAI_CONST " } else { "" }
+fn purity_const_prefix(fid: FnId, const_fns: FnSet) : String =
+  if fn_set_has(const_fns, fid) { "KAI_CONST " } else { "" }
 
 fn emit_thunk_forward(d: Decl, tab: SymTab, specs: SpecNames) : String {
   match d {
@@ -7522,7 +7523,7 @@ fn emit_thunk_forward(d: Decl, tab: SymTab, specs: SpecNames) : String {
   }
 }
 
-fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_fns: [FnId]) : String / Console {
+fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_fns: FnSet) : String / Console {
 
   match d {
     DFn(_, fid, tps, params, ret_ty_opt, row, body, _, _, mo) -> {
@@ -8200,7 +8201,7 @@ fn emit_thunk_arg_list_masked(params: [Param], mask: [Bool], i: Int, ns: LocalNa
 
 # ---- top-level passes ----
 
-fn fn_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex, capable: [FnId], const_fns: [FnId], entry: SymId) : String = {
+fn fn_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex, capable: [FnId], const_fns: FnSet, entry: SymId) : String = {
   let frames = frames_index(build_evidence_frames(decls, entry))
   concat_all(map(decls, (d) => emit_fn_forward(d, tab, specs, fx, frames, capable, const_fns)))
 }
@@ -8231,10 +8232,10 @@ fn rd_decl_ret_is_raw(fid: FnId, fx: FnIndex) : Bool =
 fn thunk_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames) : String =
   concat_all(map(decls, (d) => emit_thunk_forward(d, tab, specs)))
 
-fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx, const_fns: [FnId]) : String / Console + Mutable =
+fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx, const_fns: FnSet) : String / Console + Mutable =
   sb_build(fn_bodies_loop(src, decls, cx, const_fns, sb_new()))
 
-fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, const_fns: [FnId], b: SB) : SB / Console + Mutable = match decls {
+fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, const_fns: FnSet, b: SB) : SB / Console + Mutable = match decls {
   [] -> b
   [d, ...rest] -> match d {
     DFn(_, _, _, _, _, _, _, _, _, _) -> {
@@ -10070,7 +10071,7 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # `KAI_CONST` purity does not change the ABI and needs no such care.
   let fx = fnx_build_decls(decls, fns)
   let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
-  let const_fns = purity_const_fns(purity_analyze(decls, entry))
+  let const_fns = fn_set_of(purity_const_fns(purity_analyze(decls, entry)))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls), tab)
   let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_fns, entry)
   let thunk_fwd = thunk_forward_decls(decls, tab, specs)
@@ -10135,7 +10136,7 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
 type ModTusOut = MTO([CModuleTU], [CTU])
 
 #[doc("Build one CModuleTU per module name, each carrying that module's mo-filtered fn bodies; a stem present in `cached` splices the cached body instead of emitting. Explicit loop (not map) because `fn_bodies` carries the Console effect.")]
-fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_fns: [FnId], cached: [CTU], cacheable: [String], acc: [CModuleTU], acc_fresh: [CTU]) : ModTusOut / Console + Mutable = match mod_names {
+fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_fns: FnSet, cached: [CTU], cacheable: [String], acc: [CModuleTU], acc_fresh: [CTU]) : ModTusOut / Console + Mutable = match mod_names {
   [] -> MTO(list_reverse(acc), list_reverse(acc_fresh))
   [m, ...rest] -> {
     let stem = tu_stem(Some(m))
@@ -10232,7 +10233,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, s
   # Every fn whose lowered body is memory-clean, so the signature helper
   # prefixes `KAI_CONST`. Computed once over the same decls the native
   # backend sees. Same set drives the forward decl and the body.
-  let const_fns = purity_const_fns(purity_analyze(decls, entry))
+  let const_fns = fn_set_of(purity_const_fns(purity_analyze(decls, entry)))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls), tab)
   let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_fns, entry)
   let thunk_fwd = thunk_forward_decls(decls, tab, specs)
