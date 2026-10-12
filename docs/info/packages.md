@@ -218,6 +218,22 @@ mypackage/
                                  #   manifest needed inside tests/)
 ```
 
+The sources may sit in a subdirectory instead, with `entry` pointing
+into it. The package's modules then resolve from the directory of the
+entry for every file the package owns, and `kai test` runs the
+`tests/` beside `kai.toml` as well as one beside the entry:
+
+```text
+mypackage/
+  kai.toml                       # entry = "src/main.kai"
+  src/
+    main.kai                     # import mypackage.core.math
+    mypackage/core/math.kai
+    mypackage/core/math_test.kai # runs with `kai test`
+  tests/
+    math_test.kai                # import mypackage.core.math
+```
+
 ## Spec arg to kai build / run
 
 ```text
