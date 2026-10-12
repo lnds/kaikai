@@ -9535,11 +9535,24 @@ KAI_RT_SHARED KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
     return r;
 }
 
-/* `kai_op_le` and `kai_op_ge` are now layered over the consuming `kai_op_gt` /
- * `kai_op_lt`. The inner call consumes `a` and `b` already; we must not
- * decref them again here. The intermediate bool result is consumed
- * locally to read the inverted truth value. */
+/* Two `Real`s compare with the C operator itself: a NaN is unordered, so
+ * `<=` is not the negation of `>`. Sets `*out` and consumes both on a
+ * match; returns 0, consuming neither, otherwise. */
+static int kai_real_cmp(KaiValue *a, KaiValue *b, int le, int *out) {
+    if (!kai_is_ptr(a) || a->tag != KAI_REAL || !kai_is_ptr(b) || b->tag != KAI_REAL) return 0;
+    *out = le ? a->as.r <= b->as.r : a->as.r >= b->as.r;
+    kai_decref(a); kai_decref(b);
+    return 1;
+}
+
+/* Any other type is totally ordered, so `kai_op_le` and `kai_op_ge` are
+ * layered over the consuming `kai_op_gt` / `kai_op_lt`. The inner call
+ * consumes `a` and `b` already; we must not decref them again here. The
+ * intermediate bool result is consumed locally to read the inverted
+ * truth value. */
 static KaiValue *kai_op_le(KaiValue *a, KaiValue *b) {
+    int le;
+    if (kai_real_cmp(a, b, 1, &le)) return kai_bool(le);
     KaiValue *g = kai_op_gt(a, b);
     KaiValue *r = kai_bool(!g->as.b);
     kai_decref(g);
@@ -9547,6 +9560,8 @@ static KaiValue *kai_op_le(KaiValue *a, KaiValue *b) {
 }
 
 static KaiValue *kai_op_ge(KaiValue *a, KaiValue *b) {
+    int ge;
+    if (kai_real_cmp(a, b, 0, &ge)) return kai_bool(ge);
     KaiValue *l = kai_op_lt(a, b);
     KaiValue *r = kai_bool(!l->as.b);
     kai_decref(l);
@@ -21190,9 +21205,10 @@ static void *kai_llvm_build_fbinop(void *b, int64_t op, void *a, void *c) {
         default: return (void *) LLVMBuildFDiv(bld, la, lc, "");
     }
 }
-/* Raw `double` ordered comparison → an `i1`. `pred` selects the predicate:
- * 0=`<`, 1=`>`, 2=`<=`, 3=`>=`, 4=`==`, 5=`!=` — the ordered (`O*`) family,
- * matching the C `<`/`==` on a raw `double` (NaN compares false, as C does).
+/* Raw `double` comparison → an `i1`. `pred` selects the predicate:
+ * 0=`<`, 1=`>`, 2=`<=`, 3=`>=`, 4=`==`, 5=`!=` — what the C operator
+ * gives on a raw `double`: a NaN compares false, except under `!=`,
+ * which is the unordered predicate and so the negation of `==`.
  * The result is the `i1` a `condbr` consumes directly, or the caller boxes
  * via `kaix_bool` at a raw→boxed border. */
 static void *kai_llvm_build_fcmp(void *b, int64_t pred, void *a, void *c) {
@@ -21205,7 +21221,7 @@ static void *kai_llvm_build_fcmp(void *b, int64_t pred, void *a, void *c) {
         case 2:  p = LLVMRealOLE; break;
         case 3:  p = LLVMRealOGE; break;
         case 4:  p = LLVMRealOEQ; break;
-        default: p = LLVMRealONE; break;
+        default: p = LLVMRealUNE; break;
     }
     return (void *) LLVMBuildFCmp(bld, p, la, lc, "");
 }
