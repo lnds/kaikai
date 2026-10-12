@@ -4778,7 +4778,8 @@ test-effects-mn_cross_thread_scalar_share: $(TARGET) build core-cache-warm
 	@set -e; \
 	for f in ../examples/effects/mn_cross_thread_scalar_share.kai \
 	         ../examples/effects/mn_await_result_share.kai \
-	         ../examples/effects/mn_str_intern_race.kai; do \
+	         ../examples/effects/mn_str_intern_race.kai \
+	         ../examples/effects/mn_first_variant_on_many_fibers.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/effects/$$name.out.expected; \
 	  $(KAIC2) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \

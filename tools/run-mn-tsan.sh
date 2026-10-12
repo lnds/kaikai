@@ -69,6 +69,10 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 # while the owner closes it, and a send that slipped between the check and the
 # enqueue would write into freed memory.
 #
+# The next has every thread construct a variant tag for the first time at
+# once: the tag's name and slot mask are recorded right there, in tables every
+# thread reads on its drop path.
+#
 # The rally makes nearly every message a cross-thread wake, so it drives the
 # idle path hard: spinning workers, parks, and the permit handoff between them.
 FIXTURES=(
@@ -78,6 +82,7 @@ FIXTURES=(
   "examples/effects/mn_await_result_share.kai"
   "examples/effects/mn_str_intern_race.kai"
   "examples/effects/mn_send_to_ended_mailbox_race.kai"
+  "examples/effects/mn_first_variant_on_many_fibers.kai"
   "examples/effects/mn_pingpong_no_false_deadlock.kai"
 )
 

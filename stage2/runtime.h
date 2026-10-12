@@ -2198,82 +2198,60 @@ static void kai_var_name_report_at_exit(void) {
 
 #endif /* KAI_TRACE_VAR_NAMES */
 
-/* Monomorphic-node packing: the variant name is no longer stored per
- * node (it was 8 B/node of metadata the hot path never reads). Instead a
- * process-global tag→name table is populated the first time each tag is
- * constructed (the ctor still passes `name`), and the rare readers
- * (to_string, deep_copy, protocol dispatch) recover it via
- * `kai_variant_name_of(tag)`. Tags are dense small ints; a flat array
- * with a lazy grow covers them. Names are static string literals, never
- * freed. */
-#define KAI_VARNAME_TABLE_INIT 256
+/* A constructor's name and per-slot kind bits live in a process-wide
+ * table indexed by tag, not in the node. A tag is recorded the first time
+ * it is constructed, on whichever thread gets there first.
+ *
+ * The table spans the whole tag space (`variant_tag` is a uint16_t), so it
+ * never grows or moves. Each field is one atomic word and every store to
+ * it writes the same value, so relaxed ordering suffices. Tags are hashed
+ * across the span: name and mask share an entry so a tag touches one page. */
+#define KAI_VARIANT_TAG_SPACE 65536
+#define KAI_SLOTMASK_RECORDED (UINT64_C(1) << 32)
+typedef struct {
+    _Atomic(const char *) name;
+    _Atomic uint64_t      mask;   /* KAI_SLOTMASK_RECORDED | mask once recorded */
+} KaiCtorMeta;
 #if defined(KAI_SEPARATE_COMPILATION)
-extern const char **kai_varname_table;
-extern int kai_varname_table_cap;
+extern KaiCtorMeta kai_ctor_meta[KAI_VARIANT_TAG_SPACE];
 #  if defined(KAI_RUNTIME_OWNER)
-const char **kai_varname_table = NULL;
-int kai_varname_table_cap = 0;
+KaiCtorMeta kai_ctor_meta[KAI_VARIANT_TAG_SPACE];
 #  endif
 #else
-static const char **kai_varname_table = NULL;
-static int kai_varname_table_cap = 0;
+static KaiCtorMeta kai_ctor_meta[KAI_VARIANT_TAG_SPACE];
 #endif
 
+static inline int kai_variant_tag_in_space(int32_t tag) {
+    return (uint32_t) tag < KAI_VARIANT_TAG_SPACE;
+}
+
 static void kai_varname_register(int32_t tag, const char *name) {
-    if (tag < 0 || name == NULL) return;
-    if (tag >= kai_varname_table_cap) {
-        int newcap = kai_varname_table_cap == 0 ? KAI_VARNAME_TABLE_INIT : kai_varname_table_cap;
-        while (tag >= newcap) newcap *= 2;
-        kai_varname_table = (const char **) realloc(kai_varname_table, (size_t) newcap * sizeof(char *));
-        for (int i = kai_varname_table_cap; i < newcap; ++i) kai_varname_table[i] = NULL;
-        kai_varname_table_cap = newcap;
+    if (!kai_variant_tag_in_space(tag) || name == NULL) return;
+    if (atomic_load_explicit(&kai_ctor_meta[tag].name, memory_order_relaxed) == NULL) {
+        atomic_store_explicit(&kai_ctor_meta[tag].name, name, memory_order_relaxed);
     }
-    if (kai_varname_table[tag] == NULL) kai_varname_table[tag] = name;
 }
 
 static const char *kai_variant_name_of(int32_t tag) {
-    if (tag >= 0 && tag < kai_varname_table_cap && kai_varname_table[tag] != NULL) {
-        return kai_varname_table[tag];
-    }
-    return "";
+    if (!kai_variant_tag_in_space(tag)) return "";
+    const char *name = atomic_load_explicit(&kai_ctor_meta[tag].name, memory_order_relaxed);
+    return name != NULL ? name : "";
 }
 
-/* Koka-packed header: the per-slot kind bits (`slot_mask`) no longer live
- * per node — they are a property of the constructor, so a tag→mask table
- * holds them (populated at first construction, like the name table). The
- * generic drop / copy / reuse walkers read `kai_slot_mask_of(tag)`. A tag
- * never seen returns 0 (all-pointer), the conservative default. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern uint32_t *kai_slotmask_table;
-extern int kai_slotmask_table_cap;
-extern uint8_t *kai_slotmask_seen;
-#  if defined(KAI_RUNTIME_OWNER)
-uint32_t *kai_slotmask_table = NULL;
-int kai_slotmask_table_cap = 0;
-uint8_t *kai_slotmask_seen = NULL;   /* 1 once a tag's mask is recorded */
-#  endif
-#else
-static uint32_t *kai_slotmask_table = NULL;
-static int kai_slotmask_table_cap = 0;
-static uint8_t *kai_slotmask_seen = NULL;   /* 1 once a tag's mask is recorded */
-#endif
-
+/* The first mask recorded for a tag wins. The recorded bit and the mask
+ * share a word so a thread that sees the tag as recorded sees its mask. */
 static void kai_slotmask_register(int32_t tag, uint32_t mask) {
-    if (tag < 0) return;
-    if (tag >= kai_slotmask_table_cap) {
-        int newcap = kai_slotmask_table_cap == 0 ? KAI_VARNAME_TABLE_INIT : kai_slotmask_table_cap;
-        while (tag >= newcap) newcap *= 2;
-        kai_slotmask_table = (uint32_t *) realloc(kai_slotmask_table, (size_t) newcap * sizeof(uint32_t));
-        kai_slotmask_seen  = (uint8_t *)  realloc(kai_slotmask_seen,  (size_t) newcap * sizeof(uint8_t));
-        for (int i = kai_slotmask_table_cap; i < newcap; ++i) { kai_slotmask_table[i] = 0; kai_slotmask_seen[i] = 0; }
-        kai_slotmask_table_cap = newcap;
+    if (!kai_variant_tag_in_space(tag)) return;
+    if (atomic_load_explicit(&kai_ctor_meta[tag].mask, memory_order_relaxed) == 0) {
+        atomic_store_explicit(&kai_ctor_meta[tag].mask, KAI_SLOTMASK_RECORDED | mask,
+                              memory_order_relaxed);
     }
-    if (!kai_slotmask_seen[tag]) { kai_slotmask_table[tag] = mask; kai_slotmask_seen[tag] = 1; }
 }
 
+/* A tag never recorded reads as 0: every slot a pointer. */
 static uint32_t kai_slot_mask_of(int32_t tag) {
-    if (tag >= 0 && tag < kai_slotmask_table_cap) return kai_slotmask_table[tag];
-    return 0;
+    if (!kai_variant_tag_in_space(tag)) return 0;
+    return (uint32_t) atomic_load_explicit(&kai_ctor_meta[tag].mask, memory_order_relaxed);
 }
 
 /* ---------- KAI_MAX_HEAP: process heap ceiling (host containment) ----------
@@ -6073,44 +6051,16 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
     return v;
 }
 
-/* Fast typed constructor for a payload-carrying variant with at least
- * one PRIMITIVE slot (the only case the emitter routes here).
+/* Typed constructor for a payload-carrying variant with a primitive
+ * slot: neither the nullary cache nor the immortal-args cache can hold
+ * such a cell, so it is alloc + stores, small enough to inline.
  *
- * `kai_variant_u` runs a per-call preamble before the actual
- * alloc+stores: KAI_VAR_NAME_ALLOC, kai_varname_register,
- * kai_slotmask_register, then a nullary-singleton probe and an
- * immortal-args cache probe (262144-bucket hash + linear scan). It is
- * also KAI_RC_NOINLINE — a real call with argument spill at every one of
- * millions of construction sites (perfil: kai_variant_u = 43 samples,
- * second only to the loop body itself).
- *
- * For a cell with a primitive slot NONE of that preamble can help: the
- * nullary cache needs n == 0, and the immortal-args cache explicitly
- * skips cells with primitive slots ("their identity is the bit pattern,
- * which the cache shape does not key on"). So the only preamble work
- * that matters is registering tag→name and tag→mask — and both
- * registers are already idempotent (`kai_slotmask_seen[tag]` /
- * `kai_varname_table[tag]` guard the first write). This fast path keeps
- * exactly those two idempotent registers (so the generic drop walker
- * reads the correct mask) and drops everything else, inlined so the C
- * compiler folds the alloc + the fixed-bound store loop into the caller
- * — Koka's `kk_alloc(sizeof) + field stores` shape.
- *
- * Mask MUST be registered here (not assumed pre-stamped): the walker in
- * kai_free_value reads kai_slot_mask_of(tag) to decide which slots are
- * pointers. A missing mask would make it treat a raw i64 key as a
- * pointer and decref garbage. The `_seen` guard makes the steady-state
- * cost a single predictable branch. */
+ * It records nothing: the generic drop walker reads the tag's mask to
+ * tell pointers from raw slots, so every tag routed here must already be
+ * stamped by kai_register_payload_ctors. The loop writes all n slots,
+ * hence the no-zero alloc. */
 static inline KaiValue *kai_variant_u_fast(int32_t tag, int n,
                                            KaiVarSlot *slots) {
-    /* No tag→name/mask register here: every payload ctor's name+mask is
-     * stamped ONCE at startup by kai_register_payload_ctors (emitted in
-     * _kai_register_proto_tables). Keeping the registers in the body made
-     * the fn too large for the inliner — at -O3 it stayed a separate
-     * 31.8M-instruction function (callgrind). Reduced to alloc+stores it
-     * inlines into the call site, the Koka kk_alloc + field-stores shape.
-     * No-zero alloc: the loop writes all n slots, so the allocator's
-     * zero-init is dead work. */
     KaiValue *v = kai_alloc_var_nz(n);
     v->variant_tag = tag;
     v->var_n_args = (uint8_t) n;
@@ -6799,7 +6749,7 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
          * kai_variant_u / kai_variant_u_fast), so its mask is registered.
          * The slotmask table read by the drop walker is keyed on tag, not
          * on this cell, so the steady-state register was pure redundant
-         * work (kai_slotmask_register's _seen guard already no-op'd it).
+         * work (kai_slotmask_register already no-op'd it).
          * Dropping it removes a call from every in-place rebuild — the
          * rb-tree reuse arm fires ~20M times. The reuse counter only
          * exists under tracing; gate it so the steady path is store-only. */
