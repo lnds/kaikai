@@ -105,6 +105,9 @@ FIXTURES=(
   "examples/effects/mn_cross_thread_scalar_share.kai"
   "examples/effects/mn_await_result_share.kai"
   "examples/effects/mn_str_intern_race.kai"
+  # Constructor metadata is recorded by whichever thread builds a tag first;
+  # here every thread does so at once.
+  "examples/effects/mn_first_variant_on_many_fibers.kai"
   # A printed line's payload and its trailing newline are separate stdio
   # calls; the pair must land atomically when fibers print from different
   # scheduler threads. Cross-fiber order is unspecified, so this fixture is
