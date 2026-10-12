@@ -89,6 +89,7 @@ import compiler.core_effects
 import compiler.scalar_ty
 import compiler.core_types
 import compiler.seq_match
+import compiler.char_range
 import compiler.tbinder
 import compiler.unit_walk
 import compiler.record_head
@@ -9600,6 +9601,10 @@ fn synth_call_site(st: InferState, callee: Expr, args_: [Expr], line: Int, col: 
     [x] -> synth_lazy_part(st, x)
     _   -> synth_call(st, callee, args_, line, col)
   }
+  EMark(MkLazyRange) -> match args_ {
+    [x] -> synth_lazy_range(st, x)
+    _   -> synth_call(st, callee, args_, line, col)
+  }
   _ -> synth_call(st, callee, args_, line, col)
 }
 
@@ -12217,17 +12222,6 @@ fn synth_range(st: InferState, lo: Expr, hi: Expr, stp: Option[Expr], line: Int,
   }
 }
 
-# A range walks Int or Char, and its start says which. A start the typer
-# has yet to settle follows a Char literal end; any other range is Int.
-fn range_of_chars(start: Ty, hi: Expr) : Bool = match start {
-  TyChar -> true
-  TyInt  -> false
-  _      -> match hi.kind {
-    EChar(_) -> true
-    _        -> false
-  }
-}
-
 # A range of Chars is the range of their code points, each mapped back:
 # `map([code(lo)..code(hi)], int_to_char)`. The three elements are held to
 # Char first, so a mix is reported against the range and not against the
@@ -12240,7 +12234,7 @@ fn synth_char_range(st: InferState, peek: Inferred, lo: Expr, hi: Expr, stp: Opt
   let s3 = char_range_second(s2, stp, line, col)
   if s3.errs > st.errs { inferred_leaf(s3, TyListT(TyChar), mk_expr(EList([]), line, col)) }
   else {
-    let codes = mk_expr(ERange(char_code(lo), char_code(hi), char_range_step(stp)), line, col)
+    let codes = mk_expr(ERange(char_code(lo), char_code(hi), inf_map_opt_expr(stp, char_step)), line, col)
     let back = mk_sym(builtin_sym("int_to_char"), line, col)
     synth(st_restore_deferred_fields(s3, st.deferred_fields, st.deferred_homs),
           mk_expr(ECall(mk_sym(builtin_sym("map"), line, col), [codes, back]), line, col))
@@ -12260,17 +12254,6 @@ fn char_range_second(st: InferState, stp: Option[Expr], line: Int, col: Int) : I
     }
     None -> st
   }
-
-fn char_range_step(stp: Option[Expr]) : Option[Expr] = match stp {
-  Some(step) -> match step.kind {
-    EBinop(BoSub, second, first) -> Some(Expr { ...step, kind: EBinop(BoSub, char_code(second), char_code(first)) })
-    _                            -> stp
-  }
-  None -> None
-}
-
-fn char_code(c: Expr) : Expr =
-  mk_expr(ECall(mk_sym(builtin_sym("char_to_int"), c.line, c.col), [c]), c.line, c.col)
 
 # `x |> f(y, z)` pipes `x` into `f` as its first argument: the typed
 # result is the call `f(x, y, z)`, so no pass after the typer sees `EPipe`.
@@ -15818,21 +15801,35 @@ fn synth_lazy_part(st: InferState, x: Expr) : Inferred / Console + File + Mutabl
       [] -> lazy_close_tails(st1, st1.row_tails, x)
       ls -> lazy_impure(st1, ls, x)
     }
-    let st3 = InferState { ...st2, row: st.row, row_tails: st.row_tails }
-    match apply_ty(st3.sub, r.ty) {
-      TyChar -> mk_inferred(lazy_char_bound(st3, x), TyInt, with_ty(r.expr, TyInt))
-      _      -> mk_inferred(st3, r.ty, r.expr)
-    }
+    mk_inferred(InferState { ...st2, row: st.row, row_tails: st.row_tails }, r.ty, r.expr)
   }
 }
 
-# A list range walks Chars; the progressions a lazy range is built from
-# count Ints, and the mismatch would name a call the author never wrote.
-fn lazy_char_bound(st: InferState, at: Expr) : InferState / Console + File = {
-  let d = mk_diag(SevError, st.file, at.line, at.col, "a `lazy` range takes `Int` bounds, and this one is a `Char`",
-                  [ri_help(st.file, at.line, at.col, "walk the code points and map them back: `lazy [char_to_int('a')..] | int_to_char`")])
-  render_diag(d)
-  st_bump_err(st_push_diag(st, d))
+# The progression of a `lazy` range: `call` is `from(start)`,
+# `from_step(start, step)` or `range(start, end, step)`. The start says
+# whether the range walks Int or Char, as in a list range, and the bounds
+# are held to it first, so a mix is reported against the range.
+fn synth_lazy_range(st: InferState, call: Expr) : Inferred / Console + File + Mutable = match call.kind {
+  ECall(f, [start, ...rest]) -> {
+    let peek = synth(st, start)
+    let chars = lazy_range_of_chars(apply_ty(peek.st.sub, peek.ty), rest)
+    let of = if chars { TyChar } else { TyInt }
+    let s1 = st_unify(peek.st, of, peek.ty, "range start", call.line, call.col)
+    let s2 = match rest {
+      [hi, _] -> {
+        let rh = synth(s1, hi)
+        st_unify(rh.st, of, rh.ty, "range end", call.line, call.col)
+      }
+      _ -> s1
+    }
+    let s3 = if chars { char_range_second(s2, last(rest), call.line, call.col) } else { s2 }
+    if s3.errs > st.errs { inferred_leaf(s3, TyAny, call) }
+    else {
+      let walk = if chars { lazy_char_walk(call, f, start, rest) } else { call }
+      synth(st_restore_deferred_fields(s3, st.deferred_fields, st.deferred_homs), walk)
+    }
+  }
+  _ -> synth(st, call)
 }
 
 # The open rows a range bound calls through: one of the enclosing

@@ -1270,6 +1270,8 @@ fn main() : Unit / Stdout = {
 - The bracket is a list or a range. A range may omit its end only
   here: `lazy [2..]`, `lazy [0, 5..]`. A list has an end, so a bare
   `[2..]` is an error whose fix-it spells `lazy [2..]`.
+- A range walks `Int` or `Char`, as a list range does:
+  `lazy ['a'..'e']`, `lazy ['a', 'c'..]`.
 - A spread is the rest of the sequence, so it comes last:
   `lazy [a, b, ...rest]`. `...` keeps its one meaning, spread/rest.
 - `Seq` is declared by the `seq` module, not built in. The file that
@@ -1288,6 +1290,7 @@ fn main() : Unit / Stdout = {
 | `lazy [a, b..]` | `seq.from_step(a, b - a)` |
 | `lazy [a..hi]` | `seq.range(a, hi, 1)` |
 | `lazy [a, b..hi]` | `seq.range(a, hi, b - a)` |
+| `lazy ['a'..]` | `seq.map(seq.from(char_to_int('a')), int_to_char)`, and so each range of `Char`s |
 
 The calls name `seq`'s declarations by identity, so the qualifier a
 file binds the module under does not matter, and a local `defer` does

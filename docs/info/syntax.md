@@ -689,7 +689,8 @@ fn main() : Unit / Stdout = {
   let nat = lazy [0..]                         # endless: 0, 1, 2, …
   let odd = lazy [1, 3..]                      # endless, stepped
   let few = lazy [2, 4..10]                    # a range with an end
-  Stdout.print(show(to_list(more)) ++ show(to_list(few)))
+  let abcs = lazy ['a'..]                      # a range of Chars
+  Stdout.print(show(to_list(more)) ++ show(to_list(few)) ++ show(to_list(take(abcs, 2))))
   Stdout.print(show(to_list(take(nat, 3))) ++ show(to_list(take(odd, 3))))
 }
 ```
