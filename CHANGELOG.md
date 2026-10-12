@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.145.0 (2026-10-12)
+
+### Added
+
+- **stdlib**: a const holding a Seq is evaluated once per fiber (#2731)
+
+### Changed
+
+- **typer**: the identity of a stdlib type is tabulated, not derived at every test (#2732)
+
 ## v0.144.0 (2026-10-12)
 
 ### BREAKING CHANGE
