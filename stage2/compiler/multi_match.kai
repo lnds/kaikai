@@ -1,0 +1,150 @@
+#[doc("""
+A multi-column match — `match a, b { p, q -> ... }`, or a clause-block
+over several parameters — as a chain of single-column matches.
+
+Each arm tests one refutable column, its pivot, as the pattern of a
+two-arm match and its other columns in that arm's guard, so the arms
+after it hang from one edge. An arm's guard and body are therefore
+lowered once, and outside the binders of every other arm.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.modules_binders
+import compiler.underscore_binders
+
+type MMCol = MMCol(Expr, Pattern)
+
+# The column an arm's match tests, and its other columns in order.
+type MMSplit = MMSplit(MMCol, [MMCol])
+
+#[doc("Expand a multi-scrutinee arm list into single-column matches over the scrutinees, each bound once.")]
+pub fn desugar_multi_match(scruts: [Expr], arms: [MMArm], line: Int, col: Int) : Expr =
+  mk_expr(EBlock(mm_scrut_lets(scruts, 0),
+                 Some(mm_arms(mm_scrut_vars(scruts, 0, line, col), arms, line, col))), line, col)
+
+fn mm_scrut_lets(scruts: [Expr], i: Int) : [Stmt] = match scruts {
+  [] -> []
+  [e, ...rest] -> [SLet(mk_pat(PBind(binder_minted(mm_scrut_name(i))), e.line, e.col), None, e),
+                   ...mm_scrut_lets(rest, i + 1)]
+}
+
+fn mm_scrut_vars(scruts: [Expr], i: Int, line: Int, col: Int) : [Expr] = match scruts {
+  [] -> []
+  [_, ...rest] -> [mk_local(local_minted(mm_scrut_name(i)), line, col),
+                   ...mm_scrut_vars(rest, i + 1, line, col)]
+}
+
+fn mm_scrut_name(i: Int) : String = string_concat("__mm_s_", int_to_string(i))
+
+# An arm no value escapes ends the chain: the arms after it are dead.
+fn mm_arms(vars: [Expr], arms: [MMArm], line: Int, col: Int) : Expr = match arms {
+  [] -> mm_trap(line, col)
+  [MMArm(pats, guard, body), ...rest] -> match mm_split(mm_columns(vars, pats), guard) {
+    None -> mm_bind(mm_columns(vars, pats), (n) => true, body, line, col)
+    Some(MMSplit(MMCol(sv, p), others)) -> {
+      let hit = Arm(p, mm_guard(others, guard, line, col),
+                    mm_bind(others, (n) => mm_body_binds(n, guard, body), body, line, col))
+      mk_expr(EMatch(sv, [hit, Arm(mm_wild(line, col), None, mm_arms(vars, rest, line, col))]), line, col)
+    }
+  }
+}
+
+fn mm_columns(vars: [Expr], pats: [Pattern]) : [MMCol] = match vars {
+  [] -> []
+  [sv, ...rest_vars] -> match pats {
+    [] -> []
+    [p, ...rest_pats] -> [MMCol(sv, p), ...mm_columns(rest_vars, rest_pats)]
+  }
+}
+
+# The pivot is the first refutable column; a guarded arm with none takes
+# the first column, whose match then only carries the guard.
+fn mm_split(cols: [MMCol], guard: Option[Expr]) : Option[MMSplit] = match mm_refutable_first(cols, []) {
+  Some(s) -> Some(s)
+  None    -> match guard {
+    None    -> None
+    Some(_) -> match cols {
+      []           -> None
+      [c, ...rest] -> Some(MMSplit(c, rest))
+    }
+  }
+}
+
+fn mm_refutable_first(cols: [MMCol], seen: [MMCol]) : Option[MMSplit] = match cols {
+  [] -> None
+  [MMCol(sv, p), ...rest] ->
+    if mm_irrefutable(p) { mm_refutable_first(rest, [MMCol(sv, p), ...seen]) }
+    else { Some(MMSplit(MMCol(sv, p), list_append(list_reverse(seen), rest))) }
+}
+
+fn mm_irrefutable(p: Pattern) : Bool = match p.pkind {
+  PWild         -> true
+  PBind(_)      -> true
+  PAs(_, inner) -> mm_irrefutable(inner)
+  _             -> false
+}
+
+# Whether the columns beside the pivot match and the written guard holds.
+# The written guard is the only reader of what a column binds here.
+fn mm_guard(others: [MMCol], guard: Option[Expr], line: Int, col: Int) : Option[Expr] = match others {
+  [] -> guard
+  [MMCol(sv, p), ...rest] -> {
+    let inner = mm_guard(rest, guard, line, col)
+    let read = (n) => mm_reads(guard, n)
+    if not mm_irrefutable(p) {
+      Some(mm_match(sv, ub_pat(p, read), mm_or_true(inner, line, col), Some(mk_expr(EBool(false), line, col)), line, col))
+    } else {
+      match inner {
+        Some(g) -> if mm_keeps(p, read) { Some(mm_match(sv, ub_pat(p, read), g, None, line, col)) } else { inner }
+        None    -> None
+      }
+    }
+  }
+}
+
+fn mm_or_true(g: Option[Expr], line: Int, col: Int) : Expr = match g {
+  Some(e) -> e
+  None    -> mk_expr(EBool(true), line, col)
+}
+
+# `body` under the binders `keep` accepts of the columns beside the pivot.
+# The guard has matched them, so a refutable one cannot miss.
+fn mm_bind(cols: [MMCol], keep: (Binder) -> Bool, body: Expr, line: Int, col: Int) : Expr = match cols {
+  [] -> body
+  [MMCol(sv, p), ...rest] -> {
+    let inner = mm_bind(rest, keep, body, line, col)
+    if not mm_keeps(p, keep) { inner }
+    else if mm_irrefutable(p) { mm_match(sv, ub_pat(p, keep), inner, None, line, col) }
+    else { mm_match(sv, ub_pat(p, keep), inner, Some(mm_trap(line, col)), line, col) }
+  }
+}
+
+# A binder only the guard reads stays out of the body, and one nothing
+# reads stays in it, where it is reported unused once.
+fn mm_body_binds(n: Binder, guard: Option[Expr], body: Expr) : Bool =
+  ub_mentions(n, body) or not (mm_reads(guard, n) or mm_unnamed(n))
+
+fn mm_reads(guard: Option[Expr], n: Binder) : Bool = match guard {
+  Some(g) -> ub_mentions(n, g)
+  None    -> false
+}
+
+fn mm_unnamed(n: Binder) : Bool = match char_at(written_text(n.name), 0) {
+  Some(c) -> c == '_'
+  None    -> true
+}
+
+fn mm_keeps(p: Pattern, keep: (Binder) -> Bool) : Bool = any(pat_binders(p, []), keep)
+
+fn mm_match(sv: Expr, p: Pattern, hit: Expr, miss: Option[Expr], line: Int, col: Int) : Expr = match miss {
+  Some(m) -> mk_expr(EMatch(sv, [Arm(p, None, hit), Arm(mm_wild(line, col), None, m)]), line, col)
+  None    -> mk_expr(EMatch(sv, [Arm(p, None, hit)]), line, col)
+}
+
+# The typer tells this arm from a written `_` by its position: the match's own.
+fn mm_wild(line: Int, col: Int) : Pattern = mk_pat(PWild, line, col)
+
+# `todo!` types as anything and adds nothing to the enclosing row.
+fn mm_trap(line: Int, col: Int) : Expr =
+  mk_expr(ETodo("non-exhaustive multi-arg match"), line, col)

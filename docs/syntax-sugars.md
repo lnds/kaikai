@@ -1210,8 +1210,9 @@ For an N-arg fn (2 ≤ N ≤ 4) the scrutinee is the implicit tuple of
 parameters; surface kaikai has no tuple expression so the desugar
 reuses the existing multi-arg `match a, b { p, q -> ... }` machinery
 (`desugar_multi_match`) — each arm carries N comma-separated patterns,
-mirroring issue #129. The N=4 cap matches `parse_match`; raising it
-requires re-evaluating the nested-match blowup.
+mirroring issue #129. The N=4 cap matches `parse_match`. Each arm is
+lowered once: it tests one refutable column as a pattern and the others
+in its guard, so the arms after it are reached through a single edge.
 
 ### Why `case` keyword
 
