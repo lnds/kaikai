@@ -80,7 +80,7 @@ def parse(path):
     doc, inside = set(), False
     for i, l in enumerate(lines):
         if inside: doc.add(i)
-        if l.startswith('#[doc("""'): inside = True
+        if l.startswith('#[doc("""'): inside = '""")]' not in l[9:]
         elif inside and l.startswith('""")]'): inside = False
     bad = [l for i, l in enumerate(lines) if OTHER.match(l) and i not in doc]
     if bad: sys.exit("move.py handles fn, type and const only; found: " + bad[0])
@@ -276,9 +276,9 @@ def cmd_apply(path, plan):
     owner = {n: it.name for it in items for n in it.names}
 
     importers = []
-    for f in sorted(os.listdir(src)):
-        full = os.path.join(src, f)
-        if f.endswith(".kai") and full != path and re.search(r"^import %s\.%s$" % (pkg, old), open(full).read(), re.M):
+    above = os.path.dirname(src)
+    for full in sorted(os.path.join(d, f) for d in (src, above) for f in os.listdir(d)):
+        if full.endswith(".kai") and full != path and re.search(r"^import %s\.%s$" % (pkg, old), open(full).read(), re.M):
             importers.append(full)
     outside = collections.Counter()
     for full in importers:

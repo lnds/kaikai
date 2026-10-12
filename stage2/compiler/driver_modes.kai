@@ -1,0 +1,255 @@
+#[doc("""
+The driver's small modes: the token and builtin-doc listings, the guard
+listing, migrate, mutate, and the batch list.
+""")]
+
+import compiler.util
+import compiler.lex_tokens
+import compiler.lex
+import compiler.ast
+import compiler.symtab
+import compiler.parse
+import compiler.symtab_build
+import compiler.fmt
+import compiler.fmt_writer
+import compiler.migrate
+import compiler.migrate_scan
+import compiler.mutate
+import compiler.mutate_splice
+import compiler.modules_paths
+import compiler.user_cache
+import compiler.core_cache
+import compiler.guard_iface
+import compiler.edition
+import compiler.fnreg
+import compiler.doc_attr
+import compiler.driver_core_load
+import compiler.driver_cli
+
+fn tok_text(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+fn tok_line_str(t: Token) : String = int_to_string(t.line)
+fn tok_col_str(t: Token)  : String = int_to_string(t.col)
+
+fn dump_token(src: String, t: Token) : Unit / Console {
+  match t.kind {
+    TkNewline -> print("#{tok_line_str(t)}:#{tok_col_str(t)}  NEWLINE")
+    TkError(msg) -> eprint("#{tok_line_str(t)}:#{tok_col_str(t)}  ERROR  #{msg}")
+    _ -> {
+      let text = tok_text(src, t)
+      print("#{tok_line_str(t)}:#{tok_col_str(t)}  #{tk_name(t.kind)}  \"#{text}\"")
+    }
+  }
+}
+
+#[doc("Print one line per token.")]
+pub fn dump_tokens(src: String, tokens: [Token]) : Unit / Console {
+  tokens |> each((t) => dump_token(src, t))
+}
+
+#[doc("""
+`--builtins-doc-json`. Dump the `#[doc(...)]` attributes of the
+auto-loaded core module set as one JSON array,
+one object per module. Parses each core file fresh — docs are
+stripped from cached decl streams, so the cache is bypassed on
+purpose. The JSON rendering lives in compiler/doc_attr.kai.
+""")]
+pub fn dump_builtins_doc_json() : Int / Console + File =
+  builtins_doc_loop(core_module_files(), core_module_paths(), [])
+
+fn builtins_doc_loop(rels: [String], paths: [String],
+                       acc: [String]) : Int / Console + File {
+  match rels {
+    [] -> { print(doc_builtins_json(list_reverse(acc))); 0 }
+    [r, ...rrest] -> match paths {
+      [] -> { print(doc_builtins_json(list_reverse(acc))); 0 }
+      [p, ...prest] -> match read_file(p) {
+        Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
+        Ok(src) -> {
+          let toks = tokenize(src)
+          let lex_errs = report_errors(p, src, toks)
+          if lex_errs != 0 { 1 }
+          else {
+            let parsed = parse_program(p, src, toks, module_name_of_path(p))
+            match parsed.decls {
+              None -> 1
+              Some(ds) -> {
+                let docs = doc_strip_all(p, src, ds)
+                # "core/list.kai" -> "core/list" for the module field.
+                let mod_name = string_slice(r, 0, string_length(r) - 4)
+                builtins_doc_loop(rrest, prest,
+                  [doc_module_json(mod_name, docs.module_doc, docs.items, st_of_entries(parsed.names)), ...acc])
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("""
+The cache directory the core loader should use for this invocation:
+the shared `--core-cache-dir` when supplied, else the per-project
+`.kai-cache` under the legacy `--user-cache` opt-in, else "" (off).
+""")]
+pub fn core_cache_dir_for(opts: CliOptions, target: String) : String =
+  if opts.core_cache.dir != "" { opts.core_cache.dir }
+  else if opts.user_cache {
+    concat_all([dir_of(target), "/", uc_cache_dir_name()])
+  } else { "" }
+
+#[doc("""
+`kai migrate` body: rewrite the decls, re-emit through the fmt-
+writer, and guard the never-emit-non-parsing invariant by reparsing
+the output. On a reparse failure nothing is printed and the run
+fails, so the user's file is never overwritten with broken source.
+The migrated source goes to stdout; the `manual:` report and the
+change summary go to stderr, keeping stdout a clean source stream
+the bin/kai wrapper can diff or write back.
+The report is scanned from an INDEPENDENT parse of the same source,
+not the binding the rewrite consumes: the rewrite moves its owned
+`decls`, so reusing one binding for both passes would leave the scan
+reading freed sub-lists. Re-parsing is cheap next to the rest of
+migrate and keeps the two passes fully decoupled.
+""")]
+pub fn run_migrate(path: String, src: String, decls: [Decl], tab: SymTab, cmts: [Cmt], edition: Option[Edition]) : Int / Console =
+  if migrate_flips_types(edition) {
+    run_migrate_scanned(path, src, tab, cmts, scan_source(path, src), migrate_type_flip_count(decls), migrate_decls(decls))
+  } else {
+    run_migrate_scanned(path, src, tab, cmts, scan_source(path, src), 0, migrate_decls_renames_only(decls))
+  }
+
+# The Ok-first `Result` flip is the hanga-roa -> orongo type-order
+# change: it applies to hanga-roa source and produces orongo source.
+# The rewrite is positional, so it cannot tell an already-flipped
+# `Result[T, E]` from a not-yet-flipped `Result[E, T]` by shape — the
+# declared source edition is the only convergence signal. Anything but
+# hanga-roa, including a flagless invocation, gets the call renames
+# only; that is what makes a second migrate a no-op.
+fn migrate_flips_types(edition: Option[Edition]) : Bool = match edition {
+  Some(EdHangaRoa) -> true
+  _                -> false
+}
+
+fn scan_source(path: String, src: String) : [MigRep] / Console = match parse_program(path, src, tokenize(src), module_name_of_path(path)).decls {
+  None -> []
+  Some(ds) -> migrate_scan_decls(ds)
+}
+
+fn run_migrate_scanned(path: String, src: String, tab: SymTab, cmts: [Cmt], reps: [MigRep], flips: Int, migrated: [Decl]) : Int / Console = {
+  let out = fmt_program(migrated, tab, cmts, tokenize(src), src, fmt_default_width())
+  let reparsed = parse_program(path, out, tokenize(out), module_name_of_path(path))
+  match reparsed.decls {
+    None -> { eprint("migrate: internal error — rewritten source does not parse; aborting (no file written)"); 1 }
+    Some(_) -> run_migrate_ok(out, reps, flips)
+  }
+}
+
+fn run_migrate_ok(out: String, reps: [MigRep], flips: Int) : Int / Console = {
+  print(out)
+  let report = migrate_manual_report(reps)
+  if report != "" { eprint(report) } else { () }
+  eprint("migrate: #{int_to_string(mig_count_renames(reps) + flips)} automatic rewrite(s) applied")
+  0
+}
+
+#[doc("""
+Write the source with one mutation site applied to stdout. A mutant
+costs a full rebuild of whatever the oracle compiles, so a mutant that
+does not parse is that cost spent for nothing: the rewritten source is
+reparsed here and the run fails without printing rather than handing
+the caller a guaranteed compile-fail. A parse failure is a defect in
+an operator's span arithmetic, not a property of the corpus.
+""")]
+pub fn run_mutate_apply(path: String, src: String, toks: [Token], decls: [Decl], tab: SymTab, i: Int) : Int / Console = {
+  let sites = mutate_sites(decls, tab)
+  match mut_site_at(sites, i) {
+    None -> {
+      eprint("mutate: no site #{int_to_string(i)} (the file has #{int_to_string(list_length(sites))})")
+      1
+    }
+    Some(site) -> match mut_apply(site, toks, src) {
+      None -> { eprint("mutate: site #{int_to_string(i)} does not resolve to a source span"); 1 }
+      Some(out) -> run_mutate_checked(path, out, i)
+    }
+  }
+}
+
+fn run_mutate_checked(path: String, out: String, i: Int) : Int / Console =
+  match parse_program(path, out, tokenize(out), module_name_of_path(path)).decls {
+    None -> { eprint("mutate: site #{int_to_string(i)} produced source that does not parse"); 1 }
+    Some(_) -> { print(mut_strip_final_newline(out)); 0 }
+  }
+
+# `print` re-adds the newline the source already carries, so the mutant
+# would otherwise gain a blank last line its parent does not have.
+fn mut_strip_final_newline(out: String) : String = {
+  let n = string_length(out)
+  if n > 0 and string_slice(out, n - 1, 1) == "\n" { string_slice(out, 0, n - 1) } else { out }
+}
+
+fn mut_site_at(sites: [MutSite], i: Int) : Option[MutSite] {
+  match sites {
+    [] -> None
+    [s, ...rest] -> if i == 0 { Some(s) } else { mut_site_at(rest, i - 1) }
+  }
+}
+
+# One `<input.kai>\t<output>` entry of a batch list.
+#[doc("One entry of a batch list: an input file and its output.")]
+pub type BatchEntry = BE(String, String)
+
+# Parse the batch list file's contents into entries. Each non-blank
+# line is `<input>\t<output>`; a line missing the tab is reported and
+# dropped. Blank lines (trailing newline) are skipped.
+#[doc("The entries of a batch list, one per non-blank line; a line without a tab is dropped.")]
+pub fn parse_batch_entries(content: String) : [BatchEntry] =
+  parse_batch_entries_loop(string_split(content, "\n"), [])
+
+fn parse_batch_entries_loop(lines: [String], acc: [BatchEntry]) : [BatchEntry] = match lines {
+  [] -> list_reverse(acc)
+  [ln, ...rest] ->
+    if string_length(ln) == 0 { parse_batch_entries_loop(rest, acc) }
+    else { match string_split(ln, "\t") {
+      [inp, outp, ..._] -> parse_batch_entries_loop(rest, [BE(inp, outp), ...acc])
+      _                 -> parse_batch_entries_loop(rest, acc)
+    } }
+}
+
+#[doc("""
+The sources the import closure of the root reads besides the root, one
+per line; with `interfaces`, each followed by its interface digest.
+""")]
+pub fn guard_listing(opts: CliOptions, interfaces: Bool) : Int / Console + File =
+  match opts.path {
+    None -> { usage(); 2 }
+    Some(p) -> match read_file(p) {
+      Ok(src) -> {
+        let memo = if opts.core_cache.proj_dir == "" { "" } else { cat2(opts.core_cache.proj_dir, "/imports") }
+        let _m = if memo == "" { () } else {
+          let _p = match dir_create_dir(opts.core_cache.proj_dir) { _ -> () }
+          match dir_create_dir(memo) { _ -> () }
+        }
+        let srcs = uc_input_files(p, src, opts.test_roots, opts.search_paths, memo)
+        print_lines(if interfaces { map(srcs, (x) => with_interface(memo, x)) } else { srcs })
+        0
+      }
+      Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
+    }
+  }
+
+# A listed source with the digest of its interface after a tab; a missing
+# source, or one that does not parse, as it was listed.
+fn with_interface(memo: String, line: String) : String / Console + File =
+  if string_starts_with_q(line, "-") { line }
+  else { match read_file(line) {
+    Ok(src) -> match gi_interface_memo(memo, line, src) {
+      Some(h) -> concat_all([line, "\t", h])
+      None    -> line
+    }
+    Err(_) -> line
+  } }
+
+#[doc("Run the compiler for the given CliOptions: load cores, dispatch the mode (build/test/check/fmt/library/dump), and return the process exit code. Driver entry point called by fn main().")]
+pub fn print_lines(xs: [String]) : Unit / Console = if xs != [] { print(string_join(xs, "\n")) }

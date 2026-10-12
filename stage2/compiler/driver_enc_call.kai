@@ -1,0 +1,131 @@
+#[doc("""
+The innermost call around a source position, for signature help.
+""")]
+
+import compiler.ast
+
+#[doc("Compare two (line, col) positions: a >= b in document order.")]
+pub fn pos_ge(al: Int, ac: Int, bl: Int, bc: Int) : Bool {
+  if al > bl { true }
+  else if al < bl { false }
+  else { ac >= bc }
+}
+
+#[doc("""
+A call's callee, the declaration whose body holds it, and where the
+call starts; `CallAt` is the same call before its declaration is known.
+""")]
+pub type EncCall = EC(Expr, Decl, Int, Int)
+type CallAt = CA(Expr, Int, Int)
+
+fn enc_call_in(d: Decl, body: Expr, ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] =
+  match find_enc_call_expr(body, ql, qc, None) {
+    None              -> acc
+    Some(CA(f, l, c)) -> if enc_call_starts_after(acc, l, c) { Some(EC(f, d, l, c)) } else { acc }
+  }
+
+#[doc("The innermost call starting at or before the position, across the declarations.")]
+pub fn find_enc_call(ds: [Decl], ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> find_enc_call(rest, ql, qc, find_enc_call_decl(d, ql, qc, acc))
+  }
+}
+
+fn find_enc_call_decl(d: Decl, ql: Int, qc: Int, acc: Option[EncCall]) : Option[EncCall] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _)    -> enc_call_in(d, body, ql, qc, acc)
+    DConst(_, _, _, body, _, _, _)          -> enc_call_in(d, body, ql, qc, acc)
+    DTest(_, body, _, _, _)                 -> enc_call_in(d, body, ql, qc, acc)
+    DBench(_, body, _, _, _)                -> enc_call_in(d, body, ql, qc, acc)
+    DCheck(_, _, body, _, _, _)             -> enc_call_in(d, body, ql, qc, acc)
+    DImpl(_, _, _, inner, _, _, _, _)          -> find_enc_call(inner, ql, qc, acc)
+    DDerive(_, inner, _, _)              -> find_enc_call_decl(inner, ql, qc, acc)
+    DUnstable(inner, _, _)               -> find_enc_call_decl(inner, ql, qc, acc)
+    DProtoLaws(_, inner, _, _, _)           -> find_enc_call_decl(inner, ql, qc, acc)
+    DImplAxiom(_, inner, _, _, _)           -> find_enc_call_decl(inner, ql, qc, acc)
+    DConstructor(inner, _, _)            -> find_enc_call_decl(inner, ql, qc, acc)
+    _                                     -> acc
+  }
+}
+
+fn find_enc_call_expr(e: Expr, ql: Int, qc: Int, acc: Option[CallAt]) : Option[CallAt] {
+  # Start positions decide, not walk order: a desugared pipe's call
+  # precedes its first argument in the walk but follows it in the source.
+  # The callee's type is the signature; the call's own `ty` is its result.
+  let a0 = match e.kind {
+    ECall(callee, _) ->
+      if pos_ge(ql, qc, e.line, e.col) and call_at_starts_after(acc, e.line, e.col) {
+        Some(CA(callee, e.line, e.col))
+      } else { acc }
+    _ -> acc
+  }
+  find_enc_call_expr_kind(e.kind, ql, qc, a0)
+}
+
+fn enc_call_starts_after(acc: Option[EncCall], line: Int, col: Int) : Bool = match acc {
+  None                 -> true
+  Some(EC(_, _, l, c)) -> pos_ge(line, col, l, c)
+}
+
+fn call_at_starts_after(acc: Option[CallAt], line: Int, col: Int) : Bool = match acc {
+  None              -> true
+  Some(CA(_, l, c)) -> pos_ge(line, col, l, c)
+}
+
+fn find_enc_call_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[CallAt]) : Option[CallAt] {
+  match k {
+    ECall(f, call_args) -> {
+      let a1 = find_enc_call_expr(f, ql, qc, acc)
+      find_enc_call_exprs(call_args, ql, qc, a1)
+    }
+    EField(e1, _)   -> find_enc_call_expr(e1, ql, qc, acc)
+    EIndex(e1, e2)  -> find_enc_call_expr(e2, ql, qc, find_enc_call_expr(e1, ql, qc, acc))
+    EBinop(_, l, r) -> find_enc_call_expr(r, ql, qc, find_enc_call_expr(l, ql, qc, acc))
+    EUnop(_, e1)    -> find_enc_call_expr(e1, ql, qc, acc)
+    EIf(c, t, eo)   -> {
+      let a1 = find_enc_call_expr(c, ql, qc, acc)
+      let a2 = find_enc_call_expr(t, ql, qc, a1)
+      match eo { None -> a2  Some(el) -> find_enc_call_expr(el, ql, qc, a2) }
+    }
+    EMatch(s, arms)       -> find_enc_call_arms(arms, ql, qc, find_enc_call_expr(s, ql, qc, acc))
+    ELambda(_, body)      -> find_enc_call_expr(body, ql, qc, acc)
+    EBlock(stmts, last)   -> {
+      let a1 = find_enc_call_stmts(stmts, ql, qc, acc)
+      match last { None -> a1  Some(e1) -> find_enc_call_expr(e1, ql, qc, a1) }
+    }
+    EPipe(l, r)           -> find_enc_call_expr(r, ql, qc, find_enc_call_expr(l, ql, qc, acc))
+    _ -> acc
+  }
+}
+
+fn find_enc_call_exprs(es: [Expr], ql: Int, qc: Int, acc: Option[CallAt]) : Option[CallAt] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> find_enc_call_exprs(rest, ql, qc, find_enc_call_expr(e, ql, qc, acc))
+  }
+}
+
+fn find_enc_call_arms(arms: [Arm], ql: Int, qc: Int, acc: Option[CallAt]) : Option[CallAt] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(_, _, body) -> find_enc_call_arms(rest, ql, qc, find_enc_call_expr(body, ql, qc, acc))
+    }
+  }
+}
+
+fn find_enc_call_stmts(ss: [Stmt], ql: Int, qc: Int, acc: Option[CallAt]) : Option[CallAt] {
+  match ss {
+    []           -> acc
+    [s, ...rest] -> find_enc_call_stmts(rest, ql, qc, find_enc_call_stmt(s, ql, qc, acc))
+  }
+}
+
+fn find_enc_call_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[CallAt]) : Option[CallAt] =
+  match s {
+    SLet(_, _, e)         -> find_enc_call_expr(e, ql, qc, acc)
+    SExprStmt(e)          -> find_enc_call_expr(e, ql, qc, acc)
+    SVar(_, _, e, _, _)   -> find_enc_call_expr(e, ql, qc, acc)
+    _                      -> acc
+  }
