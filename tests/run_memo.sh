@@ -123,6 +123,23 @@ done
 scenario truncated-entries 1 "$solo" -- main.kai
 scenario truncated-replaced 0 "$solo" -- main.kai
 
+# Past the entries the memo keeps, the oldest entry goes and the digests
+# kept beside the entries stay: a warm run still asks the compiler nothing.
+many="$work/many"
+mkdir -p "$many"
+printf 'name = "many"\nentry = "main.kai"\n' > "$many/kai.toml"
+i=0
+while [ "$i" -lt 25 ]; do
+  i=$((i + 1))
+  printf 'fn main() : Unit / Stdout = Stdout.print("v%s")\n' "$i" > "$many/main.kai"
+  run "many-$i" on "$many" -- main.kai
+done
+bins="$(echo "$many"/.kai-cache/*/bins)"
+kept="$(find "$bins" -mindepth 2 -maxdepth 2 -name meta | wc -l | tr -d ' ')"
+[ "$kept" -eq 24 ] || { echo "  FAIL many: $kept entries kept, expected 24"; fail=$((fail + 1)); }
+[ -f "$bins/files" ] && [ -f "$bins/core-sources" ] \
+  || { echo "  FAIL many: the kept digests were evicted with the entries"; fail=$((fail + 1)); }
+
 # The first run in a package builds the package tools it reports on.
 run pkg-warmup 0 "$pkg" -- main.kai
 rm -rf "$pkg/.kai-cache"
