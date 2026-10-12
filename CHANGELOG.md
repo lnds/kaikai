@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.141.0 (2026-10-12)
+
+### BREAKING CHANGE
+
+- a file that reads Decimal or writes a d literal without importing decimal no longer compiles; add import decimal.
+
+### Fixed
+
+- **typer**: Decimal takes an import like BigInt, and a suffix without its import says which one (#2717)
+
+### Changed
+
+- **resolve**: the walkers dispatch to one function per node shape (#2715)
+- **desugar**: the call rules of the cell, nursery and spread walkers are named functions (#2714)
+- **protos**: impl validation and impl lookup read as one step per function (#2713)
+- **monomorph**: the leak walker, type equality and bound check share small helpers (#2711)
+
 ## v0.140.3 (2026-10-11)
 
 ### Fixed
