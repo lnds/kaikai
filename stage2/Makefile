@@ -624,8 +624,8 @@ test-modules: $(TARGET) build
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern const_interp_homonyms const_block_homonyms const_initialiser
-QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign protocol_dispatch_private pub_unit_bare_ambiguous pub_unit_cross_module qualified_record_variant_unknown const_unknown_export
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern const_interp_homonyms const_block_homonyms const_initialiser refine_predicate
+QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign protocol_dispatch_private pub_unit_bare_ambiguous pub_unit_cross_module qualified_record_variant_unknown const_unknown_export refine_predicate_unknown
 
 test-modules-qualified: $(TARGET) build
 	@set -e; \
@@ -664,23 +664,29 @@ test-modules-qualified-neg: $(TARGET) build
 	  echo "modules-qualified-neg OK $$d"; \
 	done
 
-# A const initialiser resolves a qualified name as a function body does,
-# and reports an unknown one, on the native backend too.
+# The qualified names a const initialiser and a refinement predicate
+# resolve, and the unknown ones they report, on the native backend too.
+QUALIFIED_NATIVE_DIRS := const_initialiser refine_predicate
+QUALIFIED_NATIVE_NEG_DIRS := const_unknown_export refine_predicate_unknown
 ifeq ($(KAI_LLVM),1)
 test-modules-qualified-const-native: $(TARGET) bin-kai build
 	@set -e; \
-	d=../examples/modules-qualified/const_initialiser; \
-	KAI_BACKEND=native ../bin/kai build $$d/main.kai -o build/mq-const-n 2> build/mq-const-n.err \
-	  || { echo "modules-qualified-const-native FAIL (build)"; cat build/mq-const-n.err; exit 1; }; \
-	./build/mq-const-n > build/mq-const-n.out || { echo "modules-qualified-const-native FAIL (run)"; exit 1; }; \
-	diff -q $$d/main.out.expected build/mq-const-n.out > /dev/null \
-	  || { echo "modules-qualified-const-native DIFF"; diff $$d/main.out.expected build/mq-const-n.out; exit 1; }; \
-	d=../examples/modules-qualified/const_unknown_export; \
-	if KAI_BACKEND=native ../bin/kai build $$d/main.kai -o build/mq-const-neg-n 2> build/mq-const-neg-n.err; then \
-	  echo "modules-qualified-const-native FAIL (expected error, got success)"; exit 1; \
-	fi; \
-	grep -qF "$$(head -1 $$d/main.err.expected)" build/mq-const-neg-n.err \
-	  || { echo "modules-qualified-const-native FAIL (missing diagnostic)"; cat build/mq-const-neg-n.err; exit 1; }; \
+	for n in $(QUALIFIED_NATIVE_DIRS); do \
+	  d=../examples/modules-qualified/$$n; \
+	  KAI_BACKEND=native ../bin/kai build $$d/main.kai -o build/mq-$$n-n 2> build/mq-$$n-n.err \
+	    || { echo "modules-qualified-const-native FAIL $$n (build)"; cat build/mq-$$n-n.err; exit 1; }; \
+	  ./build/mq-$$n-n > build/mq-$$n-n.out || { echo "modules-qualified-const-native FAIL $$n (run)"; exit 1; }; \
+	  diff -q $$d/main.out.expected build/mq-$$n-n.out > /dev/null \
+	    || { echo "modules-qualified-const-native DIFF $$n"; diff $$d/main.out.expected build/mq-$$n-n.out; exit 1; }; \
+	done; \
+	for n in $(QUALIFIED_NATIVE_NEG_DIRS); do \
+	  d=../examples/modules-qualified/$$n; \
+	  if KAI_BACKEND=native ../bin/kai build $$d/main.kai -o build/mq-$$n-n 2> build/mq-$$n-n.err; then \
+	    echo "modules-qualified-const-native FAIL $$n (expected error, got success)"; exit 1; \
+	  fi; \
+	  grep -qF "$$(head -1 $$d/main.err.expected)" build/mq-$$n-n.err \
+	    || { echo "modules-qualified-const-native FAIL $$n (missing diagnostic)"; cat build/mq-$$n-n.err; exit 1; }; \
+	done; \
 	echo "modules-qualified-const-native OK"
 else
 test-modules-qualified-const-native:
