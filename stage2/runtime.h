@@ -15436,11 +15436,12 @@ static int kai_stack_map_flags(void) {
  * body as clobbering nothing and keep caller-saved values across the call.
  *
  * GCC ignores `naked` on aarch64 and would wrap the body in a frame of its
- * own, so there both functions are assembled at file scope. The labels are
- * local, one copy per translation unit as a static function has, and C
- * reaches them through `extern` declarations: a body the compiler never sees
- * is an opaque call without `noipa`. Every unit needs its copy: GCC at -O0
- * emits a static function nothing calls, and with it the reference. */
+ * own, so there both functions are assembled at file scope and declared to
+ * C: a body the compiler never sees is an opaque call without `noipa`.
+ * Every unit assembles a copy, weak so the copies link as one: GCC at -O0
+ * emits a static function nothing calls, and with it the reference. Hidden,
+ * so position-independent code takes the stub's address pc-relative; through
+ * the GOT, a symbol local to the unit loses its offset in the section. */
 #if defined(__x86_64__) || (defined(__aarch64__) && (defined(__clang__) || defined(__ELF__)))
 #  define KAI_SEG_SWITCH 1
 #  if defined(__clang__)
@@ -15535,17 +15536,21 @@ static void kai_seg_boot(void) {
     __asm__ volatile(KAI_SEG_A64_BOOT);
 }
 #    else
-extern void *kai_seg_switch(void **save, void *to, void *arg);
-extern void kai_seg_boot(void);
+extern void *kai_seg_switch(void **save, void *to, void *arg) __attribute__((visibility("hidden")));
+extern void kai_seg_boot(void) __attribute__((visibility("hidden")));
 __asm__(
     ".pushsection .text\n\t"
     ".p2align 2\n\t"
+    ".weak kai_seg_switch\n\t"
+    ".hidden kai_seg_switch\n\t"
     ".type kai_seg_switch, %function\n"
     "kai_seg_switch:\n\t"
     ".cfi_startproc\n\t"
     KAI_SEG_A64_SWITCH
     ".cfi_endproc\n\t"
     ".size kai_seg_switch, .-kai_seg_switch\n\t"
+    ".weak kai_seg_boot\n\t"
+    ".hidden kai_seg_boot\n\t"
     ".type kai_seg_boot, %function\n"
     "kai_seg_boot:\n\t"
     ".cfi_startproc\n\t"
