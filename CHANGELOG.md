@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.151.0 (2026-10-13)
+
+### BREAKING CHANGE
+
+- `add(x, zero())` and `let z = zero()` used only as such
+an argument no longer compile: the right operand of `Add[a]` is the
+protocol's own parameter and fixes no type for it. They panicked at run
+time before. Annotate the value: `let z : T = zero()`.
+
+### Fixed
+
+- **perceus**: the jump releases a boxed scalar parked in a tail-argument slot (#2802)
+- **resolve**: a refinement predicate resolves module-qualified names (#2800)
+- **emit**: a raw binder takes its scalar whatever the form of its initialiser (#2799)
+- **monomorph**: a const initialiser's calls reach their specialisations (#2797)
+- **typer**: a nullary protocol operation whose type nothing fixes is a compile error (#2798)
+
 ## v0.150.0 (2026-10-13)
 
 ### BREAKING CHANGE
