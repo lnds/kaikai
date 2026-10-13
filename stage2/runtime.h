@@ -9033,6 +9033,21 @@ static inline KaiValue *kai_seq_take(KaiValue *s) {
     return step;
 }
 
+KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk);
+
+/* Apply a cell's thunk. A stage reads the one before it from inside its own
+ * thunk, so a chain of stages nests one activation each: past the middle of
+ * this stack the thunk runs on a fresh segment. The half kept free is what
+ * a trap raised inside the chain unwinds on. Depth is counted from the entry
+ * frame of the running stack; the main fiber records none and never takes
+ * that path. */
+static inline KaiValue *kai_seq_apply(KaiFiber *f, KaiValue *thunk) {
+    uintptr_t entry = f->unwind_frame;
+    size_t used = (size_t) (entry - (uintptr_t) __builtin_frame_address(0));
+    if (entry != 0 && used > f->stack_size / 2) return kai_seq_apply_far(thunk);
+    return kai_apply_borrow(thunk, 0, NULL);
+}
+
 /* Run the thunk of `s`. An unshared cell has no other reader, so it is
  * freed before the thunk runs and the step is never written. A shared one
  * is marked while it runs and then holds the step in place of the thunk;
@@ -9050,14 +9065,14 @@ static KaiValue *kai_seq_run(KaiValue *s) {
         kai_decref(s);
         KaiValue *held[1] = { thunk };
         KaiFiber *uf = kai_unw_push(held, 1);
-        KaiValue *step = kai_apply_borrow(thunk, 0, NULL);
+        KaiValue *step = kai_seq_apply(uf, thunk);
         kai_unw_pop(uf);
         kai_decref(thunk);
         return step;
     }
     s->variant_tag = KAI_SEQ_RUNNING;
     KaiFiber *uf = kai_unw_push((KaiValue **) s, KAI_UNW_SEQ);
-    KaiValue *step = kai_apply_borrow(thunk, 0, NULL);
+    KaiValue *step = kai_seq_apply(uf, thunk);
     kai_unw_pop(uf);
     s->as.seq.slot = step;
     s->variant_tag = KAI_SEQ_DONE;
@@ -20051,6 +20066,18 @@ KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
     return kai_seg_run(f, seg, seg, k);
 }
 
+/* Apply the thunk of a lazy cell on a fresh segment; `thunk` is borrowed.
+ * A thunk performs nothing, so its segment never suspends. */
+KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk) {
+    KaiValue *k = NULL;
+    KaiValue *step = kai_seg_start(kai_incref(thunk), &k);
+    if (k != NULL) {
+        fputs("kai: internal error: a lazy cell's thunk suspended\n", stderr);
+        kai_exit(1);
+    }
+    return step;
+}
+
 /* From inside a segment: hand `v` to the resumer and wait to be resumed.
  * Returns the value of the resume. */
 KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) {
@@ -20112,6 +20139,7 @@ __attribute__((noreturn)) static void kai_seg_unsupported(void) {
     __builtin_unreachable();
 }
 KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) { (void) body; (void) k; kai_seg_unsupported(); }
+KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk) { return kai_apply_borrow(thunk, 0, NULL); }
 KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) { (void) v; kai_seg_unsupported(); }
 KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
     (void) k; (void) v; (void) k_out; kai_seg_unsupported();

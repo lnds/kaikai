@@ -214,10 +214,11 @@ Seq[t]         pure; shared; evaluated at most once      (import seq)
 - Holding the first cell keeps every cell computed after it. Walk a
   long sequence through a name that is not used afterwards, and the
   cells behind the walk are freed as it goes.
-- Reading through stacked stages uses stack in proportion to their
-  number: the sieve's thousandth prime sits behind a thousand filters.
-  The main fiber's stack holds that; a spawned fiber's is small and
-  holds a few hundred.
+- Reading through stacked stages nests one activation per stage: an
+  element behind a thousand `map`s is a thousand calls deep. A spawned
+  fiber's stack is small, so the read carries on over further stack
+  segments as it deepens, and the depth a fiber reaches is bounded by
+  memory, not by its stack.
 - A `Seq` stays on the fiber that made it. Send `to_list` of the part
   another fiber needs.
 - `import seq` opens `map`, `filter`, `take`, `drop`, `each`, `foldl`

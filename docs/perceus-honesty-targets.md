@@ -228,6 +228,13 @@ the state in the header. `force` reads it:
   `resume`) gives the cell its thunk back through the fiber's unwind
   stack, so a later read evaluates it again.
 
+A stage reads the stage before it from inside its own thunk, so a chain
+of stages nests one activation each. Past the middle of the running
+stack, `force` applies the thunk on a fresh stack segment, the ones a
+handler's body runs on; a trap or a cancellation inside it unwinds that
+segment and continues in the frame that read the cell. The half kept
+free is the room that unwinding needs.
+
 The rc and the write are plain, not atomic: a cell never leaves the
 fiber that made it. The typer rejects a `Seq` in a fiber's result, in
 an actor message and in a thunk run on another fiber, as it does a
