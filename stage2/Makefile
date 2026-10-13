@@ -5941,6 +5941,10 @@ bench-effects: build
 	@./build/bench_perform_resume
 
 # The compiler's own sources compile without a single warning.
+# SELFHOST_ONCE=1 compiles the second generation as a hop is compiled: it
+# runs once. The default keeps it at the flags kaic2 ships with, which
+# also puts the C compiler's optimiser under the check.
+SELFHOST_CFLAGS := $(if $(SELFHOST_ONCE),$(CFLAGS_HOP),$(CFLAGS))
 selfhost: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(SRC) > build/kaic2b.c 2> build/kaic2b.err || { cat build/kaic2b.err >&2; exit 1; }; \
@@ -5948,7 +5952,7 @@ selfhost: $(TARGET) build
 	if grep -q '^warning:' build/kaic2b.err; then \
 	  echo "selfhost warnings: the compiler's own sources must compile without a warning"; exit 1; \
 	fi; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
+	$(CC) $(SELFHOST_CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
 	./build/kaic2b $(EDITION_FLAG) $(SRC) > build/kaic2c.c; \
 	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
 	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
