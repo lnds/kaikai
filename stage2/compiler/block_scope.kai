@@ -1,0 +1,76 @@
+#[doc("""
+Which test, bench and check blocks a build that runs blocks keeps.
+
+It keeps the blocks of the modules under test: its root modules, and
+the modules its driver names as its own, the rest of the package the
+root belongs to. Any other module it loads, a stdlib module or a
+dependency, came in to be called: its blocks belong to that module's
+own build, and leave the decl stream before any pass sees them.
+
+A module is found in the module table by the file it was loaded from
+and held by its id, so a file reached under two spellings is one module
+here as everywhere else.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.module_table
+import compiler.modules_segments
+import compiler.symtab_build
+
+#[doc("What a build does with the blocks of the modules it imports: `BlocksAll` leaves them in the stream, `BlocksOwn` keeps those of its test roots and of the modules loaded from the given files, spelled as the resolver canonicalises a path.")]
+pub type BlockPolicy = BlocksAll | BlocksOwn([String])
+
+#[doc("The import stream and its segments once the blocks a build does not run have left it.")]
+pub type BlockCut = { segs: [ImportSeg], decls: [Decl] }
+
+# The files the root file binds under one of `names`.
+fn bscope_bound(scopes: [ModScope], names: [String]) : [String] = match scopes {
+  [] -> []
+  [MScope(m, entries, _), ...rest] ->
+    if m == "" { map(filter(entries, (e) => list_has(names, bscope_name(e))), bscope_origin) }
+    else { bscope_bound(rest, names) }
+}
+
+fn bscope_name(e: ModuleEntry) : String = match e { ME(name, _, _, _) -> name }
+
+fn bscope_origin(e: ModuleEntry) : String = match e { ME(_, _, origin, _) -> origin }
+
+fn bscope_file_ids(mods: [ModuleEntry], files: [String]) : [SymId] = match files {
+  [] -> []
+  [f, ...rest] -> match mt_lookup_origin(mods, f) {
+    Some(ME(home, _, _, _)) -> [st_module_id(home), ...bscope_file_ids(mods, rest)]
+    None                    -> bscope_file_ids(mods, rest)
+  }
+}
+
+fn bscope_holds(ids: [SymId], m: SymId) : Bool = match ids {
+  []           -> false
+  [x, ...rest] -> if sym_same(x, m) { true } else { bscope_holds(rest, m) }
+}
+
+fn bscope_is_block(d: Decl) : Bool = match d {
+  DTest(_, _, _, _, _)     -> true
+  DBench(_, _, _, _, _)    -> true
+  DCheck(_, _, _, _, _, _) -> true
+  _                        -> false
+}
+
+fn bscope_without_blocks(ds: [Decl]) : [Decl] = filter(ds, (d) => not bscope_is_block(d))
+
+fn bscope_cut(segs: [ImportSeg], decls: [Decl], keep: [SymId]) : BlockCut = match segs {
+  [] -> BlockCut { segs: [], decls: decls }
+  [ISeg(home, n), ...rest] -> {
+    let own = seg_take(decls, n)
+    let here = if bscope_holds(keep, st_module_id(home)) { own } else { bscope_without_blocks(own) }
+    let more = bscope_cut(rest, seg_drop(decls, n), keep)
+    BlockCut { segs: [ISeg(home, list_length(here)), ...more.segs], decls: list_append(here, more.decls) }
+  }
+}
+
+#[doc("The import stream `decls`, partitioned by `segs`, as `policy` leaves it: under `BlocksOwn`, without the blocks of every module that is neither bound by the root file under one of `roots` nor loaded from one of the policy's files, each segment shrunk to what it still holds.")]
+pub fn bscope_apply(policy: BlockPolicy, segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+                    mods: [ModuleEntry], roots: [String]) : BlockCut = match policy {
+  BlocksAll        -> BlockCut { segs: segs, decls: decls }
+  BlocksOwn(files) -> bscope_cut(segs, decls, bscope_file_ids(mods, list_append(bscope_bound(scopes, roots), files)))
+}

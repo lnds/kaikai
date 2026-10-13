@@ -4,6 +4,10 @@ Package-wide block discovery for `kai test`, `kai check` and `kai bench`.
 The entry build reaches only its import graph, and files holding blocks
 are leaves nothing imports, so every unreachable `*_test.kai` a package
 owns compiles and runs as its own runner binary.
+
+A build runs the blocks of its root and of the files named as its own:
+the rest of the package the root belongs to. A module imported from the
+stdlib or from a dependency never adds its blocks to a run.
 """)]
 
 import os.env
@@ -11,6 +15,7 @@ import cli_caches
 import cli_compile
 import cli_err
 import cli_fs
+import cli_manifest
 import cli_plan
 import cli_proc
 import cli_spec
@@ -20,23 +25,26 @@ import cli_toolchain
 fn is_hidden(rel: String) : Bool =
   string.starts_with(rel, ".") and string_contains(rel, "/") or string_contains(rel, "/.")
 
-# A nested package (its own kai.toml) or a `tests/` dir owns what sits below it.
-fn owned(root: String, d: String) : Bool / Ffi =
+# A nested package (its own kai.toml) owns what sits below it; so does a `tests/` dir, unless `tests` counts them in.
+fn owned(root: String, d: String, tests: Bool) : Bool / Ffi =
   if d == "." {
     true
-  } else if cli_sys.is_file("#{root}/#{d}/kai.toml") or cli_fs.basename(d) == "tests" {
+  } else if cli_sys.is_file("#{root}/#{d}/kai.toml") or (not tests) and cli_fs.basename(d) == "tests" {
     false
   } else {
-    owned(root, cli_fs.dirname(d))
+    owned(root, cli_fs.dirname(d), tests)
   }
 
-#[doc("Every `.kai` file package `root` owns, root-relative and sorted; nested packages, `tests/` and hidden dirs excluded.")]
-pub fn source_files(root: String) : [String] / File + Ffi =
+# Every `.kai` file under `root` outside nested packages and hidden dirs, root-relative and sorted.
+fn kai_files(root: String, tests: Bool) : [String] / File + Ffi =
   dir_walk(root)
     |? (p => string.ends_with(p, ".kai"))
     | (p => string.drop_prefix(p, "#{root}/").unwrap_or(p))
     |> list.sort
-    |? (rel => (not is_hidden(rel)) and owned(root, cli_fs.dirname(rel)))
+    |? (rel => (not is_hidden(rel)) and owned(root, cli_fs.dirname(rel), tests))
+
+#[doc("Every `.kai` file package `root` owns, root-relative and sorted; nested packages, `tests/` and hidden dirs excluded.")]
+pub fn source_files(root: String) : [String] / File + Ffi = kai_files(root, false)
 
 fn tests_dir_files(dir: String) : [String] / File + Ffi =
   if cli_sys.is_dir(dir) {
@@ -180,9 +188,32 @@ pub type Runner = { src: String, out: String, header: String }
 #[doc("One step of a pass, in run order: build and run a runner, or print a warning.")]
 pub type Step = Build(Runner) | Warn(String)
 
+# The files under test with `src`: every file of the package that governs it, its
+# `tests/` too; with no package, the modules it imports from its own directory.
+fn own_files(src: String) : [String] / File + Ffi {
+  let dir = cli_fs.absolute(cli_fs.dirname(src))
+  match cli_manifest.find_dir(dir) {
+    Some(pkg) -> kai_files(pkg, true) | (rel => "#{pkg}/#{rel}")
+    None -> {
+      let entry = cli_fs.basename(src)
+      closure(dir, [entry], [entry]) | (rel => "#{dir}/#{rel}")
+    }
+  }
+}
+
+#[doc("The kaic2 flags naming the files under test with `src` that declare `kind` blocks: a build runs their blocks and its root's, never those of another module it imports.")]
+pub fn own_flags(src: String, kind: String) : [String] / File + Ffi =
+  own_files(src) |? (f => declares(f, kind)) || (f => ["--test-own", f])
+
 #[doc("The kaic2 job that builds runner `r` for `pass`, with `tmp` as its scratch dir.")]
-pub fn runner_job(pass: Pass, r: Runner, tmp: String) : Job =
-  cli_plan.Job { src: r.src, tmp, out: r.out, verb: pass.kind, extra: [pass.flag, ...pass.extra] }
+pub fn runner_job(pass: Pass, r: Runner, tmp: String) : Job / File + Ffi =
+  cli_plan.Job {
+    src: r.src,
+    tmp,
+    out: r.out,
+    verb: pass.kind,
+    extra: [pass.flag, ...pass.extra, ...own_flags(r.src, pass.kind)]
+  }
 
 #[doc("Fold `step` over `items` from `status`, stopping early once an interrupt is pending.")]
 pub fn fold_files[a, e](
@@ -349,13 +380,7 @@ pub fn run_entry(
     (0, false)
   } else {
     let bin = "#{tmp}/#{cli_fs.stem(src)}-#{tag}"
-    cli_compile.compile(t, b, cli_plan.Job {
-      src,
-      tmp,
-      out: bin,
-      verb: pass.kind,
-      extra: [pass.flag, ...pass.extra]
-    })!
+    cli_compile.compile(t, b, runner_job(pass, Runner { src, out: bin, header: "" }, tmp))!
     (cli_proc.run([bin], cli_proc.inherit()), declares(src, pass.kind))
   }
   if target.snd == "" {
