@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.146.2 (2026-10-12)
+
+### Fixed
+
+- **typer**: a mixed-operand operator is typed as what its impl returns (#2767)
+- **runtime**: a chain of shared filter stages deeper than a fiber's stack is read over further stack segments (#2764)
+- **typer**: a field access on a sum type is a type error (#2762)
+- **runtime**: a chain of lazy stages deeper than a fiber's stack is read over further stack segments (#2758)
+
+### Changed
+
+- **runtime**: a closure's captures do not reach libc (#2761)
+- **build**: the bootstrap's one-use binaries are compiled without optimisation (#2765)
+
 ## v0.146.1 (2026-10-12)
 
 ### Fixed
