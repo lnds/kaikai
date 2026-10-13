@@ -84,6 +84,32 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.147.0 (2026-10-13)
+
+### BREAKING CHANGE
+
+- on the C backend a Real literal with more than six
+significant digits is now the number the source wrote. A program built with
+`KAI_BACKEND=c` that printed or compared the rounded value changes its
+output; the native backend's first build of a program is unchanged.
+- a field read on a record under a unit or a refinement,
+or on an `extern "C"` struct, has the field's declared type. A program
+that used such a value at another type no longer typechecks; for
+example `int_to_string(d.raw)` with `d : Decimal<USD>`, whose `raw` is
+an `Int128`.
+
+### Added
+
+- **install**: a release that does not start on the system is refused (#2778)
+- **release**: publish a linux-aarch64 tarball (#2776)
+
+### Fixed
+
+- **runtime**: the stack-segment switch is compiled by GCC on aarch64 (#2774)
+- **emit**: a Real literal keeps every digit on the C backend and across a cached build (#2777)
+- **typer**: a field read on a type with no fields is a type error (#2773)
+- **typer**: a field read on a record under a unit, a refinement or an extern struct is typed (#2768)
+
 ## v0.146.2 (2026-10-12)
 
 ### Fixed
