@@ -1047,6 +1047,9 @@ table (carried in `InferState.proto_impls`) and routes to
 impl exists the binop falls through to the standard mismatch
 diagnostic.
 
+The expression has the type the selected impl returns, in either
+operand order: `2.0 + z` is a `Complex`, like `z + 2.0`.
+
 ### Out of scope (v1)
 
 - Polymorphic impl in `a` (`impl[T] From[T] for X`) — issue #174.
