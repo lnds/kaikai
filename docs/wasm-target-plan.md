@@ -356,9 +356,19 @@ numbers are left out on purpose; the function names are stable.
 
 ## 3. Decisions that are the owner's
 
-### 3.0 Decided: the order of targets
+### 3.0 Decided
 
-Browser first, `wasm32-wasi` later. Section 5 says what the two share.
+- **The order of targets.** Browser first, `wasm32-wasi` later. Section 5
+  says what the two share.
+- **The route.** The C backend, compiled by a C compiler that targets
+  WebAssembly. The native backend emitting WebAssembly directly (phase 4) is
+  the destination, because it leaves nothing outside `kai`; it does not gate
+  the first page. Everything in phases 1 and 2 except the choice of C
+  compiler is used unchanged by phase 4.
+- **How a user gets the toolchain.** `kai` fetches it: the first build for a
+  WebAssembly target downloads a pinned toolchain, verifies its checksum and
+  keeps it in the user cache. A user installs nothing by hand, as on the host
+  targets. A toolchain named by an environment variable is used in its place.
 
 ### 3.1 Toolchain and libc
 
@@ -390,11 +400,11 @@ the same ones a browser needs in any case (a socket has nothing behind it
 under any libc), and it is the only option whose work the WASI phase reuses.
 Emscripten's advantage is a one-time saving in guards.
 
-Attached to this decision: how a user gets the toolchain (found on `PATH` or
-through an environment variable, or fetched once and verified by checksum the
-way `KAIC_BOOT=release` fetches a compiler). Recommendation: found, with a
-diagnostic that names what is missing; fetching is a separate decision once
-the target exists.
+How a user gets the toolchain is decided in 3.0: `kai` fetches it once and
+verifies it by checksum, the way `KAIC_BOOT=release` fetches a compiler. That
+fixes which toolchain is fetched to the outcome of this decision, and makes
+its download size (180 MB for wasi-sdk on an arm64 Mac, 1.8 GB for
+Emscripten) a cost every user of the target pays once.
 
 ### 3.2 Non-resuming handlers
 
@@ -785,8 +795,10 @@ What each kind of runner is honest for:
   `app.wasm`, `app.mjs` (the host, with the module's name in it) and
   `app.html` (a `<pre id="kai-stdout">` and one module script). The host
   line-buffers fd 1 and 2 to `console.log` and `console.error` and appends
-  the same text to the element when it exists. A missing toolchain is a
-  diagnostic that names what to install.
+  the same text to the element when it exists. The first build for the
+  target fetches the pinned toolchain into the user cache and verifies its
+  checksum; a failed download or a checksum that does not match is a
+  diagnostic, never a fallback to whatever compiler is on `PATH`.
 - *A user can run*: **the first page.** Build, serve the directory, open it:
   the program's output is on the page and in the console. This is the smallest
   thing that is a kaikai program in a browser: one module, one host file of
@@ -795,7 +807,9 @@ What each kind of runner is honest for:
   it locally, drives headless Chrome and Firefox through their drivers, and
   compares the element's text with `.out.expected`. The same modules also run
   under node as the fast leg. An installed-layout leg proves the tarball
-  ships the host.
+  ships the host. The fetch is proved from an empty cache: the job starts
+  with no toolchain, and a second fixture with a wrong checksum pinned must
+  stop with the diagnostic. CI and users take the toolchain by the same path.
 - *Depends on*: PR 2; decision 3.8. The spelling of the target is the
   owner's.
 - *Risk*: the wrapper is on every build. Covered by `make test-kai-cli` and
