@@ -378,8 +378,8 @@ enum { KAI_SEQ_THUNK = 0, KAI_SEQ_RUNNING = 1, KAI_SEQ_DONE = 2,
 #define KAI_HEAD_PROCESS_EXIT 19
 #define KAI_USER_HEAD_TAG_BASE 20
 
-/* Protocol IDs — first 12 reserved for stdlib protocols in
- * stdlib/protocols.kai declaration order. User protocols start at 12.
+/* Protocol IDs — the stdlib protocols; user protocols start at
+ * KAI_USER_PROTO_ID_BASE.
  * See docs/variant-tags.md "Protocol IDs". */
 #define KAI_PROTO_SHOW          0
 #define KAI_PROTO_EQ            1
@@ -396,7 +396,8 @@ enum { KAI_SEQ_THUNK = 0, KAI_SEQ_RUNNING = 1, KAI_SEQ_DONE = 2,
 #define KAI_PROTO_NUMERIC      12
 #define KAI_PROTO_LAYOUT       13
 #define KAI_PROTO_JSON         14
-#define KAI_USER_PROTO_ID_BASE 15
+#define KAI_PROTO_NEG          15
+#define KAI_USER_PROTO_ID_BASE 16
 
 /* Operation index within a protocol (declaration order in
  * stdlib/protocols.kai). The impl table keys on (proto_id, op_id, head_tag):

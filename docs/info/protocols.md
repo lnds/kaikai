@@ -17,7 +17,11 @@ receiver. Op declarations inside `protocol { ... }` omit `fn`;
 ## Stdlib protocols
 
 Show, Eq, Ord, Hash, Serialize, BinSerialize, Default, and the
-arithmetic family Add[a] / Sub[a] / Mul[a] / Div[a] / Rem[a].
+arithmetic family Add[a] / Sub[a] / Mul[a] / Div[a] / Rem[a] / Neg.
+
+An operator on a non-primitive type calls the matching impl: `a + b` is
+`Add.add`, and unary `-x` is `Neg.neg`. A type with no impl is a compile
+error at the operator.
 
 Most user code never declares a new protocol. Implementing the
 stdlib ones for your types is the common case.

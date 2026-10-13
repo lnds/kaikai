@@ -1071,6 +1071,7 @@ following the same recipe as `Add` / `Sub` / `Mul` / `Div` (#246):
 | `*`  | `Mul` | `mul` | issue #246 / #180 |
 | `/`  | `Div` | `div` | issue #246 / #180 |
 | `%`  | `Rem` | `rem` | Wave Op-1 — `Int` and `Real` impls (issue #364 wired the libm `fmod` binding) |
+| unary `-` | `Neg` | `neg` | `neg(self: Self) : Self`; no protocol argument |
 
 Primitive `Int <op> Int` and `Real <op> Real` arithmetic for `+`,
 `-`, `*`, `/` stays on the unify-and-emit fast path — the typer
@@ -1080,6 +1081,14 @@ routing matches a registered impl). `//` (integer division)
 intentionally does **not** overload — modulo is the protocol case
 for user types (rationals, modular integers, residue rings); `//`
 keeps its Int-only contract.
+
+Unary `-` follows the same split: `Int`, `Real`, the fixed-width
+integers and a dimensioned primitive (`Real<m>`) negate on the fast
+path, and any other operand type calls `Neg.neg`. A type with no `impl
+Neg` is rejected at the operator (`no impl of `Neg` for type `T``).
+Inside a generic body the operand is still a type variable, so the
+negation resolves once monomorphisation makes it concrete; `[T: Neg]`
+is the bound that checks it at the call.
 
 `%` is the exception: `Real % Real` always routes through `Rem.rem`
 because stage0's primitive `%` is Int-only. The `Real` impl
