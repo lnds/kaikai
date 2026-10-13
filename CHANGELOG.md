@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.146.1 (2026-10-12)
+
+### Fixed
+
+- **typer**: a call settles its earlier arguments before a later lambda argument is walked (#2757)
+- **resolve**: a handler-state alias yields only to a binding the clause reaches (#2763)
+- **runtime**: a NaN `Real` compares unordered under every operator (#2760)
+- **typer**: a lambda's parameters take the expected domains before its body is walked (#2753)
+- **desugar**: a multi-column match lowers each arm once (#2759)
+- **native**: a build whose cache cannot be written emits its core object beside the program (#2754)
+- **lint**: redundant_match_catchall judges only a match the source spells (#2752)
+- **kai**: mutate names a module as it is imported when the entry sits in a subdirectory (#2751)
+
+### Changed
+
+- **stdlib**: a filter stage of a lazy sequence is read in a loop, and stacked stages merge into one (#2756)
+
 ## v0.146.0 (2026-10-12)
 
 ### Added
