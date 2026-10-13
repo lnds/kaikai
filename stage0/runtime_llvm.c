@@ -2126,6 +2126,9 @@ KaiValue *kaix_default_process_kill(void *self, KaiValue *child, KaiValue *sig, 
     kai_decref(sig);
     return _op_r;
 }
+KaiValue *kaix_default_process_uid(void *self, KaiCont *k) {
+    return kai_default_process_uid(self, k);
+}
 KaiValue *kaix_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
     KaiValue *_op_r = kai_default_process_exit(self, code, k);
     kai_decref(code);
