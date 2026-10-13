@@ -4,9 +4,10 @@ Install and self-update the kaikai compiler.
 
 ## Description
 
-Two ways to get a prebuilt `kai` on macOS arm64 (Apple Silicon). The
-binary is self-contained — no system LLVM needed. The two methods
-coexist; pick whichever fits your setup.
+Two ways to get a prebuilt `kai`: the installer, on macOS arm64 and on
+Linux x86_64 and aarch64, and Homebrew, on macOS. The binary is
+self-contained — no system LLVM needed. The two methods coexist; pick
+whichever fits your setup.
 
 ## curl | sh
 
@@ -108,11 +109,17 @@ kai build --debug   app.kai    # -O0, full DWARF line tables, source debug
 
 ## Platforms
 
-Released tarballs cover `darwin-arm64` and `linux-x86_64`. The
-platform token comes from `uname`, and names the release asset
-`kaikai-v<version>-<platform>.tar.gz`.
+Released tarballs cover `darwin-arm64`, `linux-x86_64` and
+`linux-aarch64`. The platform token comes from `uname`, and names the
+release asset `kaikai-v<version>-<platform>.tar.gz`.
 
-On a platform with no published tarball — macOS Intel, Linux arm64 —
-the installer and `kai upgrade` exit with a clear message instead of
+On a platform with no published tarball — macOS Intel, for one — the
+installer and `kai upgrade` exit with a clear message instead of
 downloading a URL that does not exist; build from source (see the
 README) meanwhile. The Homebrew formula is macOS-only.
+
+A Linux tarball needs the glibc and libstdc++ of the distribution it was
+built on, or newer: glibc 2.38 and a libstdc++ providing
+`GLIBCXX_3.4.30`. It records them in `share/kaikai/REQUIRES`. On an
+older system the installer and `kai upgrade` stop before replacing
+anything and name what the release needs and what the system has.

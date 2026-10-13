@@ -176,4 +176,57 @@ grep -q 'tag="$(latest_tag "$tmp/tags.hdr" "$tmp/tags.err")" || true' "$ROOT/ins
   || fail "install.sh must split the tag assignment from its failure test (#1569)"
 echo "test-upgrade-resolver: ok — install.sh survives a failing resolve"
 
+# ---- a release linked against newer system libraries is refused --------
+# Both installers run the unpacked binaries before replacing anything; a
+# tarball that does not start names what it needs and what the system has.
+awk '/^check_requires\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$ROOT/install.sh" > "$work/req-install.sh"
+awk '/^upgrade_check_requires\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$work/req-upgrade.sh"
+
+# fake_top <dir> <exit status of its binaries> [<REQUIRES body>]
+fake_top() {
+  mkdir -p "$1/bin" "$1/libexec/kaikai" "$1/share/kaikai"
+  for b in bin/kai libexec/kaikai/kaic2; do
+    printf '#!/bin/sh\nexit %s\n' "$2" > "$1/$b"
+    chmod +x "$1/$b"
+  done
+  [ -z "${3:-}" ] || printf '%s\n' "$3" > "$1/share/kaikai/REQUIRES"
+}
+printf 'GLIBCXX_3.4.9\000GLIBCXX_3.4.30\000GLIBCXX_3.4\000' > "$work/libstdc++.so.6"
+
+# requires_case <script> <function> <top>: the function's stderr and status,
+# on a system reporting glibc 2.36 and the fake libstdc++ above.
+requires_case() {
+  FAKE_LIB="$work/libstdc++.so.6" sh -eu -c '
+    err() { printf "%s\n" "$*" >&2; exit 1; }
+    die() { printf "%s\n" "$*" >&2; exit 1; }
+    getconf() { echo "glibc 2.36"; }
+    ldconfig() { printf "\tlibstdc++.so.6 (libc6,AArch64) => %s\n" "$FAKE_LIB"; }
+    . "$1"
+    "$2" "$3"
+  ' _ "$1" "$2" "$3" 2>&1
+}
+
+fake_top "$work/top-new" 127 "glibc 2.39
+glibcxx 3.4.33"
+fake_top "$work/top-ok" 0 "glibc 2.39
+glibcxx 3.4.33"
+fake_top "$work/top-unlisted" 127
+for pair in "req-install.sh check_requires" "req-upgrade.sh upgrade_check_requires"; do
+  script="$work/${pair% *}"; fn="${pair#* }"
+  grep -q "$fn" "$script" || fail "could not extract $fn"
+  if out="$(requires_case "$script" "$fn" "$work/top-new")"; then
+    fail "$fn accepted a release whose binaries do not start"
+  fi
+  printf '%s\n' "$out" | grep -q 'needs: glibc 2.39 and libstdc++ GLIBCXX_3.4.33' \
+    || fail "$fn does not name what the release needs: $out"
+  printf '%s\n' "$out" | grep -q 'found: glibc 2.36 and libstdc++ GLIBCXX_3.4.30' \
+    || fail "$fn does not name what the system has: $out"
+  requires_case "$script" "$fn" "$work/top-ok" >/dev/null \
+    || fail "$fn refused a release whose binaries start"
+  requires_case "$script" "$fn" "$work/top-unlisted" >/dev/null \
+    || fail "$fn checked a release that lists no requirement"
+  echo "test-upgrade-resolver: ok — $fn refuses a release that does not start, naming both sides"
+done
+
 echo "test-upgrade-resolver: all cases passed"

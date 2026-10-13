@@ -79,6 +79,28 @@ auto-detected from `llvm-config`: present → native-capable, absent →
 a cc-only `kaic2` whose implicit default degrades to the C backend.
 Force it on with `make -C stage2 KAI_LLVM=1`.
 
+## Released platforms
+
+A release publishes one tarball per platform: `darwin-arm64`,
+`linux-x86_64` and `linux-aarch64`. `install.sh` and `kai upgrade` pick
+the one `uname` names and refuse any other platform with a message.
+
+The Linux tarballs are built on a current distribution, and their
+binaries bind that distribution's system libraries. The release build
+reads the newest glibc and libstdc++ symbol versions they bind and ships
+them in the tarball as `share/kaikai/REQUIRES`:
+
+| Platform | glibc | libstdc++ |
+|---|---|---|
+| `linux-x86_64` | 2.38 | `GLIBCXX_3.4.30` |
+| `linux-aarch64` | 2.38 | `GLIBCXX_3.4.30` |
+
+On a system older than that the binaries do not start. `install.sh` and
+`kai upgrade` run them from the unpacked tarball before replacing
+anything; when they do not start, both stop, print what the release
+needs and what the system has, and leave any existing install as it was.
+Build from source there (`make kaic2 KAIC_BOOT=seed` needs only `cc`).
+
 ### Windows
 
 Out of scope for the MVP. WSL with the Linux instructions above is the

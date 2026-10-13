@@ -118,6 +118,33 @@ latest_tag() {
   printf '%s\n' "$tag"
 }
 
+# ---- system libraries ------------------------------------------------------
+# A Linux tarball lists the glibc and libstdc++ its binaries were linked
+# against in share/kaikai/REQUIRES. On an older system they do not start, so
+# stop before anything is replaced and name both sides.
+check_requires() {
+  req="$1/share/kaikai/REQUIRES"
+  [ -f "$req" ] || return 0
+  if "$1/libexec/kaikai/kaic2" --version >/dev/null 2>&1 \
+     && "$1/bin/kai" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  need_glibc="$(sed -n 's/^glibc //p' "$req")"
+  need_cxx="$(sed -n 's/^glibcxx //p' "$req")"
+  have_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc //p')"
+  cxx_lib="$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p 2>/dev/null \
+    | sed -n 's/.*libstdc++\.so\.6 .*=> //p' | head -n1)"
+  have_cxx=""
+  if [ -n "$cxx_lib" ]; then
+    have_cxx="$(grep -ao 'GLIBCXX_[0-9][0-9.]*' "$cxx_lib" 2>/dev/null \
+      | sort -u -t. -k2,2n -k3,3n -k4,4n | tail -n1)"
+  fi
+  err "this kaikai release does not start on this system.
+  needs: glibc $need_glibc and libstdc++ GLIBCXX_$need_cxx
+  found: glibc ${have_glibc:-none} and libstdc++ ${have_cxx:-none}
+Nothing was installed. Upgrade the system, or build kaikai from source."
+}
+
 # ---- checksum verification -------------------------------------------------
 # The .sha256 file is GNU-style "<hash>  <filename>"; we compare only
 # the hash so a renamed download still verifies.
@@ -196,6 +223,7 @@ The download is corrupt or tampered — aborting."
   [ -d "$top" ] || top="$(find "$tmp/unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)"
   [ -d "$top" ] || err "unexpected tarball layout: no top-level directory"
   [ -x "$top/bin/kai" ] || err "tarball missing bin/kai"
+  check_requires "$top"
 
   rm -rf "$PREFIX"
   mkdir -p "$PREFIX"
