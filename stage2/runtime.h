@@ -8003,6 +8003,52 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
 
 static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b);
 
+/* True when a finite `x` is the Real nearest to a decimal of at most six
+ * digits, which is what most printed Reals are: an integer below a million
+ * times a power of ten, one exact operation away from `x`. A miss proves
+ * nothing. */
+static int kai_real_six_digits(double x) {
+    static const double pow10[] = {
+        1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+    double a = fabs(x);
+    if (a >= 1e6) {
+        for (int k = 1; k <= 22; k++) {
+            double y = a / pow10[k];
+            if (y < 1e6) return y == (double) (int64_t) y && y * pow10[k] == a;
+        }
+        return 0;
+    }
+    for (int k = 0; k <= 22; k++) {
+        double y = a * pow10[k];
+        if (y >= 1e6) return 0;
+        if (y == (double) (int64_t) y) return y / pow10[k] == a;
+    }
+    return 0;
+}
+
+static int kai_real_reads_back(char *buf, size_t cap, int digits, double x) {
+    snprintf(buf, cap, "%.*g", digits, x);
+    return strtod(buf, NULL) == x;
+}
+
+/* A Real's text: the shortest `%.{p}g`, p from 6 to 17, that reads back
+ * as the same number. Six digits stay six when they already name it. A
+ * non-finite Real has one spelling.
+ *
+ * Fifteen digits are tried before seven: a decimal of fewer digits that
+ * reads back is also the nearest of fifteen, so a miss at fifteen rules
+ * out every shorter text. */
+static void kai_real_text(char *buf, size_t cap, double x) {
+    snprintf(buf, cap, "%g", x);
+    if (!isfinite(x) || kai_real_six_digits(x) || strtod(buf, NULL) == x) return;
+    if (kai_real_reads_back(buf, cap, 15, x)) {
+        for (int p = 7; !kai_real_reads_back(buf, cap, p, x); p++) { }
+    } else if (!kai_real_reads_back(buf, cap, 16, x)) {
+        snprintf(buf, cap, "%.17g", x);
+    }
+}
+
 KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v);
 
 /* Encode scalar value `cp` into `out` (>= 4 bytes), the exact inverse of
@@ -8070,7 +8116,7 @@ KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v) {
             snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
             return kai_str_dyn(buf);
         case KAI_REAL:
-            snprintf(buf, sizeof(buf), "%g", v->as.r);
+            kai_real_text(buf, sizeof(buf), v->as.r);
             return kai_str_dyn(buf);
         case KAI_CHAR:
             snprintf(buf, sizeof(buf), "%c", (char) v->as.c);
@@ -8467,7 +8513,7 @@ static KaiValue *kai_core_int_to_string(KaiValue *v) {
 
 static KaiValue *kai_core_real_to_string(KaiValue *v) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%g", v->as.r);
+    kai_real_text(buf, sizeof(buf), v->as.r);
     KaiValue *r = kai_str_dyn(buf);
     kai_decref(v);
     return r;
