@@ -616,24 +616,23 @@ test-modules: $(TARGET) build
 # examples/modules-qualified/ is one self-contained scenario
 # (basic / alias / selective / local_shadow / two_modules /
 # record_projection): a `main.kai` plus zero or more helper
-# modules. Compiled with the subdir as the import root (no
-# --path needed because helpers live next to main.kai). Both
-# backends run; outputs diffed against `<subdir>/main.out.expected`
-# and against each other.
+# modules. Compiled with the subdir as the import root (helpers live
+# next to main.kai) and the stdlib on the search path; the output is
+# diffed against `<subdir>/main.out.expected`.
 #
 # `record_projection` is the no-op smoke test — no imports, so
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern const_interp_homonyms const_block_homonyms
-QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign protocol_dispatch_private pub_unit_bare_ambiguous pub_unit_cross_module qualified_record_variant_unknown
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern const_interp_homonyms const_block_homonyms const_initialiser
+QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign protocol_dispatch_private pub_unit_bare_ambiguous pub_unit_cross_module qualified_record_variant_unknown const_unknown_export
 
 test-modules-qualified: $(TARGET) build
 	@set -e; \
 	for d in $(QUALIFIED_DIRS); do \
 	  src=../examples/modules-qualified/$$d/main.kai; \
 	  exp=../examples/modules-qualified/$$d/main.out.expected; \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$src > build/mq-$$d.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/mq-$$d.c \
 	    || { echo "modules-qualified FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mq-$$d.c -o build/mq-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-qualified FAIL $$d (cc)"; exit 1; }; \
@@ -664,6 +663,29 @@ test-modules-qualified-neg: $(TARGET) build
 	         cat build/mq-neg-$$d.err; exit 1; }; \
 	  echo "modules-qualified-neg OK $$d"; \
 	done
+
+# A const initialiser resolves a qualified name as a function body does,
+# and reports an unknown one, on the native backend too.
+ifeq ($(KAI_LLVM),1)
+test-modules-qualified-const-native: $(TARGET) bin-kai build
+	@set -e; \
+	d=../examples/modules-qualified/const_initialiser; \
+	KAI_BACKEND=native ../bin/kai build $$d/main.kai -o build/mq-const-n 2> build/mq-const-n.err \
+	  || { echo "modules-qualified-const-native FAIL (build)"; cat build/mq-const-n.err; exit 1; }; \
+	./build/mq-const-n > build/mq-const-n.out || { echo "modules-qualified-const-native FAIL (run)"; exit 1; }; \
+	diff -q $$d/main.out.expected build/mq-const-n.out > /dev/null \
+	  || { echo "modules-qualified-const-native DIFF"; diff $$d/main.out.expected build/mq-const-n.out; exit 1; }; \
+	d=../examples/modules-qualified/const_unknown_export; \
+	if KAI_BACKEND=native ../bin/kai build $$d/main.kai -o build/mq-const-neg-n 2> build/mq-const-neg-n.err; then \
+	  echo "modules-qualified-const-native FAIL (expected error, got success)"; exit 1; \
+	fi; \
+	grep -qF "$$(head -1 $$d/main.err.expected)" build/mq-const-neg-n.err \
+	  || { echo "modules-qualified-const-native FAIL (missing diagnostic)"; cat build/mq-const-neg-n.err; exit 1; }; \
+	echo "modules-qualified-const-native OK"
+else
+test-modules-qualified-const-native:
+	@echo "modules-qualified-const-native SKIP (C-only build; native backend not compiled)"
+endif
 
 # Issue #502: constructor-name collision with built-in Result/Option
 # variants. Two positive multi-file fixtures verify a `pub type` whose
