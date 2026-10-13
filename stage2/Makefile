@@ -14029,6 +14029,15 @@ test-progen-smoke: $(TARGET) bin-kai
 test-tail-call-matrix: $(TARGET) bin-kai
 	@../tools/tail-call-matrix-gate.sh
 
+# A build that reuses cached partition objects gives what a build with no
+# cache gives, and a package's block runs hold its own blocks: the scripts
+# run the default backend, which is native only on a kaic2 with libLLVM.
+test-native-cache-edits-native: $(TARGET) bin-kai
+	@../tests/native_cache_edits.sh
+
+test-own-blocks-native: $(TARGET) bin-kai
+	@../tests/own_blocks.sh
+
 # Targets that drive `bin/kai` with KAI_BACKEND=native. On a kaic2 built
 # without libLLVM the wrapper degrades to the C backend, so running these
 # in the C-built tier1 job asserts nothing about native — they belong to
