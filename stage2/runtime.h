@@ -690,6 +690,9 @@ struct KaiValue {
             int32_t     arity;
             int32_t     n_captures;
             KaiValue  **captures;
+            /* A closure's only capture, held in the cell: `captures`
+             * then points here, and the closure owns no block. */
+            KaiValue   *lone;
         } clo;
         /* Opaque mutable array. Used by the stage 2 inferencer to keep
            the HM substitution indexed by TyVar id, so apply_ty lookups
@@ -2815,6 +2818,27 @@ static void kai_var_block_free(KaiValue *v, int n) {
     (void) n;
     free(v);
 #endif
+}
+
+/* The captures of a closure with more than one. Up to a cell's worth
+ * of them are a cell of the cell pool, so building and dropping the
+ * closure does not reach libc; a block of its own past that. Never a
+ * slab block: a closure can outlive the slabs, read by the exit report. */
+static inline KaiValue **kai_caps_alloc(int n) {
+#ifdef KAI_CELL_POOL_ACTIVE
+    if ((size_t) n * sizeof(KaiValue *) <= sizeof(KaiValue)) {
+        KaiValue *cell = kai_cell_pool_pop();
+        return (KaiValue **) (cell != NULL ? cell : malloc(sizeof(KaiValue)));
+    }
+#endif
+    return (KaiValue **) malloc((size_t) n * sizeof(KaiValue *));
+}
+
+static inline void kai_caps_free(KaiValue **caps, int n) {
+#ifdef KAI_CELL_POOL_ACTIVE
+    if ((size_t) n * sizeof(KaiValue *) <= sizeof(KaiValue) && kai_cell_pool_push((KaiValue *) caps)) return;
+#endif
+    free(caps);
 }
 
 /* m5 #7: constant pool for nullary primitives.
@@ -4945,7 +4969,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             break;
         case KAI_CLOSURE:
             for (int i = 0; i < v->as.clo.n_captures; ++i) kai_drop_child(v->as.clo.captures[i], depth, st);
-            free(v->as.clo.captures);
+            if (v->as.clo.n_captures > 1) kai_caps_free(v->as.clo.captures, v->as.clo.n_captures);
             break;
         case KAI_ARRAY:
             for (int64_t i = 0; i < v->as.arr.len; ++i) kai_drop_child(v->as.arr.items[i], depth, st);
@@ -7751,7 +7775,7 @@ static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures
     v->as.clo.arity = arity;
     v->as.clo.n_captures = n_captures;
     if (n_captures > 0) {
-        v->as.clo.captures = (KaiValue **) malloc(n_captures * sizeof(KaiValue *));
+        v->as.clo.captures = n_captures == 1 ? &v->as.clo.lone : kai_caps_alloc(n_captures);
         for (int i = 0; i < n_captures; ++i) v->as.clo.captures[i] = kai_incref(captures[i]);
     } else {
         v->as.clo.captures = NULL;
