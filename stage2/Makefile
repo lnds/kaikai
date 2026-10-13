@@ -1959,12 +1959,13 @@ test-native-dead-strip:
 	@echo "native-dead-strip SKIP (C-only build; native backend not compiled)"
 endif
 
-# FFI v2 (#417) — negatives the surface still rejects: a struct field
-# with no exact C width, and a function-typed (callback-from-C) extern
-# param. Each must fail to compile with the matching diagnostic.
+# FFI v2 negatives: a struct field with no exact C width, a
+# function-typed (callback-from-C) extern param, and a read of a field
+# an extern struct does not declare. Each must fail to compile with the
+# matching diagnostic.
 test-ffi-v2-negatives: $(TARGET) build
 	@set -e; \
-	for f in v2_struct_field_non_c v2_callback_param; do \
+	for f in v2_struct_field_non_c v2_callback_param v2_struct_field_absent; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) --check ../examples/negative/ffi/$$f.kai > build/$$f.out 2>&1 \
 	    && { echo "$$f DID NOT FAIL — v2 must still reject it"; exit 1; } || true; \
 	  grep -F "$$(head -1 ../examples/negative/ffi/$$f.err.expected)" build/$$f.out > /dev/null \
