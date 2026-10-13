@@ -84,6 +84,33 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.148.0 (2026-10-13)
+
+### BREAKING CHANGE
+
+- unary `-` on a type with no negation is a compile
+error. `-"abc"` and `-true` used to compile and abort at run time; on
+the C backend `-true` evaluated as true.
+- a printed Real that six digits did not name now shows
+more digits: `0.1 + 0.2` prints `0.30000000000000004`, `1234567.0`
+prints `1234567`, `123456789.125` prints `123456789.125`. Output that
+relied on the six-digit rounding changes; round the value first
+(`real.round(x * 100.0) / 100.0`) to print fewer.
+
+### Added
+
+- **typer**: unary minus dispatches through the Neg protocol (#2784)
+
+### Fixed
+
+- **runtime**: a Real prints as the shortest text that reads back as the same number (#2779)
+
+### Changed
+
+- **runtime**: host facilities sit behind capability macros (#2783)
+- **compiler**: the resolver moves home only when the next declaration is in another module (#2785)
+- **compiler**: the ids of the core protocols and effects are tabulated (#2782)
+
 ## v0.147.0 (2026-10-13)
 
 ### BREAKING CHANGE
