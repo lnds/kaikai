@@ -586,6 +586,21 @@ static int32_t      kai_impl_cap    = 0;
 static int32_t      kai_impl_count  = 0;
 #endif
 
+/* One byte per head tag: set when the head has an `Eq.eq` row. The
+ * structural compare asks the table only for those heads, so a value
+ * whose type has no `impl Eq` costs it no probe. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern uint8_t *kai_eq_heads;
+extern int32_t  kai_eq_heads_len;
+#  if defined(KAI_RUNTIME_OWNER)
+uint8_t *kai_eq_heads     = NULL;
+int32_t  kai_eq_heads_len = 0;
+#  endif
+#else
+static uint8_t *kai_eq_heads     = NULL;
+static int32_t  kai_eq_heads_len = 0;
+#endif
+
 static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t op_id, int32_t head_tag) {
     /* FNV-1a-ish mix; keys are small ints so any cheap mix is fine. */
     uint32_t h = (uint32_t) proto_id * 2654435761u;
@@ -644,9 +659,23 @@ static void kai_register_impls(const KaiImplEntry *entries, int32_t n) {
     kai_impl_table  = (KaiImplSlot *) calloc((size_t) cap, sizeof(KaiImplSlot));
     kai_impl_cap    = cap;
     kai_impl_count  = 0;
+    int32_t eq_len = 0;
     for (int32_t k = 0; k < n; ++k) {
         kai_impl_insert(entries[k].proto_id, entries[k].op_id, entries[k].head_tag, entries[k].fn);
+        if (entries[k].proto_id == KAI_PROTO_EQ && entries[k].head_tag >= eq_len) eq_len = entries[k].head_tag + 1;
     }
+    if (kai_eq_heads != NULL) free(kai_eq_heads);
+    kai_eq_heads     = (uint8_t *) calloc((size_t) (eq_len > 0 ? eq_len : 1), 1);
+    kai_eq_heads_len = eq_len;
+    for (int32_t k = 0; k < n; ++k) {
+        if (entries[k].proto_id == KAI_PROTO_EQ && entries[k].head_tag >= 0) kai_eq_heads[entries[k].head_tag] = 1;
+    }
+}
+
+/* The `Eq.eq` impl of a head, or NULL when its type has none. */
+KAI_RT_SHARED_INLINE void *kai_eq_impl_of(int32_t head_tag) {
+    if (head_tag <= 0 || head_tag >= kai_eq_heads_len || !kai_eq_heads[head_tag]) return NULL;
+    return kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, head_tag);
 }
 
 typedef struct KaiValue KaiValue;
@@ -8024,7 +8053,7 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
              * kai_op_eq is NON-consuming, so we incref a/b for the impl (which
              * consumes them) and do NOT decref here. */
             int32_t _eq_head = kai_head_tag(a);
-            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, _eq_head);
+            void *_eq_fn = kai_eq_impl_of(_eq_head);
             if (_eq_fn) {
                 kai_incref(a); kai_incref(b);
                 KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
@@ -8068,7 +8097,7 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
              * a tag today). Root records reached via the resolver still work;
              * this hook fires only when as.rec.head_type_tag is a real impl. */
             int32_t _eq_head = kai_head_tag(a);
-            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, _eq_head);
+            void *_eq_fn = kai_eq_impl_of(_eq_head);
             if (_eq_fn) {
                 kai_incref(a); kai_incref(b);
                 KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);

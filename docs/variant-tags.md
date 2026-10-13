@@ -193,10 +193,10 @@ The runtime helper maps any value to its head tag:
   a record type with an `impl Ord` or a hand-written `impl Eq` (outside
   the core) wraps it in `kai_rec_stamp(v, tag)` (`kaix_rec_stamp` on
   native), so a comparison operator reaching that record dispatches to
-  its impl. A derived `impl Eq` stamps nothing and takes no row of the
-  impl table: the structural compare is what the derived impl does, on
-  a record and on a variant alike. A reused cell is reset to 0 before
-  its site stamps it.
+  its impl. A derived `impl Eq` on a record stamps nothing and takes no
+  row of the impl table: the structural compare is what that impl does,
+  so a record with a head for `Ord` compares as one without. A reused
+  cell is reset to 0 before its site stamps it.
 - **`Eq.eq` reached at run time** — a generic impl called from the
   structural compare (`impl Eq for Option[T]` on a `Some` inside a
   list) compares what it holds through the `Eq.eq` dispatcher, and that
@@ -204,6 +204,11 @@ The runtime helper maps any value to its head tag:
   value whose head has one and compares any other value member by
   member. The dispatchers of the other protocols have no structural
   reading and stop the program on a head with no impl.
+- **Heads with an `Eq.eq` row** — `kai_register_impls` fills
+  `kai_eq_heads`, one byte per head tag, as it loads the rows. The
+  structural compare asks the impl table only for a head marked there,
+  so a value whose type has no `impl Eq` costs it no probe, whether or
+  not it carries a head.
 - **Lists** — `KAI_NIL` and `KAI_CONS` both map to `HEAD_LIST = 7`.
 
 `kai_head_tag` is `static inline` in `runtime.h`; the cost is one
