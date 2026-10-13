@@ -5,7 +5,7 @@
 # the cache the first build left, and over an empty one. The two must agree,
 # and agree with the C backend; and an object both caches hold under one
 # name must be the same object. Every edit changes something an object holds
-# that no function it defines names: a thunk, an impl-table row, a variant,
+# that no function it defines names: an impl-table row, a variant,
 # a block's name, the place of an effect's operation.
 #
 # Each sequence also names how many objects its edit emits. More means the
@@ -91,6 +91,27 @@ value_after() {
   printf 'fn dbl(n: Int) : Int = n * 2\n\nfn tpl(n: Int) : Int = n * 3\n\npub fn run() : Int = list.sum(list.map([1, 2], tpl)) + dbl(0)\n' > m.kai
 }
 
+# A function of one module starts being used as a value by another.
+borrowed_before() {
+  entry borrowed
+  printf 'import b\n\nfn main() : Unit / Stdout = Stdout.print("#{b.run()}")\n' > main.kai
+  printf 'pub fn dbl(n: Int) : Int = if n > 100 { dbl(n - 100) } else { n * 2 }\n' > a.kai
+  printf 'import a\n\nfn own(n: Int) : Int = if n > 100 { own(n - 100) } else { a.dbl(n) + 1 }\n\npub fn run() : Int = list.sum(list.map([1, 2], own)) + a.dbl(0)\n' > b.kai
+}
+borrowed_after() {
+  printf 'import a\n\nfn own(n: Int) : Int = if n > 100 { own(n - 100) } else { a.dbl(n) + 1 }\n\npub fn run() : Int = list.sum(list.map([1, 2], a.dbl)) + own(0)\n' > b.kai
+}
+
+# An imported module gains a function that is only ever called.
+added_before() {
+  entry added
+  printf 'import m\n\nfn main() : Unit / Stdout = Stdout.print("#{m.run(5)}")\n' > main.kai
+  printf 'fn fact(n: Int, acc: Int) : Int = if n <= 1 { acc } else { fact(n - 1, acc * n) }\n\npub fn run(n: Int) : Int = fact(n, 1)\n' > m.kai
+}
+added_after() {
+  printf 'fn fact(n: Int, acc: Int) : Int = if n <= 1 { acc } else { fact(n - 1, acc * n) }\n\nfn fib(n: Int) : Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n\npub fn run(n: Int) : Int = fact(n, 1) + fib(n * 2)\n' > m.kai
+}
+
 # An imported module gains an impl that is reached through the impl table.
 impl_before() {
   entry impl
@@ -150,7 +171,9 @@ renamed_check_after()  { printf 'import calc\n\ncheck "second name" with n: Int 
 twin_before() { block_package twin; printf 'import calc\n\ntest "a: uses calc" {\n  assert calc.inc(1) == 2\n}\n' > tests/a_test.kai; }
 twin_after()  { printf 'import calc\n\ntest "b: uses calc" {\n  assert calc.inc(1) == 2\n}\n' > tests/b_test.kai; }
 
-sequence value     run   value_before     value_after     2
+sequence value     run   value_before     value_after     1
+sequence borrowed  run   borrowed_before  borrowed_after  2
+sequence added     run   added_before     added_after     1
 sequence impl      run   impl_before      impl_after      3
 sequence variant   run   variant_before   variant_after   2
 sequence bystander run   bystander_before bystander_after 2

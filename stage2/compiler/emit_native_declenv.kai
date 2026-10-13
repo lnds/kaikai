@@ -21,15 +21,43 @@ import compiler.purity_traps
 import compiler.fn_set
 import compiler.evidence_frame
 import compiler.effect_instance
+import compiler.infer_index
+import compiler.emit_shared
+import compiler.emit_native_refs
 
-#[doc("The analyses a declaration is emitted from: each function's evidence frame, the functions proven memory-clean, and those that cannot trap.")]
-pub type NDeclEnv = { frames: EvFrames, const_fns: FnSet, free_fns: FnSet }
+#[doc("The analyses a declaration is emitted from: each function's evidence frame, the functions proven memory-clean, those that cannot trap, and the thunk symbols the program takes as a value.")]
+pub type NDeclEnv = { frames: EvFrames, const_fns: FnSet, free_fns: FnSet, valued: NameIndex[String] }
 
 #[doc("The declaration analyses of the program `kp` was lowered from.")]
 pub fn ndecl_env(kp: KProgram, decls: [Decl]) : NDeclEnv =
   NDeclEnv { frames: frames_index(build_evidence_frames(decls, kp.entry)),
              const_fns: fn_set_of(purity_const_fns(purity_analyze(decls, kp.entry))),
-             free_fns: fn_set_of(trapfree_fns(decls, kp.tab)) }
+             free_fns: fn_set_of(trapfree_fns(decls, kp.tab)),
+             valued: ndecl_handler_thunks(kp.handlers, ndecl_runner_thunks(kp.runners, nrefs_values(kp.fns))) }
+
+# The runner driver calls each block through its thunk.
+fn ndecl_runner_thunks(rs: [KRunner], vals: NameIndex[String]) : NameIndex[String] = match rs {
+  [] -> vals
+  [r, ...rest] -> ndecl_runner_thunks(rest, nrefs_with_value(vals, c_user_thunk_sym(r.sym)))
+}
+
+# An install stores the thunk of each clause of its handler, and of its return.
+fn ndecl_handler_thunks(hs: [KHandlerDecl], vals: NameIndex[String]) : NameIndex[String] = match hs {
+  [] -> vals
+  [h, ...rest] -> ndecl_handler_thunks(rest, ndecl_op_thunks(h.op_thunks, match h.ret_thunk {
+    Some(sym) -> nrefs_with_value(vals, sym)
+    None      -> vals
+  }))
+}
+
+fn ndecl_op_thunks(ts: [KOpThunk], vals: NameIndex[String]) : NameIndex[String] = match ts {
+  [] -> vals
+  [KOT(_, sym, _), ...rest] -> ndecl_op_thunks(rest, nrefs_with_value(vals, sym))
+}
+
+#[doc("Whether the program takes `f` as a value, so the partition that defines it emits its thunk.")]
+pub fn ndecl_thunked(kp: KProgram, env: NDeclEnv, f: KFn) : Bool =
+  nrefs_valued(env.valued, c_user_thunk_sym(kfn_sym(kp_names(kp), f)))
 
 #[doc("What another partition sees of `f`: its signature, the slots of its evidence frame, and the attributes its declaration carries.")]
 pub fn ndecl_text(kp: KProgram, env: NDeclEnv, f: KFn) : String = {
