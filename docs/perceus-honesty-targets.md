@@ -228,10 +228,20 @@ the state in the header. `force` reads it:
   `resume`) gives the cell its thunk back through the fiber's unwind
   stack, so a later read evaluates it again.
 
-A stage reads the stage before it from inside its own thunk, so a chain
-of stages nests one activation each. Past the middle of the running
-stack, `force` applies the thunk on a fresh stack segment, the ones a
-handler's body runs on; a trap or a cancellation inside it unwinds that
+A `filter` stage is a cell the runtime reads itself: it holds its
+source and its predicates where another cell holds a thunk. A stage
+whose reader holds its only reference becomes the stage over the rest,
+and an unshared step is rewritten in place, so the read allocates
+nothing. The filter stages under it that nobody else holds become part
+of it, one stage with a list of predicates read in a loop. A stage two
+readers hold is evaluated once and keeps its step, like any shared
+cell.
+
+A stage reads the stage before it from inside its own read, so a chain
+of stages that do not merge nests one activation each. Past the middle
+of the running stack, `force` applies the thunk on a fresh stack
+segment, the ones a handler's body runs on, and a filter stage reads
+its source on one; a trap or a cancellation inside it unwinds that
 segment and continues in the frame that read the cell. The half kept
 free is the room that unwinding needs.
 
@@ -243,8 +253,8 @@ The region border copies the cell with its step.
 
 Measured (mac arm64, `KAI_THREADS=1`, both backends alike unless
 noted): the 1,000-prime sieve of `examples/perceus/seq_sieve.kai`
-allocates 1,558,313 cells and frees all but the `SeqEnd` singleton,
-peak 5,013 live.
+allocates 29,918 cells and frees all but the `SeqEnd` singleton, peak
+3,012 live.
 
 A `const` whose type holds a `Seq` is the one constant with storage.
 Every other constant is re-evaluated at each read; this one is built
