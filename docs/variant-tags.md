@@ -243,7 +243,7 @@ open-addressing hashmap before user `main` runs.
 ### Protocol IDs
 
 `(proto_id, head_type_tag)` is the dispatch key. The stdlib protocols
-pin the first 12 IDs in declaration order in `stdlib/protocols.kai`:
+pin the first 16 IDs:
 
 | ID  | Protocol       |
 | --- | -------------- |
@@ -259,9 +259,13 @@ pin the first 12 IDs in declaration order in `stdlib/protocols.kai`:
 | 9   | `Mul`          |
 | 10  | `Div`          |
 | 11  | `Rem`          |
+| 12  | `Numeric`      |
+| 13  | `Layout`       |
+| 14  | `Json`         |
+| 15  | `Neg`          |
 
-`KAI_USER_PROTO_ID_BASE = 12`. User-declared protocols receive IDs
-from 12 upward in declaration order. Like head tags, user proto IDs
+`KAI_USER_PROTO_ID_BASE = 16`. User-declared protocols receive IDs
+from 16 upward in declaration order. Like head tags, user proto IDs
 are stable within a compilation but not across compilations.
 
 ### Where the convention is encoded
