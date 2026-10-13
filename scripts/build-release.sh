@@ -113,11 +113,12 @@ make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >&2
 
 # Verify byte-identical selfhost before packaging — mandatory per CLAUDE.md.
 # selfhost goes through the C path (the bootstrap oracle), so it is
-# unaffected by the native link; build the selfhost-comparison kaic2 the
-# same way the gate does (default Makefile rules).
+# unaffected by the native link. Its second generation runs once and is
+# compiled unoptimised here; the gate every merge passes compiles it as
+# kaic2 ships.
 echo "==> verifying selfhost byte-identical"
 make -C stage1 selfhost >&2
-make -C stage2 selfhost >&2
+make -C stage2 selfhost SELFHOST_ONCE=1 >&2
 
 # The next release's seed: the C this kaic2 emits for its own source and the
 # runtime.h it pairs with. Linked from those two files alone, as a rescue

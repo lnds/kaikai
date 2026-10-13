@@ -227,8 +227,13 @@ build/stage2.c: $(PKG_SRCS) $(if $(filter kaic1,$(KAIC_BOOT)),$(KAIC1)) | build
 # this tree's. $(LINK_SH) takes one translation unit or a c-modular stream
 # (KAIC_BOOT_MODULAR=1), read from the file itself.
 LINK_SH := ../tools/kaic-link.sh
+
+# A hop's binary runs once, to emit C, and is thrown away. Optimising it
+# costs several times what the slower binary loses in that one run, and
+# the C it emits does not depend on how it was compiled.
+CFLAGS_HOP := $(filter-out -O2 -O1 -g,$(CFLAGS)) -O0
 boot-hop:
-	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS_HOP) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -5936,6 +5941,10 @@ bench-effects: build
 	@./build/bench_perform_resume
 
 # The compiler's own sources compile without a single warning.
+# SELFHOST_ONCE=1 compiles the second generation as a hop is compiled: it
+# runs once. The default keeps it at the flags kaic2 ships with, which
+# also puts the C compiler's optimiser under the check.
+SELFHOST_CFLAGS := $(if $(SELFHOST_ONCE),$(CFLAGS_HOP),$(CFLAGS))
 selfhost: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(SRC) > build/kaic2b.c 2> build/kaic2b.err || { cat build/kaic2b.err >&2; exit 1; }; \
@@ -5943,7 +5952,7 @@ selfhost: $(TARGET) build
 	if grep -q '^warning:' build/kaic2b.err; then \
 	  echo "selfhost warnings: the compiler's own sources must compile without a warning"; exit 1; \
 	fi; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
+	$(CC) $(SELFHOST_CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
 	./build/kaic2b $(EDITION_FLAG) $(SRC) > build/kaic2c.c; \
 	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
 	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
