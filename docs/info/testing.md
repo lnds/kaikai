@@ -25,6 +25,21 @@ kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
 ```
 
+## Whose blocks run
+
+A run holds the blocks of the package under test and no other. A
+module imported from the stdlib or from a dependency, directly or
+through another, never adds its blocks to a run: they belong to that
+module's own suite, and run when it is the one under test.
+
+A build runs the blocks of its root file and of every module of the
+same package it loads, so a module with inline blocks runs them under
+the entry and under each test file that imports it. With no
+`kai.toml`, a file's package is the modules it imports from its own
+directory.
+
+`kai bench` and `kai check` follow the same rule.
+
 ## Tests
 
 ```kaikai
