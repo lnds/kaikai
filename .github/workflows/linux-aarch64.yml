@@ -1,0 +1,123 @@
+name: linux-aarch64
+
+# The C backend on aarch64 Linux under the system GCC. Every other Linux job
+# runs x86_64 and every other aarch64 job runs macOS under clang, so this is
+# the one place the runtime's aarch64 paths meet GCC and ELF: the stack-segment
+# switch, the fiber stacks, the M:N scheduler.
+#
+# It boots from the seed, the route a machine with only `cc` takes, and builds
+# its own compiler: artifacts do not cross workflows.
+#
+# Path-gated on pull requests and not a required check; the nightly run covers
+# what a change outside those paths can still move.
+on:
+  pull_request:
+    paths:
+      - 'stage0/**'
+      - 'stage2/runtime.h'
+      - 'stage2/Makefile'
+      - 'scripts/build-release.sh'
+      - 'install.sh'
+      - '.github/workflows/linux-aarch64.yml'
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: linux-aarch64-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  KAIC_BOOT: seed
+  KAI_BACKEND: c
+  MN_CORPUS_RUN_TIMEOUT: 30
+
+jobs:
+  linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the bootstrap seeds
+        run: git fetch --depth=1 origin 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'
+
+      # The job is about GCC: a runner image whose `cc` became clang would
+      # keep it green while testing nothing it exists for.
+      - name: The system compiler is GCC
+        run: |
+          uname -m
+          cc --version | head -1
+          getconf GNU_LIBC_VERSION
+          echo "page size: $(getconf PAGESIZE)"
+          echo "BTI by default: $(echo | cc -dM -E - | grep -c __ARM_FEATURE_BTI_DEFAULT || true)"
+          [ "$(uname -m)" = aarch64 ] || { echo "::error::not an aarch64 runner"; exit 1; }
+          echo | cc -dM -E - | grep -q '__GNUC__' && ! echo | cc -dM -E - | grep -q '__clang__' \
+            || { echo "::error::cc is not GCC"; exit 1; }
+
+      - name: cc -> seed -> kaic2
+        env:
+          KAIC_BOOT_MODULAR: 1
+        run: make kaic2
+
+      # The second generation is compiled unoptimised: it runs once, and it
+      # must still emit what the optimised compiler emitted.
+      - name: Self-host
+        run: make -C stage2 selfhost SELFHOST_ONCE=1
+
+      - name: Stack-segment switch, driven from C
+        run: make -C stage2 test-segment-switch test-segment-runtime test-segment-handles
+
+      # A modular build links one runtime owner beside the program's units; a
+      # single-unit build holds the runtime itself. Every unit assembles the
+      # switch and the copies must link as one symbol the program does not
+      # export. Unoptimised units reference it even where nothing calls it,
+      # position-independent code takes its stub's address, and branch
+      # protection picks how it returns.
+      - name: Segments past a fiber's stack, per link shape, optimisation and branch protection
+        run: |
+          set -eu
+          fix=examples/perceus/seq_deep_in_fiber
+          for modular in 1 0; do
+            for opt in -O2 -O0; do
+              for prot in none standard; do
+                tag="modular=$modular $opt branch-protection=$prot"
+                exe="$RUNNER_TEMP/deep-m$modular$opt-$prot"
+                KAI_MODULAR=$modular \
+                  CFLAGS="-std=c99 -Wno-unused-function -Wno-unused-variable $opt -mbranch-protection=$prot" \
+                  bin/kai build "$fix.kai" -o "$exe"
+                for n in 1 4; do
+                  KAI_THREADS=$n "$exe" > "$exe.out" \
+                    || { echo "::error::$tag KAI_THREADS=$n: exit $?"; exit 1; }
+                  diff -u "$fix.out.expected" "$exe.out"
+                done
+                defs="$(nm "$exe" | grep -c ' kai_seg_switch$' || true)"
+                [ "$defs" = 1 ] || { echo "::error::$tag: $defs kai_seg_switch symbols"; exit 1; }
+                if nm -D "$exe" | grep -q ' kai_seg_'; then
+                  echo "::error::$tag: the switch is exported"; exit 1
+                fi
+                echo "OK $tag"
+              done
+            done
+          done
+
+      - name: Lazy sequences
+        run: tools/test-seq.sh c
+
+      - name: Effects goldens
+        run: TARGET_BACKEND=c tools/test-effects-goldens.sh
+
+      - name: One thread against four over effects, segments, RC and actors
+        run: |
+          MN_CORPUS_BACKENDS=c MN_CORPUS_THREADS=4 MN_CORPUS_REPEATS=2 \
+          MN_CORPUS_DIRS="examples/effects examples/segments examples/perceus examples/actors" \
+            tools/ci-bounded-step.sh 2400 linux-aarch64/mn-corpus tools/run-mn-corpus-determinism.sh
+
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after linux-aarch64"; git status; exit 1
+          fi
