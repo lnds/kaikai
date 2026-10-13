@@ -75,7 +75,7 @@ printf 'boot-hop:\n\t@%s $(HOP_C) $(HOP_BIN) $(HOP_INC)\n' "$work/hop-cc" > "$ro
 
 # Release tarballs for every platform the script knows, so the test runs
 # on any published host.
-for plat in darwin-arm64 linux-x86_64; do
+for plat in darwin-arm64 linux-x86_64 linux-aarch64; do
   name="kaikai-v9.9.9-$plat"
   mkdir -p "$work/pkg/$name/libexec/kaikai"
   make_kaic2 "$work/pkg/$name/libexec/kaikai/kaic2" release
@@ -215,9 +215,9 @@ for f in "$dist"/v9.9.9/*.sha256; do
 done
 if boot release emit "$out" 2>/dev/null; then fail "checksum mismatch accepted (release)"; fi
 if boot auto emit "$out" 2>/dev/null; then fail "checksum mismatch fell back (auto)"; fi
-[ ! -d "$root/stage2/build/boot/kaikai-v9.9.9-darwin-arm64" ] && [ ! -d "$root/stage2/build/boot/kaikai-v9.9.9-linux-x86_64" ] \
+[ -z "$(ls -d "$root"/stage2/build/boot/kaikai-v9.9.9-* 2>/dev/null)" ] \
   || fail "a boot failing its checksum was left in the cache"
-for plat in darwin-arm64 linux-x86_64; do
+for plat in darwin-arm64 linux-x86_64 linux-aarch64; do
   name="kaikai-v9.9.9-$plat"
   (cd "$dist/v9.9.9" && { sha256sum "$name.tar.gz" 2>/dev/null || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
 done
