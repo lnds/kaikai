@@ -86,10 +86,15 @@ brew upgrade kaikai     # to update
 A `kai upgrade` on a Homebrew install defers to `brew upgrade` rather
 than touching the Cellar.
 
-> Released tarballs cover **darwin-arm64** and **linux-x86_64**. The
-> Homebrew formula is macOS-only. On any other platform (macOS Intel,
-> Linux arm64) the installer reports the gap rather than failing on a
-> 404 — build the compiler from source there (path **B**).
+> Released tarballs cover **darwin-arm64**, **linux-x86_64** and
+> **linux-aarch64**. The Homebrew formula is macOS-only. On any other
+> platform (macOS Intel) the installer reports the gap rather than
+> failing on a 404 — build the compiler from source there (path **B**).
+>
+> The Linux tarballs are built on a current distribution and need its
+> system libraries or newer: glibc 2.38 and a libstdc++ providing
+> `GLIBCXX_3.4.30`. On an older system the installer stops, says what it
+> found and installs nothing; build from source there too.
 >
 > **Windows:** there is no native build. Use
 > [WSL2](https://learn.microsoft.com/windows/wsl/install) with an
