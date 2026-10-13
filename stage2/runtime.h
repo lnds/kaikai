@@ -9035,16 +9035,19 @@ static inline KaiValue *kai_seq_take(KaiValue *s) {
 
 KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk);
 
-/* Apply a cell's thunk. A stage reads the one before it from inside its own
- * thunk, so a chain of stages nests one activation each: past the middle of
- * this stack the thunk runs on a fresh segment. The half kept free is what
- * a trap raised inside the chain unwinds on. Depth is counted from the entry
- * frame of the running stack; the main fiber records none and never takes
- * that path. */
-static inline KaiValue *kai_seq_apply(KaiFiber *f, KaiValue *thunk) {
+/* A stage reads the one before it from inside its own read, so a chain of
+ * stages nests one activation each: past the middle of the running stack a
+ * read carries on over a fresh segment. The half kept free is what a trap
+ * raised inside the chain unwinds on. Depth is counted from the entry frame
+ * of the running stack; the main fiber records none and is never deep. */
+static inline int kai_seq_deep(KaiFiber *f) {
     uintptr_t entry = f->unwind_frame;
-    size_t used = (size_t) (entry - (uintptr_t) __builtin_frame_address(0));
-    if (entry != 0 && used > f->stack_size / 2) return kai_seq_apply_far(thunk);
+    return entry != 0 && (size_t) (entry - (uintptr_t) __builtin_frame_address(0)) > f->stack_size / 2;
+}
+
+/* Apply a cell's thunk. */
+static inline KaiValue *kai_seq_apply(KaiFiber *f, KaiValue *thunk) {
+    if (kai_seq_deep(f)) return kai_seq_apply_far(thunk);
     return kai_apply_borrow(thunk, 0, NULL);
 }
 
@@ -9162,6 +9165,28 @@ static KaiValue *kai_seq_filter_absorb(KaiValue *own, KaiValue *s) {
     return s;
 }
 
+/* The body of a read moved to a fresh segment: the cell leaves the
+ * closure, so the read holds its only reference when the caller did. */
+static KaiValue *kai_seq_force_held(KaiValue *self, KaiValue **args, int n) {
+    (void) args; (void) n;
+    KaiValue *s = self->as.clo.captures[0];
+    self->as.clo.captures[0] = NULL;
+    return kai_seq_force(s);
+}
+
+/* Read `s` on a fresh segment; consumes `s`. `*slot`, a slot of the
+ * caller's unwind entry, holds the read's closure meanwhile. */
+__attribute__((noinline))
+static KaiValue *kai_seq_force_far(KaiValue *s, KaiValue **slot) {
+    KaiValue *body = kai_closure(kai_seq_force_held, 0, 1, &s);
+    kai_decref(s);
+    *slot = body;
+    KaiValue *step = kai_seq_apply_far(body);
+    *slot = NULL;
+    kai_decref(body);
+    return step;
+}
+
 /* The first step of `s` whose head satisfies every predicate, with the
  * rest filtered in turn; consumes `s`, borrows the predicates. `own` is
  * the stage being read when the reader holds its only reference: it
@@ -9172,7 +9197,7 @@ static KaiValue *kai_seq_filter_step(KaiValue *s, KaiValue **preds, KaiValue *ow
     KaiFiber *uf = kai_unw_push(held, 2);
     for (;;) {
         if (own != NULL) s = kai_seq_filter_absorb(own, s);
-        KaiValue *step = kai_seq_force(s);
+        KaiValue *step = kai_seq_deep(uf) ? kai_seq_force_far(s, &held[1]) : kai_seq_force(s);
         if (step->var_n_args == 0) {
             kai_unw_pop(uf);
             if (own != NULL) kai_decref(own);
