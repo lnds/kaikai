@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.149.0 (2026-10-13)
+
+### BREAKING CHANGE
+
+- `kai test`, `kai bench` and `kai check` no longer run
+the blocks of a stdlib module or of a dependency the package imports,
+so the count a package reports drops by those blocks. A raw
+`kaic2 --test` runs the root's blocks alone unless `--test-own` names
+more.
+
+### Fixed
+
+- **cli**: a test run holds the blocks of the package under test, not of the modules it imports (#2787)
+
 ## v0.148.0 (2026-10-13)
 
 ### BREAKING CHANGE
