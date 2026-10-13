@@ -38,6 +38,7 @@ uname_for() {
   case "$1" in
     darwin-arm64)  echo "Darwin arm64" ;;
     linux-x86_64)  echo "Linux x86_64" ;;
+    linux-aarch64) echo "Linux aarch64" ;;
     *) return 1 ;;
   esac
 }

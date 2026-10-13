@@ -30,15 +30,14 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  KAIC_BOOT: seed
-  KAI_BACKEND: c
-  MN_CORPUS_RUN_TIMEOUT: 30
-
 jobs:
   linux-aarch64:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+    env:
+      KAIC_BOOT: seed
+      KAI_BACKEND: c
+      MN_CORPUS_RUN_TIMEOUT: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -121,3 +120,113 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after linux-aarch64"; git status; exit 1
           fi
+
+  # The tarball as release.yml builds it. Only the published libLLVM asset
+  # is accepted: a source build here would hide a missing one.
+  tarball:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      # build-release.sh boots from the newest bootstrap-seed tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install the pinned clang (native runtime bitcode)
+        run: ./tools/ci-install-toolchain.sh bitcode
+
+      - name: Fetch prebuilt static libLLVM
+        env:
+          KAI_LLVM_PREBUILT_REPO: ${{ github.repository }}
+        run: ./scripts/llvm-prebuilt.sh fetch
+
+      - name: Build release tarball
+        run: ./scripts/build-release.sh
+
+      # aarch64 kernels run 4, 16 and 64 KiB pages, and a binary whose
+      # segments are aligned to less than the page does not load.
+      - name: The shipped binaries load on 64 KiB pages
+        run: |
+          set -eu
+          tar -xzf dist/kaikai-v*-linux-aarch64.tar.gz -C "$RUNNER_TEMP"
+          top="$(echo "$RUNNER_TEMP"/kaikai-v*-linux-aarch64)"
+          for b in bin/kai libexec/kaikai/kaic2 libexec/kaikai/kai-pkg libexec/kaikai/kai-lsp; do
+            for align in $(readelf -lW "$top/$b" | awk '$1 == "LOAD" { print $NF }'); do
+              echo "$b: LOAD aligned to $align"
+              [ "$((align))" -ge 65536 ] || { echo "::error::$b has a segment aligned to $align"; exit 1; }
+            done
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaikai-linux-aarch64
+          path: dist/kaikai-v*-linux-aarch64.tar.gz*
+          retention-days: 7
+          if-no-files-found: error
+
+  # install.sh puts that tarball on a clean current distribution, where the
+  # distribution's own cc compiles the runtime for both backends.
+  install:
+    needs: tarball
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:rolling', 'debian:stable', 'fedora:latest']
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install curl, tar and the distribution's cc
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends ca-certificates curl tar gzip gcc libc6-dev
+          else
+            dnf install -y curl tar gzip gawk findutils diffutils gcc
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaikai-linux-aarch64
+          path: site
+
+      - name: install.sh from a local release site
+        run: |
+          set -eu
+          tag="v$(cat VERSION)"
+          tarball="kaikai-$tag-linux-aarch64.tar.gz"
+          site="$PWD/site"
+          printf '{"schema":1,"version":"%s","tag":"%s","platforms":{"linux-aarch64":{"url":"file://%s/%s","sha256":"%s"}}}\n' \
+            "${tag#v}" "$tag" "$site" "$tarball" "$(awk 'NR==1{print $1}' "$site/$tarball.sha256")" > "$site/latest.json"
+          getconf GNU_LIBC_VERSION
+          cc --version | head -1
+          echo "page size: $(getconf PAGESIZE)"
+          KAIKAI_DIST_BASE="file://$site" sh install.sh
+          cat "$HOME/.kaikai/share/kaikai/REQUIRES"
+
+      - name: Both backends on the installed toolchain
+        run: |
+          set -eu
+          PATH="$HOME/.kaikai/bin:$PATH"
+          work="$(mktemp -d)"
+          printf 'fn main() : Unit / Console = print("hola installed mode")\n' > "$work/hello.kai"
+          fix=examples/perceus/seq_deep_in_fiber
+          for backend in native c; do
+            echo "$backend: hello"
+            KAI_BACKEND=$backend timeout 300 kai run "$work/hello.kai" > "$work/hello.out" \
+              || { echo "::error::$backend: hello exit $?"; exit 1; }
+            grep -qx 'hola installed mode' "$work/hello.out" \
+              || { echo "::error::$backend: hello printed"; cat "$work/hello.out"; exit 1; }
+            echo "$backend: build $fix"
+            KAI_BACKEND=$backend timeout 300 kai build "$fix.kai" -o "$work/deep-$backend" \
+              || { echo "::error::$backend: build exit $?"; exit 1; }
+            for n in 1 4; do
+              echo "$backend: run at KAI_THREADS=$n"
+              KAI_THREADS=$n timeout 60 "$work/deep-$backend" > "$work/deep.out" \
+                || { echo "::error::$backend KAI_THREADS=$n: exit $?"; exit 1; }
+              diff -u "$fix.out.expected" "$work/deep.out"
+            done
+            echo "OK $backend"
+          done

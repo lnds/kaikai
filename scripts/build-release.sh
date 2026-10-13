@@ -27,6 +27,7 @@
 #       include/runtime.h
 #       demos/baseline.txt
 #       info/...                   # `kai info` reference pages
+#       REQUIRES                   # Linux: the glibc and libstdc++ it needs
 #     README.md
 #     LICENSE
 
@@ -243,6 +244,32 @@ fi
 # User-visible docs.
 cp README.md           "$STAGE/README.md"
 cp LICENSE             "$STAGE/LICENSE" 2>/dev/null || true
+
+# The newest glibc and libstdc++ symbol versions the staged binaries bind,
+# read from the binaries: the oldest system this tarball starts on.
+if [ "$OS" = linux ]; then
+  echo "==> reading the glibc and libstdc++ versions the staged binaries require"
+  bound="$DIST/.bound"
+  : > "$bound"
+  for b in "$STAGE/bin/kai" "$STAGE/libexec/kaikai/kaic2" \
+           "$STAGE/libexec/kaikai/kai-pkg" "$STAGE/libexec/kaikai/kai-lsp"; do
+    objdump -T "$b" >> "$bound" \
+      || { echo "build-release.sh: objdump -T failed on $b" >&2; exit 2; }
+  done
+  newest_bound() {
+    grep -o "$1_[0-9][0-9.]*" "$bound" | sed "s/^$1_//" \
+      | sort -u -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+  }
+  req_glibc="$(newest_bound GLIBC)"
+  req_glibcxx="$(newest_bound GLIBCXX)"
+  rm -f "$bound"
+  if [ -z "$req_glibc" ] || [ -z "$req_glibcxx" ]; then
+    echo "build-release.sh: no GLIBC_/GLIBCXX_ version read from the staged binaries" >&2
+    exit 2
+  fi
+  printf 'glibc %s\nglibcxx %s\n' "$req_glibc" "$req_glibcxx" > "$STAGE/share/kaikai/REQUIRES"
+  echo "    requires glibc >= $req_glibc, libstdc++ >= GLIBCXX_$req_glibcxx"
+fi
 
 # Assert the staged kaic2 actually carries the native backend (static
 # libLLVM linked IN). The whole point of the L3 static link is that the

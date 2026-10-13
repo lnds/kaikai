@@ -60,6 +60,7 @@ boot_platform() {
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64|Darwin-aarch64) echo darwin-arm64 ;;
     Linux-x86_64)                echo linux-x86_64 ;;
+    Linux-aarch64)               echo linux-aarch64 ;;
     *) return 1 ;;
   esac
 }

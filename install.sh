@@ -8,7 +8,7 @@
 # ~/.kaikai/bin to PATH. Independent of Homebrew; the two coexist.
 #
 # Supported platforms are the ones the release matrix publishes:
-# darwin-arm64 and linux-x86_64. Anything else exits with a clear
+# darwin-arm64, linux-x86_64 and linux-aarch64. Anything else exits with a clear
 # message rather than a 404. The binary is self-contained (libLLVM
 # linked statically), so no system LLVM is required.
 
@@ -28,9 +28,9 @@ need() {
 # ---- platform detection ----------------------------------------------------
 # Sets PLATFORM to the "<os>-<arch>" token naming the release tarball.
 # The token MUST match what scripts/build-release.sh emits on the release
-# runner, which uses a raw `uname -m`. Hence aarch64 is NOT folded into
-# arm64: a Linux arm64 tarball would be named linux-aarch64, so folding
-# would build a 404. Only Darwin's spelling is normalised.
+# runner, which uses a raw `uname -m`. Hence Linux's aarch64 is NOT folded
+# into arm64: that tarball is named linux-aarch64, so folding would build a
+# 404. Only Darwin's spelling is normalised.
 # tools/test-release-platforms.sh asserts both sides agree.
 detect_platform() {
   os="$(uname -s)"
@@ -42,8 +42,8 @@ detect_platform() {
   esac
   case "$os_name-$arch" in
     darwin-arm64|darwin-aarch64) arch_name="arm64" ;;
-    linux-x86_64)                arch_name="x86_64" ;;
-    *) err "unsupported platform '$os_name-$arch'. Published tarballs: darwin-arm64, linux-x86_64." ;;
+    linux-x86_64|linux-aarch64)  arch_name="$arch" ;;
+    *) err "unsupported platform '$os_name-$arch'. Published tarballs: darwin-arm64, linux-x86_64, linux-aarch64." ;;
   esac
   PLATFORM="$os_name-$arch_name"
 }
