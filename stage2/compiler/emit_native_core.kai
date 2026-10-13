@@ -29,6 +29,7 @@ import compiler.fnreg
 import compiler.fn_index
 import compiler.emit_shared
 import compiler.emit_native_modkey
+import compiler.emit_native_declenv
 import compiler.emit_native_fn
 import compiler.emit_native_test
 import compiler.emit_native
@@ -59,10 +60,11 @@ pub fn build_native_core_split(kp: KProgram, decls: [Decl], variants: [VariantEn
   } else {
     # A failed core emit degrades to the whole-program object, where a
     # codegen failure re-surfaces its diagnostics.
-    match ncore_obtain(kp, decls, variants, fns, bmode, src_path, core_fns, cfg, obj_path) {
+    let env = ndecl_env(kp, decls)
+    match ncore_obtain(kp, decls, variants, fns, bmode, src_path, core_fns, cfg, obj_path, env) {
       None -> ncore_whole(kp, decls, variants, fns, bmode, obj_path, src_path)
       Some(co) -> ncore_emit_user(kp, decls, variants, fns, bmode, src_path,
-                                  ncore_user_fns(nm, emit_fns, stems), obj_path, co)
+                                  ncore_user_fns(nm, emit_fns, stems), obj_path, co, env)
     }
   }
 }
@@ -73,7 +75,7 @@ pub fn build_native_core_reuse(kp: KProgram, decls: [Decl], variants: [VariantEn
     stats: Bool) : [String] / Console = {
   ncore_note(stats, "kaic2: native-core-obj: hit (core pruned)")
   let user = ncore_user_fns(kp_names(kp), kp.fns, ncore_stems(core_names))
-  ncore_emit_user(kp, decls, variants, fns, bmode, src_path, user, obj_path, core_obj)
+  ncore_emit_user(kp, decls, variants, fns, bmode, src_path, user, obj_path, core_obj, ndecl_env(kp, decls))
 }
 
 #[doc("The program without the fns nothing can reach: roots are the core partition, the root module's own fns, every FFI wrapper, every protocol impl the startup table registers, and in a test or bench build the runner bodies. Keeping the core whole keeps the cached core object program-invariant.")]
@@ -125,7 +127,7 @@ fn ncore_whole(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn]
 # build never depends on being able to write its cache.
 fn ncore_obtain(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
                 bmode: BuildMode, src_path: String, core_fns: [KFn],
-                cfg: NCoreCfg, obj_path: String) : Option[String] / Console + File = {
+                cfg: NCoreCfg, obj_path: String, env: NDeclEnv) : Option[String] / Console + File = {
   let core_obj = concat_all([cfg.dir, "/ncore-", ncore_key(kp, core_fns, cfg), ".o"])
   let hit = match read_file(core_obj) { Ok(_) -> true Err(_) -> false }
   let kept = hit or ncore_writes(core_obj)
@@ -134,7 +136,7 @@ fn ncore_obtain(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn
   } else { () }
   let dest = if kept { core_obj } else { cat2(obj_path, ".core.o") }
   if hit { ncore_recorded(cfg, core_obj) }
-  else if not ncore_emit(kp, decls, variants, fns, bmode, src_path, core_fns, NModSplitCore, "kai_native_core", dest) { None }
+  else if not ncore_emit(kp, decls, variants, fns, bmode, src_path, core_fns, NModSplitCore, "kai_native_core", dest, env) { None }
   else if kept { ncore_recorded(cfg, core_obj) }
   else { Some(dest) }
 }
@@ -158,8 +160,8 @@ fn ncore_note(stats: Bool, line: String) : Unit / Console = if stats { eprint(li
 # Emit the user partition and return the pair to link (user first).
 fn ncore_emit_user(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
                    bmode: BuildMode, src_path: String, user_fns: [KFn],
-                   obj_path: String, core_obj: String) : [String] / Console =
-  if ncore_emit(kp, decls, variants, fns, bmode, src_path, user_fns, NModSplitRoot, "kai_native", obj_path) {
+                   obj_path: String, core_obj: String, env: NDeclEnv) : [String] / Console =
+  if ncore_emit(kp, decls, variants, fns, bmode, src_path, user_fns, NModSplitRoot, "kai_native", obj_path, env) {
     [obj_path, core_obj]
   } else { [] }
 
@@ -169,11 +171,11 @@ fn ncore_emit_user(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [
 # writes byte-identical bytes.
 fn ncore_emit(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
               bmode: BuildMode, src_path: String, define_fns: [KFn],
-              role: NModRole, mod_name: String, obj: String) : Bool / Console = {
+              role: NModRole, mod_name: String, obj: String, env: NDeclEnv) : Bool / Console = {
   let m = llvm_module_new(mod_name)
   let ctx = native_ctx_new(m)
   nemit_build_module(ctx, kp, decls, variants, fns, bmode, src_path,
-                     define_fns, kp.fns, role)
+                     define_fns, kp.fns, role, env)
   if native_ctx_ok(ctx) == 1 { llvm_emit_object_raw(m, obj) == 0 }
   else {
     eprint("native: core-split partition not emitted — a KIR node is outside the current subset (see above)")
@@ -253,4 +255,4 @@ fn ncore_lam_is_core(sym: String, stems: [String]) : Bool = match stems {
 fn ncore_key(kp: KProgram, core_fns: [KFn], cfg: NCoreCfg) : String =
   uc_content_hex(concat_all([
     "NCO1\n", cfg.toolchain, "\n", cfg.edition, "\n", cfg.tag, "\n", cfg.srcs_hex, "\n",
-    nmodkey_of(kp, core_fns, "splitcore", false, BMBuild)]))
+    nmodkey_core(kp, core_fns)]))

@@ -1,95 +1,107 @@
-# compiler/emit_native_modkey.kai — the native-modular cache key.
-#
-# A partition's content-addressed object key is a hash of the KIR text that
-# feeds ITS codegen: the fns the partition DEFINES, plus the signatures of the
-# cross-TU callees those fns actually invoke. Keying on the referenced callees
-# (not every program signature) is what makes the cache INCREMENTAL: adding an
-# unrelated fn elsewhere leaves this partition's key untouched, so only the
-# partitions that changed re-emit.
-#
-# The anti-ABI-skew property is preserved. A callee's ownership/signature flip
-# changes its dumped signature, which changes the key of EVERY partition that
-# calls it, forcing their re-emit. There is no serialised ABI to go stale: the
-# key text itself carries every referenced callee's shape.
+#[doc("""
+The cache key of a native-modular partition.
+
+A partition's object is content-addressed: a hash of the text of
+everything it is emitted from. That is the functions it defines, body
+and declaration; the declaration of every function they call in another
+partition; the operations, in order, of every effect they perform; the
+handlers they install; and, for the partition that owns the program's
+singletons, the text of those.
+
+Keying on what a partition references, not on the whole program, keeps
+the cache incremental: a body edited in one module re-emits that
+module's partition alone, and so does a type, since a function's KIR
+already spells the layout it uses. Nothing serialised can go stale: the
+key text carries the shape of all the object depends on.
+""")]
 
 import compiler.util
+import compiler.ast
+import compiler.infer_index
 import compiler.kir
 import compiler.kir_syms
 import compiler.kir_dump
-import compiler.emit_shared
+import compiler.rt_name
+import compiler.emit_native_def
+import compiler.emit_native_fx
+import compiler.emit_native_declenv
+import compiler.emit_native_refs
 
-#[doc("The content-addressed cache key of a native-modular partition: a hash of the fns it defines plus the signatures of the cross-TU callees they invoke, in program order, and the build mode for a partition that carries the synthetic driver.")]
-pub fn nmodkey_of(kp: KProgram, define_fns: [KFn], role_tag: String,
-                  carries_driver: Bool, bmode: BuildMode) : String =
+#[doc("What every partition key of one build reads: the program, its declaration analyses, each function's declaration text by symbol, and the handler declarations the emitter resolves effects through.")]
+pub type NKeyCtx = { kp: KProgram, env: NDeclEnv, decls: NameIndex[NKeyDecl], handlers: [KHandlerDecl] }
+
+#[doc("A function's declaration text under its symbol. An index bucket holds every symbol that hashes alike, so each entry keeps its own and a lookup compares it.")]
+pub type NKeyDecl = { sym: String, text: String }
+
+#[doc("The key context of a build of `kp` under the declaration analyses `env`.")]
+pub fn nmodkey_ctx(kp: KProgram, env: NDeclEnv) : NKeyCtx =
+  NKeyCtx { kp: kp, env: env, decls: nmodkey_index(kp, env, kp_names(kp), kp.fns, idx_empty()),
+            handlers: list_append(kp.handlers, ndef_synth_handlers(kp.tab, kp.synth_defaults)) }
+
+fn nmodkey_index(kp: KProgram, env: NDeclEnv, nm: KNames, fns: [KFn], ix: NameIndex[NKeyDecl]) : NameIndex[NKeyDecl] = match fns {
+  [] -> ix
+  [f, ...rest] -> {
+    let sym = kfn_sym(nm, f)
+    nmodkey_index(kp, env, nm, rest, idx_prepend(ix, sym, NKeyDecl { sym: sym, text: ndecl_text(kp, env, f) }))
+  }
+}
+
+# The declaration text of the program function emitted as `sym`, empty for a
+# symbol the program does not define.
+fn nmodkey_decl(c: NKeyCtx, sym: String) : String = nmodkey_decl_in(idx_chain(c.decls, sym), sym)
+
+fn nmodkey_decl_in(ds: [NKeyDecl], sym: String) : String = match ds {
+  []           -> ""
+  [d, ...rest] -> if d.sym == sym { d.text } else { nmodkey_decl_in(rest, sym) }
+}
+
+#[doc("The declaration text of the program function `f`.")]
+pub fn nmodkey_decl_of(c: NKeyCtx, f: KFn) : String = nmodkey_decl(c, kfn_sym(kp_names(c.kp), f))
+
+#[doc("The content-addressed cache key of a partition that defines `define_fns`: a hash of those functions and their declarations, the declarations of the cross-TU callees they invoke, the operations of the effects they perform, the handlers they install, and `owned`, the text of what the partition emits that none of its functions names (empty for one that owns no singleton).")]
+pub fn nmodkey_of(c: NKeyCtx, define_fns: [KFn], role_tag: String, owned: String) : String = {
+  let nm = kp_names(c.kp)
+  let refs = nrefs_of(define_fns)
   nmodkey_hash(concat_all([
-    role_tag, "\n", nmodkey_driver_tag(carries_driver, bmode), "\n",
-    kir_dump_fns_pub(kp_names(kp), define_fns),
-    "; externs\n", nmodkey_dump_referenced_sigs(kp_names(kp), kp.fns, nmodkey_callees(define_fns))
+    role_tag, "\n", owned, "\n",
+    kir_dump_fns_pub(nm, define_fns),
+    "; declares\n", concat_all(map(define_fns, (f) => nmodkey_decl_of(c, f))),
+    "; externs\n", concat_all(map(list_reverse(refs.callees), (s) => nmodkey_decl(c, s))),
+    "; effects\n", concat_all(map(list_reverse(refs.effects), (e) => nmodkey_effect_text(c, e))),
+    "; handlers\n", concat_all(map(list_reverse(refs.installs), (h) => nmodkey_handler_text(c, h)))
   ]))
-
-# A partition that carries the synthetic `kai_main` driver has content no
-# `define_fns` entry names: the driver's calls and summary forwarder are chosen
-# from the build mode alone. Without folding it, the test-mode and bench-mode
-# roots of one source collide and whichever built first is the one that runs.
-# Leaf partitions hold no driver, so they stay mode-independent and keep
-# hitting across a `kai test` / `kai bench` alternation.
-fn nmodkey_driver_tag(carries_driver: Bool, bmode: BuildMode) : String =
-  if carries_driver { match bmode {
-    BMBuild -> "drv:build"  BMTest -> "drv:test"
-    BMBench -> "drv:bench"  BMCheck -> "drv:check"
-  } } else { "drv:none" }
-
-# The direct-call symbols the partition's fns invoke, across every block. Only
-# `KCall` / `KClosure` name a symbol; indirect calls carry a value,
-# and `KPerform` dispatches through the runtime — neither pins a cross-TU sig.
-fn nmodkey_callees(fns: [KFn]) : [String] = nmodkey_callees_loop(fns, [])
-fn nmodkey_callees_loop(fns: [KFn], acc: [String]) : [String] = match fns {
-  [] -> acc
-  [f, ...rest] -> nmodkey_callees_loop(rest, nmodkey_blocks(f.blocks, acc))
 }
 
-fn nmodkey_blocks(bs: [KBlock], acc: [String]) : [String] = match bs {
-  [] -> acc
-  [b, ...rest] -> nmodkey_blocks(rest, nmodkey_term(b.term, nmodkey_stmts(b.stmts, acc)))
+# A perform site reads the place of its operation among the effect's, off the
+# handler the emitter finds for that effect.
+fn nmodkey_effect_text(c: NKeyCtx, eff: SymId) : String = match nfx_find_handler_by_eff(c.handlers, eff) {
+  Some(h) -> concat_all(["effect ", rt_name(c.kp.tab, eff), " [", string_join(map(h.op_thunks, nmodkey_op_name), ", "), "]\n"])
+  None    -> ""
 }
 
-fn nmodkey_stmts(ss: [KStmt], acc: [String]) : [String] = match ss {
-  [] -> acc
-  [s, ...rest] -> nmodkey_stmts(rest, nmodkey_stmt(s, acc))
+fn nmodkey_op_name(t: KOpThunk) : String = match t { KOT(op, _, _) -> op }
+
+# An install site reads the whole declaration of its handler.
+fn nmodkey_handler_text(c: NKeyCtx, sym: String) : String = match nfx_find_handler(c.handlers, sym) {
+  Some(h) -> concat_all([
+    "handler ", rt_name(c.kp.tab, h.eff_sym), " ", h.sym, " [", string_join(map(h.op_thunks, nmodkey_op_text), ", "), "] ",
+    match h.ret_thunk { Some(r) -> r None -> "" }, "\n"
+  ])
+  None -> ""
 }
 
-fn nmodkey_stmt(s: KStmt, acc: [String]) : [String] = match s {
-  KLet(_, _, op, _) -> nmodkey_op(op, acc)
-  KDo(op, _)        -> nmodkey_op(op, acc)
-  _                 -> acc
+fn nmodkey_op_text(t: KOpThunk) : String = match t {
+  KOT(op, sym, arity) -> concat_all([op, "->", sym, "/", int_to_string(arity)])
 }
 
-fn nmodkey_op(op: KOp, acc: [String]) : [String] = match op {
-  KCall(sym, _)       -> nmodkey_add(acc, sym)
-  KClosure(sym, _, _) -> nmodkey_add(acc, sym)
-  _                   -> acc
-}
-
-fn nmodkey_term(t: KTerm, acc: [String]) : [String] = match t {
-  _                    -> acc
-}
-
-fn nmodkey_add(acc: [String], sym: String) : [String] =
-  if list_has(acc, sym) { acc } else { [sym, ...acc] }
-
-# Dump the signature of every program fn WHOSE SYMBOL a partition references,
-# walking `kp.fns` in program order so the text is deterministic regardless of
-# the callee-set discovery order.
-fn nmodkey_dump_referenced_sigs(nm: KNames, fns: [KFn], callees: [String]) : String =
-  nmodkey_dump_loop(nm, fns, callees, "")
-fn nmodkey_dump_loop(nm: KNames, fns: [KFn], callees: [String], acc: String) : String = match fns {
-  [] -> acc
-  [f, ...rest] ->
-    if list_has(callees, kfn_sym(nm, f)) {
-      nmodkey_dump_loop(nm, rest, callees, concat_all([acc, kir_dump_fn_sig_pub(nm, f), "\n"]))
-    } else {
-      nmodkey_dump_loop(nm, rest, callees, acc)
-    }
+#[doc("The key text of the split core, which calls into no other partition's analyses: a hash of the functions it defines and the signatures of the callees they invoke. Its sources are hashed beside this by its caller, and they are what its frames, attributes and effects derive from, so every program shares one core object.")]
+pub fn nmodkey_core(kp: KProgram, core_fns: [KFn]) : String = {
+  let nm = kp_names(kp)
+  let refs = nrefs_of(core_fns)
+  nmodkey_hash(concat_all([
+    "splitcore\n", kir_dump_fns_pub(nm, core_fns),
+    "; externs\n", concat_all(map(filter(kp.fns, (f) => nrefs_calls(refs, kfn_sym(nm, f))), (f) => cat2(kir_dump_fn_sig_pub(nm, f), "\n")))
+  ]))
 }
 
 # A stable, platform-independent content hash (djb2 over the bytes), masked to

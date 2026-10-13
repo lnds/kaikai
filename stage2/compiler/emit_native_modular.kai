@@ -28,6 +28,8 @@ import compiler.util
 import compiler.ast
 import compiler.kir
 import compiler.emit_native_modkey
+import compiler.emit_native_owned
+import compiler.emit_native_declenv
 import compiler.emit_native_fn
 import compiler.emit_native
 import compiler.emit_shared
@@ -40,11 +42,14 @@ pub fn build_native_modular(kp: KProgram, decls: [Decl], variants: [VariantEntry
                             : [String] / Console + File = {
   let emit_fns = kp.fns
   let mods = nmod_distinct_modules(emit_fns, [])
-  let root = nmod_emit_one(kp, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
+  # One key context for the build: every partition is keyed on, and emitted
+  # from, the same declaration analyses.
+  let kc = nmodkey_ctx(kp, ndecl_env(kp, decls))
+  let root = nmod_emit_one(kc, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
                            "__root__", nmod_fns_of(emit_fns, None), NModRoot)
   match root {
     None    -> []
-    Some(r) -> nmod_emit_leaves(kp, decls, variants, fns, bmode, src_path, out_dir,
+    Some(r) -> nmod_emit_leaves(kc, decls, variants, fns, bmode, src_path, out_dir,
                                 cache_dir, emit_fns, mods, [r])
   }
 }
@@ -75,17 +80,17 @@ fn nmod_mo_eq(a: Option[String], b: Option[String]) : Bool = match a {
 # Emit each leaf module, threading the accumulated object-path list. A partition
 # that fails codegen aborts the whole build (returns []), since a missing object
 # would break the link.
-fn nmod_emit_leaves(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+fn nmod_emit_leaves(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
                     bmode: BuildMode, src_path: String, out_dir: String,
                     cache_dir: Option[String], all_fns: [KFn], mods: [String],
                     acc: [String]) : [String] / Console + File = match mods {
   [] -> list_reverse(acc)
   [m, ...rest] -> {
-    let a = nmod_emit_one(kp, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
+    let a = nmod_emit_one(kc, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
                           nmod_stem(m), nmod_fns_of(all_fns, Some(m)), NModLeaf)
     match a {
       None    -> []
-      Some(x) -> nmod_emit_leaves(kp, decls, variants, fns, bmode, src_path, out_dir,
+      Some(x) -> nmod_emit_leaves(kc, decls, variants, fns, bmode, src_path, out_dir,
                                   cache_dir, all_fns, rest, [x, ...acc])
     }
   }
@@ -94,14 +99,14 @@ fn nmod_emit_leaves(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: 
 # Build one partition. On a cache hit (the content-addressed object already
 # exists) codegen is skipped and the cached path returned; otherwise the module
 # is built and emitted. Returns the object path, or `None` on a codegen failure.
-fn nmod_emit_one(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+fn nmod_emit_one(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
                  bmode: BuildMode, src_path: String, out_dir: String,
                  cache_dir: Option[String], stem: String, define_fns: [KFn],
                  role: NModRole) : Option[String] / Console + File = {
-  let key = nmod_cache_key(kp, define_fns, role, bmode)
+  let key = nmod_cache_key(kc, decls, variants, fns, bmode, define_fns, role)
   let obj = nmod_obj_path(out_dir, cache_dir, stem, key)
   if nmod_cached(cache_dir, obj) { Some(obj) }
-  else { nmod_build(kp, decls, variants, fns, bmode, src_path, stem, define_fns, role, obj) }
+  else { nmod_build(kc, decls, variants, fns, bmode, src_path, stem, define_fns, role, obj) }
 }
 
 # The object path: content-addressed `<cache_dir>/<key>.o` when a cache dir is
@@ -124,12 +129,12 @@ fn nmod_cached(cache_dir: Option[String], obj: String) : Bool / File = match cac
 # (no runtime-bitcode-merge, no internalise) emitter so cross-TU symbols keep
 # external linkage. A hit is probed by existence, so the emitter publishes the
 # object atomically and a concurrent build never sees it half-written.
-fn nmod_build(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+fn nmod_build(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
               bmode: BuildMode, src_path: String, stem: String,
               define_fns: [KFn], role: NModRole, obj: String) : Option[String] / Console + File = {
   let m = llvm_module_new(cat2("kai_native_", stem))
   let ctx = native_ctx_new(m)
-  nemit_build_module(ctx, kp, decls, variants, fns, bmode, src_path, define_fns, kp.fns, role)
+  nemit_build_module(ctx, kc.kp, decls, variants, fns, bmode, src_path, define_fns, kc.kp.fns, role, kc.env)
   if native_ctx_ok(ctx) == 1 {
     if llvm_emit_object_raw(m, obj) != 0 { None } else { Some(obj) }
   } else {
@@ -138,13 +143,15 @@ fn nmod_build(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn],
   }
 }
 
-# The partition's content-addressed cache key: the fns it DEFINES plus the
-# signatures of the cross-TU callees they invoke (see emit_native_modkey). Keying
-# on referenced callees, not every program signature, keeps the cache
-# incremental — an unrelated fn added elsewhere leaves this key untouched.
-fn nmod_cache_key(kp: KProgram, define_fns: [KFn], role: NModRole,
-                  bmode: BuildMode) : String =
-  nmodkey_of(kp, define_fns, nmod_role_tag(role), nmod_owns_singletons(role), bmode)
+# The partition's content-addressed cache key (see emit_native_modkey). The
+# owner of the singletons emits them too, a thunk for every program fn among
+# them, so its key folds their text; a leaf's stays free of the build mode.
+fn nmod_cache_key(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+                  bmode: BuildMode, define_fns: [KFn], role: NModRole) : String =
+  nmodkey_of(kc, define_fns, nmod_role_tag(role),
+             if nmod_owns_singletons(role) {
+               nowned_text(kc.kp, decls, variants, fns, bmode, kc.kp.fns, (f) => nmodkey_decl_of(kc, f))
+             } else { "" })
 
 fn nmod_role_tag(role: NModRole) : String = match role {
   NModWhole -> "whole"  NModRoot -> "root"  NModLeaf -> "leaf"
