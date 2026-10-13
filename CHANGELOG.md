@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.150.0 (2026-10-13)
+
+### BREAKING CHANGE
+
+- inside a const initialiser, `m.x` with `m` an imported
+module now names the module's `x`, as in a function body. A const that
+shares the module's name no longer wins there.
+
+### Added
+
+- **stdlib**: Process.uid returns the effective uid of the running process (#2793)
+
+### Fixed
+
+- **resolve**: a const initialiser resolves module-qualified names as a function body does (#2794)
+- **resolve**: a suffixed literal inside an interpolation needs its import like one outside it (#2796)
+- **emit**: a comparison reaches a member's impl through Option, Result and generic impls (#2792)
+- **emit**: a native partition's cached object is keyed on everything it is emitted from (#2791)
+
+### Changed
+
+- **emit**: a native partition emits the thunks of its own functions, and only those taken as values (#2795)
+
 ## v0.149.0 (2026-10-13)
 
 ### BREAKING CHANGE
