@@ -26,6 +26,10 @@ shapes it always saw:
   - `SfTuple(elems)`                -> `Pair`/`Triple`/`Quad` record
     literal; `PsTuple` -> the variant-record pattern; `TsTuple` ->
     `Pair[..]`/`Triple[..]`/`Quad[..]`.
+  - `"a#{x}"`                       -> `string_concat_all(["a",
+    show(x)])`, each `#{...}` body parsed where it stands and lowered
+    like any other expression; the `show` is a `MkInterpShow` mark
+    until the protocols are registered.
 
 The type walk visits every `TypeExpr` position a declaration can
 carry — signatures, type bodies, effect/protocol ops, annotations,
@@ -33,7 +37,8 @@ row-label arguments — because a tuple type can appear in any of them.
 
 The driver runs `surface_lower_decls` once, on the flat post-import
 decl list; no `ESurface` / `TySurface` / `PSurface` / `SAssign`
-survives it.
+survives it, and a string that still interpolates is one whose body
+does not parse.
 """)]
 
 import compiler.util
@@ -45,6 +50,7 @@ import compiler.ast_map
 import compiler.parse
 import compiler.refinements
 import compiler.interp_pattern
+import compiler.interp_holes
 import compiler.multi_match
 import compiler.underscore_binders
 import compiler.tbinder
@@ -53,14 +59,9 @@ import compiler.core_types
 import compiler.lazy_seq
 
 #[doc("Lower every surface-fidelity node in the decl list; the result is the AST the rest of the pipeline consumes.")]
-pub fn surface_lower_decls(ds: [Decl], tab: SymTab) : [Decl] = map(ds, (d) => sfl_decl(d, tab))
+pub fn surface_lower_decls(ds: [Decl], tab: SymTab) : [Decl] / Console = map(ds, (d) => sfl_decl(d, tab))
 
-# String-interpolation content is parsed after the decl-level pass ran,
-# so that late parse re-enters lowering through this entry point.
-#[doc("Lower the surface-fidelity nodes of one expression parsed after the decl pass.")]
-pub fn surface_lower_expr(e: Expr) : Expr = sfl_expr(e)
-
-fn sfl_decl(d: Decl, tab: SymTab) : Decl = match d {
+fn sfl_decl(d: Decl, tab: SymTab) : Decl / Console = match d {
   DFn(is_pub, fid, tps, ps, ret, row, body, l, c, mo) ->
     DFn(is_pub, fid, map(tps, tb_unbounded), sfl_params(ps),
         sfl_ty_opt(ret), sfl_row(row), sfl_fn_body(body, ps, tab, fid), l, c, mo)
@@ -97,7 +98,7 @@ fn sfl_decl(d: Decl, tab: SymTab) : Decl = match d {
 # Contract clauses are legal only at the top of a fn body, where the
 # owning decl supplies the params their lowering needs and the name
 # their violation message spells.
-fn sfl_fn_body(body: Expr, ps: [Param], tab: SymTab, owner: FnId) : Expr = match body.kind {
+fn sfl_fn_body(body: Expr, ps: [Param], tab: SymTab, owner: FnId) : Expr / Console = match body.kind {
   ESurface(sf) -> match sf {
     SfContract(reqs, enss, inner) ->
       wrap_with_contracts(sfl_expr(inner), map(reqs, (e) => sfl_expr(e)),
@@ -133,9 +134,11 @@ fn sfl_fn_body(body: Expr, ps: [Param], tab: SymTab, owner: FnId) : Expr = match
   _ -> sfl_expr(body)
 }
 
-fn sfl_mmarm(a: MMArm) : MMArm = match a {
+fn sfl_mmarm(a: MMArm) : MMArm / Console = match a {
   MMArm(pats, guard, body) ->
-    ipat_mmarm(MMArm(map(pats, (x) => sfl_pat(x)), sfl_opt(guard), sfl_expr(body)))
+    match ipat_mmarm(MMArm(map(pats, (x) => sfl_pat(x)), guard, body)) {
+      MMArm(pats2, guard2, body2) -> MMArm(pats2, sfl_opt(guard2), sfl_expr(body2))
+    }
 }
 
 fn sfl_mmarm_to_arm(a: MMArm) : Arm = match a {
@@ -148,13 +151,13 @@ fn sfl_mmarm_to_arm(a: MMArm) : Arm = match a {
 fn sfl_param_var(pm: Param) : Expr = mk_expr(EName(pm.binder.name), pm.pline, pm.pcol)
 
 
-fn sfl_default(o: Option[DefaultBlock]) : Option[DefaultBlock] = match o {
+fn sfl_default(o: Option[DefaultBlock]) : Option[DefaultBlock] / Console = match o {
   None -> None
   Some(DBlk(cs, ret, l, c)) ->
     Some(DBlk(map(cs, (cl) => sfl_hclause(cl)), sfl_hreturn_opt(ret), l, c))
 }
 
-fn sfl_expr(e: Expr) : Expr = match e.kind {
+fn sfl_expr(e: Expr) : Expr / Console = match e.kind {
   ESurface(sf) -> match sf {
     SfEnsure(value, pred) -> sfl_ensure(sfl_expr(value), sfl_expr(pred), e.line, e.col)
     SfContract(_, _, _) -> panic("surface_lower: contract clauses outside a fn body")
@@ -196,11 +199,15 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
     SfLazy(bracket) ->
       lazy_lower(sfl_rebuild(bracket, prc_map_expr_kind(bracket.kind, (x) => sfl_expr(x))), e.line, e.col)
   }
+  EStr(span, is_triple) -> match interp_pieces(span, is_triple, e.line, e.col) {
+    Some(ps) -> sfl_interp(ps, e.line, e.col)
+    None     -> e
+  }
   # EMatch and EBlock carry patterns / statement shapes the generic
   # child-mapper does not rewrite; ELambda / EHandle / EVariantsOf
   # carry type annotations it does not reach. They recurse here.
   EMatch(scrut, arms) ->
-    sfl_rebuild(e, EMatch(sfl_expr(scrut), map(arms, (a) => ub_arm(ipat_arm(sfl_arm(a))))))
+    sfl_rebuild(e, EMatch(sfl_expr(scrut), map(arms, (a) => ub_arm(sfl_arm(a)))))
   EBlock(stmts, tail) -> {
     let t = sfl_opt(tail)
     sfl_rebuild(e, EBlock(ub_block(map(stmts, (st) => sfl_stmt(st)), t), t))
@@ -217,7 +224,7 @@ fn sfl_expr(e: Expr) : Expr = match e.kind {
 fn sfl_rebuild(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-fn sfl_opt(o: Option[Expr]) : Option[Expr] = match o {
+fn sfl_opt(o: Option[Expr]) : Option[Expr] / Console = match o {
   None -> None
   Some(x) -> Some(sfl_expr(x))
 }
@@ -254,6 +261,17 @@ fn sfl_stepped_range(first: Expr, second: Expr, last: Expr, line: Int, col: Int)
   }
 }
 
+# `"a#{x}"` expansion. Each part keeps the position it has inside the
+# literal: passes that name a temporary after a position tell the parts
+# of one string apart.
+fn sfl_interp(ps: [InterpPiece], line: Int, col: Int) : Expr / Console {
+  let parts = map(ps, (p) => ElPlain(match p {
+    IpcText(quoted, at) -> mk_expr(EStr(quoted, false), at.line, at.col)
+    IpcHole(x)          -> mk_expr(ECall(mk_expr(EMark(MkInterpShow), x.line, x.col), [sfl_expr(x)]), x.line, x.col)
+  }))
+  mk_expr(ECall(mk_name("string_concat_all", line, col), [mk_expr(EList(parts), line, col)]), line, col)
+}
+
 # `123n` expansion: `from_literal("123")` of the module that declares
 # `BigInt`, by id, so the qualifier the file binds that module under
 # does not matter. The scope check reports a file that never imports it.
@@ -274,13 +292,13 @@ fn sfl_coll_call(mod: String, fn_name: String, args: [Expr], line: Int, col: Int
   mk_expr(ECall(callee, args), line, col)
 }
 
-fn sfl_spread(o: Option[Expr]) : Option[Expr] = match o {
+fn sfl_spread(o: Option[Expr]) : Option[Expr] / Console = match o {
   None -> None
   Some(b) -> Some(sfl_expr(b))
 }
 
 # Re-pair a map literal's flattened `[k1, v1, ...]` children.
-fn sfl_pairs(flat: [Expr]) : [Expr] = map(flat, (x) => sfl_expr(x))
+fn sfl_pairs(flat: [Expr]) : [Expr] / Console = map(flat, (x) => sfl_expr(x))
 
 # `%{}` -> map.empty(); `%{ k: v }` -> map.from([Pair]); with a spread,
 # a `map.put` chain over the base so a repeated key's override wins.
@@ -327,7 +345,7 @@ fn sfl_set_inserts(base: Expr, elems: [Expr], line: Int, col: Int) : Expr = matc
     sfl_set_inserts(sfl_coll_call("set", "insert", [base, e], line, col), rest, line, col)
 }
 
-fn sfl_stmt(st: Stmt) : Stmt = match st {
+fn sfl_stmt(st: Stmt) : Stmt / Console = match st {
   SAssign(lhs, v, l, c) -> {
     let setter = mk_expr(EField(sfl_expr(lhs), "set"), l, c)
     SExprStmt(mk_expr(ECall(setter, [sfl_expr(v)]), l, c))
@@ -344,7 +362,7 @@ fn sfl_stmt(st: Stmt) : Stmt = match st {
 # in reach: `name : Base where pred` becomes `PBind(name)` plus a guard
 # `{ let self = name; pred }`, welded ahead of any user guard with `and`
 # so a violated refinement short-circuits before the user predicate.
-fn sfl_arm(a: Arm) : Arm = match a {
+fn sfl_arm(a: Arm) : Arm / Console = match a {
   Arm(pat, guard, body) -> match pat.pkind {
     PSurface(ps) -> match ps {
       PsRefine(name, ty) ->
@@ -352,13 +370,19 @@ fn sfl_arm(a: Arm) : Arm = match a {
             Some(sfl_weld_guard(sfl_refine_guard(name, ty, pat.line, pat.col),
                                 sfl_opt(guard))),
             sfl_expr(body))
-      _ -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
+      _ -> sfl_arm_exprs(ipat_arm(Arm(sfl_pat(pat), guard, body)))
     }
-    _ -> Arm(sfl_pat(pat), sfl_opt(guard), sfl_expr(body))
+    _ -> sfl_arm_exprs(ipat_arm(Arm(sfl_pat(pat), guard, body)))
   }
 }
 
-fn sfl_refine_guard(name: String, ty: TypeExpr, line: Int, col: Int) : Expr =
+# An interpolated string pattern hands its string to the guard, so the
+# guard is lowered after the pattern settled.
+fn sfl_arm_exprs(a: Arm) : Arm / Console = match a {
+  Arm(pat, guard, body) -> Arm(pat, sfl_opt(guard), sfl_expr(body))
+}
+
+fn sfl_refine_guard(name: String, ty: TypeExpr, line: Int, col: Int) : Expr / Console =
   match ty.tkind {
     TyRefine(_, pred) -> {
       let self_let = SLet(mk_pat(PBind(binder_written("self")), line, col), None,
@@ -373,16 +397,16 @@ fn sfl_weld_guard(narrow: Expr, user: Option[Expr]) : Expr = match user {
   Some(u) -> mk_expr(EBinop(BoAnd, narrow, u), narrow.line, narrow.col)
 }
 
-fn sfl_hclause(cl: HClause) : HClause = match cl {
+fn sfl_hclause(cl: HClause) : HClause / Console = match cl {
   HC(n, ps, body, l, c) -> HC(n, sfl_params(ps), sfl_expr(body), l, c)
 }
 
-fn sfl_hreturn_opt(o: Option[HReturn]) : Option[HReturn] = match o {
+fn sfl_hreturn_opt(o: Option[HReturn]) : Option[HReturn] / Console = match o {
   None -> None
   Some(HR(n, body, l, c)) -> Some(HR(n, sfl_expr(body), l, c))
 }
 
-fn sfl_pat(p: Pattern) : Pattern = match p.pkind {
+fn sfl_pat(p: Pattern) : Pattern / Console = match p.pkind {
   PSurface(ps) -> match ps {
     PsTuple(pats) ->
       mk_pat(PVariantRecord(sfl_tuple_ref(list_length(pats)),
@@ -418,13 +442,13 @@ fn sfl_qualified(q: String, sub: Pattern, line: Int, col: Int) : Pattern = match
   _ -> sub
 }
 
-fn sfl_pfield(f: PField) : PField = match f {
+fn sfl_pfield(f: PField) : PField / Console = match f {
   PField(name, sub, is_short) -> PField(name, sfl_pat(sub), is_short)
 }
 
 # ---- type walk ------------------------------------------------------
 
-fn sfl_ty(t: TypeExpr) : TypeExpr = match t.tkind {
+fn sfl_ty(t: TypeExpr) : TypeExpr / Console = match t.tkind {
   TySurface(ts) -> match ts {
     TsTuple(tys) ->
       mk_ty(TyName(sfl_tuple_ref(list_length(tys)), map(tys, (x) => sfl_ty(x))),
@@ -441,52 +465,52 @@ fn sfl_ty(t: TypeExpr) : TypeExpr = match t.tkind {
   TyParam(id, tys)  -> mk_ty(TyParam(id, map(tys, (x) => sfl_ty(x))), t.line, t.col)
 }
 
-fn sfl_ty_opt(o: Option[TypeExpr]) : Option[TypeExpr] = match o {
+fn sfl_ty_opt(o: Option[TypeExpr]) : Option[TypeExpr] / Console = match o {
   None -> None
   Some(t) -> Some(sfl_ty(t))
 }
 
-fn sfl_row(r: RowExpr) : RowExpr = match r {
+fn sfl_row(r: RowExpr) : RowExpr / Console = match r {
   REmpty -> REmpty
   RClosed(labels) -> RClosed(map(labels, (rl) => sfl_row_label(rl)))
   ROpen(tail, labels) -> ROpen(tail, map(labels, (rl) => sfl_row_label(rl)))
 }
 
-fn sfl_row_label(rl: RowLabel) : RowLabel = match rl {
+fn sfl_row_label(rl: RowLabel) : RowLabel / Console = match rl {
   RL(n, tys) -> RL(n, map(tys, (x) => sfl_ty(x)))
 }
 
-fn sfl_params(ps: [Param]) : [Param] = map(ps, (pm) => sfl_param(pm))
+fn sfl_params(ps: [Param]) : [Param] / Console = map(ps, (pm) => sfl_param(pm))
 
-fn sfl_param(pm: Param) : Param =
+fn sfl_param(pm: Param) : Param / Console =
   Param { binder: pm.binder, ptype: sfl_ty_opt(pm.ptype), pline: pm.pline,
           pcol: pm.pcol, pborrow: pm.pborrow }
 
-fn sfl_type_body(b: TypeBody) : TypeBody = match b {
+fn sfl_type_body(b: TypeBody) : TypeBody / Console = match b {
   TBAlias(t)     -> TBAlias(sfl_ty(t))
   TBRecord(fs)   -> TBRecord(map(fs, (f) => sfl_field_decl(f)))
   TBSum(vs)      -> TBSum(map(vs, (v) => sfl_variant(v)))
   TBEffectAlias(_) -> b
 }
 
-fn sfl_field_decl(f: FieldDecl) : FieldDecl = match f {
+fn sfl_field_decl(f: FieldDecl) : FieldDecl / Console = match f {
   FD(is_pub, n, t, attrs) -> FD(is_pub, n, sfl_ty(t), attrs)
 }
 
-fn sfl_variant(v: Variant) : Variant = match v {
+fn sfl_variant(v: Variant) : Variant / Console = match v {
   Var(n, tys) -> Var(n, map(tys, (x) => sfl_ty(x)))
 }
 
-fn sfl_extern_body(b: ExternTypeBody) : ExternTypeBody = match b {
+fn sfl_extern_body(b: ExternTypeBody) : ExternTypeBody / Console = match b {
   ETStruct(fs) -> ETStruct(map(fs, (f) => sfl_field_decl(f)))
   ETOpaque     -> b
 }
 
-fn sfl_effect_op(op: EffectOp) : EffectOp = match op {
+fn sfl_effect_op(op: EffectOp) : EffectOp / Console = match op {
   EffOp(n, tps, ps, ret, l, c) -> EffOp(n, tps, sfl_params(ps), sfl_ty(ret), l, c)
 }
 
-fn sfl_proto_op(op: ProtoOp) : ProtoOp = match op {
+fn sfl_proto_op(op: ProtoOp) : ProtoOp / Console = match op {
   POp(n, tps, ps, ret, l, c) -> POp(n, tps, sfl_params(ps), sfl_ty(ret), l, c)
 }
 

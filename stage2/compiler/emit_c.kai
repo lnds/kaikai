@@ -23,9 +23,9 @@
 # Public surface: 17 fns + 1 type. Entry points the driver calls:
 # `emit_program` (the C emitter), `tcrec_rewrite_decls` (the TCO
 # pre-pass), the `--dump-mono` / `--dump-types` queries, the pre-emit
-# alias-expansion / index- and interp-desugar passes
+# alias-expansion and index-desugar passes
 # (`expand_aliases_in_decls`, `expand_ta_decls`, `desugar_index_decls`,
-# `desugar_interp_decls`, `resolve_alias_cands`, the `collect_*` alias
+# `resolve_alias_cands`, the `collect_*` alias
 # scanners), `report_unused_in_decls`, and
 # `mangle_core_segments`. `BuildMode` (build/test/bench/check wrapper
 # selection) moves here `pub` — `emit_program` matches on it and the
@@ -44,7 +44,6 @@
 import compiler.site_ids
 import compiler.ast
 import compiler.real_lit
-import compiler.decl_map
 import compiler.entry
 import compiler.core_protos
 import compiler.core_types
@@ -66,7 +65,6 @@ import compiler.diag
 import compiler.util
 import compiler.rows
 import compiler.parse
-import compiler.surface_lower
 import compiler.resolve_names
 import compiler.resolve_rows
 import compiler.refinements
@@ -81,13 +79,7 @@ import compiler.modules
 import compiler.modules_segments
 import compiler.modules_homes
 import compiler.module_table
-import compiler.qual_head
 import compiler.infer_index
-import compiler.name_uses
-import compiler.type_scope_table
-import compiler.type_scope
-import compiler.effect_scope_table
-import compiler.effect_scope
 import compiler.core_prims
 import compiler.native_prims
 import compiler.core_builtins
@@ -104,8 +96,6 @@ import compiler.perceus_payer
 import compiler.perceus_arg_reads
 import compiler.perceus_reads
 import compiler.perceus_read_walk
-import compiler.protos_names
-import compiler.protos_register
 import compiler.protos_derive_binser
 import compiler.emit_shared
 import compiler.handle_caps
@@ -147,19 +137,15 @@ import compiler.core_effects
 import compiler.effect_alias
 import compiler.evidence_frame
 import compiler.expr_positions
-import compiler.scope_file
 import compiler.self_call
 import compiler.symtab
 import compiler.written
 import compiler.decl_text
 import compiler.local_names
 import compiler.spec_names
-import compiler.ast_map
 import compiler.handler_alias
 import compiler.tbinder
 import compiler.fmt_names
-import compiler.tparam_bind
-import compiler.module_tables
 
 # ====================================================================
 
@@ -9511,415 +9497,6 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
                                    desugar_index_opt(tail))
     _ -> map_expr_kind(k, desugar_index_expr)
   }
-}
-
-# Everything the re-parsed body of a `#{...}` span must inherit from
-# its environment. The lift parses that span long after the whole-
-# program passes ran, so each table a pass consumed has to reach the
-# sub-tree through this record: the reading decl's segmented module
-# table (import aliases are per file) rides in `cs.mt`, the const
-# collision context is keyed by the decl's home. Growing the inherited
-# environment means growing this record, not another parameter thread.
-# `locals` holds the names lexically bound where the span sits. The
-# fragment is parsed with no surrounding scope, so without it the
-# qualified-call resolver reads `pa.Node` against the module table and
-# a local `pa` that shadows module `pa` loses its projection.
-type InterpCtx = { file: String, cs: CSCtx, show: Option[ExprKind],
-                   ts: Option[TSCtx], es: Option[ESCtx], locals: [String],
-                   # the type parameters of the declaration the spans sit in
-                   tps: [TBinder] }
-
-#[doc("Emit-layer entry point desugar_interp_decls. `show` names the dispatcher of the core `Show` every `#{...}` calls: user code reaches it through its home, so only that home's protocols answer; `None` leaves the op a bare name. `cores` names the core modules, whose own interpolations reach it bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
-pub fn desugar_interp_decls(ds: [Decl],
-      tabs: ModTables, imps: [ModImports], coll: [NEnt],
-      ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews,
-      target: String, file: String, show: Option[ShowRef],
-      cores: [String]) : [Decl] / Console + File =
-  desugar_interp_decls_loop(ds, None, tabs,
-                            coll, ts_coll, es_coll, tab, views, imps,
-                            target, file, show, cores, target, [])
-
-fn desugar_interp_decls_loop(ds: [Decl], prev: Option[InterpCtx],
-      tabs: ModTables, coll: [NEnt],
-      ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews, imps: [ModImports],
-      target: String, file: String, show: Option[ShowRef], cores: [String],
-      cur: String, acc: [Decl]) : [Decl] / Console + File {
-
-  match ds {
-    [] -> list_reverse(acc)
-    [d, ...rest] -> {
-      let home = nu_reader_home(d, cur, target)
-      let cx = interp_module_ctx(prev, home, tabs, coll, ts_coll, es_coll, tab, views, imps,
-                                 target, file, show, cores)
-      desugar_interp_decls_loop(rest, Some(cx), tabs,
-                                coll, ts_coll, es_coll, tab, views, imps,
-                                target, file, show, cores, home,
-                                [desugar_interp_decl(d, cx), ...acc])
-    }
-  }
-}
-
-# A module's context is built once: consecutive declarations share their home.
-fn interp_module_ctx(prev: Option[InterpCtx], home: String,
-      tabs: ModTables, coll: [NEnt],
-      ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews, imps: [ModImports],
-      target: String, file: String, show: Option[ShowRef], cores: [String]) : InterpCtx = match prev {
-  Some(p) if p.cs.home == home -> p
-  _ -> {
-    let seg = if home == target { "" } else { home }
-    InterpCtx { file: file,
-                cs: CSCtx { coll: coll, home: home, target: target,
-                            free: false,
-                            mt: mtabs_of(tabs, seg) },
-                show: interp_show_from(show, list_has(cores, home)),
-                ts: if list_length(ts_coll) == 0 { None }
-                    else { Some(ts_ctx(ts_coll, home, target, cores, tabs, imps, [])) },
-                es: if list_length(es_coll) == 0 { None }
-                    else { Some(es_ctx(home, target, tabs, tab, views)) },
-                locals: [], tps: [] }
-  }
-}
-
-# `cx` with `names` added to the lexical scope the spans below sit in.
-fn interp_bind(cx: InterpCtx, names: [String]) : InterpCtx =
-  InterpCtx { file: cx.file,
-              cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
-              locals: list_append(names, cx.locals), tps: cx.tps }
-
-fn interp_in_fn(cx: InterpCtx, tps: [TBinder], ps: [Param]) : InterpCtx =
-  InterpCtx { file: cx.file,
-              cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
-              locals: list_append(interp_param_names(ps), cx.locals), tps: tps }
-
-# The lift runs on parser output, where a binder is the name it was
-# written with.
-fn interp_param_names(ps: [Param]) : [String] = map(ps, (p) => written_text(p.binder.name))
-
-fn interp_pat_names(pat: Pattern) : [String] = map(pat_bindings(pat, []), (b) => written_text(b.name))
-
-# Every declaration form the resolver walks is lifted, so no span
-# reaches it as text.
-fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File =
-  decl_map_inner(d, (x) => desugar_interp_leaf(x, cx))
-
-fn desugar_interp_leaf(d: Decl, cx: InterpCtx) : Decl / Console + File {
-
-  match d {
-    DConst(p, s, ty, body, mo, l, c) ->
-      DConst(p, s, ty, desugar_interp_expr(body, cx), mo, l, c)
-    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(p, fid, tps, ps, ret, row,
-          desugar_interp_expr(body, interp_in_fn(cx, tps, ps)), l, c, mo)
-    DTest(desc, body, l, c, mo) ->
-      DTest(desc, desugar_interp_expr(body, cx), l, c, mo)
-    DBench(desc, body, l, c, mo) ->
-      DBench(desc, desugar_interp_expr(body, cx), l, c, mo)
-    DCheck(desc, ps, body, l, c, mo) ->
-      DCheck(desc, ps,
-             desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), l, c, mo)
-    _ -> d
-  }
-}
-
-fn desugar_interp_expr(e: Expr, cx: InterpCtx) : Expr / Console + File =
-
-  Expr { kind: desugar_interp_kind(e.kind, cx, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
-
-fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
-                        line: Int, col: Int) : ExprKind / Console + File {
-
-  match k {
-    # An EStr with `#{...}` interpolation lifts into a
-    # `string_concat_all([...])` call so the typer sees the interp
-    # body's typed expressions and protocol ops route through the
-    # user's `impl Show for T`.
-    EStr(span, is_triple) -> {
-      let n = string_length(span)
-      let body_start = if is_triple { 3 } else { 1 }
-      let body_end = if is_triple { n - 3 } else { n - 1 }
-      if has_interp(span, body_start, body_end) {
-        lift_interp_string(span, body_start, body_end, cx, line, col)
-      } else { k }
-    }
-    ECall(c, args_) -> ECall(desugar_interp_expr(c, cx),
-                              map(args_, (a) => desugar_interp_expr(a, cx)))
-    # Inlined from `map_expr_kind` for issue #528 (effect-row propagation
-    # blocked by stage 1's lack of row polymorphism on function-param types).
-    EInt(_, _)        -> k
-    EReal(_, _)       -> k
-    EIntLit(_)        -> k
-    EDecimalLit(_)    -> k
-    EFixed(_, _)      -> k
-    EBool(_)       -> k
-    EChar(_)       -> k
-    EUnit          -> k
-    EName(_)        -> k
-    EMark(_)        -> k
-    ESym(_, _)      -> k
-    ELocal(_)       -> k
-    EOp(_)          -> k
-    EUnder         -> k
-    EPlaceholder   -> k
-    EHole(_)       -> k
-    ETodo(_)       -> k
-    EExternBody(_, _) -> k
-    EVariantsOf(_, _) -> k
-    EModCall(_, _) -> k
-    EIntrinsic(name, args_) ->
-      EIntrinsic(name, map(args_, (a) => desugar_interp_expr(a, cx)))
-    ESurface(sf) ->
-      ESurface(surface_rebuild(sf, map(surface_children(sf), (a) => desugar_interp_expr(a, cx))))
-    EField(base, name)   -> EField(desugar_interp_expr(base, cx), name)
-    EIndex(a, b)         -> EIndex(desugar_interp_expr(a, cx),
-                                    desugar_interp_expr(b, cx))
-    EBinop(op, a, b)     -> EBinop(op, desugar_interp_expr(a, cx),
-                                        desugar_interp_expr(b, cx))
-    EUnop(op, x)         -> EUnop(op, desugar_interp_expr(x, cx))
-    EIf(c, t_, eo)       -> EIf(desugar_interp_expr(c, cx),
-                                  desugar_interp_expr(t_, cx),
-                                  desugar_interp_expr_opt(eo, cx))
-    EMatch(scr, arms)    -> EMatch(desugar_interp_expr(scr, cx),
-                                     desugar_interp_arms(arms, cx))
-    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, interp_bind(cx, interp_param_names(ps))))
-    ERecordLit(rh, fs)   -> ERecordLit(rh, desugar_interp_fields_init(fs, cx))
-    EList(els)           -> EList(desugar_interp_list_elems(els, cx))
-    ERange(a, b, opt_step) -> ERange(desugar_interp_expr(a, cx),
-                                       desugar_interp_expr(b, cx),
-                                       desugar_interp_expr_opt(opt_step, cx))
-    EBlock(stmts, tail)  -> match desugar_interp_block(stmts, cx, []) {
-      IBlk(ss, cx1) -> EBlock(ss, desugar_interp_expr_opt(tail, cx1))
-    }
-    EPipe(a, b)          -> EPipe(desugar_interp_expr(a, cx),
-                                    desugar_interp_expr(b, cx))
-    EMapPipe(a, b)       -> EMapPipe(desugar_interp_expr(a, cx),
-                                       desugar_interp_expr(b, cx))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(desugar_interp_expr(a, cx),
-                                            desugar_interp_expr(b, cx))
-    EFilterPipe(a, b)    -> EFilterPipe(desugar_interp_expr(a, cx),
-                                           desugar_interp_expr(b, cx))
-    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(desugar_interp_expr(body, cx), eff, eff_tyargs,
-              desugar_interp_expr_opt(init_opt, cx), alias_opt,
-              desugar_interp_hclauses(clauses, cx),
-              desugar_interp_hreturn_opt(ret_opt, cx))
-    ELitUnit(inner, u)   -> ELitUnit(desugar_interp_expr(inner, cx), u)
-    EBang(inner)         -> EBang(desugar_interp_expr(inner, cx))
-  }
-}
-
-# Issue #528 helpers for `desugar_interp_kind` — direct walkers that
-# replace the `map_expr_kind` HOF call. Stage 1 cannot parse row
-# polymorphism on function-param types.
-fn desugar_interp_expr_opt(opt: Option[Expr], cx: InterpCtx) : Option[Expr] / Console + File = match opt {
-  None    -> None
-  Some(x) -> Some(desugar_interp_expr(x, cx))
-}
-
-fn desugar_interp_arms(arms: [Arm], cx: InterpCtx) : [Arm] / Console + File = match arms {
-  []           -> []
-  [h, ...rest] -> [desugar_interp_arm(h, cx), ...desugar_interp_arms(rest, cx)]
-}
-
-fn desugar_interp_arm(a: Arm, cx: InterpCtx) : Arm / Console + File = match a {
-  Arm(pat, guard_opt, body) -> {
-    let cxa = interp_bind(cx, interp_pat_names(pat))
-    Arm(pat,
-        desugar_interp_expr_opt(guard_opt, cxa),
-        desugar_interp_expr(body, cxa))
-  }
-}
-
-fn desugar_interp_fields_init(fs: [FieldInit], cx: InterpCtx) : [FieldInit] / Console + File = match fs {
-  []           -> []
-  [h, ...rest] -> [desugar_interp_field_init(h, cx),
-                   ...desugar_interp_fields_init(rest, cx)]
-}
-
-fn desugar_interp_field_init(fi: FieldInit, cx: InterpCtx) : FieldInit / Console + File = match fi {
-  FI(name, e) -> FI(name, desugar_interp_expr(e, cx))
-}
-
-fn desugar_interp_list_elems(els: [ListElem], cx: InterpCtx) : [ListElem] / Console + File = match els {
-  []           -> []
-  [h, ...rest] -> [desugar_interp_list_elem(h, cx),
-                   ...desugar_interp_list_elems(rest, cx)]
-}
-
-fn desugar_interp_list_elem(el: ListElem, cx: InterpCtx) : ListElem / Console + File = match el {
-  ElPlain(e)  -> ElPlain(desugar_interp_expr(e, cx))
-  ElSpread(e) -> ElSpread(desugar_interp_expr(e, cx))
-}
-
-# A block's statements bind left to right: each `let` / `var` is in
-# scope for the spans that follow it, and for the block's tail.
-type IBlk = IBlk([Stmt], InterpCtx)
-
-fn desugar_interp_block(ss: [Stmt], cx: InterpCtx, acc: [Stmt]) : IBlk / Console + File = match ss {
-  []           -> IBlk(list_reverse(acc), cx)
-  [h, ...rest] -> desugar_interp_block(rest, interp_stmt_binds(h, cx),
-                                       [desugar_interp_stmt(h, cx), ...acc])
-}
-
-fn interp_stmt_binds(s: Stmt, cx: InterpCtx) : InterpCtx = match s {
-  SLet(p, _, _)       -> interp_bind(cx, interp_pat_names(p))
-  SVar(b, _, _, _, _) -> interp_bind(cx, [written_text(b.name)])
-  _ -> cx
-}
-
-fn desugar_interp_stmt(s: Stmt, cx: InterpCtx) : Stmt / Console + File = match s {
-  SLet(p, ann, rhs) -> SLet(p, ann, desugar_interp_expr(rhs, cx))
-  SAssert(e, msg_opt) -> SAssert(desugar_interp_expr(e, cx),
-                                  desugar_interp_expr_opt(msg_opt, cx))
-  SExprStmt(e) -> SExprStmt(desugar_interp_expr(e, cx))
-  SIndexAssign(arr, idx, rhs, ln, cl) ->
-    SIndexAssign(desugar_interp_expr(arr, cx),
-                  desugar_interp_expr(idx, cx),
-                  desugar_interp_expr(rhs, cx), ln, cl)
-  SAssign(lhs, rhs, ln, cl) ->
-    SAssign(desugar_interp_expr(lhs, cx),
-             desugar_interp_expr(rhs, cx), ln, cl)
-  SVar(name, ann, rhs, ln, cl) -> SVar(name, ann, desugar_interp_expr(rhs, cx), ln, cl)
-  SUse(_, _, _) -> s
-}
-
-fn desugar_interp_hclauses(cs: [HClause], cx: InterpCtx) : [HClause] / Console + File = match cs {
-  []           -> []
-  [h, ...rest] -> [desugar_interp_hclause(h, cx),
-                   ...desugar_interp_hclauses(rest, cx)]
-}
-
-fn desugar_interp_hclause(c: HClause, cx: InterpCtx) : HClause / Console + File = match c {
-  HC(op_name, ps, body, ln, cl) ->
-    HC(op_name, ps, desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), ln, cl)
-}
-
-fn desugar_interp_hreturn_opt(opt: Option[HReturn], cx: InterpCtx) : Option[HReturn] / Console + File = match opt {
-  None    -> None
-  Some(r) -> Some(desugar_interp_hreturn(r, cx))
-}
-
-fn desugar_interp_hreturn(r: HReturn, cx: InterpCtx) : HReturn / Console + File = match r {
-  HR(b, body, ln, cl) -> HR(b, desugar_interp_expr(body, interp_bind(cx, [written_text(b.name)])), ln, cl)
-}
-
-fn lift_interp_string(span: String, body_start: Int, body_end: Int,
-                       cx: InterpCtx, line: Int, col: Int) : ExprKind / Console + File {
-
-  let parts = iscan_collect(span, body_end,
-                             IScan { parts: [], lit_start: body_start, i: body_start })
-  # `body_start` chars of the literal's opening delimiter sit before the body.
-  let part_exprs = interp_parts_to_exprs(parts, InterpPos { line: line, col: col + body_start },
-                                          cx, line, col)
-  ECall(mk_name("string_concat_all", line, col),
-        [mk_expr(EList(map(part_exprs, (e: Expr) => ElPlain(e))), line, col)])
-}
-
-# Where a part begins in the real source.
-type InterpPos = { line: Int, col: Int }
-
-# Advance a position over `s`, which a triple-quoted literal may spread
-# across several lines; a newline resets the column rather than extending it.
-fn interp_pos_advance(p: InterpPos, s: String, i: Int) : InterpPos {
-  if i >= string_length(s) { p }
-  else {
-    let nxt = match char_at(s, i) {
-      Some('\n') -> InterpPos { line: p.line + 1, col: 1 }
-      _          -> InterpPos { line: p.line, col: p.col + 1 }
-    }
-    interp_pos_advance(nxt, s, i + 1)
-  }
-}
-
-# Walk the parts in source order so each interpolated expression is rebased
-# onto the position it really occupies. A literal advances by its own text;
-# an interpolation advances by its body plus the `#{` and `}` around it.
-fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos, cx: InterpCtx,
-                          line: Int, col: Int) : [Expr] / Console + File {
-  match parts {
-    [] -> []
-    [p, ...rest] -> {
-      let e = interp_part_to_expr(p, pos, cx, line, col)
-      let next = match p {
-        IpLit(piece, _) -> interp_pos_advance(pos, piece, 0)
-        # `#{` before the body, `}` after it.
-        IpExp(src) -> {
-          let after = interp_pos_advance(InterpPos { line: pos.line, col: pos.col + 2 }, src, 0)
-          InterpPos { line: after.line, col: after.col + 1 }
-        }
-      }
-      [e, ...interp_parts_to_exprs(rest, next, cx, line, col)]
-    }
-  }
-}
-
-# Type parameters are bound first, then effect scoping runs before type
-# scoping, mirroring the driver order.
-fn interp_scope_frag(e0: Expr, cx: InterpCtx) : Expr = {
-  let e = tparam_bind_expr(e0, cx.tps)
-  let e1 = match cx.es { Some(esc) -> es_expr_scoped(e, esc)  None -> e }
-  let e2 = match cx.ts { Some(tsc) -> ts_expr_scoped(e1, tsc)  None -> e1 }
-  # A qualified handler head (`with m.E`) reaches the typer bare, the
-  # same shape the whole-program pass produces for a head written
-  # outside a span.
-  qh_expr(e2, cx.cs.mt.entries)
-}
-
-fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
-                        line: Int, col: Int) : Expr / Console + File {
-
-  match p {
-    IpLit(_, raw_quoted) -> mk_expr(EStr(raw_quoted, false), line, col)
-    IpExp(expr_src) -> {
-      # The body starts past the `#{` that opens it.
-      let body = InterpPos { line: pos.line, col: pos.col + 2 }
-      let inner = match parse_interp_expr(expr_src) {
-        # The freshly-parsed sub-expression must go through the early
-        # whole-program rewrites it missed while locked in a string
-        # span; every one is idempotent on already-rewritten trees:
-        #
-        # - `interp_scope_frag` respells contested type/effect names,
-        #   so a qualified `m.T` picks its home (`T__m`) and matches
-        #   every other use site. Runs first, mirroring the driver's
-        #   pass order.
-        # - the const-keying pass keys a qualified read of a colliding
-        #   pub const before rqc collapses its uppercase form to a
-        #   bare EVar (the variant-ctor rule). Free reads are left
-        #   alone (`free` off): the driver re-runs the full pass over
-        #   the lifted stream, where lexical scope is tracked.
-        # - the qualified-call resolver keeps `list.sum(xs)` and other
-        #   `mod.fn(args)` shapes from surfacing to the typer as an
-        #   unresolved EField on a module-name EVar. The table is the
-        #   reading decl's segmented one, so a per-file import alias
-        #   resolves here just as it does outside the span.
-        Some(e) -> desugar_interp_expr(
-                     rqc_expr(nu_const_expr(interp_scope_frag(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)), cx),
-                                     cx.locals, cx.cs),
-                              cx.locals, cx.cs.mt.entries, [], cx.file),
-                     cx)
-        None    -> mk_expr(EStr("\"\"", false), line, col)
-      }
-      mk_expr(ECall(mk_expr(interp_show_callee(cx), line, col), [inner]), line, col)
-    }
-  }
-}
-
-# The dispatcher a `#{...}` calls. User code names it through its home:
-# a qualified reference dispatches among that home's protocols only, so a
-# user protocol with a `show` op never captures the interpolation, not
-# even inside its own module. A bare reference to the same dispatcher
-# would dispatch among every protocol declaring `show`, which is what a
-# core module's own interpolation means.
-fn interp_show_from(show: Option[ShowRef], in_core: Bool) : Option[ExprKind] = match show {
-  Some(ShowRef(homed, bare)) -> Some(if in_core { bare } else { homed })
-  None                       -> None
-}
-
-# With no core `Show` the op stays the name any protocol declaring `show`
-# answers to.
-fn interp_show_callee(cx: InterpCtx) : ExprKind = match cx.show {
-  Some(k) -> k
-  None    -> EName(written(proto_dispatcher_name("show")))
 }
 
 # ====================================================================

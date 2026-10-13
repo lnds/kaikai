@@ -115,6 +115,7 @@ import compiler.evidence
 import compiler.evidence_inject
 import compiler.fnreg
 import compiler.interp_check
+import compiler.interp_show
 import compiler.pub_access
 import compiler.cell_promote
 import compiler.unbox_pass
@@ -2302,64 +2303,25 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # the same table read back out of a resolver result: `Mutable`
             # is masked only over a table this function built.
             let sym_tab = st_extend(tab3, lowered.rows)
-            # Lift `#{x}` interp parts into
-            # `string_concat_all([..., show(x), ...])` so the resolver,
-            # the typer and the protocol-call rewrite see them.
-            # `desugar_interp_decls` parses the inner expression of
-            # each `#{...}` segment freshly from the source span. That
-            # sub-AST never reached the early `rqc_decls` call (it
-            # didn't exist yet), so qualified calls like `list.sum(xs)`
-            # inside `#{...}` would arrive at the typer as raw
-            # `EField(EName("list"), "sum")` and be rejected as
-            # "undefined name `list`". We thread the module table +
-            # file path through interp lowering so the freshly-parsed
-            # inner expression goes through the same rewrite the rest of
-            # the program does.
+            # Every `#{...}` hole still calls a mark: the protocols are
+            # registered now, so each takes the `show` its home reaches.
             let interp_cores = core_mod_names(core_mods, [])
             # The protocol operations are the resolver's last rung: every
             # bare use, interpolations' included, reaches one through it.
             let callee_ops = proto_rungs(lowered.reg)
-            # An interpolation body that does not parse is dropped by the
-            # lift (it rebuilds a tree and has no error channel), so the
-            # build would otherwise succeed with the fragment silently
-            # empty. Report it against the file and position it occupies.
+            # Surface lowering leaves a string as written when one of its
+            # interpolation bodies does not parse: it has no file to report
+            # against. Report it at the position it occupies.
             let interp_parse_errs = check_interp_parses(lowered.decls, diag_ctx)
-            let interp_lifted = c_bounded_decls(backend, bang_hoist_decls(desugar_interp_decls(lowered.decls,
-                                                     mod_tabs, mod_imps,
-                                                     cs_coll, ts_coll, es_coll, sym_tab, sym_views,
-                                                     target_mod_name,
-                                                     path,
+            let interp_lifted = c_bounded_decls(backend, bang_hoist_decls(interp_show_decls(lowered.decls,
                                                      proto_core_show(lowered.reg, interp_cores),
-                                                     interp_cores)), sym_tab)
-            # Free reads of colliding const names surfaced from
-            # `#{...}` bodies never met the const keying pass (they
-            # were string spans when it ran). Re-run it over the
-            # lifted stream: keyed reads (EModCall) and non-colliding
-            # names pass through untouched, and lexical binders still
-            # shadow because the walk tracks scope.
+                                                     interp_cores, target_mod_name)), sym_tab)
             let root_picks = nt_picks_of(sel_imports, "", module_table)
             let early_const_uses = nu_scan_consts(interp_lifted, sym_tab, target_mod_name, root_picks)
-            let interp_cs = nu_scope_const_decls(interp_lifted, cs_coll, target_mod_name, mtabs_build([], []))
-            # A `1<minute>` inside `#{...}` was locked in a string span
-            # when kind resolution ran, so its habitant surfaces bare and
-            # would never unify with the qualified `Wall$minute` an
-            # annotation carries. `Measure` hides this — its qualified
-            # form IS the bare one — so only user kinds break. Re-resolve
-            # against the retained context; already-qualified symbols are
-            # idempotent under the rewrite.
-            let interp_decls_pre0 = resolve_kinds_with_ctx(interp_cs, kind_ctx,
-              target_mod_name)
-            # `#{counter}` lifts to a raw `EName(counter)` inside the
-            # `show(...)` call only now (the interp body was a raw span
-            # until this pass). Re-run the cell-read lowering so that
-            # naked cell reads hidden in interpolations become
-            # `counter.get()`. The cell set is now seeded from the
-            # `with State[T] as counter` handler the var rewrite produced
-            # (and from user `with State/Reader as name`), so an inner
-            # `let counter = ...` inside `#{...}` correctly shadows.
-            # Idempotent on the rest of the tree: already-lowered
-            # `counter.get()` is recognised as legitimate, not re-lowered.
-            let interp_cell = relower_cell_reads_decls(interp_decls_pre0, diag_ctx)
+            # The cell set is now seeded from the `with State[T] as name`
+            # handlers the var rewrite produced, and from the user's own.
+            # Idempotent on a read already lowered to `name.get()`.
+            let interp_cell = relower_cell_reads_decls(interp_lifted, diag_ctx)
             let interp_decls_pre = interp_cell.decls
             # Value-position const reads need no rewrite (a const IS a
             # value). The ONE ambiguous case is pattern position: a bare

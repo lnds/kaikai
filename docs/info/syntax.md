@@ -743,6 +743,11 @@ anything above `\u{10FFFF}` at compile time.
 A string carries its length, so an embedded NUL is a byte like any
 other: `"a\0b"` has length 3.
 
+A `#{...}` body is an ordinary expression: the names, types and imports
+it uses are checked as they are outside the string, and an error points
+at the place inside the literal. A type's `where` predicate is the one
+position where a string cannot interpolate.
+
 ### Multi-line strings (`"""`)
 
 `"""..."""` is a string literal that spans lines and interpolates
