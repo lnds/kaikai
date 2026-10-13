@@ -273,6 +273,35 @@ TARGET_BACKEND=native ORACLE_BACKEND=c BACKEND_PARITY_JOBS=1 \
 
 `BACKEND_PARITY_JOBS=1` = serial (the parallel ratchet is false-green; serial is authoritative). `BACKEND_PARITY_DIRS` scopes the corpus. The ratchet gates against `tools/native-parity-baseline.txt` (must stay empty = full parity).
 
+## Host facilities — the `KAI_HOST_*` macros
+
+`stage2/runtime.h` puts each facility a small host cannot provide behind one macro, defined to 1 unless the build says otherwise:
+
+| macro | facility | at 0 |
+|---|---|---|
+| `KAI_HOST_FIBERS` | context switch by `ucontext` | one thread, one fiber; a spawn stops the program |
+| `KAI_HOST_STACK_GUARD` | mapped stacks, the guard page, the overflow handler | no stack segment: a handler that keeps `resume` stops with the message a target without the switch already prints |
+| `KAI_HOST_REACTOR` | self-pipes, `poll`, the file pool | a wait (`Clock.sleep_ns`, a `File` read, `Stdin.read_line`) stops the program |
+| `KAI_HOST_SOCKETS` | sockets and DNS | every `NetTcp` / `NetUdp` / `NetUnix` / `NetDns` op stops the program |
+| `KAI_HOST_PROCESS` | child processes | every `Process` op but `exit` stops the program |
+| `KAI_HOST_SIGNALS` | signal subscription | every `Signal` op stops the program |
+| `KAI_HOST_BACKTRACE` | the stack trace of a debug build's panic | the panic prints, then one line saying there is no trace |
+| `KAI_HOST_UNWIND` | the frame unwinder | a contained trap lands at once; the frames it crosses keep their references |
+
+A stop is `kai: this host has no <facility>` on stderr and status 1. With a macro at 0 the runtime includes none of the facility's headers and imports none of its libc entry points, so nothing is left for the host to stub. Three combinations are refused at compile time: fibers without mapped stacks, sockets / processes / signals without the reactor, and `KAI_MAIN_STACK_SIZE` without fibers.
+
+The macros are a C-backend configuration, passed through `CFLAGS` (the wrapper's own flags must then be repeated, since `CFLAGS` replaces them):
+
+```
+CFLAGS="-std=c99 -Wno-unused-function -Wno-unused-variable -O2 -DKAI_HOST_FIBERS=0 -DKAI_HOST_STACK_GUARD=0" \
+  bin/kai build --backend=c app.kai -o app
+```
+
+The native runtime is two halves — the owner object, compiled per build with `CFLAGS`, and the hot bitcode, generated when the compiler is built — and only the first sees the macros; the two would disagree on the layout of a fiber.
+
+- **Gate**: `make -C stage2 test-host-minimal` (tier 1) runs `tools/test-host-minimal.sh`: the `examples/runtime/host_minimal_*` fixtures with every macro at 0, the import check on each binary, and the runtime compiled with each facility off on its own.
+- **A change to `runtime.h` that must not reach existing platforms** is checked with `tools/runtime-preprocess-diff.sh`: `cc -E -P` of the runtime at the base against the working tree, in every shape a build instantiates it, equal up to blank lines. Equal text is equal object code, so such a change needs no runtime or compile-cost measurement. The text depends on the host's headers; run it on each platform. A PR labelled `runtime-text-identical` is held to it in CI on Linux x86_64 (`tier1`, under GCC and clang) and Linux aarch64 (`linux-aarch64`).
+
 ## Traps (verified, recurring)
 
 - **`stage2/main.kai` is a stub**, not the compiler. The compiler is the ~200 modules it reaches through `import compiler.driver`.

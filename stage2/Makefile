@@ -2637,6 +2637,12 @@ test-main-stack-sized: $(TARGET) build
 	  echo "main-stack-sized OK (KAI_THREADS=$$n: 300K deep completes, 3M deep diagnosed)"; \
 	done
 
+# The runtime with every host facility switched off (KAI_HOST_* at 0): a
+# program that needs none prints what a default build prints, and one that
+# reaches a facility stops with the diagnostic naming it.
+test-host-minimal: $(TARGET) bin-kai
+	@../tools/test-host-minimal.sh
+
 # Freeing a structure nested a million levels deep (variant, list and
 # record cells in turn) must not grow the C stack per level. Run at the
 # default 8 MB stack, where a recursive free overflows.
