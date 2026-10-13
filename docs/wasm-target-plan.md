@@ -5,6 +5,9 @@ Makefiles or CI changes with this document. It re-measures the spike recorded
 in issue #2538 on today's tree, lists the gaps by the code they live in, sets
 out the decisions that belong to the owner, and orders the work into PRs.
 
+**Landed so far: PR 1 (#2783).** Its entry in section 4 describes what
+merged, and what it measured is folded into sections 2 and 4.
+
 **Decided by the owner: the browser comes first, `wasm32-wasi` is a later
 phase.** Section 4 is ordered around that. Every other decision in section 3 is
 open; this document recommends and does not decide.
@@ -25,6 +28,10 @@ Every factual claim carries one of two labels.
 - **(R)** read: from the code, or from the source cited next to it. Engine
   release numbers are read from the WebAssembly feature table
   (`WebAssembly/website`, `features.json`, fetched 2026-10-13).
+
+- **(M1)** measured for PR 1 on its own tree (#2783), on an arm64 Mac, on
+  the host and not under WebAssembly: a build whose `CFLAGS` set every
+  `KAI_HOST_*` macro to 0, C backend unless the claim names the native one.
 
 Firefox and Safari were not driven. Wherever they appear, the claim is (R).
 
@@ -289,6 +296,14 @@ numbers are left out on purpose; the function names are stable.
    `kai_reactor_init_filepool` starts pthreads. Fixtures that reach it fail
    with `kai: reactor pipe() failed` (M). In a browser a blocking wait is not
    available at all: the thread that would block is the page.
+   **`File` is behind it.** Every default handler of `File` (`read_file`,
+   `write_file`, `open_read`, `read_chunk`, `open_write`, `write_chunk`,
+   `close_file`) calls `kai_reactor_init` and then runs its work through
+   `kai_reactor_run_in_pool`, on the file pool's threads (R). So do
+   `Stdin.read_line` and `Stdin.read_bytes`, which park on the reactor for
+   readiness, and `Clock.sleep_ns` (R). With the reactor absent
+   `File.read_file` and `Clock.sleep_ns` stop with
+   `kai: this host has no reactor` (M1).
 8. **Host facilities with nothing behind them.** Sockets and DNS
    (`_kai_net_record_fd`, `kai_default_nettcp_listen`, `kai_default_netudp_bind`,
    `kai_default_netudp_send`, `kai_default_netudp_recv`,
@@ -297,8 +312,15 @@ numbers are left out on purpose; the function names are stable.
    `kai_default_process_kill`, `kai_default_process_kill_group`); signals
    (`kai_default_signal_on`, `kai_default_signal_off`, `_kai_signal_*`); the
    panic backtrace (`kai_capture_frames`, `kai_panic_backtrace`: `backtrace`,
-   `dladdr`, `popen`). `File` compiles and runs under wasmtime with a
-   preopened directory; a browser has no file system to give it.
+   `dladdr`, `popen`). `File` compiles for the target, and a browser has no
+   file system to give it; whether it runs under wasmtime is open again.
+   The first version of this document said it does, and the corpus table of
+   section 1 counts ten fixtures that write under `/tmp` among the identical
+   ones; `examples/effects/m7a_7_default_file.kai` is a fixture of that corpus
+   that writes there through `File.write_file` (R). That does not fit entry 7: the handler opens
+   the reactor's pipes first (R), and on the host with the reactor absent it
+   stops there (M1). PR 2 re-measures it under wasmtime before it relies on
+   either statement.
 9. **The random source.** `_kai_securerandom_fill` and the `#error` above it
    know Linux and the BSD family. wasi-libc has `arc4random_buf`; a browser
    has `crypto.getRandomValues` behind an import.
@@ -737,29 +759,61 @@ What each kind of runner is honest for:
 
 ### Phase 1 — a page
 
-**PR 1 — `refactor(runtime): host facilities sit behind capability macros`**
+**PR 1 — `refactor(runtime): host facilities sit behind capability macros`** — landed, #2783
 
-- *Touches*: `stage2/runtime.h`; a new script `tools/test-host-minimal.sh`;
-  one target in `stage2/Makefile`; `docs/build-system.md`.
-- *Does*: each section a small host cannot provide (fibers by `ucontext`,
-  guard pages and the overflow handler, the reactor's pipes and `poll`,
-  sockets, processes, signals, the backtrace, the unwinder) moves behind one
-  macro per facility, each defaulting to 1. With a macro at 0 the facility's
-  entry points fail with a kaikai diagnostic that names it, instead of a
-  libc stub or a link error.
+- *Touched*: `stage2/runtime.h`; two new scripts, `tools/test-host-minimal.sh`
+  and `tools/runtime-preprocess-diff.sh`; one target in `stage2/Makefile` and
+  its line in `stage2/test-lists/light.txt`; one step in
+  `.github/workflows/tier1.yml` (job `tier0`) and one in `linux-aarch64.yml`;
+  `docs/build-system.md`; eight fixtures under `examples/runtime/`.
+- *Does*: eight macros, each 1 unless the build defines it otherwise. With a
+  macro at 0 the runtime includes none of the facility's headers and imports
+  none of its libc entry points; reaching the facility prints
+  `kai: this host has no <facility>` and exits 1, with the two exceptions the
+  table names.
+
+  | macro | facility | at 0 |
+  |---|---|---|
+  | `KAI_HOST_FIBERS` | context switch by `ucontext` (gap 2) | one thread, `KAI_THREADS` not read; creating a fiber stops (`fibers`) |
+  | `KAI_HOST_STACK_GUARD` | mapped stacks, guard page, overflow handler (gap 6) | `KAI_SEG_SWITCH` is not defined either, so a handler that keeps `resume` takes the path of a target with no switch: `kai: stack segments are not supported on this target` |
+  | `KAI_HOST_REACTOR` | self-pipes, `poll`, the file pool (gap 7) | `kai_reactor_init` stops (`reactor`): sleeps, `File`, `Stdin` reads |
+  | `KAI_HOST_SOCKETS` | sockets and DNS (gap 8) | every `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` handler stops (`sockets`) |
+  | `KAI_HOST_PROCESS` | child processes (gap 8) | every `Process` handler but `exit` stops (`processes`) |
+  | `KAI_HOST_SIGNALS` | signal subscription (gap 8) | every `Signal` handler stops (`signals`) |
+  | `KAI_HOST_BACKTRACE` | the debug panic's trace (gap 8) | does not stop: the panic prints, then `kai: this host has no stack trace`, and exits as it did |
+  | `KAI_HOST_UNWIND` | the frame unwinder (gap 5) | does not stop: `kai_trap_unwind` lands at once, the path it already took when a walk could not start; the frames crossed keep their references |
+
+  The unwinder lands instead of stopping because a failed `assert` under
+  `kai test` leaves through it: a stop would end a test run at its first
+  failing test. A file with one failing, one trapping and one passing test
+  prints the same with and without it (M1).
+
+  Three combinations are refused with `#error`: `KAI_HOST_FIBERS` without
+  `KAI_HOST_STACK_GUARD` (a fiber runs on a mapped stack);
+  `KAI_HOST_SOCKETS`, `KAI_HOST_PROCESS` or `KAI_HOST_SIGNALS` without
+  `KAI_HOST_REACTOR` (their waits park on it); `KAI_MAIN_STACK_SIZE` without
+  `KAI_HOST_FIBERS` (`main` moves to its stack by a context switch).
 - *A user can run*: nothing new. It is the ground the next two stand on.
-- *Proof*: on a normal host, a build with every macro at 0 compiles, links
-  and gives identical output on a pure, a handler and a `Seq` fixture, and a
-  pinned diagnostic on a program that spawns. New fixture:
-  `examples/runtime/host_minimal_spawn.kai` with a `.run.err.expected`. Gate:
-  a leg of `tier1`.
-- *Depends on*: nothing. **It can start today, with no decision pending**: a
-  socket or a process has nothing behind it under every option in 3.1.
-- *Risk to existing platforms*: it edits about eight sections of the file
-  every program includes. Checked by comparing `cc -E -P` of
-  `runtime_owner_c.c` before and after with the macros at their defaults, on
-  Linux x86_64, Linux aarch64 and an arm64 Mac: the preprocessed text must be
-  the same up to blank lines, and then the object code cannot differ.
+- *Proof*: `make -C stage2 test-host-minimal`, in the tier 1 light pool, runs
+  `tools/test-host-minimal.sh` on the C backend with every macro at 0.
+  `host_minimal_pure`, `host_minimal_handler` and `host_minimal_seq` print
+  their `.out.expected`, as a default build does. `host_minimal_spawn`,
+  `_sleep`, `_socket`, `_process` and `_signal` exit 1 with exactly their
+  `.run.err.expected`, one per facility a program can ask for. No binary
+  imports a libc entry point of a facility (`nm -u` against the list in the
+  script): the spawn fixture's binary went from 107 imports to 47, 27 of the
+  107 on the list and none of the 47 (M1). The runtime also compiles with
+  each facility off on its own.
+- *Risk to existing platforms, as checked*: `tools/runtime-preprocess-diff.sh`
+  compares `cc -E -P` of the runtime at the base with the working tree, blank
+  lines removed, in the seven shapes a build instantiates it (single unit, C
+  owner, C module, native owner, native hot bitcode, RC ledger, sized main).
+  All seven were identical on an arm64 Mac under Apple clang and GCC 15, on
+  Linux x86_64 under GCC and clang, and on Linux aarch64 under GCC (M1; the
+  two Linux results are from the PR's CI). A PR carrying the label
+  `runtime-text-identical` is held to the comparison by the two workflow
+  steps; the label is read when the step runs. PR 2 carries it.
+- *Not covered*: the native backend. See phase 4.
 
 **PR 2 — `feat(runtime): the runtime compiles for wasm32 and a host module runs it`**
 
@@ -777,10 +831,29 @@ What each kind of runner is honest for:
   differ, a new difference fails, a closed one must be removed. The starting
   point is the table in section 1. New fixtures: `examples/web/` with one
   program per row of the class table.
+- *`File`*: with `KAI_HOST_REACTOR` at 0, which is what this PR derives from
+  `__wasm__`, every `File` handler stops (entry 7 of section 2). PR 2 first measures what
+  `File.write_file` does under wasmtime with the shim, then takes one of:
+  - **Run the work in place when there is no reactor.** The handlers' work
+    functions (`_kai_file_*_thunk`) are ordinary blocking calls; the pool
+    exists so a read does not hold a scheduler thread, and with one thread and
+    one fiber there is nothing else to hold (R). `kai_reactor_run_in_pool`
+    calls `work(arg)` directly and the seven sites do not open the reactor.
+    The edit sits in the branch a default build does not compile, so the
+    preprocess comparison still applies. Not measured.
+  - **A macro of its own for the file pool**, apart from the reactor. Needed
+    only if some host has `poll` and no threads, or the reverse; none in this
+    plan does.
+  - **Leave `File` stopping** in the browser, where 3.6 already recommends
+    refusing it at `main`, and take the first option in PR 9 for WASI.
+
+  The first is the one that keeps `File` fixtures in PR 2's corpus; the third
+  is the smallest. `Stdin` reads and `Clock.sleep_ns` are the same question
+  with a different answer: they wait, which is 3.3 and 3.4.
 - *Depends on*: PR 1; decisions 3.1 and 3.2.
 - *Risk*: `runtime.h` again, but every edit is inside `#if defined(__wasm__)`
   or sets a macro whose default is unchanged; the same preprocess comparison
-  applies.
+  applies, under the `runtime-text-identical` label.
 
 **PR 3 — `feat(kai): --target=wasm32-browser builds a module and the page that loads it`**
 
@@ -918,6 +991,35 @@ the host; cleanup uses the pad form WebAssembly accepts; the runtime bitcode is
 generated per target. Until then the target is C-backend only and says so in
 its diagnostic. The reason to do it at all is that it removes the external C
 compiler from the user's side.
+
+**The macros of PR 1 do not reach the native runtime whole.** It is two
+halves: the owner object, which `kai` compiles per build with `$CFLAGS`, and
+the hot bitcode (`runtime_llvm.bc`, `runtime_inline.bc`), which
+`tools/gen-runtime-bc.sh` generates with fixed flags when the compiler is
+built and which is merged into the emitted objects (R). Flags that zero a
+macro therefore change the owner and not the bitcode. On a compiler that has
+the bitcode, a native build with every macro at 0 runs the pure and `Seq`
+fixtures and stops the spawn fixture with its diagnostic, and the handler
+fixture dies (M1, native backend):
+
+```
+CFLAGS="-std=c99 -Wno-unused-function -Wno-unused-variable -O2 \
+  -DKAI_HOST_FIBERS=0 -DKAI_HOST_STACK_GUARD=0 -DKAI_HOST_REACTOR=0 \
+  -DKAI_HOST_SOCKETS=0 -DKAI_HOST_PROCESS=0 -DKAI_HOST_SIGNALS=0 \
+  -DKAI_HOST_BACKTRACE=0 -DKAI_HOST_UNWIND=0" \
+  bin/kai build --backend=native examples/runtime/host_minimal_handler.kai -o h && ./h
+tail=42
+kai: internal error: a resume frame pushed outside a handler clause
+```
+
+The reading, not verified further: `KaiFiber` holds a `ucontext_t` only when
+`KAI_HOST_FIBERS` is 1, so the two halves place the fields after it at
+different offsets (R). Nothing refuses the pairing at build time, and a check
+that did would add a symbol to the default text of `runtime.h`, which PR 1
+could not do. Generating the bitcode per target, already in the list above,
+is what makes the two halves agree; until then `test-host-minimal` runs the C
+backend only, and a guard that fails the link on a mismatch is an item of
+this phase.
 
 ## 5. What WASI shares with the browser, and what is its own
 
