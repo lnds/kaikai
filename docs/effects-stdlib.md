@@ -1074,7 +1074,9 @@ unable to open an IP socket.
 - **Peer identity.** `peer_uid(c)` returns the effective uid of the
   process on the other end as the kernel recorded it at connect time
   (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS) — nothing the
-  peer sends can forge it.
+  peer sends can forge it. `Process.uid()` is the same reading of the
+  server's own process, so `peer_uid(c) == Ok(Process.uid())` is "the
+  peer runs as me".
 - **The socket is a file.** It outlives the process that created it,
   so the family carries its cleanup: `close_listener` closes the
   listener and unlinks its socket file, and `listen` replaces a socket
@@ -1124,6 +1126,7 @@ effect Process {
   start_group(cmd: String, args: [String], pipe_stdin: Bool,
               pipe_stdout: Bool, pipe_stderr: Bool) : Result[Child, String]
   kill_group(c: Child, sig: Int)      : Result[Unit, String]
+  uid()                               : Int
 }
 ```
 
@@ -1197,6 +1200,11 @@ effect Process {
   surface for this op is `os.exit` (top-level helper exposed by
   the stdlib `os` module per `docs/stdlib-layout.md`); calling
   `Process.exit` directly is legal but not idiomatic.
+- `uid` returns the effective uid of the current process, with no
+  child process involved. It is the uid `NetUnix.peer_uid` reports for
+  this process to the other end of a Unix-domain socket, so a server
+  that accepts only its own user compares the two. The `os.process`
+  surface is `uid()`.
 
 `Child`, `Exit`, and `Signal` are opaque types declared by the
 `os.process` module.
@@ -1248,6 +1256,7 @@ Runtime-installed around `main` when `Process` is in the row.
   > Linux fast path is post-MVP. Cancel mid-wait still does NOT
   > unwind — the cancel-aware redesign queues for R2 in Orongo.
 - `kill` is `kill(2)`.
+- `uid` is `geteuid(2)`.
 - `exit` is libc `_exit(code)`. No flushing of stdio buffers; the
   caller must `print` everything they want printed before
   calling `exit`. (kaikai's `Console` writes are unbuffered, so

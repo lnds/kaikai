@@ -27,18 +27,19 @@ passes first.
 ```kaikai
 import net.unix
 
-fn serve(l: Listener) : Int / NetUnix =
+fn serve(l: Listener) : Int / NetUnix + Process =
   match NetUnix.accept(l) {
     Err(_) -> 1
     Ok(c)  -> {
       let who = NetUnix.peer_uid(c)        # the kernel's record, not the peer's claim
+      let mine = who == Ok(Process.uid())  # the peer runs as this process's user
       let _ = NetUnix.send(c, [111, 107])
       NetUnix.close(c)
-      match who { Ok(_) -> 0  Err(_) -> 1 }
+      if mine { 0 } else { 1 }
     }
   }
 
-fn main() : Int / NetUnix = match listen("/tmp/demo.sock", owner_only) {
+fn main() : Int / NetUnix + Process = match listen("/tmp/demo.sock", owner_only) {
   Err(_) -> 1
   Ok(l)  -> {
     let rc = serve(l)

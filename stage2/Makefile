@@ -3751,6 +3751,7 @@ TEST_EFFECTS_CASES := \
 	test-effects-m8x_signal_await_parks \
 	test-effects-process_basic \
 	test-effects-process_piped_capture \
+	test-effects-process_uid \
 	test-effects-issue_141_log_default \
 	test-effects-array_mutable_explicit \
 	test-effects-local_ref_masks_mutable \
@@ -4994,6 +4995,34 @@ test-effects-process_piped_capture: $(TARGET) build core-cache-warm
 	    && echo "effects OK $$name (popen-shaped Process stdio pipes)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
 	done
+
+# The parity sweep compares the two backends with each other; these two
+# compare each with the golden.
+test-effects-process_uid: $(TARGET) build core-cache-warm
+	@set -e; \
+	f=process_uid; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$f.kai > build/s2-$$f.c 2> build/s2-$$f.err \
+	  || { echo "effects FAIL $$f (kaic2 errored)"; cat build/s2-$$f.err; exit 1; }; \
+	grep -q "kai_default_process_uid" build/s2-$$f.c \
+	  || { echo "effects FAIL $$f (default uid wiring missing)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$f.c -o build/s2-$$f $(LDLIBS_M) \
+	  || { echo "effects FAIL $$f (C compile failed)"; exit 1; }; \
+	./build/s2-$$f > build/s2-$$f.out 2>&1 \
+	  || { echo "effects FAIL $$f (binary exit non-zero)"; cat build/s2-$$f.out; exit 1; }; \
+	diff -q ../examples/effects/$$f.out.expected build/s2-$$f.out > /dev/null \
+	  && echo "effects OK $$f (Process.uid is the uid peer_uid reads; a handler answers it)" \
+	  || { echo "effects FAIL $$f (output mismatch)"; diff ../examples/effects/$$f.out.expected build/s2-$$f.out; exit 1; }
+
+test-effects-process_uid-native: $(TARGET) bin-kai build
+	@set -e; \
+	f=process_uid; \
+	KAI_BACKEND=native ../bin/kai build ../examples/effects/$$f.kai -o build/s2-$$f-nat 2> build/s2-$$f-nat.err \
+	  || { echo "effects FAIL $$f (native build errored)"; cat build/s2-$$f-nat.err; exit 1; }; \
+	./build/s2-$$f-nat > build/s2-$$f-nat.out 2>&1 \
+	  || { echo "effects FAIL $$f (native binary exit non-zero)"; cat build/s2-$$f-nat.out; exit 1; }; \
+	diff -q ../examples/effects/$$f.out.expected build/s2-$$f-nat.out > /dev/null \
+	  && echo "effects OK $$f (native: Process.uid is the uid peer_uid reads; a handler answers it)" \
+	  || { echo "effects FAIL $$f (native output mismatch)"; diff ../examples/effects/$$f.out.expected build/s2-$$f-nat.out; exit 1; }
 
 test-effects-issue_141_log_default: $(TARGET) build core-cache-warm
 	@set -e; \

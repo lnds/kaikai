@@ -15116,6 +15116,13 @@ static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, Kai
     }
     return _kai_process_ok(k, kai_unit());
 }
+
+/* uid() -> Int. The effective uid: what a peer reads of this process
+ * through SO_PEERCRED / LOCAL_PEERCRED. */
+static KaiValue *kai_default_process_uid(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_int((int64_t) geteuid()));
+}
 #else
 static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) { kai_host_absent("processes"); }
 KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k)
@@ -15126,6 +15133,7 @@ KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, Kai
 #endif
 static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) { kai_host_absent("processes"); }
 static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) { kai_host_absent("processes"); }
+static KaiValue *kai_default_process_uid(void *self, KaiCont *k) { kai_host_absent("processes"); }
 #endif
 
 /* exit(code) -> Nothing. _exit(2) — skip libc atexit / stdio flush
