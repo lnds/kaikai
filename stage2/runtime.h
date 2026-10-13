@@ -53,11 +53,69 @@
 #ifndef KAI_RUNTIME_H
 #define KAI_RUNTIME_H
 
+/* Host facilities, one macro each, 1 where the host provides it. At 0 the
+ * runtime includes none of the facility's headers and calls none of its libc
+ * entry points; reaching it stops the program with a diagnostic naming it.
+ *
+ *   KAI_HOST_FIBERS       context switch by ucontext; without it the program
+ *                         runs on one thread and has one fiber
+ *   KAI_HOST_STACK_GUARD  mapped stacks, their guard page, the overflow
+ *                         handler; without it no stack segment either
+ *   KAI_HOST_REACTOR      self-pipes, poll, the file pool
+ *   KAI_HOST_SOCKETS      sockets and DNS
+ *   KAI_HOST_PROCESS      child processes
+ *   KAI_HOST_SIGNALS      signal subscription
+ *   KAI_HOST_BACKTRACE    the stack trace of a debug build's panic; without
+ *                         it the panic says there is none
+ *   KAI_HOST_UNWIND       the frame unwinder; without it a contained trap
+ *                         lands at once and the frames it crosses keep
+ *                         their references */
+#ifndef KAI_HOST_FIBERS
+#  define KAI_HOST_FIBERS 1
+#endif
+#ifndef KAI_HOST_STACK_GUARD
+#  define KAI_HOST_STACK_GUARD 1
+#endif
+#ifndef KAI_HOST_REACTOR
+#  define KAI_HOST_REACTOR 1
+#endif
+#ifndef KAI_HOST_SOCKETS
+#  define KAI_HOST_SOCKETS 1
+#endif
+#ifndef KAI_HOST_PROCESS
+#  define KAI_HOST_PROCESS 1
+#endif
+#ifndef KAI_HOST_SIGNALS
+#  define KAI_HOST_SIGNALS 1
+#endif
+#ifndef KAI_HOST_BACKTRACE
+#  define KAI_HOST_BACKTRACE 1
+#endif
+#ifndef KAI_HOST_UNWIND
+#  define KAI_HOST_UNWIND 1
+#endif
+#if KAI_HOST_FIBERS && !KAI_HOST_STACK_GUARD
+#  error "KAI_HOST_FIBERS needs KAI_HOST_STACK_GUARD: a fiber runs on a mapped stack"
+#endif
+#if (KAI_HOST_SOCKETS || KAI_HOST_PROCESS || KAI_HOST_SIGNALS) && !KAI_HOST_REACTOR
+#  error "KAI_HOST_SOCKETS, KAI_HOST_PROCESS and KAI_HOST_SIGNALS need KAI_HOST_REACTOR: their waits park on it"
+#endif
+#if defined(KAI_MAIN_STACK_SIZE) && !KAI_HOST_FIBERS
+#  error "KAI_MAIN_STACK_SIZE needs KAI_HOST_FIBERS: main moves to its stack by a context switch"
+#endif
+#define KAI_HOST_COMPLETE (KAI_HOST_FIBERS && KAI_HOST_STACK_GUARD && KAI_HOST_REACTOR \
+                           && KAI_HOST_SOCKETS && KAI_HOST_PROCESS && KAI_HOST_SIGNALS \
+                           && KAI_HOST_BACKTRACE && KAI_HOST_UNWIND)
+
 #include <dirent.h>
 #include <math.h>
 #include <setjmp.h>
+#if KAI_HOST_UNWIND
 #include <unwind.h>
+#endif
+#if KAI_HOST_SIGNALS || KAI_HOST_PROCESS || KAI_HOST_REACTOR || KAI_HOST_STACK_GUARD || defined(KAI_LLVM)
 #include <signal.h>
+#endif
 #include <stddef.h>
 /* The leak-site tracer extends the RC ledger, so it switches the ledger on. */
 #if defined(KAI_TRACE_RC_LEAKSITE) && !defined(KAI_TRACE_RC)
@@ -68,13 +126,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>      /* sched_getaffinity() — CPU count for the KAI_THREADS default */
+#if KAI_HOST_STACK_GUARD
 #include <sys/mman.h>
 #include <sys/resource.h>  /* getrlimit(RLIMIT_STACK) — stack budget for the kai_main fiber */
+#endif
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if KAI_HOST_BACKTRACE
 #include <execinfo.h>   /* backtrace() for the --debug panic stack trace (#500) */
 #include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
+#endif
 
 /* Every runtime exit goes through kai_exit: exit() tears down LLVM's lazily
  * built statics, so the native emit pool is drained first. */
@@ -88,6 +150,14 @@ static void kai_exit(int code) {
 #endif
     exit(code);
 }
+
+#if !KAI_HOST_COMPLETE
+__attribute__((noreturn))
+static void kai_host_absent(const char *facility) {
+    fprintf(stderr, "kai: this host has no %s\n", facility);
+    kai_exit(1);
+}
+#endif
 
 /* Purity attribute for a confirmed memory-clean fn (issue #1139): the C
  * emitter prefixes `KAI_CONST` on the signature of a fn whose lowered
@@ -200,15 +270,23 @@ static int kai_nthreads = 1;
  * readiness reactor yet, so socket reads/writes park the OS thread
  * rather than the fiber. kqueue / epoll integration is a Tier 2
  * follow-up tracked in docs/fibers-honesty-targets.md §Reactor. */
+#if KAI_HOST_SOCKETS
 #include <arpa/inet.h>
+#endif
 #include <errno.h>
+#if KAI_HOST_SOCKETS
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 #include <sys/types.h>
+#if KAI_HOST_SOCKETS
 #include <sys/un.h>
+#endif
+#if KAI_HOST_PROCESS || KAI_HOST_REACTOR
 #include <sys/wait.h>
-#if !defined(SO_PEERCRED) && defined(LOCAL_PEERCRED)
+#endif
+#if KAI_HOST_SOCKETS && !defined(SO_PEERCRED) && defined(LOCAL_PEERCRED)
 #include <sys/ucred.h>
 #endif
 
@@ -219,7 +297,9 @@ static int kai_nthreads = 1;
  * Sockets stay on the blocking path until R2. */
 #include <fcntl.h>
 #include <limits.h>
+#if KAI_HOST_REACTOR
 #include <poll.h>
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -274,7 +354,9 @@ static int kai_nthreads = 1;
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
+#if KAI_HOST_FIBERS
 #include <ucontext.h>
+#endif
 #if defined(__APPLE__) || defined(__clang__)
 #  pragma clang diagnostic pop
 #endif
@@ -3204,7 +3286,11 @@ struct KaiFiber {
      * §*Scheduler*. main_fiber leaves ctx zero-initialised (filled in
      * by getcontext on first dispatch); spawned fibers fill ctx via
      * makecontext + a heap-allocated stack. */
+#if KAI_HOST_FIBERS
     ucontext_t      ctx;               /* swapcontext target              */
+#else
+    char            ctx[1];            /* the slot KAI_MAIN_FIBER_INIT fills by position */
+#endif
     void           *stack_base;        /* heap-allocated; freed on RC=0   */
     size_t          stack_size;        /* set per fiber (env-configurable) */
     KaiFiber       *awaiters_head;     /* per-fiber awaiter chain head    */
@@ -3595,8 +3681,10 @@ typedef struct KaiWorker {
     int         uc_link_ready;
     KaiFiber    main_fiber;
     KaiFreeStack free_stack;    /* the root fiber's */
+#if KAI_HOST_FIBERS
     ucontext_t  uc_link_ctx;
     char        uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+#endif
 } KaiWorker;
 
 /* The scheduler's only thread-local. Read nowhere but kai_worker_here. */
@@ -3751,6 +3839,7 @@ KAI_RT_SHARED void kai_evidence_unwind_all(void);
  * unwinder, `land` runs at once — exactly the longjmp it replaces. The
  * exception object lives on the heap: a landing pad runs on the frames the
  * raising call sat below, and `resume` reads the object back. */
+#if KAI_HOST_UNWIND
 typedef struct {
     struct _Unwind_Exception ex;
     uintptr_t                frame;
@@ -3775,9 +3864,11 @@ KAI_RT_SHARED _Unwind_Reason_Code kai_trap_stop(int version, _Unwind_Action acti
     }
     return _URC_NO_REASON;
 }
+#endif
 
 static size_t kai_page_size(void);
 
+#if KAI_HOST_UNWIND
 /* Room left below this frame on a fiber's mapped stack; the OS stack
  * (`base` NULL) is taken to have enough. */
 static int kai_trap_unwind_room(void *base) {
@@ -3786,9 +3877,11 @@ static int kai_trap_unwind_room(void *base) {
     uintptr_t low  = (uintptr_t) base + kai_page_size();
     return here > low && here - low > KAI_TRAP_UNWIND_ROOM;
 }
+#endif
 
 __attribute__((noreturn, noinline))
 KAI_RT_SHARED void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void *), void *arg) {
+#if KAI_HOST_UNWIND
     KaiTrapUnwind *u = (frame && kai_trap_unwind_room(stack_base))
                            ? (KaiTrapUnwind *) calloc(1, sizeof *u) : NULL;
     if (u) {
@@ -3799,6 +3892,9 @@ KAI_RT_SHARED void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*lan
         _Unwind_ForcedUnwind(&u->ex, kai_trap_stop, u);
         free(u);
     }
+#else
+    (void) frame; (void) stack_base;
+#endif
     land(arg);
     __builtin_unreachable();
 }
@@ -4053,9 +4149,11 @@ static void kai_drain_pending_free(KaiWorker *w) {
      * only stack + struct remain. The stack is an mmap region of
      * size stack_size + one guard page; pair the call with munmap
      * (free would corrupt the heap). */
+#if KAI_HOST_STACK_GUARD
     if (f->stack_base) {
         munmap(f->stack_base, f->stack_size + kai_page_size());
     }
+#endif
     kai_tsan_fiber_free(f);
     free(f->free_stack);
     free(f);
@@ -5066,10 +5164,12 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                      * and is statically allocated; spawned fibers own
                      * an mmap region of stack_size + guard page bytes
                      * and must release it via munmap. */
+#if KAI_HOST_STACK_GUARD
                     if (v->as.fib->stack_base) {
                         munmap(v->as.fib->stack_base,
                                v->as.fib->stack_size + kai_page_size());
                     }
+#endif
                     free(v->as.fib->unw_buf);
                     free(v->as.fib->rframe_buf);
                     free(v->as.fib->free_stack);
@@ -8337,6 +8437,7 @@ static KaiValue *kai_core_write_stdout(KaiValue *arg) {
  * and pays no symboliser cost. */
 __attribute__((weak)) int __kai_build_debug = 0;
 
+#if KAI_HOST_BACKTRACE
 /* Best-effort absolute path of the running executable, into `buf`. Returns 1
  * on success. The symboliser needs it to read the binary's (or its .dSYM's)
  * DWARF. */
@@ -8413,8 +8514,10 @@ static int kai_capture_frames(void **out, int max) {
     return backtrace(out, max);
 #endif
 }
+#endif
 
 KAI_RT_SHARED void kai_panic_backtrace(void) {
+#if KAI_HOST_BACKTRACE
     void *frames[64];
     int n = kai_capture_frames(frames, 64);
     if (n <= 0) return;
@@ -8467,6 +8570,9 @@ KAI_RT_SHARED void kai_panic_backtrace(void) {
         fprintf(stderr, "  %s", line);
     }
     pclose(p);
+#else
+    fputs("kai: this host has no stack trace\n", stderr);
+#endif
 }
 
 KAI_RT_SHARED KaiValue *kai_core_panic(KaiValue *msg) {
@@ -10975,10 +11081,14 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
              * flipped it earlier in this process. The flat core
              * has no fiber to park; emulate blocking semantics by
              * polling until the fd is readable, then retry. */
+#if KAI_HOST_REACTOR
             struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
             int prc = poll(&p, 1, -1);
             if (prc < 0 && errno != EINTR) break;
             continue;
+#else
+            kai_host_absent("reactor");
+#endif
         } else {
             break;  /* I/O error — surface as short read */
         }
@@ -13262,6 +13372,7 @@ KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiC
  * lane — calling out IPv4-only as a v1 limitation in the spec note.
  */
 
+#if KAI_HOST_SOCKETS
 static KaiValue *_kai_net_err(KaiCont *k, int saved_errno) {
     const char *msg = strerror(saved_errno);
     if (!msg) msg = "unknown error";
@@ -14269,6 +14380,54 @@ static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k
     }
     return kai_cont_resume(k, kai_unit());
 }
+#else
+KAI_SCHED_FN KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue *port, KaiCont *k) { kai_host_absent("sockets"); }
+KAI_SCHED_FN KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c, KaiValue *max, KaiValue *ns, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netunix_listen(void *self, KaiValue *path, KaiValue *mode, KaiCont *k) { kai_host_absent("sockets"); }
+KAI_SCHED_FN KaiValue *kai_default_netunix_connect(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+static KaiValue *kai_default_netunix_peer_uid(void *self, KaiValue *c, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netudp_bind(void *self, KaiValue *host, KaiValue *port, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netudp_send(void *self, KaiValue *sock, KaiValue *dst, KaiValue *data, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netudp_recv(void *self, KaiValue *sock, KaiValue *max, KaiCont *k) { kai_host_absent("sockets"); }
+static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) { kai_host_absent("sockets"); }
+#endif
 
 
 /* =================================================================
@@ -14302,6 +14461,7 @@ static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k
  *   - Real-time signals (SIGRTMIN+n) and siginfo_t are out of scope.
  */
 
+#if KAI_HOST_SIGNALS
 typedef struct {
     int         signo;
     const char *name;
@@ -14482,6 +14642,16 @@ KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
     }
 }
 #endif
+#else
+static KaiValue *kai_default_signal_on(void *self, KaiValue *sig_v, KaiCont *k) { kai_host_absent("signals"); }
+static KaiValue *kai_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k) { kai_host_absent("signals"); }
+KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("signals"); }
+#endif
+#endif
 
 /* =================================================================
  * Process effect — issue #126. POSIX subprocess primitives.
@@ -14526,6 +14696,7 @@ KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
  *     comment so the two effects don't fight over the disposition.
  */
 
+#if KAI_HOST_PROCESS
 /* Build a Child record `{ pid: Int }`. The "pid" field name is
  * load-bearing — `_kai_process_record_pid` reads the slot by
  * strcmp on the name pointer's contents, in lockstep with
@@ -14945,6 +15116,17 @@ static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, Kai
     }
     return _kai_process_ok(k, kai_unit());
 }
+#else
+static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) { kai_host_absent("processes"); }
+KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("processes"); }
+#endif
+static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) { kai_host_absent("processes"); }
+static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) { kai_host_absent("processes"); }
+#endif
 
 /* exit(code) -> Nothing. _exit(2) — skip libc atexit / stdio flush
  * to match the doc spec contract. The `: Nothing` return type is
@@ -14958,6 +15140,7 @@ static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k
     return NULL;
 }
 
+#if KAI_HOST_PROCESS
 /* start_piped(cmd, args, pipe_stdin, pipe_stdout, pipe_stderr)
  *   -> Result[Child, String].
  * popen-shaped: attach a pipe to any of the child's stdin, stdout and
@@ -15193,6 +15376,29 @@ KAI_SCHED_FN KaiValue *kai_default_process_read_stderr(void *self, KaiValue *chi
     (void) self;
     return _kai_proc_read_chunk(child, 2, k);
 }
+#endif
+#else
+static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *args, KaiValue *pipe_in_v, KaiValue *pipe_out_v, KaiValue *pipe_err_v, KaiCont *k) { kai_host_absent("processes"); }
+static KaiValue *kai_default_process_start_group(void *self, KaiValue *cmd, KaiValue *args, KaiValue *pipe_in_v, KaiValue *pipe_out_v, KaiValue *pipe_err_v, KaiCont *k) { kai_host_absent("processes"); }
+KAI_SCHED_FN KaiValue *kai_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("processes"); }
+#endif
+static KaiValue *kai_default_process_close_stdin(void *self, KaiValue *child, KaiCont *k) { kai_host_absent("processes"); }
+KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("processes"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_process_read_stderr(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("processes"); }
+#endif
 #endif
 
 /* =================================================================
@@ -15453,6 +15659,7 @@ static size_t kai_fiber_stack_size(void) {
  * conventional 8 MiB), and let a larger explicit KAI_FIBER_STACK_SIZE
  * still win. A build defining KAI_MAIN_STACK_SIZE fixes the budget
  * outright, at every thread count, whatever the environment says. */
+#if KAI_HOST_STACK_GUARD
 static int kai_stack_map_flags(void) {
     int flags = MAP_PRIVATE | MAP_ANON;
 #if defined(MAP_NORESERVE)
@@ -15460,6 +15667,7 @@ static int kai_stack_map_flags(void) {
 #endif
     return flags;
 }
+#endif
 
 /* ---------- Stack-segment switch ----------
  *
@@ -15489,7 +15697,7 @@ static int kai_stack_map_flags(void) {
  * emits a static function nothing calls, and with it the reference. Hidden,
  * so position-independent code takes the stub's address pc-relative; through
  * the GOT, a symbol local to the unit loses its offset in the section. */
-#if defined(__x86_64__) || (defined(__aarch64__) && (defined(__clang__) || defined(__ELF__)))
+#if KAI_HOST_STACK_GUARD && (defined(__x86_64__) || (defined(__aarch64__) && (defined(__clang__) || defined(__ELF__))))
 #  define KAI_SEG_SWITCH 1
 #  if defined(__clang__)
 #    define KAI_SEG_NAKED __attribute__((naked, noinline, unused))
@@ -15642,6 +15850,7 @@ static int kai_stack_fits(size_t size) {
 }
 #endif
 
+#if KAI_HOST_STACK_GUARD
 static size_t kai_main_fiber_stack_size(void) {
 #if defined(KAI_MAIN_STACK_SIZE)
     /* A host that refuses the reservation (RLIMIT_AS, strict overcommit)
@@ -15761,6 +15970,7 @@ static void kai_install_fiber_sigsegv_handler(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
 }
+#endif
 
 /* =================================================================
  * Phase R1 reactor — issue #611
@@ -16330,6 +16540,7 @@ static int kai_reactor_wake_pid_waiter(int pid, int status) {
     return 0;
 }
 
+#if KAI_HOST_REACTOR
 /* Drain SIGCHLD self-pipe and waitpid(-1, ..., WNOHANG) until no
  * more children have terminated, waking the fiber parked on each
  * pid. Idempotent — safe to call when no children are pending. */
@@ -16378,6 +16589,7 @@ static int kai_reactor_sigchld_drain(void) {
     }
     return woken;
 }
+#endif
 
 /* Consume a buffered exit for `pid`. Called by the wait op before
  * and after its own non-blocking waitpid, outside the reactor lock. */
@@ -16562,6 +16774,7 @@ int kai_reactor_inited = 0;
 static int kai_reactor_inited = 0;
 #endif
 static void kai_reactor_init(void) {
+#if KAI_HOST_REACTOR
     if (kai_reactor_inited) return;
     kai_reactor_inited = 1;
 
@@ -16616,6 +16829,9 @@ static void kai_reactor_init(void) {
      * reads/writes. */
     sa.sa_flags = SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
+#else
+    kai_host_absent("reactor");
+#endif
 }
 
 /* Spin up the 4-worker file pool on the first file op. SIGCHLD is
@@ -16624,6 +16840,7 @@ static void kai_reactor_init(void) {
  * self-pipe in kai_reactor_wait. The pool runs detached for the
  * lifetime of the process; the OS reclaims the threads on exit. */
 static void kai_reactor_init_filepool(void) {
+#if KAI_HOST_REACTOR
     if (kai_filepool_started) return;
     kai_filepool_started = 1;
     sigset_t block_set, prev_set;
@@ -16641,6 +16858,9 @@ static void kai_reactor_init_filepool(void) {
         pthread_detach(kai_filepool_threads[i]);
     }
     pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+#else
+    kai_host_absent("reactor");
+#endif
 }
 
 /* Submit a unit of work to the file-pool. The caller (a parking
@@ -16891,6 +17111,7 @@ static int kai_reactor_count_socket_waiters(KaiFiber *head) {
     return n;
 }
 
+#if KAI_HOST_REACTOR
 /* Issue #630 — Phase R2: drain one socket-direction waiter list.
  * For every fiber whose fd shows up in `pfds[i].revents` with
  * POLLIN/POLLOUT/POLLHUP/POLLERR set, splice it out and unpark.
@@ -16927,6 +17148,7 @@ static int kai_reactor_socket_drain(KaiFiber **head_ptr, struct pollfd *pfds,
     }
     return woken;
 }
+#endif
 
 /* Wake every deadline-armed socket-read waiter whose deadline has
  * passed, stamping reactor_wait_status = 1 so the park site returns
@@ -16960,6 +17182,7 @@ static int kai_reactor_socket_read_deadline_drain(uint64_t now) {
  * but reactor waiters exist — the dispatch loop's substitute for a
  * dedicated event loop thread. */
 static void kai_reactor_wait(void) {
+#if KAI_HOST_REACTOR
     /* F2: read the shared wheel + waiter lists to compute the timeout and
      * build the poll set under `kai_reactor_mu` (no-op at N=1), then drop
      * the lock before poll() — poll blocks the reactor thread and must not
@@ -17144,6 +17367,9 @@ static void kai_reactor_wait(void) {
      * slot lock — never nested under reactor_mu). No-op at N=1: the drains
      * unparked inline and the batch is empty. */
     kai_reactor_flush_ready();
+#else
+    kai_host_absent("reactor");
+#endif
 }
 
 /* F2 — link a reactor-parking fiber into the waiter structure its park site
@@ -17397,14 +17623,18 @@ static KaiFiber *kai_sched_steal_from(int victim, int thief) {
 /* Forward decl: the trampoline drives a fiber's body and walks its
  * awaiter chain on completion. Defined below so it can call the
  * scheduler primitives + kai_apply. */
+#if KAI_HOST_FIBERS
 static void kai_fiber_trampoline(void);
+#endif
 
 /* Fall-off-the-end landing for a fiber context. `uc_link` cannot name a
  * scheduler root directly: the address baked at spawn belongs to the
  * spawning worker, and a stolen fiber would resume a root another thread is
  * running on. Resolve the executing thread's root here instead. */
+#if KAI_HOST_FIBERS
 static void kai_fiber_uc_link_landing(void);
 static ucontext_t *kai_uc_link_target(void);
+#endif
 
 /* Phase 5 forward decl: link propagation runs in the trampoline's
  * termination tail; the helper itself is defined alongside the
@@ -17431,6 +17661,7 @@ static void kai_nursery_propagate_failure(KaiFiber *self);
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
+#if KAI_HOST_STACK_GUARD
 /* [guard page | stack_size bytes], low to high; the caller munmaps
  * stack_size + one page. MAP_NORESERVE keeps a large stack a pure address
  * reservation: pages are committed only as the stack reaches them. */
@@ -17450,7 +17681,9 @@ static void *kai_stack_map(size_t stack_size) {
     }
     return region;
 }
+#endif
 
+#if KAI_HOST_FIBERS
 /* Point `c` at the usable stack [lo, lo + size). TRAP (macOS): makecontext
  * bzeroes the whole uc_stack, which commits every page of a large reserved
  * stack up front. Hand it only the top window instead; the frames below grow
@@ -17466,8 +17699,10 @@ static void kai_ctx_set_stack(ucontext_t *c, void *lo, size_t size) {
     c->uc_stack.ss_sp   = lo;
     c->uc_stack.ss_size = size;
 }
+#endif
 
 static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
+#if KAI_HOST_FIBERS
     kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
         fprintf(stderr, "kai: getcontext failed for new fiber\n");
@@ -17491,6 +17726,10 @@ static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
     kai_ctx_set_stack(&f->ctx, (char *) region + kai_page_size(), f->stack_size);
     f->ctx.uc_link          = kai_uc_link_target();
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
+#else
+    (void) f; (void) stack_size;
+    kai_host_absent("fibers");
+#endif
 }
 
 static void kai_fiber_init_ctx(KaiFiber *f) {
@@ -17760,7 +17999,11 @@ static void kai_worker_loop(KaiWorker *w) {
         next->state = KAI_FIBER_RUNNING;
         kai_worker_run(w, next);
         KAI_TSAN_SWITCH_TO(next);
+#if KAI_HOST_FIBERS
         swapcontext(&root->ctx, &next->ctx);
+#else
+        kai_host_absent("fibers");
+#endif
         w->active = root;
         kai_drain_pending_free(w);
         /* F2 — from the root context, after the exit
@@ -17794,7 +18037,11 @@ static void kai_sched_yield(void) {
         w->requeue_stack_head = current;
         w->active = &w->main_fiber;
         KAI_TSAN_SWITCH_TO_ROOT(w);
+#if KAI_HOST_FIBERS
         swapcontext(&current->ctx, &w->main_fiber.ctx);
+#else
+        kai_host_absent("fibers");
+#endif
         kai_drain_pending_free(current->worker);
         return;
     }
@@ -17806,7 +18053,11 @@ static void kai_sched_yield(void) {
     next->state = KAI_FIBER_RUNNING;
     kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
+#if KAI_HOST_FIBERS
     swapcontext(&current->ctx, &next->ctx);
+#else
+    kai_host_absent("fibers");
+#endif
     /* If the fiber that switched to us was the tail of a now-discarded
      * fiber, its struct and stack wait in pending_free. */
     kai_drain_pending_free(current->worker);
@@ -17868,7 +18119,11 @@ static void kai_sched_park_linked(void) {
         w->commit_stack_head = current;
         w->active = &w->main_fiber;
         KAI_TSAN_SWITCH_TO_ROOT(w);
+#if KAI_HOST_FIBERS
         swapcontext(&current->ctx, &w->main_fiber.ctx);
+#else
+        kai_host_absent("fibers");
+#endif
         kai_drain_pending_free(current->worker);
         /* A reactor park that resumes without the reactor's own splice
          * (a message wake off the recv chain, a consumed permit, or a
@@ -17914,7 +18169,11 @@ static void kai_sched_park_linked(void) {
     next->state = KAI_FIBER_RUNNING;
     kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
+#if KAI_HOST_FIBERS
     swapcontext(&current->ctx, &next->ctx);
+#else
+    kai_host_absent("fibers");
+#endif
     kai_drain_pending_free(current->worker);
 }
 
@@ -18004,6 +18263,7 @@ static KaiExitFibers kai_rc_settle_exit_fibers(void) {
  * RC contract: f->thunk is owned by f for f's entire lifetime and the
  * trampoline only borrows it. kai_free_value's KAI_FIBER branch decrefs
  * both thunk and result when f's RC drops. */
+#if KAI_HOST_FIBERS
 static void kai_fiber_uc_link_landing(void) {
     KaiWorker *w = kai_worker_here();
     w->active = &w->main_fiber;
@@ -18213,6 +18473,7 @@ static void kai_fiber_trampoline(void) {
     setcontext(&next->ctx);
     /* setcontext does not return. */
 }
+#endif
 #if defined(__APPLE__) || defined(__clang__)
 #  pragma clang diagnostic pop
 #endif
@@ -18258,6 +18519,7 @@ static KaiValue *kai_main_runs(KaiValue *(*user_main)(void)) {
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
+#if KAI_HOST_FIBERS
 /* Root-fiber trampoline for the user's main under M:N. Runs kai_main on
  * a spawned fiber's stack (so main can park/steal like any actor),
  * publishes the result, flips the shutdown flag, and returns to thread 0's
@@ -18279,6 +18541,7 @@ static void kai_bootstrap_trampoline(void) {
     KAI_TSAN_SWITCH_TO_ROOT(w);
     setcontext(&w->main_fiber.ctx);
 }
+#endif
 
 #if defined(KAI_MAIN_STACK_SIZE)
 static void kai_sized_main_trampoline(void) {
@@ -18327,6 +18590,7 @@ pthread_t kai_worker_threads[KAI_MAX_THREADS];
 static pthread_t kai_worker_threads[KAI_MAX_THREADS];
 #endif
 
+#if KAI_HOST_FIBERS
 /* Worker thread entry: adopt an id, anchor this thread's root fiber,
  * mark the slot live, and run the scheduler loop until shutdown. */
 static void *kai_worker_thread_main(void *arg) {
@@ -18365,6 +18629,7 @@ static void *kai_reactor_thread_main(void *arg) {
     kai_rc_ledger_fold();
     return NULL;
 }
+#endif
 
 /* CPUs this process may actually run on. sysconf reports the whole
  * machine, which over-subscribes a process pinned by an affinity mask
@@ -18392,6 +18657,7 @@ static int kai_host_ncpu(void) {
  * Any count is clamped to [1, KAI_MAX_THREADS-1] so the reactor thread's
  * id (kai_nthreads) stays a valid slot index. */
 static int kai_read_nthreads(void) {
+#if KAI_HOST_FIBERS
     const char *e = getenv("KAI_THREADS");
     if (!e || !*e) {
         int n = kai_host_ncpu();
@@ -18403,6 +18669,9 @@ static int kai_read_nthreads(void) {
     if (n <= 1) return 1;
     if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
     return (int) n;
+#else
+    return 1;
+#endif
 }
 
 
@@ -18425,6 +18694,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
         return kai_main_runs(user_main);
     }
 
+#if KAI_HOST_FIBERS
     kai_user_main_fn = user_main;
     /* The Char cache is classified immortal — shared by every thread, never
      * mutated after init. Lazy warming breaks the second half of that: the
@@ -18511,6 +18781,9 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     pthread_join(kai_reactor_thread, NULL);
     free(root);
     return kai_user_main_result;
+#else
+    kai_host_absent("fibers");
+#endif
 }
 #endif
 
