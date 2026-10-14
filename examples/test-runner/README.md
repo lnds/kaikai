@@ -6,3 +6,8 @@ test runner rather than built as programs. Each
 
 They live outside the program corpora on purpose: those sweeps build
 every `.kai` as a program and pair it with `<name>.out.expected`.
+
+`coverage_report/` is a package, not a file: `kai test --json --coverage`
+reports the package lines each of its blocks ran, pinned by
+`coverage_report.json.expected` and, under `--only`,
+`coverage_report.only.expected`.

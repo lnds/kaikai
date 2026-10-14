@@ -333,6 +333,7 @@ KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_
    test-runner access on the one owner-side copy. */
 #if !defined(KAI_HOT_ONLY)
 void      kaix_assert_check(KaiValue *cond, const char *msg)    { kai_assert_check(cond, msg); }
+void      kaix_cov_hit(const char *site)                       { kai_cov_hit(site); }
 void      kaix_assert_check_with_value(KaiValue *cond, const char *base_msg,
                                        const char *ident_name, KaiValue *val) {
     kai_assert_check_with_value(cond, base_msg, ident_name, val);

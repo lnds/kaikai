@@ -1,0 +1,157 @@
+#[doc("""
+Line-coverage probes for a `kai test --coverage` build.
+
+The code of a covered file is cut into regions: each statement and the
+tail of a block, and each branch, arm, lambda or handler-clause body
+that is not a block. A region opens with a probe, a unit statement
+naming the file and the lines of the nodes the region runs, its nested
+regions left out. The runtime reports the lines of the probes a test
+block reached.
+
+A probe only ever lands ahead of code, so a tail call stays in tail
+position, and it holds no value, so no reference changes hands. A match
+guard and the right operand of `and`/`or` count with their parent:
+narrowing reads a guard's shape, so neither is wrapped.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.decl_map
+import compiler.util
+import compiler.expr_positions
+import compiler.module_table
+import compiler.modules_segments
+
+#[doc("What a coverage build probes: the modules loaded from `files`, and the root file when `root` is not empty, each reported under the path given for it.")]
+pub type CoverSpec = { files: [String], root: String }
+
+#[doc("The spec of a build that probes nothing.")]
+pub fn cover_none() : CoverSpec = CoverSpec { files: [], root: "" }
+
+#[doc("Whether `spec` probes anything.")]
+pub fn cover_on(spec: CoverSpec) : Bool = spec.root != "" or not list_is_empty(spec.files)
+
+#[doc("The import stream `decls`, partitioned by `segs` over the module table `mods`, with the code of every file `spec` covers probed.")]
+pub fn cover_decls(spec: CoverSpec, segs: [ImportSeg], mods: [ModuleEntry], decls: [Decl]) : [Decl] =
+  if cover_on(spec) { cv_segs(spec.root, cv_homes(spec.files, mods), segs, decls) } else { decls }
+
+# A covered module, by home, with the path its lines report under.
+type CvHome = { home: String, file: String }
+
+fn cv_homes(files: [String], mods: [ModuleEntry]) : [CvHome] = match files {
+  [] -> []
+  [f, ...rest] -> match mt_lookup_origin(mods, abspath(f)) {
+    Some(ME(home, _, _, _)) -> [CvHome { home: home, file: f }, ...cv_homes(rest, mods)]
+    None                    -> cv_homes(rest, mods)
+  }
+}
+
+fn cv_home_file(homes: [CvHome], home: String) : String = match homes {
+  []           -> ""
+  [h, ...rest] -> if h.home == home { h.file } else { cv_home_file(rest, home) }
+}
+
+# The root file's own decls follow the last segment.
+fn cv_segs(root: String, homes: [CvHome], segs: [ImportSeg], decls: [Decl]) : [Decl] = match segs {
+  [] -> cv_file(root, decls)
+  [ISeg(home, n), ...rest] ->
+    list_append(cv_file(cv_home_file(homes, home), seg_take(decls, n)),
+                cv_segs(root, homes, rest, seg_drop(decls, n)))
+}
+
+fn cv_file(file: String, ds: [Decl]) : [Decl] =
+  if file == "" { ds } else { map(ds, (d) => cv_decl(file, d)) }
+
+# A function's body is probed; a test, bench or check block is the probes'
+# reader and a constant's initialiser is pasted where it is read, so no
+# other body is.
+fn cv_decl(file: String, d: Decl) : Decl =
+  decl_map_named_bodies(d, (owner, body) => if sym_same(fnid_sym(owner), sym_none()) { body } else { cv_region(file, body) })
+
+# A block probes each of its statements; any other body takes one probe
+# ahead of it. Column 0 is no source position, so a block the emitters
+# look up by position (a `region`) never matches the wrapper.
+fn cv_region(file: String, e: Expr) : Expr = match e.kind {
+  EBlock(_, _)      -> cv_expr(file, e)
+  EExternBody(_, _) -> e
+  EIntrinsic(_, _)  -> e
+  _ -> mk_expr(EBlock(cv_probe(file, cv_lines(e, []), []), Some(cv_expr(file, e))), e.line, 0)
+}
+
+fn cv_expr(file: String, e: Expr) : Expr = match e.kind {
+  EBlock(ss, tail) -> Expr { ...e, kind: cv_block(file, e, ss, tail) }
+  EIf(c, t, oe) -> Expr { ...e, kind: EIf(cv_expr(file, c), cv_region(file, t), prc_map_opt_expr(oe, (x) => cv_region(file, x))) }
+  EMatch(s, arms) -> Expr { ...e, kind: EMatch(cv_expr(file, s), map(arms, (a) => cv_arm(file, a))) }
+  ELambda(ps, b) -> Expr { ...e, kind: ELambda(ps, cv_region(file, b)) }
+  EHandle(body, eff, tas, oi, oa, cls, oret) ->
+    Expr { ...e, kind: EHandle(cv_expr(file, body), eff, tas, prc_map_opt_expr(oi, (x) => cv_expr(file, x)), oa,
+                               map(cls, (c) => cv_clause(file, c)), cv_return(file, oret)) }
+  EExternBody(_, _) -> e
+  _ -> Expr { ...e, kind: prc_map_expr_kind(e.kind, (x) => cv_expr(file, x)) }
+}
+
+fn cv_arm(file: String, a: Arm) : Arm = match a {
+  Arm(p, g, b) -> Arm(p, prc_map_opt_expr(g, (x) => cv_expr(file, x)), cv_region(file, b))
+}
+
+fn cv_clause(file: String, c: HClause) : HClause = match c {
+  HC(h, ps, b, l, co) -> HC(h, ps, cv_region(file, b), l, co)
+}
+
+fn cv_return(file: String, r: Option[HReturn]) : Option[HReturn] = match r {
+  Some(HR(p, b, l, c)) -> Some(HR(p, cv_region(file, b), l, c))
+  None                 -> None
+}
+
+# An empty block still runs its own line.
+fn cv_block(file: String, e: Expr, ss: [Stmt], tail: Option[Expr]) : ExprKind = match tail {
+  None -> if list_is_empty(ss) { EBlock(cv_probe(file, [e.line], []), None) } else { EBlock(cv_stmts(file, ss), None) }
+  Some(t) -> EBlock(list_append(cv_stmts(file, ss), cv_probe(file, cv_lines(t, []), [])), Some(cv_expr(file, t)))
+}
+
+fn cv_stmts(file: String, ss: [Stmt]) : [Stmt] = match ss {
+  []           -> []
+  [s, ...rest] ->
+    cv_probe(file, cv_pos_lines(xp_positions_kind(EBlock([s], None)), []),
+             [prc_map_stmt_exprs(s, (x) => cv_expr(file, x)), ...cv_stmts(file, rest)])
+}
+
+# `onto` behind the probe of `lines`, or alone when they are none.
+fn cv_probe(file: String, lines: [Int], onto: [Stmt]) : [Stmt] = match list_reverse(lines) {
+  [] -> onto
+  [l, ...rest] -> {
+    let site = concat_all([join_with(map([l, ...rest], int_to_string), ","), ":", file])
+    [SExprStmt(mk_expr(EIntrinsic(InCovHit(site), []), l, 0)), ...onto]
+  }
+}
+
+# The lines of `e` and of every node below it, regions of their own left out; newest first.
+fn cv_lines(e: Expr, acc: [Int]) : [Int] = match e.kind {
+  EBlock(_, _)    -> cv_add(e.line, acc)
+  EMatch(s, arms) -> cv_guard_lines(arms, cv_lines(s, cv_add(e.line, acc)))
+  _               -> cv_pos_lines(xp_positions(e), cv_add(e.line, acc))
+}
+
+fn cv_pos_lines(ps: [XPos], acc: [Int]) : [Int] = match ps {
+  [] -> acc
+  [XP(r, x), ...rest] -> match r {
+    XAll -> cv_pos_lines(rest, cv_lines(x, acc))
+    XSc  -> cv_pos_lines(rest, cv_lines(x, acc))
+    XMsg -> cv_pos_lines(rest, cv_lines(x, acc))
+    _    -> cv_pos_lines(rest, acc)
+  }
+}
+
+fn cv_guard_lines(arms: [Arm], acc: [Int]) : [Int] = match arms {
+  [] -> acc
+  [Arm(_, Some(g), _), ...rest] -> cv_guard_lines(rest, cv_lines(g, acc))
+  [_, ...rest] -> cv_guard_lines(rest, acc)
+}
+
+fn cv_add(l: Int, acc: [Int]) : [Int] =
+  if l <= 0 or list_has_int(acc, l) { acc } else { [l, ...acc] }
+
+fn list_has_int(xs: [Int], x: Int) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> h == x or list_has_int(rest, x)
+}

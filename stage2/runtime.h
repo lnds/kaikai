@@ -11846,6 +11846,144 @@ static void kai_test_json_id(FILE *o) {
     fputc('"', o);
 }
 
+/* ---------- per-block line coverage (`kai test --coverage`) ----------
+ *
+ * A coverage build opens each region of the package's code with
+ * kai_cov_hit(site): `site` is a static "<line>,...:<file>" string whose
+ * address is the probe's identity. The sites reached since a block began
+ * are reported, as lines per file, right after its test record. */
+KAI_SCHED_FN void kai_cov_hit(const char *site);
+KAI_SCHED_FN void kai_cov_reset(void);
+KAI_SCHED_FN void kai_cov_take(FILE *o);
+
+#if !KAI_SCHED_DECL_ONLY
+static pthread_mutex_t kai_cov_mu = PTHREAD_MUTEX_INITIALIZER;
+/* The sites reached: open addressing by address, NULL a free slot. */
+static const char **kai_cov_set;
+static size_t kai_cov_cap;
+static size_t kai_cov_len;
+/* Sites known to be in the set, by hash, so a repeat hit skips the lock.
+ * Cleared with the set, under the lock. */
+#define KAI_COV_RECENT 4096
+static const char *kai_cov_recent[KAI_COV_RECENT];
+
+static size_t kai_cov_hash(const char *site) {
+    uint64_t x = (uint64_t) (uintptr_t) site;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (size_t) x;
+}
+
+static void kai_cov_insert(const char *site) {
+    size_t mask = kai_cov_cap - 1;
+    for (size_t i = kai_cov_hash(site) & mask; ; i = (i + 1) & mask) {
+        if (kai_cov_set[i] == site) return;
+        if (!kai_cov_set[i]) { kai_cov_set[i] = site; kai_cov_len++; return; }
+    }
+}
+
+static void kai_cov_grow(void) {
+    const char **old = kai_cov_set;
+    size_t n = kai_cov_cap;
+    kai_cov_cap = n ? n * 2 : 1024;
+    kai_cov_set = (const char **) calloc(kai_cov_cap, sizeof *kai_cov_set);
+    if (!kai_cov_set) { fprintf(stderr, "kai: out of memory recording coverage\n"); kai_exit(2); }
+    kai_cov_len = 0;
+    for (size_t i = 0; i < n; i++) if (old[i]) kai_cov_insert(old[i]);
+    free(old);
+}
+
+KAI_SCHED_FN void kai_cov_hit(const char *site) {
+    const char **r = &kai_cov_recent[kai_cov_hash(site) % KAI_COV_RECENT];
+    if (__atomic_load_n(r, __ATOMIC_RELAXED) == site) return;
+    pthread_mutex_lock(&kai_cov_mu);
+    if (2 * (kai_cov_len + 1) > kai_cov_cap) kai_cov_grow();
+    kai_cov_insert(site);
+    __atomic_store_n(r, site, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&kai_cov_mu);
+}
+
+static void kai_cov_clear_locked(void) {
+    if (kai_cov_set) memset(kai_cov_set, 0, kai_cov_cap * sizeof *kai_cov_set);
+    kai_cov_len = 0;
+    for (size_t i = 0; i < KAI_COV_RECENT; i++) __atomic_store_n(&kai_cov_recent[i], NULL, __ATOMIC_RELAXED);
+}
+
+KAI_SCHED_FN void kai_cov_reset(void) {
+    pthread_mutex_lock(&kai_cov_mu);
+    kai_cov_clear_locked();
+    pthread_mutex_unlock(&kai_cov_mu);
+}
+
+typedef struct { const char *file; long line; } KaiCovLine;
+
+static int kai_cov_line_cmp(const void *a, const void *b) {
+    const KaiCovLine *x = (const KaiCovLine *) a, *y = (const KaiCovLine *) b;
+    int c = strcmp(x->file, y->file);
+    return c ? c : (x->line > y->line) - (x->line < y->line);
+}
+
+static size_t kai_cov_site_count(const char *site) {
+    size_t n = 1;
+    for (const char *p = site; *p && *p != ':'; p++) n += *p == ',';
+    return n;
+}
+
+/* The lines of `site` appended at `out[n]`; the new count. */
+static size_t kai_cov_site_lines(const char *site, KaiCovLine *out, size_t n) {
+    const char *file = strchr(site, ':');
+    file = file ? file + 1 : "";
+    for (const char *p = site; *p && *p != ':'; ) {
+        char *end;
+        long line = strtol(p, &end, 10);
+        out[n].file = file;
+        out[n].line = line;
+        n++;
+        p = *end == ',' ? end + 1 : end;
+    }
+    return n;
+}
+
+/* Write the reached lines as `{"<file>":[<line>,...],...}`, sorted, and start over. */
+KAI_SCHED_FN void kai_cov_take(FILE *o) {
+    pthread_mutex_lock(&kai_cov_mu);
+    size_t total = 0, n = 0;
+    for (size_t i = 0; i < kai_cov_cap; i++) if (kai_cov_set[i]) total += kai_cov_site_count(kai_cov_set[i]);
+    KaiCovLine *ls = (KaiCovLine *) malloc((total ? total : 1) * sizeof *ls);
+    if (!ls) { fprintf(stderr, "kai: out of memory reporting coverage\n"); kai_exit(2); }
+    for (size_t i = 0; i < kai_cov_cap; i++) if (kai_cov_set[i]) n = kai_cov_site_lines(kai_cov_set[i], ls, n);
+    kai_cov_clear_locked();
+    pthread_mutex_unlock(&kai_cov_mu);
+    qsort(ls, n, sizeof *ls, kai_cov_line_cmp);
+    fputc('{', o);
+    for (size_t i = 0; i < n; i++) {
+        int same_file = i > 0 && strcmp(ls[i].file, ls[i - 1].file) == 0;
+        if (same_file && ls[i].line == ls[i - 1].line) continue;
+        if (same_file) {
+            fputc(',', o);
+        } else {
+            if (i > 0) fputs("],", o);
+            kai_test_json_str(o, ls[i].file);
+            fputs(":[", o);
+        }
+        fprintf(o, "%ld", ls[i].line);
+    }
+    if (n > 0) fputc(']', o);
+    fputc('}', o);
+    free(ls);
+}
+#endif
+
+static int kai_test_coverage_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = getenv("KAI_TEST_COVERAGE");
+        cached = (raw && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
 static void kai_test_json_record(const char *status, const char *msg) {
     long long ms = (kai_test_now_ns() - kai_test_started_ns) / 1000000LL;
     FILE *o = kai_test_json_out();
@@ -11861,6 +11999,13 @@ static void kai_test_json_record(const char *status, const char *msg) {
         kai_test_json_str(o, msg);
     }
     fputs("}\n", o);
+    if (kai_test_coverage_mode()) {
+        fputs("{\"type\":\"coverage\",\"id\":", o);
+        kai_test_json_id(o);
+        fputs(",\"lines\":", o);
+        kai_cov_take(o);
+        fputs("}\n", o);
+    }
     fflush(o);
 }
 
@@ -11891,6 +12036,7 @@ static void kai_test_begin(const char *desc) {
     kai_test_count_total++;
     kai_test_current = desc;
     kai_test_reported = 0;
+    if (kai_test_json_mode() && kai_test_coverage_mode()) kai_cov_reset();
     kai_test_started_ns = kai_test_now_ns();
 }
 
