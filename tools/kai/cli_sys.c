@@ -423,14 +423,18 @@ void kaicli_copy_to_stderr(const char *path) {
     fclose(f);
 }
 
-/* Set once kaic2 proves it lacks libLLVM: later builds of this run skip the native attempt. */
-static int no_llvm;
+/* What this run knows of kaic2's native backend: 0 nothing, 1 absent, 2 asked. */
+static int llvm_state;
 
-void kaicli_mark_no_llvm(void) { no_llvm = 1; }
+void kaicli_mark_no_llvm(void) { llvm_state = 1; }
 
-void kaicli_clear_no_llvm(void) { no_llvm = 0; }
+void kaicli_mark_llvm_probed(void) { if (llvm_state == 0) llvm_state = 2; }
 
-int kaicli_no_llvm(void) { return no_llvm; }
+void kaicli_clear_no_llvm(void) { llvm_state = 0; }
+
+int kaicli_no_llvm(void) { return llvm_state == 1; }
+
+int kaicli_llvm_probed(void) { return llvm_state != 0; }
 
 /* `cat path`: the file's exact bytes on stdout. */
 void kaicli_copy_to_stdout(const char *path) {
