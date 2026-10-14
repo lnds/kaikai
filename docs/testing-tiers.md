@@ -519,6 +519,12 @@ so each of the three shards also carries other tier1 work and a light slice. Uns
 imports and is silently dropped as unparseable, which costs about a
 quarter of the coverage.
 
+The field-types gate (`tools/field-types-gate.sh`) typechecks the same
+kind of corpus, one `kaic2` per file, and took about ten minutes on a
+CI runner. In tier0 it sat on the critical path after the build, so
+it runs as eight parts instead: shard N passes `FIELD_TYPES_SHARD=N/8`,
+with the same congruence rule and kept-count assertion.
+
 (c) compares `kaic2 --ast` output with `@line:col` suffixes stripped;
 normalising position is mandatory, since reformatting moves every token
 and an unnormalised dump would differ for every file. The dumper is
