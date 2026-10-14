@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.155.0 (2026-10-14)
+
+### BREAKING CHANGE
+
+- a bare call of an opened import's function that has the
+same type as the core function of its name no longer compiles; write it
+qualified (`hex.to_int`), pick it (`import encoding.hex.{to_int}`), or
+import the module under a qualifier so the bare name means the core one.
+
+### Fixed
+
+- **resolve**: reject a bare use of an import that shadows a core fn of the same type
+- **runtime**: set the feature-test macros once per translation unit
+
+### Changed
+
+- **resolve**: take a shadowed builtin's signature while the resolver holds its name
+
 ## v0.154.0 (2026-10-14)
 
 ### Added
