@@ -2474,6 +2474,7 @@ static KaiVarSlot *kai_slots_alloc(int n) {
     return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
 }
 static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
+static void kai_slab_register_teardown(void) {}
 static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
 #else
 /* Issue #118 follow-up #3 — fixed-size cell free-list (Koka/mimalloc
@@ -2747,6 +2748,7 @@ static KaiVarSlot *kai_slots_alloc(int n) {
     return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
 }
 static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
+static void kai_slab_register_teardown(void) {}
 #endif
 
 KAI_RT_SHARED KaiValue *kai_alloc(KaiTag tag) {
