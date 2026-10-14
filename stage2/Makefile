@@ -1466,7 +1466,11 @@ test-numeric-literal-mint: $(TARGET) build
 	  grep -F "$$(head -1 ../examples/numeric/$$f.err.expected)" build/$$f.out > /dev/null \
 	    && echo "literal-mint $$f OK (rejection)" \
 	    || { echo "literal-mint $$f DIFF — expected fold-time error"; cat build/$$f.out; exit 1; }; \
-	done
+	done; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-typed ../examples/numeric/literal_mint.kai > build/literal_mint.typed; \
+	if grep -q ' call : ?$$' build/literal_mint.typed; then \
+	  echo "literal-mint FAIL (a minted literal's call is untyped)"; grep -n -B1 ' call : ?$$' build/literal_mint.typed; exit 1; \
+	else echo "literal-mint OK (every minted call typed)"; fi
 
 # FFI v2 (#417) — struct-by-value across the C boundary. The emitter
 # ships the `extern "C" type` structs in a shared `kai_ffi.h` (issue
