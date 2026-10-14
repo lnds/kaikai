@@ -1,0 +1,67 @@
+#[doc("""
+The value an owned position takes.
+
+A position yields its value through `if`, `match` and block tails, and
+through the slot perceus binds a tail value to. A bare read of a borrowed
+binder that such a position yields is dup'd: the binder holds no reference
+of its own to hand on.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.perceus_reads
+import compiler.ret_slots
+
+#[doc("`e` with every bare read of a `borrowed` binder it yields dup'd.")]
+pub fn pov_value(e: Expr, borrowed: [Binder]) : Expr = match e.kind {
+  ELocal(l) -> if pcs_has(borrowed, l) { pov_dup(e) } else { e }
+  _         -> Expr { kind: pov_value_kind(e.kind, borrowed), line: e.line, col: e.col,
+                      ty: e.ty, mode: e.mode,  site: e.site }
+}
+
+fn pov_value_kind(k: ExprKind, borrowed: [Binder]) : ExprKind = match k {
+  EIf(c, t, oe)       -> EIf(c, pov_value(t, borrowed), prc_map_opt_expr(oe, (x) => pov_value(x, borrowed)))
+  EMatch(scr, arms)   -> EMatch(scr, map(arms, (a) => match a { Arm(p, g, b) -> Arm(p, g, pov_value(b, borrowed)) }))
+  EBlock(stmts, tail) -> match tail {
+    Some(t) -> EBlock(pov_wrapped(stmts, t, borrowed), Some(pov_value(t, borrowed)))
+    None    -> k
+  }
+  _ -> k
+}
+
+# The wrap a block tail names, if the tail is a bare result slot: its rhs
+# is owned where the block's value is.
+fn pov_wrapped(stmts: [Stmt], tail: Expr, borrowed: [Binder]) : [Stmt] = match tail.kind {
+  ELocal(l) -> map(stmts, (s) => match s {
+    SLet(pat, ann, rhs) -> match pat.pkind {
+      PBind(b) -> if local_eq(b.id, l) and ret_slot_id_is_value(l) { SLet(pat, ann, pov_value(rhs, borrowed)) } else { s }
+      _        -> s
+    }
+    _ -> s
+  })
+  _ -> stmts
+}
+
+fn pov_dup(a: Expr) : Expr =
+  Expr { kind: ECall(mk_expr(EMark(MkDup), a.line, a.col), [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }
+
+#[doc("True when `e` passes on the value of a tail: an `if`, a `match`, or a block with one.")]
+pub fn pov_yields(e: Expr) : Bool = match e.kind {
+  EIf(_, _, _)       -> true
+  EMatch(_, _)       -> true
+  EBlock(_, Some(_)) -> true
+  _                  -> false
+}
+
+#[doc("True when an operand the runtime consumes owes a reference: it reads a `borrowed` binder or yields a value. A raw read takes the scalar and leaves the box alone.")]
+pub fn pov_owes(e: Expr, borrowed: [Binder]) : Bool = match e.mode {
+  MUnboxed -> false
+  _        -> match e.kind {
+    ELocal(l) -> pcs_has(borrowed, l)
+    _         -> pov_yields(e)
+  }
+}
+
+#[doc("A consumed operand with the reference it owes; the same node when it owes none.")]
+pub fn pov_operand(e: Expr, borrowed: [Binder]) : Expr = if pov_owes(e, borrowed) { pov_value(e, borrowed) } else { e }

@@ -1,0 +1,132 @@
+#[doc("""
+Owned-borrow arguments of a C call.
+
+Perceus marks an argument the caller releases after a borrowing call, and
+the C emitter holds each in a temp for the call's extent. A temp is a named
+local bound before the call when nothing left of it can have an effect, so
+binding it early changes no order. Otherwise a temp computed in place takes
+a slot of one array and is assigned where its argument stands, and the
+operands still run left to right.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.emit_shared
+import compiler.local_names
+import compiler.unwind_binders
+
+#[doc("True for an argument carrying the bare owned-borrow mark.")]
+pub fn eob_is_marked(a: Expr) : Bool = match a.kind {
+  ECall(callee, [_]) -> match callee.kind {
+    EMark(MkOwnedBorrow) -> true
+    _                    -> false
+  }
+  _ -> false
+}
+
+#[doc("True when some argument carries the mark.")]
+pub fn eob_any(args_e: [Expr]) : Bool = match args_e {
+  []           -> false
+  [a, ...rest] -> eob_is_marked(a) or eob_any(rest)
+}
+
+#[doc("The value a marked argument wraps.")]
+pub fn eob_inner(a: Expr) : Expr = match a.kind {
+  ECall(_, [x]) -> x
+  _             -> a
+}
+
+#[doc("True for a marked argument computed in place, as opposed to one that only renames a binder.")]
+pub fn eob_is_fresh(a: Expr) : Bool = eob_is_marked(a) and not unw_bare_read(eob_inner(a))
+
+#[doc("True when a marked argument computed in place stands right of an argument that can have an effect of its own, so binding the temps up front would run them first.")]
+pub fn eob_needs_slots(args_e: [Expr]) : Bool = eob_slots_go(args_e, false)
+
+fn eob_slots_go(args_e: [Expr], seen: Bool) : Bool = match args_e {
+  []           -> false
+  [a, ...rest] ->
+    if eob_is_fresh(a) { seen or eob_slots_go(rest, seen) }
+    else { eob_slots_go(rest, seen or not eob_inert(a)) }
+}
+
+# A read or a literal: running it early or late changes nothing. A dup is
+# not one, its order against a sibling that consumes the value is load-bearing.
+fn eob_inert(a: Expr) : Bool = match a.kind {
+  ELocal(_)   -> true
+  ESym(_, _)  -> true
+  EInt(_, _)  -> true
+  EBool(_)    -> true
+  EChar(_)    -> true
+  EUnit       -> true
+  ECall(_, _) -> eob_is_marked(a)
+  _           -> false
+}
+
+# A temp takes a slot when it is computed in place and the call needs slots.
+fn eob_slotted(a: Expr, slots: Bool) : Bool = slots and eob_is_fresh(a)
+
+#[doc("The positions of the marked arguments computed in place.")]
+pub fn eob_fresh(args_e: [Expr]) : [Int] = eob_positions(args_e, true, true, 0)
+
+#[doc("The positions of the marked arguments held in a named temp bound before the call.")]
+pub fn eob_bound(args_e: [Expr], slots: Bool) : [Int] = eob_positions(args_e, false, slots, 0)
+
+fn eob_positions(args_e: [Expr], slotted: Bool, slots: Bool, i: Int) : [Int] = match args_e {
+  []           -> []
+  [a, ...rest] -> {
+    let more = eob_positions(rest, slotted, slots, i + 1)
+    if eob_is_marked(a) and eob_slotted(a, slots) == slotted { [i, ...more] } else { more }
+  }
+}
+
+#[doc("The key the named temp of argument `i` is minted under.")]
+pub fn eob_key(i: Int) : String = cat2("bc", int_to_string(i))
+
+#[doc("The C name of the named temp of argument `i`.")]
+pub fn eob_named_c(i: Int) : String = c_local(ln_implicit(eob_key(i)))
+
+#[doc("The C name of the slot array tagged `tag`.")]
+pub fn eob_array(tag: Int) : String = cat2("_obt", int_to_string(tag))
+
+#[doc("The C lvalue of slot `i` of the array tagged `tag`.")]
+pub fn eob_slot(tag: Int, i: Int) : String = cat2(eob_array(tag), cat2("[", cat2(int_to_string(i), "]")))
+
+#[doc("The C lvalue a slotted mark `__perceus_owned_borrow(g, tag, slot)` assigns.")]
+pub fn eob_slot_of(tag: Expr, slot: Expr) : String = eob_slot(eob_int(tag), eob_int(slot))
+
+fn eob_int(e: Expr) : Int = match e.kind {
+  EInt(v, _) -> v
+  _          -> 0
+}
+
+#[doc("The arguments the call is emitted over: a marked one reads its named temp, or keeps its mark and gains the slot it is assigned to.")]
+pub fn eob_call_args(args_e: [Expr], tag: Int, slots: Bool) : [Expr] = eob_call_args_go(args_e, tag, slots, 0)
+
+fn eob_call_args_go(args_e: [Expr], tag: Int, slots: Bool, i: Int) : [Expr] = match args_e {
+  []           -> []
+  [a, ...rest] -> [eob_call_arg(a, tag, slots, i), ...eob_call_args_go(rest, tag, slots, i + 1)]
+}
+
+fn eob_call_arg(a: Expr, tag: Int, slots: Bool, i: Int) : Expr =
+  if not eob_is_marked(a) { a }
+  else if eob_slotted(a, slots) { eob_with_slot(a, tag, i) }
+  else { Expr { ...a, kind: ELocal(local_minted(eob_key(i))) } }
+
+fn eob_with_slot(a: Expr, tag: Int, i: Int) : Expr = match a.kind {
+  ECall(mark, [inner]) ->
+    Expr { ...a, kind: ECall(mark, [inner, mk_expr(mk_int_synth(tag), a.line, a.col), mk_expr(mk_int_synth(i), a.line, a.col)]) }
+  _ -> a
+}
+
+#[doc("The C statements releasing every temp after the call.")]
+pub fn eob_drops(args_e: [Expr], tag: Int, slots: Bool) : String = eob_drops_go(args_e, tag, slots, 0)
+
+fn eob_drops_go(args_e: [Expr], tag: Int, slots: Bool, i: Int) : String = match args_e {
+  []           -> ""
+  [a, ...rest] -> string_concat(eob_drop(a, tag, slots, i), eob_drops_go(rest, tag, slots, i + 1))
+}
+
+fn eob_drop(a: Expr, tag: Int, slots: Bool, i: Int) : String =
+  if not eob_is_marked(a) { "" }
+  else if eob_slotted(a, slots) { concat_all(["kai_decref(", eob_slot(tag, i), "); "]) }
+  else { concat_all(["kai_decref(", eob_named_c(i), "); "]) }
