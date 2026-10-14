@@ -16,6 +16,9 @@ import compiler.symtab
 import compiler.perceus_borrow_strip
 import compiler.perceus_self_tail
 
+#[doc("Whether a self tail call's arguments may be hoisted, and the fn's borrowed boxed slots, whose bare reads the hoist keeps in place.")]
+pub type PcsHoist = { ok: Bool, bpos: [Int] }
+
 #[doc("""
 The arm binders' payers. An arm binder takes its birth ref at bind time
 (`kai_incref` in `emit_pat_binds`); when no read hands it on, a drop
@@ -75,13 +78,13 @@ read is never followed by a release. Lambda-captured binders are skipped
 — the goto ledger releases them after the args have built their closures.
 """)]
 pub fn pcs_arm_tail_drop_body(body: Expr, bound: [Binder], ln: Int, cl: Int,
-                          opt_g: Option[Expr], uses: UseIx, fn_name: SelfRef, owed_ok: Bool, tab: SymTab) : Expr =
+                          opt_g: Option[Expr], uses: UseIx, fn_name: SelfRef, hoist: PcsHoist, tab: SymTab) : Expr =
   match body.kind {
     EBlock(stmts, opt_tail) -> match opt_tail {
       Some(t) -> match pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, uses, []) {
         []    -> body
         drops -> {
-          let t1 = if pcs_is_self_tail_call(t, fn_name) { pcs_distribute_dead_drops(t, drops, fn_name, owed_ok, [], bound, tab) }
+          let t1 = if pcs_is_self_tail_call(t, fn_name) { pcs_distribute_dead_drops(t, drops, fn_name, hoist, [], bound, tab) }
                    else { pcs_arm_ret_wrap(t, drops) }
           Expr { kind: EBlock(stmts, Some(t1)), line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
         }
@@ -145,14 +148,14 @@ cannot be wrapped, since the wrap would hide the call from TCO, so each
 leaf pays on its own path. Any other body is wrapped: its value is bound,
 the drops run, the value is yielded. TRMC replants the wrap's drops.
 """)]
-pub fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, who: [Binder], tab: SymTab) : Expr {
+pub fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: SelfRef, hoist: PcsHoist, who: [Binder], tab: SymTab) : Expr {
   match body.kind {
     EBlock(stmts, opt_tail) ->
       Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
              line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
     _ -> {
       if pcs_is_self_tail_call(body, fn_name) {
-        pcs_distribute_dead_drops(body, drops, fn_name, owed_ok, [], who, tab)
+        pcs_distribute_dead_drops(body, drops, fn_name, hoist, [], who, tab)
       }
       else { pcs_arm_ret_wrap(body, drops) }
     }
@@ -178,36 +181,36 @@ fn pcs_arm_ret_wrap(body: Expr, drops: [Stmt]) : Expr = {
 
 # Close each tail leaf of `body` for `drops`: the goto skips every exit.
 # A self-tail-call leaf drops a binder it never mentions before the call,
-# and one it reads only through dups after the hoisted args (`owed_ok`),
+# and one it reads only through dups after the hoisted args (`hoist.ok`),
 # since the borrow strip may later turn a dup into a bare read the goto
 # ledger takes for a move; a binder with a bare read pays on its own path.
 # A modulo-cons leaf is left to the TRMC rewrite. A value leaf releases,
 # after its value is built, every binder it does not move except those in
 # `held`, the binders a nested scope declares. `who` lists the binders the
 # drops release.
-fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : Expr =
-  Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name, owed_ok, held, who, tab),
+fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: SelfRef, hoist: PcsHoist, held: [Binder], who: [Binder], tab: SymTab) : Expr =
+  Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name, hoist, held, who, tab),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
 
 fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: SelfRef,
-               owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : ExprKind {
+               hoist: PcsHoist, held: [Binder], who: [Binder], tab: SymTab) : ExprKind {
   match k {
     EIf(c, t, opt_e) ->
-      EIf(c, pcs_distribute_dead_drops(t, drops, fn_name, owed_ok, held, who, tab),
-          match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, owed_ok, held, who, tab)) })
-    EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, owed_ok, held, who, tab))
+      EIf(c, pcs_distribute_dead_drops(t, drops, fn_name, hoist, held, who, tab),
+          match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, hoist, held, who, tab)) })
+    EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, hoist, held, who, tab))
     EBlock(stmts, opt_tail) -> match opt_tail {
       Some(t) ->
-        if ppd_is_hoist_block(stmts) { pcs_dd_hoisted(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode , site: 0 }, drops, owed_ok, who) }
-        else { EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, owed_ok, held, ppd_let_names(stmts), who, tab))) }
+        if ppd_is_hoist_block(stmts) { pcs_dd_hoisted(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode , site: 0 }, drops, hoist, who) }
+        else { EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, hoist, held, ppd_let_names(stmts), who, tab))) }
       None    -> k
     }
-    _ -> pcs_dd_leaf(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode , site: 0 }, drops, fn_name, owed_ok, held, who, tab)
+    _ -> pcs_dd_leaf(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode , site: 0 }, drops, fn_name, hoist, held, who, tab)
   }
 }
 
-fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : ExprKind =
-  if pcs_is_self_tail_call(leaf, fn_name) { pcs_dd_goto_leaf(leaf, drops, owed_ok, who) }
+fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: SelfRef, hoist: PcsHoist, held: [Binder], who: [Binder], tab: SymTab) : ExprKind =
+  if pcs_is_self_tail_call(leaf, fn_name) { pcs_dd_goto_leaf(leaf, drops, hoist, who) }
   else if pcs_is_modcons_leaf(leaf, fn_name, tab) { leaf.kind }
   else {
     match filter(pcs_unmoved_names(drops, leaf, who), (nm) => not pcs_has(held, nm.id)) {
@@ -216,22 +219,22 @@ fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held:
     }
   }
 
-fn pcs_dd_goto_leaf(leaf0: Expr, drops: [Stmt], owed_ok: Bool, who: [Binder]) : ExprKind = {
+fn pcs_dd_goto_leaf(leaf0: Expr, drops: [Stmt], hoist: PcsHoist, who: [Binder]) : ExprKind = {
   let leaf = pcs_dd_pay_paths(drops, leaf0, who)
-  let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, leaf, who)) } else { [] }
-  let paid = match owed { [] -> leaf  _ -> ppd_hoist_then(leaf, owed) }
+  let owed = if hoist.ok { filter(drops, (d) => pcs_drop_owed_in(d, leaf, who)) } else { [] }
+  let paid = match owed { [] -> leaf  _ -> ppd_hoist_then(leaf, owed, hoist.bpos) }
   match pcs_drops_dead_in(drops, leaf, who) {
     []   -> paid.kind
     dead -> EBlock(dead, Some(paid))
   }
 }
 
-fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder], who: [Binder], tab: SymTab) : [Arm] = match arms {
+fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: SelfRef, hoist: PcsHoist, held: [Binder], who: [Binder], tab: SymTab) : [Arm] = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) ->
-      [Arm(pat, opt_g, pcs_dd_scoped(body, drops, fn_name, owed_ok, held, prc_pat_bindings(pat, []), who, tab)),
-       ...pcs_dd_arms(rest, drops, fn_name, owed_ok, held, who, tab)]
+      [Arm(pat, opt_g, pcs_dd_scoped(body, drops, fn_name, hoist, held, prc_pat_bindings(pat, []), who, tab)),
+       ...pcs_dd_arms(rest, drops, fn_name, hoist, held, who, tab)]
   }
 }
 
@@ -261,17 +264,18 @@ fn pcs_unmoved_names(drops: [Stmt], leaf: Expr, who: [Binder]) : [Binder] = matc
 
 # Under a scope binding `names`: a rebound name would make a leaf read the
 # inner binder, not the dropped one, so no drop moves past the leaf's reads.
-fn pcs_dd_scoped(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held: [Binder],
+fn pcs_dd_scoped(body: Expr, drops: [Stmt], fn_name: SelfRef, hoist: PcsHoist, held: [Binder],
                  names: [Binder], who: [Binder], tab: SymTab) : Expr =
-  pcs_distribute_dead_drops(body, drops, fn_name, owed_ok and not any(drops, (d) => ppd_drop_among(d, names)),
+  pcs_distribute_dead_drops(body, drops, fn_name,
+                            PcsHoist { ok: hoist.ok and not any(drops, (d) => ppd_drop_among(d, names)), bpos: hoist.bpos },
                             list_append(names, held), who, tab)
 
 # A self-call whose arguments an inner scope already hoisted: the argument
 # lets are part of the leaf, so its reads there count, and an owed drop
 # runs after the last of them.
-fn pcs_dd_hoisted(blk: Expr, drops: [Stmt], owed_ok: Bool, who: [Binder]) : ExprKind = {
+fn pcs_dd_hoisted(blk: Expr, drops: [Stmt], hoist: PcsHoist, who: [Binder]) : ExprKind = {
   let paid = pcs_dd_pay_paths(drops, blk, who)
-  let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, paid, who)) } else { [] }
+  let owed = if hoist.ok { filter(drops, (d) => pcs_drop_owed_in(d, paid, who)) } else { [] }
   let after = match paid.kind {
     EBlock(ss, t) -> EBlock(list_append(ss, owed), t)
     k             -> k
