@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.152.1 (2026-10-14)
+
+### Fixed
+
+- **perceus**: a mutual tail call releases the binders its arguments read (#2809)
+- **diag**: the checks that printed and counted hand their diagnostics to --diags-json (#2806)
+
 ## v0.152.0 (2026-10-13)
 
 ### BREAKING CHANGE
