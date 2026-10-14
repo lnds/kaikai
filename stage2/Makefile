@@ -6226,8 +6226,8 @@ test-unbox-phase2: $(TARGET) build
 	@# pass had emitted `int64_t kair_n` — link fail. The historical
 	@# fix forced `n` to MBoxed via the unbox_stmt SLet branch.
 	@#
-	@# Post `desugar_interp_decls`: interpolation is lifted to a
-	@# `string_concat_all([...])` ECall BEFORE the unbox pass runs, so
+	@# An interpolation is a `string_concat_all([...])` ECall from
+	@# surface lowering on, long BEFORE the unbox pass runs, so
 	@# the re-parse no longer happens — `int_to_string(n)` is a regular
 	@# ECall the codegen handles by calling `kai_int(kair_n)` at the
 	@# use site. The MBoxed demote is no longer needed and would
@@ -6240,7 +6240,7 @@ test-unbox-phase2: $(TARGET) build
 	            build/perceus-unbox_phase2_r8_let_in_interp.out; exit 1; }
 	@grep -q 'int64_t kair_n_[0-9][0-9]* = 42LL' \
 	        build/perceus-unbox_phase2_r8_let_in_interp.c \
-	  || { echo "unbox FAIL r8_let_in_interp (kair_n not unboxed — desugar_interp regressed?)"; exit 1; }
+	  || { echo "unbox FAIL r8_let_in_interp (kair_n not unboxed — interpolation lowering regressed?)"; exit 1; }
 	@if grep -q 'KaiValue \*kaiv_n_[0-9][0-9]* = kai_int(42LL)' \
 	        build/perceus-unbox_phase2_r8_let_in_interp.c; then \
 	  echo "unbox FAIL r8_let_in_interp (boxed kaiv_n re-appeared; obsolete demote returned)"; exit 1; \

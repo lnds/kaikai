@@ -1,15 +1,13 @@
 #[doc("""
 Fatal-error gate for interpolation bodies that do not parse.
 
-The lift parses each `#{...}` body (`parse_interp_expr`) and recovers from
-a parse failure by substituting the empty string — the only choice
-available to a pure rebuild walker. Without this pass the program builds
-and exits 0 with the fragment silently dropped.
+Surface lowering turns an interpolated string into a tree only when
+every `#{...}` body parses, and leaves the span as written otherwise.
+Without this pass that span would go on as a plain string.
 
-The scan runs once, before the lift, and reports each failing fragment
-against the file and position it really occupies: the parser's own error
-carries `<interp>` and a position inside the fragment, which names no
-file the user wrote.
+The scan reports each failing fragment against the file and position it
+really occupies: the parser's own error carries `<interp>` and a
+position inside the fragment, which names no file the user wrote.
 """)]
 
 import compiler.ast
@@ -17,6 +15,7 @@ import compiler.diag
 import compiler.diag_file
 import compiler.fnreg
 import compiler.infer
+import compiler.interp_holes
 import compiler.parse
 import compiler.util
 
@@ -140,22 +139,7 @@ fn ic_span(span: String, is_triple: Bool, file: String,
   else {
     let parts = iscan_collect(span, body_end,
                               IScan { parts: [], lit_start: body_start, i: body_start })
-    ic_parts(parts, IcPos { line: line, col: col + body_start }, file, acc)
-  }
-}
-
-# Where a part begins in the real source; mirrors the lift's own walk so
-# the caret lands on the fragment, not on the literal's opening quote.
-type IcPos = { line: Int, col: Int }
-
-fn ic_advance(p: IcPos, s: String, i: Int) : IcPos = {
-  if i >= string_length(s) { p }
-  else {
-    let nxt = match char_at(s, i) {
-      Some('\n') -> IcPos { line: p.line + 1, col: 1 }
-      _          -> IcPos { line: p.line, col: p.col + 1 }
-    }
-    ic_advance(nxt, s, i + 1)
+    ic_parts(parts, InterpPos { line: line, col: col + body_start }, file, acc)
   }
 }
 
@@ -166,24 +150,16 @@ fn ic_report(file: String, line: Int, col: Int, src: String, acc: Int) : Int / C
   acc + 1
 }
 
-fn ic_parts(parts: [IPart], pos: IcPos, file: String, acc: Int) : Int / Console + File =
+fn ic_parts(parts: [IPart], pos: InterpPos, file: String, acc: Int) : Int / Console + File =
   match parts {
     [] -> acc
-    [p, ...rest] -> {
-      let a1 = match p {
-        IpLit(_, _) -> acc
-        IpExp(src) -> match parse_interp_expr(src) {
-          Some(_) -> acc
-          None -> ic_report(file, pos.line, pos.col + 2, src, acc)
-        }
+    [IpLit(piece, _), ...rest] -> ic_parts(rest, interp_pos_advance(pos, piece, 0), file, acc)
+    [IpExp(src), ...rest] -> {
+      let body = interp_pos_body(pos)
+      let a1 = match parse_interp_expr(src) {
+        Some(_) -> acc
+        None    -> ic_report(file, body.line, body.col, src, acc)
       }
-      let next = match p {
-        IpLit(piece, _) -> ic_advance(pos, piece, 0)
-        IpExp(src) -> {
-          let after = ic_advance(IcPos { line: pos.line, col: pos.col + 2 }, src, 0)
-          IcPos { line: after.line, col: after.col + 1 }
-        }
-      }
-      ic_parts(rest, next, file, a1)
+      ic_parts(rest, interp_pos_past(body, src), file, a1)
     }
   }
