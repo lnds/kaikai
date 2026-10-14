@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.152.2 (2026-10-14)
+
+### Fixed
+
+- **perceus**: a borrowed slot releases what it is handed, in order, and a ^ parameter survives the reads that consume their operand (#2803)
+
 ## v0.152.1 (2026-10-14)
 
 ### Fixed
