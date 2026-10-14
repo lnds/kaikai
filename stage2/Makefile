@@ -1607,6 +1607,7 @@ test-ffi-cflags-include: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="$(CFLAGS_INCLUDE_PROBE)" ../bin/kai build --backend=c ../examples/ffi/cflags_include.kai -o build/cflags-include-c 2> build/cflags-include-c.err \
 	  || { echo "ffi-cflags-include BUILD FAIL (C backend)"; cat build/cflags-include-c.err; exit 1; }; \
+	if grep -q redefined build/cflags-include-c.err; then echo "ffi-cflags-include FAIL: a feature macro is redefined (C backend)"; cat build/cflags-include-c.err; exit 1; fi; \
 	./build/cflags-include-c > build/cflags-include-c.out; \
 	diff -q ../examples/ffi/cflags_include.out.expected build/cflags-include-c.out > /dev/null \
 	  || { echo "ffi-cflags-include DIFF (C backend)"; diff ../examples/ffi/cflags_include.out.expected build/cflags-include-c.out; exit 1; }; \
@@ -1629,6 +1630,7 @@ test-ffi-cflags-include-native: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="$(CFLAGS_INCLUDE_PROBE)" KAI_BACKEND=native ../bin/kai build ../examples/ffi/cflags_include.kai -o build/cflags-include-nat 2> build/cflags-include-nat.err \
 	  || { echo "ffi-cflags-include BUILD FAIL (native)"; cat build/cflags-include-nat.err; exit 1; }; \
+	if grep -q redefined build/cflags-include-nat.err; then echo "ffi-cflags-include FAIL: a feature macro is redefined (native)"; cat build/cflags-include-nat.err; exit 1; fi; \
 	./build/cflags-include-nat > build/cflags-include-nat.out; \
 	diff -q ../examples/ffi/cflags_include.out.expected build/cflags-include-nat.out > /dev/null \
 	  && echo "ffi-cflags-include OK (native)" \
