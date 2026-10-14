@@ -87,13 +87,13 @@ growth makes the site quadratic.
 
 | # | site | file | bound | exponent | self-compile cons | share of all allocs | state |
 |---:|---|---|---|---:|---:|---:|---|
-| 1 | `list_minus` / `list_minus_loop` | `emit_shared.kai:1394` | `st.globals` — every global in the program, walked per lambda | 1.05 / lambda | 7,539,728 | 1.14% | fixed |
-| 2 | `partition_decls_by_home` (= `bucket_append`) | `infer.kai:19649` | decls per home module | 1.67 (decls) | 2,901,030 | 0.44% | fixed in its own lane |
+| 1 | `list_minus` / `list_minus_loop` | `emit_shared.kai` (since removed) | `st.globals` — every global in the program, walked per lambda | 1.05 / lambda | 7,539,728 | 1.14% | fixed |
+| 2 | `partition_decls_by_home` (= `bucket_append`) | `infer.kai` | decls per home module | 1.67 (decls) | 2,901,030 | 0.44% | fixed in its own lane |
 | 3 | `flatten_module_decls` | `infer.kai` | modules × decls each | 1.27 (mods) | 2,393,716 | 0.36% | fixed |
-| 4 | `fns_prefer_module` | `emit_shared.kai` | the whole `EFn` table, per module | 1.35 (mods) | 2,254,504 | 0.34% | scan fixed, append kept |
-| 5 | `rs_append_decls` | `driver.kai:1047` | `rs.decls` — all decls resolved so far | 2.02 (mods) | 1,104,607 | 0.17% | fixed |
-| 6 | `scopes_bind` | `driver.kai` | bindings per owner module | 2.03 (mods) | 109,573 | 0.02% | kept, measured |
-| 7 | `rs_add_module` | `driver.kai` | `rs.modules` | 2.03 (mods) | 23,220 | 0.00% | fixed |
+| 4 | `fns_prefer_module` | `emit_shared.kai` (since removed) | the whole `EFn` table, per module | 1.35 (mods) | 2,254,504 | 0.34% | scan fixed, append kept |
+| 5 | `rs_append_decls` | `driver_front.kai` | `rs.decls` — all decls resolved so far | 2.02 (mods) | 1,104,607 | 0.17% | fixed |
+| 6 | `scopes_bind` | `driver_front.kai` | bindings per owner module | 2.03 (mods) | 109,573 | 0.02% | kept, measured |
+| 7 | `rs_add_module` | `driver_front.kai` | `rs.modules` | 2.03 (mods) | 23,220 | 0.00% | fixed |
 
 Together ~2.5% of the self-compile's allocations.
 

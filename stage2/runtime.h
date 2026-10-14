@@ -14084,7 +14084,7 @@ static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, Kai
 
 /* Build an IpAddr record `{ addr }` from an addrinfo node. The field
  * name "addr" is the runtime contract with the kaikai-side builtin
- * `type IpAddr = { addr: String }` (driver.kai builtin_ipaddr_decl);
+ * `type IpAddr = { addr: String }` (stdlib/net/dns.kai);
  * kai_op_field reads it by strcmp, so the static cstring is enough. */
 static KaiValue *_kai_net_make_ipaddr(struct addrinfo *p) {
     char ip_buf[INET_ADDRSTRLEN];
