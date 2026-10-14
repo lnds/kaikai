@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.152.0 (2026-10-13)
+
+### BREAKING CHANGE
+
+- a program whose interpolation named an undeclared type, built an undeclared record or qualified a name with a module it does not import compiled before and is rejected now; an interpolation inside a type's `where` predicate is an error with its own message.
+
+### Fixed
+
+- **runtime**: a send that lands as receive_timeout parks wakes the receiver (#2808)
+- **parse**: an interpolation body is an ordinary expression from surface lowering on (#2801)
+- **lint**: a lint reports on the package's own files, not on the modules they import (#2807)
+
 ## v0.151.0 (2026-10-13)
 
 ### BREAKING CHANGE
