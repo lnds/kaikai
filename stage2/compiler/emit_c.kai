@@ -130,6 +130,7 @@ import compiler.unwind_effects
 import compiler.unwind_cx
 import compiler.unwind_calls
 import compiler.emit_unwind_c
+import compiler.emit_ob_slots
 import compiler.kir_pat_alias
 import compiler.resume_scan
 import compiler.decl_names
@@ -1643,14 +1644,13 @@ fn emit_mark_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / 
       ])
       _ -> "kai_unit() /* trmc apply: arity mismatch */"
     }
-    # Normally the enclosing call emits the closure plus the drop-after,
-    # having seen this mark on one of its args. Reaching here means a
-    # rarer path (a pipe splice) did not capture it as such an arg, so
-    # emit the inner value and skip the drop — a bounded leak, never a
-    # miscompile.
+    # The enclosing call gives a marked arg its slot and the drop-after.
+    # A bare mark reached a path that did not (a pipe splice): its inner
+    # value is emitted with no drop — a bounded leak, never a miscompile.
     MkOwnedBorrow -> match args_e {
-      [g] -> emit_expr(src, g, cx)
-      _   -> "kai_unit() /* owned borrow: arity mismatch */"
+      [g]            -> emit_expr(src, g, cx)
+      [g, tag, slot] -> concat_all(["(", eob_slot_of(tag, slot), " = ", emit_expr(src, g, cx), ")"])
+      _              -> "kai_unit() /* owned borrow: arity mismatch */"
     }
     # A dup lowers to the runtime incref, which hands its operand back.
     MkDup -> match args_e {
@@ -1725,7 +1725,7 @@ fn emit_call_expr_named(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Str
   # each marked arg is bound to a temp, the call runs, then each temp is
   # decref'd. This is invisible to tcrec/TCO (the ref never existed in the
   # AST — it is born here as `kai_closure`), unlike an AST-level EBlock wrap.
-  if emit_args_have_owned_borrow(args_e) {
+  if eob_any(args_e) {
     emit_call_with_owned_borrow_drops(src, f, args_e, cx)
   } else {
 
@@ -1752,105 +1752,52 @@ fn emit_call_expr_named(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Str
   }
 }
 
-fn emit_args_have_owned_borrow(args_e: [Expr]) : Bool = match args_e {
-  []           -> false
-  [a, ...rest] -> if emit_is_owned_borrow(a) { true } else { emit_args_have_owned_borrow(rest) }
-}
+# `({ <open> T _bcr = <call over args>; <close> _bcr; })`: every
+# `__perceus_owned_borrow` arg is held in a temp the call borrows and `close`
+# releases — the birth ref the callee did not consume. The slot array is
+# registered for the call's extent when the call can unwind, and read live:
+# a slot not reached yet is null. A named temp is never registered, its
+# binder is already.
+type ObPlan = { open: String, close: String, args: [Expr], cx: EmitCtx }
 
-fn emit_is_owned_borrow(a: Expr) : Bool = match a.kind {
-  ECall(callee, _) -> match callee.kind {
-    EMark(MkOwnedBorrow) -> true
-    _                    -> false
+fn emit_ob_plan(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : ObPlan / Console = {
+  let tag = list_length(cx.tcpend)
+  let fresh = eob_positions(args_e, (a) => eob_is_fresh(a))
+  let named = eob_positions(args_e, (a) => eob_is_named(a))
+  let cx1 = emit_ctx_declaring(cx, map(named, eob_key))
+  let binds = emit_ob_binds(src, args_e, named, cx)
+  let plain = ObPlan { open: binds, close: eob_drops(args_e, tag), args: eob_call_args(args_e, tag), cx: cx1 }
+  match fresh {
+    [] -> plain
+    _  -> {
+      let n = int_to_string(list_length(args_e))
+      let decl = concat_all([binds, "KaiValue *", eob_array(tag), "[", n, "] = {0}; "])
+      if cx.unw.sites != [] and unw_call_unwinds(f, args_e, cx.unw.bound, cx.unw.ucx) {
+        let fib = cat2("_uwo", int_to_string(tag))
+        let pend = list_append(list_append(cx.tcpend, [tcl_unw_entry(fib)]), map(fresh, (i) => tcl_scr_entry(eob_slot(tag, i))))
+        ObPlan { ...plain, open: string_concat(decl, euw_array_push(fib, eob_array(tag), n)),
+                 close: string_concat(euw_pop(fib), plain.close), cx: emit_ctx_with_tcpend(cx1, pend) }
+      } else { ObPlan { ...plain, open: decl } }
+    }
   }
-  _ -> false
 }
 
-# Unwrap `__perceus_owned_borrow(g)` to `g` (the fn-name / closure expr).
-fn emit_owned_borrow_inner(a: Expr) : Expr = match a.kind {
-  ECall(_, inner) -> match inner { [x] -> x  _ -> a }
-  _               -> a
+fn emit_ob_binds(src: String, args_e: [Expr], named: [Int], cx: EmitCtx) : String / Console = match named {
+  []           -> ""
+  [i, ...rest] -> match nth(args_e, i) {
+    Some(a) -> concat_all(["KaiValue *", eob_named_c(i), " = ", emit_expr(src, eob_inner(a), cx), "; ",
+                           emit_ob_binds(src, args_e, rest, cx)])
+    None    -> ""
+  }
 }
 
-# `({ KaiValue *kaiv_bcN = <clo>; ...; KaiValue *_bcr = <call with kaiv_bcN>;
-#     kai_decref(kaiv_bcN); ...; _bcr; })`. Each `__perceus_owned_borrow` arg
-# is materialised into a temp `bcN` (a binder minted under that key, so its
-# read re-emits as the `kaiv_bcN` local), the call runs borrowing them, then
-# each temp is dropped — the birth ref the callee did not consume.
 fn emit_call_with_owned_borrow_drops(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
-  let hold = emit_ob_hold(f, args_e, emit_ctx_declaring(cx, emit_ob_names(args_e, 0)))
-  let binds = emit_ob_binds(src, args_e, 0, cx)
-  let call_args = emit_ob_rewrite_args(args_e, 0)
-  let call = match emit_ufn_boxed_call(src, f, call_args, hold.cx) {
+  let p = emit_ob_plan(src, f, args_e, cx)
+  let call = match emit_ufn_boxed_call(src, f, p.args, p.cx) {
     Some(s) -> s
-    None    -> emit_call_expr_default(src, f, call_args, hold.cx)
+    None    -> emit_call_expr_default(src, f, p.args, p.cx)
   }
-  let drops = emit_ob_drops(args_e, 0)
-  concat_all(["({ ", binds, hold.push, "KaiValue *_bcr = ", call, "; ", hold.pop, drops, "_bcr; })"])
-}
-
-# An owned-borrow temp computed in place is held by no binder, so across a
-# call that can unwind it is registered for the call's extent; an early
-# return out of the call's operands pops it and releases the temps. A temp
-# that only renames a binder is not: the binder is registered already.
-type ObHold = { push: String, pop: String, cx: EmitCtx }
-
-fn emit_ob_hold(f: Expr, args_e: [Expr], cx: EmitCtx) : ObHold = match emit_ob_fresh(args_e, 0) {
-  [] -> ObHold { push: "", pop: "", cx: cx }
-  names -> if cx.unw.sites != [] and unw_call_unwinds(f, args_e, cx.unw.bound, cx.unw.ucx) {
-    let vars = map(names, (n) => c_local(ln_implicit(n)))
-    let pend = list_append(list_append(cx.tcpend, [tcl_unw_entry("_uwo")]), map(vars, tcl_scr_entry))
-    ObHold { push: euw_vars_push("_uwo", vars), pop: euw_pop("_uwo"), cx: emit_ctx_with_tcpend(cx, pend) }
-  } else { ObHold { push: "", pop: "", cx: cx } }
-}
-
-fn emit_ob_fresh(args_e: [Expr], i: Int) : [String] = match args_e {
-  []           -> []
-  [a, ...rest] -> {
-    let more = emit_ob_fresh(rest, i + 1)
-    if emit_is_owned_borrow(a) and not unw_bare_read(emit_owned_borrow_inner(a)) { [cat2("bc", int_to_string(i)), ...more] } else { more }
-  }
-}
-
-fn emit_ob_names(args_e: [Expr], i: Int) : [String] = match args_e {
-  []           -> []
-  [a, ...rest] -> {
-    let more = emit_ob_names(rest, i + 1)
-    if emit_is_owned_borrow(a) { [concat_all(["bc", int_to_string(i)]), ...more] } else { more }
-  }
-}
-
-fn emit_ob_binds(src: String, args_e: [Expr], i: Int, cx: EmitCtx) : String / Console = match args_e {
-  []           -> ""
-  [a, ...rest] -> {
-    let more = emit_ob_binds(src, rest, i + 1, cx)
-    if emit_is_owned_borrow(a) {
-      concat_all(["KaiValue *", c_local(ln_implicit(cat2("bc", int_to_string(i)))), " = ",
-                  emit_expr(src, emit_owned_borrow_inner(a), cx), "; ", more])
-    } else { more }
-  }
-}
-
-# Replace each `__perceus_owned_borrow(g)` arg with a read of its temp
-# `bcN`; leave the rest untouched.
-fn emit_ob_rewrite_args(args_e: [Expr], i: Int) : [Expr] = match args_e {
-  []           -> []
-  [a, ...rest] -> {
-    let a2 = if emit_is_owned_borrow(a) {
-               Expr { kind: ELocal(local_minted(concat_all(["bc", int_to_string(i)]))),
-                      line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }
-             } else { a }
-    [a2, ...emit_ob_rewrite_args(rest, i + 1)]
-  }
-}
-
-fn emit_ob_drops(args_e: [Expr], i: Int) : String = match args_e {
-  []           -> ""
-  [a, ...rest] -> {
-    let more = emit_ob_drops(rest, i + 1)
-    if emit_is_owned_borrow(a) {
-      concat_all(["kai_decref(", c_local(ln_implicit(cat2("bc", int_to_string(i)))), "); ", more])
-    } else { more }
-  }
+  concat_all(["({ ", p.open, "KaiValue *_bcr = ", call, "; ", p.close, "_bcr; })"])
 }
 
 # Phase 3 unboxing — try to emit the call as a raw-call boxed
@@ -2472,7 +2419,7 @@ fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx)
         let g = fr.get
         let fidx = match fr.col { VecCol(k, _) -> int_to_string(k) }
         let vi = concat_all([emit_expr(src, g.v, cx), ", ", emit_expr(src, g.i, cx), ", ", fidx])
-        if g.borrows { Some(concat_all(["kai_vec_get_field_borrow(", vi, if emit_is_owned_borrow(g.v) { ", 1)" } else { ", 0)" }])) }
+        if g.borrows { Some(concat_all(["kai_vec_get_field_borrow(", vi, if eob_is_marked(g.v) { ", 1)" } else { ", 0)" }])) }
         else { Some(cat3("kai_vec_get_field(", vi, ")")) }
       }
     }
@@ -6126,16 +6073,13 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
 }
 
 # Raw-return UFn call: plain when no arg carries the
-# `__perceus_owned_borrow` mark; else bind each marked arg to a temp,
-# call, and drop the temps after — the raw-context mirror of
+# `__perceus_owned_borrow` mark, else the raw-context mirror of
 # emit_call_with_owned_borrow_drops.
 fn emit_ufn_raw_call_go(src: String, f: Expr, fid: FnId, sym: String, args_e: [Expr], mask: [Bool], ptys: [Ty], rt: Ty, cx: EmitCtx) : String / Console {
-  if emit_args_have_owned_borrow(args_e) {
-    let hold = emit_ob_hold(f, args_e, emit_ctx_declaring(cx, emit_ob_names(args_e, 0)))
-    let binds = emit_ob_binds(src, args_e, 0, cx)
-    let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, ptys, hold.cx)
-    let drops = emit_ob_drops(args_e, 0)
-    concat_all(["({ ", binds, hold.push, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(fid, sym, raw_vals, hold.cx), "; ", hold.pop, drops, "_bcr; })"])
+  if eob_any(args_e) {
+    let p = emit_ob_plan(src, f, args_e, cx)
+    let raw_vals = emit_arg_vals_masked(src, p.args, mask, ptys, p.cx)
+    concat_all(["({ ", p.open, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(fid, sym, raw_vals, p.cx), "; ", p.close, "_bcr; })"])
   } else {
     emit_user_call_seq(fid, sym, emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
   }

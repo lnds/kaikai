@@ -1,0 +1,102 @@
+#[doc("""
+Owned-borrow arguments of a C call.
+
+Perceus marks an argument the caller releases after a borrowing call, and
+the C emitter holds each in a temp for the call's extent. A temp computed
+in place takes a slot of one array and is assigned where its argument
+stands, so the operands still run left to right. A temp that only renames
+a binder is a named local bound before the call: reading it has no effect.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.emit_shared
+import compiler.local_names
+import compiler.unwind_binders
+
+#[doc("True for an argument carrying the bare owned-borrow mark.")]
+pub fn eob_is_marked(a: Expr) : Bool = match a.kind {
+  ECall(callee, [_]) -> match callee.kind {
+    EMark(MkOwnedBorrow) -> true
+    _                    -> false
+  }
+  _ -> false
+}
+
+#[doc("True when some argument carries the mark.")]
+pub fn eob_any(args_e: [Expr]) : Bool = any(args_e, (a) => eob_is_marked(a))
+
+#[doc("The value a marked argument wraps.")]
+pub fn eob_inner(a: Expr) : Expr = match a.kind {
+  ECall(_, [x]) -> x
+  _             -> a
+}
+
+#[doc("True for a marked argument computed in place.")]
+pub fn eob_is_fresh(a: Expr) : Bool = eob_is_marked(a) and not unw_bare_read(eob_inner(a))
+
+#[doc("True for a marked argument that only renames a binder.")]
+pub fn eob_is_named(a: Expr) : Bool = eob_is_marked(a) and unw_bare_read(eob_inner(a))
+
+#[doc("The positions of the arguments `pick` accepts.")]
+pub fn eob_positions(args_e: [Expr], pick: (Expr) -> Bool) : [Int] = eob_positions_go(args_e, pick, 0)
+
+fn eob_positions_go(args_e: [Expr], pick: (Expr) -> Bool, i: Int) : [Int] = match args_e {
+  []           -> []
+  [a, ...rest] -> {
+    let more = eob_positions_go(rest, pick, i + 1)
+    if pick(a) { [i, ...more] } else { more }
+  }
+}
+
+#[doc("The key the named temp of argument `i` is minted under.")]
+pub fn eob_key(i: Int) : String = cat2("bc", int_to_string(i))
+
+#[doc("The C name of the named temp of argument `i`.")]
+pub fn eob_named_c(i: Int) : String = c_local(ln_implicit(eob_key(i)))
+
+#[doc("The C name of the slot array tagged `tag`.")]
+pub fn eob_array(tag: Int) : String = cat2("_obt", int_to_string(tag))
+
+#[doc("The C lvalue of slot `i` of the array tagged `tag`.")]
+pub fn eob_slot(tag: Int, i: Int) : String = concat_all([eob_array(tag), "[", int_to_string(i), "]"])
+
+#[doc("The C lvalue a slotted mark `__perceus_owned_borrow(g, tag, slot)` assigns.")]
+pub fn eob_slot_of(tag: Expr, slot: Expr) : String = eob_slot(eob_int(tag), eob_int(slot))
+
+fn eob_int(e: Expr) : Int = match e.kind {
+  EInt(v, _) -> v
+  _          -> 0
+}
+
+#[doc("The arguments the call is emitted over: a renaming one reads its named temp, one computed in place keeps its mark and gains its slot.")]
+pub fn eob_call_args(args_e: [Expr], tag: Int) : [Expr] = eob_call_args_go(args_e, tag, 0)
+
+fn eob_call_args_go(args_e: [Expr], tag: Int, i: Int) : [Expr] = match args_e {
+  []           -> []
+  [a, ...rest] -> [eob_call_arg(a, tag, i), ...eob_call_args_go(rest, tag, i + 1)]
+}
+
+fn eob_call_arg(a: Expr, tag: Int, i: Int) : Expr =
+  if eob_is_named(a) { Expr { ...a, kind: ELocal(local_minted(eob_key(i))) } }
+  else if eob_is_fresh(a) { eob_slotted(a, tag, i) }
+  else { a }
+
+fn eob_slotted(a: Expr, tag: Int, i: Int) : Expr = match a.kind {
+  ECall(mark, [inner]) ->
+    Expr { ...a, kind: ECall(mark, [inner, mk_expr(mk_int_synth(tag), a.line, a.col), mk_expr(mk_int_synth(i), a.line, a.col)]) }
+  _ -> a
+}
+
+#[doc("The C statements releasing every temp after the call.")]
+pub fn eob_drops(args_e: [Expr], tag: Int) : String = eob_drops_go(args_e, tag, 0)
+
+fn eob_drops_go(args_e: [Expr], tag: Int, i: Int) : String = match args_e {
+  []           -> ""
+  [a, ...rest] -> string_concat(eob_drop(a, tag, i), eob_drops_go(rest, tag, i + 1))
+}
+
+fn eob_drop(a: Expr, tag: Int, i: Int) : String =
+  if eob_is_named(a) { concat_all(["kai_decref(", eob_named_c(i), "); "]) }
+  else if eob_is_fresh(a) { concat_all(["kai_decref(", eob_slot(tag, i), "); "]) }
+  else { "" }
