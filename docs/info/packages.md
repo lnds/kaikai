@@ -151,6 +151,18 @@ this file ``) whose help names the import to add. A module's names
 shadow a core name of the same spelling only in the files that import
 it.
 
+A bare use that reaches a function of a module the file opens, where
+that function has the same type as the core function it shadows, is an
+error: nothing else would catch the swap. `import encoding.hex` brings
+`hex.to_int : (String) -> Option[Int]`, which reads hexadecimal, so a
+bare `to_int("10")` beside it is rejected. Write `hex.to_int`, import
+the module under a qualifier (`import encoding.hex as hex`) so a bare
+`to_int` names the core one, or pick it by name
+(`import encoding.hex.{to_int}`) to say the file means the module's. A
+shadow of another type stays allowed, since a misuse fails to
+typecheck: `import math.bigint` keeps a bare `to_int(x)` on a `BigInt`,
+and the collections' `map` and `filter` work the same way.
+
 Imports are RESOLVED through `kai.toml` — the name on the right of
 `import` must appear as a dep (or be a stdlib name).
 
