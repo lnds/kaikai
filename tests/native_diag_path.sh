@@ -9,12 +9,13 @@
 # cannot click, under a directory whose name changes between builds. The
 # C path never copies and has always named the real file.
 #
-# Two things are pinned:
+# Three things are pinned:
 #   1. the rendered path is the user's file, on both native paths, from a
 #      project directory whose name carries `.`, `*`, `[`, `&` and `\`;
 #   2. a compile error on the native-modular path is reported ONCE — the
 #      fallback to whole-program used to recompile the same source and
-#      print every diagnostic a second time.
+#      print every diagnostic a second time;
+#   3. a relative entry is named as written, as the C path names it.
 #
 # That a compile error does not kill `kai watch` is gated separately, by
 # tests/watch_survives_error.sh.
@@ -97,6 +98,26 @@ echo "native-diag-path:"
 # partitioned path; solo.kai imports none and takes whole-program.
 check_entry_path native-modular main.kai 1
 check_entry_path whole-program solo.kai 1
+
+# A relative entry is named as the user wrote it, exactly as the C path
+# names it, never as the absolute path it resolves to.
+check_relative() {
+  _desc="$1"; _src="${proj##*/}/$2"
+  for _b in c native; do
+    (cd "$work" && "$KAI" build --backend=$_b "$_src" -o "$work/rel-$_b") \
+      >/dev/null 2>"$work/rel-$_desc-$_b.err" || true
+    grep -E '^  --> ' "$work/rel-$_desc-$_b.err" > "$work/rel-$_desc-$_b.arrows" || true
+  done
+  if ! grep -Fq -- "--> $_src:" "$work/rel-$_desc-c.arrows"; then
+    reject "relative $_desc" "the C path does not name the relative entry" "$work/rel-$_desc-c.err"
+  elif ! cmp -s "$work/rel-$_desc-c.arrows" "$work/rel-$_desc-native.arrows"; then
+    reject "relative $_desc" "native names the entry differently from C" "$work/rel-$_desc-native.err"
+  else
+    echo "  ok   $_desc names a relative entry as the C path does"
+  fi
+}
+check_relative native-modular main.kai
+check_relative whole-program solo.kai
 
 if [ "$fail" -gt 0 ]; then
   echo "native-diag-path FAIL ($fail check(s))"
