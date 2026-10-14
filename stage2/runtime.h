@@ -15633,8 +15633,9 @@ static size_t kai_page_size(void) {
  * 16 KiB pages on macOS arm64 silently break sub-page values
  * otherwise. */
 static size_t kai_fiber_stack_size(void) {
-    static size_t cached = 0;
-    if (cached != 0) return cached;
+    static _Atomic size_t cached = 0;
+    size_t hit = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (hit != 0) return hit;
     const char *env = getenv("KAI_FIBER_STACK_SIZE");
     size_t sz = 64 * 1024;  /* default 64 KiB */
     if (env && *env) {
@@ -15650,8 +15651,8 @@ static size_t kai_fiber_stack_size(void) {
     }
     size_t ps = kai_page_size();
     if (sz % ps != 0) sz = ((sz / ps) + 1) * ps;
-    cached = sz;
-    return cached;
+    atomic_store_explicit(&cached, sz, memory_order_relaxed);
+    return sz;
 }
 
 /* Stack budget for the fiber that runs kai_main. It is not an ordinary
