@@ -93,77 +93,50 @@ fn import_hole_explicit_paths(decls: [Decl], acc: [String]) : [String] {
   }
 }
 
-# Top-level: report every IkHole in `decls`. Returns the number of
-# unresolved holes (zero matches → 1; everything else → 0). The
-# caller aborts compilation if any holes failed to resolve so the
-# downstream typer/codegen sees no IkHole noise.
-pub fn report_import_holes(file: String, decls: [Decl], base_dir: String,
-                          search_paths: [String]) : Int / Console + File {
+#[doc("The error for every `import ?name` hole in `decls`, in source order: a hole never resolves, it reports the modules that export the name.")]
+pub fn import_hole_diags(file: String, decls: [Decl], base_dir: String,
+                         search_paths: [String]) : [Diagnostic] / Console + File {
   let explicit = import_hole_explicit_paths(decls, [])
   # Combine stdlib + user-explicit module paths, deduped by name.
   let all_mods = list_uniq(list_append(import_hole_known_stdlib(), explicit))
-  report_import_holes_loop(file, decls, base_dir, all_mods, search_paths, 0)
+  finalize_diags(import_hole_diags_loop(file, decls, base_dir, all_mods, search_paths, []))
 }
 
-fn report_import_holes_loop(file: String, decls: [Decl], base_dir: String,
-                              mods: [String], search_paths: [String],
-                              errs: Int) : Int / Console + File {
+fn import_hole_diags_loop(file: String, decls: [Decl], base_dir: String,
+                          mods: [String], search_paths: [String],
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match decls {
-    [] -> errs
+    [] -> acc
     [d, ...rest] -> match d {
       DImport(ik, line, col) -> match ik {
         IkHole(name) -> {
           let hits = import_hole_search_modules(name, base_dir, mods,
                                                    search_paths, [])
-          let new_errs = report_import_hole(file, name, line, col, hits)
-          report_import_holes_loop(file, rest, base_dir, mods, search_paths,
-                                      errs + new_errs)
+          import_hole_diags_loop(file, rest, base_dir, mods, search_paths,
+                                 [import_hole_diag(file, name, line, col, hits), ...acc])
         }
-        _ -> report_import_holes_loop(file, rest, base_dir, mods, search_paths, errs)
+        _ -> import_hole_diags_loop(file, rest, base_dir, mods, search_paths, acc)
       }
-      _ -> report_import_holes_loop(file, rest, base_dir, mods, search_paths, errs)
+      _ -> import_hole_diags_loop(file, rest, base_dir, mods, search_paths, acc)
     }
   }
 }
 
-fn report_import_hole(file: String, name: String, line: Int, col: Int,
-                        hits: [ImportHoleHit]) : Int / Console + File {
-
+fn import_hole_diag(file: String, name: String, line: Int, col: Int,
+                    hits: [ImportHoleHit]) : Diagnostic {
+  let help = (msg) => ri_help(file, line, col, msg)
   match hits {
-    [] -> {
-      diag_error(file, line, col,
-        "import hole: no module exports `#{name}`")
-      diag_help("the symbol-index v1 only scans well-known stdlib modules and modules already imported by name in this file")
-      diag_note("add an `import some.module` for the file that exports `#{name}`, then replace the hole if you still want the report")
-      1
-    }
-    [h] -> match h {
-      IHH(mod_path, _) -> {
-        diag_error(file, line, col,
-          "import hole: `#{name}` is exported by `#{mod_path}`")
-        diag_help("replace `?#{name}` with `#{mod_path}` (the import then loads the module and exposes `#{name}`)")
-        1
-      }
-    }
-    _ -> {
-      diag_error(file, line, col,
-        "import hole: `#{name}` is exported by multiple modules")
-      report_import_hole_candidates(hits)
-      diag_help("replace `?#{name}` with one of the explicit module paths above")
-      1
-    }
-  }
-}
-
-fn report_import_hole_candidates(hits: [ImportHoleHit]) : Unit / Console {
-  match hits {
-    [] -> ()
-    [h, ...rest] -> match h {
-      IHH(mod_path, _) -> {
-        diag_note("candidate: `#{mod_path}`")
-        report_import_hole_candidates(rest)
-      }
-    }
+    [] ->
+      mk_diag(SevError, file, line, col, "import hole: no module exports `#{name}`",
+        [help("the symbol-index v1 only scans well-known stdlib modules and modules already imported by name in this file"),
+         ri_note(file, line, col, "add an `import some.module` for the file that exports `#{name}`, then replace the hole if you still want the report")])
+    [IHH(mod_path, _)] ->
+      mk_diag(SevError, file, line, col, "import hole: `#{name}` is exported by `#{mod_path}`",
+        [help("replace `?#{name}` with `#{mod_path}` (the import then loads the module and exposes `#{name}`)")])
+    _ ->
+      mk_diag(SevError, file, line, col, "import hole: `#{name}` is exported by multiple modules",
+        list_append(map(hits, (h) => match h { IHH(mod_path, _) -> ri_note(file, line, col, "candidate: `#{mod_path}`") }),
+                    [help("replace `?#{name}` with one of the explicit module paths above")]))
   }
 }
 

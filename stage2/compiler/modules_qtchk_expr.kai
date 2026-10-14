@@ -1,0 +1,202 @@
+#[doc("""
+The qualified type heads inside signatures, expressions and patterns,
+checked against the module table: each `mod.Type` names an imported
+module that exports the type.
+
+The walk meets the heads in the order the rewrite resolves them and
+reports each at its own position. Diagnostics accumulate newest first.
+""")]
+
+import compiler.ast
+import compiler.diag
+import compiler.module_table
+import compiler.written
+import compiler.modules_dotted
+
+#[doc("What a qualified head is checked against: the module table of the file that wrote it, and that file.")]
+pub type QtCx = { mt: [ModuleEntry], file: String }
+
+#[doc("The diagnostics of one read of `mod.ty`, pushed onto `acc`: the rival-module warning, then the error when `mod` names no import or does not export `ty`.")]
+pub fn qtchk_site(mod: String, ty: String, cx: QtCx, line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] = {
+  let seen = match mt_rival_diag(cx.mt, mod, ty, cx.file, line, col) {
+    Some(w) -> [w, ...acc]
+    None    -> acc
+  }
+  match mt_lookup_member(cx.mt, mod, ty) {
+    None     -> [qt_diag_unknown_mod(mod, ty, cx.file, line, col), ...seen]
+    Some(me) ->
+      if me_has_export(me, ty) { seen }
+      else { [qt_diag_missing_type(mod, ty, me_exports(me), cx.file, line, col), ...seen] }
+  }
+}
+
+fn qtchk_ref(r: DeclRef, cx: QtCx, line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] = match r {
+  DrWritten(Some(q), n) -> qtchk_site(written_text(q), written_text(n), cx, line, col, acc)
+  _                     -> acc
+}
+
+#[doc("The diagnostics of the qualified heads inside `te`, pushed onto `acc`.")]
+pub fn qtchk_te(te: TypeExpr, cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match te.tkind {
+  TyName(r, targs)     -> qtchk_ref(r, cx, te.line, te.col, qtchk_tes(targs, cx, acc))
+  TyList(inner)        -> qtchk_te(inner, cx, acc)
+  TyFn(ps, ret, row)   -> qtchk_row(row, cx, qtchk_te(ret, cx, qtchk_tes(ps, cx, acc)))
+  TyDim(base, _)       -> qtchk_te(base, cx, acc)
+  TyRefine(base, pred) -> qtchk_expr(pred, cx, qtchk_te(base, cx, acc))
+  TyRow(row)           -> qtchk_row(row, cx, acc)
+  TySurface(ts)        -> qtchk_tes(tysurface_children(ts), cx, acc)
+  TyParam(_, targs)    -> qtchk_tes(targs, cx, acc)
+}
+
+#[doc("`qtchk_te` over a list.")]
+pub fn qtchk_tes(tes: [TypeExpr], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match tes {
+  []           -> acc
+  [t, ...rest] -> qtchk_tes(rest, cx, qtchk_te(t, cx, acc))
+}
+
+#[doc("`qtchk_te` over an optional annotation.")]
+pub fn qtchk_te_opt(o: Option[TypeExpr], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match o {
+  None     -> acc
+  Some(te) -> qtchk_te(te, cx, acc)
+}
+
+#[doc("The diagnostics of the qualified heads inside the labels of an effect row.")]
+pub fn qtchk_row(re: RowExpr, cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match re {
+  REmpty       -> acc
+  RClosed(ls)  -> qtchk_labels(ls, cx, acc)
+  ROpen(_, ls) -> qtchk_labels(ls, cx, acc)
+}
+
+fn qtchk_labels(ls: [RowLabel], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match ls {
+  []                   -> acc
+  [RL(_, ts), ...rest] -> qtchk_labels(rest, cx, qtchk_tes(ts, cx, acc))
+}
+
+#[doc("The diagnostics of the qualified heads inside a parameter list's annotations.")]
+pub fn qtchk_params(ps: [Param], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match ps {
+  []           -> acc
+  [p, ...rest] -> qtchk_params(rest, cx, qtchk_te_opt(p.ptype, cx, acc))
+}
+
+# Every variant is named: a new one is a compile error here, not a
+# position the check leaves unread.
+#[doc("The diagnostics of the qualified heads inside `e`: its annotations, narrows and record literals.")]
+pub fn qtchk_expr(e: Expr, cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match e.kind {
+  ERecordLit(r, fs)     -> qtchk_ref(r, cx, e.line, e.col, qtchk_inits(fs, cx, acc))
+  EBlock(ss, tail)      -> qtchk_expr_opt(tail, cx, qtchk_stmts(ss, cx, acc))
+  EMatch(scr, arms)     -> qtchk_arms(arms, cx, qtchk_expr(scr, cx, acc))
+  EVariantsOf(te, _)    -> qtchk_te(te, cx, acc)
+  ELambda(ps, b)        -> qtchk_expr(b, cx, qtchk_params(ps, cx, acc))
+  EHandle(body, _, tys, init, _, cs, ret) ->
+    qtchk_hreturn_opt(ret, cx, qtchk_hclauses(cs, cx,
+      qtchk_expr_opt(init, cx, qtchk_tes(tys, cx, qtchk_expr(body, cx, acc)))))
+  EIntrinsic(_, xs)     -> qtchk_exprs(xs, cx, acc)
+  ESurface(sf)          -> qtchk_exprs(surface_children(sf), cx, acc)
+  ECall(f, xs)          -> qtchk_exprs(xs, cx, qtchk_expr(f, cx, acc))
+  EField(x, _)          -> qtchk_expr(x, cx, acc)
+  EIndex(a, b)          -> qtchk_expr(b, cx, qtchk_expr(a, cx, acc))
+  EBinop(_, a, b)       -> qtchk_expr(b, cx, qtchk_expr(a, cx, acc))
+  EUnop(_, x)           -> qtchk_expr(x, cx, acc)
+  EIf(c, t_, eo)        -> qtchk_expr_opt(eo, cx, qtchk_expr(t_, cx, qtchk_expr(c, cx, acc)))
+  EList(els)            -> qtchk_elems(els, cx, acc)
+  ERange(a, b, st)      -> qtchk_expr_opt(st, cx, qtchk_expr(b, cx, qtchk_expr(a, cx, acc)))
+  EPipe(a, b)           -> qtchk_expr(b, cx, qtchk_expr(a, cx, acc))
+  EMapPipe(a, b)        -> qtchk_expr(b, cx, qtchk_expr(a, cx, acc))
+  EFlatMapPipe(a, b)    -> qtchk_expr(b, cx, qtchk_expr(a, cx, acc))
+  EFilterPipe(a, b)     -> qtchk_expr(b, cx, qtchk_expr(a, cx, acc))
+  ELitUnit(inner, _)    -> qtchk_expr(inner, cx, acc)
+  EBang(inner)          -> qtchk_expr(inner, cx, acc)
+  EInt(_, _)            -> acc
+  EReal(_, _)           -> acc
+  EIntLit(_)            -> acc
+  EDecimalLit(_)        -> acc
+  EFixed(_, _)          -> acc
+  EBool(_)              -> acc
+  EChar(_)              -> acc
+  EStr(_, _)            -> acc
+  EUnit                 -> acc
+  EName(_)              -> acc
+  EMark(_)              -> acc
+  ESym(_, _)            -> acc
+  ELocal(_)             -> acc
+  EOp(_)                -> acc
+  EUnder                -> acc
+  EPlaceholder          -> acc
+  EHole(_)              -> acc
+  ETodo(_)              -> acc
+  EExternBody(_, _)     -> acc
+  EModCall(_, _)        -> acc
+}
+
+fn qtchk_exprs(es: [Expr], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match es {
+  []           -> acc
+  [h, ...rest] -> qtchk_exprs(rest, cx, qtchk_expr(h, cx, acc))
+}
+
+fn qtchk_expr_opt(o: Option[Expr], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match o {
+  None    -> acc
+  Some(x) -> qtchk_expr(x, cx, acc)
+}
+
+fn qtchk_inits(fs: [FieldInit], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match fs {
+  []                  -> acc
+  [FI(_, v), ...rest] -> qtchk_inits(rest, cx, qtchk_expr(v, cx, acc))
+}
+
+fn qtchk_elems(els: [ListElem], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match els {
+  []           -> acc
+  [h, ...rest] -> qtchk_elems(rest, cx, match h {
+    ElPlain(e)  -> qtchk_expr(e, cx, acc)
+    ElSpread(e) -> qtchk_expr(e, cx, acc)
+  })
+}
+
+fn qtchk_arms(arms: [Arm], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match arms {
+  [] -> acc
+  [Arm(pat, g, body), ...rest] ->
+    qtchk_arms(rest, cx, qtchk_expr(body, cx, qtchk_expr_opt(g, cx, qtchk_pat(pat, cx, acc))))
+}
+
+fn qtchk_pat(pat: Pattern, cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match pat.pkind {
+  PNarrow(_, te)        -> qtchk_te(te, cx, acc)
+  PVariant(_, subs)     -> qtchk_pats(subs, cx, acc)
+  PVariantRecord(_, fs) -> qtchk_pfields(fs, cx, acc)
+  PRecord(fs)           -> qtchk_pfields(fs, cx, acc)
+  PList(subs, _)        -> qtchk_pats(subs, cx, acc)
+  PAs(_, inner)         -> qtchk_pat(inner, cx, acc)
+  _                     -> acc
+}
+
+fn qtchk_pats(ps: [Pattern], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match ps {
+  []           -> acc
+  [p, ...rest] -> qtchk_pats(rest, cx, qtchk_pat(p, cx, acc))
+}
+
+fn qtchk_pfields(fs: [PField], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match fs {
+  []                           -> acc
+  [PField(_, sub, _), ...rest] -> qtchk_pfields(rest, cx, qtchk_pat(sub, cx, acc))
+}
+
+fn qtchk_stmts(ss: [Stmt], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match ss {
+  []           -> acc
+  [s, ...rest] -> qtchk_stmts(rest, cx, qtchk_stmt(s, cx, acc))
+}
+
+fn qtchk_stmt(s: Stmt, cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match s {
+  SLet(pat, ty, e)            -> qtchk_expr(e, cx, qtchk_te_opt(ty, cx, qtchk_pat(pat, cx, acc)))
+  SVar(_, ty, init, _, _)     -> qtchk_expr(init, cx, qtchk_te_opt(ty, cx, acc))
+  SAssert(c, m)               -> qtchk_expr_opt(m, cx, qtchk_expr(c, cx, acc))
+  SExprStmt(e)                -> qtchk_expr(e, cx, acc)
+  SIndexAssign(a, i, v, _, _) -> qtchk_expr(v, cx, qtchk_expr(i, cx, qtchk_expr(a, cx, acc)))
+  SAssign(l, v, _, _)         -> qtchk_expr(v, cx, qtchk_expr(l, cx, acc))
+  SUse(_, _, _)               -> acc
+}
+
+fn qtchk_hclauses(cs: [HClause], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match cs {
+  [] -> acc
+  [HC(_, ps, body, _, _), ...rest] -> qtchk_hclauses(rest, cx, qtchk_expr(body, cx, qtchk_params(ps, cx, acc)))
+}
+
+fn qtchk_hreturn_opt(o: Option[HReturn], cx: QtCx, acc: [Diagnostic]) : [Diagnostic] = match o {
+  None                    -> acc
+  Some(HR(_, body, _, _)) -> qtchk_expr(body, cx, acc)
+}

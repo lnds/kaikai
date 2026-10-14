@@ -68,11 +68,8 @@ fn find_other_claim(chain: [VariantClaim], parent: SymId) : Option[VariantClaim]
 fn add_claim(claims: Claims, c: VariantClaim) : Claims =
   match c { VC(v, _, _, _) -> idx_prepend_sym(claims, v, c) }
 
-# Public entry: validate every TBSum's variants against earlier
-# claims. Returns the count of D2 errors (0 means clean). Plumbed
-# into `compile_source` next to `pred_errs` and `var_use_errs`.
-#[doc("infer: `validate_union_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_union_collisions_decls(ds: [Decl], tab: SymTab, df: DiagFiles) : Int / Console + File {
+#[doc("The error for every union variant a second union of the same home claims implicitly, in source order.")]
+pub fn validate_union_collisions_decls(ds: [Decl], tab: SymTab, df: DiagFiles) : [Diagnostic] {
 
   let top_names = collect_top_type_names(ds, tab)
   # D2 only governs root-file unions. `target_mod` is the root file's
@@ -81,7 +78,7 @@ pub fn validate_union_collisions_decls(ds: [Decl], tab: SymTab, df: DiagFiles) :
   # not participate — a user union reusing a core type's variant name
   # is ctor overloading resolved at use sites, not a collision.
   let target_mod = module_name_of_path(df_root(df))
-  validate_union_collisions_loop(ds, tab, top_names, df, target_mod, 0, idx_empty())
+  finalize_diags(validate_union_collisions_loop(ds, tab, top_names, df, target_mod, [], idx_empty()))
 }
 
 # The name of every type the stream declares, a record, an alias and an
@@ -115,11 +112,11 @@ fn names_core_ctor(tab: SymTab, vname: String) : Bool =
 
 fn validate_union_collisions_loop(remaining: [Decl], tab: SymTab, top_names: [String],
     df: DiagFiles,
-    target_mod: String, errs: Int,
-    claims: Claims) : Int / Console + File {
+    target_mod: String, acc: [Diagnostic],
+    claims: Claims) : [Diagnostic] {
 
   match remaining {
-    [] -> errs
+    [] -> acc
     [d, ...rest] -> match d {
       # Claims are scoped to the declaring home, so an imported module's
       # union participates without colliding with the root's: two homes
@@ -129,17 +126,18 @@ fn validate_union_collisions_loop(remaining: [Decl], tab: SymTab, top_names: [St
         TBSum(vs) -> {
           let decl_file = decl_diag_file(d, df)
           let r = check_variants_for_collision(vs, tab, decl_is_root(origin, target_mod), parent, line, col,
-          top_names, claims, decl_file, errs)
-          validate_union_collisions_loop(rest, tab, top_names, df, target_mod, r.errs, r.claims)
+          top_names, claims, decl_file, acc)
+          validate_union_collisions_loop(rest, tab, top_names, df, target_mod, r.diags, r.claims)
         }
-        _ -> validate_union_collisions_loop(rest, tab, top_names, df, target_mod, errs, claims)
+        _ -> validate_union_collisions_loop(rest, tab, top_names, df, target_mod, acc, claims)
       }
-      _ -> validate_union_collisions_loop(rest, tab, top_names, df, target_mod, errs, claims)
+      _ -> validate_union_collisions_loop(rest, tab, top_names, df, target_mod, acc, claims)
     }
   }
 }
 
-type CollisionResult = { errs: Int, claims: Claims }
+# `diags` is the running accumulator, newest first.
+type CollisionResult = { diags: [Diagnostic], claims: Claims }
 
 # One variant against the claims seen so far. A pre-declared name and a
 # root variant spelled like a core constructor are references, not
@@ -147,45 +145,40 @@ type CollisionResult = { errs: Int, claims: Claims }
 fn variant_collision_step(v: SymId, tab: SymTab, is_root: Bool, parent: SymId,
     line: Int, col: Int, top_names: [String],
     claims: Claims,
-    decl_file: String) : CollisionResult / Console + File = {
+    decl_file: String, acc: [Diagnostic]) : CollisionResult = {
   let vname = written_text(decl_name(tab, v))
-  if list_has(top_names, vname) or (is_root and names_core_ctor(tab, vname)) { CollisionResult { errs: 0, claims: claims } }
+  if list_has(top_names, vname) or (is_root and names_core_ctor(tab, vname)) { CollisionResult { diags: acc, claims: claims } }
   else { match find_other_claim(idx_chain_sym(claims, v), parent) {
-    None -> CollisionResult { errs: 0,
+    None -> CollisionResult { diags: acc,
         claims: add_claim(claims, VC(v, parent, line, col)) }
-    Some(prev) -> {
-      report_d2_collision(tab, decl_file, vname, parent, line, col, prev)
-      CollisionResult { errs: 1, claims: claims }
-    }
+    Some(prev) ->
+      CollisionResult { diags: [d2_collision_diag(tab, decl_file, vname, parent, line, col, prev), ...acc], claims: claims }
   } }
 }
 
 fn check_variants_for_collision(vs: [Variant], tab: SymTab, is_root: Bool, parent: SymId,
     line: Int, col: Int,
     top_names: [String], claims: Claims,
-    decl_file: String, errs: Int) : CollisionResult / Console + File {
+    decl_file: String, acc: [Diagnostic]) : CollisionResult {
 
   match vs {
-    [] -> CollisionResult { errs: errs, claims: claims }
+    [] -> CollisionResult { diags: acc, claims: claims }
     [v, ...rest] -> match v {
       Var(c, _) -> {
         let step = variant_collision_step(c, tab, is_root, parent, line, col,
-          top_names, claims, decl_file)
+          top_names, claims, decl_file, acc)
         check_variants_for_collision(rest, tab, is_root, parent, line, col,
           top_names, step.claims, decl_file,
-          errs + step.errs)
+          step.diags)
       }
     }
   }
 }
 
-# Render the D2 diagnostic. The first line names the offending
-# component and points at the *current* decl (the second site to
-# claim the name); the note points at the *earlier* decl; the hint
-# tells the user how to fix it. The wording matches the spec in the
-# lane brief verbatim modulo file paths.
-fn report_d2_collision(tab: SymTab, file: String, vname: String, parent: SymId,
-    line: Int, col: Int, prev: VariantClaim) : Unit / Console + File {
+# The error points at the second declaration to claim the name and
+# cites the first; the help says how to share the component.
+fn d2_collision_diag(tab: SymTab, file: String, vname: String, parent: SymId,
+    line: Int, col: Int, prev: VariantClaim) : Diagnostic {
   match prev {
     VC(_, prev_parent, prev_line, prev_col) -> {
       let msg = concat_all(["type '", vname,
@@ -202,9 +195,9 @@ fn report_d2_collision(tab: SymTab, file: String, vname: String, parent: SymId,
           int_to_string(line), ":",
           int_to_string(col),
           ")"])
-      diag_error(file, line, col, msg)
-      diag_help(concat_all(["pre-declare 'type ", vname,
-          " = ...' once and reference it from both unions"]))
+      mk_diag(SevError, file, line, col, msg,
+        [ri_help(file, line, col, concat_all(["pre-declare 'type ", vname,
+          " = ...' once and reference it from both unions"]))])
     }
   }
 }
