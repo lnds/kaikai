@@ -75,6 +75,11 @@ FIXTURES=(
   # premature None while still wheel-linked, and the next park double-inserts
   # the fiber, corrupting the wheel.
   "examples/effects/mn_recv_timeout_deadline_race.kai"
+  # A reply that lands while the receiver is between finding its mailbox
+  # empty and linking itself as a waiter must still wake it. Every wait here
+  # carries a deadline no honest reply can miss, so a wait that runs out is a
+  # lost wake-up and shows as a short count.
+  "examples/effects/mn_recv_timeout_no_lost_wakeup.kai"
   # Fiber wrappers dropping to RC=0 on a thread other than the one each fiber
   # ran on: the free path must not release a stack that is still live.
   "examples/effects/mn_fiber_free_race.kai"
