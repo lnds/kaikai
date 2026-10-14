@@ -62,18 +62,19 @@ pub fn home_diag_file(df: DiagFiles, m: Option[String]) : String = match m {
   Some(x) -> df_file_of(df, x)
 }
 
-#[doc("Report a cross-module duplicate: anchor at the second declaration, cite the first, name both homes.")]
-pub fn report_conflict(df: DiagFiles, msg: String, help: String,
-                       second: HomedDecl, first: HomedDecl) : Unit / Console + File {
-  diag_error(home_diag_file(df, hd_home(second)),
-             hd_line(second), hd_col(second), msg)
-  diag_note(concat_all(["'", hd_name(second), "' is exported by multiple modules: ",
-                        home_display(hd_home(first)), ", ",
-                        home_display(hd_home(second)), "; first at ",
-                        home_diag_file(df, hd_home(first)), ":",
-                        int_to_string(hd_line(first)), ":",
-                        int_to_string(hd_col(first))]))
-  diag_help(help)
+#[doc("The error for a cross-module duplicate: anchored at the second declaration, citing the first, naming both homes.")]
+pub fn conflict_diag(df: DiagFiles, msg: String, help: String,
+                     second: HomedDecl, first: HomedDecl) : Diagnostic {
+  let file = home_diag_file(df, hd_home(second))
+  let at = (text) => DR(file, hd_line(second), hd_col(second), text)
+  mk_diag(SevError, file, hd_line(second), hd_col(second), msg,
+          [at(concat_all(["note: '", hd_name(second), "' is exported by multiple modules: ",
+                          home_display(hd_home(first)), ", ",
+                          home_display(hd_home(second)), "; first at ",
+                          home_diag_file(df, hd_home(first)), ":",
+                          int_to_string(hd_line(first)), ":",
+                          int_to_string(hd_col(first))])),
+           at(string_concat("help: ", help))])
 }
 
 # ====================================================================
@@ -81,24 +82,22 @@ pub fn report_conflict(df: DiagFiles, msg: String, help: String,
 # ====================================================================
 
 #[doc("Reject two `extern \"C\" type` declarations sharing a name. The name denotes a C layout the boundary classifier unpacks against, so a second declaration under the same spelling has no reading that keeps both correct.")]
-pub fn validate_extern_type_homes(decls: [Decl], df: DiagFiles) : Int / Console + File =
-  extern_home_loop(decls, df, [], 0)
+pub fn validate_extern_type_homes(decls: [Decl], df: DiagFiles) : [Diagnostic] =
+  finalize_diags(extern_home_loop(decls, df, [], []))
 
 fn extern_home_loop(decls: [Decl], df: DiagFiles, seen: [HomedDecl],
-                    errs: Int) : Int / Console + File = match decls {
-  [] -> errs
+                    acc: [Diagnostic]) : [Diagnostic] = match decls {
+  [] -> acc
   [d, ...rest] -> match decl_extern_type(d) {
-    None -> extern_home_loop(rest, df, seen, errs)
+    None -> extern_home_loop(rest, df, seen, acc)
     Some(e) -> match homed_find_any(seen, hd_name(e)) {
-      Some(prev) -> {
-        report_conflict(df,
+      Some(prev) ->
+        extern_home_loop(rest, df, seen, [conflict_diag(df,
           concat_all(["conflicting declarations of extern type `",
                       hd_name(e), "`"]),
           "an extern type names one C layout; keep one declaration and import it",
-          e, prev)
-        extern_home_loop(rest, df, seen, errs + 1)
-      }
-      None -> extern_home_loop(rest, df, [e, ...seen], errs)
+          e, prev), ...acc])
+      None -> extern_home_loop(rest, df, [e, ...seen], acc)
     }
   }
 }
@@ -115,20 +114,17 @@ fn decl_extern_type(d: Decl) : Option[HomedDecl] = match d {
 # ====================================================================
 
 #[doc("Reject two `kind` declarations sharing a name, and two kinds registering the same habitant introducer. A kind names the unification algebra of the types it classifies and an introducer is habitant-declaration syntax; neither has a use site a qualifier reaches.")]
-pub fn validate_kind_homes(decls: [Decl], df: DiagFiles) : Int / Console + File =
-  kind_home_loop(decls, df, [], [], 0)
+pub fn validate_kind_homes(decls: [Decl], df: DiagFiles) : [Diagnostic] =
+  finalize_diags(kind_home_loop(decls, df, [], [], []))
 
 fn kind_home_loop(decls: [Decl], df: DiagFiles, kinds: [HomedDecl],
-                  intros: [HomedDecl], errs: Int) : Int / Console + File = match decls {
-  [] -> errs
+                  intros: [HomedDecl], acc: [Diagnostic]) : [Diagnostic] = match decls {
+  [] -> acc
   [d, ...rest] -> match decl_kind(d) {
-    None -> kind_home_loop(rest, df, kinds, intros, errs)
-    Some(KD(k, intro)) -> {
-      let ke = kind_dup_errs(df, kinds, k)
-      let ie = intro_dup_errs(df, intros, intro)
+    None -> kind_home_loop(rest, df, kinds, intros, acc)
+    Some(KD(k, intro)) ->
       kind_home_loop(rest, df, [k, ...kinds], kind_intro_seen(intros, intro),
-                     errs + ke + ie)
-    }
+                     intro_dup_onto(df, intros, intro, kind_dup_onto(df, kinds, k, acc)))
   }
 }
 
@@ -136,32 +132,27 @@ fn kind_home_loop(decls: [Decl], df: DiagFiles, kinds: [HomedDecl],
 # the introducer is absent for a derived or value-domain habitant form.
 type KindDecl = KD(HomedDecl, Option[HomedDecl])
 
-fn kind_dup_errs(df: DiagFiles, kinds: [HomedDecl],
-                 k: HomedDecl) : Int / Console + File =
+fn kind_dup_onto(df: DiagFiles, kinds: [HomedDecl], k: HomedDecl, acc: [Diagnostic]) : [Diagnostic] =
   match homed_find_any(kinds, hd_name(k)) {
-    None -> 0
-    Some(prev) -> {
-      report_conflict(df,
+    None -> acc
+    Some(prev) ->
+      [conflict_diag(df,
         concat_all(["kind `", hd_name(k), "` is declared in more than one module"]),
         "a kind names one unification algebra; keep one declaration and import it",
-        k, prev)
-      1
-    }
+        k, prev), ...acc]
   }
 
-fn intro_dup_errs(df: DiagFiles, intros: [HomedDecl],
-                  intro: Option[HomedDecl]) : Int / Console + File = match intro {
-  None -> 0
+fn intro_dup_onto(df: DiagFiles, intros: [HomedDecl], intro: Option[HomedDecl],
+                  acc: [Diagnostic]) : [Diagnostic] = match intro {
+  None -> acc
   Some(i) -> match homed_find_any(intros, hd_name(i)) {
-    None -> 0
-    Some(prev) -> {
-      report_conflict(df,
+    None -> acc
+    Some(prev) ->
+      [conflict_diag(df,
         concat_all(["introducer `", hd_name(i),
                     "` is registered by more than one kind"]),
         "an introducer word is habitant-declaration syntax and admits no qualifier; give one kind a different word",
-        i, prev)
-      1
-    }
+        i, prev), ...acc]
   }
 }
 
