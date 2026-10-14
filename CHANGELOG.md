@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.152.3 (2026-10-14)
+
+### Fixed
+
+- **perceus**: a pub loop that hands its own ^ slot an owned value runs in a worker that owns the slot (#2812)
+- **perceus**: a loop that hands a borrowed slot a value it owns owns that slot (#2811)
+- **perceus**: a self tail call that passes a borrowed parameter on releases the binders its arguments read (#2810)
+
 ## v0.152.2 (2026-10-14)
 
 ### Fixed
