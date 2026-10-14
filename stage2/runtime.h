@@ -31,7 +31,11 @@
  * the embedded ucontext_t — exactly what bit Phase 2 once
  * (the root fiber's evidence_top got clobbered to a saved register
  * value because the static evidence nodes were laid out adjacent).
- * Spec: docs/fibers-impl.md §*macOS deprecation handling*. */
+ * Spec: docs/fibers-impl.md §*macOS deprecation handling*.
+ * A header $CFLAGS forces in ahead of this one can reach a system header
+ * first, so `kai` then force-includes this block before it:
+ * KAI_RUNTIME_FEATURES_ONLY stops that pass here and lets the TU's own
+ * include read the rest. */
 #define _XOPEN_SOURCE 600
 /* mmap(MAP_ANON) is a BSD extension hidden by strict _XOPEN_SOURCE.
  * Re-expose it: _DARWIN_C_SOURCE on macOS, _DEFAULT_SOURCE on glibc.
@@ -50,7 +54,9 @@
 #  define _GNU_SOURCE 1
 #endif
 
-#ifndef KAI_RUNTIME_H
+#if defined(KAI_RUNTIME_FEATURES_ONLY)
+#  undef KAI_RUNTIME_FEATURES_ONLY
+#elif !defined(KAI_RUNTIME_H)
 #define KAI_RUNTIME_H
 
 /* Host facilities, one macro each, 1 where the host provides it. At 0 the

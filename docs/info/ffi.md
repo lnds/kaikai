@@ -96,6 +96,8 @@ Vector2 get_mouse_position(void) { ... }
 ```
 
 Build with the shim on `CFLAGS`: `CFLAGS="shim.c" kai build --backend=c app.kai`.
+A header the generated code must see first rides the same variable,
+`CFLAGS="-include shim.h shim.c"`; it may include system headers freely.
 
 In a package, declare the shim in `kai.toml` instead — a `[native]`
 table (`sources`/`include`/`libs`) travels with the dependency, so
