@@ -766,6 +766,7 @@ test-kai-cli: kaic2
 	@tests/build_memo.sh
 	@tests/path_specs.sh
 	@tests/cc_target_link.sh
+	@tests/no_llvm_probe.sh
 
 # Operand evaluation order under gcc on x86_64, which evaluates call
 # arguments right to left. The script refuses any other host.

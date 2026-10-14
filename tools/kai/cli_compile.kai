@@ -200,17 +200,34 @@ pub fn plan_in(
 fn whole_program(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi =
   match cli_native.build_whole(p)! {
     Linked -> Ok(())
-    NoLlvm(err) -> if b.explicit {
-      Stderr.eprint("kai: error: the native backend is not built into this kaic2.")
-      Stderr.eprint(
-        "kai: error: rebuild with 'make -C stage2 KAI_LLVM=1 kaic2', or pass --backend=c."
-      )
-      cli_sys.copy_to_stderr(err)
-      Err(2)
-    } else {
-      degrade()
-      dispatch(p, cli_plan.Backend { name: "c", explicit: true })
-    }
+    NoLlvm(err) -> no_native(p, b, err)
+  }
+
+fn no_native(p: Plan, b: Backend, err: String) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  if b.explicit {
+    Stderr.eprint("kai: error: the native backend is not built into this kaic2.")
+    Stderr.eprint(
+      "kai: error: rebuild with 'make -C stage2 KAI_LLVM=1 kaic2', or pass --backend=c."
+    )
+    cli_sys.copy_to_stderr(err)
+    Err(2)
+  } else {
+    degrade()
+    dispatch(p, C_BACKEND)
+  }
+
+const C_BACKEND : Backend = cli_plan.Backend { name: "c", explicit: true }
+
+# An implicit native build asks kaic2 once per run, before compiling anything, whether it has libLLVM.
+fn lacks_native(p: Plan, b: Backend) : Bool / Stderr + File + Ffi =
+  if b.explicit or cli_sys.llvm_probed() {
+    false
+  } else if cli_native.lacks_llvm(p.t, p.job.tmp) {
+    degrade()
+    true
+  } else {
+    cli_sys.mark_llvm_probed()
+    false
   }
 
 # An implicit native build found no libLLVM: the rest of the run builds C.
@@ -224,16 +241,21 @@ fn degrade() : Unit / Stderr + Ffi {
   )
 }
 
+fn native(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  if lacks_native(p, b) {
+    dispatch(p, C_BACKEND)
+  } else if not cli_native.modular(p) {
+    whole_program(p, b)
+  } else {
+    match cli_native.build_modular(p)! {
+      Linked -> Ok(())
+      NoLlvm(err) -> no_native(p, b, err)
+    }
+  }
+
 fn dispatch(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi =
   if b.name == "native" {
-    if cli_native.modular(p) {
-      match cli_native.build_modular(p)! {
-        Linked -> Ok(())
-        NoLlvm(_) -> whole_program(p, b)
-      }
-    } else {
-      whole_program(p, b)
-    }
+    native(p, b)
   } else if cli_cmodular.wanted(p.t) {
     cli_cmodular.build(p)
   } else {
@@ -244,11 +266,7 @@ fn memoised(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi
   cli_bin_memo.built(p, b.name, (q) => dispatch(q, b), () => degrade())
 
 fn effective(b: Backend) : Backend / Ffi =
-  if (not b.explicit) and cli_sys.no_llvm() {
-    cli_plan.Backend { name: "c", explicit: true }
-  } else {
-    b
-  }
+  if (not b.explicit) and cli_sys.no_llvm() { C_BACKEND } else { b }
 
 #[doc("Build `job.src` into `job.out` through backend `b`; once an implicit native degraded, the rest of the run builds C without a note.")]
 pub fn compile(t: Toolchain, b: Backend, job: Job) : Result[Unit, Int] / Stderr + Env + File + Ffi =
