@@ -2679,10 +2679,17 @@ static KAI_TLS int    kai_slab_atexit = 0;
  * bump-allocate into, or free, the parking thread's slabs after a work-steal. */
 __attribute__((noinline))
 KAI_RT_SHARED void kai_slab_teardown(void) {
+    if (kai_nthreads > 1) return;
     for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
     free(kai_slab_list);
     kai_slab_list = NULL; kai_slab_count = 0; kai_slab_cap = 0;
     kai_slab_cur = NULL; kai_slab_off = 0;
+}
+
+/* The exit reports still read slab values, so the teardown must be the
+ * first atexit registered: LIFO runs it last. */
+static void kai_slab_register_teardown(void) {
+    if (!kai_slab_atexit) { atexit(kai_slab_teardown); kai_slab_atexit = 1; }
 }
 
 __attribute__((noinline))
@@ -2707,10 +2714,8 @@ KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
          * free at exit would pull the ground out from under a live block
          * on another thread. Under M:N the OS reclaims all slabs at
          * process exit instead; the teardown (whose only purpose is a
-         * clean ASAN "0 still-reachable" at N=1) is not registered. */
-        if (!kai_slab_atexit && kai_nthreads <= 1) {
-            atexit(kai_slab_teardown); kai_slab_atexit = 1;
-        }
+         * clean ASAN "0 still-reachable" at N=1) does nothing. */
+        if (kai_nthreads <= 1) kai_slab_register_teardown();
     }
     void *p = kai_slab_cur + kai_slab_off;
     kai_slab_off += sz;
@@ -10083,6 +10088,7 @@ static void kai_set_args(int argc, char **argv) {
        the emitted main wrapper. atexit fires only when the env var
        gates a report, so the side effect is harmless when tracing is
        off. Keeps the emitter unchanged — no new emit site needed. */
+    kai_slab_register_teardown();
     kai_rc_register_once();
     kai_rc_ledger_register();
 #ifdef KAI_TRACE_RC
