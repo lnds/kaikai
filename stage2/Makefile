@@ -1602,14 +1602,27 @@ endif
 # header; on glibc that froze the libc feature set before runtime.h set it.
 CFLAGS_INCLUDE_PROBE := -include $(abspath ../examples/ffi/cflags_include_probe.h)
 
+# The CC-logged builds skip the binary memo and the modular cache, so each one compiles.
 test-ffi-cflags-include: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="$(CFLAGS_INCLUDE_PROBE)" ../bin/kai build --backend=c ../examples/ffi/cflags_include.kai -o build/cflags-include-c 2> build/cflags-include-c.err \
 	  || { echo "ffi-cflags-include BUILD FAIL (C backend)"; cat build/cflags-include-c.err; exit 1; }; \
 	./build/cflags-include-c > build/cflags-include-c.out; \
 	diff -q ../examples/ffi/cflags_include.out.expected build/cflags-include-c.out > /dev/null \
-	  && echo "ffi-cflags-include OK (C backend)" \
-	  || { echo "ffi-cflags-include DIFF (C backend)"; diff ../examples/ffi/cflags_include.out.expected build/cflags-include-c.out; exit 1; }
+	  || { echo "ffi-cflags-include DIFF (C backend)"; diff ../examples/ffi/cflags_include.out.expected build/cflags-include-c.out; exit 1; }; \
+	cc=$(CURDIR)/build/cflags-include-cc; log=$(CURDIR)/build/cflags-include-cc.log; \
+	printf '#!/bin/sh\necho "$$*" >> %s\nexec %s "$$@"\n' "$$log" "$(CC)" > $$cc; chmod +x $$cc; \
+	rm -f $$log; \
+	KAI_BIN_MEMO=0 KAI_MODULAR=0 CC=$$cc CFLAGS="$(CFLAGS_INCLUDE_PROBE)" ../bin/kai build --backend=c ../examples/ffi/cflags_include.kai -o build/cflags-include-logged 2> build/cflags-include-c.err \
+	  || { echo "ffi-cflags-include BUILD FAIL (C backend, logged)"; cat build/cflags-include-c.err; exit 1; }; \
+	grep -q KAI_RUNTIME_FEATURES_ONLY $$log \
+	  || { echo "ffi-cflags-include FAIL: a forced header does not bring the feature-block pass"; exit 1; }; \
+	rm -f $$log; \
+	env -u CFLAGS KAI_BIN_MEMO=0 KAI_MODULAR=0 CC=$$cc ../bin/kai build --backend=c ../examples/ffi/cflags_include.kai -o build/cflags-include-plain 2> build/cflags-include-c.err \
+	  || { echo "ffi-cflags-include BUILD FAIL (C backend, no CFLAGS)"; cat build/cflags-include-c.err; exit 1; }; \
+	[ -s $$log ] || { echo "ffi-cflags-include FAIL: the plain build compiled nothing through CC"; exit 1; }; \
+	if grep -q KAI_RUNTIME_FEATURES_ONLY $$log; then echo "ffi-cflags-include FAIL: a build without a forced header carries the feature-block pass"; exit 1; fi; \
+	echo "ffi-cflags-include OK (C backend)"
 
 ifeq ($(KAI_LLVM),1)
 test-ffi-cflags-include-native: $(TARGET) bin-kai build
