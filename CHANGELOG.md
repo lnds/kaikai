@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.153.0 (2026-10-14)
+
+### BREAKING CHANGE
+
+- a root module's `main` whose result is neither `Int`
+nor `Unit` (annotated or inferred) no longer compiles.
+- a real literal that overflows `Real` (`1.0e999`) no
+longer compiles to `0.0`; it is a compile error.
+
+### Fixed
+
+- **cli**: kai lint fails on a type-rejected program; fmt and help cleanups
+- **typer**: the entry `main` returns Int or Unit
+- **typer**: mint a negated literal to the annotated type
+- **parse**: accept a module-qualified label in an effect alias
+- **parse**: reject a real literal past the Real range
+- **tools**: script, CI and install hygiene from the debt audit (#2814)
+
 ## v0.152.3 (2026-10-14)
 
 ### Fixed
