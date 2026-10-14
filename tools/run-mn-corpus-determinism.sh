@@ -93,8 +93,25 @@ done < "$TMP/entry-points"
 total="$(wc -l < "$TMP/entry-points" | tr -d ' ')"
 walked="$(wc -l < "$TMP/fixtures" | tr -d ' ')"
 
+# A fixture with a `.driver` sidecar runs under it, as tools/test-effects-goldens.sh
+# runs it: a signal fixture run bare parks until the deadline.
+SIGHARNESS_BIN="$TMP/sigharness"
+drivers=0
+while IFS= read -r f; do
+  [ -f "${f%.kai}.driver" ] || continue
+  drivers=$((drivers + 1))
+  if ! mn_driver_of "$f" >/dev/null; then
+    echo "run-mn-corpus-determinism FAIL — ${f%.kai}.driver names '$(head -1 "${f%.kai}.driver")' (knows: sigharness)"
+    exit 1
+  fi
+done < "$TMP/fixtures"
+if [ "$drivers" != 0 ] && ! ${CC:-cc} -O1 tests/sigharness.c -o "$SIGHARNESS_BIN"; then
+  echo "run-mn-corpus-determinism FAIL — could not build tests/sigharness.c"
+  exit 1
+fi
+
 echo "run-mn-corpus-determinism: backends=[$BACKENDS] N=1 vs N in {$THREAD_COUNTS}, $REPEATS repeats"
-echo "  corpus: $walked fixtures ($((total - walked)) skipped by tools/backend-parity-skips.txt and negative-by-design goldens)"
+echo "  corpus: $walked fixtures ($((total - walked)) skipped by tools/backend-parity-skips.txt and negative-by-design goldens, $drivers under their .driver)"
 
 # ---------------------------------------------------------------------------
 # Build phase — parallel. Compilation is not a measurement, so it may use the
@@ -199,6 +216,13 @@ if [ "$nfind" != 0 ]; then
   echo ""
   echo "--- findings ($nfind) ---"
   cat "$findings"
+fi
+
+# A reference that never completes judges nothing at N>1: the pair is a hang.
+if [ -s "$reffail" ]; then
+  echo ""
+  echo "run-mn-corpus-determinism: FAIL — $(wc -l < "$reffail" | tr -d ' ') N=1 reference(s) did not complete"
+  exit 1
 fi
 
 if ! mn_ratchet_verdict "$findings"; then
