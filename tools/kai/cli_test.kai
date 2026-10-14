@@ -19,6 +19,7 @@ import cli_toolchain
 # `--json` and `--only` shape how the runners report and what they run, not how they compile; `jobs` 0 is one per CPU, capped by memory.
 type TestOpts = {
   json: Bool,
+  coverage: Bool,
   only: [String],
   backend: String,
   jobs: Int,
@@ -66,6 +67,7 @@ fn parse(args: [String], o: TestOpts) : Result[(TestOpts, [String]), Int] / Stde
     [] -> Ok((o, []))
     [a, ..._] if a == "-h" or a == "--help" -> Ok((TestOpts { ...o, help: true }, []))
     ["--json", ...rest] -> parse(rest, TestOpts { ...o, json: true })
+    ["--coverage", ...rest] -> parse(rest, TestOpts { ...o, coverage: true })
     [a] if VALUED.contains(a) -> cli_err.die(missing(a))
     [a, v, ...rest] if VALUED.contains(a) -> parse(rest, valued(o, a, v)!)
     ["--", ...rest] -> Ok((o, rest))
@@ -100,10 +102,11 @@ fn visit(
   } else {
     Stderr.eprint("== kai test #{label}")
     let pkg = string.drop_prefix(dir, "./").unwrap_or(dir)
+    # `PWD` keeps the walk's spelling of the cwd, so absolute paths the run reports strip as the walk's do.
     let rc = cli_proc.run(["#{t.layout.root}/bin/kai", "test", ...flags], cli_proc.Spawn {
       ...cli_proc.inherit(),
       dir: dir,
-      set: [("KAI_TEST_PACKAGE", pkg)]
+      set: [("KAI_TEST_PACKAGE", pkg), ("PWD", "#{cli_sys.cwd()}/#{pkg}")]
     })
     if rc != 0 { Stderr.eprint("== FAIL #{label}") }
     let next = (acc.fst + 1, acc.snd or rc != 0)
@@ -204,6 +207,7 @@ fn run_all(t: Toolchain, b: Backend, o: TestOpts, src: String, root: String, tmp
 # A selection that matched nothing is a caller error, whatever the output format.
 fn verdict(o: TestOpts, logs: (String, String), status: Int) : Int / Stdout + Stderr + File + Ffi {
   let only = string.join(o.only, "\n") != ""
+  if logs.fst != "" and o.coverage { relative_coverage(logs.fst) }
   if logs.fst != "" and o.json { cli_sys.copy_to_stdout(logs.fst) }
   let json_miss = logs.fst != ""
     and only
@@ -217,6 +221,19 @@ fn verdict(o: TestOpts, logs: (String, String), status: Int) : Int / Stdout + St
   } else {
     status
   }
+}
+
+# A coverage record names a file by the absolute path its build probed;
+# spelled from the cwd as a block id spells its own, the two match.
+fn relative_coverage(log: String) : Unit / File + Ffi {
+  let here = string.replace(string.replace("#{cli_sys.cwd()}/", "\\", "\\\\"), "\"", "\\\"")
+  let lines = string.split(cli_fs.read_or_empty(log), "\n")
+    | (l => if string.starts_with(l, "{\"type\":\"coverage\"") {
+      string.replace(l, "\"#{here}", "\"")
+    } else {
+      l
+    })
+  let _ = write_file(log, string.join(lines, "\n"))
 }
 
 # `^ +(ok|FAIL) `: a per-block line of the runner.
@@ -270,6 +287,7 @@ fn suite(
       let _ = env.set("KAI_TEST_ONLY", string.join(o.only, "\n"))
     }
     if o.json { let _ = env.set("KAI_TEST_JSON", "1") }
+    if o.coverage { let _ = env.set(cli_blocks.COVERAGE_ENV, "1") }
     cli_fs.with_scratch(tmp => run_suite(t, o, rest, tmp))
   }
 
@@ -279,8 +297,20 @@ pub fn test_verb(
   args: [String]
 ) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let parsed =
-    parse(args, TestOpts { json: false, only: [], backend: "", jobs: 0, extra: [], help: false })!
+    parse(
+      args,
+      TestOpts {
+        json: false,
+        coverage: false,
+        only: [],
+        backend: "",
+        jobs: 0,
+        extra: [],
+        help: false
+      }
+    )!
   let o = parsed.fst
+  if o.coverage and (not o.json) { cli_err.die("--coverage needs --json")! }
   match cli_caches.env_or(cli_group.BUILD_ONLY, "") {
     "" -> suite(t, o, parsed.snd)
     out -> cli_group.build_only(t, o.backend, o.extra, parsed.snd, out)

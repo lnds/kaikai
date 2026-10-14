@@ -20,6 +20,7 @@ matcher DSL — `assert x == 42` is enough. `assert` belongs inside
 kai test [<spec>|./...]            # run tests
 kai test --json [<spec>|./...]     # machine-readable results
 kai test --only <id> [<spec>|./...]  # run named blocks (repeatable)
+kai test --json --coverage [<spec>]  # + the lines each block ran
 kai test -j <n> [<spec>|./...]     # up to n builds at once
 kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
@@ -216,6 +217,28 @@ set; an `--only` that matches nothing is an error, not an empty pass.
 kai test --json .
 kai test --only 'tests/planner_test.kai:orders sites' .
 kai test --json --only 'planner/tests/planner_test.kai:orders sites' ./...
+```
+
+## Per-block coverage
+
+`kai test --json --coverage` follows each block's record with the
+source lines the block ran, under the same `id`:
+
+```text
+{"type":"test","id":"tests/a_test.kai:adds","file":"tests/a_test.kai","line":3,"status":"pass","duration_ms":0}
+{"type":"coverage","id":"tests/a_test.kai:adds","lines":{"src/a.kai":[3,4,9]}}
+```
+
+Only the package's own sources count: its test files, the stdlib and
+dependencies never appear. A file is spelled as a block id spells its
+own, and a block that ran none of the package's lines reports
+`"lines":{}`. The coverage build instruments the package code, so it
+never shares a cached build with a plain run. It composes with `--only`
+and with both backends; `--coverage` without `--json` is an error.
+
+```sh
+kai test --json --coverage .
+kai test --json --coverage --only 'tests/a_test.kai:adds' .
 ```
 
 ## Exit codes
