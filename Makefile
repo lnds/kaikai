@@ -736,10 +736,10 @@ test-info: kaic2
 test-doc: kaic2
 	@tools/test-doc.sh
 
-# `kai upgrade` / install.sh tag resolver (pure shell, no compiler).
-# Guards tag-based version discovery, rate-limit handling, and the
-# minified-JSON greedy-sed trap against regression.
-test-upgrade-resolver:
+# `kai upgrade` / install.sh tag resolver, and `kai upgrade` end to end
+# through bin/kai. Guards tag-based version discovery, rate-limit handling,
+# and the minified-JSON greedy-sed trap against regression.
+test-upgrade-resolver: bin/kai
 	@tools/test-upgrade-resolver.sh
 
 # Driver flag hygiene: unknown flags fail fast in every subcommand
