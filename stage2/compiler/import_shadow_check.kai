@@ -1,0 +1,135 @@
+#[doc("""
+The error for a bare name an opened import binds over a core function
+of the same type.
+
+A module a file opens shadows the core names it also declares. When the
+two functions differ in type, a use meant for one fails to typecheck
+against the other; when they agree, nothing catches the swap, so the
+bare use is rejected and the file has to say which one it means.
+""")]
+
+import compiler.ast
+import compiler.diag
+import compiler.symtab
+import compiler.decl_names
+import compiler.decl_text
+import compiler.util
+import compiler.scope_view
+import compiler.resolve_rows
+import compiler.module_table
+import compiler.written
+import compiler.builtin_types
+import compiler.builtins
+import compiler.tycon_scheme_home
+import compiler.infer
+import compiler.cache
+import compiler.cache_delta
+import compiler.import_shadow
+
+#[doc("The errors for the uses `us` whose function has the type of the core one it shadows, reading signatures from `decls`.")]
+pub fn shadow_diags(tab: SymTab, decls: [Decl], us: [ShadowUse]) : [Diagnostic] / Console + File =
+  match us {
+    [] -> []
+    _  -> {
+      let fns = fn_schemes(decls, wanted(us, []), [])
+      flat_map(list_reverse(us), (u) => same_type_diag(tab, fns, u))
+    }
+  }
+
+type SymScheme = SymScheme(SymId, TyScheme)
+
+fn same_type_diag(tab: SymTab, fns: [SymScheme], u: ShadowUse) : [Diagnostic] / Console + File =
+  match u {
+    ShadowUse(s, c, _, _, _, _) ->
+      if same_type(scheme_of(tab, fns, s), scheme_of(tab, fns, c)) { rs_report(shadow_diag(tab, u)) }
+      else { [] }
+  }
+
+fn shadow_diag(tab: SymTab, u: ShadowUse) : Diagnostic = match u {
+  ShadowUse(s, _, v, file, line, col) -> {
+    let name = written_text(decl_name(tab, s))
+    let m = mt_spell_home([], written_text(sym_home(tab, s)))
+    let q = qualifier(v, sym_owner(tab, s), m)
+    mk_diag(SevError, file, line, col,
+            "`#{name}` here names `#{m}.#{name}`, which has the type of the core `#{name}` it shadows",
+            [ri_note(file, line, col, "`import #{m}` opens `#{m}`, so every bare `#{name}` in this file stops naming the core one"),
+             ri_help(file, line, col, "write `#{q}.#{name}` for the module's, or import it as `import #{m} as #{q}` so a bare `#{name}` names the core one")])
+  }
+}
+
+fn qualifier(v: ScopeView, owner: SymId, m: String) : String = match sv_qualifier(v, owner) {
+  Some(q) -> q
+  None    -> last_segment(string_split(m, "."))
+}
+
+fn last_segment(parts: [String]) : String = match parts {
+  []           -> ""
+  [p]          -> p
+  [_, ...rest] -> last_segment(rest)
+}
+
+# The scheme bodies are compared, not the bound lists: the bound ids
+# follow declaration order, which two equal types need not share.
+fn same_type(a: Option[TyScheme], b: Option[TyScheme]) : Bool = match a {
+  Some(x) -> match b {
+    Some(y) -> cache_bytes_eq(canon_body(x), canon_body(y))
+    None    -> false
+  }
+  None -> false
+}
+
+fn canon_body(sc: TyScheme) : Array[Byte] = match sc {
+  Scheme(_, _, _, _, body) -> to_bytes(canon_scheme(Scheme([], [], [], [], body)))
+}
+
+fn scheme_of(tab: SymTab, fns: [SymScheme], s: SymId) : Option[TyScheme] =
+  match find(fns, (p) => match p { SymScheme(t, _) -> sym_same(t, s) }) {
+    Some(SymScheme(_, sc)) -> Some(sc)
+    None                   -> builtin_scheme(written_text(decl_name(tab, s)))
+  }
+
+fn fn_schemes(ds: [Decl], want: [SymId], acc: [SymScheme]) : [SymScheme] = match ds {
+  []           -> acc
+  [d, ...rest] -> fn_schemes(rest, want, fn_scheme_in(d, want, acc))
+}
+
+fn fn_scheme_in(d: Decl, want: [SymId], acc: [SymScheme]) : [SymScheme] = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) ->
+    if not any(want, (w) => sym_same(w, fnid_sym(fid))) { acc }
+    else { match fn_scheme_of_decl(d, [], tsh_none()) {
+      Some(sc) -> [SymScheme(fnid_sym(fid), sc), ...acc]
+      None     -> acc
+    } }
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> fn_scheme_in(inner, want, acc)
+    None        -> acc
+  }
+}
+
+# The functions the uses name, each once.
+fn wanted(us: [ShadowUse], acc: [SymId]) : [SymId] = match us {
+  [] -> acc
+  [ShadowUse(f, c, _, _, _, _), ...rest] -> wanted(rest, add_sym(add_sym(acc, f), c))
+}
+
+fn add_sym(ss: [SymId], s: SymId) : [SymId] = if any(ss, (t) => sym_same(t, s)) { ss } else { [s, ...ss] }
+
+# A declaration with no row clause gets a phantom row tail in its
+# scheme; a pure builtin's row is closed, so it gets the same tail
+# before the two are compared.
+fn builtin_scheme(name: String) : Option[TyScheme] =
+  match find(builtin_table(), (b) => match b { BF(n, _, _) -> n == name }) {
+    Some(BF(_, _, BS(tvs, rvs, uvs, ty))) -> Some(with_phantom(Scheme(tvs, rvs, uvs, [], ty)))
+    None -> None
+  }
+
+fn with_phantom(sc: TyScheme) : TyScheme = match sc {
+  Scheme(tvs, rvs, uvs, ks, TyFnT(ps, ret, row)) -> match row.tail {
+    None -> if list_is_empty(row.labels) {
+      let id = list_length(rvs)
+      Scheme(tvs, list_append(rvs, [id]), uvs, ks, TyFnT(ps, ret, Row { ...row, tail: Some(id) }))
+    } else { sc }
+    Some(_) -> sc
+  }
+  _ -> sc
+}
