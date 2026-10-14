@@ -23,10 +23,15 @@ kai lint --json [<spec>]           # findings as JSON, one line per root
 unit, from that entry, and the findings cover every module the package
 owns — the same scope `kai build` compiles, so a name another file's
 import made visible resolves here too. A package without an entry — a
-library — is linted module by module, each module its own root.
+library — is linted module by module, each module its own root and
+reported on once.
 
 Findings name the file that declares the code, not the root the lint
-started from. The stdlib a package imports is never reported on.
+started from. They cover the package under lint and no other: a module
+imported from the stdlib or from a dependency, directly or through
+another, is never reported on. Its findings belong to its own lint.
+A lone file is linted with the modules of its package it loads; with no
+`kai.toml`, those are the modules it imports from its own directory.
 
 `--json` prints one JSON array of `{file, line, col, rule, severity,
 message}` per compilation root, each on its own line (NDJSON): one
