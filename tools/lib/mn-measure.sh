@@ -88,6 +88,7 @@ mn_adjudicate() {
 mn_measure_pair() {
   local bin="$1" fixture="$2" backend="$3" ref ref_ec n pin
   MN_JUDGED=0
+  MN_DRIVER="$(mn_driver_of "$fixture")"
 
   pin="$(kai_corpus_pinned_threads "$fixture")" || pin=""
   [ -z "$pin" ] || printf '%s [%s] — pinned to KAI_THREADS=%s by its env file\n' \

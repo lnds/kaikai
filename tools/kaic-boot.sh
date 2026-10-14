@@ -160,6 +160,8 @@ release_version() {
   fi
   latest="$(latest_version)"
   [ -n "$latest" ] || { say "v$want is unpublished and no release manifest is reachable"; return 1; }
+  [ "$latest" != "$want" ] \
+    || { say "v$want is the newest release but publishes no $1 tarball yet"; return 1; }
   version_le "$latest" "$want" \
     || { say "v$want is unpublished and the newest release, v$latest, follows it"; return 1; }
   say "v$want is unpublished; the newest published release is v$latest"
@@ -182,6 +184,7 @@ boot_release() {
 # The seed is C, so cc alone builds it, against the runtime.h it was frozen
 # with. The linked seed is cached per tag and reused only while the tag still
 # names the commit it was built from and the binary still hashes as recorded.
+# boot_seed runs under `||`, where `set -e` is off: every step checks itself.
 seed_version() {
   want="$(cat "$ROOT/VERSION")"
   git -C "$ROOT" tag -l 'bootstrap-seed-v*' 2>/dev/null | sed 's/^bootstrap-seed-v//' \
@@ -190,7 +193,7 @@ seed_version() {
 }
 
 seed_cached() {
-  [ -f "$1/boot.id" ] && [ "$(field commit "$1/boot.id")" = "$2" ] \
+  [ -f "$1/boot.id" ] && [ -x "$1/kaic2" ] && [ "$(field commit "$1/boot.id")" = "$2" ] \
     && [ "$(field kaic2 "$1/boot.id")" = "$(sha_of "$1/kaic2" 2>/dev/null)" ]
 }
 
@@ -205,10 +208,13 @@ boot_seed() {
   if ! seed_cached "$dir" "$commit"; then
     rm -rf "$dir"
     mkdir -p "$dir"
-    git -C "$ROOT" archive "$commit" bootstrap | tar -x -C "$dir"
+    git -C "$ROOT" archive -o "$dir/seed.tar" "$commit" bootstrap \
+      && tar -xf "$dir/seed.tar" -C "$dir" && rm -f "$dir/seed.tar" \
+      || { rm -rf "$dir"; say "cannot extract $tag"; return 1; }
     say "cc $tag -> $dir/kaic2"
     "${MAKE:-make}" -s -C "$STAGE2" boot-hop HOP_C="$dir/bootstrap/stage2.c" HOP_BIN="$dir/kaic2" \
-      HOP_INC="$dir/bootstrap" >&2
+      HOP_INC="$dir/bootstrap" >&2 \
+      || { rm -rf "$dir"; say "cc $tag failed"; return 1; }
     printf 'commit=%s\nkaic2=%s\n' "$commit" "$(sha_of "$dir/kaic2")" > "$dir/boot.id"
   fi
   BOOT_BIN="$dir/kaic2"

@@ -3,11 +3,23 @@
 # corpus gate is written in; tools/lib/mn-measure.sh drives it.
 #
 # Expects from the caller: $TMP (scratch dir), $RUN_TIMEOUT, $RECHECKS,
-# $REF_RECHECKS, $ORDER_FILE, and tools/lib/timeout.sh + tools/lib/corpus.sh
-# already sourced.
+# $REF_RECHECKS, $ORDER_FILE, $SIGHARNESS_BIN, and tools/lib/timeout.sh +
+# tools/lib/corpus.sh already sourced.
 
 # Path-safe name for a fixture, used to key its built binaries.
 mn_slug_of() { echo "$1" | tr '/.' '__'; }
+
+# The command a fixture's `.driver` sidecar names, empty when it runs bare;
+# non-zero on a driver this gate cannot run.
+mn_driver_of() {
+  local sidecar="${1%.kai}.driver" driver
+  [ -f "$sidecar" ] || return 0
+  driver="$(head -1 "$sidecar")"
+  case "$driver" in
+    sigharness|sigharness\ *) echo "$SIGHARNESS_BIN ${driver#sigharness}" ;;
+    *) return 1 ;;
+  esac
+}
 
 # One line of witness, newlines folded so a multi-line stdout stays greppable
 # in a CI log.
@@ -37,9 +49,13 @@ mn_same_lines() {
 # read stdin, and the measurement loop is a `while read` over the fixture
 # list. Without this a single stdin-reading fixture swallows the rest of the
 # corpus and the gate reports a confident pass over the handful it got to.
+#
+# $MN_DRIVER prefixes the run with the fixture's `.driver` sidecar; the
+# driver reads the child's stdout through a pipe, the one exception.
 mn_run_at() {
   local bin="$1" n="$2" out="$3" ec=0
-  kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$n" "$bin" >"$out.raw" 2>"$out.err" </dev/null || ec=$?
+  # $MN_DRIVER word-splits on purpose: it carries the driver's args.
+  kai_timeout "$RUN_TIMEOUT" env KAI_THREADS="$n" ${MN_DRIVER:-} "$bin" >"$out.raw" 2>"$out.err" </dev/null || ec=$?
   kai_corpus_normalize_timestamps <"$out.raw" >"$out"
   echo "$ec"
 }

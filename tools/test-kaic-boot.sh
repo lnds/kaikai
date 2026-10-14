@@ -63,6 +63,7 @@ export HOP_LOG
 cat > "$work/hop-cc" <<'EOF'
 #!/bin/sh
 echo "$1 inc=${3:-}" >> "$HOP_LOG"
+[ -z "${HOP_FAIL:-}" ] || exit 1
 { echo '#!/bin/sh'
   echo '[ "$1" = --version ] && { echo "kaic2 stage 2 (self-hosted)"; exit 0; }'
   echo 'echo "/* hop-a stdlib=$KAIKAI_STDLIB_PATH args=$* */"'
@@ -209,6 +210,16 @@ if boot release emit "$out" 2>/dev/null; then fail "a release following an unpub
 echo 9.9.9 > "$root/VERSION"
 ok "an unpublished VERSION boots the newest published release when it precedes VERSION, else nothing"
 
+echo 9.9.10 > "$root/VERSION"
+cp "$dist/latest.json" "$work/latest.json"
+sed 's/9\.9\.9/9.9.10/g' "$work/latest.json" > "$dist/latest.json"
+if msg="$(boot release emit "$out" 2>&1)"; then fail "a release with no tarball for this host was booted"; fi
+case "$msg" in *"v9.9.10 is the newest release but publishes no "*" tarball yet"*) ;;
+  *) fail "a release with no tarball for this host reported: $msg" ;; esac
+mv "$work/latest.json" "$dist/latest.json"
+echo 9.9.9 > "$root/VERSION"
+ok "a newest release whose tarball is not uploaded yet boots nothing and says so"
+
 rm -rf "$root/stage2/build/boot"
 for f in "$dist"/v9.9.9/*.sha256; do
   echo "0000000000000000000000000000000000000000000000000000000000000000  x" > "$f"
@@ -316,6 +327,13 @@ seed_tag 9.9.9 " moved"
 boot seed emit "$out" 2>/dev/null
 grep -qx '/\* seed 9.9.9 moved \*/' "$hop_a" || fail "a moved seed tag reused the old seed"
 ok "the linked seed is cached per tag; a tampered binary or a moved tag relinks it"
+
+rm -rf "$seed_dir"
+if (HOP_FAIL=1; export HOP_FAIL; boot seed emit "$out" 2>/dev/null); then fail "a seed whose cc failed booted"; fi
+: > "$HOP_LOG"
+boot seed emit "$out" 2>/dev/null || fail "seed emit after a failed cc failed"
+grep -q 'bootstrap/stage2.c' "$HOP_LOG" || fail "a seed whose cc failed was reused as cached"
+ok "a seed whose cc dies half way is relinked, never taken as cached"
 
 echo 9.9.8 > "$root/VERSION"
 is_stale seed "a seed following VERSION"

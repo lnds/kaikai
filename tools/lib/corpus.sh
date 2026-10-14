@@ -26,7 +26,6 @@
 KAI_CORPUS_DEFAULT_DIRS="examples/effects
 examples/segments
 examples/actors
-examples/spawn
 examples/perceus
 examples/refinements
 examples/llvm

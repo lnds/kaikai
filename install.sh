@@ -213,9 +213,8 @@ The download is corrupt or tampered — aborting."
   fi
   info "    ok ($got)"
 
-  info "==> extracting to $PREFIX"
   # The tarball holds a single top-level dir (kaikai-<tag>-<platform>/);
-  # unpack to a scratch dir, then atomically swap its contents into
+  # unpack and check it in a scratch dir, then swap its contents into
   # $PREFIX so a re-run replaces a prior install cleanly.
   mkdir -p "$tmp/unpack"
   tar -xzf "$tmp/$tarball" -C "$tmp/unpack"
@@ -225,6 +224,7 @@ The download is corrupt or tampered — aborting."
   [ -x "$top/bin/kai" ] || err "tarball missing bin/kai"
   check_requires "$top"
 
+  info "==> extracting to $PREFIX"
   rm -rf "$PREFIX"
   mkdir -p "$PREFIX"
   # Move every entry (including dotfiles) from the unpacked top dir.
