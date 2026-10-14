@@ -16,11 +16,11 @@ perceus binds a tail value to. No other read is touched.
 """)]
 
 import compiler.ast
-import compiler.perceus_reads
 import compiler.ast_map
 import compiler.ret_slots
 import compiler.core_builtins
 import compiler.perceus_preds
+import compiler.perceus_owned_value
 
 type PopCx = { borrowed: [Binder], slots: (Expr) -> [Int] }
 
@@ -29,7 +29,7 @@ pub fn pop_own_positions(body: Expr, borrowed: [Binder], slots: (Expr) -> [Int])
   []         -> body
   [_, ...__] -> {
     let cx = PopCx { borrowed: borrowed, slots: slots }
-    pop_value(pop_expr(body, cx), cx)
+    pov_value(pop_expr(body, cx), cx.borrowed)
   }
 }
 
@@ -42,26 +42,30 @@ fn pop_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
   EList(els)           -> EList(map(els, (el) => pop_elem(el, cx)))
   ERecordLit(rh, fis)  -> ERecordLit(rh, map(fis, (fi) => pop_field(fi, cx)))
   ECall(f, args_)      -> if pop_is_sentinel(f) { k } else { ECall(f, pop_args(args_, cx.slots(f), 0, cx)) }
-  EField(x, nm)        -> EField(pop_operand(x, cx), nm)
-  EIndex(a, i)         -> EIndex(pop_operand(a, cx), pop_operand(i, cx))
-  EBinop(op, a, b)     -> EBinop(op, pop_operand(a, cx), pop_operand(b, cx))
-  EUnop(op, x)         -> EUnop(op, pop_operand(x, cx))
-  EBang(x)             -> EBang(pop_operand(x, cx))
-  EMatch(scr, arms)    -> EMatch(pop_scrutinee(scr, cx), arms)
-  _                    -> k
+  _                    -> if pop_reads_owed(k, cx) { pop_consumed(k, cx) } else { k }
 }
 
-# A raw read takes the scalar and leaves the box alone, so it owes no dup.
-fn pop_operand(e: Expr, cx: PopCx) : Expr = match e.mode {
-  MUnboxed -> e
-  _        -> pop_value(e, cx)
+# True when an operand the runtime consumes owes a reference; any other
+# node is kept as it came in. A bare borrowed scrutinee is inspected in
+# place, a value yielded into the scrutinee is released by the match.
+fn pop_reads_owed(k: ExprKind, cx: PopCx) : Bool = match k {
+  EField(x, _)    -> pov_owes(x, cx.borrowed)
+  EIndex(a, i)    -> pov_owes(a, cx.borrowed) or pov_owes(i, cx.borrowed)
+  EBinop(_, a, b) -> pov_owes(a, cx.borrowed) or pov_owes(b, cx.borrowed)
+  EUnop(_, x)     -> pov_owes(x, cx.borrowed)
+  EBang(x)        -> pov_owes(x, cx.borrowed)
+  EMatch(scr, _)  -> pov_yields(scr)
+  _               -> false
 }
 
-# A bare borrowed scrutinee is inspected in place; a value yielded into the
-# scrutinee is released by the match.
-fn pop_scrutinee(scr: Expr, cx: PopCx) : Expr = match scr.kind {
-  ELocal(_) -> scr
-  _         -> pop_value(scr, cx)
+fn pop_consumed(k: ExprKind, cx: PopCx) : ExprKind = match k {
+  EField(x, nm)     -> EField(pov_operand(x, cx.borrowed), nm)
+  EIndex(a, i)      -> EIndex(pov_operand(a, cx.borrowed), pov_operand(i, cx.borrowed))
+  EBinop(op, a, b)  -> EBinop(op, pov_operand(a, cx.borrowed), pov_operand(b, cx.borrowed))
+  EUnop(op, x)      -> EUnop(op, pov_operand(x, cx.borrowed))
+  EBang(x)          -> EBang(pov_operand(x, cx.borrowed))
+  EMatch(scr, arms) -> EMatch(pov_value(scr, cx.borrowed), arms)
+  _                 -> k
 }
 
 # A slot passes its value through, so its rhs is owned only where the
@@ -73,31 +77,31 @@ fn pop_stmts(ss: [Stmt], next: Int, cx: PopCx) : [Stmt] = match ss {
     SLet(pat, ann, rhs) ->
       if ret_slot_binds_tail_arg(pat, next) { [s, ...pop_stmts(rest, next + 1, cx)] }
       else if pop_is_wrap(pat) { [s, ...pop_stmts(rest, next, cx)] }
-      else { [SLet(pat, ann, pop_value(rhs, cx)), ...pop_stmts(rest, next, cx)] }
+      else { [SLet(pat, ann, pov_value(rhs, cx.borrowed)), ...pop_stmts(rest, next, cx)] }
     _ -> [s, ...pop_stmts(rest, next, cx)]
   }
 }
 
 fn pop_elem(el: ListElem, cx: PopCx) : ListElem = match el {
-  ElSpread(x) -> ElSpread(pop_value(x, cx))
-  ElPlain(x)  -> ElPlain(pop_value(x, cx))
+  ElSpread(x) -> ElSpread(pov_value(x, cx.borrowed))
+  ElPlain(x)  -> ElPlain(pov_value(x, cx.borrowed))
 }
 
 fn pop_field(fi: FieldInit, cx: PopCx) : FieldInit = match fi {
-  FI(nm, v) -> FI(nm, pop_value(v, cx))
+  FI(nm, v) -> FI(nm, pov_value(v, cx.borrowed))
 }
 
 fn pop_args(args_: [Expr], borrowed_slots: [Int], i: Int, cx: PopCx) : [Expr] = match args_ {
   []           -> []
   [a, ...rest] -> {
-    let a1 = if any(borrowed_slots, (p) => p == i) { pop_lent(a, cx) } else { pop_value(a, cx) }
+    let a1 = if any(borrowed_slots, (p) => p == i) { pop_lent(a, cx) } else { pov_value(a, cx.borrowed) }
     [a1, ...pop_args(rest, borrowed_slots, i + 1, cx)]
   }
 }
 
 # A borrowed slot lends a bare binder through. A value the caller releases
 # after the call must own a reference on every path that yields it.
-fn pop_lent(a: Expr, cx: PopCx) : Expr = if pcs_arg_is_owned_rvalue(a) { pop_value(a, cx) } else { a }
+fn pop_lent(a: Expr, cx: PopCx) : Expr = if pov_yields(a) and pcs_arg_is_owned_rvalue(a) { pov_value(a, cx.borrowed) } else { a }
 
 # Perceus's own marks manage their operands, and a unit coercion hands
 # its operand through. A call of a declaration, of a closure a local
@@ -118,36 +122,3 @@ fn pop_is_wrap(pat: Pattern) : Bool = match pat.pkind {
   PBind(b) -> ret_slot_id_is_value(b.id)
   _        -> false
 }
-
-fn pop_value(e: Expr, cx: PopCx) : Expr = match e.kind {
-  ELocal(l) -> if pcs_has(cx.borrowed, l) { pop_dup(e) } else { e }
-  _         -> Expr { kind: pop_value_kind(e.kind, cx), line: e.line, col: e.col,
-                      ty: e.ty, mode: e.mode,  site: e.site }
-}
-
-fn pop_value_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
-  EIf(c, t, oe)       -> EIf(c, pop_value(t, cx), prc_map_opt_expr(oe, (x) => pop_value(x, cx)))
-  EMatch(scr, arms)   -> EMatch(scr, map(arms, (a) => match a { Arm(p, g, b) -> Arm(p, g, pop_value(b, cx)) }))
-  EBlock(stmts, tail) -> match tail {
-    Some(t) -> EBlock(pop_wrapped(stmts, t, cx), Some(pop_value(t, cx)))
-    None    -> k
-  }
-  _ -> k
-}
-
-# The wrap a block tail names, if the tail is a bare result slot: its rhs
-# is owned where the block's value is.
-fn pop_wrapped(stmts: [Stmt], tail: Expr, cx: PopCx) : [Stmt] = match tail.kind {
-  ELocal(l) -> map(stmts, (s) => match s {
-    SLet(pat, ann, rhs) -> match pat.pkind {
-      PBind(b) -> if local_eq(b.id, l) and ret_slot_id_is_value(l) { SLet(pat, ann, pop_value(rhs, cx)) } else { s }
-      _        -> s
-    }
-    _ -> s
-  })
-  _ -> stmts
-}
-
-fn pop_dup(a: Expr) : Expr =
-  Expr { kind: ECall(mk_expr(EMark(MkDup), a.line, a.col), [a]),
-         line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }

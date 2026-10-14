@@ -1754,35 +1754,44 @@ fn emit_call_expr_named(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Str
 
 # `({ <open> T _bcr = <call over args>; <close> _bcr; })`: every
 # `__perceus_owned_borrow` arg is held in a temp the call borrows and `close`
-# releases — the birth ref the callee did not consume. The slot array is
-# registered for the call's extent when the call can unwind, and read live:
-# a slot not reached yet is null. A named temp is never registered, its
-# binder is already.
+# releases — the birth ref the callee did not consume. A temp computed in
+# place is registered for the call's extent when the call can unwind; one
+# that only renames a binder is not, its binder is already.
 type ObPlan = { open: String, close: String, args: [Expr], cx: EmitCtx }
 
 fn emit_ob_plan(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : ObPlan / Console = {
   let tag = list_length(cx.tcpend)
-  let fresh = eob_positions(args_e, (a) => eob_is_fresh(a))
-  let named = eob_positions(args_e, (a) => eob_is_named(a))
-  let cx1 = emit_ctx_declaring(cx, map(named, eob_key))
-  let binds = emit_ob_binds(src, args_e, named, cx)
-  let plain = ObPlan { open: binds, close: eob_drops(args_e, tag), args: eob_call_args(args_e, tag), cx: cx1 }
-  match fresh {
-    [] -> plain
-    _  -> {
-      let n = int_to_string(list_length(args_e))
-      let decl = concat_all([binds, "KaiValue *", eob_array(tag), "[", n, "] = {0}; "])
-      if cx.unw.sites != [] and unw_call_unwinds(f, args_e, cx.unw.bound, cx.unw.ucx) {
-        let fib = cat2("_uwo", int_to_string(tag))
-        let pend = list_append(list_append(cx.tcpend, [tcl_unw_entry(fib)]), map(fresh, (i) => tcl_scr_entry(eob_slot(tag, i))))
-        ObPlan { ...plain, open: string_concat(decl, euw_array_push(fib, eob_array(tag), n)),
-                 close: string_concat(euw_pop(fib), plain.close), cx: emit_ctx_with_tcpend(cx1, pend) }
-      } else { ObPlan { ...plain, open: decl } }
-    }
-  }
+  let slots = eob_needs_slots(args_e)
+  let fresh = eob_fresh(args_e)
+  let bound = eob_bound(args_e, slots)
+  let p = ObPlan { open: emit_ob_binds(src, args_e, bound, cx), close: eob_drops(args_e, tag, slots),
+                   args: eob_call_args(args_e, tag, slots), cx: emit_ctx_declaring(cx, map(bound, eob_key)) }
+  let held = fresh != [] and cx.unw.sites != [] and unw_call_unwinds(f, args_e, cx.unw.bound, cx.unw.ucx)
+  if slots { emit_ob_in_slots(p, fresh, tag, int_to_string(list_length(args_e)), held) }
+  else if held { emit_ob_held(p, "_uwo", map(fresh, eob_named_c), euw_vars_push("_uwo", map(fresh, eob_named_c))) }
+  else { p }
 }
 
-fn emit_ob_binds(src: String, args_e: [Expr], named: [Int], cx: EmitCtx) : String / Console = match named {
+# The slot array is read live when the frame unwinds: a slot the operands
+# have not reached yet is null.
+fn emit_ob_in_slots(p: ObPlan, fresh: [Int], tag: Int, n: String, held: Bool) : ObPlan = {
+  let arr = eob_array(tag)
+  let q = ObPlan { ...p, open: concat_all([p.open, "KaiValue *", arr, "[", n, "] = {0}; "]) }
+  if held {
+    let fib = cat2("_uwo", int_to_string(tag))
+    emit_ob_held(q, fib, map(fresh, (i) => eob_slot(tag, i)), euw_array_push(fib, arr, n))
+  } else { q }
+}
+
+# An early return out of the call's operands pops the registration and
+# releases the temps.
+fn emit_ob_held(p: ObPlan, fib: String, vars: [String], push: String) : ObPlan = {
+  let pend = list_append(list_append(p.cx.tcpend, [tcl_unw_entry(fib)]), map(vars, tcl_scr_entry))
+  ObPlan { open: string_concat(p.open, push), close: string_concat(euw_pop(fib), p.close),
+           args: p.args, cx: emit_ctx_with_tcpend(p.cx, pend) }
+}
+
+fn emit_ob_binds(src: String, args_e: [Expr], bound: [Int], cx: EmitCtx) : String / Console = match bound {
   []           -> ""
   [i, ...rest] -> match nth(args_e, i) {
     Some(a) -> concat_all(["KaiValue *", eob_named_c(i), " = ", emit_expr(src, eob_inner(a), cx), "; ",
