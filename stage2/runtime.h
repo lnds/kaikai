@@ -11118,8 +11118,10 @@ static KaiValue *kai_core_string_to_int(KaiValue *s) {
 static KaiValue *kai_core_string_to_real(KaiValue *s) {
     int ok = 0;
     double value = 0.0;
-    if (s && s->tag == KAI_STR && s->as.s.len > 0 && s->as.s.len < 64) {
-        char buf[64];
+    if (s && s->tag == KAI_STR && s->as.s.len > 0) {
+        char small[64];
+        char *buf = s->as.s.len < sizeof small ? small : (char *) malloc(s->as.s.len + 1);
+        if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         memcpy(buf, s->as.s.bytes, s->as.s.len);
         buf[s->as.s.len] = '\0';
         char *end = NULL;
@@ -11134,6 +11136,7 @@ static KaiValue *kai_core_string_to_real(KaiValue *s) {
             value = v;
             ok = 1;
         }
+        if (buf != small) free(buf);
     }
     if (s) kai_decref(s);
     if (ok) {
