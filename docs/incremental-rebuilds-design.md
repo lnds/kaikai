@@ -31,14 +31,16 @@ building on:
   invalidation is a property of the key, not a sweep. This is the exact keying
   shape the per-module typed cache needs; only the **payload** differs.
 - **KAB2 codec** (`stage2/compiler/cache.kai`). The binary blob format:
-  4-byte magic `"KAB2"`, `format_version` (u32 LE, `cache_format_version() = 4`,
+  4-byte magic `"KAB2"`, `format_version` (u32 LE, `cache_format_version()`,
   bumped on any payload schema change), `kaikai_version` hash (u32 LE), 64-byte
   ASCII source SHA, then the payload. `cache_read_header` rejects a blob whose
   magic / format / version drifts — so a stale or foreign blob is a miss, never
   a mis-load.
-- **Key-version stamps.** `uc_key_version()` / `cc_key_version()` are bumped on
-  any change to the respective key derivation, distinct from the codec
-  `format_version`. A typed cache adds a third such stamp.
+- **No key-version stamp on the post-parse or core cache.** Their blob names
+  carry only the hashes: `<content>-<dep>.kab` for a user module,
+  `core-<content>.kab` for a core one. A compiler upgrade is caught by the KAB2
+  header (`format_version` and `kaikai_version` hash), not by the key. A typed
+  cache folds its own stamp into the key.
 
 **The one gap the foundation does *not* close (blocking — see open questions):**
 the KAB2 codec today serializes **surface `[Decl]` only**. There is no schema for
@@ -64,9 +66,8 @@ typed_key(M) = ( content_hex(source(M)),
   *content*): the typed cache must key on imports' *interfaces*, so that a
   content edit to an import that leaves its interface unchanged does **not**
   invalidate `M` — that is the whole point (propagation rule below).
-- `uc_typed_key_version` — new stamp, bumped on any change to typed-key
-  derivation or typed-blob layout (a third stamp alongside `uc_key_version` /
-  `cc_key_version`).
+- `uc_typed_key_version` — stamp bumped on any change to typed-key
+  derivation or typed-blob layout.
 - `kaikai_version, edition, flags_hash` — folded into the key so an upgrade,
   edition bump, or flag change is a global miss (see Invalidation).
 

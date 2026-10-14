@@ -3710,6 +3710,7 @@ test-effects-goldens-native: $(TARGET) bin-kai build
 TEST_EFFECTS_CASES := \
 	test-effects-parse_effect \
 	test-effects-parse_row_syntax \
+	test-effects-parse_effect_alias_args \
 	test-effects-row_match_higher_order \
 	test-effects-row_pure_to_effectful \
 	test-effects-op_call_basic \
@@ -3817,6 +3818,16 @@ test-effects-parse_row_syntax: $(TARGET) build core-cache-warm
 	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
 	    && grep -q "row Io" build/s2-$$name.ast \
 	    && grep -q "row Io + Fail" build/s2-$$name.ast \
+	    && echo "effects OK $$name" \
+	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
+	done
+
+test-effects-parse_effect_alias_args: $(TARGET) build core-cache-warm
+	@set -e; \
+	for f in ../examples/effects/parse_effect_alias_args.kai; do \
+	  name=$$(basename $$f .kai); \
+	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
+	    && grep -q "ty_effect_alias Ask\[Int\] + Log" build/s2-$$name.ast \
 	    && echo "effects OK $$name" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
 	done
@@ -5376,14 +5387,30 @@ test-sugars-fixture-%: $(TARGET) build core-cache-warm
 # kai lint (#966). Each .kai under `examples/lint/` runs through the
 # `--lint` and `--lint-json` reporter modes; the human text is diffed
 # against `<name>.lint.expected` and the JSON against
-# `<name>.lint-json.expected`. The linter must exit 0 in every case —
-# a lint never blocks a build — so a non-zero exit fails the gate.
+# `<name>.lint-json.expected`. A lint never blocks a build, so a
+# non-zero exit fails the gate — except for a program the typer
+# rejects, marked by `<name>.err.expected`: both modes must exit
+# non-zero and print every line of it.
 test-lint: $(TARGET) build
 	@set -e; \
 	for f in ../examples/lint/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_txt=../examples/lint/$$name.lint.expected; \
 	  exp_json=../examples/lint/$$name.lint-json.expected; \
+	  exp_err=../examples/lint/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    for m in --lint --lint-json; do \
+	      rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$m --path ../stdlib $$f > build/s2-$$name.lint 2>&1 || rc=$$?; \
+	      if [ $$rc -eq 0 ]; then \
+	        echo "lint FAIL $$name ($$m exited 0 on a rejected program)"; cat build/s2-$$name.lint; exit 1; \
+	      fi; \
+	      while read -r line; do \
+	        grep -qF "$$line" build/s2-$$name.lint \
+	          || { echo "lint FAIL $$name ($$m missing diagnostic: $$line)"; cat build/s2-$$name.lint; exit 1; }; \
+	      done < $$exp_err; \
+	    done; \
+	    echo "lint OK $$name (rejected)"; continue; \
+	  fi; \
 	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --lint --path ../stdlib $$f > build/s2-$$name.lint 2>&1 || rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "lint FAIL $$name (--lint exited $$rc; a lint must never block)"; \
