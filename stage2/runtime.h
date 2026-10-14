@@ -3318,7 +3318,7 @@ struct KaiFiber {
 #if KAI_HOST_FIBERS
     ucontext_t      ctx;               /* swapcontext target              */
 #else
-    char            ctx[1];            /* the slot KAI_MAIN_FIBER_INIT fills by position */
+    char            ctx[1];
 #endif
     void           *stack_base;        /* heap-allocated; freed on RC=0   */
     size_t          stack_size;        /* set per fiber (env-configurable) */
@@ -3624,44 +3624,10 @@ struct KaiNursery {
 };
 
 /* A worker's root fiber starts as the OS-thread context, representing the
- * dispatch loop. Its ctx is filled lazily on first yield (getcontext at
- * the moment we suspend the dispatch loop into a fiber). */
-#define KAI_MAIN_FIBER_INIT {                                            \
-    NULL,                /* evidence_top */                              \
-    0, 0,                /* cancel_requested, cancel_delivered */        \
-    NULL, NULL,          /* sched_next, parent */                        \
-    KAI_FIBER_RUNNING,   /* state — main starts running on the OS thread */ \
-    NULL, NULL,          /* thunk, result */                            \
-    {0},                 /* ctx — getcontext fills it on first swap */   \
-    NULL, 0,             /* stack_base, stack_size — main uses OS stack */ \
-    NULL, NULL,          /* awaiters_head, awaiters_next */              \
-    NULL,                /* select_waiters_head */                       \
-    {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */ \
-    0, NULL,             /* trapped, trap_msg — main starts untrapped */  \
-    NULL,                /* linked_head */                               \
-    NULL,                /* in_dispatch_node */                          \
-    NULL,                /* value — main has no wrapper */               \
-    0,                   /* trap_exit — main starts opted out */         \
-    NULL,                /* mailbox — set by with_mailbox if main uses one */ \
-    NULL,                /* monitor_head — Monitor.monitor(...) appends here */ \
-    NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
-    NULL, NULL, NULL,    /* nursery_top, scope_sibling_next, scope_nursery */ \
-    0,                   /* home_thread — thread 0 is the main scheduler */ \
-    0,                   /* pinned_main — a scheduler root never migrates */ \
-    0,                   /* wake_pending */                              \
-    0,                   /* pending_park — not a reactor park */          \
-    0,                   /* reactor_fired */                              \
-    0,                   /* cancel_wake */                                \
-    NULL,                /* commit_next */                               \
-    NULL,                /* tsan_fiber — bound on this thread's first switch */ \
-    NULL,                /* exit_rec */                                  \
-    NULL, 0, 0,          /* unw_buf, unw_top, unw_cap */                 \
-    0,                   /* unwind_frame — main has no pad */            \
-    NULL, 0, 0,          /* rframe_buf, rframe_top, rframe_cap */        \
-    NULL, 0,             /* seg, seg_pin */                              \
-    NULL,                /* worker — bound by kai_worker_here */         \
-    NULL                 /* free_stack */                                \
-}
+ * dispatch loop, and running; every other field starts zero. Its ctx is
+ * filled lazily on first yield (getcontext at the moment we suspend the
+ * dispatch loop into a fiber). */
+#define KAI_MAIN_FIBER_INIT { .state = KAI_FIBER_RUNNING }
 /* The landing a fiber context falls off into runs only setcontext, so its
  * stack is small. A literal, not SIGSTKSZ: glibc defines that as a sysconf()
  * call, which would make the array below a VLA. */
@@ -13976,10 +13942,12 @@ static int _kai_unix_listen_at(const char *path, mode_t mode, int *fd, struct st
     const char *slash = strrchr(path, '/');
     int plen = slash ? (int) (slash - path) + 1 : 0;
     char dir[KAI_PATH_BUF], tmp[KAI_PATH_BUF];
-    snprintf(dir, sizeof(dir), "%.*s.kaiXXXXXX", plen, path);
+    int n = snprintf(dir, sizeof(dir), "%.*s.kaiXXXXXX", plen, path);
+    if (n < 0 || (size_t) n >= sizeof(dir)) return ENAMETOOLONG;
     if (!mkdtemp(dir)) return errno;
     int e = chmod(dir, 0700) < 0 ? errno : 0;
-    snprintf(tmp, sizeof(tmp), "%s/s", dir);
+    n = snprintf(tmp, sizeof(tmp), "%s/s", dir);
+    if (e == 0 && (n < 0 || (size_t) n >= sizeof(tmp))) e = ENAMETOOLONG;
     if (e == 0) e = _kai_unix_bind_private(tmp, mode, fd, st);
     if (e == 0) {
         e = _kai_unix_publish(tmp, path);
@@ -15643,14 +15611,17 @@ static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCo
 
 /* Page size, queried once via sysconf and cached. macOS arm64 pages
  * are 16 KiB, x86_64 / Linux are 4 KiB; the guard arithmetic must use
- * the runtime value or mprotect rejects the call. */
+ * the runtime value or mprotect rejects the call. Workers race to fill the
+ * cache with one value, so a relaxed atomic is enough. */
 static size_t kai_page_size(void) {
-    static size_t cached = 0;
-    if (cached == 0) {
-        long ps = sysconf(_SC_PAGESIZE);
-        cached = (ps > 0) ? (size_t) ps : 4096;
+    static _Atomic size_t cached = 0;
+    size_t ps = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (ps == 0) {
+        long q = sysconf(_SC_PAGESIZE);
+        ps = (q > 0) ? (size_t) q : 4096;
+        atomic_store_explicit(&cached, ps, memory_order_relaxed);
     }
-    return cached;
+    return ps;
 }
 
 /* Read KAI_FIBER_STACK_SIZE once and cache. Out-of-range values
