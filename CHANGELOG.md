@@ -84,6 +84,37 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.154.0 (2026-10-14)
+
+### Added
+
+- **test**: per-block line coverage with kai test --json --coverage
+
+### Fixed
+
+- **runtime**: give the poolless modes the slab teardown hook
+- **cli**: name a relative entry in native diagnostics as the C path does
+- **runtime**: free the slabs after the exit reports read them
+- **driver**: compose --emit=kir with --test, --bench and --prop-check
+- **kai**: set the runtime's feature-test macros ahead of a CFLAGS -include
+- **emit**: a self tail call's goto value has the fn's raw return type
+- **typer**: a minted DecimalBig literal types its BigInt call
+- **native**: a boxed call to a program fn spelled kai_* keeps its own symbol
+- **region**: one region-brand predicate for the signature and the ctor
+- **typer**: one concreteness predicate, so a lambda waits on a unit variable
+- **typer**: the spawn-capture check rejects a captured sum that stores an Array or a Ref
+- **runtime**: unary minus on a boxed Byte wraps like the raw one
+- **runtime**: a NaN Real compared with itself through one binder is unequal
+- **cli**: go straight to the C backend when kaic2 has no libLLVM
+- **check**: run the law checks of the build's own impls only
+- **cli**: take the macOS stack flag from the C compiler's target, not the host
+- **runtime**: cache kai_fiber_stack_size in a relaxed atomic
+
+### Changed
+
+- **typer**: scan only the mutating shapes for the cell carriers
+- **cli**: ask a kaic2 for its native backend once per binary
+
 ## v0.153.0 (2026-10-14)
 
 ### BREAKING CHANGE
