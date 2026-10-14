@@ -1,0 +1,87 @@
+#[doc("""
+A `pub` loop that owns what it hands its own `^` slot runs in a worker.
+
+A `pub` function's `^` is its callers' contract: they keep their
+reference and release it after the call, so the slot stays borrowed.
+When a back-edge fills that slot with a value the loop owns, nothing
+releases the value. Such a function keeps its signature and forwards to
+a non-`pub` worker carrying its body, whose slot Perceus makes owned:
+the forwarding call takes the one reference the worker starts with.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.ast_map
+import compiler.borrow_back_edge
+import compiler.perceus_borrow_map
+import compiler.self_call
+import compiler.symtab
+import compiler.decl_text
+import compiler.written
+import compiler.home_tu
+import compiler.decl_names
+import compiler.tailfuse
+
+#[doc("The name of the worker minted for the `pub` function `f`; the prefix is one no source identifier can spell.")]
+pub fn pub_loop_worker_name(f: String) : String = cat2("__kai_loop_", f)
+
+#[doc("`prog` with every `pub` function whose back-edge hands a `^` slot an owned value split into a forwarding wrapper and its worker, whose rows join `prog`'s.")]
+pub fn pub_loop_workers(prog: TailFused, tab: SymTab, target: String) : TailFused =
+  if any(prog.decls, (d) => plw_needs_worker(d, tab)) {
+    plw_split_all(prog.decls, PlwIn { tab: tab, target: target }, [], list_reverse(prog.rows))
+  } else { prog }
+
+type PlwIn = { tab: SymTab, target: String }
+
+fn plw_split_all(decls: [Decl], inp: PlwIn, acc: [Decl], rows: [NEnt]) : TailFused = match decls {
+  []           -> TailFused { decls: list_reverse(acc), rows: list_reverse(rows) }
+  [d, ...rest] ->
+    if plw_needs_worker(d, inp.tab) {
+      let row = plw_row(d, inp)
+      let wsym = nent_sym(row)
+      plw_split_all(rest, inp, [plw_wrapper(d, wsym), plw_worker(d, wsym), ...acc], [row, ...rows])
+    } else { plw_split_all(rest, inp, [d, ...acc], rows) }
+}
+
+fn plw_needs_worker(d: Decl, tab: SymTab) : Bool = match d {
+  DFn(true, fid, _, params, _, _, body, _, _, _) -> match pcs_explicit_borrow_names(params) {
+    []    -> false
+    caret -> {
+      let pnames = map(params, (p) => p.binder)
+      list_length(bbe_keep_borrowed(tab, SelfRef(fid), pnames, caret, body)) < list_length(caret)
+    }
+  }
+  _ -> false
+}
+
+# The worker is homed beside the function it serves.
+fn plw_row(d: Decl, inp: PlwIn) : NEnt = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> {
+    let name = pub_loop_worker_name(written_text(decl_name(inp.tab, fnid_sym(fid))))
+    let home = match home_tu(d) { Some(m) -> m  None -> inp.target }
+    NEnt(NCFn, name, home, false, NmHelper)
+  }
+  _ -> panic("pub_loop_worker: a row for a declaration that is not a function")
+}
+
+fn plw_worker(d: Decl, wsym: SymId) : Decl = match d {
+  DFn(_, fid, tparams, params, opt_ret, row, body, ln, cl, mo) ->
+    DFn(false, fnid_decl(wsym), tparams, params, opt_ret, row, plw_retarget(body, fnid_sym(fid), wsym), ln, cl, mo)
+  _ -> d
+}
+
+fn plw_wrapper(d: Decl, wsym: SymId) : Decl = match d {
+  DFn(is_pub, fid, tparams, params, opt_ret, row, _, ln, cl, mo) -> {
+    let args = map(params, (p) => mk_local(p.binder.id, ln, cl))
+    DFn(is_pub, fid, tparams, params, opt_ret, row, mk_expr(ECall(mk_sym(wsym, ln, cl), args), ln, cl), ln, cl, mo)
+  }
+  _ -> d
+}
+
+# Every reference to the function inside its own body names the worker,
+# so each back-edge stays a self call the tail rewrite turns into a jump.
+fn plw_retarget(e: Expr, me: SymId, wsym: SymId) : Expr = match e.kind {
+  ESym(s, inst) ->
+    if sym_raw(s) == sym_raw(me) { Expr { ...e, kind: ESym(wsym, inst) } } else { e }
+  k -> Expr { ...e, kind: prc_map_expr_kind(k, (x) => plw_retarget(x, me, wsym)) }
+}
