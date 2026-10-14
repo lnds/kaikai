@@ -22,8 +22,16 @@ fail() {
   exit 1
 }
 
+# `grep -q` exits at the first match, so a pipe feeding it breaks under the
+# writer; a here-document leaves no writer to break.
+has() {
+  grep -qE "$2" <<EOF
+$1
+EOF
+}
+
 need() {
-  printf '%s\n' "$out" | grep -qE "$1" || fail "no line matching: $1"
+  has "$out" "$1" || fail "no line matching: $1"
 }
 
 need '^unbox send shout#[0-9]+ shout@sink$'
@@ -140,9 +148,9 @@ cold=$(own_lines)
 warm=$(own_lines)
 out=$(printf 'cold:\n%s\nwarm:\n%s\n' "$cold" "$warm")
 need '^cold:$'
-printf '%s\n' "$cold" | grep -qE '^own effect Loud#[0-9]+ Loud@main$' \
+has "$cold" '^own effect Loud#[0-9]+ Loud@main$' \
   || fail "a cold build lost an effect declaration's id"
-printf '%s\n' "$warm" | grep -q '#-1' \
+has "$warm" '#-1' \
   && fail "a warm build reaches the late passes with a declaration stripped of its id"
 [ "$cold" = "$warm" ] || fail "a warm build's declaration ids differ from a cold build's"
 
@@ -168,7 +176,7 @@ twin_own() {
 shared=$(twin_own "$CACHE")
 fresh=$(twin_own "$TWIN")
 out=$(printf 'over main.kai cache:\n%s\nfresh:\n%s\n' "$shared" "$fresh")
-printf '%s\n' "$shared" | grep -q '@main$' && fail "a cached root restored ids homed under another target"
+has "$shared" '@main$' && fail "a cached root restored ids homed under another target"
 [ "$shared" = "$fresh" ] || fail "a root compiled over another target's cache differs from a fresh build"
 
 a=$(main_id "$ALIASFIX")
@@ -215,7 +223,7 @@ kir=$(cd "$MATFIX" && "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --
         --path "$MATFIX" --path "$ROOT/stdlib" main.kai 2>/dev/null)
 direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}/{exit}')
 [ -n "$direct" ] || { out=$kir; fail "no pkg__direct in the KIR dump"; }
-printf '%s\n' "$direct" | grep -q 'int.unbox' \
+has "$direct" 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
 # A UFCS callee carries the id of the declaration the receiver's type
@@ -286,7 +294,7 @@ for pass in cold warm; do
   need '^ctor pat pb Tok#[0-9]+ Tok@mb$'
   need '^ctor sym main Tok#[0-9]+ Tok@ma$'
   need '^ctor sym main Tok#[0-9]+ Tok@mb$'
-  printf '%s\n' "$out" | grep -q ' Tok#none$' && fail "$pass: a constructor site reached unbox with no home"
+  has "$out" ' Tok#none$' && fail "$pass: a constructor site reached unbox with no home"
   [ "$(id_of '^ctor pat pa Tok#')" != "$(id_of '^ctor pat pb Tok#')" ] \
     || fail "$pass: two modules' homonymous constructors carry one id"
   [ "$(id_of '^ctor pat pa Tok#')" = "$(id_of '^ctor sym main Tok#[0-9]+ Tok@ma$')" ] \
@@ -301,7 +309,7 @@ out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$NESTFIX" --path "$ROOT/stdlib" "$NESTFIX/main.kai" | grep '^ctor ' || true)
 need '^ctor pat ra Circle#[0-9]+ Circle@ma$'
 need '^ctor pat ra Sq#[0-9]+ Sq@ma$'
-printf '%s\n' "$out" | grep -q ' Circle#none$' && fail "a nested constructor pattern reached unbox with no home"
+has "$out" ' Circle#none$' && fail "a nested constructor pattern reached unbox with no home"
 
 # A qualified call carries the id of the declaration its qualifier names,
 # cold and warm alike, and a generic two modules share is specialised per
@@ -327,11 +335,11 @@ out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$HFIX" --path "$ROOT/stdlib" "$HFIX/main.kai")
 need '^perceus twice twice#[0-9]+ twice@ma$'
 need '^perceus half half#[0-9]+ half@ma$'
-printf '%s\n' "$out" | grep -qE '^perceus (twice|half) (twice|half)#[0-9]+ (twice|half)@main$' \
+has "$out" '^perceus (twice|half) (twice|half)#[0-9]+ (twice|half)@main$' \
   && fail "a homonym of the enclosing function reached Perceus as a self-call"
 [ "$(printf '%s\n' "$out" | grep -cE '^perceus step step#[0-9]+ step@ma$')" = 2 ] \
   || fail "mb.step's call to ma.step lost ma.step's id"
-printf '%s\n' "$out" | grep -qE '^perceus step step#[0-9]+ step@mb$' \
+has "$out" '^perceus step step#[0-9]+ step@mb$' \
   && fail "mb.step's call to ma.step reached Perceus as a self-call"
 
 # A capability annotated by an effect spelled like a core type names the
@@ -362,11 +370,11 @@ for pass in cold warm; do
           --core-cache-dir "$ECACHE" --dump-symids --path "$ROOT/stdlib" "$EFIX")
   [ "$(printf '%s\n' "$out" | grep -cE '^perceus (send|add) Child\.(get|put|rec)#[a-z0-9]+#[0-9]+ Child@capability_param_core_type_homonym$')" = 5 ] \
     || fail "a capability spelled like a core type did not name the file's effect ($pass)"
-  printf '%s\n' "$out" | grep -q 'Child@os' && fail "a capability op named the core type ($pass)"
+  has "$out" 'Child@os' && fail "a capability op named the core type ($pass)"
   out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$ECACHE" \
           --core-cache-dir "$ECACHE" --dump-symids --path "$EIMP" --path "$ROOT/stdlib" "$EIMP/main.kai")
   need '^perceus twice Child\.get#c#[0-9]+ Child@tasks$'
-  printf '%s\n' "$out" | grep -q 'Child@os' && fail "an imported capability op named the core type ($pass)"
+  has "$out" 'Child@os' && fail "an imported capability op named the core type ($pass)"
 done
 
 # A specialised callee is named by its spec's identity; a callee minted
@@ -382,8 +390,11 @@ cell_dump() {
     --path "$ROOT/stdlib" "$ROOT/examples/effects/$1.kai"
 }
 cell_core() {
-  printf '%s\n' "$out" | grep -E '^kperform [^ ]+ (State|Reader)\.' \
-    | grep -vqE ' (State|Reader)@concurrent$' && fail "a cell perform does not name the core effect ($1)"
+  if grep -E '^kperform [^ ]+ (State|Reader)\.' <<EOF | grep -vE ' (State|Reader)@concurrent$' >/dev/null
+$out
+EOF
+  then fail "a cell perform does not name the core effect ($1)"
+  fi
   return 0
 }
 out=$(cell_dump cell_perform_ids)
@@ -436,7 +447,7 @@ stamp_ids() {
 stamp_cold=$(stamp_ids)
 stamp_warm=$(stamp_ids)
 out=$(printf 'cold:\n%s\nwarm:\n%s\n' "$stamp_cold" "$stamp_warm")
-printf '%s\n' "$stamp_cold$stamp_warm" | grep -q '^unstamped' && fail "a contested type reaches the late passes without its declaration's id"
+has "$stamp_cold$stamp_warm" '^unstamped' && fail "a contested type reaches the late passes without its declaration's id"
 [ "$stamp_cold" = "$stamp_warm" ] || fail "a warm build stamps written types differently from a cold one"
 
 echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, a specialised callee is always its spec's id, and every cell perform names the core State or Reader, and every written type name the late passes read carries its declaration's id, cold and warm"
