@@ -108,6 +108,23 @@ expect_reject "kaic2 rejects -j1"              "unknown option \`-j1\`" -j1 --ch
 expect_reject "kaic2 --path needs a value"     "--path requires a directory argument" --check x.kai --path
 CMD="$KAI"
 
+# A KIR dump composes with --test in either order: it dumps the test
+# build, whose entry is the runner, so the file's `main` is a plain fn.
+fixture="$ROOT/examples/test-runner/own_main.kai"
+for order in "--emit=kir --test" "--test --emit=kir"; do
+  label="kaic2 $order dumps the test build's KIR"
+  # shellcheck disable=SC2086
+  out="$("$ROOT/stage2/kaic2" --path "$ROOT/stdlib" $order "$fixture" 2>&1)" || true
+  if printf '%s\n' "$out" | head -n1 | grep -q '^; kaikai KIR dump' \
+     && printf '%s\n' "$out" | grep -q '^fn own_main__main(' \
+     && ! printf '%s\n' "$out" | grep -q '^fn main('; then
+    ok "$label"
+  else
+    fail "$label"
+    printf '%s\n' "$out" | head -n 5 | sed 's/^/        /'
+  fi
+done
+
 # Reversion proof for the original repro: an explicit --backend=c runs
 # the check runner exactly like the flagless form — no basename noise,
 # exit 0, the summary line present.
