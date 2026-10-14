@@ -7958,7 +7958,8 @@ static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
 /* ---------- equality ---------- */
 
 KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
-    if (a == b) return 1;   /* identical word — covers two equal immediates (Koka kk_box_eq) */
+    /* identical word — covers two equal immediates; a NaN is unequal to itself */
+    if (a == b && (!a || kai_is_value(a) || a->tag != KAI_REAL)) return 1;
     /* Immediate Int: equal iff both are Ints with the same value. An
      * immediate vs a heap value of any other type is unequal. Done
      * before any header deref, since an immediate has no header. */
