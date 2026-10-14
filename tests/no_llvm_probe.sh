@@ -2,8 +2,8 @@
 # An implicit native build asks kaic2 once whether it carries libLLVM,
 # before compiling anything: a kaic2 without it goes straight to the C
 # backend, with no native compile first; one with it builds native. An
-# explicit backend never asks. The checkout's kaic2 runs behind a
-# wrapper that logs every invocation.
+# explicit backend never asks, and a settled kaic2 is asked once. The
+# checkout's kaic2 runs behind a wrapper that logs every invocation.
 
 set -eu
 
@@ -52,6 +52,15 @@ if $lacks; then
   expect "implicit: notes" 1 "$(grep -c 'native backend unavailable' "$work/implicit.err" || true)"
 else
   [ "$(count '--emit=native')" -ge 1 ] || { echo "no-llvm-probe FAIL (implicit: no native compile with libLLVM)"; fail=1; }
+fi
+
+# Once kaic2 has settled, its answer is kept: the next run does not ask.
+sleep 3
+build "settled" settled
+build "cached" cached
+expect "cached: probes" 0 "$(count '^--backend-tag$')"
+if $lacks; then
+  expect "cached: native compiles on a kaic2 without libLLVM" 0 "$(count '--emit=native')"
 fi
 
 build "explicit c" explicit_c --backend=c
