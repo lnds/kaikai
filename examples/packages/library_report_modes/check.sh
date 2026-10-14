@@ -78,8 +78,9 @@ EOF
 out="$(bad_run lib typecheck .)"
 saw "type mismatch" "$out" "'kai typecheck .' passed over an ill-typed module"
 
-# 4 — a lint never blocks, not even over a package that does not compile.
-out="$(ok_run lib lint .)"
+# 4 — a lint over a package that does not compile fails with the
+# front-end error, as it does on a resolver error.
+out="$(bad_run lib lint .)"
 saw "type mismatch" "$out" "'kai lint .' hid the front-end error"
 rm -f "$TMP/lib/broken.kai"
 
