@@ -75,6 +75,10 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 #
 # The rally makes nearly every message a cross-thread wake, so it drives the
 # idle path hard: spinning workers, parks, and the permit handoff between them.
+#
+# The last is the same rally with a deadline on every receive, so each round
+# links the receiver into the waiter chain and the timer wheel while the
+# sender's thread enqueues and looks for a waiter to wake.
 FIXTURES=(
   "examples/effects/mn_cross_thread_copy_stress.kai"
   "examples/effects/mn_deep_stack_migration.kai"
@@ -84,6 +88,7 @@ FIXTURES=(
   "examples/effects/mn_send_to_ended_mailbox_race.kai"
   "examples/effects/mn_first_variant_on_many_fibers.kai"
   "examples/effects/mn_pingpong_no_false_deadlock.kai"
+  "examples/effects/mn_recv_timeout_no_lost_wakeup.kai"
 )
 
 fail=0

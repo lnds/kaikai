@@ -4715,6 +4715,22 @@ static int kai_mailbox_park(KaiMailbox *mb, KaiFiber **head, KaiFiber **tail, Ka
     return 1;
 }
 
+/* Unlink the head message under the mailbox lock; NULL when the mailbox is
+ * empty. `*sender` receives the blocked sender the freed slot admits, for
+ * the caller to unpark once it has released the lock. */
+static KaiValue *kai_mailbox_take(KaiMailbox *mb, KaiFiber **sender) {
+    KaiMboxNode *node = mb->head;
+    if (!node) return NULL;
+    mb->head = node->next;
+    if (!mb->head) { mb->tail = NULL; }
+    KaiValue *msg = node->msg;
+    free(node);
+    mb->len--;
+    *sender = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                         &mb->send_waiter_tail);
+    return msg;
+}
+
 /* Returns NULL when a cancel is due instead of a message: the caller
  * releases its references and delivers it. */
 static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
@@ -4728,20 +4744,14 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
      * released before the park itself. */
     for (;;) {
         KaiFiber *me = kai_current_fiber();
+        KaiFiber *waiter = NULL;
         kai_mbox_lock(mb);
         /* A spurious resume leaves us linked; unlink before deciding, so the
          * re-enqueue below never double-links the chain. */
         kai_mailbox_waiter_remove(&mb->recv_waiter_head,
                                   &mb->recv_waiter_tail, me);
-        if (mb->head) {
-            KaiMboxNode *node = mb->head;
-            mb->head = node->next;
-            if (!mb->head) { mb->tail = NULL; }
-            KaiValue *msg = node->msg;
-            free(node);
-            mb->len--;
-            KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
-                                                          &mb->send_waiter_tail);
+        KaiValue *msg = kai_mailbox_take(mb, &waiter);
+        if (msg) {
             kai_mbox_unlock(mb);
             if (waiter) kai_sched_unpark(waiter);
             return msg;
@@ -4768,29 +4778,25 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
  * A spurious message-wake (another receiver drained the slot first)
  * re-parks for the remaining time; an elapsed deadline returns NULL. */
 static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos) {
+    KaiFiber *me = kai_current_fiber();
+    KaiFiber *sw = NULL;
     kai_mbox_lock(mb);
-    if (mb->head) {
-        KaiMboxNode *node = mb->head;
-        mb->head = node->next;
-        if (!mb->head) { mb->tail = NULL; }
-        KaiValue *msg = node->msg;
-        free(node);
-        mb->len--;
-        KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
-                                                   &mb->send_waiter_tail);
-        kai_mbox_unlock(mb);
-        if (sw) kai_sched_unpark(sw);
-        return msg;
-    }
+    KaiValue *msg = kai_mailbox_take(mb, &sw);
     kai_mbox_unlock(mb);
-    uint64_t deadline = kai_reactor_now_ns() + timeout_nanos;
-    for (;;) {
-        if (kai_reactor_now_ns() >= deadline) return NULL;
-        KaiFiber *me = kai_current_fiber();
+    uint64_t deadline = msg ? 0 : kai_reactor_now_ns() + timeout_nanos;
+    while (!msg) {
+        int expired = kai_reactor_now_ns() >= deadline;
+        /* The empty-check and the link share one acquisition, as in
+         * kai_mailbox_pop: a send that lands between them finds no waiter
+         * to wake, and only the deadline would end the park. */
         kai_mbox_lock(mb);
-        kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
-                                   &mb->recv_waiter_tail, me);
+        msg = kai_mailbox_take(mb, &sw);
+        if (!msg && !expired) {
+            kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
+                                       &mb->recv_waiter_tail, me);
+        }
         kai_mbox_unlock(mb);
+        if (msg || expired) break;
         kai_reactor_park_timer(me, deadline);
 
         /* park_timer's drain already spliced us off the wheel on a
@@ -4799,42 +4805,28 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
         kai_mbox_lock(mb);
         int still_waiting = kai_mailbox_waiter_remove(&mb->recv_waiter_head,
                                                       &mb->recv_waiter_tail, me);
+        if (!still_waiting) msg = kai_mailbox_take(mb, &sw);
         kai_mbox_unlock(mb);
         if (still_waiting) {
             /* Never dequeued by a send. Only the reactor's own splice
              * (reactor_fired) means the deadline really fired; a resume
              * without it is spurious — loop, which re-checks the clock
              * and re-parks for whatever time remains. */
-            if (me->reactor_fired) return NULL;
+            if (me->reactor_fired) break;
             continue;
         }
         /* A send dequeued us; disarm the still-armed deadline timer. The
          * wheel belongs to the reactor, so splice under its lock — and hold
          * that lock alone: the mailbox lock is released above so the two
          * never nest, keeping the runtime's one-lock-at-a-time discipline.
-         * Re-acquiring the mailbox below can find the slot already drained
-         * by another receiver, which is the spurious case the loop handles. */
+         * The take above can find the slot already drained by another
+         * receiver, which is the spurious case the loop re-parks on. */
         kai_reactor_lock();
         kai_reactor_timer_remove(me);
         kai_reactor_unlock();
-        kai_mbox_lock(mb);
-        if (mb->head) {
-            KaiMboxNode *node = mb->head;
-            mb->head = node->next;
-            if (!mb->head) { mb->tail = NULL; }
-            KaiValue *msg = node->msg;
-            free(node);
-            mb->len--;
-            KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
-                                                      &mb->send_waiter_tail);
-            kai_mbox_unlock(mb);
-            if (sw) kai_sched_unpark(sw);
-            return msg;
-        }
-        kai_mbox_unlock(mb);
-        /* Spurious: another receiver took the slot. Loop re-checks the
-         * deadline and re-parks for whatever time remains. */
     }
+    if (sw) kai_sched_unpark(sw);
+    return msg;
 }
 
 static void kai_mailbox_unpin(KaiMailbox *mb) {
