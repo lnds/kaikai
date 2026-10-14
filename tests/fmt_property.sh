@@ -292,6 +292,9 @@ pkg_paths() {
     "$ROOT"/examples/lint/*)
       start="$(manifest_dir_of "$(dirname "$1")")"
       if [ -n "$start" ]; then printf -- '--path %s ' "$start"; fi ;;
+    "$ROOT"/examples/test-runner/*)
+      start="$(manifest_dir_of "$(dirname "$1")")"
+      if [ -n "$start" ]; then printf -- '--path %s --path %s ' "$start" "$start/src"; fi ;;
     "$ROOT"/examples/modules-path/*)
       printf -- '--path %s ' "$ROOT/examples/modules-path-lib" ;;
     "$ROOT"/examples/oracle/*)
