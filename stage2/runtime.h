@@ -9996,6 +9996,7 @@ static KaiValue *kai_op_neg(KaiValue *a) {
     KaiValue *r;
     if (kai_is_int(a))       r = kai_int((int64_t)(0 - (uint64_t) kai_intf(a)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL) r = kai_real(-a->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_BYTE)   r = kai_byte((uint8_t)(0u - a->as.byte_val));
     else if (kai_is_ptr(a) && a->tag == KAI_INT32)  r = kai_int32((int32_t)(-(uint32_t) a->as.i32));
     else if (kai_is_ptr(a) && a->tag == KAI_UINT32) r = kai_uint32((uint32_t)(-a->as.u32));
     else if (kai_is_ptr(a) && a->tag == KAI_UINT64) r = kai_uint64((uint64_t)(-a->as.u64));
