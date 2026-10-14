@@ -229,4 +229,52 @@ for pair in "req-install.sh check_requires" "req-upgrade.sh upgrade_check_requir
   echo "test-upgrade-resolver: ok — $fn refuses a release that does not start, naming both sides"
 done
 
+# ---- `kai upgrade` end to end: the start check guards the install ------
+# The plugin itself runs against a fake prefix, served a tarball through a
+# file:// manifest, so the check is proven to sit before the swap.
+awk '/^upgrade_platform\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$work/platform.sh"
+platform="$(sh -eu -c '. "$1"; upgrade_platform' _ "$work/platform.sh")" || platform=""
+
+# upgrade_case <name> <exit status of the release's binaries>: runs the
+# plugin on a fresh v0.1.0 prefix offered v0.99.12; leaves its stderr in
+# $work/<name>.err and its status in $up_rc.
+upgrade_case() {
+  site="$work/$1-site"; prefix="$work/$1-prefix"
+  fake_top "$site/kaikai-v0.99.12-$platform" "$2" "glibc 2.39
+glibcxx 3.4.33"
+  ( cd "$site" && tar -czf "kaikai-v0.99.12-$platform.tar.gz" "kaikai-v0.99.12-$platform" )
+  sha="$(cd "$site" && { shasum -a 256 "kaikai-v0.99.12-$platform.tar.gz" 2>/dev/null \
+    || sha256sum "kaikai-v0.99.12-$platform.tar.gz"; } | awk '{print $1}')"
+  printf '{"schema":1,"tag":"v0.99.12","platforms":{"%s":{"url":"file://%s/kaikai-v0.99.12-%s.tar.gz","sha256":"%s"}}}\n' \
+    "$platform" "$site" "$platform" "$sha" > "$site/latest.json"
+  mkdir -p "$prefix/bin"
+  printf '#!/bin/sh\necho old\n' > "$prefix/bin/kai"
+  chmod +x "$prefix/bin/kai"
+  echo 0.1.0 > "$prefix/VERSION"
+  up_rc=0
+  KAIKAI_HOME="$prefix" KAIKAI_DIST_BASE="file://$site" \
+    sh "$ROOT/tools/kai/plugins/kai-upgrade" > /dev/null 2> "$work/$1.err" || up_rc=$?
+}
+
+if [ -z "$platform" ]; then
+  echo "test-upgrade-resolver: SKIP — kai upgrade end to end (no tarball for this platform)"
+else
+  upgrade_case refused 127
+  [ "$up_rc" -ne 0 ] || fail "kai upgrade installed a release whose binaries do not start"
+  grep -q 'does not start on this system' "$work/refused.err" \
+    || fail "kai upgrade refused without saying why: $(cat "$work/refused.err")"
+  grep -q 'needs: glibc 2.39 and libstdc++ GLIBCXX_3.4.33' "$work/refused.err" \
+    || fail "kai upgrade does not name what the release needs: $(cat "$work/refused.err")"
+  [ "$("$work/refused-prefix/bin/kai")" = old ] \
+    || fail "kai upgrade replaced the install before its start check"
+  echo "test-upgrade-resolver: ok — kai upgrade leaves the install alone when the release does not start"
+
+  upgrade_case accepted 0
+  [ "$up_rc" -eq 0 ] || fail "kai upgrade refused a release that starts: $(cat "$work/accepted.err")"
+  [ -f "$work/accepted-prefix/share/kaikai/REQUIRES" ] \
+    || fail "kai upgrade did not install a release that starts"
+  echo "test-upgrade-resolver: ok — kai upgrade installs a release that starts"
+fi
+
 echo "test-upgrade-resolver: all cases passed"
