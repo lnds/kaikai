@@ -35,7 +35,11 @@
  * A header $CFLAGS forces in ahead of this one can reach a system header
  * first, so `kai` then force-includes this block before it:
  * KAI_RUNTIME_FEATURES_ONLY stops that pass here and lets the TU's own
- * include read the rest. */
+ * include read the rest. The block runs once per translation unit: glibc
+ * moves _XOPEN_SOURCE to 700 under _GNU_SOURCE, and a second run would
+ * redefine it and warn. */
+#ifndef KAI_RUNTIME_FEATURES_SET
+#define KAI_RUNTIME_FEATURES_SET
 #define _XOPEN_SOURCE 600
 /* mmap(MAP_ANON) is a BSD extension hidden by strict _XOPEN_SOURCE.
  * Re-expose it: _DARWIN_C_SOURCE on macOS, _DEFAULT_SOURCE on glibc.
@@ -52,6 +56,7 @@
  * otherwise (macOS libSystem exposes them regardless, which is why a mac
  * build did not catch it). _GNU_SOURCE implies _DEFAULT_SOURCE. */
 #  define _GNU_SOURCE 1
+#endif
 #endif
 
 #if defined(KAI_RUNTIME_FEATURES_ONLY)
