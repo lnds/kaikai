@@ -1451,7 +1451,7 @@ test-issue-1637-div-overflow-trap-native: $(TARGET) bin-kai build
 # (point-to-int, Byte/u8/Decimal overflow).
 test-numeric-literal-mint: $(TARGET) build
 	@set -e; \
-	for f in literal_mint literal_suffix literal_principality byte_call_arg; do \
+	for f in literal_mint literal_suffix literal_principality byte_call_arg literal_mint_negated; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	  ./build/$$f-c > build/$$f.out; \
@@ -1459,7 +1459,7 @@ test-numeric-literal-mint: $(TARGET) build
 	    && echo "literal-mint $$f OK (C backend)" \
 	    || { echo "literal-mint $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
 	done; \
-	for f in mint_int_from_point mint_int_from_whole_point mint_byte_overflow mint_u8_suffix_overflow mint_decimal_overflow; do \
+	for f in mint_int_from_point mint_int_from_whole_point mint_byte_overflow mint_u8_suffix_overflow mint_decimal_overflow mint_unsigned_from_negative; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.err.kai > build/$$f.out 2>&1 \
 	    && { echo "literal-mint $$f DID NOT FAIL"; exit 1; } \
 	    || true; \
