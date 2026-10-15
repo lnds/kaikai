@@ -1881,6 +1881,13 @@ the binding originated from `array_make` here. A future
 refinement may track callee purity. Today the workaround is to
 keep mutation inline inside the constructing function.
 
+When the rule keeps `Mutable` on a row that does not declare it, the
+error points at the first demand whose target has no provable local
+provenance, not at the first site that put `Mutable` on the row. When
+that target came back from a call that does not prove it local (a
+`list.foldl` whose callback is a lambda, say), a note names the call
+and shows its line.
+
 ### Why this discipline
 
 - **Approachable surface (Tier 2 #5)**: a function returning a
