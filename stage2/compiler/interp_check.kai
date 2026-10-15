@@ -1,35 +1,27 @@
 #[doc("""
-Fatal-error gate for interpolation bodies that do not parse.
+The gate for a `.` inside a `#{...}` body that no pipe stage owns.
 
-Surface lowering turns an interpolated string into a tree only when
-every `#{...}` body parses, and leaves the span as written otherwise.
-Without this pass that span would go on as a plain string.
-
-The scan reports each failing fragment against the file and position it
-really occupies: the parser's own error carries `<interp>` and a
-position inside the fragment, which names no file the user wrote.
+A `|`, `||` or `|?` stage claims every `.` on its right side, those in
+interpolation bodies included. A body outside any stage keeps its `.`:
+a bare one, or a point-free section that would be shown as a function.
+A `.` wrapped by the call-argument rule inside the body is its own.
 """)]
 
 import compiler.ast
 import compiler.diag
 import compiler.diag_file
-import compiler.fnreg
-import compiler.infer
-import compiler.interp_holes
-import compiler.parse
-import compiler.util
+import compiler.expr_positions
 
-# `Console` is the parser's row; the scan itself prints nothing.
-#[doc("The error for every interpolation body that fails to parse, in source order.")]
-pub fn check_interp_parses(ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
+#[doc("The error for every `.` in an interpolation body that no pipe stage owns, in source order.")]
+pub fn check_interp_dots(ds: [Decl], df: DiagFiles) : [Diagnostic] =
   finalize_diags(ic_decls(ds, df, []))
 
-fn ic_decls(ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] / Console = match ds {
+fn ic_decls(ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
   [] -> acc
   [d, ...rest] -> ic_decls(rest, df, ic_decl(d, df, acc))
 }
 
-fn ic_decl(d: Decl, df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] / Console = match d {
+fn ic_decl(d: Decl, df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match d {
   DFn(_, _, _, _, _, _, body, _, _, _) -> ic_expr(body, decl_diag_file(d, df), acc)
   DTest(_, body, _, _, _)              -> ic_expr(body, decl_diag_file(d, df), acc)
   DBench(_, body, _, _, _)             -> ic_expr(body, decl_diag_file(d, df), acc)
@@ -43,8 +35,11 @@ fn ic_decl(d: Decl, df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] / Console =
   _ -> acc
 }
 
-fn ic_expr(e: Expr, file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match e.kind {
-  EStr(span, is_triple) -> ic_span(span, is_triple, file, e.line, e.col, acc)
+fn ic_expr(e: Expr, file: String, acc: [Diagnostic]) : [Diagnostic] = match e.kind {
+  ECall(f, xs) -> match f.kind {
+    EMark(MkInterpShow) -> ic_exprs(xs, file, ic_holes(xs, file, acc))
+    _                   -> ic_kids(e.kind, file, acc)
+  }
   k -> ic_kids(k, file, acc)
 }
 
@@ -52,7 +47,7 @@ fn ic_expr(e: Expr, file: String, acc: [Diagnostic]) : [Diagnostic] / Console = 
 # `xp_positions`: that table materialises a fresh `[XPos]` per node, and
 # a whole-program scan visits two orders of magnitude more nodes than it
 # finds interpolations, so the array is allocated and dropped unread.
-fn ic_kids(k: ExprKind, file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match k {
+fn ic_kids(k: ExprKind, file: String, acc: [Diagnostic]) : [Diagnostic] = match k {
   ECall(f, xs)          -> ic_exprs(xs, file, ic_expr(f, file, acc))
   EField(x, _)          -> ic_expr(x, file, acc)
   EIndex(a, b)          -> ic_expr(b, file, ic_expr(a, file, acc))
@@ -78,27 +73,27 @@ fn ic_kids(k: ExprKind, file: String, acc: [Diagnostic]) : [Diagnostic] / Consol
   _ -> acc
 }
 
-fn ic_exprs(es: [Expr], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match es {
+fn ic_exprs(es: [Expr], file: String, acc: [Diagnostic]) : [Diagnostic] = match es {
   [] -> acc
   [h, ...rest] -> ic_exprs(rest, file, ic_expr(h, file, acc))
 }
 
-fn ic_expr_opt(o: Option[Expr], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match o {
+fn ic_expr_opt(o: Option[Expr], file: String, acc: [Diagnostic]) : [Diagnostic] = match o {
   None    -> acc
   Some(x) -> ic_expr(x, file, acc)
 }
 
-fn ic_arms(arms: [Arm], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match arms {
+fn ic_arms(arms: [Arm], file: String, acc: [Diagnostic]) : [Diagnostic] = match arms {
   [] -> acc
   [Arm(_, g, body), ...rest] -> ic_arms(rest, file, ic_expr(body, file, ic_expr_opt(g, file, acc)))
 }
 
-fn ic_fields(fs: [FieldInit], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match fs {
+fn ic_fields(fs: [FieldInit], file: String, acc: [Diagnostic]) : [Diagnostic] = match fs {
   [] -> acc
   [FI(_, e), ...rest] -> ic_fields(rest, file, ic_expr(e, file, acc))
 }
 
-fn ic_elems(els: [ListElem], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match els {
+fn ic_elems(els: [ListElem], file: String, acc: [Diagnostic]) : [Diagnostic] = match els {
   [] -> acc
   [h, ...rest] -> ic_elems(rest, file, match h {
     ElPlain(e)  -> ic_expr(e, file, acc)
@@ -106,12 +101,12 @@ fn ic_elems(els: [ListElem], file: String, acc: [Diagnostic]) : [Diagnostic] / C
   })
 }
 
-fn ic_stmts(ss: [Stmt], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match ss {
+fn ic_stmts(ss: [Stmt], file: String, acc: [Diagnostic]) : [Diagnostic] = match ss {
   [] -> acc
   [h, ...rest] -> ic_stmts(rest, file, ic_stmt(h, file, acc))
 }
 
-fn ic_stmt(s: Stmt, file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match s {
+fn ic_stmt(s: Stmt, file: String, acc: [Diagnostic]) : [Diagnostic] = match s {
   SLet(_, _, rhs)              -> ic_expr(rhs, file, acc)
   SAssert(c, m)                -> ic_expr_opt(m, file, ic_expr(c, file, acc))
   SExprStmt(e)                 -> ic_expr(e, file, acc)
@@ -121,44 +116,50 @@ fn ic_stmt(s: Stmt, file: String, acc: [Diagnostic]) : [Diagnostic] / Console = 
   SUse(_, _, _)                -> acc
 }
 
-fn ic_hclauses(cs: [HClause], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match cs {
+fn ic_hclauses(cs: [HClause], file: String, acc: [Diagnostic]) : [Diagnostic] = match cs {
   [] -> acc
   [HC(_, _, body, _, _), ...rest] -> ic_hclauses(rest, file, ic_expr(body, file, acc))
 }
 
-fn ic_hreturn_opt(o: Option[HReturn], file: String, acc: [Diagnostic]) : [Diagnostic] / Console = match o {
+fn ic_hreturn_opt(o: Option[HReturn], file: String, acc: [Diagnostic]) : [Diagnostic] = match o {
   None -> acc
   Some(HR(_, body, _, _)) -> ic_expr(body, file, acc)
 }
 
-fn ic_span(span: String, is_triple: Bool, file: String,
-           line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] / Console = {
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  if not has_interp(span, body_start, body_end) { acc }
-  else {
-    let parts = iscan_collect(span, body_end,
-                              IScan { parts: [], lit_start: body_start, i: body_start })
-    ic_parts(parts, InterpPos { line: line, col: col + body_start }, file, acc)
+fn ic_holes(xs: [Expr], file: String, acc: [Diagnostic]) : [Diagnostic] = match xs {
+  [hole] -> match stray_dot(hole) {
+    Some(d) -> [ic_report(file, d.line, d.col), ...acc]
+    None    -> acc
   }
+  _ -> acc
 }
 
-fn ic_report(file: String, line: Int, col: Int, src: String) : Diagnostic =
-  mk_diag(SevError, file, line, col,
-          concat_all(["cannot parse the interpolated expression `", src, "`"]),
-          [ri_note(file, line, col, "an interpolation body is parsed as a single expression")])
+fn ic_report(file: String, line: Int, col: Int) : Diagnostic =
+  mk_diag(SevError, file, line, col, "`.` inside `\x23{...}` is not in a pipe stage",
+          [ri_help(file, line, col, "a `|`, `||` or `|?` stage gives `.` its element, as in `xs | println(\"\x23{.}\")`; elsewhere, name the value")])
 
-fn ic_parts(parts: [IPart], pos: InterpPos, file: String, acc: [Diagnostic]) : [Diagnostic] / Console =
-  match parts {
-    [] -> acc
-    [IpLit(piece, _), ...rest] -> ic_parts(rest, interp_pos_advance(pos, piece, 0), file, acc)
-    [IpExp(src), ...rest] -> {
-      let body = interp_pos_body(pos)
-      let a1 = match parse_interp_expr(src) {
-        Some(_) -> acc
-        None    -> [ic_report(file, body.line, body.col, src), ...acc]
-      }
-      ic_parts(rest, interp_pos_past(body, src), file, a1)
-    }
+# The body itself may be a section; below it, a section is an argument
+# the call rule already owns. A nested body is checked on its own.
+fn stray_dot(hole: Expr) : Option[Expr] = match hole.kind {
+  ELambda(ps, _) -> if params_point_free(ps) { Some(hole) } else { None }
+  _              -> bare_dot(hole)
+}
+
+fn bare_dot(e: Expr) : Option[Expr] = match e.kind {
+  EPlaceholder                 -> Some(e)
+  ELambda(_, _)                -> None
+  EHandle(_, _, _, _, _, _, _) -> None
+  ECall(f, _) -> match f.kind {
+    EMark(MkInterpShow) -> None
+    _                   -> bare_dot_in(xp_positions(e))
   }
+  _ -> bare_dot_in(xp_positions(e))
+}
+
+fn bare_dot_in(ps: [XPos]) : Option[Expr] = match ps {
+  [] -> None
+  [XP(_, x), ...rest] -> match bare_dot(x) {
+    Some(d) -> Some(d)
+    None    -> bare_dot_in(rest)
+  }
+}

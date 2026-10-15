@@ -1,0 +1,94 @@
+#[doc("""
+The text scan of an interpolated string literal.
+
+Splits a span into its literal pieces and the source of each `#{...}`
+body, and tracks the file position each part starts at. No body is
+parsed here: the parser parses each one where it stands.
+""")]
+
+import compiler.util
+
+#[doc("One part of a string span: a literal piece (as written, and as the string literal that holds it) or the source of a `#{...}` body.")]
+pub type IPart = IpLit(String, String) | IpExp(String)
+
+# The parts so far, in reverse; where the current literal piece starts; the cursor.
+type IScan = { parts: [IPart], lit_start: Int, i: Int }
+
+#[doc("A position in the source a string literal is written in.")]
+pub type InterpPos = { line: Int, col: Int }
+
+#[doc("The parts of `span` between the opening and closing quotes, in source order.")]
+pub fn interp_parts(span: String, is_triple: Bool) : [IPart] {
+  let lead = interp_lead(is_triple)
+  iscan_collect(span, string_length(span) - lead, IScan { parts: [], lit_start: lead, i: lead })
+}
+
+#[doc("True when the literal `span` holds a `#{...}` body.")]
+pub fn span_interpolates(span: String, is_triple: Bool) : Bool {
+  let lead = interp_lead(is_triple)
+  has_interp(span, lead, string_length(span) - lead)
+}
+
+#[doc("The width of the quote that opens a literal: three for `\"\"\"`, else one.")]
+pub fn interp_lead(is_triple: Bool) : Int = if is_triple { 3 } else { 1 }
+
+#[doc("The string literal that holds the text `piece`.")]
+pub fn raw_lit_for_c(piece: String) : String =
+  cat3("\"", escape_str_body_for_c(piece), "\"")
+
+fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] =
+  list_reverse(iscan_collect_rev(span, end, st))
+
+fn iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
+  if st.i >= end { finish_iscan_rev(span, end, st) }
+  else if iscan_opens(span, st.i, end) {
+    let expr_start = st.i + 2
+    let expr_end = iscan_expr_end(span, expr_start, end, 1)
+    let parts = [IpExp(string_slice(span, expr_start, expr_end - expr_start)), ...iscan_flush(span, st)]
+    let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
+    iscan_collect_rev(span, end, IScan { parts: parts, lit_start: next_i, i: next_i })
+  }
+  else { iscan_collect_rev(span, end, IScan { ...st, i: st.i + 1 }) }
+}
+
+fn iscan_opens(span: String, i: Int, end: Int) : Bool =
+  i + 1 < end and char_at(span, i) == Some('#') and char_at(span, i + 1) == Some('{')
+
+# The literal piece that ends at the cursor, prepended to the parts.
+fn iscan_flush(span: String, st: IScan) : [IPart] =
+  if st.i > st.lit_start {
+    let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
+    [IpLit(piece, raw_lit_for_c(piece)), ...st.parts]
+  } else { st.parts }
+
+fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int =
+  if depth == 0 or i >= end { i }
+  else {
+    match char_at(span, i) {
+      None      -> i
+      Some('{') -> iscan_expr_end(span, i + 1, end, depth + 1)
+      Some('}') -> if depth == 1 { i } else { iscan_expr_end(span, i + 1, end, depth - 1) }
+      _         -> iscan_expr_end(span, i + 1, end, depth)
+    }
+  }
+
+fn finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] =
+  iscan_flush(span, IScan { ...st, i: end })
+
+#[doc("Where the body of a `#{...}` that opens at `p` starts.")]
+pub fn interp_pos_body(p: InterpPos) : InterpPos = InterpPos { line: p.line, col: p.col + 2 }
+
+#[doc("The position after the `}` that closes a body `src` starting at `body`.")]
+pub fn interp_pos_past(body: InterpPos, src: String) : InterpPos {
+  let after = interp_pos_advance(body, src, 0)
+  InterpPos { line: after.line, col: after.col + 1 }
+}
+
+#[doc("`p` moved past `s` from index `i` on. A triple-quoted literal spans lines, and a newline starts the next one at column 1.")]
+pub fn interp_pos_advance(p: InterpPos, s: String, i: Int) : InterpPos =
+  if i >= string_length(s) { p }
+  else {
+    let nxt = if char_at(s, i) == Some('\n') { InterpPos { line: p.line + 1, col: 1 } }
+              else { InterpPos { line: p.line, col: p.col + 1 } }
+    interp_pos_advance(nxt, s, i + 1)
+  }
