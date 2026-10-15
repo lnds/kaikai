@@ -12645,15 +12645,16 @@ fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
 # `Option` / `Result` heads. Returns `Some(diagnostic)` for the
 # rejected heads and `None` otherwise so callers can tell apart
 # "rejected by name" from "no module mapping".
-fn pipe_rejection_reason(head: SymId, op: String) : Option[String] {
+fn pipe_rejection_reason(head: SymId, pop: PipeOp) : Option[String] {
+  let op = concat_all([core_fn_name(pipe_op_core_fn(pop)), "-pipe `", pipe_op_text(pop), "`"])
   if core_ty_is(head, CtOption) {
     Some(concat_all([
-      op, "-pipe is not supported on `Option`. Use `!` for ",
+      op, " is not supported on `Option`. Use `!` for ",
       "propagation (`x!`) or `option.and_then` for explicit chaining."
     ]))
   } else if core_ty_is(head, CtResult) {
     Some(concat_all([
-      op, "-pipe is not supported on `Result`. Use `!` for ",
+      op, " is not supported on `Result`. Use `!` for ",
       "propagation (`x!`) or `result.and_then` for explicit chaining."
     ]))
   } else {
@@ -12803,7 +12804,7 @@ fn synth_pipe_dispatch(st: InferState, pop: PipeOp, lhs: Expr, rhs: Expr,
       let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
       mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
     }
-    Some(head) -> match pipe_rejection_reason(hsym, op) {
+    Some(head) -> match pipe_rejection_reason(hsym, pop) {
       Some(msg) -> {
         let perr = mk_diag(SevError, rl.st.file, line, col, msg, [])
         render_diag(perr)
@@ -12876,12 +12877,16 @@ fn synth_pipe_dispatch(st: InferState, pop: PipeOp, lhs: Expr, rhs: Expr,
             None           -> rc.st
           }
           let elem = pipe_elem_ty(pe)
-          let rf = synth_pipe_rhs(st_pe, rhs, elem)
+          let rf = each_stage_checked(pop, synth_pipe_rhs(st_pe, rhs, elem), line, col)
           let rv = st_fresh_ty(rf.st)
+          let ret = match pop {
+            PoEach -> TyUnit
+            _      -> rv.ty
+          }
           let fr = subst_fresh_row(rv.st.sub)
           let st_fresh = st_set_sub(rv.st, fr.subst)
           let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
-          let expected = TyFnT([rl.ty, rf.ty], rv.ty, expected_row)
+          let expected = TyFnT([rl.ty, rf.ty], ret, expected_row)
           # Use the same unify-message label as `synth_call` so existing
           # diagnostics-pinning fixtures (e.g.
           # `examples/sugars/map_pipe_type_mismatch.err.expected`)
@@ -12897,7 +12902,7 @@ fn synth_pipe_dispatch(st: InferState, pop: PipeOp, lhs: Expr, rhs: Expr,
               st_unify_named(st_fresh, pipe_callee_shown(st_fresh, owner, op, qualified, pipe_callee),
                              rc.ty, [rl.ty, rf.ty], expected, line, col)
           }
-          match refine_call(st2, pipe_callee, rc.ty, [rl.expr, rf.expr], [rl.ty, rf.ty], apply_ty(st2.sub, rv.ty)) {
+          match refine_call(st2, pipe_callee, rc.ty, [rl.expr, rf.expr], [rl.ty, rf.ty], apply_ty(st2.sub, ret)) {
             RefCall(st3, ty) -> {
               let fused = try_fuse_map_pipe(st3, cf, rc.expr, rl.expr, rf.expr, ty, line, col)
               mk_inferred(fused.st, ty, fused.root)
@@ -12908,6 +12913,28 @@ fn synth_pipe_dispatch(st: InferState, pop: PipeOp, lhs: Expr, rhs: Expr,
     }
   }
 }
+
+# `|!` runs its stage for effect, so the stage returns `Unit`, checked at
+# the pipe rather than trusted to the owner's `each`. A rejected stage
+# reads as `TyAny` so the call adds no second diagnostic.
+fn each_stage_checked(pop: PipeOp, rf: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match pop {
+    PoEach -> match apply_ty(rf.st.sub, rf.ty) {
+      TyFnT(_, ret, _) -> match unify_env(rf.st.env, ret, TyUnit, rf.st.sub) {
+        Some(s) -> mk_inferred(st_set_sub(rf.st, s), rf.ty, rf.expr)
+        None    -> {
+          let perr = mk_diag(SevError, rf.st.file, line, col,
+            concat_all(["`|!` runs its stage for effect; the stage returns `",
+              inf_ty_to_string(rf.st.env.tab, apply_ty(rf.st.sub, ret)),
+              "`, not `Unit`. Use `|` to transform, or `|> ignore` the result."]), [])
+          render_diag(perr)
+          mk_inferred(st_bump_err(st_push_diag(rf.st, perr)), TyAny, rf.expr)
+        }
+      }
+      _ -> rf
+    }
+    _ -> rf
+  }
 
 # A pipe-lowering result: the emitted call and the threaded state.
 type FusedPipe = { root: Expr, st: InferState }
