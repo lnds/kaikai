@@ -958,7 +958,7 @@ test-issue-1969-typer-diag-file: $(TARGET) build
 # import its file does use is never reported, a `lazy [...]` counting as
 # a use of the module that declares `Seq`. Each fixture's warning and
 # help lines must equal its golden exactly, on both backends.
-IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-used-bare derive-uses-import lazy-uses-import
+IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-string-text unused-import-used-bare derive-uses-import lazy-uses-import
 
 test-import-verdicts: $(TARGET) bin-kai build
 	@set -e; \
