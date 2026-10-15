@@ -53,6 +53,35 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+## `.` in a stage
+
+The right side of `|`, `||` or `|?` is a stage, and the stage owns
+every `.` in it: a bare `.`, a `.` with a postfix chain (`.name`,
+`.a.b`, `.f(v)`), and a `.` in a call argument. All of them are the
+same element.
+
+```kaikai
+type Person = { name: String, age: Int }
+
+fn add(a: Int, b: Int) : Int = a + b
+
+fn main() : Unit / Stdout = {
+  let people = [Person { name: "ana", age: 30 }, Person { name: "bo", age: 41 }]
+  let next = people | add(.age, 1)             # [31, 42]
+  let pairs = [1, 2] || [., . * 10]            # [1, 10, 2, 20]
+  let grown = people |? .age > 35 | .name      # ["bo"]
+  println("#{next} #{pairs} #{grown}")
+}
+```
+
+- The closest stage owns a `.`. An explicit lambda or a handler is a
+  barrier.
+- `|>` is not a stage: it keeps `_`, and a `.` in its call is the
+  innermost-argument lambda, so `xs |> each(println(.))` hands
+  `println` the identity function. Write `xs | println(.)`.
+- Two nested stages that both use `.` are an error. Name one element
+  with `(x) => ...`.
+
 ## stdlib types that ride the pipes
 
 These stdlib types export the canonical `map` / `flat_map` / `filter`,

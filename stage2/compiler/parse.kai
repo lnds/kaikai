@@ -62,6 +62,7 @@ import compiler.refinements
 import compiler.doc_attr
 import compiler.nest_limit
 import compiler.tbinder
+import compiler.pipe_stage
 
 # ====================================================================
 # parser state
@@ -329,15 +330,15 @@ fn p_skip_newlines_and_semis(p: Parser) : Parser {
   else { p }
 }
 
-fn p_error(p: Parser, t: Token, msg: String) : Parser / Console {
+fn p_error(p: Parser, t: Token, msg: String) : Parser / Console = p_error_at(p, t.line, t.col, msg)
 
+fn p_error_at(p: Parser, line: Int, col: Int, msg: String) : Parser / Console =
   if p_failed(p) { p }
   # An interpolation fragment is parsed apart from its file, and its
   # span names no file the user wrote. `check_interp_parses` reports
   # the failure against the real position.
-  else if p.file == interp_parse_file() { p_mark_err(p, mk_diag(SevError, p.file, t.line, t.col, msg, [])) }
-  else { p_fail_at(p, t.line, t.col, msg) }
-}
+  else if p.file == interp_parse_file() { p_mark_err(p, mk_diag(SevError, p.file, line, col, msg, [])) }
+  else { p_fail_at(p, line, col, msg) }
 
 fn p_error_here(p: Parser, msg: String) : Parser / Console = p_error(p, p_peek(p), msg)
 
@@ -737,7 +738,7 @@ fn try_pipe_placeholder(line: Int, col: Int, lhs: Expr, rhs: Expr, p: Parser) : 
         # capture, perceus, monomorphisation) without depending on
         # the SLet -> EBlock walker quirks for sub-expressions
         # synthesised mid-parse.
-        let tmp = binder_minted("__pipe")
+        let tmp = pipe_apply_binder()
         let tmp_var = mk_local(tmp.id, lhs.line, lhs.col)
         let new_args = subst_underscores(args_, tmp_var)
         let new_call = mk_expr(ECall(callee, new_args), rhs.line, rhs.col)
@@ -1125,7 +1126,8 @@ fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
   }
 
 # `|>` (apply), `|` (map), `||` (flat-map) and `|?` (filter). The typer
-# rewrites the map-like three against the head type of the left side.
+# rewrites the map-like three against the head type of the left side;
+# each of them is a stage that owns the `.` on its right side.
 fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
   if tk_is(t.kind, TkPipeApply) {
     # A `_` in the call's arguments receives the left side instead of the
@@ -1136,9 +1138,16 @@ fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
       PPRPassthrough        -> ok_e(p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
     }
   }
-  else if tk_is(t.kind, TkPipe) { ok_e(p, mk_expr(EMapPipe(lhs, rhs), t.line, t.col)) }
-  else if tk_is(t.kind, TkBarBar) { ok_e(p, mk_expr(EFlatMapPipe(lhs, rhs), t.line, t.col)) }
-  else { ok_e(p, mk_expr(EFilterPipe(lhs, rhs), t.line, t.col)) }
+  else {
+    match stage_claim(rhs) {
+      SrNested(inner) -> err_e(p_error_at(p, inner.line, inner.col,
+        "this stage and the one around it both use `.`; name one element with `(x) => ...`"))
+      SrOwn(r) ->
+        if tk_is(t.kind, TkPipe) { ok_e(p, mk_expr(EMapPipe(lhs, r), t.line, t.col)) }
+        else if tk_is(t.kind, TkBarBar) { ok_e(p, mk_expr(EFlatMapPipe(lhs, r), t.line, t.col)) }
+        else { ok_e(p, mk_expr(EFilterPipe(lhs, r), t.line, t.col)) }
+    }
+  }
 
 fn is_cmp_tok(k: TokKind) : Bool {
   tk_is(k, TkEqEq) or tk_is(k, TkNeq) or tk_is(k, TkLt) or tk_is(k, TkGt) or tk_is(k, TkLe) or tk_is(k, TkGe)
