@@ -102,15 +102,69 @@ end the pipeline with `|!`. It returns `Unit`, so it closes a `Unit`
 body, and it calls the head type's own `each`.
 
 ```kaikai
+fn is_leap(y: Int) : Bool = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+
 fn main() : Unit / Stdout = {
-  [1..5] |? (. % 2 == 1) |! println("odd #{.}")
+  [1900, 1994, 1996, 2000, 2024, 2026] |! println("#{.}: #{is_leap(.)}")
 }
 ```
+
+The stage owns every `.` on its right, those inside `#{...}` included,
+so each year prints beside its own verdict. `|!` follows any other
+stage: `[1..5] |? (. % 2 == 1) |! println("odd #{.}")`.
 
 The wrong reaches are `xs | f |> ignore`, which builds a list only to
 throw it away (and over a lazy `Stream` runs nothing), and
 `xs |> each(f)`, which picks `each` by name rather than by the head
 type.
+
+## `|> ignore` to drop a value on purpose
+
+A value that is not `Unit` and is not the block's result is a discard,
+and `kai lint` flags it (`discard_pure_value`). When the value is not
+wanted, say so: close the expression with `|> ignore`, or bind it to
+`_`.
+
+```kaikai
+fn log(msg: String) : Int / Stdout = {
+  println(msg)
+  msg.length()
+}
+
+fn main() : Unit / Stdout = {
+  log("starting") |> ignore
+  let _ = log("again")
+}
+```
+
+The wrong reach is the bare call `log("starting")` as a statement: the
+reader cannot tell a dropped result from a forgotten one. To iterate
+for effect, use `|!`, not `| f |> ignore`.
+
+## `lazy [...]` for a sequence read only in part
+
+Pick the carrier by what the sequence is. A list holds every element
+and is read whole. When the sequence has no natural end, or only a
+prefix will be read, write it with `lazy [...]`: a `Seq` computes a
+cell when it is read, and never the ones nobody reads.
+
+```kaikai
+import seq as sq
+
+fn is_leap(y: Int) : Bool = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+
+fn main() : Unit / Stdout = {
+  lazy [2025..] |? is_leap(.) |> sq.take(3) |! println("#{.}")
+}
+```
+
+The wrong reaches are a list with a guessed bound,
+`[2025..2100] |? is_leap(.)`, which computes every element to keep
+three, and `lazy` on a list that is read whole, which pays a cell per
+element for nothing. A `Seq` is pure; when producing an element
+performs an effect or owns a resource (a file's lines, a socket), the
+carrier is a `Stream` or a `Gen` — see *Lazy carriers* in
+`kai info seq`.
 
 ## Point-free sections over throwaway lambdas
 
@@ -460,10 +514,15 @@ authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
   effect whose op returns `Nothing`
 - `async` / `await` → the `Spawn` effect (see `kai info fibers`)
 - `for x in xs { ... }` → `xs |! f`; `xs | (x => ...)` when you want the new list
+- an endless `range()` / `itertools.count()` → `lazy [0..]` (a `Seq`);
+  a function that `yield`s while performing effects → `gen.generate`
+  with `Yield.yield`
+- a bare call whose result is dropped → `f(x) |> ignore`, or `let _ = f(x)`
 - `return expr` → the last expression of a block IS its value
 - `self.x` / `this.x` → no implicit receiver; pass the value explicitly
 
 ## See also
 
 `kai info syntax`, `kai info pipes`, `kai info effects`,
-`kai info units`, `kai info match`, `kai info holes`, `kai info llm`
+`kai info units`, `kai info match`, `kai info holes`, `kai info seq`,
+`kai info lint`, `kai info llm`

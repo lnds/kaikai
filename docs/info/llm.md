@@ -42,21 +42,28 @@ that performs them.
 syntax      the one-page cheat sheet of forms
 deltas      prior-collision card — kaikai vs. your habits
 idiomatic   how to write kaikai well, with the wrong reaches to avoid
+llm         this page
 effects     algebraic effects and handlers
 fibers      structured concurrency, Spawn/await/cancel
 actors      send/receive/self over Actor[Msg]
 match       pattern matching, exhaustiveness
 contracts   requires / ensures + refinement-type predicates
-pipes       the four pipe operators and their intent
+pipes       the five pipe operators and their intent
+seq         Seq[t], the lazy sequence written `lazy [...]`
+vec         Vec[T], the pure contiguous vector
 units       units of measure on Real
+kinds       kinds over types: the closed property menu
 protocols   single-dispatch protocols
 holes       typed holes for incremental development
-loop        while / until
-packages    the path-is-the-package model
+loop        if / while / until, and iteration via pipes
+packages    kai.toml, imports, visibility, [native]
 ffi         crossing to C via the Ffi capability
+net         TCP, UDP, DNS and Unix-domain sockets
 testing     builtin test "..." { } + assert
+lint        the linter beside the compiler (`kai lint`)
+mutate      mutation testing: does any test notice?
 lsp         editor integration surface
-builtins    doc tree of the auto-loaded core modules
+install     install and self-update the compiler
 ```
 
 Topic pages open with a TL;DR — if the first ten lines do not answer
