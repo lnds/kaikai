@@ -1,0 +1,82 @@
+#[doc("""
+Where a `Mutable` demand that stays on the row is blamed.
+
+The masking pass keeps `Mutable` when a demand's target has no provable
+local provenance. The blame is that demand, not the first site that put
+`Mutable` on the row. When the target is a value returned by a call that
+did not prove it local, the call is named as the place the provenance
+ended.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.symtab
+import compiler.local_names
+import compiler.fmt
+
+#[doc("A note anchored at a secondary span: line, column, message.")]
+pub type SpanNote = SN(Int, Int, String)
+
+#[doc("The first demand the masking pass could not prove local, and the note naming where its target lost local provenance.")]
+pub type MutBlame = MB(Expr, Option[SpanNote])
+
+#[doc("The call where `e` stopped being provably local, following `let` bindings inside `body`.")]
+pub fn provenance_loss(body: Expr, e: Expr, nonlocal: (Expr) -> Bool) : Option[Expr] = match e.kind {
+  ELocal(l) -> match let_rhs(body, l) {
+    Some(rhs) -> if nonlocal(rhs) { provenance_loss(body, rhs, nonlocal) } else { None }
+    None      -> None
+  }
+  # A call whose mutable arguments all trace to a further loss passes
+  # the blame on; otherwise the call itself is where provenance ended.
+  ECall(_, args_) -> match first_nonlocal(args_, nonlocal) {
+    Some(a) -> match provenance_loss(body, a, nonlocal) {
+      None  -> Some(e)
+      found -> found
+    }
+    None -> Some(e)
+  }
+  _ -> None
+}
+
+fn first_nonlocal(es: [Expr], nonlocal: (Expr) -> Bool) : Option[Expr] = match es {
+  []           -> None
+  [h, ...rest] -> if nonlocal(h) { Some(h) } else { first_nonlocal(rest, nonlocal) }
+}
+
+#[doc("The right-hand side of the `let` that binds `l` inside `e`.")]
+pub fn let_rhs(e: Expr, l: LocalId) : Option[Expr] = match e.kind {
+  EBlock(ss, _) -> match stmts_let_rhs(ss, l) {
+    None  -> positions_let_rhs(xp_positions(e), l)
+    found -> found
+  }
+  _ -> positions_let_rhs(xp_positions(e), l)
+}
+
+fn stmts_let_rhs(ss: [Stmt], l: LocalId) : Option[Expr] = match ss {
+  []           -> None
+  [s, ...rest] -> match s {
+    SLet(p, _, rhs) -> match p.pkind {
+      PBind(b) -> if local_eq(b.id, l) { Some(rhs) } else { stmts_let_rhs(rest, l) }
+      _        -> stmts_let_rhs(rest, l)
+    }
+    _ -> stmts_let_rhs(rest, l)
+  }
+}
+
+fn positions_let_rhs(ps: [XPos], l: LocalId) : Option[Expr] = match ps {
+  []                  -> None
+  [XP(_, x), ...rest] -> match let_rhs(x, l) {
+    None  -> positions_let_rhs(rest, l)
+    found -> found
+  }
+}
+
+#[doc("The note, anchored at `call`, saying a demand's `target` lost local provenance in that call.")]
+pub fn mut_via_note(tab: SymTab, names: LocalNames, target: Expr, call: Expr) : SpanNote {
+  let t = fmt_expr_text(target, tab, names)
+  let c = match call.kind {
+    ECall(f, _) -> fmt_expr_text(f, tab, names)
+    _           -> fmt_expr_text(call, tab, names)
+  }
+  SN(call.line, call.col, "`#{t}` has no provable local provenance: it comes from the call to `#{c}`")
+}

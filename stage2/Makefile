@@ -3832,6 +3832,7 @@ TEST_EFFECTS_CASES := \
 	test-effects-local_ref_masks_mutable \
 	test-effects-mutable_user_handler_over_default \
 	test-effects-array_mutable_required \
+	test-effects-mutable_blame \
 	test-effects-prelude_effect_via_scheme \
 	test-effects-issue_308_user_log_effect \
 	test-effects-dual_actor_send_only \
@@ -5215,6 +5216,25 @@ test-effects-array_mutable_required: $(TARGET) build core-cache-warm
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (rejected with the expected diagnostic)"; \
+	done
+
+# A rejected `Mutable` names the demand whose target is not provably
+# local, and the call where that target lost its local provenance.
+test-effects-mutable_blame: $(TARGET) build core-cache-warm
+	@set -e; \
+	for f in ../examples/effects/string_builder_fold_append_blame.kai \
+	         ../examples/effects/string_builder_header_fold_footer_blame.kai; do \
+	  name=$$(basename $$f .kai); \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF -- "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $${f%.kai}.err.expected; \
+	  echo "effects OK $$name (blames the demand, names the call)"; \
 	done
 
 test-effects-prelude_effect_via_scheme: $(TARGET) build core-cache-warm
