@@ -84,6 +84,36 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.157.0 (2026-10-15)
+
+### BREAKING CHANGE
+
+- a `.` inside a call argument on the right side of a
+`|`, `||` or `|?` stage now refers to the stage's element instead of
+wrapping that argument in a lambda: `xs | f(g(.))` means
+`xs | (x) => f(g(x))`, and `xs | .map(.length())` means
+`xs | (x) => x.map(x.length())`.
+
+### Added
+
+- **parse**: the |! pipe runs a stage for its effect on every element
+- **parse**: a pipe stage owns the `.` inside `#{...}` bodies
+- **parse**: a pipe stage owns every `.` on its right side
+- **stdlib**: export the canonical each from every strict collection
+- **lint**: flag every discarded non-Unit value, effectful or not
+- **stdlib**: add core ignore as the explicit discard
+
+### Fixed
+
+- **parse**: an interpolated string pattern keeps its parsed bodies
+- **fmt**: keep the parentheses around a placeholder pipe used as an operand
+- **resolve**: explain a lambda parameter cut off by a pipe
+
+### Changed
+
+- **compiler**: one dispatch-pipe node for map, flat-map and filter
+- **parse**: scan an interpolated literal once, in the parser
+
 ## v0.156.0 (2026-10-14)
 
 ### BREAKING CHANGE
