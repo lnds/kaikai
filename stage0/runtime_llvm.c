@@ -135,6 +135,8 @@ int64_t kaix_idiv_chk(int64_t a, int64_t b)    { return kai_idiv_chk(a, b); }
 int64_t kaix_imod_chk(int64_t a, int64_t b)    { return kai_imod_chk(a, b); }
 /* Unsigned raw `/` `%` for the UInt32/UInt64 raw path — operands widen to
    u64 (zext), divide unsigned, truncate back. Zero divisor traps. */
+double kaix_int_to_real_raw(int64_t n)         { return kai_int_to_real_raw(n); }
+int64_t kaix_real_to_int_raw(double r)         { return kai_real_to_int_raw(r); }
 uint64_t kaix_udiv_chk(uint64_t a, uint64_t b) { return kai_udiv_chk(a, b); }
 uint64_t kaix_umod_chk(uint64_t a, uint64_t b) { return kai_umod_chk(a, b); }
 /* Comparison shims carry the tagged-Int fast path INLINE: two immediates
