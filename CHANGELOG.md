@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.158.1 (2026-10-15)
+
+### Fixed
+
+- **typer**: blame the Mutable demand that broke the masking, not the first use
+- **imports**: text inside a string literal is not a use of an import
+
+### Changed
+
+- **core-reach**: an arithmetic operator no longer keeps the primitive impls of its protocol
+- **imports**: walk a string literal by byte and stop once nothing is pending
+
 ## v0.158.0 (2026-10-15)
 
 ### Added
