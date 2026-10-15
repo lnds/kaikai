@@ -105,7 +105,9 @@ fn grid() : [[Int]] = [0..2] | (r) => [0..2] | (c) => r * 10 + c
 ```
 
 `(c) => …` is a stage of the OUTER pipe, so `r` was never in scope.
-Parenthesise to nest the inner pipe inside the outer lambda:
+The error's help says so: it names the lambda the pipe ended and shows
+the parenthesised body. Parenthesise to nest the inner pipe inside the
+outer lambda:
 
 ```kaikai-snippet
 [0..2] | (r) => ([0..2] | (c) => r * 10 + c)

@@ -1,0 +1,133 @@
+#[doc("""
+Why a lambda's parameter is out of scope in a later pipe stage: an
+arrow-lambda body ends at a top-level pipe, so the stage after that
+pipe is the lambda's sibling, not part of its body.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.resolve_env
+
+#[doc("A pipe node split into its left side, its operator as written and its stage.")]
+pub type PipeParts = PipeParts(Expr, String, Expr)
+
+#[doc("The parts of `x` when it is one of the four pipes.")]
+pub fn pipe_parts(x: Expr) : Option[PipeParts] = match x.kind {
+  EPipe(l, r)        -> Some(PipeParts(l, "|>", r))
+  EMapPipe(l, r)     -> Some(PipeParts(l, "|", r))
+  EFlatMapPipe(l, r) -> Some(PipeParts(l, "||", r))
+  EFilterPipe(l, r)  -> Some(PipeParts(l, "|?", r))
+  _                  -> None
+}
+
+#[doc("""
+`e` for walking the stage of pipe `p` with left side `a`: it remembers
+`p` when a lambda on that side had its body ended by a pipe.
+""")]
+pub fn cut_enter(e: Env, p: Expr, a: Expr) : Env =
+  if left_cut(a) { Env { ...e, cut_pipes: [p, ...e.cut_pipes] } } else { e }
+
+#[doc("`inner`, the env after a stage, with the pipes remembered before `cut_enter` was taken from `outer`.")]
+pub fn cut_leave(inner: Env, outer: Env) : Env = match inner.cut_pipes {
+  [] -> inner
+  _  -> Env { ...inner, cut_pipes: outer.cut_pipes }
+}
+
+fn left_cut(a: Expr) : Bool = is_lambda(a) or match pipe_parts(a) {
+  Some(PipeParts(l, _, r)) -> is_lambda(r) or left_cut(l)
+  None                     -> false
+}
+
+fn is_lambda(x: Expr) : Bool = match x.kind { ELambda(_, _) -> true  _ -> false }
+
+# A lambda and the pipe that ends its body.
+type Cut = Cut(Expr, Expr)
+
+# The lambda ending at pipe `p` is its left side, or the last stage of
+# that side; the spine below `p` holds the ones that end earlier.
+fn spine_cuts(p: Expr) : [Cut] = match pipe_parts(p) {
+  None -> []
+  Some(PipeParts(l, _, _)) -> {
+    let rest = spine_cuts(l)
+    if is_lambda(l) { [Cut(l, p), ...rest] }
+    else { match pipe_parts(l) {
+      Some(PipeParts(_, _, s)) -> if is_lambda(s) { [Cut(s, p), ...rest] } else { rest }
+      None                     -> rest
+    } }
+  }
+}
+
+fn binding_cut(cs: [Cut], name: String) : Option[Cut] = match cs {
+  [] -> None
+  [c, ...rest] -> if cut_binds(c, name) { Some(c) } else { binding_cut(rest, name) }
+}
+
+fn cut_binds(c: Cut, name: String) : Bool = match c {
+  Cut(lam, _) -> list_has(lam_param_names(lam), name)
+}
+
+fn lam_param_names(lam: Expr) : [String] = match lam.kind {
+  ELambda(ps, _) -> ps | (p) => written_text(p.binder.name)
+  _              -> []
+}
+
+fn find_cut(pipes: [Expr], name: String) : Option[Cut] = match pipes {
+  [] -> None
+  [p, ...rest] -> match binding_cut(spine_cuts(p), name) {
+    Some(c) -> Some(c)
+    None    -> find_cut(rest, name)
+  }
+}
+
+#[doc("""
+The help for an unbound `name` that a lambda on the spine of one of
+`pipes` binds, when its body ended at a pipe of that spine.
+""")]
+pub fn cut_hint(pipes: [Expr], name: String, file: String) : Option[String] / File =
+  match find_cut(pipes, name) {
+    None    -> None
+    Some(c) -> Some(cut_help(c, name, file))
+  }
+
+fn cut_help(c: Cut, name: String, file: String) : String / File = match c {
+  Cut(lam, p) -> {
+    let op = pipe_op(p)
+    "`#{name}` is the parameter of the lambda before this `#{op}`; a lambda body ends at a top-level pipe, so this stage is outside it. Wrap the body in parentheses: `#{cut_fix(lam, p, op, file)}`"
+  }
+}
+
+fn pipe_op(p: Expr) : String = match pipe_parts(p) {
+  Some(PipeParts(_, op, _)) -> op
+  None                      -> "|"
+}
+
+# The lambda as written runs from its head to the pipe that ends it;
+# split at its `=>` to wrap the body.
+fn cut_fix(lam: Expr, p: Expr, op: String, file: String) : String / File =
+  match lambda_text(lam, p, file) {
+    Some(text) -> match index_of(text, "=>") {
+      Some(i) -> "#{string_slice(text, 0, i + 2)} (#{trim(string_slice(text, i + 2, string_length(text) - i - 2))} #{op} …)"
+      None    -> fallback_fix(lam, op)
+    }
+    None -> fallback_fix(lam, op)
+  }
+
+fn lambda_text(lam: Expr, p: Expr, file: String) : Option[String] / File =
+  if lam.line != p.line or p.col <= lam.col { None }
+  else { match read_file(file) {
+    Err(_)  -> None
+    Ok(src) -> match nth_line(src, lam.line) {
+      Some(line) -> Some(trim(string_slice(line, lam.col - 1, p.col - lam.col)))
+      None       -> None
+    }
+  } }
+
+fn fallback_fix(lam: Expr, op: String) : String = {
+  let head = match lam_param_names(lam) {
+    [n] -> n
+    ns  -> "(#{join(ns, ", ")})"
+  }
+  "#{head} => (… #{op} …)"
+}

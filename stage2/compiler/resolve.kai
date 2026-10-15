@@ -22,6 +22,7 @@ import compiler.refine_names
 import compiler.resolve_env
 import compiler.resolve_pats
 import compiler.resolve_names
+import compiler.pipe_cut
 
 fn bind_pat(e: Env, pat: Pattern) : RPat / Console + File = match bind_pat_kind(e, pat.pkind) {
   RPatKind(e1, k) -> RPat(e1, Pattern { pkind: k, line: pat.line, col: pat.col })
@@ -134,10 +135,10 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File = match x.kind {
   EList(elems) -> chk_list(e, elems)
   ERange(a, b, opt_step) -> chk_range(e, a, b, opt_step)
   EBlock(stmts, opt_final) -> chk_block(e, stmts, opt_final)
-  EPipe(a, b) -> chk_apply_pipe(e, a, b)
-  EMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EMapPipe(l, r))
-  EFlatMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFlatMapPipe(l, r))
-  EFilterPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFilterPipe(l, r))
+  EPipe(a, b) -> chk_apply_pipe(e, x, a, b)
+  EMapPipe(a, b) -> chk_pipe(e, x, a, b, (l, r) => EMapPipe(l, r))
+  EFlatMapPipe(a, b) -> chk_pipe(e, x, a, b, (l, r) => EFlatMapPipe(l, r))
+  EFilterPipe(a, b) -> chk_pipe(e, x, a, b, (l, r) => EFilterPipe(l, r))
   EHole(_) -> rk_same(e, x.kind)          # holes bind no names; checker lets them pass silently
   ETodo(_) -> rk_same(e, x.kind)          # same posture as a hole
   EExternBody(_, _) -> rk_same(e, x.kind)          # same posture as a hole
@@ -264,11 +265,11 @@ fn chk_hidden(e: Env, name: String, x: Expr, reached: SymId) : Env / Console + F
   } }
 
 # A pipe stage named bare is called with the piped value alone.
-fn chk_pipe(e: Env, a: Expr, b: Expr,
+fn chk_pipe(e: Env, p: Expr, a: Expr, b: Expr,
       mk: (Expr, Expr) -> ExprKind) : RKind / Console + File =
   match chk_expr(e, a) {
-    RExpr(e1, a1) -> match chk_stage(e1, b) {
-      RExpr(e2, b1) -> RKind(e2, mk(a1, b1))
+    RExpr(e1, a1) -> match chk_stage(cut_enter(e1, p, a), b) {
+      RExpr(e2, b1) -> RKind(cut_leave(e2, e1), mk(a1, b1))
     }
   }
 
@@ -279,15 +280,19 @@ fn chk_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
 
 # `x |> f(a, b)` calls `f(x, a, b)`; a `_` among the arguments is the
 # slot the piped value fills instead.
-fn chk_apply_pipe(e: Env, a: Expr, b: Expr) : RKind / Console + File =
+fn chk_apply_pipe(e: Env, p: Expr, a: Expr, b: Expr) : RKind / Console + File =
   match chk_expr(e, a) {
-    RExpr(e1, a1) -> match b.kind {
-      ECall(f, xs) -> match chk_call(e1, f, xs, list_length(xs) + piped_slot(xs)) {
-        RKind(e2, k) -> RKind(e2, EPipe(a1, Expr { kind: k, line: b.line, col: b.col, ty: b.ty, mode: b.mode,  site: b.site }))
-      }
-      _ -> match chk_stage(e1, b) { RExpr(e2, b1) -> RKind(e2, EPipe(a1, b1)) }
+    RExpr(e1, a1) -> match chk_apply_stage(cut_enter(e1, p, a), b) {
+      RExpr(e2, b1) -> RKind(cut_leave(e2, e1), EPipe(a1, b1))
     }
   }
+
+fn chk_apply_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
+  ECall(f, xs) -> match chk_call(e, f, xs, list_length(xs) + piped_slot(xs)) {
+    RKind(e1, k) -> RExpr(e1, at(k, b))
+  }
+  _ -> chk_stage(e, b)
+}
 
 # A call `f(args)` with `n` arguments, the piped value counted. A bare
 # callee climbs the ladder with that arity; a method call reaches a
