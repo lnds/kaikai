@@ -3415,7 +3415,7 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
       # Reading the decision off the AST (not recomputing the branch-aware
       # analysis) is what avoids the pre/post-dup divergence that OOM'd.
       let moved = arm_moved_binders(ptr_binders, body)
-      let borrow_binds = emit_arm_borrow_binds(src, subs, tys, 0, cx)
+      let borrow_binds = emit_arm_borrow_binds(src, subs, tys, 0, "_scr", cx)
       let shared_dups  = arm_shared_dups(moved, cx.locals)
       # Single-store TRMC reuse: record the donor cell's ctor + positional
       # binders so a TRMC step rebuilding the SAME ctor into `_arm_ru`
@@ -3478,13 +3478,13 @@ fn arm_donor_binders(subs: [Pattern], i: Int) : [LocalId] = match subs {
 # slots box a fresh owning value (same as the owned path — primitives carry
 # no RC so there is no sharing concern). Any other pointer sub-pattern binds
 # its nested names as the owned path does, with their own reference.
-fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int,
+fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int, scr: String,
                          cx: EmitCtx) : String {
   match subs {
     [] -> ""
     [sp, ...rest] -> {
       let k = kind_at(tys, i)
-      let slot = concat_all(["kai_var_slots(_scr)[", int_to_string(i), "]"])
+      let slot = concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "]"])
       let here = match sp.pkind {
         PBind(b) -> {
           let nm = ln_emitted(cx.locals, b.id)
@@ -3495,7 +3495,7 @@ fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int,
         }
         _ -> if k == 0 { emit_pat_binds(src, sp, concat_all([slot, ".ptr"]), false, true, cx) } else { "" }
       }
-      cat2(here, emit_arm_borrow_binds(src, rest, tys, i + 1, cx))
+      cat2(here, emit_arm_borrow_binds(src, rest, tys, i + 1, scr, cx))
     }
   }
 }
@@ -4067,19 +4067,18 @@ fn arm_scr_release(owned: Bool, guarded: Bool, pat: Pattern, body: Expr, cx: Emi
 # The binders of an arm that takes its scrutinee apart alias its slots: the
 # take gives each its reference.
 fn arm_binds(src: String, pat: Pattern, scr_ty: Option[Ty], rel: ScrRelease, cx: EmitCtx) : String = match rel {
-  ScrTaken -> arm_take_binds(src, arm_subs(pat), arm_take_plan(pat, cx.ctor_ix), cx)
+  ScrTaken -> arm_take_binds(src, arm_subs(pat), arm_take_plan(pat, cx.ctor_ix), "_scr", cx)
   _        -> cat2(emit_pat_binds(src, pat, "_scr", true, true, cx), pbind_raw_alias(pat, "_scr", scr_ty, cx.locals))
 }
 
-fn arm_take_binds(src: String, subs: [Pattern], t: ArmTake, cx: EmitCtx) : String = match t {
+fn arm_take_binds(src: String, subs: [Pattern], t: ArmTake, scr: String, cx: EmitCtx) : String = match t {
   ArmTake(bs, ks, mask) ->
-    concat_all([emit_arm_borrow_binds(src, subs, ks, 0, cx), arm_take_test(mask),
-                arm_shared_dups(bs, cx.locals), "} _scr = NULL; "])
+    concat_all([emit_arm_borrow_binds(src, subs, ks, 0, scr, cx), arm_take_test(scr, mask),
+                arm_shared_dups(bs, cx.locals), "} ", scr, " = NULL; "])
 }
 
-fn arm_take_test(mask: Int) : String =
-  if mask == 0 { "if (!kai_arm_take(_scr, 0u)) { " }
-  else { concat_all(["if (!kai_arm_take(_scr, ", int_to_string(mask), "u)) { "]) }
+fn arm_take_test(scr: String, mask: Int) : String =
+  concat_all(["if (!kai_arm_take(", scr, ", ", int_to_string(mask), "u)) { "])
 
 fn arm_subs(pat: Pattern) : [Pattern] = match pat.pkind {
   PVariant(_, subs) -> subs
@@ -7171,8 +7170,11 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       let rhs_c = emit_expr(src, rhs, cx)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
-      let binds = emit_pat_binds(src, pat, tmp, false, true, cx)
-      concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds, "kai_decref(", tmp, "); "])
+      let head = concat_all(["KaiValue *", tmp, " = ", rhs_c, "; "])
+      match arm_release(pat, rhs, not cx.in_region) {
+        ScrTaken -> cat2(head, arm_take_binds(src, arm_subs(pat), arm_take_plan(pat, cx.ctor_ix), tmp, cx))
+        _ -> concat_all([head, emit_pat_binds(src, pat, tmp, false, true, cx), "kai_decref(", tmp, "); "])
+      }
     }
   }
 }
