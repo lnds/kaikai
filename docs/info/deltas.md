@@ -65,9 +65,11 @@ Every entry is verified against the compiler; when in doubt,
   positions exist. `list.count(p)` is count-*if* (how many satisfy `p`),
   and `stream.count` drains a lazy stream — neither is a length.
 - Left fold is `foldl` on every collection (`list`, `vec`, `stream`,
-  `map`), with `foldl`/`foldr` where both directions exist. `fold` is a
-  deprecated alias for `foldl`; `reduce` is the list-builtin sibling of
-  `map`/`filter`/`each` and stays.
+  `map`); `list` also has `foldr`. `fold` exists only on `stream` and
+  `map`, as a deprecated alias for `foldl` kept until the Orongo
+  edition (`kai migrate` rewrites it); `list` and `vec` have no `fold`.
+  `reduce` is the list-builtin sibling of `map`/`filter`/`each` and
+  stays.
 
 If a form is not in `kai info syntax`, it does not exist — check
 there before inventing syntax. To look up one API, use
