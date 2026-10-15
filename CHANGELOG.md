@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.158.0 (2026-10-15)
+
+### Added
+
+- **kai**: [native.<module>] tables link only for builds that import the module
+- **kai**: [native] libdirs and pkg-config locate libraries off the search path
+
 ## v0.157.0 (2026-10-15)
 
 ### BREAKING CHANGE
