@@ -11606,6 +11606,62 @@ static KaiValue *kai_core_string_find(KaiValue *s, KaiValue *sub) {
     return kai_int(at);
 }
 
+/* Digit value of an ASCII byte in base 36; 36 for a byte that is no digit. */
+static int kai_radix_digit(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+    return 36;
+}
+
+/* Accumulates on the negative side, which holds INT64_MIN. */
+static KaiValue *kai_core_to_int_radix(KaiValue *s, KaiValue *r) {
+    int64_t radix = kai_intf(r);
+    int ok = 0;
+    int64_t acc = 0;
+    if (s && s->tag == KAI_STR && radix >= 2 && radix <= 36) {
+        const unsigned char *p = (const unsigned char *) s->as.s.bytes;
+        size_t n = (size_t) s->as.s.len, i = 0;
+        int neg = n > 0 && p[0] == '-';
+        if (n > 0 && (p[0] == '-' || p[0] == '+')) i = 1;
+        ok = i < n;
+        for (; ok && i < n; i++) {
+            int d = kai_radix_digit(p[i]);
+            if (d >= radix || acc < (INT64_MIN + d) / radix) ok = 0;
+            else acc = acc * radix - d;
+        }
+        if (ok && !neg) {
+            if (acc == INT64_MIN) ok = 0;
+            else acc = -acc;
+        }
+    }
+    if (s) kai_decref(s);
+    kai_decref(r);
+    if (ok) {
+        KaiValue *iv = kai_int(acc);
+        return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = iv}});
+    }
+    return kai_variant_u(1, "None", 0, 0, NULL);
+}
+
+/* Divides on the non-positive side so INT64_MIN needs no negation. */
+static KaiValue *kai_core_int_to_string_radix(KaiValue *v, KaiValue *r) {
+    int64_t n = kai_intf(v), radix = kai_intf(r);
+    kai_decref(v);
+    kai_decref(r);
+    if (radix < 2 || radix > 36) return kai_variant_u(1, "None", 0, 0, NULL);
+    char buf[72];
+    char *end = buf + sizeof buf, *p = end;
+    int64_t m = n < 0 ? n : -n;
+    do {
+        *--p = "0123456789abcdefghijklmnopqrstuvwxyz"[-(m % radix)];
+        m /= radix;
+    } while (m != 0);
+    if (n < 0) *--p = '-';
+    KaiValue *sv = kai_str_from_bytes(p, (size_t) (end - p));
+    return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = sv}});
+}
+
 /* ---------- core thunks for first-class function refs ---------- */
 
 static KaiValue *_kai_core_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_core_print(a[0]); }
