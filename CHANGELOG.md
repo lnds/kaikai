@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.156.0 (2026-10-14)
+
+### BREAKING CHANGE
+
+- `encoding.hex.to_int` and `encoding.hex.from_int` are
+removed. Use `to_int_radix(s, 16)` and `int_to_string_radix(n, 16)`;
+the latter returns `Option[String]` and renders a negative with a
+leading `-` where `hex.from_int` returned "0".
+
+### Added
+
+- **stdlib**: parse and render integers in a radix in core; hex keeps only bytes
+
+### Fixed
+
+- **desugar**: lower record spreads and positional literals in const initializers
+
+### Removed
+
+- **resolve**: the same-type import shadow check added in 0.155.0 is
+reverted. A bare name an opened import declares shadows the core one in
+the files that import it, whatever the two functions' types, as
+`kai info packages` documents; code that 0.155.0 rejected compiles again.
+
 ## v0.155.0 (2026-10-14)
 
 ### BREAKING CHANGE
