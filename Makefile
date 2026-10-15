@@ -769,6 +769,7 @@ test-kai-cli: kaic2
 	@tests/own_lint.sh
 	@tests/native_cache_edits.sh
 	@tests/bin_memo.sh
+	@tests/header_digest.sh
 	@tests/run_memo.sh
 	@tests/src_entry.sh
 	@tests/build_memo.sh
