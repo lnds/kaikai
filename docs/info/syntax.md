@@ -419,8 +419,8 @@ fn run_with(f: (Int) -> Int, x: Int) : Int = f(x)
 fn main() : Int = {
   let f1 = (x) => x + 1                        # unary arrow
   let f2 = (a, b) => a * b                     # multi-arg arrow
-  let r1 = run_with(. + 10, 5)                 # placeholder `.`
-                                               # only in arg position
+  let r1 = run_with(. + 10, 5)                 # placeholder `.`: in a
+                                               # call argument or a pipe stage
   let r2 = f1(1) + f2(2, 3) + r1
   r2
 }
@@ -531,6 +531,42 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+A `|`, `||` or `|?` stage owns every `.` on its right side: a bare
+`.` and a `.` followed by a postfix chain (`.name`, `.a.b`, `.f(v)`).
+They all stand for the same element.
+
+```kaikai
+fn add(a: Int, b: Int) : Int = a + b
+
+fn main() : Unit / Stdout = {
+  let ys = [1, 2, 3] | add(., 10)              # [11, 12, 13]
+  let big = [1, 5, 9] |? . > 3                 # [5, 9]
+  println("#{ys} #{big}")
+}
+```
+
+The closest stage owns a `.`. An explicit lambda or a handler is a
+barrier: a `.` inside it belongs to a stage inside it, never to one
+around it. `|>` is not a stage; it keeps `_`. Two nested stages that
+both use `.` are an error — name one element with `(x) => ...`:
+
+```kaikai-neg
+fn main() : Unit / Stdout = {
+  let _ = [[1, 2], [3]] | (. | . + 1)           # error: both use `.`
+}
+```
+
+```kaikai
+fn main() : Unit / Stdout = {
+  let _ = [[1, 2], [3]] | (row: [Int]) => (row | . + 1)
+}
+```
+
+Outside a stage nothing changes: a `.` in a call argument stands for a
+lambda over the innermost argument (`run_with(. + 10, 5)`), so
+`xs |> each(println(.))` passes `println` the identity function. Write
+`xs | println(.)` instead.
+
 ## Point-free sections
 
 A leading `.` in function position is a point-free section: it stands
@@ -555,7 +591,9 @@ fn main() : Unit / Stdout = {
 
 The receiver is supplied implicitly (first argument by UFCS), so
 `.starts_with("a")` reads its written argument after the receiver.
-Point-free sections work as the function of `|`, `||`, `|?` and as a
+A section is the placeholder `.` with a postfix chain, so on the right
+side of `|`, `||` or `|?` it is the stage's element like any other `.`,
+a section nested in a call argument there included. Elsewhere it is a
 combinator argument (`.map`, `.and_then`, `.filter`). A point-free
 section is unary; to drop a positional argument, use the `|>`
 placeholder `_` instead — the two do not mix in one section.
