@@ -1,4 +1,4 @@
-#[doc("The `[native]` contract: vendored C sources, include dirs and system libraries a package graph declares.")]
+#[doc("The `[native]` contract: vendored C sources, include and library dirs, system libraries and pkg-config names a package graph declares.")]
 
 import path
 import cli_caches
@@ -11,7 +11,7 @@ import cli_proc
 import cli_sys
 import cli_toolchain
 
-#[doc("One declaration of a package: its root (`dir`), or a `src`/`inc`/`lib` entry of its `[native]` table.")]
+#[doc("One declaration of a package: its root (`dir`), a `src`/`inc`/`libdir`/`lib`/`pc` entry of its `[native]` table, or a `pc-cflags`/`pc-libs` answer.")]
 pub type Native = { pkg: String, kind: String, value: String }
 
 # The `[native]` table's lines joined into one blob; whole-line comments blank out.
@@ -64,7 +64,13 @@ fn quoted_strings(s: String) : [String] {
 
 fn entries(dir: String) : [(String, String)] / File {
   let blob = native_blob(string.split(cli_fs.read_or_empty("#{dir}/kai.toml"), "\n"), false, "")
-  [("sources", "src"), ("include", "inc"), ("libs", "lib")]
+  [
+    ("sources", "src"),
+    ("include", "inc"),
+    ("libdirs", "libdir"),
+    ("libs", "lib"),
+    ("pkg-config", "pc")
+  ]
     || (k => match array_body(blob, k.fst) {
       Some(body) -> quoted_strings(body) | (v => (k.snd, v))
       None -> []
@@ -74,7 +80,11 @@ fn entries(dir: String) : [(String, String)] / File {
 fn package(name: String, dir: String) : [Native] / File {
   let own = entries(dir)
     | (e => {
-      let v = if e.fst == "lib" or path.is_absolute(e.snd) { e.snd } else { "#{dir}/#{e.snd}" }
+      let v = if e.fst == "lib" or e.fst == "pc" or path.is_absolute(e.snd) {
+        e.snd
+      } else {
+        "#{dir}/#{e.snd}"
+      }
       Native { pkg: name, kind: e.fst, value: v }
     })
   [Native { pkg: name, kind: "dir", value: dir }, ...own]
@@ -84,7 +94,8 @@ fn dedupe(xs: [Native], seen: [String]) : [Native] =
   match xs {
     [] -> []
     [x, ...rest] -> {
-      let k = "#{x.kind}\t#{x.value}"
+      let scope = if x.kind == "inc" or x.kind == "pc" { x.pkg } else { "" }
+      let k = "#{scope}\t#{x.kind}\t#{x.value}"
       if seen.contains(k) { dedupe(rest, seen) } else { [x, ...dedupe(rest, [k, ...seen])] }
     }
   }
@@ -113,6 +124,12 @@ fn of_kind(info: [Native], pkg: String, kind: String) : [String] =
 fn unique(xs: [String]) : [String] =
   list.reverse(xs |> list.foldl([], (acc, x) => if acc.contains(x) { acc } else { [x, ...acc] }))
 
+fn all_of_kind(info: [Native], kind: String) : [String] =
+  unique(info |? (n => n.kind == kind) | (n => n.value))
+
+fn pc_cflags(info: [Native], pkg: String) : [String] =
+  of_kind(info, pkg, "pc-cflags") || cli_proc.words
+
 #[doc("The packages that ship native C sources, once each, in order.")]
 pub fn source_packages(info: [Native]) : [String] = unique(sources(info) | (n => n.pkg))
 
@@ -133,14 +150,22 @@ fn headers_below(dir: String) : [String] / File + Ffi =
   }
 
 fn object_key(t: Toolchain, info: [Native], n: Native) : String / File + Ffi {
-  let head = cli_hash.lines([t.cc, string.join(t.cflags_compile, " "), cli_toolchain.host(t)])
+  let head = cli_hash.lines([
+    t.cc,
+    string.join(t.cflags_compile ++ pc_cflags(info, n.pkg), " "),
+    cli_toolchain.host(t)
+  ])
   let headers = of_kind(info, n.pkg, "inc") || headers_below | (h => cli_hash.Bytes(h))
   cli_hash.digest([head, cli_hash.Bytes(n.value), ...headers])
 }
 
 fn compile_one(t: Toolchain, info: [Native], n: Native, obj: String) : Bool / Ffi {
   let incs = of_kind(info, n.pkg, "inc") || (d => ["-I", d])
-  let argv = cli_proc.words(t.cc) ++ t.cflags_compile ++ incs ++ ["-c", n.value, "-o", obj]
+  let argv = cli_proc.words(t.cc)
+    ++ t.cflags_compile
+    ++ incs
+    ++ pc_cflags(info, n.pkg)
+    ++ ["-c", n.value, "-o", obj]
   cli_proc.run(argv, cli_proc.inherit()) == 0
 }
 
@@ -200,9 +225,11 @@ pub fn objects(
   build_objects(t, info, list.enumerate(sources(info)), cache, tmp)
 }
 
-#[doc("`-l<lib>` for every declared system library, once each.")]
+#[doc("The link flags: `-L<dir>` per declared `libdirs`, each pkg-config `--libs` answer, `-l<lib>` per system library — once each.")]
 pub fn lib_flags(info: [Native]) : [String] =
-  unique(info |? (n => n.kind == "lib") | (n => n.value)) | (l => "-l#{l}")
+  (all_of_kind(info, "libdir") | (d => "-L#{d}"))
+    ++ (all_of_kind(info, "pc-libs") || cli_proc.words)
+    ++ (all_of_kind(info, "lib") | (l => "-l#{l}"))
 
 fn stray_sources_note(info: [Native], d: Native) : [String] / File + Ffi {
   let declares = sources(info) |> list.any(n => n.pkg == d.pkg)
@@ -245,7 +272,7 @@ pub fn link_hint(info: [Native]) : Unit / Stderr + Env + File + Ffi =
     libs
       |> foreach(
         n => Stderr.eprint(
-          "kai: note: package '#{n.pkg}' requires system library '#{n.value}' (-l#{n.value}); if the linker could not find it, install it on this machine."
+          "kai: note: package '#{n.pkg}' links system library '#{n.value}' (-l#{n.value}); if the linker could not find it, name its directory in that package's [native] `libdirs` or its .pc in `pkg-config`, or install it if it is absent."
         )
       )
     info

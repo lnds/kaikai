@@ -72,16 +72,22 @@ never pass it by hand:
 [native]
 sources = ["c/term_shim.c"]   # vendored C, relative to this package
 include = ["c"]               # -I dirs for compiling those sources
+libdirs = ["lib"]             # -L dirs at link, relative or absolute
 libs = ["sqlite3"]            # system libraries, -l<name> at link
+pkg-config = ["libpq"]        # --cflags for the sources, --libs at link
 ```
 
 Honoured by every verb (`build`/`run`/`test`/`install`), on both
 backends, transitively: if A and B depend on the same shim-binding
 package, the shim compiles and links once. Sources are vendored and
 always work; `libs` name system libraries that must exist on the
-consumer's machine. Declarative only — no build scripts, no free-form
-flags. `CFLAGS` keeps precedence as the escape hatch;
-`KAI_NATIVE_DEPS=0` disables the channel.
+consumer's machine. A library off the default search path is found
+through `libdirs` (paths like `include`: relative to the package,
+absolute allowed) or `pkg-config`, queried at build time for each
+name; a missing `pkg-config` (or `$PKG_CONFIG`) or an unknown name
+fails the build naming the package and the `.pc`. Declarative only —
+no build scripts, no free-form flags. `CFLAGS` keeps precedence as the
+escape hatch; `KAI_NATIVE_DEPS=0` disables the channel.
 
 ## Shell completions (`[completions]`)
 

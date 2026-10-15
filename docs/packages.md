@@ -68,7 +68,9 @@ contract, so a consumer never wires a shim in by hand:
 [native]
 sources = ["c/terevaka_term.c"]   # vendored C, relative to this package
 include = ["c"]                   # -I dirs for compiling those sources
+libdirs = ["lib"]                 # -L dirs at link, relative or absolute
 libs = ["sqlite3"]                # system libraries, -l<name> at link
+pkg-config = ["libpq"]            # --cflags for the sources, --libs at link
 ```
 
 The table lives in the layer that resolves dependencies, *below*
@@ -84,7 +86,18 @@ source always works: the `.c` travels with the package and compiles on
 the consumer's machine. A system library may be absent there through
 nobody's fault; when a link fails, the driver names the package and
 the library so the failure is actionable (`kai: note: package 'kohau'
-requires system library 'sqlite3'`).
+links system library 'sqlite3'`), and points at `libdirs`/`pkg-config`
+for a library that is installed but off the linker's search path.
+
+**Locating a system library.** `libdirs` adds `-L` dirs to the link,
+spelled like `include` (relative to the package, absolute allowed) — a
+keg-only Homebrew formula or a Postgres.app install is the usual case.
+`pkg-config` names `.pc` files; at build time the driver asks
+`pkg-config --cflags` and `--libs` for each one (`$PKG_CONFIG` names
+another tool), compiles the declaring package's sources with the
+former and adds the latter to the link. A missing tool or an unknown
+name fails the build before anything compiles, naming the package and
+the `.pc`.
 
 **One compile per shim.** Sources compile to objects cached by content
 (compiler, flags, target arch, source text, and the headers under the
@@ -99,11 +112,11 @@ the lockfile already resolves one entry per source. When A and B both
 depend on the same shim-binding package, its shim compiles and links
 exactly once.
 
-**Scope: declarative only.** `sources`, `include`, and `libs` — no
-build scripts, no arbitrary compile flags. A build script is code
-running on the consumer's machine at install time (attack surface, a
-reproducibility hole), and free-form flags turn the manifest into a
-build system. Shim sources must be self-contained C99 compiling with
+**Scope: declarative only.** `sources`, `include`, `libdirs`, `libs`,
+and `pkg-config` — no build scripts, no arbitrary compile flags. A
+build script is code running on the consumer's machine at install time
+(attack surface, a reproducibility hole), and free-form flags turn the
+manifest into a build system. Shim sources must be self-contained C99 compiling with
 default flags; a binding that needs detection or codegen is out of
 scope for the manifest.
 
@@ -119,8 +132,8 @@ one. A link that fails while a resolved dependency ships `.c` files
 its manifest does not declare gets a note naming the package and the
 missing `[native]` contract.
 
-Both backends receive the declarations: the shim objects and `-l`
-flags join every link line (C and native alike). The `[native]` table
+Both backends receive the declarations: the shim objects and the
+`-L`/`-l`/pkg-config flags join every link line (C and native alike). The `[native]` table
 is an additive `kai.toml` schema change — per `docs/editions.md`,
 additions are non-breaking, so no edition bump is involved.
 
