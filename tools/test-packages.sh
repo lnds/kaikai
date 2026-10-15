@@ -289,6 +289,11 @@ run_check_script "native_shim_verbs" "native_shim/check.sh"
 # once, links once — no duplicate symbols.
 run_check_script "native_diamond" "native_diamond/check.sh"
 
+# [native] libdirs / pkg-config: a library outside the default search
+# path links with no flags from the consumer; unknown or absent
+# pkg-config fails naming the package and the .pc.
+run_check_script "native_libdirs" "native_libdirs/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart
