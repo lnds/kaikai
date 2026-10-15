@@ -294,6 +294,10 @@ run_check_script "native_diamond" "native_diamond/check.sh"
 # pkg-config fails naming the package and the .pc.
 run_check_script "native_libdirs" "native_libdirs/check.sh"
 
+# [native.<module>] tables: a module's shim compiles and links only for
+# a build that imports that module; a failing one names its table.
+run_check_script "native_modules" "native_modules/check.sh"
+
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
 # backends and their stdout compared. This is the package-mode counterpart

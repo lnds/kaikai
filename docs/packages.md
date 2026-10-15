@@ -99,6 +99,34 @@ former and adds the latter to the link. A missing tool or an unknown
 name fails the build before anything compiles, naming the package and
 the `.pc`.
 
+**Per-module tables.** A package that binds independent libraries
+keys its tables by module, so a shim travels with whatever imports
+it and nothing else:
+
+```toml
+[native.sqlite]                   # this package's sqlite.kai
+sources = ["c/sqlite_shim.c"]
+libs = ["sqlite3"]
+
+[native."db.pg"]                  # db/pg.kai: a nested path is quoted
+sources = ["c/postgres_shim.c"]
+pkg-config = ["libpq"]
+```
+
+A module table takes the same keys as `[native]`, and its sources
+compile and its libraries link only when the consumer's build imports
+that module, directly or transitively; a consumer of `sqlite` never
+needs libpq. The module path is relative to the package, resolved
+under the directory of its entry or its root. The driver learns what
+a build imports from the compiler's import-closure listing (`kaic2
+--guard-inputs`), queried only when the graph declares a module table.
+A bare `[native]` keeps applying to the whole package; its `include`
+and `pkg-config` also reach the module tables' sources, while a module
+table's own reach only its own. An unquoted `[native.db.pg]` is a TOML
+table nested below `[native.db]`, not a module, and fails the build
+naming the quoted form. Failures name the table: `failed to compile
+native source c/postgres_shim.c (package 'kohau' [native."db.pg"])`.
+
 **One compile per shim.** Sources compile to objects cached by content
 (compiler, flags, target arch, source text, and the headers under the
 declaring package's `include` dirs). Two consumers with the same
@@ -107,7 +135,7 @@ cache extends the *build* cache (`nativedep/` beside the modular object
 caches), not the sha-keyed package cache — the object depends on the
 consumer's toolchain, which the package cache must not.
 
-**Diamond dedup.** Native entries are keyed by resolved package, and
+**Diamond dedup.** Native entries are keyed by resolved package and table, and
 the lockfile already resolves one entry per source. When A and B both
 depend on the same shim-binding package, its shim compiles and links
 exactly once.
