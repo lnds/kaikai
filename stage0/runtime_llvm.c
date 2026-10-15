@@ -1274,6 +1274,8 @@ KaiValue *kaix_core_string_slice(KaiValue *s, KaiValue *i, KaiValue *n) { return
 KaiValue *kaix_core_string_split(KaiValue *s, KaiValue *d)  { return kai_core_string_split(s, d); }
 KaiValue *kaix_core_string_contains(KaiValue *s, KaiValue *sub) { return kai_core_string_contains(s, sub); }
 KaiValue *kaix_core_string_find(KaiValue *s, KaiValue *sub)     { return kai_core_string_find(s, sub); }
+KaiValue *kaix_core_to_int_radix(KaiValue *s, KaiValue *r)     { return kai_core_to_int_radix(s, r); }
+KaiValue *kaix_core_int_to_string_radix(KaiValue *v, KaiValue *r) { return kai_core_int_to_string_radix(v, r); }
 KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i)       { return kai_core_char_at(s, i); }
 KaiValue *kaix_core_char_to_int(KaiValue *c)                { return kai_core_char_to_int(c); }
 KaiValue *kaix_core_int_to_char(KaiValue *i)                { return kai_core_int_to_char(i); }
