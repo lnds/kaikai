@@ -26,8 +26,8 @@ shapes it always saw:
   - `SfTuple(elems)`                -> `Pair`/`Triple`/`Quad` record
     literal; `PsTuple` -> the variant-record pattern; `TsTuple` ->
     `Pair[..]`/`Triple[..]`/`Quad[..]`.
-  - `"a#{x}"`                       -> `string_concat_all(["a",
-    show(x)])`, each `#{...}` body parsed where it stands and lowered
+  - `SfInterp` (`"a#{x}"`)          -> `string_concat_all(["a",
+    show(x)])`, each `#{...}` body the parser already parsed lowered
     like any other expression; the `show` is a `MkInterpShow` mark
     until the protocols are registered.
 
@@ -37,8 +37,7 @@ row-label arguments — because a tuple type can appear in any of them.
 
 The driver runs `surface_lower_decls` once, on the flat post-import
 decl list; no `ESurface` / `TySurface` / `PSurface` / `SAssign`
-survives it, and a string that still interpolates is one whose body
-does not parse.
+survives it.
 """)]
 
 import compiler.util
@@ -50,7 +49,7 @@ import compiler.ast_map
 import compiler.parse
 import compiler.refinements
 import compiler.interp_pattern
-import compiler.interp_holes
+import compiler.interp_scan
 import compiler.multi_match
 import compiler.underscore_binders
 import compiler.tbinder
@@ -119,6 +118,7 @@ fn sfl_fn_body(body: Expr, ps: [Param], tab: SymTab, owner: FnId) : Expr / Conso
     SfSteppedRange(_, _, _) -> sfl_expr(body)
     SfEndlessRange(_, _) -> sfl_expr(body)
     SfLazy(_) -> sfl_expr(body)
+    SfInterp(_, _, _) -> sfl_expr(body)
     # `case`-arms discriminate on the owning fn's params: one param
     # lowers to a plain match, several to the multi-match chain.
     SfCaseBlock(arms) -> {
@@ -198,10 +198,11 @@ fn sfl_expr(e: Expr) : Expr / Console = match e.kind {
     # here as the shape the author wrote.
     SfLazy(bracket) ->
       lazy_lower(sfl_rebuild(bracket, prc_map_expr_kind(bracket.kind, (x) => sfl_expr(x))), e.line, e.col)
-  }
-  EStr(span, is_triple) -> match interp_pieces(span, is_triple, e.line, e.col) {
-    Some(ps) -> sfl_interp(ps, e.line, e.col)
-    None     -> e
+    SfInterp(span, is_triple, holes) -> {
+      let at = InterpPos { line: e.line, col: e.col + interp_lead(is_triple) }
+      let parts = sfl_interp_parts(interp_parts(span, is_triple), holes, at)
+      mk_expr(ECall(mk_name("string_concat_all", e.line, e.col), [mk_expr(EList(parts), e.line, e.col)]), e.line, e.col)
+    }
   }
   # EMatch and EBlock carry patterns / statement shapes the generic
   # child-mapper does not rewrite; ELambda / EHandle / EVariantsOf
@@ -264,12 +265,17 @@ fn sfl_stepped_range(first: Expr, second: Expr, last: Expr, line: Int, col: Int)
 # `"a#{x}"` expansion. Each part keeps the position it has inside the
 # literal: passes that name a temporary after a position tell the parts
 # of one string apart.
-fn sfl_interp(ps: [InterpPiece], line: Int, col: Int) : Expr / Console {
-  let parts = map(ps, (p) => ElPlain(match p {
-    IpcText(quoted, at) -> mk_expr(EStr(quoted, false), at.line, at.col)
-    IpcHole(x)          -> mk_expr(ECall(mk_expr(EMark(MkInterpShow), x.line, x.col), [sfl_expr(x)]), x.line, x.col)
-  }))
-  mk_expr(ECall(mk_name("string_concat_all", line, col), [mk_expr(EList(parts), line, col)]), line, col)
+fn sfl_interp_parts(parts: [IPart], holes: [Expr], at: InterpPos) : [ListElem] / Console = match parts {
+  [] -> []
+  [IpLit(piece, quoted), ...rest] ->
+    [ElPlain(mk_expr(EStr(quoted, false), at.line, at.col)),
+     ...sfl_interp_parts(rest, holes, interp_pos_advance(at, piece, 0))]
+  [IpExp(src), ...rest] -> match holes {
+    [x, ...more] ->
+      [ElPlain(mk_expr(ECall(mk_expr(EMark(MkInterpShow), x.line, x.col), [sfl_expr(x)]), x.line, x.col)),
+       ...sfl_interp_parts(rest, more, interp_pos_past(interp_pos_body(at), src))]
+    [] -> panic("surface_lower: an interpolation body without its parsed hole")
+  }
 }
 
 # `123n` expansion: `from_literal("123")` of the module that declares

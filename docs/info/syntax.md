@@ -532,13 +532,15 @@ fn main() : Unit / Stdout = {
 ```
 
 A `|`, `||` or `|?` stage owns every `.` on its right side: a bare
-`.` and a `.` followed by a postfix chain (`.name`, `.a.b`, `.f(v)`).
-They all stand for the same element.
+`.`, a `.` followed by a postfix chain (`.name`, `.a.b`, `.f(v)`), and
+a `.` inside a `#{...}` body. They all stand for the same element.
 
 ```kaikai
+fn is_leap(y: Int) : Bool = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 fn add(a: Int, b: Int) : Int = a + b
 
 fn main() : Unit / Stdout = {
+  let _ = [1900, 2000, 2024] | println("#{.}: #{is_leap(.)}")
   let ys = [1, 2, 3] | add(., 10)              # [11, 12, 13]
   let big = [1, 5, 9] |? . > 3                 # [5, 9]
   println("#{ys} #{big}")
@@ -793,6 +795,11 @@ A `#{...}` body is an ordinary expression: the names, types and imports
 it uses are checked as they are outside the string, and an error points
 at the place inside the literal. A type's `where` predicate is the one
 position where a string cannot interpolate.
+
+Inside a pipe stage, a `.` in a body is the stage's element:
+`people | println("#{.name}: #{.age}")`. Outside any stage it is an
+error at its column inside the string. A body is not a barrier, but a
+lambda written in one is.
 
 ### Multi-line strings (`"""`)
 

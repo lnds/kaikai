@@ -62,8 +62,8 @@ fn main() : Unit / Stdout = {
 
 The right side of `|`, `||` or `|?` is a stage, and the stage owns
 every `.` in it: a bare `.`, a `.` with a postfix chain (`.name`,
-`.a.b`, `.f(v)`), and a `.` in a call argument. All of them are the
-same element.
+`.a.b`, `.f(v)`), a `.` in a call argument, and a `.` inside a `#{...}`
+body. All of them are the same element.
 
 ```kaikai
 type Person = { name: String, age: Int }
@@ -72,6 +72,7 @@ fn add(a: Int, b: Int) : Int = a + b
 
 fn main() : Unit / Stdout = {
   let people = [Person { name: "ana", age: 30 }, Person { name: "bo", age: 41 }]
+  let _ = people | println("#{.name} is #{.age}")
   let next = people | add(.age, 1)             # [31, 42]
   let pairs = [1, 2] || [., . * 10]            # [1, 10, 2, 20]
   let grown = people |? .age > 35 | .name      # ["bo"]
@@ -86,6 +87,14 @@ fn main() : Unit / Stdout = {
   `println` the identity function. Write `xs | println(.)`.
 - Two nested stages that both use `.` are an error. Name one element
   with `(x) => ...`.
+- Outside any stage, `.` inside `#{...}` is an error.
+
+```kaikai-neg
+fn main() : Unit / Stdout = {
+  let n = 3
+  println("n=#{n} #{.}")                       # error: no stage
+}
+```
 
 ## stdlib types that ride the pipes
 

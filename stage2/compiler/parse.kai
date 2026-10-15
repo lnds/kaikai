@@ -25,8 +25,6 @@
 # Public surface (4 pub fns + 2 pub types)
 #
 # - parse_program — the driver entry point: file + src + tokens -> AST.
-# - parse_interp_expr — parse a single `#{...}` interpolation body;
-#   used by the lift and the checks that run before it.
 # - PParser — parse_program's result record. Parser is pub only
 #   because PParser carries `p: Parser`; nothing else reaches for it.
 #
@@ -36,7 +34,7 @@
 #   has_interp.
 # - compiler.chars — ch_is_digit / ch_is_alpha / ch_is_alnum.
 # - compiler.diag — closest_name, diag_error_from_src.
-# - compiler.lex — tokenize (for parse_interp_expr).
+# - compiler.lex — tokenize (for interpolation bodies).
 # - compiler.ast — the whole AST data model + mk_expr / mk_pat /
 #   mk_ty, the field-marker sentinels, and tp_unit_suffix.
 # - compiler.refinements — try_eval_pred (used by
@@ -62,6 +60,7 @@ import compiler.refinements
 import compiler.doc_attr
 import compiler.nest_limit
 import compiler.tbinder
+import compiler.interp_scan
 import compiler.pipe_stage
 
 # ====================================================================
@@ -334,9 +333,8 @@ fn p_error(p: Parser, t: Token, msg: String) : Parser / Console = p_error_at(p, 
 
 fn p_error_at(p: Parser, line: Int, col: Int, msg: String) : Parser / Console =
   if p_failed(p) { p }
-  # An interpolation fragment is parsed apart from its file, and its
-  # span names no file the user wrote. `check_interp_parses` reports
-  # the failure against the real position.
+  # An interpolation body is parsed apart from its file: its source is
+  # the body alone. The string that holds it reports the failure.
   else if p.file == interp_parse_file() { p_mark_err(p, mk_diag(SevError, p.file, line, col, msg, [])) }
   else { p_fail_at(p, line, col, msg) }
 
@@ -691,18 +689,6 @@ fn parse_expr(p: Parser) : PExpr / Console {
   }
 }
 
-# Parse a single expression from raw source — the shape every
-# string-interpolation `#{...}` body takes. Only passes that run before
-# the resolver call it: from the lift on, a body is a tree.
-pub fn parse_interp_expr(src: String) : Option[Expr] / Console = parse_interp_toks(src, tokenize(src))
-
-#[doc("`parse_interp_expr` for a body whose first character sits at `line:col` of its file: every node it builds, types and patterns included, takes the position it has there.")]
-pub fn parse_interp_expr_at(src: String, line: Int, col: Int) : Option[Expr] / Console =
-  parse_interp_toks(src, map(tokenize(src), (t) => tok_at(t, line, col)))
-
-fn parse_interp_toks(src: String, toks: [Token]) : Option[Expr] / Console =
-  parse_expr(parser_new(interp_parse_file(), src, toks, "")).r
-
 # A later line of the body starts at column 1 of its own line.
 fn tok_at(t: Token, line: Int, col: Int) : Token =
   Token { ...t, line: line + t.line - 1, col: if t.line == 1 { col + t.col - 1 } else { t.col } }
@@ -786,7 +772,10 @@ fn subst_underscores(es: [Expr], replacement: Expr) : [Expr] {
 
 fn arg_has_placeholder(e: Expr) : Bool {
   match e.kind {
-    ESurface(sf)        -> any_arg_has_placeholder(surface_children(sf))
+    ESurface(sf)        -> match sf {
+      SfInterp(_, _, _) -> false
+      _                 -> any_arg_has_placeholder(surface_children(sf))
+    }
     EPlaceholder        -> true
     EInt(_, _)             -> false
     EReal(_, _)            -> false
@@ -912,7 +901,10 @@ fn subst_placeholder_expr(e: Expr, repl: Expr) : Expr {
 
 fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
   match k {
-    ESurface(sf)           -> ESurface(surface_map(sf, (x) => subst_placeholder_expr(x, repl)))
+    ESurface(sf)           -> match sf {
+      SfInterp(_, _, _) -> k
+      _                 -> ESurface(surface_map(sf, (x) => subst_placeholder_expr(x, repl)))
+    }
     EInt(_, _)             -> k
     EReal(_, _)            -> k
     EIntLit(_)            -> k
@@ -1711,15 +1703,7 @@ fn parse_primary(p: Parser) : PExpr / Console {
       let span = tok_source(p.src, t)
       ok_e(p_advance(p), mk_expr(EChar(decode_char(span)), t.line, t.col))
     }
-    TkString -> {
-      let span = tok_source(p.src, t)
-      let is_triple =
-        string_length(span) >= 6 and
-        match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
-        match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
-        match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
-      ok_e(p_advance(p), mk_expr(EStr(span, is_triple), t.line, t.col))
-    }
+    TkString -> parse_str_lit(p, t)
     TkUnderscore -> ok_e(p_advance(p), mk_expr(EUnder, t.line, t.col))
     TkDot -> {
       # `.tail` in expression position is a point-free section: it
@@ -1778,6 +1762,64 @@ fn parse_primary(p: Parser) : PExpr / Console {
     TkPercent -> parse_collection_lit(p, t)
     _ -> err_e(p_error_here(p, "expected expression"))
   }
+}
+
+# A string literal. Each `#{...}` body of one that interpolates is
+# parsed here, at the position it occupies in the file.
+fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
+  let span = tok_source(p.src, t)
+  let is_triple =
+    string_length(span) >= 6 and
+    match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
+    match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
+    match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
+  if span_interpolates(span, is_triple) {
+    let at = InterpPos { line: t.line, col: t.col + interp_lead(is_triple) }
+    let r = parse_interp_bodies(p, interp_parts(span, is_triple), at, [])
+    match r.r {
+      None        -> err_e(r.p)
+      Some(holes) -> ok_e(p_advance(r.p), mk_expr(ESurface(SfInterp(span, is_triple, holes)), t.line, t.col))
+    }
+  } else { ok_e(p_advance(p), mk_expr(EStr(span, is_triple), t.line, t.col)) }
+}
+
+fn parse_interp_bodies(p: Parser, parts: [IPart], at: InterpPos, acc: [Expr]) : PArgs / Console = match parts {
+  [] -> ok_args(p, list_reverse(acc))
+  [IpLit(piece, _), ...rest] -> parse_interp_bodies(p, rest, interp_pos_advance(at, piece, 0), acc)
+  [IpExp(src), ...rest] -> {
+    let body = interp_pos_body(at)
+    let toks = map(tokenize(src), (tk) => tok_at(tk, body.line, body.col))
+    let sub = parse_expr(Parser { ...p, file: interp_parse_file(), src: src, rest: toks, error: None,
+                                  allow_trailing_lambda: true, allow_record_lit: true })
+    match sub.r {
+      None    -> err_args(p_interp_fail(p, src, body, sub.p.error))
+      Some(x) -> parse_interp_bodies(p, rest, interp_pos_past(body, src), [x, ...acc])
+    }
+  }
+}
+
+fn interp_fail_head() : String = "cannot parse the interpolated expression"
+
+# A nested body that fails has already named itself; any other failure
+# names the body and keeps the parser's reason as a note.
+fn p_interp_fail(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Parser / Console = {
+  let own = concat_all([interp_fail_head(), " `", src, "`"])
+  match inner {
+    None -> p_interp_report(p, mk_diag(SevError, p.file, body.line, body.col, own, []))
+    Some(D(_, _, l, c, msg, notes)) ->
+      if starts_with(msg, interp_fail_head()) { p_interp_report(p, mk_diag(SevError, p.file, l, c, msg, notes)) }
+      else { p_interp_report(p, mk_diag(SevError, p.file, body.line, body.col, own, [DR(p.file, l, c, msg)])) }
+  }
+}
+
+fn p_interp_report(p: Parser, d: Diagnostic) : Parser / Console = match d {
+  D(sev, _, l, c, msg, notes) ->
+    if p.file == interp_parse_file() { p_mark_err(p, d) }
+    else {
+      diag_error_from_src(p.file, p.src, l, c, msg)
+      notes |> each((n) => match n { DR(_, _, _, m) -> diag_note(m) })
+      p_mark_err(p, D(sev, p.file, l, c, msg, map(notes, (n) => match n { DR(_, nl, nc, m) -> DR(p.file, nl, nc, m) })))
+    }
 }
 
 # `todo!(msg)` — `todo!` is a single token (lexer-fused).
