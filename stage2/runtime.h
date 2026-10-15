@@ -8785,7 +8785,7 @@ static double kai_int_to_real_raw(int64_t n) { return (double) n; }
 /* Truncating cast toward zero. Out-of-range, NaN and Inf collapse to 0. */
 static int64_t kai_real_to_int_raw(double r) {
     if (r != r) return 0;
-    if (r >  9.2233720368547748e18) return 0;
+    if (r >= 9223372036854775808.0) return 0;
     if (r < -9.2233720368547758e18) return 0;
     return (int64_t) r;
 }
