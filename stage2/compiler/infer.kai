@@ -395,9 +395,7 @@ fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => inf_map_stmt_exprs(s, f)),
                                     inf_map_opt_expr(tail, f))
     EPipe(a, b)          -> EPipe(f(a), f(b))
-    EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
-    EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
+    EDispatchPipe(op, a, b) -> EDispatchPipe(op, f(a), f(b))
     EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       EHandle(f(body), eff, eff_tyargs,
               inf_map_opt_expr(init_opt, f), alias_opt,
@@ -1133,9 +1131,7 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
     match tail { Some(t) -> collect_call_labels(t, a1) None -> a1 }
   }
   EPipe(a, b)         -> collect_pipe_labels(b, collect_call_labels(b, collect_call_labels(a, acc)))
-  EMapPipe(a, b)      -> collect_call_labels(b, collect_call_labels(a, acc))
-  EFlatMapPipe(a, b)  -> collect_call_labels(b, collect_call_labels(a, acc))
-  EFilterPipe(a, b)   -> collect_call_labels(b, collect_call_labels(a, acc))
+  EDispatchPipe(_, a, b) -> collect_call_labels(b, collect_call_labels(a, acc))
   EBang(inner)        -> collect_call_labels(inner, acc)
   ELitUnit(inner, _)  -> collect_call_labels(inner, acc)
   EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
@@ -1506,15 +1502,7 @@ fn walk_field_priv_children(file: String, cx: PrivCx,
     let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
     walk_field_priv_expr(file, cx, all_decls, b, a1)
   }
-  EMapPipe(a, b)     -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    walk_field_priv_expr(file, cx, all_decls, b, a1)
-  }
-  EFlatMapPipe(a, b) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    walk_field_priv_expr(file, cx, all_decls, b, a1)
-  }
-  EFilterPipe(a, b)  -> {
+  EDispatchPipe(_, a, b) -> {
     let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
     walk_field_priv_expr(file, cx, all_decls, b, a1)
   }
@@ -1822,15 +1810,7 @@ fn walk_coverage_expr(file: String, decls: [Decl], cx: CovCx,
       let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
       walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
     }
-    EMapPipe(a, b)     -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-    }
-    EFlatMapPipe(a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-    }
-    EFilterPipe(a, b)  -> {
+    EDispatchPipe(_, a, b) -> {
       let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
       walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
     }
@@ -8365,9 +8345,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     ERange(lo, hi, stp)        -> synth_range(st, lo, hi, stp, e.line, e.col)
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
-    EMapPipe(lhs, rhs)         -> synth_map_pipe(st, lhs, rhs, e.line, e.col)
-    EFlatMapPipe(lhs, rhs)     -> synth_flat_map_pipe(st, lhs, rhs, e.line, e.col)
-    EFilterPipe(lhs, rhs)      -> synth_filter_pipe(st, lhs, rhs, e.line, e.col)
+    EDispatchPipe(op, lhs, rhs) -> synth_pipe_dispatch(st, op, lhs, rhs, e.line, e.col)
     EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
     ETodo(msg)                 -> synth_todo(st, msg, e)
     EExternBody(_, _)          -> synth_extern_body(st, e)
@@ -9614,7 +9592,7 @@ fn arg_wants_vec_context(x: Expr, et: Ty) : Bool =
   if ty_vec_headed(et) {
     match x.kind {
       EList(_)       -> true
-      EMapPipe(_, _) -> true
+      EDispatchPipe(PoMap, _, _) -> true
       _              -> false
     }
   } else { false }
@@ -12683,8 +12661,7 @@ fn pipe_rejection_reason(head: SymId, op: String) : Option[String] {
   }
 }
 
-# Shared lowering for `EMapPipe` / `EFlatMapPipe` /
-# `EFilterPipe`. Resolves the LHS's head type, consults the head-owner
+# Shared lowering for `EDispatchPipe`. Resolves the LHS's head type, consults the head-owner
 # cache built once per compile from the module table, rewrites to
 # `<module>.<op>(lhs, f)` when the lookup is unambiguous, and runs the
 # standard call inference path (`synth_call` against an `EModCall`
@@ -12789,13 +12766,9 @@ fn pipe_stage_wants_container(env: TyEnv, sub: Subst, lhs_ty: Ty,
   }
 }
 
-# The operator the user typed, recovered from the op the pipe lowers to.
-fn pipe_surface_op(op: String) : String =
-  if op == "flat_map" { "||" } else if op == "filter" { "|?" } else { "|" }
-
 # The `|` → `|>` suggestion. Names the stage when it has one so the
 # message reads as the user's own code, not the desugared `map` call.
-fn emit_pipe_wants_apply(st: InferState, op: String, stage: Expr, param: Ty,
+fn emit_pipe_wants_apply(st: InferState, pop: PipeOp, stage: Expr, param: Ty,
                           elem: Option[Ty], line: Int, col: Int) : Unit / Console + File {
   let what = match callee_display_name(st, stage) {
     Some(nm) -> "`#{nm}` takes"
@@ -12806,13 +12779,14 @@ fn emit_pipe_wants_apply(st: InferState, op: String, stage: Expr, param: Ty,
     None     -> "the element"
   }
   diag_error(st.file, line, col,
-    concat_all(["`", pipe_surface_op(op), "` is element-wise; ", what, " `",
+    concat_all(["`", pipe_op_text(pop), "` is element-wise; ", what, " `",
       inf_ty_to_string(st.env.tab, param), "`, not `", elem_txt, "`"]))
   diag_help("did you mean `|>` (apply to the whole value)?")
 }
 
-fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
+fn synth_pipe_dispatch(st: InferState, pop: PipeOp, lhs: Expr, rhs: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let cf = pipe_op_core_fn(pop)
   let op = core_fn_name(cf)
 
 
@@ -12826,14 +12800,14 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           "left-hand side; got an unresolved type variable. Annotate ",
           "the LHS or restructure the pipeline."]), [])
       render_diag(perr)
-      let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+      let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
       mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
     }
     Some(head) -> match pipe_rejection_reason(hsym, op) {
       Some(msg) -> {
         let perr = mk_diag(SevError, rl.st.file, line, col, msg, [])
         render_diag(perr)
-        let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+        let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
         mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
       }
       None -> match find_head_owner(rl.st.env, hsym) {
@@ -12841,7 +12815,7 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           let perr = mk_diag(SevError, rl.st.file, line, col,
             concat_all(["no module declaring type `", head, "` is in scope"]), [])
           render_diag(perr)
-          let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+          let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
           mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
         }
         HLAmbiguous(mods) -> {
@@ -12850,7 +12824,7 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
               join_modules_for_diag(map(mods, (m) => "#{sym_name(rl.st.env.tab, m)}")),
               " all declare it. Use qualified type annotation."]), [])
           render_diag(perr)
-          let root = with_ty(mk_expr(EFlatMapPipe(rl.expr, rhs), line, col), TyAny)
+          let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
           mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
         }
         HLOk(owner) -> {
@@ -12916,7 +12890,7 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
           let pipe_callee = mk_expr(callee_kind, line, col)
           let st2 = match pipe_stage_wants_container(st_fresh.env, st_fresh.sub, rl.ty, rf.ty, elem) {
             Some(param) -> {
-              emit_pipe_wants_apply(st_fresh, op, rhs, param, elem, line, col)
+              emit_pipe_wants_apply(st_fresh, pop, rhs, param, elem, line, col)
               st_bump_err(st_fresh)
             }
             None ->
@@ -13205,25 +13179,6 @@ fn join_modules_for_diag(mods: [String]) : String {
   }
 }
 
-fn synth_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
-
-
-  synth_pipe_dispatch(st, CfPipeMap, lhs, rhs, line, col)
-
-fn synth_flat_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
-
-
-  synth_pipe_dispatch(st, CfPipeFlatMap, lhs, rhs, line, col)
-
-# `xs |? p` — filter-pipe. Mirrors `synth_map_pipe` /
-# `synth_flat_map_pipe` but resolves to `<module>.filter`. The
-# canonical signature `(xs: [a], p: (a) -> Bool / e) : [a] / e` is
-# enforced by the standard call-inference path (no special-casing).
-fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
-
-
-  synth_pipe_dispatch(st, CfPipeFilter, lhs, rhs, line, col)
-
 # Mutable provenance / masking pass.
 #
 # The bare `array_set` / `array_grow` builtins raise `Mutable` on the
@@ -13363,9 +13318,7 @@ fn collect_local_arrays_kind(k: ExprKind, acc: [LocalId], dmut: [SymId]) : [Loca
     EField(b, _)      -> collect_local_arrays(b, acc, dmut)
     EIndex(a, b)      -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
     EPipe(a, b)       -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
-    EMapPipe(a, b)    -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
-    EFlatMapPipe(a, b)-> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
-    EFilterPipe(a, b) -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
+    EDispatchPipe(_, a, b) -> collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
     ELambda(_, b)     -> collect_local_arrays(b, acc, dmut)
     ERecordLit(_, fs) -> collect_local_in_field_inits(fs, acc, dmut)
     EList(els)        -> collect_local_in_list_elems(els, acc, dmut)
@@ -13680,9 +13633,7 @@ fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [LocalId]) : [Loc
     EField(b, _)      -> collect_escaped_names(ids, b, acc)
     EIndex(a, b)      -> collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
     EPipe(a, b)       -> collect_escaped_names(ids, pipe_as_call(a, b), acc)
-    EMapPipe(a, b)    -> collect_escaped_via_pipe(ids, a, b, acc)
-    EFlatMapPipe(a, b)-> collect_escaped_via_pipe(ids, a, b, acc)
-    EFilterPipe(a, b) -> collect_escaped_via_pipe(ids, a, b, acc)
+    EDispatchPipe(_, a, b) -> collect_escaped_via_pipe(ids, a, b, acc)
     ELambda(_, b)     -> collect_escaped_names(ids, b, acc)
     # A record literal stores values into fields — that hands the
     # reference to a structured carrier the caller may inspect or
@@ -13985,13 +13936,7 @@ fn all_demands_local_kind(tab: SymTab, k: ExprKind, locals: [LocalId], escaped: 
       if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
       else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
     EPipe(a, b)       -> all_demands_local(tab, pipe_as_call(a, b), locals, escaped, opaque, dmut)
-    EMapPipe(a, b)    ->
-      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
-    EFlatMapPipe(a, b)->
-      if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
-      else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
-    EFilterPipe(a, b) ->
+    EDispatchPipe(_, a, b) ->
       if not all_demands_local(tab, a, locals, escaped, opaque, dmut) { false }
       else { all_demands_local(tab, b, locals, escaped, opaque, dmut) }
     ELambda(_, b)     -> all_demands_local(tab, b, locals, escaped, opaque, dmut)
@@ -14848,7 +14793,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
           }
           # a Vec-annotated map-pipe chain collects into the vec
           # (pre-sized when the head is a pure range).
-          EMapPipe(_, _) -> {
+          EDispatchPipe(PoMap, _, _) -> {
             let exp_resolved = st_annot_ty(st, te)
             check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
@@ -16149,7 +16094,7 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
     # position collects into a vec. Pure range-headed chains rewrite to
     # the pre-sized collect combinator (one buffer, zero intermediates);
     # anything else materialises once through `vec_from_list`.
-    EMapPipe(_, _) -> {
+    EDispatchPipe(PoMap, _, _) -> {
       let exp = apply_ty(st.sub, expected)
       if ty_is_fixed_vec(exp) { check_map_pipe_fixed_collect(st, e, exp, e.line, e.col) }
       else if ty_is_vec_head(exp) { check_map_pipe_vec_collect(st, e, e.line, e.col) }

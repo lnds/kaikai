@@ -5,9 +5,9 @@
 # ExprKind's sub-expression positions; ownership walkers descend through
 # it instead of enumerating the variants themselves. This audit finds
 # functions in the perceus-owned files that still pattern-match the
-# pure-traversal canary variants (EMapPipe / EFlatMapPipe / EFilterPipe
-# — no walker ever treats those specially, so matching one means the
-# function replicates the position enumeration) and compares the set
+# pure-traversal canary variant (EDispatchPipe — no walker ever treats
+# it specially, so matching it means the function replicates the
+# position enumeration) and compares the set
 # against the committed baseline.
 #
 # - A function NOT in the baseline fails the audit: new walkers must
@@ -24,7 +24,7 @@ FILES="$(echo stage2/compiler/perceus*.kai) stage2/compiler/emit_tcrec_live.kai"
 observed=$(mktemp)
 for f in $FILES; do
   [ -f "$f" ] || continue
-  grep -n 'EMapPipe(\|EFlatMapPipe(\|EFilterPipe(' "$f" | cut -d: -f1 | while read -r ln; do
+  grep -n 'EDispatchPipe(' "$f" | cut -d: -f1 | while read -r ln; do
     awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=($1=="pub")?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
   done | sort -u | sed "s|^|$(basename "$f") |"
 done | sort > "$observed"
