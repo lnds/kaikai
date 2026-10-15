@@ -89,6 +89,26 @@ fails the build naming the package and the `.pc`. Declarative only —
 no build scripts, no free-form flags. `CFLAGS` keeps precedence as the
 escape hatch; `KAI_NATIVE_DEPS=0` disables the channel.
 
+A package binding several libraries keys a table by module instead,
+so a consumer needs only the libraries of the modules it imports:
+
+```text
+[native.sqlite]               # module `sqlite` of this package
+sources = ["c/sqlite_shim.c"]
+libs = ["sqlite3"]
+
+[native."db.pg"]              # a nested module path is quoted
+sources = ["c/pg_shim.c"]
+pkg-config = ["libpq"]
+```
+
+A module table takes the same keys as `[native]` and joins a build
+only when the build imports that module, directly or transitively.
+The module path is relative to the package (`[native.sqlite]` for its
+`sqlite.kai`). A bare `[native]` still applies to every build of the
+package, and its `include`/`pkg-config` reach the module tables'
+sources too.
+
 ## Shell completions (`[completions]`)
 
 A package declares the completion scripts it ships; `kai install`

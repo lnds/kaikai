@@ -11,23 +11,48 @@ import cli_proc
 import cli_sys
 import cli_toolchain
 
-#[doc("One declaration of a package: its root (`dir`), a `src`/`inc`/`libdir`/`lib`/`pc` entry of its `[native]` table, or a `pc-cflags`/`pc-libs` answer.")]
-pub type Native = { pkg: String, kind: String, value: String }
+#[doc("One declaration of a package: its root (`dir`), a `src`/`inc`/`libdir`/`lib`/`pc` entry of one of its native tables, or a `pc-cflags`/`pc-libs` answer; `module` names the `[native.<module>]` table, empty for `[native]`.")]
+pub type Native = { pkg: String, module: String, kind: String, value: String }
 
-# The `[native]` table's lines joined into one blob; whole-line comments blank out.
-fn native_blob(ls: [String], insec: Bool, acc: String) : String =
+# The spelling of the native table a header line opens: `[native]` is
+# `Some("")`, `[native.m]` `Some("m")`, `[native."a.b"]` `Some("\"a.b\"")`.
+fn spelling(line: String) : Option[String] {
+  let t = string.trim(line)
+  let inner = if string.starts_with(t, "[") and string.ends_with(t, "]") {
+    string.trim(string_slice(t, 1, string_length(t) - 2))
+  } else {
+    ""
+  }
+  match string.drop_prefix(inner, "native") {
+    Some("") -> Some("")
+    Some(rest) -> string.drop_prefix(string.trim_left(rest), ".").map(string.trim)
+    None -> None
+  }
+}
+
+fn quoted(m: String) : Bool =
+  string_length(m) >= 2 and string.starts_with(m, "\"") and string.ends_with(m, "\"")
+
+# An unquoted dotted spelling is a TOML table nested below a module table, not a module.
+fn table_of(line: String) : Option[String] =
+  match spelling(line) {
+    Some(m) if quoted(m) -> Some(string_slice(m, 1, string_length(m) - 2))
+    Some(m) if string_contains(m, ".") -> None
+    other -> other
+  }
+
+# The lines of one native table joined into one blob; whole-line comments blank out.
+fn native_blob(ls: [String], module: String, insec: Bool, acc: String) : String =
   match ls {
     [] -> acc
     [line, ...rest] -> {
       let t = string.trim_left(line)
-      if string.trim_right(t) == "[native]" {
-        native_blob(rest, true, acc)
-      } else if string.starts_with(t, "[") {
-        native_blob(rest, false, acc)
+      if string.starts_with(t, "[") {
+        native_blob(rest, module, table_of(t) == Some(module), acc)
       } else if insec {
-        native_blob(rest, true, acc ++ " " ++ (if string.starts_with(t, "#") { "" } else { line }))
+        native_blob(rest, module, true, acc ++ " " ++ (if string.starts_with(t, "#") { "" } else { line }))
       } else {
-        native_blob(rest, false, acc)
+        native_blob(rest, module, false, acc)
       }
     }
   }
@@ -62,8 +87,7 @@ fn quoted_strings(s: String) : [String] {
     | (p => p.snd)
 }
 
-fn entries(dir: String) : [(String, String)] / File {
-  let blob = native_blob(string.split(cli_fs.read_or_empty("#{dir}/kai.toml"), "\n"), false, "")
+fn entries(blob: String) : [(String, String)] =
   [
     ("sources", "src"),
     ("include", "inc"),
@@ -75,51 +99,92 @@ fn entries(dir: String) : [(String, String)] / File {
       Some(body) -> quoted_strings(body) | (v => (k.snd, v))
       None -> []
     })
-}
 
-fn package(name: String, dir: String) : [Native] / File {
-  let own = entries(dir)
+fn table(name: String, dir: String, ls: [String], module: String) : [Native] =
+  entries(native_blob(ls, module, false, ""))
     | (e => {
       let v = if e.fst == "lib" or e.fst == "pc" or path.is_absolute(e.snd) {
         e.snd
       } else {
         "#{dir}/#{e.snd}"
       }
-      Native { pkg: name, kind: e.fst, value: v }
+      Native { pkg: name, module, kind: e.fst, value: v }
     })
-  [Native { pkg: name, kind: "dir", value: dir }, ...own]
+
+fn nested_spelling(line: String) : [String] =
+  match spelling(line) {
+    Some(m) if not quoted(m) and string_contains(m, ".") -> [m]
+    _ -> []
+  }
+
+fn package(name: String, dir: String) : Result[[Native], Int] / Stderr + File {
+  let ls = manifest_lines(dir)
+  match list.head(ls || nested_spelling) {
+    Some(m) -> cli_err.fail(
+      "package '#{name}' declares [native.#{m}]; a nested module path is quoted: [native.\"#{m}\"]",
+      1
+    )
+    None -> Ok([Native { pkg: name, module: "", kind: "dir", value: dir }, ...tables(name, dir, ls)])
+  }
 }
 
-fn dedupe(xs: [Native], seen: [String]) : [Native] =
+fn tables(name: String, dir: String, ls: [String]) : [Native] {
+  let modules = unique(ls || (l => match table_of(l) {
+    Some(m) -> [m]
+    None -> []
+  }))
+  modules || (m => table(name, dir, ls, m))
+}
+
+fn manifest_lines(dir: String) : [String] / File = string.split(cli_fs.read_or_empty("#{dir}/kai.toml"), "\n")
+
+#[doc("The declarations with repeats dropped: a source, library or library dir once in the build, an include dir or pkg-config name once per table.")]
+pub fn dedupe(xs: [Native], seen: [String]) : [Native] =
   match xs {
     [] -> []
     [x, ...rest] -> {
-      let scope = if x.kind == "inc" or x.kind == "pc" { x.pkg } else { "" }
+      let scope = if x.kind == "inc" or x.kind == "pc" { "#{x.pkg}\t#{x.module}" } else { "" }
       let k = "#{scope}\t#{x.kind}\t#{x.value}"
       if seen.contains(k) { dedupe(rest, seen) } else { [x, ...dedupe(rest, [k, ...seen])] }
     }
   }
 
-#[doc("Every package's native declarations — the root package first, then each resolved dependency — deduplicated.")]
+#[doc("Every package's native declarations: the root package first, then each resolved dependency.")]
 pub fn collect(
   t: Toolchain,
   dir: String,
   scratch: String
 ) : Result[[Native], Int] / Stderr + Env + File + Ffi {
-  let root = package(cli_manifest.package_name(dir).unwrap_or("."), dir)
-  let deps = if cli_manifest.has_dependencies(dir) {
+  let roots = if cli_manifest.has_dependencies(dir) {
     let kaipkg = cli_pkg.ensure_kaipkg(t)!
-    cli_pkg.dep_roots(t, kaipkg, dir, true, scratch) || (d => package(d.fst, d.snd))
+    cli_pkg.dep_roots(t, kaipkg, dir, true, scratch)
   } else {
     []
   }
-  Ok(dedupe(root ++ deps, []))
+  packages([(cli_manifest.package_name(dir).unwrap_or("."), dir), ...roots])
 }
+
+fn packages(roots: [(String, String)]) : Result[[Native], Int] / Stderr + File =
+  match roots {
+    [] -> Ok([])
+    [r, ...rest] -> {
+      let own = package(r.fst, r.snd)!
+      let more = packages(rest)!
+      Ok(own ++ more)
+    }
+  }
+
+#[doc("Who declares `n`: its package, and its module table when it has one.")]
+pub fn declarer(n: Native) : String =
+  if n.module == "" { "package '#{n.pkg}'" } else { "package '#{n.pkg}' [native.\"#{n.module}\"]" }
 
 fn sources(info: [Native]) : [Native] = info |? (n => n.kind == "src")
 
-fn of_kind(info: [Native], pkg: String, kind: String) : [String] =
-  info |? (n => n.pkg == pkg and n.kind == kind) | (n => n.value)
+# A source compiles with its own table's `include`/pkg-config and its package's `[native]` ones.
+fn of_kind(info: [Native], src: Native, kind: String) : [String] =
+  info
+    |? (n => n.pkg == src.pkg and (n.module == "" or n.module == src.module) and n.kind == kind)
+    | (n => n.value)
 
 fn unique(xs: [String]) : [String] =
   list.reverse(xs |> list.foldl([], (acc, x) => if acc.contains(x) { acc } else { [x, ...acc] }))
@@ -127,8 +192,7 @@ fn unique(xs: [String]) : [String] =
 fn all_of_kind(info: [Native], kind: String) : [String] =
   unique(info |? (n => n.kind == kind) | (n => n.value))
 
-fn pc_cflags(info: [Native], pkg: String) : [String] =
-  of_kind(info, pkg, "pc-cflags") || cli_proc.words
+fn pc_cflags(info: [Native], src: Native) : [String] = of_kind(info, src, "pc-cflags") || cli_proc.words
 
 #[doc("The packages that ship native C sources, once each, in order.")]
 pub fn source_packages(info: [Native]) : [String] = unique(sources(info) | (n => n.pkg))
@@ -137,7 +201,7 @@ pub fn source_packages(info: [Native]) : [String] = unique(sources(info) | (n =>
 pub fn missing_sources(info: [Native]) : [String] / Ffi =
   sources(info)
     |? (n => not cli_sys.is_file(n.value))
-    | (n => "kai: error: package '#{n.pkg}' declares native source #{n.value}, but it does not exist")
+    | (n => "kai: error: #{declarer(n)} declares native source #{n.value}, but it does not exist")
 
 fn headers_below(dir: String) : [String] / File + Ffi =
   if not cli_sys.is_dir(dir) {
@@ -152,25 +216,25 @@ fn headers_below(dir: String) : [String] / File + Ffi =
 fn object_key(t: Toolchain, info: [Native], n: Native) : String / File + Ffi {
   let head = cli_hash.lines([
     t.cc,
-    string.join(t.cflags_compile ++ pc_cflags(info, n.pkg), " "),
+    string.join(t.cflags_compile ++ pc_cflags(info, n), " "),
     cli_toolchain.host(t)
   ])
-  let headers = of_kind(info, n.pkg, "inc") || headers_below | (h => cli_hash.Bytes(h))
+  let headers = of_kind(info, n, "inc") || headers_below | (h => cli_hash.Bytes(h))
   cli_hash.digest([head, cli_hash.Bytes(n.value), ...headers])
 }
 
 fn compile_one(t: Toolchain, info: [Native], n: Native, obj: String) : Bool / Ffi {
-  let incs = of_kind(info, n.pkg, "inc") || (d => ["-I", d])
+  let incs = of_kind(info, n, "inc") || (d => ["-I", d])
   let argv = cli_proc.words(t.cc)
     ++ t.cflags_compile
     ++ incs
-    ++ pc_cflags(info, n.pkg)
+    ++ pc_cflags(info, n)
     ++ ["-c", n.value, "-o", obj]
   cli_proc.run(argv, cli_proc.inherit()) == 0
 }
 
 fn compile_failed(n: Native) : Result[String, Int] / Stderr =
-  cli_err.fail("failed to compile native source #{n.value} (package '#{n.pkg}')", 1)
+  cli_err.fail("failed to compile native source #{n.value} (#{declarer(n)})", 1)
 
 fn cached_object(
   t: Toolchain,
@@ -232,7 +296,7 @@ pub fn lib_flags(info: [Native]) : [String] =
     ++ (all_of_kind(info, "lib") | (l => "-l#{l}"))
 
 fn stray_sources_note(info: [Native], d: Native) : [String] / File + Ffi {
-  let declares = sources(info) |> list.any(n => n.pkg == d.pkg)
+  let declares = sources(tables(d.pkg, d.value, manifest_lines(d.value))) |> list.any(n => n.pkg == d.pkg)
   let stray = if declares or (not cli_sys.is_dir(d.value)) {
     []
   } else {
@@ -272,7 +336,7 @@ pub fn link_hint(info: [Native]) : Unit / Stderr + Env + File + Ffi =
     libs
       |> foreach(
         n => Stderr.eprint(
-          "kai: note: package '#{n.pkg}' links system library '#{n.value}' (-l#{n.value}); if the linker could not find it, name its directory in that package's [native] `libdirs` or its .pc in `pkg-config`, or install it if it is absent."
+          "kai: note: #{declarer(n)} links system library '#{n.value}' (-l#{n.value}); if the linker could not find it, name its directory in that table's `libdirs` or its .pc in `pkg-config`, or install it if it is absent."
         )
       )
     info
