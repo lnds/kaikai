@@ -20,7 +20,12 @@ protocol, no compiler change required.
 pub fn map      (xs: T[A], f: (A) -> B / e)        : T[B] / e
 pub fn flat_map (xs: T[A], f: (A) -> T[B] / e)     : T[B] / e
 pub fn filter   (xs: T[A], p: (A) -> Bool / e)     : T[A] / e
+pub fn each     (xs: T[A], f: (A) -> Unit / e)     : Unit / e
 ```
+
+`each` runs `f` for its effect on every element, in the order `map`
+visits them. Every strict type below exports it (`[T]` through the
+core `each`); the mutable `HashMap` / `HashSet` carry `/ Mutable`.
 
 ## Examples
 
