@@ -500,7 +500,15 @@ fn main() : Int / Stdout = {
 at the top of the file makes them available.
 
 There is no `for x in xs` loop. Iterate with the map-pipe (`xs | (x =>
-...)`) or `xs |> each(f)` from the core.
+...)`) or `xs |> each(f)` from the core. The map-pipe yields a list, so
+when it is the tail of a `Unit` body, close it with `|> ignore`:
+
+```kaikai
+fn shout(xs: [String]) : Unit / Stdout =
+  xs | (x => println("#{x}!")) |> ignore
+
+fn main() : Unit / Stdout = shout(["a", "b"])
+```
 
 ## Pipes
 

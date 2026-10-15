@@ -114,7 +114,7 @@ read short (`xs |> map(f) |> filter(p)`). The aliases re-export
 | `stdlib/core/result.kai`|                12 |                    6 |                      6 | `result_map`, `result_and_then`, `result_unwrap_or`, `result_or_else`, `result_unwrap_or_else`, `result_collect` — all #219 collisions with `list` / `option` exports |
 | `stdlib/core/char.kai`  |                 8 |                    8 |                      0 | none — character-domain names are unique across `stdlib/core/`    |
 | `stdlib/core/tuple.kai` |                 7 |                    7 |                      0 | helpers landed module-qualified only (`tuple.swap`, `tuple.map_fst`, `tuple.map_snd`, `tuple.map_pair`, `tuple.first`, `tuple.second`, `tuple.third`) — issue #348 |
-| `stdlib/core/io.kai`    |               n/a |                  n/a |                    n/a | exports a single `pub fn println`; already module-relative shape  |
+| `stdlib/core/io.kai`    |               n/a |                  n/a |                    n/a | exports `pub fn println` and `pub fn ignore`; already module-relative shape |
 
 **Issue #219** (typer EModCall lookup is name-only) is the gating
 follow-up for the 11 `opt_*` / `result_*` survivors and the lone
@@ -466,7 +466,7 @@ Single top-level module. Per-function effects: `print` / `println` /
 `eprint` / `eprintln` declare `/ Console`; `read_line` / `read_all`
 declare `/ Stdin`.
 
-- `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`, `read_bytes(n)` *(byte-oriented stdin, shipped via #453 as the `read_bytes` core builtin + `Stdin.read_bytes` effect op; LSP framing precursor for #447)*
+- `io` — `print`, `println`, `ignore` (explicit discard), `eprint`, `eprintln`, `read_line`, `read_all`, `read_bytes(n)` *(byte-oriented stdin, shipped via #453 as the `read_bytes` core builtin + `Stdin.read_bytes` effect op; LSP framing precursor for #447)*
 - TTY detection — `Stdout.is_tty()` / `Stderr.is_tty()` / `Stdin.is_tty()` effect ops bridging to `isatty(3)` on fd 1/2/0 *(shipped via #1590; the ANSI-colour gate, pairs with the `NO_COLOR` override via `Env.get`)*
 
 ### fs (`/ File`)
