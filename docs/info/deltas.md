@@ -26,8 +26,13 @@ Every entry is verified against the compiler; when in doubt,
 - No `throw` / `try` / `catch` — use `Result[a, e]` with the `expr!`
   propagation postfix, or an effect whose op returns `Nothing`.
 - No `for x in xs`, no C-style `for (;;)`, no `break` / `continue`.
-  Iterate with pipes — `xs | (x => ...)` or `xs |> each(f)`. The
-  `for` keyword appears only in `impl Proto for T`.
+  Iterate with pipes — `xs |! f` for an effect, `xs | (x => ...)` for a
+  new list. The `for` keyword appears only in `impl Proto for T`.
+- Drop a result on purpose. A non-`Unit` value used as a
+  statement is a `kai lint` warning; close it with `|> ignore` or bind
+  it with `let _ =`.
+- A list always ends. A range with no end is a `Seq`, written
+  `lazy [0..]`; a bare `[0..]` is an error.
 - No list comprehensions: `[x*2 for x in xs]` → `xs | (x => x * 2)`.
 - The cons pattern is `[h, ...t]` — not `x:xs`, not `[h|t]`.
 - Generics use brackets — `Foo[T]`, `[Int]` — never `Foo<T>`. Angle
