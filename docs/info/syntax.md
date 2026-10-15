@@ -25,7 +25,7 @@ continues) only while the parser still expects more:
   separator (`,`, `:`).
 
 A binary operator also continues from LEADING position on the next
-line — the four pipes `|>` `|` `||` `|?` and every binary operator
+line — the five pipes `|>` `|` `||` `|?` `|!` and every binary operator
 that cannot start an expression: `or`, `and`, `==` `!=` `<` `>` `<=`
 `>=`, `++`, `+`, `*`, `/`, `^`. The two that CAN start an expression
 are excluded: `-` (unary minus) and `%` (opens `%{ }` / `%[ ]`
@@ -499,20 +499,21 @@ fn main() : Int / Stdout = {
 `while` and `until` live in the `loop` stdlib package — `import loop`
 at the top of the file makes them available.
 
-There is no `for x in xs` loop. Iterate with the map-pipe (`xs | (x =>
-...)`) or `xs |> each(f)` from the core. The map-pipe yields a list, so
-when it is the tail of a `Unit` body, close it with `|> ignore`:
+There is no `for x in xs` loop. To run something for its effect on
+every element, use the each-pipe `|!`: it calls the head type's `each`
+and returns `Unit`, so it closes a `Unit` body. The map-pipe `|` builds
+a new collection instead; dropping that value is a lint warning.
 
 ```kaikai
 fn shout(xs: [String]) : Unit / Stdout =
-  xs | (x => println("#{x}!")) |> ignore
+  xs |! println("#{.}!")
 
 fn main() : Unit / Stdout = shout(["a", "b"])
 ```
 
 ## Pipes
 
-Four pipes, each with one intent. See `kai info pipes` for the full
+Five pipes, each with one intent. See `kai info pipes` for the full
 treatment.
 
 ```kaikai
@@ -528,10 +529,15 @@ fn main() : Unit / Stdout = {
   let d = [1, 2, 3] |? gt1                     # |? filter
   let e = 5 |> sub(7, _)                       # _ placeholder
   Stdout.print("a=#{a} b len=#{b.length()} c len=#{c.length()} d len=#{d.length()} e=#{e}")
+  [1, 2, 3] |! println("#{.}")                 # |! each, returns Unit
 }
 ```
 
-A `|`, `||` or `|?` stage owns every `.` on its right side: a bare
+`|!` runs its stage for its effect on every element. The stage must
+return `Unit` (a `Nothing` stage is fine), the pipe returns `Unit`, and
+no pipe may follow it.
+
+A `|`, `||`, `|?` or `|!` stage owns every `.` on its right side: a bare
 `.`, a `.` followed by a postfix chain (`.name`, `.a.b`, `.f(v)`), and
 a `.` inside a `#{...}` body. They all stand for the same element.
 
@@ -540,7 +546,7 @@ fn is_leap(y: Int) : Bool = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 fn add(a: Int, b: Int) : Int = a + b
 
 fn main() : Unit / Stdout = {
-  let _ = [1900, 2000, 2024] | println("#{.}: #{is_leap(.)}")
+  [1900, 2000, 2024] |! println("#{.}: #{is_leap(.)}")
   let ys = [1, 2, 3] | add(., 10)              # [11, 12, 13]
   let big = [1, 5, 9] |? . > 3                 # [5, 9]
   println("#{ys} #{big}")
@@ -567,7 +573,7 @@ fn main() : Unit / Stdout = {
 Outside a stage nothing changes: a `.` in a call argument stands for a
 lambda over the innermost argument (`run_with(. + 10, 5)`), so
 `xs |> each(println(.))` passes `println` the identity function. Write
-`xs | println(.)` instead.
+`xs |! println(.)` instead.
 
 ## Point-free sections
 
@@ -594,7 +600,7 @@ fn main() : Unit / Stdout = {
 The receiver is supplied implicitly (first argument by UFCS), so
 `.starts_with("a")` reads its written argument after the receiver.
 A section is the placeholder `.` with a postfix chain, so on the right
-side of `|`, `||` or `|?` it is the stage's element like any other `.`,
+side of `|`, `||`, `|?` or `|!` it is the stage's element like any other `.`,
 a section nested in a call argument there included. Elsewhere it is a
 combinator argument (`.map`, `.and_then`, `.filter`). A point-free
 section is unary; to drop a positional argument, use the `|>`
@@ -850,7 +856,7 @@ concat        ++                                     (right-assoc)
 comparison    ==  !=  <  >  <=  >=                   (non-associative)
 logical and   and                                    (short-circuit)
 logical or    or                                     (short-circuit)
-pipes         |>  |  ||  |?                          (left-assoc)
+pipes         |>  |  ||  |?  |!                      (left-assoc)
 ```
 
 `a < b < c` is a syntax error (non-associative). Use `a < b and b < c`.

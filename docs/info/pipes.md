@@ -1,7 +1,7 @@
 # pipes
 
-Apply (`|>`), map (`|`), flat-map (`||`), filter (`|?`) — four pipe
-operators, each with one intent.
+Apply (`|>`), map (`|`), flat-map (`||`), filter (`|?`), each (`|!`) —
+five pipe operators, each with one intent.
 
 ## Description
 
@@ -9,10 +9,11 @@ operators, each with one intent.
 syntactic sugar so `x |> f(a, b)` reads like `x.f(a, b)` would in
 an OO language but desugars to `f(x, a, b)`.
 
-`|`, `||`, and `|?` DISPATCH BY CONVENTION on the LHS's head type.
-Any type `T` that exports `pub fn map / flat_map / filter` with the
-canonical signatures participates automatically — no annotation, no
-protocol, no compiler change required.
+`|`, `||`, `|?` and `|!` DISPATCH BY CONVENTION on the LHS's head
+type. Any type `T` that exports `pub fn map / flat_map / filter / each`
+with the canonical signatures participates automatically — no
+annotation, no protocol, no compiler change required. A head whose
+owner exports no such function is an error; there is no fallback.
 
 ## Canonical signatures
 
@@ -24,8 +25,41 @@ pub fn each     (xs: T[A], f: (A) -> Unit / e)     : Unit / e
 ```
 
 `each` runs `f` for its effect on every element, in the order `map`
-visits them. Every strict type below exports it (`[T]` through the
-core `each`); the mutable `HashMap` / `HashSet` carry `/ Mutable`.
+visits them, and is what `|!` calls. Every type below exports it (`[T]`
+through the core `each`); the mutable `HashMap` / `HashSet` carry
+`/ Mutable`.
+
+## `|!` — for each element, for its effect
+
+`xs |! f` calls the head owner's `each(xs, f)`. The stage must return
+`Unit`; this is checked at the pipe, so a stage returning a value is an
+error that points at the pipe, not a mismatch inside `each`. A stage
+returning `Nothing` is fine. The pipe's type is `Unit`, and the stage's
+effects flow out to the caller. Because it returns `Unit`, `|!` ends a
+pipeline: any pipe after it is an error.
+
+```kaikai
+import stream
+
+fn is_leap(y: Int) : Bool = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+
+fn main() : Unit / Stdout = {
+  stream.from_list([1, 2, 3]) |! println("#{.}")     # a lazy stream runs
+  [1900, 1994, 2000, 2024] |! println("#{.}: #{is_leap(.)}")
+}
+```
+
+Use `|!`, not `|`, to iterate for effect: `|` builds a new collection,
+and over a lazy `Stream` it runs nothing until something consumes the
+result. `xs |> each(f)` resolves `each` by name, so with `import
+stream` in scope it reaches `stream.each` even for a list; `|!` picks
+`each` by the head type.
+
+```kaikai-neg
+fn double(x: Int) : Int = x * 2
+
+fn main() : Unit = [1, 2, 3] |! double         # error: stage returns `Int`
+```
 
 ## Examples
 
@@ -52,6 +86,9 @@ fn main() : Unit / Stdout = {
   # reference:
   "via pipe" |> (s => Stdout.print(s))
 
+  # |! runs a stage for its effect on every element:
+  [1, 2] |! (n => Stdout.print("n=#{n}"))
+
   # Composing pipes (left-assoc):
   let chain = [1..10] |? gt1 | (n => n * 2) |> sum
   Stdout.print("chain=#{chain}")
@@ -60,7 +97,7 @@ fn main() : Unit / Stdout = {
 
 ## `.` in a stage
 
-The right side of `|`, `||` or `|?` is a stage, and the stage owns
+The right side of `|`, `||`, `|?` or `|!` is a stage, and the stage owns
 every `.` in it: a bare `.`, a `.` with a postfix chain (`.name`,
 `.a.b`, `.f(v)`), a `.` in a call argument, and a `.` inside a `#{...}`
 body. All of them are the same element.
@@ -72,7 +109,7 @@ fn add(a: Int, b: Int) : Int = a + b
 
 fn main() : Unit / Stdout = {
   let people = [Person { name: "ana", age: 30 }, Person { name: "bo", age: 41 }]
-  let _ = people | println("#{.name} is #{.age}")
+  people |! println("#{.name} is #{.age}")
   let next = people | add(.age, 1)             # [31, 42]
   let pairs = [1, 2] || [., . * 10]            # [1, 10, 2, 20]
   let grown = people |? .age > 35 | .name      # ["bo"]
@@ -84,7 +121,7 @@ fn main() : Unit / Stdout = {
   barrier.
 - `|>` is not a stage: it keeps `_`, and a `.` in its call is the
   innermost-argument lambda, so `xs |> each(println(.))` hands
-  `println` the identity function. Write `xs | println(.)`.
+  `println` the identity function. Write `xs |! println(.)`.
 - Two nested stages that both use `.` are an error. Name one element
   with `(x) => ...`.
 - Outside any stage, `.` inside `#{...}` is an error.
@@ -98,8 +135,8 @@ fn main() : Unit / Stdout = {
 
 ## stdlib types that ride the pipes
 
-These stdlib types export the canonical `map` / `flat_map` / `filter`,
-so they dispatch through `|` / `||` / `|?`:
+These stdlib types export the canonical `map` / `flat_map` / `filter`
+/ `each`, so they dispatch through `|` / `||` / `|?` / `|!`:
 
 ```text
 [T]                  element a            (core/list)
@@ -118,7 +155,8 @@ Queue[a]             element a            (collections/queue)
 collapse duplicate output keys. The mutable `HashMap` / `HashSet`
 combinators carry `/ Mutable`.
 
-`Option` and `Result` deliberately do NOT ride the pipes — use `!`
+`Option` and `Result` deliberately do NOT ride the pipes, `|!`
+included — use `!`
 for propagation (`x!`) or `and_then` for explicit chaining.
 
 Non-List head dispatch is gated on edition `hanga-roa` or later.

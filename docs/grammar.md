@@ -156,6 +156,7 @@ three may be bound as a local identifier.
 | `PIPE_APPLY`               | `|>`    |
 | `BAR_BAR`                  | `||`    |
 | `PIPE_QUESTION`            | `|?`    |
+| `PIPE_EACH`                | `|!`    |
 | `PLUS`, `MINUS`, `STAR`    | `+` `-` `*` |
 | `SLASH`                    | `/`     |
 | `PERCENT`                  | `%`     |
@@ -568,7 +569,7 @@ directly (see §3 for the table). Each `parse_<level>` function in
 ```
 expr        ::= pipe_expr
 pipe_expr   ::= or_expr (pipe_op or_expr)*
-pipe_op     ::= '|>' | '|' | '||' | '|?'
+pipe_op     ::= '|>' | '|' | '||' | '|?' | '|!'
 or_expr     ::= and_expr ('or' and_expr)*
 and_expr   ::= cmp_expr ('and' cmp_expr)*
 cmp_expr    ::= concat_expr (cmp_op concat_expr)?     (* non-associative *)
@@ -919,7 +920,7 @@ one precedence-climbing loop (`bin_level` in `parse.kai`).
 |     7 | `==`, `!=`, `<`, `>`, `<=`, `>=`              | **Non-associative**  | `parse_bin` (loop) |
 |     8 | `and`                                         | Left (short-circuit) | `parse_bin` (loop) |
 |     9 | `or`                                          | Left (short-circuit) | `parse_bin` (loop) |
-|    10 | `\|>`, `\|`, `\|\|`, `\|?`                     | Left                 | `parse_bin` (loop) |
+|    10 | `\|>`, `\|`, `\|\|`, `\|?`, `\|!`              | Left                 | `parse_bin` (loop) |
 
 Notes:
 
@@ -991,11 +992,13 @@ xs |> f(a, _, b)       ≡  { let __p = xs in f(a, __p, b) }   (* placeholder *)
 xs | f                 ≡  <head>.map(xs, f)         (* map *)
 xs || f                ≡  <head>.flat_map(xs, f)    (* flat-map *)
 xs |? p                ≡  <head>.filter(xs, p)      (* filter *)
+xs |! f                ≡  <head>.each(xs, f)        (* each; f returns Unit *)
 ```
 
-The `|`, `||`, and `|?` pipes dispatch by head-type-of-LHS;
-participating types export `pub fn map / flat_map / filter` with the
-canonical signatures. `|>` is plain application — no dispatch.
+The `|`, `||`, `|?` and `|!` pipes dispatch by head-type-of-LHS;
+participating types export `pub fn map / flat_map / filter / each`
+with the canonical signatures. `|>` is plain application — no
+dispatch. `|!` returns `Unit`, so no pipe may follow it.
 
 The pipe placeholder `_` is recognised only inside the RHS argument
 list of `|>`. Multiple `_` in the same call are rejected (would

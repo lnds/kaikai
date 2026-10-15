@@ -62,9 +62,9 @@ fn label(n: Int) : String = if n > 0 { "pos" }   # missing else
 
 ## Pipes over nested calls and intermediate lets
 
-The four pipes (`|>` apply, `|` map, `||` flat-map, `|?` filter —
-see `kai info pipes`) read top-to-bottom in data-flow order. Reach
-for a pipeline before a stack of `let`s or nested calls.
+The five pipes (`|>` apply, `|` map, `||` flat-map, `|?` filter, `|!`
+each — see `kai info pipes`) read top-to-bottom in data-flow order.
+Reach for a pipeline before a stack of `let`s or nested calls.
 
 ```kaikai
 fn even(x: Int) : Bool = x % 2 == 0
@@ -94,6 +94,23 @@ fn main() : Unit / Stdout = {
 
 Use the intermediate-`let` form only when a step needs a name a
 reader benefits from, or the same value is consumed twice.
+
+## `|!` to iterate for effect
+
+When the point of a pass is its effect — printing, sending, writing —
+end the pipeline with `|!`. It returns `Unit`, so it closes a `Unit`
+body, and it calls the head type's own `each`.
+
+```kaikai
+fn main() : Unit / Stdout = {
+  [1..5] |? (. % 2 == 1) |! println("odd #{.}")
+}
+```
+
+The wrong reaches are `xs | f |> ignore`, which builds a list only to
+throw it away (and over a lazy `Stream` runs nothing), and
+`xs |> each(f)`, which picks `each` by name rather than by the head
+type.
 
 ## Point-free sections over throwaway lambdas
 
@@ -442,7 +459,7 @@ authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
 - `throw` / `try` / `catch` → `Result[a, e]` with postfix `!`, or an
   effect whose op returns `Nothing`
 - `async` / `await` → the `Spawn` effect (see `kai info fibers`)
-- `for x in xs { ... }` → `xs | (x => ...)` or `xs |> each(f)`
+- `for x in xs { ... }` → `xs |! f`; `xs | (x => ...)` when you want the new list
 - `return expr` → the last expression of a block IS its value
 - `self.x` / `this.x` → no implicit receiver; pass the value explicitly
 

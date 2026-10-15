@@ -1100,7 +1100,7 @@ boundaries.
 
 ### Pipe operators are convention-based, not protocol-based (#594)
 
-`|` (map pipe), `||` (flat-map pipe), and `|?` (filter pipe) do
+`|` (map pipe), `||` (flat-map pipe), `|?` (filter pipe), and `|!` (each pipe) do
 **not** dispatch through a protocol. Two of the structural rules
 this document enumerates make the protocol path unworkable for
 them, and a third makes the cost of a custom annotation surface
@@ -1115,8 +1115,8 @@ strictly worse than convention:
 Instead the typer keeps a per-compile **head-owner cache**:
 `[(head_type_name, [declaring_module])]`, built once from the
 post-`expand_imports` decl stream + module table. Any `pub type T`
-exported by a module whose `pub fn map / flat_map / filter` follow
-the canonical signatures participates in `|`, `||`, `|?`
+exported by a module whose `pub fn map / flat_map / filter / each`
+follow the canonical signatures participates in `|`, `||`, `|?`, `|!`
 automatically — no annotation, no compiler change. ahu's future
 `Source[T, e]`, henua's `EventBus[E]`, manutara stream/sink types
 opt in by declaring `pub type` + the canonical fns.
@@ -1128,7 +1128,11 @@ second, return wraps the same head type):
 pub fn map[A, B, e](xs: T[A], f: (A) -> B / e) : T[B] / e
 pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
 pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
+pub fn each[A, e](xs: T[A], f: (A) -> Unit / e) : Unit / e
 ```
+
+`|!` checks its stage's return against `Unit` at the pipe and types the
+pipe as `Unit`, whatever the export declares.
 
 A head carrying an `(element, row)` parameter list — a streaming
 carrier like `Stream[t, e]` (or ahu's `Source[t, e]`) whose effect
