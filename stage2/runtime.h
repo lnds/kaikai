@@ -8780,6 +8780,16 @@ static KaiValue *kai_core_real_to_string(KaiValue *v) {
     return r;
 }
 
+static double kai_int_to_real_raw(int64_t n) { return (double) n; }
+
+/* Truncating cast toward zero. Out-of-range, NaN and Inf collapse to 0. */
+static int64_t kai_real_to_int_raw(double r) {
+    if (r != r) return 0;
+    if (r >  9.2233720368547748e18) return 0;
+    if (r < -9.2233720368547758e18) return 0;
+    return (int64_t) r;
+}
+
 static KaiValue *kai_core_int_to_real(KaiValue *v) {
     int64_t n = (kai_is_int(v)) ? kai_intf(v) : 0;
     KaiValue *r = kai_real((double) n);
@@ -8787,18 +8797,9 @@ static KaiValue *kai_core_int_to_real(KaiValue *v) {
     return r;
 }
 
-/* Truncating cast toward zero. Out-of-range, NaN and Inf collapse to
- * 0 — kaikai has no IEEE 754 surface for the user yet, so the safer
- * default beats a UB conversion. Revisit when the math/real lane
- * adds NaN-aware predicates. */
 static KaiValue *kai_core_real_to_int(KaiValue *v) {
     if (!v || v->tag != KAI_REAL) { if (v) kai_decref(v); return kai_int(0); }
-    double r = v->as.r;
-    KaiValue *out;
-    if (r != r) out = kai_int(0);                       /* NaN */
-    else if (r >  9.2233720368547748e18) out = kai_int(0); /* > INT64_MAX */
-    else if (r < -9.2233720368547758e18) out = kai_int(0); /* < INT64_MIN */
-    else out = kai_int((int64_t) r);
+    KaiValue *out = kai_int(kai_real_to_int_raw(v->as.r));
     kai_decref(v);
     return out;
 }
