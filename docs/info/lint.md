@@ -46,42 +46,51 @@ a later phase, allowed or denied).
 ### discard_pure_value
 
 A block silently drops the value of any statement that is not its tail.
-When that dropped value is **pure and non-Unit**, it is dead code or a
-forgotten use:
+When that dropped value has a type other than `Unit` or `Nothing`, it
+is a forgotten use — whether or not the call that produced it performs
+an effect:
 
 ```kaikai
 fn area(w: Int, h: Int) : Int = w * h
 
-fn run() : Int {
-  area(3, 4)        # discard_pure_value: the Int result is dropped
-  0
+fn parse(s: String) : Result[Int, String] / Stdout = {
+  println(s)
+  Ok(s.length())
 }
 
-fn main() : Int = run()
+fn show(n: Int) : Unit / Stdout = println("#{n}")
+
+fn run() : Unit / Stdout = {
+  area(3, 4)        # discard_pure_value: the Int is dropped
+  parse("42")       # discard_pure_value: the Result is dropped
+  [1, 2] | show     # discard_pure_value: the [Unit] is dropped
+  println("done")
+}
+
+fn main() : Unit / Stdout = run()
 ```
 
-The lint fires only on a **provably pure** discard. An effectful discard
-is legitimate — the effect row already tracks the effect — so a call
-whose type carries a non-empty row is left alone, even when its result
-is non-Unit:
+To drop a value on purpose, say so: close it with `|> ignore` (a core
+function) or bind it with `let _ =`. Neither is flagged:
 
 ```kaikai
-effect Logger {
-  log(s: String) : Unit
+fn parse(s: String) : Result[Int, String] / Stdout = {
+  println(s)
+  Ok(s.length())
 }
 
-fn audit() : Int / Logger {
-  Logger.log("checked")
-  0
-}
+fn show(n: Int) : Unit / Stdout = println("#{n}")
 
-fn run() : Int / Logger {
-  audit()           # not flagged: audit performs Logger
-  0
+fn main() : Unit / Stdout = {
+  let _ = parse("42")
+  parse("7") |> ignore
+  [1, 2] | show |> ignore
 }
-
-fn main() : Int = 0
 ```
+
+The lint also stays silent on an indexed write `a[i] := v` (the write is
+the point, not the array it returns) and on a call whose result type is
+`Nothing`, which never returns.
 
 A value in **tail position** is the block's own result, never a discard,
 so it is never flagged.
@@ -318,7 +327,7 @@ one object per finding, stable schema.
 ```text
 [{"file": "src/main.kai", "line": 4, "col": 3,
   "rule": "discard_pure_value", "severity": "warning",
-  "message": "pure value of type Int discarded; bind it or drop the statement"}]
+  "message": "value of type Int discarded; close it with `|> ignore` or bind it with `let _ =`"}]
 ```
 
 ## A growing catalog
