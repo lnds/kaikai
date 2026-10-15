@@ -50,6 +50,22 @@ fn main() : Unit / Stdout = {
 `[u: Measure]` is the kind annotation — required because `u` ranges
 over units, not types.
 
+`math.real` rounding (`trunc`, `floor`, `ceil`, `round`,
+`round_half_even`, `round_to`) is unit-polymorphic, so a measured
+quantity rounds without stripping its unit:
+
+```kaikai
+import math.real
+
+unit m
+unit s
+
+fn main() : Unit / Stdout = {
+  let v: Real<m/s> = 100.0<m> / 9.58<s>
+  Stdout.print("#{real.round_to(v, 2)}")       # 10.44 m/s
+}
+```
+
 ## User-declared kinds
 
 `Measure` is not special — declare your own abelian kind and its
