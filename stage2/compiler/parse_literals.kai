@@ -2,7 +2,12 @@
 Decoding of integer, real, hex and character literal text.
 """)]
 
+import compiler.util
 import compiler.chars
+import compiler.diag
+import compiler.written
+import compiler.lex
+import compiler.interp_scan
 import compiler.escapes
 import compiler.lex_tokens
 import compiler.ast
@@ -265,3 +270,132 @@ pub fn fixed_lit_of_tok(src: String, t: Token) : Option[Expr] =
     TkInt128 -> Some(fixed_lit(src, t, 4, TyInt128))
     _ -> None
   }
+
+# A string literal. Each `#{...}` body of one that interpolates is
+# parsed here, at the position it occupies in the file.
+#[doc("Parses a string literal, including the bodies of its `#{...}` interpolations.")]
+pub fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
+  let span = tok_source(p.src, t)
+  let is_triple =
+    string_length(span) >= 6 and
+    match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
+    match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
+    match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
+  if span_interpolates(span, is_triple) {
+    let at = InterpPos { line: t.line, col: t.col + interp_lead(is_triple) }
+    let parts = interp_parts(span, is_triple)
+    let r = parse_interp_bodies(p, parts, at, [])
+    match r.r {
+      None        -> err_e(r.p)
+      Some(holes) -> ok_e(p_advance(r.p), mk_expr(ESurface(SfInterp(span, is_triple, parts, holes)), t.line, t.col))
+    }
+  } else { ok_e(p_advance(p), mk_expr(EStr(span, is_triple), t.line, t.col)) }
+}
+
+fn parse_interp_bodies(p: Parser, parts: [IPart], at: InterpPos, acc: [Expr]) : PArgs / Console = match parts {
+  [] -> ok_args(p, list_reverse(acc))
+  [IpLit(piece, _), ...rest] -> parse_interp_bodies(p, rest, interp_pos_advance(at, piece, 0), acc)
+  [IpExp(src), ...rest] -> {
+    let body = interp_pos_body(at)
+    let toks = map(tokenize(src), (tk) => tok_at(tk, body.line, body.col))
+    let sub = p_expr(Parser { ...p, file: interp_parse_file(), src: src, rest: toks, error: None,
+                                  allow_trailing_lambda: true, allow_record_lit: true })
+    match sub.r {
+      None    -> err_args(p_interp_fail(p, src, body, sub.p.error))
+      Some(x) -> parse_interp_bodies(p, rest, interp_pos_past(body, src), [x, ...acc])
+    }
+  }
+}
+
+fn interp_fail_head() : String = "cannot parse the interpolated expression"
+
+#[doc("""
+A nested body that fails has already named itself; any other failure
+names the body and carries the parser's reason.
+""")]
+pub fn p_interp_fail(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Parser / Console = {
+  let own = concat_all([interp_fail_head(), " `", src, "`"])
+  match inner {
+    None -> p_interp_report(p, mk_diag(SevError, p.file, body.line, body.col, own, []))
+    Some(D(_, _, l, c, msg, notes)) ->
+      if starts_with(msg, interp_fail_head()) { p_interp_report(p, mk_diag(SevError, p.file, l, c, msg, notes)) }
+      else { p_interp_report(p, mk_diag(SevError, p.file, body.line, body.col, concat_all([own, ": ", msg]), notes)) }
+  }
+}
+
+fn p_interp_report(p: Parser, d: Diagnostic) : Parser / Console = match d {
+  D(sev, _, l, c, msg, notes) ->
+    if p.file == interp_parse_file() { p_mark_err(p, d) }
+    else {
+      diag_error_from_src(p.file, p.src, l, c, msg)
+      notes |> each((n) => match n { DR(_, _, _, m) -> diag_note(m) })
+      p_mark_err(p, D(sev, p.file, l, c, msg, map(notes, (n) => match n { DR(_, nl, nc, m) -> DR(p.file, nl, nc, m) })))
+    }
+}
+
+# Parse a `~r/pattern/` sigil token into an expression.
+# The lexer has already validated the delimiter shape and stored the
+# full sigil source span on the token. We desugar to a runtime call
+# `regex_compile_or_panic("<pattern>")` whose result is a `Regex`
+# value — meaning `~r/pat/` works as a first-class expression in any
+# position, not just inside refinement predicates.
+#
+# The pattern body is wrapped as a kaikai string literal with two
+# byte-level escapes (`\` -> `\\`, `"` -> `\"`) so the post-decode
+# bytes match the regex source verbatim. `#` is forbidden in the body
+# because it would collide with kaikai's `#{...}` string
+# interpolation; a pattern containing `#` must use `regex_compile`
+# directly.
+#[doc("Parses a regex sigil literal into a string expression.")]
+pub fn parse_regex_sigil(p: Parser, t: Token) : PExpr / Console {
+
+  let span = tok_source(p.src, t)
+  let n = string_length(span)
+  # Span shape: `~r/pattern/`. Strip the 3-char prefix `~r/` and the
+  # trailing `/`. The lexer guarantees both delimiters are present
+  # (otherwise it emitted TkError, never TkRegex).
+  let pattern = string_slice(span, 3, n - 4)
+  if regex_pattern_has_hash(pattern, 0, string_length(pattern)) {
+    err_e(p_error_here(p,
+      "regex sigil contains `#`, which v1 forbids (would collide with kaikai string interpolation); use `regex_compile` directly for patterns containing `#`"))
+  } else {
+    let escaped = regex_pattern_to_kai_str_body(pattern, 0, string_length(pattern), "")
+    let str_span = concat_all(["\"", escaped, "\""])
+    let pat_str = mk_expr(EStr(str_span, false), t.line, t.col)
+    let callee = mk_expr(EModCall(written("regexp"), written("compile_or_panic")), t.line, t.col)
+    let call = mk_expr(ECall(callee, [pat_str]), t.line, t.col)
+    ok_e(p_advance(p), call)
+  }
+}
+
+# Walk the regex pattern body byte-by-byte, escaping the two
+# characters that have a load-bearing meaning inside a kaikai
+# string literal: `\` (escape introducer) and `"` (terminator).
+# Every other byte passes through verbatim — including bytes that
+# would be metacharacters at the regex level. The result is the
+# *body* of a kaikai string literal; the caller wraps it in `"..."`.
+fn regex_pattern_to_kai_str_body(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        let piece =
+          if c == '\\' { "\\\\" }
+          else if c == '"' { "\\\"" }
+          else { int_to_byte_string(char_to_int(c)) }
+        regex_pattern_to_kai_str_body(s, i + 1, n, string_concat(acc, piece))
+      }
+    }
+  }
+}
+
+fn regex_pattern_has_hash(s: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else {
+    match char_at(s, i) {
+      None -> false
+      Some(c) -> if c == '#' { true } else { regex_pattern_has_hash(s, i + 1, n) }
+    }
+  }
+}

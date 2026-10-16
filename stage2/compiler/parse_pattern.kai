@@ -1,0 +1,330 @@
+#[doc("Patterns: literals, lists, tuples, records, variants and ranges.")]
+
+import compiler.diag
+import compiler.lex_tokens
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.nest_limit
+import compiler.interp_scan
+import compiler.decl_names
+import compiler.parse_state
+import compiler.parse_literals
+import compiler.parse_types
+
+#[doc("Parses a pattern.")]
+pub fn parse_pattern(p: Parser) : PPat / Console {
+  if p.depth >= nest_max() { err_p(p_too_deep(p)) }
+  else {
+    let r = parse_pattern_in(p_at_depth(p, p.depth + 1))
+    PPat { p: p_at_depth(r.p, p.depth), r: r.r }
+  }
+}
+
+fn parse_pattern_in(p: Parser) : PPat / Console {
+
+  let t = p_peek(p)
+  match t.kind {
+    TkHole          -> ok_p(p_advance(p), mk_pat(PHole(None), t.line, t.col))
+    TkHoleName(nm)  -> ok_p(p_advance(p), mk_pat(PHole(Some(nm)), t.line, t.col))
+    _ -> parse_pattern_rest(p, t)
+  }
+}
+
+fn parse_pattern_rest(p: Parser, t: Token) : PPat / Console {
+  if tk_is(t.kind, TkLbracket) { parse_list_pattern(p, t) }
+  else if tk_is(t.kind, TkLparen) { parse_tuple_pattern(p, t) }
+  else if tk_is(t.kind, TkLbrace) {
+    parse_record_pattern_fields(p_skip_newlines(p_advance(p)), [], None, t)
+  } else if tk_is(t.kind, TkIdent) { parse_ident_pattern(p, t) }
+  else if tk_is(t.kind, TkUnderscore) { ok_p(p_advance(p), mk_pat(PWild, t.line, t.col)) }
+  else { parse_literal_pattern(p, t) }
+}
+
+fn lit_pat_ok(p: Parser, t: Token, lit: Expr) : PPat =
+  ok_p(p_advance(p), mk_pat(PLit(lit), t.line, t.col))
+
+fn parse_literal_pattern(p: Parser, t: Token) : PPat / Console {
+  match fixed_lit_of_tok(p.src, t) {
+    Some(lit) -> lit_pat_ok(p, t, lit)
+    None -> parse_scalar_pattern(p, t)
+  }
+}
+
+fn parse_scalar_pattern(p: Parser, t: Token) : PPat / Console {
+  if tk_is(t.kind, TkInt) {
+    let span = tok_source(p.src, t)
+    pat_lit_or_range(p_advance(p), mk_expr(mk_int_lit(decode_int(span), span), t.line, t.col), t)
+  } else if tk_is(t.kind, TkChar) {
+    pat_lit_or_range(p_advance(p), mk_expr(EChar(decode_char(tok_source(p.src, t))), t.line, t.col), t)
+  } else if tk_is(t.kind, TkReal) {
+    let span = tok_source(p.src, t)
+    match decode_real(span) {
+      Some(r) -> lit_pat_ok(p, t, mk_expr(EReal(RealLit(r), span), t.line, t.col))
+      None -> err_p(p_error(p, t, real_range_error()))
+    }
+  } else if tk_is(t.kind, TkTrue) { lit_pat_ok(p, t, mk_expr(EBool(true), t.line, t.col)) }
+  else if tk_is(t.kind, TkFalse) { lit_pat_ok(p, t, mk_expr(EBool(false), t.line, t.col)) }
+  else if tk_is(t.kind, TkString) { parse_string_pattern(p, t) }
+  else if tk_is(t.kind, TkMinus) { parse_negative_pattern(p, t) }
+  else { err_p(p_error_here(p, "expected pattern")) }
+}
+
+# An interpolated string pattern keeps its parsed bodies; surface lowering turns it into a binder and a guard.
+fn parse_string_pattern(p: Parser, t: Token) : PPat / Console {
+  let r = parse_str_lit(p, t)
+  match r.r {
+    Some(lit) -> ok_p(r.p, mk_pat(PLit(lit), t.line, t.col))
+    None -> err_p(r.p)
+  }
+}
+
+fn parse_negative_pattern(p: Parser, t: Token) : PPat / Console {
+  let nxt = p_peek1(p)
+  if tk_is(nxt.kind, TkInt) {
+    let span = tok_source(p.src, nxt)
+    pat_lit_or_range(p_advance(p_advance(p)), mk_expr(mk_int_lit(0 - decode_int(span), string_concat("-", span)), t.line, t.col), t)
+  } else {
+    err_p(p_error_here(p, "expected literal after `-` in pattern"))
+  }
+}
+
+fn parse_list_pattern(p: Parser, t: Token) : PPat / Console {
+
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbracket) {
+    ok_p(p_advance(p1), mk_pat(PList([], None), t.line, t.col))
+  } else {
+    parse_list_pattern_loop(p1, [], None, t)
+  }
+}
+
+fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: Token) : PPat / Console {
+  if p_at(p, TkEllipsis) {
+    parse_list_spread(p_advance(p), acc, t)
+  } else {
+    let r = parse_pattern(p)
+    match r.r {
+      None -> err_p(r.p)
+      Some(pat) -> parse_list_pattern_end(p_skip_newlines(r.p), [pat, ...acc], t)
+    }
+  }
+}
+
+fn parse_list_pattern_end(p1: Parser, acc: [Pattern], t: Token) : PPat / Console {
+  if p_at(p1, TkComma) { parse_list_pattern_loop(p_skip_newlines(p_advance(p1)), acc, None, t) }
+  else if p_at(p1, TkRbracket) { ok_p(p_advance(p1), mk_pat(PList(list_reverse(acc), None), t.line, t.col)) }
+  else { err_p(p_error_here(p1, "expected `,` or `]` in list pattern")) }
+}
+
+# `[h, ...]` and `[h, ..._]` are anonymous tails (`PsAnonRest`) that lowering gives a sentinel
+# binder, keeping the spread-vs-no-spread distinction the exhaustiveness check needs.
+fn parse_list_spread(p1: Parser, acc: [Pattern], t: Token) : PPat / Console {
+  let id = p_peek(p1)
+  if tk_is(id.kind, TkIdent) {
+    let tail = Some(binder_written(tok_source(p1.src, id)))
+    spread_closed(p_skip_newlines(p_advance(p1)), mk_pat(PList(list_reverse(acc), tail), t.line, t.col))
+  } else if tk_is(id.kind, TkUnderscore) {
+    spread_closed(p_skip_newlines(p_advance(p1)), mk_pat(PSurface(PsAnonRest(list_reverse(acc), true)), t.line, t.col))
+  } else if tk_is(id.kind, TkRbracket) {
+    ok_p(p_advance(p1), mk_pat(PSurface(PsAnonRest(list_reverse(acc), false)), t.line, t.col))
+  } else {
+    err_p(p_error_here(p1, "expected identifier, `_`, or `]` after `...` in list pattern"))
+  }
+}
+
+fn spread_closed(p2: Parser, pat: Pattern) : PPat / Console =
+  if p_at(p2, TkRbracket) { ok_p(p_advance(p2), pat) }
+  else { err_p(p_error_here(p2, "expected `]` after spread pattern")) }
+
+# n-tuple pattern sugar. Mirrors parse_tuple_expr_rest: starts
+# with `(`, parses N≥2 comma-separated sub-patterns, closes with `)`,
+# preserved as `PsTuple`; `surface_lower_decls` desugars it to a
+# `PVariantRecord` of the corresponding stdlib type (`Pair` / `Triple`
+# / `Quad`). Single-paren `(p)` is grouping — returns the inner
+# pattern unchanged. Empty `()` is rejected.
+fn parse_tuple_pattern(p: Parser, t: Token) : PPat / Console {
+
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRparen) {
+    err_p(p_error_here(p1, "empty tuple pattern `()` not supported"))
+  } else {
+    let r = parse_pattern(p1)
+    match r.r {
+      None -> err_p(r.p)
+      Some(first) -> {
+        let p2 = p_skip_newlines(r.p)
+        if p_at(p2, TkRparen) {
+          # Single-pattern parens: grouping.
+          ok_p(p_advance(p2), first)
+        } else if p_at(p2, TkComma) {
+          parse_tuple_pattern_rest(p_skip_newlines(p_advance(p2)), [first], t)
+        } else {
+          err_p(p_error_here(p2, "expected `,` or `)` in tuple pattern"))
+        }
+      }
+    }
+  }
+}
+
+fn parse_tuple_pattern_rest(p: Parser, acc: [Pattern], t: Token) : PPat / Console {
+
+  let r = parse_pattern(p)
+  match r.r {
+    None -> err_p(r.p)
+    Some(pat) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_tuple_pattern_rest(p_skip_newlines(p_advance(p1)), [pat, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let pats = list_reverse([pat, ...acc])
+        let p2 = p_advance(p1)
+        match tuple_type_for_arity(list_length(pats)) {
+          None -> err_p(p_error_here(p1, "n-tuple sugar supports arity 2..4 only — use a named record for wider products"))
+          Some(_) -> ok_p(p2, mk_pat(PSurface(PsTuple(pats)), t.line, t.col))
+        }
+      } else {
+        err_p(p_error_here(p1, "expected `,` or `)` in tuple pattern"))
+      }
+    }
+  }
+}
+
+fn parse_ident_pattern(p: Parser, t: Token) : PPat / Console {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if is_upper_ident(p.src, t) { parse_variant_pattern(p1, name, t) }
+  else if at_qualified_member(p, t) {
+    # `mod.Ctor...`: the qualifier rides a surface wrapper; lowering moves it into the variant's home slot.
+    let r = parse_ident_pattern(p_advance(p1), p_peek1(p1))
+    match r.r {
+      None -> r
+      Some(sub) -> ok_p(r.p, mk_pat(PSurface(PsQualified(name, sub)), t.line, t.col))
+    }
+  } else if p_at(p1, TkAs) or p_at(p1, TkAt) {
+    parse_as_pattern(p1, name, t)
+  } else {
+    ok_p(p1, mk_pat(PBind(binder_written(name)), t.line, t.col))
+  }
+}
+
+fn parse_variant_pattern(p1: Parser, name: String, t: Token) : PPat / Console {
+  if p_at(p1, TkLparen) {
+    let p2 = p_skip_newlines(p_advance(p1))
+    if p_at(p2, TkRparen) { ok_p(p_advance(p2), mk_pat(PVariant(ref_written(name), []), t.line, t.col)) }
+    else { parse_variant_sub_patterns(p2, [], name, t) }
+  } else if p_at(p1, TkLbrace) {
+    parse_record_pattern_fields(p_skip_newlines(p_advance(p1)), [], Some(name), t)
+  } else {
+    ok_p(p1, mk_pat(PVariant(ref_written(name), []), t.line, t.col))
+  }
+}
+
+# `name as pattern` binds `name` to the whole scrutinee; the legacy `name @ pattern` spelling is still accepted.
+fn parse_as_pattern(p1: Parser, name: String, t: Token) : PPat / Console {
+  let r = parse_pattern(p_skip_newlines(p_advance(p1)))
+  match r.r {
+    None -> err_p(r.p)
+    Some(sub) ->
+      if p_at(p1, TkAs) { ok_p(r.p, mk_pat(PSurface(PsAs(name, sub)), t.line, t.col)) }
+      else { ok_p(r.p, mk_pat(PAs(binder_written(name), sub), t.line, t.col)) }
+  }
+}
+
+fn parse_variant_sub_patterns(p: Parser, acc: [Pattern], name: String, t: Token) : PPat / Console {
+
+  let r = parse_pattern(p)
+  match r.r {
+    None -> err_p(r.p)
+    Some(sub) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_variant_sub_patterns(p_skip_newlines(p_advance(p1)), [sub, ...acc], name, t)
+      } else if p_at(p1, TkRparen) {
+        ok_p(p_advance(p1), mk_pat(PVariant(ref_written(name), list_reverse([sub, ...acc])), t.line, t.col))
+      } else {
+        err_p(p_error_here(p1, "expected `,` or `)` in variant pattern"))
+      }
+    }
+  }
+}
+
+fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t: Token) : PPat / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    record_pattern_closed(p_advance(p0), acc, ctor, t)
+  } else {
+    let fn_t = p_peek(p0)
+    if not tk_is(fn_t.kind, TkIdent) {
+      err_p(p_error(p0, fn_t, "expected field name in record pattern"))
+    } else {
+      parse_record_pattern_field(p_advance(p0), tok_source(p0.src, fn_t), fn_t, acc, ctor, t)
+    }
+  }
+}
+
+fn record_pattern_closed(p1: Parser, acc: [PField], ctor: Option[String], t: Token) : PPat =
+  match ctor {
+    None -> ok_p(p1, mk_pat(PRecord(list_reverse(acc)), t.line, t.col))
+    Some(name) -> ok_p(p1, mk_pat(PVariantRecord(ref_written(name), list_reverse(acc)), t.line, t.col))
+  }
+
+fn parse_record_pattern_field(p1: Parser, fname: String, fn_t: Token, acc: [PField], ctor: Option[String],
+                              t: Token) : PPat / Console {
+  let is_short = not p_at(p1, TkColon)
+  let sub_r = if is_short { ok_p(p1, mk_pat(PBind(binder_written(fname)), fn_t.line, fn_t.col)) }
+              else { parse_pattern(p_advance(p1)) }
+  match sub_r.r {
+    None -> err_p(sub_r.p)
+    Some(sub) -> {
+      let acc1 = [PField(fname, sub, is_short), ...acc]
+      let p2 = p_skip_newlines(sub_r.p)
+      if p_at(p2, TkComma) { parse_record_pattern_fields(p_skip_newlines(p_advance(p2)), acc1, ctor, t) }
+      else if p_at(p2, TkRbrace) { parse_record_pattern_fields(p2, acc1, ctor, t) }
+      else { err_p(p_error_here(p2, "expected `,` or `}` in record pattern")) }
+    }
+  }
+}
+
+#[doc("""
+A just-parsed literal `lo` becomes a `PRange` when `..` follows, else a
+plain `PLit`. Both bounds must be Int/Char literals (a non-literal upper
+bound is a parse error) so exhaustiveness stays decidable — the pattern
+never carries an expression the checker would have to evaluate.
+""")]
+pub fn pat_lit_or_range(p: Parser, lo: Expr, t: Token) : PPat / Console {
+
+  if p_at(p, TkDotDot) {
+    match parse_range_bound(p_advance(p)) {
+      None -> err_p(p_error_here(p, "range pattern bounds must be Int or Char literals"))
+      Some(hi) -> ok_p(hi.p, mk_pat(PRange(lo, hi.e), t.line, t.col))
+    }
+  } else {
+    ok_p(p, mk_pat(PLit(lo), t.line, t.col))
+  }
+}
+
+fn parse_range_bound(p: Parser) : Option[RangeBound] / Console {
+
+  let t = p_peek(p)
+  if tk_is(t.kind, TkInt) {
+    let span = tok_source(p.src, t)
+    let e = mk_expr(mk_int_lit(decode_int(span), span), t.line, t.col)
+    Some(RangeBound { p: p_advance(p), e: e })
+  } else if tk_is(t.kind, TkChar) {
+    let e = mk_expr(EChar(decode_char(tok_source(p.src, t))), t.line, t.col)
+    Some(RangeBound { p: p_advance(p), e: e })
+  } else if tk_is(t.kind, TkMinus) {
+    let nxt = p_peek1(p)
+    if tk_is(nxt.kind, TkInt) {
+      let span = tok_source(p.src, nxt)
+      let v = 0 - decode_int(span)
+      Some(RangeBound { p: p_advance(p_advance(p)),
+                        e: mk_expr(mk_int_lit(v, string_concat("-", span)), t.line, t.col) })
+    } else {
+      None
+    }
+  } else {
+    None
+  }
+}

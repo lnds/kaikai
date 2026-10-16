@@ -1,0 +1,340 @@
+#[doc("`handle` expressions and their operation and lifecycle clauses.")]
+
+import compiler.diag
+import compiler.lex_tokens
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.interp_scan
+import compiler.decl_names
+import compiler.parse_state
+import compiler.parse_types
+import compiler.parse_stmt
+
+# `handle { body } with Eff [as alias] { clauses }`. Both blocks
+# are parsed by handle-specific rules; the body is an ordinary
+# block expression, the clauses
+# block contains `op_name(args, resume) -> body` plus an optional
+# `return(x) -> body` at the end.
+#[doc("Parses a `handle` expression after the keyword.")]
+pub fn parse_handle(p: Parser, t: Token) : PExpr / Console {
+  if not p_at(p, TkLbrace) {
+    err_e(p_error_here(p, "expected `{` to start handle body"))
+  } else {
+    let body_r = parse_block(p, p_peek(p))
+    match body_r.r {
+      None -> err_e(body_r.p)
+      Some(body) -> parse_handle_with(p_skip_newlines(body_r.p), t, body)
+    }
+  }
+}
+
+fn parse_handle_with(p1: Parser, t: Token, body: Expr) : PExpr / Console {
+  if not p_at(p1, TkWith) {
+    err_e(p_error_here(p1, "expected `with` after handle body"))
+  } else {
+    let p2 = p_advance(p1)
+    let eff_t = p_peek(p2)
+    if not tk_is(eff_t.kind, TkIdent) {
+      err_e(p_error(p2, eff_t, "expected effect name after `with`"))
+    } else {
+      parse_handle_effect(p2, eff_t, t, body)
+    }
+  }
+}
+
+fn parse_handle_effect(p2: Parser, eff_t: Token, t: Token, body: Expr) : PExpr / Console {
+  let eff_q = parse_qualified_head_name(p2, eff_t)
+  let p3 = eff_q.p
+  let tyargs_r =
+    if p_at(p3, TkLbracket) {
+      parse_row_label_args(p_skip_newlines(p_advance(p3)), [])
+    } else {
+      PRowArgs { p: p3, r: Some([]) }
+    }
+  match tyargs_r.r {
+    None -> err_e(tyargs_r.p)
+    Some(eff_tyargs) -> parse_handle_init(tyargs_r.p, t, body, eff_q.dref, eff_tyargs)
+  }
+}
+
+fn parse_handle_init(p: Parser, t: Token, body: Expr, eff_name: DeclRef,
+                     eff_tyargs: [TypeExpr]) : PExpr / Console {
+  let init_r = parse_handler_state_init(p)
+  let init_failed =
+    if init_r.has_init {
+      match init_r.r { None -> true Some(_) -> false }
+    } else { false }
+  if init_failed {
+    err_e(init_r.p)
+  } else {
+    parse_handle_clause_block(init_r, t, body, eff_name, eff_tyargs)
+  }
+}
+
+fn parse_handler_state_init(p: Parser) : PInit / Console {
+  if p_at(p, TkLparen) {
+    let ie = p_expr(p_skip_newlines(p_advance(p)))
+    match ie.r {
+      None -> PInit { p: ie.p, r: None, has_init: true }
+      Some(ix) -> {
+        let p_ic = p_skip_newlines(ie.p)
+        if not p_at(p_ic, TkRparen) {
+          PInit { p: p_error_here(p_ic, "expected `)` after handler-state initializer"),
+                  r: None, has_init: true }
+        } else {
+          PInit { p: p_advance(p_ic), r: Some(ix), has_init: true }
+        }
+      }
+    }
+  } else {
+    PInit { p: p, r: None, has_init: false }
+  }
+}
+
+fn parse_handle_clause_block(init_r: PInit, t: Token, body: Expr, eff_name: DeclRef,
+                             eff_tyargs: [TypeExpr]) : PExpr / Console {
+  let alias_r = parse_handle_alias(init_r.p)
+  let p4 = p_skip_newlines(alias_r.p)
+  if not p_at(p4, TkLbrace) {
+    err_e(p_error_here(p4, "expected `{` to start handler clauses"))
+  } else {
+    let cr = parse_handle_clauses(p_skip_newlines(p_advance(p4)), [], None, [])
+    match cr.r {
+      None -> err_e(cr.p)
+      Some(_) -> finish_handle(p4, t, body, eff_name, eff_tyargs, init_r, alias_r.r, cr)
+    }
+  }
+}
+
+# Handler-clause params: like fn params but the type annotation is
+# optional. `print(s, resume) -> ...` is the common shape.
+fn parse_clause_params(p: Parser, acc: [Param]) : PParams / Console {
+  if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else {
+    let t = p_peek(p)
+    if not tk_is(t.kind, TkIdent) {
+      PParams { p: p_error(p, t, "expected parameter name"), r: None }
+    } else {
+      let opt_ty_r = parse_optional_type(p_advance(p))
+      let pm = Param { binder: binder_written(tok_source(p.src, t)), ptype: opt_ty_r.r, pline: t.line, pcol: t.col, pborrow: false }
+      let p2 = p_skip_newlines(opt_ty_r.p)
+      if p_at(p2, TkComma) {
+        parse_clause_params(p_skip_newlines(p_advance(p2)), [pm, ...acc])
+      } else if p_at(p2, TkRparen) {
+        PParams { p: p_advance(p2), r: Some(list_reverse([pm, ...acc])) }
+      } else {
+        PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
+      }
+    }
+  }
+}
+
+#[doc("""
+A `var` or `let` decl may appear at the top of the clause list,
+before all operation
+clauses. The parser collects them into a `prelude` and the
+caller wraps the `EHandle` in an `EBlock(prelude, Some(EHandle))`.
+The existing `desugar_var_block` pass then lifts each `SVar`
+into a sibling `with State[T](init) as name` that wraps the
+handler. Once an operation clause has been seen, any further
+`var` / `let` is a parse error — the rule is "var/let must
+precede all operation clauses inside one handler block."
+""")]
+pub fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    PClauses { p: p_advance(p0), clauses: list_reverse(acc),
+               return_clause: rret, prelude: list_reverse(prelude), r: Some(true) }
+  } else {
+    parse_handle_clause(p0, acc, rret, prelude)
+  }
+}
+
+fn parse_handle_clause(p0: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+  let id_t = p_peek(p0)
+  if tk_is(id_t.kind, TkVar) or tk_is(id_t.kind, TkLet) {
+    parse_clause_prelude(p0, id_t, acc, rret, prelude)
+  } else if not tk_is(id_t.kind, TkIdent) {
+    pclauses_err(p_error(p0, id_t, "expected operation name in handler"))
+  } else if is_lifecycle_clause_at(p0, id_t) {
+    parse_lifecycle_clause(p0, id_t, acc, rret, prelude)
+  } else {
+    parse_op_clause(p0, id_t, acc, rret, prelude)
+  }
+}
+
+fn parse_clause_prelude(p0: Parser, id_t: Token, acc: [HClause], rret: Option[HReturn],
+                        prelude: [Stmt]) : PClauses / Console {
+  match acc {
+    [] -> {
+      let sr = if tk_is(id_t.kind, TkVar) { parse_var(p0, id_t) } else { parse_let(p0, id_t) }
+      match sr.r {
+        None -> pclauses_err(sr.p)
+        Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+      }
+    }
+    _ -> pclauses_err(p_error(p0, id_t,
+           "`var` and `let` must precede all operation clauses inside a handler"))
+  }
+}
+
+fn parse_op_clause(p0: Parser, id_t: Token, acc: [HClause], rret: Option[HReturn],
+                   prelude: [Stmt]) : PClauses / Console {
+  let p1 = p_advance(p0)
+  if not p_at(p1, TkLparen) {
+    pclauses_err(p_error_here(p1, "expected `(` after operation name"))
+  } else {
+    let params_r = parse_clause_params(p_skip_newlines(p_advance(p1)), [])
+    match params_r.r {
+      None -> pclauses_err(params_r.p)
+      Some(params) -> parse_op_clause_body(p_skip_newlines(params_r.p), id_t, params, acc, rret, prelude)
+    }
+  }
+}
+
+fn parse_op_clause_body(p3: Parser, id_t: Token, params: [Param], acc: [HClause],
+                        rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+  if not p_at(p3, TkArrow) {
+    pclauses_err(p_error_here(p3, "expected `->` after operation parameters"))
+  } else {
+    let rb = p_expr(p_skip_newlines(p_advance(p3)))
+    match rb.r {
+      None -> pclauses_err(rb.p)
+      Some(body) -> {
+        let name = tok_source(p3.src, id_t)
+        if name == "return" {
+          match params {
+            [pp] -> parse_handle_clauses(rb.p, acc, Some(HR(pp.binder, body, id_t.line, id_t.col)), prelude)
+            _ -> pclauses_err(p_error(p3, id_t, "return clause takes exactly one parameter"))
+          }
+        } else {
+          let hc = HC(ChOp(name), params, body, id_t.line, id_t.col)
+          parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
+        }
+      }
+    }
+  }
+}
+
+# Both lower to an `HClause` with no params. `initially` is unwrapped by
+# `parse_handle` into the handler-state slot the `(init)` form already
+# fills; `finally` stays in the clause list under its own head.
+fn parse_lifecycle_clause(p: Parser, id_t: Token, acc: [HClause],
+                          rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+
+  let name = tok_source(p.src, id_t)
+  # The caller saw one of the two keywords, so the fallback never runs.
+  let head = match clause_lifecycle_of_word(name) {
+    Some(h) -> h
+    None    -> ChOp(name)
+  }
+  let p1 = p_skip_newlines(p_advance(p))
+  let bt = p_peek(p1)
+  let rb = parse_block(p1, bt)
+  match rb.r {
+    None -> PClauses { p: rb.p, clauses: [], return_clause: None,
+                       prelude: [], r: None }
+    Some(body) ->
+      if lifecycle_clause_seen(acc, head) {
+        PClauses { p: p_error(p, id_t,
+                     string_concat("duplicate `",
+                       string_concat(name, "` clause in handler"))),
+                   clauses: [], return_clause: None, prelude: [], r: None }
+      } else {
+        parse_handle_clauses(rb.p, [HC(head, [], body, id_t.line, id_t.col), ...acc],
+                             rret, prelude)
+      }
+  }
+}
+
+#[doc("Parses an optional `as name` alias after a handler head.")]
+pub fn parse_handle_alias(p: Parser) : PAlias / Console {
+
+  if not p_at(p, TkAs) { PAlias { p: p, r: None } }
+  else {
+    let p1 = p_advance(p)
+    let nt = p_peek(p1)
+    if not tk_is(nt.kind, TkIdent) {
+      PAlias { p: p_error(p1, nt, "expected alias name after `as`"), r: None }
+    } else {
+      PAlias { p: p_advance(p1), r: Some(binder_written(tok_source(p1.src, nt))) }
+    }
+  }
+}
+
+#[doc("""
+`initially { }` / `finally { }` — the acquire/release pair inside a
+handler. Contextual idents, not lexer keywords: an op clause always
+has `(` after the name, so the `{` lookahead disambiguates and user
+code may still declare an op called `finally`.
+""")]
+pub fn is_lifecycle_clause_at(p: Parser, id_t: Token) : Bool =
+  match clause_lifecycle_of_word(tok_source(p.src, id_t)) {
+    Some(_) -> p_at(p_skip_newlines(p_advance(p)), TkLbrace)
+    None    -> false
+  }
+
+#[doc("""
+Assemble the `EHandle` once the clause block has parsed: lift
+`initially` into the handler-state slot, then wrap in the `var`/`let`
+prelude block if the clause list opened with one.
+""")]
+pub fn finish_handle(p4: Parser, t: Token, body: Expr, eff_name: DeclRef,
+                 eff_tyargs: [TypeExpr], init_r: PInit,
+                 alias: Option[Binder], cr: PClauses) : PExpr / Console {
+
+  # `initially { }` fills the same handler-state slot as the `(init)`
+  # form, so the two are mutually exclusive.
+  let init_cl = find_initially_clause(cr.clauses)
+  let dup_init = match init_cl { Some(_) -> init_r.has_init None -> false }
+  if dup_init {
+    err_e(p_error(p4, t, "a handler takes either `(init)` or `initially { }`, not both"))
+  } else {
+    # The clause spelling rides a surface wrapper so the writer can
+    # reproduce `initially { }` instead of guessing from the init's shape.
+    let eff_init = match init_cl {
+      Some(HC(_, _, ib, il, ic)) -> Some(mk_expr(ESurface(SfHandleInit(ib)), il, ic))
+      None                       -> init_r.r
+    }
+    let handle_e = mk_expr(
+      EHandle(body, eff_name, eff_tyargs, eff_init, alias,
+              drop_initially_clauses(cr.clauses), cr.return_clause),
+      t.line, t.col)
+    # A `var` / `let` prelude lifts to a sibling block whose tail is the
+    # handler; `desugar_var_block` then wraps each `SVar` in its own
+    # `with State[T] as name`. An empty prelude emits the bare `EHandle`.
+    match cr.prelude {
+      [] -> ok_e(cr.p, handle_e)
+      _  -> ok_e(cr.p, mk_expr(EBlock(cr.prelude, Some(handle_e)), t.line, t.col))
+    }
+  }
+}
+
+fn find_initially_clause(cs: [HClause]) : Option[HClause] = match cs {
+  [] -> None
+  [c, ...rest] -> match c {
+    HC(ChInitially, _, _, _, _) -> Some(c)
+    _                           -> find_initially_clause(rest)
+  }
+}
+
+fn drop_initially_clauses(cs: [HClause]) : [HClause] = match cs {
+  [] -> []
+  [c, ...rest] -> match c {
+    HC(ChInitially, _, _, _, _) -> drop_initially_clauses(rest)
+    _                           -> [c, ...drop_initially_clauses(rest)]
+  }
+}
+
+#[doc("Reports whether a lifecycle clause of the given head was already parsed.")]
+pub fn lifecycle_clause_seen(acc: [HClause], head: ClauseHead) : Bool = match acc {
+  [] -> false
+  [HC(h, _, _, _, _), ...rest] -> same_lifecycle(h, head) or lifecycle_clause_seen(rest, head)
+}
+
+fn same_lifecycle(a: ClauseHead, b: ClauseHead) : Bool = match a {
+  ChInitially -> match b { ChInitially -> true  _ -> false }
+  ChFinally   -> match b { ChFinally -> true  _ -> false }
+  ChOp(_)     -> false
+}

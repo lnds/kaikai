@@ -1,0 +1,487 @@
+#[doc("Types, effect rows, refinement predicates and parameter groups.")]
+
+import compiler.chars
+import compiler.diag
+import compiler.lex_tokens
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.nest_limit
+import compiler.interp_scan
+import compiler.decl_names
+import compiler.parse_state
+import compiler.parse_ops
+import compiler.parse_units
+
+#[doc("Parses an optional `: Type` annotation.")]
+pub fn parse_optional_type(p: Parser) : PTy / Console =
+  if p_at(p, TkColon) { parse_type(p_advance(p)) } else { PTy { p: p, r: None } }
+
+#[doc("Parses an optional `/ row` effect-row suffix.")]
+pub fn parse_row_suffix(p: Parser) : PRow / Console {
+
+  if not p_at(p, TkSlash) { PRow { p: p, r: REmpty } }
+  else {
+    let p1 = p_advance(p)
+    parse_row_labels(p1, [])
+  }
+}
+
+# A row variable or hole closes the row, so a `+` after it is an error.
+fn row_open_tail(p1: Parser, tail: TParamRef, acc: [RowLabel], msg: String) : PRow / Console {
+  if p_at(p1, TkPlus) { PRow { p: p_error(p1, p_peek(p1), msg), r: ROpen(tail, list_reverse(acc)) } }
+  else { PRow { p: p1, r: ROpen(tail, list_reverse(acc)) } }
+}
+
+fn parse_row_labels(p: Parser, acc: [RowLabel]) : PRow / Console {
+  let t = p_peek(p)
+  # `?e` or `?` in tail position is a row variable the reporter tells apart by its `TpHole` tail.
+  if tk_is(t.kind, TkHole) {
+    row_open_tail(p_advance(p), TpHole(None, t.line, t.col), acc, "row hole must be the last item in the row")
+  } else if match t.kind { TkHoleName(_) -> true _ -> false } {
+    row_open_tail(p_advance(p), TpHole(Some(hole_name_text(t.kind)), t.line, t.col), acc, "row hole must be the last item in the row")
+  } else if not tk_is(t.kind, TkIdent) {
+    PRow { p: p_error(p, t, "expected effect name in row"), r: REmpty }
+  } else {
+    parse_row_label_head(p, t, acc)
+  }
+}
+
+fn hole_name_text(k: TokKind) : String =
+  match k {
+    TkHoleName(n) -> n
+    _ -> "anon"
+  }
+
+fn parse_row_label_head(p: Parser, t: Token, acc: [RowLabel]) : PRow / Console {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if is_upper_ident(p.src, t) {
+    parse_row_label_tail(p1, ref_written(name), acc)
+  } else if p_at(p1, TkDot) {
+    # Module qualifier: `ea.Emit`.
+    let p2 = p_advance(p1)
+    let t2 = p_peek(p2)
+    if tk_is(t2.kind, TkIdent) and is_upper_ident(p.src, t2) {
+      parse_row_label_tail(p_advance(p2), ref_qualified(name, tok_source(p.src, t2)), acc)
+    } else {
+      PRow { p: p_error(p2, t2, "expected effect name after module qualifier"), r: REmpty }
+    }
+  } else {
+    row_open_tail(p1, TpWritten(written(name)), acc, "row variable must be the last item in the row")
+  }
+}
+
+# The label tail shared by the bare and qualified forms: optional
+# `[T1, T2]` (`Reader[Int]` in row position parses the same way as a
+# generic type application — distinct labels for distinct
+# instantiations), then `+` or row end.
+fn parse_row_label_tail(p: Parser, name: DeclRef, acc: [RowLabel]) : PRow / Console {
+  let args_r =
+    if p_at(p, TkLbracket) {
+      parse_row_label_args(p_skip_newlines(p_advance(p)), [])
+    } else {
+      PRowArgs { p: p, r: Some([]) }
+    }
+  match args_r.r {
+    None -> PRow { p: args_r.p, r: REmpty }
+    Some(targs) -> {
+      let acc1 = [RL(name, targs), ...acc]
+      if p_at(args_r.p, TkPlus) {
+        parse_row_labels(p_advance(args_r.p), acc1)
+      } else {
+        PRow { p: args_r.p, r: RClosed(list_reverse(acc1)) }
+      }
+    }
+  }
+}
+
+#[doc("Parses the type arguments of an effect-row label.")]
+pub fn parse_row_label_args(p: Parser, acc: [TypeExpr]) : PRowArgs / Console {
+
+  let r = parse_type(p)
+  match r.r {
+    None -> PRowArgs { p: r.p, r: None }
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_row_label_args(p_skip_newlines(p_advance(p1)), [arg, ...acc])
+      } else if p_at(p1, TkRbracket) {
+        PRowArgs { p: p_advance(p1), r: Some(list_reverse([arg, ...acc])) }
+      } else {
+        PRowArgs { p: p_error_here(p1, "expected `,` or `]` after row-label type arguments"), r: None }
+      }
+    }
+  }
+}
+
+#[doc("Parses a type expression.")]
+pub fn parse_type(p: Parser) : PTy / Console {
+  if p.depth >= nest_max() { err_t(p_too_deep(p)) }
+  else {
+    let r = parse_type_in(p_at_depth(p, p.depth + 1))
+    PTy { p: p_at_depth(r.p, p.depth), r: r.r }
+  }
+}
+
+fn parse_type_in(p: Parser) : PTy / Console {
+
+  let base = parse_type_base(p)
+  match base.r {
+    None -> base
+    Some(_) -> parse_optional_refinement(base)
+  }
+}
+
+# After a base type parses, peek for `where` and consume the
+# refinement predicate as a single Expr. The predicate parses with the
+# normal expression grammar; the typer restricts it to the decidable
+# subset and wires it into codegen. The unary form `where >= 0`
+# (predicate begins with a comparator and elides `self` on the LHS) is
+# desugared at parse time into `self >= 0`.
+fn parse_optional_refinement(base: PTy) : PTy / Console {
+
+  if not p_at(base.p, TkWhere) { base } else {
+    match base.r {
+      None -> base
+      Some(bt) -> {
+        let p1 = p_advance(base.p)
+        let pe = parse_refinement_predicate(p1, bt.line, bt.col)
+        match pe.r {
+          None -> PTy { p: pe.p, r: None }
+          Some(pred) ->
+            PTy { p: pe.p, r: Some(mk_ty(TyRefine(bt, pred), bt.line, bt.col)) }
+        }
+      }
+    }
+  }
+}
+
+# Parse the body of a `where` clause. The grammar accepts any
+# Expr; in addition, when the next token is a comparison operator
+# (`<`, `<=`, `==`, `!=`, `>`, `>=`), `self` is implicitly inserted as
+# the LHS so that `where >= 0` desugars to `self >= 0`. Validation that
+# the resulting Expr lies in the decidable subset is the typer's job.
+#
+# A second receiver-elision sugar — `where matches <expr>`
+# desugars to `matches(self, <expr>)`. This is the refinement-side
+# counterpart to the regex sigil: typical use is `String where matches
+# ~r/^[a-z]+$/`. The desugar applies whenever the predicate begins
+# with the bare identifier `matches` and the next non-`(` token is an
+# expression starter — that excludes `matches(s, p)` (an explicit
+# call) and `matches.field` (a member access on a value bound to
+# `matches`), so user code that already names a function `matches` is
+# unaffected.
+#[doc("Parses the predicate of a `where` refinement.")]
+pub fn parse_refinement_predicate(p: Parser, line: Int, col: Int) : PExpr / Console {
+
+  let t = p_peek(p)
+  if is_cmp_tok(t.kind) {
+    let lhs = mk_name("self", line, col)
+    parse_refinement_cmp_with(p, lhs, line, col)
+  } else if is_matches_sugar_start(p, t) {
+    parse_refinement_matches_with(p, t, line, col)
+  } else {
+    p_expr(p)
+  }
+}
+
+fn parse_refinement_matches_with(p: Parser, t: Token, line: Int, col: Int) : PExpr / Console {
+
+  let p1 = p_advance(p)
+  let rhs = p_expr(p1)
+  match rhs.r {
+    None -> rhs
+    Some(rv) -> {
+      let self_e = mk_name("self", line, col)
+      let callee = mk_name("matches", t.line, t.col)
+      let call = mk_expr(ECall(callee, [self_e, rv]), t.line, t.col)
+      PExpr { p: rhs.p, r: Some(call) }
+    }
+  }
+}
+
+# Build `self <op> rhs` when the where clause begins with a bare
+# comparator. Emitted as an EBinop so the typer / codegen treat it
+# identically to a written-out comparison. The spec's bounded-interval
+# form `1 <= self <= 65535` is not chained here because parse_expr
+# rejects non-associative comparison chaining; users who want both
+# sides write `where 1 <= self and self <= 65535`.
+fn parse_refinement_cmp_with(p: Parser, lhs: Expr, line: Int, col: Int) : PExpr / Console {
+
+  let op_tok = p_peek(p)
+  let op = cmp_op_of_tok(op_tok.kind)
+  let p1 = p_advance(p)
+  let rhs = p_expr(p1)
+  match rhs.r {
+    None -> rhs
+    Some(rv) -> {
+      let cmp = mk_expr(EBinop(op, lhs, rv), line, col)
+      PExpr { p: rhs.p, r: Some(cmp) }
+    }
+  }
+}
+
+fn parse_type_base(p: Parser) : PTy / Console {
+
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLbracket) {
+    let p1 = p_advance(p)
+    let r = parse_type(p1)
+    match r.r {
+      None -> err_t(r.p)
+      Some(inner) -> {
+        if p_at(r.p, TkRbracket) {
+          ok_t(p_advance(r.p), mk_ty(TyList(inner), t.line, t.col))
+        } else {
+          err_t(p_error_here(r.p, "expected `]` in list type"))
+        }
+      }
+    }
+  } else if tk_is(t.kind, TkLparen) {
+    parse_fn_type(p, t)
+  } else if tk_is(t.kind, TkIdent) {
+    parse_named_type(p, t)
+  } else {
+    err_t(p_error_here(p, "expected type"))
+  }
+}
+
+fn parse_named_type(p: Parser, t: Token) : PTy / Console {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if at_qualified_member(p, t) {
+    parse_qualified_type(p1, name, t)
+  }
+  # `Foo[<...>]` is the `[<refinement_pure>]` attribute for the caller, not a generic opener.
+  else if p_at(p1, TkLbracket) and not tk_is(p_peek1(p1).kind, TkLt) {
+    let p2 = p_skip_newlines(p_advance(p1))
+    ty_args_habitant(parse_type_args_loop(p2, [], ref_written(name), t), t)
+  } else if ty_head_takes_habitant(p.src, t, name) and p_at(p1, TkLt) {
+    # A habitant in angle brackets on the head (`Real<m/s>`, `Decimal<USD>`, `Tree<r>`) rides `TyDim`,
+    # which the typer collapses to the head `TyName` at protocol-dispatch time.
+    parse_habitant_slot(p1, mk_ty(TyName(ref_written(name), []), t.line, t.col), t)
+  } else {
+    ok_t(p1, mk_ty(TyName(ref_written(name), []), t.line, t.col))
+  }
+}
+
+# `mod.Type[args?]`: the qualtype rewriter validates the qualifier against the module table before resolve.
+fn parse_qualified_type(p1: Parser, name: String, t: Token) : PTy / Console {
+  let nt = p_peek1(p1)
+  let qname = ref_qualified(name, tok_source(p1.src, nt))
+  let p2 = p_advance(p_advance(p1))
+  if p_at(p2, TkLbracket) and not tk_is(p_peek1(p2).kind, TkLt) {
+    # The habitant check keys on the type token, not the lowercase module qualifier.
+    ty_args_habitant(parse_type_args_loop(p_skip_newlines(p_advance(p2)), [], qname, t), nt)
+  } else if p_at(p2, TkLt) {
+    parse_habitant_slot(p2, mk_ty(TyName(qname, []), t.line, t.col), t)
+  } else {
+    ok_t(p2, mk_ty(TyName(qname, []), t.line, t.col))
+  }
+}
+
+fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: DeclRef, t: Token) : PTy / Console {
+  let r = parse_type(p)
+  match r.r {
+    None -> err_t(r.p)
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      # A `+` after the first label makes this argument a compound effect row (`Stream[Int, Stdout + Fail]`),
+      # re-read as a row and wrapped in a `TyRow` carrier that alias substitution folds into the alias row.
+      if p_at(p1, TkPlus) {
+        let rr = parse_row_type_arg(p_advance(p1), arg)
+        match rr.r {
+          None -> err_t(rr.p)
+          Some(row_te) -> type_args_end(p_skip_newlines(rr.p), [row_te, ...acc], name, t)
+        }
+      } else {
+        type_args_end(p1, [arg, ...acc], name, t)
+      }
+    }
+  }
+}
+
+fn type_args_end(p: Parser, acc: [TypeExpr], name: DeclRef, t: Token) : PTy / Console {
+  if p_at(p, TkComma) { parse_type_args_loop(p_skip_newlines(p_advance(p)), acc, name, t) }
+  else if p_at(p, TkRbracket) { ok_t(p_advance(p), mk_ty(TyName(name, list_reverse(acc)), t.line, t.col)) }
+  else { err_t(p_error_here(p, "expected `,` or `]` after type arguments")) }
+}
+
+# Parse the remainder of a compound row argument. `first`
+# is the label already parsed before the `+`; `p` is positioned just
+# after that `+`. Reuses `parse_row_labels` to read the rest of the
+# row, then prepends `first`, yielding a `TyRow` carrier. The first
+# label must be a plain (possibly parameterised) name — a function or
+# list type in row-argument position is rejected.
+fn parse_row_type_arg(p: Parser, first: TypeExpr) : PTy / Console {
+  match te_as_row_label(first) {
+    None -> err_t(p_error(p, p_peek(p),
+      "expected an effect label before `+` in a row type argument"))
+    Some(rl) -> {
+      let pr = parse_row_labels(p, [rl])
+      match pr.r {
+        REmpty -> err_t(pr.p)
+        _      -> ok_t(pr.p, mk_ty(TyRow(pr.r), first.line, first.col))
+      }
+    }
+  }
+}
+
+fn parse_fn_type(p: Parser, t: Token) : PTy / Console {
+
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRparen) {
+    let p2 = p_advance(p1)
+    if not p_at(p2, TkArrow) {
+      err_t(p_error_here(p2, "expected `->` in function type"))
+    } else {
+      let r = parse_type(p_advance(p2))
+      match r.r {
+        None -> err_t(r.p)
+        Some(ret) -> {
+          let row_r = parse_row_suffix(r.p)
+          ok_t(row_r.p, mk_ty(TyFn([], ret, row_r.r), t.line, t.col))
+        }
+      }
+    }
+  } else {
+    parse_fn_type_args(p1, [], t)
+  }
+}
+
+# Function-type args OR n-tuple type sugar. The disambiguation
+# is local: parse a comma-separated list of types until `)`. If `->`
+# follows, it's a function type. Otherwise it's a tuple type,
+# preserved as `TsTuple`; `surface_lower_decls` desugars it to
+# `Pair[A, B]` / `Triple[A, B, C]` / `Quad[A, B, C, D]`.
+# A single type in parens (`(A)`) followed by no `->` is grouping —
+# returns the inner type unchanged. Zero-arg `()` keeps the existing
+# function-type contract (handled in parse_fn_type, must be `() -> T`).
+fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy / Console {
+  let r = parse_type(p)
+  match r.r {
+    None -> err_t(r.p)
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_fn_type_args(p_skip_newlines(p_advance(p1)), [arg, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        parse_fn_type_close(p1, list_reverse([arg, ...acc]), t)
+      } else {
+        err_t(p_error_here(p1, "expected `,` or `)` in type"))
+      }
+    }
+  }
+}
+
+fn parse_fn_type_close(p1: Parser, args: [TypeExpr], t: Token) : PTy / Console {
+  let p2 = p_advance(p1)
+  if p_at(p2, TkArrow) {
+    let rr = parse_type(p_advance(p2))
+    match rr.r {
+      None -> err_t(rr.p)
+      Some(ret) -> {
+        let row_r = parse_row_suffix(rr.p)
+        ok_t(row_r.p, mk_ty(TyFn(args, ret, row_r.r), t.line, t.col))
+      }
+    }
+  } else {
+    parse_tuple_type_sugar(p1, p2, args, t)
+  }
+}
+
+# Without `->` the parens are grouping for one type (`(A)` is `A`) or n-tuple sugar.
+fn parse_tuple_type_sugar(p1: Parser, p2: Parser, args: [TypeExpr], t: Token) : PTy / Console {
+  match args {
+    [only] -> ok_t(p2, only)
+    _ -> match tuple_type_for_arity(list_length(args)) {
+      None -> err_t(p_error_here(p1, "n-tuple type sugar supports arity 2..4 only — use a named record for wider products"))
+      Some(_) -> ok_t(p2, mk_ty(TySurface(TsTuple(args)), t.line, t.col))
+    }
+  }
+}
+
+# Map arity → stdlib tuple type name. `None` for unsupported arities.
+pub fn tuple_type_for_arity(n: Int) : Option[String] {
+  match n {
+    2 -> Some("Pair")
+    3 -> Some("Triple")
+    4 -> Some("Quad")
+    _ -> None
+  }
+}
+
+#[doc("""
+Close an unannotated group: every pending name becomes a `ptype: None`
+Param. Lambda params may go unannotated (the typer infers them); `fn`
+params may not — that path errors instead (see parse_fn_params_group).
+""")]
+pub fn close_param_group_untyped(names: [PendName], acc: [Param]) : [Param] {
+  match names {
+    [] -> acc
+    [pn, ...rest] ->
+      close_param_group_untyped(rest,
+        [Param { binder: binder_written(pn.nm), ptype: None, pline: pn.nline, pcol: pn.ncol, pborrow: pn.pborrow }, ...acc])
+  }
+}
+
+#[doc("Reports whether the parser is at a `matches` refinement sugar.")]
+pub fn is_matches_sugar_start(p: Parser, t: Token) : Bool {
+  if not tk_is(t.kind, TkIdent) { false }
+  else if tok_source(p.src, t) != "matches" { false }
+  else { refinement_matches_sugar_at(p_advance(p)) }
+}
+
+# True when the token after `matches` looks like the start of an
+# expression argument (rather than `(` — which signals an explicit
+# call — or `.` — a member access on a value named `matches`). Used
+# to gate the `where matches <expr>` receiver-elision sugar.
+fn refinement_matches_sugar_at(p: Parser) : Bool {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLparen) { false }
+  else if tk_is(t.kind, TkDot) { false }
+  else if tk_is(t.kind, TkRegex) { true }
+  else if tk_is(t.kind, TkIdent) { true }
+  else if tk_is(t.kind, TkString) { true }
+  else { false }
+}
+
+#[doc("""
+A row label is a plain *uppercase* name (`Stdout`) or a parameterised
+effect (`Reader[Int]`). Convert the parsed `TypeExpr` form into the
+`RowLabel` the row carries. A lowercase name is a row *variable*,
+which may only be the last item in a row — so it is rejected as the
+leading label of a compound row argument (`a + Stdout` is malformed,
+matching the `parse_row_labels` discipline). A function/list/dim/
+refine type in label position is also rejected.
+""")]
+pub fn te_as_row_label(te: TypeExpr) : Option[RowLabel] = match te.tkind {
+  TyName(r, targs) -> match r {
+    DrWritten(None, nm) -> if row_label_name_is_upper(written_text(nm)) { Some(RL(r, targs)) } else { None }
+    _                   -> None
+  }
+  _ -> None
+}
+
+fn row_label_name_is_upper(s: String) : Bool = match char_at(s, 0) {
+  Some(c) -> ch_is_upper(c)
+  None    -> false
+}
+
+#[doc("""
+Back-fill `ty` onto every pending name in a type group (Go/Pony-style
+grouping: `fn foo(a, b: Int)` ≡ `fn foo(a: Int, b: Int)`). `names` is in
+left-to-right reading order; prepending each yields the group in
+reverse-reading order on top of `acc`, matching the caller's invariant
+(acc is reversed once at the end). Every emitted Param is `Some(ty)`, so
+the public-signature-fully-annotated invariant holds.
+""")]
+pub fn close_param_group(names: [PendName], ty: TypeExpr, acc: [Param]) : [Param] {
+  match names {
+    [] -> acc
+    [pn, ...rest] ->
+      close_param_group(rest, ty,
+        [Param { binder: binder_written(pn.nm), ptype: Some(ty), pline: pn.nline, pcol: pn.ncol, pborrow: pn.pborrow }, ...acc])
+  }
+}
