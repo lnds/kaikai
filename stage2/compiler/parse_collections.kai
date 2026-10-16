@@ -1,0 +1,578 @@
+#[doc("List, range, map, set and record literals.")]
+
+import compiler.util
+import compiler.diag
+import compiler.lex_tokens
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.interp_scan
+import compiler.decl_names
+import compiler.parse_state
+
+#[doc("Parses a record literal after its type name.")]
+pub fn parse_record_lit(p: Parser, type_name: DeclRef, tname: Token) : PExpr / Console {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbrace) {
+    record_closed(p_advance(p1), [], type_name, tname)
+  } else if p_at(p1, TkEllipsis) {
+    parse_record_spread_first(p_skip_newlines(p_advance(p1)), type_name, tname)
+  } else {
+    # A bare ident followed by `:`, `,` or `}` starts the named form (including `{ x, y }` puns);
+    # anything else is positional, and `desugar_pos_records_decls` names the fields later.
+    let tk1 = p_peek1(p1)
+    let named_follow = tk_is(tk1.kind, TkColon) or tk_is(tk1.kind, TkComma) or tk_is(tk1.kind, TkRbrace)
+    if tk_is(p_peek(p1).kind, TkIdent) and named_follow {
+      parse_record_fields_loop(p1, [], type_name, tname)
+    } else {
+      parse_record_pos_loop(p1, [], type_name, tname)
+    }
+  }
+}
+
+# `T { ...src, x: 10 }`: the spread must come first; only named overrides may follow.
+fn parse_record_spread_first(p2: Parser, type_name: DeclRef, tname: Token) : PExpr / Console {
+  let r = p_expr(p2)
+  match r.r {
+    None -> err_e(r.p)
+    Some(src) -> {
+      let acc0 = [mk_field_spread(src)]
+      let p3 = p_skip_newlines(r.p)
+      if p_at(p3, TkRbrace) { record_closed(p_advance(p3), acc0, type_name, tname) }
+      else if p_at(p3, TkComma) { parse_record_spread_loop(p_skip_newlines(p_advance(p3)), acc0, type_name, tname) }
+      else { err_e(p_error_here(p3, "expected `,` or `}` after `...` source in record literal")) }
+    }
+  }
+}
+
+# Parse named-field overrides after `...src,`. The spread field already
+# lives at `acc[0]`. Pun and
+# positional are rejected explicitly: pun would silently bind
+# `x: x` from the local scope, which the spread form forbids;
+# positional would conflict with the positional-sugar path. A second
+# `...` is also rejected — a literal admits a single spread.
+type RecMode = RmNamed | RmSpread | RmPositional
+
+fn record_closed(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr =
+  ok_e(p, mk_expr(ERecordLit(type_name, list_reverse(acc)), tname.line, tname.col))
+
+fn parse_record_loop(mode: RecMode, p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console =
+  match mode {
+    RmNamed -> parse_record_fields_loop(p, acc, type_name, tname)
+    RmSpread -> parse_record_spread_loop(p, acc, type_name, tname)
+    RmPositional -> parse_record_pos_loop(p, acc, type_name, tname)
+  }
+
+fn record_item_end(p: Parser, acc: [FieldInit], mode: RecMode, type_name: DeclRef, tname: Token,
+                   msg: String) : PExpr / Console {
+  let p3 = p_skip_newlines(p)
+  if p_at(p3, TkComma) { parse_record_loop(mode, p_skip_newlines(p_advance(p3)), acc, type_name, tname) }
+  else if p_at(p3, TkRbrace) { record_closed(p_advance(p3), acc, type_name, tname) }
+  else { err_e(p_error_here(p3, msg)) }
+}
+
+fn record_field_value(p1: Parser, fname: String, acc: [FieldInit], mode: RecMode, type_name: DeclRef,
+                      tname: Token) : PExpr / Console {
+  let r = p_expr(p_skip_newlines(p_advance(p1)))
+  match r.r {
+    None -> err_e(r.p)
+    Some(val) -> record_item_end(r.p, [FI(fname, val), ...acc], mode, type_name, tname, "expected `,` or `}` in record literal")
+  }
+}
+
+fn parse_record_spread_loop(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console {
+  let p0 = p_skip_newlines(p)
+  let tk = p_peek(p0)
+  if p_at(p0, TkRbrace) {
+    record_closed(p_advance(p0), acc, type_name, tname)
+  } else if p_at(p0, TkEllipsis) {
+    err_e(p_error_here(p0, "record literal admits a single `...` spread; remove the second one"))
+  } else if not tk_is(tk.kind, TkIdent) {
+    err_e(p_error(p0, tk, "expected named field override (`x: expr`) after `...` in record literal"))
+  } else {
+    let p1 = p_advance(p0)
+    if p_at(p1, TkColon) {
+      record_field_value(p1, tok_source(p0.src, tk), acc, RmSpread, type_name, tname)
+    } else {
+      err_e(p_error(p1, p_peek(p1),
+        "spread record overrides must use named field syntax `x: expr`; pun shorthand is not allowed after `...`"))
+    }
+  }
+}
+
+fn parse_record_pos_loop(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console {
+  let p0 = p_skip_newlines(p)
+  let tk0 = p_peek(p0)
+  if tk_is(tk0.kind, TkRbrace) {
+    record_closed(p_advance(p0), acc, type_name, tname)
+  } else if tk_is(tk0.kind, TkIdent) and tk_is(p_peek1(p0).kind, TkColon) {
+    err_e(p_error_here(p0, "expected positional or all-named record fields, found mixed forms"))
+  } else {
+    let r = p_expr(p0)
+    match r.r {
+      None -> err_e(r.p)
+      Some(val) -> record_item_end(r.p, [mk_field_pos(val), ...acc], RmPositional, type_name, tname,
+                                   "expected `,` or `}` in positional record literal")
+    }
+  }
+}
+
+fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: DeclRef, tname: Token) : PExpr / Console {
+  let p0 = p_skip_newlines(p)
+  let tk = p_peek(p0)
+  if tk_is(tk.kind, TkEllipsis) {
+    err_e(p_error(p0, tk, "`...` must be the first item in a record literal — found a field before the spread"))
+  } else if tk_is(tk.kind, TkRbrace) {
+    record_closed(p_advance(p0), acc, type_name, tname)
+  } else if not tk_is(tk.kind, TkIdent) {
+    err_e(p_error(p0, tk, "expected field name in record literal"))
+  } else {
+    parse_record_field_head(p_advance(p0), tk, tok_source(p0.src, tk), acc, type_name, tname)
+  }
+}
+
+# `{ x, y }` puns to `{ x: x, y: y }`, the value wrapped in `SfFieldPun` so the writer restores it.
+fn parse_record_field_head(p1: Parser, tk: Token, fname: String, acc: [FieldInit], type_name: DeclRef,
+                           tname: Token) : PExpr / Console {
+  if p_at(p1, TkColon) {
+    record_field_value(p1, fname, acc, RmNamed, type_name, tname)
+  } else if p_at(p1, TkComma) or p_at(p1, TkRbrace) {
+    let acc1 = [mk_field_pun(fname, mk_name(fname, tk.line, tk.col)), ...acc]
+    if p_at(p1, TkComma) { parse_record_fields_loop(p_skip_newlines(p_advance(p1)), acc1, type_name, tname) }
+    else { record_closed(p_advance(p1), acc1, type_name, tname) }
+  } else {
+    err_e(p_error_here(p1, "expected `:`, `,`, or `}` after field name in record literal"))
+  }
+}
+
+#[doc("Parses a list or range literal.")]
+pub fn parse_list_or_range(p: Parser, t: Token) : PExpr / Console {
+
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbracket) {
+    ok_e(p_advance(p1), mk_expr(EList([]), t.line, t.col))
+  } else {
+    # Parse first element (could start with `...`).
+    parse_first_list_elem(p1, t)
+  }
+}
+
+fn parse_first_list_elem(p: Parser, t: Token) : PExpr / Console {
+
+  if p_at(p, TkEllipsis) {
+    let r = p_expr(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> parse_list_rest(r.p, [ElSpread(e)], t)
+    }
+  } else {
+    let r = p_expr(p)
+    match r.r {
+      None -> err_e(r.p)
+      Some(first) -> {
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkDotDot) { parse_range_end(p, p1, first, t) }
+        else { parse_list_rest(p1, [ElPlain(first)], t) }
+      }
+    }
+  }
+}
+
+# `lazy [...]`. `p` is at `lazy`; the bracket is read as any list or
+# range, and an endless range is legal here alone.
+#[doc("Parses a `lazy` sequence literal.")]
+pub fn parse_lazy(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  if not p_at(p1, TkLbracket) { err_e(p_error_here(p1, "`lazy` opens a lazy sequence and takes a list or a range — write `lazy [...]`")) }
+  else {
+    let r = restore_rl(p.allow_record_lit, parse_list_or_range(p_with_record_lit(p1, true), p_peek(p1)))
+    match r.r {
+      None          -> r
+      Some(bracket) ->
+        if spread_before_last(bracket) { err_e(p_error(r.p, t, "a spread in `lazy [...]` is the rest of the sequence, so it comes last — write `lazy [a, ...rest]`")) }
+        else { ok_e(r.p, mk_expr(ESurface(SfLazy(bracket)), t.line, t.col)) }
+    }
+  }
+}
+
+# `[first..last]`. `p0` is at `first` and `p1` at the `..` after it.
+fn parse_range_end(p0: Parser, p1: Parser, first: Expr, t: Token) : PExpr / Console {
+  let pe = p_skip_newlines(p_advance(p1))
+  if p_at(pe, TkRbracket) { ok_e(p_advance(pe), mk_expr(ESurface(SfEndlessRange(first, None)), t.line, t.col)) } else {
+  let r = p_expr(pe)
+  match r.r {
+    None -> err_e(r.p)
+    Some(last) -> {
+      let p2 = p_skip_newlines(r.p)
+      if p_at(p2, TkRbracket) {
+        ok_e(p_advance(p2), mk_expr(ERange(first, last, None), t.line, t.col))
+      } else if p_at(p2, TkDotDot) { err_e(reject_trailing_step(p0, p1, p2, first))
+      } else { err_e(p_error_here(p2, "expected `]` at end of range")) }
+    }
+  }
+  }
+}
+
+# `[from..to..step]` is not a form: the error spells the stepped range the
+# author meant, from the source text of the three operands.
+fn reject_trailing_step(p0: Parser, p1: Parser, p2: Parser, first: Expr) : Parser / Console {
+  let r = p_expr(p_skip_newlines(p_advance(p2)))
+  match r.r {
+    None -> r.p
+    Some(step) -> {
+      let form = "a stepped range is written `[first, second..last]`, its step being `second - first`"
+      let from = src_between(p0, p1, 0)
+      let spelled = concat_all([from, " + ", src_between(p2, r.p, 2)])
+      let second = match try_int_literal(first) {
+        Some(a) -> match try_int_literal(step) {
+          Some(d) -> int_to_string(a + d)
+          None    -> spelled
+        }
+        None -> spelled
+      }
+      p_error_here(p2, concat_all([form, " — write `[", from, ", ", second, "..", src_between(p1, p2, 2), "]`"]))
+    }
+  }
+}
+
+# `[first, second..last]`. `p` is at the `..`; `acc` holds the elements
+# before it, newest first.
+fn parse_stepped_range(p: Parser, acc: [ListElem], t: Token) : PExpr / Console = match acc {
+  [ElPlain(second), ElPlain(first)] -> {
+    let pe = p_skip_newlines(p_advance(p))
+    if p_at(pe, TkRbracket) { stepped_range_at(pe, first, second, None, t) } else {
+    let r = p_expr(pe)
+    match r.r {
+      None -> err_e(r.p)
+      Some(last) -> {
+        let p1 = p_skip_newlines(r.p)
+        if not p_at(p1, TkRbracket) { err_e(p_error_here(p1, "expected `]` at end of range")) }
+        else { stepped_range_at(p1, first, second, Some(last), t) }
+      }
+    }
+    }
+  }
+  _ -> err_e(p_error_here(p, "a stepped range takes exactly two elements before `..` — write `[first, second..last]`"))
+}
+
+# After an index's first expr: `..` turns it into a range index
+# (`xs[a..b]`, optionally `..step`); otherwise the expr IS the index.
+#[doc("Parses the rest of an index after its first expression, allowing a range.")]
+pub fn parse_index_range(p: Parser, first: Expr) : PExpr / Console {
+  let p1 = p_skip_newlines(p)
+  if p_at(p1, TkDotDot) {
+    let r2 = p_expr(p_skip_newlines(p_advance(p1)))
+    match r2.r {
+      None -> err_e(r2.p)
+      Some(to) -> {
+        let p2 = p_skip_newlines(r2.p)
+        if p_at(p2, TkDotDot) {
+          let r3 = p_expr(p_skip_newlines(p_advance(p2)))
+          match r3.r {
+            None -> err_e(r3.p)
+            Some(step) ->
+              ok_e(r3.p, mk_expr(ERange(first, to, Some(step)), first.line, first.col))
+          }
+        } else { ok_e(p2, mk_expr(ERange(first, to, None), first.line, first.col)) }
+      }
+    }
+  } else { ok_e(p, first) }
+}
+
+fn parse_list_rest(p: Parser, acc: [ListElem], t: Token) : PExpr / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), mk_expr(EList(list_reverse(acc)), t.line, t.col))
+  } else if p_at(p0, TkDotDot) {
+    parse_stepped_range(p0, acc, t)
+  } else if p_at(p0, TkComma) {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkRbracket) { ok_e(p_advance(p1), mk_expr(EList(list_reverse(acc)), t.line, t.col)) }
+    else { parse_list_elem(p1, acc, t) }
+  } else {
+    err_e(p_error_here(p0, "expected `,` or `]` in list"))
+  }
+}
+
+fn parse_list_elem(p1: Parser, acc: [ListElem], t: Token) : PExpr / Console {
+  let spread = p_at(p1, TkEllipsis)
+  let r = p_expr(if spread { p_advance(p1) } else { p1 })
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> parse_list_rest(r.p, [if spread { ElSpread(e) } else { ElPlain(e) }, ...acc], t)
+  }
+}
+
+# Entry from `parse_primary` on `TkPercent`. The token after `%`
+# selects map (`{`) or set (`[`); anything else is not a literal.
+#[doc("Parses a `%{...}` map or `%[...]` set literal.")]
+pub fn parse_collection_lit(p: Parser, t: Token) : PExpr / Console {
+
+  let after = p_peek1(p)
+  if tk_is(after.kind, TkLbrace) {
+    parse_map_lit(p_advance(p_advance(p)), t)
+  } else if tk_is(after.kind, TkLbracket) {
+    parse_set_lit(p_advance(p_advance(p)), t)
+  } else {
+    err_e(p_error_here(p, "expected expression"))
+  }
+}
+
+fn parse_map_lit(p: Parser, t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_map_lit(None, [], t))
+  } else if p_at(p0, TkEllipsis) {
+    let r = p_expr(p_skip_newlines(p_advance(p0)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(base) -> map_after_spread(r.p, base, [], t)
+    }
+  } else {
+    parse_map_entries(p0, [], t)
+  }
+}
+
+# Collect `k: v` entries (no spread present) into `map.from([Pair])`.
+fn parse_map_entries(p: Parser, acc: [MapEntry], t: Token) : PExpr / Console {
+
+  let r = parse_map_entry(p, t)
+  match r.r {
+    None -> err_e(r.p)
+    Some(entry) -> map_entries_sep(p_skip_newlines(r.p), [entry, ...acc], t)
+  }
+}
+
+# After one entry: `}` (or `,}`) closes, `,` continues, `, ...` is the
+# spread-not-first error, anything else is a separator error.
+fn map_entries_sep(p: Parser, acc: [MapEntry], t: Token) : PExpr / Console {
+
+  if p_at(p, TkRbrace) {
+    ok_e(p_advance(p), mk_map_lit(None, list_reverse(acc), t))
+  } else if not p_at(p, TkComma) {
+    err_e(p_error_here(p, "expected `,` or `}` in map literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    if p_at(p1, TkRbrace) {
+      ok_e(p_advance(p1), mk_map_lit(None, list_reverse(acc), t))
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "map literal admits a single `...` spread, and it must come first"))
+    } else {
+      parse_map_entries(p1, acc, t)
+    }
+  }
+}
+
+# Parse one `key: value`. A bare element (no `:`) is the set-shape mistake.
+fn parse_map_entry(p: Parser, t: Token) : PEntry / Console {
+
+  let rk = p_expr(p)
+  match rk.r {
+    None -> err_entry(rk.p)
+    Some(key) -> {
+      let p1 = p_skip_newlines(rk.p)
+      if p_at(p1, TkColon) {
+        let rv = p_expr(p_skip_newlines(p_advance(p1)))
+        match rv.r {
+          None -> err_entry(rv.p)
+          Some(val) -> ok_entry(rv.p, MapE(key, val))
+        }
+      } else {
+        err_entry(p_error_here(p1,
+          "set element in map literal: use a set literal `%[ ]`, or write `key: value`"))
+      }
+    }
+  }
+}
+
+# Entries after `%{ ...base }`; overrides accumulate in source order.
+fn map_after_spread(p: Parser, base: Expr, acc: [MapEntry], t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_map_lit(Some(base), list_reverse(acc), t))
+  } else if not p_at(p0, TkComma) {
+    err_e(p_error_here(p0, "expected `,` or `}` after `...` source in map literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkRbrace) {
+      ok_e(p_advance(p1), mk_map_lit(Some(base), list_reverse(acc), t))
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "map literal admits a single `...` spread; remove the second one"))
+    } else {
+      let r = parse_map_entry(p1, t)
+      match r.r {
+        None -> err_e(r.p)
+        Some(entry) -> map_after_spread(r.p, base, [entry, ...acc], t)
+      }
+    }
+  }
+}
+
+fn parse_set_lit(p: Parser, t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), mk_set_lit(None, [], t))
+  } else if p_at(p0, TkEllipsis) {
+    let r = p_expr(p_skip_newlines(p_advance(p0)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(base) -> set_after_spread(r.p, base, [], t)
+    }
+  } else {
+    parse_set_elems(p0, [], t)
+  }
+}
+
+fn parse_set_elems(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
+
+  let r = parse_set_elem(p, t)
+  match r.r {
+    None -> err_e(r.p)
+    Some(elem) -> set_elems_sep(p_skip_newlines(r.p), [elem, ...acc], t)
+  }
+}
+
+# After one element: `]` (or `,]`) closes, `,` continues, `, ...` is
+# the spread-not-first error, anything else is a separator error.
+fn set_elems_sep(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
+
+  if p_at(p, TkRbracket) {
+    ok_e(p_advance(p), mk_set_lit(None, list_reverse(acc), t))
+  } else if not p_at(p, TkComma) {
+    err_e(p_error_here(p, "expected `,` or `]` in set literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p))
+    if p_at(p1, TkRbracket) {
+      ok_e(p_advance(p1), mk_set_lit(None, list_reverse(acc), t))
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "set literal admits a single `...` spread, and it must come first"))
+    } else {
+      parse_set_elems(p1, acc, t)
+    }
+  }
+}
+
+# Parse one set element. A `key: value` pair is the map-shape mistake.
+fn parse_set_elem(p: Parser, t: Token) : PExpr / Console {
+
+  let r = p_expr(p)
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkColon) {
+        err_e(p_error_here(p1,
+          "key:value pair in set literal: use a map literal `%{ }`"))
+      } else {
+        ok_e(r.p, e)
+      }
+    }
+  }
+}
+
+fn set_after_spread(p: Parser, base: Expr, acc: [Expr], t: Token) : PExpr / Console {
+
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), mk_set_lit(Some(base), list_reverse(acc), t))
+  } else if not p_at(p0, TkComma) {
+    err_e(p_error_here(p0, "expected `,` or `]` after `...` source in set literal"))
+  } else {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkRbracket) {
+      ok_e(p_advance(p1), mk_set_lit(Some(base), list_reverse(acc), t))
+    } else if p_at(p1, TkEllipsis) {
+      err_e(p_error_here(p1,
+        "set literal admits a single `...` spread; remove the second one"))
+    } else {
+      let r = parse_set_elem(p1, t)
+      match r.r {
+        None -> err_e(r.p)
+        Some(e) -> set_after_spread(r.p, base, [e, ...acc], t)
+      }
+    }
+  }
+}
+
+#[doc("Reports whether a spread entry appears before the last element.")]
+pub fn spread_before_last(bracket: Expr) : Bool = match bracket.kind {
+  EList(elems) -> any(drop(list_reverse(elems), 1), (el) => match el { ElSpread(_) -> true ElPlain(_) -> false })
+  _            -> false
+}
+
+#[doc("""
+A list has an end: `r` is the bracket `p` opens, and a range without
+one is an error that spells the lazy sequence it is.
+""")]
+pub fn reject_endless(p: Parser, r: PExpr) : PExpr / Console = match r.r {
+  None    -> r
+  Some(e) -> match e.kind {
+    ESurface(SfEndlessRange(_, _)) ->
+      err_e(p_error(r.p, p_peek(p), concat_all(["a list has an end; a range without one is a lazy sequence — write `lazy ", src_between(p, r.p, 0), "`"])))
+    _ -> r
+  }
+}
+
+#[doc("The source between the token at `a`, less its first `skip` bytes, and the token at `b`.")]
+pub fn src_between(a: Parser, b: Parser, skip: Int) : String {
+  let lo = p_peek(a).start + skip
+  trim(string_slice(a.src, lo, p_peek(b).start - lo))
+}
+
+#[doc("The step of a stepped range whose leading elements fix it: two Int literals, two Char literals, or `second` written as the name `first` plus a literal.")]
+pub fn literal_step(first: Expr, second: Expr) : Option[Int] = match first.kind {
+  EChar(a) -> match second.kind {
+    EChar(b) -> Some(char_to_int(b) - char_to_int(a))
+    _        -> None
+  }
+  EName(_) -> match second.kind {
+    EBinop(BoAdd, base, k) -> if same_name(first, base) { try_int_literal(k) } else { None }
+    _                      -> None
+  }
+  _ -> match try_int_literal(first) {
+    Some(a) -> match try_int_literal(second) {
+      Some(b) -> Some(b - a)
+      None    -> None
+    }
+    None -> None
+  }
+}
+
+fn same_name(a: Expr, b: Expr) : Bool = match a.kind {
+  EName(x) -> match b.kind {
+    EName(y) -> written_text(x) == written_text(y)
+    _        -> false
+  }
+  _ -> false
+}
+
+#[doc("`p` is at the `]` closing a stepped range; with no `last` it is endless.")]
+pub fn stepped_range_at(p: Parser, first: Expr, second: Expr, last: Option[Expr], t: Token) : PExpr / Console = match literal_step(first, second) {
+  Some(0) -> err_e(p_error(p, t, "the first two elements of a stepped range must differ: their difference is the step, and a step of zero never ends"))
+  _       -> ok_e(p_advance(p), mk_expr(ESurface(match last {
+    Some(hi) -> SfSteppedRange(first, second, hi)
+    None     -> SfEndlessRange(first, Some(second))
+  }), t.line, t.col))
+}
+
+#[doc("Builds a map literal expression.")]
+pub fn mk_map_lit(spread: Option[Expr], entries: [MapEntry], t: Token) : Expr =
+  mk_expr(ESurface(SfMapLit(spread, entries_flatten(entries, []))), t.line, t.col)
+
+fn entries_flatten(entries: [MapEntry], acc: [Expr]) : [Expr] = match entries {
+  [] -> list_reverse(acc)
+  [MapE(k, v), ...rest] -> entries_flatten(rest, [v, k, ...acc])
+}
+
+#[doc("""
+`%[]` -> set.empty(); `%[ e ]` -> set.from([e]);
+`%[ ...base, e ]` -> set.insert chain over base.
+""")]
+pub fn mk_set_lit(spread: Option[Expr], elems: [Expr], t: Token) : Expr =
+  mk_expr(ESurface(SfSetLit(spread, elems)), t.line, t.col)
