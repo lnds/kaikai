@@ -405,7 +405,7 @@ cell_core cell_perform_ids
 out=$(cell_dump cell_perform_ids_stdlib)
 need '^kperform _kaiu_lam_captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
 need '^kperform stream__count State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
-need '^kperform math__bigint_limbs__mag_mul State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
+need '^kperform stream__foldl State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
 cell_core cell_perform_ids_stdlib
 out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
   | grep -v /negative/ \
