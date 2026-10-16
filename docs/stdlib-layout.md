@@ -491,7 +491,8 @@ Single top-level module. Contains both the types (`Instant`,
 
 - `time` — `WallTime`, `Instant`, `Duration`, `now()` (wall),
   `monotonic()`, comparison/subtraction on instants, duration
-  arithmetic (millis, seconds, minutes, …), `sleep(d)`,
+  arithmetic (millis, seconds, minutes, …; `Duration` also answers
+  `+`, `-`, `* Int`, `/ Int`, `==` and ordering), `sleep(d)`,
   `deadline_in(d)` — integrates with `Cancel`
 
 ### date (pure; `today()` rides `/ Clock`)
