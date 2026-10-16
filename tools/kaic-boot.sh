@@ -69,8 +69,8 @@ boot_platform() {
 # emitted into the C, so they are inputs of a kaic2-class boot.
 core_files() {
   files="$(sed -n '/^pub fn core_module_files()/,/^]/s/^ *"\([^"]*\.kai\)",*$/\1/p' \
-    "$STAGE2/compiler/driver_core_load.kai")"
-  [ -n "$files" ] || die "core module set not found in stage2/compiler/driver_core_load.kai"
+    "$STAGE2/compiler/modules_paths.kai")"
+  [ -n "$files" ] || die "core module set not found in stage2/compiler/modules_paths.kai"
   echo "$files"
 }
 

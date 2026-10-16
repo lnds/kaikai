@@ -28,7 +28,7 @@ echo 9.9.9     > "$root/VERSION"
 echo hanga-roa > "$root/EDITION"
 echo 'fn main() = 0'  > "$root/stage2/main.kai"
 echo 'fn a() = 1'     > "$root/stage2/compiler/a.kai"
-cat > "$root/stage2/compiler/driver_core_load.kai" <<'EOF'
+cat > "$root/stage2/compiler/modules_paths.kai" <<'EOF'
 pub fn core_module_files() : [String] = [
   "core/x.kai",
   "effects.kai"

@@ -230,6 +230,9 @@ run_check_script "module_tests_once" "module_tests_once/check.sh"
 # The law checks of an impl in a non-root module read that module's names.
 run_check_script "module_law_checks" "module_law_checks/check.sh"
 
+# A user file named like a core module is the user's module.
+run_check_script "shadowed_core_names" "shadowed_core_names/check.sh"
+
 # `kai test -j` builds test binaries in parallel yet reads exactly as -j 1.
 run_check_script "parallel_test_builds" "parallel_test_builds/check.sh"
 
