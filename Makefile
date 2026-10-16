@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-symid-names test-field-types test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 test-light-partition test-core-cache-tid test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit test-core-full
+.PHONY: fast-gates kaic2-gates test-fmt-classify test-symid-names-static test-symid-names-compiled bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-field-types test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 test-light-partition test-core-cache-tid test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit test-core-full
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -222,7 +222,7 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-symid-names test-respelling-confined test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-light-partition test-core-cache-tid test-rc-budget test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-builtin-table test-kai-builtins
+tier0: selfhost tier0-gates
 	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, kaic1 resolves imports across a multi-module package, two modules declaring one function name mint two C symbols, a symbol's owner is a module symbol's id, unbox, perceus and KPerform read the resolved ids, every stage2 module is reachable from main.kai, RC-string prims keep their shared-let binders in Perceus scope, #!/bin/sh scripts parse under dash, the native self-host gate consumes the published kaic2 instead of rebuilding it, the compiler allocates within its ceiling compiling a fixed program, the whole core types and emits, a KAI_LLVM=1 kaic2 that cannot emit native is not left installed, every target that runs bin/kai depends on what builds it, no new hand-rolled ExprKind or Decl walker closed by a catch-all, every builtin has its C and native thunk at its arity"
 
 # tier0 minus the selfhost. The selfhost is two whole compiler generations
@@ -230,7 +230,21 @@ tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident 
 # the two as separate jobs so a broken gate reports in a couple of minutes
 # instead of waiting behind the selfhost, and the two run concurrently
 # rather than in series. Locally `tier0` stays the single pre-commit gate.
-tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-symid-names test-respelling-confined test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-light-partition test-core-cache-tid test-rc-budget test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-builtin-table test-kai-builtins
+# Gates that read only sources and scripts: no compiler is built or run, so
+# CI reports them from a job that does not wait for the build.
+FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-canonical-aliases test-release-platforms test-kaic-boot
+
+# The tier0 gates that need a built kaic2, cheapest first so a break reports
+# before the slow demos and cache gates.
+KAIC2_GATES := test-fmt-classify test-symid-names-compiled test-builtin-table test-kai-builtins test-symtab test-resolve-sym test-symid-pipeline test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-kai-namespace test-native-namespace test-module-name-ident test-rboxed-prim-scope test-heap-limit test-evidence-frame test-tls-hoist-gate test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-core-cache-tid test-rc-budget demos-no-regression
+
+fast-gates: $(FAST_GATES)
+	@echo "fast-gates OK — every tier0 gate that needs no compiler"
+
+kaic2-gates: $(KAIC2_GATES)
+	@echo "kaic2-gates OK — every tier0 gate that needs a built kaic2, except the selfhost"
+
+tier0-gates: fast-gates kaic2-gates
 	@echo "tier0-gates OK — every tier0 gate except the selfhost"
 
 # A ceiling on the cells the compiler allocates compiling a fixed
@@ -340,8 +354,11 @@ test-field-types: kaic2
 # only in listed functions, a reference by text is built only before the
 # resolver, and no `==` compares a value holding a written name. `--final`
 # also fails on any row of tools/symid-census/pending-written.txt.
-test-symid-names: kaic2
-	@./tools/symid-names-gate.sh --final
+test-symid-names-static:
+	@./tools/symid-names-gate.sh --final --static
+
+test-symid-names-compiled: kaic2
+	@./tools/symid-names-gate.sh --final --compiled
 
 # A contested declaration's emitted name is spelled by one function, from
 # its id: a second file minting a home spelling is a second rule, and the
@@ -561,7 +578,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-field-types test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
+tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-field-types test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-cli-flags test-kai-cli
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke + Perceus RC leak ledger (240 fixtures pinned)"
 
 # CI sharding (docs/ci-time-analysis.md §7). The tier1 work is split across
@@ -632,7 +649,7 @@ TIER1_LIGHT_OPT ?= -O0
 tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES) TIER1_SELFHOSTS=$(TIER1_SELFHOSTS) LIGHT_OPT=$(TIER1_LIGHT_OPT)
 tier1-shard-start = @date +%s > stage2/build/tier1-shard.start
 tier1-shard-wall = @echo "tier1-shard-wall $(1) $$(( $$(date +%s) - $$(cat stage2/build/tier1-shard.start) )) selfhosts=$(TIER1_SELFHOSTS)"
-TIER1_CLI_TAIL := test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
+TIER1_CLI_TAIL := test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-doc test-upgrade-resolver test-cli-flags test-kai-cli
 
 test-core-cache-tid: kaic2
 	$(MAKE) -C stage2 test-core-cache-tid
@@ -959,6 +976,10 @@ test-fmt-help-scope: kaic2
 # change. shard-3 is unconditional and has headroom.
 test-fmt-property: kaic2
 	@./tests/fmt_property.sh
+
+# Every example is measured or excluded by design; parse-only, whole corpus.
+test-fmt-classify: kaic2
+	@./tests/fmt_property.sh --classify
 
 # Coverage of the namespace collision corpus is a checked property, not
 # a judgement call: every cell of the matrix names a fixture that exists
