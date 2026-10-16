@@ -10,6 +10,7 @@ import compiler.kind_resolve
 import compiler.infer
 import compiler.infer_unit_habitant
 import compiler.infer_unit_expr
+import compiler.diag
 import compiler.diag_file
 import compiler.proto_resolve
 import compiler.modules_homes
@@ -17,8 +18,7 @@ import compiler.modules_homes
 # Unit hygiene: walk every `UnitExprT` reachable from the decl
 # stream and report an error for each `USym(name)` whose `name` is
 # neither a built-in dimension symbol nor declared by a `unit` decl
-# present in the merged stream. Returns the number of diagnostics
-# emitted; the driver folds it into the exit-code aggregator.
+# present in the merged stream. Returns the diagnostics found.
 #
 # Scoping rules:
 #   - A unit name is module-scoped: the kind-resolution pass resolves
@@ -32,8 +32,8 @@ import compiler.modules_homes
 #     in `validate_unit_refs_decl` itself.
 #[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver; `ps` settles a type head from the file that writes it.")]
 pub fn validate_unit_refs_decls(decls: [Decl], ps: PScope, scope: UnitScope,
-                              df: DiagFiles) : Int / Console + File =
-  validate_unit_refs_decls_loop(decls, UnitCx { units: scope, ps: ps, home: None }, df, 0)
+                              df: DiagFiles) : [Diagnostic] =
+  validate_unit_refs_decls_loop(decls, UnitCx { units: scope, ps: ps, home: None }, df, [])
 
 # The unit scope in force, and where a type head is settled from: the
 # program's scopes and the home of the declaration being walked.
@@ -41,12 +41,12 @@ type UnitCx = { units: UnitScope, ps: PScope, home: Option[String] }
 
 
 fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitCx,
-                                    df: DiagFiles, errs: Int) : Int / Console + File {
+                                    df: DiagFiles, errs: [Diagnostic]) : [Diagnostic] {
   match decls {
     [] -> errs
     [d, ...rest] -> {
       let here = UnitCx { ...scope, home: decl_slot(d, ps_root(scope.ps)) }
-      let e1 = errs + validate_unit_refs_decl(d, here, decl_diag_file(d, df))
+      let e1 = errs ++ validate_unit_refs_decl(d, here, decl_diag_file(d, df))
       validate_unit_refs_decls_loop(rest, scope, df, e1)
     }
   }
@@ -61,55 +61,55 @@ fn decl_slot(d: Decl, root: String) : Option[String] = {
 # The `DImpl` arm re-enters the walk for the methods, which already
 # resolved their file from the enclosing decl.
 fn validate_unit_refs_sub_decls(decls: [Decl], scope: UnitCx,
-                                  file: String, errs: Int) : Int / Console + File {
+                                  file: String, errs: [Diagnostic]) : [Diagnostic] {
   match decls {
     [] -> errs
     [d, ...rest] ->
       validate_unit_refs_sub_decls(rest, scope, file,
-                                     errs + validate_unit_refs_decl(d, scope, file))
+                                     errs ++ validate_unit_refs_decl(d, scope, file))
   }
 }
 
-fn validate_unit_refs_decl(d: Decl, scope: UnitCx, file: String) : Int / Console + File = match d {
+fn validate_unit_refs_decl(d: Decl, scope: UnitCx, file: String) : [Diagnostic] = match d {
   DFn(_, _, _, ps, ret, _, body, _, _, _) -> {
-    let e0 = validate_unit_refs_params(ps, scope, file, 0)
+    let e0 = validate_unit_refs_params(ps, scope, file, [])
     let e1 = match ret {
-      Some(te) -> e0 + validate_unit_refs_te(te, scope, file)
+      Some(te) -> e0 ++ validate_unit_refs_te(te, scope, file)
       None -> e0
     }
-    e1 + validate_unit_refs_expr(body, scope, file)
+    e1 ++ validate_unit_refs_expr(body, scope, file)
   }
   DType(_, _, _, body, _, _, _, _) -> validate_unit_refs_typebody(body, scope, file)
   # a unit alias body is shape-checked at its declaration —
   # expansion happens after this pass, so a Module-kind product could
   # otherwise ride in through the alias name.
   DUnit(_, _, UBAlias(body), _, line, col, _) ->
-    validate_unit_expr(body, scope.units, file, line, col) +
-    validate_module_unit_shape(body, scope.units, file, line, col) +
+    validate_unit_expr(body, scope.units, file, line, col) ++
+    validate_module_unit_shape(body, scope.units, file, line, col) ++
     validate_semilattice_unit_shape(body, scope.units, file, line, col)
   DTest(_, body, _, _, _) -> validate_unit_refs_expr(body, scope, file)
   DBench(_, body, _, _, _) -> validate_unit_refs_expr(body, scope, file)
   DCheck(_, ps, body, _, _, _) ->
-    validate_unit_refs_params(ps, scope, file, 0) +
+    validate_unit_refs_params(ps, scope, file, []) ++
     validate_unit_refs_expr(body, scope, file)
-  DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, 0)
+  DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, [])
   DImpl(_, _, _, sub_decls, _, _, _, _) ->
-    validate_unit_refs_sub_decls(sub_decls, scope, file, 0)
+    validate_unit_refs_sub_decls(sub_decls, scope, file, [])
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DUnstable(inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DProtoLaws(_, inner, _, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DImplAxiom(_, inner, _, _, _) -> validate_unit_refs_decl(inner, scope, file)
   DConstructor(inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
-  _ -> 0
+  _ -> []
 }
 
 
 fn validate_unit_refs_params(ps: [Param], scope: UnitCx, file: String,
-                                acc: Int) : Int / Console + File = match ps {
+                                acc: [Diagnostic]) : [Diagnostic] = match ps {
   [] -> acc
   [p, ...rest] -> {
     let e1 = match p.ptype {
-      Some(te) -> acc + validate_unit_refs_te(te, scope, file)
+      Some(te) -> acc ++ validate_unit_refs_te(te, scope, file)
       None -> acc
     }
     validate_unit_refs_params(rest, scope, file, e1)
@@ -117,177 +117,177 @@ fn validate_unit_refs_params(ps: [Param], scope: UnitCx, file: String,
 }
 
 fn validate_unit_refs_eops(ops: [EffectOp], scope: UnitCx, file: String,
-                              acc: Int) : Int / Console + File = match ops {
+                              acc: [Diagnostic]) : [Diagnostic] = match ops {
   [] -> acc
   [op, ...rest] -> match op {
     EffOp(_, _, ps, ret, _, _) -> {
-      let e1 = acc + validate_unit_refs_params(ps, scope, file, 0) +
+      let e1 = acc ++ validate_unit_refs_params(ps, scope, file, []) ++
                 validate_unit_refs_te(ret, scope, file)
       validate_unit_refs_eops(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_typebody(b: TypeBody, scope: UnitCx, file: String) : Int / Console + File = match b {
+fn validate_unit_refs_typebody(b: TypeBody, scope: UnitCx, file: String) : [Diagnostic] = match b {
   TBAlias(te) -> validate_unit_refs_te(te, scope, file)
-  TBRecord(fs) -> validate_unit_refs_fdecls(fs, scope, file, 0)
-  TBSum(vs) -> validate_unit_refs_variants(vs, scope, file, 0)
-  TBEffectAlias(_) -> 0
+  TBRecord(fs) -> validate_unit_refs_fdecls(fs, scope, file, [])
+  TBSum(vs) -> validate_unit_refs_variants(vs, scope, file, [])
+  TBEffectAlias(_) -> []
 }
 
 fn validate_unit_refs_fdecls(fs: [FieldDecl], scope: UnitCx, file: String,
-                                acc: Int) : Int / Console + File = match fs {
+                                acc: [Diagnostic]) : [Diagnostic] = match fs {
   [] -> acc
   [f, ...rest] -> match f {
     FD(_, _, te, _) -> {
-      let e1 = acc + validate_unit_refs_te(te, scope, file)
+      let e1 = acc ++ validate_unit_refs_te(te, scope, file)
       validate_unit_refs_fdecls(rest, scope, file, e1)
     }
   }
 }
 
 fn validate_unit_refs_variants(vs: [Variant], scope: UnitCx, file: String,
-                                  acc: Int) : Int / Console + File = match vs {
+                                  acc: [Diagnostic]) : [Diagnostic] = match vs {
   [] -> acc
   [v, ...rest] -> match v {
     Var(_, payload_tes) -> {
-      let e1 = acc + validate_unit_refs_te_list(payload_tes, scope, file, 0)
+      let e1 = acc ++ validate_unit_refs_te_list(payload_tes, scope, file, [])
       validate_unit_refs_variants(rest, scope, file, e1)
     }
   }
 }
 
-fn validate_unit_refs_te(te: TypeExpr, scope: UnitCx, file: String) : Int / Console + File = match te.tkind {
-  TyName(_, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
-  TyParam(_, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
+fn validate_unit_refs_te(te: TypeExpr, scope: UnitCx, file: String) : [Diagnostic] = match te.tkind {
+  TyName(_, targs) -> validate_unit_refs_te_list(targs, scope, file, [])
+  TyParam(_, targs) -> validate_unit_refs_te_list(targs, scope, file, [])
   TyList(inner) -> validate_unit_refs_te(inner, scope, file)
-  TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, scope, file, 0) +
+  TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, scope, file, []) ++
                        validate_unit_refs_te(ret, scope, file)
-  TyDim(base, u) -> validate_unit_refs_te(base, scope, file) +
-                     validate_unit_expr(u, scope.units, file, te.line, te.col) +
-                     validate_module_unit_shape(u, scope.units, file, te.line, te.col) +
-                     validate_semilattice_unit_shape(u, scope.units, file, te.line, te.col) +
+  TyDim(base, u) -> validate_unit_refs_te(base, scope, file) ++
+                     validate_unit_expr(u, scope.units, file, te.line, te.col) ++
+                     validate_module_unit_shape(u, scope.units, file, te.line, te.col) ++
+                     validate_semilattice_unit_shape(u, scope.units, file, te.line, te.col) ++
                      validate_habitant_slots(scope.ps, scope.home, base, u, scope.units, file, te.line, te.col)
   TyRefine(base, _) -> validate_unit_refs_te(base, scope, file)
   # a compound row as a type argument — validate units
   # inside any parameterised labels it carries (`Reader[Int<m>]`).
   TyRow(row) -> validate_unit_refs_row(row, scope, file)
-  TySurface(ts) -> validate_unit_refs_te_list(tysurface_children(ts), scope, file, 0)
+  TySurface(ts) -> validate_unit_refs_te_list(tysurface_children(ts), scope, file, [])
 }
 
 # The head type name of a `TyDim`'s base (`Vec[Real]` -> `Vec`), or
 # empty when the base is not a named type.
-fn validate_unit_refs_row(row: RowExpr, scope: UnitCx, file: String) : Int / Console + File =
+fn validate_unit_refs_row(row: RowExpr, scope: UnitCx, file: String) : [Diagnostic] =
   match row {
-    REmpty -> 0
-    RClosed(labels) -> validate_unit_refs_rls(labels, scope, file, 0)
-    ROpen(_, labels) -> validate_unit_refs_rls(labels, scope, file, 0)
+    REmpty -> []
+    RClosed(labels) -> validate_unit_refs_rls(labels, scope, file, [])
+    ROpen(_, labels) -> validate_unit_refs_rls(labels, scope, file, [])
   }
 
 fn validate_unit_refs_rls(ls: [RowLabel], scope: UnitCx, file: String,
-                             acc: Int) : Int / Console + File = match ls {
+                             acc: [Diagnostic]) : [Diagnostic] = match ls {
   [] -> acc
   [RL(_, ts), ...rest] -> {
-    let e1 = acc + validate_unit_refs_te_list(ts, scope, file, 0)
+    let e1 = acc ++ validate_unit_refs_te_list(ts, scope, file, [])
     validate_unit_refs_rls(rest, scope, file, e1)
   }
 }
 
 fn validate_unit_refs_te_list(ts: [TypeExpr], scope: UnitCx, file: String,
-                                 acc: Int) : Int / Console + File = match ts {
+                                 acc: [Diagnostic]) : [Diagnostic] = match ts {
   [] -> acc
   [t, ...rest] -> {
-    let e1 = acc + validate_unit_refs_te(t, scope, file)
+    let e1 = acc ++ validate_unit_refs_te(t, scope, file)
     validate_unit_refs_te_list(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_expr(e: Expr, scope: UnitCx, file: String) : Int / Console + File =
+fn validate_unit_refs_expr(e: Expr, scope: UnitCx, file: String) : [Diagnostic] =
   validate_unit_refs_kind(e.kind, scope, file, e.line, e.col)
 
 fn validate_unit_refs_kind(k: ExprKind, scope: UnitCx, file: String,
-                              line: Int, col: Int) : Int / Console + File = match k {
-  EInt(_, _)        -> 0
-  EReal(_, _)       -> 0
-  EIntLit(_)        -> 0
-  EDecimalLit(_)    -> 0
-  EFixed(_, _)      -> 0
-  EBool(_)       -> 0
-  EChar(_)       -> 0
-  EStr(_, _)     -> 0
-  EUnit          -> 0
-  EName(_)        -> 0
-  EMark(_)        -> 0
-  ESym(_, _)      -> 0
-  ELocal(_)       -> 0
-  EOp(_)          -> 0
-  EUnder         -> 0
-  EPlaceholder   -> 0
-  EHole(_)       -> 0
-  ETodo(_)       -> 0
-  EExternBody(_, _) -> 0
-  EVariantsOf(_, _) -> 0
-  EModCall(_, _) -> 0
-  EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, scope, file, 0)
-  ESurface(sf) -> validate_unit_refs_expr_list(surface_children(sf), scope, file, 0)
-  ECall(callee, args_) -> validate_unit_refs_expr(callee, scope, file) +
-                           validate_unit_refs_expr_list(args_, scope, file, 0)
+                              line: Int, col: Int) : [Diagnostic] = match k {
+  EInt(_, _)        -> []
+  EReal(_, _)       -> []
+  EIntLit(_)        -> []
+  EDecimalLit(_)    -> []
+  EFixed(_, _)      -> []
+  EBool(_)       -> []
+  EChar(_)       -> []
+  EStr(_, _)     -> []
+  EUnit          -> []
+  EName(_)        -> []
+  EMark(_)        -> []
+  ESym(_, _)      -> []
+  ELocal(_)       -> []
+  EOp(_)          -> []
+  EUnder         -> []
+  EPlaceholder   -> []
+  EHole(_)       -> []
+  ETodo(_)       -> []
+  EExternBody(_, _) -> []
+  EVariantsOf(_, _) -> []
+  EModCall(_, _) -> []
+  EIntrinsic(_, args_) -> validate_unit_refs_expr_list(args_, scope, file, [])
+  ESurface(sf) -> validate_unit_refs_expr_list(surface_children(sf), scope, file, [])
+  ECall(callee, args_) -> validate_unit_refs_expr(callee, scope, file) ++
+                           validate_unit_refs_expr_list(args_, scope, file, [])
   EField(base, _) -> validate_unit_refs_expr(base, scope, file)
-  EIndex(a, b) -> validate_unit_refs_expr(a, scope, file) +
+  EIndex(a, b) -> validate_unit_refs_expr(a, scope, file) ++
                   validate_unit_refs_expr(b, scope, file)
-  EBinop(_, a, b) -> validate_unit_refs_expr(a, scope, file) +
+  EBinop(_, a, b) -> validate_unit_refs_expr(a, scope, file) ++
                      validate_unit_refs_expr(b, scope, file)
   EUnop(_, x) -> validate_unit_refs_expr(x, scope, file)
-  EIf(c, t_, eo) -> validate_unit_refs_expr(c, scope, file) +
-                     validate_unit_refs_expr(t_, scope, file) +
+  EIf(c, t_, eo) -> validate_unit_refs_expr(c, scope, file) ++
+                     validate_unit_refs_expr(t_, scope, file) ++
                      validate_unit_refs_opt_expr(eo, scope, file)
-  EMatch(scr, arms) -> validate_unit_refs_expr(scr, scope, file) +
-                        validate_unit_refs_arms(arms, scope, file, 0)
+  EMatch(scr, arms) -> validate_unit_refs_expr(scr, scope, file) ++
+                        validate_unit_refs_arms(arms, scope, file, [])
   ELambda(_, b) -> validate_unit_refs_expr(b, scope, file)
-  ERecordLit(_, fs) -> validate_unit_refs_fields(fs, scope, file, 0)
-  EList(els) -> validate_unit_refs_elems(els, scope, file, 0)
-  ERange(a, b, opt_step) -> validate_unit_refs_expr(a, scope, file) +
-                             validate_unit_refs_expr(b, scope, file) +
+  ERecordLit(_, fs) -> validate_unit_refs_fields(fs, scope, file, [])
+  EList(els) -> validate_unit_refs_elems(els, scope, file, [])
+  ERange(a, b, opt_step) -> validate_unit_refs_expr(a, scope, file) ++
+                             validate_unit_refs_expr(b, scope, file) ++
                              validate_unit_refs_opt_expr(opt_step, scope, file)
-  EBlock(stmts, tail) -> validate_unit_refs_stmts(stmts, scope, file, 0) +
+  EBlock(stmts, tail) -> validate_unit_refs_stmts(stmts, scope, file, []) ++
                           validate_unit_refs_opt_expr(tail, scope, file)
-  EPipe(a, b)        -> validate_unit_refs_expr(a, scope, file) +
+  EPipe(a, b)        -> validate_unit_refs_expr(a, scope, file) ++
                          validate_unit_refs_expr(b, scope, file)
-  EDispatchPipe(_, a, b) -> validate_unit_refs_expr(a, scope, file) +
+  EDispatchPipe(_, a, b) -> validate_unit_refs_expr(a, scope, file) ++
                          validate_unit_refs_expr(b, scope, file)
   EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
-    validate_unit_refs_expr(body, scope, file) +
-    validate_unit_refs_opt_expr(init_opt, scope, file) +
-    validate_unit_refs_clauses(clauses, scope, file, 0) +
+    validate_unit_refs_expr(body, scope, file) ++
+    validate_unit_refs_opt_expr(init_opt, scope, file) ++
+    validate_unit_refs_clauses(clauses, scope, file, []) ++
     validate_unit_refs_opt_return(ret_opt, scope, file)
-  ELitUnit(inner, u) -> validate_unit_refs_expr(inner, scope, file) +
-                         validate_unit_expr(u, scope.units, file, line, col) +
-                         validate_module_unit_shape(u, scope.units, file, line, col) +
+  ELitUnit(inner, u) -> validate_unit_refs_expr(inner, scope, file) ++
+                         validate_unit_expr(u, scope.units, file, line, col) ++
+                         validate_module_unit_shape(u, scope.units, file, line, col) ++
                          validate_semilattice_unit_shape(u, scope.units, file, line, col)
   EBang(inner) -> validate_unit_refs_expr(inner, scope, file)
 }
 
 fn validate_unit_refs_expr_list(es: [Expr], scope: UnitCx, file: String,
-                                   acc: Int) : Int / Console + File = match es {
+                                   acc: [Diagnostic]) : [Diagnostic] = match es {
   [] -> acc
   [e, ...rest] -> {
-    let e1 = acc + validate_unit_refs_expr(e, scope, file)
+    let e1 = acc ++ validate_unit_refs_expr(e, scope, file)
     validate_unit_refs_expr_list(rest, scope, file, e1)
   }
 }
 
 fn validate_unit_refs_opt_expr(opt: Option[Expr], scope: UnitCx,
-                                  file: String) : Int / Console + File = match opt {
-  None -> 0
+                                  file: String) : [Diagnostic] = match opt {
+  None -> []
   Some(e) -> validate_unit_refs_expr(e, scope, file)
 }
 
 fn validate_unit_refs_arms(arms: [Arm], scope: UnitCx, file: String,
-                              acc: Int) : Int / Console + File = match arms {
+                              acc: [Diagnostic]) : [Diagnostic] = match arms {
   [] -> acc
   [a, ...rest] -> match a {
     Arm(_, g, b) -> {
-      let e1 = acc + validate_unit_refs_opt_expr(g, scope, file) +
+      let e1 = acc ++ validate_unit_refs_opt_expr(g, scope, file) ++
                 validate_unit_refs_expr(b, scope, file)
       validate_unit_refs_arms(rest, scope, file, e1)
     }
@@ -295,47 +295,47 @@ fn validate_unit_refs_arms(arms: [Arm], scope: UnitCx, file: String,
 }
 
 fn validate_unit_refs_fields(fs: [FieldInit], scope: UnitCx, file: String,
-                                acc: Int) : Int / Console + File = match fs {
+                                acc: [Diagnostic]) : [Diagnostic] = match fs {
   [] -> acc
   [f, ...rest] -> match f {
     FI(_, v) -> {
-      let e1 = acc + validate_unit_refs_expr(v, scope, file)
+      let e1 = acc ++ validate_unit_refs_expr(v, scope, file)
       validate_unit_refs_fields(rest, scope, file, e1)
     }
   }
 }
 
 fn validate_unit_refs_elems(els: [ListElem], scope: UnitCx, file: String,
-                               acc: Int) : Int / Console + File = match els {
+                               acc: [Diagnostic]) : [Diagnostic] = match els {
   [] -> acc
   [el, ...rest] -> {
     let e1 = match el {
-      ElPlain(x)  -> acc + validate_unit_refs_expr(x, scope, file)
-      ElSpread(x) -> acc + validate_unit_refs_expr(x, scope, file)
+      ElPlain(x)  -> acc ++ validate_unit_refs_expr(x, scope, file)
+      ElSpread(x) -> acc ++ validate_unit_refs_expr(x, scope, file)
     }
     validate_unit_refs_elems(rest, scope, file, e1)
   }
 }
 
 fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitCx, file: String,
-                               acc: Int) : Int / Console + File = match stmts {
+                               acc: [Diagnostic]) : [Diagnostic] = match stmts {
   [] -> acc
   [s, ...rest] -> {
     let e1 = match s {
-      SLet(_, ann, rhs)           -> acc + validate_unit_refs_opt_te(ann, scope, file) +
+      SLet(_, ann, rhs)           -> acc ++ validate_unit_refs_opt_te(ann, scope, file) ++
                                            validate_unit_refs_expr(rhs, scope, file)
       SAssert(c, m) -> match m {
-        Some(me) -> acc + validate_unit_refs_expr(c, scope, file) +
+        Some(me) -> acc ++ validate_unit_refs_expr(c, scope, file) ++
                           validate_unit_refs_expr(me, scope, file)
-        None     -> acc + validate_unit_refs_expr(c, scope, file)
+        None     -> acc ++ validate_unit_refs_expr(c, scope, file)
       }
-      SExprStmt(x)                -> acc + validate_unit_refs_expr(x, scope, file)
-      SIndexAssign(b, i, v, _, _) -> acc + validate_unit_refs_expr(b, scope, file) +
-                                            validate_unit_refs_expr(i, scope, file) +
+      SExprStmt(x)                -> acc ++ validate_unit_refs_expr(x, scope, file)
+      SIndexAssign(b, i, v, _, _) -> acc ++ validate_unit_refs_expr(b, scope, file) ++
+                                            validate_unit_refs_expr(i, scope, file) ++
                                             validate_unit_refs_expr(v, scope, file)
-      SAssign(b, v, _, _)         -> acc + validate_unit_refs_expr(b, scope, file) +
+      SAssign(b, v, _, _)         -> acc ++ validate_unit_refs_expr(b, scope, file) ++
                                             validate_unit_refs_expr(v, scope, file)
-      SVar(_, ann, rhs, _, _)     -> acc + validate_unit_refs_opt_te(ann, scope, file) +
+      SVar(_, ann, rhs, _, _)     -> acc ++ validate_unit_refs_opt_te(ann, scope, file) ++
                                            validate_unit_refs_expr(rhs, scope, file)
       SUse(_, _, _)               -> acc
     }
@@ -344,24 +344,24 @@ fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitCx, file: String,
 }
 
 fn validate_unit_refs_clauses(cs: [HClause], scope: UnitCx, file: String,
-                                 acc: Int) : Int / Console + File = match cs {
+                                 acc: [Diagnostic]) : [Diagnostic] = match cs {
   [] -> acc
   [c, ...rest] -> match c {
     HC(_, _, b, _, _) -> {
-      let e1 = acc + validate_unit_refs_expr(b, scope, file)
+      let e1 = acc ++ validate_unit_refs_expr(b, scope, file)
       validate_unit_refs_clauses(rest, scope, file, e1)
     }
   }
 }
 
 fn validate_unit_refs_opt_te(opt: Option[TypeExpr], scope: UnitCx,
-                             file: String) : Int / Console + File = match opt {
-  None -> 0
+                             file: String) : [Diagnostic] = match opt {
+  None -> []
   Some(te) -> validate_unit_refs_te(te, scope, file)
 }
 
 fn validate_unit_refs_opt_return(opt: Option[HReturn], scope: UnitCx,
-                                    file: String) : Int / Console + File = match opt {
-  None -> 0
+                                    file: String) : [Diagnostic] = match opt {
+  None -> []
   Some(r) -> match r { HR(_, b, _, _) -> validate_unit_refs_expr(b, scope, file) }
 }
