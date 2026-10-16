@@ -2475,7 +2475,20 @@ test-region-1123: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	    || { echo "region-1123 DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	done; \
-	echo "region-1123 OK (Tree<r> arena routing + wholesale-free + escape deep-copy-out)"
+	for name in region_in_lambda region_outlined_branch; do \
+	  f=../examples/regions/$$name.kai; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "region-1123 FAIL ($$name: kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q 'kai_arena_push(' build/s2-$$name.c \
+	    || { echo "region-1123 FAIL ($$name: region inside a closure lost its arena)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) 2>/dev/null \
+	    || { echo "region-1123 FAIL ($$name: C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "region-1123 FAIL ($$name: run crashed)"; cat build/s2-$$name.out; exit 1; }; \
+	  diff -q ../examples/regions/$$name.out.expected build/s2-$$name.out > /dev/null \
+	    || { echo "region-1123 DIFF ($$name)"; diff ../examples/regions/$$name.out.expected build/s2-$$name.out; exit 1; }; \
+	done; \
+	echo "region-1123 OK (Tree<r> arena routing + wholesale-free + escape deep-copy-out + region in closure)"
 
 # Native-backend arena routing. The C gate above greps the emitted C for
 # `kai_arena_variant(`; nothing checked the NATIVE binary, so a feature that
