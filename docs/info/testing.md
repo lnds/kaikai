@@ -33,11 +33,14 @@ module imported from the stdlib or from a dependency, directly or
 through another, never adds its blocks to a run: they belong to that
 module's own suite, and run when it is the one under test.
 
-A build runs the blocks of its root file and of every module of the
-same package it loads, so a module with inline blocks runs them under
-the entry and under each test file that imports it. With no
-`kai.toml`, a file's package is the modules it imports from its own
-directory.
+A module's blocks run once, in the package's own binary, and are
+reported under the module's file. A `*_test.kai` or `tests/` file links
+the modules it imports without their blocks and runs only its own. The
+package binary is the entry's build when the entry reaches the module;
+a module the entry does not reach, in a package without an entry too,
+runs as a root of its own once some file of the package imports it.
+With no `kai.toml`, a file's package is the modules it imports from its
+own directory.
 
 `kai bench` and `kai check` follow the same rule.
 
@@ -158,9 +161,9 @@ time, in order. Each file's check output prints right before its
 results, so the output and the exit status are the same at any job
 count.
 
-A file outside the import graph that declares blocks but is not
-named `*_test.kai` cannot safely run as a root, so the driver warns,
-naming the file. A package with no blocks of the kind being run also
+A file outside the import graph that declares blocks, is not named
+`*_test.kai` and that no file of the package imports has nothing to run
+it, so the driver warns, naming the file. A package with no blocks of the kind being run also
 warns instead of passing silently — `0/0 checks passed` no longer
 stands in for "found nothing to run".
 

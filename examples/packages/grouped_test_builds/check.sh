@@ -35,8 +35,8 @@ run() {
   echo "$rc" > "$TMP/rc"
 }
 
-# 1 — a file's run is its own build's blocks in its own build's order, though
-# another file loads the same modules in another order.
+# 1 — a file's run is its own blocks alone, though both files load the same
+# modules; the modules' blocks run once, under their own files.
 mk_pkg order
 printf 'pub fn x() : Int = 1\n\ntest "x block" {\n  assert x() == 1\n}\n' > "$TMP/order/lib/x.kai"
 printf 'pub fn y() : Int = 2\n\ntest "y block" {\n  assert y() == 2\n}\n' > "$TMP/order/lib/y.kai"
@@ -44,10 +44,12 @@ printf 'import lib.x\n\ntest "a" {\n  assert x.x() == 1\n}\n' > "$TMP/order/test
 printf 'import lib.y\nimport lib.x\n\ntest "b" {\n  assert y.y() + x.x() == 3\n}\n' > "$TMP/order/tests/b_test.kai"
 run order
 [ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "the ordered suite did not pass"; }
-got="$(sed -n '/b_test.kai$/,$p' "$TMP/err" | grep -E '^  ok' | tr -s ' ' | tr '\n' '|')"
-[ "$got" = " ok y block| ok x block| ok b|" ] || fail "b_test ran '$got'; want y block, x block, b"
+got="$(sed -n '/b_test.kai$/,/lib\/x.kai$/p' "$TMP/err" | grep -E '^  ok' | tr -s ' ' | tr '\n' '|')"
+[ "$got" = " ok b|" ] || fail "b_test ran '$got'; want b"
 got="$(sed -n '/a_test.kai$/,/b_test.kai$/p' "$TMP/err" | grep -E '^  ok' | tr -s ' ' | tr '\n' '|')"
-[ "$got" = " ok x block| ok a|" ] || fail "a_test ran '$got'; want x block, a"
+[ "$got" = " ok a|" ] || fail "a_test ran '$got'; want a"
+got="$(sed -n '/lib\/x.kai$/,/lib\/y.kai$/p' "$TMP/err" | grep -E '^  ok' | tr -s ' ' | tr '\n' '|')"
+case "$got" in *"ok x block|"*) ;; *) fail "x's block did not run under its own file";; esac
 
 # 2 — a file that does not build alone fails as it does alone: the files before
 # it ran, the ones after did not, though the shared build would compile it.
@@ -75,11 +77,12 @@ run dup
 grep -q "conflicting declarations of extern function" "$TMP/err" || fail "the shared build's error was not reported"
 if grep -q "ok   a" "$TMP/err"; then fail "a test ran although the shared build failed"; fi
 
-# 4 — an unused binding in an imported module's block names that module's file.
+# 4 — an unused binding in an imported module's block names that module's file,
+# where the module's blocks run.
 mk_pkg warn
 printf 'pub fn z() : Int = 1\n\ntest "z" {\n  let idle = 1\n  assert z() == 1\n}\n' > "$TMP/warn/lib/z.kai"
 printf 'import lib.z\n\ntest "a" {\n  assert z.z() == 1\n}\n' > "$TMP/warn/tests/a_test.kai"
-(cd "$TMP/warn" && "$KAI" test tests/a_test.kai > /dev/null 2> "$TMP/err") || fail "the warning suite failed"
+(cd "$TMP/warn" && "$KAI" test . > /dev/null 2> "$TMP/err") || fail "the warning suite failed"
 grep -A1 "unused binding \`idle\`" "$TMP/err" | grep -q "lib/z.kai:4:" || fail "the block's unused binding did not name lib/z.kai"
 
 # 5 — a module that does not parse fails the build though nothing uses it.

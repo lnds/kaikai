@@ -223,6 +223,10 @@ run_check_script "orphan_check_bench_discovery" "orphan_check_bench_discovery/ch
 # not need an entry, so a library is not locked out of package mode.
 run_check_script "library_test_discovery" "library_test_discovery/check.sh"
 
+# A module's blocks run once, in the package binary and under its own file,
+# however many test files import it.
+run_check_script "module_tests_once" "module_tests_once/check.sh"
+
 # `kai test -j` builds test binaries in parallel yet reads exactly as -j 1.
 run_check_script "parallel_test_builds" "parallel_test_builds/check.sh"
 
