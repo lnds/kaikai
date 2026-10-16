@@ -1,6 +1,6 @@
 #[doc("""
-Kind, unit and theory-name declarations plus kind annotations and
-bounds.
+Habitant declarations (`unit`, user introducers), `kind` declarations, habitant slot
+lists, and kind annotations and bounds on type parameters.
 """)]
 
 import compiler.util
@@ -13,17 +13,15 @@ import compiler.parse_state
 import compiler.parse_literals
 import compiler.parse_units
 
+type UnitHead = { is_pub: Bool, name: String, intro: String, t: Token }
+
+fn unit_decl_ok(p: Parser, h: UnitHead, body: UnitBody) : PDecl =
+  ok_dn(p, DUnit(h.is_pub, h.name, body, h.intro, h.t.line, h.t.col, None), [p_ent(p, NCUnit, h.name, h.is_pub)])
+
 #[doc("""
-Parse a habitant declaration. Three shapes, either introducer word:
-  `unit USD` / `metric m`                       — atomic
-  `unit Newton = kg * m / sec^2`                — alias
-  `pct pct70 = 70`                              — measure-carrying
-The RHS disambiguates LL(1): an integer literal other than `1` is a
-measure payload (`= 1` keeps its meaning as the dimensionless alias);
-anything else is a unit alias expression. `t` is the introducer token
-(`unit` or a user kind's word); its source is stored verbatim so the
-formatter round-trips it and the typer maps it to its kind through
-the KindReg.
+Parses a habitant declaration after its introducer `t`, whose source is kept verbatim:
+`unit USD` (atomic), `unit Newton = kg * m / sec^2` (alias) or `pct pct70 = 70` (measure).
+An integer other than `1` after `=` is a measure payload; anything else is a unit alias.
 """)]
 pub fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
   let intro = tok_source(p.src, t)
@@ -31,368 +29,237 @@ pub fn parse_unit_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
   if not tk_is(id.kind, TkIdent) {
     err_d(p_error(p, id, concat_all(["expected a name after `", intro, "`"])))
   } else {
-    let name = tok_source(p.src, id)
+    let h = UnitHead { is_pub: is_pub, name: tok_source(p.src, id), intro: intro, t: t }
     let p1 = p_advance(p)
-    if p_at(p1, TkEq) {
-      parse_unit_rhs(p_skip_newlines(p_advance(p1)), p, is_pub, name, intro, t)
-    } else {
-      ok_dn(p1, DUnit(is_pub, name, UBNone, intro, t.line, t.col, None), [p_ent(p, NCUnit, name, is_pub)])
-    }
+    if p_at(p1, TkEq) { parse_unit_rhs(p_advance_nl(p1), h) } else { unit_decl_ok(p1, h, UBNone) }
   }
 }
 
-fn parse_unit_rhs(p2: Parser, p: Parser, is_pub: Bool, name: String, intro: String, t: Token) : PDecl / Console {
-  let mt = p_peek(p2)
-  if tk_is(mt.kind, TkInt) and not (decode_int(tok_source(p2.src, mt)) == 1) {
-    parse_unit_measure(p2, is_pub, name, intro, t)
-  } else {
-    let rb = parse_unit_expr(p2)
+fn parse_unit_rhs(p: Parser, h: UnitHead) : PDecl / Console {
+  let mt = p_peek(p)
+  if tk_is(mt.kind, TkInt) and decode_int(tok_source(p.src, mt)) != 1 { parse_unit_measure(p, h) }
+  else {
+    let rb = parse_unit_expr(p)
     match rb.r {
       None -> err_d(rb.p)
-      Some(u) -> ok_dn(rb.p, DUnit(is_pub, name, UBAlias(u), intro, t.line, t.col, None), [p_ent(p, NCUnit, name, is_pub)])
+      Some(u) -> unit_decl_ok(rb.p, h, UBAlias(u))
     }
   }
 }
 
-# The measure payload of a habitant declaration: exactly one integer
-# literal. An operator after it means the user wrote an expression,
-# which a measure must not be — the sum a measure-carrying theory
-# verifies has to be exact, so the payload is a literal, not a term.
-fn parse_unit_measure(p: Parser, is_pub: Bool, name: String, intro: String,
-                      t: Token) : PDecl / Console {
-  let lit = tok_source(p.src, p_peek(p))
+fn at_arith_op(p: Parser) : Bool =
+  p_at(p, TkStar) or p_at(p, TkSlash) or p_at(p, TkCaret) or p_at(p, TkPlus) or p_at(p, TkMinus) or p_at(p, TkPercent)
+
+# A measure is one literal, not a term: the sum a measure-carrying theory verifies must be exact.
+fn parse_unit_measure(p: Parser, h: UnitHead) : PDecl / Console {
   let p1 = p_advance(p)
-  if p_at(p1, TkStar) or p_at(p1, TkSlash) or p_at(p1, TkCaret) or
-     p_at(p1, TkPlus) or p_at(p1, TkMinus) or p_at(p1, TkPercent) {
-    err_d(p_error_here(p1, "a habitant measure must be a single exact numeric literal (e.g. `= 70`)"))
-  } else {
-    ok_dn(p1, DUnit(is_pub, name, UBMeasure(lit), intro, t.line, t.col, None), [p_ent(p, NCUnit, name, is_pub)])
-  }
+  if at_arith_op(p1) { err_d(p_error_here(p1, "a habitant measure must be a single exact numeric literal (e.g. `= 70`)")) }
+  else { unit_decl_ok(p1, h, UBMeasure(tok_source(p.src, p_peek(p)))) }
 }
 
-#[doc("""
-`kind` is a CONTEXTUAL keyword: an ordinary identifier everywhere
-but item-declaration position, recognised by shape only (the same
-trick `region` uses). True iff the head is the identifier `kind`
-followed by `IDENT :` — the one shape that is never a valid
-expression or pattern at module scope, so `.kind`, `let kind = 1`,
-`{ kind: 1 }`, and `kind(x)` all fall through as plain identifiers.
-""")]
-pub fn decl_head_is_kind(p: Parser, hd: Token) : Bool {
-  if not tk_is(hd.kind, TkIdent) { false }
-  else if not (tok_source(p.src, hd) == "kind") { false }
-  else {
-    tk_is(p_peek1(p).kind, TkIdent) and tk_is(p_peek2(p).kind, TkColon)
-  }
-}
+# `kind` is contextual: the head `kind IDENT :` is never a valid expression or pattern at module scope.
+#[doc("Reports whether the head is the identifier `kind` followed by `IDENT :`.")]
+pub fn decl_head_is_kind(p: Parser, hd: Token) : Bool =
+  tk_is(hd.kind, TkIdent) and tok_source(p.src, hd) == "kind" and tk_is(p_peek1(p).kind, TkIdent) and tk_is(p_peek2(p).kind, TkColon)
 
-#[doc("""
-A kind-habitant declaration head: an IDENT whose word is a registered
-introducer (`unit`, `currency`, … or one from a `kind … with intro`
-seen anywhere in the file, via the pre-scan) followed by the habitant
-name. Every introducer is contextual, so `let unit = 42` and a typo
-like `retrun x` both fall through to their ordinary handling.
-""")]
-pub fn decl_head_is_user_introducer(p: Parser, hd: Token) : Bool {
-  if not tk_is(hd.kind, TkIdent) { false }
-  else if not kind_reg_is_introducer(p.kind_reg, tok_source(p.src, hd)) { false }
-  else { tk_is(p_peek1(p).kind, TkIdent) }
-}
+#[doc("Reports whether the head is a registered introducer word (builtin or from a `kind ... with` in the file) followed by a name.")]
+pub fn decl_head_is_user_introducer(p: Parser, hd: Token) : Bool =
+  tk_is(hd.kind, TkIdent) and kind_reg_is_introducer(p.kind_reg, tok_source(p.src, hd)) and tk_is(p_peek1(p).kind, TkIdent)
 
-# The theory catalog a `kind` may name: the assembled theories
-# (`AbelianGroup`, `Module`) plus the builtin theories whose engine is
-# the compiler core. The full closed property menu +
-# decidable-combination check is v2; here the barrier is a membership
-# test.
+# Theories whose operation crosses two type domains admit an `over <Domain>` clause.
 fn is_known_theory(name: String) : Bool =
-  name == "AbelianGroup" or name == "Module" or name == "Composition" or
-  name == "Semilattice" or is_builtin_theory(name)
+  name == "AbelianGroup" or name == "Module" or name == "Composition" or name == "Semilattice" or is_builtin_theory(name)
 
-# Theories whose operation crosses two type domains, and so admit an
-# `over <Domain>` clause: `Module`'s scalar ring, `Composition`'s summed
-# measure. A single-domain theory that names one is a formation error —
-# the second domain would have nothing to act on.
-fn is_two_domain_theory(name: String) : Bool =
-  name == "Module" or name == "Composition"
+fn is_two_domain_theory(name: String) : Bool = name == "Module" or name == "Composition"
 
-fn over_on_single_domain_msg(thy: String) : String =
-  concat_all(["theory `", thy, "` has one domain, so it takes no `over` clause",
-              " (only Module and Composition cross two domains)"])
+type KindHead = { is_pub: Bool, name: String, thy: String, over: String, t: Token }
 
-#[doc("""
-`[pub] kind Name : Theory [over Domain] with intro` — names a
-classification algebra. The `kind` identifier (already consumed) was
-recognised contextually; `t` anchors diagnostics. The introducer word
-after `with` is stored verbatim.
-""")]
+fn kind_decl_ok(p: Parser, h: KindHead, hab: KindHab) : PDecl =
+  ok_dn(p, DKind(h.is_pub, h.name, h.thy, h.over, hab, h.t.line, h.t.col, None), [p_ent(p, NCKind, h.name, h.is_pub)])
+
+#[doc("Parses `[pub] kind Name : Theory [over Domain] [with intro]` once the contextual `kind` is consumed; `t` anchors diagnostics.")]
 pub fn parse_kind_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
-
   let id = p_peek(p)
-  # decl_head_is_kind guarantees IDENT here, but validate the name shape.
-  if not is_upper_ident(p.src, id) {
-    err_d(p_error(p, id, "kind name must start with an uppercase letter"))
-  } else {
-    let name = tok_source(p.src, id)
-    let p1 = p_advance(p)                      # past name; `:` is next
-    let p2 = p_advance(p1)                     # past `:`
-    let th = p_peek(p2)
-    if not tk_is(th.kind, TkIdent) {
-      err_d(p_error(p2, th, "expected a theory name after `:` in a `kind` declaration"))
-    } else {
-      let thy = tok_source(p2.src, th)
-      if not is_known_theory(thy) {
-        err_d(p_error(p2, th, concat_all(["unknown theory `", thy, "`"])))
-      } else {
-        parse_kind_over(p_advance(p2), is_pub, name, thy, t)
-      }
-    }
+  if not is_upper_ident(p.src, id) { err_d(p_error(p, id, "kind name must start with an uppercase letter")) }
+  else { parse_kind_theory(p_advance(p_advance(p)), KindHead { is_pub: is_pub, name: tok_source(p.src, id), thy: "", over: "", t: t }) }
+}
+
+fn parse_kind_theory(p: Parser, h: KindHead) : PDecl / Console {
+  let th = p_peek(p)
+  if not tk_is(th.kind, TkIdent) { err_d(p_error(p, th, "expected a theory name after `:` in a `kind` declaration")) }
+  else {
+    let thy = tok_source(p.src, th)
+    if is_known_theory(thy) { parse_kind_over(p_advance(p), KindHead { ...h, thy: thy }) }
+    else { err_d(p_error(p, th, concat_all(["unknown theory `", thy, "`"]))) }
   }
 }
 
-# The optional `over <Domain>` clause between the theory and `with`.
-# `over` is contextual: it is an ordinary identifier everywhere else
-# (`let over = ...` stays legal), and is claimed here only when it sits
-# in this one slot of a `kind` head.
-fn parse_kind_over(p: Parser, is_pub: Bool, name: String,
-                   thy: String, t: Token) : PDecl / Console {
+# `over` is contextual: claimed only in this slot of a `kind` head.
+fn parse_kind_over(p: Parser, h: KindHead) : PDecl / Console {
   let ov = p_peek(p)
-  if not (tk_is(ov.kind, TkIdent) and tok_source(p.src, ov) == "over") {
-    parse_kind_with(p, is_pub, name, thy, "", t)
-  } else if not is_two_domain_theory(thy) {
-    err_d(p_error(p, ov, over_on_single_domain_msg(thy)))
-  } else {
-    let p1 = p_advance(p)
-    let dom = p_peek(p1)
-    if not (tk_is(dom.kind, TkIdent) and is_upper_ident(p1.src, dom)) {
-      err_d(p_error_here(p1, "expected a domain type after `over` (e.g. `over Int`)"))
-    } else {
-      parse_kind_with(p_advance(p1), is_pub, name, thy, tok_source(p1.src, dom), t)
-    }
+  if not (tk_is(ov.kind, TkIdent) and tok_source(p.src, ov) == "over") { parse_kind_with(p, h) }
+  else if is_two_domain_theory(h.thy) { parse_kind_domain(p_advance(p), h) }
+  else {
+    err_d(p_error(p, ov, concat_all(["theory `", h.thy, "` has one domain, so it takes no `over` clause",
+                                     " (only Module and Composition cross two domains)"])))
   }
 }
 
-# The `with` tail, or its absence. A kind whose habitants are derived
-# rather than introduced by a word (`Shape`: every arity-1 `type` is a
-# habitant) has no `with` and an empty introducer.
-fn parse_kind_with(p: Parser, is_pub: Bool, name: String, thy: String,
-                   over: String, t: Token) : PDecl / Console {
-  if not p_at(p, TkWith) {
-    ok_dn(p, DKind(is_pub, name, thy, over, HabNone, t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
-  } else {
-    parse_kind_introducer(p_advance(p), is_pub, name, thy, over, t)
-  }
+fn parse_kind_domain(p: Parser, h: KindHead) : PDecl / Console {
+  let dom = p_peek(p)
+  if tk_is(dom.kind, TkIdent) and is_upper_ident(p.src, dom) { parse_kind_with(p_advance(p), KindHead { ...h, over: tok_source(p.src, dom) }) }
+  else { err_d(p_error_here(p, "expected a domain type after `over` (e.g. `over Int`)")) }
 }
 
-# The `with <habitant-form>` tail of a `kind` decl, LL(1) on the
-# token after `with`: `type` / `effect` keywords are the builtin
-# kinds' introducers; an uppercase ident is a value domain (form b);
-# a lowercase ident is an introducer word, and an immediately
-# following `{` opens the closed habitant set (form d).
-fn parse_kind_introducer(p: Parser, is_pub: Bool, name: String,
-                         thy: String, over: String, t: Token) : PDecl / Console {
-  if p_at(p, TkType) {
-    kind_decl_ok(p_advance(p), is_pub, name, thy, over, HabIntro("type"), t)
-  } else if p_at(p, TkEffect) {
-    kind_decl_ok(p_advance(p), is_pub, name, thy, over, HabIntro("effect"), t)
-  } else {
-    parse_kind_introducer_word(p, is_pub, name, thy, over, t)
+# A kind whose habitants are derived (every arity-1 `type`) has no `with` and an empty introducer.
+fn parse_kind_with(p: Parser, h: KindHead) : PDecl / Console =
+  if p_at(p, TkWith) { parse_kind_introducer(p_advance(p), h) } else { kind_decl_ok(p, h, HabNone) }
+
+fn parse_kind_introducer(p: Parser, h: KindHead) : PDecl / Console =
+  match p_peek(p).kind {
+    TkType -> kind_decl_ok(p_advance(p), h, HabIntro("type"))
+    TkEffect -> kind_decl_ok(p_advance(p), h, HabIntro("effect"))
+    _ -> parse_kind_introducer_word(p, h)
   }
-}
 
-fn kind_decl_ok(p: Parser, is_pub: Bool, name: String, thy: String, over: String,
-                hab: KindHab, t: Token) : PDecl =
-  ok_dn(p, DKind(is_pub, name, thy, over, hab, t.line, t.col, None), [p_ent(p, NCKind, name, is_pub)])
-
-fn parse_kind_introducer_word(p: Parser, is_pub: Bool, name: String,
-                              thy: String, over: String, t: Token) : PDecl / Console {
+# An uppercase name is a value domain; a lowercase one an introducer word, whose `{` opens a closed habitant set.
+fn parse_kind_introducer_word(p: Parser, h: KindHead) : PDecl / Console {
   let it = p_peek(p)
   if not tk_is(it.kind, TkIdent) {
     err_d(p_error_here(p, "expected an introducer word or a value domain after `with` (e.g. `with metric`, `with Int`)"))
-  } else if is_upper_ident(p.src, it) {
-    match value_domain_of_name(tok_source(p.src, it)) {
-      Some(dom) -> kind_decl_ok(p_advance(p), is_pub, name, thy, over, HabDomain(dom), t)
-      None -> err_d(p_error(p, it, "a value-habitant domain must be `Int` or `String`"))
-    }
-  } else {
-    let word = tok_source(p.src, it)
-    let p1 = p_advance(p)
-    if p_at(p1, TkLbrace) {
-      parse_kind_closed_set(p_skip_newlines(p_advance(p1)), is_pub, name, thy, over, word, t, [])
-    } else {
-      kind_decl_ok(p1, is_pub, name, thy, over, HabIntro(word), t)
-    }
-  }
+  } else if is_upper_ident(p.src, it) { kind_value_domain(p, it, h) }
+  else { kind_introducer_tail(p_advance(p), tok_source(p.src, it), h) }
 }
 
-# The atoms of a closed habitant set (`with layout { be le }`), bare
-# identifiers up to `}`. The parser accepts the block; resolution
-# validates each atom against the theory engine's known set.
-fn parse_kind_closed_set(p: Parser, is_pub: Bool, name: String, thy: String,
-                         over: String, word: String, t: Token,
-                         acc: [String]) : PDecl / Console {
-  if p_at(p, TkRbrace) {
-    match acc {
-      [] -> err_d(p_error_here(p, "a closed habitant set cannot be empty"))
-      _ -> ok_dn(p_advance(p),
-                 DKind(is_pub, name, thy, over, HabClosed(word, list_reverse(acc)),
-                       t.line, t.col, None),
-                 [p_ent(p, NCKind, name, is_pub)])
-    }
-  } else {
-    let a = p_peek(p)
-    if not tk_is(a.kind, TkIdent) {
-      err_d(p_error_here(p, "expected a habitant atom or `}` in the closed habitant set"))
-    } else {
-      parse_kind_closed_set(p_skip_newlines(p_advance(p)), is_pub, name, thy,
-                            over, word, t, [tok_source(p.src, a), ...acc])
-    }
+fn kind_value_domain(p: Parser, it: Token, h: KindHead) : PDecl / Console =
+  match value_domain_of_name(tok_source(p.src, it)) {
+    Some(dom) -> kind_decl_ok(p_advance(p), h, HabDomain(dom))
+    None -> err_d(p_error(p, it, "a value-habitant domain must be `Int` or `String`"))
   }
+
+fn kind_introducer_tail(p: Parser, word: String, h: KindHead) : PDecl / Console =
+  if p_at(p, TkLbrace) { parse_kind_closed_set(p_advance_nl(p), h, word, []) }
+  else { kind_decl_ok(p, h, HabIntro(word)) }
+
+fn parse_kind_closed_set(p: Parser, h: KindHead, word: String, acc: [String]) : PDecl / Console {
+  let a = p_peek(p)
+  if p_at(p, TkRbrace) { closed_set_done(p, h, word, acc) }
+  else if tk_is(a.kind, TkIdent) { parse_kind_closed_set(p_advance_nl(p), h, word, [tok_source(p.src, a), ...acc]) }
+  else { err_d(p_error_here(p, "expected a habitant atom or `}` in the closed habitant set")) }
 }
 
-#[doc("""
-Result of parsing a `<name: Kind, ...>` habitant-slot list: one
-`"name:Kind"` string per slot (name kept so `kai fmt` round-trips
-the surface, kind read by the annotation validator).
-""")]
+fn closed_set_done(p: Parser, h: KindHead, word: String, acc: [String]) : PDecl / Console =
+  match acc {
+    [] -> err_d(p_error_here(p, "a closed habitant set cannot be empty"))
+    _  -> kind_decl_ok(p_advance(p), h, HabClosed(word, list_reverse(acc)))
+  }
+
+#[doc("The parser state paired with a `<name: Kind, ...>` habitant-slot list, one `\"name:Kind\"` string per slot.")]
 pub type PHSlots = { p: Parser, r: Option[[String]] }
 
-#[doc("""
-Parse one `name: Kind` slot and recurse over `, ...` until `>`. The
-kind must name a registered kind (`Dim`, `Measure`, a user kind).
-""")]
+fn slots_err(p: Parser) : PHSlots = PHSlots { p: p, r: None }
+
+#[doc("Parses `name: Kind` slots separated by commas up to `>`; each kind must be registered.")]
 pub fn parse_habitant_slots_loop(p: Parser, acc: [String]) : PHSlots / Console {
   let t = p_peek(p)
-  if not tk_is(t.kind, TkIdent) {
-    PHSlots { p: p_error(p, t, "expected a slot name in the `<...>` habitant list"), r: None }
-  } else {
-    let p1 = p_skip_newlines(p_advance(p))
-    if not p_at(p1, TkColon) {
-      PHSlots { p: p_error_here(p1, "expected `:` after a habitant-slot name (`<n: Dim>`)"), r: None }
+  if not tk_is(t.kind, TkIdent) { slots_err(p_error(p, t, "expected a slot name in the `<...>` habitant list")) }
+  else {
+    let p1 = p_advance_nl(p)
+    if p_at(p1, TkColon) { parse_habitant_slot_kind(p_advance_nl(p1), tok_source(p.src, t), acc) }
+    else { slots_err(p_error_here(p1, "expected `:` after a habitant-slot name (`<n: Dim>`)")) }
+  }
+}
+
+fn parse_habitant_slot_kind(p: Parser, sname: String, acc: [String]) : PHSlots / Console {
+  let kt = p_peek(p)
+  if not tk_is(kt.kind, TkIdent) { slots_err(p_error_here(p, "expected a kind after `:` in the habitant slot")) }
+  else {
+    let kind = tok_source(p.src, kt)
+    if kind == measure_kind_name() or kind_reg_has_kind(p.kind_reg, kind) {
+      parse_habitant_slot_end(p_advance_nl(p), [concat_all([sname, ":", kind]), ...acc])
     } else {
-      parse_habitant_slot_kind(p_skip_newlines(p_advance(p1)), tok_source(p.src, t), acc)
+      slots_err(p_error(p, kt, concat_all(["habitant-slot kind must be a declared kind — `", kind, "` is not a kind"])))
     }
   }
 }
 
-fn parse_habitant_slot_kind(p2: Parser, sname: String, acc: [String]) : PHSlots / Console {
-  let kt = p_peek(p2)
-  if not tk_is(kt.kind, TkIdent) {
-    PHSlots { p: p_error_here(p2, "expected a kind after `:` in the habitant slot"), r: None }
-  } else {
-    let kind = tok_source(p2.src, kt)
-    if not (kind == measure_kind_name() or kind_reg_has_kind(p2.kind_reg, kind)) {
-      PHSlots { p: p_error(p2, kt, concat_all(["habitant-slot kind must be a declared kind — `", kind, "` is not a kind"])), r: None }
-    } else {
-      parse_habitant_slot_end(p_skip_newlines(p_advance(p2)), [concat_all([sname, ":", kind]), ...acc])
-    }
-  }
-}
+fn parse_habitant_slot_end(p: Parser, acc: [String]) : PHSlots / Console =
+  if p_at(p, TkComma) { parse_habitant_slots_loop(p_advance_nl(p), acc) }
+  else if p_at(p, TkGt) { PHSlots { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else { slots_err(p_error_here(p, "expected `,` or `>` after a habitant slot")) }
 
-fn parse_habitant_slot_end(p3: Parser, acc: [String]) : PHSlots / Console {
-  if p_at(p3, TkComma) {
-    parse_habitant_slots_loop(p_skip_newlines(p_advance(p3)), acc)
-  } else if p_at(p3, TkGt) {
-    PHSlots { p: p_advance(p3), r: Some(list_reverse(acc)) }
-  } else {
-    PHSlots { p: p_error_here(p3, "expected `,` or `>` after a habitant slot"), r: None }
+# `Unit` is the void return type, not a kind; a declared kind wins over the protocol-bound reading (`[u: Metric]`).
+fn word_kind(p: Parser, kw: String) : Option[Kind] =
+  match kw {
+    "Measure" -> Some(KUnit(measure_kind_name()))
+    "Type" -> Some(KType)
+    "Shape" -> Some(KShape)
+    "Unit" -> None
+    _ -> if kind_reg_has_kind(p.kind_reg, kw) { Some(KUnit(kw)) } else { None }
+  }
+
+fn unit_not_kind_msg() : String = "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"
+
+#[doc("A kind annotation on a type parameter, defaulting to `Type`.")]
+pub type PKind = { p: Parser, kind: Kind }
+
+fn kind_err(p: Parser) : PKind = PKind { p: p, kind: KType }
+
+#[doc("Parses an optional `: Type` / `: Measure` / `: Shape` / declared-kind annotation on a type parameter.")]
+pub fn parse_optional_kind_annotation(p: Parser) : PKind / Console =
+  if not p_at(p, TkColon) { PKind { p: p, kind: KType } }
+  else {
+    let p1 = p_advance_nl(p)
+    let t = p_peek(p1)
+    if tk_is(t.kind, TkIdent) { parse_kind_word(p, p1, t) }
+    else { kind_err(p_error_here(p1, "expected `Type` or `Measure` after `:` in type parameter")) }
+  }
+
+fn parse_kind_word(p: Parser, p1: Parser, t: Token) : PKind / Console {
+  let kw = tok_source(p1.src, t)
+  match word_kind(p, kw) {
+    Some(k) -> PKind { p: p_advance(p1), kind: k }
+    None -> kind_err(p_error(p1, t, if kw == "Unit" { unit_not_kind_msg() }
+      else { concat_all(["type-parameter kind must be `Type`, `Measure`, or a declared kind — `", kw, "` is not a kind"]) }))
   }
 }
 
 #[doc("""
-Impl-site colon-suffix parser. Distinguishes:
-  `: Measure`              → kind annotation
-  `: Type`                 → kind annotation (no-op default)
-  `: Show`                 → bound list `[Show]`
-  `: Show + Eq + Ord`      → multi-bound list
-Mixing kinds and bounds is rejected: `: Measure + Show` makes no
-sense since `Measure` is a kind, not a protocol.
+The colon suffix of a type parameter: a kind annotation (`: Measure`, `: Type`) or a
+protocol bound list (`: Show + Eq`); the two do not mix.
 """)]
 pub type PKindBounds = { p: Parser, kind: Kind, bounds: [String] }
 
-#[doc("Parses an optional kind annotation or protocol bounds on a type parameter.")]
-pub fn parse_optional_kind_or_bounds(p: Parser) : PKindBounds / Console {
-  if p_at(p, TkColon) {
-    let p1 = p_skip_newlines(p_advance(p))
-    let t = p_peek(p1)
-    if not tk_is(t.kind, TkIdent) {
-      PKindBounds { p: p_error_here(p1, "expected protocol name, `Type`, or `Measure` after `:` in type parameter"),
-                    kind: KType, bounds: [] }
-    } else {
-      parse_kind_or_bounds_word(p, p1, t)
-    }
-  } else {
-    PKindBounds { p: p, kind: KType, bounds: [] }
-  }
-}
+fn bounds_err(p: Parser) : PKindBounds = PKindBounds { p: p, kind: KType, bounds: [] }
 
-# A declared kind wins over the protocol-bound reading: `[u: Metric]` is a kind annotation.
+#[doc("Parses an optional kind annotation or protocol bounds on a type parameter.")]
+pub fn parse_optional_kind_or_bounds(p: Parser) : PKindBounds / Console =
+  if not p_at(p, TkColon) { PKindBounds { p: p, kind: KType, bounds: [] } }
+  else {
+    let p1 = p_advance_nl(p)
+    let t = p_peek(p1)
+    if tk_is(t.kind, TkIdent) { parse_kind_or_bounds_word(p, p1, t) }
+    else { bounds_err(p_error_here(p1, "expected protocol name, `Type`, or `Measure` after `:` in type parameter")) }
+  }
+
 fn parse_kind_or_bounds_word(p: Parser, p1: Parser, t: Token) : PKindBounds / Console {
   let kw = tok_source(p1.src, t)
-  let p2 = p_advance(p1)
-  if kw == "Measure" { PKindBounds { p: p2, kind: KUnit(measure_kind_name()), bounds: [] } }
-  else if kw == "Type" { PKindBounds { p: p2, kind: KType, bounds: [] } }
-  else if kw == "Shape" { PKindBounds { p: p2, kind: KShape, bounds: [] } }
-  else if kw == "Unit" {
-    PKindBounds { p: p_error(p1, t, "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"),
-                  kind: KType, bounds: [] }
-  } else if kind_reg_has_kind(p.kind_reg, kw) {
-    PKindBounds { p: p2, kind: KUnit(kw), bounds: [] }
-  } else if is_upper_ident(p1.src, t) {
-    parse_more_bounds_loop(p2, [kw])
-  } else {
-    PKindBounds { p: p_error(p1, t, "type-parameter annotation must be `Type`, `Measure`, or an uppercase protocol name"),
-                  kind: KType, bounds: [] }
+  match word_kind(p, kw) {
+    Some(k) -> PKindBounds { p: p_advance(p1), kind: k, bounds: [] }
+    None ->
+      if kw == "Unit" { bounds_err(p_error(p1, t, unit_not_kind_msg())) }
+      else if is_upper_ident(p1.src, t) { parse_more_bounds_loop(p_advance(p1), [kw]) }
+      else { bounds_err(p_error(p1, t, "type-parameter annotation must be `Type`, `Measure`, or an uppercase protocol name")) }
   }
 }
 
 fn parse_more_bounds_loop(p: Parser, acc: [String]) : PKindBounds / Console {
-
   let p_n = p_skip_newlines(p)
-  if p_at(p_n, TkPlus) {
-    let p1 = p_skip_newlines(p_advance(p_n))
+  if not p_at(p_n, TkPlus) { PKindBounds { p: p, kind: KType, bounds: list_reverse(acc) } }
+  else {
+    let p1 = p_advance_nl(p_n)
     let t = p_peek(p1)
-    if not tk_is(t.kind, TkIdent) or not is_upper_ident(p1.src, t) {
-      PKindBounds { p: p_error_here(p1, "expected uppercase protocol name after `+` in bound list"),
-                    kind: KType, bounds: list_reverse(acc) }
-    } else {
-      let nm = tok_source(p1.src, t)
-      parse_more_bounds_loop(p_advance(p1), [nm, ...acc])
-    }
-  } else {
-    PKindBounds { p: p, kind: KType, bounds: list_reverse(acc) }
+    if tk_is(t.kind, TkIdent) and is_upper_ident(p1.src, t) { parse_more_bounds_loop(p_advance(p1), [tok_source(p1.src, t), ...acc]) }
+    else { PKindBounds { p: p_error_here(p1, "expected uppercase protocol name after `+` in bound list"), kind: KType, bounds: list_reverse(acc) } }
   }
-}
-
-#[doc("""
-Helper — consume an optional `: Type` / `: Measure` kind suffix.
-Defaults to KType when absent. The surface keyword is `Measure`;
-the legacy `Unit` produces a targeted diagnostic distinguishing it
-from `Unit` the void-return type.
-""")]
-pub type PKind = { p: Parser, kind: Kind }
-
-#[doc("Parses an optional kind annotation on a type parameter.")]
-pub fn parse_optional_kind_annotation(p: Parser) : PKind / Console {
-  if p_at(p, TkColon) {
-    let p1 = p_skip_newlines(p_advance(p))
-    let t = p_peek(p1)
-    if not tk_is(t.kind, TkIdent) {
-      PKind { p: p_error_here(p1, "expected `Type` or `Measure` after `:` in type parameter"), kind: KType }
-    } else {
-      parse_kind_word(p, p1, t)
-    }
-  } else {
-    PKind { p: p, kind: KType }
-  }
-}
-
-fn parse_kind_word(p: Parser, p1: Parser, t: Token) : PKind / Console {
-  let kw = tok_source(p1.src, t)
-  let p2 = p_advance(p1)
-  if kw == "Measure" { PKind { p: p2, kind: KUnit(measure_kind_name()) } }
-  else if kw == "Type" { PKind { p: p2, kind: KType } }
-  else if kw == "Shape" { PKind { p: p2, kind: KShape } }
-  else if kw == "Unit" { PKind { p: p_error(p1, t, "expected kind `Measure`; `Unit` is the void return type, not a kind (renamed in #253)"), kind: KType } }
-  else if kind_reg_has_kind(p.kind_reg, kw) { PKind { p: p2, kind: KUnit(kw) } }
-  else { PKind { p: p_error(p1, t, concat_all(["type-parameter kind must be `Type`, `Measure`, or a declared kind — `", kw, "` is not a kind"])), kind: KType } }
 }

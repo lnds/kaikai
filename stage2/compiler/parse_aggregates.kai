@@ -1,0 +1,233 @@
+#[doc("Record, map and set literals.")]
+
+import compiler.lex_tokens
+import compiler.ast
+import compiler.decl_names
+import compiler.parse_state
+
+type RecLit = { ty: DeclRef, tok: Token }
+type RecMode = RmNamed | RmSpread | RmPositional
+
+#[doc("Parses a record literal after its type name.")]
+pub fn parse_record_lit(p: Parser, type_name: DeclRef, tname: Token) : PExpr / Console {
+  let rc = RecLit { ty: type_name, tok: tname }
+  let p1 = p_advance_nl(p)
+  if p_at(p1, TkRbrace) { rec_closed(p_advance(p1), [], rc) }
+  else if p_at(p1, TkEllipsis) { rec_spread_first(p_advance_nl(p1), rc) }
+  else if starts_named(p1) { rec_named_loop(p1, [], rc) }
+  else { rec_pos_loop(p1, [], rc) }
+}
+
+# A bare ident followed by `:`, `,` or `}` starts the named form (`{ x, y }` puns); anything else is
+# positional, and `desugar_pos_records_decls` names the fields later.
+fn starts_named(p: Parser) : Bool = {
+  let follow = p_peek1(p).kind
+  tk_is(p_peek(p).kind, TkIdent) and (tk_is(follow, TkColon) or tk_is(follow, TkComma) or tk_is(follow, TkRbrace))
+}
+
+fn rec_closed(p: Parser, acc: [FieldInit], rc: RecLit) : PExpr =
+  ok_e(p, expr_at(ERecordLit(rc.ty, list_reverse(acc)), rc.tok))
+
+fn rec_loop(mode: RecMode, p: Parser, acc: [FieldInit], rc: RecLit) : PExpr / Console =
+  match mode {
+    RmNamed -> rec_named_loop(p, acc, rc)
+    RmSpread -> rec_spread_loop(p, acc, rc)
+    RmPositional -> rec_pos_loop(p, acc, rc)
+  }
+
+fn rec_item_end(p: Parser, acc: [FieldInit], mode: RecMode, rc: RecLit, msg: String) : PExpr / Console = {
+  let p1 = p_skip_newlines(p)
+  if p_at(p1, TkComma) { rec_loop(mode, p_advance_nl(p1), acc, rc) }
+  else if p_at(p1, TkRbrace) { rec_closed(p_advance(p1), acc, rc) }
+  else { fail_e(p1, msg) }
+}
+
+fn rec_field_value(p1: Parser, fname: String, acc: [FieldInit], mode: RecMode, rc: RecLit) : PExpr / Console = {
+  let r = p_expr(p_advance_nl(p1))
+  match r.r {
+    None -> r
+    Some(val) -> rec_item_end(r.p, [FI(fname, val), ...acc], mode, rc, "expected `,` or `}` in record literal")
+  }
+}
+
+# `T { ...src, x: 10 }`: the spread comes first, and only named overrides may follow.
+fn rec_spread_first(p: Parser, rc: RecLit) : PExpr / Console = {
+  let r = p_expr(p)
+  match r.r {
+    None -> r
+    Some(src) -> rec_spread_end(p_skip_newlines(r.p), [mk_field_spread(src)], rc)
+  }
+}
+
+fn rec_spread_end(p: Parser, acc: [FieldInit], rc: RecLit) : PExpr / Console =
+  if p_at(p, TkRbrace) { rec_closed(p_advance(p), acc, rc) }
+  else if p_at(p, TkComma) { rec_spread_loop(p_advance_nl(p), acc, rc) }
+  else { fail_e(p, "expected `,` or `}` after `...` source in record literal") }
+
+fn rec_spread_loop(p: Parser, acc: [FieldInit], rc: RecLit) : PExpr / Console = {
+  let p0 = p_skip_newlines(p)
+  let tk = p_peek(p0)
+  if p_at(p0, TkRbrace) { rec_closed(p_advance(p0), acc, rc) }
+  else if p_at(p0, TkEllipsis) { fail_e(p0, "record literal admits a single `...` spread; remove the second one") }
+  else if not tk_is(tk.kind, TkIdent) {
+    fail_e(p0, "expected named field override (`x: expr`) after `...` in record literal")
+  }
+  else { rec_override(p_advance(p0), tok_source(p0.src, tk), acc, rc) }
+}
+
+fn rec_override(p1: Parser, fname: String, acc: [FieldInit], rc: RecLit) : PExpr / Console =
+  if p_at(p1, TkColon) { rec_field_value(p1, fname, acc, RmSpread, rc) }
+  else {
+    fail_e(p1, "spread record overrides must use named field syntax `x: expr`; pun shorthand is not allowed after `...`")
+  }
+
+fn rec_pos_loop(p: Parser, acc: [FieldInit], rc: RecLit) : PExpr / Console = {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) { rec_closed(p_advance(p0), acc, rc) }
+  else if p_at(p0, TkIdent) and tk_is(p_peek1(p0).kind, TkColon) {
+    fail_e(p0, "expected positional or all-named record fields, found mixed forms")
+  }
+  else { rec_pos_item(p_expr(p0), acc, rc) }
+}
+
+fn rec_pos_item(r: PExpr, acc: [FieldInit], rc: RecLit) : PExpr / Console =
+  match r.r {
+    None -> r
+    Some(val) -> rec_item_end(r.p, [mk_field_pos(val), ...acc], RmPositional, rc,
+                              "expected `,` or `}` in positional record literal")
+  }
+
+fn rec_named_loop(p: Parser, acc: [FieldInit], rc: RecLit) : PExpr / Console = {
+  let p0 = p_skip_newlines(p)
+  let tk = p_peek(p0)
+  if tk_is(tk.kind, TkEllipsis) {
+    fail_e(p0, "`...` must be the first item in a record literal — found a field before the spread")
+  }
+  else if tk_is(tk.kind, TkRbrace) { rec_closed(p_advance(p0), acc, rc) }
+  else if not tk_is(tk.kind, TkIdent) { fail_e(p0, "expected field name in record literal") }
+  else { rec_named_field(p_advance(p0), tk, acc, rc) }
+}
+
+# `{ x, y }` puns to `{ x: x, y: y }`, the value wrapped in `SfFieldPun` so the writer restores it.
+fn rec_named_field(p1: Parser, tk: Token, acc: [FieldInit], rc: RecLit) : PExpr / Console = {
+  let fname = tok_source(p1.src, tk)
+  if p_at(p1, TkColon) { rec_field_value(p1, fname, acc, RmNamed, rc) }
+  else if p_at(p1, TkComma) { rec_named_loop(p_advance_nl(p1), [rec_pun(fname, tk), ...acc], rc) }
+  else if p_at(p1, TkRbrace) { rec_closed(p_advance(p1), [rec_pun(fname, tk), ...acc], rc) }
+  else { fail_e(p1, "expected `:`, `,`, or `}` after field name in record literal") }
+}
+
+fn rec_pun(fname: String, tk: Token) : FieldInit = mk_field_pun(fname, mk_name(fname, tk.line, tk.col))
+
+type Coll = CollMap | CollSet
+
+#[doc("Parses a `%{...}` map or `%[...]` set literal.")]
+pub fn parse_collection_lit(p: Parser, t: Token) : PExpr / Console = {
+  let after = p_peek1(p).kind
+  if tk_is(after, TkLbrace) { coll_start(CollMap, p_advance(p_advance(p)), t) }
+  else if tk_is(after, TkLbracket) { coll_start(CollSet, p_advance(p_advance(p)), t) }
+  else { fail_e(p, "expected expression") }
+}
+
+fn coll_close(c: Coll) : TokKind = match c {
+  CollMap -> TkRbrace
+  CollSet -> TkRbracket
+}
+
+fn coll_close_text(c: Coll) : String = match c {
+  CollMap -> "}"
+  CollSet -> "]"
+}
+
+fn coll_noun(c: Coll) : String = match c {
+  CollMap -> "map"
+  CollSet -> "set"
+}
+
+fn coll_sep_msg(c: Coll, base: Option[Expr]) : String = match base {
+  None    -> "expected `,` or `#{coll_close_text(c)}` in #{coll_noun(c)} literal"
+  Some(_) -> "expected `,` or `#{coll_close_text(c)}` after `...` source in #{coll_noun(c)} literal"
+}
+
+fn coll_spread_msg(c: Coll, base: Option[Expr]) : String = match base {
+  None    -> "#{coll_noun(c)} literal admits a single `...` spread, and it must come first"
+  Some(_) -> "#{coll_noun(c)} literal admits a single `...` spread; remove the second one"
+}
+
+# `acc` holds the items newest first: a map pushes each entry's value before its key.
+fn coll_done(c: Coll, base: Option[Expr], p: Parser, acc: [Expr], t: Token) : PExpr = {
+  let items = list_reverse(acc)
+  ok_e(p, expr_at(ESurface(match c {
+    CollMap -> SfMapLit(base, items)
+    CollSet -> SfSetLit(base, items)
+  }), t))
+}
+
+fn coll_start(c: Coll, p: Parser, t: Token) : PExpr / Console = {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, coll_close(c)) { coll_done(c, None, p_advance(p0), [], t) }
+  else if p_at(p0, TkEllipsis) { coll_spread(c, p_expr(p_advance_nl(p0)), t) }
+  else { coll_item(c, None, p0, [], t) }
+}
+
+fn coll_spread(c: Coll, r: PExpr, t: Token) : PExpr / Console =
+  match r.r {
+    None -> r
+    Some(base) -> coll_after(c, Some(base), r.p, [], t)
+  }
+
+fn coll_item(c: Coll, base: Option[Expr], p: Parser, acc: [Expr], t: Token) : PExpr / Console = {
+  let r = match c {
+    CollMap -> map_entry(p, acc)
+    CollSet -> set_elem(p, acc)
+  }
+  match r.r {
+    None -> err_e(r.p)
+    Some(acc1) -> coll_after(c, base, r.p, acc1, t)
+  }
+}
+
+# After an item: the closer ends, `,` continues, a second spread is an error.
+fn coll_after(c: Coll, base: Option[Expr], p: Parser, acc: [Expr], t: Token) : PExpr / Console = {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, coll_close(c)) { coll_done(c, base, p_advance(p0), acc, t) }
+  else if p_at(p0, TkComma) { coll_next(c, base, p_advance_nl(p0), acc, t) }
+  else { fail_e(p0, coll_sep_msg(c, base)) }
+}
+
+fn coll_next(c: Coll, base: Option[Expr], p: Parser, acc: [Expr], t: Token) : PExpr / Console =
+  if p_at(p, coll_close(c)) { coll_done(c, base, p_advance(p), acc, t) }
+  else if p_at(p, TkEllipsis) { fail_e(p, coll_spread_msg(c, base)) }
+  else { coll_item(c, base, p, acc, t) }
+
+fn map_entry(p: Parser, acc: [Expr]) : PArgs / Console = {
+  let rk = p_expr(p)
+  match rk.r {
+    None -> err_args(rk.p)
+    Some(key) -> map_value(p_skip_newlines(rk.p), key, acc)
+  }
+}
+
+fn map_value(p1: Parser, key: Expr, acc: [Expr]) : PArgs / Console =
+  if p_at(p1, TkColon) { map_value_end(p_expr(p_advance_nl(p1)), key, acc) }
+  else { err_args(p_error_here(p1, "set element in map literal: use a set literal `%[ ]`, or write `key: value`")) }
+
+fn map_value_end(rv: PExpr, key: Expr, acc: [Expr]) : PArgs =
+  match rv.r {
+    None -> err_args(rv.p)
+    Some(val) -> ok_args(rv.p, [val, key, ...acc])
+  }
+
+fn set_elem(p: Parser, acc: [Expr]) : PArgs / Console = {
+  let r = p_expr(p)
+  match r.r {
+    None -> err_args(r.p)
+    Some(e) -> set_elem_end(r, e, acc)
+  }
+}
+
+fn set_elem_end(r: PExpr, e: Expr, acc: [Expr]) : PArgs / Console = {
+  let p1 = p_skip_newlines(r.p)
+  if p_at(p1, TkColon) { err_args(p_error_here(p1, "key:value pair in set literal: use a map literal `%{ }`")) }
+  else { ok_args(r.p, [e, ...acc]) }
+}

@@ -1,331 +1,140 @@
 #[doc("""
-Binary-operator tables and node builders, and placeholder (`_`) rewriting of pipeline stages.
+Binary-operator tables and node builders, and placeholder (`_`, `.`) rewriting of
+call arguments and pipeline stages.
 """)]
 
 import compiler.ast
+import compiler.ast_map
 import compiler.parse_state
 import compiler.lex_tokens
 import compiler.operators
 import compiler.pipe_stage
 
-#[doc("Rewrites a pipeline stage containing `_` into a lambda, when it has one.")]
-pub fn try_pipe_placeholder(line: Int, col: Int, lhs: Expr, rhs: Expr, p: Parser) : PPRResult / Console {
+fn section_param(b: Binder, line: Int, col: Int) : Param =
+  Param { binder: b, ptype: None, pline: line, pcol: col, pborrow: false }
 
+fn is_under(e: Expr) : Bool = match e.kind {
+  EUnder -> true
+  _      -> false
+}
+
+# `f(a, _)` on the right of `|>` becomes `((__pipe) => f(a, __pipe))(lhs)`: the lhs is evaluated once.
+fn pipe_application(line: Int, col: Int, lhs: Expr, rhs: Expr, callee: Expr, args_: [Expr]) : Expr = {
+  let tmp = pipe_apply_binder()
+  let tmp_var = mk_local(tmp.id, lhs.line, lhs.col)
+  let call = mk_expr(ECall(callee, map(args_, (a) => if is_under(a) { tmp_var } else { a })), rhs.line, rhs.col)
+  let lam = mk_expr(ELambda([section_param(tmp, lhs.line, lhs.col)], call), line, col)
+  mk_expr(ECall(lam, [lhs]), line, col)
+}
+
+fn try_pipe_placeholder(line: Int, col: Int, lhs: Expr, rhs: Expr, p: Parser) : PPRResult / Console =
   match rhs.kind {
-    ECall(callee, args_) -> {
-      let n = count_underscores(args_, 0)
-      if n == 0 { PPRPassthrough }
-      else if n > 1 {
-        PPRError(p_error(p, p_peek(p),
-          "multiple `_` in a `|>` call would evaluate the left-hand side more than once"))
-      }
-      else {
-        # The substitution evaluates the lhs once via an immediate
-        # lambda application: `((__pipe) => f(args[_ := __pipe]))(lhs)`.
-        # Equivalent to a `let __pipe = lhs in f(...)` block but
-        # composes through the existing lambda machinery (closure
-        # capture, perceus, monomorphisation) without depending on
-        # the SLet -> EBlock walker quirks for sub-expressions
-        # synthesised mid-parse.
-        let tmp = pipe_apply_binder()
-        let tmp_var = mk_local(tmp.id, lhs.line, lhs.col)
-        let new_args = subst_underscores(args_, tmp_var)
-        let new_call = mk_expr(ECall(callee, new_args), rhs.line, rhs.col)
-        let param = Param { binder: tmp, ptype: None, pline: lhs.line, pcol: lhs.col, pborrow: false }
-        let lam = mk_expr(ELambda([param], new_call), line, col)
-        let app = mk_expr(ECall(lam, [lhs]), line, col)
-        PPRSubstituted(app, p)
-      }
+    ECall(callee, args_) -> match count(args_, is_under) {
+      0 -> PPRPassthrough
+      1 -> PPRSubstituted(pipe_application(line, col, lhs, rhs, callee, args_), p)
+      _ -> PPRError(p_error_here(p, "multiple `_` in a `|>` call would evaluate the left-hand side more than once"))
     }
     _ -> PPRPassthrough
   }
-}
 
-fn count_underscores(es: [Expr], acc: Int) : Int {
-  match es {
-    [] -> acc
-    [h, ...rest] -> match h.kind {
-      EUnder -> count_underscores(rest, acc + 1)
-      _      -> count_underscores(rest, acc)
-    }
-  }
-}
-
-fn subst_underscores(es: [Expr], replacement: Expr) : [Expr] {
-  match es {
-    [] -> []
-    [h, ...rest] -> match h.kind {
-      EUnder -> [replacement, ...subst_underscores(rest, replacement)]
-      _      -> [h, ...subst_underscores(rest, replacement)]
-    }
-  }
-}
-
-# `.` placeholder desugar at call-argument position.
-#
-# `f(. < 3)` desugars to `f((__pl) => __pl < 3)` so the placeholder
-# sugar works wherever a function value is expected. The walk stops at
-# inner `ELambda` / `EHandle` boundaries: `.` inside a nested
-# explicit-arrow lambda binds to that nested scope (and per the
-# docs, multi-arg / nested-scope cases must use named arrows — a
-# stray `.` that survives the desugar is rejected by the typer).
-#
-# Multiple `.` occurrences in the same argument all refer to the
-# same `__pl` parameter (unary), per docs.
-
-fn both_have_placeholder(a: Expr, b: Expr) : Bool =
-  arg_has_placeholder(a) or arg_has_placeholder(b)
-
-fn arg_has_placeholder(e: Expr) : Bool {
+# A `.` inside a call argument stands for its element, except under a lambda or handler, which are scope barriers.
+fn arg_has_placeholder(e: Expr) : Bool =
   match e.kind {
-    ESurface(sf)        -> match sf {
-      SfInterp(_, _, _, _) -> false
-      _                 -> any_arg_has_placeholder(surface_children(sf))
-    }
-    EPlaceholder        -> true
-    EInt(_, _)             -> false
-    EReal(_, _)            -> false
-    EIntLit(_)            -> false
-    EDecimalLit(_)        -> false
-    EFixed(_, _)          -> false
-    EBool(_)            -> false
-    EChar(_)            -> false
-    EStr(_, _)          -> false
-    EUnit               -> false
-    EName(_)             -> false
-    EMark(_)             -> false
-    ESym(_, _)           -> false
-    ELocal(_)            -> false
-    EOp(_)               -> false
-    EUnder              -> false
-    EHole(_)            -> false
-    ETodo(_)            -> false
-    EExternBody(_, _)   -> false
-    EVariantsOf(_, _)   -> false
-    EModCall(_, _)      -> false
-    EIntrinsic(_, args_) -> any_arg_has_placeholder(args_)
-    # `ELambda` introduces a fresh scope. Per docs, `.` does NOT
-    # reach into a nested arrow lambda — that's the multi-arg /
-    # nested case the spec rejects.
-    ELambda(_, _)       -> false
-    # `EHandle` clauses are themselves lambdas; treat the whole
-    # node as a scope barrier. The handler body is a normal
-    # expression but mixing `.` with effect handlers in argument
-    # position is not in the documented sugar surface.
+    EPlaceholder -> true
+    ESurface(SfInterp(_, _, _, _)) -> false
+    ESurface(sf) -> any(surface_children(sf), arg_has_placeholder)
+    EInt(_, _) -> false
+    EReal(_, _) -> false
+    EIntLit(_) -> false
+    EDecimalLit(_) -> false
+    EFixed(_, _) -> false
+    EBool(_) -> false
+    EChar(_) -> false
+    EStr(_, _) -> false
+    EUnit -> false
+    EName(_) -> false
+    EMark(_) -> false
+    ESym(_, _) -> false
+    ELocal(_) -> false
+    EOp(_) -> false
+    EUnder -> false
+    EHole(_) -> false
+    ETodo(_) -> false
+    EExternBody(_, _) -> false
+    EVariantsOf(_, _) -> false
+    EModCall(_, _) -> false
+    ELambda(_, _) -> false
     EHandle(_, _, _, _, _, _, _) -> false
-    ECall(callee, args_) ->
-      arg_has_placeholder(callee) or any_arg_has_placeholder(args_)
-    EField(base, _)     -> arg_has_placeholder(base)
-    EIndex(a, b)        -> both_have_placeholder(a, b)
-    EBinop(_, a, b)     -> both_have_placeholder(a, b)
-    EUnop(_, x)         -> arg_has_placeholder(x)
-    EIf(c, t_, eo)      ->
-      arg_has_placeholder(c) or arg_has_placeholder(t_) or
-      opt_arg_has_placeholder(eo)
-    EMatch(scr, arms)   ->
-      arg_has_placeholder(scr) or any_arm_has_placeholder(arms)
-    ERecordLit(_, fs)   -> any_field_has_placeholder(fs)
-    EList(els)          -> any_elem_has_placeholder(els)
-    ERange(a, b, opt_step) ->
-      arg_has_placeholder(a) or arg_has_placeholder(b) or
-      opt_arg_has_placeholder(opt_step)
-    EBlock(stmts, tail) ->
-      any_stmt_has_placeholder(stmts) or opt_arg_has_placeholder(tail)
-    EPipe(a, b)         -> both_have_placeholder(a, b)
-    EDispatchPipe(_, a, b) -> both_have_placeholder(a, b)
-    ELitUnit(inner, _)  -> arg_has_placeholder(inner)
-    EBang(inner)        -> arg_has_placeholder(inner)
+    EIntrinsic(_, args_) -> any(args_, arg_has_placeholder)
+    ECall(callee, args_) -> call_has_placeholder(callee, args_)
+    EField(base, _) -> arg_has_placeholder(base)
+    EIndex(a, b) -> either_has_placeholder(a, b)
+    EBinop(_, a, b) -> either_has_placeholder(a, b)
+    EUnop(_, x) -> arg_has_placeholder(x)
+    EIf(c, t_, eo) -> either_has_placeholder(c, t_) or opt_has_placeholder(eo)
+    EMatch(scr, arms) -> arg_has_placeholder(scr) or any(arms, arm_has_placeholder)
+    ERecordLit(_, fs) -> any(fs, field_has_placeholder)
+    EList(els) -> any(els, elem_has_placeholder)
+    ERange(a, b, step) -> either_has_placeholder(a, b) or opt_has_placeholder(step)
+    EBlock(stmts, tail) -> any(stmts, stmt_has_placeholder) or opt_has_placeholder(tail)
+    EPipe(a, b) -> either_has_placeholder(a, b)
+    EDispatchPipe(_, a, b) -> either_has_placeholder(a, b)
+    ELitUnit(inner, _) -> arg_has_placeholder(inner)
+    EBang(inner) -> arg_has_placeholder(inner)
   }
-}
 
-fn any_arg_has_placeholder(es: [Expr]) : Bool = match es {
-  []           -> false
-  [h, ...rest] -> if arg_has_placeholder(h) { true } else { any_arg_has_placeholder(rest) }
-}
+fn either_has_placeholder(a: Expr, b: Expr) : Bool = arg_has_placeholder(a) or arg_has_placeholder(b)
 
-fn opt_arg_has_placeholder(o: Option[Expr]) : Bool = match o {
+fn call_has_placeholder(callee: Expr, args_: [Expr]) : Bool =
+  arg_has_placeholder(callee) or any(args_, arg_has_placeholder)
+
+fn opt_has_placeholder(o: Option[Expr]) : Bool = match o {
   None    -> false
   Some(e) -> arg_has_placeholder(e)
 }
 
-fn any_arm_has_placeholder(arms: [Arm]) : Bool = match arms {
-  []           -> false
-  [h, ...rest] -> match h {
-    Arm(_, g, b) ->
-      if opt_arg_has_placeholder(g) { true }
-      else if arg_has_placeholder(b) { true }
-      else { any_arm_has_placeholder(rest) }
-  }
+fn arm_has_placeholder(a: Arm) : Bool = match a {
+  Arm(_, g, b) -> opt_has_placeholder(g) or arg_has_placeholder(b)
 }
 
-fn any_field_has_placeholder(fs: [FieldInit]) : Bool = match fs {
-  []           -> false
-  [h, ...rest] -> match h {
-    FI(_, v) -> if arg_has_placeholder(v) { true } else { any_field_has_placeholder(rest) }
-  }
+fn field_has_placeholder(fi: FieldInit) : Bool = match fi {
+  FI(_, v) -> arg_has_placeholder(v)
 }
 
-fn any_elem_has_placeholder(els: [ListElem]) : Bool = match els {
-  []           -> false
-  [h, ...rest] -> match h {
-    ElPlain(x)  -> if arg_has_placeholder(x) { true } else { any_elem_has_placeholder(rest) }
-    ElSpread(x) -> if arg_has_placeholder(x) { true } else { any_elem_has_placeholder(rest) }
-  }
-}
-
-fn any_stmt_has_placeholder(ss: [Stmt]) : Bool = match ss {
-  []           -> false
-  [h, ...rest] -> if stmt_has_placeholder(h) { true } else { any_stmt_has_placeholder(rest) }
+fn elem_has_placeholder(el: ListElem) : Bool = match el {
+  ElPlain(x)  -> arg_has_placeholder(x)
+  ElSpread(x) -> arg_has_placeholder(x)
 }
 
 fn stmt_has_placeholder(s: Stmt) : Bool = match s {
-  SLet(_, _, rhs)             -> arg_has_placeholder(rhs)
-  SAssert(c, m)               -> arg_has_placeholder(c) or opt_arg_has_placeholder(m)
-  SExprStmt(x)                -> arg_has_placeholder(x)
-  SIndexAssign(b, i, v, _, _) ->
-    arg_has_placeholder(b) or arg_has_placeholder(i) or arg_has_placeholder(v)
-  SAssign(b, v, _, _) ->
-    arg_has_placeholder(b) or arg_has_placeholder(v)
-  SVar(_, _, rhs, _, _)       -> arg_has_placeholder(rhs)
-  SUse(_, _, _)               -> false
+  SLet(_, _, rhs) -> arg_has_placeholder(rhs)
+  SAssert(c, m) -> arg_has_placeholder(c) or opt_has_placeholder(m)
+  SExprStmt(x) -> arg_has_placeholder(x)
+  SIndexAssign(b, i, v, _, _) -> either_has_placeholder(b, i) or arg_has_placeholder(v)
+  SAssign(b, v, _, _) -> either_has_placeholder(b, v)
+  SVar(_, _, rhs, _, _) -> arg_has_placeholder(rhs)
+  SUse(_, _, _) -> false
 }
 
-fn subst_placeholder_expr(e: Expr, repl: Expr) : Expr {
-  match e.kind {
-    EPlaceholder -> repl
-    # ELambda / EHandle are scope barriers — leave them alone.
-    ELambda(_, _) -> e
-    EHandle(_, _, _, _, _, _, _) -> e
-    _ -> {
-      let new_kind = subst_placeholder_kind(e.kind, repl)
-      Expr { kind: new_kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
-    }
-  }
+fn subst_placeholder_expr(e: Expr, repl: Expr) : Expr = match e.kind {
+  EPlaceholder -> repl
+  ELambda(_, _) -> e
+  EHandle(_, _, _, _, _, _, _) -> e
+  ESurface(SfInterp(_, _, _, _)) -> e
+  k -> Expr { ...e, kind: prc_map_expr_kind(k, (x) => subst_placeholder_expr(x, repl)) }
 }
 
-fn subst_placeholder_kind(k: ExprKind, repl: Expr) : ExprKind {
-  match k {
-    ESurface(sf)           -> match sf {
-      SfInterp(_, _, _, _) -> k
-      _                 -> ESurface(surface_map(sf, (x) => subst_placeholder_expr(x, repl)))
-    }
-    EInt(_, _)             -> k
-    EReal(_, _)            -> k
-    EIntLit(_)            -> k
-    EDecimalLit(_)        -> k
-    EFixed(_, _)          -> k
-    EBool(_)            -> k
-    EChar(_)            -> k
-    EStr(_, _)          -> k
-    EUnit               -> k
-    EName(_)             -> k
-    EMark(_)             -> k
-    ESym(_, _)           -> k
-    ELocal(_)            -> k
-    EOp(_)               -> k
-    EUnder              -> k
-    EHole(_)            -> k
-    ETodo(_)            -> k
-    EExternBody(_, _)   -> k
-    EVariantsOf(_, _)   -> k
-    EModCall(_, _)      -> k
-    EIntrinsic(name, args_) ->
-      EIntrinsic(name, map(args_, (a) => subst_placeholder_expr(a, repl)))
-    EPlaceholder        -> k    # handled by subst_placeholder_expr
-    ELambda(_, _)       -> k    # scope barrier
-    EHandle(_, _, _, _, _, _, _) -> k    # scope barrier
-    ECall(callee, args_) ->
-      ECall(subst_placeholder_expr(callee, repl),
-            map(args_, (a) => subst_placeholder_expr(a, repl)))
-    EField(base, name)  -> EField(subst_placeholder_expr(base, repl), name)
-    EIndex(a, b)        -> EIndex(subst_placeholder_expr(a, repl),
-                                    subst_placeholder_expr(b, repl))
-    EBinop(op, a, b)    -> EBinop(op, subst_placeholder_expr(a, repl),
-                                       subst_placeholder_expr(b, repl))
-    EUnop(op, x)        -> EUnop(op, subst_placeholder_expr(x, repl))
-    EIf(c, t_, eo)      ->
-      EIf(subst_placeholder_expr(c, repl),
-          subst_placeholder_expr(t_, repl),
-          subst_placeholder_opt(eo, repl))
-    EMatch(scr, arms)   ->
-      EMatch(subst_placeholder_expr(scr, repl),
-              map(arms, (a) => subst_placeholder_arm(a, repl)))
-    ERecordLit(rh, fs) ->
-      ERecordLit(rh, map(fs, (fi) => subst_placeholder_field(fi, repl)))
-    EList(els)          -> EList(map(els, (el) => subst_placeholder_elem(el, repl)))
-    ERange(a, b, opt_step) ->
-      ERange(subst_placeholder_expr(a, repl),
-              subst_placeholder_expr(b, repl),
-              subst_placeholder_opt(opt_step, repl))
-    EBlock(stmts, tail) ->
-      EBlock(map(stmts, (s) => subst_placeholder_stmt(s, repl)),
-              subst_placeholder_opt(tail, repl))
-    EPipe(a, b)         -> EPipe(subst_placeholder_expr(a, repl),
-                                  subst_placeholder_expr(b, repl))
-    EDispatchPipe(op, a, b) -> EDispatchPipe(op, subst_placeholder_expr(a, repl),
-                                      subst_placeholder_expr(b, repl))
-    ELitUnit(inner, u)  -> ELitUnit(subst_placeholder_expr(inner, repl), u)
-    EBang(inner)        -> EBang(subst_placeholder_expr(inner, repl))
-  }
-}
-
-fn subst_placeholder_opt(o: Option[Expr], repl: Expr) : Option[Expr] = match o {
-  None    -> None
-  Some(e) -> Some(subst_placeholder_expr(e, repl))
-}
-
-fn subst_placeholder_arm(a: Arm, repl: Expr) : Arm = match a {
-  Arm(p, g, b) ->
-    Arm(p, subst_placeholder_opt(g, repl), subst_placeholder_expr(b, repl))
-}
-
-fn subst_placeholder_field(fi: FieldInit, repl: Expr) : FieldInit = match fi {
-  FI(n, v) -> FI(n, subst_placeholder_expr(v, repl))
-}
-
-fn subst_placeholder_elem(el: ListElem, repl: Expr) : ListElem = match el {
-  ElPlain(x)  -> ElPlain(subst_placeholder_expr(x, repl))
-  ElSpread(x) -> ElSpread(subst_placeholder_expr(x, repl))
-}
-
-fn subst_placeholder_stmt(s: Stmt, repl: Expr) : Stmt = match s {
-  SLet(p, ann, rhs)           -> SLet(p, ann, subst_placeholder_expr(rhs, repl))
-  SAssert(c, m)               -> SAssert(subst_placeholder_expr(c, repl),
-                                          subst_placeholder_opt(m, repl))
-  SExprStmt(x)                -> SExprStmt(subst_placeholder_expr(x, repl))
-  SAssign(b, v, l, c) -> SAssign(subst_placeholder_expr(b, repl),
-                                  subst_placeholder_expr(v, repl), l, c)
-  SIndexAssign(b, i, v, l, c) -> SIndexAssign(subst_placeholder_expr(b, repl),
-                                                subst_placeholder_expr(i, repl),
-                                                subst_placeholder_expr(v, repl),
-                                                l, c)
-  SVar(n, ty, rhs, l, c)      -> SVar(n, ty, subst_placeholder_expr(rhs, repl), l, c)
-  SUse(n, l, c)               -> SUse(n, l, c)
-}
-
-# Wrap a single argument expression in a placeholder lambda when
-# it carries a top-level `.`. Returns the argument unchanged when
-# it has no placeholder, or when the top-level node is itself a
-# lambda / handler (scope barriers), preserving the existing
-# parser shape for those cases.
-fn desugar_placeholder_arg(arg: Expr) : Expr {
+fn desugar_placeholder_arg(arg: Expr) : Expr =
   if arg_has_placeholder(arg) {
     let pl = point_free_binder()
-    let pl_var = mk_local(pl.id, arg.line, arg.col)
-    let body = subst_placeholder_expr(arg, pl_var)
-    let pl_param = Param { binder: pl, ptype: None,
-                            pline: arg.line, pcol: arg.col, pborrow: false }
-    mk_expr(ELambda([pl_param], body), arg.line, arg.col)
-  } else {
-    arg
-  }
-}
+    let body = subst_placeholder_expr(arg, mk_local(pl.id, arg.line, arg.col))
+    mk_expr(ELambda([section_param(pl, arg.line, arg.col)], body), arg.line, arg.col)
+  } else { arg }
 
-#[doc("Rewrites call arguments containing `_` into a lambda body.")]
-pub fn desugar_placeholder_args(args_: [Expr]) : [Expr] =
-  map(args_, desugar_placeholder_arg)
+#[doc("Rewrites call arguments containing `.` into a lambda body.")]
+pub fn desugar_placeholder_args(args_: [Expr]) : [Expr] = map(args_, desugar_placeholder_arg)
 
-#[doc("Maps an operator token to its binary operator.")]
+#[doc("Maps an operator token to its spelling.")]
 pub fn op_of_tok(k: TokKind) : String {
   match k {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
@@ -336,13 +145,9 @@ pub fn op_of_tok(k: TokKind) : String {
   }
 }
 
-#[doc("""
-Binary operators by precedence, loosest first: the four pipes, `or`,
-`and`, the comparisons, `++`, additive, multiplicative. Every level is
-left-associative except `++` (right) and the comparisons, which do not
-chain: `a < b < c` is an error, not a chain. The `|` variant separator
-in `type T = A | B` is parsed by `parse_sum_body`, not here.
-""")]
+# Levels, loosest first: the four pipes, `or`, `and`, comparisons (no chaining),
+# `++` (right-associative), additive, multiplicative; the rest are left-associative.
+#[doc("Precedence level of the pipes.")]
 pub fn bin_pipe() : Int = 1
 #[doc("Precedence level of `or`.")]
 pub fn bin_or() : Int = 2
@@ -377,26 +182,23 @@ fn bin_level(k: TokKind) : Int =
     _ -> 0
   }
 
-# An operator may also lead a continuation line, unless it can start an
-# expression: `-` (unary minus) and `%` (`%{ }` / `%[ ]`) must end the
-# previous line instead.
-fn bin_leads_line(k: TokKind) : Bool =
-  not tk_is(k, TkMinus) and not tk_is(k, TkPercent)
+# `-` and `%` can start an expression, so they must end a line rather than lead the next.
+fn bin_leads_line(k: TokKind) : Bool = not tk_is(k, TkMinus) and not tk_is(k, TkPercent)
 
-#[doc("Reads the binary operator at the parser position with its level.")]
+fn bin_op_on_next_line(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
+  let t = p_peek(p)
+  let lv = bin_level(t.kind)
+  if lv > 0 and lv >= lo and lv <= hi and bin_leads_line(t.kind) { Some(BinOpAt { p: p, tok: t, level: lv }) }
+  else { None }
+}
+
+#[doc("Reads the binary operator at the parser position, or leading the next line, with its level.")]
 pub fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
   let t = p_peek(p)
   let lv = bin_level(t.kind)
-  if lv > 0 {
-    if lv >= lo and lv <= hi { Some(BinOpAt { p: p, tok: t, level: lv }) } else { None }
-  } else {
-    let p_look = p_skip_newlines(p)
-    let t1 = p_peek(p_look)
-    let l1 = bin_level(t1.kind)
-    if l1 > 0 and l1 >= lo and l1 <= hi and bin_leads_line(t1.kind) {
-      Some(BinOpAt { p: p_look, tok: t1, level: l1 })
-    } else { None }
-  }
+  if lv == 0 { bin_op_on_next_line(p_skip_newlines(p), lo, hi) }
+  else if lv >= lo and lv <= hi { Some(BinOpAt { p: p, tok: t, level: lv }) }
+  else { None }
 }
 
 #[doc("""
@@ -411,33 +213,8 @@ pub fn bin_ceiling(op: BinOpAt) : Int =
 #[doc("Builds the expression node of a binary operation.")]
 pub fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
   match binop_of_text(op_of_tok(t.kind)) {
-    Some(o) -> ok_e(p, mk_expr(EBinop(o, lhs, rhs), t.line, t.col))
-    None    -> err_e(p_error(p, t, "expected a binary operator"))
-  }
-
-#[doc("""
-`|>` (apply), `|` (map), `||` (flat-map), `|?` (filter) and `|!`
-(each). The typer rewrites the dispatch pipes against the head type of
-the left side; each of them is a stage that owns the `.` on its right
-side.
-""")]
-pub fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
-  if ends_pipeline(lhs) { err_e(p_error(p, t, "`|!` ends a pipeline; it returns `Unit`")) }
-  else if tk_is(t.kind, TkPipeApply) {
-    # A `_` in the call's arguments receives the left side instead of the
-    # first argument; `try_pipe_placeholder` evaluates it once.
-    match try_pipe_placeholder(t.line, t.col, lhs, rhs, p) {
-      PPRError(p2)          -> err_e(p2)
-      PPRSubstituted(e, p2) -> ok_e(p2, e)
-      PPRPassthrough        -> ok_e(p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
-    }
-  }
-  else {
-    match stage_claim(rhs) {
-      SrNested(inner) -> err_e(p_error_at(p, inner.line, inner.col,
-        "this stage and the one around it both use `.`; name one element with `(x) => ...`"))
-      SrOwn(r) -> ok_e(p, mk_expr(EDispatchPipe(pipe_op_of_tok(t.kind), lhs, r), t.line, t.col))
-    }
+    Some(o) -> ok_e(p, expr_at(EBinop(o, lhs, rhs), t))
+    None    -> fail_e_at(p, t, "expected a binary operator")
   }
 
 fn pipe_op_of_tok(k: TokKind) : PipeOp =
@@ -453,6 +230,28 @@ fn ends_pipeline(lhs: Expr) : Bool = match lhs.kind {
   _                           -> false
 }
 
+# A `_` among the call's arguments receives the left side instead of the first argument.
+fn apply_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  match try_pipe_placeholder(t.line, t.col, lhs, rhs, p) {
+    PPRError(p2)          -> err_e(p2)
+    PPRSubstituted(e, p2) -> ok_e(p2, e)
+    PPRPassthrough        -> ok_e(p, expr_at(EPipe(lhs, rhs), t))
+  }
+
+# Each dispatch pipe owns the `.` on its right side.
+fn dispatch_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  match stage_claim(rhs) {
+    SrNested(inner) -> err_e(p_error_at(p, inner.line, inner.col,
+      "this stage and the one around it both use `.`; name one element with `(x) => ...`"))
+    SrOwn(r) -> ok_e(p, expr_at(EDispatchPipe(pipe_op_of_tok(t.kind), lhs, r), t))
+  }
+
+#[doc("Builds the node of a pipe: `|>` (apply), `|` (map), `||` (flat-map), `|?` (filter) or `|!` (each).")]
+pub fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  if ends_pipeline(lhs) { fail_e_at(p, t, "`|!` ends a pipeline; it returns `Unit`") }
+  else if tk_is(t.kind, TkPipeApply) { apply_pipe_node(p, t, lhs, rhs) }
+  else { dispatch_pipe_node(p, t, lhs, rhs) }
+
 #[doc("Reports whether a token is a comparison operator.")]
 pub fn is_cmp_tok(k: TokKind) : Bool =
   match k {
@@ -465,19 +264,12 @@ pub fn is_cmp_tok(k: TokKind) : Bool =
     _ -> false
   }
 
-#[doc("""
-A second comparison right after `lhs OP rhs` gets a tailored diagnostic;
-falling through would report "expected `fn`, `type`, ..." at the
-enclosing statement, which is useless.
-""")]
+#[doc("Builds a comparison node; a second comparison right after it gets a tailored diagnostic.")]
 pub fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console = {
   let after = p_peek(p)
   if is_cmp_tok(after.kind) {
-    let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
-    err_e(p_error(p, after, hint))
-  } else {
-    bin_node(p, t, lhs, rhs)
-  }
+    fail_e_at(p, after, "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead")
+  } else { bin_node(p, t, lhs, rhs) }
 }
 
 #[doc("Maps a comparison token to its comparison operator.")]

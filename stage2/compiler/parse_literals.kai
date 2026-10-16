@@ -1,5 +1,6 @@
 #[doc("""
-Decoding of integer, real, hex and character literal text.
+Literal parsing: decoding of integer, real and character text, fixed-width
+literals, string literals with their interpolations, and regex sigils.
 """)]
 
 import compiler.util
@@ -13,96 +14,57 @@ import compiler.lex_tokens
 import compiler.ast
 import compiler.parse_state
 
-fn apply_sign(neg: Bool, v: Int) : Int = if neg { 0 - v } else { v }
-
-fn decode_int_loop(s: String, i: Int, n: Int, acc: Int, neg: Bool) : Int {
-  if i >= n { apply_sign(neg, acc) }
-  else {
-    match char_at(s, i) {
-      None -> apply_sign(neg, acc)
-      Some(c) -> decode_int_step(s, c, i, n, acc, neg)
-    }
-  }
-}
-
-fn decode_int_step(s: String, c: Char, i: Int, n: Int, acc: Int, neg: Bool) : Int {
-  if c == '_' { decode_int_loop(s, i + 1, n, acc, neg) }
-  else if ch_is_digit(c) { decode_int_loop(s, i + 1, n, acc * 10 + (char_to_int(c) - char_to_int('0')), neg) }
-  else { apply_sign(neg, acc) }
-}
-
 fn char_before_end(s: String, i: Int, n: Int) : Option[Char] =
   if i >= n { None } else { char_at(s, i) }
 
-fn decode_bin_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+fn lit_base(span: String, i: Int, n: Int) : Int =
+  if i + 1 < n and char_at(span, i) == Some('0') {
+    match char_at(span, i + 1) {
+      Some('x') -> 16
+      Some('X') -> 16
+      Some('b') -> 2
+      Some('B') -> 2
+      _ -> 0
+    }
+  } else { 0 }
+
+fn hex_digit_value(c: Char) : Int =
+  if ch_is_digit(c) { char_to_int(c) - char_to_int('0') }
+  else if c >= 'a' and c <= 'f' { char_to_int(c) - char_to_int('a') + 10 }
+  else if c >= 'A' and c <= 'F' { char_to_int(c) - char_to_int('A') + 10 }
+  else { 0 }
+
+# Hex digits end at `}` and read any other byte as 0, binary at the first non-bit.
+fn digit_in(c: Char, base: Int) : Option[Int] =
+  if base == 16 { if c == '}' { None } else { Some(hex_digit_value(c)) } }
+  else if ch_is_digit(c) and char_to_int(c) - char_to_int('0') < base { Some(char_to_int(c) - char_to_int('0')) }
+  else { None }
+
+fn scan_digits(s: String, i: Int, n: Int, base: Int, acc: Int) : Int =
   match char_before_end(s, i, n) {
     None -> acc
-    Some(c) ->
-      if c == '_' { decode_bin_loop(s, i + 1, n, acc) }
-      else if c == '0' { decode_bin_loop(s, i + 1, n, acc * 2) }
-      else if c == '1' { decode_bin_loop(s, i + 1, n, acc * 2 + 1) }
-      else { acc }
-  }
-}
-
-fn decode_int_after_sign(span: String, i: Int, n: Int, neg: Bool) : Int {
-  let base = lit_base(span, i, n)
-  if base == 16 { apply_sign(neg, decode_hex_loop(span, i + 2, n, 0)) }
-  else if base == 2 { apply_sign(neg, decode_bin_loop(span, i + 2, n, 0)) }
-  else { decode_int_loop(span, i, n, 0, neg) }
-}
-
-fn lit_base(span: String, i: Int, n: Int) : Int {
-  if i + 1 < n and char_is_at(span, i, '0') { prefix_base(char_at(span, i + 1)) }
-  else { 0 }
-}
-
-fn char_is_at(s: String, i: Int, want: Char) : Bool =
-  match char_at(s, i) {
-    Some(c) -> c == want
-    None -> false
+    Some('_') -> scan_digits(s, i + 1, n, base, acc)
+    Some(c) -> match digit_in(c, base) {
+      Some(d) -> scan_digits(s, i + 1, n, base, acc * base + d)
+      None -> acc
+    }
   }
 
-fn prefix_base(c: Option[Char]) : Int =
-  match c {
-    Some('x') -> 16
-    Some('X') -> 16
-    Some('b') -> 2
-    Some('B') -> 2
-    _ -> 0
+fn decode_magnitude(span: String, i: Int, n: Int) : Int =
+  match lit_base(span, i, n) {
+    0 -> scan_digits(span, i, n, 10, 0)
+    base -> scan_digits(span, i + 2, n, base, 0)
   }
 
-# Largest `Int` magnitude, as a digit string, for the overflow check
-# on decimal literals: 2^63 - 1.
-fn i64_max_digits() : String = "9223372036854775807"
-
-#[doc("""
-True when an integer literal's written form cannot be decoded without
-wrapping. Decimal compares magnitude against 2^63-1 (signed range).
-Hex/bin are bit-patterns: any pattern up to 64 bits is legal (an
-all-ones hex is the two's-complement -1), so the overflow is a width
-check — >16 significant hex digits or >64 significant bin digits do
-not fit 64 bits. `_` separators and leading zeros are ignored; the
-comparison never itself overflows.
-""")]
-pub fn int_lit_overflows(span: String) : Bool = {
-  if has_base_prefix(span) {
-    if is_hex_prefix(span) { count_base_digits(span, 2, string_length(span), 0) > 16 }
-    else { count_base_digits(span, 2, string_length(span), 0) > 64 }
-  } else {
-    mag_gt(strip_int_lit_digits(span, 0, string_length(span), ""), i64_max_digits())
-  }
-}
-
-fn is_hex_prefix(span: String) : Bool =
-  match char_at(span, 1) {
-    Some(c) -> c == 'x' or c == 'X'
-    None    -> false
+#[doc("Decode a decimal/hex/bin integer literal span (optional leading `-`, `_` separators) to Int. Shared with the backends for fixed-width literals that fit 64 bits.")]
+pub fn decode_int(span: String) : Int =
+  match char_at(span, 0) {
+    None -> 0
+    Some('-') -> 0 - decode_magnitude(span, 1, string_length(span))
+    Some(_) -> decode_magnitude(span, 0, string_length(span))
   }
 
-# Count significant base digits after the `0x`/`0b` prefix, dropping `_`
-# separators and leading zeros so the width compare is on the real
-# pattern length. Any non-`_` char keeps the run going once started.
+# Significant base digits after the `0x`/`0b` prefix: `_` and leading zeros do not count.
 fn count_base_digits(s: String, i: Int, n: Int, acc: Int) : Int =
   match char_before_end(s, i, n) {
     None -> acc
@@ -111,153 +73,48 @@ fn count_base_digits(s: String, i: Int, n: Int, acc: Int) : Int =
       else { count_base_digits(s, i + 1, n, acc + 1) }
   }
 
-#[doc("Reports whether an integer literal carries a `0x`, `0b` or `0o` prefix.")]
-pub fn has_base_prefix(span: String) : Bool =
-  match char_at(span, 0) {
-    Some('0') -> match char_at(span, 1) {
-      Some(c) -> c == 'x' or c == 'X' or c == 'b' or c == 'B'
-      None    -> false
-    }
-    _ -> false
-  }
-
-# Collect the decimal digits of a span, dropping `_` separators and any
-# leading zeros (so the length compare in `mag_gt` is on significant
-# digits only).
-fn strip_int_lit_digits(s: String, i: Int, n: Int, acc: String) : String =
+# Decimal digits of a span without `_` and leading zeros, up to the first other byte.
+fn significant_digits(s: String, i: Int, n: Int, acc: String) : String =
   match char_before_end(s, i, n) {
-    None -> if string_length(acc) == 0 { "0" } else { acc }
+    None -> acc
     Some(c) ->
-      if c == '_' or (c == '0' and string_length(acc) == 0) { strip_int_lit_digits(s, i + 1, n, acc) }
-      else if ch_is_digit(c) { strip_int_lit_digits(s, i + 1, n, string_concat(acc, "#{c}")) }
+      if c == '_' or (c == '0' and acc == "") { significant_digits(s, i + 1, n, acc) }
+      else if ch_is_digit(c) { significant_digits(s, i + 1, n, string_concat(acc, "#{c}")) }
       else { acc }
   }
 
-# `a > b` for two significant-digit magnitude strings: longer wins, else
-# lexicographic (digit strings of equal length order like the numbers).
-fn mag_gt(a: String, b: String) : Bool = {
-  let la = string_length(a)
-  let lb = string_length(b)
-  if la != lb { la > lb } else { string_gt(a, b) }
-}
+# Longer magnitude wins; equal lengths order like the numbers do.
+fn mag_gt(a: String, b: String) : Bool =
+  if string_length(a) != string_length(b) { string_length(a) > string_length(b) } else { a > b }
 
-fn string_gt(a: String, b: String) : Bool = string_cmp(a, b) > 0
-
-fn string_cmp(a: String, b: String) : Int = string_cmp_loop(a, b, 0, string_length(a))
-
-fn string_cmp_loop(a: String, b: String, i: Int, n: Int) : Int =
-  if i >= n { 0 }
-  else {
-    match char_at(a, i) {
-      None -> 0
-      Some(ca) -> match char_at(b, i) {
-        None -> 1
-        Some(cb) -> string_cmp_step(char_to_int(ca) - char_to_int(cb), a, b, i, n)
-      }
-    }
-  }
-
-fn string_cmp_step(diff: Int, a: String, b: String, i: Int, n: Int) : Int =
-  if diff < 0 { 0 - 1 }
-  else if diff > 0 { 1 }
-  else { string_cmp_loop(a, b, i + 1, n) }
-
-#[doc("Decode a decimal/hex/bin integer literal span (optional leading `-`, `_` separators) to Int. Shared with the backends for fixed-width literals that fit 64 bits.")]
-pub fn decode_int(span: String) : Int {
+#[doc("""
+True when an integer literal's written form cannot be decoded without
+wrapping. Decimal compares magnitude against 2^63-1; hex and binary are
+bit patterns, so the check is the width: more than 16 significant hex or
+64 significant binary digits.
+""")]
+pub fn int_lit_overflows(span: String) : Bool = {
   let n = string_length(span)
-  if n == 0 { 0 }
-  else {
-    match char_at(span, 0) {
-      Some(c) -> if c == '-' { decode_int_after_sign(span, 1, n, true) }
-                 else { decode_int_after_sign(span, 0, n, false) }
-      None -> 0
-    }
+  match lit_base(span, 0, n) {
+    16 -> count_base_digits(span, 2, n, 0) > 16
+    2 -> count_base_digits(span, 2, n, 0) > 64
+    _ -> mag_gt(significant_digits(span, 0, n, ""), "9223372036854775807")
   }
 }
+
+#[doc("Reports whether an integer literal carries a `0x` or `0b` prefix.")]
+pub fn has_base_prefix(span: String) : Bool = lit_base(span, 0, string_length(span)) != 0
 
 #[doc("""
 Build a fixed-width integer literal: strip the `suf_len`-char width
 suffix off the token span and keep the remaining digits verbatim in an
-`EFixed` node tagged with the width type. The span is decoded per
-backend (so an Int128 value above 2^63 survives); the value is
-range-checked at the typer, not here.
+`EFixed` node tagged with the width type. The value is range-checked by
+the typer, so an Int128 above 2^63 survives.
 """)]
 pub fn fixed_lit(src: String, t: Token, suf_len: Int, ty: Ty) : Expr {
   let span = tok_source(src, t)
   let digits = string_slice(span, 0, string_length(span) - suf_len)
-  with_ty(mk_expr(EFixed(digits, ty), t.line, t.col), ty)
-}
-
-fn strip_underscores_loop(s: String, i: Int, n: Int, acc: String) : String {
-  if i >= n { acc }
-  else {
-    match char_at(s, i) {
-      None -> acc
-      Some(c) -> {
-        if c == '_' { strip_underscores_loop(s, i + 1, n, acc) }
-        else { strip_underscores_loop(s, i + 1, n, string_concat(acc, "#{c}")) }
-      }
-    }
-  }
-}
-
-#[doc("Decodes real literal text, rejecting values out of range.")]
-pub fn decode_real(span: String) : Option[Real] =
-  string_to_real(strip_underscores_loop(span, 0, string_length(span), ""))
-
-#[doc("Returns the diagnostic for a real literal outside the representable range.")]
-pub fn real_range_error() : String = "real literal out of range for Real"
-
-fn hex_digit_value(c: Char) : Int {
-  if ch_is_digit(c) { char_to_int(c) - char_to_int('0') }
-  else if c >= 'a' and c <= 'f' { char_to_int(c) - char_to_int('a') + 10 }
-  else if c >= 'A' and c <= 'F' { char_to_int(c) - char_to_int('A') + 10 }
-  else { 0 }
-}
-
-fn decode_hex_loop(s: String, i: Int, n: Int, acc: Int) : Int {
-  if i >= n { acc }
-  else {
-    match char_at(s, i) {
-      None -> acc
-      Some(c) ->
-        if c == '}' { acc }
-        else if c == '_' { decode_hex_loop(s, i + 1, n, acc) }
-        else { decode_hex_loop(s, i + 1, n, acc * 16 + hex_digit_value(c)) }
-    }
-  }
-}
-
-# span is the raw char literal including surrounding quotes: 'a', '\n', '\u{2603}'
-#
-# The lexer already rejected every escape outside the table, so an
-# escape reaching here decodes cleanly. `\xHH` and `\u{...}` both name a
-# scalar value directly rather than the UTF-8 bytes a string would get.
-#[doc("Decodes the text of a character literal.")]
-pub fn decode_char(span: String) : Char {
-  let n = string_length(span)
-  if n < 2 { int_to_char(0) }
-  else {
-    match char_at(span, 1) {
-      None -> int_to_char(0)
-      Some(c1) -> {
-        if c1 == '\\' {
-          match esc_decode_scalar_at(span, 2, n - 1) {
-            Some(cp) -> int_to_char(cp)
-            None -> int_to_char(0)
-          }
-        } else {
-          # A non-escape char literal body is a single Unicode
-          # codepoint, possibly multi-byte UTF-8. `char_at`
-          # returns only the first byte (`c1`); decode the full
-          # codepoint that begins at byte offset 1 so `'á'`/`'▸'` lex
-          # to their scalar value, not their UTF-8 lead byte. ASCII is
-          # unchanged (a 1-byte sequence decodes to itself).
-          int_to_char(string_cp_at(span, 1))
-        }
-      }
-    }
-  }
+  with_ty(expr_at(EFixed(digits, ty), t), ty)
 }
 
 #[doc("The width-tagged literal a fixed-width integer token spells, or `None` for any other token.")]
@@ -271,26 +128,49 @@ pub fn fixed_lit_of_tok(src: String, t: Token) : Option[Expr] =
     _ -> None
   }
 
-# A string literal. Each `#{...}` body of one that interpolates is
-# parsed here, at the position it occupies in the file.
-#[doc("Parses a string literal, including the bodies of its `#{...}` interpolations.")]
-pub fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
-  let span = tok_source(p.src, t)
-  let is_triple =
-    string_length(span) >= 6 and
-    match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
-    match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
-    match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
-  if span_interpolates(span, is_triple) {
-    let at = InterpPos { line: t.line, col: t.col + interp_lead(is_triple) }
-    let parts = interp_parts(span, is_triple)
-    let r = parse_interp_bodies(p, parts, at, [])
-    match r.r {
-      None        -> err_e(r.p)
-      Some(holes) -> ok_e(p_advance(r.p), mk_expr(ESurface(SfInterp(span, is_triple, parts, holes)), t.line, t.col))
-    }
-  } else { ok_e(p_advance(p), mk_expr(EStr(span, is_triple), t.line, t.col)) }
+#[doc("Decodes real literal text, rejecting values out of range.")]
+pub fn decode_real(span: String) : Option[Real] = string_to_real(replace(span, "_", ""))
+
+#[doc("Returns the diagnostic for a real literal outside the representable range.")]
+pub fn real_range_error() : String = "real literal out of range for Real"
+
+# The lexer rejected every escape outside the table; `\xHH` and `\u{...}` name a scalar value, not UTF-8 bytes.
+#[doc("Decodes the text of a character literal.")]
+pub fn decode_char(span: String) : Char =
+  int_to_char(match char_at(span, 1) {
+    None -> 0
+    Some('\\') -> unwrap_or(esc_decode_scalar_at(span, 2, string_length(span) - 1), 0)
+    Some(_) -> string_cp_at(span, 1)
+  })
+
+fn interp_fail_head() : String = "cannot parse the interpolated expression"
+
+fn interp_diag(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Diagnostic = {
+  let own = concat_all([interp_fail_head(), " `", src, "`"])
+  match inner {
+    None -> mk_diag(SevError, p.file, body.line, body.col, own, [])
+    Some(D(_, _, l, c, msg, notes)) ->
+      if starts_with(msg, interp_fail_head()) { mk_diag(SevError, p.file, l, c, msg, notes) }
+      else { mk_diag(SevError, p.file, body.line, body.col, concat_all([own, ": ", msg]), notes) }
+  }
 }
+
+fn p_interp_report(p: Parser, d: Diagnostic) : Parser / Console = match d {
+  D(sev, _, l, c, msg, notes) ->
+    if p.file == interp_parse_file() { p_mark_err(p, d) }
+    else {
+      diag_error_from_src(p.file, p.src, l, c, msg)
+      notes |> each((n) => match n { DR(_, _, _, m) -> diag_note(m) })
+      p_mark_err(p, D(sev, p.file, l, c, msg, map(notes, (n) => match n { DR(_, nl, nc, m) -> DR(p.file, nl, nc, m) })))
+    }
+}
+
+#[doc("""
+A nested body that fails has already named itself; any other failure
+names the body and carries the parser's reason.
+""")]
+pub fn p_interp_fail(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Parser / Console =
+  p_interp_report(p, interp_diag(p, src, body, inner))
 
 fn parse_interp_bodies(p: Parser, parts: [IPart], at: InterpPos, acc: [Expr]) : PArgs / Console = match parts {
   [] -> ok_args(p, list_reverse(acc))
@@ -307,95 +187,31 @@ fn parse_interp_bodies(p: Parser, parts: [IPart], at: InterpPos, acc: [Expr]) : 
   }
 }
 
-fn interp_fail_head() : String = "cannot parse the interpolated expression"
-
-#[doc("""
-A nested body that fails has already named itself; any other failure
-names the body and carries the parser's reason.
-""")]
-pub fn p_interp_fail(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Parser / Console = {
-  let own = concat_all([interp_fail_head(), " `", src, "`"])
-  match inner {
-    None -> p_interp_report(p, mk_diag(SevError, p.file, body.line, body.col, own, []))
-    Some(D(_, _, l, c, msg, notes)) ->
-      if starts_with(msg, interp_fail_head()) { p_interp_report(p, mk_diag(SevError, p.file, l, c, msg, notes)) }
-      else { p_interp_report(p, mk_diag(SevError, p.file, body.line, body.col, concat_all([own, ": ", msg]), notes)) }
-  }
-}
-
-fn p_interp_report(p: Parser, d: Diagnostic) : Parser / Console = match d {
-  D(sev, _, l, c, msg, notes) ->
-    if p.file == interp_parse_file() { p_mark_err(p, d) }
-    else {
-      diag_error_from_src(p.file, p.src, l, c, msg)
-      notes |> each((n) => match n { DR(_, _, _, m) -> diag_note(m) })
-      p_mark_err(p, D(sev, p.file, l, c, msg, map(notes, (n) => match n { DR(_, nl, nc, m) -> DR(p.file, nl, nc, m) })))
-    }
-}
-
-# Parse a `~r/pattern/` sigil token into an expression.
-# The lexer has already validated the delimiter shape and stored the
-# full sigil source span on the token. We desugar to a runtime call
-# `regex_compile_or_panic("<pattern>")` whose result is a `Regex`
-# value — meaning `~r/pat/` works as a first-class expression in any
-# position, not just inside refinement predicates.
-#
-# The pattern body is wrapped as a kaikai string literal with two
-# byte-level escapes (`\` -> `\\`, `"` -> `\"`) so the post-decode
-# bytes match the regex source verbatim. `#` is forbidden in the body
-# because it would collide with kaikai's `#{...}` string
-# interpolation; a pattern containing `#` must use `regex_compile`
-# directly.
-#[doc("Parses a regex sigil literal into a string expression.")]
-pub fn parse_regex_sigil(p: Parser, t: Token) : PExpr / Console {
-
+#[doc("Parses a string literal, including the bodies of its `#{...}` interpolations.")]
+pub fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
   let span = tok_source(p.src, t)
-  let n = string_length(span)
-  # Span shape: `~r/pattern/`. Strip the 3-char prefix `~r/` and the
-  # trailing `/`. The lexer guarantees both delimiters are present
-  # (otherwise it emitted TkError, never TkRegex).
-  let pattern = string_slice(span, 3, n - 4)
-  if regex_pattern_has_hash(pattern, 0, string_length(pattern)) {
-    err_e(p_error_here(p,
-      "regex sigil contains `#`, which v1 forbids (would collide with kaikai string interpolation); use `regex_compile` directly for patterns containing `#`"))
+  let triple = string_length(span) >= 6 and starts_with(span, "\"\"\"")
+  if span_interpolates(span, triple) {
+    let parts = interp_parts(span, triple)
+    let r = parse_interp_bodies(p, parts, InterpPos { line: t.line, col: t.col + interp_lead(triple) }, [])
+    match r.r {
+      None        -> err_e(r.p)
+      Some(holes) -> ok_e(p_advance(r.p), expr_at(ESurface(SfInterp(span, triple, parts, holes)), t))
+    }
+  } else { ok_e(p_advance(p), expr_at(EStr(span, triple), t)) }
+}
+
+# `#` is refused in the body: it would start a `#{...}` interpolation in the generated string.
+#[doc("Parses a `~r/pattern/` sigil into a call of `regexp.compile_or_panic` on the pattern as a string literal.")]
+pub fn parse_regex_sigil(p: Parser, t: Token) : PExpr / Console {
+  let span = tok_source(p.src, t)
+  let pattern = string_slice(span, 3, string_length(span) - 4)
+  if string_find(pattern, "#") >= 0 {
+    fail_e(p, "regex sigil contains `#`, which v1 forbids (would collide with kaikai string interpolation); use `regex_compile` directly for patterns containing `#`")
   } else {
-    let escaped = regex_pattern_to_kai_str_body(pattern, 0, string_length(pattern), "")
-    let str_span = concat_all(["\"", escaped, "\""])
-    let pat_str = mk_expr(EStr(str_span, false), t.line, t.col)
-    let callee = mk_expr(EModCall(written("regexp"), written("compile_or_panic")), t.line, t.col)
-    let call = mk_expr(ECall(callee, [pat_str]), t.line, t.col)
-    ok_e(p_advance(p), call)
-  }
-}
-
-# Walk the regex pattern body byte-by-byte, escaping the two
-# characters that have a load-bearing meaning inside a kaikai
-# string literal: `\` (escape introducer) and `"` (terminator).
-# Every other byte passes through verbatim — including bytes that
-# would be metacharacters at the regex level. The result is the
-# *body* of a kaikai string literal; the caller wraps it in `"..."`.
-fn regex_pattern_to_kai_str_body(s: String, i: Int, n: Int, acc: String) : String {
-  if i >= n { acc }
-  else {
-    match char_at(s, i) {
-      None -> acc
-      Some(c) -> {
-        let piece =
-          if c == '\\' { "\\\\" }
-          else if c == '"' { "\\\"" }
-          else { int_to_byte_string(char_to_int(c)) }
-        regex_pattern_to_kai_str_body(s, i + 1, n, string_concat(acc, piece))
-      }
-    }
-  }
-}
-
-fn regex_pattern_has_hash(s: String, i: Int, n: Int) : Bool {
-  if i >= n { false }
-  else {
-    match char_at(s, i) {
-      None -> false
-      Some(c) -> if c == '#' { true } else { regex_pattern_has_hash(s, i + 1, n) }
-    }
+    let body = replace(replace(pattern, "\\", "\\\\"), "\"", "\\\"")
+    let lit = expr_at(EStr(concat_all(["\"", body, "\""]), false), t)
+    let callee = expr_at(EModCall(written("regexp"), written("compile_or_panic")), t)
+    ok_e(p_advance(p), expr_at(ECall(callee, [lit]), t))
   }
 }

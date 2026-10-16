@@ -1,153 +1,112 @@
-#[doc("Blocks, statements, `if` and `match` with its arms.")]
+#[doc("Blocks and statements: `let`, `var`, `assert`, `use`, assignments and expression statements.")]
 
-import compiler.diag
 import compiler.lex_tokens
-import compiler.lex
 import compiler.ast
-import compiler.real_lit
 import compiler.written
-import compiler.interp_scan
-import compiler.decl_names
 import compiler.parse_state
 import compiler.parse_types
 import compiler.parse_pattern
 
-#[doc("Parses a `{ ... }` block expression whose brace token is given.")]
-pub fn parse_block(p: Parser, t: Token) : PExpr / Console {
+type BlockStep = BsStop(PExpr) | BsGo(Parser, Stmt)
 
-  # `{` is at current position.
-  let p1 = p_skip_newlines_and_semis(p_advance(p))
-  parse_block_body(p1, [], t)
-}
+#[doc("Parses a `{ ... }` block expression whose brace token is given.")]
+pub fn parse_block(p: Parser, t: Token) : PExpr / Console =
+  parse_block_body(p_skip_newlines_and_semis(p_advance(p)), [], t)
 
 #[doc("Parses statements up to the closing `}` of a block.")]
 pub fn parse_block_body(p: Parser, stmts: [Stmt], t: Token) : PExpr / Console {
-
   let p0 = p_skip_newlines_and_semis(p)
-  if p_at(p0, TkRbrace) {
-    ok_e(p_advance(p0), mk_expr(EBlock(list_reverse(stmts), None), t.line, t.col))
-  } else {
-    let r = parse_stmt(p0)
-    match r.r {
-      None -> err_e(r.p)
-      Some(s) -> {
-        let p1 = p_skip_newlines_and_semis(r.p)
-        if p_at(p1, TkRbrace) {
-          # If the last stmt was an expression statement, it becomes the
-          # block's final expression.
-          match s {
-            SExprStmt(e) -> ok_e(p_advance(p1), mk_expr(EBlock(list_reverse(stmts), Some(e)), t.line, t.col))
-            _ -> ok_e(p_advance(p1), mk_expr(EBlock(list_reverse([s, ...stmts]), None), t.line, t.col))
-          }
-        } else if stmt_is_bare_section(p_peek(p0), s) {
-          err_e(p_error_here(p0, "a line starting with `.` is a point-free section whose value is discarded, not a continuation of the previous line"))
-        } else {
-          parse_block_body(p1, [s, ...stmts], t)
-        }
-      }
+  if p_at(p0, TkRbrace) { ok_e(p_advance(p0), block_node(stmts, None, t)) }
+  else {
+    match block_step(p0, stmts, t) {
+      BsStop(r) -> r
+      BsGo(p1, s) -> parse_block_body(p1, [s, ...stmts], t)
     }
   }
 }
 
-fn parse_stmt(p: Parser) : PStmt / Console {
-  let t = p_peek(p)
-  if tk_is(t.kind, TkLet) { parse_let(p, t) }
-  else if tk_is(t.kind, TkVar) { parse_var(p, t) }
-  else if tk_is(t.kind, TkCase) {
-    # Reached when a stmt-block meets a `case` arm: a block is either all stmts or all `case` arms.
-    err_s(p_error(p, t, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
+fn block_node(rev_stmts: [Stmt], tail: Option[Expr], t: Token) : Expr =
+  expr_at(EBlock(list_reverse(rev_stmts), tail), t)
+
+fn block_step(p0: Parser, stmts: [Stmt], t: Token) : BlockStep / Console {
+  let r = parse_stmt(p0)
+  match r.r {
+    None -> BsStop(err_e(r.p))
+    Some(s) -> block_after(p0, p_skip_newlines_and_semis(r.p), s, stmts, t)
   }
-  else if tk_is(t.kind, TkAssert) { parse_assert(p, t) }
-  else if tk_is(t.kind, TkUse) { parse_use_stmt(p, t) }
-  else { parse_expr_stmt(p, t) }
 }
 
-# Block-scope `use Effect`; `desugar_use_decls` strips it, like the file-level form, before resolve.
+fn block_after(p0: Parser, p1: Parser, s: Stmt, stmts: [Stmt], t: Token) : BlockStep / Console =
+  if p_at(p1, TkRbrace) { BsStop(block_close(p_advance(p1), s, stmts, t)) }
+  else if stmt_is_bare_section(p_peek(p0), s) {
+    BsStop(fail_e(p0, "a line starting with `.` is a point-free section whose value is discarded, not a continuation of the previous line"))
+  }
+  else { BsGo(p1, s) }
+
+fn block_close(p: Parser, s: Stmt, stmts: [Stmt], t: Token) : PExpr =
+  match s {
+    SExprStmt(e) -> ok_e(p, block_node(stmts, Some(e), t))
+    _ -> ok_e(p, block_node([s, ...stmts], None, t))
+  }
+
+fn parse_stmt(p: Parser) : PStmt / Console {
+  let t = p_peek(p)
+  match t.kind {
+    TkLet -> parse_let(p, t)
+    TkVar -> parse_var(p, t)
+    TkCase -> fail_s(p, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`")
+    TkAssert -> parse_assert(p)
+    TkUse -> parse_use_stmt(p, t)
+    _ -> parse_expr_stmt(p, t)
+  }
+}
+
+# Block-scope `use`; `desugar_use_decls` strips it before resolve.
 fn parse_use_stmt(p: Parser, t: Token) : PStmt / Console {
   let p1 = p_advance(p)
   let id = p_peek(p1)
-  if not tk_is(id.kind, TkIdent) {
-    err_s(p_error(p1, id, "expected effect name after `use`"))
-  } else if not is_upper_ident(p1.src, id) {
-    err_s(p_error(p1, id, "effect name in `use` must start with an uppercase letter"))
-  } else {
-    ok_s(p_advance(p1), SUse(tok_source(p1.src, id), t.line, t.col))
-  }
+  if not tk_is(id.kind, TkIdent) { fail_s(p1, "expected effect name after `use`") }
+  else if not is_upper_ident(p1.src, id) { fail_s(p1, "effect name in `use` must start with an uppercase letter") }
+  else { ok_s(p_advance(p1), SUse(tok_source(p1.src, id), t.line, t.col)) }
 }
 
-# An indexed write `a[i] := v` needs an `EIndex` target rooted at an identifier or field chain.
 fn parse_expr_stmt(p: Parser, t: Token) : PStmt / Console {
   let r = p_expr(p)
   match r.r {
     None -> err_s(r.p)
-    Some(e) -> if p_at(r.p, TkColonEq) { parse_index_assign_rest(r.p, e, t) } else { ok_s(r.p, SExprStmt(e)) }
+    Some(e) -> if p_at(r.p, TkColonEq) { parse_assign_rest(r.p, e, t) } else { ok_s(r.p, SExprStmt(e)) }
   }
 }
 
-# Validate the LHS of `:=` and parse the RHS.
-# Accepted shapes:
-#   `Ident[i] := v`            (indexed write — SIndexAssign)
-#   `Ident.field…[i] := v`     (indexed write through field path)
-#   `Ident := v`               (capability write — desugared to
-#                              `cap.set(v)`; the alias rewrite later
-#                              maps it to `State.set(cap, v)`)
-fn parse_index_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt / Console {
+fn parse_assign_rest(p: Parser, lhs: Expr, t: Token) : PStmt / Console =
+  match assign_error(lhs) {
+    Some(msg) -> err_s(p_error(p, t, msg))
+    None -> assign_done(p_expr(p_advance_nl(p)), lhs)
+  }
 
+fn assign_error(lhs: Expr) : Option[String] =
   match lhs.kind {
-    EIndex(base, idx) -> {
-      if not is_index_lhs_path(base) {
-        err_s(p_error(p, t,
-          string_concat(
-            "left-hand side of `:=` must be `Ident` or `Ident.field…[i]`; ",
-            "bind a temporary first if you need to write to a call result")))
-      } else {
-        let p1 = p_skip_newlines(p_advance(p))
-        let rv = p_expr(p1)
-        match rv.r {
-          None -> err_s(rv.p)
-          Some(v) -> ok_s(rv.p, SIndexAssign(base, idx, v, lhs.line, lhs.col))
-        }
-      }
-    }
-    EName(_) -> {
-      # `cap := v` — preserved as SAssign; `surface_lower_decls`
-      # rewrites it to `cap.set(v)`, which the alias rewrite remaps to
-      # `State.set(cap, v)`. Only `State[T].set(v)` is the semantic
-      # target; if cap is a Reader binding the lowering still produces
-      # `cap.set(v)`, the alias rewrite emits `Reader.set(v)`, and the
-      # resolver rejects it ("Reader has no operation `set`").
-      let p1 = p_skip_newlines(p_advance(p))
-      let rv = p_expr(p1)
-      match rv.r {
-        None -> err_s(rv.p)
-        Some(v) -> ok_s(rv.p, SAssign(lhs, v, lhs.line, lhs.col))
-      }
-    }
-    EField(_, _) -> {
-      # `record.field := v` where `field : Ref[T]` — preserved as
-      # SAssign; the lowering produces `record.field.set(v)`, the same
-      # `.set` shape as the `cap` arm. The typer's `try_ref_sugar_op`
-      # maps `.set` on a `Ref` receiver to
-      # `Mutable.ref_set(record.field, v)`; a non-`Ref` field falls
-      # through to the ordinary UFCS lookup and its "no method `set`"
-      # diagnostic. Only a `.`-chain rooted at an identifier is a valid
-      # write target, mirroring the indexed-write rule.
-      if not is_index_lhs_path(lhs) {
-        err_s(p_error(p, t,
-          "left-hand side of `:=` must be `Ident` or `Ident.field…`; bind a temporary first if you need to write through a call result"))
-      } else {
-        let p1 = p_skip_newlines(p_advance(p))
-        let rv = p_expr(p1)
-        match rv.r {
-          None -> err_s(rv.p)
-          Some(v) -> ok_s(rv.p, SAssign(lhs, v, lhs.line, lhs.col))
-        }
-      }
-    }
-    _ -> err_s(p_error(p, t,
-      "left-hand side of `:=` must be a capability binding `Ident`, an indexed `Ident[i]`, or `Ident.field…[i]`"))
+    EIndex(base, _) ->
+      if is_index_lhs_path(base) { None }
+      else { Some("left-hand side of `:=` must be `Ident` or `Ident.field…[i]`; bind a temporary first if you need to write to a call result") }
+    EName(_) -> None
+    EField(_, _) ->
+      if is_index_lhs_path(lhs) { None }
+      else { Some("left-hand side of `:=` must be `Ident` or `Ident.field…`; bind a temporary first if you need to write through a call result") }
+    _ -> Some("left-hand side of `:=` must be a capability binding `Ident`, an indexed `Ident[i]`, or `Ident.field…[i]`")
   }
-}
+
+fn assign_done(rv: PExpr, lhs: Expr) : PStmt =
+  match rv.r {
+    None -> err_s(rv.p)
+    Some(v) -> ok_s(rv.p, assign_stmt(lhs, v))
+  }
+
+fn assign_stmt(lhs: Expr, v: Expr) : Stmt =
+  match lhs.kind {
+    EIndex(base, idx) -> SIndexAssign(base, idx, v, lhs.line, lhs.col)
+    _ -> SAssign(lhs, v, lhs.line, lhs.col)
+  }
 
 #[doc("Parses a `let` statement.")]
 pub fn parse_let(p: Parser, t: Token) : PStmt / Console {
@@ -159,378 +118,78 @@ pub fn parse_let(p: Parser, t: Token) : PStmt / Console {
 }
 
 fn parse_let_rest(pa: Parser, pat: Pattern) : PStmt / Console {
-  let ty_opt_r = parse_optional_type(pa)
-  if p_failed(ty_opt_r.p) and not p_failed(pa) { err_s(ty_opt_r.p) }
-  else {
-    let p_eq = p_skip_newlines(ty_opt_r.p)
-    if not p_at(p_eq, TkEq) {
-      err_s(p_error_here(p_eq, "expected `=` in let binding"))
-    } else {
-      let re = p_expr(p_skip_newlines(p_advance(p_eq)))
-      match re.r {
-        None -> err_s(re.p)
-        Some(rhs) -> ok_s(re.p, SLet(pat, ty_opt_r.r, rhs))
-      }
-    }
-  }
+  let ty = parse_optional_type(pa)
+  if p_failed(ty.p) and not p_failed(pa) { err_s(ty.p) }
+  else { let_eq(p_skip_newlines(ty.p), pat, ty.r) }
 }
 
-# `var name (: T)? := init` — local mutable cell. `:=` is the single
-# mark of mutability (declaration and write); `=` binds an immutable
-# `let`. The parser produces an `SVar` node; the pre-resolve
-# `desugar_var_decls` pass rewrites every block containing an SVar into
-# the canonical `handle { rest } with State[T](init) as name { ... }`
-# form. No `var name` (without `:= init`) form: rejected here so the
-# desugar always has a state value to thread.
+fn let_eq(p_eq: Parser, pat: Pattern, ty: Option[TypeExpr]) : PStmt / Console =
+  if p_at(p_eq, TkEq) { let_done(p_expr(p_advance_nl(p_eq)), pat, ty) }
+  else { fail_s(p_eq, "expected `=` in let binding") }
+
+fn let_done(re: PExpr, pat: Pattern, ty: Option[TypeExpr]) : PStmt =
+  match re.r {
+    None -> err_s(re.p)
+    Some(rhs) -> ok_s(re.p, SLet(pat, ty, rhs))
+  }
+
 #[doc("Parses a `var` statement.")]
 pub fn parse_var(p: Parser, t: Token) : PStmt / Console {
   let p1 = p_advance(p)
   let nt = p_peek(p1)
-  if not tk_is(nt.kind, TkIdent) {
-    err_s(p_error(p1, nt, "expected identifier after `var`"))
-  } else {
-    parse_var_rest(p_advance(p1), tok_source(p1.src, nt), t)
-  }
+  if tk_is(nt.kind, TkIdent) { parse_var_rest(p_advance(p1), tok_source(p1.src, nt), t) }
+  else { fail_s(p1, "expected identifier after `var`") }
 }
 
 fn parse_var_rest(p2: Parser, name: String, t: Token) : PStmt / Console {
-  let ty_opt_r = parse_optional_type(p2)
-  if p_failed(ty_opt_r.p) and not p_failed(p2) { err_s(ty_opt_r.p) }
-  else {
-    let p_eq = p_skip_newlines(ty_opt_r.p)
-    if p_at(p_eq, TkEq) {
-      err_s(p_error_here(p_eq, "`var` declares a mutable cell with `:=`, not `=`; write `var name := init` (`=` binds an immutable `let`)"))
-    } else if not p_at(p_eq, TkColonEq) {
-      err_s(p_error_here(p_eq, "expected `:=` in var binding (initialiser is required): `var name := init`"))
-    } else {
-      let re = p_expr(p_skip_newlines(p_advance(p_eq)))
-      match re.r {
-        None -> err_s(re.p)
-        Some(rhs) -> ok_s(re.p, SVar(binder_written(name), ty_opt_r.r, rhs, t.line, t.col))
-      }
-    }
-  }
+  let ty = parse_optional_type(p2)
+  if p_failed(ty.p) and not p_failed(p2) { err_s(ty.p) }
+  else { var_eq(p_skip_newlines(ty.p), name, ty.r, t) }
 }
 
-fn parse_assert(p: Parser, t: Token) : PStmt / Console {
+fn var_eq(p_eq: Parser, name: String, ty: Option[TypeExpr], t: Token) : PStmt / Console =
+  if p_at(p_eq, TkEq) {
+    fail_s(p_eq, "`var` declares a mutable cell with `:=`, not `=`; write `var name := init` (`=` binds an immutable `let`)")
+  }
+  else if not p_at(p_eq, TkColonEq) {
+    fail_s(p_eq, "expected `:=` in var binding (initialiser is required): `var name := init`")
+  }
+  else { var_done(p_expr(p_advance_nl(p_eq)), name, ty, t) }
 
-  let p1 = p_advance(p)
-  let re = p_expr(p1)
+fn var_done(re: PExpr, name: String, ty: Option[TypeExpr], t: Token) : PStmt =
   match re.r {
     None -> err_s(re.p)
-    Some(cond) -> {
-      if p_at(re.p, TkComma) {
-        let p2 = p_skip_newlines(p_advance(re.p))
-        let rm = p_expr(p2)
-        match rm.r {
-          None -> err_s(rm.p)
-          Some(msg) -> ok_s(rm.p, SAssert(cond, Some(msg)))
-        }
-      } else {
-        ok_s(re.p, SAssert(cond, None))
-      }
-    }
+    Some(rhs) -> ok_s(re.p, SVar(binder_written(name), ty, rhs, t.line, t.col))
   }
-}
 
-#[doc("Parses an `if` expression.")]
-pub fn parse_if(p: Parser, t: Token) : PExpr / Console {
-  let p1 = p_advance(p)
-  # The condition must not take a trailing `{` as a lambda or a record literal: that `{` is the body.
-  let prev_atl = p1.allow_trailing_lambda
-  let prev_arl = p1.allow_record_lit
-  let rc = p_expr(p_with_record_lit(p_with_trailing_lambda(p1, false), false))
-  match rc.r {
-    None -> err_e(rc.p)
-    Some(cond) -> parse_if_then(p_with_record_lit(p_with_trailing_lambda(rc.p, prev_atl), prev_arl), cond, t)
-  }
-}
-
-fn parse_if_then(p: Parser, cond: Expr, t: Token) : PExpr / Console {
-  let p2 = p_skip_newlines(p)
-  if not p_at(p2, TkLbrace) {
-    err_e(p_error_here(p2, "expected `{` after `if` condition"))
-  } else {
-    let rt = parse_block(p2, p_peek(p2))
-    match rt.r {
-      None -> err_e(rt.p)
-      Some(then_e) -> parse_if_else(rt.p, cond, then_e, t)
-    }
-  }
-}
-
-# Without an `else` the `if` ends at its `}`; the newlines skipped looking for one still separate it from the next line.
-fn parse_if_else(p: Parser, cond: Expr, then_e: Expr, t: Token) : PExpr / Console {
-  let p3 = p_skip_newlines(p)
-  if not p_at(p3, TkElse) {
-    ok_e(p, mk_expr(EIf(cond, then_e, None), t.line, t.col))
-  } else {
-    let p4 = p_skip_newlines(p_advance(p3))
-    if p_at(p4, TkIf) { finish_if(parse_if(p4, p_peek(p4)), cond, then_e, t) }
-    else if p_at(p4, TkLbrace) { finish_if(parse_block(p4, p_peek(p4)), cond, then_e, t) }
-    else { err_e(p_error_here(p4, "expected `if` or `{` after `else`")) }
-  }
-}
-
-fn finish_if(re: PExpr, cond: Expr, then_e: Expr, t: Token) : PExpr =
+fn parse_assert(p: Parser) : PStmt / Console {
+  let re = p_expr(p_advance(p))
   match re.r {
-    None -> err_e(re.p)
-    Some(else_e) -> ok_e(re.p, mk_expr(EIf(cond, then_e, Some(else_e)), t.line, t.col))
-  }
-
-#[doc("Parses a `match` expression.")]
-pub fn parse_match(p: Parser, t: Token) : PExpr / Console {
-
-  let p1 = p_advance(p)
-  # Same as `if` — scrutinees cannot eat the `{` that opens the arms
-  # block, whether as a trailing lambda or a record literal.
-  let prev_atl = p1.allow_trailing_lambda
-  let prev_arl = p1.allow_record_lit
-  let ps = p_with_record_lit(p_with_trailing_lambda(p1, false), false)
-  let rs = p_expr(ps)
-  match rs.r {
-    None -> err_e(rs.p)
-    Some(scrut1) -> {
-      # Comma after the first scrutinee opens multi-scrutinee
-      # match — `match e1, e2, ..., eN { p1, p2, ..., pN -> body | ... }`.
-      let r_more = parse_more_scruts(rs.p, [scrut1])
-      let p2 = p_skip_newlines(p_with_record_lit(p_with_trailing_lambda(r_more.p, prev_atl), prev_arl))
-      if not p_at(p2, TkLbrace) {
-        err_e(p_error_here(p2, "expected `{` after `match` expression"))
-      } else {
-        let scruts = list_reverse(r_more.r)
-        let n = list_length(scruts)
-        if n == 1 {
-          parse_match_arms(p_skip_newlines(p_advance(p2)), [], scrut1, t)
-        } else if n > 4 {
-          # Cap multi-arg `match` at 4 columns. Higher arities push
-          # the desugared nesting past what stays readable in
-          # diagnostics.
-          err_e(p_error_here(p2, "multi-arg `match` supports up to 4 scrutinees"))
-        } else {
-          parse_multi_match_arms(p_skip_newlines(p_advance(p2)), [], scruts, n, t)
-        }
-      }
-    }
+    None -> err_s(re.p)
+    Some(cond) -> assert_message(re.p, cond)
   }
 }
 
-fn parse_more_scruts(p: Parser, acc: [Expr]) : PScruts / Console {
+fn assert_message(p: Parser, cond: Expr) : PStmt / Console =
+  if p_at(p, TkComma) { assert_done(p_expr(p_advance_nl(p)), cond) }
+  else { ok_s(p, SAssert(cond, None)) }
 
-  let p0 = p_skip_newlines(p)
-  if not p_at(p0, TkComma) { PScruts { p: p0, r: acc } }
-  else {
-    let p1 = p_skip_newlines(p_advance(p0))
-    let r = p_expr(p1)
-    match r.r {
-      None    -> PScruts { p: r.p, r: acc }
-      Some(e) -> parse_more_scruts(r.p, [e, ...acc])
-    }
+fn assert_done(rm: PExpr, cond: Expr) : PStmt =
+  match rm.r {
+    None -> err_s(rm.p)
+    Some(msg) -> ok_s(rm.p, SAssert(cond, Some(msg)))
   }
-}
 
-# Parse arms where each arm has N patterns separated by commas,
-# optional guard, `->`, body. Stops at `}`.
-fn parse_multi_match_arms(p: Parser, acc: [MMArm], scruts: [Expr], n: Int, t: Token) : PExpr / Console {
-
-  let p0 = p_skip_newlines_and_semis(p)
-  if p_at(p0, TkRbrace) {
-    let p1 = p_advance(p0)
-    ok_e(p1, mk_expr(ESurface(SfMultiMatch(scruts, list_reverse(acc))), t.line, t.col))
-  } else {
-    let ra = parse_multi_arm(p0, n)
-    match ra.r {
-      None -> err_e(ra.p)
-      Some(arm) -> parse_multi_match_arms(ra.p, [arm, ...acc], scruts, n, t)
-    }
-  }
-}
-
-fn parse_multi_arm(p: Parser, n: Int) : PMArm / Console {
-
-  let r_pats = parse_n_patterns(p, n, [])
-  match r_pats.r {
-    None -> err_marm(r_pats.p)
-    Some(pats) -> {
-      let p1 = p_skip_newlines(r_pats.p)
-      let guard_opt_r = parse_arm_guard(p1, TkIf)
-      parse_marm_body(guard_opt_r, pats, "expected `->` in multi-arg match arm")
-    }
-  }
-}
-
-#[doc("""
-An arm's optional guard after `kw`, read with trailing lambdas off so a
-guard ending in a call does not swallow the arm body's `{`.
-""")]
-pub fn parse_arm_guard(p: Parser, kw: TokKind) : PExpr / Console =
-  if p_at(p, kw) {
-    let rg = p_expr(p_with_trailing_lambda(p_advance(p), false))
-    PExpr { p: p_with_trailing_lambda(rg.p, p.allow_trailing_lambda), r: rg.r }
-  } else { PExpr { p: p, r: None } }
-
-#[doc("`-> body` after an arm's patterns and optional guard.")]
-pub fn parse_marm_body(g: PExpr, pats: [Pattern], missing_arrow: String) : PMArm / Console = {
-  let p2 = p_skip_newlines(g.p)
-  if not p_at(p2, TkArrow) {
-    err_marm(p_error_here(p2, missing_arrow))
-  } else {
-    let rb = p_expr(p_skip_newlines(p_advance(p2)))
-    match rb.r {
-      None -> err_marm(rb.p)
-      Some(body) -> ok_marm(rb.p, MMArm(pats, g.r, body))
-    }
-  }
-}
-
-#[doc("Parses a fixed number of comma-separated patterns.")]
-pub fn parse_n_patterns(p: Parser, n: Int, acc: [Pattern]) : PPatN / Console {
-
-  if n == 0 {
-    ok_patn(p, list_reverse(acc))
-  } else {
-    let rp = parse_pattern(p)
-    match rp.r {
-      None -> err_patn(rp.p)
-      Some(pat) -> {
-        let next = n - 1
-        if next == 0 { ok_patn(rp.p, list_reverse([pat, ...acc])) }
-        else {
-          let p1 = p_skip_newlines(rp.p)
-          if not p_at(p1, TkComma) {
-            err_patn(p_error_here(p1, "expected `,` between multi-arg match patterns"))
-          } else {
-            parse_n_patterns(p_skip_newlines(p_advance(p1)), next, [pat, ...acc])
-          }
-        }
-      }
-    }
-  }
-}
-
-fn parse_match_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr / Console {
-
-  let p0 = p_skip_newlines_and_semis(p)
-  if p_at(p0, TkRbrace) {
-    ok_e(p_advance(p0), mk_expr(EMatch(scrut, list_reverse(acc)), t.line, t.col))
-  } else {
-    let ra = parse_arm(p0)
-    match ra.r {
-      None -> err_e(ra.p)
-      Some(arm) -> parse_match_arms(ra.p, [arm, ...acc], scrut, t)
-    }
-  }
-}
-
-fn parse_arm(p: Parser) : PArm / Console {
-
-  let rp = parse_pattern(p)
-  match rp.r {
-    None -> err_a(rp.p)
-    Some(pat) -> {
-      # Optional refinement-narrowing `: Type where ...` after a
-      # binding pattern. Lowers to a guard that evaluates the
-      # refinement's predicate with `self` bound to the name. Only
-      # PBind patterns participate; other shapes ignore the suffix.
-      let p_after_ty = p_skip_newlines(rp.p)
-      let nr = parse_optional_arm_refine(p_after_ty, pat)
-      # Arm-refine may rewrite the pattern (PNarrow).
-      let pat_eff = match nr.new_pat { Some(np) -> np  None -> pat }
-      let p1 = p_skip_newlines(nr.p)
-      # Optional guard: `if expr`. Same discipline as `parse_if` /
-      # `parse_match`: the guard expression cannot eat the `->` (or
-      # an arm body's `{`) by extending into a trailing lambda. Off
-      # the flag for the guard, restore for the body.
-      let guard_opt_r = parse_arm_guard(p1, TkIf)
-      match guard_opt_r.r {
-        None -> if p_failed(guard_opt_r.p) { err_a(guard_opt_r.p) } else {
-          parse_arm_body(guard_opt_r.p, pat_eff, None)
-        }
-        Some(g) -> parse_arm_body(guard_opt_r.p, pat_eff, Some(g))
-      }
-    }
-  }
-}
-
-fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console {
-
-  if not p_at(p, TkColon) { ArmRefine { p: p, new_pat: None } }
-  else { match pat.pkind {
-    PBind(name) -> {
-      let p1 = p_skip_newlines(p_advance(p))
-      let rt = parse_type(p1)
-      match rt.r {
-        None -> ArmRefine { p: rt.p, new_pat: None }
-        Some(ty) -> match ty.tkind {
-          TyRefine(_, _) -> {
-            # Keep the author's `: Base where pred` spelling; lowering
-            # turns it into a guard over the bound name (same desugar as
-            # `ensure(value) where pred`), welded with any user guard.
-            ArmRefine { p: rt.p,
-                        new_pat: Some(mk_pat(PSurface(PsRefine(written_text(name.name), ty)),
-                                             pat.line, pat.col)) }
-          }
-          # `name : TyName(t, ...)`. Parser cannot tell whether `t` is
-          # a refinement-type alias or a union-component nominal type,
-          # so it emits a uniform `PNarrow(name, ty)` pattern with no
-          # guard. `lower_pattern_narrow_decls` later splits the cases:
-          # for every refinement alias declared in the program, the
-          # narrowing is rewritten back into `PBind(name)` + a guard
-          # call to `__ref_pred_t(name)`; narrowings whose target is
-          # not a refinement alias survive as `PNarrow` for the typer,
-          # which checks the scrutinee is a union containing the
-          # component.
-          TyName(_, _) -> ArmRefine {
-            p: rt.p,
-            new_pat: Some(mk_pat(PNarrow(name, ty), pat.line, pat.col))
-          }
-          _ -> ArmRefine {
-            p: p_error(rt.p, p_peek(p),
-                       "match-arm narrowing `: Type` requires either an inline `Int where ...` or a refinement-type alias name"),
-            new_pat: None
-          }
-        }
-      }
-    }
-    _ -> ArmRefine {
-      p: p_error(p, p_peek(p),
-                 "match-arm narrowing `: Type` only applies to a binding pattern (a bare name)"),
-      new_pat: None
-    }
-  } }
-}
-
-fn parse_arm_body(p: Parser, pat: Pattern, guard: Option[Expr]) : PArm / Console {
-
-  let p1 = p_skip_newlines(p)
-  if not p_at(p1, TkArrow) {
-    err_a(p_error_here(p1, "expected `->` in match arm"))
-  } else {
-    let p2 = p_skip_newlines(p_advance(p1))
-    let rb = p_expr(p2)
-    match rb.r {
-      None -> err_a(rb.p)
-      Some(body) -> ok_a(rb.p, Arm(pat, guard, body))
-    }
-  }
-}
-
-#[doc("A statement that opens with `.` and is nothing but the section.")]
-pub fn stmt_is_bare_section(first: Token, s: Stmt) : Bool =
+fn stmt_is_bare_section(first: Token, s: Stmt) : Bool =
   tk_is(first.kind, TkDot) and match s {
     SExprStmt(e) -> match e.kind { ELambda(_, _) -> true _ -> false }
     _ -> false
   }
 
-#[doc("""
-IndexLhs ::= Ident ("." Ident)*  — used to reject call-LHS index
-writes like `get_array()[0] := v`.
-""")]
-pub fn is_index_lhs_path(e: Expr) : Bool {
+fn is_index_lhs_path(e: Expr) : Bool =
   match e.kind {
     EName(_) -> true
     ESym(_, _) -> true
     EField(base, _) -> is_index_lhs_path(base)
     _ -> false
   }
-}

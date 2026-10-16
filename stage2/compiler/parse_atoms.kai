@@ -1,0 +1,237 @@
+#[doc("Primary expressions that need no operator context: scalar literals, call arguments, `$` intrinsics, `todo!`, `variants[T]()`, `region` and `ensure`.")]
+
+import compiler.util
+import compiler.lex_tokens
+import compiler.ast
+import compiler.intrinsics
+import compiler.real_lit
+import compiler.parse_state
+import compiler.parse_literals
+import compiler.parse_units
+import compiler.parse_types
+import compiler.parse_stmt
+import compiler.parse_lambda
+
+fn call_args_sep(p: Parser, acc: [Expr]) : PArgs / Console =
+  if p_at(p, TkComma) { call_args_loop(p_advance_nl(p), acc) }
+  else if p_at(p, TkRparen) { ok_args(p_advance(p), list_reverse(acc)) }
+  else { err_args(p_error_here(p, "expected `,` or `)` in call arguments")) }
+
+fn call_args_loop(p: Parser, acc: [Expr]) : PArgs / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRparen) { ok_args(p_advance(p0), list_reverse(acc)) }
+  else {
+    let r = p_expr(p0)
+    match r.r {
+      None -> err_args(r.p)
+      Some(e) -> call_args_sep(p_skip_newlines(r.p), [e, ...acc])
+    }
+  }
+}
+
+#[doc("Parses call arguments after an opening `(`, through the closing `)`.")]
+pub fn parse_call_args(p: Parser) : PArgs / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRparen) { ok_args(p_advance(p0), []) } else { call_args_loop(p0, []) }
+}
+
+# An adjacent `<` (no space) after a literal opens a unit annotation; a spaced one is a comparison.
+fn lit_unit_annotation(p: Parser, lit: Expr, t: Token) : PExpr / Console {
+  let ru = parse_unit_expr(p_advance_nl(p))
+  match ru.r {
+    None -> err_e(ru.p)
+    Some(u) -> {
+      let p3 = p_eat(p_skip_newlines(ru.p), TkGt, "expected `>` to close the unit annotation on a literal")
+      if p_failed(p3) { err_e(p3) } else { ok_e(p3, expr_at(ELitUnit(lit, u), t)) }
+    }
+  }
+}
+
+fn try_lit_unit_annotation(p: Parser, lit: Expr, t: Token) : PExpr / Console {
+  let nxt = p_peek(p)
+  if tk_is(nxt.kind, TkLt) and nxt.start == t.start + t.length { lit_unit_annotation(p, lit, t) }
+  else { ok_e(p, lit) }
+}
+
+# A decimal literal past i64 stays an `EIntLit` so an annotation can mint it to a wider carrier.
+#[doc("Parses an integer literal, with an optional adjacent unit annotation.")]
+pub fn parse_int_atom(p: Parser, t: Token) : PExpr / Console {
+  let span = tok_source(p.src, t)
+  if not int_lit_overflows(span) {
+    try_lit_unit_annotation(p_advance(p), expr_at(mk_int_lit(decode_int(span), span), t), t)
+  } else if has_base_prefix(span) {
+    fail_e_at(p_advance(p), t, "hex/binary literal exceeds 64 bits; Int is 64-bit — use bigint.from_string")
+  } else {
+    ok_e(p_advance(p), expr_at(EIntLit(span), t))
+  }
+}
+
+#[doc("Parses a real literal, with an optional adjacent unit annotation.")]
+pub fn parse_real_atom(p: Parser, t: Token) : PExpr / Console {
+  let span = tok_source(p.src, t)
+  match decode_real(span) {
+    Some(r) -> try_lit_unit_annotation(p_advance(p), expr_at(EReal(RealLit(r), span), t), t)
+    None -> fail_e_at(p, t, real_range_error())
+  }
+}
+
+fn span_without_suffix(p: Parser, t: Token) : String {
+  let span = tok_source(p.src, t)
+  string_slice(span, 0, string_length(span) - 1)
+}
+
+#[doc("Parses a `<num>d` decimal literal; the typer folds the exact value.")]
+pub fn parse_decimal_atom(p: Parser, t: Token) : PExpr =
+  ok_e(p_advance(p), expr_at(EDecimalLit(span_without_suffix(p, t)), t))
+
+#[doc("Parses a `<int>n` big integer literal, kept as written for surface lowering.")]
+pub fn parse_bigint_atom(p: Parser, t: Token) : PExpr =
+  ok_e(p_advance(p), expr_at(ESurface(SfBigIntLit(span_without_suffix(p, t))), t))
+
+# `<digits>i` is `complex.mk(0.0, <digits>)`.
+#[doc("Parses an imaginary literal `<num>i`.")]
+pub fn parse_complex_atom(p: Parser, t: Token) : PExpr / Console {
+  let im_span = span_without_suffix(p, t)
+  match decode_real(im_span) {
+    None -> fail_e_at(p, t, real_range_error())
+    Some(im) -> {
+      let zero = expr_at(EReal(RealLit(0.0), "0.0"), t)
+      let im_e = expr_at(EReal(RealLit(im), im_span), t)
+      let callee = expr_at(EField(mk_name("complex", t.line, t.col), "mk"), t)
+      ok_e(p_advance(p), expr_at(ECall(callee, [zero, im_e]), t))
+    }
+  }
+}
+
+fn intrinsic_call(args: PArgs, name: String, t: Token) : PExpr =
+  match args.r {
+    None -> err_e(args.p)
+    Some(xs) -> ok_e(args.p, expr_at(EIntrinsic(intrinsic_of_name(name), xs), t))
+  }
+
+# Arity and argument shape are checked by the typer.
+#[doc("Parses a `$name(args)` intrinsic call at the `$`.")]
+pub fn parse_intrinsic(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  let id = p_peek(p1)
+  if not tk_is(id.kind, TkIdent) {
+    fail_e_at(p1, id, "expected an intrinsic name after `$` (e.g. `$extern_handler(\"sym\")`)")
+  } else {
+    let p2 = p_eat(p_advance(p1), TkLparen, "expected `(` to start the intrinsic argument list — write `$NAME(args)`")
+    if p_failed(p2) { err_e(p2) } else { intrinsic_call(parse_call_args(p2), tok_source(p1.src, id), t) }
+  }
+}
+
+fn char_is_quote(s: String, i: Int) : Bool =
+  match char_at(s, i) {
+    Some(c) -> c == '"'
+    None -> false
+  }
+
+fn is_triple_quoted(span: String) : Bool =
+  string_length(span) >= 6 and char_is_quote(span, 0) and char_is_quote(span, 1) and char_is_quote(span, 2)
+
+fn todo_message(p: Parser, st: Token, t: Token) : PExpr / Console {
+  let span = tok_source(p.src, st)
+  let body_end = string_length(span) - 1
+  if is_triple_quoted(span) { fail_e_at(p, st, "`todo!` does not accept triple-quoted strings") }
+  else if has_interp(span, 1, body_end) {
+    fail_e_at(p, st, "`todo!` message must be a plain string literal (no interpolation)")
+  } else {
+    let p3 = p_eat(p_advance_nl(p), TkRparen, "expected `)` after `todo!` message")
+    if p_failed(p3) { err_e(p3) } else { ok_e(p3, expr_at(ETodo(string_slice(span, 1, body_end - 1)), t)) }
+  }
+}
+
+# The message is a plain string so `--holes-json` and the runtime panic agree on one static value.
+#[doc("Parses `todo!(\"msg\")` at the `todo!` token.")]
+pub fn parse_todo_bang(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  if not p_at(p1, TkLparen) { fail_e(p1, "expected `(` after `todo!`") }
+  else {
+    let p2 = p_advance_nl(p1)
+    let st = p_peek(p2)
+    if not tk_is(st.kind, TkString) {
+      fail_e_at(p2, st, "`todo!` requires a literal string message: `todo!(\"...\")`")
+    } else { todo_message(p2, st, t) }
+  }
+}
+
+fn variants_close(p: Parser, ty: TypeExpr, t: Token) : PExpr / Console {
+  let p1 = p_eat(p_skip_newlines(p), TkRbracket, "expected `]` after type in `variants[T]`")
+  let p2 = p_eat(p1, TkLparen, "expected `()` after `variants[T]`")
+  let p3 = p_eat(p2, TkRparen, "`variants[T]()` does not accept arguments")
+  if p_failed(p3) { err_e(p3) } else { ok_e(p3, expr_at(EVariantsOf(ty, []), t)) }
+}
+
+#[doc("Parses `variants[T]()` at the `[`.")]
+pub fn parse_variants_of(p: Parser, t: Token) : PExpr / Console {
+  let r = parse_type(p_advance_nl(p))
+  match r.r {
+    None -> err_e(r.p)
+    Some(ty) -> variants_close(r.p, ty, t)
+  }
+}
+
+# The marker wraps the block directly (not a thunk) so it stays inline until the region pass unwraps it.
+fn region_call(arg: Expr, t: Token) : Expr =
+  expr_at(ECall(expr_at(EMark(MkRegion), t), [arg]), t)
+
+fn named_region(binder: RegionBinder, t: Token) : PExpr / Console {
+  let r = parse_lambda_block_body(binder.p, t)
+  match r.r {
+    None -> err_e(r.p)
+    Some(body) -> {
+      let lam = expr_at(ELambda([param_at(binder_written(binder.name), t)], body), t)
+      ok_e(r.p, region_call(lam, t))
+    }
+  }
+}
+
+fn unnamed_region(p: Parser, t: Token) : PExpr / Console {
+  let r = parse_block(p, t)
+  match r.r {
+    None -> err_e(r.p)
+    Some(block) -> ok_e(r.p, region_call(block, t))
+  }
+}
+
+# Only a single identifier followed by `->` names a region; patterns and parameter lists do not.
+fn region_binder_name(p: Parser) : Option[RegionBinder] =
+  if not p_at(p, TkIdent) { None }
+  else {
+    let p1 = p_advance(p)
+    if p_at(p1, TkArrow) { Some(RegionBinder { p: p_advance(p1), name: tok_source(p.src, p_peek(p)) }) }
+    else { None }
+  }
+
+#[doc("Parses `region { ... }` or `region { r -> ... }` at the `{`.")]
+pub fn parse_region(p: Parser, t: Token) : PExpr / Console =
+  match region_binder_name(p_advance_nl(p)) {
+    Some(binder) -> named_region(binder, t)
+    None -> unnamed_region(p, t)
+  }
+
+fn ensure_close(p: Parser, value: Expr, t: Token) : PExpr / Console {
+  let p3 = p_eat(p_skip_newlines(p), TkRparen, "expected `)` after value in `ensure(...)`")
+  if p_failed(p3) { err_e(p3) }
+  else if not p_at(p3, TkWhere) {
+    ok_e(p3, expr_at(ECall(mk_name("ensure", t.line, t.col), [value]), t))
+  } else {
+    let pr = parse_refinement_predicate(p_advance_nl(p3), t.line, t.col)
+    match pr.r {
+      None -> err_e(pr.p)
+      Some(pred) -> ok_e(pr.p, expr_at(ESurface(SfEnsure(value, pred)), t))
+    }
+  }
+}
+
+# Without a `where` suffix `ensure(v)` stays an ordinary call, so a user function of that name works.
+#[doc("Parses `ensure(value) where pred` at the `(`.")]
+pub fn parse_ensure_primary(p: Parser, t: Token) : PExpr / Console {
+  let rv = p_expr(p_advance_nl(p))
+  match rv.r {
+    None -> err_e(rv.p)
+    Some(value) -> ensure_close(rv.p, value, t)
+  }
+}
