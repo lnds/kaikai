@@ -4585,7 +4585,10 @@ static int kai_mailbox_waiter_remove(KaiFiber **head, KaiFiber **tail, KaiFiber 
  * Caller must NOT hold the mailbox lock. Returns holding it: 1 with room in
  * the mailbox — the caller enqueues under that same acquisition, so two
  * senders racing on the last slot cannot both pass the check and overshoot
- * `cap` — or 0 once the mailbox is closed. */
+ * `cap` — or 0 once the mailbox is closed or a cancel is due; the sender
+ * then drops its message and the cancel is delivered by the send entry
+ * point after it releases its references. */
+static int kai_mailbox_park(KaiMailbox *mb, KaiFiber **head, KaiFiber **tail, KaiFiber *me);
 static int kai_mailbox_await_slot(KaiMailbox *mb) {
     for (;;) {
         KaiFiber *me = kai_current_fiber();
@@ -4599,7 +4602,11 @@ static int kai_mailbox_await_slot(KaiMailbox *mb) {
         kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
                                    &mb->send_waiter_tail, me);
         kai_mbox_unlock(mb);
-        kai_sched_park();
+        if (kai_mailbox_park(mb, &mb->send_waiter_head,
+                             &mb->send_waiter_tail, me)) {
+            kai_mbox_lock(mb);
+            return 0;
+        }
     }
 }
 
@@ -10445,6 +10452,8 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
     }
     if (mb) kai_mailbox_unpin(mb);
     kai_decref(pid);
+    /* A sender parked on a full mailbox that was cancelled unwinds here. */
+    kai_cancel_deliver(kai_current_fiber());
     return kai_unit();
 }
 #endif
