@@ -18767,6 +18767,8 @@ static void kai_fiber_trampoline(void) {
          * finish its drain, and free the scope. */
         self->cancel_pad_set = 0;
         kai_fiber_consts_drop(self);
+static void kai_nursery_abandon(KaiFiber *f);
+
         kai_nursery_propagate_failure(self);
         self->state = KAI_FIBER_CANCELLED;
     }
@@ -18795,6 +18797,7 @@ static void kai_fiber_trampoline(void) {
     /* Wake awaiters. Each was parked in Spawn.await / Spawn.select /
      * nursery_join. Snapshot the chain under this fiber's slot lock so it
      * is atomic against a concurrent awaiter's check-then-link (both sides
+        kai_nursery_abandon(self);
      * take this lock): `state` was set DONE/CANCELLED above, so an awaiter
      * that acquires the lock after this snapshot sees the terminal state
      * and never parks, while one that linked before the snapshot is on the
@@ -19399,7 +19402,18 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiC
         else          kai_awaiter_link_if_absent(f, me);
         if (kai_nthreads > 1) kai_fiber_slot_unlock_at(f_hl);
         if (terminal) break;
-        kai_sched_park();
+        atomic_store(&me->cancel_wake, 1);
+        if (!kai_cancel_due(me)) kai_sched_park_linked();
+        atomic_store(&me->cancel_wake, 0);
+        if (kai_cancel_due(me)) {
+            /* Off the chain before the unwind: the terminate walk must not
+             * wake a fiber that has left. */
+            if (kai_nthreads > 1) f_hl = kai_fiber_slot_lock(f);
+            kai_awaiter_unlink(f, me);
+            if (kai_nthreads > 1) kai_fiber_slot_unlock_at(f_hl);
+            kai_decref(fib_v);
+            kai_check_cancel_yield_point();
+        }
     }
     return kai_cont_resume(k, kai_fiber_result_for_awaiter(f));
 }
@@ -19637,8 +19651,11 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
 
 /* Park the current fiber on `child`'s awaiter chain until it reaches
  * DONE or CANCELLED. Mirrors the await park; no result is read — the
- * scope joins for completion, not for the value. */
-static void kai_nursery_join_child(KaiFiber *child) {
+ * scope joins for completion, not for the value. An `interruptible` join
+ * woken by a cancel aimed at the joiner cancels the scope's children
+ * (`head`) and keeps waiting: they must end before the scope exits. Returns
+ * 1 when that happened, for the caller to re-raise once the drain is done. */
+static int kai_nursery_join_child(KaiFiber *child, KaiFiber *head, int interruptible) {
     /* Check-and-link under child's slot lock so its terminate walk cannot
      * snapshot the chain between our state read and our link (the lost
      * wakeup that stranded a nursery join at N>1). Loop: only the child's
@@ -19651,8 +19668,16 @@ static void kai_nursery_join_child(KaiFiber *child) {
         if (terminal) kai_awaiter_unlink(child, me);
         else          kai_awaiter_link_if_absent(child, me);
         if (kai_nthreads > 1) kai_fiber_slot_unlock_at(child_hl);
-        if (terminal) return;
-        kai_sched_park();
+        if (terminal) return cancelled;
+        if (!interruptible) { kai_sched_park_linked(); continue; }
+        atomic_store(&me->cancel_wake, 1);
+        if (!kai_cancel_due(me)) kai_sched_park_linked();
+        atomic_store(&me->cancel_wake, 0);
+        if (kai_cancel_due(me)) {
+            kai_nursery_cancel_siblings(head, NULL);
+            interruptible = 0;
+            cancelled = 1;
+        }
     }
 }
 
@@ -19663,6 +19688,8 @@ static void kai_nursery_join_child(KaiFiber *child) {
  * `skip` excludes the failing child itself, which is mid-trampoline
  * and must not be flagged as a requested cancellation. */
 static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
+static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip);
+
     for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
         if (c == skip
             || c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
@@ -19671,6 +19698,7 @@ static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
         kai_fiber_request_cancel(c);
     }
 }
+    int cancelled = 0;
 
 /* Eager cancel-on-fail: a child terminating CANCELLED without a
  * requested cancellation cancels its siblings here, at its own
@@ -19716,7 +19744,37 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
     KaiFiber *head   = scope->children_head;
     int       failed = 0;
     for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        kai_nursery_join_child(c);
+        if (kai_nursery_join_child(c, head, !failed)) failed = 1;
+/* Drop the scope's refs on its terminated children and free it. The
+ * children's wrappers may still be held by the user's `Fiber[T]` handles,
+ * so decref (not free). */
+static void kai_nursery_release(KaiFiber *head, KaiNursery *scope) {
+    KaiFiber *c = head;
+    while (c) {
+        KaiFiber *nx = c->scope_sibling_next;
+        c->scope_sibling_next = NULL;
+        c->scope_nursery      = NULL;
+        if (c->value) kai_decref(c->value);
+        c = nx;
+    }
+    free(scope);
+}
+
+/* A fiber unwinding by cancel never reaches its `scope_exit`: cancel and
+ * join the children of every scope it left open, so none outlives it. */
+static void kai_nursery_abandon(KaiFiber *f) {
+    while (f->nursery_top) {
+        KaiNursery *scope = f->nursery_top;
+        f->nursery_top = scope->parent;
+        KaiFiber *head = scope->children_head;
+        kai_nursery_cancel_siblings(head, NULL);
+        for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+            kai_nursery_join_child(c, head, 0);
+        }
+        kai_nursery_release(head, scope);
+    }
+}
+
         /* A child counts as a *failure* only if it terminated
          * CANCELLED without anyone requesting its cancellation — i.e.
          * it raised `Cancel` on its own or hit a runtime trap. A child
@@ -19737,15 +19795,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
     /* Release the scope's refs and clear the intrusive links. The
      * children are all terminated now; their wrappers may still be
      * held by the user's `Fiber[T]` handles, so decref (not free). */
-    KaiFiber *c = head;
-    while (c) {
-        KaiFiber *nx = c->scope_sibling_next;
-        c->scope_sibling_next = NULL;
-        c->scope_nursery      = NULL;
-        if (c->value) kai_decref(c->value);
-        c = nx;
-    }
-    free(scope);
+    kai_nursery_release(head, scope);
 
     if (failed) {
         /* The re-raise is a `Cancel.raise()` like any other: it walks
