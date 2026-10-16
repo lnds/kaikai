@@ -20,7 +20,7 @@ import compiler.proto_op_index
 
 type TcEnt = TcFn(Decl) | TcDisp(SymId) | TcGone
 
-type TcSt = { ix: NameIndex[TcEnt], declared: NameIndex[SymId], live: NameIndex[SymId], impls: [ProtoImplReg],
+type TcSt = { ix: NameIndex[TcEnt], all: [Decl], live: NameIndex[SymId], impls: [ProtoImplReg],
               full: [SymId], lite: [SymId], work: [Decl], misses: [SymId] }
 
 #[doc("A pruned program and the dropped core functions it still references: each a reachability rule the earlier cut is missing.")]
@@ -31,10 +31,10 @@ pub fn core_typed_cut(decls: [Decl], core_mods: [String], reg: ProtocolReg, drop
   let mods = tc_mods(core_mods, idx_empty())
   let core = filter(decls, (d) => tc_core_fn(d, mods))
   let ix0 = tc_gone(dropped, disp_protos_fold(reg.ids, tc_fns(core, idx_empty()), (ix, s, p) => idx_prepend_sym(ix, s, TcDisp(p))))
-  let st0 = TcSt { ix: ix0, declared: tc_declared(decls, idx_empty()), live: idx_empty(), impls: reg.impls,
+  let st0 = TcSt { ix: ix0, all: decls, live: idx_empty(), impls: reg.impls,
                    full: [], lite: [], work: [], misses: [] }
-  let st = tc_drain(tc_decls(filter(decls, (d) => not tc_core_fn(d, mods)), st0))
-  TypedCut(filter(decls, (d) => not tc_core_fn(d, mods) or tc_in(st.live, tc_sym(d))), st.misses)
+  let st = tc_drain(tc_decls(filter(decls, (d) => not tc_is_core(ix0, d)), st0))
+  TypedCut(filter(decls, (d) => not tc_is_core(ix0, d) or tc_in(st.live, tc_sym(d))), st.misses)
 }
 
 fn tc_mods(ms: [String], ix: NameIndex[Bool]) : NameIndex[Bool] = match ms {
@@ -65,12 +65,26 @@ fn tc_gone(ss: [SymId], ix: NameIndex[TcEnt]) : NameIndex[TcEnt] = match ss {
   [s, ...rest] -> tc_gone(rest, idx_prepend_sym(ix, s, TcGone))
 }
 
-fn tc_declared(ds: [Decl], ix: NameIndex[SymId]) : NameIndex[SymId] = match ds {
-  [] -> ix
-  [d, ...rest] -> tc_declared(rest, match d {
-    DFn(_, _, _, _, _, _, _, _, _, _) -> idx_prepend_sym(ix, tc_sym(d), tc_sym(d))
-    _ -> ix
-  })
+# The core functions are exactly the declarations the index holds a function entry for.
+fn tc_is_core(ix: NameIndex[TcEnt], d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> tc_has_fn(idx_chain_sym(ix, tc_sym(d)))
+  _ -> false
+}
+
+fn tc_has_fn(es: [TcEnt]) : Bool = match es {
+  [] -> false
+  [TcFn(_), ..._] -> true
+  [_, ...rest] -> tc_has_fn(rest)
+}
+
+fn tc_declares(ds: [Decl], s: SymId) : Bool = match ds {
+  [] -> false
+  [d, ...rest] -> (tc_is_fn_decl(d) and sym_same(tc_sym(d), s)) or tc_declares(rest, s)
+}
+
+fn tc_is_fn_decl(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
 }
 
 fn tc_in(ix: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(ix, s) {
@@ -102,9 +116,18 @@ fn tc_exprs(es: [Expr], st: TcSt) : TcSt / Console = match es {
 
 fn tc_expr(e: Expr, st: TcSt) : TcSt / Console = match e.kind {
   ESym(s, _)       -> tc_ref(st, s)
-  EBinop(op, l, r) -> tc_positions(xp_positions(e), tc_binop(st, op, l, r))
-  EUnop(UoNeg, x)  -> tc_positions(xp_positions(e), if tc_native(x, x) { st } else { tc_lite(st, core_proto_id(CpNeg)) })
+  ECall(f, xs)     -> tc_exprs(xs, tc_expr(f, st))
+  EBinop(op, l, r) -> tc_expr(r, tc_expr(l, tc_binop(st, op, l, r)))
+  EUnop(UoNeg, x)  -> tc_expr(x, if tc_native(x, x) { st } else { tc_lite(st, core_proto_id(CpNeg)) })
+  EUnop(_, x)      -> tc_expr(x, st)
+  EField(b, _)     -> tc_expr(b, st)
+  EIf(c, a, oe)    -> tc_opt(oe, tc_expr(a, tc_expr(c, st)))
   _                -> tc_positions(xp_positions(e), st)
+}
+
+fn tc_opt(o: Option[Expr], st: TcSt) : TcSt / Console = match o {
+  Some(x) -> tc_expr(x, st)
+  None    -> st
 }
 
 fn tc_positions(ps: [XPos], st: TcSt) : TcSt / Console = match ps {
@@ -143,7 +166,7 @@ fn tc_ents(st: TcSt, s: SymId, es: [TcEnt]) : TcSt = match es {
 fn tc_ent(st: TcSt, s: SymId, e: TcEnt) : TcSt = match e {
   TcFn(d)   -> TcSt { ...st, work: [d, ...st.work] }
   TcDisp(p) -> tc_full(st, p)
-  TcGone    -> if tc_in(st.declared, s) { st } else { TcSt { ...st, misses: [s, ...st.misses] } }
+  TcGone    -> if tc_declares(st.all, s) { st } else { TcSt { ...st, misses: [s, ...st.misses] } }
 }
 
 # A dispatcher picks any impl of its protocol by the runtime head of its first argument.
