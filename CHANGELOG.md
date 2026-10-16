@@ -84,6 +84,59 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.159.0 (2026-10-16)
+
+### Added
+
+- **stdlib**: make math.real rounding generic over Real<u> and add round_to
+
+### Fixed
+
+- **stdlib**: show a list with a tail loop so a long list does not overflow the stack
+- **diag**: keep the point-free section diagnostic as it was
+- **typer**: leave external_demand's loop bodies unjudged; register the namespace fixtures in the matrix
+- **runtime**: compare containers holding a NaN structurally and wake a peer a link cancels
+- **diag**: hint at a leading dot after an expression and name the reason of a failed interpolation body
+- **refinements**: substitute self through every expression form of a predicate
+- **typer**: descend into intrinsic and surface nodes in the Mutable masking walks
+- **driver**: fail a batch output write with a message and a nonzero exit
+- **runtime**: real_to_int of exactly 2^63 is out of range instead of an undefined cast
+- **unbox**: restrict the raw unit coercion to a Real carrier
+
+### Changed
+
+- **stdlib**: render list show as a piece list joined once
+- **stdlib**: show lists, maps and sets in linear time and size maps in O(1)
+- **parse**: list the parser's literal tests under their new functions
+- **parse**: merge the small modules and rewrite the core parse functions as shared stage helpers
+- **parse**: carry the interpolation failure doc forward
+- **parse**: flatten the heavy parse functions of the new modules into per-stage helpers
+- **parse**: split the parser into state, literal, operator, declaration and helper modules
+- **parse**: dispatch declarations, handlers, fn and effect heads through per-stage functions
+- **parse**: compare token kinds by a flat case code instead of a nested match
+- **stdlib**: append to a file by writing only the new bytes
+- **core-reach**: a comparison operator no longer keeps the primitive Int and Real impls of Eq and Ord
+- **core-reach**: a field read that is not a call's callee no longer reaches core functions by name
+- **compiler**: index the import check's file, origin and name lookups
+- **stdlib**: accumulate the Writer log in linear time
+- **stdlib**: parse and render BigInt decimal text with nine digits per step
+- **stdlib**: fold single-use regexp helpers into their callers
+- **stdlib**: search, replace, split and compile regexes in linear time
+- **stdlib**: encode hex and base64, decode chunked bodies and drain children in linear time
+- **stdlib**: inline single-use helpers in the TOML module
+- **stdlib**: decode and encode TOML in linear time
+- **core**: read decl_bodies in the core reach and precut walks
+- **emit**: match every KIR op and statement when keying the native cache
+- **unbox**: a variant Int binder read only by int_to_real stays raw on native
+- **unbox**: int_to_real and real_to_int lower to raw conversions instead of boxing
+- **stdlib**: shrink the JSON module's compile cost
+- **stdlib**: decode and encode JSON strings in linear time
+- **unbox**: a unit coercion over a raw Real stays raw instead of boxing at its border
+- **runtime**: derive the Real printer's powers of ten from 26 base entries
+- **runtime**: print a Real's shortest round-trip digits without retrying %.*g
+- **kai**: hash the runtime headers once and keep the digest across builds
+- **emit**: a constructor `let` destructure reads raw Int slots and takes its cell apart like a match arm
+
 ## v0.158.1 (2026-10-15)
 
 ### Fixed
