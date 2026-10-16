@@ -24,7 +24,7 @@ compile() { # $1 output stem, $2 source, rest: flags
 }
 
 pass=0; fail=0; retried=0
-for src in examples/minimal/hello.kai examples/minimal/retry_warns_once.kai $(grep -l '#\[derive(' examples/*/*.kai); do
+for src in examples/minimal/hello.kai tools/core-early-cut-retry-warns.kai $(grep -l '#\[derive(' examples/*/*.kai); do
   compile "$WORK/off" "$src" --no-early-cut
   compile "$WORK/cut" "$src"
   compile "$WORK/all" "$src" --early-cut-all

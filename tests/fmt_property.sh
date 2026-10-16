@@ -351,7 +351,8 @@ check_one() {
   #      sibling's: modules-family negatives diagnose at the importing
   #      root, so their support modules fail as roots too and the
   #      golden carries the root's name), the `.err.kai` spelling, or
-  #      the examples/negative/ tree.
+  #      the examples/negative/ tree, or a `--diags-json` fixture whose
+  #      point is the rejected program.
   #   X  non-subject by design — fmt golden-suite inputs (measured by
   #      tests/fmt_fixtures.sh, deliberately not whole programs) and
   #      aspirational code that does not compile yet.
@@ -361,6 +362,7 @@ check_one() {
     case "$rel" in
       *.err.kai)                printf 'N' >> "$results"; return 0 ;;
       examples/negative/*)      printf 'N' >> "$results"; return 0 ;;
+      examples/library_mode/diags_pattern_missing_module.kai) printf 'N' >> "$results"; return 0 ;;
       examples/fmt/*)           printf 'X' >> "$results"; return 0 ;;
       examples/aspirational/*)  printf 'X' >> "$results"; return 0 ;;
     esac
