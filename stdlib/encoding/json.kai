@@ -36,19 +36,33 @@ import encoding.json_bind
 
 # ---- Encoder -----------------------------------------------------
 
-# Escape a String per RFC 8259 §7. Walks the input char-by-char
-# and emits the standard escape sequence for the seven required
-# escapes plus any control character below U+0020.
-fn json_escape_loop(s: String, i: Int, acc: String) : String = {
-  if i >= string_length(s) { acc }
+# Escape a String per RFC 8259 §7: the standard escapes for the seven
+# required characters plus any control character below U+0020. Runs of
+# bytes that need no escape are sliced whole and joined once at the end.
+fn json_escape(s: String) : String =
+  string_concat_all(list_reverse(json_escape_loop(s, 0, 0, [])))
+
+fn json_escape_loop(s: String, i: Int, run: Int, parts: [String]) : [String] = {
+  if i >= string_length(s) { json_flush(s, run, i, parts) }
   else { match char_at(s, i) {
-    None    -> acc
+    None    -> json_flush(s, run, i, parts)
     Some(c) -> {
-      let esc = json_escape_char(c)
-      json_escape_loop(s, i + 1, string_concat(acc, esc))
+      if json_needs_escape(c) {
+        json_escape_loop(s, i + 1, i + 1,
+          [json_escape_char(c), ...json_flush(s, run, i, parts)])
+      } else { json_escape_loop(s, i + 1, run, parts) }
     }
   } }
 }
+
+fn json_needs_escape(c: Char) : Bool = {
+  let n = char_to_int(c)
+  n < 32 or c == '"' or c == '\\'
+}
+
+# Prepends the slice `s[from, to)` to `parts` when it is non-empty.
+fn json_flush(s: String, from: Int, to: Int, parts: [String]) : [String] =
+  if to > from { [string_slice(s, from, to - from), ...parts] } else { parts }
 
 fn json_escape_char(c: Char) : String = {
   let n = char_to_int(c)
@@ -100,14 +114,14 @@ pub fn json_encode(v: JsonValue) : String = match v {
   JBool(b)    -> if b { "true" } else { "false" }
   JNum(n)     -> int_to_string(n)
   JReal(r)    -> real_to_string(r)
-  JStr(s)     -> string_concat(string_concat("\"", json_escape_loop(s, 0, "")), "\"")
+  JStr(s)     -> string_concat(string_concat("\"", json_escape(s)), "\"")
   JArr(xs)    -> string_concat(string_concat("[", string.join(list.map(xs, json_encode), ",")), "]")
   JObj(ps)    -> string_concat(string_concat("{", string.join(list.map(ps, json_encode_pair), ",")), "}")
 }
 
 fn json_encode_pair(p: Pair[String, JsonValue]) : String =
   string_concat(
-    string_concat(string_concat("\"", json_escape_loop(p.fst, 0, "")), "\":"),
+    string_concat(string_concat("\"", json_escape(p.fst)), "\":"),
     json_encode(p.snd))
 
 # ---- Decoder -----------------------------------------------------
@@ -419,37 +433,43 @@ fn json_scan_exp(s: String, i: Int) : Option[Int] = {
 # from a `\uD8xx\uDCxx` surrogate pair into their 4-byte UTF-8
 # sequence per RFC 8259 §7. Lone surrogates (high without low or
 # low without preceding high) yield `None`.
-fn json_parse_string(s: String, i: Int) : Option[JParse] = {
-  let i1 = i + 1   # skip opening `"`
-  json_parse_string_loop(s, i1, "")
-}
+fn json_parse_string(s: String, i: Int) : Option[JParse] =
+  json_parse_string_loop(s, i + 1, i + 1, [])
 
-fn json_parse_string_loop(s: String, i: Int, acc: String) : Option[JParse] = {
+# `run` is the start of the pending run of unescaped bytes; `parts` holds
+# the decoded pieces in reverse order. Every continuation is a self tail
+# call, so the depth does not grow with the number of escapes.
+fn json_parse_string_loop(s: String, i: Int, run: Int, parts: [String]) : Option[JParse] = {
   if i >= string_length(s) { None }
   else { match char_at(s, i) {
     None    -> None
     Some(c) -> {
-      if c == '"' { jp_some(JStr(acc), i + 1) }
-      else if c == '\\' { json_parse_escape(s, i + 1, acc) }
-      else { json_parse_string_loop(s, i + 1,
-                                     string_concat(acc, string_slice(s, i, 1))) }
-    }
-  } }
-}
-
-fn json_parse_escape(s: String, i: Int, acc: String) : Option[JParse] = {
-  if i >= string_length(s) { None }
-  else { match char_at(s, i) {
-    None    -> None
-    Some(c) -> {
-      let appended = json_escape_decode(c)
-      match appended {
-        Some(ch_str) -> json_parse_string_loop(s, i + 1, string_concat(acc, ch_str))
-        None         -> if c == 'u' { json_parse_unicode(s, i + 1, acc) }
-                        else { None }
+      if c == '"' {
+        let done = json_flush(s, run, i, parts)
+        jp_some(JStr(string_concat_all(list_reverse(done))), i + 1)
       }
+      else if c == '\\' {
+        match json_escape_step(s, i + 1) {
+          None     -> None
+          Some(st) -> json_parse_string_loop(s, st.snd, st.snd,
+                        [st.fst, ...json_flush(s, run, i, parts)])
+        }
+      }
+      else { json_parse_string_loop(s, i + 1, run, parts) }
     }
   } }
+}
+
+# Decodes the escape whose character sits at `i` (just after the
+# backslash) into its UTF-8 text and the index past it.
+fn json_escape_step(s: String, i: Int) : Option[Pair[String, Int]] = {
+  match char_at(s, i) {
+    None    -> None
+    Some(c) -> match json_escape_decode(c) {
+      Some(ch_str) -> Some(Pair { fst: ch_str, snd: i + 1 })
+      None         -> if c == 'u' { json_unicode_step(s, i + 1) } else { None }
+    }
+  }
 }
 
 fn json_escape_decode(c: Char) : Option[String] = {
@@ -464,48 +484,33 @@ fn json_escape_decode(c: Char) : Option[String] = {
   else { None }
 }
 
-# Decode `\uXXXX` at cursor `i` (positioned immediately after the
-# `\u`). Returns `None` on hex parse failure, on a lone low
-# surrogate, or on a high surrogate not followed by a `\uYYYY` low
-# surrogate. The decoded codepoint is UTF-8 encoded into the
-# accumulator; the cursor advances past all consumed characters
-# (one `\uXXXX` for BMP, two for a surrogate pair).
-fn json_parse_unicode(s: String, i: Int, acc: String) : Option[JParse] = {
+# Decodes `\uXXXX` with `i` just after the `\u`, as UTF-8 text plus the
+# index past it. A high surrogate must be followed by a `\uYYYY` low
+# surrogate (the pair decodes to one codepoint); a lone surrogate or bad
+# hex yields `None`.
+fn json_unicode_step(s: String, i: Int) : Option[Pair[String, Int]] = {
   match json_read_hex4(s, i) {
     None     -> None
     Some(cp) -> {
       let i1 = i + 4
-      if cp >= 0xDC00 and cp <= 0xDFFF {
-        # Lone low surrogate.
-        None
-      } else if cp >= 0xD800 and cp <= 0xDBFF {
-        # High surrogate: require immediately following `\uYYYY`.
-        if i1 + 6 > string_length(s) { None }
-        else {
-          let bs = string_slice(s, i1, 2)
-          if bs == "\\u" {
-            match json_read_hex4(s, i1 + 2) {
-              None      -> None
-              Some(low) -> {
-                if low >= 0xDC00 and low <= 0xDFFF {
-                  let cp_full = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00)
-                  json_parse_string_loop(s, i1 + 6,
-                    string_concat(acc, json_utf8_encode(cp_full)))
-                } else {
-                  # High surrogate not followed by low — malformed.
-                  None
-                }
-              }
-            }
-          } else { None }
-        }
-      } else {
-        # BMP codepoint (excluding surrogate range): emit 1–3 UTF-8
-        # bytes.
-        json_parse_string_loop(s, i1, string_concat(acc, json_utf8_encode(cp)))
-      }
+      if cp >= 0xDC00 and cp <= 0xDFFF { None }
+      else if cp >= 0xD800 and cp <= 0xDBFF { json_surrogate_pair(s, cp, i1) }
+      else { Some(Pair { fst: json_utf8_encode(cp), snd: i1 }) }
     }
   }
+}
+
+fn json_surrogate_pair(s: String, high: Int, i: Int) : Option[Pair[String, Int]] = {
+  if i + 6 > string_length(s) or string_slice(s, i, 2) != "\\u" { None }
+  else { match json_read_hex4(s, i + 2) {
+    None      -> None
+    Some(low) -> {
+      if low >= 0xDC00 and low <= 0xDFFF {
+        let cp = 0x10000 + (high - 0xD800) * 0x400 + (low - 0xDC00)
+        Some(Pair { fst: json_utf8_encode(cp), snd: i + 6 })
+      } else { None }
+    }
+  } }
 }
 
 # Decode one hex character to a 4-bit value. Mirrors hex_char_value
