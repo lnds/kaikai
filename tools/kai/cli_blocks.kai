@@ -5,8 +5,9 @@ The entry build reaches only its import graph, and files holding blocks
 are leaves nothing imports, so every unreachable `*_test.kai` a package
 owns compiles and runs as its own runner binary.
 
-A build runs the blocks of its root and of the files named as its own:
-the rest of the package the root belongs to. A module imported from the
+A build runs the blocks of its root and, for the package's entry, of every
+file of the package. A module's blocks therefore run once, in the package
+binary, and a test file runs only its own. A module imported from the
 stdlib or from a dependency never adds its blocks to a run.
 """)]
 
@@ -246,9 +247,16 @@ pub fn cover_flags(src: String) : [String] / Env + File + Ffi =
     covered_files(src) || (f => [if f == root { "--cover-root" } else { "--cover" }, f])
   }
 
-#[doc("The kaic2 flags naming the files under test with `src` that declare `kind` blocks, or impls whose law checks a test or check run generates: a build runs their blocks and its root's, never those of another module it imports.")]
+# Only a package's entry owns the package's other files; any other root runs its own blocks alone.
+fn block_files(src: String) : [String] / File + Ffi =
+  match cli_manifest.find_dir(cli_fs.absolute(cli_fs.dirname(src))) {
+    Some(pkg) if cli_fs.absolute(src) != cli_fs.absolute("#{pkg}/#{cli_manifest.entry(pkg)}") -> []
+    _ -> own_files(src)
+  }
+
+#[doc("The kaic2 flags naming the files under test with `src` that declare `kind` blocks, or impls whose law checks a test or check run generates: a build runs their blocks and its root's, and only a package's entry owns the files of its package.")]
 pub fn own_flags(src: String, kind: String) : [String] / File + Ffi =
-  own_files(src) |? (f => runs_in(f, kind)) || (f => ["--test-own", f])
+  block_files(src) |? (f => runs_in(f, kind)) || (f => ["--test-own", f])
 
 #[doc("The kaic2 job that builds runner `r` for `pass`, with `tmp` as its scratch dir.")]
 pub fn runner_job(pass: Pass, r: Runner, tmp: String) : Job / Env + File + Ffi =
@@ -321,19 +329,24 @@ pub fn run_steps(
 fn announce(pass: Pass, rel: String) : String / Env =
   if cli_caches.env_or("KAI_TEST_JSON", "") == "" { "== kai #{pass.kind} #{rel}" } else { "" }
 
+fn module_runner(root: String, pass: Pass, tmp: String, rel: String) : Step / Env {
+  let stem = string.drop_suffix(rel, ".kai").unwrap_or(rel)
+  let out = "#{tmp}/#{string.replace(stem, "/", "_")}-r"
+  Build(Runner { src: "#{root}/#{rel}", out, header: announce(pass, rel) })
+}
+
 fn discovered(
   root: String,
   reach: [String],
+  imported: [String],
   pass: Pass,
   tmp: String,
   rel: String
 ) : [Step] / Env + File + Ffi =
   if reach.contains(rel) or (not declares("#{root}/#{rel}", pass.kind)) {
     []
-  } else if string.ends_with(rel, "_test.kai") {
-    let stem = string.drop_suffix(rel, ".kai").unwrap_or(rel)
-    let out = "#{tmp}/#{string.replace(stem, "/", "_")}-r"
-    [Build(Runner { src: "#{root}/#{rel}", out, header: announce(pass, rel) })]
+  } else if string.ends_with(rel, "_test.kai") or imported.contains(rel) {
+    [module_runner(root, pass, tmp, rel)]
   } else {
     [
       Warn(
@@ -364,7 +377,8 @@ pub fn package_steps(
   }
   let files = source_files(root_abs)
   let any = found or (files |> list.any(rel => declares("#{root_abs}/#{rel}", pass.kind)))
-  let steps = files || (rel => discovered(root_abs, reach, pass, tmp, rel))
+  let imported = kai_files(root_abs, true) || (f => local_imports(root_abs, f))
+  let steps = files || (rel => discovered(root_abs, reach, imported, pass, tmp, rel))
   if any {
     steps
   } else {
