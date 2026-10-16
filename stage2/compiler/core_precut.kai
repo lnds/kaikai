@@ -23,10 +23,10 @@ import compiler.derive_mint
 import compiler.core_reach
 import compiler.chars
 
-type PcSt = { tab: SymTab, fns: NameIndex[Decl], live: NameIndex[String], work: [Decl] }
+type PcSt = { tab: SymTab, fns: NameIndex[Decl], live: NameIndex[SymId], work: [Decl] }
 
 #[doc("The core functions a program can name: the ones something in `user`, in a declaration of `core` that is not a function, or in another of them spells.")]
-pub type PreCut = { tab: SymTab, live: NameIndex[String] }
+pub type PreCut = { tab: SymTab, live: NameIndex[SymId] }
 
 #[doc("How much of the core the early cut empties: what the program cannot name, every function, or nothing.")]
 pub type EarlyCut = EcReached | EcAll | EcOff
@@ -39,21 +39,21 @@ pub fn precut_pays(core: [Decl], user: [Decl]) : Bool = list_length(user) < list
 
 #[doc("The cut of `core` for the program `user`. `tab` names the declarations of both.")]
 pub fn core_precut(core: [Decl], user: [Decl], tab: SymTab) : PreCut = {
-  let st0 = PcSt { tab: tab, fns: pc_index(core, tab, idx_empty()), live: idx_empty(), work: [] }
+  let st0 = PcSt { tab: tab, fns: pc_index(core, idx_empty()), live: idx_empty(), work: [] }
   let all = list_append(user, core)
-  let lib = if any(all, pc_derives) { pc_lib_names(core, tab) } else { [] }
-  let seeded = pc_names(lib, pc_fields(all, pc_names(map(variants[CoreFn](), core_fn_name), st0)))
+  let lib = if any(all, pc_derives) { pc_lib_syms(core, tab) } else { [] }
+  let seeded = pc_syms(lib, pc_fields(all, pc_core_fns(variants[CoreFn](), st0)))
   let st = pc_drain(pc_decls(filter(core, (d) => not pc_is_fn(d)), pc_decls(user, seeded)))
   PreCut { tab: tab, live: st.live }
 }
 
 #[doc("The functions of `core` the cut `pc` empties.")]
 pub fn precut_emptied(pc: PreCut, core: [Decl]) : [SymId] =
-  map(filter(core, (d) => pc_is_fn(d) and not pc_live(pc.live, pc_fn_name(d, pc.tab))), pc_fn_sym)
+  map(filter(core, (d) => pc_is_fn(d) and not pc_live(pc.live, pc_fn_sym(d))), pc_fn_sym)
 
 #[doc("`core` with the body of each function the cut `pc` empties replaced by the unit value.")]
 pub fn precut_decls(pc: PreCut, core: [Decl]) : [Decl] =
-  map(core, (d) => if not pc_is_fn(d) or pc_live(pc.live, pc_fn_name(d, pc.tab)) { d } else { pc_stub(d) })
+  map(core, (d) => if not pc_is_fn(d) or pc_live(pc.live, pc_fn_sym(d)) { d } else { pc_stub(d) })
 
 fn pc_stub(d: Decl) : Decl = match d {
   DDoc(a, b, inner, l, c) -> DDoc(a, b, pc_stub(inner), l, c)
@@ -61,6 +61,14 @@ fn pc_stub(d: Decl) : Decl = match d {
   DFn(p, id, tbs, ps, ret, row, body, l, c, m) ->
     DFn(p, id, tbs, ps, ret, row, mk_expr(EUnit, body.line, body.col), l, c, m)
   _ -> d
+}
+
+fn pc_core_fns(cfs: [CoreFn], st: PcSt) : PcSt = match cfs {
+  [] -> st
+  [cf, ...rest] -> pc_core_fns(rest, match core_fn_id(cf) {
+    Some(s) -> pc_sym(s, st)
+    None    -> pc_name(core_fn_name(cf), st)
+  })
 }
 
 # A derive's expansion reads the fields of its type and calls into the
@@ -72,9 +80,9 @@ fn pc_derives(d: Decl) : Bool = match d {
   _ -> false
 }
 
-fn pc_lib_names(core: [Decl], tab: SymTab) : [String] = match st_module(tab, core_module_name(derive_lib_module())) {
+fn pc_lib_syms(core: [Decl], tab: SymTab) : [SymId] = match st_module(tab, core_module_name(derive_lib_module())) {
   None      -> []
-  Some(lib) -> map(filter(core, (d) => pc_is_fn(d) and sym_owned_by(tab, pc_fn_sym(d), lib)), (d) => pc_fn_name(d, tab))
+  Some(lib) -> map(filter(core, (d) => pc_is_fn(d) and sym_owned_by(tab, pc_fn_sym(d), lib)), pc_fn_sym)
 }
 
 fn pc_fields(ds: [Decl], st: PcSt) : PcSt = match ds {
@@ -92,19 +100,14 @@ fn pc_typed(d: Decl) : Decl = match d {
   _ -> d
 }
 
-fn pc_index(ds: [Decl], tab: SymTab, ix: NameIndex[Decl]) : NameIndex[Decl] = match ds {
+fn pc_index(ds: [Decl], ix: NameIndex[Decl]) : NameIndex[Decl] = match ds {
   [] -> ix
-  [d, ...rest] -> pc_index(rest, tab, if pc_is_fn(d) { idx_prepend(ix, pc_fn_name(d, tab), d) } else { ix })
+  [d, ...rest] -> pc_index(rest, if pc_is_fn(d) { idx_prepend_sym(ix, pc_fn_sym(d), d) } else { ix })
 }
 
 fn pc_is_fn(d: Decl) : Bool = match pc_bare(d) {
   DFn(_, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
-}
-
-fn pc_fn_name(d: Decl, tab: SymTab) : String = match pc_bare(d) {
-  DFn(_, id, _, _, _, _, _, _, _, _) -> written_text(sym_name(tab, fnid_sym(id)))
-  _ -> ""
 }
 
 fn pc_fn_sym(d: Decl) : SymId = match pc_bare(d) {
@@ -120,7 +123,7 @@ fn pc_bare(d: Decl) : Decl = match d {
   _ -> d
 }
 
-fn pc_live(live: NameIndex[String], n: String) : Bool = match idx_chain(live, n) {
+fn pc_live(live: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(live, s) {
   [] -> false
   _  -> true
 }
@@ -144,7 +147,7 @@ fn pc_exprs(es: [Expr], st: PcSt) : PcSt = match es {
 
 fn pc_expr(e: Expr, st: PcSt) : PcSt = match e.kind {
   EName(n)       -> pc_name(written_text(n), st)
-  ESym(s, _)     -> pc_name(written_text(sym_name(st.tab, s)), st)
+  ESym(s, _)     -> pc_sym(s, st)
   EModCall(_, n) -> pc_name(written_text(n), st)
   EField(_, n)   -> pc_positions(xp_positions(e), pc_name(n, st))
   EStr(s, _)     -> if string_contains(s, "\x23{") { pc_names(pc_words(chars(s), [], []), st) } else { st }
@@ -174,9 +177,16 @@ fn pc_names(ns: [String], st: PcSt) : PcSt = match ns {
   [n, ...rest] -> pc_names(rest, pc_name(n, st))
 }
 
-fn pc_name(n: String, st: PcSt) : PcSt =
-  if pc_live(st.live, n) { st }
-  else { match idx_chain(st.fns, n) {
+fn pc_name(n: String, st: PcSt) : PcSt = pc_syms(st_by_name(st.tab, n), st)
+
+fn pc_syms(ss: [SymId], st: PcSt) : PcSt = match ss {
+  [] -> st
+  [s, ...rest] -> pc_syms(rest, pc_sym(s, st))
+}
+
+fn pc_sym(s: SymId, st: PcSt) : PcSt =
+  if pc_live(st.live, s) { st }
+  else { match idx_chain_sym(st.fns, s) {
     [] -> st
-    ds -> PcSt { ...st, live: idx_prepend(st.live, n, n), work: list_append(ds, st.work) }
+    ds -> PcSt { ...st, live: idx_prepend_sym(st.live, s, s), work: list_append(ds, st.work) }
   } }
