@@ -1,16 +1,21 @@
-#[doc("""
-`type` declarations: sums, records, aliases, and the tuple sugar they back.
-""")]
+#[doc("Type and `extern` declarations with FFI-safety validation, top-level declaration dispatch and the program entry point.")]
 
 import compiler.lex_tokens
 import compiler.ast
 import compiler.decl_names
 import compiler.parse_state
 import compiler.parse_types
-import compiler.parse_field_attrs
 import compiler.parse_fns
-import compiler.parse_kinds
-import compiler.parse_effects
+import compiler.util
+import compiler.chars
+import compiler.written
+import compiler.tbinder
+import compiler.diag
+import compiler.doc_attr
+import compiler.nest_limit
+import compiler.parse_control
+import compiler.parse_stmt
+import compiler.parse_expr
 
 # The module that declares the tuple types the `(A, B)` sugar names.
 fn tuple_type_home() : String = "tuple"
@@ -259,4 +264,622 @@ pub fn constructor_wrap(d: Decl, l: Int, c: Int) : Decl = match d {
   DDoc(raw, text, inner, dl, dc) -> DDoc(raw, text, constructor_wrap(inner, l, c), dl, dc)
   DAttr(raw, inner, al, ac) -> DAttr(raw, constructor_wrap(inner, l, c), al, ac)
   _ -> DConstructor(d, l, c)
+}
+
+type FnHead = { p: Parser, is_pub: Bool }
+
+type PStr = { p: Parser, r: Option[String] }
+
+type AxiomHead = {
+  p0: Parser,
+  is_pub: Bool,
+  abi: Option[ExternAbi],
+  c_sym: String,
+  t: Token,
+  aname: String,
+  tparams: [TBinder]
+}
+
+fn fail_d(p: Parser, msg: String) : PDecl / Console = err_d(p_error_here(p, msg))
+
+fn fail_d_at(p: Parser, t: Token, msg: String) : PDecl / Console = err_d(p_error(p, t, msg))
+
+fn at_upper_ident(p: Parser, t: Token) : Bool = tk_is(t.kind, TkIdent) and is_upper_ident(p.src, t)
+
+#[doc("Reports whether the parser sits on the retired `[<extern_c>]` attribute prefix.")]
+pub fn parse_at_legacy_extern_c_attribute(p: Parser) : Bool =
+  p_at(p, TkLbracket) and tk_is(p_peek1(p).kind, TkLt) and tk_is(p_peek2(p).kind, TkIdent)
+    and tok_source(p.src, p_peek2(p)) == "extern_c"
+
+#[doc("""
+Parses `extern "C"|"kai" [("symbol")] [pub] fn name(...) : T [/ row]`, `extern "C" type`
+and `extern "C" opaque` after the `extern` token `t`. A C symbol override must be a valid
+C identifier; under `"kai"` the symbol is mandatory.
+""")]
+pub fn parse_extern_decl(p: Parser, t: Token) : PDecl / Console {
+  let pa = p_skip_newlines(p)
+  let abi_tok = p_peek(pa)
+  if not tk_is(abi_tok.kind, TkString) {
+    fail_d_at(pa, abi_tok, "expected an ABI string literal after `extern` (only `\"C\"` is supported)")
+  } else {
+    let abi = tok_source(pa.src, abi_tok)
+    if abi == "\"C\"" { extern_c_decl(p_advance(pa), t) }
+    else if abi == "\"kai\"" { extern_kai_decl(p_advance(pa), t) }
+    else { fail_d_at(pa, abi_tok, concat_all(["unsupported FFI ABI ", abi, " — only \"C\" is supported"])) }
+  }
+}
+
+fn extern_c_decl(p: Parser, t: Token) : PDecl / Console {
+  let head = p_peek(p)
+  if tk_is(head.kind, TkType) { extern_struct_decl(p_advance(p), t) }
+  else if tk_is(head.kind, TkIdent) and tok_source(p.src, head) == "opaque" { extern_opaque_decl(p_advance(p), t) }
+  else {
+    let over = parse_optional_c_override(p)
+    match over.r {
+      None -> err_d(over.p)
+      Some(sym) -> validate_extern_c_decl(
+        extern_fn(over.p, "expected `fn`, `type`, or `opaque` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)", AbiC, sym, t), t)
+    }
+  }
+}
+
+fn extern_kai_decl(p: Parser, t: Token) : PDecl / Console {
+  let over = parse_optional_c_override(p)
+  match over.r {
+    None -> err_d(over.p)
+    Some("") -> fail_d(p, "`extern \"kai\"` needs its runtime symbol: `extern \"kai\"(\"kai_core_<name>\") fn ...`")
+    Some(sym) -> extern_fn(over.p, "expected `fn` after `extern \"kai\"(\"<symbol>\")`", AbiKai, sym, t)
+  }
+}
+
+fn extern_fn_head(p: Parser, msg: String) : FnHead / Console {
+  let p1 = p_skip_newlines(p)
+  let is_pub = p_at(p1, TkPub)
+  FnHead { p: p_eat(if is_pub { p_advance_nl(p1) } else { p1 }, TkFn, msg), is_pub: is_pub }
+}
+
+fn extern_fn(p: Parser, msg: String, abi: ExternAbi, sym: String, t: Token) : PDecl / Console {
+  let h = extern_fn_head(p, msg)
+  if p_failed(h.p) { err_d(h.p) } else { parse_axiom_decl(h.p, h.is_pub, Some(abi), sym, t) }
+}
+
+fn parse_optional_c_override(p: Parser) : PStr / Console =
+  if not p_at(p, TkLparen) { PStr { p: p, r: Some("") } }
+  else {
+    let p1 = p_advance(p)
+    let tok = p_peek(p1)
+    if tk_is(tok.kind, TkString) { c_symbol_override(p1, tok) }
+    else { PStr { p: p_error(p1, tok, "expected a C-symbol string literal inside `extern \"C\"(...)`"), r: None } }
+  }
+
+fn c_symbol_override(p: Parser, tok: Token) : PStr / Console {
+  let span = tok_source(p.src, tok)
+  let n = string_length(span)
+  let sym = if n >= 2 { string_slice(span, 1, n - 2) } else { "" }
+  if not is_valid_c_identifier(sym) {
+    PStr { p: p_error(p, tok, concat_all(["invalid C symbol override ", span, " — must match `[A-Za-z_][A-Za-z0-9_]*`"])), r: None }
+  } else {
+    let p1 = p_eat(p_advance(p), TkRparen, "expected `)` to close `extern \"C\"(\"<symbol>\")` override")
+    PStr { p: p1, r: if p_failed(p1) { None } else { Some(sym) } }
+  }
+}
+
+fn extern_struct_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not at_upper_ident(p, id) { fail_d_at(p, id, "expected an uppercase type name after `extern \"C\" type`") }
+  else {
+    let p1 = p_eat(p_advance_nl(p), TkEq, "expected `=` in `extern \"C\" type` declaration")
+    if p_failed(p1) { err_d(p1) } else { extern_struct_body(p_skip_newlines(p1), tok_source(p.src, id), t) }
+  }
+}
+
+fn extern_struct_body(p: Parser, name: String, t: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkLbrace, "expected `{` — `extern \"C\" type` must be a struct body `{ field: T, ... }`")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let body = parse_record_body(p_skip_newlines(p1), [], false, name, [], [], t)
+    match body.r {
+      None -> body
+      Some(DType(_, _, _, TBRecord(fields), _, _, _, _)) -> validate_extern_struct_decl(name, fields, body.p, t)
+      Some(_) -> fail_d_at(body.p, t, "internal: extern struct body did not parse as a record")
+    }
+  }
+}
+
+fn extern_opaque_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not at_upper_ident(p, id) { fail_d_at(p, id, "expected an uppercase type name after `extern \"C\" opaque`") }
+  else {
+    let name = tok_source(p.src, id)
+    ok_dn(p_advance(p), DExternType(name, ETOpaque, t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
+  }
+}
+
+#[doc("""
+Parses `name[tparams](params) : T / row` of an axiom; the return type is required and
+a body is rejected. `c_sym_over` is the C-symbol override, empty when absent.
+""")]
+pub fn parse_axiom_decl(p: Parser, is_pub: Bool, abi: Option[ExternAbi], c_sym_over: String, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) { fail_d_at(p, id, "expected axiom name") }
+  else if is_some(abi) and is_upper_ident(p.src, id) { fail_d_at(p, id, "function names must start with a lowercase letter") }
+  else {
+    let tp = parse_opt_type_params(p_advance(p))
+    match tp.r {
+      None -> err_d(tp.p)
+      Some(tparams) -> axiom_params(tp.p, AxiomHead { p0: p, is_pub: is_pub, abi: abi, c_sym: c_sym_over,
+                                                      t: t, aname: tok_source(p.src, id), tparams: tparams })
+    }
+  }
+}
+
+fn axiom_params(p: Parser, h: AxiomHead) : PDecl / Console {
+  let p1 = p_eat(p, TkLparen, "expected `(` after axiom name")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let ps = parse_fn_params(p_skip_newlines(p1), [])
+    match ps.r {
+      None -> err_d(ps.p)
+      Some(params) -> axiom_ret(p_skip_newlines(ps.p), h, params)
+    }
+  }
+}
+
+fn axiom_ret(p: Parser, h: AxiomHead, params: [Param]) : PDecl / Console {
+  let p1 = p_eat(p, TkColon, "axiom requires a return type — write `axiom name(...) : T`")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let rt = parse_type(p1)
+    match rt.r {
+      None -> err_d(rt.p)
+      Some(ty) -> axiom_tail(rt.p, h, params, ty)
+    }
+  }
+}
+
+fn axiom_tail(p: Parser, h: AxiomHead, params: [Param], ty: TypeExpr) : PDecl / Console {
+  let row = parse_row_suffix(p)
+  let p1 = p_skip_newlines(row.p)
+  if p_at(p1, TkEq) or p_at(p1, TkLbrace) { fail_d(p1, "axiom must not have a body — drop the `=` / `{` and trailing block") }
+  else {
+    ok_dn(row.p, DAxiom(h.is_pub, h.abi, h.aname, h.c_sym, h.tparams, params, ty, row.r, h.t.line, h.t.col),
+          [p_ent(h.p0, NCFn, h.aname, h.is_pub)])
+  }
+}
+
+# Nothing is resolved while a file is parsed, so these checks see only the
+# text a reference was written with.
+fn ref_bare_text(r: DeclRef) : String = match r {
+  DrWritten(None, n) -> written_text(n)
+  _ -> ""
+}
+
+fn ref_surface(r: DeclRef) : String = match r {
+  DrWritten(None, n) -> written_text(n)
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+  DrSym(_) -> ""
+}
+
+fn row_labels(row: RowExpr) : [RowLabel] = match row {
+  REmpty -> []
+  RClosed(lbs) -> lbs
+  ROpen(_, lbs) -> lbs
+}
+
+fn extern_row_has_ffi(row: RowExpr) : Bool =
+  any(row_labels(row), (l) => match l { RL(r, _) -> ref_bare_text(r) == "Ffi" })
+
+# The fixed-width boundary scalars: plain `Int` (`Real` for `F32`) boxes on the
+# kaikai side, C-cast at the shim.
+fn is_fixed_width_ffi_name(name: String) : Bool =
+  name == "U8" or name == "U16" or name == "U32" or name == "U64" or
+  name == "I8" or name == "I16" or name == "I32" or name == "I64" or name == "F32"
+
+fn is_v1_primitive_name(name: String) : Bool =
+  name == "Int" or name == "Real" or name == "Bool" or
+  name == "String" or name == "Char" or name == "Unit"
+
+fn is_upper_first(name: String) : Bool =
+  match char_at(name, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
+  }
+
+# A bare uppercase name may be a declared foreign type; the registry is not
+# visible here, so the resolver rejects an undeclared one.
+fn is_c_abi_safe_name(name: String, is_return_slot: Bool) : Bool =
+  if name == "Unit" { is_return_slot }
+  else { (is_v1_primitive_name(name) or is_fixed_width_ffi_name(name) or is_upper_first(name)) }
+
+fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool =
+  match t.tkind {
+    TyName(r, targs) -> targs == [] and is_c_abi_safe_name(ref_bare_text(r), is_return_slot)
+    _ -> false
+  }
+
+# A C struct field needs an exact width, so the primitives are rejected.
+fn is_c_field_type(t: TypeExpr) : Bool =
+  match t.tkind {
+    TyName(r, targs) -> {
+      let name = ref_bare_text(r)
+      targs == [] and (is_fixed_width_ffi_name(name) or (not is_v1_primitive_name(name) and is_upper_first(name)))
+    }
+    _ -> false
+  }
+
+fn type_surface(t: TypeExpr) : String =
+  match t.tkind {
+    TyName(r, []) -> ref_surface(r)
+    TyName(r, targs) -> concat_all([ref_surface(r), "[", type_args_surface(targs), "]"])
+    TyList(inner) -> concat_all(["[", type_surface(inner), "]"])
+    TyFn(_, _, _) -> "fn(...)"
+    TyDim(base, _) -> concat_all([type_surface(base), "<...>"])
+    TyRefine(base, _) -> concat_all([type_surface(base), " where ..."])
+    TyRow(row) -> row_surface(row)
+    TySurface(TsTuple(tys)) -> concat_all(["(", type_args_surface(tys), ")"])
+    TySurface(TsUnitSpan(_, inner)) -> type_surface(inner)
+    TyParam(_, _) -> "_"
+  }
+
+fn row_surface(r: RowExpr) : String =
+  match r {
+    REmpty -> ""
+    RClosed(labels) -> row_labels_surface(labels)
+    ROpen(tail, []) -> tail_written_text(tail)
+    ROpen(tail, labels) -> concat_all([row_labels_surface(labels), " + ", tail_written_text(tail)])
+  }
+
+fn row_labels_surface(ls: [RowLabel]) : String =
+  string_join(map(ls, (l) => match l { RL(r, _) -> ref_surface(r) }), " + ")
+
+fn type_args_surface(ts: [TypeExpr]) : String = string_join(map(ts, type_surface), ", ")
+
+#[doc("""
+Rejects an `extern "C" type` struct with a field that has no C struct layout; the
+nested-struct existence check is the resolver's.
+""")]
+pub fn validate_extern_struct_decl(name: String, fields: [FieldDecl], p: Parser, t: Token) : PDecl / Console =
+  match find(fields, (fd) => match fd { FD(_, _, fty, _) -> not is_c_field_type(fty) }) {
+    Some(FD(_, fname, fty, _)) -> err_d(p_error(p, t, concat_all([
+      "`extern \"C\" type ", name, "` field `", fname,
+      "` has type `", type_surface(fty),
+      "` which has no C struct layout — fields must be fixed-width (U8 U16 U32 U64 I8 I16 I32 I64 F32) or another `extern \"C\" type`"
+    ])))
+    None -> ok_dn(p, DExternType(name, ETStruct(fields), t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
+  }
+
+#[doc("""
+Turns a parsed `extern "C" fn` into an error at the `extern` token unless its row
+declares `Ffi` and every parameter and the return type are C-ABI compatible.
+""")]
+pub fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console =
+  match decl_r.r {
+    Some(DAxiom(_, _, name, _, _, params, ret_ty, row, _, _)) ->
+      match extern_c_problem(name, params, ret_ty, row) {
+        Some(msg) -> err_d(p_error(decl_r.p, t, msg))
+        None -> decl_r
+      }
+    _ -> decl_r
+  }
+
+fn extern_c_problem(name: String, params: [Param], ret_ty: TypeExpr, row: RowExpr) : Option[String] =
+  if not extern_row_has_ffi(row) {
+    Some(concat_all([
+      "`extern \"C\" fn ", name,
+      "` must declare `/ Ffi` in its row — FFI declarations always cross the Ffi capability boundary"
+    ]))
+  } else {
+    match find(params, (pm) => not param_c_abi_safe(pm)) {
+      Some(pm) -> Some(extern_param_message(name, pm))
+      None -> if is_c_abi_safe_type(ret_ty, true) { None } else { Some(extern_return_message(name, ret_ty)) }
+    }
+  }
+
+fn param_c_abi_safe(p: Param) : Bool = match p.ptype {
+  Some(ty) -> is_c_abi_safe_type(ty, false)
+  None -> false
+}
+
+fn extern_return_message(name: String, ret_ty: TypeExpr) : String =
+  concat_all([
+    "`extern \"C\" fn ", name,
+    "` return type `", type_surface(ret_ty),
+    "` is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, Unit, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
+  ])
+
+fn extern_param_message(name: String, p: Param) : String {
+  let ty_s = match p.ptype {
+    Some(ty) -> type_surface(ty)
+    None -> "<missing>"
+  }
+  concat_all([
+    "`extern \"C\" fn ", name,
+    "` parameter `", written_text(p.binder.name),
+    "` has type `", ty_s,
+    "` which is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
+  ])
+}
+
+#[doc("Reports whether a string is a valid C identifier.")]
+pub fn is_valid_c_identifier(s: String) : Bool =
+  string_length(s) > 0 and ch_is_alpha(char_at_or_zero(s, 0)) and c_ident_rest(s, 1, string_length(s))
+
+fn c_ident_rest(s: String, i: Int, n: Int) : Bool =
+  if i >= n { true }
+  else if ch_is_alnum(char_at_or_zero(s, i)) { c_ident_rest(s, i + 1, n) }
+  else { false }
+
+fn parse_decl(p: Parser) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let t = p_peek(p0)
+  if parse_at_legacy_extern_c_attribute(p0) {
+    fail_d(p0, "`[<extern_c>] axiom` is removed (issue #260) — use `extern \"C\" fn name(...) : T / Ffi` instead")
+  } else if tk_is(t.kind, TkExtern) {
+    parse_extern_decl(p_advance(p0), t)
+  } else {
+    parse_decl_after_extern(p0, tk_is(t.kind, TkPub))
+  }
+}
+
+fn parse_decl_after_extern(p0: Parser, is_pub: Bool) : PDecl / Console {
+  let p1 = if is_pub { p_advance(p0) } else { p0 }
+  let hd = p_peek(p1)
+  match (if is_pub { pub_rejection(hd) } else { None }) {
+    Some(msg) -> err_d(p_error(p1, hd, msg))
+    None -> parse_decl_head(p1, is_pub, hd)
+  }
+}
+
+fn pub_rejection(hd: Token) : Option[String] =
+  match hd.kind {
+    TkImpl -> Some("`pub` is not allowed on an impl")
+    TkHashOpen -> Some("`pub` must come AFTER the `#[...]` attribute, not before — write `#[unstable] pub fn ...`")
+    TkTest -> Some("`pub` is not allowed on a test")
+    TkBench -> Some("`pub` is not allowed on a bench")
+    TkCheck -> Some("`pub` is not allowed on a check")
+    TkImport -> Some("`pub` is not allowed on an import")
+    TkUse -> Some("`pub` is not allowed on a `use` declaration")
+    TkTheory -> Some("`pub` is not allowed on a `theory` declaration")
+    _ -> None
+  }
+
+fn parse_decl_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console {
+  let p2 = p_advance(p1)
+  match hd.kind {
+    TkFn -> parse_fn_decl(p2, is_pub, hd)
+    TkType -> parse_type_decl(p2, is_pub, hd)
+    TkEffect -> parse_effect_decl(p2, is_pub, hd)
+    TkProtocol -> parse_protocol_decl(p2, is_pub, hd)
+    TkAxiom -> parse_axiom_decl(p2, is_pub, None, "", hd)
+    TkConst -> parse_const_decl(p2, is_pub, hd)
+    TkImpl -> parse_impl_decl(p2, hd)
+    TkHashOpen -> parse_attribute_decl(p2, hd)
+    TkTest -> parse_test_decl(p2, hd)
+    TkBench -> parse_bench_decl(p2, hd)
+    TkCheck -> parse_check_decl(p2, hd)
+    TkImport -> parse_import_decl(p2, hd)
+    TkUse -> parse_use_decl(p2, hd)
+    TkTheory -> parse_theory_decl(p2, hd)
+    _ -> parse_kind_head(p1, is_pub, hd)
+  }
+}
+
+fn parse_kind_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console =
+  if decl_head_is_kind(p1, hd) { parse_kind_decl(p_advance(p1), is_pub, hd) }
+  else if decl_head_is_user_introducer(p1, hd) { parse_unit_decl(p_advance(p1), is_pub, hd) }
+  else { err_d(p_error(p1, hd, decl_head_expected_msg(p1, hd))) }
+
+fn decl_head_expected_msg(p: Parser, hd: Token) : String {
+  let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
+  let names = ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "const", "import", "pub", "kind", "theory"]
+  match (if tk_is(hd.kind, TkIdent) { closest_name(tok_source(p.src, hd), names) } else { None }) {
+    Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
+    None -> base
+  }
+}
+
+# `p` is past `#[`; known attributes take their own body, any other is wrapped as `DAttr`.
+fn parse_attribute_decl(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let id = p_peek(p0)
+  if not tk_is(id.kind, TkIdent) { err_d(p_error(p0, id, "expected attribute name after `#[`")) }
+  else {
+    let p1 = p_advance(p0)
+    match tok_source(p0.src, id) {
+      "derive" -> parse_attr_derive_body(p1, hash_tok)
+      "unstable" -> parse_attr_unstable_body(p1, hash_tok)
+      "doc" -> parse_attr_doc_body(p1, hash_tok)
+      "constructor" -> parse_attr_constructor_body(p1, hash_tok)
+      name -> parse_attr_unknown_body(p1, name, hash_tok)
+    }
+  }
+}
+
+fn wrap_decl(inner: PDecl, wrap: (Decl) -> Decl) : PDecl =
+  match inner.r {
+    None -> err_d(inner.p)
+    Some(d) -> ok_d_wrap(inner, wrap(d))
+  }
+
+fn attr_raw(src: String, hash_tok: Token, close: Token) : String =
+  string_slice(src, hash_tok.start, (close.start + close.length) - hash_tok.start)
+
+fn parse_attr_derive_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkLparen, "expected `(` after `#[derive`")
+  if p_failed(p1) { err_d(p1) } else { derive_names(parse_derive_names(p_advance_nl(p), []), hash_tok) }
+}
+
+fn derive_names(nr: PDeriveNames, hash_tok: Token) : PDecl / Console =
+  match nr.r {
+    None -> err_d(nr.p)
+    Some(names) -> {
+      let pc = p_eat(p_skip_newlines(nr.p), TkRbracket, "expected `]` to close `#[derive(...)]`")
+      if p_failed(pc) { err_d(pc) } else { parse_derive_target(p_skip_newlines(pc), names, hash_tok) }
+    }
+  }
+
+fn parse_derive_target(p: Parser, names: [String], hash_tok: Token) : PDecl / Console {
+  let inner_pub = p_at(p, TkPub)
+  let p1 = if inner_pub { p_advance(p) } else { p }
+  let hd = p_peek(p1)
+  if not tk_is(hd.kind, TkType) {
+    err_d(p_error(p1, hd, "`#[derive(...)]` must precede a `type` declaration"))
+  } else {
+    wrap_decl(parse_type_decl(p_advance(p1), inner_pub, hd), (d) => DDerive(names, d, hash_tok.line, hash_tok.col))
+  }
+}
+
+fn parse_attr_unstable_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkRbracket, "expected `]` to close `#[unstable]` (the unstable attribute takes no arguments)")
+  if p_failed(p1) { err_d(p1) } else { parse_unstable_decl(p1, hash_tok) }
+}
+
+fn parse_unstable_decl(p: Parser, t: Token) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let pub_tok = p_peek(p0)
+  if not tk_is(pub_tok.kind, TkPub) {
+    err_d(p_error(p0, pub_tok, "`#[unstable]` must precede a `pub fn`, `pub type`, or `pub const` declaration"))
+  } else {
+    let p1 = p_advance_nl(p0)
+    wrap_decl(parse_unstable_inner(p1, p_peek(p1)), (d) => DUnstable(d, t.line, t.col))
+  }
+}
+
+fn parse_unstable_inner(p1: Parser, hd: Token) : PDecl / Console {
+  let p2 = p_advance(p1)
+  match hd.kind {
+    TkFn -> parse_fn_decl(p2, true, hd)
+    TkType -> parse_type_decl(p2, true, hd)
+    TkConst -> parse_const_decl(p2, true, hd)
+    TkEffect -> parse_effect_decl(p2, true, hd)
+    TkProtocol -> parse_protocol_decl(p2, true, hd)
+    _ -> err_d(p_error(p1, hd, "`#[unstable] pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"))
+  }
+}
+
+# The wrapped decl may be preceded by a `#[doc(...)]`, so it recurses through `parse_decl`.
+fn parse_attr_constructor_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkRbracket, "expected `]` to close `#[constructor]` (the constructor attribute takes no arguments)")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let p0 = p_skip_newlines(p1)
+    constructor_target(parse_decl(p0), p0, hash_tok)
+  }
+}
+
+fn constructor_target(inner: PDecl, p0: Parser, hash_tok: Token) : PDecl / Console =
+  match inner.r {
+    None -> err_d(inner.p)
+    Some(d) ->
+      if constructor_wraps_fn(d) { ok_d_wrap(inner, constructor_wrap(d, hash_tok.line, hash_tok.col)) }
+      else { fail_d(p0, "`#[constructor]` must precede a `pub fn` returning the constructed type") }
+  }
+
+# The doc body is kept verbatim (CommonMark, no escape decoding); the full attribute span rides along for `kai fmt`.
+fn parse_attr_doc_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkLparen, "expected `(` after `#[doc` — the doc attribute takes one string argument")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let st = p_peek(p1)
+    if tk_is(st.kind, TkString) { doc_close(p_advance_nl(p1), st, hash_tok) }
+    else {
+      err_d(p_error(p1, st, "expected a string literal in `#[doc(...)]` — bare-flag and key-value forms (`hidden`, `alias = ...`, `since = ...`) are not supported yet"))
+    }
+  }
+}
+
+fn doc_close(p: Parser, st: Token, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkRparen, "expected `)` to close `#[doc(...)]` — the doc attribute takes exactly one string argument")
+  let p2 = p_eat(p1, TkRbracket, "expected `]` to close `#[doc(...)]`")
+  if p_failed(p2) { err_d(p2) }
+  else {
+    let raw = attr_raw(p.src, hash_tok, p_peek(p1))
+    finish_doc_attr(p2, raw, doc_text_normalize(doc_unquote(tok_source(p.src, st))), hash_tok)
+  }
+}
+
+# A doc on the same or next line as a declaration head documents it; any other position makes it the module doc.
+fn finish_doc_attr(p: Parser, raw: String, text: String, t: Token) : PDecl / Console {
+  let ph = p_skip_newlines(p)
+  if p_count_newlines(p, 0) <= 1 and doc_head_starts_decl(p_peek(ph).kind) {
+    let inner = parse_decl(ph)
+    match inner.r {
+      None -> err_d(inner.p)
+      Some(DDoc(_, _, _, il, ic)) ->
+        err_d(p_fail_at(inner.p, il, ic, "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute"))
+      Some(d) -> ok_d_wrap(inner, DDoc(raw, text, d, t.line, t.col))
+    }
+  } else {
+    ok_d(p, DModuleDoc(raw, text, t.line, t.col))
+  }
+}
+
+fn doc_head_starts_decl(k: TokKind) : Bool =
+  match k {
+    TkPub -> true
+    TkFn -> true
+    TkType -> true
+    TkConst -> true
+    TkEffect -> true
+    TkProtocol -> true
+    TkAxiom -> true
+    TkImpl -> true
+    TkExtern -> true
+    TkHashOpen -> true
+    _ -> false
+  }
+
+# Unknown attributes are dropped after the doc strip; the raw span keeps the formatter byte-exact.
+fn parse_attr_unknown_body(p: Parser, name: String, hash_tok: Token) : PDecl / Console {
+  let p_args = if p_at(p, TkLparen) { skip_balanced_parens(p_advance(p), 1) } else { p }
+  let p1 = p_eat(p_args, TkRbracket, concat_all(["expected `]` to close `#[", name, "(...)]`"]))
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let raw = attr_raw(p.src, hash_tok, p_peek(p_args))
+    wrap_decl(parse_decl(p_skip_newlines(p1)), (d) => DAttr(raw, d, hash_tok.line, hash_tok.col))
+  }
+}
+
+fn parse_failed(p: Parser) : PParser = PParser { p: p, decls: None, fn_bounds: [], names: [] }
+
+fn names_onto(ns: [NEnt], acc: [NEnt]) : [NEnt] =
+  match ns {
+    [] -> acc
+    [n, ...rest] -> names_onto(rest, [n, ...acc])
+  }
+
+fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) : [FnBoundsRec] =
+  match bs {
+    [] -> bacc
+    _ -> match (d, names) {
+      (DFn(_, _, _, _, _, _, _, _, _, mo), [NEnt(_, name, _, _, _), ..._]) -> [FBR(name, mo, bs), ...bacc]
+      _ -> bacc
+    }
+  }
+
+fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec], nacc: [NEnt]) : PParser / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkEof) {
+    # An error recorded while a declaration still parsed in shape must not read as success.
+    if p_failed(p0) { parse_failed(p0) }
+    else { PParser { p: p0, decls: Some(list_reverse(acc)), fn_bounds: list_reverse(bacc), names: list_reverse(nacc) } }
+  } else {
+    let r = parse_decl(p0)
+    match r.r {
+      None -> parse_failed(r.p)
+      Some(d) -> parse_program_loop(r.p, [d, ...acc], fn_bounds_seed(d, r.bounds, r.names, bacc), names_onto(r.names, nacc))
+    }
+  }
+}
+
+#[doc("Parses the file `file`. `home` is the module the file's declarations belong to: every declaration and constructor id is derived with it.")]
+pub fn parse_program(file: String, src: String, toks: [Token], home: String) : PParser / Console {
+  let r = parse_program_loop(parser_new(file, src, toks, home, parse_expr), [], [], [])
+  match r.decls {
+    None -> r
+    Some(ds) -> match nest_first_over(ds) {
+      None -> r
+      Some(e) -> parse_failed(p_fail_at(r.p, e.line, e.col, nest_msg()))
+    }
+  }
 }
