@@ -225,7 +225,8 @@ fn main() : Int / Stdout = {
 An enclosing binding of either name **wins over the alias**: a clause
 under `let log = ...` reads that `log`, and the compiler warns that the
 handler state is not reachable under that name there. Rename the
-enclosing binding if the clause needs the state. A `var` is unaffected:
+enclosing binding if the clause needs the state. Between nested stateful
+handlers the innermost wins. A `var` is unaffected:
 it reaches its cell without going through either name.
 
 ## Rebinding the capability name
