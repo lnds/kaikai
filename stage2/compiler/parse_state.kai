@@ -1,0 +1,480 @@
+#[doc("""
+Parser cursor, error helpers and the result carriers shared by every
+parse module.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.lex_tokens
+import compiler.ast
+import compiler.decl_names
+import compiler.kinds
+import compiler.nest_limit
+
+pub type Parser = { file: String, src: String, rest: [Token], error: Option[Diagnostic],
+                # Trailing lambdas attach to Calls, but the condition
+                # of `if` / `match` (and similar prefix constructs that
+                # take an Expr followed by a `{`-block) must not consume
+                # the `{` as a trailing lambda. This flag is set to false
+                # while parsing such a cond and restored when the cond
+                # parser finishes.
+                allow_trailing_lambda: Bool,
+                # Positional record literals (`Name { ... }`) share the
+                # same hazard: in an `if`/`match` cond the `{` opening the
+                # body would otherwise be eaten as a record literal. False
+                # while parsing such a cond; re-enabled inside any
+                # delimiter (call args, `()`, `[]`, block) where a record
+                # literal is unambiguous.
+                allow_record_lit: Bool,
+                # Read-only registry of the file's kind introducers,
+                # built by a pre-scan before any body is parsed. Lets the
+                # top-level dispatch recognise `metric m` as a habitant
+                # declaration by set membership, order-independently.
+                kind_reg: KindReg,
+                # Expression / pattern / type nesting entered so far;
+                # bounded by `nest_max` so the recursive descent cannot
+                # exhaust the stack.
+                depth: Int,
+                # The module the file's declarations belong to: every
+                # declaration and constructor id is derived with it.
+                home: String }
+
+# A result = a new parser plus an optional payload. `None` means the
+# parser failed (`error` is set on `p`). This mirrors stage 0's
+# error-then-stop style.
+
+#[doc("The parser state paired with the result of parsing an expression.")]
+pub type PExpr   = { p: Parser, r: Option[Expr] }
+#[doc("The parser state paired with the result of parsing a statement.")]
+pub type PStmt   = { p: Parser, r: Option[Stmt] }
+#[doc("The parser state paired with the result of parsing a pattern.")]
+pub type PPat    = { p: Parser, r: Option[Pattern] }
+#[doc("The parser state paired with the result of parsing a type.")]
+pub type PTy     = { p: Parser, r: Option[TypeExpr] }
+
+#[doc("""
+`names` holds the entries the declaration contributes to the symbol
+table, in declaration order: itself, then a sum's constructors or an
+impl's methods.
+""")]
+pub type PDecl   = { p: Parser, r: Option[Decl], bounds: [FnTPBound], names: [NEnt] }
+#[doc("The parser state paired with the result of parsing a match arm.")]
+pub type PArm    = { p: Parser, r: Option[Arm] }
+#[doc("Creates a parser over a token stream and its source.")]
+pub fn parser_new(file: String, src: String, toks: [Token], home: String) : Parser =
+  Parser { file: file, src: src, rest: toks, error: None,
+           allow_trailing_lambda: true, allow_record_lit: true,
+           kind_reg: prescan_kinds(src, toks), depth: 0, home: home }
+
+#[doc("Records a parse error on the parser without moving it.")]
+pub fn p_mark_err(p: Parser, d: Diagnostic) : Parser =
+  Parser { file: p.file, src: p.src, rest: p.rest, error: Some(d),
+           allow_trailing_lambda: p.allow_trailing_lambda,
+           allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg,
+           depth: p.depth, home: p.home }
+
+#[doc("Reports whether the parser has recorded an error.")]
+pub fn p_failed(p: Parser) : Bool = match p.error {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("Report a parse error at (line, col) and mark the parser failed with it.")]
+pub fn p_fail_at(p: Parser, line: Int, col: Int, msg: String) : Parser / Console = {
+  diag_error_from_src(p.file, p.src, line, col, msg)
+  p_mark_err(p, mk_diag(SevError, p.file, line, col, msg, []))
+}
+
+#[doc("The diagnostic a failed parse reported, if any.")]
+pub fn parse_diags(r: PParser) : [Diagnostic] = match r.p.error {
+  Some(d) -> [d]
+  None    -> []
+}
+
+#[doc("Moves the parser one token forward.")]
+pub fn p_advance(p: Parser) : Parser {
+  match p.rest {
+    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1,
+                              error: p.error,
+                              allow_trailing_lambda: p.allow_trailing_lambda,
+                              allow_record_lit: p.allow_record_lit,
+                              kind_reg: p.kind_reg, depth: p.depth, home: p.home }
+    [] -> p
+  }
+}
+
+# A sentinel EOF token used when peeking past the list end. In practice
+# the tokenizer always appends a TkEof, so we rarely hit this.
+fn eof_tok() : Token = Token { kind: TkEof, line: 0, col: 0, start: 0, length: 0 }
+
+#[doc("Returns the current token.")]
+pub fn p_peek(p: Parser) : Token {
+  match p.rest {
+    [t, ..._rs] -> t
+    [] -> eof_tok()
+  }
+}
+
+#[doc("Returns the token after the current one.")]
+pub fn p_peek1(p: Parser) : Token {
+  match p.rest {
+    [_, t, ..._rs] -> t
+    _ -> eof_tok()
+  }
+}
+
+#[doc("Returns the token two ahead of the current one.")]
+pub fn p_peek2(p: Parser) : Token {
+  match p.rest {
+    [_, _, t, ..._rs] -> t
+    _ -> eof_tok()
+  }
+}
+
+#[doc("Equal cases, payloads ignored; a `TkError` equals nothing.")]
+pub fn tk_is(a: TokKind, b: TokKind) : Bool {
+  let c = tk_code(a)
+  c >= 0 and c == tk_code(b)
+}
+
+#[doc("Reports whether the current token has the given kind.")]
+pub fn p_at(p: Parser, k: TokKind) : Bool = tk_is(p_peek(p).kind, k)
+
+#[doc("Advances past newline tokens.")]
+pub fn p_skip_newlines(p: Parser) : Parser {
+  if p_at(p, TkNewline) { p_skip_newlines(p_advance(p)) } else { p }
+}
+
+#[doc("""
+Temporarily disable trailing-lambda attachment for the parser
+passed in (used by `if` / `match` cond parsing). Returns
+a parser identical except for the flag. The caller is expected
+to restore the original flag value after the cond parses by
+threading the flag back via `p_with_trailing_lambda(p, true)`.
+""")]
+pub fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
+  Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
+           allow_trailing_lambda: allow, allow_record_lit: p.allow_record_lit,
+           kind_reg: p.kind_reg, depth: p.depth, home: p.home }
+}
+
+#[doc("""
+Toggle positional record-literal parsing (see `Parser.allow_record_lit`).
+Mirrors `p_with_trailing_lambda`: `if` / `match` disable it for the
+cond, delimiters re-enable it for their interior.
+""")]
+pub fn p_with_record_lit(p: Parser, allow: Bool) : Parser {
+  Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
+           allow_trailing_lambda: p.allow_trailing_lambda, allow_record_lit: allow,
+           kind_reg: p.kind_reg, depth: p.depth, home: p.home }
+}
+
+#[doc("Returns the parser with its nesting depth set to the given value.")]
+pub fn p_at_depth(p: Parser, d: Int) : Parser {
+  Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
+           allow_trailing_lambda: p.allow_trailing_lambda,
+           allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg, depth: d,
+           home: p.home }
+}
+
+#[doc("Reports whether the nesting depth passed the limit.")]
+pub fn p_too_deep(p: Parser) : Parser / Console = p_error_here(p, nest_msg())
+
+#[doc("""
+Reinstate the caller's `allow_record_lit` on the result of a delimited
+sub-parse. A delimiter re-enables record literals for its interior; on
+return the caller's flag must be restored so a following operand in an
+`if`/`match` cond stays suppressed.
+""")]
+pub fn restore_rl(prev: Bool, r: PExpr) : PExpr =
+  PExpr { p: p_with_record_lit(r.p, prev), r: r.r }
+
+#[doc("Advances past newline and semicolon tokens.")]
+pub fn p_skip_newlines_and_semis(p: Parser) : Parser {
+  if p_at(p, TkNewline) or p_at(p, TkSemi) { p_skip_newlines_and_semis(p_advance(p)) }
+  else { p }
+}
+
+#[doc("Records a parse error located at a given token.")]
+pub fn p_error(p: Parser, t: Token, msg: String) : Parser / Console = p_error_at(p, t.line, t.col, msg)
+
+#[doc("Records a parse error at a source position.")]
+pub fn p_error_at(p: Parser, line: Int, col: Int, msg: String) : Parser / Console =
+  if p_failed(p) { p }
+  # An interpolation body is parsed apart from its file: its source is
+  # the body alone. The string that holds it reports the failure.
+  else if p.file == interp_parse_file() { p_mark_err(p, mk_diag(SevError, p.file, line, col, msg, [])) }
+  else { p_fail_at(p, line, col, msg) }
+
+#[doc("Records a parse error at the current token.")]
+pub fn p_error_here(p: Parser, msg: String) : Parser / Console = p_error(p, p_peek(p), msg)
+
+#[doc("Advances past a token of the given kind, or records an error.")]
+pub fn p_expect(p: Parser, k: TokKind, msg: String) : PExpr / Console {
+
+  # PExpr is a misnomer — we just reuse the record structure: the `r`
+  # slot is a placeholder, this only advances past a required delimiter.
+  if p_at(p, k) { PExpr { p: p_advance(p), r: Some(mk_expr(EUnit, 0, 0)) } }
+  else { PExpr { p: p_error_here(p, msg), r: None } }
+}
+
+#[doc("Reports whether an identifier token starts with an uppercase letter.")]
+pub fn is_upper_ident(src: String, t: Token) : Bool {
+  match char_at(src, t.start) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
+  }
+}
+
+#[doc("Returns the source text of a token.")]
+pub fn tok_source(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+#[doc("A qualified name read at the parser position, with the parser advanced past it.")]
+pub type PQName = { p: Parser, name: String, dref: DeclRef }
+
+#[doc("""
+A habitant name in declaration-head position (`with m.E`, `impl m.P`),
+optionally qualified by a lowercase module. `dref` is the reference as
+written; `name` folds the qualifier into one spelling, `mod.Name`, for
+the slots that hold a name and no reference.
+""")]
+pub fn parse_qualified_head_name(p: Parser, t: Token) : PQName {
+  let p1 = p_advance(p)
+  let qualified = (not is_upper_ident(p.src, t)) and p_at(p1, TkDot) and tk_is(p_peek1(p1).kind, TkIdent) and is_upper_ident(p1.src, p_peek1(p1))
+  if qualified {
+    let q = tok_source(p.src, t)
+    let n = tok_source(p1.src, p_peek1(p1))
+    PQName { p: p_advance(p_advance(p1)), name: concat_all([q, ".", n]), dref: ref_qualified(q, n) }
+  } else {
+    PQName { p: p1, name: tok_source(p.src, t), dref: ref_written(tok_source(p.src, t)) }
+  }
+}
+
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_e(p: Parser, e: Expr) : PExpr = PExpr { p: p, r: Some(e) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_e(p: Parser) : PExpr = PExpr { p: p, r: None }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_s(p: Parser, s: Stmt) : PStmt = PStmt { p: p, r: Some(s) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_s(p: Parser) : PStmt = PStmt { p: p, r: None }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_p(p: Parser, x: Pattern) : PPat = PPat { p: p, r: Some(x) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_p(p: Parser) : PPat = PPat { p: p, r: None }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_t(p: Parser, x: TypeExpr) : PTy = PTy { p: p, r: Some(x) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_t(p: Parser) : PTy = PTy { p: p, r: None }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x), bounds: [], names: [] }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None, bounds: [], names: [] }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_dn(p: Parser, x: Decl, names: [NEnt]) : PDecl = PDecl { p: p, r: Some(x), bounds: [], names: names }
+
+#[doc("A wrapper around the declaration `inner` parsed declares what `inner` does.")]
+pub fn ok_d_wrap(inner: PDecl, x: Decl) : PDecl = PDecl { p: inner.p, r: Some(x), bounds: [], names: inner.names }
+
+#[doc("The entry of a declaration of the file being parsed, and the id it derives.")]
+pub fn p_ent(p: Parser, cls: NCls, name: String, is_pub: Bool) : NEnt = NEnt(cls, name, p.home, is_pub, NmSource)
+#[doc("Mints the symbol for a declared name in the given namespace.")]
+pub fn p_sym(p: Parser, cls: NCls, name: String) : SymId = sym_derive_word(ncls_word(cls), name, p.home)
+
+#[doc("""
+`parse_fn_decl` variant carrying the fn's declared protocol bounds
+alongside the (already stripped) DFn. `parse_program_loop` seeds the
+root file's fn-bounds side table from these; the DFn itself stays
+stripped, so every downstream pass and every load path (root,
+core, cache) sees clean tparam strings.
+""")]
+pub fn ok_d_fn(p: Parser, x: Decl, bs: [FnTPBound], names: [NEnt]) : PDecl = PDecl { p: p, r: Some(x), bounds: bs, names: names }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_a(p: Parser, x: Arm) : PArm = PArm { p: p, r: Some(x) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_a(p: Parser) : PArm = PArm { p: p, r: None }
+
+#[doc("A later line of the body starts at column 1 of its own line.")]
+pub fn tok_at(t: Token, line: Int, col: Int) : Token =
+  Token { ...t, line: line + t.line - 1, col: if t.line == 1 { col + t.col - 1 } else { t.col } }
+
+# The pseudo-file every interpolation sub-parse runs under. Diagnostics
+# from that parse are suppressed: the span belongs to no user file.
+pub fn interp_parse_file() : String = "<interp>"
+
+#[doc("""
+Outcome of a pipeline placeholder substitution attempt.
+`PPRPassthrough` keeps the legacy first-arg behaviour. The other
+two arms either return the substituted call expression (single `_`
+in the rhs args) or report a multiple-placeholder error.
+""")]
+pub type PPRResult
+  = PPRPassthrough
+  | PPRSubstituted(Expr, Parser)
+  | PPRError(Parser)
+
+#[doc("""
+The operator after an operand, at a level in [lo, hi]: on the same line,
+or leading the next non-blank one. Newlines that lead to anything else
+belong to the enclosing statement, so the caller keeps its own parser.
+""")]
+pub type BinOpAt = { p: Parser, tok: Token, level: Int }
+
+#[doc("""
+Bounded-lookahead: tentatively scan for `LambdaParams "->"` or
+bare `"->"`. Returns Some(parser-after-arrow, params) on match,
+None otherwise. The scan never consumes tokens of the underlying
+parser on failure (it's a pure predicate over the token stream).
+`wrap` carries a single destructuring pattern (`{ (a, b) -> ... }`);
+when present the caller rewrites the body to `match <fresh> { pat -> body }`,
+reusing the existing pattern lowering and its exhaustiveness check.
+""")]
+pub type LamBlockParams = { p: Parser, params: [Param], wrap: Option[Pattern] }
+
+#[doc("""
+Parse the argument list of a call. Position is AT the token after the
+opening `(`. Returns with `(` already consumed by caller, `)` to be
+consumed here. Newlines between args are allowed.
+""")]
+pub type PArgs = { p: Parser, r: Option[[Expr]] }
+
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_args(p: Parser, xs: [Expr]) : PArgs = PArgs { p: p, r: Some(xs) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_args(p: Parser) : PArgs = PArgs { p: p, r: None }
+
+#[doc("The parser state paired with the result of parsing an optional handler-state initializer.")]
+pub type PInit = { p: Parser, r: Option[Expr], has_init: Bool }
+
+#[doc("The parser state paired with the result of parsing an optional handler alias.")]
+pub type PAlias = { p: Parser, r: Option[Binder] }
+
+#[doc("The parser state paired with the result of parsing handler clauses.")]
+pub type PClauses = {
+  p: Parser,
+  clauses: [HClause],
+  return_clause: Option[HReturn],
+  prelude: [Stmt],
+  r: Option[Bool]
+}
+
+#[doc("Builds a failed handler-clause result carrying the parser with its error.")]
+pub fn pclauses_err(p: Parser) : PClauses =
+  PClauses { p: p, clauses: [], return_clause: None, prelude: [], r: None }
+
+#[doc("""
+Result of the region-binder probe: the parser positioned after `->`
+and the region's name.
+""")]
+pub type RegionBinder = { p: Parser, name: String }
+
+#[doc("""
+A lambda parameter list is a comma-separated sequence of identifiers
+(optionally with `: Type` annotations) followed by `)` then `=>`.
+This scan is non-destructive: it returns the parser advanced past the
+`=>` on success, None on failure.
+""")]
+pub type LamParams = { p: Parser, params: [Param] }
+
+#[doc("A parsed map entry: key and value expressions.")]
+pub type MapEntry = MapE(Expr, Expr)
+
+#[doc("Result of parsing one `key: value` entry, mirroring `PExpr`.")]
+pub type PEntry = { p: Parser, r: Option[MapEntry] }
+
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_entry(p: Parser, e: MapEntry) : PEntry = PEntry { p: p, r: Some(e) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_entry(p: Parser) : PEntry = PEntry { p: p, r: None }
+
+#[doc("""
+Collect additional scrutinees after the first. `acc` is in
+reverse order; caller reverses. Returns the parser state pointing
+at the first non-`,` non-newline token.
+""")]
+pub type PScruts = { p: Parser, r: [Expr] }
+
+#[doc("""
+Parse N comma-separated patterns followed by optional guard,
+`->`, body. The arity must match `n` (scrutinee count); mismatched
+arities are a parse error.
+""")]
+pub type PMArm = { p: Parser, r: Option[MMArm] }
+
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_marm(p: Parser) : PMArm = PMArm { p: p, r: None }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_marm(p: Parser, m: MMArm) : PMArm = PMArm { p: p, r: Some(m) }
+
+#[doc("""
+Parse exactly `n` patterns, separated by commas. Returns
+None if any pattern fails to parse or if the comma count does not
+match (n-1 commas expected between n patterns).
+""")]
+pub type PPatN = { p: Parser, r: Option[[Pattern]] }
+
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_patn(p: Parser) : PPatN = PPatN { p: p, r: None }
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_patn(p: Parser, ps: [Pattern]) : PPatN = PPatN { p: p, r: Some(ps) }
+
+#[doc("""
+Parser state after consuming an optional `: Type`
+refinement-narrowing suffix on a match arm pattern. `new_pat`
+overrides the original pattern (`PsRefine` for an inline refinement,
+`PNarrow` for an alias / union-component name). `None` means leave
+the caller's pattern unchanged.
+""")]
+pub type ArmRefine = { p: Parser, new_pat: Option[Pattern] }
+
+#[doc("The parser state paired with the result of parsing a range bound.")]
+pub type RangeBound = { p: Parser, e: Expr }
+
+#[doc("""
+After a return-type is parsed, an optional row suffix can follow:
+  T / Eff
+  T / Eff + Eff + ...
+  T / e                # row variable alone
+  T / Eff + e          # closed labels followed by a row variable
+Capitalisation disambiguates: TitleCase identifiers are effect
+labels, lowercase identifiers in tail position are row variables.
+Two row variables (`/ e + r`) and a row variable not in tail
+(`/ e + Eff`) are syntax errors — kaikai picks the simpler
+tail-variable semantics. If `/` is absent, REmpty.
+""")]
+pub type PRow = { p: Parser, r: RowExpr }
+
+#[doc("The parser state paired with the result of parsing row-label type arguments.")]
+pub type PRowArgs = { p: Parser, r: Option[[TypeExpr]] }
+
+#[doc("""
+Unit-expression grammar.
+  unit_expr := unit_term ( ('*' | '/' | '+') unit_term )*
+  unit_term := unit_factor ('^' integer)?
+  unit_factor := IDENT | INT('1') | '(' unit_expr ')'
+`+` builds a semilattice join; validation rejects it on habitants of
+any non-Semilattice kind (and products/powers on Semilattice ones).
+""")]
+pub type PUnit = { p: Parser, r: Option[UnitExprT] }
+
+#[doc("Wraps a successful parse result with the advanced parser.")]
+pub fn ok_u(p: Parser, u: UnitExprT) : PUnit = PUnit { p: p, r: Some(u) }
+#[doc("Builds a failed parse result carrying the parser with its error.")]
+pub fn err_u(p: Parser) : PUnit = PUnit { p: p, r: None }
+
+#[doc("The parser state paired with the result of parsing a unit integer.")]
+pub type PUInt = { p: Parser, r: Option[Int] }
+
+#[doc("The parser state paired with the result of parsing a parameter list.")]
+pub type PParams = { p: Parser, r: Option[[Param]] }
+
+#[doc("A pending parameter name awaiting the group's shared type annotation.")]
+pub type PendName = { nm: String, nline: Int, ncol: Int, pborrow: Bool }
+
+#[doc("Counts the newline tokens between two parser positions.")]
+pub fn p_count_newlines(p: Parser, acc: Int) : Int {
+  if p_at(p, TkNewline) { p_count_newlines(p_advance(p), acc + 1) } else { acc }
+}
+
+#[doc("What parsing a file gives: the parser's final state, the declarations, the protocol bounds its functions declare, and one entry per declaration, constructor and impl method it declares, in declaration order.")]
+pub type PParser = { p: Parser, decls: Option[[Decl]], fn_bounds: [FnBoundsRec], names: [NEnt] }
