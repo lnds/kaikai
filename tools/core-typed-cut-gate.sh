@@ -13,7 +13,7 @@ EDITION="$(cat "$ROOT/EDITION")"
 [ -x "$KAIC2" ] || { echo "core-typed-cut: SKIP — no stage2/kaic2"; exit 0; }
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-SRC=examples/protocols/core_cut_generic_ops.kai
+SRC=examples/stdlib/core_cut_generic_ops.kai
 "$KAIC2" --edition "$EDITION" --path "$ROOT/stdlib" "$SRC" > "$WORK/pruned.c" 2> "$WORK/pruned.err" \
   || { echo "core-typed-cut: FAIL — the pruned build does not compile"; cat "$WORK/pruned.err"; exit 1; }
 
