@@ -450,6 +450,7 @@ KAIX_CORE_THUNK0(stdlib_path)
 KAIX_CORE_THUNK1(abspath)
 KAIX_CORE_THUNK1(read_file)
 KAIX_CORE_THUNK2(write_file)
+KAIX_CORE_THUNK2(file_append)
 KAIX_CORE_THUNK1(file_exists)
 KAIX_CORE_THUNK1(file_delete)
 KAIX_CORE_THUNK2(file_rename)
@@ -1249,6 +1250,7 @@ KaiValue *kaix_core_exit(KaiValue *v)                    { return kai_core_exit(
 /* kaix_core_panic is defined above near kaix_match_panic. */
 KaiValue *kaix_core_read_file(KaiValue *p)               { return kai_core_read_file(p); }
 KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c) { return kai_core_write_file(p, c); }
+KaiValue *kaix_core_file_append(KaiValue *p, KaiValue *c){ return kai_core_file_append(p, c); }
 KaiValue *kaix_core_file_exists(KaiValue *p)             { return kai_core_file_exists(p); }
 KaiValue *kaix_core_file_delete(KaiValue *p)             { return kai_core_file_delete(p); }
 KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t){ return kai_core_file_rename(f, t); }
