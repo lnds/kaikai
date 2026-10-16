@@ -1815,86 +1815,91 @@ fn parse_intrinsic(p: Parser, t: Token) : PExpr / Console {
 # block contains `op_name(args, resume) -> body` plus an optional
 # `return(x) -> body` at the end.
 fn parse_handle(p: Parser, t: Token) : PExpr / Console {
-
-  let bt = p_peek(p)
   if not p_at(p, TkLbrace) {
     err_e(p_error_here(p, "expected `{` to start handle body"))
   } else {
-    let body_r = parse_block(p, bt)
+    let body_r = parse_block(p, p_peek(p))
     match body_r.r {
       None -> err_e(body_r.p)
-      Some(body) -> {
-        let p1 = p_skip_newlines(body_r.p)
-        if not p_at(p1, TkWith) {
-          err_e(p_error_here(p1, "expected `with` after handle body"))
+      Some(body) -> parse_handle_with(p_skip_newlines(body_r.p), t, body)
+    }
+  }
+}
+
+fn parse_handle_with(p1: Parser, t: Token, body: Expr) : PExpr / Console {
+  if not p_at(p1, TkWith) {
+    err_e(p_error_here(p1, "expected `with` after handle body"))
+  } else {
+    let p2 = p_advance(p1)
+    let eff_t = p_peek(p2)
+    if not tk_is(eff_t.kind, TkIdent) {
+      err_e(p_error(p2, eff_t, "expected effect name after `with`"))
+    } else {
+      parse_handle_effect(p2, eff_t, t, body)
+    }
+  }
+}
+
+fn parse_handle_effect(p2: Parser, eff_t: Token, t: Token, body: Expr) : PExpr / Console {
+  let eff_q = parse_qualified_head_name(p2, eff_t)
+  let p3 = eff_q.p
+  let tyargs_r =
+    if p_at(p3, TkLbracket) {
+      parse_row_label_args(p_skip_newlines(p_advance(p3)), [])
+    } else {
+      PRowArgs { p: p3, r: Some([]) }
+    }
+  match tyargs_r.r {
+    None -> err_e(tyargs_r.p)
+    Some(eff_tyargs) -> parse_handle_init(tyargs_r.p, t, body, eff_q.dref, eff_tyargs)
+  }
+}
+
+fn parse_handle_init(p: Parser, t: Token, body: Expr, eff_name: DeclRef,
+                     eff_tyargs: [TypeExpr]) : PExpr / Console {
+  let init_r = parse_handler_state_init(p)
+  let init_failed =
+    if init_r.has_init {
+      match init_r.r { None -> true Some(_) -> false }
+    } else { false }
+  if init_failed {
+    err_e(init_r.p)
+  } else {
+    parse_handle_clause_block(init_r, t, body, eff_name, eff_tyargs)
+  }
+}
+
+fn parse_handler_state_init(p: Parser) : PInit / Console {
+  if p_at(p, TkLparen) {
+    let ie = parse_expr(p_skip_newlines(p_advance(p)))
+    match ie.r {
+      None -> PInit { p: ie.p, r: None, has_init: true }
+      Some(ix) -> {
+        let p_ic = p_skip_newlines(ie.p)
+        if not p_at(p_ic, TkRparen) {
+          PInit { p: p_error_here(p_ic, "expected `)` after handler-state initializer"),
+                  r: None, has_init: true }
         } else {
-          let p2 = p_advance(p1)
-          let eff_t = p_peek(p2)
-          if not tk_is(eff_t.kind, TkIdent) {
-            err_e(p_error(p2, eff_t, "expected effect name after `with`"))
-          } else {
-            let eff_q = parse_qualified_head_name(p2, eff_t)
-            let eff_name = eff_q.dref
-            let p3 = eff_q.p
-            # Optional `[T1, T2]` after the effect name —
-            # the type instantiation. e.g. `with Reader[Int]`.
-            let tyargs_r =
-              if p_at(p3, TkLbracket) {
-                parse_row_label_args(p_skip_newlines(p_advance(p3)), [])
-              } else {
-                PRowArgs { p: p3, r: Some([]) }
-              }
-            match tyargs_r.r {
-              None -> err_e(tyargs_r.p)
-              Some(eff_tyargs) -> {
-                # Optional `(init)` after the type args — the
-                # handler-state initial value, e.g. `with State[Int](0)`.
-                let init_r =
-                  if p_at(tyargs_r.p, TkLparen) {
-                    let p_io = p_skip_newlines(p_advance(tyargs_r.p))
-                    let ie = parse_expr(p_io)
-                    match ie.r {
-                      None -> PInit { p: ie.p, r: None, has_init: true }
-                      Some(ix) -> {
-                        let p_ic = p_skip_newlines(ie.p)
-                        if not p_at(p_ic, TkRparen) {
-                          PInit { p: p_error_here(p_ic, "expected `)` after handler-state initializer"),
-                                  r: None, has_init: true }
-                        } else {
-                          PInit { p: p_advance(p_ic), r: Some(ix), has_init: true }
-                        }
-                      }
-                    }
-                  } else {
-                    PInit { p: tyargs_r.p, r: None, has_init: false }
-                  }
-                let init_failed =
-                  if init_r.has_init {
-                    match init_r.r { None -> true Some(_) -> false }
-                  } else { false }
-                if init_failed {
-                  err_e(init_r.p)
-                } else {
-                let alias_r = parse_handle_alias(init_r.p)
-                let p4 = p_skip_newlines(alias_r.p)
-                if not p_at(p4, TkLbrace) {
-                  err_e(p_error_here(p4, "expected `{` to start handler clauses"))
-                } else {
-                  let p5 = p_skip_newlines(p_advance(p4))
-                  let cr = parse_handle_clauses(p5, [], None, [])
-                  match cr.r {
-                    None -> err_e(cr.p)
-                    Some(_) ->
-                      finish_handle(p4, t, body, eff_name, eff_tyargs,
-                                    init_r, alias_r.r, cr)
-                  }
-                }
-                }
-              }
-            }
-          }
+          PInit { p: p_advance(p_ic), r: Some(ix), has_init: true }
         }
       }
+    }
+  } else {
+    PInit { p: p, r: None, has_init: false }
+  }
+}
+
+fn parse_handle_clause_block(init_r: PInit, t: Token, body: Expr, eff_name: DeclRef,
+                             eff_tyargs: [TypeExpr]) : PExpr / Console {
+  let alias_r = parse_handle_alias(init_r.p)
+  let p4 = p_skip_newlines(alias_r.p)
+  if not p_at(p4, TkLbrace) {
+    err_e(p_error_here(p4, "expected `{` to start handler clauses"))
+  } else {
+    let cr = parse_handle_clauses(p_skip_newlines(p_advance(p4)), [], None, [])
+    match cr.r {
+      None -> err_e(cr.p)
+      Some(_) -> finish_handle(p4, t, body, eff_name, eff_tyargs, init_r, alias_r.r, cr)
     }
   }
 }
@@ -1970,88 +1975,78 @@ type PClauses = {
 # `var` / `let` is a parse error — the rule is "var/let must
 # precede all operation clauses inside one handler block."
 fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
-
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
     PClauses { p: p_advance(p0), clauses: list_reverse(acc),
                return_clause: rret, prelude: list_reverse(prelude), r: Some(true) }
   } else {
-    let id_t = p_peek(p0)
-    if tk_is(id_t.kind, TkVar) {
-      match acc {
-        [] -> {
-          let sr = parse_var(p0, id_t)
-          match sr.r {
-            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
-                               prelude: [], r: None }
-            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
-          }
-        }
-        _ -> PClauses { p: p_error(p0, id_t,
-               "`var` and `let` must precede all operation clauses inside a handler"),
-               clauses: [], return_clause: None, prelude: [], r: None }
+    parse_handle_clause(p0, acc, rret, prelude)
+  }
+}
+
+fn pclauses_err(p: Parser) : PClauses =
+  PClauses { p: p, clauses: [], return_clause: None, prelude: [], r: None }
+
+fn parse_handle_clause(p0: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+  let id_t = p_peek(p0)
+  if tk_is(id_t.kind, TkVar) or tk_is(id_t.kind, TkLet) {
+    parse_clause_prelude(p0, id_t, acc, rret, prelude)
+  } else if not tk_is(id_t.kind, TkIdent) {
+    pclauses_err(p_error(p0, id_t, "expected operation name in handler"))
+  } else if is_lifecycle_clause_at(p0, id_t) {
+    parse_lifecycle_clause(p0, id_t, acc, rret, prelude)
+  } else {
+    parse_op_clause(p0, id_t, acc, rret, prelude)
+  }
+}
+
+fn parse_clause_prelude(p0: Parser, id_t: Token, acc: [HClause], rret: Option[HReturn],
+                        prelude: [Stmt]) : PClauses / Console {
+  match acc {
+    [] -> {
+      let sr = if tk_is(id_t.kind, TkVar) { parse_var(p0, id_t) } else { parse_let(p0, id_t) }
+      match sr.r {
+        None -> pclauses_err(sr.p)
+        Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
       }
-    } else if tk_is(id_t.kind, TkLet) {
-      match acc {
-        [] -> {
-          let sr = parse_let(p0, id_t)
-          match sr.r {
-            None -> PClauses { p: sr.p, clauses: [], return_clause: None,
-                               prelude: [], r: None }
-            Some(s) -> parse_handle_clauses(sr.p, acc, rret, [s, ...prelude])
+    }
+    _ -> pclauses_err(p_error(p0, id_t,
+           "`var` and `let` must precede all operation clauses inside a handler"))
+  }
+}
+
+fn parse_op_clause(p0: Parser, id_t: Token, acc: [HClause], rret: Option[HReturn],
+                   prelude: [Stmt]) : PClauses / Console {
+  let p1 = p_advance(p0)
+  if not p_at(p1, TkLparen) {
+    pclauses_err(p_error_here(p1, "expected `(` after operation name"))
+  } else {
+    let params_r = parse_clause_params(p_skip_newlines(p_advance(p1)), [])
+    match params_r.r {
+      None -> pclauses_err(params_r.p)
+      Some(params) -> parse_op_clause_body(p_skip_newlines(params_r.p), id_t, params, acc, rret, prelude)
+    }
+  }
+}
+
+fn parse_op_clause_body(p3: Parser, id_t: Token, params: [Param], acc: [HClause],
+                        rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console {
+  if not p_at(p3, TkArrow) {
+    pclauses_err(p_error_here(p3, "expected `->` after operation parameters"))
+  } else {
+    let rb = parse_expr(p_skip_newlines(p_advance(p3)))
+    match rb.r {
+      None -> pclauses_err(rb.p)
+      Some(body) -> {
+        let name = tok_source(p3.src, id_t)
+        if name == "return" {
+          match params {
+            [pp] -> parse_handle_clauses(rb.p, acc, Some(HR(pp.binder, body, id_t.line, id_t.col)), prelude)
+            _ -> pclauses_err(p_error(p3, id_t, "return clause takes exactly one parameter"))
           }
-        }
-        _ -> PClauses { p: p_error(p0, id_t,
-               "`var` and `let` must precede all operation clauses inside a handler"),
-               clauses: [], return_clause: None, prelude: [], r: None }
-      }
-    } else if not tk_is(id_t.kind, TkIdent) {
-      PClauses { p: p_error(p0, id_t, "expected operation name in handler"),
-                 clauses: [], return_clause: None, prelude: [], r: None }
-    } else if is_lifecycle_clause_at(p0, id_t) {
-      parse_lifecycle_clause(p0, id_t, acc, rret, prelude)
-    } else {
-      let name = tok_source(p0.src, id_t)
-      let p1 = p_advance(p0)
-      if not p_at(p1, TkLparen) {
-        PClauses { p: p_error_here(p1, "expected `(` after operation name"),
-                   clauses: [], return_clause: None, prelude: [], r: None }
-      } else {
-        let p2 = p_skip_newlines(p_advance(p1))
-        let params_r = parse_clause_params(p2, [])
-        match params_r.r {
-          None -> PClauses { p: params_r.p, clauses: [], return_clause: None,
-                             prelude: [], r: None }
-          Some(params) -> {
-            let p3 = p_skip_newlines(params_r.p)
-            if not p_at(p3, TkArrow) {
-              PClauses { p: p_error_here(p3, "expected `->` after operation parameters"),
-                         clauses: [], return_clause: None, prelude: [], r: None }
-            } else {
-              let p4 = p_skip_newlines(p_advance(p3))
-              let rb = parse_expr(p4)
-              match rb.r {
-                None -> PClauses { p: rb.p, clauses: [], return_clause: None,
-                                   prelude: [], r: None }
-                Some(body) -> {
-                  if name == "return" {
-                    match params {
-                      [pp] -> {
-                        let hr = HR(pp.binder, body, id_t.line, id_t.col)
-                        parse_handle_clauses(rb.p, acc, Some(hr), prelude)
-                      }
-                      _ -> PClauses { p: p_error(p3, id_t,
-                             "return clause takes exactly one parameter"),
-                             clauses: [], return_clause: None, prelude: [], r: None }
-                    }
-                  } else {
-                    let hc = HC(ChOp(name), params, body, id_t.line, id_t.col)
-                    parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
-                  }
-                }
-              }
-            }
-          }
+        } else {
+          let hc = HC(ChOp(name), params, body, id_t.line, id_t.col)
+          parse_handle_clauses(rb.p, [hc, ...acc], rret, prelude)
         }
       }
     }
@@ -4863,85 +4858,67 @@ fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy / Console {
 # ====================================================================
 
 fn parse_decl(p: Parser) : PDecl / Console {
-
-  let p_pre = p_skip_newlines(p)
-  # The legacy `[<extern_c>]` attribute prefix is rejected before
-  # any other parsing happens — the syntax is now `extern "C" fn ...`
-  # (and the override variant). We surface a migration error pointing
-  # at the new form.
-  if parse_at_legacy_extern_c_attribute(p_pre) {
-    let line_msg = "`[<extern_c>] axiom` is removed (issue #260) — use `extern \"C\" fn name(...) : T / Ffi` instead"
-    err_d(p_error_here(p_pre, line_msg))
-  } else {
-  let p0 = p_pre
+  let p0 = p_skip_newlines(p)
   let t = p_peek(p0)
-  # `extern` is a top-level keyword introducing an FFI declaration.
-  # It binds tighter than `pub`, so the surface form is
-  # `extern "C" pub fn ...`. The optional name override sits between
-  # the ABI literal and the `pub`/`fn`.
-  if tk_is(t.kind, TkExtern) {
+  if parse_at_legacy_extern_c_attribute(p0) {
+    err_d(p_error_here(p0, "`[<extern_c>] axiom` is removed (issue #260) — use `extern \"C\" fn name(...) : T / Ffi` instead"))
+  } else if tk_is(t.kind, TkExtern) {
     parse_extern_decl(p_advance(p0), t)
   } else {
-  let is_pub_r =
-    if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName(ref_written(""), []), 0, 0)) } }
-    else { PTy { p: p0, r: None } }
-  let is_pub =
-    match is_pub_r.r { Some(_) -> true None -> false }
-  let p1 = is_pub_r.p
+    parse_decl_after_extern(p0, tk_is(t.kind, TkPub))
+  }
+}
+
+fn parse_decl_after_extern(p0: Parser, is_pub: Bool) : PDecl / Console {
+  let p1 = if is_pub { p_advance(p0) } else { p0 }
   let hd = p_peek(p1)
-  if tk_is(hd.kind, TkFn) {
-    parse_fn_decl(p_advance(p1), is_pub, hd)
-  } else if tk_is(hd.kind, TkType) {
-    parse_type_decl(p_advance(p1), is_pub, hd)
-  } else if tk_is(hd.kind, TkEffect) {
-    parse_effect_decl(p_advance(p1), is_pub, hd)
-  } else if tk_is(hd.kind, TkProtocol) {
-    parse_protocol_decl(p_advance(p1), is_pub, hd)
-  } else if tk_is(hd.kind, TkImpl) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an impl")) }
-    else { parse_impl_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkHashOpen) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` must come AFTER the `#[...]` attribute, not before — write `#[unstable] pub fn ...`")) }
-    else { parse_attribute_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkTest) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
-    else { parse_test_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkBench) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a bench")) }
-    else { parse_bench_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkCheck) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a check")) }
-    else { parse_check_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkImport) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
-    else { parse_import_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkUse) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a `use` declaration")) }
-    else { parse_use_decl(p_advance(p1), hd) }
-  } else if tk_is(hd.kind, TkAxiom) {
-    parse_axiom_decl(p_advance(p1), is_pub, None, "", hd)
-  } else if tk_is(hd.kind, TkConst) {
-    parse_const_decl(p_advance(p1), is_pub, hd)
-  } else if tk_is(hd.kind, TkTheory) {
-    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a `theory` declaration")) }
-    else { parse_theory_decl(p_advance(p1), hd) }
-  } else if decl_head_is_kind(p1, hd) {
-    parse_kind_decl(p_advance(p1), is_pub, hd)
-  } else if decl_head_is_user_introducer(p1, hd) {
-    parse_unit_decl(p_advance(p1), is_pub, hd)
-  } else {
-    let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
-    let msg = if tk_is(hd.kind, TkIdent) {
-      let text = tok_source(p1.src, hd)
-      match closest_name(text, ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "const", "import", "pub", "kind", "theory"]) {
-        Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
-        None      -> base
-      }
-    } else { base }
-    err_d(p_error(p1, hd, msg))
+  match (if is_pub { pub_rejection(hd) } else { None }) {
+    Some(msg) -> err_d(p_error(p1, hd, msg))
+    None -> parse_decl_head(p1, is_pub, hd)
   }
-  }
-  }
+}
+
+fn pub_rejection(hd: Token) : Option[String] {
+  if tk_is(hd.kind, TkImpl) { Some("`pub` is not allowed on an impl") }
+  else if tk_is(hd.kind, TkHashOpen) { Some("`pub` must come AFTER the `#[...]` attribute, not before — write `#[unstable] pub fn ...`") }
+  else if tk_is(hd.kind, TkTest) { Some("`pub` is not allowed on a test") }
+  else if tk_is(hd.kind, TkBench) { Some("`pub` is not allowed on a bench") }
+  else if tk_is(hd.kind, TkCheck) { Some("`pub` is not allowed on a check") }
+  else if tk_is(hd.kind, TkImport) { Some("`pub` is not allowed on an import") }
+  else if tk_is(hd.kind, TkUse) { Some("`pub` is not allowed on a `use` declaration") }
+  else if tk_is(hd.kind, TkTheory) { Some("`pub` is not allowed on a `theory` declaration") }
+  else { None }
+}
+
+fn parse_decl_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console {
+  let p2 = p_advance(p1)
+  if tk_is(hd.kind, TkFn) { parse_fn_decl(p2, is_pub, hd) }
+  else if tk_is(hd.kind, TkType) { parse_type_decl(p2, is_pub, hd) }
+  else if tk_is(hd.kind, TkEffect) { parse_effect_decl(p2, is_pub, hd) }
+  else if tk_is(hd.kind, TkProtocol) { parse_protocol_decl(p2, is_pub, hd) }
+  else if tk_is(hd.kind, TkImpl) { parse_impl_decl(p2, hd) }
+  else if tk_is(hd.kind, TkHashOpen) { parse_attribute_decl(p2, hd) }
+  else if tk_is(hd.kind, TkTest) { parse_test_decl(p2, hd) }
+  else if tk_is(hd.kind, TkBench) { parse_bench_decl(p2, hd) }
+  else if tk_is(hd.kind, TkCheck) { parse_check_decl(p2, hd) }
+  else if tk_is(hd.kind, TkImport) { parse_import_decl(p2, hd) }
+  else if tk_is(hd.kind, TkUse) { parse_use_decl(p2, hd) }
+  else if tk_is(hd.kind, TkAxiom) { parse_axiom_decl(p2, is_pub, None, "", hd) }
+  else if tk_is(hd.kind, TkConst) { parse_const_decl(p2, is_pub, hd) }
+  else if tk_is(hd.kind, TkTheory) { parse_theory_decl(p2, hd) }
+  else if decl_head_is_kind(p1, hd) { parse_kind_decl(p2, is_pub, hd) }
+  else if decl_head_is_user_introducer(p1, hd) { parse_unit_decl(p2, is_pub, hd) }
+  else { err_d(p_error(p1, hd, decl_head_expected_msg(p1, hd))) }
+}
+
+fn decl_head_expected_msg(p: Parser, hd: Token) : String {
+  let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
+  if tk_is(hd.kind, TkIdent) {
+    match closest_name(tok_source(p.src, hd), ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "const", "import", "pub", "kind", "theory"]) {
+      Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
+      None -> base
+    }
+  } else { base }
 }
 
 # const NAME : T = expr — top-level named constant. Parses to the
@@ -6033,24 +6010,25 @@ fn parse_qualified_unit(p: Parser, qt: Token) : PUnit / Console {
   }
 }
 
-fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
+type FnHead = {
+  p0: Parser,
+  name: String,
+  is_pub: Bool,
+  t: Token,
+  tparams: [TBinder],
+  params: [Param],
+  ret: Option[TypeExpr],
+  row: RowExpr
+}
 
+fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
     err_d(p_error(p, id, "expected function name"))
   } else if is_upper_ident(p.src, id) {
     err_d(p_error(p, id, "function names must start with a lowercase letter"))
   } else {
-    let name = tok_source(p.src, id)
     let p1 = p_advance(p)
-    # Optional `[T1, T2, ...]` type parameter list before `(`.
-    # Accepts protocol bounds (`T : Eq`, `T : Show + Eq`) like impl
-    # headers do; the stored tparams keep the bounds so the writer
-    # can print the signature — `surface_lower_decls` strips them
-    # before the body is typed, and dispatch falls out of
-    # monomorphisation (the spec body re-runs the protocol resolver
-    # once `T` is concrete). A bound the instantiation cannot satisfy
-    # is rejected post-mono by the polymorphic-impl validator.
     let tparams_r =
       if p_at(p1, TkLbracket) {
         parse_impl_type_params_loop(p_skip_newlines(p_advance(p1)), [])
@@ -6059,95 +6037,75 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
       }
     match tparams_r.r {
       None -> err_d(tparams_r.p)
-      Some(tparams_raw) -> {
-        let tparams = tparams_raw
-        let fn_bounds = fn_tp_bounds_of(tparams_raw)
-        let pp = tparams_r.p
-        if not p_at(pp, TkLparen) {
-          err_d(p_error_here(pp, "expected `(` after function name"))
-        } else {
-      let p2 = p_skip_newlines(p_advance(pp))
-      let params_r = parse_fn_params(p2, [])
-      match params_r.r {
-        None -> err_d(params_r.p)
-        Some(params) -> {
-          let p3 = p_skip_newlines(params_r.p)
-          # Optional `: ReturnType`
-          let ret_r =
-            if p_at(p3, TkColon) {
-              let rt = parse_type(p_advance(p3))
-              match rt.r {
-                None -> PTy { p: rt.p, r: None }
-                Some(ty) -> PTy { p: rt.p, r: Some(ty) }
-              }
-            } else {
-              PTy { p: p3, r: None }
-            }
-          if p_failed(ret_r.p) and not p_failed(p3) { err_d(ret_r.p) }
-          else {
-            # Optional effect-row suffix: `T / Io + Fail`.
-            let row_r = parse_row_suffix(ret_r.p)
-            # Catch a now-removed `[<...>]` fn attribute between the
-            # signature/row and the contract clauses and emit a
-            # migration error. Peek-2 lookahead so a bare `[` (e.g. the
-            # rare list-type follow-up) doesn't trigger. Its parser
-            # (with any error attached) threads on into the clauses.
-            let attr = parse_optional_pure_attribute(p_skip_newlines(row_r.p))
-            # Optional `requires` / `ensures` clauses between the
-            # signature and the body. The parser preserves them as an
-            # `SfContract` surface wrapper around the body;
-            # `surface_lower_decls` desugars them to body asserts.
-            let cc = parse_contracts_loop(p_skip_newlines(attr.p), [], [])
-            let p4 = p_skip_newlines(cc.p)
-            # Body: `= expr` or `{ block }`.
-            if p_at(p4, TkEq) {
-              let p5 = p_skip_newlines(p_advance(p4))
-              let rb = parse_expr(p5)
-              match rb.r {
-                None -> err_d(rb.p)
-                Some(body) -> {
-                  let body2 = contract_surface(body, cc.reqs, cc.enss, t)
-                  let dfn = DFn(is_pub, fnid_decl(p_sym(p, NCFn, name)), tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                  ok_d_fn(rb.p, dfn, fn_bounds, [p_ent(p, NCFn, name, is_pub)])
-                }
-              }
-            } else if p_at(p4, TkLbrace) {
-              let tb = p_peek(p4)
-              # Peek past `{` and any newlines/semis. If
-              # the first significant token is `case`, parse a
-              # multi-clause body that desugars to a `match` over the
-              # implicit tuple of args. Otherwise, fall through to the
-              # existing statement-block form.
-              let after_lbrace = p_skip_newlines_and_semis(p_advance(p4))
-              if p_at(after_lbrace, TkCase) {
-                let rb = parse_clause_block(after_lbrace, params, tb)
-                match rb.r {
-                  None -> err_d(rb.p)
-                  Some(body) -> {
-                    let body2 = contract_surface(body, cc.reqs, cc.enss, t)
-                    let dfn = DFn(is_pub, fnid_decl(p_sym(p, NCFn, name)), tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                    ok_d_fn(rb.p, dfn, fn_bounds, [p_ent(p, NCFn, name, is_pub)])
-                  }
-                }
-              } else {
-                let rb = parse_block(p4, tb)
-                match rb.r {
-                  None -> err_d(rb.p)
-                  Some(body) -> {
-                    let body2 = contract_surface(body, cc.reqs, cc.enss, t)
-                    let dfn = DFn(is_pub, fnid_decl(p_sym(p, NCFn, name)), tparams, params, ret_r.r, row_r.r, body2, t.line, t.col, None)
-                    ok_d_fn(rb.p, dfn, fn_bounds, [p_ent(p, NCFn, name, is_pub)])
-                  }
-                }
-              }
-            } else {
-              err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
-            }
-          }
-        }
+      Some(tparams) -> parse_fn_paren(tparams_r.p, p, is_pub, t, tok_source(p.src, id), tparams)
+    }
+  }
+}
+
+fn parse_fn_paren(pp: Parser, p: Parser, is_pub: Bool, t: Token, name: String,
+                  tparams: [TBinder]) : PDecl / Console {
+  if not p_at(pp, TkLparen) {
+    err_d(p_error_here(pp, "expected `(` after function name"))
+  } else {
+    let params_r = parse_fn_params(p_skip_newlines(p_advance(pp)), [])
+    match params_r.r {
+      None -> err_d(params_r.p)
+      Some(params) -> parse_fn_ret(p_skip_newlines(params_r.p), p, is_pub, t, name, tparams, params)
+    }
+  }
+}
+
+fn parse_fn_ret(p3: Parser, p: Parser, is_pub: Bool, t: Token, name: String,
+                tparams: [TBinder], params: [Param]) : PDecl / Console {
+  let ret_r =
+    if p_at(p3, TkColon) {
+      let rt = parse_type(p_advance(p3))
+      match rt.r {
+        None -> PTy { p: rt.p, r: None }
+        Some(ty) -> PTy { p: rt.p, r: Some(ty) }
       }
-        }
-      }
+    } else {
+      PTy { p: p3, r: None }
+    }
+  if p_failed(ret_r.p) and not p_failed(p3) { err_d(ret_r.p) }
+  else {
+    let row_r = parse_row_suffix(ret_r.p)
+    let h = FnHead { p0: p, name: name, is_pub: is_pub, t: t, tparams: tparams,
+                     params: params, ret: ret_r.r, row: row_r.r }
+    parse_fn_contracts(h, row_r.p, fn_tp_bounds_of(tparams))
+  }
+}
+
+fn parse_fn_contracts(h: FnHead, p: Parser, bounds: [FnTPBound]) : PDecl / Console {
+  let attr = parse_optional_pure_attribute(p_skip_newlines(p))
+  let cc = parse_contracts_loop(p_skip_newlines(attr.p), [], [])
+  let p4 = p_skip_newlines(cc.p)
+  if p_at(p4, TkEq) {
+    finish_fn_decl(h, bounds, cc, parse_expr(p_skip_newlines(p_advance(p4))))
+  } else if p_at(p4, TkLbrace) {
+    parse_fn_brace_body(h, bounds, cc, p4)
+  } else {
+    err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
+  }
+}
+
+fn parse_fn_brace_body(h: FnHead, bounds: [FnTPBound], cc: Contracts, p4: Parser) : PDecl / Console {
+  let tb = p_peek(p4)
+  let after_lbrace = p_skip_newlines_and_semis(p_advance(p4))
+  if p_at(after_lbrace, TkCase) {
+    finish_fn_decl(h, bounds, cc, parse_clause_block(after_lbrace, h.params, tb))
+  } else {
+    finish_fn_decl(h, bounds, cc, parse_block(p4, tb))
+  }
+}
+
+fn finish_fn_decl(h: FnHead, bounds: [FnTPBound], cc: Contracts, rb: PExpr) : PDecl / Console {
+  match rb.r {
+    None -> err_d(rb.p)
+    Some(body) -> {
+      let body2 = contract_surface(body, cc.reqs, cc.enss, h.t)
+      let dfn = DFn(h.is_pub, fnid_decl(p_sym(h.p0, NCFn, h.name)), h.tparams, h.params, h.ret, h.row, body2, h.t.line, h.t.col, None)
+      ok_d_fn(rb.p, dfn, bounds, [p_ent(h.p0, NCFn, h.name, h.is_pub)])
     }
   }
 }
@@ -6340,14 +6298,11 @@ fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser
 # tparam list after the effect name puts its tparams in scope inside
 # every op signature's parameter and return types.
 fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
-
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
     err_d(p_error(p, id, "expected effect name"))
   } else {
-    let name = tok_source(p.src, id)
-    let p1 = p_advance(p)
-    let p1n = p_skip_newlines(p1)
+    let p1n = p_skip_newlines(p_advance(p))
     let tparams_r =
       if p_at(p1n, TkLbracket) {
         parse_type_params_loop(p_skip_newlines(p_advance(p1n)), [])
@@ -6356,57 +6311,52 @@ fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
       }
     match tparams_r.r {
       None -> err_d(tparams_r.p)
-      Some(tparams) -> {
-        let p2 = p_skip_newlines(tparams_r.p)
-        if not p_at(p2, TkLbrace) {
-          err_d(p_error_here(p2, "expected `{` to start effect body"))
+      Some(tparams) -> parse_effect_body(p_skip_newlines(tparams_r.p), p, is_pub, t, tok_source(p.src, id), tparams)
+    }
+  }
+}
+
+fn parse_effect_body(p2: Parser, p: Parser, is_pub: Bool, t: Token, name: String,
+                     tparams: [TBinder]) : PDecl / Console {
+  if not p_at(p2, TkLbrace) {
+    err_d(p_error_here(p2, "expected `{` to start effect body"))
+  } else {
+    let ops_r = parse_effect_ops(p_skip_newlines(p_advance(p2)), [])
+    match ops_r.r {
+      None -> err_d(ops_r.p)
+      Some(ops) -> {
+        let after_ops = p_skip_newlines(ops_r.p)
+        let id_t = p_peek(after_ops)
+        if tk_is(id_t.kind, TkIdent) and tok_source(after_ops.src, id_t) == "default" {
+          parse_effect_default(after_ops, id_t, p, is_pub, t, name, tparams, ops)
         } else {
-          let p3 = p_skip_newlines(p_advance(p2))
-          let ops_r = parse_effect_ops(p3, [])
-          match ops_r.r {
-            None -> err_d(ops_r.p)
-            Some(ops) -> {
-              # When parse_effect_ops stops at `default {`
-              # (sentinel return, no `}` consumed), parse the default
-              # block and then consume the effect-body closing `}`.
-              let after_ops = p_skip_newlines(ops_r.p)
-              let id_t = p_peek(after_ops)
-              let is_default_kw =
-                tk_is(id_t.kind, TkIdent) and tok_source(after_ops.src, id_t) == "default"
-              if is_default_kw {
-                let p_after_default = p_skip_newlines(p_advance(after_ops))
-                if not p_at(p_after_default, TkLbrace) {
-                  err_d(p_error_here(p_after_default, "expected `{` after `default`"))
-                } else {
-                  let p_block_open = p_skip_newlines(p_advance(p_after_default))
-                  let cr = parse_handle_clauses(p_block_open, [], None, [])
-                  match cr.r {
-                    None -> err_d(cr.p)
-                    Some(_) -> {
-                      # parse_handle_clauses already consumed the
-                      # inner `}`. Now consume the outer effect-body
-                      # closing `}`.
-                      let p_after_block = p_skip_newlines(cr.p)
-                      if not p_at(p_after_block, TkRbrace) {
-                        err_d(p_error_here(p_after_block,
-                          "expected `}` to close effect body after `default` block"))
-                      } else {
-                        let p_close = p_advance(p_after_block)
-                        let defblk = DBlk(cr.clauses, cr.return_clause,
-                                          id_t.line, id_t.col)
-                        ok_dn(p_close, DEffect(is_pub, p_sym(p, NCEffect, name), tparams, ops,
-                                               Some(defblk), t.line, t.col, None),
-                              [p_ent(p, NCEffect, name, is_pub)])
-                      }
-                    }
-                  }
-                }
-              } else {
-                ok_dn(ops_r.p, DEffect(is_pub, p_sym(p, NCEffect, name), tparams, ops, None, t.line, t.col, None),
-                      [p_ent(p, NCEffect, name, is_pub)])
-              }
-            }
-          }
+          ok_dn(ops_r.p, DEffect(is_pub, p_sym(p, NCEffect, name), tparams, ops, None, t.line, t.col, None),
+                [p_ent(p, NCEffect, name, is_pub)])
+        }
+      }
+    }
+  }
+}
+
+fn parse_effect_default(after_ops: Parser, id_t: Token, p: Parser, is_pub: Bool, t: Token,
+                        name: String, tparams: [TBinder], ops: [EffectOp]) : PDecl / Console {
+  let p_after_default = p_skip_newlines(p_advance(after_ops))
+  if not p_at(p_after_default, TkLbrace) {
+    err_d(p_error_here(p_after_default, "expected `{` after `default`"))
+  } else {
+    let cr = parse_handle_clauses(p_skip_newlines(p_advance(p_after_default)), [], None, [])
+    match cr.r {
+      None -> err_d(cr.p)
+      Some(_) -> {
+        let p_after_block = p_skip_newlines(cr.p)
+        if not p_at(p_after_block, TkRbrace) {
+          err_d(p_error_here(p_after_block,
+            "expected `}` to close effect body after `default` block"))
+        } else {
+          let defblk = DBlk(cr.clauses, cr.return_clause, id_t.line, id_t.col)
+          ok_dn(p_advance(p_after_block), DEffect(is_pub, p_sym(p, NCEffect, name), tparams, ops,
+                                                  Some(defblk), t.line, t.col, None),
+                [p_ent(p, NCEffect, name, is_pub)])
         }
       }
     }
@@ -6415,15 +6365,10 @@ fn parse_effect_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
 
 type PEffectOps = { p: Parser, r: Option[[EffectOp]] }
 
+# Stops before `default {` without consuming it; the effect decl parses that block.
 fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
-
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    # Note: do NOT advance past the `}` here. The caller drives the
-    # closing-brace consumption so it can first check for an optional
-    # `default { clauses }` block — but `default` sits *before* the
-    # closing brace of the effect body, so this branch always closes
-    # the effect decl. Keep the existing advance.
     PEffectOps { p: p_advance(p0), r: Some(list_reverse(acc)) }
   } else {
     let id = p_peek(p0)
@@ -6431,57 +6376,51 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps / Console {
       PEffectOps { p: p_error(p0, id, "expected operation name"), r: None }
     } else if is_upper_ident(p0.src, id) {
       PEffectOps { p: p_error(p0, id, "effect operation names must start with a lowercase letter"), r: None }
+    } else if tok_source(p0.src, id) == "default" and p_at(p_skip_newlines(p_advance(p0)), TkLbrace) {
+      PEffectOps { p: p0, r: Some(list_reverse(acc)) }
     } else {
-      let opname = tok_source(p0.src, id)
-      # When the ident is `default` and the next token is `{`, stop
-      # accumulating ops. The caller (parse_effect_decl)
-      # consumes the `default { clauses }` block before the effect
-      # body's closing brace. We do NOT advance past `default` here;
-      # the caller re-peeks it.
-      let p_after_id = p_skip_newlines(p_advance(p0))
-      if opname == "default" and p_at(p_after_id, TkLbrace) {
-        PEffectOps { p: p0, r: Some(list_reverse(acc)) }
-      } else {
-      let p1 = p_advance(p0)
-      # Optional `[T1, T2]` op-level tparams before `(args)`.
-      # Reuses parse_type_params_loop. Empty when omitted; the op
-      # signature is then monomorphic.
-      let op_tparams_r =
-        if p_at(p1, TkLbracket) {
-          parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
-        } else {
-          PTParams { p: p1, r: Some([]) }
-        }
-      match op_tparams_r.r {
-        None -> PEffectOps { p: op_tparams_r.p, r: None }
-        Some(op_tparams) -> {
-          let pp = op_tparams_r.p
-          if not p_at(pp, TkLparen) {
-            PEffectOps { p: p_error_here(pp, "expected `(` after operation name"), r: None }
-          } else {
-        let p2 = p_skip_newlines(p_advance(pp))
-        let params_r = parse_fn_params(p2, [])
-        match params_r.r {
-          None -> PEffectOps { p: params_r.p, r: None }
-          Some(params) -> {
-            let p3 = p_skip_newlines(params_r.p)
-            if not p_at(p3, TkColon) {
-              PEffectOps { p: p_error_here(p3, "expected `:` before operation return type"), r: None }
-            } else {
-              let rt = parse_type(p_advance(p3))
-              match rt.r {
-                None -> PEffectOps { p: rt.p, r: None }
-                Some(ty) -> {
-                  let op : EffectOp = EffOp(opname, op_tparams, params, ty, id.line, id.col)
-                  parse_effect_ops(rt.p, [op, ...acc])
-                }
-              }
-            }
-          }
-        }
-          }
-        }
-      }
+      parse_effect_op(p0, id, acc)
+    }
+  }
+}
+
+fn parse_effect_op(p0: Parser, id: Token, acc: [EffectOp]) : PEffectOps / Console {
+  let p1 = p_advance(p0)
+  let op_tparams_r =
+    if p_at(p1, TkLbracket) {
+      parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+    } else {
+      PTParams { p: p1, r: Some([]) }
+    }
+  match op_tparams_r.r {
+    None -> PEffectOps { p: op_tparams_r.p, r: None }
+    Some(op_tparams) -> parse_effect_op_sig(op_tparams_r.p, id, op_tparams, acc)
+  }
+}
+
+fn parse_effect_op_sig(pp: Parser, id: Token, op_tparams: [TBinder], acc: [EffectOp]) : PEffectOps / Console {
+  if not p_at(pp, TkLparen) {
+    PEffectOps { p: p_error_here(pp, "expected `(` after operation name"), r: None }
+  } else {
+    let params_r = parse_fn_params(p_skip_newlines(p_advance(pp)), [])
+    match params_r.r {
+      None -> PEffectOps { p: params_r.p, r: None }
+      Some(params) -> parse_effect_op_ret(p_skip_newlines(params_r.p), id, op_tparams, params, acc)
+    }
+  }
+}
+
+fn parse_effect_op_ret(p3: Parser, id: Token, op_tparams: [TBinder], params: [Param],
+                       acc: [EffectOp]) : PEffectOps / Console {
+  if not p_at(p3, TkColon) {
+    PEffectOps { p: p_error_here(p3, "expected `:` before operation return type"), r: None }
+  } else {
+    let rt = parse_type(p_advance(p3))
+    match rt.r {
+      None -> PEffectOps { p: rt.p, r: None }
+      Some(ty) -> {
+        let op : EffectOp = EffOp(tok_source(p3.src, id), op_tparams, params, ty, id.line, id.col)
+        parse_effect_ops(rt.p, [op, ...acc])
       }
     }
   }
