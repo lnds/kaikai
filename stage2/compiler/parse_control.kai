@@ -1,12 +1,170 @@
-#[doc("`if` and `match` expressions with their arms, guards and refinement narrowing.")]
+#[doc("Lambdas, control-flow expressions and handler forms.")]
 
 import compiler.lex_tokens
 import compiler.ast
-import compiler.written
 import compiler.parse_state
 import compiler.parse_types
-import compiler.parse_pattern
 import compiler.parse_stmt
+import compiler.written
+import compiler.util
+
+#[doc("A parameter without a type annotation, located at a token.")]
+pub fn param_at(binder: Binder, t: Token) : Param =
+  Param { binder: binder, ptype: None, pline: t.line, pcol: t.col, pborrow: false }
+
+#[doc("Skips to the `)` matching an already consumed `(` when `depth` starts at 1, stopping at end of input.")]
+pub fn skip_balanced_parens(p: Parser, depth: Int) : Parser {
+  let t = p_peek(p)
+  if depth <= 0 or tk_is(t.kind, TkEof) { p }
+  else if tk_is(t.kind, TkLparen) { skip_balanced_parens(p_advance(p), depth + 1) }
+  else if tk_is(t.kind, TkRparen) { skip_balanced_parens(p_advance(p), depth - 1) }
+  else { skip_balanced_parens(p_advance(p), depth) }
+}
+
+fn wrap_lam_block(lam: Expr, trailing: Bool, t: Token) : Expr =
+  expr_at(ESurface(SfLamBlock(lam, trailing)), t)
+
+fn lam_block_binder(params: [Param]) : LocalId =
+  match params {
+    [pm, ..._] -> pm.binder.id
+    [] -> local_none()
+  }
+
+# A destructuring parameter is matched against the fresh binder in a single-arm `match`.
+fn finish_block_lambda(res: LamBlockParams, body: Expr, t: Token) : Expr =
+  match res.wrap {
+    None -> expr_at(ELambda(res.params, body), t)
+    Some(pat) -> {
+      let scrut = mk_local(lam_block_binder(res.params), pat.line, pat.col)
+      let m = mk_expr(EMatch(scrut, [Arm(pat, None, body)]), pat.line, pat.col)
+      expr_at(ELambda(res.params, m), t)
+    }
+  }
+
+#[doc("Parses the statements of a lambda block body up to its closing `}`.")]
+pub fn parse_lambda_block_body(p: Parser, t: Token) : PExpr / Console =
+  parse_block_body(p_skip_newlines_and_semis(p), [], t)
+
+fn block_lambda(res: LamBlockParams, t: Token, trailing: Bool) : PExpr / Console {
+  let body = parse_lambda_block_body(res.p, t)
+  match body.r {
+    None -> err_e(body.p)
+    Some(b) -> ok_e(body.p, wrap_lam_block(finish_block_lambda(res, b, t), trailing, t))
+  }
+}
+
+fn block_params_loop(p: Parser, acc: [Param]) : Option[LamBlockParams] {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) { None }
+  else {
+    let p1 = p_advance(p)
+    let acc1 = [param_at(binder_written(tok_source(p.src, t)), t), ...acc]
+    if p_at(p1, TkComma) { block_params_loop(p_advance_nl(p1), acc1) }
+    else if p_at(p1, TkArrow) {
+      Some(LamBlockParams { p: p_advance(p1), params: list_reverse(acc1), wrap: None })
+    } else { None }
+  }
+}
+
+# `{ (a, b) -> body }` is told from a block opening with `(a + b)` by the `->` after the matching `)`.
+fn block_pattern_params(p: Parser) : Option[LamBlockParams] / Console {
+  let pr = parse_pattern(p)
+  match pr.r {
+    None -> None
+    Some(pat) -> {
+      let p2 = p_skip_newlines(pr.p)
+      if not p_at(p2, TkArrow) { None }
+      else {
+        let fresh = binder_minted(lam_pat_binder_name(pat.line, pat.col))
+        let pm = Param { binder: fresh, ptype: None, pline: pat.line, pcol: pat.col, pborrow: false }
+        Some(LamBlockParams { p: p_advance(p2), params: [pm], wrap: Some(pat) })
+      }
+    }
+  }
+}
+
+fn block_lambda_params(p: Parser) : Option[LamBlockParams] / Console =
+  if p_at(p, TkArrow) { Some(LamBlockParams { p: p_advance(p), params: [], wrap: None }) }
+  else if p_at(p, TkIdent) { block_params_loop(p, []) }
+  else if p_at(p, TkLparen) and p_at(skip_balanced_parens(p_advance(p), 1), TkArrow) { block_pattern_params(p) }
+  else { None }
+
+fn parse_trailing_lambda(p: Parser) : PExpr / Console {
+  let t = p_peek(p)
+  let p1 = p_advance(p)
+  match block_lambda_params(p_skip_newlines(p1)) {
+    Some(res) -> block_lambda(res, t, true)
+    None -> block_lambda(LamBlockParams { p: p1, params: [], wrap: None }, t, true)
+  }
+}
+
+fn second_trailing_lambda(p: Parser, acc: [Expr]) : PArgs / Console {
+  if not p_at(p, TkLbrace) { ok_args(p, acc) }
+  else {
+    let r = parse_trailing_lambda(p)
+    match r.r {
+      None -> err_args(r.p)
+      Some(lam) -> ok_args(r.p, list_append(acc, [lam]))
+    }
+  }
+}
+
+#[doc("Appends the one or two same-line `{ ... }` trailing lambdas at the parser to a call's arguments.")]
+pub fn parse_trailing_lambdas(p: Parser, acc: [Expr]) : PArgs / Console {
+  if not p_at(p, TkLbrace) { ok_args(p, acc) }
+  else {
+    let r = parse_trailing_lambda(p)
+    match r.r {
+      None -> err_args(r.p)
+      Some(lam) -> second_trailing_lambda(r.p, list_append(acc, [lam]))
+    }
+  }
+}
+
+#[doc("Parses a `{` in expression position: a block lambda when `params ->` follows, else a block.")]
+pub fn parse_brace_primary(p: Parser, t: Token) : PExpr / Console =
+  match block_lambda_params(p_advance_nl(p)) {
+    Some(res) -> block_lambda(res, t, false)
+    None -> parse_block(p, t)
+  }
+
+fn lambda_params_if_arrow(p: Parser, acc: [Param]) : Option[LamParams] =
+  if p_at(p, TkFatArrow) { Some(LamParams { p: p_advance(p), params: list_reverse(acc) }) }
+  else { None }
+
+fn typed_params_group(p: Parser, pending: [PendName], acc: [Param]) : Option[LamParams] / Console {
+  let r = parse_type(p)
+  match r.r {
+    None -> None
+    Some(te) -> {
+      let acc1 = close_param_group(list_reverse(pending), te, acc)
+      if p_at(r.p, TkComma) { lambda_params_loop(p_advance_nl(r.p), [], acc1) }
+      else if p_at(r.p, TkRparen) { lambda_params_if_arrow(p_advance(r.p), acc1) }
+      else { None }
+    }
+  }
+}
+
+# `pending` names await a `:` that types the group; `(a, b)` without `=>` is a tuple, so the scan fails.
+fn params_after_name(p1: Parser, pending: [PendName], acc: [Param]) : Option[LamParams] / Console =
+  if p_at(p1, TkComma) { lambda_params_loop(p_advance_nl(p1), pending, acc) }
+  else if p_at(p1, TkColon) { typed_params_group(p_advance(p1), pending, acc) }
+  else if p_at(p1, TkRparen) {
+    lambda_params_if_arrow(p_advance(p1), close_param_group_untyped(list_reverse(pending), acc))
+  } else { None }
+
+fn lambda_params_loop(p: Parser, pending: [PendName], acc: [Param]) : Option[LamParams] / Console {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) { None }
+  else {
+    let name = PendName { nm: tok_source(p.src, t), nline: t.line, ncol: t.col, pborrow: false }
+    params_after_name(p_advance(p), [name, ...pending], acc)
+  }
+}
+
+#[doc("Scans `a, b: T, c) =>` after an opening `(`, or returns None without consuming anything.")]
+pub fn try_parse_lambda_params(p: Parser) : Option[LamParams] / Console =
+  lambda_params_loop(p, [], [])
 
 # A condition or scrutinee must not take the `{` that follows it as a trailing lambda or record literal.
 fn cond_off(p: Parser) : Parser = p_with_record_lit(p_with_trailing_lambda(p, false), false)
@@ -219,3 +377,222 @@ fn refined(p: Parser, kind: PatKind, pat: Pattern) : ArmRefine =
 
 fn refine_fail(p: Parser, at: Token, msg: String) : ArmRefine / Console =
   ArmRefine { p: p_error(p, at, msg), new_pat: None }
+
+type HandleHead = { t: Token, body: Expr, eff: DeclRef, tyargs: [TypeExpr] }
+
+type ClauseAcc = { ops: [HClause], ret: Option[HReturn], prelude: [Stmt] }
+
+#[doc("Parses a `handle` expression after the keyword.")]
+pub fn parse_handle(p: Parser, t: Token) : PExpr / Console =
+  if not p_at(p, TkLbrace) { fail_e(p, "expected `{` to start handle body") }
+  else {
+    let b = parse_block(p, p_peek(p))
+    match b.r {
+      None -> b
+      Some(body) -> handle_with(p_skip_newlines(b.p), t, body)
+    }
+  }
+
+fn handle_with(p: Parser, t: Token, body: Expr) : PExpr / Console {
+  let p1 = p_eat(p, TkWith, "expected `with` after handle body")
+  let eff_t = p_peek(p1)
+  if p_failed(p1) { err_e(p1) }
+  else if not tk_is(eff_t.kind, TkIdent) { fail_e_at(p1, eff_t, "expected effect name after `with`") }
+  else { handle_effect(p1, eff_t, t, body) }
+}
+
+#[doc("Parses an optional `[T, ...]` argument list after an effect name.")]
+pub fn parse_opt_row_args(p: Parser) : PRowArgs / Console =
+  if p_at(p, TkLbracket) { parse_row_label_args(p_advance_nl(p), []) }
+  else { PRowArgs { p: p, r: Some([]) } }
+
+fn handle_effect(p: Parser, eff_t: Token, t: Token, body: Expr) : PExpr / Console {
+  let q = parse_qualified_head_name(p, eff_t)
+  let a = parse_opt_row_args(q.p)
+  match a.r {
+    None -> err_e(a.p)
+    Some(tyargs) -> handle_init(a.p, HandleHead { t: t, body: body, eff: q.dref, tyargs: tyargs })
+  }
+}
+
+fn handle_init(p: Parser, h: HandleHead) : PExpr / Console {
+  let init = parse_handler_state_init(p)
+  if init.has_init and is_none(init.r) { err_e(init.p) } else { handle_clause_block(init, h) }
+}
+
+fn parse_handler_state_init(p: Parser) : PInit / Console =
+  if not p_at(p, TkLparen) { PInit { p: p, r: None, has_init: false } }
+  else {
+    let ie = p_expr(p_advance_nl(p))
+    match ie.r {
+      None -> PInit { p: ie.p, r: None, has_init: true }
+      Some(ix) -> {
+        let pc = p_eat(p_skip_newlines(ie.p), TkRparen, "expected `)` after handler-state initializer")
+        PInit { p: pc, r: if p_failed(pc) { None } else { Some(ix) }, has_init: true }
+      }
+    }
+  }
+
+fn handle_clause_block(init: PInit, h: HandleHead) : PExpr / Console {
+  let alias = parse_handle_alias(init.p)
+  let p4 = p_skip_newlines(alias.p)
+  let p5 = p_eat(p4, TkLbrace, "expected `{` to start handler clauses")
+  if p_failed(p5) { err_e(p5) }
+  else {
+    let cr = parse_handle_clauses(p_skip_newlines(p5), [], None, [])
+    match cr.r {
+      None -> err_e(cr.p)
+      Some(_) -> finish_handle(p4, h, init, alias.r, cr)
+    }
+  }
+}
+
+fn parse_handle_alias(p: Parser) : PAlias / Console =
+  if not p_at(p, TkAs) { PAlias { p: p, r: None } }
+  else {
+    let p1 = p_advance(p)
+    let nt = p_peek(p1)
+    if tk_is(nt.kind, TkIdent) { PAlias { p: p_advance(p1), r: Some(binder_written(tok_source(p1.src, nt))) } }
+    else { PAlias { p: p_error(p1, nt, "expected alias name after `as`"), r: None } }
+  }
+
+fn parse_clause_params(p: Parser, acc: [Param]) : PParams / Console {
+  let t = p_peek(p)
+  if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else if not tk_is(t.kind, TkIdent) { PParams { p: p_error(p, t, "expected parameter name"), r: None } }
+  else {
+    let ty = parse_optional_type(p_advance(p))
+    let pm = Param { binder: binder_written(tok_source(p.src, t)), ptype: ty.r, pline: t.line, pcol: t.col, pborrow: false }
+    clause_params_next(p_skip_newlines(ty.p), [pm, ...acc])
+  }
+}
+
+fn clause_params_next(p: Parser, acc: [Param]) : PParams / Console =
+  if p_at(p, TkComma) { parse_clause_params(p_advance_nl(p), acc) }
+  else if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else { PParams { p: p_error_here(p, "expected `,` or `)` in parameter list"), r: None } }
+
+#[doc("""
+Parses the clauses of a handler block up to its `}`. `var` / `let` may
+open the block (collected into the prelude) but never follow an
+operation clause.
+""")]
+pub fn parse_handle_clauses(p: Parser, acc: [HClause], rret: Option[HReturn], prelude: [Stmt]) : PClauses / Console =
+  clauses_loop(p, ClauseAcc { ops: acc, ret: rret, prelude: prelude })
+
+fn clauses_loop(p: Parser, a: ClauseAcc) : PClauses / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    PClauses { p: p_advance(p0), clauses: list_reverse(a.ops), return_clause: a.ret,
+               prelude: list_reverse(a.prelude), r: Some(true) }
+  } else {
+    clause_at(p0, a)
+  }
+}
+
+fn clause_fail(p: Parser, t: Token, msg: String) : PClauses / Console = pclauses_err(p_error(p, t, msg))
+
+fn clause_at(p: Parser, a: ClauseAcc) : PClauses / Console {
+  let id_t = p_peek(p)
+  if tk_is(id_t.kind, TkVar) or tk_is(id_t.kind, TkLet) { prelude_clause(p, id_t, a) }
+  else if not tk_is(id_t.kind, TkIdent) { clause_fail(p, id_t, "expected operation name in handler") }
+  else if is_lifecycle_at(p, id_t) { lifecycle_clause(p, id_t, a) }
+  else { op_clause(p, id_t, a) }
+}
+
+fn prelude_clause(p: Parser, id_t: Token, a: ClauseAcc) : PClauses / Console =
+  match a.ops {
+    [] -> {
+      let sr = if tk_is(id_t.kind, TkVar) { parse_var(p, id_t) } else { parse_let(p, id_t) }
+      match sr.r {
+        None -> pclauses_err(sr.p)
+        Some(s) -> clauses_loop(sr.p, ClauseAcc { ...a, prelude: [s, ...a.prelude] })
+      }
+    }
+    _ -> clause_fail(p, id_t, "`var` and `let` must precede all operation clauses inside a handler")
+  }
+
+fn op_clause(p: Parser, id_t: Token, a: ClauseAcc) : PClauses / Console {
+  let p1 = p_eat(p_advance(p), TkLparen, "expected `(` after operation name")
+  if p_failed(p1) { pclauses_err(p1) }
+  else {
+    let ps = parse_clause_params(p_skip_newlines(p1), [])
+    match ps.r {
+      None -> pclauses_err(ps.p)
+      Some(params) -> op_clause_body(p_skip_newlines(ps.p), id_t, params, a)
+    }
+  }
+}
+
+fn op_clause_body(p: Parser, id_t: Token, params: [Param], a: ClauseAcc) : PClauses / Console {
+  let p1 = p_eat(p, TkArrow, "expected `->` after operation parameters")
+  if p_failed(p1) { pclauses_err(p1) }
+  else {
+    let rb = p_expr(p_skip_newlines(p1))
+    match rb.r {
+      None -> pclauses_err(rb.p)
+      Some(body) -> op_clause_done(rb.p, p, id_t, params, body, a)
+    }
+  }
+}
+
+fn op_clause_done(p: Parser, at: Parser, id_t: Token, params: [Param], body: Expr, a: ClauseAcc) : PClauses / Console {
+  let name = tok_source(at.src, id_t)
+  if name != "return" {
+    clauses_loop(p, ClauseAcc { ...a, ops: [HC(ChOp(name), params, body, id_t.line, id_t.col), ...a.ops] })
+  } else {
+    match params {
+      [pp] -> clauses_loop(p, ClauseAcc { ...a, ret: Some(HR(pp.binder, body, id_t.line, id_t.col)) })
+      _ -> clause_fail(at, id_t, "return clause takes exactly one parameter")
+    }
+  }
+}
+
+fn is_lifecycle_at(p: Parser, id_t: Token) : Bool =
+  is_some(clause_lifecycle_of_word(tok_source(p.src, id_t))) and p_at(p_advance_nl(p), TkLbrace)
+
+fn lifecycle_clause(p: Parser, id_t: Token, a: ClauseAcc) : PClauses / Console {
+  let name = tok_source(p.src, id_t)
+  let head = match clause_lifecycle_of_word(name) {
+    Some(h) -> h
+    None -> ChOp(name)
+  }
+  let p1 = p_advance_nl(p)
+  let rb = parse_block(p1, p_peek(p1))
+  match rb.r {
+    None -> pclauses_err(rb.p)
+    Some(body) ->
+      if lifecycle_seen(a.ops, head) { clause_fail(p, id_t, concat_all(["duplicate `", name, "` clause in handler"])) }
+      else { clauses_loop(rb.p, ClauseAcc { ...a, ops: [HC(head, [], body, id_t.line, id_t.col), ...a.ops] }) }
+  }
+}
+
+fn lifecycle_seen(ops: [HClause], head: ClauseHead) : Bool =
+  any(ops, (c) => match c {
+    HC(ChOp(_), _, _, _, _) -> false
+    HC(h, _, _, _, _) -> clause_head_word(h) == clause_head_word(head)
+  })
+
+fn is_initially(c: HClause) : Bool = match c {
+  HC(ChInitially, _, _, _, _) -> true
+  _ -> false
+}
+
+fn finish_handle(p: Parser, h: HandleHead, init: PInit, alias: Option[Binder], cr: PClauses) : PExpr / Console {
+  let init_cl = find(cr.clauses, is_initially)
+  match init_cl {
+    Some(_) if init.has_init -> fail_e_at(p, h.t, "a handler takes either `(init)` or `initially { }`, not both")
+    _ -> {
+      let eff_init = match init_cl {
+        Some(HC(_, _, ib, il, ic)) -> Some(mk_expr(ESurface(SfHandleInit(ib)), il, ic))
+        None -> init.r
+      }
+      let ops = filter(cr.clauses, (c) => not is_initially(c))
+      let e = expr_at(EHandle(h.body, h.eff, h.tyargs, eff_init, alias, ops, cr.return_clause), h.t)
+      ok_e(cr.p, match cr.prelude {
+        [] -> e
+        _ -> expr_at(EBlock(cr.prelude, Some(e)), h.t)
+      })
+    }
+  }
+}
