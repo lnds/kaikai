@@ -1,0 +1,161 @@
+#[doc("""
+Top-level items that carry no nested declaration: `use`, `import`, `test`, `bench` and `check`.
+""")]
+
+import compiler.util
+import compiler.lex_tokens
+import compiler.ast
+import compiler.parse_state
+import compiler.parse_types
+import compiler.parse_stmt
+
+type DescHead = { p: Parser, desc: String }
+
+fn params_err(p: Parser) : PParams = PParams { p: p, r: None }
+
+fn at_use_kind(p: Parser) : Bool {
+  let nxt = p_peek1(p)
+  tok_source(p.src, p_peek(p)) == "kind" and tk_is(nxt.kind, TkIdent) and is_upper_ident(p.src, nxt)
+}
+
+#[doc("Parses a `use Effect` or `use kind K` declaration after its keyword.")]
+pub fn parse_use_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected effect name after `use`"))
+  } else if at_use_kind(p) {
+    ok_d(p_advance(p_advance(p)), DUseKind(tok_source(p.src, p_peek1(p)), t.line, t.col, None))
+  } else if not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "effect name in `use` must start with an uppercase letter"))
+  } else {
+    ok_d(p_advance(p), DUse(tok_source(p.src, id), t.line, t.col))
+  }
+}
+
+#[doc("Parses an `import` declaration after its keyword.")]
+pub fn parse_import_decl(p: Parser, t: Token) : PDecl / Console {
+  let first = p_peek(p)
+  match first.kind {
+    TkHoleName(nm) -> ok_d(p_advance(p), DImport(IkHole(nm), t.line, t.col))
+    TkHole -> err_d(p_error(p, first, "`import ?` requires a name; write `import ?some_symbol`"))
+    TkIdent -> parse_import_path(p_advance(p), tok_source(p.src, first), t)
+    _ -> err_d(p_error(p, first, "expected module name after `import`"))
+  }
+}
+
+fn parse_import_path(p: Parser, path: String, t: Token) : PDecl / Console {
+  if p_at(p, TkDot) { import_after_dot(p_advance(p), path, t) }
+  else if p_at(p, TkAs) { import_alias(p_advance(p), path, t) }
+  else { ok_d(p, DImport(IkPath(path), t.line, t.col)) }
+}
+
+fn import_after_dot(p: Parser, path: String, t: Token) : PDecl / Console {
+  let nxt = p_peek(p)
+  match nxt.kind {
+    TkIdent -> parse_import_path(p_advance(p), concat_all([path, ".", tok_source(p.src, nxt)]), t)
+    TkLbrace -> parse_import_selectives(p_advance_nl(p), [], path, t)
+    _ -> err_d(p_error_here(p, "expected identifier or `{` after `.`"))
+  }
+}
+
+fn import_alias(p: Parser, path: String, t: Token) : PDecl / Console {
+  let nxt = p_peek(p)
+  if tk_is(nxt.kind, TkIdent) {
+    ok_d(p_advance(p), DImport(IkAlias(path, tok_source(p.src, nxt)), t.line, t.col))
+  } else {
+    err_d(p_error(p, nxt, "expected alias name after `as`"))
+  }
+}
+
+fn parse_import_selectives(p: Parser, acc: [String], path: String, t: Token) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let nxt = p_peek(p0)
+  if tk_is(nxt.kind, TkIdent) {
+    selective_sep(p_advance_nl(p0), [tok_source(p0.src, nxt), ...acc], path, t)
+  } else {
+    err_d(p_error(p0, nxt, "expected identifier in selective import"))
+  }
+}
+
+fn selective_sep(p: Parser, names: [String], path: String, t: Token) : PDecl / Console =
+  match p_peek(p).kind {
+    TkComma -> parse_import_selectives(p_advance_nl(p), names, path, t)
+    TkRbrace -> ok_d(p_advance(p), DImport(IkSelective(path, list_reverse(names)), t.line, t.col))
+    _ -> err_d(p_error_here(p, "expected `,` or `}` in selective import"))
+  }
+
+fn desc_head(p: Parser, kw: String) : DescHead / Console {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkString) {
+    DescHead { p: p_advance_nl(p), desc: tok_source(p.src, t) }
+  } else {
+    DescHead { p: p_error(p, t, concat_all(["expected string description after `", kw, "`"])), desc: "" }
+  }
+}
+
+fn body_block(p: Parser, kw: String) : PExpr / Console =
+  if p_failed(p) { err_e(p) }
+  else if p_at(p, TkLbrace) { parse_block(p, p_peek(p)) }
+  else { fail_e(p, concat_all(["expected `{` for ", kw, " body"])) }
+
+#[doc("Parses a `test` declaration after its keyword.")]
+pub fn parse_test_decl(p: Parser, t: Token) : PDecl / Console {
+  let h = desc_head(p, "test")
+  let rb = body_block(h.p, "test")
+  match rb.r {
+    None -> err_d(rb.p)
+    Some(body) -> ok_d(rb.p, DTest(h.desc, body, t.line, t.col, None))
+  }
+}
+
+#[doc("Parses a `bench` declaration after its keyword.")]
+pub fn parse_bench_decl(p: Parser, t: Token) : PDecl / Console {
+  let h = desc_head(p, "bench")
+  let rb = body_block(h.p, "bench")
+  match rb.r {
+    None -> err_d(rb.p)
+    Some(body) -> ok_d(rb.p, DBench(h.desc, body, t.line, t.col, None))
+  }
+}
+
+fn parse_check_with_params(p: Parser, acc: [Param]) : PParams / Console {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    params_err(p_error(p, t, "expected parameter name in `with` clause"))
+  } else {
+    let p1 = p_eat(p_advance(p), TkColon, "expected `:` after `with` parameter name")
+    if p_failed(p1) { params_err(p1) } else { check_param_type(parse_type(p1), tok_source(p.src, t), t, acc) }
+  }
+}
+
+fn check_param_type(rt: PTy, name: String, t: Token, acc: [Param]) : PParams / Console =
+  match rt.r {
+    None -> params_err(rt.p)
+    Some(ty) -> {
+      let param = Param { binder: binder_written(name), ptype: Some(ty), pline: t.line, pcol: t.col, pborrow: false }
+      let p2 = p_skip_newlines(rt.p)
+      if p_at(p2, TkComma) { parse_check_with_params(p_advance_nl(p2), [param, ...acc]) }
+      else { PParams { p: p2, r: Some(list_reverse([param, ...acc])) } }
+    }
+  }
+
+fn check_params(p: Parser) : PParams / Console =
+  if p_failed(p) { params_err(p) }
+  else if p_at(p, TkWith) { parse_check_with_params(p_advance_nl(p), []) }
+  else { PParams { p: p, r: Some([]) } }
+
+#[doc("Parses a `check` declaration after its keyword.")]
+pub fn parse_check_decl(p: Parser, t: Token) : PDecl / Console {
+  let h = desc_head(p, "check")
+  let pw = check_params(h.p)
+  match pw.r {
+    None -> err_d(pw.p)
+    Some(params) -> {
+      let rb = body_block(p_skip_newlines(pw.p), "check")
+      match rb.r {
+        None -> err_d(rb.p)
+        Some(body) -> ok_d(rb.p, DCheck(h.desc, params, body, t.line, t.col, None))
+      }
+    }
+  }
+}

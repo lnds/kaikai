@@ -1,0 +1,221 @@
+#[doc("`if` and `match` expressions with their arms, guards and refinement narrowing.")]
+
+import compiler.lex_tokens
+import compiler.ast
+import compiler.written
+import compiler.parse_state
+import compiler.parse_types
+import compiler.parse_pattern
+import compiler.parse_stmt
+
+# A condition or scrutinee must not take the `{` that follows it as a trailing lambda or record literal.
+fn cond_off(p: Parser) : Parser = p_with_record_lit(p_with_trailing_lambda(p, false), false)
+
+fn cond_restore(p: Parser, saved: Parser) : Parser =
+  p_with_record_lit(p_with_trailing_lambda(p, saved.allow_trailing_lambda), saved.allow_record_lit)
+
+fn parse_cond(p: Parser) : PExpr / Console {
+  let r = p_expr(cond_off(p))
+  PExpr { p: cond_restore(r.p, p), r: r.r }
+}
+
+#[doc("Parses an `if` expression.")]
+pub fn parse_if(p: Parser, t: Token) : PExpr / Console {
+  let rc = parse_cond(p_advance(p))
+  match rc.r {
+    None -> err_e(rc.p)
+    Some(cond) -> parse_if_then(p_skip_newlines(rc.p), cond, t)
+  }
+}
+
+fn parse_if_then(p: Parser, cond: Expr, t: Token) : PExpr / Console =
+  if p_at(p, TkLbrace) { if_then_done(parse_block(p, p_peek(p)), cond, t) }
+  else { fail_e(p, "expected `{` after `if` condition") }
+
+fn if_then_done(rt: PExpr, cond: Expr, t: Token) : PExpr / Console =
+  match rt.r {
+    None -> err_e(rt.p)
+    Some(then_e) -> parse_if_else(rt.p, cond, then_e, t)
+  }
+
+# Without an `else` the `if` ends at its `}`; the newlines skipped looking for one still separate it from the next line.
+fn parse_if_else(p: Parser, cond: Expr, then_e: Expr, t: Token) : PExpr / Console {
+  let p3 = p_skip_newlines(p)
+  if not p_at(p3, TkElse) { ok_e(p, expr_at(EIf(cond, then_e, None), t)) }
+  else {
+    let p4 = p_advance_nl(p3)
+    if p_at(p4, TkIf) { finish_if(parse_if(p4, p_peek(p4)), cond, then_e, t) }
+    else if p_at(p4, TkLbrace) { finish_if(parse_block(p4, p_peek(p4)), cond, then_e, t) }
+    else { fail_e(p4, "expected `if` or `{` after `else`") }
+  }
+}
+
+fn finish_if(re: PExpr, cond: Expr, then_e: Expr, t: Token) : PExpr =
+  match re.r {
+    None -> err_e(re.p)
+    Some(else_e) -> ok_e(re.p, expr_at(EIf(cond, then_e, Some(else_e)), t))
+  }
+
+#[doc("Parses a `match` expression.")]
+pub fn parse_match(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  let rs = p_expr(cond_off(p1))
+  match rs.r {
+    None -> err_e(rs.p)
+    Some(scrut) -> match_open(parse_more_scruts(rs.p, [scrut]), p1, t)
+  }
+}
+
+fn match_open(more: PScruts, saved: Parser, t: Token) : PExpr / Console {
+  let p2 = p_skip_newlines(cond_restore(more.p, saved))
+  if p_at(p2, TkLbrace) { match_arms_of(p2, list_reverse(more.r), t) }
+  else { fail_e(p2, "expected `{` after `match` expression") }
+}
+
+fn match_arms_of(p2: Parser, scruts: [Expr], t: Token) : PExpr / Console =
+  match scruts {
+    [scrut] -> parse_match_arms(p_advance_nl(p2), [], scrut, t)
+    _ -> if list_length(scruts) > 4 { fail_e(p2, "multi-arg `match` supports up to 4 scrutinees") }
+         else { parse_multi_match_arms(p_advance_nl(p2), [], scruts, list_length(scruts), t) }
+  }
+
+fn parse_more_scruts(p: Parser, acc: [Expr]) : PScruts / Console {
+  let p0 = p_skip_newlines(p)
+  if not p_at(p0, TkComma) { PScruts { p: p0, r: acc } }
+  else {
+    let r = p_expr(p_advance_nl(p0))
+    match r.r {
+      None -> PScruts { p: r.p, r: acc }
+      Some(e) -> parse_more_scruts(r.p, [e, ...acc])
+    }
+  }
+}
+
+fn parse_multi_match_arms(p: Parser, acc: [MMArm], scruts: [Expr], n: Int, t: Token) : PExpr / Console {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), expr_at(ESurface(SfMultiMatch(scruts, list_reverse(acc))), t))
+  } else {
+    let ra = parse_multi_arm(p0, n)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_multi_match_arms(ra.p, [arm, ...acc], scruts, n, t)
+    }
+  }
+}
+
+fn parse_multi_arm(p: Parser, n: Int) : PMArm / Console {
+  let r = parse_n_patterns(p, n, [])
+  match r.r {
+    None -> err_marm(r.p)
+    Some(pats) -> parse_marm_body(parse_arm_guard(p_skip_newlines(r.p), TkIf), pats, "expected `->` in multi-arg match arm")
+  }
+}
+
+#[doc("""
+An arm's optional guard after `kw`, read with trailing lambdas off so a
+guard ending in a call does not swallow the arm body's `{`.
+""")]
+pub fn parse_arm_guard(p: Parser, kw: TokKind) : PExpr / Console =
+  if p_at(p, kw) {
+    let rg = p_expr(p_with_trailing_lambda(p_advance(p), false))
+    PExpr { p: p_with_trailing_lambda(rg.p, p.allow_trailing_lambda), r: rg.r }
+  } else { PExpr { p: p, r: None } }
+
+#[doc("`-> body` after an arm's patterns and optional guard.")]
+pub fn parse_marm_body(g: PExpr, pats: [Pattern], missing_arrow: String) : PMArm / Console {
+  let p2 = p_skip_newlines(g.p)
+  if p_at(p2, TkArrow) { marm_done(p_expr(p_advance_nl(p2)), g.r, pats) }
+  else { err_marm(p_error_here(p2, missing_arrow)) }
+}
+
+fn marm_done(rb: PExpr, guard: Option[Expr], pats: [Pattern]) : PMArm =
+  match rb.r {
+    None -> err_marm(rb.p)
+    Some(body) -> ok_marm(rb.p, MMArm(pats, guard, body))
+  }
+
+#[doc("Parses a fixed number of comma-separated patterns.")]
+pub fn parse_n_patterns(p: Parser, n: Int, acc: [Pattern]) : PPatN / Console =
+  if n == 0 { ok_patn(p, list_reverse(acc)) } else { pats_next(parse_pattern(p), n, acc) }
+
+fn pats_next(rp: PPat, n: Int, acc: [Pattern]) : PPatN / Console =
+  match rp.r {
+    None -> err_patn(rp.p)
+    Some(pat) ->
+      if n == 1 { ok_patn(rp.p, list_reverse([pat, ...acc])) }
+      else { pats_comma(p_skip_newlines(rp.p), n, [pat, ...acc]) }
+  }
+
+fn pats_comma(p: Parser, n: Int, acc: [Pattern]) : PPatN / Console =
+  if p_at(p, TkComma) { parse_n_patterns(p_advance_nl(p), n - 1, acc) }
+  else { err_patn(p_error_here(p, "expected `,` between multi-arg match patterns")) }
+
+fn parse_match_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr / Console {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) { ok_e(p_advance(p0), expr_at(EMatch(scrut, list_reverse(acc)), t)) }
+  else {
+    let ra = parse_arm(p0)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_match_arms(ra.p, [arm, ...acc], scrut, t)
+    }
+  }
+}
+
+fn parse_arm(p: Parser) : PArm / Console {
+  let rp = parse_pattern(p)
+  match rp.r {
+    None -> err_a(rp.p)
+    Some(pat) -> arm_refined(parse_optional_arm_refine(p_skip_newlines(rp.p), pat), pat)
+  }
+}
+
+fn arm_refined(nr: ArmRefine, pat: Pattern) : PArm / Console {
+  let pat_eff = match nr.new_pat { Some(np) -> np  None -> pat }
+  arm_guarded(parse_arm_guard(p_skip_newlines(nr.p), TkIf), pat_eff)
+}
+
+fn arm_guarded(g: PExpr, pat: Pattern) : PArm / Console =
+  if guard_failed(g) { err_a(g.p) }
+  else { arm_done(parse_marm_body(g, [pat], "expected `->` in match arm"), pat) }
+
+fn guard_failed(g: PExpr) : Bool =
+  p_failed(g.p) and match g.r { None -> true  Some(_) -> false }
+
+fn arm_done(m: PMArm, pat: Pattern) : PArm =
+  match m.r {
+    None -> err_a(m.p)
+    Some(MMArm(_, guard, body)) -> ok_a(m.p, Arm(pat, guard, body))
+  }
+
+# `p : T where ..` keeps the written refinement; `p : Name(..)` is a uniform narrowing that a later pass splits into alias refinement or union component.
+fn parse_optional_arm_refine(p: Parser, pat: Pattern) : ArmRefine / Console =
+  if not p_at(p, TkColon) { no_refine(p) }
+  else {
+    match pat.pkind {
+      PBind(name) -> refine_type(parse_type(p_advance_nl(p)), p, pat, name)
+      _ -> refine_fail(p, p_peek(p), "match-arm narrowing `: Type` only applies to a binding pattern (a bare name)")
+    }
+  }
+
+fn refine_type(rt: PTy, colon: Parser, pat: Pattern, name: Binder) : ArmRefine / Console =
+  match rt.r {
+    None -> no_refine(rt.p)
+    Some(ty) -> refine_kind(rt.p, p_peek(colon), pat, name, ty)
+  }
+
+fn refine_kind(p: Parser, colon_tok: Token, pat: Pattern, name: Binder, ty: TypeExpr) : ArmRefine / Console =
+  match ty.tkind {
+    TyRefine(_, _) -> refined(p, PSurface(PsRefine(written_text(name.name), ty)), pat)
+    TyName(_, _) -> refined(p, PNarrow(name, ty), pat)
+    _ -> refine_fail(p, colon_tok, "match-arm narrowing `: Type` requires either an inline `Int where ...` or a refinement-type alias name")
+  }
+
+fn no_refine(p: Parser) : ArmRefine = ArmRefine { p: p, new_pat: None }
+
+fn refined(p: Parser, kind: PatKind, pat: Pattern) : ArmRefine =
+  ArmRefine { p: p, new_pat: Some(mk_pat(kind, pat.line, pat.col)) }
+
+fn refine_fail(p: Parser, at: Token, msg: String) : ArmRefine / Console =
+  ArmRefine { p: p_error(p, at, msg), new_pat: None }

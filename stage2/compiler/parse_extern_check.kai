@@ -1,6 +1,4 @@
-#[doc("""
-FFI-safety validation of parsed `extern` declarations.
-""")]
+#[doc("FFI-safety validation of parsed `extern` declarations.")]
 
 import compiler.util
 import compiler.chars
@@ -11,229 +9,112 @@ import compiler.decl_names
 import compiler.tbinder
 import compiler.parse_state
 
-# An `extern "C" fn` declaration MUST advertise `Ffi` in its effect
-# row. FFI crosses to C *via* the `Ffi` capability; an extern without
-# that label silently bypasses the contract and downstream invariants
-# about effect rows lose their teeth. Returns true iff the row
-# syntactically contains a label named `Ffi` (label args are
-# irrelevant — `Ffi` is nullary).
-fn extern_row_has_ffi(row: RowExpr) : Bool {
-  match row {
-    REmpty         -> false
-    RClosed(lbs)   -> row_label_names_has(lbs, "Ffi")
-    ROpen(_, lbs)  -> row_label_names_has(lbs, "Ffi")
-  }
-}
-
-fn row_label_names_has(labels: [RowLabel], target: String) : Bool {
-  match labels {
-    [] -> false
-    [l, ...rest] -> match l {
-      RL(r, _) -> if ref_bare_text(r) == target { true } else { row_label_names_has(rest, target) }
-    }
-  }
-}
-
-# The name of an unqualified reference as written, `""` for any other.
-# Nothing is resolved while the file is parsed, so the checks the parser
-# makes on a declaration it just read have only this text to go by.
+# Nothing is resolved while a file is parsed, so these checks see only the
+# text a reference was written with.
 fn ref_bare_text(r: DeclRef) : String = match r {
   DrWritten(None, n) -> written_text(n)
-  _                  -> ""
+  _ -> ""
 }
 
-# A reference as the source spelled it, for a diagnostic.
 fn ref_surface(r: DeclRef) : String = match r {
-  DrWritten(None, n)    -> written_text(n)
+  DrWritten(None, n) -> written_text(n)
   DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
-  DrSym(_)              -> ""
+  DrSym(_) -> ""
 }
 
-# A type appearing in the parameter list or return slot of an
-# `extern "C" fn` MUST be C-ABI compatible. The
-# kaikai layout for `[T]` (singly-linked list), `Option[T]` (tagged
-# sum), records, and user-declared sum types is implementation-
-# defined and unsafe to expose across the C boundary. The allowlist
-# is intentionally small — Int, Real, Bool, Char, String, Unit (return
-# only). New types get added here explicitly, not via heuristics.
-#
-# `is_return_slot` widens the allowlist to include `Unit` (a `void`
-# return is fine in C; a `void` parameter is not the same shape as
-# kaikai's nullary `Unit` and is excluded).
-# The fixed-width FFI-boundary scalar annotation types. They map to C
-# `uint8_t`/`int32_t`/`float`/... at the boundary and are NOT
-# first-class kaikai arithmetic types — a value flowing through one is
-# a plain `Int` (or `Real` for `F32`) box on the kaikai side, C-cast at
-# the shim. The set is closed.
+fn row_labels(row: RowExpr) : [RowLabel] = match row {
+  REmpty -> []
+  RClosed(lbs) -> lbs
+  ROpen(_, lbs) -> lbs
+}
+
+fn extern_row_has_ffi(row: RowExpr) : Bool =
+  any(row_labels(row), (l) => match l { RL(r, _) -> ref_bare_text(r) == "Ffi" })
+
+# The fixed-width boundary scalars: plain `Int` (`Real` for `F32`) boxes on the
+# kaikai side, C-cast at the shim.
 fn is_fixed_width_ffi_name(name: String) : Bool =
   name == "U8" or name == "U16" or name == "U32" or name == "U64" or
-  name == "I8" or name == "I16" or name == "I32" or name == "I64" or
-  name == "F32"
-
-fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool {
-  match t.tkind {
-    TyName(r, targs) -> list_length(targs) == 0 and is_c_abi_safe_name(ref_bare_text(r), is_return_slot)
-    _ -> false
-  }
-}
-
-# A bare uppercase name may be a declared foreign type; the parser cannot see the
-# registry, so `validate_extern_fn_types` rejects an undeclared one.
-fn is_c_abi_safe_name(name: String, is_return_slot: Bool) : Bool {
-  if name == "Unit" { is_return_slot }
-  else {
-    name == "Int" or name == "Real" or name == "Bool" or name == "Char" or name == "String"
-      or is_fixed_width_ffi_name(name) or is_upper_first(name)
-  }
-}
-
-# True when `name`'s first character is an ASCII uppercase letter.
-fn is_upper_first(name: String) : Bool =
-  match char_at(name, 0) {
-    Some(c) -> c >= 'A' and c <= 'Z'
-    None    -> false
-  }
-
-#[doc("""
-Every field of an `extern "C" type` struct must be a C-ABI scalar —
-a fixed-width annotation, an FFI primitive, or (recursively) another
-declared extern struct's name. A list / parameterised / function
-field type would have no C struct layout. Nested-struct existence is
-checked by the resolver (same registry-availability reason as fn
-params); here we reject the shapes that can never be a C field.
-""")]
-pub fn validate_extern_struct_decl(name: String, fields: [FieldDecl],
-                               p: Parser, t: Token) : PDecl / Console {
-  match first_non_c_field(fields) {
-    Some(fd) -> match fd {
-      FD(_, fname, fty, _) -> {
-        let msg = concat_all([
-          "`extern \"C\" type ", name, "` field `", fname,
-          "` has type `", type_surface(fty),
-          "` which has no C struct layout — fields must be fixed-width (U8 U16 U32 U64 I8 I16 I32 I64 F32) or another `extern \"C\" type`"
-        ])
-        err_d(p_error(p, t, msg))
-      }
-    }
-    None -> ok_dn(p, DExternType(name, ETStruct(fields), t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
-  }
-}
-
-fn first_non_c_field(fields: [FieldDecl]) : Option[FieldDecl] {
-  match fields {
-    [] -> None
-    [fd, ...rest] -> match fd {
-      FD(_, _, fty, _) ->
-        if is_c_field_type(fty) { first_non_c_field(rest) }
-        else { Some(fd) }
-    }
-  }
-}
-
-# A struct field type is valid when it is a fixed-width annotation OR a
-# bare uppercase name that could be a nested `extern "C" type` struct.
-# The scalar FFI primitives (Int/Real/String/Bool/Char/Unit) are
-# REJECTED: a C struct field needs an exact width, which `Int` (i64) /
-# `Real` (double) / `String` (ptr) do not give at the layout the C
-# compiler sees — a mis-alignment trap. Use the fixed-width set
-# (U8..F32) for struct fields.
-fn is_c_field_type(t: TypeExpr) : Bool {
-  match t.tkind {
-    TyName(r, targs) -> {
-      let name = ref_bare_text(r)
-      if list_length(targs) > 0 { false }
-      else if is_fixed_width_ffi_name(name) { true }
-      else if is_v1_primitive_name(name) { false }
-      else { is_upper_first(name) }
-    }
-    _ -> false
-  }
-}
+  name == "I8" or name == "I16" or name == "I32" or name == "I64" or name == "F32"
 
 fn is_v1_primitive_name(name: String) : Bool =
   name == "Int" or name == "Real" or name == "Bool" or
   name == "String" or name == "Char" or name == "Unit"
 
-# Walk an `extern "C" fn` parameter list and return the
-# first param whose type is NOT C-ABI safe, or `None` if every
-# parameter is safe. Untyped parameters (`ptype: None`) cannot occur
-# in an extern signature — `parse_fn_params` rejects missing
-# annotations on axiom-shape decls — but we guard for it anyway.
-fn first_non_c_abi_param(params: [Param]) : Option[Param] {
-  match params {
-    [] -> None
-    [p, ...rest] -> match p.ptype {
-      None -> Some(p)
-      Some(ty) ->
-        if is_c_abi_safe_type(ty, false) { first_non_c_abi_param(rest) }
-        else { Some(p) }
-    }
+fn is_upper_first(name: String) : Bool =
+  match char_at(name, 0) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
   }
-}
 
-# Render a TypeExpr surface form for diagnostics. We
-# only need the cases the validator might reject; the fallthrough
-# emits a placeholder that still anchors the diagnostic to the
-# offending site.
-fn type_surface(t: TypeExpr) : String {
+# A bare uppercase name may be a declared foreign type; the registry is not
+# visible here, so the resolver rejects an undeclared one.
+fn is_c_abi_safe_name(name: String, is_return_slot: Bool) : Bool =
+  if name == "Unit" { is_return_slot }
+  else { (is_v1_primitive_name(name) or is_fixed_width_ffi_name(name) or is_upper_first(name)) }
+
+fn is_c_abi_safe_type(t: TypeExpr, is_return_slot: Bool) : Bool =
   match t.tkind {
-    TyName(r, targs) ->
-      if list_length(targs) == 0 { ref_surface(r) }
-      else { concat_all([ref_surface(r), "[", type_args_surface(targs), "]"]) }
+    TyName(r, targs) -> targs == [] and is_c_abi_safe_name(ref_bare_text(r), is_return_slot)
+    _ -> false
+  }
+
+# A C struct field needs an exact width, so the primitives are rejected.
+fn is_c_field_type(t: TypeExpr) : Bool =
+  match t.tkind {
+    TyName(r, targs) -> {
+      let name = ref_bare_text(r)
+      targs == [] and (is_fixed_width_ffi_name(name) or (not is_v1_primitive_name(name) and is_upper_first(name)))
+    }
+    _ -> false
+  }
+
+fn type_surface(t: TypeExpr) : String =
+  match t.tkind {
+    TyName(r, []) -> ref_surface(r)
+    TyName(r, targs) -> concat_all([ref_surface(r), "[", type_args_surface(targs), "]"])
     TyList(inner) -> concat_all(["[", type_surface(inner), "]"])
     TyFn(_, _, _) -> "fn(...)"
     TyDim(base, _) -> concat_all([type_surface(base), "<...>"])
     TyRefine(base, _) -> concat_all([type_surface(base), " where ..."])
-    # Compound row as a type argument — render bare labels.
     TyRow(row) -> row_surface(row)
-    TySurface(ts) -> match ts {
-      TsTuple(tys) -> concat_all(["(", type_args_surface(tys), ")"])
-      TsUnitSpan(_, inner) -> type_surface(inner)
-    }
+    TySurface(TsTuple(tys)) -> concat_all(["(", type_args_surface(tys), ")"])
+    TySurface(TsUnitSpan(_, inner)) -> type_surface(inner)
     TyParam(_, _) -> "_"
   }
-}
 
-# Render a row's labels/tail as a bare `A + B + tail` string for
-# diagnostic surfaces.
-fn row_surface(r: RowExpr) : String {
+fn row_surface(r: RowExpr) : String =
   match r {
     REmpty -> ""
     RClosed(labels) -> row_labels_surface(labels)
-    ROpen(tail, labels) ->
-      if labels == [] { tail_written_text(tail) }
-      else { concat_all([row_labels_surface(labels), " + ", tail_written_text(tail)]) }
+    ROpen(tail, []) -> tail_written_text(tail)
+    ROpen(tail, labels) -> concat_all([row_labels_surface(labels), " + ", tail_written_text(tail)])
   }
-}
 
-fn row_labels_surface(ls: [RowLabel]) : String {
-  match ls {
-    [] -> ""
-    [RL(r, _)] -> ref_surface(r)
-    [RL(r, _), ...rest] -> concat_all([ref_surface(r), " + ", row_labels_surface(rest)])
-  }
-}
+fn row_labels_surface(ls: [RowLabel]) : String =
+  string_join(map(ls, (l) => match l { RL(r, _) -> ref_surface(r) }), " + ")
 
-fn type_args_surface(ts: [TypeExpr]) : String {
-  match ts {
-    [] -> ""
-    [t]  -> type_surface(t)
-    [t, ...rest] -> concat_all([type_surface(t), ", ", type_args_surface(rest)])
-  }
-}
+fn type_args_surface(ts: [TypeExpr]) : String = string_join(map(ts, type_surface), ", ")
 
 #[doc("""
-Post-process a successfully parsed `extern "C" fn`
-declaration. Three independent checks, each surfacing a parse-
-time diagnostic anchored to the `extern` keyword token:
-  (a) the effect row must contain `Ffi`;
-  (b) every parameter type must be C-ABI compatible;
-  (c) the return type must be C-ABI compatible.
-A failure in any check converts the PDecl into an error result;
-on success, the original PDecl flows through unchanged so the
-rest of the pipeline keeps seeing the uniform DAxiom shape.
+Rejects an `extern "C" type` struct with a field that has no C struct layout; the
+nested-struct existence check is the resolver's.
 """)]
-pub fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console {
+pub fn validate_extern_struct_decl(name: String, fields: [FieldDecl], p: Parser, t: Token) : PDecl / Console =
+  match find(fields, (fd) => match fd { FD(_, _, fty, _) -> not is_c_field_type(fty) }) {
+    Some(FD(_, fname, fty, _)) -> err_d(p_error(p, t, concat_all([
+      "`extern \"C\" type ", name, "` field `", fname,
+      "` has type `", type_surface(fty),
+      "` which has no C struct layout — fields must be fixed-width (U8 U16 U32 U64 I8 I16 I32 I64 F32) or another `extern \"C\" type`"
+    ])))
+    None -> ok_dn(p, DExternType(name, ETStruct(fields), t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
+  }
+
+#[doc("""
+Turns a parsed `extern "C" fn` into an error at the `extern` token unless its row
+declares `Ffi` and every parameter and the return type are C-ABI compatible.
+""")]
+pub fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console =
   match decl_r.r {
     Some(DAxiom(_, _, name, _, _, params, ret_ty, row, _, _)) ->
       match extern_c_problem(name, params, ret_ty, row) {
@@ -242,29 +123,31 @@ pub fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console {
       }
     _ -> decl_r
   }
-}
 
-fn extern_c_problem(name: String, params: [Param], ret_ty: TypeExpr, row: RowExpr) : Option[String] {
+fn extern_c_problem(name: String, params: [Param], ret_ty: TypeExpr, row: RowExpr) : Option[String] =
   if not extern_row_has_ffi(row) {
     Some(concat_all([
       "`extern \"C\" fn ", name,
       "` must declare `/ Ffi` in its row — FFI declarations always cross the Ffi capability boundary"
     ]))
   } else {
-    match first_non_c_abi_param(params) {
-      Some(p) -> Some(extern_param_message(name, p))
-      None ->
-        if is_c_abi_safe_type(ret_ty, true) { None }
-        else {
-          Some(concat_all([
-            "`extern \"C\" fn ", name,
-            "` return type `", type_surface(ret_ty),
-            "` is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, Unit, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
-          ]))
-        }
+    match find(params, (pm) => not param_c_abi_safe(pm)) {
+      Some(pm) -> Some(extern_param_message(name, pm))
+      None -> if is_c_abi_safe_type(ret_ty, true) { None } else { Some(extern_return_message(name, ret_ty)) }
     }
   }
+
+fn param_c_abi_safe(p: Param) : Bool = match p.ptype {
+  Some(ty) -> is_c_abi_safe_type(ty, false)
+  None -> false
 }
+
+fn extern_return_message(name: String, ret_ty: TypeExpr) : String =
+  concat_all([
+    "`extern \"C\" fn ", name,
+    "` return type `", type_surface(ret_ty),
+    "` is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, Unit, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
+  ])
 
 fn extern_param_message(name: String, p: Param) : String {
   let ty_s = match p.ptype {
@@ -279,27 +162,11 @@ fn extern_param_message(name: String, p: Param) : String {
   ])
 }
 
-#[doc("""
-The override must be a syntactically valid C identifier so the
-emitted call site survives the C compiler. We
-do not try to validate that the symbol actually links — that is
-a build-time concern, not a parse-time one.
-""")]
-pub fn is_valid_c_identifier(s: String) : Bool {
-  let n = string_length(s)
-  if n == 0 { false }
-  else {
-    let c0 = char_at_or_zero(s, 0)
-    if not (ch_is_alpha(c0) or c0 == '_') { false }
-    else { is_valid_c_identifier_rest(s, 1, n) }
-  }
-}
+#[doc("Reports whether a string is a valid C identifier.")]
+pub fn is_valid_c_identifier(s: String) : Bool =
+  string_length(s) > 0 and ch_is_alpha(char_at_or_zero(s, 0)) and c_ident_rest(s, 1, string_length(s))
 
-fn is_valid_c_identifier_rest(s: String, i: Int, n: Int) : Bool {
+fn c_ident_rest(s: String, i: Int, n: Int) : Bool =
   if i >= n { true }
-  else {
-    let c = char_at_or_zero(s, i)
-    if ch_is_alnum(c) or c == '_' { is_valid_c_identifier_rest(s, i + 1, n) }
-    else { false }
-  }
-}
+  else if ch_is_alnum(char_at_or_zero(s, i)) { c_ident_rest(s, i + 1, n) }
+  else { false }

@@ -1,61 +1,19 @@
 #[doc("""
-Function declarations: heads, parameters, contracts and bodies.
+Function and constant declarations: heads, parameters, type parameters and bodies.
 """)]
 
-import compiler.util
 import compiler.lex_tokens
-import compiler.lex
 import compiler.ast
 import compiler.decl_names
-import compiler.refinements
 import compiler.tbinder
 import compiler.parse_state
 import compiler.parse_types
 import compiler.parse_stmt
 import compiler.parse_expr
 import compiler.parse_kinds
+import compiler.parse_contracts
 
-#[doc("""
-const NAME : T = expr — top-level named constant. Parses to the
-dedicated `DConst` variant. The `lower_consts` pass converts it to
-`DAttribPure(DFn arity-0)` early in the pipeline so downstream
-walkers (typer, monomorphiser, emitters) keep seeing the arity-0-fn
-shape. Const reads go through the `desugar_const_refs_decls` pass
-that rewrites `EName(NAME)` to `ECall(EName(NAME), [])`; that pass is
-scope-aware so a fn parameter named `NAME` shadows the const
-correctly.
-""")]
-pub fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
-  let id = p_peek(p)
-  if not tk_is(id.kind, TkIdent) {
-    err_d(p_error(p, id, "expected constant name after `const`"))
-  } else {
-    let p2 = p_skip_newlines(p_advance(p))
-    if not p_at(p2, TkColon) {
-      err_d(p_error_here(p2, "expected `:` after constant name (`const NAME : T = expr`)"))
-    } else {
-      let rt = parse_type(p_skip_newlines(p_advance(p2)))
-      match rt.r {
-        None -> err_d(rt.p)
-        Some(ty) -> parse_const_body(p_skip_newlines(rt.p), p, is_pub, tok_source(p.src, id), ty, t)
-      }
-    }
-  }
-}
-
-fn parse_const_body(p4: Parser, p: Parser, is_pub: Bool, name: String, ty: TypeExpr, t: Token) : PDecl / Console {
-  if not p_at(p4, TkEq) {
-    err_d(p_error_here(p4, "expected `=` in constant declaration"))
-  } else {
-    let re = parse_expr(p_skip_newlines(p_advance(p4)))
-    match re.r {
-      None -> err_d(re.p)
-      Some(body) ->
-        ok_dn(re.p, DConst(is_pub, p_sym(p, NCConst, name), ty, body, None, t.line, t.col),
-              [p_ent(p, NCConst, name, is_pub)])
-    }
-  }
-}
+type ConstHead = { p0: Parser, is_pub: Bool, name: String, t: Token }
 
 type FnHead = {
   p0: Parser,
@@ -68,424 +26,200 @@ type FnHead = {
   row: RowExpr
 }
 
+fn params_err(p: Parser) : PParams = PParams { p: p, r: None }
+
+#[doc("Parses a `const NAME : T = expr` declaration after its keyword.")]
+pub fn parse_const_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected constant name after `const`"))
+  } else {
+    let p2 = p_eat(p_advance_nl(p), TkColon, "expected `:` after constant name (`const NAME : T = expr`)")
+    if p_failed(p2) { err_d(p2) }
+    else { const_type(parse_type(p_skip_newlines(p2)), ConstHead { p0: p, is_pub: is_pub, name: tok_source(p.src, id), t: t }) }
+  }
+}
+
+fn const_type(rt: PTy, c: ConstHead) : PDecl / Console =
+  match rt.r {
+    None -> err_d(rt.p)
+    Some(ty) -> {
+      let p4 = p_eat(p_skip_newlines(rt.p), TkEq, "expected `=` in constant declaration")
+      if p_failed(p4) { err_d(p4) } else { const_value(parse_expr(p_skip_newlines(p4)), c, ty) }
+    }
+  }
+
+fn const_value(re: PExpr, c: ConstHead, ty: TypeExpr) : PDecl / Console =
+  match re.r {
+    None -> err_d(re.p)
+    Some(body) ->
+      ok_dn(re.p, DConst(c.is_pub, p_sym(c.p0, NCConst, c.name), ty, body, None, c.t.line, c.t.col),
+            [p_ent(c.p0, NCConst, c.name, c.is_pub)])
+  }
+
 #[doc("Parses a `fn` declaration after its keyword.")]
 pub fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
   let id = p_peek(p)
-  if not tk_is(id.kind, TkIdent) {
-    err_d(p_error(p, id, "expected function name"))
-  } else if is_upper_ident(p.src, id) {
-    err_d(p_error(p, id, "function names must start with a lowercase letter"))
-  } else {
+  if not tk_is(id.kind, TkIdent) { err_d(p_error(p, id, "expected function name")) }
+  else if is_upper_ident(p.src, id) { err_d(p_error(p, id, "function names must start with a lowercase letter")) }
+  else {
     let p1 = p_advance(p)
-    let tparams_r =
-      if p_at(p1, TkLbracket) {
-        parse_impl_type_params_loop(p_skip_newlines(p_advance(p1)), [])
-      } else {
-        PTParams { p: p1, r: Some([]) }
-      }
-    match tparams_r.r {
-      None -> err_d(tparams_r.p)
-      Some(tparams) -> parse_fn_paren(tparams_r.p, p, is_pub, t, tok_source(p.src, id), tparams)
+    let tr = if p_at(p1, TkLbracket) { parse_impl_type_params_loop(p_advance_nl(p1), []) }
+             else { PTParams { p: p1, r: Some([]) } }
+    match tr.r {
+      None -> err_d(tr.p)
+      Some(tparams) -> fn_params(tr.p, FnHead { p0: p, fname: tok_source(p.src, id), is_pub: is_pub, t: t,
+                                                tparams: tparams, params: [], ret: None, row: REmpty })
     }
   }
 }
 
-fn parse_fn_paren(pp: Parser, p: Parser, is_pub: Bool, t: Token, name: String,
-                  tparams: [TBinder]) : PDecl / Console {
-  if not p_at(pp, TkLparen) {
-    err_d(p_error_here(pp, "expected `(` after function name"))
-  } else {
-    let params_r = parse_fn_params(p_skip_newlines(p_advance(pp)), [])
-    match params_r.r {
-      None -> err_d(params_r.p)
-      Some(params) -> parse_fn_ret(p_skip_newlines(params_r.p), p, is_pub, t, name, tparams, params)
+fn fn_params(p: Parser, h: FnHead) : PDecl / Console =
+  if not p_at(p, TkLparen) { fail_d(p, "expected `(` after function name") }
+  else {
+    let pr = parse_fn_params(p_advance_nl(p), [])
+    match pr.r {
+      None -> err_d(pr.p)
+      Some(params) -> fn_ret(p_skip_newlines(pr.p), FnHead { ...h, params: params })
     }
   }
-}
 
-fn parse_fn_ret(p3: Parser, p: Parser, is_pub: Bool, t: Token, name: String,
-                tparams: [TBinder], params: [Param]) : PDecl / Console {
-  let ret_r = parse_optional_type(p3)
-  if p_failed(ret_r.p) and not p_failed(p3) { err_d(ret_r.p) }
+fn fn_ret(p: Parser, h: FnHead) : PDecl / Console {
+  let ret_r = parse_optional_type(p)
+  if p_failed(ret_r.p) and not p_failed(p) { err_d(ret_r.p) }
   else {
     let row_r = parse_row_suffix(ret_r.p)
-    let h = FnHead { p0: p, fname: name, is_pub: is_pub, t: t, tparams: tparams,
-                     params: params, ret: ret_r.r, row: row_r.r }
-    parse_fn_contracts(h, row_r.p, fn_tp_bounds_of(tparams))
+    fn_body(row_r.p, FnHead { ...h, ret: ret_r.r, row: row_r.r })
   }
 }
 
-fn parse_fn_contracts(h: FnHead, p: Parser, bounds: [FnTPBound]) : PDecl / Console {
-  let attr = parse_optional_pure_attribute(p_skip_newlines(p))
-  let cc = parse_contracts_loop(p_skip_newlines(attr.p), [], [])
+fn fn_body(p: Parser, h: FnHead) : PDecl / Console {
+  let attr_p = reject_fn_attribute(p_skip_newlines(p))
+  let cc = parse_contracts_loop(p_skip_newlines(attr_p), [], [])
   let p4 = p_skip_newlines(cc.p)
-  if p_at(p4, TkEq) {
-    finish_fn_decl(h, bounds, cc, parse_expr(p_skip_newlines(p_advance(p4))))
-  } else if p_at(p4, TkLbrace) {
-    parse_fn_brace_body(h, bounds, cc, p4)
-  } else {
-    err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
+  match p_peek(p4).kind {
+    TkEq -> finish_fn_decl(h, cc, parse_expr(p_advance_nl(p4)))
+    TkLbrace -> finish_fn_decl(h, cc, brace_body(p4, h.params))
+    _ -> fail_d(p4, "expected `=` or `{` to start function body")
   }
 }
 
-fn parse_fn_brace_body(h: FnHead, bounds: [FnTPBound], cc: Contracts, p4: Parser) : PDecl / Console {
-  let tb = p_peek(p4)
-  let after_lbrace = p_skip_newlines_and_semis(p_advance(p4))
-  if p_at(after_lbrace, TkCase) {
-    finish_fn_decl(h, bounds, cc, parse_clause_block(after_lbrace, h.params, tb))
-  } else {
-    finish_fn_decl(h, bounds, cc, parse_block(p4, tb))
-  }
+fn fail_d(p: Parser, msg: String) : PDecl / Console = err_d(p_error_here(p, msg))
+
+fn brace_body(p: Parser, params: [Param]) : PExpr / Console {
+  let after_lbrace = p_skip_newlines_and_semis(p_advance(p))
+  if p_at(after_lbrace, TkCase) { parse_clause_block(after_lbrace, params, p_peek(p)) }
+  else { parse_block(p, p_peek(p)) }
 }
 
-fn finish_fn_decl(h: FnHead, bounds: [FnTPBound], cc: Contracts, rb: PExpr) : PDecl / Console {
+fn finish_fn_decl(h: FnHead, cc: Contracts, rb: PExpr) : PDecl / Console =
   match rb.r {
     None -> err_d(rb.p)
     Some(body) -> {
-      let body2 = contract_surface(body, cc.reqs, cc.enss, h.t)
-      let dfn = DFn(h.is_pub, fnid_decl(p_sym(h.p0, NCFn, h.fname)), h.tparams, h.params, h.ret, h.row, body2, h.t.line, h.t.col, None)
-      ok_d_fn(rb.p, dfn, bounds, [p_ent(h.p0, NCFn, h.fname, h.is_pub)])
+      let name = p_sym(h.p0, NCFn, h.fname)
+      let dfn = DFn(h.is_pub, fnid_decl(name), h.tparams, h.params, h.ret, h.row,
+                    contract_surface(body, cc, h.t), h.t.line, h.t.col, None)
+      ok_d_fn(rb.p, dfn, fn_tp_bounds_of(h.tparams), [p_ent(h.p0, NCFn, h.fname, h.is_pub)])
     }
   }
-}
-
-# Parse a multi-clause function body. The opening `{`
-# has already been consumed; `p` points at the first `case` keyword
-# (or whatever follows `{` and any newlines/semis — caller verified
-# `p_at(p, TkCase)`). Each arm is `case <pat> (when <guard>)? -> <body>`.
-# For a 1-arg fn the scrutinee is `EName(arg_name)` and arms carry a
-# single pattern (reuses `parse_match_arms`). For an N-arg fn (N>=2)
-# the scrutinee tuple is `(arg1, ..., argN)` represented as N parallel
-# scrutinees and arms carry N comma-separated patterns (reuses
-# `parse_multi_match_arms`). `surface_lower` turns the collected arms
-# into plain `EMatch`es, so the typer / codegen / perceus see no new shape.
-#
-# Pure-block rule: if any non-`case` token appears between arms, the
-# arm-collection loop fails with "expected `case` or `}`" and the
-# whole fn body is rejected — stmt-block mixed with case-arms is a
-# hard parse error, never a warning.
-fn parse_clause_block(p: Parser, params: [Param], t: Token) : PExpr / Console {
-
-  let n = list_length(params)
-  if n == 0 {
-    # Zero-arg fn with case-arms: there's nothing to discriminate
-    # on. Reject explicitly so the diagnostic points at the keyword.
-    err_e(p_error_here(p, "case-block requires at least one parameter to discriminate on"))
-  } else if n > 4 {
-    # The cap of a multi-arg `match`, whose lowering this shares.
-    err_e(p_error_here(p, "case-block supports up to 4 parameters"))
-  } else {
-    parse_case_multi_arms(p, [], n, t)
-  }
-}
-
-# Arm collector for N-arg case-block. Mirrors
-# `parse_multi_match_arms`. Each arm is `case p1, ..., pN (when g)? -> body`.
-fn parse_case_multi_arms(p: Parser, acc: [MMArm], n: Int, t: Token) : PExpr / Console {
-
-  let p0 = p_skip_newlines_and_semis(p)
-  if p_at(p0, TkRbrace) {
-    if list_is_empty(acc) {
-      err_e(p_error_here(p0, "case-block must have at least one `case` arm"))
-    } else {
-      let p1 = p_advance(p0)
-      ok_e(p1, mk_expr(ESurface(SfCaseBlock(list_reverse(acc))), t.line, t.col))
-    }
-  } else if not p_at(p0, TkCase) {
-    err_e(p_error_here(p0, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`"))
-  } else {
-    let p1 = p_skip_newlines(p_advance(p0))
-    let ra = parse_case_multi_arm(p1, n)
-    match ra.r {
-      None -> err_e(ra.p)
-      Some(arm) -> parse_case_multi_arms(ra.p, [arm, ...acc], n, t)
-    }
-  }
-}
-
-# Parse `pat1, ..., patN (when guard)? -> body` after the
-# leading `case` has been consumed. Mirrors `parse_multi_arm` but
-# uses `when` instead of `if` for the guard.
-fn parse_case_multi_arm(p: Parser, n: Int) : PMArm / Console {
-
-  let r_pats = parse_n_patterns(p, n, [])
-  match r_pats.r {
-    None -> err_marm(r_pats.p)
-    Some(pats) -> {
-      let p1 = p_skip_newlines(r_pats.p)
-      let guard_opt_r = parse_arm_guard(p1, TkWhen)
-      parse_marm_body(guard_opt_r, pats, "expected `->` in case-arm")
-    }
-  }
-}
-
-# Detect a now-removed `[<...>]` fn attribute after a signature / row.
-# The `[<refinement_pure>]` attribute is gone: contract-predicate
-# purity is read directly off a fn's declared effect row (`REmpty`),
-# so the opt-in marker is redundant. The parser still recognises the
-# `[<ident>]` shape (peek-2 lookahead so a bare `[` index doesn't
-# trigger) only to emit a clear migration error rather than a generic
-# syntax failure. `ok` stays true when no such bracket is present.
-type PureAttr = { p: Parser, ok: Bool }
-
-fn parse_optional_pure_attribute(p: Parser) : PureAttr / Console {
-
-  if not p_at(p, TkLbracket) { PureAttr { p: p, ok: true } }
-  else if not tk_is(p_peek1(p).kind, TkLt) {
-    PureAttr { p: p, ok: true }
-  } else {
-    # `[<` opens a removed fn attribute. Consume through `>]` if we
-    # can, then error — emitting at the attribute keeps the span tight.
-    let p1 = p_skip_newlines(p_advance(p))
-    let p2 = p_skip_newlines(p_advance(p1))
-    let id = p_peek(p2)
-    let attr_name = if tk_is(id.kind, TkIdent) { tok_source(p2.src, id) } else { "" }
-    PureAttr {
-      p: p_error(p2, id, concat_all([
-        "`[<", attr_name, ">]` fn attributes are not supported — ",
-        "contract-predicate purity is derived from the effect row ",
-        "(a fn with an empty row is pure); remove the attribute"
-      ])),
-      ok: false
-    }
-  }
-}
-
-# Contract-clause result. Carries the parser advanced past
-# all `requires` / `ensures` clauses plus the accumulated predicates.
-# Both lists are stored in source order (parse_contracts_loop reverses
-# the accumulators before returning).
-type Contracts = { p: Parser, reqs: [Expr], enss: [Expr] }
-
-# Parse a single contract predicate. A trailing `{` belongs to the
-# enclosing decl (a block body), never to the predicate, so a
-# predicate cannot consume it as a trailing lambda nor an
-# `UpperIdent {` as a record literal. Same suppression `if`/`match`
-# apply to their cond; the caller's flags are restored on return.
-fn parse_contract_pred(p: Parser) : PExpr / Console {
-  let prev_atl = p.allow_trailing_lambda
-  let prev_arl = p.allow_record_lit
-  let r = parse_expr(p_with_record_lit(p_with_trailing_lambda(p, false), false))
-  PExpr { p: p_with_record_lit(p_with_trailing_lambda(r.p, prev_atl), prev_arl), r: r.r }
-}
-
-# Parse zero-or-more `requires <expr>` / `ensures <expr>`
-# clauses, in any interleaving, until the next token is `=` or `{`
-# (the start of the body) or anything else. Each clause's predicate
-# is parsed as a single Expr; parse_expr stops at TkRequires /
-# TkEnsures / TkEq because none are operators, and at TkLbrace
-# because parse_contract_pred suppresses the trailing-lambda form.
-fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts / Console {
-
-  let p0 = p_skip_newlines(p)
-  if p_at(p0, TkRequires) {
-    let kw = p_peek(p0)
-    let pe = parse_contract_pred(p_skip_newlines(p_advance(p0)))
-    match pe.r {
-      None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
-      Some(pred) -> {
-        let p1 = check_pred_not_false(pe.p, pred, "requires", kw)
-        # Pure-call check runs in a post-parse pass so it can consult
-        # the program-wide list of fns marked with `[<refinement_pure>]`.
-        # See validate_contract_predicates_decls.
-        parse_contracts_loop(p1, [pred, ...reqs], enss)
-      }
-    }
-  } else if p_at(p0, TkEnsures) {
-    let kw = p_peek(p0)
-    let pe = parse_contract_pred(p_skip_newlines(p_advance(p0)))
-    match pe.r {
-      None -> Contracts { p: pe.p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
-      Some(pred) -> {
-        let p1 = check_pred_not_false(pe.p, pred, "ensures", kw)
-        parse_contracts_loop(p1, reqs, [pred, ...enss])
-      }
-    }
-  } else {
-    Contracts { p: p0, reqs: list_reverse(reqs), enss: list_reverse(enss) }
-  }
-}
-
-# Wrap a fn body in its contract clauses, preserved verbatim for the
-# writer. `surface_lower_decls` performs the assert desugar.
-fn contract_surface(body: Expr, reqs: [Expr], enss: [Expr], t: Token) : Expr {
-  if list_is_empty(reqs) and list_is_empty(enss) { body }
-  else { mk_expr(ESurface(SfContract(reqs, enss, body)), t.line, t.col) }
-}
-
-# If a contract predicate folds to `false` at parse time,
-# emit a compile-time error pointing at the clause keyword. The
-# contract list still accumulates the predicate so downstream stmts
-# parse cleanly; the parser's `error` aborts code emission
-# at the end of the file, the same path as any other parse error.
-fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser / Console {
-
-  match try_eval_pred(pred) {
-    Some(false) -> p_error(p, kw, concat_all([
-      "`", kind, "` predicate is statically `false` — the contract ",
-      "would always panic. Remove the clause or fix the predicate."
-    ]))
-    _ -> p
-  }
-}
 
 #[doc("Parses a function parameter list after its opening parenthesis.")]
-pub fn parse_fn_params(p: Parser, acc: [Param]) : PParams / Console {
-
+pub fn parse_fn_params(p: Parser, acc: [Param]) : PParams / Console =
   if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
-  else { parse_fn_params_group(p, [], acc) }
-}
+  else { params_group(p, [], acc) }
 
-# Accumulate names of the current type group in `pending` (reverse reading
-# order) until a `:` closes the group; then parse the shared type and
-# back-fill it onto every name. LL(1): one token of lookahead at each step —
-# `,` keeps the group open, `:` closes it.
-# A leading `^` borrows this name only (no group back-fill): `^a, b: T` borrows `a` alone.
-fn parse_fn_params_group(p: Parser, pending: [PendName], acc: [Param]) : PParams / Console {
+# A leading `^` borrows that name only; the others in a `a, b: T` group share the type.
+fn params_group(p: Parser, pending: [PendName], acc: [Param]) : PParams / Console {
   let borrow = p_at(p, TkCaret)
   let p0 = if borrow { p_advance(p) } else { p }
   let t = p_peek(p0)
   if not tk_is(t.kind, TkIdent) {
-    PParams { p: p_error(p0, t, "expected parameter name after `^`"), r: None }
+    params_err(p_error(p0, t, "expected parameter name after `^`"))
   } else {
     let pending1 = [PendName { nm: tok_source(p0.src, t), nline: t.line, ncol: t.col, pborrow: borrow }, ...pending]
     let p1 = p_advance(p0)
-    if p_at(p1, TkComma) {
-      parse_fn_params_group(p_skip_newlines(p_advance(p1)), pending1, acc)
-    } else if p_at(p1, TkColon) {
-      parse_fn_param_group_type(p_advance(p1), pending1, acc)
-    } else if p_at(p1, TkRparen) {
-      PParams { p: p_error_here(p1, "parameter group has no type annotation"), r: None }
-    } else {
-      PParams { p: p_error_here(p1, "expected `,`, `:` or `)` in parameter list"), r: None }
+    match p_peek(p1).kind {
+      TkComma -> params_group(p_advance_nl(p1), pending1, acc)
+      TkColon -> params_group_type(parse_type(p_advance(p1)), pending1, acc)
+      TkRparen -> params_err(p_error_here(p1, "parameter group has no type annotation"))
+      _ -> params_err(p_error_here(p1, "expected `,`, `:` or `)` in parameter list"))
     }
   }
 }
 
-fn parse_fn_param_group_type(p: Parser, pending: [PendName], acc: [Param]) : PParams / Console {
-  let rt = parse_type(p)
+fn params_group_type(rt: PTy, pending: [PendName], acc: [Param]) : PParams / Console =
   match rt.r {
-    None -> PParams { p: rt.p, r: None }
+    None -> params_err(rt.p)
     Some(ty) -> {
       let acc1 = close_param_group(list_reverse(pending), ty, acc)
       let p2 = p_skip_newlines(rt.p)
-      if p_at(p2, TkComma) {
-        parse_fn_params(p_skip_newlines(p_advance(p2)), acc1)
-      } else if p_at(p2, TkRparen) {
-        PParams { p: p_advance(p2), r: Some(list_reverse(acc1)) }
-      } else {
-        PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
+      match p_peek(p2).kind {
+        TkComma -> parse_fn_params(p_advance_nl(p2), acc1)
+        TkRparen -> PParams { p: p_advance(p2), r: Some(list_reverse(acc1)) }
+        _ -> params_err(p_error_here(p2, "expected `,` or `)` in parameter list"))
       }
     }
   }
-}
 
 #[doc("The parser state paired with the result of parsing a type-parameter list.")]
 pub type PTParams = { p: Parser, r: Option[[TBinder]] }
 
-#[doc("Parses the type parameters of a declaration.")]
-pub fn parse_type_params_loop(p: Parser, acc: [TBinder]) : PTParams / Console {
+fn tparam_kind(p: Parser, bounded: Bool) : PKindBounds / Console =
+  if bounded { parse_optional_kind_or_bounds(p) }
+  else {
+    let kr = parse_optional_kind_annotation(p)
+    PKindBounds { p: kr.p, kind: kr.kind, bounds: [] }
+  }
 
+fn parse_tparams(p: Parser, acc: [TBinder], bounded: Bool) : PTParams / Console {
   let t = p_peek(p)
   if not tk_is(t.kind, TkIdent) {
     PTParams { p: p_error(p, t, "expected type parameter name"), r: None }
   } else {
-    let raw_name = tok_source(p.src, t)
-    let p1 = p_skip_newlines(p_advance(p))
-    # Optional `: Measure` (or `: Type`) kind annotation.
-    let kr = parse_optional_kind_annotation(p1)
-    let stored = tbinder_written(raw_name, kr.kind, [])
-    let p2 = p_skip_newlines(kr.p)
-    if p_at(p2, TkComma) {
-      parse_type_params_loop(p_skip_newlines(p_advance(p2)), [stored, ...acc])
-    } else if p_at(p2, TkRbracket) {
-      PTParams { p: p_advance(p2), r: Some(list_reverse([stored, ...acc])) }
-    } else {
-      PTParams { p: p_error_here(p2, "expected `,` or `]` after type parameter"), r: None }
-    }
+    let kb = tparam_kind(p_advance_nl(p), bounded)
+    let stored = tbinder_written(tok_source(p.src, t), kb.kind, map(kb.bounds, ref_written))
+    tparams_sep(p_skip_newlines(kb.p), [stored, ...acc], bounded)
   }
 }
 
-#[doc("""
-Impl-site variant of parse_type_params_loop. Accepts the
-`Measure` kind annotation AND, additionally, a list
-of uppercase protocol-name bounds: `T : Show`, `T : Show + Eq`.
-""")]
-pub fn parse_impl_type_params_loop(p: Parser, acc: [TBinder]) : PTParams / Console {
-
-  let t = p_peek(p)
-  if not tk_is(t.kind, TkIdent) {
-    PTParams { p: p_error(p, t, "expected type parameter name"), r: None }
-  } else {
-    let raw_name = tok_source(p.src, t)
-    let p1 = p_skip_newlines(p_advance(p))
-    let kbr = parse_optional_kind_or_bounds(p1)
-    let stored = tbinder_written(raw_name, kbr.kind, map(kbr.bounds, ref_written))
-    let p2 = p_skip_newlines(kbr.p)
-    if p_at(p2, TkComma) {
-      parse_impl_type_params_loop(p_skip_newlines(p_advance(p2)), [stored, ...acc])
-    } else if p_at(p2, TkRbracket) {
-      PTParams { p: p_advance(p2), r: Some(list_reverse([stored, ...acc])) }
-    } else {
-      PTParams { p: p_error_here(p2, "expected `,` or `]` after type parameter"), r: None }
-    }
+fn tparams_sep(p: Parser, acc: [TBinder], bounded: Bool) : PTParams / Console =
+  match p_peek(p).kind {
+    TkComma -> parse_tparams(p_advance_nl(p), acc, bounded)
+    TkRbracket -> PTParams { p: p_advance(p), r: Some(list_reverse(acc)) }
+    _ -> PTParams { p: p_error_here(p, "expected `,` or `]` after type parameter"), r: None }
   }
-}
 
-# Collect the protocol bounds of each type-kind tparam, keyed by its
-# position among the type-kind tparams (unit-kind tparams excluded, so
-# the index aligns with a monomorphised call's concrete `tys`).
+#[doc("Parses the type parameters of a declaration, each with an optional kind annotation.")]
+pub fn parse_type_params_loop(p: Parser, acc: [TBinder]) : PTParams / Console = parse_tparams(p, acc, false)
+
+#[doc("Parses type parameters that may also carry protocol bounds: `T : Show + Eq`.")]
+pub fn parse_impl_type_params_loop(p: Parser, acc: [TBinder]) : PTParams / Console = parse_tparams(p, acc, true)
+
 #[doc("Protocol bounds of each type-kind tparam of a fn, keyed by position among the type-kind tparams.")]
-pub fn fn_tp_bounds_of(tps: [TBinder]) : [FnTPBound] =
-  fn_tp_bounds_loop(tps, 0, [])
+pub fn fn_tp_bounds_of(tps: [TBinder]) : [FnTPBound] = fn_tp_bounds_loop(tps, 0, [])
 
-fn fn_tp_bounds_loop(tps: [TBinder], idx: Int, acc: [FnTPBound]) : [FnTPBound] {
+fn fn_tp_bounds_loop(tps: [TBinder], idx: Int, acc: [FnTPBound]) : [FnTPBound] =
   match tps {
     [] -> list_reverse(acc)
     [tp, ...rest] ->
-      if tb_is_unit(tp) {
-        fn_tp_bounds_loop(rest, idx, acc)
-      } else {
-        let acc1 = match tp.bounds { [] -> acc  bs -> [FTB(idx, bs), ...acc] }
-        fn_tp_bounds_loop(rest, idx + 1, acc1)
-      }
-  }
-}
-
-#[doc("""
-Seed a fn-bounds record for a bounded free fn, named by the entry the
-fn declares. `mo` is None here (the parser stamps no origin); the
-driver re-keys the target file's records to its module name to match
-the monomorphiser's view.
-""")]
-pub fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) : [FnBoundsRec] =
-  match bs {
-    [] -> bacc
-    _  -> match d {
-      DFn(_, _, _, _, _, _, _, _, _, mo) -> match names {
-        [NEnt(_, name, _, _, _), ..._] -> [FBR(name, mo, bs), ...bacc]
-        []                          -> bacc
-      }
-      _ -> bacc
-    }
+      if tb_is_unit(tp) { fn_tp_bounds_loop(rest, idx, acc) }
+      else { fn_tp_bounds_loop(rest, idx + 1, match tp.bounds { [] -> acc  bs -> [FTB(idx, bs), ...acc] }) }
   }
 
 #[doc("Parses comma-separated types up to `closer`, accepting a trailing comma; `msg` is the error for any other token.")]
 pub fn parse_type_list(p: Parser, closer: TokKind, msg: String, acc: [TypeExpr]) : PTypes / Console {
   let p0 = p_skip_newlines(p)
-  if p_at(p0, closer) {
-    PTypes { p: p_advance(p0), r: Some(list_reverse(acc)) }
-  } else {
-    let ty_r = parse_type(p0)
-    match ty_r.r {
-      None -> PTypes { p: ty_r.p, r: None }
-      Some(ty) -> parse_type_list_sep(p_skip_newlines(ty_r.p), closer, msg, [ty, ...acc])
+  if p_at(p0, closer) { PTypes { p: p_advance(p0), r: Some(list_reverse(acc)) } }
+  else {
+    let r = parse_type(p0)
+    match r.r {
+      None -> PTypes { p: r.p, r: None }
+      Some(ty) -> type_list_sep(p_skip_newlines(r.p), closer, msg, [ty, ...acc])
     }
   }
 }
 
-fn parse_type_list_sep(p1: Parser, closer: TokKind, msg: String, acc: [TypeExpr]) : PTypes / Console {
-  if p_at(p1, TkComma) { parse_type_list(p_advance(p1), closer, msg, acc) }
-  else if p_at(p1, closer) { PTypes { p: p_advance(p1), r: Some(list_reverse(acc)) } }
-  else { PTypes { p: p_error_here(p1, msg), r: None } }
-}
+fn type_list_sep(p: Parser, closer: TokKind, msg: String, acc: [TypeExpr]) : PTypes / Console =
+  if p_at(p, TkComma) { parse_type_list(p_advance(p), closer, msg, acc) }
+  else if p_at(p, closer) { PTypes { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else { PTypes { p: p_error_here(p, msg), r: None } }

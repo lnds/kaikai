@@ -11,398 +11,232 @@ import compiler.parse_state
 import compiler.parse_types
 import compiler.parse_fns
 
-# The protocol-law sets a `protocol P : L` header (and its `axiom L`
-# exemption) may name. A law set is verified by generated property
-# checks, not by a unifier, so it is a namespace of its own — naming one
-# where a theory belongs, or the reverse, is an error.
+# A law set is verified by generated property checks, not by a unifier: a
+# law set and a theory are separate namespaces.
 fn is_protocol_law(name: String) : Bool = name == "Functorial"
 
 fn unknown_protocol_law_msg(name: String) : String =
   concat_all(["unknown protocol law `", name, "` — the law sets are: Functorial"])
 
-#[doc("""
-`theory Name = { prop, ... }` — a named assembly of unification
-properties. `theory` is a hard keyword (already consumed); the head
-token `t` anchors diagnostics.
-""")]
-pub fn parse_theory_decl(p: Parser, t: Token) : PDecl / Console {
-  let id = p_peek(p)
-  if not tk_is(id.kind, TkIdent) {
-    err_d(p_error(p, id, "expected theory name after `theory`"))
-  } else if not is_upper_ident(p.src, id) {
-    err_d(p_error(p, id, "theory name must start with an uppercase letter"))
-  } else {
-    let p1 = p_advance(p)
-    if not p_at(p1, TkEq) {
-      err_d(p_error_here(p1, "expected `=` after theory name — a theory is `theory Name = { prop, ... }` or `theory Name = builtin`"))
-    } else {
-      parse_theory_body(p_advance(p1), tok_source(p.src, id), t)
-    }
-  }
-}
+fn is_upper_name(p: Parser, t: Token) : Bool = tk_is(t.kind, TkIdent) and is_upper_ident(p.src, t)
 
-fn parse_theory_body(p2: Parser, name: String, t: Token) : PDecl / Console {
-  if theory_body_is_builtin(p2) {
-    ok_d(p_advance(p2), DTheory(name, [theory_builtin_marker()], t.line, t.col, None))
-  } else if not p_at(p2, TkLbrace) {
-    err_d(p_error_here(p2, "expected `{` or `builtin` after `=` in a `theory` declaration"))
-  } else {
-    let rp = parse_theory_props(p_advance(p2), [])
-    match rp.r {
-      None -> err_d(rp.p)
-      Some(props) -> ok_d(rp.p, DTheory(name, props, t.line, t.col, None))
-    }
-  }
-}
+fn opt_type_params(p: Parser) : PTParams / Console =
+  if p_at(p, TkLbracket) { parse_type_params_loop(p_advance_nl(p), []) }
+  else { PTParams { p: p, r: Some([]) } }
 
-# `builtin` is contextual, not a keyword: only the ident spelled
-# `builtin` directly after a theory's `=` selects the builtin body.
-fn theory_body_is_builtin(p: Parser) : Bool {
-  let t = p_peek(p)
-  tk_is(t.kind, TkIdent) and tok_source(p.src, t) == "builtin"
-}
-
-type PProps = { p: Parser, r: Option[[String]] }
-
-# The closed menu of unification properties a `theory` may assemble.
-# Membership is the barrier here; which combinations map to a decidable
-# engine is checked downstream.
 fn theory_prop_menu() : [String] =
   ["assoc", "commut", "idempotent", "inverse", "identity", "measure", "rows"]
 
-fn is_known_theory_prop(name: String) : Bool =
-  name == "assoc" or name == "commut" or name == "idempotent" or
-  name == "inverse" or name == "identity" or name == "measure" or
-  name == "rows"
-
 fn unknown_theory_prop_msg(prop: String) : String {
   let base = concat_all(["unknown theory property `", prop,
-                         "` — the closed menu is assoc, commut, idempotent, ",
-                         "inverse, identity, measure, rows"])
+                         "` — the closed menu is assoc, commut, idempotent, inverse, identity, measure, rows"])
   match closest_name(prop, theory_prop_menu()) {
     Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
     None      -> base
   }
 }
 
-# Parse `prop, prop, ... }` — the comma-separated property idents
-# after a theory's opening brace, consuming the closing `}`.
-fn parse_theory_props(p: Parser, acc: [String]) : PProps / Console {
+#[doc("Parses `theory Name = { prop, ... }` or `theory Name = builtin`; `t` anchors the declaration.")]
+pub fn parse_theory_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) { err_d(p_error(p, id, "expected theory name after `theory`")) }
+  else if not is_upper_ident(p.src, id) { err_d(p_error(p, id, "theory name must start with an uppercase letter")) }
+  else {
+    let p1 = p_eat(p_advance(p), TkEq, "expected `=` after theory name — a theory is `theory Name = { prop, ... }` or `theory Name = builtin`")
+    if p_failed(p1) { err_d(p1) } else { parse_theory_body(p1, tok_source(p.src, id), t) }
+  }
+}
+
+# `builtin` is contextual: only directly after a theory's `=`.
+fn parse_theory_body(p: Parser, name: String, t: Token) : PDecl / Console {
+  let b = p_peek(p)
+  if tk_is(b.kind, TkIdent) and tok_source(p.src, b) == "builtin" {
+    ok_d(p_advance(p), DTheory(name, [theory_builtin_marker()], t.line, t.col, None))
+  } else if not p_at(p, TkLbrace) {
+    err_d(p_error_here(p, "expected `{` or `builtin` after `=` in a `theory` declaration"))
+  } else {
+    theory_props(p_advance(p), [], name, t)
+  }
+}
+
+fn theory_props(p: Parser, acc: [String], name: String, t: Token) : PDecl / Console {
   let p0 = p_skip_newlines(p)
-  if p_at(p0, TkRbrace) {
-    PProps { p: p_advance(p0), r: Some(list_reverse(acc)) }
-  } else {
-    let id = p_peek(p0)
-    let prop = tok_source(p0.src, id)
-    if not tk_is(id.kind, TkIdent) {
-      PProps { p: p_error(p0, id, "expected a property name inside `theory { ... }`"), r: None }
-    } else if not is_known_theory_prop(prop) {
-      PProps { p: p_error(p0, id, unknown_theory_prop_msg(prop)), r: None }
-    } else {
-      parse_theory_prop_end(p_skip_newlines(p_advance(p0)), [prop, ...acc])
-    }
-  }
+  let id = p_peek(p0)
+  let prop = tok_source(p0.src, id)
+  if p_at(p0, TkRbrace) { ok_d(p_advance(p0), DTheory(name, list_reverse(acc), t.line, t.col, None)) }
+  else if not tk_is(id.kind, TkIdent) { err_d(p_error(p0, id, "expected a property name inside `theory { ... }`")) }
+  else if not list_has(theory_prop_menu(), prop) { err_d(p_error(p0, id, unknown_theory_prop_msg(prop))) }
+  else { theory_prop_end(p_advance_nl(p0), [prop, ...acc], name, t) }
 }
 
-fn parse_theory_prop_end(p1: Parser, acc: [String]) : PProps / Console {
-  if p_at(p1, TkComma) {
-    parse_theory_props(p_advance(p1), acc)
-  } else if p_at(p1, TkRbrace) {
-    PProps { p: p_advance(p1), r: Some(list_reverse(acc)) }
-  } else {
-    PProps { p: p_error_here(p1, "expected `,` or `}` in a `theory` property list"), r: None }
-  }
+fn theory_prop_end(p: Parser, acc: [String], name: String, t: Token) : PDecl / Console {
+  if p_at(p, TkComma) { theory_props(p_advance(p), acc, name, t) }
+  else if p_at(p, TkRbrace) { ok_d(p_advance(p), DTheory(name, list_reverse(acc), t.line, t.col, None)) }
+  else { err_d(p_error_here(p, "expected `,` or `}` in a `theory` property list")) }
 }
 
-#[doc("""
-`protocol P { op_decls }`. Each op_decl is `name(params) :
-ReturnType`, body-less, mirroring effect-op shape. The first param
-may use `Self` as its type to indicate the dispatch site; the
-resolver / typer treats `Self` as a fresh type variable.
-""")]
+type ProtoHead = { at: Parser, name: String, is_pub: Bool, tparams: [TBinder], law: String, t: Token }
+
+#[doc("Parses `protocol P[T] : Law { op(params) : Ret ... }`; the first parameter may be typed `Self`.")]
 pub fn parse_protocol_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
   let id = p_peek(p)
-  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
-    err_d(p_error(p, id, "expected an uppercase protocol name"))
-  } else {
-    let p1 = p_advance(p)
-    let proto_tps_r =
-      if p_at(p1, TkLbracket) {
-        parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
-      } else {
-        PTParams { p: p1, r: Some([]) }
-      }
-    match proto_tps_r.r {
-      None -> err_d(proto_tps_r.p)
-      Some(proto_tparams) -> parse_protocol_theory(proto_tps_r.p, p, is_pub, t, tok_source(p.src, id), proto_tparams)
+  if not is_upper_name(p, id) { err_d(p_error(p, id, "expected an uppercase protocol name")) }
+  else {
+    let tps = opt_type_params(p_advance(p))
+    match tps.r {
+      None -> err_d(tps.p)
+      Some(tparams) -> protocol_law(tps.p, ProtoHead { at: p, name: tok_source(p.src, id), is_pub: is_pub, tparams: tparams, law: "", t: t })
     }
   }
 }
 
-fn parse_protocol_theory(p: Parser, p0: Parser, is_pub: Bool, t: Token, name: String,
-                         proto_tparams: [TBinder]) : PDecl / Console {
-  let thy_r = parse_optional_proto_theory(p)
-  match thy_r.r {
-    None -> err_d(thy_r.p)
-    Some(thy) -> {
-      let p1n = p_skip_newlines(thy_r.p)
-      if not p_at(p1n, TkLbrace) {
-        err_d(p_error_here(p1n, "expected `{` to start protocol body"))
-      } else {
-        let ops_r = parse_protocol_ops(p_skip_newlines(p_advance(p1n)), [])
-        match ops_r.r {
-          None -> err_d(ops_r.p)
-          Some(ops) -> {
-            let proto = DProtocol(is_pub, p_sym(p0, NCProtocol, name), proto_tparams, ops, t.line, t.col, None)
-            let rows = [p_ent(p0, NCProtocol, name, is_pub)]
-            if thy == "" { ok_dn(ops_r.p, proto, rows) }
-            else { ok_dn(ops_r.p, DProtoLaws(thy, proto, t.line, t.col, None), rows) }
-          }
-        }
-      }
-    }
-  }
-}
-
-type PProtoTheory = { p: Parser, r: Option[String] }
-
-# A `: <Theory>` clause after the protocol tparams. Returns the theory
-# name, or `""` when absent. Rejects an unknown theory (the catalog is
-# closed).
-fn parse_optional_proto_theory(p: Parser) : PProtoTheory / Console {
+# `: Law` after the type parameters; an unknown law is rejected (the catalog is closed).
+fn protocol_law(p: Parser, h: ProtoHead) : PDecl / Console {
   let pn = p_skip_newlines(p)
-  if p_at(pn, TkColon) {
-    let p1 = p_skip_newlines(p_advance(pn))
-    let th = p_peek(p1)
-    if not tk_is(th.kind, TkIdent) or not is_upper_ident(p1.src, th) {
-      PProtoTheory { p: p_error_here(p1, "expected a protocol law after `:`"), r: None }
-    } else {
-      let thy = tok_source(p1.src, th)
-      if not is_protocol_law(thy) {
-        PProtoTheory { p: p_error(p1, th, unknown_protocol_law_msg(thy)), r: None }
-      } else {
-        PProtoTheory { p: p_advance(p1), r: Some(thy) }
-      }
-    }
-  } else {
-    PProtoTheory { p: p, r: Some("") }
-  }
-}
-
-# After an impl body, an optional `axiom <Law>` clause asserts the impl
-# obeys the named law set, exempting it from the autogenerated
-# law-checks (the audited escape). `axiom` is the existing keyword.
-fn parse_trailing_axiom(p: Parser, impl_decl: Decl, rows: [NEnt], t: Token) : PDecl / Console {
-  let pn = p_skip_newlines(p)
-  # `axiom` also starts a top-level body-less-decl (`axiom f(x): T`), so a
-  # trailing impl clause is claimed ONLY when `axiom` is followed by a known
-  # law name. Otherwise the `axiom` stays unconsumed for the decl parser.
-  if p_at(pn, TkAxiom) and trailing_axiom_is_law(p_advance(pn)) {
-    let p1 = p_skip_newlines(p_advance(pn))
-    let th = p_peek(p1)
-    let thy = tok_source(p1.src, th)
-    ok_dn(p_advance(p1), DImplAxiom(thy, impl_decl, t.line, t.col, None), rows)
-  } else {
-    ok_dn(p, impl_decl, rows)
-  }
-}
-
-# True iff the token after `axiom` (skipping newlines) is a known law
-# name — the discriminant between the trailing impl clause and a top-level
-# `axiom <fn>` declaration. Consumes nothing.
-fn trailing_axiom_is_law(after_axiom: Parser) : Bool {
-  let p1 = p_skip_newlines(after_axiom)
+  let p1 = p_advance_nl(pn)
   let th = p_peek(p1)
-  if not tk_is(th.kind, TkIdent) or not is_upper_ident(p1.src, th) { false }
-  else { is_protocol_law(tok_source(p1.src, th)) }
+  let law = tok_source(p1.src, th)
+  if not p_at(pn, TkColon) { protocol_body(pn, h) }
+  else if not is_upper_name(p1, th) { err_d(p_error_here(p1, "expected a protocol law after `:`")) }
+  else if not is_protocol_law(law) { err_d(p_error(p1, th, unknown_protocol_law_msg(law))) }
+  else { protocol_body(p_skip_newlines(p_advance(p1)), ProtoHead { ...h, law: law }) }
 }
 
-type PProtoOps = { p: Parser, r: Option[[ProtoOp]] }
+fn protocol_body(p: Parser, h: ProtoHead) : PDecl / Console {
+  let pb = p_eat(p, TkLbrace, "expected `{` to start protocol body")
+  if p_failed(pb) { err_d(pb) } else { protocol_ops(p_advance_nl(p), [], h) }
+}
 
-fn parse_protocol_ops(p: Parser, acc: [ProtoOp]) : PProtoOps / Console {
+fn protocol_ops(p: Parser, acc: [ProtoOp], h: ProtoHead) : PDecl / Console {
   let p0 = p_skip_newlines(p)
-  if p_at(p0, TkRbrace) {
-    PProtoOps { p: p_advance(p0), r: Some(list_reverse(acc)) }
-  } else {
-    let id = p_peek(p0)
-    if not tk_is(id.kind, TkIdent) {
-      PProtoOps { p: p_error(p0, id, "expected operation name"), r: None }
-    } else {
-      parse_protocol_op(p0, id, acc)
+  let id = p_peek(p0)
+  if p_at(p0, TkRbrace) { protocol_done(p_advance(p0), list_reverse(acc), h) }
+  else if not tk_is(id.kind, TkIdent) { err_d(p_error(p0, id, "expected operation name")) }
+  else {
+    let tps = opt_type_params(p_advance(p0))
+    match tps.r {
+      None -> err_d(tps.p)
+      Some(op_tparams) -> protocol_op_params(tps.p, id, op_tparams, acc, h)
     }
   }
 }
 
-fn parse_protocol_op(p0: Parser, id: Token, acc: [ProtoOp]) : PProtoOps / Console {
-  let p1 = p_advance(p0)
-  let op_tparams_r =
-    if p_at(p1, TkLbracket) {
-      parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
-    } else {
-      PTParams { p: p1, r: Some([]) }
-    }
-  match op_tparams_r.r {
-    None -> PProtoOps { p: op_tparams_r.p, r: None }
-    Some(op_tparams) -> parse_protocol_op_sig(op_tparams_r.p, id, op_tparams, acc)
-  }
+fn protocol_done(p: Parser, ops: [ProtoOp], h: ProtoHead) : PDecl {
+  let proto = DProtocol(h.is_pub, p_sym(h.at, NCProtocol, h.name), h.tparams, ops, h.t.line, h.t.col, None)
+  let rows = [p_ent(h.at, NCProtocol, h.name, h.is_pub)]
+  if h.law == "" { ok_dn(p, proto, rows) }
+  else { ok_dn(p, DProtoLaws(h.law, proto, h.t.line, h.t.col, None), rows) }
 }
 
-fn parse_protocol_op_sig(pp: Parser, id: Token, op_tparams: [TBinder], acc: [ProtoOp]) : PProtoOps / Console {
-  if not p_at(pp, TkLparen) {
-    PProtoOps { p: p_error_here(pp, "expected `(` after operation name"), r: None }
-  } else {
-    let params_r = parse_fn_params(p_skip_newlines(p_advance(pp)), [])
-    match params_r.r {
-      None -> PProtoOps { p: params_r.p, r: None }
-      Some(params) -> parse_protocol_op_ret(p_skip_newlines(params_r.p), id, op_tparams, params, acc)
+fn protocol_op_params(p: Parser, id: Token, op_tparams: [TBinder], acc: [ProtoOp], h: ProtoHead) : PDecl / Console {
+  let pa = p_eat(p, TkLparen, "expected `(` after operation name")
+  if p_failed(pa) { err_d(pa) }
+  else {
+    let params = parse_fn_params(p_skip_newlines(pa), [])
+    match params.r {
+      None -> err_d(params.p)
+      Some(ps) -> protocol_op_ret(p_skip_newlines(params.p), id, op_tparams, ps, acc, h)
     }
   }
 }
 
-fn parse_protocol_op_ret(p3: Parser, id: Token, op_tparams: [TBinder], params: [Param],
-                         acc: [ProtoOp]) : PProtoOps / Console {
-  if not p_at(p3, TkColon) {
-    PProtoOps { p: p_error_here(p3, "expected `:` before operation return type"), r: None }
-  } else {
-    let rt = parse_type(p_advance(p3))
+fn protocol_op_ret(p: Parser, id: Token, op_tparams: [TBinder], params: [Param], acc: [ProtoOp], h: ProtoHead) : PDecl / Console {
+  let pc = p_eat(p, TkColon, "expected `:` before operation return type")
+  if p_failed(pc) { err_d(pc) }
+  else {
+    let rt = parse_type(pc)
     match rt.r {
-      None -> PProtoOps { p: rt.p, r: None }
-      Some(ty) -> {
-        let op = POp(tok_source(p3.src, id), op_tparams, params, ty, id.line, id.col)
-        parse_protocol_ops(rt.p, [op, ...acc])
-      }
+      None -> err_d(rt.p)
+      Some(ty) -> protocol_ops(rt.p, [POp(tok_source(p.src, id), op_tparams, params, ty, id.line, id.col), ...acc], h)
     }
   }
 }
 
-#[doc("""
-`impl P for T { fn op(args) = body ... }`. Each method is a
-regular DFn whose name matches a protocol op name. The body
-inherits the parser's full feature set (any expression form).
-
-An optional impl-level tparam list `[u: Measure, ...]` may follow
-`impl` (mirrors the `fn[T1, T2]` shape). The bound names
-are prepended to each method's own tparams so the typer sees them
-as ordinary fn tparams in scope inside parameter and body types
-(e.g. `impl[u: Measure] Show for Real<u> { fn show(x: Real<u>) ... }`).
-""")]
+#[doc("Parses `impl[u: Measure] P[A] for T { fn op(args) = body ... }`; an impl tparam list is prepended to each method's own.")]
 pub fn parse_impl_decl(p: Parser, t: Token) : PDecl / Console {
-  let imp_tps_r =
-    if p_at(p, TkLbracket) {
-      parse_impl_type_params_loop(p_skip_newlines(p_advance(p)), [])
-    } else {
-      PTParams { p: p, r: Some([]) }
-    }
-  match imp_tps_r.r {
-    None -> err_d(imp_tps_r.p)
-    Some(impl_tparams) -> parse_impl_head(p_skip_newlines(imp_tps_r.p), p, t, impl_tparams)
+  let tps =
+    if p_at(p, TkLbracket) { parse_impl_type_params_loop(p_advance_nl(p), []) }
+    else { PTParams { p: p, r: Some([]) } }
+  match tps.r {
+    None -> err_d(tps.p)
+    Some(tparams) -> impl_head(p_skip_newlines(tps.p), p, t, tparams)
   }
 }
 
-fn parse_impl_head(p_after_tps: Parser, p: Parser, t: Token, impl_tparams: [TBinder]) : PDecl / Console {
-  let id = p_peek(p_after_tps)
-  if not at_type_head(p_after_tps, id) {
-    err_d(p_error(p_after_tps, id, "expected an uppercase protocol name after `impl`"))
-  } else {
-    let pq = parse_qualified_head_name(p_after_tps, id)
-    let p1 = pq.p
-    let pa_args_r =
-      if p_at(p1, TkLbracket) {
-        parse_type_list(p_advance(p1), TkRbracket, "expected `,` or `]` in impl protocol arguments", [])
-      } else {
-        PTypes { p: p1, r: Some([]) }
-      }
-    match pa_args_r.r {
-      None -> err_d(pa_args_r.p)
-      Some(proto_args) -> parse_impl_for(p_skip_newlines(pa_args_r.p), p, t, impl_tparams, pq.dref, proto_args)
+type ImplHead = { at: Parser, t: Token, tparams: [TBinder], pname: DeclRef, args: [TypeExpr], target: TypeExpr }
+
+fn impl_head(p: Parser, at: Parser, t: Token, tparams: [TBinder]) : PDecl / Console {
+  let id = p_peek(p)
+  if not at_type_head(p, id) { err_d(p_error(p, id, "expected an uppercase protocol name after `impl`")) }
+  else {
+    let pq = parse_qualified_head_name(p, id)
+    let args =
+      if p_at(pq.p, TkLbracket) { parse_type_list(p_advance(pq.p), TkRbracket, "expected `,` or `]` in impl protocol arguments", []) }
+      else { PTypes { p: pq.p, r: Some([]) } }
+    match args.r {
+      None -> err_d(args.p)
+      Some(proto_args) -> impl_for(p_skip_newlines(args.p), at, t, tparams, pq.dref, proto_args)
     }
   }
 }
 
-fn parse_impl_for(p1n: Parser, p: Parser, t: Token, impl_tparams: [TBinder], pname: DeclRef,
-                  proto_args: [TypeExpr]) : PDecl / Console {
-  if not p_at(p1n, TkFor) {
-    err_d(p_error_here(p1n, "expected `for` after protocol name in `impl`"))
-  } else {
-    let target_r = parse_type(p_skip_newlines(p_advance(p1n)))
-    match target_r.r {
-      None -> err_d(target_r.p)
-      Some(target_ty) -> parse_impl_body(p_skip_newlines(target_r.p), p, t, impl_tparams, pname, proto_args, target_ty)
+fn impl_for(p: Parser, at: Parser, t: Token, tparams: [TBinder], pname: DeclRef, args: [TypeExpr]) : PDecl / Console {
+  let pf = p_eat(p, TkFor, "expected `for` after protocol name in `impl`")
+  if p_failed(pf) { err_d(pf) }
+  else {
+    let target = parse_type(p_skip_newlines(pf))
+    match target.r {
+      None -> err_d(target.p)
+      Some(ty) -> impl_body(p_skip_newlines(target.p), ImplHead { at: at, t: t, tparams: tparams, pname: pname, args: args, target: ty })
     }
   }
 }
 
-fn parse_impl_body(p3: Parser, p: Parser, t: Token, impl_tparams: [TBinder], pname: DeclRef,
-                   proto_args: [TypeExpr], target_ty: TypeExpr) : PDecl / Console {
-  if not p_at(p3, TkLbrace) {
-    err_d(p_error_here(p3, "expected `{` to start impl body"))
-  } else {
-    let methods_r = parse_impl_methods(p_skip_newlines(p_advance(p3)), impl_scope(p.home, t.line, t.col), [], [])
-    match methods_r.r {
-      None -> err_d(methods_r.p)
-      Some(ms) -> {
-        let impl_d = DImpl(pname, proto_args, target_ty, ms, t.line, t.col, impl_tparams, sym_none())
-        parse_trailing_axiom(methods_r.p, impl_d, methods_r.names, t)
-      }
-    }
-  }
+fn impl_body(p: Parser, h: ImplHead) : PDecl / Console {
+  let pb = p_eat(p, TkLbrace, "expected `{` to start impl body")
+  if p_failed(pb) { err_d(pb) } else { impl_methods(p_skip_newlines(pb), impl_scope(h.at.home, h.t.line, h.t.col), [], [], h) }
 }
 
-type PImplMethods = { p: Parser, r: Option[[Decl]], names: [NEnt] }
-
-# `scope` is the impl block's: a method is declared in it, not in the
-# module's function namespace, so two impls' `show` are two symbols.
-fn parse_impl_methods(p: Parser, scope: String, acc: [Decl], racc: [NEnt]) : PImplMethods / Console {
-
+# `scope` is the impl block's: a method is declared in it, not in the module's function
+# namespace, so two impls' `show` are two symbols.
+fn impl_methods(p: Parser, scope: String, acc: [Decl], racc: [NEnt], h: ImplHead) : PDecl / Console {
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    PImplMethods { p: p_advance(p0), r: Some(list_reverse(acc)), names: list_reverse(racc) }
+    let impl_d = DImpl(h.pname, h.args, h.target, list_reverse(acc), h.t.line, h.t.col, h.tparams, sym_none())
+    trailing_axiom(p_advance(p0), impl_d, list_reverse(racc), h.t)
+  } else if not p_at(p0, TkFn) {
+    err_d(p_error_here(p0, "expected `fn` to start an impl method"))
   } else {
-    if not p_at(p0, TkFn) {
-      PImplMethods { p: p_error_here(p0, "expected `fn` to start an impl method"), r: None, names: [] }
-    } else {
-      let fn_tok = p_peek(p0)
-      let p1 = p_advance(p0)
-      let dr = parse_fn_decl(p1, false, fn_tok)
-      match dr.r {
-        None -> PImplMethods { p: dr.p, r: None, names: [] }
-        Some(d) -> match dr.names {
-          [NEnt(_, op, _, _, _)] ->
-            parse_impl_methods(dr.p, scope, [impl_method(d, op, scope), ...acc], [method_ent(op, scope), ...racc])
-          _ -> panic("parse: an impl method without its entry")
-        }
-      }
+    let dr = parse_fn_decl(p_advance(p0), false, p_peek(p0))
+    match dr.r {
+      None -> err_d(dr.p)
+      Some(d) -> impl_method_next(dr, d, scope, acc, racc, h)
     }
   }
 }
 
-# The function `d`, read as a module's, re-identified as the method `op`
-# of the impl block whose scope is `scope`.
+fn impl_method_next(dr: PDecl, d: Decl, scope: String, acc: [Decl], racc: [NEnt], h: ImplHead) : PDecl / Console =
+  match dr.names {
+    [NEnt(_, op, _, _, _)] -> impl_methods(dr.p, scope, [impl_method(d, op, scope), ...acc], [method_ent(op, scope), ...racc], h)
+    _ -> panic("parse: an impl method without its entry")
+  }
+
+# The function `d`, read as a module's, re-identified as the method `op` of the impl block `scope`.
 fn impl_method(d: Decl, op: String, scope: String) : Decl = match d {
   DFn(is_pub, _, tps, ps, ret, row, body, l, c, mo) ->
     DFn(is_pub, fnid_decl(method_sym(op, scope)), tps, ps, ret, row, body, l, c, mo)
   _ -> d
 }
 
-#[doc("True when `d` is a `pub fn`, seeing through a `#[doc(...)]` wrapper.")]
-pub fn constructor_wraps_fn(d: Decl) : Bool {
-  match d {
-    DFn(is_pub, _, _, _, _, _, _, _, _, _) -> is_pub
-    DDoc(_, _, inner, _, _)                -> constructor_wraps_fn(inner)
-    DAttr(_, inner, _, _)                  -> constructor_wraps_fn(inner)
-    _                                      -> false
-  }
-}
-
-#[doc("""
-Wrap the `pub fn` in `DConstructor`, hoisting any `#[doc(...)]` wrapper
-to the outside so `doc_strip_collect` still lifts it and every walker
-sees `DConstructor(DFn)`, not `DConstructor(DDoc(DFn))`.
-""")]
-pub fn constructor_wrap(d: Decl, l: Int, c: Int) : Decl {
-  match d {
-    DDoc(raw, text, inner, dl, dc) -> DDoc(raw, text, constructor_wrap(inner, l, c), dl, dc)
-    DAttr(raw, inner, al, ac)      -> DAttr(raw, constructor_wrap(inner, l, c), al, ac)
-    _                              -> DConstructor(d, l, c)
+# `axiom` also starts a top-level declaration, so a trailing `axiom <Law>` is claimed only
+# when a known law name follows; otherwise `axiom` stays for the declaration parser.
+fn trailing_axiom(p: Parser, impl_d: Decl, rows: [NEnt], t: Token) : PDecl / Console {
+  let pn = p_skip_newlines(p)
+  let p1 = p_advance_nl(pn)
+  let th = p_peek(p1)
+  if p_at(pn, TkAxiom) and is_upper_name(p1, th) and is_protocol_law(tok_source(p1.src, th)) {
+    ok_dn(p_advance(p1), DImplAxiom(tok_source(p1.src, th), impl_d, t.line, t.col, None), rows)
+  } else {
+    ok_dn(p, impl_d, rows)
   }
 }
