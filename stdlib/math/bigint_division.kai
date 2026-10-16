@@ -1,0 +1,182 @@
+#[doc("""
+Magnitude division: Knuth's schoolbook algorithm for short quotients and
+the recursive Burnikel–Ziegler scheme above a limb threshold, which
+reduces long division to Karatsuba products.
+""")]
+
+import math.bits
+import loop
+import math.bigint_limbs.{sig_len, mag_cmp, mag_add, mag_sub, limb_lo, limb_hi, limb_radix}
+import math.bigint_shift.{mag_slice, mag_add_shifted, mag_shl_bits, mag_shr_bits, limb_norm_shift}
+import math.bigint_karatsuba.{mag_mul_fast}
+
+fn bz_threshold() : Int = 16
+
+fn one_mag() : Array[Int] = array_make(1, 1)
+
+fn zero_mag() : Array[Int] = array_make(1, 0)
+
+# ---- Schoolbook (Knuth D, one quotient limb per step) -------------
+
+# Quotient digit estimate from the top two remainder limbs and the top
+# divisor limb (>= 2^31). Never below the true digit and at most two
+# above it. The numerator is halved first so it stays within `Int`.
+fn qhat_estimate(u1: Int, u0: Int, v1: Int) : Int =
+  if u1 >= v1 { limb_radix() - 1 }
+  else {
+    let n1 = bit_or(bit_shl(u1, 31), bit_ushr(u0, 1))
+    let qa = n1 / v1
+    let ra = n1 - qa * v1
+    2 * qa + (2 * ra + bit_and(u0, 1)) / v1
+  }
+
+# `r * 2^32 + limb` as `nb + 1` limbs, for a remainder `r` below the divisor.
+fn shift_in(r: Array[Int], limb: Int, nb: Int) : Array[Int] = {
+  let cur = array_make(nb + 1, 0)
+  let nr = if array_length(r) < nb { array_length(r) } else { nb }
+  cur[0] := limb
+  var i := 0
+  while { i < nr } {
+    cur[i + 1] := r[i]
+    i := i + 1
+  }
+  cur
+}
+
+# `cur - q * b` over `nb + 1` limbs; the top limb is negative when `q` overshoots.
+fn mulsub(cur: Array[Int], b: Array[Int], nb: Int, q: Int) : Array[Int] = {
+  let out = array_make(nb + 1, 0)
+  let qlo = bit_and(q, 65535)
+  let qhi = bit_ushr(q, 16)
+  var ylo := 0
+  var yhi := 0
+  var mid := 0
+  var lo := 0
+  var t := 0
+  var d := 0
+  var mc := 0
+  var borrow := 0
+  var i := 0
+  while { i < nb } {
+    ylo := bit_and(b[i], 65535)
+    yhi := bit_ushr(b[i], 16)
+    mid := qhi * ylo + qlo * yhi
+    lo := qlo * ylo + bit_and(mid, 65535) * 65536
+    t := bit_and(lo, 4294967295) + mc
+    mc := qhi * yhi + bit_ushr(mid, 16) + bit_ushr(lo, 32) + bit_ushr(t, 32)
+    d := cur[i] - bit_and(t, 4294967295) - borrow
+    if d < 0 { out[i] := d + 4294967296; borrow := 1 }
+    else { out[i] := d; borrow := 0 }
+    i := i + 1
+  }
+  out[nb] := cur[nb] - mc - borrow
+  out
+}
+
+# `cur + b` over `nb + 1` limbs, dropping the carry out of the top.
+fn add_back(cur: Array[Int], b: Array[Int], nb: Int) : Array[Int] = {
+  let out = array_make(nb + 1, 0)
+  var carry := 0
+  var i := 0
+  while { i < nb } {
+    let s = cur[i] + b[i] + carry
+    out[i] := limb_lo(s)
+    carry := limb_hi(s)
+    i := i + 1
+  }
+  out[nb] := cur[nb] + carry
+  out
+}
+
+fn fix_negative(q: Int, cur: Array[Int], b: Array[Int], nb: Int) : Pair[Int, Array[Int]] =
+  if cur[nb] >= 0 { Pair { fst: q, snd: cur } }
+  else { fix_negative(q - 1, add_back(cur, b, nb), b, nb) }
+
+fn div_step(r: Array[Int], limb: Int, b: Array[Int], nb: Int) : Pair[Int, Array[Int]] = {
+  let cur = shift_in(r, limb, nb)
+  let q = qhat_estimate(cur[nb], cur[nb - 1], b[nb - 1])
+  fix_negative(q, mulsub(cur, b, nb, q), b, nb)
+}
+
+# Quotient and remainder of `a` by a divisor `b` whose top bit is set.
+fn school_divmod(a: Array[Int], b: Array[Int]) : Pair[Array[Int], Array[Int]] = {
+  let na = sig_len(a)
+  let nb = sig_len(b)
+  let q = array_make(if na <= 0 { 1 } else { na }, 0)
+  var r := zero_mag()
+  var i := na - 1
+  while { i >= 0 } {
+    let s = div_step(r, a[i], b, nb)
+    q[i] := s.fst
+    r := s.snd
+    i := i - 1
+  }
+  Pair { fst: q, snd: r }
+}
+
+# ---- Recursive (Burnikel–Ziegler) ---------------------------------
+
+# Lowers `q` and raises `u` by `d` until `u >= t`.
+fn fix_down(q: Array[Int], u: Array[Int], t: Array[Int], d: Array[Int]) : Pair[Array[Int], Array[Int]] =
+  if mag_cmp(u, t) >= 0 { Pair { fst: q, snd: u } }
+  else { fix_down(mag_sub(q, one_mag()), mag_add(u, d), t, d) }
+
+# Divides `a` by the normalized `b` for a quotient of about `m` limbs,
+# with `b` no shorter than `m`.
+fn bz_rec(a: Array[Int], b: Array[Int], m: Int) : Pair[Array[Int], Array[Int]] =
+  if m < bz_threshold() { school_divmod(a, b) }
+  else { bz_split(a, b, m, m / 2) }
+
+fn bz_split(a: Array[Int], b: Array[Int], m: Int, k: Int) : Pair[Array[Int], Array[Int]] = {
+  let nb = sig_len(b)
+  let b1 = mag_slice(b, k, nb)
+  let b0 = mag_slice(b, 0, k)
+  let hi = bz_rec(mag_slice(a, 2 * k, sig_len(a)), b1, m - k)
+  let u = mag_add_shifted(mag_slice(a, 0, 2 * k), hi.snd, 2 * k)
+  let t = mag_add_shifted(zero_mag(), mag_mul_fast(hi.fst, b0), k)
+  let top = fix_down(hi.fst, u, t, mag_add_shifted(zero_mag(), b, k))
+  let a1 = mag_sub(top.snd, t)
+  let lo = bz_rec(mag_slice(a1, k, sig_len(a1)), b1, k)
+  let v = mag_add_shifted(mag_slice(a1, 0, k), lo.snd, k)
+  let t0 = mag_mul_fast(lo.fst, b0)
+  let bot = fix_down(lo.fst, v, t0, b)
+  Pair { fst: mag_add_shifted(bot.fst, top.fst, k), snd: mag_sub(bot.snd, t0) }
+}
+
+# Quotient and remainder of `a` by the normalized `b`, in blocks of
+# `b`'s length taken from the top: each block plus the running
+# remainder is a 2n-by-n division.
+fn block_divmod(a: Array[Int], b: Array[Int]) : Pair[Array[Int], Array[Int]] = {
+  let na = sig_len(a)
+  let nb = sig_len(b)
+  let blocks = (na + nb - 1) / nb
+  let q = array_make(blocks * nb + 1, 0)
+  var r := zero_mag()
+  var bi := blocks - 1
+  while { bi >= 0 } {
+    let cur = mag_add_shifted(mag_slice(a, bi * nb, (bi + 1) * nb), r, nb)
+    let s = bz_rec(cur, b, nb)
+    let nq = sig_len(s.fst)
+    var i := 0
+    while { i < nq } {
+      q[bi * nb + i] := s.fst[i]
+      i := i + 1
+    }
+    r := s.snd
+    bi := bi - 1
+  }
+  Pair { fst: q, snd: r }
+}
+
+fn normalized_divmod(a: Array[Int], b: Array[Int]) : Pair[Array[Int], Array[Int]] =
+  if sig_len(b) < bz_threshold() { school_divmod(a, b) }
+  else { block_divmod(a, b) }
+
+#[doc("Quotient and remainder of magnitude `num` by the nonzero magnitude `den`, as `Pair(q, r)`. Both may carry high zero limbs; the caller canonicalizes.")]
+pub fn mag_divmod(num: Array[Int], den: Array[Int]) : Pair[Array[Int], Array[Int]] =
+  if mag_cmp(num, den) < 0 { Pair { fst: zero_mag(), snd: num } }
+  else {
+    let s = limb_norm_shift(den[sig_len(den) - 1])
+    let qr = normalized_divmod(mag_shl_bits(num, s), mag_shl_bits(den, s))
+    Pair { fst: qr.fst, snd: mag_shr_bits(qr.snd, s) }
+  }
