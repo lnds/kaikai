@@ -629,6 +629,9 @@ TIER1_SELFHOSTS ?= 1
 # core it includes, and a test needs its program to run, not to run fast.
 # The daily run sets -O2, so the emitted C still meets the optimiser.
 TIER1_LIGHT_OPT ?= -O0
+# The same holds for every fixture a gate builds through bin/kai: its C
+# compile defaults to this level (KAI_C_OPT) unless the caller already set one.
+tier0 tier1 tier1-shard-%: export KAI_C_OPT ?= 0
 tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES) TIER1_SELFHOSTS=$(TIER1_SELFHOSTS) LIGHT_OPT=$(TIER1_LIGHT_OPT)
 tier1-shard-start = @date +%s > stage2/build/tier1-shard.start
 tier1-shard-wall = @echo "tier1-shard-wall $(1) $$(( $$(date +%s) - $$(cat stage2/build/tier1-shard.start) )) selfhosts=$(TIER1_SELFHOSTS)"
@@ -775,6 +778,7 @@ test-kai-cli: kaic2
 	@tests/build_memo.sh
 	@tests/path_specs.sh
 	@tests/cc_target_link.sh
+	@tests/c_opt.sh
 	@tests/no_llvm_probe.sh
 
 # Operand evaluation order under gcc on x86_64, which evaluates call
