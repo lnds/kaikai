@@ -149,6 +149,8 @@ fn main() : Unit / Stdout = {
 | `vec.set(v, i, x)`     | `(Vec[a], Int, a) : Vec[a]`           | O(1) unique / O(n) shared |
 | `vec.push(v, x)`       | `(Vec[a], a) : Vec[a]`                | amortised O(1) unique / O(n) shared |
 | `vec.map(v, f)`        | `(Vec[a], (a) -> b / e) : Vec[b] / e` | O(n) |
+| `vec.flat_map(v, f)`   | `(Vec[a], (a) -> Vec[b] / e) : Vec[b] / e` | O(n + output) |
+| `vec.filter(v, p)`     | `(Vec[a], (a) -> Bool / e) : Vec[a] / e` | O(n) |
 | `vec.foldl(v, z, f)`   | `(Vec[a], r, (r, a) -> r / e) : r / e`| O(n) |
 | `vec.to_list(v)`       | `(Vec[a]) : [a]`                      | O(n) |
 
@@ -168,6 +170,8 @@ fn main() : Unit / Stdout = {
   stays in place, and so does a vector bound from a constructor field
   (`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`).
 - Equality (`==`) is structural, element by element.
+- `|`, `||`, `|?` and `|!` over a `Vec` dispatch to `vec.map`,
+  `vec.flat_map`, `vec.filter` and `vec.each`.
 
 ## See also
 
