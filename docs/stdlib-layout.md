@@ -264,7 +264,7 @@ stdlib/
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
   io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)
   fs/            effect: File
-    file.kai     (shipped via PR #132 — `read_file`, `write_file`, `append`; `exists`, `delete`, `rename` shipped via #345 + #423)
+    file.kai     (shipped via PR #132 — `read_file`, `write_file`, `append` (the `file_append` core builtin: `O_APPEND`, only the new bytes); `exists`, `delete`, `rename` shipped via #345 + #423)
     dir.kai      (stub — runtime primitives planned via #344)
     path.kai     pure helpers — shipped, currently lives at `stdlib/path.kai` (top-level), not `stdlib/fs/path.kai`
   os/            effects: Env, Process

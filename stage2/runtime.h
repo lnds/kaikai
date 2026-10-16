@@ -10604,6 +10604,54 @@ static KaiValue *kai_core_write_file(KaiValue *path, KaiValue *content) {
     return r;
 }
 
+/* Appends `content` through one O_APPEND descriptor, so the kernel
+ * places each write at the end of the file and only the new bytes are
+ * written. Consumes both arguments like write_file. */
+static KaiValue *kai_core_file_append(KaiValue *path, KaiValue *content) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_append: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else if (!content || content->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_append: content is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        int fd = open(pbuf, O_WRONLY | O_APPEND | O_CREAT, 0666);
+        if (fd < 0) {
+            KaiValue *msg = kai_str("file_append: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else {
+            const char *p = content->as.s.bytes;
+            size_t left = content->as.s.len;
+            int ok = 1;
+            while (left > 0) {
+                ssize_t w = write(fd, p, left);
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    ok = 0;
+                    break;
+                }
+                p += w;
+                left -= (size_t) w;
+            }
+            close(fd);
+            if (!ok) {
+                KaiValue *msg = kai_str("file_append: short write");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else {
+                r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = kai_unit()}});
+            }
+        }
+    }
+    if (path)    kai_decref(path);
+    if (content) kai_decref(content);
+    return r;
+}
+
 /* ---------- core: chunked / streaming file io (issue #771) ----------
  *
  * Five primitives behind the new `File` ops `open_read` / `read_chunk` /
@@ -11878,6 +11926,7 @@ static KaiValue *_kai_core_stdlib_path_thunk(KaiValue *s, KaiValue **a, int n)  
 static KaiValue *_kai_core_abspath_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_core_abspath(a[0]); }
 static KaiValue *_kai_core_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_read_file(a[0]); }
 static KaiValue *_kai_core_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_write_file(a[0], a[1]); }
+static KaiValue *_kai_core_file_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_append(a[0], a[1]); }
 static KaiValue *_kai_core_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_exists(a[0]); }
 static KaiValue *_kai_core_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_delete(a[0]); }
 static KaiValue *_kai_core_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_rename(a[0], a[1]); }
