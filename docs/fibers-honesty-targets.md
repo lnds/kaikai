@@ -323,6 +323,16 @@ stack of `KaiNursery` so nested nurseries compose. Coverage:
 `issue_1970_nursery_reraise_handler_nested.kai` (the handler reached in
 the root fiber and one fiber down).
 
+A cancel aimed at a fiber parked in a nursery join or in `n.await` wakes
+it. A join cancels the scope's children and keeps waiting until they have
+all terminated, then re-raises like a failed child; an await leaves the
+child's awaiter chain and unwinds. A fiber that unwinds by cancel with
+scopes still open (a cancel inside the nursery body) cancels and joins
+their children before it terminates, so none outlives it. Coverage:
+`examples/effects/cancel_interrupts_join.kai`. A cancel delivered inside
+`receive_timeout` leaves the waiter chain and the wheel before it
+unwinds (`examples/effects/cancel_in_receive_timeout.kai`).
+
 ### 4. Cancel-handler dispatch on remote cancel (shipped)
 
 A user `with Cancel { raise(_) -> cleanup }` installed in a fiber runs
