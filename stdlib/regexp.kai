@@ -1,8 +1,8 @@
 #[doc("""
 RE2-style regular expressions.
 
-Pure kaikai NFA set-of-states simulation, retried from each start
-position (worst-case quadratic, not RE2's linear guarantee).
+Pure kaikai NFA set-of-states simulation: one pass over the input,
+with a new thread entering at each position until a match is found.
 RE2-compatible subset:
   - Char literals + escapes (\\d \\w \\s . \\n \\t \\\\ \\/).
   - Character classes [abc], [^abc], [a-z], [0-9].
@@ -167,7 +167,7 @@ fn rx_parse_alt_loop(st: RxParseState, acc: [RxAst]) : PRx = {
       let rn = rx_parse_concat(st1)
       match rn.r {
         None -> rn
-        Some(next) -> rx_parse_alt_loop(rn.st, list_append(acc, [next]))
+        Some(next) -> rx_parse_alt_loop(rn.st, [next, ...acc])
       }
     } else { rx_finish_alt(st, acc) }
     None -> rx_finish_alt(st, acc)
@@ -177,7 +177,7 @@ fn rx_parse_alt_loop(st: RxParseState, acc: [RxAst]) : PRx = {
 fn rx_finish_alt(st: RxParseState, alts: [RxAst]) : PRx = match alts {
   []  -> rx_ok(st, RxConcat([]))
   [a] -> rx_ok(st, a)
-  _   -> rx_ok(st, RxAlt(alts))
+  _   -> rx_ok(st, RxAlt(list_reverse(alts)))
 }
 
 # `concat` parses a sequence of atoms until end-of-input, ')' or
@@ -194,7 +194,7 @@ fn rx_parse_concat_loop(st: RxParseState, acc: [RxAst]) : PRx = {
       let r = rx_parse_atom(st)
       match r.r {
         None -> r
-        Some(at) -> rx_parse_concat_loop(r.st, list_append(acc, [at]))
+        Some(at) -> rx_parse_concat_loop(r.st, [at, ...acc])
       }
     }
   }
@@ -203,7 +203,7 @@ fn rx_parse_concat_loop(st: RxParseState, acc: [RxAst]) : PRx = {
 fn rx_finish_concat(st: RxParseState, items: [RxAst]) : PRx = match items {
   []  -> rx_ok(st, RxConcat([]))
   [x] -> rx_ok(st, x)
-  _   -> rx_ok(st, RxConcat(items))
+  _   -> rx_ok(st, RxConcat(list_reverse(items)))
 }
 
 # An atom is a primary expression optionally followed by a single
@@ -338,12 +338,12 @@ fn rx_parse_class_loop(st: RxParseState, acc: [CharRange], neg: Bool) : PRx = {
     None      -> rx_err(st, "unterminated character class")
     Some(']') -> if list.is_empty(acc) {
       rx_err(st, "empty character class")
-    } else { rx_ok(rx_advance(st), RxClass(acc, neg)) }
+    } else { rx_ok(rx_advance(st), RxClass(list_reverse(acc), neg)) }
     Some(c)   -> {
       let r = rx_parse_class_atom(st, c)
       match r.r_range {
         None -> rx_err(r.st, "malformed character class")
-        Some(rng) -> rx_parse_class_loop(r.st, list_append(acc, [rng]), neg)
+        Some(rng) -> rx_parse_class_loop(r.st, [rng, ...acc], neg)
       }
     }
   }
@@ -530,11 +530,12 @@ pub type NfaState = { id: Int, transitions: [NfaTransition], accept: Bool }
 pub type Nfa = { states: [NfaState], start: Int, num_groups: Int }
 
 #[doc("""
-Builder threads the in-progress state list and a fresh-id counter
-through compilation. `num_groups` tracks the highest capture-group
-id seen (so the simulator allocates that many position slots).
+Builder threads the transitions added so far (newest first), a
+fresh-id counter and the accept state through compilation.
+`num_groups` tracks the highest capture-group id seen (so the
+simulator allocates that many position slots).
 """)]
-pub type NfaBuilder = { states: [NfaState], next_id: Int, num_groups: Int }
+pub type NfaBuilder = { edges: [Pair[Int, NfaTransition]], next_id: Int, num_groups: Int, accept: Int }
 
 #[doc("""
 A compiled fragment: the entry state (where matching starts) and
@@ -543,79 +544,34 @@ the accept state (whose outgoing ε wires to the next fragment).
 pub type NfaFrag = NF(Int, Int)
 #                    ^start ^accept
 
-fn nb_init() : NfaBuilder = NfaBuilder { states: [], next_id: 0, num_groups: 0 }
-
-fn nb_fresh(b: NfaBuilder) : NfaBuilder = {
-  let st = NfaState { id: b.next_id, transitions: [], accept: false }
-  NfaBuilder {
-    states: list_append(b.states, [st]),
-    next_id: b.next_id + 1,
-    num_groups: b.num_groups
-  }
-}
+fn nb_fresh(b: NfaBuilder) : NfaBuilder = NfaBuilder { ...b, next_id: b.next_id + 1 }
 
 fn nb_last_id(b: NfaBuilder) : Int = b.next_id - 1
 
-# Update the transitions list of state `id` to `trs`. Linear scan;
-# fine for the sizes we deal with (NFA size O(pattern length)).
-fn nb_set_transitions(b: NfaBuilder, id: Int, trs: [NfaTransition]) : NfaBuilder =
-  NfaBuilder {
-    states: nb_replace_state(b.states, id, trs),
-    next_id: b.next_id,
-    num_groups: b.num_groups
+fn nb_add_transition(b: NfaBuilder, id: Int, t: NfaTransition) : NfaBuilder =
+  NfaBuilder { ...b, edges: [Pair { fst: id, snd: t }, ...b.edges] }
+
+# One state per id, each with its transitions in insertion order.
+fn nb_states(b: NfaBuilder) : [NfaState] =
+  nb_collect(b.next_id - 1, nb_fill(b.edges, vec_make(b.next_id, [])), b.accept, [])
+
+# `edges` is newest first, so consing leaves each bucket oldest first.
+fn nb_fill(edges: [Pair[Int, NfaTransition]], buckets: Vec[[NfaTransition]]) : Vec[[NfaTransition]] =
+  match edges {
+    []           -> buckets
+    [e, ...rest] -> nb_fill(rest, vec_set(buckets, e.fst, [e.snd, ...vec_get(buckets, e.fst)]))
   }
 
-fn nb_replace_state(states: [NfaState], id: Int, trs: [NfaTransition]) : [NfaState] =
-  match states {
-    [] -> []
-    [s, ...rest] ->
-      if s.id == id {
-        [NfaState { id: s.id, transitions: trs, accept: s.accept }, ...rest]
-      } else {
-        [s, ...nb_replace_state(rest, id, trs)]
-      }
-  }
-
-# Append a transition to the existing list of state `id`.
-fn nb_add_transition(b: NfaBuilder, id: Int, t: NfaTransition) : NfaBuilder = {
-  let cur = nb_get_transitions(b.states, id)
-  nb_set_transitions(b, id, list_append(cur, [t]))
-}
-
-fn nb_get_transitions(states: [NfaState], id: Int) : [NfaTransition] = match states {
-  []           -> []
-  [s, ...rest] -> if s.id == id { s.transitions } else { nb_get_transitions(rest, id) }
-}
-
-# Mark the state at `id` as accept. Used only on the final accept
-# state of the whole NFA — Thompson fragments don't need accept
-# flags on intermediate states.
-fn nb_mark_accept(b: NfaBuilder, id: Int) : NfaBuilder =
-  NfaBuilder {
-    states: nb_set_accept(b.states, id),
-    next_id: b.next_id,
-    num_groups: b.num_groups
-  }
-
-fn nb_set_accept(states: [NfaState], id: Int) : [NfaState] = match states {
-  [] -> []
-  [s, ...rest] ->
-    if s.id == id {
-      [NfaState { id: s.id, transitions: s.transitions, accept: true }, ...rest]
-    } else {
-      [s, ...nb_set_accept(rest, id)]
-    }
-}
+fn nb_collect(id: Int, buckets: Vec[[NfaTransition]], accept: Int, acc: [NfaState]) : [NfaState] =
+  if id < 0 { acc }
+  else { nb_collect(id - 1, buckets, accept,
+         [NfaState { id: id, transitions: vec_get(buckets, id), accept: id == accept }, ...acc]) }
 
 # Bump the highest-seen capture-group id. Called when compiling
 # RxGroup. The final NFA reports `max + 1` so that group 0 (the
 # whole match) plus all numbered groups have a slot.
 fn nb_record_group(b: NfaBuilder, gid: Int) : NfaBuilder =
-  NfaBuilder {
-    states: b.states,
-    next_id: b.next_id,
-    num_groups: if gid > b.num_groups { gid } else { b.num_groups }
-  }
+  NfaBuilder { ...b, num_groups: if gid > b.num_groups { gid } else { b.num_groups } }
 
 # ---- Compilation ----
 
@@ -625,14 +581,13 @@ of the root fragment becomes the NFA's accept (single-accept by
 construction; matching ends when any path reaches it).
 """)]
 pub fn compile_nfa(ast: RxAst) : Nfa = {
-  let b0 = nb_init()
-  let r = compile_frag(b0, ast)
+  let r = compile_frag(NfaBuilder { edges: [], next_id: 0, num_groups: 0, accept: -1 }, ast)
   match r {
     NB_Frag(b1, frag) -> match frag {
       NF(start, accept) -> {
-        let b2 = nb_mark_accept(b1, accept)
+        let b2 = NfaBuilder { ...b1, accept: accept }
         Nfa {
-          states: b2.states,
+          states: nb_states(b2),
           start: start,
           # +1 because group ids are 1-based; group 0 is the whole match.
           num_groups: b2.num_groups + 1
@@ -991,10 +946,8 @@ fn rx_transition_show(t: NfaTransition) : String = match t {
 # for the whole-match span and is initialised when the seed thread
 # is built.
 #
-# leftmost-longest: try start positions 0, 1, 2, ... in order; for
-# each start, run the simulation and remember the longest accept
-# position. The first start that produces *any* accept wins (left)
-# and we return its longest span.
+# leftmost-longest: the start closest to the left that matches wins,
+# and among its matches the longest.
 
 #[doc("""
 Captured span. `start == -1` means the group has not opened yet
@@ -1007,18 +960,6 @@ pub type Match = { start: Int, end: Int, groups: [Capture] }
 
 # Thread record: which NFA state and the per-thread capture stack.
 type Thread = { state_id: Int, captures: [Capture] }
-
-# Initialise a fresh capture vector with group 0's start anchored at
-# the input position the simulation seeds from. Group ids 1..n-1 are
-# absent until TGroupOpen fills them in.
-fn rx_init_captures(start_pos: Int) : [Capture] =
-  [Capture { group_id: 0, start: start_pos, end: -1 }]
-
-# Update the capture vector with a TGroupOpen at `pos`. If a record
-# for `gid` already exists, replace its start (last open wins for
-# that thread); otherwise append.
-fn rx_capture_open(caps: [Capture], gid: Int, pos: Int) : [Capture] =
-  rx_capture_set(caps, gid, pos, -1, true)
 
 fn rx_capture_close(caps: [Capture], gid: Int, pos: Int) : [Capture] =
   rx_capture_set(caps, gid, -1, pos, false)
@@ -1040,87 +981,92 @@ fn rx_capture_set(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: 
     }
 }
 
-# Close group 0 (the whole-match span) at `pos`. Used right before
-# returning a successful Match so the user always sees the match
-# bounds.
-fn rx_close_match(caps: [Capture], pos: Int) : [Capture] =
-  rx_capture_close(caps, 0, pos)
+# ---- Search ----
 
-# ---- Public entry point ----
+# The input, the NFA and its states indexed by id.
+type RxSim = { nfa: Nfa, tbl: Vec[NfaState], input: String, n: Int }
+
+fn rx_sim(nfa: Nfa, input: String) : RxSim =
+  RxSim { nfa: nfa, tbl: rx_fill_table(nfa.states, vec_make(rx_max_id(nfa.states, 0) + 1, NfaState { id: -1, transitions: [], accept: false })), input: input, n: string_length(input) }
+
+fn rx_max_id(states: [NfaState], best: Int) : Int = match states {
+  []           -> best
+  [s, ...rest] -> rx_max_id(rest, if s.id > best { s.id } else { best })
+}
+
+fn rx_fill_table(states: [NfaState], tbl: Vec[NfaState]) : Vec[NfaState] = match states {
+  []           -> tbl
+  [s, ...rest] -> rx_fill_table(rest, vec_set(tbl, s.id, s))
+}
 
 #[doc("""
 Simulate `nfa` over `input`. Returns Some(Match) at the leftmost
 position with the longest extent, or None if no match exists.
 """)]
-pub fn simulate(nfa: Nfa, input: String) : Option[Match] = {
-  let n = string_length(input)
-  rx_simulate_from(nfa, input, n, 0)
-}
+pub fn simulate(nfa: Nfa, input: String) : Option[Match] = rx_search(rx_sim(nfa, input), 0)
 
-# Try start positions in order until one matches. n is precomputed.
-fn rx_simulate_from(nfa: Nfa, input: String, n: Int, start: Int) : Option[Match] = {
-  if start > n { None }
+# Leftmost-longest match starting at or after `from_pos`, in one pass:
+# a fresh thread enters at every position until some thread accepts, and
+# threads that started later than the best match are dropped. A thread
+# that started earlier keeps running, since it would win if it accepts.
+fn rx_search(sim: RxSim, from_pos: Int) : Option[Match] =
+  if from_pos > sim.n { None }
+  else { rx_search_loop(sim, from_pos, [], None, vec_make(vec_length(sim.tbl), -1)) }
+
+# `stepped` holds the threads already advanced to `pos`, before their
+# ε-closure; `seen` stamps the states the closure at `pos` has reached.
+fn rx_search_loop(sim: RxSim, pos: Int, stepped: [Thread], best: Option[Match],
+                  seen: Vec[Int]) : Option[Match] = {
+  let seed = match best {
+    None    -> [Thread { state_id: sim.nfa.start, captures: [Capture { group_id: 0, start: pos, end: -1 }] }]
+    Some(_) -> []
+  }
+  let old = rx_closure(sim, stepped, [], [], seen, pos)
+  let fresh = rx_closure(sim, seed, [], [], old.seen, pos)
+  let cl = RxClosed { threads: list_append(old.threads, fresh.threads), seen: fresh.seen }
+  let best1 = match rx_pick_accept(sim, cl.threads, pos) {
+    None    -> best
+    Some(h) -> match best {
+      None    -> Some(h)
+      Some(b) -> if h.start <= b.start { Some(h) } else { best }
+    }
+  }
+  let live = match best1 {
+    None    -> cl.threads
+    Some(b) -> rx_started_by(cl.threads, b.start)
+  }
+  let done = match best1 {
+    Some(_) -> list.is_empty(live)
+    None    -> false
+  }
+  if pos >= sim.n or done { best1 }
   else {
-    match rx_simulate_at(nfa, input, n, start) {
-      Some(m) -> Some(m)
-      None    -> rx_simulate_from(nfa, input, n, start + 1)
+    match char_at(sim.input, pos) {
+      None    -> best1
+      Some(c) -> rx_search_loop(sim, pos + 1, rx_step(sim, live, c, []), best1, cl.seen)
     }
   }
 }
 
-# Simulate from a fixed start position. Returns the longest accept
-# position (or None) by stepping the threadset forward.
-fn rx_simulate_at(nfa: Nfa, input: String, n: Int, start: Int) : Option[Match] = {
-  let seed = Thread { state_id: nfa.start, captures: rx_init_captures(start) }
-  let initial = rx_eps_closure(nfa, [seed], input, n, start)
-  # If any thread already in an accept state, the empty match
-  # at `start` is the current best. We keep stepping in case a
-  # longer match exists.
-  let initial_best = rx_pick_accept(nfa, initial, start)
-  rx_simulate_loop(nfa, input, n, start, initial, initial_best)
+fn rx_started_by(threads: [Thread], start: Int) : [Thread] = match threads {
+  []           -> []
+  [t, ...rest] -> if rx_match_start(t.captures) <= start { [t, ...rx_started_by(rest, start)] }
+                  else { rx_started_by(rest, start) }
 }
 
-# Step pos by pos until threadset empties or input ends.
-fn rx_simulate_loop(nfa: Nfa, input: String, n: Int, pos: Int,
-                     threads: [Thread], best: Option[Match]) : Option[Match] = {
-  if pos >= n or list.is_empty(threads) { best }
-  else {
-    match char_at(input, pos) {
-      None    -> best
-      Some(c) -> {
-        let stepped = rx_step(nfa, threads, c)
-        let pos1 = pos + 1
-        let closed = rx_eps_closure(nfa, stepped, input, n, pos1)
-        let new_best = match rx_pick_accept(nfa, closed, pos1) {
-          Some(m) -> Some(m)
-          None    -> best
-        }
-        rx_simulate_loop(nfa, input, n, pos1, closed, new_best)
-      }
-    }
-  }
-}
-
-# If any thread is in an accept state, materialise its capture
-# vector as a Match record (closing group 0 at `end_pos`). Returns
-# None when no thread is at accept.
-fn rx_pick_accept(nfa: Nfa, threads: [Thread], end_pos: Int) : Option[Match] = match threads {
+# The first thread in an accept state, as a Match closed at `end_pos`.
+fn rx_pick_accept(sim: RxSim, threads: [Thread], end_pos: Int) : Option[Match] = match threads {
   []           -> None
   [t, ...rest] ->
-    if rx_state_is_accept(nfa.states, t.state_id) {
-      let caps = rx_close_match(t.captures, end_pos)
+    if vec_get(sim.tbl, t.state_id).accept {
+      let caps = rx_capture_close(t.captures, 0, end_pos)
       Some(Match { start: rx_match_start(caps), end: end_pos, groups: caps })
-    } else { rx_pick_accept(nfa, rest, end_pos) }
+    } else { rx_pick_accept(sim, rest, end_pos) }
 }
 
 fn rx_match_start(caps: [Capture]) : Int = match caps {
   [] -> 0
   [c, ...rest] -> if c.group_id == 0 { c.start } else { rx_match_start(rest) }
-}
-
-fn rx_state_is_accept(states: [NfaState], id: Int) : Bool = match states {
-  [] -> false
-  [s, ...rest] -> if s.id == id { s.accept } else { rx_state_is_accept(rest, id) }
 }
 
 # ---- ε-closure ----
@@ -1135,43 +1081,45 @@ fn rx_state_is_accept(states: [NfaState], id: Int) : Bool = match states {
 # Pike-style. This keeps the threadset bounded by the number of
 # NFA states.
 
-fn rx_eps_closure(nfa: Nfa, seeds: [Thread], input: String, n: Int, pos: Int) : [Thread] = {
-  rx_eps_closure_loop(nfa, seeds, [], input, n, pos)
-}
+type RxClosed = { threads: [Thread], seen: Vec[Int] }
 
-# Worklist algorithm: pop a thread, if its state is not yet in the
-# closure, add it and push its zero-width neighbours. Order
-# preserved so leftmost-priority is naturally the seed order.
-fn rx_eps_closure_loop(nfa: Nfa, work: [Thread], closure: [Thread],
-                        input: String, n: Int, pos: Int) : [Thread] = match work {
-  [] -> closure
+# Breadth-first worklist, the queue being `front` then `back` reversed:
+# pop a thread, if its state is not yet in the closure add it and queue
+# its zero-width neighbours. Order is preserved so leftmost-priority is
+# naturally the seed order. `closure` is newest first.
+fn rx_closure(sim: RxSim, front: [Thread], back: [Thread], closure: [Thread],
+              seen: Vec[Int], pos: Int) : RxClosed = match front {
+  [] -> match back {
+    [] -> RxClosed { threads: list_reverse(closure), seen: seen }
+    _  -> rx_closure(sim, list_reverse(back), [], closure, seen, pos)
+  }
   [t, ...rest] ->
-    if rx_thread_in(closure, t.state_id) {
-      rx_eps_closure_loop(nfa, rest, closure, input, n, pos)
-    } else {
-      let closure1 = list_append(closure, [t])
-      let trs = rx_get_transitions(nfa.states, t.state_id)
-      let new_threads = rx_zero_width_targets(trs, t.captures, input, n, pos)
-      rx_eps_closure_loop(nfa, list_append(rest, new_threads), closure1, input, n, pos)
+    if vec_get(seen, t.state_id) == pos { rx_closure(sim, rest, back, closure, seen, pos) }
+    else {
+      let trs = vec_get(sim.tbl, t.state_id).transitions
+      let next = rx_zero_width_targets(trs, t.captures, sim.n, pos)
+      rx_closure(sim, rest, rx_push_all(next, back), [t, ...closure],
+                 vec_set(seen, t.state_id, pos), pos)
     }
 }
 
-fn rx_thread_in(threads: [Thread], state_id: Int) : Bool = match threads {
-  [] -> false
-  [t, ...rest] -> if t.state_id == state_id { true } else { rx_thread_in(rest, state_id) }
+# Pushes `xs` onto the reversed list `acc`, first element deepest.
+fn rx_push_all(xs: [Thread], acc: [Thread]) : [Thread] = match xs {
+  []           -> acc
+  [x, ...rest] -> rx_push_all(rest, [x, ...acc])
 }
 
 # Collect every zero-width transition's target as a new thread,
 # updating captures appropriately. TAnchor only contributes when the
 # anchor condition holds at `pos`.
 fn rx_zero_width_targets(trs: [NfaTransition], caps: [Capture],
-                          input: String, n: Int, pos: Int) : [Thread] = match trs {
+                          n: Int, pos: Int) : [Thread] = match trs {
   [] -> []
   [t, ...rest] -> {
     let mine = match t {
       TEpsilon(dst) -> [Thread { state_id: dst, captures: caps }]
       TGroupOpen(gid, dst) ->
-        [Thread { state_id: dst, captures: rx_capture_open(caps, gid, pos) }]
+        [Thread { state_id: dst, captures: rx_capture_set(caps, gid, pos, -1, true) }]
       TGroupClose(gid, dst) ->
         [Thread { state_id: dst, captures: rx_capture_close(caps, gid, pos) }]
       TAnchor(an, dst) -> match an {
@@ -1180,27 +1128,21 @@ fn rx_zero_width_targets(trs: [NfaTransition], caps: [Capture],
       }
       _ -> []
     }
-    list_append(mine, rx_zero_width_targets(rest, caps, input, n, pos))
+    list_append(mine, rx_zero_width_targets(rest, caps, n, pos))
   }
-}
-
-fn rx_get_transitions(states: [NfaState], id: Int) : [NfaTransition] = match states {
-  [] -> []
-  [s, ...rest] -> if s.id == id { s.transitions } else { rx_get_transitions(rest, id) }
 }
 
 # ---- Step ----
 #
 # For each thread, try every consuming transition (TChar / TClass /
-# TAny) against the current character. Accumulate the targets. Order
-# preserved so the next ε-closure dedup keeps leftmost priority.
+# TAny) against the current character. Order is preserved so the next
+# ε-closure dedup keeps leftmost priority.
 
-fn rx_step(nfa: Nfa, threads: [Thread], c: Char) : [Thread] = match threads {
-  [] -> []
+fn rx_step(sim: RxSim, threads: [Thread], c: Char, acc: [Thread]) : [Thread] = match threads {
+  [] -> list_reverse(acc)
   [t, ...rest] -> {
-    let trs = rx_get_transitions(nfa.states, t.state_id)
-    let here = rx_step_thread(trs, t.captures, c)
-    list_append(here, rx_step(nfa, rest, c))
+    let trs = vec_get(sim.tbl, t.state_id).transitions
+    rx_step(sim, rest, c, rx_push_all(rx_step_thread(trs, t.captures, c), acc))
   }
 }
 
@@ -1268,16 +1210,16 @@ scan cursor by one character so we don't loop forever on
 patterns like `a*` against `bbb`.
 """)]
 pub fn find_all(re: Regex, s: String) : [Match] = match re {
-  R(nfa) -> rx_find_all_loop(nfa, s, 0, string_length(s), [])
+  R(nfa) -> rx_find_all_loop(rx_sim(nfa, s), 0, [])
 }
 
-fn rx_find_all_loop(nfa: Nfa, s: String, from_pos: Int, n: Int, acc: [Match]) : [Match] = {
-  if from_pos > n { acc }
-  else { match rx_simulate_from(nfa, s, n, from_pos) {
-    None -> acc
+fn rx_find_all_loop(sim: RxSim, from_pos: Int, acc: [Match]) : [Match] = {
+  if from_pos > sim.n { list_reverse(acc) }
+  else { match rx_search(sim, from_pos) {
+    None -> list_reverse(acc)
     Some(m) -> {
       let next = if m.end > m.start { m.end } else { m.start + 1 }
-      rx_find_all_loop(nfa, s, next, n, list_append(acc, [m]))
+      rx_find_all_loop(sim, next, [m, ...acc])
     }
   } }
 }
@@ -1288,29 +1230,28 @@ replacement supports `$0` (whole match) and `$1`..`$9` (numbered
 groups). Use `$$` for a literal `$`.
 """)]
 pub fn replace(re: Regex, s: String, replacement: String) : String = match re {
-  R(nfa) -> rx_replace_loop(nfa, s, replacement, 0, string_length(s), "")
+  R(nfa) -> string_concat_all(list_reverse(rx_replace_loop(rx_sim(nfa, s), replacement, 0, [])))
 }
 
-fn rx_replace_loop(nfa: Nfa, s: String, repl: String, from_pos: Int, n: Int, acc: String) : String = {
-  if from_pos > n { acc }
-  else { match rx_simulate_from(nfa, s, n, from_pos) {
-    None -> string_concat(acc, string_slice(s, from_pos, n - from_pos))
+# `parts` holds the output pieces, newest first.
+fn rx_replace_loop(sim: RxSim, repl: String, from_pos: Int, parts: [String]) : [String] = {
+  if from_pos > sim.n { parts }
+  else { match rx_search(sim, from_pos) {
+    None -> [string_slice(sim.input, from_pos, sim.n - from_pos), ...parts]
     Some(m) -> {
-      # Append source [from_pos..m.start) verbatim, then the
-      # expanded replacement. Advance to m.end (or +1 on a
-      # zero-width match) for the next iteration.
-      let prefix = string_slice(s, from_pos, m.start - from_pos)
-      let expanded = rx_expand_replacement(repl, m, s)
-      let acc1 = string_concat(acc, string_concat(prefix, expanded))
+      # Source [from_pos..m.start) verbatim, then the expanded
+      # replacement. Advance to m.end (or +1 on a zero-width match).
+      let prefix = string_slice(sim.input, from_pos, m.start - from_pos)
+      let parts1 = [rx_expand_replacement(repl, m, sim.input), prefix, ...parts]
       let next = if m.end > m.start { m.end } else { m.start + 1 }
       # Zero-width: also copy the skipped char so it is not lost.
-      let acc2 = if m.end == m.start and m.start < n {
-        match char_at(s, m.start) {
-          Some(c) -> string_concat(acc1, int_to_byte_string(char_to_int(c)))
-          None    -> acc1
+      let parts2 = if m.end == m.start and m.start < sim.n {
+        match char_at(sim.input, m.start) {
+          Some(c) -> [int_to_byte_string(char_to_int(c)), ...parts1]
+          None    -> parts1
         }
-      } else { acc1 }
-      rx_replace_loop(nfa, s, repl, next, n, acc2)
+      } else { parts1 }
+      rx_replace_loop(sim, repl, next, parts2)
     }
   } }
 }
@@ -1318,36 +1259,33 @@ fn rx_replace_loop(nfa: Nfa, s: String, repl: String, from_pos: Int, n: Int, acc
 # Expand $N back-references in `repl` against the captured groups.
 # `$$` -> literal `$`. Unknown groups expand to the empty string
 # (mirrors most engines' lenient behaviour).
-fn rx_expand_replacement(repl: String, m: Match, src: String) : String = {
-  let n = string_length(repl)
-  rx_expand_loop(repl, 0, n, m, src, "")
-}
+fn rx_expand_replacement(repl: String, m: Match, src: String) : String =
+  string_concat_all(list_reverse(rx_expand_loop(repl, 0, string_length(repl), m, src, [])))
 
-fn rx_expand_loop(repl: String, i: Int, n: Int, m: Match, src: String, acc: String) : String = {
-  if i >= n { acc }
+fn rx_expand_loop(repl: String, i: Int, n: Int, m: Match, src: String, parts: [String]) : [String] = {
+  if i >= n { parts }
   else { match char_at(repl, i) {
-    None -> acc
+    None -> parts
     Some(c) ->
       if c == '$' {
         let i1 = i + 1
-        if i1 >= n { string_concat(acc, "$") }
+        if i1 >= n { ["$", ...parts] }
         else { match char_at(repl, i1) {
-          None -> string_concat(acc, "$")
+          None -> ["$", ...parts]
           Some(c2) ->
             if c2 == '$' {
-              rx_expand_loop(repl, i1 + 1, n, m, src, string_concat(acc, "$"))
+              rx_expand_loop(repl, i1 + 1, n, m, src, ["$", ...parts])
             } else if char.is_digit(c2) {
               let gid = char_to_int(c2) - char_to_int('0')
-              let span = rx_group_span(m.groups, gid, src)
-              rx_expand_loop(repl, i1 + 1, n, m, src, string_concat(acc, span))
+              rx_expand_loop(repl, i1 + 1, n, m, src, [rx_group_span(m.groups, gid, src), ...parts])
             } else {
               # `$x` where x is not a digit or $ — emit literally.
               rx_expand_loop(repl, i1 + 1, n, m, src,
-                             string_concat(acc, string_concat("$", int_to_byte_string(char_to_int(c2)))))
+                             [int_to_byte_string(char_to_int(c2)), "$", ...parts])
             }
         } }
       } else {
-        rx_expand_loop(repl, i + 1, n, m, src, string_concat(acc, int_to_byte_string(char_to_int(c))))
+        rx_expand_loop(repl, i + 1, n, m, src, [int_to_byte_string(char_to_int(c)), ...parts])
       }
   } }
 }
@@ -1372,18 +1310,17 @@ Empty matches are tolerated: the scan advances by one char so
 looping. Trailing empty segments are kept (Python semantics).
 """)]
 pub fn split(re: Regex, s: String) : [String] = match re {
-  R(nfa) -> rx_split_loop(nfa, s, 0, string_length(s), [])
+  R(nfa) -> rx_split_loop(rx_sim(nfa, s), 0, [])
 }
 
-fn rx_split_loop(nfa: Nfa, s: String, from_pos: Int, n: Int, acc: [String]) : [String] = {
-  if from_pos > n { acc }
-  else { match rx_simulate_from(nfa, s, n, from_pos) {
-    None -> list_append(acc, [string_slice(s, from_pos, n - from_pos)])
+fn rx_split_loop(sim: RxSim, from_pos: Int, acc: [String]) : [String] = {
+  if from_pos > sim.n { list_reverse(acc) }
+  else { match rx_search(sim, from_pos) {
+    None -> list_reverse([string_slice(sim.input, from_pos, sim.n - from_pos), ...acc])
     Some(m) -> {
-      let segment = string_slice(s, from_pos, m.start - from_pos)
-      let acc1 = list_append(acc, [segment])
+      let segment = string_slice(sim.input, from_pos, m.start - from_pos)
       let next = if m.end > m.start { m.end } else { m.start + 1 }
-      rx_split_loop(nfa, s, next, n, acc1)
+      rx_split_loop(sim, next, [segment, ...acc])
     }
   } }
 }
