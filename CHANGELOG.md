@@ -84,6 +84,44 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.160.0 (2026-10-16)
+
+### BREAKING CHANGE
+
+- Queue is now { front, back, len } and Stack is
+{ items, len }, where len is the number of elements. Code that builds or
+destructures these records by field must supply len (the length of front
+plus back, or of items); code that goes through queue.empty, push, pop,
+from_list and the other functions is unaffected.
+
+### Fixed
+
+- **runtime**: keep the variant-head table reachable when nothing reads it
+- **core-reach**: ignore impls an earlier cut dropped when the typed cut selects by runtime head
+- **lint**: decide core by module identity, keep a single-file lint to its unit
+- **lint**: keep a combinator-shaped match that tail-calls its function or defines the combinator
+- **typer**: hint that a leading dot starts a new statement when the tail section mismatches
+- **derive**: derive BinSerialize for a Byte field as one raw byte
+- **diag**: report unit, shape and variant-capacity errors under --diags-json
+- **emit**: keep a region's arena inside a closure body
+- **lint**: lint a package module the entry never imports as its own root
+- **stdlib**: trim list show's RC traffic and run the RC budget gate in CI
+
+### Changed
+
+- **parse**: keep every regrouped parser file at B or better
+- **parse**: regroup the 25 parser modules into 9 cohesive files
+- **emit**: emit the variant-head table as a constant instead of building it at startup
+- **core-reach**: walk the typed program without allocating positions for the common nodes
+- **core-reach**: cut the core by reachability after monomorphisation
+- **stdlib**: keep core off the combinator rewrite and derive Byte without new helpers
+- **stdlib**: write non-looping Option matches as combinators
+- **stdlib**: multiply, divide and convert BigInt in subquadratic time
+- **parse**: flatten and split the parser into layered A-grade modules
+- **parse**: add the parser's token-eat and located-node helpers
+- **parse**: split the recursive core into layered modules behind an expression entry in the parser
+- **stdlib**: keep an element count in Queue and Stack so size is O(1)
+
 ## v0.159.0 (2026-10-16)
 
 ### Added
