@@ -11,6 +11,7 @@ import compiler.diag_file
 import compiler.module_table
 import compiler.expr_positions
 import compiler.written
+import compiler.util
 import compiler.symtab
 import compiler.module_tables
 import compiler.modules_qualtype_decl
@@ -59,75 +60,87 @@ pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, tabs: M
 
 # Only `EMatch` arms and `EBlock` lets carry patterns after lowering;
 # every other position descends through `xp_positions`.
-#[doc("Count qualified variant patterns whose module is not imported or does not export the constructor, so the exit code reflects the diagnostics `rqc_pat` emits.")]
-pub fn pqchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
-  [] -> 0
-  [d, ...rest] -> pqchk_exprs(decl_preds(d), mt) + pqchk_exprs(decl_exprs(d), mt) + pqchk_decls(rest, mt)
-}
-
-fn pqchk_exprs(es: [Expr], mt: [ModuleEntry]) : Int = match es {
-  [] -> 0
-  [e, ...rest] -> pqchk_expr(e, mt) + pqchk_exprs(rest, mt)
-}
-
-fn pqchk_expr(e: Expr, mt: [ModuleEntry]) : Int = {
-  let own = match e.kind {
-    EMatch(_, arms)  -> pqchk_arms(arms, mt)
-    EBlock(stmts, _) -> pqchk_stmts(stmts, mt) + pqchk_exprs(expr_preds(e), mt)
-    ELambda(_, _)    -> pqchk_exprs(expr_preds(e), mt)
-    EHandle(_, _, _, _, _, _, _) -> pqchk_exprs(expr_preds(e), mt)
-    _ -> 0
+#[doc("One diagnostic per qualified variant pattern whose module is not imported or does not export the constructor.")]
+pub fn pqchk_decls(ds: [Decl], mt: [ModuleEntry], df: DiagFiles) : [Diagnostic] = match ds {
+  [] -> []
+  [d, ...rest] -> {
+    let file = decl_diag_file(d, df)
+    list_append(pqchk_exprs(list_append(decl_preds(d), decl_exprs(d)), mt, file), pqchk_decls(rest, mt, df))
   }
-  own + pqchk_positions(xp_positions(e), mt)
 }
 
-fn pqchk_positions(ps: [XPos], mt: [ModuleEntry]) : Int = match ps {
-  [] -> 0
-  [XP(_, e), ...rest] -> pqchk_expr(e, mt) + pqchk_positions(rest, mt)
+fn pqchk_exprs(es: [Expr], mt: [ModuleEntry], file: String) : [Diagnostic] = match es {
+  [] -> []
+  [e, ...rest] -> list_append(pqchk_expr(e, mt, file), pqchk_exprs(rest, mt, file))
 }
 
-fn pqchk_arms(arms: [Arm], mt: [ModuleEntry]) : Int = match arms {
-  [] -> 0
-  [Arm(pat, _, _), ...rest] -> pqchk_pat(pat, mt) + pqchk_arms(rest, mt)
+fn pqchk_expr(e: Expr, mt: [ModuleEntry], file: String) : [Diagnostic] = {
+  let own = match e.kind {
+    EMatch(_, arms)  -> pqchk_arms(arms, mt, file)
+    EBlock(stmts, _) -> list_append(pqchk_stmts(stmts, mt, file), pqchk_exprs(expr_preds(e), mt, file))
+    ELambda(_, _)    -> pqchk_exprs(expr_preds(e), mt, file)
+    EHandle(_, _, _, _, _, _, _) -> pqchk_exprs(expr_preds(e), mt, file)
+    _ -> []
+  }
+  list_append(own, pqchk_positions(xp_positions(e), mt, file))
 }
 
-fn pqchk_stmts(stmts: [Stmt], mt: [ModuleEntry]) : Int = match stmts {
-  [] -> 0
-  [SLet(pat, _, _), ...rest] -> pqchk_pat(pat, mt) + pqchk_stmts(rest, mt)
-  [_, ...rest] -> pqchk_stmts(rest, mt)
+fn pqchk_positions(ps: [XPos], mt: [ModuleEntry], file: String) : [Diagnostic] = match ps {
+  [] -> []
+  [XP(_, e), ...rest] -> list_append(pqchk_expr(e, mt, file), pqchk_positions(rest, mt, file))
 }
 
-fn pqchk_pat(pat: Pattern, mt: [ModuleEntry]) : Int = match pat.pkind {
-  PVariant(r, subs)     -> pqchk_ref(r, mt) + pqchk_pats(subs, mt)
-  PVariantRecord(r, fs) -> pqchk_ref(r, mt) + pqchk_pfields(fs, mt)
-  PRecord(fs)           -> pqchk_pfields(fs, mt)
-  PList(subs, _)        -> pqchk_pats(subs, mt)
-  PAs(_, inner)         -> pqchk_pat(inner, mt)
-  _ -> 0
+fn pqchk_arms(arms: [Arm], mt: [ModuleEntry], file: String) : [Diagnostic] = match arms {
+  [] -> []
+  [Arm(pat, _, _), ...rest] -> list_append(pqchk_pat(pat, mt, file), pqchk_arms(rest, mt, file))
 }
 
-fn pqchk_ref(r: DeclRef, mt: [ModuleEntry]) : Int = match r {
-  DrWritten(Some(q), n) -> if pat_qualifier_ok(written_text(q), written_text(n), mt) { 0 } else { 1 }
-  _                     -> 0
+fn pqchk_stmts(stmts: [Stmt], mt: [ModuleEntry], file: String) : [Diagnostic] = match stmts {
+  [] -> []
+  [SLet(pat, _, _), ...rest] -> list_append(pqchk_pat(pat, mt, file), pqchk_stmts(rest, mt, file))
+  [_, ...rest] -> pqchk_stmts(rest, mt, file)
 }
 
-fn pqchk_pats(ps: [Pattern], mt: [ModuleEntry]) : Int = match ps {
-  [] -> 0
-  [p, ...rest] -> pqchk_pat(p, mt) + pqchk_pats(rest, mt)
+fn pqchk_pat(pat: Pattern, mt: [ModuleEntry], file: String) : [Diagnostic] = match pat.pkind {
+  PVariant(r, subs)     -> list_append(pqchk_ref(r, mt, file, pat), pqchk_pats(subs, mt, file))
+  PVariantRecord(r, fs) -> list_append(pqchk_ref(r, mt, file, pat), pqchk_pfields(fs, mt, file))
+  PRecord(fs)           -> pqchk_pfields(fs, mt, file)
+  PList(subs, _)        -> pqchk_pats(subs, mt, file)
+  PAs(_, inner)         -> pqchk_pat(inner, mt, file)
+  _ -> []
 }
 
-fn pqchk_pfields(fs: [PField], mt: [ModuleEntry]) : Int = match fs {
-  [] -> 0
-  [PField(_, sub, _), ...rest] -> pqchk_pat(sub, mt) + pqchk_pfields(rest, mt)
+fn pqchk_ref(r: DeclRef, mt: [ModuleEntry], file: String, pat: Pattern) : [Diagnostic] = match r {
+  DrWritten(Some(q), n) -> pqchk_qualifier(written_text(q), written_text(n), mt, file, pat)
+  _                     -> []
+}
+
+fn pqchk_qualifier(q: String, ctor: String, mt: [ModuleEntry], file: String, pat: Pattern) : [Diagnostic] =
+  match mt_lookup_member(mt, q, ctor) {
+    Some(me) -> if me_has_export(me, ctor) { [] } else {
+      [mk_diag(SevError, file, pat.line, pat.col, missing_export_msg(q, ctor, me_exports(me)), [])]
+    }
+    None -> [mk_diag(SevError, file, pat.line, pat.col, concat_all(["cannot find module `", q, "`"]),
+                     [ri_help(file, pat.line, pat.col, concat_all(["import `", q, "` before qualifying `", ctor, "` with it"]))])]
+  }
+
+fn pqchk_pats(ps: [Pattern], mt: [ModuleEntry], file: String) : [Diagnostic] = match ps {
+  [] -> []
+  [p, ...rest] -> list_append(pqchk_pat(p, mt, file), pqchk_pats(rest, mt, file))
+}
+
+fn pqchk_pfields(fs: [PField], mt: [ModuleEntry], file: String) : [Diagnostic] = match fs {
+  [] -> []
+  [PField(_, sub, _), ...rest] -> list_append(pqchk_pat(sub, mt, file), pqchk_pfields(rest, mt, file))
 }
 
 #[doc("`pqchk_decls` over an import-segmented stream, each segment against its own module table.")]
-pub fn pqchk_segmented(segs: [ImportSeg], decls: [Decl], tabs: ModTables) : Int = match segs {
-  [] -> pqchk_decls(decls, mtabs_of(tabs, "").entries)
+pub fn pqchk_segmented(segs: [ImportSeg], decls: [Decl], tabs: ModTables, df: DiagFiles) : [Diagnostic] = match segs {
+  [] -> pqchk_decls(decls, mtabs_of(tabs, "").entries, df)
   [ISeg(home, n), ...rest] -> {
     let mt = mtabs_of(tabs, home).entries
-    pqchk_decls(seg_take(decls, n), mt) +
-      pqchk_segmented(rest, seg_drop(decls, n), tabs)
+    list_append(pqchk_decls(seg_take(decls, n), mt, df),
+                pqchk_segmented(rest, seg_drop(decls, n), tabs, df))
   }
 }
 
