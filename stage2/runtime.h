@@ -4374,6 +4374,7 @@ static int kai_reactor_detach_fiber(KaiFiber *target);
 typedef struct KaiFilepoolItem KaiFilepoolItem;
 static void     kai_reactor_init(void);
 static void     kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns);
+static void     kai_reactor_park_timer_linked(KaiFiber *f, uint64_t deadline_ns);
 static void     kai_reactor_park_pid(KaiFiber *f, int pid);
 static int      kai_reactor_take_child_exit(int pid, int *status);
 static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg);
@@ -4767,7 +4768,9 @@ static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
  * that already returned — the use-after-free trap this guards.
  *
  * A spurious message-wake (another receiver drained the slot first)
- * re-parks for the remaining time; an elapsed deadline returns NULL. */
+ * re-parks for the remaining time; an elapsed deadline returns NULL.
+ * A due cancel also returns NULL, with `me` off both structures: the caller
+ * releases what it holds and delivers it. */
 static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos) {
     KaiFiber *me = kai_current_fiber();
     KaiFiber *sw = NULL;
@@ -4788,7 +4791,7 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
         }
         kai_mbox_unlock(mb);
         if (msg || expired) break;
-        kai_reactor_park_timer(me, deadline);
+        if (!kai_cancel_due(me)) kai_reactor_park_timer_linked(me, deadline);
 
         /* park_timer's drain already spliced us off the wheel on a
          * deadline wake. Disarm it on a message wake; in both cases
@@ -4803,7 +4806,7 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
              * (reactor_fired) means the deadline really fired; a resume
              * without it is spurious — loop, which re-checks the clock
              * and re-parks for whatever time remains. */
-            if (me->reactor_fired) break;
+            if (me->reactor_fired || kai_cancel_due(me)) break;
             continue;
         }
         /* A send dequeued us; disarm the still-armed deadline timer. The
@@ -10527,6 +10530,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_free(KaiValue *pid)
 
 static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
     KaiValue *r = NULL;
+    kai_cancel_deliver(kai_current_fiber());
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("read_file: argument is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
@@ -17329,7 +17333,7 @@ static void kai_filepool_submit(KaiFilepoolItem *item) {
  * and yields via kai_sched_park (which falls into kai_reactor_wait
  * once the run queue empties). On resume the reactor drain has
  * already cleared the fiber's reactor_* slots and unparked it. */
-static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
+static void kai_reactor_park_timer_linked(KaiFiber *f, uint64_t deadline_ns) {
     f->reactor_deadline_ns = deadline_ns;
     if (kai_nthreads > 1) {
         /* F2: the root links us into the wheel post-swap (commit_park). */
@@ -17355,7 +17359,12 @@ static void kai_reactor_park_pid(KaiFiber *f, int pid) {
     f->reactor_next = kai_reactor_pid_waiters;
     kai_reactor_pid_waiters = f;
     kai_reactor_parked_count++;
-    kai_sched_park();
+    kai_sched_park_linked();
+}
+
+static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
+    kai_reactor_park_timer_linked(f, deadline_ns);
+    kai_check_cancel_yield_point();
 }
 
 /* Issue #620 — Phase R3: park `f` on the singleton stdin slot.
@@ -17374,7 +17383,7 @@ static int kai_reactor_park_stdin(KaiFiber *f) {
         kai_reactor_unlock();
         if (busy) return -1;
         f->pending_park = KAI_PARK_STDIN;
-        kai_sched_park();
+        kai_sched_park_linked();
         return 0;
     }
     if (kai_reactor_stdin_waiter != NULL) return -1;
