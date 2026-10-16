@@ -5846,6 +5846,23 @@ static inline KaiValue *kai_rec_stamp(KaiValue *v, int32_t head_tag) {
  * nullary variants; 64 buckets gives ample headroom.
  */
 #define KAI_NULLARY_SINGLETON_BUCKETS 64
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_mutex_t kai_variant_intern_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_mutex_t kai_variant_intern_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static pthread_mutex_t kai_variant_intern_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+/* Serialises installs into the interned-variant tables. Lookups never
+ * take it: a bucket becomes visible when its `name` is release-stored
+ * after the rest of the bucket is written. */
+static inline void kai_variant_intern_lock(void) {
+    if (kai_nthreads > 1) pthread_mutex_lock(&kai_variant_intern_mu);
+}
+static inline void kai_variant_intern_unlock(void) {
+    if (kai_nthreads > 1) pthread_mutex_unlock(&kai_variant_intern_mu);
+}
 typedef struct {
     int32_t       tag;
     const char   *name;     /* NULL ⇒ empty bucket */
@@ -5873,8 +5890,9 @@ static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
     size_t i = kai_nullary_hash(tag, name);
     for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
         KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
-        if (b->name == NULL) return NULL;
-        if (b->tag == tag && b->name == name) return b->value;
+        const char *bn = __atomic_load_n(&b->name, __ATOMIC_ACQUIRE);
+        if (bn == NULL) return NULL;
+        if (b->tag == tag && bn == name) return b->value;
         i = (i + 1) & (KAI_NULLARY_SINGLETON_BUCKETS - 1);
     }
     return NULL;
@@ -5915,21 +5933,22 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
                                                KaiVarSlot *slots);
 static inline KaiValue *kai_nullary_fast(int32_t tag, const char *name) {
     if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) {
-        KaiValue *v = kai_enum_by_tag[tag];
+        KaiValue *v = __atomic_load_n(&kai_enum_by_tag[tag], __ATOMIC_ACQUIRE);
         if (v) return v;
     }
     return kai_variant_u(tag, name, 0, 0, NULL);
 }
 
 static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
-    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) kai_enum_by_tag[tag] = v;
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX)
+        __atomic_store_n(&kai_enum_by_tag[tag], v, __ATOMIC_RELEASE);
     size_t i = kai_nullary_hash(tag, name);
     for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
         KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
         if (b->name == NULL) {
             b->tag = tag;
-            b->name = name;
             b->value = v;
+            __atomic_store_n(&b->name, name, __ATOMIC_RELEASE);
             return;
         }
         i = (i + 1) & (KAI_NULLARY_SINGLETON_BUCKETS - 1);
@@ -5947,7 +5966,7 @@ static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
  * hits; the fallback (defensive) returns unit rather than dangle. */
 static inline KaiValue *kai_enum_slot_box(int64_t tag) {
     if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) {
-        KaiValue *v = kai_enum_by_tag[(int) tag];
+        KaiValue *v = __atomic_load_n(&kai_enum_by_tag[(int) tag], __ATOMIC_ACQUIRE);
         if (v) return v;
     }
     return kai_unit();
@@ -6090,7 +6109,8 @@ static inline size_t kai_immortal_slot_hash(int32_t tag, const char *name,
 
 static int kai_immortal_slot_match(KaiImmortalVarBucket *b, int32_t tag,
                                    const char *name, int n, KaiVarSlot *slots) {
-    if (b->name != name || b->tag != tag || b->n != n) return 0;
+    if (__atomic_load_n(&b->name, __ATOMIC_ACQUIRE) != name
+        || b->tag != tag || b->n != n) return 0;
     for (int i = 0; i < n; i++) {
         if (b->args[i] != slots[i].ptr) return 0;
     }
@@ -6102,7 +6122,7 @@ static KaiValue *kai_immortal_slot_lookup(int32_t tag, const char *name,
     size_t i = kai_immortal_slot_hash(tag, name, n, slots);
     for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_PROBE; probe++) {
         KaiImmortalVarBucket *b = &kai_immortal_vars[i];
-        if (b->name == NULL) return NULL;
+        if (__atomic_load_n(&b->name, __ATOMIC_ACQUIRE) == NULL) return NULL;
         if (kai_immortal_slot_match(b, tag, name, n, slots)) return b->value;
         i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
     }
@@ -6116,10 +6136,10 @@ static int kai_immortal_slot_install(int32_t tag, const char *name, int n,
         KaiImmortalVarBucket *b = &kai_immortal_vars[i];
         if (b->name == NULL) {
             b->tag = tag;
-            b->name = name;
             b->n = n;
             for (int j = 0; j < n; j++) b->args[j] = slots[j].ptr;
             b->value = v;
+            __atomic_store_n(&b->name, name, __ATOMIC_RELEASE);
             return 1;
         }
         i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
@@ -6141,6 +6161,9 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
     if (n == 0 && name != NULL) {
         KaiValue *cached = kai_nullary_lookup(tag, name);
         if (cached) return cached;
+        kai_variant_intern_lock();
+        cached = kai_nullary_lookup(tag, name);
+        if (cached) { kai_variant_intern_unlock(); return cached; }
         KAI_VAR_NAME_REAL_ALLOC(name);
         KaiValue *v = kai_alloc(KAI_VARIANT);
         v->variant_tag = tag;
@@ -6148,6 +6171,7 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
         kai_slotmask_register(v->variant_tag, 0);
         v->rc = INT32_MAX;
         kai_nullary_install(tag, name, v);
+        kai_variant_intern_unlock();
         return v;
     }
 
@@ -6165,6 +6189,9 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
         kai_slots_all_immortal_ptr(n, slots)) {
         KaiValue *cached = kai_immortal_slot_lookup(tag, name, n, slots);
         if (cached) return cached;
+        kai_variant_intern_lock();
+        cached = kai_immortal_slot_lookup(tag, name, n, slots);
+        if (cached) { kai_variant_intern_unlock(); return cached; }
         KAI_VAR_NAME_REAL_ALLOC(name);
         KaiValue *v = kai_alloc_var(n);
         v->variant_tag = tag;
@@ -6175,6 +6202,7 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
          * saturated rc would never be freed. */
         v->rc = INT32_MAX;
         if (!kai_immortal_slot_install(tag, name, n, slots, v)) v->rc = 1;
+        kai_variant_intern_unlock();
         return v;
     }
 
@@ -10502,6 +10530,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ti
     if (msg) {
         return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     }
+    kai_cancel_deliver(kai_current_fiber());
     return kai_variant_u(1, "None", 0, 0, NULL);
 }
 #endif
@@ -10530,7 +10559,6 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_free(KaiValue *pid)
 
 static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
     KaiValue *r = NULL;
-    kai_cancel_deliver(kai_current_fiber());
     if (!path || path->tag != KAI_STR) {
         KaiValue *msg = kai_str("read_file: argument is not a String");
         r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
@@ -17338,12 +17366,17 @@ static void kai_reactor_park_timer_linked(KaiFiber *f, uint64_t deadline_ns) {
     if (kai_nthreads > 1) {
         /* F2: the root links us into the wheel post-swap (commit_park). */
         f->pending_park = KAI_PARK_TIMER;
-        kai_sched_park();
+        kai_sched_park_linked();
         return;
     }
     kai_reactor_timer_insert(f);
     kai_reactor_parked_count++;
-    kai_sched_park();
+    kai_sched_park_linked();
+}
+
+static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
+    kai_reactor_park_timer_linked(f, deadline_ns);
+    kai_check_cancel_yield_point();
 }
 
 static void kai_reactor_park_pid(KaiFiber *f, int pid) {
@@ -17359,12 +17392,7 @@ static void kai_reactor_park_pid(KaiFiber *f, int pid) {
     f->reactor_next = kai_reactor_pid_waiters;
     kai_reactor_pid_waiters = f;
     kai_reactor_parked_count++;
-    kai_sched_park_linked();
-}
-
-static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
-    kai_reactor_park_timer_linked(f, deadline_ns);
-    kai_check_cancel_yield_point();
+    kai_sched_park();
 }
 
 /* Issue #620 — Phase R3: park `f` on the singleton stdin slot.
@@ -17383,7 +17411,7 @@ static int kai_reactor_park_stdin(KaiFiber *f) {
         kai_reactor_unlock();
         if (busy) return -1;
         f->pending_park = KAI_PARK_STDIN;
-        kai_sched_park_linked();
+        kai_sched_park();
         return 0;
     }
     if (kai_reactor_stdin_waiter != NULL) return -1;
@@ -18739,6 +18767,8 @@ static ucontext_t *kai_uc_link_target(void) {
     return &w->uc_link_ctx;
 }
 
+static void kai_nursery_abandon(KaiFiber *f);
+
 static void kai_fiber_trampoline(void) {
     KaiWorker *w = kai_worker_here();
     KaiFiber *self = w->active;
@@ -18767,8 +18797,7 @@ static void kai_fiber_trampoline(void) {
          * finish its drain, and free the scope. */
         self->cancel_pad_set = 0;
         kai_fiber_consts_drop(self);
-static void kai_nursery_abandon(KaiFiber *f);
-
+        kai_nursery_abandon(self);
         kai_nursery_propagate_failure(self);
         self->state = KAI_FIBER_CANCELLED;
     }
@@ -18797,7 +18826,6 @@ static void kai_nursery_abandon(KaiFiber *f);
     /* Wake awaiters. Each was parked in Spawn.await / Spawn.select /
      * nursery_join. Snapshot the chain under this fiber's slot lock so it
      * is atomic against a concurrent awaiter's check-then-link (both sides
-        kai_nursery_abandon(self);
      * take this lock): `state` was set DONE/CANCELLED above, so an awaiter
      * that acquires the lock after this snapshot sees the terminal state
      * and never parks, while one that linked before the snapshot is on the
@@ -19649,6 +19677,8 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
 }
 #endif
 
+static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip);
+
 /* Park the current fiber on `child`'s awaiter chain until it reaches
  * DONE or CANCELLED. Mirrors the await park; no result is read — the
  * scope joins for completion, not for the value. An `interruptible` join
@@ -19660,6 +19690,7 @@ static int kai_nursery_join_child(KaiFiber *child, KaiFiber *head, int interrupt
      * snapshot the chain between our state read and our link (the lost
      * wakeup that stranded a nursery join at N>1). Loop: only the child's
      * terminal state ends the join; a spurious resume re-parks. */
+    int cancelled = 0;
     for (;;) {
         int child_hl = 0;
         if (kai_nthreads > 1) child_hl = kai_fiber_slot_lock(child);
@@ -19688,8 +19719,6 @@ static int kai_nursery_join_child(KaiFiber *child, KaiFiber *head, int interrupt
  * `skip` excludes the failing child itself, which is mid-trampoline
  * and must not be flagged as a requested cancellation. */
 static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
-static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip);
-
     for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
         if (c == skip
             || c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
@@ -19698,7 +19727,6 @@ static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip);
         kai_fiber_request_cancel(c);
     }
 }
-    int cancelled = 0;
 
 /* Eager cancel-on-fail: a child terminating CANCELLED without a
  * requested cancellation cancels its siblings here, at its own
@@ -19717,34 +19745,6 @@ static void kai_nursery_propagate_failure(KaiFiber *self) {
     kai_nursery_cancel_siblings(scope->children_head, self);
 }
 
-/* Issue #959 — close the innermost scope: join every child, then on
- * the first child that terminated CANCELLED cancel the remaining
- * siblings, finish the drain (waiting their unwind), release the
- * scope's refs, and re-raise via the current fiber's cancel_pad so
- * the failure propagates out of the nursery body. On a clean drain
- * just release the refs and return unit. */
-KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
-#if KAI_SCHED_DECL_ONLY
-;
-#else
-{
-    (void) self;
-    KaiFiber   *f     = kai_current_fiber();
-    KaiNursery *scope = f->nursery_top;
-    if (!scope) {
-        /* No open scope — `nursery_exit` without a matching enter is a
-         * runtime invariant violation, but degrade to a no-op rather
-         * than crash. */
-        return kai_cont_resume(k, kai_unit());
-    }
-    /* Pop the scope first so children joined below (which run on the
-     * scheduler) see the enclosing scope, not this closing one. */
-    f->nursery_top = scope->parent;
-
-    KaiFiber *head   = scope->children_head;
-    int       failed = 0;
-    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (kai_nursery_join_child(c, head, !failed)) failed = 1;
 /* Drop the scope's refs on its terminated children and free it. The
  * children's wrappers may still be held by the user's `Fiber[T]` handles,
  * so decref (not free). */
@@ -19775,6 +19775,34 @@ static void kai_nursery_abandon(KaiFiber *f) {
     }
 }
 
+/* Issue #959 — close the innermost scope: join every child, then on
+ * the first child that terminated CANCELLED cancel the remaining
+ * siblings, finish the drain (waiting their unwind), release the
+ * scope's refs, and re-raise via the current fiber's cancel_pad so
+ * the failure propagates out of the nursery body. On a clean drain
+ * just release the refs and return unit. */
+KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    KaiFiber   *f     = kai_current_fiber();
+    KaiNursery *scope = f->nursery_top;
+    if (!scope) {
+        /* No open scope — `nursery_exit` without a matching enter is a
+         * runtime invariant violation, but degrade to a no-op rather
+         * than crash. */
+        return kai_cont_resume(k, kai_unit());
+    }
+    /* Pop the scope first so children joined below (which run on the
+     * scheduler) see the enclosing scope, not this closing one. */
+    f->nursery_top = scope->parent;
+
+    KaiFiber *head   = scope->children_head;
+    int       failed = 0;
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        if (kai_nursery_join_child(c, head, !failed)) failed = 1;
         /* A child counts as a *failure* only if it terminated
          * CANCELLED without anyone requesting its cancellation — i.e.
          * it raised `Cancel` on its own or hit a runtime trap. A child

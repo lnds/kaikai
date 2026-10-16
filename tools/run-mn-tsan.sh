@@ -87,6 +87,7 @@ FIXTURES=(
   "examples/effects/mn_str_intern_race.kai"
   "examples/effects/mn_send_to_ended_mailbox_race.kai"
   "examples/effects/mn_first_variant_on_many_fibers.kai"
+  "examples/effects/mn_first_variant_intern_race.kai"
   "examples/effects/mn_pingpong_no_false_deadlock.kai"
   "examples/effects/mn_recv_timeout_no_lost_wakeup.kai"
 )
