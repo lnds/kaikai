@@ -7976,8 +7976,15 @@ static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
 /* ---------- equality ---------- */
 
 KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
-    /* identical word — covers two equal immediates; a NaN is unequal to itself */
-    if (a == b && (!a || kai_is_value(a) || a->tag != KAI_REAL)) return 1;
+    /* identical word — covers two equal immediates. A NaN is unequal to itself,
+     * so a Real and every container that can hold one compare structurally. */
+    if (a == b) {
+        if (!a || kai_is_value(a)) return 1;
+        switch ((KaiTag) a->tag) {
+            case KAI_REAL: case KAI_CONS: case KAI_VARIANT: case KAI_RECORD: case KAI_VEC: break;
+            default: return 1;
+        }
+    }
     /* Immediate Int: equal iff both are Ints with the same value. An
      * immediate vs a heap value of any other type is unequal. Done
      * before any header deref, since an immediate has no header. */
@@ -19778,7 +19785,7 @@ static void kai_deliver_to_mailbox(KaiMailbox *mb, KaiValue *msg) {
  * yield point. */
 static void kai_link_notify(KaiFiber *peer, KaiExitReason reason, const char *trap_msg) {
     if (!(peer->trap_exit && peer->mailbox)) {
-        peer->cancel_requested = 1;
+        kai_fiber_request_cancel(peer);
     } else if (reason == KAI_EXIT_TRAPPED) {
         char buf[256];
         snprintf(buf, sizeof(buf), "Trapped: %s", trap_msg ? trap_msg : "runtime trap");
