@@ -1,0 +1,293 @@
+#[doc("Top-level declaration dispatch, attributes and the program entry point.")]
+
+import compiler.util
+import compiler.diag
+import compiler.lex_tokens
+import compiler.ast
+import compiler.decl_names
+import compiler.doc_attr
+import compiler.nest_limit
+import compiler.parse_state
+import compiler.parse_control
+import compiler.parse_type_decls
+import compiler.parse_fns
+import compiler.parse_stmt
+import compiler.parse_types
+import compiler.parse_expr
+
+fn fail_d(p: Parser, msg: String) : PDecl / Console = err_d(p_error_here(p, msg))
+
+fn parse_decl(p: Parser) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let t = p_peek(p0)
+  if parse_at_legacy_extern_c_attribute(p0) {
+    fail_d(p0, "`[<extern_c>] axiom` is removed (issue #260) — use `extern \"C\" fn name(...) : T / Ffi` instead")
+  } else if tk_is(t.kind, TkExtern) {
+    parse_extern_decl(p_advance(p0), t)
+  } else {
+    parse_decl_after_extern(p0, tk_is(t.kind, TkPub))
+  }
+}
+
+fn parse_decl_after_extern(p0: Parser, is_pub: Bool) : PDecl / Console {
+  let p1 = if is_pub { p_advance(p0) } else { p0 }
+  let hd = p_peek(p1)
+  match (if is_pub { pub_rejection(hd) } else { None }) {
+    Some(msg) -> err_d(p_error(p1, hd, msg))
+    None -> parse_decl_head(p1, is_pub, hd)
+  }
+}
+
+fn pub_rejection(hd: Token) : Option[String] =
+  match hd.kind {
+    TkImpl -> Some("`pub` is not allowed on an impl")
+    TkHashOpen -> Some("`pub` must come AFTER the `#[...]` attribute, not before — write `#[unstable] pub fn ...`")
+    TkTest -> Some("`pub` is not allowed on a test")
+    TkBench -> Some("`pub` is not allowed on a bench")
+    TkCheck -> Some("`pub` is not allowed on a check")
+    TkImport -> Some("`pub` is not allowed on an import")
+    TkUse -> Some("`pub` is not allowed on a `use` declaration")
+    TkTheory -> Some("`pub` is not allowed on a `theory` declaration")
+    _ -> None
+  }
+
+fn parse_decl_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console {
+  let p2 = p_advance(p1)
+  match hd.kind {
+    TkFn -> parse_fn_decl(p2, is_pub, hd)
+    TkType -> parse_type_decl(p2, is_pub, hd)
+    TkEffect -> parse_effect_decl(p2, is_pub, hd)
+    TkProtocol -> parse_protocol_decl(p2, is_pub, hd)
+    TkAxiom -> parse_axiom_decl(p2, is_pub, None, "", hd)
+    TkConst -> parse_const_decl(p2, is_pub, hd)
+    TkImpl -> parse_impl_decl(p2, hd)
+    TkHashOpen -> parse_attribute_decl(p2, hd)
+    TkTest -> parse_test_decl(p2, hd)
+    TkBench -> parse_bench_decl(p2, hd)
+    TkCheck -> parse_check_decl(p2, hd)
+    TkImport -> parse_import_decl(p2, hd)
+    TkUse -> parse_use_decl(p2, hd)
+    TkTheory -> parse_theory_decl(p2, hd)
+    _ -> parse_kind_head(p1, is_pub, hd)
+  }
+}
+
+fn parse_kind_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console =
+  if decl_head_is_kind(p1, hd) { parse_kind_decl(p_advance(p1), is_pub, hd) }
+  else if decl_head_is_user_introducer(p1, hd) { parse_unit_decl(p_advance(p1), is_pub, hd) }
+  else { err_d(p_error(p1, hd, decl_head_expected_msg(p1, hd))) }
+
+fn decl_head_expected_msg(p: Parser, hd: Token) : String {
+  let base = "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
+  let names = ["fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "const", "import", "pub", "kind", "theory"]
+  match (if tk_is(hd.kind, TkIdent) { closest_name(tok_source(p.src, hd), names) } else { None }) {
+    Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
+    None -> base
+  }
+}
+
+# `p` is past `#[`; known attributes take their own body, any other is wrapped as `DAttr`.
+fn parse_attribute_decl(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let id = p_peek(p0)
+  if not tk_is(id.kind, TkIdent) { err_d(p_error(p0, id, "expected attribute name after `#[`")) }
+  else {
+    let p1 = p_advance(p0)
+    match tok_source(p0.src, id) {
+      "derive" -> parse_attr_derive_body(p1, hash_tok)
+      "unstable" -> parse_attr_unstable_body(p1, hash_tok)
+      "doc" -> parse_attr_doc_body(p1, hash_tok)
+      "constructor" -> parse_attr_constructor_body(p1, hash_tok)
+      name -> parse_attr_unknown_body(p1, name, hash_tok)
+    }
+  }
+}
+
+fn wrap_decl(inner: PDecl, wrap: (Decl) -> Decl) : PDecl =
+  match inner.r {
+    None -> err_d(inner.p)
+    Some(d) -> ok_d_wrap(inner, wrap(d))
+  }
+
+fn attr_raw(src: String, hash_tok: Token, close: Token) : String =
+  string_slice(src, hash_tok.start, (close.start + close.length) - hash_tok.start)
+
+fn parse_attr_derive_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkLparen, "expected `(` after `#[derive`")
+  if p_failed(p1) { err_d(p1) } else { derive_names(parse_derive_names(p_advance_nl(p), []), hash_tok) }
+}
+
+fn derive_names(nr: PDeriveNames, hash_tok: Token) : PDecl / Console =
+  match nr.r {
+    None -> err_d(nr.p)
+    Some(names) -> {
+      let pc = p_eat(p_skip_newlines(nr.p), TkRbracket, "expected `]` to close `#[derive(...)]`")
+      if p_failed(pc) { err_d(pc) } else { parse_derive_target(p_skip_newlines(pc), names, hash_tok) }
+    }
+  }
+
+fn parse_derive_target(p: Parser, names: [String], hash_tok: Token) : PDecl / Console {
+  let inner_pub = p_at(p, TkPub)
+  let p1 = if inner_pub { p_advance(p) } else { p }
+  let hd = p_peek(p1)
+  if not tk_is(hd.kind, TkType) {
+    err_d(p_error(p1, hd, "`#[derive(...)]` must precede a `type` declaration"))
+  } else {
+    wrap_decl(parse_type_decl(p_advance(p1), inner_pub, hd), (d) => DDerive(names, d, hash_tok.line, hash_tok.col))
+  }
+}
+
+fn parse_attr_unstable_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkRbracket, "expected `]` to close `#[unstable]` (the unstable attribute takes no arguments)")
+  if p_failed(p1) { err_d(p1) } else { parse_unstable_decl(p1, hash_tok) }
+}
+
+fn parse_unstable_decl(p: Parser, t: Token) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let pub_tok = p_peek(p0)
+  if not tk_is(pub_tok.kind, TkPub) {
+    err_d(p_error(p0, pub_tok, "`#[unstable]` must precede a `pub fn`, `pub type`, or `pub const` declaration"))
+  } else {
+    let p1 = p_advance_nl(p0)
+    wrap_decl(parse_unstable_inner(p1, p_peek(p1)), (d) => DUnstable(d, t.line, t.col))
+  }
+}
+
+fn parse_unstable_inner(p1: Parser, hd: Token) : PDecl / Console {
+  let p2 = p_advance(p1)
+  match hd.kind {
+    TkFn -> parse_fn_decl(p2, true, hd)
+    TkType -> parse_type_decl(p2, true, hd)
+    TkConst -> parse_const_decl(p2, true, hd)
+    TkEffect -> parse_effect_decl(p2, true, hd)
+    TkProtocol -> parse_protocol_decl(p2, true, hd)
+    _ -> err_d(p_error(p1, hd, "`#[unstable] pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"))
+  }
+}
+
+# The wrapped decl may be preceded by a `#[doc(...)]`, so it recurses through `parse_decl`.
+fn parse_attr_constructor_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkRbracket, "expected `]` to close `#[constructor]` (the constructor attribute takes no arguments)")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let p0 = p_skip_newlines(p1)
+    constructor_target(parse_decl(p0), p0, hash_tok)
+  }
+}
+
+fn constructor_target(inner: PDecl, p0: Parser, hash_tok: Token) : PDecl / Console =
+  match inner.r {
+    None -> err_d(inner.p)
+    Some(d) ->
+      if constructor_wraps_fn(d) { ok_d_wrap(inner, constructor_wrap(d, hash_tok.line, hash_tok.col)) }
+      else { fail_d(p0, "`#[constructor]` must precede a `pub fn` returning the constructed type") }
+  }
+
+# The doc body is kept verbatim (CommonMark, no escape decoding); the full attribute span rides along for `kai fmt`.
+fn parse_attr_doc_body(p: Parser, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkLparen, "expected `(` after `#[doc` — the doc attribute takes one string argument")
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let st = p_peek(p1)
+    if tk_is(st.kind, TkString) { doc_close(p_advance_nl(p1), st, hash_tok) }
+    else {
+      err_d(p_error(p1, st, "expected a string literal in `#[doc(...)]` — bare-flag and key-value forms (`hidden`, `alias = ...`, `since = ...`) are not supported yet"))
+    }
+  }
+}
+
+fn doc_close(p: Parser, st: Token, hash_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p, TkRparen, "expected `)` to close `#[doc(...)]` — the doc attribute takes exactly one string argument")
+  let p2 = p_eat(p1, TkRbracket, "expected `]` to close `#[doc(...)]`")
+  if p_failed(p2) { err_d(p2) }
+  else {
+    let raw = attr_raw(p.src, hash_tok, p_peek(p1))
+    finish_doc_attr(p2, raw, doc_text_normalize(doc_unquote(tok_source(p.src, st))), hash_tok)
+  }
+}
+
+# A doc on the same or next line as a declaration head documents it; any other position makes it the module doc.
+fn finish_doc_attr(p: Parser, raw: String, text: String, t: Token) : PDecl / Console {
+  let ph = p_skip_newlines(p)
+  if p_count_newlines(p, 0) <= 1 and doc_head_starts_decl(p_peek(ph).kind) {
+    let inner = parse_decl(ph)
+    match inner.r {
+      None -> err_d(inner.p)
+      Some(DDoc(_, _, _, il, ic)) ->
+        err_d(p_fail_at(inner.p, il, ic, "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute"))
+      Some(d) -> ok_d_wrap(inner, DDoc(raw, text, d, t.line, t.col))
+    }
+  } else {
+    ok_d(p, DModuleDoc(raw, text, t.line, t.col))
+  }
+}
+
+fn doc_head_starts_decl(k: TokKind) : Bool =
+  match k {
+    TkPub -> true
+    TkFn -> true
+    TkType -> true
+    TkConst -> true
+    TkEffect -> true
+    TkProtocol -> true
+    TkAxiom -> true
+    TkImpl -> true
+    TkExtern -> true
+    TkHashOpen -> true
+    _ -> false
+  }
+
+# Unknown attributes are dropped after the doc strip; the raw span keeps the formatter byte-exact.
+fn parse_attr_unknown_body(p: Parser, name: String, hash_tok: Token) : PDecl / Console {
+  let p_args = if p_at(p, TkLparen) { skip_balanced_parens(p_advance(p), 1) } else { p }
+  let p1 = p_eat(p_args, TkRbracket, concat_all(["expected `]` to close `#[", name, "(...)]`"]))
+  if p_failed(p1) { err_d(p1) }
+  else {
+    let raw = attr_raw(p.src, hash_tok, p_peek(p_args))
+    wrap_decl(parse_decl(p_skip_newlines(p1)), (d) => DAttr(raw, d, hash_tok.line, hash_tok.col))
+  }
+}
+
+fn parse_failed(p: Parser) : PParser = PParser { p: p, decls: None, fn_bounds: [], names: [] }
+
+fn names_onto(ns: [NEnt], acc: [NEnt]) : [NEnt] =
+  match ns {
+    [] -> acc
+    [n, ...rest] -> names_onto(rest, [n, ...acc])
+  }
+
+fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) : [FnBoundsRec] =
+  match bs {
+    [] -> bacc
+    _ -> match (d, names) {
+      (DFn(_, _, _, _, _, _, _, _, _, mo), [NEnt(_, name, _, _, _), ..._]) -> [FBR(name, mo, bs), ...bacc]
+      _ -> bacc
+    }
+  }
+
+fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec], nacc: [NEnt]) : PParser / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkEof) {
+    # An error recorded while a declaration still parsed in shape must not read as success.
+    if p_failed(p0) { parse_failed(p0) }
+    else { PParser { p: p0, decls: Some(list_reverse(acc)), fn_bounds: list_reverse(bacc), names: list_reverse(nacc) } }
+  } else {
+    let r = parse_decl(p0)
+    match r.r {
+      None -> parse_failed(r.p)
+      Some(d) -> parse_program_loop(r.p, [d, ...acc], fn_bounds_seed(d, r.bounds, r.names, bacc), names_onto(r.names, nacc))
+    }
+  }
+}
+
+#[doc("Parses the file `file`. `home` is the module the file's declarations belong to: every declaration and constructor id is derived with it.")]
+pub fn parse_program(file: String, src: String, toks: [Token], home: String) : PParser / Console {
+  let r = parse_program_loop(parser_new(file, src, toks, home, parse_expr), [], [], [])
+  match r.decls {
+    None -> r
+    Some(ds) -> match nest_first_over(ds) {
+      None -> r
+      Some(e) -> parse_failed(p_fail_at(r.p, e.line, e.col, nest_msg()))
+    }
+  }
+}
