@@ -551,6 +551,10 @@ static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
  * dense table; build it here sized to the max tag present. Unclaimed
  * slots stay 0 (KAI_HEAD_ANON). Called once at startup; the table is
  * intentionally immortal. */
+/* A build that never reads the table lets the optimiser drop the write-only
+ * global; this volatile slot keeps the immortal table reachable. */
+static const int32_t *volatile kai_variant_to_head_keep;
+
 static void kai_register_variant_head_pairs(const int32_t *pairs, int32_t n) {
     int32_t max_tag = 10;
     int32_t i;
@@ -559,6 +563,7 @@ static void kai_register_variant_head_pairs(const int32_t *pairs, int32_t n) {
     tbl = (int32_t *) calloc((size_t) max_tag + 1, sizeof(int32_t));
     if (!tbl) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     for (i = 0; i + 1 < n; i += 2) tbl[pairs[i]] = pairs[i + 1];
+    kai_variant_to_head_keep = tbl;
     kai_register_variant_heads(tbl, max_tag + 1);
 }
 
