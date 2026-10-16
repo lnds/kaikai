@@ -103,6 +103,7 @@ type ColorErr = Color | Shade                  # union of PRE-DECLARED sums
                                                #   (not new ctors; narrow
                                                #   with `n : T ->` arms)
 type Web = Stdout + Mutable                    # effect alias (row)
+type Ids = List[Int]                           # `List[T]` is `[T]`: one type
 
 effect Logger {                                # effect declaration
   log(s: String) : Unit
