@@ -231,7 +231,10 @@ LINK_SH := ../tools/kaic-link.sh
 # A hop's binary runs once, to emit C, and is thrown away. Optimising it
 # costs several times what the slower binary loses in that one run, and
 # the C it emits does not depend on how it was compiled.
-CFLAGS_HOP := $(filter-out -O2 -O1 -g,$(CFLAGS)) -O0
+# -O0 puts the aarch64 Linux image text past the reach of a direct call, so a
+# hop there is built at -O1.
+HOP_OPT := $(if $(filter aarch64,$(shell uname -m)),-O1,-O0)
+CFLAGS_HOP := $(filter-out -O2 -O1 -g,$(CFLAGS)) $(HOP_OPT)
 boot-hop:
 	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS_HOP) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
 
