@@ -21,14 +21,18 @@ Zero is always `Small(0)`. `i64::MIN` has magnitude 2^63 (not an
 out of `Small` removes the `negate(i64::MIN)` overflow trap from every
 arithmetic path.
 
-The magnitude layer (carry discipline, schoolbook multiply, limb
-division) lives in `bigint_limbs`.
+The magnitude layer lives in `bigint_limbs` (carry discipline,
+schoolbook multiply), `bigint_karatsuba`, `bigint_division` and the
+decimal conversions `bigint_parse` / `bigint_render`.
 """)]
 
 import math.bits
-import math.bigint_limbs.{sig_len, mag_cmp, mag_add, mag_sub, mag_mul, mag_muladd_limb, limb_lo, limb_hi, mag_divmod_limb}
+import math.bigint_limbs.{sig_len, mag_cmp, mag_add, mag_sub, limb_lo, limb_hi}
+import math.bigint_karatsuba.{mag_mul_fast}
+import math.bigint_division.{mag_divmod}
+import math.bigint_parse.{mag_from_digits}
+import math.bigint_render.{mag_to_decimal}
 import protocols
-import loop
 
 # ---- Representation ----------------------------------------------
 
@@ -96,8 +100,10 @@ fn min_i64_mag() : Array[Int] = {
 }
 
 #[doc("Builds a BigInt from a decimal digit string (`_` separators allowed). For `n`-literal desugaring: the lexer already validated the run as digits, so this folds them exactly with no i64 intermediate. Non-digit characters other than `_` contribute nothing.")]
-pub fn from_literal(digits: String) : BigInt =
-  make(1, fold_digits(digits, 0, string_length(digits), true, int_magnitude(0)).fst)
+pub fn from_literal(digits: String) : BigInt = {
+  let clean = string.replace(digits, "_", "")
+  make(1, mag_from_digits(clean, 0, string_length(clean)).fst)
+}
 
 # ---- Sign / magnitude views --------------------------------------
 
@@ -260,16 +266,11 @@ fn mul_small(x: Int, y: Int) : BigInt =
 
 fn mul_general(a: BigInt, b: BigInt) : BigInt =
   if is_zero(a) or is_zero(b) { Small(0) }
-  else { make(sign(a) * sign(b), mag_mul(magnitude(a), magnitude(b))) }
+  else { make(sign(a) * sign(b), mag_mul_fast(magnitude(a), magnitude(b))) }
 
 # ====================================================================
-# Decimal text and truncating division. Rendering divides the magnitude
-# by 10^9 repeatedly; division is schoolbook binary long division.
+# Decimal text and truncating division.
 # ====================================================================
-
-# 10^9 — the largest power of ten below 2^31, so `mag_divmod_limb`'s
-# `rem * 2^32` term stays within signed `Int` range.
-fn chunk_base() : Int = 1000000000
 
 # ---- to_string ---------------------------------------------------
 
@@ -277,22 +278,9 @@ fn chunk_base() : Int = 1000000000
 pub fn to_string(x: BigInt) : String =
   if is_zero(x) { "0" }
   else {
-    let body = mag_decimal_loop(magnitude(x), [])
+    let body = mag_to_decimal(magnitude(x))
     if is_negative(x) { "-" ++ body } else { body }
   }
-
-# Render a nonzero magnitude as decimal digits by repeated /10^9;
-# `parts` holds the nine-digit groups already taken, most significant first.
-fn mag_decimal_loop(mag: Array[Int], parts: [String]) : String = {
-  let qr = mag_divmod_limb(mag, chunk_base())
-  if sig_len(qr.fst) == 0 {
-    # Most significant chunk: no zero padding.
-    string_concat_all([int_to_string(qr.snd), ...parts])
-  } else {
-    let digits = int_to_string(qr.snd)
-    mag_decimal_loop(qr.fst, [string_slice("000000000", 0, 9 - string_length(digits)), digits, ...parts])
-  }
-}
 
 # ---- from_string -------------------------------------------------
 
@@ -318,40 +306,11 @@ pub fn from_string(s: String) : Option[BigInt] = {
 fn parse_body(s: String, start: Int, n: Int, sign: Int) : Option[BigInt] =
   if start >= n { None }
   else {
-    let r = fold_digits(s, start, n, false, int_magnitude(0))
+    let r = mag_from_digits(s, start, n)
     if r.snd { Some(make(sign, r.fst)) } else { None }
   }
 
-# Folds the digits of `s` from `i` into `acc`, nine at a time; the flag
-# is false when a character that is neither a digit nor an allowed `_`
-# stopped the fold.
-fn fold_digits(s: String, i: Int, n: Int, sep: Bool, acc: Array[Int]) : Pair[Array[Int], Bool] = {
-  let run = digit_run(s, i, n, sep, 0, 1)
-  let acc1 = mag_muladd_limb(acc, run.mult, run.value)
-  if run.bad or run.next >= n { Pair { fst: acc1, snd: not run.bad } }
-  else { fold_digits(s, run.next, n, sep, acc1) }
-}
-
-# Up to nine digits of `s` from `i`: their value, the power of ten they
-# span and the index after them. `_` is skipped when `sep`; any other
-# character ends the run and sets `bad`.
-type DigitRun = { value: Int, mult: Int, next: Int, bad: Bool }
-
-fn digit_run(s: String, i: Int, n: Int, sep: Bool, value: Int, mult: Int) : DigitRun =
-  if mult >= chunk_base() or i >= n { DigitRun { value: value, mult: mult, next: i, bad: false } }
-  else {
-    match char_at(s, i) {
-      Some(c) -> {
-        let d = char_to_int(c) - char_to_int('0')
-        if d >= 0 and d <= 9 { digit_run(s, i + 1, n, sep, value * 10 + d, mult * 10) }
-        else if sep and c == '_' { digit_run(s, i + 1, n, sep, value, mult) }
-        else { DigitRun { value: value, mult: mult, next: i, bad: true } }
-      }
-      None -> DigitRun { value: value, mult: mult, next: i, bad: true }
-    }
-  }
-
-# ---- divmod (binary long division) -------------------------------
+# ---- divmod ------------------------------------------------------
 
 #[doc("""
 Truncating division with remainder: `Some(Pair(q, r))` where
@@ -362,7 +321,7 @@ pub fn divmod(a: BigInt, b: BigInt) : Option[Pair[BigInt, BigInt]] =
   if is_zero(b) { None }
   else if is_zero(a) { Some(Pair { fst: zero(), snd: zero() }) }
   else {
-    let qm = divmod_mag(magnitude(a), magnitude(b))
+    let qm = mag_divmod(magnitude(a), magnitude(b))
     let q = make(sign(a) * sign(b), qm.fst)
     let r = make(sign(a), qm.snd)
     Some(Pair { fst: q, snd: r })
@@ -386,73 +345,6 @@ pub fn op_div(a: BigInt, b: BigInt) : BigInt =
 #[doc("Remainder of truncating division (sign of `a`), or `None` when `b` is zero.")]
 pub fn rem(a: BigInt, b: BigInt) : Option[BigInt] =
   match divmod(a, b) { Some(p) -> Some(p.snd) None -> None }
-
-# Magnitude division returning `Pair(quotient_mag, remainder_mag)`. The
-# quotient and remainder are each produced by an independent inline
-# shift-subtract sweep so neither buffer crosses a call boundary and
-# `Mutable` masks in both producers. (Two sweeps trade a constant factor
-# for pure signatures; division is not a BigInt hot path.)
-fn divmod_mag(num: Array[Int], den: Array[Int]) : Pair[Array[Int], Array[Int]] =
-  Pair { fst: div_quotient_mag(num, den), snd: div_remainder_mag(num, den) }
-
-# Quotient magnitude by shift-subtract: walk dividend bits most-
-# significant first, shifting the running remainder left one bit and
-# subtracting the divisor when it fits, recording the set quotient bit.
-fn div_quotient_mag(num: Array[Int], den: Array[Int]) : Array[Int] = {
-  let nbits = sig_len(num) * 32
-  let nq = sig_len(num)
-  let q = array_make(if nq <= 0 { 1 } else { nq }, 0)
-  var rem := array_make(1, 0)
-  var i := nbits - 1
-  while { i >= 0 } {
-    rem := shl1_or(rem, mag_bit(num, i))
-    if mag_cmp(rem, den) >= 0 {
-      rem := mag_sub(rem, den)
-      let limb = i / 32
-      q[limb] := bit_or(q[limb], bit_shl(1, i % 32))
-    }
-    i := i - 1
-  }
-  q
-}
-
-# Remainder magnitude by the same sweep, returning the leftover instead
-# of the quotient bits.
-fn div_remainder_mag(num: Array[Int], den: Array[Int]) : Array[Int] = {
-  let nbits = sig_len(num) * 32
-  var rem := array_make(1, 0)
-  var i := nbits - 1
-  while { i >= 0 } {
-    rem := shl1_or(rem, mag_bit(num, i))
-    if mag_cmp(rem, den) >= 0 { rem := mag_sub(rem, den) }
-    i := i - 1
-  }
-  rem
-}
-
-# The `i`-th bit of a magnitude (0 or 1).
-fn mag_bit(mag: Array[Int], i: Int) : Int = {
-  let limb = i / 32
-  if limb >= array_length(mag) { 0 }
-  else { bit_and(bit_ushr(mag[limb], i % 32), 1) }
-}
-
-# `mag << 1 | bit`, returning a fresh magnitude. Built and returned
-# inline, so `Mutable` masks.
-fn shl1_or(mag: Array[Int], bit: Int) : Array[Int] = {
-  let n = array_length(mag)
-  let out = array_make(n + 1, 0)
-  var i := 0
-  var carry := bit
-  while { i < n } {
-    let v = mag[i] * 2 + carry
-    out[i] := limb_lo(v)
-    carry := limb_hi(v)
-    i := i + 1
-  }
-  out[n] := carry
-  out
-}
 
 # ====================================================================
 # Protocol impls
