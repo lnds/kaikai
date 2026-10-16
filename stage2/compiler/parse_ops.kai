@@ -1,9 +1,12 @@
 #[doc("""
-Placeholder (`_`) detection and substitution for pipeline stages.
+Binary-operator tables and node builders, and placeholder (`_`) rewriting of pipeline stages.
 """)]
 
 import compiler.ast
 import compiler.parse_state
+import compiler.lex_tokens
+import compiler.operators
+import compiler.pipe_stage
 
 #[doc("Rewrites a pipeline stage containing `_` into a lambda, when it has one.")]
 pub fn try_pipe_placeholder(line: Int, col: Int, lhs: Expr, rhs: Expr, p: Parser) : PPRResult / Console {
@@ -321,3 +324,169 @@ fn desugar_placeholder_arg(arg: Expr) : Expr {
 #[doc("Rewrites call arguments containing `_` into a lambda body.")]
 pub fn desugar_placeholder_args(args_: [Expr]) : [Expr] =
   map(args_, desugar_placeholder_arg)
+
+#[doc("Maps an operator token to its binary operator.")]
+pub fn op_of_tok(k: TokKind) : String {
+  match k {
+    TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
+    TkPercent -> "%" TkPlusPlus -> "++"
+    TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">" TkLe -> "<=" TkGe -> ">="
+    TkAnd -> "and" TkOr -> "or"
+    _ -> "?"
+  }
+}
+
+#[doc("""
+Binary operators by precedence, loosest first: the four pipes, `or`,
+`and`, the comparisons, `++`, additive, multiplicative. Every level is
+left-associative except `++` (right) and the comparisons, which do not
+chain: `a < b < c` is an error, not a chain. The `|` variant separator
+in `type T = A | B` is parsed by `parse_sum_body`, not here.
+""")]
+pub fn bin_pipe() : Int = 1
+#[doc("Precedence level of `or`.")]
+pub fn bin_or() : Int = 2
+#[doc("Precedence level of comparison operators.")]
+pub fn bin_cmp() : Int = 4
+#[doc("Precedence level of concatenation.")]
+pub fn bin_concat() : Int = 5
+#[doc("Precedence level of the tightest binary operators.")]
+pub fn bin_tightest() : Int = 7
+
+fn bin_level(k: TokKind) : Int =
+  match k {
+    TkPipeApply -> 1
+    TkPipe -> 1
+    TkBarBar -> 1
+    TkPipeQuestion -> 1
+    TkPipeEach -> 1
+    TkOr -> 2
+    TkAnd -> 3
+    TkEqEq -> 4
+    TkNeq -> 4
+    TkLt -> 4
+    TkGt -> 4
+    TkLe -> 4
+    TkGe -> 4
+    TkPlusPlus -> 5
+    TkPlus -> 6
+    TkMinus -> 6
+    TkStar -> 7
+    TkSlash -> 7
+    TkPercent -> 7
+    _ -> 0
+  }
+
+# An operator may also lead a continuation line, unless it can start an
+# expression: `-` (unary minus) and `%` (`%{ }` / `%[ ]`) must end the
+# previous line instead.
+fn bin_leads_line(k: TokKind) : Bool =
+  not tk_is(k, TkMinus) and not tk_is(k, TkPercent)
+
+#[doc("Reads the binary operator at the parser position with its level.")]
+pub fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
+  let t = p_peek(p)
+  let lv = bin_level(t.kind)
+  if lv > 0 {
+    if lv >= lo and lv <= hi { Some(BinOpAt { p: p, tok: t, level: lv }) } else { None }
+  } else {
+    let p_look = p_skip_newlines(p)
+    let t1 = p_peek(p_look)
+    let l1 = bin_level(t1.kind)
+    if l1 > 0 and l1 >= lo and l1 <= hi and bin_leads_line(t1.kind) {
+      Some(BinOpAt { p: p_look, tok: t1, level: l1 })
+    } else { None }
+  }
+}
+
+#[doc("""
+The loosest operator that may follow once `op` is combined: the same
+level again for a left-associative one, strictly looser after a
+comparison (no chaining) or after `++`, whose right operand already took
+the rest of its chain.
+""")]
+pub fn bin_ceiling(op: BinOpAt) : Int =
+  if op.level == bin_cmp() or op.level == bin_concat() { op.level - 1 } else { op.level }
+
+#[doc("Builds the expression node of a binary operation.")]
+pub fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  match binop_of_text(op_of_tok(t.kind)) {
+    Some(o) -> ok_e(p, mk_expr(EBinop(o, lhs, rhs), t.line, t.col))
+    None    -> err_e(p_error(p, t, "expected a binary operator"))
+  }
+
+#[doc("""
+`|>` (apply), `|` (map), `||` (flat-map), `|?` (filter) and `|!`
+(each). The typer rewrites the dispatch pipes against the head type of
+the left side; each of them is a stage that owns the `.` on its right
+side.
+""")]
+pub fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  if ends_pipeline(lhs) { err_e(p_error(p, t, "`|!` ends a pipeline; it returns `Unit`")) }
+  else if tk_is(t.kind, TkPipeApply) {
+    # A `_` in the call's arguments receives the left side instead of the
+    # first argument; `try_pipe_placeholder` evaluates it once.
+    match try_pipe_placeholder(t.line, t.col, lhs, rhs, p) {
+      PPRError(p2)          -> err_e(p2)
+      PPRSubstituted(e, p2) -> ok_e(p2, e)
+      PPRPassthrough        -> ok_e(p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+    }
+  }
+  else {
+    match stage_claim(rhs) {
+      SrNested(inner) -> err_e(p_error_at(p, inner.line, inner.col,
+        "this stage and the one around it both use `.`; name one element with `(x) => ...`"))
+      SrOwn(r) -> ok_e(p, mk_expr(EDispatchPipe(pipe_op_of_tok(t.kind), lhs, r), t.line, t.col))
+    }
+  }
+
+fn pipe_op_of_tok(k: TokKind) : PipeOp =
+  match k {
+    TkPipe -> PoMap
+    TkBarBar -> PoFlatMap
+    TkPipeEach -> PoEach
+    _ -> PoFilter
+  }
+
+fn ends_pipeline(lhs: Expr) : Bool = match lhs.kind {
+  EDispatchPipe(PoEach, _, _) -> true
+  _                           -> false
+}
+
+#[doc("Reports whether a token is a comparison operator.")]
+pub fn is_cmp_tok(k: TokKind) : Bool =
+  match k {
+    TkEqEq -> true
+    TkNeq -> true
+    TkLt -> true
+    TkGt -> true
+    TkLe -> true
+    TkGe -> true
+    _ -> false
+  }
+
+#[doc("""
+A second comparison right after `lhs OP rhs` gets a tailored diagnostic;
+falling through would report "expected `fn`, `type`, ..." at the
+enclosing statement, which is useless.
+""")]
+pub fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console = {
+  let after = p_peek(p)
+  if is_cmp_tok(after.kind) {
+    let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
+    err_e(p_error(p, after, hint))
+  } else {
+    bin_node(p, t, lhs, rhs)
+  }
+}
+
+#[doc("Maps a comparison token to its comparison operator.")]
+pub fn cmp_op_of_tok(k: TokKind) : BinOp =
+  match k {
+    TkLt -> BoLt
+    TkLe -> BoLe
+    TkNeq -> BoNe
+    TkGt -> BoGt
+    TkGe -> BoGe
+    _ -> BoEq
+  }
