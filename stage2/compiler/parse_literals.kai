@@ -1,0 +1,270 @@
+#[doc("""
+Decoding of integer, real, hex and character literal text.
+""")]
+
+import compiler.chars
+import compiler.escapes
+import compiler.lex_tokens
+import compiler.ast
+import compiler.parse_state
+
+fn decode_int_loop(s: String, i: Int, n: Int, acc: Int, neg: Bool) : Int {
+  if i >= n { if neg { 0 - acc } else { acc } }
+  else {
+    match char_at(s, i) {
+      None -> if neg { 0 - acc } else { acc }
+      Some(c) -> {
+        if c == '_' { decode_int_loop(s, i + 1, n, acc, neg) }
+        else if ch_is_digit(c) {
+          let d = char_to_int(c) - char_to_int('0')
+          decode_int_loop(s, i + 1, n, acc * 10 + d, neg)
+        } else {
+          if neg { 0 - acc } else { acc }
+        }
+      }
+    }
+  }
+}
+
+fn decode_bin_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '_' { decode_bin_loop(s, i + 1, n, acc) }
+        else if c == '0' { decode_bin_loop(s, i + 1, n, acc * 2) }
+        else if c == '1' { decode_bin_loop(s, i + 1, n, acc * 2 + 1) }
+        else { acc }
+      }
+    }
+  }
+}
+
+fn decode_int_after_sign(span: String, i: Int, n: Int, neg: Bool) : Int {
+  # Detect 0x / 0b base prefixes; otherwise fall back to decimal.
+  let has_prefix =
+    if i + 1 < n {
+      match char_at(span, i) {
+        Some(c0) -> {
+          if c0 == '0' {
+            match char_at(span, i + 1) {
+              Some(c1) -> c1 == 'x' or c1 == 'X' or c1 == 'b' or c1 == 'B'
+              None -> false
+            }
+          } else { false }
+        }
+        None -> false
+      }
+    } else { false }
+  if has_prefix {
+    match char_at(span, i + 1) {
+      Some(c1) -> {
+        let is_hex = c1 == 'x' or c1 == 'X'
+        let v = if is_hex { decode_hex_loop(span, i + 2, n, 0) }
+                else { decode_bin_loop(span, i + 2, n, 0) }
+        if neg { 0 - v } else { v }
+      }
+      None -> if neg { 0 } else { 0 }
+    }
+  } else {
+    decode_int_loop(span, i, n, 0, neg)
+  }
+}
+
+# Largest `Int` magnitude, as a digit string, for the overflow check
+# on decimal literals: 2^63 - 1.
+fn i64_max_digits() : String = "9223372036854775807"
+
+#[doc("""
+True when an integer literal's written form cannot be decoded without
+wrapping. Decimal compares magnitude against 2^63-1 (signed range).
+Hex/bin are bit-patterns: any pattern up to 64 bits is legal (an
+all-ones hex is the two's-complement -1), so the overflow is a width
+check — >16 significant hex digits or >64 significant bin digits do
+not fit 64 bits. `_` separators and leading zeros are ignored; the
+comparison never itself overflows.
+""")]
+pub fn int_lit_overflows(span: String) : Bool = {
+  if has_base_prefix(span) {
+    if is_hex_prefix(span) { count_base_digits(span, 2, string_length(span), 0) > 16 }
+    else { count_base_digits(span, 2, string_length(span), 0) > 64 }
+  } else {
+    mag_gt(strip_int_lit_digits(span, 0, string_length(span), ""), i64_max_digits())
+  }
+}
+
+fn is_hex_prefix(span: String) : Bool =
+  match char_at(span, 1) {
+    Some(c) -> c == 'x' or c == 'X'
+    None    -> false
+  }
+
+# Count significant base digits after the `0x`/`0b` prefix, dropping `_`
+# separators and leading zeros so the width compare is on the real
+# pattern length. Any non-`_` char keeps the run going once started.
+fn count_base_digits(s: String, i: Int, n: Int, acc: Int) : Int =
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) ->
+        if c == '_' { count_base_digits(s, i + 1, n, acc) }
+        else if c == '0' and acc == 0 { count_base_digits(s, i + 1, n, acc) }
+        else { count_base_digits(s, i + 1, n, acc + 1) }
+    }
+  }
+
+#[doc("Reports whether an integer literal carries a `0x`, `0b` or `0o` prefix.")]
+pub fn has_base_prefix(span: String) : Bool =
+  match char_at(span, 0) {
+    Some('0') -> match char_at(span, 1) {
+      Some(c) -> c == 'x' or c == 'X' or c == 'b' or c == 'B'
+      None    -> false
+    }
+    _ -> false
+  }
+
+# Collect the decimal digits of a span, dropping `_` separators and any
+# leading zeros (so the length compare in `mag_gt` is on significant
+# digits only).
+fn strip_int_lit_digits(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { if string_length(acc) == 0 { "0" } else { acc } }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) ->
+        if c == '_' { strip_int_lit_digits(s, i + 1, n, acc) }
+        else if c == '0' and string_length(acc) == 0 {
+          strip_int_lit_digits(s, i + 1, n, acc)
+        }
+        else if ch_is_digit(c) { strip_int_lit_digits(s, i + 1, n, string_concat(acc, "#{c}")) }
+        else { acc }
+    }
+  }
+
+# `a > b` for two significant-digit magnitude strings: longer wins, else
+# lexicographic (digit strings of equal length order like the numbers).
+fn mag_gt(a: String, b: String) : Bool = {
+  let la = string_length(a)
+  let lb = string_length(b)
+  if la != lb { la > lb } else { string_gt(a, b) }
+}
+
+fn string_gt(a: String, b: String) : Bool = string_cmp(a, b) > 0
+
+fn string_cmp(a: String, b: String) : Int = string_cmp_loop(a, b, 0, string_length(a))
+
+fn string_cmp_loop(a: String, b: String, i: Int, n: Int) : Int =
+  if i >= n { 0 }
+  else {
+    match char_at(a, i) {
+      None -> 0
+      Some(ca) -> match char_at(b, i) {
+        None -> 1
+        Some(cb) ->
+          if char_to_int(ca) < char_to_int(cb) { 0 - 1 }
+          else if char_to_int(ca) > char_to_int(cb) { 1 }
+          else { string_cmp_loop(a, b, i + 1, n) }
+      }
+    }
+  }
+
+#[doc("Decode a decimal/hex/bin integer literal span (optional leading `-`, `_` separators) to Int. Shared with the backends for fixed-width literals that fit 64 bits.")]
+pub fn decode_int(span: String) : Int {
+  let n = string_length(span)
+  if n == 0 { 0 }
+  else {
+    match char_at(span, 0) {
+      Some(c) -> if c == '-' { decode_int_after_sign(span, 1, n, true) }
+                 else { decode_int_after_sign(span, 0, n, false) }
+      None -> 0
+    }
+  }
+}
+
+#[doc("""
+Build a fixed-width integer literal: strip the `suf_len`-char width
+suffix off the token span and keep the remaining digits verbatim in an
+`EFixed` node tagged with the width type. The span is decoded per
+backend (so an Int128 value above 2^63 survives); the value is
+range-checked at the typer, not here.
+""")]
+pub fn fixed_lit(src: String, t: Token, suf_len: Int, ty: Ty) : Expr {
+  let span = tok_source(src, t)
+  let digits = string_slice(span, 0, string_length(span) - suf_len)
+  with_ty(mk_expr(EFixed(digits, ty), t.line, t.col), ty)
+}
+
+fn strip_underscores_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '_' { strip_underscores_loop(s, i + 1, n, acc) }
+        else { strip_underscores_loop(s, i + 1, n, string_concat(acc, "#{c}")) }
+      }
+    }
+  }
+}
+
+#[doc("Decodes real literal text, rejecting values out of range.")]
+pub fn decode_real(span: String) : Option[Real] =
+  string_to_real(strip_underscores_loop(span, 0, string_length(span), ""))
+
+#[doc("Returns the diagnostic for a real literal outside the representable range.")]
+pub fn real_range_error() : String = "real literal out of range for Real"
+
+fn decode_hex_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '}' { acc }
+        else if c == '_' { decode_hex_loop(s, i + 1, n, acc) }
+        else {
+          let v =
+            if ch_is_digit(c) { char_to_int(c) - char_to_int('0') }
+            else if c >= 'a' and c <= 'f' { char_to_int(c) - char_to_int('a') + 10 }
+            else if c >= 'A' and c <= 'F' { char_to_int(c) - char_to_int('A') + 10 }
+            else { 0 }
+          decode_hex_loop(s, i + 1, n, acc * 16 + v)
+        }
+      }
+    }
+  }
+}
+
+# span is the raw char literal including surrounding quotes: 'a', '\n', '\u{2603}'
+#
+# The lexer already rejected every escape outside the table, so an
+# escape reaching here decodes cleanly. `\xHH` and `\u{...}` both name a
+# scalar value directly rather than the UTF-8 bytes a string would get.
+#[doc("Decodes the text of a character literal.")]
+pub fn decode_char(span: String) : Char {
+  let n = string_length(span)
+  if n < 2 { int_to_char(0) }
+  else {
+    match char_at(span, 1) {
+      None -> int_to_char(0)
+      Some(c1) -> {
+        if c1 == '\\' {
+          match esc_decode_scalar_at(span, 2, n - 1) {
+            Some(cp) -> int_to_char(cp)
+            None -> int_to_char(0)
+          }
+        } else {
+          # A non-escape char literal body is a single Unicode
+          # codepoint, possibly multi-byte UTF-8. `char_at`
+          # returns only the first byte (`c1`); decode the full
+          # codepoint that begins at byte offset 1 so `'á'`/`'▸'` lex
+          # to their scalar value, not their UTF-8 lead byte. ASCII is
+          # unchanged (a 1-byte sequence decodes to itself).
+          int_to_char(string_cp_at(span, 1))
+        }
+      }
+    }
+  }
+}

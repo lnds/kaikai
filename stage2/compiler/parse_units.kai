@@ -1,0 +1,202 @@
+#[doc("""
+Unit-of-measure expression parsing.
+""")]
+
+import compiler.util
+import compiler.lex_tokens
+import compiler.ast
+import compiler.kinds
+import compiler.parse_state
+import compiler.parse_literals
+
+#[doc("""
+A type head may carry a `<habitant>` annotation when it is a numeric
+head that takes a unit (`Real`/`Int`/`Decimal`), or any user-declared
+nominal head (an uppercase identifier) — the latter for a kind
+habitant like a region brand (`Tree<r>`). A lowercase head is a type
+variable and never takes a habitant, so `t < u` in a signature stays a
+refinement comparison, not a mis-parsed annotation.
+""")]
+pub fn ty_head_takes_habitant(src: String, t: Token, name: String) : Bool =
+  name == "Real" or name == "Int" or name == "Decimal" or is_upper_ident(src, t)
+
+#[doc("""
+A parameterised uppercase head may carry a habitant after its
+argument list (`Money[Decimal]<USD>`), riding the same `<...>` route
+a bare head takes. Lowercase heads never do, so `t < u` in a
+signature stays a comparison.
+""")]
+pub fn ty_args_habitant(pr: PTy, t: Token) : PTy / Console = match pr.r {
+  None -> pr
+  Some(base) ->
+    if p_at(pr.p, TkLt) and is_upper_ident(pr.p.src, t) {
+      parse_habitant_slot(pr.p, base, t)
+    } else { pr }
+}
+
+#[doc("""
+The `<...>` habitant slot on a type head, `p` at the `<`: one
+habitant expression, or a comma-separated positional list
+(`Matrix[t]<m, n>`). Two or more habitants ride a single `UDims`;
+a lone habitant stays bare so every pre-list annotation is
+byte-identical.
+""")]
+pub fn parse_habitant_slot(p: Parser, base: TypeExpr, t: Token) : PTy / Console {
+  let lt = p_peek(p)
+  parse_habitant_list(p_skip_newlines(p_advance(p)), [], base, t,
+                      lt.start + lt.length)
+}
+
+# The author's spelling of the `<...>` interior (qualifiers, introducer
+# words, spacing) is not recoverable from the resolved `UnitExprT`, so
+# the closing `>` slices it out of the source and a `TsUnitSpan` wrapper
+# carries it for the writer.
+fn parse_habitant_list(p: Parser, acc: [UnitExprT], base: TypeExpr, t: Token,
+                       span_start: Int) : PTy / Console {
+  let ru = parse_unit_expr(p)
+  match ru.r {
+    None -> err_t(ru.p)
+    Some(u) -> {
+      let p1 = p_skip_newlines(ru.p)
+      if p_at(p1, TkComma) {
+        parse_habitant_list(p_skip_newlines(p_advance(p1)), [u, ...acc], base, t,
+                            span_start)
+      } else if p_at(p1, TkGt) {
+        let gt = p_peek(p1)
+        let raw = string_slice(p1.src, span_start, gt.start - span_start)
+        let hab = match acc { [] -> u  _ -> UDims(list_reverse([u, ...acc])) }
+        let dim = mk_ty(TyDim(base, hab), t.line, t.col)
+        ok_t(p_advance(p1), mk_ty(TySurface(TsUnitSpan(raw, dim)), t.line, t.col))
+      } else {
+        err_t(p_error_here(p1, "expected `>` to close the habitant annotation"))
+      }
+    }
+  }
+}
+
+#[doc("Parses a unit-of-measure expression.")]
+pub fn parse_unit_expr(p: Parser) : PUnit / Console {
+
+  let r = parse_unit_term(p)
+  match r.r {
+    None -> err_u(r.p)
+    Some(lhs) -> parse_unit_expr_rest(r.p, lhs)
+  }
+}
+
+fn parse_unit_expr_rest(p: Parser, lhs: UnitExprT) : PUnit / Console {
+
+  if p_at(p, TkStar) {
+    let r = parse_unit_term(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(rhs) -> parse_unit_expr_rest(r.p, UMul(lhs, rhs))
+    }
+  } else if p_at(p, TkSlash) {
+    let r = parse_unit_term(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(rhs) -> parse_unit_expr_rest(r.p, UMul(lhs, UInv(rhs)))
+    }
+  } else if p_at(p, TkPlus) {
+    let r = parse_unit_term(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(rhs) -> parse_unit_expr_rest(r.p, UJoin(lhs, rhs))
+    }
+  } else {
+    ok_u(p, lhs)
+  }
+}
+
+fn parse_unit_term(p: Parser) : PUnit / Console {
+
+  let r = parse_unit_factor(p)
+  match r.r {
+    None -> err_u(r.p)
+    Some(base) -> {
+      if p_at(r.p, TkCaret) {
+        let p1 = p_advance(r.p)
+        let rn = parse_unit_signed_int(p1)
+        match rn.r {
+          None -> err_u(rn.p)
+          Some(n) -> ok_u(rn.p, UPow(base, n))
+        }
+      } else {
+        ok_u(r.p, base)
+      }
+    }
+  }
+}
+
+fn parse_unit_signed_int(p: Parser) : PUInt / Console {
+
+  let neg = p_at(p, TkMinus)
+  let p1 = if neg { p_advance(p) } else { p }
+  let t = p_peek(p1)
+  if not tk_is(t.kind, TkInt) {
+    PUInt { p: p_error_here(p1, "expected integer after `^` in unit expression"), r: None }
+  } else {
+    let n = decode_int(tok_source(p1.src, t))
+    let v = if neg { 0 - n } else { n }
+    PUInt { p: p_advance(p1), r: Some(v) }
+  }
+}
+
+fn parse_unit_factor(p: Parser) : PUnit / Console {
+
+  let t = p_peek(p)
+  if tk_is(t.kind, TkIdent) {
+    # `Kind.sym` / `intro.sym` — explicit qualification. The parser
+    # emits the final qualified form (`Kind$sym`); the resolver only
+    # rewrites the bare `USym(sym)` case below.
+    if tk_is(p_peek1(p).kind, TkDot) {
+      parse_qualified_unit(p, t)
+    } else {
+      ok_u(p_advance(p), USym(tok_source(p.src, t)))
+    }
+  } else if tk_is(t.kind, TkInt) {
+    # `<1>` is the dimensionless unit; any other integer is a value
+    # habitant, resolved by domain against the `with Int` kinds.
+    let span = tok_source(p.src, t)
+    if decode_int(span) == 1 { ok_u(p_advance(p), UOne) }
+    else { ok_u(p_advance(p), USym(span)) }
+  } else if tk_is(t.kind, TkString) {
+    # A string literal is a value habitant of a `with String` kind.
+    # The quoted source text is the symbol, disjoint from every
+    # identifier habitant by its leading quote.
+    ok_u(p_advance(p), USym(tok_source(p.src, t)))
+  } else if tk_is(t.kind, TkLparen) {
+    let r = parse_unit_expr(p_advance(p))
+    match r.r {
+      None -> err_u(r.p)
+      Some(u) -> {
+        if not p_at(r.p, TkRparen) {
+          err_u(p_error_here(r.p, "expected `)` in unit expression"))
+        } else {
+          ok_u(p_advance(r.p), u)
+        }
+      }
+    }
+  } else {
+    err_u(p_error(p, t, "expected unit symbol, `1`, or parenthesised unit expression"))
+  }
+}
+
+# `Kind.sym` or `intro.sym` — a habitant qualified by its kind. `p` is
+# at the qualifier token `qt`; a `.` and the habitant name follow. The
+# qualifier resolves through the KindReg (kind name or introducer word)
+# to the kind, and the factor becomes the final `USym("Kind$sym")`.
+fn parse_qualified_unit(p: Parser, qt: Token) : PUnit / Console {
+  let qual = tok_source(p.src, qt)
+  let p1 = p_advance(p_advance(p))          # past qualifier and `.`
+  let st = p_peek(p1)
+  if not tk_is(st.kind, TkIdent) {
+    err_u(p_error_here(p1, "expected a habitant name after `.` in a qualified unit"))
+  } else {
+    match kind_reg_resolve_qualifier(p.kind_reg, qual) {
+      None -> err_u(p_error(p, qt, concat_all(["`", qual, "` is not a declared kind or introducer"])))
+      Some(kind) -> ok_u(p_advance(p1), USym(kind_qualify_nondefault(kind, tok_source(p1.src, st))))
+    }
+  }
+}

@@ -1,0 +1,288 @@
+#[doc("""
+`extern` declaration parsing.
+""")]
+
+import compiler.util
+import compiler.lex_tokens
+import compiler.ast
+import compiler.decl_names
+import compiler.parse_state
+import compiler.parse_type_decls
+import compiler.parse
+import compiler.parse_fns
+import compiler.parse_extern_check
+
+#[doc("""
+Detect the legacy `[<extern_c>]` attribute prefix without consuming
+any tokens. We peek for the exact 3-token shape
+`[`, `<`, `extern_c` so the much-more-common `[` (a list literal
+at the top of a const) does not trigger. Returns true only when
+the migration error should fire. The parser then surfaces a
+diagnostic without trying to recover.
+""")]
+pub fn parse_at_legacy_extern_c_attribute(p: Parser) : Bool {
+  if not p_at(p, TkLbracket) { false }
+  else if not tk_is(p_peek1(p).kind, TkLt) { false }
+  else {
+    # Peek the third token (the attribute name). `p_peek1` is +1, so
+    # we advance once into the `<` and peek1 from there to get the
+    # ident slot. `extern_c` is the only attribute that lived inside
+    # `[<...>]` to date; other names are likely typos and still get
+    # the same migration message (cheaper than enumerating valid
+    # alternatives, none of which exist).
+    let p1 = p_advance(p)
+    let id = p_peek1(p1)
+    if not tk_is(id.kind, TkIdent) { false }
+    else { tok_source(p1.src, id) == "extern_c" }
+  }
+}
+
+#[doc("""
+Parse the form
+  extern STRING_LIT [ "(" STRING_LIT ")" ] [ "pub" ] "fn" name(...) : T [ / row ]
+into a `DAxiom` carrying its ABI. `t` is the `extern` token, used for
+line/col on the resulting decl.
+
+The optional `("symbol")` after the ABI literal is the runtime symbol.
+It must be a valid C identifier (`[A-Za-z_][A-Za-z0-9_]*`), so a
+typo'd quote does not silently link a symbol the user did not intend.
+Under `"kai"` it is mandatory: a core builtin is never named implicitly.
+""")]
+pub fn parse_extern_decl(p: Parser, t: Token) : PDecl / Console {
+
+  let p_abi = p_skip_newlines(p)
+  let abi_tok = p_peek(p_abi)
+  if not tk_is(abi_tok.kind, TkString) {
+    err_d(p_error(p_abi, abi_tok, "expected an ABI string literal after `extern` (only `\"C\"` is supported)"))
+  } else {
+    let abi_span = tok_source(p_abi.src, abi_tok)
+    if abi_span == "\"C\"" { parse_extern_c_decl(p_advance(p_abi), t) }
+    else if abi_span == "\"kai\"" { parse_extern_kai_decl(p_advance(p_abi), t) }
+    else {
+      err_d(p_error(p_abi, abi_tok,
+        concat_all(["unsupported FFI ABI ", abi_span, " — only \"C\" is supported"])))
+    }
+  }
+}
+
+fn parse_extern_c_decl(p1: Parser, t: Token) : PDecl / Console {
+  # After `extern "C"` the head can be a foreign TYPE declaration
+  # (`type Name = { ... }` struct, or the contextual keyword
+  # `opaque Name`) as well as a `fn`. A type head takes no
+  # `("symbol")` override and no `pub`.
+  let head = p_peek(p1)
+  if tk_is(head.kind, TkType) {
+    parse_extern_struct_decl(p_advance(p1), t)
+  } else if is_opaque_keyword(p1, head) {
+    parse_extern_opaque_decl(p_advance(p1), t)
+  } else {
+    # The override sits immediately after the ABI literal with no
+    # intervening newline, so a list literal on the next line is never
+    # mistaken for it.
+    let over_r = parse_optional_extern_c_override(p1)
+    match over_r.r {
+      None -> err_d(over_r.p)
+      Some(c_sym_over) -> match parse_extern_fn_head(over_r.p, "expected `fn`, `type`, or `opaque` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)") {
+        EFHead(p3, is_pub, true) ->
+          validate_extern_c_decl(parse_axiom_decl(p_advance(p3), is_pub, Some(AbiC), c_sym_over, t), t)
+        EFHead(p3, _, false) -> err_d(p3)
+      }
+    }
+  }
+}
+
+# `extern "kai"("<symbol>") [pub] fn name[T](...) : T / row` declares a
+# core builtin: boxed values in and out, any kaikai type, the row as
+# written. Which files may declare one is checked once the file's
+# resolved path is known, not here.
+fn parse_extern_kai_decl(p1: Parser, t: Token) : PDecl / Console {
+  let over_r = parse_optional_extern_c_override(p1)
+  match over_r.r {
+    None -> err_d(over_r.p)
+    Some(sym) ->
+      if sym == "" {
+        err_d(p_error_here(p1, "`extern \"kai\"` needs its runtime symbol: `extern \"kai\"(\"kai_core_<name>\") fn ...`"))
+      } else { match parse_extern_fn_head(over_r.p, "expected `fn` after `extern \"kai\"(\"<symbol>\")`") {
+        EFHead(p3, is_pub, true) -> parse_axiom_decl(p_advance(p3), is_pub, Some(AbiKai), sym, t)
+        EFHead(p3, _, false) -> err_d(p3)
+      } }
+  }
+}
+
+# The `[pub] fn` head after an extern's ABI and symbol: the parser at
+# `fn`, whether `pub` preceded it, and whether `fn` was found (else the
+# parser carries `msg`).
+type ExternFnHead = EFHead(Parser, Bool, Bool)
+
+fn parse_extern_fn_head(p: Parser, msg: String) : ExternFnHead / Console {
+  let p2 = p_skip_newlines(p)
+  let is_pub = tk_is(p_peek(p2).kind, TkPub)
+  let p3 = if is_pub { p_skip_newlines(p_advance(p2)) } else { p2 }
+  let fn_tok = p_peek(p3)
+  if tk_is(fn_tok.kind, TkFn) { EFHead(p3, is_pub, true) }
+  else { EFHead(p_error(p3, fn_tok, msg), is_pub, false) }
+}
+
+type PStr = { p: Parser, r: Option[String] }
+
+# Parse the optional `("real_symbol")` override after the ABI
+# literal. Returns:
+#   - `None` parser-error on a malformed override (unmatched paren,
+#     non-string token inside, or a non-C-identifier symbol);
+#   - `Some("")` when there is no override (caller will use the
+#     kaikai identifier as the C symbol);
+#   - `Some(s)` when the override is `s`.
+fn parse_optional_extern_c_override(p: Parser) : PStr / Console {
+
+  if not p_at(p, TkLparen) { PStr { p: p, r: Some("") } }
+  else {
+    let p1 = p_advance(p)
+    let sym_tok = p_peek(p1)
+    if not tk_is(sym_tok.kind, TkString) {
+      PStr { p: p_error(p1, sym_tok, "expected a C-symbol string literal inside `extern \"C\"(...)`"), r: None }
+    } else {
+      let sym_span = tok_source(p1.src, sym_tok)
+      let n = string_length(sym_span)
+      # The span includes the surrounding quotes — strip them.
+      let sym_clean = if n >= 2 { string_slice(sym_span, 1, n - 2) } else { "" }
+      if not is_valid_c_identifier(sym_clean) {
+        PStr {
+          p: p_error(p1, sym_tok,
+            concat_all(["invalid C symbol override ", sym_span,
+                        " — must match `[A-Za-z_][A-Za-z0-9_]*`"])),
+          r: None
+        }
+      } else {
+        let p2 = p_advance(p1)
+        if not p_at(p2, TkRparen) {
+          PStr { p: p_error_here(p2, "expected `)` to close `extern \"C\"(\"<symbol>\")` override"), r: None }
+        } else {
+          PStr { p: p_advance(p2), r: Some(sym_clean) }
+        }
+      }
+    }
+  }
+}
+
+# `opaque` is a CONTEXTUAL keyword — a plain identifier everywhere
+# except immediately after `extern "C"`, so the lexer keeps no
+# `TkOpaque` token. Recognise it by spelling at this one site.
+fn is_opaque_keyword(p: Parser, tok: Token) : Bool =
+  tk_is(tok.kind, TkIdent) and tok_source(p.src, tok) == "opaque"
+
+# Parse `extern "C" type Name = { field: T, ... }` — a C struct passed
+# by value across the boundary. The body reuses the
+# ordinary record-body parser (so field syntax, `priv`, and trailing
+# commas behave identically) and the resulting field list is rewrapped
+# into the foreign-type node. Field C-ABI validation runs in
+# `validate_extern_struct_decl`; here we only parse the shape.
+# `p` points just past the `type` keyword; `t` is the `extern` token.
+fn parse_extern_struct_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "expected an uppercase type name after `extern \"C\" type`"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkEq) {
+      err_d(p_error_here(p1, "expected `=` in `extern \"C\" type` declaration"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      if not p_at(p2, TkLbrace) {
+        err_d(p_error_here(p2, "expected `{` — `extern \"C\" type` must be a struct body `{ field: T, ... }`"))
+      } else {
+        let body_r = parse_record_body(p_skip_newlines(p_advance(p2)), [], false, name, [], [], t)
+        match body_r.r {
+          None -> body_r
+          Some(d) -> match d {
+            DType(_, _, _, TBRecord(fields), _, _, _, _) ->
+              validate_extern_struct_decl(name, fields, body_r.p, t)
+            _ -> err_d(p_error(body_r.p, t, "internal: extern struct body did not parse as a record"))
+          }
+        }
+      }
+    }
+  }
+}
+
+# Parse `extern "C" opaque Name` — an opaque C handle. No body, no `=`,
+# no fields. `p` points just past `opaque`.
+fn parse_extern_opaque_decl(p: Parser, t: Token) : PDecl / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "expected an uppercase type name after `extern \"C\" opaque`"))
+  } else {
+    let name = tok_source(p.src, id)
+    ok_dn(p_advance(p), DExternType(name, ETOpaque, t.line, t.col, None), [p_ent(p, NCExternType, name, true)])
+  }
+}
+
+#[doc("""
+Parse `axiom name[tparams](params) : T / row`. Mirrors
+`parse_fn_decl`'s prologue (name + tparams + params) but the
+return type is REQUIRED (no default `Unit`) and there is no body
+clause — `=` or `{` after the row annotation is rejected. The
+Decl carries everything `lower_axioms` needs to synthesise a
+`todo!` body in the desugar pass.
+
+`extern_c` is only set via `parse_extern_decl` routing through
+here; bare `axiom` decls always pass `extern_c=false,
+c_sym_over=""`.
+
+`c_sym_over` carries the optional C-symbol override (empty string
+when absent). Only meaningful when `extern_c` is true.
+""")]
+pub fn parse_axiom_decl(p: Parser, is_pub: Bool, abi: Option[ExternAbi], c_sym_over: String, t: Token) : PDecl / Console {
+
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected axiom name"))
+  } else if is_some(abi) and is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "function names must start with a lowercase letter"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    let tparams_r =
+      if p_at(p1, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PTParams { p: p1, r: Some([]) }
+      }
+    match tparams_r.r {
+      None -> err_d(tparams_r.p)
+      Some(tparams) -> {
+        let pp = tparams_r.p
+        if not p_at(pp, TkLparen) {
+          err_d(p_error_here(pp, "expected `(` after axiom name"))
+        } else {
+          let p2 = p_skip_newlines(p_advance(pp))
+          let params_r = parse_fn_params(p2, [])
+          match params_r.r {
+            None -> err_d(params_r.p)
+            Some(params) -> {
+              let p3 = p_skip_newlines(params_r.p)
+              if not p_at(p3, TkColon) {
+                err_d(p_error_here(p3, "axiom requires a return type — write `axiom name(...) : T`"))
+              } else {
+                let rt = parse_type(p_advance(p3))
+                match rt.r {
+                  None -> err_d(rt.p)
+                  Some(ty) -> {
+                    let row_r = parse_row_suffix(rt.p)
+                    let p4 = p_skip_newlines(row_r.p)
+                    if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
+                      err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
+                    } else {
+                      ok_dn(row_r.p, DAxiom(is_pub, abi, name, c_sym_over, tparams, params, ty, row_r.r, t.line, t.col),
+                            [p_ent(p, NCFn, name, is_pub)])
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
