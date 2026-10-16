@@ -71,11 +71,7 @@ spelling the way an `impl` head is.
 pub fn parse_derive_names(p: Parser, acc: [String]) : PDeriveNames / Console {
 
   let id = p_peek(p)
-  let qualified = tk_is(id.kind, TkIdent) and not is_upper_ident(p.src, id) and
-                  p_at(p_advance(p), TkDot) and
-                  tk_is(p_peek1(p_advance(p)).kind, TkIdent) and
-                  is_upper_ident(p.src, p_peek1(p_advance(p)))
-  if not tk_is(id.kind, TkIdent) or (not is_upper_ident(p.src, id) and not qualified) {
+  if not at_type_head(p, id) {
     PDeriveNames { p: p_error(p, id, "expected a protocol name in `#[derive(...)]`"), r: None }
   } else {
     let pq = parse_qualified_head_name(p, id)
@@ -93,15 +89,11 @@ pub fn parse_derive_names(p: Parser, acc: [String]) : PDeriveNames / Console {
 
 #[doc("Parses a `type` declaration after its keyword.")]
 pub fn parse_type_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
-
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
     err_d(p_error(p, id, "expected an uppercase type name after `type`"))
   } else {
-    let name = tok_source(p.src, id)
-    let p1 = p_advance(p)
-    let p1n = p_skip_newlines(p1)
-    # Optional type params `[a, b, c]`.
+    let p1n = p_skip_newlines(p_advance(p))
     let tparams_r =
       if p_at(p1n, TkLbracket) {
         parse_type_params_loop(p_skip_newlines(p_advance(p1n)), [])
@@ -110,76 +102,63 @@ pub fn parse_type_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
       }
     match tparams_r.r {
       None -> err_d(tparams_r.p)
-      Some(tparams) -> {
-        # Optional habitant-slot declaration `<m: Dim, n: Dim>` after the
-        # tparam bracket: fixes the per-slot kind and arity of the type's
-        # `<>` annotation. LL(1): a `<` here in decl position.
-        let slots_r =
-          if p_at(tparams_r.p, TkLt) {
-            parse_habitant_slots_loop(p_skip_newlines(p_advance(tparams_r.p)), [])
-          } else {
-            PHSlots { p: tparams_r.p, r: Some([]) }
-          }
-        match slots_r.r {
-          None -> err_d(slots_r.p)
-          Some(slots) -> {
-            let p2 = p_skip_newlines(slots_r.p)
-            if not p_at(p2, TkEq) {
-              err_d(p_error_here(p2, "expected `=` in type declaration"))
-            } else {
-              let p3 = p_skip_newlines(p_advance(p2))
-              parse_type_body(p3, is_pub, name, tparams, slots, t)
-            }
-          }
-        }
+      Some(tparams) -> parse_type_slots(tparams_r.p, is_pub, tok_source(p.src, id), tparams, t)
+    }
+  }
+}
+
+fn parse_type_slots(p: Parser, is_pub: Bool, name: String, tparams: [TBinder], t: Token) : PDecl / Console {
+  let slots_r =
+    if p_at(p, TkLt) {
+      parse_habitant_slots_loop(p_skip_newlines(p_advance(p)), [])
+    } else {
+      PHSlots { p: p, r: Some([]) }
+    }
+  match slots_r.r {
+    None -> err_d(slots_r.p)
+    Some(slots) -> {
+      let p2 = p_skip_newlines(slots_r.p)
+      if not p_at(p2, TkEq) {
+        err_d(p_error_here(p2, "expected `=` in type declaration"))
+      } else {
+        parse_type_body(p_skip_newlines(p_advance(p2)), is_pub, name, tparams, slots, t)
       }
     }
   }
 }
 
 fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
-
   if p_at(p, TkLbrace) {
-    let p1 = p_skip_newlines(p_advance(p))
-    parse_record_body(p1, [], is_pub, name, tparams, slots, t)
+    parse_record_body(p_skip_newlines(p_advance(p)), [], is_pub, name, tparams, slots, t)
   } else if p_at(p, TkPipe) {
-    # A leading bar marks a sum outright, which is what lets a
-    # one-member sum exist: without it `= X` is an alias, and no
-    # amount of lookahead can tell the two apart.
+    # A leading bar marks a sum outright, so a one-member sum can exist: without it `= X` is an alias.
     parse_sum_body(p_skip_newlines(p_advance(p)), [], [], is_pub, name, tparams, slots, t)
   } else {
-    # Sum or alias: check for an uppercase ident followed by `(` OR
-    # followed eventually by `|` to decide. Simpler approach: try to
-    # parse as sum; if the first variant is followed by `|`, continue
-    # as sum; otherwise, fall back to alias. But stage 1 mirrors stage
-    # 0: use the same heuristic — if the first token is Uppercase and
-    # the next is `(` OR further along we see `|`, treat as sum.
-    let hd = p_peek(p)
-    # A qualified head only enters the sum path when a `|` follows: on
-    # its own, `type T = m.U` is an alias.
-    if tk_is(hd.kind, TkIdent) and at_qualified_member(p, hd) and looks_like_sum(p) {
-      parse_sum_body(p, [], [], is_pub, name, tparams, slots, t)
-    } else if tk_is(hd.kind, TkIdent) and is_upper_ident(p.src, hd) {
-      # Effect alias body has the form `Eff1 + Eff2 + ...`. The `+`
-      # immediately after the first uppercase ident is the unambiguous
-      # signal: type aliases never use `+`, sums use `|`. Single-effect
-      # aliases (`type Foo = Console`) parse as TBAlias and are
-      # recognised at resolve time.
-      let nxt = p_peek1(p)
-      if tk_is(nxt.kind, TkPlus) {
-        let nm = tok_source(p.src, hd)
-        parse_effect_alias_body(p_advance(p_advance(p)), [RL(ref_written(nm), [])], is_pub, name, tparams, slots, t)
-      } else {
-        let is_sum = looks_like_sum(p)
-        if is_sum {
-          parse_sum_body(p, [], [], is_pub, name, tparams, slots, t)
-        } else {
-          parse_alias_body(p, is_pub, name, tparams, slots, t)
-        }
-      }
-    } else {
-      parse_alias_body(p, is_pub, name, tparams, slots, t)
-    }
+    parse_type_body_head(p, is_pub, name, tparams, slots, t)
+  }
+}
+
+fn parse_type_body_head(p: Parser, is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
+  let hd = p_peek(p)
+  # A qualified head only enters the sum path when a `|` follows: on its own, `type T = m.U` is an alias.
+  if tk_is(hd.kind, TkIdent) and at_qualified_member(p, hd) and looks_like_sum(p) {
+    parse_sum_body(p, [], [], is_pub, name, tparams, slots, t)
+  } else if tk_is(hd.kind, TkIdent) and is_upper_ident(p.src, hd) {
+    parse_type_body_upper(p, hd, is_pub, name, tparams, slots, t)
+  } else {
+    parse_alias_body(p, is_pub, name, tparams, slots, t)
+  }
+}
+
+# A `+` right after the first uppercase ident marks an effect alias; aliases of types never use `+`.
+fn parse_type_body_upper(p: Parser, hd: Token, is_pub: Bool, name: String, tparams: [TBinder],
+                         slots: [String], t: Token) : PDecl / Console {
+  if tk_is(p_peek1(p).kind, TkPlus) {
+    parse_effect_alias_body(p_advance(p_advance(p)), [RL(ref_written(tok_source(p.src, hd)), [])], is_pub, name, tparams, slots, t)
+  } else if looks_like_sum(p) {
+    parse_sum_body(p, [], [], is_pub, name, tparams, slots, t)
+  } else {
+    parse_alias_body(p, is_pub, name, tparams, slots, t)
   }
 }
 
@@ -241,56 +220,55 @@ fn looks_like_sum_after_nl(toks: [Token]) : Bool {
 
 #[doc("Parses the field list of a record type.")]
 pub fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
-
   let p0 = p_skip_newlines(p)
   if p_at(p0, TkRbrace) {
-    ok_dn(p_advance(p0), DType(is_pub, p_sym(p, NCType, name), tparams, TBRecord(list_reverse(acc)), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
+    record_decl_ok(p_advance(p0), acc, is_pub, name, tparams, slots, t)
   } else {
-    # A field may carry zero or more `#[json(...)]` overrides before its
-    # `priv`/name; they parse to `[FieldAttr]` on the FieldDecl.
     let fa = parse_field_attrs(p0, [])
     match fa.r {
       None -> err_d(fa.p)
-      Some(attrs) -> {
-        let pa = p_skip_newlines(fa.p)
-        # Optional `priv` qualifier marks the field private to the
-        # declaring module. Default visibility for record fields is
-        # public (record fields are the value's representation, not
-        # its API — the module is the unit of encapsulation in kaikai;
-        # the record is the unit of representation). Marking `priv`
-        # is the opt-out used when a field carries an invariant the
-        # module wants to enforce — e.g. `Map.root: Tree` where `Tree`
-        # is private to the `map` module.
-        let field_is_pub = not tk_is(p_peek(pa).kind, TkPriv)
-        let p_after_priv = if field_is_pub { pa } else { p_advance(pa) }
-        let ft = p_peek(p_after_priv)
-        if not tk_is(ft.kind, TkIdent) {
-          err_d(p_error(p_after_priv, ft, "expected field name in record type"))
-        } else {
-          let fname = tok_source(p_after_priv.src, ft)
-          let p1 = p_advance(p_after_priv)
-          if not p_at(p1, TkColon) {
-            err_d(p_error_here(p1, "expected `:` after field name"))
-          } else {
-            let rt = parse_type(p_advance(p1))
-            match rt.r {
-              None -> err_d(rt.p)
-              Some(ty) -> {
-                let fd = FD(field_is_pub, fname, ty, attrs)
-                let p2 = p_skip_newlines(rt.p)
-                if p_at(p2, TkComma) {
-                  parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, slots, t)
-                } else if p_at(p2, TkRbrace) {
-                  ok_dn(p_advance(p2), DType(is_pub, p_sym(p, NCType, name), tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col, None, slots), [p_ent(p, NCType, name, is_pub)])
-                } else {
-                  err_d(p_error_here(p2, "expected `,` or `}` in record type"))
-                }
-              }
-            }
-          }
-        }
+      Some(attrs) -> parse_record_field(p_skip_newlines(fa.p), attrs, acc, is_pub, name, tparams, slots, t)
+    }
+  }
+}
+
+fn record_decl_ok(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [TBinder],
+                  slots: [String], t: Token) : PDecl =
+  ok_dn(p, DType(is_pub, p_sym(p, NCType, name), tparams, TBRecord(list_reverse(acc)), t.line, t.col, None, slots),
+        [p_ent(p, NCType, name, is_pub)])
+
+# Fields are public unless marked `priv`.
+fn parse_record_field(pa: Parser, attrs: [FieldAttr], acc: [FieldDecl], is_pub: Bool, name: String,
+                      tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
+  let field_is_pub = not tk_is(p_peek(pa).kind, TkPriv)
+  let p_after_priv = if field_is_pub { pa } else { p_advance(pa) }
+  let ft = p_peek(p_after_priv)
+  if not tk_is(ft.kind, TkIdent) {
+    err_d(p_error(p_after_priv, ft, "expected field name in record type"))
+  } else {
+    let p1 = p_advance(p_after_priv)
+    if not p_at(p1, TkColon) {
+      err_d(p_error_here(p1, "expected `:` after field name"))
+    } else {
+      let rt = parse_type(p_advance(p1))
+      match rt.r {
+        None -> err_d(rt.p)
+        Some(ty) -> parse_record_field_end(rt.p, [FD(field_is_pub, tok_source(p_after_priv.src, ft), ty, attrs), ...acc],
+                                           is_pub, name, tparams, slots, t)
       }
     }
+  }
+}
+
+fn parse_record_field_end(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [TBinder],
+                          slots: [String], t: Token) : PDecl / Console {
+  let p2 = p_skip_newlines(p)
+  if p_at(p2, TkComma) {
+    parse_record_body(p_skip_newlines(p_advance(p2)), acc, is_pub, name, tparams, slots, t)
+  } else if p_at(p2, TkRbrace) {
+    record_decl_ok(p_advance(p2), acc, is_pub, name, tparams, slots, t)
+  } else {
+    err_d(p_error_here(p2, "expected `,` or `}` in record type"))
   }
 }
 
@@ -329,19 +307,18 @@ fn parse_json_field_attr(p: Parser) : PFAttr / Console {
     if not tk_is(kw.kind, TkIdent) {
       PFAttr { p: p_error(p1, kw, "expected `rename`, `default`, or `skip` in `#[json(...)]`"), r: None }
     } else {
-      let key = tok_source(p1.src, kw)
-      let p2 = p_advance(p1)
-      if key == "skip" {
-        parse_json_attr_close(p_skip_newlines(p2), FAJsonSkip)
-      } else if key == "rename" {
-        parse_json_rename_attr(p2)
-      } else if key == "default" {
-        parse_json_default_attr(p2)
-      } else {
-        PFAttr { p: p_error(p1, kw, "unknown `#[json(...)]` key — expected `rename`, `default`, or `skip`"), r: None }
-      }
+      parse_json_key(p1, kw)
     }
   }
+}
+
+fn parse_json_key(p1: Parser, kw: Token) : PFAttr / Console {
+  let key = tok_source(p1.src, kw)
+  let p2 = p_advance(p1)
+  if key == "skip" { parse_json_attr_close(p_skip_newlines(p2), FAJsonSkip) }
+  else if key == "rename" { parse_json_rename_attr(p2) }
+  else if key == "default" { parse_json_default_attr(p2) }
+  else { PFAttr { p: p_error(p1, kw, "unknown `#[json(...)]` key — expected `rename`, `default`, or `skip`"), r: None } }
 }
 
 fn parse_json_rename_attr(p: Parser) : PFAttr / Console {
@@ -388,28 +365,18 @@ fn parse_json_attr_close(p: Parser, a: FieldAttr) : PFAttr / Console {
 }
 
 fn parse_sum_body(p: Parser, acc: [Variant], racc: [NEnt], is_pub: Bool, name: String, tparams: [TBinder], slots: [String], t: Token) : PDecl / Console {
-
   let p0 = p_skip_newlines(p)
   let vt = p_peek(p0)
-  if not tk_is(vt.kind, TkIdent) or not (is_upper_ident(p0.src, vt) or at_qualified_member(p0, vt)) {
+  if not at_type_head(p0, vt) {
     err_d(p_error(p0, vt, "expected variant constructor name"))
   } else {
     let qn = parse_qualified_head_name(p0, vt)
-    let vname = qn.name
-    let p1 = qn.p
-    let args_r =
-      if p_at(p1, TkLparen) and at_qualified_member(p0, vt) {
-        PVariantArgs { p: p_error_here(p1, "a qualified union member names a declared type, so it takes no payload"), r: None }
-      } else if p_at(p1, TkLparen) {
-        parse_variant_args(p_skip_newlines(p_advance(p1)), [])
-      } else {
-        PVariantArgs { p: p1, r: Some([]) }
-      }
+    let args_r = parse_sum_variant_args(qn.p, p0, vt)
     match args_r.r {
       None -> err_d(args_r.p)
       Some(vargs) -> {
-        let vnode = Var(p_sym(p, NCCtor, vname), vargs)
-        let racc1 = [p_ent(p, NCCtor, vname, is_pub), ...racc]
+        let vnode = Var(p_sym(p, NCCtor, qn.name), vargs)
+        let racc1 = [p_ent(p, NCCtor, qn.name, is_pub), ...racc]
         let p2 = p_skip_newlines(args_r.p)
         if p_at(p2, TkPipe) {
           parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], racc1, is_pub, name, tparams, slots, t)
@@ -419,6 +386,16 @@ fn parse_sum_body(p: Parser, acc: [Variant], racc: [NEnt], is_pub: Bool, name: S
         }
       }
     }
+  }
+}
+
+fn parse_sum_variant_args(p1: Parser, p0: Parser, vt: Token) : PVariantArgs / Console {
+  if p_at(p1, TkLparen) and at_qualified_member(p0, vt) {
+    PVariantArgs { p: p_error_here(p1, "a qualified union member names a declared type, so it takes no payload"), r: None }
+  } else if p_at(p1, TkLparen) {
+    parse_variant_args(p_skip_newlines(p_advance(p1)), [])
+  } else {
+    PVariantArgs { p: p1, r: Some([]) }
   }
 }
 

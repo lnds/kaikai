@@ -133,7 +133,6 @@ type PStr = { p: Parser, r: Option[String] }
 #     kaikai identifier as the C symbol);
 #   - `Some(s)` when the override is `s`.
 fn parse_optional_extern_c_override(p: Parser) : PStr / Console {
-
   if not p_at(p, TkLparen) { PStr { p: p, r: Some("") } }
   else {
     let p1 = p_advance(p)
@@ -141,25 +140,28 @@ fn parse_optional_extern_c_override(p: Parser) : PStr / Console {
     if not tk_is(sym_tok.kind, TkString) {
       PStr { p: p_error(p1, sym_tok, "expected a C-symbol string literal inside `extern \"C\"(...)`"), r: None }
     } else {
-      let sym_span = tok_source(p1.src, sym_tok)
-      let n = string_length(sym_span)
-      # The span includes the surrounding quotes — strip them.
-      let sym_clean = if n >= 2 { string_slice(sym_span, 1, n - 2) } else { "" }
-      if not is_valid_c_identifier(sym_clean) {
-        PStr {
-          p: p_error(p1, sym_tok,
-            concat_all(["invalid C symbol override ", sym_span,
-                        " — must match `[A-Za-z_][A-Za-z0-9_]*`"])),
-          r: None
-        }
-      } else {
-        let p2 = p_advance(p1)
-        if not p_at(p2, TkRparen) {
-          PStr { p: p_error_here(p2, "expected `)` to close `extern \"C\"(\"<symbol>\")` override"), r: None }
-        } else {
-          PStr { p: p_advance(p2), r: Some(sym_clean) }
-        }
-      }
+      parse_extern_c_symbol(p1, sym_tok)
+    }
+  }
+}
+
+fn parse_extern_c_symbol(p1: Parser, sym_tok: Token) : PStr / Console {
+  let sym_span = tok_source(p1.src, sym_tok)
+  let n = string_length(sym_span)
+  let sym_clean = if n >= 2 { string_slice(sym_span, 1, n - 2) } else { "" }
+  if not is_valid_c_identifier(sym_clean) {
+    PStr {
+      p: p_error(p1, sym_tok,
+        concat_all(["invalid C symbol override ", sym_span,
+                    " — must match `[A-Za-z_][A-Za-z0-9_]*`"])),
+      r: None
+    }
+  } else {
+    let p2 = p_advance(p1)
+    if not p_at(p2, TkRparen) {
+      PStr { p: p_error_here(p2, "expected `)` to close `extern \"C\"(\"<symbol>\")` override"), r: None }
+    } else {
+      PStr { p: p_advance(p2), r: Some(sym_clean) }
     }
   }
 }
@@ -182,25 +184,25 @@ fn parse_extern_struct_decl(p: Parser, t: Token) : PDecl / Console {
   if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
     err_d(p_error(p, id, "expected an uppercase type name after `extern \"C\" type`"))
   } else {
-    let name = tok_source(p.src, id)
     let p1 = p_skip_newlines(p_advance(p))
     if not p_at(p1, TkEq) {
       err_d(p_error_here(p1, "expected `=` in `extern \"C\" type` declaration"))
     } else {
-      let p2 = p_skip_newlines(p_advance(p1))
-      if not p_at(p2, TkLbrace) {
-        err_d(p_error_here(p2, "expected `{` — `extern \"C\" type` must be a struct body `{ field: T, ... }`"))
-      } else {
-        let body_r = parse_record_body(p_skip_newlines(p_advance(p2)), [], false, name, [], [], t)
-        match body_r.r {
-          None -> body_r
-          Some(d) -> match d {
-            DType(_, _, _, TBRecord(fields), _, _, _, _) ->
-              validate_extern_struct_decl(name, fields, body_r.p, t)
-            _ -> err_d(p_error(body_r.p, t, "internal: extern struct body did not parse as a record"))
-          }
-        }
-      }
+      parse_extern_struct_body(p_skip_newlines(p_advance(p1)), tok_source(p.src, id), t)
+    }
+  }
+}
+
+fn parse_extern_struct_body(p2: Parser, name: String, t: Token) : PDecl / Console {
+  if not p_at(p2, TkLbrace) {
+    err_d(p_error_here(p2, "expected `{` — `extern \"C\" type` must be a struct body `{ field: T, ... }`"))
+  } else {
+    let body_r = parse_record_body(p_skip_newlines(p_advance(p2)), [], false, name, [], [], t)
+    match body_r.r {
+      None -> body_r
+      Some(DType(_, _, _, TBRecord(fields), _, _, _, _)) ->
+        validate_extern_struct_decl(name, fields, body_r.p, t)
+      Some(_) -> err_d(p_error(body_r.p, t, "internal: extern struct body did not parse as a record"))
     }
   }
 }
@@ -233,14 +235,12 @@ c_sym_over=""`.
 when absent). Only meaningful when `extern_c` is true.
 """)]
 pub fn parse_axiom_decl(p: Parser, is_pub: Bool, abi: Option[ExternAbi], c_sym_over: String, t: Token) : PDecl / Console {
-
   let id = p_peek(p)
   if not tk_is(id.kind, TkIdent) {
     err_d(p_error(p, id, "expected axiom name"))
   } else if is_some(abi) and is_upper_ident(p.src, id) {
     err_d(p_error(p, id, "function names must start with a lowercase letter"))
   } else {
-    let name = tok_source(p.src, id)
     let p1 = p_advance(p)
     let tparams_r =
       if p_at(p1, TkLbracket) {
@@ -250,39 +250,54 @@ pub fn parse_axiom_decl(p: Parser, is_pub: Bool, abi: Option[ExternAbi], c_sym_o
       }
     match tparams_r.r {
       None -> err_d(tparams_r.p)
-      Some(tparams) -> {
-        let pp = tparams_r.p
-        if not p_at(pp, TkLparen) {
-          err_d(p_error_here(pp, "expected `(` after axiom name"))
-        } else {
-          let p2 = p_skip_newlines(p_advance(pp))
-          let params_r = parse_fn_params(p2, [])
-          match params_r.r {
-            None -> err_d(params_r.p)
-            Some(params) -> {
-              let p3 = p_skip_newlines(params_r.p)
-              if not p_at(p3, TkColon) {
-                err_d(p_error_here(p3, "axiom requires a return type — write `axiom name(...) : T`"))
-              } else {
-                let rt = parse_type(p_advance(p3))
-                match rt.r {
-                  None -> err_d(rt.p)
-                  Some(ty) -> {
-                    let row_r = parse_row_suffix(rt.p)
-                    let p4 = p_skip_newlines(row_r.p)
-                    if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
-                      err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
-                    } else {
-                      ok_dn(row_r.p, DAxiom(is_pub, abi, name, c_sym_over, tparams, params, ty, row_r.r, t.line, t.col),
-                            [p_ent(p, NCFn, name, is_pub)])
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+      Some(tparams) ->
+        parse_axiom_params(tparams_r.p, AxiomHead { p0: p, is_pub: is_pub, abi: abi, c_sym: c_sym_over,
+                                                    t: t, name: tok_source(p.src, id), tparams: tparams })
     }
+  }
+}
+
+type AxiomHead = {
+  p0: Parser,
+  is_pub: Bool,
+  abi: Option[ExternAbi],
+  c_sym: String,
+  t: Token,
+  name: String,
+  tparams: [TBinder]
+}
+
+fn parse_axiom_params(pp: Parser, h: AxiomHead) : PDecl / Console {
+  if not p_at(pp, TkLparen) {
+    err_d(p_error_here(pp, "expected `(` after axiom name"))
+  } else {
+    let params_r = parse_fn_params(p_skip_newlines(p_advance(pp)), [])
+    match params_r.r {
+      None -> err_d(params_r.p)
+      Some(params) -> parse_axiom_ret(p_skip_newlines(params_r.p), h, params)
+    }
+  }
+}
+
+fn parse_axiom_ret(p3: Parser, h: AxiomHead, params: [Param]) : PDecl / Console {
+  if not p_at(p3, TkColon) {
+    err_d(p_error_here(p3, "axiom requires a return type — write `axiom name(...) : T`"))
+  } else {
+    let rt = parse_type(p_advance(p3))
+    match rt.r {
+      None -> err_d(rt.p)
+      Some(ty) -> parse_axiom_tail(rt.p, h, params, ty)
+    }
+  }
+}
+
+fn parse_axiom_tail(p: Parser, h: AxiomHead, params: [Param], ty: TypeExpr) : PDecl / Console {
+  let row_r = parse_row_suffix(p)
+  let p4 = p_skip_newlines(row_r.p)
+  if p_at(p4, TkEq) or p_at(p4, TkLbrace) {
+    err_d(p_error_here(p4, "axiom must not have a body — drop the `=` / `{` and trailing block"))
+  } else {
+    ok_dn(row_r.p, DAxiom(h.is_pub, h.abi, h.name, h.c_sym, h.tparams, params, ty, row_r.r, h.t.line, h.t.col),
+          [p_ent(h.p0, NCFn, h.name, h.is_pub)])
   }
 }
