@@ -1338,6 +1338,8 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+`==` on two arrays compares their contents, like every other container.
+
 `Ref[T]` cells — prefix `&` makes one, prefix `@` dereferences
 (`@x.f.g` walks a field path), `r := v` writes, and a record field
 holding a `Ref` writes through `rec.field := v`. Observable `Ref`

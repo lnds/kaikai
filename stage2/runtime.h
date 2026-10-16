@@ -8019,7 +8019,7 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
     if (a == b) {
         if (!a || kai_is_value(a)) return 1;
         switch ((KaiTag) a->tag) {
-            case KAI_REAL: case KAI_CONS: case KAI_VARIANT: case KAI_RECORD: case KAI_VEC: break;
+            case KAI_REAL: case KAI_CONS: case KAI_VARIANT: case KAI_RECORD: case KAI_VEC: case KAI_ARRAY: break;
             default: return 1;
         }
     }
@@ -8134,7 +8134,13 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
             return 1;
         }
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
-        case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
+        case KAI_ARRAY: {                /* contents; `array_same` is identity */
+            if (a->as.arr.len != b->as.arr.len) return 0;
+            for (int64_t i = 0; i < a->as.arr.len; ++i) {
+                if (!kai_op_eq(a->as.arr.items[i], b->as.arr.items[i])) return 0;
+            }
+            return 1;
+        }
         case KAI_VEC:     return kai_vec_eq(a, b);  /* value: structural */
         case KAI_REF:     return 0;      /* refs are identity-compared; a==b handled above */
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
@@ -9091,6 +9097,14 @@ static KaiValue *kai_core_array_length(KaiValue *a) {
     int64_t len = (kai_is_ptr(a) && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
     KaiValue *r = kai_int(len);
     if (a) kai_decref(a);
+    return r;
+}
+
+/* Identity: whether both handles are the one array. */
+static KaiValue *kai_core_array_same(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_bool(a == b);
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
     return r;
 }
 
@@ -12051,6 +12065,7 @@ KAI_CORE_THUNK1(uint32_to_int)
 KAI_CORE_THUNK1(uint64_to_int)
 KAI_CORE_THUNK1(int128_to_int)
 KAI_CORE_THUNK1(array_length_borrow)
+KAI_CORE_THUNK2(array_same)
 KAI_CORE_THUNK2(array_get_borrow)
 KAI_CORE_THUNK2(vec_make)
 KAI_CORE_THUNK0(vec_empty)

@@ -507,6 +507,7 @@ KAIX_CORE_THUNK2(array_make)
 KAIX_CORE_THUNK0(array_empty)
 KAIX_CORE_THUNK1(array_length)
 KAIX_CORE_THUNK1(array_length_borrow)
+KAIX_CORE_THUNK2(array_same)
 KAIX_CORE_THUNK2(array_get)
 KAIX_CORE_THUNK2(array_get_borrow)
 KAIX_CORE_THUNK2(array_take)
@@ -1301,6 +1302,7 @@ KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init)           { return k
 KaiValue *kaix_core_array_empty(void)                                 { return kai_core_array_empty(); }
 KaiValue *kaix_core_array_length(KaiValue *a)                         { return kai_core_array_length(a); }
 KaiValue *kaix_core_array_length_borrow(KaiValue *a)                  { return kai_core_array_length_borrow(a); }
+KaiValue *kaix_core_array_same(KaiValue *a, KaiValue *b)              { return kai_core_array_same(a, b); }
 KaiValue *kaix_core_array_get(KaiValue *a, KaiValue *i)               { return kai_core_array_get(a, i); }
 KaiValue *kaix_core_array_get_borrow(KaiValue *a, KaiValue *i)        { return kai_core_array_get_borrow(a, i); }
 KaiValue *kaix_core_array_take(KaiValue *a, KaiValue *i)              { return kai_core_array_take(a, i); }
