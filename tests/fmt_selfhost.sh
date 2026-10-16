@@ -59,9 +59,10 @@ pass=0
 skip=0
 n=0
 
-# Corpus: every stdlib source (recursive) + the stage2 compiler tree.
+# Corpus: every stdlib source (recursive) + the stage2 compiler tree + the
+# `kai` driver sources.
 # `find` keeps the list shell-independent — no glob-expansion surprises.
-corpus="$(find "$ROOT/stdlib" -name '*.kai' -type f; find "$ROOT/stage2/compiler" -name '*.kai' -type f)"
+corpus="$(find "$ROOT/stdlib" -name '*.kai' -type f; find "$ROOT/stage2/compiler" -name '*.kai' -type f; find "$ROOT/tools/kai" -name '*.kai' -type f)"
 
 for abs in $corpus; do
   rel="${abs#"$ROOT"/}"
