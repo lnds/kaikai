@@ -1223,7 +1223,8 @@ test-diagnostics-collected: kaic2
 	for fx in diags_t1_type_mismatch diags_t2_non_exhaustive \
 	          diags_t3_unbound_name diags_t4_wrong_arity \
 	          diags_t5_missing_effect diags_multiple_errors \
-	          diags_mono_bound diags_t3_pipe_cut; do \
+	          diags_mono_bound diags_t3_pipe_cut \
+	          diags_pattern_missing_module; do \
 	  src="examples/library_mode/$$fx.kai"; \
 	  exp="examples/library_mode/$$fx.diags.expected"; \
 	  out=$$(mktemp); \
