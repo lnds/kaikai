@@ -1,0 +1,168 @@
+#[doc("""
+The core functions a monomorphised program can reach.
+
+The reachability cut before inference keeps every impl an operator or a
+dispatcher may select, because it cannot see an operand's type. After
+monomorphisation the program is typed: a core function is kept only when
+something reached references it, a dispatcher reached selects it by the
+runtime head of a value, or an operator on operands that are not a
+primitive walks to it at run time. An operator on two `Int`s or two
+`Real`s is native and selects none.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.core_reach
+import compiler.core_refs
+import compiler.core_protos
+import compiler.proto_op_index
+
+type TcEnt = TcFn(Decl) | TcDisp(SymId) | TcGone
+
+type TcSt = { ix: NameIndex[TcEnt], declared: NameIndex[SymId], live: NameIndex[SymId], impls: [ProtoImplReg],
+              full: [SymId], lite: [SymId], work: [Decl], misses: [SymId] }
+
+#[doc("A pruned program and the dropped core functions it still references: each a reachability rule the earlier cut is missing.")]
+pub type TypedCut = TypedCut([Decl], [SymId])
+
+#[doc("`decls` without the core functions nothing in it can reach, and the functions of `dropped`, which an earlier cut removed, that it still references. `core_mods` are the core modules; `reg` the protocol registry.")]
+pub fn core_typed_cut(decls: [Decl], core_mods: [String], reg: ProtocolReg, dropped: [SymId]) : TypedCut / Console = {
+  let mods = tc_mods(core_mods, idx_empty())
+  let core = filter(decls, (d) => tc_core_fn(d, mods))
+  let ix0 = tc_gone(dropped, disp_protos_fold(reg.ids, tc_fns(core, idx_empty()), (ix, s, p) => idx_prepend_sym(ix, s, TcDisp(p))))
+  let st0 = TcSt { ix: ix0, declared: tc_declared(decls, idx_empty()), live: idx_empty(), impls: reg.impls,
+                   full: [], lite: [], work: [], misses: [] }
+  let st = tc_drain(tc_decls(filter(decls, (d) => not tc_core_fn(d, mods)), st0))
+  TypedCut(filter(decls, (d) => not tc_core_fn(d, mods) or tc_in(st.live, tc_sym(d))), st.misses)
+}
+
+fn tc_mods(ms: [String], ix: NameIndex[Bool]) : NameIndex[Bool] = match ms {
+  [] -> ix
+  [m, ...rest] -> tc_mods(rest, idx_prepend(ix, m, true))
+}
+
+fn tc_core_fn(d: Decl, mods: NameIndex[Bool]) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, Some(m)) -> match idx_chain(mods, m) {
+    [] -> false
+    _  -> true
+  }
+  _ -> false
+}
+
+fn tc_sym(d: Decl) : SymId = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)
+  _ -> sym_none()
+}
+
+fn tc_fns(ds: [Decl], ix: NameIndex[TcEnt]) : NameIndex[TcEnt] = match ds {
+  [] -> ix
+  [d, ...rest] -> tc_fns(rest, idx_prepend_sym(ix, tc_sym(d), TcFn(d)))
+}
+
+fn tc_gone(ss: [SymId], ix: NameIndex[TcEnt]) : NameIndex[TcEnt] = match ss {
+  [] -> ix
+  [s, ...rest] -> tc_gone(rest, idx_prepend_sym(ix, s, TcGone))
+}
+
+fn tc_declared(ds: [Decl], ix: NameIndex[SymId]) : NameIndex[SymId] = match ds {
+  [] -> ix
+  [d, ...rest] -> tc_declared(rest, match d {
+    DFn(_, _, _, _, _, _, _, _, _, _) -> idx_prepend_sym(ix, tc_sym(d), tc_sym(d))
+    _ -> ix
+  })
+}
+
+fn tc_in(ix: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(ix, s) {
+  [] -> false
+  _  -> true
+}
+
+fn tc_has(ss: [SymId], s: SymId) : Bool = match ss {
+  [] -> false
+  [h, ...rest] -> sym_same(h, s) or tc_has(rest, s)
+}
+
+fn tc_drain(st: TcSt) : TcSt / Console = match st.work {
+  [] -> st
+  [d, ...rest] -> tc_drain(tc_decl(d, TcSt { ...st, work: rest }))
+}
+
+fn tc_decls(ds: [Decl], st: TcSt) : TcSt / Console = match ds {
+  [] -> st
+  [d, ...rest] -> tc_decls(rest, tc_decl(d, st))
+}
+
+fn tc_decl(d: Decl, st: TcSt) : TcSt / Console = tc_exprs(cr_decl_exprs(d), st)
+
+fn tc_exprs(es: [Expr], st: TcSt) : TcSt / Console = match es {
+  [] -> st
+  [e, ...rest] -> tc_exprs(rest, tc_expr(e, st))
+}
+
+fn tc_expr(e: Expr, st: TcSt) : TcSt / Console = match e.kind {
+  ESym(s, _)       -> tc_ref(st, s)
+  EBinop(op, l, r) -> tc_positions(xp_positions(e), tc_binop(st, op, l, r))
+  EUnop(UoNeg, x)  -> tc_positions(xp_positions(e), if tc_native(x, x) { st } else { tc_lite(st, core_proto_id(CpNeg)) })
+  _                -> tc_positions(xp_positions(e), st)
+}
+
+fn tc_positions(ps: [XPos], st: TcSt) : TcSt / Console = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> tc_positions(rest, tc_expr(x, st))
+}
+
+# Two operands of one primitive type are compared and combined natively.
+fn tc_binop(st: TcSt, op: BinOp, l: Expr, r: Expr) : TcSt = match op_proto_core(binop_proto(op)) {
+  Some(cp) -> if tc_native(l, r) { st } else { tc_lite(st, core_proto_id(cp)) }
+  None     -> st
+}
+
+fn tc_native(l: Expr, r: Expr) : Bool = {
+  let k = tc_prim(l)
+  k != 0 and k == tc_prim(r)
+}
+
+fn tc_prim(e: Expr) : Int = match e.ty {
+  Some(TyInt)  -> 1
+  Some(TyReal) -> 2
+  _            -> 0
+}
+
+fn tc_ref(st: TcSt, s: SymId) : TcSt = match idx_chain_sym(st.ix, s) {
+  [] -> st
+  es -> if tc_in(st.live, s) { st }
+        else { tc_ents(TcSt { ...st, live: idx_prepend_sym(st.live, s, s) }, s, es) }
+}
+
+fn tc_ents(st: TcSt, s: SymId, es: [TcEnt]) : TcSt = match es {
+  [] -> st
+  [e, ...rest] -> tc_ents(tc_ent(st, s, e), s, rest)
+}
+
+fn tc_ent(st: TcSt, s: SymId, e: TcEnt) : TcSt = match e {
+  TcFn(d)   -> TcSt { ...st, work: [d, ...st.work] }
+  TcDisp(p) -> tc_full(st, p)
+  TcGone    -> if tc_in(st.declared, s) { st } else { TcSt { ...st, misses: [s, ...st.misses] } }
+}
+
+# A dispatcher picks any impl of its protocol by the runtime head of its first argument.
+fn tc_full(st: TcSt, p: SymId) : TcSt =
+  if sym_raw(p) < 0 or tc_has(st.full, p) { st }
+  else { tc_impls(TcSt { ...st, full: [p, ...st.full] }, p, (i) => true) }
+
+# An operator on a compound operand walks it at run time and reaches the impl of each member by its head.
+fn tc_lite(st: TcSt, p: SymId) : TcSt =
+  if sym_raw(p) < 0 or tc_has(st.full, p) or tc_has(st.lite, p) { st }
+  else { tc_impls(TcSt { ...st, lite: [p, ...st.lite] }, p, (i) => not cr_prim_impl(i)) }
+
+fn tc_impls(st: TcSt, p: SymId, keep: (ProtoImplReg) -> Bool) : TcSt =
+  tc_impl_refs(st, p, keep, st.impls)
+
+fn tc_impl_refs(st: TcSt, p: SymId, keep: (ProtoImplReg) -> Bool, is: [ProtoImplReg]) : TcSt = match is {
+  [] -> st
+  [i, ...rest] -> match i {
+    PIR(proto, _, _, f, _, _, _) ->
+      tc_impl_refs(if sym_same(proto, p) and keep(i) { tc_ref(st, f) } else { st }, p, keep, rest)
+  }
+}

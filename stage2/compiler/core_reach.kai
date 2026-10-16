@@ -23,12 +23,10 @@ import compiler.ast
 import compiler.decl_bodies
 import compiler.written
 import compiler.symtab
-import compiler.decl_text
 import compiler.expr_positions
 import compiler.infer_index
 import compiler.core_refs
 import compiler.core_protos
-import compiler.emit_shared
 import compiler.proto_op_index
 import compiler.impl_identity
 
@@ -39,7 +37,7 @@ pub type CoreCut = CoreCut([Decl], [SymId], [SymId])
 pub fn core_reach(decls: [Decl], tab: SymTab, core_mods: [String], reg: ProtocolReg, emptied: [SymId]) : CoreCut / Console = {
   let core_fns = filter(decls, (d) => cr_is_core_fn(d, core_mods))
   let st0 = CrSt { tab: tab, live: idx_empty(), fns: cr_index(core_fns, idx_empty()), impls: reg.impls,
-                   disps: reg.ids.shared, ops: op_index(reg.ops),
+                   disps: reg.ids.shared, ops: op_index(reg.ops), dprotos: disp_protos_index(reg.ids),
                    protos: [], lite: [], inert: [], bps: [], trigs: [], work: [], fields: cr_fields(decls, idx_empty()) }
   let st = cr_drain(cr_decls(filter(decls, (d) => not cr_is_core_fn(d, core_mods)), st0))
   let dropped = map(filter(core_fns, (d) => not cr_in(st.live, cr_sym(d))), cr_sym)
@@ -52,13 +50,6 @@ pub fn core_reach(decls: [Decl], tab: SymTab, core_mods: [String], reg: Protocol
 #[doc("The declared names of `ss`, for the note a cut prints.")]
 pub fn core_cut_names(tab: SymTab, ss: [SymId]) : [String] = map(ss, (s) => written_text(sym_name(tab, s)))
 
-#[doc("The names of the dropped core functions `decls` still reference, each a reachability rule pruning is missing. A specialisation is its template's id; a function some decl in `decls` declares is never a miss.")]
-pub fn core_cut_misses(decls: [Decl], tab: SymTab, dropped: [SymId]) : [String] / Console = {
-  let declared = cr_sym_set(map(filter(decls, cr_is_fn), cr_sym), idx_empty())
-  let ck = CrCheck { gone: cr_sym_set(dropped, idx_empty()), declared: declared, misses: [] }
-  list_uniq(map(cr_check_decls(decls, ck).misses, (s) => written_text(decl_name(tab, s))))
-}
-
 # ---- identities --------------------------------------------------------
 
 fn cr_is_core_fn(d: Decl, core_mods: [String]) : Bool = match d {
@@ -66,11 +57,6 @@ fn cr_is_core_fn(d: Decl, core_mods: [String]) : Bool = match d {
     Some(m) -> list_has(core_mods, m)
     None    -> false
   }
-  _ -> false
-}
-
-fn cr_is_fn(d: Decl) : Bool = match d {
-  DFn(_, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -101,7 +87,7 @@ fn cr_in(ix: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(ix, s) {
 # dispatchers of its operations: the typer calls one when it lowers an
 # operator, so a reached protocol reaches them too.
 type CrSt = { tab: SymTab, live: NameIndex[SymId], fns: NameIndex[Decl], impls: [ProtoImplReg],
-              disps: [ProtoDisp], ops: OpIndex, protos: [SymId], lite: [SymId], inert: [SymId], bps: [Int], trigs: [Int],
+              disps: [ProtoDisp], ops: OpIndex, dprotos: NameIndex[SymId], protos: [SymId], lite: [SymId], inert: [SymId], bps: [Int], trigs: [Int],
               work: [Decl], fields: NameIndex[Bool] }
 
 # The field names some record declares.
@@ -175,11 +161,6 @@ fn cr_ref_syms(st: CrSt, ss: [SymId]) : CrSt = match ss {
   [s, ...rest] -> cr_ref_syms(cr_ref_sym(st, s), rest)
 }
 
-fn cr_refs(st: CrSt, ns: [String]) : CrSt = match ns {
-  [] -> st
-  [n, ...rest] -> cr_refs(cr_ref(st, n), rest)
-}
-
 # A reached protocol reaches every impl and dispatcher of it.
 fn cr_proto(st: CrSt, p: SymId) : CrSt =
   if sym_raw(p) < 0 or cr_has_sym(st.protos, p) { st }
@@ -196,7 +177,8 @@ fn cr_proto_ops(st: CrSt, p: SymId) : CrSt =
                   cr_disp_fns(st.disps, p, []))
   }
 
-fn cr_prim_impl(i: ProtoImplReg) : Bool = match i {
+#[doc("True when the impl is for `Int` alone or `Real` alone, which a primitive operand never selects.")]
+pub fn cr_prim_impl(i: ProtoImplReg) : Bool = match i {
   PIR(_, t, _, _, args, _, _) -> cr_prim_homogeneous(t, args, DhScalar(TyInt)) or cr_prim_homogeneous(t, args, DhScalar(TyReal))
 }
 
@@ -261,9 +243,16 @@ fn cr_trig(st: CrSt, t: CoreTrigger) : CrSt = {
   let k = cr_trig_rank(t)
   if list_has_int(st.trigs, k) { st }
   else {
-    cr_refs(CrSt { ...st, trigs: [k, ...st.trigs] },
-            map(filter(variants[CoreFn](), (cf) => core_fn_fires_on(cf, t)), core_fn_name))
+    cr_core_fns(CrSt { ...st, trigs: [k, ...st.trigs] }, filter(variants[CoreFn](), (cf) => core_fn_fires_on(cf, t)))
   }
+}
+
+fn cr_core_fns(st: CrSt, cfs: [CoreFn]) : CrSt = match cfs {
+  [] -> st
+  [cf, ...rest] -> cr_core_fns(match core_fn_id(cf) {
+    Some(s) -> cr_ref_sym(st, s)
+    None    -> cr_ref(st, core_fn_name(cf))
+  }, rest)
 }
 
 fn cr_trig_rank(t: CoreTrigger) : Int = match t {
@@ -286,7 +275,21 @@ fn cr_decls(ds: [Decl], st: CrSt) : CrSt / Console = match ds {
 }
 
 fn cr_decl(d: Decl, st: CrSt) : CrSt / Console =
-  cr_exprs(cr_decl_exprs(d), st)
+  cr_exprs(cr_decl_exprs(d), cr_dispatcher(cr_fn_sym(d), st))
+
+fn cr_fn_sym(d: Decl) : SymId = match decl_transparent_inner(d) {
+  Some(inner) -> cr_fn_sym(inner)
+  None        -> cr_sym(d)
+}
+
+# A dispatcher whose body is scanned selects the impl of every protocol it answers.
+fn cr_dispatcher(s: SymId, st: CrSt) : CrSt =
+  if sym_raw(s) < 0 { st } else { cr_protos(st, idx_chain_sym(st.dprotos, s)) }
+
+fn cr_protos(st: CrSt, ps: [SymId]) : CrSt = match ps {
+  [] -> st
+  [p, ...rest] -> cr_protos(cr_proto(st, p), rest)
+}
 
 fn cr_exprs(es: [Expr], st: CrSt) : CrSt / Console = match es {
   [] -> st
@@ -297,9 +300,6 @@ fn cr_expr(e: Expr, st: CrSt) : CrSt / Console = match e.kind {
   EName(n)       -> cr_ref(st, written_text(n))
   ESym(s, _)     -> cr_ref_sym(st, s)
   EModCall(_, n) -> cr_ref(st, written_text(n))
-  ETodo(_)       ->
-    if proto_dispatch_marker_in(e) { match proto_dispatch_parts(e) { PDP(_, op) -> cr_op(st, op) } }
-    else { st }
   k -> cr_positions(xp_positions(e), cr_node(k, st))
 }
 
@@ -364,32 +364,3 @@ fn cr_ret_body(o: Option[HReturn]) : [Expr] = match o {
   Some(HR(_, b, _, _)) -> [b]
   None -> []
 }
-
-# ---- the post-lowering check -------------------------------------------
-
-type CrCheck = { gone: NameIndex[SymId], declared: NameIndex[SymId], misses: [SymId] }
-
-fn cr_check_decls(ds: [Decl], ck: CrCheck) : CrCheck / Console = match ds {
-  [] -> ck
-  [d, ...rest] -> cr_check_decls(rest, cr_check_exprs(cr_decl_exprs(d), ck))
-}
-
-fn cr_check_exprs(es: [Expr], ck: CrCheck) : CrCheck / Console = match es {
-  [] -> ck
-  [e, ...rest] -> cr_check_exprs(rest, cr_check_expr(e, ck))
-}
-
-fn cr_check_expr(e: Expr, ck: CrCheck) : CrCheck / Console = match e.kind {
-  ESym(s, _) -> cr_check_ref(ck, s)
-  _ -> cr_check_positions(xp_positions(e), ck)
-}
-
-fn cr_check_positions(ps: [XPos], ck: CrCheck) : CrCheck / Console = match ps {
-  [] -> ck
-  [XP(_, x), ...rest] -> cr_check_positions(rest, cr_check_expr(x, ck))
-}
-
-fn cr_check_ref(ck: CrCheck, s: SymId) : CrCheck =
-  if cr_in(ck.gone, s) and not cr_in(ck.declared, s) {
-    CrCheck { gone: ck.gone, declared: ck.declared, misses: [s, ...ck.misses] }
-  } else { ck }

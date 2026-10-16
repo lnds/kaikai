@@ -14402,6 +14402,12 @@ test-core-ops: $(TARGET)
 test-core-early-cut: $(TARGET)
 	@../tools/core-early-cut-gate.sh
 
+# After monomorphisation a core impl no reached call or operator
+# selects is dropped: a queue and a stack keep neither the Complex
+# arithmetic impls nor the structural Eq impls.
+test-core-typed-cut: $(TARGET)
+	@../tools/core-typed-cut-gate.sh
+
 test-core-cache: $(TARGET) bin-kai
 	@set -e; \
 	for f in ../examples/cache/corec_*.sh ../examples/cache/emitc_*.sh ../examples/cache/wrapper_*.sh ../examples/cache/ncoreobj_*.sh ../examples/cache/nmodular_*.sh; do \
