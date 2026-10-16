@@ -92,6 +92,11 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "${1:-}" = "--classify" ]; then
+  FMT_PROPERTY_CLASSIFY=1
+  export FMT_PROPERTY_CLASSIFY
+  shift
+fi
 KAIC2="$ROOT/stage2/kaic2"
 
 # A flagless kaic2 runs the oldest edition; fmt reproduces the surface
@@ -375,6 +380,11 @@ check_one() {
     { echo "  UNCOVERED $rel — valid-looking file the harness cannot evaluate:"
       sed 's/^/      /' "$b.err"; } >> "$failures"
     printf 'D' >> "$results"
+    return 0
+  fi
+
+  if [ -n "${FMT_PROPERTY_CLASSIFY:-}" ]; then
+    printf 'P' >> "$results"
     return 0
   fi
 

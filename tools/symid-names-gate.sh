@@ -22,7 +22,9 @@
 # tools/symid-census/pending-written.txt. `--final` fails while that
 # file has a row.
 #
-# Usage: symid-names-gate.sh [--final]
+# Usage: symid-names-gate.sh [--final] [--static | --compiled]
+#   --static    checks 1-4 only, no compiler needed
+#   --compiled  check 5 only
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,7 +32,22 @@ CENSUS="$ROOT/tools/symid-census"
 KAIC2="$ROOT/stage2/kaic2"
 EDITION="$(cat "$ROOT/EDITION")"
 
-python3 "$CENSUS/gate.py" "$ROOT/stage2/compiler" "$@"
+mode=all
+for a in "$@"; do
+  shift
+  case "$a" in
+    --static) mode=static ;;
+    --compiled) mode=compiled ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+
+if [ "$mode" != compiled ]; then
+  python3 "$CENSUS/gate.py" "$ROOT/stage2/compiler" "$@"
+fi
+if [ "$mode" = static ]; then
+  exit 0
+fi
 
 # The functions `--check-written-eq` reports for a program, one per line.
 compared() {

@@ -148,6 +148,7 @@ green `main` runs (no outliers; tier1 spread 25m40s–28m00s):
 |---|---|---|---|---|
 | **tier1** | tier1.yml | **27m 26s** | **yes (the gate)** | **yes** |
 | tier1-native | tier1-native.yml | 20m 29s | no | no |
+| fast-gates | tier1.yml | see §1a | no (aggregated by `tier1`) | no (parallel runner) |
 | tier0 | tier1.yml | 12m 35s | no | no (parallel runner) |
 | tier1-asan | tier1-asan.yml | 9m 21s¹ | no (path-gated) | no |
 
@@ -165,6 +166,26 @@ parallelism.
 `runs-on` migrated self-hosted m2 → github-hosted ubuntu in commit
 `54afa108`; the older `docs/lane-experience-tier1-perf.md` describes the
 **m2 world** (its 18m tier1 number is stale — the ubuntu number is 27m).
+
+### 1a. Fail-fast split of tier0
+
+`make tier0-gates` is two halves, each its own job in `tier1.yml`:
+
+- **`fast-gates`** (`make fast-gates`, `FAST_GATES` in the Makefile) — the
+  gates that read only sources and scripts: wiring, ledgers, audits, the
+  symid census (`test-symid-names-static`), namespace matrix, hermetic
+  script tests, `km` new-file grades. No compiler is built or run, so the
+  job starts right after `changes`, beside `build`, and reports in minutes.
+- **`tier0`** (`make kaic2-gates`, `KAIC2_GATES`) — the gates that need the
+  built kaic2, cheapest first: fmt-corpus classification
+  (`test-fmt-classify`, parse-only), the compiled half of the symid names
+  gate, builtin tables, kaic1 rejections, then the slow cache/demos gates.
+
+A gate lives in exactly one half; `tier0-gates` is their union and
+`make tier0` still runs everything plus the selfhost. A gate belongs in
+`FAST_GATES` only if it neither builds nor runs kaic1/kaic2 (a gate that
+SKIPs without a compiler must not go there: it would pass vacuously). The
+`tier1` aggregate requires `fast-gates` alongside `tier0` and the shards.
 
 ## 2. tier1 critical-path breakdown (from CI log timestamps)
 
