@@ -207,6 +207,11 @@ expect "lint: a library lints every module it owns" 0 "$(cat "$L/lint.expected")
 U="$ROOT/examples/lint/pkg_unit_scope"
 expect "lint: a package with an entry is linted as one unit" 0 "$(cat "$U/lint.expected")" \
   sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_unit_scope/||"' _ "$U" "$KAI"
+
+# A module the entry never imports is its own root, so it is linted too.
+N="$ROOT/examples/lint/pkg_unreached"
+expect "lint: a module the entry never imports is linted" 0 "$(cat "$N/lint.expected")" \
+  sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_unreached/||"' _ "$N" "$KAI"
 got="$(cd "$TMP/ws/lib" && "$KAI" typecheck --diags-json 2>/dev/null)"
 if [ "$(printf '%s\n' "$got" | grep -c '^{"file": .*"diagnostics": .*}$')" = 3 ] && [ "$(printf '%s\n' "$got" | wc -l | tr -d ' ')" = 3 ]; then
   ok "typecheck --diags-json: a library is one object per module, one per line"
