@@ -264,21 +264,6 @@ The cost is instructions retired (`/usr/bin/time -l` on macOS, `perf stat` on Li
 
 CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1.yml`), as the non-required `cost-ab` job: the PR's `kaic2-c` artifact against the base commit's bootstrap-cache `kaic2`, posted as one PR comment that later pushes update in place. A runner is noisy, so `up` there is a prompt to reproduce locally, not a verdict.
 
-## The c-modular core TU set — pruning against a cached core
-
-The c-modular backend (`--emit=c-modular`, what `bin/kai build --backend=c` uses) emits one translation unit per module. The core's TUs, with the two header slices each compiles against, are cached in the shared core-cache directory (`core-emit-<key>.kct`). A compile that finds the set for its inputs prunes the core to what the program reaches (`core_reach`, the early cut) and splices every cached core TU, so typing, monomorphising, Perceus and emitting never walk the unreached core.
-
-Two keys, because the TU text depends on the program only through a few global inputs:
-
-- the **pre-key** (`ec_pre_key`): format tag, toolchain id, edition, the core source hashes and the compiler arguments and `KAI_*` environment. It is computed before the core is typed and names an index file, `core-emit-pre-<pre-key>`.
-- the **variant** (`core_variant`): the core effects the program's own handlers make unwind, from the resolved program before the cut. A core function that can unwind is emitted with an unwind frame, so two variants need two TU sets. The index keeps up to `ec_index_cap` variants per pre-key, newest first; each line is `<variant> <content digest> <entry key>`.
-
-A compile prunes only against its own variant. With none recorded it compiles the whole core, as before, and records the variant, the entry key and a digest of the TUs; if a later full compile of the same variant digests differently the variant is marked `conflict` and never pruned against again.
-
-The functions the unwind analysis reads (`unw_feeds_analysis`: a function that handles an effect, declares a `var`, or whose row may cancel) are never cut in a c-modular build, so the pruned program yields the same frames as the whole one. Lifted lambdas and handler clauses of the cacheable modules are emitted into their module's TU, not the root.
-
-Gate: `make test-cmodular-prune` (tier0) primes a cache with one program and compiles the others against it, comparing every file with a no-cache compile — core TUs and their slices exactly, the root and library TUs as subsets. `CMOD_PRUNE_ALL=1` sweeps every example that has an `.out.expected`.
-
 ## Verification targets (root)
 
 - `make tier0` — fast pre-commit sanity (`selfhost` + `demos-no-regression` + arena + heap-limit). Run before committing compiler changes.
