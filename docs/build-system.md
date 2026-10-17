@@ -247,6 +247,22 @@ Caveats:
 
 Checks that the fast path builds the *same compiler* as the one in place: the fast-built staging binary and `./stage2/kaic2` must emit **byte-identical C** for the compiler itself (`main.kai`, single-TU) and for a sample program. Run it from a fixed point — `kaic2` built from the current source (right after `make kaic2` it proves bootstrap ≡ fast). It does not touch `kaic2`. Byte-identity of the *binaries* is not expected (multi-`.o` parallel link vs one `-O2` TU); identical emitted C is the functional-parity gate, consistent with how `selfhost` pins determinism.
 
+## `tools/cost-ab.sh` — compile-cost A/B
+
+A change to the compiler is held to its compile cost: an increase over noise blocks the merge until recovered. `tools/cost-ab.sh` is the one way to measure it. Both binaries compile **the same inputs** — the base tree's `stage2/main.kai` (self-compile, run from that tree's `stage2/`), an empty program, and any `.kai` files given — with the base tree's stdlib on an explicit `--path` (a `kaic2` bakes its stdlib path at build time, and a binary that compiled its own tree would charge the branch's source growth to the compiler). `KAI_THREADS=1`, one warm-up, then N alternating rounds (default 3).
+
+```sh
+tools/cost-ab.sh --base origin/main                      # base built from the ref, branch = ./stage2/kaic2
+tools/cost-ab.sh --base origin/main --rounds 5 prog.kai  # more rounds, one extra probe
+tools/cost-ab.sh <base-kaic2> <branch-kaic2> [prog.kai ...]
+```
+
+`--base <ref>` builds the ref in a cached worktree (`$TMPDIR/cost-ab/base-<sha>`) with two `make kaic2-fast` hops, so the base source is compiled by a compiler of the base's own code. It needs a built `stage2/kaic2` in this tree to seed from. Run on a quiet machine (load < 3).
+
+The cost is instructions retired (`/usr/bin/time -l` on macOS, `perf stat` on Linux), reported in millions (M); where a host exposes no counters (a virtualised runner) it falls back to CPU milliseconds and the header says so. Per probe it prints min/mean for both sides, the delta in units and %, and a verdict from the stated band: `up` when every branch round is above every base round, `down` when every one is below, else `noise`.
+
+CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1.yml`), as the non-required `cost-ab` job: the PR's `kaic2-c` artifact against the base commit's bootstrap-cache `kaic2`, posted as one PR comment that later pushes update in place. A runner is noisy, so `up` there is a prompt to reproduce locally, not a verdict.
+
 ## Verification targets (root)
 
 - `make tier0` — fast pre-commit sanity (`selfhost` + `demos-no-regression` + arena + heap-limit). Run before committing compiler changes.

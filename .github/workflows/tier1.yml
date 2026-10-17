@@ -693,6 +693,96 @@ jobs:
             git status; exit 1
           fi
 
+  # Compile-cost A/B against the PR's base, posted as one updating PR comment.
+  # Not in the tier1 aggregator's `needs`: it informs, never blocks, and runs
+  # beside the shards. The base compiler comes from the exact-match bootstrap
+  # cache (main's build saved it) and is built here only on a miss.
+  cost-ab:
+    needs: [changes, build]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: head
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - name: Install toolchain
+        working-directory: head
+        run: ./tools/ci-install-toolchain.sh
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Resolve the release boot
+        id: boot
+        working-directory: base
+        run: |
+          id="$(tools/kaic-boot.sh release-id)"
+          echo "id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+      - name: Restore the base bootstrap chain
+        id: base-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            base/stage0/*.o
+            base/stage0/kaic0
+            base/stage1/kaic1
+            base/stage1/build/stage1.c
+            base/stage2/kaic2
+            base/stage2/build/stage2.c
+            base/stage2/build/stage2.c.id
+            base/stage2/build/kaic2.id
+          key: kaic2-c-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('base/Makefile', 'base/EDITION', 'base/stage0/**', 'base/stage1/**', 'base/stage2/**', 'base/stdlib/**', 'base/tools/ci-touch-build.sh', 'base/tools/kaic-boot.sh', 'base/tools/kaic-link.sh') }}
+      - name: Restore boot objects
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: base/stage2/build/obj-cache
+          key: kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-${{ github.event.pull_request.base.sha }}
+          restore-keys: |
+            kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-
+      - name: Build the base compiler
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        working-directory: base
+        env:
+          KAIC_BOOT_MODULAR: 1
+        run: make CC=clang kaic1 kaic2
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+          path: pr-artifact
+      - name: Measure and post
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          chmod +x base/stage2/kaic2 pr-artifact/stage2/kaic2
+          head/tools/cost-ab.sh --markdown --base-tree "$PWD/base" \
+            base/stage2/kaic2 pr-artifact/stage2/kaic2 > cost-ab.md
+          cat cost-ab.md
+          {
+            echo '<!-- cost-ab -->'
+            echo "### Compile cost vs \`${GITHUB_BASE_REF}\` (\`${{ github.event.pull_request.base.sha }}\`)"
+            echo
+            cat cost-ab.md
+            echo
+            echo '_`tools/cost-ab.sh`; a CI runner is noisy, so a flagged `up` is a prompt to re-run locally with `tools/cost-ab.sh --base origin/main`._'
+          } > comment.md
+          id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- cost-ab -->")) | .id' | head -1)"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md >/dev/null
+          fi
+
   # Aggregator: the REQUIRED check. Green iff fast-gates, tier0, every shard and, when
   # the diff reaches its paths, tier1-asan are green: a job left out of
   # `needs` runs without blocking anything. Keeping the name `tier1` means
