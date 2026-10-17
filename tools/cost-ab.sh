@@ -30,6 +30,9 @@
 #                     directory per side and probe. cold empties it before every
 #                     run; warm primes it in the warm-up and reuses it.
 #   --markdown        Print the table as GitHub markdown.
+#   --fail-above <pct>
+#                     Exit 1 when self-compile or the empty program is "up" by
+#                     more than <pct> percent.
 #
 # Unit: millions of instructions retired (macOS, Linux with perf), else CPU
 # milliseconds.
@@ -48,6 +51,7 @@ BRANCH_TREE=""
 MARKDOWN=0
 CACHE_MODE=""
 FLOOR_PCT=0.1
+FAIL_ABOVE=""
 pos=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,6 +61,7 @@ while [ $# -gt 0 ]; do
     --rounds) ROUNDS="${2:?--rounds needs a number}"; shift 2 ;;
     --cache) CACHE_MODE="${2:?--cache needs cold or warm}"; shift 2 ;;
     --markdown) MARKDOWN=1; shift ;;
+    --fail-above) FAIL_ABOVE="${2:?--fail-above needs a percentage}"; shift 2 ;;
     -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) pos+=("$1"); shift ;;
   esac
@@ -117,18 +122,35 @@ trap 'rm -rf "$WORK"' EXIT
 : > "$WORK/empty.kai"
 
 # Instructions retired where the host exposes them, else CPU milliseconds
-# (virtualised Linux runners have no hardware counters).
+# (virtualised Linux runners have no hardware counters). Each writes the
+# count to $WORK/count and the compiler's stderr to $WORK/err, and returns the
+# compiler's exit status: a compile that fails measures nothing.
 UNIT=M
 case "$(uname -s)" in
   Darwin) DIV=1000000
-    measure_cmd() { /usr/bin/time -l "$@" 2>&1 >/dev/null | awk '/instructions retired/ {print $1}'; } ;;
+    measure_cmd() {
+      local rc=0
+      /usr/bin/time -l "$@" >/dev/null 2>"$WORK/err" || rc=$?
+      awk '/instructions retired/ {print $1}' "$WORK/err" > "$WORK/count"
+      return $rc
+    } ;;
   Linux)
-    perf_count() { perf stat -x, -e instructions:u "$@" 2>&1 >/dev/null | awk -F, '/instructions/ && $1 ~ /^[0-9]+$/ {print $1}'; }
-    if command -v perf >/dev/null && [ -n "$(perf_count true)" ]; then
+    perf_count() {
+      local rc=0
+      perf stat -x, -o "$WORK/perf" -e instructions:u "$@" >/dev/null 2>"$WORK/err" || rc=$?
+      awk -F, '/instructions/ && $1 ~ /^[0-9]+$/ {print $1}' "$WORK/perf" > "$WORK/count"
+      return $rc
+    }
+    if command -v perf >/dev/null && perf_count true && [ -s "$WORK/count" ]; then
       DIV=1000000; measure_cmd() { perf_count "$@"; }
     else
       UNIT=ms; DIV=1
-      measure_cmd() { /usr/bin/time -f '%U %S' "$@" 2>&1 >/dev/null | awk 'END {printf "%d", ($1 + $2) * 1000}'; }
+      measure_cmd() {
+        local rc=0
+        /usr/bin/time -f '%U %S' -o "$WORK/time" "$@" >/dev/null 2>"$WORK/err" || rc=$?
+        awk 'END {printf "%d", ($1 + $2) * 1000}' "$WORK/time" > "$WORK/count"
+        return $rc
+      }
     fi ;;
   *) die "unsupported platform" ;;
 esac
@@ -144,11 +166,14 @@ run_probe() {
   fi
   if [ "$file" = selfhost ]; then dir="$BASE_TREE/stage2"; file=main.kai
   else dir="$(dirname "$file")"; file="$(basename "$file")"; fi
-  n="$(cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" ${cflags[@]+"${cflags[@]}"} "$file")"
+  (cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" ${cflags[@]+"${cflags[@]}"} "$file") \
+    || { tail -20 "$WORK/err" >&2; die "$bin failed on $file"; }
+  n="$(cat "$WORK/count")"
   [ -n "$n" ] || die "no measurement from $bin on $file"
   echo $((n / DIV))
 }
 
+over=0
 probes=(selfhost "$WORK/empty.kai")
 for p in "${progs[@]+"${progs[@]}"}"; do probes+=("$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"); done
 
@@ -188,9 +213,14 @@ for p in "${probes[@]}"; do
   pct="$(awk -v d="$delta" -v b="$bmean" 'BEGIN{printf "%+.2f", b ? 100*d/b : 0}')"
   [ "$verdict" != noise ] && awk -v p="$pct" -v f="$FLOOR_PCT" 'BEGIN{exit !((p < 0 ? -p : p) < f)}' && verdict=noise
   band="base ${bmin}..${bmax}, branch ${rmin}..${rmax}"
+  if [ -n "$FAIL_ABOVE" ] && [ "$verdict" = up ] && { [ "$p" = selfhost ] || [ "$p" = "$WORK/empty.kai" ]; } \
+     && awk -v p="$pct" -v f="$FAIL_ABOVE" 'BEGIN{exit !(p > f)}'; then
+    verdict="up, over the ${FAIL_ABOVE}% budget"; over=1
+  fi
   if [ "$MARKDOWN" = 1 ]; then
     echo "| $(label "$p") | $bmin / $bmean | $rmin / $rmean | $(printf '%+d' "$delta") | $pct | $verdict ($band) |"
   else
     printf '%-28s %22s %22s %12s %8s  %s (%s)\n' "$(label "$p")" "$bmin / $bmean" "$rmin / $rmean" "$(printf '%+d' "$delta")" "$pct" "$verdict" "$band"
   fi
 done
+[ "$over" = 0 ]
