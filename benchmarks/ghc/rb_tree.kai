@@ -1,0 +1,124 @@
+# examples/perceus/rb_tree.kai — pure-functional red-black tree.
+#
+# The canonical Perceus showcase from Reinking, Xie, de Moura,
+# Leijen (2021) "Perceus: Garbage Free Reference Counting with
+# Reuse" (POPL'21), section 7. Insert rebuilds the spine from
+# leaf to root via constant-arity `RBNode` rewrites — exactly
+# the shape that issue #210's reuse-in-place transform is
+# designed to optimise.
+#
+# Used by examples/perceus/rb_tree_bench.kai for the Hanga Roa
+# Definition-of-Done #4 measurement (inner-loop benchmark within
+# ~1.5–1.7× of a C reference).
+#
+# Algorithm: Okasaki-style functional insert with the four
+# balance-rotation cases. Roots are repainted black after each
+# top-level insert. Single-key keys (Int → Int) keep the layout
+# small so allocation cost dominates pointer chasing.
+#
+# `RBTree` / `RBNode` / `RBLeaf` are RB-prefixed to avoid
+# colliding with `Tree[k, v]` from `stdlib/collections/map.kai`,
+# which the kai driver auto-loads as part of the prelude.
+
+pub type Color = Red | Black
+pub type RBTree = RBLeaf | RBNode(Color, RBTree, Int, Int, RBTree)
+
+# Lean4/Koka-style red-black insert (the modulo-cons shape).
+#
+# This is the form Koka's bench/rbtree.kk uses (adapted from
+# lean4/IFL19). Unlike Okasaki's monolithic `balance`, the common
+# descent in `insert_loop` rebuilds the spine via a constructor in
+# *tail position* — `RBNode(Red, insert_loop(l, ...), k0, v0, r)` —
+# which is exactly the Tail-Recursion-Modulo-Cons shape the TRMC
+# codegen pass recognises (Leijen & Lorenzen, POPL'22). Rebalancing
+# is deferred to the two narrow `balance_left`/`balance_right`
+# rotations, invoked only under an `is_red` guard.
+
+# Is the root of `t` a red node?
+fn is_red(t: RBTree) : Bool = match t {
+  RBNode(Red, _, _, _, _) -> true
+  _                       -> false
+}
+
+# Left-leaning rebalance after inserting into a red left subtree.
+# Mirror of Koka rbtree.kk `balance-left`.
+fn balance_left(l: RBTree, k: Int, v: Int, r: RBTree) : RBTree =
+  match l {
+    RBNode(_, RBNode(Red, lx, kx, vx, rx), ky, vy, ry) ->
+      RBNode(Red, RBNode(Black, lx, kx, vx, rx), ky, vy, RBNode(Black, ry, k, v, r))
+    RBNode(_, ly, ky, vy, RBNode(Red, lx, kx, vx, rx)) ->
+      RBNode(Red, RBNode(Black, ly, ky, vy, lx), kx, vx, RBNode(Black, rx, k, v, r))
+    RBNode(_, lx, kx, vx, rx) ->
+      RBNode(Black, RBNode(Red, lx, kx, vx, rx), k, v, r)
+    RBLeaf -> RBLeaf
+  }
+
+# Right-leaning rebalance after inserting into a red right subtree.
+# Mirror of Koka rbtree.kk `balance-right`.
+fn balance_right(l: RBTree, k: Int, v: Int, r: RBTree) : RBTree =
+  match r {
+    RBNode(_, RBNode(Red, lx, kx, vx, rx), ky, vy, ry) ->
+      RBNode(Red, RBNode(Black, l, k, v, lx), kx, vx, RBNode(Black, rx, ky, vy, ry))
+    RBNode(_, lx, kx, vx, RBNode(Red, ly, ky, vy, ry)) ->
+      RBNode(Red, RBNode(Black, l, k, v, lx), kx, vx, RBNode(Black, ly, ky, vy, ry))
+    RBNode(_, lx, kx, vx, rx) ->
+      RBNode(Black, l, k, v, RBNode(Red, lx, kx, vx, rx))
+    RBLeaf -> RBLeaf
+  }
+
+# Insert in the Koka `ins` shape. The Red-node and Black-node arms
+# each recur through a constructor in tail position (modulo-cons);
+# only the rebalancing sub-case detours through balance_left/right.
+pub fn insert_loop(t: RBTree, k: Int, v: Int) : RBTree = match t {
+  RBNode(Red, l, kx, vx, r) ->
+    if k < kx      { RBNode(Red, insert_loop(l, k, v), kx, vx, r) }
+    else if k > kx { RBNode(Red, l, kx, vx, insert_loop(r, k, v)) }
+    else           { RBNode(Red, l, k, v, r) }
+  RBNode(Black, l, kx, vx, r) ->
+    if k < kx {
+      if is_red(l) { balance_left(insert_loop(l, k, v), kx, vx, r) }
+      else         { RBNode(Black, insert_loop(l, k, v), kx, vx, r) }
+    }
+    else if k > kx {
+      if is_red(r) { balance_right(l, kx, vx, insert_loop(r, k, v)) }
+      else         { RBNode(Black, l, kx, vx, insert_loop(r, k, v)) }
+    }
+    else { RBNode(Black, l, k, v, r) }
+  RBLeaf -> RBNode(Red, RBLeaf, k, v, RBLeaf)
+}
+
+# Top-level insert. Always repaints the root black per Okasaki
+# §3.3. The match arm on RBLeaf is unreachable (insert_loop never
+# returns RBLeaf for non-Leaf input, and a Leaf input becomes a
+# Red node above), but kept for exhaustiveness.
+pub fn rb_insert(t: RBTree, k: Int, v: Int) : RBTree = match insert_loop(t, k, v) {
+  RBNode(_, l, k0, v0, r) -> RBNode(Black, l, k0, v0, r)
+  RBLeaf                  -> RBLeaf
+}
+
+# Lookup: standard BST descent. Returns -1 on miss; the caller
+# distinguishes via separate contains check if needed (the
+# benchmark only counts hits, not the value itself).
+pub fn rb_get(t: RBTree, k: Int) : Int = match t {
+  RBLeaf -> 0 - 1
+  RBNode(_, l, k0, v0, r) ->
+    if k < k0      { rb_get(l, k) }
+    else if k > k0 { rb_get(r, k) }
+    else           { v0 }
+}
+
+pub fn rb_size(t: RBTree) : Int = match t {
+  RBLeaf                 -> 0
+  RBNode(_, l, _, _, r)  -> 1 + rb_size(l) + rb_size(r)
+}
+
+# Black-height + 2 ≤ height ≤ 2 · black-height for a valid RB
+# tree. We track raw height (longest root-to-leaf path) so the
+# benchmark can sanity-check that 1M random inserts produced a
+# tree with depth in the expected range (≈ 2 · log2(N) ≈ 40).
+fn rb_max(a: Int, b: Int) : Int = if a > b { a } else { b }
+
+pub fn rb_height(t: RBTree) : Int = match t {
+  RBLeaf                -> 0
+  RBNode(_, l, _, _, r) -> 1 + rb_max(rb_height(l), rb_height(r))
+}
