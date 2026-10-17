@@ -259,6 +259,8 @@ pub fn join_loop(xs: [String], sep: String) : [String] = match xs {
   [x, ...rest] -> [sep, x, ...join_loop(rest, sep)]
 #                               ^^^^^^^^^ non_tail_list_recursion
 }
+
+fn main() : Int = 0
 ```
 
 The call is flagged when its argument is a rest binder (`...rest`) of a
@@ -272,6 +274,8 @@ pub fn join_acc(xs: [String], sep: String, acc: [String]) : [String] = match xs 
   []           -> list_reverse(acc)
   [x, ...rest] -> join_acc(rest, sep, [x, sep, ...acc])
 }
+
+fn main() : Int = 0
 ```
 
 A cons with one head (`[h, ...f(t)]`) or a constructor whose only
