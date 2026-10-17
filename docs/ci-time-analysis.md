@@ -115,7 +115,7 @@
 >
 > `tier1-native` ran ~105 single-fixture gates as serial workflow steps on
 > shards 1 and 2. They now run as one `make -j` per shard over
-> `stage2/test-lists/native-gates-{1,2}.txt`. Three gates hide the
+> the `native-gates-{1,2}` rows of `stage2/test-registry.txt`. Three gates hide the
 > runtime bitcode in `stage0/` while they run, so they stay serial steps.
 > The bin/kai native-wrapper targets run on shard 1, the lightest native shard.
 >

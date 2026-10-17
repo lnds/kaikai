@@ -334,6 +334,18 @@ if [ -z "${FMT_PROPERTY_TMP:-}" ]; then
   : > "$failures"
 fi
 
+# The `.fmt-class` of the nearest ancestor directory that has one.
+fmt_class() {
+  d="$1"
+  while [ "$d" != "$ROOT" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/.fmt-class" ]; then
+      cat "$d/.fmt-class"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+}
+
 # Worker — one fixture, invoked via `xargs -P $JOBS -n 1`.
 #
 # Appends exactly one status char to $results and, on failure or a stale
@@ -355,21 +367,24 @@ check_one() {
   #   N  negative by design — an `.err.expected` golden (own name or a
   #      sibling's: modules-family negatives diagnose at the importing
   #      root, so their support modules fail as roots too and the
-  #      golden carries the root's name), the `.err.kai` spelling, or
-  #      the examples/negative/ tree, or a `--diags-json` fixture whose
-  #      point is the rejected program.
-  #   X  non-subject by design — fmt golden-suite inputs (measured by
-  #      tests/fmt_fixtures.sh, deliberately not whole programs) and
-  #      aspirational code that does not compile yet.
+  #      golden carries the root's name), the `.err.kai` spelling, a
+  #      `# fixture: negative` line in the file, or a `.fmt-class`
+  #      holding `negative` in the file's directory or an ancestor.
+  #   X  non-subject by design — a `.fmt-class` holding `nonsubject`
+  #      (fmt golden-suite inputs, aspirational code that does not
+  #      compile yet).
   #   D  coverage debt — everything else. FAILS the run: either the
   #      harness learns to resolve the file or it gets classified.
   if ! "$KAIC2" $EDITION_FLAG $KPATH $extra --ast "$abs" > "$b.ast0" 2> "$b.err"; then
     case "$rel" in
-      *.err.kai)                printf 'N' >> "$results"; return 0 ;;
-      examples/negative/*)      printf 'N' >> "$results"; return 0 ;;
-      examples/library_mode/diags_pattern_missing_module.kai) printf 'N' >> "$results"; return 0 ;;
-      examples/fmt/*)           printf 'X' >> "$results"; return 0 ;;
-      examples/aspirational/*)  printf 'X' >> "$results"; return 0 ;;
+      *.err.kai) printf 'N' >> "$results"; return 0 ;;
+    esac
+    if grep -q '^# fixture: negative$' "$abs"; then
+      printf 'N' >> "$results"; return 0
+    fi
+    case "$(fmt_class "$dir")" in
+      negative)   printf 'N' >> "$results"; return 0 ;;
+      nonsubject) printf 'X' >> "$results"; return 0 ;;
     esac
     for g in "$dir"/*.err.expected; do
       if [ -f "$g" ]; then

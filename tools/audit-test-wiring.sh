@@ -10,10 +10,14 @@
 #      referenced somewhere outside its own definition, `.PHONY`, and
 #      comments — by an aggregate list, another recipe, a workflow, or
 #      a tools/ script.
-#   B. Every examples/ level-1 directory containing .kai fixtures is
-#      mentioned by some harness source (Makefiles, tools/, workflows).
+#   B. Every examples/ level-1 directory containing .kai fixtures has a
+#      FIXTURES manifest or is mentioned by some harness source
+#      (Makefiles, tools/, workflows).
 #   C. Every examples/packages/ fixture directory is named by some
 #      harness (tools/test-packages.sh enumerates fixtures by hand).
+#   E. Every recipe that runs the compiler over an examples/ glob passes
+#      the stdlib path: a fixture dropped into the directory imports
+#      stdlib and must resolve it.
 #   D. Target allowlist entries must still be unwired — a wired one is
 #      stale and fails, so the target list self-cleans. Checked with A.
 #
@@ -42,8 +46,8 @@ allow() { grep -qE "^$1:$2:" "$ALLOWLIST"; }
 # only by .PHONY or a comment still counts as orphaned. For fixture
 # dirs: the full harness sources, comments stripped. Workflows and
 # tools/ scripts count for both (this audit and its allowlist excluded),
-# and so do the target lists the Makefile reads.
-cat .github/workflows/*.yml stage2/test-lists/*.txt > "$tmp/shared"
+# and so does the registry the Makefile reads.
+cat .github/workflows/*.yml stage2/test-registry.txt > "$tmp/shared"
 find tools -name '*.sh' ! -name 'audit-test-wiring.sh' -exec cat {} + >> "$tmp/shared"
 
 grep -hE '\btest-[a-z0-9-]+' $MAKEFILES \
@@ -57,6 +61,7 @@ cat "$tmp/shared" >> "$tmp/refs_all"
 
 target_wired() { grep -qE "(^|[^a-z0-9-])$1(\$|[^a-z0-9-])" "$tmp/refs"; }
 dir_wired() {
+  [ -f "$1/FIXTURES" ] && return 0
   grep -qF "$1" "$tmp/refs_all" \
     || grep -qE "(^|[^a-zA-Z0-9_])${1#examples/}([^a-zA-Z0-9_]|\$)" "$tmp/refs_all"
 }
@@ -100,6 +105,20 @@ for d in examples/packages/*/; do
   grep -qF "$(basename "$d")" "$tmp/refs_all" \
     || fail "examples/packages/$(basename "$d") is enumerated by no harness (tools/test-packages.sh lists fixtures by hand)"
 done
+
+# --- E: examples/ glob loops that do not resolve the stdlib ---
+awk '
+  function flush() {
+    if (cur != "" && body ~ /\$\(KAIC2\)/ && body ~ /examples\/[A-Za-z0-9_\/-]*\*[A-Za-z0-9_]*\.kai/ && body !~ /--path/)
+      print cur
+  }
+  /^[A-Za-z0-9_.%$()-]+:/ && !/:=/ { flush(); cur = $0; sub(/:.*/, "", cur); body = ""; next }
+  /^\t/ { body = body $0 "\n"; next }
+  END { flush() }
+' stage2/Makefile > "$tmp/nopath"
+while read -r t; do
+  [ -n "$t" ] && fail "$t runs the compiler over an examples/ glob without --path ../stdlib"
+done < "$tmp/nopath"
 
 [ "$FAIL" -eq 0 ] || exit 1
 echo "audit-test-wiring OK — every test-* target and fixture dir is reachable from a tier (allowlist: $(grep -cE '^(target|dir):' "$ALLOWLIST") entries)"
