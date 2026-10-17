@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.160.1 (2026-10-16)
+
+### Fixed
+
+- **typer**: decide the List alias by declaration ids, not spelling
+- **typer**: decide List[T] per reference inside the qualified-type walk
+- **typer**: make List[T] and [T] the same type in every type position
+- **runtime**: publish interned variants race-free under M:N
+- **runtime**: wake a cancelled await or nursery join and cancel the children of an unwound scope
+- **runtime**: unlink the receive waiter and release the pid on a cancel inside receive_timeout
+- **kir**: model heap literals and fixed-width boxes as owned references in the linearity check
+- **driver**: keep the whole-core retry from repeating warnings the first pass printed
+- **typer**: type a named pipe-stage parameter at the element when its body calls a method on it
+- **diag**: report a qualified pattern of a missing module under --diags-json
+- **runtime**: wake a sender parked on a full BlockSender mailbox when it is cancelled
+
+### Changed
+
+- **typer**: skip the per-module List lookup when no type List is declared
+- **typer**: match the List head as a guard arm so other types pay nothing
+- **build**: compile fixture C at -O0 by default under kai test and the tier gates
+- **diag**: read the pattern diagnostic file only when a diagnostic is made
+
 ## v0.160.0 (2026-10-16)
 
 ### BREAKING CHANGE
