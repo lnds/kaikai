@@ -121,7 +121,16 @@ check_kai_reject() {
 check_kai_output() {
   local b="$OUT/$1" exp="main.$AXIS.expected"
   [ "$AXIS" = testsym ] && exp=main.test.expected
-  kai $KAI_ARGS "$CORPUS/$1/main.kai" > "$b.out" 2>&1 || { echo "FAIL kai $KAI_ARGS errored"; cat "$b.out" >&2; return 1; }
+  local spec="$CORPUS/$1/main.kai"
+  [ "$AXIS" = testsym ] && spec="$CORPUS/$1"
+  kai $KAI_ARGS "$spec" > "$b.out" 2>&1 || { echo "FAIL kai $KAI_ARGS errored"; cat "$b.out" >&2; return 1; }
+  if [ "$AXIS" = testsym ]; then
+    local line
+    while IFS= read -r line; do
+      grep -qF "$line" "$b.out" || { echo "FAIL substring '$line' not in output"; head -8 "$b.out" >&2; return 1; }
+    done < "$(golden "$1" "$exp")"
+    return 0
+  fi
   needle_in "$1" "$exp" "$b.out"
 }
 
