@@ -121,7 +121,7 @@ a message and the byte offset at which parsing failed.
 """)]
 pub fn parse_pattern(pattern: String) : Result[RxAst, RxParseError] = {
   let st0 = rx_state_init(pattern)
-  let r = rx_parse_alt(st0)
+  let r = rx_parse_alt(st0, 0)
   match r.r {
     None -> match r.err {
       Some(e) -> Err(e)
@@ -156,7 +156,104 @@ pub fn parse_pattern(pattern: String) : Result[RxAst, RxParseError] = {
 # newest first; an open group parks its enclosing level in an `RxFrame`.
 type RxFrame = { gid: Int, noncap: Bool, alts: [RxAst], items: [RxAst] }
 
-fn rx_parse_alt(st: RxParseState) : PRx = rx_parse_loop(st, [], [], [])
+# Nesting deeper than RX_DEPTH switches to `rx_parse_loop`.
+fn rx_parse_alt(st: RxParseState, d: Int) : PRx =
+  if d >= RX_DEPTH { rx_parse_loop(st, [], [], []) }
+  else {
+    let r0 = rx_parse_concat(st, d)
+    match r0.r {
+      None -> r0
+      Some(first) -> rx_parse_alt_loop(r0.st, [first], d)
+    }
+  }
+
+fn rx_parse_alt_loop(st: RxParseState, acc: [RxAst], d: Int) : PRx = {
+  match rx_peek(st) {
+    Some(c) -> if c == '|' {
+      let st1 = rx_advance(st)
+      let rn = rx_parse_concat(st1, d)
+      match rn.r {
+        None -> rn
+        Some(next) -> rx_parse_alt_loop(rn.st, [next, ...acc], d)
+      }
+    } else { rx_ok(st, rx_alt_of(acc)) }
+    None -> rx_ok(st, rx_alt_of(acc))
+  }
+}
+
+# `concat` parses a sequence of atoms until end-of-input, ')' or
+# '|'. An empty concat is valid (matches the empty string) so we
+# always succeed but may return RxConcat([]).
+fn rx_parse_concat(st: RxParseState, d: Int) : PRx = rx_parse_concat_loop(st, [], d)
+
+fn rx_parse_concat_loop(st: RxParseState, acc: [RxAst], d: Int) : PRx = {
+  match rx_peek(st) {
+    None -> rx_ok(st, rx_concat_of(acc))
+    Some(c) -> if c == '|' or c == ')' {
+      rx_ok(st, rx_concat_of(acc))
+    } else {
+      let r = rx_parse_atom(st, d)
+      match r.r {
+        None -> r
+        Some(at) -> rx_parse_concat_loop(r.st, [at, ...acc], d)
+      }
+    }
+  }
+}
+
+# An atom is a primary expression optionally followed by a single
+# quantifier. Quantifiers do not stack (`a**` is rejected) — that
+# is the user's job to write `(a*)*` if they want the meaning.
+fn rx_parse_atom(st: RxParseState, d: Int) : PRx = {
+  let r = rx_parse_primary(st, d)
+  match r.r {
+    None -> r
+    Some(p) -> rx_apply_quantifier(r.st, p)
+  }
+}
+
+# A primary expression is one of: group, class, anchor, ".", escape,
+# or a literal char.
+fn rx_parse_primary(st: RxParseState, d: Int) : PRx = {
+  match rx_peek(st) {
+    None    -> rx_err(st, "unexpected end of pattern")
+    Some(c) ->
+      if c == '(' { rx_parse_group(rx_advance(st), d) }
+      else if c == '[' { rx_parse_class(rx_advance(st)) }
+      else if c == '.' { rx_ok(rx_advance(st), RxAny) }
+      else if c == '^' { rx_ok(rx_advance(st), RxAnchor(AnchorStart)) }
+      else if c == '$' { rx_ok(rx_advance(st), RxAnchor(AnchorEnd)) }
+      else if c == '\\' { rx_parse_escape(rx_advance(st)) }
+      else if c == ')' or c == '|' or c == '*' or c == '+' or c == '?' or c == '{' or c == '}' or c == ']' {
+        rx_err(st, "unexpected metacharacter in primary position")
+      }
+      else { rx_ok(rx_advance(st), RxChar(c)) }
+  }
+}
+
+# `(` already consumed. Detect `?:` for non-capturing form, parse
+# inner alt, expect `)`.
+fn rx_parse_group(st: RxParseState, d: Int) : PRx = {
+  let is_noncap =
+    match rx_peek(st) {
+      Some('?') -> match rx_peek_at(st, 1) { Some(':') -> true _ -> false }
+      _         -> false
+    }
+  let st1 = if is_noncap { rx_advance_n(st, 2) } else { st }
+  let st2 = if is_noncap { st1 } else { rx_bump_group(st1) }
+  let gid = if is_noncap { 0 } else { st2.group_id }
+  let r = rx_parse_alt(st2, d + 1)
+  match r.r {
+    None -> r
+    Some(inner) -> match rx_peek(r.st) {
+      Some(')') -> {
+        let inner_wrapped = if is_noncap { inner } else { RxGroup(gid, inner) }
+        rx_ok(rx_advance(r.st), inner_wrapped)
+      }
+      _ -> rx_err(r.st, "expected `)` to close group")
+    }
+  }
+}
 
 # One tail-recursive driver for alt, concat and group: nesting depth costs
 # list cells, not stack frames. A parse error returns as found, unwrapped.
@@ -190,7 +287,7 @@ fn rx_parse_loop(st: RxParseState, stack: [RxFrame], alts: [RxAst], items: [RxAs
       rx_parse_loop(st2, [RxFrame { gid: gid, noncap: noncap, alts: alts, items: items }, ...stack], [], [])
     }
     Some(_) -> {
-      let r = rx_parse_atom(st)
+      let r = rx_parse_atom(st, 0)
       match r.r {
         None     -> r
         Some(at) -> rx_parse_loop(r.st, stack, alts, [at, ...items])
@@ -208,17 +305,6 @@ fn rx_concat_of(items: [RxAst]) : RxAst = match items {
   []  -> RxConcat([])
   [x] -> x
   _   -> RxConcat(list_reverse(items))
-}
-
-# An atom is a primary expression optionally followed by a single
-# quantifier. Quantifiers do not stack (`a**` is rejected) — that
-# is the user's job to write `(a*)*` if they want the meaning.
-fn rx_parse_atom(st: RxParseState) : PRx = {
-  let r = rx_parse_primary(st)
-  match r.r {
-    None -> r
-    Some(p) -> rx_apply_quantifier(r.st, p)
-  }
 }
 
 fn rx_apply_quantifier(st: RxParseState, p: RxAst) : PRx = {
@@ -283,24 +369,6 @@ fn rx_parse_int_loop(st: RxParseState, acc: Int, any: Bool) : RxIntParse = {
       RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
     }
     None -> RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
-  }
-}
-
-# A primary expression is one of: group, class, anchor, ".", escape,
-# or a literal char.
-fn rx_parse_primary(st: RxParseState) : PRx = {
-  match rx_peek(st) {
-    None    -> rx_err(st, "unexpected end of pattern")
-    Some(c) ->
-      if c == '[' { rx_parse_class(rx_advance(st)) }
-      else if c == '.' { rx_ok(rx_advance(st), RxAny) }
-      else if c == '^' { rx_ok(rx_advance(st), RxAnchor(AnchorStart)) }
-      else if c == '$' { rx_ok(rx_advance(st), RxAnchor(AnchorEnd)) }
-      else if c == '\\' { rx_parse_escape(rx_advance(st)) }
-      else if c == ')' or c == '|' or c == '*' or c == '+' or c == '?' or c == '{' or c == '}' or c == ']' {
-        rx_err(st, "unexpected metacharacter in primary position")
-      }
-      else { rx_ok(rx_advance(st), RxChar(c)) }
   }
 }
 
@@ -430,10 +498,44 @@ fn rx_parse_escape_char(st: RxParseState) : RxCharParse = {
 # (`Ch(a)` instead of `Ch(97)`).
 
 #[doc("Renders a regex AST as a compact tree string (the debug/fixture format).")]
-pub fn ast_show(a: RxAst) : String =
-  string_concat_all(list_reverse(rx_show_loop([ShowAst(a)], [])))
+pub fn ast_show(a: RxAst) : String = rx_show_at(a, 0)
 
-# Pending output of `ast_show`: a node still to render, or final text.
+fn rx_show_at(a: RxAst, d: Int) : String =
+  if d >= RX_DEPTH { string_concat_all(list_reverse(rx_show_loop([ShowAst(a)], []))) }
+  else { match a {
+    RxChar(c)     -> "Ch(#{c})"
+    RxAny         -> "Any"
+    RxClass(rs, neg) ->
+      string_concat_all(["Cls(", if neg { "^" } else { "" }, rx_ranges_show(rs), ")"])
+    RxAnchor(a) -> match a {
+      AnchorStart -> "Start"
+      AnchorEnd   -> "End"
+    }
+    RxConcat(xs) -> string_concat_all(["Cat(", rx_list_show(xs, d + 1), ")"])
+    RxAlt(xs)    -> string_concat_all(["Alt(", rx_list_show(xs, d + 1), ")"])
+    RxStar(x)    -> string_concat_all(["Star(", rx_show_at(x, d + 1), ")"])
+    RxPlus(x)    -> string_concat_all(["Plus(", rx_show_at(x, d + 1), ")"])
+    RxOpt(x)     -> string_concat_all(["Opt(", rx_show_at(x, d + 1), ")"])
+    RxRepeat(x, lo, hi_opt) -> {
+      let hi_s = match hi_opt {
+        Some(h) -> int_to_string(h)
+        None    -> "*"
+      }
+      string_concat_all(["Rep(", rx_show_at(x, d + 1), ",", int_to_string(lo), ",", hi_s, ")"])
+    }
+    RxGroup(id, x) ->
+      string_concat_all(["Grp(", int_to_string(id), ",", rx_show_at(x, d + 1), ")"])
+  } }
+
+fn rx_list_show(xs: [RxAst], d: Int) : String = string_concat_all(list_reverse(rx_list_parts(xs, [], d)))
+
+fn rx_list_parts(xs: [RxAst], acc: [String], d: Int) : [String] = match xs {
+  []           -> acc
+  [x]          -> [rx_show_at(x, d), ...acc]
+  [x, ...rest] -> rx_list_parts(rest, [",", rx_show_at(x, d), ...acc], d)
+}
+
+# Deep path: pending output is a node still to render, or final text.
 type RxShow = ShowAst(RxAst) | ShowText(String)
 
 # Work-stack driver: nodes expand in place, so nesting costs list cells,
@@ -568,7 +670,7 @@ of the root fragment becomes the NFA's accept (single-accept by
 construction; matching ends when any path reaches it).
 """)]
 pub fn compile_nfa(ast: RxAst) : Nfa = {
-  let r = compile_frag(NfaBuilder { edges: [], next_id: 0, num_groups: 0, accept: -1 }, ast)
+  let r = compile_frag(NfaBuilder { edges: [], next_id: 0, num_groups: 0, accept: -1 }, ast, 0)
   match r {
     NB_Frag(b1, frag) -> match frag {
       NF(start, accept) -> {
@@ -588,11 +690,299 @@ pub fn compile_nfa(ast: RxAst) : Nfa = {
 # does not have tuple types, so we wrap in a 1-variant nominal.
 type NB_FragR = NB_Frag(NfaBuilder, NfaFrag)
 
-# Compilation is a work-stack machine, so nesting depth costs list cells,
-# not stack frames. `CVisit` compiles a node and leaves its fragment on the
+# Nesting deeper than this switches to the work-stack machine below.
+const RX_DEPTH : Int = 12
+
+# Compile a single AST node to a fragment. Each branch allocates
+# states via nb_fresh and wires transitions with nb_add_transition.
+fn compile_frag(b: NfaBuilder, a: RxAst, d: Int) : NB_FragR =
+  if d >= RX_DEPTH { compile_run(b, [CVisit(a)], []) }
+  else { match a {
+    RxChar(c) -> {
+      let b1 = nb_fresh(b)
+      let s = nb_last_id(b1)
+      let b2 = nb_fresh(b1)
+      let e = nb_last_id(b2)
+      let b3 = nb_add_transition(b2, s, TChar(c, e))
+      NB_Frag(b3, NF(s, e))
+    }
+    RxAny -> {
+      let b1 = nb_fresh(b)
+      let s = nb_last_id(b1)
+      let b2 = nb_fresh(b1)
+      let e = nb_last_id(b2)
+      let b3 = nb_add_transition(b2, s, TAny(e))
+      NB_Frag(b3, NF(s, e))
+    }
+    RxClass(rs, neg) -> {
+      let b1 = nb_fresh(b)
+      let s = nb_last_id(b1)
+      let b2 = nb_fresh(b1)
+      let e = nb_last_id(b2)
+      let b3 = nb_add_transition(b2, s, TClass(rs, neg, e))
+      NB_Frag(b3, NF(s, e))
+    }
+    RxAnchor(an) -> {
+      let b1 = nb_fresh(b)
+      let s = nb_last_id(b1)
+      let b2 = nb_fresh(b1)
+      let e = nb_last_id(b2)
+      let b3 = nb_add_transition(b2, s, TAnchor(an, e))
+      NB_Frag(b3, NF(s, e))
+    }
+    RxConcat(xs) -> compile_concat(b, xs, d)
+    RxAlt(xs)    -> compile_alt(b, xs, d)
+    RxStar(x)    -> compile_star(b, x, d)
+    RxPlus(x)    -> compile_plus(b, x, d)
+    RxOpt(x)     -> compile_opt(b, x, d)
+    RxRepeat(x, lo, hi_opt) -> compile_repeat(b, x, lo, hi_opt, d)
+    RxGroup(id, inner) -> compile_group(b, id, inner, d)
+  } }
+
+# Concatenation: empty -> a single ε-fragment (matches empty
+# string); non-empty -> compile each child, ε-wire successive
+# accepts to the next start.
+fn compile_concat(b: NfaBuilder, xs: [RxAst], d: Int) : NB_FragR = match xs {
+  []  -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  }
+  [first, ...rest] -> {
+    let r = compile_frag(b, first, d + 1)
+    compile_concat_rest(r, rest, d)
+  }
+}
+
+fn compile_concat_rest(prev: NB_FragR, rest: [RxAst], d: Int) : NB_FragR = match prev {
+  NB_Frag(b, frag) -> match rest {
+    [] -> NB_Frag(b, frag)
+    [next, ...more] -> match frag {
+      NF(s, e) -> {
+        let r = compile_frag(b, next, d + 1)
+        match r {
+          NB_Frag(b1, frag2) -> match frag2 {
+            NF(s2, e2) -> {
+              # Wire previous accept (e) to next start (s2) by ε.
+              let b2 = nb_add_transition(b1, e, TEpsilon(s2))
+              compile_concat_rest(NB_Frag(b2, NF(s, e2)), more, d)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Alternation: new start with ε-edges to each branch's start; new
+# accept with each branch's accept ε-wired in.
+fn compile_alt(b: NfaBuilder, xs: [RxAst], d: Int) : NB_FragR = {
+  # Allocate the outer start + accept up front so every branch
+  # knows where to wire.
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let b3 = compile_alt_branches(b2, xs, outer_s, outer_e, d)
+  NB_Frag(b3, NF(outer_s, outer_e))
+}
+
+fn compile_alt_branches(b: NfaBuilder, xs: [RxAst], outer_s: Int, outer_e: Int, d: Int) : NfaBuilder = match xs {
+  [] -> b
+  [first, ...rest] -> {
+    let r = compile_frag(b, first, d + 1)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) -> {
+          let b2 = nb_add_transition(b1, outer_s, TEpsilon(s))
+          let b3 = nb_add_transition(b2, e, TEpsilon(outer_e))
+          compile_alt_branches(b3, rest, outer_s, outer_e, d)
+        }
+      }
+    }
+  }
+}
+
+# Star: new start + new accept; ε-edges from outer_s to inner_s and
+# to outer_e (skip path); inner_e ε-back to inner_s (loop) and
+# ε-forward to outer_e.
+fn compile_star(b: NfaBuilder, x: RxAst, d: Int) : NB_FragR = {
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, x, d + 1)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TEpsilon(s))
+        let b5 = nb_add_transition(b4, outer_s, TEpsilon(outer_e))
+        let b6 = nb_add_transition(b5, e, TEpsilon(s))
+        let b7 = nb_add_transition(b6, e, TEpsilon(outer_e))
+        NB_Frag(b7, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Plus: like star but no skip-path from outer_s — the body must
+# match at least once.
+fn compile_plus(b: NfaBuilder, x: RxAst, d: Int) : NB_FragR = {
+  let r = compile_frag(b, x, d + 1)
+  match r {
+    NB_Frag(b1, frag) -> match frag {
+      NF(s, e) -> {
+        # Add a loop-back ε from accept to start. The inner
+        # fragment's start/accept become the outer's directly —
+        # no need to allocate fresh wrapper states.
+        let b2 = nb_add_transition(b1, e, TEpsilon(s))
+        NB_Frag(b2, NF(s, e))
+      }
+    }
+  }
+}
+
+# Opt: ε-edge from outer_s to outer_e (skip path); compile body
+# between them.
+fn compile_opt(b: NfaBuilder, x: RxAst, d: Int) : NB_FragR = {
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, x, d + 1)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TEpsilon(s))
+        let b5 = nb_add_transition(b4, outer_s, TEpsilon(outer_e))
+        let b6 = nb_add_transition(b5, e, TEpsilon(outer_e))
+        NB_Frag(b6, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Bounded repeat {n,m}: unroll into a chain of n required copies
+# followed by (m - n) optional copies. {n,} (max = None) emits
+# n required copies followed by a single Star wrapper for the
+# rest. {n,n} is just n required copies.
+fn compile_repeat(b: NfaBuilder, x: RxAst, lo: Int, hi_opt: Option[Int], d: Int) : NB_FragR = {
+  let r0 = compile_repeat_required(b, x, lo, d)
+  match r0 {
+    NB_Frag(b1, frag1) -> match frag1 {
+      NF(s1, e1) -> match hi_opt {
+        None    -> {
+          # Unbounded tail — append a Star.
+          let r_tail = compile_star(b1, x, d)
+          match r_tail {
+            NB_Frag(b2, frag_tail) -> match frag_tail {
+              NF(s_tail, e_tail) -> {
+                let b3 = nb_add_transition(b2, e1, TEpsilon(s_tail))
+                NB_Frag(b3, NF(s1, e_tail))
+              }
+            }
+          }
+        }
+        Some(hi) -> {
+          # Bounded tail — append (hi - lo) optional copies.
+          let r_tail = compile_repeat_optional(b1, x, hi - lo, d)
+          match r_tail {
+            NB_Frag(b2, frag_tail) -> match frag_tail {
+              NF(s_tail, e_tail) -> {
+                let b3 = nb_add_transition(b2, e1, TEpsilon(s_tail))
+                NB_Frag(b3, NF(s1, e_tail))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Compile `n` required copies of `x` chained by ε. n == 0 yields a
+# trivial pass-through (single state, start == accept).
+fn compile_repeat_required(b: NfaBuilder, x: RxAst, n: Int, d: Int) : NB_FragR =
+  if d >= RX_DEPTH { compile_run(b, [CCopies(x, n, false)], []) }
+  else if n <= 0 {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  } else {
+    let r = compile_frag(b, x, d + 1)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) ->
+          if n == 1 { NB_Frag(b1, NF(s, e)) }
+          else {
+            let r2 = compile_repeat_required(b1, x, n - 1, d + 1)
+            match r2 {
+              NB_Frag(b2, frag2) -> match frag2 {
+                NF(s2, e2) -> {
+                  let b3 = nb_add_transition(b2, e, TEpsilon(s2))
+                  NB_Frag(b3, NF(s, e2))
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+
+# Compile `n` optional copies of `x` chained by ε. Each copy is
+# a fresh Opt-fragment (skip path included).
+fn compile_repeat_optional(b: NfaBuilder, x: RxAst, n: Int, d: Int) : NB_FragR =
+  if d >= RX_DEPTH { compile_run(b, [CCopies(x, n, true)], []) }
+  else if n <= 0 {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  } else {
+    let r = compile_opt(b, x, d + 1)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) ->
+          if n == 1 { NB_Frag(b1, NF(s, e)) }
+          else {
+            let r2 = compile_repeat_optional(b1, x, n - 1, d + 1)
+            match r2 {
+              NB_Frag(b2, frag2) -> match frag2 {
+                NF(s2, e2) -> {
+                  let b3 = nb_add_transition(b2, e, TEpsilon(s2))
+                  NB_Frag(b3, NF(s, e2))
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+
+# Capture group: outer_s opens the group, outer_e closes it.
+# Inner fragment is sandwiched between zero-width markers.
+fn compile_group(b: NfaBuilder, gid: Int, inner: RxAst, d: Int) : NB_FragR = {
+  let b0 = NfaBuilder { ...b, num_groups: if gid > b.num_groups { gid } else { b.num_groups } }
+  let b1 = nb_fresh(b0)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, inner, d + 1)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TGroupOpen(gid, s))
+        let b5 = nb_add_transition(b4, e, TGroupClose(gid, outer_e))
+        NB_Frag(b5, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Deep path: a work-stack machine, so nesting depth costs list cells, not
+# stack frames. `CVisit` compiles a node and leaves its fragment on the
 # result stack; every other task finishes a node once its children's
-# fragments are there. States are numbered in the order a recursive
-# descent would allocate them.
+# fragments are there. States are numbered in the order the recursive
+# compiler above allocates them.
 type CTask
   = CVisit(RxAst)
   | CCatNext([RxAst])
@@ -609,8 +999,6 @@ type CTask
   | CRepeatTail(RxAst, Option[Int], Int)
   | CRepeatEnd(Int, Int)
   | CWire(Int, Int)
-
-fn compile_frag(b: NfaBuilder, a: RxAst) : NB_FragR = compile_run(b, [CVisit(a)], [])
 
 fn cs_missing() : NB_FragR = panic("regexp: compile task found no fragment")
 
@@ -833,7 +1221,27 @@ fn rx_capture_close(caps: [Capture], gid: Int, pos: Int) : [Capture] =
   rx_capture_set(caps, gid, -1, pos, false)
 
 fn rx_capture_set(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool) : [Capture] =
-  rx_capture_set_loop(caps, gid, start_v, end_v, is_open, [])
+  rx_capture_set_at(caps, gid, start_v, end_v, is_open, 0)
+
+# Past RX_DEPTH captures the update switches to `rx_capture_set_loop`.
+fn rx_capture_set_at(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool, d: Int) : [Capture] =
+  if d >= RX_DEPTH { rx_capture_set_loop(caps, gid, start_v, end_v, is_open, []) }
+  else { match caps {
+    [] ->
+      if is_open { [Capture { group_id: gid, start: start_v, end: end_v }] }
+      else       { [Capture { group_id: gid, start: -1, end: end_v }] }
+    [c, ...rest] ->
+      if c.group_id == gid {
+        let new_c = if is_open {
+          Capture { group_id: gid, start: start_v, end: c.end }
+        } else {
+          Capture { group_id: gid, start: c.start, end: end_v }
+        }
+        [new_c, ...rest]
+      } else {
+        [c, ...rx_capture_set_at(rest, gid, start_v, end_v, is_open, d + 1)]
+      }
+  } }
 
 # `before` holds the captures already passed, newest first.
 fn rx_capture_set_loop(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool,
@@ -927,8 +1335,16 @@ fn rx_search_loop(sim: RxSim, pos: Int, stepped: [Thread], best: Option[Match],
   }
 }
 
-fn rx_started_by(threads: [Thread], start: Int) : [Thread] =
-  rx_started_by_loop(threads, start, [])
+fn rx_started_by(threads: [Thread], start: Int) : [Thread] = rx_started_by_at(threads, start, 0)
+
+# Past RX_DEPTH threads the filter switches to `rx_started_by_loop`.
+fn rx_started_by_at(threads: [Thread], start: Int, d: Int) : [Thread] =
+  if d >= RX_DEPTH { rx_started_by_loop(threads, start, []) }
+  else { match threads {
+    []           -> []
+    [t, ...rest] -> if rx_match_start(t.captures) <= start { [t, ...rx_started_by_at(rest, start, d + 1)] }
+                    else { rx_started_by_at(rest, start, d) }
+  } }
 
 fn rx_started_by_loop(threads: [Thread], start: Int, kept: [Thread]) : [Thread] = match threads {
   []           -> list_reverse(kept)
