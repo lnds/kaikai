@@ -809,7 +809,7 @@ error at its column inside the string. A body is not a barrier, but a
 lambda written in one is.
 
 A top-level `:` in a body starts a format spec: `#{n:5}` pads to a width
-(right-aligned), `#{n:05}` zero-pads (`-0042`), `#{s:<10}` / `#{s:>10}` /
+(right-aligned for every type, strings included, as in C and Go; `#{s:<10}` for left), `#{n:05}` zero-pads (`-0042`), `#{s:<10}` / `#{s:>10}` /
 `#{s:^10}` align, `#{x:.2}` renders a `Real` with 2 decimals (exact binary value, half-even, as `printf("%.2f")`), and
 `#{x:8.2}` combines them. The spec lowers to `format_spec.fixed` (module `text.format_spec`, loaded only
 by a file that uses a spec, no import needed) and `string.pad_left` / `pad_right`, so `.N` on a
