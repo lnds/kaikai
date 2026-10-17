@@ -39,6 +39,9 @@ expect() {
 }
 
 expect cold "$(build | sed 's/^[1-9][0-9]*$/some/')" some
+# The cold build compiled the whole core; the next one prunes it against the
+# cached core, so its root TU is smaller. Only builds that prune alike share objects.
+build > /dev/null
 sleep 3
 expect warm "$(build)" 0
 
