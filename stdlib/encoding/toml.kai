@@ -461,7 +461,7 @@ fn toml_parse_value(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] = {
   else { char_at(st.s, st.i).and_then(
     c => {
       if c == '"' { toml_parse_string(st) }
-      else if c == '[' { toml_parse_array(toml_jump(st, 1), []) }
+      else if c == '[' { toml_parse_array(toml_jump(st, 1)) }
       else if c == '{' { toml_parse_inline_table(st) }
       else if c == 't' or c == 'f' {
         let word = if c == 't' { "true" } else { "false" }
@@ -574,25 +574,48 @@ fn toml_escape(c: Option[Char]) : Option[String] = match c {
 # ---- Arrays ["a", "b"] --------------------------------------------
 #
 # Newlines and comments may separate elements, so a value list can
-# span lines. Trailing comma accepted. Elements recurse through
-# toml_parse_value, so arrays nest.
+# span lines. Trailing comma accepted. Arrays nest.
 
-fn toml_parse_array(st: TomlSt, acc: [TomlValue]) : Option[Pair[TomlSt, TomlValue]] = {
-  let st1 = toml_skip_ws_and_comments(st)
-  if toml_char_is(st1.s, st1.i, ']') {
-    Some(Pair { fst: toml_jump(st1, 1), snd: TArr(list_reverse(acc)) })
-  } else {
-    match toml_parse_value(st1) {
+fn toml_parse_array(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] =
+  toml_array_loop(st, [], [], AElem)
+
+# An array left open while its nested array is parsed.
+type TomlArrFrame = AFrame([TomlValue])
+
+# What the array driver does next: read an element (or the closing `]`), or
+# feed a finished element, if any, to the open array.
+type TomlArrMode = AElem | AValue(Option[TomlValue])
+
+# One tail-recursive driver for every nesting level: `acc` holds the open
+# array's elements newest first and `stack` the enclosing arrays, so depth
+# costs list cells, not stack frames.
+fn toml_array_loop(st: TomlSt, stack: [TomlArrFrame], acc: [TomlValue], mode: TomlArrMode)
+    : Option[Pair[TomlSt, TomlValue]] = match mode {
+  AElem -> {
+    let st1 = toml_skip_ws_and_comments(st)
+    if toml_char_is(st1.s, st1.i, ']') { toml_array_loop(st1, stack, acc, AValue(None)) }
+    else if toml_char_is(st1.s, st1.i, '[') {
+      toml_array_loop(toml_jump(st1, 1), [AFrame(acc), ...stack], [], AElem)
+    } else { match toml_parse_value(st1) {
       None    -> None
-      Some(p) -> {
-        let st2 = toml_skip_ws_and_comments(p.fst)
-        let more = [p.snd, ...acc]
-        if toml_char_is(st2.s, st2.i, ']') {
-          Some(Pair { fst: toml_jump(st2, 1), snd: TArr(list_reverse(more)) })
-        } else if toml_char_is(st2.s, st2.i, ',') { toml_parse_array(toml_jump(st2, 1), more) }
-        else { None }
+      Some(p) -> toml_array_loop(p.fst, stack, acc, AValue(Some(p.snd)))
+    } }
+  }
+  AValue(item) -> {
+    let st2 = toml_skip_ws_and_comments(st)
+    let more = match item {
+      Some(v) -> [v, ...acc]
+      None    -> acc
+    }
+    if toml_char_is(st2.s, st2.i, ']') {
+      let arr = TArr(list_reverse(more))
+      match stack {
+        []                         -> Some(Pair { fst: toml_jump(st2, 1), snd: arr })
+        [AFrame(parent), ...outer] -> toml_array_loop(toml_jump(st2, 1), outer, parent, AValue(Some(arr)))
       }
     }
+    else if toml_char_is(st2.s, st2.i, ',') { toml_array_loop(toml_jump(st2, 1), stack, more, AElem) }
+    else { None }
   }
 }
 
@@ -703,17 +726,48 @@ fn toml_enc_table(open: String, close: String, name: String, ps: Pairs) : String
 
 # Encode a single value as it appears on the right-hand side of
 # `key = ...`. Inline tables and arrays are single-line.
-fn toml_enc_scalar(v: TomlValue) : String = {
-  match v {
-    TStr(s)  -> string_concat_all(["\"", string_concat_all(list_reverse(toml_enc_str_escape(s, 0, 0, []))), "\""])
-    TBool(b) -> if b { "true" } else { "false" }
-    TInt(n)  -> int_to_string(n)
-    TReal(r) -> toml_enc_real(r)
-    TArr(xs) -> string_concat_all(["[", string.join(list.map(xs, toml_enc_scalar), ", "), "]"])
-    TTbl(ps) -> string_concat_all(["{ ", string.join(list.map(ps,
-                  (p) => string_concat_all([p.fst, " = ", toml_enc_scalar(p.snd)])), ", "), " }"])
+fn toml_enc_scalar(v: TomlValue) : String =
+  string_concat_all(list_reverse(toml_enc_loop([toml_enc_item(v)], [])))
+
+# Pending output of the encoder: final text, or a container still to expand.
+type TomlEnc = TencText(String) | TencArr([TomlValue]) | TencTbl(Pairs)
+
+fn toml_enc_item(v: TomlValue) : TomlEnc = match v {
+  TStr(s)  -> TencText(string_concat_all(["\"", string_concat_all(list_reverse(toml_enc_str_escape(s, 0, 0, []))), "\""]))
+  TBool(b) -> TencText(if b { "true" } else { "false" })
+  TInt(n)  -> TencText(int_to_string(n))
+  TReal(r) -> TencText(toml_enc_real(r))
+  TArr(xs) -> TencArr(xs)
+  TTbl(ps) -> TencTbl(ps)
+}
+
+# Work-stack driver: containers expand in place, so nesting depth costs list
+# cells, not stack frames. `out` holds the emitted pieces newest first.
+fn toml_enc_loop(work: [TomlEnc], out: [String]) : [String] = match work {
+  [] -> out
+  [item, ...rest] -> match item {
+    TencText(t) -> toml_enc_loop(rest, [t, ...out])
+    TencArr(xs) -> toml_enc_loop(toml_enc_elems(list_reverse(xs), [TencText("]"), ...rest], false), ["[", ...out])
+    TencTbl(ps) -> toml_enc_loop(toml_enc_members(list_reverse(ps), [TencText(" }"), ...rest]), ["{ ", ...out])
   }
 }
+
+# `rev` is the elements last first; each is consed before `acc`, with a comma
+# between neighbours.
+fn toml_enc_elems(rev: [TomlValue], acc: [TomlEnc], sep: Bool) : [TomlEnc] = match rev {
+  []           -> acc
+  [x, ...more] -> toml_enc_elems(more, [toml_enc_item(x), ...toml_enc_comma(acc, sep)], true)
+}
+
+# The comma between members rides on the key text of every member but the first.
+fn toml_enc_members(rev: Pairs, acc: [TomlEnc]) : [TomlEnc] = match rev {
+  []           -> acc
+  [p, ...more] -> toml_enc_members(more,
+    [TencText(string_concat_all([match more { [] -> "" _ -> ", " }, p.fst, " = "])), toml_enc_item(p.snd), ...acc])
+}
+
+fn toml_enc_comma(acc: [TomlEnc], sep: Bool) : [TomlEnc] =
+  if sep { [TencText(", "), ...acc] } else { acc }
 
 # A TOML float needs a `.` or an exponent; `real_to_string` drops
 # both for integral values, which would re-decode as an integer.
