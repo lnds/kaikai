@@ -1,5 +1,5 @@
 #[doc("""
-The core functions a program cannot name, emptied before any pass walks them.
+The core and imported library functions a program cannot name, emptied before any pass walks them.
 
 Every pass between the parser and the reachability cut walks the whole
 core, though a program reaches a small part of it. This empties the body
@@ -12,6 +12,7 @@ The reachability cut then drops what was emptied; a function it keeps
 after all means this cut was wrong, and the compile starts over without it.
 """)]
 
+import compiler.util
 import compiler.ast
 import compiler.written
 import compiler.symtab
@@ -22,6 +23,10 @@ import compiler.core_modules
 import compiler.derive_mint
 import compiler.core_reach
 import compiler.chars
+import compiler.lazy_seq
+import compiler.symtab_build
+import compiler.decl_names
+import compiler.core_types
 
 type PcSt = { tab: SymTab, fns: NameIndex[Decl], live: NameIndex[SymId], work: [Decl] }
 
@@ -37,12 +42,22 @@ pub fn precut_all(tab: SymTab) : PreCut = PreCut { tab: tab, live: idx_empty() }
 #[doc("True when the cut can save more than it costs: it walks all of `user` to spare the front end at most all of `core`.")]
 pub fn precut_pays(core: [Decl], user: [Decl]) : Bool = list_length(user) < list_length(core)
 
+#[doc("The functions of `ds` that belong to one of the modules `mods`: the imported library functions the cut may empty.")]
+pub fn precut_lib_fns(ds: [Decl], mods: [String]) : [Decl] = filter(ds, (d) => pc_in_mods(d, mods))
+
+#[doc("The declarations of `ds` that `precut_lib_fns` leaves out.")]
+pub fn precut_rest(ds: [Decl], mods: [String]) : [Decl] = filter(ds, (d) => not pc_in_mods(d, mods))
+
+#[doc("`ds` with the body of each function of `mods` the cut `pc` empties replaced by the unit value.")]
+pub fn precut_imported(pc: PreCut, mods: [String], ds: [Decl]) : [Decl] =
+  map(ds, (d) => if not pc_in_mods(d, mods) or pc_live(pc.live, pc_fn_sym(d)) { d } else { pc_stub(d) })
+
 #[doc("The cut of `core` for the program `user`. `tab` names the declarations of both.")]
 pub fn core_precut(core: [Decl], user: [Decl], tab: SymTab) : PreCut = {
   let st0 = PcSt { tab: tab, fns: pc_index(core, idx_empty()), live: idx_empty(), work: [] }
   let all = list_append(user, core)
-  let lib = if any(all, pc_derives) { pc_lib_syms(core, tab) } else { [] }
-  let seeded = pc_syms(lib, pc_fields(all, pc_core_fns(variants[CoreFn](), st0)))
+  let lib = if any(all, pc_derives) { list_append(pc_lib_syms(core, tab, core_module_name(derive_lib_module())), pc_lib_syms(core, tab, json_lib_home())) } else { [] }
+  let seeded = pc_syms(lib, pc_fields(all, pc_minted(pc_core_fns(variants[CoreFn](), st0))))
   let st = pc_drain(pc_decls(filter(core, (d) => not pc_is_fn(d)), pc_decls(user, seeded)))
   PreCut { tab: tab, live: st.live }
 }
@@ -63,6 +78,12 @@ fn pc_stub(d: Decl) : Decl = match d {
   _ -> d
 }
 
+# The functions the front end writes into a program by identity: a lazy
+# sequence's cells and a big-integer literal's constructor.
+fn pc_minted(st: PcSt) : PcSt =
+  pc_sym(sym_derive(NCFn, "from_literal", core_decl_ty_home(CdBigInt)),
+         pc_syms(map(variants[SeqFn](), seq_fn_id), st))
+
 fn pc_core_fns(cfs: [CoreFn], st: PcSt) : PcSt = match cfs {
   [] -> st
   [cf, ...rest] -> pc_core_fns(rest, match core_fn_id(cf) {
@@ -80,7 +101,7 @@ fn pc_derives(d: Decl) : Bool = match d {
   _ -> false
 }
 
-fn pc_lib_syms(core: [Decl], tab: SymTab) : [SymId] = match st_module(tab, core_module_name(derive_lib_module())) {
+fn pc_lib_syms(core: [Decl], tab: SymTab, home: String) : [SymId] = match st_module(tab, home) {
   None      -> []
   Some(lib) -> map(filter(core, (d) => pc_is_fn(d) and sym_owned_by(tab, pc_fn_sym(d), lib)), pc_fn_sym)
 }
@@ -107,6 +128,11 @@ fn pc_index(ds: [Decl], ix: NameIndex[Decl]) : NameIndex[Decl] = match ds {
 
 fn pc_is_fn(d: Decl) : Bool = match pc_bare(d) {
   DFn(_, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+fn pc_in_mods(d: Decl, mods: [String]) : Bool = match pc_bare(d) {
+  DFn(_, _, _, _, _, _, _, _, _, Some(m)) -> list_has(mods, m)
   _ -> false
 }
 

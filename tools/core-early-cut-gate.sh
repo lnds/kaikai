@@ -4,7 +4,7 @@
 # and field reads no source text holds. Every fixture that carries a
 # derive must compile to the same C with the cut, without it, and with
 # every core body emptied; the cut must never need its whole-core retry,
-# and emptying everything must. The retry repeats no warning.
+# and emptying everything must. Imported library modules ride the same cut. The retry repeats no warning.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -17,14 +17,14 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 compile() { # $1 output stem, $2 source, rest: flags
   local stem="$1" src="$2"; shift 2
-  "$KAIC2" --edition "$EDITION" --path "$(dirname "$src")" --core-cache-stats "$@" "$src" \
+  "$KAIC2" --edition "$EDITION" --path "$(dirname "$src")" --path "$ROOT/stdlib" --core-cache-stats "$@" "$src" \
     > "$stem.c" 2> "$stem.raw"
   echo $? > "$stem.rc"
   grep -v '^kaic2: core-' "$stem.raw" > "$stem.err"
 }
 
 pass=0; fail=0; retried=0
-for src in examples/minimal/hello.kai tools/core-early-cut-retry-warns.kai $(grep -l '#\[derive(' examples/*/*.kai); do
+for src in examples/minimal/hello.kai tools/core-early-cut-retry-warns.kai tools/core-early-cut-import.kai $(grep -l '#\[derive(' examples/*/*.kai) $(grep -l '^import ' examples/stdlib/*.kai | awk 'NR%3==0'| awk 'NR%6==0'); do
   compile "$WORK/off" "$src" --no-early-cut
   compile "$WORK/cut" "$src"
   compile "$WORK/all" "$src" --early-cut-all
