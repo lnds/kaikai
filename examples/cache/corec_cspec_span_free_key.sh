@@ -1,6 +1,6 @@
 #!/bin/sh
-# Core emit-cache differential fixture — a HOF-with-lambda edit HITS the
-# warm core emit cache.
+# Core emit-cache differential fixture — a HOF-with-lambda edit or a new
+# top-level fn HITS the warm core emit cache; a new unwind variant MISSES.
 #
 # `closure_spec_pass` appends per-call-site spec decls named
 # `<fn>__cspec__L<line>_<col>` with `mo=None` (root-homed). Those names
@@ -11,11 +11,15 @@
 # perturb a core TU, so it stays out of the surface key.
 #
 #   - A: `list.sum([1,2,3])`                       -> cold miss, entry written.
-#   - B: `list.sum(list.map([1,2,3], (x)=>x*2))`   -> warm HIT (same name-level
-#        surface; the spec decl B adds no longer re-keys the core surface).
+#   - B: `list.sum(list.map([1,2,3], (x)=>x*2))`   -> warm HIT.
 #
-# Guardrail (never weaken invalidation): a real name-level surface
-# change — a new top-level fn — must still MISS.
+# The core TU set is found by a pre-key and the variant of the program (the
+# core effects its handlers make unwind), never by the program's name-level
+# surface, so the core TUs cannot depend on it:
+#   - C: a new top-level fn           -> still HITS, and the core TUs it is
+#        compiled against are byte-identical to a no-cache compile.
+#   - D: a row that may cancel (`/ Spawn`) flips the variant -> MISS, the
+#        whole core is compiled and recorded.
 
 set -eu
 
@@ -43,11 +47,19 @@ fn main() : Unit / Console {
 }
 EOF
 
-# C: a genuine name-level surface change — a new top-level fn.
+# C: a new top-level fn.
 cat > "$PROJ/c.kai" <<'EOF'
 fn helper(n: Int) : Int = n + 1
 fn main() : Unit / Console {
   print("#{int_to_string(list.sum(list.map([1, 2, 3], (x) => x * 2)))}")
+}
+EOF
+
+# D: a row that may cancel.
+cat > "$PROJ/d.kai" <<'EOF'
+fn helper() : Unit / Spawn = ()
+fn main() : Unit / Console {
+  print("#{int_to_string(list.sum([1, 2, 3]))}")
 }
 EOF
 
@@ -71,14 +83,27 @@ grep -q "core-emit-cache: hit" "$PROJ/b.err" || {
   echo "corec_cspec_span_free_key FAIL — adding a HOF-with-lambda call missed the warm core emit cache"
   cat "$PROJ/b.err"; exit 1; }
 
-# C: a new top-level fn is a real surface change and must still MISS —
-# the fix drops cspec noise, it does not weaken invalidation.
+# C: a new top-level fn does not touch the variant: it hits, and pruning
+# against the cached set emits the same core TUs as an unpruned compile.
 "$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/c.kai" \
   > /dev/null 2> "$PROJ/c.err"
-grep -q "core-emit-cache: miss" "$PROJ/c.err" || {
-  echo "corec_cspec_span_free_key FAIL — a new top-level fn did not change the surface key"
+grep -q "core-emit-cache: hit" "$PROJ/c.err" || {
+  echo "corec_cspec_span_free_key FAIL — a new top-level fn missed the core TU set"
   cat "$PROJ/c.err"; exit 1; }
+"$ROOT/tools/cmodular-prune-diff.sh" "$KAIC2" "$STDLIB" "$PROJ/a.kai" "$PROJ/b.kai" "$PROJ/c.kai" \
+  > "$PROJ/diff.out" 2>&1 || {
+  echo "corec_cspec_span_free_key FAIL — pruned core TUs differ from the unpruned ones"
+  cat "$PROJ/diff.out"; exit 1; }
 
-echo "corec_cspec_span_free_key OK — HOF-with-lambda edit hits, real surface change still misses"
+# D: a row that may cancel changes what the core's functions unwind
+# through, so it is another variant and must MISS.
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+  --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/d.kai" \
+  > /dev/null 2> "$PROJ/d.err"
+grep -q "core-emit-cache: miss" "$PROJ/d.err" || {
+  echo "corec_cspec_span_free_key FAIL — a program of another unwind variant hit the core TU set"
+  cat "$PROJ/d.err"; exit 1; }
+
+echo "corec_cspec_span_free_key OK — HOF-with-lambda edit and a new fn hit, a new unwind variant misses"
 exit 0
