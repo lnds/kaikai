@@ -1,0 +1,85 @@
+#[doc("Recency and eviction of the shared build caches: a hit keeps its entry young, and entries unused for days are trimmed.")]
+
+import cli_caches
+import cli_io
+import cli_sys
+
+#[doc("Mark the entry at `path` as used now, unless that was within the last hour.")]
+extern "C"("kaicli_refresh") pub fn refresh(path: String) : Unit / Ffi
+
+extern "C"("kaicli_tree_bytes") fn tree_bytes(root: String) : Int / Ffi
+
+extern "C"("kaicli_trim_add") fn trim_add(root: String, unit: Int) : Unit / Ffi
+
+extern "C"("kaicli_trim_spawn") fn trim_spawn(max_age: Int) : Bool / Ffi
+
+const DAY : Int = 86400
+
+const DEFAULT_DAYS : Int = 5
+
+# `depth` is how many levels down an entry sits; 0 makes every file one.
+type Store = { knob: String, sub: String, depth: Int }
+
+fn stores() : [Store] = [
+  Store { knob: "KAI_MODULAR_CACHE_DIR", sub: "cmodular", depth: 0 },
+  Store { knob: "KAI_NATIVE_MODULAR_CACHE_DIR", sub: "nmodular", depth: 0 },
+  Store { knob: "KAI_NATIVE_DEP_CACHE_DIR", sub: "nativedep", depth: 0 },
+  Store { knob: "KAI_CORE_CACHE_DIR", sub: "core", depth: 1 },
+  Store { knob: "KAIKAI_CACHE", sub: "pkg", depth: 2 }
+]
+
+fn live(os: String) : [(String, Int)] / Env + Ffi =
+  stores()
+    | (s => (cli_caches.root(s.knob, s.sub, os), s.depth))
+    |? (r => cli_sys.is_dir(r.fst))
+
+fn max_age_days() : Int / Env =
+  match string.to_int(cli_caches.env_or("KAI_CACHE_TRIM_DAYS", "")) {
+    Some(n) if n > 0 -> n
+    _ -> DEFAULT_DAYS
+  }
+
+fn due(stamp: String) : Bool / Ffi =
+  not cli_sys.is_file(stamp) or cli_io.epoch() - cli_sys.mtime(stamp) >= DAY
+
+#[doc("Start the daily trim of entries unused for `KAI_CACHE_TRIM_DAYS` (default 5) in a detached child; `KAI_CACHE_TRIM=0` turns it off.")]
+pub fn trim_if_due(os: String) : Unit / Env + File + Ffi {
+  let base = cli_caches.base(os)
+  let stamp = "#{base}/trim-stamp"
+  if cli_caches.env_or("KAI_CACHE_TRIM", "1") != "0" and cli_sys.is_dir(base) and due(stamp) {
+    let _ = write_file(stamp, "")
+    let roots = live(os)
+    if not list.is_empty(roots) {
+      roots |> foreach(r => trim_add(r.fst, r.snd))
+      let _ = trim_spawn(max_age_days() * DAY)
+    }
+  }
+}
+
+fn size_text(bytes: Int) : String {
+  let mib = bytes / 1048576
+  if mib >= 1024 {
+    "#{mib / 1024}.#{mib % 1024 * 10 / 1024} GiB"
+  } else {
+    "#{mib} MiB"
+  }
+}
+
+fn remove_counting(path: String) : Int / Ffi {
+  let bytes = tree_bytes(path)
+  let _ = cli_sys.remove_tree(path)
+  bytes
+}
+
+#[doc("Delete the whole shared cache and print what that freed.")]
+pub fn clean_shared(os: String) : Unit / Stdout + Env + File + Ffi {
+  let freed = live(os) |> list.foldl(0, (acc, r) => acc + remove_counting(r.fst))
+  let _ = file_delete("#{cli_caches.base(os)}/trim-stamp")
+  Stdout.print("kai: removed the shared cache (#{size_text(freed)})")
+}
+
+#[doc("Delete the package's `.kai-cache` and print what that freed.")]
+pub fn clean_package(dir: String) : Unit / Stdout + Ffi {
+  let freed = remove_counting("#{dir}/.kai-cache")
+  Stdout.print("kai: removed #{dir}/.kai-cache (#{size_text(freed)})")
+}

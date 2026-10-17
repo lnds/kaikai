@@ -98,6 +98,32 @@ native-modular, whose kaic2 stderr it otherwise captures to a file and
 only surfaces on failure — the stats line is re-emitted to the user's
 stderr on success too so it is never silently swallowed there.
 
+### Cache lifetime — recency, trim, `kai clean`
+
+The shared caches under `~/Library/Caches/kai` (`$XDG_CACHE_HOME/kai`,
+else `~/.cache/kai`) — `cmodular`, `nmodular`, `nativedep`, `core`, `pkg`
+— are content-addressed and keyed by compiler identity, so every new
+`kaic2` mints new keys. They are bounded by recency, as in Go's build
+cache:
+
+- **A hit refreshes its entry's mtime** (a `utimensat`, skipped when the
+  mtime is under an hour old): a c-modular or nativedep object on a hit,
+  the objects a native-modular link uses, the `core/<toolchain id>`
+  directory on every compile verb, and the checkout of each fetched
+  dependency a build resolves.
+- **The trim runs at most once per 24 h.** The first compile-verb `kai`
+  after the stamp `<cache root>/trim-stamp` ages out forks a detached,
+  low-priority child once its own work is done; the child removes
+  entries unused for 5 days. The unit is a file for `cmodular`,
+  `nmodular` and `nativedep`, a toolchain directory for `core`, a
+  checkout for `pkg`. Entries are published by write-to-temp + rename
+  and a fresh temp file is never old enough to go; a path another
+  process removed first is skipped.
+- `KAI_CACHE_TRIM=0` disables the trim; `KAI_CACHE_TRIM_DAYS=<n>` changes
+  the age (default 5).
+- `kai clean` deletes the cwd package's `.kai-cache`; `kai clean --cache`
+  deletes the shared caches. Both print what they freed.
+
 ## The five Makefiles — recursive delegation
 
 ```
