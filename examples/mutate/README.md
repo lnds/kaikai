@@ -29,6 +29,11 @@ cd stage2 && ./kaic2 --mutate-list-json ../examples/mutate/site_data.kai --path 
   > ../examples/mutate/site_data.sites.json.expected
 ```
 
+`receiver_shapes.kai` pins the catalogue for calls under a method call
+or pipe stage (`receiver_shapes.sites.json.expected`):
+`make -C stage2 test-mutate-receiver-shapes` diffs it and fails if any
+mutant (span, operator, replacement) appears twice.
+
 Regenerate the golden after an intentional operator change:
 
 ```sh
