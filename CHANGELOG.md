@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.162.0 (2026-10-17)
+
+### Added
+
+- **lint**: non_tail_list_recursion flags a self-call on a destructured list tail outside tail position
+
+### Fixed
+
+- **lint**: list non_tail_list_recursion's message names in the written-readers ledger
+- **lint**: non_tail_list_recursion keeps names out of identity; complete the doc blocks
+- **lint**: non_tail_list_recursion exempts modulo-cons sites the compiler loops
+- **mutate**: resolve a call elision by the call's own span
+- **mutate**: list a call elision once when the call sits under a method call
+- **stdlib**: keep open-row list walks, regexp dumps and toml headers in constant stack
+- **stdlib**: run list-shaped stdlib walks in constant stack
+
+### Changed
+
+- **compile**: keep the modules the compiler writes calls into whole
+- **compile**: prune unreached functions of imported library modules before infer
+
 ## v0.161.0 (2026-10-17)
 
 ### BREAKING CHANGE
