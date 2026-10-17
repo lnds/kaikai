@@ -84,6 +84,38 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.161.0 (2026-10-17)
+
+### BREAKING CHANGE
+
+- == on Array[t] compares contents; code relying on
+identity must wait for array.same.
+
+### Added
+
+- **stdlib**: Vec rides the map, flat_map, filter and each pipes
+- **stdlib**: Duration operators and real.to_fixed
+- **runtime**: compare Array contents with ==
+
+### Fixed
+
+- **stdlib**: string.join runs in constant stack
+- **typer**: pin a pipe lambda's parameter when its body calls a method on a field of it
+- **tools**: cost-ab builds both sides with one recipe and reads each side's stdlib
+- **stdlib**: json_decode keeps a NUL decoded from \u0000
+- **kai**: run every file's blocks as the root of its own runner
+- **resolve**: keep a root file named like a core module distinct from it
+- **typer**: resolve a synthesised law check in its impl's own module
+- **kai**: run a module's test blocks once, under its own file
+- **emit**: unit_name no longer interns its string
+- **resolve**: nested stateful handlers no longer warn that the outer state wins
+- **typer**: say how to fix a stranded zero()
+- **typer**: reject an effectful const initialiser
+
+### Changed
+
+- **ci**: build native fixtures at O0 in the tier1-native shards and under kai test
+
 ## v0.160.1 (2026-10-16)
 
 ### Fixed
