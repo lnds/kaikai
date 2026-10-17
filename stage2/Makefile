@@ -11508,6 +11508,8 @@ test-perceus-1083-variant-spine-free: $(TARGET) bin-kai build
 # host target-features so the opt pipeline folds the `kaix_*` runtime ops into
 # the rb-tree hot loop. Without the stamp the residual `bl kaix_*` call count
 # jumps from ~168 back past 1000 (areInlineCompatible blocks every inline).
+# These gates measure the optimised pipeline, whatever level the caller runs the corpus at.
+test-native-1083-inline-gate test-native-cgen-quality test-native-cache-edits-native: export KAI_NATIVE_OPT = 2
 test-native-1083-inline-gate: $(TARGET) bin-kai
 	@CC="$(CC)" LLVM_CONFIG="$(LLVM_CONFIG)" ../tools/native-perf/inline-gate.sh
 
