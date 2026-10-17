@@ -3325,6 +3325,12 @@ test-mutate-receiver-shapes: $(TARGET) build
 	dup=$$(sed -E 's/"id": [0-9]+, //; s/"ordinal": [0-9]+, //' $$exp | sort | uniq -d | wc -l); \
 	[ "$$dup" -eq 0 ] \
 	  || { echo "mutate-receiver FAIL ($$dup repeated mutant(s))"; exit 1; }; \
+	for i in $$(grep -o '"id": [0-9]*' $$exp | cut -d' ' -f2); do \
+	  $(KAIC2) $(TEST_CORE_CACHE) --mutate-apply $$i $(MUTATE_RECEIVER_FIXTURE) --path ../stdlib \
+	    > build/mutate-receiver-$$i.kai 2> build/mutate-receiver-$$i.err \
+	    || { echo "mutate-receiver FAIL site $$i (apply errored)"; cat build/mutate-receiver-$$i.err; exit 1; }; \
+	done; \
+	python3 ../scripts/check_mutate_sites.py build/mutate-receiver.json $(MUTATE_RECEIVER_FIXTURE) build/mutate-receiver- --splice-only; \
 	echo "mutate-receiver OK"
 
 # Issue #83 — call-site contract elision report. For each positive
