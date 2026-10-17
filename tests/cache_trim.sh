@@ -19,12 +19,13 @@ mkdir -p "$work/pkg"
 printf 'fn main() : Unit / Stdout = Stdout.print("hello")\n' > "$work/pkg/hello.kai"
 
 fail=0
+BACKEND=c
 ok() { echo "  ok   $1"; }
 bad() { echo "  FAIL $1"; fail=$((fail + 1)); }
 
 # kai <env...> -- <args>: kai against the scratch cache.
 kai() {
-  (cd "$work/pkg" && env XDG_CACHE_HOME="$xdg" KAI_BACKEND=c KAI_MODULAR=1 "$@")
+  (cd "$work/pkg" && env XDG_CACHE_HOME="$xdg" KAI_BACKEND="$BACKEND" KAI_MODULAR=1 "$@")
 }
 
 build() { kai "$@" "$KAI" build hello.kai -o "$work/hello" > "$work/build.out" 2>&1; }
@@ -109,18 +110,37 @@ rm -f "$cache/trim-stamp"
 build KAI_CACHE_TRIM_DAYS=2
 if gone "$cache/cmodular/fresh.o"; then ok "a 2-day window trims a 3-day entry"; else bad "short window ignored"; fi
 
-# Builds racing trims all succeed.
-plant
-pids=""
-for n in 1 2 3 4; do
-  rm -f "$cache/trim-stamp"
-  (kai "$KAI" build hello.kai -o "$work/race$n" > "$work/race$n.out" 2>&1 && "$work/race$n" > "$work/race$n.run") &
-  pids="$pids $!"
-done
-racefail=0
-for p in $pids; do wait "$p" || racefail=$((racefail + 1)); done
-for n in 1 2 3 4; do [ "$(cat "$work/race$n.run" 2>/dev/null)" = "hello" ] || racefail=$((racefail + 1)); done
-if [ "$racefail" -eq 0 ]; then ok "builds concurrent with trims succeed"; else bad "$racefail racing builds failed"; fi
+# race <backend>: builds that reuse entries past the window while trims
+# run all succeed.
+race() {
+  BACKEND="$1"
+  build KAI_CACHE_TRIM=0 KAI_BIN_MEMO=0
+  find "$cache" -type f -exec perl -e '$t = time - 9 * 86400; utime($t, $t, @ARGV)' {} +
+  plant
+  pids=""
+  for n in 1 2 3 4; do
+    rm -f "$cache/trim-stamp"
+    (kai KAI_BIN_MEMO=0 "$KAI" build hello.kai -o "$work/race$n" > "$work/race$n.out" 2>&1 \
+      && "$work/race$n" > "$work/race$n.run") &
+    pids="$pids $!"
+  done
+  racefail=0
+  for p in $pids; do wait "$p" || racefail=$((racefail + 1)); done
+  for n in 1 2 3 4; do
+    [ "$(cat "$work/race$n.run" 2>/dev/null)" = "hello" ] || racefail=$((racefail + 1))
+  done
+  if [ "$racefail" -eq 0 ]; then ok "$BACKEND: builds on aged entries concurrent with trims succeed"
+  else bad "$BACKEND: $racefail racing builds failed"; cat "$work"/race*.out; fi
+  BACKEND=c
+}
+
+race c
+if (cd "$work/pkg" && env XDG_CACHE_HOME="$xdg" KAI_BACKEND=native KAI_CACHE_TRIM=0 "$KAI" build hello.kai -o "$work/probe") \
+  > "$work/probe.out" 2>&1 && ! grep -q 'native backend unavailable' "$work/probe.out"; then
+  race native
+else
+  echo "  skip native race (no LLVM)"
+fi
 
 # kai clean --cache empties the shared cache; kai clean the package's.
 build KAI_CACHE_TRIM=0
