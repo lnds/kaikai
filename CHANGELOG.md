@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.163.0 (2026-10-17)
+
+### Added
+
+- **syntax**: format specs after a top-level colon in interpolation holes
+- **kai**: kai run builds at optimisation level 1 on both backends
+
+### Fixed
+
+- **stdlib**: regexp, json_encode and toml walk nested data in constant stack
+- **syntax**: cut an interpolation body at its spec by index, not through a record
+- **stdlib**: string.fixed rounds the exact binary value like printf
+- **tools**: cost-ab points each kaic2 at its own tree's core
+
+### Changed
+
+- **compile**: keep the core variant sort and the TU lookup in tail position
+- **compile**: prune the core of a c-modular build against a cached core TU set
+- **stdlib**: regexp walks nested patterns on the work stack only
+- **stdlib**: recurse plainly to a depth bound, switch to the work stack past it
+- **syntax**: move the width pads that only specs use out of core
+- **syntax**: load the format library only for files that use a precision spec
+- **native**: key the shared core object by opt level
+
 ## v0.162.0 (2026-10-17)
 
 ### Added
