@@ -276,7 +276,9 @@ pub fn join_acc(xs: [String], sep: String, acc: [String]) : [String] = match xs 
 
 A cons with one head (`[h, ...f(t)]`) or a constructor whose only
 self-call is one slot (`Link(x, f(rest))`) is compiled to a loop when the
-function's effect row is empty, so it is not flagged. Recursion on a
+function's effect row is empty, so it is not flagged. A row left open
+(`/ e`) is flagged: it loops only for the instantiations that perform no
+effect, and overflows when the callback does. Recursion on a
 tree is depth-bounded and not flagged, nor is a call to a
 different function, nor a call whose arguments are not a rest binder.
 Only direct self-recursion is tracked; mutual recursion is not.
