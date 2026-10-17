@@ -97,6 +97,14 @@ kai_corpus_pinned_threads() {
   sed -n 's/^KAI_THREADS=//p' "$envfile" | head -1 | grep .
 }
 
+# Fixtures whose property is the optimised frame size or fold (stack depth,
+# tail calls) build natively at O2 even when the harness runs at KAI_NATIVE_OPT=0.
+# Prints the pinned level; non-zero when the fixture is not listed.
+kai_corpus_native_opt() {
+  local list="${KAI_NATIVE_O2_FIXTURES:-tools/native-o2-fixtures.txt}"
+  [ -f "$list" ] && grep -qx -- "$1" "$list" && echo 2
+}
+
 # Rewrite ISO-8601 UTC timestamps (the stdlib Log default handler's
 # `[YYYY-MM-DDTHH:MM:SSZ] LEVEL message` form) to a fixed placeholder before
 # any comparison. Applied identically to both sides, so a real content

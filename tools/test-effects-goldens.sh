@@ -105,7 +105,8 @@ check_contract() {
   want_rc=0
   [ -f "$base.status.expected" ] && want_rc="$(tr -d '[:space:]' < "$base.status.expected")"
 
-  if ! KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$bin" >"$tmp/${slug}.build.log" 2>&1; then
+  nopt="$(kai_corpus_native_opt "$f")" || nopt=""
+  if ! env ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$bin" >"$tmp/${slug}.build.log" 2>&1; then
     tail -10 "$tmp/${slug}.build.log" > "$detail"
     echo "$f — $TARGET_BACKEND build failed:"
     return 0
@@ -218,7 +219,7 @@ if ls "$FIXDIR"/*.driver >/dev/null 2>&1; then
   }
 fi
 
-export -f process_one check_contract run_with_timeout report_fail kai_corpus_pinned_threads
+export -f process_one check_contract run_with_timeout report_fail kai_corpus_pinned_threads kai_corpus_native_opt
 export tmp results failures SKIPS KAI TARGET_BACKEND TIMEOUT_CMD RUN_TIMEOUT SIGHARNESS_BIN
 
 find "$FIXDIR" -name '*.out.expected' -o -name '*.out.sorted.expected' | while read -r g; do

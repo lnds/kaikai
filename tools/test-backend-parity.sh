@@ -165,7 +165,8 @@ process_one() {
   # cache to amortise it (a 30-min shard timeout). The modular path's own
   # equivalence is proved byte-for-byte by `test-native-modular`; this harness
   # need not re-pay for it. (KAI_NATIVE_MODULAR is a no-op on the C oracle.)
-  if ! KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$t_bin" >"$t_blog" 2>&1; then
+  nopt="$(kai_corpus_native_opt "$f")" || nopt=""
+  if ! env ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$t_bin" >"$t_blog" 2>&1; then
     {
       echo "FAIL $f — $TARGET_BACKEND (target) build failed:"
       tail -10 "$t_blog" | sed 's/^/    /'
@@ -215,7 +216,7 @@ process_one() {
 # reach them from each forked subshell.
 export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND
-export -f process_one kai_corpus_is_skipped kai_corpus_pinned_threads run_with_timeout kai_corpus_normalize_timestamps
+export -f process_one kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
@@ -284,7 +285,8 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
     attempt=0
     while [ "$attempt" -lt "$PARITY_RECHECKS" ]; do
       attempt=$((attempt + 1))
-      if ! KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
+      nopt="$(kai_corpus_native_opt "$rf")" || nopt=""
+      if ! env ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
         return 0   # target build failed => a deterministic, real gap.
       fi
       rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || rt=$?
