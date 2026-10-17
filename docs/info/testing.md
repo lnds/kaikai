@@ -33,14 +33,12 @@ module imported from the stdlib or from a dependency, directly or
 through another, never adds its blocks to a run: they belong to that
 module's own suite, and run when it is the one under test.
 
-A module's blocks run once, in the package's own binary, and are
-reported under the module's file. A `*_test.kai` or `tests/` file links
-the modules it imports without their blocks and runs only its own. The
-package binary is the entry's build when the entry reaches the module;
-a module the entry does not reach, in a package without an entry too,
-runs as a root of its own once some file of the package imports it.
-With no `kai.toml`, a file's package is the modules it imports from its
-own directory.
+Every file that declares blocks is the root of one test binary and
+runs its own blocks alone, reported under its own file. A module's
+blocks therefore run once, however many files import it: a
+`*_test.kai` or `tests/` file links the modules it imports without
+their blocks, as does the entry. With no `kai.toml`, a file's package is
+the modules it imports from its own directory.
 
 `kai bench` and `kai check` follow the same rule.
 
@@ -128,8 +126,7 @@ In package mode (`kai test`, `kai test .`, `kai test ./<sub>`, and
 each package `./...` visits), every `*_test.kai` file the package
 owns runs as its own test binary — nothing needs to import it. Test
 files are leaves by nature, so reachability from the entry point
-plays no part in whether they run; a file already in the entry's
-import graph runs once, through the entry binary.
+plays no part in whether they run.
 
 `kai check` and `kai bench` discover the same files: one convention
 serves all three keywords, so a `*_test.kai` need not be split per
