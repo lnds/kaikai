@@ -808,6 +808,16 @@ Inside a pipe stage, a `.` in a body is the stage's element:
 error at its column inside the string. A body is not a barrier, but a
 lambda written in one is.
 
+A top-level `:` in a body starts a format spec: `#{n:5}` pads to a width
+(right-aligned), `#{n:05}` zero-pads (`-0042`), `#{s:<10}` / `#{s:>10}` /
+`#{s:^10}` align, `#{x:.2}` renders a `Real` with 2 decimals (half-even), and
+`#{x:8.2}` combines them. The spec lowers to `string.fixed` and
+`string.pad_left` / `pad_right` / `pad_center` / `pad_zero`, so `.N` on a
+non-`Real` is a type error located at the spec, and a malformed spec is a
+parse error. A `:` inside brackets (`Foo { x: 1 }`, `%{ "k": v }`, a lambda
+parameter, a nested string) is not a spec. Hex, binary and thousands
+separators are not specs.
+
 ### Multi-line strings (`"""`)
 
 `"""..."""` is a string literal that spans lines and interpolates

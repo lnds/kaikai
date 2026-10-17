@@ -1,0 +1,147 @@
+#[doc("""
+The format spec after a top-level `:` in a `#{...}` body.
+
+`[<|>|^]W`, `0W`, `.N` and `W.N` (`<`, `>`, `^` align left, right, centre; a bare
+width aligns right). A spec lowers to calls of existing stdlib functions on the
+rendered hole: `string.fixed` for the precision, `string.pad_*` for the width.
+""")]
+
+import compiler.util
+import compiler.chars
+import compiler.ast
+import compiler.lex_tokens
+import compiler.parse_state
+import compiler.interp_scan
+
+#[doc("A parsed format spec: the width (0 for none), its alignment (0 right, 1 left, 2 centre, 3 zero fill) and the decimals of a `.N` (-1 for none).")]
+pub type FmtSpec = { align: Int, width: Int, prec: Int }
+
+#[doc("A spec that parsed, or the reason it did not.")]
+pub type SpecParse = SpecOk(FmtSpec) | SpecBad(String)
+
+fn spec_hint() : String = "expected a width and/or `.N` precision, as in `5`, `05`, `<10`, `.2` or `8.2`"
+
+fn spec_unknown(s: String) : SpecParse = SpecBad(concat_all(["unknown format spec `", s, "`: ", spec_hint()]))
+
+#[doc("Parses the text after the `:` of an interpolation body.")]
+pub fn parse_fmt_spec(s: String) : SpecParse = {
+  let n = string_length(s)
+  let al = spec_align(s)
+  let start = if al.aligned { 1 } else { 0 }
+  let zero = not al.aligned and n > 1 and spec_char_is(s, 0, '0') and spec_digit_at(s, 1)
+  let wend = spec_digits_end(s, start, n)
+  let width = spec_value(s, start, wend, 0)
+  if wend - start > 6 { SpecBad("the width is too large") }
+  else if wend >= n { spec_finish(al, zero, wend - start, width, 0 - 1) }
+  else if not spec_char_is(s, wend, '.') { spec_unknown(s) }
+  else {
+    let pend = spec_digits_end(s, wend + 1, n)
+    if pend == wend + 1 { SpecBad("expected the number of decimals after `.`") }
+    else if pend < n or pend - wend > 4 { spec_unknown(s) }
+    else { spec_finish(al, zero, wend - start, width, spec_value(s, wend + 1, pend, 0)) }
+  }
+}
+
+type Lead = { align: Int, aligned: Bool }
+
+fn spec_char_is(s: String, i: Int, c: Char) : Bool = match char_at(s, i) {
+  Some(d) -> d == c
+  None    -> false
+}
+
+fn spec_digit_at(s: String, i: Int) : Bool = match char_at(s, i) {
+  Some(c) -> ch_is_digit(c)
+  None    -> false
+}
+
+fn spec_align(s: String) : Lead = match char_at(s, 0) {
+  Some('<') -> Lead { align: 1, aligned: true }
+  Some('>') -> Lead { align: 0, aligned: true }
+  Some('^') -> Lead { align: 2, aligned: true }
+  _         -> Lead { align: 0, aligned: false }
+}
+
+fn spec_digits_end(s: String, i: Int, n: Int) : Int =
+  if i < n and spec_digit_at(s, i) { spec_digits_end(s, i + 1, n) } else { i }
+
+fn spec_value(s: String, i: Int, end: Int, acc: Int) : Int = match char_at(s, i) {
+  Some(c) -> if i < end { spec_value(s, i + 1, end, acc * 10 + (char_to_int(c) - 48)) } else { acc }
+  None    -> acc
+}
+
+fn spec_finish(al: Lead, zero: Bool, digits: Int, width: Int, prec: Int) : SpecParse =
+  if digits == 0 and al.aligned { SpecBad(concat_all(["expected a width after the alignment; ", spec_hint()])) }
+  else if digits == 0 and prec < 0 { SpecBad(spec_hint()) }
+  else if zero { SpecOk(FmtSpec { align: 3, width: width, prec: prec }) }
+  else { SpecOk(FmtSpec { align: al.align, width: width, prec: prec }) }
+
+#[doc("The hole `x` rendered under `sp`: its precision first, then its width, all at `line`:`col`.")]
+pub fn lower_fmt_spec(x: Expr, sp: FmtSpec, line: Int, col: Int) : Expr = {
+  let align = sp.align
+  let width = sp.width
+  let shown = if sp.prec >= 0 { spec_call("string", "fixed", [x, spec_int(sp.prec, line, col)], line, col) }
+              else { mk_expr(ECall(mk_expr(EMark(MkInterpShow), line, col), [x]), line, col) }
+  if width == 0 { shown } else { spec_pad(shown, align, width, line, col) }
+}
+
+fn spec_pad(shown: Expr, align: Int, width: Int, line: Int, col: Int) : Expr = {
+  let w = spec_int(width, line, col)
+  let fill = mk_expr(EChar(' '), line, col)
+  if align == 1 { spec_call("string", "pad_right", [shown, w, fill], line, col) }
+  else if align == 2 { spec_call("string", "pad_center", [shown, w, fill], line, col) }
+  else if align == 3 { spec_call("string", "pad_zero", [shown, w], line, col) }
+  else { spec_call("string", "pad_left", [shown, w, fill], line, col) }
+}
+
+fn spec_int(v: Int, line: Int, col: Int) : Expr = mk_expr(mk_int_synth(v), line, col)
+
+fn spec_call(modname: String, fn_name: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_expr(EField(mk_name(modname, line, col), fn_name), line, col), args), line, col)
+
+#[doc("A body's tokens up to its top-level `:`, closed by an end token, and that `:` when there is one.")]
+pub type SpecSplit = { head: [Token], colon: Option[Token] }
+
+#[doc("Cuts a body's tokens at the first `:` outside every bracket pair, the start of its format spec.")]
+pub fn split_spec(toks: [Token]) : SpecSplit = {
+  let at = spec_colon_index(toks, 0, 0)
+  if at < 0 { SpecSplit { head: toks, colon: None } }
+  else { spec_cut(toks, at) }
+}
+
+fn spec_cut(toks: [Token], at: Int) : SpecSplit = match drop(toks, at) {
+  [t, ..._] -> SpecSplit { head: list_append(take(toks, at), [tok(TkEof, t.line, t.col, t.start, t.start)]), colon: Some(t) }
+  []        -> SpecSplit { head: toks, colon: None }
+}
+
+fn spec_colon_index(ts: [Token], depth: Int, i: Int) : Int = match ts {
+  [] -> 0 - 1
+  [t, ...rest] ->
+    if tk_is(t.kind, TkColon) and depth == 0 { i }
+    else { spec_colon_index(rest, depth + spec_depth(t.kind), i + 1) }
+}
+
+fn spec_depth(k: TokKind) : Int = match k {
+  TkLparen   -> 1
+  TkLbracket -> 1
+  TkLbrace   -> 1
+  TkRparen   -> 0 - 1
+  TkRbracket -> 0 - 1
+  TkRbrace   -> 0 - 1
+  _          -> 0
+}
+
+#[doc("A hole with its spec lowered, or the located reason the spec is malformed.")]
+pub type SpecHole = SpecHoleOk(Expr) | SpecHoleBad(SpecDiag)
+
+#[doc("Where a malformed spec sits and what is wrong with it.")]
+pub type SpecDiag = { line: Int, col: Int, msg: String }
+
+#[doc("Lowers the body `src` that opens at `body`: `x` is the expression before its top-level `colon`, and the text after it is the spec.")]
+pub fn spec_hole(src: String, body: InterpPos, x: Expr, colon: Token) : SpecHole = {
+  let from = colon.start + 1
+  let pos = interp_pos_advance(body, string_slice(src, 0, from), 0)
+  match parse_fmt_spec(string_slice(src, from, string_length(src) - from)) {
+    SpecBad(msg) -> SpecHoleBad(SpecDiag { line: pos.line, col: pos.col, msg: msg })
+    SpecOk(sp)   -> SpecHoleOk(lower_fmt_spec(x, sp, pos.line, pos.col))
+  }
+}
