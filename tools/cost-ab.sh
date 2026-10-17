@@ -2,20 +2,28 @@
 # Compile-cost A/B of two kaic2 binaries on identical inputs.
 #
 # Both binaries compile the BASE tree's stage2/main.kai (self-compile) and an
-# empty program, plus any program given, with the base tree's stdlib on the
-# path. A binary that compiled its own tree would measure the branch's source
-# growth along with its compiler cost; kaic2 also bakes its stdlib path at
-# build time, so --path is always explicit.
+# empty program, plus any program given. A binary that compiled its own tree
+# would measure the branch's source growth along with its compiler cost. Each
+# side reads its OWN tree's stdlib (kaic2 bakes its stdlib path at build time,
+# so --path is always explicit): a stdlib or core change is part of what a
+# user's compile costs.
 #
 # Usage:
 #   tools/cost-ab.sh [options] <base-kaic2> <branch-kaic2> [program.kai ...]
 #   tools/cost-ab.sh [options] --base <git-ref> [program.kai ...]
 #
 # Options:
-#   --base <ref>      Build the base compiler from <ref> in a cached worktree;
-#                     the branch compiler is this tree's stage2/kaic2.
-#   --base-tree <dir> Tree whose stage2/main.kai and stdlib are compiled
-#                     (default: the tree holding <base-kaic2>, else this one).
+#   --base <ref>      Build the base compiler from <ref> and the branch compiler
+#                     from this tree's HEAD, each in a cached worktree with the
+#                     same recipe (seeded by this tree's stage2/kaic2, two
+#                     kaic2-fast hops), so the binaries differ only by source.
+#                     Uncommitted changes are not measured.
+#   --base-tree <dir> Tree whose stage2/main.kai is compiled and whose stdlib
+#                     the base reads (default: the tree holding <base-kaic2>,
+#                     else this one).
+#   --branch-tree <dir>
+#                     Tree whose stdlib the branch reads (default: the tree
+#                     holding <branch-kaic2>, else this one).
 #   --rounds <n>      Alternating measured rounds after one warm-up (default 3).
 #   --markdown        Print the table as GitHub markdown.
 #
@@ -32,6 +40,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROUNDS=3
 BASE_REF=""
 BASE_TREE=""
+BRANCH_TREE=""
 MARKDOWN=0
 FLOOR_PCT=0.1
 pos=()
@@ -39,6 +48,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --base) BASE_REF="${2:?--base needs a ref}"; shift 2 ;;
     --base-tree) BASE_TREE="${2:?--base-tree needs a dir}"; shift 2 ;;
+    --branch-tree) BRANCH_TREE="${2:?--branch-tree needs a dir}"; shift 2 ;;
     --rounds) ROUNDS="${2:?--rounds needs a number}"; shift 2 ;;
     --markdown) MARKDOWN=1; shift ;;
     -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
@@ -48,12 +58,12 @@ done
 
 die() { echo "cost-ab: $*" >&2; exit 2; }
 
-# A base built from a ref: two fast hops, so the base source is compiled by a
-# compiler of the base's own code, not by the branch's.
-build_base() {
+# A compiler built from a ref: two fast hops, so its source is compiled by a
+# compiler of its own code. Base and branch go through the same recipe.
+build_ref() {
   local ref="$1" sha wt
   sha="$(git -C "$HERE" rev-parse --verify "$ref^{commit}")" || die "unknown ref $ref"
-  wt="${COST_AB_CACHE:-${TMPDIR:-/tmp}/cost-ab}/base-${sha:0:12}"
+  wt="${COST_AB_CACHE:-${TMPDIR:-/tmp}/cost-ab}/tree-${sha:0:12}"
   if [ ! -x "$wt/stage2/kaic2" ] || [ ! -f "$wt/.cost-ab-built" ]; then
     rm -rf "$wt"
     mkdir -p "$(dirname "$wt")"
@@ -61,17 +71,19 @@ build_base() {
     git -C "$HERE" worktree add -q --detach "$wt" "$sha" >&2
     [ -x "$HERE/stage2/kaic2" ] || die "no $HERE/stage2/kaic2 to seed the base build; run make kaic2"
     cp "$HERE/stage2/kaic2" "$wt/stage2/kaic2"
-    echo "cost-ab: building base $ref (${sha:0:12}) with two kaic2-fast hops" >&2
-    (cd "$wt" && make bin/kai >&2 && make kaic2-fast >&2 && make kaic2-fast >&2) || die "base build failed"
+    echo "cost-ab: building $ref (${sha:0:12}) with two kaic2-fast hops" >&2
+    (cd "$wt" && make bin/kai >&2 && make kaic2-fast >&2 && make kaic2-fast >&2) || die "build of $ref failed"
     touch "$wt/.cost-ab-built"
   fi
   echo "$wt"
 }
 
 if [ -n "$BASE_REF" ]; then
-  BASE_TREE="$(build_base "$BASE_REF")"
+  [ -z "$(git -C "$HERE" status --porcelain --untracked-files=no)" ] || echo "cost-ab: warning: uncommitted changes are not measured (the branch is built from HEAD)" >&2
+  BASE_TREE="$(build_ref "$BASE_REF")"
+  BRANCH_TREE="$(build_ref HEAD)"
   BASE_BIN="$BASE_TREE/stage2/kaic2"
-  BRANCH_BIN="$HERE/stage2/kaic2"
+  BRANCH_BIN="$BRANCH_TREE/stage2/kaic2"
   progs=("${pos[@]+"${pos[@]}"}")
 else
   [ ${#pos[@]} -ge 2 ] || die "usage: $0 [options] <base-kaic2> <branch-kaic2> [program.kai ...] | --base <ref>"
@@ -79,6 +91,8 @@ else
   progs=("${pos[@]:2}")
   [ -n "$BASE_TREE" ] || BASE_TREE="$(cd "$(dirname "$BASE_BIN")/.." 2>/dev/null && pwd)"
   [ -f "$BASE_TREE/stage2/main.kai" ] || BASE_TREE="$HERE"
+  [ -n "$BRANCH_TREE" ] || BRANCH_TREE="$(cd "$(dirname "$BRANCH_BIN")/.." 2>/dev/null && pwd)"
+  [ -d "$BRANCH_TREE/stdlib" ] || BRANCH_TREE="$HERE"
 fi
 abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
 [ -x "$BASE_BIN" ] && BASE_BIN="$(abs "$BASE_BIN")"
@@ -87,7 +101,8 @@ abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
 [ -x "$BRANCH_BIN" ] || die "not executable: $BRANCH_BIN"
 [ -f "$BASE_TREE/stage2/main.kai" ] || die "no stage2/main.kai in $BASE_TREE"
 EDITION="$(cat "$BASE_TREE/EDITION")"
-STDLIB="$BASE_TREE/stdlib"
+BASE_STDLIB="$BASE_TREE/stdlib"
+BRANCH_STDLIB="$BRANCH_TREE/stdlib"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cost-ab.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -110,12 +125,12 @@ case "$(uname -s)" in
   *) die "unsupported platform" ;;
 esac
 
-# $1=binary $2=probe (selfhost or a .kai path) -> cost in $UNIT
+# $1=binary $2=probe (selfhost or a .kai path) $3=stdlib -> cost in $UNIT
 run_probe() {
-  local bin="$1" file="$2" dir n
+  local bin="$1" file="$2" stdlib="$3" dir n
   if [ "$file" = selfhost ]; then dir="$BASE_TREE/stage2"; file=main.kai
   else dir="$(dirname "$file")"; file="$(basename "$file")"; fi
-  n="$(cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$STDLIB" "$file")"
+  n="$(cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" "$file")"
   [ -n "$n" ] || die "no measurement from $bin on $file"
   echo $((n / DIV))
 }
@@ -128,7 +143,7 @@ stats() { # min mean of args
   printf '%s\n' "$@" | awk 'NR==1{m=$1} $1<m{m=$1} {s+=$1} END{printf "%d %d", m, s/NR}'
 }
 
-echo "cost-ab: base=$BASE_BIN branch=$BRANCH_BIN tree=$BASE_TREE rounds=$ROUNDS load=$(uptime | sed 's/.*averages*: //')" >&2
+echo "cost-ab: base=$BASE_BIN branch=$BRANCH_BIN input=$BASE_TREE stdlib base=$BASE_STDLIB branch=$BRANCH_STDLIB rounds=$ROUNDS load=$(uptime | sed 's/.*averages*: //')" >&2
 
 if [ "$MARKDOWN" = 1 ]; then
   echo "| probe | base min / mean ($UNIT) | branch min / mean ($UNIT) | delta ($UNIT) | delta (%) | verdict |"
@@ -138,14 +153,14 @@ else
 fi
 
 for p in "${probes[@]}"; do
-  run_probe "$BASE_BIN" "$p" >/dev/null
-  run_probe "$BRANCH_BIN" "$p" >/dev/null
+  run_probe "$BASE_BIN" "$p" "$BASE_STDLIB" >/dev/null
+  run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB" >/dev/null
   b=(); r=()
   for i in $(seq 1 "$ROUNDS"); do
     if [ $((i % 2)) -eq 1 ]; then
-      b+=("$(run_probe "$BASE_BIN" "$p")"); r+=("$(run_probe "$BRANCH_BIN" "$p")")
+      b+=("$(run_probe "$BASE_BIN" "$p" "$BASE_STDLIB")"); r+=("$(run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB")")
     else
-      r+=("$(run_probe "$BRANCH_BIN" "$p")"); b+=("$(run_probe "$BASE_BIN" "$p")")
+      r+=("$(run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB")"); b+=("$(run_probe "$BASE_BIN" "$p" "$BASE_STDLIB")")
     fi
   done
   read -r bmin bmean <<<"$(stats "${b[@]}")"
