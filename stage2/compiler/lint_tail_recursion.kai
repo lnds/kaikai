@@ -3,25 +3,35 @@
 import compiler.ast
 import compiler.expr_positions
 import compiler.lint_idiom
-import compiler.call_site_target
+import compiler.self_call
+import compiler.trmc_self_call
 import compiler.ret_slots
 import compiler.util
+import compiler.symtab
+import compiler.ctor_ix
 import compiler.written
 
 # A rest binder in scope, with the parameter it was split from.
 type RestOf = RestOf(LocalId, String)
 
-# What the walk knows at a node: the fn under check, its parameters, the
-# rest binders in scope, and whether the node is in tail position.
-type TrCtx = TrCtx(SymId, [LocalId], [RestOf], Bool)
+# What the walk knows at a node: the fn under check with its arity, the
+# table, whether its row admits the modulo-cons rewrite, its parameters,
+# the rest binders in scope, and whether the node is in tail position.
+type TrCtx = TrCtx(SelfRef, Int, SymTab, Bool, [LocalId], [RestOf], Bool)
 
 #[doc("non_tail_list_recursion findings of one fn: direct self-calls fed the tail of a destructured parameter from outside tail position. Mutual recursion is not tracked.")]
-pub fn tail_recursion_findings(fid: SymId, name: String, params: [Param], body: Expr) : [LintFinding] =
-  tr_walk(body, TrCtx(fid, map(params, (p) => p.binder.id), [], true), name, [])
+pub fn tail_recursion_findings(fid: FnId, name: String, params: [Param], row: RowExpr, body: Expr, tab: SymTab) : [LintFinding] =
+  tr_walk(body, TrCtx(SelfRef(fid), list_length(params), tab, tr_row_is_affine(row), map(params, (p) => p.binder.id), [], true), name, [])
+
+fn tr_row_is_affine(row: RowExpr) : Bool = match row {
+  REmpty -> true
+  _      -> false
+}
 
 fn tr_walk(e: Expr, cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
   match e.kind {
-    ECall(callee, args) -> tr_children(e, cx, name, tr_call(callee, args, cx, name, acc))
+    ECall(callee, args) -> tr_call_node(e, callee, args, cx, name, acc)
+    EList(els)          -> tr_list(e, els, cx, name, acc)
     EMatch(scrut, arms) -> tr_match(scrut, arms, cx, name, tr_walk(scrut, tr_inner(cx), name, acc))
     EIf(c, t, oe)       -> tr_if(c, t, oe, cx, name, acc)
     EBlock(ss, ot)      -> tr_block(ss, ot, cx, name, acc)
@@ -29,9 +39,9 @@ fn tr_walk(e: Expr, cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding]
     _                   -> tr_children(e, tr_inner(cx), name, acc)
   }
 
-fn tr_inner(cx: TrCtx) : TrCtx = match cx { TrCtx(f, ps, rs, _) -> TrCtx(f, ps, rs, false) }
+fn tr_inner(cx: TrCtx) : TrCtx = match cx { TrCtx(f, n, t, a, ps, rs, _) -> TrCtx(f, n, t, a, ps, rs, false) }
 
-fn tr_reset(cx: TrCtx) : TrCtx = match cx { TrCtx(f, ps, _, _) -> TrCtx(f, ps, [], false) }
+fn tr_reset(cx: TrCtx) : TrCtx = match cx { TrCtx(f, n, t, a, ps, _, _) -> TrCtx(f, n, t, a, ps, [], false) }
 
 fn tr_children(e: Expr, cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
   tr_positions(xp_positions(e), tr_inner(cx), name, acc)
@@ -64,11 +74,11 @@ fn tr_match(scrut: Expr, arms: [Arm], cx: TrCtx, name: String, acc: [LintFinding
   }
 
 fn tr_with_rests(cx: TrCtx, rs: [RestOf]) : TrCtx =
-  match cx { TrCtx(f, ps, old, t) -> TrCtx(f, ps, list_append(rs, old), t) }
+  match cx { TrCtx(f, n, t, a, ps, old, tl) -> TrCtx(f, n, t, a, ps, list_append(rs, old), tl) }
 
 fn tr_rests_of(scrut: Expr, p: Pattern, cx: TrCtx) : [RestOf] =
   match scrut.kind {
-    ELocal(l) -> match cx { TrCtx(_, ps, _, _) ->
+    ELocal(l) -> match cx { TrCtx(_, _, _, _, ps, _, _) ->
       if tr_has_local(ps, l) { tr_pattern_rest(p) } else { [] }
     }
     _ -> []
@@ -125,15 +135,46 @@ fn tr_binds_slot(p: Pattern, slot: Option[LocalId]) : Bool = match slot {
 
 fn tr_call(callee: Expr, args: [Expr], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
   match cx {
-    TrCtx(fid, _, rs, tail) ->
-      if tail or not tr_is_self(callee, fid) { acc }
+    TrCtx(me, _, _, _, _, rs, tail) ->
+      if tail or not tcrec_callee_is_self(callee, me) { acc }
       else { tr_arg_findings(callee, args, rs, name, acc) }
   }
 
-fn tr_is_self(callee: Expr, fid: SymId) : Bool = match callee_id(callee) {
-  Some(s) -> sym_raw(s) == sym_raw(fid)
-  None    -> false
+# A constructor or cons whose only self-call sits in one slot is rewritten
+# to a loop when the row is affine, so that slot counts as tail.
+fn tr_call_node(e: Expr, callee: Expr, args: [Expr], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match tr_ctor_hole(callee, args, cx) {
+    Some(i) -> tr_slots(args, i, 0, cx, name, tr_walk(callee, tr_inner(cx), name, acc))
+    None    -> tr_children(e, cx, name, tr_call(callee, args, cx, name, acc))
+  }
+
+fn tr_ctor_hole(callee: Expr, args: [Expr], cx: TrCtx) : Option[Int] = match cx {
+  TrCtx(me, n, tab, affine, _, _, tail) ->
+    if tail and affine and tr_is_ctor(tab, callee) { tcrec_ctor_modcons_slot(args, me, n) } else { None }
 }
+
+fn tr_is_ctor(tab: SymTab, f: Expr) : Bool = match f.kind {
+  ESym(s, _) -> sym_is_ctor(tab, s)
+  _          -> false
+}
+
+fn tr_slots(xs: [Expr], hole: Int, i: Int, cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match xs {
+    []           -> acc
+    [x, ...rest] -> tr_slots(rest, hole, i + 1, cx, name,
+                             tr_walk(x, if i == hole { cx } else { tr_inner(cx) }, name, acc))
+  }
+
+fn tr_list(e: Expr, els: [ListElem], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match cx {
+    TrCtx(me, n, _, affine, _, _, tail) -> match els {
+      [ElPlain(h), ElSpread(t)] ->
+        if tail and affine and tcrec_is_direct_self_call(t, me, n) and not tcrec_expr_has_self_call(h, me, n) {
+          tr_walk(t, cx, name, tr_walk(h, tr_inner(cx), name, acc))
+        } else { tr_children(e, cx, name, acc) }
+      _ -> tr_children(e, cx, name, acc)
+    }
+  }
 
 fn tr_arg_findings(callee: Expr, args: [Expr], rs: [RestOf], name: String, acc: [LintFinding]) : [LintFinding] =
   match args {

@@ -264,8 +264,7 @@ pub fn join_loop(xs: [String], sep: String) : [String] = match xs {
 The call is flagged when its argument is a rest binder (`...rest`) of a
 `match` on one of the function's own parameters and the call is not the
 last thing the arm does: an operand (`x + f(rest)`), a pipe stage
-(`f(rest) |> g`), a list element or spread, or a constructor or record
-field. Make the call the arm's result and carry the partial result in a
+(`f(rest) |> g`), a spread after two or more heads, or a record field. Make the call the arm's result and carry the partial result in a
 parameter, reversing once at the end if order matters:
 
 ```kaikai
@@ -275,7 +274,10 @@ pub fn join_acc(xs: [String], sep: String, acc: [String]) : [String] = match xs 
 }
 ```
 
-Recursion on a tree is depth-bounded and not flagged, nor is a call to a
+A cons with one head (`[h, ...f(t)]`) or a constructor whose only
+self-call is one slot (`Link(x, f(rest))`) is compiled to a loop when the
+function's effect row is empty, so it is not flagged. Recursion on a
+tree is depth-bounded and not flagged, nor is a call to a
 different function, nor a call whose arguments are not a rest binder.
 Only direct self-recursion is tracked; mutual recursion is not.
 
