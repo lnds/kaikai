@@ -22050,8 +22050,10 @@ static KaiValue *kai_llvm_backend_tag(void) {
      * object is never program-invariant: no tag, no shared core object. */
     const char *mode = getenv("KAI_BUILD_MODE");
     if (mode && strcmp(mode, "debug") == 0) return kai_str("");
+    /* The opt level keys the object: each level gets its own shared core
+     * object, so `kai run` (1) and `kai test` (0) reuse one too. */
     const char *lvl = getenv("KAI_NATIVE_OPT");
-    if (lvl && lvl[0] && strcmp(lvl, "2") != 0) return kai_str("");
+    if (!lvl || !lvl[0]) lvl = "2";
     char bc[64], inlbc[64], tag[512];
     kai_llvm_bc_id("KAI_NATIVE_RUNTIME_BC", bc, sizeof bc);
     kai_llvm_bc_id("KAI_NATIVE_RUNTIME_INLINE_BC", inlbc, sizeof inlbc);
@@ -22066,8 +22068,8 @@ static KaiValue *kai_llvm_backend_tag(void) {
         return kai_str("");
     }
     char *triple = LLVMGetDefaultTargetTriple();
-    snprintf(tag, sizeof tag, "%s|O2|cg:%s|bc:%s|inlbc:%s",
-             triple ? triple : "?", kai_llvm_cgen_level_id(), bc, inlbc);
+    snprintf(tag, sizeof tag, "%s|O%s|cg:%s|bc:%s|inlbc:%s",
+             triple ? triple : "?", lvl, kai_llvm_cgen_level_id(), bc, inlbc);
     if (triple) LLVMDisposeMessage(triple);
     return kai_str(tag);
 }
