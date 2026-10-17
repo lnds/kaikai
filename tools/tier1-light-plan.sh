@@ -16,7 +16,7 @@
 #   longest target's wall      (bound by its serial pole)
 # because a slice runs under `make -j` yet no target finishes faster than
 # its own serial loop. An `elastic` target fans its work out, so it adds
-# CPU and no pole. Each slice prints longest first, so `make -j` starts
+# CPU and no pole; so is every fixture-directory unit (`test-dir-*`). Each slice prints longest first, so `make -j` starts
 # its long poles before the short targets.
 #
 # A shard's fixed work depends on TIER1_SELFHOSTS: with it 0, a `base0`
@@ -50,7 +50,7 @@ shift
 
 echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" -v selfhosts="${TIER1_SELFHOSTS:-1}" '
   function cpu(t) { return (t in c) ? c[t] : dflt }
-  function pole(t) { return (t in el) ? 0 : (t in p) ? p[t] : dflt }
+  function pole(t) { return (t in el || t ~ /^test-dir-/) ? 0 : (t in p) ? p[t] : dflt }
   function wall(k, addc, addp,   big, work) {
     big = (addp > mx[k]) ? addp : mx[k]
     work = (sum[k] + addc) / par

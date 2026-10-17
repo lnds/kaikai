@@ -197,7 +197,7 @@ STACK :=
 .PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158 test-kir-while-param-slot-1173 test-kir-while-vcell-moved-set test-kir-var-escape-state-1173 test-kir-while-raw-cond-1414 test-kir-while-boxed-cond-1414
 .PHONY: test-issue-1331-op-arg-release-asan test-issue-1331-borrowed-op-arg-asan
 .PHONY: test-mn-sigaltstack-asan test-main-stack-sized test-evf-passthrough test-free-deep test-deep-chains test-deep-chains-native test-deep-ctor-values test-supervision-ended
-.PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-segment-switch test-segment-switch-asan test-segment-runtime test-segment-runtime-asan test-segment-runtime-tsan test-segment-handles test-segment-handles-asan test-segment-handles-native test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-tco-fuse-order test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-trmc-dead-drop-deep test-trmc-dead-drop-deep-native test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-shadowing-arm-lambda-native test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-native-runtime-decl test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-seq test-seq-native test-seq-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-perceus-1902-block-let-move test-perceus-1902-block-let-move-asan test-perceus-1902-block-let-move-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-native test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-perceus-1961-trmc-real-elision-native test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-coverage-report test-coverage-report-native test-trap-pads-native test-trap-pads-asan-native test-perceus-2032-bang-operand-use test-perceus-2032-bang-operand-use-asan test-perceus-2032-bang-operand-use-native test-perceus-owned-scope-unused-param test-perceus-owned-scope-unused-param-asan test-perceus-owned-scope-unused-param-native test-perceus-block-let-unused-alias test-perceus-block-let-unused-alias-asan test-perceus-block-let-unused-alias-native test-perceus-closure-capture-tail test-perceus-closure-capture-tail-asan test-perceus-borrow-homonym test-perceus-borrow-homonym-asan test-perceus-borrow-homonym-native test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-mailbox-scope-unwind test-mailbox-scope-unwind-native test-cancel-clause-ubsan test-monitor-ref-asan test-monitor-ref-asan-native test-perceus-asan test-perceus-asan-native test-perceus-switch-scrutinee-selftail test-perceus-switch-scrutinee-selftail-asan test-perceus-switch-scrutinee-selftail-native test-perceus-arm-branch-read test-perceus-arm-branch-read-asan test-perceus-arm-branch-read-native test-perceus-read-identity test-perceus-read-identity-asan test-perceus-read-identity-native test-handle-boxed-slot test-perceus-trmc-step-ledger test-perceus-trmc-step-ledger-asan test-perceus-trmc-step-ledger-native test-perceus-spread-consumes test-perceus-spread-consumes-asan test-perceus-spread-consumes-native test-perceus-borrow-own test-perceus-borrow-own-asan test-perceus-borrow-own-native test-modules-ctor-homonym test-modules-ctor-homonym-native test-modules-list-alias test-modules-list-alias-native test-index-coll-diag-once test-perceus-reuse-untaken-slot test-perceus-reuse-untaken-slot-asan test-perceus-reuse-untaken-slot-native test-perceus-reuse-nested-rebuild test-perceus-reuse-nested-rebuild-asan test-perceus-reuse-nested-rebuild-native test-slice-bound-once test-slice-bound-once-native test-rc-runs-every-thread-count test-rc-runs-every-thread-count-native test-perceus-branch-param-selftail test-perceus-branch-param-selftail-asan test-perceus-branch-param-selftail-native test-perceus-trmc-raw-operand-drop test-perceus-trmc-raw-operand-drop-asan test-perceus-trmc-raw-operand-drop-native test-perceus-pipe-borrowed-slot-alignment test-perceus-pipe-borrowed-slot-alignment-asan test-perceus-pipe-borrowed-slot-alignment-native test-trmc-slot-forms test-trmc-slot-forms-asan test-trmc-slot-forms-native test-trmc-qualified-nullary test-trmc-qualified-nullary-native test-pattern-shapes test-pattern-shapes-native test-variant-capacity test-string-escape-depth test-string-escape-depth-native test-exit-report-asan
+.PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-segment-switch test-segment-switch-asan test-segment-runtime test-segment-runtime-asan test-segment-runtime-tsan test-segment-handles test-segment-handles-asan test-segment-handles-native test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-dir-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-dir-protocols test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-tco-fuse-order test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-trmc-dead-drop-deep test-trmc-dead-drop-deep-native test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-dir-unions test-aliases test-dir-sequence test-dir-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-dir-shadowing test-shadowing-arm-lambda-native test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-native-runtime-decl test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-seq test-seq-native test-seq-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-perceus-1902-block-let-move test-perceus-1902-block-let-move-asan test-perceus-1902-block-let-move-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-native test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-perceus-1961-trmc-real-elision-native test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-coverage-report test-coverage-report-native test-trap-pads-native test-trap-pads-asan-native test-perceus-2032-bang-operand-use test-perceus-2032-bang-operand-use-asan test-perceus-2032-bang-operand-use-native test-perceus-owned-scope-unused-param test-perceus-owned-scope-unused-param-asan test-perceus-owned-scope-unused-param-native test-perceus-block-let-unused-alias test-perceus-block-let-unused-alias-asan test-perceus-block-let-unused-alias-native test-perceus-closure-capture-tail test-perceus-closure-capture-tail-asan test-perceus-borrow-homonym test-perceus-borrow-homonym-asan test-perceus-borrow-homonym-native test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-mailbox-scope-unwind test-mailbox-scope-unwind-native test-cancel-clause-ubsan test-monitor-ref-asan test-monitor-ref-asan-native test-perceus-asan test-perceus-asan-native test-perceus-switch-scrutinee-selftail test-perceus-switch-scrutinee-selftail-asan test-perceus-switch-scrutinee-selftail-native test-perceus-arm-branch-read test-perceus-arm-branch-read-asan test-perceus-arm-branch-read-native test-perceus-read-identity test-perceus-read-identity-asan test-perceus-read-identity-native test-handle-boxed-slot test-perceus-trmc-step-ledger test-perceus-trmc-step-ledger-asan test-perceus-trmc-step-ledger-native test-perceus-spread-consumes test-perceus-spread-consumes-asan test-perceus-spread-consumes-native test-perceus-borrow-own test-perceus-borrow-own-asan test-perceus-borrow-own-native test-modules-ctor-homonym test-modules-ctor-homonym-native test-modules-list-alias test-modules-list-alias-native test-index-coll-diag-once test-perceus-reuse-untaken-slot test-perceus-reuse-untaken-slot-asan test-perceus-reuse-untaken-slot-native test-perceus-reuse-nested-rebuild test-perceus-reuse-nested-rebuild-asan test-perceus-reuse-nested-rebuild-native test-slice-bound-once test-slice-bound-once-native test-rc-runs-every-thread-count test-rc-runs-every-thread-count-native test-perceus-branch-param-selftail test-perceus-branch-param-selftail-asan test-perceus-branch-param-selftail-native test-perceus-trmc-raw-operand-drop test-perceus-trmc-raw-operand-drop-asan test-perceus-trmc-raw-operand-drop-native test-perceus-pipe-borrowed-slot-alignment test-perceus-pipe-borrowed-slot-alignment-asan test-perceus-pipe-borrowed-slot-alignment-native test-trmc-slot-forms test-trmc-slot-forms-asan test-trmc-slot-forms-native test-trmc-qualified-nullary test-trmc-qualified-nullary-native test-pattern-shapes test-pattern-shapes-native test-variant-capacity test-string-escape-depth test-string-escape-depth-native test-exit-report-asan
 all: $(TARGET)
 
 $(KAIC1):
@@ -378,7 +378,7 @@ test-tokens: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai ../stage1/compiler.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
+	  $(KAIC2) --path ../stdlib --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
 	  ../stage1/kaic1 --tokens $$f | awk '{$$1=$$1; print}' > build/s1-$$name.tok; \
 	  diff -q build/s1-$$name.tok build/s2-$$name.tok > /dev/null \
 	    && echo "tokens OK $$name" \
@@ -390,7 +390,7 @@ test-ast: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
+	  $(KAIC2) --path ../stdlib --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
 	    || { echo "ast FAIL $$name"; exit 1; }; \
 	done
 
@@ -399,7 +399,7 @@ test-types: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) --types $$f > build/s2-$$name.types && echo "types OK $$name" \
+	  $(KAIC2) --path ../stdlib --types $$f > build/s2-$$name.types && echo "types OK $$name" \
 	    || { echo "types FAIL $$name"; exit 1; }; \
 	done
 
@@ -408,7 +408,7 @@ test-env: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) --env $$f > build/s2-$$name.env && echo "env OK $$name" \
+	  $(KAIC2) --path ../stdlib --env $$f > build/s2-$$name.env && echo "env OK $$name" \
 	    || { echo "env FAIL $$name"; exit 1; }; \
 	done
 
@@ -419,7 +419,7 @@ test-infer: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --infer $$f > build/s2-$$name.infer 2> build/s2-$$name.infer.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --infer $$f > build/s2-$$name.infer 2> build/s2-$$name.infer.err \
 	    && [ ! -s build/s2-$$name.infer.err ] \
 	    && echo "infer OK $$name" \
 	    || { echo "infer FAIL $$name"; cat build/s2-$$name.infer.err; exit 1; }; \
@@ -433,7 +433,7 @@ test-dump-mono: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --dump-mono $$f > build/s2-$$name.mono 2> build/s2-$$name.mono.err; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-mono $$f > build/s2-$$name.mono 2> build/s2-$$name.mono.err; \
 	  : '#645 introduced phantom row vars on pure named fns, so call-sites'; \
 	  : 'into row-poly callbacks (filter, map, each, ...) legitimately'; \
 	  : 'leave the trailing row slot as `?tN` until m4c specialises.'; \
@@ -455,7 +455,7 @@ test-dump-typed: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --dump-typed $$f > build/s2-$$name.typed 2> build/s2-$$name.typed.err; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-typed $$f > build/s2-$$name.typed 2> build/s2-$$name.typed.err; \
 	  if grep -q ' : ?$$' build/s2-$$name.typed; then \
 	    echo "dump-typed FAIL $$name (found un-annotated nodes)"; \
 	    grep ' : ?$$' build/s2-$$name.typed | head; \
@@ -550,7 +550,7 @@ test-infer-check: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --check $$f > build/s2-$$name.check 2> build/s2-$$name.check.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --check $$f > build/s2-$$name.check 2> build/s2-$$name.check.err \
 	    && [ ! -s build/s2-$$name.check ] \
 	    && [ ! -s build/s2-$$name.check.err ] \
 	    && echo "check-types OK $$name" \
@@ -562,7 +562,7 @@ test-check: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $$f > /dev/null \
+	  $(KAIC2) --path ../stdlib $$f > /dev/null \
 	    && echo "check OK $$name" \
 	    || { echo "check FAIL $$name"; exit 1; }; \
 	done
@@ -572,7 +572,7 @@ test-run: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/run-$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/run-$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/run-$$name.c -o build/run-$$name $(LDLIBS_M) ; \
 	  ./build/run-$$name > build/run-$$name.out; \
 	  ../stage1/kaic1 $$f > build/run-$$name-s1.c; \
@@ -588,7 +588,7 @@ test-blocks: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --test $$f > build/$$name-t.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --test $$f > build/$$name-t.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name-t.c -o build/$$name-t $(LDLIBS_M) ; \
 	  ./build/$$name-t 2> build/$$name-t.err || true; \
 	  ../stage1/kaic1 --test $$f > build/$$name-t-s1.c; \
@@ -3363,7 +3363,7 @@ test-unused-bindings: $(TARGET) build
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \
 	  exp=../examples/typer/$$name.warn.expected; \
-	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > build/typer-$$name.c 2> build/typer-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/typer-$$name.c 2> build/typer-$$name.err || rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "unused-bindings FAIL $$name (kaic2 exit=$$rc)"; cat build/typer-$$name.err; exit 1; \
 	  fi; \
@@ -3635,18 +3635,18 @@ test-holes: $(TARGET) build
 	@set -e; \
 	for f in ../examples/holes/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --holes $$f > build/s2-$$name.holes; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --holes $$f > build/s2-$$name.holes; \
 	  if ! grep -q "type hole" build/s2-$$name.holes; then \
 	    echo "holes FAIL $$name (no report)"; cat build/s2-$$name.holes; exit 1; \
 	  fi; \
-	  $(KAIC2) $(TEST_CORE_CACHE) --holes-json $$f > build/s2-$$name.holes.json; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --holes-json $$f > build/s2-$$name.holes.json; \
 	  python3 ../scripts/validate_holes_json.py build/s2-$$name.holes.json \
 	    || { echo "holes FAIL $$name (invalid JSON / schema)"; cat build/s2-$$name.holes.json; exit 1; }; \
-	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --strict-holes $$f > /dev/null 2> build/s2-$$name.strict.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --strict-holes $$f > /dev/null 2> build/s2-$$name.strict.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "holes FAIL $$name (--strict-holes did not fail)"; cat build/s2-$$name.strict.err; exit 1; \
 	  fi; \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name-holes.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/$$name-holes.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name-holes.c -o build/$$name-holes-c $(LDLIBS_M) ; \
 	  crc=0; ./build/$$name-holes-c > build/$$name-holes-c.out 2>&1 || crc=$$?; \
 	  if [ $$crc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-c.out; then \
@@ -4964,7 +4964,7 @@ test-effects-m12_8_y_phase4: $(TARGET) build core-cache-warm
 	  exp_out=../examples/effects/$$name.out.expected; \
 	  exp_err=../examples/effects/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4975,7 +4975,7 @@ test-effects-m12_8_y_phase4: $(TARGET) build core-cache-warm
 	    done < $$exp_err; \
 	    echo "effects OK $$name (rejected as expected)"; \
 	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	      || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	      || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -5422,50 +5422,6 @@ test-effects-wc: $(TARGET) build core-cache-warm
 # (positive cases — diffed against `<name>.out.expected`) or fails
 # with a specific diagnostic (negative cases — every line of
 # `<name>.err.expected` must be a substring of the compiler's stderr).
-SUGARS_FIXTURES := $(basename $(notdir $(wildcard ../examples/sugars/*.kai)))
-
-test-sugars: $(addprefix test-sugars-fixture-,$(SUGARS_FIXTURES))
-
-test-sugars-fixture-%: $(TARGET) build core-cache-warm
-	@set -e; \
-	name=$*; f=../examples/sugars/$$name.kai; \
-	exp_out=../examples/sugars/$$name.out.expected; \
-	exp_err=../examples/sugars/$$name.err.expected; \
-	case "$$name" in \
-	  complex_literal_*) extra_flags="--path ../stdlib" ;; \
-	  coll_literal_*) extra_flags="--path ../stdlib" ;; \
-	  shape_kind_*) extra_flags="--path ../stdlib" ;; \
-	  kinds_dim_*) extra_flags="--path ../stdlib" ;; \
-	  kinds_module_lit_carrier) extra_flags="--path ../stdlib" ;; \
-	  kinds_over_domain|m12_5_uom_record_field) extra_flags="--path ../stdlib" ;; \
-	  *) extra_flags="" ;; \
-	esac; \
-	if [ -f $$exp_err ]; then \
-	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
-	  if [ $$rc -eq 0 ]; then \
-	    echo "sugars FAIL $$name (expected error, got success)"; exit 1; \
-	  fi; \
-	  while read -r line; do \
-	    grep -q "$$line" build/s2-$$name.err \
-	      || { echo "sugars FAIL $$name (missing diagnostic: $$line)"; \
-	           cat build/s2-$$name.err; exit 1; }; \
-	  done < $$exp_err; \
-	  echo "sugars OK $$name (rejected as expected)"; \
-	else \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > build/$$name.c \
-	    || { echo "sugars FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
-	    || { echo "sugars FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/$$name > build/$$name.out \
-	    || { echo "sugars FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
-	  if [ -f $$exp_out ]; then \
-	    diff -q $$exp_out build/$$name.out > /dev/null \
-	      && echo "sugars OK $$name" \
-	      || { echo "sugars DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
-	  else \
-	    echo "sugars OK $$name (no golden, ran clean)"; \
-	  fi; \
-	fi
 
 # kai lint (#966). Each .kai under `examples/lint/` runs through the
 # `--lint` and `--lint-json` reporter modes; the human text is diffed
@@ -5515,47 +5471,6 @@ test-lint: $(TARGET) build
 	  echo "lint OK $$name"; \
 	done
 
-# Issue #326 — record-spread sugar (`T { ...src, x: 10 }`). Each .kai
-# under `examples/records/` either compiles + runs to a known stdout
-# (positive cases — diffed against `<name>.out.expected`) or fails
-# with a specific diagnostic (negative cases — every line of
-# `<name>.err.expected` must be a substring of the compiler's stderr).
-# Lives in its own target so a regression in spread desugaring shows
-# up under a clearly named gate.
-test-records: $(TARGET) build
-	@set -e; \
-	for f in ../examples/records/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/records/$$name.out.expected; \
-	  exp_err=../examples/records/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/r-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "records FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/r-$$name.err \
-	        || { echo "records FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/r-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "records OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name.c \
-	      || { echo "records FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
-	      || { echo "records FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/$$name > build/$$name.out \
-	      || { echo "records FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/$$name.out > /dev/null \
-	        && echo "records OK $$name" \
-	        || { echo "records DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
-	    else \
-	      echo "records OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
 # Issue #445 — m11 v1 diagnostic templates. Same `.err.expected`
 # substring discipline as `test-sugars` / `test-records`. Negative
 # fixtures must reject; every line of the golden must be a substring
@@ -5569,7 +5484,7 @@ test-diagnostics: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/diagnostics/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/diag-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/diag-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "diagnostics FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -5580,7 +5495,7 @@ test-diagnostics: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "diagnostics OK $$name (m11 v1 template emitted)"; \
 	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/diag-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/diag-$$name.c \
 	      || { echo "diagnostics FAIL $$name (kaic2 errored unexpectedly)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/diag-$$name.c -o build/diag-$$name $(LDLIBS_M) \
 	      || { echo "diagnostics FAIL $$name (C compile failed)"; exit 1; }; \
@@ -5689,237 +5604,11 @@ test-match-native:
 	@echo "test-match-native: SKIP (KAI_LLVM != 1)"
 endif
 
-# issue #156 — hex (`0x[0-9a-fA-F]+`) and binary (`0b[01]+`) integer
-# literal fixtures. Same diff / `.err.expected` discipline as test-sugars.
-# Positive cases verify round-trip values up to signed 64-bit max;
-# negative cases assert the lexer's malformed-literal diagnostic.
-test-literals: $(TARGET) build
-	@set -e; \
-	for f in ../examples/literals/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/literals/$$name.out.expected; \
-	  exp_err=../examples/literals/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/lit-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "literals FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/lit-$$name.err \
-	        || { echo "literals FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/lit-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "literals OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/lit-$$name.c \
-	      || { echo "literals FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/lit-$$name.c -o build/lit-$$name $(LDLIBS_M) \
-	      || { echo "literals FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/lit-$$name > build/lit-$$name.out \
-	      || { echo "literals FAIL $$name (run errored)"; cat build/lit-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/lit-$$name.out > /dev/null \
-	        && echo "literals OK $$name" \
-	        || { echo "literals DIFF $$name"; diff $$exp_out build/lit-$$name.out; exit 1; }; \
-	    else \
-	      echo "literals OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
-# issue #332 — string stdlib public-wrapper fixtures. Each .kai
-# under `examples/string/` exercises one of the four wrappers
-# added in `stdlib/core/string.kai` (`length`, `concat`, `slice`,
-# `to_int`) plus a regression guard that the qualified surface
-# and the flat PRELUDE primitive agree byte-for-byte. Loads the
-# cores (so `string.length` etc. resolve) — same shape
-# as `test-stdlib`. Diff / `.err.expected` discipline mirrors
-# `test-literals`.
-test-string: $(TARGET) build
-	@set -e; \
-	for f in ../examples/string/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/string/$$name.out.expected; \
-	  exp_err=../examples/string/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
-	      > /dev/null 2> build/str-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "string FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/str-$$name.err \
-	        || { echo "string FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/str-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "string OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
-	      > build/str-$$name.c \
-	      || { echo "string FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/str-$$name.c -o build/str-$$name $(LDLIBS_M) \
-	      || { echo "string FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/str-$$name > build/str-$$name.out \
-	      || { echo "string FAIL $$name (run errored)"; cat build/str-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/str-$$name.out > /dev/null \
-	        && echo "string OK $$name" \
-	        || { echo "string DIFF $$name"; diff $$exp_out build/str-$$name.out; exit 1; }; \
-	    else \
-	      echo "string OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
-# issue #130 — leading-pipe regression fixtures. Each .kai under
-# `examples/pipes/` exercises the apply (`|>`) and map (`|`) pipe
-# operators in leading-line position; one fixture re-checks the
-# pre-existing trailing-pipe shape so the relaxation in
-# `parse_pipe_rest` does not regress it. Same diff/golden discipline
-# as test-sugars.
-test-pipes: $(TARGET) build
-	@set -e; \
-	for f in ../examples/pipes/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/pipes/$$name.out.expected; \
-	  exp_err=../examples/pipes/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "pipes FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/p2-$$name.err \
-	        || { echo "pipes FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/p2-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "pipes OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name.c \
-	      || { echo "pipes FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
-	      || { echo "pipes FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/$$name > build/$$name.out \
-	      || { echo "pipes FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/$$name.out > /dev/null \
-	        && echo "pipes OK $$name" \
-	        || { echo "pipes DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
-	    else \
-	      echo "pipes OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
-# `examples/pipes/collections/` exercises convention-based pipe
-# dispatch (`|`, `||`, `|?`) on the opt-in stdlib collections (Set,
-# Stack, Queue, HashSet, HashMap, and a Map re-confirm). These import
-# `collections.*` (so they need `--path ../stdlib`) and rely on the
-# hanga-roa edition gate that enables non-List head dispatch, which is
-# why they live in their own subdir rather than the flat
-# `examples/pipes/*.kai` glob.
-test-pipes-collections: $(TARGET) build
-	@set -e; \
-	for f in ../examples/pipes/collections/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/pipes/collections/$$name.out.expected; \
-	  $(KAIC2) --path ../stdlib $$f > build/pc-$$name.c \
-	    || { echo "pipes-collections FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/pc-$$name.c -o build/pc-$$name $(LDLIBS_M) \
-	    || { echo "pipes-collections FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/pc-$$name > build/pc-$$name.out \
-	    || { echo "pipes-collections FAIL $$name (run errored)"; cat build/pc-$$name.out; exit 1; }; \
-	  diff -q $$exp_out build/pc-$$name.out > /dev/null \
-	    && echo "pipes-collections OK $$name" \
-	    || { echo "pipes-collections DIFF $$name"; diff $$exp_out build/pc-$$name.out; exit 1; }; \
-	done
-
 # Single-dispatch protocols, one target per fixture. Each .kai under
 # `examples/protocols/` either compiles + runs to a known stdout
 # (positive cases — diffed against `<name>.out.expected`) or fails
 # with a specific diagnostic substring (negative cases — every line
 # of `<name>.err.expected` must appear in the compiler's stderr).
-PROTOCOLS_FIXTURES := $(filter-out poly_scalar_dispatch bare_narrow_in_assert,$(basename $(notdir $(wildcard ../examples/protocols/*.kai))))
-
-test-protocols: $(addprefix test-protocols-fixture-,$(PROTOCOLS_FIXTURES))
-
-test-protocols-fixture-%: $(TARGET) build core-cache-warm
-	@set -e; \
-	name=$*; f=../examples/protocols/$$name.kai; \
-	exp_out=../examples/protocols/$$name.out.expected; \
-	exp_err=../examples/protocols/$$name.err.expected; \
-	if [ -f $$exp_err ]; then \
-	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
-	  if [ $$rc -eq 0 ]; then \
-	    echo "protocols FAIL $$name (expected error, got success)"; exit 1; \
-	  fi; \
-	  while read -r line; do \
-	    grep -qF "$$line" build/p2-$$name.err \
-	      || { echo "protocols FAIL $$name (missing diagnostic: $$line)"; \
-	           cat build/p2-$$name.err; exit 1; }; \
-	  done < $$exp_err; \
-	  echo "protocols OK $$name (rejected as expected)"; \
-	else \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/p2-$$name.c \
-	    || { echo "protocols FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/p2-$$name.c -o build/p2-$$name $(LDLIBS_M) \
-	    || { echo "protocols FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/p2-$$name > build/p2-$$name.out \
-	    || { echo "protocols FAIL $$name (run errored)"; cat build/p2-$$name.out; exit 1; }; \
-	  if [ -f $$exp_out ]; then \
-	    diff -q $$exp_out build/p2-$$name.out > /dev/null \
-	      && echo "protocols OK $$name (C)" \
-	      || { echo "protocols DIFF $$name (C)"; diff $$exp_out build/p2-$$name.out; exit 1; }; \
-	  else \
-	    echo "protocols OK $$name (no golden, ran clean)"; \
-	  fi; \
-	fi
-
-# Regression for the protocol-dispatch ABI mismatch (fix-proto-eq-abi).
-# `examples/protocols/poly_scalar_dispatch.kai` uses `test` blocks
-# whose `assert ... == ...` lowers to the runtime `kai_op_eq_v` (the
-# `assert` form drops the operand's static type, so the post-monomorph
-# rewrite to a specialised impl never fires). That routes through the
-# impl-table dispatch which, pre-fix, called the unboxed builtin scalar
-# impls (`Eq_Int_eq`, …) with the wrong ABI and SIGSEGV'd. Compiled
-# with `--test` (not as a program, so it is skipped by `test-protocols`).
-# The `--test` runner is C-only; the native backend's parity is gated
-# separately by the native-vs-C ratchet.
-test-proto-scalar-dispatch: $(TARGET) build
-	@set -e; \
-	src=../examples/protocols/poly_scalar_dispatch.kai; \
-	exp=../examples/protocols/poly_scalar_dispatch.out.expected; \
-	$(KAIC2) $(TEST_CORE_CACHE) --test $$src > build/psd.c \
-	  || { echo "proto-scalar-dispatch FAIL (kaic2 errored)"; exit 1; }; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/psd.c -o build/psd $(LDLIBS_M) \
-	  || { echo "proto-scalar-dispatch FAIL (C compile failed)"; exit 1; }; \
-	./build/psd > build/psd.out 2>&1; \
-	diff -q $$exp build/psd.out > /dev/null \
-	  && echo "proto-scalar-dispatch OK (C)" \
-	  || { echo "proto-scalar-dispatch DIFF (C)"; diff $$exp build/psd.out; exit 1; }
-
-# Issue #758: `bare_narrow_in_assert.kai` exercises #235 first-arg
-# narrowing for a bare cross-module name used INLINE in an `assert`
-# inside a `test` block. The fix types test/bench/check bodies so the
-# narrowing fires there too. Compiled with `--test` (the body is a
-# `test` block, skipped by the program-glob `test-protocols` loop).
-# C-only — the `--test` runner is the C path; the behavioural assertion
-# (right candidate dispatched) is what gates, not byte-id (the compiler
-# has no test blocks of its own so selfhost byte-id is false-green for
-# this fix; this fixture is the real gate).
-test-bare-narrow-assert: $(TARGET) build
-	@set -e; \
-	src=../examples/protocols/bare_narrow_in_assert.kai; \
-	exp=../examples/protocols/bare_narrow_in_assert.out.expected; \
-	$(KAIC2) $(TEST_CORE_CACHE) --test $$src > build/bna.c \
-	  || { echo "bare-narrow-assert FAIL (kaic2 errored)"; exit 1; }; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/bna.c -o build/bna $(LDLIBS_M) \
-	  || { echo "bare-narrow-assert FAIL (C compile failed)"; exit 1; }; \
-	./build/bna > build/bna.out 2>&1 \
-	  || { echo "bare-narrow-assert FAIL (test assertion failed)"; cat build/bna.out; exit 1; }; \
-	diff -q $$exp build/bna.out > /dev/null \
-	  && echo "bare-narrow-assert OK (C)" \
-	  || { echo "bare-narrow-assert DIFF (C)"; diff $$exp build/bna.out; exit 1; }
 
 # Self-hosting: per-compiler determinism.
 #
@@ -6222,7 +5911,7 @@ test-unbox-phase2: $(TARGET) build
 	@set -e; \
 	for f in ../examples/perceus/unbox_phase2_*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/perceus-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/perceus-$$name.c \
 	    || { echo "unbox FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/perceus-$$name.c -o build/perceus-$$name $(LDLIBS_M) \
 	    || { echo "unbox FAIL $$name (cc errored)"; exit 1; }; \
@@ -6387,7 +6076,7 @@ test-unbox-phase2: $(TARGET) build
 	@# inside `n + 1` instead of routing through `kai_op_eq` /
 	@# `kai_op_add`. The boxed match path's per-arm `kai_op_eq` chain
 	@# and `kai_decref(_scr)` cleanup must not appear inside the body.
-	$(KAIC2) $(TEST_CORE_CACHE) ../examples/perceus/match_pbind_catchall_raw.kai > build/perceus-match_pbind_catchall_raw.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/match_pbind_catchall_raw.kai > build/perceus-match_pbind_catchall_raw.c \
 	  || { echo "unbox FAIL match_pbind_catchall_raw (kaic2 errored)"; exit 1; }
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/perceus-match_pbind_catchall_raw.c -o build/perceus-match_pbind_catchall_raw $(LDLIBS_M) \
 	  || { echo "unbox FAIL match_pbind_catchall_raw (cc errored)"; exit 1; }
@@ -13477,125 +13166,6 @@ test-env-mutate-asan: $(TARGET) build
 	    || { echo "env-mutate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
 	done
 
-# issue #187 phase 2 — fixtures for unified-algebraic-types resolver.
-# Each .kai under `examples/unions/` either compiles + runs to a known
-# stdout (positive cases — diffed against `<name>.out.expected`) or
-# fails with a specific diagnostic (negative cases — every line of
-# `<name>.err.expected` must be a substring of the compiler's stderr).
-# Mirrors `test-sugars` / `test-match` mechanically; lives in its own
-# target so a regression in the union resolver / D2 collision check
-# shows up under a clearly named gate.
-# issue #201 — fixtures for the `|` map-pipe + `||` flat-map-pipe
-# operators with naming-convention dispatch. Mirrors `test-unions`
-# mechanically: each `.kai` either compiles + runs to a known stdout
-# (positive — diffed against `<name>.out.expected`) or fails with a
-# specific diagnostic (negative — every line of `<name>.err.expected`
-# must be a substring of the compiler's stderr). Lives in its own
-# target so a regression in the head-type-to-module dispatch path or
-# the rejection diagnostics shows up under a clearly-named gate.
-test-sequence: $(TARGET) build
-	@set -e; \
-	for f in ../examples/sequence/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/sequence/$$name.out.expected; \
-	  exp_err=../examples/sequence/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/seq-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "sequence FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/seq-$$name.err \
-	        || { echo "sequence FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/seq-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "sequence OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/seq-$$name.c \
-	      || { echo "sequence FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/seq-$$name.c -o build/seq-$$name $(LDLIBS_M) \
-	      || { echo "sequence FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/seq-$$name > build/seq-$$name.out \
-	      || { echo "sequence FAIL $$name (run errored)"; cat build/seq-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/seq-$$name.out > /dev/null \
-	        && echo "sequence OK $$name" \
-	        || { echo "sequence DIFF $$name"; diff $$exp_out build/seq-$$name.out; exit 1; }; \
-	    else \
-	      echo "sequence OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
-test-ufcs: $(TARGET) build
-	@set -e; \
-	for f in ../examples/ufcs/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/ufcs/$$name.out.expected; \
-	  exp_err=../examples/ufcs/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
-	      > /dev/null 2> build/ufcs-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "ufcs FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -qF "$$line" build/ufcs-$$name.err \
-	        || { echo "ufcs FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/ufcs-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "ufcs OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/ufcs-$$name.c \
-	      || { echo "ufcs FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/ufcs-$$name.c -o build/ufcs-$$name $(LDLIBS_M) \
-	      || { echo "ufcs FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/ufcs-$$name > build/ufcs-$$name.out \
-	      || { echo "ufcs FAIL $$name (run errored)"; cat build/ufcs-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/ufcs-$$name.out > /dev/null \
-	        && echo "ufcs OK $$name" \
-	        || { echo "ufcs DIFF $$name"; diff $$exp_out build/ufcs-$$name.out; exit 1; }; \
-	    else \
-	      echo "ufcs OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
-test-unions: $(TARGET) build
-	@set -e; \
-	for f in ../examples/unions/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/unions/$$name.out.expected; \
-	  exp_err=../examples/unions/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/u2-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "unions FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/u2-$$name.err \
-	        || { echo "unions FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/u2-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "unions OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/u2-$$name.c \
-	      || { echo "unions FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/u2-$$name.c -o build/u2-$$name $(LDLIBS_M) \
-	      || { echo "unions FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/u2-$$name > build/u2-$$name.out \
-	      || { echo "unions FAIL $$name (run errored)"; cat build/u2-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/u2-$$name.out > /dev/null \
-	        && echo "unions OK $$name" \
-	        || { echo "unions DIFF $$name"; diff $$exp_out build/u2-$$name.out; exit 1; }; \
-	    else \
-	      echo "unions OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
-
 # issue #376 — fixtures for transparent type aliases. `type Foo = T`
 # (single-component, no `|`) restores the structural-alias contract
 # from `docs/kaikai-minimal.md` lines 194-195. Mirrors `test-unions`:
@@ -13612,7 +13182,7 @@ test-aliases: $(TARGET) build
 	  exp_out=../examples/types/$$name.out.expected; \
 	  exp_err=../examples/types/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/ta-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/ta-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "aliases FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -13623,7 +13193,7 @@ test-aliases: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "aliases OK $$name (rejected as expected)"; \
 	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/ta-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/ta-$$name.c \
 	      || { echo "aliases FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/ta-$$name.c -o build/ta-$$name $(LDLIBS_M) \
 	      || { echo "aliases FAIL $$name (C compile failed)"; exit 1; }; \
@@ -13683,7 +13253,7 @@ test-violations: $(TARGET) build
 	  exp_out=../examples/refinements/$$name.out.expected; \
 	  exp_err=../examples/refinements/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/viol-$$name.cerr || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/viol-$$name.cerr || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "violations FAIL $$name (expected compile error, got success)"; exit 1; \
 	    fi; \
@@ -13695,7 +13265,7 @@ test-violations: $(TARGET) build
 	    echo "violations OK $$name (rejected at compile time)"; \
 	    continue; \
 	  fi; \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/viol-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/viol-$$name.c \
 	    || { echo "violations FAIL $$name (kaic2 C errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/viol-$$name.c -o build/viol-$$name $(LDLIBS_M) \
 	    || { echo "violations FAIL $$name (C compile failed)"; exit 1; }; \
@@ -13788,52 +13358,6 @@ test-doc-attr: $(TARGET) build
 	grep -qF '"module": "core/list"' build/builtins-doc.json \
 	  && echo "doc-attr OK builtins-doc-json" \
 	  || { echo "doc-attr FAIL builtins-doc-json"; exit 1; }
-
-# Issue #644 — ctor-overloading regression fixtures. Each .kai under
-# `examples/shadowing/` either compiles + runs to a known stdout
-# (positive cases — diffed against `<name>.out.expected`) or fails
-# to compile with a known diagnostic substring (negative cases —
-# matched against `<name>.err.expected`). Same diff / golden
-# discipline as `test-string` and `test-pipes`. Loads the core
-# preludes so user types that collide with prelude `Result.Ok` /
-# `Option.Some` exercise the real prelude shape. Wired into `test`
-# (the tier1 chain) so byte-identical selfhost + the closing PR's
-# acceptance gate both touch this target.
-test-shadowing: $(TARGET) build
-	@set -e; \
-	for f in ../examples/shadowing/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/shadowing/$$name.out.expected; \
-	  exp_err=../examples/shadowing/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
-	      > /dev/null 2> build/shadowing-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "shadowing FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -qF "$$line" build/shadowing-$$name.err \
-	        || { echo "shadowing FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/shadowing-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "shadowing OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
-	      > build/shadowing-$$name.c \
-	      || { echo "shadowing FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/shadowing-$$name.c -o build/shadowing-$$name $(LDLIBS_M) \
-	      || { echo "shadowing FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/shadowing-$$name > build/shadowing-$$name.out \
-	      || { echo "shadowing FAIL $$name (run errored)"; cat build/shadowing-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/shadowing-$$name.out > /dev/null \
-	        && echo "shadowing OK $$name" \
-	        || { echo "shadowing DIFF $$name"; diff $$exp_out build/shadowing-$$name.out; exit 1; }; \
-	    else \
-	      echo "shadowing OK $$name (no golden, ran clean)"; \
-	    fi; \
-	  fi; \
-	done
 
 ifeq ($(KAI_LLVM),1)
 # The native lowering takes a lambda's captures from the same collector
@@ -14271,8 +13795,23 @@ core-cache-warm: $(TARGET) build
 # A target that is a prerequisite of another one here is not listed: it runs
 # with its dependent (test-modular-build under test-modular-identity), and
 # listing it too would run it once per CI slice that holds either.
-# One target per line, sorted; the tier1 plan orders by cost, not position.
-TEST_LIGHT_TARGETS := $(shell cat test-lists/light.txt)
+# Pools come from test-registry.txt; a directory with a FIXTURES manifest
+# is a light unit by existing (tools/fixture-dir.sh).
+FIXTURE_SLUGS := $(shell sh ../tools/fixture-dir.sh --list)
+FIXTURE_UNITS := $(addprefix test-dir-,$(FIXTURE_SLUGS))
+registry_pool = $(shell awk '$$1 !~ /^\#/ && $$2 == "$(1)" { print $$1 }' test-registry.txt)
+TEST_LIGHT_TARGETS := $(call registry_pool,light) $(FIXTURE_UNITS)
+
+print-light-targets:
+	@echo $(TEST_LIGHT_TARGETS)
+
+define fixture_unit_rule
+test-dir-$(1): $$(TARGET) build core-cache-warm
+	@FIXTURE_JOBS=$$(TEST_JOBS) KAIC2='$$(KAIC2)' CC='$$(CC)' CFLAGS='$$(CFLAGS)' \
+	  CPPFLAGS_CORE='$$(CPPFLAGS_CORE)' LDLIBS_M='$$(LDLIBS_M)' LDFLAGS_STACK='$$(LDFLAGS_STACK)' TEST_CORE_CACHE='$$(TEST_CORE_CACHE)' \
+	  sh ../tools/fixture-dir.sh $(1)
+endef
+$(foreach slug,$(FIXTURE_SLUGS),$(eval $(call fixture_unit_rule,$(slug))))
 
 # The random program generator behind the nightly differential run still
 # builds, is deterministic, and emits programs the C backend accepts.
@@ -14298,7 +13837,7 @@ test-own-blocks-native: $(TARGET) bin-kai
 # without libLLVM the wrapper degrades to the C backend, so running these
 # in the C-built tier1 job asserts nothing about native — they belong to
 # the job that builds with KAI_LLVM=1.
-TEST_NATIVE_WRAPPER_TARGETS := $(shell cat test-lists/native-wrapper.txt)
+TEST_NATIVE_WRAPPER_TARGETS := $(call registry_pool,native-wrapper)
 .PHONY: $(TEST_LIGHT_TARGETS) $(TEST_NATIVE_WRAPPER_TARGETS)
 
 test-native-wrapper: $(TARGET) build
@@ -14308,8 +13847,8 @@ test-native-wrapper: $(TARGET) build
 
 # Single-fixture native gates, one list per tier1-native shard. They write
 # disjoint build/ files, so a shard runs its list under one `make -j`.
-TEST_NATIVE_GATES_1 := $(shell cat test-lists/native-gates-1.txt)
-TEST_NATIVE_GATES_2 := $(shell cat test-lists/native-gates-2.txt)
+TEST_NATIVE_GATES_1 := $(call registry_pool,native-gates-1)
+TEST_NATIVE_GATES_2 := $(call registry_pool,native-gates-2)
 NATIVE_GATE_JOBS ?= 4
 
 test-native-gates-%: $(TARGET) build core-cache-warm
@@ -14365,9 +13904,10 @@ tier1-light-timed-%:
 	exit $$rc
 
 test-light-partition:
-	@for f in test-lists/light.txt test-lists/native-wrapper.txt test-lists/native-gates-1.txt test-lists/native-gates-2.txt; do \
-	  LC_ALL=C sort -c -u $$f || { echo "test-light-partition FAIL: $$f must hold one target per line, sorted, no repeats"; exit 1; }; \
-	done
+	@dups=$$(awk '$$1 !~ /^\#/ && NF { print $$1, $$2 }' test-registry.txt | LC_ALL=C sort | uniq -d); \
+	  [ -z "$$dups" ] || { echo "test-light-partition FAIL: registry repeats a row: $$dups"; exit 1; }
+	@bad=$$(awk '$$1 !~ /^\#/ && NF && $$2 !~ /^(light|native-wrapper|native-gates-[12])$$/ { print $$1 }' test-registry.txt); \
+	  [ -z "$$bad" ] || { echo "test-light-partition FAIL: registry rows with an unknown pool: $$bad"; exit 1; }
 	@TIER1_SELFHOSTS=1 sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)
 	@TIER1_SELFHOSTS=0 sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)
 
@@ -14385,7 +13925,7 @@ test: $(TARGET) build
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-purity test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-holes test-driver-holes test-effects test-effect-runtime test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-issue-1194-reassigned-record-field-in-interp test-issue-779 test-unions test-aliases test-sequence test-ufcs test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-in-test-blocks test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-native-modular test-issue-1706-runner-mode-key test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json-native test-native-core-obj test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-unused-bindings test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1852-cross-module-derive-json test-home-tu-partition test-kir test-packages test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-issue-1875-success-diag-forwarded
+test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-purity test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-holes test-driver-holes test-effects test-effect-runtime test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-dir-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-issue-1194-reassigned-record-field-in-interp test-issue-779 test-dir-unions test-aliases test-dir-sequence test-dir-ufcs test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-in-test-blocks test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-native-modular test-issue-1706-runner-mode-key test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json-native test-native-core-obj test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-unused-bindings test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1852-cross-module-derive-json test-home-tu-partition test-kir test-packages test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-issue-1875-success-diag-forwarded
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category
