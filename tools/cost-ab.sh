@@ -166,7 +166,9 @@ run_probe() {
   fi
   if [ "$file" = selfhost ]; then dir="$BASE_TREE/stage2"; file=main.kai
   else dir="$(dirname "$file")"; file="$(basename "$file")"; fi
-  (cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" ${cflags[@]+"${cflags[@]}"} "$file") \
+  # A kaic2 reads the core from the stdlib path baked at its build; a binary
+  # built elsewhere (a CI artifact) must be pointed at this side's tree.
+  (cd "$dir" && KAI_THREADS=1 KAIKAI_STDLIB_PATH="$stdlib" measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" ${cflags[@]+"${cflags[@]}"} "$file") \
     || { tail -20 "$WORK/err" >&2; die "$bin failed on $file"; }
   n="$(cat "$WORK/count")"
   [ -n "$n" ] || die "no measurement from $bin on $file"
