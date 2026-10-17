@@ -246,6 +246,39 @@ is for. Two literal-adjacent shapes are also deliberately out:
 - `xs ++ [y]` (an append) — no spelling avoids copying `xs`, so the
   lint has no better form to point at.
 
+### non_tail_list_recursion
+
+A function that calls itself on the tail of a list parameter it
+destructured, with the call outside tail position, keeps one stack
+frame per element. A fiber's stack is small, so a few thousand elements
+overflow it:
+
+```kaikai
+pub fn join_loop(xs: [String], sep: String) : [String] = match xs {
+  []           -> []
+  [x, ...rest] -> [sep, x, ...join_loop(rest, sep)]
+#                               ^^^^^^^^^ non_tail_list_recursion
+}
+```
+
+The call is flagged when its argument is a rest binder (`...rest`) of a
+`match` on one of the function's own parameters and the call is not the
+last thing the arm does: an operand (`x + f(rest)`), a pipe stage
+(`f(rest) |> g`), a list element or spread, or a constructor or record
+field. Make the call the arm's result and carry the partial result in a
+parameter, reversing once at the end if order matters:
+
+```kaikai
+pub fn join_acc(xs: [String], sep: String, acc: [String]) : [String] = match xs {
+  []           -> list_reverse(acc)
+  [x, ...rest] -> join_acc(rest, sep, [x, sep, ...acc])
+}
+```
+
+Recursion on a tree is depth-bounded and not flagged, nor is a call to a
+different function, nor a call whose arguments are not a rest binder.
+Only direct self-recursion is tracked; mutual recursion is not.
+
 ### dead_code_unused_priv
 
 A private root-file function whose name appears nowhere in the file is
