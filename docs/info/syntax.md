@@ -810,7 +810,7 @@ lambda written in one is.
 
 A top-level `:` in a body starts a format spec: `#{n:5}` pads to a width
 (right-aligned), `#{n:05}` zero-pads (`-0042`), `#{s:<10}` / `#{s:>10}` /
-`#{s:^10}` align, `#{x:.2}` renders a `Real` with 2 decimals (half-even), and
+`#{s:^10}` align, `#{x:.2}` renders a `Real` with 2 decimals (exact binary value, half-even, as `printf("%.2f")`), and
 `#{x:8.2}` combines them. The spec lowers to `string.fixed` and
 `string.pad_left` / `pad_right` / `pad_center` / `pad_zero`, so `.N` on a
 non-`Real` is a type error located at the spec, and a malformed spec is a
