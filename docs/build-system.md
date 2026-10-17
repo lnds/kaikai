@@ -255,6 +255,7 @@ A change to the compiler is held to its compile cost: an increase over noise blo
 tools/cost-ab.sh --base origin/main                      # base built from the ref, branch = ./stage2/kaic2
 tools/cost-ab.sh --base origin/main --rounds 5 prog.kai  # more rounds, one extra probe
 tools/cost-ab.sh <base-kaic2> <branch-kaic2> [prog.kai ...]
+tools/cost-ab.sh --cache warm --base origin/main prog.kai  # per-project cache on; cold empties it before each run
 ```
 
 `--base <ref>` builds the ref in a cached worktree (`$TMPDIR/cost-ab/base-<sha>`) with two `make kaic2-fast` hops, so the base source is compiled by a compiler of the base's own code. It needs a built `stage2/kaic2` in this tree to seed from. Run on a quiet machine (load < 3).

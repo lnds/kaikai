@@ -25,6 +25,10 @@
 #                     Tree whose stdlib the branch reads (default: the tree
 #                     holding <branch-kaic2>, else this one).
 #   --rounds <n>      Alternating measured rounds after one warm-up (default 3).
+#   --cache <mode>    cold | warm: compile with the per-project cache on
+#                     (--user-cache-dir, shared with --core-cache-dir), one
+#                     directory per side and probe. cold empties it before every
+#                     run; warm primes it in the warm-up and reuses it.
 #   --markdown        Print the table as GitHub markdown.
 #
 # Unit: millions of instructions retired (macOS, Linux with perf), else CPU
@@ -42,6 +46,7 @@ BASE_REF=""
 BASE_TREE=""
 BRANCH_TREE=""
 MARKDOWN=0
+CACHE_MODE=""
 FLOOR_PCT=0.1
 pos=()
 while [ $# -gt 0 ]; do
@@ -50,11 +55,14 @@ while [ $# -gt 0 ]; do
     --base-tree) BASE_TREE="${2:?--base-tree needs a dir}"; shift 2 ;;
     --branch-tree) BRANCH_TREE="${2:?--branch-tree needs a dir}"; shift 2 ;;
     --rounds) ROUNDS="${2:?--rounds needs a number}"; shift 2 ;;
+    --cache) CACHE_MODE="${2:?--cache needs cold or warm}"; shift 2 ;;
     --markdown) MARKDOWN=1; shift ;;
     -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) pos+=("$1"); shift ;;
   esac
 done
+
+case "$CACHE_MODE" in ""|cold|warm) ;; *) echo "cost-ab: --cache takes cold or warm" >&2; exit 2 ;; esac
 
 die() { echo "cost-ab: $*" >&2; exit 2; }
 
@@ -125,12 +133,18 @@ case "$(uname -s)" in
   *) die "unsupported platform" ;;
 esac
 
-# $1=binary $2=probe (selfhost or a .kai path) $3=stdlib -> cost in $UNIT
+# $1=binary $2=probe (selfhost or a .kai path) $3=stdlib $4=side -> cost in $UNIT
 run_probe() {
-  local bin="$1" file="$2" stdlib="$3" dir n
+  local bin="$1" file="$2" stdlib="$3" side="$4" dir n cflags=()
+  if [ -n "$CACHE_MODE" ]; then
+    local cdir="$WORK/cache-$side-$(printf '%s' "$file" | cksum | cut -d' ' -f1)"
+    [ "$CACHE_MODE" = cold ] && rm -rf "$cdir"
+    mkdir -p "$cdir"
+    cflags=(--user-cache --user-cache-dir "$cdir" --core-cache-dir "$cdir")
+  fi
   if [ "$file" = selfhost ]; then dir="$BASE_TREE/stage2"; file=main.kai
   else dir="$(dirname "$file")"; file="$(basename "$file")"; fi
-  n="$(cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" "$file")"
+  n="$(cd "$dir" && KAI_THREADS=1 measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" ${cflags[@]+"${cflags[@]}"} "$file")"
   [ -n "$n" ] || die "no measurement from $bin on $file"
   echo $((n / DIV))
 }
@@ -153,14 +167,14 @@ else
 fi
 
 for p in "${probes[@]}"; do
-  run_probe "$BASE_BIN" "$p" "$BASE_STDLIB" >/dev/null
-  run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB" >/dev/null
+  run_probe "$BASE_BIN" "$p" "$BASE_STDLIB" base >/dev/null
+  run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB" branch >/dev/null
   b=(); r=()
   for i in $(seq 1 "$ROUNDS"); do
     if [ $((i % 2)) -eq 1 ]; then
-      b+=("$(run_probe "$BASE_BIN" "$p" "$BASE_STDLIB")"); r+=("$(run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB")")
+      b+=("$(run_probe "$BASE_BIN" "$p" "$BASE_STDLIB" base)"); r+=("$(run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB" branch)")
     else
-      r+=("$(run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB")"); b+=("$(run_probe "$BASE_BIN" "$p" "$BASE_STDLIB")")
+      r+=("$(run_probe "$BRANCH_BIN" "$p" "$BRANCH_STDLIB" branch)"); b+=("$(run_probe "$BASE_BIN" "$p" "$BASE_STDLIB" base)")
     fi
   done
   read -r bmin bmean <<<"$(stats "${b[@]}")"
