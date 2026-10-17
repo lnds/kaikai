@@ -1,0 +1,157 @@
+#[doc("Non-tail list recursion lint: non_tail_list_recursion. A fn that recurses on the rest of a list it destructured, with the call outside tail position, keeps one stack frame per element.")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.lint_idiom
+import compiler.call_site_target
+import compiler.ret_slots
+import compiler.util
+import compiler.written
+
+# A rest binder in scope, with the parameter it was split from.
+type RestOf = RestOf(LocalId, String)
+
+# What the walk knows at a node: the fn under check, its parameters, the
+# rest binders in scope, and whether the node is in tail position.
+type TrCtx = TrCtx(SymId, [LocalId], [RestOf], Bool)
+
+#[doc("non_tail_list_recursion findings of one fn: direct self-calls fed the tail of a destructured parameter from outside tail position. Mutual recursion is not tracked.")]
+pub fn tail_recursion_findings(fid: SymId, name: String, params: [Param], body: Expr) : [LintFinding] =
+  tr_walk(body, TrCtx(fid, map(params, (p) => p.binder.id), [], true), name, [])
+
+fn tr_walk(e: Expr, cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match e.kind {
+    ECall(callee, args) -> tr_children(e, cx, name, tr_call(callee, args, cx, name, acc))
+    EMatch(scrut, arms) -> tr_match(scrut, arms, cx, name, tr_walk(scrut, tr_inner(cx), name, acc))
+    EIf(c, t, oe)       -> tr_if(c, t, oe, cx, name, acc)
+    EBlock(ss, ot)      -> tr_block(ss, ot, cx, name, acc)
+    ELambda(_, _)       -> tr_children(e, tr_reset(cx), name, acc)
+    _                   -> tr_children(e, tr_inner(cx), name, acc)
+  }
+
+fn tr_inner(cx: TrCtx) : TrCtx = match cx { TrCtx(f, ps, rs, _) -> TrCtx(f, ps, rs, false) }
+
+fn tr_reset(cx: TrCtx) : TrCtx = match cx { TrCtx(f, ps, _, _) -> TrCtx(f, ps, [], false) }
+
+fn tr_children(e: Expr, cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  tr_positions(xp_positions(e), tr_inner(cx), name, acc)
+
+fn tr_positions(xs: [XPos], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match xs {
+    []                  -> acc
+    [XP(_, x), ...rest] -> tr_positions(rest, cx, name, tr_walk(x, cx, name, acc))
+  }
+
+fn tr_if(c: Expr, t: Expr, oe: Option[Expr], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] {
+  let a1 = tr_walk(t, cx, name, tr_walk(c, tr_inner(cx), name, acc))
+  match oe {
+    Some(x) -> tr_walk(x, cx, name, a1)
+    None    -> a1
+  }
+}
+
+fn tr_match(scrut: Expr, arms: [Arm], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match arms {
+    []                        -> acc
+    [Arm(p, g, body), ...rest] -> {
+      let cx2 = tr_with_rests(cx, tr_rests_of(scrut, p, cx))
+      let a1 = match g {
+        Some(ge) -> tr_walk(ge, tr_inner(cx2), name, acc)
+        None     -> acc
+      }
+      tr_match(scrut, rest, cx, name, tr_walk(body, cx2, name, a1))
+    }
+  }
+
+fn tr_with_rests(cx: TrCtx, rs: [RestOf]) : TrCtx =
+  match cx { TrCtx(f, ps, old, t) -> TrCtx(f, ps, list_append(rs, old), t) }
+
+fn tr_rests_of(scrut: Expr, p: Pattern, cx: TrCtx) : [RestOf] =
+  match scrut.kind {
+    ELocal(l) -> match cx { TrCtx(_, ps, _, _) ->
+      if tr_has_local(ps, l) { tr_pattern_rest(p) } else { [] }
+    }
+    _ -> []
+  }
+
+fn tr_pattern_rest(p: Pattern) : [RestOf] = match p.pkind {
+  PList(_, Some(b)) -> [RestOf(b.id, written_text(b.name))]
+  _                 -> []
+}
+
+fn tr_has_local(ls: [LocalId], l: LocalId) : Bool = match ls {
+  []           -> false
+  [x, ...rest] -> local_eq(x, l) or tr_has_local(rest, l)
+}
+
+# The tail of a block is the block's value; a `let` that the tail merely
+# reads back (a return-slot) holds the real tail.
+fn tr_block(ss: [Stmt], ot: Option[Expr], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] {
+  let slot = tr_slot_of(ot)
+  let a1 = tr_stmts(ss, slot, cx, name, acc)
+  match ot {
+    Some(t) -> tr_walk(t, cx, name, a1)
+    None    -> a1
+  }
+}
+
+fn tr_slot_of(ot: Option[Expr]) : Option[LocalId] = match ot {
+  Some(t) -> match t.kind {
+    ELocal(l) -> if ret_slot_id_is_scope(l) { Some(l) } else { None }
+    _         -> None
+  }
+  None -> None
+}
+
+fn tr_stmts(ss: [Stmt], slot: Option[LocalId], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match ss {
+    []           -> acc
+    [s, ...rest] -> tr_stmts(rest, slot, cx, name, tr_stmt(s, slot, cx, name, acc))
+  }
+
+fn tr_stmt(s: Stmt, slot: Option[LocalId], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match s {
+    SLet(p, _, rhs) -> tr_walk(rhs, if tr_binds_slot(p, slot) { cx } else { tr_inner(cx) }, name, acc)
+    _               -> tr_positions(xp_stmt_positions(s), tr_inner(cx), name, acc)
+  }
+
+fn tr_binds_slot(p: Pattern, slot: Option[LocalId]) : Bool = match slot {
+  Some(l) -> match p.pkind {
+    PBind(b) -> local_eq(b.id, l)
+    _        -> false
+  }
+  None -> false
+}
+
+fn tr_call(callee: Expr, args: [Expr], cx: TrCtx, name: String, acc: [LintFinding]) : [LintFinding] =
+  match cx {
+    TrCtx(fid, _, rs, tail) ->
+      if tail or not tr_is_self(callee, fid) { acc }
+      else { tr_arg_findings(callee, args, rs, name, acc) }
+  }
+
+fn tr_is_self(callee: Expr, fid: SymId) : Bool = match callee_id(callee) {
+  Some(s) -> sym_raw(s) == sym_raw(fid)
+  None    -> false
+}
+
+fn tr_arg_findings(callee: Expr, args: [Expr], rs: [RestOf], name: String, acc: [LintFinding]) : [LintFinding] =
+  match args {
+    []           -> acc
+    [a, ...rest] -> match a.kind {
+      ELocal(l) -> match tr_find_rest(rs, l) {
+        Some(RestOf(_, rname)) -> [tr_finding(callee, name, rname), ...acc]
+        None                 -> tr_arg_findings(callee, rest, rs, name, acc)
+      }
+      _ -> tr_arg_findings(callee, rest, rs, name, acc)
+    }
+  }
+
+fn tr_find_rest(rs: [RestOf], l: LocalId) : Option[RestOf] = match rs {
+  []                    -> None
+  [RestOf(b, v), ...rest] -> if local_eq(b, l) { Some(RestOf(b, v)) } else { tr_find_rest(rest, l) }
+}
+
+fn tr_finding(callee: Expr, name: String, rname: String) : LintFinding =
+  LF("non_tail_list_recursion", callee.line, callee.col,
+     concat_all(["`", name, "` recurses on `", rname, "`, the tail of a list it destructured, outside tail position: one stack frame per element; help: accumulate into a parameter, make the recursive call the last thing the arm does, and reverse once if order matters"]))
