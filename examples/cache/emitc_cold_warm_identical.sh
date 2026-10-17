@@ -8,12 +8,15 @@
 #
 #   - no-cache   (cache flags absent, the oracle)
 #   - cold-cache (dir + toolchain id set, first run: miss, entry written)
-#   - warm-cache (second run: hit, 13 core TU bodies spliced)
+#   - warm-cache (second run: hit, the core pruned to what the program
+#                 reaches, every cached core TU spliced)
 #
 # The user program deliberately exercises generics, a protocol impl on a
 # user type, a user effect with a handler, and units of measure — the
 # surfaces whose lowering most plausibly could leak user state into a
-# core TU. Any stream divergence means the splice is not sound.
+# core TU. The cold and warm streams must be equal and agree
+# with the oracle on every core TU and its slices, and its root and library TUs
+# may only have lost what the pruning dropped (tools/cmodular-prune-diff.sh).
 #
 # Also gates the key discipline: a different toolchain id must MISS
 # (never splice another compiler build's C), and a test-shaped build
@@ -88,12 +91,13 @@ grep -q "core-emit-cache: hit" "$PROJ/warm.err" || {
   echo "emitc_cold_warm_identical FAIL — warm run did not report an emit-cache hit"
   cat "$PROJ/warm.err"; exit 1; }
 
-cmp -s "$PROJ/cold.stream" "$PROJ/oracle.stream" || {
-  echo "emitc_cold_warm_identical FAIL — cold-cache stream differs from no-cache oracle"
+cmp -s "$PROJ/cold.stream" "$PROJ/warm.stream" || {
+  echo "emitc_cold_warm_identical FAIL — cold-cache stream differs from the warm one"
   exit 1; }
-cmp -s "$PROJ/warm.stream" "$PROJ/oracle.stream" || {
+"$ROOT/tools/cmodular-prune-diff.sh" "$KAIC2" "$STDLIB" "$PROJ/main.kai" "$PROJ/main.kai" \
+  > "$PROJ/prune.out" 2>&1 || {
   echo "emitc_cold_warm_identical FAIL — warm-cache stream differs from no-cache oracle"
-  exit 1; }
+  cat "$PROJ/prune.out"; exit 1; }
 
 # A different toolchain id must miss: never splice another build's C.
 "$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid2 \
@@ -103,7 +107,7 @@ grep -q "core-emit-cache: miss" "$PROJ/tid2.err" || {
   echo "emitc_cold_warm_identical FAIL — different toolchain id did not miss"
   cat "$PROJ/tid2.err"; exit 1; }
 
-# A body-only edit keeps the surface key: the hot rebuild loop hits.
+# A body-only edit hits: the hot rebuild loop.
 sed 's/"light"/"lighter"/' "$PROJ/main.kai" > "$PROJ/edited.kai"
 "$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/edited.kai" \
@@ -112,8 +116,9 @@ grep -q "core-emit-cache: hit" "$PROJ/edited.err" || {
   echo "emitc_cold_warm_identical FAIL — body-only edit did not hit"
   cat "$PROJ/edited.err"; exit 1; }
 
-# Adding an impl changes the type-level surface: must MISS (a user
-# impl can perturb synthetic decls attributed to a core TU).
+# Adding an impl changes the type-level surface, not the unwind variant:
+# it hits, and the core TUs it is compiled against stay those of an
+# unpruned compile.
 cat "$PROJ/main.kai" > "$PROJ/impl_added.kai"
 cat >> "$PROJ/impl_added.kai" <<'EOF'
 
@@ -128,9 +133,13 @@ EOF
 "$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/impl_added.kai" \
   > /dev/null 2> "$PROJ/impl.err"
-grep -q "core-emit-cache: miss" "$PROJ/impl.err" || {
-  echo "emitc_cold_warm_identical FAIL — added impl did not change the surface key"
+grep -q "core-emit-cache: hit" "$PROJ/impl.err" || {
+  echo "emitc_cold_warm_identical FAIL — added impl missed the core TU set"
   cat "$PROJ/impl.err"; exit 1; }
+"$ROOT/tools/cmodular-prune-diff.sh" "$KAIC2" "$STDLIB" "$PROJ/main.kai" "$PROJ/impl_added.kai" \
+  > "$PROJ/impl.out" 2>&1 || {
+  echo "emitc_cold_warm_identical FAIL — added impl changed a core TU"
+  cat "$PROJ/impl.out"; exit 1; }
 
 # A test-shaped build must not consult the emit cache (bmode gating).
 "$KAIC2" $EDITION_FLAG --emit=c-modular --test --core-cache-dir "$CACHE" --toolchain-id tid1 \
