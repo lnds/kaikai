@@ -27,6 +27,7 @@ pub type Plan = {
   native: [Native],
   native_objs: [String],
   libs: [String],
+  native_info: [Native],
   ffi_dir: String
 }
 
@@ -56,7 +57,11 @@ pub fn reads_scheduler_tls(p: Plan, objs: [String]) : Bool / File + Env + Ffi =
 
 #[doc("The kaic2 argv for `entry`: the emit flags, the plan's flags, the job's extra flags, then the entry.")]
 pub fn kaic2(p: Plan, emit: [String], entry: String) : [String] =
-  [p.t.layout.kaic2, ...emit] ++ p.flags ++ p.job.extra ++ [entry]
+  [p.t.layout.kaic2, ...emit]
+    ++ p.flags
+    ++ p.job.extra
+    ++ (if p.ffi_dir == "" { [] } else { cli_ffi_header.flag(p.ffi_dir) })
+    ++ [entry]
 
 #[doc("How kaic2 runs: `KAI_TRACE_RC` removed (the trace belongs to the user's program), `set` added, output to the named files.")]
 pub fn kaic2_spawn(set: [(String, String)], out: String, err: String) : Spawn =
@@ -93,36 +98,18 @@ pub fn replay(file: String) : Unit / Ffi =
 pub fn c_only(err_file: String) : Bool / File =
   string_contains(cli_fs.read_or_empty(err_file), "not built into this compiler")
 
-fn without_inputs_out(flags: [String]) : [String] =
-  match flags {
-    [] -> []
-    ["--inputs-out", _, ...rest] -> without_inputs_out(rest)
-    [f, ...rest] -> [f, ...without_inputs_out(rest)]
-  }
-
-#[doc("The directory of the generated `kai_ffi.h` for a plan: the one the native sources already needed, else one made when `$CFLAGS` links a C source; empty when the program declares no struct.")]
-pub fn ffi_dir(p: Plan) : String / File + Ffi =
-  if p.ffi_dir != "" {
-    p.ffi_dir
-  } else if not list.is_empty(cli_toolchain.shim_sources(p.t.cflags)) {
-    let flags = Plan { ...p, flags: without_inputs_out(p.flags) }
-    cli_ffi_header.generate(
-      kaic2(flags, ["--emit=ffi-header"], p.job.src),
-      cli_ffi_header.dir_for(p.job.tmp, p.job.out)
-    )
+#[doc("The plan with its `[native]` sources compiled: they follow the compile, so they may include the `kai_ffi.h` it wrote.")]
+pub fn with_objects(p: Plan) : Result[Plan, Int] / Stderr + Env + File + Ffi =
+  if list.is_empty(p.native_info) {
+    Ok(p)
   } else {
-    ""
-  }
-
-fn ffi_flags(p: Plan) : [String] / File + Ffi =
-  match ffi_dir(p) {
-    "" -> []
-    dir -> ["-I", dir]
+    let dir = if list.is_empty(cli_ffi_header.include(p.ffi_dir)) { "" } else { p.ffi_dir }
+    Ok(Plan { ...p, native_objs: cli_nativedeps.objects(p.t, p.native_info, dir, p.job.tmp)! })
   }
 
 #[doc("Run a link line; on failure name the `[native]` causes and fail with `<what> link failed`.")]
 pub fn link(p: Plan, argv: [String], what: String) : Result[Unit, Int] / Stderr + Env + File + Ffi =
-  if cli_proc.run(argv ++ ffi_flags(p), cli_proc.inherit()) == 0 {
+  if cli_proc.run(argv ++ cli_ffi_header.include(p.ffi_dir), cli_proc.inherit()) == 0 {
     Ok(())
   } else {
     cli_nativedeps.link_hint(p.native)
