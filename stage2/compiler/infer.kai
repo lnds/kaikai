@@ -8597,7 +8597,8 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       let filt = filter_labels_matching_res(rb.st.row, hsym, cell,
                                               cap_tyargs, rb.st.sub)
       let body_row_minus = filt.kept
-      let rb_st1 = st_set_sub(rb.st, filt.sub)
+      let rb_st1 = InferState { ...st_set_sub(rb.st, filt.sub),
+                                eff_uses: scope_eff_uses(st_capbound.eff_uses, rb.st.eff_uses, body_row_minus) }
       let st_out0 = st_merge_labels(st_set_row(rb_st1, prev_row), body_row_minus)
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
       # verify `with <Eff>` names a known effect. When
@@ -8626,6 +8627,21 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
   }
 }
+
+# A handle body's uses stay blamable only for the labels it lets escape, and
+# only when the enclosing scope has not used the label earlier in source.
+fn scope_eff_uses(outer: [EffUse], inner: [EffUse], kept: [Label]) : [EffUse] =
+  list_append(escaping_uses(inner, list_length(inner) - list_length(outer), outer, kept, []), outer)
+
+fn escaping_uses(inner: [EffUse], n_new: Int, outer: [EffUse], kept: [Label], acc: [EffUse]) : [EffUse] =
+  if n_new <= 0 { list_reverse(acc) }
+  else { match inner {
+    [] -> list_reverse(acc)
+    [EU(l, line, col), ...rest] -> {
+      let blamable = any(kept, (k) => label_same(k, l)) and not any(outer, (u) => match u { EU(ol, _, _) -> label_same(ol, l) })
+      escaping_uses(rest, n_new - 1, outer, kept, if blamable { [EU(l, line, col), ...acc] } else { acc })
+    }
+  } }
 
 # What a handle body performs through row variables is discharged too: their
 # bound labels join the body row, and only their open residues stay tails.
@@ -18008,6 +18024,12 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
 # scope, `synth` the body, then absorb the body's builtin effects the
 # way `main` does (the test runner installs those defaults). The decl
 # shape itself is returned unchanged with its now-typed body.
+fn test_block_kind(d: Decl) : String = match d {
+  DBench(_, _, _, _, _)    -> "bench"
+  DCheck(_, _, _, _, _, _) -> "check"
+  _                        -> "test"
+}
+
 fn test_decl_desc(d: Decl) : String = match d {
   DTest(desc, _, _, _, _)     -> desc
   DBench(desc, _, _, _, _)    -> desc
@@ -18035,7 +18057,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
   # `main` may opt into by declaring it. A test block has no surface
   # to declare a row on, so the opt-in set is granted outright; the
   # audit point for FFI stays on the wrappers' public `/ Ffi` rows.
-  let st2pre = check_body_row_label_loop(rb.st, "main",
+  let st2pre = check_body_row_label_loop(rb.st, RsBlock(test_block_kind(d)),
     test_non_absorbed_labels(rb.st, rb.st.row, all_decls),
     [], [], line, col, None)
   let hd = drain_deferred_homs(st2pre, list_reverse(st2pre.deferred_homs), [])
@@ -18624,12 +18646,12 @@ fn check_body_labels(st: InferState, fname: String, entry: Bool, f: FnId, declar
       # source-level `default { }` block. Stage A's `default_setups_from_block`
       # wires shims for them at `main`, so the runtime IS evidence-backed.
       if entry {
-        check_body_row_label_loop(st, fname,
+        check_body_row_label_loop(st, RsFn(fname),
                                   only_non_absorbed_labels(st, st.row, decls),
                                   [], [], line, col, mb)
       }
       else if list_is_empty(st.row) { st }
-      else { check_body_row_label_loop(st, fname, st.row, [], unrowed_notes(st, f), line, col, mb) }
+      else { check_body_row_label_loop(st, RsFn(fname), st.row, [], unrowed_notes(st, f), line, col, mb) }
     RClosed(lbs) -> {
       # for `main`, every declared row label must also
       # have an `emit_main_wrapper` default handler. `main : Int / Net`
@@ -18637,14 +18659,14 @@ fn check_body_labels(st: InferState, fname: String, entry: Bool, f: FnId, declar
       # at runtime because no handler was installed before `kai_main()`.
       # The body-vs-declared subset check is still the primary check;
       # this added pass surfaces the unhandled top-level row.
-      let st1 = check_body_row_label_loop(st, fname, st.row,
+      let st1 = check_body_row_label_loop(st, RsFn(fname), st.row,
                                             st_annot_labels(st, lbs),
                                             [], line, col, mb)
       if entry {
         check_main_row_handlable(st1, st.row, line, col, decls)
       } else { st1 }
     }
-    ROpen(_, lbs) -> check_body_row_label_loop(st, fname, st.row, st_annot_labels(st, lbs), [], line, col, mb)
+    ROpen(_, lbs) -> check_body_row_label_loop(st, RsFn(fname), st.row, st_annot_labels(st, lbs), [], line, col, mb)
   }
 }
 
@@ -18746,7 +18768,7 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
 # unify ty_args with `unify_label_args` (extends the substitution).
 # Unification failure or absence both report "effect not handled" with
 # the parametric label rendered in full, and the notes of `extra`.
-fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
+fn check_body_row_label_loop(st: InferState, sc: RowScope, performed: [Label],
                               declared: [Label], extra: [String], fline: Int, fcol: Int,
                               mb: Option[MutBlame]) : InferState / Console + File + Mutable {
   match performed {
@@ -18770,19 +18792,13 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               # vs handle-locally) instead of the single combined hint.
               let header = string_concat("effect not handled: ", lab_str)
               diag_error(st.file, line, col, header)
-              let n1 = "`#{fname}`'s declared row does not include `#{lab_str}`"
+              let n1 = scope_row_note(sc, lab_str)
               let n2 = "missing effect: `#{lab_str}`"
-              let n3 = "enclosing row: #{render_declared_row(st.env.tab, declared)}"
-              let helps = if any(applied.ty_args, (t) => ty_is_free_var(st.sub, t)) {
-                ["replace each `_` in `#{lab_str}` with the instance `#{fname}` runs under, a concrete type or one of its type parameters, and declare it in `#{fname}`'s row"]
-              } else {
-                ["either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`",
-                 "add `/ #{lab_str}` to `#{fname}`'s return type",
-                 "or wrap the call in `handle { ... } with #{lab_str} { ... }`"]
-              }
+              let n3 = scope_row_line(sc, st.env.tab, declared)
+              let helps = [scope_row_help(sc, lab_str, any(applied.ty_args, (t) => ty_is_free_var(st.sub, t)))]
               diag_note(n1)
               diag_note(n2)
-              diag_note(n3)
+              foreach(n3, (n) => diag_note(n))
               let vias = blame_via_notes(blame)
               foreach(vias, (v) => match v { SN(vl, vc, m) -> { diag_note(m)  emit_source_caret(st.file, vl, vc) } })
               foreach(extra, (n) => diag_note(n))
@@ -18791,7 +18807,7 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               let related = list_append([
                 ri_note(st.file, line, col, n1),
                 ri_note(st.file, line, col, n2),
-                ri_note(st.file, line, col, n3),
+                ...map(n3, (n) => ri_note(st.file, line, col, n)),
                 ...map(vias, (v) => match v { SN(vl, vc, m) -> ri_note(st.file, vl, vc, m) }),
                 ...map(extra, (n) => ri_note(st.file, line, col, n))
               ], map(helps, (h) => ri_help(st.file, line, col, h)))
@@ -18801,8 +18817,35 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
           }
         }
       }
-      check_body_row_label_loop(st1, fname, rest, declared, extra, fline, fcol, mb)
+      check_body_row_label_loop(st1, sc, rest, declared, extra, fline, fcol, mb)
     }
+  }
+}
+
+# What encloses an effect-row check: a function with a signature, or a
+# `test` / `bench` / `check` block, which has none.
+type RowScope = RsFn(String) | RsBlock(String)
+
+fn scope_row_note(sc: RowScope, lab_str: String) : String = match sc {
+  RsFn(f)    -> "`#{f}`'s declared row does not include `#{lab_str}`"
+  RsBlock(k) -> "this `#{k}` block's row is empty"
+}
+
+fn scope_row_line(sc: RowScope, tab: SymTab, declared: [Label]) : [String] = match sc {
+  RsFn(_)    -> ["enclosing row: #{render_declared_row(tab, declared)}"]
+  RsBlock(_) -> []
+}
+
+fn scope_row_help(sc: RowScope, lab_str: String, free_instance: Bool) : String = match sc {
+  RsFn(f) -> if free_instance {
+    "replace each `_` in `#{lab_str}` with the instance `#{f}` runs under, a concrete type or one of its type parameters, and declare it in `#{f}`'s row"
+  } else {
+    "add `/ #{lab_str}` to `#{f}`'s return type, or wrap the call in `handle { ... } with #{lab_str} { ... }`"
+  }
+  RsBlock(_) -> if free_instance {
+    "replace each `_` in `#{lab_str}` with a concrete type, and wrap the call in `handle { ... } with #{lab_str} { ... }`"
+  } else {
+    "wrap the call in `handle { ... } with #{lab_str} { ... }`"
   }
 }
 
