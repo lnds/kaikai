@@ -316,7 +316,7 @@ tools/prebuilt-kaic2.sh seed             # in a worktree: the build of its HEAD,
 tools/prebuilt-kaic2.sh has || tools/prebuilt-kaic2.sh build
 ```
 
-A worktree whose HEAD has no stored build gets the newest one and a `make kaic2-fast` on top, which is C-backend only. After seeding, edit and rebuild as usual (`make kaic2-fast`). The store is `$KAI_PREBUILT_STORE`, else `${XDG_CACHE_HOME:-~/.cache}/kaikai-prebuilt`, and keeps the newest three builds. Nothing CI or the selfhost oracle trusts comes from it: it is a dev convenience over the same `make kaic2`.
+`seed` restores the build of the commit the worktree branched from `origin/main` at, building it first if it is missing (concurrent seeds wait for one build); commits on top of that base are rebuilt by `make kaic2-fast`, which is C-backend only. An older commit's kaic2 is never used: it may not compile a newer tree. After seeding, edit and rebuild as usual (`make kaic2-fast`). The store is `$KAI_PREBUILT_STORE`, else `${XDG_CACHE_HOME:-~/.cache}/kaikai-prebuilt`, and keeps the newest three builds. Nothing CI or the selfhost oracle trusts comes from it: it is a dev convenience over the same `make kaic2`.
 
 ## Before the first push — the gates that turn CI red
 
