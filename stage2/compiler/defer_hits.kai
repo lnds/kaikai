@@ -1,0 +1,153 @@
+#[doc("""
+The deferred core groups a typed program needs.
+
+An operator reaches no impl before inference, because which one it
+selects depends on the operand types. A comparison of two values the
+runtime compares natively selects none; any other operand, a dispatcher
+call, or a reference to a deferred function needs the group of its
+protocol typed.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.core_reach
+import compiler.core_refs
+import compiler.core_protos
+import compiler.impl_identity
+import compiler.proto_op_index
+import compiler.proto_ids
+
+type DhSt = { ids: ProtoIds, ops: OpIndex, groups: [DeferGroup], members: NameIndex[SymId], hit: [SymId], want: Int, full: Bool,
+              generic: Int, compound: Int, dispatch: Int, member: Int, nodes: Int }
+
+#[doc("The protocols a typed program needs and, when the scan ran in full, how many sites asked: operators on a type variable, operators on a compound type, dispatcher calls and references to group members.")]
+pub type DeferHits = DeferHits([SymId], Int, Int, Int, Int, Int)
+
+#[doc("The protocols of `groups` that something in `typed` needs: an operator on operands the runtime does not compare natively, a call of one of their dispatchers, or a reference to a function of their group. `full` keeps scanning once every protocol is needed, to count the sites.")]
+pub fn defer_hits(reg: ProtocolReg, groups: [DeferGroup], typed: [Decl], full: Bool) : DeferHits = {
+  let members = foldl(groups, idx_empty(), (ix, g) => dh_members(ix, g))
+  let st = dh_decls(typed, DhSt { ids: reg.ids, ops: op_index(reg.ops), groups: groups, members: members, hit: [], want: list_length(groups), full: full,
+                                  generic: 0, compound: 0, dispatch: 0, member: 0, nodes: 0 })
+  DeferHits(if st.nodes > dh_budget() { map(groups, (g) => match g { DeferGroup(p, _) -> p }) } else { st.hit }, st.generic, st.compound, st.dispatch, st.member, st.nodes)
+}
+
+#[doc("True when `d` is a function of `syms`.")]
+pub fn defer_pooled(syms: [SymId], d: Decl) : Bool = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> any(syms, (s) => sym_same(s, fnid_sym(fid)))
+  _ -> false
+}
+
+#[doc("`whole` without the dropped core functions that are not in `syms`: what the cut kept and the deferred functions, in program order. Empty when nothing is deferred.")]
+pub fn defer_with_pool(whole: [Decl], dropped: [SymId], syms: [SymId]) : [Decl] = if list_is_empty(syms) { [] } else {
+  let gone = foldl(filter(dropped, (s) => not any(syms, (t) => sym_same(s, t))), idx_empty(), (ix, s) => idx_prepend_sym(ix, s, s))
+  filter(whole, (d) => match d {
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> match idx_chain_sym(gone, fnid_sym(fid)) { [] -> true  _ -> false }
+    _ -> true
+  })
+}
+
+#[doc("`reg` without the impls whose function is in `syms` but not declared by `typed`: the deferred impls the program did not ask for.")]
+pub fn defer_registry(reg: ProtocolReg, syms: [SymId], typed: [Decl]) : ProtocolReg = if list_is_empty(syms) { reg } else {
+  let asked = map(filter(typed, (d) => defer_pooled(syms, d)), (d) => match d { DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)  _ -> sym_none() })
+  reg_with_impls(reg, filter(reg.impls, (p) => match p {
+    PIR(_, _, _, f, _, _, _) -> not any(syms, (s) => sym_same(s, f)) or any(asked, (a) => sym_same(a, f))
+  }))
+}
+
+#[doc("`dropped` without the functions of `syms` that `typed` declares: the ones the typed program asked for.")]
+pub fn defer_dropped(dropped: [SymId], syms: [SymId], typed: [Decl]) : [SymId] = if list_is_empty(syms) { dropped } else {
+  let asked = map(filter(typed, (d) => defer_pooled(syms, d)), (d) => match d { DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)  _ -> sym_none() })
+  filter(dropped, (s) => not any(asked, (a) => sym_same(a, s)))
+}
+
+fn dh_members(ix: NameIndex[SymId], g: DeferGroup) : NameIndex[SymId] = match g {
+  DeferGroup(p, ss) -> foldl(ss, ix, (acc, s) => idx_prepend_sym(acc, s, p))
+}
+
+# Past this many nodes the scan costs more than typing the groups would, so it stops and asks for all of them.
+fn dh_budget() : Int = 32768
+
+fn dh_all(st: DhSt) : Bool = st.nodes > dh_budget() or (not st.full and list_length(st.hit) >= st.want)
+
+fn dh_decls(ds: [Decl], st: DhSt) : DhSt = match ds {
+  [] -> st
+  [d, ...rest] -> if dh_all(st) { st } else { dh_decls(rest, dh_exprs(cr_decl_exprs(d), st)) }
+}
+
+fn dh_exprs(es: [Expr], st: DhSt) : DhSt = match es {
+  [] -> st
+  [e, ...rest] -> if dh_all(st) { st } else { dh_exprs(rest, dh_expr(e, st)) }
+}
+
+fn dh_expr(e: Expr, st: DhSt) : DhSt = dh_positions(xp_positions(e), dh_node(e, DhSt { ...st, nodes: st.nodes + 1 }))
+
+fn dh_positions(ps: [XPos], st: DhSt) : DhSt = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> dh_positions(rest, dh_expr(x, st))
+}
+
+fn dh_node(e: Expr, st: DhSt) : DhSt = match e.kind {
+  ESym(s, _)       -> dh_sym(st, s)
+  EMark(MkProtoOp(ss)) -> foldl(ss, st, (acc, s) => dh_sym(acc, s))
+  EBinop(op, l, _) -> dh_binop(st, binop_proto(op), l)
+  _                -> st
+}
+
+fn dh_sym(st: DhSt, s: SymId) : DhSt = match idx_chain_sym(st.members, s) {
+  [] -> match pid_disp(st.ids, s) {
+    None    -> st
+    Some(d) -> op_protocols_fold(st.ops, disp_op(d), DhSt { ...st, dispatch: st.dispatch + 1 }, (acc, p) => dh_add_group(acc, p))
+  }
+  ps -> foldl(ps, DhSt { ...st, member: st.member + 1 }, (acc, p) => dh_add(acc, p))
+}
+
+fn dh_add_group(st: DhSt, p: SymId) : DhSt =
+  if any(st.groups, (g) => match g { DeferGroup(q, _) -> sym_same(p, q) }) { dh_add(st, p) } else { st }
+
+fn dh_add(st: DhSt, p: SymId) : DhSt =
+  if any(st.hit, (q) => sym_same(p, q)) { st } else { DhSt { ...st, hit: [p, ...st.hit] } }
+
+fn dh_binop(st: DhSt, bp: BinopProto, l: Expr) : DhSt = match bp {
+  BpEq  -> dh_operands(st, bp, CpEq, l)
+  BpOrd -> dh_operands(st, bp, CpOrd, l)
+  _     -> st
+}
+
+fn dh_operands(st: DhSt, bp: BinopProto, cp: CoreProto, l: Expr) : DhSt =
+  if dh_native(bp, l.ty) { st }
+  else if dh_generic(l.ty) { dh_add(DhSt { ...st, generic: st.generic + 1 }, core_proto_id(cp)) }
+  else if bp_is_eq(bp) { st }
+  else { dh_add(DhSt { ...st, compound: st.compound + 1 }, core_proto_id(cp)) }
+
+fn dh_generic(t: Option[Ty]) : Bool = match t {
+  Some(TyVarT(_)) -> true
+  Some(TyAny)     -> true
+  None            -> true
+  _               -> false
+}
+
+# `==` on a compound value needs no core impl: `kai_op_eq` compares structurally and only a user impl, which is never deferred, overrides it. `<` has no structural fallback.
+# The runtime compares these without looking an impl up: `kai_op_eq` and `kai_op_lt`.
+fn dh_native(bp: BinopProto, t: Option[Ty]) : Bool = match t {
+  Some(TyDimT(inner, _))    -> dh_native(bp, Some(inner))
+  Some(TyRefineT(inner, _)) -> dh_native(bp, Some(inner))
+  Some(TyInt)    -> true
+  Some(TyReal)   -> true
+  Some(TyChar)   -> true
+  Some(TyString) -> true
+  Some(TyByte)   -> true
+  Some(TyInt32)  -> true
+  Some(TyUInt32) -> true
+  Some(TyUInt64) -> true
+  Some(TyInt128) -> true
+  Some(TyBool)   -> bp_is_eq(bp)
+  Some(TyUnit)   -> bp_is_eq(bp)
+  _              -> false
+}
+
+fn bp_is_eq(bp: BinopProto) : Bool = match bp {
+  BpEq -> true
+  _    -> false
+}

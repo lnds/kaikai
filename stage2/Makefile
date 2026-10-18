@@ -14040,6 +14040,11 @@ test-core-ops: $(TARGET)
 test-core-early-cut: $(TARGET)
 	@../tools/core-early-cut-gate.sh
 
+# A comparison on operands the runtime compares natively types no Eq/Ord
+# impl; one it cannot, and a dispatcher call, still do.
+test-core-defer: $(TARGET)
+	@../tools/core-defer-gate.sh
+
 # After monomorphisation a core impl no reached call or operator
 # selects is dropped: a queue and a stack keep neither the Complex
 # arithmetic impls nor the structural Eq impls.
