@@ -84,6 +84,21 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.164.0 (2026-10-17)
+
+### Added
+
+- **kai**: bound the shared build caches by recency and add kai clean
+
+### Fixed
+
+- **kai**: refresh the cached runtime object before linking it
+- **kai**: a trim can never fail a build that reuses a cached entry
+
+### Changed
+
+- **compile**: prune the core of a c-modular build against a cached core TU set
+
 ## v0.163.0 (2026-10-17)
 
 ### Added
