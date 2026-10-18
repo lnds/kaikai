@@ -84,6 +84,51 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.165.0 (2026-10-18)
+
+### BREAKING CHANGE
+
+- a function whose return type holds a Fiber[T] or Pid[Msg]
+through a record field no longer compiles.
+- programs that annotated a String, Bool, Char or Unit
+with a unit no longer compile.
+- a function that writes a parameter array inside a loop
+body, or passes a local array to a user effect operation and then
+mutates it, was accepted without `/ Mutable` and is now rejected.
+
+### Added
+
+- **kai**: list a suite and its sources with kai test --list / --deps
+
+### Fixed
+
+- **typer**: name no field in the record escape note and pin the census
+- **typer**: reject a Fiber or Pid held by a record field in a return type
+- **runtime**: drain nurseries and restore the dispatch mask on every handle exit
+- **runtime**: leave no stale state when a cancel lands in a user handler
+- **runtime**: deliver a linked peer's cancel to the main fiber
+- **tools**: seed a worktree only from its base commit's kaic2
+- **kai**: write kai_ffi.h during the normal compile instead of a second pass
+- **kai**: decide the kai_ffi.h include path from the program, not from a scan of C sources
+- **kai**: put the generated kai_ffi.h on the include path of hand-written C sources
+- **typer**: judge the unit-annotated head through aliases, not the expanded carrier
+- **typer**: decide the unit-annotation head by the resolved scalar, not its spelling
+- **typer**: reject a unit annotation on a non-numeric builtin head
+- **typer**: count one scope in both hole reports and report pattern holes
+- **typer**: report one error for an undeclared effect in main
+- **typer**: anchor 'effect not handled' at the escaping call and name the real scope
+- **typer**: walk loop bodies and operation arguments in the Mutable masking rule
+- **typer**: eta-expand a constructor read as a function value
+- **fmt**: keep the unit under .N and count codepoints for a width
+
+### Changed
+
+- **typer**: read a sum's payload types from its resolved constructor schemes
+- **typer**: one fixed point for the handle table and a gate on the resolved return type
+- **typer**: resolve each declaration's mentioned types once for the carrier table
+- **typer**: answer the Cont and Seq crossing checks from the per-program carrier table
+- **typer**: answer the return-type handle check from a per-program carrier table
+
 ## v0.164.0 (2026-10-17)
 
 ### Added
