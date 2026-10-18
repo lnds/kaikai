@@ -45,330 +45,179 @@ fn check_default_coverage(df: DiagFiles, tab: SymTab, mod_decls: [Decl], all_dec
 }
 
 
+type CovWalk = { file: String, decls: [Decl], cx: CovCx, entry: Bool }
+
 fn check_default_coverage_loop(df: DiagFiles, all_decls: [Decl],
-                                cx: CovCx, homes: TyHomes, ds: [Decl],
-                                acc: [Diagnostic]) : [Diagnostic] / Console + File {
+                               cx: CovCx, homes: TyHomes, ds: [Decl],
+                               acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, fid, _, _, _, _, body, _, _, _) -> {
-        let acc1 = walk_coverage_expr(decl_diag_file(d, df), all_decls, cx, decl_types_as_entry(homes, fid), body, [], acc)
-        check_default_coverage_loop(df, all_decls, cx, homes, rest, acc1)
+        let w = CovWalk { file: decl_diag_file(d, df), decls: all_decls, cx: cx,
+                          entry: decl_types_as_entry(homes, fid) }
+        check_default_coverage_loop(df, all_decls, cx, homes, rest, cov_expr(w, body, [], acc))
       }
       _ -> check_default_coverage_loop(df, all_decls, cx, homes, rest, acc)
     }
   }
 }
 
-# Field-privacy walker: every `.f` read and record literal in this
-# module's typed bodies, judged by `field_hidden` once `Expr.ty` is the
-# resolved record type. Record patterns are judged where the typer
-# resolves their fields (`check_pfield_list`).
-
-
-fn walk_coverage_expr(file: String, decls: [Decl], cx: CovCx,
-                       entry: Bool,
-                       e: Expr, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
+fn cov_expr(w: CovWalk, e: Expr, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
   match e.kind {
-    EInt(_, _)           -> acc
-    EReal(_, _)          -> acc
-    EIntLit(_)           -> acc
-    EDecimalLit(_)       -> acc
-    EFixed(_, _)         -> acc
-    EBool(_)          -> acc
-    EChar(_)          -> acc
-    EStr(_, _)        -> acc
-    EUnit             -> acc
-    EName(_)           -> acc
-    EMark(_)           -> acc
-    ESym(_, _)        -> acc
-    ELocal(_)         -> acc
-    EOp(_)            -> acc
-    EUnder            -> acc
-    EPlaceholder      -> acc
-    EHole(_)          -> acc
-    ETodo(_)          -> acc
+    EInt(_, _) -> acc
+    EReal(_, _) -> acc
+    EIntLit(_) -> acc
+    EDecimalLit(_) -> acc
+    EFixed(_, _) -> acc
+    EBool(_) -> acc
+    EChar(_) -> acc
+    EStr(_, _) -> acc
+    EUnit -> acc
+    EName(_) -> acc
+    EMark(_) -> acc
+    ESym(_, _) -> acc
+    ELocal(_) -> acc
+    EOp(_) -> acc
+    EUnder -> acc
+    EPlaceholder -> acc
+    EHole(_) -> acc
+    ETodo(_) -> acc
     EExternBody(_, _) -> acc
     EVariantsOf(_, _) -> acc
-    EModCall(_, _)    -> acc
-    EIntrinsic(_, args_) ->
-      walk_coverage_list(file, decls, cx, entry, args_, stack, acc)
-    ESurface(sf) ->
-      walk_coverage_list(file, decls, cx, entry, surface_children(sf), stack, acc)
+    EModCall(_, _) -> acc
+    ELambda(_, _) -> acc
+    EIntrinsic(_, args_) -> cov_exprs(w, args_, stack, acc)
+    ESurface(sf) -> cov_exprs(w, surface_children(sf), stack, acc)
     ECall(callee, args_) -> {
       let head_errs = match callee.kind {
-        EOp(r) -> check_op_call_coverage(file, decls, cx, entry, r,
-                                         stack, e.line, e.col)
+        EOp(r) -> check_op_call_coverage(w, r, stack, e.line, e.col)
         _ -> []
       }
-      let acc1 = list_append(head_errs, acc)
-      let acc2 = walk_coverage_expr(file, decls, cx, entry, callee, stack, acc1)
-      walk_coverage_list(file, decls, cx, entry, args_, stack, acc2)
+      cov_exprs(w, args_, stack, cov_expr(w, callee, stack, list_append(head_errs, acc)))
     }
-    EField(base, _) -> walk_coverage_expr(file, decls, cx, entry, base, stack, acc)
-    EIndex(a, b)    -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-    }
-    EBinop(_, a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-    }
-    EUnop(_, x)     -> walk_coverage_expr(file, decls, cx, entry, x, stack, acc)
-    EIf(c, t, eo)   -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, c, stack, acc)
-      let a2 = walk_coverage_expr(file, decls, cx, entry, t, stack, a1)
-      match eo {
-        Some(b) -> walk_coverage_expr(file, decls, cx, entry, b, stack, a2)
-        None    -> a2
-      }
-    }
-    EMatch(scr, arms) -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, scr, stack, acc)
-      walk_coverage_arms(file, decls, cx, entry, arms, stack, a1)
-    }
-    ELambda(_, _) -> acc           # lambda bodies have their own row
-    ERecordLit(_, fs) -> walk_coverage_fields(file, decls, cx, entry, fs, stack, acc)
-    EList(els)        -> walk_coverage_elems(file, decls, cx, entry, els, stack, acc)
-    ERange(a, b, opt) -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      let a2 = walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-      match opt {
-        Some(s) -> walk_coverage_expr(file, decls, cx, entry, s, stack, a2)
-        None    -> a2
-      }
-    }
-    EBlock(stmts, tail) -> {
-      let a1 = walk_coverage_stmts(file, decls, cx, entry, stmts, stack, acc)
-      match tail {
-        Some(t) -> walk_coverage_expr(file, decls, cx, entry, t, stack, a1)
-        None    -> a1
-      }
-    }
-    EPipe(a, b)        -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-    }
-    EDispatchPipe(_, a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-      walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-    }
-    EBang(inner)       -> walk_coverage_expr(file, decls, cx, entry, inner, stack, acc)
-    ELitUnit(inner, _) -> walk_coverage_expr(file, decls, cx, entry, inner, stack, acc)
-    EHandle(body, eff, _, init_opt, _, clauses, ret_opt) -> {
-      let hsym = ref_sym(eff)
-      let clause_ops = handle_clause_op_names(clauses)
-      let default_ops = effect_default_op_map_get(cx.effs, hsym)
-      let frame = HF(hsym, clause_ops, default_ops, e.line, e.col)
-      let missing = handler_missing_ops(effect_decl_of(hsym, decls), clause_ops, default_ops)
-      let a0 = list_append(report_partial_handler(file, ref_text(cx.tab, eff), missing, e.line, e.col), acc)
-      let a1 = match init_opt {
-        Some(i) -> walk_coverage_expr(file, decls, cx, entry, i, stack, a0)
-        None    -> a0
-      }
-      # Clause bodies execute outside `with eff_name` (the typer enforces
-      # this; clauses are separate functions). Walk them under the outer
-      # stack so a Eff.op clause body that itself calls Eff.op is not
-      # silently treated as discharged by this frame.
-      let a2 = walk_coverage_clauses(file, decls, cx, entry, clauses, stack, a1)
-      let a3 = match ret_opt {
-        Some(r) -> match r {
-          HR(_, b, _, _) -> walk_coverage_expr(file, decls, cx, entry, b, stack, a2)
-        }
-        None -> a2
-      }
-      walk_coverage_expr(file, decls, cx, entry, body, [frame, ...stack], a3)
-    }
+    EField(base, _) -> cov_expr(w, base, stack, acc)
+    EIndex(a, b) -> cov_pair(w, a, b, stack, acc)
+    EBinop(_, a, b) -> cov_pair(w, a, b, stack, acc)
+    EUnop(_, x) -> cov_expr(w, x, stack, acc)
+    EIf(c, t, eo) -> cov_opt(w, eo, stack, cov_pair(w, c, t, stack, acc))
+    EMatch(scr, arms) -> foldl(arms, cov_expr(w, scr, stack, acc), (a, arm) => cov_arm(w, arm, stack, a))
+    ERecordLit(_, fs) -> foldl(fs, acc, (a, f) => match f { FI(_, x) -> cov_expr(w, x, stack, a) })
+    EList(els) -> foldl(els, acc, (a, el) => cov_elem(w, el, stack, a))
+    ERange(a, b, opt) -> cov_opt(w, opt, stack, cov_pair(w, a, b, stack, acc))
+    EBlock(stmts, tail) -> cov_opt(w, tail, stack, foldl(stmts, acc, (a, s) => cov_stmt(w, s, stack, a)))
+    EPipe(a, b) -> cov_pair(w, a, b, stack, acc)
+    EDispatchPipe(_, a, b) -> cov_pair(w, a, b, stack, acc)
+    EBang(inner) -> cov_expr(w, inner, stack, acc)
+    ELitUnit(inner, _) -> cov_expr(w, inner, stack, acc)
+    EHandle(body, eff, _, init_opt, _, clauses, ret_opt) ->
+      cov_handle(w, e, body, eff, init_opt, clauses, ret_opt, stack, acc)
   }
+
+fn cov_pair(w: CovWalk, a: Expr, b: Expr, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  cov_expr(w, b, stack, cov_expr(w, a, stack, acc))
+
+fn cov_opt(w: CovWalk, o: Option[Expr], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  match o {
+    Some(x) -> cov_expr(w, x, stack, acc)
+    None -> acc
+  }
+
+fn cov_exprs(w: CovWalk, es: [Expr], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  foldl(es, acc, (a, x) => cov_expr(w, x, stack, a))
+
+fn cov_arm(w: CovWalk, arm: Arm, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  match arm {
+    Arm(_, og, body) -> cov_expr(w, body, stack, cov_opt(w, og, stack, acc))
+  }
+
+fn cov_elem(w: CovWalk, el: ListElem, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  match el {
+    ElPlain(x) -> cov_expr(w, x, stack, acc)
+    ElSpread(x) -> cov_expr(w, x, stack, acc)
+  }
+
+fn cov_stmt(w: CovWalk, s: Stmt, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  match s {
+    SLet(_, _, e) -> cov_expr(w, e, stack, acc)
+    SVar(_, _, e, _, _) -> cov_expr(w, e, stack, acc)
+    SAssert(e, og) -> cov_opt(w, og, stack, cov_expr(w, e, stack, acc))
+    SExprStmt(e) -> cov_expr(w, e, stack, acc)
+    SIndexAssign(a, b, c, _, _) -> cov_expr(w, c, stack, cov_pair(w, a, b, stack, acc))
+    SAssign(a, c, _, _) -> cov_pair(w, a, c, stack, acc)
+    SUse(_, _, _) -> acc
+  }
+
+# Clause bodies run outside `with eff`: they are walked under the outer stack,
+# so an `Eff.op` call in a clause of `Eff` is not taken as discharged by it.
+fn cov_handle(w: CovWalk, e: Expr, body: Expr, eff: DeclRef, init_opt: Option[Expr],
+              clauses: [HClause], ret_opt: Option[HReturn],
+              stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
+  let hsym = ref_sym(eff)
+  let clause_ops = handle_clause_op_names(clauses)
+  let default_ops = effect_default_op_map_get(w.cx.effs, hsym)
+  let frame = HF(hsym, clause_ops, default_ops, e.line, e.col)
+  let missing = handler_missing_ops(effect_decl_of(hsym, w.decls), clause_ops, default_ops)
+  let a0 = list_append(report_partial_handler(w.file, ref_text(w.cx.tab, eff), missing, e.line, e.col), acc)
+  let a1 = cov_opt(w, init_opt, stack, a0)
+  let a2 = foldl(clauses, a1, (a, c) => match c { HC(_, _, b, _, _) -> cov_expr(w, b, stack, a) })
+  let a3 = match ret_opt {
+    Some(HR(_, b, _, _)) -> cov_expr(w, b, stack, a2)
+    None -> a2
+  }
+  cov_expr(w, body, [frame, ...stack], a3)
 }
 
-
-
-fn walk_coverage_list(file: String, decls: [Decl], cx: CovCx,
-                       entry: Bool,
-                       es: [Expr], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
-  match es {
-    []           -> acc
-    [h, ...rest] -> {
-      let a1 = walk_coverage_expr(file, decls, cx, entry, h, stack, acc)
-      walk_coverage_list(file, decls, cx, entry, rest, stack, a1)
-    }
-  }
-}
-
-
-
-fn walk_coverage_arms(file: String, decls: [Decl], cx: CovCx,
-                       entry: Bool,
-                       arms: [Arm], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
-  match arms {
-    []           -> acc
-    [a, ...rest] -> match a {
-      Arm(_, og, body) -> {
-        let a1 = match og {
-          Some(g) -> walk_coverage_expr(file, decls, cx, entry, g, stack, acc)
-          None    -> acc
-        }
-        let a2 = walk_coverage_expr(file, decls, cx, entry, body, stack, a1)
-        walk_coverage_arms(file, decls, cx, entry, rest, stack, a2)
-      }
-    }
-  }
-}
-
-
-
-fn walk_coverage_fields(file: String, decls: [Decl], cx: CovCx,
-                         entry: Bool,
-                         fs: [FieldInit], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
-  match fs {
-    []           -> acc
-    [f, ...rest] -> match f {
-      FI(_, e) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        walk_coverage_fields(file, decls, cx, entry, rest, stack, a1)
-      }
-    }
-  }
-}
-
-
-
-fn walk_coverage_elems(file: String, decls: [Decl], cx: CovCx,
-                        entry: Bool,
-                        els: [ListElem], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
-  match els {
-    []            -> acc
-    [el, ...rest] -> match el {
-      ElPlain(e)  -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        walk_coverage_elems(file, decls, cx, entry, rest, stack, a1)
-      }
-      ElSpread(e) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        walk_coverage_elems(file, decls, cx, entry, rest, stack, a1)
-      }
-    }
-  }
-}
-
-
-
-fn walk_coverage_stmts(file: String, decls: [Decl], cx: CovCx,
-                        entry: Bool,
-                        ss: [Stmt], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
-  match ss {
-    []           -> acc
-    [s, ...rest] -> match s {
-      SLet(_, _, e) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        walk_coverage_stmts(file, decls, cx, entry, rest, stack, a1)
-      }
-      SVar(_, _, e, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        walk_coverage_stmts(file, decls, cx, entry, rest, stack, a1)
-      }
-      SAssert(e, og) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        let a2 = match og {
-          Some(g) -> walk_coverage_expr(file, decls, cx, entry, g, stack, a1)
-          None    -> a1
-        }
-        walk_coverage_stmts(file, decls, cx, entry, rest, stack, a2)
-      }
-      SExprStmt(e) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, e, stack, acc)
-        walk_coverage_stmts(file, decls, cx, entry, rest, stack, a1)
-      }
-      SIndexAssign(a, b, c, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-        let a2 = walk_coverage_expr(file, decls, cx, entry, b, stack, a1)
-        let a3 = walk_coverage_expr(file, decls, cx, entry, c, stack, a2)
-        walk_coverage_stmts(file, decls, cx, entry, rest, stack, a3)
-      }
-      SAssign(a, c, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, a, stack, acc)
-        let a3 = walk_coverage_expr(file, decls, cx, entry, c, stack, a1)
-        walk_coverage_stmts(file, decls, cx, entry, rest, stack, a3)
-      }
-      SUse(_, _, _) -> walk_coverage_stmts(file, decls, cx, entry, rest, stack, acc)
-    }
-  }
-}
-
-
-
-fn walk_coverage_clauses(file: String, decls: [Decl], cx: CovCx,
-                          entry: Bool,
-                          cs: [HClause], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
-  match cs {
-    []           -> acc
-    [c, ...rest] -> match c {
-      HC(_, _, body, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, cx, entry, body, stack, acc)
-        walk_coverage_clauses(file, decls, cx, entry, rest, stack, a1)
-      }
-    }
-  }
-}
-
-# Op-call discharge for the perform `r`: returns the diagnostic it
-# emitted, if any.
-
-
-fn check_op_call_coverage(file: String, decls: [Decl],
-                           cx: CovCx, entry: Bool,
-                           r: OpRef, stack: [HandleFrame],
-                           line: Int, col: Int) : [Diagnostic] / Console + File {
+# An op call is discharged by the nearest enclosing handle of its effect when
+# that handle has a clause for it: an inner handle's evidence masks the
+# effect's `default` block, so the block does not cover it. Outside any
+# handle only `main` can discharge it, through the default block.
+fn check_op_call_coverage(w: CovWalk, r: OpRef, stack: [HandleFrame],
+                          line: Int, col: Int) : [Diagnostic] / Console + File {
   let esym = r.eff
   let op_name = written_text(r.op)
-  # Skip the row-level absorbed labels (Ffi etc.) — they have no per-op
-  # discharge surface. The walker only fires for declared effects that
-  # come through `effect E { ops }`. Builtins are injected as DEffect
-  # by `inject_builtin_effects` before this check runs, so they all
-  # show up via `is_effect_declared`.
-  if not is_effect_declared(esym, decls) { [] }
+  if not is_effect_declared(esym, w.decls) { [] }
   else {
     match find_top_eff_frame(stack, esym) {
-      Some(frame) -> match frame {
-        HF(_, clause_ops, _default_ops, _, _) ->
-          if list_has_string(clause_ops, op_name) { [] }
-          else {
-            # Spec step 3 ("enclosing handle exists, op not in
-            # clauses, default block covers op → clause-merge from
-            # default fires") is DISABLED in Stage B: codegen Stage
-            # A's `emit_clause_assignments` only wires `_ev.<op>` for
-            # ops the user typed in the handle. The inner handle's
-            # evidence node masks any enclosing default, so the
-            # dispatch hits a NULL function pointer at runtime
-            # regardless of what `default { }` declares. Stage C
-            # extends the handle emitter to consult the effect's
-            # default block and synthesize the missing clauses; at
-            # that point this branch flips to check `_default_ops`
-            # and discharges.
-            [report_uncovered_op(file, cx.tab, op_name, esym, decls,
-                                 line, col, false)]
-          }
-      }
+      Some(HF(_, clause_ops, _, _, _)) ->
+        uncovered_op_unless(list_has_string(clause_ops, op_name), w, op_name, esym, line, col, false)
       None ->
-        # No enclosing handle for the effect. The op either fires from
-        # main (step 4) or escapes to the caller's row.
-        if entry {
-          # every effect (builtin or user) with a
-          # source-level `default { }` block bridging via
-          # `$extern_handler` gets auto-installed at main. The
-          # check is now uniform — no special builtin list.
-          let default_ops = effect_default_op_map_get(cx.effs, esym)
-          if list_has_string(default_ops, op_name) { [] }
-          else {
-            [report_uncovered_op(file, cx.tab, op_name, esym, decls,
-                                 line, col, true)]
-          }
-        }
-        else { [] }
+        if w.entry {
+          uncovered_op_unless(list_has_string(effect_default_op_map_get(w.cx.effs, esym), op_name),
+                              w, op_name, esym, line, col, true)
+        } else { [] }
     }
   }
 }
+
+fn uncovered_op_unless(covered: Bool, w: CovWalk, op_name: String, esym: SymId,
+                       line: Int, col: Int, at_main: Bool) : [Diagnostic] / Console + File =
+  if covered { [] }
+  else { [report_uncovered_op(w.file, w.cx.tab, op_name, esym, w.decls, line, col, at_main)] }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 fn report_uncovered_op(file: String, tab: SymTab,
@@ -398,81 +247,31 @@ fn report_uncovered_op(file: String, tab: SymTab,
 }
 
 
-
 fn describe_default_status(eff_name: String, op_name: String,
-                            dblk: Option[DefaultBlock]) : String {
+                           dblk: Option[DefaultBlock]) : String =
   match dblk {
     None ->
       concat_all(["effect `", eff_name,
                   "` declares no `default { }` block, so no fallback handler exists"])
-    Some(defblk) -> match defblk {
-      DBlk(clauses, _, _, _) -> {
-        let all_names = handle_clause_op_names(clauses)
-        let extern_names = extern_handler_op_names(clauses)
-        if list_has_string(extern_names, op_name) {
-          # The default block does declare the op AND its body is an
-          # `$extern_handler(...)` bridge — codegen Stage A can lower it
-          # at `main` level. The reason discharge failed is that we are
-          # inside a partial `handle ... with E`: Stage A's
-          # `emit_clause_assignments` only wires the user-declared
-          # clauses, so an inner handle's evidence node masks the
-          # main-level default. Stage C lifts the masking by emitting
-          # the default's clauses inside every enclosing handle's `_ev`.
-          concat_all(["effect `", eff_name,
-                      "`'s `default { }` block does declare `", op_name,
-                      "` via `$extern_handler`, but the enclosing `handle ... with ",
-                      eff_name, "` masks the main-level default — Stage C will let the handle inherit unmissed default clauses; until then the partial handle must add `",
-                      op_name, "`"])
-        } else if list_has_string(all_names, op_name) {
-          # The user wrote the clause but its body is a kaikai expression.
-          # Stage A lowers only `$extern_handler(...)` bridges; Stage C
-          # will close this gap.
-          concat_all(["effect `", eff_name,
-                      "`'s `default { }` block declares `", op_name,
-                      "` but its body is not an `$extern_handler(...)` bridge — Stage C will lower kaikai-bodied default clauses; for now the clause must use the intrinsic"])
-        } else {
-          concat_all(["effect `", eff_name,
-                      "`'s `default { }` block does not declare `",
-                      op_name, "`"])
-        }
-      }
-    }
+    Some(DBlk(clauses, _, _, _)) -> default_clause_status(eff_name, op_name, clauses)
   }
-}
 
-# Build a single shim declaration from a clause whose body bridges to
-# a C symbol via `$extern_handler("c_sym")`. Returns "" if the body is
-# not an extern_handler intrinsic — Stage A does not emit kaikai-bodied
-# default clauses.
-# NOTE: do NOT name a local binding `c_sym` here — `c_sym` is also a
-# pre-existing fn in compiler.kai (FFI C-symbol minter), and
-# the resolver picks the global fn over the let-binding, emitting the
-# expression as a closure reference instead of a string read. Use
-# `csym_name` or similar to dodge the collision.
-
-# register a `[unstable] <pkg> = true` opt-in from
-# kai.toml. Repeated flags accumulate.
-
-# ====================================================================
-# HM type schemes, substitution/unification, bidirectional inference,
-# and the infer driver
-# ====================================================================
-
-# type schemes + environment
-# ====================================================================
-#
-# A TyScheme is `Scheme(bound_vars, bound_rvars, Ty)`: the type-var
-# ids in `bound_vars` appear as TyVarT(n) inside `Ty`; the row-var
-# ids in `bound_rvars` appear as `Row { tail: Some(n) }` inside any
-# TyFnT in `Ty`. Both kinds are instantiated to fresh ids at each
-# use site. The bound ids
-# are scheme-local — bound-id 0 in scheme A and bound-id 0 in scheme
-# B refer to different vars; the instantiation step rewrites them
-# through a temporary substitution before they reach the inferencer's
-# main subst slots.
-#
-# A TyEnv holds its entries newest first, each indexed by the identity
-# it binds, plus a fresh-variable counter.
+fn default_clause_status(eff_name: String, op_name: String, clauses: [HClause]) : String =
+  if list_has_string(extern_handler_op_names(clauses), op_name) {
+    concat_all(["effect `", eff_name,
+                "`'s `default { }` block does declare `", op_name,
+                "` via `$extern_handler`, but the enclosing `handle ... with ",
+                eff_name, "` masks the main-level default — Stage C will let the handle inherit unmissed default clauses; until then the partial handle must add `",
+                op_name, "`"])
+  } else if list_has_string(handle_clause_op_names(clauses), op_name) {
+    concat_all(["effect `", eff_name,
+                "`'s `default { }` block declares `", op_name,
+                "` but its body is not an `$extern_handler(...)` bridge — Stage C will lower kaikai-bodied default clauses; for now the clause must use the intrinsic"])
+  } else {
+    concat_all(["effect `", eff_name,
+                "`'s `default { }` block does not declare `",
+                op_name, "`"])
+  }
 
 
 #[doc("infer: run HM + bidirectional inference over a program, returning the TypedProgram.")]
@@ -703,22 +502,6 @@ fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Decl], 
 }
 
 
-# ---- bounded candidate synthesis ----
-#
-# Given a hole's expected type `E` and the visible scope, enumerate a
-# small set of expressions the user (or an LLM) might plug in. The
-# doc calls this a "bounded enumeration": we do not explore beyond a
-# single application, and we never nest candidates. Two classes:
-#   1. direct: `name` where `name : T` and `T ~= E`.
-#   2. application: `f(x1, .., xn)` where `f : (T1..Tn) -> R`, `R ~= E`,
-#      and each `Ti` unifies with some in-scope name's type.
-# Entries whose *immediate* return type is a bare polymorphic var (e.g.
-# `panic`, `exit`) are rejected from class 2 — they'd match any hole
-# and drown useful suggestions. A shared `env_fresh` counter keeps
-# each instantiation's fresh TyVars disjoint from the hole's own
-# residual vars.
-
-
 # Walk scope looking for the first entry whose instantiated type
 # unifies with `want`. Returns the entry's key on hit, None otherwise.
 # `avoid` prevents obvious circular fills like `f(f)` when f itself
@@ -783,26 +566,31 @@ fn synth_try_entry(cx: SynthCtx, te: TyEntry) : Option[Synth] / Mutable {
   let inst = instantiate(TyEnv { ...ty_env_empty(), fresh: cx.fresh }, te.scheme)
   match unify(inst.ty, cx.expected, subst_empty()) {
     Some(_) -> Some(Synth { head: te.key, args: None, performs: [] })
-    None    -> match inst.ty {
-      TyFnT(ps, r, rw) -> {
-        if synth_return_structural(te.scheme) {
-          match unify(r, cx.expected, subst_empty()) {
-            None     -> None
-            Some(s0) -> match synth_find_args(cx.all, ps, inst.env.fresh, [te.key], s0, []) {
-              None    -> None
-              Some(m) ->
-                if synth_reenters_owner(cx.owner, te.key, m.keys) { None }
-                else { Some(Synth { head: te.key, args: Some(m.keys),
-                                    performs: label_concat(apply_labels(m.sub, rw.labels),
-                                                           synth_op_label(cx.decls, te.key, synth_inst_vars(te.scheme, inst, m.sub))) }) }
-            }
-          }
-        } else { None }
-      }
-      _ -> None
-    }
+    None -> synth_try_application(cx, te, inst)
   }
 }
+
+fn synth_try_application(cx: SynthCtx, te: TyEntry, inst: Instantiated) : Option[Synth] / Mutable =
+  match inst.ty {
+    TyFnT(ps, r, rw) ->
+      if synth_return_structural(te.scheme) { synth_apply_args(cx, te, inst, ps, r, rw) } else { None }
+    _ -> None
+  }
+
+fn synth_apply_args(cx: SynthCtx, te: TyEntry, inst: Instantiated, ps: [Ty], r: Ty, rw: Row) : Option[Synth] / Mutable =
+  match unify(r, cx.expected, subst_empty()) {
+    None -> None
+    Some(s0) -> match synth_find_args(cx.all, ps, inst.env.fresh, [te.key], s0, []) {
+      None -> None
+      Some(m) ->
+        if synth_reenters_owner(cx.owner, te.key, m.keys) { None }
+        else {
+          let performs = label_concat(apply_labels(m.sub, rw.labels),
+                                      synth_op_label(cx.decls, te.key, synth_inst_vars(te.scheme, inst, m.sub)))
+          Some(Synth { head: te.key, args: Some(m.keys), performs: performs })
+        }
+    }
+  }
 
 
 # The scheme's bound variables as instantiated, in quantification order.

@@ -28,12 +28,6 @@ pub fn inf_collect_op_to_eff(decls: [Decl]) : [OpToEff] {
 }
 
 
-# Alias-aware op-call resolution lives inside `try_op_call` rather than in
-# a standalone walker: a separate pre-pass blew the selfhost stack on the
-# compiler's own deep AST.
-
-
-
 fn inf_indent_of(depth: Int) : String {
   if depth == 0 { "" } else { string_concat("  ", inf_indent_of(depth - 1)) }
 }
@@ -43,77 +37,8 @@ fn inf_indent_of(depth: Int) : String {
 pub fn inf_emit_line(depth: Int, s: String) : Unit / Console = print("#{inf_indent_of(depth)}#{s}")
 
 
-# Substitute every alias name in `labels` with its expanded form.
-# Effect names pass through unchanged. Duplicates introduced by
-# expansion are removed by the caller.
-
-# Op-level coverage walker.
-#
-# The typer's row-level checks (`check_body_row`, `check_main_row_handlable`)
-# enforce that every effect label reached from a body is named by an
-# enclosing `handle` or absorbed by `main`. They are blind to which
-# specific op of an effect was performed, so a `handle ... with Log
-# { info }` whose body invokes `Log.warn` compiles cleanly and
-# segfaults at runtime (dispatch hits an unwired evidence slot).
-#
-# This walker closes the gap. For every directly-performed `Eff.op`
-# call inside a `DFn` body it walks the lexical stack of enclosing
-# handles. Discharge order:
-#
-#   1. Enclosing `handle ... with Eff { clauses }` lists `op` in its
-#      clauses  → discharged.
-#   2. Enclosing `handle ... with Eff` exists, `op` not in clauses,
-#      but `Eff`'s `default { }` block declares `op` → discharged
-#      (clause-merge from the spec).
-#   3. No enclosing `handle ... with Eff`, the function is `main`,
-#      and `Eff`'s `default { }` block declares `op` → discharged
-#      (auto-installed at the program root).
-#   4. Otherwise → "effect not handled: Eff.op" with notes naming
-#      the default-block status so the user can decide between
-#      adding a clause to the handle, growing the default block, or
-#      wrapping the call site.
-#
-# Scope: only direct `Eff.op(...)` invocations are checked (the
-# `ECall` whose callee is an `EOp`, produced by `synth_op_call_with_scheme`).
-# Cross-function reachability is out of scope for Stage B; the row-
-# level check still propagates labels through helper signatures and
-# bites where they bubble up.
-
-# Emit an LLVM global string constant and return both the textual
-# declaration and the total byte count (including null terminator),
-# so callers can size their `getelementptr` with the same N the
-# declaration uses.
-
-
 #[doc("infer: join strings with a separator, the typer-side alias of `string_join`.")]
 pub fn inf_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
-
-# ---- tables: user function arities, variant arities ----
-#
-# Stage 0 emit keeps parallel tables of user-defined function names and
-# variant constructors; the ident dispatcher looks into both before
-# falling back to a local. Stage 1 does the same; both tables are
-# lists of sum-variant pairs.
-
-# EFn now carries the decl's module of origin. None for
-# decls authored in the root file; Some(m) for decls imported from
-# module `m` (or pulled in via --core, see expand_imports +
-# load_core). Codegen reads the field to mint `kai_<m>__<name>`
-# vs `kai_<name>`, and to disambiguate two-modules-export-same-name
-# at bare-name call sites.
-#
-# Unboxing: the fourth slot is the unboxed-
-# signature classification. `None` means the classical
-# `static KaiValue *kai_<name>(KaiValue *...)` calling convention.
-# `Some(US([Ty], Ty))` means the fn was classified by `unbox_classify`
-# as taking + returning raw C scalars (`int64_t` / `double` /
-# `int` / `uint32_t`); the emitter mints a raw signature, reads
-# of the fn's parameters resolve to `kair_<name>`, and call sites
-# emit raw arguments via `emit_expr_raw`. The classifier requires
-# every param ty + return ty to be in {Int, Bool, Char, Real}
-# (concretely; not parametric T), no FFI shim, no protocol-impl
-# child, no effect row, no closure parameters. See
-# `unbox_classify_decl`.
 
 
 #[doc("infer: last-use position of a binder across a use list.")]
@@ -121,57 +46,19 @@ pub fn inf_last_use_for(nm: LocalId, uses: [Use]) : LU =
   inf_last_use_for_loop(nm, uses, false, -1, -1)
 
 
-
 fn inf_last_use_for_loop(nm: LocalId, uses: [Use], blocked: Bool,
-                     mx_line: Int, mx_col: Int) : LU {
+                         mx_line: Int, mx_col: Int) : LU =
   match uses {
-    [] -> {
+    [] ->
       if blocked { LUBlocked(nm) }
       else if mx_line < 0 { LUUnused(nm) }
       else { LUAt(nm, mx_line, mx_col) }
-    }
-    [h, ...rest] -> match h {
-      U(uname, ln, cl, in_lam) -> {
-        if local_eq(uname, nm) {
-          if in_lam {
-            inf_last_use_for_loop(nm, rest, true, mx_line, mx_col)
-          } else if ln > mx_line or (ln == mx_line and cl > mx_col) {
-            inf_last_use_for_loop(nm, rest, blocked, ln, cl)
-          } else {
-            inf_last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
-          }
-        } else {
-          inf_last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
-        }
-      }
-    }
+    [U(uname, ln, cl, in_lam), ...rest] ->
+      if not local_eq(uname, nm) { inf_last_use_for_loop(nm, rest, blocked, mx_line, mx_col) }
+      else if in_lam { inf_last_use_for_loop(nm, rest, true, mx_line, mx_col) }
+      else if ln > mx_line or (ln == mx_line and cl > mx_col) { inf_last_use_for_loop(nm, rest, blocked, ln, cl) }
+      else { inf_last_use_for_loop(nm, rest, blocked, mx_line, mx_col) }
   }
-}
-
-# ---- TCO — self-tail-call detection --------------------------------
-#
-# the Perceus exit-drop wrap places `kai_internal_drop(...)`
-# calls *after* the body's tail expression, so neither gcc nor clang
-# can fold a self-recursive call into `jmp` at the C level. The
-# compiler-side fix rewrites self-tail-calls into a `goto`-loop with
-# parameter rebinding; this walker is the recognition half.
-#
-# `tcrec_has_tail_self_call(body, nm, arity)` returns true if `body`
-# contains at least one self-recursive call to a fn named `nm` with
-# `arity` arguments in *tail position*. Tail position propagates
-# through:
-#   - EBlock(_, Some(tail))      — `tail` is tail
-#   - EIf(_, then, opt_else)     — both branches are tail
-#   - EMatch(_, arms)            — each arm body is tail
-# It does NOT propagate through:
-#   - ECall args / EBinop / EUnop / ERange / records / lists
-#   - EBlock stmts (only the trailing expression is tail)
-#   - EMatch scrutinee / EIf condition / match guards
-#   - ELambda body (different fn — never tail of the enclosing fn)
-#   - EPipe / EHandle (conservative; could be relaxed later)
-#
-# A locally-bound `let`/`var` shadowing `nm` disables the match
-# inside its scope.
 
 
 fn inf_mangle_ty(tab: SymTab, t: Ty) : String {
@@ -244,13 +131,11 @@ pub fn primitive_type_names() : [String] =
   map(inf_primitive_tys(), (t) => inf_mangle_ty(st_empty(), t))
 
 
-
 fn inf_map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
   match a {
     Arm(p, g, b) -> Arm(p, inf_map_opt_expr(g, f), f(b))
   }
 }
-
 
 
 fn inf_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
@@ -260,14 +145,12 @@ fn inf_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
 }
 
 
-
 fn inf_map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
   match el {
     ElPlain(x)  -> ElPlain(f(x))
     ElSpread(x) -> ElSpread(f(x))
   }
 }
-
 
 
 #[doc("Typer-internal helper `inf_map_expr_kind` shared across the infer modules.")]
@@ -330,13 +213,11 @@ pub fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
 }
 
 
-
 fn inf_map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
   match fi {
     FI(n, v) -> FI(n, f(v))
   }
 }
-
 
 
 #[doc("Typer-internal helper `inf_map_opt_expr` shared across the infer modules.")]
@@ -348,7 +229,6 @@ pub fn inf_map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
 }
 
 
-
 fn inf_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
   match opt {
     Some(r) -> Some(inf_map_return_exprs(r, f))
@@ -357,13 +237,11 @@ fn inf_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HR
 }
 
 
-
 fn inf_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
   match r {
     HR(p, b, l, c) -> HR(p, f(b), l, c)
   }
 }
-
 
 
 fn inf_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
@@ -380,9 +258,6 @@ fn inf_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
 }
 
 
-
-
-
 fn inf_ops_to_eff_pairs(eff: SymId, ops: [EffectOp]) : [OpToEff] {
   match ops {
     [] -> []
@@ -393,42 +268,13 @@ fn inf_ops_to_eff_pairs(eff: SymId, ops: [EffectOp]) : [OpToEff] {
   }
 }
 
-# Returns Some(eff_name) if some component of the alias provides op_name.
-# When multiple components share an op_name (currently impossible in
-# the catalog — Stdout.print, Stderr.eprint, Stdin.read_line, etc., are
-# disjoint), the leftmost component wins. The check is case-sensitive.
-
-# Parse a core file and return its decl list paired with a
-# ModuleEntry. On any error report to stderr and return None.
-#
-# every `DTest` / `DBench` / `DCheck` block authored in a
-# core module file is dropped at load time (see `load_core` in
-# driver.kai). Without that filter `kai test <user.kai>` would also run
-# every stdlib test block — testing one file must never run another
-# module's tests. The kaikai project's own intrinsic-test gate is
-# unaffected: it passes the stdlib file as the *target* (which keeps
-# its own test blocks intact through `compile_source`).
-
 
 #[doc("Typer-internal helper `inf_proto_dispatch_tag_prefix` shared across the infer modules.")]
 pub fn inf_proto_dispatch_tag_prefix() : String = "__kai_proto_dispatch__:"
 
 
-
 #[doc("Typer-internal helper `inf_proto_dispatcher_name` shared across the infer modules.")]
 pub fn inf_proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
-
-# Register every DProtocol decl the program declares. The op list
-# becomes the universe of "names that look like ordinary fn calls but
-# really need protocol dispatch".
-#
-# Boundary tagging: thread `cur_mod` through the walk so
-# each registered DProtocol records its home module. DProtocol carries
-# no `module_origin` field of its own (only `DFn` does), so we recover
-# the home by streaming through the same
-# `decl_home_hint_reset` algorithm `validate_pub_access` uses. The
-# result `proto_origins` table feeds `make_dispatcher_fn` so each
-# synthesised dispatcher inherits the originating module's tag.
 
 
 # The name a type reference still spells: a type parameter, a scalar, a
@@ -466,7 +312,6 @@ pub fn inf_row_empty() : Row = Row {
 pub fn row_label(eff: SymId, ty_args: [Ty]) : Label = Label { sym: eff, ty_args: ty_args, cell: local_none() }
 
 
-
 #[doc("Typer-internal helper `inf_rvbind_lookup` shared across the infer modules.")]
 pub fn inf_rvbind_lookup(binds: [RVBind], id: TLocalId) : Option[Int] {
   match binds {
@@ -476,7 +321,6 @@ pub fn inf_rvbind_lookup(binds: [RVBind], id: TLocalId) : Option[Int] {
     }
   }
 }
-
 
 
 fn inf_starts_with_loop(s: String, prefix: String, i: Int) : Bool {
@@ -492,65 +336,48 @@ fn inf_starts_with_loop(s: String, prefix: String, i: Int) : Bool {
 }
 
 
-
 #[doc("Typer-internal helper `inf_string_starts_with_q` shared across the infer modules.")]
 pub fn inf_string_starts_with_q(s: String, prefix: String) : Bool =
   inf_starts_with_loop(s, prefix, 0)
 
 
-# assemble the full
-# setup block for the builtins listed in `main`'s row. Push order
-# Stdout → Stderr → Stdin → Env → File → Mutable → Cancel →
-# Spawn matches Doc B §*Installation order*: Spawn innermost (last
-# pushed, first looked up); Cancel the layer below it (root nursery
-# flags fibers, Cancel handler unwinds); Mutable below Cancel (I/O
-# cluster). `Console` acts as the alias `Stdout + Stderr`,
-# so a row containing it triggers both setups.
-
-
-#[doc("Typer-internal helper `inf_ty_eq` shared across the infer modules.")]
-pub fn inf_ty_eq(a: Ty, b: Ty) : Bool {
-  match a {
-    TyInt -> match b { TyInt -> true _ -> false }
-    TyReal -> match b { TyReal -> true _ -> false }
-    TyBool -> match b { TyBool -> true _ -> false }
-    TyChar -> match b { TyChar -> true _ -> false }
-    TyString -> match b { TyString -> true _ -> false }
-    TyUnit -> match b { TyUnit -> true _ -> false }
-    TyByte -> match b { TyByte -> true _ -> false }
-    TyInt32 -> match b { TyInt32 -> true _ -> false }
-    TyUInt32 -> match b { TyUInt32 -> true _ -> false }
-    TyUInt64 -> match b { TyUInt64 -> true _ -> false }
-    TyInt128 -> match b { TyInt128 -> true _ -> false }
-    TyHandle -> match b { TyHandle -> true _ -> false }
-    TyAny -> match b { TyAny -> true _ -> false }
-    TyVarT(ai) -> match b { TyVarT(bi) -> ai == bi _ -> false }
-    TyListT(ai) -> match b { TyListT(bi) -> inf_ty_eq(ai, bi) _ -> false }
-    TyFnT(aps, ar, _) -> match b {
-      TyFnT(bps, br, _) -> inf_ty_list_eq(aps, bps) and inf_ty_eq(ar, br)
-      _ -> false
-    }
-    # A nominal type is its declaration: `tuple.Pair` and a user
-    # `Pair` share a spelling and nothing else.
-    TyCon(ta_sym, atas) -> match b {
-      TyCon(tb_sym, btas) -> sym_same(ta_sym, tb_sym) and inf_ty_list_eq(atas, btas)
-      _ -> false
-    }
-    TyDimT(ab, _) -> match b { TyDimT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
-    TyRefineT(ab, _) -> match b { TyRefineT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
-    TyShapeApp(asv, aa) -> match b {
-      TyShapeApp(bsv, ba) -> asv == bsv and inf_ty_eq(aa, ba)
-      _ -> false
-    }
-    # two unions are equal iff their canonical
-    # component lists are point-wise equal. Callers that hand us a
-    # `TyUnion` constructed via `normalize_union` get this for free;
-    # any caller that bypasses normalisation falls through and is
-    # rejected — that's the bug, not the equality check.
-    TyUnion(aps) -> match b { TyUnion(bps) -> inf_ty_list_eq(aps, bps) _ -> false }
-  }
+#[doc("True for a type variable or `Any`: a type that adopts whatever it meets.")]
+pub fn ty_is_flexible(t: Ty) : Bool = match t {
+  TyVarT(_) -> true
+  TyAny -> true
+  _ -> false
 }
 
+#[doc("Each primitive scalar type has its own rank; every other type is -1.")]
+pub fn scalar_rank(t: Ty) : Int = match t {
+  TyInt -> 0
+  TyReal -> 1
+  TyBool -> 2
+  TyString -> 3
+  TyChar -> 4
+  TyUnit -> 5
+  TyByte -> 6
+  TyInt32 -> 7
+  TyUInt32 -> 8
+  TyUInt64 -> 9
+  TyInt128 -> 10
+  TyHandle -> 11
+  _ -> -1
+}
+
+#[doc("Structural equality on resolved types; refinements and units compare by their base.")]
+pub fn inf_ty_eq(a: Ty, b: Ty) : Bool = match (a, b) {
+  (TyVarT(x), TyVarT(y)) -> x == y
+  (TyListT(x), TyListT(y)) -> inf_ty_eq(x, y)
+  (TyFnT(aps, ar, _), TyFnT(bps, br, _)) -> inf_ty_list_eq(aps, bps) and inf_ty_eq(ar, br)
+  (TyCon(sa, aa), TyCon(sb, ba)) -> sym_same(sa, sb) and inf_ty_list_eq(aa, ba)
+  (TyDimT(x, _), TyDimT(y, _)) -> inf_ty_eq(x, y)
+  (TyRefineT(x, _), TyRefineT(y, _)) -> inf_ty_eq(x, y)
+  (TyShapeApp(asv, x), TyShapeApp(bsv, y)) -> asv == bsv and inf_ty_eq(x, y)
+  (TyUnion(x), TyUnion(y)) -> inf_ty_list_eq(x, y)
+  (TyAny, TyAny) -> true
+  _ -> scalar_rank(a) >= 0 and scalar_rank(a) == scalar_rank(b)
+}
 
 
 # A lone named parameter the body calls a method on needs its type before
@@ -601,12 +428,6 @@ pub fn inf_ty_head_name(tab: SymTab, t: Ty) : Option[String] {
   }
 }
 
-# Walks the registry's impl table for a (protocol-op, type-name)
-# match. The op-name search visits each impl entry's protocol's
-# ops to find which protocol the op belongs to; we look
-# the op up first to know `pname`, then iterate impls for a matching
-# (pname, tname).
-
 
 fn inf_ty_list_eq(a: [Ty], b: [Ty]) : Bool =
   match a {
@@ -616,7 +437,6 @@ fn inf_ty_list_eq(a: [Ty], b: [Ty]) : Bool =
       [bh, ...brest] -> if inf_ty_eq(ah, bh) { inf_ty_list_eq(arest, brest) } else { false }
     }
   }
-
 
 
 # Recognise the row-arg carrier (`TyFnT([], TyUnit, row)`) a `TyCon`
@@ -638,45 +458,20 @@ pub fn inf_row_carrier_of(t: Ty) : Option[Row] = match t {
 pub type OpToEff = OEFP(Written, SymId)
 
 
-
 #[doc("infer: `label_to_rl_zero` — typer/effect support type.")]
 pub fn label_to_rl_zero(lab: Label) : RowLabel = RL(DrSym(lab.sym), [])
-
-# walk a typed Expr collecting effect labels from
-# every call site's callee type. Used only on `main`'s body to fix
-# the footgun where every `Stdout.print` reached only via helpers
-# left `inferred_main_row` empty, the wrapper installed no default
-# handlers, and the program SIGSEGV'd. Caller-side effect tracking
-# during typing is intentionally direct-only (the body-row
-# enforcement lives there); this walk is a separate, post-typing pass that
-# reads the *callee's* declared row out of its resolved Expr.ty so
-# nothing changes for non-main inference. ELambda is *not* recursed
-# into — a lambda's body effects only run when the lambda is
-# invoked, and that invocation appears as its own ECall whose
-# callee row already carries those effects (the row var was
-# unified with the lambda's row at the call site).
 
 
 #[doc("infer: `HandleFrame` — typer/effect support type.")]
 pub type HandleFrame = HF(SymId, [String], [String], Int, Int)
-
-# Two-list signature so the per-module body walk (first arg) can still
-# iterate this pass's DFns while effect-existence lookups (second arg)
-# consult the whole program. Hanga Roa's module partition can place
-# `effect MyLog { ... }` and the `fn main()` that performs `MyLog.warn`
-# in different per-module passes — even when both live in the same
-# source file — so a single-list lookup misses the DEffect and the
-# walker exits silently on every cross-pass op call.
 
 
 #[doc("infer: a record field's declaration, the module declaring its record, and the record's identity.")]
 pub type FieldDeclWithHome = FDH(FieldDecl, Option[String], SymId)
 
 
-
 #[doc("infer: `Use` — typer/effect support type.")]
 pub type Use = U(LocalId, Int, Int, Bool)   # binder, line, col, in_lambda
-
 
 
 #[doc("infer: `LU` — typer/effect support type.")]
@@ -684,17 +479,6 @@ pub type LU
   = LUAt(LocalId, Int, Int)            # last-use position
   | LUBlocked(LocalId)                 # closure capture blocks last
   | LUUnused(LocalId)                  # never referenced
-
-# Walker entry: collect every local read in `e`. The flag is true while
-# we are inside any enclosing ELambda body; closure capture detection
-# is conservative — a single in-lambda read of a binder blocks last for
-# that binder regardless of how far up the lambda is nested.
-
-
-# ====================================================================
-# Moved-in effect-coverage / field-privacy / call-label / edition
-# helper families (sole external caller is the infer driver below)
-# ====================================================================
 
 
 #[doc("Typer-internal helper `inferred_main_row` shared across the infer modules.")]
@@ -704,7 +488,6 @@ pub fn inferred_main_row(performed: [Label]) : RowExpr {
     _  -> RClosed(map(performed, label_to_rl_zero))
   }
 }
-
 
 
 # What the field-privacy walk reads: the table that names a record, and
@@ -736,7 +519,6 @@ pub fn field_recs(rev_decls: [Decl], ix: FieldRecs) : FieldRecs = match rev_decl
 }
 
 
-
 # A record type that names no declaration has no field to judge.
 #[doc("Typer-internal helper `lookup_record_field` shared across the infer modules.")]
 pub fn lookup_record_field(all_decls: FieldRecs, rec_sym: SymId, fname: String)
@@ -753,7 +535,6 @@ fn field_in_recs(rs: [FieldRec], fname: String) : Option[FieldDeclWithHome] = ma
 }
 
 
-
 #[doc("Typer-internal helper `find_field_in_decls` shared across the infer modules.")]
 pub fn find_field_in_decls(fields: [FieldDecl], target: String) : Option[FieldDecl] =
   match fields {
@@ -762,11 +543,6 @@ pub fn find_field_in_decls(fields: [FieldDecl], target: String) : Option[FieldDe
       FD(_, n, _, _) -> if n == target { Some(f) } else { find_field_in_decls(rest, target) }
     }
   }
-
-# The declaration of the record type carried by `obj.ty`. Records
-# whose carrier is anything other than a record-shaped TyCon (free
-# variable, primitive, list, fn) cannot be classified at this point —
-# return None and skip the check.
 
 
 #[doc("Typer-internal helper `record_carrier_of` shared across the infer modules.")]
@@ -777,14 +553,12 @@ pub fn record_carrier_of(ty: Option[Ty]) : Option[SymId] =
   }
 
 
-
 fn record_carrier_t(t: Ty) : Option[SymId] = match t {
   TyCon(tsym, _) -> Some(tsym)
   TyRefineT(inner, _) -> record_carrier_t(inner)
   TyDimT(inner, _)    -> record_carrier_t(inner)
   _ -> None
 }
-
 
 
 #[doc("Typer-internal helper `walk_priv_field_inits` shared across the infer modules.")]

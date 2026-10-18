@@ -56,34 +56,21 @@ pub fn env_bind_local(env: TyEnv, b: Binder, sc: TyScheme) : TyEnv =
   env_entry_add(env, TyEntry { key: KLocal(b), scheme: sc })
 
 
-# collapse `TyDimT(TyDimT(b, u1), u2)` to `TyDimT(b, u1*u2)` and
-# strip a `TyDimT(_, UOne)` down to its base. Both shapes can arise
-# transiently when chasing unit-vars through nested dimensioned types.
-# also lift refinements outside of unit wrappers — the
-# canonical form is `TyRefineT(TyDimT(b, u), p)`. The predicate
-# describes the value of the dimensioned quantity; the unit
-# describes the dimension. Putting refinements outside lets the
-# pred-lookup walkers find them at the top of the type tree.
-#[doc("infer: `dim_collapse` — typer entry point invoked by the driver.")]
+#[doc("Wrap `base` in the unit `u`: units nest only as written, refinements lift outside, and a dimensionless unit vanishes except on a fixed-width vec.")]
 pub fn dim_collapse(base: Ty, u: UnitExprT) : Ty {
   match base {
-    # A positional list never merges into an abelian product: the
-    # nesting stays as written and unification decides its fate.
     TyDimT(inner, u_inner) ->
       if unit_is_dims(u_inner) or unit_is_dims(u) { TyDimT(base, unit_canon(u)) }
       else { dim_collapse(inner, unit_canon(UMul(u_inner, u))) }
-    TyRefineT(inner, p)    -> TyRefineT(dim_collapse(inner, u), p)
-    _ -> {
-      let uc = unit_canon(u)
-      # A `Vec[e]<1>` keeps its brand: a fixed-width-1 vec has a distinct
-      # inline layout, so it must NOT collapse into the dynamic `Vec[e]`
-      # the way a dimensionless `Real<1>` collapses into `Real`.
-      if unit_is_one(uc) {
-        if ty_vec_headed(base) { TyDimT(base, uc) } else { base }
-      } else { TyDimT(base, uc) }
-    }
+    TyRefineT(inner, p) -> TyRefineT(dim_collapse(inner, u), p)
+    _ -> dim_over_base(base, unit_canon(u))
   }
 }
+
+# A `Vec[e]<1>` keeps its brand: a fixed-width vec has its own inline layout
+# and must not collapse into the dynamic `Vec[e]`.
+fn dim_over_base(base: Ty, uc: UnitExprT) : Ty =
+  if unit_is_one(uc) and not ty_vec_headed(base) { base } else { TyDimT(base, uc) }
 
 
 # The constructor the sum `tsym` declares as `name`: the one its module
@@ -286,8 +273,6 @@ pub fn check_pfield_visible(st: InferState, ri: RecInfo, fnm: String, line: Int,
     }
   }
 
-# ---- match ----
-
 
 # redundant arms in a `match`. Two
 # arms whose patterns trivially overlap and that share guard
@@ -373,27 +358,13 @@ fn arm_head_of(pat: Pattern) : ArmHead {
 }
 
 
-fn arm_head_eq(a: ArmHead, b: ArmHead) : Bool {
-  match a {
-    AhCatchAll -> match b { AhCatchAll -> true _ -> false }
-    AhLitInt(va) -> match b {
-      AhLitInt(vb) -> va == vb
-      _ -> false
-    }
-    AhLitBool(va) -> match b {
-      AhLitBool(vb) -> va == vb
-      _ -> false
-    }
-    AhLitChar(va) -> match b {
-      AhLitChar(vb) -> va == vb
-      _ -> false
-    }
-    AhLitStr(va) -> match b {
-      AhLitStr(vb) -> va == vb
-      _ -> false
-    }
-    AhUnclassified -> false
-  }
+fn arm_head_eq(a: ArmHead, b: ArmHead) : Bool = match (a, b) {
+  (AhCatchAll, AhCatchAll) -> true
+  (AhLitInt(x), AhLitInt(y)) -> x == y
+  (AhLitBool(x), AhLitBool(y)) -> x == y
+  (AhLitChar(x), AhLitChar(y)) -> x == y
+  (AhLitStr(x), AhLitStr(y)) -> x == y
+  _ -> false
 }
 
 
@@ -409,10 +380,9 @@ fn arm_head_describe(h: ArmHead) : String {
 }
 
 
-fn arm_is_unguarded(a: Arm) : Bool {
-  match a {
-    Arm(_, guard, _) -> match guard { None -> true Some(_) -> false }
-  }
+fn arm_is_unguarded(a: Arm) : Bool = match a {
+  Arm(_, None, _) -> true
+  Arm(_, Some(_), _) -> false
 }
 
 
@@ -423,71 +393,65 @@ fn arm_pat_of(a: Arm) : Pattern {
 }
 
 
-# A wildcard fallthrough arm emitted by the multi-arg-match desugar
-# inherits the outer EMatch's source span:
-# `mk_pat(PWild, line, col)` where `(line, col)` are the match
-# header. The user-written wildcards always carry their own pattern
-# span, so equality of pat.line/col with the match's line/col is a
-# reliable "synthetic" marker. We skip those arms in redundancy
-# bookkeeping so the desugared chain of two-arm matches never
-# triggers a false positive against itself.
-fn arm_is_synthetic_fallthrough(a: Arm, match_line: Int, match_col: Int) : Bool {
-  match a {
-    Arm(pat, guard, _) -> {
-      let unguarded = match guard { None -> true Some(_) -> false }
-      if not unguarded { false }
-      else if pat.line != match_line { false }
-      else if pat.col != match_col { false }
-      else { match pat.pkind { PWild -> true _ -> false } }
-    }
-  }
+# The multi-arg match desugar emits a wildcard fallthrough carrying the outer
+# match header's span; a user-written wildcard has a span of its own. Those
+# synthetic arms are skipped so a desugared chain never flags itself.
+fn arm_is_synthetic_fallthrough(a: Arm, match_line: Int, match_col: Int) : Bool = match a {
+  Arm(pat, None, _) -> pat.line == match_line and pat.col == match_col and pat_is_wild(pat)
+  Arm(_, Some(_), _) -> false
+}
+
+fn pat_is_wild(pat: Pattern) : Bool = match pat.pkind {
+  PWild -> true
+  _ -> false
 }
 
 
-# Scan arms in order, accumulating the heads of unguarded arms
-# already seen. Errors fire on the FIRST redundant arm — once
-# diagnostic per offender — so a chain `1 -> 1 -> 1 -> _` reports
-# two errors (the two trailing `1`s), not one report listing
-# every collision. `match_line`/`match_col` pin the outer match
-# header so synthetic fallthrough arms can be filtered.
-#[doc("Typer-internal helper `check_arms_redundancy` shared across the infer modules.")]
+type ArmScan = { st: InferState, seen: [ArmHead], saw_catch_all: Bool }
+
+# Scan arms in order, accumulating the heads of unguarded arms already seen.
+# Each redundant arm is reported once, so `1 -> 1 -> 1 -> _` yields two
+# errors. `match_line`/`match_col` pin the outer match header: desugared
+# fallthrough arms carry its span and are skipped.
+#[doc("Report every unguarded match arm that an earlier arm already covers.")]
 pub fn check_arms_redundancy(st: InferState, arms: [Arm], seen: [ArmHead],
-                          saw_catch_all: Bool,
-                          match_line: Int, match_col: Int) : InferState / Console + File {
+                             saw_catch_all: Bool,
+                             match_line: Int, match_col: Int) : InferState / Console + File =
   match arms {
     [] -> st
     [a, ...rest] -> {
-      if arm_is_synthetic_fallthrough(a, match_line, match_col) {
-        check_arms_redundancy(st, rest, seen, saw_catch_all, match_line, match_col)
+      let n = if arm_is_synthetic_fallthrough(a, match_line, match_col) {
+        ArmScan { st: st, seen: seen, saw_catch_all: saw_catch_all }
       } else {
-        let pat = arm_pat_of(a)
-        let head = arm_head_of(pat)
-        let unguarded = arm_is_unguarded(a)
-        if saw_catch_all and unguarded {
-          let perr = mk_diag(SevError, st.file, pat.line, pat.col,
-            "unreachable match arm: previous arm matched every value", [])
-          render_diag(perr)
-          diag_note("an earlier unguarded `_` or bare binding already covers this case")
-          diag_help("remove this arm, or move it before the catch-all")
-          let st1 = st_bump_err(st_push_diag(st, perr))
-          check_arms_redundancy(st1, rest, seen, saw_catch_all, match_line, match_col)
-        } else if unguarded and arm_head_classified(head) and arm_head_in(seen, head) {
-          let perr = mk_diag(SevError, st.file, pat.line, pat.col,
-            "duplicate match arm: #{arm_head_describe(head)} is already matched above", [])
-          render_diag(perr)
-          diag_help("remove this arm, or distinguish it with a guard (`#{arm_head_describe(head)} if cond -> ...`)")
-          let st1 = st_bump_err(st_push_diag(st, perr))
-          check_arms_redundancy(st1, rest, seen, saw_catch_all, match_line, match_col)
-        } else {
-          let seen1 = if unguarded and arm_head_classified(head) {
-            [head, ...seen]
-          } else {
-            seen
-          }
-          let saw_ca1 = saw_catch_all or (unguarded and arm_head_is_catch_all(head))
-          check_arms_redundancy(st, rest, seen1, saw_ca1, match_line, match_col)
-        }
+        scan_arm_head(st, a, seen, saw_catch_all)
       }
+      check_arms_redundancy(n.st, rest, n.seen, n.saw_catch_all, match_line, match_col)
+    }
+  }
+
+fn scan_arm_head(st: InferState, a: Arm, seen: [ArmHead], saw_catch_all: Bool) : ArmScan / Console + File {
+  let pat = arm_pat_of(a)
+  let head = arm_head_of(pat)
+  let unguarded = arm_is_unguarded(a)
+  if saw_catch_all and unguarded {
+    let perr = mk_diag(SevError, st.file, pat.line, pat.col,
+      "unreachable match arm: previous arm matched every value", [])
+    render_diag(perr)
+    diag_note("an earlier unguarded `_` or bare binding already covers this case")
+    diag_help("remove this arm, or move it before the catch-all")
+    ArmScan { st: st_bump_err(st_push_diag(st, perr)), seen: seen, saw_catch_all: saw_catch_all }
+  } else if unguarded and arm_head_classified(head) and arm_head_in(seen, head) {
+    let perr = mk_diag(SevError, st.file, pat.line, pat.col,
+      "duplicate match arm: #{arm_head_describe(head)} is already matched above", [])
+    render_diag(perr)
+    diag_help("remove this arm, or distinguish it with a guard (`#{arm_head_describe(head)} if cond -> ...`)")
+    ArmScan { st: st_bump_err(st_push_diag(st, perr)), seen: seen, saw_catch_all: saw_catch_all }
+  } else {
+    let counted = unguarded and arm_head_classified(head)
+    ArmScan {
+      st: st,
+      seen: if counted { [head, ...seen] } else { seen },
+      saw_catch_all: saw_catch_all or (unguarded and arm_head_is_catch_all(head))
     }
   }
 }
@@ -503,38 +467,48 @@ fn arm_open_ctor(pat: Pattern) : Option[SymId] = match pat.pkind {
 }
 
 
-# The constructor half of `check_arms_redundancy`, over typed arms: a
-# second unguarded arm of one constructor is dead. `dead` follows the
-# catch-all the first pass already reported the arms after.
-#[doc("Typer-internal helper `check_arms_ctor_repeats` shared across the infer modules.")]
+type CtorScan = { st: InferState, seen: [SymId], dead: Bool }
+
+# The constructor half of `check_arms_redundancy`, over typed arms: a second
+# unguarded arm of one constructor is dead. `dead` follows the catch-all the
+# first pass already reported the arms after.
+#[doc("Report a second unguarded arm of a constructor an earlier arm already matches.")]
 pub fn check_arms_ctor_repeats(st: InferState, arms: [Arm], seen: [SymId], dead: Bool,
-                           match_line: Int, match_col: Int) : InferState / Console + File {
+                               match_line: Int, match_col: Int) : InferState / Console + File =
   match arms {
     [] -> st
-    [a, ...rest] ->
-      if arm_is_synthetic_fallthrough(a, match_line, match_col) {
-        check_arms_ctor_repeats(st, rest, seen, dead, match_line, match_col)
+    [a, ...rest] -> {
+      let n = if arm_is_synthetic_fallthrough(a, match_line, match_col) {
+        CtorScan { st: st, seen: seen, dead: dead }
       } else {
-        let pat = arm_pat_of(a)
-        let unguarded = arm_is_unguarded(a)
-        match arm_open_ctor(pat) {
-          None -> check_arms_ctor_repeats(st, rest, seen,
-                    dead or (unguarded and arm_head_is_catch_all(arm_head_of(pat))), match_line, match_col)
-          Some(c) ->
-            if dead and unguarded { check_arms_ctor_repeats(st, rest, seen, dead, match_line, match_col) }
-            else if unguarded and sym_list_has(seen, c) {
-              let shown = "variant `#{decl_name(st.env.tab, c)}`"
-              let perr = mk_diag(SevError, st.file, pat.line, pat.col,
-                "duplicate match arm: #{shown} is already matched above", [])
-              render_diag(perr)
-              diag_help("remove this arm, or distinguish it with a guard (`#{shown} if cond -> ...`)")
-              check_arms_ctor_repeats(st_bump_err(st_push_diag(st, perr)), rest, seen, dead, match_line, match_col)
-            } else {
-              check_arms_ctor_repeats(st, rest, if unguarded { [c, ...seen] } else { seen }, dead, match_line, match_col)
-            }
-        }
+        scan_ctor_arm(st, a, seen, dead)
       }
+      check_arms_ctor_repeats(n.st, rest, n.seen, n.dead, match_line, match_col)
+    }
   }
+
+fn scan_ctor_arm(st: InferState, a: Arm, seen: [SymId], dead: Bool) : CtorScan / Console + File {
+  let pat = arm_pat_of(a)
+  let unguarded = arm_is_unguarded(a)
+  match arm_open_ctor(pat) {
+    None -> CtorScan { st: st, seen: seen,
+                       dead: dead or (unguarded and arm_head_is_catch_all(arm_head_of(pat))) }
+    Some(c) ->
+      if dead and unguarded { CtorScan { st: st, seen: seen, dead: dead } }
+      else if unguarded and sym_list_has(seen, c) {
+        CtorScan { st: report_repeated_ctor(st, pat, c), seen: seen, dead: dead }
+      }
+      else { CtorScan { st: st, seen: if unguarded { [c, ...seen] } else { seen }, dead: dead } }
+  }
+}
+
+fn report_repeated_ctor(st: InferState, pat: Pattern, c: SymId) : InferState / Console + File {
+  let shown = "variant `#{decl_name(st.env.tab, c)}`"
+  let perr = mk_diag(SevError, st.file, pat.line, pat.col,
+    "duplicate match arm: #{shown} is already matched above", [])
+  render_diag(perr)
+  diag_help("remove this arm, or distinguish it with a guard (`#{shown} if cond -> ...`)")
+  st_bump_err(st_push_diag(st, perr))
 }
 
 
@@ -891,13 +865,6 @@ pub fn expand_narrow_one(vs: [SymId], name: Binder, guard: Option[Expr],
   }
 }
 
-# ---- exhaustiveness checking ----
-#
-# Flag match expressions that miss a constructor of a known sum
-# type. Scope: built-in Option / Result and any user sum the env
-# binds constructors for. Arms and variants meet by constructor id:
-# the check reads the arms the typer has stamped.
-
 
 fn is_catch_all_pat(pat: Pattern) : Bool {
   match pat.pkind {
@@ -912,19 +879,11 @@ fn is_catch_all_pat(pat: Pattern) : Bool {
 }
 
 
-#[doc("Typer-internal helper `has_catch_all` shared across the infer modules.")]
-pub fn has_catch_all(arms: [Arm]) : Bool {
-  match arms {
-    [] -> false
-    [a, ...rest] -> match a {
-      Arm(pat, guard, _) -> {
-        let catch = is_catch_all_pat(pat)
-        let unguarded = match guard { None -> true Some(_) -> false }
-        if catch and unguarded { true }
-        else { has_catch_all(rest) }
-      }
-    }
-  }
+#[doc("True when an unguarded arm matches every value.")]
+pub fn has_catch_all(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(pat, None, _), ...rest] -> if is_catch_all_pat(pat) { true } else { has_catch_all(rest) }
+  [_, ...rest] -> has_catch_all(rest)
 }
 
 

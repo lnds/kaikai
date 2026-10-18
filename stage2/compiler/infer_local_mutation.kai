@@ -236,100 +236,66 @@ fn collect_escaped_names(ids: ProtoIds, e: Expr, acc: [LocalId]) : [LocalId] =
 
 fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [LocalId]) : [LocalId] {
   match k {
-    ECall(callee, args_) -> {
-      # generalised the previous `is_array_safe_callee`
-      # whitelist (which hardcoded specific stdlib names) into a row-
-      # consulting rule:
-      #   * Runtime-builtin Array primitives (array_make / set / grow / …)
-      #     are still whitelisted by name.
-      #   * Any other callee whose row does NOT carry `Mutable` (post-
-      #     substitution) cannot mutate the arrays it receives, so its
-      #     args do not leak for masking purposes. This covers all pure
-      #     user-defined helpers and HOFs instantiated with a pure
-      #     callback (`bin_foldl(xs, init, pure_lambda)`).
-      #   * A callee whose row DOES carry `Mutable` could mutate; its
-      #     args are conservatively treated as escaped here. The masking
-      #     pass's `mutable_callee_args_all_local` then decides per call
-      #     site whether the locally-constructed Arrays are still safe
-      #     (every Array/Ref arg must be a local non-param non-escaped
-      #     read). The two checks agree: if every Array arg is local,
-      #     escape's pessimism is overridden by the demand check.
-      # every named callee (a declaration, a local) is safe for escape
-      # purposes. The masking pass's `mutable_callee_args_all_local`
-      # is the sole authority on whether passing an Array/Ref to a
-      # callee `/ Mutable` is observable mutation. For non-Mutable
-      # callees the question doesn't arise. Unnamed callees (lambdas,
-      # field accesses, etc.) remain conservative.
-      # a callee whose row carries `/ Mutable` (a module op
-      # like `hashmap.put`, or any user fn `/ Mutable`) is NOT an escape:
-      # the masking demand-check (`mutable_callee_args_all_local`) is the
-      # sole authority on whether passing a local mutable value to it is
-      # observable. Treating it as escape here would mark a locally-built
-      # `HashMap` as escaped the moment it is read or written through its
-      # own module ops, defeating the masking entirely.
-      let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
-      let safe = match callee.kind {
-        ELocal(_) -> true
-        ESym(_, _) -> true
-        # A handler keeps what an operation hands it; only `Mutable`'s own
-        # operations take the cell they act on.
-        EOp(r) -> effect_is(r.eff, CeMutable)
-        # A callee the typer has yet to settle names a declaration.
-        EName(_) -> true
-        # A primitive mark is a named callee like any bare one.
-        EMark(m) -> mark_is_prim(m) or ty_callee_has_mutable(callee_ty)
-        # A module-qualified dispatcher is a named callee like any bare
-        # one.
-        EModCall(m, n) -> pid_qualified_is_disp(ids, m, n) or ty_callee_has_mutable(callee_ty)
-        _       -> ty_callee_has_mutable(callee_ty)
-      }
-      let a0 = collect_escaped_names(ids, callee, acc)
-      if safe { collect_escaped_in_exprs_safe(ids, args_, a0) }
-      else    { collect_escaped_in_exprs(ids, args_, a0) }
-    }
-    EBlock(stmts, tail) -> {
-      let a1 = collect_escaped_in_stmts(ids, stmts, acc)
-      match tail { Some(t) -> collect_escaped_names(ids, t, a1) None -> a1 }
-    }
-    EIf(c, t_, eo) -> {
-      let a1 = collect_escaped_names(ids, c, acc)
-      let a2 = collect_escaped_names(ids, t_, a1)
-      match eo { Some(e2) -> collect_escaped_names(ids, e2, a2) None -> a2 }
-    }
-    EMatch(scr, arms) -> {
-      let a1 = collect_escaped_names(ids, scr, acc)
-      collect_escaped_in_arms(ids, arms, a1)
-    }
-    EBinop(_, a, b)   -> collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
-    EUnop(_, x)       -> collect_escaped_names(ids, x, acc)
-    EField(b, _)      -> collect_escaped_names(ids, b, acc)
-    EIndex(a, b)      -> collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
-    EPipe(a, b)       -> collect_escaped_names(ids, pipe_as_call(a, b), acc)
+    ECall(callee, args_) -> collect_escaped_call(ids, callee, args_, acc)
+    EBlock(stmts, tail) -> escaped_opt(ids, tail, collect_escaped_in_stmts(ids, stmts, acc))
+    EIf(c, t_, eo) -> escaped_opt(ids, eo, collect_escaped_names(ids, t_, collect_escaped_names(ids, c, acc)))
+    EMatch(scr, arms) -> collect_escaped_in_arms(ids, arms, collect_escaped_names(ids, scr, acc))
+    EBinop(_, a, b) -> collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
+    EUnop(_, x) -> collect_escaped_names(ids, x, acc)
+    EField(b, _) -> collect_escaped_names(ids, b, acc)
+    EIndex(a, b) -> collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
+    EPipe(a, b) -> collect_escaped_names(ids, pipe_as_call(a, b), acc)
     EDispatchPipe(_, a, b) -> collect_escaped_via_pipe(ids, a, b, acc)
-    ELambda(_, b)     -> collect_escaped_names(ids, b, acc)
-    # A record literal stores values into fields — that hands the
-    # reference to a structured carrier the caller may inspect or
-    # mutate. Treat field-init args as escaping.
+    ELambda(_, b) -> collect_escaped_names(ids, b, acc)
     ERecordLit(_, fs) -> collect_escaped_in_field_inits(ids, fs, acc)
-    EList(els)        -> collect_escaped_in_list_elems(ids, els, acc)
-    ERange(a, b, oc)  -> {
-      let a1 = collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc))
-      match oc { Some(c) -> collect_escaped_names(ids, c, a1) None -> a1 }
-    }
+    EList(els) -> collect_escaped_in_list_elems(ids, els, acc)
+    ERange(a, b, oc) -> escaped_opt(ids, oc, collect_escaped_names(ids, b, collect_escaped_names(ids, a, acc)))
     EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      let a1 = collect_escaped_names(ids, body, acc)
-      let a2 = match init_opt { Some(i) -> collect_escaped_names(ids, i, a1) None -> a1 }
+      let a2 = escaped_opt(ids, init_opt, collect_escaped_names(ids, body, acc))
       let a3 = collect_escaped_in_hclauses(ids, clauses, a2)
       match ret_opt {
-        Some(HR(_, body, _, _)) -> collect_escaped_names(ids, body, a3)
-        None              -> a3
+        Some(HR(_, rbody, _, _)) -> collect_escaped_names(ids, rbody, a3)
+        None -> a3
       }
     }
     ELitUnit(inner, _) -> collect_escaped_names(ids, inner, acc)
-    EBang(inner)       -> collect_escaped_names(ids, inner, acc)
-    EIntrinsic(_, xs)  -> collect_escaped_in_exprs_safe(ids, xs, acc)
-    ESurface(sf)       -> collect_escaped_in_exprs(ids, surface_children(sf), acc)
+    EBang(inner) -> collect_escaped_names(ids, inner, acc)
+    EIntrinsic(_, xs) -> collect_escaped_in_exprs_safe(ids, xs, acc)
+    ESurface(sf) -> collect_escaped_in_exprs(ids, surface_children(sf), acc)
     _ -> acc
+  }
+}
+
+fn escaped_opt(ids: ProtoIds, o: Option[Expr], acc: [LocalId]) : [LocalId] =
+  match o {
+    Some(x) -> collect_escaped_names(ids, x, acc)
+    None -> acc
+  }
+
+fn collect_escaped_call(ids: ProtoIds, callee: Expr, args_: [Expr], acc: [LocalId]) : [LocalId] {
+  let a0 = collect_escaped_names(ids, callee, acc)
+  if callee_args_safe(ids, callee) { collect_escaped_in_exprs_safe(ids, args_, a0) }
+  else { collect_escaped_in_exprs(ids, args_, a0) }
+}
+
+# A named callee (a declaration, a local, a primitive or dispatcher mark) never
+# makes its arguments escape: `mutable_callee_args_all_local` alone decides per
+# call site whether passing a local mutable value to a `/ Mutable` callee is
+# observable. An unnamed callee (a lambda, a field access) is safe only when
+# its row carries no `Mutable`.
+fn callee_args_safe(ids: ProtoIds, callee: Expr) : Bool {
+  let callee_ty = match callee.ty {
+    Some(t) -> t
+    None -> TyAny
+  }
+  match callee.kind {
+    ELocal(_) -> true
+    ESym(_, _) -> true
+    EName(_) -> true
+    EOp(r) -> effect_is(r.eff, CeMutable)
+    EMark(m) -> mark_is_prim(m) or ty_callee_has_mutable(callee_ty)
+    EModCall(m, n) -> pid_qualified_is_disp(ids, m, n) or ty_callee_has_mutable(callee_ty)
+    _ -> ty_callee_has_mutable(callee_ty)
   }
 }
 

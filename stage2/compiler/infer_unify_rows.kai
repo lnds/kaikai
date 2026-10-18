@@ -5,6 +5,7 @@ import compiler.ast
 import compiler.resolve_names
 import compiler.decl_names
 import compiler.union_table
+import compiler.infer_glue
 import compiler.infer_row_kinds
 import compiler.infer_unit_tables
 import compiler.infer_state
@@ -35,9 +36,6 @@ fn occurs_row(v: Int, r: Row, s: Subst) : Bool {
     Some(w) -> v == w
   }
 }
-
-# Partition two label lists into (both-pairs, only-left, only-right).
-# O(n*m); fine for rows of expected size <10.
 
 
 # best-match label lookup for nested parametric effects.
@@ -277,37 +275,33 @@ pub fn row_shape_compatible(a: Row, b: Row, s: Subst) : Bool {
 
 fn bind_compatible_row_tails(at: Option[Int], bt: Option[Int],
                              oleft: [Label], oright: [Label],
-                             s: Subst) : Option[Subst] / Mutable {
+                             s: Subst) : Option[Subst] / Mutable =
   match at {
     None -> match bt {
       None -> Some(s)
-      Some(b_id) -> {
-        let r = Row { labels: oleft, tail: None, display_alias: None }
-        if occurs_row(b_id, r, s) { None }
-        else { Some(subst_row_extend(s, b_id, r)) }
-      }
+      Some(b_id) -> bind_closed_tail(b_id, oleft, s)
     }
     Some(a_id) -> match bt {
-      None -> {
-        let r = Row { labels: oright, tail: None, display_alias: None }
-        if occurs_row(a_id, r, s) { None }
-        else { Some(subst_row_extend(s, a_id, r)) }
-      }
-      Some(b_id) -> {
-        if a_id == b_id and labels_empty(oleft) and labels_empty(oright) { Some(s) }
-        else {
-          let fr = subst_fresh_row(s)
-          let s1 = fr.subst
-          let r_for_a = Row { labels: oright, tail: Some(fr.id), display_alias: None }
-          let r_for_b = Row { labels: oleft,  tail: Some(fr.id), display_alias: None }
-          if occurs_row(a_id, r_for_a, s1) { None }
-          else {
-            let s2 = subst_row_extend(s1, a_id, r_for_a)
-            if occurs_row(b_id, r_for_b, s2) { None }
-            else { Some(subst_row_extend(s2, b_id, r_for_b)) }
-          }
-        }
-      }
+      None -> bind_closed_tail(a_id, oright, s)
+      Some(b_id) -> bind_open_tails(a_id, b_id, oleft, oright, s)
+    }
+  }
+
+fn bind_closed_tail(id: Int, labels: [Label], s: Subst) : Option[Subst] / Mutable {
+  let r = Row { labels: labels, tail: None, display_alias: None }
+  if occurs_row(id, r, s) { None } else { Some(subst_row_extend(s, id, r)) }
+}
+
+fn bind_open_tails(a_id: Int, b_id: Int, oleft: [Label], oright: [Label], s: Subst) : Option[Subst] / Mutable {
+  if a_id == b_id and labels_empty(oleft) and labels_empty(oright) { Some(s) }
+  else {
+    let fr = subst_fresh_row(s)
+    let r_for_a = Row { labels: oright, tail: Some(fr.id), display_alias: None }
+    let r_for_b = Row { labels: oleft,  tail: Some(fr.id), display_alias: None }
+    if occurs_row(a_id, r_for_a, fr.subst) { None }
+    else {
+      let s2 = subst_row_extend(fr.subst, a_id, r_for_a)
+      if occurs_row(b_id, r_for_b, s2) { None } else { Some(subst_row_extend(s2, b_id, r_for_b)) }
     }
   }
 }
@@ -423,61 +417,51 @@ pub fn occurs(v: Int, t: Ty, s: Subst) : Bool {
 }
 
 
-# env-threaded unify. The env carries the type
-# environment so `unify_heads` can consult `variants_of_type` for
-# the Decision-3 implicit upcast (`docs/unions-design.md`): a value
-# of a component type is usable wherever its parent union is
-# expected. Calls without env access (e.g. hole-synthesis) pass
-# `ty_env_empty()` and lose only the upcast-acceptance behaviour.
+# The env carries the unions `unify_heads` consults for the implicit upcast
+# (a component type is usable where its parent union is expected); a caller
+# without env access passes `ty_env_empty()` and loses only the upcast.
+# Refinements are transparent: both sides are peeled before head unification,
+# and effect-row labels keep their raw TyVar payloads so `unify_row` can tell
+# a bound variable from a literal concrete label when ordering absorption.
 #[doc("Typer-internal helper `unify_env` shared across the infer modules.")]
 pub fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
-  # refinements are transparent for unify — peel
-  # them off both sides before head-unification so neither direction
-  # gets blocked. The predicate stays attached at the declaration
-  # site; downstream passes that need to reason about it look it up
-  # from the source signature.
-  # `apply_ty_keep_row_labels` preserves the raw TyVar
-  # payloads inside effect-row labels (only the row TAIL is chased)
-  # so the downstream `unify_row` partition can pick by
-  # raw-tyvar-vs-concrete in `find_remove_label_best`. A plain
-  # `apply_ty` would substitute bound TyVars away — every label
-  # whose ty_args reference a TyVar that has been unified to a
-  # concrete type would become structurally identical to a
-  # source-literal concrete label, and the absorption order for two
-  # `Actor[T]` instantiations would collapse back to row position.
   let a = unwrap_refines(apply_ty_keep_row_labels(s, t1))
   let b = unwrap_refines(apply_ty_keep_row_labels(s, t2))
-  match a {
-    TyAny -> Some(s)
-    _ -> match b {
-      TyAny -> Some(s)
-      _ -> match a {
-        TyVarT(n) -> match b {
-          TyVarT(m) -> if n == m { Some(s) }
-                       else if subst_is_rigid(s, n) {
-                         if subst_is_rigid(s, m) { None } else { Some(subst_extend(s, m, a)) }
-                       }
-                       else { Some(subst_extend(s, n, b)) }
-          _ -> if subst_is_rigid(s, n) or occurs(n, b, s) { None } else { Some(subst_extend(s, n, b)) }
+  if ty_is_any(a) or ty_is_any(b) { Some(s) }
+  else {
+    match a {
+      TyVarT(n) -> bind_var_left(n, a, b, s)
+      _ -> match b {
+        TyVarT(m) -> if subst_is_rigid(s, m) or occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
+        TyShapeApp(_, _) -> match a {
+          TyShapeApp(_, _) -> unify_heads(env, a, b, s)
+          _ -> unify_heads(env, b, a, s)
         }
-        _ -> match b {
-          TyVarT(m) -> if subst_is_rigid(s, m) or occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
-          # a shape application on the right is normalised to the left so
-          # the single `TyShapeApp` arm in `unify_heads` handles both
-          # directions symmetrically.
-          TyShapeApp(_, _) -> match a { TyShapeApp(_, _) -> unify_heads(env, a, b, s)
-                                        _ -> unify_heads(env, b, a, s) }
-          _ -> unify_heads(env, a, b, s)
-        }
+        _ -> unify_heads(env, a, b, s)
       }
     }
   }
 }
 
+fn ty_is_any(t: Ty) : Bool = match t {
+  TyAny -> true
+  _ -> false
+}
 
-# Neither side is a var: must match head-symbol + structure.
-#[doc("Typer-internal helper `unify_list` shared across the infer modules.")]
-pub fn unify_list(env: TyEnv, xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] / Mutable {
+fn bind_var_left(n: Int, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable =
+  match b {
+    TyVarT(m) ->
+      if n == m { Some(s) }
+      else if subst_is_rigid(s, n) {
+        if subst_is_rigid(s, m) { None } else { Some(subst_extend(s, m, a)) }
+      }
+      else { Some(subst_extend(s, n, b)) }
+    _ -> if subst_is_rigid(s, n) or occurs(n, b, s) { None } else { Some(subst_extend(s, n, b)) }
+  }
+
+
+#[doc("Unify two type lists pairwise; lists of different lengths do not unify.")]
+pub fn unify_list(env: TyEnv, xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] / Mutable =
   match xs {
     [] -> match ys { [] -> Some(s) _ -> None }
     [x, ...xr] -> match ys {
@@ -488,170 +472,125 @@ pub fn unify_list(env: TyEnv, xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] / Mu
       }
     }
   }
-}
 
-
+# Neither side is a var: the heads must match structurally.
 fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
   match a {
-    # bare numerics on the LHS treat the RHS dim case specially
-    # — `Real` ≡ `Real<1>`. Any other unit is a mismatch (`Real` vs
-    # `Real<USD>` is rejected).
-    TyInt    -> match b {
-      TyInt    -> Some(s)
-      TyDimT(bb, bu) -> match bb { TyInt -> unify_dim(UOne, bu, s) _ -> None }
-      _ -> None
-    }
-    TyReal   -> match b {
-      TyReal   -> Some(s)
-      TyDimT(bb, bu) -> match bb { TyReal -> unify_dim(UOne, bu, s) _ -> None }
-      _ -> None
-    }
-    TyBool   -> match b { TyBool   -> Some(s) _ -> None }
-    TyString -> match b { TyString -> Some(s) _ -> None }
-    TyChar   -> match b { TyChar   -> Some(s) _ -> None }
-    TyUnit   -> match b { TyUnit   -> Some(s) _ -> None }
-    # Byte is nominal — distinct from Int. Only unifies
-    # with itself. Conversions use `int_to_u8` / `u8_to_int`.
-    TyByte     -> match b { TyByte     -> Some(s) _ -> None }
-    TyInt32    -> match b { TyInt32    -> Some(s) _ -> None }
-    TyUInt32   -> match b { TyUInt32   -> Some(s) _ -> None }
-    TyUInt64   -> match b { TyUInt64   -> Some(s) _ -> None }
-    TyInt128   -> match b { TyInt128   -> Some(s) _ -> None }
-    TyHandle   -> match b { TyHandle   -> Some(s) _ -> None }
-    # TyAny unifies with anything until typed holes and error reporting
-    # land; it's the "I don't know yet" placeholder.
-    TyAny    -> Some(s)
+    TyAny -> Some(s)
+    TyVarT(_) -> None
+    TyInt -> unify_scalar(a, b, s)
+    TyReal -> unify_scalar(a, b, s)
+    TyBool -> unify_scalar(a, b, s)
+    TyString -> unify_scalar(a, b, s)
+    TyChar -> unify_scalar(a, b, s)
+    TyUnit -> unify_scalar(a, b, s)
+    TyByte -> unify_scalar(a, b, s)
+    TyInt32 -> unify_scalar(a, b, s)
+    TyUInt32 -> unify_scalar(a, b, s)
+    TyUInt64 -> unify_scalar(a, b, s)
+    TyInt128 -> unify_scalar(a, b, s)
+    TyHandle -> unify_scalar(a, b, s)
     TyListT(a1) -> match b {
       TyListT(b1) -> unify_env(env, a1, b1, s)
       _ -> None
     }
-    TyFnT(ap, ar, arow) -> match b {
-      TyFnT(bp, br, brow) -> match unify_list(env, ap, bp, s) {
-        None -> None
-        Some(s1) -> match unify_env(env, ar, br, s1) {
-          None -> None
-          Some(s2) -> unify_row(arow, brow, s2)
-        }
-      }
-      _ -> None
-    }
-    # Two nominal types unify only when they name one declaration:
-    # same-name types from different modules are distinct (the
-    # load-bearing rule for shadowing).
-    TyCon(ta_sym, aa) -> match b {
-      TyCon(tb_sym, ba) -> {
-        if sym_same(ta_sym, tb_sym) { unify_list(env, aa, ba, s) }
-        # implicit upcast inside structural
-        # unification. When the two TyCons disagree, accept the
-        # mismatch if `b` is a component of the union `a` per the env
-        # (`type a = ... | b | ...`). Direction matters: only the
-        # found-side type may be a component of the expected-side
-        # union (`unify` is called with the *expected* side first
-        # via st_unify; here we mirror that contract). Empty arg
-        # lists ensure we are looking at bare nominal types, not
-        # generic instances. No chains: only the immediate parent
-        # accepts.
-        # The two homes are deliberately not compared: `type Both =
-        # ua.Cfg | ub.Cfg` lists components another module declares, so
-        # the union's home and its component's are unrelated. Membership
-        # in the parent's component list is what authorises the lift,
-        # and that list already names one declaration each.
-        else if list_length(aa) == 0 and list_length(ba) == 0 and ut_lists(env.unions, ta_sym, tb_sym) { Some(s) }
-        else { None }
-      }
-      # a bare named record on the LHS unifies with the
-      # same record on the RHS decorated by a unit, when the unit
-      # collapses to UOne. Mirrors the `Real ≡ Real<1>` / `Int ≡ Int<1>`
-      # rules above. Only `Decimal` has a UoM-decorated form; the other
-      # named records do not.
-      TyDimT(bb, bu) -> match bb {
-        TyCon(tb_sym, ba) ->
-          # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
-          # never collapses into a bare `Vec[t]` — even at `<1>`. The
-          # numeric `Real ≡ Real<1>` collapse below is untouched.
-          if core_ty_is(tb_sym, CtVec) { None }
-          else if sym_same(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
-            None -> None
-            Some(s1) -> unify_dim(UOne, bu, s1)
-          } } else { None }
-        _ -> None
-      }
-      _ -> None
-    }
-    TyVarT(_) -> None                                  # handled in unify
-    # TyDimT vs TyDimT — unify base then unit. TyDimT vs bare
-    # primitive uses the `Real ≡ Real<1>` rule above (the bare-side
-    # arms catch this via the dim-aware match arms).
-    TyDimT(ab, au) -> match b {
-      TyDimT(bb, bu) -> match unify_env(env, ab, bb, s) {
-        None -> None
-        Some(s1) -> unify_dim(au, bu, s1)
-      }
-      TyInt    -> match ab { TyInt -> unify_dim(au, UOne, s) _ -> None }
-      TyReal   -> match ab { TyReal -> unify_dim(au, UOne, s) _ -> None }
-      # `Decimal<u>` ≡ bare `Decimal` when u collapses to 1,
-      # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
-      # flow into a fn expecting bare `Decimal` only when the units
-      # cancel — anything else is a unit mismatch.
-      TyCon(tb_sym, ba) -> match ab {
-        TyCon(ta_sym, aa) ->
-          # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
-          # (distinct inline layout); the numeric collapse above stays.
-          if core_ty_is(ta_sym, CtVec) { None }
-          else if sym_same(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
-            None -> None
-            Some(s1) -> unify_dim(au, UOne, s1)
-          } } else { None }
-        _ -> None
-      }
-      TyRefineT(bbase, _) -> unify_env(env, a, bbase, s)
-      _ -> None
-    }
-    # refinements are transparent to unify — both
-    # `TyRefineT(b, p) ⊑ b` (upcast) and `b ⊑ TyRefineT(b, p)` go
-    # through. The predicate stays attached on the source-side fn
-    # signature; downstream passes (interval propagation, match-arm
-    # narrowing, ensure() desugar) consume it from there. A future
-    # refinement-aware unify could distinguish argument-flow direction
-    # to reject downcasts, but it requires reshape of unify's API.
+    TyFnT(ap, ar, arow) -> unify_fn_heads(env, ap, ar, arow, b, s)
+    TyCon(ta_sym, aa) -> unify_con_head(env, ta_sym, aa, b, s)
+    TyDimT(ab, au) -> unify_dim_head(env, a, ab, au, b, s)
     TyRefineT(abase, _) -> unify_env(env, abase, b, s)
-    # two unions unify only when their canonical
-    # component lists agree component-wise. Subsumption between a
-    # union and one of its components — the implicit upcast — is the
-    # resolver's job; unify stays symmetric here.
     TyUnion(aps) -> match b {
       TyUnion(bps) -> unify_list(env, aps, bps, s)
       _ -> None
     }
-    # First-order shape application: `s[A] ~ D[B]` binds `s := D`
-    # (a nullary constructor witness) and unifies `A ~ B`. The witness
-    # carries the constructor head only; `apply_ty` reconstructs `D[A]`.
-    # A `List` head witnesses as the nullary core `List` and rebuilds to
-    # `TyListT`. No witness (`Int`, arity-2 `Map`) fails cleanly — the
-    # strict-arity-1, no-higher-order rule.
-    TyShapeApp(sv, a1) -> match shape_witness_of(b) {
-      Some(wit) -> match shape_bind(sv, wit, a1, s) {
-        None -> None
-        Some(s1) -> unify_env(env, a1, shape_arg_of(b), s1)
-      }
-      None -> None
-    }
+    TyShapeApp(sv, a1) -> unify_shape_head(env, sv, a1, b, s)
   }
 }
+
+# Int and Real alone unify with their own `<1>` form; the other scalars are
+# nominal and unify only with themselves.
+fn unify_scalar(a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
+  let ra = scalar_rank(a)
+  match b {
+    TyDimT(bb, bu) -> if ra <= 1 and ra == scalar_rank(bb) { unify_dim(UOne, bu, s) } else { None }
+    _ -> if ra == scalar_rank(b) { Some(s) } else { None }
+  }
+}
+
+fn unify_fn_heads(env: TyEnv, ap: [Ty], ar: Ty, arow: Row, b: Ty, s: Subst) : Option[Subst] / Mutable =
+  match b {
+    TyFnT(bp, br, brow) -> match unify_list(env, ap, bp, s) {
+      None -> None
+      Some(s1) -> match unify_env(env, ar, br, s1) {
+        None -> None
+        Some(s2) -> unify_row(arow, brow, s2)
+      }
+    }
+    _ -> None
+  }
+
+# Same-name types from different modules are distinct, so nominal types unify
+# only when they name one declaration. A union's home and its component's are
+# deliberately not compared: the component list already names one declaration
+# each, and membership in it authorises the upcast. Only the found side may be
+# a component of the expected side's union, and only for bare (argument-less)
+# types.
+fn unify_con_head(env: TyEnv, ta_sym: SymId, aa: [Ty], b: Ty, s: Subst) : Option[Subst] / Mutable =
+  match b {
+    TyCon(tb_sym, ba) ->
+      if sym_same(ta_sym, tb_sym) { unify_list(env, aa, ba, s) }
+      else if list_length(aa) == 0 and list_length(ba) == 0 and ut_lists(env.unions, ta_sym, tb_sym) { Some(s) }
+      else { None }
+    TyDimT(bb, bu) -> match bb {
+      TyCon(tb_sym, ba) ->
+        if core_ty_is(tb_sym, CtVec) or not sym_same(ta_sym, tb_sym) { None }
+        else { unify_args_then_dim(env, aa, ba, UOne, bu, s) }
+      _ -> None
+    }
+    _ -> None
+  }
+
+# A fixed-width `Vec[t]<n>` has its own inline layout and never collapses into
+# a bare `Vec[t]`, even at `<1>`.
+fn unify_dim_head(env: TyEnv, a: Ty, ab: Ty, au: UnitExprT, b: Ty, s: Subst) : Option[Subst] / Mutable =
+  match b {
+    TyDimT(bb, bu) -> match unify_env(env, ab, bb, s) {
+      None -> None
+      Some(s1) -> unify_dim(au, bu, s1)
+    }
+    TyInt -> if scalar_rank(ab) == 0 { unify_dim(au, UOne, s) } else { None }
+    TyReal -> if scalar_rank(ab) == 1 { unify_dim(au, UOne, s) } else { None }
+    TyCon(tb_sym, ba) -> match ab {
+      TyCon(ta_sym, aa) ->
+        if core_ty_is(ta_sym, CtVec) or not sym_same(ta_sym, tb_sym) { None }
+        else { unify_args_then_dim(env, aa, ba, au, UOne, s) }
+      _ -> None
+    }
+    TyRefineT(bbase, _) -> unify_env(env, a, bbase, s)
+    _ -> None
+  }
+
+fn unify_args_then_dim(env: TyEnv, xs: [Ty], ys: [Ty], ua: UnitExprT, ub: UnitExprT, s: Subst) : Option[Subst] / Mutable =
+  match unify_list(env, xs, ys, s) {
+    None -> None
+    Some(s1) -> unify_dim(ua, ub, s1)
+  }
+
+# `s[A] ~ D[B]` binds `s := D` (a nullary constructor witness) and unifies
+# `A ~ B`. A type with no witness (`Int`, arity-2 `Map`) fails cleanly.
+fn unify_shape_head(env: TyEnv, sv: Int, a1: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable =
+  match shape_witness_of(b) {
+    Some(wit) -> match shape_bind(sv, wit, a1, s) {
+      None -> None
+      Some(s1) -> unify_env(env, a1, shape_arg_of(b), s1)
+    }
+    None -> None
+  }
 
 
 # Bind a shape variable to its constructor witness with an occurs-check
 # over the pending argument, then record `sv := witness` in the subst.
 fn shape_bind(sv: Int, wit: Ty, arg: Ty, s: Subst) : Option[Subst] / Mutable =
   if occurs(sv, arg, s) { None } else { Some(subst_extend(s, sv, wit)) }
-
-# ---- instantiation ----
-#
-# Turn a TyScheme into (fresh Ty, updated env). Each bound var in the
-# scheme is replaced by a freshly-generated TyVarT; everywhere the
-# bound id appears inside the scheme body, we substitute the fresh
-# id. The env's `fresh` counter advances by one per bound var.
-
 
 # Speculative arity + unification check on two ty_arg lists. Wrong
 # arity → no match. Used by st_add_label and the handler-filter pass.
@@ -692,48 +631,20 @@ fn ty_unifiable_shallow(a: Ty, b: Ty) : Bool {
 }
 
 
-# Structural equality on resolved Tys — used only as a fallback in
-# `ty_unifiable_shallow`. Excludes TyVarT/TyAny which short-circuit
-# above. Approximates HM-equality for concrete types.
+# Structural equality on resolved Tys, the fallback of `ty_unifiable_shallow`
+# for non-variable types. Refinements are peeled: only the shape is compared.
 #[doc("Typer-internal helper `ty_eq_shape` shared across the infer modules.")]
 pub fn ty_eq_shape(a: Ty, b: Ty) : Bool {
-  # ty_eq_shape is a shape-only check (no predicate
-  # equality), so refinements are peeled before comparing.
   let ax = unwrap_refines(a)
   let bx = unwrap_refines(b)
-  match ax {
-    TyInt    -> match bx { TyInt -> true _ -> false }
-    TyReal   -> match bx { TyReal -> true _ -> false }
-    TyBool   -> match bx { TyBool -> true _ -> false }
-    TyString -> match bx { TyString -> true _ -> false }
-    TyChar   -> match bx { TyChar -> true _ -> false }
-    TyUnit   -> match bx { TyUnit -> true _ -> false }
-    TyByte     -> match bx { TyByte -> true _ -> false }
-    TyInt32    -> match bx { TyInt32 -> true _ -> false }
-    TyUInt32   -> match bx { TyUInt32 -> true _ -> false }
-    TyUInt64   -> match bx { TyUInt64 -> true _ -> false }
-    TyInt128   -> match bx { TyInt128 -> true _ -> false }
-    TyHandle   -> match bx { TyHandle -> true _ -> false }
-    TyListT(ai) -> match bx { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
-    TyFnT(ap, ar, arow) -> match bx {
-      TyFnT(bp, br, brow) ->
-        ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
-          and (rows_label_free(arow, brow) or row_shape_compatible(arow, brow, subst_empty()))
-      _ -> false
-    }
-    TyCon(ta_sym, atas) -> match bx {
-      TyCon(tb_sym, btas) -> sym_same(ta_sym, tb_sym) and ty_list_eq_shape(atas, btas)
-      _ -> false
-    }
-    # shape-equality on unions is point-wise on
-    # the canonical component list — same rule as `inf_ty_eq` minus the
-    # refinement-stripping the caller already did at the top of this
-    # function. Different union arities never compare equal.
-    TyUnion(aps) -> match bx {
-      TyUnion(bps) -> ty_list_eq_shape(aps, bps)
-      _ -> false
-    }
-    _ -> false
+  match (ax, bx) {
+    (TyListT(x), TyListT(y)) -> ty_eq_shape(x, y)
+    (TyFnT(ap, ar, arow), TyFnT(bp, br, brow)) ->
+      ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
+        and (rows_label_free(arow, brow) or row_shape_compatible(arow, brow, subst_empty()))
+    (TyCon(sa, aa), TyCon(sb, ba)) -> sym_same(sa, sb) and ty_list_eq_shape(aa, ba)
+    (TyUnion(x), TyUnion(y)) -> ty_list_eq_shape(x, y)
+    _ -> scalar_rank(ax) >= 0 and scalar_rank(ax) == scalar_rank(bx)
   }
 }
 
