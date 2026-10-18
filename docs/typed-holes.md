@@ -56,7 +56,7 @@ foo.kai:4:3: type hole
     name
     string_concat(name, excited)
 
-  312 more bindings in scope (--holes-scope lists them)
+  563 more bindings in scope (--holes-scope lists them)
 ```
 
 A candidate fits when its type unifies with the hole's AND the effects
@@ -96,7 +96,7 @@ where each element describes one hole. Stable schema:
       {"name": "name", "type": "String"},
       {"name": "excited", "type": "String"}
     ],
-    "scope_elided": 312,
+    "scope_elided": 563,
     "candidates": [
       {"expr": "excited", "kind": "synth"},
       {"expr": "string_concat(name, excited)", "kind": "synth"}
@@ -113,7 +113,9 @@ row adds `effects`, each as
 
 `in_scope` carries the local bindings; `scope_elided` counts the
 reachable bindings not listed. `kai build --holes-json-scope` lists
-everything in `in_scope` (core included) with `scope_elided: 0`.
+everything in `in_scope` (core included) with `scope_elided: 0`. The
+human report's "more bindings in scope" line counts the same set, core
+included: a binding the user can write at the hole.
 
 A reachable binding is one the root file can write at the hole: a
 candidate or `in_scope` entry never names a top-level declaration
@@ -127,10 +129,12 @@ unchanged (it never returns), and a call whose result is `Nothing`. A
 recursive call on other arguments, such as a sub-term bound by a
 pattern, stays.
 
-`kind` is `"hole"` for `?` / `?name` and `"todo"` for `todo!("msg")`,
-which share the typed-hole pipeline (see *Implementation notes*).
-`message` carries the `todo!` argument for `"todo"` kinds, `null`
-otherwise. `name` is the `?name` identifier, or `null` for the
+`kind` is `"hole"` for `?` / `?name` in expression position,
+`"pattern"` for a `?` in pattern position, and `"todo"` for
+`todo!("msg")`, which share the typed-hole pipeline (see
+*Implementation notes*). `message` carries the `todo!` argument for
+`"todo"` kinds, `null` otherwise. `remaining` is `null` except for
+`"pattern"` holes (see *Patterns*). `name` is the `?name` identifier, or `null` for the
 anonymous `?`. The schema is validated in CI by
 `scripts/validate_holes_json.py` against `examples/holes/*.kai`.
 
@@ -138,8 +142,10 @@ The JSON path is the integration point for LLM agents.
 
 ## Patterns
 
-A hole in pattern position gets the same treatment, plus
-**exhaustiveness information**:
+A `?` in pattern position is a *pattern hole*. It reports the type it
+must match and **exhaustiveness information**: a value the arms
+*before* the hole's arm leave uncovered, as the exhaustiveness checker
+spells it (one witness, not the full set):
 
 ```
 tail.kai:4:5: pattern hole
@@ -147,16 +153,19 @@ tail.kai:4:5: pattern hole
   expected: a pattern matching [Int]
 
   remaining inhabitants (exhaustiveness):
-    [_, ...rest]
-
-  candidates:
-    [_, ...rest]
-    [only]
-    [a, b, ...rest]
+    [_, ..._]
 ```
 
-Binding names introduced by a pattern candidate are previewed in the
-subsequent expression-hole's scope.
+When the earlier arms already cover every value the line reads
+`remaining inhabitants (exhaustiveness): none`. A pattern hole outside
+a `match` (a `let` destructure) reports only the expected type. A
+pattern hole lists no candidates and no scope.
+
+`--holes-json` reports it with `"kind": "pattern"`, `expected_type` the
+matched type (without the "a pattern matching" prefix) and `remaining`
+the list of witnesses (`[]` for none, `null` when there is no `match`
+or the checker cannot decide). `name` is the `?name` identifier or
+`null`.
 
 ## Typing rules
 

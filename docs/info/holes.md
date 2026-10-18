@@ -39,7 +39,7 @@ file.kai:2:11: type hole ?
   candidates that fit:
     maybe_parse(s)
     ...
-  861 more bindings in scope (--holes-scope lists them)
+  563 more bindings in scope (--holes-scope lists them)
 ```
 
 The report is LOCAL by default: parameters and lets around the hole,
@@ -57,9 +57,10 @@ fields:
 ```text
 file            string         source file path
 line, col       int            position
-kind            string         "hole" (vs other hole kinds)
+kind            string         "hole", "pattern" (a `?` in pattern position) or "todo"
 name            string|null    null for `?`, name for `?ident`
 message         string|null    extra context if any
+remaining       array|null     pattern holes: values the earlier arms miss
 expected_type   string         the type the hole must have
 in_scope        array          [{name, type}, ...] local bindings
 scope_elided    int            reachable bindings not listed

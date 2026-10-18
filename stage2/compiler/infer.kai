@@ -32,6 +32,7 @@ import compiler.impl_identity
 import compiler.proto_ids
 import compiler.proto_contest
 import compiler.exhaust
+import compiler.pattern_holes
 import compiler.effect_default
 import compiler.type_text
 import compiler.marks
@@ -6287,9 +6288,12 @@ type HoleSite = HS(HoleKind, Int, Int, Int, [TyEntry], Int, [Label])
 # - `HKTodo(msg)`      — `todo!(msg)`. Each occurrence is independent
 #   (no name-based sharing), and reporting flags it under
 #   `"kind": "todo"` in `--holes-json`.
+# - `HKPattern(n, rem)` — `?` / `?n` in pattern position. `rem` is the
+#   value the earlier arms of the enclosing match leave uncovered
+#   (`Some([])`: none); `None` outside a match or when undecidable.
 #[doc("infer: `HoleKind` — driver-facing type.")]
 #[derive(BinSerialize)]
-pub type HoleKind = HKHole(Option[String]) | HKTodo(String)
+pub type HoleKind = HKHole(Option[String]) | HKTodo(String) | HKPattern(Option[String], Option[[String]])
 
 type InferState = { file: String, env: TyEnv, core_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
                     insts: [CallSite], holes: [HoleSite],
@@ -9484,6 +9488,10 @@ fn find_hole_by_name(holes: [HoleSite], target: String) : Option[Int] {
           None     -> find_hole_by_name(rest, target)
         }
         HKTodo(_) -> find_hole_by_name(rest, target)
+        HKPattern(nm_opt, _) -> match nm_opt {
+          Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
+          None     -> find_hole_by_name(rest, target)
+        }
       }
     }
   }
@@ -15041,7 +15049,7 @@ fn register_fresh_pattern_hole(st: InferState, nm_opt: Option[String], expected:
 
   let fresh_id = st.env.fresh
   let st1 = st_set_env(st, fresh_var(st.env))
-  let site = HS(HKHole(nm_opt), line, col, fresh_id, st1.env.entries, st1.env.fresh, [])
+  let site = HS(HKPattern(nm_opt, None), line, col, fresh_id, st1.env.entries, st1.env.fresh, [])
   let st2 = st_push_hole(st1, site)
   st_unify(st2, TyVarT(fresh_id), expected, "pattern hole", line, col)
 }
@@ -15620,7 +15628,7 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   let ty = apply_ty(ra.st.sub, rv.ty)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
   let st_rep = check_arms_ctor_repeats(ra.st, ra.arms, [], false, line, col)
-  let st_post = check_exhaustive(st_rep, ra.arms, scr_final, line, col)
+  let st_post = check_exhaustive(annotate_pattern_holes(st_rep, ra.arms, scr_final), ra.arms, scr_final, line, col)
   # expand `PNarrow(name, T)` arms into one
   # `PAs(name, PVariant(Vi, []))` arm per variant of T so codegen
   # never sees `PNarrow`. Variants come from the post-resolve env
@@ -15682,7 +15690,7 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
   let ty = apply_ty(ra.st.sub, expected)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
   let st_rep = check_arms_ctor_repeats(ra.st, ra.arms, [], false, line, col)
-  let st_post = check_exhaustive(st_rep, ra.arms, scr_final, line, col)
+  let st_post = check_exhaustive(annotate_pattern_holes(st_rep, ra.arms, scr_final), ra.arms, scr_final, line, col)
   let arms_narrowed = expand_narrow_arms(ra.arms, st_post, scr_final)
   let arms_codegen  = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
@@ -16945,6 +16953,34 @@ fn build_nonexhaustive_diag(file: String, line: Int, col: Int,
                               covered: [String]) : Diagnostic =
   mk_diag(SevError, file, line, col, header,
           build_nonexhaustive_related(file, line, col, missing, covered))
+
+# A pattern hole reports what the arms before its own leave uncovered.
+fn annotate_pattern_holes(st: InferState, arms: [Arm], scr_ty: Ty) : InferState =
+  annotate_arm_holes(st, [], arms, scr_ty)
+
+fn annotate_arm_holes(st: InferState, before: [Arm], rest: [Arm], scr_ty: Ty) : InferState = match rest {
+  [] -> st
+  [Arm(p, g, b), ...tail] -> {
+    let holes = pattern_holes(p)
+    let st1 = if list_is_empty(holes) { st } else {
+      let rem = match x_match_verdict(before, XCtors((c) => x_ctor_entry(st, c, scr_ty))) {
+        XMissing(ws) -> Some(ws)
+        XCovered     -> Some([])
+        XUnknown     -> None
+      }
+      InferState { ...st, holes: map(st.holes, (h) => set_pattern_remaining(h, holes, rem)) }
+    }
+    annotate_arm_holes(st1, list_append(before, [Arm(p, g, b)]), tail, scr_ty)
+  }
+}
+
+fn set_pattern_remaining(h: HoleSite, holes: [Pattern], rem: Option[[String]]) : HoleSite = match h {
+  HS(HKPattern(nm, _), line, col, fresh, scope, env_fresh, handled) ->
+    if any(holes, (p) => p.line == line and p.col == col) {
+      HS(HKPattern(nm, rem), line, col, fresh, scope, env_fresh, handled)
+    } else { h }
+  _ -> h
+}
 
 fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File = {
   let st1 = check_exhaustive_ctors(st, arms, scr_ty, line, col)
