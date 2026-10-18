@@ -4,6 +4,7 @@ import path
 import cli_caches
 import cli_gc
 import cli_err
+import cli_ffi_header
 import cli_fs
 import cli_hash
 import cli_manifest
@@ -225,18 +226,30 @@ fn headers_below(dir: String) : [String] / File + Ffi =
       |> list.sort
   }
 
-fn object_key(t: Toolchain, info: [Native], n: Native) : String / File + Ffi {
+fn include_headers(info: [Native], src: Native) : [String] / File + Ffi =
+  of_kind(info, src, "inc") || headers_below
+
+#[doc("Whether a declared C source, or a header below its include dirs, names the generated `kai_ffi.h`.")]
+pub fn names_ffi_header(info: [Native]) : Bool / File + Ffi =
+  cli_ffi_header.mentioned_in(
+    sources(info) |> list.flat_map(n => [n.value, ...include_headers(info, n)])
+  )
+
+# The generated header's bytes join the key, so an object never outlives the struct it was built against.
+fn object_key(t: Toolchain, info: [Native], n: Native, ffi: String) : String / File + Ffi {
   let head = cli_hash.lines([
     t.cc,
     string.join(t.cflags_compile ++ pc_cflags(info, n), " "),
     cli_toolchain.host(t)
   ])
   let headers = of_kind(info, n, "inc") || headers_below | (h => cli_hash.Bytes(h))
-  cli_hash.digest([head, cli_hash.Bytes(n.value), ...headers])
+  let generated = if ffi == "" { [] } else { [cli_hash.Bytes(cli_ffi_header.path_in(ffi))] }
+  cli_hash.digest([head, cli_hash.Bytes(n.value), ...headers, ...generated])
 }
 
-fn compile_one(t: Toolchain, info: [Native], n: Native, obj: String) : Bool / Ffi {
-  let incs = of_kind(info, n, "inc") || (d => ["-I", d])
+fn compile_one(t: Toolchain, info: [Native], n: Native, ffi: String, obj: String) : Bool / Ffi {
+  let incs = (of_kind(info, n, "inc") || (d => ["-I", d]))
+    ++ (if ffi == "" { [] } else { ["-I", ffi] })
   let argv = cli_proc.words(t.cc)
     ++ t.cflags_compile
     ++ incs
@@ -252,13 +265,14 @@ fn cached_object(
   t: Toolchain,
   info: [Native],
   n: Native,
+  ffi: String,
   cache: String
 ) : Result[String, Int] / Stderr + File + Ffi {
-  let obj = "#{cache}/#{object_key(t, info, n)}.o"
+  let obj = "#{cache}/#{object_key(t, info, n, ffi)}.o"
   let part = "#{obj}.#{cli_sys.getpid()}"
   if cli_gc.refresh(obj) {
     Ok(obj)
-  } else if compile_one(t, info, n, part) and file_rename(part, obj).is_ok() {
+  } else if compile_one(t, info, n, ffi, part) and file_rename(part, obj).is_ok() {
     Ok(obj)
   } else {
     let _ = file_delete(part)
@@ -271,6 +285,7 @@ fn build_objects(
   t: Toolchain,
   info: [Native],
   srcs: [Pair[Int, Native]],
+  ffi: String,
   cache: String,
   tmp: String
 ) : Result[[String], Int] / Stderr + File + Ffi =
@@ -279,26 +294,27 @@ fn build_objects(
     [p, ...rest] -> {
       let obj = "#{tmp}/nativedep-#{p.fst + 1}.o"
       let o = if cache != "" {
-        cached_object(t, info, p.snd, cache)!
-      } else if compile_one(t, info, p.snd, obj) {
+        cached_object(t, info, p.snd, ffi, cache)!
+      } else if compile_one(t, info, p.snd, ffi, obj) {
         obj
       } else {
         compile_failed(p.snd)!
       }
-      let os = build_objects(t, info, rest, cache, tmp)!
+      let os = build_objects(t, info, rest, ffi, cache, tmp)!
       Ok([o, ...os])
     }
   }
 
-#[doc("Compile every declared native source to an object — cached by content across projects — and return the object paths.")]
+#[doc("Compile every declared native source to an object — cached by content across projects — and return the object paths. `ffi` is the directory of the generated `kai_ffi.h`, or empty.")]
 pub fn objects(
   t: Toolchain,
   info: [Native],
+  ffi: String,
   tmp: String
 ) : Result[[String], Int] / Stderr + Env + File + Ffi {
   let dir = cli_caches.root("KAI_NATIVE_DEP_CACHE_DIR", "nativedep", t.os)
   let cache = if cli_fs.mkdir_p(dir) { dir } else { "" }
-  build_objects(t, info, list.enumerate(sources(info)), cache, tmp)
+  build_objects(t, info, list.enumerate(sources(info)), ffi, cache, tmp)
 }
 
 #[doc("The link flags: `-L<dir>` per declared `libdirs`, each pkg-config `--libs` answer, `-l<lib>` per system library — once each.")]

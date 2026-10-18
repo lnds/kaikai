@@ -809,6 +809,7 @@ test-kai-cli: kaic2
 	@tests/run_memo.sh
 	@tests/src_entry.sh
 	@tests/build_memo.sh
+	@tests/ffi_header.sh
 	@tests/path_specs.sh
 	@tests/cc_target_link.sh
 	@tests/c_opt.sh
