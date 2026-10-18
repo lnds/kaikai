@@ -71,7 +71,7 @@ same trick BinSerialize and Layout use for `from_bytes`.
 
 A derived decode does not grow `path` with depth. A nested record is
 decoded under a one-byte placeholder (`json_path_child`), and only a
-failure swaps that placeholder for the field's path (`json_bind_rebase`),
+failure swaps that placeholder for the field's path (`json_error_rebase`),
 so a success builds no path and a document nested `d` levels deep decodes
 in memory linear in `d`. The failing path text is the one a fully threaded
 path would give. An `of_json` that only appends to `path` is unaffected;
