@@ -800,6 +800,7 @@ test-kai-cli: kaic2
 	@tests/guard_interfaces.sh
 	@tests/test_only_root.sh
 	@tests/own_blocks.sh
+	@tests/test_deps.sh
 	@tests/own_lint.sh
 	@tests/native_cache_edits.sh
 	@tests/bin_memo.sh

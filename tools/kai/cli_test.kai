@@ -13,6 +13,7 @@ import cli_prebuild
 import cli_proc
 import cli_sys
 import cli_test_help
+import cli_test_query
 import cli_plan
 import cli_toolchain
 
@@ -20,6 +21,8 @@ import cli_toolchain
 type TestOpts = {
   json: Bool,
   coverage: Bool,
+  list: Bool,
+  deps: Bool,
   only: [String],
   backend: String,
   jobs: Int,
@@ -37,6 +40,10 @@ fn with_jobs(o: TestOpts, v: String) : Result[TestOpts, Int] / Stderr =
 
 fn with_backend(o: TestOpts, v: String) : Result[TestOpts, Int] / Stderr =
   cli_compile.backend_name(v).map(b => TestOpts { ...o, backend: b })
+
+const LIST_ENV : String = "KAI_TEST_LIST"
+
+const DEPS_ENV : String = "KAI_TEST_DEPS"
 
 const VALUED : [String] = ["--only", "--backend", "-j", "--jobs"]
 
@@ -68,6 +75,8 @@ fn parse(args: [String], o: TestOpts) : Result[(TestOpts, [String]), Int] / Stde
     [a, ..._] if a == "-h" or a == "--help" -> Ok((TestOpts { ...o, help: true }, []))
     ["--json", ...rest] -> parse(rest, TestOpts { ...o, json: true })
     ["--coverage", ...rest] -> parse(rest, TestOpts { ...o, coverage: true })
+    ["--list", ...rest] -> parse(rest, TestOpts { ...o, list: true })
+    ["--deps", ...rest] -> parse(rest, TestOpts { ...o, deps: true })
     [a] if VALUED.contains(a) -> cli_err.die(missing(a))
     [a, v, ...rest] if VALUED.contains(a) -> parse(rest, valued(o, a, v)!)
     ["--", ...rest] -> Ok((o, rest))
@@ -178,6 +187,59 @@ fn tests_dir_step(o: TestOpts, tmp: String, tf: String) : Step =
     header: if o.json { "" } else { "== kai test #{tf}" }
   })
 
+# The `tests/` siblings of the entry, then the package's unreachable test files.
+fn runner_steps(
+  o: TestOpts,
+  pass: Pass,
+  src: String,
+  root: String,
+  tmp: String
+) : [Step] / Env + File + Ffi {
+  let tests = cli_blocks.tests_of(
+    if src == "" { cli_manifest.source_root(root) } else { cli_fs.dirname(src) },
+    root
+  )
+  let pkg = if root == "" {
+    []
+  } else {
+    cli_blocks.package_steps(root, src, pass, not list.is_empty(tests), tmp)
+  }
+  (tests | (tf => tests_dir_step(o, tmp, tf))) ++ pkg
+}
+
+# Every runner of a run in run order: the entry, then the steps' builds.
+fn runner_srcs(src: String, steps: [Step]) : [String] =
+  (if src == "" { [] } else { [src] })
+    ++ (steps
+      || (s => match s {
+        cli_blocks.Build(r) -> [r.src]
+        cli_blocks.Warn(_) -> []
+      }))
+
+fn warn_steps(steps: [Step]) : Unit / Stderr =
+  steps
+    |> foreach(
+      s => match s {
+        cli_blocks.Warn(msg) -> Stderr.eprint(msg)
+        cli_blocks.Build(_) -> ()
+      }
+    )
+
+# `--list`: the records of every block the run would run, nothing built or run.
+fn list_all(
+  t: Toolchain,
+  o: TestOpts,
+  src: String,
+  root: String,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra: o.extra }
+  let steps = runner_steps(o, pass, src, root, tmp)
+  warn_steps(steps)
+  cli_toolchain.ensure_built(t)!
+  cli_test_query.append(t, runner_srcs(src, steps), o.list, o.deps, o.only, tmp).map(u => 0)
+}
+
 # The entry, then its `tests/` sibling, then the package's unreachable test files.
 fn run_all(t: Toolchain, b: Backend, o: TestOpts, src: String, root: String, tmp: String) : Result[
   Int,
@@ -188,6 +250,8 @@ fn run_all(t: Toolchain, b: Backend, o: TestOpts, src: String, root: String, tmp
     let _ = env.set(cli_guard_memo.TOOLCHAIN_ENV, cli_guard_memo.toolchain_digest(t.layout.kaic2))
     let _ = env.set(cli_guard_memo.CORE_ENV, cli_guard_memo.core_digest(t.layout.kaic2, tmp))
   }
+  let steps = runner_steps(o, pass, src, root, tmp)
+  if o.deps { cli_test_query.append(t, runner_srcs(src, steps), false, true, [], tmp)! }
   let entry_status = if src == "" {
     0
   } else {
@@ -195,16 +259,6 @@ fn run_all(t: Toolchain, b: Backend, o: TestOpts, src: String, root: String, tmp
     cli_compile.compile(t, b, cli_blocks.runner_job(pass, entry, tmp))!
     cli_blocks.run_binary(src, entry.out, tmp)
   }
-  let tests = cli_blocks.tests_of(
-    if src == "" { cli_manifest.source_root(root) } else { cli_fs.dirname(src) },
-    root
-  )
-  let pkg = if root == "" {
-    []
-  } else {
-    cli_blocks.package_steps(root, src, pass, not list.is_empty(tests), tmp)
-  }
-  let steps = (tests | (tf => tests_dir_step(o, tmp, tf))) ++ pkg
   cli_prebuild.run(t, b, pass, jobs_of(o), steps, entry_status, tmp, src != "")
 }
 
@@ -271,7 +325,11 @@ fn run_suite(
     [s, ..._] if s == "./..." or s == "..." -> Ok(recursive(t, o, rec ++ o.extra, logs))
     _ -> {
       let target = cli_blocks.target(rest, "test")!
-      let status = run_all(t, b, o, target.fst, target.snd, tmp)!
+      let status = if o.list {
+        list_all(t, o, target.fst, target.snd, tmp)!
+      } else {
+        run_all(t, b, o, target.fst, target.snd, tmp)!
+      }
       Ok(verdict(o, logs, status))
     }
   }
@@ -291,6 +349,8 @@ fn suite(
       let _ = env.set("KAI_TEST_ONLY", string.join(o.only, "\n"))
     }
     if o.json { let _ = env.set("KAI_TEST_JSON", "1") }
+    if o.list { let _ = env.set(LIST_ENV, "1") }
+    if o.deps { let _ = env.set(DEPS_ENV, "1") }
     if o.coverage { let _ = env.set(cli_blocks.COVERAGE_ENV, "1") }
     cli_fs.with_scratch(tmp => run_suite(t, o, rest, tmp))
   }
@@ -306,6 +366,8 @@ pub fn test_verb(
       TestOpts {
         json: false,
         coverage: false,
+        list: false,
+        deps: false,
         only: [],
         backend: "",
         jobs: 0,
@@ -315,8 +377,17 @@ pub fn test_verb(
     )!
   let o = parsed.fst
   if o.coverage and (not o.json) { cli_err.die("--coverage needs --json")! }
+  if (o.list or o.deps) and (not o.json) { cli_err.die("--list and --deps need --json")! }
   match cli_caches.env_or(cli_group.BUILD_ONLY, "") {
-    "" -> suite(t, o, parsed.snd)
+    "" -> suite(
+      t,
+      TestOpts {
+        ...o,
+        list: o.list or cli_caches.env_or(LIST_ENV, "") != "",
+        deps: o.deps or cli_caches.env_or(DEPS_ENV, "") != ""
+      },
+      parsed.snd
+    )
     out -> cli_group.build_only(t, o.backend, o.extra, parsed.snd, out)
   }
 }

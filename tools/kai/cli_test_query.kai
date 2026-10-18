@@ -1,0 +1,139 @@
+#[doc("""
+`kai test --list` and `--deps`: what a run would report, from parsing
+and import resolution alone. A runner's blocks come from `kaic2
+--list-tests`; the files its build reads, from `kaic2 --guard-inputs`,
+the listing the build's own import resolution produces.
+""")]
+
+import os.env
+import cli_blocks
+import cli_caches
+import cli_compile
+import cli_fs
+import cli_manifest
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+fn quote_char(c: Char) : String =
+  match c {
+    '"' -> "\\\""
+    '\\' -> "\\\\"
+    '\n' -> "\\n"
+    '\r' -> "\\r"
+    '\t' -> "\\t"
+    _ -> string.from_chars([c])
+  }
+
+fn quote(s: String) : String = "\"#{string.chars(s) | quote_char |> string.join("")}\""
+
+fn quoted_list(xs: [String]) : String = "[#{xs | quote |> string.join(",")}]"
+
+# The package files are named from this root: the manifest's dir, else the cwd.
+fn package_dir(src: String) : String / Ffi =
+  cli_manifest.find_dir(cli_fs.absolute(cli_fs.dirname(src))).unwrap_or(cli_sys.cwd())
+
+fn under(root: String, p: String) : Option[String] = string.drop_prefix(p, "#{root}/")
+
+fn kaic2_lines(
+  t: Toolchain,
+  src: String,
+  mode: [String],
+  tmp: String
+) : Result[[String], Int] / Stderr + Env + File + Ffi {
+  let flags = cli_compile.front_flags(t, src, tmp)!
+  let r = cli_proc.capture(
+    [t.layout.kaic2, ...flags] ++ mode ++ [cli_fs.absolute(src)],
+    cli_proc.Spawn { ...cli_proc.inherit(), unset: ["KAI_TRACE_RC"] },
+    "#{tmp}/query.out"
+  )
+  if r.fst != 0 { Err(r.fst) } else { Ok(string.split(r.snd, "\n") |? (l => l != "")) }
+}
+
+# The sorted, deduplicated files the build of `src` reads: the package's, spelled as a block id spells its file, then the rest as kaic2 spells them.
+fn read_files(
+  t: Toolchain,
+  src: String,
+  tmp: String
+) : Result[([String], [String]), Int] / Stderr + Env + File + Ffi {
+  let root = package_dir(src)
+  let manifest = "#{root}/kai.toml"
+  let listed = kaic2_lines(t, src, ["--guard-inputs"], tmp)!
+    |? (l => not string.starts_with(l, "-"))
+  let all = [abspath(src), ...listed] ++ (if cli_sys.is_file(manifest) { [abspath(manifest)] } else { [] })
+  let physical = abspath(root)
+  let own = all || (f => under(physical, f).map(rel => [cli_blocks.test_id("#{root}/#{rel}")]).unwrap_or([]))
+  let external = all |? (f => under(physical, f).is_none())
+  Ok((list.uniq(list.sort(own)), list.uniq(list.sort(external))))
+}
+
+#[doc("The `{\"type\":\"deps\",...}` record of the runner built from `src`, which a run names `label`.")]
+pub fn deps_record(
+  t: Toolchain,
+  src: String,
+  label: String,
+  tmp: String
+) : Result[String, Int] / Stderr + Env + File + Ffi {
+  let files = read_files(t, src, tmp)!
+  Ok(
+    "{\"type\":\"deps\",\"file\":#{quote(label)},\"sources\":#{quoted_list(files.fst)},\"external\":#{quoted_list(files.snd)}}"
+  )
+}
+
+#[doc("The `{\"type\":\"test\",...}` records of the blocks the runner built from `src` would run, one line each.")]
+pub fn test_records(
+  t: Toolchain,
+  src: String,
+  tmp: String
+) : Result[[String], Int] / Stderr + Env + File + Ffi =
+  kaic2_lines(t, src, ["--list-tests", cli_blocks.test_id(src)], tmp)
+
+fn names(record: String, id: String) : Bool =
+  string.starts_with(record, "{\"type\":\"test\",\"id\":#{quote(id)},")
+
+fn chosen(only: [String], record: String) : Bool =
+  list.is_empty(only) or list.any(only, id => names(record, id))
+
+# One runner's records: its deps, then the blocks it would run.
+fn records(
+  t: Toolchain,
+  src: String,
+  want_list: Bool,
+  want_deps: Bool,
+  only: [String],
+  tmp: String
+) : Result[[String], Int] / Stderr + Env + File + Ffi {
+  let d = if want_deps { [deps_record(t, src, cli_blocks.test_id(src), tmp)!] } else { [] }
+  let l = if want_list { test_records(t, src, tmp)! |? (r => chosen(only, r)) } else { [] }
+  Ok(d ++ l)
+}
+
+fn append_lines(lines: [String]) : Unit / Env + File {
+  let log = cli_caches.env_or("KAI_TEST_JSON_LOG", "")
+  if log != "" and (not list.is_empty(lines)) {
+    let _ = write_file(log, cli_fs.read_or_empty(log) ++ string.join(lines, "\n") ++ "\n")
+  }
+}
+
+#[doc("""
+Add to the run's record log, for each runner built from `srcs`, its deps
+record (`want_deps`) and the records of the blocks it would run that `only`
+selects, all when empty (`want_list`).
+""")]
+pub fn append(
+  t: Toolchain,
+  srcs: [String],
+  want_list: Bool,
+  want_deps: Bool,
+  only: [String],
+  tmp: String
+) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  match srcs {
+    [] -> Ok(())
+    _ if cli_sys.pending_signal() != 0 -> Ok(())
+    [src, ...rest] -> {
+      append_lines(records(t, src, want_list, want_deps, only, tmp)!)
+      append(t, rest, want_list, want_deps, only, tmp)
+    }
+  }
+}
