@@ -1,0 +1,604 @@
+#[doc("Typer support: infer_apply.")]
+
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_names
+import compiler.infer_unit_alias
+import compiler.tycon_scheme_home
+import compiler.tycon_ref
+import compiler.scalar_ty
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_arms_vec
+import compiler.infer_dump_text
+
+# Each nominal head's module slot comes from `hv`, so an annotation
+# agrees with the constructor scheme and the record table on which
+# declaration a name denotes.
+#[doc("Typer-internal helper `inf_resolve_ty` shared across the infer modules.")]
+pub fn inf_resolve_ty(t: TypeExpr, hv: TyHomeView) : Ty {
+  match t.tkind {
+    TyName(th, targs) -> match undeclared_ty_named(ref_name(th), SnValue) {
+      Some(t) -> t
+      None ->
+        if ref_is_cont(th) { tsh_tycon_at(hv, th, cont_full_args(th, inf_resolve_args_rk(targs, [2], 0, [], hv))) }
+        else { tsh_tycon_at(hv, th, inf_resolve_ty_list(targs, hv)) }
+    }
+    TyParam(id, targs) -> tparam_use([], id, inf_resolve_ty_list(targs, hv))
+    TyList(inner) -> TyListT(inf_resolve_ty(inner, hv))
+    TyFn(fps, fret, rexpr) -> TyFnT(inf_resolve_ty_list(fps, hv), inf_resolve_ty(fret, hv), inf_row_of_expr(rexpr, hv))
+    # dimensioned base type. The unit goes through unit_canon
+    # (with empty alias and tparam contexts here) so two textually
+    # different but algebraically equal forms compare equal under unify.
+    TyDim(base, u) -> TyDimT(inf_resolve_ty(base, hv), unit_canon(u))
+    # preserve the refinement on the semantic side.
+    # `TyRefineT(b, p)` ⊑ `b` in the unifier (upcast); narrowing
+    # requires explicit `ensure(...)` or a match-arm `: RefinedT`.
+    TyRefine(base, p) -> TyRefineT(inf_resolve_ty(base, hv), p)
+    # a compound row reaching *type* position (not dissolved
+    # by alias substitution) — resolve to no declaration so the
+    # natural "unknown type" cascade reports it.
+    TyRow(_) -> TyCon(sym_none(), [])
+    TySurface(_) -> panic("inf_resolve_ty: surface type not lowered")
+  }
+}
+
+
+fn inf_resolve_ty_list(ts: [TypeExpr], hv: TyHomeView) : [Ty] =
+  map(ts, (t) => inf_resolve_ty(t, hv))
+
+
+# Annotation resolution that honours the per-type row-kind table: a
+# `T[..., e]` slot the type declares row-kind resolves to a row carrier
+# so `let s : Stream[String, File + ReadFault]` unifies with the
+# inferred carrier. Without the table this path can't tell `Console`
+# (an effect) from a type in argument position, so it falls back to
+# `inf_resolve_ty` for non-row-kind slots and types with no table entry.
+#[doc("Typer-internal helper `inf_resolve_ty_rk` shared across the infer modules.")]
+pub fn inf_resolve_ty_rk(t: TypeExpr, table: [RowKindEntry], hv: TyHomeView) : Ty {
+  match t.tkind {
+    TyName(th, targs) ->
+      match row_kind_slots_of(table, th, hv) {
+        [] -> inf_resolve_ty(t, hv)
+        idxs -> tsh_tycon_at(hv, th, cont_full_args(th, inf_resolve_args_rk(targs, idxs, 0, table, hv)))
+      }
+    TyList(inner) -> TyListT(inf_resolve_ty_rk(inner, table, hv))
+    _ -> inf_resolve_ty(t, hv)
+  }
+}
+
+
+fn inf_resolve_args_rk(targs: [TypeExpr], idxs: [Int], i: Int, table: [RowKindEntry],
+                       hv: TyHomeView) : [Ty] {
+  match targs {
+    [] -> []
+    [a, ...rest] -> {
+      let resolved = if list_has_int(idxs, i) { inf_resolve_row_arg(a, hv) }
+                     else { inf_resolve_ty_rk(a, table, hv) }
+      [resolved, ...inf_resolve_args_rk(rest, idxs, i + 1, table, hv)]
+    }
+  }
+}
+
+
+# A row-kind argument slot in an annotation: `Console`, `File + Fail`,
+# or a bare row var. Resolves to a row carrier matching the inferred one.
+#[doc("Typer-internal helper `inf_resolve_row_arg` shared across the infer modules.")]
+pub fn inf_resolve_row_arg(a: TypeExpr, hv: TyHomeView) : Ty = match a.tkind {
+  TyRow(rexpr) -> row_arg_carrier(inf_row_of_expr(rexpr, hv))
+  TyName(eff, []) -> row_arg_carrier(Row { labels: [row_label(ref_sym(eff), [])], tail: None, display_alias: None })
+  _ -> inf_resolve_ty(a, hv)
+}
+
+
+
+#[doc("Typer-internal helper `inf_row_labels_of_rls` shared across the infer modules.")]
+pub fn inf_row_labels_of_rls(ls: [RowLabel], hv: TyHomeView) : [Label] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(r, ts) -> [
+        row_label(ref_sym(r), inf_resolve_ty_list(ts, hv)),
+        ...inf_row_labels_of_rls(rest, hv)
+      ]
+    }
+  }
+}
+
+
+# A parsed row with no row-var binding context: an open tail gets the
+# placeholder id -1. Callers that bind row vars use
+# `row_of_expr_with_binds`.
+fn inf_row_of_expr(re: RowExpr, hv: TyHomeView) : Row {
+  match re {
+    REmpty -> inf_row_empty()
+    RClosed(labels) -> Row {
+      labels: inf_row_labels_of_rls(labels, hv),
+      tail: None,
+      display_alias: None
+    }
+    ROpen(_, labels) -> Row {
+      labels: inf_row_labels_of_rls(labels, hv),
+      tail: Some(-1),
+      display_alias: None
+    }
+  }
+}
+
+
+
+# parallel walker that *also* chases UVar bindings through the
+# substitution. `seen` keeps the recursion linear by short-circuiting
+# any cycle (occurs check is the real guard; this is just defence).
+fn unit_resolve_to_at(u: UnitExprT, scale: Int, t: UTable, s: Subst, seen: [Int]) : UTable {
+  match u {
+    UOne -> t
+    USym(sm) -> UTable { syms: usym_insert(t.syms, sm, scale), vars: t.vars }
+    UParam(p) -> UTable { syms: usym_insert(t.syms, unit_param_atom(p), scale), vars: t.vars }
+    UVar(v) -> {
+      if list_has_int(seen, v) {
+        UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
+      } else {
+        match subst_unit_lookup(s, v) {
+          Some(u_sub) -> unit_resolve_to_at(u_sub, scale, t, s, [v, ...seen])
+          None -> UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
+        }
+      }
+    }
+    UMul(a, b) -> unit_resolve_to_at(b, scale, unit_resolve_to_at(a, scale, t, s, seen), s, seen)
+    UInv(a) -> unit_resolve_to_at(a, 0 - scale, t, s, seen)
+    UPow(a, n) -> unit_resolve_to_at(a, scale * n, t, s, seen)
+    UJoin(a, b) -> unit_resolve_to_at(b, scale, unit_resolve_to_at(a, scale, t, s, seen), s, seen)
+    UDims(us) -> units_resolve_to_at(us, scale, t, s, seen)
+  }
+}
+
+
+fn units_resolve_to_at(us: [UnitExprT], scale: Int, t: UTable, s: Subst, seen: [Int]) : UTable = match us {
+  [] -> t
+  [u, ...rest] -> units_resolve_to_at(rest, scale, unit_resolve_to_at(u, scale, t, s, seen), s, seen)
+}
+
+
+# Apply the unit substitution to a UnitExprT: each UVar(n) is chased
+# through unit_slots to its current binding (if any), and the resolved
+# tree is canonicalised. This is the unit-side analogue of apply_ty
+# and must be called before any structural decision about a unit.
+# The head is chased without table conversion first, so a variable
+# bound to a positional list surfaces intact.
+#[doc("Typer-internal helper `apply_unit` shared across the infer modules.")]
+pub fn apply_unit(s: Subst, u: UnitExprT) : UnitExprT {
+  match unit_resolve_hab_head(s, u, []) {
+    UDims(us) -> UDims(apply_units(s, us))
+    r -> utable_to_tree(unit_to_table_resolved(r, s))
+  }
+}
+
+
+fn apply_units(s: Subst, us: [UnitExprT]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [apply_unit(s, u), ...apply_units(s, rest)]
+}
+
+
+# Chase a top-level UVar chain to its binding without converting to a
+# table, so a positional-list binding is seen as such. `seen` guards
+# against cycles (the occurs check is the real guard).
+fn unit_resolve_hab_head(s: Subst, u: UnitExprT, seen: [Int]) : UnitExprT = match u {
+  UVar(v) ->
+    if list_has_int(seen, v) { u }
+    else { match subst_unit_lookup(s, v) {
+      Some(b) -> unit_resolve_hab_head(s, b, [v, ...seen])
+      None -> u
+    } }
+  _ -> u
+}
+
+
+# Walk the unit, chasing UVar bindings through `s.unit_slots`. The
+# Bool guard prevents cycles by remembering which uvars we've already
+# expanded on the current path; a cycle indicates a bug elsewhere
+# (occurs check should have caught it) and we treat it as identity.
+#[doc("Typer-internal helper `unit_to_table_resolved` shared across the infer modules.")]
+pub fn unit_to_table_resolved(u: UnitExprT, s: Subst) : UTable =
+  unit_resolve_to_at(u, 1, utable_empty(), s, [])
+
+
+# Occurs check: does unit-var `v` appear (after substitution chase) in
+# `u`? Refuses self-binding to keep apply_unit terminating.
+fn occurs_unit(v: Int, u: UnitExprT, s: Subst) : Bool {
+  let tab = unit_to_table_resolved(u, s)
+  occurs_unit_in_vars(v, tab.vars)
+}
+
+
+# Dimension-unification dispatch seam. Positional lists (`<m, n>`)
+# unify point to point before any table forms; after that the kind's
+# theory selects the engine: Semilattice kinds ride the subsumption
+# join (`unify_semilattice`), nominal-slot kinds (Module and Composition
+# atoms, Dim's value indices) identity-plus-binding (`unify_nominal`),
+# everything else the abelian solver. Composition's order and summed
+# measure are formation invariants of the composed type, not this seam.
+#[doc("Typer-internal helper `unify_dim` shared across the infer modules.")]
+pub fn unify_dim(u1: UnitExprT, u2: UnitExprT, s: Subst) : Option[Subst] / Mutable {
+  let h1 = unit_resolve_hab_head(s, u1, [])
+  let h2 = unit_resolve_hab_head(s, u2, [])
+  match h1 {
+    UDims(xs) -> match h2 {
+      UDims(ys) -> unify_dims(xs, ys, s)
+      UVar(v) -> bind_unit_dims(v, xs, s)
+      _ -> None
+    }
+    _ -> match h2 {
+      UDims(ys) -> match h1 {
+        UVar(v) -> bind_unit_dims(v, ys, s)
+        _ -> None
+      }
+      _ -> {
+        let t1 = unit_to_table_resolved(h1, s)
+        let t2 = unit_to_table_resolved(h2, s)
+        if utable_semilattice_theory(t1, s) or utable_semilattice_theory(t2, s) {
+          unify_semilattice(t1, t2, s)
+        } else if utable_first_order(t1, s) or utable_first_order(t2, s) {
+          unify_nominal(t1, t2, s)
+        } else {
+          unify_abelian_diff(utable_diff(t1, t2), s)
+        }
+      }
+    }
+  }
+}
+
+
+fn unify_dims(xs: [UnitExprT], ys: [UnitExprT], s: Subst) : Option[Subst] / Mutable = match xs {
+  [] -> match ys { [] -> Some(s) _ -> None }
+  [x, ...xr] -> match ys {
+    [] -> None
+    [y, ...yr] -> match unify_dim(x, y, s) {
+      None -> None
+      Some(s1) -> unify_dims(xr, yr, s1)
+    }
+  }
+}
+
+
+# Bind a unit variable to a whole positional list. The occurs check
+# and the kind gate both read the merged component table, which
+# carries exactly the sym/var sets each needs.
+fn bind_unit_dims(v: Int, us: [UnitExprT], s: Subst) : Option[Subst] / Mutable {
+  let bound = UDims(us)
+  if occurs_unit(v, bound, s) { None }
+  else {
+    match unit_kind_gate(s, v, bound) {
+      None -> None
+      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
+    }
+  }
+}
+
+
+fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
+  if utable_is_one(t) { Some(s) }
+  else {
+    match utable_pick_min_var(t) {
+      None -> None                                 # only syms left, but non-zero — fail
+      Some(pick) -> {
+        let rest = utable_drop_var(t, pick.id)
+        let k = pick.exp
+        if utable_all_divisible(rest, k) {
+          # Bind `pick.id := (-rest) / k`. occurs check guards against
+          # self-cycle (would be unusual since we removed the var).
+          let bound = utable_to_tree(utable_negdiv(rest, k))
+          if occurs_unit(pick.id, bound, s) { None }
+          else {
+            match unit_kind_gate(s, pick.id, bound) {
+              None -> None
+              Some(s1) -> Some(subst_unit_extend(s1, pick.id, bound))
+            }
+          }
+        } else {
+          # Pivot does not cleanly divide the remainder. The classical
+          # Kennedy/Stuckey fix introduces a fresh unit-var w and
+          # rewrites `pick := w * (low/k)` so the residual equation
+          # uses smaller exponents. The lane fixtures don't exercise
+          # this path (every case the lane ships pivots with |k|=1).
+          # Refuse here so the failure is loud rather than silent —
+          # see docs/units-of-measure.md §Risks "polynomial" guarantee.
+          None
+        }
+      }
+    }
+  }
+}
+
+
+# Apply the substitution to a type. Recurses structurally; resolves
+# `TyVarT(n)` via subst_lookup, then recurses on the replacement so a
+# chained binding `?t0 -> ?t1 -> Int` collapses to `Int`.
+#[doc("Typer-internal helper `apply_ty` shared across the infer modules.")]
+pub fn apply_ty(s: Subst, t: Ty) : Ty = match apply_ty_opt(s, t) {
+  None      -> t
+  Some(t1)  -> t1
+}
+
+
+# `None` means the substitution left the subtree untouched, so callers
+# keep the input node instead of rebuilding an identical one. Nominal
+# types with no arguments (`Int`, `Decl`) dominate the annotation sites,
+# and rebuilding them allocates a fresh node per call for nothing.
+fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
+  match t {
+    TyInt    -> None
+    TyReal   -> None
+    TyBool   -> None
+    TyString -> None
+    TyChar   -> None
+    TyUnit   -> None
+    TyByte     -> None
+    TyInt32    -> None
+    TyUInt32   -> None
+    TyUInt64   -> None
+    TyInt128   -> None
+    TyHandle   -> None
+    TyAny    -> None
+    TyVarT(n) -> match subst_lookup(s, n) {
+      Some(t2) -> Some(apply_ty(s, t2))
+      None     -> None
+    }
+    TyListT(inner) -> match apply_ty_opt(s, inner) {
+      None      -> None
+      Some(i1)  -> Some(TyListT(i1))
+    }
+    TyFnT(params, ret, row) -> {
+      let ps = apply_tys_opt(s, params)
+      let rt = apply_ty_opt(s, ret)
+      let rw = apply_row_opt(s, row)
+      match ps {
+        None -> match rt {
+          None -> match rw {
+            None      -> None
+            Some(rw1) -> Some(TyFnT(params, ret, rw1))
+          }
+          Some(rt1) -> Some(TyFnT(params, rt1, opt_row_or(rw, row)))
+        }
+        Some(ps1) -> Some(TyFnT(ps1, opt_ty_or(rt, ret), opt_row_or(rw, row)))
+      }
+    }
+    TyCon(sid, atys) -> match apply_tys_opt(s, atys) {
+      None      -> None
+      Some(as1) -> Some(TyCon(sid, as1))
+    }
+    # Once the shape var binds to a constructor witness, reconstruct the
+    # concrete applied type (`s := List, A := Int` → `TyListT(Int)`), so
+    # a resolved `TyShapeApp` never survives past substitution. Unbound,
+    # only the argument is walked.
+    TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
+      Some(wit) -> Some(shape_reapply(apply_ty(s, wit), apply_ty(s, arg)))
+      None      -> match apply_ty_opt(s, arg) {
+        None      -> None
+        Some(a1)  -> Some(TyShapeApp(sv, a1))
+      }
+    }
+    # applying a substitution to a dimensioned type recurses into
+    # both the base type and the unit expression. Unit-vars chase
+    # through unit_slots; everything else passes through unchanged.
+    # `dim_collapse` normalises, so it runs even when nothing was
+    # substituted.
+    TyDimT(base, u) -> Some(dim_collapse(apply_ty(s, base), apply_unit(s, u)))
+    # substitutions don't touch the predicate Expr (it
+    # references value-level identifiers, not Ty vars); just recurse
+    # through the base.
+    TyRefineT(base, p) -> match apply_ty_opt(s, base) {
+      None      -> None
+      Some(b1)  -> Some(TyRefineT(b1, p))
+    }
+    # substitute through each component then
+    # re-normalise. A substitution can change a component's mangled
+    # form (e.g. `?t0` → `Int`), which can re-order the canonical
+    # list and uncover new duplicates that idempotence collapses.
+    TyUnion(parts) -> Some(normalize_union(map(parts, (p) => apply_ty(s, p))))
+  }
+}
+
+
+#[doc("Typer-internal helper `apply_tys` shared across the infer modules.")]
+pub fn apply_tys(s: Subst, ts: [Ty]) : [Ty] = match apply_tys_opt(s, ts) {
+  None      -> ts
+  Some(ts1) -> ts1
+}
+
+
+# `None` keeps the caller's list. A spine is only rebuilt once an
+# element actually changed; the prefix before it is shared verbatim.
+fn apply_tys_opt(s: Subst, ts: [Ty]) : Option[[Ty]] {
+  match ts {
+    [] -> None
+    [t, ...rest] -> match apply_ty_opt(s, t) {
+      Some(t1) -> Some([t1, ...apply_tys(s, rest)])
+      None     -> match apply_tys_opt(s, rest) {
+        None       -> None
+        Some(rest1) -> Some([t, ...rest1])
+      }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `apply_label_args_opt` shared across the infer modules.")]
+pub fn apply_label_args_opt(s: Subst, l: Label) : Option[Label] =
+  match apply_tys_opt(s, l.ty_args) {
+    None      -> None
+    Some(as1) -> Some(Label { ...l, ty_args: as1 })
+  }
+
+
+#[doc("Typer-internal helper `apply_labels` shared across the infer modules.")]
+pub fn apply_labels(s: Subst, ls: [Label]) : [Label] = match apply_labels_opt(s, ls) {
+  None      -> ls
+  Some(ls1) -> ls1
+}
+
+
+#[doc("Typer-internal helper `apply_labels_opt` shared across the infer modules.")]
+pub fn apply_labels_opt(s: Subst, ls: [Label]) : Option[[Label]] {
+  match ls {
+    [] -> None
+    [h, ...rest] -> match apply_label_args_opt(s, h) {
+      Some(h1) -> Some([h1, ...apply_labels(s, rest)])
+      None     -> match apply_labels_opt(s, rest) {
+        None        -> None
+        Some(rest1) -> Some([h, ...rest1])
+      }
+    }
+  }
+}
+
+
+# Resolve a row under the current substitution: apply_ty to each
+# label payload, and chase the tail var if it's bound.
+#[doc("Typer-internal helper `apply_row` shared across the infer modules.")]
+pub fn apply_row(s: Subst, r: Row) : Row = match apply_row_opt(s, r) {
+  None     -> r
+  Some(r1) -> r1
+}
+
+
+# `None` means neither the labels nor the tail moved, so the row is
+# returned as-is rather than copied field by field.
+fn apply_row_opt(s: Subst, r: Row) : Option[Row] {
+  let labels1 = apply_labels_opt(s, r.labels)
+  match r.tail {
+    None -> match labels1 {
+      None     -> None
+      Some(ls) -> Some(Row { labels: ls, tail: None, display_alias: r.display_alias })
+    }
+    Some(v) -> match subst_row_lookup(s, v) {
+      None -> match labels1 {
+        None     -> None
+        Some(ls) -> Some(Row { labels: ls, tail: Some(v), display_alias: r.display_alias })
+      }
+      Some(r2) -> {
+        let r2r = apply_row(s, r2)
+        Some(Row {
+          labels: label_concat(opt_labels_or(labels1, r.labels), r2r.labels),
+          tail: r2r.tail,
+          display_alias: r.display_alias
+        })
+      }
+    }
+  }
+}
+
+
+# Hanga Roa modular typecheck: partition a post-cascade flat decl
+# stream into per-module sub-streams. Each decl is attributed to
+# its declaring module based on its OWN `module_origin` field (or
+# the target's basename when the field is `None`); the result is a
+# list of `ModuleDecls` in first-appearance order so the typer
+# fold processes cores in the order the loader saw them, and
+# the target file last.
+#
+# This deliberately does NOT reuse `imports_home_anchors` — that
+# walker propagates the running home backward to fix up untagged
+# DTypes at module boundaries, which is correct for the pub-access
+# table but wrong here. We need a static, decl-local rule so a
+# post-cascade decl interleaved (e.g. a target-file fn sitting
+# between a core's last DFn and its later-emitted protocol
+# impl methods) lands in its own bucket instead of being absorbed
+# by the surrounding core's home.
+#
+# The partition is structural — once it runs, the typer can no
+# longer see a core module's records leaking into the target
+# (or vice versa).
+#[doc("infer: partition a post-cascade flat decl stream into per-module sub-streams, attributing each decl to its declaring module.")]
+pub fn partition_decls_by_home(decls: [Decl], target_mod: String) : [ModuleDecls] =
+  target_bucket_last(partition_by_homes_loop(decls, target_mod, []), target_mod)
+
+
+# Bucket each decl under its home module. Buckets keep first-appearance
+# order; within a bucket decls keep source order.
+fn partition_by_homes_loop(decls: [Decl], target_mod: String,
+                              acc: [HomeBucket]) : [ModuleDecls] =
+  buckets_finish(partition_by_homes_walk(decls, target_mod, "__builtin__", acc), [])
+
+
+# Walk decls left-to-right, threading the running anchor: the home of
+# the nearest decl that names one, which a decl with no origin slot
+# inherits. The starting anchor is `__builtin__`.
+fn partition_by_homes_walk(decls: [Decl], target_mod: String,
+                              current_anchor: String,
+                              acc: [HomeBucket]) : [HomeBucket] = match decls {
+  [] -> acc
+  [d, ...rest_d] -> {
+    let explicit = decl_explicit_module_origin(d)
+    let anchor1 = match explicit {
+      Some(m) -> m
+      None    -> current_anchor
+    }
+    let home = decide_partition_home(d, target_mod, anchor1)
+    let next_anchor = if home == target_mod { target_mod } else { anchor1 }
+    let acc1 = bucket_push(acc, home, d, [])
+    partition_by_homes_walk(rest_d, target_mod, next_anchor, acc1)
+  }
+}
+
+
+# A bucket under construction. BOTH axes are held reversed —
+# newest bucket first, newest decl first — so a push is O(1) on the
+# common path instead of copying a spine. Decls arrive in runs that
+# share a home, so the run's bucket is the one just created and sits
+# at the head. `buckets_finish` is the only way back to
+# `ModuleDecls`; it undoes both reversals, so first-appearance order
+# of buckets and source order of decls are restored exactly once and
+# no caller can observe the working representation.
+type HomeBucket = { home: String, rev_decls: [Decl] }
+
+
+# Push `d` onto the bucket named `home`, creating it at the head when
+# absent. An existing bucket keeps its position; `done` carries the
+# scanned prefix reversed so the rebuild costs only the buckets the
+# scan actually passed.
+fn bucket_push(acc: [HomeBucket], home: String, d: Decl,
+                  done: [HomeBucket]) : [HomeBucket] = match acc {
+  [] -> [HomeBucket { home: home, rev_decls: [d] }, ...list_reverse(done)]
+  [m, ...rest] ->
+    if m.home == home {
+      prepend_reverse_buckets(done,
+        [HomeBucket { home: home, rev_decls: [d, ...m.rev_decls] }, ...rest])
+    } else {
+      bucket_push(rest, home, d, [m, ...done])
+    }
+}
+
+
+fn prepend_reverse_buckets(xs: [HomeBucket], acc: [HomeBucket]) : [HomeBucket] =
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_buckets(rest, [x, ...acc])
+  }
+
+
+# Undo both reversals: bucket order and, inside each bucket, decl
+# order.
+fn buckets_finish(acc: [HomeBucket], out: [ModuleDecls]) : [ModuleDecls] =
+  match acc {
+    [] -> out
+    [m, ...rest] ->
+      buckets_finish(rest,
+        [ModuleDecls { name: Some(m.home), decls: list_reverse(m.rev_decls) },
+         ...out])
+  }
+
+
+#[doc("infer: `list_has_int` — typer entry point invoked by the driver.")]
+pub fn list_has_int(xs: [Int], n: Int) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> if h == n { true } else { list_has_int(rest, n) }
+  }
+}
+

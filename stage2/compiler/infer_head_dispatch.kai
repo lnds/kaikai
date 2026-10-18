@@ -1,0 +1,931 @@
+#[doc("Typer support: infer_head_dispatch.")]
+
+import compiler.util
+import compiler.diag
+import compiler.edition
+import compiler.ast
+import compiler.written
+import compiler.core_builtins
+import compiler.operators
+import compiler.core_refs
+import compiler.core_protos
+import compiler.impl_identity
+import compiler.proto_ids
+import compiler.mutation_carriers
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.pipe_fusion
+import compiler.infer_unit_alias
+import compiler.tycon_scheme_home
+import compiler.scope_view
+import compiler.core_modules
+import compiler.homonym
+import compiler.core_effects
+import compiler.scalar_ty
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_state
+import compiler.infer_call_labels
+
+#[doc("Typer-internal helper `pool_answer` shared across the infer modules.")]
+pub fn pool_answer(st: InferState, target_ty: Ty, r: SvRes) : Settled = match r {
+  SvSym(s)    -> SetOne(s)
+  SvAmbig(ss) -> match tie_break(st, target_ty, ss) {
+    Some(s) -> SetOne(s)
+    None    -> SetTie(ss)
+  }
+  _ -> SetNone
+}
+
+
+# Two ties on one rung are no ambiguity. Cores restate one another's
+# functions over the same parameter (`char_unicode` over `char`), and
+# the core set's order says which stands. Dispatchers of one operation
+# several protocols declare are told apart by the impl that serves the
+# argument's type; an argument no impl serves yet leaves the tie.
+fn tie_break(st: InferState, target_ty: Ty, ss: [SymId]) : Option[SymId] =
+  match sv_last_listed_core(st.env.tab, st_scope(st), ss) {
+    Some(s) -> Some(s)
+    None    -> if op_tie(st, ss) { served_dispatcher(st.protos, target_ty, ss) } else { None }
+  }
+
+
+# The dispatcher, among `ss`, of the protocol whose impl serves the head
+# of `t`.
+fn served_dispatcher(pv: ProtoView, t: Ty, ss: [SymId]) : Option[SymId] = match ss {
+  [] -> None
+  [s, ..._] -> match pid_disp(pv.ids, s) {
+    None    -> None
+    Some(d) -> match pipe_op_impl(pv.impls, t, disp_op(d)) {
+      None    -> None
+      Some(p) -> match pid_op_disp(pv.ids, pir_proto(p), disp_op(d)) {
+        Some(x) -> if any(ss, (y) => sym_same(x, y)) { Some(x) } else { None }
+        None    -> None
+      }
+    }
+  }
+}
+
+
+# A type an earlier error left unknown; that error already answered for it.
+#[doc("Typer-internal helper `ty_unsettled` shared across the infer modules.")]
+pub fn ty_unsettled(t: Ty) : Bool = match ty_dispatch_head(t) {
+  TyAny       -> true
+  TyCon(s, _) -> sym_raw(s) < 0
+  _           -> false
+}
+
+
+# same-prim Real detection used by the `%` typer rule to
+# route `Real % Real` through `impl Rem for Real` (libm `fmod`).
+# Strips Dim / Refine wrappers like `ty_is_concrete_prim` does.
+#[doc("Typer-internal helper `ty_is_real_head` shared across the infer modules.")]
+pub fn ty_is_real_head(t: Ty) : Bool {
+  match t {
+    TyReal -> true
+    TyDimT(inner, _) -> ty_is_real_head(inner)
+    TyRefineT(inner, _) -> ty_is_real_head(inner)
+    _ -> false
+  }
+}
+
+
+# Two operands share a head when they are the same scalar or name one
+# declaration, units and refinements aside. A type with no head (a
+# variable, a function, a union) shares none.
+#[doc("Typer-internal helper `ty_same_head` shared across the infer modules.")]
+pub fn ty_same_head(a: Ty, b: Ty) : Bool = {
+  let ha = ty_dispatch_head(a)
+  let hb = ty_dispatch_head(b)
+  match ha {
+    TyCon(sa, _) -> sym_raw(sa) >= 0 and sym_same(sa, ty_head_sym(hb))
+    TyListT(_)   -> sym_same(core_ty_sym(CtList), ty_head_sym(hb))
+    _ -> match scalar_ty_name(ha) {
+      Some(_) -> inf_ty_eq(ha, hb)
+      None    -> false
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `ty_dispatch_head` shared across the infer modules.")]
+pub fn ty_dispatch_head(t: Ty) : Ty = match t {
+  TyDimT(base, _)    -> ty_dispatch_head(base)
+  TyRefineT(base, _) -> ty_dispatch_head(base)
+  _                  -> t
+}
+
+
+# predicate gating the operator → protocol-method
+# rewrite. Returns true iff BOTH operands have a concrete non-primitive
+# head type. Concrete = not a `TyVar` after substitution; non-primitive
+# = not `Int`, `Real`, or one of those wrapped in `TyDimT` /
+# `TyRefineT`. Mixed cases (`Int + Complex`) fall through to the
+# unify-both-sides rule, which produces the standard mismatch
+# diagnostic.
+#[doc("Typer-internal helper `binop_should_dispatch_proto` shared across the infer modules.")]
+pub fn binop_should_dispatch_proto(lt: Ty, rt: Ty) : Bool =
+  ty_is_concrete_nonprim(lt) and ty_is_concrete_nonprim(rt)
+
+
+
+# heterogeneous-friendly variant. Returns the head
+# of the dispatch receiver (`Self`) when an impl matching the
+# (lhs, rhs) pair exists in the post-lower-protocols snapshot, or
+# None when no such impl is registered. The choice between
+# `(receiver=lhs, arg=rhs)` and `(receiver=rhs, arg=lhs)` is
+# stable: the left operand wins iff `impl P[Rhs] for Lhs` is
+# registered; otherwise the mirror `impl P[Lhs] for Rhs` is tried.
+# Returning Some signals "route to __proto_<op>(l, r) and let the
+# resolver pick the impl". Returning None lets the caller fall
+# through to the unify-and-emit primitive arithmetic path (for
+# matching primitive pairs) or the standard mismatch diagnostic
+# (for everything else).
+#[doc("Typer-internal type `BinopProtoChoice` shared across the infer modules.")]
+pub type BinopProtoChoice = BPC(DispHead, [DispHead])
+#                          recv       proto_args
+
+
+# The dispatch head of `t`: its declaration for a nominal type, the
+# scalar itself for a scalar.
+#[doc("Typer-internal helper `inf_disp_head` shared across the infer modules.")]
+pub fn inf_disp_head(t: Ty) : Option[DispHead] = match ty_dispatch_head(t) {
+  TyCon(s, _) -> Some(DhSym(s))
+  TyListT(_)  -> Some(DhSym(core_ty_sym(CtList)))
+  h           -> match scalar_ty_name(h) {
+    Some(_) -> Some(DhScalar(h))
+    None    -> None
+  }
+}
+
+
+#[doc("Typer-internal helper `impl_pair_exists` shared across the infer modules.")]
+pub fn impl_pair_exists(impls: [ProtoImplReg], proto: SymId, op: String,
+                     recv: DispHead, args: [DispHead]) : Bool {
+  match impls {
+    [] -> false
+    [it, ...rest] ->
+      if pir_answers(it, proto, op, recv, args) { true }
+      else { impl_pair_exists(rest, proto, op, recv, args) }
+  }
+}
+
+
+# `it` is the impl of `proto` that supplies `op` for `recv` with the
+# protocol arguments `args`. An operation has no id of its own: within
+# one protocol its label is all that tells it apart.
+fn pir_answers(it: ProtoImplReg, proto: SymId, op: String,
+               recv: DispHead, args: [DispHead]) : Bool = match it {
+  PIR(_, _, o, _, ans, _, _) ->
+    pir_of_proto(it, proto) and pir_serves(it, recv) and written_text(o) == op and arg_names_match(ans, recv, args)
+}
+
+
+# legacy `impl P for X` is registered with no protocol arguments.
+# For matching purposes treat it as `impl P[X] for X` (i.e. the
+# homogeneous default). The heterogeneous form
+# `impl P[Y] for X` registers `[Y]`; matching is exact.
+#[doc("True when an impl registered with the protocol arguments `reg_args` for the receiver `recv` serves a call whose protocol arguments are `want`.")]
+pub fn arg_names_match(reg_args: [DeclRef], recv: DispHead, want: [DispHead]) : Bool {
+  match reg_args {
+    [] -> match want {
+      [] -> true
+      [w] -> dh_same(w, recv)
+      _ -> false
+    }
+    _ -> refs_name_heads(reg_args, want)
+  }
+}
+
+
+fn refs_name_heads(rs: [DeclRef], hs: [DispHead]) : Bool {
+  match rs {
+    [] -> match hs { [] -> true _ -> false }
+    [r, ...rrest] -> match hs {
+      [] -> false
+      [h, ...hrest] -> dh_ref_is(r, h) and refs_name_heads(rrest, hrest)
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `ty_is_concrete_nonprim` shared across the infer modules.")]
+pub fn ty_is_concrete_nonprim(t: Ty) : Bool {
+  match t {
+    TyInt           -> false
+    TyReal          -> false
+    TyVarT(_)       -> false
+    TyDimT(inner, _)    -> ty_is_concrete_nonprim(inner)
+    TyRefineT(inner, _) -> ty_is_concrete_nonprim(inner)
+    TyCon(_, _)     -> true
+    _               -> false
+  }
+}
+
+
+# A call whose callee is typed as answering `ty`.
+#[doc("Typer-internal helper `call_answering` shared across the infer modules.")]
+pub fn call_answering(call: Expr, ty: Ty) : Expr = match call.kind {
+  ECall(f, args) -> match f.ty {
+    Some(TyFnT(ps, _, row)) -> Expr { ...call, kind: ECall(with_ty(f, TyFnT(ps, ty, row)), args) }
+    _                       -> call
+  }
+  _ -> call
+}
+
+
+# The state once an operator's operands were checked against the impl it
+# dispatches to, and the result type that impl declares.
+#[doc("Typer-internal type `BinopImpl` shared across the infer modules.")]
+pub type BinopImpl = BinopImpl(InferState, Option[Ty])
+
+
+# The dispatcher of the protocol an operator is sugar for, by its id. A
+# typer run with no registry reaches the one the protocol's own module
+# generates.
+#[doc("Typer-internal helper `binop_dispatcher_ref` shared across the infer modules.")]
+pub fn binop_dispatcher_ref(ids: ProtoIds, bp: BinopProto, line: Int, col: Int) : Expr =
+  match op_proto_core(bp) {
+    Some(cp) -> op_dispatcher_ref(ids, cp, op_proto_method(bp), line, col)
+    None     -> panic("infer: an operator with no protocol was dispatched as one")
+  }
+
+
+#[doc("Typer-internal helper `op_dispatcher_ref` shared across the infer modules.")]
+pub fn op_dispatcher_ref(ids: ProtoIds, cp: CoreProto, method: String, line: Int, col: Int) : Expr =
+  match pid_op_ref(ids, core_proto_id(cp), method) {
+    Some(k) -> mk_expr(k, line, col)
+    None    -> mk_sym(pid_fn_id(inf_proto_dispatcher_name(method), Some(core_proto_home(cp)), ""), line, col)
+  }
+
+
+#[doc("Typer-internal helper `impl_sym_for` shared across the infer modules.")]
+pub fn impl_sym_for(impls: [ProtoImplReg], proto: SymId, op: String,
+                recv: DispHead, want: [DispHead]) : Option[SymId] =
+  match impls {
+    [] -> None
+    [it, ...rest] ->
+      if pir_answers(it, proto, op, recv, want) { Some(pir_sym(it)) }
+      else { impl_sym_for(rest, proto, op, recv, want) }
+  }
+
+
+# both operands share a concrete TyCon head and at least one carries
+# a unit decoration — the shapes where protocol dispatch would
+# otherwise erase the units (the impl signature is the bare carrier).
+#[doc("Typer-internal helper `binop_same_head_dimmed` shared across the infer modules.")]
+pub fn binop_same_head_dimmed(lt: Ty, rt: Ty) : Bool =
+  ty_same_head(lt, rt) and (ty_is_dimmed(lt) or ty_is_dimmed(rt))
+
+
+#[doc("Typer-internal helper `ty_is_dimmed` shared across the infer modules.")]
+pub fn ty_is_dimmed(t: Ty) : Bool = match t {
+  TyDimT(_, _) -> true
+  TyRefineT(inner, _) -> ty_is_dimmed(inner)
+  _ -> false
+}
+
+
+# type rule for `*` and `/` over (possibly) dimensioned values.
+# Splits each operand into (base_ty, unit_expr) — bare Real → unit
+# `1`, TyDimT(b, u) → (b, u). The base types are unified; the units
+# are combined into the result.
+#[doc("Typer-internal type `DimSplit` shared across the infer modules.")]
+pub type DimSplit = { base: Ty, dim: UnitExprT }
+
+
+# `x |> f(y, z)` pipes `x` into `f` as its first argument: the typed
+# result is the call `f(x, y, z)`, so no pass after the typer sees `EPipe`.
+# The unify chain is the pipe's own so its diagnostics keep the pipe's span.
+#[doc("Typer-internal type `PipeRes` shared across the infer modules.")]
+pub type PipeRes = { st: InferState, ty: Ty, call: Expr }
+
+
+# Result of `find_head_owner` lookup. Distinguishing the three states
+# at the use site lets the typer print the four error texts
+# verbatim (missing module, missing op, ambiguous, signature mismatch
+# falls through to the standard call-inference path).
+#[doc("Typer-internal type `HeadLookup` shared across the infer modules.")]
+pub type HeadLookup
+  = HLOk(SymId)
+  # Two or more modules declare `pub type Head`. The user must
+  # disambiguate via a qualified annotation on the LHS.
+  | HLAmbiguous([SymId])
+  | HLNone
+
+
+fn find_head_owner_loop(es: [HeadOwnerEntry], head: SymId) : HeadLookup {
+  match es {
+    [] -> HLNone
+    [e, ...rest] -> match e {
+      HOE(s, mods) ->
+        if sym_raw(head) >= 0 and sym_same(s, head) {
+          match mods {
+            [m]      -> HLOk(m)
+            [_, _, ...] -> HLAmbiguous(mods)
+            _        -> HLNone
+          }
+        } else { find_head_owner_loop(rest, head) }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `find_head_owner` shared across the infer modules.")]
+pub fn find_head_owner(env: TyEnv, head: SymId) : HeadLookup =
+  find_head_owner_loop(env.head_owners, head)
+
+# The head-owner cache maps each `pub type T` a module declares to that
+# module, the one its declaration is owned by. A type the root file
+# declares gets no entry: the root has no qualified surface a pipe
+# rewrite can target, so a pipe against it falls through to the "no
+# module declaring type" diagnostic.
+
+
+# A core type is declared by no module, so no walk over the module
+# table discovers its owner. Every head-owner cache carries an entry for
+# each core type that has one, and entry points that build no cache at
+# all still seed them — otherwise `|`, `||` and `|?` over a list are
+# rejected on code the build accepts.
+#[doc("infer: the head-owner entries of the core types, each mapped to the module that owns it.")]
+pub fn head_owner_seed() : [HeadOwnerEntry] =
+  flat_map([CtList, CtVec], (c) => match core_ty_owner(c) {
+    Some(m) -> [HOE(core_ty_sym(c), [core_module_id(m)])]
+    None    -> []
+  })
+
+
+#[doc("infer: `build_head_owner_map` — typer entry point invoked by the driver.")]
+pub fn build_head_owner_map(decls: [Decl], tab: SymTab,
+                         target_mod: String, edition: Edition) : [HeadOwnerEntry] {
+  # gate the convention-based pipe dispatch on
+  # edition >= hanga-roa. Pre-hanga-roa (tongariki) packages keep only
+  # the seeded `List → list` mapping. User `pub type` heads
+  # therefore route through the bare-name fallback in
+  # `synth_pipe_dispatch` ("no module declaring type `T` is in scope"
+  # via HLNone).
+  let walk_user_types = edition_at_least(edition, EdHangaRoa)
+  if walk_user_types {
+    let pub_types = collect_pub_types(decls, [])
+    # Pipes against a `pub type` the root file declares are intentionally
+    # not dispatchable — the rejection diagnostic ("no module declaring
+    # type `T` is in scope") is the design.
+    let from_decls = build_head_owner_loop(pub_types, tab, st_module_id(target_mod), [])
+    list_append(head_owner_seed(), list_append(from_decls, spelled_head_owners(decls, tab, [])))
+  } else {
+    # Tongariki: only the seeded built-in `List → list` participates.
+    # User-defined `pub type T` is invisible to pipe dispatch and the
+    # rejection diagnostic falls through to the standard HLNone path.
+    # Contested entries ride along regardless of edition: they feed
+    # diagnostics (showing a contested name as `mod.T`), which need
+    # the owner even where old-edition dispatch ignores the cache.
+    list_append(head_owner_seed(), spelled_head_owners(decls, tab, []))
+  }
+}
+
+
+# A module's type or effect whose name another declaration of its class
+# shares is not found through an export list, which carries the name
+# alone: its owner is its home. Effects join types here for the
+# diagnostics that show a contested name as `mod.T`.
+#[doc("The home of each contested type and effect a module of `ds` declares, as head-owner entries a diagnostic qualifies names with.")]
+pub fn spelled_head_owners(ds: [Decl], tab: SymTab, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> spelled_head_owners([inner, ...rest], tab, acc)
+    None -> match d {
+      DType(true, s, _, _, _, _, Some(_), _) ->
+        spelled_head_owners(rest, tab, spelled_owner(tab, s, acc))
+      DEffect(_, s, _, _, _, _, _, Some(_)) ->
+        spelled_head_owners(rest, tab, spelled_owner(tab, s, acc))
+      _ -> spelled_head_owners(rest, tab, acc)
+    }
+  }
+}
+
+
+fn spelled_owner(tab: SymTab, s: SymId, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
+  if decl_contested(tab, s) { [HOE(s, [sym_owner(tab, s)]), ...acc] } else { acc }
+
+
+fn decl_contested(tab: SymTab, s: SymId) : Bool = st_valid(tab, s) and sym_contested(tab, s)
+
+
+fn collect_pub_types(ds: [Decl], acc: [SymId]) : [SymId] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> collect_pub_types(rest, collect_pub_type_one(d, acc))
+  }
+}
+
+
+fn collect_pub_type_one(d: Decl, acc: [SymId]) : [SymId] = match d {
+  DType(true, s, _, _, _, _, _, _) ->
+    if sym_in(acc, s) { acc } else { [s, ...acc] }
+  DDerive(_, inner, _, _) -> collect_pub_type_one(inner, acc)
+  DUnstable(inner, _, _) -> collect_pub_type_one(inner, acc)
+  DProtoLaws(_, inner, _, _, _) -> collect_pub_type_one(inner, acc)
+  DImplAxiom(_, inner, _, _, _) -> collect_pub_type_one(inner, acc)
+  DConstructor(inner, _, _) -> collect_pub_type_one(inner, acc)
+  _ -> acc
+}
+
+
+fn sym_in(ss: [SymId], s: SymId) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> sym_same(h, s) or sym_in(rest, s)
+}
+
+
+# The owner of a type is the module its declaration belongs to; a
+# contested type is left to its `spelled_head_owners` entry.
+fn build_head_owner_loop(tys: [SymId], tab: SymTab, root: SymId,
+                          acc: [HeadOwnerEntry]) : [HeadOwnerEntry] {
+  match tys {
+    [] -> acc
+    [s, ...rest] -> {
+      let owner = sym_owner(tab, s)
+      if decl_contested(tab, s) or sym_raw(owner) < 0 or sym_same(owner, root) {
+        build_head_owner_loop(rest, tab, root, acc)
+      } else { build_head_owner_loop(rest, tab, root, [HOE(s, [owner]), ...acc]) }
+    }
+  }
+}
+
+
+# Attach a freshly-built head-owner cache to a `TyEnv`, preserving
+# the rest of the env. Called once per compile from `compile_source`
+# right before the typer runs.
+#[doc("Typer-internal helper `ty_env_with_head_owners` shared across the infer modules.")]
+pub fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
+  TyEnv { ...env, head_owners: hos }
+
+
+# Explicit, typed rejection for the
+# `Option` / `Result` heads. Returns `Some(diagnostic)` for the
+# rejected heads and `None` otherwise so callers can tell apart
+# "rejected by name" from "no module mapping".
+#[doc("Typer-internal helper `pipe_rejection_reason` shared across the infer modules.")]
+pub fn pipe_rejection_reason(head: SymId, pop: PipeOp) : Option[String] {
+  let op = concat_all([core_fn_name(pipe_op_core_fn(pop)), "-pipe `", pipe_op_text(pop), "`"])
+  if core_ty_is(head, CtOption) {
+    Some(concat_all([
+      op, " is not supported on `Option`. Use `!` for ",
+      "propagation (`x!`) or `option.and_then` for explicit chaining."
+    ]))
+  } else if core_ty_is(head, CtResult) {
+    Some(concat_all([
+      op, " is not supported on `Result`. Use `!` for ",
+      "propagation (`x!`) or `result.and_then` for explicit chaining."
+    ]))
+  } else {
+    None
+  }
+}
+
+
+# Shared lowering for `EDispatchPipe`. Resolves the LHS's head type, consults the head-owner
+# cache built once per compile from the module table, rewrites to
+# `<module>.<op>(lhs, f)` when the lookup is unambiguous, and runs the
+# standard call inference path (`synth_call` against an `EModCall`
+# callee — same arms the explicit `list.map(xs, f)` qualified-call
+# form uses).
+#
+# Errors stamp `TyAny` and bump `st.errs` so cascade is graceful and
+# downstream passes don't crash on a missing pipe lowering.
+#
+# Diagnostic shape — the four error textual forms anchor on
+# the user's pipe-call site and stay verbatim across releases so LSP
+# clients can match them:
+#   * "no module declaring type `T` is in scope" (HLNone after the
+#      cache lookup), and
+#   * "module `mod.path` declares `T` but does not export `op`"
+#     (HLOk(mod) but the qualified `mod::op` entry is missing — the
+#     module ships the type but not the canonical fn), and
+#   * "ambiguous head type `T` — `mod_a` and `mod_b` both declare it.
+#     Use qualified type annotation." (HLAmbiguous), and
+#   * the standard call-inference signature mismatch (when `mod::op`
+#     exists but its declared shape does not unify with the pipe's
+#     expected `(T[A], (A) -> ...) -> T[B]`).
+# True when some protocol impl for the head of `t` supplies operation `op`
+# (`impl Sequence for Chain` provides `map`/`foldl` for head `Chain`),
+# so a pipe over that head routes through the protocol.
+#[doc("Typer-internal helper `pipe_op_has_impl` shared across the infer modules.")]
+pub fn pipe_op_has_impl(impls: [ProtoImplReg], t: Ty, op: String) : Bool = match pipe_op_impl(impls, t, op) {
+  Some(_) -> true
+  None    -> false
+}
+
+
+fn pipe_op_impl(impls: [ProtoImplReg], t: Ty, op: String) : Option[ProtoImplReg] = match inf_disp_head(t) {
+  Some(h) -> pipe_op_impl_of(impls, h, op)
+  None    -> None
+}
+
+
+fn pipe_op_impl_of(impls: [ProtoImplReg], h: DispHead, op: String) : Option[ProtoImplReg] = match impls {
+  [] -> None
+  [p, ...rest] -> match p {
+    PIR(_, _, o, _, _, _, _) -> if pir_serves(p, h) and written_text(o) == op { Some(p) } else { pipe_op_impl_of(rest, h, op) }
+  }
+}
+
+
+# The dispatcher of the protocol whose impl for the head of `t` supplies
+# `op`, by its id; none when no impl does, or when its protocol resolved
+# to no declaration.
+#[doc("Typer-internal helper `pipe_op_dispatcher` shared across the infer modules.")]
+pub fn pipe_op_dispatcher(pv: ProtoView, t: Ty, op: String) : Option[ExprKind] =
+  match pipe_op_impl(pv.impls, t, op) {
+    Some(p) -> pid_op_ref(pv.ids, pir_proto(p), op)
+    None    -> None
+  }
+
+
+# A pipe calls the op of the module that owns its head, and a mismatch
+# names the callee so; an op no module supplies keeps its own name.
+#[doc("Typer-internal helper `pipe_callee_shown` shared across the infer modules.")]
+pub fn pipe_callee_shown(st: InferState, owner: SymId, op: String, qualified: Option[SymId], callee: Expr) : Option[String] =
+  match qualified {
+    Some(_) -> Some("#{sym_name(st.env.tab, owner)}.#{op}")
+    None    -> callee_display_name(st, callee)
+  }
+
+
+# A pipe-lowering result: the emitted call and the threaded state.
+#[doc("Typer-internal type `FusedPipe` shared across the infer modules.")]
+pub type FusedPipe = { root: Expr, st: InferState }
+
+
+#[doc("Typer-internal helper `fuse_fn_domain` shared across the infer modules.")]
+pub fn fuse_fn_domain(t: Ty) : Ty =
+  match t {
+    TyFnT([a, ...], _, _) -> a
+    _                     -> TyAny
+  }
+
+
+#[doc("Typer-internal helper `fuse_fn_codomain` shared across the infer modules.")]
+pub fn fuse_fn_codomain(t: Ty) : Ty =
+  match t {
+    TyFnT(_, b, _) -> b
+    _              -> TyAny
+  }
+
+
+#[doc("Typer-internal helper `fuse_expr_ty` shared across the infer modules.")]
+pub fn fuse_expr_ty(e: Expr) : Ty =
+  match e.ty {
+    Some(t) -> t
+    None    -> TyAny
+  }
+
+
+# Terminal-fold deforestation (issue #1134). A `map`-into-`foldl` chain
+# — `xs | stage |> foldl(init, combine)` — folds over a full mapped list
+# built first. When both closures are pure, rewrite to the stdlib
+# `map_foldl` (or `range_map_foldl` for a range head), which folds
+# `combine` over `stage(x)` in one pass, materialising nothing: the
+# mapped list disappears, and a range head never allocates at all.
+#
+# The purity gate synthesises `stage` and `combine` in isolation to read
+# their effect rows (fresh tvars each time, so this does not poison the
+# shared substitution). If both are pure the raw rewrite is synthesised
+# once — `synth_call` instantiates the generic stdlib scheme cleanly, so
+# no node type is built by hand.
+# A gated fusion attempt. `st` is threaded, never discarded: the
+# isolation synths advance the fresh-tvar counter against the in-place-
+# mutated substitution, so a caller that rewound the counter would
+# re-mint ids the isolation pass already bound and types would silently
+# cross between chains.
+#[doc("Typer-internal type `FuseAttempt` shared across the infer modules.")]
+pub type FuseAttempt = { st: InferState, fused: Option[Inferred] }
+
+
+#[doc("Typer-internal type `FuseGate` shared across the infer modules.")]
+pub type FuseGate = { st: InferState, ok: Bool }
+
+
+# A `foldl` terminal fuses through the function it names: the protocol
+# operation only over a container implementing it, `list.foldl` only
+# over anything else.
+#[doc("Typer-internal helper `fuse_owner_mismatch` shared across the infer modules.")]
+pub fn fuse_owner_mismatch(ff: FusedFold, proto_foldl: Option[ExprKind], is_seq: Bool) : Bool = match ff.term {
+  TermFoldl(_, _) -> match proto_foldl {
+    Some(_) -> not is_seq
+    None    -> is_seq
+  }
+  _               -> false
+}
+
+
+# A non-`List` source whose head type has a protocol `foldl` impl fuses
+# via the generic single-traversal rewrite, not the `list.map_foldl`
+# fast-path. Peeking the head SYNTHS the source, which mints fresh tvars and
+# binds them in the shared mutable `sub`. The verdict is returned WITH the
+# post-peek state so the real rewrite synth continues from the advanced
+# fresh counter — reusing the caller's OLD counter would re-mint the ids the
+# peek already bound, so the rewrite's stage lambda binds its param to the
+# peek's stale binding (`(r) => r.active` reads `r: [Record]` → spurious
+# "annotation needed", #1186). Deferred fields ARE rolled back: head
+# detection needs no field resolution, and the peek's orphan receiver must
+# not leak into the worklist.
+# What a peek at a fusion source finds: whether its type folds through a
+# protocol, and whether it is a range of Chars, which the counting loops,
+# all over Int, do not walk.
+#[doc("Typer-internal type `FuseSeqPeek` shared across the infer modules.")]
+pub type FuseSeqPeek = FSP(InferState, Bool, Bool)
+
+
+#[doc("Typer-internal helper `ty_is_char_list` shared across the infer modules.")]
+pub fn ty_is_char_list(t: Ty) : Bool = match t {
+  TyListT(TyChar) -> true
+  _               -> false
+}
+
+
+#[doc("Typer-internal helper `st_restore_deferred_fields` shared across the infer modules.")]
+pub fn st_restore_deferred_fields(st: InferState, dfs: [DeferredField], hs: [DeferredHom]) : InferState =
+  InferState { ...st, deferred_fields: dfs, deferred_homs: hs }
+
+
+# Format a list of module names for the ambiguous-head diagnostic.
+# Two modules become "`a` and `b`"; three or more become "`a`, `b`,
+# and `c`". Output is wrapped in backticks for the diagnostic.
+#[doc("Typer-internal helper `join_modules_for_diag` shared across the infer modules.")]
+pub fn join_modules_for_diag(mods: [String]) : String {
+  match mods {
+    []        -> ""
+    [a]       -> concat_all(["`", a, "`"])
+    [a, b]    -> concat_all(["`", a, "` and `", b, "`"])
+    [a, ...rest] ->
+      concat_all(["`", a, "`, ", join_modules_for_diag(rest)])
+  }
+}
+
+# Mutable provenance / masking pass.
+#
+# The bare `array_set` / `array_grow` builtins raise `Mutable` on the
+# caller's row through their scheme (`builtin_table`)
+# when the body calls them (the desugar of
+# `a[i] := v`). That over-approximates: a function that
+# constructs an Array locally, mutates it before returning, and
+# never lets the caller observe the act of mutation is
+# semantically pure from the caller's POV (the Koka observable-
+# effects discipline pinned in `docs/effects-stdlib.md`
+# §`Mutable`). This pass walks the typed body, classifies each
+# Mutable demand as local-non-escaping vs external, and drops
+# `Mutable` from the inferred row when every demand is local.
+#
+# Algorithm (Pass 1 + Pass 2):
+#   Pass 1 — provenance scan. Walks every `let n = rhs` binding
+#     and records `n` as "local" iff `rhs` is a direct call to
+#     `array_make`, or a call to `array_set` / `array_grow`
+#     whose first arg is itself a previously-recorded local
+#     name. Names introduced via `var x = init` desugar to
+#     `let x__slot = array_make(1, init)` and pick up the same
+#     local label for free.
+#   Escape scan. A name escapes if it is an argument of an operation
+#     of an effect other than `Mutable`, or of a callee that is not a
+#     named function. Returning the name as the function's tail value
+#     is NOT an escape (the caller receives a settled value, not a
+#     witnessable mutation); neither is passing it to a named callee,
+#     whose demand Pass 2 classifies.
+#   Taint. A local that `array_set` stores a foreign carrier into stays
+#     a valid destination, but nothing read out of it is local.
+#   Pass 2 — demand classification. Walks every call to a callee
+#     declared `/ Mutable` (the core `array_set`/`array_grow`,
+#     the qualified `Mutable.array_set`/`ref_set`, a Ref-backed
+#     container op like `hashmap.put`, or any user fn `/ Mutable`).
+#     The demand is "local" iff every argument that CARRIES MUTATION
+#     (head `Array`/`Ref`, or a record with a transitive `Array`/`Ref`
+#     field) is a read of a local `n`, with `n` local-constructed, not a
+#     parameter, and not escaped. Otherwise the demand is "external".
+#   If every demand is local, `Mutable` is removed from
+#   `st.row` (and from `st.eff_uses` to keep diagnostics
+#   consistent). Otherwise the row is left untouched.
+#
+# this used to split mutable values into DIRECT (`Array`,
+# mutated by a bare C call, maskable when local) and DISPATCH (`Ref` /
+# Ref-backed containers, mutated through the evidence stack, NEVER
+# maskable even when local because the masked row dropped the handler
+# install). The default handler for `Mutable` is now installed
+# UNCONDITIONALLY at the base of the evidence stack (see
+# `ensure_unconditional_defaults`, emit_shared), so a local Ref/HashMap
+# whose row drops `Mutable` still finds a handler at the dispatch site.
+# The direct/dispatch distinction is gone: a value carries mutation or
+# it does not, and the only question is whether it escapes. The masking
+# invariant: a callee `/ Mutable` is masked iff every mutation-carrying
+# argument is a local, non-parameter, non-escaping read; an argument
+# that carries mutation and is a parameter or escapes keeps `Mutable`.
+
+
+# `dmut` lists every mutation-carrying type (a transitive `Array`/`Ref`
+# field, e.g. `HashMap` / `HashSet` / `{ arr: Array }`): passing one to a
+# `/ Mutable` callee is observable iff it is a parameter or escapes.
+#[doc("Typer-internal type `MutScan` shared across the infer modules.")]
+pub type MutScan = { tab: SymTab, locals: [LocalId], tainted: [LocalId], escaped: [LocalId], opaque: [LocalId], dmut: [SymId] }
+
+
+#[doc("Typer-internal helper `stores_foreign_carrier` shared across the infer modules.")]
+pub fn stores_foreign_carrier(v: Expr, live: [LocalId], dmut: [SymId]) : Bool = match v.ty {
+  Some(t) -> ty_may_carry_mutation(t, dmut) and not rhs_is_local_origin(v, live, dmut)
+  None    -> false
+}
+
+
+#[doc("Typer-internal helper `carrier_shapes` shared across the infer modules.")]
+pub fn carrier_shapes(v: TyHomeView, recs: [RecInfo], sums: [SumInfo]) : [CarrierShape] =
+  list_append(map(recs, (r) => record_shape(v, r)), map(sums, (s) => sum_carrier_shape(v, s)))
+
+
+fn sum_carrier_shape(v: TyHomeView, s: SumInfo) : CarrierShape = match s {
+  SI(sum, _, vs, mo) -> sum_shape(v, sum, vs, mo)
+}
+
+
+#[doc("Typer-internal helper `ty_env_with_carriers` shared across the infer modules.")]
+pub fn ty_env_with_carriers(env: TyEnv, cs: [SymId]) : TyEnv = TyEnv { ...env, carriers: cs }
+
+
+#[doc("Typer-internal helper `st_drop_effect` shared across the infer modules.")]
+pub fn st_drop_effect(st: InferState, c: CoreEffect) : InferState {
+  let row1 = filter(st.row, (h) => not effect_is(h.sym, c))
+  let uses1 = filter(st.eff_uses, (u) => match u { EU(l, _, _) -> not effect_is(l.sym, c) })
+  InferState { ...st, row: row1, eff_uses: uses1 }
+}
+
+
+#[doc("Typer-internal helper `mut_collect_param_ids` shared across the infer modules.")]
+pub fn mut_collect_param_ids(ps: [Param], acc: [LocalId]) : [LocalId] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> mut_collect_param_ids(rest, [p.binder.id, ...acc])
+  }
+}
+
+
+#[doc("Typer-internal helper `lid_in` shared across the infer modules.")]
+pub fn lid_in(ls: [LocalId], l: LocalId) : Bool = match ls {
+  []           -> false
+  [h, ...rest] -> local_eq(h, l) or lid_in(rest, l)
+}
+
+
+# True iff `rhs` ORIGINATES a fresh local mutable value the caller never
+# observes. Covers every mutable kind (not Array alone),
+# using the fresh-vs-borrowed distinction of region inference
+# (Tofte-Talpin) / JVM escape analysis (Choi et al. 1999): a value whose
+# identity did not come in from a parameter is local.
+#
+#   * a read of a local `n` is local iff `n` is already local (propagate —
+#     never decide by type, so `let m2 = param_map` stays non-local);
+#   * an `if`/`match`/block-tail is local iff EVERY tail branch is local
+#     (so `if c { local_a } else { param_ref }` is correctly non-local);
+#   * an in-place op (`array_set` / `array_grow` of an already-local first
+#     arg) returns the same cell — local iff that arg is local;
+#   * any OTHER call is a constructor of a local value iff its result type
+#     carries mutation AND no argument carries mutation. A call that takes
+#     no mutable argument cannot return an alias of one — it can only build
+#     a fresh value (`array_make`, `Mutable.ref_make`, `hashmap.empty`,
+#     `from_pairs`). A call that DOES take a mutable argument (a user helper
+#     that might return it) is conservatively non-local.
+#[doc("Typer-internal helper `rhs_is_local_origin` shared across the infer modules.")]
+pub fn rhs_is_local_origin(rhs: Expr, local_so_far: [LocalId], dmut: [SymId]) : Bool =
+  match rhs.kind {
+    ELocal(l)          -> lid_in(local_so_far, l)
+    EBlock(_, tail)    -> {
+      match tail {
+        Some(t) -> rhs_is_local_origin(t, local_so_far, dmut)
+        None    -> false
+      }
+    }
+    EIf(_, t_, eo)     -> {
+      match eo {
+        Some(e2) -> both_local_origin(t_, e2, local_so_far, dmut)
+        None     -> false
+      }
+    }
+    EMatch(_, arms)    -> arms_all_local_origin(arms, local_so_far, dmut)
+    ECall(callee, args_) -> {
+      if rhs_is_inplace_local(callee, args_, local_so_far) { true }
+      else if rhs_is_constructor(rhs.ty, args_, dmut) { true }
+      # threading in-place: a call whose result carries mutation and ALL of
+      # whose carrier args are local-origin returns a local value — it can
+      # only alias a carrier it received, and every one was local. Covers
+      # `mixed1 = string_builder.append(mixed0, ...)` (append returns the
+      # same buffer it grew). A carrier arg that is shared (param) makes the
+      # result potentially-shared, so this stays false.
+      else { rhs_threads_local_carrier(rhs.ty, args_, local_so_far, dmut) }
+    }
+    # A record literal builds a fresh value; it is local iff no field
+    # init aliases a non-local mutation carrier. `Box { arr: array_make(..) }`
+    # is local; `Box { arr: param_arr }` is not (it aliases the caller's
+    # buffer, so a callee mutating `b.arr` is observable through the param).
+    ERecordLit(_, fs)  -> field_inits_all_local_origin(fs, local_so_far, dmut)
+    _ -> false
+  }
+
+
+fn field_inits_all_local_origin(fs: [FieldInit], local_so_far: [LocalId], dmut: [SymId]) : Bool =
+  match fs {
+    []           -> true
+    [f, ...rest] -> match f {
+      FI(_, v) ->
+        if field_init_local(v, local_so_far, dmut) {
+          field_inits_all_local_origin(rest, local_so_far, dmut)
+        } else { false }
+    }
+  }
+
+
+# A field init keeps the record local iff it does not bring in a
+# non-local mutation carrier: a non-carrier value is harmless, and a
+# carrier value must itself be locally originated.
+fn field_init_local(v: Expr, local_so_far: [LocalId], dmut: [SymId]) : Bool =
+  match v.ty {
+    Some(t) -> if ty_may_carry_mutation(t, dmut) { rhs_is_local_origin(v, local_so_far, dmut) }
+               else { true }
+    None    -> true
+  }
+
+
+fn both_local_origin(a: Expr, b: Expr, local_so_far: [LocalId], dmut: [SymId]) : Bool =
+  if rhs_is_local_origin(a, local_so_far, dmut) { rhs_is_local_origin(b, local_so_far, dmut) }
+  else { false }
+
+
+fn arms_all_local_origin(arms: [Arm], local_so_far: [LocalId], dmut: [SymId]) : Bool = match arms {
+  []           -> true
+  [h, ...rest] -> match h {
+    Arm(_, _, b) ->
+      if rhs_is_local_origin(b, local_so_far, dmut) { arms_all_local_origin(rest, local_so_far, dmut) }
+      else { false }
+  }
+}
+
+
+# The in-place builtins (`array_set` / `array_grow`) return the
+# SAME cell they were given, so the binding is local iff the first arg is
+# already a local. Checked BEFORE the constructor rule because these
+# DO take a mutable first arg (which the constructor rule would reject).
+fn rhs_is_inplace_local(callee: Expr, args_: [Expr], local_so_far: [LocalId]) : Bool =
+  if is_inplace_array_op(callee) {
+    match args_ {
+      [first, ..._ignore] -> match first.kind {
+        ELocal(l) -> lid_in(local_so_far, l)
+        _         -> false
+      }
+      [] -> false
+    }
+  } else { false }
+
+
+fn is_inplace_array_op(callee: Expr) : Bool =
+  is_builtin_ref(callee, CbArraySet) or is_builtin_ref(callee, CbArrayGrow)
+
+
+# A call is a fresh-value constructor iff its result type carries mutation
+# and NO argument carries mutation (it cannot alias a mutable value it never
+# received). The result-type guard also rejects pure non-mutable calls.
+fn rhs_is_constructor(ret_ty: Option[Ty], args_: [Expr], dmut: [SymId]) : Bool =
+  match ret_ty {
+    None    -> false
+    Some(t) -> ty_may_carry_mutation(t, dmut) and not any_arg_carries_mutation(args_, dmut)
+  }
+
+
+# A call threads a local carrier iff its result carries mutation and every
+# carrier argument is local-origin: the returned carrier can only alias one
+# it received, and all were local. (`string_builder.append(local, s)`.)
+fn rhs_threads_local_carrier(ret_ty: Option[Ty], args_: [Expr],
+                             local_so_far: [LocalId], dmut: [SymId]) : Bool =
+  match ret_ty {
+    None    -> false
+    Some(t) -> ty_may_carry_mutation(t, dmut) and carrier_args_all_local(args_, local_so_far, dmut)
+  }
+
+
+fn carrier_args_all_local(args_: [Expr], local_so_far: [LocalId], dmut: [SymId]) : Bool = match args_ {
+  []           -> true
+  [h, ...rest] -> {
+    let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
+    if ty_may_carry_mutation(arg_ty, dmut) {
+      if rhs_is_local_origin(h, local_so_far, dmut) { carrier_args_all_local(rest, local_so_far, dmut) }
+      else { false }
+    } else { carrier_args_all_local(rest, local_so_far, dmut) }
+  }
+}
+
+
+fn any_arg_carries_mutation(args_: [Expr], dmut: [SymId]) : Bool = match args_ {
+  []           -> false
+  [h, ...rest] -> {
+    let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
+    if ty_may_carry_mutation(arg_ty, dmut) { true }
+    else { any_arg_carries_mutation(rest, dmut) }
+  }
+}
+
