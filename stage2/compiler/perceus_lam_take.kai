@@ -1,0 +1,66 @@
+#[doc("""
+The params a lambda body consumes itself.
+
+A closure's frame releases every param after the body, and the body dups
+each read, so the param is never unique inside it. A param read once on
+every path, at a consuming position, hands its reference on instead: its
+reads stay bare and the frame leaves it alone. A leading `MkLamTake`
+statement names those params for the backends.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.anf_ops
+import compiler.borrow_map
+import compiler.expr_exists
+import compiler.perceus_linear
+import compiler.perceus_borrow_strip
+
+#[doc("`body` with the reads of the params it consumes left bare and the body marked, or `body` itself when none is consumed. `orig` is the body before the dup rewrite, which decides.")]
+pub fn plt_take(ps: [Param], orig: Expr, body: Expr, bmap: BorrowMap) : Expr = {
+  let owned = map(filter(ps, (p) => not p.pborrow), .binder)
+  match filter(owned, (b) => plt_consumes(b, orig, bmap)) {
+    []    -> body
+    taken -> {
+      let ids = map(taken, .id)
+      plt_mark(ids, plt_bare(ids, body))
+    }
+  }
+}
+
+# The mark is a leading statement: a body that is itself a block takes it in
+# place, any other body becomes the tail of a block of its own.
+fn plt_mark(ids: [LocalId], body: Expr) : Expr = {
+  let m = SExprStmt(Expr { kind: ECall(mk_expr(EMark(MkLamTake(ids)), body.line, body.col), []), line: body.line, col: body.col, ty: None, mode: MUnknown, site: body.site })
+  match body.kind {
+    EBlock(ss, ot) -> with_kind(body, EBlock([m, ...ss], ot))
+    _              -> with_kind(body, EBlock([m], Some(body)))
+  }
+}
+
+# Every path hands the param over at one owning read, after the lends of it.
+fn plt_consumes(b: Binder, body: Expr, bmap: BorrowMap) : Bool =
+  not plt_captured(b.id, body) and pcs_consumed_b_expr(b, body, bmap) and pcs_all_consumers_linear(b, body) and
+  (pcs_max_paths_in_expr(b, body) <= 1 or pcs_lends_end_first(b, body, bmap))
+
+# A read in a nested lambda is a capture: it dups.
+fn plt_captured(l: LocalId, e: Expr) : Bool =
+  xp_exists(e, false, (x) => match x.kind {
+    ELambda(_, b) -> xp_exists(b, false, (y) => match y.kind { ELocal(u) -> local_eq(u, l)  _ -> false })
+    _             -> false
+  })
+
+fn plt_bare(ids: [LocalId], e: Expr) : Expr = match e.kind {
+  ECall(f, [a]) -> match f.kind {
+    EMark(MkDup) -> match a.kind {
+      ELocal(l) -> if contains_local(ids, l) { a } else { e }
+      _         -> plt_bare_kind(ids, e)
+    }
+    _ -> plt_bare_kind(ids, e)
+  }
+  _ -> plt_bare_kind(ids, e)
+}
+
+fn plt_bare_kind(ids: [LocalId], e: Expr) : Expr = with_kind(e, prc_map_expr_kind(e.kind, (c) => plt_bare(ids, c)))
+
+fn contains_local(ids: [LocalId], l: LocalId) : Bool = any(ids, (i) => local_eq(i, l))

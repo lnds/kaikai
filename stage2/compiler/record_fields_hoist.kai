@@ -1,0 +1,123 @@
+#[doc("""
+Field reads of a record parameter, hoisted ahead of the body when one of
+them is a `Vec`.
+
+A write through `s.buf` copies while `s` still holds the vector. Binding
+every field the body reads from `s` first, then letting `s` go before the
+body runs, leaves the vector with the one reference the write needs. A
+parameter the body uses any other way (passed on, captured, matched) is
+left as written.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.anf_ops
+import compiler.expr_exists
+import compiler.expr_positions
+import compiler.util
+
+#[doc("Hoist, in every fn body of `ds`, the field reads of a record parameter that carries a `Vec`.")]
+pub fn rfh_hoist_decls(ds: [Decl]) : [Decl] = map(ds, rfh_decl)
+
+fn rfh_decl(d: Decl) : Decl = match d {
+  DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> DFn(pub_, fid, tps, ps, ret, row, rfh_body(ps, body), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym)        -> DImpl(p, tas, tgt, map(inner, rfh_decl), l, c, tps, isym)
+  _ -> d
+}
+
+# A body with no `Vec` field read is returned as is: the rebuild would cost every program.
+fn rfh_body(ps: [Param], body: Expr) : Expr =
+  if xp_exists(body, false, rfh_is_vec_read) { rfh_params(ps, body) } else { body }
+
+fn rfh_is_vec_read(e: Expr) : Bool = match e.kind {
+  EField(x, _) -> match x.kind {
+    ELocal(_) -> match e.ty {
+      Some(TyCon(s, _)) -> core_ty_is(s, CtVec)
+      _                 -> false
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
+fn rfh_params(ps: [Param], body: Expr) : Expr = match ps {
+  []           -> body
+  [p, ...rest] -> rfh_params(rest, if p.pborrow { body } else { rfh_param(p.binder, body) })
+}
+
+fn rfh_param(b: Binder, body: Expr) : Expr = {
+  let reads = list_reverse(rfh_reads(b.id, body, []))
+  if not any(reads, rfh_is_vec_read) { body }
+  else {
+    let firsts = rfh_firsts(reads, [])
+    let stem = concat_all(["__rfh_", int_to_string(local_raw(b.id))])
+    let alias = binder_minted(stem)
+    let fbs = map(firsts, (r) => (rfh_field_name(r), binder_minted(concat_all([stem, "_", rfh_field_name(r)]))))
+    let body1 = rfh_subst(b.id, fbs, body)
+    if xp_exists(body1, false, (x) => rfh_is_local(b.id, x)) { body }
+    else {
+      let lets = map(firsts, (r) => rfh_field_let(alias, rfh_binder_of(fbs, rfh_field_name(r)), r))
+      with_kind(body, EBlock([rfh_alias_let(alias, b, firsts), ...lets], Some(body1)))
+    }
+  }
+}
+
+fn rfh_is_local(p: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(l) -> local_eq(l, p)
+  _         -> false
+}
+
+# The reads of `p`'s fields outside lambdas and handler clauses, last first.
+fn rfh_reads(p: LocalId, e: Expr, acc: [Expr]) : [Expr] = match e.kind {
+  EField(x, _) -> if rfh_is_local(p, x) { [e, ...acc] } else { rfh_reads_ps(p, xp_positions(e), acc) }
+  _            -> rfh_reads_ps(p, xp_positions(e), acc)
+}
+
+fn rfh_reads_ps(p: LocalId, ps: [XPos], acc: [Expr]) : [Expr] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> rfh_reads_ps(p, rest, if xrole_inline(r) { rfh_reads(p, c, acc) } else { acc })
+}
+
+fn rfh_field_name(e: Expr) : String = match e.kind {
+  EField(_, f) -> f
+  _            -> ""
+}
+
+# The first read of each field, in order.
+fn rfh_firsts(reads: [Expr], acc: [Expr]) : [Expr] = match reads {
+  []           -> list_reverse(acc)
+  [r, ...rest] -> rfh_firsts(rest, if any(acc, (a) => rfh_field_name(a) == rfh_field_name(r)) { acc } else { [r, ...acc] })
+}
+
+fn rfh_subst(p: LocalId, fbs: [(String, Binder)], e: Expr) : Expr = match e.kind {
+  EField(x, f) ->
+    if rfh_is_local(p, x) { with_kind(e, ELocal(rfh_binder_of(fbs, f).id)) }
+    else { with_kind(e, EField(rfh_subst(p, fbs, x), f)) }
+  ELambda(_, _)                 -> e
+  EHandle(_, _, _, _, _, _, _)  -> e
+  _ -> with_kind(e, prc_map_expr_kind(e.kind, (c) => rfh_subst(p, fbs, c)))
+}
+
+fn rfh_binder_of(fbs: [(String, Binder)], name: String) : Binder = match fbs {
+  []                  -> binder_minted("")
+  [(n, b), ...rest]   -> if n == name { b } else { rfh_binder_of(rest, name) }
+}
+
+fn rfh_base(r: Expr) : Expr = match r.kind {
+  EField(x, _) -> x
+  _            -> r
+}
+
+fn rfh_alias_let(alias: Binder, b: Binder, firsts: [Expr]) : Stmt = match firsts {
+  [r, ..._] -> {
+    let base = rfh_base(r)
+    SLet(Pattern { pkind: PBind(alias), line: base.line, col: base.col }, None, with_kind(base, ELocal(b.id)))
+  }
+  [] -> SLet(Pattern { pkind: PWild, line: 0, col: 0 }, None, mk_expr(EUnit, 0, 0))
+}
+
+fn rfh_field_let(alias: Binder, fb: Binder, r: Expr) : Stmt = match r.kind {
+  EField(x, f) -> SLet(Pattern { pkind: PBind(fb), line: r.line, col: r.col }, None,
+                       with_kind(r, EField(with_kind(x, ELocal(alias.id)), f)))
+  _            -> SLet(Pattern { pkind: PWild, line: r.line, col: r.col }, None, r)
+}
