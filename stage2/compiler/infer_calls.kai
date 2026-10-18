@@ -1,0 +1,927 @@
+#[doc("Typing of calls: bare, UFCS, operation, resume and segment calls.")]
+
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.proto_contest
+import compiler.marks
+import compiler.parse_type_decls
+import compiler.resolve_names
+import compiler.handler_alias
+import compiler.decl_names
+import compiler.symtab
+import compiler.cont_type
+import compiler.infer_unit_alias
+import compiler.homonym
+import compiler.core_effects
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_clause_holes
+import compiler.infer_local_mutation
+import compiler.infer_arms_vec
+import compiler.infer_env_exhaust
+import compiler.infer_dump_text
+import compiler.infer_apply
+import compiler.infer_unify_rows
+import compiler.infer_instantiate
+import compiler.infer_tparam_escape
+import compiler.infer_fuse_arith
+import compiler.infer_match
+
+# A name the resolver left to the typer. Settled here, the node carries
+# the declaration's id; a name that settles to none is an error, so no
+# written name leaves the typer of a program that compiles.
+#[doc("Typer-internal helper `synth_name_read` shared across the infer modules.")]
+pub fn synth_name_read(st: InferState, w: Written, e: Expr) : Inferred / Console + File + Mutable =
+  synth_settled(st, settle_name(st, None, w, TyAny, value_classes()), w, false, e)
+
+
+
+# The callee of a call is read the same way; its tie is reported as a call.
+#[doc("Typer-internal helper `synth_callee` shared across the infer modules.")]
+pub fn synth_callee(st: InferState, callee: Expr) : Inferred / Console + File + Mutable = match callee.kind {
+  EName(w) -> synth_settled(st, settle_name(st, None, w, TyAny, value_classes()), w, true, callee)
+  _        -> w_synth(st, callee)
+}
+
+
+
+fn synth_settled(st: InferState, r: Settled, w: Written, called: Bool, e: Expr) : Inferred / Console + File + Mutable = match r {
+  SetOne(s)    -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
+  SetTie(ss)   -> if op_tie(st, ss) { synth_op_ref(st, w, ss, called, e) }
+                  else { inferred_leaf(report_name_tie(st, w, ss, called, e.line, e.col), TyAny, e) }
+  SetOther(ss) -> inferred_leaf(report_no_value(st, w, ss, e.line, e.col), TyAny, e)
+  SetNone      -> inferred_leaf(report_no_declaration(st, w, e.line, e.col), TyAny, e)
+}
+
+
+
+# An operation several protocols declare, read where nothing tells them
+# apart. Called, the reference stays between its dispatchers and the
+# dispatch rewrite settles it by the receiver. Read as a value it is the
+# function that calls it, so the same holds of that call.
+fn synth_op_ref(st: InferState, w: Written, ss: [SymId], called: Bool, e: Expr) : Inferred / Console + File + Mutable =
+  if called {
+    let c = op_unsettled(st, ss, e.line, e.col)
+    match c.ty {
+      Some(t) -> inferred_leaf(c.st, t, Expr { ...e, kind: EMark(MkProtoOp(ss)) })
+      None    -> inferred_leaf(report_name_tie(c.st, w, ss, true, e.line, e.col), TyAny, e)
+    }
+  }
+  else { match contest_arity(st.protos.ids, ss) {
+    Some(n) -> w_synth(st, contest_as_function(e, n))
+    None    -> inferred_leaf(report_name_tie(st, w, ss, false, e.line, e.col), TyAny, e)
+  } }
+
+
+
+fn synth_many(st: InferState, es: [Expr]) : InferredList / Console + File + Mutable {
+
+
+  match es {
+    [] -> InferredList { st: st, tys: [], exprs: [] }
+    [x, ...rest] -> {
+      let r = w_synth(st, x)
+      let rr = synth_many(r.st, rest)
+      InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+    }
+  }
+}
+
+
+
+# Like `synth_many`, but each argument is paired with the declared
+# parameter type at the same position (`param_tys`), which it is
+# synthesised against; a missing expected type is a no-op.
+fn synth_many_threaded(st: InferState, es: [Expr],
+                        param_tys: [Ty]) : InferredList / Console + File + Mutable {
+  match es {
+    [] -> InferredList { st: st, tys: [], exprs: [] }
+    [x, ...rest] -> {
+      let exp = match param_tys { [pt, ...] -> Some(apply_ty(st.sub, pt))  _ -> None }
+      let prest = match param_tys { [_, ...pr] -> pr  _ -> [] }
+      let r = synth_threaded_arg(st, x, exp)
+      let rr = synth_many_threaded(st_settle_arg(r.st, exp, r.ty, rest, prest), rest, prest)
+      InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+    }
+  }
+}
+
+
+
+fn synth_threaded_arg(st: InferState, x: Expr,
+                       exp: Option[Ty]) : Inferred / Console + File + Mutable =
+  match exp {
+    Some(et) ->
+      if arg_wants_vec_context(x, et) {
+        w_check_against(st, x, et, "argument", x.line, x.col)
+      } else { synth_expecting(st, x, et) }
+    None -> w_synth(st, x)
+  }
+
+
+
+# `synth_many` with the callee's declared params threaded per position.
+# The expected type routes a Vec-context arg (literal / collect) through
+# the bidirectional check, coins a dimensioned numeric literal to the
+# parameter's declared carrier (`10.50<USD>` against `Decimal<USD>`), and
+# names the record a bare literal head builds; every other arg keeps the
+# plain synth path.
+fn synth_many_vec_args(st: InferState, es: [Expr],
+                       param_tys: [Ty]) : InferredList / Console + File + Mutable {
+  match es {
+    [] -> InferredList { st: st, tys: [], exprs: [] }
+    [x, ...rest] -> {
+      let exp = match param_tys { [pt, ...] -> Some(apply_ty(st.sub, pt))  _ -> None }
+      let prest = match param_tys { [_, ...pr] -> pr  _ -> [] }
+      let r = match exp {
+        Some(et) ->
+          if arg_wants_vec_context(x, et) {
+            w_check_against(st, x, et, "argument", x.line, x.col)
+          } else { synth_expecting(st, x, et) }
+        None -> w_synth(st, x)
+      }
+      let lowered = match exp {
+        Some(et) -> maybe_lower_decimal_lit(r.expr, r.ty, et, mint_bigint_home(st.env))
+        None     -> ExprTy { expr: r.expr, ty: r.ty }
+      }
+      let rr = synth_many_vec_args(st_settle_arg(r.st, exp, lowered.ty, rest, prest), rest, prest)
+      InferredList { st: rr.st, tys: [lowered.ty, ...rr.tys],
+                     exprs: [lowered.expr, ...rr.exprs] }
+    }
+  }
+}
+
+
+
+# `synth_many` with each argument's declared parameter in hand, where no
+# other context rule applies: a record literal's head is asked of it.
+#[doc("Typer-internal helper `synth_many_expecting` shared across the infer modules.")]
+pub fn synth_many_expecting(st: InferState, es: [Expr], param_tys: [Ty]) : InferredList / Console + File + Mutable = match es {
+  [] -> InferredList { st: st, tys: [], exprs: [] }
+  [x, ...rest] -> {
+    let exp = match param_tys { [pt, ...] -> Some(apply_ty(st.sub, pt))  _ -> None }
+    let r = match exp {
+      Some(et) -> synth_expecting(st, x, et)
+      None     -> w_synth(st, x)
+    }
+    let prest = params_after_first(param_tys)
+    let rr = synth_many_expecting(st_settle_arg(r.st, exp, r.ty, rest, prest), rest, prest)
+    InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
+  }
+}
+
+
+
+# A `@x` the cell-read lowering never reached (a `const` initialiser has
+# no cell scope) is typed as the method call it reads as, so it is
+# reported the way a call of a missing method is.
+#[doc("Typer-internal helper `synth_call_site` shared across the infer modules.")]
+pub fn synth_call_site(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = match callee.kind {
+  EMark(MkDeref) -> match args_ {
+    [x] -> synth_call(st, mk_expr(EField(x, mark_name(MkDeref)), callee.line, callee.col), [], line, col)
+    _   -> synth_call(st, callee, args_, line, col)
+  }
+  EMark(MkLazy(_)) -> match args_ {
+    [x] -> synth_lazy_part(st, x)
+    _   -> synth_call(st, callee, args_, line, col)
+  }
+  EMark(MkLazyRange) -> match args_ {
+    [x] -> synth_lazy_range(st, x)
+    _   -> synth_call(st, callee, args_, line, col)
+  }
+  _ -> synth_call(st, callee, args_, line, col)
+}
+
+
+
+#[doc("Typer-internal helper `synth_call` shared across the infer modules.")]
+pub fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  # The bare core IO builtins (`print`, `read_file`, `array_set`, …)
+  # carry their effect in their own scheme row (`builtin_table`), so the standard call-inference path below — the open-row
+  # unification of the callee's `TyFnT` plus `st_propagate_capability_labels`
+  # — raises the label on the caller's row, exactly as for an explicit
+  # `Eff.op(...)` call or a stdlib fn written `: T / Stdout`. No name-keyed
+  # side table is needed; `check_body_row` still enforces row declaration
+  # uniformly.
+  let st_p = st
+  match try_resume_call(st_p, callee, args_, line, col) {
+    Some(inf) -> inf
+    None ->
+      match try_op_call(st_p, callee, args_, line, col) {
+        Some(inf) -> inf
+        None -> match try_ufcs_call(st_p, callee, args_, line, col) {
+          Some(inf) -> inf
+          None -> match try_constructor_call(st_p, callee, args_, line, col) {
+            Some(inf) -> inf
+            None -> match try_record_type_call(st_p, callee, args_, line, col) {
+            Some(inf) -> inf
+            None -> match try_bare_call_narrow(st_p, callee, args_, line, col) {
+            Some(inf) -> inf
+            None -> {
+            let rc = nullary_op_noted(synth_callee(st_p, callee), args_, line, col)
+            let callee_ty = apply_ty(rc.st.sub, rc.ty)
+            match cont_parts(callee_ty) {
+              Some(cp) -> synth_cont_call(rc, cp, args_, line, col)
+              None -> {
+            # pair each arg with its declared param so a Vec-typed
+            # param mints an EList / collects a map-pipe chain — the
+            # argument-position face of the annotation-context rules.
+            let vparams = match callee_ty {
+              TyFnT(ps, _, _) -> ps
+              _               -> []
+            }
+            let ra = synth_many_vec_args(rc.st, args_, vparams)
+            let rv = st_fresh_ty(ra.st)
+            # An open expected row keeps the callee's own row unforced; its
+            # labels reach the caller through st_propagate_capability_labels.
+            let fr = subst_fresh_row(rv.st.sub)
+            let st_fresh = st_set_sub(rv.st, fr.subst)
+            let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+            let expected = TyFnT(ra.tys, rv.ty, expected_row)
+            let st_unif = dot_identity_help(st_fresh, st_unify_call(st_fresh, callee, rc.ty, ra.tys, expected, line, col),
+                                            rc.ty, ra.tys, args_)
+            let st2 = st_propagate_capability_labels(st_unif,
+                        apply_ty(st_unif.sub, rc.ty), line, col)
+            let ca = coerce_lambda_args(coerce_ctor_args(st2, rc.expr, ra.exprs, ra.tys, rc.ty), rc.ty)
+            match refine_call(ca.st, rc.expr, rc.ty, ca.exprs, ca.tys, apply_ty(st2.sub, rv.ty)) {
+              RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(rc.expr, ca.exprs), line, col), ty))
+            }
+              }
+            }
+            }
+          }
+          }
+          }
+        }
+      }
+  }
+}
+
+
+
+# `k(v)` on a `Cont[T, S, e]`: resume with a `T`, get the handle's `S`; the
+# body runs on, so the caller performs `e`. A stateful handle's
+# `Cont[(T, H), S, e]` is called `k(v, s)` and resumes with the pair.
+fn synth_cont_call(rc: Inferred, cp: ContParts, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let r = match args_ {
+    [v] -> cont_arg(w_synth(rc.st, v), cp, "continuation argument")
+    [v, s] -> cont_arg(w_synth(rc.st, tuple_lit_expr([v, s], line, col)), cp, "continuation value and state")
+    _ -> {
+      let ra = synth_many(rc.st, args_)
+      inferred_leaf(seg_error(ra.st, rc.expr, "a continuation takes a value, or a value and a state", "call it as `k(v)`, or `k(v, s)` for a stateful handle's").st, TyUnit, rc.expr)
+    }
+  }
+  let st2 = st_propagate_capability_labels(r.st, apply_ty(r.st.sub, cp.row), line, col)
+  mk_inferred(st2, cp.answer, with_ty(mk_expr(ECall(rc.expr, [r.expr]), line, col), cp.answer))
+}
+
+
+
+# `#[constructor]` sugar: a call whose callee is a bare type name with
+# a registered constructor desugars to a call to that fn,
+# so `Rational(2, 3)` routes through `rational.make` — passing
+# the fn's logic (canonicalisation, invariants), never the raw record
+# literal — and its arg literals mint against `make`'s param types.
+fn try_constructor_call(st: InferState, callee: Expr, args_: [Expr],
+                        line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+  match constructor_of_type(st, callee_type_sym(st, callee)) {
+    Some(CtorE(_, fsym)) -> {
+      let qcallee = mk_sym(fsym, callee.line, callee.col)
+      # coin bare numeric args to the marked fn's param types (its
+      # scheme is concrete, e.g. `make(BigInt, BigInt)`), so
+      # `Rational(2, 3)` mints `2`/`3` to `BigInt`. Call-arg minting
+      # is not automatic, so the sugar does it explicitly here.
+      let minted_args = match env_sym(st.env, fsym) {
+        Some(sc) -> constructor_mint_args(st.env, sc, args_)
+        None     -> args_
+      }
+      let rewritten = mk_expr(ECall(qcallee, minted_args), line, col)
+      Some(w_synth(st, rewritten))
+    }
+    None -> None
+  }
+}
+
+
+
+# when a bare-name callee has several candidate schemes
+# (`option.map`, `list.map`, `result.map`, ...), narrow by the type of
+# the FIRST argument before instantiating: the scope alone would call it
+# a tie.
+#
+# Returns Some only when:
+#   - callee is a name the resolver left unsettled,
+#   - the name has 2+ candidates in the env (otherwise the default arm
+#     does the right thing already),
+#   - args_ is non-empty (we need a first-arg type to narrow on),
+#   - some candidate's first param unifies with the first arg's type.
+# Otherwise returns None and the caller falls through to the default
+# arm, where the scope settles the name and the diagnostics for missing
+# names / arity mismatches fire.
+fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
+                         line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+
+  match callee.kind {
+    EName(w) -> {
+      # A declaration the resolver reached arrives stamped; a bare name
+      # here is a contest it left to the type. The candidates are
+      # functions only: a constructor is never a receiver-typed
+      # dispatch target.
+      let candidates = bare_fn_candidates(st, w)
+      let n_cand = list_length(candidates)
+      if n_cand < 2 { None }
+      else {
+        match args_ {
+          [] -> None
+          [first_arg, ...rest_args] -> {
+            let r0 = w_synth(st, first_arg)
+            let first_ty = apply_ty(r0.st.sub, r0.ty)
+            match hom_try_defer(r0.st, w, candidates, first_ty, r0.expr,
+                                 rest_args, callee, line, col) {
+              Some(inf) -> Some(inf)
+              None ->
+            match pick_by_first_arg(r0.st, candidates, first_ty, callee.line, callee.col) {
+              FaNone -> None
+              FaTie(st_t, ss) -> {
+                let st_e = report_name_tie(st_t, w, ss, true, callee.line, callee.col)
+                Some(mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(callee, [r0.expr, ...rest_args]), line, col), TyAny)))
+              }
+              FaOne(pick) -> {
+                let st_inst = pick_inst(pick, line, col)
+                let ra_rest = synth_many_expecting(st_inst, rest_args, params_after_first(fn_param_tys(st_inst, pick.inst_ty)))
+                let all_arg_tys = [first_ty, ...ra_rest.tys]
+                let all_arg_exprs = [r0.expr, ...ra_rest.exprs]
+                let rv = st_fresh_ty(ra_rest.st)
+                let fr = subst_fresh_row(rv.st.sub)
+                let st_fresh = st_set_sub(rv.st, fr.subst)
+                let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+                let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
+                # propagate capability-only labels only.
+                let st_unif = st_unify_call(st_fresh, callee, pick.inst_ty, all_arg_tys, expected, line, col)
+                let st2 = st_propagate_capability_labels(st_unif,
+                            apply_ty(st_unif.sub, pick.inst_ty), line, col)
+                let ty = apply_ty(st2.sub, rv.ty)
+                let callee_node = with_ty(pick_ref(pick, callee.line, callee.col), pick.inst_ty)
+                match refine_call(st2, callee, pick.inst_ty, all_arg_exprs, all_arg_tys, ty) {
+                  RefCall(st3, ty3) -> Some(mk_inferred(st3, ty3, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty3)))
+                }
+              }
+            }
+            }
+          }
+        }
+      }
+    }
+    _ -> None
+  }
+}
+
+
+
+# A bare call several modules could answer, written where the first
+# argument's type is still a variable. Nothing can be committed here: a
+# variable fits every candidate. So
+# record the call against its expected function type, stamp a fresh
+# result tyvar, and let `infer_decl` decide once the body has settled;
+# the worklist mirrors the deferred field accesses. Only a candidate set
+# an argument's head CAN decide is deferred, which leaves every other
+# bare call on the path it already took.
+fn hom_try_defer(st: InferState, w: Written, candidates: [TyCandidate],
+                  first_ty: Ty, first_expr: Expr, rest_args: [Expr],
+                  callee: Expr, line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+  match hom_head(first_ty) {
+    Some(_) -> None
+    None -> {
+      if hom_decidable(hom_cands_of(candidates)) == false { None } else {
+      let ra = synth_many(st, rest_args)
+      let rv = st_fresh_ty(ra.st)
+      let fr = subst_fresh_row(rv.st.sub)
+      let st_fresh = st_set_sub(rv.st, fr.subst)
+      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let want = TyFnT([first_ty, ...ra.tys], rv.ty, expected_row)
+      let st1 = st_push_deferred_hom(st_fresh, DHom(w, want, callee.line, callee.col))
+      let callee_node = with_ty(callee, want)
+      let root = with_ty(mk_expr(ECall(callee_node, [first_expr, ...ra.exprs]), line, col), rv.ty)
+      Some(mk_inferred(st1, rv.ty, root))
+    } }
+  }
+}
+
+
+
+# type-check `resume(v)` in a STATELESS clause against `resume`'s env scheme
+# (`bind_resume_param_typed` bound it to `(answer) -> ?fresh`). Done here
+# rather than via the generic `synth(callee)` path so the callee `resume`
+# never reaches the value-position guard of a local read.
+fn synth_resume_call_stateless(st: InferState, k: LocalId, args_: [Expr], callee: Expr,
+                                line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let callee_ty = match env_local(st.env, k) {
+    Some(sc) -> (st_instantiate_report(st, sc)).ty
+    None     -> TyAny
+  }
+  let ra = synth_many(st, args_)
+  let rv = st_fresh_ty(ra.st)
+  let fr = subst_fresh_row(rv.st.sub)
+  let st_fresh = st_set_sub(rv.st, fr.subst)
+  let expected = TyFnT(ra.tys, rv.ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
+  let st_unif = st_unify_call(st_fresh, callee, callee_ty, ra.tys, expected, line, col)
+  let ty = apply_ty(st_unif.sub, rv.ty)
+  let resume_root = with_ty(mk_local(local_minted(canonical_continuation()), callee.line, callee.col), callee_ty)
+  let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
+  mk_inferred(st_unif, ty, root)
+}
+
+
+
+# `$resume_frame(f)`, minted by the non-tail `resume` split: `f` takes
+# the handle's result and yields the next one, and it runs at the handle's
+# exit in the clause's own context, so its effects are the clause's.
+#[doc("Typer-internal helper `synth_resume_frame` shared across the infer modules.")]
+pub fn synth_resume_frame(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [f] -> {
+    let rf = w_synth(st, f)
+    let s_ty = clause_result_ty(rf.st)
+    let fr = subst_fresh_row(rf.st.sub)
+    let expected = TyFnT([s_ty], s_ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
+    let st1 = st_unify(st_set_sub(rf.st, fr.subst), expected, rf.ty, "deferred clause tail", e.line, e.col)
+    let st2 = st_propagate_capability_labels(st1, apply_ty(st1.sub, rf.ty), e.line, e.col)
+    mk_inferred(st2, TyUnit, with_ty(mk_expr(EIntrinsic(InResumeFrame, [rf.expr]), e.line, e.col), TyUnit))
+  }
+  _ -> {
+    let perr = mk_diag(SevError, st.file, e.line, e.col, "compiler intrinsic `$resume_frame` takes one argument", [])
+    render_diag(perr)
+    inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
+  }
+}
+
+
+
+# `$seg_request(i, args...)`: a forwarding clause handing op `i` to its
+# segment handle; its value is what the continuation is called with.
+#[doc("Typer-internal helper `synth_seg_request` shared across the infer modules.")]
+pub fn synth_seg_request(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [ix, ...xs] -> {
+    let ra = synth_many(st, xs)
+    let r = st_fresh_ty(ra.st)
+    mk_inferred(r.st, r.ty, with_ty(mk_expr(EIntrinsic(InSegRequest, [with_ty(ix, TyInt), ...ra.exprs]), e.line, e.col), r.ty))
+  }
+  [] -> seg_error(st, e, "compiler intrinsic `$seg_request` takes an op index", "")
+}
+
+
+
+# `$seg_handle(escapes, reason, body, return, clause...)`: the body thunk is
+# typed first; its forwarders' requests give each clause its parameter types
+# and its continuation `Cont[answer, S, e]`, where `S` is the handle's type and
+# `e` the thunk's row: what the body performs besides the handled effect.
+#[doc("Typer-internal helper `synth_seg_handle` shared across the infer modules.")]
+pub fn synth_seg_handle(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [esc, why, thunk, ret, ...cls] -> {
+    let rt = w_synth(st, thunk)
+    let (body_ty, e_ty) = match apply_ty(rt.st.sub, rt.ty) {
+      TyFnT(_, b, row) -> (b, row_arg_carrier(row))
+      t -> (t, row_arg_carrier(inf_row_empty()))
+    }
+    let rs = st_fresh_ty(rt.st)
+    let rr = seg_lambda(rs.st, ret, [body_ty], rs.ty)
+    let rc = seg_clauses(rr.st, cls, rt.expr, rs.ty, e_ty, 0, [])
+    let st1 = seg_absorb(seg_absorb(rc.st, rt.ty, e), rr.ty, e)
+    let node = mk_expr(EIntrinsic(InSegHandle, [esc, why, rt.expr, rr.expr, ...rc.exprs]), e.line, e.col)
+    mk_inferred(st1, rs.ty, with_ty(node, rs.ty))
+  }
+  _ -> seg_error(st, e, "compiler intrinsic `$seg_handle` has a malformed argument list", "")
+}
+
+
+
+fn seg_clauses(st: InferState, cls: [Expr], body: Expr, s_ty: Ty, e_ty: Ty, i: Int, acc: [Expr]) : SegClauses / Console + File + Mutable =
+  match cls {
+    [] -> SegClauses { st: st, exprs: list_reverse(acc) }
+    [c, ...rest] -> {
+      let pins = match seg_request_at(body, i) {
+        Some(req) -> [...map(req.args, (a) => ty_of_expr(a)), cont_ty(ty_of_expr(req.at), s_ty, e_ty)]
+        None -> []
+      }
+      let r = seg_lambda(st, c, pins, s_ty)
+      seg_clauses(seg_absorb(r.st, r.ty, c), rest, body, s_ty, e_ty, i + 1, [r.expr, ...acc])
+    }
+  }
+
+
+
+# A clause or return lambda: parameters pinned, result the handle's type.
+# The `()` standing for a missing return clause passes the body's value on.
+fn seg_lambda(st: InferState, lam: Expr, pins: [Ty], s_ty: Ty) : Inferred / Console + File + Mutable = match lam.kind {
+  EUnit -> match pins {
+    [b] -> mk_inferred(st_unify(st, s_ty, b, "handle result", lam.line, lam.col), TyUnit, with_ty(lam, TyUnit))
+    _ -> w_synth(st, lam)
+  }
+  ELambda(ps, b) -> {
+    let r = synth_lambda_pinned(st, ps, b, pins, "handler clause", lam.line, lam.col)
+    let res = match apply_ty(r.st.sub, r.ty) { TyFnT(_, t, _) -> t  t -> t }
+    Inferred { ...r, st: st_unify(r.st, s_ty, res, "handler clause result", lam.line, lam.col) }
+  }
+  _ -> w_synth(st, lam)
+}
+
+
+
+# type-check `resume(v)` / `resume(v, ns)` inside a clause body.
+# Stateful clauses validate against `clause_resume` (precise answer/state
+# types); stateless clauses type the call against `resume`'s env scheme.
+# Intercepting the call here keeps the callee off the local-read arm of
+# `synth`, whose value-position guard would otherwise reject this legal call.
+# Returns None when the call is not a resume inside a clause.
+fn try_resume_call(st: InferState, callee: Expr, args_: [Expr],
+                    line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+
+  match callee.kind {
+    ELocal(l) -> match st.in_clause {
+      CcOwn(k) -> if local_eq(l, k.id) {
+        match st.clause_resume {
+          Some(rb) -> Some(synth_resume_call(st, rb, args_, callee, line, col))
+          None     -> Some(synth_resume_call_stateless(st, l, args_, callee, line, col))
+        }
+      } else { None }
+      CcInLambda(k) -> if local_eq(l, k.id) { Some(lambda_resume_call(st, k.name, callee)) } else { None }
+      CcNone -> None
+    }
+    _ -> None
+  }
+}
+
+
+
+fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
+                      callee: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  match rb {
+    RB(answer_ty, state_ty, result_ty) -> {
+      let ra = synth_many(st, args_)
+      let rv = ty_res(ra.st, result_ty)
+      # st_unify treats the first arg as `expected` and the second as
+      # `found`; the resume answer is what the clause must produce, so
+      # answer_ty is the `expected` slot.
+      let st_after = match ra.tys {
+        [a]     -> st_unify(rv.st, answer_ty, a,
+                             "resume answer", line, col)
+        [a, ns] -> {
+          let s1 = st_unify(rv.st, answer_ty, a,
+                              "resume answer", line, col)
+          st_unify(s1, state_ty, ns,
+                    "resume new state", line, col)
+        }
+        _ -> {
+          let perr = mk_diag(SevError, rv.st.file, line, col,
+            "resume call: expected 1 or 2 arguments inside a stateful clause", [])
+          render_diag(perr)
+          diag_note("`resume(v)` resumes with the answer; `resume(v, ns)` also writes the new handler state")
+          diag_help("for `with State[T]` and `with Writer[W]`, use `resume(v, new_state)`; otherwise `resume(v)`")
+          st_bump_err(st_push_diag(rv.st, perr))
+        }
+      }
+      let ty = apply_ty(st_after.sub, rv.ty)
+      let resume_root = with_ty(mk_local(local_minted(canonical_continuation()), callee.line, callee.col), TyAny)
+      let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
+      mk_inferred(st_after, ty, root)
+    }
+  }
+}
+
+
+
+# detect the surface shape `Eff.op(args)` and treat it as
+# an op call. Args are unified against the op's parameter types; the
+# result type is the op's return type; `Eff` is added to the caller's row.
+#
+# The resolver settled the head: a declared effect (a row alias reads as
+# the component that declares the op) is its id, an alias binder or a
+# capability parameter is the local it is. If `Eff` is an effect but the
+# op is missing, we emit a dedicated diagnostic instead of falling
+# through to the generic `unknown identifier` path.
+fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
+               line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+
+  match callee.kind {
+    EField(base, op_name) -> match base.kind {
+      ESym(bsym, _) -> match env_op(st.env, bsym, written(op_name)) {
+        Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, bsym, op_name, line, col), bsym, written(op_name), None, false, line, col))
+        None ->
+          if env_has_effect(st.env, bsym) {
+            Some(synth_op_call_unknown_op(st, bsym, op_name, line, col))
+          } else { None }
+      }
+      # A local heads the op: an alias bound by an enclosing
+      # `handle ... with Eff as name`, else a capability PARAMETER
+      # (`c: Eff`), provided by the caller, whose op does not join the row
+      # (§6 named instances).
+      ELocal(l) -> match lookup_alias_taggable(st.aliases, l) {
+        None -> cap_op_call(st, l, op_name, args_, line, col)
+        Some(taggable) -> {
+          # The callee names the declaration the `handle` head resolved to.
+          let asym = lookup_alias_sym(st.aliases, l)
+          # `@cap` desugars to `cap.get()` for every capability shape; for
+          # a Reader-bound alias the op is `ask`, not `get`.
+          let real_op = canonical_cap_getter(asym, op_name)
+          # §6 named instances: a `with Eff as name` binding dispatches
+          # `name.op` against the handle's own evidence node, the value the
+          # alias holds — the same path a capability parameter uses, no
+          # by-id walk. `var`/State/Reader cells keep the by-id dispatch:
+          # their naked-read sugar and nested-cell identity ride that path.
+          # Inside a lambda body the prologue local is out of scope, so the
+          # instance is not named and the ambient lookup runs.
+          let via = if not taggable { ViaAmbient }
+                    else if eff_is_cell_effect(asym) { ViaAlias(l) }
+                    else { ViaRecv(l) }
+          # The row label is tagged with the cell whatever `taggable`
+          # says: row identity must hold inside a lambda too (the `while`
+          # thunks are lambdas).
+          match env_op(st.env, asym, written(real_op)) {
+            Some(sc) -> Some(record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, asym, real_op, via, Some(l), line, col), asym, written(real_op), Some(l), taggable, line, col))
+            None ->
+              if env_has_effect(st.env, asym) {
+                Some(synth_op_call_unknown_op(st, asym, real_op, line, col))
+              } else { None }
+          }
+        }
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+
+
+# UFCS dispatch for `receiver.method(args)` callees.
+#
+# Fires from `synth_call` when the callee shape is `EField(obj, ident)`
+# and `try_op_call` already declined (so `obj` is not an effect-name
+# reference). Walks `obj` once to learn its type, then applies the
+# field-vs-function precedence rule:
+#
+#   1. If `obj` is a record value AND `ident` names a field of that
+#      record, returns None — let `synth_call`'s generic path run
+#      `w_synth(st, callee)` (which dispatches `synth_field`) so field
+#      access wins on ties.
+#   2. Else if `ident` names a function whose first parameter unifies
+#      with `obj`'s type, lowers the call to `ident(obj, ...args)` on that
+#      function's id and finishes typing it with the same expected-row
+#      pattern `synth_call`/`synth_pipe_dispatch` use, so call-site
+#      row-tracking and unify diagnostics stay identical to the prefix
+#      form.
+#   3. Else, emits a Q4-style diagnostic naming the receiver type and
+#      hinting at scope candidates whose first arg matches, then
+#      stamps `TyAny` to keep cascade graceful.
+#
+# Returning Some always means "we handled this call site". Returning
+# None always means "let the generic `w_synth(st, callee)` path run" —
+# used for the field-wins precedence step.
+fn try_ufcs_call(st: InferState, callee: Expr, args_: [Expr],
+                  line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+
+  match callee.kind {
+    EField(obj, ident) -> {
+      let r = w_synth(st, obj)
+      let obj_ty = apply_ty(r.st.sub, r.ty)
+      if record_has_field(r.st, obj_ty, ident) { None }
+      else {
+        # `c := v` and `@c` for `c : Ref[T]` desugar in
+        # the parser to `c.set(v)` / `c.get()`. `Ref[T]` is the
+        # return type of `Mutable.ref_make[T]`; `get`/`set` aren't
+        # inherent methods, but `Mutable` carries `ref_get`/`ref_set`
+        # ops with matching signatures. Bridge here, mirroring the
+        # `a[i] := v` → `Mutable.array_set(a, i, v)` precedent.
+        # Effect-row injection rides for free: `synth_op_call_with_scheme`
+        # already labels the row with `Mutable` for op calls.
+        match try_ref_sugar_op(st, obj, obj_ty, ident, args_, line, col) {
+          Some(inf) -> Some(inf)
+          None -> Some(synth_ufcs_dispatch(r.st, ident, r.expr, obj_ty, args_, line, col))
+        }
+      }
+    }
+    _ -> None
+  }
+}
+
+
+
+# rewrite `c.get()` / `c.set(v)` to `Mutable.ref_get(c)` /
+# `Mutable.ref_set(c, v)` when `c : Ref[T]`. Returns None when the
+# receiver is not a `Ref` or the ident is not `get` / `set`, so the
+# caller falls back to the regular UFCS path (preserving the existing
+# "method not found" diagnostic for unrelated names).
+fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
+                     args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
+
+
+  match obj_ty {
+    TyCon(tcs, _) ->
+      if core_ty_is(tcs, CtRef) {
+        let op_opt =
+          if ident == "get" { Some("ref_get") }
+          else if ident == "set" { Some("ref_set") }
+          else { None }
+        match op_opt {
+          None -> None
+          Some(op) -> {
+            let ms = core_effect_id(CeMutable)
+            match env_op(st.env, ms, written(op)) {
+              None -> None
+              Some(sc) -> {
+                # `obj` re-walks once inside `synth_op_call_with_scheme`
+                # (via `synth_many`); typing a read twice is idempotent.
+                let all_args = [obj, ...args_]
+                Some(synth_op_call_with_scheme(st, sc, all_args, ms, op, line, col))
+              }
+            }
+          }
+        }
+      } else { None }
+    _ -> None
+  }
+}
+
+
+
+# Lowers `obj.ident(args)` to `ident(obj, args)`. Picks among the
+# functions spelled `ident`; if none is found or its first param doesn't
+# unify with `obj_ty`, emits the Q4 method-not-found diagnostic and
+# returns a TyAny stamp. Mirrors `synth_pipe_dispatch`'s open-row pattern
+# so the dispatched call's effect labels and unify diagnostics match
+# the prefix-form call (`ident(obj, args)`).
+#
+# `obj_expr` has already been walked by `try_ufcs_call`; we walk
+# `args_` ourselves to avoid double-walking `obj` (the args may
+# carry their own effect labels and CallSite entries which must
+# stamp the final InferState).
+fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
+                        obj_ty: Ty, args_: [Expr],
+                        line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  match ufcs_target(st, ident, obj_ty, line, col) {
+    UfNone -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
+    UfTie(st_t, ss) -> {
+      let st_e = report_tie(st_t, ident, ss, true, line, col)
+      mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(field_root(obj_expr, ident, line, col, TyAny), args_), line, col), TyAny))
+    }
+    UfOne(target) -> {
+      let st_inst = target.st
+      let inst_ty = target.inst_ty
+      match inst_ty {
+        TyFnT(params, _, _) -> match params {
+          [] -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
+          [first, ..._rest] -> match unify_env(st_inst.env, first, obj_ty, st_inst.sub) {
+            None -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
+            Some(_) -> {
+              # Walk the remaining args (obj is already typed in obj_expr).
+              # Thread each declared param type (skip the receiver at
+              # params[0]) so a point-free section arg gets its receiver
+              # pinned from the combinator's element type up front.
+              let arg_param_tys = match params { [_, ...pr] -> pr  _ -> [] }
+              let ra = synth_many_threaded(st_inst, args_, arg_param_tys)
+              let all_arg_tys = [obj_ty, ...ra.tys]
+              let all_arg_exprs = [obj_expr, ...ra.exprs]
+              # Same expected-row pattern `synth_call` and
+              # `synth_pipe_dispatch` use: open-row tail so the
+              # callee's declared row variables don't force-bind the
+              # call site's row.
+              let rv = st_fresh_ty(ra.st)
+              let fr = subst_fresh_row(rv.st.sub)
+              let st_fresh = st_set_sub(rv.st, fr.subst)
+              let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+              let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
+              let synth_callee = target.callee
+              # propagate capability-only labels through UFCS.
+              let st_unif = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
+              let st2 = st_propagate_capability_labels(st_unif,
+                          apply_ty(st_unif.sub, inst_ty), line, col)
+              let callee_node = with_ty(synth_callee, inst_ty)
+              match refine_call(st2, synth_callee, inst_ty, all_arg_exprs, all_arg_tys, apply_ty(st2.sub, rv.ty)) {
+                RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty))
+              }
+            }
+          }
+        }
+        _ -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
+      }
+    }
+  }
+}
+
+
+
+# Type `name.op(args)` where `name` is a capability value. Dispatch the op to the
+# effect it carries; codegen reads `name`'s evidence node. The effect does NOT
+# join the row — the capability is provided, not demanded.
+fn cap_op_call(st: InferState, l: LocalId, op_name: String, args_: [Expr],
+               line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match cap_eff_of_var(st, l) {
+    None -> None
+    Some(esym) -> match env_op(st.env, esym, written(op_name)) {
+      Some(sc) -> Some(synth_op_call_provided(st, sc, args_, l, esym, op_name, line, col))
+      None     -> Some(synth_op_call_unknown_op(st, esym, op_name, line, col))
+    }
+  }
+
+
+
+fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
+                              esym: SymId, op: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  # No alias: a direct `Eff.op(...)` call is not a `with ... as <name>`
+  # cell, so it reaches the ambient handler and its row label is the
+  # effect's own.
+  synth_op_call_with_scheme_keys(st, sc, args_, esym, op, ViaAmbient, None, line, col)
+}
+
+
+
+# An op call on a PROVIDED capability (`c.op(...)` where `c: Eff` is a value
+# parameter, §6 named instances). Types the call exactly like a normal op call —
+# instantiate, unify args against the op scheme — but does NOT add the effect to
+# the body's row: a capability passed in is satisfied by the caller, not demanded
+# by this function (design §3 "capability as a parameter does not enter the row").
+# Codegen reads the evidence from the parameter's own slot, so distinct instances
+# stay distinct by parameter position.
+fn synth_op_call_provided(st: InferState, sc: TyScheme, args_: [Expr],
+                           recv: LocalId, esym: SymId, op: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let inst = st_instantiate_report(st, sc)
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
+  let rv = st_fresh_ty(ra.st)
+  let expected = fn_ty(ra.tys, rv.ty)
+  let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "cap op call ", esym, op), line, col)
+  let ty = apply_ty(st2.sub, rv.ty)
+  # The callee goes through the receiver, so codegen reads `recv`'s own
+  # evidence slot rather than walking by effect — distinct capability params
+  # resolve to distinct nodes. No row label: the capability is provided, not
+  # demanded.
+  let root = with_ty(mk_expr(ECall(op_callee(esym, op, ViaRecv(recv), line, col), ra.exprs), line, col), ty)
+  mk_inferred(st2, ty, root)
+}
+
+
+
+fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
+                                   esym: SymId, op: String, via: OpVia,
+                                   row_alias: Option[LocalId],
+                                   line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  # capture the fresh ids minted by instantiation. For
+  # parametric effects (where the scheme quantifies over the effect's
+  # tparams) these fresh tyvars are the row label's ty_args. For
+  # stateless effects the list is empty and the label has none.
+  # per-op generic schemes also quantify over op-level
+  # tparams; those are NOT part of the row label's ty_args. Use the
+  # `op_eff_arities` table to take only the first N fresh ids
+  # (corresponding to the effect's tparams) for the row.
+  # `via` routes the perform through the handle's own instance; the
+  # type-level lookups (op_eff_arities, row label) read the effect.
+  let inst = st_instantiate_report(st, sc)
+  let eff_fresh = take_first(inst.fresh, eff_tparam_arity(st.op_eff_arities, esym))
+  # Read before unifying: the substitution's slots mutate in place.
+  let pinned = map(eff_fresh, (id) => occurs(id, inst.ty, inst.st.sub))
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
+  let rv = st_fresh_ty(ra.st)
+  let expected = fn_ty(ra.tys, rv.ty)
+  let st2 = st_unify(rv.st, inst.ty, expected, op_what(st, "op call ", esym, op), line, col)
+  let row_args = phantom_eff_args(eff_fresh, pinned, st2.sub)
+  # tag the row label with the cell so two distinct
+  # `with <eff> as <name>` cells stay distinct labels. The cell is
+  # discharged symmetrically by its own handler.
+  let cell = alias_cell(row_alias)
+  let lab = label_in_cell(esym, row_args, cell)
+  # stash the effect + live payload tyvar ids before
+  # `st_add_label`, whose dedup may drop this label against a sibling op's
+  # concrete label of the same effect. The deferred-field drain reads it
+  # to pin a receiver the dropped label was the only carrier for, under
+  # the final sub so the `match` binder's receiver-to-payload link shows.
+  let st2p = st_push_op_payload_vars(st2, esym, cell, eff_fresh)
+  # The cell keeps distinct cells apart, so this only
+  # threads ty_args between ops of the same cell (`cur.set` → `cur.get`).
+  let st2u = st_unify_dedup_label(st2p, lab, line, col)
+  let st3 = st_add_label(st2u, lab, line, col)
+  let ty = apply_ty(st3.sub, rv.ty)
+  # The callee carries the instance the perform resolved to, for evidence selection.
+  let callee = with_ty(op_callee(esym, op, via, line, col), TyCon(esym, row_args))
+  let root = with_ty(mk_expr(ECall(callee, ra.exprs), line, col), ty)
+  mk_inferred(st3, ty, root)
+}
+
+

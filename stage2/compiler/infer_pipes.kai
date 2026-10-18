@@ -1,0 +1,821 @@
+#[doc("Typing of operators, pipes, ranges, indexing and pipe fusion.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_text
+import compiler.core_syms
+import compiler.core_builtins
+import compiler.operators
+import compiler.core_refs
+import compiler.core_protos
+import compiler.impl_identity
+import compiler.kinds
+import compiler.decl_names
+import compiler.symtab
+import compiler.index_coll
+import compiler.pipe_fusion
+import compiler.infer_unit_alias
+import compiler.char_range
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_clause_holes
+import compiler.infer_head_dispatch
+import compiler.infer_local_mutation
+import compiler.infer_arms_vec
+import compiler.infer_env_exhaust
+import compiler.infer_dump_text
+import compiler.infer_apply
+import compiler.infer_unify_rows
+import compiler.infer_instantiate
+import compiler.infer_tparam_escape
+import compiler.infer_fuse_arith
+import compiler.infer_match
+import compiler.infer_calls
+
+# Infer a pipe / combinator function argument. A point-free section takes
+# the stage's element type before its body is walked. A lambda that names
+# its parameter keeps it open: what its body asks of it is how a stage
+# written for the whole container is told from one written for an element.
+fn synth_pipe_rhs(st: InferState, rhs: Expr, elem: Option[Ty]) : Inferred / Console + File + Mutable =
+  match rhs.kind {
+    ELambda(ps, body) -> match elem {
+      Some(et) -> if params_point_free(ps) or stage_param_is_receiver(ps, body) { synth_lambda_expecting(st, ps, body, [et], rhs.line, rhs.col) }
+                  else { w_synth(st, rhs) }
+      None     -> w_synth(st, rhs)
+    }
+    _ -> w_synth(st, rhs)
+  }
+
+
+
+#[doc("Typer-internal helper `synth_field` shared across the infer modules.")]
+pub fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let r = w_synth(st, obj)
+  let applied = apply_ty(r.st.sub, r.ty)
+  # A unit or a refinement wraps the record that carries the fields.
+  let carrier = ty_dispatch_head(applied)
+  match carrier {
+    TyCon(tsym, _) -> match rec_pick(r.st.recs, tsym) {
+      None -> field_non_record_or_partial_app(r.st, r.expr, applied, fnm, line, col)
+      Some(ri) -> {
+        let inst = rec_instantiate(r.st, ri)
+        let st1 = st_unify(inst.st, inst.result_ty, carrier, "record field access", line, col)
+        match fty_find(inst.fields, fnm) {
+          Some(t) -> {
+            let ty = apply_ty(st1.sub, t)
+            mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
+          }
+          None -> {
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}#{field_hint(inst.fields, fnm)}", [])
+            render_diag(perr)
+            mk_inferred(st_bump_err(st_push_diag(st1, perr)), TyAny, field_root(r.expr, fnm, line, col, TyAny))
+          }
+        }
+      }
+    }
+    # the receiver's type is still an unbound tyvar — the
+    # canonical case is the payload of a generic effect op (`Some(b) ->
+    # b.id` where `b : ?a` and `?a` is only pinned to the row's `Box`
+    # later by `check_body_row`). We cannot decide field-vs-UFCS here:
+    # eager UFCS (the `_` fallback below) is exactly the wrong guess —
+    # it produces a bogus diagnostic. Defer instead — record a
+    # constraint keyed on the receiver tyvar, stamp the access with a
+    # FRESH result tyvar (not TyAny, so downstream uses stay connected),
+    # and let `infer_decl` resolve it once the receiver settles. This is
+    # purely a timing fix in the field-access path; it touches neither
+    # effect-row inference nor the UFCS rule for resolved receivers.
+    TyVarT(recv_id) -> {
+      let fr = st_fresh_ty(r.st)
+      let res_id = ty_var_id(fr.ty)
+      let st1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, res_id, line, col, false))
+      mk_inferred(st1, fr.ty, field_root(r.expr, fnm, line, col, fr.ty))
+    }
+    _ -> field_non_record_or_partial_app(r.st, r.expr, applied, fnm, line, col)
+  }
+}
+
+
+
+# `e1[e2]` dispatches on the container's inferred
+# type. `Map[K, V]` lowers to `map.get(coll, ix)` and `HashMap[K, V]`
+# to `hashmap.get(coll, ix)` (both return `Option[V]`); any
+# other container — including unresolved type variables — falls back
+# to `array_get(coll, ix)` so the unifier produces the existing
+# "expected `Array[T]`" error message at the call site. The chosen
+# callee's scheme types the arguments, the result AND the effect row —
+# `hashmap_get`'s `/ Mutable` included. `coll` is walked exactly once:
+# the call is typed against a placeholder (`compiler.index_coll`).
+#
+# Design note (not a smell — kept as a closed 3-case dispatch on
+# purpose): a smell audit flagged the `name == "Map"` test as wanting
+# an `Index` protocol. It does not. kaikai has exactly three indexable
+# containers (Array, Map, HashMap), and the language bans
+# type-class-style resolution — a closed compile-time dispatch is
+# precisely what is preferred over a resolution mechanism. An `Index`
+# protocol
+# would not remove a hardcode, it would move it (the proto name + the
+# builtin impls) across more sites and route every `[]` through the
+# proto impl-table at runtime. Worse, it would degrade this error:
+# the Array fallback for an unresolved type var is deliberate, and a
+# protocol over `?t` can only emit a generic "no `Index` impl" or
+# re-hardcode the Array bias inside the resolver.
+#[doc("Typer-internal helper `synth_index` shared across the infer modules.")]
+pub fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let probe = w_synth(st, coll)
+  let coll_ty = apply_ty(probe.st.sub, probe.ty)
+  let ph = ixc_ref(coll)
+  match coll_ty {
+    TyCon(tcs, _) ->
+      if core_ty_is(tcs, CtVec) { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
+      else { synth_on_coll(probe, coll_ty, ECall(index_getter(coll_ty, line, col), [ph, ix]), line, col) }
+    # A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index
+    # is a bare struct field load with the bound proved at compile time
+    # (no runtime check). A dynamic index is declined in v1.
+    TyDimT(inner, _) -> match inner {
+      TyCon(tcs, _) ->
+        if core_ty_is(tcs, CtVec) {
+          if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, probe.expr, ix, coll_ty, line, col) }
+          else {
+            let bare = mk_expr(ECall(builtin_mk(CbDetachUnit, line, col), [ph]), line, col)
+            synth_vec_index(probe, coll_ty, bare, ix, line, col)
+          }
+        } else { synth_on_coll(probe, coll_ty, ECall(builtin_mk(CbArrayGet, line, col), [ph, ix]), line, col) }
+      _ -> synth_on_coll(probe, coll_ty, ECall(builtin_mk(CbArrayGet, line, col), [ph, ix]), line, col)
+    }
+    _ -> synth_on_coll(probe, coll_ty, ECall(builtin_mk(CbArrayGet, line, col), [ph, ix]), line, col)
+  }
+}
+
+
+
+# Types the read `k`, whose collection is the placeholder, against the
+# probe's type for it, then splices the probe's typed collection back.
+fn synth_on_coll(probe: Inferred, t: Ty, k: ExprKind, line: Int,
+      col: Int) : Inferred / Console + File + Mutable {
+  let st1 = st_set_env(probe.st, env_bind_local(probe.st.env, binder_minted(ixc_name()), mono(t)))
+  let r = w_synth(st1, mk_expr(k, line, col))
+  mk_inferred(st_restore_entries(probe.st, r.st), r.ty, ixc_splice(r.expr, probe.expr))
+}
+
+
+
+# `xs[i]` on a Vec reads the element; `xs[a..b]` (inclusive, like the
+# range literal) is the O(1) slice — the same view `[h, ...t]` binds.
+fn synth_vec_index(probe: Inferred, t: Ty, coll: Expr, ix: Expr,
+                   line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match ix.kind {
+    ERange(a, b, None) -> synth_on_coll(probe, t, vec_slice_block(coll, a, b, line, col), line, col)
+    ERange(_, _, Some(_)) -> {
+      let perr = mk_diag(SevError, probe.st.file, line, col, "a stepped range cannot slice a Vec — a slice is one contiguous view", [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(probe.st, perr)), TyAny, with_ty(mk_expr(EIndex(probe.expr, ix), line, col), TyAny))
+    }
+    _ -> synth_on_coll(probe, t, ECall(builtin_mk(CbVecGet, line, col), [coll, ix]), line, col)
+  }
+
+
+
+# `v[k]` on a fixed-width `Vec[e]<n>`: a static literal index in range
+# lowers to `__fixed_vec_get` — a bare struct field load, the bound
+# proved here at compile time so no runtime check is emitted. Out of
+# range is a compile error (strictly better than the dynamic vec's
+# runtime trap). A dynamic index lowers to `__fixed_vec_get_dyn`, the
+# same inline field load behind a bounds check against the static `n`.
+fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
+                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let n = fixed_vec_n(coll_ty)
+  let elem = fixed_vec_elem(coll_ty)
+  match ix.kind {
+    EInt(k, _) ->
+      if k >= 0 and k < n {
+        fixed_vec_index_node(st, coll, ix, MkFixedVecGet, elem, line, col)
+      } else {
+        let perr = mk_diag(SevError, st.file, line, col,
+          concat_all(["index ", int_to_string(k), " is out of range for a fixed-width `Vec` of length ", int_to_string(n)]), [])
+        render_diag(perr)
+        mk_inferred(st_bump_err(st_push_diag(st, perr)), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
+      }
+    _ -> {
+      let ir = w_check_against(st, ix, TyInt, "index", ix.line, ix.col)
+      fixed_vec_index_node(ir.st, coll, ir.expr, MkFixedVecGetDyn, elem, line, col)
+    }
+  }
+}
+
+
+
+#[doc("Typer-internal helper `synth_binop` shared across the infer modules.")]
+pub fn synth_binop(st: InferState, op: BinOp, l: Expr, r: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let rl = w_synth(st, l)
+  let rr = w_synth(rl.st, r)
+  if binop_eq(op, BoConcat) {
+    synth_concat(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+  } else if binop_is_logical(op) {
+    let s1 = st_unify(rr.st, rl.ty, TyBool, "boolean operator", line, col)
+    let s2 = st_unify(s1, rr.ty, TyBool, "boolean operator", line, col)
+    mk_inferred(s2, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
+  } else if binop_is_equality(op) {
+    # `==` / `!=` are sugar for Eq.eq. The typer keeps the existing
+    # structural builtin form (`binop_root`, lowered to `kai_op_eq_v`);
+    # the structural-vs-custom-impl decision is made later, per spec,
+    # by `resolve_protocol_calls` over concrete types (it rewrites the
+    # EBinop to a `__pimpl_Eq_<T>_eq` call when the type — or a field
+    # at any depth — carries a custom `impl Eq`). Deciding here is
+    # premature: inside a generic body the operand type is still a
+    # `TyVarT` and only monomorphisation makes it concrete.
+    let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
+    mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
+  } else if binop_is_ordering(op) {
+    # `<` / `>` / `<=` / `>=` are sugar for Ord.cmp. Same as `==`: the
+    # typer keeps the structural builtin form and the per-spec protocol
+    # resolver rewrites to `__pimpl_Ord_<T>_cmp` (reduced to Bool against
+    # 0) when the concrete type has a custom `impl Ord`.
+    let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
+    mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
+  } else if binop_eq(op, BoMod) {
+    # modulo over a `Rem` protocol. Primitive `Int % Int`
+    # keeps the unify-and-emit fast path; concrete non-primitive
+    # operands desugar to a `Rem.rem` protocol-method call so user
+    # types can supply `impl Rem for T`. Heterogeneous routing follows
+    # the same shape as `*` / `/`. `Real % Real` also routes through
+    # the protocol, which dispatches to `impl Rem for Real` and lowers
+    # to the `fmod` libm binding.
+    let lty_now = apply_ty(rr.st.sub, rl.ty)
+    let rty_now = apply_ty(rr.st.sub, rr.ty)
+    if binop_should_dispatch_proto(lty_now, rty_now) {
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+    } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+    } else if ty_is_real_head(lty_now) and ty_is_real_head(rty_now) {
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+    } else if ty_is_var_head(lty_now) or ty_is_var_head(rty_now) {
+      # A generic operand keeps its type: the protocol rewrite after
+      # monomorphisation reaches `Rem` once the type is concrete.
+      let s1 = st_unify(rr.st, rl.ty, rr.ty, "arithmetic operator '%'", line, col)
+      let ty = apply_ty(s1.sub, rl.ty)
+      mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+    } else {
+      # `T % T` over a same-width fixed integer keeps the primitive fast
+      # path (`+`/`-`/`*`-style width wrap); everything else unifies with
+      # `Int`.
+      let modt = fixed_mod_result(lty_now, rty_now)
+      let s1 = st_unify(rr.st, rl.ty, modt, "integer arithmetic", line, col)
+      let s2 = st_unify(s1, rr.ty, modt, "integer arithmetic", line, col)
+      mk_inferred(s2, modt, binop_root(op, rl.expr, rr.expr, line, col, modt))
+    }
+  } else if binop_eq(op, BoMul) or binop_eq(op, BoDiv) {
+    # when neither operand is primitive numeric (Int/Real,
+    # optionally dim-wrapped) but both have concrete head TyCon (e.g.
+    # Complex), desugar to a Mul/Div protocol-method call so the
+    # post-inference rewrite can dispatch to `__pimpl_<P>_<T>_<op>`.
+    # Falls through to the dim-aware path otherwise (keeps primitive
+    # arithmetic on the zero-overhead unify-and-emit fast path).
+    let lty_now = apply_ty(rr.st.sub, rl.ty)
+    let rty_now = apply_ty(rr.st.sub, rr.ty)
+    if binop_should_dispatch_proto(lty_now, rty_now) {
+      if binop_same_head_dimmed(lty_now, rty_now) {
+        # dimensioned protocol operands (`Decimal<USD>`): the impl
+        # erases units (its signature is the bare carrier), so combine
+        # them here exactly as the primitive dim path does — the
+        # Module guard rejects habitant products, and the result
+        # carries the combined unit.
+        synth_binop_proto_dim_mul(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+      } else {
+        synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+      }
+    } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
+      # heterogeneous prim<->nonprim or cross-nonprim
+      # routing, gated on impl-existence in the snapshot.
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+    } else {
+      # multiplication and division of dimensioned values
+      # combine units rather than requiring equality. The operand-type
+      # rule still requires the *base* numeric types to agree (Real*Real
+      # / Int*Int) — we delegate that to synth_dim_mul_div.
+      synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+    }
+  } else if binop_eq(op, BoPow) {
+    # Integer-exponent power. Mirrors `*`/`/`'s UoM behaviour with one
+    # twist: the result unit is `u^n`, which only resolves when `n`
+    # is a literal Int known at compile time. If the exponent is not
+    # a literal AND the base has a non-trivial unit, the rule is
+    # rejected (no dependent types). Bare numeric bases (`Int`,
+    # `Real<1>`, …) accept any `Int` exponent.
+    synth_dim_pow(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
+  } else {
+    # protocol-method dispatch fall-through for `+` / `-`
+    # when both operands resolve to a non-primitive concrete type.
+    # Primitive `Int + Int` / `Real + Real` arithmetic still goes
+    # through the unify-and-emit path; only user types (Complex,
+    # Vector, ...) take the protocol detour.
+    let lty_now = apply_ty(rr.st.sub, rl.ty)
+    let rty_now = apply_ty(rr.st.sub, rr.ty)
+    if binop_should_dispatch_proto(lty_now, rty_now) {
+      # dimensioned protocol operands keep the primitive rule: `+` and
+      # `-` demand unit equality. The impl signature is the bare
+      # carrier and would silently swallow a unit mismatch.
+      let st_d = if binop_same_head_dimmed(lty_now, rty_now) {
+        let what = string_concat("arithmetic operator '", string_concat(binop_text(op), "'"))
+        st_unify(rr.st, rl.ty, rr.ty, what, line, col)
+      } else { rr.st }
+      synth_binop_proto(st_d, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+    } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty_now, rty_now) {
+      # heterogeneous routing.
+      synth_binop_proto(rr.st, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
+    } else {
+      # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
+      # checks the unit equality automatically.
+      let what = string_concat("arithmetic operator '", string_concat(binop_text(op), "'"))
+      let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
+      let s2 = st_check_arith_string(s1, op, rl.ty, line, col)
+      let ty = apply_ty(s2.sub, rl.ty)
+      mk_inferred(s2, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+    }
+  }
+}
+
+
+
+# Build a call of the operator protocol's dispatcher on `[l, r]` and walk
+# it through `synth_call`. The lower-protocols pass has already
+# generated the dispatcher (when the matching protocol is declared); the
+# post-inference rewrite then redirects to the impl.
+fn synth_binop_proto(st: InferState, op: BinOp, le: Expr, lt: Ty,
+                      re: Expr, rt: Ty,
+                      line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  match binop_check_against_impl(st, op, lt, rt, line, col) {
+    BinopImpl(st_h, declared) ->
+      binop_impl_result(synth_call(st_h, binop_dispatcher_ref(st_h.protos.ids, binop_proto(op), line, col), [le, re], line, col), declared)
+  }
+}
+
+
+
+# `*` / `/` over dimensioned protocol operands: combine the units the
+# way the primitive dim path does, run the Module formation guard on
+# the combined unit, dispatch to the impl on the bare carriers, and
+# stamp the combined unit back onto the impl's result. `USD·USD` dies
+# in the guard; `Decimal<USD> · Decimal` keeps the habitant; a full
+# cancellation (`USD/USD`) yields the bare carrier.
+fn synth_binop_proto_dim_mul(st: InferState, op: BinOp,
+                             le: Expr, lt: Ty, re: Expr, rt: Ty,
+                             line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let ls = ty_split_dim(lt, st.sub)
+  let rs = ty_split_dim(rt, st.sub)
+  let combined = if binop_eq(op, BoMul) { UMul(ls.dim, rs.dim) }
+                 else { UMul(ls.dim, UInv(rs.dim)) }
+  let s1 = st_check_atomic_unit(st, op, combined, line, col)
+  # The units are the combined-unit rule's business, already checked
+  # above; the impl sees the bare carriers.
+  let inf = synth_binop_proto(s1, op, le, ls.base, re, rs.base, line, col)
+  let base = (ty_split_dim(inf.ty, inf.st.sub)).base
+  let ty = dim_collapse(base, unit_canon(combined))
+  mk_inferred(inf.st, ty, with_ty(inf.expr, ty))
+}
+
+
+
+#[doc("Typer-internal helper `synth_unop` shared across the infer modules.")]
+pub fn synth_unop(st: InferState, op: UnOp, x: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let r = w_synth(st, x)
+  match op {
+    UoNot -> {
+      let s1 = st_unify(r.st, r.ty, TyBool, "logical 'not'", line, col)
+      let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), TyBool)
+      mk_inferred(s1, TyBool, root)
+    }
+    UoNeg ->
+      if ty_negates(apply_ty(r.st.sub, r.ty)) {
+        let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), r.ty)
+        mk_inferred(r.st, r.ty, root)
+      } else { synth_call(r.st, op_dispatcher_ref(r.st.protos.ids, CpNeg, neg_proto_method(), line, col), [r.expr], line, col) }
+  }
+}
+
+
+
+#[doc("Typer-internal helper `synth_range` shared across the infer modules.")]
+pub fn synth_range(st: InferState, lo: Expr, hi: Expr, stp: Option[Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let rl = w_synth(st, lo)
+  if range_of_chars(apply_ty(rl.st.sub, rl.ty), hi) { synth_char_range(st, rl, lo, hi, stp, line, col) }
+  else {
+    let s1 = st_unify(rl.st, TyInt, rl.ty, "range start", line, col)
+    let rh = w_synth(s1, hi)
+    let s2 = st_unify(rh.st, TyInt, rh.ty, "range end", line, col)
+    match stp {
+      None -> {
+        let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, None), line, col), TyListT(TyInt))
+        mk_inferred(s2, TyListT(TyInt), root)
+      }
+      Some(se) -> {
+        let rs_ = w_synth(s2, se)
+        let s3 = st_unify(rs_.st, TyInt, rs_.ty, "range step", line, col)
+        let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, Some(rs_.expr)), line, col), TyListT(TyInt))
+        mk_inferred(s3, TyListT(TyInt), root)
+      }
+    }
+  }
+}
+
+
+
+# A range of Chars is the range of their code points, each mapped back:
+# `map([code(lo)..code(hi)], int_to_char)`. The three elements are held to
+# Char first, so a mix is reported against the range and not against the
+# rewrite; `peek` is the start, already read once to choose this path.
+fn synth_char_range(st: InferState, peek: Inferred, lo: Expr, hi: Expr, stp: Option[Expr],
+                    line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let s1 = st_unify(peek.st, TyChar, peek.ty, "range start", line, col)
+  let rh = w_synth(s1, hi)
+  let s2 = st_unify(rh.st, TyChar, rh.ty, "range end", line, col)
+  let s3 = char_range_second(s2, stp, line, col)
+  if s3.errs > st.errs { inferred_leaf(s3, TyListT(TyChar), mk_expr(EList([]), line, col)) }
+  else {
+    let codes = mk_expr(ERange(char_code(lo), char_code(hi), inf_map_opt_expr(stp, char_step)), line, col)
+    let back = mk_sym(builtin_sym("int_to_char"), line, col)
+    w_synth(st_restore_deferred_fields(s3, st.deferred_fields, st.deferred_homs),
+          mk_expr(ECall(mk_sym(builtin_sym("map"), line, col), [codes, back]), line, col))
+  }
+}
+
+
+
+#[doc("Typer-internal helper `synth_pipe` shared across the infer modules.")]
+pub fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let att = try_fuse_terminal_fold(st, lhs, rhs, line, col)
+  match att.fused {
+    Some(inf) -> inf
+    None      -> synth_pipe_plain(att.st, lhs, rhs, line, col)
+  }
+}
+
+
+
+# The callee of a pipe stage. A name the resolver left for the typer,
+# one several modules declare (`filter` of both `option` and `list`), is
+# narrowed by the piped value's type: under the pipe rewrite that value
+# is the callee's first argument. A settled callee, and one with a single
+# candidate, is read as any callee is.
+fn synth_pipe_callee(st: InferState, f: Expr, lhs_ty: Ty) : Inferred / Console + File + Mutable = match f.kind {
+  EName(nm) -> {
+    let candidates = bare_fn_candidates(st, nm)
+    if list_length(candidates) < 2 { synth_callee(st, f) }
+    else { match pick_by_first_arg(st, candidates, apply_ty(st.sub, lhs_ty), f.line, f.col) {
+      FaNone -> synth_callee(st, f)
+      FaTie(st_t, ss) -> inferred_leaf(report_name_tie(st_t, nm, ss, true, f.line, f.col), TyAny, f)
+      FaOne(pick) -> mk_inferred(pick_inst(pick, f.line, f.col), pick.inst_ty, with_ty(pick_ref(pick, f.line, f.col), pick.inst_ty))
+    } }
+  }
+  _ -> w_synth(st, f)
+}
+
+
+
+fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let rl = w_synth(st, lhs)
+  let res = match rhs.kind {
+    ECall(f, pa) -> {
+      let rf = synth_pipe_callee(rl.st, f, rl.ty)
+      let ra = synth_many_expecting(rf.st, pa, params_after_first(fn_param_tys(rf.st, rf.ty)))
+      let rv = st_fresh_ty(ra.st)
+      # same open-row trick `synth_call`
+      # uses — let the callee's row tail bind to a fresh row var so
+      # `xs |> each(handler)` against a row-polymorphic combinator
+      # passes type checking when `handler` carries effect labels.
+      let fr = subst_fresh_row(rv.st.sub)
+      let st_fresh = st_set_sub(rv.st, fr.subst)
+      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let expected = TyFnT([rl.ty, ...ra.tys], rv.ty, expected_row)
+      let st_unif = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
+      let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, rf.ty), line, col)
+      match refine_call(st2, rf.expr, rf.ty, [rl.expr, ...ra.exprs], [rl.ty, ...ra.tys], apply_ty(st2.sub, rv.ty)) {
+        RefCall(st3, ty) -> PipeRes { st: st3, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr, ...ra.exprs]), line, col) }
+      }
+    }
+    _ -> {
+      let rf = synth_pipe_callee(rl.st, rhs, rl.ty)
+      let rv = st_fresh_ty(rf.st)
+      let fr = subst_fresh_row(rv.st.sub)
+      let st_fresh = st_set_sub(rv.st, fr.subst)
+      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let expected = TyFnT([rl.ty], rv.ty, expected_row)
+      let st_unif = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
+      let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, rf.ty), line, col)
+      match refine_call(st2, rf.expr, rf.ty, [rl.expr], [rl.ty], apply_ty(st2.sub, rv.ty)) {
+        RefCall(st3, ty) -> PipeRes { st: st3, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr]), line, col) }
+      }
+    }
+  }
+  mk_inferred(res.st, res.ty, with_ty(res.call, res.ty))
+}
+
+# head-owner cache.
+#
+# `synth_pipe_dispatch` rewrites `xs | f`, `xs || f`, and `xs |? p`
+# into a qualified call against the module that owns the LHS's head
+# type — `List → list.map`, `MyBox → mypkg.mybox.map`, etc.
+#
+# Earlier this was a hardcoded `if head == "List" { Some("list") }`
+# table that knew exactly one entry. That made any downstream package
+# wishing to participate in `|` (ahu.stream.Source[T], henua.EventBus,
+# manutara stream/sink types, …) require a recompile of `kaic2`.
+# Unacceptable for a downstream-package ecosystem.
+#
+# Why convention beats annotation/protocol here:
+#   * Operator protocols (`+`-style) require the op's signature to fit
+#     `(Self, X) -> Y` shapes a protocol can express. `map`'s shape is
+#     `F[A] -> (A -> B) -> F[B]` — higher-kinded. CLAUDE.md bans HKT in
+#     the typer; protocols cannot express it.
+#   * Effect rows in operator-protocol ops are also banned, but `map`
+#     against an effectful function carries the function's effect row
+#     into its own signature — protocols would have to admit row-poly
+#     ops, which they don't.
+#   * Annotations (`#pipe_dispatch`) cost a parser change and a new
+#     visible concept for ~5 stdlib + future package decls. Convention
+#     is free at the surface, costs ~70 LOC inside the compiler, and
+#     mirrors how qualified-name resolution already works for
+#     `EModCall`-driven calls.
+#
+# The cache shape: `[HOE(head type, [module_path])]`. A single-element
+# `module_path` list is the dispatchable case; a multi-element list is
+# ambiguous and the typer reports the modules at the use site so the
+# user can pick `mod.T` annotation or rename one of the conflicting
+# `pub type T` declarations.
+#
+# Canonical signatures package authors must follow for their `pub type T`
+# to participate in `|` / `||` / `|?` (the LHS receiver is always the
+# first argument; the function/predicate is second; the return wraps
+# the same head type):
+#
+#   pub fn map[A, B, e](xs: T[A], f: (A) -> B / e) : T[B] / e
+#   pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
+#   pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
+#
+# A head carrying an `(element, row)` parameter list — `Stream[t, e]`,
+# the streaming carrier whose effect row is a type parameter — also
+# rides the pipes: dispatch is by the head type (arity-agnostic), and the
+# whole LHS type unifies against the canonical receiver, so the row
+# slot threads via the row carrier (`row_arg_carrier`). The element
+# unifies against the first slot; the row threads as `e`.
+#
+# A package that ships `map` with a swapped argument order or a missing
+# row var still surfaces the standard call-inference signature mismatch
+# — the typer does not need a separate diagnostic for "your map shape
+# is wrong". (An extra *type* parameter that is NOT the trailing
+# effect-row slot still mismatches; only the legitimate `(element, row)`
+# shape is accepted.)
+#
+# Construction: linear over `(decls, modules)`, called once per
+# `compile_source` invocation right before `infer_program`
+# runs the typer over the same decl stream. Lookup at each pipe call
+# site is `find_head_owner` walking the cache; it is a small linear
+# list (one entry per `pub type` across all modules in scope) and the
+# constant-factor cost dominates over a hash map until the program
+# crosses ~hundreds of pub types — hello-world programs sit at <50.
+
+
+
+#[doc("Typer-internal helper `synth_pipe_dispatch` shared across the infer modules.")]
+pub fn synth_pipe_dispatch(st: InferState, pop: PipeOp, lhs: Expr, rhs: Expr,
+                        line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let cf = pipe_op_core_fn(pop)
+  let op = core_fn_name(cf)
+
+
+  let rl = w_synth(st, lhs)
+  let lhs_ty = apply_ty(rl.st.sub, rl.ty)
+  let hsym = ty_head_sym(lhs_ty)
+  match inf_ty_head_name(rl.st.env.tab, lhs_ty) {
+    None -> {
+      let perr = mk_diag(SevError, rl.st.file, line, col,
+        concat_all([op, "-pipe requires a concrete head type on the ",
+          "left-hand side; got an unresolved type variable. Annotate ",
+          "the LHS or restructure the pipeline."]), [])
+      render_diag(perr)
+      let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
+      mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
+    }
+    Some(head) -> match pipe_rejection_reason(hsym, pop) {
+      Some(msg) -> {
+        let perr = mk_diag(SevError, rl.st.file, line, col, msg, [])
+        render_diag(perr)
+        let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
+        mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
+      }
+      None -> match find_head_owner(rl.st.env, hsym) {
+        HLNone -> {
+          let perr = mk_diag(SevError, rl.st.file, line, col,
+            concat_all(["no module declaring type `", head, "` is in scope"]), [])
+          render_diag(perr)
+          let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
+          mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
+        }
+        HLAmbiguous(mods) -> {
+          let perr = mk_diag(SevError, rl.st.file, line, col,
+            concat_all(["ambiguous head type `", head, "` — ",
+              join_modules_for_diag(map(mods, (m) => "#{sym_name(rl.st.env.tab, m)}")),
+              " all declare it. Use qualified type annotation."]), [])
+          render_diag(perr)
+          let root = with_ty(mk_expr(EDispatchPipe(pop, rl.expr, rhs), line, col), TyAny)
+          mk_inferred(st_bump_err(st_push_diag(rl.st, perr)), TyAny, root)
+        }
+        HLOk(owner) -> {
+          # call the module's own `op` when it declares one — that is
+          # the dispatch-eligible case (the diagnostic surface
+          # `pipe_no_map` checks). When it declares none the call
+          # reaches the runtime's primitive of that op: this is the
+          # seeded head, `List → list`, under a harness that does not
+          # load `core/list.kai` as a core. For a user-defined head
+          # whose declaring module ships no canonical op, the
+          # primitive then triggers the standard call-inference
+          # signature mismatch, after the diagnostic below.
+          let qualified = env_module_fn(rl.st.env, owner, op)
+          # A `Shape`-protocol impl (`impl Sequence for Chain { map, ... }`)
+          # provides the pipe op even when the head's module ships no
+          # `map` function: call its dispatcher, which `resolve_protocol_calls`
+          # retargets to `__pimpl_<P>_<head>_<op>` post-typing.
+          let proto_disp = pipe_op_dispatcher(rl.st.protos, lhs_ty, op)
+          let head_proto_op = is_some(proto_disp)
+          let callee_kind = match qualified {
+            Some(s) -> ESym(s, spec_none())
+            None    -> match proto_disp {
+              Some(k) -> k
+              None    -> ESym(builtin_sym(op), spec_none())
+            }
+          }
+          # emit the "module declares T but does not
+          # export op" diagnostic only when the head was contributed
+          # by the from_decls walk — i.e. a real user `pub type` —
+          # AND the module ships no qualified op. The seeded
+          # `List → list` case stays silent and routes through the
+          # primitive so existing test-sugars fixtures (no
+          # `--core core/list.kai`) continue to compile.
+          let st_after_diag = match qualified {
+            Some(_) -> rl.st
+            None ->
+              if core_ty_is(hsym, CtList) or head_proto_op { rl.st }
+              else {
+                let perr = mk_diag(SevError, rl.st.file, line, col,
+                  "module `#{sym_name(rl.st.env.tab, owner)}` declares `#{head}` but does not export `#{op}`", [])
+                render_diag(perr)
+                st_bump_err(st_push_diag(rl.st, perr))
+              }
+          }
+          let rc = w_synth(st_after_diag, with_ty(mk_expr(callee_kind, line, col), TyAny))
+          let pe = pipe_elem_from_callee(rc.st.env, rc.st.sub, rc.ty, lhs_ty)
+          let st_pe = match pe {
+            Some(PE(_, s)) -> st_set_sub(rc.st, s)
+            None           -> rc.st
+          }
+          let elem = pipe_elem_ty(pe)
+          let rf = each_stage_checked(pop, synth_pipe_rhs(st_pe, rhs, elem), line, col)
+          let rv = st_fresh_ty(rf.st)
+          let ret = match pop {
+            PoEach -> TyUnit
+            _      -> rv.ty
+          }
+          let fr = subst_fresh_row(rv.st.sub)
+          let st_fresh = st_set_sub(rv.st, fr.subst)
+          let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+          let expected = TyFnT([rl.ty, rf.ty], ret, expected_row)
+          # Use the same unify-message label as `synth_call` so existing
+          # diagnostics-pinning fixtures (e.g.
+          # `examples/sugars/map_pipe_type_mismatch.err.expected`)
+          # match identically — the surface-level lane should not
+          # change unrelated diagnostic strings.
+          let pipe_callee = mk_expr(callee_kind, line, col)
+          let st2 = match pipe_stage_wants_container(st_fresh.env, st_fresh.sub, rl.ty, rf.ty, elem) {
+            Some(param) -> {
+              emit_pipe_wants_apply(st_fresh, pop, rhs, param, elem, line, col)
+              st_bump_err(st_fresh)
+            }
+            None ->
+              st_unify_named(st_fresh, pipe_callee_shown(st_fresh, owner, op, qualified, pipe_callee),
+                             rc.ty, [rl.ty, rf.ty], expected, line, col)
+          }
+          match refine_call(st2, pipe_callee, rc.ty, [rl.expr, rf.expr], [rl.ty, rf.ty], apply_ty(st2.sub, ret)) {
+            RefCall(st3, ty) -> {
+              let fused = try_fuse_map_pipe(st3, cf, rc.expr, rl.expr, rf.expr, ty, line, col)
+              mk_inferred(fused.st, ty, fused.root)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+fn try_fuse_terminal_fold(st: InferState, lhs: Expr, rhs0: Expr,
+                          line: Int, col: Int) : FuseAttempt / Console + File + Mutable = {
+  let rhs = if pipe_fusion_head(lhs) { terminal_settled(st, rhs0) } else { rhs0 }
+  match pipe_fusion_as_terminal_fold(st.protos.ids, lhs, rhs) {
+    None -> FuseAttempt { st: st, fused: None }
+    Some(ff) -> {
+      let g = fuse_terminal_gate(st, ff)
+      if g.ok {
+        # Peek the source head; the peek synth advances the fresh-tvar
+        # counter and binds in the shared `sub`, so the rewrite synth must
+        # continue from the RETURNED state (`peek.0`), not `g.st` — reusing
+        # the old counter re-mints the peek's already-bound ids (#1186).
+        let peek = fuse_source_is_protocol_seq(g.st, ff)
+        let st_after = match peek { FSP(s, _, _) -> s }
+        let is_seq = match peek { FSP(_, b, _) -> b }
+        let of_chars = match peek { FSP(_, _, c) -> c }
+        let proto_foldl = pipe_fusion_proto_foldl(st.protos.ids, rhs)
+        if of_chars or fuse_owner_mismatch(ff, proto_foldl, is_seq) { FuseAttempt { st: st_after, fused: None } }
+        else {
+          let rewrite = if is_seq {
+            pipe_fusion_generic_fold_rewrite(ff, proto_foldl, line, col)
+          } else {
+            pipe_fusion_fold_rewrite(ff, line, col)
+          }
+          FuseAttempt { st: st_after, fused: Some(w_synth(st_after, rewrite)) }
+        }
+      } else { FuseAttempt { st: g.st, fused: None } }
+    }
+  }
+}
+
+
+
+fn fuse_source_is_protocol_seq(st: InferState, ff: FusedFold) : FuseSeqPeek / Console + File + Mutable =
+  fuse_source_peek(st, ff.source)
+
+
+
+#[doc("Typer-internal helper `fuse_source_peek` shared across the infer modules.")]
+pub fn fuse_source_peek(st: InferState, source: Expr) : FuseSeqPeek / Console + File + Mutable {
+  let r = w_synth(st, source)
+  let src_ty = apply_ty(r.st.sub, r.ty)
+  let head_ok = not core_ty_is(ty_head_sym(src_ty), CtList) and pipe_op_has_impl(st.protos.impls, src_ty, "foldl")
+  let of_chars = pipe_fusion_head(source) and ty_is_char_list(src_ty)
+  FSP(st_restore_deferred_fields(r.st, st.deferred_fields, st.deferred_homs), head_ok, of_chars)
+}
+
+
+
+# An explicit `foldl` keeps the Mutable-masked purity gate — its stage
+# and combine still run, only reordered. An implicit terminal (`sum`,
+# `product`, `length`) rewrites to a target with a row-less stage
+# parameter — and `length` drops the stages — so it demands strictly
+# empty labels.
+fn fuse_terminal_gate(st: InferState, ff: FusedFold) : FuseGate / Console + File + Mutable =
+  match ff.term {
+    TermFoldl(_, combine) -> {
+      let g = fuse_all_raw(st, ff.stages, false)
+      if g.ok { fuse_raw(g.st, combine, false) } else { g }
+    }
+    _ -> fuse_all_raw(st, ff.stages, true)
+  }
+
+
+
+#[doc("Typer-internal helper `fuse_all_raw` shared across the infer modules.")]
+pub fn fuse_all_raw(st: InferState, closures: [Expr], strict: Bool) : FuseGate / Console + File + Mutable =
+  match closures {
+    [] -> FuseGate { st: st, ok: true }
+    [c, ...rest] -> {
+      let g = fuse_raw(st, c, strict)
+      if g.ok { fuse_all_raw(g.st, rest, strict) } else { g }
+    }
+  }
+
+
+
+# Synthesise a raw stage/combine closure solely to read its effect row.
+# The typed node is discarded — only the verdict and the threaded state
+# are kept. The probe's `deferred_fields` are rolled back: a stage body
+# `(r) => r.field` with an unannotated `r` synthesised in isolation defers
+# the field against a receiver tyvar that this probe never pins (only the
+# re-synthesised rewrite call binds the real stage param to the element
+# type). Left in the worklist, that orphan receiver drains to a spurious
+# "annotation needed". The fresh-tvar counter and substitution still ride
+# forward — rewinding those would re-mint ids the probe already bound.
+fn fuse_raw(st: InferState, closure: Expr, strict: Bool) : FuseGate / Console + File + Mutable {
+  let r = w_synth(st, closure)
+  let ok = if strict { fuse_row_strict(r.st.sub, r.expr) }
+           else { fuse_stage_pure(r.st.sub, r.expr) }
+  FuseGate { st: st_restore_deferred_fields(r.st, st.deferred_fields, st.deferred_homs), ok: ok }
+}
+
+
