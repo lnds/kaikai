@@ -169,44 +169,51 @@ fn nemit_evf_build_frame(ctx: Handle, callee: String, f: KFn, fx: NFnIndex, n: I
   let arrty = llvm_array_type(native_ctx_ptrt(ctx), n)
   let frame = llvm_build_alloca_entry(ctx, arrty, "__evf_frame")
   let keys = nfnx_frame_keys(fx, f)
-  if list_length(keys) == n { nemit_evf_fill_slots(ctx, fx.tab, keys, arrty, frame, 0) }
+  if list_length(keys) == n { nemit_evf_fill_slots(ctx, fx.tab, keys, arrty, frame) }
   else { nemit_unsupported(ctx, cat2("evidence frame: the slots of the symbol are not the frame of ", callee)) }
   frame
 }
 
-fn nemit_evf_fill_slots(ctx: Handle, tab: SymTab, keys: [InstKey], arrty: Handle, frame: Handle, j: Int) : Unit / Console = match keys {
-  [] -> ()
-  [k, ...rest] -> {
-    let node = nemit_evf_slot_node(ctx, tab, k)
-    let idx = llvm_const_int(native_ctx_i64t(ctx), j)
-    let slotptr = llvm_build_array_gep(native_ctx_b(ctx), arrty, frame, idx)
-    let _s = llvm_build_store(native_ctx_b(ctx), node, slotptr)
-    nemit_evf_fill_slots(ctx, tab, rest, arrty, frame, j + 1)
-  }
+# Resolve the frame in one runtime pass over the slots' label and default
+# tables: a lexical handler on the stack wins, falling back to the minted default
+# node of a default-bearing effect. The runtime reports `effect not handled in
+# fiber` for a NULL node (no handler on this fiber — the walk crossed a spawn) or
+# a zeroed synth-default whose handler slot is NULL, instead of storing a slot the
+# perform derefs to a segfault. `Ffi` declares no ops and is routed around the
+# dispatcher, so its slot node legitimately carries a NULL handler: exempt.
+fn nemit_evf_fill_slots(ctx: Handle, tab: SymTab, keys: [InstKey], arrty: Handle, frame: Handle) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let i64t = native_ctx_i64t(ctx)
+  let labels = llvm_build_alloca_entry(ctx, arrty, "__evf_labels")
+  let defaults = llvm_build_alloca_entry(ctx, arrty, "__evf_defaults")
+  let unchecked = nemit_evf_store_tables(ctx, tab, keys, arrty, labels, defaults, 0, 1, 0)
+  let ptb = llvm_buf_new()
+  let ab = llvm_buf_new()
+  llvm_buf_push(ptb, p); llvm_buf_push(ab, frame)
+  llvm_buf_push(ptb, i64t); llvm_buf_push(ab, llvm_const_int(i64t, list_length(keys)))
+  llvm_buf_push(ptb, p); llvm_buf_push(ab, labels)
+  llvm_buf_push(ptb, p); llvm_buf_push(ab, defaults)
+  llvm_buf_push(ptb, i64t); llvm_buf_push(ab, llvm_const_int(i64t, unchecked))
+  let _r = ncall_finish(ctx, "kaix_evidence_fill_frame", p, ptb, ab)
+  ()
 }
 
-# The node a caller fills a slot with: a lexical handler on the stack wins,
-# falling back to the minted default node for a default-bearing effect. Either
-# result is guarded by `kaix_evidence_require` so a NULL node (no handler on
-# this fiber — the walk crossed a spawn) or a zeroed synth-default node whose
-# handler slot is NULL (a fiber-local/user effect with no real default) reports
-# `effect not handled in fiber` instead of being stored as a slot the perform
-# derefs to a segfault.
-fn nemit_evf_slot_node(ctx: Handle, tab: SymTab, k: InstKey) : Handle / Console = {
-  let p = native_ctx_ptrt(ctx)
-  let key = inst_key_text(tab, k)
-  let effname = llvm_build_global_string(native_ctx_b(ctx), key)
-  let g = llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", rt_name(tab, k.eff)))
-  let node =
-    if llvm_handle_is_null(g) == 1 {
-      ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
-    } else {
-      ncall_sig2(ctx, "kaix_evidence_lookup_or_default", p, p, p, effname, g)
-    }
-  # `Ffi` declares no ops and is routed around the dispatcher, so its slot node
-  # legitimately carries a NULL handler the FFI shim never dereferences.
-  if effect_is(k.eff, CeFfi) { node }
-  else { ncall_sig2(ctx, "kaix_evidence_require", p, p, p, node, effname) }
+# Store each slot's label and default node (null when the effect has none) at
+# its index; returns the bit set of the slots exempt from the unhandled report.
+fn nemit_evf_store_tables(ctx: Handle, tab: SymTab, keys: [InstKey], arrty: Handle, labels: Handle, defaults: Handle,
+                          j: Int, bit: Int, unchecked: Int) : Int / Console = match keys {
+  [] -> unchecked
+  [k, ...rest] -> {
+    let b = native_ctx_b(ctx)
+    let idx = llvm_const_int(native_ctx_i64t(ctx), j)
+    let label = llvm_build_global_string(b, inst_key_text(tab, k))
+    let g = llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", rt_name(tab, k.eff)))
+    let def = if llvm_handle_is_null(g) == 1 { llvm_const_null(native_ctx_ptrt(ctx)) } else { g }
+    let _l = llvm_build_store(b, label, llvm_build_array_gep(b, arrty, labels, idx))
+    let _d = llvm_build_store(b, def, llvm_build_array_gep(b, arrty, defaults, idx))
+    let next = if effect_is(k.eff, CeFfi) { unchecked + bit } else { unchecked }
+    nemit_evf_store_tables(ctx, tab, rest, arrty, labels, defaults, j + 1, bit * 2, next)
+  }
 }
 
 # Materialise each arg at its param's slot, pushing the param TYPE into

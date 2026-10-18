@@ -992,14 +992,18 @@ fn emit_nullary_read(tab: SymTab, row: VariantEntry) : String = match row {
   EV(_, _, tag, c) -> concat_all(["kai_nullary_fast(", int_to_string(tag), ", \"", ctor_cell_name(tab, c), "\")"])
 }
 
+# The immortal closure of a capture-free fn: one per reference site, built on first use.
+fn static_closure_c(thunk: String, arity: Int) : String =
+  concat_all(["({ static KaiValue *_sc; kai_static_closure(&_sc, &", thunk, ", ", int_to_string(arity), "); })"])
+
 # A function or a builtin in value position: the closure of its thunk.
 fn emit_ident_value(fid: FnId, cx: EmitCtx) : String = match fnx_callee(cx.fx, fid) {
   Some(EFn(n, ar, mo, _, _)) ->
-    cat5("kai_closure(&", c_user_thunk_sym(c_sym(written_text(n), mo)), ", ", int_to_string(ar), ", 0, NULL)")
+    static_closure_c(c_user_thunk_sym(c_sym(written_text(n), mo)), ar)
   None -> match core_ix_boxed(cx.core_ix, fnid_sym(fid)) {
     Some(ep) -> match ep {
       EP(_, cname, ar) ->
-        cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+        static_closure_c(cat3("_", cname, "_thunk"), ar)
     }
     None -> c_temp(emit_fn_text(cx.tab, cx.specs, fid))
   }
@@ -2308,13 +2312,33 @@ fn evf_join_args(frame_arg: String, rest: String) : String =
   else if rest == "" { frame_arg }
   else { concat_all([frame_arg, ", ", rest]) }
 
-# The frame value a thunk passes: a default-bearing slot from its minted
-# default node, else the live by-name walk (the thunk has no caller frame; the
-# node live at the indirect call is the ≤1-handler-correct one). Empty when the
-# callee carries no frame.
-fn emit_evf_thunk_frame(slots: [InstKey], effs: [Decl], tab: SymTab) : String = match slots {
+# The frame a thunk passes, resolved at the call by one runtime pass over its
+# slots: a lexical handler on the stack wins, else the minted default node of a
+# default-bearing effect. The tables are static; `__tf` is the frame, "" when
+# the callee carries none.
+fn emit_evf_thunk_prelude(slots: [InstKey], effs: [Decl], tab: SymTab) : String = match slots {
   [] -> ""
-  _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, (e) => evf_thunk_slot(e, effs, tab)), ", "), "}"])
+  _  -> {
+    let n = int_to_string(list_length(slots))
+    let labels = join_with(map(slots, (e) => cat3("\"", inst_key_text(tab, e), "\"")), ", ")
+    let defs = join_with(map(slots, (e) => evf_thunk_default(e, effs, tab)), ", ")
+    concat_all([
+      "    static const char *const __tl[] = {", labels, "};\n",
+      "    static KaiEvidence *const __td[] = {", defs, "};\n",
+      "    KaiEvidence *__tf[", n, "];\n",
+      "    kai_evidence_fill_frame(__tf, ", n, ", __tl, __td, ", int_to_string(evf_thunk_unchecked(slots, 1, 0)), "ULL);\n"])
+  }
+}
+
+fn evf_thunk_default(key: InstKey, effs: [Decl], tab: SymTab) : String =
+  if effect_declares_default(effs, key.eff) { cat2("&_kai_default_node_", string_to_lower_ascii(rt_name(tab, key.eff))) }
+  else { "NULL" }
+
+# Bit i marks slot i exempt from the unhandled-effect report (`Ffi`, whose node
+# carries no handler by design).
+fn evf_thunk_unchecked(slots: [InstKey], bit: Int, acc: Int) : Int = match slots {
+  [] -> acc
+  [k, ...rest] -> evf_thunk_unchecked(rest, bit * 2, if effect_is(k.eff, CeFfi) { acc + bit } else { acc })
 }
 
 fn evf_thunk_slot(key: InstKey, effs: [Decl], tab: SymTab) : String = {
@@ -5217,10 +5241,7 @@ fn emit_lambda_ref(x: Expr, cx: EmitCtx) : String {
         let arity = list_length(params)
         let n_caps = list_length(caps)
         if n_caps == 0 {
-          concat_all([
-            "kai_closure(&", lam_symbol(l),
-            ", ", int_to_string(arity), ", 0, NULL)"
-          ])
+          static_closure_c(lam_symbol(l), arity)
         } else {
           concat_all([
             "kai_closure(&", lam_symbol(l),
@@ -8025,10 +8046,11 @@ fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: Ev
       # still hands back a `KaiValue *`. This is the dispatch
       # bridge between the boxed first-class-fn world and the
       # raw direct-call world.
-      # A thunk is the indirect (closure) entry; it has no
-      # caller frame, so it fills the callee's frame from the live evidence
-      # stack (a walk per slot — the ≤1-handler-correct node at the call).
-      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, fid), effs, tab)
+      # A thunk is the indirect (closure) entry; it has no caller frame, so it
+      # resolves the callee's frame against the evidence stack live at the call.
+      let thunk_slots = frame_slots_of(frames, fid)
+      let thunk_prelude = emit_evf_thunk_prelude(thunk_slots, effs, tab)
+      let thunk_frame = if thunk_prelude == "" { "" } else { "__tf" }
       match fnx_ufn_sig_first(fx, fid) {
         Some(US(pts, rt, mask)) -> {
           # Mixed-param lane: raw slots unbox `args[i]` to `kair_<p>`,
@@ -8042,13 +8064,13 @@ fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: Ev
             arg_unbox,
             "    return ", ufn_call_result(rt, call_raw), ";\n}\n\n"
           ])
-          concat_all([hdr, body])
+          concat_all([hdr, thunk_prelude, body])
         }
         None -> {
           let param_reads = emit_param_reads(params, 0, params_table(params))
           let named_args = emit_param_args(params, params_table(params))
           let call = concat_all(["    return ", c_user_sym(sym), "(", evf_join_args(thunk_frame, named_args), rd_arg, ");\n}\n\n"])
-          concat_all([hdr, param_reads, call])
+          concat_all([hdr, thunk_prelude, param_reads, call])
         }
       }
       }

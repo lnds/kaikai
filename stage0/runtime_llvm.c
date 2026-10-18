@@ -359,6 +359,10 @@ KaiValue *kaix_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures)
     return kai_closure(fn, arity, n_captures, captures);
 }
 
+KaiValue *kaix_static_closure(KaiValue **slot, KaiFn fn, int arity) {
+    return kai_static_closure(slot, fn, arity);
+}
+
 /* Indirect call for a closure value held in a local binding. The LLVM
    backend emits this when a ECall's head is a fn-typed parameter or
    let binding — we can't lower it as a direct `call @kai_<name>`
@@ -1560,6 +1564,10 @@ void *kaix_evidence_lookup_node(const char *eff_label) {
 
 void *kaix_evidence_require(void *node_v, const char *eff_label) {
     return (void *) kai_evidence_require((KaiEvidence *) node_v, eff_label);
+}
+
+void *kaix_evidence_fill_frame(void *out, int64_t n, const char *const *labels, KaiEvidence *const *defs, int64_t unchecked) {
+    return (void *) kai_evidence_fill_frame((KaiEvidence **) out, (int) n, labels, defs, (uint64_t) unchecked);
 }
 
 void *kaix_evidence_require_reachable(void *node_v, const char *cap_name) {
