@@ -3639,6 +3639,7 @@ struct KaiNursery {
     _Atomic(KaiFiber *) children_head;
     KaiNursery         *parent;
     _Atomic(KaiFiber *) failed_child;
+    KaiEvidence        *ev_top;
 };
 
 /* A worker's root fiber starts as the OS-thread context, representing the
@@ -19011,7 +19012,12 @@ static int kai_read_rc_runs(void) {
 /* main, as many times as the ledger asks, on the fiber that is current;
  * what that fiber kept for its constants goes with the last run. */
 static KaiValue *kai_main_runs(KaiValue *(*user_main)(void)) {
-    for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(user_main());
+    KaiFiber *self = kai_current_fiber();
+    for (int run = kai_read_rc_runs(); run > 1; run--) {
+        kai_decref(user_main());
+        atomic_store(&self->cancel_requested, 0);
+        self->cancel_delivered = 0;
+    }
     KaiValue *r = user_main();
     kai_fiber_consts_drop(kai_current_fiber());
     return r;
@@ -19543,7 +19549,11 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
          * finds us on its chain and the unpark is recorded rather than
          * lost. Unlinking before the park would leave nobody able to wake
          * us — the whole race would hang on the first sleeper. */
-        if (!winner) kai_sched_park();
+        if (!winner) {
+            atomic_store(&me->cancel_wake, 1);
+            if (!kai_cancel_due(me)) kai_sched_park_linked();
+            atomic_store(&me->cancel_wake, 0);
+        }
         /* Unlink every node we linked this round, whether we won, lost the
          * tie, or woke spuriously: the nodes live in this frame, so no
          * candidate may hold a pointer into it past the return, and the
@@ -19556,6 +19566,12 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
             if (kai_nthreads > 1) kai_fiber_slot_unlock_at(hl);
         }
         if (winner) break;
+        if (kai_cancel_due(me)) {
+            if (nodes != nodes_stack) free(nodes);
+            if (fibs  != fibs_stack)  free(fibs);
+            kai_decref(fibs_v);
+            kai_cancel_deliver(me);
+        }
     }
 
     /* Cancel the losers. `select` returns one result and the nursery joins
@@ -19693,6 +19709,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
     if (!n) { fprintf(stderr, "kai: out of memory (nursery scope)\n"); kai_exit(1); }
     n->children_head = NULL;
     n->parent        = f->nursery_top;
+    n->ev_top        = f->evidence_top;
     f->nursery_top   = n;
     return kai_cont_resume(k, kai_unit());
 }
@@ -19783,17 +19800,19 @@ static void kai_nursery_release(KaiFiber *head, KaiNursery *scope) {
 
 /* A fiber unwinding by cancel never reaches its `scope_exit`: cancel and
  * join the children of every scope it left open, so none outlives it. */
-static void kai_nursery_abandon(KaiFiber *f) {
-    while (f->nursery_top) {
-        KaiNursery *scope = f->nursery_top;
-        f->nursery_top = scope->parent;
-        KaiFiber *head = scope->children_head;
-        kai_nursery_cancel_siblings(head, NULL);
-        for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-            kai_nursery_join_child(c, head, 0);
-        }
-        kai_nursery_release(head, scope);
+static void kai_nursery_abandon_top(KaiFiber *f) {
+    KaiNursery *scope = f->nursery_top;
+    f->nursery_top = scope->parent;
+    KaiFiber *head = scope->children_head;
+    kai_nursery_cancel_siblings(head, NULL);
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        kai_nursery_join_child(c, head, 0);
     }
+    kai_nursery_release(head, scope);
+}
+
+static void kai_nursery_abandon(KaiFiber *f) {
+    while (f->nursery_top) kai_nursery_abandon_top(f);
 }
 
 /* Issue #959 — close the innermost scope: join every child, then on
@@ -20219,7 +20238,11 @@ struct KaiEvidence {
     void        *cleanup_env;
     /* Guards against running the same cleanup twice when a normal exit
      * races an unwind through the same node. */
-    int          cleanup_done;
+    uint8_t      cleanup_done;
+    /* Distance from `parent` to the node whose clause was running when this
+     * one was pushed (1 = `parent`); 0 for none. An exit through this node
+     * lands back inside that clause. */
+    uint8_t      disp_hops;
     /* The fiber's unwind-stack height when the node was pushed: what lies
      * above it belongs to frames an exit through this node discards. */
     uint32_t     unw_mark;
@@ -20300,6 +20323,8 @@ static void kai_evidence_run_cleanup(KaiEvidence *node) {
     if (r != NULL) kai_decref(r);
 }
 
+static uint8_t kai_disp_hops(KaiFiber *f);
+
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled
  * `handle` prologue. This primitive only fills its fields and
@@ -20314,6 +20339,7 @@ static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *ha
     node->cleanup      = NULL;
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
+    node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
 }
@@ -20330,6 +20356,7 @@ static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, 
     node->cleanup      = NULL;
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
+    node->disp_hops    = 0;
     node->unw_mark     = 0;
 }
 
@@ -20350,6 +20377,7 @@ static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
     node->cleanup      = NULL;
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
+    node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
 }
@@ -20404,6 +20432,22 @@ static int kai_eff_label_match(const char *a, const char *b);
 /* The chain node `n` stands for. */
 static inline KaiEvidence *kai_ev_real(KaiEvidence *n) {
     return n != NULL && n->parent == KAI_EV_RELAY ? ((KaiSegRelay *) n)->target : n;
+}
+
+static uint8_t kai_disp_hops(KaiFiber *f) {
+    KaiEvidence *disp = kai_ev_real(f->in_dispatch_node);
+    if (disp == NULL) return 0;
+    unsigned hops = 1;
+    for (KaiEvidence *n = f->evidence_top; n != NULL && n != KAI_EV_RELAY; n = n->parent, hops++)
+        if (n == disp) return hops < 255 ? (uint8_t) hops : 0;
+    return 0;
+}
+
+/* The dispatch mask in force when `node` was pushed. */
+static KaiEvidence *kai_disp_at_push(KaiEvidence *node) {
+    KaiEvidence *n = node->parent;
+    for (unsigned h = node->disp_hops; h > 1 && n != NULL; h--) n = n->parent;
+    return node->disp_hops ? n : NULL;
 }
 
 /* The nearest node handling `eff_label` from `n` down to `stop`, `skip` aside. */
@@ -21199,6 +21243,18 @@ struct KaiRtEvCancel {
     KaiValue   *(*raise)(KaiRtEvCancel *self, KaiCont *k);
 };
 
+/* An exit to `node`'s handle abandons the scopes opened inside its body. */
+static void kai_nursery_abandon_inside(KaiFiber *f, KaiEvidence *node) {
+    for (;;) {
+        KaiNursery *scope = f->nursery_top;
+        int inside = 0;
+        for (KaiEvidence *n = scope ? scope->ev_top : NULL; n && n != KAI_EV_RELAY; n = n->parent)
+            if (n == node) { inside = 1; break; }
+        if (!inside) return;
+        kai_nursery_abandon_top(f);
+    }
+}
+
 /* Walk the current fiber's evidence stack and, if a user `with Cancel`
  * handler is in scope, dispatch its `raise` clause and longjmp to the
  * handle's landing pad — the call does not return. Returns 0 when no
@@ -21243,6 +21299,8 @@ static int kai_cancel_dispatch_user_handler(void) {
 
     if (k.status == KAI_CONT_UNRESUMED && user_node->handle_jmp != NULL) {
         *user_node->discard_slot = op_r;
+        kai_nursery_abandon_inside(f, user_node);
+        f->in_dispatch_node = kai_disp_at_push(user_node);
         kai_evidence_unwind_to(user_node);
         _longjmp(*user_node->handle_jmp, 1);
         /* Unreachable. */
