@@ -212,8 +212,8 @@ fn main() : Unit / Stdout = {
   a type error. Multiplying multiplies units: `1.0<m> * 1.0<s> :
   Real<m*s>`.
 - Unit annotations apply only to numeric heads: `Real<m>`, `Int<m>`,
-  and `Decimal<m>` parse and typecheck. `String<m>` or `Bool<m>`
-  are parse errors.
+  and `Decimal<m>` typecheck. `String<m>` or `Bool<m>` are rejected
+  with an error at the annotation.
 
 ## NOT IN KAIKAI
 
