@@ -211,9 +211,11 @@ fn main() : Unit / Stdout = {
 - Adding two values requires matching units: `1.0<m> + 1.0<s>` is
   a type error. Multiplying multiplies units: `1.0<m> * 1.0<s> :
   Real<m*s>`.
-- Unit annotations apply only to numeric heads: `Real<m>`, `Int<m>`,
-  and `Decimal<m>` typecheck. `String<m>` or `Bool<m>` are rejected
-  with an error at the annotation.
+- A unit annotates `Int`, `Real` or `Decimal` (directly, through a type
+  alias, or as a `[u: Measure]` generic) or a user type (habitant slots
+  per `kai info kinds`, otherwise a free brand). `String<m>`, `Bool<m>`,
+  `Char<m>`, `Unit<m>` and aliases to them are rejected with an error at
+  the annotation.
 
 ## NOT IN KAIKAI
 
