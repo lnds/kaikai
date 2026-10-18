@@ -17686,7 +17686,7 @@ fn st_hint_section_tail(st: InferState, site: Expr) : InferState / Console + Fil
 fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               op_eff_arities: [OpEffArity],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
-              sums: [SumInfo], hcar: [SymId],
+              sums: [SumInfo], hcar: HandleTab,
               protos: ProtoView,
               all_decls: [Decl],
               kind_theories: [KindTheory],
@@ -17835,7 +17835,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let st1b = check_no_fiber_escape(st1e, file, fnid_sym(fid), nm, opt_ret, sums, hcar, line, col)
       # Drop `Mutable` when every demand targets a locally built value
       # that never escapes; otherwise blame the first demand that does not.
-      let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr)
+      let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr, hcar)
       let st2pre = check_body_row(st1c, nm, entry, fid, row, rbinds, tparams, line, col, all_decls,
                                   mutable_blame(st1c, ps, rb.expr))
       # drain the deferred field-access constraints now that
@@ -17962,7 +17962,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       kind_theories, ps, body, d, line, col)
     DConst(is_pub, csym, cte, cbody, mo, line, col) ->
       infer_const_body(file, env, core_len, recs, op_eff_arities, type_aliases,
-                       op_to_eff, sums, protos, kind_theories,
+                       op_to_eff, sums, hcar, protos, kind_theories,
                        is_pub, csym, cte, cbody, mo, line, col)
     # `#[constructor]` wrapper: type-check the inner fn and unwrap it —
     # the marker has done its job (the registry was built in
@@ -18052,7 +18052,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
 fn infer_const_body(file: String, env: TyEnv, core_len: Int,
                     recs: [RecInfo], op_eff_arities: [OpEffArity],
                     type_aliases: [AliasResult], op_to_eff: [OpToEff],
-                    sums: [SumInfo], protos: ProtoView,
+                    sums: [SumInfo], hcar: HandleTab, protos: ProtoView,
                     kind_theories: [KindTheory],
                     is_pub: Bool, csym: SymId, cte: TypeExpr, cbody: Expr,
                     mo: Option[String], line: Int,
@@ -18063,7 +18063,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
                                                 kind_theories)
   let st_init1 = st_set_protos(st_set_home(st_init0, mo), protos)
   let st_init = st_set_sums(st_init1, sums)
-  let shared = ty_holds(st_home_view(st_init), core_decl_ty_id(CdSeq), st_annot_ty(st_init, cte), sums, recs, [])
+  let shared = ty_holds(core_decl_ty_id(CdSeq), st_annot_ty(st_init, cte), hcar)
   let rr = synth_let_rhs_or_mint(st_init, if shared { seq_once_call(cbody) } else { cbody }, cte, line, col)
   let minted = maybe_mint_literal(rr.st, rr.expr, rr.ty,
                                   apply_ty(rr.st.sub, st_annot_ty(rr.st, cte)),
@@ -18176,7 +18176,7 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # unwritable in user code. Until the cap binding lands, the
 # brand-mismatch detection has no surface to attach to.
 fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
-                          opt_ret: Option[TypeExpr], sums: [SumInfo], hcar: [SymId],
+                          opt_ret: Option[TypeExpr], sums: [SumInfo], hcar: HandleTab,
                           line: Int, col: Int) : InferState / Console + File {
 
 
@@ -18185,7 +18185,7 @@ fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
   else {
     match opt_ret {
       None -> st
-      Some(rty) -> if not te_hits(hv, [core_ty_sym(CtFiber), core_ty_sym(CtPid), ...hcar], rty) { st } else {
+      Some(rty) -> if not te_hits(hv, [core_ty_sym(CtFiber), core_ty_sym(CtPid), ...ht_carriers(hcar, core_ty_sym(CtFiber))], rty) { st } else {
         match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, st.recs, []) {
           Some(breach) -> {
             let lline = if rty.line > 0 { rty.line } else { line }
@@ -18273,9 +18273,9 @@ type HandleBreach = HBDirect | HBSum(SymId, SymId) | HBRec(SymId)
 
 # A continuation stays on the fiber whose segment it suspended, inside the
 # handlers of what its body performs; a lazy sequence on the fiber that made it.
-fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + File =
-  foldl(cont_crossings(body, st.env.tab, (t) => apply_ty(st.sub, t), (t) => fiber_bound(t, (h, x) => ty_holds(st_home_view(st), h, x, st.sums, st.recs, [])),
-                       (t, es) => ty_cont_needs(st_home_view(st), t, es, st.sums, st.recs)), st,
+fn check_cont_crossings(st: InferState, body: Expr, ht: HandleTab) : InferState / Console + File =
+  foldl(cont_crossings(body, st.env.tab, (t) => apply_ty(st.sub, t), (t) => fiber_bound(t, (h, x) => ty_holds(h, x, ht)),
+                       (t, es) => ty_cont_needs(t, es, ht)), st,
         (acc, c) => match c {
           Crossing(msg, help, l, col) -> {
             diag_error(acc.file, l, col, msg)
@@ -18285,34 +18285,34 @@ fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + Fil
         })
 
 # A value of `t` holds one of the type `h`, directly or in a field of a type it names.
-fn ty_holds(hv: TyHomeView, h: SymId, t: Ty, sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : Bool = match t {
+fn ty_holds(h: SymId, t: Ty, ht: HandleTab) : Bool = match t {
   TyCon(s, args) ->
-    sym_same(s, h) or any(args, (a) => ty_holds(hv, h, a, sums, recs, seen)) or named_holds(hv, h, s, sums, recs, seen)
-  TyListT(x) -> ty_holds(hv, h, x, sums, recs, seen)
+    sym_same(s, h) or any(args, (a) => ty_holds(h, a, ht)) or named_holds(h, s, ht)
+  TyListT(x) -> ty_holds(h, x, ht)
   _ -> false
 }
 
 # A value of `t` holds a continuation whose row names the effect `es`: a
 # `Cont` with it in its row, or a type holding one that `t` instantiates
 # with such a row.
-fn ty_cont_needs(hv: TyHomeView, t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match cont_parts(t) {
-  Some(cp) -> row_arg_names(cp.row, es) or cont_needs_any(hv, [cp.arg, cp.answer], es, sums, recs)
-  None -> ty_cont_needs_in(hv, t, es, sums, recs)
+fn ty_cont_needs(t: Ty, es: SymId, ht: HandleTab) : Bool = match cont_parts(t) {
+  Some(cp) -> row_arg_names(cp.row, es) or cont_needs_any([cp.arg, cp.answer], es, ht)
+  None -> ty_cont_needs_in(t, es, ht)
 }
 
-fn ty_cont_needs_in(hv: TyHomeView, t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match t {
-  TyCon(s, args) -> cont_named_needs(hv, s, args, es, sums, recs)
-  TyListT(x) -> ty_cont_needs(hv, x, es, sums, recs)
-  TyFnT(_, r, _) -> ty_cont_needs(hv, r, es, sums, recs)
+fn ty_cont_needs_in(t: Ty, es: SymId, ht: HandleTab) : Bool = match t {
+  TyCon(s, args) -> cont_named_needs(s, args, es, ht)
+  TyListT(x) -> ty_cont_needs(x, es, ht)
+  TyFnT(_, r, _) -> ty_cont_needs(r, es, ht)
   _ -> false
 }
 
-fn cont_named_needs(hv: TyHomeView, s: SymId, args: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
-  cont_needs_any(hv, args, es, sums, recs)
-    or (any(args, (a) => row_arg_names(a, es)) and named_holds(hv, core_ty_sym(CtCont), s, sums, recs, []))
+fn cont_named_needs(s: SymId, args: [Ty], es: SymId, ht: HandleTab) : Bool =
+  cont_needs_any(args, es, ht)
+    or (any(args, (a) => row_arg_names(a, es)) and named_holds(core_ty_sym(CtCont), s, ht))
 
-fn cont_needs_any(hv: TyHomeView, ts: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
-  any(ts, (t) => ty_cont_needs(hv, t, es, sums, recs))
+fn cont_needs_any(ts: [Ty], es: SymId, ht: HandleTab) : Bool =
+  any(ts, (t) => ty_cont_needs(t, es, ht))
 
 # A row carrier naming the effect `es`, bare of any cell.
 fn row_arg_names(t: Ty, es: SymId) : Bool = match t {
@@ -18320,20 +18320,28 @@ fn row_arg_names(t: Ty, es: SymId) : Bool = match t {
   _ -> false
 }
 
-fn named_holds(hv: TyHomeView, h: SymId, s: SymId, sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : Bool =
-  match handle_walk(hv, h, TypeExpr { tkind: TyName(DrSym(s), []), line: 0, col: 0 }, sums, recs, seen) {
-    HW(Some(_), _) -> true
-    HW(None, _) -> false
-  }
+fn named_holds(h: SymId, s: SymId, ht: HandleTab) : Bool = sym_list_has(ht_carriers(ht, h), s)
 
 # Named types that transitively hold a Fiber or Pid, computed once per program
 # so a return-type check consults a table instead of re-expanding declarations.
-fn handle_carriers(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : [SymId] =
-  carriers_close(hv, sums, recs, [])
+type HandleTab = HT([SymId], [SymId], [SymId])
 
-fn carriers_close(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], cs: [SymId]) : [SymId] {
-  let fresh = carriers_among(hv, sums, recs, [core_ty_sym(CtFiber), core_ty_sym(CtPid), ...cs])
-  if list_length(fresh) == 0 { cs } else { carriers_close(hv, sums, recs, concat([fresh, cs])) }
+fn handle_tab(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : HandleTab =
+  HT(carriers_close(hv, sums, recs, [core_ty_sym(CtFiber), core_ty_sym(CtPid)], []),
+     carriers_close(hv, sums, recs, [core_ty_sym(CtCont)], []),
+     carriers_close(hv, sums, recs, [core_decl_ty_id(CdSeq)], []))
+
+# The carriers of the handle type `h`: Cont, Seq, or Fiber/Pid.
+fn ht_carriers(ht: HandleTab, h: SymId) : [SymId] = match ht {
+  HT(fp, cont, seq) ->
+    if sym_same(h, core_ty_sym(CtCont)) { cont }
+    else if sym_same(h, core_decl_ty_id(CdSeq)) { seq }
+    else { fp }
+}
+
+fn carriers_close(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], base: [SymId], cs: [SymId]) : [SymId] {
+  let fresh = carriers_among(hv, sums, recs, concat([base, cs]))
+  if list_length(fresh) == 0 { cs } else { carriers_close(hv, sums, recs, base, concat([fresh, cs])) }
 }
 
 fn carriers_among(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], hs: [SymId]) : [SymId] =
@@ -19056,7 +19064,7 @@ fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                    acc_op_res: [OpResolution],
                    type_aliases: [AliasResult],
                    op_to_eff: [OpToEff],
-                   sums: [SumInfo], hcar: [SymId],
+                   sums: [SumInfo], hcar: HandleTab,
                    protos: ProtoView,
                    all_decls: [Decl],
                    kind_theories: [KindTheory]) : TypedProgram / Console + File + Mutable {
@@ -19408,7 +19416,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   let tp = infer_all_loop(df, data.built.env, data.built.core_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [], [],
                  data.alias_res.aliases, data.op_to_eff, data.sums,
-                 handle_carriers(env_home_view(data.built.env, None), data.sums, data.recs), protos,
+                 handle_tab(env_home_view(data.built.env, None), data.sums, data.recs), protos,
                  all_decls_for_typer, kind_theories)
   # Stage B coverage check. Runs after row-level inference
   # is complete so the typed body carries the resolved effect-op
