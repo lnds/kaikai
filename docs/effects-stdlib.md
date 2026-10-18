@@ -19,7 +19,8 @@ and used by the stdlib sparingly.
 
 | Effect          | Purpose                                       | Default handler?      |
 |-----------------|-----------------------------------------------|-----------------------|
-| `Console`       | stdout and stderr output                      | yes (runtime, if in `main`'s row) |
+| `Stdout`        | standard output                               | yes (runtime, if in `main`'s row) |
+| `Stderr`        | standard error                                | yes (runtime, if in `main`'s row) |
 | `Stdin`         | terminal input                                | yes (runtime, if in `main`'s row) |
 | `Env`           | command-line args and process environment     | yes (runtime, if in `main`'s row) |
 | `File`          | filesystem read/write                         | yes (runtime, if in `main`'s row) |
@@ -46,15 +47,16 @@ separate spec, `docs/actors.md`, because the mailbox model
 design surface; it does not fit inside a single table row. Doc B
 stays silent on actors beyond this note.
 
-The four stdlib-granularised effects (`Console`, `Stdin`, `Env`,
-`File`) are grouped by the stdlib under a single closed alias
-for convenience:
+The stdlib groups the IO effects under two closed aliases
+(`stdlib/effects.kai`). They are rows, not effects: a function
+names `Stdout`, never `Console`, when it calls an op.
 
 ```kai
-type Io = Console + Stdin + Env + File
+type Console = Stdout + Stderr + Stdin
+type Io = Console + Env + File
 ```
 
-Functions that only log use `/ Console`. Functions that read
+Functions that only print use `/ Stdout`. Functions that read
 user input add `/ Stdin`. Functions that read configuration get
 `/ Env + File`. The `Io` alias is the umbrella when a function
 does "several of the above" and the precise breakdown is not
@@ -220,11 +222,11 @@ B would rather not ship.
 The `var` keyword declares a local mutable cell:
 
 ```kai
-fn sum_costs(events: [Event]) : Int / Console {
+fn sum_costs(events: [Event]) : Int / Stdout {
   var total := 0
   each(events, (e) => {
     total := total + e.cost
-    Console.print("running: #{total}")
+    Stdout.print("running: #{total}")
   })
   total
 }
@@ -247,7 +249,7 @@ Consequences:
 - **The cell does not escape the block's effect row.** Because
   the implicit `handle` closes `State[T]` in the same scope, the
   enclosing function's signature is unchanged. `sum_costs`
-  above is `/ Console`, not `/ Console + State[Int]`.
+  above is `/ Stdout`, not `/ Stdout + State[Int]`.
 - **Scope is the innermost block.** The cell is live from its
   `var` line to the next `}`, matching `let`.
 - **Nested `var`s nest handlers.** Each `var` is its own
@@ -299,51 +301,32 @@ explicit ops double as documentation.
 
 Array indexing sugar ships in **m7b**.
 
-## `Console`
+## `Stdout` and `Stderr`
 
 ### Declaration
 
 ```kai
-effect Console {
-  print(s: String)  : Unit
-  eprint(s: String) : Unit
-}
+effect Stdout { print(s: String) : Unit ; is_tty() : Bool }
+effect Stderr { eprint(s: String) : Unit ; is_tty() : Bool }
 ```
 
-Two ops, both appending `\n` to the string before writing. Match
-the minimal core's `print`/`eprint`. Neither carries a failure
-type: under the default handler, the common recoverable fault
-(pipe closed on the other side, `EPIPE`) is absorbed silently,
-and any remaining fault is catastrophic enough to panic.
+`print` / `eprint` append `\n` to the string before writing.
+Neither carries a failure type: under the default handler, the
+common recoverable fault (pipe closed on the other side, `EPIPE`)
+is absorbed silently, and any remaining fault is catastrophic
+enough to panic. Separate effects let a test harness capture
+stdout without touching stderr writes.
 
-Each stream effect additionally exposes `is_tty() : Bool` —
-whether the stream is a terminal, per `isatty(3)` on the
-stream's own fd (`Stdout` asks fd 1, `Stderr` fd 2, `Stdin`
-fd 0). It is the standard gate for ANSI colour: emit escapes
-when `Stdout.is_tty()`, plain text under a pipe or redirection.
-`Env.get("NO_COLOR")` covers the user-override half of that
-convention.
-
-> **v1 vs target shape (2026-05-08).** The monolithic `Console`
-> declaration above is the **v1** shape — a single effect with
-> `print` + `eprint`. The post-Phase-4b target is a 3-way split
-> documented in `stdlib/effects.kai:36-46`:
->
-> ```kai
-> effect Stdout { print(s: String) : Unit ; is_tty() : Bool }
-> effect Stderr { eprint(s: String) : Unit ; is_tty() : Bool }
-> effect Stdin  { read_line() : Result[String, String] ; is_tty() : Bool }
-> type Console = Stdout + Stderr + Stdin
-> ```
->
-> The split lets a test harness capture stdout without affecting
-> stderr writes. Tracking issue: #360. Until that lands, treat
-> `Console` here as the canonical declaration; do not import
-> `Stdout` / `Stderr` as if they were already separate effects.
+`is_tty() : Bool` reports whether the stream is a terminal, per
+`isatty(3)` on the stream's own fd (`Stdout` asks fd 1, `Stderr`
+fd 2; `Stdin` has the same op on fd 0). It is the standard gate
+for ANSI colour: emit escapes when `Stdout.is_tty()`, plain text
+under a pipe or redirection. `Env.get("NO_COLOR")` covers the
+user-override half of that convention.
 
 ### Default handler
 
-Runtime-installed around `main` when `Console` is in the row.
+Runtime-installed around `main` when `Stdout` or `Stderr` is in the row.
 Each clause calls `Ffi` (`fputs(s, stdout)` / `fputs(s, stderr)`,
 then `fputc('\n', …)`) and resumes with `()`.
 
@@ -363,9 +346,8 @@ Fault handling inside the clause:
 ### Capture / interception
 
 A test harness that wants to capture stdout writes its own
-`handle { body() } with Console { print(s, resume) -> {
-captured.push(s); resume(()) } ; eprint(s, resume) -> resume(())
-}`. The default only installs when no user handler covers the
+`handle { body() } with Stdout { print(s, resume) -> {
+captured.push(s); resume(()) } ; is_tty(resume) -> resume(false) }`. The default only installs when no user handler covers the
 effect in scope.
 
 ## `Stdin`
@@ -726,7 +708,7 @@ The handler never short-circuits; clock ops always resume.
 `clock_gettime` is infallible on supported platforms (Linux,
 macOS, FreeBSD; the only documented `EINVAL` returns are for
 clock IDs the runtime never passes). A failure here is treated
-the same as `Console`: panic with a banner on stderr.
+the same as `Stdout`: panic with a banner on stderr.
 
 ### What's not in v1 (planned extensions)
 
@@ -783,7 +765,7 @@ and resumes; the handler never short-circuits.
 
 The default handler is **not deterministic across runs**. Tests
 that need reproducibility install their own `Random` handler with
-a fixed seed, in the same shape as the `Console` capture pattern.
+a fixed seed, in the same shape as the `Stdout` capture pattern.
 
 ### Error model
 
@@ -839,7 +821,7 @@ Runtime-installed around `main` when `SecureRandom` is in the row.
 The handler never short-circuits unless the syscall actually
 fails, which on these platforms only happens under catastrophic
 conditions (kernel pool unrecoverable). v1 treats such failures
-as panics, the same as `Console` and `Clock`.
+as panics, the same as `Stdout` and `Clock`.
 
 ### Error model
 
@@ -888,7 +870,7 @@ The three effects cover the byte-level networking capability,
 each focused on one protocol family. The `Net` alias bundles
 them when a function does several at once and the precise
 breakdown is not worth spelling out — same pattern as `Io =
-Console + Stdin + Env + File`.
+Console + Env + File`.
 
 Higher-level protocols (HTTP, WebSocket, gRPC) live in stdlib
 modules that *use* the relevant effects — they do not introduce

@@ -266,7 +266,7 @@ cleanly. There are no silent survivors. Doc B §`Cancel`
 pin the wider semantics.
 
 One exception applies in the actor model: when a fiber is linked
-to a peer with `trap_exit=true` (set via `fiber_set_trap_exit`),
+to a peer with `trap_exit=true` (set via `spawn.set_trap_exit`),
 its `Cancel.raise()` bypasses any `with Cancel { raise(_) -> ... }`
 handler in the call chain — and unwinds straight
 to the trampoline cancel pad so the link-propagation walk can push

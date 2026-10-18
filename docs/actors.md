@@ -466,10 +466,10 @@ still respect the flag — the read happens at termination time,
 not at link time.
 
 ```kai
-fn supervisor() : Unit / Actor[String] + Spawn + Console + Link + Cancel = {
-  fiber_set_trap_exit(true)
+fn supervisor() : Unit / Actor[String] + Spawn + Stdout + Link + Cancel = {
+  spawn.set_trap_exit(true)
   let me = Actor.self()
-  let _ = fiber_spawn(() => with_mailbox { worker(me) })
+  let _ = spawn.spawn(() => with_mailbox { worker(me) })
   match Actor.receive() {
     "Normal"  -> Stdout.print("worker finished cleanly")
     "Crashed" -> { Stdout.print("worker crashed; restarting"); restart(me) }
@@ -481,7 +481,7 @@ fn supervisor() : Unit / Actor[String] + Spawn + Console + Link + Cancel = {
 Trap-exit is a per-fiber switch, not a per-link one: every link
 the fiber holds at the moment of a peer's termination respects
 the current `trap_exit` value. To revoke, call
-`fiber_set_trap_exit(false)` and links revert to the default
+`spawn.set_trap_exit(false)` and links revert to the default
 cancel-cascade behaviour.
 
 Trap-exit converts at the runtime boundary, before any user-level
