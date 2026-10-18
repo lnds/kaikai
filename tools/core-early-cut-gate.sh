@@ -17,7 +17,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 compile() { # $1 output stem, $2 source, rest: flags
   local stem="$1" src="$2"; shift 2
-  "$KAIC2" --edition "$EDITION" --path "$(dirname "$src")" --path "$ROOT/stdlib" --core-cache-stats "$@" "$src" \
+  "$KAIC2" --edition "$EDITION" --path "$(dirname "$src")" --path "${STDLIB:-$ROOT/stdlib}" --core-cache-stats "$@" "$src" \
     > "$stem.c" 2> "$stem.raw"
   echo $? > "$stem.rc"
   grep -v '^kaic2: core-' "$stem.raw" > "$stem.err"
@@ -39,6 +39,15 @@ for src in examples/minimal/hello.kai tools/core-early-cut-retry-warns.kai tools
     echo "  FAIL $src — $why"; grep 'core-precut' "$WORK/cut.raw" | sed 's/^/    /'; fail=$((fail+1))
   else pass=$((pass+1)); fi
 done
+
+# A copy of the stdlib elsewhere is the same library: same cut, same C.
+cp -R "$ROOT/stdlib" "$WORK/stdlib-copy"
+fx=examples/effects/stdlib_hof_effectful_callback.kai
+compile "$WORK/home" "$fx"
+STDLIB="$WORK/stdlib-copy" compile "$WORK/twin" "$fx"
+grep -q 'core-precut: emptied' "$WORK/home.raw" || { echo "core-early-cut: FAIL — $fx reports no cut"; exit 1; }
+cmp -s "$WORK/home.raw" "$WORK/twin.raw" && cmp -s "$WORK/home.c" "$WORK/twin.c" \
+  || { echo "core-early-cut: FAIL — a copy of the stdlib at another path changes the compile of $fx"; exit 1; }
 
 [ "$retried" -gt 0 ] || { echo "core-early-cut: FAIL — emptying every core body never forced the retry"; exit 1; }
 [ "$fail" -eq 0 ] || { echo "core-early-cut: FAIL — $fail of $((pass+fail)) programs"; exit 1; }
