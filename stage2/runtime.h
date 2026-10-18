@@ -8072,8 +8072,15 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
                               memcmp(a->as.s.bytes, b->as.s.bytes, a->as.s.len) == 0;
         case KAI_NIL:  return 1;
         case KAI_CONS:
-            return kai_op_eq(a->as.cons.head, b->as.cons.head) &&
-                   kai_op_eq(a->as.cons.tail, b->as.cons.tail);
+            /* the spine is a loop: recursing per element overflows a fiber stack */
+            for (;;) {
+                if (!kai_op_eq(a->as.cons.head, b->as.cons.head)) return 0;
+                a = a->as.cons.tail;
+                b = b->as.cons.tail;
+                if (kai_is_value(a) || kai_is_value(b) || !a || !b ||
+                    a->tag != KAI_CONS || b->tag != KAI_CONS)
+                    return kai_op_eq(a, b);
+            }
         case KAI_RANGE: return 1;   /* unreachable: the cursor walk above owns ranges */
         case KAI_VARIANT: {
             /* Eq dispatch: if a's head type has a custom impl Eq, route to it
