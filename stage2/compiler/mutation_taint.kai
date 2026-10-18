@@ -1,0 +1,88 @@
+#[doc("""
+Which local containers hold a value they did not build.
+
+`array_set(c, i, v)` mutates `c` alone, so a demand on it is local when `c`
+is. But `v` is now reachable through `c`: when `v` is a mutation carrier the
+function did not originate (a parameter, a call that may return one), a later
+write through an element read out of `c` mutates the caller's value. Such a
+container is tainted: it stays a valid destination, but nothing read out of
+it, and nothing derived from it, is local.
+""")]
+
+import compiler.ast
+import compiler.core_builtins
+import compiler.expr_positions
+import compiler.modules_binders
+
+#[doc("`roots` are the containers a foreign carrier was stored into; `all` adds every binder read out of one, none of which is local.")]
+pub type Taint = { roots: [LocalId], all: [LocalId] }
+
+type TtEnv = { locals: [LocalId], foreign: (Expr, [LocalId]) -> Bool }
+
+#[doc("""
+The taint of `body`'s `locals`. `foreign(v, live)` answers whether the stored
+value `v` is a carrier not local to `live`, the locals still untainted.
+""")]
+pub fn tainted_locals(body: Expr, locals: [LocalId], foreign: (Expr, [LocalId]) -> Bool) : Taint =
+  tt_fixpoint(body, TtEnv { locals: locals, foreign: foreign }, Taint { roots: [], all: [] }, 0)
+
+fn tt_fixpoint(body: Expr, env: TtEnv, t: Taint, passes: Int) : Taint = {
+  let next = tt_expr(body, env, t)
+  if list_length(next.all) == list_length(t.all) or passes > list_length(env.locals) { t }
+  else { tt_fixpoint(body, env, next, passes + 1) }
+}
+
+fn tt_has(ls: [LocalId], l: LocalId) : Bool = any(ls, (h) => local_eq(h, l))
+
+fn tt_live(env: TtEnv, t: Taint) : [LocalId] = filter(env.locals, (l) => not tt_has(t.all, l))
+
+fn tt_add(env: TtEnv, ls: [LocalId], acc: [LocalId]) : [LocalId] =
+  foldl(ls, acc, (a, l) => if tt_has(env.locals, l) and not tt_has(a, l) { [l, ...a] } else { a })
+
+fn tt_add_roots(env: TtEnv, ls: [LocalId], t: Taint) : Taint =
+  Taint { roots: tt_add(env, ls, t.roots), all: tt_add(env, ls, t.all) }
+
+fn tt_add_derived(env: TtEnv, ls: [LocalId], t: Taint) : Taint =
+  Taint { roots: t.roots, all: tt_add(env, ls, t.all) }
+
+fn tt_mentions(e: Expr, set: [LocalId]) : Bool = match e.kind {
+  ELocal(l) -> tt_has(set, l)
+  _         -> tt_any_mentions(xp_positions(e), set)
+}
+
+fn tt_any_mentions(ps: [XPos], set: [LocalId]) : Bool = any(ps, (p) => match p { XP(_, c) -> tt_mentions(c, set) })
+
+fn tt_mentioned(e: Expr, acc: [LocalId]) : [LocalId] = match e.kind {
+  ELocal(l) -> [l, ...acc]
+  _         -> foldl(xp_positions(e), acc, (a, p) => match p { XP(_, c) -> tt_mentioned(c, a) })
+}
+
+fn tt_expr(e: Expr, env: TtEnv, t: Taint) : Taint = match e.kind {
+  ECall(callee, args_) -> tt_positions(xp_positions(e), env, tt_store(callee, args_, env, t))
+  EBlock(stmts, tail)  -> tt_tail(tail, env, foldl(stmts, t, (a, s) => tt_stmt(s, env, a)))
+  _                    -> tt_positions(xp_positions(e), env, t)
+}
+
+fn tt_tail(tail: Option[Expr], env: TtEnv, t: Taint) : Taint = match tail {
+  Some(x) -> tt_expr(x, env, t)
+  None    -> t
+}
+
+fn tt_positions(ps: [XPos], env: TtEnv, t: Taint) : Taint =
+  foldl(ps, t, (a, p) => match p { XP(_, c) -> tt_expr(c, env, a) })
+
+fn tt_stmt(s: Stmt, env: TtEnv, t: Taint) : Taint = match s {
+  SLet(pat, _, rhs) -> {
+    let t1 = tt_expr(rhs, env, t)
+    if tt_mentions(rhs, t1.all) { tt_add_derived(env, map(pat_binders(pat, []), .id), t1) } else { t1 }
+  }
+  _ -> tt_positions(xp_stmt_positions(s), env, t)
+}
+
+fn tt_store(callee: Expr, args_: [Expr], env: TtEnv, t: Taint) : Taint =
+  if is_builtin_ref(callee, CbArraySet) {
+    match args_ {
+      [dst, _, v] -> if env.foreign(v, tt_live(env, t)) { tt_add_roots(env, tt_mentioned(dst, []), t) } else { t }
+      _           -> t
+    }
+  } else { t }
