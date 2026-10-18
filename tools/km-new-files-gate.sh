@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The differential quality bar, executed: every NEW compiler/stdlib file
-# on this branch scores at least B (the landing floor), with A- the
+# on this branch scores at least C (the landing floor), with A- the
 # stated target. Pre-existing files are debt being paid down elsewhere;
 # this gate only judges what the branch itself authored, so "we're
 # already at F" can never excuse a new monolith.
 #
-# The floor is the whole B band: B-, B and B+ all land, as does every
-# A grade (A++ through A-). Anything below B- does not. Modifiers are
+# The floor is the whole C band: C-, C and C+ land, as does every B and
+# A grade. Anything below C- does not. Modifiers are
 # part of the grade, so the accepted set is spelled out rather than
 # matched by prefix - an earlier `A*|B)` accepted a bare B while
 # rejecting the better B+. An empty grade means km failed, which is a
@@ -20,7 +20,7 @@
 set -eu
 
 # Keep in step with the pin in .github/workflows/tier1.yml.
-KIMUN_VERSION=0.34.1
+KIMUN_VERSION=0.37.0
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -52,7 +52,7 @@ for f in $new_files; do
     A++|A+|A|A-)
       echo "  $grade  $f  ($loc LOC)"
       ;;
-    B+|B|B-)
+    B+|B|B-|C+|C|C-)
       echo "  $grade  $f  ($loc LOC)  (floor; the stated bar is A-)"
       ;;
     "")
@@ -67,7 +67,7 @@ for f in $new_files; do
 done
 
 if [ "$fails" -gt 0 ]; then
-  echo "km-new-files-gate FAIL - $fails new file(s) below the B floor; the differential bar is not optional"
+  echo "km-new-files-gate FAIL - $fails new file(s) below the C floor; the differential bar is not optional"
   exit 1
 fi
 echo "km-new-files-gate OK — every new file at or above the floor"

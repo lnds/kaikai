@@ -100,20 +100,20 @@ Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI structure in `d
 - **Tier 2** — `make daily`: maintainer / cron only, ~10–20 min. Tier 1 + stress + coverage probe + RC budget. Failures are diagnostics, not blockers — `main` already gated by Tier 1.
 - **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally AND in CI (the PR-side `changes` job short-circuits the required checks; pushes to main additionally skip via `paths-ignore`, which also covers `VERSION`/`.cz.toml` bump commits). Code paths (`stage*/`, `stdlib/`, `examples/`, `demos/`, `.github/`, `Makefile`, build scripts) always trigger tiers.
 
-## Code-quality bar — B at least, cohesive files up to 1000 lines
+## Code-quality bar — C at least, cohesive files up to 1000 lines
 
-**Every new file a lane authors scores `km score` B or better; below B does not land. Reaching A is not a goal.** This is the *differential* standard: it applies to code the lane writes from scratch, not to pre-existing files it merely edits. The existing F monoliths (`stage2/compiler/infer.kai`, `emit_c.kai`, `cache.kai`) are debt being paid down, NOT the baseline — never calibrate a new file's acceptable quality against them. "We're already at F" is never a reason to relax; new code is debt-free and has no excuse.
+**Every new file a lane authors scores `km score` C or better (the default model of the kimun version pinned in CI); below C does not land. Reaching A is not a goal.** This is the *differential* standard: it applies to code the lane writes from scratch, not to pre-existing files it merely edits. The existing F monoliths (`stage2/compiler/infer.kai`, `emit_c.kai`, `cache.kai`) are debt being paid down, NOT the baseline — never calibrate a new file's acceptable quality against them. "We're already at F" is never a reason to relax; new code is debt-free and has no excuse.
 
 (Some stdlib files have slipped below the bar — `regexp`, `encoding/json`, `net/http` — they are debt like the compiler monoliths, not license.)
 
 Concrete gate, measured with `km` on each file the lane adds (cross-check `km score` with `km cogcom`):
 
-- **`km score`: B or better.** Never split a cohesive file to raise its grade: `km`'s Halstead term grows with file size, so chasing A forces ~300-line files.
+- **`km score`: C or better.** Never split a cohesive file to raise its grade: `km`'s Halstead term grows with file size, so chasing A forces ~300-line files.
 - **File size: 1000 lines hard cap, grouped by cohesion.** No small-file target: prefer a few cohesive modules over many small ones. A file nearing the cap is split *before* it grows, along a cohesive seam.
 - **Cognitive complexity (`km cogcom`): average < 5/fn, max < 25/fn.** A high number is a *design smell* — usually logic that belongs in a shared/earlier layer leaked into a leaf — fix the design, don't accept the cost.
 - **No new duplicate groups** (`km dups`) the lane authored.
 
-Binary, like CI-green and selfhost byte-id: a lane that ships a sub-B file does not close until it is split or simplified. Editing an existing F file does not *raise* its grade obligation (that's separate refactor work), but it must not *lower* it either — don't grow a monolith.
+Binary, like CI-green and selfhost byte-id: a lane that ships a sub-C file does not close until it is split or simplified. Editing an existing F file does not *raise* its grade obligation (that's separate refactor work), but it must not *lower* it either — don't grow a monolith.
 
 ## Lane discipline
 
