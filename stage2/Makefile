@@ -3648,7 +3648,8 @@ test-stdlib-regex-predicate-asan: $(TARGET) build
 	done
 
 # Typed holes (M10): every example under examples/holes/ must
-# (a) produce a --holes report with at least one "type hole" entry,
+# (a) produce a --holes report with at least one "type hole" entry (a
+#     "pattern hole" with its exhaustiveness section for pattern.kai),
 # (b) produce a valid --holes-json array,
 # (c) fail under --strict-holes with non-zero exit,
 # (d) compile clean through both backends, and
@@ -3659,8 +3660,12 @@ test-holes: $(TARGET) build
 	for f in ../examples/holes/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --holes $$f > build/s2-$$name.holes; \
-	  if ! grep -q "type hole" build/s2-$$name.holes; then \
+	  if [ $$name = pattern ]; then want="pattern hole"; else want="type hole"; fi; \
+	  if ! grep -q "$$want" build/s2-$$name.holes; then \
 	    echo "holes FAIL $$name (no report)"; cat build/s2-$$name.holes; exit 1; \
+	  fi; \
+	  if [ $$name = pattern ] && ! grep -q "remaining inhabitants (exhaustiveness)" build/s2-$$name.holes; then \
+	    echo "holes FAIL $$name (no exhaustiveness section)"; cat build/s2-$$name.holes; exit 1; \
 	  fi; \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --holes-json $$f > build/s2-$$name.holes.json; \
 	  python3 ../scripts/validate_holes_json.py build/s2-$$name.holes.json \
