@@ -18186,7 +18186,7 @@ fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
     match opt_ret {
       None -> st
       Some(rty) -> {
-        match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, []) {
+        match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, st.recs, []) {
           Some(breach) -> {
             let lline = if rty.line > 0 { rty.line } else { line }
             let lcol  = if rty.col  > 0 { rty.col  } else { col  }
@@ -18200,7 +18200,7 @@ fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
             diag_help("process the fiber inside the nursery (e.g. with `spawn.await`), or pass a thunk in and a value out instead")
             st_bump_err(st_push_diag(st, perr))
           }
-          None -> match ty_expr_find_handle(hv, core_ty_sym(CtPid), rty, sums, []) {
+          None -> match ty_expr_find_handle(hv, core_ty_sym(CtPid), rty, sums, st.recs, []) {
             Some(breach) -> {
               let lline = if rty.line > 0 { rty.line } else { line }
               let lcol  = if rty.col  > 0 { rty.col  } else { col  }
@@ -18231,6 +18231,9 @@ fn emit_handle_breach_note(tab: SymTab, hname: String, breach: HandleBreach) : U
 
   match breach {
     HBDirect -> ()
+    HBRec(tsym, fld) ->
+      diag_note(concat_all(["`", hname, "` is held by field `", fld,
+                            "` of record type `", written_text(decl_name(tab, tsym)), "`"]))
     HBSum(tsym, csym) ->
       diag_note(concat_all(["`", hname,
                             "` is wrapped by constructor `", written_text(decl_name(tab, csym)),
@@ -18267,7 +18270,7 @@ fn mailbox_alloc_helpers() : [SymId] =
 # user-defined sum's variant payload (`type Boxed =
 # Wrap(Fiber[Int])`). The `visited` set guards recursive sums
 # (`type Tree[T] = Leaf(T) | Node(Tree[T], Tree[T])`).
-type HandleBreach = HBDirect | HBSum(SymId, SymId)
+type HandleBreach = HBDirect | HBSum(SymId, SymId) | HBRec(SymId, String)
 
 # A continuation stays on the fiber whose segment it suspended, inside the
 # handlers of what its body performs; a lazy sequence on the fiber that made it.
@@ -18319,103 +18322,89 @@ fn row_arg_names(t: Ty, es: SymId) : Bool = match t {
 }
 
 fn named_holds(hv: TyHomeView, h: SymId, s: SymId, sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : Bool =
-  if sym_list_has(seen, s) { false }
-  else { match ty_expr_find_handle(hv, h, TypeExpr { tkind: TyName(DrSym(s), []), line: 0, col: 0 }, sums, seen) {
-    Some(_) -> true
-    None -> any(recs, (r) => match r {
-      RI(rs, _, fs, rmo) -> sym_same(rs, s) and any(fs, (f) => match f {
-        FD(_, _, te, _) -> match ty_expr_find_handle(tsh_at(hv, rmo), h, te, sums, [s, ...seen]) { Some(_) -> true  None -> false }
-      })
-    })
-  } }
+  match handle_walk(hv, h, TypeExpr { tkind: TyName(DrSym(s), []), line: 0, col: 0 }, sums, recs, seen) {
+    HW(Some(_), _) -> true
+    HW(None, _) -> false
+  }
+
+# The breach found in a type, and the named types already explored: a type
+# explored without a hit is never walked again, so the walk is linear in the
+# type graph however many paths reach it.
+type HandleWalk = HW(Option[HandleBreach], [SymId])
+
+fn ty_expr_find_handle(hv: TyHomeView, hsym: SymId, t: TypeExpr,
+                        sums: [SumInfo], recs: [RecInfo], visited: [SymId]) : Option[HandleBreach] =
+  match handle_walk(hv, hsym, t, sums, recs, visited) { HW(b, _) -> b }
 
 # `hv` reads the type names `t` writes: the module that wrote `t`.
-fn ty_expr_find_handle(hv: TyHomeView, hsym: SymId, t: TypeExpr,
-                        sums: [SumInfo], visited: [SymId]) : Option[HandleBreach] {
+fn handle_walk(hv: TyHomeView, hsym: SymId, t: TypeExpr,
+               sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : HandleWalk =
   match t.tkind {
     TyName(r, tas) -> {
       let s = ref_ty_sym(hv, r)
-      if sym_raw(s) >= 0 and sym_same(s, hsym) { Some(HBDirect) }
+      if sym_raw(s) >= 0 and sym_same(s, hsym) { HW(Some(HBDirect), seen) }
       else {
-        match ty_expr_list_find_handle(hv, hsym, tas, sums, visited) {
-          Some(b) -> Some(b)
-          None -> {
-            if sym_raw(s) < 0 or sym_list_has(visited, s) { None }
-            else {
-              match sum_find(sums, s) {
-                None -> None
-                Some(si) -> match si {
-                  SI(ssym, tps, vs, smo) -> {
-                    let mapping = build_tparam_mapping(tps, tas)
-                    variants_find_handle(tsh_at(hv, smo), hsym, vs, mapping, sums,
-                                          [ssym, ...visited], ssym)
-                  }
-                }
-              }
-            }
-          }
+        match handle_walk_list(hv, hsym, tas, sums, recs, seen) {
+          HW(Some(b), sn) -> HW(Some(b), sn)
+          HW(None, sn) ->
+            if sym_raw(s) < 0 or sym_list_has(sn, s) { HW(None, sn) }
+            else { handle_walk_decl(hv, hsym, s, tas, sums, recs, [s, ...sn]) }
         }
       }
     }
-    TyList(inner) -> ty_expr_find_handle(hv, hsym, inner, sums, visited)
-    TyFn(ps, ret, _) -> {
-      match ty_expr_list_find_handle(hv, hsym, ps, sums, visited) {
-        Some(b) -> Some(b)
-        None -> ty_expr_find_handle(hv, hsym, ret, sums, visited)
-      }
+    TyList(inner) -> handle_walk(hv, hsym, inner, sums, recs, seen)
+    TyFn(ps, ret, _) -> match handle_walk_list(hv, hsym, ps, sums, recs, seen) {
+      HW(Some(b), sn) -> HW(Some(b), sn)
+      HW(None, sn) -> handle_walk(hv, hsym, ret, sums, recs, sn)
     }
-    # dimensioned types never carry a Fiber/Pid — recurse into base.
-    TyDim(base, _) -> ty_expr_find_handle(hv, hsym, base, sums, visited)
-    # refinement predicates cannot mention Fiber/Pid (predicate
-    # subset is data-only); only the base type matters.
-    TyRefine(base, _) -> ty_expr_find_handle(hv, hsym, base, sums, visited)
-    # a compound row carries effect labels, never a
-    # Fiber/Pid handle type — no breach to find.
-    TyRow(_) -> None
-    TySurface(ts) -> ty_expr_list_find_handle(hv, hsym, tysurface_children(ts), sums, visited)
-    TyParam(_, tas) -> ty_expr_list_find_handle(hv, hsym, tas, sums, visited)
+    TyDim(base, _) -> handle_walk(hv, hsym, base, sums, recs, seen)
+    TyRefine(base, _) -> handle_walk(hv, hsym, base, sums, recs, seen)
+    TyRow(_) -> HW(None, seen)
+    TySurface(ts) -> handle_walk_list(hv, hsym, tysurface_children(ts), sums, recs, seen)
+    TyParam(_, tas) -> handle_walk_list(hv, hsym, tas, sums, recs, seen)
   }
-}
 
-fn ty_expr_list_find_handle(hv: TyHomeView, hsym: SymId, ts: [TypeExpr],
-                              sums: [SumInfo], visited: [SymId]) : Option[HandleBreach] {
+fn handle_walk_list(hv: TyHomeView, hsym: SymId, ts: [TypeExpr],
+                    sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : HandleWalk =
   match ts {
-    [] -> None
-    [t, ...rest] -> match ty_expr_find_handle(hv, hsym, t, sums, visited) {
-      Some(b) -> Some(b)
-      None    -> ty_expr_list_find_handle(hv, hsym, rest, sums, visited)
+    [] -> HW(None, seen)
+    [t, ...rest] -> match handle_walk(hv, hsym, t, sums, recs, seen) {
+      HW(Some(b), sn) -> HW(Some(b), sn)
+      HW(None, sn) -> handle_walk_list(hv, hsym, rest, sums, recs, sn)
     }
   }
-}
 
-fn variants_find_handle(hv: TyHomeView, hsym: SymId, vs: [Variant],
-                          mapping: [TParamMapEntry], sums: [SumInfo],
-                          visited: [SymId], ssym: SymId) : Option[HandleBreach] {
+fn handle_walk_decl(hv: TyHomeView, hsym: SymId, s: SymId, tas: [TypeExpr],
+                    sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : HandleWalk =
+  match sum_find(sums, s) {
+    Some(SI(ssym, tps, vs, smo)) ->
+      walk_variants(tsh_at(hv, smo), hsym, vs, build_tparam_mapping(tps, tas), sums, recs, seen, ssym)
+    None -> match rec_find(recs, s) {
+      Some(RI(rsym, tps, fs, rmo)) ->
+        walk_fields(tsh_at(hv, rmo), hsym, fs, build_tparam_mapping(tps, tas), sums, recs, seen, rsym)
+      None -> HW(None, seen)
+    }
+  }
+
+fn walk_fields(hv: TyHomeView, hsym: SymId, fs: [FieldDecl], mapping: [TParamMapEntry],
+               sums: [SumInfo], recs: [RecInfo], seen: [SymId], rsym: SymId) : HandleWalk =
+  match fs {
+    [] -> HW(None, seen)
+    [FD(_, nm, te, _), ...rest] -> match handle_walk(hv, hsym, subst_tparams_te(te, mapping), sums, recs, seen) {
+      HW(Some(_), sn) -> HW(Some(HBRec(rsym, nm)), sn)
+      HW(None, sn) -> walk_fields(hv, hsym, rest, mapping, sums, recs, sn, rsym)
+    }
+  }
+
+fn walk_variants(hv: TyHomeView, hsym: SymId, vs: [Variant], mapping: [TParamMapEntry],
+                 sums: [SumInfo], recs: [RecInfo], seen: [SymId], ssym: SymId) : HandleWalk =
   match vs {
-    [] -> None
-    [v, ...rest] -> match v {
-      Var(csym, payload) -> match payload_find_handle(hv, hsym, payload, mapping, sums, visited) {
-        Some(_) -> Some(HBSum(ssym, csym))
-        None    -> variants_find_handle(hv, hsym, rest, mapping, sums, visited, ssym)
-      }
+    [] -> HW(None, seen)
+    [Var(csym, payload), ...rest] -> match handle_walk_list(hv, hsym, map(payload, (te) => subst_tparams_te(te, mapping)), sums, recs, seen) {
+      HW(Some(_), sn) -> HW(Some(HBSum(ssym, csym)), sn)
+      HW(None, sn) -> walk_variants(hv, hsym, rest, mapping, sums, recs, sn, ssym)
     }
   }
-}
-
-fn payload_find_handle(hv: TyHomeView, hsym: SymId, payload: [TypeExpr],
-                         mapping: [TParamMapEntry], sums: [SumInfo],
-                         visited: [SymId]) : Option[HandleBreach] {
-  match payload {
-    [] -> None
-    [te, ...rest] -> {
-      let te_subst = subst_tparams_te(te, mapping)
-      match ty_expr_find_handle(hv, hsym, te_subst, sums, visited) {
-        Some(b) -> Some(b)
-        None    -> payload_find_handle(hv, hsym, rest, mapping, sums, visited)
-      }
-    }
-  }
-}
 
 # Tparam->TypeExpr mapping built from a sum's [tparams] zipped with
 # the type-args at the use site. When the use site provides fewer
