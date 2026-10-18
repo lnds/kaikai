@@ -20659,9 +20659,12 @@ static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node) {
  * handle, a lone pop leaves the dead node linked as top: the next handle
  * to reuse that stack storage links itself as its own parent, and every
  * later lookup walks the resulting cycle forever. */
+static void kai_nursery_abandon_inside(KaiFiber *f, KaiEvidence *node);
+
 static void kai_evidence_unwind_to(KaiEvidence *node) {
     node = kai_ev_real(node);
     if (node == NULL) return;
+    kai_nursery_abandon_inside(kai_current_fiber(), node);
     /* Run every `finally` between the jump site and the target, innermost
      * first, before the chain is truncated. `node` itself is included:
      * the jump lands past its handler, so its scope is exiting too.
@@ -20677,6 +20680,7 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
         if (n != node) kai_resume_frames_drop(f, n);
     }
     f->evidence_top = stop;
+    f->in_dispatch_node = kai_disp_at_push(node);
 }
 
 /* Cancellation longjmps straight to the fiber's `cancel_pad` without a
@@ -21299,8 +21303,6 @@ static int kai_cancel_dispatch_user_handler(void) {
 
     if (k.status == KAI_CONT_UNRESUMED && user_node->handle_jmp != NULL) {
         *user_node->discard_slot = op_r;
-        kai_nursery_abandon_inside(f, user_node);
-        f->in_dispatch_node = kai_disp_at_push(user_node);
         kai_evidence_unwind_to(user_node);
         _longjmp(*user_node->handle_jmp, 1);
         /* Unreachable. */
