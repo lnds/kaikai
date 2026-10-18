@@ -18326,10 +18326,15 @@ fn named_holds(h: SymId, s: SymId, ht: HandleTab) : Bool = sym_list_has(ht_carri
 # so a return-type check consults a table instead of re-expanding declarations.
 type HandleTab = HT([SymId], [SymId], [SymId])
 
-fn handle_tab(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : HandleTab =
-  HT(carriers_close(hv, sums, recs, [core_ty_sym(CtFiber), core_ty_sym(CtPid)], []),
-     carriers_close(hv, sums, recs, [core_ty_sym(CtCont)], []),
-     carriers_close(hv, sums, recs, [core_decl_ty_id(CdSeq)], []))
+# A declared type and the named types its fields or payloads mention.
+type TypeDeps = TD(SymId, [SymId])
+
+fn handle_tab(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : HandleTab {
+  let deps = type_deps(hv, sums, recs)
+  HT(carriers_close(deps, [core_ty_sym(CtFiber), core_ty_sym(CtPid)], []),
+     carriers_close(deps, [core_ty_sym(CtCont)], []),
+     carriers_close(deps, [core_decl_ty_id(CdSeq)], []))
+}
 
 # The carriers of the handle type `h`: Cont, Seq, or Fiber/Pid.
 fn ht_carriers(ht: HandleTab, h: SymId) : [SymId] = match ht {
@@ -18339,19 +18344,41 @@ fn ht_carriers(ht: HandleTab, h: SymId) : [SymId] = match ht {
     else { fp }
 }
 
-fn carriers_close(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], base: [SymId], cs: [SymId]) : [SymId] {
-  let fresh = carriers_among(hv, sums, recs, concat([base, cs]))
-  if list_length(fresh) == 0 { cs } else { carriers_close(hv, sums, recs, base, concat([fresh, cs])) }
+fn type_deps(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : [TypeDeps] =
+  concat([
+    map(sums, (si) => match si {
+      SI(sy, _, vs, mo) -> TD(sy, foldl(vs, [], (acc, v) => match v {
+        Var(_, tes) -> foldl(tes, acc, (a, te) => te_syms(tsh_at(hv, mo), te, a))
+      }))
+    }),
+    map(recs, (ri) => match ri {
+      RI(sy, _, fs, mo) -> TD(sy, foldl(fs, [], (acc, f) => match f {
+        FD(_, _, te, _) -> te_syms(tsh_at(hv, mo), te, acc)
+      }))
+    })])
+
+fn carriers_close(deps: [TypeDeps], base: [SymId], cs: [SymId]) : [SymId] {
+  let hs = concat([base, cs])
+  let fresh = flat_map(deps, (d) => match d {
+    TD(sy, ms) -> if not sym_list_has(hs, sy) and any(ms, (m) => sym_list_has(hs, m)) { [sy] } else { [] }
+  })
+  if list_length(fresh) == 0 { cs } else { carriers_close(deps, base, concat([fresh, cs])) }
 }
 
-fn carriers_among(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], hs: [SymId]) : [SymId] =
-  concat([
-    flat_map(sums, (si) => match si {
-      SI(sy, _, vs, mo) -> if not sym_list_has(hs, sy) and any(vs, (v) => match v { Var(_, tes) -> any(tes, (te) => te_hits(tsh_at(hv, mo), hs, te)) }) { [sy] } else { [] }
-    }),
-    flat_map(recs, (ri) => match ri {
-      RI(sy, _, fs, mo) -> if not sym_list_has(hs, sy) and any(fs, (f) => match f { FD(_, _, te, _) -> te_hits(tsh_at(hv, mo), hs, te) }) { [sy] } else { [] }
-    })])
+# The named types `t` mentions, prepended to `acc`.
+fn te_syms(hv: TyHomeView, t: TypeExpr, acc: [SymId]) : [SymId] = match t.tkind {
+  TyName(r, tas) -> {
+    let s = ref_ty_sym(hv, r)
+    foldl(tas, if sym_raw(s) >= 0 { [s, ...acc] } else { acc }, (a, x) => te_syms(hv, x, a))
+  }
+  TyList(inner) -> te_syms(hv, inner, acc)
+  TyFn(ps, ret, _) -> te_syms(hv, ret, foldl(ps, acc, (a, x) => te_syms(hv, x, a)))
+  TyDim(base, _) -> te_syms(hv, base, acc)
+  TyRefine(base, _) -> te_syms(hv, base, acc)
+  TyRow(_) -> acc
+  TySurface(ts) -> foldl(tysurface_children(ts), acc, (a, x) => te_syms(hv, x, a))
+  TyParam(_, tas) -> foldl(tas, acc, (a, x) => te_syms(hv, x, a))
+}
 
 # `t` names a type of `hs`, or has one among its type arguments or parts.
 fn te_hits(hv: TyHomeView, hs: [SymId], t: TypeExpr) : Bool = match t.tkind {
