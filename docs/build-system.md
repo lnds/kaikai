@@ -9,7 +9,8 @@ Practical map of the build. Read this before running the compiler or touching a 
 | Run / build a `.kai` program | `./bin/kai run <file.kai>` · `./bin/kai build <file.kai> -o <out>` |
 | Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2-fast` (dev, needs an existing kaic2) · `make kaic2` (boots from the previous release, C) · `make KAI_LLVM=1 kaic2` (native) · `make kaic2 KAIC_BOOT=seed` (offline, `cc` only; see §KAIC_BOOT) |
 | Full bootstrap from scratch | `make all KAIC_BOOT=seed` (`cc` → seed → `kaic2` → `bin/kai`; also builds the frozen `kaic0` → `kaic1`) |
-| Verify a change | `make tier0` (fast) · `make tier1` (full, CI gate) |
+| A compiler in a fresh worktree, in seconds | `tools/prebuilt-kaic2.sh seed` (see §Prebuilt kaic2) |
+| Verify a change | the gates of §Before the first push · `make tier0` (fast) · `make tier1` (full, CI gate) |
 | One backend-parity fixture | `tools/test-backend-parity.sh` (env-driven; see §parity) |
 | Diff the backends over generated programs | `tools/progen-diff.sh <first-seed> <count>` (see `docs/testing-tiers.md` §Generated-program differential test) |
 
@@ -288,7 +289,7 @@ tools/cost-ab.sh --cache warm --base origin/main prog.kai  # per-project cache o
 
 The cost is instructions retired (`/usr/bin/time -l` on macOS, `perf stat` on Linux), reported in millions (M); where a host exposes no counters (a virtualised runner) it falls back to CPU milliseconds and the header says so. Per probe it prints min/mean for both sides, the delta in units and %, and a verdict from the stated band: `up` when every branch round is above every base round, `down` when every one is below, else `noise`.
 
-CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1.yml`), as the non-required `cost-ab` job: the PR's `kaic2-c` artifact against the base commit's bootstrap-cache `kaic2`, posted as one PR comment that later pushes update in place. A runner is noisy, so `up` there is a prompt to reproduce locally, not a verdict.
+CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1.yml`) as the required `cost-ab` job: the PR's `kaic2-c` artifact against the base commit's bootstrap-cache `kaic2`, posted as one PR comment that later pushes update in place. The job fails when self-compile or the empty program rises by more than 1 %.
 
 ## The c-modular core TU set — pruning against a cached core
 
@@ -304,6 +305,32 @@ A compile prunes only against its own variant. With none recorded it first compi
 The functions the unwind analysis reads (`unw_feeds_analysis`: a function that handles an effect, declares a `var`, or whose row may cancel) are never cut in a c-modular build, so the pruned program yields the same frames as the whole one. Lifted lambdas and handler clauses of the cacheable modules are emitted into their module's TU, not the root.
 
 Gate: `make test-cmodular-prune` (tier0) primes a cache with one program and compiles the others against it, comparing every file with a no-cache compile — core TUs and their slices exactly, the root and library TUs as subsets. `CMOD_PRUNE_ALL=1` sweeps every example that has an `.out.expected`.
+
+## Prebuilt kaic2 — one build per commit, shared by worktrees
+
+A fresh worktree has no compiler, and `make kaic2` boots one in minutes (more for a native-capable one). `tools/prebuilt-kaic2.sh` builds kaic2 + `bin/kai` once per commit and hands the build to every worktree of the repo:
+
+```sh
+tools/prebuilt-kaic2.sh build            # once per origin/main commit (native-capable where llvm-config is found)
+tools/prebuilt-kaic2.sh seed             # in a worktree: the build of its HEAD, in seconds
+tools/prebuilt-kaic2.sh has || tools/prebuilt-kaic2.sh build
+```
+
+A worktree whose HEAD has no stored build gets the newest one and a `make kaic2-fast` on top, which is C-backend only. After seeding, edit and rebuild as usual (`make kaic2-fast`). The store is `$KAI_PREBUILT_STORE`, else `${XDG_CACHE_HOME:-~/.cache}/kaikai-prebuilt`, and keeps the newest three builds. Nothing CI or the selfhost oracle trusts comes from it: it is a dev convenience over the same `make kaic2`.
+
+## Before the first push — the gates that turn CI red
+
+Each runs in seconds with a built kaic2. Run the ones a change can touch; a red that one of these would have caught costs a whole CI round.
+
+| Gate | Catches | The fix |
+|---|---|---|
+| `make test-symid-names-static` | a name's text kept beside an id; a `written_text` read not in `tools/symid-census/written-readers.txt` | key by the id; list a legitimate read with its reason (the file header defines them) |
+| `tools/compiler-lint-ratchet.sh` | a new `kai lint` finding in the compiler | fix the finding; the baseline only goes down |
+| `make test-walker-catchall-audit` | a new `match` over many AST constructors closed by `_` | explicit arms for a walker; a pure recognizer goes in `tools/walker-catchall-baseline.txt` with its reason |
+| `tools/test-check-parity.sh` | `--diags-json` disagreeing with `kai build` on a negative fixture | report the same diagnostic on both paths |
+| `make test-km-new-files` | a new file below `km score` B | simplify or split along a cohesive seam |
+| `examples/cache/*.sh`, `tests/*.sh` | cache keys, memo and trim behaviour of the wrapper | run the ones next to the code touched |
+| `tools/baselines/rc-leak/<fixture>` | an RC leak in a new `examples/perceus` fixture | pin the measured ledger line with the fixture |
 
 ## Verification targets (root)
 
