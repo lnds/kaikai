@@ -152,21 +152,6 @@ fn fn_hole_row(st: InferState, entry: Bool, row: RowExpr) : HoleRow = match row 
 }
 
 
-type DeclEnv = {
-  file: String,
-  env: TyEnv,
-  core_len: Int,
-  recs: [RecInfo],
-  op_eff_arities: [OpEffArity],
-  type_aliases: [AliasResult],
-  op_to_eff: [OpToEff],
-  sums: [SumInfo],
-  hcar: HandleTab,
-  protos: ProtoView,
-  all_decls: [Decl],
-  kind_theories: [KindTheory]
-}
-
 type FnSite = {
   is_pub: Bool,
   fid: FnId,
@@ -193,43 +178,9 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               protos: ProtoView,
               all_decls: [Decl],
               kind_theories: [KindTheory],
-              d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable {
-  let de = DeclEnv {
-    file: file, env: env, core_len: core_len, recs: recs, op_eff_arities: op_eff_arities,
-    type_aliases: type_aliases, op_to_eff: op_to_eff, sums: sums, hcar: hcar, protos: protos,
-    all_decls: all_decls, kind_theories: kind_theories
-  }
-  infer_decl_in(de, d, verbose)
-}
-
-fn infer_decl_in(de: DeclEnv, d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable =
-  match d {
-    DFn(_, _, _, _, _, _, _, _, _, _) -> infer_fn_decl(de, d, verbose)
-    DTest(_, body, line, col, _) -> infer_test_decl(de, d, [], body, line, col)
-    DBench(_, body, line, col, _) -> infer_test_decl(de, d, [], body, line, col)
-    DCheck(_, ps, body, line, col, _) -> infer_test_decl(de, d, ps, body, line, col)
-    DConst(is_pub, csym, cte, cbody, mo, line, col) ->
-      infer_const_body(de.file, de.env, de.core_len, de.recs, de.op_eff_arities, de.type_aliases,
-                       de.op_to_eff, de.sums, de.hcar, de.protos, de.kind_theories,
-                       is_pub, csym, cte, cbody, mo, line, col)
-    DProtoLaws(_, inner, _, _, _) -> infer_decl_in(de, inner, verbose)
-    DImplAxiom(_, inner, _, _, _) -> infer_decl_in(de, inner, verbose)
-    DConstructor(inner, _, _) -> infer_decl_in(de, inner, verbose)
-    _ -> untyped_decl(d)
-  }
-
-fn untyped_decl(d: Decl) : TypedDecl =
-  TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
-
-fn infer_test_decl(de: DeclEnv, d: Decl, ps: [Param], body: Expr, line: Int, col: Int) : TypedDecl / Console + File + Mutable =
-  infer_test_body(de.file, de.env, de.core_len, de.recs, de.op_eff_arities, de.type_aliases,
-                  de.op_to_eff, de.sums, de.protos, de.all_decls, de.kind_theories,
-                  ps, body, d, line, col)
-
-fn infer_fn_decl(de: DeclEnv, d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable =
+              d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable =
   match d {
     DFn(is_pub, fid, tparams, ps, opt_ret, row, body0, line, col, mo) -> {
-      let env = de.env
       let nm = written_text(decl_name(env.tab, fnid_sym(fid)))
       let rbinds = mk_rvbinds(list_append(collect_decl_rvars(d),
                                           collect_rowkind_args_decl(d, env.row_kind, env_home_view(env, mo))))
@@ -241,7 +192,9 @@ fn infer_fn_decl(de: DeclEnv, d: Decl, verbose: Bool) : TypedDecl / Console + Fi
         rbinds: rbinds, ps: ps, opt_ret: opt_ret, row: row, line: line, col: col
       }
       let body = name_unit_tparams(body0, tparams)
-      let added = add_infer_params_with_binds(fn_initial_state(de, site, nm, mo), ps, tpbinds, rbinds)
+      let st_init = fn_initial_state(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff,
+                                     kind_theories, protos, sums, site, nm, mo)
+      let added = add_infer_params_with_binds(st_init, ps, tpbinds, rbinds)
       let opt_declared = match opt_ret {
         Some(rty) -> Some(resolve_ty_with_binds(rty, tpbinds, rbinds, env.row_kind, env_home_view(env, mo)))
         None -> None
@@ -249,10 +202,31 @@ fn infer_fn_decl(de: DeclEnv, d: Decl, verbose: Bool) : TypedDecl / Console + Fi
       let st_ready = InferState { ...st_set_refine_ctx(st_set_ret_ty(added.st, opt_declared), nm),
                                   decl_row: declared_row_labels(added.st, row) }
       let fb = check_fn_body(st_ready, nm, body, opt_declared)
-      let rows = check_fn_rows(de, site, nm, mo, fb, added.tys)
-      finalise_fn_decl(de, d, site, nm, mo, fb, rows, added.tys, verbose)
+      let rows = check_fn_rows(file, env, sums, hcar, all_decls, site, nm, mo, fb, added.tys)
+      finalise_fn_decl(env, d, site, nm, mo, fb, rows, added.tys, verbose)
     }
-    _ -> untyped_decl(d)
+    DTest(_, body, line, col, _) ->
+      infer_test_body(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, protos,
+                      all_decls, kind_theories, [], body, d, line, col)
+    DBench(_, body, line, col, _) ->
+      infer_test_body(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, protos,
+                      all_decls, kind_theories, [], body, d, line, col)
+    DCheck(_, ps, body, line, col, _) ->
+      infer_test_body(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, protos,
+                      all_decls, kind_theories, ps, body, d, line, col)
+    DConst(is_pub, csym, cte, cbody, mo, line, col) ->
+      infer_const_body(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, hcar,
+                       protos, kind_theories, is_pub, csym, cte, cbody, mo, line, col)
+    DProtoLaws(_, inner, _, _, _) ->
+      infer_decl(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, hcar, protos,
+                 all_decls, kind_theories, inner, verbose)
+    DImplAxiom(_, inner, _, _, _) ->
+      infer_decl(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, hcar, protos,
+                 all_decls, kind_theories, inner, verbose)
+    DConstructor(inner, _, _) ->
+      infer_decl(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff, sums, hcar, protos,
+                 all_decls, kind_theories, inner, verbose)
+    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
   }
 
 # Inside its own body a unit parameter is the symbol it is named.
@@ -266,11 +240,14 @@ fn name_unit_tparams(body: Expr, tparams: [TBinder]) : Expr =
 # ids the registered scheme already quantifies over (row binds, the phantom
 # row of an empty signature, tparams, unit tparams), so a fresh variable
 # minted in the body never aliases a bound one.
-fn fn_initial_state(de: DeclEnv, site: FnSite, nm: String, mo: Option[String]) : InferState / Mutable {
-  let st_init0 = infer_state_new_full_aliases(de.file, de.env, de.core_len, de.recs,
-                                              de.op_eff_arities, de.type_aliases, de.op_to_eff,
-                                              de.kind_theories)
-  let st_init = st_set_sums(st_set_protos(st_set_home(st_init0, mo), de.protos), de.sums)
+fn fn_initial_state(file: String, env: TyEnv, core_len: Int, recs: [RecInfo], op_eff_arities: [OpEffArity],
+                    type_aliases: [AliasResult], op_to_eff: [OpToEff], kind_theories: [KindTheory],
+                    protos: ProtoView, sums: [SumInfo], site: FnSite, nm: String,
+                    mo: Option[String]) : InferState / Mutable {
+  let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
+                                              op_eff_arities, type_aliases, op_to_eff,
+                                              kind_theories)
+  let st_init = st_set_sums(st_set_protos(st_set_home(st_init0, mo), protos), sums)
   let phantom_extra = if elaborate_phantom_row(site.row, site.entry) { 1 } else { 0 }
   let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: site.rbinds },
                               list_length(site.rbinds) + phantom_extra)
@@ -318,18 +295,19 @@ fn check_fn_body(st_ready: InferState, nm: String, body: Expr, opt_declared: Opt
 # The post-body checks, then the drains of what the walk had to postpone: a
 # deferred field is resolved once the declared row has pinned its receiver's
 # type, and a deferred bare call once its argument type settled.
-fn check_fn_rows(de: DeclEnv, site: FnSite, nm: String, mo: Option[String], fb: FnBody, added_tys: [Ty]) : FnRows / Console + File + Mutable {
+fn check_fn_rows(file: String, env: TyEnv, sums: [SumInfo], hcar: HandleTab, all_decls: [Decl],
+                 site: FnSite, nm: String, mo: Option[String], fb: FnBody, added_tys: [Ty]) : FnRows / Console + File + Mutable {
   let st1 = fb.st
   let body = fb.rb.expr
   let ret_now = apply_ty(st1.sub, fb.declared_ret)
   let st1e = check_entry_result(st1, site.entry, ret_now, fb.ret_site.line, fb.ret_site.col)
-  let st1b = check_no_fiber_escape(st1e, de.file, fnid_sym(site.fid), nm, site.opt_ret, ret_now,
-                                   de.sums, de.hcar, site.line, site.col)
-  let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, site.ps, body), body, de.hcar)
+  let st1b = check_no_fiber_escape(st1e, file, fnid_sym(site.fid), nm, site.opt_ret, ret_now,
+                                   sums, hcar, site.line, site.col)
+  let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, site.ps, body), body, hcar)
   let st2pre = check_body_row(st1c, nm, site.entry, site.fid, site.row, site.rbinds, site.tparams,
-                              site.line, site.col, de.all_decls, mutable_blame(st1c, site.ps, body))
+                              site.line, site.col, all_decls, mutable_blame(st1c, site.ps, body))
   let st2f = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
-                                   decl_row_concrete_labels(site.row, env_home_view(de.env, mo)))
+                                   decl_row_concrete_labels(site.row, env_home_view(env, mo)))
   let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
   FnRows { st: report_stranded_ops(hd.st, st2f.deferred_homs, [fb.declared_ret, ...added_tys]), picks: hd.picks }
 }
@@ -337,10 +315,9 @@ fn check_fn_rows(de: DeclEnv, site: FnSite, nm: String, mo: Option[String], fb: 
 # The final substitution is applied to every `Expr.ty` of the body, then the
 # body's and the call sites' ids are canonicalised back to the impl's bound
 # ids: the unifier may have redirected a bound var through fresh ones.
-fn finalise_fn_decl(de: DeclEnv, d: Decl, site: FnSite, nm: String, mo: Option[String], fb: FnBody, rows: FnRows,
+fn finalise_fn_decl(env: TyEnv, d: Decl, site: FnSite, nm: String, mo: Option[String], fb: FnBody, rows: FnRows,
                     added_tys: [Ty], verbose: Bool) : TypedDecl / Console + File + Mutable {
   let st2 = rows.st
-  let env = de.env
   let _ = if verbose {
     print_inferred_fn(env.tab, nm, apply_ty(st2.sub, fb.declared_ret), apply_tys(st2.sub, added_tys), site.line, site.col)
     print_row_ids(env.tab, nm, st2.row)
