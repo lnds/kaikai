@@ -54,7 +54,8 @@ kai_corpus_entry_points() {
 #      File the issue first; the skip is the bookmark, the issue the work.
 #   2. First line contains "// skip-backend-parity" — for fixtures that are
 #      intentionally backend-specific.
-#   3. A sibling `.err.expected` / `.diag.expected` declares the fixture
+#   3. A `# fixture: test` line: tools/rc-leak-gate.sh measures it through `kai test`.
+#   4. A sibling `.err.expected` / `.diag.expected` declares the fixture
 #      rejected at compile time; tools/test-negative.sh owns it against its
 #      golden. A `.run.err.expected` fixture builds, so it stays: its panic
 #      text is pinned on C by the golden and on every other backend here.
@@ -64,6 +65,9 @@ kai_corpus_is_skipped() {
     return 0
   fi
   if [ -r "$fixture" ] && head -1 "$fixture" | grep -q "// skip-backend-parity"; then
+    return 0
+  fi
+  if [ -r "$fixture" ] && grep -q '^# fixture: test' "$fixture"; then
     return 0
   fi
   case "$fixture" in

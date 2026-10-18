@@ -127,6 +127,29 @@ fn pcs_all_arm_binders_arms(arms: [Arm], acc: [Binder]) : [Binder] = match arms 
     pcs_all_arm_binders_arms(rest, pcs_all_arm_binders(body, prc_pat_bindings(pat, acc)))
 }
 
+#[doc("The body of a declaration that owns no boxed parameter, with its reference counting made explicit.")]
+fn pcs_paramless_body(body: Expr, me: SelfRef, raw_params: [Binder], opaque_ret_fns: [FnId], bmap: BorrowMap,
+                      prim_bmap: BorrowMap, fns: FnIndex, cores: SymSet, tab: SymTab) : Expr / Console = {
+  let uses = pcs_use_index(body, [])
+  # Boxed locals whose single read a short circuit may skip take
+  # the same force-dup + exit-drop treatment as the mixed path.
+  let branchy_lets = pcs_branchy_let_binders(body, me, uses, [])
+  let lend_lets = pcs_lend_move_lets(body, uses, pcs_collect_opaque_let_binders(body, opaque_ret_fns, []), bmap)
+  let new_body0 = pcs_rewrite_expr(body, [], uses, false, lend_lets, branchy_lets, bmap, lend_lets)
+  # A local whose last read sits in the tail needs a post-tail release: every
+  # read of a multi-use local can land in a borrowed slot and orphan the birth ref.
+  let new_body = ptd_tail_exit_drops(new_body0, me, uses, lend_lets, branchy_lets, [])
+  let arm_dropped = pcs_arm_drop_pass(new_body, me, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [],
+                                                                 borrowed: [], bmap: bm_empty(), forced: branchy_lets }, tab)
+  let branch_paid = pbp_branch_drops(arm_dropped, raw_params, uses, [], [])
+  let reused_body = pcs_recognise_reuse_expr(branch_paid, tab)
+  # Without the caller-side strip a bare last-use arg is a move no borrowing callee releases.
+  let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
+  let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
+                      no_wrap: lend_lets, raw_no_wrap: lend_lets, uses: uses, fns: fns, cores: cores }
+  pcs_strip_borrow_args_d(reused_body, scx)
+}
+
 #[doc("The declaration `d` with its reference counting made explicit.")]
 pub fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, opaque_ret_fns: [FnId],
                   prim_bmap: BorrowMap, caps: CapScope, cores: SymSet, tab: SymTab) : Decl / Console {
@@ -157,32 +180,7 @@ pub fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex
       # dups + exit drops, while the raw params stay untouched and
       # take no param drops (no boxed params to reclaim).
       else if prc_is_all_raw_ufn_decl(fns, fsym) {
-        # ALL-raw UFn: every param is a raw C scalar with no rc, so the
-        # body rewrite runs with an EMPTY param scope (issue #703) — no
-        # boxed param to dup/drop, no borrow, no arm-move analysis.
-        let uses = pcs_use_index(body, [])
-        # Boxed locals whose single read a short circuit may skip take
-        # the same force-dup + exit-drop treatment as the mixed path.
-        let branchy_lets = pcs_branchy_let_binders(body, me, uses, [])
-        let lend_lets = pcs_lend_move_lets(body, uses, pcs_collect_opaque_let_binders(body, opaque_ret_fns, []), bmap)
-        let new_body0 = pcs_rewrite_expr(body, [], uses, false, lend_lets, branchy_lets, bmap, lend_lets)
-        # A boxed local whose last read sits in the tail needs the same
-        # post-tail release as the mixed path — this body shape is where
-        # every read of a multi-use local can land in a borrowed slot and
-        # orphan the birth ref.
-        let new_body = ptd_tail_exit_drops(new_body0, me, uses, lend_lets, branchy_lets, [])
-        let arm_dropped = pcs_arm_drop_pass(new_body, me, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [],
-                                                                       borrowed: [], bmap: bm_empty(), forced: branchy_lets }, tab)
-        let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.binder), uses, [], [])
-        let reused_body = pcs_recognise_reuse_expr(branch_paid, tab)
-        # Boxed LOCALS can still flow to borrowed callee slots; without the
-        # caller-side strip a bare last-use arg is a move no borrowing
-        # callee releases. Same strip as the mixed path — no params, so no
-        # borrowed/raw/skip sets and no `no_wrap` names.
-        let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
-        let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
-                            no_wrap: lend_lets, raw_no_wrap: lend_lets, uses: uses, fns: fns, cores: cores }
-        let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
+        let body_borrow = pcs_paramless_body(body, me, map(params, (p) => p.binder), opaque_ret_fns, bmap, prim_bmap, fns, cores, tab)
         DFn(is_pub, fsym, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
       }
       else {
@@ -389,24 +387,10 @@ pub fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex
             opt_ret, row, body_lent, ln, cl, mo)
       }
     }
-    # Test bodies are emitted as their own thunk fns; without rewriting
-    # them here, multi-use let-bindings inside test bodies (especially
-    # ones captured by closures) skip the dup pass and the closure body
-    # double-consumes its captures under the linear runtime. No params
-    # to drop, but the dup walker is still needed for in-body multi-use
-    # bindings.
-    DTest(desc, body, ln, cl, mo) -> {
-      let uses = pcs_use_index(body, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
-      let reused_body = pcs_recognise_reuse_expr(new_body, tab)
-      DTest(desc, reused_body, ln, cl, mo)
-    }
-    DBench(desc, body, ln, cl, mo) -> {
-      let uses = pcs_use_index(body, [])
-      let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
-      let reused_body = pcs_recognise_reuse_expr(new_body, tab)
-      DBench(desc, reused_body, ln, cl, mo)
-    }
+    DTest(desc, body, ln, cl, mo) ->
+      DTest(desc, pcs_paramless_body(body, SelfRef(fnid_none()), [], opaque_ret_fns, bmap, prim_bmap, fns, cores, tab), ln, cl, mo)
+    DBench(desc, body, ln, cl, mo) ->
+      DBench(desc, pcs_paramless_body(body, SelfRef(fnid_none()), [], opaque_ret_fns, bmap, prim_bmap, fns, cores, tab), ln, cl, mo)
     # check v1 (issue #44): with-clause params behave like fn params
     # for Perceus — collected as known external bindings so dup/drop
     # discipline accounts for them. The emitter wraps each iter in a
