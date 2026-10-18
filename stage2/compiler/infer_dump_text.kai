@@ -1,0 +1,918 @@
+#[doc("Typer support: infer_dump_text.")]
+
+import compiler.core_shadow_diag
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_text
+import compiler.operators
+import compiler.proto_ids
+import compiler.diag_file
+import compiler.mutation_carriers
+import compiler.kind_theory
+import compiler.resolve_names
+import compiler.decl_names
+import compiler.entry
+import compiler.symtab
+import compiler.modules_paths
+import compiler.refine_variance
+import compiler.union_table
+import compiler.infer_unit_alias
+import compiler.tycon_scheme_home
+import compiler.scope_file
+import compiler.effect_alias
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_clause_holes
+import compiler.infer_head_dispatch
+import compiler.infer_local_mutation
+import compiler.infer_env_exhaust
+import compiler.infer_handle_walk
+
+# As `inf_ty_to_string`, but a contested head renders as the qualified
+# form the user can write (`db.Item`): the owner comes from the env's
+# head-owner table.
+pub fn inf_ty_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
+    TyHandle   -> "Handle"
+    TyListT(inner) -> cat3("[", inf_ty_to_string_ow(tab, owners, inner), "]")
+    TyFnT(ps, ret, row) -> concat_all([
+      "(", inf_join_with(inf_ty_string_list_ow(tab, owners, ps), ", "), ") -> ",
+      inf_ty_to_string_ow(tab, owners, ret),
+      inf_row_suffix_ow(tab, owners, row)
+    ])
+    TyCon(csym, tas) -> {
+      let shown = inf_tycon_display_ow(tab, owners, csym)
+      match tas {
+        [] -> shown
+        _ -> concat_all([shown, "[", inf_join_with(map(cont_shown_args(csym, tas), (a) => inf_tycon_arg_to_string_ow(tab, owners, a)), ", "), "]"])
+      }
+    }
+    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyShapeApp(sv, arg) -> concat_all(["?s", int_to_string(sv), "[", inf_ty_to_string_ow(tab, owners, arg), "]"])
+    TyAny -> "?"
+    TyDimT(base, u) -> concat_all([inf_ty_to_string_ow(tab, owners, base), "<", inf_unit_canon_display(u), ">"])
+    TyRefineT(base, _) -> concat_all([inf_ty_to_string_ow(tab, owners, base), " where <pred>"])
+    TyUnion(parts) -> inf_join_with(map(parts, (x) => inf_ty_to_string_ow(tab, owners, x)), " | ")
+  }
+}
+
+
+fn inf_ty_string_list_ow(tab: SymTab, owners: [HeadOwnerEntry], ts: [Ty]) : [String] =
+  map(ts, (x) => inf_ty_to_string_ow(tab, owners, x))
+
+
+fn inf_tycon_arg_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : String =
+  match inf_row_carrier_of(t) {
+    Some(row) -> if labels_empty(row.labels) { "_" } else { inf_join_with(map(row.labels, (l) => label_display(tab, owners, l)), " + ") }
+    None      -> inf_ty_to_string_ow(tab, owners, t)
+  }
+
+
+#[doc("Typer-internal helper `check_entry_result` shared across the infer modules.")]
+pub fn check_entry_result(st: InferState, entry: Bool, ret: Ty, line: Int, col: Int) : InferState / Console + File =
+  if not entry or entry_result_ok(ret) { st } else {
+    let perr = mk_diag(SevError, st.file, line, col, "the entry point `main` must return `Int` or `Unit`", [])
+    render_diag(perr)
+    diag_note(string_concat("found: ", inf_ty_to_string(st.env.tab, ret)))
+    st_bump_err(st_push_diag(st, perr))
+  }
+
+
+#[doc("infer: render a type scheme as source-like text for reports.")]
+pub fn scheme_to_string(tab: SymTab, sc: TyScheme) : String {
+  match sc {
+    Scheme(vars, rvars, uvars, _, ty) -> {
+      let tv_part = map(vars, (n) => cat2("?t", int_to_string(n)))
+      let rv_part = map(rvars, (n) => cat2("?r", int_to_string(n)))
+      let uv_part = map(uvars, (n) => cat2("?u", int_to_string(n)))
+      let all = list_append(tv_part, list_append(rv_part, uv_part))
+      match all {
+        [] -> inf_ty_to_string(tab, ty)
+        _  -> concat_all(["forall ", inf_join_with(all, " "), ". ", inf_ty_to_string(tab, ty)])
+      }
+    }
+  }
+}
+
+
+fn dump_env_entry(tab: SymTab, e: TyEntry) : Unit / Console =
+  print("#{env_key_text(tab, e.key)} : #{scheme_to_string(tab, e.scheme)}")
+
+
+#[doc("infer: --dump-env dump of the typing environment.")]
+pub fn dump_env(env: TyEnv) : Unit / Console = dump_env_loop(env.tab, list_reverse(env.entries))
+
+
+fn dump_env_loop(tab: SymTab, es: [TyEntry]) : Unit / Console {
+  match es {
+    [] -> ()
+    [e, ...rest] -> { dump_env_entry(tab, e) dump_env_loop(tab, rest) }
+  }
+}
+
+# ====================================================================
+# substitution + unification
+# ====================================================================
+#
+# A Subst maps type-variable ids to types. It is applied to a type by
+# walking structurally and replacing each TyVarT(n) whose n has a
+# binding in the substitution. Unification takes two types and either
+# extends a substitution so the two become equal or reports failure.
+#
+# The occurs check prevents infinite types: unifying `?t0` with
+# `[?t0]` would otherwise loop, so we refuse.
+#
+# Instantiation turns a TyScheme into a Ty by replacing each bound id
+# with a fresh TyVarT drawn from the environment's counter. Each call
+# site of a polymorphic function gets its own fresh vars.
+
+
+# The signature note restates whatever the `expected:` note already
+# printed whenever the callee is the expected side, which is the common
+# case; it only earns its line when the two differ.
+#[doc("Typer-internal helper `call_sig_note_text` shared across the infer modules.")]
+pub fn call_sig_note_text(env: TyEnv, name_opt: Option[String], resolved: Ty,
+                        expected_shown: String) : Option[String] {
+  match name_opt {
+    None -> None
+    Some(nm) -> match resolved {
+      TyFnT(_, _, _) -> {
+        let sig = inf_ty_to_string_ow(env.tab, env.head_owners, resolved)
+        if sig == expected_shown { None } else { Some("`#{nm}` expects: #{sig}") }
+      }
+      _ -> None
+    }
+  }
+}
+
+
+# Emit Template 4 — wrong number of arguments. The callee's signature
+# (when displayable) goes on a `note: \`fn\` expects: (T1, T2) -> R`
+# line so users see exactly which arity was declared. When the callee
+# is anonymous, the notes omit the name but still surface the param
+# count + signature.
+#[doc("Typer-internal helper `emit_wrong_arity` shared across the infer modules.")]
+pub fn emit_wrong_arity(env: TyEnv, file: String, name_opt: Option[String], callee_ty: Ty,
+                      arg_tys: [Ty], line: Int, col: Int) : Unit / Console + File {
+
+  let np = match callee_ty {
+    TyFnT(params, _, _) -> list_length(params)
+    _ -> 0
+  }
+  let na = list_length(arg_tys)
+  match name_opt {
+    Some(nm) -> diag_error(file, line, col, "wrong number of arguments to `#{nm}`")
+    None     -> diag_error(file, line, col, "wrong number of arguments")
+  }
+  match name_opt {
+    Some(nm) -> diag_note("`#{nm}` expects #{int_to_string(np)} argument(s), got #{int_to_string(na)}")
+    None     -> diag_note("expected #{int_to_string(np)} argument(s), got #{int_to_string(na)}")
+  }
+  match name_opt {
+    Some(nm) -> match callee_ty {
+      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{inf_ty_to_string_ow(env.tab, env.head_owners, callee_ty)}")
+      _              -> ()
+    }
+    None -> ()
+  }
+  if na < np {
+    diag_help("add the missing argument(s) or use `_` as a placeholder hole")
+  } else {
+    diag_help("remove the extra argument(s) — `#{int_to_string(na - np)}` too many")
+  }
+}
+
+
+# structured T4 Diagnostic builder. Mirrors the text emitted
+# by `emit_wrong_arity` exactly so an LSP client can rebuild the same
+# `error: / note: / help:` block from the collected value.
+#[doc("Typer-internal helper `build_wrong_arity_diag` shared across the infer modules.")]
+pub fn build_wrong_arity_diag(env: TyEnv, file: String, name_opt: Option[String], callee_ty: Ty,
+                            arg_tys: [Ty], line: Int, col: Int) : Diagnostic {
+  let np = match callee_ty {
+    TyFnT(params, _, _) -> list_length(params)
+    _ -> 0
+  }
+  let na = list_length(arg_tys)
+  let header = match name_opt {
+    Some(nm) -> "wrong number of arguments to `#{nm}`"
+    None     -> "wrong number of arguments"
+  }
+  let count_note = match name_opt {
+    Some(nm) -> "`#{nm}` expects #{int_to_string(np)} argument(s), got #{int_to_string(na)}"
+    None     -> "expected #{int_to_string(np)} argument(s), got #{int_to_string(na)}"
+  }
+  let sig_notes = match name_opt {
+    Some(nm) -> match callee_ty {
+      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{inf_ty_to_string_ow(env.tab, env.head_owners, callee_ty)}")]
+      _              -> []
+    }
+    None -> []
+  }
+  let help_msg = if na < np {
+    "add the missing argument(s) or use `_` as a placeholder hole"
+  } else {
+    "remove the extra argument(s) — `#{int_to_string(na - np)}` too many"
+  }
+  let related = list_append(
+    [ri_note(file, line, col, count_note)],
+    list_append(sig_notes, [ri_help(file, line, col, help_msg)])
+  )
+  mk_diag(SevError, file, line, col, header, related)
+}
+
+
+# when either side of a failed unification is a union
+# (or a component of one), augment the generic `expected:` / `found:`
+# notes with structural context — the union's component list and the
+# found type's parent union, plus a concrete remediation hint. The
+# plain notes still fire when neither side is union-flavoured.
+#[doc("Typer-internal helper `emit_union_aware_notes` shared across the infer modules.")]
+pub fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
+  diag_note("expected: #{inf_ty_to_string_ow(env.tab, env.head_owners, expected)}")
+  diag_note("found:    #{inf_ty_to_string_ow(env.tab, env.head_owners, found)}")
+  # Drill through matching wrappers (TyFn, TyCon-of-same-name with
+  # mismatched args) to surface the first divergent TyCon pair. That
+  # is where the union/component context is meaningful — at the
+  # surface a function-shape mismatch hides whether the inner
+  # divergence is a leaf-vs-leaf union upcast that almost-but-didn't
+  # land.
+  match find_mismatched_tycons(expected, found) {
+    Some(pair) -> if core_shadow_notes(env.tab, env.ty_homes, pair.exp, pair.fnd) { () } else { emit_union_focus_notes(env, pair.exp, pair.fnd) }
+    None       -> ()
+  }
+}
+
+
+#[doc("Typer-internal helper `bang_bad_operand` shared across the infer modules.")]
+pub fn bang_bad_operand(st: InferState, found: Ty, inner_typed: Expr,
+                     line: Int, col: Int) : Inferred / Console + File {
+
+
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` requires an `Option[T]` or `Result[T, E]` operand", [])
+  render_diag(perr)
+  diag_note("operand type: #{inf_ty_to_string(st.env.tab, found)}")
+  diag_help("`!` is reserved for the two compiler-blessed propagation types; convert the value explicitly first")
+  let st1 = st_bump_err(st_push_diag(st, perr))
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), TyAny)
+  mk_inferred(st1, TyAny, stub)
+}
+
+
+#[doc("Typer-internal helper `bang_no_enclosing_fn` shared across the infer modules.")]
+pub fn bang_no_enclosing_fn(st: InferState, fam: String, t: Ty, inner_typed: Expr,
+                         line: Int, col: Int) : Inferred / Console + File {
+
+
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` is only valid inside a function body", [])
+  render_diag(perr)
+  diag_note("operand type: #{fam}[#{inf_ty_to_string(st.env.tab, t)}]")
+  diag_help("`!` propagates from the enclosing function; it cannot appear inside a lambda or at top level")
+  let st1 = st_bump_err(st_push_diag(st, perr))
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
+  mk_inferred(st1, t, stub)
+}
+
+
+#[doc("Typer-internal helper `bang_ret_mismatch` shared across the infer modules.")]
+pub fn bang_ret_mismatch(st: InferState, fam: String, t: Ty, ret_ty: Ty,
+                      inner_typed: Expr, line: Int, col: Int) : Inferred / Console + File {
+
+
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` on `#{fam}[#{inf_ty_to_string(st.env.tab, t)}]` requires the enclosing function to return `#{fam}[U]`", [])
+  render_diag(perr)
+  diag_note("enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}")
+  diag_help("change the function's return type, or pattern-match the operand explicitly")
+  let st1 = st_bump_err(st_push_diag(st, perr))
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
+  mk_inferred(st1, t, stub)
+}
+
+
+#[doc("Typer-internal helper `bang_ret_mismatch_result` shared across the infer modules.")]
+pub fn bang_ret_mismatch_result(st: InferState, e_ty: Ty, t: Ty, ret_ty: Ty,
+                             inner_typed: Expr, line: Int, col: Int) : Inferred / Console + File {
+
+
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` on `Result[#{inf_ty_to_string(st.env.tab, t)}, #{inf_ty_to_string(st.env.tab, e_ty)}]` requires the enclosing function to return `Result[U, #{inf_ty_to_string(st.env.tab, e_ty)}]`", [])
+  render_diag(perr)
+  diag_note("enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}")
+  diag_help("kaikai does not implicitly convert error types (no `From`); convert the error explicitly or change the function's return type")
+  let st1 = st_bump_err(st_push_diag(st, perr))
+  let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
+  mk_inferred(st1, t, stub)
+}
+
+
+# A type that is not a record has no field to read: a nominal type is
+# named, any other is called what it is.
+#[doc("Typer-internal helper `field_absent_error` shared across the infer modules.")]
+pub fn field_absent_error(st: InferState, recv: Ty, fnm: String, line: Int, col: Int) : InferState / Console + File {
+  let msg = match ty_dispatch_head(recv) {
+    TyCon(tsym, _) -> "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}"
+    other          -> "no field '#{fnm}' on #{inf_ty_to_string(st.env.tab, other)}"
+  }
+  let perr = mk_diag(SevError, st.file, line, col, msg, [])
+  render_diag(perr)
+  st_bump_err(st_push_diag(st, perr))
+}
+
+
+# A field read on a receiver that is no record is an error: a function
+# of that name in scope gets the call-site rule (UFCS fires only as the
+# callee of a call, never as a bare `r.fnm`), any other the missing
+# field. Only a receiver an earlier error left unknown passes silently.
+#[doc("Typer-internal helper `field_non_record_or_partial_app` shared across the infer modules.")]
+pub fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, recv: Ty, fnm: String,
+                                     line: Int, col: Int) : Inferred / Console + File {
+  let root = field_root(obj_expr, fnm, line, col, TyAny)
+  if ufcs_reaches(st, fnm) {
+    let perr = mk_diag(SevError, st.file, line, col,
+      concat_all(["`", fnm, "` is a function in scope, not a field. ",
+                  "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
+                  "not a bare `expr.", fnm, "`."]), [])
+    render_diag(perr)
+    mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root)
+  } else if ty_unsettled(recv) { mk_inferred(st, TyAny, root) }
+  else { mk_inferred(field_absent_error(st, recv, fnm, line, col), TyAny, root) }
+}
+
+
+# The `|` → `|>` suggestion. Names the stage when it has one so the
+# message reads as the user's own code, not the desugared `map` call.
+#[doc("Typer-internal helper `emit_pipe_wants_apply` shared across the infer modules.")]
+pub fn emit_pipe_wants_apply(st: InferState, pop: PipeOp, stage: Expr, param: Ty,
+                          elem: Option[Ty], line: Int, col: Int) : Unit / Console + File {
+  let what = match callee_display_name(st, stage) {
+    Some(nm) -> "`#{nm}` takes"
+    None     -> "the stage takes"
+  }
+  let elem_txt = match elem {
+    Some(et) -> inf_ty_to_string(st.env.tab, et)
+    None     -> "the element"
+  }
+  diag_error(st.file, line, col,
+    concat_all(["`", pipe_op_text(pop), "` is element-wise; ", what, " `",
+      inf_ty_to_string(st.env.tab, param), "`, not `", elem_txt, "`"]))
+  diag_help("did you mean `|>` (apply to the whole value)?")
+}
+
+
+#[doc("Typer-internal helper `refine_narrow_error` shared across the infer modules.")]
+pub fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, what: String, line: Int, col: Int, note: String) : InferState / Console + File = match miss {
+  RvMiss(pol, h, w, p) -> {
+    let tab = st.env.tab
+    let pred = rv_pred_text(tab, p)
+    let why = if pol == 1 {
+      concat_all(["`", rv_text(tab, have), "` does not narrow to `", rv_text(tab, want), "`: inside a generic type nothing checks `", pred, "`; map the value through a function that checks it"])
+    } else if pol == 2 {
+      concat_all(["`", rv_text(tab, have), "` does not fit `", rv_text(tab, want), "`: a function taking `", rv_text(tab, h), "` cannot stand in for one taking `", rv_text(tab, w), "`"])
+    } else {
+      concat_all(["`", rv_text(tab, have), "` does not fit `", rv_text(tab, want), "`: a mutable type keeps its refinements exactly, and these differ in `", pred, "`"])
+    }
+    let perr = mk_diag(SevError, st.file, line, col, concat_all([what, ": ", why, note]), [])
+    render_diag(perr)
+    st_bump_err(st_push_diag(st, perr))
+  }
+}
+
+
+fn rv_text(tab: SymTab, t: Ty) : String = match t {
+  TyRefineT(b, p)  -> concat_all([rv_text(tab, b), " where ", rv_pred_text(tab, p)])
+  TyListT(x)       -> concat_all(["[", rv_text(tab, x), "]"])
+  TyCon(s, [])     -> "#{decl_name(tab, s)}"
+  TyCon(s, args_)  -> concat_all(["#{decl_name(tab, s)}", "[", string_join(map(args_, (a) => rv_text(tab, a)), ", "), "]"])
+  TyFnT(ps, r, _)  -> concat_all(["(", string_join(map(ps, (a) => rv_text(tab, a)), ", "), ") -> ", rv_text(tab, r)])
+  _                -> inf_ty_to_string(tab, t)
+}
+
+
+#[doc("Typer-internal helper `refine_args_flow` shared across the infer modules.")]
+pub fn refine_args_flow(st: InferState, args_: [Expr], have: [Ty], wants: [Ty], binds: [RvBind], i: Int, label: String) : InferState / Console + File = match args_ {
+  [a, ...arest] -> match have {
+    [h, ...hrest] -> match wants {
+      [w, ...wrest] -> {
+        let built = match a.kind {
+          EList(_)    -> true
+          ECall(c, _) -> callee_is_ctor(st.env.tab, c)
+          _           -> false
+        }
+        let target = match a.kind {
+          ELambda(_, _) -> rf_keep_result(w, h)
+          _             -> w
+        }
+        let st1 = if built { st } else { match rv_flow(st_ty_defs(st), h, target) {
+          None       -> st
+          Some(miss) -> refine_narrow_error(st, miss, h, w, concat_all(["argument ", int_to_string(i), label]), a.line, a.col, widened_note(args_, binds))
+        } }
+        refine_args_flow(st1, arest, hrest, wrest, binds, i + 1, label)
+      }
+      [] -> st
+    }
+    [] -> st
+  }
+  [] -> st
+}
+
+
+# `ls` is what the part at `at` performs; empty when it is a row of the
+# enclosing signature.
+#[doc("Typer-internal helper `lazy_impure` shared across the infer modules.")]
+pub fn lazy_impure(st: InferState, ls: [Label], at: Expr) : InferState / Console + File = {
+  let what = match ls {
+    [] -> "the effects of the function around it"
+    _  -> "`#{inf_join_with(map(ls, (l) => label_diag_display(st, l)), " + ")}`"
+  }
+  let d = mk_diag(SevError, st.file, at.line, at.col, "everything inside `lazy [...]` is pure, and this performs #{what}",
+                  [ri_help(st.file, at.line, at.col, "a producer that performs effects is a generator: write it with `gen.generate`")])
+  render_diag(d)
+  st_bump_err(st_push_diag(st, d))
+}
+
+
+#[doc("Typer-internal helper `print_inferred_fn` shared across the infer modules.")]
+pub fn print_inferred_fn(tab: SymTab, nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit / Console {
+  let fn_t = fn_ty(param_tys, final_ret)
+  print("fn #{nm} : #{inf_ty_to_string(tab, fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
+}
+
+
+#[doc("Typer-internal helper `scope_row_line` shared across the infer modules.")]
+pub fn scope_row_line(sc: RowScope, tab: SymTab, declared: [Label]) : [String] = match sc {
+  RowInFn(_)    -> ["enclosing row: #{render_declared_row(tab, declared)}"]
+  RowInBlock(_) -> []
+}
+
+
+# Template 5 — render the declared row labels for the
+# `note: enclosing row` line. Empty declared list → "(empty)".
+fn render_declared_row(tab: SymTab, declared: [Label]) : String {
+  match declared {
+    [] -> "(empty)"
+    _  -> inf_join_with(map(declared, (l) => label_to_string(tab, l)), " + ")
+  }
+}
+
+
+# A type argument no use fixed shows as `_`: any instance serves the call.
+#[doc("Typer-internal helper `label_diag_display` shared across the infer modules.")]
+pub fn label_diag_display(st: InferState, l: Label) : String =
+  label_with_args(inf_tycon_display_ow(st.env.tab, st.env.head_owners, l.sym),
+                  map(l.ty_args, (t) => if ty_is_free_var(st.sub, t) { "_" } else { inf_ty_to_string(st.env.tab, t) }))
+
+
+#[doc("Typer-internal helper `ty_is_free_var` shared across the infer modules.")]
+pub fn ty_is_free_var(s: Subst, t: Ty) : Bool = match t {
+  TyVarT(v) -> not subst_is_rigid(s, v)
+  TyAny     -> true
+  _         -> false
+}
+
+
+#[doc("infer: the result of inference — typed decls, errors, instantiations, holes.")]
+#[derive(BinSerialize)]
+pub type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
+                      holes: [ResolvedHole], row_holes: [ResolvedRowHole],
+                      core_len: Int,
+                      # length of the top-level env the root module's
+                      # decl bodies start from. A hole's scope entries
+                      # past this boundary (counted from the tail) are
+                      # top-level/core bindings; the head slice is
+                      # the hole's locals.
+                      toplevel_len: Int,
+                      # the root file's module-level
+                      # `#[doc(...)]` text, lifted from the DModuleDoc
+                      # carrier decl that rides the stream into the
+                      # typer. None when the file has no module doc.
+                      module_doc: Option[String],
+                      # The typer's collected diagnostics; the resolver's
+                      # travel in its own result.
+                      diags: [Diagnostic],
+                      # per op-call resolution side data (#820 evidence
+                      # analysis). Read-only; the typer never consults it.
+                      op_res: [OpResolution] }
+
+
+#[doc("A copy of `tp` with its `decls` replaced — the post-inference rewrite passes swap in a transformed decl stream without restating every field.")]
+pub fn typed_prog_with_decls(tp: TypedProgram, ds: [Decl]) : TypedProgram =
+  TypedProgram { decls: ds, errs: tp.errs, insts: tp.insts, holes: tp.holes,
+                 row_holes: tp.row_holes, core_len: tp.core_len,
+                 toplevel_len: tp.toplevel_len, module_doc: tp.module_doc,
+                 diags: tp.diags, op_res: tp.op_res }
+
+
+#[doc("infer: prepend row holes onto the fold accumulator, reversed.")]
+pub fn prepend_reverse_row_holes(xs: [ResolvedRowHole], acc: [ResolvedRowHole]) : [ResolvedRowHole] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_row_holes(rest, [x, ...acc])
+  }
+}
+
+
+#[doc("infer: prepend op resolutions onto the fold accumulator, reversed.")]
+pub fn prepend_reverse_op_res(xs: [OpResolution], acc: [OpResolution]) : [OpResolution] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_op_res(rest, [x, ...acc])
+  }
+}
+
+
+# stamp the enclosing function onto every resolution captured while
+# walking that function's body — the attribution the evidence dump uses
+# instead of source lines (an interpolation re-parse rewrites lines).
+#[doc("Typer-internal helper `stamp_op_res_fn` shared across the infer modules.")]
+pub fn stamp_op_res_fn(xs: [OpResolution], f: FnId) : [OpResolution] =
+  map(xs, (o) => match o {
+    OPR(_, op, cands, chosen, alias, tagged, line, col) -> OPR(f, op, cands, chosen, alias, tagged, line, col)
+  })
+
+
+# Prepend `xs` onto `acc` in reverse order so `list_reverse(acc)` at
+# the end restores document order. Saves a full list_append per decl.
+#[doc("infer: prepend resolved call sites onto the fold accumulator, reversed.")]
+pub fn llvm_prepend_reverse(xs: [ResolvedCS], acc: [ResolvedCS]) : [ResolvedCS] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> llvm_prepend_reverse(rest, [x, ...acc])
+  }
+}
+
+
+#[doc("infer: prepend holes onto the fold accumulator, reversed.")]
+pub fn prepend_reverse_holes(xs: [ResolvedHole], acc: [ResolvedHole]) : [ResolvedHole] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_holes(rest, [x, ...acc])
+  }
+}
+
+
+# prepend `xs` onto `acc` in reverse order so the final
+# `list_reverse(acc)` at infer_all_loop's terminal restores source
+# order. Matches the pattern used for holes / row_holes / insts above.
+#[doc("infer: prepend diagnostics onto the fold accumulator, reversed.")]
+pub fn prepend_reverse_diags(xs: [Diagnostic], acc: [Diagnostic]) : [Diagnostic] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_diags(rest, [x, ...acc])
+  }
+}
+
+
+# Per-module typer env deltas.
+#
+# `ModuleEnvDelta` is the diff a single module contributes to the
+# typer env. It is the load-bearing data type for the stdlib cache:
+# the core's delta gets serialised; cold
+# starts re-apply it on top of the freshly-built built-in seed.
+#
+# Diff (not full env) so the cache stays independent of the
+# built-in env baked into the compiler. `add_core_sigs` +
+# `add_builtin_variant_sigs` re-run every invocation; only the
+# user-visible decls live in the delta.
+#
+# Scope A (this lane): ty_entries, unions, op_eff_arities, recs,
+# sums, op_to_eff, unit_aliases. Effect aliases, transparent
+# aliases, and protocol impls are produced by the pre-typer cascade
+# (cross-module by design) and threaded around the fold as separate
+# args. The record's shape is open so scope B/C can add fields
+# without rewriting downstream consumers.
+#[derive(BinSerialize)]
+pub type ModuleEnvDelta = {
+  name:           Option[String],
+  ty_entries:     [TyEntry],
+  unions:         [UnionInfo],
+  op_eff_arities: [OpEffArity],
+  recs:           [RecInfo],
+  sums:           [SumInfo],
+  op_to_eff:      [OpToEff],
+  unit_aliases:   [UAliasEntry],
+  constructors:   [CtorEntry]
+}
+
+
+#[doc("infer: the empty `ModuleEnvDelta` — the seed an unfolded module inherits.")]
+pub fn module_env_delta_empty() : ModuleEnvDelta = ModuleEnvDelta {
+  name: None, ty_entries: [], unions: [], op_eff_arities: [],
+  recs: [], sums: [], op_to_eff: [], unit_aliases: [], constructors: []
+}
+
+
+# Compose a child delta onto a parent. Cons-front so the child's
+# bindings shadow the parent's (Rule B: locals shadow imports).
+# Data-only tables (recs, sums, op_eff_arities, etc.) are
+# prepended so downstream lookups see the same precedence as the
+# pre-refactor merged stream.
+#[doc("infer: compose a child module's delta onto its parent so the child's bindings shadow the parent's.")]
+pub fn merge_env_deltas(parent: ModuleEnvDelta, child: ModuleEnvDelta) : ModuleEnvDelta =
+  ModuleEnvDelta {
+    name:           child.name,
+    ty_entries:     list_append(child.ty_entries, parent.ty_entries),
+    unions:         list_append(child.unions, parent.unions),
+    op_eff_arities: list_append(child.op_eff_arities, parent.op_eff_arities),
+    recs:           list_append(child.recs, parent.recs),
+    sums:           list_append(child.sums, parent.sums),
+    op_to_eff:      list_append(child.op_to_eff, parent.op_to_eff),
+    unit_aliases:   list_append(child.unit_aliases, parent.unit_aliases),
+    constructors:   list_append(child.constructors, parent.constructors)
+  }
+
+
+# A single module's view of the decl stream. `name = None` is the
+# synthetic seed; everything else carries its source module name
+# (or the target file's basename for the root). Used by
+# `typecheck_program` to partition `all_decls` into per-module
+# sub-streams.
+#[doc("infer: one module's slice of the post-cascade decl stream — its home module name (`None` for the synthetic seed) and its decls.")]
+pub type ModuleDecls = { name: Option[String], decls: [Decl] }
+
+
+#[doc("infer: what the typer reads beside the declarations it types. `df` attributes each diagnostic to the file declaring what it fires on; `protos` is the registry whose impl targets carry the ids types are stamped with; `views` are the files' scopes and `roots` the compile's root modules.")]
+pub type TyperIn = { df: DiagFiles, protos: ProtoView, head_owners: [HeadOwnerEntry], kind_theories: [KindTheory],
+                     tab: SymTab, views: FileViews, roots: Roots }
+
+
+# pre-typer data tables collected once over the full
+# decl stream. `infer_program` (and the per-module fold
+# composing it) read these tables; under scope A the cascade
+# computes them globally and the fold inherits them without
+# recomputing.
+#[doc("Typer-internal type `ProgramData` shared across the infer modules.")]
+pub type ProgramData = {
+  decls_a:    [Decl],            # decls after unit-alias expansion
+  built:      BuiltEnv,
+  recs:       [RecInfo],
+  alias_res:  AliasResolution,
+  op_to_eff:  [OpToEff],
+  sums:       [SumInfo],
+  # the whole-program type-home table this module's tables were
+  # stamped from; the delta below stamps its own from the same one.
+  homes:      TyHomes
+}
+
+
+#[doc("infer: the tables every module's typecheck reads, built once over the full program decl stream: the built-in seed, the env entries and indexes of every module typed so far, the row-kind slots, the type homes, the effect-alias resolution, the unions of the modules typed so far and the union rows of those still to come.")]
+pub type TcShared = {
+  seed:      BuiltEnv,
+  inh:       TyEnvParts,
+  rk_table:  [RowKindEntry],
+  homes:     TyHomes,
+  alias_res: AliasResolution,
+  field_recs: FieldRecs,
+  unions:    UnionTable,
+  # In stream order, which is the order the modules are typed in.
+  unions_ahead: [UnionRow],
+  # The types whose values may reach a mutable cell, and those that
+  # store an `Array`/`Ref` through fields and payloads alone. Whether a
+  # type is one depends only on what it stores, so the program's
+  # closure answers for every module.
+  carriers:      [SymId],
+  cell_carriers: [SymId]
+}
+
+
+#[doc("infer: build the `TcShared` tables once over the whole program, so a module's typecheck neither rebuilds the seed nor rescans the program for homes and aliases. `roots` are the compile's root modules.")]
+pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
+                 tab: SymTab, views: FileViews, roots: Roots) : TcShared / Console + File {
+  let alias_cands = collect_alias_cands(all_program_decls, tab, df)
+  let seed = build_ty_env_seed()
+  let homes = tsh_homes(all_program_decls, tab, views, root_module_name(file), roots)
+  let hview = tsh_view(homes, None)
+  let shapes = carrier_shapes(hview, typer_records(all_program_decls, tab), collect_sums(all_program_decls))
+  let carriers = mutating_type_names(shapes)
+  TcShared {
+    seed: seed,
+    inh: TEP(seed.env.entries, seed.env.index, seed.env.vindex),
+    rk_table: compute_row_kind_slots(all_program_decls),
+    homes: homes,
+    alias_res: resolve_alias_cands(alias_cands, tab, file),
+    field_recs: field_recs_of(all_program_decls),
+    unions: ut_empty(),
+    unions_ahead: collect_union_rows(all_program_decls, tab, hview),
+    carriers: carriers,
+    cell_carriers: cell_carrier_type_names(shapes, carriers)
+  }
+}
+
+
+#[doc("infer: fold a typed module's env entries into the shared tables, so the next module starts from the entries and indexes of everything typed before it.")]
+pub fn tc_shared_extend(sh: TcShared, delta: ModuleEnvDelta) : TcShared =
+  match sh.inh {
+    TEP(es, ix, vx) -> match union_rows_split(sh.unions_ahead, delta.unions, []) {
+      URSplit(block, ahead) -> TcShared {
+        ...sh,
+        inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx),
+        unions: ut_add(sh.unions, block), unions_ahead: ahead
+      }
+    }
+  }
+
+
+# The rows of the module a delta came from, and the rows still ahead.
+#[doc("Typer-internal type `URSplit` shared across the infer modules.")]
+pub type URSplit = URSplit([UnionRow], [UnionRow])
+
+
+# A delta lists one union per row of its module, in the same order, so
+# the module's rows are the next ones ahead.
+fn union_rows_split(ahead: [UnionRow], us: [UnionInfo], acc: [UnionRow]) : URSplit = match us {
+  [] -> URSplit(list_reverse(acc), ahead)
+  [UI(un, _, ul, uc), ...urest] -> match ahead {
+    [UnionRow(t, comps, l, c), ...rest] ->
+      if l == ul and c == uc { union_rows_split(rest, urest, [UnionRow(t, comps, l, c), ...acc]) }
+      else { panic("union rows out of step with the module deltas: #{int_to_string(sym_raw(un))}") }
+    [] -> panic("union rows out of step with the module deltas: #{int_to_string(sym_raw(un))}")
+  }
+}
+
+
+# cons-front unit-alias composition. Child shadows
+# parent: `unit Newton = kg * m / sec^2` declared locally hides any
+# inherited alias of the same name. Linear in the child + parent
+# count, called once per module fold step.
+#[doc("Typer-internal helper `unit_alias_compose` shared across the infer modules.")]
+pub fn unit_alias_compose(child: [UAliasEntry], parent: [UAliasEntry])
+                       : [UAliasEntry] = list_append(child, parent)
+
+
+# public per-module typecheck entry point.
+#
+# Typechecks `mod.decls` against the env carried by `inherited`
+# and returns the typed decls plus the delta this module
+# contributes. The composed result of folding `typecheck_module`
+# over a list of modules is byte-identical to the monolithic
+# whole-program inference on the concatenation.
+#
+# A single-module call collects ProgramData over its
+# `decls` and runs `infer_all_loop` once. Multi-module fold lives
+# in `typecheck_program` and flattens to a single segment so the
+# byte-identical baseline holds.
+#[doc("infer: what typechecking one module yields — its `TypedProgram` contribution plus the `ModuleEnvDelta` it adds to the typer env.")]
+#[derive(BinSerialize)]
+pub type TypecheckedModule = { typed: TypedProgram, delta: ModuleEnvDelta }
+
+
+# take the first `n` op-eff arity records, mirroring
+# `take_entries`. Used by `typecheck_module` to extract the head
+# slice that `add_decls_loop` cons-prepended for this module's
+# contribution. Tail-recursive on `acc` for arity-list sizes that
+# scale with the effect-op count of every loaded module.
+#[doc("Typer-internal helper `take_op_eff_arities` shared across the infer modules.")]
+pub fn take_op_eff_arities(xs: [OpEffArity], n: Int,
+                         acc: [OpEffArity]) : [OpEffArity] {
+  if n <= 0 { list_reverse(acc) }
+  else { match xs {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> take_op_eff_arities(rest, n - 1, [h, ...acc])
+  } }
+}
+
+
+#[doc("infer: concatenate every module bucket's decls in fold order, so a per-module typecheck can still cross-reference program-wide decls.")]
+pub fn flatten_module_decls(mods: [ModuleDecls], acc: [Decl]) : [Decl] =
+  list_reverse(fmd_rev(mods, list_reverse(acc)))
+
+
+# Each bucket's decls go on head-first onto a reversed accumulator, so
+# the concatenation copies each decl once rather than re-copying the
+# whole prefix per bucket.
+fn fmd_rev(mods: [ModuleDecls], rev: [Decl]) : [Decl] = match mods {
+  []           -> rev
+  [m, ...rest] -> fmd_rev(rest, fmd_rev_prepend(m.decls, rev))
+}
+
+
+fn fmd_rev_prepend(ds: [Decl], rev: [Decl]) : [Decl] = match ds {
+  []           -> rev
+  [d, ...rest] -> fmd_rev_prepend(rest, [d, ...rev])
+}
+
+
+# prepend `xs` onto `acc` reversed; the final
+# `list_reverse(acc)` at terminal restores source order. Mirrors the
+# pattern used by `prepend_reverse_holes` / `llvm_prepend_reverse`
+# inside `infer_all_loop`.
+#[doc("infer: prepend `xs` onto `acc` reversed; the fold's terminal `list_reverse` restores source order.")]
+pub fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_decls(rest, [x, ...acc])
+  }
+}
+
+
+# The target is typed after every module it may import. First-appearance
+# order does not guarantee that: a module whose only declarations are
+# protocols and impls contributes nothing to the stream until the
+# lowered impl fns and dispatchers, which are appended after the
+# target's own decls.
+#[doc("Typer-internal helper `target_bucket_last` shared across the infer modules.")]
+pub fn target_bucket_last(mods: [ModuleDecls], target_mod: String) : [ModuleDecls] =
+  match tbl_target(mods, target_mod) {
+    None    -> mods
+    Some(t) -> list_append(tbl_others(mods, target_mod, []), [t])
+  }
+
+
+fn tbl_is_target(m: ModuleDecls, target_mod: String) : Bool = match m.name {
+  Some(n) -> n == target_mod
+  None    -> false
+}
+
+
+fn tbl_target(mods: [ModuleDecls], target_mod: String) : Option[ModuleDecls] =
+  match mods {
+    [] -> None
+    [m, ...rest] -> if tbl_is_target(m, target_mod) { Some(m) }
+                    else { tbl_target(rest, target_mod) }
+  }
+
+
+fn tbl_others(mods: [ModuleDecls], target_mod: String,
+              acc: [ModuleDecls]) : [ModuleDecls] = match mods {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> if tbl_is_target(m, target_mod) { tbl_others(rest, target_mod, acc) }
+                  else { tbl_others(rest, target_mod, [m, ...acc]) }
+}
+
+
+# Per-decl bucketing rule. Every decl kind with a `module_origin` slot
+# is stamped at load time for an imported or core module, so an empty
+# slot means the root file wrote it: it goes to `target_mod`. Only the
+# kinds with no slot (`use`, a non-`pub` axiom) follow the running
+# anchor, the home of the nearest decl before them.
+#[doc("Typer-internal helper `decide_partition_home` shared across the infer modules.")]
+pub fn decide_partition_home(d: Decl, target_mod: String,
+                            anchor: String) : String = match decl_explicit_module_origin(d) {
+  Some(m) -> m
+  None    -> if decl_has_origin_slot(d) { target_mod } else { anchor }
+}
+
+
+# Wrappers delegate to the decl they wrap; an impl to its first method.
+#[doc("Typer-internal helper `decl_explicit_module_origin` shared across the infer modules.")]
+pub fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo)      -> mo
+  DType(_, _, _, _, _, _, mo, _)          -> mo
+  DEffect(_, _, _, _, _, _, _, mo)        -> mo
+  DProtocol(_, _, _, _, _, _, mo)         -> mo
+  DConst(_, _, _, _, mo, _, _)            -> mo
+  DExternType(_, _, _, _, mo)             -> mo
+  DKind(_, _, _, _, _, _, _, mo)          -> mo
+  DTheory(_, _, _, _, mo)                 -> mo
+  DUnit(_, _, _, _, _, _, mo)             -> mo
+  DUseKind(_, _, _, mo)                   -> mo
+  DTest(_, _, _, _, mo)                   -> mo
+  DBench(_, _, _, _, mo)                  -> mo
+  DCheck(_, _, _, _, _, mo)               -> mo
+  DDerive(_, inner, _, _)                 -> decl_explicit_module_origin(inner)
+  DUnstable(inner, _, _)                  -> decl_explicit_module_origin(inner)
+  DProtoLaws(_, inner, _, _, _)           -> decl_explicit_module_origin(inner)
+  DImplAxiom(_, inner, _, _, _)           -> decl_explicit_module_origin(inner)
+  DConstructor(inner, _, _)               -> decl_explicit_module_origin(inner)
+  DImpl(_, _, _, sub, _, _, _, _)         -> match sub {
+    [] -> None
+    [m, ..._] -> decl_explicit_module_origin(m)
+  }
+  _ -> None
+}
+
+
+fn decl_has_origin_slot(d: Decl) : Bool = match d {
+  DUse(_, _, _)                        -> false
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> false
+  DImpl(_, _, _, sub, _, _, _, _)      -> match sub {
+    [] -> false
+    [m, ..._] -> decl_has_origin_slot(m)
+  }
+  DDerive(_, inner, _, _)              -> decl_has_origin_slot(inner)
+  DUnstable(inner, _, _)               -> decl_has_origin_slot(inner)
+  DProtoLaws(_, inner, _, _, _)        -> decl_has_origin_slot(inner)
+  DImplAxiom(_, inner, _, _, _)        -> decl_has_origin_slot(inner)
+  DConstructor(inner, _, _)            -> decl_has_origin_slot(inner)
+  _ -> true
+}
+

@@ -1,0 +1,983 @@
+#[doc("Typer support: infer_clause_holes.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_text
+import compiler.core_syms
+import compiler.call_site_target
+import compiler.core_builtins
+import compiler.effect_default
+import compiler.resolve_names
+import compiler.handler_alias
+import compiler.expr_positions
+import compiler.decl_names
+import compiler.symtab
+import compiler.lit_mint
+import compiler.infer_unit_alias
+import compiler.tycon_scheme_home
+import compiler.homonym
+import compiler.core_effects
+import compiler.core_types
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_call_labels
+
+# A clause body is its own function: a cell alias's handler id rides the
+# handler env into it and keeps its tag; a capability alias drops it.
+fn aliases_clause_tags(aliases: [AliasBinding]) : [AliasBinding] {
+  match aliases {
+    [] -> []
+    [AB(a, t, s), ...rest] -> [AB(a, t and eff_is_cell_effect(s), s), ...aliases_clause_tags(rest)]
+  }
+}
+
+
+#[doc("Typer-internal helper `st_clause_alias_tags` shared across the infer modules.")]
+pub fn st_clause_alias_tags(st: InferState) : InferState =
+  InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses,
+               aliases: aliases_clause_tags(st.aliases),
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
+               ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
+
+
+# A handle body's uses stay blamable only for the labels it lets escape, and
+# only when the enclosing scope has not used the label earlier in source.
+#[doc("Typer-internal helper `scope_eff_uses` shared across the infer modules.")]
+pub fn scope_eff_uses(outer: [EffUse], inner: [EffUse], kept: [Label]) : [EffUse] =
+  list_append(escaping_uses(inner, list_length(inner) - list_length(outer), outer, kept, []), outer)
+
+
+# The holes a handle body registered (prepended past the `n_before`
+# already there) see the effect the handler discharges.
+#[doc("Typer-internal helper `holes_under_handler` shared across the infer modules.")]
+pub fn holes_under_handler(st: InferState, n_before: Int, lab: Label) : InferState =
+  InferState { ...st, holes: tag_new_holes(st.holes, list_length(st.holes) - n_before, lab) }
+
+
+fn tag_new_holes(hs: [HoleSite], n_new: Int, lab: Label) : [HoleSite] =
+  if n_new <= 0 { hs }
+  else { match hs {
+    [] -> []
+    [HS(kind, line, col, fresh, scope, env_fresh, handled), ...rest] ->
+      [HS(kind, line, col, fresh, scope, env_fresh, [lab, ...handled]), ...tag_new_holes(rest, n_new - 1, lab)]
+  } }
+
+
+# thread an init's typed sub-expression and resolved
+# handler-state type alongside the inferred state.
+#[doc("Typer-internal type `IT` shared across the infer modules.")]
+pub type IT = { st: InferState, init_opt: Option[Expr], state_ty: Option[Ty] }
+
+
+#[doc("Typer-internal type `RetTyped` shared across the infer modules.")]
+pub type RetTyped = { st: InferState, ty: Ty, ret_opt: Option[HReturn] }
+
+
+# type-check each handler clause body under an env that
+# binds the op's args and `resume`. The trailing param is `resume`
+# by surface convention; the rest map positionally to the op's
+# declared parameter types. If the clause's arity does not match
+# the op's signature we fall back to fresh tyvars for any unbound
+# slot — clause-arity validation is a separate diagnostic-baseline
+# task.
+#[doc("Typer-internal type `ClausesTyped` shared across the infer modules.")]
+pub type ClausesTyped = { st: InferState, clauses: [HClause] }
+
+
+#[doc("Typer-internal type `ClauseTyped1` shared across the infer modules.")]
+pub type ClauseTyped1 = { st: InferState, clause: HClause }
+
+
+# bind clause params; also returns the answer type recovered
+# from the op's instantiated signature so the caller can build a
+# precise resume binding. The op's effect-tparam fresh tyvars are
+# unified with `eff_tyargs` (the handler's `with Eff[T1, T2]`
+# instantiation) so the answer type is concrete when the handler is
+# instantiated to concrete types.
+#[doc("Typer-internal type `ClauseBindRes` shared across the infer modules.")]
+pub type ClauseBindRes = { st: InferState, answer_ty: Ty, op_rigid: [Int] }
+
+
+#[doc("Typer-internal helper `ty_is_generic_slot` shared across the infer modules.")]
+pub fn ty_is_generic_slot(t: Ty) : Bool {
+  match t {
+    TyVarT(_) -> true
+    TyAny     -> true
+    _         -> false
+  }
+}
+
+
+# The effect a `with` head names, as a diagnostic spells it.
+fn handle_eff_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
+}
+
+
+#[doc("Typer-internal helper `check_handle_effect_known` shared across the infer modules.")]
+pub fn check_handle_effect_known(st: InferState, eff_ref: DeclRef,
+                              line: Int, col: Int) : InferState / Console + File {
+  if env_has_effect(st.env, ref_sym(eff_ref)) { st }
+  else {
+    let eff = handle_eff_text(st.env.tab, eff_ref)
+    let header = string_concat("unknown effect in `with`: `",
+      string_concat(eff, "`"))
+    let perr = mk_diag(SevError, st.file, line, col, header, [])
+    render_diag(perr)
+    diag_note("`handle { ... } with #{eff} { ... }` references an undeclared effect")
+    diag_help("either `effect #{eff} { ... }` it, or correct the name to a declared effect")
+    st_bump_err(st_push_diag(st, perr))
+  }
+}
+
+
+#[doc("Typer-internal helper `check_clause_names` shared across the infer modules.")]
+pub fn check_clause_names(st: InferState, eff_ref: DeclRef, cs: [HClause],
+                      line: Int, col: Int) : InferState / Console + File {
+
+
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(head, _, _, cline, ccol) -> {
+        let name = clause_head_word(head)
+        if is_lifecycle_clause(head) {
+          check_clause_names(st, eff_ref, rest, line, col)
+        } else {
+        match env_op(st.env, ref_sym(eff_ref), written(name)) {
+          Some(_) -> check_clause_names(st, eff_ref, rest, line, col)
+          None -> {
+            let eff = handle_eff_text(st.env.tab, eff_ref)
+            let perr = mk_diag(SevError, st.file, cline, ccol,
+              string_concat("unknown op `",
+                string_concat(name,
+                  string_concat("` on effect `",
+                    string_concat(eff, "`")))), [])
+            render_diag(perr)
+            diag_note("handler clauses must match an op declared in `effect #{eff} { ... }`")
+            diag_help("either remove this clause, or add `#{name}(...)` to the effect declaration")
+            check_clause_names(st_bump_err(st_push_diag(st, perr)), eff_ref, rest, line, col)
+          }
+        }
+        }
+      }
+    }
+  }
+}
+
+
+# `initially { }` never reaches a handle past the parser, which lifts it
+# into the handler-state slot; anywhere else it reads as a clause for an
+# op of that name.
+#[doc("True for `finally { }`, the handler lifecycle clause: it is not an op of the effect.")]
+pub fn is_lifecycle_clause(h: ClauseHead) : Bool = match h {
+  ChFinally   -> true
+  ChInitially -> false
+  ChOp(_)     -> false
+}
+
+
+# verify a handler clause's positional parameter count
+# matches the op signature plus one for `resume`. Unknown ops fall
+# through (None branch): `check_clause_names` already reports those
+# and stacking an arity error would be confusing. The op scheme's
+# fn arg-tys count is the user-declared arity; the clause body
+# binds the user params positionally and the trailing param as
+# `resume`, so the expected clause-side count is `arg_tys.length + 1`.
+# We read the arg-tys length directly off the scheme's body — no
+# instantiation needed for an arity-only check.
+#[doc("Typer-internal helper `check_clause_arity` shared across the infer modules.")]
+pub fn check_clause_arity(st: InferState, eff: SymId, op_name: String,
+                       params: [Param], line: Int, col: Int) : InferState / Console + File {
+  match env_op(st.env, eff, written(op_name)) {
+    None     -> st
+    Some(sc) -> match sc {
+      Scheme(_, _, _, _, body) -> match body {
+        TyFnT(arg_tys, _, _) -> {
+          let expected = list_length(arg_tys) + 1
+          let got = list_length(params)
+          if got == expected { st }
+          else {
+            let eff_name = written_text(decl_name(st.env.tab, eff))
+            let header = string_concat("handler clause `",
+              string_concat(op_name,
+                string_concat("` has wrong arity for effect `",
+                  string_concat(eff_name, "`"))))
+            let perr = mk_diag(SevError, st.file, line, col, header, [])
+            render_diag(perr)
+            let n1 = "`#{eff_name}.#{op_name}` declares #{int_to_string(expected - 1)} parameter(s); the clause must take those plus a trailing `resume`, for a total of #{int_to_string(expected)}"
+            let n2 = "got #{int_to_string(got)} clause parameter(s)"
+            let h1 = "write `#{op_name}(#{int_to_string(expected - 1)} arg(s), resume) -> ...`"
+            let h2 = "the trailing parameter is the resumption continuation; omitting it makes the clause uncallable"
+            diag_note(n1)
+            diag_note(n2)
+            diag_help(h1)
+            diag_help(h2)
+            st_bump_err(st_push_diag(st, perr))
+          }
+        }
+        _ -> st
+      }
+    }
+  }
+}
+
+
+# filter labels of the effect `hsym` in `cell` whose
+# ty_args unify with `tyargs`. This is the handler-removal path: only
+# the labels matching the handler's instantiation are dropped from the
+# body's row. A handler `with Reader[Int]` does NOT remove a body's
+# `Reader[String]` label.
+#
+# the handler is the AUTHORITY on the type of the cell it
+# discharges, so a matching label's ty_args are UNIFIED against the
+# handler's `tyargs` (binding into the substitution), not merely
+# shape-checked. Two reads of one cell that the row partition no longer
+# cross-pairs (distinct cells are distinct labels)
+# converge here instead: the first read pins the element type, the
+# handler's `[?t0]` binds the label's `[?t15]`, and the threaded subst
+# carries the binding to the next read so all reads of the cell agree.
+# Match is a two-step "guard then bind": `label_args_dischargeable` is a
+# pure, tyvar-permissive predicate (accepts a TyVar at any depth, rejects
+# only a concrete-vs-concrete leaf clash) that DECIDES whether to
+# discharge; only on a positive decision do we run the real `unify` that
+# BINDS — so a non-matching label (`Reader[Int]` body under a
+# `Reader[String]` handler) never leaves a partial binding behind.
+#[doc("Typer-internal type `FilterResult` shared across the infer modules.")]
+pub type FilterResult = { kept: [Label], sub: Subst }
+
+
+#[doc("Typer-internal type `LabelJoin` shared across the infer modules.")]
+pub type LabelJoin = { st: InferState, added: Bool }
+
+
+# A phantom label (every argument `TyAny`) only demands some instance of
+# its effect. It must not stand in for a sibling that pins one, so a pinning
+# label replaces it, and a phantom joining a row with a sibling is dropped.
+#[doc("Typer-internal helper `drop_phantom_twins` shared across the infer modules.")]
+pub fn drop_phantom_twins(row: [Label], lab: Label) : [Label] =
+  if label_is_phantom(lab) { row }
+  else { filter(row, (h) => not (label_same(h, lab) and label_is_phantom(h))) }
+
+
+#[doc("Typer-internal helper `label_is_phantom` shared across the infer modules.")]
+pub fn label_is_phantom(l: Label) : Bool = match l.ty_args {
+  []   -> false
+  args -> all(args, (t) => match t { TyAny -> true _ -> false })
+}
+
+
+# A hole gets a fresh TyVarT and records its source position and the
+# current scope snapshot. Named holes with the same name within the
+# same decl share a TyVarT so both instances unify to the same type
+# (matches the `if ... { ?x } else { ?x }` example in the doc).
+#[doc("Typer-internal helper `synth_hole` shared across the infer modules.")]
+pub fn synth_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
+  match nm_opt {
+    Some(nm) -> match find_hole_by_name(st.holes, nm) {
+      Some(prior_fresh) -> inferred_leaf(st, TyVarT(prior_fresh), e)
+      None -> register_fresh_hole(st, HKHole(nm_opt), e)
+    }
+    None -> register_fresh_hole(st, HKHole(nm_opt), e)
+  }
+}
+
+
+# register a `todo!(msg)` site as a hole-with-kind. Each
+# occurrence is independent (no name-based sharing — `todo!` carries
+# a free-form message, not an identifier), so we always allocate a
+# fresh TyVarT.
+#[doc("Typer-internal helper `synth_todo` shared across the infer modules.")]
+pub fn synth_todo(st: InferState, msg: String, e: Expr) : Inferred {
+  # Protocol-dispatcher markers reach `synth_todo` because they are
+  # ETodos. They are NOT user-authored holes; the dispatcher fn typechecks
+  # exactly like a regular polymorphic fn but emits a runtime shim at
+  # codegen. Skip the hole register so `--holes-json` does not list the
+  # marker as a user hole.
+  if inf_string_starts_with_q(msg, inf_proto_dispatch_tag_prefix()) {
+    let fresh_id = st.env.fresh
+    let st1 = st_set_env(st, fresh_var(st.env))
+    inferred_leaf(st1, TyVarT(fresh_id), e)
+  } else {
+    register_fresh_hole(st, HKTodo(msg), e)
+  }
+}
+
+
+# An extern-fn body type-checks like a hole (any expected type fits)
+# but is never a user hole: allocate a fresh tyvar without registering
+# it, so `--holes-json` ignores it and no effect leaks from the body.
+#[doc("Typer-internal helper `synth_extern_body` shared across the infer modules.")]
+pub fn synth_extern_body(st: InferState, e: Expr) : Inferred {
+  let fresh_id = st.env.fresh
+  let st1 = st_set_env(st, fresh_var(st.env))
+  inferred_leaf(st1, TyVarT(fresh_id), e)
+}
+
+
+fn register_fresh_hole(st: InferState, kind: HoleKind, e: Expr) : Inferred {
+  let fresh_id = st.env.fresh
+  let st1 = st_set_env(st, fresh_var(st.env))
+  let site = HS(kind, e.line, e.col, fresh_id, st1.env.entries, st1.env.fresh, [])
+  let st2 = st_push_hole(st1, site)
+  inferred_leaf(st2, TyVarT(fresh_id), e)
+}
+
+
+#[doc("Typer-internal helper `find_hole_by_name` shared across the infer modules.")]
+pub fn find_hole_by_name(holes: [HoleSite], target: String) : Option[Int] {
+  match holes {
+    [] -> None
+    [h, ...rest] -> match h {
+      HS(kind, _, _, fresh, _, _, _) -> match kind {
+        HKHole(nm_opt) -> match nm_opt {
+          Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
+          None     -> find_hole_by_name(rest, target)
+        }
+        HKTodo(_) -> find_hole_by_name(rest, target)
+        HKPattern(nm_opt, _) -> match nm_opt {
+          Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
+          None     -> find_hole_by_name(rest, target)
+        }
+      }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `doms_open` shared across the infer modules.")]
+pub fn doms_open(t: Ty) : Bool = match t {
+  TyFnT(doms, _, _) -> not tuple_concrete(doms)
+  _                 -> false
+}
+
+
+#[doc("True when no type of the list holds a type, shape or unit variable.")]
+pub fn tuple_concrete(tys: [Ty]) : Bool {
+  match tys {
+    [] -> true
+    [t, ...rest] -> if ty_concrete(t) { tuple_concrete(rest) } else { false }
+  }
+}
+
+
+#[doc("True when a type holds no type, shape or unit variable.")]
+pub fn ty_concrete(t: Ty) : Bool {
+  match t {
+    TyVarT(_) -> false
+    TyShapeApp(_, _) -> false
+    TyListT(inner) -> ty_concrete(inner)
+    TyFnT(ps, r, _) -> tuple_concrete(ps) and ty_concrete(r)
+    TyCon(_, tas) -> tuple_concrete(tas)
+    TyDimT(b, u) -> ty_concrete(b) and unit_concrete(u)
+    TyRefineT(b, _) -> ty_concrete(b)
+    TyUnion(parts) -> tuple_concrete(parts)
+    _ -> true   # primitive types and TyAny are concrete
+  }
+}
+
+
+#[doc("True when no unit of the list holds a unit variable.")]
+pub fn units_concrete(us: [UnitExprT]) : Bool {
+  match us {
+    [] -> true
+    [u, ...rest] -> if unit_concrete(u) { units_concrete(rest) } else { false }
+  }
+}
+
+
+fn unit_concrete(u: UnitExprT) : Bool {
+  let cu = unit_canon(u)
+  match cu {
+    UVar(_)    -> false
+    UOne       -> true
+    USym(_)    -> true
+    UParam(_)  -> true
+    UMul(a, b) -> unit_concrete(a) and unit_concrete(b)
+    UInv(a)    -> unit_concrete(a)
+    UPow(a, _) -> unit_concrete(a)
+    UJoin(a, b) -> unit_concrete(a) and unit_concrete(b)
+    UDims(us)  -> units_concrete(us)
+  }
+}
+
+
+#[doc("Typer-internal helper `is_lambda` shared across the infer modules.")]
+pub fn is_lambda(e: Expr) : Bool = match e.kind {
+  ELambda(_, _) -> true
+  _             -> false
+}
+
+
+#[doc("Typer-internal helper `params_after_first` shared across the infer modules.")]
+pub fn params_after_first(ps: [Ty]) : [Ty] = match ps {
+  [_, ...rest] -> rest
+  []           -> []
+}
+
+
+#[doc("Typer-internal helper `constructor_of_type` shared across the infer modules.")]
+pub fn constructor_of_type(st: InferState, t: SymId) : Option[CtorEntry] =
+  if sym_raw(t) < 0 { None } else { constructor_lookup(st.env.constructors, t) }
+
+
+# The type a bare callee spells: only a name the resolver left unsettled
+# can be one, since a type is no value.
+#[doc("Typer-internal helper `callee_type_sym` shared across the infer modules.")]
+pub fn callee_type_sym(st: InferState, callee: Expr) : SymId = match callee.kind {
+  EName(nm) -> tsh_sym(st_home_view(st), written_text(nm))
+  _         -> sym_none()
+}
+
+
+# Coin each bare numeric arg to the marked constructor's param type.
+# The scheme is instantiated to read its `TyFnT` param list; an arg
+# whose literal mints against its param is rewritten, others pass
+# through untouched (the unifier still confirms the result).
+# The home of the module declaring `BigInt`: a minted big literal calls
+# that module's `from_literal`.
+#[doc("Typer-internal helper `mint_bigint_home` shared across the infer modules.")]
+pub fn mint_bigint_home(env: TyEnv) : String =
+  match tsh_sym_slot(env_home_view(env, None), core_decl_ty_id(CdBigInt)) {
+    Some(h) -> h
+    None    -> "bigint"
+  }
+
+
+#[doc("Typer-internal helper `constructor_mint_zip` shared across the infer modules.")]
+pub fn constructor_mint_zip(args_: [Expr], param_tys: [Ty], bh: String) : [Expr] {
+  match args_ {
+    [] -> []
+    [a, ...rest_a] -> match param_tys {
+      [] -> args_
+      [p, ...rest_p] -> {
+        let a2 = match mint_literal(a, p, bh) { MintOk(e2) -> e2  _ -> a }
+        [a2, ...constructor_mint_zip(rest_a, rest_p, bh)]
+      }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `rec_fields_hint` shared across the infer modules.")]
+pub fn rec_fields_hint(fs: [FieldDecl]) : String = match fs {
+  [] -> ""
+  [f] -> match f { FD(_, nm, _, _) -> concat_all([nm, ": ..."]) }
+  [f, ...rest] -> match f { FD(_, nm, _, _) -> concat_all([nm, ": ..., ", rec_fields_hint(rest)]) }
+}
+
+
+#[doc("Typer-internal helper `hom_cands_of` shared across the infer modules.")]
+pub fn hom_cands_of(cs: [TyCandidate]) : [HomCand] = match cs {
+  []           -> []
+  [c, ...rest] -> [HCand(c.sym, hom_scheme_body(c.scheme)), ...hom_cands_of(rest)]
+}
+
+
+fn hom_scheme_body(sc: TyScheme) : Ty = match sc {
+  Scheme(_, _, _, _, t) -> t
+}
+
+
+# The drained state plus the retargets the typed body still needs.
+#[doc("Typer-internal type `HomDrain` shared across the infer modules.")]
+pub type HomDrain = { st: InferState, picks: [HomPick] }
+
+
+#[doc("Typer-internal type `SegClauses` shared across the infer modules.")]
+pub type SegClauses = { st: InferState, exprs: [Expr] }
+
+
+#[doc("Typer-internal type `SegReq` shared across the infer modules.")]
+pub type SegReq = { at: Expr, args: [Expr] }
+
+
+#[doc("Typer-internal helper `seg_request_at` shared across the infer modules.")]
+pub fn seg_request_at(e: Expr, i: Int) : Option[SegReq] = match e.kind {
+  EIntrinsic(InSegRequest, xs) -> match xs {
+    [ix, ...args] -> match ix.kind {
+      EInt(n, _) -> if n == i { Some(SegReq { at: e, args: args }) } else { None }
+      _ -> None
+    }
+    [] -> None
+  }
+  _ -> seg_request_in(map(xp_positions(e), xpos_expr), i)
+}
+
+
+fn seg_request_in(es: [Expr], i: Int) : Option[SegReq] = match es {
+  [] -> None
+  [x, ...rest] -> match seg_request_at(x, i) {
+    Some(r) -> Some(r)
+    None    -> seg_request_in(rest, i)
+  }
+}
+
+
+fn xpos_expr(p: XPos) : Expr = match p { XP(_, x) -> x }
+
+
+#[doc("Typer-internal helper `ty_of_expr` shared across the infer modules.")]
+pub fn ty_of_expr(e: Expr) : Ty = match e.ty { Some(t) -> t  None -> TyAny }
+
+
+#[doc("Typer-internal helper `seg_error` shared across the infer modules.")]
+pub fn seg_error(st: InferState, at: Expr, header: String, help: String) : Inferred / Console + File + Mutable = {
+  diag_error(st.file, at.line, at.col, header)
+  let related = if help == "" { [] } else {
+    diag_help(help)
+    [ri_help(st.file, at.line, at.col, help)]
+  }
+  let d = mk_diag(SevError, st.file, at.line, at.col, header, related)
+  inferred_leaf(st_bump_err(st_push_diag(st, d)), TyAny, at)
+}
+
+
+# `$resume_bad(message, help)`: a clause the non-tail `resume` split
+# could not express, reported at the offending call.
+#[doc("Typer-internal helper `report_resume_bad` shared across the infer modules.")]
+pub fn report_resume_bad(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = {
+  let (msg, help) = match args_ {
+    [m, h] -> (intrinsic_text(m), intrinsic_text(h))
+    _      -> ("malformed `$resume_bad`", "")
+  }
+  diag_error(st.file, e.line, e.col, msg)
+  diag_help(help)
+  let d = mk_diag(SevError, st.file, e.line, e.col, msg, [ri_help(st.file, e.line, e.col, help)])
+  let r = st_fresh_ty(st_bump_err(st_push_diag(st, d)))
+  inferred_leaf(r.st, r.ty, e)
+}
+
+
+fn intrinsic_text(x: Expr) : String = match x.kind {
+  EStr(span, _) -> strip_string_quotes(span)
+  _             -> ""
+}
+
+
+# The type of the handle whose clause is being checked: what `resume` returns.
+#[doc("Typer-internal helper `clause_result_ty` shared across the infer modules.")]
+pub fn clause_result_ty(st: InferState) : Ty = match st.clause_resume {
+  Some(RB(_, _, s)) -> s
+  None -> match st.in_clause {
+    CcOwn(k) -> match env_local(st.env, k.id) {
+      Some(Scheme(_, _, _, _, t)) -> match t {
+        TyFnT(_, s, _) -> s
+        _ -> TyAny
+      }
+      None -> TyAny
+    }
+    _ -> TyAny
+  }
+}
+
+
+#[doc("Typer-internal helper `lambda_resume_call` shared across the infer modules.")]
+pub fn lambda_resume_call(st: InferState, name: Written, callee: Expr) : Inferred / Console + File + Mutable = {
+  let header = "calling the continuation from inside a lambda is not supported yet"
+  let help_msg = "call `#{name}` in the clause body itself"
+  diag_error(st.file, callee.line, callee.col, header)
+  diag_help(help_msg)
+  let d = mk_diag(SevError, st.file, callee.line, callee.col, header, [ri_help(st.file, callee.line, callee.col, help_msg)])
+  inferred_leaf(st_bump_err(st_push_diag(st, d)), TyAny, callee)
+}
+
+
+# result of `pick_by_first_arg`. The picked scheme has
+# already been instantiated (state's `fresh` and `sub` advanced); the
+# caller proceeds with the standard unify-arg-then-emit pipeline.
+# `target` is what the caller makes the callee.
+#[doc("Typer-internal type `PickResult` shared across the infer modules.")]
+pub type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
+                    target: PickTarget }
+
+
+# A function, the identity of the settled contest; or an operation left
+# between the dispatchers of the protocols declaring it.
+#[doc("Typer-internal type `PickTarget` shared across the infer modules.")]
+pub type PickTarget = PtDecl(SymId) | PtOp([SymId])
+
+
+# The picked callee, at a position.
+#[doc("Typer-internal helper `pick_ref` shared across the infer modules.")]
+pub fn pick_ref(p: PickResult, line: Int, col: Int) : Expr = match p.target {
+  PtDecl(s) -> mk_sym(s, line, col)
+  PtOp(ss)  -> mk_expr(EMark(MkProtoOp(ss)), line, col)
+}
+
+
+# The state with the pick's instantiation recorded against the call at a
+# position. An operation left between dispatchers records none.
+#[doc("Typer-internal helper `pick_inst` shared across the infer modules.")]
+pub fn pick_inst(p: PickResult, line: Int, col: Int) : InferState = match p.target {
+  PtDecl(s) -> if p.fresh == [] and p.unit_fresh == [] { p.st }
+               else { st_push_inst(p.st, CS(s, line, col, p.fresh, p.unit_fresh, None)) }
+  PtOp(_)   -> p.st
+}
+
+
+# What the first argument's type decides among the candidates of one
+# name: the function, a tie the scope cannot break, or nothing.
+#[doc("Typer-internal type `FirstArg` shared across the infer modules.")]
+pub type FirstArg = FaOne(PickResult) | FaTie(InferState, [SymId]) | FaNone
+
+
+# One candidate whose first parameter unifies with the argument.
+#[doc("Typer-internal type `Probed` shared across the infer modules.")]
+pub type Probed = { pick: PickResult, sym: SymId, concrete: Bool }
+
+
+#[doc("Typer-internal type `ProbeRun` shared across the infer modules.")]
+pub type ProbeRun = { st: InferState, hits: [Probed] }
+
+
+# A pick carrying the state past every candidate's instantiation.
+#[doc("Typer-internal helper `pick_at` shared across the infer modules.")]
+pub fn pick_at(p: PickResult, latest: InferState) : PickResult = PickResult { ...p, st: latest }
+
+
+#[doc("Typer-internal type `ProbeOutcome` shared across the infer modules.")]
+pub type ProbeOutcome = ProbeNoMatch | ProbeTyvar | ProbeConcrete
+
+
+# True when the head of `t` is a concrete type constructor (TyCon,
+# TyListT, primitive). Tyvars (TyVarT) and TyAny match anything and
+# count as ambiguous — the caller routes them to the tyvar bucket.
+# `TyFnT` first params (a higher-order arg) are concrete: distinct
+# arities or shapes won't accidentally unify with a `TyListT`-headed
+# first param.
+#[doc("Typer-internal helper `first_param_head_is_concrete` shared across the infer modules.")]
+pub fn first_param_head_is_concrete(t: Ty) : Bool = match t {
+  TyVarT(_)    -> false
+  TyAny        -> false
+  TyInt        -> true
+  TyReal       -> true
+  TyBool       -> true
+  TyString     -> true
+  TyChar       -> true
+  TyUnit       -> true
+  TyByte         -> true
+  TyInt32        -> true
+  TyUInt32       -> true
+  TyUInt64       -> true
+  TyInt128       -> true
+  TyListT(_)   -> true
+  TyFnT(_, _, _) -> true
+  TyCon(_, _)  -> true
+  TyDimT(_, _) -> true
+  _            -> false
+}
+
+
+# The function module `home` declares as `name`, when the env holds it.
+fn env_home_fn(env: TyEnv, home: String, name: String) : Option[SymId] = match st_module(env.tab, home) {
+  None    -> None
+  Some(h) -> env_module_fn(env, h, name)
+}
+
+
+# The function the module `m` declares as `name`, when the env holds it.
+#[doc("Typer-internal helper `env_module_fn` shared across the infer modules.")]
+pub fn env_module_fn(env: TyEnv, m: SymId, name: String) : Option[SymId] = match st_lookup(env.tab, NCFn, name, m) {
+  None    -> None
+  Some(s) -> match env_sym(env, s) {
+    Some(_) -> Some(s)
+    None    -> None
+  }
+}
+
+
+# What a method name no visible module answers and no binder in scope
+# spells reads: the root file's function, else the builtin.
+#[doc("Typer-internal helper `ufcs_bare_sym` shared across the infer modules.")]
+pub fn ufcs_bare_sym(env: TyEnv, ident: String) : Option[SymId] =
+  match env_home_fn(env, tsh_target(env.ty_homes), ident) {
+    Some(s) -> Some(s)
+    None    -> match env_sym(env, builtin_sym(ident)) {
+      Some(_) -> Some(builtin_sym(ident))
+      None    -> None
+    }
+  }
+
+
+# The innermost binder in scope the source wrote as `name`. Binders are
+# bound after every declaration, so they are the prefix of the entries.
+#[doc("Typer-internal helper `env_local_written` shared across the infer modules.")]
+pub fn env_local_written(es: [TyEntry], name: String) : Option[Binder] = match es {
+  [] -> None
+  [e, ...rest] -> match e.key {
+    KLocal(b) -> if written_text(b.name) == name { Some(b) } else { env_local_written(rest, name) }
+    _         -> None
+  }
+}
+
+
+# The callee of a UFCS call, instantiated, with the state past it.
+#[doc("Typer-internal type `UfcsTarget` shared across the infer modules.")]
+pub type UfcsTarget = { st: InferState, inst_ty: Ty, callee: Expr }
+
+
+# What `obj.ident(…)` reaches: a callee, several functions the receiver's
+# type and the scope cannot tell apart, or nothing.
+#[doc("Typer-internal type `UfcsFound` shared across the infer modules.")]
+pub type UfcsFound = UfOne(UfcsTarget) | UfTie(InferState, [SymId]) | UfNone
+
+
+#[doc("Typer-internal helper `ufcs_sym_target` shared across the infer modules.")]
+pub fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
+                   line: Int, col: Int) : UfcsTarget {
+  let st_inst = if fresh == [] and unit_fresh == [] { st }
+                else { st_push_inst(st, CS(s, line, col, fresh, unit_fresh, None)) }
+  UfcsTarget { st: st_inst, inst_ty: inst_ty, callee: mk_sym(s, line, col) }
+}
+
+
+# Q4 diagnostic — the receiver's type is statically known (or `TyAny`
+# from a cascade), no field of that type matches, and no scope
+# function `ident(receiver_ty, ...)` was found. Cascade-friendly: we
+# stamp `TyAny` and bump the error counter so downstream passes don't
+# crash on a missing call lowering.
+#[doc("Typer-internal helper `ufcs_method_not_found` shared across the infer modules.")]
+pub fn ufcs_method_not_found(st: InferState, ident: String, obj_expr: Expr,
+                          obj_ty: Ty, args_: [Expr],
+                          line: Int, col: Int) : Inferred / Console + File {
+
+
+  let head_msg = match inf_ty_head_name(st.env.tab, obj_ty) {
+    Some(name) -> concat_all(["method `", ident, "` not found for type `", name, "`"])
+    None       -> concat_all(["method `", ident, "` not found (receiver type unresolved)"])
+  }
+  let perr = mk_diag(SevError, st.file, line, col, head_msg, [])
+  render_diag(perr)
+  diag_help(concat_all(["if `", ident, "` is a free function, ensure its first parameter ",
+                        "type matches the receiver; otherwise check the spelling."]))
+  let bare_callee = with_ty(mk_expr(EField(obj_expr, ident), line, col), TyAny)
+  let root = with_ty(mk_expr(ECall(bare_callee, args_), line, col), TyAny)
+  mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root)
+}
+
+
+# `State`/`Reader` are readable cells: a `var` desugars to `with State as name`
+# and reads naked. Their dispatch keeps the legacy by-id path; a user effect's
+# named instance uses the §6 capability path. Mirrors desugar's `eff_is_cell`.
+#[doc("Typer-internal helper `eff_is_cell_effect` shared across the infer modules.")]
+pub fn eff_is_cell_effect(s: SymId) : Bool = effect_is(s, CeState) or effect_is(s, CeReader)
+
+
+#[doc("Typer-internal helper `synth_op_call_unknown_op` shared across the infer modules.")]
+pub fn synth_op_call_unknown_op(st: InferState, eff: SymId, op_name: String,
+                             line: Int, col: Int) : Inferred / Console + File {
+
+
+  let eff_name = decl_name(st.env.tab, eff)
+  let perr = mk_diag(SevError, st.file, line, col,
+    "unknown op `#{op_name}` on effect `#{eff_name}`", [])
+  render_diag(perr)
+  diag_note("`#{eff_name}.#{op_name}` is not declared in `effect #{eff_name} { ... }`")
+  diag_help("declare `#{op_name}(...)` inside the effect, or call an existing op")
+  let st1 = st_bump_err(st_push_diag(st, perr))
+  mk_inferred(st1, TyAny, with_ty(mk_sym(eff, line, col), TyAny))
+}
+
+
+# How a unify failure names the op being called.
+#[doc("Typer-internal helper `op_what` shared across the infer modules.")]
+pub fn op_what(st: InferState, lead: String, eff: SymId, op: String) : String =
+  "#{lead}#{decl_name(st.env.tab, eff)}.#{op}"
+
+
+# How many of an op's quantified variables are its effect's own: every
+# op of one effect records that same count.
+#[doc("Typer-internal helper `lookup_op_eff_arity` shared across the infer modules.")]
+pub fn lookup_op_eff_arity(table: [OpEffArity], eff: SymId) : Int = eff_tparam_arity(table, eff)
+
+
+# The tparam arity of an effect — how many type args its capability type carries.
+# A non-parametric effect (`Cell`) returns 0 so its capability type is the bare
+# nominal type a parameter annotates.
+#[doc("Typer-internal helper `eff_tparam_arity` shared across the infer modules.")]
+pub fn eff_tparam_arity(table: [OpEffArity], eff: SymId) : Int {
+  match table {
+    [] -> 0
+    [h, ...rest] -> match h {
+      OEA(e, _, n) -> if sym_same(e, eff) { n } else { eff_tparam_arity(rest, eff) }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `take_first_tys` shared across the infer modules.")]
+pub fn take_first_tys(xs: [Ty], n: Int) : [Ty] {
+  if n <= 0 { [] }
+  else { match xs {
+    [] -> []
+    [h, ...rest] -> [h, ...take_first_tys(rest, n - 1)]
+  } }
+}
+
+
+#[doc("Typer-internal helper `take_first` shared across the infer modules.")]
+pub fn take_first(xs: [Int], n: Int) : [Int] {
+  if n <= 0 { [] }
+  else { match xs {
+    [] -> []
+    [h, ...rest] -> [h, ...take_first(rest, n - 1)]
+  } }
+}
+
+
+# render a Real value as a C/LLVM floating-point
+# literal. `real_to_string(9.0)` gives `"9"` (no trailing `.0`
+# when the value is integer-valued); emitting that bare into C
+# makes the backend lex it as `int`, so a Real-typed `9.0 / 2.0`
+# silently degrades to integer division. Append `.0` only when the
+# rendered form has neither a decimal point NOR an exponent
+# (`1e+10` is already a valid floating literal — appending `.0`
+# would produce `1e+10.0`, which is a syntax error in both C and
+# LLVM IR).
+#[doc("infer: `real_c_lit` — typer entry point invoked by the driver.")]
+pub fn real_c_lit(s: String) : String {
+  if real_lit_is_float_typed(s, 0, string_length(s)) { s }
+  else { cat2(s, ".0") }
+}
+
+
+fn real_lit_is_float_typed(s: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else {
+    match char_at(s, i) {
+      Some(c) ->
+        if c == '.' or c == 'e' or c == 'E' { true }
+        else { real_lit_is_float_typed(s, i + 1, n) }
+      None -> false
+    }
+  }
+}
+
+
+# The callee of a settled perform: the effect, the operation, and the
+# instance it goes through. Emit turns it into the runtime op dispatch.
+#[doc("Typer-internal helper `op_callee` shared across the infer modules.")]
+pub fn op_callee(eff: SymId, op: String, via: OpVia, line: Int, col: Int) : Expr =
+  mk_expr(EOp(OpRef { eff: eff, op: written(op), via: via }), line, col)
+
+
+#[doc("Typer-internal helper `field_root` shared across the infer modules.")]
+pub fn field_root(obj_expr: Expr, fnm: String, line: Int, col: Int, ty: Ty) : Expr =
+  with_ty(mk_expr(EField(obj_expr, fnm), line, col), ty)
+
+
+# extract the id of a freshly-minted TyVarT. `st_fresh_ty`
+# always returns a `TyVarT(n)`, so the `_` arm is unreachable in
+# practice; it returns -1 (an id `apply_ty` can never bind) as a safe
+# sentinel that drains to the "annotation needed" path.
+#[doc("Typer-internal helper `ty_var_id` shared across the infer modules.")]
+pub fn ty_var_id(t: Ty) : Int = match t { TyVarT(n) -> n  _ -> -1 }
+
+
+# Whether a UFCS call could reach something under `ident`.
+#[doc("Typer-internal helper `ufcs_reaches` shared across the infer modules.")]
+pub fn ufcs_reaches(st: InferState, ident: String) : Bool = match st_visible_candidates(st, ident) {
+  [_, ..._] -> true
+  []        -> match env_local_written(st.env.entries, ident) {
+    Some(_) -> true
+    None    -> match ufcs_bare_sym(st.env, ident) {
+      Some(_) -> true
+      None    -> false
+    }
+  }
+}
+
+
+# `Map` and `HashMap` read through the `get` of the module that declares
+# the collection's type, which is the home its symbols were minted under.
+#[doc("Typer-internal helper `index_getter` shared across the infer modules.")]
+pub fn index_getter(t: Ty, line: Int, col: Int) : Expr = match ty_coll(t) {
+  Some(c) -> mk_expr(home_fn_ref(core_coll_home(c), "get"), line, col)
+  None    -> builtin_mk(CbArrayGet, line, col)
+}
+
+
+#[doc("Typer-internal helper `ty_coll` shared across the infer modules.")]
+pub fn ty_coll(t: Ty) : Option[CoreColl] = match t {
+  TyCon(s, _) -> core_coll_of(s)
+  _           -> None
+}
+
+
+# `xs[a..b]` is `vec_slice(xs, a, (b - a) + 1)`. The start is read twice,
+# so it is bound once: typed once and evaluated once. The collection is
+# bound ahead of it to keep the source's evaluation order.
+#[doc("Typer-internal helper `vec_slice_block` shared across the infer modules.")]
+pub fn vec_slice_block(coll: Expr, a: Expr, b: Expr, line: Int, col: Int) : ExprKind {
+  let lo = mk_local(local_minted("__slice_lo"), a.line, a.col)
+  let slen = mk_expr(EBinop(BoAdd, mk_expr(EBinop(BoSub, b, lo), line, col),
+                            mk_expr(mk_int_synth(1), line, col)),
+                     line, col)
+  let call = mk_expr(ECall(builtin_mk(CbVecSlice, line, col), [mk_local(local_minted("__slice_coll"), line, col), lo, slen]), line, col)
+  EBlock([SLet(mk_pat(PBind(binder_minted("__slice_coll")), line, col), None, coll),
+          SLet(mk_pat(PBind(binder_minted("__slice_lo")), a.line, a.col), None, a)], Some(call))
+}
+
+
+# The `__fixed_vec_get`/`_get_dyn` call node, typed at the element and
+# marked unboxed: the read yields a raw scalar out of the flat aggregate.
+#[doc("Typer-internal helper `fixed_vec_index_node` shared across the infer modules.")]
+pub fn fixed_vec_index_node(st: InferState, coll: Expr, ix: Expr, prim: Mark, elem: Ty,
+                        line: Int, col: Int) : Inferred {
+  let call = ECall(mk_expr(EMark(prim), line, col), [coll, ix])
+  let node = Expr { kind: call, line: line, col: col, ty: Some(elem), mode: MUnboxed , site: 0 }
+  mk_inferred(st, elem, node)
+}
+
+
+# Binop typing is deliberately coarse: numeric operators unify their
+# two operands and return the shared type (usually `Int`); comparison
+# operators unify operands and return `Bool`; logical `and`/`or` pin
+# both sides to `Bool`; `%` pins operands to `Int`. There is no
+# dedicated `//` operator — `Int / Int` already truncates via the
+# `Div[Int]` impl.
+#[doc("Typer-internal helper `binop_root` shared across the infer modules.")]
+pub fn binop_root(op: BinOp, l_expr: Expr, r_expr: Expr, line: Int, col: Int, ty: Ty) : Expr =
+  with_ty(mk_expr(EBinop(op, l_expr, r_expr), line, col), ty)
+
+
+# `%` result type: a same-width fixed integer on both sides keeps that
+# width (its own primitive `%`); anything else falls to `Int`.
+#[doc("Typer-internal helper `ty_is_var_head` shared across the infer modules.")]
+pub fn ty_is_var_head(t: Ty) : Bool = match t {
+  TyVarT(_) -> true
+  _         -> false
+}
+
+
+#[doc("Typer-internal helper `fixed_mod_result` shared across the infer modules.")]
+pub fn fixed_mod_result(lt: Ty, rt: Ty) : Ty = match lt {
+  TyByte   -> match rt { TyByte   -> TyByte   _ -> TyInt }
+  TyInt32  -> match rt { TyInt32  -> TyInt32  _ -> TyInt }
+  TyUInt32 -> match rt { TyUInt32 -> TyUInt32 _ -> TyInt }
+  TyUInt64 -> match rt { TyUInt64 -> TyUInt64 _ -> TyInt }
+  TyInt128 -> match rt { TyInt128 -> TyInt128 _ -> TyInt }
+  _        -> TyInt
+}
+
+
+#[doc("Typer-internal helper `ty_is_concrete_prim` shared across the infer modules.")]
+pub fn ty_is_concrete_prim(t: Ty) : Bool {
+  match t {
+    TyInt -> true
+    TyReal -> true
+    TyDimT(inner, _) -> ty_is_concrete_prim(inner)
+    TyRefineT(inner, _) -> ty_is_concrete_prim(inner)
+    _ -> false
+  }
+}
+

@@ -1,0 +1,936 @@
+#[doc("Typer support: infer_unit_tables.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.type_text
+import compiler.kinds
+import compiler.kind_theory
+import compiler.kind_semilattice
+import compiler.decl_names
+import compiler.infer_unit_alias
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+
+# Sorts symbols and groups powers, so `kg * m` and `m * kg` render identically.
+#[doc("infer: render a unit expression in canonical form.")]
+pub fn inf_unit_canon_display(u: UnitExprT) : String = unit_text(unit_canon(u))
+
+# extract the canonical unit symbol
+# of a dimensioned type for the `unit_name` compile-time intrinsic.
+# Bare types and unresolved unit-vars yield the empty string so the
+# emitter never produces an LLVM/C error from a missing dimension.
+
+
+#[doc("Typer-internal helper `inf_unit_eq` shared across the infer modules.")]
+pub fn inf_unit_eq(a: UnitExprT, b: UnitExprT) : Bool {
+  let ca = unit_canon(a)
+  let cb = unit_canon(b)
+  unit_text(ca) == unit_text(cb)
+}
+
+# `inf_ty_eq` is a structural equality on resolved types. Conservative:
+# `TyVarT` only matches itself by id; refinements / units erase at
+# the type level (units distinguished separately in MonoTuple's
+# `[UnitExprT]` field, refinements stay erased per Tier 1's
+# value-only refinement semantics).
+
+# Extract just the eff names from a row's labels — useful for the
+# many string-based passes in the resolver that don't need the type
+# args. Parametric effects are projected to their bare name (so
+# `Reader[Int]` and `Reader[String]` both yield `Reader`); callers
+# that need to distinguish instantiations work on the full label list.
+
+# ====================================================================
+# Shared typer/effect types (AliasCand, AliasResolution, HandleFrame,
+# Use, OpToEff, FieldDeclWithHome, ...). Both main and
+# infer use them, so they live here (pub) and main imports them
+# downward — no lateral arrow, no upward reference.
+# ====================================================================
+
+
+# Walkers `canon_uvars_*` / `canon_tvars_*` rewrite `Expr.ty` in
+# place by replacing `UVar(endpoint)` / `TyVarT(endpoint)` with the
+# bound id per the redirect map. Recurse via subst_expr-style
+# structural traversal. The map is small (≤ #bound-tparams) so
+# linear lookups are cheap.
+#[doc("Typer-internal helper `canon_uvars_expr` shared across the infer modules.")]
+pub fn canon_uvars_expr(e: Expr, m: [IntPair]) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(canon_uvars_ty(t, m))
+    None    -> None
+  }
+  Expr { kind: canon_uvars_kind(e.kind, m), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode,  site: e.site }
+}
+
+
+fn canon_uvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
+  inf_map_expr_kind(k, (sub) => canon_uvars_expr(sub, m))
+}
+
+
+#[doc("Typer-internal helper `canon_uvars_ty` shared across the infer modules.")]
+pub fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyChar   -> t
+    TyString -> t
+    TyUnit   -> t
+    TyByte     -> t
+    TyInt32    -> t
+    TyUInt32   -> t
+    TyUInt64   -> t
+    TyInt128   -> t
+    TyHandle   -> t
+    TyAny    -> t
+    TyVarT(_) -> t
+    TyListT(inner) -> TyListT(canon_uvars_ty(inner, m))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_uvars_ty(p, m)),
+                                  canon_uvars_ty(ret, m), canon_uvars_row(row, m))
+    TyCon(sid, tas) -> TyCon(sid, map(tas, (a) => canon_uvars_ty(a, m)))
+    # the shape var id is a tvar, not a unit var — leave it, recurse arg.
+    TyShapeApp(sv, arg) -> TyShapeApp(sv, canon_uvars_ty(arg, m))
+    TyDimT(base, u) -> TyDimT(canon_uvars_ty(base, m), canon_uvars_unit(u, m))
+    TyRefineT(base, p) -> TyRefineT(canon_uvars_ty(base, m), p)
+    # a union's components are unit-vars-free
+    # at the top level by construction (the resolver only
+    # composes nominal types) but their inner Tys may carry unit
+    # vars; recurse and re-normalise so the canonical form survives.
+    TyUnion(parts) -> normalize_union(map(parts, (a) => canon_uvars_ty(a, m)))
+  }
+}
+
+
+fn canon_uvars_row(r: Row, m: [IntPair]) : Row {
+  let new_labels = map(r.labels, (l) => canon_uvars_label(l, m))
+  Row { labels: new_labels, tail: r.tail, display_alias: r.display_alias }
+}
+
+
+fn canon_uvars_label(l: Label, m: [IntPair]) : Label =
+  Label { ...l, ty_args: map(l.ty_args, (a) => canon_uvars_ty(a, m)) }
+
+
+#[doc("Typer-internal helper `canon_tvars_expr` shared across the infer modules.")]
+pub fn canon_tvars_expr(e: Expr, m: [IntPair]) : Expr {
+  let ty1 = match e.ty {
+    Some(t) -> Some(canon_tvars_ty(t, m))
+    None    -> None
+  }
+  Expr { kind: canon_tvars_kind(e.kind, m), line: e.line, col: e.col,
+         ty: ty1, mode: e.mode,  site: e.site }
+}
+
+
+fn canon_tvars_kind(k: ExprKind, m: [IntPair]) : ExprKind {
+  inf_map_expr_kind(k, (sub) => canon_tvars_expr(sub, m))
+}
+
+
+#[doc("Typer-internal helper `canon_tvars_ty` shared across the infer modules.")]
+pub fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyChar   -> t
+    TyString -> t
+    TyUnit   -> t
+    TyByte     -> t
+    TyInt32    -> t
+    TyUInt32   -> t
+    TyUInt64   -> t
+    TyInt128   -> t
+    TyHandle   -> t
+    TyAny    -> t
+    TyVarT(n) -> match intpair_lookup(m, n) {
+      Some(b) -> TyVarT(b)
+      None    -> t
+    }
+    TyListT(inner) -> TyListT(canon_tvars_ty(inner, m))
+    TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_tvars_ty(p, m)),
+                                  canon_tvars_ty(ret, m), canon_tvars_row(row, m))
+    TyCon(sid, tas) -> TyCon(sid, map(tas, (a) => canon_tvars_ty(a, m)))
+    TyShapeApp(sv, arg) -> match intpair_lookup(m, sv) {
+      Some(b) -> TyShapeApp(b, canon_tvars_ty(arg, m))
+      None    -> TyShapeApp(sv, canon_tvars_ty(arg, m))
+    }
+    TyDimT(base, u) -> TyDimT(canon_tvars_ty(base, m), u)
+    TyRefineT(base, p) -> TyRefineT(canon_tvars_ty(base, m), p)
+    # see `canon_uvars_ty`. Renumbering tvars
+    # inside components can change their `inf_mangle_ty` strings, so
+    # we re-normalise to keep the canonical sort order.
+    TyUnion(parts) -> normalize_union(map(parts, (a) => canon_tvars_ty(a, m)))
+  }
+}
+
+
+fn canon_tvars_row(r: Row, m: [IntPair]) : Row {
+  let new_labels = map(r.labels, (l) => canon_tvars_label(l, m))
+  Row { labels: new_labels, tail: r.tail, display_alias: r.display_alias }
+}
+
+
+fn canon_tvars_label(l: Label, m: [IntPair]) : Label =
+  Label { ...l, ty_args: map(l.ty_args, (a) => canon_tvars_ty(a, m)) }
+
+
+#[doc("Typer-internal helper `subst_unit_extend` shared across the infer modules.")]
+pub fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst / Mutable {
+  let len = array_length(s.unit_slots)
+  let us1 = if v >= len {
+    let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
+    array_grow(s.unit_slots, grown, None)
+  } else { s.unit_slots }
+  let us2 = array_set(us1, v, Some(u))
+  Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
+          unit_slots: us2, unit_fresh: s.unit_fresh,
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
+}
+
+
+#[doc("Typer-internal type `FreshUnit` shared across the infer modules.")]
+pub type FreshUnit = { id: Int, subst: Subst }
+
+
+#[doc("Typer-internal helper `subst_fresh_unit` shared across the infer modules.")]
+pub fn subst_fresh_unit(s: Subst) : FreshUnit {
+  let id = s.unit_fresh
+  let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
+                   unit_slots: s.unit_slots, unit_fresh: id + 1,
+                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
+  FreshUnit { id: id, subst: s1 }
+}
+
+# ====================================================================
+# unit-of-measure operations
+# ====================================================================
+#
+# Three layers of operations on UnitExprT:
+#   1. unit_to_table / unit_from_table — convert between the AST tree
+#      shape and a canonical (sym, exponent) / (uvar, exponent) table.
+#   2. unit_canon — normal form: alphabetically-sorted symbols, grouped
+#      exponents, no factor-of-1 noise.
+#   3. unify_dim — abelian-group unification (Stuckey/Kennedy): solve
+#      `u1 = u2` by reducing `u1 * u2^-1 = 1` to a substitution.
+#
+# Aliases (`unit Newton = kg * m / sec^2`) are expanded by the *resolver*
+# before they reach unification; canonicalisation never sees them.
+
+
+# Sym and unit-var entries of the canonical table. Both use a sorted
+# (key, exponent) representation; zero exponents are dropped.
+#[doc("infer: one named unit atom and its exponent.")]
+pub type USymEntry = USE(String, Int)
+
+#[doc("infer: one unit variable and its exponent.")]
+pub type UVarEntry = UVE(Int, Int)
+
+
+#[doc("infer: a unit expression normalised to atom-exponent pairs.")]
+pub type UTable = { syms: [USymEntry], vars: [UVarEntry] }
+
+
+#[doc("Typer-internal helper `utable_empty` shared across the infer modules.")]
+pub fn utable_empty() : UTable = UTable { syms: [], vars: [] }
+
+
+# True iff the table represents the dimensionless unit "1".
+#[doc("Typer-internal helper `utable_is_one` shared across the infer modules.")]
+pub fn utable_is_one(t: UTable) : Bool {
+  match t.syms { [] -> match t.vars { [] -> true _ -> false } _ -> false }
+}
+
+
+# Insert a `(sym, exp)` contribution; merges with an existing entry by
+# adding exponents; drops entries that reach 0; keeps the list sorted
+# alphabetically.
+#[doc("Typer-internal helper `usym_insert` shared across the infer modules.")]
+pub fn usym_insert(xs: [USymEntry], k: String, n: Int) : [USymEntry] {
+  match xs {
+    [] -> if n == 0 { [] } else { [USE(k, n)] }
+    [h, ...rest] -> match h {
+      USE(hk, hn) ->
+        if hk == k {
+          let m = hn + n
+          if m == 0 { rest } else { [USE(hk, m), ...rest] }
+        } else if string_lt(k, hk) {
+          if n == 0 { [h, ...rest] } else { [USE(k, n), h, ...rest] }
+        } else {
+          [h, ...usym_insert(rest, k, n)]
+        }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `uvar_insert` shared across the infer modules.")]
+pub fn uvar_insert(xs: [UVarEntry], k: Int, n: Int) : [UVarEntry] {
+  match xs {
+    [] -> if n == 0 { [] } else { [UVE(k, n)] }
+    [h, ...rest] -> match h {
+      UVE(hk, hn) ->
+        if hk == k {
+          let m = hn + n
+          if m == 0 { rest } else { [UVE(hk, m), ...rest] }
+        } else if k < hk {
+          if n == 0 { [h, ...rest] } else { [UVE(k, n), h, ...rest] }
+        } else {
+          [h, ...uvar_insert(rest, k, n)]
+        }
+    }
+  }
+}
+
+
+# Walk a UnitExprT, accumulating contributions into the table. The
+# `mul` parameter scales every leaf's exponent; flips sign for UInv
+# and multiplies by n for UPow.
+fn unit_to_table_at(u: UnitExprT, scale: Int, t: UTable) : UTable {
+  match u {
+    UOne -> t
+    USym(s) -> UTable { syms: usym_insert(t.syms, s, scale), vars: t.vars }
+    UParam(p) -> UTable { syms: usym_insert(t.syms, unit_param_atom(p), scale), vars: t.vars }
+    UVar(v) -> UTable { syms: t.syms, vars: uvar_insert(t.vars, v, scale) }
+    UMul(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
+    UInv(a) -> unit_to_table_at(a, 0 - scale, t)
+    UPow(a, n) -> unit_to_table_at(a, scale * n, t)
+    # a join contributes each side at the same scale; the semilattice
+    # engine reads any positive multiplicity as membership.
+    UJoin(a, b) -> unit_to_table_at(b, scale, unit_to_table_at(a, scale, t))
+    # Positional lists are intercepted before any equality decision
+    # reaches a table (unify_dim, unit_canon, apply_unit). Merging the
+    # components here keeps the walk total for the two consumers that
+    # only read the table's sym/var SETS: the kind gate and the occurs
+    # check, for both of which the merged set is exactly right.
+    UDims(us) -> units_to_table_at(us, scale, t)
+  }
+}
+
+
+fn units_to_table_at(us: [UnitExprT], scale: Int, t: UTable) : UTable = match us {
+  [] -> t
+  [u, ...rest] -> units_to_table_at(rest, scale, unit_to_table_at(u, scale, t))
+}
+
+
+#[doc("infer: normalise a unit expression into its exponent table.")]
+pub fn unit_to_table(u: UnitExprT) : UTable = unit_to_table_at(u, 1, utable_empty())
+
+
+# Rebuild a UnitExprT from a canonical table. The table is already
+# sorted, so we walk left-to-right and chain UMul; positive exponents
+# render as USym/UVar (or UPow when |n|>1), negative as UInv-of-pow.
+#[doc("Typer-internal helper `utable_to_tree` shared across the infer modules.")]
+pub fn utable_to_tree(t: UTable) : UnitExprT {
+  let factors_syms = sym_entries_to_factors(t.syms)
+  let factors_vars = var_entries_to_factors(t.vars)
+  let all_factors = list_append(factors_syms, factors_vars)
+  match all_factors {
+    [] -> UOne
+    [h, ...rest] -> tree_chain(h, rest)
+  }
+}
+
+
+# helpers to convert table entries into UnitExprT factors.
+# Standalone (rather than inline lambdas) because stage 1's lambda
+# free-var analysis would over-capture the pattern binders here.
+fn sym_entries_to_factors(xs: [USymEntry]) : [UnitExprT] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      USE(k, n) -> [sym_factor(k, n), ...sym_entries_to_factors(rest)]
+    }
+  }
+}
+
+
+fn var_entries_to_factors(xs: [UVarEntry]) : [UnitExprT] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      UVE(k, n) -> [var_factor(k, n), ...var_entries_to_factors(rest)]
+    }
+  }
+}
+
+
+fn sym_factor(k: String, n: Int) : UnitExprT {
+  if n == 1 { USym(k) }
+  else if n == 0 - 1 { UInv(USym(k)) }
+  else if n > 0 { UPow(USym(k), n) }
+  else { UInv(UPow(USym(k), 0 - n)) }
+}
+
+
+fn var_factor(k: Int, n: Int) : UnitExprT {
+  if n == 1 { UVar(k) }
+  else if n == 0 - 1 { UInv(UVar(k)) }
+  else if n > 0 { UPow(UVar(k), n) }
+  else { UInv(UPow(UVar(k), 0 - n)) }
+}
+
+
+fn tree_chain(acc: UnitExprT, rest: [UnitExprT]) : UnitExprT {
+  match rest {
+    [] -> acc
+    [h, ...tl] -> tree_chain(UMul(acc, h), tl)
+  }
+}
+
+
+# Public canonicaliser. Aliases are *not* expanded here; that's the
+# resolver's job (resolve_ty_with_units below). A positional list
+# canonicalises point to point — its components never merge into one
+# abelian table.
+#[doc("infer: `unit_canon` — typer entry point invoked by the driver.")]
+pub fn unit_canon(u: UnitExprT) : UnitExprT = match u {
+  UDims(us) -> UDims(units_canon(us))
+  _ -> utable_to_tree(unit_to_table(u))
+}
+
+
+fn units_canon(us: [UnitExprT]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [unit_canon(u), ...units_canon(rest)]
+}
+
+
+#[doc("Typer-internal helper `unit_is_one` shared across the infer modules.")]
+pub fn unit_is_one(u: UnitExprT) : Bool = match u {
+  UDims(_) -> false
+  _ -> utable_is_one(unit_to_table(u))
+}
+
+
+# Subtract `b` from `a` (i.e. compute `a / b` as exponent vector). The
+# result is `a * b^-1` in canonical form.
+#[doc("Typer-internal helper `utable_diff` shared across the infer modules.")]
+pub fn utable_diff(a: UTable, b: UTable) : UTable {
+  let s1 = utable_diff_syms(a.syms, b.syms)
+  let v1 = utable_diff_vars(a.vars, b.vars)
+  UTable { syms: s1, vars: v1 }
+}
+
+
+fn utable_diff_syms(a: [USymEntry], b: [USymEntry]) : [USymEntry] {
+  match b {
+    [] -> a
+    [h, ...rest] -> match h {
+      USE(k, n) -> utable_diff_syms(usym_insert(a, k, 0 - n), rest)
+    }
+  }
+}
+
+
+fn utable_diff_vars(a: [UVarEntry], b: [UVarEntry]) : [UVarEntry] {
+  match b {
+    [] -> a
+    [h, ...rest] -> match h {
+      UVE(k, n) -> utable_diff_vars(uvar_insert(a, k, 0 - n), rest)
+    }
+  }
+}
+
+
+# Pick the unit-var with the smallest |exponent| in the table; returns
+# (index_in_vars, var_id, exponent). None if `vars` is empty.
+#[doc("Typer-internal type `UPickVar` shared across the infer modules.")]
+pub type UPickVar = { id: Int, exp: Int }
+
+
+#[doc("Typer-internal helper `utable_pick_min_var` shared across the infer modules.")]
+pub fn utable_pick_min_var(t: UTable) : Option[UPickVar] {
+  match t.vars {
+    [] -> None
+    [h, ...rest] -> match h {
+      UVE(id, e) -> Some(utable_pick_min_var_pick(rest, UPickVar { id: id, exp: e }))
+    }
+  }
+}
+
+
+fn utable_pick_min_var_pick(rest: [UVarEntry], best: UPickVar) : UPickVar {
+  match rest {
+    [] -> best
+    [h, ...tl] -> match h {
+      UVE(id, e) -> {
+        let abs_e = abs_int(e)
+        let abs_b = abs_int(best.exp)
+        if abs_e < abs_b { utable_pick_min_var_pick(tl, UPickVar { id: id, exp: e }) }
+        else { utable_pick_min_var_pick(tl, best) }
+      }
+    }
+  }
+}
+
+
+# Remove a single (var, exp) entry by its id from the table, returning
+# the table without that var.
+#[doc("Typer-internal helper `utable_drop_var` shared across the infer modules.")]
+pub fn utable_drop_var(t: UTable, target: Int) : UTable {
+  UTable { syms: t.syms, vars: utable_drop_var_loop(t.vars, target) }
+}
+
+
+fn utable_drop_var_loop(xs: [UVarEntry], target: Int) : [UVarEntry] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      UVE(k, _) -> if k == target { rest } else { [h, ...utable_drop_var_loop(rest, target)] }
+    }
+  }
+}
+
+
+# True iff every entry's exponent is a multiple of `k`. Used by the
+# unit unifier to decide whether the chosen pivot var divides cleanly.
+#[doc("Typer-internal helper `utable_all_divisible` shared across the infer modules.")]
+pub fn utable_all_divisible(t: UTable, k: Int) : Bool =
+  syms_divisible(t.syms, k) and vars_divisible(t.vars, k)
+
+
+fn syms_divisible(xs: [USymEntry], k: Int) : Bool {
+  match xs {
+    [] -> true
+    [h, ...rest] -> match h {
+      USE(_, n) -> if (n - (n / k) * k) == 0 { syms_divisible(rest, k) } else { false }
+    }
+  }
+}
+
+
+fn vars_divisible(xs: [UVarEntry], k: Int) : Bool {
+  match xs {
+    [] -> true
+    [h, ...rest] -> match h {
+      UVE(_, n) -> if (n - (n / k) * k) == 0 { vars_divisible(rest, k) } else { false }
+    }
+  }
+}
+
+
+# Negate every exponent and divide by k (caller guarantees k | every
+# entry). Used to construct the substitution `var := -(rest)/k`.
+#[doc("Typer-internal helper `utable_negdiv` shared across the infer modules.")]
+pub fn utable_negdiv(t: UTable, k: Int) : UTable {
+  UTable {
+    syms: usym_negdiv(t.syms, k),
+    vars: uvar_negdiv(t.vars, k)
+  }
+}
+
+
+fn usym_negdiv(xs: [USymEntry], k: Int) : [USymEntry] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      USE(s, n) -> [USE(s, (0 - n) / k), ...usym_negdiv(rest, k)]
+    }
+  }
+}
+
+
+fn uvar_negdiv(xs: [UVarEntry], k: Int) : [UVarEntry] {
+  match xs {
+    [] -> []
+    [h, ...rest] -> match h {
+      UVE(v, n) -> [UVE(v, (0 - n) / k), ...uvar_negdiv(rest, k)]
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `occurs_unit_in_vars` shared across the infer modules.")]
+pub fn occurs_unit_in_vars(v: Int, xs: [UVarEntry]) : Bool {
+  match xs {
+    [] -> false
+    [h, ...rest] -> match h {
+      UVE(k, _) -> if k == v { true } else { occurs_unit_in_vars(v, rest) }
+    }
+  }
+}
+
+
+# A table rides the nominal slot verdict when any habitant's kind — or
+# any variable's kind constraint — is declared over a first-order theory
+# (Module, Composition, or the HM core behind `Dim`).
+#[doc("Typer-internal helper `utable_first_order` shared across the infer modules.")]
+pub fn utable_first_order(t: UTable, s: Subst) : Bool =
+  usyms_any_first_order(t.syms, s.kind_theories) or uvars_any_first_order(t.vars, s)
+
+
+fn usyms_any_first_order(xs: [USymEntry], kts: [KindTheory]) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    USE(k, _) ->
+      kind_is_first_order(kts, kind_sym_kind(k)) or usyms_any_first_order(rest, kts)
+  }
+}
+
+
+fn uvars_any_first_order(xs: [UVarEntry], s: Subst) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
+      Some(k) -> kind_is_first_order(s.kind_theories, k) or uvars_any_first_order(rest, s)
+      None -> uvars_any_first_order(rest, s)
+    }
+  }
+}
+
+
+# A table rides the Semilattice engine when any habitant's kind — or
+# any variable's kind constraint — is declared over the Semilattice
+# theory.
+#[doc("Typer-internal helper `utable_semilattice_theory` shared across the infer modules.")]
+pub fn utable_semilattice_theory(t: UTable, s: Subst) : Bool =
+  usyms_any_semilattice(t.syms, s.kind_theories) or uvars_any_semilattice(t.vars, s)
+
+
+fn usyms_any_semilattice(xs: [USymEntry], kts: [KindTheory]) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    USE(k, _) ->
+      kind_is_semilattice(kts, kind_sym_kind(k)) or usyms_any_semilattice(rest, kts)
+  }
+}
+
+
+fn uvars_any_semilattice(xs: [UVarEntry], s: Subst) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h {
+    UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
+      Some(k) -> kind_is_semilattice(s.kind_theories, k) or uvars_any_semilattice(rest, s)
+      None -> uvars_any_semilattice(rest, s)
+    }
+  }
+}
+
+
+# The Semilattice engine: classify each side (ground habitant set,
+# lone variable) and unify by subsumption — the required (expected)
+# side must be a subset of the provided side. A variable bind still
+# passes the kind gate, so a habitant of another kind cannot bind a
+# Semilattice tparam.
+#[doc("Typer-internal helper `unify_semilattice` shared across the infer modules.")]
+pub fn unify_semilattice(t1: UTable, t2: UTable, s: Subst) : Option[Subst] / Mutable {
+  let v1 = sl_side(utable_symexps(t1), utable_varexps(t1))
+  let v2 = sl_side(utable_symexps(t2), utable_varexps(t2))
+  match sl_unify_verdict(v1, v2) {
+    SlOk -> Some(s)
+    SlFail -> None
+    SlBind(v, bound) -> match unit_kind_gate(s, v, bound) {
+      None -> None
+      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
+    }
+  }
+}
+
+
+# The nominal slot engine shared by Module and Composition: classify
+# each side (dimensionless, lone atom, lone variable) and unify by atom
+# identity. A variable bind still passes the kind gate, so a habitant of
+# another kind cannot bind the tparam — and Composition's order/measure
+# invariants ride the composed type's formation, not this slot verdict.
+#[doc("Typer-internal helper `unify_nominal` shared across the infer modules.")]
+pub fn unify_nominal(t1: UTable, t2: UTable, s: Subst) : Option[Subst] / Mutable {
+  let v1 = nominal_side(utable_symexps(t1), utable_varexps(t1))
+  let v2 = nominal_side(utable_symexps(t2), utable_varexps(t2))
+  match nominal_unify_verdict(v1, v2) {
+    MEq -> Some(s)
+    MFail -> None
+    MBind(v, bound) -> match unit_kind_gate(s, v, bound) {
+      None -> None
+      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `utable_symexps` shared across the infer modules.")]
+pub fn utable_symexps(t: UTable) : [SymExp] = use_to_symexps(t.syms)
+
+
+fn use_to_symexps(xs: [USymEntry]) : [SymExp] = match xs {
+  [] -> []
+  [h, ...rest] -> match h { USE(k, n) -> [SEx(k, n), ...use_to_symexps(rest)] }
+}
+
+
+fn utable_varexps(t: UTable) : [VarExp] = uve_to_varexps(t.vars)
+
+
+fn uve_to_varexps(xs: [UVarEntry]) : [VarExp] = match xs {
+  [] -> []
+  [h, ...rest] -> match h { UVE(v, n) -> [VEx(v, n), ...uve_to_varexps(rest)] }
+}
+
+
+# The kind a habitant symbol inhabits: its qualifier when present,
+# Measure for a bare symbol (default-kind habitants stay bare by
+# construction — see kind_qualify_nondefault).
+fn unit_sym_kind_name(sym: String) : String =
+  if kind_sym_is_qualified(sym) { kind_sym_kind(sym) } else { measure_kind_name() }
+
+
+# Kind gate on a pivot bind `?v := bound`: when `v` is constrained to
+# kind K, every habitant symbol in `bound` must inhabit K, and every
+# unit var in `bound` inherits the constraint. A cross-kind habitant
+# or a conflicting var constraint refuses the bind (None), surfacing
+# as the ordinary unification mismatch at the source position.
+#[doc("Typer-internal helper `unit_kind_gate` shared across the infer modules.")]
+pub fn unit_kind_gate(s: Subst, v: Int, bound: UnitExprT) : Option[Subst] {
+  match subst_unit_kind_lookup(s, v) {
+    None -> Some(s)
+    Some(k) -> {
+      let t = unit_to_table(bound)
+      if uk_syms_ok(t.syms, k) { uk_constrain_vars(t.vars, k, s) } else { None }
+    }
+  }
+}
+
+
+fn uk_syms_ok(xs: [USymEntry], k: String) : Bool = match xs {
+  [] -> true
+  [h, ...rest] -> match h {
+    USE(sym, _) -> if unit_sym_kind_name(sym) == k { uk_syms_ok(rest, k) } else { false }
+  }
+}
+
+
+fn uk_constrain_vars(xs: [UVarEntry], k: String, s: Subst) : Option[Subst] = match xs {
+  [] -> Some(s)
+  [h, ...rest] -> match h {
+    UVE(v, _) -> match subst_unit_kind_lookup(s, v) {
+      None -> uk_constrain_vars(rest, k, subst_add_unit_kind(s, v, k))
+      Some(k2) -> if k2 == k { uk_constrain_vars(rest, k, s) } else { None }
+    }
+  }
+}
+
+
+# Formation check on a canonical table, dispatched by each habitant
+# kind's theory (atom_form_violation in kind_theory).
+#[doc("infer: first atom in a unit table that breaks the expected shape, if any.")]
+pub fn utable_atom_violation(t: UTable, kts: [KindTheory]) : Option[String] =
+  atom_form_violation(utable_symexps(t), list_length(t.vars), kts)
+
+
+#[doc("Typer-internal helper `opt_ty_or` shared across the infer modules.")]
+pub fn opt_ty_or(o: Option[Ty], d: Ty) : Ty = match o { None -> d  Some(t) -> t }
+
+
+#[doc("Typer-internal helper `opt_row_or` shared across the infer modules.")]
+pub fn opt_row_or(o: Option[Row], d: Row) : Row = match o { None -> d  Some(r) -> r }
+
+
+
+#[doc("Typer-internal helper `unit_is_dims` shared across the infer modules.")]
+pub fn unit_is_dims(u: UnitExprT) : Bool = match u { UDims(_) -> true  _ -> false }
+
+
+# canonicalise a list of union components.
+# Applies the three algebraic laws of `|` (D6 in `docs/unions-design.md`):
+#
+#   - associative: nested `TyUnion` flattens (`(A | B) | C` → `A | B | C`).
+#   - idempotent:  duplicates collapse (`A | A` → `A`).
+#   - commutative: the result is sorted by `union_order_key` so component
+#                  order does not affect type identity (`A | B ≡ B | A`).
+#
+# The key is a pure function of the resolved Ty that erases units and
+# refinements, so two types that differ only there sort adjacently;
+# unification still distinguishes them — normalisation is purely about
+# canonical ordering for equality, not about merging distinct types.
+#
+# Returns the bare component when the normalised list collapses to a
+# singleton (`TyUnion([T])` ≡ `T`). The `TyUnion([])` case is
+# unreachable (no constructor produces it) and rejected by the
+# resolver; if it nevertheless arises here we return `TyAny` as a
+# safe placeholder rather than crash, matching the "I don't know yet"
+# semantics elsewhere in this file.
+#[doc("infer: `normalize_union` — typer entry point invoked by the driver.")]
+pub fn normalize_union(components: [Ty]) : Ty {
+  let flat = union_flatten(components)
+  let sorted = union_sort_by_mangle(flat)
+  let deduped = union_dedup_sorted(sorted)
+  match deduped {
+    [] -> TyAny
+    [only] -> only
+    _ -> TyUnion(deduped)
+  }
+}
+
+
+# Flatten any `TyUnion` directly inside the input — single level is
+# enough because the invariant is that every constructed `TyUnion`
+# was itself built via `normalize_union`, so its components are never
+# unions. We still recurse to absorb a `TyUnion` from a caller that
+# bypassed the helper.
+fn union_flatten(ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> match h {
+      TyUnion(inner) -> append_ty_lists(union_flatten(inner), union_flatten(rest))
+      _ -> [h, ...union_flatten(rest)]
+    }
+  }
+}
+
+
+fn append_ty_lists(a: [Ty], b: [Ty]) : [Ty] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_ty_lists(rest, b)]
+  }
+}
+
+
+# Insertion sort keyed by `union_order_key`. The expected union arity is
+# small (a handful of bounded-context errors in the DDD use case)
+# so insertion sort beats merge sort here in both code size and
+# constant factor.
+fn union_sort_by_mangle(ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> union_sort_insert(h, union_sort_by_mangle(rest))
+  }
+}
+
+
+fn union_sort_insert(t: Ty, sorted: [Ty]) : [Ty] {
+  match sorted {
+    [] -> [t]
+    [h, ...rest] -> {
+      if string_lt(union_order_key(t), union_order_key(h)) { [t, h, ...rest] }
+      else { [h, ...union_sort_insert(t, rest)] }
+    }
+  }
+}
+
+
+# The canonical position of a union component: a nominal type by its
+# identity, so the order needs no symbol table and no spelling.
+fn union_order_key(t: Ty) : String = match t {
+  TyInt    -> "Int"
+  TyReal   -> "Real"
+  TyBool   -> "Bool"
+  TyString -> "String"
+  TyChar   -> "Char"
+  TyUnit   -> "Unit"
+  TyByte   -> "Byte"
+  TyInt32  -> "Int32"
+  TyUInt32 -> "UInt32"
+  TyUInt64 -> "UInt64"
+  TyInt128 -> "Int128"
+  TyHandle -> "Handle"
+  TyListT(inner) -> concat_all(["L_", union_order_key(inner), "_E"])
+  TyFnT(ps, ret, _) -> concat_all(["F_", inf_join_with(map(ps, union_order_key), "_"), "_R_", union_order_key(ret), "_E"])
+  TyCon(s, tas) -> match tas {
+    [] -> string_concat("c", int_to_string(sym_raw(s)))
+    _  -> concat_all(["c", int_to_string(sym_raw(s)), "_O_", inf_join_with(map(tas, union_order_key), "_"), "_C"])
+  }
+  TyVarT(_) -> "TVAR"
+  TyShapeApp(_, arg) -> string_concat("SVAR_", union_order_key(arg))
+  TyAny -> "Any"
+  TyDimT(base, _) -> union_order_key(base)
+  TyRefineT(base, _) -> union_order_key(base)
+  TyUnion(parts) -> concat_all(["U_", inf_join_with(map(parts, union_order_key), "_"), "_E"])
+}
+
+
+# Dedup adjacent equal entries. Input must already be sorted by
+# `union_order_key` so `inf_ty_eq` only fires on neighbours. `inf_ty_eq` is the
+# semantic equality from later in this file; forward references work
+# because top-level fn definitions are not order-dependent.
+fn union_dedup_sorted(ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [h, ...rest] -> match rest {
+      [] -> [h]
+      [n, ..._trail] -> {
+        if inf_ty_eq(h, n) { union_dedup_sorted(rest) }
+        else { [h, ...union_dedup_sorted(rest)] }
+      }
+    }
+  }
+}
+
+# ---- row substitution + unification --------------------------------
+#
+# Rémy-style row unification.
+#
+# Canonicality (sorted/dedup labels) is the caller's responsibility;
+# it is not enforced here.
+
+
+# row-level cell identity for parametric effects.
+#
+# Two `var` cells (`var i`, `var go`) each desugar to `with State[T](init)
+# as <name>`; semantically they are two independent State handlers, but
+# their row labels are both `State[?T]`. When the two cells reach a
+# row-unification partition with their `T`s still unresolved (the
+# `while`-in-lambda shape), the partition would fuse them and cross-bind
+# their `T`s (`Int := Bool`). So a label carries the cell it belongs to,
+# the alias binder of its handler, and two cells are two labels.
+# The cell is confined to the typer: every cell label is discharged by
+# its own `with State as <name>` handler, so none escapes to a function
+# signature, `main`'s row, or the emitters.
+#
+# Unlike the codegen dispatch tag, the cell is stamped whenever the alias
+# resolves, independent of taggability: the dispatch tag is disabled
+# across a lambda boundary, but row identity must hold inside lambdas
+# too — that is exactly where the `while` thunks live.
+#[doc("Typer-internal helper `label_in_cell` shared across the infer modules.")]
+pub fn label_in_cell(esym: SymId, ty_args: [Ty], cell: LocalId) : Label =
+  Label { sym: esym, ty_args: ty_args, cell: cell }
+
+
+#[doc("Typer-internal helper `label_cell` shared across the infer modules.")]
+pub fn label_cell(l: Label) : LocalId = l.cell
+
+
+# The cell an alias names; a label reached through no alias is in none.
+#[doc("Typer-internal helper `alias_cell` shared across the infer modules.")]
+pub fn alias_cell(alias_opt: Option[LocalId]) : LocalId = match alias_opt {
+  None    -> local_none()
+  Some(a) -> a
+}
+
+
+#[doc("Typer-internal helper `label_concat` shared across the infer modules.")]
+pub fn label_concat(a: [Label], b: [Label]) : [Label] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...label_concat(rest, b)]
+  }
+}
+
+
+#[doc("Typer-internal helper `opt_labels_or` shared across the infer modules.")]
+pub fn opt_labels_or(o: Option[[Label]], d: [Label]) : [Label] = match o { None -> d  Some(ls) -> ls }
+
+
+#[doc("Typer-internal type `LabelPair` shared across the infer modules.")]
+pub type LabelPair = LPair(Label, Label)
+
+
+#[doc("Typer-internal type `LabelPartition` shared across the infer modules.")]
+pub type LabelPartition = {
+  both_pairs: [LabelPair],
+  only_left:  [Label],
+  only_right: [Label]
+}
+
+
+# A label-removal result: the matched `Label` plus the candidate list
+# with that label removed (relative order of the rest preserved).
+#[doc("Typer-internal type `FindRemove` shared across the infer modules.")]
+pub type FindRemove = { found: Label, remain: [Label] }
+

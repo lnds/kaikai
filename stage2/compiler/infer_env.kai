@@ -1,0 +1,937 @@
+#[doc("Typer support: infer_env.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_text
+import compiler.core_syms
+import compiler.effect_default
+import compiler.diag_file
+import compiler.resolve_names
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.native_prims
+import compiler.builtin_types
+import compiler.infer_index
+import compiler.variant_index
+import compiler.infer_unit_alias
+import compiler.tycon_scheme_home
+import compiler.field_privacy
+import compiler.tbinder
+import compiler.infer_glue
+
+fn inf_head_owner_of(owners: [HeadOwnerEntry], s: SymId) : Option[SymId] =
+  match owners {
+    [] -> None
+    [HOE(n, mods), ...rest] ->
+      if sym_same(n, s) { head(mods) }
+      else { inf_head_owner_of(rest, s) }
+  }
+
+
+#[doc("A nominal head as the reader writes it: `mod.T` when a module other than the root owns it and another declares the name too, the name itself otherwise.")]
+pub fn inf_tycon_display_ow(tab: SymTab, owners: [HeadOwnerEntry], s: SymId) : String = {
+  let n = written_text(decl_name(tab, s))
+  match inf_head_owner_of(owners, s) {
+    Some(own) -> if st_valid(tab, own) and st_valid(tab, s) and sym_contested(tab, s) { "#{sym_name(tab, own)}.#{n}" } else { n }
+    None      -> n
+  }
+}
+
+
+# What the coverage walk reads besides the program: the table that
+# names an effect, and each effect's bridged default ops.
+#[doc("Typer-internal type `CovCx` shared across the infer modules.")]
+pub type CovCx = { tab: SymTab, effs: [EffDefaultOps] }
+
+
+
+#[doc("Typer-internal helper `check_field_privacy` shared across the infer modules.")]
+pub fn check_field_privacy(df: DiagFiles, tab: SymTab, home: TyHomeView,
+                        mod_decls: [Decl], recs: FieldRecs)
+                        : [Diagnostic] / Console + File {
+  list_reverse(check_field_privacy_loop(df, PrivCx { tab: tab, home: home }, recs, mod_decls, []))
+}
+
+
+fn check_field_privacy_loop(df: DiagFiles, cx: PrivCx,
+                              all_decls: FieldRecs, ds: [Decl],
+                              acc: [Diagnostic]) : [Diagnostic] / Console + File {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, body, _, _, _) -> {
+        let acc1 = walk_field_priv_expr(decl_diag_file(d, df), cx, all_decls, body, acc)
+        check_field_privacy_loop(df, cx, all_decls, rest, acc1)
+      }
+      _ -> check_field_privacy_loop(df, cx, all_decls, rest, acc)
+    }
+  }
+}
+
+
+fn walk_field_priv_expr(file: String, cx: PrivCx,
+                          all_decls: FieldRecs, e: Expr,
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
+  let head_errs = match e.kind {
+    EField(obj, fname) -> match record_carrier_of(obj.ty) {
+      None         -> []
+      Some(rsym) -> match lookup_record_field(all_decls, rsym, fname) {
+        None -> []
+        Some(FDH(fd, decl_mo, dsym)) -> {
+          let rec_name = written_text(decl_name(cx.tab, rsym))
+          if field_hidden(cx.home, rec_name, dsym, fd) {
+            let d = priv_read_diag(file, e.line, e.col, fname, rec_name, decl_mo)
+            render_diag(d)
+            [d]
+          } else { [] }
+        }
+      }
+    }
+    ERecordLit(_, fis) -> match record_carrier_of(e.ty) {
+      None         -> []
+      Some(rsym) ->
+        walk_priv_field_inits(file, cx, all_decls, rsym,
+                                fis, e.line, e.col, [])
+    }
+    _ -> []
+  }
+  walk_field_priv_children(file, cx, all_decls, e.kind, list_append(head_errs, acc))
+}
+
+
+
+fn walk_field_priv_children(file: String, cx: PrivCx,
+                              all_decls: FieldRecs, k: ExprKind,
+                              acc: [Diagnostic]) : [Diagnostic] / Console + File = match k {
+  EInt(_, _)           -> acc
+  EReal(_, _)          -> acc
+  EIntLit(_)           -> acc
+  EDecimalLit(_)       -> acc
+  EFixed(_, _)         -> acc
+  EBool(_)          -> acc
+  EChar(_)          -> acc
+  EStr(_, _)        -> acc
+  EUnit             -> acc
+  EName(_)           -> acc
+  EMark(_)           -> acc
+  ESym(_, _)        -> acc
+  ELocal(_)         -> acc
+  EOp(_)            -> acc
+  EUnder            -> acc
+  EPlaceholder      -> acc
+  EHole(_)          -> acc
+  ETodo(_)          -> acc
+  EExternBody(_, _) -> acc
+  EVariantsOf(_, _) -> acc
+  EModCall(_, _)    -> acc
+  EIntrinsic(_, args_) -> walk_field_priv_list(file, cx, all_decls, args_, acc)
+  ESurface(sf) -> walk_field_priv_list(file, cx, all_decls, surface_children(sf), acc)
+  ECall(callee, args_) -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, callee, acc)
+    walk_field_priv_list(file, cx, all_decls, args_, a1)
+  }
+  EField(base, _)   -> walk_field_priv_expr(file, cx, all_decls, base, acc)
+  EIndex(a, b)      -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+    walk_field_priv_expr(file, cx, all_decls, b, a1)
+  }
+  EBinop(_, a, b)   -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+    walk_field_priv_expr(file, cx, all_decls, b, a1)
+  }
+  EUnop(_, x)       -> walk_field_priv_expr(file, cx, all_decls, x, acc)
+  EIf(c, t, eo)     -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, c, acc)
+    let a2 = walk_field_priv_expr(file, cx, all_decls, t, a1)
+    match eo {
+      Some(b) -> walk_field_priv_expr(file, cx, all_decls, b, a2)
+      None    -> a2
+    }
+  }
+  EMatch(scr, arms) -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, scr, acc)
+    walk_field_priv_arms(file, cx, all_decls, arms, a1)
+  }
+  ELambda(_, _) -> acc
+  ERecordLit(_, fs) -> walk_field_priv_field_inits(file, cx, all_decls, fs, acc)
+  EList(els) -> walk_field_priv_elems(file, cx, all_decls, els, acc)
+  ERange(a, b, opt) -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+    let a2 = walk_field_priv_expr(file, cx, all_decls, b, a1)
+    match opt {
+      Some(s) -> walk_field_priv_expr(file, cx, all_decls, s, a2)
+      None    -> a2
+    }
+  }
+  EBlock(stmts, tail) -> {
+    let a1 = walk_field_priv_stmts(file, cx, all_decls, stmts, acc)
+    match tail {
+      Some(t) -> walk_field_priv_expr(file, cx, all_decls, t, a1)
+      None    -> a1
+    }
+  }
+  EPipe(a, b)        -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+    walk_field_priv_expr(file, cx, all_decls, b, a1)
+  }
+  EDispatchPipe(_, a, b) -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+    walk_field_priv_expr(file, cx, all_decls, b, a1)
+  }
+  EBang(inner)       -> walk_field_priv_expr(file, cx, all_decls, inner, acc)
+  ELitUnit(inner, _) -> walk_field_priv_expr(file, cx, all_decls, inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a0 = match init_opt {
+      Some(i) -> walk_field_priv_expr(file, cx, all_decls, i, acc)
+      None    -> acc
+    }
+    let a1 = walk_field_priv_clauses(file, cx, all_decls, clauses, a0)
+    let a2 = match ret_opt {
+      Some(r) -> match r { HR(_, b, _, _) -> walk_field_priv_expr(file, cx, all_decls, b, a1) }
+      None    -> a1
+    }
+    walk_field_priv_expr(file, cx, all_decls, body, a2)
+  }
+}
+
+
+
+fn walk_field_priv_list(file: String, cx: PrivCx,
+                          all_decls: FieldRecs, es: [Expr],
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match es {
+  [] -> acc
+  [h, ...rest] -> {
+    let a1 = walk_field_priv_expr(file, cx, all_decls, h, acc)
+    walk_field_priv_list(file, cx, all_decls, rest, a1)
+  }
+}
+
+
+
+fn walk_field_priv_arms(file: String, cx: PrivCx,
+                         all_decls: FieldRecs, arms: [Arm],
+                         acc: [Diagnostic]) : [Diagnostic] / Console + File = match arms {
+  [] -> acc
+  [a, ...rest] -> match a {
+    Arm(_, og, body) -> {
+      let a1 = match og {
+        Some(g) -> walk_field_priv_expr(file, cx, all_decls, g, acc)
+        None    -> acc
+      }
+      let a2 = walk_field_priv_expr(file, cx, all_decls, body, a1)
+      walk_field_priv_arms(file, cx, all_decls, rest, a2)
+    }
+  }
+}
+
+
+
+fn walk_field_priv_field_inits(file: String, cx: PrivCx,
+                                 all_decls: FieldRecs, fis: [FieldInit],
+                                 acc: [Diagnostic]) : [Diagnostic] / Console + File = match fis {
+  [] -> acc
+  [fi, ...rest] -> match fi {
+    FI(_, e) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      walk_field_priv_field_inits(file, cx, all_decls, rest, a1)
+    }
+  }
+}
+
+
+
+fn walk_field_priv_elems(file: String, cx: PrivCx,
+                          all_decls: FieldRecs, els: [ListElem],
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match els {
+  [] -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      walk_field_priv_elems(file, cx, all_decls, rest, a1)
+    }
+    ElSpread(e) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      walk_field_priv_elems(file, cx, all_decls, rest, a1)
+    }
+  }
+}
+
+
+
+fn walk_field_priv_stmts(file: String, cx: PrivCx,
+                          all_decls: FieldRecs, ss: [Stmt],
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match ss {
+  [] -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      walk_field_priv_stmts(file, cx, all_decls, rest, a1)
+    }
+    SVar(_, _, e, _, _) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      walk_field_priv_stmts(file, cx, all_decls, rest, a1)
+    }
+    SAssert(e, og) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      let a2 = match og {
+        Some(g) -> walk_field_priv_expr(file, cx, all_decls, g, a1)
+        None    -> a1
+      }
+      walk_field_priv_stmts(file, cx, all_decls, rest, a2)
+    }
+    SExprStmt(e) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
+      walk_field_priv_stmts(file, cx, all_decls, rest, a1)
+    }
+    SIndexAssign(a, b, c, _, _) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+      let a2 = walk_field_priv_expr(file, cx, all_decls, b, a1)
+      let a3 = walk_field_priv_expr(file, cx, all_decls, c, a2)
+      walk_field_priv_stmts(file, cx, all_decls, rest, a3)
+    }
+    SAssign(a, c, _, _) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
+      let a3 = walk_field_priv_expr(file, cx, all_decls, c, a1)
+      walk_field_priv_stmts(file, cx, all_decls, rest, a3)
+    }
+    SUse(_, _, _) -> walk_field_priv_stmts(file, cx, all_decls, rest, acc)
+  }
+}
+
+
+
+fn walk_field_priv_clauses(file: String, cx: PrivCx,
+                             all_decls: FieldRecs, cs: [HClause],
+                             acc: [Diagnostic]) : [Diagnostic] / Console + File = match cs {
+  [] -> acc
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> {
+      let a1 = walk_field_priv_expr(file, cx, all_decls, body, acc)
+      walk_field_priv_clauses(file, cx, all_decls, rest, a1)
+    }
+  }
+}
+
+# Names of ops the user wrote in a handle's clause list.
+
+
+#[doc("Typer-internal helper `handle_clause_op_names` shared across the infer modules.")]
+pub fn handle_clause_op_names(cs: [HClause]) : [String] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(h, _, _, _, _) -> [clause_head_word(h), ...handle_clause_op_names(rest)]
+  }
+}
+
+# Names of ops declared inside an effect's `default { }` block whose
+# clause body is an `$extern_handler("c_sym")` intrinsic — the only
+# shape Stage A codegen knows how to lower into a runtime shim.
+# kaikai-bodied default clauses are recognised by the parser but their
+# emit path is Stage C scope; including them here would let the typer
+# discharge ops that the binary cannot service at runtime.
+# Returns the empty list for "no default block" — the walker treats
+# that case identically to "default block exists but covers no extern
+# handlerable ops".
+
+
+fn default_block_extern_ops(defblk: Option[DefaultBlock]) : [String] =
+  match defblk {
+    None      -> []
+    Some(blk) -> match blk {
+      DBlk(clauses, _, _, _) -> extern_handler_op_names(clauses)
+    }
+  }
+
+
+
+# precomputed `eff_name -> extern-handlerable default ops`
+# table. The coverage walk used to call `effect_default_op_names`, an
+# O(n_decls) scan over every declaration, at every `EHandle` node and at
+# every main-level uncovered op-call — O(N_EHandle x n_decls) overall.
+# This table walks `decls` ONCE, recording per effect exactly the op
+# names the old scan would have returned, so each use site is a single
+# assoc-list lookup. Mirrors the `EffOps`/`use_eff_lookup` idiom from
+# desugar.kai (kept local here because this lane touches only infer.kai).
+# Effects absent from the table (lookup `None`) resolve to `[]` at the use
+# site, matching the old scan on an effect with no `default { }` block.
+#[doc("Typer-internal type `EffDefaultOps` shared across the infer modules.")]
+pub type EffDefaultOps = EDOps(SymId, [String])
+
+
+
+#[doc("Typer-internal helper `build_effect_default_op_map` shared across the infer modules.")]
+pub fn build_effect_default_op_map(decls: [Decl]) : [EffDefaultOps] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, s, _, _, defblk, _, _, _) ->
+        [EDOps(s, default_block_extern_ops(defblk)),
+         ...build_effect_default_op_map(rest)]
+      _ -> build_effect_default_op_map(rest)
+    }
+  }
+}
+
+
+
+# Lookup matching `effect_default_op_names`'s contract: an undeclared
+# effect (no table entry) returns `[]`, exactly as the original scan does
+# when the effect's declaration carries no `default { }` block.
+#[doc("Typer-internal helper `effect_default_op_map_get` shared across the infer modules.")]
+pub fn effect_default_op_map_get(table: [EffDefaultOps], s: SymId) : [String] =
+  if sym_raw(s) < 0 { [] } else { edop_get(table, sym_raw(s)) }
+
+
+fn edop_get(table: [EffDefaultOps], id: Int) : [String] = match table {
+  [] -> []
+  [EDOps(n, ops), ...rest] -> if sym_raw(n) == id { ops } else { edop_get(rest, id) }
+}
+
+
+
+#[doc("Typer-internal helper `extern_handler_op_names` shared across the infer modules.")]
+pub fn extern_handler_op_names(cs: [HClause]) : [String] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(h, _, body, _, _) -> match extern_handler_c_symbol(body) {
+      None    -> extern_handler_op_names(rest)
+      Some(_) -> [clause_head_word(h), ...extern_handler_op_names(rest)]
+    }
+  }
+}
+
+
+
+# The innermost handle of the effect a perform names.
+#[doc("Typer-internal helper `find_top_eff_frame` shared across the infer modules.")]
+pub fn find_top_eff_frame(stack: [HandleFrame], esym: SymId) : Option[HandleFrame] {
+  match stack {
+    []           -> None
+    [f, ...rest] -> match f {
+      HF(hs, _, _, _, _) ->
+        if sym_raw(hs) >= 0 and sym_same(hs, esym) { Some(f) }
+        else { find_top_eff_frame(rest, esym) }
+    }
+  }
+}
+
+# walker over a typed (or pre-typed) Expr. `entry` says the enclosing
+# `DFn` is the program's entry point, where the startup defaults
+# discharge an op no handler covers.
+
+
+#[doc("Typer-internal helper `is_effect_declared` shared across the infer modules.")]
+pub fn is_effect_declared(eff: SymId, decls: [Decl]) : Bool {
+  match decls {
+    [] -> false
+    [d, ...rest] -> match d {
+      DEffect(_, s, _, _, _, _, _, _) ->
+        if sym_same(s, eff) { true } else { is_effect_declared(eff, rest) }
+      _ -> is_effect_declared(eff, rest)
+    }
+  }
+}
+
+
+# A reference as a diagnostic names it: the declaration's name once
+# settled, what the source wrote before.
+#[doc("Typer-internal helper `ref_text` shared across the infer modules.")]
+pub fn ref_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, w) -> written_text(w)
+}
+
+# Emit the structured diagnostic for an unhandled op. The `at_main` flag
+# distinguishes "no handle at the entry point, default block does not cover
+# the op" from "enclosing handle exists, clauses omit the op, default
+# does not fill the gap" — the help lines differ.
+
+
+#[doc("infer: a quantified type scheme (bound ty/row/unit vars + unit-var kinds + the Ty).")]
+#[derive(BinSerialize)]
+pub type TyScheme = Scheme([Int], [Int], [Int], [String], Ty)
+# third parameter `bound_uvars` lists unit-var ids quantified
+# by the scheme. Instantiation allocates a fresh UVar per bound id
+# (parallel to bound_vars / bound_rvars). Empty for non-unit-poly
+# schemes. The fourth parameter is parallel to `bound_uvars`: the
+# kind each unit tparam ranges over (`Measure`, `Currency`, ...);
+# `""` leaves the var unconstrained (kind-agnostic builtins).
+
+
+#[doc("infer: what a typing-environment entry binds: a declaration, a constructor, an effect operation (its effect and its label), or a local binder.")]
+#[derive(BinSerialize)]
+pub type EnvKey = KSym(SymId) | KCtor(SymId) | KOp(SymId, Written) | KLocal(Binder)
+
+
+#[doc("infer: an entry of the typing environment: what it binds, and the scheme bound.")]
+#[derive(BinSerialize)]
+pub type TyEntry = { key: EnvKey, scheme: TyScheme }
+
+
+# A per-decl summary of `type T = A | B` declarations, as a module's
+# delta carries it. The typer reads the same rows keyed by the union's
+# declaration (`union_table`); the first slot is that declaration, and
+# `line`/`col` point at its token.
+#[doc("infer: `UnionInfo` — driver-facing type.")]
+#[derive(BinSerialize)]
+pub type UnionInfo = UI(SymId, [Ty], Int, Int)
+
+
+# `unions` carries the union rows harvested at env-build time, keyed by
+# each union's declaration. It coexists with the variant-table dual rep:
+# the table drives runtime ctor lookup, while `unions` is the
+# typer-side authority for "which types compose this union?".
+# per-compile cache `head_owners` records the (head_type
+# → declaring_module) mapping the typer consults when lowering a
+# convention-based pipe (`|`, `||`, `|?`). Each `HeadOwnerEntry` carries
+# the modules that declare a `pub type T` so a second-pass dispatch
+# lookup can answer "module that owns `T`'s `map`/`flat_map`/`filter`"
+# in O(1) per pipe call site without re-scanning the decl stream.
+# The list is built once per compile by
+# `build_head_owner_map` and stays empty for typer entry points that
+# do not run inside `compile_source` (test helpers, `dump_typed`, etc.)
+# — those paths have no module table to consult, so the only head a
+# pipe could resolve against is the core-loaded `List`, which their
+# fixtures already exercise via the standard core path.
+# `#[constructor]` registry entry: the constructed type and the marked
+# fn. `try_constructor_call` reads it to rewrite `Type(args)` into a
+# call of that fn.
+#[doc("infer: one `#[constructor]` binding: the constructed type, and the fn marked for it.")]
+#[derive(BinSerialize)]
+pub type CtorEntry = CtorE(SymId, SymId)
+
+
+#[doc("infer: a nominal head and the modules that declare it.")]
+pub type HeadOwnerEntry = HOE(SymId, [SymId])
+
+
+#[doc("infer: the id a key binds: the declaration, the constructor, or an operation's effect; `sym_none()` for a local binder.")]
+pub fn env_key_sym(k: EnvKey) : SymId = match k {
+  KSym(s)   -> s
+  KCtor(s)  -> s
+  KOp(s, _) -> s
+  KLocal(_) -> sym_none()
+}
+
+
+#[doc("infer: a key as a dump, a hole's scope or a completion list prints it: the declaration's name, `Eff.op`, or the binder's name.")]
+pub fn env_key_text(tab: SymTab, k: EnvKey) : String = match k {
+  KSym(s)    -> written_text(decl_name(tab, s))
+  KCtor(s)   -> written_text(decl_name(tab, s))
+  KOp(s, op) -> concat_all([written_text(decl_name(tab, s)), ".", written_text(op)])
+  KLocal(b)  -> written_text(b.name)
+}
+
+
+#[doc("infer: a text that orders and tells apart serialised keys without a symbol table.")]
+pub fn env_key_ord(k: EnvKey) : String = match k {
+  KSym(s)    -> cat2("s", int_to_string(sym_raw(s)))
+  KCtor(s)   -> cat2("c", int_to_string(sym_raw(s)))
+  KOp(s, op) -> concat_all(["o", int_to_string(sym_raw(s)), ".", written_text(op)])
+  KLocal(b)  -> cat2("l", int_to_string(local_raw(b.id)))
+}
+
+
+#[doc("Typer-internal helper `env_ix_add` shared across the infer modules.")]
+pub fn env_ix_add(ix: NameIndex[TyEntry], e: TyEntry) : NameIndex[TyEntry] = match e.key {
+  KLocal(_) -> ix
+  k         -> idx_prepend_sym(ix, env_key_sym(k), e)
+}
+
+
+# An effect's operations share its bucket and are no value of that id.
+#[doc("Typer-internal helper `env_sym_in` shared across the infer modules.")]
+pub fn env_sym_in(es: [TyEntry]) : Option[TyScheme] = match es {
+  [] -> None
+  [e, ...rest] -> match e.key {
+    KSym(_)  -> Some(e.scheme)
+    KCtor(_) -> Some(e.scheme)
+    _        -> env_sym_in(rest)
+  }
+}
+
+
+#[doc("Typer-internal helper `env_op_in` shared across the infer modules.")]
+pub fn env_op_in(es: [TyEntry], op: String) : Option[TyScheme] = match es {
+  [] -> None
+  [e, ...rest] -> match e.key {
+    KOp(_, w) -> if written_text(w) == op { Some(e.scheme) } else { env_op_in(rest, op) }
+    _         -> env_op_in(rest, op)
+  }
+}
+
+
+# Prepend a fresh batch of new entries onto BOTH the entries list and the
+# indexes, returning them together. Each `TyEntry` is shared into
+# `entries` and its index exactly as a single bind shares it. `batch`
+# must be a fresh local (not an already-stored list): it is reversed so
+# a tail-recursive prepend lands the original head (newest) at the front
+# of every structure, matching a single bind's newest-first order.
+#[doc("infer: the entries and the identity and variant indexes of a typing env, kept in step.")]
+pub type TyEnvParts = TEP([TyEntry], NameIndex[TyEntry], VariantIndex[TyEntry])
+
+
+# A function the typer may settle a bare name to: its scheme and its
+# declaration. A use narrowed to one is rewritten to that declaration.
+#[doc("Typer-internal type `TyCandidate` shared across the infer modules.")]
+pub type TyCandidate = { scheme: TyScheme, sym: SymId }
+
+
+#[doc("Typer-internal helper `env_ctor_names_loop` shared across the infer modules.")]
+pub fn env_ctor_names_loop(tab: SymTab, es: [TyEntry], acc: [String]) : [String] = match es {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e.key {
+    KCtor(c) -> env_ctor_names_loop(tab, rest, [written_text(decl_name(tab, c)), ...acc])
+    _        -> env_ctor_names_loop(tab, rest, acc)
+  }
+}
+
+# ---- small constructors ----
+
+
+#[doc("Typer-internal helper `mono` shared across the infer modules.")]
+pub fn mono(ty: Ty) : TyScheme = Scheme([], [], [], [], ty)
+
+
+#[doc("Typer-internal helper `scheme` shared across the infer modules.")]
+pub fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, [], [], [], ty)
+
+
+#[doc("Typer-internal helper `scheme_full` shared across the infer modules.")]
+pub fn scheme_full(vars: [Int], rvars: [Int], ty: Ty) : TyScheme = Scheme(vars, rvars, [], [], ty)
+
+
+# scheme generalising over type-, row-, and unit-vars all at once.
+# Used by fn_scheme_of_decl when the signature has [u: Measure] tparams.
+# `ukinds` is parallel to `uvars`: the kind each unit tparam ranges
+# over ("" = unconstrained).
+#[doc("Typer-internal helper `scheme_uvars` shared across the infer modules.")]
+pub fn scheme_uvars(vars: [Int], rvars: [Int], uvars: [Int], ukinds: [String], ty: Ty) : TyScheme =
+  Scheme(vars, rvars, uvars, ukinds, ty)
+
+
+#[doc("Typer-internal helper `tv` shared across the infer modules.")]
+pub fn tv(n: Int) : Ty = TyVarT(n)
+
+
+#[doc("Typer-internal helper `fn_ty` shared across the infer modules.")]
+pub fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, inf_row_empty())
+
+
+# An empty row open on row variable `rid`.
+#[doc("Typer-internal helper `row_with_tail` shared across the infer modules.")]
+pub fn row_with_tail(rid: Int) : Row = Row {
+  labels:        [],
+  tail:          Some(rid),
+  display_alias: None
+}
+
+
+#[doc("Typer-internal helper `list_ty` shared across the infer modules.")]
+pub fn list_ty(t: Ty) : Ty = TyListT(t)
+
+# ---- core signatures ----
+
+
+#[doc("Typer-internal helper `builtin_ty_entries` shared across the infer modules.")]
+pub fn builtin_ty_entries(table: [Builtin]) : [TyEntry] = match table {
+  [] -> []
+  [BF(name, _, BS(vs, rvs, uvs, ty)), ...rest] ->
+    [TyEntry { key: KSym(builtin_sym(name)), scheme: Scheme(vs, rvs, uvs, map(uvs, (_u) => ""), ty) }, ...builtin_ty_entries(rest)]
+}
+
+
+# Map each raw core prim to its typer entry: a monomorphic function
+# scheme over the prim's raw param/return types.
+#[doc("Typer-internal helper `native_prim_ty_entries` shared across the infer modules.")]
+pub fn native_prim_ty_entries(table: [RCore]) : [TyEntry] = match table {
+  [] -> []
+  [RP(name, _, ptys, rty), ...rest] ->
+    [TyEntry { key: KSym(builtin_sym(name)), scheme: mono(fn_ty(ptys, rty)) }, ...native_prim_ty_entries(rest)]
+}
+
+# ---- built-in variant constructors ----
+
+
+# The id of a constructor the runtime builds, homed at the core.
+#[doc("Typer-internal helper `core_ctor_sym` shared across the infer modules.")]
+pub fn core_ctor_sym(name: String) : SymId = sym_derive(NCCtor, name, core_type_home())
+
+
+# The names of the constructors the runtime builds.
+#[doc("Typer-internal helper `core_ctor_names` shared across the infer modules.")]
+pub fn core_ctor_names() : [String] = ["Some", "None", "Ok", "Err"]
+
+# ---- user-defined signatures ----
+#
+# For each DFn decl add its signature; for each DType of sum-shape add a
+# scheme per variant that produces the sum's `TyCon` over its tparams.
+
+
+# A row variable a signature never listed holds no position: every walk
+# below that numbers a parameter list steps over it.
+fn tparam_ids_loop(tparams: [TBinder], i: Int, acc: [Int]) : [Int] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [b, ...rest] -> if tb_is_row(b) { tparam_ids_loop(rest, i, acc) }
+                    else { tparam_ids_loop(rest, i + 1, [i, ...acc]) }
+  }
+}
+
+
+#[doc("Typer-internal helper `tparam_ids` shared across the infer modules.")]
+pub fn tparam_ids(tparams: [TBinder]) : [Int] = tparam_ids_loop(tparams, 0, [])
+
+
+# same as tparam_ids but starts numbering from `start` so a
+# nested set of tparams (op-level on top of effect-level) gets a
+# disjoint id range.
+#[doc("Typer-internal helper `tparam_ids_from` shared across the infer modules.")]
+pub fn tparam_ids_from(tparams: [TBinder], start: Int) : [Int] = tparam_ids_loop(tparams, start, [])
+
+
+# split the tparam list into separate type-var and unit-var ID
+# lists. Mirrors the kind-aware allocation in mk_tpbinds — bound_vars
+# (type pool) get IDs 0..nT-1; bound_uvars (unit pool) get IDs 0..nU-1.
+#[doc("infer: `TParamSplit` — driver-facing type.")]
+pub type TParamSplit = { tvars: [Int], uvars: [Int] }
+
+
+#[doc("infer: `tparam_id_split` — typer entry point invoked by the driver.")]
+pub fn tparam_id_split(tparams: [TBinder]) : TParamSplit =
+  tparam_id_split_loop(tbs_positional(tparams), 0, 0, [], [])
+
+
+# Count how many tparams in `tparams` are unit-kind. Used by
+# `infer_decl` to advance the inferencer's unit_fresh counter past
+# the impl-level bound uvar ids so freshly minted uvars during body
+# type-checking do not alias them.
+#[doc("Typer-internal helper `tparam_unit_count` shared across the infer modules.")]
+pub fn tparam_unit_count(tparams: [TBinder]) : Int = list_length(filter(tparams, tb_is_unit))
+
+
+# The kind each unit tparam ranges over, in tparam order — parallel
+# to `tparam_id_split`'s uvars, so uvar id i has kind element i.
+#[doc("Typer-internal helper `tparam_unit_kinds` shared across the infer modules.")]
+pub fn tparam_unit_kinds(tparams: [TBinder]) : [String] = map(filter(tparams, tb_is_unit), tb_unit_kind)
+
+
+# build a `[(endpoint_id, bound_id)]` redirect map for
+# uvar canonicalisation. For each bound uvar id, chase the
+# substitution to find the chain endpoint. If the endpoint is a
+# different UVar id, record `(endpoint -> bound)` so subsequent
+# walkers can rewrite the body's `Expr.ty` to use the bound id (the
+# id the body subst map keys on). If the endpoint resolves to a
+# concrete unit (USym / UMul / ...), no redirect is needed — the
+# body's `Expr.ty` already pinpoints a non-generic call site.
+#[doc("Typer-internal type `IntPair` shared across the infer modules.")]
+pub type IntPair = IPair(Int, Int)
+
+
+#[doc("Typer-internal helper `intpair_lookup` shared across the infer modules.")]
+pub fn intpair_lookup(ps: [IntPair], k: Int) : Option[Int] {
+  match ps {
+    [] -> None
+    [h, ...rest] -> match h {
+      IPair(a, b) -> if a == k { Some(b) } else { intpair_lookup(rest, k) }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `canon_uvars_unit` shared across the infer modules.")]
+pub fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
+  match u {
+    UOne        -> u
+    USym(_)     -> u
+    UParam(_)   -> u
+    UVar(n)     -> match intpair_lookup(m, n) {
+      Some(b) -> UVar(b)
+      None    -> u
+    }
+    UMul(a, b)  -> UMul(canon_uvars_unit(a, m), canon_uvars_unit(b, m))
+    UInv(a)     -> UInv(canon_uvars_unit(a, m))
+    UPow(a, n)  -> UPow(canon_uvars_unit(a, m), n)
+    UJoin(a, b) -> UJoin(canon_uvars_unit(a, m), canon_uvars_unit(b, m))
+    UDims(us)   -> UDims(canon_uvars_units(us, m))
+  }
+}
+
+
+fn canon_uvars_units(us: [UnitExprT], m: [IntPair]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [canon_uvars_unit(u, m), ...canon_uvars_units(rest, m)]
+}
+
+
+fn tparam_id_split_loop(tparams: [TBinder], ti: Int, ui: Int,
+                        tacc: [Int], uacc: [Int]) : TParamSplit {
+  match tparams {
+    [] -> TParamSplit { tvars: list_reverse(tacc), uvars: list_reverse(uacc) }
+    [n, ...rest] -> {
+      if tb_is_unit(n) {
+        tparam_id_split_loop(rest, ti, ui + 1, tacc, [ui, ...uacc])
+      } else {
+        tparam_id_split_loop(rest, ti + 1, ui, [ti, ...tacc], uacc)
+      }
+    }
+  }
+}
+
+
+# The type-var ids assigned (by `tparam_id_split`'s numbering) to the
+# tparams among `targets`. Used to drop row-kind tparams from the
+# generalised type-var set.
+#[doc("Typer-internal helper `tparam_type_ids_of` shared across the infer modules.")]
+pub fn tparam_type_ids_of(tparams: [TBinder], targets: [TLocalId]) : [Int] =
+  tparam_type_ids_of_loop(tbs_positional(tparams), targets, 0, [])
+
+
+fn tparam_type_ids_of_loop(tparams: [TBinder], targets: [TLocalId], ti: Int, acc: [Int]) : [Int] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [n, ...rest] ->
+      if tb_is_unit(n) { tparam_type_ids_of_loop(rest, targets, ti, acc) }
+      else {
+        let acc1 = if tids_has(targets, n.id) { [ti, ...acc] } else { acc }
+        tparam_type_ids_of_loop(rest, targets, ti + 1, acc1)
+      }
+  }
+}
+
+
+# Resolve a TypeExpr under a mapping from a type parameter to its TyVarT
+# id. The mapping is itself an association list for now.
+#[doc("infer: a type-parameter binding (the parameter -> the id of its type or unit variable).")]
+pub type TPBind = TPB(TBinder, Int)
+
+
+# A use in type position reaches a type-kind parameter only: a unit or
+# shape parameter has its own lookup.
+#[doc("Typer-internal helper `tpbind_lookup` shared across the infer modules.")]
+pub fn tpbind_lookup(binds: [TPBind], id: TLocalId) : Option[Int] {
+  match binds {
+    [] -> None
+    [b, ...rest] -> match b {
+      TPB(n, i) -> if tlocal_eq(n.id, id) and tb_is_type(n) { Some(i) } else { tpbind_lookup(rest, id) }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `tpbind_any` shared across the infer modules.")]
+pub fn tpbind_any(binds: [TPBind], id: TLocalId) : Option[Int] = match binds {
+  [] -> None
+  [TPB(n, i), ...rest] -> if tlocal_eq(n.id, id) { Some(i) } else { tpbind_any(rest, id) }
+}
+
+
+#[doc("Typer-internal helper `binds_of` shared across the infer modules.")]
+pub fn binds_of(binds: [TPBind]) : [TBinder] = map(binds, (b) => match b { TPB(n, _) -> n })
+
+
+# Where a unit tparam has no variable — a record field read without unit
+# bindings, a function's own body — it is the unit symbol it is named.
+#[doc("Typer-internal helper `unit_named` shared across the infer modules.")]
+pub fn unit_named(u: UnitExprT, tps: [TBinder]) : UnitExprT = match u {
+  UParam(p) -> match tbs_find(tps, p) {
+    Some(b) -> USym(tb_text(b))
+    None    -> u
+  }
+  UMul(a, b)  -> UMul(unit_named(a, tps), unit_named(b, tps))
+  UInv(a)     -> UInv(unit_named(a, tps))
+  UPow(a, n)  -> UPow(unit_named(a, tps), n)
+  UJoin(a, b) -> UJoin(unit_named(a, tps), unit_named(b, tps))
+  UDims(us)   -> UDims(map(us, (x) => unit_named(x, tps)))
+  UOne        -> u
+  USym(_)     -> u
+  UVar(_)     -> u
+}
+
+
+# A unit tparam no binding reached keeps an atom of its own, spelled
+# from its id: it equals only itself.
+#[doc("Typer-internal helper `unit_param_atom` shared across the infer modules.")]
+pub fn unit_param_atom(p: TLocalId) : String = string_concat("'", int_to_string(tlocal_raw(p)))
+
+
+# `Cont[T, S]` is `Cont[T, S, e]` with `e` empty: the continuation of a pure body.
+#[doc("Typer-internal helper `cont_full_args` shared across the infer modules.")]
+pub fn cont_full_args(r: DeclRef, args: [Ty]) : [Ty] = match args {
+  [a, s] -> if ref_is_cont(r) { [a, s, row_arg_carrier(inf_row_empty())] } else { args }
+  _ -> args
+}
+
+
+# Build the TPBind list for a decl's generic type parameters.
+# type-kind and unit-kind params allocate IDs from *separate*
+# pools (type-var pool for KType, unit-var pool for KUnit). Without
+# this split a `[u: Unit, T]` decl would conflate type-var 1 with
+# unit-var 1 across instantiation passes.
+fn mk_tpbinds_loop(tparams: [TBinder], ti: Int, ui: Int, acc: [TPBind]) : [TPBind] {
+  match tparams {
+    [] -> list_reverse(acc)
+    [n, ...rest] -> {
+      if tb_is_row(n) {
+        mk_tpbinds_loop(rest, ti, ui, acc)
+      } else if tb_is_unit(n) {
+        mk_tpbinds_loop(rest, ti, ui + 1, [TPB(n, ui), ...acc])
+      } else {
+        mk_tpbinds_loop(rest, ti + 1, ui, [TPB(n, ti), ...acc])
+      }
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `mk_tpbinds` shared across the infer modules.")]
+pub fn mk_tpbinds(tparams: [TBinder]) : [TPBind] = mk_tpbinds_loop(tparams, 0, 0, [])
+
+
+# same as mk_tpbinds but starts ids at `start`. Used to
+# combine effect-level and op-level tparams into a single binding
+# context with disjoint ids.
+#[doc("Typer-internal helper `mk_tpbinds_from` shared across the infer modules.")]
+pub fn mk_tpbinds_from(tparams: [TBinder], start: Int) : [TPBind] = mk_tpbinds_loop(tparams, start, 0, [])
+
+
+#[doc("Typer-internal helper `append_tpbinds` shared across the infer modules.")]
+pub fn append_tpbinds(a: [TPBind], b: [TPBind]) : [TPBind] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_tpbinds(rest, b)]
+  }
+}
+
+
+#[doc("Typer-internal helper `append_ints` shared across the infer modules.")]
+pub fn append_ints(a: [Int], b: [Int]) : [Int] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_ints(rest, b)]
+  }
+}
+
+
+# An effect row occupying a `TyCon` argument slot. The row has no
+# runtime witness — it is a `TyFnT([], TyUnit, row)` carrier so every
+# existing `Ty` walker handles it (mangling erases the row, so two
+# `Stream[t, e]` differing only in `e` share one monomorphisation),
+# and unifying two carriers routes the row to `unify_row` via the
+# `TyFnT` arm. Keyed on a row-var id shared with the ctor field's row.
+#[doc("Typer-internal helper `row_arg_carrier` shared across the infer modules.")]
+pub fn row_arg_carrier(r: Row) : Ty = TyFnT([], TyUnit, r)
+
+
+# Which slots of a nominal type are effect-row-kind. `RKE(type, [idx])`
+# lists the zero-based tparam positions a `pub type` declares in row
+# position (a tparam that appears after `/` inside some ctor field).
+# A use-site `T[..., e, ...]` consults this so the `e` slot resolves to
+# a row carrier even when the surrounding fn never mentions `e` after a
+# `/` — the `from_list[t,e](xs:[t]) : Stream[t,e]` case, where the row
+# var is sourced, not threaded from an argument.
+pub type RowKindEntry = RKE(SymId, [Int])
+
