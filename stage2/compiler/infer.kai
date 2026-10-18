@@ -17686,7 +17686,7 @@ fn st_hint_section_tail(st: InferState, site: Expr) : InferState / Console + Fil
 fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               op_eff_arities: [OpEffArity],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
-              sums: [SumInfo],
+              sums: [SumInfo], hcar: [SymId],
               protos: ProtoView,
               all_decls: [Decl],
               kind_theories: [KindTheory],
@@ -17832,7 +17832,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # (spawn.spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
       let st1e = check_entry_result(st1, entry, apply_ty(st1.sub, declared_ret), ret_site.line, ret_site.col)
-      let st1b = check_no_fiber_escape(st1e, file, fnid_sym(fid), nm, opt_ret, sums, line, col)
+      let st1b = check_no_fiber_escape(st1e, file, fnid_sym(fid), nm, opt_ret, sums, hcar, line, col)
       # Drop `Mutable` when every demand targets a locally built value
       # that never escapes; otherwise blame the first demand that does not.
       let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr)
@@ -17969,15 +17969,15 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
     # `add_decls_loop`), so the emitter sees a plain `DFn`.
     DProtoLaws(_, inner, _, _, _) -> infer_decl(file, env, core_len, recs,
                                             op_eff_arities, type_aliases, op_to_eff,
-                                            sums, protos, all_decls, kind_theories,
+                                            sums, hcar, protos, all_decls, kind_theories,
                                             inner, verbose)
     DImplAxiom(_, inner, _, _, _) -> infer_decl(file, env, core_len, recs,
                                             op_eff_arities, type_aliases, op_to_eff,
-                                            sums, protos, all_decls, kind_theories,
+                                            sums, hcar, protos, all_decls, kind_theories,
                                             inner, verbose)
     DConstructor(inner, _, _) -> infer_decl(file, env, core_len, recs,
                                             op_eff_arities, type_aliases, op_to_eff,
-                                            sums, protos, all_decls, kind_theories,
+                                            sums, hcar, protos, all_decls, kind_theories,
                                             inner, verbose)
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
   }
@@ -18176,7 +18176,7 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # unwritable in user code. Until the cap binding lands, the
 # brand-mismatch detection has no surface to attach to.
 fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
-                          opt_ret: Option[TypeExpr], sums: [SumInfo],
+                          opt_ret: Option[TypeExpr], sums: [SumInfo], hcar: [SymId],
                           line: Int, col: Int) : InferState / Console + File {
 
 
@@ -18185,7 +18185,7 @@ fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
   else {
     match opt_ret {
       None -> st
-      Some(rty) -> {
+      Some(rty) -> if not te_hits(hv, [core_ty_sym(CtFiber), core_ty_sym(CtPid), ...hcar], rty) { st } else {
         match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, st.recs, []) {
           Some(breach) -> {
             let lline = if rty.line > 0 { rty.line } else { line }
@@ -18325,6 +18325,40 @@ fn named_holds(hv: TyHomeView, h: SymId, s: SymId, sums: [SumInfo], recs: [RecIn
     HW(Some(_), _) -> true
     HW(None, _) -> false
   }
+
+# Named types that transitively hold a Fiber or Pid, computed once per program
+# so a return-type check consults a table instead of re-expanding declarations.
+fn handle_carriers(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : [SymId] =
+  carriers_close(hv, sums, recs, [])
+
+fn carriers_close(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], cs: [SymId]) : [SymId] {
+  let fresh = carriers_among(hv, sums, recs, [core_ty_sym(CtFiber), core_ty_sym(CtPid), ...cs])
+  if list_length(fresh) == 0 { cs } else { carriers_close(hv, sums, recs, concat([fresh, cs])) }
+}
+
+fn carriers_among(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo], hs: [SymId]) : [SymId] =
+  concat([
+    flat_map(sums, (si) => match si {
+      SI(sy, _, vs, mo) -> if not sym_list_has(hs, sy) and any(vs, (v) => match v { Var(_, tes) -> any(tes, (te) => te_hits(tsh_at(hv, mo), hs, te)) }) { [sy] } else { [] }
+    }),
+    flat_map(recs, (ri) => match ri {
+      RI(sy, _, fs, mo) -> if not sym_list_has(hs, sy) and any(fs, (f) => match f { FD(_, _, te, _) -> te_hits(tsh_at(hv, mo), hs, te) }) { [sy] } else { [] }
+    })])
+
+# `t` names a type of `hs`, or has one among its type arguments or parts.
+fn te_hits(hv: TyHomeView, hs: [SymId], t: TypeExpr) : Bool = match t.tkind {
+  TyName(r, tas) -> {
+    let s = ref_ty_sym(hv, r)
+    (sym_raw(s) >= 0 and sym_list_has(hs, s)) or any(tas, (a) => te_hits(hv, hs, a))
+  }
+  TyList(inner) -> te_hits(hv, hs, inner)
+  TyFn(ps, ret, _) -> any(ps, (a) => te_hits(hv, hs, a)) or te_hits(hv, hs, ret)
+  TyDim(base, _) -> te_hits(hv, hs, base)
+  TyRefine(base, _) -> te_hits(hv, hs, base)
+  TyRow(_) -> false
+  TySurface(ts) -> any(tysurface_children(ts), (a) => te_hits(hv, hs, a))
+  TyParam(_, tas) -> any(tas, (a) => te_hits(hv, hs, a))
+}
 
 # The breach found in a type, and the named types already explored: a type
 # explored without a hit is never walked again, so the walk is linear in the
@@ -19022,7 +19056,7 @@ fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                    acc_op_res: [OpResolution],
                    type_aliases: [AliasResult],
                    op_to_eff: [OpToEff],
-                   sums: [SumInfo],
+                   sums: [SumInfo], hcar: [SymId],
                    protos: ProtoView,
                    all_decls: [Decl],
                    kind_theories: [KindTheory]) : TypedProgram / Console + File + Mutable {
@@ -19044,7 +19078,7 @@ fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
       # root: the flattened stream mixes every imported module's decls
       # and each one's line/column belongs to its own source.
       let r = infer_decl(decl_diag_file(d, df), env, core_len, recs, op_eff_arities,
-                          type_aliases, op_to_eff, sums, protos,
+                          type_aliases, op_to_eff, sums, hcar, protos,
                           # pass program-level decls so
                           # check_body_row / check_main_row_handlable can
                           # consult source-level `default { }` blocks
@@ -19060,7 +19094,7 @@ fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                      prepend_reverse_row_holes(r.row_holes, acc_row_holes),
                      prepend_reverse_diags(r.diags, acc_diags),
                      prepend_reverse_op_res(r.op_res, acc_op_res),
-                     type_aliases, op_to_eff, sums, protos,
+                     type_aliases, op_to_eff, sums, hcar, protos,
                      all_decls, kind_theories)
     }
   }
@@ -19373,7 +19407,8 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   } else { data.decls_a }
   let tp = infer_all_loop(df, data.built.env, data.built.core_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [], [],
-                 data.alias_res.aliases, data.op_to_eff, data.sums, protos,
+                 data.alias_res.aliases, data.op_to_eff, data.sums,
+                 handle_carriers(env_home_view(data.built.env, None), data.sums, data.recs), protos,
                  all_decls_for_typer, kind_theories)
   # Stage B coverage check. Runs after row-level inference
   # is complete so the typed body carries the resolved effect-op
