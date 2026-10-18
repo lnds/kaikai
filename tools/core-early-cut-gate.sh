@@ -24,7 +24,7 @@ compile() { # $1 output stem, $2 source, rest: flags
 }
 
 pass=0; fail=0; retried=0
-for src in examples/minimal/hello.kai tools/core-early-cut-retry-warns.kai tools/core-early-cut-import.kai $(grep -l '#\[derive(' examples/*/*.kai) $(grep -l '^import ' examples/stdlib/*.kai | awk 'NR%3==0'| awk 'NR%6==0'); do
+for src in examples/minimal/hello.kai tools/core-early-cut-retry-warns.kai tools/core-early-cut-brand-warns.kai examples/effects/issue_682_cancel_sibling_handler.kai tools/core-early-cut-import.kai $(grep -l '#\[derive(' examples/*/*.kai) $(grep -l '^import ' examples/stdlib/*.kai | awk 'NR%3==0'| awk 'NR%6==0'); do
   compile "$WORK/off" "$src" --no-early-cut
   compile "$WORK/cut" "$src"
   compile "$WORK/all" "$src" --early-cut-all
