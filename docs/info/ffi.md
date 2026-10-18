@@ -110,7 +110,7 @@ puts that directory on the include path of the C sources it compiles
 by hand (`CFLAGS` shims and `[native]` sources), on every backend and
 in `kai build`, `kai run` and `kai test`. The header is regenerated from
 the program, so a struct that changes rebuilds the shim against it.
-`kaic2 --emit=ffi-header` prints it.
+`kaic2 --ffi-header-out <file>` writes it during a compile.
 
 > Struct-by-value works on **both backends**. The C-direct backend
 > (`--backend=c`) lets the C compiler own the ABI; the native (libLLVM)
