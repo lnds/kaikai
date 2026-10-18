@@ -81,6 +81,23 @@ for edit in 42 7; do
   check "shim edit $edit" "$("$pt/pt-edit")" "$edit"
 done
 
+# The shim reaches the header only through another header of its own.
+program I32
+printf '#include "kai_ffi.h"\n' > "$pt/my.h"
+printf '#include "my.h"\n\nint64_t pt_sum(Pt p) { return (int64_t) p.x + (int64_t) p.y; }\n' > "$pt/pt_indirect.c"
+for b in $backends; do
+  (cd "$pt" && CFLAGS="pt_indirect.c" "$KAI" build --backend="$b" pt.kai -o "pt-indirect-$b") \
+    || { echo "ffi-header FAIL (indirect $b)"; fail=1; continue; }
+  check "indirect $b" "$("$pt/pt-indirect-$b")" 42
+done
+
+# A program without an `extern "C" type` builds with a shim that never includes the header.
+printf 'fn main() {\n  println("plain")\n}\n' > "$pt/plain.kai"
+printf 'int unused_by_plain(void) { return 0; }\n' > "$pt/plain_shim.c"
+(cd "$pt" && CFLAGS="plain_shim.c" "$KAI" build --backend=c plain.kai -o plain) \
+  || { echo "ffi-header FAIL (no struct)"; fail=1; }
+check "no struct" "$("$pt/plain")" plain
+
 # A `[native]` source includes the header too.
 pkg="$work/pkg"
 mkdir -p "$pkg/c"
@@ -92,7 +109,8 @@ entry = "main.kai"
 sources = ["c/shim.c"]
 include = ["c"]
 EOF
-cp "$pt/pt_shim.c" "$pkg/c/shim.c"
+printf '#include "kai_ffi.h"\n' > "$pkg/c/my.h"
+printf '#include "my.h"\n\nint64_t pt_sum(Pt p) { return (int64_t) p.x + (int64_t) p.y; }\n' > "$pkg/c/shim.c"
 for b in $backends; do
   for w in I32 I64 I32; do
     cat > "$pkg/main.kai" <<EOF
