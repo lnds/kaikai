@@ -7934,6 +7934,28 @@ static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures
     return v;
 }
 
+/* The one immortal closure of a capture-free fn, built on first reference and
+ * published through `slot` and never freed, so the ledger retires it. A
+ * racing builder's cell was never visible, so its rc is restored before the
+ * free. */
+static KAI_RC_NOINLINE KaiValue *kai_static_closure_build(KaiValue **slot, KaiFn fn, int arity) {
+    KaiValue *c = kai_closure(fn, arity, 0, NULL);
+    c->rc = INT32_MAX;
+    KaiValue *expected = NULL;
+    if (__atomic_compare_exchange_n(slot, &expected, c, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        kai_rc_count_free();
+        return c;
+    }
+    c->rc = 1;
+    kai_decref(c);
+    return expected;
+}
+
+static inline KaiValue *kai_static_closure(KaiValue **slot, KaiFn fn, int arity) {
+    KaiValue *c = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    return c != NULL ? c : kai_static_closure_build(slot, fn, arity);
+}
+
 /* Invoke a closure dynamically.
  *
  * Issue #298 — kai_apply consumes its closure argument. Pre-fix the
@@ -21545,6 +21567,32 @@ static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char
         kai_exit(1);
     }
     return node;
+}
+
+/* Resolve a whole evidence frame in one pass: one cancel poll and one fiber
+ * fetch for every slot, and an empty evidence stack resolves each slot to its
+ * default. Bit i of `unchecked` exempts slot i from the unhandled-effect
+ * report. */
+static KaiEvidence **kai_evidence_fill_frame(KaiEvidence **out, int n, const char *const *labels,
+                                             KaiEvidence *const *defs, uint64_t unchecked) {
+    kai_check_cancel_yield_point();
+    KaiFiber *f = kai_current_fiber();
+    int bare = f->seg == NULL && f->evidence_top == NULL;
+    for (int i = 0; i < n; i++) {
+        const char *label = labels[i];
+        if (label[0] == 'C' && strcmp(label, "Cancel") == 0) kai_check_trap_exit_cancel_bypass();
+        KaiEvidence *node;
+        if (bare) {
+            node = defs[i];
+        } else if (f->seg != NULL) {
+            node = kai_seg_lookup(f, label, defs[i]);
+        } else {
+            node = kai_ev_find(f->evidence_top, NULL, label, f->in_dispatch_node);
+            if (node == NULL) node = defs[i];
+        }
+        out[i] = (i < 64 && ((unchecked >> i) & 1)) ? node : kai_evidence_require(node, label);
+    }
+    return out;
 }
 
 /* m7b #15: per-instance dispatch — find the evidence node whose
