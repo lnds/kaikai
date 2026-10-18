@@ -57,13 +57,8 @@ pub fn inf_row_suffix_ow(tab: SymTab, owners: [HeadOwnerEntry], r: Row) : String
   body
 }
 
-# Dump the declared signature (or shape) of every top-level decl. Used
-# by `--types`; does not attempt to infer bodies, just surfaces what
-# the user wrote.
-
 
 fn inf_ty_string_list(tab: SymTab, ts: [Ty]) : [String] = map(ts, (t) => inf_ty_to_string(tab, t))
-
 
 
 fn inf_tycon_arg_to_string(tab: SymTab, t: Ty) : String = match inf_row_carrier_of(t) {
@@ -213,87 +208,76 @@ pub fn test_decl_with_body(d: Decl, body: Expr) : Decl {
 }
 
 
-# shallow region-brand check on Fiber[T]. Walks the type
-# annotation (the user-written TypeExpr, not the resolved Ty, so
-# the diagnostic can point at the exact text the user wrote) and
-# rejects any occurrence of `Fiber[...]` (or `Pid[...]`) in the
-# return-type position of a fn that is NOT one of the legitimate
-# stdlib producers (`spawn.spawn` family in stdlib/spawn.kai). See
-# the comment at the call site in infer_decl for the design trade-off
-# (path-based exemption doesn't work because import decls inherit
-# the importer's file path through expand_imports).
-#
-# Tier 2: symmetrise the check across `Fiber[T]` and
-# `Pid[Msg]` so a stdlib-external helper can no longer return a
-# raw Pid either.
-#
-# (option (a)): the walker now also descends
-# into user-defined sum-type constructor payloads via the
-# `[SumInfo]` registry collected in `infer_program`. A
-# `type Boxed = Wrap(Fiber[Int])` return value used to escape the
-# shallow walker — its surface TypeExpr names `Boxed` alone
-# and the Fiber lives in the variant payload, not in the TypeExpr
-# the walker saw. The deep walker substitutes the type's tparams
-# into each variant's payload TypeExprs and recurses, with a
-# `visited` set to terminate on recursive sums (`type Tree[T] =
-# Leaf(T) | Node(Tree[T], Tree[T])`).
-#
-# The full TyBranded(Ty, BrandId) machinery from
-# `docs/structured-concurrency.md` §*Type system* — propagating a
-# brand through every binding form (let, match, list literal,
-# record field, fn arg) and rejecting brand-mismatch between
-# sibling nurseries — has not landed. Its structural prerequisite
-# is the cap-binding form `nursery { n -> ... }` which
-# also has not landed: today `nursery { ... }` is a plain helper
-# with no `n` parameter, so sibling-nursery brand mismatch is
-# unwritable in user code. Until the cap binding lands, the
-# brand-mismatch detection has no surface to attach to.
-#[doc("Typer-internal helper `check_no_fiber_escape` shared across the infer modules.")]
+type HandleEscapeKind = HkFiber | HkPid
+
+fn handle_kind_sym(k: HandleEscapeKind) : SymId = match k {
+  HkFiber -> core_ty_sym(CtFiber)
+  HkPid -> core_ty_sym(CtPid)
+}
+
+fn handle_kind_shown(k: HandleEscapeKind) : String = match k {
+  HkFiber -> "Fiber[T]"
+  HkPid -> "Pid[Msg]"
+}
+
+fn handle_kind_name(k: HandleEscapeKind) : String = match k {
+  HkFiber -> "Fiber"
+  HkPid -> "Pid"
+}
+
+fn handle_kind_owner(k: HandleEscapeKind) : String = match k {
+  HkFiber -> "nursery"
+  HkPid -> "actor scope"
+}
+
+fn handle_kind_help(k: HandleEscapeKind) : String = match k {
+  HkFiber -> "process the fiber inside the nursery (e.g. with `spawn.await`), or pass a thunk in and a value out instead"
+  HkPid -> "process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead"
+}
+
+#[doc("Reject a function whose return type lets a `Fiber` or `Pid` handle outlive the scope that created it.")]
 pub fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
-                          opt_ret: Option[TypeExpr], ret: Ty, sums: [SumInfo], hcar: HandleTab,
-                          line: Int, col: Int) : InferState / Console + File {
-
-
-  let hv = st_home_view(st)
+                             opt_ret: Option[TypeExpr], ret: Ty, sums: [SumInfo], hcar: HandleTab,
+                             line: Int, col: Int) : InferState / Console + File {
   if is_fiber_producer_helper(f) { st }
   else {
     match opt_ret {
       None -> st
-      Some(rty) -> if not ty_mentions(ht_carriers(hcar, core_ty_sym(CtFiber)), ret) { st } else {
-        match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, st.recs, []) {
-          Some(breach) -> {
-            let lline = if rty.line > 0 { rty.line } else { line }
-            let lcol  = if rty.col  > 0 { rty.col  } else { col  }
-            let perr = mk_diag(SevError, file, lline, lcol,
-              string_concat(string_concat("Fiber[T] cannot escape `", fname),
-                            "`'s structured-concurrency scope"), [])
-            render_diag(perr)
-            diag_note("a `Fiber[T]` handle is bound to the nursery that created it")
-            diag_note("returning one from a function lets it outlive that scope")
-            emit_handle_breach_note(st.env.tab, "Fiber", breach)
-            diag_help("process the fiber inside the nursery (e.g. with `spawn.await`), or pass a thunk in and a value out instead")
-            st_bump_err(st_push_diag(st, perr))
-          }
-          None -> match ty_expr_find_handle(hv, core_ty_sym(CtPid), rty, sums, st.recs, []) {
-            Some(breach) -> {
-              let lline = if rty.line > 0 { rty.line } else { line }
-              let lcol  = if rty.col  > 0 { rty.col  } else { col  }
-              let perr = mk_diag(SevError, file, lline, lcol,
-                string_concat(string_concat("Pid[Msg] cannot escape `", fname),
-                              "`'s structured-concurrency scope"), [])
-              render_diag(perr)
-              diag_note("a `Pid[Msg]` handle is bound to the actor scope that created it")
-              diag_note("returning one from a function lets it outlive that scope")
-              emit_handle_breach_note(st.env.tab, "Pid", breach)
-              diag_help("process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead")
-              st_bump_err(st_push_diag(st, perr))
-            }
-            None -> st
-          }
+      Some(rty) ->
+        if not ty_mentions(ht_carriers(hcar, core_ty_sym(CtFiber)), ret) { st }
+        else {
+          let site = EscapeSite { file: file, fname: fname, rty: rty, line: line, col: col }
+          find_handle_escape(st, st_home_view(st), site, sums, [HkFiber, HkPid])
         }
-      }
     }
   }
+}
+
+type EscapeSite = { file: String, fname: String, rty: TypeExpr, line: Int, col: Int }
+
+fn find_handle_escape(st: InferState, hv: TyHomeView, site: EscapeSite, sums: [SumInfo],
+                      kinds: [HandleEscapeKind]) : InferState / Console + File =
+  match kinds {
+    [] -> st
+    [k, ...rest] -> match ty_expr_find_handle(hv, handle_kind_sym(k), site.rty, sums, st.recs, []) {
+      Some(breach) -> report_handle_escape(st, site, k, breach)
+      None -> find_handle_escape(st, hv, site, sums, rest)
+    }
+  }
+
+fn report_handle_escape(st: InferState, site: EscapeSite, k: HandleEscapeKind,
+                        breach: HandleBreach) : InferState / Console + File {
+  let shown = handle_kind_shown(k)
+  let lline = if site.rty.line > 0 { site.rty.line } else { site.line }
+  let lcol = if site.rty.col > 0 { site.rty.col } else { site.col }
+  let perr = mk_diag(SevError, site.file, lline, lcol,
+    concat_all([shown, " cannot escape `", site.fname, "`'s structured-concurrency scope"]), [])
+  render_diag(perr)
+  diag_note(concat_all(["a `", shown, "` handle is bound to the ", handle_kind_owner(k), " that created it"]))
+  diag_note("returning one from a function lets it outlive that scope")
+  emit_handle_breach_note(st.env.tab, handle_kind_name(k), breach)
+  diag_help(handle_kind_help(k))
+  st_bump_err(st_push_diag(st, perr))
 }
 
 
@@ -797,7 +781,6 @@ pub fn label_absorbed(h: Label, decls: [Decl]) : Bool =
   effect_decl_default_all_extern(effect_decl_of(h.sym, decls)) or is_parametric_handlerless_stdlib_eff(h.sym)
 
 
-
 # Parametric stdlib effects whose handlers are always user-installed
 # (`var x = init` desugar wraps `with State[T](init) { ... }`). They
 # carry no runtime default but main absorption stays true so the sugar
@@ -850,12 +833,6 @@ pub fn check_main_row_handlable(st: InferState, body_row: [Label],
     }
   }
 }
-
-# `Console` is the auto-injected alias `type Console = Stdout +
-# Stderr + Stdin`; row labels are expanded to atomics by
-# `expand_aliases_in_decls` at the program level before any DFn
-# row reaches `check_body_row`. There is no per-effect hardcoded
-# expansion here.
 
 
 # What encloses an effect-row check: a function with a signature, or a

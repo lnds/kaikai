@@ -232,51 +232,35 @@ pub fn join_tails(st: InferState, tail: Int, us: [TailUse], every: Bool, line: I
 }
 
 
-# `xs | f` where `f` takes the whole container instead of the element:
-# the pipe-stage parameter unifies with `lhs_ty` but not with its
-# element type. That is the `|` vs `|>` confusion, not a genuine type
-# error, so the caller swaps the raw `map` mismatch for a targeted
-# "did you mean `|>`" diagnostic. A stage that matches neither side is
-# a real mismatch and returns None.
-#[doc("Typer-internal helper `pipe_stage_wants_container` shared across the infer modules.")]
+#[doc("The stage's parameter type when it takes the piped container but not its element: the `|` versus `|>` confusion.")]
 pub fn pipe_stage_wants_container(env: TyEnv, sub: Subst, lhs_ty: Ty,
-                                stage_ty: Ty, elem: Option[Ty]) : Option[Ty] / Mutable {
+                                  stage_ty: Ty, elem: Option[Ty]) : Option[Ty] / Mutable =
   match apply_ty(sub, stage_ty) {
     TyFnT([p], _ret, _row) -> {
       let param = apply_ty(sub, p)
-      let container = apply_ty(sub, lhs_ty)
-      # An open param (a bare lambda's, still a metavariable) unifies
-      # with the container for free; only a committed shape is evidence
-      # the user meant apply.
-      let param_open = match param {
-        TyVarT(_) -> true
-        TyAny     -> true
-        _         -> false
-      }
-      # Elem trial FIRST. Unification mutates the shared substitution, so
-      # trying the container first would bind a stage metavariable to the
-      # container (`[?t]` over `[[Int]]` unifies both ways) and poison the
-      # elem trial that decides. A stage that can take the element is the
-      # pipe working as declared; only elem-fail + container-fit is apply
-      # confusion.
-      let takes_elem = match elem {
-        Some(et) -> match unify_env(env, param, apply_ty(sub, et), sub) {
-          Some(_) -> true
-          None    -> false
-        }
-        None -> false
-      }
-      let takes_container = if param_open or takes_elem { false } else {
-        match unify_env(env, param, container, sub) {
-          Some(_) -> true
-          None    -> false
-        }
-      }
-      if takes_container { Some(apply_ty(sub, param)) } else { None }
+      let takes_elem = stage_takes_elem(env, sub, param, elem)
+      if ty_is_flexible(param) or takes_elem { None }
+      else if unify_ok(env, param, apply_ty(sub, lhs_ty), sub) { Some(apply_ty(sub, param)) }
+      else { None }
     }
     _ -> None
   }
-}
+
+# The element trial comes first: unification mutates the shared substitution,
+# so trying the container first would bind a stage metavariable to it and
+# poison the trial that decides. An open param (a bare lambda's) unifies with
+# the container for free and is no evidence the user meant apply.
+fn stage_takes_elem(env: TyEnv, sub: Subst, param: Ty, elem: Option[Ty]) : Bool / Mutable =
+  match elem {
+    Some(et) -> unify_ok(env, param, apply_ty(sub, et), sub)
+    None -> false
+  }
+
+fn unify_ok(env: TyEnv, a: Ty, b: Ty, sub: Subst) : Bool / Mutable =
+  match unify_env(env, a, b, sub) {
+    Some(_) -> true
+    None -> false
+  }
 
 
 # `|!` runs its stage for effect, so the stage returns `Unit`, checked at
@@ -710,73 +694,46 @@ pub fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col:
 }
 
 
-fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File {
-
+fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File =
   if has_catch_all(arms) { st }
   else {
     match scr_ty {
-      TyCon(scr_sym, _) -> {
-        # The declaration decides: a type spelled alike elsewhere, of
-        # any arity, has its own constructors.
-        let needed = match_needs(st, scr_sym)
-        match needed {
-          [] -> st                     # unknown sum (e.g. Int, lists): skip
-          _  -> {
-            # under dual representation a `type
-            # T = A | B` decl registers `A` and `B` as zero-arg
-            # variants of `T`. When the user wrote a `PNarrow(_,C)`
-            # arm targeting one of those names, the match is a
-            # union-of-types form; recurse per-component so a
-            # narrowing arm covers every variant of that component
-            # transparently. When NO arm is a PNarrow we keep
-            # today's flat exhaustiveness — narrowing has not been
-            # used and reverting protects existing match shapes
-            # (regular sum types whose variant names happen to
-            # collide with other top-level type names — e.g.
-            # `ExprKind`'s variant `EVar` and the unrelated
-            # `type EVar = EV(...)` decl).
-            #
-            # also recurse per-component when the
-            # scrutinee tycon is itself declared as a union
-            # (`type ErrAB = ErrA | ErrB`), regardless of arm shape.
-            # Without this, a match enumerating every variant of
-            # every component is reported as "missing ErrA, ErrB"
-            # because the flat path looks for arms named after the
-            # components themselves. The union-decl test relies on
-            # `env.unions`, which records explicit union parents
-            # only — collision shapes (`type EVar = ...` whose name
-            # collides with another type's variant) are NOT in
-            # `env.unions`, so this trigger preserves the existing
-            # flat behavior for those.
-            if any_arm_is_narrow(arms) or is_union_of_types(st.env, scr_sym) {
-              check_union_components_under_tycon(st, arms, scr_sym, needed, line, col)
-            } else {
-              let missing = need_names(st.env.tab, find_missing_variants(st, needed, arms, []))
-              match missing {
-                [] -> st
-                _  -> {
-                  let header = "non-exhaustive match on #{decl_name(st.env.tab, scr_sym)}: missing #{inf_join_with(missing, ", ")}"
-                  diag_error(st.file, line, col, header)
-                  let covered = need_names(st.env.tab, find_covered_variants(st, needed, arms, []))
-                  emit_nonexhaustive_notes(missing, covered)
-                  # T2 collected diagnostic.
-                  let d = build_nonexhaustive_diag(st.file, line, col, header, missing, covered)
-                  st_bump_err(st_push_diag(st, d))
-                }
-              }
-            }
-          }
-        }
-      }
+      TyCon(scr_sym, _) -> check_sum_exhaustive(st, arms, scr_sym, line, col)
       TyListT(_) -> check_list_exhaustive(st, arms, line, col)
-      # walk union components. A component is
-      # covered if (a) a `PNarrow(_, T)` arm targets the whole
-      # component, or (b) every variant of that component is covered
-      # by a `PVariant`-style arm. Diagnostics name the
-      # component-of-origin so the user knows which `type T = ...`
-      # declaration the missing variant belongs to.
       TyUnion(parts) -> check_union_exhaustive(st, arms, parts, line, col)
       _ -> st
+    }
+  }
+
+# The declaration decides which constructors are needed: a type spelled alike
+# elsewhere, of any arity, has its own. A `PNarrow` arm, or a scrutinee
+# declared as a union of types, switches to per-component checking; a regular
+# sum whose variant names collide with other type names keeps the flat check.
+fn check_sum_exhaustive(st: InferState, arms: [Arm], scr_sym: SymId, line: Int, col: Int) : InferState / Console + File {
+  let needed = match_needs(st, scr_sym)
+  match needed {
+    [] -> st
+    _ ->
+      if any_arm_is_narrow(arms) or is_union_of_types(st.env, scr_sym) {
+        check_union_components_under_tycon(st, arms, scr_sym, needed, line, col)
+      } else {
+        report_missing_ctors(st, arms, scr_sym, needed, line, col)
+      }
+  }
+}
+
+fn report_missing_ctors(st: InferState, arms: [Arm], scr_sym: SymId, needed: [SumVar],
+                        line: Int, col: Int) : InferState / Console + File {
+  let missing = need_names(st.env.tab, find_missing_variants(st, needed, arms, []))
+  match missing {
+    [] -> st
+    _ -> {
+      let header = "non-exhaustive match on #{decl_name(st.env.tab, scr_sym)}: missing #{inf_join_with(missing, ", ")}"
+      diag_error(st.file, line, col, header)
+      let covered = need_names(st.env.tab, find_covered_variants(st, needed, arms, []))
+      emit_nonexhaustive_notes(missing, covered)
+      let d = build_nonexhaustive_diag(st.file, line, col, header, missing, covered)
+      st_bump_err(st_push_diag(st, d))
     }
   }
 }
@@ -801,51 +758,49 @@ fn check_union_exhaustive(st: InferState, arms: [Arm], parts: [Ty],
 
 
 fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
-                           line: Int, col: Int) : InferState / Console + File {
-
-
+                         line: Int, col: Int) : InferState / Console + File =
   match comp {
-    TyCon(csym, _) -> {
+    TyCon(csym, _) ->
       if arms_cover_narrow(st, arms, csym) { st }
       else {
         let needed = match_needs(st, csym)
         match needed {
-          [] -> st       # not a sum component (record / primitive); skip
-          _  -> {
-            let missing = need_names(st.env.tab, find_missing_variants(st, needed, arms, []))
-            match missing {
-              [] -> st
-              _  -> {
-                let tycon = written_text(decl_name(st.env.tab, csym))
-                let header = "non-exhaustive match: missing #{inf_join_with(missing, ", ")} (component of #{tycon})"
-                diag_error(st.file, line, col, header)
-                let covered = need_names(st.env.tab, find_covered_variants(st, needed, arms, []))
-                emit_missing_notes(missing)
-                match covered {
-                  [] -> ()
-                  _  -> diag_note("covered: #{inf_join_with(covered, ", ")}")
-                }
-                let help_msg = "add an arm for each missing variant, a `name : #{tycon}` narrowing arm covering the whole component, or a wildcard `_` arm"
-                diag_help(help_msg)
-                # T2 collected diagnostic (union component path).
-                let miss_notes = map(missing, (m) => ri_note(st.file, line, col, "missing variant: `#{m}`"))
-                let cov_notes = match covered {
-                  [] -> []
-                  _  -> [ri_note(st.file, line, col, "covered: #{inf_join_with(covered, ", ")}")]
-                }
-                let related = list_append(miss_notes,
-                                list_append(cov_notes,
-                                  [ri_help(st.file, line, col, help_msg)]))
-                let d = mk_diag(SevError, st.file, line, col, header, related)
-                st_bump_err(st_push_diag(st, d))
-              }
-            }
-          }
+          [] -> st
+          _ -> report_missing_in_component(st, needed, arms, written_text(decl_name(st.env.tab, csym)), line, col)
         }
       }
-    }
-    _ -> st              # non-nominal component (record / primitive / nested union): skip
+    _ -> st
   }
+
+# Reports the variants of a union component no arm covers, with the ones
+# that are covered as context.
+fn report_missing_in_component(st: InferState, needed: [SumVar], arms: [Arm], comp_name: String,
+                               line: Int, col: Int) : InferState / Console + File {
+  let missing = need_names(st.env.tab, find_missing_variants(st, needed, arms, []))
+  match missing {
+    [] -> st
+    _ -> {
+      let header = "non-exhaustive match: missing #{inf_join_with(missing, ", ")} (component of #{comp_name})"
+      diag_error(st.file, line, col, header)
+      let covered = need_names(st.env.tab, find_covered_variants(st, needed, arms, []))
+      emit_missing_notes(missing)
+      note_covered(covered)
+      let help_msg = "add an arm for each missing variant, a `name : #{comp_name}` narrowing arm covering the whole component, or a wildcard `_` arm"
+      diag_help(help_msg)
+      let miss_notes = map(missing, (m) => ri_note(st.file, line, col, "missing variant: `#{m}`"))
+      let cov_notes = match covered {
+        [] -> []
+        _ -> [ri_note(st.file, line, col, "covered: #{inf_join_with(covered, ", ")}")]
+      }
+      let related = list_append(miss_notes, list_append(cov_notes, [ri_help(st.file, line, col, help_msg)]))
+      st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, header, related)))
+    }
+  }
+}
+
+fn note_covered(covered: [String]) : Unit / Console = match covered {
+  [] -> ()
+  _ -> diag_note("covered: #{inf_join_with(covered, ", ")}")
 }
 
 
@@ -870,68 +825,34 @@ fn check_union_components_under_tycon(st: InferState, arms: [Arm], psym: SymId,
 
 
 fn check_one_union_comp(st: InferState, arms: [Arm], psym: SymId, v: SumVar,
-                          line: Int, col: Int) : InferState / Console + File {
-
-
+                        line: Int, col: Int) : InferState / Console + File {
   let csym = match v { SumVar(_, t) -> t }
   let comp = written_text(decl_name(st.env.tab, sum_var_ctor(v)))
   if arms_cover_narrow(st, arms, csym) { st }
   else {
-    # If the variant stands for a declared type with its own variants,
-    # this is a component of a union-of-types decl. Walk its
-    # variants and require each to be covered.
     let sub_variants = match_needs(st, csym)
     match sub_variants {
-      [] -> {
-        # Atomic variant of `parent` — direct coverage required.
+      [] ->
         if arms_head(arms, sum_var_ctor(v)) or arms_head(arms, csym) { st }
-        else {
-          let parent = written_text(decl_name(st.env.tab, psym))
-          let header = "non-exhaustive match on #{parent}: missing #{comp}"
-          diag_error(st.file, line, col, header)
-          diag_note("missing variant: `#{comp}`")
-          let help_msg = "add an arm `#{comp} -> ...` or a wildcard `_ -> ...`"
-          diag_help(help_msg)
-          # T2 collected diagnostic (atomic variant path).
-          let related = [
-            ri_note(st.file, line, col, "missing variant: `#{comp}`"),
-            ri_help(st.file, line, col, help_msg)
-          ]
-          let d = mk_diag(SevError, st.file, line, col, header, related)
-          st_bump_err(st_push_diag(st, d))
-        }
-      }
-      _ -> {
-        let missing = need_names(st.env.tab, find_missing_variants(st, sub_variants, arms, []))
-        match missing {
-          [] -> st
-          _  -> {
-            let header = "non-exhaustive match: missing #{inf_join_with(missing, ", ")} (component of #{comp})"
-            diag_error(st.file, line, col, header)
-            let covered = need_names(st.env.tab, find_covered_variants(st, sub_variants, arms, []))
-            emit_missing_notes(missing)
-            match covered {
-              [] -> ()
-              _  -> diag_note("covered: #{inf_join_with(covered, ", ")}")
-            }
-            let help_msg = "add an arm for each missing variant, a `name : #{comp}` narrowing arm covering the whole component, or a wildcard `_` arm"
-            diag_help(help_msg)
-            # T2 collected diagnostic (component sub-variant path).
-            let miss_notes = map(missing, (m) => ri_note(st.file, line, col, "missing variant: `#{m}`"))
-            let cov_notes = match covered {
-              [] -> []
-              _  -> [ri_note(st.file, line, col, "covered: #{inf_join_with(covered, ", ")}")]
-            }
-            let related = list_append(miss_notes,
-                            list_append(cov_notes,
-                              [ri_help(st.file, line, col, help_msg)]))
-            let d = mk_diag(SevError, st.file, line, col, header, related)
-            st_bump_err(st_push_diag(st, d))
-          }
-        }
-      }
+        else { report_missing_atomic(st, psym, comp, line, col) }
+      _ -> report_missing_in_component(st, sub_variants, arms, comp, line, col)
     }
   }
+}
+
+fn report_missing_atomic(st: InferState, psym: SymId, comp: String,
+                         line: Int, col: Int) : InferState / Console + File {
+  let parent = written_text(decl_name(st.env.tab, psym))
+  let header = "non-exhaustive match on #{parent}: missing #{comp}"
+  diag_error(st.file, line, col, header)
+  diag_note("missing variant: `#{comp}`")
+  let help_msg = "add an arm `#{comp} -> ...` or a wildcard `_ -> ...`"
+  diag_help(help_msg)
+  let related = [
+    ri_note(st.file, line, col, "missing variant: `#{comp}`"),
+    ri_help(st.file, line, col, help_msg)
+  ]
+  st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, header, related)))
 }
 
 
@@ -947,15 +868,6 @@ fn arm_narrows_to(st: InferState, a: Arm, comp: SymId) : Bool = match a {
   }
   _ -> false
 }
-
-
-# A list match is exhaustive when (a) some unguarded arm matches the
-# empty list `[]` and (b) some unguarded arm matches at least one
-# non-empty shape. Any spread-bearing list pattern (`[_, ...rest]`,
-# `[a, b, ...rest]`, …) collectively covers every list of length ≥
-# its fixed portion; requiring one such arm is a pragmatic cover for
-# non-empty. Fixed-length arms alone leave gaps (e.g. `[a]` matches
-# size 1 only) — we flag that.
 
 
 # Walk a typed Expr applying the per-decl substitution to every

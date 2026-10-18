@@ -128,7 +128,6 @@ fn extract_row_holes_loop(holes: [TBinder], fn_name: SymId,
     }
   }
 }
-#                       kind     line col expected scope     env_fresh
 
 
 fn resolve_holes(hs: [HoleSite], sub: Subst, owner: HoleOwner, base: HoleRow) : [ResolvedHole] {
@@ -153,6 +152,40 @@ fn fn_hole_row(st: InferState, entry: Bool, row: RowExpr) : HoleRow = match row 
 }
 
 
+type DeclEnv = {
+  file: String,
+  env: TyEnv,
+  core_len: Int,
+  recs: [RecInfo],
+  op_eff_arities: [OpEffArity],
+  type_aliases: [AliasResult],
+  op_to_eff: [OpToEff],
+  sums: [SumInfo],
+  hcar: HandleTab,
+  protos: ProtoView,
+  all_decls: [Decl],
+  kind_theories: [KindTheory]
+}
+
+type FnSite = {
+  is_pub: Bool,
+  fid: FnId,
+  entry: Bool,
+  tparams: [TBinder],
+  tps: [TBinder],
+  tpbinds: [TPBind],
+  rbinds: [RVBind],
+  ps: [Param],
+  opt_ret: Option[TypeExpr],
+  row: RowExpr,
+  line: Int,
+  col: Int
+}
+
+type FnBody = { rb: Inferred, st: InferState, declared_ret: Ty, ret_site: Expr }
+
+type FnRows = { st: InferState, picks: [HomPick] }
+
 fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               op_eff_arities: [OpEffArity],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
@@ -161,297 +194,192 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               all_decls: [Decl],
               kind_theories: [KindTheory],
               d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable {
+  let de = DeclEnv {
+    file: file, env: env, core_len: core_len, recs: recs, op_eff_arities: op_eff_arities,
+    type_aliases: type_aliases, op_to_eff: op_to_eff, sums: sums, hcar: hcar, protos: protos,
+    all_decls: all_decls, kind_theories: kind_theories
+  }
+  infer_decl_in(de, d, verbose)
+}
 
-
+fn infer_decl_in(de: DeclEnv, d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable =
   match d {
-    DFn(is_pub, fid, tparams, ps, opt_ret, row, body, line, col, mo) -> {
+    DFn(_, _, _, _, _, _, _, _, _, _) -> infer_fn_decl(de, d, verbose)
+    DTest(_, body, line, col, _) -> infer_test_decl(de, d, [], body, line, col)
+    DBench(_, body, line, col, _) -> infer_test_decl(de, d, [], body, line, col)
+    DCheck(_, ps, body, line, col, _) -> infer_test_decl(de, d, ps, body, line, col)
+    DConst(is_pub, csym, cte, cbody, mo, line, col) ->
+      infer_const_body(de.file, de.env, de.core_len, de.recs, de.op_eff_arities, de.type_aliases,
+                       de.op_to_eff, de.sums, de.hcar, de.protos, de.kind_theories,
+                       is_pub, csym, cte, cbody, mo, line, col)
+    DProtoLaws(_, inner, _, _, _) -> infer_decl_in(de, inner, verbose)
+    DImplAxiom(_, inner, _, _, _) -> infer_decl_in(de, inner, verbose)
+    DConstructor(inner, _, _) -> infer_decl_in(de, inner, verbose)
+    _ -> untyped_decl(d)
+  }
+
+fn untyped_decl(d: Decl) : TypedDecl =
+  TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
+
+fn infer_test_decl(de: DeclEnv, d: Decl, ps: [Param], body: Expr, line: Int, col: Int) : TypedDecl / Console + File + Mutable =
+  infer_test_body(de.file, de.env, de.core_len, de.recs, de.op_eff_arities, de.type_aliases,
+                  de.op_to_eff, de.sums, de.protos, de.all_decls, de.kind_theories,
+                  ps, body, d, line, col)
+
+fn infer_fn_decl(de: DeclEnv, d: Decl, verbose: Bool) : TypedDecl / Console + File + Mutable =
+  match d {
+    DFn(is_pub, fid, tparams, ps, opt_ret, row, body0, line, col, mo) -> {
+      let env = de.env
       let nm = written_text(decl_name(env.tab, fnid_sym(fid)))
-      # row-variable binding context for this decl. The
-      # bound ids match those produced by fn_scheme_of_decl so the
-      # body's params and any internal references to row-poly user
-      # functions agree with the scheme stored in the env. The
-      # inferencer's row_fresh counter is advanced past the highest
-      # bound id, so future fresh row vars can never alias these.
-      # same idea for tpbinds — fn-level tparams resolve
-      # to small bound ids reused by the inferencer when fresh-
-      # instantiating at call sites.
-      # include row vars sourced only in a `T[..., e]` slot (the
-      # `from_list(...) : Stream[t, e]` case) so the body walk's rbinds
-      # match the registered scheme's; consult `env.row_kind`.
       let rbinds = mk_rvbinds(list_append(collect_decl_rvars(d),
                                           collect_rowkind_args_decl(d, env.row_kind, env_home_view(env, mo))))
-      # the parameters the signature binds without listing them are
-      # among `tparams`, matching the set fn_scheme_of_decl built into
-      # the registered scheme.
-      let effective_tparams = tbs_positional(tparams)
-      let tpbinds = mk_tpbinds(effective_tparams)
-      # Inside its own body a unit parameter is the symbol it is named:
-      # its variable binds to that symbol once the body mentions it.
-      let body = match filter(tparams, tb_is_unit) {
-        [] -> body
-        us -> map_units_expr(body, (u) => unit_named(u, us))
-      }
-      # The per-module fold in `typecheck_program_loop` feeds this
-      # decl's typer only the records / sums its bucket inherits from
-      # upstream modules.
-      let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
-                                                    op_eff_arities, type_aliases, op_to_eff,
-                                                    kind_theories)
-      # install the protocol impl table snapshot so
-      # `synth_binop` can decide whether a (prim, nonprim) /
-      # (nonprim, nonprim cross) pair routes to a registered impl.
-      let st_init1 = st_set_protos(st_set_home(st_init0, mo), protos)
-      # Install the sum-type registry so `synth_binop` can decide
-      # structural-vs-dispatch for `==` / `<` over compound types.
-      let st_init = st_set_sums(st_init1, sums)
-      # reserve one extra row-var id for the phantom row
-      # variable inserted by `fn_scheme_of_decl` into REmpty signatures.
-      # Without this advance, the inferencer's first fresh row var
-      # would alias `phantom_id = len(rbinds)`, which the scheme
-      # already quantifies over.
+      let tps = tbs_positional(tparams)
+      let tpbinds = mk_tpbinds(tps)
       let entry = decl_types_as_entry(env.ty_homes, fid)
-      let phantom_extra = if elaborate_phantom_row(row, entry) { 1 } else { 0 }
-      let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: rbinds }, list_length(rbinds) + phantom_extra)
-      # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
-      # the fresh state starts env.fresh at 0 too. Without bumping the
-      # counter past the tparam ids, the first fresh ty-var minted in
-      # the body (e.g., the result of synth_op_call_with_scheme inside
-      # `pub fn spawn.spawn[T, e](...) = Spawn.spawn(f)`) aliases `T`,
-      # which then fails the return-type unify with an occurs-check
-      # error ("expected: Fiber[?t0], found: ?t0"). Advance the env's
-      # fresh counter past the tpbinds the same way we already advance
-      # the row_fresh counter past the rbinds above.
-      let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(tpbinds)))
-      # parallel to the env.fresh bump above, advance the
-      # unit_fresh counter past any unit-kind tpbinds so fresh uvars
-      # minted while typing the body do not alias the impl-level bound
-      # uvar id (the unifier's `utable_pick_min_var` would otherwise
-      # always select the bound id and bind it to a fresh id, leaving
-      # `x : Real<UVar(N)>` for some chained fresh N — breaking the
-      # body subst map that keys on the bound id from `tparam_id_split`).
-      # The advance alone is not sufficient: even with reserved ids,
-      # `utable_pick_min_var` picks the smallest-id var in the diff,
-      # which is still the bound id when it appears alongside a fresh
-      # one. The post-finalise canonicalisation pass below redirects
-      # the chain endpoint back to the bound id.
-      let unit_tpcount = tparam_unit_count(effective_tparams)
-      let st0b0 = if unit_tpcount > 0 { advance_unit_fresh(st0a, unit_tpcount) } else { st0a }
-      # constrain the reserved tparam uvar ids (0..n-1, in tparam
-      # order) to their declared kinds, so body-side binds of the
-      # tparam var refuse habitants of another kind.
-      let st0b = if unit_tpcount > 0 {
-        st_set_sub(st0b0, subst_add_unit_kinds(st0b0.sub,
-          range_ids(0, unit_tpcount), tparam_unit_kinds(effective_tparams)))
-      } else { st0b0 }
-      let st0r = st_set_sub(st0b, subst_with_rigid(st0b.sub, rigid_tparams(tpbinds, nm)))
-      let added = add_infer_params_with_binds(st0r, ps, tpbinds, rbinds)
-      # when the user omits the return-type
-      # annotation, infer it from the body's actual type. The
-      # `fn x() = expr` form (and `fn x() { ... last_expr }`) signals
-      # "the function's value is the body's value", so forcing TyUnit
-      # would break programs whose tail produces a real value (the
-      # canonical case is `fn main() = { ... 0 }` returning Int).
-      # The scheme registered earlier in `fn_scheme_of_decl` still
-      # assumes TyUnit when opt_ret is None — fine for `main` (never
-      # called from user code); a future pass threading the inferred
-      # return into the scheme is the proper fix for callable helpers.
+      let site = FnSite {
+        is_pub: is_pub, fid: fid, entry: entry, tparams: tparams, tps: tps, tpbinds: tpbinds,
+        rbinds: rbinds, ps: ps, opt_ret: opt_ret, row: row, line: line, col: col
+      }
+      let body = name_unit_tparams(body0, tparams)
+      let added = add_infer_params_with_binds(fn_initial_state(de, site, nm, mo), ps, tpbinds, rbinds)
       let opt_declared = match opt_ret {
         Some(rty) -> Some(resolve_ty_with_binds(rty, tpbinds, rbinds, env.row_kind, env_home_view(env, mo)))
-        None      -> None
+        None -> None
       }
-      # thread the declared return type through the body walk
-      # so `e!` can validate the propagation target. Cleared on entry
-      # to lambda bodies (synth_lambda) — `!` does not propagate from
-      # closures.
       let st_ready = InferState { ...st_set_refine_ctx(st_set_ret_ty(added.st, opt_declared), nm),
                                   decl_row: declared_row_labels(added.st, row) }
-      let what = string_concat("return type of ", nm)
-      let ret_site = return_site_of(body)
-      # when the fn has an annotated return type, drive the
-      # body in check-mode so the expected type reaches every match-arm
-      # via `check_match`. The post-hoc unify below collapses to a
-      # no-op (`apply_ty(sub, expected)` is already pinned), but is
-      # kept for non-match bodies whose synthesised type still needs
-      # the unification step. The synthesise-only behaviour is preserved
-      # exactly when `opt_declared = None`.
-      let rb = match opt_declared {
-        Some(rty) -> check_body_against_ret(st_ready, body, rty, what, ret_site.line, ret_site.col)
-        None      -> synth(st_ready, body)
-      }
-      let rb = match opt_declared {
-        Some(rty) -> if not (rc_mentions(rty) or rc_mentions_in(rb.st.sub, rb.ty)) { rb } else { refine_coerce_tail(rb, rty, concat_all(["return of `", nm, "`"])) }
-        None      -> rb
-      }
-      let declared_ret = match opt_declared {
-        Some(rty) -> rty
-        None      -> rb.ty
-      }
-      let st1 = match opt_declared {
-        Some(rty) -> st_unify(rb.st, rty, rb.ty, what, ret_site.line, ret_site.col)
-        None      -> rb.st
-      }
-      let st1 = if st1.errs > st_ready.errs and tail_is_section(body) { st_hint_section_tail(st1, ret_site) } else { st1 }
-      # shallow region-brand check. The full brand machinery tags every
-      # Fiber[T] / Pid[Msg] handle with the brand of its enclosing
-      # nursery scope and rejects values whose brand has expired. This
-      # check is the pragmatic syntactic approximation: any function
-      # declared OUTSIDE
-      # stdlib/ whose declared return type contains Fiber[T] (at any
-      # nesting depth — list, option, record, etc.) is rejected at
-      # the type-annotation line. Internal stdlib helpers
-      # (spawn.spawn, etc.) are exempt by file-path because they are
-      # the legitimate constructors of Fiber[T] values.
-      let st1e = check_entry_result(st1, entry, apply_ty(st1.sub, declared_ret), ret_site.line, ret_site.col)
-      let st1b = check_no_fiber_escape(st1e, file, fnid_sym(fid), nm, opt_ret, apply_ty(st1.sub, declared_ret), sums, hcar, line, col)
-      # Drop `Mutable` when every demand targets a locally built value
-      # that never escapes; otherwise blame the first demand that does not.
-      let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr, hcar)
-      let st2pre = check_body_row(st1c, nm, entry, fid, row, rbinds, tparams, line, col, all_decls,
-                                  mutable_blame(st1c, ps, rb.expr))
-      # drain the deferred field-access constraints now that
-      # the body's tyvars have settled — `check_body_row` above unified
-      # the inferred effect row against the declared one, so a generic
-      # op's payload tyvar (`?a` in `Repo.find : Option[a]`) is pinned to
-      # the row's concrete `Box`. Each pending `b.field` is resolved
-      # against the now-concrete receiver type, closing the field-vs-UFCS
-      # decision the synth pass had to postpone. The list is in reverse
-      # registration order; drain order does not matter (each constraint
-      # is independent and only extends the substitution / reports an
-      # error). Recurses on its own sub so a field whose result type is
-      # itself the receiver of a later deferred field resolves too.
-      let st2f = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
-                                       decl_row_concrete_labels(row, env_home_view(env, mo)))
-      # the bare calls whose candidates only a settled argument type
-      # tells apart drain after the fields: a call on `b.field` needs
-      # the field's own receiver resolved first.
-      let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
-      let st2 = report_stranded_ops(hd.st, st2f.deferred_homs, [declared_ret, ...added.tys])
-      let _ = if verbose {
-        print_inferred_fn(env.tab, nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
-        print_row_ids(env.tab, nm, st2.row)
-        print_sig_ids(env.tab, nm, row_expr_labels(row))
-      } else { () }
-      # Hanga Roa: tag every call-site instance with the enclosing
-      # DFn's module_origin so downstream consumers (`--dump-mono`,
-      # the monomorphiser, the test runner) can distinguish
-      # instances authored in the user's root file from those that
-      # come through core or other modules.
-      let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
-      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(fnid_sym(fid), map(ps, (p) => p.binder.id)), fn_hole_row(st2, entry, row))
-      # apply the final substitution to every
-      # `Expr.ty` annotation in the body so the post-inference protocol-
-      # call rewrite can read concrete head types from sites whose
-      # `synth` saved a TyVar that later unified with a concrete type
-      # — most visibly the parameters of lambdas passed to generic
-      # higher-order ops (`each`, `map`, `filter`).
-      let final_body0 = hom_retarget(finalise_typed_expr(st2.sub, rb.expr), hd.picks)
-      # canonicalise the body's UVar / TyVarT ids back
-      # to the impl's bound ids. The unifier may have redirected
-      # `UVar(b) -> UVar(f)` (chain through fresh ids) when typing
-      # `unit_name(x)` etc., so post-finalise the body's `Expr.ty`
-      # references the chain endpoint UVar, not the bound id. The
-      # body subst map keys on the bound id (since `tparam_id_split`
-      # numbers them 0..n-1), so without this canonicalisation the
-      # subst is a no-op in the spec body. We compute the redirect
-      # map by chasing each bound id through `st2.sub` and rewriting
-      # any UVar(endpoint) / TyVarT(endpoint) in the body's tys.
-      let split_for_canon = tparam_id_split(effective_tparams)
-      let canon_uvars = build_uvar_canon_map(split_for_canon.uvars, st2.sub, [])
-      let canon_tvars = build_tvar_canon_map(split_for_canon.tvars, st2.sub, [])
-      let final_body = if list_length(canon_uvars) == 0 and list_length(canon_tvars) == 0 {
-        final_body0
-      } else {
-        canon_uvars_expr(canon_tvars_expr(final_body0, canon_tvars), canon_uvars)
-      }
-      # Apply the same canonicalisation to the resolved CSs so the
-      # body subst map (keyed on bound ids 0..n-1) and the recorded
-      # CS tys/units agree. Without this, an inner-call CS in a
-      # polymorphic-flow-through position records the chain endpoint
-      # id and the substitution becomes a no-op for transitive specs.
-      let resolved = if list_length(canon_uvars) == 0 and list_length(canon_tvars) == 0 {
-        resolved0
-      } else {
-        canon_resolved_css(resolved0, canon_tvars, canon_uvars)
-      }
-      # main-row inference. When `main` ships without a
-      # declared row, write the body-performed row back into the
-      # DFn so `emit_main_wrapper` / `main_row_labels` install the
-      # default handlers for every builtin the body uses. Helpers
-      # are not affected — only `main` gets this exception.
-      # extend main's inferred row with effects
-      # reached transitively via helpers. `st2.row` only carries
-      # labels from *direct* op calls (`Stdout.print(x)` /
-      # `print(x)`); helper-only call chains were silent at the
-      # caller level, so the wrapper installed no default handlers
-      # and any `Stdout.print` segfaulted at runtime. The post-
-      # typing walker `collect_call_labels` reads the resolved
-      # callee type at every ECall in the typed body and merges
-      # those labels into the main-only row. Caller-side typing
-      # behaviour is unchanged for non-main fns, so signatures of
-      # higher-order helpers like `inf_map_expr_kind` (which pass
-      # lambdas with effecting bodies) keep their current shape.
-      let final_row = match row {
-        REmpty -> if entry {
-          let extended = collect_call_labels(final_body, st2.row)
-          inferred_main_row(extended)
-        } else { row }
-        _      -> row
-      }
-      let row_holes = extract_row_holes(d, rbinds, st2.sub, st2.row)
-      let stamp = (te: TypeExpr) => resolve_ty_with_binds(te, tpbinds, rbinds, env.row_kind, env_home_view(env, mo))
-      TypedDecl {
-        decl: DFn(is_pub, fid, tparams, stamp_params(ps, stamp), stamp_opt(opt_ret, stamp), stamp_row_with(final_row, stamp),
-                  final_body, line, col, mo),
-        errs: st2.errs,
-        insts: resolved,
-        holes: hole_reports,
-        row_holes: row_holes,
-        diags: finalize_diags(st2.diags),
-        op_res: stamp_op_res_fn(list_reverse(st2.op_res), fid)
-      }
+      let fb = check_fn_body(st_ready, nm, body, opt_declared)
+      let rows = check_fn_rows(de, site, nm, mo, fb, added.tys)
+      finalise_fn_decl(de, d, site, nm, mo, fb, rows, added.tys, verbose)
     }
-    # `test` / `bench` / `check` bodies were previously
-    # returned untyped (the catch-all below), so `try_bare_call_narrow`
-    # (first-arg narrowing) and the protocol-call rewrite — both of
-    # which depend on a typed body — never fired inside them. A bare
-    # cross-module name (`repeat("x", 3)` with both `string.repeat` and
-    # `list.repeat` in scope) then resolved to the wrong candidate. Run
-    # the same body walk a paramless `fn` gets so the typed AST carries
-    # resolved callees. `check` blocks bind their `with`
-    # params first. The body is run like `main`'s REmpty row (the test
-    # harness installs the identical builtin default handlers), so
-    # `print`/`assert` and effecting helpers type without a declared row.
-    DTest(_, body, line, col, _) -> infer_test_body(file, env, core_len, recs,
-      op_eff_arities, type_aliases, op_to_eff, sums, protos, all_decls,
-      kind_theories, [], body, d, line, col)
-    DBench(_, body, line, col, _) -> infer_test_body(file, env, core_len, recs,
-      op_eff_arities, type_aliases, op_to_eff, sums, protos, all_decls,
-      kind_theories, [], body, d, line, col)
-    DCheck(_, ps, body, line, col, _) -> infer_test_body(file, env, core_len, recs,
-      op_eff_arities, type_aliases, op_to_eff, sums, protos, all_decls,
-      kind_theories, ps, body, d, line, col)
-    DConst(is_pub, csym, cte, cbody, mo, line, col) ->
-      infer_const_body(file, env, core_len, recs, op_eff_arities, type_aliases,
-                       op_to_eff, sums, hcar, protos, kind_theories,
-                       is_pub, csym, cte, cbody, mo, line, col)
-    # `#[constructor]` wrapper: type-check the inner fn and unwrap it —
-    # the marker has done its job (the registry was built in
-    # `add_decls_loop`), so the emitter sees a plain `DFn`.
-    DProtoLaws(_, inner, _, _, _) -> infer_decl(file, env, core_len, recs,
-                                            op_eff_arities, type_aliases, op_to_eff,
-                                            sums, hcar, protos, all_decls, kind_theories,
-                                            inner, verbose)
-    DImplAxiom(_, inner, _, _, _) -> infer_decl(file, env, core_len, recs,
-                                            op_eff_arities, type_aliases, op_to_eff,
-                                            sums, hcar, protos, all_decls, kind_theories,
-                                            inner, verbose)
-    DConstructor(inner, _, _) -> infer_decl(file, env, core_len, recs,
-                                            op_eff_arities, type_aliases, op_to_eff,
-                                            sums, hcar, protos, all_decls, kind_theories,
-                                            inner, verbose)
-    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [], row_holes: [], diags: [], op_res: [] }
+    _ -> untyped_decl(d)
+  }
+
+# Inside its own body a unit parameter is the symbol it is named.
+fn name_unit_tparams(body: Expr, tparams: [TBinder]) : Expr =
+  match filter(tparams, tb_is_unit) {
+    [] -> body
+    us -> map_units_expr(body, (u) => unit_named(u, us))
+  }
+
+# The typer state a fn body is walked under. Every counter advances past the
+# ids the registered scheme already quantifies over (row binds, the phantom
+# row of an empty signature, tparams, unit tparams), so a fresh variable
+# minted in the body never aliases a bound one.
+fn fn_initial_state(de: DeclEnv, site: FnSite, nm: String, mo: Option[String]) : InferState / Mutable {
+  let st_init0 = infer_state_new_full_aliases(de.file, de.env, de.core_len, de.recs,
+                                              de.op_eff_arities, de.type_aliases, de.op_to_eff,
+                                              de.kind_theories)
+  let st_init = st_set_sums(st_set_protos(st_set_home(st_init0, mo), de.protos), de.sums)
+  let phantom_extra = if elaborate_phantom_row(site.row, site.entry) { 1 } else { 0 }
+  let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: site.rbinds },
+                              list_length(site.rbinds) + phantom_extra)
+  let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(site.tpbinds)))
+  let st0b = reserve_unit_tparams(st0a, site.tps)
+  st_set_sub(st0b, subst_with_rigid(st0b.sub, rigid_tparams(site.tpbinds, nm)))
+}
+
+# Reserves the unit-kind tparam ids and constrains them to their declared kinds.
+fn reserve_unit_tparams(st: InferState, tps: [TBinder]) : InferState {
+  let n = tparam_unit_count(tps)
+  if n > 0 {
+    let st1 = advance_unit_fresh(st, n)
+    st_set_sub(st1, subst_add_unit_kinds(st1.sub, range_ids(0, n), tparam_unit_kinds(tps)))
+  } else { st }
+}
+
+# With a declared return type the body is checked against it, so the expected
+# type reaches every match arm; without one the body's own type is the return.
+fn check_fn_body(st_ready: InferState, nm: String, body: Expr, opt_declared: Option[Ty]) : FnBody / Console + File + Mutable {
+  let what = string_concat("return type of ", nm)
+  let ret_site = return_site_of(body)
+  let rb0 = match opt_declared {
+    Some(rty) -> check_body_against_ret(st_ready, body, rty, what, ret_site.line, ret_site.col)
+    None -> synth(st_ready, body)
+  }
+  let rb = match opt_declared {
+    Some(rty) ->
+      if not (rc_mentions(rty) or rc_mentions_in(rb0.st.sub, rb0.ty)) { rb0 }
+      else { refine_coerce_tail(rb0, rty, concat_all(["return of `", nm, "`"])) }
+    None -> rb0
+  }
+  let declared_ret = match opt_declared {
+    Some(rty) -> rty
+    None -> rb.ty
+  }
+  let st1 = match opt_declared {
+    Some(rty) -> st_unify(rb.st, rty, rb.ty, what, ret_site.line, ret_site.col)
+    None -> rb.st
+  }
+  let st1h = if st1.errs > st_ready.errs and tail_is_section(body) { st_hint_section_tail(st1, ret_site) } else { st1 }
+  FnBody { rb: rb, st: st1h, declared_ret: declared_ret, ret_site: ret_site }
+}
+
+# The post-body checks, then the drains of what the walk had to postpone: a
+# deferred field is resolved once the declared row has pinned its receiver's
+# type, and a deferred bare call once its argument type settled.
+fn check_fn_rows(de: DeclEnv, site: FnSite, nm: String, mo: Option[String], fb: FnBody, added_tys: [Ty]) : FnRows / Console + File + Mutable {
+  let st1 = fb.st
+  let body = fb.rb.expr
+  let ret_now = apply_ty(st1.sub, fb.declared_ret)
+  let st1e = check_entry_result(st1, site.entry, ret_now, fb.ret_site.line, fb.ret_site.col)
+  let st1b = check_no_fiber_escape(st1e, de.file, fnid_sym(site.fid), nm, site.opt_ret, ret_now,
+                                   de.sums, de.hcar, site.line, site.col)
+  let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, site.ps, body), body, de.hcar)
+  let st2pre = check_body_row(st1c, nm, site.entry, site.fid, site.row, site.rbinds, site.tparams,
+                              site.line, site.col, de.all_decls, mutable_blame(st1c, site.ps, body))
+  let st2f = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
+                                   decl_row_concrete_labels(site.row, env_home_view(de.env, mo)))
+  let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
+  FnRows { st: report_stranded_ops(hd.st, st2f.deferred_homs, [fb.declared_ret, ...added_tys]), picks: hd.picks }
+}
+
+# The final substitution is applied to every `Expr.ty` of the body, then the
+# body's and the call sites' ids are canonicalised back to the impl's bound
+# ids: the unifier may have redirected a bound var through fresh ones.
+fn finalise_fn_decl(de: DeclEnv, d: Decl, site: FnSite, nm: String, mo: Option[String], fb: FnBody, rows: FnRows,
+                    added_tys: [Ty], verbose: Bool) : TypedDecl / Console + File + Mutable {
+  let st2 = rows.st
+  let env = de.env
+  let _ = if verbose {
+    print_inferred_fn(env.tab, nm, apply_ty(st2.sub, fb.declared_ret), apply_tys(st2.sub, added_tys), site.line, site.col)
+    print_row_ids(env.tab, nm, st2.row)
+    print_sig_ids(env.tab, nm, row_expr_labels(site.row))
+  } else { () }
+  let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
+  let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub,
+                                   HOwner(fnid_sym(site.fid), map(site.ps, (p) => p.binder.id)),
+                                   fn_hole_row(st2, site.entry, site.row))
+  let final_body0 = hom_retarget(finalise_typed_expr(st2.sub, fb.rb.expr), rows.picks)
+  let split_for_canon = tparam_id_split(site.tps)
+  let canon_uvars = build_uvar_canon_map(split_for_canon.uvars, st2.sub, [])
+  let canon_tvars = build_tvar_canon_map(split_for_canon.tvars, st2.sub, [])
+  let canonical = list_length(canon_uvars) > 0 or list_length(canon_tvars) > 0
+  let final_body = if canonical { canon_uvars_expr(canon_tvars_expr(final_body0, canon_tvars), canon_uvars) } else { final_body0 }
+  let resolved = if canonical { canon_resolved_css(resolved0, canon_tvars, canon_uvars) } else { resolved0 }
+  let row_holes = extract_row_holes(d, site.rbinds, st2.sub, st2.row)
+  let stamp = (te: TypeExpr) => resolve_ty_with_binds(te, site.tpbinds, site.rbinds, env.row_kind, env_home_view(env, mo))
+  TypedDecl {
+    decl: DFn(site.is_pub, site.fid, site.tparams, stamp_params(site.ps, stamp), stamp_opt(site.opt_ret, stamp),
+              stamp_row_with(main_inferred_row(site, final_body, st2), stamp),
+              final_body, site.line, site.col, mo),
+    errs: st2.errs,
+    insts: resolved,
+    holes: hole_reports,
+    row_holes: row_holes,
+    diags: finalize_diags(st2.diags),
+    op_res: stamp_op_res_fn(list_reverse(st2.op_res), site.fid)
   }
 }
+
+# A `main` without a declared row takes the row its body performs, directly
+# and through the helpers it calls, so the wrapper installs the default
+# handlers for every builtin the body uses. Other fns keep their row.
+fn main_inferred_row(site: FnSite, final_body: Expr, st2: InferState) : RowExpr =
+  match site.row {
+    REmpty -> if site.entry { inferred_main_row(collect_call_labels(final_body, st2.row)) } else { site.row }
+    _ -> site.row
+  }
 
 
 fn infer_test_body(file: String, env: TyEnv, core_len: Int,
@@ -591,35 +519,13 @@ fn check_body_row(st: InferState, fname: String, entry: Bool, f: FnId, declared:
 
 fn check_body_labels(st: InferState, fname: String, entry: Bool, f: FnId, declared: RowExpr,
                      line: Int, col: Int, decls: [Decl], mb: Option[MutBlame]) : InferState / Console + File + Mutable {
-  # every body label must match a declared label by effect AND
-  # unifiable ty_args. An open declared row's tail is the caller's row
-  # variable: it absorbs no label the body performs.
+  # An open declared row's tail is the caller's variable and absorbs nothing
+  # the body performs.
   match declared {
-    REmpty       ->
-      # `fn main() { ... }` without an explicit row absorbs every
-      # builtin effect the body performs. Helpers must still declare
-      # their row — body-row enforcement still bites where it matters.
-      #
-      # `Ffi` is the one builtin that does NOT get a
-      # default handler from `emit_main_wrapper` (it declares zero
-      # ops and is a capability tag, not a handlable effect; per
-      # docs/design.md §Baseline architecture FFI crosses to C via
-      # the Ffi capability). Absorbing it silently would let
-      # `extern "C" fn puts ... / Ffi` called from `main : Unit`
-      # compile cleanly — exactly the silent contract documented in
-      # `examples/negative/silent_contract/ffi_call_no_capability.kai`.
-      # Filter Ffi out of the absorbed set so main must declare
-      # `/ Ffi` explicitly when it performs FFI calls directly.
-      #
-      # main's REmpty branch also absorbed user-defined
-      # effects and any builtin without a runtime default handler.
-      # `effect Net { ... }` called from `main` compiled silently and
-      # SIGSEGV'd at runtime (no handler installed). Reject the same
-      # way Ffi is rejected: only labels with an `emit_main_wrapper`
-      # default handler should be absorbed.
-      # also absorb user-declared effects that carry a
-      # source-level `default { }` block. Stage A's `default_setups_from_block`
-      # wires shims for them at `main`, so the runtime IS evidence-backed.
+    REmpty ->
+      # `main` without a row absorbs only the effects that have a default
+      # handler (a builtin or a source-level `default` block); `Ffi` has none,
+      # so a direct FFI call must declare `/ Ffi`.
       if entry {
         check_body_row_label_loop(st, RowInFn(fname),
                                   only_non_absorbed_labels(st, st.row, decls),
@@ -647,61 +553,54 @@ fn check_body_labels(st: InferState, fname: String, entry: Bool, f: FnId, declar
 }
 
 
-# label-aware body-vs-declared check. For each label the
-# body performed, look for an `eff`-name match in the declared list;
-# unify ty_args with `unify_label_args` (extends the substitution).
-# Unification failure or absence both report "effect not handled" with
-# the parametric label rendered in full, and the notes of `extra`.
+# Each performed label must match a declared label by effect and by
+# unifiable ty_args (the match extends the substitution). A miss reports
+# "effect not handled" with the label rendered in full and the notes of
+# `extra`.
 fn check_body_row_label_loop(st: InferState, sc: RowScope, performed: [Label],
-                              declared: [Label], extra: [String], fline: Int, fcol: Int,
-                              mb: Option[MutBlame]) : InferState / Console + File + Mutable {
+                             declared: [Label], extra: [String], fline: Int, fcol: Int,
+                             mb: Option[MutBlame]) : InferState / Console + File + Mutable =
   match performed {
     [] -> st
     [lab, ...rest] -> {
       let st1 = match find_matching_declared(declared, lab, st) {
         Some(s_after) -> s_after
-        None -> {
-          let blame = if effect_is(lab.sym, CeMutable) { mb } else { None }
-          match blamed_use(st.eff_uses, lab, blame) {
-            EU(_, uline, ucol) -> {
-              let line = if uline >= 0 { uline } else { fline }
-              let col  = if ucol  >= 0 { ucol  } else { fcol  }
-              let applied = apply_label_args(st.sub, lab)
-              let lab_str = label_diag_display(st, applied)
-              # Template 5 — missing effect. Header keeps the
-              # legacy "effect not handled: <label>" wording so all
-              # prior fixtures still match; the shape notes
-              # surface the enclosing function's actual row and split
-              # the help into two actionable lines (declare-the-effect
-              # vs handle-locally) instead of the single combined hint.
-              let header = string_concat("effect not handled: ", lab_str)
-              diag_error(st.file, line, col, header)
-              let n1 = scope_row_note(sc, lab_str)
-              let n2 = "missing effect: `#{lab_str}`"
-              let n3 = scope_row_line(sc, st.env.tab, declared)
-              let helps = [scope_row_help(sc, lab_str, any(applied.ty_args, (t) => ty_is_free_var(st.sub, t)))]
-              diag_note(n1)
-              diag_note(n2)
-              foreach(n3, (n) => diag_note(n))
-              let vias = blame_via_notes(blame)
-              foreach(vias, (v) => match v { SN(vl, vc, m) -> { diag_note(m)  emit_source_caret(st.file, vl, vc) } })
-              foreach(extra, (n) => diag_note(n))
-              foreach(helps, (h) => diag_help(h))
-              # T5 collected diagnostic.
-              let related = list_append([
-                ri_note(st.file, line, col, n1),
-                ri_note(st.file, line, col, n2),
-                ...map(n3, (n) => ri_note(st.file, line, col, n)),
-                ...map(vias, (v) => match v { SN(vl, vc, m) -> ri_note(st.file, vl, vc, m) }),
-                ...map(extra, (n) => ri_note(st.file, line, col, n))
-              ], map(helps, (h) => ri_help(st.file, line, col, h)))
-              let d = mk_diag(SevError, st.file, line, col, header, related)
-              st_bump_err(st_push_diag(st, d))
-            }
-          }
-        }
+        None -> report_unhandled_label(st, sc, lab, declared, extra, fline, fcol, mb)
       }
       check_body_row_label_loop(st1, sc, rest, declared, extra, fline, fcol, mb)
+    }
+  }
+
+fn report_unhandled_label(st: InferState, sc: RowScope, lab: Label, declared: [Label], extra: [String],
+                          fline: Int, fcol: Int, mb: Option[MutBlame]) : InferState / Console + File + Mutable {
+  let blame = if effect_is(lab.sym, CeMutable) { mb } else { None }
+  match blamed_use(st.eff_uses, lab, blame) {
+    EU(_, uline, ucol) -> {
+      let line = if uline >= 0 { uline } else { fline }
+      let col = if ucol >= 0 { ucol } else { fcol }
+      let applied = apply_label_args(st.sub, lab)
+      let lab_str = label_diag_display(st, applied)
+      let header = string_concat("effect not handled: ", lab_str)
+      diag_error(st.file, line, col, header)
+      let n1 = scope_row_note(sc, lab_str)
+      let n2 = "missing effect: `#{lab_str}`"
+      let n3 = scope_row_line(sc, st.env.tab, declared)
+      let helps = [scope_row_help(sc, lab_str, any(applied.ty_args, (t) => ty_is_free_var(st.sub, t)))]
+      diag_note(n1)
+      diag_note(n2)
+      foreach(n3, (n) => diag_note(n))
+      let vias = blame_via_notes(blame)
+      foreach(vias, (v) => match v { SN(vl, vc, m) -> { diag_note(m)  emit_source_caret(st.file, vl, vc) } })
+      foreach(extra, (n) => diag_note(n))
+      foreach(helps, (h) => diag_help(h))
+      let related = list_append([
+        ri_note(st.file, line, col, n1),
+        ri_note(st.file, line, col, n2),
+        ...map(n3, (n) => ri_note(st.file, line, col, n)),
+        ...map(vias, (v) => match v { SN(vl, vc, m) -> ri_note(st.file, vl, vc, m) }),
+        ...map(extra, (n) => ri_note(st.file, line, col, n))
+      ], map(helps, (h) => ri_help(st.file, line, col, h)))
+      st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, header, related)))
     }
   }
 }
