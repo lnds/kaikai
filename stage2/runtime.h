@@ -9585,6 +9585,68 @@ static KaiValue *kai_seq_force_far(KaiValue *s, KaiValue **slot) {
     return step;
 }
 
+/* The body of a deep call moved to a fresh segment: the callee and its
+ * arguments leave the closure, so the call holds their only references. */
+static KaiValue *kai_deep_apply_held(KaiValue *self, KaiValue **args, int n) {
+    (void) args; (void) n;
+    int argc = self->as.clo.n_captures - 1;
+    KaiValue *f = self->as.clo.captures[0];
+    KaiValue *argv[2] = { NULL, NULL };
+    for (int i = 0; i < argc; ++i) {
+        argv[i] = self->as.clo.captures[i + 1];
+        self->as.clo.captures[i + 1] = NULL;
+    }
+    self->as.clo.captures[0] = NULL;
+    KaiValue *r = kai_apply_borrow(f, argc, argv);
+    kai_decref(f);
+    return r;
+}
+
+/* Apply `f` to `argc` (1 or 2) owned arguments, on a fresh segment once
+ * the running stack is past half used; consumes `f`. A callee that
+ * suspends aborts, as a lazy cell's thunk does. */
+__attribute__((noinline))
+static KaiValue *kai_deep_apply_far(KaiValue *f, int argc, KaiValue **argv, KaiValue **held) {
+    KaiValue *caps[3] = { f, argv[0], argc > 1 ? argv[1] : NULL };
+    KaiValue *body = kai_closure(kai_deep_apply_held, 0, argc + 1, caps);
+    kai_decref(f);
+    for (int i = 0; i < argc; ++i) kai_decref(argv[i]);
+    held[0] = NULL;
+    held[1] = body;
+    KaiValue *r = kai_seq_apply_far(body);
+    held[1] = NULL;
+    kai_decref(body);
+    return r;
+}
+
+static KaiValue *kai_deep_apply(KaiValue *f, int argc, KaiValue **argv) {
+    KaiValue *held[2] = { f, NULL };
+    KaiFiber *uf = kai_unw_push(held, 2);
+    KaiValue *r;
+    if (kai_seq_deep(uf)) {
+        r = kai_deep_apply_far(f, argc, argv, held);
+        kai_unw_pop(uf);
+    } else {
+        r = kai_apply_borrow(f, argc, argv);
+        kai_unw_pop(uf);
+        kai_decref(f);
+    }
+    return r;
+}
+
+/* `__deep_apply1(x, f)` / `__deep_apply2(x, p, f)`: `f(x)` / `f(x, p)`,
+ * continued over a fresh stack segment when the running one is past half
+ * used, so a recursion through `f` is bounded by memory, not by the stack. */
+static KaiValue *kai_core___deep_apply1(KaiValue *x, KaiValue *f) {
+    KaiValue *argv[1] = { x };
+    return kai_deep_apply(f, 1, argv);
+}
+
+static KaiValue *kai_core___deep_apply2(KaiValue *x, KaiValue *p, KaiValue *f) {
+    KaiValue *argv[2] = { x, p };
+    return kai_deep_apply(f, 2, argv);
+}
+
 /* The first step of `s` whose head satisfies every predicate, with the
  * rest filtered in turn; consumes `s`, borrows the predicates. `own` is
  * the stage being read when the reader holds its only reference: it
@@ -11981,6 +12043,8 @@ static KaiValue *_kai_core_map_thunk(KaiValue *s, KaiValue **a, int n)          
 static KaiValue *_kai_core_flat_map_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_flat_map(a[0], a[1]); }
 static KaiValue *_kai_core_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_filter(a[0], a[1]); }
 static KaiValue *_kai_core_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_reduce(a[0], a[1], a[2]); }
+static KaiValue *_kai_core___deep_apply1_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core___deep_apply1(a[0], a[1]); }
+static KaiValue *_kai_core___deep_apply2_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core___deep_apply2(a[0], a[1], a[2]); }
 static KaiValue *_kai_core_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_core_each(a[0], a[1]); }
 static KaiValue *_kai_core_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_core_args(); }
 static KaiValue *_kai_core_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_program_name(); }
