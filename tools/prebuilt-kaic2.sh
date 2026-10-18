@@ -4,8 +4,9 @@
 #   tools/prebuilt-kaic2.sh build [<ref>]    build kaic2 + bin/kai at <ref> (default origin/main)
 #                                            once, native-capable where llvm-config is found,
 #                                            and store it by commit
-#   tools/prebuilt-kaic2.sh seed [<worktree>] give a worktree (default .) the stored build of its
-#                                            HEAD; with none, the newest stored one rebuilt by
+#   tools/prebuilt-kaic2.sh seed [<worktree>] give a worktree (default .) the build of the commit
+#                                            it branched from origin/main at, building it first
+#                                            when missing; local commits on top are rebuilt by
 #                                            `make kaic2-fast` (C backend only)
 #   tools/prebuilt-kaic2.sh has [<ref>]      exit 0 iff a build of <ref> is stored
 #
@@ -25,7 +26,7 @@ FILES=(
 
 die() { echo "prebuilt-kaic2: $*" >&2; exit 2; }
 sha_of() { git -C "$REPO" rev-parse --verify "${1:-origin/main}^{commit}"; }
-stored() { ls -1td "$STORE"/*/ 2>/dev/null | grep -v '/tree/$' || true; }
+stored() { ls -1td "$STORE"/*/ 2>/dev/null | grep -vE '/(tree|lock)/$|\.tmp/$' || true; }
 
 copy_files() { # from-root to-root
   local f
@@ -58,10 +59,22 @@ llvm_env() {
   return 1
 }
 
+# One build at a time per store: concurrent seeds of a missing commit wait for the first.
+with_lock() {
+  mkdir -p "$STORE"
+  until mkdir "$STORE/lock" 2>/dev/null; do sleep 5; done
+  trap 'rmdir "$STORE/lock" 2>/dev/null' EXIT
+  "$@"
+  rmdir "$STORE/lock"; trap - EXIT
+}
+
 cmd_build() {
-  local sha tree out env=() native=0 line
   git -C "$REPO" fetch -q origin
-  sha="$(sha_of "${1:-origin/main}")"
+  with_lock build_locked "$(sha_of "${1:-origin/main}")"
+}
+
+build_locked() {
+  local sha="$1" tree out env=() native=0 line
   [ -x "$STORE/$sha/stage2/kaic2" ] && { echo "prebuilt-kaic2: $sha already stored"; return 0; }
   if out="$(llvm_env)"; then
     native=1
@@ -85,21 +98,22 @@ cmd_build() {
   echo "prebuilt-kaic2: stored $sha ($([ $native = 1 ] && echo native-capable || echo C backend only))"
 }
 
+# An older commit's kaic2 may not compile a newer tree, so a worktree is seeded only
+# from the build of its own base commit.
 cmd_seed() {
-  local wt="${1:-.}" sha newest
-  sha="$(git -C "$wt" rev-parse HEAD)"
-  if [ -x "$STORE/$sha/stage2/kaic2" ]; then
-    copy_files "$STORE/$sha" "$wt"
-    touch_chain "$wt"
-    echo "prebuilt-kaic2: restored the build of $sha"
-    return 0
-  fi
-  newest="$(stored | head -1)"
-  [ -n "$newest" ] && [ -x "$newest/stage2/kaic2" ] || die "nothing stored; run make kaic2"
-  copy_files "${newest%/}" "$wt"
+  local wt="${1:-.}" head base
+  head="$(git -C "$wt" rev-parse HEAD)"
+  git -C "$REPO" fetch -q origin
+  base="$(git -C "$wt" merge-base HEAD origin/main)"
+  [ -x "$STORE/$base/stage2/kaic2" ] || with_lock build_locked "$base"
+  copy_files "$STORE/$base" "$wt"
   touch_chain "$wt"
-  (cd "$wt" && make kaic2-fast bin/kai >/dev/null)
-  echo "prebuilt-kaic2: seeded from $(basename "$newest") and rebuilt by kaic2-fast (C backend only)"
+  if [ "$head" = "$base" ]; then
+    echo "prebuilt-kaic2: restored the build of $base"
+  else
+    (cd "$wt" && make kaic2-fast bin/kai >/dev/null)
+    echo "prebuilt-kaic2: restored the build of $base and rebuilt local commits by kaic2-fast (C backend only)"
+  fi
 }
 
 case "${1:-}" in
