@@ -1,8 +1,22 @@
-#[doc("Typing of the value forms an expression builds or coerces: record and list literals, lambdas, refinement and constructor coercions, and the branches of an if that name a constructor.")]
+#[doc("Typing of patterns and of the value forms an expression builds or coerces: record and list literals, lambdas, and refinement and constructor coercions.")]
 
 import compiler.util
 import compiler.diag
 import compiler.ast
+import compiler.resolve_names
+import compiler.entry
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_clause_holes
+import compiler.infer_arms_vec
+import compiler.infer_env_exhaust
+import compiler.infer_dump_text
+import compiler.infer_apply
+import compiler.infer_instantiate
+import compiler.infer_fuse_arith
 import compiler.written
 import compiler.local_names
 import compiler.handler_alias
@@ -16,22 +30,315 @@ import compiler.lit_mint
 import compiler.infer_unit_alias
 import compiler.tycon_ref
 import compiler.record_head
-import compiler.infer_glue
-import compiler.infer_env
-import compiler.infer_row_kinds
 import compiler.infer_unit_tables
-import compiler.infer_state
-import compiler.infer_call_labels
-import compiler.infer_clause_holes
 import compiler.infer_local_mutation
-import compiler.infer_arms_vec
-import compiler.infer_env_exhaust
-import compiler.infer_dump_text
-import compiler.infer_apply
-import compiler.infer_instantiate
 import compiler.infer_tparam_escape
-import compiler.infer_fuse_arith
-import compiler.infer_patterns
+
+#[doc("Typer-internal helper `check_pattern` shared across the infer modules.")]
+pub fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Console + File + Mutable =
+  check_pattern_stamped(st, pat, expected).st
+
+
+
+#[doc("Typer-internal helper `check_pattern_stamped` shared across the infer modules.")]
+pub fn check_pattern_stamped(st: InferState, pat: Pattern, expected: Ty) : PatChecked / Console + File + Mutable {
+
+
+  match pat.pkind {
+    PWild      -> PatChecked { st: st, pat: pat }
+    PBind(b)   -> {
+      let env2 = env_bind_local(st.env, b, mono(apply_ty(st.sub, expected)))
+      PatChecked { st: st_set_env(st, env2), pat: pat }
+    }
+    PLit(lit)  -> {
+      let r = w_synth(st, lit)
+      PatChecked { st: st_unify(r.st, expected, r.ty, "literal pattern", pat.line, pat.col), pat: pat }
+    }
+    # `PRange` is desugared to a binder + comparison guard before the
+    # typer runs, so it never reaches here.
+    PRange(_, _) -> PatChecked { st: st, pat: pat }
+    PList(subpats, rest_opt) -> {
+      let rv = st_fresh_ty(st)
+      let s1 = st_unify(rv.st, expected, TyListT(rv.ty), "list pattern", pat.line, pat.col)
+      let subs = check_list_subpats(s1, subpats, rv.ty)
+      let s2 = subs.st
+      let s3 = match rest_opt {
+        None -> s2
+        Some(rb) -> {
+          let env2 = env_bind_local(s2.env, rb, mono(TyListT(apply_ty(s2.sub, rv.ty))))
+          st_set_env(s2, env2)
+        }
+      }
+      PatChecked { st: s3, pat: mk_pat(PList(subs.pats, rest_opt), pat.line, pat.col) }
+    }
+    PVariant(r, sub_pats) ->
+      check_variant_pattern(st, r, sub_pats, expected, pat.line, pat.col)
+    PVariantRecord(r, pfs) ->
+      check_variant_record_pattern(st, r, pfs, expected, pat.line, pat.col)
+    PRecord(pfs) -> {
+      let fs = check_record_pattern(st, pfs, expected, pat.line, pat.col)
+      PatChecked { st: fs.st, pat: mk_pat(PRecord(fs.fields), pat.line, pat.col) }
+    }
+    PHole(nm_opt) -> PatChecked { st: check_hole_pattern(st, nm_opt, expected, pat.line, pat.col), pat: pat }
+    # bind the as-name to the scrutinee at the *expected*
+    # type, then continue typing the inner pattern at the same type.
+    # The inner pattern owns its own bindings; the as-binding adds
+    # one more name that aliases the whole scrutinee.
+    PAs(b, sub) -> {
+      let env2 = env_bind_local(st.env, b, mono(apply_ty(st.sub, expected)))
+      let inner = check_pattern_stamped(st_set_env(st, env2), sub, expected)
+      PatChecked { st: inner.st, pat: mk_pat(PAs(b, inner.pat), pat.line, pat.col) }
+    }
+    # type-narrowing pattern. The scrutinee must
+    # be a `TyUnion` containing the narrow type as a component; bind
+    # `name` at the narrow type so the arm body can call APIs that
+    # accept the component directly. Exhaustiveness treats this as
+    # full coverage of the component's variants (see
+    # `check_exhaustive`). Codegen never sees `PNarrow` — it is
+    # rewritten to a sequence of `PAs(name, PVariant(Vi, []))` arms
+    # in `expand_narrow_arms` after typing.
+    PNarrow(b, ty_expr) -> PatChecked { st: check_narrow_pattern(st, b, ty_expr, expected, pat.line, pat.col), pat: pat }
+    PSurface(_) -> panic("check_pattern: surface pattern not lowered")
+  }
+}
+
+
+
+fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : PatsChecked / Console + File + Mutable {
+
+
+  match ps {
+    [] -> PatsChecked { st: st, pats: [] }
+    [p, ...rest] -> {
+      let h = check_pattern_stamped(st, p, elem)
+      let t = check_list_subpats(h.st, rest, elem)
+      PatsChecked { st: t.st, pats: [h.pat, ...t.pats] }
+    }
+  }
+}
+
+
+
+# A pattern head the scope cannot tell apart: reported, and its
+# sub-patterns typed against nothing.
+fn check_tied_pattern(st: InferState, r: DeclRef, ss: [SymId], subpats: [Pattern], line: Int, col: Int) : PatChecked / Console + File + Mutable = {
+  let st1 = match r {
+    DrWritten(_, w) -> report_name_tie(st, w, ss, not list_is_empty(subpats), line, col)
+    DrSym(_)        -> st
+  }
+  let subs = check_unknown_subpats(st1, subpats)
+  PatChecked { st: subs.st, pat: mk_pat(PVariant(r, subs.pats), line, col) }
+}
+
+
+
+fn check_variant_pattern(st: InferState, r: DeclRef, subpats: [Pattern], expected: Ty, line: Int, col: Int) : PatChecked / Console + File + Mutable {
+
+
+  let cname = ref_text(st.env.tab, r)
+  let picked = match pattern_ctor(st, r, expected) {
+    SetOne(c)  -> PcOne(ctor_entry(st.env, c))
+    SetTie(ss) -> PcTie(ss)
+    _          -> PcOne(None)
+  }
+  match picked {
+    PcTie(ss) -> check_tied_pattern(st, r, ss, subpats, line, col)
+    PcOne(None) -> {
+      let hint = match closest_name(cname, env_ctor_names(st.env)) {
+        Some(sug) -> " (did you mean `#{sug}`?)"
+        None      -> ""
+      }
+      let perr = mk_diag(SevError, st.file, line, col, "unknown variant '#{cname}'#{hint}", [])
+      render_diag(perr)
+      let subs = check_unknown_subpats(st_bump_err(st_push_diag(st, perr)), subpats)
+      PatChecked { st: subs.st, pat: mk_pat(PVariant(r, subs.pats), line, col) }
+    }
+    PcOne(Some(CtorPick(c, entry))) -> {
+      let inst = st_instantiate(st, entry.scheme)
+      match inst.ty {
+        TyFnT(aps, ret, _) -> {
+          let what = string_concat("variant pattern '", string_concat(cname, "'"))
+          let s1 = st_unify(inst.st, expected, ret, what, line, col)
+          let subs = check_subpat_list(s1, subpats, aps, line, col)
+          PatChecked { st: subs.st, pat: mk_pat(PVariant(DrSym(c), subs.pats), line, col) }
+        }
+        _ -> {
+          let what = string_concat("variant pattern '", string_concat(cname, "'"))
+          let s1 = st_unify(inst.st, expected, inst.ty, what, line, col)
+          match subpats {
+            [] -> PatChecked { st: s1, pat: mk_pat(PVariant(DrSym(c), []), line, col) }
+            _  -> {
+              let perr = mk_diag(SevError, st.file, line, col, "variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}", [])
+              render_diag(perr)
+              PatChecked { st: st_bump_err(st_push_diag(s1, perr)), pat: mk_pat(PVariant(DrSym(c), subpats), line, col) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+fn check_unknown_subpats(st: InferState, ps: [Pattern]) : PatsChecked / Console + File + Mutable {
+
+
+  match ps {
+    [] -> PatsChecked { st: st, pats: [] }
+    [p, ...rest] -> {
+      let h = check_pattern_stamped(st, p, TyAny)
+      let t = check_unknown_subpats(h.st, rest)
+      PatsChecked { st: t.st, pats: [h.pat, ...t.pats] }
+    }
+  }
+}
+
+
+
+fn check_subpat_list(st: InferState, ps: [Pattern], tys: [Ty], line: Int, col: Int) : PatsChecked / Console + File + Mutable {
+
+
+  variant_arity_check(st, ps, tys, line, col, list_length(tys), list_length(ps))
+}
+
+
+
+fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
+                        line: Int, col: Int, expected: Int, found: Int) : PatsChecked / Console + File + Mutable {
+
+
+  match ps {
+    [] -> match tys {
+      [] -> PatsChecked { st: st, pats: [] }
+      _  -> {
+        let perr = mk_diag(SevError, st.file, line, col, "variant pattern has too few sub-patterns", [])
+        render_diag(perr)
+        diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
+        diag_help("add #{int_to_string(expected - found)} more sub-pattern(s), or use a wildcard `_` for each")
+        PatsChecked { st: st_bump_err(st_push_diag(st, perr)), pats: [] }
+      }
+    }
+    [p, ...pr] -> match tys {
+      [] -> {
+        let perr = mk_diag(SevError, st.file, line, col, "variant pattern has too many sub-patterns", [])
+        render_diag(perr)
+        diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
+        diag_help("remove #{int_to_string(found - expected)} sub-pattern(s) so the count matches the variant's declared arity")
+        PatsChecked { st: st_bump_err(st_push_diag(st, perr)), pats: ps }
+      }
+      [t, ...tr] -> {
+        let h = check_pattern_stamped(st, p, t)
+        let r = variant_arity_check(h.st, pr, tr, line, col, expected, found)
+        PatsChecked { st: r.st, pats: [h.pat, ...r.pats] }
+      }
+    }
+  }
+}
+
+
+
+# `Name { fields }` names a record type; the typed pattern holds its id.
+fn check_variant_record_pattern(st: InferState, r: DeclRef, pfs: [PField], expected: Ty, line: Int, col: Int) : PatChecked / Console + File + Mutable {
+
+
+  let head = record_head_sym(st, r, expected, line, col)
+  match head_record(st.recs, head.sym) {
+    None -> {
+      let fs = check_unknown_pfields(head.st, pfs)
+      PatChecked { st: fs.st, pat: mk_pat(PVariantRecord(r, fs.fields), line, col) }
+    }
+    Some(ri) -> {
+      let rsym = match ri { RI(s, _, _, _) -> s }
+      let inst = rec_instantiate(head.st, ri)
+      let what = string_concat("record pattern '", string_concat(ref_text(st.env.tab, r), "'"))
+      let s1 = st_unify(inst.st, expected, inst.result_ty, what, line, col)
+      let fs = check_pfield_list(s1, pfs, ri, inst.fields, line, col)
+      PatChecked { st: fs.st, pat: mk_pat(PVariantRecord(DrSym(rsym), fs.fields), line, col) }
+    }
+  }
+}
+
+
+
+fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, col: Int) : PFieldsChecked / Console + File + Mutable {
+
+
+  let applied = apply_ty(st.sub, expected)
+  match applied {
+    TyCon(tsym, _) -> {
+      let lookup = rec_pick(st.recs, tsym)
+      match lookup {
+        None -> check_unknown_pfields(st, pfs)
+        Some(ri) -> {
+          let inst = rec_instantiate(st, ri)
+          let s1 = st_unify(inst.st, expected, inst.result_ty, "record pattern", line, col)
+          check_pfield_list(s1, pfs, ri, inst.fields, line, col)
+        }
+      }
+    }
+    TyVarT(recv_id) -> check_deferred_pfields(st, pfs, recv_id, line, col)
+    _ -> check_unknown_pfields(st, pfs)
+  }
+}
+
+
+
+# The record type is not known yet: each field is resolved, and its
+# visibility judged, once the body settles the scrutinee.
+fn check_deferred_pfields(st: InferState, pfs: [PField], recv_id: Int, line: Int, col: Int) : PFieldsChecked / Console + File + Mutable =
+  match pfs {
+    [] -> PFieldsChecked { st: st, fields: [] }
+    [PField(fnm, sub, sh), ...rest] -> {
+      let fr = st_fresh_ty(st)
+      let s1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, ty_var_id(fr.ty), line, col, true))
+      let h = check_pattern_stamped(s1, sub, fr.ty)
+      let t = check_deferred_pfields(h.st, rest, recv_id, line, col)
+      PFieldsChecked { st: t.st, fields: [PField(fnm, h.pat, sh), ...t.fields] }
+    }
+  }
+
+
+
+fn check_unknown_pfields(st: InferState, pfs: [PField]) : PFieldsChecked / Console + File + Mutable {
+
+
+  match pfs {
+    [] -> PFieldsChecked { st: st, fields: [] }
+    [pf, ...rest] -> match pf {
+      PField(fnm, sub, sh) -> {
+        let h = check_pattern_stamped(st, sub, TyAny)
+        let t = check_unknown_pfields(h.st, rest)
+        PFieldsChecked { st: t.st, fields: [PField(fnm, h.pat, sh), ...t.fields] }
+      }
+    }
+  }
+}
+
+
+
+fn check_pfield_list(st: InferState, pfs: [PField], ri: RecInfo, fields: [FTy], line: Int, col: Int) : PFieldsChecked / Console + File + Mutable {
+
+
+  match pfs {
+    [] -> PFieldsChecked { st: st, fields: [] }
+    [pf, ...rest] -> match pf {
+      PField(fnm, sub, sh) -> {
+        let h = match fty_find(fields, fnm) {
+          Some(ft) -> check_pattern_stamped(check_pfield_visible(st, ri, fnm, line, col), sub, ft)
+          None -> {
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' in record pattern#{field_hint(fields, fnm)}", [])
+            render_diag(perr)
+            check_pattern_stamped(st_bump_err(st_push_diag(st, perr)), sub, TyAny)
+          }
+        }
+        let t = check_pfield_list(h.st, rest, ri, fields, line, col)
+        PFieldsChecked { st: t.st, fields: [PField(fnm, h.pat, sh), ...t.fields] }
+      }
+    }
+  }
+}
+
 
 # synth a literal annotated with a unit. Unit aliases were
 # expanded by the resolver before the typer ever sees them; here we
