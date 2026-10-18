@@ -102,8 +102,15 @@ A header the generated code must see first rides the same variable,
 In a package, declare the shim in `kai.toml` instead — a `[native]`
 table (`sources`/`include`/`libs`) travels with the dependency, so
 consumers build with plain `kai build` and no `CFLAGS` (see
-`kai info packages`). The `kai_ffi.h` struct pattern above still
-rides `CFLAGS`; `[native]` sources must be self-contained C.
+`kai info packages`). A `[native]` source includes `kai_ffi.h` the same
+way a `CFLAGS` shim does.
+
+`kai` writes `kai_ffi.h` per build, under the build's scratch dir, and
+puts that directory on the include path of the C sources it compiles
+by hand (`CFLAGS` shims and `[native]` sources), on every backend and
+in `kai build`, `kai run` and `kai test`. The header is regenerated from
+the program, so a struct that changes rebuilds the shim against it.
+`kaic2 --emit=ffi-header` prints it.
 
 > Struct-by-value works on **both backends**. The C-direct backend
 > (`--backend=c`) lets the C compiler own the ABI; the native (libLLVM)
