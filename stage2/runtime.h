@@ -4356,9 +4356,15 @@ static int kai_cancel_dispatch_user_handler(void);
 /* kai_sched_park without the cancel check on resume, for a site linked
  * into a chain it must leave before it unwinds. */
 static void kai_sched_park_linked(void);
+/* The program's main fiber has no pad: its cancel runs the user handler or
+ * ends the process. */
+static inline int kai_cancel_can_land(KaiFiber *f) {
+    return f->cancel_pad_set || f->pinned_main ||
+           (f->worker && f == &f->worker->main_fiber);
+}
 /* True when a requested cancellation can be delivered to `f` now. */
 static inline int kai_cancel_due(KaiFiber *f) {
-    return f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set;
+    return f->cancel_requested && !f->cancel_delivered && kai_cancel_can_land(f);
 }
 static void kai_cancel_deliver(KaiFiber *f);
 static void kai_fiber_request_cancel(KaiFiber *f);
@@ -17913,7 +17919,7 @@ static void kai_sched_commit_park(KaiFiber *f) {
      * here and abort the park; the resume path runs the cancel yield-point
      * check. The gate mirrors kai_check_cancel_yield_point so a fiber whose
      * cancel cannot be delivered (already delivered, no pad) still parks. */
-    int cancel_abort = (f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set);
+    int cancel_abort = kai_cancel_due(f);
     if (f->wake_pending > 0 || cancel_abort) {
         /* A wake raced the pre-commit window (or a stale permit survived
          * an earlier park), or a pending cancel must not be slept through:
@@ -21269,6 +21275,10 @@ static __attribute__((noinline)) void kai_cancel_deliver(KaiFiber *f) {
     /* No user handler in scope (or a clause that illegally resumed):
      * fall back to the pad — the trampoline's second return marks the
      * fiber CANCELLED and continues with the awaiter walk. */
+    if (!f->cancel_pad_set) {
+        fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
+        kai_exit(0);
+    }
     kai_evidence_unwind_all();
     kai_fiber_pad_jump(f, 0);
     /* Unreachable. */

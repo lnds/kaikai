@@ -345,6 +345,12 @@ closed earlier. A `pid` whose fiber has already terminated when
 `link` runs is reported at once, with the reason it terminated
 for, exactly as if it had terminated right after the call.
 
+The rule holds when the peer is the `main` fiber, wherever it is
+parked (`receive`, `receive_timeout`, `sleep`, `await`): a `Cancel`
+handler around the wait runs; with none, the program ends with status
+0 after `kai: Cancel.raise: unhandled (fiber cancelled)`. A `main`
+that traps exits receives the reason string instead.
+
 Use when two actors depend on each other symmetrically — a
 worker and its job queue, two sides of a handshake. Do **not**
 use link when the relationship is "observer watches observee"
