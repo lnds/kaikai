@@ -1,0 +1,387 @@
+#[doc("Typing of operators and element access: binary and unary operators with their protocol dispatch, ranges, field reads and indexing.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.decl_text
+import compiler.core_syms
+import compiler.core_builtins
+import compiler.operators
+import compiler.core_refs
+import compiler.core_protos
+import compiler.kinds
+import compiler.decl_names
+import compiler.index_coll
+import compiler.infer_unit_alias
+import compiler.char_range
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_clause_holes
+import compiler.infer_head_dispatch
+import compiler.infer_arms_vec
+import compiler.infer_env_exhaust
+import compiler.infer_dump_text
+import compiler.infer_apply
+import compiler.infer_instantiate
+import compiler.infer_tparam_escape
+import compiler.infer_fuse_arith
+import compiler.infer_match
+import compiler.infer_calls
+
+#[doc("Typer-internal helper `synth_field` shared across the infer modules.")]
+pub fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let r = w_synth(st, obj)
+  let applied = apply_ty(r.st.sub, r.ty)
+  # A unit or a refinement wraps the record that carries the fields.
+  let carrier = ty_dispatch_head(applied)
+  match carrier {
+    TyCon(tsym, _) -> match rec_pick(r.st.recs, tsym) {
+      None -> field_non_record_or_partial_app(r.st, r.expr, applied, fnm, line, col)
+      Some(ri) -> {
+        let inst = rec_instantiate(r.st, ri)
+        let st1 = st_unify(inst.st, inst.result_ty, carrier, "record field access", line, col)
+        match fty_find(inst.fields, fnm) {
+          Some(t) -> {
+            let ty = apply_ty(st1.sub, t)
+            mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
+          }
+          None -> {
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{decl_name(st.env.tab, tsym)}#{field_hint(inst.fields, fnm)}", [])
+            render_diag(perr)
+            mk_inferred(st_bump_err(st_push_diag(st1, perr)), TyAny, field_root(r.expr, fnm, line, col, TyAny))
+          }
+        }
+      }
+    }
+    # the receiver's type is still an unbound tyvar — the
+    # canonical case is the payload of a generic effect op (`Some(b) ->
+    # b.id` where `b : ?a` and `?a` is only pinned to the row's `Box`
+    # later by `check_body_row`). We cannot decide field-vs-UFCS here:
+    # eager UFCS (the `_` fallback below) is exactly the wrong guess —
+    # it produces a bogus diagnostic. Defer instead — record a
+    # constraint keyed on the receiver tyvar, stamp the access with a
+    # FRESH result tyvar (not TyAny, so downstream uses stay connected),
+    # and let `infer_decl` resolve it once the receiver settles. This is
+    # purely a timing fix in the field-access path; it touches neither
+    # effect-row inference nor the UFCS rule for resolved receivers.
+    TyVarT(recv_id) -> {
+      let fr = st_fresh_ty(r.st)
+      let res_id = ty_var_id(fr.ty)
+      let st1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, res_id, line, col, false))
+      mk_inferred(st1, fr.ty, field_root(r.expr, fnm, line, col, fr.ty))
+    }
+    _ -> field_non_record_or_partial_app(r.st, r.expr, applied, fnm, line, col)
+  }
+}
+
+
+# `e1[e2]` dispatches on the container's inferred
+# type. `Map[K, V]` lowers to `map.get(coll, ix)` and `HashMap[K, V]`
+# to `hashmap.get(coll, ix)` (both return `Option[V]`); any
+# other container — including unresolved type variables — falls back
+# to `array_get(coll, ix)` so the unifier produces the existing
+# "expected `Array[T]`" error message at the call site. The chosen
+# callee's scheme types the arguments, the result AND the effect row —
+# `hashmap_get`'s `/ Mutable` included. `coll` is walked exactly once:
+# the call is typed against a placeholder (`compiler.index_coll`).
+#
+# Design note (not a smell — kept as a closed 3-case dispatch on
+# purpose): a smell audit flagged the `name == "Map"` test as wanting
+# an `Index` protocol. It does not. kaikai has exactly three indexable
+# containers (Array, Map, HashMap), and the language bans
+# type-class-style resolution — a closed compile-time dispatch is
+# precisely what is preferred over a resolution mechanism. An `Index`
+# protocol
+# would not remove a hardcode, it would move it (the proto name + the
+# builtin impls) across more sites and route every `[]` through the
+# proto impl-table at runtime. Worse, it would degrade this error:
+# the Array fallback for an unresolved type var is deliberate, and a
+# protocol over `?t` can only emit a generic "no `Index` impl" or
+# re-hardcode the Array bias inside the resolver.
+#[doc("Typer-internal helper `synth_index` shared across the infer modules.")]
+pub fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let probe = w_synth(st, coll)
+  let coll_ty = apply_ty(probe.st.sub, probe.ty)
+  let ph = ixc_ref(coll)
+  match coll_ty {
+    TyCon(tcs, _) ->
+      if core_ty_is(tcs, CtVec) { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
+      else { synth_on_coll(probe, coll_ty, ECall(index_getter(coll_ty, line, col), [ph, ix]), line, col) }
+    TyDimT(TyCon(tcs, _), _) -> if core_ty_is(tcs, CtVec) { synth_dim_vec_index(probe, coll_ty, ph, ix, line, col) } else { index_array_get(probe, coll_ty, ph, ix, line, col) }
+    _ -> index_array_get(probe, coll_ty, ph, ix, line, col)
+  }
+}
+
+
+fn index_array_get(probe: Inferred, coll_ty: Ty, ph: Expr, ix: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_on_coll(probe, coll_ty, ECall(builtin_mk(CbArrayGet, line, col), [ph, ix]), line, col)
+
+
+# A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index is a bare
+# struct field load with the bound proved at compile time.
+fn synth_dim_vec_index(probe: Inferred, coll_ty: Ty, ph: Expr, ix: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, probe.expr, ix, coll_ty, line, col) }
+  else { synth_vec_index(probe, coll_ty, mk_expr(ECall(builtin_mk(CbDetachUnit, line, col), [ph]), line, col), ix, line, col) }
+
+
+# Types the read `k`, whose collection is the placeholder, against the
+# probe's type for it, then splices the probe's typed collection back.
+fn synth_on_coll(probe: Inferred, t: Ty, k: ExprKind, line: Int,
+      col: Int) : Inferred / Console + File + Mutable {
+  let st1 = st_set_env(probe.st, env_bind_local(probe.st.env, binder_minted(ixc_name()), mono(t)))
+  let r = w_synth(st1, mk_expr(k, line, col))
+  mk_inferred(st_restore_entries(probe.st, r.st), r.ty, ixc_splice(r.expr, probe.expr))
+}
+
+
+# `xs[i]` on a Vec reads the element; `xs[a..b]` (inclusive, like the
+# range literal) is the O(1) slice — the same view `[h, ...t]` binds.
+fn synth_vec_index(probe: Inferred, t: Ty, coll: Expr, ix: Expr,
+                   line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match ix.kind {
+    ERange(a, b, None) -> synth_on_coll(probe, t, vec_slice_block(coll, a, b, line, col), line, col)
+    ERange(_, _, Some(_)) -> {
+      let perr = mk_diag(SevError, probe.st.file, line, col, "a stepped range cannot slice a Vec — a slice is one contiguous view", [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(probe.st, perr)), TyAny, with_ty(mk_expr(EIndex(probe.expr, ix), line, col), TyAny))
+    }
+    _ -> synth_on_coll(probe, t, ECall(builtin_mk(CbVecGet, line, col), [coll, ix]), line, col)
+  }
+
+
+# `v[k]` on a fixed-width `Vec[e]<n>`: a static literal index in range
+# lowers to `__fixed_vec_get` — a bare struct field load, the bound
+# proved here at compile time so no runtime check is emitted. Out of
+# range is a compile error (strictly better than the dynamic vec's
+# runtime trap). A dynamic index lowers to `__fixed_vec_get_dyn`, the
+# same inline field load behind a bounds check against the static `n`.
+fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
+                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let n = fixed_vec_n(coll_ty)
+  let elem = fixed_vec_elem(coll_ty)
+  match ix.kind {
+    EInt(k, _) ->
+      if k >= 0 and k < n {
+        fixed_vec_index_node(st, coll, ix, MkFixedVecGet, elem, line, col)
+      } else {
+        let perr = mk_diag(SevError, st.file, line, col,
+          concat_all(["index ", int_to_string(k), " is out of range for a fixed-width `Vec` of length ", int_to_string(n)]), [])
+        render_diag(perr)
+        mk_inferred(st_bump_err(st_push_diag(st, perr)), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
+      }
+    _ -> {
+      let ir = w_check_against(st, ix, TyInt, "index", ix.line, ix.col)
+      fixed_vec_index_node(ir.st, coll, ir.expr, MkFixedVecGetDyn, elem, line, col)
+    }
+  }
+}
+
+
+#[doc("Typer-internal helper `synth_binop` shared across the infer modules.")]
+pub fn synth_binop(st: InferState, op: BinOp, l: Expr, r: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let rl = w_synth(st, l)
+  let rr = w_synth(rl.st, r)
+  synth_binop_typed(op, rl, rr, line, col)
+}
+
+
+fn synth_binop_typed(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  if binop_eq(op, BoConcat) { synth_concat(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col) }
+  else if binop_is_logical(op) { binop_logical(op, rl, rr, line, col) }
+  else if binop_is_equality(op) or binop_is_ordering(op) { binop_compare(op, rl, rr, line, col) }
+  else if binop_eq(op, BoMod) { binop_mod(op, rl, rr, line, col) }
+  else if binop_eq(op, BoMul) or binop_eq(op, BoDiv) { binop_mul_div(op, rl, rr, line, col) }
+  else if binop_eq(op, BoPow) { synth_dim_pow(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col) }
+  else { binop_add_sub(op, rl, rr, line, col) }
+
+
+fn binop_logical(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let s1 = st_unify(rr.st, rl.ty, TyBool, "boolean operator", line, col)
+  let s2 = st_unify(s1, rr.ty, TyBool, "boolean operator", line, col)
+  mk_inferred(s2, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
+}
+
+
+# Equality and ordering keep the structural builtin form; the protocol resolver
+# rewrites to the custom impl once the operand type is concrete.
+fn binop_compare(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
+  mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
+}
+
+
+fn binop_dispatch(op: BinOp, rl: Inferred, rr: Inferred, lty: Ty, rty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_binop_proto(rr.st, op, rl.expr, lty, rr.expr, rty, line, col)
+
+
+# Primitive `Int % Int` keeps the unify-and-emit path; concrete non-primitive
+# operands and `Real % Real` go through the `Rem` protocol.
+fn binop_mod(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let lty = apply_ty(rr.st.sub, rl.ty)
+  let rty = apply_ty(rr.st.sub, rr.ty)
+  if binop_should_dispatch_proto(lty, rty) or binop_dispatch_proto_heterogeneous(rr.st, op, lty, rty) or (ty_is_real_head(lty) and ty_is_real_head(rty)) {
+    binop_dispatch(op, rl, rr, lty, rty, line, col)
+  } else if ty_is_var_head(lty) or ty_is_var_head(rty) {
+    binop_mod_generic(op, rl, rr, line, col)
+  } else { binop_mod_fixed(op, rl, rr, lty, rty, line, col) }
+}
+
+
+# A generic operand keeps its type; the protocol rewrite after monomorphisation reaches `Rem`.
+fn binop_mod_generic(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let s1 = st_unify(rr.st, rl.ty, rr.ty, "arithmetic operator '%'", line, col)
+  let ty = apply_ty(s1.sub, rl.ty)
+  mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+}
+
+
+# `T % T` over a same-width fixed integer keeps the width wrap; everything else unifies with `Int`.
+fn binop_mod_fixed(op: BinOp, rl: Inferred, rr: Inferred, lty: Ty, rty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let modt = fixed_mod_result(lty, rty)
+  let s1 = st_unify(rr.st, rl.ty, modt, "integer arithmetic", line, col)
+  let s2 = st_unify(s1, rr.ty, modt, "integer arithmetic", line, col)
+  mk_inferred(s2, modt, binop_root(op, rl.expr, rr.expr, line, col, modt))
+}
+
+
+# Two concrete non-numeric heads take the `Mul`/`Div` protocol; dimensioned
+# operands of the same head combine their units first, the rest combine units
+# in `synth_dim_mul_div`.
+fn binop_mul_div(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let lty = apply_ty(rr.st.sub, rl.ty)
+  let rty = apply_ty(rr.st.sub, rr.ty)
+  if binop_should_dispatch_proto(lty, rty) {
+    if binop_same_head_dimmed(lty, rty) { synth_binop_proto_dim_mul(rr.st, op, rl.expr, lty, rr.expr, rty, line, col) }
+    else { binop_dispatch(op, rl, rr, lty, rty, line, col) }
+  } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty, rty) { binop_dispatch(op, rl, rr, lty, rty, line, col) }
+  else { synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col) }
+}
+
+
+fn arith_what(op: BinOp) : String = string_concat("arithmetic operator '", string_concat(binop_text(op), "'"))
+
+
+# `+` / `-` demand unit equality, and dispatch to a protocol only for concrete non-primitive operands.
+fn binop_add_sub(op: BinOp, rl: Inferred, rr: Inferred, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let lty = apply_ty(rr.st.sub, rl.ty)
+  let rty = apply_ty(rr.st.sub, rr.ty)
+  if binop_should_dispatch_proto(lty, rty) {
+    let st_d = if binop_same_head_dimmed(lty, rty) { st_unify(rr.st, rl.ty, rr.ty, arith_what(op), line, col) } else { rr.st }
+    synth_binop_proto(st_d, op, rl.expr, lty, rr.expr, rty, line, col)
+  } else if binop_dispatch_proto_heterogeneous(rr.st, op, lty, rty) { binop_dispatch(op, rl, rr, lty, rty, line, col) }
+  else {
+    let s1 = st_unify(rr.st, rl.ty, rr.ty, arith_what(op), line, col)
+    let s2 = st_check_arith_string(s1, op, rl.ty, line, col)
+    let ty = apply_ty(s2.sub, rl.ty)
+    mk_inferred(s2, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
+  }
+}
+
+
+# Build a call of the operator protocol's dispatcher on `[l, r]` and walk
+# it through `synth_call`. The lower-protocols pass has already
+# generated the dispatcher (when the matching protocol is declared); the
+# post-inference rewrite then redirects to the impl.
+fn synth_binop_proto(st: InferState, op: BinOp, le: Expr, lt: Ty,
+                      re: Expr, rt: Ty,
+                      line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  match binop_check_against_impl(st, op, lt, rt, line, col) {
+    BinopImpl(st_h, declared) ->
+      binop_impl_result(synth_call(st_h, binop_dispatcher_ref(st_h.protos.ids, binop_proto(op), line, col), [le, re], line, col), declared)
+  }
+}
+
+
+# `*` / `/` over dimensioned protocol operands: combine the units the
+# way the primitive dim path does, run the Module formation guard on
+# the combined unit, dispatch to the impl on the bare carriers, and
+# stamp the combined unit back onto the impl's result. `USD·USD` dies
+# in the guard; `Decimal<USD> · Decimal` keeps the habitant; a full
+# cancellation (`USD/USD`) yields the bare carrier.
+fn synth_binop_proto_dim_mul(st: InferState, op: BinOp,
+                             le: Expr, lt: Ty, re: Expr, rt: Ty,
+                             line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let ls = ty_split_dim(lt, st.sub)
+  let rs = ty_split_dim(rt, st.sub)
+  let combined = if binop_eq(op, BoMul) { UMul(ls.dim, rs.dim) }
+                 else { UMul(ls.dim, UInv(rs.dim)) }
+  let s1 = st_check_atomic_unit(st, op, combined, line, col)
+  # The units are the combined-unit rule's business, already checked
+  # above; the impl sees the bare carriers.
+  let inf = synth_binop_proto(s1, op, le, ls.base, re, rs.base, line, col)
+  let base = (ty_split_dim(inf.ty, inf.st.sub)).base
+  let ty = dim_collapse(base, unit_canon(combined))
+  mk_inferred(inf.st, ty, with_ty(inf.expr, ty))
+}
+
+
+#[doc("Typer-internal helper `synth_unop` shared across the infer modules.")]
+pub fn synth_unop(st: InferState, op: UnOp, x: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  let r = w_synth(st, x)
+  match op {
+    UoNot -> {
+      let s1 = st_unify(r.st, r.ty, TyBool, "logical 'not'", line, col)
+      let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), TyBool)
+      mk_inferred(s1, TyBool, root)
+    }
+    UoNeg ->
+      if ty_negates(apply_ty(r.st.sub, r.ty)) {
+        let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), r.ty)
+        mk_inferred(r.st, r.ty, root)
+      } else { synth_call(r.st, op_dispatcher_ref(r.st.protos.ids, CpNeg, neg_proto_method(), line, col), [r.expr], line, col) }
+  }
+}
+
+
+#[doc("Typer-internal helper `synth_range` shared across the infer modules.")]
+pub fn synth_range(st: InferState, lo: Expr, hi: Expr, stp: Option[Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let rl = w_synth(st, lo)
+  if range_of_chars(apply_ty(rl.st.sub, rl.ty), hi) { synth_char_range(st, rl, lo, hi, stp, line, col) }
+  else {
+    let s1 = st_unify(rl.st, TyInt, rl.ty, "range start", line, col)
+    let rh = w_synth(s1, hi)
+    let s2 = st_unify(rh.st, TyInt, rh.ty, "range end", line, col)
+    match stp {
+      None -> {
+        let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, None), line, col), TyListT(TyInt))
+        mk_inferred(s2, TyListT(TyInt), root)
+      }
+      Some(se) -> {
+        let rs_ = w_synth(s2, se)
+        let s3 = st_unify(rs_.st, TyInt, rs_.ty, "range step", line, col)
+        let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, Some(rs_.expr)), line, col), TyListT(TyInt))
+        mk_inferred(s3, TyListT(TyInt), root)
+      }
+    }
+  }
+}
+
+
+# A range of Chars is the range of their code points, each mapped back:
+# `map([code(lo)..code(hi)], int_to_char)`. The three elements are held to
+# Char first, so a mix is reported against the range and not against the
+# rewrite; `peek` is the start, already read once to choose this path.
+fn synth_char_range(st: InferState, peek: Inferred, lo: Expr, hi: Expr, stp: Option[Expr],
+                    line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let s1 = st_unify(peek.st, TyChar, peek.ty, "range start", line, col)
+  let rh = w_synth(s1, hi)
+  let s2 = st_unify(rh.st, TyChar, rh.ty, "range end", line, col)
+  let s3 = char_range_second(s2, stp, line, col)
+  if s3.errs > st.errs { inferred_leaf(s3, TyListT(TyChar), mk_expr(EList([]), line, col)) }
+  else {
+    let codes = mk_expr(ERange(char_code(lo), char_code(hi), inf_map_opt_expr(stp, char_step)), line, col)
+    let back = mk_sym(builtin_sym("int_to_char"), line, col)
+    w_synth(st_restore_deferred_fields(s3, st.deferred_fields, st.deferred_homs),
+          mk_expr(ECall(mk_sym(builtin_sym("map"), line, col), [codes, back]), line, col))
+  }
+}

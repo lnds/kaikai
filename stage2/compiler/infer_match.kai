@@ -4,32 +4,18 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.written
-import compiler.local_names
 import compiler.kinds
-import compiler.handler_alias
 import compiler.decl_names
-import compiler.refinements
-import compiler.refine_coerce
-import compiler.refine_help
-import compiler.refine_types
-import compiler.fmt
-import compiler.lit_mint
 import compiler.vec_surface
 import compiler.fixed_vec_match
 import compiler.infer_unit_alias
-import compiler.tycon_ref
 import compiler.seq_match
 import compiler.char_range
-import compiler.record_head
 import compiler.infer_glue
 import compiler.infer_env
-import compiler.infer_row_kinds
-import compiler.infer_unit_tables
 import compiler.infer_state
 import compiler.infer_call_labels
-import compiler.infer_clause_holes
 import compiler.infer_head_dispatch
-import compiler.infer_local_mutation
 import compiler.infer_arms_vec
 import compiler.infer_env_exhaust
 import compiler.infer_handle_walk
@@ -39,24 +25,7 @@ import compiler.infer_instantiate
 import compiler.infer_tparam_escape
 import compiler.infer_fuse_arith
 import compiler.infer_patterns
-
-# synth a literal annotated with a unit. Unit aliases were
-# expanded by the resolver before the typer ever sees them; here we
-# only canonicalise (sort/group) and stamp the dimensioned type onto
-# the rebuilt expression node.
-#[doc("Typer-internal helper `synth_lit_unit` shared across the infer modules.")]
-pub fn synth_lit_unit(st: InferState, inner: Expr, u: UnitExprT, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
-  let ri = w_synth(st, inner)
-  let base = apply_ty(ri.st.sub, ri.ty)
-  let canon_u = unit_canon(u)
-  let ty = dim_collapse(base, canon_u)
-  let root = with_ty(mk_expr(ELitUnit(ri.expr, canon_u), line, col), ty)
-  mk_inferred(ri.st, ty, root)
-}
-
-
+import compiler.infer_values
 
 #[doc("Typer-internal helper `synth_if` shared across the infer modules.")]
 pub fn synth_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr], line: Int, col: Int) : Inferred / Console + File + Mutable {
@@ -81,153 +50,6 @@ pub fn synth_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr], line: Int, 
 }
 
 
-
-#[doc("Typer-internal helper `synth_lambda` shared across the infer modules.")]
-pub fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
-  synth_lambda_pinned(st, ps, body, [], "", line, col)
-
-
-
-# A lambda where a function over `doms` is expected: each parameter takes
-# the domain at its position BEFORE the body is walked. A method call in
-# the body is chosen by its receiver's type there and then; it cannot
-# defer the way a bare field access can, so a parameter it reaches must
-# already be typed.
-#[doc("Typer-internal helper `synth_lambda_expecting` shared across the infer modules.")]
-pub fn synth_lambda_expecting(st: InferState, ps: [Param], body: Expr, doms: [Ty],
-                          line: Int, col: Int) : Inferred / Console + File + Mutable =
-  synth_lambda_pinned(st, ps, body, expected_pins(st, ps, doms), "lambda parameter", line, col)
-
-
-
-# A lambda whose leading parameters take `pins` before its body is walked.
-#[doc("Typer-internal helper `synth_lambda_pinned` shared across the infer modules.")]
-pub fn synth_lambda_pinned(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String,
-                       line: Int, col: Int) : Inferred / Console + File + Mutable =
-  synth_lambda_rows(st, ps, body, pins, why, false, line, col)
-
-
-
-# `every_tail` ties the lambda's row to every open row its body calls
-# through, not only the enclosing signature's: closing the lambda's row
-# then closes them all.
-fn synth_lambda_rows(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String, every_tail: Bool,
-                     line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
-  let outer = st
-  let added0 = add_infer_params(st, ps)
-  let added = InferredParams { st: pin_params(added0.st, added0.tys, pins, why, line, col), tys: added0.tys }
-  # walk the body in an isolated row context. Effects
-  # invoked inside the lambda body MUST NOT leak to the enclosing
-  # function's row — they belong to the lambda type's own row.
-  # Same pattern as `synth_handle` (snapshot, reset, walk, restore).
-  # closure-capture: tagging stays enabled across the
-  # lambda boundary now that `kai_alias_<a>_id` is captured by the
-  # closure (see `fv_expr`'s tagged-op detection plus the
-  # `__alias_id__<a>` lane in `emit_closure_caps` /
-  # `emit_lam_cap_reads`). Without this the typer would emit a
-  # bare dispatch key for every op call inside the lambda and the
-  # innermost-name lookup would shadow outer cap binders — the
-  # exact failure mode that broke `var n = ...; var m = ...; while
-  # @n < lim { ... }` and routed `@n` to `m`.
-  let prev_row = added.st.row
-  let prev_tails = added.st.row_tails
-  let st_in = InferState { ...added.st, row: [], row_tails: [], decl_row: [] }
-  # `e!` propagates from the enclosing function, not from a
-  # closure. Clear ret_ty inside the lambda body so any `!` site
-  # inside reports a clean diagnostic. st_restore_entries (below)
-  # restores ret_ty from `outer` after the walk, so subsequent
-  # siblings of the lambda see the function-level ret_ty unchanged.
-  let st_in2 = st_set_ret_ty(st_in, None)
-  # A lambda lifted out of a clause body cannot call the clause's
-  # continuation, unless a lambda param shadows its name.
-  let st_in3 = st_set_in_clause(st_set_clause_resume(st_in2, None), clause_cont_in_lambda(st_in2.in_clause, ps))
-  let rb = w_synth(st_in3, body)
-  # keep the row labels in their raw form so a downstream
-  # `unify_row` partition can see TyVar payloads (an `Actor[?T]` mint-
-  # ed by `Actor.self()` inside this body should bias the enclosing
-  # handler's `Msg` toward that `?T`). The previous `apply_labels`
-  # call substituted bound TyVars away and forced the partition into
-  # a row-position lottery; `find_remove_label_best`'s
-  # `find_remove_label_tyvar_args` branch needs the raw shape to
-  # prefer body-local labels over callee-propagated concrete labels.
-  #
-  # apply the Mutable-masking pass to the lambda
-  # body too. `infer_decl` masks `Mutable` for a top-level fn whose
-  # body only mutates locally-constructed Arrays (the `var i = 0`
-  # desugar lowers to a `let i__slot = array_make(1, 0)` slot the
-  # caller never observes), but a lambda body went through `synth`
-  # alone and never reached that pass — so a `var` inside a thunk
-  # leaked `Mutable` into the lambda's row. The thunk
-  # `() => { var i = 0  i := @i + 1 }` would surface as
-  # `() -> Unit / Mutable + ?e`, which then refused to unify against a
-  # higher-order slot declared `() -> Unit / Stdout`. Masking here is
-  # scoped to the lambda's own params + body and is a no-op when
-  # `Mutable` is not in the body row, mirroring the fn-decl call site.
-  let rb_masked = mask_local_mutable_demand(st_add_tail_labels(rb.st, rb.st.row_tails), ps, rb.expr)
-  let lambda_row_labels = rb_masked.row
-  let st_after = InferState { ...rb_masked, row: prev_row, row_tails: prev_tails, decl_row: added.st.decl_row }
-  let st2 = st_restore_entries(outer, st_after)
-  # lambdas carry an *open* row with a
-  # fresh tail var. Closed rows pinned row-polymorphic call sites
-  # too eagerly: `while(pred, body)` would unify the pure-pred's
-  # closed-empty row with `while`'s `e`, then reject `body`'s
-  # `Stdout` row when the same `e` was already bound to empty.
-  # The open form `[labels] + ?eN` lets sibling args' rows unify
-  # via Rémy-style tail unification — the row variable absorbs
-  # whatever residual labels each arg performs.
-  let fr = subst_fresh_row(st2.sub)
-  let st3 = join_tails(st_set_sub(st2, fr.subst), fr.id, rb_masked.row_tails, every_tail, line, col)
-  let lam_row = Row { labels: lambda_row_labels,
-                       tail: Some(fr.id),
-                       display_alias: None }
-  # Left unapplied: finalise applies the substitution once. Applying it here
-  # rebuilt the body's type at every level of a lambda nest.
-  let lam_ty = TyFnT(added.tys, rb.ty, lam_row)
-  let root = with_ty(mk_expr(ELambda(ps, rb.expr), line, col), lam_ty)
-  mk_inferred(st3, lam_ty, root)
-}
-
-
-
-#[doc("Typer-internal helper `synth_list_expr` shared across the infer modules.")]
-pub fn synth_list_expr(st: InferState, els: [ListElem], line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
-  let rv = st_fresh_ty(st)
-  let elems = synth_list_elems(rv.st, els, rv.ty, line, col)
-  let ty = TyListT(apply_ty(elems.st.sub, rv.ty))
-  let root = with_ty(mk_expr(EList(elems.elems), line, col), ty)
-  mk_inferred(elems.st, ty, root)
-}
-
-
-
-fn synth_list_elems(st: InferState, els: [ListElem], elem: Ty, line: Int, col: Int) : InferredElems / Console + File + Mutable {
-
-
-  match els {
-    [] -> InferredElems { st: st, elems: [] }
-    [el, ...rest] -> match el {
-      ElPlain(ex) -> {
-        let r = w_synth(st, ex)
-        let s1 = st_unify(r.st, elem, r.ty, "list element", line, col)
-        let rr = synth_list_elems(s1, rest, elem, line, col)
-        InferredElems { st: rr.st, elems: [ElPlain(r.expr), ...rr.elems] }
-      }
-      ElSpread(ex) -> {
-        let r = w_synth(st, ex)
-        let s1 = st_unify(r.st, TyListT(elem), r.ty, "list spread", line, col)
-        let rr = synth_list_elems(s1, rest, elem, line, col)
-        InferredElems { st: rr.st, elems: [ElSpread(r.expr), ...rr.elems] }
-      }
-    }
-  }
-}
-
-
-
 # The step a stepped range lowers to is `second - first`: between two
 # Chars, the distance of their code points.
 #[doc("Typer-internal helper `char_range_second` shared across the infer modules.")]
@@ -242,321 +64,6 @@ pub fn char_range_second(st: InferState, stp: Option[Expr], line: Int, col: Int)
     }
     None -> st
   }
-
-
-
-#[doc("Typer-internal helper `synth_record_lit` shared across the infer modules.")]
-pub fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
-  # The typed literal carries the id of the record its head settles to,
-  # and its fields lie in the order that record declares: a field's slot
-  # is the declaration's, however the literal wrote it.
-  let head = record_head_sym(st, rh, expected, line, col)
-  match head_record(st.recs, head.sym) {
-    None -> {
-      let named = match head.sym {
-        Some(s) -> TyCon(s, [])
-        None    -> tsh_tycon_at(st_home_view(st), rh, [])
-      }
-      let r = synth_field_inits(head.st, fis, [], line, col)
-      let root = with_ty(mk_expr(ERecordLit(rh, r.fis), line, col), named)
-      mk_inferred(r.st, named, root)
-    }
-    Some(ri) -> match ri {
-      RI(rsym, _, fds, _) -> {
-        let inst = rec_instantiate(head.st, ri)
-        let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
-        let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
-        let ty = apply_ty(st1.sub, inst.result_ty)
-        if rh_out_of_order(fis, fds) { lay_in_declared_order(head.st, st1, rsym, fds, r.fis, ty, line, col) }
-        else { mk_inferred(st1, ty, with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)) }
-      }
-    }
-  }
-}
-
-
-
-# A literal written in another order than its record declares, as a
-# block: each typed value bound in the order written, the record laid
-# from those bindings in the declared order. Evaluation keeps the source
-# order; `outer` is the state the bindings are scoped out to.
-fn lay_in_declared_order(outer: InferState, st: InferState, rsym: SymId, fds: [FieldDecl], vals: [FieldInit],
-                         ty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable = {
-  let bound = bind_written_fields(st, vals, line, col, 0)
-  let laid = read_declared_fields(bound.st, fds, vals, line, col)
-  let lit = with_ty(mk_expr(ERecordLit(DrSym(rsym), laid.fis), line, col), ty)
-  mk_inferred(st_restore_entries(outer, laid.st), ty, with_ty(mk_expr(EBlock(bound.stmts, Some(lit)), line, col), ty))
-}
-
-
-
-fn bind_written_fields(st: InferState, vals: [FieldInit], line: Int, col: Int, i: Int) : InferredStmts / Console + File + Mutable = match vals {
-  [] -> InferredStmts { st: st, stmts: [] }
-  [FI(_, v), ...rest] -> {
-    let pat = mk_pat(PBind(rh_temp_binder(line, col, i)), line, col)
-    let after = check_pattern_stamped(st, pat, let_binder_ty(typed_ty_or(v, TyAny), v))
-    let rr = bind_written_fields(after.st, rest, line, col, i + 1)
-    InferredStmts { st: rr.st, stmts: [SLet(after.pat, None, v), ...rr.stmts] }
-  }
-}
-
-
-
-fn read_declared_fields(st: InferState, fds: [FieldDecl], vals: [FieldInit], line: Int, col: Int) : InferredFInits / Console + File + Mutable = match fds {
-  [] -> InferredFInits { st: st, fis: [] }
-  [FD(_, dnm, _, _), ...rest] -> {
-    let r = w_synth(st, mk_local(rh_temp_binder(line, col, rh_written_at(vals, dnm)).id, line, col))
-    let rr = read_declared_fields(r.st, rest, vals, line, col)
-    InferredFInits { st: rr.st, fis: [FI(dnm, r.expr), ...rr.fis] }
-  }
-}
-
-
-
-# A value meeting a refined type: a refuting literal is an error, and
-# an unproven value is bound once and checked before it flows on.
-#[doc("Typer-internal helper `refine_coerce` shared across the infer modules.")]
-pub fn refine_coerce(m: MintedExpr, expected: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable =
-  if not (rc_mentions(expected) or rc_mentions_in(m.st.sub, m.pair.ty)) { m } else {
-    let want = apply_ty(m.st.sub, expected)
-    let m1 = refine_flow(m, want, what, line, col)
-    if rc_may_owe(want) { refine_coerce_applied(m1, want, what, line, col) } else { m1 }
-  }
-
-
-
-fn refine_coerce_applied(m: MintedExpr, want: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable {
-  match want {
-    TyFnT(_, ret, _) -> match m.pair.expr.kind {
-      ELambda(ps, body) -> {
-        let b = refine_coerce_tail(mk_inferred(m.st, typed_ty_or(body, ret), body), ret, what)
-        MintedExpr { st: b.st, pair: ExprTy { expr: Expr { ...m.pair.expr, kind: ELambda(ps, b.expr) }, ty: m.pair.ty } }
-      }
-      _ -> m
-    }
-    _ -> refine_coerce_value(m, want, what, line, col)
-  }
-}
-
-
-
-fn refine_coerce_value(m: MintedExpr, want: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable {
-  match rc_verdict(want, m.pair.expr, apply_ty(m.st.sub, m.pair.ty)) {
-    RcProven -> m
-    RcRefuted(why) -> {
-      # The refuted value and the refinement it carries read the locals in scope.
-      let names = ln_with_binder(st_local_names(m.st), pred_self_binder())
-      let show = (e) => fmt_expr_text(e, m.st.env.tab, names)
-      let perr = mk_diag(SevError, m.st.file, line, col, concat_all([what, ": ", loose_text(why, show, show)]), [])
-      render_diag(perr)
-      MintedExpr { st: st_bump_err(st_push_diag(m.st, perr)), pair: m.pair }
-    }
-    RcCheck(preds) -> {
-      let r = refine_checked(m.st, m.pair.expr, m.pair.ty, preds, rc_is_dim(want))
-      MintedExpr { st: r.st, pair: ExprTy { expr: r.expr, ty: r.ty } }
-    }
-  }
-}
-
-
-
-# A constructor has no body to check its fields on entry, so its call
-# coerces each argument to the declared payload type.
-#[doc("Typer-internal helper `coerce_ctor_args` shared across the infer modules.")]
-pub fn coerce_ctor_args(st: InferState, callee: Expr, args_: [Expr], arg_tys: [Ty], callee_ty: Ty) : InferredList / Console + File + Mutable =
-  if not list_any_may_owe(fn_param_tys(st, callee_ty)) { InferredList { st: st, tys: arg_tys, exprs: args_ } }
-  else { match callee_ctor_name(st.env.tab, callee) {
-    Some(cn) -> coerce_args_to(st, args_, arg_tys, fn_param_tys(st, callee_ty), "argument of `#{cn}`")
-    None     -> InferredList { st: st, tys: arg_tys, exprs: args_ }
-  } }
-
-
-
-# A lambda passed where its parameter's type has a refined return
-# checks that return in its own body.
-#[doc("Typer-internal helper `coerce_lambda_args` shared across the infer modules.")]
-pub fn coerce_lambda_args(r: InferredList, callee_ty: Ty) : InferredList / Console + File + Mutable =
-  if not list_any_lambda(r.exprs) { r } else {
-    let params = fn_param_tys(r.st, callee_ty)
-    if not list_any_may_owe(params) { r }
-    else { coerce_args_to(r.st, r.exprs, r.tys, map(params, (p) => fn_ret_only(p)), "lambda result") }
-  }
-
-
-
-# Under an expected type, a generic constructor's payload takes the
-# refined type the expectation gives its variable, as `Some(v)` does
-# for an `Option[Pos]`.
-#[doc("Typer-internal helper `ctor_coerce_expected` shared across the infer modules.")]
-pub fn ctor_coerce_expected(r: Inferred, expected: Ty) : Inferred / Console + File + Mutable = match r.expr.kind {
-  ECall(c, args_) -> match callee_ctor_name(r.st.env.tab, c) {
-    Some(cn) -> if not rc_mentions(apply_ty(r.st.sub, expected)) { r } else { match ctor_fresh_sig(r.st.env, c) {
-      TyFnT(ps, res, _) -> {
-        let binds = rc_var_binds(res, apply_ty(r.st.sub, expected))
-        if binds == [] { r } else {
-          let ca = coerce_args_to(r.st, args_, map(args_, (a) => typed_ty_or(a, TyAny)),
-                                  map(ps, (p) => rc_subst(p, binds)), "argument of `#{cn}`")
-          mk_inferred(ca.st, r.ty, Expr { ...r.expr, kind: ECall(c, ca.exprs) })
-        }
-      }
-      _ -> r
-    } }
-    None -> r
-  }
-  _ -> r
-}
-
-
-
-fn coerce_args_to(st: InferState, args_: [Expr], arg_tys: [Ty], params: [Ty], what: String) : InferredList / Console + File + Mutable =
-  match args_ {
-    [a, ...rest] -> match arg_tys {
-      [t, ...trest] -> match params {
-        [p, ...prest] -> {
-          let m = refine_coerce(MintedExpr { st: st, pair: ExprTy { expr: a, ty: t } }, p, what, a.line, a.col)
-          let rr = coerce_args_to(m.st, rest, trest, prest, what)
-          InferredList { st: rr.st, tys: [m.pair.ty, ...rr.tys], exprs: [m.pair.expr, ...rr.exprs] }
-        }
-        [] -> InferredList { st: st, tys: arg_tys, exprs: args_ }
-      }
-      [] -> InferredList { st: st, tys: arg_tys, exprs: args_ }
-    }
-    [] -> InferredList { st: st, tys: arg_tys, exprs: args_ }
-  }
-
-
-
-# A block's value is its tail; checking the tail keeps the block's
-# prefix (the requires checks a call site reads) in front.
-#[doc("Typer-internal helper `refine_coerce_tail` shared across the infer modules.")]
-pub fn refine_coerce_tail(r: Inferred, expected: Ty, what: String) : Inferred / Console + File + Mutable = match r.expr.kind {
-  EBlock(ss, Some(t)) -> {
-    let inner = refine_coerce_tail(mk_inferred(r.st, typed_ty_or(t, r.ty), t), expected, what)
-    mk_inferred(inner.st, r.ty, Expr { ...r.expr, kind: EBlock(ss, Some(inner.expr)) })
-  }
-  _ -> {
-    let m = refine_coerce(MintedExpr { st: r.st, pair: ExprTy { expr: r.expr, ty: r.ty } }, expected, what, r.expr.line, r.expr.col)
-    mk_inferred(m.st, m.pair.ty, m.pair.expr)
-  }
-}
-
-
-
-fn refine_checked(st: InferState, v: Expr, vty: Ty, preds: [Expr], strip: Bool) : Inferred / Console + File + Mutable {
-  let rv = binder_minted("__rv")
-  let pat = mk_pat(PBind(rv), v.line, v.col)
-  let named = (p) => pred_local_names(p, (l) => st_local_text(st, l), ln_empty())
-  let checks = w_synth_stmts(check_pattern(st, pat, vty), map(preds, (p) => rc_assert(rv, p, st.refine_ctx, strip, st.env.tab, named(p))))
-  let tail = w_synth(checks.st, mk_local(rv.id, v.line, v.col))
-  let block = mk_expr(EBlock([SLet(pat, None, v), ...checks.stmts], Some(tail.expr)), v.line, v.col)
-  mk_inferred(st_restore_entries(st, tail.st), vty, with_ty(block, vty))
-}
-
-
-
-# A let-RHS under annotation. A textual numeric literal
-# (`EIntLit`/`EDecimalLit`) coins against the resolved annotation here,
-# before `synth` would error on the missing context; everything else
-# synths normally and the post-synth `maybe_mint_literal` covers the
-# `EInt`/`EReal` cases.
-#[doc("Typer-internal helper `synth_let_rhs_or_mint` shared across the infer modules.")]
-pub fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
-                         line: Int, col: Int) : Inferred / Console + File + Mutable {
-  match rhs.kind {
-    EIntLit(_)     -> mint_let_textual(st, rhs, te, line, col)
-    EDecimalLit(_) -> mint_let_textual(st, rhs, te, line, col)
-    EUnop(UoNeg, x) -> match x.kind {
-      EIntLit(_) -> mint_let_textual(st, rhs, te, line, col)
-      _          -> w_synth(st, rhs)
-    }
-    # The annotation names the record a bare literal head builds.
-    ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, st_annot_ty(st, te), rhs.line, rhs.col)
-    _ -> w_synth(st, rhs)
-  }
-}
-
-
-
-# `e` where a type is expected: a record literal's head is asked of that
-# type first, as is one written as an element of a list literal, and a
-# lambda's parameters take its domains; any other shape is synthesised.
-#[doc("Typer-internal helper `synth_expecting` shared across the infer modules.")]
-pub fn synth_expecting(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = match e.kind {
-  ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
-  ELambda(ps, body) -> match apply_ty(st.sub, expected) {
-    TyFnT(doms, _, _) -> synth_lambda_expecting(st, ps, body, doms, e.line, e.col)
-    _                 -> w_synth(st, e)
-  }
-  EList(els) -> match apply_ty(st.sub, expected) {
-    TyListT(elem_ty) -> if any(els, elem_is_record_lit) { w_check_elems(st, els, elem_ty, e.line, e.col) }
-                        else { w_synth(st, e) }
-    _ -> w_synth(st, e)
-  }
-  _ -> w_synth(st, e)
-}
-
-
-
-fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
-                    line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let expected = apply_ty(st.sub, st_annot_ty(st, te))
-  match mint_literal(rhs, expected, mint_bigint_home(st.env)) {
-    MintOk(e2) -> {
-      let ty = match e2.ty { Some(t) -> t None -> expected }
-      mk_inferred(st, ty, e2)
-    }
-    MintErr(msg) -> {
-      let perr = mk_diag(SevError, st.file, line, col, msg, [])
-      render_diag(perr)
-      mk_inferred(st_bump_err(st_push_diag(st, perr)), expected, rhs)
-    }
-    MintNone -> w_synth(st, rhs)
-  }
-}
-
-
-
-# A field whose declared type is a sum picks the constructor the way an
-# annotated binding does; every other shape keeps synthesising, so the
-# field's type still only has to unify.
-fn synth_field_value(st: InferState, ex: Expr, ft: Option[Ty]) : Inferred / Console + File + Mutable =
-  match ft {
-    None     -> w_synth(st, ex)
-    Some(ty) -> check_branch_for_ctor(st, ex, apply_ty(st.sub, ty))
-  }
-
-
-
-fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferredFInits / Console + File + Mutable {
-
-
-  match fis {
-    [] -> InferredFInits { st: st, fis: [] }
-    [fi, ...rest] -> match fi {
-      FI(fnm, ex) -> {
-        let r = synth_field_value(st, ex, fty_find(fields, fnm))
-        let minted = match fty_find(fields, fnm) {
-          None -> MintedExpr { st: r.st, pair: ExprTy { expr: r.expr, ty: r.ty } }
-          Some(ft) -> maybe_mint_literal(r.st, r.expr, r.ty, apply_ty(r.st.sub, ft), line, col)
-        }
-        let coerced = match fty_find(fields, fnm) {
-          Some(ft) -> if rc_mentions(ft) or rc_mentions_in(minted.st.sub, minted.pair.ty) { refine_coerce(minted, ft, field_what(fnm), ex.line, ex.col) } else { minted }
-          None -> minted
-        }
-        let lower_pair = coerced.pair
-        let s1 = match fty_find(fields, fnm) {
-          None -> coerced.st
-          Some(ft) -> st_unify(coerced.st, ft, lower_pair.ty, field_what(fnm), line, col)
-        }
-        let rr = synth_field_inits(s1, rest, fields, line, col)
-        InferredFInits { st: rr.st, fis: [FI(fnm, lower_pair.expr), ...rr.fis] }
-      }
-    }
-  }
-}
-
 
 
 #[doc("Typer-internal helper `synth_match` shared across the infer modules.")]
@@ -602,7 +109,6 @@ pub fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) 
   mk_inferred(st_post, ty, root)
   }
 }
-
 
 
 # bidirectional check variant of `synth_match`. When the
@@ -652,7 +158,6 @@ pub fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 }
 
 
-
 # Rewrite a fixed-vec match to the selected arm's body. Arms ride the
 # same shape contract as the dynamic rewrite (no guards, simple head
 # binders); the length test is decided here instead of at runtime, so a
@@ -684,7 +189,6 @@ fn synth_fixed_vec_match(st: InferState, scr: Expr, arms: [Arm], scr_ty: Ty,
 }
 
 
-
 # Rewrite a Vec-scrutinee match into the vec_match if-chain and type it
 # ONCE (check-mode when an expected type is in play). The scrutinee was
 # already synthesised to learn its type; the returned state is threaded
@@ -703,7 +207,6 @@ fn synth_vec_match(st: InferState, scr: Expr, arms: [Arm], expected: Option[Ty],
     mk_inferred(g.st, TyAny, with_ty(mk_expr(EMatch(scr, arms), line, col), TyAny))
   }
 }
-
 
 
 # A list-pattern match on a `Seq`, typed as the match over the read cell
@@ -725,7 +228,6 @@ fn synth_seq_match(st: InferState, scr: Expr, arms: [Arm], expected: Option[Ty],
       }
     }
   }
-
 
 
 # A part of a `lazy [...]` performs nothing. A thunk's effects are its
@@ -762,7 +264,6 @@ pub fn synth_lazy_part(st: InferState, x: Expr) : Inferred / Console + File + Mu
 }
 
 
-
 # The progression of a `lazy` range: `call` is `from(start)`,
 # `from_step(start, step)` or `range(start, end, step)`. The start says
 # whether the range walks Int or Char, as in a list range, and the bounds
@@ -790,7 +291,6 @@ pub fn synth_lazy_range(st: InferState, call: Expr) : Inferred / Console + File 
   }
   _ -> w_synth(st, call)
 }
-
 
 
 # bidirectional walker over match arms. Mirrors
@@ -830,7 +330,6 @@ fn check_arms(st: InferState, arms: [Arm], scrut_ty: Ty, expected: Ty,
     }
   }
 }
-
 
 
 # bidirectional check variant of `synth_if`, parallel to
@@ -876,40 +375,6 @@ pub fn check_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr],
 }
 
 
-
-# Helper: route a branch through `check_expr_against`
-# when it is a bare ctor reference (or a block whose tail is), so the
-# annotation context can disambiguate. Other shapes fall through to
-# `synth` to keep existing behaviour.
-fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Console + File + Mutable {
-
-  match br.kind {
-    ECall(c, _) -> match c.kind {
-      EName(_) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-      ESym(_, _) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-      _ -> w_synth(st, br)
-    }
-    EName(_) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-    ESym(_, _) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-    EBlock(_, tail) -> match tail {
-      Some(te) -> match te.kind {
-        ECall(c, _) -> match c.kind {
-          EName(_) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-          ESym(_, _) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-          _ -> w_synth(st, br)
-        }
-        EName(_) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-        ESym(_, _) -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-        _ -> if is_record_lit(te) { w_check_against(st, br, expected, "if branch", br.line, br.col) } else { w_synth(st, br) }
-      }
-      None -> w_synth(st, br)
-    }
-    _ -> synth_expecting(st, br, expected)
-  }
-}
-
-
-
 fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int, col: Int) : InferredArms / Console + File + Mutable {
 
 
@@ -939,20 +404,5 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
 }
 
 # ---- per-decl entry + dumper ----
-
-
-
-# A contract predicate is synthesised against an empty row, so what it
-# performs is its own and not hidden by the enclosing body's effects.
-#[doc("Typer-internal helper `synth_assert_cond` shared across the infer modules.")]
-pub fn synth_assert_cond(st: InferState, cond: Expr, kind: Option[ContractKind]) : Inferred / Console + File + Mutable =
-  match kind {
-    None    -> w_synth(st, cond)
-    Some(k) -> {
-      let r = w_synth(InferState { ...st, row: [], eff_uses: [] }, cond)
-      let st1 = reject_predicate_effect(r.st, contract_kind_word(k), r.st.row, cond)
-      Inferred { st: InferState { ...st1, row: st.row, eff_uses: st.eff_uses }, ty: r.ty, expr: r.expr }
-    }
-  }
 
 

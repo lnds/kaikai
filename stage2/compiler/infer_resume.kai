@@ -1,0 +1,201 @@
+#[doc("Typing of `resume` calls inside handler clauses and of the segment requests and handles a clause body performs.")]
+
+import compiler.diag
+import compiler.ast
+import compiler.written
+import compiler.resolve_names
+import compiler.handler_alias
+import compiler.decl_names
+import compiler.symtab
+import compiler.cont_type
+import compiler.infer_unit_alias
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_clause_holes
+import compiler.infer_env_exhaust
+import compiler.infer_dump_text
+import compiler.infer_apply
+import compiler.infer_instantiate
+import compiler.infer_tparam_escape
+import compiler.infer_values
+import compiler.infer_args
+
+# type-check `resume(v)` in a STATELESS clause against `resume`'s env scheme
+# (`bind_resume_param_typed` bound it to `(answer) -> ?fresh`). Done here
+# rather than via the generic `synth(callee)` path so the callee `resume`
+# never reaches the value-position guard of a local read.
+fn synth_resume_call_stateless(st: InferState, k: LocalId, args_: [Expr], callee: Expr,
+                                line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let callee_ty = match env_local(st.env, k) {
+    Some(sc) -> (st_instantiate_report(st, sc)).ty
+    None     -> TyAny
+  }
+  let ra = synth_many(st, args_)
+  let rv = st_fresh_ty(ra.st)
+  let fr = subst_fresh_row(rv.st.sub)
+  let st_fresh = st_set_sub(rv.st, fr.subst)
+  let expected = TyFnT(ra.tys, rv.ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
+  let st_unif = st_unify_call(st_fresh, callee, callee_ty, ra.tys, expected, line, col)
+  let ty = apply_ty(st_unif.sub, rv.ty)
+  let resume_root = with_ty(mk_local(local_minted(canonical_continuation()), callee.line, callee.col), callee_ty)
+  let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
+  mk_inferred(st_unif, ty, root)
+}
+
+
+# `$resume_frame(f)`, minted by the non-tail `resume` split: `f` takes
+# the handle's result and yields the next one, and it runs at the handle's
+# exit in the clause's own context, so its effects are the clause's.
+#[doc("Typer-internal helper `synth_resume_frame` shared across the infer modules.")]
+pub fn synth_resume_frame(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [f] -> {
+    let rf = w_synth(st, f)
+    let s_ty = clause_result_ty(rf.st)
+    let fr = subst_fresh_row(rf.st.sub)
+    let expected = TyFnT([s_ty], s_ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
+    let st1 = st_unify(st_set_sub(rf.st, fr.subst), expected, rf.ty, "deferred clause tail", e.line, e.col)
+    let st2 = st_propagate_capability_labels(st1, apply_ty(st1.sub, rf.ty), e.line, e.col)
+    mk_inferred(st2, TyUnit, with_ty(mk_expr(EIntrinsic(InResumeFrame, [rf.expr]), e.line, e.col), TyUnit))
+  }
+  _ -> {
+    let perr = mk_diag(SevError, st.file, e.line, e.col, "compiler intrinsic `$resume_frame` takes one argument", [])
+    render_diag(perr)
+    inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
+  }
+}
+
+
+# `$seg_request(i, args...)`: a forwarding clause handing op `i` to its
+# segment handle; its value is what the continuation is called with.
+#[doc("Typer-internal helper `synth_seg_request` shared across the infer modules.")]
+pub fn synth_seg_request(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [ix, ...xs] -> {
+    let ra = synth_many(st, xs)
+    let r = st_fresh_ty(ra.st)
+    mk_inferred(r.st, r.ty, with_ty(mk_expr(EIntrinsic(InSegRequest, [with_ty(ix, TyInt), ...ra.exprs]), e.line, e.col), r.ty))
+  }
+  [] -> seg_error(st, e, "compiler intrinsic `$seg_request` takes an op index", "")
+}
+
+
+# `$seg_handle(escapes, reason, body, return, clause...)`: the body thunk is
+# typed first; its forwarders' requests give each clause its parameter types
+# and its continuation `Cont[answer, S, e]`, where `S` is the handle's type and
+# `e` the thunk's row: what the body performs besides the handled effect.
+#[doc("Typer-internal helper `synth_seg_handle` shared across the infer modules.")]
+pub fn synth_seg_handle(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [esc, why, thunk, ret, ...cls] -> {
+    let rt = w_synth(st, thunk)
+    let (body_ty, e_ty) = match apply_ty(rt.st.sub, rt.ty) {
+      TyFnT(_, b, row) -> (b, row_arg_carrier(row))
+      t -> (t, row_arg_carrier(inf_row_empty()))
+    }
+    let rs = st_fresh_ty(rt.st)
+    let rr = seg_lambda(rs.st, ret, [body_ty], rs.ty)
+    let rc = seg_clauses(rr.st, cls, rt.expr, rs.ty, e_ty, 0, [])
+    let st1 = seg_absorb(seg_absorb(rc.st, rt.ty, e), rr.ty, e)
+    let node = mk_expr(EIntrinsic(InSegHandle, [esc, why, rt.expr, rr.expr, ...rc.exprs]), e.line, e.col)
+    mk_inferred(st1, rs.ty, with_ty(node, rs.ty))
+  }
+  _ -> seg_error(st, e, "compiler intrinsic `$seg_handle` has a malformed argument list", "")
+}
+
+
+fn seg_clauses(st: InferState, cls: [Expr], body: Expr, s_ty: Ty, e_ty: Ty, i: Int, acc: [Expr]) : SegClauses / Console + File + Mutable =
+  match cls {
+    [] -> SegClauses { st: st, exprs: list_reverse(acc) }
+    [c, ...rest] -> {
+      let pins = match seg_request_at(body, i) {
+        Some(req) -> [...map(req.args, (a) => ty_of_expr(a)), cont_ty(ty_of_expr(req.at), s_ty, e_ty)]
+        None -> []
+      }
+      let r = seg_lambda(st, c, pins, s_ty)
+      seg_clauses(seg_absorb(r.st, r.ty, c), rest, body, s_ty, e_ty, i + 1, [r.expr, ...acc])
+    }
+  }
+
+
+# A clause or return lambda: parameters pinned, result the handle's type.
+# The `()` standing for a missing return clause passes the body's value on.
+fn seg_lambda(st: InferState, lam: Expr, pins: [Ty], s_ty: Ty) : Inferred / Console + File + Mutable = match lam.kind {
+  EUnit -> match pins {
+    [b] -> mk_inferred(st_unify(st, s_ty, b, "handle result", lam.line, lam.col), TyUnit, with_ty(lam, TyUnit))
+    _ -> w_synth(st, lam)
+  }
+  ELambda(ps, b) -> {
+    let r = synth_lambda_pinned(st, ps, b, pins, "handler clause", lam.line, lam.col)
+    let res = match apply_ty(r.st.sub, r.ty) { TyFnT(_, t, _) -> t  t -> t }
+    Inferred { ...r, st: st_unify(r.st, s_ty, res, "handler clause result", lam.line, lam.col) }
+  }
+  _ -> w_synth(st, lam)
+}
+
+
+# type-check `resume(v)` / `resume(v, ns)` inside a clause body.
+# Stateful clauses validate against `clause_resume` (precise answer/state
+# types); stateless clauses type the call against `resume`'s env scheme.
+# Intercepting the call here keeps the callee off the local-read arm of
+# `synth`, whose value-position guard would otherwise reject this legal call.
+# Returns None when the call is not a resume inside a clause.
+#[doc("Typer-internal helper `try_resume_call` shared across the infer modules.")]
+pub fn try_resume_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match callee.kind {
+    ELocal(l) -> try_resume_local(st, l, callee, args_, line, col)
+    _         -> None
+  }
+
+
+fn try_resume_local(st: InferState, l: LocalId, callee: Expr, args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match st.in_clause {
+    CcOwn(k)      -> if local_eq(l, k.id) { Some(resume_in_clause(st, l, args_, callee, line, col)) } else { None }
+    CcInLambda(k) -> if local_eq(l, k.id) { Some(lambda_resume_call(st, k.name, callee)) } else { None }
+    CcNone        -> None
+  }
+
+
+fn resume_in_clause(st: InferState, l: LocalId, args_: [Expr], callee: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match st.clause_resume {
+    Some(rb) -> synth_resume_call(st, rb, args_, callee, line, col)
+    None     -> synth_resume_call_stateless(st, l, args_, callee, line, col)
+  }
+
+
+fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
+                      callee: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+
+
+  match rb {
+    RB(answer_ty, state_ty, result_ty) -> {
+      let ra = synth_many(st, args_)
+      let rv = ty_res(ra.st, result_ty)
+      # st_unify treats the first arg as `expected` and the second as
+      # `found`; the resume answer is what the clause must produce, so
+      # answer_ty is the `expected` slot.
+      let st_after = match ra.tys {
+        [a]     -> st_unify(rv.st, answer_ty, a,
+                             "resume answer", line, col)
+        [a, ns] -> {
+          let s1 = st_unify(rv.st, answer_ty, a,
+                              "resume answer", line, col)
+          st_unify(s1, state_ty, ns,
+                    "resume new state", line, col)
+        }
+        _ -> {
+          let perr = mk_diag(SevError, rv.st.file, line, col,
+            "resume call: expected 1 or 2 arguments inside a stateful clause", [])
+          render_diag(perr)
+          diag_note("`resume(v)` resumes with the answer; `resume(v, ns)` also writes the new handler state")
+          diag_help("for `with State[T]` and `with Writer[W]`, use `resume(v, new_state)`; otherwise `resume(v)`")
+          st_bump_err(st_push_diag(rv.st, perr))
+        }
+      }
+      let ty = apply_ty(st_after.sub, rv.ty)
+      let resume_root = with_ty(mk_local(local_minted(canonical_continuation()), callee.line, callee.col), TyAny)
+      let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
+      mk_inferred(st_after, ty, root)
+    }
+  }
+}
