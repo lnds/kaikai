@@ -350,6 +350,8 @@ KaiValue *kaix_core_flat_map(KaiValue *xs, KaiValue *f)     { return kai_core_fl
 KaiValue *kaix_core_each(KaiValue *xs, KaiValue *f)         { return kai_core_each(xs, f); }
 KaiValue *kaix_core_filter(KaiValue *xs, KaiValue *p)       { return kai_core_filter(xs, p); }
 KaiValue *kaix_core_reduce(KaiValue *xs, KaiValue *i, KaiValue *f) { return kai_core_reduce(xs, i, f); }
+KaiValue *kaix_core___deep_apply1(KaiValue *x, KaiValue *f)             { return kai_core___deep_apply1(x, f); }
+KaiValue *kaix_core___deep_apply2(KaiValue *x, KaiValue *p, KaiValue *f) { return kai_core___deep_apply2(x, p, f); }
 
 /* Closure construction. Accepts a KaiFn-compatible function pointer
    (passed as a void* from the LLVM IR for opaque-pointer mode). */
@@ -442,6 +444,8 @@ KAIX_CORE_THUNK2(map)
 KAIX_CORE_THUNK2(flat_map)
 KAIX_CORE_THUNK2(filter)
 KAIX_CORE_THUNK3(reduce)
+KAIX_CORE_THUNK2(__deep_apply1)
+KAIX_CORE_THUNK3(__deep_apply2)
 KAIX_CORE_THUNK2(each)
 KAIX_CORE_THUNK0(args)
 KAIX_CORE_THUNK0(program_name)
