@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.165.2 (2026-10-18)
+
+### Fixed
+
+- **stdlib**: bound derived Json recursion depth by memory, not by the fiber stack
+- **tools**: write the KIR verify report for test fixtures in the leak gate
+- **perceus**: keep a param read ahead of a block whose tail has a base path from moving raw
+- **runtime**: walk a list's spine iteratively in structural equality
+- **derive**: keep a decoded field's binder from shadowing the reader's parameters
+- **mutate**: elide a call whose receiver is parenthesised, and widen negate over leading groups
+
+### Changed
+
+- **perceus**: write a Vec in place through a fold lambda, an arm binder and a record field
+- **perceus**: build the read table once in perceus_decl_b
+- **perceus**: give test and bench bodies the full paramless Perceus rewrite
+
 ## v0.165.1 (2026-10-18)
 
 ### Fixed
