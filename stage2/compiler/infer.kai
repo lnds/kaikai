@@ -40,6 +40,7 @@ import compiler.diag_file
 import compiler.spawn_row
 import compiler.mutation_callees
 import compiler.mutation_carriers
+import compiler.mutation_taint
 import compiler.kinds
 import compiler.kind_theory
 import compiler.kind_semilattice
@@ -13243,13 +13244,14 @@ fn join_modules_for_diag(mods: [String]) : String {
 #     name. Names introduced via `var x = init` desugar to
 #     `let x__slot = array_make(1, init)` and pick up the same
 #     local label for free.
-#   Escape scan. A name escapes if it appears as an argument
-#     position of any call other than `array_make`,
-#     `array_length`, `array_get`, `array_set`, `array_grow`.
-#     Returning the name as the function's tail value is NOT an
-#     escape (the caller receives a settled value, not a
-#     witnessable mutation). Passing a local Array to ANOTHER
-#     function that may mutate it is conservatively treated as escape.
+#   Escape scan. A name escapes if it is an argument of an operation
+#     of an effect other than `Mutable`, or of a callee that is not a
+#     named function. Returning the name as the function's tail value
+#     is NOT an escape (the caller receives a settled value, not a
+#     witnessable mutation); neither is passing it to a named callee,
+#     whose demand Pass 2 classifies.
+#   Taint. A local that `array_set` stores a foreign carrier into stays
+#     a valid destination, but nothing read out of it is local.
 #   Pass 2 — demand classification. Walks every call to a callee
 #     declared `/ Mutable` (the core `array_set`/`array_grow`,
 #     the qualified `Mutable.array_set`/`ref_set`, a Ref-backed
@@ -13290,13 +13292,20 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
 # `dmut` lists every mutation-carrying type (a transitive `Array`/`Ref`
 # field, e.g. `HashMap` / `HashSet` / `{ arr: Array }`): passing one to a
 # `/ Mutable` callee is observable iff it is a parameter or escapes.
-type MutScan = { tab: SymTab, locals: [LocalId], escaped: [LocalId], opaque: [LocalId], dmut: [SymId] }
+type MutScan = { tab: SymTab, locals: [LocalId], tainted: [LocalId], escaped: [LocalId], opaque: [LocalId], dmut: [SymId] }
 
 fn mut_scan(st: InferState, params: [Param], body: Expr) : MutScan {
   let dmut = st.env.carriers
-  MutScan { tab: st.env.tab, locals: collect_local_arrays(body, [], dmut),
-            escaped: collect_escaped_names(st.protos.ids, body, []),
+  let built = collect_local_arrays(body, [], dmut)
+  let tainted = tainted_locals(body, built, (v, live) => stores_foreign_carrier(v, live, dmut))
+  MutScan { tab: st.env.tab, locals: filter(built, (l) => not lid_in(tainted.all, l)), tainted: tainted.roots,
+            escaped: collect_escaped_result(st.protos.ids, body, []),
             opaque: opaque_binders(params, body), dmut: dmut }
+}
+
+fn stores_foreign_carrier(v: Expr, live: [LocalId], dmut: [SymId]) : Bool = match v.ty {
+  Some(t) -> ty_may_carry_mutation(t, dmut) and not rhs_is_local_origin(v, live, dmut)
+  None    -> false
 }
 
 # Re-runs the masking scan, so call it only where `Mutable` stayed on a row
@@ -13678,7 +13687,9 @@ fn collect_escaped_names_kind(ids: ProtoIds, k: ExprKind, acc: [LocalId]) : [Loc
       let safe = match callee.kind {
         ELocal(_) -> true
         ESym(_, _) -> true
-        EOp(_) -> true
+        # A handler keeps what an operation hands it; only `Mutable`'s own
+        # operations take the cell they act on.
+        EOp(r) -> effect_is(r.eff, CeMutable)
         # A callee the typer has yet to settle names a declaration.
         EName(_) -> true
         # A primitive mark is a named callee like any bare one.
@@ -13794,6 +13805,29 @@ fn collect_escaped_in_exprs(ids: ProtoIds, es: [Expr], acc: [LocalId]) : [LocalI
     ELocal(l) -> collect_escaped_in_exprs(ids, rest, [l, ...acc])
     _         -> collect_escaped_in_exprs(ids, rest, collect_escaped_names(ids, h, acc))
   }
+}
+
+# The function's result: a record literal returned from it hands its fields
+# to the caller, like returning the local itself, so they do not escape.
+fn collect_escaped_result(ids: ProtoIds, e: Expr, acc: [LocalId]) : [LocalId] = match e.kind {
+  EBlock(stmts, tail) -> {
+    let a1 = collect_escaped_in_stmts(ids, stmts, acc)
+    match tail { Some(t) -> collect_escaped_result(ids, t, a1)  None -> a1 }
+  }
+  EIf(c, t_, eo) -> {
+    let a2 = collect_escaped_result(ids, t_, collect_escaped_names(ids, c, acc))
+    match eo { Some(x) -> collect_escaped_result(ids, x, a2)  None -> a2 }
+  }
+  EMatch(scr, arms) -> foldl(arms, collect_escaped_names(ids, scr, acc), (a, arm) => match arm {
+    Arm(_, g, b) -> collect_escaped_result(ids, b, match g { Some(gx) -> collect_escaped_names(ids, gx, a)  None -> a })
+  })
+  ERecordLit(_, fs) -> foldl(fs, acc, (a, f) => match f {
+    FI(_, v) -> match v.kind {
+      ELocal(_) -> a
+      _         -> collect_escaped_result(ids, v, a)
+    }
+  })
+  _ -> collect_escaped_names(ids, e, acc)
 }
 
 fn collect_escaped_in_stmts(ids: ProtoIds, stmts: [Stmt], acc: [LocalId]) : [LocalId] = match stmts {
@@ -13912,7 +13946,14 @@ fn first_nonlocal_carrier(args_: [Expr], sc: MutScan) : Option[Expr] = match arg
 # observable only through that destination.
 fn writer_dst_nonlocal(args_: [Expr], sc: MutScan) : Option[Expr] = match args_ {
   []            -> None
-  [h, ..._rest] -> if arg_is_local_carrier(h, sc.locals, sc.escaped, sc.dmut) { None } else { Some(h) }
+  [h, ..._rest] -> if dst_is_local(h, sc) { None } else { Some(h) }
+}
+
+# A tainted container is still a local destination: only what is read out
+# of it is foreign.
+fn dst_is_local(h: Expr, sc: MutScan) : Bool = match h.kind {
+  ELocal(l) -> not lid_in(sc.escaped, l) and (lid_in(sc.locals, l) or lid_in(sc.tainted, l))
+  _         -> arg_is_local_carrier(h, sc.locals, sc.escaped, sc.dmut)
 }
 
 # The argument through which a `/ Mutable` call's demand is observable.
@@ -13921,7 +13962,7 @@ fn demand_target(callee: Expr, args_: [Expr], sc: MutScan) : Option[Expr] =
   else { first_nonlocal_carrier(args_, sc) }
 
 fn callee_writes_only_first_arg(tab: SymTab, callee: Expr) : Bool = match callee.kind {
-  ESym(s, _) -> writes_only_first_arg(tab, s)
+  ESym(s, _) -> writes_only_first_arg(tab, s) or is_builtin_ref(callee, CbArraySet)
   _          -> false
 }
 
@@ -13949,7 +13990,8 @@ fn call_demand_is_local(callee: Expr, args_: [Expr], sc: MutScan) : Bool {
 }
 
 # The first `Mutable` demand in `e` whose mutation the caller could observe,
-# or None when every demand is local.
+# or None when every demand is local. A loop intrinsic's lambdas are walked
+# like any other child.
 fn external_demand(e: Expr, sc: MutScan) : Option[Expr] = match e.kind {
   ECall(callee, args_) ->
     if not call_demand_is_local(callee, args_, sc) { Some(e) }
@@ -13957,57 +13999,16 @@ fn external_demand(e: Expr, sc: MutScan) : Option[Expr] = match e.kind {
       None  -> external_demand_in_args(args_, sc)
       found -> found
     } }
-  EBlock(stmts, tail) -> match external_demand_in_stmts(stmts, sc) {
-    None  -> external_demand_opt(tail, sc)
-    found -> found
-  }
-  EIf(c, t_, eo) -> match external_demand_pair(c, t_, sc) {
-    None  -> external_demand_opt(eo, sc)
-    found -> found
-  }
-  EMatch(scr, arms) -> match external_demand(scr, sc) {
-    None  -> external_demand_in_arms(arms, sc)
-    found -> found
-  }
-  EBinop(_, a, b)        -> external_demand_pair(a, b, sc)
-  EUnop(_, x)            -> external_demand(x, sc)
-  EField(b, _)           -> external_demand(b, sc)
-  EIndex(a, b)           -> external_demand_pair(a, b, sc)
-  EPipe(a, b)            -> external_demand(pipe_as_call(a, b), sc)
-  EDispatchPipe(_, a, b) -> external_demand_pair(a, b, sc)
-  ELambda(_, b)          -> external_demand(b, sc)
-  ERecordLit(_, fs)      -> external_demand_in_field_inits(fs, sc)
-  EList(els)             -> external_demand_in_list_elems(els, sc)
-  ERange(a, b, oc) -> match external_demand_pair(a, b, sc) {
-    None  -> external_demand_opt(oc, sc)
-    found -> found
-  }
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> match external_demand(body, sc) {
-    None -> match external_demand_opt(init_opt, sc) {
-      None -> match external_demand_in_hclauses(clauses, sc) {
-        None -> match ret_opt {
-          Some(HR(_, b, _, _)) -> external_demand(b, sc)
-          None                 -> None
-        }
-        found -> found
-      }
-      found -> found
-    }
-    found -> found
-  }
-  ELitUnit(inner, _) -> external_demand(inner, sc)
-  EBang(inner)       -> external_demand(inner, sc)
-  _ -> None
+  EPipe(a, b) -> external_demand(pipe_as_call(a, b), sc)
+  _           -> external_demand_in_positions(xp_positions(e), sc)
 }
 
-fn external_demand_opt(o: Option[Expr], sc: MutScan) : Option[Expr] = match o {
-  Some(x) -> external_demand(x, sc)
-  None    -> None
-}
-
-fn external_demand_pair(a: Expr, b: Expr, sc: MutScan) : Option[Expr] = match external_demand(a, sc) {
-  None  -> external_demand(b, sc)
-  found -> found
+fn external_demand_in_positions(ps: [XPos], sc: MutScan) : Option[Expr] = match ps {
+  []                  -> None
+  [XP(_, c), ...rest] -> match external_demand(c, sc) {
+    None  -> external_demand_in_positions(rest, sc)
+    found -> found
+  }
 }
 
 # Reached only once the call passed the carrier-locality check, so a lambda
@@ -14024,77 +14025,6 @@ fn external_demand_in_args(es: [Expr], sc: MutScan) : Option[Expr] = match es {
     match found {
       None -> external_demand_in_args(rest, sc)
       _    -> found
-    }
-  }
-}
-
-fn external_demand_in_stmts(stmts: [Stmt], sc: MutScan) : Option[Expr] = match stmts {
-  []           -> None
-  [s, ...rest] -> match external_demand_in_stmt(s, sc) {
-    None  -> external_demand_in_stmts(rest, sc)
-    found -> found
-  }
-}
-
-fn external_demand_in_stmt(s: Stmt, sc: MutScan) : Option[Expr] = match s {
-  SLet(_, _, rhs) -> external_demand(rhs, sc)
-  SAssert(c, m) -> match external_demand(c, sc) {
-    None  -> external_demand_opt(m, sc)
-    found -> found
-  }
-  SExprStmt(x) -> external_demand(x, sc)
-  SIndexAssign(b, i, v, _, _) -> match external_demand_pair(b, i, sc) {
-    None  -> external_demand(v, sc)
-    found -> found
-  }
-  SAssign(b, v, _, _)   -> external_demand_pair(b, v, sc)
-  SVar(_, _, rhs, _, _) -> external_demand(rhs, sc)
-  SUse(_, _, _)         -> None
-}
-
-fn external_demand_in_arms(arms: [Arm], sc: MutScan) : Option[Expr] = match arms {
-  []           -> None
-  [h, ...rest] -> match h {
-    Arm(_, g, b) -> match external_demand_opt(g, sc) {
-      None -> match external_demand(b, sc) {
-        None  -> external_demand_in_arms(rest, sc)
-        found -> found
-      }
-      found -> found
-    }
-  }
-}
-
-fn external_demand_in_hclauses(cs: [HClause], sc: MutScan) : Option[Expr] = match cs {
-  []           -> None
-  [h, ...rest] -> match h {
-    HC(_, _, b, _, _) -> match external_demand(b, sc) {
-      None  -> external_demand_in_hclauses(rest, sc)
-      found -> found
-    }
-  }
-}
-
-fn external_demand_in_field_inits(fs: [FieldInit], sc: MutScan) : Option[Expr] = match fs {
-  []           -> None
-  [h, ...rest] -> match h {
-    FI(_, v) -> match external_demand(v, sc) {
-      None  -> external_demand_in_field_inits(rest, sc)
-      found -> found
-    }
-  }
-}
-
-fn external_demand_in_list_elems(els: [ListElem], sc: MutScan) : Option[Expr] = match els {
-  []           -> None
-  [h, ...rest] -> {
-    let x = match h {
-      ElPlain(p)  -> p
-      ElSpread(p) -> p
-    }
-    match external_demand(x, sc) {
-      None  -> external_demand_in_list_elems(rest, sc)
-      found -> found
     }
   }
 }

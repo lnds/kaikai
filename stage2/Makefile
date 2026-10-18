@@ -3871,6 +3871,7 @@ TEST_EFFECTS_CASES := \
 	test-effects-local_ref_masks_mutable \
 	test-effects-mutable_user_handler_over_default \
 	test-effects-array_mutable_required \
+	test-effects-mask_escape_required \
 	test-effects-mutable_blame \
 	test-effects-prelude_effect_via_scheme \
 	test-effects-issue_308_user_log_effect \
@@ -5200,7 +5201,13 @@ test-effects-local_ref_masks_mutable: $(TARGET) build core-cache-warm
 	for f in ../examples/effects/local_ref_masks_mutable.kai \
 	         ../examples/effects/local_hashmap_masks_mutable.kai \
 	         ../examples/effects/string_builder_build_correct.kai \
-	         ../examples/effects/string_builder_masks_mutable.kai; do \
+	         ../examples/effects/string_builder_masks_mutable.kai \
+	         ../examples/effects/mask_helper_local.kai \
+	         ../examples/effects/mask_helper_returns.kai \
+	         ../examples/effects/mask_stored_in_local_cell.kai \
+	         ../examples/effects/mask_loop_local.kai \
+	         ../examples/effects/mask_loop_replaced_array.kai \
+	         ../examples/effects/mask_user_loop_local.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -5255,6 +5262,25 @@ test-effects-array_mutable_required: $(TARGET) build core-cache-warm
 	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
+	  echo "effects OK $$name (rejected with the expected diagnostic)"; \
+	done
+
+# A local container that can be observed from outside the function keeps
+# `Mutable` on its row: a loop body, an operation argument, a stored
+# parameter, a closure the function did not write.
+test-effects-mask_escape_required: $(TARGET) build core-cache-warm
+	@set -e; \
+	for f in ../examples/effects/mask_err_*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $${f%.kai}.err.expected; \
 	  echo "effects OK $$name (rejected with the expected diagnostic)"; \
 	done
 

@@ -1746,10 +1746,11 @@ two precise rules:
    function. The mutation is NOT observable when the Array was
    constructed locally inside the function (`array_make`, or a
    chained `array_set` / `array_grow` of an already-local
-   binding) and the function never passes the Array to another
-   helper before returning. Returning the Array as the
-   function's tail value is fine — the caller receives a
-   settled value, not a witnessable mutation.
+   binding) and the function never lets it escape (see *Escape
+   rule*). Passing it to a `/ Mutable` helper does not make it
+   escape. Returning the Array as the function's tail value is
+   fine — the caller receives a settled value, not a witnessable
+   mutation.
 
 2. **`array_get` and `array_length` NEVER require `Mutable`,
    regardless of the Array's provenance.** Reading is pure from
@@ -1782,8 +1783,8 @@ two precise rules:
 The typer enforces this by collecting Mutable demand at every
 `array_set` / `array_grow` call site, then walking the typed
 function body once to classify each demand as local (the target
-Array was constructed in this function and never escapes via a
-non-`array_*` call) or external (anything else). A function
+Array was constructed in this function and never escapes, per the
+*Escape rule*) or external (anything else). A function
 whose every demand is local has `Mutable` *masked* from its
 inferred row — the same way `var x := init` masks `State[T]` at
 the surrounding block boundary. A function with even one
@@ -1853,16 +1854,34 @@ Both rows need `/ Mutable`: `apply` calls a closure it did not write,
 and `poke` hands the caller's `a` to a `/ Mutable` callee. Dropping
 either row is a type error.
 
-### Conservative escape rule (v1 scope)
+### Escape rule
 
-Edge case explicitly out of scope for v1: passing a
-locally-constructed Array to ANOTHER function that mutates it.
-The conservative classification treats every Array passed as an
-argument to a non-`array_*` callee as escaping (the callee
-might mutate it), forcing `Mutable` in the caller's row even if
-the binding originated from `array_make` here. A future
-refinement may track callee purity. Today the workaround is to
-keep mutation inline inside the constructing function.
+A `/ Mutable` call is a local demand when every argument that carries
+mutation (an `Array`, a `Ref`, or a type that stores one) is a local the
+function built and did not let escape. One external demand keeps
+`Mutable` on the function's row. A local stops being local when:
+
+- it is a parameter, or is read out of one;
+- it is an argument of an effect operation other than `Mutable`'s own,
+  because a handler keeps what an operation hands it;
+- `array_set` stores into it a carrier the function did not build (a
+  parameter, or a call result that may alias one). The container is
+  still a valid destination, but whatever is read out of it, or bound
+  from it, is not local;
+- it is handed to a closure the function did not write (rule 5).
+
+Passing a local to a `/ Mutable` helper does not break any of these: the
+helper may write it, return it, or store it in another local, and the
+caller still holds the only reference. `array_set` and the bytes writers
+mutate only their first argument, so the value `array_set` stores is not
+a mutated carrier.
+
+The walk covers every sub-expression of the body, including the blocks
+of `while`, `until` and `repeat`. A lambda literal passed to a call is
+walked with the body and its parameters inherit the locality proven at
+that call, so a block passed to a loop combinator or to a user-written
+higher-order function writes the caller's locals locally and the
+caller's parameters externally.
 
 When the rule keeps `Mutable` on a row that does not declare it, the
 error points at the first demand whose target has no provable local
