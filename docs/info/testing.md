@@ -21,6 +21,8 @@ kai test [<spec>|./...]            # run tests
 kai test --json [<spec>|./...]     # machine-readable results
 kai test --only <id> [<spec>|./...]  # run named blocks (repeatable)
 kai test --json --coverage [<spec>]  # + the lines each block ran
+kai test --json --list [<spec>]    # the blocks a run holds, nothing runs
+kai test --json --deps [<spec>]    # + the files each test file is built from
 kai test -j <n> [<spec>|./...]     # up to n builds at once
 kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
@@ -217,6 +219,35 @@ set; an `--only` that matches nothing is an error, not an empty pass.
 kai test --json .
 kai test --only 'tests/planner_test.kai:orders sites' .
 kai test --json --only 'planner/tests/planner_test.kai:orders sites' ./...
+```
+
+## Listing a suite and its sources
+
+`kai test --json --list` prints the `test` records a run would report,
+without building or running anything: each runner's file is parsed, not
+compiled. The records carry `id`, `file` and `line` (no `status`), spelled
+as a run spells them, so the two join on `id`. `--only` narrows the list;
+one that matches nothing is exit 1.
+
+`--deps` adds a `deps` record per test file: the files the compiler reads
+to build it, from the same import resolution a build runs.
+
+```text
+{"type":"deps","file":"tests/planner_test.kai","sources":["kai.toml","src/listing.kai","src/planner.kai","tests/planner_test.kai"],"external":["/usr/local/share/kaikai/stdlib/encoding/json.kai"]}
+{"type":"test","id":"tests/planner_test.kai:orders sites","file":"tests/planner_test.kai","line":18}
+```
+
+`sources` holds the package's own files (the test file, the manifest,
+every module it imports transitively), sorted, spelled as a block `id`
+spells its file. `external` holds the rest (stdlib modules, dependencies)
+as absolute paths, so a consumer can fingerprint them or ignore them.
+`--deps` alone adds the records to a normal run; with `--list` nothing
+runs. Both need `--json` and work under `./...`.
+
+```sh
+kai test --json --list .
+kai test --json --list --deps .
+kai test --json --deps .
 ```
 
 ## Per-block coverage
