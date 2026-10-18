@@ -12,9 +12,11 @@
 # a field of that name. A
 # protocol is reached through an operation's name, its dispatcher or an
 # operator that is sugar for it, and keeps every impl, because the
-# dispatcher picks one at run time. An arithmetic or comparison operator or a negation
+# dispatcher picks one at run time. An arithmetic operator or a negation
 # keeps every impl but the homogeneous `Int` and `Real` ones, which a
-# primitive operand never selects. Protocols declaring an operation of the
+# primitive operand never selects. A comparison reaches no impl: what it
+# would have reached is returned as a deferred group, typed only when the
+# typed program needs it. Protocols declaring an operation of the
 # same name share one dispatcher, so the name reaches all of them. A pipe
 # keeps the core functions the typer inserts for it.
 
@@ -31,21 +33,39 @@ import compiler.proto_op_index
 import compiler.impl_identity
 import compiler.unwind_effects
 
-#[doc("A pruned program: the decls a build keeps, the core functions it dropped, and the functions an earlier cut emptied that it keeps.")]
-pub type CoreCut = CoreCut([Decl], [SymId], [SymId])
+#[doc("A pruned program: the decls a build keeps, the core functions it dropped, the functions an earlier cut emptied that it keeps, and the groups deferred to the typed program.")]
+pub type CoreCut = CoreCut([Decl], [SymId], [SymId], [DeferGroup])
+
+#[doc("The dropped core functions an operator on operands of unknown type would have reached through `proto`: they are typed only once the typed program needs the protocol.")]
+pub type DeferGroup = DeferGroup(SymId, [SymId])
 
 #[doc("Drop the core functions nothing in `decls` can reach. `tab` is the table of `decls`; `core_mods` are the core modules; `reg` the protocol registry, whose impl entries map each `__pimpl_*` to its protocol; `emptied` the core functions an earlier cut left without a body; `keep_unw` keeps the functions that feed the unwind analysis.")]
 pub fn core_reach(decls: [Decl], tab: SymTab, core_mods: [String], reg: ProtocolReg, emptied: [SymId], keep_unw: Bool) : CoreCut / Console = {
   let core_fns = filter(decls, (d) => cr_is_core_fn(d, core_mods, keep_unw))
-  let st0 = CrSt { tab: tab, live: idx_empty(), fns: cr_index(core_fns, idx_empty()), impls: reg.impls,
+  let roots = filter(decls, (d) => not cr_is_core_fn(d, core_mods, keep_unw))
+  let st0 = CrSt { tab: tab, live: idx_empty(), fns: cr_index(core_fns, idx_empty()), impls: reg.impls, deferring: cr_defers(roots), cores: reg.cores,
                    disps: reg.ids.shared, ops: op_index(reg.ops), dprotos: disp_protos_index(reg.ids),
-                   protos: [], lite: [], inert: [], bps: [], trigs: [], work: [], fields: cr_fields(decls, idx_empty()) }
-  let st = cr_drain(cr_decls(filter(decls, (d) => not cr_is_core_fn(d, core_mods, keep_unw)), st0))
+                   protos: [], lite: [], defer: [], inert: [], bps: [], trigs: [], work: [], fields: cr_fields(decls, idx_empty()) }
+  let st = cr_drain(cr_decls(roots, st0))
+  let groups = cr_groups(st, core_fns, st.defer)
   let dropped = map(filter(core_fns, (d) => not cr_in(st.live, cr_sym(d))), cr_sym)
-  let gone = cr_sym_set(dropped, idx_empty())
+  let held = cr_sym_set(flat_map(groups, (g) => match g { DeferGroup(_, ss) -> ss }), idx_empty())
+  let gone = cr_sym_set(filter(dropped, (s) => not cr_in(held, s)), idx_empty())
   CoreCut(filter(decls, (d) => not cr_is_core_fn(d, core_mods, keep_unw) or cr_in(st.live, cr_sym(d))),
           dropped,
-          filter(emptied, (s) => not cr_in(gone, s)))
+          filter(emptied, (s) => not cr_in(gone, s)),
+          groups)
+}
+
+# A program this large types the groups anyway, and typing them late costs more than typing them with the rest.
+fn cr_defers(roots: [Decl]) : Bool = list_length(roots) < 4000
+
+fn cr_groups(st: CrSt, core_fns: [Decl], ps: [SymId]) : [DeferGroup] / Console = map(ps, (p) => cr_group(st, core_fns, p))
+
+# What reaching `p`'s impls would add to the cut.
+fn cr_group(st: CrSt, core_fns: [Decl], p: SymId) : DeferGroup / Console = {
+  let grown = cr_drain(cr_ref_syms(CrSt { ...st, work: [] }, cr_impl_fns_if(st.impls, p, (i) => cr_core_impl(st, i) and not cr_prim_impl(i), [])))
+  DeferGroup(p, map(filter(core_fns, (d) => cr_in(grown.live, cr_sym(d)) and not cr_in(st.live, cr_sym(d))), cr_sym))
 }
 
 #[doc("The declared names of `ss`, for the note a cut prints.")]
@@ -88,7 +108,7 @@ fn cr_in(ix: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(ix, s) {
 # dispatchers of its operations: the typer calls one when it lowers an
 # operator, so a reached protocol reaches them too.
 type CrSt = { tab: SymTab, live: NameIndex[SymId], fns: NameIndex[Decl], impls: [ProtoImplReg],
-              disps: [ProtoDisp], ops: OpIndex, dprotos: NameIndex[SymId], protos: [SymId], lite: [SymId], inert: [SymId], bps: [Int], trigs: [Int],
+              disps: [ProtoDisp], ops: OpIndex, dprotos: NameIndex[SymId], deferring: Bool, cores: [String], protos: [SymId], lite: [SymId], defer: [SymId], inert: [SymId], bps: [Int], trigs: [Int],
               work: [Decl], fields: NameIndex[Bool] }
 
 # The field names some record declares.
@@ -178,6 +198,18 @@ fn cr_proto_ops(st: CrSt, p: SymId) : CrSt =
                   cr_disp_fns(st.disps, p, []))
   }
 
+# A comparison reaches no impl: whether it selects one depends on the operand types, which the typed program knows.
+fn cr_proto_deferred(st: CrSt, p: SymId) : CrSt =
+  if sym_raw(p) < 0 or cr_has_sym(st.protos, p) or cr_has_sym(st.lite, p) { st }
+  else { cr_refs_inert(cr_ref_syms(CrSt { ...st, lite: [p, ...st.lite], defer: [p, ...st.defer] }, cr_impl_fns_if(st.impls, p, (i) => not cr_core_impl(st, i), [])),
+                       cr_disp_fns(st.disps, p, [])) }
+
+# Only a stdlib impl is deferred: one an imported module defines is the program's own and may be selected by any value of its type.
+fn cr_core_impl(st: CrSt, i: ProtoImplReg) : Bool = match i {
+  PIR(_, _, _, _, _, _, Some(h)) -> list_has(st.cores, h)
+  _ -> false
+}
+
 #[doc("True when the impl is for `Int` alone or `Real` alone, which a primitive operand never selects.")]
 pub fn cr_prim_impl(i: ProtoImplReg) : Bool = match i {
   PIR(_, t, _, _, args, _, _) -> cr_prim_homogeneous(t, args, DhScalar(TyInt)) or cr_prim_homogeneous(t, args, DhScalar(TyReal))
@@ -223,8 +255,8 @@ fn cr_binop_proto(st: CrSt, bp: BinopProto, p: SymId) : CrSt = match bp {
   BpSub -> cr_proto_ops(st, p)
   BpMul -> cr_proto_ops(st, p)
   BpDiv -> cr_proto_ops(st, p)
-  BpEq  -> cr_proto_ops(st, p)
-  BpOrd -> cr_proto_ops(st, p)
+  BpEq  -> if st.deferring { cr_proto_deferred(st, p) } else { cr_proto_ops(st, p) }
+  BpOrd -> if st.deferring { cr_proto_deferred(st, p) } else { cr_proto_ops(st, p) }
   _     -> cr_proto(st, p)
 }
 

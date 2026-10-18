@@ -160,6 +160,7 @@ import compiler.emit_native_modular
 import compiler.lint
 import compiler.law_checks
 import compiler.core_reach
+import compiler.defer_hits
 import compiler.core_precut
 import compiler.core_typed_cut
 import compiler.cache_ast
@@ -2480,7 +2481,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   let fused = pub_loop_workers(tailfuse_decls(all_decls, sym_tab, target_mod_name), sym_tab, target_mod_name)
                   let typed_tab = st_extend(sym_tab, fused.rows)
                   let tin = typer_in(front, protos, all_decls, typed_tab)
-                  let typed = tcut_infer_program(path, fused.decls, "", tin, false)
+                  let typed = tcut_infer_program(path, fused.decls, "", tin, tcut_no_defer(), false)
                   if typed.errs != 0 { typed.errs } else { dump_call_elision(path, typed.decls, typed_tab) }
                 }
               }
@@ -2588,8 +2589,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 let core_hit = match backend { BkCModular -> picked  _ -> core_hit }
                 let cut = if chk == 0 and prunes and not no_variant {
                             core_reach(all_decls, sym_tab, list_append(core_mod_names(core_mods, []), lib_mods), proto_reg, emptied, cmod_plain(backend, mode))
-                          } else { CoreCut(all_decls, [], []) }
-                let missed = match cut { CoreCut(_, _, m) -> m }
+                          } else { CoreCut(all_decls, [], [], []) }
+                let missed = match cut { CoreCut(_, _, m, _) -> m }
                 if chk != 0 { vd_exit(json, [Verdict(chk, rd.diags)]) }
                 else if need_seed {
                   # The core TU set of this program's variant does not exist yet: compile the core alone,
@@ -2628,9 +2629,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # `|?` automatically — no compiler change required when
                   # a downstream package adds a new pipe-eligible type.
                   prune_note(core_cache.stats, prunes, cut)
-                  let all_decls = match cut { CoreCut(kept, _, _) -> kept }
-                  let dropped = match cut { CoreCut(_, d, _) -> d }
+                  let whole_decls = all_decls
+                  let all_decls = match cut { CoreCut(kept, _, _, _) -> kept }
+                  let dropped = match cut { CoreCut(_, d, _, _) -> d }
                   let pruned = match dropped { [] -> false _ -> true }
+                  let defer_groups = match cut { CoreCut(_, _, _, gs) -> gs }
+                  let defer_syms = flat_map(defer_groups, (g) => match g { DeferGroup(_, ss) -> ss })
+                  let with_pool = defer_with_pool(whole_decls, dropped, defer_syms)
                   # The typed blobs follow the sources, so an explicit
                   # project directory wins over the entry's own: the
                   # native paths compile a copy of the entry from an
@@ -2652,11 +2657,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # synthesised dispatch is typed like any other body and
                   # the self-tail rewrite downstream turns the cycle into
                   # the goto-loop it already emits.
-                  let fused = pub_loop_workers(tailfuse_decls(all_decls, sym_tab, target_mod_name), sym_tab, target_mod_name)
+                  let fused = pub_loop_workers(tailfuse_decls(if list_is_empty(defer_syms) { all_decls } else { with_pool }, sym_tab, target_mod_name), sym_tab, target_mod_name)
+                  let defer = TcDefer { pool: if list_is_empty(defer_syms) { [] } else { filter(fused.decls, (d) => defer_pooled(defer_syms, d)) }, groups: defer_groups,
+                                        order: fused.decls, stats: core_cache.stats,
+                                        hits: (gs, ds) => defer_hits(proto_reg, gs, ds, core_cache.stats) }
                   # The fused functions are declarations the typer must name.
                   let typed_tab = st_extend(sym_tab, fused.rows)
                   let tin = typer_in(front, stamped.view, all_decls, typed_tab)
-                  let typed_prog0 = tcut_infer_program(path, fused.decls, tcut_dir, tin, match mode { MDumpSymIds -> true _ -> false })
+                  let typed_prog0 = tcut_infer_program(path, if list_is_empty(defer_syms) { fused.decls } else { filter(fused.decls, (d) => not defer_pooled(defer_syms, d)) }, tcut_dir, tin, defer, match mode { MDumpSymIds -> true _ -> false })
                   # Contracts are discharged against the typed calls, where a
                   # pipe is the call it spells.
                   let contract_vd = if typed_prog0.errs != 0 { vd_count(0) }
@@ -2667,6 +2675,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # `__pimpl_<P>_<T>_<op>` direct call. Sites with
                   # unknown types fall through and execute the
                   # dispatcher fn's panic at runtime.
+                  let proto_reg = defer_registry(proto_reg, defer_syms, typed_prog0.decls)
                   let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg)
                   # Walk the post-rewrite AST and report any
                   # `__proto_<op>` call whose receiver type is concrete
@@ -2725,7 +2734,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # A constant's initialiser with locals of its own is a
                       # function from here on; its read pastes the call.
                       let const_inits = const_init_fns(mf.decls, typed_tab, target_mod_name)
-                      let tcut = if pruned { core_typed_cut(const_inits.decls, core_mod_names(core_mods, []), proto_reg, dropped) } else { TypedCut(const_inits.decls, []) }
+                      let tcut = if pruned { core_typed_cut(const_inits.decls, core_mod_names(core_mods, []), proto_reg, defer_dropped(dropped, defer_syms, typed_prog.decls)) } else { TypedCut(const_inits.decls, []) }
                       let mono_decls = match tcut { TypedCut(ds, _) -> ds }
                       # The names the backends spell: the table with the
                       # closure specialisations the front minted, and the
