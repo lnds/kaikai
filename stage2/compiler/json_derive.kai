@@ -231,16 +231,30 @@ fn jd_tower(d: DeriveFor, jfs: [JsonField], bound: [String], slot: Int,
         # A `#[json(default)]` field substitutes the default when the key
         # is absent (`JNull`); an absent field with no default still errors
         # in the leaf reader, preserving #1280's required-field policy.
-        let read = match dflt {
-          None    -> jd_decode(d, shape, node, sub, slot, line, col)
-          Some(dv) -> jd_default_read(d, shape, node, sub, dv, slot, line, col)
-        }
         let next = slot + jd_dec_lams(shape)
         let tail = jd_tower(d, rest, [name, ...bound], next, line, col)
         let ok_arm = Arm(jd_ctor_pat("Ok", [jd_bind(jd_field_var(name), line, col)], line, col), None, tail)
-        let err_arm = jd_err_arm(line, col)
-        jd_expr(EMatch(read, [ok_arm, err_arm]), line, col)
+        match jd_plain_nested(shape, dflt) {
+          Some(rt) -> jd_nested_scope(d, rt, node, sub, jd_rebase_arm(line, col), ok_arm, line, col)
+          None -> {
+            let read = match dflt {
+              None    -> jd_decode(d, shape, node, sub, slot, line, col)
+              Some(dv) -> jd_default_read(d, shape, node, sub, dv, slot, line, col)
+            }
+            jd_expr(EMatch(read, [ok_arm, jd_err_arm(line, col)]), line, col)
+          }
+        }
       }
+  }
+}
+
+# The nested record of a required field: its decode failure is rebased in
+# the tower's own error arm.
+fn jd_plain_nested(shape: JsonShape, dflt: Option[Expr]) : Option[DeclRef] = match dflt {
+  Some(_) -> None
+  None -> match shape {
+    JSRecord(rt) -> Some(rt)
+    _ -> None
   }
 }
 
@@ -283,16 +297,25 @@ fn jd_decode(d: DeriveFor, shape: JsonShape, node: Expr, path: Expr, slot: Int,
 # The helper is not generic: a generic wrapper would instantiate once per
 # nested type.
 fn jd_nested_decode(d: DeriveFor, rt: DeclRef, node: Expr, path: Expr, line: Int, col: Int) : Expr {
+  let pass_arm = Arm(jd_bind("__r", line, col), None, jd_var("__r", line, col))
+  jd_nested_scope(d, rt, node, path, jd_rebase_arm(line, col), pass_arm, line, col)
+}
+
+# `{ let __np = <path>; match <nested of_json under the placeholder> { ok_arm; err_arm } }`.
+fn jd_nested_scope(d: DeriveFor, rt: DeclRef, node: Expr, path: Expr, err_arm: Arm, ok_arm: Arm,
+                   line: Int, col: Int) : Expr {
   let np = jd_var("__np", line, col)
   let child = jd_call(jd_nested(d, rt, "of_json"),
                 [node, jd_lib("json_path_child", [np], line, col)], line, col)
-  let err_arm = Arm(jd_ctor_pat("Err", [jd_bind("e", line, col)], line, col), None,
-                    jd_call("Err", [jd_lib("json_error_rebase", [jd_var("e", line, col), np], line, col)],
-                            line, col))
-  let pass_arm = Arm(jd_bind("__r", line, col), None, jd_var("__r", line, col))
-  let rebased = jd_expr(EMatch(child, [err_arm, pass_arm]), line, col)
-  jd_expr(EBlock([SLet(jd_bind("__np", line, col), None, path)], Some(rebased)), line, col)
+  let read = jd_expr(EMatch(child, [err_arm, ok_arm]), line, col)
+  jd_expr(EBlock([SLet(jd_bind("__np", line, col), None, path)], Some(read)), line, col)
 }
+
+# `Err(e) -> Err(json_error_rebase(e, __np))`.
+fn jd_rebase_arm(line: Int, col: Int) : Arm =
+  Arm(jd_ctor_pat("Err", [jd_bind("e", line, col)], line, col), None,
+      jd_call("Err", [jd_lib("json_error_rebase", [jd_var("e", line, col), jd_var("__np", line, col)],
+                             line, col)], line, col))
 
 # The optional readers are per-leaf so `null` short-circuits before the
 # leaf's shape check; a nested record or list under `Option` has no
