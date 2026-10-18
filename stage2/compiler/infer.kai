@@ -17832,7 +17832,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # (spawn.spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
       let st1e = check_entry_result(st1, entry, apply_ty(st1.sub, declared_ret), ret_site.line, ret_site.col)
-      let st1b = check_no_fiber_escape(st1e, file, fnid_sym(fid), nm, opt_ret, sums, hcar, line, col)
+      let st1b = check_no_fiber_escape(st1e, file, fnid_sym(fid), nm, opt_ret, apply_ty(st1.sub, declared_ret), sums, hcar, line, col)
       # Drop `Mutable` when every demand targets a locally built value
       # that never escapes; otherwise blame the first demand that does not.
       let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr, hcar)
@@ -18176,7 +18176,7 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # unwritable in user code. Until the cap binding lands, the
 # brand-mismatch detection has no surface to attach to.
 fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
-                          opt_ret: Option[TypeExpr], sums: [SumInfo], hcar: HandleTab,
+                          opt_ret: Option[TypeExpr], ret: Ty, sums: [SumInfo], hcar: HandleTab,
                           line: Int, col: Int) : InferState / Console + File {
 
 
@@ -18185,7 +18185,7 @@ fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
   else {
     match opt_ret {
       None -> st
-      Some(rty) -> if not te_hits(hv, [core_ty_sym(CtFiber), core_ty_sym(CtPid), ...ht_carriers(hcar, core_ty_sym(CtFiber))], rty) { st } else {
+      Some(rty) -> if not ty_mentions(ht_carriers(hcar, core_ty_sym(CtFiber)), ret) { st } else {
         match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, st.recs, []) {
           Some(breach) -> {
             let lline = if rty.line > 0 { rty.line } else { line }
@@ -18330,10 +18330,41 @@ type HandleTab = HT([SymId], [SymId], [SymId])
 type TypeDeps = TD(SymId, [SymId])
 
 fn handle_tab(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : HandleTab {
-  let deps = type_deps(hv, sums, recs)
-  HT(carriers_close(deps, [core_ty_sym(CtFiber), core_ty_sym(CtPid)], []),
-     carriers_close(deps, [core_ty_sym(CtCont)], []),
-     carriers_close(deps, [core_decl_ty_id(CdSeq)], []))
+  let marks = hold_close(type_deps(hv, sums, recs),
+    [HA(core_ty_sym(CtFiber), Hold(true, false, false)), HA(core_ty_sym(CtPid), Hold(true, false, false)),
+     HA(core_ty_sym(CtCont), Hold(false, true, false)), HA(core_decl_ty_id(CdSeq), Hold(false, false, true))])
+  HT(flat_map(marks, (m) => match m { HA(sy, Hold(f, _, _)) -> if f { [sy] } else { [] } }),
+     flat_map(marks, (m) => match m { HA(sy, Hold(_, c, _)) -> if c { [sy] } else { [] } }),
+     flat_map(marks, (m) => match m { HA(sy, Hold(_, _, q)) -> if q { [sy] } else { [] } }))
+}
+
+# What a type holds: a Fiber or Pid, a Cont, a Seq.
+type Hold = Hold(Bool, Bool, Bool)
+type HoldAt = HA(SymId, Hold)
+
+fn hold_or(a: Hold, b: Hold) : Hold = match a {
+  Hold(f1, c1, q1) -> match b { Hold(f2, c2, q2) -> Hold(f1 or f2, c1 or c2, q1 or q2) }
+}
+
+fn hold_adds(m: Hold, old: Hold) : Bool = match m {
+  Hold(f, c, q) -> match old { Hold(f0, c0, q0) -> (f and not f0) or (c and not c0) or (q and not q0) }
+}
+
+# Newest mark first: a type's later marks only ever add to its earlier ones.
+fn hold_of(marks: [HoldAt], s: SymId) : Hold = match marks {
+  [] -> Hold(false, false, false)
+  [HA(sy, h), ...rest] -> if sym_same(sy, s) { h } else { hold_of(rest, s) }
+}
+
+fn hold_close(deps: [TypeDeps], marks: [HoldAt]) : [HoldAt] {
+  let fresh = flat_map(deps, (d) => match d {
+    TD(sy, ms) -> {
+      let old = hold_of(marks, sy)
+      let m = foldl(ms, old, (a, x) => hold_or(a, hold_of(marks, x)))
+      if hold_adds(m, old) { [HA(sy, m)] } else { [] }
+    }
+  })
+  if list_length(fresh) == 0 { marks } else { hold_close(deps, concat([fresh, marks])) }
 }
 
 # The carriers of the handle type `h`: Cont, Seq, or Fiber/Pid.
@@ -18357,14 +18388,6 @@ fn type_deps(hv: TyHomeView, sums: [SumInfo], recs: [RecInfo]) : [TypeDeps] =
       }))
     })])
 
-fn carriers_close(deps: [TypeDeps], base: [SymId], cs: [SymId]) : [SymId] {
-  let hs = concat([base, cs])
-  let fresh = flat_map(deps, (d) => match d {
-    TD(sy, ms) -> if not sym_list_has(hs, sy) and any(ms, (m) => sym_list_has(hs, m)) { [sy] } else { [] }
-  })
-  if list_length(fresh) == 0 { cs } else { carriers_close(deps, base, concat([fresh, cs])) }
-}
-
 # The named types `t` mentions, prepended to `acc`.
 fn te_syms(hv: TyHomeView, t: TypeExpr, acc: [SymId]) : [SymId] = match t.tkind {
   TyName(r, tas) -> {
@@ -18380,19 +18403,15 @@ fn te_syms(hv: TyHomeView, t: TypeExpr, acc: [SymId]) : [SymId] = match t.tkind 
   TyParam(_, tas) -> foldl(tas, acc, (a, x) => te_syms(hv, x, a))
 }
 
-# `t` names a type of `hs`, or has one among its type arguments or parts.
-fn te_hits(hv: TyHomeView, hs: [SymId], t: TypeExpr) : Bool = match t.tkind {
-  TyName(r, tas) -> {
-    let s = ref_ty_sym(hv, r)
-    (sym_raw(s) >= 0 and sym_list_has(hs, s)) or any(tas, (a) => te_hits(hv, hs, a))
-  }
-  TyList(inner) -> te_hits(hv, hs, inner)
-  TyFn(ps, ret, _) -> any(ps, (a) => te_hits(hv, hs, a)) or te_hits(hv, hs, ret)
-  TyDim(base, _) -> te_hits(hv, hs, base)
-  TyRefine(base, _) -> te_hits(hv, hs, base)
-  TyRow(_) -> false
-  TySurface(ts) -> any(tysurface_children(ts), (a) => te_hits(hv, hs, a))
-  TyParam(_, tas) -> any(tas, (a) => te_hits(hv, hs, a))
+# `t` is, or has among its parts, a type of `hs`.
+fn ty_mentions(hs: [SymId], t: Ty) : Bool = match t {
+  TyCon(s, args) -> sym_list_has(hs, s) or any(args, (a) => ty_mentions(hs, a))
+  TyListT(x) -> ty_mentions(hs, x)
+  TyFnT(ps, r, _) -> any(ps, (a) => ty_mentions(hs, a)) or ty_mentions(hs, r)
+  TyDimT(x, _) -> ty_mentions(hs, x)
+  TyRefineT(x, _) -> ty_mentions(hs, x)
+  TyUnion(parts) -> any(parts, (a) => ty_mentions(hs, a))
+  _ -> false
 }
 
 # The breach found in a type, and the named types already explored: a type
