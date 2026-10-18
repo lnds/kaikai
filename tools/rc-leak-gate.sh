@@ -228,7 +228,7 @@ measure_one() {
   [ "$BACKEND" = native ] && verify="$bin.kv"
   if grep -q '^# fixture: test' "$ROOT/examples/$1.kai"; then
     # A test fixture is measured through `kai test`, which builds and runs it.
-    printf '#!/bin/sh\nKAI_BACKEND=%s exec "%s" test "%s/examples/%s.kai"\n' "$BACKEND" "$KAI" "$ROOT" "$1" > "$bin"
+    printf '#!/bin/sh\nKAI_KIR_VERIFY="%s" KAI_BACKEND=%s exec "%s" test "%s/examples/%s.kai"\n' "$verify" "$BACKEND" "$KAI" "$ROOT" "$1" > "$bin"
     chmod +x "$bin"
   elif ! KAI_KIR_VERIFY="$verify" "$KAI" build --backend="$BACKEND" "$ROOT/examples/$1.kai" -o "$bin" >"$bin.build" 2>&1; then
     echo "BUILD-FAIL:-" > "$bin.measured"; return
