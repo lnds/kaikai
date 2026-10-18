@@ -3774,6 +3774,20 @@ test-driver-holes: $(TARGET) bin-kai build
 	  fi; \
 	  echo "driver-holes OK $$name (candidate golden)"; \
 	done; \
+	for src in ../examples/typed_holes/hole_pattern_*.kai; do \
+	  name=$$(basename $$src .kai); \
+	  $$KAI build --holes $$src | sed 's|^.*/typed_holes/||' > build/driver-$$name.holes; \
+	  diff $${src%.kai}.holes.expected build/driver-$$name.holes \
+	    || { echo "driver-holes FAIL $$name (--holes report drifted)"; exit 1; }; \
+	  $$KAI build --holes-json $$src > build/driver-$$name.json; \
+	  python3 ../scripts/validate_holes_json.py build/driver-$$name.json \
+	    || { echo "driver-holes FAIL $$name (schema)"; cat build/driver-$$name.json; exit 1; }; \
+	  python3 -c "import json,sys; [print('%d:%d %s %s %s %s' % (r['line'], r['col'], r['kind'], r['name'], r['expected_type'], r['remaining'])) for r in json.load(open(sys.argv[1]))]" \
+	    build/driver-$$name.json > build/driver-$$name.got; \
+	  diff $${src%.kai}.json.expected build/driver-$$name.got \
+	    || { echo "driver-holes FAIL $$name (--holes-json report drifted)"; exit 1; }; \
+	  echo "driver-holes OK $$name (pattern hole golden)"; \
+	done; \
 	echo "driver-holes OK"
 
 # Effects golden gate. Backend parity diffs native against the C

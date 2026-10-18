@@ -15,6 +15,7 @@ REQUIRED = {
     "kind",
     "name",
     "message",
+    "remaining",
     "expected_type",
     "in_scope",
     "scope_elided",
@@ -22,7 +23,7 @@ REQUIRED = {
     "candidates_needing_effects",
 }
 
-VALID_KINDS = {"hole", "todo"}
+VALID_KINDS = {"hole", "todo", "pattern"}
 
 INTERNAL_MARKS = ("#", "::", "__")
 
