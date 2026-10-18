@@ -34,64 +34,32 @@ import compiler.infer_match
 import compiler.infer_calls
 import compiler.infer_pipes
 import compiler.infer_check
+import compiler.infer_values
+import compiler.infer_ops
+import compiler.infer_resume
 
 #[doc("Typer-internal helper `synth` shared across the infer modules.")]
-pub fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
-
-
+pub fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable =
   match e.kind {
     EInt(_, _)        -> inferred_leaf(st, TyInt, e)
-    # A suffix-tagged literal (`42i32`, `7u8`) carries its width type in
-    # the node itself; that type IS the literal's type. Byte is the one
-    # width whose range check the parser defers here.
-    EFixed(span, ty) -> match ty {
+    EFixed(span, ty)  -> match ty {
       TyByte -> synth_byte_lit(st, decode_int(span), e)
       _      -> inferred_leaf(st, ty, e)
     }
     EReal(_, _)       -> inferred_leaf(st, TyReal, e)
-    # A past-i64 integer literal with no concrete carrier in context is
-    # out of range — the `n`/`bigint.from_string` escape hatch is named.
-    EIntLit(span)  -> synth_lit_mint_or_err(st, e, EIntLit(span))
-    # A `d`-suffixed literal always targets `Decimal`; the suffix
-    # supplies the carrier locally, so mint it with no expected type.
-    EDecimalLit(_) -> synth_lit_mint_or_err(st, e, e.kind)
-    EBool(_)       -> inferred_leaf(st, TyBool, e)
-    EChar(_)       -> inferred_leaf(st, TyChar, e)
-    EStr(_, _)     -> inferred_leaf(st, TyString, e)
-    EUnit          -> inferred_leaf(st, TyUnit, e)
-    # `try_pipe_placeholder` substitutes the legitimate `_` while
-    # parsing, so one reaching the typer is in value position. Typing it
-    # `TyAny` fits every slot and lowers to zero — a wrong value that
-    # looks valid for its type (`0`, `""`, a real row id), not garbage.
-    EUnder         -> {
-      let perr = mk_diag(SevError, st.file, e.line, e.col,
-        "`_` is not an expression; it is a pattern wildcard, or a `|>` argument placeholder", [])
-      render_diag(perr)
-      inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-    }
-    # a `.` placeholder that survives parsing in a
-    # non-argument position is a hard error per
-    # `docs/kaikai-minimal.md` §"Placeholder rules". The argument-
-    # position desugar (`desugar_placeholder_arg`) wraps every
-    # call-arg subtree containing a `.` into a unary lambda before
-    # the typer ever sees it; reaching this arm means the user
-    # wrote `.` outside that sugar.
-    EPlaceholder   -> {
-      let perr = mk_diag(SevError, st.file, e.line, e.col,
-        "`.` placeholder used outside lambda-expected position; use a named arrow `(x) => ...`", [])
-      render_diag(perr)
-      inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-    }
-    # `resume` reaching the value-position read arm (call-position
-    # `resume(...)` is intercepted by `try_resume_call` upstream) means it
-    # escapes its clause as a first-class value — `let k = resume`,
-    # `f(resume)`. The continuation has no value representation outside its
-    # clause, so reject it cleanly (docs/effects.md).
-    ESym(sy, _) -> synth_sym_read(st, sy, e)
-    ELocal(l)   -> synth_local_read(st, l, e)
-    EOp(r)      -> synth_op_read(st, r, e)
-    EName(nm) -> synth_name_read(st, nm, e)
-    EMark(m) -> synth_mark_read(st, m, e)
+    EIntLit(span)     -> synth_lit_mint_or_err(st, e, EIntLit(span))
+    EDecimalLit(_)    -> synth_lit_mint_or_err(st, e, e.kind)
+    EBool(_)          -> inferred_leaf(st, TyBool, e)
+    EChar(_)          -> inferred_leaf(st, TyChar, e)
+    EStr(_, _)        -> inferred_leaf(st, TyString, e)
+    EUnit             -> inferred_leaf(st, TyUnit, e)
+    EUnder            -> synth_misplaced(st, e, "`_` is not an expression; it is a pattern wildcard, or a `|>` argument placeholder")
+    EPlaceholder      -> synth_misplaced(st, e, "`.` placeholder used outside lambda-expected position; use a named arrow `(x) => ...`")
+    ESym(sy, _)       -> synth_sym_read(st, sy, e)
+    ELocal(l)         -> synth_local_read(st, l, e)
+    EOp(r)            -> synth_op_read(st, r, e)
+    EName(nm)         -> synth_name_read(st, nm, e)
+    EMark(m)          -> synth_mark_read(st, m, e)
     ECall(callee, args_)       -> synth_call_site(st, callee, args_, e.line, e.col)
     EField(obj, fnm)           -> synth_field(st, obj, fnm, e.line, e.col)
     EIndex(coll, ix)           -> synth_index(st, coll, ix, e.line, e.col)
@@ -111,84 +79,66 @@ pub fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     EExternBody(_, _)          -> synth_extern_body(st, e)
     EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
     EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
-    # numeric literal with a unit annotation. The inner Expr is
-    # always EInt or EReal; the literal's type is `TyDimT(base, u)`
-    # where base is TyInt or TyReal and u is the canonical unit.
-    ELitUnit(inner, u) -> synth_lit_unit(st, inner, u, e.line, e.col)
-    # `variants[T]()`. Validate T is a sum type with
-    # nullary-only variants, stamp the result with `[T]` (TyListT),
-    # and bake the resolved variant names into the AST so codegen
-    # has them without re-walking the env. Errors yield a TyAny
-    # stub so cascade is graceful.
-    EVariantsOf(ty_expr, _) -> synth_variants_of(st, ty_expr, e)
-    # A loop intrinsic types exactly as the combinator call it replaced:
-    # arg 0 is the original callee, so delegating to `synth_call` gives
-    # the same scheme lookup, lambda checking, and row join. The stamped
-    # pieces are re-wrapped; a non-call rewrite (e.g. a dispatch rewrite
-    # that changes the node shape) falls back to the rewritten call,
-    # dropping the intrinsic rather than guessing at its semantics.
-    #
-    # Any other `$<name>(args)` reaching `synth` is an error. The
-    # clause-body path that legitimately admits `$extern_handler`
-    # short-circuits before reaching this arm.
-    ESurface(_) ->
-      panic("infer: ESurface must be lowered by surface_lower before the typer")
-    EIntrinsic(nm, args_) ->
-      if is_loop_intrinsic(nm) {
-        match args_ {
-          [callee, ...rest] -> {
-            let r = synth_call(st, callee, rest, e.line, e.col)
-            match r.expr.kind {
-              ECall(callee2, rest2) ->
-                Inferred { st: r.st, ty: r.ty,
-                           expr: Expr { kind: EIntrinsic(nm, [callee2, ...rest2]),
-                                        line: e.line, col: e.col,
-                                        ty: r.expr.ty, mode: r.expr.mode,  site: e.site } }
-              _ -> r
-            }
-          }
-          _ -> {
-            let perr = mk_diag(SevError, st.file, e.line, e.col,
-              concat_all(["compiler intrinsic `$", intrinsic_name(nm), "` has a malformed argument list"]), [])
-            render_diag(perr)
-            inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-          }
-        }
-      } else { match nm {
-        InResumeFrame -> synth_resume_frame(st, args_, e)
-        InResumeBad   -> report_resume_bad(st, args_, e)
-        InSegHandle   -> synth_seg_handle(st, args_, e)
-        InSegRequest  -> synth_seg_request(st, args_, e)
-        InAbsent -> {
-          let r = st_fresh_ty(st)
-          inferred_leaf(r.st, r.ty, e)
-        }
-        InCovHit(_) -> inferred_leaf(st, TyUnit, e)
-        _ -> {
-          let perr = mk_diag(SevError, st.file, e.line, e.col,
-            concat_all(["compiler intrinsic `$", intrinsic_name(nm),
-                        "` is not valid in this position"]), [])
-          render_diag(perr)
-          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-        }
-      } }
-    # A qualified reference the resolver left. Settled here, the node
-    # carries the declaration's id.
-    EModCall(m, fname) -> match settle_name(st, Some(m), fname, TyAny, value_classes()) {
-      SetOne(s)  -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
-      SetTie(ss) -> inferred_leaf(report_name_tie(st, fname, ss, false, e.line, e.col), TyAny, e)
-      _ -> {
-        # The resolver only leaves a name the module exports, so the
-        # table and the decl stream are out of sync: a diagnostic
-        # rather than a panic, so the user sees a concrete location.
-        let perr = mk_diag(SevError, st.file, e.line, e.col,
-          "module '#{m}' does not export '#{fname}' at the typer (rqc / TyEnv mismatch — internal)", [])
-        render_diag(perr)
-        inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-      }
-    }
+    ELitUnit(inner, u)         -> synth_lit_unit(st, inner, u, e.line, e.col)
+    EVariantsOf(ty_expr, _)    -> synth_variants_of(st, ty_expr, e)
+    ESurface(_)                -> panic("infer: ESurface must be lowered by surface_lower before the typer")
+    EIntrinsic(nm, args_)      -> synth_intrinsic(st, nm, args_, e)
+    EModCall(m, fname)         -> synth_mod_call(st, m, fname, e)
   }
+
+# `_` and `.` reaching the typer are in value position: `try_pipe_placeholder` and
+# the argument-position desugar consume the legitimate ones. Typing the node `TyAny`
+# keeps the cascade quiet.
+fn synth_misplaced(st: InferState, e: Expr, msg: String) : Inferred / Console + File + Mutable = {
+  let perr = mk_diag(SevError, st.file, e.line, e.col, msg, [])
+  render_diag(perr)
+  inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
 }
+
+# A loop intrinsic types exactly as the combinator call it replaced: arg 0 is the
+# original callee, so `synth_call` gives the same scheme lookup, lambda checking and
+# row join. Any other `$<name>(args)` is an error.
+fn synth_intrinsic(st: InferState, nm: Intrinsic, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable =
+  if is_loop_intrinsic(nm) {
+    match args_ {
+      [callee, ...rest] -> rewrap_loop_intrinsic(synth_call(st, callee, rest, e.line, e.col), nm, e)
+      _ -> synth_misplaced(st, e, concat_all(["compiler intrinsic `$", intrinsic_name(nm), "` has a malformed argument list"]))
+    }
+  } else { synth_other_intrinsic(st, nm, args_, e) }
+
+# A rewrite that changes the node shape falls back to the rewritten call, dropping
+# the intrinsic rather than guessing at its semantics.
+fn rewrap_loop_intrinsic(r: Inferred, nm: Intrinsic, e: Expr) : Inferred =
+  match r.expr.kind {
+    ECall(callee2, rest2) ->
+      Inferred { st: r.st, ty: r.ty,
+                 expr: Expr { kind: EIntrinsic(nm, [callee2, ...rest2]), line: e.line, col: e.col,
+                              ty: r.expr.ty, mode: r.expr.mode, site: e.site } }
+    _ -> r
+  }
+
+fn synth_other_intrinsic(st: InferState, nm: Intrinsic, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable =
+  match nm {
+    InResumeFrame -> synth_resume_frame(st, args_, e)
+    InResumeBad   -> report_resume_bad(st, args_, e)
+    InSegHandle   -> synth_seg_handle(st, args_, e)
+    InSegRequest  -> synth_seg_request(st, args_, e)
+    InAbsent      -> {
+      let r = st_fresh_ty(st)
+      inferred_leaf(r.st, r.ty, e)
+    }
+    InCovHit(_)   -> inferred_leaf(st, TyUnit, e)
+    _             -> synth_misplaced(st, e, concat_all(["compiler intrinsic `$", intrinsic_name(nm), "` is not valid in this position"]))
+  }
+
+# The resolver only leaves a name the module exports, so a miss means the table and
+# the decl stream disagree: a diagnostic at a concrete location, not a panic.
+fn synth_mod_call(st: InferState, m: Written, fname: Written, e: Expr) : Inferred / Console + File + Mutable =
+  match settle_name(st, Some(m), fname, TyAny, value_classes()) {
+    SetOne(s)  -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
+    SetTie(ss) -> inferred_leaf(report_name_tie(st, fname, ss, false, e.line, e.col), TyAny, e)
+    _          -> synth_misplaced(st, e, "module '#{m}' does not export '#{fname}' at the typer (rqc / TyEnv mismatch — internal)")
+  }
 
 
 
@@ -199,114 +149,79 @@ pub fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 # function's row. Clause bodies and the optional return clause
 # are not type-checked against the op signatures here, and alias
 # resolution (`Eff as log`) is not handled here.
-fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
-
-
+fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable =
   match e.kind {
     EHandle(body, eff_ref, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       let hsym = ref_sym(eff_ref)
-      # type-check the init expression in the outer scope.
-      # The init's inferred type IS the handler-state type — it is
-      # propagated into the clauses so `state` / `log` and 2-arg
-      # `resume(v, ns)` are typed precisely (no TyAny escape).
-      let init_typed_st = match init_opt {
-        Some(ie) -> {
-          let ri = synth(st, ie)
-          let ity = apply_ty(ri.st.sub, ri.ty)
-          IT { st: ri.st, init_opt: Some(ri.expr), state_ty: Some(ity) }
-        }
-        None -> IT { st: st, init_opt: None, state_ty: None }
-      }
-      # alias rebinds the capability inside the body.
+      let it = handle_init(st, init_opt)
       let st_aliased = match alias_opt {
-        Some(a) -> st_push_alias(init_typed_st.st, a.id, hsym)
-        None    -> init_typed_st.st
+        Some(a) -> st_push_alias(it.st, a.id, hsym)
+        None    -> it.st
       }
-      # when a stateful handler omits the explicit `[T]`
-      # instantiation but supplies an `(init)`, infer the single
-      # type argument from the init's type. This is the path for the
-      # unannotated `var x = init` desugar:
-      # `with State(init) as x { ... }` resolves to
-      # `State[type_of_init]`. The fallback only fires when no syntactic
-      # type args were written, so explicit `with State[Int](0)` still
-      # round-trips verbatim.
-      let resolved_eff_tyargs = match eff_tyargs {
-        [] -> match init_typed_st.state_ty {
-          Some(t) -> [t]
-          None    -> []
-        }
-        _ -> map(eff_tyargs, (t) => st_annot_ty(st, t))
-      }
-      # A `with Eff as a` binding makes `a` a first-class capability value of
-      # type `Eff[ty_args]` so it can be passed as a call argument (§6 named
-      # instances). The capability type IS the effect's nominal type — no
-      # `Handler[E]` wrapper (HKT stays banned). The alias entry on st.aliases
-      # still drives op dispatch inside the handle body; this env binding is what
-      # lets `a` cross into `f(a)` and type against a `c: Eff` parameter.
-      # The capability type carries only the effect's own tparams, not the
-      # handler's full state type: a non-parametric `Cell` has no arguments
-      # even when `with Cell(0)` infers an Int state. Truncating to the effect's
-      # tparam arity makes the binding unify with a `c: Cell` parameter.
-      let cap_arity = eff_tparam_arity(st_aliased.op_eff_arities, hsym)
-      let cap_tyargs = take_first_tys(resolved_eff_tyargs, cap_arity)
-      let st_capbound = match alias_opt {
-        Some(a) -> st_set_env(st_aliased,
-                     env_bind_local(st_aliased.env, a, mono(TyCon(hsym, cap_tyargs))))
-        None    -> st_aliased
-      }
-      let prev_row = st_capbound.row
-      let st_in = InferState { ...st_set_row(st_capbound, []), row_tails: [] }
-      let rb_raw = synth(st_in, body)
-      let rb0 = Inferred { ...rb_raw, st: st_scope_tails(rb_raw.st, st_capbound.row_tails) }
-      let cell = match alias_opt { Some(a) -> a.id  None -> local_none() }
-      let rb = Inferred { ...rb0, st: holes_under_handler(rb0.st, list_length(st_in.holes),
-                                     label_in_cell(hsym, cap_tyargs, cell)) }
-      # filter out *only* the labels whose ty_args unify with
-      # the handler's instantiation. Labels with the same eff name but
-      # non-unifiable ty_args remain and propagate to the outer row —
-      # they need their own enclosing handler.
-      # a `with State as i` handler discharges the labels of its own
-      # cell, leaving a sibling cell for its own handler; an unaliased
-      # handler (`alias_opt = None`) discharges the labels of no cell. The
-      # discharge binds the cell's type via `unify_list`, so thread the
-      # resulting substitution into the handler's output state (all reads
-      # of the cell converge on the handler's instantiation).
-      # Discharge against the effect's own tparam tyargs (truncated to its
-      # arity), not the full handler state type — a non-parametric `Cell` op
-      # carries a `[]` label even when `with Cell(0)` infers an Int state, so
-      # matching against `[Int]` would leave the label undischarged.
-      let filt = filter_labels_matching_res(rb.st.row, hsym, cell,
-                                              cap_tyargs, rb.st.sub)
-      let body_row_minus = filt.kept
-      let rb_st1 = InferState { ...st_set_sub(rb.st, filt.sub),
-                                eff_uses: scope_eff_uses(st_capbound.eff_uses, rb.st.eff_uses, body_row_minus) }
-      let st_out0 = st_merge_labels(st_set_row(rb_st1, prev_row), body_row_minus)
-      let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
-      # verify `with <Eff>` names a known effect. When
-      # `Eff` is unknown the body's labels still flow up via the
-      # filter-and-merge step above (so a downstream "effect not
-      # handled" still fires for what the body actually performs),
-      # but we surface the parse-level mistake directly so the user
-      # does not chase a "unknown op X on effect Y" cascade.
-      let st_out_eff = check_handle_effect_known(st_out1, eff_ref, e.line, e.col)
-      # every clause name must be a declared op of the effect.
-      let st_out2 = check_clause_names(st_out_eff, eff_ref, clauses, e.line, e.col)
+      let resolved_eff_tyargs = handle_tyargs(st, eff_tyargs, it.state_ty)
+      let cap_tyargs = take_first_tys(resolved_eff_tyargs, eff_tparam_arity(st_aliased.op_eff_arities, hsym))
+      let st_capbound = handle_bind_capability(st_aliased, alias_opt, hsym, cap_tyargs)
+      let hb = handle_walk_body(st_capbound, body, alias_opt, hsym, cap_tyargs)
+      let st_out2 = check_clause_names(check_handle_effect_known(hb.st, eff_ref, e.line, e.col), eff_ref, clauses, e.line, e.col)
       let stateful = match init_opt { Some(_) -> true None -> false }
-      let r_typed = check_return_clause_opt(st_out2, ret_opt, rb.ty,
-                                             stateful, init_typed_st.state_ty)
-      let cs_typed = check_clauses_types(r_typed.st, hsym, clauses,
-                                          stateful, init_typed_st.state_ty,
-                                          resolved_eff_tyargs, r_typed.ty)
+      let r_typed = check_return_clause_opt(st_out2, ret_opt, hb.rb.ty, stateful, it.state_ty)
+      let cs_typed = check_clauses_types(r_typed.st, hsym, clauses, stateful, it.state_ty, resolved_eff_tyargs, r_typed.ty)
       let hty = apply_ty(cs_typed.st.sub, r_typed.ty)
-      let new_e = with_ty(
-        mk_expr(EHandle(rb.expr, eff_ref, stamp_tes(eff_tyargs, resolved_eff_tyargs, (te: TypeExpr) => st_annot_ty(st, te)), init_typed_st.init_opt,
-                         alias_opt, cs_typed.clauses, r_typed.ret_opt),
-                e.line, e.col),
-        hty)
+      let tyargs_stamped = stamp_tes(eff_tyargs, resolved_eff_tyargs, (te: TypeExpr) => st_annot_ty(st, te))
+      let new_e = with_ty(mk_expr(EHandle(hb.rb.expr, eff_ref, tyargs_stamped, it.init_opt, alias_opt, cs_typed.clauses, r_typed.ret_opt), e.line, e.col), hty)
       mk_inferred(cs_typed.st, hty, new_e)
     }
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
   }
+
+# The init is typed in the outer scope; its type is the handler-state type, which
+# reaches the clauses so `state` and the two-argument `resume(v, ns)` are typed
+# precisely.
+fn handle_init(st: InferState, init_opt: Option[Expr]) : IT / Console + File + Mutable =
+  match init_opt {
+    Some(ie) -> {
+      let ri = synth(st, ie)
+      IT { st: ri.st, init_opt: Some(ri.expr), state_ty: Some(apply_ty(ri.st.sub, ri.ty)) }
+    }
+    None -> IT { st: st, init_opt: None, state_ty: None }
+  }
+
+# A stateful handler that omits `[T]` but supplies an `(init)` takes its single type
+# argument from the init's type; written type arguments round-trip verbatim.
+fn handle_tyargs(st: InferState, eff_tyargs: [TypeExpr], state_ty: Option[Ty]) : [Ty] =
+  match eff_tyargs {
+    [] -> match state_ty {
+      Some(t) -> [t]
+      None    -> []
+    }
+    _ -> map(eff_tyargs, (t) => st_annot_ty(st, t))
+  }
+
+# `with Eff as a` makes `a` a first-class capability value of the effect's nominal
+# type, truncated to the effect's own tparams, so it unifies with a `c: Eff`
+# parameter even when `with Cell(0)` infers an Int state.
+fn handle_bind_capability(st: InferState, alias_opt: Option[Binder], hsym: SymId, cap_tyargs: [Ty]) : InferState =
+  match alias_opt {
+    Some(a) -> st_set_env(st, env_bind_local(st.env, a, mono(TyCon(hsym, cap_tyargs))))
+    None    -> st
+  }
+
+type HandleBody = { rb: Inferred, st: InferState }
+
+# The body is walked under a fresh row; only the labels whose type arguments unify
+# with the handler's instantiation are discharged. The rest, and any label of a
+# sibling cell, propagate to the outer row. The discharge binds the cell's type, so
+# its substitution flows into the output state.
+fn handle_walk_body(st_capbound: InferState, body: Expr, alias_opt: Option[Binder], hsym: SymId, cap_tyargs: [Ty]) : HandleBody / Console + File + Mutable = {
+  let st_in = InferState { ...st_set_row(st_capbound, []), row_tails: [] }
+  let rb_raw = synth(st_in, body)
+  let rb0 = Inferred { ...rb_raw, st: st_scope_tails(rb_raw.st, st_capbound.row_tails) }
+  let cell = match alias_opt { Some(a) -> a.id  None -> local_none() }
+  let rb = Inferred { ...rb0, st: holes_under_handler(rb0.st, list_length(st_in.holes), label_in_cell(hsym, cap_tyargs, cell)) }
+  let filt = filter_labels_matching_res(rb.st.row, hsym, cell, cap_tyargs, rb.st.sub)
+  let rb_st1 = InferState { ...st_set_sub(rb.st, filt.sub), eff_uses: scope_eff_uses(st_capbound.eff_uses, rb.st.eff_uses, filt.kept) }
+  let st_out0 = st_merge_labels(st_set_row(rb_st1, st_capbound.row), filt.kept)
+  HandleBody { rb: rb, st: match alias_opt { Some(_) -> st_pop_alias(st_out0)  None -> st_out0 } }
 }
 
 
@@ -350,73 +265,45 @@ fn check_clauses_types(st: InferState, eff: SymId, cs: [HClause],
 
 
 
-fn check_clauses_types_loop(st: InferState, eff: SymId, cs: [HClause],
-                             stateful: Bool, state_ty: Option[Ty],
-                             eff_tyargs: [Ty], result_ty: Ty, acc: [HClause]) : ClausesTyped / Console + File + Mutable {
-
-
+fn check_clauses_types_loop(st: InferState, eff: SymId, cs: [HClause], stateful: Bool, state_ty: Option[Ty],
+                            eff_tyargs: [Ty], result_ty: Ty, acc: [HClause]) : ClausesTyped / Console + File + Mutable =
   match cs {
     [] -> ClausesTyped { st: st, clauses: list_reverse(acc) }
-    [c, ...rest] -> match c {
-      HC(head, params, body, line, col) ->
-        if is_lifecycle_clause(head) {
-          let ft = check_finally_clause(st, head, params, body, line, col,
-                                         stateful, state_ty)
-          check_clauses_types_loop(ft.st, eff, rest, stateful, state_ty,
-                                    eff_tyargs, result_ty, [ft.clause, ...acc])
-        } else {
-      {
-        let outer = st
-        let op_name = clause_head_word(head)
-        # clause shape: the clause's positional parameter
-        # count must equal the op's declared arity plus one (the
-        # trailing `resume`). Without this check `print_io(s) -> 0`
-        # (missing resume) or `print_io(a, b, c, resume) -> resume(())`
-        # (too many user params for a single-param op) type-check
-        # silently; the downstream C emitter then produces ill-formed
-        # function pointers. Validation is gated on a known op scheme
-        # so the unknown-op path keeps its dedicated diagnostic in
-        # check_clause_names instead of layering an arity error on top.
-        let st_arity = check_clause_arity(st, eff, op_name, params, line, col)
-        # bind the clause params and unify the op's
-        # effect-tparam tyvars with the handler's instantiation, so
-        # the answer type is concrete (e.g., `Int` for State.get under
-        # `with State[Int]`). `st.clause_resume` is then set with the
-        # concrete answer/state types so `resume(v)` / `resume(v, ns)`
-        # are typechecked precisely.
-        let bind_res = bind_clause_env_typed(st_arity, eff, op_name, params,
-                                              stateful, state_ty, eff_tyargs, result_ty)
-        let fresh_before = st_arity.env.fresh
-        let sty = match state_ty { Some(t) -> t None -> TyAny }
-        let env_bound = bind_res.st.env
-        let env_with_sl = if stateful { add_state_aliases(env_bound, sty) } else { env_bound }
-        let st_env = st_set_env(bind_res.st, env_with_sl)
-        let answer_resolved = apply_ty(st_env.sub, bind_res.answer_ty)
-        let st_resume = if stateful {
-          match state_ty {
-            Some(sv) -> st_set_clause_resume(st_env,
-              Some(RB(answer_resolved, sv, result_ty)))
-            None -> st_env
-          }
-        } else { st_env }
-        let st_clause_in = st_set_in_clause(st_clause_alias_tags(st_resume), clause_cont_of(params))
-        let rb = synth(st_clause_in, body)
-        let st_res = st_unify(rb.st, result_ty, rb.ty, "handler clause result", line, col)
-        let st_esc = check_op_tparam_escape(st_res, bind_res.op_rigid, fresh_before,
-                                            state_ty, rb.ty, line, col)
-        let st_out0 = st_restore_entries(outer, st_esc)
-        let st_out = st_set_sub(st_set_clause_resume(st_out0, outer.clause_resume),
-                                subst_with_rigid(st_out0.sub, outer.sub.rigid))
-        # keep the typed body so the op resolution that fired inside
-        # `synth` (`Console.print(...)` settled to `Stdout`'s `print`)
-        # actually reaches the emit phase.
-        let new_clause = HC(head, params, rb.expr, line, col)
-        check_clauses_types_loop(st_out, eff, rest, stateful, state_ty,
-                                  eff_tyargs, result_ty, [new_clause, ...acc])
-      }
-        }
+    [HC(head, params, body, line, col), ...rest] -> {
+      let ct = if is_lifecycle_clause(head) { check_finally_clause(st, head, params, body, line, col, stateful, state_ty) }
+               else { check_op_clause(st, eff, head, params, body, line, col, stateful, state_ty, eff_tyargs, result_ty) }
+      check_clauses_types_loop(ct.st, eff, rest, stateful, state_ty, eff_tyargs, result_ty, [ct.clause, ...acc])
     }
   }
+
+# The clause's parameter count must be the op's arity plus the trailing `resume`;
+# its params are bound and the op's effect tparams unified with the handler's
+# instantiation, so the answer type is concrete and `resume(v)` / `resume(v, ns)`
+# are checked precisely. The typed body is kept so the op resolutions inside it
+# reach the emit phase.
+fn check_op_clause(st: InferState, eff: SymId, head: ClauseHead, params: [Param], body: Expr, line: Int, col: Int,
+                   stateful: Bool, state_ty: Option[Ty], eff_tyargs: [Ty], result_ty: Ty) : ClauseTyped1 / Console + File + Mutable = {
+  let st_arity = check_clause_arity(st, eff, clause_head_word(head), params, line, col)
+  let bind_res = bind_clause_env_typed(st_arity, eff, clause_head_word(head), params, stateful, state_ty, eff_tyargs, result_ty)
+  let st_clause_in = clause_entry_state(bind_res, stateful, state_ty, result_ty, params)
+  let rb = synth(st_clause_in, body)
+  let st_res = st_unify(rb.st, result_ty, rb.ty, "handler clause result", line, col)
+  let st_esc = check_op_tparam_escape(st_res, bind_res.op_rigid, st_arity.env.fresh, state_ty, rb.ty, line, col)
+  let st_out0 = st_restore_entries(st, st_esc)
+  let st_out = st_set_sub(st_set_clause_resume(st_out0, st.clause_resume), subst_with_rigid(st_out0.sub, st.sub.rigid))
+  ClauseTyped1 { st: st_out, clause: HC(head, params, rb.expr, line, col) }
+}
+
+fn clause_entry_state(bind_res: ClauseBindRes, stateful: Bool, state_ty: Option[Ty], result_ty: Ty, params: [Param]) : InferState = {
+  let sty = match state_ty { Some(t) -> t None -> TyAny }
+  let env_bound = bind_res.st.env
+  let st_env = st_set_env(bind_res.st, if stateful { add_state_aliases(env_bound, sty) } else { env_bound })
+  let answer_resolved = apply_ty(st_env.sub, bind_res.answer_ty)
+  let st_resume = match state_ty {
+    Some(sv) -> if stateful { st_set_clause_resume(st_env, Some(RB(answer_resolved, sv, result_ty))) } else { st_env }
+    None     -> st_env
+  }
+  st_set_in_clause(st_clause_alias_tags(st_resume), clause_cont_of(params))
 }
 
 
@@ -459,30 +346,22 @@ fn check_finally_clause(st: InferState, head: ClauseHead, params: [Param], body:
 # Diagnostics name both types; the inner Expr is re-stamped with its
 # resolved operand type so the C emitter can pick the correct
 # discriminator (`Some` / `Ok`).
-fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
+fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable = {
   let ri = synth(st, inner)
   let it_now = apply_ty(ri.st.sub, ri.ty)
   let inner_typed = with_ty(ri.expr, it_now)
   match it_now {
-    TyCon(tcs, args_) ->
-      if core_ty_is(tcs, CtOption) {
-        match args_ {
-          [t] -> bang_finish_option(ri.st, inner_typed, t, line, col)
-          _   -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
-        }
-      } else if core_ty_is(tcs, CtResult) {
-        match args_ {
-          [t, e_ty] -> bang_finish_result(ri.st, inner_typed, e_ty, t, line, col)
-          _ -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
-        }
-      } else {
-        bang_bad_operand(ri.st, it_now, inner_typed, line, col)
-      }
-    _ -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
+    TyCon(tcs, args_) -> bang_on_con(ri.st, tcs, args_, it_now, inner_typed, line, col)
+    _                 -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
   }
 }
+
+fn bang_on_con(st: InferState, tcs: SymId, args_: [Ty], it_now: Ty, inner_typed: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match args_ {
+    [t] -> if core_ty_is(tcs, CtOption) { bang_finish_option(st, inner_typed, t, line, col) } else { bang_bad_operand(st, it_now, inner_typed, line, col) }
+    [t, e_ty] -> if core_ty_is(tcs, CtResult) { bang_finish_result(st, inner_typed, e_ty, t, line, col) } else { bang_bad_operand(st, it_now, inner_typed, line, col) }
+    _ -> bang_bad_operand(st, it_now, inner_typed, line, col)
+  }
 
 
 
@@ -522,158 +401,102 @@ pub fn synth_stmts(st: InferState, stmts: [Stmt]) : InferredStmts / Console + Fi
 
 
 
-fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
-
-
+fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable =
   match stmt {
-    SLet(pat, ann, rhs) -> {
-      let ann_label = if pat_binds_var_ann(pat) { "var annotation" } else { "let annotation" }
-      # when the let is annotated and the RHS is an
-      # `EMatch`, drive the RHS in check-mode so the expected
-      # type reaches every arm via `check_match`. The non-match
-      # path is unchanged (synth + post-hoc unify against `declared`
-      # below). Decimal-literal lowering relies on `rr.ty` being the
-      # synthesised RHS type, which is preserved in both paths.
-      # same routing for `EIf` via `check_if`.
-      let rr = match ann {
-        Some(te) -> match rhs.kind {
-          EMatch(_, _) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          EIf(_, _, _) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          # Fix B: route EList through bidirectional check so element
-          # literals can be retagged to Byte when expected is [Byte]
-          # (and a Vec annotation mints the literal to a vec build).
-          EList(_) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          # a Vec-annotated map-pipe chain collects into the vec
-          # (pre-sized when the head is a pure range).
-          EDispatchPipe(PoMap, _, _) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          # route a call, a bare name and a local read with annotation
-          # context through check_expr_against so a bare ctor the
-          # annotation's type declares resolves to that constructor.
-          ECall(_, _) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          EName(_) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          ELocal(_) -> {
-            let exp_resolved = st_annot_ty(st, te)
-            check_expr_against(st, rhs, exp_resolved, ann_label, pat.line, pat.col)
-          }
-          # a bare numeric literal coins directly to the annotated carrier
-          # from its source lexeme, before synth would stamp a default
-          # type (or error on a textual `EIntLit`/`EDecimalLit`).
-          _ -> synth_let_rhs_or_mint(st, rhs, te, pat.line, pat.col)
-        }
-        None -> synth(st, rhs)
-      }
-      # when the let binding is annotated, coin a numeric RHS literal to
-      # the declared carrier: a point literal to an exact Decimal, an
-      # integer to any numeric type, from the source lexeme. The
-      # Decimal-with-unit lowering is folded into `maybe_mint_literal`.
-      # `st_unify` below still confirms the minted type equals the
-      # declared one, so the unifier stays the authority.
-      let minted = match ann {
-        None -> MintedExpr { st: rr.st, pair: ExprTy { expr: rr.expr, ty: rr.ty } }
-        Some(te) -> maybe_mint_literal(rr.st, rr.expr, rr.ty,
-                                       apply_ty(rr.st.sub, st_annot_ty(rr.st, te)),
-                                       pat.line, pat.col)
-      }
-      let coerced = match ann {
-        None -> minted
-        Some(te) -> {
-          let declared = st_annot_ty(minted.st, te)
-          if not (rc_mentions(declared) or rc_mentions_in(minted.st.sub, minted.pair.ty)) { minted }
-          else { refine_coerce(minted, declared, binding_what(pat, ann_label), pat.line, pat.col) }
-        }
-      }
-      let lower_pair = coerced.pair
-      let binding_st = match ann {
-        None -> coerced.st
-        Some(te) -> {
-          let declared = st_annot_ty(coerced.st, te)
-          st_unify(coerced.st, declared, lower_pair.ty, ann_label, pat.line, pat.col)
-        }
-      }
-      let binding_ty0 = match ann {
-        None -> lower_pair.ty
-        Some(te) -> st_annot_ty(rr.st, te)
-      }
-      let binding_ty = let_binder_ty(binding_ty0, lower_pair.expr)
-      let after = check_pattern_stamped(binding_st, pat, binding_ty)
-      OneStmt { st: after.st, stmt: SLet(after.pat, ann, lower_pair.expr) }
-    }
+    SLet(pat, ann, rhs) -> synth_let(st, pat, ann, rhs)
     SAssert(cond, msg) -> {
       let rc = synth_assert_cond(st, cond, contract_assert_kind(msg))
       let s1 = st_unify(rc.st, rc.ty, TyBool, "assert condition", cond.line, cond.col)
-      let rm = match msg {
-        None -> InferredOptExpr { st: s1, expr: None }
-        Some(mx) -> {
-          let r = synth(s1, mx)
-          InferredOptExpr { st: r.st, expr: Some(r.expr) }
-        }
-      }
+      let rm = synth_opt_expr(s1, msg)
       OneStmt { st: rm.st, stmt: SAssert(rc.expr, rm.expr) }
     }
     SExprStmt(ex) -> {
       let r = synth(st, ex)
       OneStmt { st: r.st, stmt: SExprStmt(r.expr) }
     }
-    # dispatch the indexed write by container type.
-    # `Array[T]` lowers to `array_set(b, i, v)`. `Map[K, V]` is
-    # rejected with a typed error that points at `map_put`; the
-    # node returned is harmless filler so downstream passes never
-    # see a typed `SIndexAssign` survive.
-    SAssign(_, _, _, _) ->
-      panic("infer: SAssign must be lowered by surface_lower before the typer")
-    SIndexAssign(b, i, v, line, col) -> {
-      let probe = synth(st, b)
-      let base_ty = apply_ty(probe.st.sub, probe.ty)
-      match ty_coll(base_ty) {
-        Some(CcMap) -> {
-          let ri = synth(probe.st, i)
-          let rv = synth(ri.st, v)
-          let perr = mk_diag(SevError, st.file, line, col,
-            "indexed write `m[k] := v` is not supported for `Map[K, V]` in v1", [])
-          render_diag(perr)
-          diag_help("use `map.put(m, k, v)` and rebind; the v2 design lands alongside the HAMT carrier")
-          OneStmt { st: st_bump_err(st_push_diag(rv.st, perr)), stmt: SExprStmt(probe.expr) }
-        }
-        _ -> {
-          let callee = builtin_mk(CbArraySet, line, col)
-          let call_node = mk_expr(ECall(callee, [b, i, v]), line, col)
-          let rc = synth(st, call_node)
-          OneStmt { st: rc.st, stmt: SExprStmt(rc.expr) }
-        }
-      }
-    }
-    # `var name = init` — desugar pass not yet implemented.
-    # The resolve pass (chk_stmt) already emits the explicit "not yet
-    # implemented" diagnostic and short-circuits before infer normally
-    # runs. If a future caller invokes inference on the raw AST, return
-    # the init's type without binding `name`, so we never silently
-    # produce a `let`-equivalent.
+    SAssign(_, _, _, _) -> panic("infer: SAssign must be lowered by surface_lower before the typer")
+    SIndexAssign(b, i, v, line, col) -> synth_index_assign(st, b, i, v, line, col)
     SVar(name, ann, rhs, line, col) -> {
       let rr = synth(st, rhs)
       OneStmt { st: rr.st, stmt: SVar(name, ann, rr.expr, line, col) }
     }
-    # SUse stripped pre-typer; if we ever reach here, treat
-    # as a no-op (no expressions, no bindings).
     SUse(n, line, col) -> OneStmt { st: st, stmt: SUse(n, line, col) }
   }
+
+fn synth_opt_expr(st: InferState, msg: Option[Expr]) : InferredOptExpr / Console + File + Mutable =
+  match msg {
+    None     -> InferredOptExpr { st: st, expr: None }
+    Some(mx) -> {
+      let r = synth(st, mx)
+      InferredOptExpr { st: r.st, expr: Some(r.expr) }
+    }
+  }
+
+# `Array[T]` lowers to `array_set(b, i, v)`. `Map[K, V]` is rejected with a typed
+# error pointing at `map_put`; the node returned is filler, so downstream passes
+# never see a typed `SIndexAssign`.
+fn synth_index_assign(st: InferState, b: Expr, i: Expr, v: Expr, line: Int, col: Int) : OneStmt / Console + File + Mutable = {
+  let probe = synth(st, b)
+  match ty_coll(apply_ty(probe.st.sub, probe.ty)) {
+    Some(CcMap) -> {
+      let ri = synth(probe.st, i)
+      let rv = synth(ri.st, v)
+      let perr = mk_diag(SevError, st.file, line, col, "indexed write `m[k] := v` is not supported for `Map[K, V]` in v1", [])
+      render_diag(perr)
+      diag_help("use `map.put(m, k, v)` and rebind; the v2 design lands alongside the HAMT carrier")
+      OneStmt { st: st_bump_err(st_push_diag(rv.st, perr)), stmt: SExprStmt(probe.expr) }
+    }
+    _ -> {
+      let rc = synth(st, mk_expr(ECall(builtin_mk(CbArraySet, line, col), [b, i, v]), line, col))
+      OneStmt { st: rc.st, stmt: SExprStmt(rc.expr) }
+    }
+  }
+}
+
+# An annotated let drives the forms that take an expected type in check mode, so
+# it reaches every arm of a match or if, retags list elements, collects a Vec
+# map-pipe and resolves a bare constructor to the one the annotation declares. A
+# numeric literal coins directly to the annotated carrier from its lexeme.
+fn let_rhs_checked(st: InferState, rhs: Expr, te: TypeExpr, label: String, pat: Pattern) : Inferred / Console + File + Mutable =
+  if let_rhs_takes_expected(rhs) { check_expr_against(st, rhs, st_annot_ty(st, te), label, pat.line, pat.col) }
+  else { synth_let_rhs_or_mint(st, rhs, te, pat.line, pat.col) }
+
+fn let_rhs_takes_expected(rhs: Expr) : Bool =
+  match rhs.kind {
+    EMatch(_, _)               -> true
+    EIf(_, _, _)               -> true
+    EList(_)                   -> true
+    EDispatchPipe(PoMap, _, _) -> true
+    ECall(_, _)                -> true
+    EName(_)                   -> true
+    ELocal(_)                  -> true
+    _                          -> false
+  }
+
+fn synth_let(st: InferState, pat: Pattern, ann: Option[TypeExpr], rhs: Expr) : OneStmt / Console + File + Mutable =
+  match ann {
+    None -> {
+      let rr = synth(st, rhs)
+      let_finish(pat, ann, rr.st, rr.ty, rr.expr)
+    }
+    Some(te) -> synth_let_annotated(st, pat, ann, te, rhs)
+  }
+
+# The annotation coins a numeric literal to the declared carrier, coerces a
+# refinement, and is confirmed by the unifier, which stays the authority.
+fn synth_let_annotated(st: InferState, pat: Pattern, ann: Option[TypeExpr], te: TypeExpr, rhs: Expr) : OneStmt / Console + File + Mutable = {
+  let label = if pat_binds_var_ann(pat) { "var annotation" } else { "let annotation" }
+  let rr = let_rhs_checked(st, rhs, te, label, pat)
+  let minted = maybe_mint_literal(rr.st, rr.expr, rr.ty, apply_ty(rr.st.sub, st_annot_ty(rr.st, te)), pat.line, pat.col)
+  let declared = st_annot_ty(minted.st, te)
+  let coerced = if rc_mentions(declared) or rc_mentions_in(minted.st.sub, minted.pair.ty) { refine_coerce(minted, declared, binding_what(pat, label), pat.line, pat.col) } else { minted }
+  let binding_st = st_unify(coerced.st, st_annot_ty(coerced.st, te), coerced.pair.ty, label, pat.line, pat.col)
+  let_finish(pat, ann, binding_st, st_annot_ty(rr.st, te), coerced.pair.expr)
+}
+
+fn let_finish(pat: Pattern, ann: Option[TypeExpr], binding_st: InferState, ty0: Ty, expr: Expr) : OneStmt / Console + File + Mutable = {
+  let after = check_pattern_stamped(binding_st, pat, let_binder_ty(ty0, expr))
+  OneStmt { st: after.st, stmt: SLet(after.pat, ann, expr) }
 }
 
 # ---- patterns ----

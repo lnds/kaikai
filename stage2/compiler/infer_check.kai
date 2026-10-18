@@ -28,6 +28,7 @@ import compiler.infer_instantiate
 import compiler.infer_fuse_arith
 import compiler.infer_match
 import compiler.infer_pipes
+import compiler.infer_values
 
 # route an expression through `check_match` when its
 # AST head is `EMatch`, otherwise fall back to synth. The post-hoc
@@ -36,78 +37,45 @@ import compiler.infer_pipes
 # inside `check_match`.
 # extends to `EIf` via `check_if`.
 #[doc("Typer-internal helper `check_expr_against` shared across the infer modules.")]
-pub fn check_expr_against(st: InferState, e: Expr, expected: Ty,
-                      what: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
+pub fn check_expr_against(st: InferState, e: Expr, expected: Ty, what: String, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match e.kind {
-    EMatch(scr, arms) -> check_match(st, scr, arms, expected, e.line, e.col)
-    EIf(c, t_, eo)    -> check_if(st, c, t_, eo, expected, e.line, e.col)
-    # Fix B: bidirectional list literals. When the typer expects
-    # `[T]`, propagate `T` to each element. Specifically lets
-    # `let bs: [Byte] = [65, 66]` work — Int literals get rewritten
-    # to Byte literals (range-checked 0..255) when the expected
-    # element type is TyByte.
-    EList(els) -> match apply_ty(st.sub, expected) {
-      TyListT(elem_ty) -> check_list_elems_against(st, els, elem_ty, e.line, e.col)
-      # Vec-context minting (the #1091 shape for containers): the
-      # literal builds a pre-sized vec instead of a cons list. A BARE
-      # literal keeps denoting the cons list — only annotation /
-      # argument context reaches here.
-      TyCon(tcs, hargs) ->
-        if core_ty_is(tcs, CtVec) { check_vec_lit_against(st, els, hargs, e.line, e.col) }
-        else { w_synth(st, e) }
-      # Fixed-width Vec context: `Vec[T]<k>` fixes the literal's
-      # length by its habitant.
-      TyDimT(inner, u) -> match inner {
-        TyCon(tcs, hargs) ->
-          if core_ty_is(tcs, CtVec) { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
-          else { w_synth(st, e) }
-        _ -> w_synth(st, e)
-      }
-      _                -> w_synth(st, e)
-    }
-    # Vec-context pipeline collect: a map-pipe chain in Vec-expected
-    # position collects into a vec. Pure range-headed chains rewrite to
-    # the pre-sized collect combinator (one buffer, zero intermediates);
-    # anything else materialises once through `vec_from_list`.
-    EDispatchPipe(PoMap, _, _) -> {
-      let exp = apply_ty(st.sub, expected)
-      if ty_is_fixed_vec(exp) { check_map_pipe_fixed_collect(st, e, exp, e.line, e.col) }
-      else if ty_is_vec_head(exp) { check_map_pipe_vec_collect(st, e, e.line, e.col) }
-      else { w_synth(st, e) }
-    }
-    # annotation-driven ctor disambiguation. When
-    # the expected type is a sum and the callee is a bare
-    # `EName(cname)` that names one of its constructors,
-    # rewrite the callee to that constructor so the core's
-    # same-named one never wins. Falls through to synth otherwise.
-    ECall(callee, args_) ->
-      ctor_coerce_expected(ctor_check_or_synth(st, e, callee, args_, expected, line, col), expected)
-    # nullary ctor disambiguation. A bare
-    # `EName(cname)` (e.g. `NotFound`) in annotation context that
-    # names a constructor of the expected sum picks its scheme.
-    EName(_) -> nullary_ctor_check_or_synth(st, e, expected)
-    ESym(_, _) -> nullary_ctor_check_or_synth(st, e, expected)
-    # A record literal's head is asked of the expected type first.
-    ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
-    # thread expected into block tails so a
-    # `{ ...stmts...; ctor(args) }` body benefits from the same
-    # annotation-driven disambiguation as a bare ctor expression.
-    EBlock(stmts, tail) -> match tail {
-      Some(te) -> {
-        let outer = st
-        let is_ = w_synth_stmts(st, stmts)
-        let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
-        let st2 = st_restore_entries(outer, r.st)
-        let ty = apply_ty(st2.sub, r.ty)
-        let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), e.line, e.col), ty)
-        mk_inferred(st2, ty, root)
-      }
-      None -> w_synth(st, e)
-    }
-    _ -> w_synth(st, e)
+    EMatch(scr, arms)       -> check_match(st, scr, arms, expected, e.line, e.col)
+    EIf(c, t_, eo)          -> check_if(st, c, t_, eo, expected, e.line, e.col)
+    EList(els)              -> check_list_against(st, e, els, expected)
+    EDispatchPipe(PoMap, _, _) -> check_map_pipe_against(st, e, expected)
+    ECall(callee, args_)    -> ctor_coerce_expected(ctor_check_or_synth(st, e, callee, args_, expected, line, col), expected)
+    EName(_)                -> nullary_ctor_check_or_synth(st, e, expected)
+    ESym(_, _)              -> nullary_ctor_check_or_synth(st, e, expected)
+    ERecordLit(rh, fis)     -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
+    EBlock(stmts, Some(te)) -> check_block_against(st, e, stmts, te, expected, what)
+    _                       -> w_synth(st, e)
   }
+
+# A list literal under `[T]` checks each element against `T` (an Int literal
+# becomes a Byte under `[Byte]`). Under `Vec[T]` it builds a pre-sized vec; a bare
+# literal keeps denoting the cons list.
+fn check_list_against(st: InferState, e: Expr, els: [ListElem], expected: Ty) : Inferred / Console + File + Mutable =
+  match apply_ty(st.sub, expected) {
+    TyListT(elem_ty)         -> check_list_elems_against(st, els, elem_ty, e.line, e.col)
+    TyCon(tcs, hargs)        -> if core_ty_is(tcs, CtVec) { check_vec_lit_against(st, els, hargs, e.line, e.col) } else { w_synth(st, e) }
+    TyDimT(TyCon(tcs, hargs), u) -> if core_ty_is(tcs, CtVec) { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) } else { w_synth(st, e) }
+    _                        -> w_synth(st, e)
+  }
+
+# A map-pipe chain in Vec-expected position collects into a vec: a pure range-headed
+# chain rewrites to the pre-sized collect, anything else materialises once.
+fn check_map_pipe_against(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = {
+  let exp = apply_ty(st.sub, expected)
+  if ty_is_fixed_vec(exp) { check_map_pipe_fixed_collect(st, e, exp, e.line, e.col) }
+  else if ty_is_vec_head(exp) { check_map_pipe_vec_collect(st, e, e.line, e.col) }
+  else { w_synth(st, e) }
+}
+
+# The expected type reaches the tail of a block, so a `{ ...; ctor(args) }` body
+# gets the same constructor disambiguation as a bare constructor expression.
+fn check_block_against(st: InferState, e: Expr, stmts: [Stmt], te: Expr, expected: Ty, what: String) : Inferred / Console + File + Mutable = {
+  let is_ = w_synth_stmts(st, stmts)
+  block_with_tail(st, e, is_, check_expr_against(is_.st, te, expected, what, te.line, te.col))
 }
 
 
@@ -323,35 +291,30 @@ fn check_list_elems_loop(st: InferState, els: [ListElem], elem_ty: Ty,
 
 
 
-fn check_elem_against(st: InferState, ex: Expr, elem_ty: Ty,
-                      line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
-  match elem_ty {
-    TyByte -> match ex.kind {
-      EInt(n, _) -> if n >= 0 and n <= 255 {
-        let retagged = with_ty(mk_expr(mk_int_synth(n), ex.line, ex.col), TyByte)
-        mk_inferred(st, TyByte, retagged)
-      } else {
-        let r = w_synth(st, ex)
-        let s1 = st_unify(r.st, elem_ty, r.ty, "Byte literal out of range 0..255", line, col)
-        mk_inferred(s1, elem_ty, r.expr)
-      }
-      _ -> elem_synth_unify(st, ex, elem_ty, line, col)
+fn check_elem_against(st: InferState, ex: Expr, elem_ty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match ex.kind {
+    EInt(n, _) -> match elem_ty {
+      TyByte -> check_byte_literal(st, ex, n, line, col)
+      _      -> elem_synth_unify(st, ex, elem_ty, line, col)
     }
-    # A list literal against a Vec-typed element (a fixed-width
-    # matrix row) re-enters the bidirectional path, so the inner
-    # literal builds a vec and its length habitant binds.
-    _ -> match ex.kind {
-      EList(_) ->
-        if ty_vec_headed(elem_ty) {
-          let r = check_expr_against(st, ex, elem_ty, "list element", ex.line, ex.col)
-          let s1 = st_unify(r.st, elem_ty, r.ty, "list element", line, col)
-          mk_inferred(s1, apply_ty(s1.sub, r.ty), r.expr)
-        } else { elem_synth_unify(st, ex, elem_ty, line, col) }
-      _ -> elem_synth_unify(st, ex, elem_ty, line, col)
-    }
+    EList(_) -> if ty_vec_headed(elem_ty) { check_nested_list(st, ex, elem_ty, line, col) } else { elem_synth_unify(st, ex, elem_ty, line, col) }
+    _        -> elem_synth_unify(st, ex, elem_ty, line, col)
   }
+
+fn check_byte_literal(st: InferState, ex: Expr, n: Int, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  if n >= 0 and n <= 255 { mk_inferred(st, TyByte, with_ty(mk_expr(mk_int_synth(n), ex.line, ex.col), TyByte)) }
+  else {
+    let r = w_synth(st, ex)
+    let s1 = st_unify(r.st, TyByte, r.ty, "Byte literal out of range 0..255", line, col)
+    mk_inferred(s1, TyByte, r.expr)
+  }
+
+# A list literal against a Vec-typed element (a fixed-width matrix row) re-enters
+# the bidirectional path, so the inner literal builds a vec and binds its length.
+fn check_nested_list(st: InferState, ex: Expr, elem_ty: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let r = check_expr_against(st, ex, elem_ty, "list element", ex.line, ex.col)
+  let s1 = st_unify(r.st, elem_ty, r.ty, "list element", line, col)
+  mk_inferred(s1, apply_ty(s1.sub, r.ty), r.expr)
 }
 
 
@@ -388,55 +351,42 @@ fn check_literal_against(st: InferState, body: Expr, expected: Ty,
 
 
 #[doc("Typer-internal helper `check_body_against_ret` shared across the infer modules.")]
-pub fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
-                          what: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
+pub fn check_body_against_ret(st: InferState, body: Expr, expected: Ty, what: String, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match body.kind {
-    EMatch(scr, arms) -> check_match(st, scr, arms, expected, body.line, body.col)
-    EIf(c, t_, eo)    -> check_if(st, c, t_, eo, expected, body.line, body.col)
-    ELitUnit(_, _)    -> check_literal_against(st, body, expected, line, col)
-    EBlock(stmts, tail) -> match tail {
-      Some(te) -> match te.kind {
-        EMatch(scr, arms) -> {
-          let outer = st
-          let is_ = w_synth_stmts(st, stmts)
-          let r = check_match(is_.st, scr, arms, expected, te.line, te.col)
-          let st2 = st_restore_entries(outer, r.st)
-          let ty = apply_ty(st2.sub, r.ty)
-          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
-          mk_inferred(st2, ty, root)
-        }
-        EIf(c, t_, eo) -> {
-          let outer = st
-          let is_ = w_synth_stmts(st, stmts)
-          let r = check_if(is_.st, c, t_, eo, expected, te.line, te.col)
-          let st2 = st_restore_entries(outer, r.st)
-          let ty = apply_ty(st2.sub, r.ty)
-          let root = with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty)
-          mk_inferred(st2, ty, root)
-        }
-        # thread `expected` into the block tail
-        # when the tail is a bare ctor reference (a call, or a name
-        # the resolver left written), so annotation-driven
-        # disambiguation can pick a user variant over the core builtin. Other
-        # tail shapes keep synthing the whole body as before to avoid
-        # regressions in non-ctor expression types.
-        ECall(_, _) -> check_block_tail(st, stmts, te, expected, what, body)
-        EName(_)    -> check_block_tail(st, stmts, te, expected, what, body)
-        _ -> if is_record_lit(te) { check_block_tail(st, stmts, te, expected, what, body) } else { w_synth(st, body) }
-      }
-      None -> w_synth(st, body)
-    }
-    # bare-expression body benefits from
-    # annotation-driven ctor disambiguation when it is a ctor call
-    # or a nullary ctor reference. Other shapes stay on synth to
-    # avoid regressing existing inference paths.
-    ECall(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
-    EName(_) -> check_expr_against(st, body, expected, what, body.line, body.col)
-    ESym(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
-    _ -> synth_expecting(st, body, expected)
+    EMatch(scr, arms)   -> check_match(st, scr, arms, expected, body.line, body.col)
+    EIf(c, t_, eo)      -> check_if(st, c, t_, eo, expected, body.line, body.col)
+    ELitUnit(_, _)      -> check_literal_against(st, body, expected, line, col)
+    EBlock(stmts, Some(te)) -> check_body_block(st, body, stmts, te, expected, what)
+    EBlock(_, None)     -> w_synth(st, body)
+    ECall(_, _)         -> check_expr_against(st, body, expected, what, body.line, body.col)
+    EName(_)            -> check_expr_against(st, body, expected, what, body.line, body.col)
+    ESym(_, _)          -> check_expr_against(st, body, expected, what, body.line, body.col)
+    _                   -> synth_expecting(st, body, expected)
   }
+
+# `expected` reaches a block tail that is a match, an if, or a bare constructor
+# reference (a call, or a name the resolver left written), so annotation-driven
+# disambiguation picks a user variant over the core builtin. Other tails keep
+# synthing the whole body.
+fn check_body_block(st: InferState, body: Expr, stmts: [Stmt], te: Expr, expected: Ty, what: String) : Inferred / Console + File + Mutable =
+  match te.kind {
+    EMatch(scr, arms) -> {
+      let is_ = w_synth_stmts(st, stmts)
+      block_with_tail(st, body, is_, check_match(is_.st, scr, arms, expected, te.line, te.col))
+    }
+    EIf(c, t_, eo)    -> {
+      let is_ = w_synth_stmts(st, stmts)
+      block_with_tail(st, body, is_, check_if(is_.st, c, t_, eo, expected, te.line, te.col))
+    }
+    ECall(_, _)       -> check_block_tail(st, stmts, te, expected, what, body)
+    EName(_)          -> check_block_tail(st, stmts, te, expected, what, body)
+    _                 -> if is_record_lit(te) { check_block_tail(st, stmts, te, expected, what, body) } else { w_synth(st, body) }
+  }
+
+fn block_with_tail(st: InferState, body: Expr, is_: InferredStmts, r: Inferred) : Inferred / Console + File + Mutable {
+  let st2 = st_restore_entries(st, r.st)
+  let ty = apply_ty(st2.sub, r.ty)
+  mk_inferred(st2, ty, with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty))
 }
 
 
