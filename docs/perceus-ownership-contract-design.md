@@ -18,7 +18,7 @@ The exit-drop rule used to exist in seven places:
 |---|---|
 | `perceus.kai` `pcs_collect_exit_drops` | canonical |
 | `perceus.kai` `pcs_collect_block_let_exit_drops` | second copy, same file |
-| `perceus_tail_drop.kai`, `perceus_plant_drop.kai` | coordinated by convention |
+| `perceus_exit_drops.kai` | coordinated by convention |
 | `emit_c.kai` ×4 | textual mirrors |
 | `emit_native_fn.kai` `nemit_drop_assigns_masked` | mirrors the emit_c mirror |
 

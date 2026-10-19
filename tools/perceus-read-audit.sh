@@ -31,8 +31,8 @@ audit() {
   fi
   observed=$(mktemp)
   for f in "$ROOT"/stage2/compiler/*.kai; do
-    grep -n 'pcs_use_index(' "$f" | grep -v 'pub fn pcs_use_index' | cut -d: -f1 | while read -r ln; do
-      awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=($1=="pub")?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
+    grep -n 'pcs_use_index(' "$f" | grep -vE 'pub(\([a-z]+\))? fn pcs_use_index' | cut -d: -f1 | while read -r ln; do
+      awk -v t="$ln" 'NR<=t && /^(pub(\([a-z]+\))? )?fn /{n=($1 ~ /^pub/)?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
     done | sort -u | sed "s|^|$(basename "$f") |"
   done | sort > "$observed"
   local new gone
@@ -62,7 +62,7 @@ self_test() {
   printf '\nfn pra_probe(e: Expr) : UseIx / Console = pcs_use_index(e, [])\n' >> "$tmp/stage2/compiler/perceus_payer.kai"
   audit "$tmp" > /dev/null; rc=$?
   cp stage2/compiler/perceus_payer.kai "$tmp/stage2/compiler/"
-  printf '\nfn pra_probe(u: Use) : String = match u { U(n, _, _, _) -> n }\n' >> "$tmp/stage2/compiler/perceus_tail_drop.kai"
+  printf '\nfn pra_probe(u: Use) : String = match u { U(n, _, _, _) -> n }\n' >> "$tmp/stage2/compiler/perceus_exit_drops.kai"
   audit "$tmp" > /dev/null; local rc2=$?
   rm -rf "$tmp"
   if [ $rc -eq 0 ] || [ $rc2 -eq 0 ]; then echo "perceus-read-audit self-test FAIL — an injected derivation passed"; return 1; fi

@@ -25,7 +25,7 @@ observed=$(mktemp)
 for f in $FILES; do
   [ -f "$f" ] || continue
   grep -n 'EDispatchPipe(' "$f" | cut -d: -f1 | while read -r ln; do
-    awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=($1=="pub")?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
+    awk -v t="$ln" 'NR<=t && /^(pub(\([a-z]+\))? )?fn /{n=($1 ~ /^pub/)?$3:$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
   done | sort -u | sed "s|^|$(basename "$f") |"
 done | sort > "$observed"
 
