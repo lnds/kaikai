@@ -273,7 +273,7 @@ stdlib/
     process.kai  (shipped — closes #346 + #1591; `start`, `wait`, `kill`, `exit` plus the pipe family `start_piped`, `pipe_to`, `pipe_from`, `pipe_errs`, `write_stdin`, `close_stdin`, `read_stdout`, `read_stderr`, `read_all`, and process groups `start_in_group`, `kill_group`, and `uid`, the effective uid of the current process)
   time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
   date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped via PR #770, closes #767)
-  array.kai      pure (Array[T] / [T] bridge, plus `each` / `map` / `filter` / `flat_map` for the pipes — shipped via #366)
+  array.kai      pure (Array[T] / [T] bridge, plus `each` for `|!` — shipped via #366)
   string_builder.kai  amortised text accumulator; `append` rides Mutable, `build` is pure (top-level module — shipped, closes #902)
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
@@ -375,11 +375,7 @@ covers `list.*`. Listed here as shipped:
   is a distinct allocation; mutating either side does not affect
   the other. Seeds from the source's first element; empty source
   returns a length-0 array.
-- `array.each` / `map` / `filter` / `flat_map` — the canonical pipe
-  functions over `Array[a]` (index order, new arrays for the
-  transforms), so `Array` participates in `|`, `||`, `|?` and `|!`
-  *(shipped)*. Pure: they read the source and write only arrays they
-  allocate.
+- `array.each[a, e](xs: Array[a], f: (a) -> Unit / e) : Unit / e` — runs `f` in index order; pure read, so `Array` participates in `|!`. `map` / `flat_map` / `filter` are not exported: pipe over `array.to_list(a)` *(shipped)*.
 
 The empty case is served by the `array_empty[a]() : Array[a]`
 core prim: `array_make` always demands an `init: T` to reify the

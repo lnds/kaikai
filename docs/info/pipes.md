@@ -26,7 +26,7 @@ pub fn each     (xs: T[A], f: (A) -> Unit / e)     : Unit / e
 
 `each` runs `f` for its effect on every element, in the order `map`
 visits them, and is what `|!` calls. Every type below exports it (`[T]`
-through the core `each`, `Array[T]` through `array.each`); the mutable `HashMap` / `HashSet` carry
+through the core `each`, `Array[T]` through `array.each`, which is the only pipe function `Array` has: `|`, `||` and `|?` over an Array are errors, so pipe over `array.to_list(a)`); the mutable `HashMap` / `HashSet` carry
 `/ Mutable`.
 
 ## `|!` — for each element, for its effect
@@ -140,7 +140,6 @@ These stdlib types export the canonical `map` / `flat_map` / `filter`
 
 ```text
 [T]                  element a            (core/list)
-Array[T]             element a            (array)
 Stream[t, e]         element t            (stream)
 Gen[t, e]            element t            (gen)
 Seq[t]               element t            (seq, pure-only functions)
