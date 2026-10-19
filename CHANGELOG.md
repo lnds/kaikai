@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.165.4 (2026-10-19)
+
+### Fixed
+
+- **typer**: a function the cut emptied joins the pool whichever view says it feeds the unwind analysis
+- **typer**: key the candidates' signatures by identity, not spelling
+
+### Changed
+
+- **typer**: drop the retry wording the early cut no longer has
+- **typer**: empty every core body and complete it when the program asks for it
+- **front**: pass a core function through the front end on its own
+- **resolve**: number locals from the declaration's place in the stream
+- **typer**: delete the type-blind core reach, keep the cut's predicates
+- **precut**: seed the pipe fusion helpers only when a pipe fires them
+- **typer**: type core bodies only when the typed program asks for them
+- **typer**: split typecheck_module into a declaration front and a body half
+
 ## v0.165.3 (2026-10-18)
 
 ### Fixed
