@@ -202,7 +202,7 @@ pointer** of the borrowed scrutinee (the RC pass does not dup it at the
 bind), so the borrow is refused if any arm lets a child ESCAPE — returned in
 tail position, stored in a ctor/record/list, captured, or passed owned. A
 pure read (binop operand, callee inspection) does not escape. The escape
-walk lives in `compiler/borrow_escape.kai`. This is decided whole-program
+walk lives in `compiler/borrow_infer.kai`. This is decided whole-program
 but is sound per-function (bounded to what the RC pass guarantees), so it
 survives the sep-comp oracle that the pre-gate revert (#1129) did not.
 
