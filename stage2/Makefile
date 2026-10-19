@@ -13901,6 +13901,11 @@ test-native-cache-edits-native: $(TARGET) bin-kai
 test-own-blocks-native: $(TARGET) bin-kai
 	@../tests/own_blocks.sh
 
+# Modules of one package may import each other; a cycle across packages or in
+# a tree with no kai.toml is still an error.
+test-intra-pkg-cycles: $(TARGET) bin-kai
+	@../tests/intra_pkg_cycles.sh
+
 # Targets that drive `bin/kai` with KAI_BACKEND=native. On a kaic2 built
 # without libLLVM the wrapper degrades to the C backend, so running these
 # in the C-built tier1 job asserts nothing about native — they belong to

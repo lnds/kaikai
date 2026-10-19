@@ -1,0 +1,86 @@
+#[doc("Constants defined in terms of one another: a constant has no storage, so a read of one that reaches itself never finishes.")]
+
+
+import compiler.ast
+import compiler.diag
+import compiler.diag_file
+import compiler.scc
+import compiler.written
+import compiler.decl_text
+import compiler.symtab
+import compiler.expr_positions
+
+#[doc("The diagnostics for the constants of `decls` that reach themselves through the constants their initialisers read directly.")]
+pub fn const_cycle_diags(decls: [Decl], tab: SymTab, df: DiagFiles) : [Diagnostic] = {
+  let consts = filter(decls, is_const)
+  let ids = map(consts, const_id)
+  let edges = flat_map(range_pairs(consts), (ic) => map(filter_map_idx(ids, ic.snd), (j) => (ic.fst, j)))
+  let loops = filter(edges, (e) => e.fst == e.snd)
+  let groups = scc_groups(list_length(consts), edges)
+  flat_map(list_append(map(loops, (e) => [e.fst]), groups), (g) => const_cycle_diag(consts, g, tab, df))
+}
+
+fn is_const(d: Decl) : Bool = match d {
+  DConst(_, s, _, _, _, _, _) -> sym_raw(s) >= 0
+  _ -> false
+}
+
+fn const_id(d: Decl) : SymId = match d {
+  DConst(_, s, _, _, _, _, _) -> s
+  _ -> sym_none()
+}
+
+fn const_body(d: Decl) : Option[Expr] = match d {
+  DConst(_, _, _, e, _, _, _) -> Some(e)
+  _ -> None
+}
+
+fn range_pairs(ds: [Decl]) : [(Int, Decl)] = zip_index(ds, 0)
+
+fn zip_index(ds: [Decl], i: Int) : [(Int, Decl)] = match ds {
+  []           -> []
+  [d, ...rest] -> [(i, d), ...zip_index(rest, i + 1)]
+}
+
+fn filter_map_idx(ids: [SymId], d: Decl) : [Int] = {
+  let refs = match const_body(d) { Some(e) -> inline_syms(e)  None -> [] }
+  index_all(ids, refs, 0)
+}
+
+fn index_all(ids: [SymId], refs: [SymId], i: Int) : [Int] = match ids {
+  []           -> []
+  [s, ...rest] -> if any(refs, (r) => sym_raw(r) == sym_raw(s)) { [i, ...index_all(rest, refs, i + 1)] } else { index_all(rest, refs, i + 1) }
+}
+
+fn inline_syms(e: Expr) : [SymId] = {
+  let here = match e.kind { ESym(s, _) -> [s]  _ -> [] }
+  list_append(here, flat_map(xp_positions(e), (p) => match p {
+    XP(r, x) -> if xrole_inline(r) { inline_syms(x) } else { [] }
+  }))
+}
+
+fn const_cycle_diag(consts: [Decl], members: [Int], tab: SymTab, df: DiagFiles) : [Diagnostic] =
+  match nth_decl(consts, list_min(members)) {
+    Some(first) -> match first {
+      DConst(_, _, _, _, _, l, c) -> {
+        let file = decl_diag_file(first, df)
+        let names = flat_map(sort(members), (i) => match nth_decl(consts, i) { Some(d) -> [const_name(d, tab)]  None -> [] })
+        [mk_diag(SevError, file, l, c, "constant `#{const_name(first, tab)}` is defined in terms of itself",
+                 [ri_note(file, l, c, "the cycle runs through #{string_join(names, ", ")}")])]
+      }
+      _ -> []
+    }
+    None -> []
+  }
+
+fn const_name(d: Decl, tab: SymTab) : String = match d {
+  DConst(_, s, _, _, _, _, _) -> written_text(decl_name(tab, s))
+  _ -> ""
+}
+
+fn nth_decl(ds: [Decl], i: Int) : Option[Decl] = match ds {
+  [d, ...rest] -> if i == 0 { Some(d) } else { nth_decl(rest, i - 1) }
+  []           -> None
+}
+
+fn list_min(xs: [Int]) : Int = foldl(xs, 1000000000, (a, x) => if x < a { x } else { a })
