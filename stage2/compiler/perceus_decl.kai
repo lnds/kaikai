@@ -1,13 +1,12 @@
 #[doc("""
-Perceus over one declaration: the sets its body is rewritten under, then
-the drops its parameters, arms and lets owe.
+Per-declaration Perceus: the declaration rewrite, the pass over the program and the capability test it resolves against.
 """)]
 
 import compiler.ast
 import compiler.fnreg
 import compiler.ast_map
 import compiler.expr_positions
-import compiler.perceus_owned_pos
+import compiler.perceus_borrow
 import compiler.perceus_lend
 import compiler.perceus_payer
 import compiler.perceus_exit_drops
@@ -18,18 +17,19 @@ import compiler.entry
 import compiler.core_builtin_sets
 import compiler.perceus_reads
 import compiler.perceus_read_walk
-import compiler.perceus_cap
 import compiler.self_call
 import compiler.symtab
 import compiler.perceus_reuse
-import compiler.perceus_opaque_lets
-import compiler.perceus_borrow_map
-import compiler.perceus_borrow_strip
 import compiler.perceus_arm
-import compiler.perceus_wrap_borrow
 import compiler.perceus
-import compiler.perceus_self_tail
 import compiler.perceus_linear
+import compiler.core_builtins
+import compiler.scope_file
+import compiler.spec_names
+import compiler.written
+import compiler.decl_names
+import compiler.symtab_build
+import compiler.scope_view
 
 # True iff the fn is a UFn whose EVERY param lowers raw (all mask bits
 # true). Only these take the simplified empty-param-scope Perceus path;
@@ -136,8 +136,7 @@ fn pcs_paramless_body(body: Expr, uses: UseIx, me: SelfRef, raw_params: [Binder]
   pcs_strip_borrow_args_d(reused_body, scx)
 }
 
-#[doc("The declaration `d` with its reference counting made explicit.")]
-pub fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, opaque_ret_fns: [FnId],
+pub(pkg) fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, opaque_ret_fns: [FnId],
                   prim_bmap: BorrowMap, caps: CapScope, cores: SymSet, tab: SymTab) : Decl / Console {
 
   match d {
@@ -513,3 +512,175 @@ fn pcs_body_is_block_with_tail(body: Expr) : Bool {
     _ -> false
   }
 }
+
+# ---- m5 — basic Perceus (m5 #1, walker scaffold) ----
+#
+# Walks the post-mono `[Decl]` and (eventually) inserts `kai_dup` /
+# `kai_decref` calls at non-last / last-use positions per the Koka
+# Perceus paper. m5 #1 wires the slot; the body is identity. m5 #2
+# computes per-binding last-use positions; m5 #3 emits drops at
+# end-of-scope; m5 #4 emits dups at non-last uses; m5 #5 measures.
+#
+# Operates on values, not types. Under uniform boxing every
+# `KaiValue *` has the same RC shape, so a single drop/dup discipline
+# applies across instantiations — the m4c retrofit blocking real
+# monomorphisation does not block this pass.
+#
+# Reads the source AST as the IR. The emitter consumes whatever this
+# function returns; selfhost convergence remains the gate.
+
+# For each `DFn` the pass collects the in-scope reads once (`pcs_use_index`),
+# then rewrites the body so every read that does not hand its binder's birth
+# ref on is wrapped in `__perceus_dup`. The drops that release what no read
+# hands on are planted where `compiler.perceus_payer` names the payer.
+
+
+pub(pkg) fn perceus_pass_in(decls: [Decl], tab: SymTab, specs: SpecNames, views: FileViews,
+      root: String, entry: SymId) : [Decl] / Console {
+
+  let fns = fnx_build(register_fn_decls(decls, tab, specs, entry))
+  # Borrow inference pre-pass (Koka pre-Parc): per-fn borrowed param
+  # positions, consumed by BOTH sides of the flip (callee wraps the
+  # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
+  # decref; caller strips the __perceus_dup on args in borrowed slots).
+  # Read-only prims (array_get/array_length) join the borrow map so the
+  # caller strips the container dup and the path counter charges 0 —
+  # reusing the whole borrow pipeline. A prim is keyed by its row's
+  # identity like any declaration, so a user fn spelled like a prim never
+  # reads the prim's row; the same entry gates the callee rename.
+  let prim_bmap = pcs_seed_prim_borrows()
+  let bmap = pcs_build_borrow_map(decls, prim_bmap, tab)
+  # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
+  # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
+  # callee like regexp nb_add_transition) must keep the caller's ref.
+  let cmap = pcs_build_consume_map(decls, cix_empty(), tab)
+  # The `extern "C" fn` shims whose return type is an opaque handle.
+  # A `let h = f(...)` with such an `f` binds a handle box that must move
+  # at its last consuming use (the shim there decrefs the box); otherwise
+  # it is dup'd at every use and the birth ref never reaches zero.
+  let opaque_names = pcs_collect_opaque_names(decls, [])
+  let opaque_ret_fns = pcs_collect_opaque_ret_fns(decls, opaque_names, [])
+  let caps = pcap_scope(decls, tab, views, root)
+  let prim_bm = bm_of(prim_bmap)
+  let cores = bound_builtin_syms()
+  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, prim_bm, caps, cores, tab))
+}
+
+# The `extern "C" fn` shims whose return type is an opaque handle.
+fn pcs_collect_opaque_ret_fns(decls: [Decl], opaque_names: [SymId], acc: [FnId]) : [FnId] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, fsym, _, _, opt_ret, _, body, _, _, _) ->
+      if body_is_ffi_extern(body) and pcs_ret_is_opaque(opt_ret, opaque_names) {
+        pcs_collect_opaque_ret_fns(rest, opaque_names, [fsym, ...acc])
+      } else { pcs_collect_opaque_ret_fns(rest, opaque_names, acc) }
+    _ -> pcs_collect_opaque_ret_fns(rest, opaque_names, acc)
+  }
+}
+
+fn pcs_ret_is_opaque(opt_ret: Option[TypeExpr], opaque_names: [SymId]) : Bool = match opt_ret {
+  Some(t) -> match t.tkind { TyName(r, _) -> pcs_has_sym(opaque_names, ref_sym(r)) _ -> false }
+  None    -> false
+}
+
+fn pcs_has_sym(ss: [SymId], s: SymId) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> (sym_raw(s) >= 0 and sym_same(h, s)) or pcs_has_sym(rest, s)
+}
+
+# The types declared `extern "C" opaque`, recovered from the
+# one-`__ffi_handle`-field records they lower to. Every boxed FFI input
+# is consumed (the shim decrefs each after the extern returns).
+fn pcs_collect_opaque_names(decls: [Decl], acc: [SymId]) : [SymId] = match decls {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DType(_, tsym, _, TBRecord(fields), _, _, _, _) ->
+      if pcs_is_ffi_opaque_record(fields) { pcs_collect_opaque_names(rest, [tsym, ...acc]) }
+      else { pcs_collect_opaque_names(rest, acc) }
+    _ -> pcs_collect_opaque_names(rest, acc)
+  }
+}
+
+fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
+  [FD(_, fname, _, _)] -> fname == "__ffi_handle"
+  _ -> false
+}
+
+# Seed the borrow map with the read-only prims. One map entry gates BOTH
+# the caller-dup strip and the callee rename, so a strip-without-rename
+# (double free) or rename-without-strip (leak) is impossible.
+fn pcs_seed_prim_borrows() : [BorrowEntry] = map(lending_builtins(), (b) => BwE(fnid_decl(builtin_id(b)), [0]))
+
+#[doc("What the capability test resolves against: the program's symbol table, its per-file views, the root module, and the effects and types the declarations declare.")]
+pub type CapScope = { tab: SymTab, views: FileViews, root: String,
+                      effects: [SymId], types: [SymId] }
+
+fn pcap_scope(decls: [Decl], tab: SymTab, views: FileViews,
+      root: String) : CapScope =
+  CapScope { tab: tab, views: views, root: root,
+             effects: pcap_declared(decls, true, []),
+             types: pcap_declared(decls, false, []) }
+
+fn pcap_param_names(c: CapScope, mo: Option[String],
+      params: [Param]) : [Binder] =
+  pcap_names(c, fv_of(c.views, st_module_id(pcap_home(c, mo))), params)
+
+fn pcap_home(c: CapScope, mo: Option[String]) : String = match mo {
+  Some(m) -> m
+  None    -> c.root
+}
+
+fn pcap_names(c: CapScope, v: ScopeView, params: [Param]) : [Binder] =
+  match params {
+    [] -> []
+    [p, ...rest] ->
+      if pcap_is_cap(c, v, p.ptype) { [p.binder, ...pcap_names(c, v, rest)] }
+      else { pcap_names(c, v, rest) }
+  }
+
+fn pcap_is_cap(c: CapScope, v: ScopeView, t: Option[TypeExpr]) : Bool =
+  match t {
+    Some(te) -> match te.tkind {
+      TyName(r, _) -> pcap_names_effect(c, v, r)
+      _            -> false
+    }
+    None -> false
+  }
+
+fn pcap_names_effect(c: CapScope, v: ScopeView, r: DeclRef) : Bool = match r {
+  DrSym(s) ->
+    if st_valid(c.tab, s) { pcap_effect(c.tab, s) }
+    else { pcap_has(c.effects, s) and not pcap_has(c.types, s) }
+  DrWritten(_, n) -> match sv_resolve_any(c.tab, v, [NCEffect, NCType], written_text(n)) {
+    SvSym(s)     -> pcap_effect(c.tab, s)
+    SvPrivate(s) -> pcap_effect(c.tab, s)
+    SvAmbig(ss)  -> pcap_all_effects(c.tab, ss)
+    SvNone       -> false
+  }
+}
+
+fn pcap_effect(t: SymTab, s: SymId) : Bool = ncls_same(sym_class(t, s), NCEffect)
+
+# Two declarations on one rung leave the annotation contested. Only when
+# every candidate is an effect is there no value type it could mean.
+fn pcap_all_effects(t: SymTab, ss: [SymId]) : Bool = match ss {
+  [] -> true
+  [s, ...rest] -> pcap_effect(t, s) and pcap_all_effects(t, rest)
+}
+
+fn pcap_has(ss: [SymId], s: SymId) : Bool = match ss {
+  []           -> false
+  [h, ...rest] -> (sym_raw(s) >= 0 and sym_same(h, s)) or pcap_has(rest, s)
+}
+
+fn pcap_declared(decls: [Decl], effects: Bool, acc: [SymId]) : [SymId] =
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DEffect(_, s, _, _, _, _, _, _) ->
+        pcap_declared(rest, effects, if effects { [s, ...acc] } else { acc })
+      DType(_, s, _, _, _, _, _, _) ->
+        pcap_declared(rest, effects, if effects { acc } else { [s, ...acc] })
+      _ -> pcap_declared(rest, effects, acc)
+    }
+  }

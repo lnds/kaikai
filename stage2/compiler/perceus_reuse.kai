@@ -1,14 +1,17 @@
 #[doc("""
-Reuse: a match arm that rebuilds the shape it took apart writes into the
-scrutinee's cell.
+Constructor reuse: the rebuilds that reuse a dropped cell, the cells they reuse and the constructors they name.
 """)]
 
 import compiler.ast
 import compiler.ast_map
 import compiler.perceus_reads
 import compiler.symtab
-import compiler.perceus_borrow_strip
-import compiler.perceus_dups
+import compiler.perceus_borrow
+import compiler.perceus
+import compiler.emit_shared
+import compiler.ctor_ix
+import compiler.expr_positions
+import compiler.live_fns
 
 # Two types of one runtime shape. Units and refinements are erased, a
 # nominal type is its declaration, and an unresolved one equals none.
@@ -57,15 +60,7 @@ fn prc_leaf_ty(t: Ty) : Int = match t {
   _         -> 0 - 1
 }
 
-#[doc("""
-`borrowed` names the params that are borrowed in THIS fn: a match over one
-of them must NOT reuse its scrutinee cell (issue #1127 rule 5 — the cell is
-the caller's, reuse-in-place would corrupt it). Threading the set here
-marks such a scrutinee not-owned so the recogniser skips reuse, mirroring
-what the `__perceus_borrow` wrap does downstream (the wrap runs AFTER this
-pass, so the recogniser cannot see it and must consult `borrowed` directly).
-""")]
-pub fn pcs_recognise_reuse_expr_b(e: Expr, borrowed: [Binder], tab: SymTab) : Expr =
+pub(pkg) fn pcs_recognise_reuse_expr_b(e: Expr, borrowed: [Binder], tab: SymTab) : Expr =
   Expr { kind: pcs_recognise_reuse_kind_b(e.kind, e.line, e.col, borrowed, tab),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
@@ -322,4 +317,127 @@ fn pcs_zip_fields(fis: [FieldInit], vals: [Expr]) : [FieldInit] = match fis {
     [v, ...vrest] -> match fi { FI(n, _) -> [FI(n, v), ...pcs_zip_fields(frest, vrest)] }
     []            -> []
   }
+}
+
+#[doc("A boxed child of an inner cell, by slot: a binder, a slot no binder names, or a deeper cell.")]
+pub type CellKid = KidBind(Int, LocalId) | KidDrop(Int) | KidCell(Int, ReuseCell)
+
+#[doc("An inner cell: its arity and its boxed children in slot order.")]
+pub type ReuseCell = ReuseCell(Int, [CellKid])
+
+pub(pkg) fn reuse_is_cell(sp: Pattern, k: Int) : Bool = k == 0 and match sp.pkind {
+  PVariant(_, isubs) -> isubs != []
+  _                  -> false
+}
+
+# A layout of another arity is worse than none: the kinds are walked in
+# lockstep with the sub-patterns.
+pub(pkg) fn reuse_ctor_kinds(ctors: CtorIx, r: DeclRef, isubs: [Pattern]) : [Int] = match ctor_ix_row(ctors, ref_sym(r)) {
+  Some(EV(_, ks, _, _)) -> if list_length(ks) == list_length(isubs) { ks } else { [] }
+  None                     -> []
+}
+
+pub(pkg) fn reuse_slot_cells(subs: [Pattern], ks: [Int], ctors: CtorIx) : [(Int, ReuseCell)] =
+  rc_slots(subs, ks, 0, ctors)
+
+pub(pkg) fn reuse_pattern_cells(p: Pattern, ctors: CtorIx) : [(Int, ReuseCell)] = match p.pkind {
+  PVariant(r, subs) -> rc_slots(subs, reuse_ctor_kinds(ctors, r, subs), 0, ctors)
+  _                 -> []
+}
+
+fn rc_slots(subs: [Pattern], ks: [Int], i: Int, ctors: CtorIx) : [(Int, ReuseCell)] = match subs {
+  []            -> []
+  [sp, ...rest] -> {
+    let tl = rc_slots(rest, ks, i + 1, ctors)
+    match rc_cell(sp, kind_at(ks, i), ctors) { Some(c) -> [(i, c), ...tl] None -> tl }
+  }
+}
+
+fn rc_cell(sp: Pattern, k: Int, ctors: CtorIx) : Option[ReuseCell] =
+  if not reuse_is_cell(sp, k) { None }
+  else { match sp.pkind {
+    PVariant(r, isubs) ->
+      Some(ReuseCell(list_length(isubs), rc_kids(isubs, reuse_ctor_kinds(ctors, r, isubs), 0, ctors)))
+    _ -> None
+  } }
+
+# Only boxed slots carry a reference to settle.
+fn rc_kids(isubs: [Pattern], ks: [Int], j: Int, ctors: CtorIx) : [CellKid] = match isubs {
+  []            -> []
+  [sp, ...rest] -> {
+    let k = kind_at(ks, j)
+    let tl = rc_kids(rest, ks, j + 1, ctors)
+    if k != 0 { tl }
+    else { match rc_cell(sp, k, ctors) {
+      Some(c) -> [KidCell(j, c), ...tl]
+      None    -> match sp.pkind {
+        PBind(b)  -> [KidBind(j, b.id), ...tl]
+        _         -> [KidDrop(j), ...tl]
+      }
+    } }
+  }
+}
+
+pub(pkg) fn reusable_tags(decls: [Decl], ids: ProtoIds, ctors: CtorIx, entry: SymId) : [Int] =
+  list_reverse(collect_reuse_tags(live_decls(decls, ids, entry), ctors, []))
+
+fn reuse_site_tag(ctors: CtorIx, ctor: Expr) : Option[Int] = match reuse_site_row(ctors, ctor) {
+  Some(row) -> Some(ctor_row_tag(row))
+  None      -> None
+}
+
+fn reuse_site_row(ctors: CtorIx, ctor: Expr) : Option[VariantEntry] = match ctor.kind {
+  ECall(cf, _) -> ctor_ix_site(ctors, cf)
+  _            -> None
+}
+
+pub(pkg) fn reuse_ctor_id(ctors: CtorIx, ctor: Expr) : Option[SymId] = match ctor.kind {
+  ECall(cf, _) -> match cf.kind {
+    ESym(s, _) -> match ctor_ix_row(ctors, s) {
+      Some(_) -> Some(s)
+      None    -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+pub(pkg) fn reuse_same_ctor(p: DeclRef, b: SymId) : Bool = sym_raw(b) >= 0 and sym_same(ref_sym(p), b)
+
+# Newest first, each tag once.
+fn collect_reuse_tags(decls: [Decl], cx: CtorIx, acc: [Int]) : [Int] = match decls {
+  []           -> acc
+  [d, ...rest] -> collect_reuse_tags(rest, cx, collect_reuse_tags_decl(d, cx, acc))
+}
+
+fn collect_reuse_tags_decl(d: Decl, cx: CtorIx, acc: [Int]) : [Int] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> walk_reuse_tags(body, cx, acc)
+  DTest(_, body, _, _, _)     -> walk_reuse_tags(body, cx, acc)
+  DBench(_, body, _, _, _)    -> walk_reuse_tags(body, cx, acc)
+  DCheck(_, _, body, _, _, _) -> walk_reuse_tags(body, cx, acc)
+  _ -> acc
+}
+
+fn walk_reuse_tags(e: Expr, cx: CtorIx, acc: [Int]) : [Int] =
+  walk_reuse_tags_positions(xp_positions(e), cx, add_reuse_tag(e.kind, cx, acc))
+
+fn walk_reuse_tags_positions(ps: [XPos], cx: CtorIx, acc: [Int]) : [Int] = match ps {
+  []                 -> acc
+  [XP(_, x), ...rest] -> walk_reuse_tags_positions(rest, cx, walk_reuse_tags(x, cx, acc))
+}
+
+fn add_reuse_tag(k: ExprKind, cx: CtorIx, acc: [Int]) : [Int] = match k {
+  ECall(callee, [_scr, ctor]) ->
+    if is_reuse_variant_callee(callee) {
+      match reuse_site_tag(cx, ctor) {
+        Some(t) -> if any(acc, (x) => x == t) { acc } else { [t, ...acc] }
+        None    -> acc
+      }
+    } else { acc }
+  _ -> acc
+}
+
+fn is_reuse_variant_callee(callee: Expr) : Bool = match callee.kind {
+  EMark(MkReuseVariant) -> true
+  _                     -> false
 }

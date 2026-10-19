@@ -1,0 +1,809 @@
+#[doc("""
+Borrowed parameters during the Perceus rewrite: stripping borrowed args, the consume map, opaque lets, wrapped borrows and lambda takes.
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.ast_map
+import compiler.expr_positions
+import compiler.perceus_payer
+import compiler.perceus_lend
+import compiler.consume_index
+import compiler.fn_index
+import compiler.borrow_infer
+import compiler.perceus_reads
+import compiler.core_builtins
+import compiler.core_builtin_sets
+import compiler.name_ix
+import compiler.symtab
+import compiler.kinds
+import compiler.ctor_ix
+import compiler.ret_slots
+
+pub(pkg) fn pcs_collect_borrow_last_set(names: [Binder], body: Expr, prim_bmap: BorrowMap) : [Binder] = match names {
+  [] -> []
+  _  -> {
+    let reads = pbr_slot_reads(body, (f) => pcs_borrow_lookup(prim_bmap, pcs_callee_key(f)))
+    filter(names, (n) => pbr_only_lent(reads, n))
+  }
+}
+
+pub(pkg) fn pcs_borrow_lookup(bmap: BorrowMap, key: FnId) : [Int] = bm_lookup(bmap, key)
+
+pub(pkg) fn pcs_lent_slots(l: LocalId, f: Expr, xs: [Expr], bmap: BorrowMap) : [Int] =
+  if pcs_any_arg_is_var(l, xs) { pcs_borrow_slots(bmap, f) } else { [] }
+
+pub(pkg) fn pcs_borrow_slots(bmap: BorrowMap, f: Expr) : [Int] = match bmap {
+  BEmpty -> []
+  _      -> bm_lookup(bmap, pcs_callee_key(f))
+}
+
+#[doc("""
+Caller side: strip the __perceus_dup the rewrite put on an argument
+that lands in a borrowed parameter slot of the callee. The callee
+borrows (does not consume) so the caller need not dup → the incref is
+removed. Uses the global borrow map keyed by callee identity; a raw param of
+an unboxed callee is handled by `perceus_raw_slot.kai`.
+
+`borrow_last` names are the containers whose sole use IS this borrow —
+their prim access stays CONSUMING (no strip, no rename): the runtime
+decref reclaims them in place, avoiding the exit-drop wrap that would
+otherwise reset a raw sibling param's unbox scope. The borrow win lives
+in the loop shape (container re-threaded, not last-use), which this
+does not touch.
+Context for the caller-side borrow strip.
+
+`fns` — the function registry. A function passed by value in a borrowed
+slot materialises a fresh `kai_closure` the callee borrows but no one
+drops; it is marked `__perceus_owned_borrow` here for the emit to
+balance after the call.
+
+`no_wrap` — names whose bare (un-dup'd) reads are NOT owned moves even
+at their last-use position: borrowed params (borrow-through), raw
+scalars, the move/reuse binder sets, exit-dropped locals.
+
+`raw_no_wrap` — the names of `no_wrap` whose bare read hands on no
+reference in a raw slot either. A moved arm binder is not one: its move
+delegates the release, and a raw slot takes a copy of the scalar.
+
+`uses` — the rewrite's use records, so the strip can recognise a
+SINGLE-use name: its one bare read is a MOVE by the dup predicate's
+own rule, and in a borrowed slot that move has no taker — it is
+marked `__perceus_owned_borrow` so the emit drops the ref after the
+call. Multi-use names are never marked: their bare borrowed reads are
+stripped dups (net-zero), and per-read reclassification is unsound
+where sugar clones share one source position.
+""")]
+pub type StripCx = { bmap: BorrowMap, borrow_last: [Binder],
+                 no_wrap: [Binder], raw_no_wrap: [Binder], uses: UseIx, fns: FnIndex, cores: SymSet }
+
+pub(pkg) fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
+  Expr { kind: pcs_strip_borrow_kind(e.kind, scx),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
+  ECall(callee, args_) -> {
+    let key = pcs_callee_key(callee)
+    # The borrowing indirect call holds the closure it invokes in slot 0
+    # without consuming it, so that slot must not take the dup-on-consume
+    # while the rest keep the owned convention.
+    if pcs_callee_borrows_slot0(callee) {
+      let args2 = pcs_strip_args_at_d(args_, [0], 0, scx)
+      ECall(pcs_strip_borrow_args_d(callee, scx), args2)
+    } else {
+    # A prim call whose container arg0 is its LAST borrowed use stays
+    # consuming: suppress the dup strip and the rename so the runtime
+    # decref reclaims the container. Earlier borrowed reads are rewritten.
+    let keep_consuming = pcs_arg0_is_borrow_last(args_, scx.borrow_last) and
+                         (match pcs_lending_form(callee) { Some(_) -> true None -> false })
+    let positions = if keep_consuming { [] } else { pcs_borrow_lookup(scx.bmap, key) }
+    let args2 = prs_mark_raw_moves(pcs_strip_args_at_d(args_, positions, 0, scx),
+                                   prs_raw_arg_positions(callee, scx.fns), scx.raw_no_wrap, scx.uses)
+    let callee2 = if keep_consuming { callee }
+                  else { pcs_maybe_rename_borrow_prim(callee, positions) }
+    ECall(pcs_strip_borrow_args_d(callee2, scx), args2)
+    }
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_d(sub, scx))
+}
+
+# The local arg0 reads, seeing through a dup wrap the rewrite may have
+# placed. `None` if arg0 is not a (possibly dup-wrapped) bare local.
+fn pcs_arg0_var_name(args_: [Expr]) : Option[LocalId] = match args_ {
+  []          -> None
+  [h, ...___] -> pcs_unwrap_dup_var(h)
+}
+
+fn pcs_unwrap_dup_var(e: Expr) : Option[LocalId] = match prc_peel_unit(e).kind {
+  ELocal(l)       -> Some(l)
+  ECall(f, inner) -> match f.kind {
+    EMark(MkDup) -> match inner { [x] -> pcs_unwrap_dup_var(x) _ -> None }
+    _            -> None
+  }
+  _ -> None
+}
+
+fn pcs_arg0_is_borrow_last(args_: [Expr], borrow_last: [Binder]) : Bool = match pcs_arg0_var_name(args_) {
+  Some(l) -> pcs_has(borrow_last, l)
+  None    -> false
+}
+
+fn pcs_maybe_rename_borrow_prim(callee: Expr, positions: [Int]) : Expr =
+  if pcs_has_int(positions, 0) {
+    match pcs_lending_form(callee) {
+      Some(b) -> builtin_ref_at(b, callee)
+      None    -> callee
+    }
+  } else { callee }
+
+# The lending sibling of the builtin a callee names.
+fn pcs_lending_form(callee: Expr) : Option[CoreBuiltin] = match builtin_ref(callee) {
+  Some(b) -> builtin_lending_form(b)
+  None    -> None
+}
+
+# A mark whose slot 0 holds a value it invokes rather than consumes.
+fn pcs_callee_borrows_slot0(callee: Expr) : Bool = match callee.kind {
+  EMark(MkApplyBorrow) -> true
+  _                    -> false
+}
+
+pub(pkg) fn pcs_boxed_borrow_slots(bmap: BorrowMap, fns: FnIndex, f: Expr) : [Int] = {
+  let raw = prs_raw_arg_positions(f, fns)
+  filter(pcs_borrow_slots(bmap, f), (i) => not pcs_has_int(raw, i))
+}
+
+pub(pkg) fn pcs_callee_key(callee: Expr) : FnId = match callee.kind {
+  ESym(s, inst) -> FnId(s, inst)
+  _             -> fnid_none()
+}
+
+pub(pkg) fn pcs_callee_is_ctor(tab: SymTab, f: Expr) : Bool = match f.kind {
+  ESym(s, _) -> sym_is_ctor(tab, s)
+  EOp(_)     -> true
+  _          -> false
+}
+
+# For each arg: if its index is in `positions` (borrowed slot) and it is
+# `__perceus_dup(x)`, strip to `x`. Recurse into every arg either way.
+fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : [Expr] = match args_ {
+  []           -> []
+  [a, ...rest] -> {
+    let a1 = pcs_strip_borrow_args_d(a, scx)
+    let borrowed_slot = pcs_has_int(positions, i)
+    # Borrowed slot: strip the dup (callee borrows, no incref needed). A
+    # freshly-materialised closure (a bare top-level fn name → kai_closure)
+    # in a borrowed slot has no consumer, so the emit must drop its birth
+    # ref after the call (#1130 rule 1): mark it `__perceus_owned_borrow`
+    # for the emit to recognise. The mark is a plain arg wrapper (like
+    # `__perceus_dup`), NOT an EBlock — the emit unwraps it and balances the
+    # ref in a local C statement-expression, invisible to tcrec/TCO.
+    # A bare read the rewrite classified as a MOVE takes the same mark:
+    # its delegated release never happens in a borrowing callee.
+    let a2 = if borrowed_slot {
+               let s = pcs_strip_dup_wrap(a1)
+               if pcs_arg_is_fn_ref(s, scx.fns, scx.cores) { prs_wrap_owned_borrow(s) }
+               else if pcs_arg_is_owned_move(a1, scx) { prs_wrap_owned_borrow(s) }
+               else if pcs_arg_is_owned_rvalue(s) { prs_wrap_owned_borrow(s) }
+               else { s }
+             }
+             else { a1 }
+    [a2, ...pcs_strip_args_at_d(rest, positions, i + 1, scx)]
+  }
+}
+
+# A bare local argument (no dup wrap) holding a SINGLE-use value: the
+# rewrite's dup rule moves a sole read raw, delegating the release to
+# the callee — in a borrowed slot that transfer has no taker. Excludes
+# `no_wrap` names (their bare reads balance elsewhere: borrow-through,
+# skip/move sets, exit-dropped locals), lambda-blocked names, and
+# unboxable-typed reads, which `prs_mark_raw_moves` handles at raw slots.
+fn pcs_arg_is_owned_move(a: Expr, scx: StripCx) : Bool = match prc_peel_unit(a).kind {
+  ELocal(l) ->
+    if pcs_has(scx.no_wrap, l) { false }
+    else if not pcs_fate_transfers(pcs_fate_of(l, scx.uses, false, false)) { false }
+    else { match a.ty {
+      Some(t) -> not (ty_is_unboxable_t(t) or ty_is_fixed_vec(t))
+      None    -> false
+    } }
+  _ -> false
+}
+
+# A top-level fn or core builtin passed by value (the emit
+# materialises a fresh `kai_closure`, like a lambda literal). A local/param
+# is never marked — it is borrow-through or tracked, and dropping it would
+# over-free.
+fn pcs_arg_is_fn_ref(a: Expr, fns: FnIndex, cores: SymSet) : Bool = match a.kind {
+  ESym(s, inst) -> match fnx_of_sym(fns, FnId(s, inst)) {
+    Some(_) -> true
+    None    -> sym_set_has(cores, s)
+  }
+  _             -> false
+}
+
+pub(pkg) fn pcs_has_int(xs: [Int], t: Int) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> if x == t { true } else { pcs_has_int(rest, t) }
+}
+
+pub(pkg) fn pcs_uses_only_consuming_slots(nm: Binder, e: Expr, cmap: ConsumeIndex, bm: BorrowMap, tab: SymTab) : Bool =
+  pcs_consuming_slots_kind(nm, e.kind, cmap, bm, tab)
+
+fn pcs_any_arg_is_lambda(xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> match h.kind { ELambda(_, _) -> true _ -> pcs_any_arg_is_lambda(rest) }
+}
+
+pub(pkg) fn pcs_name_in_expr(nm: Binder, e: Expr) : Bool = pcs_read_outside_lambda(nm, e)
+
+fn pcs_name_in_exprs(nm: Binder, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_name_in_expr(nm, h) or pcs_name_in_exprs(nm, rest)
+}
+
+fn pcs_consuming_slots_kind(nm: Binder, k: ExprKind, cmap: ConsumeIndex, bm: BorrowMap, tab: SymTab) : Bool = match k {
+  ECall(f, xs) -> {
+    # Higher-order conservatism: if ANY arg is a lambda, the call is a
+    # higher-order combinator (map/filter/fold). The lambda may FIELD-READ
+    # nm's elements (e.g. `map(args, (a) => desugar_interp_expr(a))` field-
+    # reads each a), which the per-callee consume-map does not model — the
+    # consume bit is about the LIST param, not its elements. Moving nm into
+    # such a call corrupts the AST (the desugar_interp self-host infinite
+    # recursion). Treat nm as non-consuming-safe whenever the call carries a
+    # lambda arg, OR nm itself appears inside a lambda.
+    if pcs_any_arg_is_lambda(xs) and (pcs_name_in_exprs(nm, xs) or pcs_name_in_expr(nm, f)) {
+      false
+    } else {
+      pcs_consuming_slots_kind(nm, f.kind, cmap, bm, tab) and
+        (if pcs_any_arg_is_var(nm.id, xs) { pcs_consuming_call_args(nm, f, xs, cmap, bm, tab) }
+         else { pcs_consuming_args(nm, xs, [], false, 0, cmap, bm, tab) })
+    }
+  }
+  EMatch(s, arms) -> {
+    let s_ok = pcs_is_leaf_ref(s) or pcs_uses_only_consuming_slots(nm, s, cmap, bm, tab)
+    s_ok and pcs_consuming_arms(nm, arms, cmap, bm, tab)
+  }
+  EField(x, _)    -> if pcs_is_leaf_ref(x) { not pcs_is_bare(nm.id, x) } else { pcs_uses_only_consuming_slots(nm, x, cmap, bm, tab) }
+  EIndex(a, b)    -> (if pcs_is_leaf_ref(a) { not pcs_is_bare(nm.id, a) } else { pcs_uses_only_consuming_slots(nm, a, cmap, bm, tab) }) and
+                      pcs_uses_only_consuming_slots(nm, b, cmap, bm, tab)
+  # Intrinsics incref their args internally — no arg slot ever consumes.
+  EIntrinsic(_, xs)   -> not pcs_name_in_exprs(nm, xs)
+  ESurface(sf)        -> not pcs_name_in_exprs(nm, surface_children(sf))
+  # Everything else scans its positions: a lambda capture is never
+  # move-safe, an assert message blocks on mere presence (it only runs
+  # on the aborting path), and the remaining roles apply the slot check.
+  _ -> pcs_consuming_slots_ps(nm, xp_positions_kind(k), cmap, bm, tab)
+}
+
+pub(pkg) fn pcs_is_leaf_ref(e: Expr) : Bool = match e.kind {
+  ELocal(_)  -> true
+  ESym(_, _) -> true
+  _          -> false
+}
+
+# The callee's slots matter only to a call that takes `nm` bare.
+fn pcs_consuming_call_args(nm: Binder, f: Expr, xs: [Expr], cmap: ConsumeIndex, bm: BorrowMap, tab: SymTab) : Bool = {
+  let key = pcs_callee_key(f)
+  pcs_consuming_args(nm, xs, list_append(cix_lookup(cmap, key), pcs_borrow_lookup(bm, key)), pcs_callee_is_ctor(tab, f), 0, cmap, bm, tab)
+}
+
+fn pcs_consuming_slots_ps(nm: Binder, ps: [XPos], cmap: ConsumeIndex, bm: BorrowMap, tab: SymTab) : Bool = match ps {
+  []                  -> true
+  [XP(r, c), ...rest] ->
+    (match r {
+      XLam -> false
+      XMsg -> not pcs_name_in_expr(nm, c)
+      _    -> pcs_uses_only_consuming_slots(nm, c, cmap, bm, tab)
+    }) and pcs_consuming_slots_ps(nm, rest, cmap, bm, tab)
+}
+
+fn pcs_consuming_args(nm: Binder, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: ConsumeIndex, bm: BorrowMap, tab: SymTab) : Bool = match xs {
+  []           -> true
+  [h, ...rest] -> {
+    let here = if pcs_is_bare(nm.id, h) { is_ctor or pcs_has_int(consumed, i) }
+               else if pcs_is_leaf_ref(h) { true }
+               else { pcs_uses_only_consuming_slots(nm, h, cmap, bm, tab) }
+    here and pcs_consuming_args(nm, rest, consumed, is_ctor, i + 1, cmap, bm, tab)
+  }
+}
+
+fn pcs_consuming_arms(nm: Binder, arms: [Arm], cmap: ConsumeIndex, bm: BorrowMap, tab: SymTab) : Bool = match arms {
+  []           -> true
+  [a, ...rest] -> match a {
+    Arm(_, opt_g, b) ->
+      (match opt_g { None -> true Some(g) -> pcs_uses_only_consuming_slots(nm, g, cmap, bm, tab) }) and
+      pcs_uses_only_consuming_slots(nm, b, cmap, bm, tab) and pcs_consuming_arms(nm, rest, cmap, bm, tab)
+  }
+}
+
+# The callee's consuming slots and whether it builds a constructor, as the
+# last-use move check reads them.
+fn pcs_slot_consumers(cmap: ConsumeIndex, tab: SymTab) : (Expr) -> ([Int], Bool) =
+  (f) => (cix_lookup(cmap, pcs_callee_key(f)), pcs_callee_is_ctor(tab, f))
+
+pub(pkg) fn pcs_collect_move_last_set(binders: [Binder], body: Expr, uses: UseIx, cmap: ConsumeIndex, tab: SymTab) : [Binder] =
+  match filter(binders, (nm) => pcs_read_count(nm.id, uses) >= 2) {
+    []    -> []
+    cands -> {
+      let sites = pms_move_sites(body, pcs_slot_consumers(cmap, tab))
+      filter(cands, (nm) => pcs_last_read_moves(nm.id, uses, sites))
+    }
+  }
+
+fn pcs_last_read_moves(l: LocalId, uses: UseIx, sites: MoveSites) : Bool = match last_use_for(l, uses) {
+  LuAt(ll, lc) -> pms_moves_at(sites, l, ll, lc)
+  _            -> false
+}
+
+pub(pkg) fn pcs_lends_end_first(nm: Binder, e: Expr, bmap: BorrowMap) : Bool =
+  plo_moves_after_lends(nm, e, (f) => pcs_borrow_slots(bmap, f))
+
+pub(pkg) fn pcs_strip_dup_wrap(e: Expr) : Expr = match e.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EMark(MkDup) -> match args_ {
+      [inner] -> inner
+      _       -> e
+    }
+    _ -> e
+  }
+  _ -> e
+}
+
+pub(pkg) fn pcs_collect_move_last_lets(body: Expr, uses: UseIx, cmap: ConsumeIndex,
+                              skip: [Binder], tab: SymTab) : [Binder] = match pcs_mll_expr(body, body, uses, cmap, skip, []) {
+  []    -> []
+  cands -> {
+    let roles = pbr_role_reads(body)
+    let sites = pms_move_sites(body, pcs_slot_consumers(cmap, tab))
+    filter(cands, (nm) => pcs_mll_reached_once(nm, roles, uses, sites))
+  }
+}
+
+fn pcs_mll_reached_once(nm: Binder, roles: NameIx[RoleRead], uses: UseIx, sites: MoveSites) : Bool =
+  match pbr_roles_of(roles, nm) {
+    (a, brc, blocked) -> a == 1 and brc == 0 and not blocked and pcs_last_read_moves(nm.id, uses, sites)
+  }
+
+pub(pkg) fn pcs_user_borrow_slots(bmap: BorrowMap, callee: Expr) : [Int] = match pcs_lending_form(callee) {
+  Some(_) -> []
+  None    -> pcs_borrow_lookup(bmap, pcs_callee_key(callee))
+}
+
+pub(pkg) fn pcs_boxed_positions(bpos: [Int], params: [Param], raw: [Binder], i: Int) : [Int] = match params {
+  []           -> []
+  [p, ...rest] -> {
+    let tl = pcs_boxed_positions(bpos, rest, raw, i + 1)
+    if pcs_has_int(bpos, i) and not pcs_has(raw, p.binder.id) { [i, ...tl] } else { tl }
+  }
+}
+
+type PopCx = { borrowed: [Binder], slots: (Expr) -> [Int] }
+
+pub(pkg) fn pop_own_positions(body: Expr, borrowed: [Binder], slots: (Expr) -> [Int]) : Expr = match borrowed {
+  []         -> body
+  [_, ...__] -> {
+    let cx = PopCx { borrowed: borrowed, slots: slots }
+    pov_value(pop_expr(body, cx), cx.borrowed)
+  }
+}
+
+fn pop_expr(e: Expr, cx: PopCx) : Expr =
+  Expr { kind: pop_kind(prc_map_expr_kind(e.kind, (x) => pop_expr(x, cx)), cx),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pop_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
+  EBlock(stmts, tail)  -> EBlock(pop_stmts(stmts, 0, tail, cx), tail)
+  EList(els)           -> EList(map(els, (el) => pop_elem(el, cx)))
+  ERecordLit(rh, fis)  -> ERecordLit(rh, map(fis, (fi) => pop_field(fi, cx)))
+  ECall(f, args_)      -> if pop_is_sentinel(f) { k } else { ECall(f, pop_args(args_, cx.slots(f), 0, cx)) }
+  _                    -> if pop_reads_owed(k, cx) { pop_consumed(k, cx) } else { k }
+}
+
+# True when an operand the runtime consumes owes a reference; any other
+# node is kept as it came in. A bare borrowed scrutinee is inspected in
+# place, a value yielded into the scrutinee is released by the match.
+fn pop_reads_owed(k: ExprKind, cx: PopCx) : Bool = match k {
+  EField(x, _)    -> pov_owes(x, cx.borrowed)
+  EIndex(a, i)    -> pov_owes(a, cx.borrowed) or pov_owes(i, cx.borrowed)
+  EBinop(_, a, b) -> pov_owes(a, cx.borrowed) or pov_owes(b, cx.borrowed)
+  EUnop(_, x)     -> pov_owes(x, cx.borrowed)
+  EBang(x)        -> pov_owes(x, cx.borrowed)
+  EMatch(scr, _)  -> pov_yields(scr)
+  _               -> false
+}
+
+fn pop_consumed(k: ExprKind, cx: PopCx) : ExprKind = match k {
+  EField(x, nm)     -> EField(pov_operand(x, cx.borrowed), nm)
+  EIndex(a, i)      -> EIndex(pov_operand(a, cx.borrowed), pov_operand(i, cx.borrowed))
+  EBinop(op, a, b)  -> EBinop(op, pov_operand(a, cx.borrowed), pov_operand(b, cx.borrowed))
+  EUnop(op, x)      -> EUnop(op, pov_operand(x, cx.borrowed))
+  EBang(x)          -> EBang(pov_operand(x, cx.borrowed))
+  EMatch(scr, arms) -> EMatch(pov_value(scr, cx.borrowed), arms)
+  _                 -> k
+}
+
+# A slot passes its value through, so its rhs is owned only where the
+# block's value is, and a hoisted tail-call argument where the slot it
+# feeds is. `next` is the hoisted argument the block binds next.
+fn pop_stmts(ss: [Stmt], next: Int, tail: Option[Expr], cx: PopCx) : [Stmt] = match ss {
+  []           -> []
+  [s, ...rest] -> match s {
+    SLet(pat, ann, rhs) ->
+      if ret_slot_binds_tail_arg(pat, next) { [SLet(pat, ann, pop_hoisted(pat, rhs, tail, cx)), ...pop_stmts(rest, next + 1, tail, cx)] }
+      else if pop_is_wrap(pat) { [s, ...pop_stmts(rest, next, tail, cx)] }
+      else { [SLet(pat, ann, pov_value(rhs, cx.borrowed)), ...pop_stmts(rest, next, tail, cx)] }
+    _ -> [s, ...pop_stmts(rest, next, tail, cx)]
+  }
+}
+
+fn pop_hoisted(pat: Pattern, rhs: Expr, tail: Option[Expr], cx: PopCx) : Expr = match tail {
+  Some(t) -> match t.kind {
+    ECall(f, args_) -> if pop_reads_lent(pat, args_, cx.slots(f), 0) { pop_lent(rhs, cx) } else { pov_value(rhs, cx.borrowed) }
+    _               -> rhs
+  }
+  None -> rhs
+}
+
+fn pop_reads_lent(pat: Pattern, args_: [Expr], slots: [Int], i: Int) : Bool = match args_ {
+  []           -> false
+  [a, ...rest] -> (pop_reads_bind(pat, a) and any(slots, (p) => p == i)) or pop_reads_lent(pat, rest, slots, i + 1)
+}
+
+fn pop_reads_bind(pat: Pattern, a: Expr) : Bool = match pat.pkind {
+  PBind(b) -> match a.kind { ELocal(l) -> local_eq(l, b.id)  _ -> false }
+  _        -> false
+}
+
+fn pop_elem(el: ListElem, cx: PopCx) : ListElem = match el {
+  ElSpread(x) -> ElSpread(pov_value(x, cx.borrowed))
+  ElPlain(x)  -> ElPlain(pov_value(x, cx.borrowed))
+}
+
+fn pop_field(fi: FieldInit, cx: PopCx) : FieldInit = match fi {
+  FI(nm, v) -> FI(nm, pov_value(v, cx.borrowed))
+}
+
+fn pop_args(args_: [Expr], borrowed_slots: [Int], i: Int, cx: PopCx) : [Expr] = match args_ {
+  []           -> []
+  [a, ...rest] -> {
+    let a1 = if any(borrowed_slots, (p) => p == i) { pop_lent(a, cx) } else { pov_value(a, cx.borrowed) }
+    [a1, ...pop_args(rest, borrowed_slots, i + 1, cx)]
+  }
+}
+
+# A borrowed slot lends a bare binder through. A value the caller releases
+# after the call must own a reference on every path that yields it.
+fn pop_lent(a: Expr, cx: PopCx) : Expr = if pov_yields(a) and pcs_arg_is_owned_rvalue(a) { pov_value(a, cx.borrowed) } else { a }
+
+# Perceus's own marks manage their operands, and a unit coercion hands
+# its operand through. A call of a declaration, of a closure a local
+# holds or of an effect operation is an ordinary call.
+fn pop_is_sentinel(f: Expr) : Bool = match f.kind {
+  ESym(_, _) -> pop_is_coercion(f)
+  ELocal(_)  -> false
+  EOp(_)     -> false
+  _          -> true
+}
+
+fn pop_is_coercion(f: Expr) : Bool = match builtin_ref(f) {
+  Some(b) -> builtin_is_unit_coercion(b)
+  None    -> false
+}
+
+fn pop_is_wrap(pat: Pattern) : Bool = match pat.pkind {
+  PBind(b) -> ret_slot_id_is_value(b.id)
+  _        -> false
+}
+
+fn pov_value(e: Expr, borrowed: [Binder]) : Expr = match e.kind {
+  ELocal(l) -> if pcs_has(borrowed, l) { pov_dup(e) } else { e }
+  _         -> Expr { kind: pov_value_kind(e.kind, borrowed), line: e.line, col: e.col,
+                      ty: e.ty, mode: e.mode,  site: e.site }
+}
+
+fn pov_value_kind(k: ExprKind, borrowed: [Binder]) : ExprKind = match k {
+  EIf(c, t, oe)       -> EIf(c, pov_value(t, borrowed), prc_map_opt_expr(oe, (x) => pov_value(x, borrowed)))
+  EMatch(scr, arms)   -> EMatch(scr, map(arms, (a) => match a { Arm(p, g, b) -> Arm(p, g, pov_value(b, borrowed)) }))
+  EBlock(stmts, tail) -> match tail {
+    Some(t) -> EBlock(pov_wrapped(stmts, t, borrowed), Some(pov_value(t, borrowed)))
+    None    -> k
+  }
+  _ -> k
+}
+
+# The wrap a block tail names, if the tail is a bare result slot: its rhs
+# is owned where the block's value is.
+fn pov_wrapped(stmts: [Stmt], tail: Expr, borrowed: [Binder]) : [Stmt] = match tail.kind {
+  ELocal(l) -> map(stmts, (s) => match s {
+    SLet(pat, ann, rhs) -> match pat.pkind {
+      PBind(b) -> if local_eq(b.id, l) and ret_slot_id_is_value(l) { SLet(pat, ann, pov_value(rhs, borrowed)) } else { s }
+      _        -> s
+    }
+    _ -> s
+  })
+  _ -> stmts
+}
+
+fn pov_dup(a: Expr) : Expr =
+  Expr { kind: ECall(mk_expr(EMark(MkDup), a.line, a.col), [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }
+
+fn pov_yields(e: Expr) : Bool = match e.kind {
+  EIf(_, _, _)       -> true
+  EMatch(_, _)       -> true
+  EBlock(_, Some(_)) -> true
+  _                  -> false
+}
+
+fn pov_owes(e: Expr, borrowed: [Binder]) : Bool = match e.mode {
+  MUnboxed -> false
+  _        -> match e.kind {
+    ELocal(l) -> pcs_has(borrowed, l)
+    _         -> pov_yields(e)
+  }
+}
+
+fn pov_operand(e: Expr, borrowed: [Binder]) : Expr = if pov_owes(e, borrowed) { pov_value(e, borrowed) } else { e }
+
+# ---------- Consume-map (Koka Borrowed dual: which params a fn CONSUMES) ---
+#
+# A param is CONSUMED by its fn iff the fn deconstructs it (match scrutinee
+# whose arm binds children) or stores it (ctor/record/list slot) — i.e. the fn
+# takes ownership and the cell is reclaimed/reused inside. A param that is
+# only FIELD-READ (`b.states`, `b.next_id`) or passed to another fn that does
+# not consume it (the stdlib/regexp `nb_add_transition`/`nb_set_transitions`
+# field-read chain) is NOT consumed — the caller keeps the obligation. This is
+# the bit a caller needs to decide whether MOVING a binder into `f(binder)` is
+# sound: move only into CONSUMING slots; a non-consuming slot must keep the
+# caller's ref (dup), else the value's life after the call reads freed memory
+# (the regexp UAF). Keyed by function identity, like the borrow map.
+
+pub(pkg) fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex, tab: SymTab) : ConsumeIndex = match decls {
+  []           -> acc
+  [d, ...rest] -> pcs_build_consume_map(rest, pcs_consume_entry_of(d, acc, tab), tab)
+}
+
+fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex, tab: SymTab) : ConsumeIndex = match d {
+  DFn(_, fsym, _, params, _, _, body, _, _, _) -> {
+    let pnames = map(params, (p) => p.binder)
+    # An FFI shim's body is opaque to the consuming-use walk, so a normal
+    # scan finds nothing consumed. The shim decrefs every boxed input, so
+    # mark each (a Unit param carries no boxed value and is skipped); else
+    # a value passed to two shim calls is double-freed.
+    let positions = if body_is_extern(body) { pcs_ffi_consumed_positions(params, 0) }
+                    else { pcs_consumed_positions(pnames, body, 0, tab) }
+    cix_add(acc, CE(fsym, positions))
+  }
+  _ -> acc
+}
+
+fn pcs_ffi_consumed_positions(params: [Param], i: Int) : [Int] = match params {
+  [] -> []
+  [p, ...rest] ->
+    if pcs_param_is_unit(p) { pcs_ffi_consumed_positions(rest, i + 1) }
+    else { [i, ...pcs_ffi_consumed_positions(rest, i + 1)] }
+}
+
+fn pcs_param_is_unit(p: Param) : Bool = match p.ptype {
+  Some(t) -> match resolve_ty(t) {
+    TyUnit -> true
+    _      -> false
+  }
+  None    -> false
+}
+
+fn pcs_consumed_positions(pnames: [Binder], body: Expr, i: Int, tab: SymTab) : [Int] = match pnames {
+  []           -> []
+  [p, ...rest] ->
+    if pcs_param_consumes(p.id, body, tab) { [i, ...pcs_consumed_positions(rest, body, i + 1, tab)] }
+    else { pcs_consumed_positions(rest, body, i + 1, tab) }
+}
+
+# A param p is CONSUMED iff it appears as a deconstructing match scrutinee
+# (arm binds a child = ownership taken) OR in a ctor/record/list slot (stored).
+# A field-read-only param (regexp nb_*) is NOT consumed. Only the storing
+# forms keep explicit arms; everything else descends through the table's
+# inline positions (a deferred `XLam`/`XCl` body runs elsewhere and cannot
+# witness a consuming use of the caller's ref — the closure capture is
+# RC'd separately, matching the lambda rule the analysis always had).
+fn pcs_param_consumes(p: LocalId, body: Expr, tab: SymTab) : Bool = pcs_consumes_expr(p, body, tab)
+
+fn pcs_consumes_expr(p: LocalId, e: Expr, tab: SymTab) : Bool = match e.kind {
+  EMatch(s, arms) -> {
+    let scr = pcs_is_bare(p, s) and pcs_arms_bind_children(arms)
+    scr or pcs_consumes_ps(p, xp_positions(e), tab)
+  }
+  ECall(f, xs) ->
+    (pcs_any_bare_var(p, xs) and pcs_callee_is_ctor(tab, f)) or pcs_consumes_ps(p, xp_positions(e), tab)
+  ERecordLit(_, fis) -> pcs_fields_bare_var(p, fis) or pcs_consumes_ps(p, xp_positions(e), tab)
+  EList(els)         -> pcs_elems_bare_var(p, els) or pcs_consumes_ps(p, xp_positions(e), tab)
+  _                  -> pcs_consumes_ps(p, xp_positions(e), tab)
+}
+
+fn pcs_consumes_ps(p: LocalId, ps: [XPos], tab: SymTab) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] ->
+    (xrole_inline(r) and pcs_consumes_expr(p, c, tab)) or pcs_consumes_ps(p, rest, tab)
+}
+
+fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a, ...rest] -> match a {
+    Arm(pat, _, _) -> match prc_pat_bindings(pat, []) { [] -> pcs_arms_bind_children(rest) _ -> true }
+  }
+}
+
+fn pcs_any_bare_var(p: LocalId, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_is_bare(p, h) or pcs_any_bare_var(p, rest)
+}
+
+fn pcs_fields_bare_var(p: LocalId, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [h, ...rest] -> match h {
+    FI(_, e) -> pcs_is_bare(p, e) or pcs_fields_bare_var(p, rest)
+  }
+}
+
+# A plain slot and a trailing spread store the ref; a middle spread copies
+# the spine out and releases it.
+fn pcs_elems_bare_var(p: LocalId, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let stores = match h { ElPlain(e) -> Some(e) ElSpread(e) -> match rest { [] -> Some(e) _ -> None } }
+    let here = match stores {
+      Some(e) -> pcs_is_bare(p, e)
+      None    -> false
+    }
+    here or pcs_elems_bare_var(p, rest)
+  }
+}
+
+fn pcs_has_fn(fs: [FnId], f: FnId) : Bool = match fs {
+  []           -> false
+  [h, ...rest] -> fnid_eq(h, f) or pcs_has_fn(rest, f)
+}
+
+pub(pkg) fn pcs_collect_opaque_let_binders(e: Expr, opaque_ret_fns: [FnId], acc: [Binder]) : [Binder] =
+  pcs_olb_kind(e.kind, opaque_ret_fns, acc)
+
+fn pcs_olb_kind(k: ExprKind, ofns: [FnId], acc: [Binder]) : [Binder] = match k {
+  EBlock(stmts, tail) -> {
+    let a1 = pcs_olb_stmts(stmts, ofns, acc)
+    match tail { None -> a1 Some(e) -> pcs_collect_opaque_let_binders(e, ofns, a1) }
+  }
+  EIf(c, t, oe) -> {
+    let a1 = pcs_collect_opaque_let_binders(t, ofns, pcs_collect_opaque_let_binders(c, ofns, acc))
+    match oe { None -> a1 Some(e2) -> pcs_collect_opaque_let_binders(e2, ofns, a1) }
+  }
+  EMatch(s, arms) -> pcs_olb_arms(arms, ofns, pcs_collect_opaque_let_binders(s, ofns, acc))
+  ELambda(_, body) -> pcs_collect_opaque_let_binders(body, ofns, acc)
+  _ -> acc
+}
+
+fn pcs_olb_stmts(stmts: [Stmt], ofns: [FnId], acc: [Binder]) : [Binder] = match stmts {
+  []           -> acc
+  [s, ...rest] -> {
+    let a1 = match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) -> if pcs_rhs_calls_opaque_fn(rhs, ofns) { [nm, ...pcs_collect_opaque_let_binders(rhs, ofns, acc)] }
+                     else { pcs_collect_opaque_let_binders(rhs, ofns, acc) }
+        _ -> pcs_collect_opaque_let_binders(rhs, ofns, acc)
+      }
+      SExprStmt(e) -> pcs_collect_opaque_let_binders(e, ofns, acc)
+      _ -> acc
+    }
+    pcs_olb_stmts(rest, ofns, a1)
+  }
+}
+
+fn pcs_olb_arms(arms: [Arm], ofns: [FnId], acc: [Binder]) : [Binder] = match arms {
+  []           -> acc
+  [Arm(_, _, b), ...rest] -> pcs_olb_arms(rest, ofns, pcs_collect_opaque_let_binders(b, ofns, acc))
+}
+
+fn pcs_rhs_calls_opaque_fn(rhs: Expr, ofns: [FnId]) : Bool = match rhs.kind {
+  ECall(f, _) -> pcs_has_fn(ofns, pcs_callee_key(f))
+  _           -> false
+}
+
+pub(pkg) fn pcs_wrap_borrow_scrutinees(e: Expr, borrowed: [Binder]) : Expr =
+  Expr { kind: pcs_wrap_borrow_kind(e.kind, borrowed),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pcs_wrap_borrow_kind(k: ExprKind, borrowed: [Binder]) : ExprKind = match k {
+  EMatch(scr, arms) -> {
+    let scr2 = match scr.kind {
+      ELocal(l) ->
+        if pcs_has(borrowed, l) {
+          Expr { kind: ECall(
+                   Expr { kind: EMark(MkBorrow), line: scr.line, col: scr.col,
+                          ty: None, mode: MUnknown,  site: scr.site },
+                   [scr]),
+                 line: scr.line, col: scr.col, ty: scr.ty, mode: scr.mode , site: 0 }
+        } else { pcs_wrap_borrow_scrutinees(scr, borrowed) }
+      _ -> pcs_wrap_borrow_scrutinees(scr, borrowed)
+    }
+    EMatch(scr2, pcs_wrap_borrow_arms(arms, borrowed))
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_scrutinees(sub, borrowed))
+}
+
+fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [Binder]) : [Arm] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(p, g, b) -> [Arm(p, g, pcs_wrap_borrow_scrutinees(b, borrowed)),
+                     ...pcs_wrap_borrow_arms(rest, borrowed)]
+  }
+}
+
+pub(pkg) fn pcs_wrap_borrow_calls(e: Expr, bc: [Binder]) : Expr =
+  Expr { kind: pcs_wrap_borrow_call_kind(e.kind, bc),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn pcs_wrap_borrow_call_kind(k: ExprKind, bc: [Binder]) : ExprKind = match k {
+  ECall(callee, args_) -> match callee.kind {
+    ELocal(l) ->
+      if pcs_has(bc, l) {
+        let args2 = map(args_, (a) => pcs_wrap_borrow_calls(a, bc))
+        pcs_apply_borrow_call(callee, args2)
+      } else {
+        ECall(pcs_wrap_borrow_calls(callee, bc),
+              map(args_, (a) => pcs_wrap_borrow_calls(a, bc)))
+      }
+    _ -> ECall(pcs_wrap_borrow_calls(callee, bc),
+               map(args_, (a) => pcs_wrap_borrow_calls(a, bc)))
+  }
+  _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_calls(sub, bc))
+}
+
+# Build the borrowing indirect call from a closure callee expr and its
+# already-walked call args.
+fn pcs_apply_borrow_call(clo: Expr, args2: [Expr]) : ExprKind =
+  ECall(Expr { kind: EMark(MkApplyBorrow), line: clo.line,
+               col: clo.col, ty: None, mode: MUnknown,  site: clo.site },
+        [clo, ...args2])
+
+fn pcs_mll_expr(e: Expr, body: Expr, uses: UseIx, cmap: ConsumeIndex,
+                skip: [Binder], acc: [Binder]) : [Binder] = {
+  let acc1 = match e.kind {
+    EBlock(ss, _) -> pcs_mll_scan(ss, body, uses, cmap, skip, acc)
+    _             -> acc
+  }
+  pcs_mll_ps(xp_positions(e), body, uses, cmap, skip, acc1)
+}
+
+fn pcs_mll_ps(ps: [XPos], body: Expr, uses: UseIx, cmap: ConsumeIndex,
+              skip: [Binder], acc: [Binder]) : [Binder] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> {
+    let acc1 = if xrole_inline(r) { pcs_mll_expr(c, body, uses, cmap, skip, acc) }
+               else { acc }
+    pcs_mll_ps(rest, body, uses, cmap, skip, acc1)
+  }
+}
+
+fn pcs_mll_scan(ss: [Stmt], body: Expr, uses: UseIx, cmap: ConsumeIndex,
+                skip: [Binder], acc: [Binder]) : [Binder] = match ss {
+  []           -> acc
+  [s, ...rest] -> {
+    let acc1 = match s {
+      SLet(pat, _, rhs) -> match rhs.mode {
+        MUnboxed -> acc
+        _        -> match pat.pkind {
+          PBind(nm) ->
+            if pcs_mll_qualifies(nm, pat, rhs, body, uses, cmap, skip) { [nm, ...acc] }
+            else { acc }
+          _ -> acc
+        }
+      }
+      _ -> acc
+    }
+    pcs_mll_scan(rest, body, uses, cmap, skip, acc1)
+  }
+}
+
+fn pcs_mll_qualifies(nm: Binder, pat: Pattern, rhs: Expr, body: Expr,
+                     uses: UseIx, cmap: ConsumeIndex, skip: [Binder]) : Bool =
+  not pcs_has(skip, nm.id) and pcs_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm.id)
+    and pcs_read_once(nm.id, uses)
