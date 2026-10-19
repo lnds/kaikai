@@ -769,7 +769,7 @@ as a parameter** and store it in a data value. `stdlib/stream.kai`
 is built on this:
 
 ```kaikai
-pub type Stream[t, e] = Stream(((t) -> Bool / e) -> Unit / e)
+pub type Stream[t, e] = Stream(() -> Unit / Emit[t] + e)
 ```
 
 The mechanism is a **row carrier**: a row-kind argument slot resolves

@@ -1,24 +1,22 @@
 #[doc("""
-Lazy streams with a **push** carrier (internal iteration), the
+Lazy streams as generators over the `Emit[t]` effect, the
 constant-memory backbone for line-oriented file processing.
 
-A `Stream[t, e]` is a recipe, not a cursor: it wraps a function that,
-given a `yield` callback, drives the elements through it one at a time.
-The producer owns its resource — `read_lines` opens the file, loops
+A `Stream[t, e]` is a recipe, not a cursor: it wraps a producer that
+performs `Emit.emit` once per element. A stage or sink is a handler of
+`Emit[t]`; it stops the stream early by not resuming, so no further
+element is produced and the producer's resource is released. The
+producer owns its resource — `read_lines` opens the file, loops
 `read_chunk`, and closes on normal end and early stop. The caller writes
-no bracket; cleanup is by construction (Go `iter.Seq` / Rust drop).
+no bracket; cleanup is by construction.
 
-`yield` returns `Bool`: `false` means "stop early", and a well-behaved
-producer honours it and unwinds. Because a `Stream` is a recipe,
-consuming it twice re-runs the producer from the start (re-opens the
-file) — re-runnable, never a shared-cursor corruption.
+Because a `Stream` is a recipe, consuming it twice re-runs the producer
+from the start (re-opens the file) — re-runnable, never a shared-cursor
+corruption.
 
 The carrier is a single-constructor variant `Stream(run)` rather than a
 bare function-type alias: the `|`, `||`, `|?` pipes dispatch by head
-type, and only a nominal `TyCon` head (here `Stream`) participates — a
-function-type alias has no head type, so the pipes would decline. The
-wrapper is one field, the same constructor through every stage, so
-Perceus reuses it in place; the residual cost is a tag-match per stage.
+type, and only a nominal `TyCon` head (here `Stream`) participates.
 
 Surface:
   - sources : from_list, read_lines
@@ -35,11 +33,11 @@ always a clean `String`. The recoverable per-chunk fault is `ReadFault`
 returns `Nothing` (abort only). `import stream`.
 """)]
 
-# A stream wraps a function that runs the consumer: `run` calls `yield`
-# once per element, and `yield` returns false to stop early. The nominal
-# wrapper (not a bare function alias) is what lets the pipes dispatch.
-#[doc("A lazy push stream of `t` whose production may perform effects `e`; a re-runnable recipe, not a cursor.")]
-pub type Stream[t, e] = Stream(((t) -> Bool / e) -> Unit / e)
+#[doc("The effect a stream's producer performs to hand out each element; a consumer handles it and stops the stream by not resuming.")]
+pub effect Emit[t] { emit(v: t) : Unit }
+
+#[doc("A lazy stream of `t` whose production may perform effects `e`; a re-runnable recipe, not a cursor.")]
+pub type Stream[t, e] = Stream(() -> Unit / Emit[t] + e)
 
 #[doc("""
 The recoverable IO fault for streamed reads. `bad_chunk(msg)` returns
@@ -63,35 +61,31 @@ effect Bracket {
   unused() : Unit
 }
 
-# Drive a stream's run function with `yield` — the single point that
-# unwraps the carrier, so the combinators below read as one-liners.
-fn run_with[t, e](s: Stream[t, e], yield: (t) -> Bool / e) : Unit / e =
-  match s { Stream(run) -> run(yield) }
+# The single point that unwraps the carrier.
+fn run[t, e](s: Stream[t, e]) : Unit / Emit[t] + e =
+  match s { Stream(body) -> body() }
 
 # -- sources -----------------------------------------------------------
 
-# Drive a list element by element, honouring early stop.
-fn feed_list[t, e](xs: [t], yield: (t) -> Bool / e) : Unit / e = match xs {
+fn feed_list[t, e](xs: [t]) : Unit / Emit[t] + e = match xs {
   []        -> ()
-  [h, ...t] -> if yield(h) { feed_list(t, yield) } else { () }
+  [h, ...t] -> { Emit.emit(h); feed_list(t) }
 }
 
 #[doc("A stream over the elements of `xs`, in order. Pure — its row is empty.")]
-pub fn from_list[t, e](xs: [t]) : Stream[t, e] = Stream((yield) => feed_list(xs, yield))
+pub fn from_list[t, e](xs: [t]) : Stream[t, e] = Stream(() => feed_list(xs))
 
-# Split `buf` at newlines: emit each completed line through `yield`,
-# return the unterminated remainder (the bytes after the last '\n').
-# Honouring early stop, a `false` from `yield` returns the empty
-# remainder paired with `false` so the producer knows to stop.
-fn drain_lines[e](buf: String, yield: (String) -> Bool / e) : (String, Bool) / e =
+# Split `buf` at newlines: emit each completed line, return the
+# unterminated remainder (the bytes after the last '\n').
+fn drain_lines(buf: String) : String / Emit[String] =
   match string.index_of(buf, "\n") {
-    None    -> (buf, true)
+    None    -> buf
     Some(i) -> {
-      # The cut is at a '\n' and one byte past it — both codepoint
-      # boundaries by construction, so the byte slice is exact.
+      # Both cuts sit on codepoint boundaries, so the byte slices are exact.
       let line = string_slice(buf, 0, i)
       let rest = string_slice(buf, i + 1, string.length(buf) - i - 1)
-      if yield(line) { drain_lines(rest, yield) } else { ("", false) }
+      Emit.emit(line)
+      drain_lines(rest)
     }
   }
 
@@ -99,17 +93,15 @@ fn drain_lines[e](buf: String, yield: (String) -> Bool / e) : (String, Bool) / e
 # (`Ok("")`) emit the final unterminated line (if any) and stop. A
 # `read_chunk` error performs `bad_chunk`; resuming drops the failed
 # read and continues, abandoning aborts.
-fn pump_lines[e](h: FileHandle<read>, carry: String, yield: (String) -> Bool / e)
-  : Unit / File + ReadFault + e =
+fn pump_lines(h: FileHandle<read>, carry: String) : Unit / File + ReadFault + Emit[String] =
   match File.read_chunk(h, 4096) {
     Ok(chunk) ->
       if string.length(chunk) == 0 {
-        if string.length(carry) > 0 { let _ = yield(carry); () } else { () }
+        if string.length(carry) > 0 { Emit.emit(carry) } else { () }
       } else {
-        let pair = drain_lines(string.concat(carry, chunk), yield)
-        if pair.snd { pump_lines(h, pair.fst, yield) } else { () }
+        pump_lines(h, drain_lines(string.concat(carry, chunk)))
       }
-    Err(msg) -> { ReadFault.bad_chunk(msg); pump_lines(h, carry, yield) }
+    Err(msg) -> { ReadFault.bad_chunk(msg); pump_lines(h, carry) }
   }
 
 #[doc("""
@@ -122,11 +114,11 @@ failed chunk read performs `ReadFault.bad_chunk` — resume to skip, or
 abandon to abort.
 """)]
 pub fn read_lines(path: String) : Stream[String, File + ReadFault] =
-  Stream((yield) => match File.open_read(path) {
+  Stream(() => match File.open_read(path) {
     Err(msg) -> { ReadFault.open_fault(msg); () }
     Ok(h)    ->
       handle {
-        pump_lines(h, "", yield)
+        pump_lines(h, "")
       } with Bracket {
         initially { h }
         finally   { File.close_file(state) }
@@ -139,41 +131,48 @@ pub fn read_lines(path: String) : Stream[String, File + ReadFault] =
 
 #[doc("Maps `f` over every element, lazily. Canonical `map` — participates in the `|` pipe.")]
 pub fn map[a, b, e](s: Stream[a, e], f: (a) -> b / e) : Stream[b, e] =
-  Stream((yield) => run_with(s, (x) => yield(f(x))))
+  Stream(() => handle { run(s) } with Emit[a] {
+    emit(x, resume) -> { Emit.emit(f(x)); resume(()) }
+  })
 
 #[doc("Maps `f` to a sub-stream per element and concatenates them, lazily. Canonical `flat_map` — participates in the `||` pipe.")]
 pub fn flat_map[a, b, e](s: Stream[a, e], f: (a) -> Stream[b, e] / e) : Stream[b, e] =
-  Stream((yield) => {
-    var alive := true
-    run_with(s, (x) => {
-      run_with(f(x), (y) => { let go = yield(y); if go { true } else { alive := false; false } })
-      alive
-    })
+  Stream(() => handle { run(s) } with Emit[a] {
+    emit(x, resume) -> { run(f(x)); resume(()) }
   })
 
 #[doc("Keeps only elements satisfying `p`, lazily. Canonical `filter` — participates in the `|?` pipe.")]
 pub fn filter[t, e](s: Stream[t, e], p: (t) -> Bool / e) : Stream[t, e] =
-  Stream((yield) => run_with(s, (x) => if p(x) { yield(x) } else { true }))
+  Stream(() => handle { run(s) } with Emit[t] {
+    emit(x, resume) -> { if p(x) { Emit.emit(x) } else { () }; resume(()) }
+  })
 
 #[doc("Yields at most the first `n` elements, then stops the producer early (no further reads).")]
 pub fn take[t, e](s: Stream[t, e], n: Int) : Stream[t, e] =
-  Stream((yield) => {
-    var seen := 0
-    run_with(s, (x) => if seen >= n { false } else { seen := seen + 1; yield(x) })
-  })
+  if n <= 0 { Stream(() => ()) }
+  else {
+    Stream(() => handle { run(s) } with Emit[t](1) {
+      emit(x, resume) -> {
+        Emit.emit(x)
+        if state >= n { () } else { resume((), state + 1) }
+      }
+    })
+  }
 
 #[doc("Yields elements while `p` holds, stopping at (and excluding) the first that fails — no further reads.")]
 pub fn take_while[t, e](s: Stream[t, e], p: (t) -> Bool / e) : Stream[t, e] =
-  Stream((yield) => run_with(s, (x) => if p(x) { yield(x) } else { false }))
+  Stream(() => handle { run(s) } with Emit[t] {
+    emit(x, resume) -> if p(x) { Emit.emit(x); resume(()) } else { () }
+  })
 
 # -- sinks (force the pipeline) ----------------------------------------
 
 #[doc("Folds `f` over every element left-to-right from `init`, forcing the pipeline.")]
-pub fn foldl[t, a, e](s: Stream[t, e], init: a, f: (a, t) -> a / e) : a / e = {
-  var acc := init
-  run_with(s, (x) => { acc := f(acc, x); true })
-  acc
-}
+pub fn foldl[t, a, e](s: Stream[t, e], init: a, f: (a, t) -> a / e) : a / e =
+  handle { run(s) } with Emit[t](init) {
+    emit(x, resume) -> resume((), f(state, x))
+    return(_u)      -> state
+  }
 
 #[doc("""
 Deprecated alias for `foldl` — the left-fold spelling is now uniform
@@ -185,30 +184,37 @@ pub fn fold[t, a, e](s: Stream[t, e], init: a, f: (a, t) -> a / e) : a / e =
 
 #[doc("Runs `f` for its effect on every element, forcing the pipeline.")]
 pub fn each[t, e](s: Stream[t, e], f: (t) -> Unit / e) : Unit / e =
-  run_with(s, (x) => { f(x); true })
+  handle { run(s) } with Emit[t] {
+    emit(x, resume) -> { f(x); resume(()) }
+  }
 
 #[doc("Counts the elements, forcing the pipeline in constant memory.")]
-pub fn count[t, e](s: Stream[t, e]) : Int / e = {
-  var c := 0
-  run_with(s, (_x) => { c := c + 1; true })
-  c
-}
+pub fn count[t, e](s: Stream[t, e]) : Int / e =
+  handle { run(s) } with Emit[t](0) {
+    emit(_x, resume) -> resume((), state + 1)
+    return(_u)       -> state
+  }
 
 #[doc("Materialises the stream into a list — **not** constant memory; use a streaming sink when you can.")]
-pub fn to_list[t, e](s: Stream[t, e]) : [t] / e = {
-  var acc := []
-  run_with(s, (x) => { acc := [x, ...acc]; true })
-  list.reverse(acc)
-}
+pub fn to_list[t, e](s: Stream[t, e]) : [t] / e =
+  handle { run(s) } with Emit[t]([]) {
+    emit(x, resume) -> resume((), [x, ...state])
+    return(_u)      -> list.reverse(state)
+  }
 
 # Write loop: drain the stream through `h`, one line per element with a
 # trailing newline, performing `bad_chunk` on a failed write (resume to
 # skip the line, abandon to abort).
 fn drain_to[e](s: Stream[String, e], h: FileHandle<write>) : Unit / File + ReadFault + e =
-  run_with(s, (line) => match File.write_chunk(h, string.concat(line, "\n")) {
-    Ok(_)    -> true
-    Err(msg) -> { ReadFault.bad_chunk(msg); true }
-  })
+  handle { run(s) } with Emit[String] {
+    emit(line, resume) -> {
+      match File.write_chunk(h, string.concat(line, "\n")) {
+        Ok(_)    -> ()
+        Err(msg) -> ReadFault.bad_chunk(msg)
+      }
+      resume(())
+    }
+  }
 
 #[doc("""
 Writes every element as a line (one trailing `'\\n'` each) to the file at
