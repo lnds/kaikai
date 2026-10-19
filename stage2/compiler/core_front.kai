@@ -1,0 +1,180 @@
+#[doc("""
+One core function through the passes the whole stream goes through, so a
+body can be produced on its own from the declaration it was parsed as.
+`core_front_check` runs every core function through them and compares the
+result with what the stream produced.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.util
+import compiler.diag_file
+import compiler.scope_file
+import compiler.module_table
+import compiler.module_tables
+import compiler.modules_qualtype
+import compiler.modules_qualtype_decl
+import compiler.modules_decls
+import compiler.name_uses
+import compiler.qual_head
+import compiler.effect_scope_core
+import compiler.surface_lower
+import compiler.tparam_bind
+import compiler.cache_module
+import compiler.decl_text
+import compiler.written
+import compiler.resolve_env
+import compiler.resolve_program
+import compiler.infer_index
+import compiler.core_mangle
+import compiler.decl_names
+import compiler.modules
+import compiler.emit_c
+import compiler.effect_alias
+import compiler.kind_resolve
+import compiler.protos_register
+import compiler.desugar_refine_pred
+import compiler.desugar_narrow
+import compiler.refine_enforce
+import compiler.desugar_pos_records
+import compiler.region
+import compiler.resume_decls
+import compiler.desugar_cells
+import compiler.loop_lower
+import compiler.desugar_var
+import compiler.desugar_use
+import compiler.interp_show
+import compiler.bang_hoist
+import compiler.const_pattern
+import compiler.range_patterns
+import compiler.desugar_nursery
+import compiler.modules_segments
+import compiler.effect_scope
+import compiler.type_scope
+import compiler.type_scope_table
+import compiler.value_scope
+import compiler.value_scope_table
+import compiler.name_contest
+import compiler.protos_laws
+import compiler.driver_exports
+
+#[doc("The tables the passes read: each is built from the whole stream's signatures, never from a body.")]
+pub type CoreFrontCx = {
+  tab0: SymTab,
+  tab1: SymTab,
+  target: String,
+  module_table: [ModuleEntry],
+  mod_tabs: ModTables,
+  core_tabs: ModTables,
+  sym_views: FileViews,
+  cs_coll: [NEnt],
+  rqc_fx: [RqcFx],
+  diag_ctx: DiagFiles,
+  mangle: MangleSegs,
+  tab2: SymTab,
+  tab3: SymTab,
+  sym_tab: SymTab,
+  file: String,
+  narrow_aliases: [SymId],
+  kind_ctx_a: KindCtx,
+  kind_ctx_b: KindCtx,
+  effect_aliases: [AliasResult],
+  ta_table: [TAEntry],
+  ref_pred_fns: [SymId],
+  recs: [RecInfo],
+  blocked: [String],
+  loops: Bool,
+  show: Option[ShowRef],
+  cores: [String],
+  bound: ([Decl]) -> [Decl],
+  consts: [CDecl],
+  ts_coll: [TSEntry],
+  vs_coll: [VSEntry],
+  mod_imps: [ModImports],
+  sel_imports: [SelImport],
+  entry: SymId
+}
+
+#[doc("The module a core function was declared in.")]
+pub fn cf_module(d: Decl) : String = match d {
+  DFn(_, _, _, _, _, _, _, _, _, Some(m)) -> m
+  _ -> ""
+}
+
+#[doc("A core function after the passes that settle its names against the modules, as the stream has it before the stream is merged with the program's own declarations.")]
+pub fn core_front_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
+  let lowered = tparam_bind_decls(surface_lower_decls([d], cx.tab0))
+  let scoped = es_core_decls(lowered, cx.mod_tabs, cx.target, cx.tab0, cx.sym_views)
+  let typed = qualtype_decls_only(scoped, cx.tab0, [qualtype_list_mark(), ...cx.module_table])
+  let headed = qh_decls(typed, cx.module_table)
+  let consts = nu_scope_const_decls(headed, cx.cs_coll, cx.target, cx.core_tabs)
+  let qualified = rqc_decls(consts, cx.module_table, cx.rqc_fx, cx.diag_ctx)
+  map(qualified, (q) => mangle_core_decl(cx.mangle, q, cf_module(d)))
+}
+
+#[doc("An imported library function after the passes that settle its names, through the segment chain: `d` is the only declaration of a segment of its own module.")]
+pub fn core_front_lib_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
+  let seg = [ISeg(cf_module(d), 1)]
+  let lowered = strip_sl_decls(strip_law_wrappers(tparam_bind_decls(surface_lower_decls([d], cx.tab0))))
+  let tagged = tag_target_decls_module_origin(lowered, cx.target, cx.entry)
+  let effects = es_segmented(seg, tagged, cx.mod_tabs, cx.target, cx.tab0, cx.sym_views)
+  let scoped = ts_segmented(seg, effects, cx.ts_coll, cx.mod_tabs, cx.mod_imps, cx.target, cx.cores, cx.sel_imports)
+  let typed = qualtype_segmented(seg, scoped, cx.tab0, cx.mod_tabs, cx.mod_imps)
+  let headed = qh_segmented(seg, typed.decls, cx.mod_tabs)
+  let valued = vs_segmented(seg, headed, cx.vs_coll, cx.mod_tabs, cx.mod_imps, cx.target, cx.cores)
+  rqc_segmented(seg, nu_scope_const_decls(valued, cx.cs_coll, cx.target, cx.mod_tabs), cx.mod_tabs, cx.rqc_fx, cx.diag_ctx)
+}
+
+#[doc("A core function after the passes that rewrite its body, as the stream has it before name resolution. `q` is the result of `core_front_names`.")]
+pub fn core_front_body(cx: CoreFrontCx, q: Decl) : [Decl] / Console + File = {
+  let narrowed = lower_pattern_narrow_decls([q], cx.tab2, cx.sym_views, cx.target, cx.narrow_aliases)
+  let opaque = lower_extern_opaques(lower_axioms(narrowed, cx.target), cx.target).decls
+  let kinds_a = map(opaque, (d) => resolve_kinds_fn(d, cx.kind_ctx_a, cx.target))
+  let expanded = expand_aliases_in_decls(expand_ta_decls(expand_aliases_in_decls(kinds_a, cx.tab3, cx.effect_aliases), cx.tab3, cx.ta_table, cx.effect_aliases), cx.tab3, cx.effect_aliases)
+  let kinds_b = map(expanded, (d) => resolve_kinds_fn(d, cx.kind_ctx_b, cx.target))
+  let enforced = enforce_refinements_decls(kinds_b, cx.tab3, cx.ref_pred_fns)
+  let positional = desugar_pos_records_with(cx.recs, enforced, cx.tab3, cx.sym_views, cx.target, cx.diag_ctx).decls
+  let regioned = rewrite_regions_decls(positional, cx.diag_ctx).decls
+  let indexed = split_resume_decls(desugar_index_decls(regioned))
+  let cells = lower_cell_reads_decls(indexed, cx.diag_ctx).decls
+  let looped = if cx.loops { lower_loop_intrinsics_with(cx.blocked, cells) } else { cells }
+  let vars = desugar_var_decls(looped)
+  let used = desugar_use_decls(vars, cx.tab3, cx.sym_views, cx.target, cx.file).decls
+  let lifted = cx.bound(bang_hoist_decls(interp_show_decls(used, cx.show, cx.cores, cx.target)))
+  let relowered = relower_cell_reads_decls(lifted, cx.diag_ctx).decls
+  let patterns = desugar_range_patterns_decls(desugar_const_patterns_with(cx.consts, relowered))
+  rewrite_nursery_caps_decls(patterns, cx.diag_ctx).decls
+}
+
+#[doc("One line per core or library function of `orig` and `libs` the stream holds: its symbol and the hash of the declaration completed on its own and of the one the stream holds, the line ending in ` !DIFF` when they differ. `stream` is the stream before resolution, `res` its resolution.")]
+pub fn core_front_check(cx: CoreFrontCx, orig: [Decl], libs: [Decl], stream: [Decl], res: Resolution) : [String] / Console + File = {
+  let index = (ds) => foldl(ds, idx_empty(), (acc, o) => match o {
+    DFn(_, fid, _, _, _, _, _, _, _, Some(_)) -> idx_prepend_sym(acc, fnid_sym(fid), o)
+    _ -> acc
+  })
+  check_loop(cx, index(orig), index(libs), stream, res.decls, res, 0, [])
+}
+
+fn check_loop(cx: CoreFrontCx, orig: NameIndex[Decl], libs: NameIndex[Decl], stream: [Decl], resolved: [Decl], res: Resolution, i: Int, acc: [String]) : [String] / Console + File = match stream {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match resolved {
+    [] -> list_reverse(acc)
+    [r, ...rrest] -> match d {
+      DFn(_, fid, _, _, _, _, _, _, _, _) -> match idx_chain_sym(orig, fnid_sym(fid)) {
+        [o, ..._] -> check_loop(cx, orig, libs, rest, rrest, res, i + 1, [check_line(cx, core_front_names(cx, o), r, res, i, fnid_sym(fid)), ...acc])
+        [] -> match idx_chain_sym(libs, fnid_sym(fid)) {
+          [o, ..._] -> check_loop(cx, orig, libs, rest, rrest, res, i + 1, [check_line(cx, core_front_lib_names(cx, o), r, res, i, fnid_sym(fid)), ...acc])
+          [] -> check_loop(cx, orig, libs, rest, rrest, res, i + 1, acc)
+        }
+      }
+      _ -> check_loop(cx, orig, libs, rest, rrest, res, i + 1, acc)
+    }
+  }
+}
+
+fn check_line(cx: CoreFrontCx, names: [Decl], r: Decl, res: Resolution, i: Int, s: SymId) : String / Console + File = {
+  let mine = map(flat_map(names, (q) => core_front_body(cx, q)), (b) => resolve_complete(res.env, cx.diag_ctx, cx.target, i, b))
+  let a = tm_decls_hex(mine)
+  let b = tm_decls_hex([r])
+  concat_all(["#{decl_name(cx.tab1, s)}", " ", a, " ", b, if a == b { "" } else { " !DIFF" }])
+}

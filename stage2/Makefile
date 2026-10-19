@@ -14051,6 +14051,11 @@ test-core-defer: $(TARGET)
 test-core-typed-cut: $(TARGET)
 	@../tools/core-typed-cut-gate.sh
 
+# Each core and library function, front-ended and resolved on its own, equals
+# the stream's: the check a body produced late depends on.
+test-core-front: $(TARGET)
+	@../tools/core-front-gate.sh
+
 test-core-cache: $(TARGET) bin-kai
 	@set -e; \
 	for f in ../examples/cache/corec_*.sh ../examples/cache/emitc_*.sh ../examples/cache/wrapper_*.sh ../examples/cache/ncoreobj_*.sh ../examples/cache/nmodular_*.sh; do \
