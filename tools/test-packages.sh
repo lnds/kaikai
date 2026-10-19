@@ -279,6 +279,12 @@ run_positive     "extern_pub_type"      "extern_pub_type"      "extern_pub_type/
 run_negative     "extern_private_type"  "extern_private_type"  "extern_private_type/main.err.expected"
 run_check_script "extern_sig_import"    "extern_sig_import/check.sh"
 
+# A private type of one module never changes how another module reads a type of the same name.
+run_positive     "private_type_scope_plain"  "private_type_scope_plain"  "private_type_scope_plain/main.out.expected"
+run_negative     "private_type_scope_use"    "private_type_scope_use"    "private_type_scope_use/main.err.expected"
+run_check_script "private_type_scope_struct"  "private_type_scope_struct/check.sh"
+run_check_script "private_type_scope_reverse" "private_type_scope_reverse/check.sh"
+
 # git-source dep chains (rendered manifests): direct dep and a
 # transitive chain. SKIP when the manifest was not rendered, matching
 # the git-fixture fail-open policy above. A silent warm-up build runs
