@@ -270,6 +270,15 @@ run_positive "builtin_shadow"         "builtin_shadow"         "builtin_shadow/m
 run_positive "builtin_pick"           "builtin_pick"           "builtin_pick/main.out.expected"
 run_positive "builtin_import"         "builtin_import"         "builtin_import/main.out.expected"
 
+# An `extern "C"` fn from another module is a first-class value; an
+# `extern "C" pub type` crosses modules, takes spread and qualified
+# construction, and counts as a use of its import; a private one is
+# refused in a `pub` signature.
+run_positive     "extern_fn_value"      "extern_fn_value"      "extern_fn_value/main.out.expected"
+run_positive     "extern_pub_type"      "extern_pub_type"      "extern_pub_type/main.out.expected"
+run_negative     "extern_private_type"  "extern_private_type"  "extern_private_type/main.err.expected"
+run_check_script "extern_sig_import"    "extern_sig_import/check.sh"
+
 # git-source dep chains (rendered manifests): direct dep and a
 # transitive chain. SKIP when the manifest was not rendered, matching
 # the git-fixture fail-open policy above. A silent warm-up build runs
@@ -347,6 +356,8 @@ run_parity  "parity-transitive"         "transitive"
 run_parity  "parity-builtin_shadow"     "builtin_shadow"
 run_parity  "parity-builtin_pick"       "builtin_pick"
 run_parity  "parity-builtin_import"     "builtin_import"
+run_parity  "parity-extern_fn_value"    "extern_fn_value"
+run_parity  "parity-extern_pub_type"    "extern_pub_type"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then
