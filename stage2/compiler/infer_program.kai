@@ -299,22 +299,13 @@ pub fn infer_program(file: String, decls: [Decl], tin: TyperIn, verbose: Bool) :
                                    tin.kind_theories, tin.tab, tin.views, tin.roots)
 
 
-#[doc("infer: typecheck one module against an inherited `ModuleEnvDelta`, returning its typed program plus the delta it contributes. `df` attributes each diagnostic to the file declaring the decl it fires on; `file` stays the root and keeps naming the target module.")]
-pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
-                     inherited: ModuleEnvDelta,
-                     all_program_decls: [Decl],
-                     protos: ProtoView,
-                     head_owners: [HeadOwnerEntry],
-                     kind_theories: [KindTheory],
-                     tab: SymTab, sh: TcShared,
-                     verbose: Bool) : TypecheckedModule / Console + File + Mutable {
+#[doc("infer: what a module's declarations alone give the typer: its program data over the inherited env, the sums, records and hold marks it adds, and the `ModuleEnvDelta` it contributes. No body is read.")]
+pub type ModuleFront = { data: ProgramData, sums_here: [SumInfo], recs_here: [RecInfo], holds: [HoldAt], delta: ModuleEnvDelta }
 
+#[doc("infer: the declaration half of `typecheck_module`.")]
+pub fn module_front(file: String, mod: ModuleDecls, inherited: ModuleEnvDelta, head_owners: [HeadOwnerEntry],
+                    tab: SymTab, sh: TcShared) : ModuleFront / Console + File + Mutable = {
   let data0 = collect_program_data_inherited(file, mod.decls, inherited, sh, tab)
-  # attach the per-compile head-owner cache to the env
-  # the typer walks. The cache is built once per `compile_source`
-  # invocation from the post-`expand_imports` decl stream + module
-  # table; threading it here keeps `synth_pipe_dispatch`'s lookup
-  # `O(1)` per call site.
   let env_with_owners = ty_env_with_head_owners(data0.built.env, head_owners)
   let built1 = BuiltEnv { env: ty_env_with_carriers(env_with_owners, sh.carriers),
                           core_len: data0.built.core_len,
@@ -324,37 +315,58 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
                             recs: data0.recs, alias_res: data0.alias_res,
                             op_to_eff: data0.op_to_eff, sums: data0.sums,
                             homes: data0.homes }
-  let n_inh = match sh.inh {
-    TEP(_, _, _, n) -> n
-  }
-  # Hanga Roa modular typecheck: `infer_all_loop` keeps a per-decl
-  # `all_decls` pointer so `check_main_row_handlable` /
-  # `check_body_row` can look up `DEffect default { ... }` blocks
-  # from any module. Pass the full program's decl list (not just
-  # this module's) so cross-module effect-default lookups stay
-  # honest after the partition.
-  let all_decls_for_typer = if not list_is_empty(all_program_decls) {
-    all_program_decls
-  } else { data.decls_a }
   let sums_here = collect_sums(data.decls_a)
   let recs_here = typer_records(data.decls_a, tab)
   let holds = hold_extend(data.built.env, sums_here, recs_here, sh.holds)
+  let new_entries = take_entries(data.built.env.entries, data.built.env.added, [])
+  let delta = ModuleEnvDelta {
+    name:           mod.name,
+    ty_entries:     new_entries,
+    unions:         collect_unions(data.decls_a, tab, tsh_view(data.homes, None)),
+    op_eff_arities: data.built.new_arities,
+    recs:           recs_here,
+    sums:           sums_here,
+    op_to_eff:      inf_collect_op_to_eff(data.decls_a),
+    unit_aliases:   collect_unit_alias_table(mod.decls),
+    constructors:   collect_constructors(data.decls_a, sh.homes, [])
+  }
+  ModuleFront { data: data, sums_here: sums_here, recs_here: recs_here, holds: holds, delta: delta }
+}
+
+#[doc("infer: typecheck one module against an inherited `ModuleEnvDelta`, returning its typed program plus the delta it contributes. `df` attributes each diagnostic to the file declaring the decl it fires on; `file` stays the root and keeps naming the target module.")]
+pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
+                     inherited: ModuleEnvDelta,
+                     all_program_decls: [Decl],
+                     protos: ProtoView,
+                     head_owners: [HeadOwnerEntry],
+                     kind_theories: [KindTheory],
+                     tab: SymTab, sh: TcShared,
+                     verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
+  let fr = module_front(file, mod, inherited, head_owners, tab, sh)
+  module_bodies(file, df, mod, fr, all_program_decls, protos, kind_theories, tab, sh, verbose)
+}
+
+#[doc("infer: the body half of `typecheck_module`, over the front the module's declarations gave.")]
+pub fn module_bodies(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFront,
+                     all_program_decls: [Decl],
+                     protos: ProtoView,
+                     kind_theories: [KindTheory],
+                     tab: SymTab, sh: TcShared,
+                     verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
+  let data = fr.data
+  let n_inh = match sh.inh {
+    TEP(_, _, _, n) -> n
+  }
+  # `infer_all_loop` and the coverage checks look up `DEffect default`
+  # blocks from any module, so they see the whole program's decls.
+  let all_decls_for_typer = if not list_is_empty(all_program_decls) {
+    all_program_decls
+  } else { data.decls_a }
   let tp = infer_all_loop(df, data.built.env, data.built.core_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [], [],
                  data.alias_res.aliases, data.op_to_eff, data.sums,
-                 handle_tab_of(holds), protos,
+                 handle_tab_of(fr.holds), protos,
                  all_decls_for_typer, kind_theories)
-  # Stage B coverage check. Runs after row-level inference
-  # is complete so the typed body carries the resolved effect-op
-  # callees the walker keys on. Its diagnostics are rendered as found and
-  # join TypedProgram.diags.
-  #
-  # Pass `all_decls_for_typer` (whole program) as the second list so
-  # effect-existence and default-block lookups see DEffects that the
-  # modular partition placed in a different pass than the body that
-  # performs the op. Without this, `is_effect_declared` returns false
-  # for any user effect declared in the same file but partitioned away
-  # from its `fn main()`, silencing the per-op coverage walker.
   let cov_diags = check_default_coverage(df, tab, tp.decls, all_decls_for_typer,
     if not list_is_empty(all_program_decls) { sh.effs } else { build_effect_default_op_map(all_decls_for_typer) }, sh.homes)
   let priv_diags = check_field_privacy(df, tab, tsh_view(sh.homes, mod.name), tp.decls,
@@ -367,33 +379,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
     module_doc: doc_module_doc_text(data.decls_a),
     diags: list_append(tp.diags, list_append(cov_diags, list_append(priv_diags, spawn_diags))), op_res: tp.op_res
   }
-  # the returned delta carries ONLY this module's
-  # contribution (i.e. the slice of working-table state that
-  # `decls_a` added on top of `inherited`). The fold's `acc_delta`
-  # composes these per-module slices via `merge_env_deltas`, so a
-  # downstream cache hit can serialise this slice in isolation and
-  # the next loader hands it back through `inherited` to skip the
-  # work this call did.
-  #
-  # `ty_entries` extracted by length-diff against `inherited`: every
-  # entry past `len(inherited.ty_entries) + len(seed_entries)` was
-  # added by `add_decls_loop` over this module. `add_decls_loop`
-  # cons-prepends, so the new entries occupy the head of the list;
-  # the same shape holds for `op_eff_arities`.
-  let new_entries = take_entries(data.built.env.entries, data.built.env.added, [])
-  let new_arities = data.built.new_arities
-  let delta = ModuleEnvDelta {
-    name:           mod.name,
-    ty_entries:     new_entries,
-    unions:         collect_unions(data.decls_a, tab, tsh_view(data.homes, None)),
-    op_eff_arities: new_arities,
-    recs:           recs_here,
-    sums:           sums_here,
-    op_to_eff:      inf_collect_op_to_eff(data.decls_a),
-    unit_aliases:   collect_unit_alias_table(mod.decls),
-    constructors:   collect_constructors(data.decls_a, sh.homes, [])
-  }
-  TypecheckedModule { typed: typed, delta: delta }
+  TypecheckedModule { typed: typed, delta: fr.delta }
 }
 
 
