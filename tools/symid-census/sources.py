@@ -3,7 +3,7 @@
 import os, re
 
 TOKEN = re.compile(r'#\[|#[^\n]*|"""[\s\S]*?"""|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)\'')
-FN = re.compile(r"^[ \t]*(?:pub\s+)?fn\s+([a-z_]\w*)", re.M)
+FN = re.compile(r"^[ \t]*(?:pub(?:\([a-z]+\))?\s+)?fn\s+([a-z_]\w*)", re.M)
 LIT_RE = re.compile(r'"\x00(\d+)\x00"')              # a masked literal: its index in the table
 
 
