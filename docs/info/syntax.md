@@ -122,7 +122,6 @@ fn greet(name: String) : Unit / Logger {       # with effect row
   Logger.log("hi #{name}")
 }
 pub fn area(w: Int, h: Int) : Int = w * h      # exported
-pub(pkg) fn side(w: Int) : Int = w             # exported to the package only
 pub fn twice(^f: (Int) -> Int, x: Int) : Int   # `^` borrows a param: the
   = f(f(x))                                    #   callee reads it, the caller
                                                #   skips the dup. Per-name
@@ -248,6 +247,10 @@ Theory with <introducer>`, habitant introducers (`currency USD`,
 `perm read`, `unit Newton = kg * m / sec^2`), and habitant slots on a
 type head (`type Matrix[t]<m: Dim, n: Dim>`) — are covered in
 `kai info kinds` and `kai info units`.
+
+Visibility: no keyword keeps a declaration private to its file, `pub`
+exports it, and `pub(pkg)` exports it to the modules of its own package
+alone (`kai info packages`).
 
 ## Imports and effect opening
 
