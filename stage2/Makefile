@@ -2182,10 +2182,10 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	    || { echo "$$f DIFF"; diff $$exp build/$$f.out; exit 1; }; \
 	done; \
 	for fn in sum_to count_down reps joins nested; do \
-	  grep -q "kaiu_$${fn}__clause" build/issue_1179_var_slot_loops.c \
+	  grep -q "kaiu_issue_1179_var_slot_loops__$${fn}__clause" build/issue_1179_var_slot_loops.c \
 	    && { echo "issue_1179 FAIL ($$fn still carries a State clause)"; exit 1; } || true; \
 	done; \
-	grep -q "kaiu_each_sum__clause" build/issue_1179_each_closure_state.c \
+	grep -q "kaiu_issue_1179_each_closure_state__each_sum__clause" build/issue_1179_each_closure_state.c \
 	  || { echo "issue_1179 FAIL (each_sum lost its State clauses)"; exit 1; }; \
 	for cell in acc_int acc_real flag post; do \
 	  grep -q "kair_$${cell}__slot_[0-9][0-9]*" build/issue_1179_cell_register.c \
@@ -2232,11 +2232,11 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 	  || { echo "$$f DIFF"; diff $$exp build/$$f.out; exit 1; }; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$src > build/$$f.kir \
 	  || { echo "$$f FAIL (kir dump)"; exit 1; }; \
-	awk '/^fn collatz/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
+	awk '/^fn issue_1214_nonliteral_init__collatz/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
 	  || { echo "$$f FAIL (collatz m := n not promoted to raw i64)"; exit 1; }; \
-	awk '/^fn arith/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
+	awk '/^fn issue_1214_nonliteral_init__arith/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
 	  || { echo "$$f FAIL (arith m := n*2+1 not promoted to raw i64)"; exit 1; }; \
-	awk '/^fn callinit/,/^}/' build/$$f.kir | grep -q "array_make" \
+	awk '/^fn issue_1214_nonliteral_init__callinit/,/^}/' build/$$f.kir | grep -q "array_make" \
 	  || { echo "$$f FAIL (callinit m := twice(n) wrongly promoted — call init must keep the slot)"; exit 1; }; \
 	grep -q "kaiv_acc__slot_[0-9][0-9]* = kai_core_array_make" build/$$f.c \
 	  || { echo "$$f FAIL (String var lost its array slot)"; exit 1; }; \
@@ -2408,9 +2408,9 @@ test-trmc-list-build: $(TARGET) build
 	name=$$(basename $$f .kai); \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	  || { echo "trmc-list-build FAIL (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	grep -q 'goto _kai_build_entry' build/s2-$$name.c \
+	grep -q 'goto _kai_trmc_list_build_large__build_entry' build/s2-$$name.c \
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for build — rewrite regressed?)"; exit 1; }; \
-	grep -q 'goto _kai_map_inc_entry' build/s2-$$name.c \
+	grep -q 'goto _kai_trmc_list_build_large__map_inc_entry' build/s2-$$name.c \
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for map_inc — reuse-cons shape regressed?)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -Wl,-stack_size,0x800000 -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) 2>/dev/null \
 	  || $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
@@ -2824,9 +2824,9 @@ test-evf-passthrough: $(TARGET) build
 	@set -e; \
 	name=evf_frame_passthrough; \
 	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/s2-$$name.c; \
-	grep -q 'kaiu_walk(__evf, ' build/s2-$$name.c \
+	grep -q 'kaiu_evf_frame_passthrough__walk(__evf, ' build/s2-$$name.c \
 	  || { echo "evf-passthrough FAIL (recursive call copies its own frame)"; exit 1; }; \
-	grep -q 'kaiu_walk((KaiEvidence \*\[\]){' build/s2-$$name.c \
+	grep -q 'kaiu_evf_frame_passthrough__walk((KaiEvidence \*\[\]){' build/s2-$$name.c \
 	  || { echo "evf-passthrough FAIL (handler site lost its frame)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	./build/s2-$$name > build/s2-$$name.out; \
@@ -5834,30 +5834,30 @@ test-m4c: $(TARGET) build
 	    || { echo "m4c FAIL $$name (C binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  echo "m4c OK $$name (C)"; \
 	done
-	@grep -q "kaiu_run_with__mono__Int__Int" build/s2-m4c_run_with.c \
-	  && grep -q "kaiu_run_with__mono__String__Int" build/s2-m4c_run_with.c \
+	@grep -q "kaiu_m4c_run_with__run_with__mono__Int__Int" build/s2-m4c_run_with.c \
+	  && grep -q "kaiu_m4c_run_with__run_with__mono__String__Int" build/s2-m4c_run_with.c \
 	  && echo "m4c OK m4c_run_with monomorph specialisations emitted" \
 	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }
-	@grep -q "_kaiu_process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.c \
-	  && grep -q "_kaiu_process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
+	@grep -q "_kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.c \
+	  && grep -q "_kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }
-	@grep -q "= kaiu_run_with__mono__Int__Int(" build/s2-m4c_run_with.c \
-	  && grep -q "= kaiu_run_with__mono__String__Int(" build/s2-m4c_run_with.c \
+	@grep -q "= kaiu_m4c_run_with__run_with__mono__Int__Int(" build/s2-m4c_run_with.c \
+	  && grep -q "= kaiu_m4c_run_with__run_with__mono__String__Int(" build/s2-m4c_run_with.c \
 	  && echo "m4c OK m4c_run_with C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_run_with — main still calls polymorphic kai_run_with"; exit 1; }
-	@grep -qE "= kaiu_process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.c \
-	  && grep -qE "= kaiu_process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.c \
+	@grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.c \
+	  && grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls polymorphic kai_process_with_log"; exit 1; }
-	@grep -q "kaiu_outer__mono__Int" build/s2-m4c_flow_through.c \
-	  && grep -q "kaiu_outer__mono__String" build/s2-m4c_flow_through.c \
-	  && grep -q "kaiu_inner__mono__Int" build/s2-m4c_flow_through.c \
-	  && grep -q "kaiu_inner__mono__String" build/s2-m4c_flow_through.c \
+	@grep -q "kaiu_m4c_flow_through__outer__mono__Int" build/s2-m4c_flow_through.c \
+	  && grep -q "kaiu_m4c_flow_through__outer__mono__String" build/s2-m4c_flow_through.c \
+	  && grep -q "kaiu_m4c_flow_through__inner__mono__Int" build/s2-m4c_flow_through.c \
+	  && grep -q "kaiu_m4c_flow_through__inner__mono__String" build/s2-m4c_flow_through.c \
 	  && echo "m4c OK m4c_flow_through outer + inner specialisations emitted" \
 	  || { echo "m4c FAIL m4c_flow_through — outer or inner spec missing"; exit 1; }
-	@grep -A 2 "kaiu_outer__mono__Int(" build/s2-m4c_flow_through.c | grep -q "kaiu_inner__mono__Int(" \
-	  && grep -A 2 "kaiu_outer__mono__String(" build/s2-m4c_flow_through.c | grep -q "kaiu_inner__mono__String(" \
+	@grep -A 2 "kaiu_m4c_flow_through__outer__mono__Int(" build/s2-m4c_flow_through.c | grep -q "kaiu_m4c_flow_through__inner__mono__Int(" \
+	  && grep -A 2 "kaiu_m4c_flow_through__outer__mono__String(" build/s2-m4c_flow_through.c | grep -q "kaiu_m4c_flow_through__inner__mono__String(" \
 	  && echo "m4c OK m4c_flow_through specs call matching specs (no flow-through to polymorphic inner)" \
 	  || { echo "m4c FAIL m4c_flow_through — outer__mono__T does not call inner__mono__T"; exit 1; }
 
@@ -6205,9 +6205,9 @@ test-issue-892-mono-arg-unbox: $(TARGET) build
 	  || { echo "892 FAIL $$name (cc errored)"; exit 1; }; \
 	out=$$(./build/perceus-$$name); \
 	[ "$$out" = "agree" ] || { echo "892 FAIL $$name (generic != direct: $$out)"; exit 1; }
-	@grep -q 'int64_t kaiu_larger__mono__Int(int64_t kair_a_[0-9][0-9]*, int64_t kair_b_[0-9][0-9]*)' build/perceus-mono_arg_unbox_892.c \
+	@grep -q 'int64_t kaiu_mono_arg_unbox_892__larger__mono__Int(int64_t kair_a_[0-9][0-9]*, int64_t kair_b_[0-9][0-9]*)' build/perceus-mono_arg_unbox_892.c \
 	  || { echo "892 FAIL (spec signature not unboxed)"; exit 1; }
-	@if grep -E 'static int64_t kaiu_loop_g\(.*\) \{[^}]*kai_int(f)?\(' build/perceus-mono_arg_unbox_892.c; then \
+	@if grep -E 'static int64_t kaiu_mono_arg_unbox_892__loop_g\(.*\) \{[^}]*kai_int(f)?\(' build/perceus-mono_arg_unbox_892.c; then \
 	  echo "892 FAIL (boxing survived in loop_g body)"; exit 1; \
 	fi
 	@echo "issue-892 mono-arg-unbox OK"
@@ -6282,9 +6282,9 @@ test-tco-zero-arg: $(TARGET) build
 test-tco-309: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/issue_309_countdown.kai > build/tco-309.c; \
-	grep -F -q '_kai_count_down_entry:;' build/tco-309.c \
+	grep -F -q '_kai_issue_309_countdown__count_down_entry:;' build/tco-309.c \
 	  || { echo "tco-309 FAIL (no _kai_count_down_entry label in emitted C)"; exit 1; }; \
-	grep -F -q 'goto _kai_count_down_entry;' build/tco-309.c \
+	grep -F -q 'goto _kai_issue_309_countdown__count_down_entry;' build/tco-309.c \
 	  || { echo "tco-309 FAIL (no goto _kai_count_down_entry in emitted C)"; exit 1; }; \
 	if grep -F -q 'int64_t _scr =' build/tco-309.c; then \
 	  : "Phase 3 unboxing — raw int64_t scrutinee carries no RC; pre-goto decref is unnecessary"; \
@@ -6318,9 +6318,9 @@ test-tco-309: $(TARGET) build
 test-tco-perceus-wrap: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/perceus/unbox_bench.kai > build/tco-perceus.c; \
-	grep -F -q '_kai_bench_loop_entry:;' build/tco-perceus.c \
+	grep -F -q '_kai_unbox_bench__bench_loop_entry:;' build/tco-perceus.c \
 	  || { echo "tco-perceus-wrap FAIL (no _kai_bench_loop_entry label in emitted C)"; exit 1; }; \
-	grep -F -q 'goto _kai_bench_loop_entry;' build/tco-perceus.c \
+	grep -F -q 'goto _kai_unbox_bench__bench_loop_entry;' build/tco-perceus.c \
 	  || { echo "tco-perceus-wrap FAIL (no goto _kai_bench_loop_entry in emitted C)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-perceus.c -o build/tco-perceus $(LDLIBS_M) ; \
 	./build/tco-perceus > build/tco-perceus.out; \
@@ -7480,7 +7480,7 @@ test-trmc-qualified-nullary: $(TARGET) build
 	dir=../examples/perceus/trmc_qualified_nullary; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path $$dir --path ../stdlib $$dir/main.kai > build/s2-trmcqn.c \
 	  || { echo "trmc-qualified-nullary FAIL (kaic2 errored)"; exit 1; }; \
-	grep -q 'goto _kai_build_entry' build/s2-trmcqn.c \
+	grep -q 'goto _kai_main__build_entry' build/s2-trmcqn.c \
 	  || { echo "trmc-qualified-nullary FAIL (TRMC did not fire for build)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-trmcqn.c -o build/s2-trmcqn $(LDLIBS_M); \
 	./build/s2-trmcqn > build/s2-trmcqn.out \
@@ -8828,11 +8828,11 @@ test-trmc-slot-forms: $(TARGET) build
 	    || { echo "trmc-slot-forms FAIL ($$p: kaic2 errored)"; cat build/s2-trmc-slot-$$p.err; exit 1; }; \
 	done; \
 	for pf in $(TRMC_SLOT_FORMS); do \
-	  grep -q "goto _kai_$${pf#*:}_entry" build/s2-trmc-slot-$${pf%%:*}.c \
+	  grep -q "goto _kai_$${pf%%:*}__$${pf#*:}_entry" build/s2-trmc-slot-$${pf%%:*}.c \
 	    || { echo "trmc-slot-forms FAIL ($$pf: modulo-cons step did not fire)"; exit 1; }; \
 	done; \
 	for pf in $(TRMC_SLOT_NEGATIVES); do \
-	  ! grep -q "goto _kai_$${pf#*:}_entry" build/s2-trmc-slot-$${pf%%:*}.c \
+	  ! grep -q "goto _kai_$${pf%%:*}__$${pf#*:}_entry" build/s2-trmc-slot-$${pf%%:*}.c \
 	    || { echo "trmc-slot-forms FAIL ($$pf: a deferred self-call was admitted into a modulo-cons step)"; exit 1; }; \
 	done; \
 	for p in $(TRMC_SLOT_PROGRAMS); do \
@@ -11003,7 +11003,7 @@ test-kir-inline-trmc-1158: $(TARGET) bin-kai build
 	  || { echo "kir-inline-trmc-1158 FAIL (run crashed/hung — TRMC spine broke under the paste)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out > /dev/null \
 	  || { echo "kir-inline-trmc-1158 FAIL (output diff)"; diff ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn build/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_inline_trmc_tail_1158__build/,/^}/'); \
 	echo "$$kir" | grep -q 'trmc-step' \
 	  || { echo "kir-inline-trmc-1158 FAIL (build lost its trmc-step terminator)"; exit 1; }; \
 	echo "$$kir" | grep -q 'classify' \
@@ -11042,7 +11042,7 @@ test-kir-while-param-slot-1173: $(TARGET) bin-kai build
 	  || { echo "kir-while-param-slot-1173 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_param_slot_1173.out.expected build/s2-1173wpslot.out > /dev/null \
 	  || { echo "kir-while-param-slot-1173 FAIL (output diff)"; diff ../examples/perceus/kir_while_param_slot_1173.out.expected build/s2-1173wpslot.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn lcg/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_while_param_slot_1173__lcg/,/^}/'); \
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-param-slot-1173 FAIL (State dispatch survived in lcg)"; exit 1; } \
 	  || true; \
@@ -11105,7 +11105,7 @@ test-kir-while-raw-cond-1414: $(TARGET) bin-kai build
 	  || { echo "kir-while-raw-cond-1414 FAIL (C run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_raw_cond_1414.out.expected build/s2-1414raw-c.out > /dev/null \
 	  || { echo "kir-while-raw-cond-1414 FAIL (C output diff)"; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn spin/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_while_raw_cond_1414__spin/,/^}/'); \
 	echo "$$kir" | grep -q 'bool.box' \
 	  && { echo "kir-while-raw-cond-1414 FAIL (bool.box survived in spin — pred boxed again)"; exit 1; } \
 	  || true; \
@@ -11131,7 +11131,7 @@ test-kir-while-boxed-cond-1414: $(TARGET) bin-kai build
 	  || { echo "kir-while-boxed-cond-1414 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_boxed_cond_1414.out.expected build/s2-1414box.out > /dev/null \
 	  || { echo "kir-while-boxed-cond-1414 FAIL (output diff)"; diff ../examples/perceus/kir_while_boxed_cond_1414.out.expected build/s2-1414box.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn spin/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_while_boxed_cond_1414__spin/,/^}/'); \
 	echo "$$kir" | grep -q ': box = prim !=' \
 	  || { echo "kir-while-boxed-cond-1414 FAIL (boxed != gone from spin — twin no longer negative)"; exit 1; }; \
 	echo "$$kir" | grep -q ': i1 = prim i!=' \
@@ -11218,7 +11218,7 @@ test-perceus-1069-projection-reuse: $(TARGET) bin-kai build
 	diff -q $$exp build/s2-1069proj-n.out > /dev/null \
 	  || { echo "perceus-1069-projection-reuse FAIL (native output diff — original corrupted)"; diff $$exp build/s2-1069proj-n.out; exit 1; }; \
 	$(KAIC2) --path ../stdlib $$src > build/s2-1069proj.c; \
-	body=$$(awk '/\*kaiu_grow_kind\(KaiValue \*kaiv_e_[0-9]+\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
+	body=$$(awk '/\*kaiu_reuse_projection_scrutinee_1069__grow_kind\(KaiValue \*kaiv_e_[0-9]+\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
 	echo "$$body" | grep -q "kai_variant_u" \
 	  || { echo "perceus-1069-projection-reuse FAIL (grow_kind not found in emitted C)"; exit 1; }; \
 	if echo "$$body" | grep -qE "kai_variant_reuse_at|kai_reuse_or_alloc_variant"; then \
@@ -11350,10 +11350,10 @@ test-native-purity-attrs: $(TARGET) bin-kai build
 	./build/s2-purity > build/s2-purity.out 2>&1; \
 	diff -q $$exp build/s2-purity.out > /dev/null \
 	  || { echo "native-purity FAIL (native output diff)"; diff $$exp build/s2-purity.out; exit 1; }; \
-	hgrp=$$(grep -oE 'define (internal )?i64 @heavy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
+	hgrp=$$(grep -oE 'define (internal )?i64 @purity_licm__heavy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
 	grep -Eq "^attributes $$hgrp = \{ nounwind memory\(none\) \}" build/s2-purity.ll \
 	  || { echo "native-purity FAIL (heavy $$hgrp not nounwind memory(none))"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
-	ngrp=$$(grep -oE 'define (internal )?ptr @noisy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
+	ngrp=$$(grep -oE 'define (internal )?ptr @purity_licm__noisy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
 	grep -Eq "^attributes $$ngrp = \{ nounwind \}" build/s2-purity.ll \
 	  || { echo "native-purity FAIL (noisy $$ngrp should be nounwind only)"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
 	if grep -q 'willreturn' build/s2-purity.ll; then echo "native-purity FAIL (willreturn stamped)"; exit 1; fi; \
@@ -11527,9 +11527,9 @@ test-native-check-runner: $(TARGET) bin-kai build
 test-tco-rule3-basic: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/rule3_basic.kai > build/tco-r3b.c; \
-	grep -F -q 'goto _kai_walk_entry' build/tco-r3b.c \
+	grep -F -q 'goto _kai_rule3_basic__walk_entry' build/tco-r3b.c \
 	  || { echo "tco-rule3-basic FAIL (no walk goto label)"; exit 1; }; \
-	if awk '/_kai_walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
+	if awk '/_kai_rule3_basic__walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
 	  echo "tco-rule3-basic FAIL (rule 3 misfired on match scrutinee xs; would double-free under perceus tcrec-tail-always-sentinel early-decref)"; exit 1; \
 	fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-r3b.c -o build/tco-r3b $(LDLIBS_M) ; \
@@ -11548,9 +11548,9 @@ test-tco-rule3-basic: $(TARGET) build
 test-tco-rule3-no-misfire: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/rule3_no_misfire.kai > build/tco-r3n.c; \
-	grep -F -q 'goto _kai_id_walk_entry' build/tco-r3n.c \
+	grep -F -q 'goto _kai_rule3_no_misfire__id_walk_entry' build/tco-r3n.c \
 	  || { echo "tco-rule3-no-misfire FAIL (no id_walk goto label)"; exit 1; }; \
-	if awk '/_kai_id_walk_entry/,/__pcs_ret/' build/tco-r3n.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
+	if awk '/_kai_rule3_no_misfire__id_walk_entry/,/__pcs_ret/' build/tco-r3n.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
 	  echo "tco-rule3-no-misfire FAIL (rule 3 misfired: kai_internal_drop(kai_xs) present in id_walk goto)"; exit 1; \
 	fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-r3n.c -o build/tco-r3n $(LDLIBS_M) ; \
@@ -11855,6 +11855,34 @@ test-issue-2022-test-body-builtin-effects-native: $(TARGET) bin-kai build
 else
 test-issue-2022-test-body-builtin-effects-native:
 	@echo "issue-2022 native: SKIP (KAI_LLVM != 1)"
+endif
+
+# `kai test` on a file that imports a module: its public fns link into the
+# file's module object and its private fns into the root one, so a public fn
+# calling a private one reaches it by symbol across objects.
+ROOT_PRIVATE_CALLEE_FIXTURE := ../examples/multi-module/root-private-callee-test
+
+define root_private_callee_run
+	@set -e; \
+	f=$(ROOT_PRIVATE_CALLEE_FIXTURE); out=build/root-private-callee-$(1); \
+	../bin/kai test --backend=$(1) $$f/game.kai > $$out.stdout 2> $$out.raw \
+	  || { echo "root-private-callee FAIL ($(1): kai test exited non-zero)"; cat $$out.stdout $$out.raw; exit 1; }; \
+	grep -v '^kai: note' $$out.raw > $$out.stderr || true; \
+	cat $$out.stdout $$out.stderr > $$out.out; \
+	diff -q $$f/game.test.expected $$out.out > /dev/null \
+	  || { echo "root-private-callee DIFF ($(1))"; diff $$f/game.test.expected $$out.out; exit 1; }; \
+	echo "root-private-callee OK ($(1): a module fn calls a private fn of the root file)"
+endef
+
+test-root-private-callee-test: $(TARGET) bin-kai build
+	$(call root_private_callee_run,c)
+
+ifeq ($(KAI_LLVM),1)
+test-root-private-callee-test-native: $(TARGET) bin-kai build
+	$(call root_private_callee_run,native)
+else
+test-root-private-callee-test-native:
+	@echo "root-private-callee native: SKIP (KAI_LLVM != 1)"
 endif
 
 # A block calls its own file's `main`. The runner starts a test binary, so
@@ -12543,7 +12571,7 @@ test-tco-fuse-order: $(TARGET) build
 	done; \
 	for f in mutual_fuse_slot_layout; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/$$f.kai > build/tco-$$f.c; \
-	  grep -E '^(KAI_CONST )?static [^=]*kaiu___kai_fused_[A-Za-z0-9_]*\(.*\);$$' build/tco-$$f.c | grep -v '_thunk(' > build/tco-$$f.proto; \
+	  grep -E '^(KAI_CONST )?static [^=]*kaiu_[A-Za-z0-9_]*__kai_fused_[A-Za-z0-9_]*\(.*\);$$' build/tco-$$f.c | grep -v '_thunk(' > build/tco-$$f.proto; \
 	  diff ../examples/tco/$$f.proto.expected build/tco-$$f.proto || { echo "tco-fuse-order DIFF ($$f slots)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-$$f.c -o build/tco-$$f $(LDLIBS_M) ; \
 	  ./build/tco-$$f > build/tco-$$f.out; \
@@ -13614,7 +13642,7 @@ test-home-tu-partition: $(TARGET) build
 	  || { echo "home-tu FAIL: $$1 ($$2) in '$$got', want $$3"; exit 1; }; \
 	  echo "home-tu OK: $$1 -> $$3"; }; \
 	assert_tu "root pub fn"        "kaiu_main__badge"             "main.c"; \
-	assert_tu "root private fn"    "kaiu_helper"                  "__root__.c"; \
+	assert_tu "root private fn"    "kaiu_main__helper"            "main.c"; \
 	assert_tu "fn main"            "kaiu_main.void. .$$"         "__root__.c"; \
 	assert_tu "root lambda"        "_kaiu_lam_main_19_14"         "__root__.c"; \
 	assert_tu "imported pub fn"    "kaiu_lib__widget__label"           "lib__widget.c"; \
