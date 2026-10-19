@@ -1,0 +1,105 @@
+# compiler/import_cycles.kai — the groups of modules that import each other.
+
+import compiler.util
+import compiler.scc
+import compiler.ast
+import compiler.modules_segments
+import compiler.module_table
+import compiler.driver_front
+
+#[doc("The homes of each set of modules that import one another, members and sets ordered by file path so the answer does not depend on the order imports were discovered in.")]
+pub fn import_cycles(rs: ResolveState, mods: [ModuleEntry]) : [[String]] = {
+  let edges = rs.rev_edges
+  let files = sort(dedup_strings(flat_map(edges, (e) => match e { IE(a, b) -> [a, b] })))
+  let ix = (p: String) => index_of_string(files, p)
+  let es = map(edges, (e) => match e { IE(a, b) -> (ix(a), ix(b)) })
+  let groups = scc_groups(list_length(files), es)
+  map(groups, (g) => map(sort(map(g, (i) => nth_string(files, i))), (p) => home_of_file(mods, p)))
+}
+
+fn home_of_file(mods: [ModuleEntry], path: String) : String = match mods {
+  [] -> ""
+  [ME(home, _, origin, _), ...rest] -> if origin == path { home } else { home_of_file(rest, path) }
+}
+
+fn index_of_string(xs: [String], s: String) : Int = index_from(xs, s, 0)
+
+fn index_from(xs: [String], s: String, i: Int) : Int = match xs {
+  []         -> -1
+  [x, ...rest] -> if x == s { i } else { index_from(rest, s, i + 1) }
+}
+
+fn nth_string(xs: [String], i: Int) : String = match xs {
+  []         -> ""
+  [x, ...rest] -> if i == 0 { x } else { nth_string(rest, i - 1) }
+}
+
+fn dedup_strings(xs: [String]) : [String] = foldl(xs, [], (acc, x) => if list_has(acc, x) { acc } else { [x, ...acc] })
+
+type Chunk = Chunk(String, [Decl])
+
+#[doc("The stream with the members of each import cycle made contiguous, in group order, at the place of the cycle's last member; a module that imports a cycle and sat among its members moves after them.")]
+pub fn cycles_reorder(rs: ResolveState, mods: [ModuleEntry], groups: [[String]], segs: [ImportSeg], decls: [Decl]) : ([ImportSeg], [Decl]) = {
+  let chunks = chunks_of(segs, decls, [])
+  let homes = map(chunks, (c) => match c { Chunk(h, _) -> h })
+  let deps = home_deps(rs, mods, homes)
+  let out = order_chunks(chunks, chunks, groups, deps, [], [], [])
+  (map(out, (c) => match c { Chunk(h, ds) -> ISeg(h, list_length(ds)) }), flat_map(out, (c) => match c { Chunk(_, ds) -> ds }))
+}
+
+fn chunks_of(segs: [ImportSeg], decls: [Decl], acc: [Chunk]) : [Chunk] = match segs {
+  [] -> list_reverse(acc)
+  [ISeg(h, n), ...rest] -> chunks_of(rest, drop(decls, n), [Chunk(h, take(decls, n)), ...acc])
+}
+
+fn home_deps(rs: ResolveState, mods: [ModuleEntry], homes: [String]) : [(String, String)] =
+  flat_map(rs.rev_edges, (e) => match e {
+    IE(a, b) -> {
+      let ha = home_of_file(mods, a)
+      let hb = home_of_file(mods, b)
+      if ha != hb and list_has(homes, ha) and list_has(homes, hb) { [(ha, hb)] } else { [] }
+    }
+  })
+
+fn chunk_home(c: Chunk) : String = match c { Chunk(h, _) -> h }
+
+fn group_of(groups: [[String]], h: String) : [String] = match groups {
+  [] -> []
+  [g, ...rest] -> if list_has(g, h) { g } else { group_of(rest, h) }
+}
+
+fn ready(deps: [(String, String)], emitted: [String], h: String) : Bool =
+  all(deps, (d) => d.fst != h or list_has(emitted, d.snd))
+
+fn order_chunks(all_chunks: [Chunk], items: [Chunk], groups: [[String]], deps: [(String, String)],
+                emitted: [String], postponed: [Chunk], out: [Chunk]) : [Chunk] = match items {
+  [] -> list_append(list_reverse(out), postponed)
+  [c, ...rest] -> {
+    let h = chunk_home(c)
+    let g = group_of(groups, h)
+    if list_is_empty(g) {
+      if ready(deps, emitted, h) {
+        let step = release(groups, deps, [h, ...emitted], postponed, [c, ...out], [])
+        order_chunks(all_chunks, rest, groups, deps, step.emitted, step.postponed, step.out)
+      } else { order_chunks(all_chunks, rest, groups, deps, emitted, list_append(postponed, [c]), out) }
+    } else if any(rest, (r) => list_has(g, chunk_home(r))) {
+      order_chunks(all_chunks, rest, groups, deps, emitted, postponed, out)
+    } else {
+      let members = filter_map_chunks(all_chunks, g)
+      let step = release(groups, deps, list_append(g, emitted), postponed, list_append(list_reverse(members), out), [])
+      order_chunks(all_chunks, rest, groups, deps, step.emitted, step.postponed, step.out)
+    }
+  }
+}
+
+type Released = { emitted: [String], postponed: [Chunk], out: [Chunk] }
+
+fn release(groups: [[String]], deps: [(String, String)], emitted: [String], waiting: [Chunk], out: [Chunk], keep: [Chunk]) : Released = match waiting {
+  [] -> Released { emitted: emitted, postponed: list_reverse(keep), out: out }
+  [c, ...rest] -> if ready(deps, emitted, chunk_home(c)) {
+    release(groups, deps, [chunk_home(c), ...emitted], list_append(list_reverse(keep), rest), [c, ...out], [])
+  } else { release(groups, deps, emitted, rest, out, [c, ...keep]) }
+}
+
+fn filter_map_chunks(chunks: [Chunk], g: [String]) : [Chunk] =
+  flat_map(g, (h) => filter(chunks, (c) => chunk_home(c) == h))

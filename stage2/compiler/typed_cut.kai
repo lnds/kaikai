@@ -33,6 +33,7 @@ exclusion is what makes a one-line body edit stop at its own module.
 
 import compiler.ast
 import compiler.util
+import compiler.const_cycles
 import compiler.infer_glue
 import compiler.infer_env
 import compiler.infer_state
@@ -63,7 +64,7 @@ import compiler.core_cut
 import compiler.infer_index
 
 #[doc("Per-module cut context: the cache directory (empty disables the cut), the cross-module context hash folded into every module key, the scope view of each file, the target module that owns untagged declarations, and the root modules.")]
-pub type TypedCutCtx = TCC(String, String, FileViews, String, Roots)
+pub type TypedCutCtx = TCC(String, String, FileViews, String, Roots, [(String, String)])
 
 #[doc("Resolve the directory the typed blobs live in: an explicit project directory when the caller supplies one, else the entry file's own. A caller that compiles a copy of the entry outside the project must supply it, or the blobs are published where the next build will not look.")]
 pub fn tcut_cache_dir(proj_dir: String, entry_path: String) : String =
@@ -71,7 +72,7 @@ pub fn tcut_cache_dir(proj_dir: String, entry_path: String) : String =
   else { concat_all([dir_of(entry_path), "/", uc_cache_dir_name()]) }
 
 #[doc("Whether the cut is live. A cut with no cache directory infers every module, which is the behaviour every non-build entry point wants.")]
-pub fn tcut_on(ctx: TypedCutCtx) : Bool = match ctx { TCC(dir, _, _, _, _) -> dir != "" }
+pub fn tcut_on(ctx: TypedCutCtx) : Bool = match ctx { TCC(dir, _, _, _, _, _) -> dir != "" }
 
 # ---- cross-module context hash ----------------------------------------
 #
@@ -128,23 +129,45 @@ fn kth_chunk(k: KindTheory) : String = match k {
 #[doc("Build the cut context for one compile: the cache directory, the files' scope views, the root modules, plus a hash over the cross-module inputs the typer reads around the fold — the protocol-impl, kind-theory and head-owner tables, the program-wide type/effect declarations, and the function names several modules declare. Pass an empty directory to disable the cut.")]
 pub fn tcut_ctx(cache_dir: String, all_program_decls: [Decl], tab: SymTab, target: String, roots: Roots,
                  protos: ProtoView, head_owners: [HeadOwnerEntry],
-                 kind_theories: [KindTheory], views: FileViews, pool_hex: String) : TypedCutCtx = {
+                 kind_theories: [KindTheory], views: FileViews, pool_hex: String, cycles: [[String]]) : TypedCutCtx = {
   let xhex = uc_content_hex(concat_all([tm_decls_hex(filter(all_program_decls, is_xdecl)), "|",
                                         concat_all(map(protos.impls, (p) => pir_chunk(p))), "|",
                                         concat_all(map(head_owners, (h) => hoe_chunk(h))), "|",
                                         concat_all(map(kind_theories, (k) => kth_chunk(k))), "|",
                                         tsh_fn_contests(all_program_decls, tab, target), "|", pool_hex]))
-  TCC(cache_dir, xhex, views, target, roots)
+  TCC(cache_dir, xhex, views, target, roots, tcut_cycle_digests(all_program_decls, target, views, cycles))
+}
+
+# A module typed against the signatures of its import cycle depends on every
+# peer's declarations and imports, which the inherited interface does not carry.
+fn tcut_cycle_digests(decls: [Decl], target: String, views: FileViews, cycles: [[String]]) : [(String, String)] =
+  if list_is_empty(cycles) { [] } else {
+    let by_home = partition_decls_by_home(decls, target)
+    flat_map(cycles, (g) => {
+      let d = uc_content_hex(concat_all(map(g, (h) => concat_all([h, "=", tm_decls_hex(tcut_decls_of(by_home, h)), sv_key(fv_of(views, st_module_id(h)))]))))
+      map(g, (h) => (h, d))
+    })
+  }
+
+fn tcut_decls_of(ms: [ModuleDecls], h: String) : [Decl] = match ms {
+  [] -> []
+  [m, ...rest] -> if tcx_same(m.name, Some(h)) { m.decls } else { tcut_decls_of(rest, h) }
+}
+
+fn tcut_cycle_of(cyc: [(String, String)], name: String) : String = match cyc {
+  [] -> ""
+  [(h, d), ...rest] -> if h == name { d } else { tcut_cycle_of(rest, name) }
 }
 
 # ---- key + lookup + publish -------------------------------------------
 
 #[doc("The typed-module cache key for one module folded against an inherited interface, under the given cut context. The module's own file view is part of it: an import changes what a bare name reaches without changing a declaration. So is whether the module is a root: its `main` types as an entry point only then.")]
 pub fn tcut_key(ctx: TypedCutCtx, m: ModuleDecls, inherited: IfaceAcc) : String = match ctx {
-  TCC(_, xhex, views, target, roots) -> {
-    let home = st_module_id(match m.name { Some(n) -> n  None -> target })
+  TCC(_, xhex, views, target, roots, cyc) -> {
+    let name = unwrap_or(m.name, target)
+    let home = st_module_id(name)
     let root = if is_root_module(roots, home) { "|root" } else { "|" }
-    tm_key_hex(uc_content_hex(concat_all([tm_decls_hex(m.decls), "|", sv_key(fv_of(views, home)), root])),
+    tm_key_hex(uc_content_hex(concat_all([tm_decls_hex(m.decls), "|", sv_key(fv_of(views, home)), root, "|", tcut_cycle_of(cyc, name)])),
                iface_acc_hash(inherited), xhex)
   }
 }
@@ -153,7 +176,7 @@ pub fn tcut_key(ctx: TypedCutCtx, m: ModuleDecls, inherited: IfaceAcc) : String 
 pub fn tcut_lookup(ctx: TypedCutCtx,
                     key: String) : Option[TypecheckedModule] / Console + File =
   match ctx {
-    TCC(dir, _, _, _, _) -> if dir == "" { None }
+    TCC(dir, _, _, _, _, _) -> if dir == "" { None }
                    else { tcut_read(dir, key) }
   }
 
@@ -166,7 +189,7 @@ fn tcut_read(dir: String, key: String) : Option[TypecheckedModule] / Console + F
 #[doc("Publish a module's typed blob for its key. A write failure is swallowed — a cache that cannot be written is a performance loss, never a correctness one.")]
 pub fn tcut_publish(ctx: TypedCutCtx, key: String,
                      m: TypecheckedModule) : Unit / Console + File = match ctx {
-  TCC(dir, _, _, _, _) -> if dir == "" { () }
+  TCC(dir, _, _, _, _, _) -> if dir == "" { () }
                  else {
                    cache_publish_bytes(tm_blob_path(dir, key),
                                        cache_serialize_tcmodule(m, tm_header_sha(key)))
@@ -388,17 +411,79 @@ fn tcut_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
               kind_theories: [KindTheory], tab: SymTab, verbose: Bool, dm: Option[Demand],
               lp: TCLoop) : TCLoop / Console + File + Mutable = match modules {
   [] -> lp
-  [m, ...rest] -> match lp {
-    TCL(acc, inherited, iface, sh, fresh, ctxs) -> {
-      let r = tcut_module(file, df, m, inherited, iface, all_program_decls, ctx,
-                           protos, head_owners, kind_theories, tab, sh, verbose, dm)
-      let tm = match r { TcMod(t, _) -> t }
-      tcut_loop(file, df, rest, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, dm,
-                 TCL(tcf_step(acc, tm), merge_env_deltas(inherited, tm.delta),
-                     tcut_iface_next(ctx, iface, tm.delta), tc_shared_extend(sh, tm.delta),
-                     if is_some(dm) { list_append(tm.typed.decls, fresh) } else { fresh },
-                     if is_some(dm) { [TcX(m, inherited, sh, match r { TcMod(_, f) -> f }, list_length(tm.typed.decls)), ...ctxs] } else { ctxs }))
+  [m, ...rest] -> match tcut_unit(ctx, m, rest) {
+    TcU([_], _) -> match lp {
+      TCL(_, inherited, iface, sh, _, _) -> {
+        let r = tcut_module(file, df, m, inherited, iface, all_program_decls, ctx,
+                             protos, head_owners, kind_theories, tab, sh, verbose, dm)
+        tcut_loop(file, df, rest, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, dm,
+                   tcut_absorb(m, match r { TcMod(t, _) -> t }, match r { TcMod(_, f) -> f }, dm, ctx, lp))
+      }
     }
+    TcU(members, after) -> tcut_loop(file, df, after, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, dm,
+                                      tcut_unit_run(file, df, members, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, dm, lp))
+  }
+}
+
+# The modules the fold takes together: the head and, when it is in an import cycle, the rest of the cycle that follows it.
+type TcU = TcU([ModuleDecls], [ModuleDecls])
+
+fn tcut_unit(ctx: TypedCutCtx, m: ModuleDecls, rest: [ModuleDecls]) : TcU = match ctx {
+  TCC(_, _, _, target, _, cyc) -> {
+    let d = tcut_cycle_of(cyc, unwrap_or(m.name, target))
+    if d == "" { TcU([m], rest) } else { tcut_unit_take(cyc, target, d, rest, [m]) }
+  }
+}
+
+fn tcut_unit_take(cyc: [(String, String)], target: String, d: String, rest: [ModuleDecls], acc: [ModuleDecls]) : TcU = match rest {
+  [] -> TcU(list_reverse(acc), [])
+  [r, ...more] -> if tcut_cycle_of(cyc, unwrap_or(r.name, target)) == d { tcut_unit_take(cyc, target, d, more, [r, ...acc]) }
+                  else { TcU(list_reverse(acc), rest) }
+}
+
+# Fold one typed module into the loop state.
+fn tcut_absorb(m: ModuleDecls, tm: TypecheckedModule, fr: Option[ModuleFront], dm: Option[Demand], ctx: TypedCutCtx, lp: TCLoop) : TCLoop = match lp {
+  TCL(acc, inherited, iface, sh, fresh, ctxs) ->
+    TCL(tcf_step(acc, tm), merge_env_deltas(inherited, tm.delta),
+        tcut_iface_next(ctx, iface, tm.delta), tc_shared_extend(sh, tm.delta),
+        if is_some(dm) { list_append(tm.typed.decls, fresh) } else { fresh },
+        if is_some(dm) { [TcX(m, inherited, sh, fr, list_length(tm.typed.decls)), ...ctxs] } else { ctxs })
+}
+
+# An import cycle restores when every member's key hits and is typed together otherwise.
+fn tcut_unit_run(file: String, df: DiagFiles, members: [ModuleDecls], all_program_decls: [Decl], ctx: TypedCutCtx,
+                  protos: ProtoView, head_owners: [HeadOwnerEntry], kind_theories: [KindTheory], tab: SymTab,
+                  verbose: Bool, dm: Option[Demand], lp: TCLoop) : TCLoop / Console + File + Mutable = match lp {
+  TCL(_, inherited, iface, sh, _, _) -> {
+    let keys = map(members, (m) => tcut_key(ctx, m, iface))
+    let hits = map(keys, (k) => tcut_lookup(ctx, k))
+    let tms = if all(hits, (h) => is_some(h)) { flat_map(hits, (h) => match h { Some(t) -> [t]  None -> [] }) } else {
+      let got = tcut_unit_consts(typecheck_unit(file, df, members, inherited, all_program_decls, protos, head_owners, kind_theories, tab, sh, verbose), tab, df)
+      if tcut_on(ctx) { each(zip(keys, got), (kt) => if kt.snd.typed.errs == 0 { tcut_publish(ctx, kt.fst, kt.snd) } else { () }) } else { () }
+      got
+    }
+    tcut_absorb_all(members, tms, dm, ctx, lp)
+  }
+}
+
+# The constants of a cycle cannot be checked one module at a time: the loop closes across the members.
+fn tcut_unit_consts(tms: [TypecheckedModule], tab: SymTab, df: DiagFiles) : [TypecheckedModule] / Console + File = {
+  let ds = const_cycle_diags(flat_map(tms, .typed.decls), tab, df)
+  if list_is_empty(ds) { tms } else {
+    each(ds, (d) => render_diag(d))
+    let n = list_length(tms) - 1
+    list_append(take(tms, n), map(drop(tms, n), (t) => tcut_with_diags(t, ds)))
+  }
+}
+
+fn tcut_with_diags(t: TypecheckedModule, ds: [Diagnostic]) : TypecheckedModule =
+  TypecheckedModule { ...t, typed: TypedProgram { ...t.typed, errs: t.typed.errs + list_length(ds), diags: list_append(t.typed.diags, ds) } }
+
+fn tcut_absorb_all(ms: [ModuleDecls], tms: [TypecheckedModule], dm: Option[Demand], ctx: TypedCutCtx, lp: TCLoop) : TCLoop = match ms {
+  [] -> lp
+  [m, ...rest] -> match tms {
+    [tm, ...more] -> tcut_absorb_all(rest, more, dm, ctx, tcut_absorb(m, tm, None, dm, ctx, lp))
+    [] -> lp
   }
 }
 
@@ -471,7 +556,7 @@ fn tcut_infer_modules(file: String, mods0: [ModuleDecls], full: [ModuleDecls], c
                        defer: TcDefer, verbose: Bool) : TcOut / Console + File + Mutable = {
   let pool_hex = match defer.demand { Some(dm) -> if cache_dir == "" { "" } else { demand_digest(tin.tab, dm) }  None -> "" }
   let ctx = tcut_ctx(cache_dir, flatten_module_decls(mods0, []), tin.tab, root_module_name(file), tin.roots,
-                      tin.protos, tin.head_owners, tin.kind_theories, tin.views, pool_hex)
+                      tin.protos, tin.head_owners, tin.kind_theories, tin.views, pool_hex, tin.cycles)
   tcut_typecheck_program(file, tin.df, mods0, full, ctx, tin.protos, tin.head_owners,
                           tin.kind_theories, tin.tab, tin.views, tin.roots, defer, verbose)
 }

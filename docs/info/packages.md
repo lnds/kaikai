@@ -194,6 +194,31 @@ as unused: the warning names the file that needs the module (`import
 the import belongs there. Removing every import reported as unused, all
 at once, keeps the program building.
 
+## Import cycles
+
+Modules of one package may import each other. A package is the
+directory tree under one `kai.toml`; the files stay separate modules.
+
+```kaikai
+# even.kai                      # odd.kai
+import odd                      import even
+pub fn is_even(n: Int) : Bool   pub fn is_odd(n: Int) : Bool
+  = if n == 0 { true }            = if n == 0 { false }
+    else { is_odd(n - 1) }          else { is_even(n - 1) }
+```
+
+The modules of a cycle are typed together: every top-level signature
+(private ones included) is explicit, so all of them are collected
+before any body is read, and a body sees the whole cycle. Mutual tail
+calls across the files stay jumps on both backends. Editing one member
+rebuilds the cycle and the modules that import it, and no others.
+
+A cycle is an error when it crosses packages, when no `kai.toml`
+encloses the files, or when it runs through the stdlib. A cycle of
+constants (`A = B + 1` in one file, `B = A + 1` in another) is an
+error: a constant has no storage, so reading one that reaches itself
+never finishes.
+
 ## Visibility
 
 ```kaikai

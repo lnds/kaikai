@@ -6,6 +6,7 @@ core loader and the AST dumper sit beside them.
 """)]
 
 import compiler.site_ids_check
+import compiler.import_cycles
 import compiler.written_eq_check
 import compiler.util
 import compiler.verdicts
@@ -941,20 +942,20 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, line:
       # below still fires with a useful candidate path.
       let abs_path = match opt_src { Some(src) -> baked_twin(abspath(raw_path), src)  None -> abspath(raw_path) }
       let rs = if opt_src.is_some() { rs_tried(rs, MTry(base_dir, mod_path, raw_path, abs_path)) } else { rs }
-      # An `abs_path` that is already on the in_progress stack means
-      # resolution looped back to a module
-      # whose load has not yet returned — an import cycle. Emit the
-      # chain (root -> ... -> abs_path) and bump errs so the build
-      # fails. Do NOT push abs_path nor recurse; the cycle is broken
-      # at the re-entry point and the partially-loaded module's
-      # exports remain whatever the outer load had at this moment.
+      let rs = rs_edge(rs, importer_file(rs), abs_path)
+      # A module still loading is imported again: a cycle. Inside one package
+      # it is legal and the binding waits for the target's exports, so no body
+      # resolves against a half-loaded module.
       if rs_in_progress(rs, abs_path) {
-        let msg = if abspath(importer_file(rs)) == abs_path {
-          "`#{mod_path}` is this file's own name, so it shadows the module it imports; rename the file"
+        if abspath(importer_file(rs)) == abs_path {
+          rs_report(rs, [import_diag(importer_file(rs), line, col,
+            "`#{mod_path}` is this file's own name, so it shadows the module it imports; rename the file")])
+        } else if abs_path != rs_root(rs) and same_package(importer_file(rs), abs_path) {
+          rs_defer(rs, abs_path, owner, import_name)
         } else {
-          "import cycle detected: #{format_cycle_chain(rs.in_progress, abs_path)}"
+          rs_report(rs, [import_diag(importer_file(rs), line, col,
+            "import cycle detected: #{format_cycle_chain(rs.in_progress, abs_path)}; cycles are allowed only between modules of one package (files under one kai.toml)")])
         }
-        rs_report(rs, [import_diag(importer_file(rs), line, col, msg)])
       }
       # Legitimate diamond import: A imports B and C, both of which
       # import D. D is already loaded, so its decls must not join the
@@ -1047,7 +1048,11 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, line:
                   # A module may qualify its own names by its file name,
                   # which is not its home once the path is nested.
                   let own = ME(last_segment(mod_path), exports, abs_path, unstable_exports)
-                  rs_bind_in(rs_bind_in(rs_add_module(rs3, entry), owner, bound), home, own)
+                  let rs4 = rs_bind_in(rs_bind_in(rs_add_module(rs3, entry), owner, bound), home, own)
+                  let released = foldl(rs_waiting(rs4, abs_path), rs4, (r, w) => match w {
+                    BE(_, o, written) -> rs_bind_in(r, o, ME(written, exports, abs_path, unstable_exports))
+                  })
+                  rs_release(released, abs_path)
                 }
               }
             }
@@ -1124,7 +1129,7 @@ fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], sea
   # the importer wrote) but never accumulate into `rev_modules` — the
   # caller supplies the core table separately.
   let cores = canon_module_origins(core_mods)
-  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [], rev_tried: [] }
+  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [], rev_tried: [], back: [], rev_edges: [], looped: false }
   let rs_roots = load_test_roots(base_dir, test_roots, search_paths, cores, cache_dir,
                                  process_imports(base_dir, root_decls, search_paths, cores, "", cache_dir, rs0))
   let rs1 = rs_scan_imports(rs_roots, canon_root, root_path, root_src, root_tokens, root_decls, "")
@@ -1132,10 +1137,12 @@ fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], sea
   # A grouped build's own diagnostics come from each test file built alone.
   let ledger = if list_is_empty(test_roots) { rs1.imports } else { ledger_new([]) }
   let mods = rs_modules(rs1)
-  let cut = bscope_apply(blocks, rs_segs(rs1), rs_decls(rs1), rs1.scopes, mods, test_roots)
+  let cycles = if rs1.looped { import_cycles(rs1, mods) } else { [] }
+  let ordered = if rs1.looped { cycles_reorder(rs1, mods, cycles, rs_segs(rs1), rs_decls(rs1)) } else { (rs_segs(rs1), rs_decls(rs1)) }
+  let cut = bscope_apply(blocks, ordered.fst, ordered.snd, rs1.scopes, mods, test_roots)
   let n_imports = list_length(cut.decls)
   let all_decls = list_append(cut.decls, non_import_decls(root_decls))
-  EP_Mod(all_decls, mods, n_imports, Verdict(rs1.errs, list_reverse(rs1.diags)), cut.segs, rs1.scopes, rs_sels(rs1), rs_rows(rs1), ledger)
+  EP_Mod(all_decls, mods, n_imports, Verdict(rs1.errs, list_reverse(rs1.diags)), cut.segs, rs1.scopes, rs_sels(rs1), rs_rows(rs1), ledger, cycles)
 }
 
 # Each test root loads as if the root file imported it, after its own imports.
@@ -1830,7 +1837,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                           if user_cache { tcut_cache_dir(core_cache.proj_dir, path) } else { "" },
                                           test_roots, blocks, inputs_out)
             match expanded {
-              EP_Mod(_, mods, _, _, _, scopes, _, _, _) ->
+              EP_Mod(_, mods, _, _, _, scopes, _, _, _, _) ->
                 if test_plan != "" { let _w = write_file(test_plan, tplan_text(scopes, mods)) }
             }
             # Dissolve the parser's surface-fidelity nodes (contract
@@ -1842,13 +1849,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # Kept un-lowered for `--ast`: the dump must show the
             # surface forms (tparam bounds, block lambdas, contracts)
             # or an AST-equality gate over it is blind to their loss.
-            let surface_decls = match expanded { EP_Mod(ds, _, _, _, _, _, _, _, _) -> ds }
+            let surface_decls = match expanded { EP_Mod(ds, _, _, _, _, _, _, _, _, _) -> ds }
             # The program's one symbol table: the rows the parser minted
             # for every loaded file, with the core builtins. A pass that
             # mints declarations hands its rows up and the table is
             # extended; ids are derived, so none moves.
             let tab0 = st_program(list_append(core_rows,
-              list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _) -> rows }, parsed.names)),
+              list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _, _) -> rows }, parsed.names)),
               target_mod_name, core_mod_names(core_mods, []))
             let nsrcs = native_core_srcs(backend, core_cache, core_mod_names(core_mods, []))
             let npre = native_core_pre(core_cache, edition, nsrcs)
@@ -1858,7 +1865,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let core_decls_whole = core_decls
             let core_segs_whole = core_segs
             let surface_decls_whole = surface_decls
-            let lib_mods = if prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }) } else { [] }
+            let lib_mods = if prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }) } else { [] }
             let lib_fns = list_append(core_decls, precut_lib_fns(surface_decls, lib_mods))
             let pcut = if prunes { early_cut(core_cache.early_cut, lib_fns, tab0, cmod_plain(backend, mode)) } else { None }
             let emptied = match pcut { Some(pc) -> precut_emptied(pc, lib_fns)  None -> [] }
@@ -1880,14 +1887,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # the wrapper variant.
             let stripped_laws = strip_law_wrappers(expanded_decls_raw0)
             let expanded_decls_raw = cover_decls(if runs_blocks(mode) { cover } else { cover_none() },
-                                                 match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _) -> sg },
-                                                 match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt },
+                                                 match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _, _) -> sg },
+                                                 match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt },
                                                  strip_sl_decls(stripped_laws))
-            let n_imports_raw = match expanded { EP_Mod(_, _, n, _, _, _, _, _, _) -> n }
+            let n_imports_raw = match expanded { EP_Mod(_, _, n, _, _, _, _, _, _, _) -> n }
             # Count of import-resolution failures (e.g.
             # `import nothing_here` whose file is missing on the search
             # path). Folded into the exit-code aggregator below.
-            let import_resolve_vd = match expanded { EP_Mod(_, _, _, v, _, _, _, _, _) -> v }
+            let import_resolve_vd = match expanded { EP_Mod(_, _, _, v, _, _, _, _, _, _) -> v }
             # Register the target file itself in the module table under
             # its own basename, mirroring what `load_core_file` does for
             # core files. Without this, an intrinsic test block
@@ -1922,7 +1929,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # any same-named core (intentional: the file is
             # "itself").
             let module_table = list_append(
-              list_append(core_mods, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }),
+              list_append(core_mods, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }),
               [target_me])
             # The pre-typer passes walk one flat stream holding every
             # imported module's decls, so a diagnostic takes its file
@@ -1954,12 +1961,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # binding the same module under another name cannot displace
             # it. `module_table` stays the fallback for the names every
             # file sees without importing them (auto-loaded cores).
-            let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc, _, _, _) -> sc }
-            let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _) -> sg }
+            let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc, _, _, _, _) -> sc }
+            let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _, _) -> sg }
             let mod_tabs = mtabs_build(mod_scopes, module_table)
             let mod_imps = scope_imports(mod_scopes, module_table)
             let core_decls_l = tparam_bind_decls(surface_lower_decls(core_decls, tab0))
-            let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si, _, _) -> si },
+            let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si, _, _, _) -> si },
                                              mod_scopes, module_table, expanded_decls, tab0, target_mod_name)
             let sym_views = fv_build(mod_imps,
                                      sel_imports, mod_scopes, module_table,
@@ -2076,7 +2083,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # Segment views of the post-rqc streams: core segment
             # lengths come from `core_segs` (rqc rewrites decls
             # 1:1), import boundaries from the resolver's marks.
-            let import_seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _) -> sg }
+            let import_seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _, _) -> sg }
             let pa_segs = list_append(
               pa_reseg(core_segs, qualified_core),
               list_append(
@@ -2122,7 +2129,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # the file each declaration was read from: the root by its own
             # path, an import by its entry's, never through a module name a
             # user file can share with one of them.
-            let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }, []), path)
+            let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }, []), path)
             let kai_decl_vd = vd_render(list_append(
               kai_builtin_decl_diags(qualified_core_mangled, tab1, diag_files(module_files(core_mods, []), path), declares_kai_builtins),
               kai_builtin_decl_diags(qualified_decls, tab1, import_files, declares_kai_builtins)))
@@ -2197,7 +2204,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let law_reg = strip_sl_reg(stripped_laws)
             let gen_laws =
               if wants_law_checks(mode) {
-                let kept = match expanded { EP_Mod(_, mods, _, _, _, scopes, _, _, _) -> bscope_kept(blocks, scopes, mods, test_roots) }
+                let kept = match expanded { EP_Mod(_, mods, _, _, _, scopes, _, _, _, _) -> bscope_kept(blocks, scopes, mods, test_roots) }
                 gen_law_checks(merged_no_laws, PScope(tab3, sym_views, target_mod_name), law_reg, path, kept)
               }
               else { GL([], []) }
@@ -2365,7 +2372,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                           mod_imps,
                                           PScope(tab3, sym_views, target_mod_name))
             if quiet { () } else {
-              report_imports(ledger_note_derived(match expanded { EP_Mod(_, _, _, _, _, _, _, _, l) -> l }, lowered.minted, diag_ctx),
+              report_imports(ledger_note_derived(match expanded { EP_Mod(_, _, _, _, _, _, _, _, l, _) -> l }, lowered.minted, diag_ctx),
                              abspath(path))
             }
             # The dispatchers, lowered impl methods and derived functions
@@ -2452,7 +2459,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                        bound: (ds) => c_bounded_decls(backend, ds, sym_tab), consts: pattern_consts,
                                        ts_coll: ts_coll, vs_coll: vs_coll, mod_imps: mod_imps, sel_imports: sel_imports, entry: entry }
             let front = TyperFront { df: diag_ctx, views: sym_views, target: target_mod_name, roots: roots,
-                                     kind_theories: kind_theories, edition: edition_or_oldest(edition) }
+                                     kind_theories: kind_theories, edition: edition_or_oldest(edition),
+                                     cycles: match expanded { EP_Mod(_, _, _, _, _, _, _, _, _, cy) -> cy } }
             match mode {
               MAst -> { dump_program(surface_decls, tab0); 0 }
               MTypes -> { dump_types(doc_decls, own_tab); 0 }
@@ -2615,7 +2623,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 } else { 1 }
                 let picked = cmod_core_pick(backend, mode, core_cache, cpre, cvar)
                 let prunes = prunes or (in_place and seeded == 0 and is_some(picked))
-                let lib_mods = if in_place and prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }) } else { lib_mods }
+                let lib_mods = if in_place and prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }) } else { lib_mods }
                 let need_seed = want_seed and not in_place
                 let no_variant = chk == 0 and prunes and cvar != "" and is_some(core_hit) and is_none(picked) and not need_seed
                 let core_hit = match backend { BkCModular -> picked  _ -> core_hit }
