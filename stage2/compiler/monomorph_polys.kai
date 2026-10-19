@@ -8,6 +8,10 @@ import compiler.call_site_target
 import compiler.fnreg
 import compiler.effect_instance_canon
 import compiler.tbinder
+import compiler.proto_ids
+import compiler.core_refs
+import compiler.expr_exists
+import compiler.infer_clause_holes
 
 #[doc("""
 The poly fns of the program, by declaration. A `DFn` with non-empty
@@ -35,26 +39,46 @@ pub fn poly_ix_target(px: PolyIx) : String = match px { PIx(_, t, _) -> t }
 pub fn poly_ix_inst(px: PolyIx) : [PolyFn] = match px { PIx(_, _, ifs) -> ifs }
 
 #[doc("The index of the generic functions among `ds`.")]
-pub fn collect_poly_fns(ds: [Decl], target_mod: String) : PolyIx = {
-  let fns = collect_poly_fns_loop(ds)
+pub fn collect_poly_fns(ds: [Decl], target_mod: String, ids: ProtoIds) : PolyIx = {
+  let fns = collect_poly_fns_loop(ds, ids)
   PIx(fns, target_mod, filter(fns, (p) => match p { PFn(_, d) -> handle_instance_tparams(d) != [] }))
 }
 
-fn collect_poly_fns_loop(ds: [Decl]) : [PolyFn] {
+fn collect_poly_fns_loop(ds: [Decl], ids: ProtoIds) : [PolyFn] {
   match ds {
     [] -> []
     [d, ...rest] -> match d {
       # An extern shim takes boxed values whatever its type arguments, so
       # its calls keep naming the one declaration.
       DFn(_, fid, tparams, _, _, _, body, _, _, _) ->
-        if tbs_declared(tparams) != [] and not body_is_extern(body) {
-          [PFn(fnid_sym(fid), d), ...collect_poly_fns_loop(rest)]
+        if (tbs_declared(tparams) != [] or dispatches_on_implicit(tparams, body, ids)) and not body_is_extern(body) {
+          [PFn(fnid_sym(fid), d), ...collect_poly_fns_loop(rest, ids)]
         } else {
-          collect_poly_fns_loop(rest)
+          collect_poly_fns_loop(rest, ids)
         }
-      _ -> collect_poly_fns_loop(rest)
+      _ -> collect_poly_fns_loop(rest, ids)
     }
   }
+}
+
+# A function over implicit type parameters stays one shared copy unless its
+# body applies a protocol operation to a value of such a type: only a
+# specialisation sees the concrete head the dispatch needs.
+fn dispatches_on_implicit(tparams: [TBinder], body: Expr, ids: ProtoIds) : Bool =
+  any(tparams, (b) => b.implicit and tb_is_type(b)) and xp_exists(body, false, (e) => applies_op_on_var(e, ids))
+
+fn applies_op_on_var(e: Expr, ids: ProtoIds) : Bool = match e.kind {
+  ECall(callee, [a, ..._]) -> match pid_bare_disp(ids, callee) {
+    Some(_) -> not ty_is_known(a.ty)
+    None    -> false
+  }
+  EBinop(op, l, _)         -> bp_is_arith(binop_proto(op)) and not ty_is_known(l.ty)
+  _                        -> false
+}
+
+fn ty_is_known(t: Option[Ty]) : Bool = match t {
+  Some(ty) -> ty_concrete(ty)
+  None     -> true
 }
 
 #[doc("""

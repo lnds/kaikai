@@ -224,7 +224,10 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     # bookkeeping at this stage.
     ECall(callee, args_) -> {
       let new_args = map(args_, (a) => resolve_protocol_calls_expr(a, reg, cm))
-      let new_callee = resolve_protocol_calls_expr(callee, reg, cm)
+      let new_callee = match callee.kind {
+        ESym(_, _) -> callee
+        _          -> resolve_protocol_calls_expr(callee, reg, cm)
+      }
       # Issue #180: pass the call's inferred return type so dispatchers
       # whose only Self informant is the return position (e.g.
       # `from(x) : Self` against a `let x : T = from(...)` annotation)
@@ -247,6 +250,8 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
       let nr = resolve_protocol_calls_expr(r, reg, cm)
       prc_rewrite_cmp_binop(op, nl, nr, reg)
     }
+    # A dispatcher taken as a value is the impl its parameter types select.
+    ESym(_, _) -> prc_rewrite_bare_ref(k, ret_ty, reg, cm, line, col)
     # A negation the typer left builtin over a type then unknown.
     EUnop(UoNeg, x) -> {
       let nx = resolve_protocol_calls_expr(x, reg, cm)
@@ -257,6 +262,18 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
     }
     _ -> proto_map_expr_kind(k, (sub) => resolve_protocol_calls_expr(sub, reg, cm))
   }
+}
+
+fn prc_rewrite_bare_ref(k: ExprKind, ty: Option[Ty], reg: ProtocolReg, cm: Option[String],
+                        line: Int, col: Int) : ExprKind = match ty {
+  Some(TyFnT(ps, _, _)) -> {
+    let args_ = map(ps, (p) => prc_mk_ty(EUnit, line, col, Some(p)))
+    match try_rewrite_proto_call_with_ret(prc_mk_ty(k, line, col, ty), args_, reg, cm, None) {
+      Some(ECall(impl_ref, _)) -> impl_ref.kind
+      _                        -> k
+    }
+  }
+  _ -> k
 }
 
 # The `Neg` impl of the operand's type; a unit or a refinement on it
@@ -327,13 +344,17 @@ fn prc_arith_impl(reg: ProtocolReg, bp: BinopProto, lt: Option[Ty], rt: Option[T
   }
 
 fn prc_con_head(t: Option[Ty]) : Option[SymId] = match t {
-  Some(TyCon(s, _)) -> Some(s)
-  _                 -> None
+  Some(TyCon(s, _))        -> Some(s)
+  Some(TyDimT(inner, _))   -> prc_con_head(Some(inner))
+  Some(TyRefineT(inner, _)) -> prc_con_head(Some(inner))
+  _                        -> None
 }
 
 fn prc_same_head(t: Option[Ty], s: SymId) : Bool = match t {
-  Some(TyCon(ts, _)) -> sym_raw(s) >= 0 and sym_raw(ts) == sym_raw(s)
-  _                  -> false
+  Some(TyCon(ts, _))        -> sym_raw(s) >= 0 and sym_raw(ts) == sym_raw(s)
+  Some(TyDimT(inner, _))    -> prc_same_head(Some(inner), s)
+  Some(TyRefineT(inner, _)) -> prc_same_head(Some(inner), s)
+  _                         -> false
 }
 
 fn prc_homogeneous(p: ProtoImplReg, proto: SymId, opname: String, h: DispHead) : Bool = match p {
