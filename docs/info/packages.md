@@ -199,7 +199,7 @@ at once, keeps the program building.
 Modules of one package may import each other. A package is the
 directory tree under one `kai.toml`; the files stay separate modules.
 
-```kaikai
+```text
 # even.kai                      # odd.kai
 import odd                      import even
 pub fn is_even(n: Int) : Bool   pub fn is_odd(n: Int) : Bool
