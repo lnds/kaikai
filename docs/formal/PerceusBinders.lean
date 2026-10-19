@@ -227,7 +227,7 @@ leaked 30 over 10 calls. -/
 
     Note what is NOT a variant: there is no `tail` payer. A binder whose
     read is in the tail is still `exit` — `ptd_needs_drop`
-    (perceus_tail_drop.kai:122) asks the same `pcs_fate_of` and guards
+    (perceus_exit_drops.kai:122) asks the same `pcs_fate_of` and guards
     with `ptd_has_drop` so the drop is planted once. The tail is a
     different SITE for the same payer, not a different payer. An earlier
     draft of this model invented a `tail` payer; the shipped type has

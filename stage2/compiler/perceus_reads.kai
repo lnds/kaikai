@@ -1,16 +1,5 @@
 #[doc("""
-The read table: every read of every tracked binder in a body, collected once.
-
-The table is keyed by binder identity. The rewriter's dup-or-move decision and
-every payer answer "how often is this binder read" and "which read is its
-last" from this one table; nothing else in the pass re-collects reads.
-
-A read inside a lambda body is a capture: it is flagged, and it blocks the
-last-use transfer. A raw read of a boxed binder copies the payload out and
-leaves the box alone, so it is flagged too: as the last read it hands
-nothing on. `compiler.perceus_read_walk` collects the table.
-
-A binder is tracked as its `Binder`; its identity decides every question.
+Reads of a binder in a function body: indexing, argument slots, moves and self-call positions.
 """)]
 
 import compiler.ast
@@ -18,6 +7,7 @@ import compiler.expr_positions
 import compiler.handler_alias
 import compiler.core_builtins
 import compiler.name_ix
+import compiler.self_call
 
 #[doc("A function's reads, indexed by binder.")]
 pub type UseIx = NameIx[Read]
@@ -28,37 +18,21 @@ pub type Read = Rd(LocalId, Int, Int, Bool, Bool)
 #[doc("Where a binder is read last: at a position, behind a capture that blocks the last-use transfer, or nowhere.")]
 pub type LastUse = LuAt(Int, Int) | LuBlocked | LuUnused
 
-#[doc("True when `l` is one of the binders `bs`.")]
-pub fn pcs_has(bs: [Binder], l: LocalId) : Bool = match bs {
+pub(pkg) fn pcs_has(bs: [Binder], l: LocalId) : Bool = match bs {
   []           -> false
   [b, ...rest] -> local_eq(b.id, l) or pcs_has(rest, l)
 }
 
-#[doc("""
-A clause's op-argument binders, without the continuation.
+pub(pkg) fn pcs_filter_non_resume(params: [Param]) : [Binder] = map(clause_op_args(params), (p) => p.binder)
 
-A call of the continuation is emitted by a special case and has no runtime
-value, so wrapping a read of it in `__perceus_dup` would reach an undeclared
-symbol.
-""")]
-pub fn pcs_filter_non_resume(params: [Param]) : [Binder] = map(clause_op_args(params), (p) => p.binder)
-
-#[doc("""
-The state aliases a handle binds in its clauses; a handle carries state
-exactly when it has an initial value.
-
-A clause reads each alias through the binder minted under its name. A scope
-lists them after every other binder.
-""")]
-pub fn pcs_handle_aliases(init_opt: Option[Expr]) : [Binder] = match init_opt {
+pub(pkg) fn pcs_handle_aliases(init_opt: Option[Expr]) : [Binder] = match init_opt {
   Some(_) -> map(list_append(user_state_aliases(), [var_cell_alias()]), binder_minted)
   None    -> []
 }
 
 # ---- the tracked binders of a pattern ----
 
-#[doc("The binders a pattern declares that perceus tracks.")]
-pub fn prc_pat_bindings(pat: Pattern, acc: [Binder]) : [Binder] = match pat.pkind {
+pub(pkg) fn prc_pat_bindings(pat: Pattern, acc: [Binder]) : [Binder] = match pat.pkind {
   PBind(b)                  -> [b, ...acc]
   PList(pats, opt_rest)     -> {
     let acc1 = prc_pats_bindings(pats, acc)
@@ -76,8 +50,7 @@ pub fn prc_pat_bindings(pat: Pattern, acc: [Binder]) : [Binder] = match pat.pkin
   _                         -> acc
 }
 
-#[doc("`prc_pat_bindings` of a `let`, except that a single `PBind` over an `MUnboxed` rhs is a raw C scalar with no refcount and stays out.")]
-pub fn prc_pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [Binder]) : [Binder] = match pat.pkind {
+pub(pkg) fn prc_pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [Binder]) : [Binder] = match pat.pkind {
   PBind(b) -> match rhs.mode {
     MUnboxed -> acc
     _        -> [b, ...acc]
@@ -94,8 +67,7 @@ fn prc_pfield_pat(f: PField) : Pattern = match f { PField(_, p, _) -> p }
 
 # ---- queries ----
 
-#[doc("Last-use class of a binder over a read table: never read, read inside a lambda (a capture blocks the last-use transfer), or last read at a position.")]
-pub fn last_use_for(b: LocalId, uses: UseIx) : LastUse = {
+pub(pkg) fn last_use_for(b: LocalId, uses: UseIx) : LastUse = {
   let reads = ni_bucket_id(uses, local_raw(b))
   if prt_any_in_lam(reads, b) { LuBlocked }
   else {
@@ -117,36 +89,31 @@ fn prt_after(ln: Int, cl: Int, best: Option[(Int, Int)]) : Bool = match best {
   Some((l, c)) -> ln > l or (ln == l and cl > c)
 }
 
-#[doc("The reads of a binder outside lambdas; a lambda read is a capture, paid by the closure's own incref.")]
-pub fn pcs_read_count(b: LocalId, uses: UseIx) : Int = prt_count(b, ni_bucket_id(uses, local_raw(b)), 0)
+pub(pkg) fn pcs_read_count(b: LocalId, uses: UseIx) : Int = prt_count(b, ni_bucket_id(uses, local_raw(b)), 0)
 
 fn prt_count(b: LocalId, uses: [Read], n: Int) : Int = match uses {
   [] -> n
   [Rd(u, _, _, in_lam, _), ...rest] -> prt_count(b, rest, if local_eq(u, b) and not in_lam { n + 1 } else { n })
 }
 
-#[doc("True when some read of `b` sits inside a lambda.")]
-pub fn pcs_uses_have_in_lam(uses: UseIx, b: LocalId) : Bool = prt_any_in_lam(ni_bucket_id(uses, local_raw(b)), b)
+pub(pkg) fn pcs_uses_have_in_lam(uses: UseIx, b: LocalId) : Bool = prt_any_in_lam(ni_bucket_id(uses, local_raw(b)), b)
 
 fn prt_any_in_lam(uses: [Read], b: LocalId) : Bool = match uses {
   []                                -> false
   [Rd(u, _, _, in_lam, _), ...rest] -> (in_lam and local_eq(u, b)) or prt_any_in_lam(rest, b)
 }
 
-#[doc("True when the read of `b` at `(l, c)` is raw, which leaves its box alone.")]
-pub fn pcs_read_raw_at(b: LocalId, uses: UseIx, l: Int, c: Int) : Bool = prt_raw_at(ni_bucket_id(uses, local_raw(b)), b, l, c)
+pub(pkg) fn pcs_read_raw_at(b: LocalId, uses: UseIx, l: Int, c: Int) : Bool = prt_raw_at(ni_bucket_id(uses, local_raw(b)), b, l, c)
 
 fn prt_raw_at(uses: [Read], b: LocalId, l: Int, c: Int) : Bool = match uses {
   []                               -> false
   [Rd(u, ln, cl, _, raw), ...rest] -> (raw and local_eq(u, b) and ln == l and cl == c) or prt_raw_at(rest, b, l, c)
 }
 
-#[doc("True when `b` is read exactly once, outside any lambda.")]
-pub fn pcs_read_once(b: LocalId, uses: UseIx) : Bool =
+pub(pkg) fn pcs_read_once(b: LocalId, uses: UseIx) : Bool =
   pcs_read_count(b, uses) == 1 and not pcs_uses_have_in_lam(uses, b)
 
-#[doc("True when `b` is read anywhere in `e`: lambda bodies and handler clauses included.")]
-pub fn pcs_mentions(b: Binder, e: Expr) : Bool = match e.kind {
+pub(pkg) fn pcs_mentions(b: Binder, e: Expr) : Bool = match e.kind {
   ELocal(u) -> local_eq(u, b.id)
   _         -> prt_mentions_ps(b, xp_positions(e))
 }
@@ -156,8 +123,7 @@ fn prt_mentions_ps(b: Binder, ps: [XPos]) : Bool = match ps {
   [XP(_, c), ...rest] -> pcs_mentions(b, c) or prt_mentions_ps(b, rest)
 }
 
-#[doc("The expression a unit coercion wraps, peeled to the value Perceus reads; any other expression is itself.")]
-pub fn prc_peel_unit(e: Expr) : Expr = match e.kind {
+pub(pkg) fn prc_peel_unit(e: Expr) : Expr = match e.kind {
   ECall(f, xs) -> if prc_is_unit_coercion(f) { match xs { [x] -> prc_peel_unit(x)  _ -> e } } else { e }
   _ -> e
 }
@@ -165,4 +131,393 @@ pub fn prc_peel_unit(e: Expr) : Expr = match e.kind {
 fn prc_is_unit_coercion(f: Expr) : Bool = match builtin_ref(f) {
   Some(b) -> builtin_is_unit_coercion(b)
   None    -> false
+}
+
+pub(pkg) fn pcs_read_outside_lambda(b: Binder, e: Expr) : Bool = match e.kind {
+  ELocal(u) -> local_eq(u, b.id)
+  _         -> pcs_read_outside_lambda_ps(b, xp_positions_kind(e.kind))
+}
+
+fn pcs_read_outside_lambda_ps(b: Binder, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] -> (match r { XLam -> false  _ -> pcs_read_outside_lambda(b, c) }) or pcs_read_outside_lambda_ps(b, rest)
+}
+
+pub(pkg) fn pcs_is_bare(l: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(u) -> local_eq(u, l)
+  _         -> false
+}
+
+pub(pkg) fn pcs_any_arg_is_var(l: LocalId, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_is_bare(l, h) or pcs_any_arg_is_var(l, rest)
+}
+
+pub(pkg) fn pcs_any_arg_bare(l: LocalId, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_is_bare(l, prc_peel_unit(h)) or pcs_any_arg_bare(l, rest)
+}
+
+pub(pkg) fn pcs_any_arg_mentions(b: Binder, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_read_outside_lambda(b, h) or pcs_any_arg_mentions(b, rest)
+}
+
+#[doc("A read of a binder outside lambdas, and whether it is a bare argument in a slot its callee borrows.")]
+pub type SlotRead = SR(LocalId, Bool)
+
+pub(pkg) type ReadRole = RDirect | RShort | RDeferred
+
+pub(pkg) type RoleRead = RoleR(LocalId, ReadRole)
+
+pub(pkg) fn pbr_slot_reads(body: Expr, borrowed_at: (Expr) -> [Int]) : NameIx[SlotRead] =
+  ni_wrap(pbr_sr(body, borrowed_at, false, ni_buckets()))
+
+pub(pkg) fn pbr_only_lent(ix: NameIx[SlotRead], b: Binder) : Bool =
+  pbr_lent_ids(ni_bucket_id(ix, local_raw(b.id)), b.id, 0) == 1
+
+# 0: no read seen; 1: every read seen is lent; 2: some read is not.
+fn pbr_lent_ids(rs: [SlotRead], l: LocalId, st: Int) : Int = match rs {
+  [] -> st
+  [SR(n, lent), ...rest] ->
+    if not local_eq(n, l) { pbr_lent_ids(rest, l, st) } else if lent { pbr_lent_ids(rest, l, 1) } else { 2 }
+}
+
+fn pbr_sr(e: Expr, borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match e.kind {
+    ELocal(u)       -> ni_add_id(acc, local_raw(u), SR(u, lent))
+    ECall(f, xs)    -> pbr_sr_args(xs, borrowed_at(f), 0, borrowed_at, lent, pbr_sr(f, borrowed_at, lent, acc))
+    EIf(c, t, oe)   -> pbr_sr_opt(oe, borrowed_at, lent, pbr_sr(t, borrowed_at, lent, pbr_sr(c, borrowed_at, lent, acc)))
+    EMatch(s, arms) -> pbr_sr_arms(arms, borrowed_at, lent, pbr_sr(s, borrowed_at, lent, acc))
+    _               -> pbr_sr_ps(xp_positions_kind(e.kind), borrowed_at, lent, acc)
+  }
+
+# A bare local in a borrowed slot is lent to the callee, not consumed;
+# a compound argument consumes its own reads while it is evaluated.
+fn pbr_sr_args(xs: [Expr], slots: [Int], i: Int, borrowed_at: (Expr) -> [Int], lent: Bool,
+               acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable = match xs {
+  [] -> acc
+  [h, ...rest] -> {
+    let bare = match prc_peel_unit(h).kind { ELocal(_) -> true  _ -> false }
+    let here = lent or (bare and pbr_has(slots, i))
+    pbr_sr_args(rest, slots, i + 1, borrowed_at, lent, pbr_sr(h, borrowed_at, here, acc))
+  }
+}
+
+fn pbr_sr_opt(oe: Option[Expr], borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match oe {
+    None    -> acc
+    Some(e) -> pbr_sr(e, borrowed_at, lent, acc)
+  }
+
+fn pbr_sr_arms(arms: [Arm], borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match arms {
+    [] -> acc
+    [Arm(_, og, body), ...rest] ->
+      pbr_sr_arms(rest, borrowed_at, lent, pbr_sr(body, borrowed_at, lent, pbr_sr_opt(og, borrowed_at, lent, acc)))
+  }
+
+fn pbr_sr_ps(ps: [XPos], borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match ps {
+    [] -> acc
+    [XP(r, c), ...rest] -> pbr_sr_ps(rest, borrowed_at, lent, match r {
+      XLam -> acc
+      _    -> pbr_sr(c, borrowed_at, lent, acc)
+    })
+  }
+
+fn pbr_has(xs: [Int], t: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> h == t or pbr_has(rest, t)
+}
+
+pub(pkg) fn pbr_role_reads(body: Expr) : NameIx[RoleRead] = ni_wrap(pbr_rr(body, RDirect, ni_buckets()))
+
+pub(pkg) fn pbr_roles_of(ix: NameIx[RoleRead], b: Binder) : (Int, Int, Bool) =
+  pbr_roles_go(ni_bucket_id(ix, local_raw(b.id)), b.id, 0, 0, false)
+
+fn pbr_roles_go(rs: [RoleRead], l: LocalId, d: Int, s: Int, k: Bool) : (Int, Int, Bool) = match rs {
+  [] -> (d, s, k)
+  [RoleR(n, r), ...rest] ->
+    if not local_eq(n, l) { pbr_roles_go(rest, l, d, s, k) }
+    else { match r {
+      RDirect   -> pbr_roles_go(rest, l, d + 1, s, k)
+      RShort    -> pbr_roles_go(rest, l, d, s + 1, k)
+      RDeferred -> pbr_roles_go(rest, l, d, s, true)
+    } }
+}
+
+fn pbr_rr(e: Expr, role: ReadRole, acc: Array[[RoleRead]]) : Array[[RoleRead]] / Mutable = match e.kind {
+  ELocal(u) -> ni_add_id(acc, local_raw(u), RoleR(u, role))
+  _         -> pbr_rr_ps(xp_positions(e), role, acc)
+}
+
+# A deferred body taints every read beneath it, short circuits included.
+fn pbr_rr_ps(ps: [XPos], role: ReadRole, acc: Array[[RoleRead]]) : Array[[RoleRead]] / Mutable = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> {
+    let inner = match role {
+      RDeferred -> RDeferred
+      _ -> match r {
+        XSc  -> RShort
+        XMsg -> RShort
+        XLam -> RDeferred
+        XCl  -> RDeferred
+        _    -> role
+      }
+    }
+    pbr_rr_ps(rest, role, pbr_rr(c, inner, acc))
+  }
+}
+
+pub(pkg) fn pcs_clause_in_lam(in_lam: Bool, params: [Param], body: Expr) : Bool = match pcs_clause_requested(params, body) {
+  [] -> in_lam
+  _ -> false
+}
+
+pub(pkg) fn pcs_clause_requested(params: [Param], body: Expr) : [Binder] =
+  pcs_seg_request_moves(map(clause_op_args(params), (p) => p.binder), body)
+
+fn pcs_seg_request_moves(names: [Binder], body: Expr) : [Binder] =
+  filter(names, (b) => psr_reads(b.id, body) == 1 and psr_requested(b.id, body))
+
+fn psr_is(nm: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(u) -> local_eq(u, nm)
+  _ -> false
+}
+
+fn psr_requested(nm: LocalId, e: Expr) : Bool = match e.kind {
+  EIntrinsic(InSegRequest, xs) -> any(xs, (x) => psr_is(nm, x)) or any(xs, (x) => psr_requested(nm, x))
+  EIntrinsic(_, xs) -> any(xs, (x) => psr_requested(nm, x))
+  _ -> any(psr_inline_ps(xp_positions(e)), (x) => psr_requested(nm, x))
+}
+
+# A read under a lambda is a capture: it disqualifies the move.
+fn psr_reads(nm: LocalId, e: Expr) : Int = if psr_is(nm, e) { 1 } else { psr_reads_ps(nm, xp_positions(e), 0) }
+
+fn psr_reads_ps(nm: LocalId, ps: [XPos], n: Int) : Int = match ps {
+  [] -> n
+  [XP(r, c), ...rest] -> {
+    let here = psr_reads(nm, c)
+    psr_reads_ps(nm, rest, n + (if xrole_inline(r) { here } else { here * 2 }))
+  }
+}
+
+fn psr_inline_ps(ps: [XPos]) : [Expr] = match ps {
+  [] -> []
+  [XP(r, c), ...rest] -> if xrole_inline(r) { [c, ...psr_inline_ps(rest)] } else { psr_inline_ps(rest) }
+}
+
+#[doc("A bare local argument at a position, and whether its callee's slot consumes it.")]
+pub type ArgSlot = AS(LocalId, Int, Int, Bool)
+
+#[doc("Where a body's last reads may move: nowhere when a lambda is reachable, never at the positions inside a guard, an intrinsic, a surface form or an assert message, and at a bare argument only into a consuming slot.")]
+pub type MoveSites = MoveSites(Bool, [(Int, Int)], NameIx[ArgSlot])
+
+type MsAcc = MsA(Bool, [(Int, Int)], Array[[ArgSlot]])
+
+pub(pkg) fn pms_move_sites(body: Expr, consumes: (Expr) -> ([Int], Bool)) : MoveSites =
+  match pms_ms(body.kind, consumes, MsA(false, [], ni_buckets())) {
+    MsA(blocked, held, slots) -> MoveSites(blocked, held, ni_wrap(slots))
+  }
+
+pub(pkg) fn pms_moves_at(ms: MoveSites, b: LocalId, ll: Int, lc: Int) : Bool = match ms {
+  MoveSites(blocked, held, ix) ->
+    not blocked and not pms_holds(held, ll, lc) and pms_slots_ok(ni_bucket_id(ix, local_raw(b)), b, ll, lc)
+}
+
+fn pms_holds(held: [(Int, Int)], ll: Int, lc: Int) : Bool = match held {
+  [] -> false
+  [(l, c), ...rest] -> (l == ll and c == lc) or pms_holds(rest, ll, lc)
+}
+
+fn pms_slots_ok(slots: [ArgSlot], b: LocalId, ll: Int, lc: Int) : Bool = match slots {
+  [] -> true
+  [AS(n, l, c, ok), ...rest] -> (ok or not local_eq(n, b) or l != ll or c != lc) and pms_slots_ok(rest, b, ll, lc)
+}
+
+fn pms_ms(k: ExprKind, consumes: (Expr) -> ([Int], Bool), acc: MsAcc) : MsAcc / Mutable = match k {
+  ECall(f, xs) ->
+    if pms_any_lambda(xs) { pms_block(acc) }
+    else { match consumes(f) {
+      (slots, ctor) -> pms_ms_args(xs, slots, ctor, 0, consumes, pms_ms(f.kind, consumes, acc))
+    } }
+  EMatch(s, arms) -> pms_ms_arms(arms, consumes, pms_ms(s.kind, consumes, acc))
+  EField(_, _) -> acc
+  EIndex(_, _) -> acc
+  EHandle(_, _, _, _, _, _, _) -> acc
+  EIntrinsic(_, xs) -> pms_hold_all(xs, acc)
+  ESurface(sf) -> pms_hold_all(surface_children(sf), acc)
+  _ -> pms_ms_ps(xp_positions_kind(k), consumes, acc)
+}
+
+fn pms_block(acc: MsAcc) : MsAcc = match acc { MsA(_, held, slots) -> MsA(true, held, slots) }
+
+fn pms_any_lambda(xs: [Expr]) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> match h.kind { ELambda(_, _) -> true  _ -> pms_any_lambda(rest) }
+}
+
+fn pms_ms_args(xs: [Expr], slots: [Int], ctor: Bool, i: Int, consumes: (Expr) -> ([Int], Bool),
+               acc: MsAcc) : MsAcc / Mutable = match xs {
+  [] -> acc
+  [h, ...rest] -> {
+    let acc1 = match h.kind {
+      ELocal(u) -> match acc {
+        MsA(b, held, arr) -> MsA(b, held, ni_add_id(arr, local_raw(u), AS(u, h.line, h.col, ctor or pms_has(slots, i))))
+      }
+      _ -> pms_ms(h.kind, consumes, acc)
+    }
+    pms_ms_args(rest, slots, ctor, i + 1, consumes, acc1)
+  }
+}
+
+# A guard can run and its arm still not be chosen, so no last read inside
+# one may move.
+fn pms_ms_arms(arms: [Arm], consumes: (Expr) -> ([Int], Bool), acc: MsAcc) : MsAcc / Mutable = match arms {
+  [] -> acc
+  [Arm(_, og, b), ...rest] -> {
+    let acc1 = match og { None -> acc  Some(g) -> pms_hold(g, acc) }
+    pms_ms_arms(rest, consumes, pms_ms(b.kind, consumes, acc1))
+  }
+}
+
+fn pms_ms_ps(ps: [XPos], consumes: (Expr) -> ([Int], Bool), acc: MsAcc) : MsAcc / Mutable = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> pms_ms_ps(rest, consumes, match r {
+    XLam -> pms_block(acc)
+    XMsg -> pms_hold(c, acc)
+    _    -> pms_ms(c.kind, consumes, acc)
+  })
+}
+
+fn pms_hold_all(xs: [Expr], acc: MsAcc) : MsAcc = match xs {
+  [] -> acc
+  [x, ...rest] -> pms_hold_all(rest, pms_hold(x, acc))
+}
+
+# Every position in `e` outside lambdas, as `pcs_pos_in_expr` sees them.
+fn pms_hold(e: Expr, acc: MsAcc) : MsAcc = match acc {
+  MsA(b, held, slots) -> MsA(b, pms_positions(e, held), slots)
+}
+
+fn pms_positions(e: Expr, acc: [(Int, Int)]) : [(Int, Int)] = pms_positions_ps(xp_positions(e), [(e.line, e.col), ...acc])
+
+fn pms_positions_ps(ps: [XPos], acc: [(Int, Int)]) : [(Int, Int)] = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> pms_positions_ps(rest, match r { XLam -> acc  _ -> pms_positions(c, acc) })
+}
+
+fn pms_has(xs: [Int], t: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> h == t or pms_has(rest, t)
+}
+
+pub(pkg) fn pcs_lbn_kind(k: ExprKind, acc: [Binder]) : [Binder] = match k {
+  EBlock(stmts, tail) -> {
+    let a1 = pcs_lbn_stmts(stmts, acc)
+    match tail { Some(t) -> pcs_lbn_kind(t.kind, a1) None -> a1 }
+  }
+  EIf(c, t, eo) -> {
+    let a1 = pcs_lbn_kind(c.kind, acc)
+    let a2 = pcs_lbn_kind(t.kind, a1)
+    match eo { Some(e) -> pcs_lbn_kind(e.kind, a2) None -> a2 }
+  }
+  EMatch(s, arms) -> pcs_lbn_arms(arms, pcs_lbn_kind(s.kind, acc))
+  _ -> acc
+}
+
+fn pcs_lbn_stmts(stmts: [Stmt], acc: [Binder]) : [Binder] = match stmts {
+  []           -> acc
+  [s, ...rest] -> {
+    let a1 = match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) -> pcs_lbn_kind(rhs.kind, [nm, ...acc])
+        _         -> pcs_lbn_kind(rhs.kind, acc)
+      }
+      _ -> acc
+    }
+    pcs_lbn_stmts(rest, a1)
+  }
+}
+
+fn pcs_lbn_arms(arms: [Arm], acc: [Binder]) : [Binder] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> pcs_lbn_arms(rest, pcs_lbn_kind(b.kind, acc))
+  }
+}
+
+pub(pkg) fn pcs_pisc_kind(self_name: SelfRef, ll: Int, lc: Int, k: ExprKind) : Bool = match k {
+  ECall(f, xs) ->
+    if is_self_callee(f, self_name) { pcs_pos_in_exprs(ll, lc, xs) }
+    else { pcs_pisc_kind(self_name, ll, lc, f.kind) or pcs_pisc_exprs(self_name, ll, lc, xs) }
+  EIf(c, t, oe)       -> pcs_pisc_kind(self_name, ll, lc, c.kind) or pcs_pisc_kind(self_name, ll, lc, t.kind) or
+                         (match oe { None -> false Some(e2) -> pcs_pisc_kind(self_name, ll, lc, e2.kind) })
+  EMatch(s, arms)     -> pcs_pisc_kind(self_name, ll, lc, s.kind) or pcs_pisc_arms(self_name, ll, lc, arms)
+  EBlock(stmts, tail) -> pcs_pisc_stmts(self_name, ll, lc, stmts) or
+                         (match tail { None -> false Some(e) -> pcs_pisc_kind(self_name, ll, lc, e.kind) })
+  EBinop(_, a, b)     -> pcs_pisc_kind(self_name, ll, lc, a.kind) or pcs_pisc_kind(self_name, ll, lc, b.kind)
+  EUnop(_, x)         -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  EField(x, _)        -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  EIndex(a, b)        -> pcs_pisc_kind(self_name, ll, lc, a.kind) or pcs_pisc_kind(self_name, ll, lc, b.kind)
+  ERecordLit(_, fis)  -> pcs_pisc_fields(self_name, ll, lc, fis)
+  EList(els)          -> pcs_pisc_elems(self_name, ll, lc, els)
+  EBang(x)            -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  ELitUnit(x, _)      -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+  _ -> false
+}
+
+# True iff `(ll, lc)` appears anywhere within `xs` (the self-call's args).
+fn pcs_pos_in_exprs(ll: Int, lc: Int, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_pos_in_expr(ll, lc, h) or pcs_pos_in_exprs(ll, lc, rest)
+}
+
+# A lambda body is a different frame: its reads are in_lam and never a
+# last-use candidate, so its positions stay invisible on purpose.
+fn pcs_pos_in_expr(ll: Int, lc: Int, e: Expr) : Bool =
+  (e.line == ll and e.col == lc) or pcs_pos_in_ps(ll, lc, xp_positions(e))
+
+fn pcs_pos_in_ps(ll: Int, lc: Int, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(r, c), ...rest] ->
+    (match r { XLam -> false _ -> pcs_pos_in_expr(ll, lc, c) }) or
+    pcs_pos_in_ps(ll, lc, rest)
+}
+
+fn pcs_pisc_exprs(self_name: SelfRef, ll: Int, lc: Int, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> pcs_pisc_kind(self_name, ll, lc, h.kind) or pcs_pisc_exprs(self_name, ll, lc, rest)
+}
+
+fn pcs_pisc_arms(self_name: SelfRef, ll: Int, lc: Int, arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [Arm(_, _, b), ...rest] -> pcs_pisc_kind(self_name, ll, lc, b.kind) or pcs_pisc_arms(self_name, ll, lc, rest)
+}
+
+fn pcs_pisc_stmts(self_name: SelfRef, ll: Int, lc: Int, stmts: [Stmt]) : Bool = match stmts {
+  []           -> false
+  [s, ...rest] -> {
+    let here = match s {
+      SLet(_, _, e)       -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      SVar(_, _, e, _, _) -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      SExprStmt(e)        -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      _ -> false
+    }
+    here or pcs_pisc_stmts(self_name, ll, lc, rest)
+  }
+}
+
+fn pcs_pisc_fields(self_name: SelfRef, ll: Int, lc: Int, fis: [FieldInit]) : Bool = match fis {
+  []           -> false
+  [FI(_, e), ...rest] -> pcs_pisc_kind(self_name, ll, lc, e.kind) or pcs_pisc_fields(self_name, ll, lc, rest)
+}
+
+fn pcs_pisc_elems(self_name: SelfRef, ll: Int, lc: Int, els: [ListElem]) : Bool = match els {
+  []           -> false
+  [h, ...rest] -> {
+    let inner = match h { ElPlain(e) -> e ElSpread(e) -> e }
+    pcs_pisc_kind(self_name, ll, lc, inner.kind) or pcs_pisc_elems(self_name, ll, lc, rest)
+  }
 }

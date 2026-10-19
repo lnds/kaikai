@@ -220,7 +220,7 @@ A third correction, from checking the model against the merged code
 rather than against the PR description: **there is no `tail` payer.**
 `PcsPayer` has six variants and none of them is one; a binder whose read
 is in the tail is still `PyExit`, and `ptd_needs_drop`
-(perceus_tail_drop.kai) asks the same `pcs_fate_of` while guarding with
+(perceus_exit_drops.kai) asks the same `pcs_fate_of` while guarding with
 `ptd_has_drop` so the drop is planted once. The tail is a different
 *site* for the same payer. This model had invented a separate `tail`
 payer, which would have reported the two as independent decisions.

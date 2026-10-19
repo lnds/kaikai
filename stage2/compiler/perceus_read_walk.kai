@@ -1,11 +1,5 @@
 #[doc("""
-Collects the read table of `compiler.perceus_reads` from a function body.
-
-Raw locals and `_` binders are not tracked. A read is raw where the payload
-is copied out of the box: a read the unbox pass marked raw, an operand of a
-raw operator or of an Int comparison, and an argument in a raw slot. Only
-the binders known to hold a box are flagged, a boxed param and a list
-element: a binder bound raw has none.
+Walking the reads of a name and classifying them by the edges between the scope root and each read.
 """)]
 
 import compiler.ast
@@ -17,17 +11,19 @@ import compiler.infer_apply
 import compiler.name_ix
 import compiler.int_cmp
 import compiler.perceus_reads
-import compiler.perceus_seg_request
+import compiler.perceus_exit_drops
+import compiler.self_call
+import compiler.perceus_arm
+import compiler.local_names
+import compiler.ast_map
 
 # Buckets of reads a collector fills, and what filling them performs.
 type UseAcc = Array[[Read]]
 type Collect = Console + Mutable
 
-#[doc("Every read of the binders in `scope`, and of every binder the body introduces, anywhere in `body`, indexed by binder.")]
-pub fn pcs_use_index(body: Expr, scope: [Binder]) : UseIx / Console = pcs_use_index_in(body, scope, [], prt_no_slots)
+pub(pkg) fn pcs_use_index(body: Expr, scope: [Binder]) : UseIx / Console = pcs_use_index_in(body, scope, [], prt_no_slots)
 
-#[doc("`pcs_use_index`, flagging the raw reads of the `boxed` binders: an operand of a raw operator or an argument in a slot `slots` names raw.")]
-pub fn pcs_use_index_in(body: Expr, scope: [Binder], boxed: [Binder], slots: (Expr) -> [Int]) : UseIx / Console =
+pub(pkg) fn pcs_use_index_in(body: Expr, scope: [Binder], boxed: [Binder], slots: (Expr) -> [Int]) : UseIx / Console =
   ni_wrap(prt_expr(body, scope, Prt { capt: [], in_lam: false, slots: slots, boxed: boxed, lent: [] }, ni_buckets()))
 
 fn prt_no_slots(f: Expr) : [Int] = []
@@ -183,3 +179,220 @@ fn prt_is_raw(e: Expr) : Bool = match e.mode {
   MUnboxed -> true
   _        -> false
 }
+
+# Reads of a name classified by the edges between the scope root and
+# each read: reads reachable without crossing a short-circuit edge land
+# in the first count (`XAll` chains and `XBr` alternatives — the
+# sibling-branch machinery can pay those), reads behind an `XSc`/`XMsg`
+# edge (an `and`/`or` RHS, an assert message — skippable with no
+# covering alternative) land in the second, and the flag marks reads
+# the walk cannot attribute to a path at all (deferred `XLam`/`XCl`
+# bodies).
+type PcsRR = PRR(Int, Int, Bool)
+
+fn pcs_rr_merge(a: PcsRR, b: PcsRR) : PcsRR = match a {
+  PRR(a1, b1, k1) -> match b { PRR(a2, b2, k2) -> PRR(a1 + a2, b1 + b2, k1 or k2) }
+}
+
+fn pcs_read_roles(nm: Binder, e: Expr, in_sc: Bool) : PcsRR = match e.kind {
+  ELocal(u) -> if local_eq(u, nm.id) {
+                 if in_sc { PRR(0, 1, false) } else { PRR(1, 0, false) }
+               } else { PRR(0, 0, false) }
+  _ -> pcs_read_roles_ps(nm, xp_positions(e), in_sc)
+}
+
+fn pcs_read_roles_ps(nm: Binder, ps: [XPos], in_sc: Bool) : PcsRR = match ps {
+  []                  -> PRR(0, 0, false)
+  [XP(r, c), ...rest] -> {
+    let here = match r {
+      XAll -> pcs_read_roles(nm, c, in_sc)
+      XBr  -> pcs_read_roles(nm, c, in_sc)
+      XSc  -> pcs_read_roles(nm, c, true)
+      XMsg -> pcs_read_roles(nm, c, true)
+      XLam -> pcs_read_roles_deferred(nm, c)
+      XCl  -> pcs_read_roles_deferred(nm, c)
+    }
+    pcs_rr_merge(here, pcs_read_roles_ps(nm, rest, in_sc))
+  }
+}
+
+fn pcs_read_roles_deferred(nm: Binder, e: Expr) : PcsRR =
+  match pcs_read_roles(nm, e, false) {
+    PRR(a, b, k) -> if a + b > 0 or k { PRR(0, 0, true) } else { PRR(0, 0, false) }
+  }
+
+pub(pkg) fn pcs_branchy_arm_binders(e: Expr, fn_name: SelfRef, uses: UseIx, skip: [Binder],
+                           acc: [Binder]) : [Binder] = match e.kind {
+  EMatch(s, arms) ->
+    pcs_bab_arms(arms, fn_name, uses, skip, pcs_branchy_arm_binders(s, fn_name, uses, skip, acc))
+  _ -> pcs_bab_ps(xp_positions(e), fn_name, uses, skip, acc)
+}
+
+fn pcs_bab_ps(ps: [XPos], fn_name: SelfRef, uses: UseIx, skip: [Binder], acc: [Binder]) : [Binder] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> {
+    let acc1 = if xrole_inline(r) { pcs_branchy_arm_binders(c, fn_name, uses, skip, acc) }
+               else { acc }
+    pcs_bab_ps(rest, fn_name, uses, skip, acc1)
+  }
+}
+
+fn pcs_bab_arms(arms: [Arm], fn_name: SelfRef, uses: UseIx, skip: [Binder], acc: [Binder]) : [Binder] = match arms {
+  []           -> acc
+  [Arm(pat, og, b), ...rest] -> {
+    let acc1 = pcs_bab_binders(prc_pat_bindings(pat, []), og, b, fn_name, uses, skip, acc)
+    let acc2 = match og {
+      None    -> acc1
+      Some(g) -> pcs_branchy_arm_binders(g, fn_name, uses, skip, acc1)
+    }
+    pcs_bab_arms(rest, fn_name, uses, skip, pcs_branchy_arm_binders(b, fn_name, uses, skip, acc2))
+  }
+}
+
+fn pcs_bab_binders(bound: [Binder], og: Option[Expr], b: Expr, fn_name: SelfRef,
+                   uses: UseIx, skip: [Binder], acc: [Binder]) : [Binder] = match bound {
+  []            -> acc
+  [nm, ...rest] -> {
+    let acc1 = if pcs_bab_qualifies(nm, og, b, fn_name, uses, skip) { [nm, ...acc] } else { acc }
+    pcs_bab_binders(rest, og, b, fn_name, uses, skip, acc1)
+  }
+}
+
+fn pcs_bab_qualifies(nm: Binder, og: Option[Expr], b: Expr, fn_name: SelfRef,
+                     uses: UseIx, skip: [Binder]) : Bool =
+  if pcs_has(skip, nm.id) or not pcs_read_once(nm.id, uses) { false }
+  else {
+    let g_roles = pcs_guard_roles(nm, og)
+    let b_roles = pcs_read_roles(nm, b, false)
+    pcs_rr_one_skippable(pcs_rr_merge(g_roles, b_roles)) and pcs_bab_body_paid(b_roles, b, fn_name)
+  }
+
+fn pcs_guard_roles(nm: Binder, og: Option[Expr]) : PcsRR = match og {
+  None    -> PRR(0, 0, false)
+  Some(g) -> pcs_read_roles(nm, g, false)
+}
+
+# The one read sits behind a short-circuit edge and the walk attributed it.
+fn pcs_rr_one_skippable(r: PcsRR) : Bool = match r {
+  PRR(a, brc, blocked) -> a == 0 and brc == 1 and not blocked
+}
+
+# A guard read pays through the guard-fail drop plus the body drop. A
+# body read is forced only when every tail leaf is a self-call, where
+# the goto ledger pays it.
+fn pcs_bab_body_paid(b_roles: PcsRR, b: Expr, fn_name: SelfRef) : Bool = match b_roles {
+  PRR(_, bb, _) -> bb == 0 or (pcs_is_self_tail_call(b, fn_name) and pcs_bab_all_leaves_self(b, fn_name))
+}
+
+fn pcs_bab_all_leaves_self(e: Expr, fn_name: SelfRef) : Bool = match e.kind {
+  EIf(_, t, oe)   -> pcs_bab_all_leaves_self(t, fn_name) and
+                     (match oe { None -> false Some(e2) -> pcs_bab_all_leaves_self(e2, fn_name) })
+  EMatch(_, arms) -> pcs_bab_leaves_arms(arms, fn_name)
+  EBlock(_, ot)   -> match ot { None -> false Some(t) -> pcs_bab_all_leaves_self(t, fn_name) }
+  ECall(f, _)     -> is_self_callee(f, fn_name)
+  _               -> false
+}
+
+fn pcs_bab_leaves_arms(arms: [Arm], fn_name: SelfRef) : Bool = match arms {
+  []                      -> true
+  [Arm(_, _, b), ...rest] -> pcs_bab_all_leaves_self(b, fn_name) and pcs_bab_leaves_arms(rest, fn_name)
+}
+
+pub(pkg) fn pcs_branchy_let_binders(body: Expr, fn_name: SelfRef, uses: UseIx,
+                           skip: [Binder]) : [Binder] =
+  pcs_blb_expr(body, body, fn_name, uses, skip, [])
+
+fn pcs_blb_expr(e: Expr, body: Expr, fn_name: SelfRef, uses: UseIx,
+                skip: [Binder], acc: [Binder]) : [Binder] = {
+  let acc1 = match e.kind {
+    EBlock(ss, ot) -> pcs_blb_scan(ss, ot, body, fn_name, uses, skip, acc)
+    _              -> acc
+  }
+  pcs_blb_ps(xp_positions(e), body, fn_name, uses, skip, acc1)
+}
+
+fn pcs_blb_ps(ps: [XPos], body: Expr, fn_name: SelfRef, uses: UseIx,
+              skip: [Binder], acc: [Binder]) : [Binder] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> {
+    let acc1 = if xrole_inline(r) { pcs_blb_expr(c, body, fn_name, uses, skip, acc) }
+               else { acc }
+    pcs_blb_ps(rest, body, fn_name, uses, skip, acc1)
+  }
+}
+
+fn pcs_blb_scan(ss: [Stmt], ot: Option[Expr], body: Expr, fn_name: SelfRef,
+                uses: UseIx, skip: [Binder], acc: [Binder]) : [Binder] = match ss {
+  []           -> acc
+  [s, ...rest] -> {
+    let acc1 = match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(nm) ->
+          if pcs_blb_qualifies(nm, pat, rhs, rest, ot, body, fn_name, uses, skip) {
+            [nm, ...acc]
+          } else { acc }
+        _ -> acc
+      }
+      _ -> acc
+    }
+    pcs_blb_scan(rest, ot, body, fn_name, uses, skip, acc1)
+  }
+}
+
+fn pcs_blb_qualifies(nm: Binder, pat: Pattern, rhs: Expr, rest: [Stmt],
+                     ot: Option[Expr], body: Expr, fn_name: SelfRef,
+                     uses: UseIx, skip: [Binder]) : Bool =
+  pcs_blb_candidate(nm, pat, rhs, uses, skip) and
+  pcs_rr_one_skippable(pcs_read_roles(nm, mk_expr(EBlock(rest, ot), pat.line, pat.col), false)) and
+  pcs_blb_payer_ok(nm, ot, fn_name)
+
+fn pcs_blb_candidate(nm: Binder, pat: Pattern, rhs: Expr, uses: UseIx, skip: [Binder]) : Bool =
+  not pcs_has(skip, nm.id) and pcs_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm.id) and
+  pcs_read_once(nm.id, uses)
+
+fn pcs_blb_payer_ok(nm: Binder, ot: Option[Expr], fn_name: SelfRef) : Bool = match ot {
+  None    -> true
+  Some(t) -> match pcs_read_roles(nm, t, false) {
+    PRR(_, tb, _) -> tb == 0 or not ppd_has_self_call(t, fn_name)
+  }
+}
+
+pub(pkg) fn reuse_gc_uses(ns: LocalNames, cargs: [Expr], gc: [LocalId]) : [LocalId] / Console = match gc {
+  [] -> []
+  _  -> ru_exprs(cargs, gc, map(gc, (l) => Binder { id: l, name: ln_text(ns, l) }), [])
+}
+
+pub(pkg) fn reuse_taken_uses(ns: LocalNames, cargs: [Expr], gc: [LocalId]) : [LocalId] / Console =
+  reuse_gc_uses(ns, map(cargs, reuse_unlent), gc)
+
+fn reuse_unlent(e: Expr) : Expr = match e.kind {
+  ECall(f, _) -> match f.kind {
+    EMark(MkBorrow) -> Expr { ...e, kind: EUnit }
+    _               -> ru_map(e)
+  }
+  _ -> ru_map(e)
+}
+
+fn ru_map(e: Expr) : Expr = Expr { ...e, kind: prc_map_expr_kind(e.kind, reuse_unlent) }
+
+fn ru_exprs(es: [Expr], gc: [LocalId], scope: [Binder], acc: [LocalId]) : [LocalId] / Console = match es {
+  []           -> acc
+  [e, ...rest] -> {
+    let ix = pcs_use_index(e, scope)
+    ru_exprs(rest, gc, scope, ru_names(gc, ix, acc))
+  }
+}
+
+# The collector grows its scope with lambda params, so it indexes their
+# reads too: only the donor binders' reads count, one entry per read.
+fn ru_names(gc: [LocalId], ix: UseIx, acc: [LocalId]) : [LocalId] = match gc {
+  []           -> acc
+  [g, ...rest] -> ru_names(rest, ix, ru_reads_of(g, ni_bucket_id(ix, local_raw(g)), acc))
+}
+
+fn ru_reads_of(g: LocalId, us: [Read], acc: [LocalId]) : [LocalId] = match us {
+  [] -> acc
+  [Rd(l, _, _, _, _), ...rest] -> ru_reads_of(g, rest, if local_eq(l, g) { [g, ...acc] } else { acc })
+}
+
+pub(pkg) fn reuse_taken_binders(gc: [LocalId], uses: [LocalId]) : [LocalId] = filter(gc, (n) => any(uses, (u) => local_eq(u, n)))

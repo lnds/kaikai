@@ -1,0 +1,580 @@
+#[doc("""
+Binders lent to a call in a borrowed slot: the order in which paths lend and hand over, tail lending, raw slots and rethreading.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.perceus_reads
+import compiler.ast_map
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_apply
+import compiler.modules_binders
+import compiler.self_call
+import compiler.fnreg
+import compiler.fn_index
+import compiler.perceus_payer
+import compiler.infer_apply.{list_has_int}
+import compiler.core_builtins
+import compiler.kinds
+
+# No path has handed the binder over, every path has, only some have, or
+# some path reads it after the hand-over.
+type Lo = LoHeld | LoGone | LoSome | LoLate
+
+type PloCx = { uses: UseIx, skip: [Binder], moves: (Binder, Expr) -> Bool }
+
+pub(pkg) fn plo_moves_after_lends(nm: Binder, e: Expr, lent: (Expr) -> [Int]) : Bool = match plo_expr(nm, e, lent) {
+  LoGone -> true
+  _      -> false
+}
+
+pub(pkg) fn plo_lend_move_lets(body: Expr, uses: UseIx, skip: [Binder], moves: (Binder, Expr) -> Bool) : [Binder] =
+  plo_lets(body, PloCx { uses: uses, skip: skip, moves: moves }, [])
+
+fn plo_expr(nm: Binder, e: Expr, lent: (Expr) -> [Int]) : Lo =
+  if pcs_is_bare(nm.id, e) { LoGone } else { plo_inner(nm, e, lent) }
+
+fn plo_inner(nm: Binder, e: Expr, lent: (Expr) -> [Int]) : Lo = match e.kind {
+  ECall(f, xs)    -> plo_call(nm, f, xs, lent, plo_args(nm, xs, lent, plo_expr(nm, f, lent)))
+  EIf(c, t, oe)   -> plo_if(nm, t, oe, lent, plo_expr(nm, c, lent))
+  EMatch(s, arms) -> plo_arms(nm, arms, lent, plo_expr(nm, s, lent))
+  _               -> plo_ps(nm, xp_positions(e), lent, LoHeld)
+}
+
+# `before` is the state once the callee and the compound arguments ran. The
+# callee's slots are looked up only for a call that takes `nm` bare.
+fn plo_call(nm: Binder, f: Expr, xs: [Expr], lent: (Expr) -> [Int], before: Lo) : Lo = {
+  if pcs_any_arg_bare(nm.id, xs) { plo_handed(nm, xs, lent(f), before) } else { before }
+}
+
+# A call that takes `nm` bare after it was handed over reads it late; so does
+# one that both owns and borrows it, or owns it twice.
+fn plo_handed(nm: Binder, xs: [Expr], slots: [Int], before: Lo) : Lo = match before {
+  LoHeld -> match plo_bare(nm, xs, slots, 0, false) {
+    0 -> LoHeld
+    1 -> if plo_bare(nm, xs, slots, 0, true) == 0 { LoGone } else { LoLate }
+    _ -> LoLate
+  }
+  _ -> LoLate
+}
+
+fn plo_args(nm: Binder, xs: [Expr], lent: (Expr) -> [Int], st: Lo) : Lo = match xs {
+  []           -> st
+  [x, ...rest] -> plo_args(nm, rest, lent, if plo_is_bare(nm, x) { st } else { plo_then(st, nm, x, lent) })
+}
+
+# The bare reads of `nm` among `xs` that sit in a borrowed slot (`want`) or outside one.
+fn plo_bare(nm: Binder, xs: [Expr], slots: [Int], i: Int, want: Bool) : Int = match xs {
+  []           -> 0
+  [x, ...rest] ->
+    (if plo_is_bare(nm, x) and contains(slots, i) == want { 1 } else { 0 }) + plo_bare(nm, rest, slots, i + 1, want)
+}
+
+# A unit coercion is identity at runtime, so the callee takes the binder itself.
+fn plo_is_bare(nm: Binder, x: Expr) : Bool = pcs_is_bare(nm.id, prc_peel_unit(x))
+
+fn plo_then(st: Lo, nm: Binder, c: Expr, lent: (Expr) -> [Int]) : Lo = match st {
+  LoHeld -> plo_expr(nm, c, lent)
+  LoLate -> LoLate
+  _      -> if pcs_mentions(nm, c) { LoLate } else { st }
+}
+
+fn plo_join(a: Lo, b: Lo) : Lo = match a {
+  LoLate -> LoLate
+  LoHeld -> match b {
+    LoHeld -> LoHeld
+    LoLate -> LoLate
+    _      -> LoSome
+  }
+  LoGone -> match b {
+    LoGone -> LoGone
+    LoLate -> LoLate
+    _      -> LoSome
+  }
+  LoSome -> match b {
+    LoLate -> LoLate
+    _      -> LoSome
+  }
+}
+
+# A missing `else` is a path that reads nothing.
+fn plo_if(nm: Binder, t: Expr, oe: Option[Expr], lent: (Expr) -> [Int], pre: Lo) : Lo =
+  plo_join(plo_then(pre, nm, t, lent), match oe {
+    Some(e) -> plo_then(pre, nm, e, lent)
+    None    -> pre
+  })
+
+# A position some path skips with no alternative covering it joins with the
+# state it started from; a deferred body runs at a time this walk cannot place.
+fn plo_ps(nm: Binder, ps: [XPos], lent: (Expr) -> [Int], st: Lo) : Lo = match ps {
+  []                  -> st
+  [XP(r, c), ...rest] -> plo_ps(nm, rest, lent, match r {
+    XAll -> plo_then(st, nm, c, lent)
+    XLam -> plo_deferred(st, nm, c)
+    XCl  -> plo_deferred(st, nm, c)
+    _    -> plo_join(st, plo_then(st, nm, c, lent))
+  })
+}
+
+fn plo_deferred(st: Lo, nm: Binder, c: Expr) : Lo = if pcs_mentions(nm, c) { LoLate } else { st }
+
+fn plo_arms(nm: Binder, arms: [Arm], lent: (Expr) -> [Int], pre: Lo) : Lo = match arms {
+  []                       -> pre
+  [Arm(_, og, b)]          -> plo_then(plo_guard(pre, nm, og, lent), nm, b, lent)
+  [Arm(_, og, b), ...rest] ->
+    plo_join(plo_then(plo_guard(pre, nm, og, lent), nm, b, lent), plo_arms(nm, rest, lent, pre))
+}
+
+# A guard that fails falls through to the later arms, so it may only lend.
+fn plo_guard(pre: Lo, nm: Binder, og: Option[Expr], lent: (Expr) -> [Int]) : Lo = match og {
+  None    -> pre
+  Some(g) -> match pre {
+    LoHeld -> match plo_expr(nm, g, lent) {
+      LoHeld -> LoHeld
+      _      -> LoLate
+    }
+    _ -> plo_then(pre, nm, g, lent)
+  }
+}
+
+# Blocks reached through statements, branches and arms; a block nested in
+# any other position keeps its `let`s as they were.
+fn plo_lets(e: Expr, cx: PloCx, acc: [Binder]) : [Binder] = match e.kind {
+  EBlock(ss, ot)  -> plo_scan(ss, ot, cx, acc)
+  EIf(c, t, oe)   -> plo_lets_opt(oe, cx, plo_lets(t, cx, plo_lets(c, cx, acc)))
+  EMatch(s, arms) -> plo_lets_arms(arms, cx, plo_lets(s, cx, acc))
+  _               -> acc
+}
+
+fn plo_lets_opt(oe: Option[Expr], cx: PloCx, acc: [Binder]) : [Binder] = match oe {
+  Some(e) -> plo_lets(e, cx, acc)
+  None    -> acc
+}
+
+fn plo_lets_arms(arms: [Arm], cx: PloCx, acc: [Binder]) : [Binder] = match arms {
+  []                      -> acc
+  [Arm(_, _, b), ...rest] -> plo_lets_arms(rest, cx, plo_lets(b, cx, acc))
+}
+
+fn plo_scan(ss: [Stmt], ot: Option[Expr], cx: PloCx, acc: [Binder]) : [Binder] = match ss {
+  []           -> plo_lets_opt(ot, cx, acc)
+  [s, ...rest] -> plo_scan(rest, ot, cx, match s {
+    SLet(pat, _, rhs) -> plo_let(pat, rhs, rest, ot, cx, plo_lets(rhs, cx, acc))
+    _                 -> acc
+  })
+}
+
+# The scope is built only for a binder the read table leaves in question.
+fn plo_let(pat: Pattern, rhs: Expr, rest: [Stmt], ot: Option[Expr], cx: PloCx, acc: [Binder]) : [Binder] = match pat.pkind {
+  PBind(nm) ->
+    if plo_candidate(nm, pat, rhs, cx) and cx.moves(nm, mk_expr(EBlock(rest, ot), pat.line, pat.col)) { [nm, ...acc] }
+    else { acc }
+  _ -> acc
+}
+
+# A raw `let` carries no reference to hand over.
+fn plo_candidate(nm: Binder, pat: Pattern, rhs: Expr, cx: PloCx) : Bool =
+  pcs_read_count(nm.id, cx.uses) >= 2 and not pcs_uses_have_in_lam(cx.uses, nm.id) and
+  not pcs_has(cx.skip, nm.id) and pcs_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm.id)
+
+# A match-arm binder read in a borrowed parameter slot is lent to that call,
+# not handed over.
+#
+# The arm's bind dups every pointer child, and when the function's own tail
+# call becomes the loop back-edge, the goto ledger must release that dup. It
+# judges consumption syntactically, so a bare read in a call argument looked
+# like a move and the dup survived: a borrowed descent kept all of its
+# structure but the head alive, and a binder the arm also inspected through a
+# borrowing callee kept one reference per step. Marking the read
+# `__perceus_borrow` tells the ledger the call does not consume the binder;
+# both backends emit the wrapped read unchanged.
+#
+# The back-edge is stricter. There the read becomes the next step's borrowed
+# parameter, so it must stay alive after the goto releases the dup: only a
+# child of a borrowed scrutinee is marked, whose parent the caller keeps
+# alive for the whole loop, and one level down the children of a match over
+# such a child. A child of an OWNED scrutinee keeps its dup: the goto
+# releases that parent too, and the dup is then the child's only reference.
+#
+
+
+pub(pkg) fn plt_lend_binders(e: Expr, self_name: SelfRef, bpos: [Int], borrowed: [Binder],
+                        slots: (Expr) -> [Int]) : Expr = {
+  let cx = PltCx { self_name: self_name, bpos: bpos, borrowed: borrowed, slots: slots }
+  let sc = PltScope { bound: [], lent: [] }
+  if plt_has_back_edge(e, self_name) { plt_expr(e, cx, sc, true) } else { plt_rebuilds(e, cx, sc) }
+}
+
+# Without a back-edge only a reuse rebuild reads the marks: on a shared
+# donor the native rebuild gives a kept child one reference per use, and a
+# borrowed read takes none.
+fn plt_rebuilds(e: Expr, cx: PltCx, sc: PltScope) : Expr =
+  Expr { kind: plt_rebuilds_kind(e.kind, cx, sc), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn plt_rebuilds_kind(k: ExprKind, cx: PltCx, sc: PltScope) : ExprKind = match k {
+  EMatch(s, arms)       -> EMatch(plt_rebuilds(s, cx, sc), map(arms, (a) => plt_rebuild_arm(a, cx, sc)))
+  ECall(f, [scr, rb])   ->
+    if plt_is_reuse(f) { ECall(f, [scr, plt_expr(rb, cx, sc, false)]) }
+    else { prc_map_expr_kind(k, (x) => plt_rebuilds(x, cx, sc)) }
+  ELambda(_, _)         -> k
+  _                     -> prc_map_expr_kind(k, (x) => plt_rebuilds(x, cx, sc))
+}
+
+fn plt_rebuild_arm(a: Arm, cx: PltCx, sc: PltScope) : Arm = match a {
+  Arm(p, g, b) -> {
+    let sc1 = PltScope { bound: pat_binders(p, sc.bound), lent: sc.lent }
+    Arm(p, g, plt_rebuilds(b, cx, sc1))
+  }
+}
+
+fn plt_is_reuse(f: Expr) : Bool = match f.kind {
+  EMark(MkReuseVariant) -> true
+  EMark(MkReuseCons)    -> true
+  _                     -> false
+}
+
+# Only a goto ledger reads the marks, and only a tail self-call becomes a goto.
+fn plt_has_back_edge(e: Expr, self_name: SelfRef) : Bool = match e.kind {
+  ECall(f, _)     -> plt_is_self(f, self_name)
+  EMatch(_, arms) -> plt_arms_back_edge(arms, self_name)
+  EIf(_, t, oe)   -> plt_has_back_edge(t, self_name) or plt_opt_back_edge(oe, self_name)
+  EBlock(_, bt)   -> plt_opt_back_edge(bt, self_name)
+  _               -> false
+}
+
+fn plt_arms_back_edge(arms: [Arm], self_name: SelfRef) : Bool = match arms {
+  []                  -> false
+  [Arm(_, _, b), ...rest] -> plt_has_back_edge(b, self_name) or plt_arms_back_edge(rest, self_name)
+}
+
+fn plt_opt_back_edge(oe: Option[Expr], self_name: SelfRef) : Bool = match oe {
+  None    -> false
+  Some(x) -> plt_has_back_edge(x, self_name)
+}
+
+type PltCx = { self_name: SelfRef, bpos: [Int], borrowed: [Binder], slots: (Expr) -> [Int] }
+
+# `bound`: the arm binders in scope; `lent`: those whose parent outlives the loop.
+type PltScope = { bound: [Binder], lent: [Binder] }
+
+fn plt_expr(e: Expr, cx: PltCx, sc: PltScope, tail: Bool) : Expr =
+  Expr { kind: plt_kind(e.kind, cx, sc, tail), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn plt_kind(k: ExprKind, cx: PltCx, sc: PltScope, tail: Bool) : ExprKind = match k {
+  EMatch(s, arms)     -> {
+    let lends = plt_scrut_lends(s, cx.borrowed, sc.lent)
+    EMatch(plt_expr(s, cx, sc, false), map(arms, (a) => plt_arm(a, lends, cx, sc, tail)))
+  }
+  EIf(c, t, oe)       ->
+    EIf(plt_expr(c, cx, sc, false), plt_expr(t, cx, sc, tail),
+        prc_map_opt_expr(oe, (x) => plt_expr(x, cx, sc, tail)))
+  EBlock(stmts, bt)   ->
+    EBlock(map(stmts, (s) => prc_map_stmt_exprs(s, (x) => plt_expr(x, cx, sc, false))),
+           prc_map_opt_expr(bt, (x) => plt_expr(x, cx, sc, tail)))
+  ECall(f, xs)        -> ECall(f, plt_call_args(f, xs, cx, sc, tail))
+  ELambda(_, _)       -> k
+  _                   -> prc_map_expr_kind(k, (x) => plt_expr(x, cx, sc, false))
+}
+
+fn plt_arm(a: Arm, lends: Bool, cx: PltCx, sc: PltScope, tail: Bool) : Arm = match a {
+  Arm(p, g, b) -> {
+    let sc1 = PltScope { bound: pat_binders(p, sc.bound),
+                         lent: if lends { pat_binders(p, sc.lent) } else { sc.lent } }
+    Arm(p, prc_map_opt_expr(g, (x) => plt_expr(x, cx, sc1, false)), plt_expr(b, cx, sc1, tail))
+  }
+}
+
+# A scrutinee lends its children when it reads a borrowed param (bare or
+# already wrapped by the callee flip) or a child that is itself lent.
+fn plt_scrut_lends(s: Expr, borrowed: [Binder], lent: [Binder]) : Bool = match s.kind {
+  ELocal(l)   -> pcs_has(borrowed, l) or pcs_has(lent, l)
+  ECall(f, _) -> match f.kind { EMark(MkBorrow) -> true  _ -> false }
+  _           -> false
+}
+
+# Only the back-edge takes over a `__perceus_owned_borrow` read: a plain call
+# drops that ref itself after returning. The slot lookup runs only for a call
+# that passes a tracked binder.
+fn plt_call_args(f: Expr, xs: [Expr], cx: PltCx, sc: PltScope, tail: Bool) : [Expr] = {
+  let xs1 = map(xs, (x) => plt_expr(x, cx, sc, false))
+  let back_edge = tail and plt_is_self(f, cx.self_name)
+  let names = if back_edge { sc.lent } else { sc.bound }
+  if plt_any_named(xs1, names, back_edge) {
+    plt_args(xs1, if back_edge { cx.bpos } else { (cx.slots)(f) }, names, back_edge, 0)
+  } else { xs1 }
+}
+
+fn plt_any_named(xs: [Expr], names: [Binder], back_edge: Bool) : Bool = match xs {
+  []           -> false
+  [a, ...rest] -> plt_names(a, names, back_edge) or plt_any_named(rest, names, back_edge)
+}
+
+fn plt_names(a: Expr, names: [Binder], back_edge: Bool) : Bool = match plt_read(a, back_edge).kind {
+  ELocal(l) -> pcs_has(names, l)
+  _         -> false
+}
+
+# The read an argument makes: on the back-edge, under its owned-borrow mark.
+fn plt_read(a: Expr, back_edge: Bool) : Expr = if back_edge { plt_owned_inner(a) } else { a }
+
+fn plt_is_self(f: Expr, self_name: SelfRef) : Bool = is_self_callee(f, self_name)
+
+fn plt_args(xs: [Expr], pos: [Int], names: [Binder], back_edge: Bool, i: Int) : [Expr] = match xs {
+  []           -> []
+  [a, ...rest] -> {
+    let a1 = if list_has_int(pos, i) { plt_arg(a, names, back_edge) } else { a }
+    [a1, ...plt_args(rest, pos, names, back_edge, i + 1)]
+  }
+}
+
+fn plt_arg(a: Expr, names: [Binder], back_edge: Bool) : Expr =
+  if plt_names(a, names, back_edge) { plt_borrow(plt_read(a, back_edge)) } else { a }
+
+fn plt_owned_inner(a: Expr) : Expr = match a.kind {
+  ECall(f, [x]) -> match f.kind { EMark(MkOwnedBorrow) -> x  _ -> a }
+  _             -> a
+}
+
+fn plt_borrow(a: Expr) : Expr =
+  Expr { kind: ECall(Expr { kind: EMark(MkBorrow), line: a.line, col: a.col, ty: None, mode: MUnknown,  site: a.site }, [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode , site: 0 }
+
+pub(pkg) fn prs_raw_arg_positions(callee: Expr, fns: FnIndex) : [Int] = match prs_callee_sig(callee, fns) {
+  Some(US(_, _, mask)) -> prs_set_positions(mask, 0)
+  None                 -> []
+}
+
+fn prs_ty_is_heap_scalar(t: Ty) : Bool = match t {
+  TyInt    -> true
+  TyReal   -> true
+  TyChar   -> true
+  TyInt32  -> true
+  TyUInt32 -> true
+  TyUInt64 -> true
+  TyInt128 -> true
+  TyDimT(inner, _)    -> prs_ty_is_heap_scalar(inner)
+  TyRefineT(inner, _) -> prs_ty_is_heap_scalar(inner)
+  _ -> false
+}
+
+# Resolved the way the unbox pass classifies a UFn call, so both agree on
+# which argument slots are raw.
+fn prs_callee_sig(callee: Expr, fns: FnIndex) : Option[UFnSig] = fnx_callee_sig(fns, callee)
+
+fn prs_set_positions(mask: [Bool], i: Int) : [Int] = match mask {
+  []           -> []
+  [m, ...rest] -> if m { [i, ...prs_set_positions(rest, i + 1)] } else { prs_set_positions(rest, i + 1) }
+}
+
+pub(pkg) fn prs_wrap_owned_borrow(a: Expr) : Expr =
+  Expr { kind: ECall(
+           Expr { kind: EMark(MkOwnedBorrow), line: a.line, col: a.col,
+                  ty: None, mode: MUnknown,  site: a.site },
+           [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode , site: 0 }
+
+pub(pkg) fn prs_mark_raw_moves(args_: [Expr], raws: [Int], no_wrap: [Binder], uses: UseIx) : [Expr] =
+  prs_mark_raw_go(args_, raws, 0, no_wrap, uses)
+
+fn prs_mark_raw_go(args_: [Expr], raws: [Int], i: Int, no_wrap: [Binder], uses: UseIx) : [Expr] = match args_ {
+  []           -> []
+  [a, ...rest] -> {
+    let a2 = if prs_has_pos(raws, i) and prs_is_raw_move(a, no_wrap, uses) { prs_wrap_owned_borrow(a) } else { a }
+    [a2, ...prs_mark_raw_go(rest, raws, i + 1, no_wrap, uses)]
+  }
+}
+
+# The read hands its reference on: a tracked, single-use, boxed read of a
+# binder whose box may be a heap cell. A raw read hands on no box.
+fn prs_is_raw_move(a: Expr, no_wrap: [Binder], uses: UseIx) : Bool = match a.kind {
+  ELocal(l) -> not prs_read_is_raw(a) and not pcs_has(no_wrap, l) and
+               pcs_fate_transfers(pcs_fate_of(l, uses, false, false)) and
+               prs_opt_ty_is_heap_scalar(a.ty)
+  _         -> false
+}
+
+fn prs_read_is_raw(a: Expr) : Bool = match a.mode { MUnboxed -> true _ -> false }
+
+fn prs_opt_ty_is_heap_scalar(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> prs_ty_is_heap_scalar(t)
+  None    -> false
+}
+
+fn prs_has_pos(xs: [Int], i: Int) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> x == i or prs_has_pos(rest, i)
+}
+
+pub(pkg) fn prt_borrow_only_binders(body: Expr, borrowed: [Binder], slots: (Expr) -> [Int]) : [Binder] =
+  prt_walk(body, borrowed, slots, [])
+
+fn prt_walk(e: Expr, borrowed: [Binder], slots: (Expr) -> [Int], acc: [Binder]) : [Binder] = {
+  let here = match e.kind {
+    EMatch(s, arms) -> if prt_scr_is_param(s, borrowed) { prt_arms(arms, slots, acc) } else { acc }
+    _               -> acc
+  }
+  prt_walk_ps(xp_positions(e), borrowed, slots, here)
+}
+
+fn prt_walk_ps(ps: [XPos], borrowed: [Binder], slots: (Expr) -> [Int], acc: [Binder]) : [Binder] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> prt_walk_ps(rest, borrowed, slots, prt_walk(c, borrowed, slots, acc))
+}
+
+pub(pkg) fn prt_scr_is_param(s: Expr, borrowed: [Binder]) : Bool = match s.kind {
+  ELocal(l) -> pcs_has(borrowed, l)
+  _         -> false
+}
+
+fn prt_arms(arms: [Arm], slots: (Expr) -> [Int], acc: [Binder]) : [Binder] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(pat, opt_g, body) -> prt_arms(rest, slots, list_append(acc, prt_arm_borrow_only(pat, opt_g, body, slots)))
+  }
+}
+
+pub(pkg) fn prt_arm_borrow_only(pat: Pattern, opt_g: Option[Expr], body: Expr, slots: (Expr) -> [Int]) : [Binder] =
+  filter(prt_projected(pat, []), (nm) => prt_qualifies(nm, opt_g, body, slots))
+
+fn prt_qualifies(nm: Binder, opt_g: Option[Expr], body: Expr, slots: (Expr) -> [Int]) : Bool = {
+  let in_guard = match opt_g { Some(g) -> prt_mentions(nm, g) > 0  None -> false }
+  let borrows = prt_borrows(nm.id, body, slots)
+  not in_guard and borrows > 0 and borrows == prt_mentions(nm, body)
+}
+
+# Binders a variant or list pattern projects, through nested variant and
+# list sub-patterns only.
+fn prt_projected(p: Pattern, acc: [Binder]) : [Binder] = match p.pkind {
+  PVariant(_, subs) -> prt_subs(subs, acc)
+  PList(subs, _)    -> prt_subs(subs, acc)
+  _                 -> acc
+}
+
+fn prt_subs(subs: [Pattern], acc: [Binder]) : [Binder] = match subs {
+  []           -> acc
+  [p, ...rest] -> prt_subs(rest, match p.pkind {
+    PBind(b) -> [b, ...acc]
+    _        -> prt_projected(p, acc)
+  })
+}
+
+# Reads of `nm` that are a whole argument in a borrowed slot and carry a
+# reference-counted type.
+fn prt_borrows(nm: LocalId, e: Expr, slots: (Expr) -> [Int]) : Int = match e.kind {
+  ECall(f, xs) -> {
+    let here = match f.kind {
+      ESym(_, _) -> prt_borrowed_args(nm, xs, slots(f), 0)
+      ELocal(_)  -> prt_borrowed_args(nm, xs, slots(f), 0)
+      EOp(_)     -> prt_borrowed_args(nm, xs, slots(f), 0)
+      _          -> 0
+    }
+    here + prt_borrows_ps(nm, xp_positions(e), slots)
+  }
+  _ -> prt_borrows_ps(nm, xp_positions(e), slots)
+}
+
+fn prt_borrows_ps(nm: LocalId, ps: [XPos], slots: (Expr) -> [Int]) : Int = match ps {
+  []                  -> 0
+  [XP(r, c), ...rest] ->
+    (if xrole_inline(r) { prt_borrows(nm, c, slots) } else { 0 }) + prt_borrows_ps(nm, rest, slots)
+}
+
+fn prt_borrowed_args(nm: LocalId, xs: [Expr], bpos: [Int], i: Int) : Int = match xs {
+  []           -> 0
+  [a, ...rest] -> {
+    let here = if prt_arg_reads(a, nm) and list_has_int(bpos, i) and prt_is_rc(a.ty) { 1 } else { 0 }
+    here + prt_borrowed_args(nm, rest, bpos, i + 1)
+  }
+}
+
+# The argument is `nm` read bare, or under a dup.
+fn prt_arg_reads(a: Expr, nm: LocalId) : Bool = match a.kind {
+  ELocal(u)    -> local_eq(u, nm)
+  ECall(f, xs) -> match xs {
+    [x] -> prt_is_dup(f) and prt_arg_reads(x, nm)
+    _   -> false
+  }
+  _ -> false
+}
+
+fn prt_is_dup(f: Expr) : Bool = match f.kind {
+  EMark(MkDup) -> true
+  _            -> false
+}
+
+fn prt_is_rc(ty: Option[Ty]) : Bool = match ty {
+  Some(t) -> not ty_is_unboxable_t(t)
+  None    -> false
+}
+
+# Every mention of `nm`: reads and lambda captures.
+fn prt_mentions(nm: Binder, e: Expr) : Int = match e.kind {
+  ELocal(u) -> if local_eq(u, nm.id) { 1 } else { 0 }
+  _         -> prt_mentions_ps(nm, xp_positions(e))
+}
+
+fn prt_mentions_ps(nm: Binder, ps: [XPos]) : Int = match ps {
+  []                  -> 0
+  [XP(_, c), ...rest] -> prt_mentions(nm, c) + prt_mentions_ps(nm, rest)
+}
+
+pub(pkg) fn prc_raw_param_names(fns: FnIndex, fid: FnId, params: [Param]) : [Binder] {
+  match fnx_decl_sig(fns, fid) {
+    Some(US(_, _, mask)) -> prc_raw_names_zip(params, mask)
+    None                 -> []
+  }
+}
+
+fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [Binder] = match params {
+  [] -> []
+  [p, ...prest] -> match mask {
+    [] -> []
+    [m, ...mrest] ->
+      if m { [p.binder, ...prc_raw_names_zip(prest, mrest)] }
+      else { prc_raw_names_zip(prest, mrest) }
+  }
+}
+
+pub(pkg) fn pcs_callee_is_ref(f: Expr) : Bool = match f.kind {
+  ESym(_, _) -> true
+  ELocal(_)  -> true
+  EOp(_)     -> true
+  _          -> false
+}
+
+pub(pkg) fn pcs_arg_is_owned_rvalue(a: Expr) : Bool = match a.kind {
+  ELambda(_, _) -> true
+  ECall(callee, _) ->
+    if pcs_callee_is_ref(pcs_unwrap_dup_callee(callee)) and not pcs_is_unit_coercion(callee) { pcs_ty_is_rc(a.ty) } else { false }
+  EField(_, _)       -> pcs_ty_is_rc(a.ty)
+  EStr(_, _)         -> pcs_ty_is_rc(a.ty)
+  ERecordLit(_, _)   -> pcs_ty_is_rc(a.ty)
+  EList(_)           -> pcs_ty_is_rc(a.ty)
+  EBinop(_, _, _)    -> pcs_ty_is_rc(a.ty)
+  EIf(_, _, Some(_)) -> pcs_ty_is_rc(a.ty)
+  EMatch(_, _)       -> pcs_ty_is_rc(a.ty)
+  EBlock(_, Some(_)) -> pcs_ty_is_rc(a.ty)
+  _ -> false
+}
+
+# A callee read dup'd before the call is still the closure it names.
+fn pcs_unwrap_dup_callee(callee: Expr) : Expr = match callee.kind {
+  ECall(m, [inner]) -> match m.kind {
+    EMark(MkDup) -> inner
+    _            -> callee
+  }
+  _ -> callee
+}
+
+# A unit coercion hands its argument through: its result is no fresh value.
+fn pcs_is_unit_coercion(callee: Expr) : Bool = match builtin_ref(callee) {
+  Some(b) -> builtin_is_unit_coercion(b)
+  None    -> false
+}
+
+fn pcs_ty_is_rc(ty: Option[Ty]) : Bool = match ty {
+  Some(t) -> not (ty_is_unboxable_t(t) or ty_is_fixed_vec(t))
+  None    -> false
+}

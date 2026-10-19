@@ -55,8 +55,8 @@ observed_type() {
         for (k in cnt) if (cnt[k] >= min && (k in catchall)) { print file " " fn; break }
         delete cnt; delete catchall; delete seen
       }
-      /^(pub )?fn / {
-        flush(); fn = $0; sub(/^(pub )?fn /, "", fn); sub(/[^a-z_0-9].*/, "", fn); next
+      /^(pub(\([a-z]+\))? )?fn / {
+        flush(); fn = $0; sub(/^(pub(\([a-z]+\))? )?fn /, "", fn); sub(/[^a-z_0-9].*/, "", fn); next
       }
       index($0, "->") == 0 { next }
       match($0, /^[ \t]*/) {
