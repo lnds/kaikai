@@ -179,8 +179,8 @@ is how a union names two homonymous imported types, since a bare `Cfg`
 cannot mean either one. A qualified member always reads as a reference
 to a declared type, never as a constructor, so it takes no payload.
 
-FFI surface beyond `extern "C" fn` — extern structs (`extern "C"
-type Vec2 = { x: F32, y: F32 }`), opaque handles (`extern "C" opaque
+FFI surface beyond `extern "C" fn` — extern structs (`extern "C" [pub]
+type Vec2 = { x: F32, y: F32 }`, usable as a record, spread included), opaque handles (`extern "C" opaque
 Conn`), a C-symbol override (`extern "C"("PQconnectdb") fn
 connect(...)`), and the fixed-width marshal types (`U8`–`I64`,
 `F32`) — is covered in `kai info ffi`.

@@ -64,8 +64,8 @@ rejected as struct fields, because an `int64_t`/`double`/pointer field
 breaks the small-struct layout the C compiler lays out.
 
 ```text
-extern "C" type Color = { r: U8, g: U8, b: U8, a: U8 }
-extern "C" type Vector2 = { x: F32, y: F32 }
+extern "C" pub type Color = { r: U8, g: U8, b: U8, a: U8 }
+extern "C" pub type Vector2 = { x: F32, y: F32 }
 
 extern "C"("DrawCircleV")
 pub fn draw_circle_v(center: Vector2, radius: F32, color: Color) : Unit / Ffi
@@ -73,6 +73,14 @@ pub fn draw_circle_v(center: Vector2, radius: F32, color: Color) : Unit / Ffi
 extern "C"("GetMousePosition")
 pub fn get_mouse_position() : Vector2 / Ffi
 ```
+
+An extern type is a record on the kaikai side: `Vector2 { x: 1.0, y: 2.0 }`
+builds one, `Vector2 { ...v, x: 5.0 }` copies one with a field changed, and
+a field reads as `v.x`. It follows the visibility rules of `type`: declare
+it `pub` (the keyword goes after `extern "C"`, as on `extern "C"("sym") pub
+fn`) to use it from another module, and a `pub` fn signature cannot name a
+private one. An importer builds it with `m.Vector2 { ... }` or imports the
+name.
 
 The shim unwraps the record's fields into a local C struct with the
 real widths, calls by value, and re-boxes a returned struct into a
