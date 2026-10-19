@@ -84,6 +84,38 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.166.0 (2026-10-19)
+
+### BREAKING CHANGE
+
+- an `extern "C" type` or `opaque` is private unless
+declared `pub`. Add `pub` (`extern "C" pub type T = ...`) to any extern
+type that other modules import or that a `pub` signature names.
+
+### Added
+
+- **resolver**: add pub(pkg), a declaration exported to its own package
+- **resolver**: allow import cycles between modules of one package
+
+### Fixed
+
+- **typer**: keep the declares-but-does-not-export wording for non-core heads
+- **stdlib**: keep only each in array; point |, || and |? over Array at array.to_list
+- **typer**: give Array the canonical pipe functions and report a missing one accurately
+- **ffi**: extern fns as values, pub extern types with record spread
+- **effects**: an op performed in a handler clause reaches the next outer handler
+- **typer**: a generic body's protocol operations resolve at compile time or are rejected
+- **kir**: a `++` operand without a type is an internal error, not a string concat
+
+### Changed
+
+- **typer**: print the callee of a rejected operator from its id, drop the census row
+- **stdlib**: fold a nested field's rebase into one library call
+- **stdlib**: fold a nested field's rebase into the tower's error arm
+- **stdlib**: rebase a nested decode failure without string_length
+- **stdlib**: rebase a nested decode failure through a non-generic helper
+- **stdlib**: decode derived Json in memory linear in nesting depth
+
 ## v0.165.4 (2026-10-19)
 
 ### Fixed
