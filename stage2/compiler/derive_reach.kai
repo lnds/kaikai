@@ -1,23 +1,26 @@
 #[doc("""
-How far a derived impl's field type reaches impls of the derived protocol.
-
-A container impl that bounds a type argument by the protocol
-(`impl[T : Eq] Eq for [T]`) needs the protocol on that argument too, so a
-field of type `[(Int, String)]` needs `Eq` on `List` and on `Pair`. The
-walk follows exactly the arguments each impl bounds, and names the first
-head it cannot reach together with the heads above it.
-
-A head is the reference its file settled: the declaration of a declared
-type, what the source wrote for a scalar, and for a type parameter of
-the declaration being read a spelling made from its id. An impl is
-filed under the protocol it implements, by id. Which protocols answer a
-derive, and when two heads are one type, is the caller's to say.
+What a derive reaches: mentioned types, picked generators, minted names and the generic shape.
 """)]
 
 import compiler.ast
 import compiler.util
 import compiler.scalar_ty
 import compiler.tbinder
+import compiler.expr_positions
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.decl_text
+import compiler.rt_name
+import compiler.core_syms
+import compiler.core_protos
+import compiler.core_modules
+import compiler.proto_ids
+import compiler.diag
+import compiler.modules_dotted
+import compiler.proto_resolve
+import compiler.name_report
 
 #[doc("A type expression as protocol dispatch sees it: each node's head and its type arguments.")]
 pub type HeadTree = HT(DeclRef, [HeadTree])
@@ -30,29 +33,29 @@ pub type ReachCx = { impls: [ImplReach], serves: (SymId) -> Bool,
                    same: (DeclRef, DeclRef) -> Bool, builtin: (DeclRef) -> Bool }
 
 #[doc("The head a type parameter of the declaration being read is filed under: a spelling made from its id, which no type and no other parameter shares.")]
-pub fn param_head(tp: TBinder) : DeclRef = ref_written(tparam_key(tp.id))
+pub(pkg) fn param_head(tp: TBinder) : DeclRef = ref_written(tparam_key(tp.id))
 
 #[doc("The parameter among `tps` that `h` is the head of, if it is one's.")]
-pub fn head_param(tps: [TBinder], h: DeclRef) : Option[TBinder] = match tps {
+pub(pkg) fn head_param(tps: [TBinder], h: DeclRef) : Option[TBinder] = match tps {
   []            -> None
   [tp, ...rest] -> if names_param(h, [tparam_key(tp.id)]) { Some(tp) } else { head_param(rest, h) }
 }
 
 #[doc("The reach of `impl[tps] proto for target`: the target arguments that are type parameters bounded by the impl's own protocol. `bounds_proto` says a bound names it.")]
-pub fn impl_reach(proto: SymId, target: HeadTree, tps: [TBinder], bounds_proto: (DeclRef) -> Bool) : ImplReach =
+pub(pkg) fn impl_reach(proto: SymId, target: HeadTree, tps: [TBinder], bounds_proto: (DeclRef) -> Bool) : ImplReach =
   match target {
     HT(head, args) -> IR(proto, head, bounded_positions(args, bounded_keys(tps, bounds_proto, []), 0))
   }
 
 #[doc("The reach of a derived `proto` on the type `t` with parameters `tps`: the derive bounds every plain parameter.")]
-pub fn derived_reach(proto: SymId, t: SymId, tps: [TBinder]) : ImplReach =
+pub(pkg) fn derived_reach(proto: SymId, t: SymId, tps: [TBinder]) : ImplReach =
   IR(proto, DrSym(t), plain_positions(tps, 0))
 
 #[doc("The reach a derive of `proto` gives the type parameter `tp` it bounds: a field typed by it is covered.")]
-pub fn param_reach(proto: SymId, tp: TBinder) : ImplReach = IR(proto, param_head(tp), [])
+pub(pkg) fn param_reach(proto: SymId, tp: TBinder) : ImplReach = IR(proto, param_head(tp), [])
 
 #[doc("The heads from `t` down to the first one with no impl that serves; empty when every head the impls reach has one.")]
-pub fn missing_path(r: ReachCx, t: HeadTree) : [DeclRef] = match t {
+pub(pkg) fn missing_path(r: ReachCx, t: HeadTree) : [DeclRef] = match t {
   HT(head, args) -> {
     let builtin = r.builtin
     if builtin(head) { [] }
@@ -67,7 +70,7 @@ pub fn missing_path(r: ReachCx, t: HeadTree) : [DeclRef] = match t {
 }
 
 #[doc("A missing path, each head by the name a diagnostic shows, spelled as the type it walks: `[List, Pair]` is `List[Pair]`.")]
-pub fn path_type(path: [String]) : String = match path {
+pub(pkg) fn path_type(path: [String]) : String = match path {
   []           -> ""
   [h]          -> h
   [h, ...rest] -> concat_all([h, "[", path_type(rest), "]"])
@@ -130,3 +133,471 @@ fn list_has_int(xs: [Int], n: Int) : Bool = match xs {
   []           -> false
   [x, ...rest] -> if x == n { true } else { list_has_int(rest, n) }
 }
+
+#[doc("Rewrite a derived impl of protocol `pname` for the type `t` with type parameters `tps` into its generic form. A non-generic type or a non-impl decl comes back unchanged.")]
+pub(pkg) fn derive_generalize(d: Decl, pname: String, t: SymId, tps: [TBinder]) : Decl =
+  if list_length(tps) == 0 { d } else {
+    match d {
+      DImpl(p, pargs, target, ms, l, c, _, isym) -> {
+        let applied = mk_ty(TyName(DrSym(t), dg_args(tps, l, c)), target.line, target.col)
+        let methods = map(ms, (m) => dg_method(m, map(tps, tb_unbounded), t))
+        DImpl(p, pargs, applied, methods, l, c, map(tps, (tp) => dg_bounded(tp, pname)), isym)
+      }
+      _ -> d
+    }
+  }
+
+#[doc("The type parameters a derived impl bounds by its protocol; a field typed by one of them is covered by that bound.")]
+pub(pkg) fn derive_bound_params(tps: [TBinder]) : [TBinder] = filter(tps, tb_is_type)
+
+# The type's own parameters, as the argument list its head takes.
+fn dg_args(tps: [TBinder], l: Int, c: Int) : [TypeExpr] =
+  map(tps, (tp) => tb_use(tp, l, c))
+
+# Only a plain type parameter takes the protocol bound: a kinded one (a
+# measure, a shape) is not a value the protocol ranges over.
+fn dg_bounded(tp: TBinder, pname: String) : TBinder =
+  if tb_is_type(tp) { TBinder { id: tp.id, name: tp.name, kind: tp.kind, bounds: [ref_written(pname)], implicit: tp.implicit } }
+  else { tp }
+
+fn dg_method(m: Decl, tps: [TBinder], head: SymId) : Decl = match m {
+  DFn(is_pub, f, mtps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, f, list_append(tps, mtps), map(ps, (p) => dg_param(p, head, tps)),
+        dg_ty_opt(ret, head, tps), row, body, l, c, mo)
+  _ -> m
+}
+
+fn dg_param(p: Param, head: SymId, tps: [TBinder]) : Param =
+  Param { binder: p.binder, ptype: dg_ty_opt(p.ptype, head, tps),
+          pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
+
+fn dg_ty_opt(t: Option[TypeExpr], head: SymId, tps: [TBinder]) : Option[TypeExpr] =
+  match t {
+    None -> None
+    Some(x) -> Some(dg_ty(x, head, tps))
+  }
+
+# A generator names the type it derives for by id.
+fn dg_is_head(r: DeclRef, head: SymId) : Bool = match r {
+  DrSym(s)        -> sym_raw(s) >= 0 and sym_raw(s) == sym_raw(head)
+  DrWritten(_, _) -> false
+}
+
+# Apply the type's arguments to every bare occurrence of its head.
+fn dg_ty(t: TypeExpr, head: SymId, tps: [TBinder]) : TypeExpr = match t.tkind {
+  TyName(r, targs) ->
+    if dg_is_head(r, head) and list_length(targs) == 0 { mk_ty(TyName(r, dg_args(tps, t.line, t.col)), t.line, t.col) }
+    else { mk_ty(TyName(r, map(targs, (x) => dg_ty(x, head, tps))), t.line, t.col) }
+  TyParam(p, targs) -> mk_ty(TyParam(p, map(targs, (x) => dg_ty(x, head, tps))), t.line, t.col)
+  TyList(inner) -> mk_ty(TyList(dg_ty(inner, head, tps)), t.line, t.col)
+  TyFn(ps, ret, row) ->
+    mk_ty(TyFn(map(ps, (x) => dg_ty(x, head, tps)), dg_ty(ret, head, tps), row), t.line, t.col)
+  _ -> t
+}
+
+#[doc("Every name `d` leaves written, a qualified one as its qualifier: what the file `d` is homed in must have in scope.")]
+pub(pkg) fn derive_mentions(d: Decl) : [String] = dm_decl(d, [])
+
+fn dm_decl(d: Decl, acc: [String]) : [String] = match d {
+  DImpl(p, pargs, target, ms, _, _, tps, _) ->
+    dm_decls(ms, dm_tparams(tps, dm_types([target, ...pargs], dm_ref(p, acc))))
+  DFn(_, _, tps, ps, ret, row, body, _, _, _) ->
+    dm_expr(body, dm_row(row, dm_opt_type(ret, dm_params(ps, dm_tparams(tps, acc)))))
+  _ -> acc
+}
+
+fn dm_decls(ds: [Decl], acc: [String]) : [String] = match ds {
+  []           -> acc
+  [d, ...rest] -> dm_decls(rest, dm_decl(d, acc))
+}
+
+# A reference by id needs no import; a qualified one needs its qualifier.
+fn dm_ref(r: DeclRef, acc: [String]) : [String] = match r {
+  DrSym(_)              -> acc
+  DrWritten(None, n)    -> [written_text(n), ...acc]
+  DrWritten(Some(q), _) -> [written_text(q), ...acc]
+}
+
+fn dm_refs(rs: [DeclRef], acc: [String]) : [String] = match rs {
+  []           -> acc
+  [r, ...rest] -> dm_refs(rest, dm_ref(r, acc))
+}
+
+fn dm_tparams(tps: [TBinder], acc: [String]) : [String] = match tps {
+  []            -> acc
+  [tp, ...rest] -> dm_tparams(rest, dm_refs(tp.bounds, acc))
+}
+
+fn dm_params(ps: [Param], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> dm_params(rest, dm_opt_type(p.ptype, acc))
+}
+
+fn dm_opt_type(ot: Option[TypeExpr], acc: [String]) : [String] = match ot {
+  None    -> acc
+  Some(t) -> dm_type(t, acc)
+}
+
+fn dm_types(ts: [TypeExpr], acc: [String]) : [String] = match ts {
+  []           -> acc
+  [t, ...rest] -> dm_types(rest, dm_type(t, acc))
+}
+
+fn dm_type(t: TypeExpr, acc: [String]) : [String] = match t.tkind {
+  TyName(r, args)  -> dm_types(args, dm_ref(r, acc))
+  TyList(inner)    -> dm_type(inner, acc)
+  TyFn(ps, r, row) -> dm_row(row, dm_type(r, dm_types(ps, acc)))
+  TyDim(b, _)      -> dm_type(b, acc)
+  TyRefine(b, e)   -> dm_expr(e, dm_type(b, acc))
+  TyRow(row)       -> dm_row(row, acc)
+  TyParam(_, args) -> dm_types(args, acc)
+  TySurface(_)     -> acc
+}
+
+fn dm_row(row: RowExpr, acc: [String]) : [String] = match row {
+  REmpty        -> acc
+  RClosed(ls)   -> dm_labels(ls, acc)
+  ROpen(_, ls)  -> dm_labels(ls, acc)
+}
+
+fn dm_labels(ls: [RowLabel], acc: [String]) : [String] = match ls {
+  []                     -> acc
+  [RL(r, args), ...rest] -> dm_labels(rest, dm_types(args, dm_ref(r, acc)))
+}
+
+fn dm_expr(e: Expr, acc: [String]) : [String] = dm_positions(xp_positions(e), dm_node(e.kind, acc))
+
+fn dm_positions(ps: [XPos], acc: [String]) : [String] = match ps {
+  []                 -> acc
+  [XP(_, x), ...rest] -> dm_positions(rest, dm_expr(x, acc))
+}
+
+# What a node names beside its sub-expressions: a head, a pattern or an
+# annotation is no position. A string an expansion builds is a literal,
+# with no interpolation to read.
+fn dm_node(k: ExprKind, acc: [String]) : [String] = match k {
+  EName(w)                        -> [written_text(w), ...acc]
+  EModCall(q, _)                  -> [written_text(q), ...acc]
+  ERecordLit(r, _)                -> dm_ref(r, acc)
+  EVariantsOf(t, _)               -> dm_type(t, acc)
+  EMatch(_, arms)                 -> dm_arms(arms, acc)
+  ELambda(ps, _)                  -> dm_params(ps, acc)
+  EBlock(ss, _)                   -> dm_stmts(ss, acc)
+  EHandle(_, r, tys, _, _, cs, _) -> dm_clauses(cs, dm_types(tys, dm_ref(r, acc)))
+  _                               -> acc
+}
+
+fn dm_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []                      -> acc
+  [Arm(p, _, _), ...rest] -> dm_arms(rest, dm_pat(p, acc))
+}
+
+fn dm_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []                         -> acc
+  [SLet(p, ot, _), ...rest]  -> dm_stmts(rest, dm_opt_type(ot, dm_pat(p, acc)))
+  [_, ...rest]               -> dm_stmts(rest, acc)
+}
+
+fn dm_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []                            -> acc
+  [HC(_, ps, _, _, _), ...rest] -> dm_clauses(rest, dm_params(ps, acc))
+}
+
+fn dm_pats(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> dm_pats(rest, dm_pat(p, acc))
+}
+
+fn dm_pat(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PVariant(r, subs)     -> dm_pats(subs, dm_ref(r, acc))
+  PVariantRecord(r, fs) -> dm_pfields(fs, dm_ref(r, acc))
+  PRecord(fs)           -> dm_pfields(fs, acc)
+  PList(ps, _)          -> dm_pats(ps, acc)
+  PAs(_, inner)         -> dm_pat(inner, acc)
+  _                     -> acc
+}
+
+fn dm_pfields(fs: [PField], acc: [String]) : [String] = match fs {
+  []                           -> acc
+  [PField(_, p, _), ...rest]   -> dm_pfields(rest, dm_pat(p, acc))
+}
+
+#[doc("How a derived body names the operation `op` of the protocol `proto` it derives: its dispatcher by id. A core protocol's goes through its home when `homed`, so that only that home's protocols answer; any other protocol's is named bare, so every protocol declaring the operation answers by the receiver's type. The bare operation when the program holds no such dispatcher.")]
+pub(pkg) fn derive_op_ref(ids: ProtoIds, homed: Bool, proto: SymId, op: String) : ExprKind = {
+  let through_home = homed and match core_proto_of(proto) { Some(_) -> true  None -> false }
+  let named = match pid_op_disp(ids, proto, op) {
+    Some(s) -> if through_home { pid_disp_homed_ref(ids, s) } else { pid_disp_ref(ids, s) }
+    None    -> None
+  }
+  match named {
+    Some(k) -> k
+    None    -> EName(written(op))
+  }
+}
+
+fn derive_lib_module() : CoreModule = CmProtocols
+
+#[doc("The home of the JSON readers and writers a derived JSON impl calls: an imported module, not a core one.")]
+pub(pkg) fn json_lib_home() : String = "encoding__json_bind"
+
+#[doc("A reference to the function `name` of the derive library.")]
+pub(pkg) fn derive_lib_ref(name: String, line: Int, col: Int) : Expr =
+  mk_sym(sym_derive(NCFn, name, core_module_name(derive_lib_module())), line, col)
+
+#[doc("A reference to the core builtin named `name`.")]
+pub(pkg) fn derive_builtin_ref(name: String, line: Int, col: Int) : Expr =
+  mk_sym(builtin_sym(name), line, col)
+
+#[doc("What a derive generator hands back: the declarations it built, and the symbol-table row of every function among them, impl methods included.")]
+pub type Minted = { decls: [Decl], rows: [NEnt] }
+
+#[doc("Nothing derived.")]
+pub(pkg) fn minted_none() : Minted = Minted { decls: [], rows: [] }
+
+#[doc("What a derive is for: the type's id, the table that names it, its constructors and the module its functions are minted in, and `spell`, the piece a generated symbol spells a type head of the deriving file with.")]
+pub type DeriveFor = { tab: SymTab, t: SymId, spell: (DeclRef) -> String }
+
+#[doc("The name the derived type is declared with: what a runtime message and the entry point beside the impl spell.")]
+pub(pkg) fn derive_type_name(f: DeriveFor) : String = written_text(sym_name(f.tab, f.t))
+
+#[doc("The name the derived type is emitted under: the type piece of a generated impl symbol.")]
+pub(pkg) fn derive_type_spell(f: DeriveFor) : String = rt_name(f.tab, f.t)
+
+# The module that declares the derived type: the home its ids, and those
+# of the functions derived for it, are minted with.
+fn derive_home(f: DeriveFor) : String =
+  if st_valid(f.tab, f.t) { written_text(sym_home(f.tab, f.t)) }
+  else { panic("identity: the derived type has no row in the symbol table (derive_home)") }
+
+#[doc("The derived type as a type expression: its declaration by id, which no homonym of another module can capture.")]
+pub(pkg) fn derive_self_ty(f: DeriveFor, line: Int, col: Int) : TypeExpr =
+  mk_ty(TyName(DrSym(f.t), []), line, col)
+
+#[doc("The text of a type head: its declaration's name once the reference is settled, what the source wrote before.")]
+pub(pkg) fn derive_ref_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)              -> written_text(decl_name(tab, s))
+  DrWritten(None, n)    -> written_text(n)
+  DrWritten(Some(q), n) -> string_concat_all([written_text(q), ".", written_text(n)])
+}
+
+#[doc("The text of a type head written bare: empty for a qualified head, and for one already settled, which names a declared type.")]
+pub(pkg) fn derive_bare_text(r: DeclRef) : String = match r {
+  DrWritten(None, n) -> written_text(n)
+  _                  -> ""
+}
+
+# The scope the methods of the derived impl of `g` are minted in: one per
+# protocol and type, so two derives of a module never share a method id.
+fn derive_impl_scope(f: DeriveFor, g: CoreProto) : String =
+  impl_scope_keyed(derive_home(f), string_concat_all(["derive ", core_proto_name(g), " ", derive_type_name(f)]))
+
+#[doc("One method of a derived impl: the operation it implements, its parameters, return type and body.")]
+pub type DeriveMethod = DeriveMethod(String, [Param], TypeExpr, Expr)
+
+#[doc("The impl of the core protocol `g` for the derived type, its `methods` minted in the impl's own scope, with the row of each.")]
+pub(pkg) fn derive_impl(f: DeriveFor, g: CoreProto, methods: [DeriveMethod], line: Int, col: Int) : Minted = {
+  let scope = derive_impl_scope(f, g)
+  let fns = map(methods, (m) => match m {
+    DeriveMethod(op, params, ret, body) ->
+      DFn(false, fnid_decl(method_sym(op, scope)), [], params, Some(ret), REmpty, body, line, col, None)
+  })
+  let rows = map(methods, (m) => match m { DeriveMethod(op, _, _, _) -> method_ent(op, scope) })
+  Minted { decls: [DImpl(DrSym(core_proto_id(g)), [], derive_self_ty(f, line, col), fns, line, col, [], sym_none())],
+           rows: rows }
+}
+
+#[doc("The public function `name` of the deriving module, with its row.")]
+pub(pkg) fn derive_fn(f: DeriveFor, name: String, params: [Param], ret: TypeExpr, body: Expr,
+                 line: Int, col: Int) : Minted = {
+  let home = derive_home(f)
+  Minted { decls: [DFn(true, fnid_decl(sym_derive(NCFn, name, home)), [], params, Some(ret), REmpty, body, line, col, None)],
+           rows: [NEnt(NCFn, name, home, true, NmDerived)] }
+}
+
+#[doc("Both mints, the declarations and rows of `a` before those of `b`.")]
+pub(pkg) fn minted_append(a: Minted, b: Minted) : Minted =
+  Minted { decls: list_append(a.decls, b.decls), rows: list_append(a.rows, b.rows) }
+
+fn core_proto_derivable(g: CoreProto) : Bool = match g {
+  CpShow         -> true
+  CpEq           -> true
+  CpOrd          -> true
+  CpHash         -> true
+  CpBinSerialize -> true
+  CpLayout       -> true
+  CpJson         -> true
+  _              -> false
+}
+
+# The generators whose impl calls nothing but the derived protocol's operations.
+fn structural_gens() : [CoreProto] = [CpShow, CpEq, CpOrd, CpHash]
+
+# One declared operation: its label and its arity.
+type OpShape = OpShape(String, Int)
+
+type ProtoShape = ProtoShape(SymId, [OpShape])
+
+# A structural generator with the operations its core protocol declares.
+type GenModel = GenModel(CoreProto, [OpShape])
+
+#[doc("A protocol that is no core one, and the generator its operations pick.")]
+pub type ShapedGen = ShapedGen(SymId, CoreProto)
+
+#[doc("The generator each protocol of a program picks by the operations it declares.")]
+pub(pkg) type ShapedGens = ShapedGens([ShapedGen])
+
+#[doc("The generator each protocol declared in `ds` picks by its operations: a structural generator's, when the protocol declares exactly the operations of that generator's core protocol. A core protocol picks by identity and has no entry.")]
+pub(pkg) fn shaped_gens(ds: [Decl]) : ShapedGens = {
+  let shapes = proto_shapes(ds, [])
+  ShapedGens(shaped_loop(shapes, gen_models(structural_gens(), shapes), []))
+}
+
+fn proto_shapes(ds: [Decl], acc: [ProtoShape]) : [ProtoShape] = match ds {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DProtocol(_, psym, _, ops, _, _, _) ->
+      proto_shapes(rest, [ProtoShape(psym, map(ops, op_shape)), ...acc])
+    _ -> match decl_transparent_inner(d) {
+      Some(inner) -> proto_shapes([inner, ...rest], acc)
+      None        -> proto_shapes(rest, acc)
+    }
+  }
+}
+
+fn op_shape(op: ProtoOp) : OpShape = match op {
+  POp(label, _, params, _, _, _) -> OpShape(label, list_length(params))
+}
+
+fn gen_models(gs: [CoreProto], shapes: [ProtoShape]) : [GenModel] = match gs {
+  []           -> []
+  [g, ...rest] -> match shape_of(shapes, core_proto_id(g)) {
+    Some(ops) -> [GenModel(g, ops), ...gen_models(rest, shapes)]
+    None      -> gen_models(rest, shapes)
+  }
+}
+
+fn shape_of(shapes: [ProtoShape], p: SymId) : Option[[OpShape]] = match shapes {
+  [] -> None
+  [ProtoShape(s, ops), ...rest] -> if sym_raw(s) == sym_raw(p) { Some(ops) } else { shape_of(rest, p) }
+}
+
+fn shaped_loop(shapes: [ProtoShape], models: [GenModel], acc: [ShapedGen]) : [ShapedGen] = match shapes {
+  [] -> acc
+  [ProtoShape(p, ops), ...rest] -> match core_proto_of(p) {
+    Some(_) -> shaped_loop(rest, models, acc)
+    None    -> match model_for(models, ops) {
+      Some(g) -> shaped_loop(rest, models, [ShapedGen(p, g), ...acc])
+      None    -> shaped_loop(rest, models, acc)
+    }
+  }
+}
+
+fn model_for(models: [GenModel], ops: [OpShape]) : Option[CoreProto] = match models {
+  [] -> None
+  [GenModel(g, want), ...rest] -> if ops_same(ops, want) { Some(g) } else { model_for(rest, ops) }
+}
+
+# An operation has no id of its own: within a protocol, the label and
+# the arity are the operation.
+fn ops_same(a: [OpShape], b: [OpShape]) : Bool =
+  list_length(a) == list_length(b) and all(a, (o) => has_op(b, o)) and all(b, (o) => has_op(a, o))
+
+fn has_op(ops: [OpShape], o: OpShape) : Bool = match ops {
+  [] -> false
+  [OpShape(label, arity), ...rest] -> match o {
+    OpShape(l, n) -> (label == l and arity == n) or has_op(rest, o)
+  }
+}
+
+#[doc("The generator the protocol `p` picks: its own when it is a core protocol that has one, else the one its operations pick in `sg`.")]
+pub(pkg) fn proto_gen(sg: ShapedGens, p: SymId) : Option[CoreProto] = match core_proto_of(p) {
+  Some(g) -> if core_proto_derivable(g) { Some(g) } else { None }
+  None    -> match sg { ShapedGens(rows) -> shaped_find(rows, p) }
+}
+
+fn shaped_find(rows: [ShapedGen], p: SymId) : Option[CoreProto] = match rows {
+  [] -> None
+  [ShapedGen(s, g), ...rest] ->
+    if sym_raw(p) >= 0 and sym_raw(s) == sym_raw(p) { Some(g) } else { shaped_find(rest, p) }
+}
+
+#[doc("A `#[derive]` entry that picked a generator: the protocol it resolved to, and the generator.")]
+pub type DeriveGen = DeriveGen(SymId, CoreProto)
+
+#[doc("What the protocol reference `pspell` picks, resolved from the file homed at `from` (`None` = root file); `None` when it resolves to no protocol that picks a generator.")]
+pub(pkg) fn derive_gen(ps: PScope, sg: ShapedGens, pspell: String, from: Option[String]) : Option[DeriveGen] = {
+  let p = ps_proto_sym(ps, pspell, from)
+  match proto_gen(sg, p) {
+    Some(g) -> Some(DeriveGen(p, g))
+    None    -> None
+  }
+}
+
+#[doc("The entries of `names`, written in the file homed at `from`, that pick a generator.")]
+pub(pkg) fn derive_gens(ps: PScope, sg: ShapedGens, names: [String], from: Option[String]) : [DeriveGen] = match names {
+  []           -> []
+  [n, ...rest] -> match derive_gen(ps, sg, n, from) {
+    Some(d) -> [d, ...derive_gens(ps, sg, rest, from)]
+    None    -> derive_gens(ps, sg, rest, from)
+  }
+}
+
+#[doc("True when one of the `#[derive]` entries `names`, written in the file homed at `from`, picks the generator `g`.")]
+pub(pkg) fn derives_gen(ps: PScope, sg: ShapedGens, names: [String], from: Option[String], g: CoreProto) : Bool =
+  any(derive_gens(ps, sg, names, from), (d) => match d { DeriveGen(_, p) -> core_proto_same(p, g) })
+
+#[doc("True when one of the `#[derive]` entries `names`, written in the file homed at `from`, is the core protocol `g` itself: what picks a generator that serves its own protocol alone.")]
+pub(pkg) fn derives_core(ps: PScope, names: [String], from: Option[String], g: CoreProto) : Bool = match names {
+  []           -> false
+  [n, ...rest] -> proto_is(ps_proto_sym(ps, n, from), g) or derives_core(ps, rest, from, g)
+}
+
+#[doc("The errors of the `#[derive]` entries `names` at `file:line:col`, written in the file homed at `from`: an entry that resolves to no single protocol, reported the way an impl head is, and an entry whose protocol picks no generator. Prepended to `acc`.")]
+pub(pkg) fn derive_pick_diags(ps: PScope, sg: ShapedGens, names: [String], from: Option[String], file: String,
+                         line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] = match names {
+  []           -> acc
+  [n, ...rest] -> {
+    let acc1 = match derive_gen(ps, sg, n, from) {
+      Some(_) -> acc
+      None    -> [dp_error(ps, n, ps_resolve(ps, n, from), file, line, col), ...acc]
+    }
+    derive_pick_diags(ps, sg, rest, from, file, line, col, acc1)
+  }
+}
+
+fn dp_error(ps: PScope, pspell: String, res: PkRes, file: String, line: Int, col: Int) : Diagnostic = {
+  let pname = dotted_bare(pspell)
+  match res {
+    PkHome(home) -> mk_diag(SevError, file, line, col,
+      concat_all(["no derive generator for protocol `", dp_spelled(home, pname), "`"]),
+      dp_core_help(pname, file, line, col))
+    PkPrivate(m) -> mk_diag(SevError, file, line, col,
+      concat_all(["protocol `", pname, "` is declared in module `", m, "` but is not `pub`"]), [])
+    PkUnknown -> mk_diag(SevError, file, line, col,
+      concat_all(["unknown protocol `", pname, "` in `#[derive]`"]), [])
+    PkAmbiguous(cands) ->
+      nr_ambiguous_diag(file, line, col, NCProtocol, pname, map(cands, (c) => dp_home_name(c, ps_root(ps))), "", [])
+  }
+}
+
+# A protocol as a diagnostic names it: through its module, bare for the root file's own.
+fn dp_spelled(home: Option[String], pname: String) : String = match home {
+  Some(m) -> concat_all([m, ".", pname])
+  None    -> pname
+}
+
+fn dp_home_name(home: Option[String], root: String) : String = match home {
+  Some(m) -> m
+  None    -> root
+}
+
+# The entry is spelled like a core protocol that has a generator, and is not it.
+fn dp_core_help(pname: String, file: String, line: Int, col: Int) : [RelatedInfo] =
+  match core_proto_named(pname) {
+    Some(g) ->
+      if core_proto_derivable(g) {
+        [ri_help(file, line, col, concat_all(["to derive the core protocol, write `#[derive(",
+                                              core_proto_home(g), ".", pname, ")]`"]))]
+      } else { [] }
+    None -> []
+  }
