@@ -93,7 +93,7 @@ class Expr:
 class Fn:
     def __init__(self, file, name, text, first_line):
         self.file, self.name = file, name
-        paren = text.find("(")
+        paren = text.find("(", re.search(r"\bfn\b", text).end())
         end = close_of(text, paren) if paren >= 0 else 0
         self.params = [a.split(":")[0].strip() for a in split_args(text[paren + 1:end])] if paren >= 0 else []
         rest = text[end + 1:]
