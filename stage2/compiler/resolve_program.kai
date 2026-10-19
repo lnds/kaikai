@@ -1,7 +1,4 @@
-#[doc("""
-Name resolution of a whole program: declarations registered, each
-resolved in its file's scope, rows checked.
-""")]
+#[doc("Resolution of a whole program: its declarations, rows and the symbol test.")]
 
 import compiler.diag
 import compiler.ast
@@ -12,22 +9,25 @@ import compiler.resolve_state
 import compiler.scope_chain
 import compiler.decl_text
 import compiler.scope_file
-import compiler.resolve_callee
+import compiler.resolve_env
 import compiler.kai_builtin
 import compiler.refine_types
-import compiler.resolve_env
-import compiler.resolve_pats
+import compiler.resolve_names
 import compiler.resolve
-import compiler.resolve_register
-import compiler.resolve_rows
+import compiler.util
+import compiler.decl_names
+import compiler.written
+import compiler.tbinder
+import compiler.tparam_uses
+import compiler.symtab_build
+import compiler.core_builtins
+import compiler.scope_chain_test
 
-#[doc("A walked declaration list: the env after it, and the rewritten declarations.")]
-pub type RDecls = RDecls(Env, [Decl])
+type RDecls = RDecls(Env, [Decl])
 
 # ---- top-level pre-registration ----
 
-#[doc("Pre-register every top-level decl's name into the env so forward references resolve.")]
-pub fn register_decls(e: Env, ds: [Decl], target: String) : Env {
+fn register_decls(e: Env, ds: [Decl], target: String) : Env {
   match ds {
     [] -> e
     [d, ...rest] -> register_decls(register_one(env_at_decl(e, d, target), d), rest, target)
@@ -50,26 +50,24 @@ fn env_at_decl(e: Env, d: Decl, target: String) : Env =
 # ---- entry point ----
 
 #[doc("Resolve `decls` whose files resolve under `views`, against the table `tab` those views index.")]
-pub fn resolve_decls_views(df: DiagFiles, decls: [Decl], views: FileViews,
+pub(pkg) fn resolve_decls_views(df: DiagFiles, decls: [Decl], views: FileViews,
       tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File {
   let r = resolve_program_views(df, decls, views, tab, target, ops)
   ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags, params: r.params, env: r.env }
 }
 
 #[doc("`resolve_decls_views`: a reference to a core builtin carries its id on every path.")]
-pub fn resolve_decls_stamped(df: DiagFiles, decls: [Decl], views: FileViews,
+pub(pkg) fn resolve_decls_stamped(df: DiagFiles, decls: [Decl], views: FileViews,
       tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File =
   resolve_decls_views(df, decls, views, tab, target, ops)
 
-#[doc("A resolved decl stream: the resolver's error count, the declarations downstream passes consume, the table their ids index, and the diagnostics the walk collected.")]
-pub type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagnostic], params: [ParamIds], env: Env }
+pub(pkg) type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagnostic], params: [ParamIds], env: Env }
 
-#[doc("Resolve a program and keep the resolution: every scope check, with every use site resolved against `tab`.")]
-pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
+fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
   resolve_run(df, decls, rs_on(tab, target), tab, [])
 
 #[doc("Resolve a program whose files resolve under `views`: a bare name climbs the file's own imports, picks and cores, not its home alone.")]
-pub fn resolve_program_views(df: DiagFiles, decls: [Decl], views: FileViews,
+pub(pkg) fn resolve_program_views(df: DiagFiles, decls: [Decl], views: FileViews,
       tab: SymTab, target: String, ops: [ProtoRung]) : Resolution / Console + File =
   resolve_run(df, decls, rs_on_views(tab, views, target, kai_unshadowed(core_names(), decls, tab)), tab, ops)
 
@@ -90,8 +88,7 @@ fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
                decls: out, tab: tab, diags: list_append(finalize_diags(e3.diags), checks), params: e3.params, env: e3 }
 }
 
-#[doc("The env a decl walk ended in.")]
-pub fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
+fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
 
 fn rds_decls(r: RDecls) : [Decl] = match r { RDecls(_, ds) -> ds }
 
@@ -124,7 +121,7 @@ fn decl_env(e: Env, df: DiagFiles, target: String, i: Int, d: Decl) : Env =
   env_at_decl(env_with_file(Env { ...e, larity: [], chain: ch_with_next_local(e.chain, local_base(i)) }, decl_diag_file(d, df)), d, target)
 
 #[doc("`d`, the declaration at index `i` of a stream resolved in the environment `env` it ended in, resolved on its own against that environment.")]
-pub fn resolve_complete(env: Env, df: DiagFiles, target: String, i: Int, d: Decl) : Decl / Console + File =
+pub(pkg) fn resolve_complete(env: Env, df: DiagFiles, target: String, i: Int, d: Decl) : Decl / Console + File =
   match chk_decl(decl_env(env, df, target, i, d), d) { RDecl(_, d1) -> d1 }
 
 fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles, target: String, i: Int,
@@ -137,3 +134,353 @@ fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles, target: String, i: Int,
     }
   }
 }
+
+#[doc("""
+Arity table built from every DEffect in the program. Effects are
+declared in stdlib source and loaded before this runs, so every
+effect a row can name is here; effect aliases (`Console`) expand to
+their atomic labels before the row-label check, so they need no
+entry of their own.
+""")]
+pub(pkg) type EffArity = EA(SymId, Int)
+
+fn collect_effect_arities(decls: [Decl]) : [EffArity] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, esym, tparams, _, _, _, _, _) ->
+        [EA(esym, list_length(tparams)), ...collect_effect_arities(rest)]
+      _ -> collect_effect_arities(rest)
+    }
+  }
+}
+
+fn lookup_arity(arities: [EffArity], target: SymId) : Option[Int] {
+  match arities {
+    [] -> None
+    [a, ...rest] -> match a {
+      EA(s, k) -> if sym_raw(s) == sym_raw(target) { Some(k) } else { lookup_arity(rest, target) }
+    }
+  }
+}
+
+# ---- name resolution for effect labels in rows ----
+# Every label that appears in a `T / Eff + ...` suffix must refer to
+# a declared effect. Anything else is a compile error.
+
+#[doc("Every declared effect of the program (every DEffect's id).")]
+pub(pkg) fn collect_effect_ids(decls: [Decl]) : [SymId] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, esym, _, _, _, _, _, _) -> [esym, ...collect_effect_ids(rest)]
+      _ -> collect_effect_ids(rest)
+    }
+  }
+}
+
+fn check_row_labels(decls: [Decl], df: DiagFiles, tab: SymTab,
+                     arities: [EffArity]) : [Diagnostic] / Console + File {
+  match decls {
+    [] -> []
+    [d, ...rest] ->
+      list_append(check_decl_row_labels(d, decl_diag_file(d, df), tab, arities),
+                  check_row_labels(rest, df, tab, arities))
+  }
+}
+
+fn check_decl_row_labels(d: Decl, file: String, tab: SymTab,
+                          arities: [EffArity]) : [Diagnostic] / Console + File {
+  match d {
+    DFn(_, _, _, _, _, rexpr, _, line, col, _) ->
+      check_row_expr(rexpr, file, line, col, tab, arities)
+    _ -> []
+  }
+}
+
+fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
+                   tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  match re {
+    REmpty -> []
+    RClosed(labels) -> check_row_labels_loop(labels, file, line, col, tab, arities)
+    # row variables in tail position carry the same labels;
+    # apply the same name + arity check.
+    ROpen(_, labels) -> check_row_labels_loop(labels, file, line, col, tab, arities)
+  }
+}
+
+fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
+                          tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  match labels {
+    [] -> []
+    [RL(r, ts), ...rest] ->
+      list_append(check_row_label(r, list_length(ts), file, line, col, tab, arities),
+                  check_row_labels_loop(rest, file, line, col, tab, arities))
+  }
+}
+
+# The arity of the effect a label names: its declaration's when the label
+# is settled, else that of the first effect declared under the name it
+# writes. `None` when no effect is declared for it.
+fn label_arity(tab: SymTab, arities: [EffArity], r: DeclRef) : Option[Int] = match r {
+  DrSym(s)              -> lookup_arity(arities, s)
+  DrWritten(None, n)    -> first_arity(arities, st_candidates(tab, NCEffect, written_text(n)))
+  DrWritten(Some(_), _) -> None
+}
+
+fn first_arity(arities: [EffArity], cands: [SymId]) : Option[Int] = match cands {
+  [] -> None
+  [s, ...rest] -> match lookup_arity(arities, s) {
+    Some(k) -> Some(k)
+    None    -> first_arity(arities, rest)
+  }
+}
+
+fn label_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(q, n) -> ref_text(q, n)
+}
+
+# Per-label name + arity check. Unknown effect → "unknown effect: X".
+# Arity mismatch → "effect 'X' expects N type argument(s), got M".
+fn check_row_label(r: DeclRef, got: Int, file: String, line: Int, col: Int,
+                    tab: SymTab, arities: [EffArity]) : [Diagnostic] / Console + File {
+  let name = label_text(tab, r)
+  match label_arity(tab, arities, r) {
+    None ->
+      rs_report(mk_diag(SevError, file, line, col, "unknown effect: #{name}",
+        [ri_note(file, line, col, "only declared `effect Foo { ... }` names and the catalog (Console, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row"),
+         ri_help(file, line, col, "declare `effect #{name} { ... }` first, or fix the spelling")]))
+    Some(want) ->
+      if want == got { [] }
+      else {
+        let help = if got > want {
+            concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
+          } else {
+            concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
+          }
+        rs_report(mk_diag(SevError, file, line, col,
+          concat_all(["effect '", name, "' expects ", int_to_string(want),
+                      " type argument(s), got ", int_to_string(got)]),
+          [ri_note(file, line, col, "the parametric label must match the effect's `[...]` declaration"),
+           ri_help(file, line, col, help)]))
+      }
+  }
+}
+
+fn check_unbound_tyvars(decls: [Decl], df: DiagFiles, tab: SymTab) : [Diagnostic] / Console + File {
+  match decls {
+    [] -> []
+    [d, ...rest] ->
+      list_append(check_decl_unbound_tyvars(d, decl_diag_file(d, df), tab), check_unbound_tyvars(rest, df, tab))
+  }
+}
+
+fn is_compiler_synth_name(n: String) : Bool {
+  if string_length(n) < 2 { false }
+  else { match char_at(n, 0) {
+    Some(c1) -> if c1 == '_' { match char_at(n, 1) {
+      Some(c2) -> c2 == '_'
+      None -> false
+    } } else { false }
+    None -> false
+  } }
+}
+
+fn check_decl_unbound_tyvars(d: Decl, file: String, tab: SymTab) : [Diagnostic] / Console + File {
+  match d {
+    DFn(_, fid, tps, params, opt_ret, rexpr, _, line, col, _) -> {
+      let fname = written_text(sym_name(tab, fnid_sym(fid)))
+      # Synthetic compiler-generated fns (`__proto_*`, `__deriv_*`,
+      # etc.) come from desugar and may legitimately have tyvars in
+      # return-only position by construction (protocol `Self` lives
+      # only on the right of `:`). Skip them; their soundness is the
+      # desugar pass's responsibility.
+      if is_compiler_synth_name(fname) { [] }
+      else { unbound_tyvars(tps, params, opt_ret, rexpr, fname, file, line, col) }
+    }
+    DAxiom(_, _, fname, _, tps, params, ret, rexpr, line, col) ->
+      if is_compiler_synth_name(fname) { [] }
+      else { unbound_tyvars(tps, params, Some(ret), rexpr, fname, file, line, col) }
+    _ -> []
+  }
+}
+
+# Constructor-style fns whose parameters mention no implicit type
+# parameter (`pub fn empty() : Map[k, v] = ...`) are caller-elects: the
+# caller picks the return's at the use site. Only a fn that already binds
+# an implicit one through a parameter can suffer the silent-shadow shape.
+fn unbound_tyvars(tps: [TBinder], params: [Param], ret: Option[TypeExpr], row: RowExpr,
+                  fname: String, file: String, line: Int, col: Int) : [Diagnostic] / Console + File = {
+  let in_params = filter(sig_param_ids(params, None, REmpty), (id) => match tbs_find(tps, id) {
+    Some(b) -> b.implicit
+    None    -> false
+  })
+  if in_params == [] { [] } else {
+    let ret_errs = report_unbound_tyvars_in_set(sig_param_ids([], ret, REmpty), tps, in_params, fname, file, line, col, [])
+    let row_errs = report_unbound_tyvars_in_set(sig_param_ids([], None, row), tps, in_params, fname, file, line, col, [])
+    list_append(ret_errs, row_errs)
+  }
+}
+
+# A parameter the source listed is always legal; one a signature only
+# uses must be used by a parameter.
+fn report_unbound_tyvars_in_set(found: [TLocalId], tps: [TBinder], in_params: [TLocalId],
+                                 fname: String, file: String, line: Int, col: Int,
+                                 acc: [Diagnostic]) : [Diagnostic] / Console + File {
+  match found {
+    [] -> acc
+    [id, ...rest] -> {
+      let here = match tbs_find(tps, id) {
+        None    -> []
+        Some(b) -> if not b.implicit or tids_has(in_params, id) { [] } else {
+          let n = tb_text(b)
+          rs_report(mk_diag(SevError, file, line, col, "unbound type variable: `#{n}`",
+            [ri_note(file, line, col, "type variable `#{n}` appears in the return type or effect row of `fn #{fname}` but not in any parameter"),
+             ri_help(file, line, col, "introduce it as an explicit tparam (e.g. `fn #{fname}[#{n}](...) : ...`)")]))
+        }
+      }
+      report_unbound_tyvars_in_set(rest, tps, in_params, fname, file, line, col, list_append(acc, here))
+    }
+  }
+}
+
+#[doc("Render a resolver-check diagnostic and return it as the check's verdict.")]
+pub(pkg) fn rs_report(d: Diagnostic) : [Diagnostic] / Console + File = {
+  render_diag(d)
+  [d]
+}
+
+# A function a gate declares: its name, its home (`None` for the root
+# file), its parameters and its body.
+type RstFn = RstFn(String, Option[String], [String], Expr)
+
+# `pub fn <n>() = <body>`, homed in `mo`.
+fn rst_fn(n: String, mo: Option[String], body: Expr) : RstFn = RstFn(n, mo, [], body)
+
+# `fn <n>(<p>) = <body>` — the parameter is what shadows.
+fn rst_fn1(n: String, p: String, body: Expr) : RstFn = RstFn(n, None, [p], body)
+
+fn rst_home(mo: Option[String]) : String = match mo {
+  Some(m) -> m
+  None    -> "root"
+}
+
+fn rst_id(n: String, mo: Option[String]) : SymId = sym_derive(NCFn, n, rst_home(mo))
+
+fn rst_decl(f: RstFn) : Decl = match f {
+  RstFn(n, mo, ps, body) ->
+    DFn(true, fnid_decl(rst_id(n, mo)), [], map(ps, rst_param), None, REmpty, body, 0, 0, mo)
+}
+
+fn rst_row(f: RstFn) : NEnt = match f { RstFn(n, mo, _, _) -> NEnt(NCFn, n, rst_home(mo), true, NmSource) }
+
+fn rst_param(p: String) : Param =
+  Param { binder: binder_written(p), ptype: None, pline: 0, pcol: 0, pborrow: false }
+
+fn rst_var(n: String) : Expr = mk_name(n, 0, 0)
+
+# The resolution of the functions `fs`, the untagged ones homed in `root`.
+fn rst_run(fs: [RstFn]) : Resolution / Console + File =
+  resolve_program_with(diag_files_flat("t.kai"), map(fs, rst_decl), st_program(map(fs, rst_row), "root", []), "root")
+
+fn rst_resolve(fs: [RstFn]) : [Decl] / Console + File = rst_run(fs).decls
+
+# The body of the function `s` declares.
+fn rst_body_of(ds: [Decl], s: SymId) : Option[Expr] = match ds {
+  [] -> None
+  [d, ...rest] -> match d {
+    DFn(_, fid, _, _, _, _, body, _, _, _) ->
+      if sym_raw(fnid_sym(fid)) == sym_raw(s) { Some(body) } else { rst_body_of(rest, s) }
+    _ -> rst_body_of(rest, s)
+  }
+}
+
+# The declaration a body's reference names, or `None` when it names none.
+fn rst_sym_in(ds: [Decl], caller: SymId) : Option[SymId] =
+  match rst_body_of(ds, caller) {
+    None    -> None
+    Some(b) -> match b.kind { ESym(s, _) -> Some(s)  _ -> None }
+  }
+
+fn rst_is_sym(o: Option[SymId]) : Bool = match o {
+  Some(_) -> true
+  None    -> false
+}
+
+# A call to a declaration carries its id.
+fn rst_call_reaches_decl() : Bool / Console + File {
+  let ds = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
+                        rst_fn("caller", None, rst_var("helper"))])
+  rst_is_sym(rst_sym_in(ds, rst_id("caller", None)))
+}
+
+# A parameter shadows a declaration of the same name: the use is a read
+# of the binder, never a reference to the declaration.
+fn rst_binder_shadows_decl() : Bool / Console + File {
+  let ds = rst_resolve([rst_fn("x", None, mk_expr(EUnit, 0, 0)),
+                        rst_fn1("caller", "x", rst_var("x"))])
+  match rst_body_of(ds, rst_id("caller", None)) {
+    Some(b) -> match b.kind { ELocal(_) -> true  _ -> false }
+    None    -> false
+  }
+}
+
+# Two homes each declaring `dup`, each calling it: a reader reaches the
+# declaration its own home owns, and the two ids differ — which no
+# spelling can say.
+fn rst_home_decides() : Bool / Console + File {
+  let ds = rst_resolve([rst_fn("dup", Some("alpha"), mk_expr(EUnit, 0, 0)),
+                        rst_fn("ua", Some("alpha"), rst_var("dup")),
+                        rst_fn("dup", Some("beta"), mk_expr(EUnit, 0, 0)),
+                        rst_fn("ub", Some("beta"), rst_var("dup"))])
+  rst_ids_differ(rst_sym_in(ds, rst_id("ua", Some("alpha"))), rst_sym_in(ds, rst_id("ub", Some("beta"))))
+}
+
+fn rst_ids_differ(a: Option[SymId], b: Option[SymId]) : Bool = match a {
+  None    -> false
+  Some(x) -> match b {
+    None    -> false
+    Some(y) -> sym_raw(x) != sym_raw(y)
+  }
+}
+
+# The home the root function `caller`'s reference reaches, or `""` when it names no declaration.
+fn rst_home_in(fs: [RstFn], caller: String) : String / Console + File {
+  let r = rst_run(fs)
+  match rst_sym_in(r.decls, rst_id(caller, None)) {
+    Some(s) -> written_text(sym_home(r.tab, s))
+    None    -> ""
+  }
+}
+
+# Untagged decls after a module's decls are the root file's: a root call
+# reaches the root declaration even when that module declares a homonym.
+fn rst_root_shadows_module() : Bool / Console + File =
+  rst_home_in([rst_fn("add", Some("complex"), mk_expr(EUnit, 0, 0)),
+               rst_fn("add", None, mk_expr(EUnit, 0, 0)),
+               rst_fn("caller", None, rst_var("add"))], "caller") == "root"
+
+# The inverse: a root call to a name only the module declares reaches it.
+fn rst_root_reaches_module() : Bool / Console + File =
+  rst_home_in([rst_fn("conj", Some("complex"), mk_expr(EUnit, 0, 0)),
+               rst_fn("caller", None, rst_var("conj"))], "caller") == "complex"
+
+# The walk must resolve something: a stream whose every reference stayed
+# written is the state the pipeline was in before it was wired.
+fn rst_walk_stamps() : Bool / Console + File {
+  let ds = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
+                        rst_fn("caller", None, rst_var("helper"))])
+  rst_is_sym(rst_sym_in(ds, rst_id("caller", None)))
+}
+
+#[doc("Runs every resolver stamping gate. Returns a line starting `OK` on success, `FAIL:` otherwise.")]
+pub(pkg) fn resolve_sym_selftest() : String / Console + File =
+  if scope_chain_selftest() != "" { "FAIL: " ++ scope_chain_selftest() }
+  else if rst_walk_stamps() == false { "FAIL: the resolver resolved no reference" }
+  else if rst_call_reaches_decl() == false { "FAIL: a call to a declaration does not carry its id" }
+  else if rst_binder_shadows_decl() == false { "FAIL: a parameter did not shadow the declaration" }
+  else if rst_home_decides() == false { "FAIL: two homes resolved one name to one symbol" }
+  else if rst_root_shadows_module() == false { "FAIL: a root call reached a module homonym, not the root declaration" }
+  else if rst_root_reaches_module() == false { "FAIL: a root call did not reach the module declaration it names" }
+  else { "OK resolve-sym (7 gates)" }
