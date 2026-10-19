@@ -21501,14 +21501,15 @@ static void *kai_evidence_lookup(const char *eff_label) {
  * m8 bug #12: the walk skips the node whose clause is being dispatched on
  * this fiber, so a recursive op resolves to the outer handler. */
 static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *def) {
-    kai_check_cancel_yield_point();
+    KaiFiber *f = kai_current_fiber();
+    kai_cancel_poll(f);
     /* Issue #103 — bypass user Cancel handlers when the current
      * fiber is linked to a trap-exit'd peer (see
      * kai_check_trap_exit_cancel_bypass for rationale). */
-    if (eff_label && strcmp(eff_label, "Cancel") == 0) {
+    if (eff_label && eff_label[0] == 'C' && strcmp(eff_label, "Cancel") == 0) {
         kai_check_trap_exit_cancel_bypass();
+        f = kai_current_fiber();
     }
-    KaiFiber *f = kai_current_fiber();
     if (f->seg != NULL) return kai_seg_lookup(f, eff_label, def);
     KaiEvidence *node = kai_ev_find(f->evidence_top, NULL, eff_label, f->in_dispatch_node);
     return node != NULL ? node : def;
