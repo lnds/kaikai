@@ -84,6 +84,31 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.165.3 (2026-10-18)
+
+### Fixed
+
+- **perceus**: keep the operand type when a lambda take strips a param's dup
+- **driver**: drop the unused derive_mint import that fails the selfhost warning gate
+- **driver**: a stdlib copy at another path is the same core, not a second module
+
+### Changed
+
+- **typer**: group the walker into five cohesive modules
+- **typer**: flatten the walker modules and split calls, pipes and match along their seams
+- **typer**: update InferState with a spread so a unique state is reused in place
+- **typer**: split the inference walker by construct behind a walker record
+- **emit**: resolve a thunk's evidence frame in one pass and share one closure per capture-free fn
+- **typer**: build the effect default-ops table once per program, not once per module
+- **typer**: extend the handle-holding marks per module instead of closing over every earlier type
+- **compile**: prune the JSON bind library unless a Json derive needs it
+- **typer**: count a module's new env entries as they are added instead of re-walking the env per module
+- **typer**: keep infer_decl and the coverage walker allocation-free per decl and per node
+- **typer**: rewrite the infer modules' heaviest functions flat
+- **typer**: repoint ledgers and lint baseline at the infer modules
+- **typer**: split infer.kai into layered modules
+- **core-reach**: type the Eq/Ord impl groups only when the typed program needs them
+
 ## v0.165.2 (2026-10-18)
 
 ### Fixed
