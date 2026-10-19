@@ -25,22 +25,23 @@ import compiler.ast
 import compiler.symtab
 import compiler.decl_names
 import compiler.written
+import compiler.util
 import compiler.symtab_build
 
-#[doc("The modules one file can see: its own home, the names its selective imports pick, the modules its plain imports open, and the prelude cores. `quals` are the qualifiers the file binds, each to its module; they open nothing.")]
-pub type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick] }
+#[doc("The modules one file can see: its own home, the names its selective imports pick, the modules its plain imports open, and the prelude cores. `quals` are the qualifiers the file binds, each to its module; they open nothing. `pkgs` binds a module to the package it belongs to, for the modules that sit in one.")]
+pub type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick], pkgs: [SvPick] }
 
 #[doc("One name a selective import picks, bound to the module that exports it.")]
 pub type SvPick = SvPick(String, SymId)
 
 #[doc("A view that sees nothing but its own home. The root file before any import is resolved.")]
 pub fn sv_of_home(home: SymId) : ScopeView =
-  ScopeView { home: home, picks: [], imports: [], cores: [], quals: [] }
+  ScopeView { home: home, picks: [], imports: [], cores: [], quals: [], pkgs: [] }
 
 #[doc("The view of a file homed at `home`, picking `picks`, importing `imports`, over the prelude `cores`.")]
 pub fn sv_new(home: SymId, picks: [SvPick], imports: [SymId],
       cores: [SymId]) : ScopeView =
-  ScopeView { home: home, picks: picks, imports: imports, cores: cores, quals: [] }
+  ScopeView { home: home, picks: picks, imports: imports, cores: cores, quals: [], pkgs: [] }
 
 #[doc("The same view seen from `home`, keeping the file's imports and picks. The walk enters a new module without rebuilding what its file sees.")]
 pub fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
@@ -48,6 +49,26 @@ pub fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
 
 #[doc("The same view with the file's qualifier bindings.")]
 pub fn sv_with_quals(v: ScopeView, quals: [SvPick]) : ScopeView = ScopeView { ...v, quals: quals }
+
+#[doc("The same view with the package of each module that sits in one.")]
+pub fn sv_with_pkgs(v: ScopeView, pkgs: [SvPick]) : ScopeView = ScopeView { ...v, pkgs: pkgs }
+
+#[doc("Whether the declaration `s`, owned by the module `owner`, is within reach of this view's package: a declaration exported to its package alone is seen from the modules of that package, and a package is a directory with a manifest.")]
+pub fn sv_pkg_reaches(t: SymTab, v: ScopeView, s: SymId, owner: SymId) : Bool =
+  list_is_empty(v.pkgs) or not mint_package(sym_mint(t, s)) or sv_same_pkg(v, owner, v.home)
+
+fn sv_same_pkg(v: ScopeView, a: SymId, b: SymId) : Bool = pkgs_same(v.pkgs, a, b)
+
+#[doc("Whether the modules `a` and `b` sit in one package of `ps`.")]
+pub fn pkgs_same(ps: [SvPick], a: SymId, b: SymId) : Bool = match sv_pkg_of(ps, a) {
+  Some(pa) -> match sv_pkg_of(ps, b) { Some(pb) -> pa != "" and pa == pb  None -> false }
+  None     -> false
+}
+
+fn sv_pkg_of(ps: [SvPick], m: SymId) : Option[String] = match ps {
+  [] -> None
+  [SvPick(pkg, o), ...rest] -> if sym_raw(o) == sym_raw(m) { Some(pkg) } else { sv_pkg_of(rest, m) }
+}
 
 #[doc("The qualifier the file binds module `m` under, if it binds one.")]
 pub fn sv_qualifier(v: ScopeView, m: SymId) : Option[String] = sv_qual_of(v.quals, m)
@@ -60,7 +81,7 @@ fn sv_qual_of(qs: [SvPick], m: SymId) : Option[String] = match qs {
 #[doc("Every rung of the view rendered as text: two views that resolve some name differently render differently. A cache key folds it in.")]
 pub fn sv_key(v: ScopeView) : String =
   string_concat_all([int_to_string(sym_raw(v.home)), "|", sv_picks_key(v.picks), "|", sv_ids_key(v.imports),
-              "|", sv_ids_key(v.cores), "|", sv_picks_key(v.quals)])
+              "|", sv_ids_key(v.cores), "|", sv_picks_key(v.quals), "|", unwrap_or(sv_pkg_of(v.pkgs, v.home), "")])
 
 fn sv_ids_key(ms: [SymId]) : String = string_join(map(ms, (m) => int_to_string(sym_raw(m))), ",")
 
@@ -164,7 +185,7 @@ fn sv_any_visible(t: SymTab, v: ScopeView, cands: [SymId], name: String) : Bool 
   [] -> false
   [s, ...rest] -> {
     let o = sym_owner(t, s)
-    sym_raw(o) == sym_raw(v.home) or sv_reserved(o) or sym_exported(t, s) and sv_reaches(v, o, name)
+    sym_raw(o) == sym_raw(v.home) or sv_reserved(o) or sym_exported(t, s) and sv_pkg_reaches(t, v, s, o) and sv_reaches(v, o, name)
       or sv_any_visible(t, v, rest, name)
   }
 }
@@ -268,7 +289,7 @@ fn sv_on_rung(t: SymTab, v: ScopeView, r: SvRung, cands: [SymId],
     let owner = sym_owner(t, s)
     let at_home = sym_raw(owner) == sym_raw(v.home)
     let ok = sv_admits(v, r, owner, written_text(sym_name(t, s))) and
-             (at_home or sym_exported(t, s)) and
+             (at_home or sym_exported(t, s) and sv_pkg_reaches(t, v, s, owner)) and
              not sv_owner_seen(t, acc, owner)
     if ok { sv_on_rung(t, v, r, rest, [s, ...acc]) }
     else { sv_on_rung(t, v, r, rest, acc) }
@@ -311,3 +332,6 @@ pub fn sv_qualified(t: SymTab, cls: NCls, modn: String, name: String) : SvRes =
       None    -> SvNone
     }
   }
+
+#[doc("The package of the module `m` in `ps`; empty when `m` sits in none.")]
+pub fn pkgs_root(ps: [SvPick], m: SymId) : String = unwrap_or(sv_pkg_of(ps, m), "")

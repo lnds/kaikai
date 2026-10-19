@@ -233,6 +233,22 @@ also exports its variant constructors), `effect`, `protocol`, `unit`,
 `axiom` and `const`. A `pub const` is read from an importing module
 qualified (`lib.LIMIT`), unqualified, or in match-pattern position.
 
+`pub(pkg)` takes the same forms and exports to the package alone:
+
+```kaikai
+pub(pkg) fn helper(n: Int) : Int = n * 2       # every module under this kai.toml
+pub fn api(n: Int) : Int = helper(n)            # what other packages see
+```
+
+A module of the same package reads a `pub(pkg)` name like a `pub` one,
+and so do the files under the package's `tests/`; a module of another
+package gets an error naming the declaration (`` `helper` is `pub(pkg)`
+in module `lib`, which belongs to another package ``), bare or
+qualified. A `pub` signature cannot expose a `pub(pkg)` type, effect or
+protocol: the validator rejects the leak, since other packages read the
+signature. A `pub(pkg)` item needs no `#[doc]`, and `kai doc` leaves it
+out. It needs a package: in a file under no `kai.toml` it is an error.
+
 Private items cannot be imported by other packages. Public items in
 internal packages do NOT leak to consumers if the public package
 re-exports them through a public surface; the typer's pub-leak

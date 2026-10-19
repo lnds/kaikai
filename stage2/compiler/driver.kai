@@ -7,6 +7,7 @@ core loader and the AST dumper sit beside them.
 
 import compiler.site_ids_check
 import compiler.import_cycles
+import compiler.pkg_views
 import compiler.written_eq_check
 import compiler.util
 import compiler.verdicts
@@ -951,7 +952,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, line:
           rs_report(rs, [import_diag(importer_file(rs), line, col,
             "`#{mod_path}` is this file's own name, so it shadows the module it imports; rename the file")])
         } else if abs_path != rs_root(rs) and same_package(importer_file(rs), abs_path) {
-          rs_defer(rs, abs_path, owner, import_name)
+          rs_defer(rs, abs_path, owner, import_name, importer_file(rs))
         } else {
           rs_report(rs, [import_diag(importer_file(rs), line, col,
             "import cycle detected: #{format_cycle_chain(rs.in_progress, abs_path)}; cycles are allowed only between modules of one package (files under one kai.toml)")])
@@ -974,7 +975,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, line:
           None -> rs
           Some(me) -> match me {
             ME(_, exports, origin, unstable) ->
-              rs_bind_in(rs, owner, ME(import_name, exports, origin, unstable))
+              rs_bind_in(rs, owner, ME(import_name, me_exports_for(exports, unstable, reader_root(unstable, importer_file(rs))), origin, unstable))
           }
         }
       }
@@ -1042,15 +1043,16 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, line:
                   let exports = collect_pub_exports(kept, ftab, [])
                   let rs3 = rs_scan_imports(rs_note_names(rs_append_decls(rs2b, home, tagged, rows), abs_path, exports, kept),
                                             abs_path, abs_path, src, tokens, decls, home)
-                  let unstable_exports = collect_unstable_exports(kept, ftab, [])
+                  let unstable_exports = list_append(collect_unstable_exports(kept, ftab, []), package_markers(rows, abs_path))
                   let entry = ME(home, exports, abs_path, unstable_exports)
-                  let bound = ME(import_name, exports, abs_path, unstable_exports)
+                  let bound = ME(import_name, me_exports_for(exports, unstable_exports, reader_root(unstable_exports, importer_file(rs))), abs_path, unstable_exports)
                   # A module may qualify its own names by its file name,
                   # which is not its home once the path is nested.
                   let own = ME(last_segment(mod_path), exports, abs_path, unstable_exports)
                   let rs4 = rs_bind_in(rs_bind_in(rs_add_module(rs3, entry), owner, bound), home, own)
                   let released = foldl(rs_waiting(rs4, abs_path), rs4, (r, w) => match w {
-                    BE(_, o, written) -> rs_bind_in(r, o, ME(written, exports, abs_path, unstable_exports))
+                    Deferred(_, o, written, importer) ->
+                      rs_bind_in(r, o, ME(written, me_exports_for(exports, unstable_exports, reader_root(unstable_exports, importer)), abs_path, unstable_exports))
                   })
                   rs_release(released, abs_path)
                 }
@@ -1968,10 +1970,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let core_decls_l = tparam_bind_decls(surface_lower_decls(core_decls, tab0))
             let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si, _, _, _) -> si },
                                              mod_scopes, module_table, expanded_decls, tab0, target_mod_name)
+            let pkg_picks = package_picks(list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _, _) -> rows }, parsed.names),
+                                          module_table, path, target_mod_name)
             let sym_views = fv_build(mod_imps,
                                      sel_imports, mod_scopes, module_table,
                                      core_mod_names(core_mods, []),
-                                     target_mod_name)
+                                     target_mod_name, pkg_picks)
             # Every effect reference is settled to its declaration here, while
             # a qualified head or perform still carries its qualifier; two
             # modules declaring the same effect name each get a home-spelled one.
@@ -2032,8 +2036,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                            core_mod_names(core_mods, []))
             let qualified_core = rqc_decls(nu_scope_const_decls(qt_core, cs_coll, target_mod_name, mtabs_build([], module_table)), module_table, rqc_fx, diag_ctx)
             let qualified_decls = rqc_segmented(seg_marks, nu_scope_const_decls(vs_expanded, cs_coll, target_mod_name, mod_tabs), mod_tabs, rqc_fx, diag_ctx)
-            let missing_exports = list_append(mexp_decls(qualified_core, module_table, diag_ctx, target_mod_name),
-              mexp_segmented(seg_marks, qualified_decls, mod_tabs, target_mod_name, diag_ctx))
+            let missing_exports = list_append(mexp_decls(qualified_core, module_table, diag_ctx, target_mod_name, pkg_picks),
+              mexp_segmented(seg_marks, qualified_decls, mod_tabs, target_mod_name, diag_ctx, pkg_picks))
             # Emit warnings for consumed `#unstable` exports the user
             # hasn't opted into. Runs over the user
             # decls only (cores are part of the stdlib and the
@@ -2102,7 +2106,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               root_only_decls, tab1, path)
             let pub_access_vd =
               if type_name_coll != [] { vd_count(0) }
-              else { vd_render(validate_pub_access(pa_segs, tab1, list_append(fn_bounds, surface_fn_bounds), target_mod_name, core_mod_names(core_mods, []), diag_ctx)) }
+              else { vd_render(validate_pub_access(pa_segs, tab1, list_append(fn_bounds, surface_fn_bounds), target_mod_name, core_mod_names(core_mods, []), diag_ctx, pkg_picks)) }
             # Reject two `fn foo` decls in the same root file. Mirrors
             # the type check above. The resolver's `register_one`
             # prepends blindly so a second `fn foo` would otherwise

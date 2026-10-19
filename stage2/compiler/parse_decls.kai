@@ -25,9 +25,38 @@ fn parse_decl(p: Parser) : PDecl / Console {
     fail_d(p0, "`[<extern_c>] axiom` is removed (issue #260) — use `extern \"C\" fn name(...) : T / Ffi` instead")
   } else if tk_is(t.kind, TkExtern) {
     parse_extern_decl(p_advance(p0), t)
+  } else if at_pub_pkg(p0) {
+    parse_pub_pkg_decl(p0, t)
   } else {
     parse_decl_after_extern(p0, tk_is(t.kind, TkPub))
   }
+}
+
+fn at_pub_pkg(p: Parser) : Bool =
+  p_at(p, TkPub) and tk_is(p_peek1(p).kind, TkLparen) and tk_is(p_peek2(p).kind, TkIdent)
+    and string_slice(p.src, p_peek2(p).start, p_peek2(p).length) == "pkg"
+
+# `pub(pkg)` exports to the modules of the declaration's package alone: the rows it mints say so, and the
+# wrapper keeps the spelling for the formatter.
+fn parse_pub_pkg_decl(p0: Parser, pub_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p_advance(p_advance(p_advance(p0))), TkRparen, "expected `)` to close `pub(pkg`")
+  let hd = p_peek(p1)
+  match pub_rejection(hd) {
+    Some(msg) -> err_d(p_error(p1, hd, msg))
+    None -> {
+      package_wrap(parse_decl_head(p1, true, hd), pub_tok)
+    }
+  }
+}
+
+fn package_wrap(inner: PDecl, pub_tok: Token) : PDecl = match inner.r {
+  None -> inner
+  Some(d) -> PDecl { p: inner.p, r: Some(DAttr(pub_pkg_raw(), d, pub_tok.line, pub_tok.col)), bounds: inner.bounds,
+                     names: map(inner.names, package_row) }
+}
+
+fn package_row(e: NEnt) : NEnt = match e {
+  NEnt(cls, name, home, exported, mint) -> NEnt(cls, name, home, exported, if exported { NmPackage } else { mint })
 }
 
 fn parse_decl_after_extern(p0: Parser, is_pub: Bool) : PDecl / Console {
@@ -129,12 +158,16 @@ fn derive_names(nr: PDeriveNames, hash_tok: Token) : PDecl / Console =
 
 fn parse_derive_target(p: Parser, names: [String], hash_tok: Token) : PDecl / Console {
   let inner_pub = p_at(p, TkPub)
-  let p1 = if inner_pub { p_advance(p) } else { p }
+  let pkg_tok = p_peek(p)
+  let in_pkg = at_pub_pkg(p)
+  let p1 = if in_pkg { p_eat(p_advance(p_advance(p_advance(p))), TkRparen, "expected `)` to close `pub(pkg`") }
+           else if inner_pub { p_advance(p) } else { p }
   let hd = p_peek(p1)
   if not tk_is(hd.kind, TkType) {
     err_d(p_error(p1, hd, "`#[derive(...)]` must precede a `type` declaration"))
   } else {
-    wrap_decl(parse_type_decl(p_advance(p1), inner_pub, hd), (d) => DDerive(names, d, hash_tok.line, hash_tok.col))
+    let derived = wrap_decl(parse_type_decl(p_advance(p1), inner_pub, hd), (d) => DDerive(names, d, hash_tok.line, hash_tok.col))
+    if in_pkg { package_wrap(derived, pkg_tok) } else { derived }
   }
 }
 
@@ -262,6 +295,7 @@ fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) 
     [] -> bacc
     _ -> match (d, names) {
       (DFn(_, _, _, _, _, _, _, _, _, mo), [NEnt(_, name, _, _, _), ..._]) -> [FBR(name, mo, bs), ...bacc]
+      (DAttr(_, inner, _, _), _) -> fn_bounds_seed(inner, bs, names, bacc)
       _ -> bacc
     }
   }
