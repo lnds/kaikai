@@ -21,6 +21,7 @@ import compiler.pub_access_refs
 import compiler.pub_access_decl
 import compiler.pub_access_table
 import compiler.pa_index
+import compiler.scope_view
 import compiler.resolve_env
 import compiler.decl_names
 import compiler.symtab
@@ -29,19 +30,19 @@ import compiler.written
 
 type PaVerdict = PaVisible | PaPrivateTo(String) | PaUnknown
 
-type PaMeta = { name: String, kind: String, is_pub: Bool }
+type PaMeta = { name: String, kind: String, is_pub: Bool, pkg: Bool }
 
 # What every reference of one declaration is checked against.
 type PaCx = { table: PaIndex, tab: SymTab, home: String, target_mod: String,
-      cores: [String], file: String }
+      cores: [String], file: String, pkgs: [SvPick] }
 
 #[doc("Validate module privacy over the per-module decl segments: the violations, in source order. `bounds` carries every module's fn tparam bounds, keyed by the module that declares the fn (the parser strips them from the stored tparams into a side table).")]
 pub fn validate_pub_access(segs: [CoreSegment], tab: SymTab, bounds: [FnBoundsRec],
       target_mod: String, cores: [String],
-      df: DiagFiles) : [Diagnostic] / Console + File {
+      df: DiagFiles, pkgs: [SvPick]) : [Diagnostic] / Console + File {
   let table = pai_build(pa_table(segs, tab))
-  let e1 = pa_check_segs(segs, table, tab, target_mod, cores, df, [])
-  list_reverse(pa_check_bound_segs(segs, bounds, table, tab, df, e1))
+  let e1 = pa_check_segs(segs, table, tab, target_mod, cores, df, pkgs, [])
+  list_reverse(pa_check_bound_segs(segs, bounds, table, tab, df, pkgs, e1))
 }
 
 #[doc("The top-level declarations a root-file reference cannot reach: those of a name whose every carrier is non-`pub` in a foreign module.")]
@@ -150,13 +151,13 @@ fn pa_is_ctor(k: PaKind) : Bool = match k {
 # Each segment carries its own module, so the diagnostics for its
 # decls name that module's file rather than the root path.
 fn pa_check_segs(segs: [CoreSegment], table: PaIndex, tab: SymTab, target_mod: String,
-      cores: [String], df: DiagFiles,
+      cores: [String], df: DiagFiles, pkgs: [SvPick],
       errs: [Diagnostic]) : [Diagnostic] / Console + File = match segs {
   [] -> errs
   [PSeg(mod_name, ds), ...rest] -> {
     let cx = PaCx { table: table, tab: tab, home: mod_name, target_mod: target_mod,
-                    cores: cores, file: df_file_of(df, mod_name) }
-    pa_check_segs(rest, table, tab, target_mod, cores, df, pa_check_decls(ds, cx, errs))
+                    cores: cores, file: df_file_of(df, mod_name), pkgs: pkgs }
+    pa_check_segs(rest, table, tab, target_mod, cores, df, pkgs, pa_check_decls(ds, cx, errs))
   }
 }
 
@@ -164,26 +165,50 @@ fn pa_check_decls(ds: [Decl], cx: PaCx,
       errs: [Diagnostic]) : [Diagnostic] / Console + File = match ds {
   [] -> errs
   [d, ...rest] ->
-    pa_check_decls(rest, cx, pa_check_refs(pa_decl_refs(d), pa_decl_meta(d, cx.tab), cx, errs))
+    pa_check_decls(rest, cx, pa_check_decl(d, pa_decl_meta(d, cx.tab, not list_is_empty(cx.pkgs)), cx, errs))
+}
+
+fn pa_check_decl(d: Decl, meta: PaMeta, cx: PaCx, errs: [Diagnostic]) : [Diagnostic] / Console + File =
+  pa_check_refs(pa_decl_refs(d), meta, cx, list_append(pa_package_home(d, meta, cx), errs))
+
+# `pub(pkg)` is a promise about a package, which a file under no `kai.toml` is not part of.
+fn pa_package_home(d: Decl, meta: PaMeta, cx: PaCx) : [Diagnostic] =
+  if list_is_empty(cx.pkgs) or not meta.pkg or pkgs_root(cx.pkgs, st_module_id(cx.home)) != "" { [] }
+  else { match pa_decl_pos(d) {
+    Some(lc) -> [mk_diag(SevError, cx.file, lc.fst, lc.snd, "`pub(pkg)` needs a package, and no `kai.toml` encloses this file", [])]
+    None     -> []
+  } }
+
+fn pa_decl_pos(d: Decl) : Option[(Int, Int)] = match d {
+  DFn(_, _, _, _, _, _, _, l, c, _)   -> Some((l, c))
+  DConst(_, _, _, _, _, l, c)         -> Some((l, c))
+  DType(_, _, _, _, l, c, _, _)       -> Some((l, c))
+  DEffect(_, _, _, _, _, l, c, _)     -> Some((l, c))
+  DProtocol(_, _, _, _, l, c, _)      -> Some((l, c))
+  DDerive(_, inner, _, _)             -> pa_decl_pos(inner)
+  _                                   -> None
 }
 
 fn pa_meta(name: String, kind: String, is_pub: Bool) : PaMeta =
-  PaMeta { name: name, kind: kind, is_pub: is_pub }
+  PaMeta { name: name, kind: kind, is_pub: is_pub, pkg: false }
 
-fn pa_decl_meta(d: Decl, tab: SymTab) : PaMeta = match d {
-  DFn(is_pub, fid, _, _, _, _, _, _, _, _)     -> pa_meta(pa_sym_text(tab, fnid_sym(fid)), "fn", is_pub)
+fn pa_meta_s(tab: SymTab, pk: Bool, s: SymId, kind: String, is_pub: Bool) : PaMeta =
+  PaMeta { name: pa_sym_text(tab, s), kind: kind, is_pub: is_pub, pkg: pk and mint_package(sym_mint(tab, s)) }
+
+fn pa_decl_meta(d: Decl, tab: SymTab, pk: Bool) : PaMeta = match d {
+  DFn(is_pub, fid, _, _, _, _, _, _, _, _)     -> pa_meta_s(tab, pk, fnid_sym(fid), "fn", is_pub)
   DAxiom(is_pub, _, name, _, _, _, _, _, _, _) -> pa_meta(name, "axiom", is_pub)
-  DConst(is_pub, s, _, _, _, _, _)             -> pa_meta(pa_sym_text(tab, s), "const", is_pub)
-  DType(is_pub, s, _, _, _, _, _, _)           -> pa_meta(pa_sym_text(tab, s), "type", is_pub)
-  DEffect(is_pub, s, _, _, _, _, _, _)         -> pa_meta(pa_sym_text(tab, s), "effect", is_pub)
-  DProtocol(is_pub, s, _, _, _, _, _)          -> pa_meta(pa_sym_text(tab, s), "protocol", is_pub)
+  DConst(is_pub, s, _, _, _, _, _)             -> pa_meta_s(tab, pk, s, "const", is_pub)
+  DType(is_pub, s, _, _, _, _, _, _)           -> pa_meta_s(tab, pk, s, "type", is_pub)
+  DEffect(is_pub, s, _, _, _, _, _, _)         -> pa_meta_s(tab, pk, s, "effect", is_pub)
+  DProtocol(is_pub, s, _, _, _, _, _)          -> pa_meta_s(tab, pk, s, "protocol", is_pub)
   DUnit(is_pub, name, _, _, _, _, _)           -> pa_meta(name, "unit", is_pub)
-  DDerive(_, inner, _, _)    -> pa_decl_meta(inner, tab)
-  DUnstable(inner, _, _)     -> pa_decl_meta(inner, tab)
-  DProtoLaws(_, inner, _, _, _) -> pa_decl_meta(inner, tab)
-  DImplAxiom(_, inner, _, _, _) -> pa_decl_meta(inner, tab)
-  DConstructor(inner, _, _)  -> pa_decl_meta(inner, tab)
-  DDoc(_, _, inner, _, _)    -> pa_decl_meta(inner, tab)
+  DDerive(_, inner, _, _)    -> pa_decl_meta(inner, tab, pk)
+  DUnstable(inner, _, _)     -> pa_decl_meta(inner, tab, pk)
+  DProtoLaws(_, inner, _, _, _) -> pa_decl_meta(inner, tab, pk)
+  DImplAxiom(_, inner, _, _, _) -> pa_decl_meta(inner, tab, pk)
+  DConstructor(inner, _, _)  -> pa_decl_meta(inner, tab, pk)
+  DDoc(_, _, inner, _, _)    -> pa_decl_meta(inner, tab, pk)
   # An impl is not an exported signature of its own; its references
   # get the cross-module check but never the leak rule.
   _ -> pa_meta("", "", false)
@@ -218,7 +243,8 @@ fn pa_check_written(r: PaRef, n: String, meta: PaMeta, cx: PaCx) : [Diagnostic] 
 # reachable when its reader's own or `pub`, and a leak when a `pub`
 # signature exposes a non-`pub` one of its own module.
 fn pa_check_sym(r: PaRef, s: SymId, meta: PaMeta, cx: PaCx) : [Diagnostic] =
-  if not st_valid(cx.tab, s) or sym_exported(cx.tab, s) { [] }
+  if not list_is_empty(cx.pkgs) and st_valid(cx.tab, s) and sym_exported(cx.tab, s) and mint_package(sym_mint(cx.tab, s)) { pa_check_package_sym(r, s, meta, cx) }
+  else if not st_valid(cx.tab, s) or sym_exported(cx.tab, s) { [] }
   else if not sym_owned_by(cx.tab, s, st_module_id(cx.home)) {
     [pa_diag_private(cx.file, r, pa_sym_text(cx.tab, s), written_text(sym_home(cx.tab, s)))]
   }
@@ -229,6 +255,30 @@ fn pa_check_sym(r: PaRef, s: SymId, meta: PaMeta, cx: PaCx) : [Diagnostic] =
     }
   }
   else { [] }
+
+# A `pub(pkg)` declaration is reachable from the modules of its package and leaks
+# when a `pub` signature, which other packages read, exposes one of its types.
+fn pa_check_package_sym(r: PaRef, s: SymId, meta: PaMeta, cx: PaCx) : [Diagnostic] =
+  if not pkgs_same(cx.pkgs, sym_owner(cx.tab, s), st_module_id(cx.home)) {
+    [pa_diag_package(cx.file, r, pa_sym_text(cx.tab, s), written_text(sym_home(cx.tab, s)))]
+  }
+  else if meta.is_pub and not meta.pkg and pa_leak_position(r, meta) {
+    match pa_cls_leak_word(sym_class(cx.tab, s)) {
+      Some(w) -> [pa_diag_package_leak(cx.file, r, meta, pa_sym_text(cx.tab, s), w)]
+      None    -> []
+    }
+  }
+  else { [] }
+
+fn pa_diag_package(file: String, r: PaRef, name: String, owner: String) : Diagnostic =
+  mk_diag(SevError, file, r.line, r.col,
+    concat_all(["`", name, "` is `pub(pkg)` in module `", owner,
+      "`, which belongs to another package; declare it `pub` there to use it from here"]), [])
+
+fn pa_diag_package_leak(file: String, r: PaRef, meta: PaMeta, name: String, kind_word: String) : Diagnostic =
+  mk_diag(SevError, file, r.line, r.col,
+    concat_all(["pub ", meta.kind, " `", meta.name, "` exposes ", kind_word, " `", name,
+      "`, which is `pub(pkg)`; mark `", meta.name, "` `pub(pkg)` too or remove it from the signature"]), [])
 
 # The kind word of a class the leak rule covers: the type namespace
 # without constructors, which a type exposes on its own.
@@ -271,15 +321,15 @@ fn pa_diag_leak(file: String, r: PaRef, meta: PaMeta, name: String, kind_word: S
 # parser stores fn-decl bounds in a side table instead of the tparam
 # string — walk each module's fn decls against its own bounds.
 fn pa_check_bound_segs(segs: [CoreSegment], bounds: [FnBoundsRec],
-      table: PaIndex, tab: SymTab, df: DiagFiles,
+      table: PaIndex, tab: SymTab, df: DiagFiles, pkgs: [SvPick],
       errs: [Diagnostic]) : [Diagnostic] = match segs {
   [] -> errs
   [PSeg(mod_name, ds), ...rest] -> {
     let own = filter(bounds, (b) => match b { FBR(_, mo, _) -> mo == Some(mod_name) })
     let cx = PaCx { table: table, tab: tab, home: mod_name, target_mod: mod_name,
-                    cores: [], file: df_file_of(df, mod_name) }
+                    cores: [], file: df_file_of(df, mod_name), pkgs: pkgs }
     let e1 = if list_length(own) == 0 { errs } else { pa_check_bound_decls(ds, own, cx, errs) }
-    pa_check_bound_segs(rest, bounds, table, tab, df, e1)
+    pa_check_bound_segs(rest, bounds, table, tab, df, pkgs, e1)
   }
 }
 

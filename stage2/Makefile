@@ -13906,6 +13906,10 @@ test-own-blocks-native: $(TARGET) bin-kai
 test-intra-pkg-cycles: $(TARGET) bin-kai
 	@../tests/intra_pkg_cycles.sh
 
+# `pub(pkg)` reaches the modules of the declaring package, its tests included, and no other.
+test-pub-pkg: $(TARGET) bin-kai
+	@../tests/pub_pkg.sh
+
 # Targets that drive `bin/kai` with KAI_BACKEND=native. On a kaic2 built
 # without libLLVM the wrapper degrades to the C backend, so running these
 # in the C-built tier1 job asserts nothing about native — they belong to
