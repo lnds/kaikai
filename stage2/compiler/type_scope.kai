@@ -1,3 +1,5 @@
+#[doc("The scope of type names, and the table it is read from.")]
+
 # compiler/type_scope.kai — module scoping for type names.
 #
 # Every annotation, record literal and type-qualified constructor path
@@ -10,17 +12,17 @@
 
 import compiler.util
 import compiler.ast
-import compiler.modules_dotted
+import compiler.modules_paths
 import compiler.modules_segments
-import compiler.scope_walk
-import compiler.type_scope_table
-import compiler.decl_map
+import compiler.scope_view
+import compiler.symtab
 import compiler.name_contest
 import compiler.written
 import compiler.module_tables
+import compiler.module_table
 
 #[doc("Settle the contested type names of each import segment under its own module's viewpoint; the decls past the marks are the root file's. `sels` carries every file's selective imports, which outrank the plain import list on a contested bare name.")]
-pub fn ts_segmented(segs: [ImportSeg], decls: [Decl], coll: [TSEntry],
+pub(pkg) fn ts_segmented(segs: [ImportSeg], decls: [Decl], coll: [TSEntry],
       tabs: ModTables, imps: [ModImports], target: String,
       cores: [String], sels: [SelImport]) : [Decl] =
   if list_length(coll) == 0 { decls }
@@ -38,8 +40,7 @@ fn ts_seg_loop(segs: [ImportSeg], decls: [Decl], coll: [TSEntry],
   }
 }
 
-#[doc("One module's viewpoint: its home, the root's, the cores, its imports, the names its selective imports pick, and its qualifier table.")]
-pub fn ts_ctx(coll: [TSEntry], home: String, target: String, cores: [String],
+fn ts_ctx(coll: [TSEntry], home: String, target: String, cores: [String],
       tabs: ModTables, imps: [ModImports],
       sels: [SelImport]) : TSCtx = {
   let owner = if home == target { "" } else { home }
@@ -119,8 +120,7 @@ fn ts_ty_opt(o: Option[TypeExpr], cx: TSCtx) : Option[TypeExpr] = match o {
   Some(t) -> Some(ts_ty(t, cx))
 }
 
-#[doc("Settle the nominal type names inside a type.")]
-pub fn ts_ty(t: TypeExpr, cx: TSCtx) : TypeExpr = {
+fn ts_ty(t: TypeExpr, cx: TSCtx) : TypeExpr = {
   let k = match t.tkind {
     TyName(r, ts) -> TyName(ts_ref(r, list_length(ts), cx), map(ts, (x) => ts_ty(x, cx)))
     TyParam(p, ts) -> TyParam(p, map(ts, (x) => ts_ty(x, cx)))
@@ -199,3 +199,164 @@ fn ts_qualified_path(e: Expr, inner: Expr, mid: String, f: String,
 
 fn ts_re(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+#[doc("One scoped type declaration: `TSE(name, home, pub, arity, is_alias)`. Nominal entries exist only when contested; alias entries always. Root declarations carry the target module as home.")]
+pub(pkg) type TSEntry = TSE(String, String, Bool, Int, Bool)
+
+type TSCtx = { coll: [TSEntry], home: String, target: String, cores: [String],
+                   imports: [String], picks: [NPick], mt: [ModuleEntry] }
+
+#[doc("The type declarations of `decls` that carry per-home identity: contested nominals and aliases, plus every remaining transparent alias. Single-name bodies resolving to effects stay with the effect-alias machinery.")]
+pub(pkg) fn ts_collect(decls: [Decl], tab: SymTab, target: String, effs: [String]) : [TSEntry] = {
+  let all = ts_entries(decls, tab, target, effs, [])
+  let kept = ts_keep_contested(all, all, [])
+  ts_add_uncontested_aliases(all, kept, kept)
+}
+
+fn ts_entries(ds: [Decl], tab: SymTab, target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> ts_entries(rest, tab, target, effs, ts_entry(d, tab, target, effs, acc))
+}
+
+fn ts_entry(d: Decl, tab: SymTab, target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match decl_transparent_inner(d) {
+  Some(inner) -> ts_entry(inner, tab, target, effs, acc)
+  None -> match d {
+    DType(p, s, tps, body, _, _, mo, _) ->
+      if ts_scoped_body(body, effs) {
+        [TSE(written_text(sym_name(tab, s)), match mo { Some(m) -> m  None -> target }, p,
+             list_length(tps), ts_is_alias_body(body)), ...acc]
+      } else { acc }
+    _ -> acc
+  }
+}
+
+fn ts_scoped_body(body: TypeBody, effs: [String]) : Bool = match body {
+  TBRecord(_) -> true
+  TBSum(_)    -> true
+  TBAlias(t)  -> not ts_effect_named(t, effs)
+  TBEffectAlias(_) -> false
+}
+
+fn ts_is_alias_body(body: TypeBody) : Bool = match body {
+  TBAlias(_) -> true
+  _          -> false
+}
+
+fn ts_effect_named(t: TypeExpr, effs: [String]) : Bool = match t.tkind {
+  TyName(DrWritten(None, n), []) -> list_has(effs, written_text(n))
+  _ -> false
+}
+
+fn ts_keep_contested(all: [TSEntry], todo: [TSEntry], acc: [TSEntry]) : [TSEntry] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    TSE(n, home, _, _, _) ->
+      if ts_other_home(all, n, home) { ts_keep_contested(all, rest, [e, ...acc]) }
+      else { ts_keep_contested(all, rest, acc) }
+  }
+}
+
+fn ts_other_home(t: [TSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [TSE(n, h, _, _, _), ...rest] ->
+    if n == name and h != home { true } else { ts_other_home(rest, name, home) }
+}
+
+# An uncontested alias still settles always, so its name can never be
+# captured by an unrelated module at expansion time.
+fn ts_add_uncontested_aliases(all: [TSEntry], kept: [TSEntry], acc: [TSEntry]) : [TSEntry] =
+  match all {
+    [] -> acc
+    [e, ...rest] -> match e {
+      TSE(n, h, _, _, is_alias) ->
+        if is_alias and not ts_declares(kept, n, h) {
+          ts_add_uncontested_aliases(rest, kept, [e, ...acc])
+        } else { ts_add_uncontested_aliases(rest, kept, acc) }
+    }
+  }
+
+# The declaration `name` of `home` is, when the scope tells it from its
+# homonyms: an entry of a module that is neither core nor root.
+# `sym_none()` otherwise, and the name stays as written.
+fn ts_scoped_sym(cx: TSCtx, name: String, home: String) : SymId =
+  if home == cx.target or list_has(cx.cores, home) { sym_none() }
+  else { match ts_entry_of(cx.coll, name, home) {
+    Some(_) -> sym_derive(NCType, name, home)
+    None    -> sym_none()
+  } }
+
+fn ts_entry_of(t: [TSEntry], name: String, home: String) : Option[TSEntry] =
+  match t {
+    [] -> None
+    [e, ...rest] -> match e {
+      TSE(n, h, _, _, _) ->
+        if n == name and h == home { Some(e) } else { ts_entry_of(rest, name, home) }
+    }
+  }
+
+fn ts_declares(t: [TSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [TSE(n, h, _, _, _), ...rest] ->
+    if n == name and h == home { true } else { ts_declares(rest, name, home) }
+}
+
+# Only an alias entry is arity-gated: a 0-argument alias must not answer
+# a generic use like `Option[Int]` (the generic core type wins those),
+# and a parameterised alias must not answer a bare use. Nominal entries
+# stay arity-agnostic, exactly as before.
+fn ts_arity_ok(e: TSEntry, nargs: Int) : Bool = match e {
+  TSE(_, _, _, arity, is_alias) -> not is_alias or arity == nargs
+}
+
+fn ts_resolve(cx: TSCtx, name: String, nargs: Int) : SymId =
+  match ts_entry_of(cx.coll, name, cx.home) {
+    Some(e) ->
+      if ts_arity_ok(e, nargs) { ts_scoped_sym(cx, name, cx.home) }
+      else { ts_resolve_imported(cx, name, nargs) }
+    None -> ts_resolve_imported(cx, name, nargs)
+  }
+
+# A selective import naming the type outranks the plain import list:
+# `import m.{T}` says which `T` the file means, so it decides even when
+# a second import also exports one.
+fn ts_resolve_imported(cx: TSCtx, name: String, nargs: Int) : SymId =
+  match ts_imported(cx.coll, name, nargs, nt_pick_homes(cx.picks, name, []), []) {
+    [h] -> ts_scoped_sym(cx, name, h)
+    _   -> match ts_imported(cx.coll, name, nargs, cx.imports, []) {
+      [h] -> ts_scoped_sym(cx, name, h)
+      _   -> sym_none()
+    }
+  }
+
+fn ts_imported(t: [TSEntry], name: String, nargs: Int, imports: [String],
+      acc: [String]) : [String] = match t {
+  [] -> acc
+  [e, ...rest] -> match e {
+    TSE(n, h, p, _, _) -> {
+      let cand = n == name and p and list_has(imports, h)
+      let ok = cand and ts_arity_ok(e, nargs) and not list_has(acc, h)
+      if ok { ts_imported(rest, name, nargs, imports, [h, ...acc]) }
+      else { ts_imported(rest, name, nargs, imports, acc) }
+    }
+  }
+}
+
+fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String, nargs: Int) : Option[SymId] =
+  match mt_lookup_member(cx.mt, mod, name) {
+    None -> None
+    Some(me) -> {
+      let home = mt_member_home(cx.mt, mod, name)
+      match ts_entry_of(cx.coll, name, home) {
+        None -> None
+        Some(e) ->
+          if me_has_export(me, name) and ts_arity_ok(e, nargs) {
+            Some(sym_derive(NCType, name, home))
+          } else { None }
+      }
+    }
+  }
+
+fn ts_is_module(cx: TSCtx, name: String) : Bool = match mt_lookup(cx.mt, name) {
+  Some(_) -> true
+  None    -> false
+}
