@@ -20543,10 +20543,30 @@ static KaiEvidence *kai_disp_at_push(KaiEvidence *node) {
     return node->disp_hops ? n : NULL;
 }
 
-/* The nearest node handling `eff_label` from `n` down to `stop`, `skip` aside. */
+static int kai_ev_on_chain(KaiEvidence *n, KaiEvidence *stop, KaiEvidence *node) {
+    for (; n != stop && n != NULL; n = n->parent) {
+        if (n == node) return 1;
+    }
+    return 0;
+}
+
+/* The nearest node handling `eff_label` from `n` down to `stop`, in the
+ * context of the clause `skip` is dispatching. That clause runs outside its
+ * handler: `skip` and the nodes above it that were already pushed when the
+ * clause began (handlers nested inside the handle) are out of reach. The
+ * nodes the clause pushed since remember `skip` in their dispatch mask. A
+ * `skip` pushed by another clause was itself outside that clause's handler,
+ * so the same rule continues from there. */
 static KaiEvidence *kai_ev_find(KaiEvidence *n, KaiEvidence *stop, const char *eff_label, KaiEvidence *skip) {
+    KaiEvidence *cur = skip != NULL && kai_ev_on_chain(n, stop, skip) ? skip : NULL;
     for (; n != stop; n = n->parent) {
-        if (n != skip && (n->eff_label == eff_label || kai_eff_label_match(n->eff_label, eff_label))) return n;
+        if (n == cur) {
+            cur = kai_disp_at_push(n);
+            if (cur != NULL && !kai_ev_on_chain(n->parent, stop, cur)) cur = NULL;
+            continue;
+        }
+        if (cur != NULL && kai_disp_at_push(n) != cur) continue;
+        if (n->eff_label == eff_label || kai_eff_label_match(n->eff_label, eff_label)) return n;
     }
     return NULL;
 }
