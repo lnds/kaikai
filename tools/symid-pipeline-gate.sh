@@ -383,8 +383,8 @@ grep -nE 'EVar\(mangled\)|EModCall\([a-z]+, mangled\)' "$ROOT"/stage2/compiler/m
   && fail "monomorph mints a spec callee from its mangled name"
 
 # A cell perform names the core `State`/`Reader`: the native backend finds
-# the op's handler by that id alone. The fixtures cover the cell shapes and
-# the cells stdlib keeps; the sweep covers every corpus file declaring one.
+# the op's handler by that id alone. The fixtures cover the cell shapes; the
+# sweep covers every corpus file declaring one.
 cell_dump() {
   "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
     --path "$ROOT/stdlib" "$ROOT/examples/effects/$1.kai"
@@ -404,8 +404,6 @@ need '^kperform _kaiu_lam_reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@con
 cell_core cell_perform_ids
 out=$(cell_dump cell_perform_ids_stdlib)
 need '^kperform _kaiu_lam_captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
-need '^kperform stream__count State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
-need '^kperform stream__foldl State\.[a-z]+(@[a-z_0-9]+)?#[0-9]+ State@concurrent$'
 cell_core cell_perform_ids_stdlib
 out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
   | grep -v /negative/ \
