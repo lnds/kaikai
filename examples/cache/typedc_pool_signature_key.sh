@@ -8,6 +8,11 @@
 # compile again, even though a blob typed against the old signature is in
 # the cache. Each class is checked on its own, and each edit is first shown
 # to fail with no cache, so a pass cannot come from anything but the key.
+# The key reads the scheme, not the spelling: renaming a type parameter is
+# a hit. A bound is not part of the scheme the typer reads (the lowering
+# strips it and the monomorphiser checks it against the declaration each
+# compile), so a blob does not depend on it; the bound class below shows the
+# check still bites with a blob cached.
 
 set -eu
 
@@ -33,7 +38,8 @@ fn main() : Unit / Stdout = {
   let b: Int = probe_ret(1)
   let c: Int = probe_row(1)
   let d: Int = probe_bound(Opaque(1))
-  Stdout.print(show(a + b + c + d))
+  let e: Int = probe_gen(1)
+  Stdout.print(show(a + b + c + d + e))
 }
 EOF
 
@@ -43,7 +49,7 @@ compile() {
   KAIKAI_STDLIB_PATH="$WORK/stdlib" "$KAIC2" $EDITION_FLAG --path "$WORK/stdlib" --path "$PROJ" "$@" "$f" > "$WORK/out.c" 2> "$WORK/err"
 }
 
-write_probes() { # $1 param, $2 ret, $3 row, $4 bound
+write_probes() { # $1 param, $2 ret, $3 row, $4 bound, $5 generic type parameter, $6 its bound
   rm -rf "$WORK/stdlib"
   cp -R "$ROOT/stdlib" "$WORK/stdlib"
   cat >> "$WORK/stdlib/core/string.kai" <<EOF
@@ -52,6 +58,7 @@ pub fn probe_param(x: $1) : Int = panic("probe")
 pub fn probe_ret(x: Int) : $2 = panic("probe")
 pub fn probe_row(x: Int) : Int$3 = panic("probe")
 pub fn probe_bound$4(x: T) : Int = panic("probe")
+pub fn probe_gen[${5:-T}: ${6:-Show}](x: ${5:-T}) : Int = panic("probe")
 EOF
 }
 
@@ -79,5 +86,20 @@ edit_class "return type" "$BASE_PARAM" "String" "$BASE_ROW" "$BASE_BOUND"
 edit_class "effect row" "$BASE_PARAM" "$BASE_RET" " / File" "$BASE_BOUND"
 edit_class "type parameter bound" "$BASE_PARAM" "$BASE_RET" "$BASE_ROW" "[T: Show]"
 
-echo "typedc_pool_signature_key: OK — an edit of a parameter type, a return type, an effect row or a type parameter bound of a function typed on demand is never served from a typed blob of the old signature"
+blobs() { ls "$CACHE"/tm-*.kab 2>/dev/null | wc -l | tr -d ' '; }
+
+# A rename keeps the scheme: nothing is re-keyed, nothing is published.
+write_probes "$BASE_PARAM" "$BASE_RET" "$BASE_ROW" "$BASE_BOUND"
+cached || fail "the baseline does not compile with the cache"
+before="$(blobs)"
+write_probes "$BASE_PARAM" "$BASE_RET" "$BASE_ROW" "$BASE_BOUND" U Show
+cached || fail "renaming a type parameter breaks the program"
+[ "$(blobs)" -eq "$before" ] || fail "renaming a type parameter missed the cache ($before -> $(blobs) blobs)"
+
+# A bound the argument still meets changes no scheme: the blobs are served.
+write_probes "$BASE_PARAM" "$BASE_RET" "$BASE_ROW" "$BASE_BOUND" T Eq
+cached || fail "changing a bound to one the argument meets breaks the program"
+[ "$(blobs)" -eq "$before" ] || fail "changing a bound re-keyed the typed blobs ($before -> $(blobs))"
+
+echo "typedc_pool_signature_key: OK — an edit of a parameter type, a return type, an effect row or a type parameter bound of a function typed on demand is never served from a typed blob of the old signature, and renaming a type parameter or changing a bound keeps the blobs"
 exit 0
