@@ -328,7 +328,7 @@ pub fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int)
       # accept it after the symmetric `unify` failed, with no
       # substitution side-effects: the runtime layout is identical.
       if union_upcast_ok(st.env, a1, b1) { st }
-      else { match rigid_forced(st, a, b) {
+      else { match rigid_either(st, a, b) {
         Some(RigidWhy(msg, help)) -> {
           diag_error(st.file, line, col, msg)
           diag_help(help)
@@ -343,6 +343,25 @@ pub fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int)
         }
       } }
     }
+  }
+}
+
+
+fn rigid_either(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match rigid_forced(st, a, b) {
+  Some(w) -> Some(w)
+  None    -> rigid_row_forced(st, a, b)
+}
+
+
+# A declared row variable stands for whatever effects the callers choose, so
+# a pure function type cannot take its place: the unification that fails
+# here succeeds once the declared rows are let go.
+fn rigid_row_forced(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match st.sub.rigid_rows {
+  [] -> None
+  _  -> match unify_env(st.env, a, b, subst_with_rigid_rows(st.sub, [])) {
+    None    -> None
+    Some(_) -> Some(RigidWhy("a function that may perform effects is used where a pure function type is expected: the row variable declared on the enclosing function stands for any effects its callers choose",
+                             "widen the expected function type with the row (`/ e`), or handle the effect before this point"))
   }
 }
 
@@ -535,7 +554,9 @@ pub fn st_unify_named(st: InferState, who: Option[String], callee_ty: Ty,
       let d = build_wrong_arity_diag(st.env, st.file, who, resolved_callee, arg_tys, line, col)
       st_bump_err(st_push_diag(st, d))
     }
-    None -> {
+    None -> match rigid_row_call(st, who, callee_ty, arg_tys, expected_fn_ty, line, col) {
+      Some(st_row) -> st_row
+      None -> {
       let pre_errs = st.errs
       let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
       if st1.errs > pre_errs {
@@ -548,7 +569,76 @@ pub fn st_unify_named(st: InferState, who: Option[String], callee_ty: Ty,
                                               arg_tys, st1.file, line, col, expected_shown)
         st_refine_diag(st1, d)
       } else { st1 }
+      }
     }
+  }
+}
+
+
+# The call whose argument is the effectful function a pure parameter rejects:
+# names the argument, the parameter's pure type and the way out.
+fn rigid_row_call(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [Ty], expected_fn_ty: Ty,
+                  line: Int, col: Int) : Option[InferState] / Console + File + Mutable =
+  if st.sub.rigid_rows == [] or rigid_row_unifies(st, callee_ty, expected_fn_ty) { None }
+  else { match rigid_row_forced(st, callee_ty, expected_fn_ty) {
+    None -> None
+    Some(RigidWhy(msg, help)) -> {
+      let resolved = apply_ty(st.sub, callee_ty)
+      let notes = match rigid_row_pure_arg(st, resolved, arg_tys) {
+        Some(idx) -> [rigid_row_arg_note(st.env, who, resolved, idx)]
+        None      -> []
+      }
+      diag_error(st.file, line, col, msg)
+      for_each_note(notes)
+      diag_help(help)
+      let rel = list_append(map(notes, (n) => ri_note(st.file, line, col, n)), [ri_help(st.file, line, col, help)])
+      Some(st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, rel))))
+    }
+  } }
+
+
+fn rigid_row_pure_arg(st: InferState, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] / Mutable =
+  match first_failing_arg(st.env, st.sub, callee_ty, arg_tys) {
+    Some(i) -> Some(i)
+    None    -> match callee_ty {
+      TyFnT(ps, _, _) -> first_pure_fn_param(ps, 1)
+      _               -> None
+    }
+  }
+
+
+fn first_pure_fn_param(ps: [Ty], idx: Int) : Option[Int] = match ps {
+  []           -> None
+  [p, ...rest] -> match p {
+    TyFnT(_, _, row) -> if row.labels == [] and row.tail == None { Some(idx) } else { first_pure_fn_param(rest, idx + 1) }
+    _                -> first_pure_fn_param(rest, idx + 1)
+  }
+}
+
+
+fn rigid_row_unifies(st: InferState, a: Ty, b: Ty) : Bool / Mutable = match unify_env(st.env, a, b, st.sub) {
+  Some(_) -> true
+  None    -> false
+}
+
+
+fn for_each_note(notes: [String]) : Unit / Console = match notes {
+  []           -> ()
+  [n, ...rest] -> { diag_note(n); for_each_note(rest) }
+}
+
+
+fn rigid_row_arg_note(env: TyEnv, who: Option[String], callee_ty: Ty, idx: Int) : String = {
+  let param = match callee_ty {
+    TyFnT(ps, _, _) -> match nth(ps, idx - 1) {
+      Some(p) -> concat_all([" is pure (`", inf_ty_to_string_ow(env.tab, env.head_owners, p), "`)"])
+      None    -> " is pure"
+    }
+    _ -> " is pure"
+  }
+  match who {
+    Some(nm) -> concat_all(["argument ", int_to_string(idx), " of `", nm, "`", param])
+    None     -> concat_all(["argument ", int_to_string(idx), param])
   }
 }
 
