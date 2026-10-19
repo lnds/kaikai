@@ -166,6 +166,8 @@ import compiler.law_checks
 import compiler.core_cut
 import compiler.core_demand
 import compiler.core_precut
+import compiler.core_front
+import compiler.core_mangle
 import compiler.core_typed_cut
 import compiler.cache_ast
 import compiler.doc_attr
@@ -1194,6 +1196,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpCallElision))
       } else if a == "--dump-brands" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpBrands))
+      } else if a == "--check-core-front" {
+        parse_cli_loop(more, cli_with_early_cut(cli_with_mode(opts, MCheckCoreFront), EcOff))
       } else if a == "--dump=evidence-obligations" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpEvidenceObligations))
       } else if a == "--dump=evidence-arity" {
@@ -1854,6 +1858,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let prunes = core_prunes(mode, backend, core_cache, core_hit)
             let core_decls_whole = core_decls
             let core_segs_whole = core_segs
+            let surface_decls_whole = surface_decls
             let lib_mods = if prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _) -> mt }) } else { [] }
             let lib_fns = list_append(core_decls, precut_lib_fns(surface_decls, lib_mods))
             let pcut = if prunes { early_cut(core_cache.early_cut, lib_fns, precut_rest(surface_decls, lib_mods), tab0, cmod_plain(backend, mode)) } else { None }
@@ -2135,8 +2140,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `__ref_pred_T(name)` guard so match-arm narrowing keeps
             # working under the unified parser path. Non-alias
             # `PNarrow` survives for the typer's union-component check.
-            let merged_raw_synth = lower_pattern_narrow_decls(merged_raw_synth_ref, tab2, sym_views, target_mod_name,
-                                                              collect_refine_alias_ids(merged_raw_synth_ref))
+            let narrow_aliases = collect_refine_alias_ids(merged_raw_synth_ref)
+            let merged_raw_synth = lower_pattern_narrow_decls(merged_raw_synth_ref, tab2, sym_views, target_mod_name, narrow_aliases)
             # Lower DAxiom → DFn(body=todo!) before any other Decl
             # walker runs. Subsequent passes (alias resolution,
             # builtin injection, desugars, typer) see only ordinary
@@ -2164,8 +2169,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let usites = nu_unit_sites(merged_pre_kinds, target_mod_name)
             let hab_view = hab_view_of(mod_imps,
                                        core_mod_names(core_mods, []), target_mod_name)
-            let merged_kr = resolve_kinds_decls(merged_pre_kinds, kind_reg,
-              usites, target_mod_name, hab_view)
+            let kind_ctx_a = resolve_kinds_ctx(merged_pre_kinds, kind_reg, usites, hab_view)
+            let merged_kr = resolve_kinds_decls_in(kind_ctx_a, merged_pre_kinds, usites, target_mod_name)
             let kind_ctx = build_kind_ctx(merged_kr, tab3, kind_reg, usites, hab_view)
             # Atomic (kind, theory) pairs, captured before the catalog
             # decls are stripped; the typer's unit formation and
@@ -2275,8 +2280,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # or ill-shaped alias argument diagnoses at its use site.
             # Gated on the first validation being clean to avoid
             # duplicate diagnostics.
-            let raw_decls_pre_pos = resolve_kinds_decls(raw_decls_pre_pos0,
-              kind_reg, usites, target_mod_name, hab_view)
+            let kind_ctx_b = resolve_kinds_ctx(raw_decls_pre_pos0, kind_reg, usites, hab_view)
+            let raw_decls_pre_pos = resolve_kinds_decls_in(kind_ctx_b, raw_decls_pre_pos0, usites, target_mod_name)
             let post_alias_unit_vd = if vd_failed([unit_ref_vd]) { vd_count(0) } else {
               vd_render(validate_unit_refs_decls_expanded(raw_decls_pre_pos, PScope(tab3, sym_views, target_mod_name), unit_scope(kind_ctx), diag_ctx))
             }
@@ -2290,7 +2295,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # nameless field. Reports unknown-record + arity
             # diagnostics; on errs > 0 we short-circuit before
             # invariants downstream can panic on the still-tagged AST.
-            let pos_rec = desugar_pos_records_decls(raw_decls_enforced, tab3, sym_views, target_mod_name, diag_ctx)
+            let pos_recs = collect_records(raw_decls_enforced)
+            let pos_rec = desugar_pos_records_with(pos_recs, raw_decls_enforced, tab3, sym_views, target_mod_name, diag_ctx)
             let raw_decls_with_regions = pos_rec.decls
             let pos_rec_errs = pos_rec.errs
             if pos_rec_errs > 0 { pos_rec_errs } else {
@@ -2337,7 +2343,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # KIR lowering builds the equivalent block loop, so the KIR
             # dump modes keep matching the native pipeline byte-for-byte.
             let loop_low_md = match mode { MDumpPurity -> false _ -> true }
-            let loop_low = if loop_low_md { lower_loop_intrinsics(cell_low.decls, tab3) }
+            let loop_blocked = if loop_low_md { loop_blocked_names(cell_low.decls, tab3) } else { [] }
+            let loop_low = if loop_low_md { lower_loop_intrinsics_with(loop_blocked, cell_low.decls) }
                            else { cell_low.decls }
             let var_decls = desugar_var_decls(loop_low)
             # `use Effect` desugar. Strips DUse / SUse and rewrites bare
@@ -2388,7 +2395,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # value). The ONE ambiguous case is pattern position: a bare
             # const name parses as PVariant/PBind, so rewrite it to an
             # equality-guard arm (`__cv if __cv == NAME -> ...`).
-            let interp_decls_c = desugar_const_patterns_decls(interp_decls_pre, sym_tab)
+            let pattern_consts = const_pattern_names(interp_decls_pre, sym_tab)
+            let interp_decls_c = desugar_const_patterns_with(pattern_consts, interp_decls_pre)
             # Rewrite `lo..hi` interval patterns into a binder + comparison
             # guard, so the checker + lowering see a bind-with-guard arm
             # (refutable, catch-all still required) instead of a `PRange`.
@@ -2488,6 +2496,26 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   let typed = tcut_infer_program(path, fused.decls, "", tin, tcut_no_defer(), false)
                   if typed.errs != 0 { typed.errs } else { dump_call_elision(path, typed.decls, typed_tab) }
                 }
+              }
+              MCheckCoreFront -> {
+                let cx = CoreFrontCx { tab0: tab0, tab1: tab1, target: target_mod_name, module_table: module_table,
+                                         mod_tabs: mod_tabs, core_tabs: mtabs_build([], module_table), sym_views: sym_views, cs_coll: cs_coll, rqc_fx: rqc_fx,
+                                         diag_ctx: diag_ctx, mangle: mangle_core_plan(qualified_core, tab1, core_segs),
+                                         tab2: tab2, tab3: tab3, sym_tab: sym_tab, file: path,
+                                         narrow_aliases: narrow_aliases, kind_ctx_a: kind_ctx_a, kind_ctx_b: kind_ctx_b,
+                                         effect_aliases: alias_res.aliases, ta_table: ta_table, ref_pred_fns: ref_pred_fns,
+                                         recs: pos_recs, blocked: loop_blocked, loops: loop_low_md,
+                                         show: proto_core_show(lowered.reg, interp_cores), cores: interp_cores,
+                                         bound: (ds) => c_bounded_decls(backend, ds, sym_tab), consts: pattern_consts,
+                                         ts_coll: ts_coll, vs_coll: vs_coll, mod_imps: mod_imps, sel_imports: sel_imports, entry: entry }
+                let res = resolve_program_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
+                let lines = core_front_check(cx, core_decls_whole, filter(surface_decls_whole, (d) => cf_module(d) != ""), all_decls, res)
+                let fused_rows = pub_loop_workers(tailfuse_decls(all_decls, sym_tab, target_mod_name), sym_tab, target_mod_name).rows
+                eprint("core-front: fused or split #{int_to_string(list_length(fused_rows))}:")
+                each(lines, (l) => print(l))
+                let bad = list_length(filter(lines, (l) => string_index_of_char(l, '!') >= 0))
+                eprint("core-front: #{int_to_string(list_length(filter(core_decls_whole, (d) => cf_module(d) != "")))} core functions, #{int_to_string(list_length(filter(surface_decls_whole, (d) => cf_module(d) != "")))} library functions, #{int_to_string(bad)} differ")
+                bad
               }
               MDumpBrands -> {
                 # No type-check needed: the brand registry is collected
