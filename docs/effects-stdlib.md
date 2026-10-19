@@ -563,7 +563,7 @@ The error register is `Result[_, String]` (Ok first),
 mirroring `read_file` — callers branch on the motive (missing /
 permission / mid-stream fault). The ergonomic line surface layers on
 top of these primitives in `stdlib/stream.kai` (issue #801, shipped):
-the lazy push carrier `Stream[t, e]` with `read_lines` / `write_lines`
+the lazy generator carrier `Stream[t, e]` over the `Emit[t]` effect with `read_lines` / `write_lines`
 and the pipe-canonical combinators, replacing the originally-planned
 Phase 2 bracket surface.
 

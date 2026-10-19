@@ -9,8 +9,8 @@
 > **Two corrections the implementation made to the draft below**, kept
 > inline because they are load-bearing:
 > 1. **The carrier is a single-constructor *variant*, not a bare
->    function-type alias.** `pub type Stream[t, e] = Stream(((t) -> Bool /
->    e) -> Unit / e)`. A function-type alias has no nominal head, and the
+>    function-type alias.** `pub type Stream[t, e] = Stream(() -> Unit /
+>    Emit[t] + e)`. A function-type alias has no nominal head, and the
 >    `|` / `||` / `|?` pipes dispatch by head type (`TyCon` only) — so an
 >    alias carrier silently declines the pipes. The nominal wrapper gives
 >    the head `Stream`; Perceus reuses the one-field constructor in place
@@ -21,6 +21,14 @@
 >    this. `read_lines` carries `File + ReadFault`, and a consumer that
 >    uses it must `handle ... with ReadFault` to pick a policy. The
 >    galleries below are updated accordingly.
+>
+> 3. **The producer is a generator over the `Emit[t]` effect**, not a
+>    function that takes a `yield` callback. A stage is a handler of
+>    `Emit[t]` that re-emits (`map`, `filter`, `flat_map`) or stops by not
+>    resuming (`take`, `take_while`), keeping its state in the handler; a
+>    sink (`foldl`, `each`, `count`, `to_list`) is the outermost handler.
+>    The `yield`/`Bool` wording below describes the original carrier and
+>    the spikes that confirmed early stop.
 >
 > Pipe dispatch on a user `pub type` is gated on edition ≥ `hanga-roa`
 > (#603); the `kai` driver passes this from `kai.toml`/`EDITION`
@@ -118,14 +126,15 @@ typed first-class resume gets clean elements **and** per-element recovery.
 ### Carrier: push (internal iteration)
 
 ```kaikai
-# A stream wraps a function that runs its consumer: `run` calls `yield`
-# once per element, and `yield` returns false to stop early. The nominal
-# wrapper (a single-constructor variant, not a bare function alias) is
-# what lets `|` / `||` / `|?` dispatch on `Stream` by head type.
-pub type Stream[t, e] = Stream(((t) -> Bool / e) -> Unit / e)
+# A stream wraps a producer that performs `Emit.emit` once per element;
+# a consumer is a handler of `Emit[t]` and stops the stream by not
+# resuming. The nominal wrapper (a single-constructor variant, not a bare
+# function alias) is what lets `|` / `||` / `|?` dispatch on `Stream` by
+# head type.
+pub type Stream[t, e] = Stream(() -> Unit / Emit[t] + e)
 ```
 
-This is Go's `iter.Seq` shape, wrapped in a one-field variant so it has a
+The producer is a generator over the `Emit[t]` effect, wrapped in a one-field variant so it has a
 nominal head — no language change, no HKT, monomorphises like everything
 else; Perceus reuses the constructor in place through every stage.
 Why push wins over the pull-thunk (`() -> Option[t]`) sketch:
@@ -196,8 +205,8 @@ construction. One effect for both faults keeps the row to `File +
 ReadFault` (the open-design point in #801 — resolved as a second
 non-resumable op on the same effect, not a separate abort effect).
 
-Combinator bodies are one-liners — `map` is
-`(yield) => s((x) => yield(f(x)))` — which keeps the module small and
+Stages are handlers — `map` handles `Emit[a]` and re-emits `f(x)`; `take`
+keeps its count in the handler state and stops by not resuming — which keeps the module small and
 A-grade by construction.
 
 `write_lines` is the Elixir lesson: **the writer is a sink stage**, not a
