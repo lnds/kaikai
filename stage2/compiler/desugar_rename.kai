@@ -1,6 +1,5 @@
 #[doc("""
-The names parameters and patterns bind, and whether a task body touches
-a cell.
+The names patterns and parameters bind, whether an expression mentions a variable, and whether a task body touches a cell.
 """)]
 
 import compiler.util
@@ -8,7 +7,7 @@ import compiler.ast
 import compiler.written
 
 #[doc("`acc` with the names the parameters bind.")]
-pub fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
+pub(pkg) fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
   match ps {
     [] -> acc
     [p, ...rest] -> dsg_rename_param_names(rest, [written_text(p.binder.name), ...acc])
@@ -19,7 +18,7 @@ pub fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
 # accumulates into a `[String]` rather than a resolver Env.
 
 #[doc("`acc` with the names the pattern binds.")]
-pub fn dsg_rename_pat_names(p: Pattern, acc: [String]) : [String] {
+pub(pkg) fn dsg_rename_pat_names(p: Pattern, acc: [String]) : [String] {
   match p.pkind {
     PWild         -> acc
     PLit(_)       -> acc
@@ -56,7 +55,7 @@ fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
 }
 
 #[doc("`s` introduces a fresh binder named `n`, shadowing the cell from here on.")]
-pub fn stmt_rebinds_cell(s: Stmt, n: String) : Bool =
+pub(pkg) fn stmt_rebinds_cell(s: Stmt, n: String) : Bool =
   match s {
     SVar(m, _, _, _, _) -> written_text(m.name) == n
     SLet(p, _, _) -> list_has(dsg_rename_pat_names(p, []), n)
@@ -68,7 +67,7 @@ Does the spawn task `e` touch the cell `n` (read/write directly, or apply a
 tainted closure that captured it)? Shadow-aware: a nested binder that rebinds
 `n` masks the cell from that point on, so the inner `n` is its own fiber's.
 """)]
-pub fn task_touches_cell(e: Expr, n: String, tainted: [String]) : Bool =
+pub(pkg) fn task_touches_cell(e: Expr, n: String, tainted: [String]) : Bool =
   match e.kind {
     ECall(callee, args_) -> {
       let direct = match callee.kind {
@@ -148,6 +147,159 @@ fn task_elems_touch_cell(es: [ListElem], n: String, tainted: [String]) : Bool {
     [el, ...rest] -> {
       let here = match el { ElPlain(x) -> task_touches_cell(x, n, tainted)  ElSpread(x) -> task_touches_cell(x, n, tainted) }
       here or task_elems_touch_cell(rest, n, tainted)
+    }
+  }
+}
+
+#[doc("""
+Conservative containment check used by the lambda branch of
+`body_escapes`: a closure that mentions `name` at all is treated
+as escape (we have no way to prove the closure does not outlive
+the handle). Returns true if `name` appears anywhere in `e`.
+""")]
+pub(pkg) fn contains_var(name: String, e: Expr) : Bool {
+  match e.kind {
+    EName(n) -> written_text(n) == name
+    ECall(c, args_) -> contains_var(name, c) or any_contains(name, args_)
+    EField(b, _) -> contains_var(name, b)
+    EIndex(a, b) -> contains_var(name, a) or contains_var(name, b)
+    EBinop(_, a, b) -> contains_var(name, a) or contains_var(name, b)
+    EUnop(_, x) -> contains_var(name, x)
+    EIf(c, t_, eo) -> contains_var(name, c) or contains_var(name, t_) or opt_contains(name, eo)
+    EBlock(stmts, tail) -> stmts_contain(name, stmts) or opt_contains(name, tail)
+    EMatch(scr, arms) -> contains_var(name, scr) or arms_contain(name, arms)
+    ELambda(_, b) -> contains_var(name, b)
+    EList(elems) -> elems_contain(name, elems)
+    ERange(a, b, opt_step) ->
+      contains_var(name, a) or contains_var(name, b) or opt_contains(name, opt_step)
+    ERecordLit(_, fields) -> fields_contain(name, fields)
+    EPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
+    EDispatchPipe(_, a, b) -> contains_var(name, a) or contains_var(name, b)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
+    EBang(inner) -> contains_var(name, inner)
+    _ -> false
+  }
+}
+
+fn any_contains(name: String, es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if contains_var(name, h) { true } else { any_contains(name, rest) }
+  }
+}
+
+fn opt_contains(name: String, opt: Option[Expr]) : Bool {
+  match opt { None -> false  Some(e) -> contains_var(name, e) }
+}
+
+fn stmts_contain(name: String, ss: [Stmt]) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> if stmt_contains(name, s) { true } else { stmts_contain(name, rest) }
+  }
+}
+
+fn stmt_contains(name: String, s: Stmt) : Bool {
+  match s {
+    SLet(_, _, rhs) -> contains_var(name, rhs)
+    SAssert(c, msg) -> contains_var(name, c) or opt_contains(name, msg)
+    SExprStmt(x) -> contains_var(name, x)
+    SIndexAssign(b, i, v, _, _) ->
+      contains_var(name, b) or contains_var(name, i) or contains_var(name, v)
+    SAssign(b, v, _, _) ->
+      contains_var(name, b) or contains_var(name, v)
+    SVar(_, _, rhs, _, _) -> contains_var(name, rhs)
+    # SUse has no expression — never contains a value-level name.
+    SUse(_, _, _) -> false
+  }
+}
+
+fn arms_contain(name: String, arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, g, b) ->
+        if opt_contains(name, g) or contains_var(name, b) { true }
+        else { arms_contain(name, rest) }
+    }
+  }
+}
+
+fn elems_contain(name: String, es: [ListElem]) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> if contains_var(name, x) { true } else { elems_contain(name, rest) }
+      ElSpread(x) -> if contains_var(name, x) { true } else { elems_contain(name, rest) }
+    }
+  }
+}
+
+fn fields_contain(name: String, fs: [FieldInit]) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FI(_, v) -> if contains_var(name, v) { true } else { fields_contain(name, rest) }
+    }
+  }
+}
+
+fn clauses_contain(name: String, cs: [HClause]) : Bool {
+  match cs {
+    [] -> false
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) ->
+        if contains_var(name, b) { true } else { clauses_contain(name, rest) }
+    }
+  }
+}
+
+fn ret_opt_contains(name: String, opt: Option[HReturn]) : Bool {
+  match opt { None -> false  Some(r) -> match r { HR(_, b, _, _) -> contains_var(name, b) } }
+}
+
+#[doc("`acc` with the names the pattern binds.")]
+pub(pkg) fn dsg_pat_bindings(pat: Pattern, acc: [String]) : [String] {
+  match pat.pkind {
+    PWild -> acc
+    PLit(_) -> acc
+    PRange(_, _) -> acc
+    PBind(b) -> [written_text(b.name), ...acc]
+    PList(pats, opt_rest) -> {
+      let acc1 = dsg_pat_bindings_loop(pats, acc)
+      match opt_rest {
+        Some(r) -> [written_text(r.name), ...acc1]
+        None -> acc1
+      }
+    }
+    PVariant(_, subs) -> dsg_pat_bindings_loop(subs, acc)
+    PVariantRecord(_, fields) -> dsg_pfield_bindings_loop(fields, acc)
+    PRecord(fields) -> dsg_pfield_bindings_loop(fields, acc)
+    PHole(_) -> acc
+    PAs(b, sub) -> dsg_pat_bindings(sub, [written_text(b.name), ...acc])
+    PNarrow(b, _) -> [written_text(b.name), ...acc]
+    PSurface(sp) -> dsg_pat_bindings_loop(patsurface_children(sp), acc)
+  }
+}
+
+# Like `dsg_pat_bindings`, but if the pattern is a single `PBind` and
+# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
+# must NOT enter the Perceus tracking scope. All other shapes —
+# destructured lets, wildcards, literals — defer to the standard
+# `dsg_pat_bindings` walker.
+
+fn dsg_pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> dsg_pat_bindings_loop(rest, dsg_pat_bindings(p, acc))
+  }
+}
+
+fn dsg_pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> dsg_pfield_bindings_loop(rest, dsg_pat_bindings(sub, acc))
     }
   }
 }
