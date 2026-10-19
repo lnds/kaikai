@@ -1,6 +1,5 @@
 #[doc("""
-Predicate functions synthesised for refined aliases, and the lowering of
-extern opaques and axioms.
+One-level map over expression nodes, pattern narrowing over refined aliases, and the predicates synthesised for refined aliases.
 """)]
 
 import compiler.ast
@@ -11,9 +10,10 @@ import compiler.symtab_build
 import compiler.written
 import compiler.symtab
 import compiler.decl_text
+import compiler.scope_file
+import compiler.desugar_record_lit
 
-#[doc("A lowered stream and the table rows of the declarations the lowering minted.")]
-pub type DsgMinted = { decls: [Decl], rows: [NEnt] }
+pub(pkg) type DsgMinted = { decls: [Decl], rows: [NEnt] }
 
 # Rewrite every `axiom name(params) : T / row` into a regular
 # `fn name(params) : T / row = todo!("axiom <name> not bound")`. The
@@ -22,7 +22,7 @@ pub type DsgMinted = { decls: [Decl], rows: [NEnt] }
 # The typer / monomorphiser / emitter therefore see only ordinary fns
 # and need no DAxiom-specific handling.
 #[doc("Rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function. `home` is the module the stream's axioms are declared in.")]
-pub fn lower_axioms(ds: [Decl], home: String) : [Decl] = map(ds, (d) => lower_axiom_one(d, home))
+pub(pkg) fn lower_axioms(ds: [Decl], home: String) : [Decl] = map(ds, (d) => lower_axiom_one(d, home))
 
 # Lower an `extern "C" opaque T` to a one-phantom-field nominal record
 # so Perceus reference-counts the handle box (dup before
@@ -36,7 +36,7 @@ pub fn lower_axioms(ds: [Decl], home: String) : [Decl] = map(ds, (d) => lower_ax
 # box. An `extern "C" type` STRUCT is left untouched: it already works
 # as an ordinary structural record (constructed + field-accessed).
 #[doc("Lower every `extern \"C\" opaque` to a one-field nominal record so Perceus RC-tracks the handle box. The record is a type of its module (the `root` when it carries no origin), returned with its table row.")]
-pub fn lower_extern_opaques(ds: [Decl], root: String) : DsgMinted = lower_extern_opaques_loop(ds, root, [], [])
+pub(pkg) fn lower_extern_opaques(ds: [Decl], root: String) : DsgMinted = lower_extern_opaques_loop(ds, root, [], [])
 
 fn lower_extern_opaques_loop(ds: [Decl], root: String, acc: [Decl], rows: [NEnt]) : DsgMinted = match ds {
   [] -> DsgMinted { decls: list_reverse(acc), rows: list_reverse(rows) }
@@ -53,7 +53,7 @@ fn lower_extern_opaques_loop(ds: [Decl], root: String, acc: [Decl], rows: [NEnt]
 }
 
 #[doc("The `DFn` a `DAxiom` lowers to, declared in the module `home`; any other declaration unchanged.")]
-pub fn lower_axiom_one(d: Decl, home: String) : Decl {
+pub(pkg) fn lower_axiom_one(d: Decl, home: String) : Decl {
   match d {
     DAxiom(is_pub, abi, name, sym, tparams, params, ret_ty, row, l, c) -> {
       # An extern fn lowers to a DFn whose body is an `EExternBody`
@@ -79,18 +79,14 @@ pub fn lower_axiom_one(d: Decl, home: String) : Decl {
 # origin of the originating `DType`: `mo = Some("foo")` for an alias of
 # `stdlib/foo.kai`, `mo = None` for a root-file one.
 #[doc("Synthesise the predicate fn backing each `type T = base where pred` refinement alias; returns the stream with them and their table rows.")]
-pub fn synthesize_refine_pred_fns(decls: [Decl], tab: SymTab, target_mod: String) : DsgMinted =
+pub(pkg) fn synthesize_refine_pred_fns(decls: [Decl], tab: SymTab, target_mod: String) : DsgMinted =
   synth_refine_loop(decls, tab, target_mod, target_mod, [], [])
 
 #[doc("The identity of each predicate fn `synthesize_refine_pred_fns` mints for `decls`.")]
-pub fn refine_pred_fn_syms(decls: [Decl], tab: SymTab) : [SymId] =
+pub(pkg) fn refine_pred_fn_syms(decls: [Decl], tab: SymTab) : [SymId] =
   map(collect_refine_alias_ids(decls), (t) => refine_pred_sym(tab, t))
 
-#[doc("""
-The predicate fn of the refinement alias `t`: `__ref_pred_<T>` in the
-module that declares `t`.
-""")]
-pub fn refine_pred_sym(tab: SymTab, t: SymId) : SymId =
+fn refine_pred_sym(tab: SymTab, t: SymId) : SymId =
   sym_derive(NCFn, refine_pred_name(tab, t), written_text(decl_home(tab, t)))
 
 fn refine_pred_name(tab: SymTab, t: SymId) : String =
@@ -153,7 +149,7 @@ fn build_refine_pred_fn(tab: SymTab, t: SymId, base: TypeExpr, pred: Expr,
 # populated the alias namespace. Non-refinement narrowings stay as
 # `PNarrow` for the typer's union-component check.
 #[doc("Collect the refinement-alias types so the pattern-narrow lowering knows which `PNarrow` heads are refinement checks.")]
-pub fn collect_refine_alias_ids(decls: [Decl]) : [SymId] =
+pub(pkg) fn collect_refine_alias_ids(decls: [Decl]) : [SymId] =
   collect_refine_alias_loop(decls, [])
 
 fn collect_refine_alias_loop(decls: [Decl], acc: [SymId]) : [SymId] {
@@ -170,6 +166,192 @@ fn collect_refine_alias_loop(decls: [Decl], acc: [SymId]) : [SymId] {
           _ -> collect_refine_alias_loop(rest, acc)
         }
         _ -> collect_refine_alias_loop(rest, acc)
+      }
+    }
+  }
+}
+
+#[doc("Applies `f` to every direct sub-expression of `k`, rebuilding the kind. One-level structural mapper; recursive passes close `f` over themselves.")]
+pub(pkg) fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
+  match k {
+    # Leaves: no sub-Expr to recurse into.
+    EInt(_, _)        -> k
+    EReal(_, _)       -> k
+    EIntLit(_)        -> k
+    EDecimalLit(_)    -> k
+    EFixed(_, _)      -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EName(_)        -> k
+    EMark(_)        -> k
+    ESym(_, _)        -> k
+    ELocal(_)       -> k
+    EOp(_)          -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    EExternBody(_, _) -> k
+    EVariantsOf(_, _) -> k
+    EModCall(_, _) -> k
+    # Intrinsic args ARE sub-Exprs, so the visitor recurs.
+    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    ESurface(sf) -> ESurface(surface_map(sf, f))
+    # Composites: apply f to every direct sub-Expr.
+    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
+    EField(base, name)   -> EField(f(base), name)
+    EIndex(a, b)         -> EIndex(f(a), f(b))
+    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
+    EUnop(op, x)         -> EUnop(op, f(x))
+    EIf(c, t_, eo)       -> EIf(f(c), f(t_), dsg_map_opt_expr(eo, f))
+    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => dsg_map_arm_exprs(a, f)))
+    ELambda(ps, b)       -> ELambda(ps, f(b))
+    ERecordLit(rh, fs)   -> ERecordLit(rh, map(fs, (fi) => dsg_map_field_exprs(fi, f)))
+    EList(els)           -> EList(map(els, (el) => dsg_map_elem_exprs(el, f)))
+    ERange(a, b, opt_step) -> ERange(f(a), f(b), dsg_map_opt_expr(opt_step, f))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => dsg_map_stmt_exprs(s, f)),
+                                    dsg_map_opt_expr(tail, f))
+    EPipe(a, b)          -> EPipe(f(a), f(b))
+    EDispatchPipe(op, a, b) -> EDispatchPipe(op, f(a), f(b))
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff, eff_tyargs,
+              dsg_map_opt_expr(init_opt, f), alias_opt,
+              map(clauses, (c) => dsg_map_clause_exprs(c, f)),
+              dsg_map_opt_return_exprs(ret_opt, f))
+    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
+    EBang(inner)         -> EBang(f(inner))
+  }
+}
+
+fn dsg_map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(f(e))
+    None    -> None
+  }
+}
+
+fn dsg_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
+  match s {
+    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
+    SAssert(c, m)               -> SAssert(f(c), dsg_map_opt_expr(m, f))
+    SExprStmt(x)                -> SExprStmt(f(x))
+    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SAssign(b, v, l, c) -> SAssign(f(b), f(v), l, c)
+    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
+    # SUse has no sub-expression — pass through unchanged.
+    SUse(n, l, c)               -> SUse(n, l, c)
+  }
+}
+
+fn dsg_map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, dsg_map_opt_expr(g, f), f(b))
+  }
+}
+
+fn dsg_map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, f(v))
+  }
+}
+
+fn dsg_map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(f(x))
+    ElSpread(x) -> ElSpread(f(x))
+  }
+}
+
+fn dsg_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
+  }
+}
+
+fn dsg_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(dsg_map_return_exprs(r, f))
+    None    -> None
+  }
+}
+
+fn dsg_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, f(b), l, c)
+  }
+}
+
+#[doc("Lower `PNarrow(name, alias)` patterns into a binder plus a predicate guard against the alias's synthesised pred fn. A written narrow head is settled against `tab` under the view of its file; `root` is the target module.")]
+pub(pkg) fn lower_pattern_narrow_decls(decls: [Decl], tab: SymTab, views: FileViews, root: String, aliases: [SymId]) : [Decl] =
+  map(decls, (d) => lower_narrow_decl(d, NarrowScope { sc: dsg_scope_of(d, tab, views, root), aliases: aliases }))
+
+# The refinement aliases and the scope a narrow's head is settled in.
+type NarrowScope = { sc: DsgScope, aliases: [SymId] }
+
+fn lower_narrow_decl(d: Decl, ns: NarrowScope) : Decl {
+  match d {
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, fid, tps, ps, ret, row, lower_narrow_expr(body, ns), l, c, mo)
+    DTest(desc, body, l, c, mo) -> DTest(desc, lower_narrow_expr(body, ns), l, c, mo)
+    DBench(desc, body, l, c, mo) -> DBench(desc, lower_narrow_expr(body, ns), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, lower_narrow_expr(body, ns), l, c, mo)
+    # See through the transparent `#[unstable]` wrapper so a
+    # `p : RefineAlias` narrow inside an unstable fn body still lowers to
+    # a binder + predicate guard instead of reaching the typer as a raw
+    # `PNarrow` ("requires a union scrutinee").
+    DUnstable(inner, l, c) -> DUnstable(lower_narrow_decl(inner, ns), l, c)
+    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, lower_narrow_decl(inner, ns), l, c, mo)
+    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, lower_narrow_decl(inner, ns), l, c, mo)
+    DConstructor(inner, l, c) -> DConstructor(lower_narrow_decl(inner, ns), l, c)
+    _ -> d
+  }
+}
+
+fn lower_narrow_expr(e: Expr, ns: NarrowScope) : Expr {
+  match e.kind {
+    EMatch(scr, arms) -> {
+      let scr2 = lower_narrow_expr(scr, ns)
+      let arms2 = map(arms, (a) => lower_narrow_arm(a, ns))
+      mk_expr(EMatch(scr2, arms2), e.line, e.col)
+    }
+    _ -> {
+      let new_kind = dsg_map_expr_kind(e.kind, (sub) => lower_narrow_expr(sub, ns))
+      mk_expr(new_kind, e.line, e.col)
+    }
+  }
+}
+
+fn lower_narrow_arm(a: Arm, ns: NarrowScope) : Arm {
+  match a {
+    Arm(pat, guard, body) -> {
+      let body1 = lower_narrow_expr(body, ns)
+      let guard1 = match guard {
+        None -> None
+        Some(g) -> Some(lower_narrow_expr(g, ns))
+      }
+      match pat.pkind {
+        PNarrow(b, ty) -> match ty.tkind {
+          TyName(r, []) -> {
+            let t = dsg_type_sym(ns.sc, r)
+            if dsg_sym_in(ns.aliases, t) {
+              # Restore the bind + synthesised pred call shape.
+              let var_e = mk_expr(EName(b.name), pat.line, pat.col)
+              let pred_fn = mk_sym(refine_pred_sym(ns.sc.tab, t), pat.line, pat.col)
+              let call = mk_expr(ECall(pred_fn, [var_e]), pat.line, pat.col)
+              let new_guard = match guard1 {
+                None -> Some(call)
+                Some(g) -> Some(mk_expr(EBinop(BoAnd, call, g), call.line, call.col))
+              }
+              Arm(mk_pat(PBind(b), pat.line, pat.col), new_guard, body1)
+            } else {
+              Arm(pat, guard1, body1)
+            }
+          }
+          _ -> Arm(pat, guard1, body1)
+        }
+        _ -> Arm(pat, guard1, body1)
       }
     }
   }
