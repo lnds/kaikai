@@ -1,3 +1,24 @@
+#[doc("The access check of `pub` and `pub(pkg)` exports, and the worker a `pub` loop that owns its `^` slot runs in.")]
+
+import compiler.ast
+import compiler.util
+import compiler.ast_map
+import compiler.borrow_infer
+import compiler.perceus_arm
+import compiler.self_call
+import compiler.symtab
+import compiler.written
+import compiler.home_tu
+import compiler.tailfuse
+import compiler.diag
+import compiler.diag_file
+import compiler.modules_segments
+import compiler.modules_homes
+import compiler.pub_access_decl
+import compiler.pa_index
+import compiler.scope_view
+import compiler.resolve_env
+
 # Module privacy, decided at one point. The table records every
 # top-level symbol with its home module and `pub`-ness; every free
 # reference the enumerator yields (`pub_access_decl.kai`) is resolved
@@ -11,23 +32,6 @@
 # Qualified references (`mod.name`) are validated earlier, where the
 # qualified path is resolved against the module's export list.
 
-import compiler.util
-import compiler.diag
-import compiler.ast
-import compiler.diag_file
-import compiler.modules_segments
-import compiler.modules_homes
-import compiler.pub_access_refs
-import compiler.pub_access_decl
-import compiler.pub_access_table
-import compiler.pa_index
-import compiler.scope_view
-import compiler.resolve_env
-import compiler.decl_names
-import compiler.symtab
-import compiler.symtab_build
-import compiler.written
-
 type PaVerdict = PaVisible | PaPrivateTo(String) | PaUnknown
 
 type PaMeta = { name: String, kind: String, is_pub: Bool, pkg: Bool }
@@ -37,7 +41,7 @@ type PaCx = { table: PaIndex, tab: SymTab, home: String, target_mod: String,
       cores: [String], file: String, pkgs: [SvPick] }
 
 #[doc("Validate module privacy over the per-module decl segments: the violations, in source order. `bounds` carries every module's fn tparam bounds, keyed by the module that declares the fn (the parser strips them from the stored tparams into a side table).")]
-pub fn validate_pub_access(segs: [CoreSegment], tab: SymTab, bounds: [FnBoundsRec],
+pub(pkg) fn validate_pub_access(segs: [CoreSegment], tab: SymTab, bounds: [FnBoundsRec],
       target_mod: String, cores: [String],
       df: DiagFiles, pkgs: [SvPick]) : [Diagnostic] / Console + File {
   let table = pai_build(pa_table(segs, tab))
@@ -46,7 +50,7 @@ pub fn validate_pub_access(segs: [CoreSegment], tab: SymTab, bounds: [FnBoundsRe
 }
 
 #[doc("The top-level declarations a root-file reference cannot reach: those of a name whose every carrier is non-`pub` in a foreign module.")]
-pub fn pa_hidden_from_root(segs: [CoreSegment], tab: SymTab, target_mod: String) : [SymId] = {
+pub(pkg) fn pa_hidden_from_root(segs: [CoreSegment], tab: SymTab, target_mod: String) : [SymId] = {
   let entries = pa_table(segs, tab)
   flat_map(pa_hidden_loop(entries, pai_build(entries), target_mod, []), (name) => st_by_name(tab, name))
 }
@@ -64,7 +68,7 @@ fn pa_hidden_loop(es: [PaEntry], table: PaIndex, target_mod: String,
 }
 
 #[doc("Rebuild per-module segments from a rewritten flat decl stream, taking each segment's length from `orig`. The rewrite passes map decls 1:1, so slicing by length restores the module boundaries.")]
-pub fn pa_reseg(orig: [CoreSegment], flat: [Decl]) : [CoreSegment] = match orig {
+pub(pkg) fn pa_reseg(orig: [CoreSegment], flat: [Decl]) : [CoreSegment] = match orig {
   [] -> []
   [PSeg(mod_name, ds), ...rest] -> {
     let n = list_length(ds)
@@ -73,7 +77,7 @@ pub fn pa_reseg(orig: [CoreSegment], flat: [Decl]) : [CoreSegment] = match orig 
 }
 
 #[doc("Slice the flat imported-decl stream into per-module segments using the (module, count) marks the resolver recorded.")]
-pub fn pa_import_segs(marks: [ImportSeg], flat: [Decl]) : [CoreSegment] = match marks {
+pub(pkg) fn pa_import_segs(marks: [ImportSeg], flat: [Decl]) : [CoreSegment] = match marks {
   [] -> []
   [ISeg(home, n), ...rest] ->
     [PSeg(home, pae_take(flat, n)), ...pa_import_segs(rest, pae_drop(flat, n))]
@@ -362,4 +366,67 @@ fn pa_ftb_refs(ftbs: [FnTPBound], line: Int, col: Int,
   [] -> acc
   [FTB(_, names), ...rest] ->
     pa_ftb_refs(rest, line, col, pa_bound_names(names, line, col, acc))
+}
+
+fn pub_loop_worker_name(f: String) : String = cat2("__kai_loop_", f)
+
+#[doc("`prog` with every `pub` function whose back-edge hands a `^` slot an owned value split into a forwarding wrapper and its worker, whose rows join `prog`'s.")]
+pub(pkg) fn pub_loop_workers(prog: TailFused, tab: SymTab, target: String) : TailFused =
+  if any(prog.decls, (d) => plw_needs_worker(d, tab)) {
+    plw_split_all(prog.decls, PlwIn { tab: tab, target: target }, [], list_reverse(prog.rows))
+  } else { prog }
+
+type PlwIn = { tab: SymTab, target: String }
+
+fn plw_split_all(decls: [Decl], inp: PlwIn, acc: [Decl], rows: [NEnt]) : TailFused = match decls {
+  []           -> TailFused { decls: list_reverse(acc), rows: list_reverse(rows) }
+  [d, ...rest] ->
+    if plw_needs_worker(d, inp.tab) {
+      let row = plw_row(d, inp)
+      let wsym = nent_sym(row)
+      plw_split_all(rest, inp, [plw_wrapper(d, wsym), plw_worker(d, wsym), ...acc], [row, ...rows])
+    } else { plw_split_all(rest, inp, [d, ...acc], rows) }
+}
+
+fn plw_needs_worker(d: Decl, tab: SymTab) : Bool = match d {
+  DFn(true, fid, _, params, _, _, body, _, _, _) -> match pcs_explicit_borrow_names(params) {
+    []    -> false
+    caret -> {
+      let pnames = map(params, (p) => p.binder)
+      list_length(bbe_keep_borrowed(tab, SelfRef(fid), pnames, caret, body)) < list_length(caret)
+    }
+  }
+  _ -> false
+}
+
+# The worker is homed beside the function it serves.
+fn plw_row(d: Decl, inp: PlwIn) : NEnt = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> {
+    let name = pub_loop_worker_name(written_text(decl_name(inp.tab, fnid_sym(fid))))
+    let home = match home_tu(d) { Some(m) -> m  None -> inp.target }
+    NEnt(NCFn, name, home, false, NmHelper)
+  }
+  _ -> panic("pub_loop_worker: a row for a declaration that is not a function")
+}
+
+fn plw_worker(d: Decl, wsym: SymId) : Decl = match d {
+  DFn(_, fid, tparams, params, opt_ret, row, body, ln, cl, mo) ->
+    DFn(false, fnid_decl(wsym), tparams, params, opt_ret, row, plw_retarget(body, fnid_sym(fid), wsym), ln, cl, mo)
+  _ -> d
+}
+
+fn plw_wrapper(d: Decl, wsym: SymId) : Decl = match d {
+  DFn(is_pub, fid, tparams, params, opt_ret, row, _, ln, cl, mo) -> {
+    let args = map(params, (p) => mk_local(p.binder.id, ln, cl))
+    DFn(is_pub, fid, tparams, params, opt_ret, row, mk_expr(ECall(mk_sym(wsym, ln, cl), args), ln, cl), ln, cl, mo)
+  }
+  _ -> d
+}
+
+# Every reference to the function inside its own body names the worker,
+# so each back-edge stays a self call the tail rewrite turns into a jump.
+fn plw_retarget(e: Expr, me: SymId, wsym: SymId) : Expr = match e.kind {
+  ESym(s, inst) ->
+    if sym_raw(s) == sym_raw(me) { Expr { ...e, kind: ESym(wsym, inst) } } else { e }
+  k -> Expr { ...e, kind: prc_map_expr_kind(k, (x) => plw_retarget(x, me, wsym)) }
 }

@@ -1,24 +1,20 @@
-# compiler/name_report.kai — the one ambiguity diagnostic.
-#
-# Every class routes here, so a contested type reads like a contested
-# function: the spelling, every candidate home, and the qualified form
-# that resolves it. A contested name is an error in every class — the
-# candidates are equals, and there is no order to prefer one by.
+#[doc("The diagnostic for a bare name the file reaches only through a module it never imported, and the indexes it reads.")]
 
-import compiler.util
-import compiler.ast
 import compiler.diag
+import compiler.symtab
+import compiler.module_table
+import compiler.ast
+import compiler.scope_view
+import compiler.written
+import compiler.core_types
+import compiler.util
 import compiler.diag_file
-import compiler.decl_names
 import compiler.name_contest
 import compiler.name_uses
-import compiler.symtab
-import compiler.symtab_build
 import compiler.infer_index
-import compiler.module_table
 
 #[doc("The error for a bare `name` of class `cls` contested by `homes`: every candidate, and the qualified form as the reader whose module table is `mt` would type it. `suffix` distinguishes a call (`(...)`) from a plain reference.")]
-pub fn nr_ambiguous_diag(file: String, line: Int, col: Int, cls: NCls,
+pub(pkg) fn nr_ambiguous_diag(file: String, line: Int, col: Int, cls: NCls,
       name: String, homes: [String], suffix: String, mt: [ModuleEntry]) : Diagnostic {
   let spelled = map(homes, (h) => mt_spell_home(mt, h))
   let at = (msg) => DR(file, line, col, msg)
@@ -63,7 +59,7 @@ fn nr_first(homes: [String]) : String = match homes {
 }
 
 #[doc("Report once for every contested bare name the root file references, and once for every effect two non-core modules both export; returns the errors. The single entry point: read the names `tab` holds for the declarations, scan the uses, report each. A reference carrying an id names one declaration, so it is settled and never reported, and neither is a use `told` already reports as contested. `early` carries uses scanned before a pass keyed them; `core` names the modules whose collisions are theirs to resolve; `pre` is the stream before the protocol lowering, which is where the `DProtocol` decls still are.")]
-pub fn nr_report_program_tab(df: DiagFiles, decls: [Decl], target: String,
+pub(pkg) fn nr_report_program_tab(df: DiagFiles, decls: [Decl], target: String,
       reg: ProtocolReg, early: [NUse], core: [String],
       pre: [Decl], picks: [NPick], tab: SymTab, mt: [ModuleEntry], told: [Diagnostic]) : [Diagnostic] / Console + File {
   let t = list_append(nt_collect(decls, tab, target), nt_protocols(pre, tab, target))
@@ -180,3 +176,110 @@ fn nr_last(xs: [String]) : String = match xs {
   [x]          -> x
   [_, ...rest] -> nr_last(rest)
 }
+
+#[doc("The error for the bare `name` at `file:line:col`, which the view `v` reaches as the exported declarations `ss` only through modules it does not import; `ss` is never empty.")]
+pub(pkg) fn nh_diag(t: SymTab, v: ScopeView, ss: [SymId], file: String, line: Int, col: Int,
+      name: String) : Diagnostic {
+  let ms = map(ss, (s) => mt_spell_home([], written_text(sym_home(t, s))))
+  if all(ss, (s) => not sv_pkg_reaches(t, v, s, sym_owner(t, s))) {
+    mk_diag(SevError, file, line, col, "`#{name}` is `pub(pkg)` in #{nh_modules(ms)}, which belongs to another package",
+            [ri_help(file, line, col, "a `pub(pkg)` declaration is visible only to the modules of its own package; declare it `pub` there to use it from here")])
+  } else { nh_diag_unimported(t, v, ss, file, line, col, name, ms) }
+}
+
+fn nh_diag_unimported(t: SymTab, v: ScopeView, ss: [SymId], file: String, line: Int, col: Int,
+      name: String, ms: [String]) : Diagnostic =
+  mk_diag(SevError, file, line, col, "`#{name}` is not imported in this file",
+          [ri_note(file, line, col, "#{nh_class(t, ss)} `#{name}` is declared in #{nh_modules(ms)}"),
+           ri_help(file, line, col, nh_help(nh_qualifier(t, v, ss), ms, name))])
+
+#[doc("The error for the type name `name` at `file:line:col`, which nothing declares. The help names the import when a stdlib module declares a type so named, else the one-member sum when the name is the whole body of the alias declaration `alias`.")]
+pub(pkg) fn nh_unknown_type_diag(file: String, line: Int, col: Int, name: String, alias: Option[Written]) : Diagnostic =
+  mk_diag(SevError, file, line, col, "unknown type `#{name}`",
+          match stdlib_type_home(name) {
+            Some(h) -> [ri_help(file, line, col, "add `import #{mt_spell_home([], h)}`")]
+            None    -> match alias {
+              Some(t) -> [ri_help(file, line, col, "to declare a one-member sum, write `type #{t} = | #{name}`")]
+              None    -> []
+            }
+          })
+
+#[doc("The error for a literal at `file:line:col` that writes the stdlib type `t`, in a file that does not import the module declaring it.")]
+pub(pkg) fn nh_literal_import_diag(file: String, line: Int, col: Int, t: CoreDeclTy) : Diagnostic =
+  mk_diag(SevError, file, line, col,
+          "#{nh_literal_form(t)} writes a `#{core_decl_ty_name(t)}`, and this file does not import its module",
+          [ri_help(file, line, col, "add `import #{mt_spell_home([], core_decl_ty_home(t))}`")])
+
+fn nh_literal_form(t: CoreDeclTy) : String = match t {
+  CdSeq -> "`lazy [...]`"
+  _     -> "the `#{core_decl_ty_suffix(t)}` suffix"
+}
+
+# A file that already binds the module under a qualifier can name the
+# declaration through it; otherwise it has to import the module.
+fn nh_help(q: Option[String], ms: [String], name: String) : String = match q {
+  Some(qual) -> "qualify it as `#{qual}.#{name}`, or import it with `import #{nh_first(ms)}.{#{name}}`"
+  None       -> "import it with `import #{nh_first(ms)}.{#{name}}`, or open the module with `import #{nh_first(ms)}`"
+}
+
+fn nh_qualifier(t: SymTab, v: ScopeView, ss: [SymId]) : Option[String] = match ss {
+  [] -> None
+  [s, ...rest] -> match sv_qualifier(v, sym_owner(t, s)) {
+    Some(q) -> Some(q)
+    None    -> nh_qualifier(t, v, rest)
+  }
+}
+
+fn nh_first(ms: [String]) : String = match ms {
+  [m, ..._] -> m
+  []        -> ""
+}
+
+fn nh_class(t: SymTab, ss: [SymId]) : String = match ss {
+  [s, ..._] -> ncls_word(sym_class(t, s))
+  []        -> "name"
+}
+
+fn nh_modules(ms: [String]) : String = match ms {
+  [m] -> "module `#{m}`"
+  _   -> "modules #{string_join(map(ms, (m) => "`#{m}`"), ", ")}"
+}
+
+#[doc("Entries bucketed by the hash of the name each one is about.")]
+pub(pkg) type NameIx[a] = NameIx(Array[[a]])
+
+const BUCKETS : Int = 128
+
+#[doc("Empty buckets for a collector to fill with `ni_add`.")]
+pub(pkg) fn ni_buckets() : Array[[a]] = array_make(BUCKETS, [])
+
+#[doc("`buckets` with `x` added under `key`.")]
+pub(pkg) fn ni_add(buckets: Array[[a]], key: String, x: a) : Array[[a]] / Mutable = {
+  let b = ni_slot(key)
+  buckets[b] := [x, ...array_get(buckets, b)]
+  buckets
+}
+
+#[doc("The index over filled buckets.")]
+pub(pkg) fn ni_wrap(buckets: Array[[a]]) : NameIx[a] = NameIx(buckets)
+
+#[doc("The bucket holding the entries about `key`. It holds every name that hashes alike, so a consumer re-tests the name of each entry.")]
+pub(pkg) fn ni_bucket(ix: NameIx[a], key: String) : [a] = match ix {
+  NameIx(buckets) -> array_get(buckets, ni_slot(key))
+}
+
+#[doc("`buckets` with `x` added under the id `key`.")]
+pub(pkg) fn ni_add_id(buckets: Array[[a]], key: Int, x: a) : Array[[a]] / Mutable = {
+  let b = ni_slot_id(key)
+  buckets[b] := [x, ...array_get(buckets, b)]
+  buckets
+}
+
+#[doc("The bucket holding the entries about the id `key`. It holds every id that falls alike, so a consumer re-tests the id of each entry.")]
+pub(pkg) fn ni_bucket_id(ix: NameIx[a], key: Int) : [a] = match ix {
+  NameIx(buckets) -> array_get(buckets, ni_slot_id(key))
+}
+
+fn ni_slot(key: String) : Int = ((string_hash(key) % BUCKETS) + BUCKETS) % BUCKETS
+
+fn ni_slot_id(key: Int) : Int = ((key % BUCKETS) + BUCKETS) % BUCKETS

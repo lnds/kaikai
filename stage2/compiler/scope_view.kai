@@ -1,66 +1,43 @@
-#[doc("""
-What one module can see: the rungs a bare name climbs before it
-resolves.
-
-The scope chain binds a name to the symbol it declares, but a use site
-reaches further than its own scopes — it reaches the modules its file
-imports, and the prelude every file sees without importing. That
-structure is a link in the chain like any other: the ladder
-`own module -> selective picks -> plain imports -> cores -> any` is a
-walk outward through scopes that happen to be modules.
-
-Before this, three passes each rebuilt that ladder over their own entry
-type and each answered in a *string* — a name respelled with its home
-baked in. They disagreed about the rung order, so one name could reach
-two declarations depending on which pass asked. Here the rungs are one
-list, walked once, and the answer is a `SymId`.
-
-A rung answers only when exactly one symbol on it is visible. Two
-candidates on the same rung are an ambiguity the caller reports, never
-a first-declared pick — the failure mode the string ladders kept
-reproducing.
-""")]
+#[doc("What one module can see: the scope view a file resolves under and the rungs a bare name climbs before it resolves.")]
 
 import compiler.ast
 import compiler.symtab
-import compiler.decl_names
 import compiler.written
 import compiler.util
-import compiler.symtab_build
+import compiler.name_contest
+import compiler.module_table
+import compiler.infer_index
 
 #[doc("The modules one file can see: its own home, the names its selective imports pick, the modules its plain imports open, and the prelude cores. `quals` are the qualifiers the file binds, each to its module; they open nothing. `pkgs` binds a module to the package it belongs to, for the modules that sit in one.")]
-pub type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick], pkgs: [SvPick] }
+pub(pkg) type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick], pkgs: [SvPick] }
 
 #[doc("One name a selective import picks, bound to the module that exports it.")]
-pub type SvPick = SvPick(String, SymId)
+pub(pkg) type SvPick = SvPick(String, SymId)
 
 #[doc("A view that sees nothing but its own home. The root file before any import is resolved.")]
-pub fn sv_of_home(home: SymId) : ScopeView =
+pub(pkg) fn sv_of_home(home: SymId) : ScopeView =
   ScopeView { home: home, picks: [], imports: [], cores: [], quals: [], pkgs: [] }
 
 #[doc("The view of a file homed at `home`, picking `picks`, importing `imports`, over the prelude `cores`.")]
-pub fn sv_new(home: SymId, picks: [SvPick], imports: [SymId],
+pub(pkg) fn sv_new(home: SymId, picks: [SvPick], imports: [SymId],
       cores: [SymId]) : ScopeView =
   ScopeView { home: home, picks: picks, imports: imports, cores: cores, quals: [], pkgs: [] }
 
-#[doc("The same view seen from `home`, keeping the file's imports and picks. The walk enters a new module without rebuilding what its file sees.")]
-pub fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
+fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
   ScopeView { ...v, home: home }
 
-#[doc("The same view with the file's qualifier bindings.")]
-pub fn sv_with_quals(v: ScopeView, quals: [SvPick]) : ScopeView = ScopeView { ...v, quals: quals }
+fn sv_with_quals(v: ScopeView, quals: [SvPick]) : ScopeView = ScopeView { ...v, quals: quals }
 
-#[doc("The same view with the package of each module that sits in one.")]
-pub fn sv_with_pkgs(v: ScopeView, pkgs: [SvPick]) : ScopeView = ScopeView { ...v, pkgs: pkgs }
+fn sv_with_pkgs(v: ScopeView, pkgs: [SvPick]) : ScopeView = ScopeView { ...v, pkgs: pkgs }
 
 #[doc("Whether the declaration `s`, owned by the module `owner`, is within reach of this view's package: a declaration exported to its package alone is seen from the modules of that package, and a package is a directory with a manifest.")]
-pub fn sv_pkg_reaches(t: SymTab, v: ScopeView, s: SymId, owner: SymId) : Bool =
+pub(pkg) fn sv_pkg_reaches(t: SymTab, v: ScopeView, s: SymId, owner: SymId) : Bool =
   list_is_empty(v.pkgs) or not mint_package(sym_mint(t, s)) or sv_same_pkg(v, owner, v.home)
 
 fn sv_same_pkg(v: ScopeView, a: SymId, b: SymId) : Bool = pkgs_same(v.pkgs, a, b)
 
 #[doc("Whether the modules `a` and `b` sit in one package of `ps`.")]
-pub fn pkgs_same(ps: [SvPick], a: SymId, b: SymId) : Bool = match sv_pkg_of(ps, a) {
+pub(pkg) fn pkgs_same(ps: [SvPick], a: SymId, b: SymId) : Bool = match sv_pkg_of(ps, a) {
   Some(pa) -> match sv_pkg_of(ps, b) { Some(pb) -> pa != "" and pa == pb  None -> false }
   None     -> false
 }
@@ -71,7 +48,7 @@ fn sv_pkg_of(ps: [SvPick], m: SymId) : Option[String] = match ps {
 }
 
 #[doc("The qualifier the file binds module `m` under, if it binds one.")]
-pub fn sv_qualifier(v: ScopeView, m: SymId) : Option[String] = sv_qual_of(v.quals, m)
+pub(pkg) fn sv_qualifier(v: ScopeView, m: SymId) : Option[String] = sv_qual_of(v.quals, m)
 
 fn sv_qual_of(qs: [SvPick], m: SymId) : Option[String] = match qs {
   [] -> None
@@ -79,7 +56,7 @@ fn sv_qual_of(qs: [SvPick], m: SymId) : Option[String] = match qs {
 }
 
 #[doc("Every rung of the view rendered as text: two views that resolve some name differently render differently. A cache key folds it in.")]
-pub fn sv_key(v: ScopeView) : String =
+pub(pkg) fn sv_key(v: ScopeView) : String =
   string_concat_all([int_to_string(sym_raw(v.home)), "|", sv_picks_key(v.picks), "|", sv_ids_key(v.imports),
               "|", sv_ids_key(v.cores), "|", sv_picks_key(v.quals), "|", unwrap_or(sv_pkg_of(v.pkgs, v.home), "")])
 
@@ -89,10 +66,10 @@ fn sv_picks_key(ps: [SvPick]) : String =
   string_join(map(ps, (p) => match p { SvPick(n, m) -> string_concat_all([n, "@", int_to_string(sym_raw(m))]) }), ",")
 
 #[doc("True when `m` is one of the prelude cores. A core's declarations keep the spelling the runtime is keyed by.")]
-pub fn sv_is_core(v: ScopeView, m: SymId) : Bool = sv_has(v.cores, m)
+pub(pkg) fn sv_is_core(v: ScopeView, m: SymId) : Bool = sv_has(v.cores, m)
 
 #[doc("Between core modules only, the core set's order is a rung order: the one of `ss`, declarations of one name, whose module the set lists last. `None` when any of them is not a core's.")]
-pub fn sv_last_listed_core(t: SymTab, v: ScopeView, ss: [SymId]) : Option[SymId] =
+pub(pkg) fn sv_last_listed_core(t: SymTab, v: ScopeView, ss: [SymId]) : Option[SymId] =
   if not all(ss, (s) => sv_is_core(v, sym_owner(t, s))) { None }
   else { last_listed(t, v.cores, ss, None) }
 
@@ -105,17 +82,17 @@ fn last_listed(t: SymTab, cores: [SymId], ss: [SymId], found: Option[SymId]) : O
 }
 
 #[doc("True when the file is the module `m` or imports it in any form: opened, picked from, or bound to a qualifier.")]
-pub fn sv_imports(v: ScopeView, m: SymId) : Bool =
+pub(pkg) fn sv_imports(v: ScopeView, m: SymId) : Bool =
   sym_raw(m) == sym_raw(v.home) or sv_has(v.imports, m) or sv_names(v.picks, m) or sv_names(v.quals, m)
 
 fn sv_names(ps: [SvPick], m: SymId) : Bool =
   any(ps, (p) => match p { SvPick(_, o) -> sym_raw(o) == sym_raw(m) })
 
 #[doc("True when the file imports the module `m` or sees it as a core.")]
-pub fn sv_sees(v: ScopeView, m: SymId) : Bool = sv_has(v.imports, m) or sv_has(v.cores, m)
+pub(pkg) fn sv_sees(v: ScopeView, m: SymId) : Bool = sv_has(v.imports, m) or sv_has(v.cores, m)
 
 #[doc("True when a bare `name` the module `m` declares sits on one of the file's rungs: its own home, a pick of that name, an opened import, or a core.")]
-pub fn sv_reaches(v: ScopeView, m: SymId, name: String) : Bool =
+pub(pkg) fn sv_reaches(v: ScopeView, m: SymId, name: String) : Bool =
   sym_raw(m) == sym_raw(v.home) or sv_sees(v, m) or sv_has(sv_pick_homes(v.picks, name, []), m)
 
 fn sv_has(ms: [SymId], m: SymId) : Bool = match ms {
@@ -134,13 +111,13 @@ fn sv_pick_homes(ps: [SvPick], name: String, acc: [SymId]) : [SymId] = match ps 
 }
 
 #[doc("The rungs a bare `name` climbs, outermost last. `SvAny` closes the ladder: a declaration in a module the file never opened still answers, so the use can be reported as not imported or private rather than unknown.")]
-pub type SvRung = SvOwn | SvPicks | SvImports | SvCores | SvAny
+pub(pkg) type SvRung = SvOwn | SvPicks | SvImports | SvCores | SvAny
 
 #[doc("The ladder every name class climbs, in order.")]
-pub fn sv_rungs() : [SvRung] = [SvOwn, SvPicks, SvImports, SvCores, SvAny]
+pub(pkg) fn sv_rungs() : [SvRung] = [SvOwn, SvPicks, SvImports, SvCores, SvAny]
 
 #[doc("What resolving a name against a view decided. `SvPrivate` names the home of a declaration that exists but this view cannot reach, which a diagnostic reports differently from a name nothing declares.")]
-pub type SvRes = SvSym(SymId) | SvAmbig([SymId]) | SvNone | SvPrivate(SymId)
+pub(pkg) type SvRes = SvSym(SymId) | SvAmbig([SymId]) | SvNone | SvPrivate(SymId)
 
 #[doc("""
 The symbol `name` of class `cls` reaches from this view.
@@ -149,7 +126,7 @@ Each rung is tried in turn and the first that holds a candidate
 answers. One candidate resolves; two or more are an ambiguity, because
 a rung that cannot tell them apart has no ground to prefer either.
 """)]
-pub fn sv_resolve(t: SymTab, v: ScopeView, cls: NCls, name: String) : SvRes =
+pub(pkg) fn sv_resolve(t: SymTab, v: ScopeView, cls: NCls, name: String) : SvRes =
   sv_climb(t, v, sv_rungs(), st_candidates(t, cls, name))
 
 #[doc("""
@@ -161,7 +138,7 @@ The rungs are climbed once over the union, not once per class: a
 constant at home must beat a function two modules away, which resolving
 each class apart and choosing between the answers cannot express.
 """)]
-pub fn sv_resolve_any(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =
+pub(pkg) fn sv_resolve_any(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =
   sv_climb(t, v, sv_rungs(), sv_cands_of(t, cs, name))
 
 #[doc("""
@@ -173,7 +150,7 @@ hidden competes.
 A core is compiled against the other cores alone, so nothing is hidden
 from it.
 """)]
-pub fn sv_hidden(t: SymTab, v: ScopeView, cs: [NCls], name: String) : [SymId] =
+pub(pkg) fn sv_hidden(t: SymTab, v: ScopeView, cs: [NCls], name: String) : [SymId] =
   match sv_cands_of(t, cs, name) {
     [] -> []
     cands ->
@@ -201,14 +178,14 @@ fn sv_exported(t: SymTab, cands: [SymId], acc: [SymId]) : [SymId] = match cands 
 }
 
 #[doc("The symbol `name` reaches on the rungs nearer than the cores, across the classes `cs`: what the reader's module declares, picks or imports.")]
-pub fn sv_resolve_near(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =
+pub(pkg) fn sv_resolve_near(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =
   sv_climb(t, v, sv_near_rungs(), sv_cands_of(t, cs, name))
 
 #[doc("The rungs nearer than the cores: the file's own module, its selective imports and its imports.")]
-pub fn sv_near_rungs() : [SvRung] = [SvOwn, SvPicks, SvImports]
+pub(pkg) fn sv_near_rungs() : [SvRung] = [SvOwn, SvPicks, SvImports]
 
 #[doc("What an arity-checked climb decided: the answer, and the nearest declaration it passed over because the call's arity did not fit it.")]
-pub type SvFit = SvFit(SvRes, Option[SymId])
+pub(pkg) type SvFit = SvFit(SvRes, Option[SymId])
 
 #[doc("""
 The symbol a call of `name` reaches across the classes `cs`, climbing
@@ -218,12 +195,12 @@ A rung whose visible candidates all fail `fits` is passed over, never
 answered by, and its first candidate is reported so the caller can name
 what the call skipped. `SvNone` when no rung answers.
 """)]
-pub fn sv_resolve_fit(t: SymTab, v: ScopeView, rungs: [SvRung], cs: [NCls],
+pub(pkg) fn sv_resolve_fit(t: SymTab, v: ScopeView, rungs: [SvRung], cs: [NCls],
       name: String, fits: (SymId) -> Bool) : SvFit =
   sv_climb_fit(t, v, rungs, sv_cands_of(t, cs, name), fits, None)
 
 #[doc("The nearest of `rungs` holding any of `cands`, declarations of one name: alone there it answers, several are the tie.")]
-pub fn sv_nearest(t: SymTab, v: ScopeView, rungs: [SvRung], cands: [SymId]) : SvRes =
+pub(pkg) fn sv_nearest(t: SymTab, v: ScopeView, rungs: [SvRung], cands: [SymId]) : SvRes =
   match sv_climb_fit(t, v, rungs, cands, (_s) => true, None) {
     SvFit(r, _) -> r
   }
@@ -297,7 +274,7 @@ fn sv_on_rung(t: SymTab, v: ScopeView, r: SvRung, cands: [SymId],
 }
 
 #[doc("True when the rung `r` of this view admits a bare `name` declared by the module `owner`.")]
-pub fn sv_admits(v: ScopeView, r: SvRung, owner: SymId, name: String) : Bool =
+pub(pkg) fn sv_admits(v: ScopeView, r: SvRung, owner: SymId, name: String) : Bool =
   sv_tier_ok(v, owner) and sv_on(v, r, owner, name)
 
 # A core sees only other cores. The prelude is compiled once and must
@@ -324,7 +301,7 @@ fn sv_owner_seen(t: SymTab, acc: [SymId], owner: SymId) : Bool = match acc {
 }
 
 #[doc("The symbol the qualified `mod.name` of class `cls` reaches: the declaration `mod` homes, ignoring every other module. A qualifier names its module, so no rung applies.")]
-pub fn sv_qualified(t: SymTab, cls: NCls, modn: String, name: String) : SvRes =
+pub(pkg) fn sv_qualified(t: SymTab, cls: NCls, modn: String, name: String) : SvRes =
   match st_module(t, modn) {
     None    -> SvNone
     Some(m) -> match st_lookup(t, cls, name, m) {
@@ -334,4 +311,409 @@ pub fn sv_qualified(t: SymTab, cls: NCls, modn: String, name: String) : SvRes =
   }
 
 #[doc("The package of the module `m` in `ps`; empty when `m` sits in none.")]
-pub fn pkgs_root(ps: [SvPick], m: SymId) : String = unwrap_or(sv_pkg_of(ps, m), "")
+pub(pkg) fn pkgs_root(ps: [SvPick], m: SymId) : String = unwrap_or(sv_pkg_of(ps, m), "")
+
+#[doc("Every file's scope view, each found by its home module's id, and the view a home with no recorded file falls back to.")]
+pub(pkg) type FileViews = FileViews([ScopeView], ScopeView)
+
+#[doc("""
+The per-file views for a program: for each file the loader recorded,
+the modules it opens, the names it picks, and the cores every file
+sees without importing them.
+
+`root` is the target module's name — the home of every untagged
+declaration, and the owner an import table spells `""`. A pick names its
+module as its file wrote it, which `scopes` over `global` turns into the
+home the module's declarations carry.
+""")]
+pub(pkg) fn fv_build(imports: [ModImports], sels: [SelImport], scopes: [ModScope],
+      global: [ModuleEntry], cores: [String], root: String, pkgs: [SvPick]) : FileViews {
+  let core_ids = fv_ids(cores, [])
+  FileViews(map(fv_entries(imports, fv_tag_sels(sels, scopes, global), scopes, fv_origins(global, idx_empty()), core_ids, root, []),
+                (v) => sv_with_pkgs(v, pkgs)),
+            sv_with_pkgs(fv_bare(core_ids, root), pkgs))
+}
+
+#[doc("""
+Every selective import with the constructors of each sum type it picks
+added: `import m.{Shape}` lets the file write `Circle(1)`. The type and
+its variants are exported as one, and a constructor is read under its
+type. `decls` is the stream the picked modules' declarations are in, and
+`tab` the table that names them.
+""")]
+pub(pkg) fn sel_with_ctors(sels: [SelImport], scopes: [ModScope], global: [ModuleEntry],
+      decls: [Decl], tab: SymTab, root: String) : [SelImport] = match sels {
+  [] -> []
+  _  -> {
+    let sums = fv_sums(decls, tab, root, [])
+    map(sels, (s) => match s {
+      SelImport(o, written, names) ->
+        SelImport(o, written, fv_with_ctors(names, sums, mt_tagged_name(ms_scope_table(scopes, o, global), written), names))
+    })
+  }
+}
+
+#[doc("No file views: every home resolves seeing only its own declarations, the shape a caller with no loader tables gets.")]
+pub(pkg) fn fv_empty() : FileViews = FileViews([], sv_of_home(sym_none()))
+
+#[doc("The view of the file owned by the module `home`; a view seeing only that home and the cores when no file was recorded for it.")]
+pub(pkg) fn fv_of(v: FileViews, home: SymId) : ScopeView = match v {
+  FileViews(vs, fallback) -> match fv_find(vs, home) {
+    Some(sv) -> sv
+    None     -> sv_at_home(fallback, home)
+  }
+}
+
+fn fv_find(vs: [ScopeView], home: SymId) : Option[ScopeView] = match vs {
+  [] -> None
+  [sv, ...rest] -> if sym_raw(sv.home) == sym_raw(home) { Some(sv) } else { fv_find(rest, home) }
+}
+
+fn fv_tag_sels(sels: [SelImport], scopes: [ModScope], global: [ModuleEntry]) : [SelImport] =
+  map(sels, (s) => match s {
+    SelImport(o, written, names) -> SelImport(o, mt_tagged_name(ms_scope_table(scopes, o, global), written), names)
+  })
+
+# A file the loader spells `""` is the root file, whose declarations are
+# homed in the target module.
+fn fv_owner(owner: String, root: String) : String =
+  if owner == "" { root } else { owner }
+
+fn fv_entries(imports: [ModImports], sels: [SelImport], scopes: [ModScope],
+      origins: NameIndex[FvOrigin], core_ids: [SymId], root: String, acc: [ScopeView]) : [ScopeView] =
+  match imports {
+    [] -> list_reverse(acc)
+    [MImp(owner, names), ...rest] -> {
+      let home = fv_owner(owner, root)
+      let v = sv_with_quals(fv_view(home, names, sels, core_ids, root), fv_quals(scopes, owner, origins))
+      fv_entries(rest, sels, scopes, origins, core_ids, root, [v, ...acc])
+    }
+  }
+
+# The qualifiers the file `owner` wrote, each bound to the module it names.
+fn fv_quals(scopes: [ModScope], owner: String, origins: NameIndex[FvOrigin]) : [SvPick] = match scopes {
+  [] -> []
+  [MScope(o, mes, _), ...rest] ->
+    if o == owner {
+      map(mes, (me) => match me {
+        ME(written, _, origin, _) -> SvPick(written, st_module_id(fv_origin_name(origins, origin, written)))
+      })
+    } else { fv_quals(rest, owner, origins) }
+}
+
+# The name the global table last binds a file under, keyed by the file's
+# origin: one pass over the table instead of one per import.
+type FvOrigin = FvOrigin(String, String)
+
+fn fv_origins(global: [ModuleEntry], ix: NameIndex[FvOrigin]) : NameIndex[FvOrigin] = match global {
+  [] -> ix
+  [ME(n, _, o, _), ...rest] -> fv_origins(rest, idx_prepend(ix, o, FvOrigin(o, n)))
+}
+
+fn fv_origin_name(ix: NameIndex[FvOrigin], origin: String, fallback: String) : String =
+  fv_origin_first(idx_chain(ix, origin), origin, fallback)
+
+fn fv_origin_first(es: [FvOrigin], origin: String, fallback: String) : String = match es {
+  [] -> fallback
+  [FvOrigin(o, n), ...rest] -> if o == origin { n } else { fv_origin_first(rest, origin, fallback) }
+}
+
+fn fv_view(home: String, names: [String], sels: [SelImport],
+      core_ids: [SymId], root: String) : ScopeView =
+  sv_new(st_module_id(home), fv_picks(sels, home, root, []),
+         fv_ids(names, []), core_ids)
+
+# A sum type a module declares: its name, its home, its constructors.
+type FvSum = FvSum(String, String, [String])
+
+fn fv_sums(ds: [Decl], tab: SymTab, root: String, acc: [FvSum]) : [FvSum] = match ds {
+  [] -> acc
+  [d, ...rest] -> fv_sums(rest, tab, root, fv_sum(d, tab, root, acc))
+}
+
+# A pick is written as a name, so the sum is filed under the names the
+# table holds for it and for its constructors.
+fn fv_sum(d: Decl, tab: SymTab, root: String, acc: [FvSum]) : [FvSum] = match d {
+  DType(_, s, _, TBSum(vs), _, _, mo, _) ->
+    [FvSum(written_text(sym_name(tab, s)), fv_mo_home(mo, root), fv_variant_names(vs, tab)), ...acc]
+  DDoc(_, _, inner, _, _) -> fv_sum(inner, tab, root, acc)
+  DAttr(_, inner, _, _)   -> fv_sum(inner, tab, root, acc)
+  _ -> acc
+}
+
+fn fv_mo_home(mo: Option[String], root: String) : String = match mo {
+  Some(m) -> m
+  None    -> root
+}
+
+fn fv_variant_names(vs: [Variant], tab: SymTab) : [String] =
+  map(vs, (v) => match v { Var(c, _) -> written_text(sym_name(tab, c)) })
+
+fn fv_with_ctors(ns: [String], sums: [FvSum], home: String, acc: [String]) : [String] = match ns {
+  [] -> acc
+  [n, ...rest] -> fv_with_ctors(rest, sums, home, list_append(acc, fv_ctors_of(sums, n, home)))
+}
+
+fn fv_ctors_of(sums: [FvSum], n: String, home: String) : [String] = match sums {
+  [] -> []
+  [FvSum(t, h, cs), ...rest] -> if t == n and h == home { cs } else { fv_ctors_of(rest, n, home) }
+}
+
+fn fv_bare(core_ids: [SymId], root: String) : ScopeView =
+  sv_new(st_module_id(root), [], [], core_ids)
+
+# Only the picks the file itself wrote. A pick names one module, so it
+# outranks the plain import list even when a second import exports the
+# same name.
+fn fv_picks(sels: [SelImport], home: String, root: String,
+      acc: [SvPick]) : [SvPick] = match sels {
+  [] -> list_reverse(acc)
+  [SelImport(owner, picked, names), ...rest] ->
+    if fv_owner(owner, root) == home {
+      fv_picks(rest, home, root, fv_pick_loop(names, st_module_id(picked), acc))
+    } else { fv_picks(rest, home, root, acc) }
+}
+
+fn fv_pick_loop(names: [String], m: SymId, acc: [SvPick]) : [SvPick] =
+  match names {
+    [] -> acc
+    [n, ...rest] -> fv_pick_loop(rest, m, [SvPick(n, m), ...acc])
+  }
+
+fn fv_ids(names: [String], acc: [SymId]) : [SymId] = match names {
+  [] -> list_reverse(acc)
+  [n, ...rest] -> fv_ids(rest, [st_module_id(n), ...acc])
+}
+
+#[doc("Names bound by a param list, prepended onto `acc`.")]
+pub(pkg) fn sw_params(ps: [Param], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> sw_params(rest, [written_text(p.binder.name), ...acc])
+}
+
+fn sw_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+#[doc("The head hook that leaves a handler head as it was.")]
+pub(pkg) fn sw_head_same(r: DeclRef) : DeclRef = r
+
+#[doc("Rewrite one expression; `sh` holds the names already bound in scope. `lf` answers for a free `EName`/`EField` (None = descend), `tyf` maps each annotation, `hdf` each `with E` head.")]
+pub(pkg) fn sw_expr(e: Expr, sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Expr = match e.kind {
+  EName(_) -> match lf(e, sh) { Some(r) -> r  None -> e }
+  ESym(_, _) -> match lf(e, sh) { Some(r) -> r  None -> e }
+  EField(obj, f) -> match lf(e, sh) {
+    Some(r) -> r
+    None -> sw_re(e, EField(sw_expr(obj, sh, lf, tyf, hdf), f))
+  }
+  ECall(callee, args_) ->
+    sw_re(e, ECall(sw_expr(callee, sh, lf, tyf, hdf), sw_exprs(args_, sh, lf, tyf, hdf)))
+  EIndex(a, b) -> sw_re(e, EIndex(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf)))
+  EBinop(op, a, b) ->
+    sw_re(e, EBinop(op, sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf)))
+  EUnop(op, x) -> sw_re(e, EUnop(op, sw_expr(x, sh, lf, tyf, hdf)))
+  EIf(c, t_, eo) ->
+    sw_re(e, EIf(sw_expr(c, sh, lf, tyf, hdf), sw_expr(t_, sh, lf, tyf, hdf),
+                 sw_expr_opt(eo, sh, lf, tyf, hdf)))
+  EMatch(scr, arms) ->
+    sw_re(e, EMatch(sw_expr(scr, sh, lf, tyf, hdf), sw_arms(arms, sh, lf, tyf, hdf)))
+  ELambda(ps, body) ->
+    sw_re(e, ELambda(sw_typed_params(ps, tyf),
+                     sw_expr(body, sw_params(ps, sh), lf, tyf, hdf)))
+  ERecordLit(r, fis) ->
+    sw_re(e, ERecordLit(sw_type_ref(r, e.line, e.col, tyf), sw_fis(fis, sh, lf, tyf, hdf)))
+  EVariantsOf(t, ns) -> sw_re(e, EVariantsOf(tyf(t), ns))
+  EList(els) -> sw_re(e, EList(sw_elems(els, sh, lf, tyf, hdf)))
+  ERange(a, b, stp) ->
+    sw_re(e, ERange(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf),
+                    sw_expr_opt(stp, sh, lf, tyf, hdf)))
+  EBlock(ss, tail) -> match sw_stmts(ss, sh, lf, tyf, hdf, []) {
+    SWS(ss1, sh1) -> sw_re(e, EBlock(ss1, sw_expr_opt(tail, sh1, lf, tyf, hdf)))
+  }
+  EPipe(a, b) -> sw_re(e, EPipe(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf)))
+  EDispatchPipe(op, a, b) ->
+    sw_re(e, EDispatchPipe(op, sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf)))
+  EBang(x) -> sw_re(e, EBang(sw_expr(x, sh, lf, tyf, hdf)))
+  ELitUnit(x, u) -> sw_re(e, ELitUnit(sw_expr(x, sh, lf, tyf, hdf), u))
+  EHandle(body, eff, tas, init, alias, hcs, ret) -> {
+    let shb = match alias { Some(a) -> [written_text(a.name), ...sh]  None -> sh }
+    sw_re(e, EHandle(sw_expr(body, shb, lf, tyf, hdf), hdf(eff), map(tas, tyf),
+                     sw_expr_opt(init, sh, lf, tyf, hdf), alias,
+                     sw_hclauses(hcs, sh, lf, tyf, hdf),
+                     sw_hreturn_opt(ret, sh, lf, tyf, hdf)))
+  }
+  EIntrinsic(n, args_) -> sw_re(e, EIntrinsic(n, sw_exprs(args_, sh, lf, tyf, hdf)))
+  _ -> e
+}
+
+# A record literal names its type; the annotation hook sees a reference
+# still written as one, and what it hands back is the reference. One
+# already resolved to its declaration is left alone.
+fn sw_type_ref(r: DeclRef, l: Int, c: Int, tyf: (TypeExpr) -> TypeExpr) : DeclRef = match r {
+  DrSym(_)        -> r
+  DrWritten(_, _) -> {
+    let t = tyf(TypeExpr { tkind: TyName(r, []), line: l, col: c })
+    match t.tkind {
+      TyName(r1, _) -> r1
+      _ -> r
+    }
+  }
+}
+
+fn sw_typed_params(ps: [Param], tyf: (TypeExpr) -> TypeExpr) : [Param] =
+  map(ps, (p) => Param { binder: p.binder, ptype: sw_ty_opt(p.ptype, tyf),
+                         pline: p.pline, pcol: p.pcol, pborrow: p.pborrow })
+
+fn sw_ty_opt(o: Option[TypeExpr], tyf: (TypeExpr) -> TypeExpr) : Option[TypeExpr] = match o {
+  None -> None
+  Some(t) -> Some(tyf(t))
+}
+
+fn sw_exprs(es: [Expr], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [Expr] = match es {
+  [] -> []
+  [x, ...rest] -> [sw_expr(x, sh, lf, tyf, hdf), ...sw_exprs(rest, sh, lf, tyf, hdf)]
+}
+
+fn sw_expr_opt(o: Option[Expr], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Option[Expr] = match o {
+  None -> None
+  Some(x) -> Some(sw_expr(x, sh, lf, tyf, hdf))
+}
+
+fn sw_fis(fis: [FieldInit], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [FieldInit] = match fis {
+  [] -> []
+  [FI(f, x), ...rest] ->
+    [FI(f, sw_expr(x, sh, lf, tyf, hdf)), ...sw_fis(rest, sh, lf, tyf, hdf)]
+}
+
+fn sw_elems(els: [ListElem], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [ListElem] = match els {
+  [] -> []
+  [el, ...rest] -> {
+    let el1 = match el {
+      ElPlain(x)  -> ElPlain(sw_expr(x, sh, lf, tyf, hdf))
+      ElSpread(x) -> ElSpread(sw_expr(x, sh, lf, tyf, hdf))
+    }
+    [el1, ...sw_elems(rest, sh, lf, tyf, hdf)]
+  }
+}
+
+fn sw_arms(arms: [Arm], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [Arm] = match arms {
+  [] -> []
+  [Arm(p, g, body), ...rest] -> {
+    let shb = sw_pat_names(p, sh)
+    [Arm(sw_pat(p, tyf), sw_expr_opt(g, shb, lf, tyf, hdf), sw_expr(body, shb, lf, tyf, hdf)),
+     ...sw_arms(rest, sh, lf, tyf, hdf)]
+  }
+}
+
+# A narrowing pattern names a type, and so does the head of a
+# record-shaped ctor pattern whenever that head is a record alias
+# (`P { x: a }` over `type P = { x: Int }`): the head goes through the
+# annotation hook with the qualifier it was written with, so `m.P { ... }`
+# picks `m`'s declaration exactly as `m.P` does in type position. A head
+# the hook leaves as written is a sum-type ctor.
+fn sw_pat(p: Pattern, tyf: (TypeExpr) -> TypeExpr) : Pattern = {
+  let k = match p.pkind {
+    PNarrow(n, t) -> PNarrow(n, tyf(t))
+    PVariant(r, subs) -> PVariant(r, map(subs, (x) => sw_pat(x, tyf)))
+    PVariantRecord(r, fs) -> PVariantRecord(sw_type_ref(r, p.line, p.col, tyf), sw_pfields(fs, tyf))
+    PRecord(fs) -> PRecord(sw_pfields(fs, tyf))
+    PList(subs, rest) -> PList(map(subs, (x) => sw_pat(x, tyf)), rest)
+    PAs(n, inner) -> PAs(n, sw_pat(inner, tyf))
+    PSurface(ps) ->
+      PSurface(patsurface_rebuild(ps, map(patsurface_children(ps), (x) => sw_pat(x, tyf))))
+    _ -> p.pkind
+  }
+  Pattern { pkind: k, line: p.line, col: p.col }
+}
+
+# The names a pattern binds, as written, prepended onto `acc`.
+fn sw_pat_names(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PBind(b)              -> [written_text(b.name), ...acc]
+  PAs(b, inner)         -> sw_pat_names(inner, [written_text(b.name), ...acc])
+  PNarrow(b, _)         -> [written_text(b.name), ...acc]
+  PList(subs, rest)     -> {
+    let acc1 = sw_pats_names(subs, acc)
+    match rest { Some(b) -> [written_text(b.name), ...acc1]  None -> acc1 }
+  }
+  PVariant(_, subs)     -> sw_pats_names(subs, acc)
+  PVariantRecord(_, fs) -> sw_pfield_names(fs, acc)
+  PRecord(fs)           -> sw_pfield_names(fs, acc)
+  PSurface(sp)          -> sw_pats_names(patsurface_children(sp), acc)
+  _                     -> acc
+}
+
+fn sw_pats_names(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> sw_pats_names(rest, sw_pat_names(p, acc))
+}
+
+fn sw_pfield_names(fs: [PField], acc: [String]) : [String] = match fs {
+  []                           -> acc
+  [PField(_, sub, _), ...rest] -> sw_pfield_names(rest, sw_pat_names(sub, acc))
+}
+
+fn sw_pfields(fs: [PField], tyf: (TypeExpr) -> TypeExpr) : [PField] = match fs {
+  [] -> []
+  [PField(n, sub, sh), ...rest] -> [PField(n, sw_pat(sub, tyf), sh), ...sw_pfields(rest, tyf)]
+}
+
+#[doc("Rewrite the bodies of a handler-clause list; each clause binds its op params and `resume`.")]
+pub(pkg) fn sw_hclauses(hcs: [HClause], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : [HClause] = match hcs {
+  [] -> []
+  [HC(op, ps, body, l, c), ...rest] -> {
+    let shc = ["resume", ...sw_params(ps, sh)]
+    [HC(op, sw_typed_params(ps, tyf), sw_expr(body, shc, lf, tyf, hdf), l, c),
+     ...sw_hclauses(rest, sh, lf, tyf, hdf)]
+  }
+}
+
+#[doc("Rewrite a handler `return(x)` clause body; `x` is bound inside it.")]
+pub(pkg) fn sw_hreturn_opt(o: Option[HReturn], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Option[HReturn] = match o {
+  None -> None
+  Some(HR(x, body, l, c)) -> Some(HR(x, sw_expr(body, [written_text(x.name), ...sh], lf, tyf, hdf), l, c))
+}
+
+# A statement list threads its binders forward: a `let` / `var` name
+# scopes over the remaining statements and the block tail.
+type SwStmts = SWS([Stmt], [String])
+
+fn sw_stmts(ss: [Stmt], sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef, acc: [Stmt]) : SwStmts = match ss {
+  [] -> SWS(list_reverse(acc), sh)
+  [s, ...rest] ->
+    sw_stmts(rest, sw_stmt_binders(s, sh), lf, tyf, hdf, [sw_stmt(s, sh, lf, tyf, hdf), ...acc])
+}
+
+fn sw_stmt(s: Stmt, sh: [String], lf: (Expr, [String]) -> Option[Expr],
+      tyf: (TypeExpr) -> TypeExpr, hdf: (DeclRef) -> DeclRef) : Stmt = match s {
+  SLet(p, t, x) -> SLet(sw_pat(p, tyf), sw_ty_opt(t, tyf), sw_expr(x, sh, lf, tyf, hdf))
+  SAssert(x, mo) -> SAssert(sw_expr(x, sh, lf, tyf, hdf), sw_expr_opt(mo, sh, lf, tyf, hdf))
+  SExprStmt(x) -> SExprStmt(sw_expr(x, sh, lf, tyf, hdf))
+  SIndexAssign(a, b, c, l, cc) ->
+    SIndexAssign(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf),
+                 sw_expr(c, sh, lf, tyf, hdf), l, cc)
+  SAssign(a, b, l, c) -> SAssign(sw_expr(a, sh, lf, tyf, hdf), sw_expr(b, sh, lf, tyf, hdf), l, c)
+  SVar(n, t, x, l, c) -> SVar(n, sw_ty_opt(t, tyf), sw_expr(x, sh, lf, tyf, hdf), l, c)
+  SUse(n, l, c) -> SUse(sw_use_name(hdf(ref_written(n)), n), l, c)
+}
+
+# A `use` names its effect in text; a head the hook settled keeps the
+# name the source wrote.
+fn sw_use_name(r: DeclRef, n: String) : String = match r {
+  DrWritten(None, w)    -> written_text(w)
+  DrWritten(Some(q), w) -> cat3(written_text(q), ".", written_text(w))
+  DrSym(_)              -> n
+}
+
+fn sw_stmt_binders(s: Stmt, sh: [String]) : [String] = match s {
+  SLet(p, _, _)       -> sw_pat_names(p, sh)
+  SVar(n, _, _, _, _) -> [written_text(n.name), ...sh]
+  _ -> sh
+}
