@@ -1,14 +1,5 @@
 #[doc("""
-Protocol name resolution through the scope chain.
-
-A protocol name climbs the same rungs every other name class does. The
-registry keys a home by `Option[String]` — `None` for the root file —
-so this is where the chain's `SymId` answers become the shape the
-registry stores, and the only place that mapping is written.
-
-`PkPrivate` keeps the distinction the ladder this replaced could make:
-a protocol declared in a module the use site cannot reach reports as
-private, naming that module, not as an unknown name.
+Protocol keys, ranking and orphan detection over the resolved program.
 """)]
 
 import compiler.ast
@@ -19,20 +10,26 @@ import compiler.scope_view
 import compiler.decl_names
 import compiler.scope_file
 import compiler.written
+import compiler.util
+import compiler.decl_text
+import compiler.module_table
+import compiler.type_text
+import compiler.diag
+import compiler.fnreg
 
 #[doc("What protocol resolution needs from the chain: the symbol table, every file's scope view, and the module untagged declarations are homed in.")]
 pub type PScope = PScope(SymTab, FileViews, String)
 
 #[doc("The scope view of the file homed at `home` (`None` = root file).")]
-pub fn ps_view(p: PScope, home: Option[String]) : ScopeView = match p {
+pub(pkg) fn ps_view(p: PScope, home: Option[String]) : ScopeView = match p {
   PScope(t, vs, root) -> fv_of(vs, st_module_id(pk_home_name(home, root)))
 }
 
 #[doc("The symbol table this scope resolves against.")]
-pub fn ps_tab(p: PScope) : SymTab = match p { PScope(t, _, _) -> t }
+pub(pkg) fn ps_tab(p: PScope) : SymTab = match p { PScope(t, _, _) -> t }
 
 #[doc("The module name untagged declarations are homed in.")]
-pub fn ps_root(p: PScope) : String = match p { PScope(_, _, r) -> r }
+pub(pkg) fn ps_root(p: PScope) : String = match p { PScope(_, _, r) -> r }
 
 #[doc("""
 The protocol `name` (bare, or `m.P`) reaches from the view `v`, as the
@@ -46,8 +43,7 @@ diagnostic can say "declared in `m`, not visible here" rather than
 pub type PkRes = PkHome(Option[String]) | PkPrivate(String) | PkUnknown
                | PkAmbiguous([Option[String]])
 
-#[doc("Resolve the protocol `name` from the view `v`, answering the home the registry keys by. `root` is the target module, whose declarations the registry homes at `None`.")]
-pub fn pk_resolve(t: SymTab, v: ScopeView, name: String, root: String) : PkRes =
+fn pk_resolve(t: SymTab, v: ScopeView, name: String, root: String) : PkRes =
   pk_res(t, pk_sv(t, v, name), root)
 
 fn pk_sv(t: SymTab, v: ScopeView, name: String) : SvRes =
@@ -81,18 +77,18 @@ fn pk_home_name(home: Option[String], root: String) : String = match home {
 }
 
 #[doc("Resolve the protocol `name` as seen from the file homed at `from` (`None` = root file).")]
-pub fn ps_resolve(p: PScope, name: String, from: Option[String]) : PkRes =
+pub(pkg) fn ps_resolve(p: PScope, name: String, from: Option[String]) : PkRes =
   pk_resolve(ps_tab(p), ps_view(p, from), name, ps_root(p))
 
 #[doc("The protocol `name` (bare, or `m.P`) denotes as seen from the file homed at `from` (`None` = root file); `sym_none()` when it resolves to no single reachable protocol.")]
-pub fn ps_proto_sym(p: PScope, name: String, from: Option[String]) : SymId =
+pub(pkg) fn ps_proto_sym(p: PScope, name: String, from: Option[String]) : SymId =
   match pk_sv(ps_tab(p), ps_view(p, from), name) {
     SvSym(s) -> s
     _        -> sym_none()
   }
 
 #[doc("The protocol the reference `r` denotes as seen from the file homed at `from` (`None` = root file); `sym_none()` when it resolves to no single reachable protocol.")]
-pub fn ps_ref_proto(p: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
+pub(pkg) fn ps_ref_proto(p: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
   DrSym(s)              -> s
   DrWritten(None, n)    -> ps_proto_sym(p, written_text(n), from)
   DrWritten(Some(m), n) -> match sv_qualified(ps_tab(p), NCProtocol, written_text(m), written_text(n)) {
@@ -101,14 +97,13 @@ pub fn ps_ref_proto(p: PScope, r: DeclRef, from: Option[String]) : SymId = match
   }
 }
 
-#[doc("The module declaring the type the reference `r` names, as seen from the file homed at `from` (`None` = root file); `sym_none()` when no declared type answers, as for a builtin.")]
-pub fn ps_type_owner(p: PScope, r: DeclRef, from: Option[String]) : SymId {
+fn ps_type_owner(p: PScope, r: DeclRef, from: Option[String]) : SymId {
   let s = ps_type_sym(p, r, from)
   if sym_raw(s) < 0 { sym_none() } else { sym_owner(ps_tab(p), s) }
 }
 
 #[doc("The type declaration the reference `r` names, as seen from the file homed at `from` (`None` = root file); `sym_none()` when no declared type answers, as for a builtin.")]
-pub fn ps_type_sym(p: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
+pub(pkg) fn ps_type_sym(p: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
   DrSym(s)        -> s
   DrWritten(q, n) -> match ps_type_written(p, q, written_text(n), from) {
     SvSym(s) -> s
@@ -121,5 +116,209 @@ fn ps_type_written(p: PScope, q: Option[Written], name: String, from: Option[Str
   None    -> match split_dotted_qualifier(name) {
     Some(QSplit(m, bare)) -> sv_qualified(ps_tab(p), NCType, m, bare)
     None -> sv_resolve(ps_tab(p), ps_view(p, from), NCType, name)
+  }
+}
+
+#[doc("The dispatch key of the protocol symbol `s`: `<home>__<name>` when the name is contested and the home is a non-core module, the bare name otherwise.")]
+pub(pkg) fn pk_of(t: SymTab, v: ScopeView, s: SymId) : String {
+  let name = written_text(sym_name(t, s))
+  let owner = sym_owner(t, s)
+  if pk_bare_home(t, v, owner) or not pk_contested(t, name) { name }
+  else { concat_all([written_text(sym_name(t, owner)), "__", name]) }
+}
+
+# The root file (no module to qualify with) and the cores (keyed by the
+# runtime under their fixed bare ids) never take a spelled key.
+fn pk_bare_home(t: SymTab, v: ScopeView, owner: SymId) : Bool =
+  not st_valid(t, owner) or sv_is_core(v, owner)
+
+# Contested = at least two distinct homes declare the name.
+fn pk_contested(t: SymTab, name: String) : Bool =
+  pk_two_homes(t, st_candidates(t, NCProtocol, name))
+
+fn pk_two_homes(t: SymTab, cands: [SymId]) : Bool = match cands {
+  []        -> false
+  [s, ...rest] -> pk_other_home(t, rest, sym_owner(t, s))
+}
+
+fn pk_other_home(t: SymTab, cands: [SymId], h: SymId) : Bool = match cands {
+  [] -> false
+  [s, ...rest] ->
+    if sym_raw(sym_owner(t, s)) == sym_raw(h) { pk_other_home(t, rest, h) }
+    else { true }
+}
+
+#[doc("One dispatch key per protocol the table declares, keyed by the home the registry uses (`None` = the root file).")]
+pub(pkg) fn pk_table(t: SymTab, v: ScopeView, root: String) : [ProtoKey] =
+  pk_rows(t, v, root, st_ids(t), [])
+
+fn pk_rows(t: SymTab, v: ScopeView, root: String, ids: [SymId],
+      acc: [ProtoKey]) : [ProtoKey] = match ids {
+  [] -> list_reverse(acc)
+  [s, ...rest] ->
+    if pk_is_protocol(t, s) { pk_rows(t, v, root, rest, [pk_row(t, v, s, root), ...acc]) }
+    else { pk_rows(t, v, root, rest, acc) }
+}
+
+fn pk_is_protocol(t: SymTab, s: SymId) : Bool =
+  ncls_same(sym_class(t, s), NCProtocol)
+
+fn pk_row(t: SymTab, v: ScopeView, s: SymId, root: String) : ProtoKey {
+  let owner = sym_owner(t, s)
+  PKey(s,
+       if sym_raw(owner) == sym_raw(st_module_id(root)) { None } else { Some(written_text(sym_name(t, owner))) },
+       written(pk_of(t, v, s)))
+}
+
+#[doc("An impl as the orphan rule judges it. `proto_home` is `None` when the protocol did not resolve, which its own diagnostic reports.")]
+pub(pkg) type OrphanImpl = {
+  pspell: String,
+  proto_home: Option[String],
+  args: [TypeExpr],
+  target: TypeExpr,
+  from: Option[String],
+  impl_mod: String
+}
+
+#[doc("What the rule resolves type names against: the scope chain.")]
+pub(pkg) type OrphanScope = OrphanScope(PScope)
+
+#[doc("The orphan-rule diagnostic for `o`, or `None` when the impl is legal.")]
+pub(pkg) fn orphan_error(os: OrphanScope, o: OrphanImpl) : Option[String] = match o.proto_home {
+  None -> None
+  Some(ph) ->
+    if ph == o.impl_mod or orphan_any_local(os, [o.target, ...o.args], o) { None }
+    else { Some(orphan_text(os, o, ph)) }
+}
+
+fn orphan_any_local(os: OrphanScope, ts: [TypeExpr], o: OrphanImpl) : Bool = match ts {
+  [] -> false
+  [t, ...rest] -> orphan_local(orphan_owner(os, orphan_head(t), o.from), o) or
+                  orphan_any_local(os, rest, o)
+}
+
+fn orphan_local(owner: SymId, o: OrphanImpl) : Bool =
+  sym_raw(owner) >= 0 and sym_raw(owner) == sym_raw(st_module_id(o.impl_mod))
+
+# The reference a type is headed by; none for a type no declaration can head.
+fn orphan_head(t: TypeExpr) : Option[DeclRef] = match t.tkind {
+  TyName(r, _) -> Some(r)
+  TyList(_) -> Some(ref_written("List"))
+  TyDim(base, _) -> orphan_head(base)
+  TyRefine(base, _) -> orphan_head(base)
+  _ -> None
+}
+
+fn orphan_owner(os: OrphanScope, h: Option[DeclRef], from: Option[String]) : SymId = match h {
+  Some(r) -> match os { OrphanScope(ps) -> ps_type_owner(ps, r, from) }
+  None    -> sym_none()
+}
+
+fn orphan_tab(os: OrphanScope) : SymTab = match os { OrphanScope(ps) -> ps_tab(ps) }
+
+fn orphan_text(os: OrphanScope, o: OrphanImpl, ph: String) : String {
+  let head = orphan_head(o.target)
+  let owner = orphan_owner(os, head, o.from)
+  let thome =
+    if sym_raw(owner) >= 0 { concat_all([" in `", mt_spell_home([], written_text(sym_name(orphan_tab(os), owner))), "`"]) }
+    else { " is builtin" }
+  let pshown = match o.args {
+    [] -> o.pspell
+    _  -> concat_all([o.pspell, "[", orphan_list(os, o.args), "]"])
+  }
+  concat_all(["orphan rule: `impl ", pshown, " for ", orphan_shown(os, o.target),
+              "` is in module `", mt_spell_home([], o.impl_mod), "`, but `", o.pspell,
+              "` is declared in `", mt_spell_home([], ph),
+              "` and `", orphan_head_name(os, head), "`", thome,
+              "; an impl must live in the module of its protocol, its type, or a protocol argument's type"])
+}
+
+# A type as its source wrote it.
+fn orphan_shown(os: OrphanScope, t: TypeExpr) : String = match t.tkind {
+  TyName(r, []) -> orphan_name(os, r)
+  TyName(r, args) -> concat_all([orphan_name(os, r), "[", orphan_list(os, args), "]"])
+  _ -> type_text(orphan_tab(os), t)
+}
+
+fn orphan_list(os: OrphanScope, ts: [TypeExpr]) : String =
+  join_with(map(ts, (t) => orphan_shown(os, t)), ", ")
+
+fn orphan_head_name(os: OrphanScope, h: Option[DeclRef]) : String = match h {
+  Some(r) -> orphan_name(os, r)
+  None    -> ""
+}
+
+fn orphan_name(os: OrphanScope, r: DeclRef) : String = match r {
+  DrWritten(_, n) -> written_text(n)
+  DrSym(s)        -> written_text(decl_name(orphan_tab(os), s))
+}
+
+#[doc("One protocol able to serve a bare op call: `PMatch(home, tier, impl)`. Tier 0 = the caller's own module, 1 = imported or root, 2 = core.")]
+pub type ProtoMatch = PMatch(Option[String], Int, ProtoImplReg)
+
+#[doc("Rank `cands` (each an op declaration with its home) by tier, keeping only those `serves` maps to an impl. `cm` is the calling module, `cores` the prelude module names.")]
+pub(pkg) fn proto_ranked_matches(cands: [ProtoOpReg], cm: Option[String], cores: [String],
+                            serves: (ProtoOpReg) -> Option[ProtoImplReg]) : [ProtoMatch] = {
+  let ms = prm_collect(cands, cm, cores, serves, [])
+  list_append(prm_tier(ms, 0), list_append(prm_tier(ms, 1), prm_tier(ms, 2)))
+}
+
+#[doc("True when a ranked match list carries, at the head's tier, a second protocol from another home.")]
+pub(pkg) fn proto_matches_ambiguous(ms: [ProtoMatch]) : Bool = match ms {
+  [] -> false
+  [PMatch(h, t, _), ...rest] -> t < 2 and prm_other_home(rest, h, t)
+}
+
+#[doc("The diagnostic for an ambiguous bare op call: every home whose protocol serves the receiver, in declaration order.")]
+pub(pkg) fn ambiguous_proto_call_diag(file: String, line: Int, col: Int, opname: String,
+                                 pname: String, ms: [ProtoMatch]) : Diagnostic = {
+  let homes = prm_homes(list_reverse(ms), [])
+  mk_diag(SevError, file, line, col,
+    concat_all(["ambiguous call to `", opname, "`: protocol `", pname,
+                "` is exported by multiple modules: ", join_with(homes, ", ")]),
+    [ri_note(file, line, col, concat_all(["each of ", join_with(map(homes, (h) => concat_all([h, ".", pname])), ", "),
+                                           " implements `", opname, "` for this receiver"])),
+     ri_help(file, line, col, "import only one of the declaring modules, or dispatch on a receiver only one of them implements")])
+}
+
+fn prm_collect(cands: [ProtoOpReg], cm: Option[String], cores: [String],
+               serves: (ProtoOpReg) -> Option[ProtoImplReg],
+               acc: [ProtoMatch]) : [ProtoMatch] = match cands {
+  [] -> list_reverse(acc)
+  [po, ...rest] -> match serves(po) {
+    None -> prm_collect(rest, cm, cores, serves, acc)
+    Some(hit) -> match po {
+      POR(_, _, _, _, _, _, pmo, _) ->
+        prm_collect(rest, cm, cores, serves,
+                    [PMatch(pmo, prm_tier_of(pmo, cm, cores), hit), ...acc])
+    }
+  }
+}
+
+fn prm_tier_of(pmo: Option[String], cm: Option[String], cores: [String]) : Int =
+  if mo_eq(pmo, cm) { 0 }
+  else { match pmo {
+    Some(m) -> if list_has(cores, m) { 2 } else { 1 }
+    None    -> 1
+  } }
+
+fn prm_tier(ms: [ProtoMatch], t: Int) : [ProtoMatch] = match ms {
+  [] -> []
+  [m, ...rest] -> match m {
+    PMatch(_, mt, _) -> if mt == t { [m, ...prm_tier(rest, t)] } else { prm_tier(rest, t) }
+  }
+}
+
+fn prm_other_home(ms: [ProtoMatch], h: Option[String], t: Int) : Bool = match ms {
+  [] -> false
+  [PMatch(m, mt, _), ...rest] ->
+    if mt == t and not mo_eq(m, h) { true } else { prm_other_home(rest, h, t) }
+}
+
+fn prm_homes(ms: [ProtoMatch], acc: [String]) : [String] = match ms {
+  [] -> list_reverse(acc)
+  [PMatch(mo, _, _), ...rest] -> {
+    let h = match mo { Some(m) -> m  None -> "<root>" }
+    if list_has(acc, h) { prm_homes(rest, acc) } else { prm_homes(rest, [h, ...acc]) }
   }
 }

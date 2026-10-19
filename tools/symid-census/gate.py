@@ -48,7 +48,7 @@ FINAL = "--final" in sys.argv[2:]
 REASONS = "RDEL"
 TEXT = {"String", "Written"}
 IDENT = {"SymId", "FnId", "LocalId", "DeclRef", "Binder"}
-TYPE_DEF = re.compile(r"^(?:pub\s+)?(?:opaque\s+)?type\s+([A-Z]\w*)[^=\n]*=?", re.M)
+TYPE_DEF = re.compile(r"^(?:pub(?:\([a-z]+\))?\s+)?(?:opaque\s+)?type\s+([A-Z]\w*)[^=\n]*=?", re.M)
 TOP_LEVEL = re.compile(r"^[a-z#]", re.M)
 READ = re.compile(r"(?<!fn )\bwritten_text\b")
 MINT = re.compile(r"(?<!fn )\b(EName|EModCall|mk_name)\(")
