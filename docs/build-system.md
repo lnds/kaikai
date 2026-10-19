@@ -293,7 +293,7 @@ CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1
 
 ## The c-modular core TU set — pruning against a cached core
 
-The c-modular backend (`--emit=c-modular`, what `bin/kai build --backend=c` uses) emits one translation unit per module. The core's TUs, with the two header slices each compiles against, are cached in the shared core-cache directory (`core-emit-<key>.kct`). A compile that finds the set for its inputs prunes the core to what the program reaches (`core_reach`, the early cut) and splices every cached core TU, so typing, monomorphising, Perceus and emitting never walk the unreached core.
+The c-modular backend (`--emit=c-modular`, what `bin/kai build --backend=c` uses) emits one translation unit per module. The core's TUs, with the two header slices each compiles against, are cached in the shared core-cache directory (`core-emit-<key>.kct`). A compile that finds the set for its inputs prunes the core to what the typed program asks for (`core_demand`) and splices every cached core TU, so typing, monomorphising, Perceus and emitting never walk the unreached core. Every core function is a candidate: the front end reads its scheme from its signature on the first lookup and types its body only when typed code refers to it, an operator on operands the runtime does not combine natively asks for the impls of its protocol, and a dispatcher asks for all of them. A core function the early cut left without a body that the scan asks for starts the compile over without that cut (`--core-cache-stats` prints the note and, per wave, `core-demand: typing …`).
 
 Two keys, because the TU text depends on the program only through a few global inputs:
 

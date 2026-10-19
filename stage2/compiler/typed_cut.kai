@@ -39,6 +39,7 @@ import compiler.infer_state
 import compiler.infer_env_exhaust
 import compiler.infer_dump_text
 import compiler.infer_apply
+import compiler.infer_unit_alias
 import compiler.infer_program
 import compiler.proto_ids
 import compiler.symtab
@@ -56,8 +57,8 @@ import compiler.entry
 import compiler.kind_theory
 import compiler.doc_attr
 import compiler.written
+import compiler.core_demand
 import compiler.core_reach
-import compiler.defer_hits
 import compiler.infer_index
 
 #[doc("Per-module cut context: the cache directory (empty disables the cut), the cross-module context hash folded into every module key, the scope view of each file, the target module that owns untagged declarations, and the root modules.")]
@@ -126,12 +127,12 @@ fn kth_chunk(k: KindTheory) : String = match k {
 #[doc("Build the cut context for one compile: the cache directory, the files' scope views, the root modules, plus a hash over the cross-module inputs the typer reads around the fold — the protocol-impl, kind-theory and head-owner tables, the program-wide type/effect declarations, and the function names several modules declare. Pass an empty directory to disable the cut.")]
 pub fn tcut_ctx(cache_dir: String, all_program_decls: [Decl], tab: SymTab, target: String, roots: Roots,
                  protos: ProtoView, head_owners: [HeadOwnerEntry],
-                 kind_theories: [KindTheory], views: FileViews) : TypedCutCtx = {
+                 kind_theories: [KindTheory], views: FileViews, pool_hex: String) : TypedCutCtx = {
   let xhex = uc_content_hex(concat_all([tm_decls_hex(filter(all_program_decls, is_xdecl)), "|",
                                         concat_all(map(protos.impls, (p) => pir_chunk(p))), "|",
                                         concat_all(map(head_owners, (h) => hoe_chunk(h))), "|",
                                         concat_all(map(kind_theories, (k) => kth_chunk(k))), "|",
-                                        tsh_fn_contests(all_program_decls, tab, target)]))
+                                        tsh_fn_contests(all_program_decls, tab, target), "|", pool_hex]))
   TCC(cache_dir, xhex, views, target, roots)
 }
 
@@ -210,59 +211,83 @@ fn tcf_finish(acc: TCFold, all_program_decls: [Decl]) : TypedProgram = match acc
     }
 }
 
-#[doc("The core functions the front end types only when the typed program needs them: the pool of their declarations, the groups they belong to, and the test that names the groups a batch of typed declarations needs.")]
-pub type TcDefer = { pool: [Decl], groups: [DeferGroup], order: [Decl], stats: Bool, hits: ([DeferGroup], [Decl]) -> DeferHits }
+#[doc("The core functions the front end types only when the typed program needs them: the lookups of the candidates, and the declarations in program order, which the late ones are put back into.")]
+pub type TcDefer = { demand: Option[Demand], order: [Decl], stats: Bool }
 
 #[doc("A fold with nothing deferred.")]
-pub fn tcut_no_defer() : TcDefer = TcDefer { pool: [], groups: [], order: [], stats: false, hits: tcut_no_hits }
+pub fn tcut_no_defer() : TcDefer = TcDefer { demand: None, order: [], stats: false }
 
-fn tcut_no_hits(gs: [DeferGroup], ds: [Decl]) : DeferHits = DeferHits([], 0, 0, 0, 0, 0)
+#[doc("A typed program and the core functions it asked for that the early cut left without a body.")]
+pub type TcOut = TcOut(TypedProgram, [SymId])
 
-# The fold so far, and the declarations its last pass typed.
-type TCLoop = TCL(TCFold, ModuleEnvDelta, IfaceAcc, TcShared, [Decl])
+# A module as the fold met it, and the front a late batch of its functions is typed against.
+type TcCtx = TcX(ModuleDecls, ModuleEnvDelta, TcShared, Option[ModuleFront], Int)
 
-#[doc("Fold the per-module typechecker across a partitioned decl stream, restoring each module from its typed blob when the cut's key matches and inferring it otherwise. With the cut disabled every module is inferred, which is byte-identical to the uncut fold. The deferred groups the typed program needs are typed afterwards, until no more are.")]
-pub fn tcut_typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls],
+# The fold so far, the declarations its last pass typed, and the modules met.
+type TCLoop = TCL(TCFold, ModuleEnvDelta, IfaceAcc, TcShared, [Decl], [TcCtx])
+
+type TcMod = TcMod(TypecheckedModule, Option[ModuleFront])
+
+#[doc("Fold the per-module typechecker across a partitioned decl stream, restoring each module from its typed blob when the cut's key matches and inferring it otherwise. With the cut disabled every module is inferred, which is byte-identical to the uncut fold. The core functions left to the demand scan are typed afterwards, until no more are asked for.")]
+pub fn tcut_typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls], full: [ModuleDecls],
                                ctx: TypedCutCtx,
                                protos: ProtoView,
                                head_owners: [HeadOwnerEntry],
                                kind_theories: [KindTheory],
                                tab: SymTab, views: FileViews, roots: Roots,
                                defer: TcDefer,
-                               verbose: Bool) : TypedProgram / Console + File + Mutable = {
+                               verbose: Bool) : TcOut / Console + File + Mutable = {
   let all_program_decls = flatten_module_decls(modules, [])
-  let sh = tc_shared(file, df, all_program_decls, tab, views, roots)
-  let track = not list_is_empty(defer.groups)
+  let sh0 = tc_shared(file, df, match defer.demand { Some(_) -> flatten_module_decls(full, [])  None -> all_program_decls }, tab, views, roots)
+  let sh = match defer.demand { Some(dm) -> TcShared { ...sh0, pool: dm.sigs }  None -> sh0 }
   let first = tcut_loop(file, df, modules, all_program_decls, ctx, protos, head_owners,
-                         kind_theories, tab, verbose, track,
-                         TCL(tcf_empty(), module_env_delta_empty(), iface_acc_empty(), sh, []))
-  if not track { tcf_finish(match first { TCL(acc, _, _, _, _) -> acc }, all_program_decls) } else {
-  let done = tcut_defer(file, df, all_program_decls, ctx, protos, head_owners,
-                         kind_theories, tab, verbose, defer, first)
-  let first_acc = match first { TCL(a, _, _, _, _) -> a }
-  let tp = tcf_finish(match done { TCL(acc, _, _, _, _) -> tcf_keep_toplevel(acc, first_acc) }, all_program_decls)
-  tcut_in_order(tp, tcf_count(first_acc), defer.order)
+                         kind_theories, tab, verbose, defer.demand,
+                         TCL(tcf_empty(), module_env_delta_empty(), iface_acc_empty(), sh, [], []))
+  match defer.demand {
+    None -> TcOut(tcf_finish(match first { TCL(acc, _, _, _, _, _) -> acc }, all_program_decls), [])
+    Some(dm) -> {
+      let first_acc = match first { TCL(a, _, _, _, _, _) -> a }
+      let done = tcut_demand(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, dm,
+                              dm_empty(), defer.stats, full, first, [], [])
+      match done {
+        TcDone(TCL(acc, _, _, _, _, ctxs), ms, late) -> {
+          let tp = tcf_finish(tcf_keep_toplevel(acc, first_acc), all_program_decls)
+          let firsts = tcf_finish(first_acc, all_program_decls).decls
+          TcOut(TypedProgram { ...tp, decls: tcut_weave(file, defer.order, dm, list_reverse(ctxs), firsts, late) }, ms)
+        }
+      }
+    }
   }
 }
 
-fn tcf_count(acc: TCFold) : Int = match acc { TCF(ds, _, _, _, _, _, _, _, _) -> list_length(ds) }
-
-# The deferred functions follow the first pass in program order, not in the order they were asked for.
-fn tcut_in_order(tp: TypedProgram, n: Int, order: [Decl]) : TypedProgram =
-  if list_length(tp.decls) <= n { tp }
-  else {
-    let pos = tcg_positions(order, 0, idx_empty())
-    TypedProgram { ...tp, decls: list_append(take(tp.decls, n), sort_by(drop(tp.decls, n), (a, b) => tcg_pos(pos, a) - tcg_pos(pos, b))) }
-  }
-
-fn tcg_positions(ds: [Decl], i: Int, ix: NameIndex[Int]) : NameIndex[Int] = match ds {
-  [] -> ix
-  [d, ...rest] -> tcg_positions(rest, i + 1, idx_prepend_sym(ix, tcg_decl_sym(d), i))
+# The typed program in the order the modules of what it keeps give: each late function takes the place it has in its module.
+fn tcut_weave(file: String, order: [Decl], dm: Demand, ctxs: [TcCtx], firsts: [Decl], late: [Decl]) : [Decl] = {
+  let slices = tcut_slices(ctxs, firsts, [])
+  let lates = foldl(late, idx_empty(), (ix, d) => idx_prepend_sym(ix, tcg_decl_sym(d), d))
+  let kept = filter(order, (d) => not demand_pooled(dm, tcg_decl_sym(d)) or tcx_asked(lates, d))
+  flat_map(partition_decls_by_home(kept, root_module_name(file)), (m) => tcut_weave_module(dm, lates, m.decls, tcut_slice_of(slices, m.name), []))
 }
 
-fn tcg_pos(ix: NameIndex[Int], d: Decl) : Int = match idx_chain_sym(ix, tcg_decl_sym(d)) {
-  [i, ..._] -> i
-  []        -> 0
+type TcSlice = TcSlice(Option[String], [Decl])
+
+fn tcut_slices(ctxs: [TcCtx], rest: [Decl], acc: [TcSlice]) : [TcSlice] = match ctxs {
+  [] -> acc
+  [TcX(m, _, _, _, c), ...more] -> tcut_slices(more, drop(rest, c), [TcSlice(m.name, take(rest, c)), ...acc])
+}
+
+fn tcut_slice_of(ss: [TcSlice], name: Option[String]) : [Decl] = match ss {
+  [] -> []
+  [TcSlice(n, ds), ...rest] -> if tcx_same(n, name) { ds } else { tcut_slice_of(rest, name) }
+}
+
+fn tcut_weave_module(dm: Demand, lates: NameIndex[Decl], orig: [Decl], first: [Decl], acc: [Decl]) : [Decl] = match orig {
+  [] -> list_append(list_reverse(acc), first)
+  [o, ...rest] -> if demand_pooled(dm, tcg_decl_sym(o)) {
+    tcut_weave_module(dm, lates, rest, first, list_append(list_reverse(idx_chain_sym(lates, tcg_decl_sym(o))), acc))
+  } else { match first {
+    [f, ...more] -> tcut_weave_module(dm, lates, rest, more, [f, ...acc])
+    []           -> tcut_weave_module(dm, lates, rest, [], acc)
+  } }
 }
 
 fn tcf_keep_toplevel(acc: TCFold, first: TCFold) : TCFold = match acc {
@@ -271,41 +296,69 @@ fn tcf_keep_toplevel(acc: TCFold, first: TCFold) : TCFold = match acc {
   }
 }
 
-fn tcut_defer(file: String, df: DiagFiles, all_program_decls: [Decl], ctx: TypedCutCtx,
-               protos: ProtoView, head_owners: [HeadOwnerEntry],
-               kind_theories: [KindTheory], tab: SymTab, verbose: Bool,
-               defer: TcDefer, lp: TCLoop) : TCLoop / Console + File + Mutable = match lp {
-  TCL(acc, inherited, iface, sh, fresh) -> if list_is_empty(defer.groups) { lp } else {
-    let found = defer.hits(defer.groups, fresh)
-    let hit = match found { DeferHits(ps, _, _, _, _, _) -> ps }
-    let _note = tcut_defer_note(defer.stats, found)
-    let taken = filter(defer.groups, (g) => tcg_hit(g, hit))
-    match taken {
-      [] -> lp
-      _ -> {
-        let syms = flat_map(taken, tcg_syms)
-        let chosen = filter(defer.pool, (d) => tcg_has(syms, tcg_decl_sym(d)))
-        let next = TcDefer { pool: filter(defer.pool, (d) => not tcg_has(syms, tcg_decl_sym(d))),
-                              groups: filter(defer.groups, (g) => not tcg_hit(g, hit)), order: defer.order, stats: defer.stats, hits: defer.hits }
-        tcut_defer(file, df, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, next,
-                    tcut_loop(file, df, partition_decls_by_home(chosen, root_module_name(file)), all_program_decls, ctx,
-                              protos, head_owners, kind_theories, tab, verbose, true, TCL(acc, inherited, iface, sh, [])))
+# The fold once nothing more is asked for, and the asked-for functions that had no body.
+type TcDone = TcDone(TCLoop, [SymId], [Decl])
+
+fn tcut_demand(file: String, df: DiagFiles, all_program_decls: [Decl], protos: ProtoView,
+                head_owners: [HeadOwnerEntry], kind_theories: [KindTheory], tab: SymTab, verbose: Bool,
+                dm: Demand, st: DmSt, stats: Bool, full: [ModuleDecls], lp: TCLoop, missed: [SymId], late: [Decl]) : TcDone / Console + File + Mutable = match lp {
+  TCL(acc, inherited, iface, sh, fresh, ctxs) -> match demand_take(demand_scan(dm, st, fresh)) {
+    DmTake(want, miss, st2) -> if list_is_empty(want) { TcDone(lp, list_append(miss, missed), late) } else {
+      let _note = if stats { eprint("kaic2: core-demand: typing #{list_length(want)}: #{string_join(core_cut_names(tab, want), ", ")}") } else { () }
+      let asked = foldl(want, idx_empty(), (ix, s) => idx_prepend_sym(ix, s, s))
+      let batches = filter(map(full, (m) => ModuleDecls { name: m.name, decls: filter(m.decls, (d) => tcx_asked(asked, d)) }), (m) => not list_is_empty(m.decls))
+      match tcut_batches(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, sh, inherited, batches, acc, ctxs, []) {
+        TcB(acc2, ctxs2, typed) -> tcut_demand(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, dm, st2, stats, full,
+                                                TCL(acc2, inherited, iface, sh, typed, ctxs2), list_append(miss, missed), list_append(typed, late))
       }
     }
   }
 }
 
-fn tcut_defer_note(stats: Bool, found: DeferHits) : Unit / Console = match found {
-  DeferHits(ps, g, c, d, m, n) -> if stats {
-    eprint("kaic2: core-defer: needed #{list_length(ps)} (type-variable operators #{g}, compound operators #{c}, dispatcher calls #{d}, group references #{m}) after #{n} nodes")
-  } else { () }
+type TcB = TcB(TCFold, [TcCtx], [Decl])
+
+fn tcut_batches(file: String, df: DiagFiles, all_program_decls: [Decl], protos: ProtoView,
+                 head_owners: [HeadOwnerEntry], kind_theories: [KindTheory], tab: SymTab, verbose: Bool,
+                 sh: TcShared, inherited: ModuleEnvDelta, bs: [ModuleDecls], acc: TCFold, ctxs: [TcCtx],
+                 typed: [Decl]) : TcB / Console + File + Mutable = match bs {
+  [] -> TcB(acc, ctxs, typed)
+  [b, ...rest] -> match tcx_front(file, head_owners, tab, b.name, TcX(ModuleDecls { name: b.name, decls: [] }, inherited, sh, None, 0), ctxs, []) {
+    TcFr(fr, inh, ctxs2) -> {
+      let own = ModuleFront { ...fr, data: ProgramData { ...fr.data, decls_a: expand_unit_aliases_decls(b.decls, unit_alias_compose(fr.delta.unit_aliases, inh.unit_aliases)) } }
+      let tm = module_bodies(file, df, b, own, all_program_decls, protos, kind_theories, tab, sh, verbose)
+      tcut_batches(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, sh, inherited, rest,
+                    tcf_step(acc, tm), ctxs2, list_append(tm.typed.decls, typed))
+    }
+  }
 }
 
-fn tcg_syms(g: DeferGroup) : [SymId] = match g { DeferGroup(_, ss) -> ss }
+fn tcx_asked(asked: NameIndex[a], d: Decl) : Bool = match idx_chain_sym(asked, tcg_decl_sym(d)) {
+  [] -> false
+  _  -> true
+}
 
-fn tcg_hit(g: DeferGroup, hit: [SymId]) : Bool = match g { DeferGroup(p, _) -> tcg_has(hit, p) }
+fn tcx_same(a: Option[String], b: Option[String]) : Bool = match a {
+  Some(x) -> match b { Some(y) -> x == y  None -> false }
+  None    -> match b { Some(_) -> false  None -> true }
+}
 
-fn tcg_has(ss: [SymId], s: SymId) : Bool = any(ss, (h) => sym_same(h, s))
+type TcFr = TcFr(ModuleFront, ModuleEnvDelta, [TcCtx])
+
+# The front of the module `name`, computed on the first batch that needs it, and the modules with it kept.
+fn tcx_front(file: String, head_owners: [HeadOwnerEntry], tab: SymTab, name: Option[String], bare: TcCtx,
+              ctxs: [TcCtx], seen: [TcCtx]) : TcFr / Console + File + Mutable = match ctxs {
+  [] -> match bare {
+    TcX(m, inherited, sh, _, c) -> {
+      let got = module_front(file, m, inherited, head_owners, tab, sh)
+      TcFr(got, inherited, [TcX(m, inherited, sh, Some(got), c), ...list_reverse(seen)])
+    }
+  }
+  [TcX(m, inherited, sh, fr, c), ...rest] ->
+    if tcx_same(m.name, name) {
+      let got = match fr { Some(f) -> f  None -> module_front(file, m, inherited, head_owners, tab, sh) }
+      TcFr(got, inherited, list_append(list_reverse(seen), [TcX(m, inherited, sh, Some(got), c), ...rest]))
+    } else { tcx_front(file, head_owners, tab, name, bare, rest, [TcX(m, inherited, sh, fr, c), ...seen]) }
+}
 
 fn tcg_decl_sym(d: Decl) : SymId = match d {
   DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)
@@ -315,17 +368,19 @@ fn tcg_decl_sym(d: Decl) : SymId = match d {
 fn tcut_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
               all_program_decls: [Decl], ctx: TypedCutCtx,
               protos: ProtoView, head_owners: [HeadOwnerEntry],
-              kind_theories: [KindTheory], tab: SymTab, verbose: Bool, track: Bool,
+              kind_theories: [KindTheory], tab: SymTab, verbose: Bool, dm: Option[Demand],
               lp: TCLoop) : TCLoop / Console + File + Mutable = match modules {
   [] -> lp
   [m, ...rest] -> match lp {
-    TCL(acc, inherited, iface, sh, fresh) -> {
-      let tm = tcut_module(file, df, m, inherited, iface, all_program_decls, ctx,
-                            protos, head_owners, kind_theories, tab, sh, verbose)
-      tcut_loop(file, df, rest, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, track,
+    TCL(acc, inherited, iface, sh, fresh, ctxs) -> {
+      let r = tcut_module(file, df, m, inherited, iface, all_program_decls, ctx,
+                           protos, head_owners, kind_theories, tab, sh, verbose, dm)
+      let tm = match r { TcMod(t, _) -> t }
+      tcut_loop(file, df, rest, all_program_decls, ctx, protos, head_owners, kind_theories, tab, verbose, dm,
                  TCL(tcf_step(acc, tm), merge_env_deltas(inherited, tm.delta),
                      tcut_iface_next(ctx, iface, tm.delta), tc_shared_extend(sh, tm.delta),
-                     if track { list_append(tm.typed.decls, fresh) } else { fresh }))
+                     if is_some(dm) { list_append(tm.typed.decls, fresh) } else { fresh },
+                     if is_some(dm) { [TcX(m, inherited, sh, match r { TcMod(_, f) -> f }, list_length(tm.typed.decls)), ...ctxs] } else { ctxs }))
     }
   }
 }
@@ -334,6 +389,18 @@ fn tcut_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
 fn tcut_iface_next(ctx: TypedCutCtx, iface: IfaceAcc, d: ModuleEnvDelta) : IfaceAcc =
   if tcut_on(ctx) { iface_acc_extend(iface, d) } else { iface }
 
+fn tcut_compute(file: String, df: DiagFiles, m: ModuleDecls, inherited: ModuleEnvDelta,
+                 all_program_decls: [Decl], protos: ProtoView, head_owners: [HeadOwnerEntry],
+                 kind_theories: [KindTheory], tab: SymTab, sh: TcShared,
+                 verbose: Bool, dm: Option[Demand]) : TcMod / Console + File + Mutable = match dm {
+  None -> TcMod(typecheck_module(file, df, m, inherited, all_program_decls, protos,
+                                  head_owners, kind_theories, tab, sh, verbose), None)
+  Some(_) -> {
+    let fr = module_front(file, m, inherited, head_owners, tab, sh)
+    TcMod(module_bodies(file, df, m, fr, all_program_decls, protos, kind_theories, tab, sh, verbose), Some(fr))
+  }
+}
+
 # One module: restore it when its key hits, infer and publish otherwise.
 # The key is computed once and reused for the publish, so a hit and the
 # miss that would have replaced it name the same blob.
@@ -341,50 +408,53 @@ fn tcut_module(file: String, df: DiagFiles, m: ModuleDecls, inherited: ModuleEnv
                 iface: IfaceAcc, all_program_decls: [Decl], ctx: TypedCutCtx,
                 protos: ProtoView, head_owners: [HeadOwnerEntry],
                 kind_theories: [KindTheory], tab: SymTab, sh: TcShared,
-                verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
+                verbose: Bool, dm: Option[Demand]) : TcMod / Console + File + Mutable = {
   if not tcut_on(ctx) {
-    typecheck_module(file, df, m, inherited, all_program_decls, protos,
-                      head_owners, kind_theories, tab, sh, verbose)
+    tcut_compute(file, df, m, inherited, all_program_decls, protos, head_owners, kind_theories, tab, sh, verbose, dm)
   } else {
     let key = tcut_key(ctx, m, iface)
     match tcut_lookup(ctx, key) {
-      Some(hit) -> hit
-      None -> tcut_infer_publish(file, df, m, inherited, all_program_decls, ctx, key,
-                                  protos, head_owners, kind_theories, tab, sh, verbose)
+      Some(hit) -> TcMod(hit, None)
+      None -> {
+        let r = tcut_compute(file, df, m, inherited, all_program_decls, protos, head_owners, kind_theories, tab, sh, verbose, dm)
+        let tm = match r { TcMod(t, _) -> t }
+        # A module that produced errors is not published: its typed artifact is
+        # a partial result the next build must reproduce, diagnostics and all.
+        if tm.typed.errs == 0 { tcut_publish(ctx, key, tm) } else { () }
+        r
+      }
     }
   }
 }
 
-fn tcut_infer_publish(file: String, df: DiagFiles, m: ModuleDecls, inherited: ModuleEnvDelta,
-                       all_program_decls: [Decl], ctx: TypedCutCtx, key: String,
-                       protos: ProtoView, head_owners: [HeadOwnerEntry],
-                       kind_theories: [KindTheory], tab: SymTab, sh: TcShared,
-                       verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
-  let tm = typecheck_module(file, df, m, inherited, all_program_decls, protos,
-                             head_owners, kind_theories, tab, sh, verbose)
-  # A module that produced errors is not published: its typed artifact is
-  # a partial result the next build must reproduce, diagnostics and all.
-  if tm.typed.errs == 0 { tcut_publish(ctx, key, tm) } else { () }
-  tm
-}
-
 #[doc("The cut-aware counterpart of `infer_program`: partition the post-cascade decl stream by home module, then fold the per-module typechecker across it under the cut. An empty cache directory disables the cut and reproduces the uncut path exactly.")]
 pub fn tcut_infer_program(file: String, decls: [Decl], cache_dir: String, tin: TyperIn,
-                           defer: TcDefer, verbose: Bool) : TypedProgram / Console + File + Mutable = {
-  let mods0 = partition_decls_by_home(decls, root_module_name(file))
+                           defer: TcDefer, verbose: Bool) : TypedProgram / Console + File + Mutable =
+  match tcut_infer_demand(file, decls, cache_dir, tin, defer, verbose) { TcOut(tp, _) -> tp }
+
+#[doc("`tcut_infer_program` with the core functions the demand scan asked for that had no body.")]
+pub fn tcut_infer_demand(file: String, decls: [Decl], cache_dir: String, tin: TyperIn,
+                          defer: TcDefer, verbose: Bool) : TcOut / Console + File + Mutable = {
+  let full = partition_decls_by_home(decls, root_module_name(file))
+  let mods0 = match defer.demand {
+    Some(dm) -> filter(map(full, (m) => ModuleDecls { name: m.name, decls: filter(m.decls, (d) => not demand_pooled(dm, tcg_decl_sym(d))) }),
+                       (m) => not list_is_empty(m.decls))
+    None -> full
+  }
   # One bucket (or none) means there is nothing to cut: the fold would
   # re-infer the whole program on any edit anyway, so run it uncut.
   match mods0 {
-    []  -> infer_program(file, decls, tin, verbose)
-    [_] -> if list_is_empty(defer.pool) { infer_program(file, decls, tin, verbose) } else { tcut_infer_modules(file, mods0, cache_dir, tin, defer, verbose) }
-    _   -> tcut_infer_modules(file, mods0, cache_dir, tin, defer, verbose)
+    []  -> TcOut(infer_program(file, flatten_module_decls(full, []), tin, verbose), [])
+    [_] -> if is_none(defer.demand) { TcOut(infer_program(file, decls, tin, verbose), []) } else { tcut_infer_modules(file, mods0, full, cache_dir, tin, defer, verbose) }
+    _   -> tcut_infer_modules(file, mods0, full, cache_dir, tin, defer, verbose)
   }
 }
 
-fn tcut_infer_modules(file: String, mods0: [ModuleDecls], cache_dir: String, tin: TyperIn,
-                       defer: TcDefer, verbose: Bool) : TypedProgram / Console + File + Mutable = {
+fn tcut_infer_modules(file: String, mods0: [ModuleDecls], full: [ModuleDecls], cache_dir: String, tin: TyperIn,
+                       defer: TcDefer, verbose: Bool) : TcOut / Console + File + Mutable = {
+  let pool_hex = match defer.demand { Some(dm) -> if cache_dir == "" { "" } else { demand_digest(tin.tab, dm) }  None -> "" }
   let ctx = tcut_ctx(cache_dir, flatten_module_decls(mods0, []), tin.tab, root_module_name(file), tin.roots,
-                      tin.protos, tin.head_owners, tin.kind_theories, tin.views)
-  tcut_typecheck_program(file, tin.df, mods0, ctx, tin.protos, tin.head_owners,
+                      tin.protos, tin.head_owners, tin.kind_theories, tin.views, pool_hex)
+  tcut_typecheck_program(file, tin.df, mods0, full, ctx, tin.protos, tin.head_owners,
                           tin.kind_theories, tin.tab, tin.views, tin.roots, defer, verbose)
 }
