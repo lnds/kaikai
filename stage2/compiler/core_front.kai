@@ -1,9 +1,4 @@
-#[doc("""
-One core function through the passes the whole stream goes through, so a
-body can be produced on its own from the declaration it was parsed as.
-`core_front_check` runs every core function through them and compares the
-result with what the stream produced.
-""")]
+#[doc("The core front end: the cache of its results and the mangling of its symbols.")]
 
 import compiler.ast
 import compiler.symtab
@@ -26,7 +21,6 @@ import compiler.written
 import compiler.resolve_env
 import compiler.resolve_program
 import compiler.infer_index
-import compiler.core_mangle
 import compiler.decl_names
 import compiler.modules
 import compiler.emit_c
@@ -55,9 +49,12 @@ import compiler.value_scope_table
 import compiler.name_contest
 import compiler.protos_check
 import compiler.driver_exports
+import compiler.modules_homes
+import compiler.cache_ast
+import compiler.user_cache
 
 #[doc("The tables the passes read: each is built from the whole stream's signatures, never from a body.")]
-pub type CoreFrontCx = {
+pub(pkg) type CoreFrontCx = {
   tab0: SymTab,
   tab1: SymTab,
   target: String,
@@ -94,13 +91,12 @@ pub type CoreFrontCx = {
 }
 
 #[doc("The module a core function was declared in.")]
-pub fn cf_module(d: Decl) : String = match d {
+pub(pkg) fn cf_module(d: Decl) : String = match d {
   DFn(_, _, _, _, _, _, _, _, _, Some(m)) -> m
   _ -> ""
 }
 
-#[doc("A core function after the passes that settle its names against the modules, as the stream has it before the stream is merged with the program's own declarations.")]
-pub fn core_front_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
+fn core_front_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
   let lowered = tparam_bind_decls(surface_lower_decls([d], cx.tab0))
   let scoped = es_core_decls(lowered, cx.mod_tabs, cx.target, cx.tab0, cx.sym_views)
   let typed = qualtype_decls_only(scoped, cx.tab0, [qualtype_list_mark(), ...cx.module_table])
@@ -110,8 +106,7 @@ pub fn core_front_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
   map(qualified, (q) => mangle_core_decl(cx.mangle, q, cf_module(d)))
 }
 
-#[doc("An imported library function after the passes that settle its names, through the segment chain: `d` is the only declaration of a segment of its own module.")]
-pub fn core_front_lib_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
+fn core_front_lib_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File = {
   let seg = [ISeg(cf_module(d), 1)]
   let lowered = strip_sl_decls(strip_law_wrappers(tparam_bind_decls(surface_lower_decls([d], cx.tab0))))
   let tagged = tag_target_decls_module_origin(lowered, cx.target, cx.entry)
@@ -123,8 +118,7 @@ pub fn core_front_lib_names(cx: CoreFrontCx, d: Decl) : [Decl] / Console + File 
   rqc_segmented(seg, nu_scope_const_decls(valued, cx.cs_coll, cx.target, cx.mod_tabs), cx.mod_tabs, cx.rqc_fx, cx.diag_ctx)
 }
 
-#[doc("A core function after the passes that rewrite its body, as the stream has it before name resolution. `q` is the result of `core_front_names`.")]
-pub fn core_front_body(cx: CoreFrontCx, q: Decl) : [Decl] / Console + File = {
+fn core_front_body(cx: CoreFrontCx, q: Decl) : [Decl] / Console + File = {
   let narrowed = lower_pattern_narrow_decls([q], cx.tab2, cx.sym_views, cx.target, cx.narrow_aliases)
   let opaque = lower_extern_opaques(lower_axioms(narrowed, cx.target), cx.target).decls
   let kinds_a = map(opaque, (d) => resolve_kinds_fn(d, cx.kind_ctx_a, cx.target))
@@ -145,7 +139,7 @@ pub fn core_front_body(cx: CoreFrontCx, q: Decl) : [Decl] / Console + File = {
 }
 
 #[doc("One line per core or library function of `orig` and `libs` the stream holds: its symbol and the hash of the declaration completed on its own and of the one the stream holds, the line ending in ` !DIFF` when they differ. `stream` is the stream before resolution, `res` its resolution.")]
-pub fn core_front_check(cx: CoreFrontCx, orig: [Decl], libs: [Decl], stream: [Decl], res: Resolution) : [String] / Console + File = {
+pub(pkg) fn core_front_check(cx: CoreFrontCx, orig: [Decl], libs: [Decl], stream: [Decl], res: Resolution) : [String] / Console + File = {
   let index = (ds) => foldl(ds, idx_empty(), (acc, o) => match o {
     DFn(_, fid, _, _, _, _, _, _, _, Some(_)) -> idx_prepend_sym(acc, fnid_sym(fid), o)
     _ -> acc
@@ -178,13 +172,13 @@ fn check_line(cx: CoreFrontCx, names: [Decl], r: Decl, res: Resolution, i: Int, 
 }
 
 #[doc("What a body completed on its own needs besides the tables: the declarations as they were parsed, the stream they were resolved in and where in it each stands.")]
-pub type FrontCtx = { cx: CoreFrontCx, core: NameIndex[Decl], libs: NameIndex[Decl], slots: NameIndex[Int] }
+pub(pkg) type FrontCtx = { cx: CoreFrontCx, core: NameIndex[Decl], libs: NameIndex[Decl], slots: NameIndex[Int] }
 
 #[doc("The source of completions: how to build the tables when the first body is asked for, the parsed declarations and the resolved stream.")]
-pub type FrontSrc = { cx_of: () -> CoreFrontCx, core: [Decl], libs: [Decl], stream: [Decl], held: NameIndex[SymId], env: Env }
+pub(pkg) type FrontSrc = { cx_of: () -> CoreFrontCx, core: [Decl], libs: [Decl], stream: [Decl], held: NameIndex[SymId], env: Env }
 
 #[doc("The tables and indexes of `src`, built once the first body is asked for.")]
-pub fn front_ctx(src: FrontSrc) : FrontCtx = FrontCtx {
+pub(pkg) fn front_ctx(src: FrontSrc) : FrontCtx = FrontCtx {
   cx: src.cx_of(),
   core: front_index(src.core),
   libs: front_index(src.libs),
@@ -208,7 +202,7 @@ fn front_slots(held: NameIndex[SymId], ds: [Decl], i: Int, acc: NameIndex[Int]) 
 }
 
 #[doc("The function `s` as the stream would have it had its body not been emptied, or `None` when no parsed declaration of it is known.")]
-pub fn front_complete(fc: FrontCtx, env: Env, s: SymId) : Option[Decl] / Console + File =
+pub(pkg) fn front_complete(fc: FrontCtx, env: Env, s: SymId) : Option[Decl] / Console + File =
   match idx_chain_sym(fc.slots, s) {
     [i, ..._] -> {
       match flat_map(front_names(fc, s), (q) => core_front_body(fc.cx, q)) {
@@ -225,4 +219,82 @@ fn front_names(fc: FrontCtx, s: SymId) : [Decl] / Console + File = match idx_cha
     [o, ..._] -> core_front_lib_names(fc.cx, o)
     [] -> []
   }
+}
+
+# ---- blob path -------------------------------------------------------
+
+# Blob filename for a core module given its source content hash:
+# "core-<content_hex>.kab". The "core-" prefix keeps the namespace
+# disjoint from the user cache's "<content>-<dep>.kab" blobs in the
+# same directory.
+fn cc_blob_name(content_hex: String) : String =
+  concat_all(["core-", content_hex, ".kab"])
+
+fn cc_blob_path(cache_dir: String, content_hex: String) : String =
+  concat_all([cache_dir, "/", cc_blob_name(content_hex)])
+
+# The 64-char source_sha field the KAB2 header validates by length.
+# Pack the content hash plus zero-padding so the header is a second
+# line of defense: a blob renamed onto a different key still fails
+# this check (mirrors uc_header_sha for the user cache).
+fn cc_header_sha(content_hex: String) : String =
+  concat_all([content_hex,
+              "000000000000000000000000000000000000000000000000"])  # 48 zeros -> 64
+
+# ---- lookup ----------------------------------------------------------
+
+pub(pkg) type CcLookup
+  = CcHit([Decl], [NEnt])
+  | CcMiss(String)   # content_hex
+
+#[doc("Look up the core cache for one core module from its source. Computes the content key, reads the matching blob under `cache_dir`, and returns CcHit(decls, rows) on a present header-valid entry or CcMiss(content_hex) otherwise (absent, version or format drift, or corruption). Never parses, so a hit skips the lex+parse the cache exists to amortise.")]
+pub(pkg) fn cc_lookup(cache_dir: String, src: String) : CcLookup / Console + File = {
+  let content_hex = uc_content_hex(src)
+  let blob_path = cc_blob_path(cache_dir, content_hex)
+  match file_read_bytes(blob_path) {
+    Err(_) -> CcMiss(content_hex)
+    Ok(blob) -> match cache_deserialize_module(blob) {
+      None -> CcMiss(content_hex)
+      Some(cds) -> match cds { CDs(decls, rows, _) -> CcHit(decls, rows) }
+    }
+  }
+}
+
+# ---- write -----------------------------------------------------------
+
+#[doc("Write core decls to the cache for the given content key: serialise via the reused KAB2 codec and publish the blob atomically to its content-addressed path under `cache_dir`. The directory must already exist (bin/kai creates it once with mkdir -p before invoking kaic2). Any IO failure is swallowed - a cache that cannot be written is a performance loss, never a correctness one. The decls passed in are exactly load_core post-parse output (doc-stripped, test-stripped, module-origin-tagged), so a later cc_lookup hit reconstructs precisely what a fresh parse would.")]
+pub(pkg) fn cc_write(cache_dir: String, content_hex: String,
+                decls: [Decl], rows: [NEnt]) : Unit / Console + File = {
+  let blob = cache_serialize_module(decls, rows, cc_header_sha(content_hex))
+  cache_publish_bytes(cc_blob_path(cache_dir, content_hex), blob)
+}
+
+pub(pkg) type MangleSegs = MangleSegs(SymTab, [MangleSeg])
+
+pub(pkg) type MangleSeg = MangleSeg(String, [SymId])
+
+#[doc("The private sum types of every segment of `core_decls`, which holds the core declarations segment by segment as `segs` gives their lengths.")]
+pub(pkg) fn mangle_core_plan(core_decls: [Decl], tab: SymTab, segs: [CoreSegment]) : MangleSegs =
+  MangleSegs(tab, plan_loop(core_decls, segs, []))
+
+fn plan_loop(core_decls: [Decl], segs: [CoreSegment], acc: [MangleSeg]) : [MangleSeg] = match segs {
+  [] -> acc
+  [PSeg(mod_name, seg_template), ...rest] -> {
+    let n_seg = list_length(seg_template)
+    let seg_types = collect_private_segment_types(pae_take(core_decls, n_seg), [])
+    plan_loop(pae_drop(core_decls, n_seg), rest,
+              if seg_types == [] { acc } else { [MangleSeg(mod_name, seg_types), ...acc] })
+  }
+}
+
+fn mangle_core_decl(plan: MangleSegs, d: Decl, mod_name: String) : Decl = match plan {
+  MangleSegs(tab, segs) -> match find_seg(segs, mod_name) {
+    Some(types) -> mangle_one_decl(d, PrivTys { tab: tab, types: types }, mod_name)
+    None        -> d
+  }
+}
+
+fn find_seg(segs: [MangleSeg], mod_name: String) : Option[[SymId]] = match segs {
+  [] -> None
+  [MangleSeg(m, ts), ...rest] -> if m == mod_name { Some(ts) } else { find_seg(rest, mod_name) }
 }
