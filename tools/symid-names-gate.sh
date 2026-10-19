@@ -61,10 +61,10 @@ fail() {
 }
 
 probe=$(compared --path "$ROOT/stage2" --path "$ROOT/stdlib" "$CENSUS/probe/main.kai")
-for f in cmp_direct cmp_field cmp_nested cmp_binder cmp_ref has__mono__Written; do
+for f in main.cmp_direct main.cmp_field main.cmp_nested main.cmp_binder main.cmp_ref main.has__mono__Written; do
   printf '%s\n' "$probe" | grep -qx "$f" || fail "--check-written-eq no longer reports the probe's $f"
 done
-if printf '%s\n' "$probe" | grep -q '^ok_'; then
+if printf '%s\n' "$probe" | grep -q "^main\.ok_"; then
   fail "--check-written-eq reports a probe comparison that holds no written name"
 fi
 
