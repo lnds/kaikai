@@ -36,6 +36,10 @@ for p in $PROGRAMS; do
     *" 0 differ") ;;
     *) echo "  FAIL — $p: $out"; fail=1 ;;
   esac
+  # The tables built from the stream with the bodies emptied are the ones built from the whole stream.
+  off="$(cd "$dir" && "$KAIC2" --edition "$EDITION" --path . --path "$ROOT/stdlib" --check-core-front "$(basename "$p")" 2>/dev/null | awk '{print $1, $2}' | sort)"
+  on="$(cd "$dir" && "$KAIC2" --edition "$EDITION" --path . --path "$ROOT/stdlib" --check-core-front-stubs "$(basename "$p")" 2>/dev/null | awk '{print $1, $2}' | sort)"
+  [ "$off" = "$on" ] || { echo "  FAIL — $p: a function completed against the emptied stream differs from the whole one"; fail=1; }
   n="$(echo "$line" | sed -n 's/.* \([0-9][0-9]*\) library functions.*/\1/p')"
   libs=$((libs + ${n:-0}))
 done
