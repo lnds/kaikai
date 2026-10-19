@@ -1,19 +1,20 @@
 #[doc("""
-The gate for a `.` inside a `#{...}` body that no pipe stage owns.
-
-A `|`, `||` or `|?` stage claims every `.` on its right side, those in
-interpolation bodies included. A body outside any stage keeps its `.`:
-a bare one, or a point-free section that would be shown as a function.
-A `.` wrapped by the call-argument rule inside the body is its own.
+String interpolation: the check, the pattern form and the shown text.
 """)]
 
 import compiler.ast
 import compiler.diag
 import compiler.diag_file
 import compiler.expr_positions
+import compiler.util
+import compiler.ast_map
+import compiler.decl_map
+import compiler.written
+import compiler.name_uses
+import compiler.protos_registry
 
 #[doc("The error for every `.` in an interpolation body that no pipe stage owns, in source order.")]
-pub fn check_interp_dots(ds: [Decl], df: DiagFiles) : [Diagnostic] =
+pub(pkg) fn check_interp_dots(ds: [Decl], df: DiagFiles) : [Diagnostic] =
   finalize_diags(ic_decls(ds, df, []))
 
 fn ic_decls(ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
@@ -160,4 +161,114 @@ fn bare_dot_in(ps: [XPos]) : Option[Expr] = match ps {
     Some(d) -> Some(d)
     None    -> bare_dot_in(rest)
   }
+}
+
+# One rewritten pattern and the equality tests it handed to the guard.
+type IPat = IPat(Pattern, [Expr])
+
+type IPats = IPats([Pattern], [Expr])
+
+type IFields = IFields([PField], [Expr])
+
+#[doc("The arm with every interpolated string pattern turned into a binder its guard compares.")]
+pub(pkg) fn ipat_arm(a: Arm) : Arm = match a {
+  Arm(pat, guard, body) -> match ipat_split(pat) {
+    IPat(pat2, tests) -> Arm(pat2, ipat_weld(tests, guard), body)
+  }
+}
+
+#[doc("`ipat_arm` over the patterns of a multi-scrutinee arm.")]
+pub(pkg) fn ipat_mmarm(a: MMArm) : MMArm = match a {
+  MMArm(pats, guard, body) -> match ipat_pats(pats) {
+    IPats(pats2, tests) -> MMArm(pats2, ipat_weld(tests, guard), body)
+  }
+}
+
+#[doc("A `let` pattern with its interpolated strings as binders nothing reads: a `let` tests no literal.")]
+pub(pkg) fn ipat_let(p: Pattern) : Pattern = match ipat_split(p) {
+  IPat(p2, _) -> p2
+}
+
+# The user's guard runs last: a binder it reads already passed its test.
+fn ipat_weld(tests: [Expr], user: Option[Expr]) : Option[Expr] = match tests {
+  [] -> user
+  [t, ...rest] -> match ipat_weld(rest, user) {
+    None    -> Some(t)
+    Some(r) -> Some(mk_expr(EBinop(BoAnd, t, r), t.line, t.col))
+  }
+}
+
+fn ipat_is_interp(lit: Expr) : Bool = match lit.kind {
+  ESurface(SfInterp(_, _, _, _)) -> true
+  _                              -> false
+}
+
+# The binder is compiler-internal and unique per pattern position.
+fn ipat_split(p: Pattern) : IPat = match p.pkind {
+  PLit(lit) ->
+    if ipat_is_interp(lit) {
+      let name = concat_all(["__sp_", int_to_string(p.line), "_", int_to_string(p.col)])
+      IPat(mk_pat(PBind(binder_written(name)), p.line, p.col),
+           [mk_expr(EBinop(BoEq, mk_name(name, p.line, p.col), lit), p.line, p.col)])
+    } else { IPat(p, []) }
+  PList(subs, rest) -> match ipat_pats(subs) {
+    IPats(subs2, ts) -> IPat(mk_pat(PList(subs2, rest), p.line, p.col), ts)
+  }
+  PVariant(r, subs) -> match ipat_pats(subs) {
+    IPats(subs2, ts) -> IPat(mk_pat(PVariant(r, subs2), p.line, p.col), ts)
+  }
+  PVariantRecord(r, fs) -> match ipat_fields(fs) {
+    IFields(fs2, ts) -> IPat(mk_pat(PVariantRecord(r, fs2), p.line, p.col), ts)
+  }
+  PRecord(fs) -> match ipat_fields(fs) {
+    IFields(fs2, ts) -> IPat(mk_pat(PRecord(fs2), p.line, p.col), ts)
+  }
+  PAs(b, inner) -> match ipat_split(inner) {
+    IPat(inner2, ts) -> IPat(mk_pat(PAs(b, inner2), p.line, p.col), ts)
+  }
+  _ -> IPat(p, [])
+}
+
+fn ipat_pats(ps: [Pattern]) : IPats = match ps {
+  [] -> IPats([], [])
+  [p, ...rest] -> match ipat_split(p) {
+    IPat(p2, ts) -> match ipat_pats(rest) {
+      IPats(rest2, ts2) -> IPats([p2, ...rest2], list_append(ts, ts2))
+    }
+  }
+}
+
+fn ipat_fields(fs: [PField]) : IFields = match fs {
+  [] -> IFields([], [])
+  [PField(name, sub, short), ...rest] -> match ipat_split(sub) {
+    IPat(sub2, ts) -> match ipat_fields(rest) {
+      IFields(rest2, ts2) -> IFields([PField(name, sub2, short), ...rest2], list_append(ts, ts2))
+    }
+  }
+}
+
+#[doc("`ds` with the mark of every interpolation hole replaced by the dispatcher of the core `Show`, as the declaration's home reaches it. `cores` names the core modules; with no core `Show` the operation stays the name any protocol declaring `show` answers to.")]
+pub(pkg) fn interp_show_decls(ds: [Decl], show: Option[ShowRef], cores: [String], target: String) : [Decl] =
+  ish_decls(ds, show, cores, target, target, ish_callee(show, list_has(cores, target)), [])
+
+# Consecutive declarations share their home, so the callee is settled
+# once per run of them.
+fn ish_decls(ds: [Decl], show: Option[ShowRef], cores: [String], target: String,
+      cur: String, k: ExprKind, acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let home = nu_reader_home(d, cur, target)
+    let k1 = if home == cur { k } else { ish_callee(show, list_has(cores, home)) }
+    ish_decls(rest, show, cores, target, home, k1, [decl_map_bodies(d, (b) => ish_expr(b, k1)), ...acc])
+  }
+}
+
+fn ish_callee(show: Option[ShowRef], in_core: Bool) : ExprKind = match show {
+  Some(ShowRef(homed, bare)) -> if in_core { bare } else { homed }
+  None                       -> EName(written(proto_dispatcher_name("show")))
+}
+
+fn ish_expr(e: Expr, k: ExprKind) : Expr = match e.kind {
+  EMark(MkInterpShow) -> Expr { ...e, kind: k }
+  other               -> Expr { ...e, kind: prc_map_expr_kind(other, (x) => ish_expr(x, k)) }
 }
