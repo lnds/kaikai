@@ -1,0 +1,102 @@
+#[doc("""
+The operators a specialised body still applies to a type the runtime does
+not combine natively: the instantiation has no impl of the operator's
+protocol.
+""")]
+
+import compiler.ast
+import compiler.symtab
+import compiler.decl_text
+import compiler.written
+import compiler.operators
+import compiler.util
+import compiler.core_refs
+import compiler.core_protos
+import compiler.fn_bounds
+import compiler.tbinder
+import compiler.expr_positions
+import compiler.monomorph_bounds
+import compiler.monomorph_mangle
+
+#[doc("The violations of the operators in the specialised body `body` of `callee`, each located at `loc`, the call that instantiated it.")]
+pub fn spec_op_violations(tab: SymTab, callee: SymId, body: Expr, loc: LineCol) : [BoundViolation] =
+  op_scan(tab, callee, body, loc, [])
+
+fn op_scan(tab: SymTab, callee: SymId, e: Expr, loc: LineCol, acc: [BoundViolation]) : [BoundViolation] = {
+  let here = match e.kind {
+    EBinop(op, l, _) -> if bp_is_arith(binop_proto(op)) and operand_unsupported(l.ty) { [op_violation(tab, callee, op, l.ty, loc), ...acc] } else { acc }
+    _ -> acc
+  }
+  op_scan_children(tab, callee, xp_positions(e), loc, here)
+}
+
+fn op_scan_children(tab: SymTab, callee: SymId, ps: [XPos], loc: LineCol, acc: [BoundViolation]) : [BoundViolation] = match ps {
+  [] -> acc
+  [XP(_, c), ...rest] -> op_scan_children(tab, callee, rest, loc, op_scan(tab, callee, c, loc, acc))
+}
+
+fn operand_unsupported(t: Option[Ty]) : Bool = match t {
+  Some(TyDimT(inner, _))    -> operand_unsupported(Some(inner))
+  Some(TyRefineT(inner, _)) -> operand_unsupported(Some(inner))
+  Some(TyCon(_, _))         -> true
+  Some(TyString)            -> true
+  Some(TyBool)              -> true
+  Some(TyChar)              -> true
+  Some(TyUnit)              -> true
+  Some(TyListT(_))          -> true
+  _                         -> false
+}
+
+fn op_violation(tab: SymTab, callee: SymId, op: BinOp, t: Option[Ty], loc: LineCol) : BoundViolation = {
+  let shown = match t { Some(ty) -> mono_ty_to_string(tab, ty)  None -> "?" }
+  let msg = concat_all(["type `", shown, "` has no impl for operator `", binop_text(op),
+                        "` used in `", written_text(decl_name(tab, callee)),
+                        "`; declare the matching protocol bound on its type parameter"])
+  match loc { MoLC(l, c) -> BV(msg, l, c) }
+}
+
+#[doc("A located warning.")]
+pub type OpWarning = OpWarn(String, Int, Int)
+
+#[doc("The operators of the generic `d` applied to a type parameter while none of its type parameters declares a bound, each with the bound it needs. Nothing for a fn the target module does not own.")]
+pub fn unbounded_op_warnings(d: Decl, fn_bounds: [SymBounds], target_mod: String) : [OpWarning] = match d {
+  DFn(_, fid, tps, _, _, _, body, _, _, mo) ->
+    if owned_by(mo, target_mod) and any(tps, (b) => tb_is_type(b)) and is_unbounded(bounds_of_sym(fn_bounds, fnid_sym(fid))) {
+      var_op_scan(body, [])
+    } else { [] }
+  _ -> []
+}
+
+fn owned_by(mo: Option[String], target_mod: String) : Bool = match mo {
+  None    -> true
+  Some(m) -> m == target_mod
+}
+
+fn is_unbounded(bs: Option[[FnTPBound]]) : Bool = match bs {
+  None    -> true
+  Some(_) -> false
+}
+
+fn var_op_scan(e: Expr, acc: [OpWarning]) : [OpWarning] = {
+  let here = match e.kind {
+    EBinop(op, l, _) -> if bp_is_arith(binop_proto(op)) and operand_is_var(l.ty) { [var_op_warning(op, e), ...acc] } else { acc }
+    _ -> acc
+  }
+  var_op_children(xp_positions(e), here)
+}
+
+fn var_op_children(ps: [XPos], acc: [OpWarning]) : [OpWarning] = match ps {
+  [] -> acc
+  [XP(_, c), ...rest] -> var_op_children(rest, var_op_scan(c, acc))
+}
+
+fn operand_is_var(t: Option[Ty]) : Bool = match t {
+  Some(TyVarT(_)) -> true
+  _               -> false
+}
+
+fn var_op_warning(op: BinOp, e: Expr) : OpWarning = {
+  let bound = match op_proto_core(binop_proto(op)) { Some(cp) -> core_proto_name(cp)  None -> "" }
+  OpWarn(concat_all(["operator `", binop_text(op), "` on a type parameter with no declared bound; declare `[T: ", bound, "]`"]),
+         e.line, e.col)
+}

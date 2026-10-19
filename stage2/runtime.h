@@ -469,7 +469,10 @@ enum { KAI_SEQ_THUNK = 0, KAI_SEQ_RUNNING = 1, KAI_SEQ_DONE = 2,
 #define KAI_HEAD_RESULT      17
 #define KAI_HEAD_SIGNAL      18
 #define KAI_HEAD_PROCESS_EXIT 19
-#define KAI_USER_HEAD_TAG_BASE 20
+#define KAI_HEAD_PAIR        20
+#define KAI_HEAD_TRIPLE      21
+#define KAI_HEAD_QUAD        22
+#define KAI_USER_HEAD_TAG_BASE 23
 
 /* Protocol IDs — the stdlib protocols; user protocols start at
  * KAI_USER_PROTO_ID_BASE.

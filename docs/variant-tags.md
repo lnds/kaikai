@@ -161,7 +161,7 @@ pattern-matches on the value as usual).
 `impl P for { ... }` is not allowed in v1; the post-mono validator
 rejects any impl whose target is anonymous.
 
-### Stdlib nominal heads (reserved 16..19)
+### Stdlib nominal heads (reserved 16..22)
 
 The stdlib sum types are pinned alongside the primitives so the runtime
 and all three stages agree byte-for-byte:
@@ -172,9 +172,12 @@ and all three stages agree byte-for-byte:
 | 17  | `Result`      | `Ok`, `Err`           |
 | 18  | `Signal`      | `SigInt`…`SigWinch`   |
 | 19  | `ProcessExit` | `Exited`, `Signaled`  |
+| 20  | `Pair`        | tuple record          |
+| 21  | `Triple`      | tuple record          |
+| 22  | `Quad`        | tuple record          |
 
-`KAI_USER_HEAD_TAG_BASE = 20`. User-declared sum types and records
-receive head tags from 20 upward, assigned in declaration order during
+`KAI_USER_HEAD_TAG_BASE = 23`. User-declared sum types and records
+receive head tags from 23 upward, assigned in declaration order during
 resolve. Like `variant_tag`, user head tags are stable within a single
 compilation but not across compilations (declaration-order
 dependent).
@@ -250,7 +253,7 @@ open-addressing hashmap before user `main` runs.
    above). User-assigned tags ≥16 are *not* stable across recompilation
    (declaration order shifts them); the impl-table is rebuilt per
    compilation, so this is fine.
-4. **`KAI_USER_HEAD_TAG_BASE = 20`.** If a new primitive or stdlib
+4. **`KAI_USER_HEAD_TAG_BASE = 23`.** If a new primitive or stdlib
    head is added (e.g. `Map` becomes a runtime primitive), bump this
    constant and document it here.
 

@@ -10,6 +10,7 @@ import compiler.symtab
 import compiler.decl_text
 import compiler.spec_names
 import compiler.fn_bounds
+import compiler.mono_op_check
 import compiler.util
 import compiler.infer_glue
 import compiler.infer_dump_text
@@ -32,7 +33,7 @@ pub type MonoOutput = MonoOut([Decl], SpecNames, [MLeakRecord], [BoundViolation]
 #[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), one spec per (declaration, tys, units) tuple: a spec is `FnId(<the generic's id>, <instance>)`, and the name it is emitted under rides in the returned table. Also returns the leak records and the fn-bound violations at concrete instantiations. The table of `ps` holds the row of every generic. With `check_only` the non-spec decls come back unrewritten: only a verdict is wanted.")]
 pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBounds],
                   ps: PScope, target_mod: String, check_only: Bool) : MonoOutput {
-  let polys = collect_poly_fns(tp.decls, target_mod)
+  let polys = collect_poly_fns(tp.decls, target_mod, reg.ids)
   # `resolve_protocol_calls` retargets a dispatcher call to its impl
   # function AFTER `infer_program` has populated tp.insts, so no inst
   # names the impl. Discover the impl-side tuples by walking the decl
@@ -54,16 +55,16 @@ pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBounds],
   # concrete tuples (the spec of `f` at `Int` calls `g(x : Int)`);
   # those new tuples enter the worklist and produce additional specs.
   # Each spec also accumulates a per-spec leak record.
-  let r = generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg)
+  let r = generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg, [])
   match r {
-    GenSpecsOut(specs, all_items, leaks) -> {
+    GenSpecsOut(specs, all_items, leaks, op_viols) -> {
       # Every concrete instantiation (direct + transitive) surfaces as a
       # tuple in `all_items`; check each against the callee's declared
       # bounds. A tuple whose type-kind slot is still a tyvar never
       # reaches here (it isn't concrete), so a generic caller forwarding
       # its own tparam defers to its own instantiation — no constraint
       # propagation.
-      let viols = check_fn_bounds(all_items, fn_bounds, insts_ix, polys, reg, ps, [])
+      let viols = list_append(check_fn_bounds(all_items, fn_bounds, insts_ix, polys, reg, ps, []), op_viols)
       let ordered = spec_sort(specs)
       MonoOut(list_append(rewritten, map(ordered, spec_decl_of)), spec_names_of(map(ordered, spec_name_row)), leaks, viols)
     }
@@ -94,14 +95,14 @@ fn spec_insert(d: Spec, sorted: [Spec]) : [Spec] = match sorted {
     else { [h, ...spec_insert(d, rest)] }
 }
 
-type GenSpecsResult = GenSpecsOut([Spec], [MonoTuple], [MLeakRecord])
+type GenSpecsResult = GenSpecsOut([Spec], [MonoTuple], [MLeakRecord], [BoundViolation])
 
 # Per-spec body emission: build SubstMap, substitute the body, run
 # the call-site rewrite walker with the substitution map applied
 # inline at each call site (so internal polymorphic-flow-through
 # calls retarget to their specs), and return the rewritten DFn
 # alongside the list of newly-discovered tuples.
-type SpecEmitOut = SEO(Spec, [MonoTuple], [MLeakRecord])
+type SpecEmitOut = SEO(Spec, [MonoTuple], [MLeakRecord], [BoundViolation])
 
 fn emit_spec(tab: SymTab, d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
               all_tuples: TupleSet, reg: ProtocolReg) : SpecEmitOut {
@@ -140,7 +141,7 @@ fn emit_spec(tab: SymTab, d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyI
         }
       _ -> []
     }
-    SEO(Spec(spec3, name), new_tuples, leaks)
+    SEO(Spec(spec3, name), new_tuples, leaks, spec_body_violations(tab, d, mt, spec3, insts))
   } }
 }
 
@@ -151,25 +152,31 @@ fn generate_specs_iter(tab: SymTab, polys: PolyIx, worklist: [MonoTuple],
                         insts: InstIndex, specs_acc: [Spec],
                         all_tuples: TupleSet,
                         leaks_acc: [MLeakRecord],
-                        reg: ProtocolReg) : GenSpecsResult {
+                        reg: ProtocolReg, viols_acc: [BoundViolation]) : GenSpecsResult {
   match worklist {
-    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples.items, list_reverse(leaks_acc))
+    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples.items, list_reverse(leaks_acc), list_reverse(viols_acc))
     [t, ...rest] -> match lookup_poly_fn_sym(poly_ix_fns(polys), mt_sym(t)) {
-      None -> generate_specs_iter(tab, polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg)
+      None -> generate_specs_iter(tab, polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg, viols_acc)
       Some(d) -> {
         let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg)
         match r {
-          SEO(spec, new_ts, new_leaks) -> {
+          SEO(spec, new_ts, new_leaks, new_viols) -> {
             let next_worklist = list_append(rest, new_ts)
             let next_all = ts_add_all(all_tuples, new_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
             generate_specs_iter(tab, polys, next_worklist, insts,
-                                 [spec, ...specs_acc], next_all, next_leaks, reg)
+                                 [spec, ...specs_acc], next_all, next_leaks, reg,
+                                 list_append(list_reverse(new_viols), viols_acc))
           }
         }
       }
     }
   }
+}
+
+fn spec_body_violations(tab: SymTab, d: Decl, mt: MonoTuple, spec: Decl, insts: InstIndex) : [BoundViolation] = match spec {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> spec_op_violations(tab, mt_sym(mt), body, mono_inst_loc(insts, d, mt))
+  _ -> []
 }
 
 fn prepend_leaks(xs: [MLeakRecord], acc: [MLeakRecord]) : [MLeakRecord] {
