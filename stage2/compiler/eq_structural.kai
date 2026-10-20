@@ -1,0 +1,141 @@
+#[doc("""
+Which types are `Eq`: an explicit or derived impl, else a data type whose every field is. A function is never `Eq`, so neither is a type that holds one.
+""")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.core_refs
+import compiler.diag
+import compiler.impl_identity
+import compiler.protos_registry
+import compiler.protos_impls
+import compiler.proto_resolve
+import compiler.protos_calls
+import compiler.expr_positions
+import compiler.operators
+import compiler.written
+
+#[doc("What `Eq` is read against: the scope, which types have an `Eq` and an `Ord` impl, and the type declarations of the program.")]
+pub(pkg) type EqEnv = { ps: PScope, has_eq: (SymId) -> Bool, has_ord: (SymId) -> Bool, types: [Decl] }
+
+#[doc("The environment for deciding `Eq` over the program `ds` against the impls registered in `reg`.")]
+pub(pkg) fn eq_env(ps: PScope, reg: ProtocolReg, ds: [Decl]) : EqEnv =
+  EqEnv { ps: ps,
+          has_eq: (s) => prc_reg_has_impl(reg, core_proto_id(CpEq), DhSym(s)),
+          has_ord: (s) => prc_reg_has_impl(reg, core_proto_id(CpOrd), DhSym(s)),
+          types: eq_types(ds) }
+
+#[doc("The environment for deciding `Eq` over the program `ds` when `has_eq` says which types have an impl.")]
+pub(pkg) fn eq_env_of(ps: PScope, has_eq: (SymId) -> Bool, ds: [Decl]) : EqEnv =
+  EqEnv { ps: ps, has_eq: has_eq, has_ord: (s) => false, types: eq_types(ds) }
+
+#[doc("True when `s` is a data type with no type parameters whose fields are all `Eq`.")]
+pub(pkg) fn plain_data_eq(env: EqEnv, s: SymId) : Bool = match find(env.types, (d) => type_decl_is(d, s)) {
+  Some(DType(_, _, [], _, _, _, _, _)) -> fields_eq(env, [s], s)
+  _                                    -> false
+}
+
+#[doc("The type declarations of the program `ds`.")]
+pub(pkg) fn eq_types(ds: [Decl]) : [Decl] = type_decls(ds, [])
+
+fn type_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DType(_, _, _, _, _, _, _, _) -> type_decls(rest, [d, ...acc])
+    DUnstable(inner, _, _)        -> type_decls([inner, ...rest], acc)
+    DProtoLaws(_, inner, _, _, _) -> type_decls([inner, ...rest], acc)
+    DImplAxiom(_, inner, _, _, _) -> type_decls([inner, ...rest], acc)
+    DConstructor(inner, _, _)     -> type_decls([inner, ...rest], acc)
+    _                             -> type_decls(rest, acc)
+  }
+}
+
+#[doc("True when values of `t` can be compared with `==` and satisfy an `Eq` bound.")]
+pub(pkg) fn ty_is_eq(env: EqEnv, t: Ty) : Bool = ty_eq(env, [], t)
+
+fn ty_eq(env: EqEnv, seen: [SymId], t: Ty) : Bool = match t {
+  TyFnT(_, _, _)  -> false
+  TyListT(inner)  -> ty_eq(env, seen, inner)
+  TyDimT(inner, _)    -> ty_eq(env, seen, inner)
+  TyRefineT(inner, _) -> ty_eq(env, seen, inner)
+  TyUnion(ts)     -> all(ts, (x) => ty_eq(env, seen, x))
+  TyCon(s, args)  -> all(args, (x) => ty_eq(env, seen, x)) and head_eq(env, seen, s)
+  _               -> true
+}
+
+fn head_eq(env: EqEnv, seen: [SymId], s: SymId) : Bool =
+  list_has_sym(seen, s) or env.has_eq(s) or fields_eq(env, [s, ...seen], s)
+
+fn list_has_sym(xs: [SymId], s: SymId) : Bool = any(xs, (x) => sym_raw(x) == sym_raw(s))
+
+fn fields_eq(env: EqEnv, seen: [SymId], s: SymId) : Bool = match find(env.types, (d) => type_decl_is(d, s)) {
+  None    -> true
+  Some(d) -> match d {
+    DType(_, _, _, body, _, _, _, _) -> {
+      let from = decl_type_home(d, ps_root(env.ps))
+      match body {
+        TBAlias(te)    -> te_eq(env, seen, from, te)
+        TBRecord(fs)   -> all(fs, (f) => match f { FD(_, _, te, _) -> te_eq(env, seen, from, te) })
+        TBSum(vs)      -> all(vs, (v) => match v { Var(_, tes) -> all(tes, (te) => te_eq(env, seen, from, te)) })
+        TBEffectAlias(_) -> true
+      }
+    }
+    _ -> true
+  }
+}
+
+fn type_decl_is(d: Decl, s: SymId) : Bool = match d {
+  DType(_, ds, _, _, _, _, _, _) -> sym_raw(ds) >= 0 and sym_raw(ds) == sym_raw(s)
+  _                              -> false
+}
+
+fn te_eq(env: EqEnv, seen: [SymId], from: Option[String], te: TypeExpr) : Bool = match te.tkind {
+  TyName(_, args) -> all(args, (a) => te_eq(env, seen, from, a)) and te_head_eq(env, seen, vdv_head(env.ps, te, from))
+  TyList(inner)   -> te_eq(env, seen, from, inner)
+  TyFn(_, _, _)   -> false
+  TyDim(base, _)    -> te_eq(env, seen, from, base)
+  TyRefine(base, _) -> te_eq(env, seen, from, base)
+  TyParam(_, args)  -> all(args, (a) => te_eq(env, seen, from, a))
+  _                 -> true
+}
+
+fn te_head_eq(env: EqEnv, seen: [SymId], head: DeclRef) : Bool =
+  if ref_resolved(head) { head_eq(env, seen, ref_sym(head)) } else { true }
+
+#[doc("A comparison the program may not make: where it is, the operand type, and whether it is `==`/`!=` (else an ordering).")]
+pub(pkg) type CmpSite = CS(Int, Int, Ty, Bool)
+
+#[doc("The comparisons in `e` that compare a value with no `Eq`, or order a function or a record with no `Ord` impl.")]
+pub(pkg) fn cmp_sites(env: EqEnv, e: Expr, acc: [CmpSite]) : [CmpSite] {
+  let here = match e.kind {
+    EBinop(op, l, _) -> match l.ty {
+      Some(t) ->
+        if binop_is_equality(op) and not ty_is_eq(env, t) { [CS(e.line, e.col, t, true), ...acc] }
+        else if binop_is_ordering(op) and ty_unordered(env, t) { [CS(e.line, e.col, t, false), ...acc] }
+        else { acc }
+      None -> acc
+    }
+    _ -> acc
+  }
+  cmp_sites_in(env, xp_positions(e), here)
+}
+
+fn cmp_sites_in(env: EqEnv, ps: [XPos], acc: [CmpSite]) : [CmpSite] = match ps {
+  []             -> acc
+  [XP(_, c), ...rest] -> cmp_sites_in(env, rest, cmp_sites(env, c, acc))
+}
+
+fn ty_unordered(env: EqEnv, t: Ty) : Bool = match t {
+  TyFnT(_, _, _)      -> true
+  TyDimT(inner, _)    -> ty_unordered(env, inner)
+  TyRefineT(inner, _) -> ty_unordered(env, inner)
+  TyCon(s, _) -> not env.has_ord(s) and is_record(env, s)
+  _ -> false
+}
+
+fn is_record(env: EqEnv, s: SymId) : Bool = match find(env.types, (d) => type_decl_is(d, s)) {
+  Some(DType(_, _, _, TBRecord(_), _, _, _, _)) -> true
+  _ -> false
+}

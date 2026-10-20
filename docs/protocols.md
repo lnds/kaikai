@@ -414,6 +414,20 @@ documentation text to a declaration (or, in module position, to the
 file). Other annotations (`#deprecated`, etc.) live in their own
 whitelist per `proposed-extensions.md §27`.
 
+### Equality and order without an impl
+
+`Eq` has one definition: a type is `Eq` when it has an `impl Eq` (written
+or derived), or, failing that, when it is a record or sum type whose
+every field is `Eq`. `==`, `!=` and a `[T: Eq]` bound all ask that same
+question, decided per concrete type at monomorphisation. A written impl
+overrides the structural rule, so `#[derive(Eq)]` stays valid and is
+redundant. A function type is not `Eq`, nor is a type that holds one
+unless it carries its own impl; `f == f` is a compile error.
+
+`Pair`, `Triple` and `Quad` implement `Ord` lexicographically when each
+element does. A record or sum type has no automatic `Ord`; `<` on a
+record without an `impl Ord` is a compile error.
+
 `#[derive(...)]` is **opt-in**: if the user does not write the annotation, no
 impl is generated. This avoids surprising user-defined `impl Show for
 Account` getting shadowed by an auto-derived one.
