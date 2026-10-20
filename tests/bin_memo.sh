@@ -43,7 +43,7 @@ printf 'name = "binmemo"\nentry = "main.kai"\n' > "$pkg/kai.toml"
 printf 'import lib.util\n\nfn main() : Unit / Stdout = Stdout.print(int_to_string(util.add(1, 2)))\n' > "$pkg/main.kai"
 printf '#[doc("Adds.")]\npub fn add(a: Int, b: Int) : Int = a + b\n' > "$pkg/lib/util.kai"
 printf 'import lib.util\n\ntest "adds" {\n  assert util.add(2, 2) == 4\n}\n' > "$pkg/tests/a_test.kai"
-printf 'test "counts" {\n  assert [1, 2, 3].length() == 3\n}\n' > "$pkg/tests/b_test.kai"
+printf 'test "counts" {\n  assert ([1, 2, 3] |> length()) == 3\n}\n' > "$pkg/tests/b_test.kai"
 printf 'import lib.util\n\ntest "solo" {\n  assert util.add(0, 1) == 1\n}\n' > "$pkg/solo_test.kai"
 
 fail=0
