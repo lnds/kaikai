@@ -1,9 +1,9 @@
-#[doc("""
-The generic functions of a program, indexed, and the `(declaration,
-types, units)` tuple naming one specialisation.
-""")]
+#[doc("The instance tables: the polymorphic function table, the index over resolved call-site instantiations and the specialised copies made from them.")]
 
 import compiler.ast
+import compiler.infer_glue
+import compiler.infer_env_exhaust
+import compiler.infer_index
 import compiler.call_site_target
 import compiler.fnreg
 import compiler.effect_instance_canon
@@ -12,6 +12,44 @@ import compiler.proto_ids
 import compiler.core_refs
 import compiler.expr_exists
 import compiler.infer_clause_holes
+import compiler.monomorph_subst
+
+# Hash index over the typer's resolved call-site instantiations.
+#
+# `find_mono_insts_at` collects the instantiations of one declaration
+# recorded at one `(line, col)`, and the monomorphiser asks once per call
+# site it rewrites, against one entry per instantiation in the whole
+# program. The index buckets by the instantiated declaration so the
+# position filter runs over its instantiations instead of all of them.
+#
+# The collected order is load-bearing: `resolve_call_inst_first` takes
+# the HEAD of the collected list, so a chain must preserve the table's
+# order. The index builds newest-first, so the table is indexed back
+# to front and each chain comes out in table order.
+
+#[doc("The resolved call-site table plus an index from a declaration to its instantiations.")]
+pub(pkg) type InstIndex = { ix: NameIndex[ResolvedCS], all: [ResolvedCS] }
+
+#[doc("The index over an empty call-site table.")]
+pub(pkg) fn iix_empty() : InstIndex = InstIndex { ix: idx_empty(), all: [] }
+
+#[doc("Index the resolved call-site table so one declaration's instantiations are reachable without scanning it.")]
+pub(pkg) fn iix_build(insts: [ResolvedCS]) : InstIndex =
+  InstIndex { ix: iix_add_rev(list_reverse(insts), idx_empty()), all: insts }
+
+fn iix_add_rev(rev: [ResolvedCS], ix: NameIndex[ResolvedCS]) : NameIndex[ResolvedCS] = match rev {
+  []           -> ix
+  [r, ...rest] -> match r {
+    RCS(s, _, _, _, _, _) -> iix_add_rev(rest, idx_prepend_sym(ix, s, r))
+  }
+}
+
+#[doc("The instantiations of the declaration `s`, in table order; empty when it has none.")]
+pub(pkg) fn iix_chain(ix: InstIndex, s: SymId) : [ResolvedCS] =
+  idx_chain_sym(ix.ix, s)
+
+#[doc("The whole resolved call-site table, in its original order.")]
+pub(pkg) fn iix_all(ix: InstIndex) : [ResolvedCS] = ix.all
 
 #[doc("""
 The poly fns of the program, by declaration. A `DFn` with non-empty
@@ -20,26 +58,26 @@ Implicit tparams (auto-collected lowercase identifiers) are folded
 into the explicit tparam list at type-check time so this single
 check covers both surface forms.
 """)]
-pub type PolyFn = PFn(SymId, Decl)
+pub(pkg) type PolyFn = PFn(SymId, Decl)
 
 #[doc("""
 The poly fns, the module the translation unit is compiled as (a root
 fn's bounds resolve from it), and the poly fns whose `handle` takes a
 type parameter as its instance.
 """)]
-pub type PolyIx = PIx([PolyFn], String, [PolyFn])
+pub(pkg) type PolyIx = PIx([PolyFn], String, [PolyFn])
 
 #[doc("Every generic function of the index.")]
-pub fn poly_ix_fns(px: PolyIx) : [PolyFn] = match px { PIx(fns, _, _) -> fns }
+pub(pkg) fn poly_ix_fns(px: PolyIx) : [PolyFn] = match px { PIx(fns, _, _) -> fns }
 
 #[doc("The module the translation unit is compiled as.")]
-pub fn poly_ix_target(px: PolyIx) : String = match px { PIx(_, t, _) -> t }
+pub(pkg) fn poly_ix_target(px: PolyIx) : String = match px { PIx(_, t, _) -> t }
 
 #[doc("The generics whose `handle` takes a type parameter as its instance.")]
-pub fn poly_ix_inst(px: PolyIx) : [PolyFn] = match px { PIx(_, _, ifs) -> ifs }
+pub(pkg) fn poly_ix_inst(px: PolyIx) : [PolyFn] = match px { PIx(_, _, ifs) -> ifs }
 
 #[doc("The index of the generic functions among `ds`.")]
-pub fn collect_poly_fns(ds: [Decl], target_mod: String, ids: ProtoIds) : PolyIx = {
+pub(pkg) fn collect_poly_fns(ds: [Decl], target_mod: String, ids: ProtoIds) : PolyIx = {
   let fns = collect_poly_fns_loop(ds, ids)
   PIx(fns, target_mod, filter(fns, (p) => match p { PFn(_, d) -> handle_instance_tparams(d) != [] }))
 }
@@ -86,34 +124,183 @@ The poly decl a CALL names: the declaration its id names. A
 specialisation is already specialised, and a local names no
 declaration, so neither names one.
 """)]
-pub fn lookup_poly_fn_at(polys: PolyIx, callee: Expr) : Option[Decl] =
+pub(pkg) fn lookup_poly_fn_at(polys: PolyIx, callee: Expr) : Option[Decl] =
   match callee_fnid(callee) {
     Some(f) -> if fnid_inst(f) == spec_none() { lookup_poly_fn_sym(poly_ix_fns(polys), fnid_sym(f)) } else { None }
     None    -> None
   }
 
 #[doc("The generic declared under the id `s`.")]
-pub fn lookup_poly_fn_sym(fns: [PolyFn], s: SymId) : Option[Decl] = match fns {
+pub(pkg) fn lookup_poly_fn_sym(fns: [PolyFn], s: SymId) : Option[Decl] = match fns {
   [] -> None
   [PFn(g, d), ...rest] ->
     if sym_raw(g) >= 0 and sym_same(g, s) { Some(d) } else { lookup_poly_fn_sym(rest, s) }
 }
 
 #[doc("The function id of a declaration; none for anything but a function.")]
-pub fn poly_decl_fid(d: Decl) : FnId = match d {
+pub(pkg) fn poly_decl_fid(d: Decl) : FnId = match d {
   DFn(_, fid, _, _, _, _, _, _, _, _) -> fid
   _ -> fnid_none()
 }
 
 #[doc("The symbol of a function declaration.")]
-pub fn poly_decl_sym(d: Decl) : SymId = fnid_sym(poly_decl_fid(d))
+pub(pkg) fn poly_decl_sym(d: Decl) : SymId = fnid_sym(poly_decl_fid(d))
 
 #[doc("""
 One specialisation: the generic's declaration and the concrete
 `(tys, units)` it is instantiated at. Two generics spelled alike in two
 modules are two declarations, so each has its own specs.
 """)]
-pub type MonoTuple = MT(SymId, [Ty], [UnitExprT])
+pub(pkg) type MonoTuple = MT(SymId, [Ty], [UnitExprT])
 
 #[doc("The generic a specialisation is of.")]
-pub fn mt_sym(t: MonoTuple) : SymId = match t { MT(s, _, _) -> s }
+pub(pkg) fn mt_sym(t: MonoTuple) : SymId = match t { MT(s, _, _) -> s }
+
+# A spec's signature must read concrete: `subst_decl` only rewrites
+# the body, leaving `Param.ptype` / `opt_ret` at the written
+# type parameter. The unbox classifier reads the SIGNATURE, so an
+# unconcreted one keeps the spec boxed (lost int64 ABI on every
+# scalar `fn[T:P]`). These helpers concrete the syntactic signature
+# by mapping each type-kind tparam name to its actual TypeExpr.
+
+# Reverse of resolve_ty for the slots that matter to unboxing.
+# Primitives become bare TyName so the classifier sees Int/Real/Bool/
+# Char; compound types reconstruct structurally (a boxed param either
+# way, but kept faithful for the rest of the signature walk).
+fn ty_to_typeexpr(t: Ty) : TypeExpr {
+  let k = match t {
+    TyInt    -> TyName(ref_written("Int"), [])
+    TyReal   -> TyName(ref_written("Real"), [])
+    TyBool   -> TyName(ref_written("Bool"), [])
+    TyString -> TyName(ref_written("String"), [])
+    TyChar   -> TyName(ref_written("Char"), [])
+    TyUnit   -> TyName(ref_written("Unit"), [])
+    TyByte   -> TyName(ref_written("Byte"), [])
+    TyInt32  -> TyName(ref_written("Int32"), [])
+    TyUInt32 -> TyName(ref_written("UInt32"), [])
+    TyUInt64 -> TyName(ref_written("UInt64"), [])
+    TyInt128 -> TyName(ref_written("Int128"), [])
+    TyHandle -> TyName(ref_written("Handle"), [])
+    TyAny    -> TyName(ref_written("Any"), [])
+    TyListT(inner) -> TyList(ty_to_typeexpr(inner))
+    TyFnT(ps, ret, _) -> TyFn(map(ps, ty_to_typeexpr), ty_to_typeexpr(ret), REmpty)
+    TyCon(csym, tas) -> TyName(DrSym(csym), map(tas, ty_to_typeexpr))
+    TyVarT(_) -> TyName(ref_written("Any"), [])
+    # a resolved shape app is erased before this conversion; an
+    # unresolved one has no surface constructor, like a bare tvar.
+    TyShapeApp(_, _) -> TyName(ref_written("Any"), [])
+    TyDimT(base, u) -> TyDim(ty_to_typeexpr(base), u)
+    TyRefineT(base, p) -> TyRefine(ty_to_typeexpr(base), p)
+    TyUnion(parts) -> union_head_tkind(parts)
+  }
+  mk_ty(k, 0, 0)
+}
+
+fn union_head_tkind(parts: [Ty]) : TyKind = match parts {
+  [p, ..._] -> {
+    let te = ty_to_typeexpr(p)
+    te.tkind
+  }
+  [] -> TyName(ref_written("Any"), [])
+}
+
+type SigSubst = SS(TLocalId, TypeExpr)
+
+# Pair the decl's type-kind tparams (unit-kind dropped, matching the
+# `tys` alignment) with their concrete TypeExprs, in the ordering
+# build_subst_map uses.
+fn build_sig_subst(d: Decl, tys: [Ty]) : [SigSubst] = zip_sig_subst(sig_type_names(d), tys)
+
+#[doc("The type parameters of a function, unit parameters left out, in declaration order.")]
+pub(pkg) fn sig_type_names(d: Decl) : [TBinder] = match d {
+  DFn(_, _, tparams, _, _, _, _, _, _, _) ->
+    filter(tbs_positional(tparams), (n) => not tb_is_unit(n))
+  _ -> []
+}
+
+fn zip_sig_subst(names: [TBinder], tys: [Ty]) : [SigSubst] {
+  match names {
+    [] -> []
+    [n, ...nrest] -> match tys {
+      [] -> []
+      [t, ...trest] -> [SS(n.id, ty_to_typeexpr(t)), ...zip_sig_subst(nrest, trest)]
+    }
+  }
+}
+
+# The concrete form of the type parameter `id`.
+fn sig_subst_of(subst: [SigSubst], id: TLocalId) : Option[TypeExpr] = match subst {
+  [] -> None
+  [SS(n, te), ...rest] -> if tlocal_eq(n, id) { Some(te) } else { sig_subst_of(rest, id) }
+}
+
+# Rewrite a TypeExpr, replacing each use of a type parameter with its
+# concrete form.
+fn apply_sig_subst_te(te: TypeExpr, subst: [SigSubst]) : TypeExpr {
+  let k = match te.tkind {
+    TyName(r, targs) -> TyName(r, map(targs, (a) => apply_sig_subst_te(a, subst)))
+    TyParam(p, targs) -> {
+      let targs1 = map(targs, (a) => apply_sig_subst_te(a, subst))
+      match sig_subst_of(subst, p) {
+        Some(rep) -> if targs1 == [] { rep.tkind } else { TyParam(p, targs1) }
+        None -> TyParam(p, targs1)
+      }
+    }
+    TyList(inner) -> TyList(apply_sig_subst_te(inner, subst))
+    TyFn(ps, ret, row) -> TyFn(map(ps, (p) => apply_sig_subst_te(p, subst)),
+                                apply_sig_subst_te(ret, subst), row)
+    TyDim(base, u) -> TyDim(apply_sig_subst_te(base, subst), u)
+    TyRefine(base, p) -> TyRefine(apply_sig_subst_te(base, subst), p)
+    TyRow(row) -> TyRow(row)
+    TySurface(ts) -> TySurface(tysurface_rebuild(ts, map(tysurface_children(ts), (c) => apply_sig_subst_te(c, subst))))
+  }
+  mk_ty(k, te.line, te.col)
+}
+
+fn subst_param_sig(p: Param, subst: [SigSubst]) : Param =
+  match p.ptype {
+    None -> p
+    Some(te) -> Param { binder: p.binder, ptype: Some(apply_sig_subst_te(te, subst)),
+                        pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
+  }
+
+#[doc("The spec of `d` at `tys`: instance `inst` of the generic's id.")]
+pub(pkg) fn specialise_decl(d: Decl, tys: [Ty], inst: Int) : Decl {
+  match d {
+    DFn(is_pub, fid, _, params, opt_ret, row, body, ln, cl, mo) -> {
+      let subst = build_sig_subst(d, tys)
+      let params1 = map(params, (p) => subst_param_sig(p, subst))
+      let opt_ret1 = match opt_ret {
+        None -> None
+        Some(te) -> Some(apply_sig_subst_te(te, subst))
+      }
+      let body1 = if handle_instance_tparams(d) == [] { body } else { subst_handle_sig(body, subst) }
+      DFn(is_pub, FnId(fnid_sym(fid), inst), [], params1, opt_ret1, subst_row_sig(row, subst), body1,
+          ln, cl, mo)
+    }
+    _ -> d
+  }
+}
+
+# A spec's row labels and `handle` type arguments name its instances, which
+# evidence selection keys on, so they read concrete too.
+fn subst_row_sig(r: RowExpr, subst: [SigSubst]) : RowExpr = match r {
+  REmpty       -> REmpty
+  RClosed([])  -> r
+  RClosed(ls)  -> RClosed(map(ls, (l) => subst_label_sig(l, subst)))
+  ROpen(t, ls) -> ROpen(t, map(ls, (l) => subst_label_sig(l, subst)))
+}
+
+fn subst_label_sig(l: RowLabel, subst: [SigSubst]) : RowLabel = match l {
+  RL(r, ts) -> RL(r, map(ts, (t) => apply_sig_subst_te(t, subst)))
+}
+
+fn subst_handle_sig(e: Expr, subst: [SigSubst]) : Expr = {
+  let k = mono_map_expr_kind(e.kind, (sub) => subst_handle_sig(sub, subst))
+  let k1 = match k {
+    EHandle(body, eff, tas, init, alias, cls, ret) ->
+      EHandle(body, eff, map(tas, (t) => apply_sig_subst_te(t, subst)), init, alias, cls, ret)
+    _ -> k
+  }
+  Expr { kind: k1, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+}

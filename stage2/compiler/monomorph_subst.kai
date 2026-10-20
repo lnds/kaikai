@@ -1,7 +1,4 @@
-#[doc("""
-Substitution of a spec's type and unit arguments through types, rows,
-units and bodies, and whether a type is concrete.
-""")]
+#[doc("Type substitution for monomorphisation: the substitution map, type-variable collection and the bindings a call site induces.")]
 
 import compiler.ast
 import compiler.infer_env
@@ -10,10 +7,129 @@ import compiler.infer_state
 import compiler.infer_arms_vec
 import compiler.infer_env_exhaust
 import compiler.infer_dump_text
-import compiler.monomorph_map
+import compiler.infer_apply
+import compiler.infer_clause_holes
+
+#[doc("`k` with `f` applied to each direct sub-expression.")]
+pub(pkg) fn mono_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
+  match k {
+    # Leaves: no sub-Expr to recurse into.
+    EInt(_, _)        -> k
+    EReal(_, _)       -> k
+    EIntLit(_)        -> k
+    EDecimalLit(_)    -> k
+    EFixed(_, _)      -> k
+    EBool(_)       -> k
+    EChar(_)       -> k
+    EStr(_, _)     -> k
+    EUnit          -> k
+    EName(_)        -> k
+    EMark(_)        -> k
+    ESym(_, _)      -> k
+    ELocal(_)       -> k
+    EOp(_)          -> k
+    EUnder         -> k
+    EPlaceholder   -> k
+    EHole(_)       -> k
+    ETodo(_)       -> k
+    EExternBody(_, _) -> k
+    # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
+    # TypeExpr and a resolved-names list, neither of which the
+    # visitor traverses). Same shape as EHole/ETodo for the
+    # purposes of the structural recursion.
+    EVariantsOf(_, _) -> k
+    # m6.2 Phase 2.1: qualified module call carries no sub-Exprs
+    # (both fields are plain Strings), so `f` has nothing to apply.
+    EModCall(_, _) -> k
+    # Issue #556: intrinsic args ARE sub-Exprs, so the visitor recurs.
+    EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
+    ESurface(sf) -> ESurface(surface_map(sf, f))
+    # Composites: apply f to every direct sub-Expr.
+    ECall(callee, args_) -> ECall(f(callee), map(args_, f))
+    EField(base, name)   -> EField(f(base), name)
+    EIndex(a, b)         -> EIndex(f(a), f(b))
+    EBinop(op, a, b)     -> EBinop(op, f(a), f(b))
+    EUnop(op, x)         -> EUnop(op, f(x))
+    EIf(c, t_, eo)       -> EIf(f(c), f(t_), mono_map_opt_expr(eo, f))
+    EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => mono_map_arm_exprs(a, f)))
+    ELambda(ps, b)       -> ELambda(ps, f(b))
+    ERecordLit(rh, fs)   -> ERecordLit(rh, map(fs, (fi) => mono_map_field_exprs(fi, f)))
+    EList(els)           -> EList(map(els, (el) => mono_map_elem_exprs(el, f)))
+    ERange(a, b, opt_step) -> ERange(f(a), f(b), mono_map_opt_expr(opt_step, f))
+    EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => mono_map_stmt_exprs(s, f)),
+                                    mono_map_opt_expr(tail, f))
+    EPipe(a, b)          -> EPipe(f(a), f(b))
+    EDispatchPipe(op, a, b) -> EDispatchPipe(op, f(a), f(b))
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff, eff_tyargs,
+              mono_map_opt_expr(init_opt, f), alias_opt,
+              map(clauses, (c) => mono_map_clause_exprs(c, f)),
+              mono_map_opt_return_exprs(ret_opt, f))
+    ELitUnit(inner, u)   -> ELitUnit(f(inner), u)
+    EBang(inner)         -> EBang(f(inner))
+  }
+}
+
+fn mono_map_opt_expr(opt: Option[Expr], f: (Expr) -> Expr) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(f(e))
+    None    -> None
+  }
+}
+
+fn mono_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
+  match s {
+    SLet(p, ann, rhs)           -> SLet(p, ann, f(rhs))
+    SAssert(c, m)               -> SAssert(f(c), mono_map_opt_expr(m, f))
+    SExprStmt(x)                -> SExprStmt(f(x))
+    SIndexAssign(b, i, v, l, c) -> SIndexAssign(f(b), f(i), f(v), l, c)
+    SAssign(b, v, l, c) -> SAssign(f(b), f(v), l, c)
+    SVar(n, ty, rhs, l, c)      -> SVar(n, ty, f(rhs), l, c)
+    # m7e §25: SUse has no sub-expression — pass through unchanged.
+    SUse(n, l, c)               -> SUse(n, l, c)
+  }
+}
+
+fn mono_map_arm_exprs(a: Arm, f: (Expr) -> Expr) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, mono_map_opt_expr(g, f), f(b))
+  }
+}
+
+fn mono_map_field_exprs(fi: FieldInit, f: (Expr) -> Expr) : FieldInit {
+  match fi {
+    FI(n, v) -> FI(n, f(v))
+  }
+}
+
+fn mono_map_elem_exprs(el: ListElem, f: (Expr) -> Expr) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(f(x))
+    ElSpread(x) -> ElSpread(f(x))
+  }
+}
+
+fn mono_map_clause_exprs(c: HClause, f: (Expr) -> Expr) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, f(b), l, co)
+  }
+}
+
+fn mono_map_opt_return_exprs(opt: Option[HReturn], f: (Expr) -> Expr) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(mono_map_return_exprs(r, f))
+    None    -> None
+  }
+}
+
+fn mono_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, f(b), l, c)
+  }
+}
 
 #[doc("The type-parameter ids a substitution binds.")]
-pub fn subst_map_tvar_ids(sm: SubstMap) : [Int] =
+pub(pkg) fn subst_map_tvar_ids(sm: SubstMap) : [Int] =
   match sm { SM(tvars, _) -> stp_ids(tvars, []) }
 
 fn stp_ids(ps: [SubstPairTy], acc: [Int]) : [Int] {
@@ -26,7 +142,7 @@ fn stp_ids(ps: [SubstPairTy], acc: [Int]) : [Int] {
 }
 
 #[doc("The unit-parameter ids a substitution binds.")]
-pub fn subst_map_uvar_ids(sm: SubstMap) : [Int] =
+pub(pkg) fn subst_map_uvar_ids(sm: SubstMap) : [Int] =
   match sm { SM(_, uvars) -> sup_ids(uvars, []) }
 
 fn sup_ids(ps: [SubstPairUnit], acc: [Int]) : [Int] {
@@ -39,7 +155,7 @@ fn sup_ids(ps: [SubstPairUnit], acc: [Int]) : [Int] {
 }
 
 #[doc("A type with its refinements stripped.")]
-pub fn ty_unrefined(t: Ty) : Ty = match t {
+pub(pkg) fn ty_unrefined(t: Ty) : Ty = match t {
   TyRefineT(base, _) -> ty_unrefined(base)
   _                  -> t
 }
@@ -54,21 +170,21 @@ pairs. Both ids come from `tparam_id_split(effective_tparams)`,
 which is the same allocation order the inferencer used to type
 the body (so a body's `TyVarT(0)` is the first tvar tparam, etc.).
 """)]
-pub type SubstPairTy = STP(Int, Ty)
+pub(pkg) type SubstPairTy = STP(Int, Ty)
 #[doc("A unit-parameter id and the unit it is bound to.")]
-pub type SubstPairUnit = SUP(Int, UnitExprT)
+pub(pkg) type SubstPairUnit = SUP(Int, UnitExprT)
 #[doc("The types and units one specialisation binds its declaration's parameters to.")]
-pub type SubstMap = SM([SubstPairTy], [SubstPairUnit])
+pub(pkg) type SubstMap = SM([SubstPairTy], [SubstPairUnit])
 
 #[doc("A substitution binding nothing.")]
-pub fn subst_map_empty() : SubstMap = SM([], [])
+pub(pkg) fn subst_map_empty() : SubstMap = SM([], [])
 
 fn subst_map_lookup_ty(sm: SubstMap, id: Int) : Option[Ty] {
   match sm { SM(tvars, _) -> subst_pairs_lookup_ty(tvars, id) }
 }
 
 #[doc("The type bound to the id `id`.")]
-pub fn subst_pairs_lookup_ty(ps: [SubstPairTy], id: Int) : Option[Ty] {
+pub(pkg) fn subst_pairs_lookup_ty(ps: [SubstPairTy], id: Int) : Option[Ty] {
   match ps {
     [] -> None
     [h, ...rest] -> match h {
@@ -82,7 +198,7 @@ fn subst_map_lookup_unit(sm: SubstMap, id: Int) : Option[UnitExprT] {
 }
 
 #[doc("The unit bound to the id `id`.")]
-pub fn subst_pairs_lookup_unit(ps: [SubstPairUnit], id: Int) : Option[UnitExprT] {
+pub(pkg) fn subst_pairs_lookup_unit(ps: [SubstPairUnit], id: Int) : Option[UnitExprT] {
   match ps {
     [] -> None
     [h, ...rest] -> match h {
@@ -96,7 +212,7 @@ Build the SubstMap for a DFn given a concrete `(tys, units)` tuple.
 Numbers the same parameters the inferencer did, so the id allocation in
 `tparam_id_split` agrees with the body's `TyVarT` / `UVar` ids.
 """)]
-pub fn build_subst_map(d: Decl, tys: [Ty], units: [UnitExprT]) : SubstMap {
+pub(pkg) fn build_subst_map(d: Decl, tys: [Ty], units: [UnitExprT]) : SubstMap {
   match d {
     DFn(_, _, tparams, _, _, _, _, _, _, _) -> {
       let split = tparam_id_split(tparams)
@@ -134,7 +250,7 @@ into the base AND substitutes the unit (which may be a UVar matching
 `sm.uvars`). Adding a new Ty variant fails compilation here rather
 than slipping through.
 """)]
-pub fn subst_ty(t: Ty, sm: SubstMap) : Ty {
+pub(pkg) fn subst_ty(t: Ty, sm: SubstMap) : Ty {
   match t {
     TyInt    -> t
     TyReal   -> t
@@ -200,7 +316,7 @@ Walker `subst_unit(u, sm)` — recurses through every UnitExprT
 constructor. `UVar(id)` substitutes via `sm.uvars` (canonicalised
 at TyDimT level via `dim_collapse` above).
 """)]
-pub fn subst_unit(u: UnitExprT, sm: SubstMap) : UnitExprT {
+pub(pkg) fn subst_unit(u: UnitExprT, sm: SubstMap) : UnitExprT {
   match u {
     UOne        -> u
     USym(_)     -> u
@@ -239,7 +355,7 @@ fn subst_kind(k: ExprKind, sm: SubstMap) : ExprKind {
 }
 
 #[doc("A declaration with the substitution applied to its body.")]
-pub fn subst_decl(d: Decl, sm: SubstMap) : Decl {
+pub(pkg) fn subst_decl(d: Decl, sm: SubstMap) : Decl {
   match d {
     DFn(is_pub, fid, tps, ps, ret, row, body, ln, cl, mo) ->
       DFn(is_pub, fid, tps, ps, ret, row, subst_expr(body, sm), ln, cl, mo)
@@ -250,5 +366,386 @@ pub fn subst_decl(d: Decl, sm: SubstMap) : Decl {
     DCheck(desc, ps, body, ln, cl, mo) ->
       DCheck(desc, ps, subst_expr(body, sm), ln, cl, mo)
     _ -> d
+  }
+}
+
+#[doc("`acc` plus the allowed type and unit variables still present in `e`.")]
+pub(pkg) fn count_tyvar_in_expr(e: Expr, allowed_tvars: [Int], allowed_uvars: [Int],
+                        acc: Int) : Int {
+  let n_self = match e.ty {
+    Some(t) -> count_tyvar_in_ty(t, allowed_tvars, allowed_uvars)
+    None    -> 0
+  }
+  let n_kind = count_tyvar_in_kind(e.kind, allowed_tvars, allowed_uvars)
+  acc + n_self + n_kind
+}
+
+#[doc("How many of the allowed type and unit variables a type still holds.")]
+pub(pkg) fn count_tyvar_in_ty(t: Ty, atv: [Int], auv: [Int]) : Int {
+  match t {
+    TyVarT(n) -> if list_has_int(atv, n) { 1 } else { 0 }
+    TyListT(inner) -> count_tyvar_in_ty(inner, atv, auv)
+    TyFnT(ps, ret, row) -> {
+      let np = sum_count_tyvar_tys(ps, atv, auv)
+      let nr = count_tyvar_in_ty(ret, atv, auv)
+      let nrow = count_tyvar_in_row(row, atv, auv)
+      np + nr + nrow
+    }
+    TyCon(_, tas) -> sum_count_tyvar_tys(tas, atv, auv)
+    TyDimT(b, u) -> count_tyvar_in_ty(b, atv, auv) + count_tyvar_in_unit(u, auv)
+    TyRefineT(b, _) -> count_tyvar_in_ty(b, atv, auv)
+    # issue #187 phase 1: count contributions from each component
+    # — same shape as the TyCon arm, since a union is structurally
+    # a list of types and each one can carry tvars independently.
+    TyUnion(parts) -> sum_count_tyvar_tys(parts, atv, auv)
+    _ -> 0
+  }
+}
+
+fn count_tyvar_in_row(r: Row, atv: [Int], auv: [Int]) : Int =
+  sum_count_tyvar_labels(r.labels, atv, auv)
+
+fn sum_count_tyvar_labels(ls: [Label], atv: [Int], auv: [Int]) : Int {
+  match ls {
+    [] -> 0
+    [l, ...rest] -> {
+      let here = sum_count_tyvar_tys(l.ty_args, atv, auv)
+      let after = sum_count_tyvar_labels(rest, atv, auv)
+      here + after
+    }
+  }
+}
+
+fn sum_count_tyvar_tys(ts: [Ty], atv: [Int], auv: [Int]) : Int {
+  match ts {
+    [] -> 0
+    [h, ...rest] -> {
+      let here = count_tyvar_in_ty(h, atv, auv)
+      let after = sum_count_tyvar_tys(rest, atv, auv)
+      here + after
+    }
+  }
+}
+
+fn count_tyvar_in_unit(u: UnitExprT, auv: [Int]) : Int {
+  match u {
+    UVar(n) -> if list_has_int(auv, n) { 1 } else { 0 }
+    UMul(a, b) -> count_tyvar_in_unit(a, auv) + count_tyvar_in_unit(b, auv)
+    UInv(a) -> count_tyvar_in_unit(a, auv)
+    UPow(a, _) -> count_tyvar_in_unit(a, auv)
+    UJoin(a, b) -> count_tyvar_in_unit(a, auv) + count_tyvar_in_unit(b, auv)
+    UDims(us) -> count_tyvar_in_units(us, auv)
+    _ -> 0
+  }
+}
+
+fn count_tyvar_in_units(us: [UnitExprT], auv: [Int]) : Int = match us {
+  [] -> 0
+  [u, ...rest] -> count_tyvar_in_unit(u, auv) + count_tyvar_in_units(rest, auv)
+}
+
+fn count_tyvar_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Int {
+  match k {
+    EInt(_, _)        -> 0
+    EReal(_, _)       -> 0
+    EIntLit(_)        -> 0
+    EDecimalLit(_)    -> 0
+    EFixed(_, _)      -> 0
+    EBool(_)       -> 0
+    EChar(_)       -> 0
+    EStr(_, _)     -> 0
+    EUnit          -> 0
+    EName(_)        -> 0
+    EMark(_)        -> 0
+    ESym(_, _)      -> 0
+    ELocal(_)       -> 0
+    EOp(_)          -> 0
+    EUnder         -> 0
+    EPlaceholder   -> 0
+    EHole(_)       -> 0
+    ETodo(_)       -> 0
+    EExternBody(_, _) -> 0
+    EVariantsOf(_, _) -> 0
+    EModCall(_, _) -> 0
+    EIntrinsic(_, args_) -> sum_count_tyvar_args(args_, atv, auv)
+    ESurface(sf) -> sum_count_tyvar_args(surface_children(sf), atv, auv)
+    ECall(callee, args_) -> count_tyvar_in_expr(callee, atv, auv, 0) + sum_count_tyvar_args(args_, atv, auv)
+    EField(base, _)   -> count_tyvar_in_expr(base, atv, auv, 0)
+    EIndex(a, b)      -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EBinop(_, a, b)   -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EUnop(_, x)       -> count_tyvar_in_expr(x, atv, auv, 0)
+    EIf(c, t_, eo)    -> {
+      let n0 = count_tyvar_in_expr(c, atv, auv, 0) + count_tyvar_in_expr(t_, atv, auv, 0)
+      match eo { Some(eb) -> n0 + count_tyvar_in_expr(eb, atv, auv, 0) None -> n0 }
+    }
+    EMatch(scr, arms) -> count_tyvar_in_expr(scr, atv, auv, 0) + sum_count_tyvar_arms(arms, atv, auv)
+    ELambda(_, b)     -> count_tyvar_in_expr(b, atv, auv, 0)
+    ERecordLit(_, fs) -> sum_count_tyvar_fields(fs, atv, auv)
+    EList(els)        -> sum_count_tyvar_elems(els, atv, auv)
+    ERange(a, b, opt_step) -> {
+      let n0 = count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+      match opt_step { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+    }
+    EBlock(stmts, tail) -> {
+      let n0 = sum_count_tyvar_stmts(stmts, atv, auv)
+      match tail { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+    }
+    EPipe(a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EDispatchPipe(_, a, b) -> count_tyvar_in_expr(a, atv, auv, 0) + count_tyvar_in_expr(b, atv, auv, 0)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let n0 = count_tyvar_in_expr(body, atv, auv, 0)
+      let n1 = match init_opt { Some(e3) -> n0 + count_tyvar_in_expr(e3, atv, auv, 0) None -> n0 }
+      let n2 = n1 + sum_count_tyvar_clauses(clauses, atv, auv)
+      match ret_opt {
+        Some(r) -> match r { HR(_, b, _, _) -> n2 + count_tyvar_in_expr(b, atv, auv, 0) }
+        None -> n2
+      }
+    }
+    ELitUnit(inner, _) -> count_tyvar_in_expr(inner, atv, auv, 0)
+    EBang(inner)       -> count_tyvar_in_expr(inner, atv, auv, 0)
+  }
+}
+
+fn sum_count_tyvar_args(args: [Expr], atv: [Int], auv: [Int]) : Int {
+  match args {
+    [] -> 0
+    [a, ...rest] -> count_tyvar_in_expr(a, atv, auv, 0) + sum_count_tyvar_args(rest, atv, auv)
+  }
+}
+
+fn sum_count_tyvar_arms(arms: [Arm], atv: [Int], auv: [Int]) : Int {
+  match arms {
+    [] -> 0
+    [arm, ...rest] -> match arm {
+      Arm(_, g, b) -> {
+        let ng = match g { Some(ge) -> count_tyvar_in_expr(ge, atv, auv, 0) None -> 0 }
+        ng + count_tyvar_in_expr(b, atv, auv, 0) + sum_count_tyvar_arms(rest, atv, auv)
+      }
+    }
+  }
+}
+
+fn sum_count_tyvar_fields(fs: [FieldInit], atv: [Int], auv: [Int]) : Int {
+  match fs {
+    [] -> 0
+    [f, ...rest] -> match f {
+      FI(_, v) -> count_tyvar_in_expr(v, atv, auv, 0) + sum_count_tyvar_fields(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_elems(els: [ListElem], atv: [Int], auv: [Int]) : Int {
+  match els {
+    [] -> 0
+    [el, ...rest] -> {
+      let n = match el {
+        ElPlain(x)  -> count_tyvar_in_expr(x, atv, auv, 0)
+        ElSpread(x) -> count_tyvar_in_expr(x, atv, auv, 0)
+      }
+      n + sum_count_tyvar_elems(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_stmts(stmts: [Stmt], atv: [Int], auv: [Int]) : Int {
+  match stmts {
+    [] -> 0
+    [s, ...rest] -> {
+      let n = match s {
+        SLet(_, _, rhs)             -> count_tyvar_in_expr(rhs, atv, auv, 0)
+        SAssert(c, m)               -> match m { Some(me) -> count_tyvar_in_expr(c, atv, auv, 0) + count_tyvar_in_expr(me, atv, auv, 0) None -> count_tyvar_in_expr(c, atv, auv, 0) }
+        SExprStmt(x)                -> count_tyvar_in_expr(x, atv, auv, 0)
+        SIndexAssign(b, i, v, _, _) -> count_tyvar_in_expr(b, atv, auv, 0) + count_tyvar_in_expr(i, atv, auv, 0) + count_tyvar_in_expr(v, atv, auv, 0)
+        SAssign(b, v, _, _)         -> count_tyvar_in_expr(b, atv, auv, 0) + count_tyvar_in_expr(v, atv, auv, 0)
+        SVar(_, _, rhs, _, _)       -> count_tyvar_in_expr(rhs, atv, auv, 0)
+        SUse(_, _, _)               -> 0
+      }
+      n + sum_count_tyvar_stmts(rest, atv, auv)
+    }
+  }
+}
+
+fn sum_count_tyvar_clauses(cs: [HClause], atv: [Int], auv: [Int]) : Int {
+  match cs {
+    [] -> 0
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> count_tyvar_in_expr(b, atv, auv, 0) + sum_count_tyvar_clauses(rest, atv, auv)
+    }
+  }
+}
+
+#[doc("The type and unit arguments bound so far, by type-parameter id.")]
+pub(pkg) type SubstBindings = { tvars: [SubstPairTy], uvars: [SubstPairUnit] }
+
+#[doc("`b` extended with what each formal binds against its argument's type.")]
+pub(pkg) fn extract_bindings_args(formals: [Ty], args_: [Expr],
+                          b: SubstBindings) : SubstBindings {
+  match formals {
+    [] -> b
+    [f, ...frest] -> match args_ {
+      [] -> b
+      [a, ...arest] -> match a.ty {
+        Some(at) -> extract_bindings_args(frest, arest, extract_bindings_ty(f, at, b))
+        None     -> extract_bindings_args(frest, arest, b)
+      }
+    }
+  }
+}
+
+#[doc("""
+Add the binding a RETURN-ONLY tparam gets from the call site's resolved
+return type. Only tparams absent from every parameter qualify: a tparam a
+parameter mentions is the args' job to pin, and if the arg type did not
+unify (`sum(tree)` against `list.sum[T](xs: [T]): T`) the call is not this
+generic — grounding it from the return would steal a same-named local
+fn's call site (#748 shadowing). Skips an absent or tyvar `ret_ty`
+(nothing to add) — the whole step stays additive.
+""")]
+pub(pkg) fn extract_bindings_from_ret(formal_ret: Ty, formal_pts: [Ty], ret_ty: Option[Ty], b: SubstBindings) : SubstBindings =
+  match ret_ty {
+    None    -> b
+    Some(t) -> if ty_concrete(t) {
+                 let param_ids = collect_ty_tvar_ids_list(formal_pts, [])
+                 extract_ret_only_bindings(formal_ret, t, param_ids, b)
+               } else { b }
+  }
+
+# Like extract_bindings_ty but records a binding only for a TyVarT whose id
+# is NOT mentioned in any parameter — a genuine return-only tparam.
+fn extract_ret_only_bindings(formal: Ty, actual: Ty, param_ids: [Int], b: SubstBindings) : SubstBindings {
+  match formal {
+    TyVarT(id) -> if list_has_int(param_ids, id) { b }
+                  else { SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars } }
+    TyListT(fi) -> match actual {
+      TyListT(ai) -> extract_ret_only_bindings(fi, ai, param_ids, b)
+      _ -> b
+    }
+    TyCon(_, fas) -> match actual {
+      TyCon(_, aas) -> extract_ret_only_bindings_list(fas, aas, param_ids, b)
+      _ -> b
+    }
+    _ -> b
+  }
+}
+
+fn extract_ret_only_bindings_list(fs: [Ty], a_s: [Ty], param_ids: [Int], b: SubstBindings) : SubstBindings {
+  match fs {
+    [] -> b
+    [f, ...frest] -> match a_s {
+      [] -> b
+      [a, ...arest] -> extract_ret_only_bindings_list(frest, arest, param_ids,
+                         extract_ret_only_bindings(f, a, param_ids, b))
+    }
+  }
+}
+
+# Every TyVarT id appearing anywhere in a list of formal parameter types.
+fn collect_ty_tvar_ids_list(ts: [Ty], acc: [Int]) : [Int] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_ty_tvar_ids_list(rest, collect_ty_tvar_ids(t, acc))
+  }
+}
+
+fn collect_ty_tvar_ids(t: Ty, acc: [Int]) : [Int] {
+  match t {
+    TyVarT(id)       -> if list_has_int(acc, id) { acc } else { [id, ...acc] }
+    TyListT(inner)   -> collect_ty_tvar_ids(inner, acc)
+    TyFnT(ps, r, _)  -> collect_ty_tvar_ids(r, collect_ty_tvar_ids_list(ps, acc))
+    TyCon(_, as_)    -> collect_ty_tvar_ids_list(as_, acc)
+    TyDimT(base, _)  -> collect_ty_tvar_ids(base, acc)
+    TyRefineT(base, _) -> collect_ty_tvar_ids(base, acc)
+    _ -> acc
+  }
+}
+
+fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings {
+  # A refinement on the actual side hides the shape a formal reads.
+  let a = match formal {
+    TyRefineT(_, _) -> actual
+    _               -> ty_unrefined(actual)
+  }
+  match formal {
+    TyVarT(id) -> SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars }
+    TyListT(fi) -> match a {
+      TyListT(ai) -> extract_bindings_ty(fi, ai, b)
+      _ -> b
+    }
+    TyFnT(fps, fret, _) -> match a {
+      TyFnT(aps, aret, _) -> extract_bindings_ty(fret, aret,
+                              extract_bindings_tys(fps, aps, b))
+      _ -> b
+    }
+    TyCon(_, fas) -> match a {
+      TyCon(_, aas) -> extract_bindings_tys(fas, aas, b)
+      _ -> b
+    }
+    # `s[A]` against a concrete arity-1 type binds the shape var to the
+    # constructor witness and recurses into the argument — the mono
+    # mirror of the first-order shape-app unification rule.
+    TyShapeApp(sv, fa) -> match shape_witness_of(a) {
+      Some(wit) -> extract_bindings_ty(fa, shape_arg_of(a),
+                     SubstBindings { tvars: [STP(sv, wit), ...b.tvars], uvars: b.uvars })
+      None -> b
+    }
+    TyDimT(fb, fu) -> match a {
+      TyDimT(ab, au) -> extract_bindings_unit(fu, au,
+                          extract_bindings_ty(fb, ab, b))
+      _ -> b
+    }
+    TyRefineT(fb, _) -> match a {
+      TyRefineT(ab, _) -> extract_bindings_ty(fb, ab, b)
+      _ -> extract_bindings_ty(fb, a, b)
+    }
+    _ -> b
+  }
+}
+
+fn extract_bindings_tys(fs: [Ty], a_s: [Ty], b: SubstBindings) : SubstBindings {
+  match fs {
+    [] -> b
+    [f, ...frest] -> match a_s {
+      [] -> b
+      [a, ...arest] -> extract_bindings_tys(frest, arest, extract_bindings_ty(f, a, b))
+    }
+  }
+}
+
+fn extract_bindings_unit(formal: UnitExprT, actual: UnitExprT,
+                          b: SubstBindings) : SubstBindings {
+  let f_canon = unit_canon(formal)
+  match f_canon {
+    UVar(id) -> SubstBindings { tvars: b.tvars,
+                                uvars: [SUP(id, unit_canon(actual)), ...b.uvars] }
+    _ -> b
+  }
+}
+
+#[doc("""
+Resolve each type-tparam id to its bound type. Returns None if any
+id is left unbound — the generic's formal shape did not unify with
+the call, so no instantiation should be synthesised.
+""")]
+pub(pkg) fn collect_subst_tys(ids: [Int], pairs: [SubstPairTy]) : Option[[Ty]] {
+  match ids {
+    [] -> Some([])
+    [i, ...rest] -> match subst_pairs_lookup_ty(pairs, i) {
+      Some(t) -> match collect_subst_tys(rest, pairs) {
+        Some(ts) -> Some([t, ...ts])
+        None     -> None
+      }
+      None    -> None
+    }
+  }
+}
+
+#[doc("The unit bound to each id of `ids`, in order; `UOne` for an unbound one.")]
+pub(pkg) fn collect_subst_units(ids: [Int], pairs: [SubstPairUnit]) : [UnitExprT] {
+  match ids {
+    [] -> []
+    [i, ...rest] -> match subst_pairs_lookup_unit(pairs, i) {
+      Some(u) -> [u, ...collect_subst_units(rest, pairs)]
+      None    -> [UOne, ...collect_subst_units(rest, pairs)]
+    }
   }
 }
