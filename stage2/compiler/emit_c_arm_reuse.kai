@@ -26,25 +26,21 @@ import compiler.util
 # (no incref) so the recursive consumer sees the children at their
 # actual RC, enabling spine-deep reuse instead of one-cell-only.
 fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
-  match pat.pkind {
-    PList(pats, opt_rest) -> match opt_rest {
-      Some(rest_b) -> match pats {
-        [head_pat] -> match body.kind {
-          ECall(callee, call_args) -> match callee.kind {
-            EMark(MkReuseCons) -> match call_args {
-              [_scr_arg, h_new, t_new] -> Some(ReuseConsArm(head_pat, rest_b, h_new, t_new))
-              _ -> None
-            }
-            _ -> None
-          }
-          _ -> None
-        }
-        _ -> None
-      }
-      None -> None
+  match reuse_cons_call_args(body) {
+    Some([_scr_arg, h_new, t_new]) -> match pat.pkind {
+      PList([head_pat], Some(rest_b)) -> Some(ReuseConsArm(head_pat, rest_b, h_new, t_new))
+      _ -> None
     }
     _ -> None
   }
+}
+
+fn reuse_cons_call_args(body: Expr) : Option[[Expr]] = match body.kind {
+  ECall(callee, call_args) -> match callee.kind {
+    EMark(MkReuseCons) -> Some(call_args)
+    _ -> None
+  }
+  _ -> None
 }
 
 pub(pkg) type ReuseConsArm = ReuseConsArm(Pattern, Binder, Expr, Expr)
@@ -317,36 +313,46 @@ pub(pkg) type ReuseVariantArm = ReuseVariantArm([Pattern], VariantEntry, [Expr],
 # directly, and emit_match_arm receives that tail as `body`).
 fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] {
   match pat.pkind {
-    PVariant(pr, subs) -> match body.kind {
-      ECall(scallee, sargs) -> match scallee.kind {
-        EMark(MkReuseVariant) -> match sargs {
-          [_scr_arg, ctor] -> match reuse_ctor_id(cx.ctor_ix, ctor) {
-            Some(bctor) -> match ctor.kind {
-              ECall(_cf, cargs) ->
-                if reuse_same_ctor(pr, bctor) and
-                   list_length(subs) == list_length(cargs) {
-                  match ctor_ix_row(cx.ctor_ix, bctor) {
-                    Some(row) -> match row {
-                      EV(_, tys, _, _) ->
-                        if list_length(tys) == list_length(subs) {
-                          Some(ReuseVariantArm(subs, row, cargs, tys))
-                        } else { None }
-                    }
-                    None -> None
-                  }
-                } else { None }
-              _ -> None
-            }
-            None -> None
-          }
-          _ -> None
-        }
-        _ -> None
-      }
+    PVariant(pr, subs) -> and_then(reuse_variant_site(body, cx), (site) => rv_arm_of(pr, subs, site, cx))
+    _ -> None
+  }
+}
+
+type RvSite = RvSite(SymId, [Expr])
+
+fn rv_sentinel_ctor(body: Expr) : Option[Expr] = match body.kind {
+  ECall(scallee, sargs) -> match scallee.kind {
+    EMark(MkReuseVariant) -> match sargs {
+      [_scr_arg, ctor] -> Some(ctor)
       _ -> None
     }
     _ -> None
   }
+  _ -> None
+}
+
+fn reuse_variant_site(body: Expr, cx: EmitCtx) : Option[RvSite] = match rv_sentinel_ctor(body) {
+  Some(ctor) -> match reuse_ctor_id(cx.ctor_ix, ctor) {
+    Some(bctor) -> match ctor.kind {
+      ECall(_cf, cargs) -> Some(RvSite(bctor, cargs))
+      _ -> None
+    }
+    None -> None
+  }
+  None -> None
+}
+
+fn rv_arm_of(pr: DeclRef, subs: [Pattern], site: RvSite, cx: EmitCtx) : Option[ReuseVariantArm] = match site {
+  RvSite(bctor, cargs) ->
+    if reuse_same_ctor(pr, bctor) and list_length(subs) == list_length(cargs) {
+      match ctor_ix_row(cx.ctor_ix, bctor) {
+        Some(row) -> match row {
+          EV(_, tys, _, _) ->
+            if list_length(tys) == list_length(subs) { Some(ReuseVariantArm(subs, row, cargs, tys)) } else { None }
+        }
+        None -> None
+      }
+    } else { None }
 }
 
 # True iff every binder bound by the arm pattern is used EXACTLY ONCE
@@ -530,30 +536,20 @@ pub(pkg) fn rv_old_slot_drops(subs: [Pattern], tys: [Int], i: Int) : String = ma
 pub(pkg) fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
   if cx.in_region { "" }
   else { match pat.pkind {
-    PVariant(pr, subs) -> match body.kind {
-      ECall(scallee, sargs) -> match scallee.kind {
-        EMark(MkReuseVariant) -> match sargs {
-          [_scr_arg, ctor] -> match reuse_ctor_id(cx.ctor_ix, ctor) {
-            Some(bctor) -> match ctor.kind {
-              ECall(_cf, cargs) -> match pat_ctor_row(cx, pr) {
-                Some(EV(_, ptys, _, _)) ->
-                  if reuse_fire_iff_unique(bctor, ptys, cx) {
-                    reuse_kept_drops(subs, cargs, ptys, 0, cx)
-                  } else { "" }
-                None -> ""
-              }
-              _ -> ""
-            }
-            None -> ""
-          }
-          _ -> ""
-        }
-        _ -> ""
-      }
-      _ -> ""
+    PVariant(pr, subs) -> match reuse_variant_site(body, cx) {
+      Some(site) -> reuse_kept_pay_site(pr, subs, site, cx)
+      None -> ""
     }
     _ -> ""
   } }
+
+fn reuse_kept_pay_site(pr: DeclRef, subs: [Pattern], site: RvSite, cx: EmitCtx) : String = match site {
+  RvSite(bctor, cargs) -> match pat_ctor_row(cx, pr) {
+    Some(EV(_, ptys, _, _)) ->
+      if reuse_fire_iff_unique(bctor, ptys, cx) { reuse_kept_drops(subs, cargs, ptys, 0, cx) } else { "" }
+    None -> ""
+  }
+}
 
 # True iff the emitted rebuild's runtime reuse fires EXACTLY when the donor
 # is unique, making `kai_check_unique` the complete fire predicate. The

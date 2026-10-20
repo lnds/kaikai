@@ -1,4 +1,4 @@
-# Mangling of private-segment types in core declarations.
+# Declaration rewrites ahead of emission: operator and index desugaring, and mangling of private-segment types in core declarations.
 
 import compiler.ast
 import compiler.emit_shared
@@ -627,3 +627,164 @@ fn mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : String {
     mangle_unit_ident_loop(s, i + 1, n, [piece, ...acc])
   }
 }
+
+pub(pkg) fn desugar_op_calls_decls(ds: [Decl], effs: [SymId]) : [Decl] =
+  map(ds, (d) => desugar_op_calls_decl(d, effs))
+
+fn desugar_op_calls_decl(d: Decl, effs: [SymId]) : Decl {
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c, mo)
+    DTest(desc, body, l, c, mo) ->
+      DTest(desc, desugar_op_calls_expr(body, effs), l, c, mo)
+    DBench(desc, body, l, c, mo) ->
+      DBench(desc, desugar_op_calls_expr(body, effs), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) ->
+      DCheck(desc, params, desugar_op_calls_expr(body, effs), l, c, mo)
+    _ -> d
+  }
+}
+
+fn desugar_op_calls_expr(e: Expr, effs: [SymId]) : Expr =
+  Expr { kind: desugar_op_calls_kind(e.kind, effs),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn desugar_op_calls_callee(callee: Expr, effs: [SymId]) : Expr {
+  match callee.kind {
+    EField(base, op_name) -> match base.kind {
+      ESym(s, _) ->
+        if any(effs, (e) => sym_same(e, s)) {
+          mk_expr(EOp(OpRef { eff: s, op: written(op_name), via: ViaAmbient }), callee.line, callee.col)
+        } else { desugar_op_calls_expr(callee, effs) }
+      _ -> desugar_op_calls_expr(callee, effs)
+    }
+    _ -> desugar_op_calls_expr(callee, effs)
+  }
+}
+
+fn desugar_op_calls_kind(k: ExprKind, effs: [SymId]) : ExprKind {
+  match k {
+    # The only kind that needs special handling: a callee still spelled
+    # `Eff.op` on an effect's own id becomes the ambient perform of
+    # that operation. Everything else recurses via the shared visitor.
+    ECall(callee, args_) ->
+      ECall(desugar_op_calls_callee(callee, effs),
+            map(args_, (a) => desugar_op_calls_expr(a, effs)))
+    _ -> map_expr_kind(k, (sub) => desugar_op_calls_expr(sub, effs))
+  }
+}
+
+# Pre-typer recursion over `EIndex` and `SIndexAssign`. The pass no
+# longer rewrites either form (issue #128 moved the dispatch to the
+# typer so `Map[K, V]` and `Array[T]` can pick different lowerings).
+# What the pass *does* do is walk every body so any sugar layered
+# above this one — `EBlock` rewrites, var-cell desugar — sees the
+# stmts in their original shape; an unmodified visitor would miss
+# the `SIndexAssign` arm because it survives the typer too.
+
+# Pre-typer recursion over `EIndex` and `SIndexAssign`. The pass no
+# longer rewrites either form (issue #128 moved the dispatch to the
+# typer so `Map[K, V]` and `Array[T]` can pick different lowerings).
+# What the pass *does* do is walk every body so any sugar layered
+# above this one — `EBlock` rewrites, var-cell desugar — sees the
+# stmts in their original shape; an unmodified visitor would miss
+# the `SIndexAssign` arm because it survives the typer too.
+#[doc("Pre-typer recursion over `EIndex` and `SIndexAssign`. The pass no longer rewrites either form (issue #128 moved the dispatch to the typer so `Map[K, V]` and `Array[T]` can pick…")]
+pub fn desugar_index_decls(ds: [Decl]) : [Decl] = map(ds, desugar_index_decl)
+
+fn desugar_index_decl(d: Decl) : Decl {
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row, desugar_index_expr(body), l, c, mo)
+    DTest(desc, body, l, c, mo) -> DTest(desc, desugar_index_expr(body), l, c, mo)
+    DBench(desc, body, l, c, mo) -> DBench(desc, desugar_index_expr(body), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, desugar_index_expr(body), l, c, mo)
+    _ -> d
+  }
+}
+
+fn desugar_index_expr(e: Expr) : Expr =
+  Expr { kind: desugar_index_kind(e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn desugar_index_opt(opt: Option[Expr]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(desugar_index_expr(e))
+    None    -> None
+  }
+}
+
+fn desugar_index_stmts(ss: [Stmt]) : [Stmt] = map(ss, desugar_index_stmt)
+
+fn desugar_index_stmt(s: Stmt) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_index_expr(rhs))
+    SAssert(c, m) -> SAssert(desugar_index_expr(c), desugar_index_opt(m))
+    SExprStmt(x) -> SExprStmt(desugar_index_expr(x))
+    # issue #128: SIndexAssign now flows through to the typer, which
+    # dispatches on the container's inferred type (Array → array_set
+    # call; Map → typed error). Sub-exprs still recurse so any nested
+    # sugars below this layer are picked up.
+    SIndexAssign(b, i, v, line, col) ->
+      SIndexAssign(desugar_index_expr(b), desugar_index_expr(i),
+                   desugar_index_expr(v), line, col)
+    SAssign(b, v, line, col) ->
+      SAssign(desugar_index_expr(b), desugar_index_expr(v), line, col)
+    # m7b #5: pass through; the var-desugar pass below transforms SVar
+    # into a `handle ... with State[T](init)` form. Until that pass runs
+    # we still need to recurse into `init` so any nested `a[i]` inside
+    # the initialiser is rewritten.
+    SVar(n, ty, rhs, l, c) -> SVar(n, ty, desugar_index_expr(rhs), l, c)
+    # m7e §25: SUse pass through.
+    SUse(n, l, c) -> SUse(n, l, c)
+  }
+}
+
+fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
+  match k {
+    # issue #128: EIndex now flows through to the typer, which
+    # dispatches by the container's inferred type (Array → array_get
+    # call; Map → map_get call returning Option[V]). The pass still
+    # walks sub-expressions because EBlock stmt-bodies carry the
+    # SIndexAssign variant we now also leave intact.
+    EBlock(stmts, tail) -> EBlock(desugar_index_stmts(stmts),
+                                   desugar_index_opt(tail))
+    _ -> map_expr_kind(k, desugar_index_expr)
+  }
+}
+
+# Separate compilation (issue #748): per-module .h/.c emission.
+#
+# `emit_program` (below) is the single-translation-unit path — the
+# default, and the ONLY path the bootstrap / selfhost chain exercises,
+# so it stays byte-identical. `emit_program_modular` is the additive
+# opt-in path used by `kai build` on USER programs (driver flag
+# `--emit=c-modular`). It reuses every section emitter unchanged but
+# PARTITIONS `decls` by module-origin (`mo`) and emits, per module, a
+# `.c` translation unit; plus a per-TU pair of header slices every `.c`
+# includes:
+#
+#   kai_types_<stem>.h — `#include "runtime.h"` + the struct/typedef/
+#                        effect-env definitions the TU references.
+#   kai_decls_<stem>.h — the function/thunk/lambda/clause prototypes the
+#                        TU references, over the whole program, so any
+#                        cross-module call resolves at compile time.
+#
+# The slices are projections of the whole-program header text, computed
+# in `emit_slices` by identifier reference, so a declaration added in
+# one module re-keys only the TUs that reference it — the lever that
+# lets the wrapper's per-.o cache survive type/fn additions.
+#
+# Each `<mod>.c` carries only ITS module's fn bodies (mo-filtered).
+# Lambdas, clause bodies, tests, benches, checks and the `main`
+# wrapper all land in the root TU (`__root__.c`): LamInfo/ClauseInfo
+# carry no `mo` (collect_decls flattens away the parent decl's origin),
+# so routing them to root is the link-safe choice (no duplicate symbol,
+# no missing definition). Sealing the real parent-mo into LamInfo /
+# ClauseInfo is a follow-up with its own fixture.
+#
+# Output is one String with file markers the `bin/kai` wrapper splits:
+#   //KAIDELIM:<nonce>        (line 1 — declares the marker nonce)
+#   //KAIFILE:<nonce>::<name> (column 0 — starts file <name>)
+# The nonce is derived per compile from the program text length so the
+# marker cannot collide with emitted C by construction.
