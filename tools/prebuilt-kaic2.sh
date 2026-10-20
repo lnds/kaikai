@@ -9,6 +9,8 @@
 #                                            when missing; local commits on top are rebuilt by
 #                                            `make kaic2-fast` (C backend only)
 #   tools/prebuilt-kaic2.sh has [<ref>]      exit 0 iff a build of <ref> is stored
+#   tools/prebuilt-kaic2.sh path [<ref>]     print the stored build's root, building it first when
+#                                            missing; <root>/bin/kai runs on its own
 #
 # Store: $KAI_PREBUILT_STORE, else ${XDG_CACHE_HOME:-~/.cache}/kaikai-prebuilt; the newest
 # $KAI_PREBUILT_KEEP (default 3) builds are kept.
@@ -24,6 +26,9 @@ FILES=(
   bin/kai
 )
 
+# The tracked files bin/kai resolves its dev layout against.
+STANDALONE=(stage0 stage2/runtime.h stdlib tools/kai/plugins VERSION EDITION)
+
 die() { echo "prebuilt-kaic2: $*" >&2; exit 2; }
 sha_of() { git -C "$REPO" rev-parse --verify "${1:-origin/main}^{commit}"; }
 stored() { ls -1td "$STORE"/*/ 2>/dev/null | grep -vE '/(tree|lock)/$|\.tmp/$' || true; }
@@ -35,6 +40,13 @@ copy_files() { # from-root to-root
     mkdir -p "$2/$(dirname "$f")"
     cp -p "$1/$f" "$2/$f"
   done
+}
+
+# A stored root is a dev layout of its commit: bin/kai finds stage0/, stdlib/ and stage2/kaic2
+# beside it. Idempotent, so a build stored before the layout existed is completed in place.
+complete_layout() { # sha
+  [ -d "$STORE/$1/stdlib" ] && return 0
+  git -C "$REPO" archive "$1" "${STANDALONE[@]}" | tar -x -C "$STORE/$1"
 }
 
 # Copies land with arbitrary mtimes relative to the checkout: touch the chain
@@ -75,7 +87,7 @@ cmd_build() {
 
 build_locked() {
   local sha="$1" tree out env=() native=0 line
-  [ -x "$STORE/$sha/stage2/kaic2" ] && { echo "prebuilt-kaic2: $sha already stored"; return 0; }
+  [ -x "$STORE/$sha/stage2/kaic2" ] && { complete_layout "$sha"; echo "prebuilt-kaic2: $sha already stored"; return 0; }
   if out="$(llvm_env)"; then
     native=1
     while IFS= read -r line; do [ -n "$line" ] && env+=("$line"); done <<<"$out"
@@ -92,6 +104,7 @@ build_locked() {
   (cd "$tree" && env ${env[@]+"${env[@]}"} make KAI_LLVM=$native kaic2 bin/kai) >"$STORE/build-$sha.log" 2>&1 \
     || die "build of $sha failed; see $STORE/build-$sha.log"
   copy_files "$tree" "$STORE/$sha.tmp"
+  git -C "$REPO" archive "$sha" "${STANDALONE[@]}" | tar -x -C "$STORE/$sha.tmp"
   mv "$STORE/$sha.tmp" "$STORE/$sha"
   stored | tail -n +$((KEEP + 1)) | while IFS= read -r d; do rm -rf "$d"; done
   rm -f "$STORE/build-$sha.log"
@@ -119,6 +132,9 @@ cmd_seed() {
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
   seed)  shift; cmd_seed "$@" ;;
+  path)  shift; sha="$(sha_of "${1:-origin/main}")"
+         [ -x "$STORE/$sha/stage2/kaic2" ] || cmd_build "$sha" >&2
+         complete_layout "$sha"; echo "$STORE/$sha" ;;
   has)   shift; [ -x "$STORE/$(sha_of "${1:-origin/main}")/stage2/kaic2" ] ;;
-  *) sed -n '2,14p' "$0"; exit 2 ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
 esac
