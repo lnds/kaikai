@@ -1,0 +1,70 @@
+#[doc("Typing of `lhs ?? rhs`: an Option on the left, the right side a lazy branch of a match.")]
+
+import compiler.diag
+import compiler.ast
+import compiler.ast_ids
+import compiler.ast_build
+import compiler.infer_state
+import compiler.infer_forms
+import compiler.infer_apply
+import compiler.util
+import compiler.infer_dump_text
+import compiler.infer_handle_walk
+import compiler.infer_call_labels
+import compiler.infer_instantiate
+
+fn coalesce_error(st: InferState, lhs_typed: Expr, msg: String, note: String, help: String, line: Int, col: Int) : Inferred / Console + File {
+  let perr = mk_diag(SevError, st.file, line, col, msg, [])
+  render_diag(perr)
+  diag_note(note)
+  diag_help(help)
+  mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, with_ty(lhs_typed, TyAny))
+}
+
+fn coalesce_bad_left(st: InferState, lhs_typed: Expr, found: Ty, is_result: Bool, line: Int, col: Int) : Inferred / Console + File {
+  let note = "left side type: #{inf_ty_to_string(st.env.tab, found)}"
+  if is_result {
+    coalesce_error(st, lhs_typed, "`??` takes an `Option` on its left, not a `Result`", note,
+      "drop the error explicitly first: `ok(r) ?? default`", line, col)
+  } else {
+    coalesce_error(st, lhs_typed, "`??` takes an `Option` on its left", note,
+      "`??` unwraps an `Option[T]` or falls back to a default of type `T`", line, col)
+  }
+}
+
+fn coalesce_finish(st: InferState, lhs_typed: Expr, lt: Ty, t: Ty, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let v = concat_all(["__coalesce_", int_to_string(line), "_", int_to_string(col), "__"])
+  let outer = st
+  let b = binder_minted(v)
+  let some_pat = mk_pat(PVariant(ref_written("Some"), [mk_pat(PBind(b), line, col)]), line, col)
+  let pc = check_pattern_stamped(st, some_pat, lt)
+  let rv = w_synth(pc.st, mk_local(b.id, line, col))
+  let s1 = st_restore_entries(outer, rv.st)
+  let pw = check_pattern_stamped(s1, mk_pat(PWild, line, col), lt)
+  let rr = w_check_body(pw.st, rhs, t, "the right side of `??`", rhs.line, rhs.col)
+  let s2 = st_unify(rr.st, t, rr.ty, "the right side of `??`", rhs.line, rhs.col)
+  let ty = apply_ty(s2.sub, t)
+  let arms = [Arm(pc.pat, None, rv.expr), Arm(pw.pat, None, rr.expr)]
+  mk_inferred(s2, ty, with_ty(mk_expr(EMatch(lhs_typed, arms), line, col), ty))
+}
+
+#[doc("Types `lhs ?? rhs` as a match on `lhs` whose `None` branch is `rhs`, so its effects join the enclosing row.")]
+pub fn synth_coalesce(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let rl = w_synth(st, lhs)
+  let lt = apply_ty(rl.st.sub, rl.ty)
+  let typed = with_ty(rl.expr, lt)
+  match lt {
+    TyCon(tcs, args_) -> match args_ {
+      [t] -> if core_ty_is(tcs, CtOption) { coalesce_finish(rl.st, typed, lt, t, rhs, line, col) }
+             else { coalesce_bad_left(rl.st, typed, lt, false, line, col) }
+      _ -> coalesce_bad_left(rl.st, typed, lt, core_ty_is(tcs, CtResult), line, col)
+    }
+    TyVarT(_) -> {
+      let fresh = st_fresh_ty(rl.st)
+      let opt = core_ty_con(CtOption, [fresh.ty])
+      let s1 = st_unify(fresh.st, opt, lt, "the left side of `??`", line, col)
+      coalesce_finish(s1, typed, apply_ty(s1.sub, opt), fresh.ty, rhs, line, col)
+    }
+    _ -> coalesce_bad_left(rl.st, typed, lt, false, line, col)
+  }
+}

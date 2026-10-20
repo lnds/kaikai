@@ -375,6 +375,11 @@ fn main() : Unit / Stdout = match find_pos([3, 7, 9], 7) {
 }
 ```
 
+A default for an `Option` is the infix `??`: `find_pos(xs, 7) ?? 0`.
+The right side runs only on `None`, so `o ?? compute()` is lazy and
+`o ?? f()!` propagates from the enclosing function. Prefer it to
+`unwrap_or` / `unwrap_or_else`.
+
 ## Short body vs block body
 
 Use the `=` short body when a function is a single expression; use a
