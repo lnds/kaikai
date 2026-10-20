@@ -226,42 +226,42 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 has "$direct" 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-# A UFCS callee carries the id of the declaration the receiver's type
+# A pipe callee carries the id of the declaration the receiver's type
 # picked, cold and warm: an imported fn, one chained on another, a private
 # fn called inside its own module, and a root fn. A local binder spelled
 # like the root fn keeps its own reference, so the root id appears once.
-UFCSFIX="$ROOT/examples/namespace-collisions/ufcs_callee_identity"
-ufcs_lines() {
+PIPEFIX="$ROOT/examples/namespace-collisions/pipe_callee_identity"
+pipe_lines() {
   "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$CACHE" \
     --core-cache-dir "$CACHE" --dump-symids \
-    --path "$UFCSFIX" --path "$ROOT/stdlib" "$UFCSFIX/main.kai" | grep -E '^perceus (main|twice) (bump|twice|scale)#'
+    --path "$PIPEFIX" --path "$ROOT/stdlib" "$PIPEFIX/main.kai" | grep -E '^perceus (main|twice) (bump|twice|scale)#'
 }
 for pass in cold warm; do
-  out=$(ufcs_lines)
+  out=$(pipe_lines)
   [ "$(printf '%s\n' "$out" | grep -cE '^perceus twice bump#[0-9]+ bump@ma$')" = 2 ] \
-    || fail "$pass: a private fn called by UFCS in its own module lost its id"
+    || fail "$pass: a private fn called by a pipe in its own module lost its id"
   [ "$(printf '%s\n' "$out" | grep -cE '^perceus main twice#[0-9]+ twice@ma$')" = 3 ] \
-    || fail "$pass: an imported or chained UFCS callee lost its id"
+    || fail "$pass: an imported or chained pipe callee lost its id"
   [ "$(printf '%s\n' "$out" | grep -cE '^perceus main twice#[0-9]+ twice@main$')" = 1 ] \
     || fail "$pass: a root fn spelled like an imported one lost its id"
   [ "$(printf '%s\n' "$out" | grep -cE '^perceus main scale#[0-9]+ scale@main$')" = 1 ] \
     || fail "$pass: the root fn and the local binder that shadows it do not resolve apart"
 done
 
-# A root fn spelled like a stdlib export and the export itself: each UFCS
+# A root fn spelled like a stdlib export and the export itself: each pipe
 # callee carries the id of the one its receiver's type picked.
-VSFIX="$ROOT/examples/namespace-collisions/ufcs_callee_vs_stdlib"
+VSFIX="$ROOT/examples/namespace-collisions/pipe_callee_vs_stdlib"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$ROOT/stdlib" "$VSFIX/main.kai")
 need '^perceus main reverse#[0-9]+ reverse@main$'
 need '^perceus main reverse#[0-9]+ reverse@list$'
 
-# A UFCS callee carries the id of the declaration its receiver's type
+# A pipe callee carries the id of the declaration its receiver's type
 # picked whether or not another module declares the name, so `ma`'s cached
 # typed blob serves a program where the pick is uncontested and one where
 # it is contested, in either order. Both programs carry byte-identical
 # copies of `ma` and `mc`.
-CUT="$ROOT/examples/ufcs/contest_cut"
+CUT="$ROOT/examples/namespace-collisions/pipe_callee_contest_cut"
 CUTCACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE"' EXIT
 cut_ids() {
@@ -272,7 +272,7 @@ cut_ids() {
 for step in two one two one; do
   got=$(cut_ids --path "$CUT/$step" "$CUT/$step/main.kai")
   out="step $step: $got id line(s), want 1"
-  [ "$got" = 1 ] || fail "a UFCS callee lost its id across programs sharing a cached typed blob"
+  [ "$got" = 1 ] || fail "a pipe callee lost its id across programs sharing a cached typed blob"
 done
 
 # A constructor's home is its identity: an arm tests, and a construction
@@ -448,4 +448,4 @@ out=$(printf 'cold:\n%s\nwarm:\n%s\n' "$stamp_cold" "$stamp_warm")
 has "$stamp_cold$stamp_warm" '^unstamped' && fail "a contested type reaches the late passes without its declaration's id"
 [ "$stamp_cold" = "$stamp_warm" ] || fail "a warm build stamps written types differently from a cold one"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, a specialised callee is always its spec's id, and every cell perform names the core State or Reader, and every written type name the late passes read carries its declaration's id, cold and warm"
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a pipe callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, a specialised callee is always its spec's id, and every cell perform names the core State or Reader, and every written type name the late passes read carries its declaration's id, cold and warm"
