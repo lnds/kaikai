@@ -6,12 +6,14 @@ import compiler.ast
 import compiler.ast_decl
 import compiler.ast_decl
 import compiler.diag_file
-import compiler.desugar
 import compiler.desugar_brand
 import compiler.brand_transp
 import compiler.written
 import compiler.symtab
 import compiler.desugar_rename
+import compiler.util
+import compiler.diag
+import compiler.desugar_cell_access
 
 # Top-level entry. Walks every Decl body and returns the rewritten
 # program plus the brand registry collected during the walk.
@@ -393,4 +395,423 @@ fn check_brand_elems(els: [ListElem], env: BrandEnv, file: String,
       check_brand_elems(rest, env, file, calls, brs, e1)
     }
   }
+}
+
+#[doc("`e` with each call on a nursery capability of `s` rewritten to the operation it performs.")]
+fn rewrite_nursery_caps_expr(e: Expr, s: NCapStack, file: String,
+                               bw: BrandWalk) : NurseryRwExpr {
+  let r = rewrite_nursery_caps_kind(e.kind, s, file, bw, e.line, e.col)
+  NurseryRwExpr { expr: Expr { kind: r.kind, line: e.line, col: e.col,
+                                ty: e.ty, mode: e.mode,  site: e.site },
+                   bw: r.bw }
+}
+
+# Rewrite an expression kind. The cap rewrite proper handles three
+# cases: (1) a `nursery` call with a 1-arg trailing lambda (mints a
+# brand and recurses with cap pushed), (2) a `EField(EName(n), op)`
+# whose `n` matches an active cap and `op` is a Spawn primitive
+# (rewrites to `Spawn.op` on the core effect), and (3) every other
+# kind, which recurses structurally.
+fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
+                               bw: BrandWalk, line: Int, col: Int) : NurseryRwKind {
+  match k {
+    ECall(callee, args_) -> rewrite_nursery_caps_call(callee, args_, s, file, bw, line, col)
+    # A bare `n.op` on an active capability: the typer rejects a bare
+    # effect op at its use site, and the rewrite keeps that diagnostic
+    # on the same surface as a call's.
+    EField(base, op_name) -> match nursery_cap_brand(base, op_name, s) {
+      Some(_) -> NurseryRwKind { kind: EField(spawn_ref(base.line, base.col), op_name), bw: bw }
+      None    -> {
+        let br = rewrite_nursery_caps_expr(base, s, file, bw)
+        NurseryRwKind { kind: EField(br.expr, op_name), bw: br.bw }
+      }
+    }
+    ELambda(ps, body) -> {
+      # Lambda params shadow outer caps with the same name.
+      let pnames = map(ps, (p) => written_text(p.binder.name))
+      let s1 = ncs_remove_all(s, pnames)
+      let r = rewrite_nursery_caps_expr(body, s1, file, bw)
+      NurseryRwKind { kind: ELambda(ps, r.expr), bw: r.bw }
+    }
+    EBlock(stmts, tail) -> {
+      let sr = rewrite_nursery_caps_stmts(stmts, s, file, bw, [])
+      let tr = rewrite_nursery_caps_opt(tail, sr.s, file, sr.bw)
+      NurseryRwKind { kind: EBlock(sr.stmts, tr.expr), bw: tr.bw }
+    }
+    EMatch(scr, arms) -> {
+      let sr = rewrite_nursery_caps_expr(scr, s, file, bw)
+      let ar = rewrite_nursery_caps_arms(arms, s, file, sr.bw, [])
+      NurseryRwKind { kind: EMatch(sr.expr, ar.arms), bw: ar.bw }
+    }
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let br = rewrite_nursery_caps_expr(body, s, file, bw)
+      let ir = rewrite_nursery_caps_opt(init_opt, s, file, br.bw)
+      let cr = rewrite_nursery_caps_clauses(clauses, s, file, ir.bw, [])
+      let rr = rewrite_nursery_caps_opt_return(ret_opt, s, file, cr.bw)
+      NurseryRwKind { kind: EHandle(br.expr, eff, eff_tyargs,
+                                      ir.expr, alias_opt, cr.clauses, rr.ret),
+                       bw: rr.bw }
+    }
+    # All other composites: fold sub-expressions through dsg_map_expr_kind
+    # by hand — but we need to thread `bw`. The simplest path is to
+    # emulate dsg_map_expr_kind here for composites that may carry sub-
+    # exprs. We handle them explicitly to keep the brand counter
+    # threaded.
+    EIf(c, t_, eo) -> {
+      let cr = rewrite_nursery_caps_expr(c, s, file, bw)
+      let tr = rewrite_nursery_caps_expr(t_, s, file, cr.bw)
+      let er = rewrite_nursery_caps_opt(eo, s, file, tr.bw)
+      NurseryRwKind { kind: EIf(cr.expr, tr.expr, er.expr), bw: er.bw }
+    }
+    EBinop(op, a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EBinop(op, ar.expr, br.expr), bw: br.bw }
+    }
+    EUnop(op, x) -> {
+      let r = rewrite_nursery_caps_expr(x, s, file, bw)
+      NurseryRwKind { kind: EUnop(op, r.expr), bw: r.bw }
+    }
+    EIndex(a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EIndex(ar.expr, br.expr), bw: br.bw }
+    }
+    EPipe(a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EPipe(ar.expr, br.expr), bw: br.bw }
+    }
+    EDispatchPipe(op, a, b) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      NurseryRwKind { kind: EDispatchPipe(op, ar.expr, br.expr), bw: br.bw }
+    }
+    ERecordLit(rh, fs) -> {
+      let r = rewrite_nursery_caps_fields(fs, s, file, bw, [])
+      NurseryRwKind { kind: ERecordLit(rh, r.fields), bw: r.bw }
+    }
+    EList(els) -> {
+      let r = rewrite_nursery_caps_elems(els, s, file, bw, [])
+      NurseryRwKind { kind: EList(r.elems), bw: r.bw }
+    }
+    ERange(a, b, opt_step) -> {
+      let ar = rewrite_nursery_caps_expr(a, s, file, bw)
+      let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
+      let stepr = rewrite_nursery_caps_opt(opt_step, s, file, br.bw)
+      NurseryRwKind { kind: ERange(ar.expr, br.expr, stepr.expr), bw: stepr.bw }
+    }
+    ELitUnit(inner, u) -> {
+      let r = rewrite_nursery_caps_expr(inner, s, file, bw)
+      NurseryRwKind { kind: ELitUnit(r.expr, u), bw: r.bw }
+    }
+    EBang(inner) -> {
+      let r = rewrite_nursery_caps_expr(inner, s, file, bw)
+      NurseryRwKind { kind: EBang(r.expr), bw: r.bw }
+    }
+    # Leaves and forms with no sub-Exprs.
+    _ -> NurseryRwKind { kind: k, bw: bw }
+  }
+}
+
+# Three shapes: `nursery { n -> body }`, the scope that binds a
+# capability; `n.<op>(args)` on an active capability, whose callee is
+# rewritten and whose site is recorded so the brand check can attribute
+# the call to its scope; and any other call, which recurses.
+fn rewrite_nursery_caps_call(callee: Expr, args_: [Expr], s: NCapStack, file: String, bw: BrandWalk,
+                             line: Int, col: Int) : NurseryRwKind = match callee.kind {
+  EName(callee_name) ->
+    if written_text(callee_name) == "nursery" { rewrite_nursery_call(callee, args_, s, file, bw, line, col) }
+    else { rewrite_nursery_plain_call(callee, args_, s, file, bw) }
+  EField(base, op_name) -> match nursery_cap_brand(base, op_name, s) {
+    Some(bid) -> {
+      let bw1 = bw_record_call(bw, file, line, col, bid, op_name)
+      let ar = rewrite_nursery_caps_exprs(args_, s, file, bw1, [])
+      let new_callee = mk_expr(EField(spawn_ref(base.line, base.col), op_name), callee.line, callee.col)
+      NurseryRwKind { kind: ECall(new_callee, ar.exprs), bw: ar.bw }
+    }
+    None -> rewrite_nursery_plain_call(callee, args_, s, file, bw)
+  }
+  _ -> rewrite_nursery_plain_call(callee, args_, s, file, bw)
+}
+
+fn rewrite_nursery_plain_call(callee: Expr, args_: [Expr], s: NCapStack, file: String,
+                              bw: BrandWalk) : NurseryRwKind = {
+  let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
+  let ar = rewrite_nursery_caps_exprs(args_, s, file, cr.bw, [])
+  NurseryRwKind { kind: ECall(cr.expr, ar.exprs), bw: ar.bw }
+}
+
+# The brand of the active capability `base` names, when `op_name` is one
+# of its operations.
+fn nursery_cap_brand(base: Expr, op_name: String, s: NCapStack) : Option[Int] = match base.kind {
+  EName(name) -> if is_nursery_cap_op(op_name) { ncs_lookup(s, written_text(name)) } else { None }
+  _           -> None
+}
+
+fn rewrite_nursery_caps_exprs(es: [Expr], s: NCapStack, file: String,
+                                bw: BrandWalk, acc: [Expr]) : NurseryRwExprs {
+  match es {
+    [] -> NurseryRwExprs { exprs: list_reverse(acc), bw: bw }
+    [h, ...rest] -> {
+      let r = rewrite_nursery_caps_expr(h, s, file, bw)
+      rewrite_nursery_caps_exprs(rest, s, file, r.bw, [r.expr, ...acc])
+    }
+  }
+}
+
+fn rewrite_nursery_caps_opt(opt: Option[Expr], s: NCapStack, file: String,
+                              bw: BrandWalk) : NurseryRwOpt {
+  match opt {
+    None -> NurseryRwOpt { expr: None, bw: bw }
+    Some(e) -> {
+      let r = rewrite_nursery_caps_expr(e, s, file, bw)
+      NurseryRwOpt { expr: Some(r.expr), bw: r.bw }
+    }
+  }
+}
+
+# Statement-list walk. Tracks SLet / SVar bindings to drop them from
+# the cap stack so a re-bind of `n` inside the body shadows.
+fn rewrite_nursery_caps_stmts(ss: [Stmt], s: NCapStack, file: String,
+                                bw: BrandWalk, acc: [Stmt]) : NurseryRwStmts {
+  match ss {
+    [] -> NurseryRwStmts { stmts: list_reverse(acc), s: s, bw: bw }
+    [stmt, ...rest] -> match stmt {
+      SLet(pat, ann, rhs) -> {
+        let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
+        let s1 = ncs_remove_all(s, dsg_pat_bindings(pat, []))
+        rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SLet(pat, ann, r.expr), ...acc])
+      }
+      SVar(n, ty, rhs, l, c) -> {
+        let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
+        let s1 = ncs_remove(s, written_text(n.name))
+        rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SVar(n, ty, r.expr, l, c), ...acc])
+      }
+      SAssert(c, m) -> {
+        let cr = rewrite_nursery_caps_expr(c, s, file, bw)
+        let mr = rewrite_nursery_caps_opt(m, s, file, cr.bw)
+        rewrite_nursery_caps_stmts(rest, s, file, mr.bw, [SAssert(cr.expr, mr.expr), ...acc])
+      }
+      SExprStmt(x) -> {
+        let r = rewrite_nursery_caps_expr(x, s, file, bw)
+        rewrite_nursery_caps_stmts(rest, s, file, r.bw, [SExprStmt(r.expr), ...acc])
+      }
+      SIndexAssign(b, i, v, l, c) -> {
+        let br = rewrite_nursery_caps_expr(b, s, file, bw)
+        let ir = rewrite_nursery_caps_expr(i, s, file, br.bw)
+        let vr = rewrite_nursery_caps_expr(v, s, file, ir.bw)
+        rewrite_nursery_caps_stmts(rest, s, file, vr.bw,
+          [SIndexAssign(br.expr, ir.expr, vr.expr, l, c), ...acc])
+      }
+      SAssign(b, v, l, c) -> {
+        let br = rewrite_nursery_caps_expr(b, s, file, bw)
+        let vr = rewrite_nursery_caps_expr(v, s, file, br.bw)
+        rewrite_nursery_caps_stmts(rest, s, file, vr.bw,
+          [SAssign(br.expr, vr.expr, l, c), ...acc])
+      }
+      SUse(n, l, c) ->
+        rewrite_nursery_caps_stmts(rest, s, file, bw, [SUse(n, l, c), ...acc])
+    }
+  }
+}
+
+fn rewrite_nursery_caps_arms(arms: [Arm], s: NCapStack, file: String,
+                               bw: BrandWalk, acc: [Arm]) : NurseryRwArms {
+  match arms {
+    [] -> NurseryRwArms { arms: list_reverse(acc), bw: bw }
+    [a, ...rest] -> match a {
+      Arm(p, g, b) -> {
+        let s1 = ncs_remove_all(s, dsg_pat_bindings(p, []))
+        let gr = rewrite_nursery_caps_opt(g, s1, file, bw)
+        let br = rewrite_nursery_caps_expr(b, s1, file, gr.bw)
+        rewrite_nursery_caps_arms(rest, s, file, br.bw, [Arm(p, gr.expr, br.expr), ...acc])
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_clauses(cs: [HClause], s: NCapStack, file: String,
+                                  bw: BrandWalk, acc: [HClause]) : NurseryRwClauses {
+  match cs {
+    [] -> NurseryRwClauses { clauses: list_reverse(acc), bw: bw }
+    [c, ...rest] -> match c {
+      HC(n, ps, b, l, co) -> {
+        let pnames = map(ps, (pm) => written_text(pm.binder.name))
+        let s1 = ncs_remove_all(s, pnames)
+        let r = rewrite_nursery_caps_expr(b, s1, file, bw)
+        rewrite_nursery_caps_clauses(rest, s, file, r.bw, [HC(n, ps, r.expr, l, co), ...acc])
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_opt_return(opt: Option[HReturn], s: NCapStack,
+                                     file: String, bw: BrandWalk) : NurseryRwRet {
+  match opt {
+    None -> NurseryRwRet { ret: None, bw: bw }
+    Some(r) -> match r {
+      HR(p, b, l, c) -> {
+        let s1 = ncs_remove(s, written_text(p.name))
+        let br = rewrite_nursery_caps_expr(b, s1, file, bw)
+        NurseryRwRet { ret: Some(HR(p, br.expr, l, c)), bw: br.bw }
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_fields(fs: [FieldInit], s: NCapStack, file: String,
+                                 bw: BrandWalk, acc: [FieldInit]) : NurseryRwFields {
+  match fs {
+    [] -> NurseryRwFields { fields: list_reverse(acc), bw: bw }
+    [f, ...rest] -> match f {
+      FI(n, v) -> {
+        let r = rewrite_nursery_caps_expr(v, s, file, bw)
+        rewrite_nursery_caps_fields(rest, s, file, r.bw, [FI(n, r.expr), ...acc])
+      }
+    }
+  }
+}
+
+fn rewrite_nursery_caps_elems(els: [ListElem], s: NCapStack, file: String,
+                                bw: BrandWalk, acc: [ListElem]) : NurseryRwElems {
+  match els {
+    [] -> NurseryRwElems { elems: list_reverse(acc), bw: bw }
+    [el, ...rest] -> match el {
+      ElPlain(x) -> {
+        let r = rewrite_nursery_caps_expr(x, s, file, bw)
+        rewrite_nursery_caps_elems(rest, s, file, r.bw, [ElPlain(r.expr), ...acc])
+      }
+      ElSpread(x) -> {
+        let r = rewrite_nursery_caps_expr(x, s, file, bw)
+        rewrite_nursery_caps_elems(rest, s, file, r.bw, [ElSpread(r.expr), ...acc])
+      }
+    }
+  }
+}
+
+# `nursery { n -> body }` → mint a brand, push `(n, brand)`, walk
+# body, strip `n` from the lambda. The trailing-lambda parser
+# always leaves the lambda as the LAST argument (per
+# parse_trailing_lambdas), and `nursery` takes only the body, so
+# args is typically `[lam]` — we still loop over args so a future
+# multi-arg `nursery(extra) { n -> body }` form would not silently
+# misbehave.
+fn rewrite_nursery_call(callee: Expr, args_: [Expr], s: NCapStack,
+                          file: String, bw: BrandWalk,
+                          line: Int, col: Int) : NurseryRwKind {
+  let lr = split_last_arg(args_)
+  match lr {
+    NoLast -> {
+      let ar = rewrite_nursery_caps_exprs(args_, s, file, bw, [])
+      NurseryRwKind { kind: ECall(callee, ar.exprs), bw: ar.bw }
+    }
+    HasLast(prefix, last) -> match last.kind {
+      ELambda(ps, body) -> match ps {
+        [p0] -> {
+          let p_name = written_text(p0.binder.name)
+          let alloc = bw_alloc(bw, p_name, file, last.line, last.col)
+          let s1 = ncs_push(s, p_name, alloc.bid)
+          let pr = rewrite_nursery_caps_exprs(prefix, s, file, alloc.bw, [])
+          let br = rewrite_nursery_caps_expr(body, s1, file, pr.bw)
+          let stripped_lam = mk_expr(ELambda([], br.expr), last.line, last.col)
+          let new_args = list_append(pr.exprs, [stripped_lam])
+          NurseryRwKind { kind: ECall(callee, new_args), bw: br.bw }
+        }
+        _ -> {
+          let pr = rewrite_nursery_caps_exprs(prefix, s, file, bw, [])
+          let lr2 = rewrite_nursery_caps_expr(last, s, file, pr.bw)
+          NurseryRwKind { kind: ECall(callee, list_append(pr.exprs, [lr2.expr])),
+                           bw: lr2.bw }
+        }
+      }
+      _ -> {
+        let pr = rewrite_nursery_caps_exprs(prefix, s, file, bw, [])
+        let lr2 = rewrite_nursery_caps_expr(last, s, file, pr.bw)
+        NurseryRwKind { kind: ECall(callee, list_append(pr.exprs, [lr2.expr])),
+                         bw: lr2.bw }
+      }
+    }
+  }
+}
+
+# Diagnostic emitter. The two sides of the mismatch carry
+# `(brand_id, allocation_site)` so the user can see which two
+# nurseries produced the conflicting brands.
+fn emit_brand_mismatch(file: String, line: Int, col: Int,
+                         expected_bid: Int, found_bid: Int,
+                         brs: [BrandRec], op_name: String) : Unit / Console + File {
+
+  diag_error(file, line, col,
+    concat_all(["sibling-nursery brand mismatch on `", op_name,
+                "`: fiber from a different nursery scope"]))
+  match brand_rec_lookup(brs, expected_bid) {
+    Some(b) -> match b {
+      BR(_, name, bf, bl, bc) ->
+        diag_note(concat_all(["expected brand from nursery `",
+                               name, "` at ", bf, ":",
+                               int_to_string(bl), ":",
+                               int_to_string(bc)]))
+    }
+    None -> ()
+  }
+  match brand_rec_lookup(brs, found_bid) {
+    Some(b) -> match b {
+      BR(_, name, bf, bl, bc) ->
+        diag_note(concat_all(["fiber argument carries brand from nursery `",
+                               name, "` at ", bf, ":",
+                               int_to_string(bl), ":",
+                               int_to_string(bc)]))
+    }
+    None -> ()
+  }
+  diag_help("each `n.spawn(...)` returns a Fiber bound to that nursery; pass it only to the same nursery's await/select/cancel — or restructure so the consume site shares the spawn site's `n` cap")
+}
+
+#[doc("""
+Consume-op brand check. For await/cancel/select the first arg
+carries the fiber(s); for the other ops there is nothing to
+check (spawn produces a brand, set_trap_exit/yield/cancel_all
+don't take a fiber).
+""")]
+fn check_brand_consume(op_name: String, args_: [Expr], expected_bid: Int,
+                        env: BrandEnv, file: String, calls: [BrandCall],
+                        brs: [BrandRec], errs: Int) : Int / Console + File = match args_ {
+  [arg, ..._other_args] ->
+    if op_name == "await" or op_name == "cancel" {
+      check_brand_arg(arg, op_name, expected_bid, env, file, calls, brs, errs)
+    } else if op_name == "select" {
+      check_brand_select_arg(arg, expected_bid, env, file, calls, brs, errs)
+    } else { errs }
+  _ -> errs
+}
+
+# `errs`, plus one when `arg` carries a brand other than `expected_bid`.
+fn check_brand_arg(arg: Expr, op_name: String, expected_bid: Int, env: BrandEnv, file: String,
+                   calls: [BrandCall], brs: [BrandRec], errs: Int) : Int / Console + File =
+  match expr_brand(arg, env, calls) {
+    Some(found) ->
+      if found == expected_bid { errs }
+      else {
+        emit_brand_mismatch(file, arg.line, arg.col, expected_bid, found, brs, op_name)
+        errs + 1
+      }
+    None -> errs
+  }
+
+fn check_brand_select_arg(arg: Expr, expected_bid: Int, env: BrandEnv, file: String,
+                          calls: [BrandCall], brs: [BrandRec], errs: Int) : Int / Console + File = match arg.kind {
+  EList(els) -> check_brand_select_elems(els, expected_bid, env, file, calls, brs, errs)
+  _          -> check_brand_arg(arg, "select", expected_bid, env, file, calls, brs, errs)
+}
+
+fn check_brand_select_elems(els: [ListElem], expected_bid: Int,
+                              env: BrandEnv, file: String,
+                              calls: [BrandCall], brs: [BrandRec],
+                              errs: Int) : Int / Console + File = match els {
+  [] -> errs
+  [ElPlain(x), ...rest] ->
+    check_brand_select_elems(rest, expected_bid, env, file, calls, brs,
+                             check_brand_arg(x, "select", expected_bid, env, file, calls, brs, errs))
+  [ElSpread(_), ...rest] -> check_brand_select_elems(rest, expected_bid, env, file, calls, brs, errs)
 }
