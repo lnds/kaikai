@@ -22,7 +22,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/stage2/compiler"
 
 # The file allowed to mint a home spelling.
-SPELL_ALLOW='rt_name'
+SPELL_ALLOW='spec_names'
 
 # Comments and `#[doc]` bodies name the function when they explain the
 # mechanism, so strip a line's comment before matching: prose about the
@@ -31,7 +31,6 @@ scan() {
   pat="$1"
   for f in "$SRC"/*.kai; do
     b=$(basename "$f" .kai)
-    [ "$b" = "home_spell" ] && continue
     n=$(sed 's/#.*$//' "$f" | grep -cE "(^|[^a-z_])$pat\(" || true)
     [ "$n" -gt 0 ] && printf '%s %s\n' "$b" "$n"
   done
@@ -49,4 +48,4 @@ if [ -n "$spellers" ]; then
 fi
 
 ns=$(scan hs_spell | awk '{s+=$2} END {print s+0}')
-echo "respelling-confined OK — $ns minting site(s), in rt_name"
+echo "respelling-confined OK — $ns minting site(s), in spec_names"
