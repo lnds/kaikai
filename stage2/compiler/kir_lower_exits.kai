@@ -1,0 +1,516 @@
+#[doc("Lowering helpers for blocks, lets, ifs and the exits that release what they hold: drops, handle frames and unwinding.")]
+
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.util
+import compiler.fnreg
+import compiler.emit_shared
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_clause_holes
+import compiler.region
+import compiler.kir
+import compiler.kir_lower
+import compiler.ctor_ix
+import compiler.unwind_pend
+import compiler.unwind_sites
+import compiler.kir_lower_bind
+import compiler.kir_lower_raw
+import compiler.emit_tcrec_live
+import compiler.local_names
+import compiler.handler_alias
+import compiler.effect_instance
+import compiler.kir_lower_scalar
+
+# A runtime panic over a message string (the hole / todo lowering, and
+# the match-non-exhaustive fallback shape). `msg` is an ALREADY-QUOTED
+# source span (so `KStrV` round-trips it like a literal).
+pub(pkg) fn lower_panic_stub(msg: String, st: LowerSt) : LRes / Console =
+  bind_op(st, KPrim(KpPanic, [KStrV(msg)]), KNoPos)
+
+# Wrap a plain string in source-span quotes so `KStrV` treats it as a
+# literal (the dumper / translator strip the quotes back off).
+pub(pkg) fn kir_quote(s: String) : String = cat3("\"", s, "\"")
+
+# The hole panic message, bundling label + location like emit_c does.
+pub(pkg) fn kir_hole_message(nm_opt: Option[String], x: Expr) : String {
+  let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+  kir_quote(concat_all(["unfilled hole: ", label, " at line ",
+                        int_to_string(x.line), " col ", int_to_string(x.col)]))
+}
+
+# --- variants[T]() / record literal / range / modcall-value -------------
+
+pub(pkg) fn fn_body_lowers_raw(body: Expr) : Bool =
+  if kir_node_is_raw(body) { true }
+  else { match body.mode {
+    MUnboxed -> match body.kind { ECall(_, _) -> true _ -> false }
+    _        -> false
+  } }
+
+# A sibling block may bind the same surface name again before the enclosing
+# expression reads this block's value (`{ ...; r } == { ...; r }`), so a
+# value held in a binder of this block leaves it in a fresh register.
+pub(pkg) fn block_value_out(v: KVal, outer: [String], dst: KSlot, pos: KPos, st: LowerSt) : LRes / Console = match v {
+  KVar(n) ->
+    if string_starts_with_q(n, ".") or name_in_list(outer, n) { LRes(v, st) }
+    else { bind_op_slot(st, KLitOp(v), dst, pos) }
+  _ -> LRes(v, st)
+}
+
+pub(pkg) fn block_is_region(ms: [RegionMark], line: Int, col: Int) : Bool = match ms {
+  [] -> false
+  [m, ...rest] ->
+    if rmark_line(m) == line and rmark_col(m) == col { true }
+    else { block_is_region(rest, line, col) }
+}
+
+# Emit a `KDrop` for each dead `let`-binding whose RHS is a fresh boxed
+# allocation. Same set the C emitter drops (`block_unused_lets`), minus the
+# raw-scalar bindings (an `MUnboxed` rhs binds a raw register with no rc).
+pub(pkg) fn lower_block_exit_drops(stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LowerSt / Console =
+  lb_exit_drops_loop(block_unused_lets(stmts, tail), stmts, st)
+
+fn lb_exit_drops_loop(names: [LocalId], stmts: [Stmt], st: LowerSt) : LowerSt / Console = match names {
+  [] -> st
+  [nm, ...rest] ->
+    if lb_binding_is_boxed(stmts, nm) {
+      lb_exit_drops_loop(rest, stmts, ls_emit(st, KRC(KDrop(KVar(ls_reg_of(st, nm))), KNoPos)))
+    } else {
+      lb_exit_drops_loop(rest, stmts, st)
+    }
+}
+
+# True when `nm` is bound by a `let nm = <boxed rhs>` in `stmts`. A raw
+# binding (`raw_let_slot` = Some, the `SReal`/`SBool`/`SInt64` register)
+# carries no rc — dropping it would decref a non-pointer.
+fn lb_binding_is_boxed(stmts: [Stmt], nm: LocalId) : Bool = match stmts {
+  [] -> false
+  [s, ...rest] -> match s {
+    SLet(pat, _, rhs) -> match pat.pkind {
+      PBind(b)  -> if local_eq(b.id, nm) {
+                     match raw_let_slot(pat, rhs) { Some(_) -> false None -> true }
+                   } else { lb_binding_is_boxed(rest, nm) }
+      _         -> lb_binding_is_boxed(rest, nm)
+    }
+    _ -> lb_binding_is_boxed(rest, nm)
+  }
+}
+
+# The assert message span (quote-wrapped, as `KStrV` carries it): a plain
+# string-literal message keeps its source span; anything else (or no
+# message) falls back to the generic `"assertion failed"`. Mirror of
+# emit_c's `msg_lit`.
+pub(pkg) fn kir_assert_msg(opt_msg: Option[Expr]) : String = match opt_msg {
+  Some(m) -> match m.kind {
+    EStr(span, false) -> span
+    _                 -> kir_quote("assertion failed")
+  }
+  None -> kir_quote("assertion failed")
+}
+
+# A `let x = rhs` takes the RAW path when `rhs` is a raw node (Real arith or
+# a Real-comparison/logical) AND a plain `PBind` (a raw scalar has no fields
+# to destructure). Returns the raw slot (SReal for a Real result, SBool for
+# a comparison/logical result), or None to keep the boxed path. Mirror of
+# perceus's `prc_pat_bindings_skip_raw` gate (a raw binder skips RC).
+#
+# Any other initialiser the unbox pass marked `MUnboxed` binds raw too:
+# perceus skipped the binder's RC on that verdict, so a boxed binder would
+# mint a box per evaluation that nothing owns and nothing frees.
+pub(pkg) fn raw_let_slot(pat: Pattern, rhs: Expr) : Option[KSlot] = match pat.pkind {
+  PBind(_) ->
+    if raw_if_join(rhs) { Some(if_join_slot(rhs)) }
+    else if kir_node_is_raw(rhs) {
+      if kir_ty_is_real(rhs.ty) { Some(SReal) }
+      else if kir_ty_is_int(rhs.ty) { Some(SInt64) }
+      else if kir_ty_is_char(rhs.ty) { Some(SChar) }
+      else if kir_ty_is_byte(rhs.ty) { Some(SByte) }
+      else if kir_ty_is_fixed_raw(rhs.ty) { Some(kir_fixed_raw_slot(rhs.ty)) }
+      else { Some(SBool) }
+    } else if raw_block_rhs(rhs) { Some(border_slot_of(rhs.ty)) }
+    else { raw_mode_let_slot(rhs) }
+  _ -> None
+}
+
+# A block the unbox pass left raw whose value is a raw form: its statements
+# lower in the block's scope and its tail at the binder's raw slot.
+fn raw_block_rhs(rhs: Expr) : Bool = match rhs.mode {
+  MUnboxed -> match rhs.kind {
+    EBlock(_, Some(t)) -> kir_node_is_raw(t) or raw_block_rhs(t)
+    _                  -> false
+  }
+  _ -> false
+}
+
+# The raw slot of any other `MUnboxed` initialiser (a call, a `match`, an
+# `if` with no raw join), or None. Its binder is read raw at these types,
+# so the initialiser crosses the border here, which releases its box. A
+# type with no raw slot keeps the boxed path, as its reads do: the
+# `else`-to-`SBool` guess above would read it as an i32 bool.
+fn raw_mode_let_slot(rhs: Expr) : Option[KSlot] = match rhs.mode {
+  MUnboxed ->
+    if kir_ty_is_real(rhs.ty) { Some(SReal) }
+    else if kir_ty_is_int(rhs.ty) { Some(SInt64) }
+    else if kir_ty_is_char(rhs.ty) { Some(SChar) }
+    else if kir_ty_is_byte(rhs.ty) { Some(SByte) }
+    else if kir_ty_is_fixed_raw(rhs.ty) { Some(kir_fixed_raw_slot(rhs.ty)) }
+    else { None }
+  _ -> None
+}
+
+# Bind a `PBind` name to an already-lowered RAW value at its raw slot. The
+# `KLet` carries `slot` (SReal/SBool), so pass-1 allocates an `f64`/`i32`
+# alloca and a read of the binder loads it raw. No RC: a raw scalar is not tracked.
+pub(pkg) fn lower_let_bind_raw(pat: Pattern, v: KVal, slot: KSlot, st: LowerSt) : LowerSt / Console = match pat.pkind {
+  PBind(b)    -> lower_let_pbind(b, slot, v, pat, st)
+  _           -> match v {
+    KUnitV -> st
+    _      -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+  }
+}
+
+# Bind a `PBind` to an already-lowered value at `slot`. The binder enters
+# scope after the caller lowered `v`, so an RHS that reads an outer binder
+# of the same name (`let x = f(x)`) read that one.
+fn lower_let_pbind(b: Binder, slot: KSlot, v: KVal, pat: Pattern, st: LowerSt) : LowerSt / Console =
+  ls_let(st, b, slot, KLitOp(v), KAt(pat.line, pat.col))
+
+# Bind a pattern to an already-lowered value. A plain `PBind` aliases the
+# value into its register; a DESTRUCTURING pattern (`let { p: { x, y } } = b`,
+# `let Some(x) = o`) reads each field/slot and recurses into nested
+# sub-patterns — the SAME `bind_pattern_fields_any` path the variant match
+# arms use.
+pub(pkg) fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match pat.pkind {
+  PBind(b)             -> lower_let_pbind(b, SBoxed, v, pat, st)
+  PRecord(_)           -> lower_let_owned(pat, v, st)
+  PVariant(_, _)       -> lower_let_owned(pat, v, st)
+  PVariantRecord(_, _) -> lower_let_owned(pat, v, st)
+  PList(_, _)          -> lower_let_owned(pat, v, st)
+  PAs(_, _)            -> lower_let_owned(pat, v, st)
+  # A wildcard let discards its value: a `()` needs no `KDo` (nothing to
+  # drop) — the shape every desugared cell write takes.
+  _                    -> match v {
+    KUnitV -> st
+    _      -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
+  }
+}
+
+fn lower_let_owned(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
+  ls_unw_owning(bind_let_owned(pat, v, st), list_append(rec_field_owned(pat), pat_alias_binders(pat, st.ctor_ix)))
+
+# A plain record field binder owns its `kai_op_field` read; one nested
+# under a field's sub-pattern may own nothing.
+pub(pkg) fn rec_field_owned(p: Pattern) : [LocalId] = match p.pkind {
+  PRecord(fs)           -> rfo_fields(fs)
+  PVariantRecord(_, fs) -> rfo_fields(fs)
+  PAs(_, inner)         -> rec_field_owned(inner)
+  _                     -> []
+}
+
+fn rfo_fields(fs: [PField]) : [LocalId] = match fs {
+  [] -> []
+  [PField(_, sub, _), ...rest] -> match sub.pkind {
+    PBind(b) -> [b.id, ...rfo_fields(rest)]
+    _        -> rfo_fields(rest)
+  }
+}
+
+pub(pkg) fn ls_unw_owning(st: LowerSt, names: [LocalId]) : LowerSt =
+  if st.unw.arms == [] { st } else { ls_with_unw(st, unw_owning(st.unw, names)) }
+
+# --- if -----------------------------------------------------------------
+
+# `if c { t } else { e }`: condbr to two forked blocks, each storing its
+# arm into a shared join register, then both branch to a continuation. The
+# condition lowers here; the block-building (flat) is `lower_if_blocks`.
+#
+# Guard #3 (P1) — a RAW comparison/bool condition lowers RAW (an `SBool`
+# i32 0/1 register), NOT boxed. The backend's `nemit_condbr` then branches
+# on the i32 directly (`icmp ne 0`), skipping the `bool.box` (`kaix_bool`) +
+# `kaix_truthy` round-trip the boxed path pays — the `i==0` / `i<N` loop
+# header empties of calls. A non-raw (boxed Bool) condition keeps the boxed
+# path. The `bind_op_slot(SBool)` inside `lower_expr_raw` yields a `KVar` of
+# an `SBool` register; `nemit_condbr` reads the slot to pick its lowering.
+# The constant arm of a short-circuit `and`/`or`, carrying the whole
+# expression's Bool type and position so the join slot types cleanly.
+pub(pkg) fn mk_typed_bool(v: Bool, x: Expr) : Expr =
+  Expr { kind: EBool(v), line: x.line, col: x.col, ty: x.ty, mode: MBoxed,  site: x.site }
+
+# The join register's slot: raw (`SInt64`/`SReal`) when the `if`-node is a
+# raw-promoted Int/Real expression (`x.mode == MUnboxed` — both arms raw),
+# else `SBoxed`. Bool/Char raw `if`s stay boxed (no raw KIR register form —
+# the `kir_lower_raw` scope bound).
+# An `if` whose join lowers raw binds raw too: a boxed binder would box the
+# join and never release the box.
+fn raw_if_join(x: Expr) : Bool = match x.kind {
+  EIf(_, _, _) -> match if_join_slot(x) { SBoxed -> false  _ -> true }
+  _            -> false
+}
+
+pub(pkg) fn if_join_slot(x: Expr) : KSlot = match x.mode {
+  MUnboxed -> if kir_ty_is_int(x.ty) { SInt64 } else if kir_ty_is_real(x.ty) { SReal } else { SBoxed }
+  _        -> SBoxed
+}
+
+# The join's initial placeholder, matching its slot (the `KLet` decl must
+# store a value of the alloca's type before the branches overwrite it).
+pub(pkg) fn if_join_init(slot: KSlot) : KVal = match slot {
+  SInt64 -> KIntV(0)
+  SReal  -> KRealV(0.0)
+  _      -> KUnitV
+}
+
+# Build the success/fail fork over the lowered inner value `bv`. The join
+# register holds the unwrapped payload; the success path stores `KProj(bv,0)`
+# and branches to the continuation, the fail path early-returns `bv`. Mirror
+# of `lower_if_blocks`, but the else-branch is a `KRet` (short-circuit), not
+# a store-and-merge.
+pub(pkg) fn lower_bang_split(x: Expr, bv: KVal, ctor: SymId, st: LowerSt) : LRes / Console =
+  match ls_fresh_reg(st) { LSReg(join, st1) -> {
+    let st2 = ls_emit(st1, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+    match bind_op(st2, KPrim(KpTagEq, [bv, KIntV(ls_ctor_tag(st2, ctor))]), kpos_of(x)) { LRes(cond, st3) ->
+      match three_labels(st3) { LSL3(lok, lfail, lcont, st4) -> {
+        # condbr seals the current block and opens `lfail` as the cursor.
+        let st5 = ls_seal(st4, KCondBr(cond, lok, lfail, kpos_of(x)), lfail)
+        # Fail block: release what the frame still owes past `x`, then
+        # short-circuit the enclosing fn with the unmatched value.
+        let st6 = ls_seal(lower_exit_drops(x, st5), KRet(bv, kpos_of(x)), lok)
+        # Success block: take the payload out of slot 0 and release the
+        # shell it came in, then store it into the join.
+        match bind_op(st6, KProj(bv, 0), kpos_of(x)) { LRes(payload, st7) -> {
+          let st7b = ls_emit(ls_emit(st7, KRC(KDup(payload), kpos_of(x))), KRC(KDrop(bv), kpos_of(x)))
+          let st8 = ls_emit(st7b, KStore(join, payload, kpos_of(x)))
+          let st9 = ls_seal(st8, KBr(lcont, kpos_of(x)), lcont)
+          LRes(KVar(join), st9)
+        } }
+      } } }
+  } }
+
+fn lower_exit_drops(x: Expr, st: LowerSt) : LowerSt = {
+  let st1 = match unw_exit_at(st.unw.sites, x.site) {
+    None     -> st
+    Some(ns) -> lower_drops(unw_admit(st.unw, ns), x, st)
+  }
+  tcp_drop_entries(tcl_exit_entries(st1.tcpend), st1)
+}
+
+fn lower_drops(ns: [LocalId], x: Expr, st: LowerSt) : LowerSt = match ns {
+  [] -> st
+  [n, ...rest] -> lower_drops(rest, x, ls_emit(st, KRC(KDrop(KVar(ls_reg_of(st, n))), kpos_of(x))))
+}
+
+# --- match --------------------------------------------------------------
+
+pub(pkg) fn tcp_drop_entries(es: [TclEntry], st: LowerSt) : LowerSt = match es {
+  [] -> st
+  [e, ...rest] -> if tcl_is_unw(e) {
+    tcp_drop_entries(rest, ls_emit(st, KDo(KPrim(KpUnwPop, [KVar(tcl_unw_reg(e))]), KNoPos)))
+  } else if tcl_is_tok(e) {
+    tcp_drop_entries(rest, ls_emit(st, KRC(KArmTokenFree, KNoPos)))
+  } else {
+    let reg = match e {
+      TclBinder(l) -> ls_reg_of(st, l)
+      _            -> tcl_reg(e)
+    }
+    tcp_drop_entries(rest, ls_emit(st, KRC(KDrop(KVar(reg)), KNoPos)))
+  }
+}
+
+# The alias of an install and the state it is in scope in.
+pub(pkg) type HandleAlias = { reg: Option[String], st: LowerSt }
+
+# An alias is a binder like any other: it takes a register of its own, so
+# a parameter or an enclosing alias spelled alike keeps its.
+pub(pkg) fn bind_handle_alias(alias_opt: Option[Binder], st: LowerSt) : HandleAlias = match alias_opt {
+  Some(b) -> match ls_bind_alias(st, b) { LSReg(reg, st1) -> HandleAlias { reg: Some(reg), st: st1 } }
+  None    -> HandleAlias { reg: None, st: st }
+}
+
+# Where each capture of the handle's clauses lives at the install: the
+# register its binder was bound to, or none when the binder is not in
+# scope here (no clause running from this install reads that slot).
+pub(pkg) fn handle_env_regs(caps: [Capture], st: LowerSt) : [Option[String]] = map(caps, (c) => match c {
+  CapLocal(l) -> if ls_local_bound(st, l) { Some(ls_reg_of(st, l)) } else { None }
+  CapAlias(a) -> if ls_local_bound(st, a) { Some(kir_alias_id_reg(ls_reg_of(st, a))) } else { None }
+})
+
+# The registers pushed below a handle's landing pad, popped where its exits
+# meet, innermost first.
+pub(pkg) type UnwOpen = { pops: [String], st: LowerSt }
+
+# The references pending at the handle that outlive it.
+pub(pkg) fn kir_unw_handle_vars(uw: Option[[LocalId]], x: Expr, st: LowerSt) : UnwOpen / Console = match uw {
+  Some(ns) -> match unw_admit(st.unw, ns) {
+    [] -> UnwOpen { pops: [], st: st }
+    held -> match ls_fresh_reg(st) { LSReg(fr, st1) ->
+      UnwOpen { pops: [fr], st: ls_emit(st1, KLet(fr, SBoxed, KPrim(KpUnwPush, [KVar(unw_fib(st1.unw)), ...map(held, (m) => KVar(ls_reg_of(st1, m)))]), kpos_of(x))) } }
+  }
+  None -> UnwOpen { pops: [], st: st }
+}
+
+# The handler state slot, read when released: a clause's `resume(v, s)`
+# replaces it.
+pub(pkg) fn kir_unw_handle_state(uw: Option[[LocalId]], init_opt: Option[Expr], sym: String, x: Expr, st: LowerSt) : UnwOpen / Console =
+  match uw {
+    Some(_) -> match init_opt {
+      Some(_) -> match ls_fresh_reg(st) { LSReg(fr, st1) ->
+        UnwOpen { pops: [fr], st: ls_emit(st1, KLet(fr, SBoxed, KPrim(KpUnwPushState, [KStrV(sym), KVar(unw_fib(st1.unw))]), kpos_of(x))) } }
+      None -> UnwOpen { pops: [], st: st }
+    }
+    None -> UnwOpen { pops: [], st: st }
+  }
+
+pub(pkg) fn handle_has_finally(cs: [HClause]) : Bool = match cs {
+  [] -> false
+  [HC(h, _, _, _, _), ...rest] ->
+    if is_lifecycle_clause(h) { true } else { handle_has_finally(rest) }
+}
+
+# The setjmp split: `condbr (setjmp eff) ? Ldiscard : Lbody`. Lbody runs
+# the body inline, pops, applies the return clause, stores; Ldiscard
+# stores the longjmp-returned value as is; both branch to Lret.
+# `stateful` (the handle carries `init` state) gates the return clause's
+# `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
+# What shapes a handle's exits: its state, its `finally`, and whether a
+# clause defers resume frames to them.
+pub(pkg) type HandleFork = { stateful: Bool, has_fin: Bool, frames: Bool, inst: InstKey }
+
+# The cleanup runs BEFORE the pop, so it still sees its own node.
+pub(pkg) fn lower_handle_exit(eff: String, sym: String, has_fin: Bool, body: Expr, st: LowerSt) : LowerSt / Console = {
+  let st1 = if has_fin { ls_emit(st, KRunCleanup(eff, sym, kpos_of(body))) } else { st }
+  ls_emit(st1, KPop(eff, sym, kpos_of(body)))
+}
+
+# Ldiscard: the value the longjmp landed with becomes the result (the
+# clause already produced it and popped the evidence). The runtime hands
+# it back through the handler's discard slot — modelled as a unit store
+# placeholder the backend fills from the landing pad.
+# The discard slot is per install-SITE (`__kai_discard_<sym>`), not a single
+# `__kai_discard`: nested same-effect handles each own a jmp_buf+discard slot,
+# and the landing pad (setjmp != 0) of site N must read SITE N's discarded
+# value. The name MUST agree with `nfx_discard_reg(sym)` in emit_native_fx.kai
+# (the alloca the install reserves under the same string).
+pub(pkg) fn lower_handle_discard(sym: String, result: String, lret: String, ldisc: String, st: LowerSt) : LowerSt / Console {
+  let st1 = ls_emit(reopen(st, ldisc), KStore(result, KVar(cat2("__kai_discard_", sym)), KNoPos))
+  ls_seal(st1, KBr(lret, KNoPos), lret)
+}
+
+# Lret: `result`, through the clauses' deferred frames, is the handle's value.
+pub(pkg) fn lower_handle_ret(eff: String, sym: String, result: String, fork: HandleFork,
+                    pops: [String], lret: String, st: LowerSt) : LRes / Console =
+  match lower_handle_frames(sym, result, fork.frames, reopen(st, lret)) {
+    LRes(v, st0) -> {
+      let st1 = kir_unw_pops(pops, st0)
+      LRes(v, if fork.stateful { lower_handle_release_state(eff, sym, st1) } else { st1 })
+    }
+  }
+
+fn lower_handle_frames(sym: String, result: String, frames: Bool, st: LowerSt) : LRes / Console =
+  if frames { bind_op(st, KPrim(KpResumeFramesRun, [KStrV(sym), KVar(result)]), KNoPos) }
+  else { LRes(KVar(result), st) }
+
+fn kir_unw_pops(pops: [String], st: LowerSt) : LowerSt / Console = match pops {
+  [] -> st
+  [p, ...rest] -> kir_unw_pops(rest, ls_emit(st, KDo(KPrim(KpUnwPop, [KVar(p)]), KNoPos)))
+}
+
+# The Ev owns its final state: both exits (normal and discard) meet in
+# Lret, so it is released there, after the return clause has read it.
+fn lower_handle_release_state(eff: String, sym: String, st: LowerSt) : LowerSt / Console =
+  match ls_fresh_reg(st) { LSReg(r, st1) ->
+    ls_emit(ls_emit(st1, KBindEvState(eff, sym, [r], KNoPos)), KRC(KDrop(KVar(r)), KNoPos)) }
+
+pub(pkg) fn bind_ret_state(eff: String, sym: String, st: LowerSt) : LowerSt / Console =
+  match alias_regs(unbound_state_aliases(st), st, []) {
+    AliasRegs(regs, st1) -> ls_emit(st1, KBindEvState(eff, sym, regs, KNoPos))
+  }
+
+#[doc("Bind a stateful clause's state aliases, those its params and captures leave unbound, each to a register of its own.")]
+pub fn bind_self_state(st: LowerSt) : LowerSt / Console =
+  match alias_regs(unbound_state_aliases(st), st, []) {
+    AliasRegs(regs, st1) -> ls_emit(st1, KBindSelfState(regs, KNoPos))
+  }
+
+# An alias whose binder the scope already holds reached it from outside:
+# the enclosing binding is the one the body reads.
+fn unbound_state_aliases(st: LowerSt) : [String] =
+  clause_state_aliases((k) => ls_local_bound(st, local_minted(k)))
+
+pub(pkg) type AliasRegs = AliasRegs([String], LowerSt)
+
+# Each alias is the binder minted under its key.
+fn alias_regs(keys: [String], st: LowerSt, regs: [String]) : AliasRegs = match keys {
+  [] -> AliasRegs(list_reverse(regs), st)
+  [k, ...rest] -> match ls_fresh_reg(st) {
+    LSReg(r, st1) -> alias_regs(rest, ls_scope_put(ls_bind_reg(st1, k), local_minted(k), r), [r, ...regs])
+  }
+}
+
+pub(pkg) type UnwCallee = UkTransfer(LocalId) | UkDup(LocalId)
+
+pub(pkg) fn kir_unw_held(names: [LocalId], clo: Option[UnwCallee]) : [LocalId] = match clo {
+  Some(UkTransfer(n)) -> [n, ...names]
+  _                   -> names
+}
+
+# The closure a call goes through: a local in callee position that the
+# scope binds.
+pub(pkg) fn kir_unw_closure(f: Expr, st: LowerSt) : Option[UnwCallee] = match f.kind {
+  ELocal(n) -> if ls_local_bound(st, n) { Some(UkTransfer(n)) } else { None }
+  ECall(g, xs) -> match g.kind {
+    EMark(MkDup) -> match xs {
+      [inner] -> match inner.kind {
+        ELocal(n) -> if ls_local_bound(st, n) { Some(UkDup(n)) } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+pub(pkg) fn kir_unw_var(f: Expr, n: LocalId) : Expr = Expr { kind: ELocal(n), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }
+
+# The instance a typed perform reaches: its callee carries the resolved
+# `Eff[args]` as its type.
+pub(pkg) fn perform_inst_args(x: Expr) : [Ty] = match x.kind {
+  ECall(f, _) -> match f.ty {
+    Some(TyCon(_, args)) -> args
+    _                    -> []
+  }
+  _ -> []
+}
+
+# An alias or a receiver names its evidence by what its binder is bound to.
+# Otherwise, inside a `handle` of the same instance in this fn, the op must
+# reach that handler, not the caller's frame slot.
+pub(pkg) fn perform_via(r: OpRef, targs: [Ty], st: LowerSt) : KVia = match r.via {
+  ViaAlias(a) -> KvAlias(ls_reg_of(st, a), written_text(ln_text(st.locals, a)))
+  ViaRecv(v)  -> KvRecv(ls_reg_of(st, v))
+  ViaAmbient  -> if ls_handled_here(st, inst_key_of_tys(r.eff, targs)) { KvLexical } else { KvAmbient }
+}
+
+# --- Perceus RC marks → first-class KRC statements (§4.7) ---------------
+
+# `unit_name(e)` — compile-time reflection on the dimensioned argument. Reads
+# the canonical unit symbol from the arg's finalised `.ty` (`unit_name_of_ty`,
+# the SAME extractor emit_c's `unit_name` case uses) and lowers to a constant
+# `KStrV` literal — never a runtime call. A bare `Real` / unresolved unit-var
+# yields the empty string (defensive, like the oracle), so user code that
+# calls `unit_name` on an undimensioned value stays well-defined.
+pub(pkg) fn lower_unit_name(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
+  [a] -> LRes(KStrV(kir_quote(unit_name_of_ty(a.ty))), st)
+  _   -> LRes(KUnitV, st)
+}
+
+#[doc("`st` with a fiber cache for its frame when the frame brackets anything: a frame never changes fiber.")]
+pub fn kir_unw_enter(st: LowerSt) : LowerSt / Console = match st.unw.sites {
+  [] -> st
+  _  -> match ls_fresh_reg(st) { LSReg(f, st1) ->
+    ls_with_unw(ls_emit(st1, KLet(f, SBoxed, KPrim(KpUnwFiber, []), KNoPos)), unw_with_fib(st1.unw, f)) }
+}
