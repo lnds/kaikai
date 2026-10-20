@@ -104,7 +104,7 @@ self_test() {
   mkdir -p "$tmp/tools" "$tmp/stage2/compiler"
   cp tools/walker-catchall-baseline.txt "$tmp/tools/"
   cp stage2/compiler/*.kai "$tmp/stage2/compiler/"
-  cat >> "$tmp/stage2/compiler/lint_spread.kai" <<'EOF'
+  cat >> "$tmp/stage2/compiler/lint_redundant.kai" <<'EOF'
 
 fn wca_probe(k: ExprKind) : [Expr] = match k {
   ECall(f, xs)    -> [f, ...xs]
@@ -119,8 +119,8 @@ fn wca_probe(k: ExprKind) : [Expr] = match k {
 }
 EOF
   audit "$tmp" > /dev/null; rc1=$?
-  cp stage2/compiler/lint_spread.kai "$tmp/stage2/compiler/"
-  cat >> "$tmp/stage2/compiler/lint_spread.kai" <<'EOF'
+  cp stage2/compiler/lint_redundant.kai "$tmp/stage2/compiler/"
+  cat >> "$tmp/stage2/compiler/lint_redundant.kai" <<'EOF'
 
 fn wca_decl_probe(d: Decl) : Int = match d {
   DFn(_, _, _, _, _, _, _, _, _, _, _) -> 1
@@ -135,8 +135,8 @@ fn wca_decl_probe(d: Decl) : Int = match d {
 }
 EOF
   audit "$tmp" > /dev/null; rc3=$?
-  cp stage2/compiler/lint_spread.kai "$tmp/stage2/compiler/"
-  echo "lint_spread.kai wca_gone  # pre-existing, unaudited" >> "$tmp/tools/walker-catchall-baseline.txt"
+  cp stage2/compiler/lint_redundant.kai "$tmp/stage2/compiler/"
+  echo "lint_redundant.kai wca_gone  # pre-existing, unaudited" >> "$tmp/tools/walker-catchall-baseline.txt"
   audit "$tmp" > /dev/null; rc2=$?
   rm -rf "$tmp"
   if [ $rc1 -eq 0 ] || [ $rc2 -eq 0 ] || [ $rc3 -eq 0 ]; then
