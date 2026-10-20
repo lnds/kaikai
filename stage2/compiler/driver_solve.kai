@@ -1,0 +1,346 @@
+#[doc("Compile stages that resolve, stamp and type the lowered program and check its verdicts.")]
+
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.verdicts
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.call_site_check
+import compiler.resolve_program
+import compiler.modules_segments
+import compiler.module_table
+import compiler.user_cache
+import compiler.typed_cut
+import compiler.driver_cli
+import compiler.cover
+import compiler.core_front
+import compiler.region_yield
+import compiler.edition
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.infer_dump_text
+import compiler.rec_stamp
+import compiler.evidence_inject
+import compiler.pub_access
+import compiler.tailfuse
+import compiler.protos_calls
+import compiler.protos_registry
+import compiler.name_report
+import compiler.core_cut
+import compiler.driver_policy
+import compiler.driver_modes
+import compiler.unwind_clauses
+import compiler.driver_front
+import compiler.emit_c_unused
+import compiler.driver_lower
+
+pub(pkg) type StampRun = { prev: Ready, rd: ResolvedDecls, chk: Int, all_decls: [Decl], stamped: Stamped,
+  proto_reg: ProtocolReg, stamp_ids: [SymId] }
+
+pub(pkg) type CvarRun = { prev: StampRun, cvr: CoreVariant, cvar: String, useed: UnwSeed, want_seed: Bool,
+  in_place: Bool }
+
+pub(pkg) type SeedRun = { prev: CvarRun, picked: Option[String], prunes: Bool, lib_mods: [String], need_seed: Bool,
+  no_variant: Bool }
+
+pub(pkg) type Solved = { prev: SeedRun, core_hit: Option[String], pcut: PoolCut, cut: CoreCut }
+
+pub(pkg) type InferRun = { prev: Solved, all_decls: [Decl], dropped: [SymId], pruned: Bool, dm: Option[Demand],
+  typed_tab: SymTab, tin: TyperIn, typed_prog0: TypedProgram }
+
+pub(pkg) type Checked = { prev: InferRun, proto_reg: ProtocolReg, typed_prog: TypedProgram, typed_vds: [Verdict] }
+
+pub(pkg) fn stage_stamp(req: Req, cx: Ready) : StampRun / Console + File + Mutable {
+  let all_decls = cx.prev.all_decls
+  let callee_ops = cx.prev.callee_ops
+  let core_mods = req.core_mods
+  let diag_ctx = cx.prev.prev.prev.prev.prev.prev.prev.diag_ctx
+  let front = cx.front
+  let lowered = cx.prev.lowered
+  let proto_reg = cx.prev.proto_reg
+  let sym_tab = cx.prev.sym_tab
+  let sym_views = cx.prev.prev.prev.prev.prev.prev.prev.sym_views
+  let target_mod_name = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.target_mod_name
+  let rd = resolve_decls_stamped(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
+  let chk = rd.errs
+  let all_decls = rd.decls
+  let stamped = stamped_registry(front, proto_reg, all_decls, sym_tab)
+  let proto_reg = reg_with_walked(stamped.reg, walked_impls(stamped.reg.impls, lowered.derived, all_decls))
+  let stamp_ids = stamp_targets(proto_reg.impls, lowered.derived, core_mod_names(core_mods, []))
+  StampRun { prev: cx, rd: rd, chk: chk, all_decls: all_decls, stamped: stamped, proto_reg: proto_reg, stamp_ids: stamp_ids }
+}
+
+pub(pkg) fn stage_cvar(req: Req, cx: StampRun) : CvarRun / Console + File + Mutable {
+  let all_decls = cx.all_decls
+  let backend = req.backend
+  let chk = cx.chk
+  let core_cache = req.core_cache
+  let core_hit = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_hit
+  let core_mods = req.core_mods
+  let cpre = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.cpre
+  let mode = req.mode
+  let sym_tab = cx.prev.prev.sym_tab
+  let cvr = if chk == 0 and cmod_plain(backend, mode) {
+              match core_cache.core_seed {
+                Some(CoreSeed(dg, sd)) -> CoreVariant { digest: dg, seed: sd }
+                None -> core_variant(all_decls, sym_tab, core_mod_names(core_mods, []))
+              }
+            } else { core_variant_none() }
+  let cvar = cvr.digest
+  let useed = match core_cache.core_seed { Some(CoreSeed(_, sd)) -> sd  None -> unw_seed_none() }
+  let want_seed = chk == 0 and cvar != "" and is_none(core_cache.core_seed) and not core_cache.full_core
+                  and is_none(cmod_core_pick(backend, mode, core_cache, cpre, cvar))
+                  and not cmod_variant_known(core_cache, cpre, cvar)
+  let in_place = want_seed and is_none(core_hit) and core_prunes(mode, backend, core_cache, Some(cpre))
+  CvarRun { prev: cx, cvr: cvr, cvar: cvar, useed: useed, want_seed: want_seed, in_place: in_place }
+}
+
+pub(pkg) fn stage_seed(req: Req, cx: CvarRun, again: (Req) -> Int / Stdout + Stderr + Stdin + File + Mutable) : SeedRun / Console + File + Mutable {
+  let backend = req.backend
+  let batch_out = req.batch_out
+  let chk = cx.prev.chk
+  let core_cache = req.core_cache
+  let core_decls = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_decls
+  let core_decls_whole = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_decls_whole
+  let core_hit = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_hit
+  let core_mods = req.core_mods
+  let core_rows = req.core_rows
+  let core_segs = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_segs
+  let core_segs_whole = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_segs_whole
+  let cover = req.cover
+  let cpre = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.cpre
+  let cvar = cx.cvar
+  let cvr = cx.cvr
+  let edition = req.edition
+  let expanded = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.expanded
+  let ffi_out = req.ffi_out
+  let in_place = cx.in_place
+  let inputs_out = req.inputs_out
+  let kir_verify = req.kir_verify
+  let lib_mods = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.lib_mods
+  let mode = req.mode
+  let package_name = req.package_name
+  let path = req.path
+  let prunes = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prunes
+  let quiet = req.quiet
+  let search_paths = req.search_paths
+  let src = req.src
+  let strict_holes = req.strict_holes
+  let test_own = req.test_own
+  let test_plan = req.test_plan
+  let test_roots = req.test_roots
+  let unstable_optins = req.unstable_optins
+  let user_cache = req.user_cache
+  let want_seed = cx.want_seed
+  let seeded = if in_place {
+    again(Req { path: path, mode: mode, backend: backend, strict_holes: strict_holes, search_paths: search_paths, src: "fn main() : Unit / Console {\n}\n", core_decls: core_decls_whole, core_mods: core_mods, core_segs: core_segs_whole, core_rows: core_rows, package_name: package_name, unstable_optins: unstable_optins, edition: edition, user_cache: false, batch_out: Some("/dev/null"), core_cache: CoreCacheOpt { ...core_cache, full_core: true, core_seed: Some(CoreSeed(cvar, cvr.seed)) }, test_roots: [], test_own: [], cover: cover, test_plan: "", kir_verify: kir_verify, inputs_out: "", ffi_out: "", quiet: true })
+  } else { 1 }
+  let picked = cmod_core_pick(backend, mode, core_cache, cpre, cvar)
+  let prunes = prunes or (in_place and seeded == 0 and is_some(picked))
+  let lib_mods = if in_place and prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }) } else { lib_mods }
+  let need_seed = want_seed and not in_place
+  let no_variant = chk == 0 and prunes and cvar != "" and is_some(core_hit) and is_none(picked) and not need_seed
+  SeedRun { prev: cx, picked: picked, prunes: prunes, lib_mods: lib_mods, need_seed: need_seed, no_variant: no_variant }
+}
+
+pub(pkg) fn stage_solve(req: Req, cx: SeedRun, again: (Req) -> Int / Stdout + Stderr + Stdin + File + Mutable) : Flow[Solved] / Console + File + Mutable {
+  let all_decls = cx.prev.prev.all_decls
+  let backend = req.backend
+  let chk = cx.prev.prev.chk
+  let core_decls_whole = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_decls_whole
+  let core_hit = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_hit
+  let core_mods = req.core_mods
+  let core_segs_whole = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_segs_whole
+  let cpre = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.cpre
+  let cvar = cx.prev.cvar
+  let cvr = cx.prev.cvr
+  let emptied = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.emptied
+  let json = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.json
+  let lib_mods = cx.lib_mods
+  let mode = req.mode
+  let need_seed = cx.need_seed
+  let no_variant = cx.no_variant
+  let pcut = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.pcut
+  let picked = cx.picked
+  let proto_reg = cx.prev.prev.proto_reg
+  let prunes = cx.prunes
+  let rd = cx.prev.prev.rd
+  let sym_tab = cx.prev.prev.prev.prev.sym_tab
+  let core_hit = match backend { BkCModular -> picked  _ -> core_hit }
+  let pcut = if chk == 0 and prunes and not no_variant {
+               core_pool(all_decls, list_append(core_mod_names(core_mods, []), lib_mods), proto_reg, emptied, cmod_plain(backend, mode))
+             } else { pool_none(all_decls) }
+  let cut = pcut.cut
+  let missed = match cut { CoreCut(_, _, m) -> m }
+  if chk != 0 { Halt(vd_exit(json, [Verdict(chk, rd.diags)])) }
+  else if need_seed { Halt(reseed_compile(req, again, core_decls_whole, core_segs_whole, cvar, cvr, cpre)) }
+  else if no_variant { Halt(recompile_full_core(req, again, core_decls_whole, core_segs_whole)) }
+  else if list_length(missed) > 0 { Halt(core_cut_fail("keeps a function the early cut emptied", core_cut_names(sym_tab, missed))) }
+  else { Go(Solved { prev: cx, core_hit: core_hit, pcut: pcut, cut: cut }) }
+}
+
+pub(pkg) fn stage_infer(req: Req, cx: Solved) : Flow[InferRun] / Console + File + Mutable {
+  let all_decls = cx.prev.prev.prev.all_decls
+  let core_cache = req.core_cache
+  let core_decls_whole = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.core_decls_whole
+  let cut = cx.cut
+  let emptied = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.emptied
+  let front = cx.prev.prev.prev.prev.front
+  let front_cx_of = cx.prev.prev.prev.prev.front_cx_of
+  let lib_mods = cx.prev.lib_mods
+  let mode = req.mode
+  let path = req.path
+  let pcut = cx.pcut
+  let proto_reg = cx.prev.prev.prev.proto_reg
+  let prunes = cx.prev.prunes
+  let rd = cx.prev.prev.prev.rd
+  let stamped = cx.prev.prev.prev.stamped
+  let surface_decls_whole = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.surface_decls_whole
+  let sym_tab = cx.prev.prev.prev.prev.prev.sym_tab
+  let target_mod_name = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.target_mod_name
+  let user_cache = req.user_cache
+  # Build the per-compile head-owner cache once from the
+  # post-`expand_imports` decl stream + the
+  # full module table (cores + transitively imported +
+  # the target file itself). The typer threads this cache
+  # into `synth_pipe_dispatch` so any in-scope `pub type`
+  # whose declaring module exports the canonical
+  # `map / flat_map / filter` participates in `|`, `||`,
+  # `|?` automatically — no compiler change required when
+  # a downstream package adds a new pipe-eligible type.
+  prune_note(core_cache.stats, prunes, cut)
+  let whole_decls = all_decls
+  let all_decls = match cut { CoreCut(kept, _, _) -> kept }
+  let dropped = match cut { CoreCut(_, d, _) -> d }
+  let pruned = match dropped { [] -> false _ -> true }
+  let whole_decls = pcut.stream
+  # The typed blobs follow the sources, so an explicit
+  # project directory wins over the entry's own: the
+  # native paths compile a copy of the entry from an
+  # ephemeral object-cache dir, and deriving the cache
+  # from that copy publishes blobs nothing ever reads.
+  # With the project cache off, a typecheck-only run rides
+  # the shared core-cache directory: the blobs are
+  # content-addressed by a key folding the module's decls,
+  # its inherited interface hash and the cross-module
+  # context, so a toolchain-scoped directory serves them
+  # safely, and without it the stdlib core is re-inferred
+  # on every invocation. Restricted to the modes that stop
+  # at the front-end: a build publishes one blob per module
+  # and the whole-compiler selfhost pays that serialisation
+  # on every run for a cache it never reads back.
+  let tcut_dir = typed_cut_dir(mode, user_cache, core_cache, path)
+  # Mutual tail recursion is fused into one
+  # self-recursive function ahead of inference, so the
+  # synthesised dispatch is typed like any other body and
+  # the self-tail rewrite downstream turns the cycle into
+  # the goto-loop it already emits.
+  let fused = pub_loop_workers(tailfuse_decls(whole_decls, sym_tab, target_mod_name), sym_tab, target_mod_name)
+  let dm = if pruned { Some(demand_new(fused.decls, pcut, proto_reg, true)) } else { None }
+  let front_src = FrontSrc { cx_of: front_cx_of, core: core_decls_whole, libs: precut_lib_fns(surface_decls_whole, lib_mods),
+                             stream: whole_decls, held: pcut.held, env: rd.env }
+  let defer = TcDefer { demand: dm, order: fused.decls, stats: core_cache.stats, front: Some(front_src) }
+  # The fused functions are declarations the typer must name.
+  let typed_tab = st_extend(sym_tab, fused.rows)
+  let tin = typer_in(front, stamped.view, whole_decls, typed_tab)
+  let tout = tcut_infer_demand(path, fused.decls, tcut_dir, tin, defer, match mode { MDumpSymIds -> true _ -> false })
+  let typed_prog0 = match tout { TcOut(tp, _) -> tp }
+  let asked_bare = match tout { TcOut(_, ms) -> ms }
+  if list_length(asked_bare) > 0 { Halt(core_cut_fail("asks for a function the early cut emptied", core_cut_names(sym_tab, asked_bare))) }
+  else { Go(InferRun { prev: cx, all_decls: all_decls, dropped: dropped, pruned: pruned, dm: dm, typed_tab: typed_tab, tin: tin, typed_prog0: typed_prog0 }) }
+}
+
+pub(pkg) fn stage_check(req: Req, cx: InferRun) : Flow[Checked] / Console + File + Mutable {
+  let core_mods = req.core_mods
+  let diag_ctx = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.diag_ctx
+  let dm = cx.dm
+  let early_const_uses = cx.prev.prev.prev.prev.prev.prev.early_const_uses
+  let json = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.json
+  let lowered = cx.prev.prev.prev.prev.prev.prev.lowered
+  let mod_tabs = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.mod_tabs
+  let module_table = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.module_table
+  let path = req.path
+  let post_use_decls = cx.prev.prev.prev.prev.prev.prev.post_use_decls
+  let proto_reg = cx.prev.prev.prev.prev.proto_reg
+  let rd = cx.prev.prev.prev.prev.rd
+  let region_marks = cx.prev.prev.prev.prev.prev.prev.prev.region_marks
+  let root_picks = cx.prev.prev.prev.prev.prev.prev.root_picks
+  let sym_tab = cx.prev.prev.prev.prev.prev.prev.sym_tab
+  let target_mod_name = cx.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.prev.target_mod_name
+  let typed_prog0 = cx.typed_prog0
+  let typed_tab = cx.typed_tab
+  # Contracts are discharged against the typed calls, where a
+  # pipe is the call it spells.
+  let contract_vd = if typed_prog0.errs != 0 { vd_count(0) }
+                    else { vd_render(call_site_diags(path, typed_prog0.decls, typed_tab)) }
+  # Post-inference protocol-call rewrite. `Expr.ty` is
+  # populated for every node now, so each `op(x, ...)`
+  # call can be redirected to the matching
+  # `__pimpl_<P>_<T>_<op>` direct call. Sites with
+  # unknown types fall through and execute the
+  # dispatcher fn's panic at runtime.
+  let proto_reg = match dm { Some(x) -> demand_registry(proto_reg, x, typed_prog0.decls)  None -> proto_reg }
+  let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg)
+  # Walk the post-rewrite AST and report any
+  # `__proto_<op>` call whose receiver type is concrete
+  # but has no matching impl. Polymorphic helpers whose
+  # receiver is a TyVar at this point keep the runtime
+  # fallthrough behaviour.
+  let dispatch_diags =
+    validate_resolved_protocols(typed_prog, typed_tab, proto_reg, diag_ctx)
+  # The pinned-region gate. A `region { }` bump-arena is
+  # a per-thread pointer; a fiber that parks inside one
+  # would resume on another OS thread with a stale arena
+  # pointer. Fail the compile if any region body can reach
+  # a suspending effect — the typed row already carries
+  # the transitive reach a syntactic scan would miss.
+  let region_yield_diags = region_yield_findings(typed_prog.decls, region_marks, path)
+  # Op-name collision diagnostic. The by-name handler
+  # walk binds the wrong evidence when an op name is shared
+  # by ≥2 effects and the call is not disambiguated; the
+  # typer's resolution record (`op_res`) flags those sites.
+  # Capability passing makes the collision impossible, so it
+  # is a compile error, not corruption.
+  let collision_errs =
+    check_op_collisions(path, typed_prog.op_res, typed_prog.decls, typed_tab)
+  # One table, one message, every class: a contested
+  # type reads like a contested function, and a bare
+  # name two modules both export is an error rather
+  # than a pick by registration order.
+  let name_errs =
+    nr_report_program_tab(diag_ctx, typed_prog.decls, target_mod_name,
+                      lowered.reg, early_const_uses,
+                      core_mod_names(core_mods, []),
+                      post_use_decls, root_picks, sym_tab,
+                      mtabs_of(mod_tabs, "").entries, typed_prog.diags)
+  # Unused local bindings in the root file's fns and in every
+  # runner block; warnings only.
+  report_unused_in_decls(path, module_table, typed_prog.decls)
+  let typed_vds = [Verdict(0, rd.diags), Verdict(typed_prog.errs, typed_prog.diags), contract_vd,
+                   vd_rendered(dispatch_diags), vd_rendered(region_yield_diags),
+                   vd_rendered(collision_errs), vd_rendered(name_errs)]
+  if vd_failed(typed_vds) { Halt(vd_exit(json, typed_vds)) }
+  else { Go(Checked { prev: cx, proto_reg: proto_reg, typed_prog: typed_prog, typed_vds: typed_vds }) }
+}
+
+
+fn reseed_compile(req: Req, again: (Req) -> Int / Stdout + Stderr + Stdin + File + Mutable, core_decls_whole: [Decl], core_segs_whole: [CoreSegment], cvar: String, cvr: CoreVariant, cpre: String) : Int / Console + File + Mutable {
+  # The core TU set of this program's variant does not exist yet: compile the core alone,
+  # with the unwind knowledge the program would bring, then this program against it.
+  let seeded = again(Req { ...req, src: "fn main() : Unit / Console {\n}\n", core_decls: core_decls_whole, core_segs: core_segs_whole,
+                           user_cache: false, batch_out: Some("/dev/null"),
+                           core_cache: CoreCacheOpt { ...req.core_cache, full_core: true, core_seed: Some(CoreSeed(cvar, cvr.seed)) },
+                           test_roots: [], test_own: [], test_plan: "", inputs_out: "", ffi_out: "", quiet: true })
+  let next_cache = if seeded == 0 and cmod_variant_known(req.core_cache, cpre, cvar) { req.core_cache }
+                   else { CoreCacheOpt { ...req.core_cache, full_core: true } }
+  again(Req { ...req, core_decls: core_decls_whole, core_segs: core_segs_whole, core_cache: next_cache, quiet: true })
+}
+
+fn recompile_full_core(req: Req, again: (Req) -> Int / Stdout + Stderr + Stdin + File + Mutable, core_decls_whole: [Decl], core_segs_whole: [CoreSegment]) : Int / Console + File + Mutable {
+  early_cut_note(req.core_cache.stats, ["no core TU set recorded for this program's variant"])
+  again(Req { ...req, core_decls: core_decls_whole, core_segs: core_segs_whole,
+              core_cache: CoreCacheOpt { ...req.core_cache, full_core: true }, quiet: true })
+}
+
