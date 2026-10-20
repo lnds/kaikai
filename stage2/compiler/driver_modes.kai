@@ -3,35 +3,45 @@ The driver's small modes: the token and builtin-doc listings, the guard
 listing, migrate, mutate, and the batch list.
 """)]
 
-import compiler.ast_decl
-import compiler.ast_ids
-import compiler.doc_attr
-import compiler.driver_cli
-import compiler.driver_core_load
-import compiler.driver_exports
-import compiler.driver_policy
-import compiler.edition
-import compiler.emit_cache
-import compiler.emit_native
-import compiler.emit_native_core
-import compiler.emit_shared_syms
+import compiler.util
+import compiler.lex
+import compiler.ast
+import compiler.symtab
+import compiler.parse_decls
 import compiler.fmt
 import compiler.fmt_writer
-import compiler.fnreg
-import compiler.guard_iface
-import compiler.home_dup
-import compiler.kir
-import compiler.lex
 import compiler.migrate
-import compiler.modules_paths
 import compiler.mutate
 import compiler.mutate_splice
-import compiler.parse_decls
-import compiler.resolve_env
-import compiler.spec_names
-import compiler.symtab
+import compiler.modules_paths
 import compiler.user_cache
-import compiler.util
+import compiler.guard_iface
+import compiler.edition
+import compiler.fnreg
+import compiler.doc_attr
+import compiler.driver_core_load
+import compiler.driver_cli
+import compiler.spec_names
+import compiler.resolve_env
+import compiler.home_dup
+import compiler.emit_shared
+import compiler.emit_cache
+import compiler.kir
+import compiler.emit_native
+import compiler.emit_native_core
+import compiler.driver_policy
+import compiler.driver_exports
+import compiler.real_lit
+import compiler.written
+import compiler.entry
+import compiler.module_table
+import compiler.region
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.infer_dump_text
+import compiler.unwind_clauses
+import compiler.driver_front
+import compiler.emit_c_program
 
 fn tok_text(src: String, t: Token) : String = string_slice(src, t.start, t.length)
 
@@ -420,3 +430,47 @@ pub(pkg) fn core_emit_key(cc: CoreCacheOpt, edition: Option[Edition], decls: [De
         string_join(hexes, "\n")]))
     }
   }
+
+# c-modular emit with the core emit cache threaded through. On a warm
+# entry the core TU bodies splice from the cache; on a miss the fresh
+# core TU bodies are persisted for the next build. Only plain builds
+# participate: test/bench shapes skip the cache instead of folding the
+# shape into the key.
+pub(pkg) fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymTab, specs: SpecNames,
+                             ids: ProtoIds, bmode: BuildMode, target_mod_name: String, entry: SymId,
+                             regions: [RegionMark], cc: CoreCacheOpt,
+                             core_mods: [ModuleEntry], edition: Option[Edition], pre: String, variant: String, seed: UnwSeed, hit: Option[String], stamp_ids: [SymId])
+                             : String / Console + File + Mutable = {
+  let plain = match bmode { BMBuild -> true _ -> false }
+  let cacheable = core_mod_names(core_mods, [])
+  let key = match hit {
+    Some(k) -> k
+    None    -> if plain { core_emit_key(cc, edition, decls, tab, specs, cacheable, target_mod_name, variant) } else { "" }
+  }
+  if key == "" {
+    let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
+    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), entry, regions, [], cacheable, false, seed, stamp_ids) {
+      EMO(stream, _) -> stream
+    }
+  } else {
+    let cached = match ec_lookup(cc.dir, key) { None -> [] Some(tus) -> tus }
+    let _v = if is_some(hit) and list_is_empty(cached) { panic("kaic2: the core TU set the compile pruned against is gone") } else { () }
+    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), entry, regions, cached, cacheable, is_some(hit), seed, stamp_ids) {
+      EMO(stream, fresh) -> {
+        let n_hit = list_length(cached)
+        let written = if n_hit == 0 and list_length(fresh) > 0 { ec_write(cc.dir, key, fresh) } else { "" }
+        let complete = if n_hit == 0 { fresh } else if list_is_empty(fresh) { cached } else { [] }
+        let _i = if is_none(hit) and variant != "" and not list_is_empty(complete) {
+          if written != "" { ec_index_record(cc.dir, pre, variant, key, written, cc.stats) }
+          else if not ec_index_has(cc.dir, pre, variant) { ec_index_record(cc.dir, pre, variant, key, ec_content_hex(complete), cc.stats) }
+          else { () }
+        } else { () }
+        let _s = if cc.stats {
+          if n_hit > 0 { eprint("kaic2: core-emit-cache: hit (#{n_hit} TUs)") }
+          else { eprint("kaic2: core-emit-cache: miss (wrote #{list_length(fresh)} TUs)") }
+        } else { () }
+        stream
+      }
+    }
+  }
+}
