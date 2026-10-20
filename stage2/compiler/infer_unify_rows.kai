@@ -339,6 +339,76 @@ fn unify_row(r1: Row, r2: Row, s: Subst) : Option[Subst] / Mutable {
 }
 
 
+#[doc("A call's argument types with function rows widened, and the substitution that does it.")]
+pub type WidenedArgs = { args: [Ty], sub: Subst }
+
+type WidenRows = { r: Int, e: Int, m: Row, l: Row }
+
+# The rows of a function argument ending in a rigid variable `e` passed for a
+# function parameter ending in a flexible `r`.
+fn widen_rows(param: Ty, arg: Ty, s: Subst) : Option[WidenRows] =
+  match (apply_ty_keep_row_labels(s, param), arg) {
+    (TyFnT(_, _, prow), TyFnT(_, _, arow)) -> {
+      let m = apply_row_tail_only(s, prow)
+      let l = apply_row_tail_only(s, arow)
+      match (m.tail, l.tail) {
+        (Some(r), Some(e)) -> if e != r and subst_row_is_rigid(s, e) and not subst_row_is_rigid(s, r) {
+          Some(WidenRows { r: r, e: e, m: m, l: l })
+        } else { None }
+        _ -> None
+      }
+    }
+    _ -> None
+  }
+
+# A function argument whose row is `L | e` with `e` rigid fits a parameter row
+# `M | r` with `r` flexible when L is within M: the argument does fewer effects
+# than the parameter allows. `r` takes `e` as its tail and the argument's row
+# becomes the parameter's. Any other shape keeps plain row equality.
+fn widen_fn_arg(param: Ty, arg: Ty, s: Subst) : WidenedArgs / Mutable =
+  match widen_rows(param, arg, s) {
+    None -> WidenedArgs { args: [arg], sub: s }
+    Some(w) -> {
+      let p = partition_labels_sub(w.l.labels, w.m.labels, s)
+      if not labels_empty(p.only_left) or labels_empty(p.only_right) { WidenedArgs { args: [arg], sub: s } }
+      else { match (unify_label_pairs(p.both_pairs, s), arg) {
+        (Some(s1), TyFnT(ap, ar, _)) -> WidenedArgs {
+          args: [TyFnT(ap, ar, w.m)],
+          sub: subst_row_extend(s1, w.r, Row { labels: [], tail: Some(w.e), display_alias: None }) }
+        _ -> WidenedArgs { args: [arg], sub: s }
+      } }
+    }
+  }
+
+# Every other argument settles first: labels the parameter row gains from them
+# count toward what the widened argument may leave out.
+fn settle_other_args(env: TyEnv, params: [Ty], args: [Ty], s: Subst) : Subst / Mutable =
+  match (params, args) {
+    ([p, ...prest], [a, ...arest]) -> match widen_rows(p, a, s) {
+      Some(_) -> settle_other_args(env, prest, arest, s)
+      None -> match unify_env(env, p, a, s) {
+        Some(s1) -> settle_other_args(env, prest, arest, s1)
+        None     -> settle_other_args(env, prest, arest, s)
+      }
+    }
+    _ -> s
+  }
+
+fn widen_each(params: [Ty], args: [Ty], s: Subst) : WidenedArgs / Mutable =
+  match (params, args) {
+    ([p, ...prest], [a, ...arest]) -> {
+      let w = widen_fn_arg(p, a, s)
+      let rest = widen_each(prest, arest, w.sub)
+      WidenedArgs { args: list_append(w.args, rest.args), sub: rest.sub }
+    }
+    _ -> WidenedArgs { args: args, sub: s }
+  }
+
+#[doc("Widens each function argument whose parameter row admits more effects, so the call unifies by row equality.")]
+pub fn widen_fn_args(env: TyEnv, params: [Ty], args: [Ty], s: Subst) : WidenedArgs / Mutable =
+  widen_each(params, args, settle_other_args(env, params, args, s))
+
+
 # variant of `apply_ty` whose only difference from the
 # plain one is that effect-row LABELS are NOT substituted (the row
 # tail still is). Used by `unify_env` so a downstream `unify_row`
