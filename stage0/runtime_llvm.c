@@ -38,7 +38,7 @@
  * Layout coupling: the emitted IR reads cell interiors directly (the
  * variant tag word and the inline slot array) through typed GEPs the
  * emitter lays against the VANILLA packed header — see
- * stage2/compiler/emit_native_slot.kai, the one module that owns that
+ * stage2/compiler/emit_native_fn.kai, the one module that owns that
  * layout. The static asserts below pin `struct KaiValue` to the exact
  * offsets the emitter hardcodes; a header change (or a build defining
  * KAI_TRACE_RC* for this TU, which grows the header) fails here at
@@ -77,7 +77,7 @@
 #include <runtime.h>
 #include <stddef.h>
 
-/* The native emitter's layout module (emit_native_slot.kai) models the
+/* The native emitter's layout module (emit_native_fn.kai) models the
  * cell as `{ i32 rc, i8 tag, i8 var_n_args, i16 variant_tag, [N x i64] }`
  * with the slot array at the union offset. These pins are that contract. */
 _Static_assert(offsetof(KaiValue, rc) == 0, "native emitter layout: rc at 0");

@@ -1,45 +1,168 @@
-# compiler/emit_native.kai — KIR → in-process libLLVM backend, the
-# orchestration layer (KIR Lane 1, docs/kir-design.md §7.2).
-#
-# `build_native_object` consumes a `KProgram` and constructs the LLVM
-# module IN MEMORY by calling the libLLVM C API (via the raw-core
-# prims in `native_prims.kai` / `runtime.h`), runs verify + codegen, and
-# emits a native object file — one process, no `.ll` text, no `clang`.
-# The driver then links that object against the effects runtime to
-# produce the executable.
-#
-# Native is opt-in this lane (`KAI_BACKEND=native` / `--emit=native`); the
-# C-text backend stays the default + bootstrap + the differential oracle
-# every construct is validated against. The flip to native-default is
-# Lane 1.5.
-#
-# This file is the orchestration: cache the LLVM types, declare every
-# user function up front (so a call can forward-reference a fn defined
-# later), walk each `KFn` (the per-fn walk lives in `emit_native_fn` /
-# `emit_native_ops` / `emit_native_term`), emit the runtime-entry hooks,
-# and — IFF every node lowered (`e.ok`) — verify + emit the object. A node
-# that breaks a lowering invariant flips `e.ok` false (a loud
-# `nemit_unsupported`), and `build_native_object` returns non-zero rather
-# than emit a half-built module.
+#[doc("""
+The native backend driver: program emission and the test and bench runner driver.
 
-import compiler.util
-import compiler.modules_paths
+compiler/emit_native_test.kai — the synthetic `kai_main` driver the
+native backend emits in test / bench / check mode (`--emit=native --test` /
+`--bench` / `--prop-check`).
+
+The C-direct backend builds a fresh `int main` per build mode
+(emit_c's `emit_main_wrapper`): in test mode it calls each
+`_kai_test_<id>()` and returns `kai_test_summary()`. The native
+backend cannot emit `int main` — `stage0/runtime_llvm.c` owns it and
+always calls `kai_main()`. So in test/bench mode the runner body fns
+already live in `KProgram.fns` (one per block, returning the block's
+final boxed value — see `lower_runner_decls`), and THIS module emits
+the `kai_main` symbol as a driver that runs them through the runtime
+helpers and `exit()`s with the summary code. That driver is the entry
+point of such a build: no `KFn` is, so a user `fn main` is emitted under
+its own symbol like any function.
+
+compiler/emit_native.kai — KIR → in-process libLLVM backend, the
+orchestration layer (KIR Lane 1, docs/kir-design.md §7.2).
+
+`build_native_object` consumes a `KProgram` and constructs the LLVM
+module IN MEMORY by calling the libLLVM C API (via the raw-core
+prims in `native_prims.kai` / `runtime.h`), runs verify + codegen, and
+emits a native object file — one process, no `.ll` text, no `clang`.
+The driver then links that object against the effects runtime to
+produce the executable.
+
+Native is opt-in this lane (`KAI_BACKEND=native` / `--emit=native`); the
+C-text backend stays the default + bootstrap + the differential oracle
+every construct is validated against. The flip to native-default is
+Lane 1.5.
+
+This file is the orchestration: cache the LLVM types, declare every
+user function up front (so a call can forward-reference a fn defined
+later), walk each `KFn` (the per-fn walk lives in `emit_native_fn` /
+`emit_native_ops` / `emit_native_term`), emit the runtime-entry hooks,
+and — IFF every node lowered (`e.ok`) — verify + emit the object. A node
+that breaks a lowering invariant flips `e.ok` false (a loud
+`nemit_unsupported`), and `build_native_object` returns non-zero rather
+than emit a half-built module.
+""")]
+
 import compiler.ast
+import compiler.effect_instance
+import compiler.emit_native_def
+import compiler.emit_native_fn
+import compiler.emit_native_proto
+import compiler.emit_native_term
+import compiler.emit_shared
+import compiler.fn_index
+import compiler.fnreg
 import compiler.kir
 import compiler.kir_syms
-import compiler.fnreg
-import compiler.fn_index
-import compiler.effect_instance
-import compiler.emit_shared
-import compiler.emit_native_di
-import compiler.emit_native_fn
-import compiler.emit_native_term
-import compiler.emit_native_fnix
-import compiler.emit_native_def
-import compiler.emit_native_declenv
-import compiler.emit_native_proto
-import compiler.emit_native_test
-import compiler.emit_native_call
+import compiler.modules_paths
+import compiler.util
+
+# True when the build mode runs a synthetic runner driver instead of the
+# user's `fn main`.
+pub fn nemit_is_runner_mode(bmode: BuildMode) : Bool = match bmode {
+  BMBuild -> false
+  _       -> true
+}
+
+# Emit the synthetic `kai_main` driver for the active runner mode. Opens
+# `kai_main` with the shim's `ptr ()` signature, registers and drives the
+# test blocks or runs each bench block, then calls the matching
+# `*_summary_exit` (which prints the summary and `exit()`s with its code). The block ends `unreachable`: `*_summary_exit` never
+# returns, but a basic block still needs a terminator.
+fn nemit_build_runner_driver(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console =
+  if nemit_is_runner_mode(bmode) {
+    ndriver_open_kai_main(ctx)
+    nemit_runner_calls(ctx, runners, bmode)
+    match bmode {
+      BMTest -> { let _d = ncall_sig0(ctx, "kaix_test_drive", native_ctx_voidt(ctx)) }
+      _ -> ()
+    }
+    let _e = ncall_sig0(ctx, ndriver_exit_sym(bmode), native_ctx_voidt(ctx))
+    llvm_build_unreachable(native_ctx_b(ctx))
+  } else { () }
+
+# Open `KaiValue *kai_main(void)` + position the builder at its entry.
+# Mirrors `ndef_open_void_fn` but with the `ptr ()` return the shim's
+# `extern KaiValue *kai_main(void)` expects.
+fn ndriver_open_kai_main(ctx: Handle) : Unit = {
+  let m = native_ctx_m(ctx)
+  let fnty = llvm_fn_type_0(native_ctx_ptrt(ctx))
+  let fnval = llvm_add_function(m, "kai_main", fnty)
+  let entry = llvm_append_block(m, fnval, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+}
+
+# The `*_summary_exit` forwarder for this mode.
+fn ndriver_exit_sym(bmode: BuildMode) : String = match bmode {
+  BMBench -> "kaix_bench_summary_exit"
+  BMCheck -> "kaix_check_summary_exit"
+  _       -> "kaix_test_summary_exit"
+}
+
+# Does this runner belong to the active driver mode? Each mode runs only
+# its own kind of block — the C oracle drives the same split by emitting a
+# per-mode call list.
+fn nrunner_in_mode(kind: KRunnerKind, bmode: BuildMode) : Bool = match bmode {
+  BMBench -> match kind { KRBench -> true _ -> false }
+  BMCheck -> match kind { KRCheck(_) -> true _ -> false }
+  _       -> match kind { KRTest  -> true _ -> false }
+}
+
+fn nemit_runner_calls(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console = match runners {
+  [] -> ()
+  [r, ...rest] -> {
+    if nrunner_in_mode(r.kind, bmode) { nemit_runner_call(ctx, r) } else { () }
+    nemit_runner_calls(ctx, rest, bmode)
+  }
+}
+
+fn nemit_runner_call(ctx: Handle, r: KRunner) : Unit / Console = match r.kind {
+  KRCheck(specs) -> nemit_check_runner_call(ctx, r, specs)
+  _              -> nemit_one_runner_call(ctx, r)
+}
+
+# `kaix_check_run_one(i8* desc, i8* spec, ptr thunk) -> void`. The body is
+# reached through its thunk-ABI forwarder, so the runtime passes the
+# generated params as `args[]` whatever the body's own signature is; `spec`
+# is the `;`-joined `name:Type` list the runtime generates and shrinks from.
+fn nemit_check_runner_call(ctx: Handle, r: KRunner, specs: [String]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let b = native_ctx_b(ctx)
+  let desc = llvm_build_string_span(b, nemit_decode_span(r.desc))
+  let spec = llvm_build_string_span(b, string_join(specs, ";"))
+  let thunk = nemit_declare_thunk(ctx, c_user_thunk_sym(r.sym))
+  let _c = ncall_sig3(ctx, "kaix_check_run_one", native_ctx_voidt(ctx), p, p, p, desc, spec, thunk)
+  ()
+}
+
+# A test block registers `(desc, body, line, home)` for `kaix_test_drive`; a
+# bench block runs in place through `kaix_bench_run_one(desc, body)`. `desc`
+# is the block's source span decoded to its literal bytes; `body` is the
+# runner fn's `Function*` handle, which under opaque pointers IS the `ptr`.
+fn nemit_one_runner_call(ctx: Handle, r: KRunner) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let b = native_ctx_b(ctx)
+  let desc = llvm_build_string_span(b, nemit_decode_span(r.desc))
+  let bodyfn = llvm_get_or_declare_fn(native_ctx_m(ctx), r.sym, llvm_fn_type_0(p))
+  match r.kind {
+    KRTest -> {
+      let i32t = native_ctx_i32t(ctx)
+      let home = llvm_build_string_span(b, r.home)
+      let _c = ncall_sig4(ctx, "kaix_test_register", native_ctx_voidt(ctx), p, p, i32t, p,
+                          desc, bodyfn, llvm_const_i32(i32t, r.line), home)
+      ()
+    }
+    _ -> {
+      let _c = ncall_sig2(ctx, "kaix_bench_run_one", native_ctx_voidt(ctx), p, p, desc, bodyfn)
+      ()
+    }
+  }
+}
+
+# The defaults `kai_main_install_defaults` stamps: a runner driver calls
+# blocks that may perform any default-handled effect, a program entry
+# only what `main`'s row names.
+pub fn nemit_entry_defaults(kp: KProgram, bmode: BuildMode) : [KDefault] =
+  if nemit_is_runner_mode(bmode) { kp.runner_defaults } else { kp.defaults }
 
 # Build the LLVM module for `kp` in memory and emit it as an object at
 # `out_path`. Returns 0 on success, non-zero on a verify / codegen
@@ -262,7 +385,7 @@ fn native_build_runtime_hooks(ctx: Handle, kp: KProgram, defaults: [KDefault], d
 # A path not ending in `.kai` just gets `.o` appended. The `bin/kai`
 # wrapper (or the test harness) links this object against the effects
 # runtime to the final executable.
-pub fn native_object_path(src_path: String) : String = {
+fn native_object_path(src_path: String) : String = {
   let n = string_length(src_path)
   if n > 4 and string_slice(src_path, n - 4, 4) == ".kai" {
     cat2(string_slice(src_path, 0, n - 4), ".o")

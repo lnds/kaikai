@@ -1,40 +1,114 @@
-# compiler/emit_native_core.kai — the whole-program native build split into a
-# cached CORE object plus a per-build USER object.
-#
-# Every fn homing to an auto-loaded core module (plus the lambdas those fns
-# lift, whose symbols embed their enclosing module) emits into ONE core
-# object, content-addressed under the shared core cache dir. The core's KIR
-# is a pure function of the core sources — monomorphised instances of core
-# generics home to the root, so a user program cannot perturb the partition —
-# and the key folds everything else that shapes the object (toolchain id,
-# edition, target triple, opt level, runtime-bitcode ids, core source
-# hashes). A warm build therefore links the stored object and only lowers,
-# optimises and emits the user's own partition.
-#
-# Soundness is the modular-cache model: a stale object cannot be linked
-# because the key IS the content — any drift in what would be emitted (or in
-# what emits it) produces a different filename, and a miss re-emits. Both
-# partitions are raw (external-linkage) emissions of the SAME whole-program
-# tables, so their ABIs agree by construction, exactly like native-modular
-# partitions.
+#[doc("""
+Native build entry points: owned text, core objects and separate compilation.
 
-import compiler.util
+What the partition that owns a program's singletons emits beyond the
+functions it defines, as text for its cache key: the default handlers
+it installs and the globals it defines for them, the impl table it
+registers, and the runner driver.
+
+Each part is read from the value its emitter walks, so the key moves
+whenever the object would. A singleton the owner gains belongs here in
+the same change, or two builds that differ only in it share one object.
+
+compiler/emit_native_core.kai — the whole-program native build split into a
+cached CORE object plus a per-build USER object.
+
+Every fn homing to an auto-loaded core module (plus the lambdas those fns
+lift, whose symbols embed their enclosing module) emits into ONE core
+object, content-addressed under the shared core cache dir. The core's KIR
+is a pure function of the core sources — monomorphised instances of core
+generics home to the root, so a user program cannot perturb the partition —
+and the key folds everything else that shapes the object (toolchain id,
+edition, target triple, opt level, runtime-bitcode ids, core source
+hashes). A warm build therefore links the stored object and only lowers,
+optimises and emits the user's own partition.
+
+Soundness is the modular-cache model: a stale object cannot be linked
+because the key IS the content — any drift in what would be emitted (or in
+what emits it) produces a different filename, and a miss re-emits. Both
+partitions are raw (external-linkage) emissions of the SAME whole-program
+tables, so their ABIs agree by construction, exactly like native-modular
+partitions.
+
+compiler/emit_native_modular.kai — the native separate-compilation driver.
+
+The frontend stays whole-program: parse / infer / perceus / monomorph run
+once and produce ONE `KProgram`. This backend partitions only the CODEGEN —
+it projects that whole-program `KProgram` onto one LLVM module per `KFn.mo`
+(the `home_tu` partition L2 stamped) plus the root, emits each to its own
+object, and returns the object paths for the driver to link. The per-module
+object is a PROJECTION of the whole-program computation, never an isolated
+compile: every partition declares the SAME whole-program fn table, so their
+ABIs agree by construction and no serialised signature can drift.
+
+What lands where (asu-reviewed):
+  root TU  — every fn with `mo = None` (private fns, lambdas, clauses, the
+             user `main`), the proto impl-table init, the
+             default install/teardown, the default-evidence global DEFINITIONS
+             (external), and the synthetic `kai_main` runner driver. It is the
+             runtime owner, so the runtime links against it.
+  leaf TU  — every fn homing to that module; the default globals and the other
+             modules' fns it calls are EXTERNAL declarations resolved at link.
+  Every TU carries the thunk of each fn it defines, so a closure over a fn
+  of another module resolves the definition that module's object holds.
+
+Cache: each partition's object is content-addressed on the hash of its
+projected KIR — the fns it DEFINES plus every program fn's SIGNATURE (so a
+producer's signature/ownership flip rewrites a consumer's key). With a cache
+dir, a hit reuses the stored object and SKIPS codegen; only changed partitions
+re-emit. Without one, every partition emits to `<out_dir>/<stem>.o`.
+""")]
+
 import compiler.ast
-import compiler.kir
+import compiler.emit_native
+import compiler.emit_native_def
+import compiler.emit_native_fn
+import compiler.emit_native_proto
+import compiler.emit_shared
 import compiler.enc_unit
-import compiler.kir_syms
+import compiler.fn_index
+import compiler.fnreg
 import compiler.infer_index
+import compiler.kir
+import compiler.kir_syms
+import compiler.ncore_index
+import compiler.spec_names
 import compiler.symtab
 import compiler.user_cache
-import compiler.fnreg
-import compiler.fn_index
-import compiler.emit_shared
-import compiler.emit_native_modkey
-import compiler.emit_native_declenv
-import compiler.emit_native_fn
-import compiler.emit_native_test
-import compiler.emit_native
-import compiler.ncore_index
+import compiler.util
+
+#[doc("The text of what the owner of the singletons of `kp` emits for them in a `bmode` build.")]
+fn nowned_text(kp: KProgram, decls: [Decl], variants: [VariantEntry], fns: [EFn], bmode: BuildMode) : String =
+  concat_all([
+    "entry defaults\n", nowned_defaults_text(kp.tab, nemit_entry_defaults(kp, bmode)),
+    "default globals\n", nowned_defaults_text(kp.tab, kp.synth_defaults),
+    nproto_init_text(decls, kp.tab, kp.ids, variants, fns, kp.reuse_tags),
+    "runners ", nowned_mode_word(bmode), "\n", concat_all(map(kp.runners, nowned_runner_text))
+  ])
+
+fn nowned_defaults_text(tab: SymTab, ds: [KDefault]) : String = concat_all(map(ds, (d) => match d {
+  KDef(eff, ops) -> concat_all([rt_name(tab, eff), ":", concat_all(map(ops, nowned_op_text)), "\n"])
+}))
+
+fn nowned_op_text(op: KDefOp) : String = match op {
+  KDOp(name, sym, arity) -> concat_all([" ", name, "=", sym, "/", int_to_string(arity)])
+}
+
+fn nowned_mode_word(bmode: BuildMode) : String = match bmode {
+  BMBuild -> "build"
+  BMTest  -> "test"
+  BMBench -> "bench"
+  BMCheck -> "check"
+}
+
+fn nowned_runner_text(r: KRunner) : String =
+  concat_all([r.sym, " ", int_to_string(r.line), " ", r.home, " ", nowned_kind_text(r.kind), " ", r.desc, "\n"])
+
+fn nowned_kind_text(k: KRunnerKind) : String = match k {
+  KRTest         -> "test"
+  KRBench        -> "bench"
+  KRCheck(specs) -> cat2("check ", string_join(specs, ";"))
+}
 
 #[doc("Configuration of the native core-object cache: the writable cache dir, the toolchain id, the edition, the backend tag (triple, opt level, bitcode ids), the joined core source hashes, the stats toggle, and the pre-key the obtained object is recorded under (empty records nothing).")]
 pub type NCoreCfg = { dir: String, toolchain: String, edition: String,
@@ -273,3 +347,133 @@ fn ncore_key(kp: KProgram, core_fns: [KFn], cfg: NCoreCfg) : String =
   uc_content_hex(concat_all([
     "NCO1\n", cfg.toolchain, "\n", cfg.edition, "\n", cfg.tag, "\n", cfg.srcs_hex, "\n",
     nmodkey_core(kp, core_fns)]))
+
+#[doc("Emit the program as N native objects (root plus one per KFn.mo) and return their object paths, empty on a codegen failure. A Some cache_dir content-addresses each object and skips codegen on a hit. The caller links every returned path with the runtime owner.")]
+pub fn build_native_modular(kp: KProgram, decls: [Decl], variants: [VariantEntry],
+                            fns: [EFn], bmode: BuildMode, out_dir: String,
+                            cache_dir: Option[String], src_path: String)
+                            : [String] / Console + File = {
+  let emit_fns = kp.fns
+  let mods = nmod_distinct_modules(emit_fns, [])
+  # One key context for the build: every partition is keyed on, and emitted
+  # from, the same declaration analyses.
+  let kc = nmodkey_ctx(kp, ndecl_env(kp, decls))
+  let root = nmod_emit_one(kc, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
+                           "__root__", nmod_fns_of(emit_fns, None), NModRoot)
+  match root {
+    None    -> []
+    Some(r) -> nmod_emit_leaves(kc, decls, variants, fns, bmode, src_path, out_dir,
+                                cache_dir, emit_fns, mods, [r])
+  }
+}
+
+# The distinct `Some(m)` module origins across the fn list, first-seen order.
+fn nmod_distinct_modules(fns: [KFn], acc: [String]) : [String] = match fns {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> match f.mo {
+    None    -> nmod_distinct_modules(rest, acc)
+    Some(m) -> if list_has(acc, m) { nmod_distinct_modules(rest, acc) }
+               else                { nmod_distinct_modules(rest, [m, ...acc]) }
+  }
+}
+
+# The fns homing to `mo` (`None` = root), preserving program order.
+fn nmod_fns_of(fns: [KFn], mo: Option[String]) : [KFn] = nmod_fns_of_loop(fns, mo, [])
+fn nmod_fns_of_loop(fns: [KFn], mo: Option[String], acc: [KFn]) : [KFn] = match fns {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> if nmod_mo_eq(f.mo, mo) { nmod_fns_of_loop(rest, mo, [f, ...acc]) }
+                  else                    { nmod_fns_of_loop(rest, mo, acc) }
+}
+
+fn nmod_mo_eq(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true  Some(_) -> false }
+  Some(x) -> match b { None -> false Some(y) -> x == y }
+}
+
+# Emit each leaf module, threading the accumulated object-path list. A partition
+# that fails codegen aborts the whole build (returns []), since a missing object
+# would break the link.
+fn nmod_emit_leaves(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+                    bmode: BuildMode, src_path: String, out_dir: String,
+                    cache_dir: Option[String], all_fns: [KFn], mods: [String],
+                    acc: [String]) : [String] / Console + File = match mods {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> {
+    let a = nmod_emit_one(kc, decls, variants, fns, bmode, src_path, out_dir, cache_dir,
+                          nmod_stem(m), nmod_fns_of(all_fns, Some(m)), NModLeaf)
+    match a {
+      None    -> []
+      Some(x) -> nmod_emit_leaves(kc, decls, variants, fns, bmode, src_path, out_dir,
+                                  cache_dir, all_fns, rest, [x, ...acc])
+    }
+  }
+}
+
+# Build one partition. On a cache hit (the content-addressed object already
+# exists) codegen is skipped and the cached path returned; otherwise the module
+# is built and emitted. Returns the object path, or `None` on a codegen failure.
+fn nmod_emit_one(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+                 bmode: BuildMode, src_path: String, out_dir: String,
+                 cache_dir: Option[String], stem: String, define_fns: [KFn],
+                 role: NModRole) : Option[String] / Console + File = {
+  let key = nmod_cache_key(kc, decls, variants, fns, bmode, define_fns, role)
+  let obj = nmod_obj_path(out_dir, cache_dir, stem, key)
+  if nmod_cached(cache_dir, obj) { Some(obj) }
+  else { nmod_build(kc, decls, variants, fns, bmode, src_path, stem, define_fns, role, obj) }
+}
+
+# The object path: content-addressed `<cache_dir>/<key>.o` when a cache dir is
+# set (so identical KIR reuses one object across builds), else `<out_dir>/<stem>.o`.
+fn nmod_obj_path(out_dir: String, cache_dir: Option[String], stem: String, key: String) : String =
+  match cache_dir {
+    Some(d) -> concat_all([d, "/", key, ".o"])
+    None    -> concat_all([out_dir, "/", stem, ".o"])
+  }
+
+# A cache hit iff a cache dir is set and the content-addressed object already
+# exists — probed with `read_file` (its `Ok` means present) rather than a
+# dedicated exists prim, so kaic1 (which lacks that prim) still bootstraps.
+fn nmod_cached(cache_dir: Option[String], obj: String) : Bool / File = match cache_dir {
+  None    -> false
+  Some(_) -> match read_file(obj) { Ok(_) -> true Err(_) -> false }
+}
+
+# Build the LLVM module for this partition and emit its object with the raw
+# (no runtime-bitcode-merge, no internalise) emitter so cross-TU symbols keep
+# external linkage. A hit is probed by existence, so the emitter publishes the
+# object atomically and a concurrent build never sees it half-written.
+fn nmod_build(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+              bmode: BuildMode, src_path: String, stem: String,
+              define_fns: [KFn], role: NModRole, obj: String) : Option[String] / Console + File = {
+  let m = llvm_module_new(cat2("kai_native_", stem))
+  let ctx = native_ctx_new(m)
+  nemit_build_module(ctx, kc.kp, decls, variants, fns, bmode, src_path, define_fns, kc.kp.fns, role, kc.env)
+  if native_ctx_ok(ctx) == 1 {
+    if llvm_emit_object_raw(m, obj) != 0 { None } else { Some(obj) }
+  } else {
+    eprint(concat_all(["native-modular: partition ", stem, " not emitted — a KIR node is outside the current subset (see above)"]))
+    None
+  }
+}
+
+# The partition's content-addressed cache key (see emit_native_modkey). The
+# owner of the singletons emits them too, so its key folds their text; a
+# leaf's stays free of the build mode.
+fn nmod_cache_key(kc: NKeyCtx, decls: [Decl], variants: [VariantEntry], fns: [EFn],
+                  bmode: BuildMode, define_fns: [KFn], role: NModRole) : String =
+  nmodkey_of(kc, define_fns, nmod_role_tag(role),
+             if nmod_owns_singletons(role) { nowned_text(kc.kp, decls, variants, fns, bmode) } else { "" })
+
+fn nmod_role_tag(role: NModRole) : String = match role {
+  NModWhole -> "whole"  NModRoot -> "root"  NModLeaf -> "leaf"
+  NModSplitRoot -> "splitroot"  NModSplitCore -> "splitcore"
+}
+
+# Sanitise a module origin into an object-file stem (`geo.shapes` -> `geo_shapes`).
+fn nmod_stem(m: String) : String = nmod_dots(m, 0, string_length(m), "")
+fn nmod_dots(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else {
+    let c = string_slice(s, i, 1)
+    nmod_dots(s, i + 1, n, cat2(acc, if c == "." { "_" } else { c }))
+  }
