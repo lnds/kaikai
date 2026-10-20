@@ -92,55 +92,42 @@ fn trmc_reuse_cons_tail(xs: [Expr], me: SelfRef, arity: Int, cons_ok: Bool) : Bo
   cons_ok and
   (match trmc_reuse_cons_modcons(xs, me, arity) { Some(_) -> true None -> false })
 
+fn tcrec_walk_call(f: Expr, xs: [Expr], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
+  match f.kind {
+    EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
+    _ -> (tcrec_callee_is_self(f, me) and list_length(xs) == arity)
+         or (tcrec_names_ctor(tab, f) and is_some(tcrec_ctor_modcons_slot(xs, me, arity)))
+  }
+
+fn tcrec_walk_opt(o: Option[Expr], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool = match o {
+  None -> false
+  Some(e) -> tcrec_walk_tail(e.kind, me, arity, cons_ok, tab)
+}
+
+fn tcrec_walk_ret_slot(stmts: [Stmt], tl: LocalId, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
+  if ret_slot_id_is_scope(tl) {
+    match trmc_find_ret_let_rhs(stmts, tl) {
+      Some(inner) -> tcrec_walk_tail(inner.kind, me, arity, cons_ok, tab)
+      None        -> false
+    }
+  } else { false }
+
+fn tcrec_walk_block(stmts: [Stmt], opt_tail: Option[Expr], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
+  match opt_tail {
+    None -> false
+    Some(e) -> match e.kind {
+      ELocal(tl) -> tcrec_walk_ret_slot(stmts, tl, me, arity, cons_ok, tab)
+      _ -> tcrec_walk_tail(e.kind, me, arity, cons_ok, tab)
+    }
+  }
+
 fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
   match k {
-    ECall(f, xs) -> match f.kind {
-      # Builtin cons via perceus's reuse-cons rewrite.
-      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
-      _ ->
-        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-          true
-        } else if tcrec_names_ctor(tab, f) {
-          # TRMC: a constructor application in tail position with a
-          # self-call in exactly one slot is modulo-cons-eligible.
-          match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
-        } else { false }
-    }
-    EList(els) ->
-      if cons_ok { match trmc_list_cons_modcons(els, me, arity) { Some(_) -> true None -> false } }
-      else { false }
-    EIf(_, t, opt_e) -> {
-      if tcrec_walk_tail(t.kind, me, arity, cons_ok, tab) { true }
-      else { match opt_e {
-        None -> false
-        Some(e2) -> tcrec_walk_tail(e2.kind, me, arity, cons_ok, tab)
-      } }
-    }
+    ECall(f, xs) -> tcrec_walk_call(f, xs, me, arity, cons_ok, tab)
+    EList(els) -> cons_ok and is_some(trmc_list_cons_modcons(els, me, arity))
+    EIf(_, t, opt_e) -> tcrec_walk_tail(t.kind, me, arity, cons_ok, tab) or tcrec_walk_opt(opt_e, me, arity, cons_ok, tab)
     EMatch(_, arms) -> tcrec_walk_arms(arms, me, arity, cons_ok, tab)
-    EBlock(stmts, opt_tail) -> {
-      match opt_tail {
-        None -> false
-        # Perceus wraps an arm/block tail as `EBlock([..SLet(__pcs_arm_ret,
-        # INNER)..], Some(ELocal(__pcs_arm_ret)))`. The tail read carries no
-        # self-call shape, so the naive descent reports `false` and the TRMC
-        # rewrite is skipped — exactly the mixed-signature regression where
-        # the unbox/perceus passes introduce this wrap and the gate then
-        # loses the modulo-cons site `trmc_walk_modcons` (which DOES unwrap)
-        # still sees. Peel the wrap here too so the gate and the modcons
-        # recogniser agree, keeping TRMC (and its fused reuse-in-place)
-        # alive through mixed-signature unboxing.
-        Some(e) -> match e.kind {
-          ELocal(tl) ->
-            if ret_slot_id_is_scope(tl) {
-              match trmc_find_ret_let_rhs(stmts, tl) {
-                Some(inner) -> tcrec_walk_tail(inner.kind, me, arity, cons_ok, tab)
-                None        -> false
-              }
-            } else { false }
-          _ -> tcrec_walk_tail(e.kind, me, arity, cons_ok, tab)
-        }
-      }
-    }
+    EBlock(stmts, opt_tail) -> tcrec_walk_block(stmts, opt_tail, me, arity, cons_ok, tab)
     _ -> false
   }
 }
@@ -178,24 +165,22 @@ pub(pkg) fn trmc_row_is_affine(row: RowExpr) : Bool = match row {
 pub(pkg) fn trmc_body_has_modcons(body: Expr, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
   trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, cons_ok, tab)
 
+fn trmc_walk_modcons_opt(o: Option[Expr], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool = match o {
+  None -> false
+  Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, me, arity, cons_ok, tab)
+}
+
 fn trmc_walk_modcons(k: ExprKind, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
-      _ ->
-        if tcrec_names_ctor(tab, f) {
-          match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
-        } else { false }
+      _ -> tcrec_names_ctor(tab, f) and is_some(tcrec_ctor_modcons_slot(xs, me, arity))
     }
-    EList(els) ->
-      if cons_ok { match trmc_list_cons_modcons(els, me, arity) { Some(_) -> true None -> false } }
-      else { false }
+    EList(els) -> cons_ok and is_some(trmc_list_cons_modcons(els, me, arity))
     EIf(_, t, opt_e) ->
-      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, me, arity, cons_ok, tab) { true }
-      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, me, arity, cons_ok, tab) } }
+      trmc_walk_modcons((trmc_unwrap_ret(t)).kind, me, arity, cons_ok, tab) or trmc_walk_modcons_opt(opt_e, me, arity, cons_ok, tab)
     EMatch(_, arms) -> trmc_walk_modcons_arms(arms, me, arity, cons_ok, tab)
-    EBlock(_, opt_tail) ->
-      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, me, arity, cons_ok, tab) }
+    EBlock(_, opt_tail) -> trmc_walk_modcons_opt(opt_tail, me, arity, cons_ok, tab)
     _ -> false
   }
 }
@@ -278,21 +263,21 @@ pub(pkg) fn tcrec_body_has_sentinel(body: Expr) : Bool =
 # pure TRMC-shape probe so its eligibility gate stays in lock-step with C.
 pub fn trmc_body_has_step(body: Expr) : Bool = trmc_scan_step_kind(body.kind)
 
+fn trmc_step_opt(o: Option[Expr]) : Bool = match o {
+  None -> false
+  Some(e) -> trmc_body_has_step(e)
+}
+
 fn trmc_scan_step_kind(k: ExprKind) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
       EMark(MkTrmcStep(_)) -> true
       _ -> trmc_scan_step_exprs(xs)
     }
-    EIf(c, t, opt_e) ->
-      if trmc_body_has_step(c) { true }
-      else if trmc_body_has_step(t) { true }
-      else { match opt_e { None -> false Some(e2) -> trmc_body_has_step(e2) } }
-    EMatch(s, arms) -> if trmc_body_has_step(s) { true } else { trmc_scan_step_arms(arms) }
-    EBlock(stmts, opt_tail) ->
-      if trmc_scan_step_stmts(stmts) { true }
-      else { match opt_tail { None -> false Some(e) -> trmc_body_has_step(e) } }
-    EBinop(_, l, r) -> if trmc_body_has_step(l) { true } else { trmc_body_has_step(r) }
+    EIf(c, t, opt_e) -> trmc_body_has_step(c) or trmc_body_has_step(t) or trmc_step_opt(opt_e)
+    EMatch(s, arms) -> trmc_body_has_step(s) or trmc_scan_step_arms(arms)
+    EBlock(stmts, opt_tail) -> trmc_scan_step_stmts(stmts) or trmc_step_opt(opt_tail)
+    EBinop(_, l, r) -> trmc_body_has_step(l) or trmc_body_has_step(r)
     EUnop(_, x) -> trmc_body_has_step(x)
     EField(x, _) -> trmc_body_has_step(x)
     _ -> false
@@ -327,38 +312,26 @@ fn trmc_scan_step_stmts(stmts: [Stmt]) : Bool {
   }
 }
 
+fn tcrec_sentinel_opt(o: Option[Expr]) : Bool = match o {
+  None -> false
+  Some(e) -> tcrec_body_has_sentinel(e)
+}
+
 fn tcrec_scan_kind(k: ExprKind) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
-      # A TRMC step needs the goto label too.
-      EMark(m) -> if mark_is_tail_step(m) { true } else { tcrec_scan_exprs(xs) }
-      _ -> if tcrec_body_has_sentinel(f) { true } else { tcrec_scan_exprs(xs) }
+      EMark(m) -> mark_is_tail_step(m) or tcrec_scan_exprs(xs)
+      _ -> tcrec_body_has_sentinel(f) or tcrec_scan_exprs(xs)
     }
-    EIf(c, t, opt_e) ->
-      if tcrec_body_has_sentinel(c) { true }
-      else if tcrec_body_has_sentinel(t) { true }
-      else { match opt_e {
-        None -> false
-        Some(e2) -> tcrec_body_has_sentinel(e2)
-      } }
-    EMatch(s, arms) ->
-      if tcrec_body_has_sentinel(s) { true } else { tcrec_scan_arms(arms) }
-    EBlock(stmts, opt_tail) ->
-      if tcrec_scan_stmts(stmts) { true }
-      else { match opt_tail {
-        None -> false
-        Some(e) -> tcrec_body_has_sentinel(e)
-      } }
-    EBinop(_, l, r) ->
-      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EIf(c, t, opt_e) -> tcrec_body_has_sentinel(c) or tcrec_body_has_sentinel(t) or tcrec_sentinel_opt(opt_e)
+    EMatch(s, arms) -> tcrec_body_has_sentinel(s) or tcrec_scan_arms(arms)
+    EBlock(stmts, opt_tail) -> tcrec_scan_stmts(stmts) or tcrec_sentinel_opt(opt_tail)
+    EBinop(_, l, r) -> tcrec_body_has_sentinel(l) or tcrec_body_has_sentinel(r)
     EUnop(_, x) -> tcrec_body_has_sentinel(x)
     EField(x, _) -> tcrec_body_has_sentinel(x)
-    EIndex(x, i) ->
-      if tcrec_body_has_sentinel(x) { true } else { tcrec_body_has_sentinel(i) }
-    EPipe(l, r) ->
-      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
-    EDispatchPipe(_, l, r) ->
-      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EIndex(x, i) -> tcrec_body_has_sentinel(x) or tcrec_body_has_sentinel(i)
+    EPipe(l, r) -> tcrec_body_has_sentinel(l) or tcrec_body_has_sentinel(r)
+    EDispatchPipe(_, l, r) -> tcrec_body_has_sentinel(l) or tcrec_body_has_sentinel(r)
     _ -> false
   }
 }
@@ -381,30 +354,19 @@ fn tcrec_scan_arms(arms: [Arm]) : Bool {
   }
 }
 
+fn tcrec_scan_stmt(s: Stmt) : Bool = match s {
+  SLet(_, _, e) -> tcrec_body_has_sentinel(e)
+  SVar(_, _, e, _, _) -> tcrec_body_has_sentinel(e)
+  SAssert(c, opt_m) -> tcrec_body_has_sentinel(c) or tcrec_sentinel_opt(opt_m)
+  SExprStmt(e) -> tcrec_body_has_sentinel(e)
+  SIndexAssign(b, i, v, _, _) -> tcrec_body_has_sentinel(b) or tcrec_body_has_sentinel(i) or tcrec_body_has_sentinel(v)
+  SAssign(b, v, _, _) -> tcrec_body_has_sentinel(b) or tcrec_body_has_sentinel(v)
+  SUse(_, _, _) -> false
+}
+
 fn tcrec_scan_stmts(stmts: [Stmt]) : Bool {
   match stmts {
     [] -> false
-    [s, ...rest] -> {
-      let here = match s {
-        SLet(_, _, e) -> tcrec_body_has_sentinel(e)
-        SVar(_, _, e, _, _) -> tcrec_body_has_sentinel(e)
-        SAssert(c, opt_m) ->
-          if tcrec_body_has_sentinel(c) { true }
-          else { match opt_m {
-            None -> false
-            Some(m) -> tcrec_body_has_sentinel(m)
-          } }
-        SExprStmt(e) -> tcrec_body_has_sentinel(e)
-        SIndexAssign(b, i, v, _, _) ->
-          if tcrec_body_has_sentinel(b) { true }
-          else if tcrec_body_has_sentinel(i) { true }
-          else { tcrec_body_has_sentinel(v) }
-        SAssign(b, v, _, _) ->
-          if tcrec_body_has_sentinel(b) { true }
-          else { tcrec_body_has_sentinel(v) }
-        SUse(_, _, _) -> false
-      }
-      if here { true } else { tcrec_scan_stmts(rest) }
-    }
+    [s, ...rest] -> if tcrec_scan_stmt(s) { true } else { tcrec_scan_stmts(rest) }
   }
 }

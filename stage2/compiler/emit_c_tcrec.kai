@@ -289,68 +289,77 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
       EMatch(s, trmc_rewrite_arms(arms, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, [], cons_ok, tab, ns))
     EBlock(stmts, opt_tail) -> {
       match opt_tail {
-        None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
+        None -> trmc_leaf(k, line, col)
         Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)))
       }
     }
-    # Builtin cons literal `[head, ...self(t)]` in tail position. The
-    # cons args are `[head, self_call]`; the hole is the cdr (slot 1).
-    EList(els) ->
-      if cons_ok { match trmc_list_cons_modcons(els, me, arity) {
-        Some(cargs) -> trmc_make_step_call(TsCons, cargs, 1, line, col,
-                                           self_fn, params, pnames, uses, dm_table, skip_set)
-        None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
-      } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 }) }
-    # A bare self-call beside a modulo-cons step is a loop step that leaves
-    # the accumulator open, never a call whose result plugs the hole.
-    ECall(f, xs) -> if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-      tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, self_fn)
-    } else {
-      # Tail-position ctor application: is it modulo-cons (user ctor or,
-      # via perceus's reuse-cons rewrite, the builtin cons)?
-      let modslot = match tcrec_ctor_callee(tab, f) {
-        Some(c2) -> match tcrec_ctor_modcons_slot(xs, me, arity) {
-          Some(slot) -> Some((c2, slot))
-          None       -> None
-        }
-        None -> None
-      }
-      match modslot {
-        Some((csym, h)) -> {
-          # Dropmask for the rebind of the loop params from the
-          # self-call's args. Same per-site computation as ordinary
-          # tcrec; the self-call sits at slot `h`.
-          let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
-          let self_e = trmc_expr_nth(xs, h)
-          let site_mask = match self_e {
-            Some(se) -> tcrec_lookup_dm(dm_table, se.line, se.col)
-            None     -> 0
-          }
-          let dropmask = base_mask + site_mask
-          let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, spine: TsCtor(csym), dropmask: dropmask, params: pnames })
-          ECall(Expr { kind: EMark(step), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
-        }
-        None -> match trmc_reuse_variant_ctor(f, xs, me, arity, tab) {
-          # A Perceus reuse rebuild of a modulo-cons ctor is that ctor's step:
-          # the arm-top token hands the step the scrutinee's cell as its hole.
-          Some(ctor) -> trmc_rewrite_kind(ctor.kind, ctor.line, ctor.col, me, arity,
-                                          self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
-          None -> {
-          # Reuse-cons leaf: the mark over `(scr, head, self)`.
-          let reuse = match f.kind {
-            EMark(MkReuseCons) -> if cons_ok { trmc_reuse_cons_modcons(xs, me, arity) } else { None }
-            _                  -> None
-          }
-          match reuse {
-            Some(cargs) -> trmc_make_step_call(TsConsScr, cargs, 1, line, col,
-                                               self_fn, params, pnames, uses, dm_table, skip_set)
-            None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
-          }
-          }
-        }
+    EList(els) -> trmc_rewrite_list(k, els, line, col, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok)
+    ECall(f, xs) -> trmc_rewrite_call(k, f, xs, line, col, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
+    _ -> trmc_leaf(k, line, col)
+  }
+}
+
+fn trmc_leaf(k: ExprKind, line: Int, col: Int) : ExprKind =
+  trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
+
+fn trmc_rewrite_list(k: ExprKind, els: [ListElem], line: Int, col: Int, me: SelfRef, arity: Int,
+                     self_fn: FnId, params: [Param], pnames: [String],
+                     uses: UseIx, dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool) : ExprKind {
+  let modcons = if cons_ok { trmc_list_cons_modcons(els, me, arity) } else { None }
+  match modcons {
+    Some(cargs) -> trmc_make_step_call(TsCons, cargs, 1, line, col, self_fn, params, pnames, uses, dm_table, skip_set)
+    None        -> trmc_leaf(k, line, col)
+  }
+}
+
+fn trmc_rewrite_call(k: ExprKind, f: Expr, xs: [Expr], line: Int, col: Int, me: SelfRef, arity: Int,
+                     self_fn: FnId, params: [Param], pnames: [String],
+                     uses: UseIx, dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool, tab: SymTab, ns: LocalNames) : ExprKind =
+  if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
+    tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, self_fn)
+  } else {
+    match trmc_ctor_modslot(f, xs, me, arity, tab) {
+      Some(ModSlot(csym, h)) -> trmc_ctor_step(csym, h, f, xs, line, col, self_fn, params, pnames, uses, dm_table, skip_set)
+      None -> match trmc_reuse_variant_ctor(f, xs, me, arity, tab) {
+        Some(ctor) -> trmc_rewrite_kind(ctor.kind, ctor.line, ctor.col, me, arity,
+                                        self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
+        None -> trmc_rewrite_reuse_cons(k, f, xs, line, col, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok)
       }
     }
-    _ -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
+  }
+
+type ModSlot = ModSlot(SymId, Int)
+
+fn trmc_ctor_modslot(f: Expr, xs: [Expr], me: SelfRef, arity: Int, tab: SymTab) : Option[ModSlot] = match tcrec_ctor_callee(tab, f) {
+  Some(c2) -> match tcrec_ctor_modcons_slot(xs, me, arity) {
+    Some(slot) -> Some(ModSlot(c2, slot))
+    None       -> None
+  }
+  None -> None
+}
+
+fn trmc_ctor_step(csym: SymId, h: Int, f: Expr, xs: [Expr], line: Int, col: Int,
+                  self_fn: FnId, params: [Param], pnames: [String],
+                  uses: UseIx, dm_table: [TcrDm], skip_set: [Binder]) : ExprKind {
+  let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
+  let site_mask = match trmc_expr_nth(xs, h) {
+    Some(se) -> tcrec_lookup_dm(dm_table, se.line, se.col)
+    None     -> 0
+  }
+  let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, spine: TsCtor(csym), dropmask: base_mask + site_mask, params: pnames })
+  ECall(Expr { kind: EMark(step), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
+}
+
+fn trmc_rewrite_reuse_cons(k: ExprKind, f: Expr, xs: [Expr], line: Int, col: Int, me: SelfRef, arity: Int,
+                           self_fn: FnId, params: [Param], pnames: [String],
+                           uses: UseIx, dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool) : ExprKind {
+  let reuse = match f.kind {
+    EMark(MkReuseCons) -> if cons_ok { trmc_reuse_cons_modcons(xs, me, arity) } else { None }
+    _                  -> None
+  }
+  match reuse {
+    Some(cargs) -> trmc_make_step_call(TsConsScr, cargs, 1, line, col, self_fn, params, pnames, uses, dm_table, skip_set)
+    None        -> trmc_leaf(k, line, col)
   }
 }
 

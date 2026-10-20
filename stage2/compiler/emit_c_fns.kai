@@ -181,146 +181,67 @@ fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: 
   }
 }
 
-fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_fns: FnSet) : String / Console {
+fn emit_fn_ffi_body(sig: String, body: Expr, name: String, params: [Param], ret_ty_opt: Option[TypeExpr], cx: EmitCtx, locals: LocalNames) : String = {
+  let csym = ffi_extern_symbol_of(body, name)
+  if ffi_sig_uses_v2(params, ret_ty_opt, cx.ffi_reg, cx.tab) {
+    emit_ffi_v2_shim_body(sig, csym, params, ret_ty_opt, cx.ffi_reg, cx.tab, locals)
+  } else {
+    emit_ffi_shim_body(sig, csym, params, ret_ty_opt, cx.tab, locals)
+  }
+}
 
+fn fn_entry_label(body: Expr, ptrs: String, sym: String) : String =
+  if tcrec_body_has_sentinel(body) { concat_all([ptrs, "\n    ", c_user_entry_label(sym), ":;\n    "]) } else { "" }
+
+fn emit_fn_user_body(src: String, d: Decl, cx: EmitCtx, body_fns: [EFn], sig: String, rd_cap: Bool, locals: LocalNames) : String / Console =
   match d {
-    DFn(_, fid, tps, params, ret_ty_opt, row, body, _, _, mo) -> {
-      let name = emit_fn_text(cx.tab, cx.specs, fid)
+    DFn(_, fid, _, params, ret_ty_opt, row, body, _, _, mo) -> {
+      let sym = c_sym(emit_fn_text(cx.tab, cx.specs, fid), mo)
       let opt_sig = fnx_ufn_sig_first(cx.fx, fid)
+      let pids = param_local_ids(params)
+      let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
+      let enc = enc_of_fn(fid, sym)
+      let frame = unw_fn_frame(cx.unw, enc.unit, Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
+      let body_cx = EmitCtx { ...cx, locals: locals, lcs: list_append(cx.lcs, pids), fns: body_fns, in_region: body_in_region,
+                              hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: enc,
+                              rd_active: rd_cap, tcpend: [], unw: frame }
+      let acc_decl = if trmc_body_has_step(body) {
+        "KaiCctx _kai_acc = kai_cctx_empty();\n    KaiReuse _arm_ru = kai_reuse_null;\n    "
+      } else { "" }
+      let boxed_ret = match opt_sig {
+        Some(usig) -> not ufn_ret_is_raw(usig)
+        None -> true
+      }
+      let body_c0 = if boxed_ret { emit_expr(src, body, body_cx) } else { emit_expr_raw(src, body, body_cx) }
+      let body_c = rd_wrap_body(body_c0, boxed_ret, rd_cap and not tcrec_body_has_sentinel(body))
+      let ptrs = match opt_sig {
+        Some(usig) -> tcrec_emit_param_ptrs_masked(params, usig, 0, locals)
+        None -> tcrec_emit_param_ptrs(params, 0, locals)
+      }
+      concat_all([sig, " {\n    ", euw_with_fiber(frame.sites != [], acc_decl), fn_entry_label(body, ptrs, sym), "return ", body_c, ";\n}\n\n"])
+    }
+    _ -> ""
+  }
+
+fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_fns: FnSet) : String / Console {
+  match d {
+    DFn(_, fid, _, params, ret_ty_opt, _, body, _, _, mo) -> {
+      let name = emit_fn_text(cx.tab, cx.specs, fid)
       let evf_slots = frame_slots_of(cx.evf, fid)
-      # The signature and the body spell the function's locals from one table.
       let locals = ln_of_decl(d)
-      # Interprocedural reuse donation: a fn whose body rebuilds a variant
-      # through a reuse arm takes a hidden `_donor` reuse-token param so an
-      # out-of-line caller holding a live unconsumed token can donate it
-      # instead of freeing it (emit_reuse_donate.kai). The `_donor` ABI is
-      # keyed on `cx.rd_capable` — the SAME set the call site consults — so
-      # definition, forward decl, thunk and call site never disagree. Under
-      # separate compilation the set is empty (a cross-TU call cannot see the
-      # body), so no fn takes `_donor` and every call site omits it.
       let rd_cap = rd_is_capable(fid, cx.rd_capable)
-      let sig = cat2(purity_const_prefix(fid, const_fns), rd_splice_param(match opt_sig {
+      let sig = cat2(purity_const_prefix(fid, const_fns), rd_splice_param(match fnx_ufn_sig_first(cx.fx, fid) {
         Some(us) -> emit_fn_signature_unboxed_evf(c_sym(name, mo), params, us, evf_slots, locals)
         None     -> emit_fn_signature_evf(c_sym(name, mo), params, evf_slots, locals)
       }, rd_cap))
-      # m12.7.x FFI v1: a `[<extern_c>]` axiom lowered into a DFn
-      # whose body is the magic ETodo tag. Emit the FFI shim instead
-      # of the standard body — the shim unboxes each parameter to
-      # the matching C scalar, calls the extern symbol, and re-boxes
-      # the return value. The shim does its own `extern` forward decl
-      # inline so callers don't need a separate header pass.
       if is_some(body_kai_builtin(body)) {
         emit_kai_forwarder_body(sig, body, params, locals)
       } else if body_is_ffi_extern(body) {
-        # Issue #261: the C-side symbol is either the override
-        # baked into the body's tag or the kaikai identifier.
-        # A signature mentioning a struct / opaque / fixed-width type
-        # takes the extended shim (struct unwrap + re-box, opaque void*,
-        # width casts); a purely-scalar signature stays on the basic
-        # shim.
-        let csym = ffi_extern_symbol_of(body, name)
-        if ffi_sig_uses_v2(params, ret_ty_opt, cx.ffi_reg, cx.tab) {
-          emit_ffi_v2_shim_body(sig, csym, params, ret_ty_opt, cx.ffi_reg, cx.tab, locals)
-        } else {
-          emit_ffi_shim_body(sig, csym, params, ret_ty_opt, cx.tab, locals)
-        }
+        emit_fn_ffi_body(sig, body, name, params, ret_ty_opt, cx, locals)
       } else if body_is_proto_dispatch(body) {
-        # Option C: runtime dispatch shim. Look up the matching
-        # `__pimpl_*` in the impl-table and tail-call it. See
-        # `make_dispatcher_body` and docs/protocols.md §Codegen sketch.
         emit_proto_dispatch_shim_c(sig, proto_dispatch_parts(body), params, ret_ty_opt, locals)
       } else {
-        # Seed the scope with the fn's parameters.
-        let pids = param_local_ids(params)
-        let body_lcs = list_append(cx.lcs, pids)
-        # Same-module preference: when this DFn lives in a module,
-        # rotate the EFn table so entries from that same module come
-        # first AND prune any root-file shadow of a name the module
-        # redefines (#748). The rotation lets a recursive call inside
-        # `loop.repeat` resolve to `loop.repeat` over a sibling
-        # `list.repeat`; the prune is what stops the lookup from
-        # grabbing the USER's `fn sum` shadow for `list.sum`'s internal
-        # `sum(t)` — so the self-call mangles to `kai_list__sum`, the
-        # user's stays `kai_sum`, and the two link cleanly.
-        let body_fns = body_fns_pre
-        # Body sees the extended lexical scope and the module-rotated
-        # EFn table; the other three context fields are unchanged.
-        # `cur_enc_fn` becomes THIS fn's mangled symbol so a nested
-        # ELambda in the body resolves to its own module's LamInfo.
-        # A region-polymorphic fn (a `Tree<r>` param or return) allocates
-        # its aggregates in the ambient arena: its ctors bump-allocate in
-        # `kai_arena_current()`, which is the region's arena during the
-        # dynamic extent of the `region { r -> }` that called it, and
-        # NULL (→ RC fallback) otherwise. Routing keys on the SIGNATURE
-        # types (which survive mono), not the tparam list (emptied by
-        # mono) nor the per-ctor `.ty` (the brand does not survive the
-        # unit normaliser on every ctor), so every ctor in the body routes.
-        let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
-        let enc = enc_of_fn(fid, c_sym(name, mo))
-        let frame = unw_fn_frame(cx.unw, enc.unit, Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
-        let body_cx = EmitCtx { ...cx, locals: locals, lcs: body_lcs, fns: body_fns, in_region: body_in_region,
-                                hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: enc,
-                                rd_active: rd_cap, tcpend: [], unw: frame }
-        # Phase 3 unboxing — UFn body emits a raw return expression
-        # whose value is the raw scalar matching `ret_ty`. The
-        # body's `mode` is set by `unbox_pass`;
-        # `emit_expr_raw` handles the MBoxed→raw boundary if the
-        # body somehow stayed boxed (defensive for partial
-        # promotions). The TCO sentinel goto path stays compatible:
-        # `tcrec_emit_goto` writes `goto _kai_<sym>_entry;` which
-        # ignores the surrounding return-expression shape.
-        # TRMC: a step sentinel needs the cctx accumulator declared
-        # before the entry label (mirror Koka's wrapper seeding
-        # kk_cctx_empty once — kaikai's single-fn-with-entry-label gets
-        # it for free with a local declaration).
-        # `_arm_ru` is the reuse token the arm-top (emit_arm_top_reuse)
-        # captures from `_scr` when the consumed node is unique. Declared
-        # fn-wide and null by default so the TRMC step can reference it
-        # unconditionally — a fn whose arms have no arm-top reuse leaves it
-        # null and the step fresh-allocs, exactly the old behaviour.
-        let acc_decl = if trmc_body_has_step(body) {
-          "KaiCctx _kai_acc = kai_cctx_empty();\n    KaiReuse _arm_ru = kai_reuse_null;\n    "
-        } else { "" }
-        match opt_sig {
-          Some(usig) -> {
-            # Mixed-param lane: a UFn with a RAW return emits its body
-            # raw (`emit_expr_raw`); a UFn with a BOXED return (e.g.
-            # `balance(...) : RBTree` — raw k/v params, boxed result)
-            # emits the body boxed (`emit_expr`), exactly like a non-UFn
-            # return. The raw params still travel raw inside the body;
-            # only the returned value is a `KaiValue *`.
-            let is_raw = ufn_ret_is_raw(usig)
-            let body_c0 =
-              if is_raw {
-                emit_expr_raw(src, body, body_cx)
-              } else {
-                emit_expr(src, body, body_cx)
-              }
-            # Free a donated token no arm consumed, after the result is
-            # computed. A capable body never has a TRMC goto (it rebuilds
-            # via pcs_ret, not a self-tail step), so wrapping is safe.
-            let body_c = rd_wrap_body(body_c0, not is_raw, rd_cap and not tcrec_body_has_sentinel(body))
-            let label = if tcrec_body_has_sentinel(body) {
-              concat_all([tcrec_emit_param_ptrs_masked(params, usig, 0, locals),
-                          "\n    ", c_user_entry_label(c_sym(name, mo)), ":;\n    "])
-            } else { "" }
-            concat_all([sig, " {\n    ", euw_with_fiber(frame.sites != [], acc_decl), label, "return ", body_c, ";\n}\n\n"])
-          }
-          None -> {
-            let body_c0 = emit_expr(src, body, body_cx)
-            let body_c = rd_wrap_body(body_c0, true, rd_cap and not tcrec_body_has_sentinel(body))
-            # Issue #37: when `tcrec_rewrite_decl` planted at least one
-            # `__kai_tcrec|...` self-tail-call sentinel inside `body`,
-            # plant the matching `_kai_<c_sym>_entry:;` label *before*
-            # the `return ({ ... });` so the goto inside the
-            # statement-expression has a target.
-            let label = if tcrec_body_has_sentinel(body) {
-              concat_all([tcrec_emit_param_ptrs(params, 0, locals),
-                          "\n    ", c_user_entry_label(c_sym(name, mo)), ":;\n    "])
-            } else { "" }
-            concat_all([sig, " {\n    ", euw_with_fiber(frame.sites != [], acc_decl), label, "return ", body_c, ";\n}\n\n"])
-          }
-        }
+        emit_fn_user_body(src, d, cx, body_fns_pre, sig, rd_cap, locals)
       }
     }
     _ -> ""
