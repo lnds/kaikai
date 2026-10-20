@@ -24,6 +24,8 @@ import compiler.infer_head_dispatch
 import compiler.infer_handle_walk
 import compiler.resolve_names
 import compiler.handler_alias
+import compiler.core_types
+import compiler.desugar_rename
 import compiler.enc_unit
 import compiler.infer_row_kinds
 import compiler.infer_call_labels
@@ -372,6 +374,8 @@ pub fn synth_call_site(st: InferState, callee: Expr, args_: [Expr], line: Int, c
     [c, v] -> synth_ref_op(st, c, "ref_set", [v], "`:=` writes a `var` or", line, col)
     _      -> synth_call(st, callee, args_, line, col)
   }
+  EMark(MkCellGet) -> synth_cell_node(st, callee, args_, line, col)
+  EMark(MkCellPut) -> synth_cell_node(st, callee, args_, line, col)
   EMark(MkCoalesce) -> match args_ {
     [l, r] -> synth_coalesce(st, l, r, line, col)
     _      -> synth_call(st, callee, args_, line, col)
@@ -634,13 +638,32 @@ fn try_op_on_local(st: InferState, l: LocalId, op_name: String, args_: [Expr], l
     Some(taggable) -> try_op_on_alias(st, l, taggable, op_name, args_, line, col)
   }
 
+# The read or write of a cell performs the op its effect declares for it.
+fn synth_cell_node(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match cell_node(callee, args_) {
+    None -> synth_call(st, callee, args_, line, col)
+    Some(n) -> match lookup_alias_taggable(st.aliases, n.cell) {
+      None -> {
+        let perr = mk_diag(SevError, st.file, line, col, "a cell read or write outside the handle that binds it", [])
+        render_diag(perr)
+        mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, with_ty(mk_expr(ECall(callee, args_), line, col), TyAny))
+      }
+      Some(taggable) -> {
+        let op = cell_op_name(cell_node_op(lookup_alias_sym(st.aliases, n.cell), n.write))
+        match try_op_on_alias(st, n.cell, taggable, op, n.rest, line, col) {
+          Some(inf) -> inf
+          None      -> mk_inferred(st, TyAny, with_ty(mk_expr(ECall(callee, args_), line, col), TyAny))
+        }
+      }
+    }
+  }
+
 # A `with Eff as name` binding dispatches against the handle's own evidence node;
 # `var`/State/Reader cells keep the by-id dispatch. Inside a lambda the instance is
 # not named and the ambient lookup runs. The row label carries the cell either way,
 # so row identity holds inside a lambda too.
-fn try_op_on_alias(st: InferState, l: LocalId, taggable: Bool, op_name: String, args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable = {
+fn try_op_on_alias(st: InferState, l: LocalId, taggable: Bool, real_op: String, args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable = {
   let asym = lookup_alias_sym(st.aliases, l)
-  let real_op = canonical_cap_getter(asym, op_name)
   let via = if not taggable { ViaAmbient }
             else if eff_is_cell_effect(asym) { ViaAlias(l) }
             else { ViaRecv(l) }
