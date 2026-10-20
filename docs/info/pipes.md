@@ -6,8 +6,8 @@ five pipe operators, each with one intent.
 ## Description
 
 `|>` is plain application — no dispatch, no type lookup. It is
-syntactic sugar so `x |> f(a, b)` reads like `x.f(a, b)` would in
-an OO language but desugars to `f(x, a, b)`.
+syntactic sugar: `x |> f(a, b)` desugars to `f(x, a, b)`. kaikai has no
+methods, so this is how a call reads left to right.
 
 `|`, `||`, `|?` and `|!` DISPATCH BY CONVENTION on the LHS's head
 type. Any type `T` that exports `pub fn map / flat_map / filter / each`
@@ -79,7 +79,7 @@ fn main() : Unit / Stdout = {
   let f = 5 |> sub(7, _)                       # placeholder `_`
                                                # → sub(7, 5) = 2
   Stdout.print("a=#{a} f=#{f}")
-  Stdout.print("b len=#{b.length()} c len=#{c.length()} d len=#{d.length()} e=#{e}")
+  Stdout.print("b len=#{b |> length()} c len=#{c |> length()} d len=#{d |> length()} e=#{e}")
 
   # |> into an effect op needs an explicit lambda — capability ops
   # (`Stdout.print`, etc.) are NOT first-class values you can bare-

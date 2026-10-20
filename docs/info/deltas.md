@@ -51,8 +51,9 @@ Every entry is verified against the compiler; when in doubt,
   `protocol P { ... }` + `impl P for T`.
 - No `async` / `await` — structured concurrency is the `Spawn`
   effect (`kai info fibers`).
-- No `self` / `this` receiver. Methods take explicit parameters;
-  `xs.map(f)` is UFCS sugar for `map(xs, f)`.
+- No `self` / `this` receiver and no methods. Functions take explicit
+  parameters; `xs.map(f)` does not exist — write `xs | f` or
+  `xs |> map(f)`.
 - No module header (`mod` / `package` / `module`). The file path is
   the package; bring code in with `import loop`.
 - No `do { ... }` blocks, and no Haskell-style `where` clause for

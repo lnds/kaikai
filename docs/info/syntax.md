@@ -48,7 +48,7 @@ fn main() : Unit / Stdout = {
 ```
 
 A postfix never continues from the next line: a call `(`, an index
-`[`, a field or method `.`, `!` and a trailing-lambda `{` apply only
+`[`, a field `.`, `!` and a trailing-lambda `{` apply only
 on the line of the expression they follow. A form that ends in a block
 — `if` with or without `else`, `match`, `handle`, `{ }` — is complete
 at its `}`, so the next line starts a new statement or match arm:
@@ -237,7 +237,7 @@ impl Tagged for Int {
 }
 
 fn describe[t : Tagged + Eq](x: t, y: t) : String =
-  if x == y { "same #{x.tag()}" } else { "diff" }
+  if x == y { "same #{x |> tag()}" } else { "diff" }
 
 fn main() : Unit / Stdout = Stdout.print(describe(1, 1))
 ```
@@ -303,8 +303,7 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-Qualify (`list.max(xs)`) or use the method form (`3.max(9)`) to name
-the binding explicitly.
+Qualify (`list.max(xs)`) to name the binding explicitly.
 
 When two imports declare the same name, qualify the use — the
 qualifier names the module the declaration comes from:
@@ -452,7 +451,7 @@ A block lambda's parameter may be a tuple pattern, destructuring a
 ```kaikai
 fn main() : Unit / Stdout = {
   let rows = ["a", "b", "c"]
-  foreach(rows.enumerate()) { (row, line) ->   # binds row, line from the Pair
+  foreach(rows |> enumerate()) { (row, line) ->   # binds row, line from the Pair
     Stdout.print("#{row}: #{line}")
   }
 }
@@ -533,7 +532,7 @@ fn main() : Unit / Stdout = {
   let c = [1, 2] || single                     # || flat-map
   let d = [1, 2, 3] |? gt1                     # |? filter
   let e = 5 |> sub(7, _)                       # _ placeholder
-  Stdout.print("a=#{a} b len=#{b.length()} c len=#{c.length()} d len=#{d.length()} e=#{e}")
+  Stdout.print("a=#{a} b len=#{b |> length()} c len=#{c |> length()} d len=#{d |> length()} e=#{e}")
   [1, 2, 3] |! println("#{.}")                 # |! each, returns Unit
 }
 ```
@@ -588,9 +587,9 @@ lambda over the innermost argument (`run_with(. + 10, 5)`), so
 ## Point-free sections
 
 A leading `.` in function position is a point-free section: it stands
-for a one-argument lambda whose body is the rest of the chain applied
-to the implicit argument. The chain may be a field, a field path, a
-method call, or a method call with arguments.
+for a one-argument lambda whose body is the field or field path applied
+to the implicit argument. There are no method sections: a call on the
+element is a stage that writes the `.` as an argument.
 
 ```kaikai
 type Addr = { city: String }
@@ -600,21 +599,19 @@ fn main() : Unit / Stdout = {
   let people = [Person { name: "ana", addr: Addr { city: "Hanga Roa" } }]
   let names  = people | .name                    # (p) => p.name
   let cities = people | .addr.city               # (p) => p.addr.city
-  let lens   = (people | .name) | .length()      # (s) => s.length()
-  let init   = people | .name |? .starts_with("a")  # (s) => s.starts_with("a")
-  let upper  = Some("hi").map(.length())         # UFCS arg position
+  let lens   = (people | .name) | length(.)      # the stage owns the `.`
+  let init   = people | .name |? starts_with(., "a")
+  let upper  = Some("hi") | length(.)
   Stdout.print("ok")
 }
 ```
 
-The receiver is supplied implicitly (first argument by UFCS), so
-`.starts_with("a")` reads its written argument after the receiver.
-A section is the placeholder `.` with a postfix chain, so on the right
+A section is the placeholder `.` with a field chain, so on the right
 side of `|`, `||`, `|?` or `|!` it is the stage's element like any other `.`,
 a section nested in a call argument there included. Elsewhere it is a
-combinator argument (`.map`, `.and_then`, `.filter`). A point-free
-section is unary; to drop a positional argument, use the `|>`
-placeholder `_` instead — the two do not mix in one section.
+function argument (`xs |> map(.name)`). A point-free section is unary; to
+drop a positional argument, use the `|>` placeholder `_` instead — the two
+do not mix in one section.
 
 A `.f()` on its own line is a section too, never a call on the line
 above. Left as a statement whose value is dropped it is a compile
@@ -717,7 +714,7 @@ fn main() : Unit / Stdout = {
   let combined = [1, 2] ++ [3, 4]              # ++ concat (right-assoc)
   let all = variants[Color]()                  # enumerate ctors of a
                                                #   nullary sum type
-  Stdout.print("n=#{n} s=#{s} xs len=#{xs.length()} r1 len=#{r1.length()} r2 len=#{r2.length()} r3 len=#{r3.length()} combined len=#{combined.length()} colors=#{all.length()}")
+  Stdout.print("n=#{n} s=#{s} xs len=#{xs |> length()} r1 len=#{r1 |> length()} r2 len=#{r2 |> length()} r3 len=#{r3 |> length()} combined len=#{combined |> length()} colors=#{all |> length()}")
   match opt {
     Some(v) -> Stdout.print("v=#{v}")
     None    -> Stdout.print("none")
@@ -1024,8 +1021,8 @@ denominator).
 ## Collections
 
 kaikai builds every collection the same way: a literal that names what
-it builds by itself, a runtime constructor `X.from(list)`, and `.to_X`
-methods to cross between the immutable and mutable siblings. A literal
+it builds by itself, a runtime constructor `X.from(list)`, and `to_X`
+functions to cross between the immutable and mutable siblings. A literal
 is **always** an immutable, pure value; the crossing to a mutable
 collection is an explicit, local token.
 
@@ -1080,7 +1077,7 @@ fn main() : Unit / Stdout + Mutable {
 ### Immutable and mutable
 
 `Map`/`Set` (literal, persistent, pure) and `HashMap`/`HashSet`
-(hash-backed, `Mutable`) are separate types. The four `.to_X` methods
+(hash-backed, `Mutable`) are separate types. The four `to_X` functions
 (`collections.convert`) are the only crossing, and each makes the
 mutability decision visible at the call site — never driven by a remote
 annotation.
@@ -1095,13 +1092,13 @@ import core.io
 
 fn main() : Unit / Stdout + Mutable {
   let m = %{ "a": 1, "b": 2 }
-  let h = m.to_hashmap()                        # Map -> HashMap (mutable)
+  let h = m |> to_hashmap()                        # Map -> HashMap (mutable)
   hashmap.put(h, "c", 3)                        # mutate the open handle
-  let frozen = h.to_map()                       # HashMap -> Map (freeze)
+  let frozen = h |> to_map()                       # HashMap -> Map (freeze)
   let s = %[ 1, 2, 3 ]
-  let hs = s.to_hashset()                       # Set -> HashSet
+  let hs = s |> to_hashset()                       # Set -> HashSet
   hashset.add(hs, 4)
-  let fs = hs.to_set()                          # HashSet -> Set
+  let fs = hs |> to_set()                          # HashSet -> Set
   println("#{map.size(m)} #{map.size(frozen)} #{set.size(s)} #{set.size(fs)}")
 }
 ```
@@ -1194,7 +1191,7 @@ fn swap(pr: (Int, Int)) : (Int, Int) = match pr {
 }
 
 fn list_info(xs: [Int]) : String = match xs {
-  whole as [_, ...]  -> "non-empty len=#{whole.length()}"
+  whole as [_, ...]  -> "non-empty len=#{whole |> length()}"
                                                 # `as` binds the entire
                                                 # scrutinee (`whole @ ...`
                                                 # is the legacy spelling;
@@ -1301,22 +1298,6 @@ Errors with their own message: a `Result` or other non-Option on the
 left, a right side that is not the inner type, `o! ?? d` (the `!` has
 already unwrapped), and `x |> f() ?? d`, where `??` would become the
 `|>` stage: write `(x |> f()) ?? d`.
-
-## UFCS
-
-`receiver.fn(args)` desugars to `fn(receiver, args)`, dispatched by
-receiver type. Chains left-associative.
-
-```kaikai
-fn main() : Unit / Stdout = {
-  let r : Result[Int, Int] = Ok(5)
-  let b = r.map((x) => x + 1).map_err((e) => e * 10).is_ok()
-  let xs = [1, 2, 3]
-  let n = xs.length()
-  let label = if b { "yes" } else { "no" }
-  Stdout.print("ok=#{label} n=#{n}")
-}
-```
 
 ## Units of measure
 
@@ -1520,6 +1501,10 @@ fn main() : [Int] = [1, 2, 3] | (+ 1)         # operator section
 
 ```kaikai-neg
 fn main() : [Int] = [x * 2 for x in [1, 2, 3]]  # Python list comp
+```
+
+```kaikai-neg
+fn main() : Int = [1, 2, 3].length()          # no methods: `xs |> length()`
 ```
 
 ```kaikai-neg

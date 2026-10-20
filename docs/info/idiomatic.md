@@ -128,7 +128,7 @@ wanted, say so: close the expression with `|> ignore`, or bind it to
 ```kaikai
 fn log(msg: String) : Int / Stdout = {
   println(msg)
-  msg.length()
+  msg |> length()
 }
 
 fn main() : Unit / Stdout = {
@@ -170,7 +170,7 @@ carrier is a `Stream` or a `Gen` — see *Lazy carriers* in
 
 When a pipe or combinator step is just "reach into the element", drop
 the lambda and write the point-free section — a leading `.` followed
-by the field, path, or method (see `kai info syntax`). It reads as the
+by the field or path (see `kai info syntax`). It reads as the
 projection itself, with no bound name to invent.
 
 ```kaikai
@@ -181,8 +181,7 @@ fn main() : Unit / Stdout = {
   let people = [Person { name: "ana", addr: Addr { city: "Hanga Roa" } }]
   let names  = people | .name                    # not (c) => c.name
   let cities = people | .addr.city               # not (c) => c.addr.city
-  let lens   = names | .length()                 # not (s) => s.length()
-  let first  = Some("hi").map(.length())         # UFCS arg position
+  let lens   = names | length(.)                 # a stage owns the `.`
   Stdout.print("ok")
 }
 ```

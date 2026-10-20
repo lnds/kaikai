@@ -582,7 +582,7 @@ unary_expr  ::= ('-' | 'not' | '@') unary_expr
 pow_expr    ::= postfix_expr ('^' unary_expr)?         (* right-assoc, allows
                                                         '-' in the exponent *)
 postfix_expr ::= primary postfix*
-postfix     ::= '.' field_name                         (* field / method / UFCS *)
+postfix     ::= '.' field_name                         (* field *)
               | '(' arg_list? ')' trailing_lambda?
                                   trailing_lambda?     (* call *)
               | '[' expr ']'                           (* index *)
@@ -1015,16 +1015,6 @@ let h = { -> 42 }            ≡  let h = () => 42
 Disambiguated from a plain block by peeking past `{` for a parameter
 list followed by `->`.
 
-### 4.6 UFCS
-
-```
-r.f(args)               ≡  f(r, args)               (* when f is a free fn *)
-```
-
-Resolved by the head-module-of-`r` rule: if `r` has type `T` declared
-in module `M`, `r.f(args)` rewrites to `M.f(r, args)` when `M.f`
-exists.
-
 ### 4.7 Record punning
 
 ```
@@ -1206,17 +1196,16 @@ This is bounded lookahead — one identifier-list scan terminating at
 `->` or any non-`,`/non-`IDENT` token. Implemented as a checkpoint
 on the lexer with rewind on miss (`parse_lambda_block_body`).
 
-### 5.3 `EField(EVar(n), m)` — projection vs module call vs UFCS
+### 5.3 `EField(EVar(n), m)` — projection vs module call
 
-`a.b(args)` has three readings; the resolver (not the parser) picks
+`a.b(args)` has two readings; the resolver (not the parser) picks
 between them in the order:
 
 1. If `a` is bound as a module alias (`import math as a`), parse as
    `EModCall(a, b, args)`.
-2. Else, if `a` resolves to a value of type `T` declared in module
-   `M` and `M.b` exists, parse as UFCS: `EModCall(M, b, [a, ...args])`.
-3. Else, parse as field projection followed by call:
-   `ECall(EField(a, b), args)`.
+2. Else, parse as field projection followed by call:
+   `ECall(EField(a, b), args)`; a `b` that is no field of `a`'s type is
+   an error, since kaikai has no methods.
 
 The parser produces the syntactic form `ECall(EField(EVar("a"), "b"), args)`
 unconditionally; resolution rewrites later.

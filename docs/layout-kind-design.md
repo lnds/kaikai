@@ -257,7 +257,7 @@ bitwise ops.
 2. **Bitwise infix operators / scope.** Independent of `Layout`, but binary code is
    bit-twiddling and kaikai's bit ops are intrinsic *functions* (`bit_and`,
    `bit_shl`, …) not operators. Its own follow-up
-   (`docs/bitwise-scope-design.md` / `stdlib/math/bits.kai` UFCS), tracked
+   (`docs/bitwise-scope-design.md` / `stdlib/math/bits.kai`), tracked
    alongside so both gate legible binary code together.
 
 3. **Default-width layout of an un-annotated field.** Whether `id: U32` (no

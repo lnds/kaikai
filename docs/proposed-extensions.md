@@ -40,7 +40,6 @@ on.
 | Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
-| `f.field` is always field access; UFCS needs `f.method()` | proposed (edition-boundary) | resolver + edition bump |
 
 ## 1. `kai type <pos> --json` — queryable type-at-position
 
@@ -453,124 +452,6 @@ prior art, 25 years of production use), Elixir bitstrings
 (same semantics, modernised lexis), Gleam `BitArray`
 (a recent re-implementation in a typed setting — closest fit
 to what kaikai would adopt).
-
-## 9. `f.field` is always field access; UFCS of a function requires `f.method()`
-
-```kai
-type Account = { id: String, balance: Int }
-
-fn label(a: Account) : String = a.id        # always field access — unambiguous
-fn ndigits(a: Account) : Int  = a.id.len()  # UFCS of `len` — parens required
-
-# Today `a.id` is ambiguous: if a function `id` is in scope, the
-# resolver may read `a.id` as bare UFCS (`id(a)`) instead of the
-# field. This proposal removes that overload: a bare `.name` is
-# *only* field access; calling a free function method-style *always*
-# carries parens.
-```
-
-Today kaikai allows **paren-less UFCS**: `xs.length` reads as
-`length(xs)` when `length` is a free function and `xs` has no
-`length` field. That overloads the `.name` syntax — it means "field
-access" OR "function applied method-style", and the resolver
-disambiguates by a heuristic (is `name` a field of the receiver's
-type? else, is there a free function `name` in scope?). When the
-receiver's type is not yet resolved (e.g. issue #743, a generic
-effect payload), the heuristic misfires and a legitimate field
-access is reported as `` `name` is a function in scope, not a
-field ``.
-
-This proposal makes the rule mechanical: **`f.name` is always field
-access. UFCS of a free function is always written `f.name(args)`,
-with parens, even when `args` is empty (`f.name()`).** The `.name`
-syntax stops meaning two things.
-
-### Semantics
-
-- `f.name` — field access, unconditionally. If `name` is not a
-  field of `f`'s type, it is a field error on that type. The
-  resolver never falls back to "maybe `name` is a free function".
-- `f.name(args)` — method-style call. Resolves to a field-of-function
-  type if `name` is a function-typed field, otherwise to UFCS
-  `name(f, args)`. Parens are the marker that a *call* is intended.
-- `f.name()` — UFCS of a zero-extra-arg function (`name(f)`).
-  Previously spelled `f.name`; now requires the parens.
-
-### What it buys
-
-- **Removes a syntactic ambiguity.** `.name` has one meaning, not
-  two. Aligned with Tier 2 #5 *few forms, each with clear intent* —
-  field access and function application stop competing for the same
-  surface.
-- **Eliminates an entire class of resolver misfires**, including the
-  misleading half of issue #743 (Bug B). The field-access resolver
-  no longer needs a "is there a homonymous function?" fallback, so
-  it cannot blame UFCS for what is actually an unresolved-type
-  problem. (#743's Tier 1 escape — the typer accepting `b.field`
-  without checking it when the receiver type is free — is a separate
-  typer fix; this proposal removes the *confusing diagnostic*, not
-  the underlying typer bug. Both are wanted.)
-- **More LLM-authorable.** A model never has to infer whether `.id`
-  is a field or a call; the rule is positional. The compiler-tells-
-  the-model bet (Tier 3) is stronger when the surface is
-  unambiguous.
-- **Better errors generally.** A missing field is reported as a
-  missing field on a concrete type, not as a UFCS hint.
-
-### What it costs
-
-- **Breaking change to the language surface.** Paren-less property-
-  style UFCS (`xs.length`, `r.is_ok`, `pid.self`) stops resolving;
-  it must become `xs.length()`, `r.is_ok()`. This is a Tier 1 #4
-  *stability* concern: it changes code a user wrote against. It
-  therefore requires an **edition bump** (Tongariki → Hanga Roa →
-  Orongo …), the deliberate public commitment editions exist for —
-  not an incidental minor. A migration is mechanical (`kai fix`
-  could add the parens), which keeps it inside the "never dread
-  upgrading" contract: the upgrade has a migration path.
-- **An audit of how much stdlib + compiler code uses paren-less
-  property UFCS** is a prerequisite to sizing the break. If the
-  idiom is rare (most call sites already write `()`), the break is
-  small; if pervasive, the `kai fix` migration carries more weight.
-- It removes a small ergonomic affordance some users like (reading
-  `xs.length` as a property). The trade is paid in keystrokes, not
-  in expressive power.
-
-### Constraints
-
-- Method references via the `.field` placeholder lambda and
-  receiver-bound `obj.method` (the deferred item in §*Closed*) must
-  be reconciled with this rule — `obj.method` as a *value* (not a
-  call) would still be field-access-only under this proposal, so a
-  method reference needs its own spelling decided alongside.
-- Does not change protocol dispatch or `|`/`||`/`|?` pipe
-  convention dispatch — those are call sites with explicit operators,
-  not `.name` accesses.
-
-### Decision posture
-
-This is the language owner's call: it trades a liked ergonomic
-affordance (paren-less property UFCS) for the removal of a
-syntactic ambiguity and a class of resolver misfires. The case
-*for* is strongest under kaikai's own principles — *few forms with
-clear intent*, LLM authorability, and "safety/clarity beats
-ergonomics" — and the migration is mechanical. The case *against*
-is the breakage and the lost affordance.
-
-Sequencing: it is an **edition-boundary** change, so it lands with
-an edition bump, not a minor. Pair the decision with the §*What it
-costs* audit (measure paren-less property UFCS usage across stdlib +
-compiler) so the break is sized before committing. It is independent
-of — and complementary to — the typer fix in issue #743: that fix
-closes the Tier 1 escape; this proposal closes the ambiguity that
-makes #743's diagnostic misleading. Land the typer fix regardless;
-land this when an edition window opens and the audit says the break
-is affordable.
-
-**Cost**: medium. Resolver change is small; the edition bump,
-migration tooling (`kai fix`), and usage audit are the real work.
-**Depends on**: resolver + edition bump (+ optional `kai fix`
-migration).
 
 ## Deliberately not on this list
 

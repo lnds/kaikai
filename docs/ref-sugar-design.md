@@ -68,7 +68,7 @@ remains in the row type inferred for any function that touches a ref, so Tier 1 
 ### Sigil availability (verified)
 
 - **`&`** is free — not a lexer token, no bit-and-as-sigil (bitwise ops live in
-  `stdlib/math/bits.kai` via UFCS, not as a symbol). Available for `ref_make`.
+  `stdlib/math/bits.kai` as functions, not as a symbol). Available for `ref_make`.
 - **`@`** is `TkAt`. It serves deref in **expression** position (`@r`) and, as
   legacy, as-binding in **pattern** position (`whole @ [_, ...]`). The two never
   collide — the parser is never in both grammatical positions at once — so deref did
