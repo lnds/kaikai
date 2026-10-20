@@ -84,6 +84,43 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.167.1 (2026-10-20)
+
+### Fixed
+
+- **typer**: a bare homonym under a pipe waits for a headless receiver instead of guessing
+- **compiler**: builtins lowered in place usable as function values
+- **native**: classify a lifted body by the declaration it is lifted out of
+
+### Changed
+
+- **compiler**: merge leaf modules into the modules that own their concept
+- **compiler**: merge the typer, pattern, tail, resolver and cli leftovers into cohesive modules
+- **compiler**: split compile_source into staged driver modules
+- **compiler**: move the ast dump, command line and import loading out of driver.kai
+- **compiler**: split desugar.kai into cohesive modules
+- **compiler**: split refinements.kai into predicate algebra, entailment and contracts
+- **compiler**: split ast.kai along its type-family seams into four modules
+- **compiler**: split the kir_lower state from its signature and layout helpers
+- **compiler**: split emit_shared into cohesive modules and fold emit_ffi_c, emit_slices into their homes
+- **compiler**: fold the emit_native, emit_reuse and emit_seq dwarf modules into cohesive homes
+- **compiler**: split the emit_c expression core into a declared import cycle of six modules
+- **compiler**: split the kir_lower_walk recursive core into five declared-cycle modules
+- **compiler**: merge the scattered home, scope, pipe, record, mutation, layout and builtin dwarf modules by cohesion
+- **compiler**: merge the effect, handler, unwind, infer and driver dwarf modules by cohesion
+- **fmt**: split the type and pattern forms out of fmt_expr
+- **compiler**: move the leaf helpers out of kir_lower_walk into cohesive modules
+- **compiler**: decompose the extreme-complexity emit_c helpers the split carries
+- **compiler**: split the emit_c layers around the expression core into cohesive modules
+- **compiler**: merge the monomorph and mono dwarf modules by cohesion
+- **compiler**: merge the kir core, closure_spec, cache and naming dwarf modules by cohesion
+- **compiler**: merge the kir linearity and lowering dwarf modules by cohesion
+- **compiler**: fold the remaining dwarf modules into acyclic homes
+- **compiler**: absorb the lex, fmt and migrate entry modules into their satellites
+- **compiler**: merge the fmt, lint, migrate and mutate dwarf modules by cohesion
+- **compiler**: merge the scope, name, pub, symtab, modules, type and kind dwarf modules by cohesion
+- **compiler**: merge the core, lex and resolve dwarf modules by cohesion
+
 ## v0.167.0 (2026-10-19)
 
 ### BREAKING CHANGE
