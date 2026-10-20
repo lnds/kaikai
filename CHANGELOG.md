@@ -84,6 +84,38 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.169.0 (2026-10-20)
+
+### BREAKING CHANGE
+
+- receiver.f(args) no longer calls f(receiver, args), and method sections (.f(args)) are gone; write receiver |> f(args).
+- comparing functions, or values that hold functions, with `==`
+or `!=` no longer compiles.
+
+### Added
+
+- **typer**: remove UFCS
+- **typer**: data types are Eq structurally, functions are not, tuples order lexicographically
+
+### Fixed
+
+- write the pipes in the kaikai sources embedded in scripts and drop an unused import
+- **typer**: resolve a core-qualified eq over data to the structural comparison
+
+### Changed
+
+- **typer**: read and write a Ref by its type, not by method name
+- **examples**: write method calls as pipes
+- write method calls as pipes in tools, demos, tests and the compiler
+- **stdlib**: write method calls as pipes
+- **typer**: express the structural eq rewrite with and_then
+- **stdlib**: order tuples without helper functions
+- **typer**: skip core types when collecting those that hold functions
+- **typer**: keep the structural Eq decision in an existing module
+- **typer**: resolve each type's field heads once when deciding structural Eq
+- **typer**: decide structural Eq from a precomputed set of types holding functions
+- **compiler**: write the one method call in driver_imports as a pipe
+
 ## v0.168.0 (2026-10-20)
 
 ### BREAKING CHANGE
