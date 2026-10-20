@@ -32,7 +32,7 @@ pub(pkg) fn eq_env_of(ps: PScope, has_eq: (SymId) -> Bool, ds: [Decl]) : EqEnv =
 
 fn mk_env(ps: PScope, has_eq: (SymId) -> Bool, has_ord: (SymId) -> Bool, ds: [Decl]) : EqEnv = {
   let types = type_decls(ds, [])
-  EqEnv { ps: ps, has_eq: has_eq, has_ord: has_ord, types: types, bad: bad_fixpoint(ps, has_eq, types, idx_empty()) }
+  EqEnv { ps: ps, has_eq: has_eq, has_ord: has_ord, types: types, bad: bad_fixpoint(type_uses(ps, has_eq, types), idx_empty()) }
 }
 
 #[doc("True when `s` is a data type with no type parameters whose fields are all `Eq`.")]
@@ -61,43 +61,56 @@ fn in_bad(bad: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(bad, s) 
   _  -> true
 }
 
-# Grows the set of types holding a function until a round adds none.
-fn bad_fixpoint(ps: PScope, has_eq: (SymId) -> Bool, types: [Decl], bad: NameIndex[SymId]) : NameIndex[SymId] =
-  match bad_round(ps, has_eq, types, bad, false) {
-    BadRound(next, changed) -> if changed { bad_fixpoint(ps, has_eq, types, next) } else { next }
-  }
+# A type with no impl of its own, what it holds directly, and the types it names.
+type TypeUse = TypeUse(SymId, Bool, [SymId])
 
-type BadRound = BadRound(NameIndex[SymId], Bool)
-
-fn bad_round(ps: PScope, has_eq: (SymId) -> Bool, types: [Decl], bad: NameIndex[SymId], changed: Bool) : BadRound = match types {
-  [] -> BadRound(bad, changed)
+fn type_uses(ps: PScope, has_eq: (SymId) -> Bool, types: [Decl]) : [TypeUse] = match types {
+  []           -> []
   [d, ...rest] -> match d {
     DType(_, s, _, body, _, _, _, _) ->
-      if in_bad(bad, s) or has_eq(s) or not body_bad(ps, bad, decl_type_home(d, ps_root(ps)), body) {
-        bad_round(ps, has_eq, rest, bad, changed)
-      } else { bad_round(ps, has_eq, rest, idx_prepend_sym(bad, s, s), true) }
-    _ -> bad_round(ps, has_eq, rest, bad, changed)
+      if has_eq(s) { type_uses(ps, has_eq, rest) }
+      else { [body_use(ps, decl_type_home(d, ps_root(ps)), s, body), ...type_uses(ps, has_eq, rest)] }
+    _ -> type_uses(ps, has_eq, rest)
   }
 }
 
-fn body_bad(ps: PScope, bad: NameIndex[SymId], from: Option[String], body: TypeBody) : Bool = match body {
-  TBAlias(te)      -> te_bad(ps, bad, from, te)
-  TBRecord(fs)     -> any(fs, (f) => match f { FD(_, _, te, _) -> te_bad(ps, bad, from, te) })
-  TBSum(vs)        -> any(vs, (v) => match v { Var(_, tes) -> any(tes, (te) => te_bad(ps, bad, from, te)) })
-  TBEffectAlias(_) -> false
+fn body_use(ps: PScope, from: Option[String], s: SymId, body: TypeBody) : TypeUse = match body {
+  TBAlias(te)      -> te_use(ps, from, s, te, TypeUse(s, false, []))
+  TBRecord(fs)     -> foldl(fs, TypeUse(s, false, []), (u, f) => match f { FD(_, _, te, _) -> te_use(ps, from, s, te, u) })
+  TBSum(vs)        -> foldl(vs, TypeUse(s, false, []), (u, v) => match v {
+                        Var(_, tes) -> foldl(tes, u, (w, te) => te_use(ps, from, s, te, w)) })
+  TBEffectAlias(_) -> TypeUse(s, false, [])
 }
 
-fn te_bad(ps: PScope, bad: NameIndex[SymId], from: Option[String], te: TypeExpr) : Bool = match te.tkind {
-  TyFn(_, _, _)     -> true
-  TyName(_, args)   -> any(args, (a) => te_bad(ps, bad, from, a)) or head_bad(bad, vdv_head(ps, te, from))
-  TyList(inner)     -> te_bad(ps, bad, from, inner)
-  TyDim(base, _)    -> te_bad(ps, bad, from, base)
-  TyRefine(base, _) -> te_bad(ps, bad, from, base)
-  TyParam(_, args)  -> any(args, (a) => te_bad(ps, bad, from, a))
-  _                 -> false
+fn te_use(ps: PScope, from: Option[String], s: SymId, te: TypeExpr, u: TypeUse) : TypeUse = match te.tkind {
+  TyFn(_, _, _)     -> TypeUse(s, true, [])
+  TyName(_, args)   -> foldl(args, with_ref(u, vdv_head(ps, te, from)), (w, a) => te_use(ps, from, s, a, w))
+  TyList(inner)     -> te_use(ps, from, s, inner, u)
+  TyDim(base, _)    -> te_use(ps, from, s, base, u)
+  TyRefine(base, _) -> te_use(ps, from, s, base, u)
+  TyParam(_, args)  -> foldl(args, u, (w, a) => te_use(ps, from, s, a, w))
+  _                 -> u
 }
 
-fn head_bad(bad: NameIndex[SymId], head: DeclRef) : Bool = ref_resolved(head) and in_bad(bad, ref_sym(head))
+fn with_ref(u: TypeUse, head: DeclRef) : TypeUse = match u {
+  TypeUse(s, direct, refs) -> if ref_resolved(head) { TypeUse(s, direct, [ref_sym(head), ...refs]) } else { u }
+}
+
+# Grows the set of types holding a function until a round adds none.
+fn bad_fixpoint(uses: [TypeUse], bad: NameIndex[SymId]) : NameIndex[SymId] = match bad_round(uses, bad, [], false) {
+  BadRound(next, rest, changed) -> if changed { bad_fixpoint(rest, next) } else { next }
+}
+
+type BadRound = BadRound(NameIndex[SymId], [TypeUse], Bool)
+
+fn bad_round(uses: [TypeUse], bad: NameIndex[SymId], kept: [TypeUse], changed: Bool) : BadRound = match uses {
+  [] -> BadRound(bad, kept, changed)
+  [u, ...rest] -> match u {
+    TypeUse(s, direct, refs) ->
+      if direct or any(refs, (r) => in_bad(bad, r)) { bad_round(rest, idx_prepend_sym(bad, s, s), kept, true) }
+      else { bad_round(rest, bad, [u, ...kept], changed) }
+  }
+}
 
 #[doc("True when values of `t` can be compared with `==` and satisfy an `Eq` bound.")]
 pub(pkg) fn ty_is_eq(env: EqEnv, t: Ty) : Bool = match t {
