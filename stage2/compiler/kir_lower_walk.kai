@@ -1,15 +1,4 @@
-# compiler/kir_lower_walk.kai — the Expr→ANF recursion.
-#
-# `lower_expr ↔ lower_call ↔ lower_if/lower_match` are one mutual-recursion
-# cycle; the module DAG cannot split a cycle, so they share this module
-# (the same reason emit_expr/emit_stmt live together in emit_c). The
-# NON-recursive base (state, name supply, type/decl walks, pure helpers)
-# lives in `kir_lower.kai`, which this module imports — base ← walk only,
-# so the import graph stays acyclic.
-#
-# This is the single semantics-bearing pass (design §5): ANF flattening +
-# basic-block construction + sentinel decode + KRC placement, written ONCE
-# so the two translators (KIR→C, KIR→LLVM) stay dumb.
+#[doc("The KIR lowering walk: expression dispatch, raw and boxed forms, loops, lists, records and vector reads and writes. Mutually recursive with kir_lower_stmts and kir_lower_calls.")]
 
 import compiler.ast
 import compiler.real_lit
@@ -17,142 +6,24 @@ import compiler.written
 import compiler.symtab
 import compiler.marks
 import compiler.util
-import compiler.kinds
 import compiler.fnreg
-import compiler.emit_shared
-import compiler.unwind_clauses
 import compiler.rec_stamp
 import compiler.infer_glue
 import compiler.infer_env
 import compiler.infer_state
 import compiler.kir
 import compiler.kir_lower
-import compiler.ctor_ix
-import compiler.core_builtins
 import compiler.unwind_pend
 import compiler.kir_lower_reuse
 import compiler.kir_lower_scalar
 import compiler.kir_lower_exits
-import compiler.kir_lower_arms
-import compiler.fn_index
-import compiler.kir_lower_bind
-import compiler.perceus_read_walk
 import compiler.kir_lower_raw
-import compiler.kir_syms
-import compiler.loop_lower
-import compiler.kir_lower_match
 import compiler.vec_raw
-import compiler.emit_tcrec_live
 import compiler.raw_border
-import compiler.refinements
-import compiler.resume_scan
 import compiler.effect_instance
-
-# Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
-# `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
-# `None` for any other call. The element scalar rides the prim (the
-# emitter picks the scalar LLVM type + box constructor from it, mirroring
-# the C `KaiFixedVec_<elem>_<n>` typedef), so the aggregate op carries its
-# full type without a KOp variant. `__fixed_vec_lit(e0..en)` binds the flat
-# aggregate at a `SBoxed` handle slot (the alloca pointer, no RC); a static
-# `__fixed_vec_get(v, i)` is a GEP+load re-box.
-fn lower_fixed_vec_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
-  match f.kind {
-    EMark(MkFixedVecLit)    -> Some(lower_fixed_vec_lit(x, cargs, st))
-    EMark(MkFixedVecGet)    -> lower_fixed_vec_get(x, cargs, st)
-    EMark(MkFixedVecGetDyn) -> lower_fixed_vec_get_dyn(x, cargs, st)
-    _                       -> None
-  }
-
-# `[e0, ..., en]` typed `Vec[elem]<n>` → each element lowered raw at the
-# element scalar slot, then a `KpFixedVecLit(elem, n)` prim binding the
-# flat aggregate at a handle slot. `(elem, n)` is the aggregate shape the
-# emitter rebuilds the `[n x elem]` LLVM type from (LLVM dedups it with the
-# read side's).
-fn lower_fixed_vec_lit(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let vty = match x.ty { Some(t) -> t  None -> TyReal }
-  let elem = if ty_is_fixed_vec(vty) { fixed_vec_elem(vty) } else { TyReal }
-  let eslot = kslot_of_raw_ty(elem)
-  let re = lower_fixed_vec_elems(cargs, eslot, st, [])
-  match re { LRes2(raws, st1) ->
-    bind_op_slot(st1, KPrim(KpFixedVecLit(fixed_vec_elem_scalar(elem), list_length(cargs)), raws), SBoxed, kpos_of(x)) }
-}
-
-# `__fixed_vec_get(v, i)` → the base handle atom + a static-index prim,
-# re-boxed at the element's box constructor. `i` is a compile-time literal
-# (the typer proved it in range and elided the bounds check). The prim's
-# length comes from the base's fixed-vec type so the emitter rebuilds the
-# same `[n x elem]` type the write side alloca'd.
-#
-# The inline `[n x elem]` aggregate is the representation of a binder the
-# unbox pass marked `MUnboxed`. A fixed-vec-TYPED base that is boxed (a
-# parameter, a call result) already crossed the border and is a dynamic
-# heap vec: GEPing into it would read through the `KaiValue *` header and
-# return garbage, so it takes the `heap` read, which reaches the slot
-# through the runtime. Neither form touches RC — what Perceus assumes for
-# this read.
-fn lower_fixed_vec_get(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
-  match cargs {
-    [v, i] -> {
-      let elem = match x.ty { Some(t) -> t  None -> TyReal }
-      let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
-      let rv = lower_expr_boxed(v, st)
-      match rv { LRes(vv, st1) ->
-        Some(bind_op_slot(st1, KPrim(fixed_vec_get_prim(v.mode, false, false, elem, n), [vv, fixed_vec_idx_atom(i)]), SBoxed, kpos_of(x))) }
-    }
-    _ -> None
-  }
-
-# `__fixed_vec_get_dyn(v, i)` → the base handle atom plus the index lowered
-# RAW at `SInt64`: the emitter gates it against the static length before the
-# GEP, so the index must reach it as a machine word, not a boxed value.
-fn lower_fixed_vec_get_dyn(x: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
-  match cargs {
-    [v, i] -> {
-      let elem = match x.ty { Some(t) -> t  None -> TyReal }
-      let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
-      match lower_expr_boxed(v, st) { LRes(vv, st1) ->
-        match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
-          Some(bind_op_slot(st2, KPrim(fixed_vec_get_prim(v.mode, false, true, elem, n), [vv, iv]), SBoxed, kpos_of(x))) } }
-    }
-    _ -> None
-  }
-
-# A fixed-vec element read in RAW position: the same GEP+load, bound at the
-# element's scalar slot with no re-box. The read's `raw` tells the emitter to
-# stop at the loaded word. Only the reads qualify — a fixed-vec LITERAL is an
-# aggregate pointer, never a raw scalar.
-#
-# The base's mode picks the read exactly as on the boxed path: raw position
-# changes what the loaded word becomes, never where it lives.
-fn lower_fixed_vec_read_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console =
-  match f.kind {
-    EMark(MkFixedVecGet)    -> lower_fixed_vec_get_at(x, cargs, false, st)
-    EMark(MkFixedVecGetDyn) -> lower_fixed_vec_get_at(x, cargs, true, st)
-    _                       -> None
-  }
-
-fn lower_fixed_vec_get_at(x: Expr, cargs: [Expr], dyn: Bool, st: LowerSt) : Option[LRes] / Console =
-  match cargs {
-    [v, i] -> {
-      let elem = match x.ty { Some(t) -> t  None -> TyReal }
-      let n = match v.ty { Some(t) -> if ty_is_fixed_vec(t) { fixed_vec_n(t) } else { 0 }  None -> 0 }
-      match lower_expr_boxed(v, st) { LRes(vv, st1) -> {
-        let ri = if dyn { lower_expr_raw_at(i, SInt64, st1) } else { LRes(fixed_vec_idx_atom(i), st1) }
-        match ri { LRes(iv, st2) ->
-          Some(bind_op_slot(st2, KPrim(fixed_vec_get_prim(v.mode, true, dyn, elem, n), [vv, iv]),
-                            kslot_of_raw_ty(elem), kpos_of(x))) }
-      } }
-    }
-    _ -> None
-  }
-
-fn lower_fixed_vec_elems(es: [Expr], eslot: KSlot, st: LowerSt, acc: [KVal]) : LRes2 / Console = match es {
-  []           -> LRes2(acc, st)
-  [e, ...rest] -> match lower_expr_raw_at(e, eslot, st) {
-    LRes(ev, st1) -> lower_fixed_vec_elems(rest, eslot, st1, list_append(acc, [ev]))
-  }
-}
+import compiler.kir_lower_stmts
+import compiler.kir_lower_forms
+import compiler.kir_lower_calls
 
 # Lower an expression in BOXED position (the default — every value-bearing
 # slot a call/record/list/return wants is a boxed `ptr`). MODE-SLAVE to the
@@ -178,21 +49,10 @@ fn lower_expr_unpadded(x: Expr, st: LowerSt) : LRes / Console =
   } else if fixed_vec_needs_materialize(x) { lower_fixed_vec_materialize(x, st) }
   else { lower_expr_boxed(x, st) }
 
-# The inline aggregate → a dynamic heap `Vec`, one copy at the border
-# (`vec_reserve` + one `vec_push` per element). Mirrors the C backend's
-# `materialize_fixed_vec` reached from `box_wrap`.
-fn lower_fixed_vec_materialize(x: Expr, st: LowerSt) : LRes / Console = {
-  let vty = match x.ty { Some(t) -> t  None -> TyReal }
-  let elem = fixed_vec_elem(vty)
-  let n = fixed_vec_n(vty)
-  match lower_expr_boxed(x, st) { LRes(vv, st1) ->
-    bind_op_slot(st1, KPrim(KpFixedVecMaterialize(fixed_vec_elem_scalar(elem), n), [vv]), SBoxed, kpos_of(x)) }
-}
-
 # The boxed-position dispatch (the original `lower_expr` body). Reached
 # either directly (non-raw node) or as the boxed fallback inside the raw
 # path (`lower_expr_raw`'s box→raw border lowers boxed here then unboxes).
-fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
+pub(pkg) fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
   Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_boxed_unpadded(x, st1) {
     LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
   } }
@@ -238,17 +98,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # reads, transfers single-use, ctors return rc=1) and is no longer reachable
   # through the result, so drop it to balance — the C oracle's `kai_decref(_b)`
   # after the field load.
-  EField(base, fname) -> match lower_vec_get_field_fused(x, base, fname, st) {
-    Some(r) -> r
-    None -> {
-      let rb = lower_expr(base, st)
-      match rb { LRes(bv, st1) ->
-        match field_index_of(st1.recs, base.ty, fname) {
-          Some(n) -> lower_field_read(st1, KPrim(KpFieldAt, [bv, KIntV(n)]), bv, kpos_of(x))
-          None    -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(fname)]), bv, kpos_of(x))
-        } }
-    }
-  }
+  EField(base, fname) -> lower_field_boxed(x, base, fname, st)
 
   # Binary / unary operators → a KPrim over their operand atoms. The
   # specific runtime helper is the translator's concern.
@@ -261,23 +111,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # whose arguments are already materialised.) Route them through the
   # branch machinery instead: `a and b` is `if a { b } else { false }`,
   # `a or b` is `if a { true } else { b }`.
-  EBinop(op, a, b)   -> match op {
-    BoAnd -> lower_if(x, a, b, Some(mk_typed_bool(false, x)), st)
-    BoOr  -> lower_if(x, a, mk_typed_bool(true, x), Some(b), st)
-    _     -> {
-      let ra = lower_expr(a, st)
-      match ra { LRes(av, st1) -> {
-        let rbv = lower_expr(b, lower_flight_add(a, av, st1))
-        match rbv { LRes(bv, st2) -> {
-          let st3 = lower_flight_end(st1, st2)
-          match lower_consumed_pad(x, op, [(a, av), (b, bv)], st3) { PadB(outer, st4) ->
-            match bind_op(st4, KPrim(binop_prim(op, a, st4), [av, bv]), kpos_of(x)) {
-              LRes(v, st5) -> LRes(v, lower_pad_end(x, outer, st5))
-            } }
-        } }
-      } }
-    }
-  }
+  EBinop(op, a, b)   -> lower_binop_boxed(x, op, a, b, st)
   EUnop(op, a)       -> {
     let ra = lower_expr(a, st)
     match ra { LRes(av, st1) -> bind_op(st1, KPrim(KpUn(op), [av]), kpos_of(x)) }
@@ -343,19 +177,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # at its scalar type; a write stores the raw value and yields unit. A
   # loop intrinsic pastes its pred/body lambda bodies into an inline
   # block loop in the enclosing fn (the C emitter's `for (;;)` mirror).
-  EIntrinsic(inm, iargs) -> match inm {
-    InCellGet     -> bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(iargs, st))]), kpos_of(x))
-    InCellSet     -> lower_cell_set(x, inm, iargs, st)
-    InLoopWhile   -> lower_loop_intrinsic(x, inm, iargs, st)
-    InLoopUntil   -> lower_loop_intrinsic(x, inm, iargs, st)
-    InLoopRepeat  -> lower_loop_intrinsic(x, inm, iargs, st)
-    InResumeFrame -> lower_resume_frame(x, iargs, st)
-    InSegHandle   -> lower_seg_handle(x, iargs, st)
-    InSegRequest  -> lower_seg_request(x, iargs, st)
-    InAbsent      -> LRes(KUnitV, st)
-    InCovHit(s)   -> LRes(KUnitV, ls_emit(st, KDo(KPrim(KpCovHit, [KStrV(json_quote(s))]), kpos_of(x))))
-    _             -> lower_unhandled(x, st)
-  }
+  EIntrinsic(inm, iargs) -> lower_intrinsic_boxed(x, inm, iargs, st)
 
   # Forms the resolve / desugar / typer passes rewrite away before codegen
   # (every pipe → ECall, `EIndex` → call, `EUnder`/`EPlaceholder`
@@ -372,13 +194,57 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   _ -> lower_unhandled(x, st)
 }
 
+# A known record base gives the field a compile-time slot (`kai_op_field_at`);
+# otherwise the read goes by name. The base arrives owned and is not reachable
+# through the result, so it is dropped after the read.
+fn lower_field_boxed(x: Expr, base: Expr, fname: String, st: LowerSt) : LRes / Console =
+  match lower_vec_get_field_fused(x, base, fname, st) {
+    Some(r) -> r
+    None -> match lower_expr(base, st) { LRes(bv, st1) ->
+      match field_index_of(st1.recs, base.ty, fname) {
+        Some(n) -> lower_field_read(st1, KPrim(KpFieldAt, [bv, KIntV(n)]), bv, kpos_of(x))
+        None    -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(fname)]), bv, kpos_of(x))
+      } }
+  }
+
+# `and` / `or` short-circuit, so they lower as branches: a `KPrim` would
+# evaluate both operand atoms before the helper runs.
+fn lower_binop_boxed(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console = match op {
+  BoAnd -> lower_if(x, a, b, Some(mk_typed_bool(false, x)), st)
+  BoOr  -> lower_if(x, a, mk_typed_bool(true, x), Some(b), st)
+  _     -> match lower_expr(a, st) { LRes(av, st1) ->
+    match lower_expr(b, lower_flight_add(a, av, st1)) { LRes(bv, st2) -> {
+      let st3 = lower_flight_end(st1, st2)
+      match lower_consumed_pad(x, op, [(a, av), (b, bv)], st3) { PadB(outer, st4) ->
+        match bind_op(st4, KPrim(binop_prim(op, a, st4), [av, bv]), kpos_of(x)) {
+          LRes(v, st5) -> LRes(v, lower_pad_end(x, outer, st5))
+        } }
+    } } }
+}
+
+# A cell read boxes its raw register; a loop intrinsic pastes its predicate and
+# body lambdas into an inline loop in the enclosing function.
+fn lower_intrinsic_boxed(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match inm {
+  InCellGet     -> bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(iargs, st))]), kpos_of(x))
+  InCellSet     -> lower_cell_set(x, inm, iargs, st)
+  InLoopWhile   -> lower_loop_intrinsic(x, inm, iargs, st)
+  InLoopUntil   -> lower_loop_intrinsic(x, inm, iargs, st)
+  InLoopRepeat  -> lower_loop_intrinsic(x, inm, iargs, st)
+  InResumeFrame -> lower_resume_frame(x, iargs, st)
+  InSegHandle   -> lower_seg_handle(x, iargs, st)
+  InSegRequest  -> lower_seg_request(x, iargs, st)
+  InAbsent      -> LRes(KUnitV, st)
+  InCovHit(s)   -> LRes(KUnitV, ls_emit(st, KDo(KPrim(KpCovHit, [KStrV(json_quote(s))]), kpos_of(x))))
+  _             -> lower_unhandled(x, st)
+}
+
 # --- raw (unboxed) scalar lowering ----------------------------------------
 #
 # Lower `x` in RAW position: the result is a raw scalar register, not a
 # boxed `ptr`. Mirror of the C oracle's `emit_expr_raw`: a `MUnboxed` node is
 # natively raw; any other crosses the box→raw border (`raw_border.kai`). The
 # mutual recursion with `lower_expr` is why this lives in the Expr-SCC.
-fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
+pub(pkg) fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
   Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_raw_unpadded(x, st1) {
     LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
   } }
@@ -396,7 +262,7 @@ fn lower_expr_raw_unpadded(x: Expr, st: LowerSt) : LRes / Console = {
 # Lower `x` raw at a KNOWN destination slot (a call arg at its param's raw
 # slot). The border keys off the param's slot, not `x.ty`: an arg the typer
 # left untyped would otherwise cross as a Real.
-fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
+pub(pkg) fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
   Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_raw_at_unpadded(x, slot, st1) {
     LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
   } }
@@ -425,11 +291,11 @@ fn lower_scalar_unbox_border_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Cons
 fn lower_scalar_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
   lower_scalar_unbox_border_at(x, border_slot_of(x.ty), st)
 
-fn lower_unbox_border(x: Expr, prim: PrimOp, slot: KSlot, st: LowerSt) : LRes / Console =
+pub(pkg) fn lower_unbox_border(x: Expr, prim: PrimOp, slot: KSlot, st: LowerSt) : LRes / Console =
   lower_unbox_at(x, prim, slot, raw_border_owns(x), st)
 
 # Unbox `x`'s boxed form through `prim`, releasing the box when it is owned.
-fn lower_unbox_at(x: Expr, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
+pub(pkg) fn lower_unbox_at(x: Expr, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
   match lower_expr_boxed(x, st) { LRes(bv, st1) ->
     match bind_op_slot(st1, KPrim(prim, [bv]), slot, kpos_of(x)) {
       LRes(rv, st2) -> if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
@@ -448,105 +314,92 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EChar(c)    -> LRes(KCharV(c), st)
   ELocal(l)   -> lower_local(l, st)
   ELitUnit(inner, _) -> lower_expr_raw(inner, st)
-  # Arith routes by RESULT type (mirror of `kir_kind_is_raw`): a Real-typed
-  # node lowers the f-family (`f+`, `SReal`), an Int-typed node the i-family
-  # (`i+`, `SInt64`). Routing by operator alone would send Int `+` down the
-  # Real `f+` path (a miscompile — `fadd` over i64 operands). A comparison
-  # routes by OPERAND type (its result is Bool, not the scalar).
-  EBinop(op, a, b) ->
-    if kir_ty_is_real(x.ty) and kir_op_is_raw_freal_arith(op) {
-      lower_raw_binop(x, KpRawBin(RwReal, op), SReal, a, b, st)
-    }
-    else if kir_ty_is_int(x.ty) and kir_op_is_raw_iint_arith(op) {
-      lower_raw_binop(x, KpRawBin(RwInt, op), SInt64, a, b, st)
-    }
-    else if kir_ty_is_byte(x.ty) and kir_op_is_raw_iint_arith(op) {
-      lower_raw_binop(x, KpRawBin(RwByte, op), SByte, a, b, st)
-    }
-    else if kir_ty_is_fixed_raw(x.ty) and kir_op_is_raw_iint_arith(op) {
-      lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(x.ty), op), kir_fixed_raw_slot(x.ty), a, b, st)
-    }
-    else if kir_op_is_raw_cmp(op) {
-      if kir_ty_is_int(a.ty) { lower_raw_binop(x, KpRawBin(RwInt, op), SBool, a, b, st) }
-      else if kir_ty_is_byte(a.ty) { lower_raw_binop(x, KpRawBin(RwByte, op), SBool, a, b, st) }
-      else if kir_ty_is_bool(a.ty) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
-      else if kir_ty_is_char(a.ty) { lower_raw_binop(x, KpRawBin(RwChar, op), SBool, a, b, st) }
-      else if kir_ty_is_fixed_raw(a.ty) { lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(a.ty), op), SBool, a, b, st) }
-      else { lower_raw_binop(x, KpRawBin(RwReal, op), SBool, a, b, st) }
-    }
-    else if kir_op_is_raw_logical(op) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
-    else { lower_scalar_unbox_border(x, st) }
-  # Unary `-` is raw ONLY for Real (`fneg` over f64); an Int `-x` has no raw
-  # `ineg` form in v1, so it crosses the box→raw border (boxed `kaix_neg`
-  # then `int.unbox`). Routing every `-` to `fneg`/`SReal` would emit
-  # `fneg ptr` over a boxed/i64 operand (the `int_cache_reuse_bump` crash:
-  # a raw-Int `seen == -1` recursing into the `-1` unop). `not` stays raw
-  # (i1 over a raw bool).
-  EUnop(op, a) -> match op {
-    UoNeg ->
-      if kir_ty_is_real(x.ty) {
-        match lower_expr_raw(a, st) {
-          LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNeg), [av]), SReal, kpos_of(x))
-        }
-      } else { lower_scalar_unbox_border(x, st) }
-    UoNot -> match lower_expr_raw(a, st) {
-      LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNot), [av]), SBool, kpos_of(x))
-    }
+  EBinop(op, a, b) -> lower_raw_arith(x, op, a, b, st)
+  EUnop(op, a) -> lower_raw_unop(x, op, a, st)
+  ECall(f, cargs) -> lower_raw_call(x, f, cargs, st)
+  EField(_, _) -> match vec_raw_read(st.recs, x.kind, x.ty) {
+    Some(rd) -> lower_vec_raw_read(x, rd, st)
+    None     -> lower_scalar_unbox_border(x, st)
   }
-  # A call in raw position (`fib(n-1) + fib(n-2)` — each call is an arith
-  # OPERAND, not a `let`-binder). Route it through the ORDINARY call dispatch:
-  # `lower_direct_call` binds the result at the callee's return slot, so a
-  # raw-return UFn lands its `i64`/`f64`/`i1` in a raw register and the
-  # consuming `lower_raw_binop` reads it directly (`nemit_load_reg_as_int`,
-  # no `kaix_int_field`) — eliminating the `kaix_int` box + `kaix_int_field`
-  # unbox round-trip the old `_`-arm border emitted per call (the ~8× on
-  # `fib`-tree recursion). A callee with a BOXED return resolves to an
-  # `SBoxed` register; the consumer then unbox-borrows at the slot exactly
-  # as the border did, so a non-raw callee keeps the prior behaviour. Mirror
-  # of the oracle's `emit_kind_raw` ECall arm → `emit_ufn_raw_call`. RC: a
-  # raw call result carries no refcount; perceus already skipped it (the
-  # node is `MUnboxed`), so no KDup/KDrop lands on the raw register.
-  # A fixed-vec read has no core symbol to call: on the raw path it lowers
-  # to the inline prim at the element's SCALAR slot, skipping the re-box the
-  # boxed path needs.
-  ECall(f, cargs) -> if kir_is_scalar_conv(f, cargs) { lower_scalar_conv_raw(x, f, cargs, st) }
-    else { match lower_fixed_vec_read_raw(x, f, cargs, st) {
+  EBlock(stmts, tail) -> lower_raw_block(x, stmts, tail, st)
+  EIntrinsic(inm, iargs) -> lower_raw_intrinsic(x, inm, iargs, st)
+  # Only the forms above are admitted as raw; this arm is reached by recursion
+  # on an operand the unbox pass left boxed.
+  _ -> lower_scalar_unbox_border(x, st)
+}
+
+# Arith routes by the RESULT type, a comparison by the OPERAND type: routing
+# by operator alone would send Int `+` down the Real `f+` path.
+fn lower_raw_arith(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
+  if kir_ty_is_real(x.ty) and kir_op_is_raw_freal_arith(op) {
+    lower_raw_binop(x, KpRawBin(RwReal, op), SReal, a, b, st)
+  }
+  else if kir_ty_is_int(x.ty) and kir_op_is_raw_iint_arith(op) {
+    lower_raw_binop(x, KpRawBin(RwInt, op), SInt64, a, b, st)
+  }
+  else if kir_ty_is_byte(x.ty) and kir_op_is_raw_iint_arith(op) {
+    lower_raw_binop(x, KpRawBin(RwByte, op), SByte, a, b, st)
+  }
+  else if kir_ty_is_fixed_raw(x.ty) and kir_op_is_raw_iint_arith(op) {
+    lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(x.ty), op), kir_fixed_raw_slot(x.ty), a, b, st)
+  }
+  else if kir_op_is_raw_cmp(op) { lower_raw_cmp(x, op, a, b, st) }
+  else if kir_op_is_raw_logical(op) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
+  else { lower_scalar_unbox_border(x, st) }
+
+fn lower_raw_cmp(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
+  if kir_ty_is_int(a.ty) { lower_raw_binop(x, KpRawBin(RwInt, op), SBool, a, b, st) }
+  else if kir_ty_is_byte(a.ty) { lower_raw_binop(x, KpRawBin(RwByte, op), SBool, a, b, st) }
+  else if kir_ty_is_bool(a.ty) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
+  else if kir_ty_is_char(a.ty) { lower_raw_binop(x, KpRawBin(RwChar, op), SBool, a, b, st) }
+  else if kir_ty_is_fixed_raw(a.ty) { lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(a.ty), op), SBool, a, b, st) }
+  else { lower_raw_binop(x, KpRawBin(RwReal, op), SBool, a, b, st) }
+
+# Unary `-` is raw only for Real: an Int `-x` has no raw form and crosses the
+# border, since `fneg` over a boxed or i64 operand miscompiles.
+fn lower_raw_unop(x: Expr, op: UnOp, a: Expr, st: LowerSt) : LRes / Console = match op {
+  UoNeg ->
+    if kir_ty_is_real(x.ty) {
+      match lower_expr_raw(a, st) {
+        LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNeg), [av]), SReal, kpos_of(x))
+      }
+    } else { lower_scalar_unbox_border(x, st) }
+  UoNot -> match lower_expr_raw(a, st) {
+    LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNot), [av]), SBool, kpos_of(x))
+  }
+}
+
+# A call in raw position goes through the ordinary call dispatch, which binds
+# the result at the callee's return slot; a boxed return is unbox-borrowed by
+# the consumer. A fixed-vec read has no callee and lowers to the inline prim.
+fn lower_raw_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
+  if kir_is_scalar_conv(f, cargs) { lower_scalar_conv_raw(x, f, cargs, st) }
+  else { match lower_fixed_vec_read_raw(x, f, cargs, st) {
     Some(r) -> r
     None    -> match vec_raw_read(st.recs, x.kind, x.ty) {
       Some(rd) -> lower_vec_raw_read(x, rd, st)
       None     -> lower_call(x, f, cargs, st)
     }
   } }
-  EField(_, _) -> match vec_raw_read(st.recs, x.kind, x.ty) {
-    Some(rd) -> lower_vec_raw_read(x, rd, st)
-    None     -> lower_scalar_unbox_border(x, st)
+
+# A plain block lowers its statements in its own scope and its tail at the raw
+# slot; a region block lowers boxed and unbox-borrows at the border.
+fn lower_raw_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
+  match stmts {
+    [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_scalar_unbox_border(x, st) }
+    _  -> if block_is_region(st.regions, x.line, x.col) { lower_scalar_unbox_border(x, st) }
+          else { lower_plain_block_at(x, stmts, tail, border_slot_of(x.ty), st) }
   }
-  # A single-tail block transparently wraps its raw tail. A plain block with
-  # statements lowers them in its own scope and its tail at the raw slot; a
-  # region block lowers boxed and unbox-borrows at the border.
-  EBlock(stmts, tail) ->
-    match stmts {
-      [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_scalar_unbox_border(x, st) }
-      _  -> if block_is_region(st.regions, x.line, x.col) { lower_scalar_unbox_border(x, st) }
-            else { lower_plain_block_at(x, stmts, tail, border_slot_of(x.ty), st) }
-    }
-  # A promoted var cell: a read is the raw register itself (resolving an
-  # active shadow rename, like a local read); the init forwards its raw
-  # literal.
-  EIntrinsic(inm, iargs) -> match inm {
-    InCellGet  -> LRes(KVar(lower_cell_reg(iargs, st)), st)
-    InCellInit -> match iargs {
-      [init] -> lower_expr_raw(init, st)
-      _      -> lower_scalar_unbox_border(x, st)
-    }
-    InAbsent   -> lower_absent_raw(x, st)
-    _          -> lower_scalar_unbox_border(x, st)
+
+# A promoted var cell reads as its raw register; the init forwards its literal.
+fn lower_raw_intrinsic(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match inm {
+  InCellGet  -> LRes(KVar(lower_cell_reg(iargs, st)), st)
+  InCellInit -> match iargs {
+    [init] -> lower_expr_raw(init, st)
+    _      -> lower_scalar_unbox_border(x, st)
   }
-  # The guard (`kir_node_is_raw`) only admits the FORMS above, so this arm is
-  # reached only via internal recursion on a sub-operand the unbox pass left
-  # boxed — lower it boxed and unbox-borrow its raw scalar (the box→raw
-  # border, by type).
-  _ -> lower_scalar_unbox_border(x, st)
+  InAbsent   -> lower_absent_raw(x, st)
+  _          -> lower_scalar_unbox_border(x, st)
 }
 
 # A zero of the slot's scalar type; a width with no immediate goes
@@ -556,127 +409,6 @@ fn lower_absent_raw(x: Expr, st: LowerSt) : LRes / Console = match border_slot_o
   SBool  -> LRes(KBoolV(false), st)
   SReal  -> LRes(KRealV(0.0), st)
   _      -> lower_scalar_unbox_border(x, st)
-}
-
-# A promoted var cell's write: store the raw value into the cell's
-# register (an alloca — the same mutation KStore performs for TCO loop
-# assigns). A raw value stores directly; a boxed value crosses the
-# border (borrowing unbox) and is then dropped — the store owns the
-# scalar, and a raw register carries no RC to hand the box to.
-fn lower_cell_set(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
-  [_, v] -> {
-    let reg = lower_cell_reg(iargs, st)
-    match v.mode {
-      MUnboxed -> match lower_expr_raw(v, st) {
-        LRes(rv, st1) -> LRes(KUnitV, ls_emit(st1, KStore(reg, rv, kpos_of(x))))
-      }
-      _ -> {
-        let slot = cell_slot_of_ty(v.ty)
-        match lower_expr_boxed(v, st) {
-          LRes(bv, st1) -> match bind_op_slot(st1, KPrim(cell_unbox_prim(slot), [bv]), slot, kpos_of(x)) {
-            LRes(rv, st2) ->
-              LRes(KUnitV, ls_emit(ls_emit(st2, KStore(reg, rv, kpos_of(x))),
-                                   KRC(KDrop(bv), kpos_of(x))))
-          }
-        }
-      }
-    }
-  }
-  _ -> lower_unhandled(x, st)
-}
-
-# --- loop intrinsics (inline block loops) -------------------------------
-#
-# The loop combinator's pred/body arrive as literal nullary lambdas the
-# collector never lifted (they are not closures); their bodies lower
-# INLINE into cond/body blocks with a backedge, in the enclosing fn's
-# frame — so a promoted var cell mutated by the loop is a plain alloca
-# the backedge re-reads. RC inside the pasted bodies was computed under
-# the closure discipline (per-iteration balance), same as the C paste.
-
-fn lower_loop_intrinsic(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
-  [_, a, b] -> match inm {
-    InLoopWhile  -> lower_loop_while(x, loop_arg_body(a), loop_arg_body(b), st)
-    InLoopUntil  -> lower_loop_until(x, loop_arg_body(a), loop_arg_body(b), st)
-    InLoopRepeat -> lower_loop_repeat(x, a, loop_arg_body(b), st)
-    _            -> lower_unhandled(x, st)
-  }
-  _ -> lower_unhandled(x, st)
-}
-
-# `while { pred } { body }`: cond block (backedge target) evaluates the
-# pred and forks to body/exit; the body block re-enters the cond.
-fn lower_loop_while(x: Expr, pred: Expr, body: Expr, st: LowerSt) : LRes / Console =
-  match three_labels(st) { LSL3(lcond, lbody, lcont, st1) -> {
-    let st2 = ls_seal(st1, KBr(lcond, kpos_of(x)), lcond)
-    match lower_loop_cond(pred, st2) { LRes(cv, st3) -> {
-      let st4 = ls_seal(st3, KCondBr(cv, lbody, lcont, kpos_of(x)), lbody)
-      let st5 = lower_loop_body(body, st4)
-      LRes(KUnitV, ls_seal(st5, KBr(lcond, kpos_of(x)), lcont))
-    } }
-  } }
-
-# `until { pred } { body }`: body runs first, then the pred in the same
-# block; exit when it holds.
-fn lower_loop_until(x: Expr, pred: Expr, body: Expr, st: LowerSt) : LRes / Console =
-  match three_labels(st) { LSL3(lbody, _, lcont, st1) -> {
-    let st2 = ls_seal(st1, KBr(lbody, kpos_of(x)), lbody)
-    let st3 = lower_loop_body(body, st2)
-    match lower_loop_cond(pred, st3) { LRes(cv, st4) ->
-      LRes(KUnitV, ls_seal(st4, KCondBr(cv, lcont, lbody, kpos_of(x)), lcont))
-    }
-  } }
-
-# `repeat(n) { body }`: a raw i64 count-down register.
-fn lower_loop_repeat(x: Expr, n: Expr, body: Expr, st: LowerSt) : LRes / Console =
-  match lower_loop_count(n, st) { LRes(nv, st1) ->
-    match ls_fresh_reg(st1) { LSReg(reg, st2) -> {
-      let st3 = ls_emit(st2, KLet(reg, SInt64, KLitOp(nv), kpos_of(x)))
-      match three_labels(st3) { LSL3(lcond, lbody, lcont, st4) -> {
-        let st5 = ls_seal(st4, KBr(lcond, kpos_of(x)), lcond)
-        match bind_op_slot(st5, KPrim(KpRawBin(RwInt, BoGt), [KVar(reg), KIntV(0)]), SBool, kpos_of(x)) { LRes(cv, st6) -> {
-          let st7 = ls_seal(st6, KCondBr(cv, lbody, lcont, kpos_of(x)), lbody)
-          let st8 = lower_loop_body(body, st7)
-          match bind_op_slot(st8, KPrim(KpRawBin(RwInt, BoSub), [KVar(reg), KIntV(1)]), SInt64, kpos_of(x)) { LRes(dv, st9) -> {
-            let st10 = ls_emit(st9, KStore(reg, dv, kpos_of(x)))
-            LRes(KUnitV, ls_seal(st10, KBr(lcond, kpos_of(x)), lcont))
-          } }
-        } }
-      } }
-    } }
-  }
-
-# The loop condition: raw when its tail is a raw-marked node (an i1 the
-# condbr reads directly), else boxed (the condbr truthy path) — the same
-# split `lower_if` applies. The pred arrives as the literal lambda's body,
-# usually a single-tail block wrapping the comparison; the block itself is
-# not a raw FORM, so peel transparent wrappers before consulting the mark
-# (`lower_expr_raw`'s block arm recurses to the same tail).
-fn lower_loop_cond(pred: Expr, st: LowerSt) : LRes / Console =
-  if loop_cond_is_raw(pred) { lower_expr_raw(pred, st) }
-  else { lower_expr(pred, st) }
-
-# The loop body in statement position: its per-iteration value is
-# discarded (the SExprStmt shape). A `()` value owns nothing and needs no
-# `KDo` — eliding it keeps loop bodies free of dead unit ops; any other
-# atom keeps the `KDo`, whose emitter drops an owned boxed discard. The
-# unit test happens HERE, at the `LRes` destructure: an atom passed on to
-# a helper that matches it hits the stage1 variant-read miscompile.
-fn lower_loop_body(body: Expr, st: LowerSt) : LowerSt / Console =
-  match lower_expr(body, st) { LRes(v, st1) -> match v {
-    KUnitV -> st1
-    _      -> ls_emit(st1, KDo(KLitOp(v), kpos_of(body)))
-  } }
-
-# The repeat count: raw when marked, else a boxed Int crossed at the
-# border (borrowing unbox) and dropped — the count is consumed here.
-fn lower_loop_count(n: Expr, st: LowerSt) : LRes / Console = match n.mode {
-  MUnboxed -> lower_expr_raw(n, st)
-  _ -> match lower_expr_boxed(n, st) {
-    LRes(bv, st1) -> match bind_op_slot(st1, KPrim(KpUnbox(RwInt), [bv]), SInt64, kpos_of(n)) {
-      LRes(rv, st2) -> LRes(rv, ls_emit(st2, KRC(KDrop(bv), kpos_of(n))))
-    }
-  }
 }
 
 # `a <op> b` raw binary op → one native instruction over two raw operands.
@@ -741,7 +473,7 @@ fn lower_exprs_flying(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console
 # form), so lowering it raw would `real.unbox` a boxed Char (a miscompile —
 # native returned 0 vs C's 5 on a `Char` param). Using the slot keeps the arg
 # repr in lockstep with the param the callee declares (`lower_params_sig`).
-fn lower_tcrec_args(xs: [Expr], sig: Option[UFnSig], st: LowerSt) : LResMany / Console =
+pub(pkg) fn lower_tcrec_args(xs: [Expr], sig: Option[UFnSig], st: LowerSt) : LResMany / Console =
   match lower_tcrec_args_idx(xs, tcrec_ptys_of(sig), tcrec_mask_of(sig), st, []) {
     LResMany(vs, st1) -> LResMany(vs, lower_flight_end(st, st1))
   }
@@ -782,1738 +514,4 @@ fn lower_tail_slot_raw(e: Expr, pslot: KSlot, st: LowerSt) : LRes / Console = ma
     Some(prim) -> lower_unbox_at(e, prim, pslot, true, st)
     None       -> lower_expr_boxed(e, st)
   }
-}
-
-# `[e0, ..., ...spread]` → a cons/nil/append spine, mirroring the C
-# emitter's `emit_list_tail`: nil for the empty tail, `kai_cons(h, t)` for a
-# plain head, `kai_core_list_append(h, t)` for a mid-list spread, and the
-# operand itself for a trailing spread (it consumes like a ctor slot). Head
-# is lowered before the tail to keep left-to-right evaluation order. Inside
-# a region the cons cells bump-allocate: `kai_cons` becomes `kai_arena_cons`.
-fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = match elems {
-  [] -> bind_op(st, KPrim(KpNil, []), pos)
-  [el] -> lower_list_last(el, pos, st)
-  [el, ...rest] -> match el {
-    ElPlain(x)  -> lower_list_cons(x, rest, region_cons_prim(st), pos, st)
-    ElSpread(x) -> lower_list_cons(x, rest, KpListAppend, pos, st)
-  }
-}
-
-fn lower_list_last(el: ListElem, pos: KPos, st: LowerSt) : LRes / Console = match el {
-  ElPlain(x) -> match lower_expr(x, st) { LRes(hdv, st1) ->
-    match bind_op(st1, KPrim(KpNil, []), pos) { LRes(nilv, st2) ->
-      bind_op(st2, KPrim(region_cons_prim(st2), [hdv, nilv]), pos) } }
-  ElSpread(x) -> lower_expr(x, st)
-}
-
-# A head (plain or spread) joined to the lowered rest by `prim`
-# (`kai_cons` for a plain head, `kai_core_list_append` for a spread).
-fn lower_list_cons(x: Expr, rest: [ListElem], prim: PrimOp, pos: KPos, st: LowerSt) : LRes / Console =
-  match lower_expr(x, st) { LRes(hdv, st1) ->
-    match lower_list(rest, pos, lower_flight_add(x, hdv, st1)) { LRes(tlv, st2) ->
-      bind_op(lower_flight_end(st, st2), KPrim(prim, [hdv, tlv]), pos) } }
-
-# --- Holes / todo! → panic stub -----------------------------------------
-
-# `T { f0: v0, ... }` → a `KRecord` op carrying each (name, value-atom).
-# Field values lower left-to-right; the translator emits the parallel
-# value/name buffers `kai_record` takes. The desugar already normalised the
-# field order to DECLARATION order (eval still in source order via its
-# let-bind), so the layout reaching here is canonical — KIR does not reorder.
-fn lower_record_lit(fis: [FieldInit], tag: Int, pos: KPos, st: LowerSt) : LRes / Console =
-  match lower_field_inits(fis, st, []) { RecPlan(pairs, st1) ->
-    bind_op(st1, KRecord(pairs, st1.in_region, tag), pos) }
-
-fn lower_field_inits(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match lower_field_inits_flying(fis, st, acc) {
-  RecPlan(pairs, st1) -> RecPlan(pairs, lower_flight_end(st, st1))
-}
-
-fn lower_field_inits_flying(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match fis {
-  [] -> RecPlan(acc, st)
-  [FI(fname, fe), ...rest] -> match lower_expr(fe, st) { LRes(v, st1) ->
-    lower_field_inits_flying(rest, lower_flight_next(fe, v, rest == [], st1), list_append(acc, [KFI(fname, v)])) }
-}
-
-# `lo..hi` / `lo..hi:step` → the runtime range builder prim.
-fn lower_range(lo: Expr, hi: Expr, stp: Option[Expr], pos: KPos, st: LowerSt) : LRes / Console =
-  match lower_expr(lo, st) { LRes(lov, st1) -> match lower_expr(hi, st1) { LRes(hiv, st2) ->
-    match stp {
-      None -> bind_op(st2, KPrim(KpRange, [lov, hiv]), pos)
-      Some(se) -> match lower_expr(se, st2) { LRes(sv, st3) ->
-        bind_op(st3, KPrim(KpRangeStep, [lov, hiv, sv]), pos) }
-    } } }
-
-# A block opens a lexical scope: the register scope and the live register
-# names are snapshotted on entry and restored on exit. Restoring the scope
-# makes a read of an outer binder after the block reach the outer register
-# again; restoring the names keeps a binder of one block from making a
-# same-name binder of a sibling block take a fresh register. `rc` is not
-# restored, so fresh registers never alias.
-fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
-  if block_is_region(st.regions, x.line, x.col) { lower_region_block(x, stmts, tail, st) }
-  else { lower_plain_block(x, stmts, tail, st) }
-
-fn lower_plain_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
-  lower_plain_block_at(x, stmts, tail, SBoxed, st)
-
-# Lower a fn body at its declared return slot. A boxed slot is the ordinary
-# lowering. A raw slot forwards through the slot-driven border: a natively
-# raw body yields its scalar register, a plain block forwards its tail to
-# that same border, and anything else lowers boxed and unbox-borrows at the
-# slot the signature declares (never one guessed from the body's type — the
-# type-driven border routes a Bool/Char body to `real.unbox`).
-#
-# `kir_node_is_raw` gates the raw FORMS rather than `.mode` alone: the unbox
-# pass marks forms `MUnboxed` that `lower_expr_raw_kind` has no raw prim for
-# — a Char comparison routes to the f-family there and feeds an i32 register
-# to `kaix_real_field`. A `MUnboxed` call is admitted on top of that: its
-# callee already returns the scalar raw.
-pub fn lower_fn_body_at(body: Expr, ret: KSlot, st: LowerSt) : LRes / Console = match ret {
-  SBoxed -> lower_expr(body, st)
-  _      -> match body.kind {
-    EBlock(stmts, tail) ->
-      if block_is_region(st.regions, body.line, body.col) { lower_boxed_body_at(body, ret, st) }
-      else { lower_plain_block_at(body, stmts, tail, ret, st) }
-    _ -> if fn_body_lowers_raw(body) { lower_expr_raw_at(body, ret, st) }
-         else { lower_boxed_body_at(body, ret, st) }
-  }
-}
-
-# A boxed body at a raw slot crosses the border here rather than in the
-# `KRet`, which could not release an owned temporary's box.
-fn lower_boxed_body_at(body: Expr, ret: KSlot, st: LowerSt) : LRes / Console =
-  match border_unbox_prim(ret) {
-    Some(prim) -> lower_unbox_border(raw_operand(body), prim, ret, st)
-    None       -> lower_expr(body, st)
-  }
-
-# A plain block lowered with a destination slot for its TAIL. The statements
-# and their scope-exit drops are identical either way — only the tail's
-# border differs, so a raw destination forwards it to `lower_expr_raw_at`
-# instead of boxing it for the caller to unbox straight back.
-fn lower_plain_block_at(x: Expr, stmts: [Stmt], tail: Option[Expr], dst: KSlot, st: LowerSt) : LRes / Console {
-  let snap = st.scope
-  let lsnap = st.regs
-  let st1 = lower_stmts(stmts, st)
-  # Invariant: every heap-allocated value bound to a dead `let` is decref'd
-  # at scope exit — records, variants, lists, call results alike. Mirrors
-  # the C oracle's `block_unused_lets` drops (boxed bindings only; a raw
-  # scalar carries no rc).
-  let st2 = lower_block_exit_drops(stmts, tail, st1)
-  match tail {
-    Some(e) -> match lower_tail_at(x, e, dst, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> match block_value_out(v, lsnap, dst, kpos_of(e), st3) {
-      LRes(v4, st4) -> LRes(v4, ls_set_regs(ls_set_scope(st4, snap), lsnap)) } }
-    None    -> LRes(KUnitV, ls_set_regs(ls_set_scope(st2, snap), lsnap))
-  }
-}
-
-# A boxed block's tail is the block's own result, owned whatever its form, as
-# the C oracle takes the whole block's box; a raw block's tail crosses the
-# border like any raw operand.
-fn lower_tail_at(x: Expr, e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = match dst {
-  SBoxed -> lower_expr(e, st)
-  _      -> match x.mode {
-    MUnboxed -> lower_fn_body_at(e, dst, st)
-    _        -> lower_owned_tail_at(e, dst, st)
-  }
-}
-
-fn lower_owned_tail_at(e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = match e.kind {
-  EBlock(_, _) -> lower_fn_body_at(e, dst, st)
-  _ -> if fn_body_lowers_raw(e) { lower_expr_raw_at(e, dst, st) }
-       else { match border_unbox_prim(dst) {
-         Some(prim) -> lower_unbox_at(e, prim, dst, true, st)
-         None       -> lower_expr(e, st)
-       } }
-}
-
-# A lexical `region { }` block: bump-allocate the body's ctors into a fresh
-# arena, then free it wholesale at the brace. `in_region` is set for the
-# body's extent, so every ctor lowered here routes to the arena. The tail
-# value is deep-copied OUT of the arena (rc = 1) BEFORE the arena is popped
-# — copy-before-pop is load-bearing (the arena free would dangle it). A
-# scalar tail crosses the border as an immediate: `kaix_deep_copy_out` is a
-# no-op on non-pointers, so the whole arena frees with zero copy traffic.
-# The copy-out + pop are emitted AT THE JOIN — the point `lower_expr(tail)`
-# returns to, which post-dominates any `if`/`match` fork inside the tail —
-# so an early fork cannot skip the pop or free the value before the copy.
-fn lower_region_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
-  let snap = st.scope
-  let lsnap = st.regs
-  let osnap = st.in_region
-  let stp = ls_emit(ls_set_in_region(st, true), KDo(KCall("kaix_arena_push", []), kpos_of(x)))
-  let st1 = lower_stmts(stmts, stp)
-  let st2 = lower_block_exit_drops(stmts, tail, st1)
-  match tail {
-    Some(e) -> match lower_expr(e, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> {
-      match bind_op(st3, KCall("kaix_deep_copy_out", [v]), kpos_of(x)) { LRes(cv, st4) -> {
-        let st5 = ls_emit(ls_set_in_region(st4, osnap), KDo(KCall("kaix_arena_pop", []), kpos_of(x)))
-        LRes(cv, ls_set_regs(ls_set_scope(st5, snap), lsnap))
-      } }
-    } }
-    None -> {
-      let st3 = ls_emit(ls_set_in_region(st2, osnap), KDo(KCall("kaix_arena_pop", []), kpos_of(x)))
-      LRes(KUnitV, ls_set_regs(ls_set_scope(st3, snap), lsnap))
-    }
-  }
-}
-
-# `vec_get(v, i).f` / `vec_get_borrow(v, i).f` on a REC carrier, for a
-# field the bare-word paths do not carry: the column is read as its box and
-# no record is built.
-fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : Option[LRes] / Console = match vec_field_read(st.recs, base, fname) {
-  None     -> None
-  Some(fr) -> {
-    let a = lower_vec_read_args(fr.get, st)
-    Some(lower_vec_read_bind(x, a, vec_boxed_field_op(fr.col, a.vv, a.iv, a.owned), SBoxed))
-  }
-}
-
-# A bare-word Vec read (verdict in vec_raw.kai).
-fn lower_vec_raw_read(x: Expr, rd: VecRawRead, st: LowerSt) : LRes / Console = {
-  let a = lower_vec_read_args(rd.get, st)
-  lower_vec_read_bind(x, a, vec_raw_read_op(rd, a.vv, a.iv, a.owned), vec_bits_slot(rd.bits))
-}
-
-fn lower_vec_read_args(g: VecGet, st: LowerSt) : VecReadArgs / Console =
-  match lower_expr(g.v, st) { LRes(vv, st1) ->
-    match lower_expr_raw_at(g.i, SInt64, lower_flight_add(g.v, vv, st1)) { LRes(iv, st2) ->
-      VecReadArgs { vv: vv, iv: iv, owned: not g.borrows or ob_is_marked(g.v), st: lower_flight_end(st1, st2) } } }
-
-# `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
-# `kai_vec_push_rec_raw` / `kai_vec_set_rec_raw` over the unpacked
-# field values; the record is never allocated and the uniqueness
-# decision stays inside the runtime helper. Push carries (value, name)
-# pairs after the arity (the PENDING classify needs the names); set
-# writes an already-classified slot and carries values only.
-fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console = match f.kind {
-  ESym(_, _) ->
-    if is_builtin_ref(f, CbVecPush) {
-      match cargs {
-        [v, lit] -> match lit.kind {
-          ERecordLit(_, fis) -> match vec_rec_lit_bits(st.recs, lit.ty, fis) {
-            Some(bs) -> Some(lower_vec_push_rec_bits(x, v, fis, bs, st))
-            None ->
-              if vec_elem_is_rec_carrier(st.recs, lit.ty) {
-                match lower_vec_write_target(v, st) { LRes(vv, st1) ->
-                  match lower_vec_rec_pairs(fis, st1, []) {
-                    LResMany(pvs, st2) ->
-                      Some(bind_op(lower_flight_end(st, st2),
-                        KPrim(KpVecPushRecRaw, [vv, KIntV(list_length(fis)), ...pvs]),
-                        kpos_of(x)))
-                  } }
-              } else { None }
-          }
-          _ -> lower_vec_push_scalar(x, v, lit, st)
-        }
-        _ -> None
-      }
-    } else if is_builtin_ref(f, CbVecSet) {
-      match cargs {
-        [v, i, lit] -> match lit.kind {
-          ERecordLit(_, fis) -> match vec_rec_lit_bits(st.recs, lit.ty, fis) {
-            Some(bs) -> Some(lower_vec_set_rec_bits(x, v, i, fis, bs, st))
-            None ->
-              if vec_elem_is_rec_carrier(st.recs, lit.ty) {
-                match lower_vec_write_target(v, st) { LRes(vv, st1) ->
-                  match lower_expr(i, st1) { LRes(iv, st2) ->
-                    match lower_vec_rec_vals(fis, st2, []) {
-                      LResMany(fvs, st3) ->
-                        Some(bind_op(lower_flight_end(st, st3),
-                          KPrim(KpVecSetRecRaw, [vv, iv, KIntV(list_length(fis)), ...fvs]),
-                          kpos_of(x)))
-                    } } }
-              } else { None }
-          }
-          _ -> lower_vec_set_scalar(x, v, i, lit, st)
-        }
-        _ -> None
-      }
-    } else { None }
-  _ -> None
-}
-
-# The vec a fused write consumes stays in flight while its other operands
-# run; the write's own op lands it.
-fn lower_vec_write_target(v: Expr, st: LowerSt) : LRes / Console =
-  match lower_expr(v, st) { LRes(vv, st1) -> LRes(vv, lower_flight_add(v, vv, st1)) }
-
-fn lower_vec_fields_raw(fis: [FieldInit], bs: [VecBits], st: LowerSt, acc: [VecField]) : LVecFields / Console = match fis {
-  []            -> LVecFields(list_reverse(acc), st)
-  [fi, ...rest] -> match fi {
-    FI(nm, e) -> match bs {
-      []            -> LVecFields(list_reverse(acc), st)
-      [b, ...brest] -> match lower_expr_raw_at(e, vec_bits_slot(b), st) {
-        LRes(ev, st1) -> lower_vec_fields_raw(rest, brest, st1, [VecField(nm, b, ev), ...acc])
-      }
-    }
-  }
-}
-
-fn lower_vec_push_rec_bits(x: Expr, v: Expr, fis: [FieldInit], bs: [VecBits], st: LowerSt) : LRes / Console =
-  match lower_vec_write_target(v, st) { LRes(vv, st1) ->
-    match lower_vec_fields_raw(fis, bs, st1, []) { LVecFields(fs, st2) ->
-      bind_op(lower_flight_end(st, st2), vec_push_rec_op(vv, fs), kpos_of(x)) } }
-
-fn lower_vec_set_rec_bits(x: Expr, v: Expr, i: Expr, fis: [FieldInit], bs: [VecBits], st: LowerSt) : LRes / Console =
-  match lower_vec_write_target(v, st) { LRes(vv, st1) ->
-    match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
-      match lower_vec_fields_raw(fis, bs, st2, []) { LVecFields(fs, st3) ->
-        bind_op(lower_flight_end(st, st3), vec_set_rec_op(vv, iv, fs), kpos_of(x)) } } }
-
-fn lower_vec_push_scalar(x: Expr, v: Expr, e: Expr, st: LowerSt) : Option[LRes] / Console = match vec_bits_of(e.ty) {
-  None    -> None
-  Some(b) -> match lower_vec_write_target(v, st) { LRes(vv, st1) ->
-    match lower_expr_raw_at(e, vec_bits_slot(b), st1) { LRes(xv, st2) ->
-      Some(bind_op(lower_flight_end(st, st2), vec_push_scalar_op(b, vv, xv), kpos_of(x))) } }
-}
-
-fn lower_vec_set_scalar(x: Expr, v: Expr, i: Expr, e: Expr, st: LowerSt) : Option[LRes] / Console = match vec_bits_of(e.ty) {
-  None    -> None
-  Some(b) -> match lower_vec_write_target(v, st) { LRes(vv, st1) ->
-    match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
-      match lower_expr_raw_at(e, vec_bits_slot(b), st2) { LRes(xv, st3) ->
-        Some(bind_op(lower_flight_end(st, st3), vec_set_scalar_op(b, vv, iv, xv), kpos_of(x))) } } }
-}
-
-fn lower_vec_rec_pairs(fis: [FieldInit], st: LowerSt, acc: [KVal]) : LResMany / Console = match fis {
-  []           -> LResMany(list_reverse(acc), st)
-  [fi, ...rest] -> match fi {
-    FI(nm, e) -> {
-      let re = lower_expr(e, st)
-      match re { LRes(ev, st1) -> lower_vec_rec_pairs(rest, st1, [KStrV(nm), ev, ...acc]) }
-    }
-  }
-}
-
-fn lower_vec_rec_vals(fis: [FieldInit], st: LowerSt, acc: [KVal]) : LResMany / Console = match fis {
-  []           -> LResMany(list_reverse(acc), st)
-  [fi, ...rest] -> match fi {
-    FI(_, e) -> {
-      let re = lower_expr(e, st)
-      match re { LRes(ev, st1) -> lower_vec_rec_vals(rest, st1, [ev, ...acc]) }
-    }
-  }
-}
-
-fn lower_stmts(stmts: [Stmt], st: LowerSt) : LowerSt / Console = match stmts {
-  [] -> st
-  [s, ...rest] -> lower_stmts(rest, lower_stmt(s, st))
-}
-
-fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
-  # A `let x = <raw rhs>` where the rhs is `MUnboxed` (Real/Bool) binds a
-  # RAW register (SReal/SBool) — mode-slave to the unbox pass, which marked
-  # the binder raw and perceus skipped its RC. Lower the rhs raw and bind it
-  # at its raw slot; the body's read of `x` loads it raw (a sibling boxed use
-  # boxes at its own border via `lower_expr`'s guard). A non-`PBind` raw
-  # binder (destructure) cannot occur — a raw scalar has no fields — so only
-  # the `PBind` shape takes the raw path; everything else stays boxed.
-  SLet(pat, _, rhs) -> match raw_let_slot(pat, rhs) {
-    Some(slot) -> match lower_expr_raw(rhs, st) {
-      LRes(v, st1) -> lower_let_bind_raw(pat, v, slot, st1)
-    }
-    # An inline fixed-vec binder aliased to another binder crosses no boxed
-    # border: both hold the same header-less aggregate, so the read must NOT
-    # materialise (the alias would then be a dynamic vec its own reads still
-    # index as an aggregate). Every other read of one boxes at its border.
-    None -> if fixed_vec_alias_rhs(rhs) {
-      match lower_expr_boxed(rhs, st) { LRes(v, st1) -> lower_let_bind(pat, v, st1) }
-    } else {
-      match lower_expr(rhs, st) { LRes(v, st1) -> lower_let_bind(pat, v, st1) }
-    }
-  }
-  # A discarded `if` needs no join register: each branch discards its own
-  # value in place, so no unit init / stores / `do join` survive per
-  # iteration in loop bodies. Other shapes discard their lowered atom —
-  # a `()` value elides the `KDo` (nothing to drop), tested at the
-  # destructure (see `lower_loop_body`'s stage1 note).
-  SExprStmt(x) -> match x.kind {
-    EIf(c, t, e_opt) -> lower_if_discard(x, c, t, e_opt, st)
-    _ -> match lower_expr(x, st) {
-      LRes(v, st1) -> match v {
-        KUnitV -> st1
-        _      -> ls_emit(st1, KDo(KLitOp(v), kpos_of(x)))
-      }
-    }
-  }
-  # `assert cond` / `assert cond, "msg"` → `kai_assert_check(cond, msg)`,
-  # the SAME runtime entry the C-direct oracle's `emit_assert_stmt` emits.
-  SAssert(cond, opt_msg) -> match unw_assert_at(st.unw.sites, cond.site) {
-    Some(ns) -> match lower_pad_begin(cond, ns, st) { PadB(outer, st1) -> lower_pad_end(cond, outer, lower_assert(cond, opt_msg, st1)) }
-    None     -> lower_assert(cond, opt_msg, st)
-  }
-  _ -> st
-}
-
-fn lower_assert(cond: Expr, opt_msg: Option[Expr], st: LowerSt) : LowerSt / Console = match assert_reported_binding(cond, opt_msg) {
-  Some(CtrId(ident, idnode, _)) -> lower_assert_with_value(cond, kir_assert_msg(opt_msg), reported_binding_span(ls_local_name(st, ident)), idnode, st)
-  None -> match lower_expr(cond, st) {
-    LRes(v, st1) -> ls_emit(st1, KDo(KPrim(KpAssertCheck, [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
-  }
-}
-
-# The runtime consumes the reported value, so it is an owned ref taken
-# BEFORE the condition, which consumes the binding: a boxed binding is
-# dup'd, a raw one is boxed fresh by `lower_expr`.
-fn lower_assert_with_value(cond: Expr, msg: String, ident_span: String, idnode: Expr, st: LowerSt) : LowerSt / Console =
-  match lower_expr(idnode, st) { LRes(iv, st1) -> {
-    let st2 = if kir_node_is_raw(idnode) { st1 } else { ls_emit(st1, KRC(KDup(iv), KNoPos)) }
-    match lower_expr(cond, st2) { LRes(cv, st3) ->
-      ls_emit(st3, KDo(KPrim(KpAssertCheckWithValue,
-                             [cv, KStrV(msg), KStrV(ident_span), iv]), KNoPos)) }
-  } }
-
-fn lower_if(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console {
-  # The condition's reads refine the tcrec pending-release ledger before
-  # either branch (and any goto inside one) lowers.
-  if kir_node_is_raw(c) {
-    match lower_expr_raw(c, st) { LRes(cv, st1) -> lower_if_blocks(x, cv, t, e_opt, tcp_after(st1, c)) }
-  } else {
-    match lower_expr(c, st) { LRes(cv, st1) -> lower_if_blocks(x, cv, t, e_opt, tcp_after(st1, c)) }
-  }
-}
-
-# The `join` register is materialised with a `KLet` BEFORE the condbr so a
-# translator reads it as a mutable slot (alloca) each branch's `KStore`
-# writes — not an undeclared name to infer (Linus review #1).
-#
-# A RAW `if` (`if n<2 { n } else { fib(n-1)+fib(n-2) }` — the unbox pass
-# marks the whole `EIf` `MUnboxed` when both arms AND the cond are raw)
-# lowers the JOIN at the result's raw slot (`SInt64`/`SReal`), each arm
-# stored raw. This mirrors the C oracle's raw ternary `(cond ? a : b)`: the
-# `+`'s `i64` flows into the join WITHOUT a `kaix_int` box, and a raw-return
-# `KRet` reads the join directly (no `kaix_int_field`). The box/unbox round-
-# trip a boxed join forced on every `fib` arm is gone. A boxed `if` (the
-# default, and any Bool/Char-typed raw `if` outside the Int/Real raw KIR
-# scope) keeps the `SBoxed` join unchanged. RC: a raw join carries no
-# refcount; the arms are `MUnboxed` (perceus skipped them), so no KDup/KDrop
-# lands on the raw register.
-fn lower_if_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt) : LRes / Console = {
-  let js = if_join_slot(x)
-  match ls_fresh_reg(st) { LSReg(join, st2) -> {
-    let st_decl = ls_emit(st2, KLet(join, js, KLitOp(if_join_init(js)), kpos_of(x)))
-    match three_labels(st_decl) { LSL3(lt, le, lcont, st3) -> {
-      let st4 = ls_seal(st3, KCondBr(cv, lt, le, kpos_of(x)), lt)
-      let st5 = lower_branch_into_slot(t, join, js, lcont, st4)
-      let st6 = lower_else_into_slot(e_opt, join, js, lcont, le, tcp_rewind(st5, st4))
-      LRes(KVar(join), tcp_after(tcp_rewind(st6, st4), x))
-    } }
-  } }
-}
-
-# A statement-position `if` whose value is discarded: same block fork as
-# `lower_if_blocks`, but with NO join register — each branch discards its
-# own value in place (`ls_emit_discard` keeps the owned-box drop and elides
-# the unit noise). A missing else is an empty block.
-fn lower_if_discard(x: Expr, c: Expr, t: Expr, e_opt: Option[Expr], st: LowerSt) : LowerSt / Console {
-  if kir_node_is_raw(c) {
-    match lower_expr_raw(c, st) { LRes(cv, st1) -> lower_if_discard_blocks(x, cv, t, e_opt, tcp_after(st1, c)) }
-  } else {
-    match lower_expr(c, st) { LRes(cv, st1) -> lower_if_discard_blocks(x, cv, t, e_opt, tcp_after(st1, c)) }
-  }
-}
-
-fn lower_if_discard_blocks(x: Expr, cv: KVal, t: Expr, e_opt: Option[Expr], st: LowerSt) : LowerSt / Console =
-  match three_labels(st) { LSL3(lt, le, lcont, st1) -> {
-    let st2 = ls_seal(st1, KCondBr(cv, lt, le, kpos_of(x)), lt)
-    let st3 = tcp_rewind(lower_branch_discard(t, lcont, st2), st2)
-    let st4 = match e_opt {
-      Some(e) -> lower_branch_discard(e, lcont, reopen(st3, le))
-      None    -> ls_seal(reopen(st3, le), KBr(lcont, KNoPos), lcont)
-    }
-    tcp_after(tcp_rewind(st4, st2), x)
-  } }
-
-fn lower_branch_discard(e: Expr, lcont: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(e, st) { LRes(v, st1) -> match v {
-    KUnitV -> ls_seal(st1, KBr(lcont, kpos_of(e)), lcont)
-    _      -> ls_seal(ls_emit(st1, KDo(KLitOp(v), kpos_of(e))), KBr(lcont, kpos_of(e)), lcont)
-  } }
-
-# Lower one `if`-arm into the join register and branch to the continuation. A
-# raw join (`SInt64`/`SReal`) lowers the arm RAW; a boxed join keeps the
-# plain boxed `lower_expr`. The slot drives the choice so the store matches
-# the alloca. (`lower_branch_into` is the boxed-only match variant.)
-fn lower_branch_into_slot(e: Expr, join: String, js: KSlot, lcont: String, st: LowerSt) : LowerSt / Console =
-  match if_branch_lower(e, js, st) { LRes(v, st1) ->
-    ls_seal(ls_emit(st1, KStore(join, v, kpos_of(e))), KBr(lcont, kpos_of(e)), lcont) }
-
-fn if_branch_lower(e: Expr, js: KSlot, st: LowerSt) : LRes / Console = match js {
-  SBoxed -> lower_expr(e, st)
-  _      -> lower_expr_raw(e, st)
-}
-
-fn lower_else_into_slot(e_opt: Option[Expr], join: String, js: KSlot, lcont: String,
-                        le: String, st: LowerSt) : LowerSt / Console = match e_opt {
-  Some(e) -> lower_branch_into_slot(e, join, js, lcont, reopen(st, le))
-  None    -> ls_seal(ls_emit(reopen(st, le), KStore(join, KUnitV, KNoPos)),
-                     KBr(lcont, KNoPos), lcont)
-}
-
-# Lower one branch (a MATCH arm body) into a BOXED join register and branch
-# to the continuation. The match-lowering's join is always `SBoxed`.
-fn lower_branch_into(e: Expr, join: String, lcont: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(e, st) { LRes(v, st1) ->
-    ls_seal(ls_emit(st1, KStore(join, v, kpos_of(e))), KBr(lcont, kpos_of(e)), lcont) }
-
-# --- postfix `!` (Option/Result propagation) ----------------------------
-
-# `expr!` — unwrap the success payload of an Option/Result, or EARLY-RETURN
-# the whole `None`/`Err` from the enclosing fn (mirror of emit_c's
-# `emit_bang`). Lower the inner value, read its tag, and `condbr` on
-# "is it the success ctor": the success path projects slot 0 (the payload)
-# into a join register; the fail path `KRet`s the inner value verbatim — the
-# short-circuit. The success ctor (`Some` for `Option`, `Ok` for `Result`)
-# is read from `inner.ty` via the shared `bang_success_ctor`; a non-
-# Option/Result type here is a typer-invariant violation, lowered to a loud
-# panic stub like the oracle's `None` arm (never a silent miscompile).
-fn lower_bang(x: Expr, inner: Expr, st: LowerSt) : LRes / Console =
-  match bang_success_ctor(inner.ty) {
-    None       -> lower_panic_stub(kir_quote("internal: `!` on non-Option/Result reached kir lowering"), st)
-    Some(ctor) -> match lower_expr(inner, st) { LRes(bv, st1) -> lower_bang_split(x, bv, ctor, st1) }
-  }
-
-# An arm binder's shadow rename is scoped to its arm: whatever arm lowered
-# last must not leak its bindings past the match.
-fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console =
-  match lower_match_scoped(x, scr, arms, st) { LRes(v, st1) -> LRes(v, ls_set_scope(st1, st.scope)) }
-
-fn lower_match_scoped(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
-  let owned = not match_scr_is_borrowed(scr)
-  # Evaluating the scrutinee may consume enclosing ledger binders — refine
-  # before any arm seeds on top of the pending set.
-  match lower_expr(scr, tcp_after(st, scr)) { LRes(scrv, st1) ->
-    # Each specialised path runs `match_preamble` (which mints a FRESH per-match
-    # `<join>$sd` exit-drop binder) and plants its OWN `match_finish` with that
-    # binder — so nested matches never share one drop name. `lower_match` no
-    # longer wraps a single `match_finish` here (that forced one shared literal).
-    # GUARDS / all-binder dispatch (FIRST — overrides every specialised
-    # path). A `match` arm carries an optional guard (`X if cond -> body`);
-    # any backend's tag-switch / equality-tree assumes the matched arm is
-    # the WINNER, but a guard can REJECT an arm AFTER its pattern matched,
-    # so control must fall to the NEXT arm in source order — exactly the
-    # C-direct oracle's linear `if (pat) { binds; if (truthy(g)) { … } }`
-    # fail-chain (`emit_match_arm`). The O(1) switch is sound ONLY when the
-    # tag alone decides the winner; a guard breaks that invariant. Likewise,
-    # a `match` whose arms ALL bind (no discriminating pattern — `n if … ->`
-    # / `n -> …`) has no tag to switch on: the variant path would emit
-    # `KTagOf` over a scalar scrutinee (an Int / Real), which the native
-    # backend deref-faults (`kaix_variant_tag_of` on a tagged Int → SIGSEGV).
-    # Both cases route to the linear `lower_guard_chain` (asu review: the KIR
-    # never needs to be cleverer than its oracle; exhaustivity is the typer's
-    # job, so degrading to a linear chain is always sound).
-    if match_has_any_guard(arms) or not match_has_discriminating_pattern(arms) {
-      lower_guard_chain(x, arms, scrv, owned, st1)
-    }
-    # List patterns (`[]`, `[h, ...t]`, `[a, b, ...rest]`) need a length-
-    # aware decision tree, not the variant tag-switch: cons arms of
-    # different lengths share the `KAI_CONS` tag (kir_lower_match.kai).
-    else if match_is_list(arms) { lower_list_match(x, arms, scrv, owned, st1) }
-    # Literal patterns (`0`/`'c'`/`"s"`/`true`) need an EQUALITY decision
-    # tree, not the variant tag-switch: a `PLit` is not a variant, so its
-    # `arm_tag` is -1 and every literal arm would collapse into one default
-    # block — an empty `KSwitch` that segfaults the native backend
-    # (kir_lower_lit.kai). Dispatched after the list test so a `PList` never
-    # reaches the literal chain.
-    else if match_is_literal(arms) { lower_lit_match(x, arms, scrv, owned, st1) }
-    # Record patterns (`{ x: 0, y }`, `{ x, y }`) need a FIELD-TEST decision
-    # tree, not the variant tag-switch: a `PRecord` is not a variant, so its
-    # `arm_tag` is -1 and every record arm would collapse into one default
-    # block with its field binds never projected — an empty `KSwitch` plus a
-    # free `unbound register` the native backend aborts on (kir_lower_rec.kai).
-    # Dispatched after list + literal (a `PRecord` is neither) and before the
-    # variant fallback; a `PVariantRecord` (`Some { x }`) is NOT a `PRecord`,
-    # so it stays on the variant path below.
-    else if match_is_record(arms) { lower_record_match(x, arms, scrv, owned, st1) }
-    # The variant tag register carries `SInt32` (the raw `variant_tag`
-    # word), NOT `SBoxed`: a `KSwitch` scrutinee must be an integer so the
-    # native backend emits a real LLVM `switch`. The repr is decided here,
-    # in the lowering, never re-derived by a backend (asu review).
-    else { match bind_op_slot(st1, KTagOf(scrv), SInt32, kpos_of(x)) { LRes(tagv, st2) ->
-      lower_match_blocks(x, arms, scrv, tagv, owned, st2) } } }
-}
-
-# `match scr { [list patterns] }`: a fail-chain decision tree mirroring the
-# C-direct (`emit_pat_test_list`) / LLVM (`llvm_emit_pat_list`) emitters.
-# Each arm emits its cons/nil + length test into a block that branches to
-# the arm body on success and to the next arm on failure; the head/tail
-# `KProj` binds land in the matched-body block. A shared `join` register
-# (materialised before the chain, like `lower_if`) collects each body's
-# value. The chain's final fail panics (`seal_match_miss`).
-fn lower_list_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
-  match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
-    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let pend0 = st2.tcpend
-      let st3 = lower_list_arms(arms, scrv, join, lcont, owned, sd, pend0, st2)
-      match_finish(owned, sd, LRes(KVar(join), ls_set_tcpend(reopen(st3, lcont), pend0)))
-    } } }
-
-# Lower each list arm in order. The arm's test seals the current block into
-# a condbr (body vs the fresh fail label); the body lowers into the join +
-# branches to `lcont`; the next arm reopens the fail label. A catch-all arm
-# matches unconditionally and ends the chain (later arms are dead). With no
-# catch-all the last fail label panics.
-#
-# Issue #858 — after `lm_emit_arm` binds the arm's alias binders (head /
-# tail / rest, all borrows of the scrutinee slots), emit a structural
-# `KDup` for each, mirroring the C-direct oracle's `kai_incref` on
-# `is_alias=true` cons binds. Gated on `owned ∧ ¬arm_body_uses_reuse`:
-# only an OWNED match plants the exit `__pcs_scr_drop` the dup balances,
-# and a reuse arm consumes the scrutinee through `__perceus_reuse_*` (which
-# owns the kept children's RC) so a dup there would double-incref.
-fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                   owned: Bool, sd: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match arms {
-  [] -> seal_match_miss(st, lcont)
-  [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
-    match lm_emit_arm(p, scrv, body_lbl, arm_reuses(body, st1), st1) { LMArm(st_body, fail_lbl) -> {
-      # A non-reuse owned arm structurally dups EVERY alias binder it reaches
-      # over a borrow path — the flat cons head/tail PLUS nested-variant slot
-      # binders at any depth (`pat_alias_binders`, the sole mirror of the
-      # oracle's `emit_pat_binds` alias set). All are `KProj` borrows the exit
-      # `__pcs_scr_drop` would free before a self-tail arm body reads them. A
-      # reuse arm instead publishes its head/tail binders as the reuse-gc set
-      # so the `KConReuse` shared path increfs them (the C oracle's
-      # shared-branch `incref(_scr->head/tail)`), else the match-exit drop
-      # frees them.
-      let st_dup = if not arm_reuses(body, st_body) {
-        # Owned OR borrowed (issue #1127 rule 4): dup every alias binder so a
-        # bound child carries its own ref before flowing to an owned position.
-        # Only a reuse arm (else) hands that RC to `__perceus_reuse_*`.
-        lm_dup_alias_binders(pat_alias_binders(p, st_body.ctor_ix), KAt(p.line, p.col), st_body)
-      } else {
-        # Reuse arm (dual-branch): the DECONSTRUCTED sub-binders of a head are
-        # incref'd UNCONDITIONALLY — the oracle's `emit_pat_binds` is_alias
-        # path increfs them in both the unique and the shared branch, so they
-        # leave the condbr; only the DIRECT cons slots (published as reuse_gc)
-        # differ per branch (borrow in unique, dup in shared). Emitting the
-        # decon dups here (outside the fork) keeps the fork managing only the
-        # direct slots.
-        let decon = pat_decon_alias_binders(p, st_body.ctor_ix)
-        let st_decon = lm_dup_alias_binders(decon, KAt(p.line, p.col), st_body)
-        set_reuse_gc_for_arm(p, body, if rh_held(st_decon) { rh_own(st_decon, decon) } else { st_decon })
-      }
-      let st_drop = if arm_reuses(body, st_dup) { tcp_seed_inherit(body, pend0, st_dup) }
-                    else { tcp_seed_arm(owned, sd, pat_alias_binders(p, st_dup.ctor_ix), body, pend0, st_dup) }
-      let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
-      if list_arm_is_catchall(p) { st_done }
-      else { lower_list_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
-    } } }
-}
-
-# `match scr { <literal patterns> }`: an equality-test fail-chain mirroring
-# the C-direct oracle's boxed-scrutinee path (`emit_pat_test`'s `kai_op_eq`
-# arm) and structurally identical to `lower_list_match`. Each literal arm
-# emits `condbr (kai_eq_raw scr lit) ? body : next`; the catch-all binds the
-# whole scrutinee and ends the chain. The join slot + `__pcs_scr` alias come
-# from the shared `match_preamble`; with no catch-all the final fail panics.
-fn lower_lit_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
-  match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
-    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let pend0 = st2.tcpend
-      let st3 = lower_lit_arms(arms, scrv, join, lcont, owned, sd, pend0, st2)
-      match_finish(owned, sd, LRes(KVar(join), ls_set_tcpend(reopen(st3, lcont), pend0)))
-    } } }
-
-# Lower each literal arm in order, exactly like `lower_list_arms`: the arm's
-# test seals the current block into a condbr (body vs a fresh fail label);
-# the body lowers into the join + branches to `lcont`; the next arm reopens
-# the fail label. A catch-all arm matches unconditionally and ends the chain
-# (later arms are dead). With no catch-all the last fail label panics.
-fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                  owned: Bool, sd: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match arms {
-  [] -> seal_match_miss(st, lcont)
-  [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
-    match lit_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_body)
-      let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
-      if lit_arm_is_catchall(p) { st_done }
-      else { lower_lit_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
-    } } }
-}
-
-# `match scr { <record patterns> }`: a field-test fail-chain mirroring the
-# C-direct oracle's `emit_pat_test_record` (a `kai_op_field_borrow` +
-# `kai_op_eq` conjunction per arm) and structurally identical to
-# `lower_lit_match`. Each arm with literal fields emits a conjunction of
-# `condbr (kai_eq_raw (field_borrow scr name) lit)` tests, projects its
-# binding fields on the success path, then lowers its body; an arm with no
-# literal fields is a catch-all that binds its fields and ends the chain.
-# The join slot + `__pcs_scr` alias come from the shared `match_preamble`;
-# with no catch-all the final fail panics.
-fn lower_record_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
-  match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
-    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let pend0 = st2.tcpend
-      let st3 = lower_record_arms(arms, scrv, join, lcont, owned, sd, pend0, st2)
-      match_finish(owned, sd, LRes(KVar(join), ls_set_tcpend(reopen(st3, lcont), pend0)))
-    } } }
-
-# Lower each record arm in order, exactly like `lower_lit_arms`: the arm's
-# field tests seal the current block into a condbr chain (body vs a fresh
-# fail label); the body lowers into the join + branches to `lcont`; the next
-# arm reopens the fail label. A catch-all arm (a record with no literal
-# fields, or a non-record pattern) matches unconditionally and ends the
-# chain (later arms are dead). With no catch-all the last fail label panics.
-fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                     owned: Bool, sd: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match arms {
-  [] -> seal_match_miss(st, lcont)
-  [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
-    match rec_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      # Field binds arrive OWNED (`kai_op_field` increfs); only a whole-value
-      # binder aliases the scrutinee (an unconsumed field binder on a goto
-      # path stays a bounded leak).
-      let st_own = ls_unw_owning(st_body, rec_field_owned(p))
-      let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_own)
-      let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
-      if rec_arm_is_catchall(p) { st_done }
-      else { lower_record_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
-    } } }
-}
-
-# Build the switch + per-arm blocks + default + continuation, given the
-# already-lowered scrutinee atom and tag register (`match_preamble` set up
-# the join slot + `__pcs_scr` alias). With no catch-all the default block
-# panics.
-fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
-  match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st_decl) ->
-    match two_labels(st_decl) { LSL2(lcont, ldef, st4) -> {
-      let tagged = map(arms, (a) => match a { Arm(p, _, _) -> (arm_tag(p, st4), a) })
-      match plan_arms(tagged, st4, []) { ArmPlan(cases, st5) -> {
-        let pend0 = st5.tcpend
-        let st6 = ls_seal(st5, KSwitch(tagv, cases, ldef, kpos_of(x)), ldef)
-        # The default block holds the catch-all arm's body (a `_` or other
-        # non-variant pattern → tag -1, routed here rather than to a
-        # duplicate switch case). With no catch-all the default panics.
-        let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, owned, sd, pend0, st6)
-        # One switch case per DISTINCT tag (plan_arms dedups). A tag matched
-        # by one arm lowers its body directly in the case block; a tag SHARED
-        # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
-        # case block that discriminates on the payload (kir_lower_variant).
-        let st8 = lower_variant_groups(cases, tagged, scrv, join, lcont, ldef, owned, sd, st6.mscr, pend0, ls_set_scope(st7, st6.scope))
-        match_finish_tok(owned, sd, arms_have_arm_top(arms, st8), LRes(KVar(join), ls_set_tcpend(reopen(st8, lcont), pend0)))
-      } } } } }
-
-# Lower the catch-all arm's body into the default block, or a panic when
-# there is none. This path now only
-# runs for a VARIANT match with a single wildcard/binder default arm:
-# literal-discriminated dispatch (`match n { 0 -> ...; 1 -> ... }`) is
-# diverted to `lower_lit_match` (kir_lower_lit.kai) BEFORE this switch is
-# built, so multiple non-variant arms no longer collapse into one default.
-# The default arm runs when no variant case matched. Its PATTERN may bind
-# the whole scrutinee: a `PBind(s)` whole-value binder, a `PNarrow(x, T)`
-# refinement-narrowed binder (`x : LowerSlug -> shout(x)` — the typer's
-# `where`-predicate match arm), or a `PAs(name, sub)`. Before binding the
-# name to `scrv`, the body's read of the binder was an unbound register.
-# A `PWild`/`PLit` default binds nothing. Destructuring (variant / record)
-# default patterns also bind via `bind_pattern_fields_any`.
-fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                     ldef: String, owned: Bool, sd: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console =
-  match first_default_arm(arms) {
-    Some(Arm(p, _, body)) -> {
-      let st_def = bind_default_pattern(p, scrv, body, reopen(st, ldef))
-      # Issue #858 — the default arm's pattern (a `_`-tag binder / as-name /
-      # destructure) aliases the scrutinee like a variant arm; restore the
-      # oracle's structural pointer-slot incref so the owned exit drop balances.
-      let st_rc = lower_arm_rc(p, body, sd, owned, false, st_def)
-      let st_drop = tcp_seed_after_arm_rc(owned, false, sd, p, body, pend0, st_rc)
-      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, false, sd, p, body, st_drop)), st_def.arm_tok)
-    }
-    None -> seal_match_miss(reopen(st, ldef), lcont)
-  }
-
-# Lower the body block(s) for each switch case. One case per distinct tag
-# (plan_arms dedups); its arms are recovered from `arms` by tag, preserving
-# source order. A tag matched by ONE arm lowers that arm's binds + body
-# directly in the case block. A tag SHARED by N arms opens a sub-fail-chain
-# in the case block: each discriminating arm tests its payload
-# (`pt_arm_subtests`) and branches to its own body on success / the next
-# arm on failure; the tag's catch-all arm (`Exited(_)`) ends the chain
-# unconditionally. The chain's final fail routes to `ldef` (the switch
-# default): "no arm of this tag matched" is exactly "fell through the
-# switch" — `ldef` carries the global `_` body or the miss panic.
-# `mscr0` is this match's `mscr` as of the preamble (its own `<join>$sd` when
-# owned, else the enclosing match's). It is restored before EACH group: a prior
-# group's body may run a nested match that leaves `mscr` pointing at ITS
-# `<join>$sd`, and a reuse-fork arm (`condbr kaix_check_unique`, no
-# `match_preamble` of its own) reads the stale name in
-# `reuse_neutralise_exit_drop` — storing/dropping the wrong register, a raw
-# scalar from the nested arm freed as a pointer (#1229).
-fn lower_variant_groups(cases: [KCase], arms: [(Int, Arm)], scrv: KVal, join: String,
-                        lcont: String, ldef: String, owned: Bool, sd: String, mscr0: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match cases {
-  [] -> st
-  [KC(tag, lbl), ...crest] -> {
-    let group = arms_with_tag(arms, tag)
-    let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, ls_set_mscr(st, mscr0))
-    lower_variant_groups(crest, arms, scrv, join, lcont, ldef, owned, sd, mscr0, pend0, st1)
-  }
-}
-
-# Lower one tag group into its case block `lbl`. A lone arm that does NOT
-# discriminate on its payload (`Some(x)`, `Ok(_)`) binds its fields and
-# lowers its body directly — the common case, keeping the switch O(1) with
-# no extra branch (the tag alone decided the winner). A lone arm that DOES
-# discriminate on its payload (`Some(91)`, `Some(Red)` — a literal / nullary-
-# ctor / nested-variant slot) must still TEST that slot: the tag-switch only
-# proved the constructor, not the sub-pattern, so a bare jump would match
-# every `Some(_)` (the lone-arm-skips-sub-test miscompile — `Some(91)` would
-# capture `Some(49)`). Such an arm routes through the same sub-fail-chain a
-# shared tag uses, with the single arm's miss falling to `ldef` (the switch
-# default = the global `_` body or the miss panic). A shared tag (N>1 arms)
-# always opens the chain.
-fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
-                   lbl: String, ldef: String, owned: Bool, sd: String, mscr0: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match group {
-  [Arm(p, g, body)] ->
-    if var_arm_is_tag_catchall(p) {
-      let st_arm = reopen(st, lbl)
-      let st_bound = bind_pattern_fields(p, scrv, body, st_arm)
-      let st_rc = lower_arm_rc(p, body, sd, owned, false, st_bound)
-      let st_drop = tcp_seed_after_arm_rc(owned, false, sd, p, body, pend0, st_rc)
-      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, false, sd, p, body, st_drop)), st_bound.arm_tok)
-    } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, reopen(st, lbl)) }
-  _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, reopen(st, lbl))
-}
-
-# The sub-fail-chain for a tag shared by N>1 arms. Each arm: if it
-# discriminates on its payload, test it (`condbr` to its body on match / a
-# fresh fail label on mismatch); if it is the tag's catch-all, branch
-# unconditionally to its body (ending the chain — later arms are dead). After
-# binding its fields, the arm's
-# body lowers into the shared join. The last fail label routes to `ldef`.
-fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
-                     fail_lbl: String, ldef: String, owned: Bool, sd: String, mscr0: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match group {
-  [] -> ls_seal(reopen(st, fail_lbl), KBr(ldef, KNoPos), ldef)
-  [Arm(p, _, body), ...rest] -> match ls_fresh_label(reopen(ls_set_mscr(st, mscr0), fail_lbl)) { LSLabel(body_lbl, st1) ->
-    if var_arm_is_tag_catchall(p) {
-      # Catch-all of this tag: branch straight to the body; later arms dead.
-      let st2 = ls_seal(st1, KBr(body_lbl, KNoPos), body_lbl)
-      let st3 = bind_pattern_fields(p, scrv, body, reopen(st2, body_lbl))
-      let st3d = lower_arm_rc(p, body, sd, owned, false, st3)
-      let st3dd = tcp_seed_after_arm_rc(owned, false, sd, p, body, pend0, st3d)
-      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, false, sd, p, body, st3dd)), st3.arm_tok)
-    } else {
-      match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
-        let st4 = emit_arm_subtests_and_binds(p, scrv, body, body_lbl, next_fail, st2)
-        let st4d = lower_arm_rc(p, body, sd, owned, false, st4)
-        let st4dd = tcp_seed_after_arm_rc(owned, false, sd, p, body, pend0, st4d)
-        let st5 = ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, false, sd, p, body, st4dd)), st4.arm_tok)
-        lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, sd, mscr0, pend0, st5)
-      } }
-    } }
-}
-
-# --- Guarded / all-binder match: the linear fail-chain ------------------
-#
-# The general decision tree for a `match` that carries ANY arm guard, or
-# whose arms all bind (no tag to switch on). Mirrors the C-direct oracle's
-# `emit_match_arm` exactly: a linear chain, in source order, of
-#   pattern-test → bind → [guard-test] → body | next-arm
-# No `KTagOf` / `KSwitch`: the scrutinee may be a scalar (Int / Real) whose
-# `variant_tag` word is meaningless. Each arm:
-#   1. tests its pattern (`guard_emit_pat_test`); a non-discriminating
-#      pattern (PBind / PWild / PNarrow / PAs / PHole) always matches, so
-#      its "fail" label IS its body label (no branch);
-#   2. binds the pattern's names (`bind_pattern_fields`) — BEFORE the guard,
-#      which reads them (`n if n % 2 == 0`);
-#   3. if guarded, evaluates the guard and `condbr`s to the body on truthy /
-#      the next arm's fail label on falsy (the guard can reject post-match);
-#   4. lowers its body into the shared `join`, then branches to `lcont`.
-# The chain's final fail panics, as the other chains. The binds are pure slot aliases (`KLitOp(scrv)` / `KProj`), so a
-# rejected guard's unused binder owns nothing — no drop is owed (the oracle
-# emits none either; byte-id parity by construction).
-fn lower_guard_chain(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
-  match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
-    match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
-      let pend0 = st2.tcpend
-      let st3 = lower_guard_arms(arms, scrv, join, lcont, owned, sd, pend0, st2)
-      match_finish(owned, sd, LRes(KVar(join), ls_set_tcpend(reopen(st3, lcont), pend0)))
-    } } }
-
-# Each arm pre-allocates `next_fail`, the block where the REST of the chain
-# starts. Both the pattern test (mismatch) AND the guard (falsy) route there,
-# so a rejected arm — for either reason — falls to the next in source order
-# (the oracle's `if (pat) { binds; if (truthy(g)) {…} }` fall-through). An
-# arm that always matches seals `next_fail` `KUnreachable`. Keeping `next_fail` distinct from the body label is what
-# lets a guarded BINDER arm (`n if … ->`) fail to the next arm rather than
-# loop back onto its own body.
-fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
-                    owned: Bool, sd: String, pend0: [TclEntry], st: LowerSt) : LowerSt / Console = match arms {
-  # No arm matched: the open block is the last arm's `next_fail`. The fresh
-  # successor is discarded by the caller's `reopen(lcont)`.
-  [] -> match ls_fresh_label(st) { LSLabel(dead, st1) -> seal_match_miss(st1, dead) }
-  [Arm(p, opt_guard, body), ...rest] -> match ls_fresh_label(st) { LSLabel(next_fail, st0) ->
-    match guard_emit_pat_test(p, scrv, next_fail, arm_reuses(body, st0), st0) {
-      LMArm(st_body, _) -> {
-        # The arm's binder may shadow-rename an outer name; that rename is
-        # scoped to THIS arm's guard + body. Snapshot before binding so the
-        # rest of the chain (lowered at `next_fail`) does not inherit it.
-        let rsnap = st_body.scope
-        let st_alias = bind_default_pattern(p, scrv, body, st_body)
-        # A whole-value / as / destructure binder aliases the owned scrutinee;
-        # without the structural pointer-slot incref (`lower_arm_rc`, as the
-        # variant + default arms already emit) the match-exit `KDrop(sd)` frees
-        # the cell the binder transfers to the result — a use-after-free.
-        let st_rc = lower_arm_rc(p, body, sd, owned, arm_guarded(opt_guard), st_alias)
-        let st_bound = tcp_seed_after_arm_rc(owned, arm_guarded(opt_guard), sd, p, body, pend0, st_rc)
-        let st_done = ls_set_arm_tok(match opt_guard {
-          None -> lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, false, sd, p, body, st_bound))
-          Some(g) -> match ls_fresh_label(st_bound) { LSLabel(run_lbl, stg) ->
-            match lower_expr(g, stg) { LRes(gv, stg1) -> {
-              # Guard truthy → run the body; falsy → `next_fail` (next arm).
-              # `KCondBr` takes the boxed guard value directly (the backend's
-              # condbr lowering reads it through `kaix_truthy`, as `lower_if`).
-              # The guard's reads refine the ledger before the body lowers.
-              let st_fork = ls_seal(stg1, KCondBr(gv, run_lbl, next_fail, kpos_of(g)), run_lbl)
-              lower_branch_into(body, join, lcont,
-                                match_arm_scr_drop(owned, true, sd, p, body, tcp_after(reopen(st_fork, run_lbl), g)))
-            } } }
-        }, st_alias.arm_tok)
-        # The next arm continues at `next_fail`. If this arm always matched
-        # (a binder with NO guard), control never falls through — `next_fail`
-        # is dead, sealed `KUnreachable` (the typer forbids a reachable arm
-        # after an unconditional one). Otherwise the rest of the chain lowers
-        # starting at `next_fail`.
-        let arm_is_terminal = guard_pat_always_matches(p) and match opt_guard { None -> true Some(_) -> false }
-        if arm_is_terminal {
-          ls_seal(reopen(st_done, next_fail), KUnreachable(KNoPos), next_fail)
-        } else {
-          lower_guard_arms(rest, scrv, join, lcont, owned, sd, pend0, ls_set_scope(reopen(st_done, next_fail), rsnap))
-        }
-      } } }
-}
-
-# Materialise an effect handler as a double fork (asu review): a join
-# `result` slot, then `install eff` + `setjmp eff` + `condbr` splitting
-# the normal body path from the longjmp-discard path. The body lowers
-# INLINE (it runs in the handle's frame, capturing the whole scope), pops
-# the evidence on its normal exit, and stores into `result`; the discard
-# path stores the discarded value. The return clause (if any) lowers
-# inline over `result` at the merge. The clause bodies are separate
-# `KFnClause`s (generated in `lower_to_kir`).
-fn lower_handle(x: Expr, body: Expr, inst: InstKey, init_opt: Option[Expr],
-                alias_opt: Option[Binder], clauses: [HClause],
-                ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
-  let eff = inst_key_text(st.tab, inst)
-  let sym = user_handler_sym(st.enc_fn.sym, x.line, x.col)
-  let has_fin = handle_has_finally(clauses)
-  let uw = unw_handle_at(st.unw.sites, x.site)
-  let ho = kir_unw_handle_vars(uw, x, st)
-  match lower_init_opt(init_opt, ho.st) { LResOpt(initv, st1) ->
-    match ls_fresh_reg(st1) { LSReg(result, st2) -> {
-      let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
-      let hs = kir_unw_handle_state(uw, init_opt, sym, x, st3)
-      let env = handle_env_regs(handle_captures_at(st.cls, st.enc_fn, x.line, x.col), hs.st)
-      let al = bind_handle_alias(alias_opt, hs.st)
-      let st3b = ls_emit(al.st, KInstall(eff, sym, initv, al.reg, env, kpos_of(x)))
-      # Arm the cleanup right after the push, so every unwind past this
-      # node runs it; the normal exit runs it explicitly before the pop.
-      let st4 = if has_fin {
-        ls_emit(st3b, KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn.sym, x.line, x.col), kpos_of(x)))
-      } else { st3b }
-      # A handle carrying `init` state is stateful — its return clause sees
-      # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
-      let stateful = match initv { Some(_) -> true None -> false }
-      # `sym` (the install-site id) threads into the setjmp/pop so each site's
-      # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
-      # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
-      # the second push self-cycles the parent chain (refs #789).
-      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses), inst: inst }
-      lower_handle_fork(x, body, eff, sym, result, fork, ret_opt, list_append(hs.pops, ho.pops), st4)
-    } } }
-}
-
-fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
-                     fork: HandleFork, ret_opt: Option[HReturn], pops: [String], st: LowerSt) : LRes / Console =
-  match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
-    match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
-      let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, sym, result, fork, ret_opt, lret, st3)
-      let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
-      lower_handle_ret(eff, sym, result, fork, pops, lret, st5)
-    } } }
-
-# Lbody: lower the body inline, pop the evidence, apply the return
-# clause, store into result, branch to the merge. The pop sits on the
-# NORMAL exit only — the discard path's longjmp already unwound past it.
-fn lower_handle_body(body: Expr, eff: String, sym: String, result: String,
-                     fork: HandleFork, ret_opt: Option[HReturn],
-                     lret: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(body, ls_in_handle(st, fork.inst)) { LRes(bv, st0) -> {
-    let has_fin = fork.has_fin
-    let stateful = fork.stateful
-    let st1 = ls_set_handles(ls_set_regs(st0, st.regs), st.handles)
-    match ret_opt {
-      None -> {
-        let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
-        ls_seal(lower_handle_exit(eff, sym, has_fin, body, st2), KBr(lret, kpos_of(body)), lret)
-      }
-      Some(r) -> match lower_handle_ret_value(eff, sym, bv, stateful, r, lower_handle_exit(eff, sym, has_fin, body, st1)) {
-        LRes(rv, st2) -> ls_seal(ls_emit(st2, KStore(result, rv, kpos_of(body))), KBr(lret, kpos_of(body)), lret)
-      }
-    }
-  } }
-
-# The return clause over the body's value. A stateful handle's clause sees
-# the state aliases the handle site leaves unbound, each in a register of
-# its own: a later binder of the same name is a different binder.
-fn lower_handle_ret_value(eff: String, sym: String, bv: KVal, stateful: Bool,
-                          r: HReturn, st: LowerSt) : LRes / Console = match r {
-  HR(b, rexpr, _, _) -> {
-    let st1 = if stateful { bind_ret_state(eff, sym, st) } else { st }
-    match lower_expr(rexpr, ls_let(st1, b, SBoxed, KLitOp(bv), KNoPos)) {
-      LRes(v, st2) -> LRes(v, ls_set_scope(ls_set_regs(st2, st.regs), st.scope))
-    }
-  }
-}
-
-fn lower_init_opt(init_opt: Option[Expr], st: LowerSt) : LResOpt / Console = match init_opt {
-  None    -> LResOpt(None, st)
-  Some(e) -> match lower_expr(e, st) { LRes(v, st1) -> LResOpt(Some(v), st1) }
-}
-
-# --- Calls: dispatch by callee shape -----------------------------------
-
-# A call that can unwind registers the frame's pending references for its
-# extent, pushed before its arguments are evaluated (as the C emitter
-# does). A closure it calls through a local is invoked borrowed and
-# registered too: the consuming call would hold the frame's reference
-# where no unwind can reach it.
-fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match unw_call_of(st.unw, x) {
-    None -> lower_call_at(x, f, cargs, st)
-    Some(names) -> {
-      let clo = kir_unw_closure(f, st)
-      match lp_union(map(kir_unw_held(unw_admit(st.unw, names), clo), (n) => ls_reg_of(st, n)), lower_flight_free(st)) {
-        [] -> match clo {
-          Some(UkDup(n)) -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st)
-          _              -> lower_call_at(x, f, cargs, st)
-        }
-        held -> lower_call_bracketed(x, f, cargs, clo, held, st)
-      }
-    }
-  }
-
-# `regs` are the registers the bracket holds: the binders registered at
-# the call and the operand values in flight across it.
-fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], regs: [String], st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(fr, st0) -> {
-      let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim(KpUnwPush, [KVar(unw_fib(st0.unw)), ...map(regs, (r) => KVar(r))]), kpos_of(x)))
-      let r = match lower_bracket_begin(x, regs, st1) { PadB(outer, sb) ->
-        match lower_call_in_bracket(x, f, cargs, clo, sb) { LRes(v, se) -> LRes(v, lower_bracket_end(outer, se)) }
-      }
-      match r { LRes(v, st2) -> {
-        let st3 = ls_emit(st2, KDo(KPrim(KpUnwPop, [KVar(fr)]), kpos_of(x)))
-        match clo {
-          Some(UkTransfer(n)) -> LRes(v, ls_emit(st3, KRC(KDrop(KVar(ls_reg_of(st3, n))), kpos_of(x))))
-          _                   -> LRes(v, st3)
-        }
-      } }
-    } }
-
-fn lower_call_in_bracket(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], st: LowerSt) : LRes / Console = match clo {
-  Some(UkTransfer(n)) -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st)
-  Some(UkDup(n))      -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st)
-  None                -> lower_call_at(x, f, cargs, st)
-}
-
-fn lower_call_at(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match f.kind {
-  # A local in callee position holds a function value, called through
-  # `kaix_apply`; the clause's continuation is resumed instead.
-  ELocal(l) -> if local_is_continuation(l) { lower_resume(x, cargs, st) } else { lower_local_call(x, l, cargs, st) }
-  ESym(s, inst) -> match ls_ctor_lay(st, s) {
-    Some(c) -> lower_ctor_call(x, c, cargs, st)
-    None    -> lower_sym_call(x, FnId(s, inst), cargs, st)
-  }
-  EOp(r)       -> lower_perform(x, r, cargs, st)
-  # A mark in callee position asks for a lowering, not for a call: the
-  # mark decides which.
-  EMark(m)     -> lower_mark_call(x, m, cargs, st)
-  _ -> {
-    let rf = lower_expr(f, st)
-    match rf { LRes(fv, st1) -> match lower_exprs(cargs, st1, []) {
-      LResMany(avs, st2) -> bind_op(st2, KCallIndirect(fv, avs), kpos_of(x)) } }
-  }
-}
-
-fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Console =
-  if mark_is_drop(m) { lower_rc_unary(cargs, KDropMk, st) }
-  else if mark_is_transparent(m) { lower_borrow_through(cargs, st) }
-  else { match m {
-    MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
-    MkTcrecStep(s) -> lower_tcrec(x, s, cargs, st)
-    MkTrmcStep(s)  -> lower_trmc_step(x, s, cargs, st)
-    MkTrmcApply   -> lower_trmc_apply(x, cargs, st)
-    MkDup         -> lower_rc_unary(cargs, KDupMk, st)
-    MkReuseCons    -> lower_reuse(x, m, cargs, st)
-    MkReuseVariant -> lower_reuse(x, m, cargs, st)
-    MkReuseRecord  -> lower_reuse(x, m, cargs, st)
-    _ -> {
-      eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
-      LRes(KUnitV, st)
-    }
-  } }
-
-# A call of a declaration that is no constructor.
-fn lower_sym_call(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match ls_classify(st, fid) {
-    # `__strip_unit(e)` is a compile-time unit erasure — identity at
-    # runtime, so lower the inner expr directly (like `__perceus_borrow`).
-    CkStripUnit -> if kir_node_is_raw(x) { lower_raw_through(cargs, st) } else { lower_borrow_through(cargs, st) }
-    # `unit_name(e)` is COMPILE-TIME reflection (m12.8.x phase 2): the unit is
-    # phantom (no runtime value carries it), so it CANNOT be a runtime call —
-    # the C-direct oracle inlines the canonical unit symbol as a `kai_str`
-    # literal read from the arg's `.ty` (emit_c's `unit_name` case).
-    CkUnitName  -> lower_unit_name(cargs, st)
-    CkDirect    -> lower_callee_dispatch(x, fid, cargs, st)
-  }
-
-# An effect op call → a `KPerform`. The dispatch (evidence lookup + clause
-# call) is the backend's; `KPerform` carries the effect, the instance the
-# typer settled it to, the op, the evidence it goes through and the args.
-fn lower_perform(x: Expr, r: OpRef, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let targs = perform_inst_args(x)
-  match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
-    bind_op(st1, KPerform(r.eff, targs, written_text(r.op), perform_via(r, targs, st), avs), kpos_of(x)) }
-}
-
-fn lower_rc_unary(cargs: [Expr], kind: RCKind, st: LowerSt) : LRes / Console = match cargs {
-  [a] -> match lower_expr(a, st) { LRes(v, st1) -> {
-    let op = match kind { KDupMk -> KDup(v) KDropMk -> KDrop(v) }
-    let st2 = ls_emit(st1, KRC(op, kpos_of(a)))
-    # A dup evaluates to its operand; a drop evaluates to unit.
-    match kind { KDupMk -> LRes(v, st2) KDropMk -> LRes(KUnitV, st2) }
-  } }
-  _ -> LRes(KUnitV, st)
-}
-
-# `__perceus_borrow(e)` reads `e` without an RC op — transparent.
-fn lower_borrow_through(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [a] -> lower_expr(a, st)
-  _   -> LRes(KUnitV, st)
-}
-
-# `int_to_real` / `real_to_int` in raw position: one raw instruction; the operand crosses raw, borrowing a boxed binder.
-fn lower_scalar_conv_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [a] -> match lower_expr_raw(a, st) { LRes(av, st1) ->
-    match builtin_ref(f) {
-      Some(CbIntToReal) -> bind_op_slot(st1, KPrim(KpIntToReal, [av]), SReal, kpos_of(x))
-      _                 -> bind_op_slot(st1, KPrim(KpRealToInt, [av]), SInt64, kpos_of(x))
-    } }
-  _ -> LRes(KUnitV, st)
-}
-
-# A raw coercion hands its raw argument through without a box round trip.
-fn lower_raw_through(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [a] -> lower_expr_raw(a, st)
-  _   -> LRes(KUnitV, st)
-}
-
-# A borrowing indirect call. The first arg is the closure value, invoked
-# WITHOUT being consumed; the rest are the owned call arguments.
-fn lower_apply_borrow(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [fe, ...rest] ->
-    match lower_expr(fe, st) { LRes(fv, st1) ->
-      match lower_exprs(rest, st1, []) {
-        LResMany(avs, st2) -> bind_op(st2, KCallIndirectBorrow(fv, avs), kpos_of(x)) } }
-  _ -> LRes(KUnitV, st)
-}
-
-# A reuse mark over (scr, rbld...): donor scrutinee + rebuild. The mark is
-# the authoritative reuse-kind tag — perceus stamped it from the pattern
-# shape — so each reuse routes to its own move-semantics runtime helper.
-# The record form needs its rebuild's field NAMES, so it decodes the
-# `ERecordLit` into a `KRecordReuse`; the variant/cons forms share the
-# slot-init `KConReuse`.
-fn lower_reuse(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [scr, ...rbld] ->
-    # Under a live region the donor is never reused in place: the rebuild
-    # bump-allocates a fresh cell in the arena (`KCon` carries `in_region`),
-    # and the old donor dies wholesale with the arena — no `KConReuse`, no
-    # per-node RC. The donor is a scrutinee alias (`__pcs_scr`), not an owned
-    # ref, so it needs no lowering here; the match's exit drop reclaims it
-    # (a no-op on the arena's immortal-rc cells).
-    if st.in_region { lower_reuse_fresh(x, rbld, st) }
-    else { match lower_expr(scr, st) { LRes(donor, st1) ->
-      match m {
-        MkReuseRecord -> lower_reuse_record(x, donor, rbld, st1)
-        _             -> lower_reuse_rebuild(x, reuse_kind_of(m), donor, rbld, st1)
-      } } }
-  _ -> LRes(KUnitV, st)
-}
-
-# The region rebuild: lower the reconstruction expression as an ordinary ctor.
-# `st.in_region` is live, so the `KCon`/cons/record it emits routes to the
-# arena — a fresh bump-alloc, no donor reuse. The rebuild is always a single
-# expression (a ctor call or a record literal), the same shape perceus wraps.
-fn lower_reuse_fresh(x: Expr, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
-  [one] -> lower_expr(one, st)
-  _     -> LRes(KUnitV, st)
-}
-
-# A single-element rebuild whose head is a constructor is a variant reuse;
-# otherwise it is a cons reuse (`reuse_cons` passes head+tail directly).
-# The constructor is the one its callee's id names. Perceus never emits a
-# reuse over a non-ctor `ECall`, so the cons layout is correct for cons and
-# unreachable for anything else.
-fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
-  [one] -> match one.kind {
-    ECall(cf, cas) -> match cf.kind {
-      ESym(s, _)       -> match ls_ctor_lay(st, s) {
-        Some(c) -> lower_reuse_con(x, rk, donor, c, cas, st)
-        None    -> lower_reuse_cons(x, rk, donor, rbld, st)
-      }
-      _ -> lower_reuse_cons(x, rk, donor, rbld, st)
-    }
-    _ -> lower_reuse_cons(x, rk, donor, rbld, st)
-  }
-  _ -> lower_reuse_cons(x, rk, donor, rbld, st)
-}
-
-fn lower_reuse_cons(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console =
-  lower_reuse_con(x, rk, donor, ctor_lay_cons(), rbld, st)
-
-# native variant reuse leak (#872). Two backend-distinct reuse shapes:
-#
-#  - FLAT (bijective) rebuild — every rebuild slot is a direct top-level kept
-#    child or a scalar. `KConReuse` reuses the donor cell IN PLACE. A SHARED
-#    donor fresh-allocs and keeps a borrowed reference to each kept child, which
-#    the match-exit `kai_decref(donor)` cascade would free — so emit one
-#    `kai_incref_if_shared(donor, child)` per embedded use (multiset). A unique
-#    donor moves its children in place (no incref). This is half A of #872.
-#
-#  - NESTED (non-bijective) rebuild — a rebuild slot is a fresh sub-ctor that
-#    embeds GRAND-children of a deconstructed inner cell (the rb-tree rotation
-#    `Node(_, Node(Red, lx, ..), ..) -> Node(.., Node(.., lx, ..), ..)`). The C
-#    oracle reuses BOTH the outer cell and the inner cell (Koka 2-of-3 token
-#    reuse). Native mirrors it with a dual-branch fork
-#    (`lower_reuse_nested_dual`) when the arm's slot plan is available
-#    (`st.rnested`): the UNIQUE branch steals the inner cell's shell through
-#    the outer's slot, settles the per-slot RC (kir_lower_reuse), donates the
-#    token to the first same-arity sub-ctor and overwrites the outer in
-#    place; the SHARED branch — and any arm whose pattern the plan does not
-#    cover — keeps the fresh-alloc path (`lower_reuse_nested_fresh`): fresh
-#    outer + one unconditional `dup` per embedded borrowed leaf (multiset),
-#    the match-exit `kai_decref(donor)` cascade reclaiming donor + inner +
-#    originals.
-# The shared-donor incref of each kept child must precede `lower_exprs`: a
-# rebuild arg that CONSUMES a kept child (`inc(l)`, `ins(l, ..)`) reuses it
-# in place inside the call, so the incref has to land BEFORE the call runs —
-# else the call mutates the donor's still-live child. Emitting it after the
-# args (as the old `emit_reuse_gc_increfs(.., st1)` did) protected only
-# children embedded by reference, not children threaded through a call. The
-# nested-rotation path keeps its own ordering (the dup precedes nothing it
-# consumes — `KCon` fresh-allocs).
-fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, c: CtorLay, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs, st)
-  if nested and rh_held(st) { lower_reuse_nested_fresh(x, c, cargs, st) }
-  else if nested {
-    match st.rnested.rot {
-      RNI(oarity, nslot, n_inner, directs, grands) ->
-        # In-place overwrite requires the donor and rebuilt ctor to share an
-        # arity; a mismatch keeps the fresh path (the shared branch would be
-        # taken inside `kaix_variant_reuse_at` anyway, but the inner steal
-        # must not run against a donor the rebuild cannot absorb).
-        if list_length(cargs) == oarity {
-          lower_reuse_nested_dual(x, donor, c, cargs, nslot, n_inner, directs, grands, st)
-        } else { lower_reuse_nested_fresh(x, c, cargs, st) }
-      RNInone -> lower_reuse_nested_fresh(x, c, cargs, st)
-    }
-  } else if reuse_kind_is_variant(rk) {
-    # A held scrutinee's exit would release the inner cells the flat fork
-    # settles; that arm keeps the fresh path.
-    match st.rnested.cells {
-      [] -> lower_reuse_flat_fork(x, donor, c, cargs, st)
-      _  -> if rh_held(st) { lower_reuse_nested_fresh(x, c, cargs, st) }
-            else { lower_reuse_flat_fork(x, donor, c, cargs, st) }
-    }
-  } else {
-    lower_reuse_dual(x, rk, donor, c, cargs, st)
-  }
-}
-
-# Flat variant reuse (no nested sub-ctor). The kept-binder increfs are
-# unconditional (`kaix_incref_if_shared` — a no-op on a unique donor) and
-# the args lower ONCE before the fork; the branches share the atoms, so
-# nothing evaluates or dups twice. The fork exists only so the UNIQUE
-# branch can take the exit-drop-neutralised MOVE (`RkVariantMove`, no
-# survive-the-drop incref — the C oracle's `_r = _scr; _scr = NULL`); the
-# SHARED branch fresh-allocs and leaves the donor for the match-exit
-# cascade, exactly the old single-body shim's else path.
-fn lower_reuse_flat_fork(x: Expr, donor: KVal, c: CtorLay, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
-    let pos = kpos_of(x)
-    # Capture the arm's slot plan and uses BEFORE the args lower: a nested
-    # match inside a rebuild arg re-sets `rnested`/`reuse_gc` per inner arm
-    # and nothing restores them for the rest of this arm, so reading them
-    # after `lower_exprs` settles against the WRONG pattern's plan (an
-    # inner arm's slot 0 projected out of the outer donor — over-release).
-    let plan = st0.rnested
-    let uses = reuse_taken_uses(st0.locals, cargs, st0.reuse_gc)
-    let held = rh_held(st0)
-    let st_gc = if held { emit_reuse_gc_increfs(donor, rh_repeats(uses), pos, rh_own(rh_take_slots(donor, lid_uniq(uses), pos, st0), lid_uniq(uses))) }
-                else { emit_reuse_gc_increfs(donor, kc_uses_outside_cells(uses, plan.cells), pos, st0) }
-    # The inner cells settle before the args: an arg may consume a taken
-    # binder beneath one, and lend an untaken one.
-    match kc_cells_own(plan.cells, donor, uses, pos, st_gc) { CellOwn(st_own, cell_drops) ->
-    match lower_kinds_held(cargs, c.kinds, 0, held, RhHolds { regs: [], st: st_own }, [], pos) { LResMany(avs, st_args) -> {
-      let st1 = kc_drop_regs(cell_drops, pos, st_args)
-      let st_decl = ls_emit(st1, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
-      match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
-        match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
-          let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
-          # The move overwrite pays no old slot; a donor child the rebuild
-          # does not re-embed (wildcard / unused binder) still carries the
-          # donor's claim and must be dropped by projection before the
-          # overwrite.
-          let st_paid = rn_flat_unique_drops(plan.flat, donor, uses, pos, st_fork)
-          let st_ub = match bind_op(st_paid, KConReuse(RkVariantMove, donor, c.name, c.tag, typed_inits(avs, c)), pos) { LRes(ru, st_u2) ->
-            ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) }
-          let st_sb = match bind_op(st_ub, KCon(c.name, c.tag, c.mask, typed_inits(avs, c), st_ub.in_region), pos) { LRes(rs, st_s2) ->
-            ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) }
-          LRes(KVar(rjoin), st_sb)
-        } } }
-    } } }
-  } }
-
-# The fresh-alloc nested rebuild: fresh outer + one unconditional dup per
-# embedded borrowed leaf; the match-exit `decref(donor)` reclaims
-# donor + inner + originals. The shared branch of the dual fork below, and
-# the whole rebuild for arms the slot plan does not cover.
-fn lower_reuse_nested_fresh(x: Expr, c: CtorLay, cargs: [Expr], st0: LowerSt) : LRes / Console = {
-  let leaves = reuse_gc_uses(st0.locals, cargs, st0.reuse_gc)
-  let st = if rh_held(st0) { rh_own(st0, lid_uniq(leaves)) } else { st0 }
-  # The first nested sub-ctor consumes the cross-call donor (inner stage
-  # off — there is no stolen shell on the fresh path). The donor's
-  # uniqueness is independent of this scrutinee's, so the shared branch
-  # still absorbs the caller's shell — the C backend's shared-branch site.
-  # The leaf dups precede the args: an arg call may consume a borrowed leaf.
-  match lower_reuse_args_donate(cargs, c.kinds, "", 0, true, false,
-                                emit_reuse_leaf_dups(leaves, kpos_of(x), st), []) { LResDon(avs, _, st1) ->
-    bind_op(st1, reuse_fresh_op(RkVariant, c, avs, st1), kpos_of(x)) }
-}
-
-# The dual-branch nested rotation reuse (mirrors emit_c's Koka 2-of-3 token
-# reuse: outer `_scr` overwrite + `_ru_inner` donation). Arm binds are
-# borrows, so the UNIQUE branch owns every old reference of the donated
-# outer shell and — conditionally, via the steal — of the inner cell:
-#   1. project the inner cell and steal its shell (`KTokenSteal`; null when
-#      the inner is shared, after its non-recursive rc--);
-#   2. settle the RC per slot plan (`rn_direct_acct` / `rn_grand_acct`) so
-#      each embedded use owns exactly one reference;
-#   3. lower the rebuild args, donating the token to the first same-arity
-#      sub-ctor (`KConAt` rebuilds into the shell; a null token falls back
-#      to a fresh alloc inside the runtime); an undonated token is freed;
-#   4. overwrite the outer in place (`KConReuse` — its incref balances the
-#      match-exit drop).
-# The SHARED branch is the fresh path. Args are lowered TWICE (textual
-# duplication, evaluated once — the branches are mutually exclusive),
-# exactly like `lower_reuse_dual` below.
-fn lower_reuse_nested_dual(x: Expr, donor: KVal, c: CtorLay, cargs: [Expr],
-                           nslot: Int, n_inner: Int, directs: [RNSlot], grands: [RNSlot],
-                           st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
-    let pos = kpos_of(x)
-    let uses = reuse_gc_uses(st0.locals, cargs, st0.reuse_gc)
-    let st_decl = ls_emit(st0, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
-    match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
-      match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
-        let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
-        # UNIQUE: steal the inner shell, settle RC, rebuild donating, overwrite.
-        # A flat pattern (`nslot < 0`, the recolor-wrap shape) has no inner
-        # cell — only the outer overwrite applies. The inner cell and token
-        # are threaded as REGISTER NAMES (a fresh `KVar` per use), never one
-        # KVal atom reused across helper calls — the stage1-built compiler
-        # miscompiles that shape.
-        let st_ub = if nslot < 0 {
-          let st_a = rn_direct_acct(directs, donor, uses, pos, st_fork)
-          # The recolor-wrap shape has no inner steal; the nested rebuild
-          # cell consumes the cross-call donor instead (inner stage off).
-          match lower_reuse_args_donate(cargs, c.kinds, "", 0, true, false, st_a, []) { LResDon(avs_u, _, st_d) ->
-            match bind_op(st_d, KConReuse(RkVariantMove, donor, c.name, c.tag, typed_inits(avs_u, c)), pos) { LRes(ru, st_u2) ->
-              ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } }
-        } else { match ls_fresh_reg(st_fork) { LSReg(innerreg, st_r1) ->
-          match ls_fresh_reg(st_r1) { LSReg(tokreg, st_r) -> {
-          let st_i = ls_emit(st_r, KLet(innerreg, SBoxed, KProj(donor, nslot), pos))
-          let st_t = ls_emit(st_i, KLet(tokreg, SBoxed, KTokenSteal(KVar(innerreg), n_inner), pos))
-          let st_a = rn_grand_acct(grands, innerreg, tokreg, uses, pos,
-                       rn_direct_acct(directs, donor, uses, pos, st_t))
-          match lower_reuse_args_donate(cargs, c.kinds, tokreg, n_inner, false, false, st_a, []) {
-            LResDon(avs_u, donated, st_d) -> {
-              let st_f = if donated { st_d } else { ls_emit(st_d, KRC(KFreeToken(KVar(tokreg)), pos)) }
-              match bind_op(st_f, KConReuse(RkVariantMove, donor, c.name, c.tag, typed_inits(avs_u, c)), pos) { LRes(ru, st_u2) ->
-                ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) }
-            } }
-        } } } }
-        # SHARED: the fresh path, joined into `rjoin`.
-        let st_sb = match lower_reuse_nested_fresh(x, c, cargs, st_ub) { LRes(rs, st_s) ->
-          ls_seal(ls_emit(st_s, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) }
-        LRes(KVar(rjoin), st_sb)
-      } } }
-  } }
-
-# Lower the rebuild args, donating the inner token to the FIRST top-level
-# sub-ctor whose arity matches the stolen shell (`RkTokenVariant`), and the
-# fn's CROSS-CALL donor token to the NEXT sub-ctor (`RkDonorVariant` — the
-# fresh cell the caller's donated shell pays for; degrades to a fresh alloc
-# when no donor arrived). Exactly one consumer each; the caller frees an
-# undonated inner token, the fn exit frees an unconsumed donor. `tokreg` is
-# the inner token's register name (fresh `KVar` per use); `donated = true`
-# at entry disables the inner stage (the fresh path, which has no stolen
-# shell). Returns the INNER-donation flag only.
-fn lower_reuse_args_donate(es: [Expr], ks: [Int], tokreg: String, n_inner: Int, donated: Bool,
-                           ddone: Bool, st: LowerSt, acc: [KVal]) : LResDon / Console = match es {
-  [] -> LResDon(acc, donated, st)
-  [e, ...rest] -> match donate_ctor(e, n_inner, donated, st) {
-    Some(c2) -> match e.kind {
-      ECall(_, cas) -> match lower_kinds_vals(cas, c2.kinds, 0, st, []) { LResMany(avs, st1) -> {
-        let tokv = KVar(tokreg)
-        match bind_op(st1, KConReuse(RkTokenVariant, tokv, c2.name, c2.tag, typed_inits(avs, c2)), kpos_of(e)) { LRes(v, st2) ->
-          lower_reuse_args_donate(rest, ks, tokreg, n_inner, true, ddone, st2, list_append(acc, [v])) }
-      } }
-      # Unreachable (donate_ctor proved ECall); lower normally.
-      _ -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
-        lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
-    }
-    None -> match donor_ctor(e, donated and not ddone, st) {
-      Some(c3) -> match e.kind {
-        ECall(_, cas) -> match lower_kinds_vals(cas, c3.kinds, 0, st, []) { LResMany(avs, st1) ->
-          match bind_op(st1, KConReuse(RkDonorVariant, KUnitV, c3.name, c3.tag, typed_inits(avs, c3)), kpos_of(e)) { LRes(v, st2) ->
-            lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, true, st2, list_append(acc, [v])) } }
-        _ -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
-          lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
-      }
-      None -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
-        lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
-    }
-  }
-}
-
-# Args lowered at their slot kinds `ks`: a kind-1 Int slot lowers raw, as
-# `lower_ctor_args` does, since the emitter reads that word without
-# consuming the box a boxed value would bring.
-# `ks` must come from the entry the rebuild's tag uses: its type's home here, arity in `lower_ctor_args`.
-fn lower_kinds_vals(es: [Expr], ks: [Int], i: Int, st: LowerSt, acc: [KVal]) : LResMany / Console = match es {
-  [] -> LResMany(acc, st)
-  [e, ...rest] -> match lower_at_kind(e, kind_at(ks, i), st) {
-    LRes(v, st1) -> lower_kinds_vals(rest, ks, i + 1, st1, list_append(acc, [v]))
-  }
-}
-
-# `lower_kinds_vals` that, under `held`, registers each operand value a
-# later operand could strand until the last one has run.
-fn lower_kinds_held(es: [Expr], ks: [Int], i: Int, held: Bool, h: RhHolds, acc: [KVal], pos: KPos) : LResMany / Console = match es {
-  [] -> LResMany(acc, rh_release(h, pos))
-  [e, ...rest] -> match lower_at_kind(e, kind_at(ks, i), h.st) {
-    LRes(v, st1) -> {
-      let h1 = RhHolds { regs: h.regs, st: st1 }
-      lower_kinds_held(rest, ks, i + 1, held, if held { rh_hold(e, v, kind_at(ks, i), rest != [], pos, h1) } else { h1 }, list_append(acc, [v]), pos)
-    }
-  }
-}
-
-fn lower_at_kind(e: Expr, k: Int, st: LowerSt) : LRes / Console =
-  if k == 1 { lower_expr_raw_at(e, SInt64, st) } else { lower_expr(e, st) }
-
-# The genuine dual-branch reuse (mirrors emit_c's emit_match_arm_reuse_cons /
-# _variant). The single-body `kai_reuse_or_alloc_*` shim cannot mirror C's
-# per-branch binding mode: the UNIQUE branch binds the DIRECT scrutinee slots
-# BORROW (no incref) and rebuilds in place (store RAW, no decref of the old
-# slot — the borrow gave up no ownership), while the SHARED branch binds them
-# OWNED (dup) and fresh-allocs. Borrow-no-incref and store-raw-no-decref are
-# the two halves of one saving and must go together — mixing an owned bind
-# with a raw store leaks, a borrow bind with a decref-store double-frees. The
-# DECONSTRUCTED sub-binders were already dup'd unconditionally by the caller
-# (they are incref'd in both branches, per the oracle's is_alias path), so the
-# fork manages only the direct slots (`st.reuse_gc`). The body's rebuild args
-# are lowered TWICE (textual duplication, evaluated once — the branches are
-# mutually exclusive), exactly as C interpolates h_new_c/t_new_c in both arms.
-fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, c: CtorLay, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
-    let pos = kpos_of(x)
-    # A direct slot the rebuild does not take has no owner once overwritten:
-    # the unique branch drops it, the shared branch does not dup it.
-    let uses = reuse_taken_uses(st.locals, cargs, st.reuse_gc)
-    let taken = lid_uniq(reuse_taken_binders(st.reuse_gc, uses))
-    let held = rh_held(st)
-    let st_decl = ls_emit(st0, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
-    match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
-      match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
-        let st_fork0 = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
-        let st_fork = if held { rh_own(rh_take_slots(donor, taken, pos, st_fork0), taken) } else { st_fork0 }
-        # UNIQUE: direct slots stay borrows (no dup); rebuild; reuse in place.
-        let st_ub = match lower_kinds_held(cargs, c.kinds, 0, held, RhHolds { regs: [], st: st_fork }, [], pos) { LResMany(avs_u, st_u0) -> {
-          let st_u1 = rn_flat_unique_drops(st.rnested.flat, donor, uses, pos, st_u0)
-          match bind_op(st_u1, KConReuse(rk, donor, c.name, c.tag, typed_inits(avs_u, c)), pos) { LRes(ru, st_u2) ->
-            ls_seal(ls_emit(st_u2, KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } } }
-        # SHARED: dup the direct slots (owned), rebuild, fresh-alloc. A cons
-        # rebuild allocates a real KAI_CONS cell (`kai_cons`) — `Cons` is the
-        # builtin list ctor, not a registered variant, so a `KCon` here would
-        # build a variant-shaped cell whose `as.cons` reads are garbage.
-        let st_sd = emit_direct_dups(reuse_taken_binders(st.reuse_gc, uses), pos, st_ub)
-        let st_sb = match lower_kinds_held(cargs, c.kinds, 0, held, RhHolds { regs: [], st: st_sd }, [], pos) { LResMany(avs_s, st_s1) ->
-          match bind_op(st_s1, reuse_fresh_op(rk, c, avs_s, st_s1), pos) { LRes(rs, st_s2) ->
-            ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) } }
-        LRes(KVar(rjoin), st_sb)
-      } } }
-  } }
-
-# The record-reuse rebuild is an `ERecordLit` (perceus wraps it directly);
-# decode its (name, value) field inits into a `KRecordReuse` so the backend
-# donates the unique scrutinee cell via `kaix_reuse_or_alloc_record` (which
-# carries the parallel name array `kai_record` needs). A malformed rebuild
-# (not an `ERecordLit`) cannot arise — perceus only wraps record literals —
-# so fall back to unit defensively.
-fn lower_reuse_record(x: Expr, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
-  [one] -> match one.kind {
-    ERecordLit(_, fis) -> match lower_field_inits(fis, st, []) { RecPlan(pairs, st1) ->
-      bind_op(st1, KRecordReuse(donor, pairs, record_kept_mask(fis, 0, 0), rec_stamp_of(st.stamps, one.ty)), kpos_of(x)) }
-    _ -> LRes(KUnitV, st)
-  }
-  _ -> LRes(KUnitV, st)
-}
-
-# --- Constructors / direct calls ---------------------------------------
-
-# Lower a ctor call, each arg AT ITS SLOT: a kind-1 Int slot lowers its arg RAW
-# (`lower_expr_raw_at SInt64` — no trailing `int.box`, so a raw `k` flows
-# straight into the `.i64` word instead of `int.box(k)` then unbox), everything
-# else boxed. Mirror of `lower_tcrec_args` for the ctor-arg ABI: the slot init
-# `SIInt64`/`SIBoxed` matches the arg's lowered repr, so the emitter never
-# re-boxes a raw scalar just to store it raw again (the rb-tree hot-path box).
-fn lower_ctor_call(x: Expr, c: CtorLay, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_ctor_args(cargs, c.kinds, st, []) { LCtorInits(inits, st1) ->
-    bind_op(lower_flight_end(st, st1), KCon(c.name, c.tag, c.mask, inits, st1.in_region), kpos_of(x)) }
-
-fn lower_ctor_args(cargs: [Expr], ks: [Int], st: LowerSt, acc: [KSlotInit]) : LCtorInits / Console =
-  match cargs {
-    [] -> LCtorInits(acc, st)
-    [e, ...rest] -> {
-      let trest = match ks {
-        [_, ...r] -> r
-        [] -> []
-      }
-      let k = kind_at(ks, 0)
-      # A user-ctor kind-1 Int slot lowers RAW; a kind-2 Real / kind-3 enum
-      # slot lowers boxed but is WRAPPED at its kind so the emitter stores the
-      # raw f64 bits / immediate tag word; builtins + boxed slots stay boxed.
-      if k == 1 {
-        match lower_expr_raw_at(e, SInt64, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, trest, st1, list_append(acc, [SIInt64(v)])) }
-      } else if k == 2 {
-        match lower_expr(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, trest, st1, list_append(acc, [SIReal(v)])) }
-      } else if k == 3 {
-        # Literal-ctor peephole (the C `{.i64 = tag}` mirror): a bare nullary
-        # user-ctor arg (`Red`) contributes its tag as an immediate — no
-        # singleton load + tag re-read. Anything else lowers boxed and the
-        # emitter takes the tag at the border (`kaix_take_enum`).
-        match lower_enum_slot_arg(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, trest, st1, list_append(acc, [SIEnum(v)])) }
-      } else {
-        match lower_expr(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, trest, lower_flight_next(e, v, rest == [], st1), list_append(acc, [SIBoxed(v)])) }
-      }
-    }
-  }
-
-# An enum-slot ctor arg. A NULLARY user ctor lowers to its tag immediate
-# (`KIntV`); everything else lowers boxed (the emitter's `kaix_take_enum`
-# reads whatever tag it carries).
-fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
-  ESym(s, _) -> match ctor_ix_row(st.ctor_ix, s) {
-    Some(EV(ar, _, tag, _)) ->
-      if ar == 0 and tag >= user_variant_tag_base() { LRes(KIntV(tag), st) }
-      else { lower_expr(e, st) }
-    None -> lower_expr(e, st)
-  }
-  _ -> lower_expr(e, st)
-}
-
-# `sym` is the already-resolved mangled symbol and `sig` the callee's
-# UFnSig: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
-#
-# ARGS — lower each at the callee's PARAM slot (`lower_tcrec_args`, shared
-# with the self-tail-call back-edge): a raw param gets its arg lowered RAW
-# (`fib(n-1)` passes the `i64` directly, no `int.box` → `kaix_int_field`
-# round-trip at the callee boundary), a boxed param keeps the boxed atom.
-# Without this the args round-tripped (`int.box(n-1)` then the callee's
-# `nemit_raw_args` unbox-borrowed back) — the other half of the residual.
-#
-# RESULT — bind at the callee's RETURN slot, not the unconditional `SBoxed`
-# of `bind_op`: a raw-return UFn lands its `i64` in a raw register, so a
-# consuming `i+` reads it directly (`nemit_load_reg_as_int`) and a boxed use
-# boxes once at the border (`nemit_load_reg_boxed` → `kaix_int`, the oracle's
-# `box_wrap`). A non-raw callee (FFI wrapper, effectful / generic / proto fn
-# → `None` sig) lowers args + result exactly as before (all boxed).
-#
-# RC: a raw `i64`/`f64`/`i1` carries NO refcount. Perceus already skips a raw
-# arg / result — the unbox pass marks them `MUnboxed`, so neither the raw
-# args nor the raw result register attract a KDup/KDrop. The raw slots here
-# only change the repr, never the RC plan.
-#[doc("Lower the direct call `sym(cargs)` at `x`, of a callee whose unboxed signature is `sig`.")]
-pub fn lower_direct_call(x: Expr, sym: String, sig: Option[UFnSig], cargs: [Expr], st: LowerSt) : LRes / Console = {
-  match lower_tcrec_args(cargs, sig, st) { LResMany(avs0, st0) ->
-    match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) -> {
-      let held = ob_held(x, cargs, avs, st1)
-      ob_drop_after(ob_release(held, bind_op_slot(held.st, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x))),
-                    cargs, avs, kpos_of(x)) } } }
-}
-
-# A top-level fn or a core builtin is a direct `KCall`; any other
-# declaration is read as a register spelled like it and called indirectly.
-fn lower_callee_dispatch(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
-  if callee_is_direct(st, fid) {
-    lower_direct_call(x, c_sym_of_callee_st(st, fid), ls_call_sig(st, fid), cargs, st)
-  } else { lower_reg_call(x, ls_fn_name(st, fid), cargs, st) }
-
-# A local holding a function value, called through `kaix_apply` from its
-# register.
-fn lower_local_call(x: Expr, l: LocalId, cargs: [Expr], st: LowerSt) : LRes / Console =
-  lower_reg_call(x, ls_reg_of(st, l), cargs, st)
-
-fn lower_reg_call(x: Expr, reg: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_exprs(cargs, st, []) { LResMany(avs0, st0) ->
-    match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) ->
-      ob_drop_after(bind_op(st1, KCallIndirect(KVar(reg), avs), kpos_of(x)),
-                    cargs, avs, kpos_of(x)) } }
-
-# --- Resume / sentinels → typed terminators ----------------------------
-
-# `resume(v)` lowers to an EXPRESSION-call (`bind_op`), NOT a terminator —
-# the block stays OPEN so a non-tail resume (`let _ = resume(()) resume(())`)
-# materialises the SECOND call in the same block; the runtime's one-shot
-# check then fires on it (the m7a #6d native gap). The block's `KRet` is
-# supplied by the clause's `ls_finish` close, exactly as the C-direct oracle
-# lets the C function's normal return sequence the resume call. The op result
-# is the resume value (usable by a deep handler's `let x = resume(v)`).
-# The clause's tail after a non-tail `resume`, deferred to the handle's
-# exit. The runtime takes the closure's reference.
-# A handle on a stack segment: the body thunk, the return clause (unit when
-# there is none) and one closure per op clause, each consumed by the runtime.
-fn lower_seg_handle(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
-  [_, _, body, ret, ...cls] -> match lower_exprs([body, ret, ...cls], st, []) {
-    LResMany(vs, st1) -> bind_op(st1, KPrim(KpSegHandle, vs), kpos_of(x))
-  }
-  _ -> lower_unhandled(x, st)
-}
-
-# A forwarding clause handing op `i` and its arguments to its segment handle.
-fn lower_seg_request(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
-  [ix, ...xs] -> match ix.kind {
-    EInt(i, _) -> match lower_exprs(xs, st, []) {
-      LResMany(vs, st1) -> bind_op(st1, KPrim(KpSegRequest, [KIntV(i), ...vs]), kpos_of(x))
-    }
-    _ -> lower_unhandled(x, st)
-  }
-  [] -> lower_unhandled(x, st)
-}
-
-fn lower_resume_frame(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
-  [f] -> match lower_expr(f, st) {
-    LRes(fv, st1) -> bind_op(st1, KPrim(KpResumeFramePush, [fv]), kpos_of(x))
-  }
-  _ -> lower_unhandled(x, st)
-}
-
-fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [a] -> match lower_expr(a, st) { LRes(av, st1) ->
-    bind_op(st1, KResumeOp(KVar(kir_resume_reg()), av), kpos_of(x)) }
-  [a, s] -> match lower_expr(a, st) { LRes(av, st1) -> match lower_expr(s, st1) {
-    LRes(sv, st2) -> bind_op(st2, KResume2Op(KVar(kir_resume_reg()), av, sv), kpos_of(x)) } }
-  _ -> LRes(KUnitV, st)
-}
-
-# A `MkTcrecStep` call → KTcrecGoto (seals the block).
-# Invariant: `tcrec_rewrite_decls` plants the call args in the SAME order
-# as the loop params, so the ordinal index from `assigns_of(avs, 0, …)` IS
-# the slot index — the step's `params` are redundant here and deliberately
-# unused. If that producer ever reorders, this assumption breaks silently;
-# the dropmask is a bitfield over the same ordering, so the two must stay
-# aligned.
-fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_tcrec_args(cargs, fnx_ufn_sig_first(st.fx, step.fid), st) {
-    LResMany(avs, st1) ->
-      # The goto leaves every enclosing match block, skipping their
-      # continuation scrutinee drops and this path's unconsumed binder
-      # dups — release the pending ledger entries before the back-edge.
-      seal_tail(tcp_goto_drops(cargs, st1),
-                KTcrecGoto(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), assigns_of(avs, 0, []),
-                           step.dropmask, kpos_of(x)))
-  }
-
-# A `MkTrmcStep` call → KTrmcStep.
-# Same ordinal-index invariant as `lower_tcrec`: the step's `params`
-# are unused; cargs order == slot order, guaranteed by the rewrite producer.
-#
-# CRITICAL — the self-call is the back-edge, NEVER a value (mirror the C
-# oracle `emit_trmc_cons_step`/`emit_trmc_variant_step`). The ctor-args are
-# `[..non-hole.., self_call, ..non-hole..]` with the self-call `ECall(_, sa)`
-# at index `hole_slot`. Lowering ALL cargs (the old bug) emits the recursion
-# `t = sym(t)` into the KIR, defeating TRMC. Instead:
-#   - the NON-hole args (the real head value(s)) lower as values → `head_vals`;
-#     the backend builds the cell from them with NULL at the hole slot.
-#   - the hole-slot arg's `ECall(_, sa)` args lower → loop-param rebinds
-#     (`assigns`), exactly as `lower_tcrec` does for an ordinary self-tail-call.
-# The dropmask threads identically to `KTcrecGoto` (it reconciles the
-# exit-drops the goto skips); the hole-slot arg is never materialised, so it
-# carries no ref to drop.
-fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let hole = step.hole
-  let spine = trmc_spine(step.spine, st)
-  # The full slot mask of the spine ctor (0 for the builtin cons spine),
-  # so the native step lays each slot at its kind like KCon/KConReuse do —
-  # the same mask (`variant_slot_mask`) the fresh route reads.
-  let slot_mask = match trmc_spine_lay(step.spine, st) {
-    Some(c) -> c.mask
-    None    -> 0
-  }
-  # Lower the non-hole ctor args (head value(s)) left-to-right, then the
-  # self-call's args (the rebinds) — preserving evaluation order.
-  match lower_kinds_vals(trmc_drop_nth(cargs, hole, 0, []), mask_kinds_but(slot_mask, hole, 0, list_length(cargs)), 0, st, []) {
-    LResMany(heads, st1) ->
-      lower_trmc_seal(x, step, spine, slot_mask, heads, cargs, st1)
-  }
-}
-
-# Lower the self-call's args into the loop-param rebinds and seal the step.
-# Split out of `lower_trmc_step` so the head/rebind lowerings sit at one
-# nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
-fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
-                   slot_mask: Int, heads: [KVal], cargs: [Expr], st: LowerSt) : LRes / Console =
-  # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
-  # param), so the TRMC back-edge re-stores them raw — no per-step
-  # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
-  match lower_tcrec_args(trmc_self_args(cargs, step.hole), fnx_ufn_sig_first(st.fx, step.fid), st) {
-    LResMany(reb, st1) -> {
-      # The variant ctor tag is resolved here (as `KCon` resolves it), so the
-      # backend builds the spine cell without a name→tag table. The builtin-
-      # cons spine is not a registered variant → tag -1 (its backend path
-      # is cons-specific and ignores the tag).
-      let tag = match spine {
-        KSpineCons(_)  -> 0 - 1
-        KSpineCtor(_)  -> match trmc_spine_lay(step.spine, st1) {
-          Some(c) -> c.tag
-          None    -> 0
-        }
-      }
-      # Like the tcrec goto, the step leaves every enclosing match: it
-      # releases the ledger's pending entries the ctor args do not consume.
-      seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st1, tcl_without_tok(st1.tcpend))),
-                KTrmcStep(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), step.hole, spine, tag, slot_mask, step.dropmask,
-                          heads, assigns_of(reb, 0, []), st1.in_region, kpos_of(x)))
-    }
-  }
-
-# The trmc apply mark → KTrmcApply (plug leaf into the open hole).
-#
-# A `KTrmcApply` is a terminal RET: it skips every enclosing match exit, so it
-# releases the ledger's pending entries the leaf does not consume. A reuse arm
-# seeds no entry for its own scrutinee; a leaf that con-reuses it increfs the
-# donor to survive the skipped exit drop, so that drop is emitted here.
-fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [leaf] -> match lower_expr(leaf, st) { LRes(lv, st1) -> {
-    let st2 = if st1.mscr == "" or not trmc_apply_leaf_reuses_scr(leaf) { st1 }
-              else { ls_emit(st1, KRC(KDrop(KVar(st1.mscr)), kpos_of(x))) }
-    seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st2, tcl_without_tok(st2.tcpend))), KTrmcApply(lv, kpos_of(x))) } }
-  _ -> LRes(KUnitV, st)
 }
