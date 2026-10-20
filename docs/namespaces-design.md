@@ -261,9 +261,9 @@ semantic**: it survives lowering and selects the named declaration. A
 qualifier the compiler validates and then drops is worse than no
 qualifier, because it looks like a fix.
 
-**The `.` disambiguation table.** `.` is overloaded: record field, UFCS
-call, module path, effect operation. Adding the three-segment `m.E.op`
-makes five. The decision is not made at one point today — the module
+**The `.` disambiguation table.** `.` is overloaded: record field,
+module path, effect operation. Adding the three-segment `m.E.op`
+makes four. The decision is not made at one point today — the module
 rewrite happens syntactically before inference, the effect check happens
 during it — which is why the precedence has never been stated.
 
@@ -276,7 +276,7 @@ The order, matching what the compiler does today except where noted:
 
 | # | Base resolves to | Result |
 |---|---|---|
-| 1 | **local binding** | field access, or UFCS call |
+| 1 | **local binding** | field access |
 | 2 | `bit` | bitwise intrinsic (special case) |
 | 3 | **module** | member of that module |
 | 4 | **effect** in scope | operation |
@@ -289,10 +289,9 @@ introduces no change.
 
 Three sub-rules that are real precedences and belong here:
 
-- **Field beats UFCS.** With a local receiver, if the record has the
-  field, it is a field access; UFCS applies only when it does not. A
-  record with a field `area` and a function `area(r: Rect)` in scope
-  resolves to the field.
+- **A field is never a function in scope.** With a local receiver, `.f`
+  is a field access of the record. A record with a field `area` and a
+  function `area(r: Rect)` in scope resolves to the field.
 - **Capability locals dispatch, not project.** A local bound by
   `handle … with E as a` is a local by §1, but `a.op` is an operation
   dispatch, not field access. Row 1 covers ordinary locals; capability

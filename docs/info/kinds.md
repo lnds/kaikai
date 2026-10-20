@@ -134,7 +134,7 @@ for kaikai's own structural format.)
 type Packet = { magic: U32<be>, port: U16<be> }
 
 fn main() : Unit / Stdout = {
-  let bytes = Packet { magic: 0<be>, port: 0<be> }.to_bytes()
+  let bytes = Packet { magic: 0<be>, port: 0<be> } |> to_bytes()
   match packet_from_bytes(bytes, 0) {
     Ok(c)  -> Stdout.print("port #{c.value.port}")
     Err(m) -> Stdout.print(m)

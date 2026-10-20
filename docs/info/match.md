@@ -81,7 +81,7 @@ fn area_at_origin(p: Point) : Int = match p {
 }
 
 fn list_info(xs: [Int]) : String = match xs {
-  whole @ [_, ..._] -> "non-empty len=#{whole.length()}"
+  whole @ [_, ..._] -> "non-empty len=#{whole |> length()}"
   []                -> "empty"
 }
 

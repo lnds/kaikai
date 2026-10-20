@@ -55,7 +55,7 @@ fn area(w: Int, h: Int) : Int = w * h
 
 fn parse(s: String) : Result[Int, String] / Stdout = {
   println(s)
-  Ok(s.length())
+  Ok(s |> length())
 }
 
 fn show(n: Int) : Unit / Stdout = println("#{n}")
@@ -76,7 +76,7 @@ function) or bind it with `let _ =`. Neither is flagged:
 ```kaikai
 fn parse(s: String) : Result[Int, String] / Stdout = {
   println(s)
-  Ok(s.length())
+  Ok(s |> length())
 }
 
 fn show(n: Int) : Unit / Stdout = println("#{n}")
@@ -99,37 +99,35 @@ Precedent: OCaml Warning 10, Rust `#[must_use]`.
 
 ### point_free_nudge
 
-A unary lambda whose body is nothing but a field or method chain over
-its parameter reads cleaner as a leading-dot section. kaikai has
-point-free sections for fields, method calls, and chains (`kai info
-syntax` §Point-free sections), so the lambda has an equivalent
-shorter form:
+A unary lambda whose body is nothing but a field chain over its
+parameter reads cleaner as a leading-dot section. kaikai has
+point-free sections for fields and field chains (`kai info syntax`
+§Point-free sections), so the lambda has an equivalent shorter form:
 
 ```kaikai
 type Person = { name: String }
 
-fn names(ps: [Person]) : [String] = ps.map((c) => c.name)
+fn names(ps: [Person]) : [String] = ps | (c) => c.name
 #                                            ^^^^^^^^^^^^^ point_free_nudge: use .name
 
 fn main() : Int = 0
 ```
 
 The nudge fires only when the section is **equivalent**: the chain is
-rooted exactly at the parameter and no method argument depends on it
-(the section supplies the receiver, the written arguments follow). A
-lambda whose body computes anything more than the access — `(c) => c.age
-* 2`, or `(x) => f(x, x)` — is left alone, because no point-free section
-expresses it. A lambda the parser already synthesised from a `.field`
+rooted exactly at the parameter. A lambda whose body computes anything
+more than the access — `(c) => c.age * 2`, or `(x) => f(x, x)` — is left
+alone, because no point-free section expresses it. A lambda the parser
+already synthesised from a `.field`
 section is never re-nudged.
 
 ### and_then_to_map_nudge
 
-`o.and_then((x) => Some(expr))` is `o.map((x) => expr)` when the function
+`o || (x) => Some(expr)` is `o | (x) => expr` when the function
 **always** wraps its result in `Some` — the bind is doing nothing a map
 would not:
 
 ```kaikai
-fn inc(o: Option[Int]) : Option[Int] = o.and_then((x) => Some(x + 1))
+fn inc(o: Option[Int]) : Option[Int] = o || (x) => Some(x + 1)
 #                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ and_then_to_map_nudge: use map
 
 fn main() : Int = 0
@@ -144,13 +142,13 @@ call is left alone:
 ```kaikai
 # not flagged: the else branch is None, so this is a real bind
 fn keep_positive(o: Option[Int]) : Option[Int] =
-  o.and_then((x) => if x > 0 { Some(x) } else { None })
+  o || (x) => if x > 0 { Some(x) } else { None }
 
 fn main() : Int = 0
 ```
 
 Both nudges recognise the combinator call whether it is still written as
-a pipe / UFCS method or has been rewritten by the typer.
+a pipe or has been rewritten by the typer.
 
 ### match_option_to_combinator
 
@@ -169,9 +167,9 @@ fn main() : Int = 0
 
 The arm shapes pick the combinator:
 
-- `Some(x) -> Some(expr)` + `None -> None` is `o.map((x) => expr)`.
-- `Some(x) -> opt` + `None -> None` is `o.and_then((x) => opt)`.
-- `Some(x) -> x` + `None -> dflt` is `o.unwrap_or(dflt)`, and only when
+- `Some(x) -> Some(expr)` + `None -> None` is `o | (x) => expr`.
+- `Some(x) -> opt` + `None -> None` is `o || (x) => opt`.
+- `Some(x) -> x` + `None -> dflt` is `o ?? dflt`, and only when
   `dflt` is **trivial** (a literal, a variable, a nullary constructor).
   A computed default is `unwrap_or_else` territory — `unwrap_or` would
   evaluate it eagerly, which the lazy `None` arm does not — so it is
