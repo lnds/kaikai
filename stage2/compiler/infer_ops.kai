@@ -90,23 +90,9 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
 
   let rl = w_synth(st, lhs)
   let res = match rhs.kind {
-    ECall(f, pa) -> {
-      let rf = synth_pipe_callee(rl.st, f, rl.ty)
-      let ra = synth_many_expecting(rf.st, pa, params_after_first(fn_param_tys(rf.st, rf.ty)))
-      let rv = st_fresh_ty(ra.st)
-      # same open-row trick `synth_call`
-      # uses — let the callee's row tail bind to a fresh row var so
-      # `xs |> each(handler)` against a row-polymorphic combinator
-      # passes type checking when `handler` carries effect labels.
-      let fr = subst_fresh_row(rv.st.sub)
-      let st_fresh = st_set_sub(rv.st, fr.subst)
-      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
-      let expected = TyFnT([rl.ty, ...ra.tys], rv.ty, expected_row)
-      let st_unif = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
-      let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, rf.ty), line, col)
-      match refine_call(st2, rf.expr, rf.ty, [rl.expr, ...ra.exprs], [rl.ty, ...ra.tys], apply_ty(st2.sub, rv.ty)) {
-        RefCall(st3, ty) -> PipeRes { st: st3, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr, ...ra.exprs]), line, col) }
-      }
+    ECall(f, pa) -> match pipe_defer(rl, f, pa, line, col) {
+      Some(inf) -> PipeRes { st: inf.st, ty: inf.ty, call: inf.expr }
+      None      -> synth_pipe_args(rl, f, pa, line, col)
     }
     _ -> {
       let rf = synth_pipe_callee(rl.st, rhs, rl.ty)
@@ -123,6 +109,43 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
     }
   }
   mk_inferred(res.st, res.ty, with_ty(res.call, res.ty))
+}
+
+
+# A bare homonym piped a receiver whose head is not known yet waits for
+# it, as a direct call does.
+fn pipe_defer(rl: Inferred, f: Expr, pa: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
+  match f.kind {
+    EName(nm) -> {
+      let candidates = bare_fn_candidates(rl.st, nm)
+      if list_length(candidates) < 2 { None }
+      else { hom_try_defer(rl.st, nm, candidates, apply_ty(rl.st.sub, rl.ty), rl.expr, pa, f, line, col) }
+    }
+    _ -> None
+  }
+
+
+# The receiver is settled against the callee's first parameter before the
+# other arguments are walked, as a direct call settles each earlier argument.
+fn synth_pipe_args(rl: Inferred, f: Expr, pa: [Expr], line: Int, col: Int) : PipeRes / Console + File + Mutable = {
+  let rf = synth_pipe_callee(rl.st, f, rl.ty)
+  let params = fn_param_tys(rf.st, rf.ty)
+  let rest_params = params_after_first(params)
+  let first = match params {
+    [p, ..._] -> Some(p)
+    []        -> None
+  }
+  let ra = synth_many_expecting(st_settle_arg(rf.st, first, rl.ty, pa, rest_params), pa, rest_params)
+  let rv = st_fresh_ty(ra.st)
+  let fr = subst_fresh_row(rv.st.sub)
+  let st_fresh = st_set_sub(rv.st, fr.subst)
+  let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+  let expected = TyFnT([rl.ty, ...ra.tys], rv.ty, expected_row)
+  let st_unif = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
+  let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, rf.ty), line, col)
+  match refine_call(st2, rf.expr, rf.ty, [rl.expr, ...ra.exprs], [rl.ty, ...ra.tys], apply_ty(st2.sub, rv.ty)) {
+    RefCall(st3, ty) -> PipeRes { st: st3, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr, ...ra.exprs]), line, col) }
+  }
 }
 
 # head-owner cache.
