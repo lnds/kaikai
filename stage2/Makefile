@@ -13929,6 +13929,10 @@ test-native-cache-edits-native: $(TARGET) bin-kai
 test-own-blocks-native: $(TARGET) bin-kai
 	@../tests/own_blocks.sh
 
+# `pub(pkg)` and intra-package cycles on the explicit native backend: run, build, test.
+test-native-pkg-native: $(TARGET) bin-kai
+	@../tests/native_pkg.sh
+
 # Modules of one package may import each other; a cycle across packages or in
 # a tree with no kai.toml is still an error.
 test-intra-pkg-cycles: $(TARGET) bin-kai
