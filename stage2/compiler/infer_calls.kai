@@ -1,4 +1,4 @@
-#[doc("Typing of calls: bare, UFCS, operation, resume and segment calls, and the arguments each call walks against its declared parameters.")]
+#[doc("Typing of calls: bare, method, operation, resume and segment calls, and the arguments each call walks against its declared parameters.")]
 
 import compiler.diag
 import compiler.ast
@@ -20,6 +20,7 @@ import compiler.infer_tparam_escape
 import compiler.infer_forms
 import compiler.infer_coalesce
 import compiler.infer_stage_hint
+import compiler.infer_head_dispatch
 import compiler.resolve_names
 import compiler.handler_alias
 import compiler.enc_unit
@@ -393,11 +394,11 @@ pub fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: I
 fn synth_call_op(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_op_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_ufcs(st, callee, args_, line, col)
+    None      -> synth_call_method(st, callee, args_, line, col)
   }
 
-fn synth_call_ufcs(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
-  match try_ufcs_call(st, callee, args_, line, col) {
+fn synth_call_method(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match try_method_call(st, callee, args_, line, col) {
     Some(inf) -> inf
     None      -> synth_call_ctor(st, callee, args_, line, col)
   }
@@ -646,51 +647,20 @@ fn try_op_on_alias(st: InferState, l: LocalId, taggable: Bool, op_name: String, 
 }
 
 
-# UFCS dispatch for `receiver.method(args)` callees.
-#
-# Fires from `synth_call` when the callee shape is `EField(obj, ident)`
-# and `try_op_call` already declined (so `obj` is not an effect-name
-# reference). Walks `obj` once to learn its type, then applies the
-# field-vs-function precedence rule:
-#
-#   1. If `obj` is a record value AND `ident` names a field of that
-#      record, returns None — let `synth_call`'s generic path run
-#      `w_synth(st, callee)` (which dispatches `synth_field`) so field
-#      access wins on ties.
-#   2. Else if `ident` names a function whose first parameter unifies
-#      with `obj`'s type, lowers the call to `ident(obj, ...args)` on that
-#      function's id and finishes typing it with the same expected-row
-#      pattern `synth_call`/`synth_pipe_dispatch` use, so call-site
-#      row-tracking and unify diagnostics stay identical to the prefix
-#      form.
-#   3. Else, emits a Q4-style diagnostic naming the receiver type and
-#      hinting at scope candidates whose first arg matches, then
-#      stamps `TyAny` to keep cascade graceful.
-#
-# Returning Some always means "we handled this call site". Returning
-# None always means "let the generic `w_synth(st, callee)` path run" —
-# used for the field-wins precedence step.
-fn try_ufcs_call(st: InferState, callee: Expr, args_: [Expr],
-                  line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
-
-
+# `recv.f(args)` calls the function-typed field `f`; a resolved receiver without that field has no such method.
+fn try_method_call(st: InferState, callee: Expr, args_: [Expr],
+                   line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
   match callee.kind {
     EField(obj, ident) -> {
       let r = w_synth(st, obj)
       let obj_ty = apply_ty(r.st.sub, r.ty)
-      if record_has_field(r.st, obj_ty, ident) { None }
+      if record_has_field(r.st, obj_ty, ident) or ty_unsettled(obj_ty) { None }
       else {
-        # `c := v` and `@c` for `c : Ref[T]` desugar in
-        # the parser to `c.set(v)` / `c.get()`. `Ref[T]` is the
-        # return type of `Mutable.ref_make[T]`; `get`/`set` aren't
-        # inherent methods, but `Mutable` carries `ref_get`/`ref_set`
-        # ops with matching signatures. Bridge here, mirroring the
-        # `a[i] := v` → `Mutable.array_set(a, i, v)` precedent.
-        # Effect-row injection rides for free: `synth_op_call_with_scheme`
-        # already labels the row with `Mutable` for op calls.
+        # `c := v` and `@c` for `c : Ref[T]` lower to `c.set(v)` / `c.get()`;
+        # `Mutable` carries the matching `ref_set` / `ref_get` ops.
         match try_ref_sugar_op(st, obj, obj_ty, ident, args_, line, col) {
           Some(inf) -> Some(inf)
-          None -> Some(synth_ufcs_dispatch(r.st, ident, r.expr, obj_ty, args_, line, col))
+          None      -> Some(method_call_error(r.st, ident, r.expr, args_, line, col))
         }
       }
     }
@@ -702,8 +672,7 @@ fn try_ufcs_call(st: InferState, callee: Expr, args_: [Expr],
 # rewrite `c.get()` / `c.set(v)` to `Mutable.ref_get(c)` /
 # `Mutable.ref_set(c, v)` when `c : Ref[T]`. Returns None when the
 # receiver is not a `Ref` or the ident is not `get` / `set`, so the
-# caller falls back to the regular UFCS path (preserving the existing
-# "method not found" diagnostic for unrelated names).
+# caller reports the missing method.
 fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String, args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
   match obj_ty {
     TyCon(tcs, _) -> if core_ty_is(tcs, CtRef) { ref_sugar_named(st, obj, ref_sugar_op_name(ident), args_, line, col) } else { None }
@@ -727,62 +696,6 @@ fn ref_sugar_named(st: InferState, obj: Expr, op_opt: Option[String], args_: [Ex
       }
     }
   }
-
-
-# Lowers `obj.ident(args)` to `ident(obj, args)`. Picks among the
-# functions spelled `ident`; if none is found or its first param doesn't
-# unify with `obj_ty`, emits the Q4 method-not-found diagnostic and
-# returns a TyAny stamp. Mirrors `synth_pipe_dispatch`'s open-row pattern
-# so the dispatched call's effect labels and unify diagnostics match
-# the prefix-form call (`ident(obj, args)`).
-#
-# `obj_expr` has already been walked by `try_ufcs_call`; we walk
-# `args_` ourselves to avoid double-walking `obj` (the args may
-# carry their own effect labels and CallSite entries which must
-# stamp the final InferState).
-fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr, obj_ty: Ty, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
-  match ufcs_target(st, ident, obj_ty, line, col) {
-    UfNone          -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
-    UfTie(st_t, ss) -> {
-      let st_e = report_tie(st_t, ident, ss, true, line, col)
-      mk_inferred(st_e, TyAny, with_ty(mk_expr(ECall(field_root(obj_expr, ident, line, col, TyAny), args_), line, col), TyAny))
-    }
-    UfOne(target)   -> ufcs_one(target, ident, obj_expr, obj_ty, args_, line, col)
-  }
-
-fn ufcs_one(target: UfcsTarget, ident: String, obj_expr: Expr, obj_ty: Ty, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
-  match target.inst_ty {
-    TyFnT(params, _, _) -> match params {
-      [first, ...rest_params] -> match unify_env(target.st.env, first, obj_ty, target.st.sub) {
-        Some(_) -> ufcs_apply(target, rest_params, obj_expr, obj_ty, args_, line, col)
-        None    -> ufcs_method_not_found(target.st, ident, obj_expr, obj_ty, args_, line, col)
-      }
-      [] -> ufcs_method_not_found(target.st, ident, obj_expr, obj_ty, args_, line, col)
-    }
-    _ -> ufcs_method_not_found(target.st, ident, obj_expr, obj_ty, args_, line, col)
-  }
-
-# The declared param types after the receiver are threaded so a point-free section
-# argument gets its receiver pinned from the combinator's element type up front. The
-# expected row is open, as in `synth_call`, so the callee's row variables do not
-# force-bind the call site's row.
-fn ufcs_apply(target: UfcsTarget, arg_param_tys: [Ty], obj_expr: Expr, obj_ty: Ty, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
-  let inst_ty = target.inst_ty
-  let ra = synth_many_threaded(target.st, args_, arg_param_tys)
-  let all_arg_tys = [obj_ty, ...ra.tys]
-  let all_arg_exprs = [obj_expr, ...ra.exprs]
-  let rv = st_fresh_ty(ra.st)
-  let fr = subst_fresh_row(rv.st.sub)
-  let st_fresh = st_set_sub(rv.st, fr.subst)
-  let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
-  let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-  let st_unif = stage_hinted_call(st_fresh, target.callee, inst_ty, all_arg_tys, all_arg_exprs, expected, line, col)
-  let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, inst_ty), line, col)
-  let callee_node = with_ty(target.callee, inst_ty)
-  match refine_call(st2, target.callee, inst_ty, all_arg_exprs, all_arg_tys, apply_ty(st2.sub, rv.ty)) {
-    RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty))
-  }
-}
 
 
 # Type `name.op(args)` where `name` is a capability value. Dispatch the op to the

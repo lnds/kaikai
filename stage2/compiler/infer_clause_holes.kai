@@ -668,13 +668,6 @@ pub fn first_param_head_is_concrete(t: Ty) : Bool = match t {
 }
 
 
-# The function module `home` declares as `name`, when the env holds it.
-fn env_home_fn(env: TyEnv, home: String, name: String) : Option[SymId] = match st_module(env.tab, home) {
-  None    -> None
-  Some(h) -> env_module_fn(env, h, name)
-}
-
-
 # The function the module `m` declares as `name`, when the env holds it.
 #[doc("Typer-internal helper `env_module_fn` shared across the infer modules.")]
 pub fn env_module_fn(env: TyEnv, m: SymId, name: String) : Option[SymId] = match st_lookup(env.tab, NCFn, name, m) {
@@ -686,75 +679,29 @@ pub fn env_module_fn(env: TyEnv, m: SymId, name: String) : Option[SymId] = match
 }
 
 
-# What a method name no visible module answers and no binder in scope
-# spells reads: the root file's function, else the builtin.
-#[doc("Typer-internal helper `ufcs_bare_sym` shared across the infer modules.")]
-pub fn ufcs_bare_sym(env: TyEnv, ident: String) : Option[SymId] =
-  match env_home_fn(env, tsh_target(env.ty_homes), ident) {
-    Some(s) -> Some(s)
-    None    -> match env_sym(env, builtin_sym(ident)) {
-      Some(_) -> Some(builtin_sym(ident))
-      None    -> None
-    }
-  }
-
-
-# The innermost binder in scope the source wrote as `name`. Binders are
-# bound after every declaration, so they are the prefix of the entries.
-#[doc("Typer-internal helper `env_local_written` shared across the infer modules.")]
-pub fn env_local_written(es: [TyEntry], name: String) : Option[Binder] = match es {
-  [] -> None
-  [e, ...rest] -> match e.key {
-    KLocal(b) -> if written_text(b.name) == name { Some(b) } else { env_local_written(rest, name) }
-    _         -> None
-  }
-}
-
-
-# The callee of a UFCS call, instantiated, with the state past it.
-#[doc("Typer-internal type `UfcsTarget` shared across the infer modules.")]
-pub type UfcsTarget = { st: InferState, inst_ty: Ty, callee: Expr }
-
-
-# What `obj.ident(…)` reaches: a callee, several functions the receiver's
-# type and the scope cannot tell apart, or nothing.
-#[doc("Typer-internal type `UfcsFound` shared across the infer modules.")]
-pub type UfcsFound = UfOne(UfcsTarget) | UfTie(InferState, [SymId]) | UfNone
-
-
-#[doc("Typer-internal helper `ufcs_sym_target` shared across the infer modules.")]
-pub fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
-                   line: Int, col: Int) : UfcsTarget {
-  let st_inst = if fresh == [] and unit_fresh == [] { st }
-                else { st_push_inst(st, CS(s, line, col, fresh, unit_fresh, None)) }
-  UfcsTarget { st: st_inst, inst_ty: inst_ty, callee: mk_sym(s, line, col) }
-}
-
-
-# Q4 diagnostic — the receiver's type is statically known (or `TyAny`
-# from a cascade), no field of that type matches, and no scope
-# function `ident(receiver_ty, ...)` was found. Cascade-friendly: we
-# stamp `TyAny` and bump the error counter so downstream passes don't
-# crash on a missing call lowering.
-#[doc("Typer-internal helper `ufcs_method_not_found` shared across the infer modules.")]
-pub fn ufcs_method_not_found(st: InferState, ident: String, obj_expr: Expr,
-                          obj_ty: Ty, args_: [Expr],
-                          line: Int, col: Int) : Inferred / Console + File {
-
-
-  let head_msg = match inf_ty_head_name(st.env.tab, obj_ty) {
-    Some(name) -> concat_all(["method `", ident, "` not found for type `", name, "`"])
-    None       -> concat_all(["method `", ident, "` not found (receiver type unresolved)"])
-  }
-  let perr = mk_diag(SevError, st.file, line, col, head_msg, [])
+# A call on `recv.f` where the resolved receiver has no field `f`: the fix-it is the pipe form.
+#[doc("Reports `recv.f(args)` on a receiver without a field `f`, with the `|>` rewrite as the fix.")]
+pub fn method_call_error(st: InferState, ident: String, obj_expr: Expr, args_: [Expr],
+                         line: Int, col: Int) : Inferred / Console + File {
+  let shown = string_join(map(args_, (a) => operand_hint(st, a)), ", ")
+  let fix = if is_section_binder(obj_expr) { "#{ident}(., #{shown})" }
+            else { "#{operand_hint(st, obj_expr)} |> #{ident}(#{shown})" }
+  let perr = mk_diag(SevError, st.file, line, col, "kaikai has no methods: write `#{fix}`", [])
   render_diag(perr)
-  diag_help(concat_all(["if `", ident, "` is a free function, ensure its first parameter ",
-                        "type matches the receiver; otherwise check the spelling."]))
   let bare_callee = with_ty(mk_expr(EField(obj_expr, ident), line, col), TyAny)
   let root = with_ty(mk_expr(ECall(bare_callee, args_), line, col), TyAny)
   mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root)
 }
 
+fn operand_hint(st: InferState, e: Expr) : String = match e.kind {
+  EField(base, f) -> "#{operand_hint(st, base)}.#{f}"
+  _               -> callee_display_name(st, e) ?? "..."
+}
+
+fn is_section_binder(e: Expr) : Bool = match e.kind {
+  ELocal(l) -> local_eq(l, point_free_binder().id)
+  _         -> false
+}
 
 # `State`/`Reader` are readable cells: a `var` desugars to `with State as name`
 # and reads naked. Their dispatch keeps the legacy by-id path; a user effect's
@@ -872,20 +819,6 @@ pub fn field_root(obj_expr: Expr, fnm: String, line: Int, col: Int, ty: Ty) : Ex
 # sentinel that drains to the "annotation needed" path.
 #[doc("Typer-internal helper `ty_var_id` shared across the infer modules.")]
 pub fn ty_var_id(t: Ty) : Int = match t { TyVarT(n) -> n  _ -> -1 }
-
-
-# Whether a UFCS call could reach something under `ident`.
-#[doc("Typer-internal helper `ufcs_reaches` shared across the infer modules.")]
-pub fn ufcs_reaches(st: InferState, ident: String) : Bool = match st_visible_candidates(st, ident) {
-  [_, ..._] -> true
-  []        -> match env_local_written(st.env.entries, ident) {
-    Some(_) -> true
-    None    -> match ufcs_bare_sym(st.env, ident) {
-      Some(_) -> true
-      None    -> false
-    }
-  }
-}
 
 
 # `Map` and `HashMap` read through the `get` of the module that declares
