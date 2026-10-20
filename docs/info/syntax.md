@@ -546,6 +546,11 @@ A `|`, `||`, `|?` or `|!` stage owns every `.` on its right side: a bare
 `.`, a `.` followed by a postfix chain (`.name`, `.a.b`, `.f(v)`), and
 a `.` inside a `#{...}` body. They all stand for the same element.
 
+A bare lambda stage ends at the next pipe, but a lambda that starts a
+parenthesised group or an argument has a body that runs across the pipes
+to the closing `)` or `,`: `xs | (o => o |> unwrap_or(0))` (see
+`kai info pipes`).
+
 ```kaikai
 fn is_leap(y: Int) : Bool = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 fn add(a: Int, b: Int) : Int = a + b

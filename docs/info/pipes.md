@@ -190,6 +190,22 @@ outer lambda:
 # [[0, 1, 2], [10, 11, 12], [20, 21, 22]]
 ```
 
+### Lambda bodies inside parentheses and arguments
+
+The rule above is for a BARE lambda stage. A lambda inside parentheses,
+or passed as an argument, has a body that extends to the closing `)` or
+`,`, across `|>` and the other pipes:
+
+```kaikai-snippet
+xs | (o => o |> unwrap_or(0))                    # body: o |> unwrap_or(0)
+foldl(xs, Ok([]), (done, x) => done |> and_then(ys => inserted(x, ys)))
+[1..10] |? gt1 | (n => n * 2) |> sum             # `)` closes the lambda first
+```
+
+So `(h => h |> twice)` is the lambda `h => (h |> twice)`, never
+`twice(h => h)`. A lambda that does not start an argument or a group
+still ends at the next pipe.
+
 ## NOT IN KAIKAI
 
 - `|>` from F# meaning the same thing — close but in F# it is
