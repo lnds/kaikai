@@ -1,0 +1,251 @@
+# Function signatures, parameter lists, thunk forwards and effect structs.
+
+import compiler.ast
+import compiler.core_types
+import compiler.effect_instance
+import compiler.emit_c_ctx
+import compiler.emit_c_rawtypes
+import compiler.emit_shared
+import compiler.fn_index
+import compiler.fnreg
+import compiler.local_names
+import compiler.spec_names
+import compiler.symtab
+import compiler.util
+
+# m7a #6a: emit the `Ev<Eff>` struct per `effect Eff { ops }` decl,
+# per docs/effects-impl.md §*Surface-to-runtime mapping*. Each op
+# becomes a plain function-pointer field with `*Self` as the implicit
+# first argument, the surface op args next, and a trailing `KaiCont
+# *k` (the reified continuation). m7a #6a only emits the type; m7a
+# #6b populates an EvE at handle entry, m7a #6c calls through it.
+fn emit_op_fn_ptr_args(params: [Param]) : String {
+  match params {
+    [] -> ""
+    _  -> cat2(", ", join_with(map(params, (pm) => "KaiValue *"), ", "))
+  }
+}
+
+# The C struct/identity name for an effect's evidence. Module-
+# qualified like a type's `c_sym`, so two same-name effects from
+# different modules (two same-named user effects) emit
+# distinct `Ev` structs and register/look up under distinct names.
+# The single source of truth for the name — struct def, the perform
+# cast + runtime lookup, the clause fn param, and the default install
+# all route through this so they stay in lockstep.
+pub fn ev_name(name: String, mo: Option[String]) : String =
+  string_concat("Ev", c_sym(name, mo))
+
+fn emit_op_fn_ptr(ev_n: String, op: EffectOp) : String {
+  match op {
+    EffOp(op_name, _, params, _, _, _) ->
+      concat_all([
+        "    KaiValue *(*", op_name, ")(", ev_n, " *self",
+        emit_op_fn_ptr_args(params),
+        ", KaiCont *k);\n"
+      ])
+  }
+}
+
+# The runtime dispatches a user `Cancel` clause itself, so the builtin
+# Cancel's evidence is the runtime's own struct: the clause is then
+# called through its exact function type.
+fn emit_effect_struct(d: Decl, tab: SymTab) : String {
+  match d {
+    DEffect(_, esym, _tparams, ops, _, _, _, mo) -> {
+      let evn = ev_name(rt_name(tab, esym), mo)
+      let fields = concat_all(map(ops, (op) => emit_op_fn_ptr(evn, op)))
+      if effect_is(esym, CeCancel) { concat_all(["typedef KaiRtEvCancel ", evn, ";\n\n"]) }
+      else { concat_all([
+        "typedef struct ", evn, " ", evn, ";\n",
+        "struct ", evn, " {\n",
+        "    KaiHandlerId handler_id;\n",
+        "    void *env;\n",
+        # m7b #11: every Ev struct carries a `state` slot for parameter-
+        # ised handlers (`with State[T](init)` / `with Writer[W]([])`).
+        # Stateless handlers leave it NULL — cost is one pointer per
+        # handler instance; benefit is a uniform clause-body shape.
+        "    KaiValue *state;\n",
+        fields,
+        "};\n\n"
+      ]) }
+    }
+    _ -> ""
+  }
+}
+
+pub(pkg) fn effect_struct_decls(decls: [Decl], tab: SymTab) : String =
+  concat_all(map(decls, (d) => emit_effect_struct(d, tab)))
+
+# m7c-a — LLVM equivalent of `emit_effect_struct`. Emits an
+# `%EvX = type { i64, i8*, %KaiValue*, fn-ptrs... }` where the
+# leading three fields mirror the C layout (handler_id, env,
+# state slot) and each op contributes one function pointer.
+# Doc C §m7c assumes the LLVM backend uses the same on-the-heap
+# layout as the C backend so the runtime helpers can see both
+# without translation.
+
+# m7c-a — LLVM equivalent of `emit_effect_struct`. Emits an
+# `%EvX = type { i64, i8*, %KaiValue*, fn-ptrs... }` where the
+# leading three fields mirror the C layout (handler_id, env,
+# state slot) and each op contributes one function pointer.
+# Doc C §m7c assumes the LLVM backend uses the same on-the-heap
+# layout as the C backend so the runtime helpers can see both
+# without translation.
+fn emit_param_list(params: [Param], ns: LocalNames) : String {
+  match params {
+    [] -> "void"
+    _ -> join_with(map(params, (pm) => cat2("KaiValue *", c_local(ln_emitted(ns, pm.binder.id)))), ", ")
+  }
+}
+
+# The hidden evidence-frame param. A fn whose row demands a
+# transported user effect takes `KaiEvidence **__evf` as its FIRST param
+# (the Koka evidence vector); the call site fills each slot. Empty when the
+# fn carries no transported effect (the legacy by-name walk serves it).
+fn evf_param_decl(slots: [InstKey]) : String = match slots {
+  [] -> ""
+  _  -> "KaiEvidence **__evf"
+}
+
+# Prepend the frame param to a C param list, joining with the user params.
+fn evf_join_params(frame_decl: String, rest: String) : String =
+  if frame_decl == "" { rest }
+  else if rest == "void" { frame_decl }
+  else { concat_all([frame_decl, ", ", rest]) }
+
+pub(pkg) fn emit_fn_signature_evf(name: String, params: [Param], slots: [InstKey], ns: LocalNames) : String =
+  cat5("static KaiValue *", c_user_sym(name), "(", evf_join_params(evf_param_decl(slots), emit_param_list(params, ns)), ")")
+
+# Phase 3 unboxing — raw signature for a UFn. Return type is the
+# raw C scalar matching `ret_ty`; param list mints `kair_<name>`
+# locals typed to each `param_ty`.
+
+# Same as above but with the evidence-frame param prepended (the
+# pointer is orthogonal to arg/return unboxing — it rides as the first arg).
+pub(pkg) fn emit_fn_signature_unboxed_evf(name: String, params: [Param], sig: UFnSig, slots: [InstKey], ns: LocalNames) : String =
+  match sig {
+    US(pts, rt, mask) -> concat_all([
+      "static ", ufn_ret_c_type(rt),
+      " ", c_user_sym(name), "(", evf_join_params(evf_param_decl(slots), emit_param_list_masked(params, pts, mask, [], ns)), ")"
+    ])
+  }
+
+# Return-type C string for a (possibly mixed) UFn: raw scalar when the
+# return ty is unboxable, else `KaiValue *` (boxed return — e.g.
+# `balance(...) : RBTree`). Mixed-param lane (issue #440 follow-up).
+pub(pkg) fn ufn_ret_c_type(rt: Ty) : String =
+  if ty_is_unboxable_t(rt) { raw_c_type(Some(rt)) } else { "KaiValue *" }
+
+# True iff the UFn's return lowers to a raw scalar (vs a boxed
+# `KaiValue *`). Drives the body's `return` form and the call-site
+# box_wrap decision.
+pub(pkg) fn ufn_ret_is_raw(sig: UFnSig) : Bool = match sig { US(_, rt, _) -> ty_is_unboxable_t(rt) }
+
+# Per-param C parameter list honouring the raw mask: raw slots emit
+# `<scalar> kair_<p>`, boxed slots emit `KaiValue *kai_<p>`. The two
+# name prefixes (`kair_` vs `kai_`) match what the body's EVar reads
+# resolve to (unbox pass marks only raw params MUnboxed).
+fn emit_param_list_masked(params: [Param], tys: [Ty], mask: [Bool], acc: [String], ns: LocalNames) : String {
+  match params {
+    [] -> match acc { [] -> "void" _ -> join_with(list_reverse(acc), ", ") }
+    [p, ...rest] -> {
+      let pty = match tys {
+        [t, ..._] -> t
+        [] -> param_ty(p)
+      }
+      let trest = match tys {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let entry =
+        if is_raw { concat_all([raw_c_type(Some(pty)), " ", c_raw_local(ln_emitted(ns, p.binder.id))]) }
+        else { concat_all(["KaiValue *", c_local(ln_emitted(ns, p.binder.id))]) }
+      emit_param_list_masked(rest, trest, mrest, [entry, ...acc], ns)
+    }
+  }
+}
+
+# `KAI_CONST ` when the confirmation table proved this fn memory-clean,
+# else empty. The prefix must be IDENTICAL on the forward decl and the
+# definition (both go through this helper on the same fn), so `cc`
+# never sees a mismatched declaration.
+pub(pkg) fn purity_const_prefix(fid: FnId, const_fns: FnSet) : String =
+  if fn_set_has(const_fns, fid) { "KAI_CONST " } else { "" }
+
+fn emit_thunk_forward(d: Decl, tab: SymTab, specs: SpecNames) : String {
+  match d {
+    DFn(_, fid, _, _, _, _, _, _, _, mo) ->
+      cat3("static KaiValue *", c_user_thunk_sym(c_sym(emit_fn_text(tab, specs, fid), mo)), "(KaiValue *, KaiValue **, int);\n")
+    _ -> ""
+  }
+}
+
+pub(pkg) fn emit_param_args(params: [Param], ns: LocalNames) : String =
+  join_with(map(params, (pm) => c_local(ln_emitted(ns, pm.binder.id))), ", ")
+
+pub(pkg) fn emit_param_reads(params: [Param], start: Int, ns: LocalNames) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] ->
+      cat2(
+        concat_all(["    KaiValue *", c_local(ln_emitted(ns, p.binder.id)), " = args[", int_to_string(start), "];\n"]),
+        emit_param_reads(rest, start + 1, ns))
+  }
+}
+
+# KIR Lane 1: true when a fn signature mentions `TyHandle` in any param
+# or the return. Such a fn is native-backend internal and gets a panic
+# thunk (a handle cannot ride the boxed thunk ABI).
+pub(pkg) fn sig_has_handle(params: [Param], opt_ret: Option[TypeExpr]) : Bool =
+  params_have_handle(params) or match opt_ret {
+    Some(rty) -> ty_is_handle(resolve_ty(rty))
+    None      -> false
+  }
+
+fn params_have_handle(params: [Param]) : Bool = match params {
+  [] -> false
+  [p, ...rest] -> if ty_is_handle(param_ty(p)) { true } else { params_have_handle(rest) }
+}
+
+fn ty_is_handle(t: Ty) : Bool = match t {
+  TyHandle -> true
+  _        -> false
+}
+
+# Mixed-param thunk arg list: `kair_<p>` for raw slots, `kai_<p>` for
+# boxed slots, in declaration order.
+pub(pkg) fn emit_thunk_arg_list_masked(params: [Param], mask: [Bool], i: Int, ns: LocalNames) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let is_raw = match mask {
+        [m, ..._] -> m
+        [] -> true
+      }
+      let mrest = match mask {
+        [_, ...r] -> r
+        [] -> []
+      }
+      let head = if is_raw { concat_all([c_raw_local(ln_emitted(ns, p.binder.id))]) } else { c_local(ln_emitted(ns, p.binder.id)) }
+      match rest {
+        [] -> head
+        _  -> concat_all([head, ", ", emit_thunk_arg_list_masked(rest, mrest, i + 1, ns)])
+      }
+    }
+  }
+}
+
+pub(pkg) fn rd_decl_ret_is_raw(fid: FnId, fx: FnIndex) : Bool =
+  match fnx_ufn_sig_first(fx, fid) { Some(us) -> ufn_ret_is_raw(us) None -> false }
+
+pub(pkg) fn thunk_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames) : String =
+  concat_all(map(decls, (d) => emit_thunk_forward(d, tab, specs)))

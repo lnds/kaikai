@@ -1,0 +1,332 @@
+# Pattern test and binder emission that does not recurse into expressions.
+
+import compiler.ast
+import compiler.emit_c_ctx
+import compiler.emit_c_rawtypes
+import compiler.emit_shared
+import compiler.kinds
+import compiler.local_names
+import compiler.real_lit
+import compiler.unbox
+import compiler.util
+
+pub(pkg) fn list_nth(xs: [Pattern], i: Int) : Pattern {
+  match xs {
+    [] -> mk_pat(PWild, 0, 0)
+    [h, ...rest] -> if i == 0 { h } else { list_nth(rest, i - 1) }
+  }
+}
+
+# Issue #688 — emit the variant-name dispatch as either
+# `scr->variant_tag == N` (when the constructor is registered
+# under the atom-style global convention, docs/variant-tags.md) or
+# `strcmp(scr->as.var.variant_name, "Name") == 0` (synthetic fallback).
+# Used by emit_pat_test_variant, emit_pat_test_variant_record, and
+# emit_bang to keep the three sites in sync.
+
+# Issue #688 — emit the variant-name dispatch as either
+# `scr->variant_tag == N` (when the constructor is registered
+# under the atom-style global convention, docs/variant-tags.md) or
+# `strcmp(scr->as.var.variant_name, "Name") == 0` (synthetic fallback).
+# Used by emit_pat_test_variant, emit_pat_test_variant_record, and
+# emit_bang to keep the three sites in sync.
+# `known` is None only for a name the table never registered, which is
+# where the strcmp fallback belongs.
+pub(pkg) fn emit_tag_test_at(scr: String, name: String, tag: Int, known: Option[Int]) : String =
+  match known {
+    Some(_) -> concat_all([
+      scr, "->tag == KAI_VARIANT && ",
+      scr, "->variant_tag == ", int_to_string(tag)
+    ])
+    None -> concat_all([
+      scr, "->tag == KAI_VARIANT && strcmp(kai_variant_name_of(",
+      scr, "->variant_tag), \"", name, "\") == 0"
+    ])
+  }
+
+# The tag test of the constructor a pattern names.
+pub(pkg) fn emit_ctor_tag_test(scr: String, r: DeclRef, cx: EmitCtx) : String = match pat_ctor_row(cx, r) {
+  Some(EV(_, _, tag, c)) -> emit_tag_test_at(scr, ctor_cell_name(cx.tab, c), tag, Some(tag))
+  None                         -> emit_tag_test_at(scr, decl_ref_text(cx.tab, r), 0, None)
+}
+
+# A boxed view of slot `i` for a pattern test: the alias for a pointer slot,
+# a `kai_int` immediate for an Int slot, and for a Real slot a fresh box the
+# test must release (a Real literal compares the raw slot instead).
+pub(pkg) fn slot_read_for_test(scr: String, i: Int, tys: [Int]) : String {
+  let k = kind_at(tys, i)
+  if k == 1 {
+    concat_all(["kai_int(", "kai_var_slots(", scr, ")[", int_to_string(i), "].i64)"])
+  } else if k == 2 {
+    concat_all(["kai_real(", "kai_var_slots(", scr, ")[", int_to_string(i), "].r)"])
+  } else {
+    concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].ptr"])
+  }
+}
+
+# Enum-slot pattern test (slot kind == ENUM): the slot stores the
+# immediate variant_tag of an all-nullary sum value. A ctor sub-pattern
+# (`Red`) tests `slots[i].i64 == <tag>` directly — one integer compare,
+# no pointer deref. PWild / PBind bind no constraint. A PLit / nested
+# pattern over an enum slot is impossible (the type is nullary-only).
+pub(pkg) fn emit_enum_slot_test(scr: String, i: Int, sp: Pattern, cx: EmitCtx) : String =
+  match sp.pkind {
+    PVariant(r, _) ->
+      concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].i64 == ",
+                  int_to_string(pat_ctor_tag(cx, r))])
+    PWild -> "1"
+    PBind(_) -> "1"
+    PAs(_, sub) -> emit_enum_slot_test(scr, i, sub, cx)
+    _ -> "1"
+  }
+
+# The C expression for the pointer sub-cell at slot `i` off `scr`. When
+# `scr` is the match scrutinee (`root`) and slot i has been hoisted to a
+# local (cx.hoisted), spell the local `_hs<i>` — sharing the dependent
+# load across the separate `if`-arms. Otherwise the inline slot deref.
+pub(pkg) fn sub_scr_expr(scr: String, root: Bool, i: Int, cx: EmitCtx) : String =
+  if root and hoist_slot_member(cx.hoisted, i) {
+    concat_all(["_hs", int_to_string(i)])
+  } else {
+    concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].ptr"])
+  }
+
+pub(pkg) fn pat_is_real_lit(p: Pattern) : Bool = match p.pkind {
+  PLit(e) -> match e.kind { EReal(_, _) -> true  _ -> false }
+  _       -> false
+}
+
+# A Real slot holds the raw double: compare it in place, with no box on
+# either side.
+pub(pkg) fn emit_real_slot_lit_test(scr: String, i: Int, p: Pattern) : String = match p.pkind {
+  PLit(e) -> match e.kind {
+    EReal(RealLit(r), _) -> concat_all(["(kai_var_slots(", scr, ")[", int_to_string(i), "].r == ", real_exact_text(r), ")"])
+    _           -> "0"
+  }
+  _       -> "0"
+}
+
+# `is_alias` = the scrutinee shares storage with its producer (variant args,
+# cons head/tail). PBind/PAs emit `kai_incref(scr)` so the binding has its
+# own owned reference. When false, scr is already owned (top-level _scr /
+# _letv from a transferred RHS, or `kai_op_field` which already increfs its
+# return) and the binding takes the ref directly. The producer-side incref
+# is the prerequisite for runtime-flip exit drops: a multi-use param
+# decref'd at exit must not free a value still pointed at by the original
+# scrutinee's variant slot — landed in the m5.x runtime flip
+# (atomic A+B+C+D, 2026-04-28); see `git log` if archaeology is needed.
+pub(pkg) fn emit_pat_binds(src: String, pat: Pattern, scr: String, root: Bool, is_alias: Bool,
+                  cx: EmitCtx) : String {
+  match pat.pkind {
+    PWild ->
+      # #293 Phase 2.3/2.4: when scr is an owned (non-alias) ref the
+      # value would otherwise leak. Drop it. For alias paths the
+      # parent's decref reclaims it.
+      if is_alias { "" }
+      else { concat_all(["kai_decref(", scr, "); "]) }
+    PLit(_) -> ""
+    PRange(_, _) -> ""
+    PBind(b) -> emit_binder_bind(b, scr, is_alias, cx.locals)
+    PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, cx)
+    # Issue #440 Phase 2 — the variant bind helper reads each slot with
+    # the kind the constructor's row gives it.
+    PVariant(r, subs) -> {
+      let tys = match pat_ctor_kinds(cx, r, list_length(subs)) {
+        Some(ts) -> ts
+        None     -> []
+      }
+      emit_pat_binds_variant(src, subs, tys, scr, root, 0, cx)
+    }
+    PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, cx)
+    PRecord(fields) -> emit_pat_binds_record(src, fields, scr, cx)
+    PHole(_) -> ""
+    # m7d §14: bind the as-name to the whole scrutinee, then descend
+    # into the inner pattern's bindings on the same scrutinee. The
+    # bound name follows the outer is_alias; the sub-pattern always
+    # treats scr as alias because the as-bound name is now sharing
+    # storage with the sub-bindings even when scr was originally owned.
+    PAs(b, sub) -> cat2(emit_binder_bind(b, scr, is_alias, cx.locals), emit_pat_binds(src, sub, scr, root, true, cx))
+    # issue #187 phase 3: defensive arm; PNarrow is rewritten to
+    # PAs+PVariant before codegen. If reached, bind the name like
+    # PBind so the body sees the scrutinee under its narrow name.
+    PNarrow(b, _) -> emit_binder_bind(b, scr, is_alias, cx.locals)
+    PSurface(_) -> panic("emit_pat_binds: surface pattern not lowered")
+  }
+}
+
+# The C local of a binder, bound to `scr`: with its own reference when
+# `scr` shares storage with its producer.
+fn emit_binder_bind(b: Binder, scr: String, is_alias: Bool, ns: LocalNames) : String =
+  if is_alias { concat_all(["KaiValue *", c_local(ln_emitted(ns, b.id)), " = kai_incref(", scr, "); "]) }
+  else { concat_all(["KaiValue *", c_local(ln_emitted(ns, b.id)), " = ", scr, "; "]) }
+
+fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[Binder],
+                       cur: String, i: Int, cx: EmitCtx) : String {
+  match pats {
+    [] -> match opt_rest {
+      Some(b) -> emit_binder_bind(b, cur, true, cx.locals)
+      None -> ""
+    }
+    [p, ...rest] -> {
+      let head = cat2(cur, "->as.cons.head")
+      let tail = cat2(cur, "->as.cons.tail")
+      # cons.head / cons.tail are aliases of cur's storage.
+      cat2(emit_pat_binds(src, p, head, false, true, cx),
+           emit_pat_binds_list(src, rest, opt_rest, tail, i + 1, cx))
+    }
+  }
+}
+
+fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String, root: Bool, i: Int,
+                          cx: EmitCtx) : String {
+  match subs {
+    [] -> ""
+    [sp, ...rest] -> {
+      # Issue #440 Phase 2 — read each slot in the shape its kind
+      # dictates. Pointer slots stay aliased to the cell's storage
+      # (no RC bump on the read; the binding decides whether to
+      # incref). Primitive slots (Int / Real) emit a freshly-boxed
+      # owning temporary so the bind machinery can treat them
+      # uniformly. The owning shape (is_alias=false) lets the bind
+      # consume the temp without leaking — kai_incref skipped, no
+      # decref needed at arm exit because no extra ref was taken.
+      let k = kind_at(tys, i)
+      if k == 0 {
+        let sub_scr = sub_scr_expr(scr, root, i, cx)
+        # variant arg slot is alias of scr's storage.
+        cat2(emit_pat_binds(src, sp, sub_scr, false, true, cx),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx))
+      } else if k == 3 {
+        # Enum slot: re-intern the immediate tag into its singleton
+        # KaiValue*. The singleton is immortal (rc==INT32_MAX), so the
+        # binding is alias-shaped — PBind needs no incref, PWild no
+        # decref (decref of an immortal is a no-op either way).
+        let sub_scr = concat_all(["kai_enum_slot_box(", "kai_var_slots(", scr, ")[", int_to_string(i), "].i64)"])
+        cat2(emit_pat_binds(src, sp, sub_scr, false, true, cx),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx))
+      } else if pat_binds_nothing(sp) {
+        # Scalar slot (Int / Real) whose sub-pattern binds nothing
+        # (PWild or `_`-prefixed PBind). An unboxed scalar carries no
+        # RC, so there is nothing to box-then-release: emit no read at
+        # all. Pre-FAM this was a marginal `kai_decref(kai_int(...))`
+        # (immediate under tagged-Int, but still two calls); post-FAM,
+        # with malloc no longer the bottleneck, eliding it removes
+        # ~18M no-op calls from the rb-tree's is_red hot path.
+        emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx)
+      } else if k == 1 {
+        # The raw read takes no ref: a kind-1 slot carries no RC.
+        let bs = kind1_slot_binders(sp)
+        cat2(kind1_slot_decls(bs, scr, i, cx.locals),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1,
+                                    emit_ctx_with_kind1_raw(cx, list_append(binder_ids(bs), cx.kind1_raw))))
+      } else {
+        let sub_scr = concat_all(["kai_real(", "kai_var_slots(", scr, ")[", int_to_string(i), "].r)"])
+        # The primitive slot read allocates a fresh boxed temp; the
+        # bind owns it (is_alias=false) so PBind takes the ref
+        # directly without an incref, PWild releases it, etc.
+        cat2(emit_pat_binds(src, sp, sub_scr, false, false, cx),
+             emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx))
+      }
+    }
+  }
+}
+
+# True iff a sub-pattern binds no name and reads no value. Such a
+# pattern over an unboxed scalar slot needs no slot read emitted at all (the scalar has
+# no RC to release). PLit is NOT included: a literal slot pattern is a
+# TEST, handled on the test side, and reaches emit_pat_binds as "" only
+# after the test matched — here we only gate the bind read.
+fn pat_binds_nothing(p: Pattern) : Bool = match p.pkind {
+  PWild -> true
+  _     -> false
+}
+
+fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
+                          cx: EmitCtx) : String {
+  match fields {
+    [] -> ""
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        # #293 Phase 1.3 — nested destructuring needs a temp drop on
+        # the intermediate field. See the matching comment in
+        # stage1/compiler.kai's emit_pat_binds_record for the rationale.
+        if pat_is_destructuring(sub) {
+          let tname = concat_all(["_pf_", int_to_string(sub.line), "_",
+                                    int_to_string(sub.col)])
+          let inner = emit_pat_binds(src, sub, tname, false, true, cx)
+          cat2(
+            concat_all([
+              "KaiValue *", tname, " = kai_op_field(", scr, ", \"", name, "\"); ",
+              inner, "kai_decref(", tname, "); "
+            ]),
+            emit_pat_binds_record(src, rest, scr, cx)
+          )
+        } else {
+          let tmp = concat_all(["kai_op_field(", scr, ", \"", name, "\")"])
+          # kai_op_field returns an incref'd value; child is owned.
+          cat2(emit_pat_binds(src, sub, tmp, false, false, cx),
+               emit_pat_binds_record(src, rest, scr, cx))
+        }
+      }
+    }
+  }
+}
+
+fn pat_is_destructuring(p: Pattern) : Bool {
+  match p.pkind {
+    PBind(_) -> false
+    PWild -> false
+    PLit(_) -> false
+    PRange(_, _) -> false
+    PRecord(_) -> true
+    PVariant(_, _) -> true
+    PVariantRecord(_, _) -> true
+    PList(_, _) -> true
+    PNarrow(_, _) -> false
+    PAs(_, sub) -> pat_is_destructuring(sub)
+    PHole(_) -> false
+    PSurface(_) -> panic("pat_is_destructuring: surface pattern not lowered")
+  }
+}
+
+# A catch-all body over a raw-scalar scrutinee may read the binder in
+# either form: perceus-dup'd reads resolve boxed (`kaiv_`), bare
+# single-use reads keep their unbox seed and resolve raw (`kair_`).
+# The switch fast path declares both; the if-chain must mirror it or a
+# bare read hits an undeclared `kair_<name>`. Whichever form the body
+# skips is `(void)`-silenced.
+pub(pkg) fn pbind_raw_alias(pat: Pattern, scr: String, scr_ty: Option[Ty], ns: LocalNames) : String =
+  match pat.pkind {
+    PBind(b) ->
+      if not scr_ty_raw_scalar(scr_ty) { "" }
+      else {
+        concat_all([raw_c_type(scr_ty), " ", c_raw_local(ln_emitted(ns, b.id)), " = ",
+                    unbox_boxed_scalar(scr, scr_ty), "; (void) ", c_raw_local(ln_emitted(ns, b.id)), "; "])
+      }
+    _ -> ""
+  }
+
+fn scr_ty_raw_scalar(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> scr_ty_raw_scalar_t(t)
+  None -> false
+}
+
+fn scr_ty_raw_scalar_t(t: Ty) : Bool = match t {
+  TyReal -> true
+  TyDimT(inner, _) -> if ty_is_fixed_vec(t) { false } else { scr_ty_raw_scalar_t(inner) }
+  TyRefineT(inner, _) -> scr_ty_raw_scalar_t(inner)
+  _ -> ty_is_integral_raw(Some(t))
+}
+
+# Issue #209 — detect a cons reuse-arm whose body is the synthetic
+# `__perceus_reuse_cons(__pcs_scr, h_new, t_new)` produced by
+# `pcs_recognise_reuse_*`. When detected, the arm is emitted via the
+# dual-path layout in `emit_match_arm_reuse_cons` instead of the
+# default incref-the-binds layout: the unique branch borrows head/tail
+# (no incref) so the recursive consumer sees the children at their
+# actual RC, enabling spine-deep reuse instead of one-cell-only.
+
+pub(pkg) fn hoist_slot_member(xs: [Int], n: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == n { true } else { hoist_slot_member(rest, n) }
+}

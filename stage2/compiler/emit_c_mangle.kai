@@ -1,0 +1,629 @@
+# Mangling of private-segment types in core declarations.
+
+import compiler.ast
+import compiler.emit_shared
+import compiler.fnreg
+import compiler.infer_unit_tables
+import compiler.kinds
+import compiler.modules_homes
+import compiler.modules_segments
+import compiler.spec_names
+import compiler.symtab
+import compiler.type_text
+import compiler.util
+import compiler.written
+
+# A core segment's private sum types, and the table that names them.
+#[doc("A core segment's private sum types, and the table that names them.")]
+pub type PrivTys = { tab: SymTab, types: [SymId] }
+
+#[doc("The private sum types `decls` declare, added to `acc`.")]
+pub fn collect_private_segment_types(decls: [Decl], acc: [SymId]) : [SymId] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> collect_private_segment_types(rest, private_type_entry_of(d, acc))
+  }
+}
+
+fn private_type_entry_of(d: Decl, acc: [SymId]) : [SymId] {
+  match d {
+    DType(is_pub, tsym, _, body, _, _, _, _) ->
+      if is_pub { acc }
+      else { match body {
+        TBSum(_) -> [tsym, ...acc]
+        _ -> acc
+      } }
+    _ -> acc
+  }
+}
+
+# The private type a written reference names in its own segment.
+fn priv_ty_lookup(entries: PrivTys, r: DeclRef) : Option[SymId] = match r {
+  DrWritten(None, n) -> priv_ty_among(entries.types, st_candidates(entries.tab, NCType, written_text(n)))
+  _                  -> None
+}
+
+fn priv_ty_among(types: [SymId], named: [SymId]) : Option[SymId] = match named {
+  [] -> None
+  [s, ...rest] ->
+    if any(types, (t) => sym_same(t, s)) { Some(s) } else { priv_ty_among(types, rest) }
+}
+
+#[doc("Settle, inside each core segment, the written references to that segment's own private sum types. `segs` gives each core file's module and length, `n_core` how many of `decls` are core; `tab` names the types.")]
+pub fn mangle_core_segments(decls: [Decl], tab: SymTab, segs: [CoreSegment],
+                              n_core: Int) : [Decl] {
+  let core_part = pae_take(decls, n_core)
+  let root_part = pae_drop(decls, n_core)
+  let mangled_core = mangle_core_segments_loop(core_part, tab, segs, [])
+  list_append(mangled_core, root_part)
+}
+
+fn mangle_core_segments_loop(core_decls: [Decl], tab: SymTab,
+                                   segs: [CoreSegment],
+                                   acc: [Decl]) : [Decl] {
+  match segs {
+    [] -> list_append(acc, core_decls)   # safety: leftover untouched
+    [s, ...rest] -> match s {
+      PSeg(mod_name, seg_template) -> {
+        let n_seg = list_length(seg_template)
+        let this_seg = pae_take(core_decls, n_seg)
+        let remaining = pae_drop(core_decls, n_seg)
+        let seg_types = collect_private_segment_types(this_seg, [])
+        let mangled_seg =
+          if seg_types == [] { this_seg }
+          else { mangle_one_segment(this_seg, PrivTys { tab: tab, types: seg_types }, mod_name, []) }
+        mangle_core_segments_loop(remaining, tab, rest,
+                                        list_append(acc, mangled_seg))
+      }
+    }
+  }
+}
+
+fn mangle_one_segment(decls: [Decl], entries: PrivTys,
+                        mod_name: String, acc: [Decl]) : [Decl] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let d1 = mangle_one_decl(d, entries, mod_name)
+      mangle_one_segment(rest, entries, mod_name, [d1, ...acc])
+    }
+  }
+}
+
+#[doc("`d`, a declaration of the core module `home_mod`, with its references to that module's private sum types settled.")]
+pub fn mangle_one_decl(d: Decl, entries: PrivTys, home_mod: String) : Decl {
+  match d {
+    DType(is_pub, tsym, tps, body, l, c, mo, slots) ->
+      DType(is_pub, tsym, tps,
+            mangle_typebody(body, entries, home_mod), l, c, mo, slots)
+    DFn(p, fid, tps, ps, ret_opt, row, body, l, c, mo) ->
+      DFn(p, fid, tps, mangle_params(ps, entries, home_mod),
+          match ret_opt { None -> None
+                          Some(te) -> Some(mangle_te(te, entries, home_mod)) },
+          row,
+          mangle_expr(body, entries, home_mod), l, c, mo)
+    DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+      DAxiom(p, sm, n, cso, tps, mangle_params(ps, entries, home_mod),
+             mangle_te(ret, entries, home_mod), row, l, c)
+    DConst(p, csym, ty, body, mo, l, c) ->
+      DConst(p, csym, mangle_te(ty, entries, home_mod),
+              mangle_expr(body, entries, home_mod), mo, l, c)
+    DEffect(p, esym, tps, ops, defblk, l, c, _) ->
+      DEffect(p, esym, tps, mangle_eops(ops, entries, home_mod), defblk, l, c, None)
+    DProtocol(p, psym, tps, ops, l, c, mo) ->
+      DProtocol(p, psym, tps, mangle_pops(ops, entries, home_mod), l, c, mo)
+    DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
+      DImpl(name, mangle_te_list(proto_args, entries, home_mod),
+            mangle_te(ty, entries, home_mod),
+            mangle_one_segment(sub_decls, entries, home_mod, []),
+            l, c, tps, isym)
+    DDerive(ps, inner, l, c) ->
+      DDerive(ps, mangle_one_decl(inner, entries, home_mod), l, c)
+    DUnstable(inner, l, c) ->
+      DUnstable(mangle_one_decl(inner, entries, home_mod), l, c)
+    DProtoLaws(thy, inner, l, c, mo) ->
+      DProtoLaws(thy, mangle_one_decl(inner, entries, home_mod), l, c, mo)
+    DImplAxiom(thy, inner, l, c, mo) ->
+      DImplAxiom(thy, mangle_one_decl(inner, entries, home_mod), l, c, mo)
+    DConstructor(inner, l, c) ->
+      DConstructor(mangle_one_decl(inner, entries, home_mod), l, c)
+    DTest(n, body, l, c, mo) ->
+      DTest(n, mangle_expr(body, entries, home_mod), l, c, mo)
+    DBench(n, body, l, c, mo) ->
+      DBench(n, mangle_expr(body, entries, home_mod), l, c, mo)
+    DCheck(n, ps, body, l, c, mo) ->
+      DCheck(n, mangle_params(ps, entries, home_mod),
+              mangle_expr(body, entries, home_mod), l, c, mo)
+    _ -> d
+  }
+}
+
+fn mangle_te(te: TypeExpr, entries: PrivTys, home_mod: String) : TypeExpr {
+  match te.tkind {
+    TyName(r, targs) -> {
+      let targs1 = mangle_te_list(targs, entries, home_mod)
+      let r1 = match priv_ty_lookup(entries, r) {
+        Some(s) -> DrSym(s)
+        None    -> r
+      }
+      TypeExpr { tkind: TyName(r1, targs1), line: te.line, col: te.col }
+    }
+    TyList(inner) ->
+      TypeExpr { tkind: TyList(mangle_te(inner, entries, home_mod)),
+                  line: te.line, col: te.col }
+    TyFn(ps, ret, row) ->
+      TypeExpr { tkind: TyFn(mangle_te_list(ps, entries, home_mod),
+                              mangle_te(ret, entries, home_mod),
+                              mangle_row(row, entries, home_mod)),
+                  line: te.line, col: te.col }
+    TyDim(base, u) ->
+      TypeExpr { tkind: TyDim(mangle_te(base, entries, home_mod), u),
+                  line: te.line, col: te.col }
+    TyRefine(base, p) ->
+      TypeExpr { tkind: TyRefine(mangle_te(base, entries, home_mod), p),
+                  line: te.line, col: te.col }
+    # issue #772: a compound row carrier — mangle private labels it
+    # carries. Dissolved by alias substitution before reaching emit, so
+    # this is defensive completeness for the exhaustiveness check.
+    TyRow(row) ->
+      TypeExpr { tkind: TyRow(mangle_row(row, entries, home_mod)),
+                  line: te.line, col: te.col }
+    TySurface(ts) ->
+      TypeExpr { tkind: TySurface(tysurface_rebuild(ts, mangle_te_list(tysurface_children(ts), entries, home_mod))),
+                  line: te.line, col: te.col }
+    TyParam(p, targs) ->
+      TypeExpr { tkind: TyParam(p, mangle_te_list(targs, entries, home_mod)),
+                  line: te.line, col: te.col }
+  }
+}
+
+fn mangle_te_list(tes: [TypeExpr], entries: PrivTys,
+                    home_mod: String) : [TypeExpr] {
+  match tes {
+    [] -> []
+    [t, ...rest] -> [mangle_te(t, entries, home_mod),
+                     ...mangle_te_list(rest, entries, home_mod)]
+  }
+}
+
+fn mangle_row(r: RowExpr, entries: PrivTys,
+                home_mod: String) : RowExpr {
+  match r {
+    REmpty -> REmpty
+    RClosed(labels) -> RClosed(mangle_rls(labels, entries, home_mod))
+    ROpen(rv, labels) -> ROpen(rv, mangle_rls(labels, entries, home_mod))
+  }
+}
+
+fn mangle_rls(ls: [RowLabel], entries: PrivTys,
+                home_mod: String) : [RowLabel] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(r, ts) -> [RL(r, mangle_te_list(ts, entries, home_mod)),
+                        ...mangle_rls(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_params(ps: [Param], entries: PrivTys,
+                   home_mod: String) : [Param] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [mangle_param(p, entries, home_mod),
+                     ...mangle_params(rest, entries, home_mod)]
+  }
+}
+
+fn mangle_param(pm: Param, entries: PrivTys,
+                  home_mod: String) : Param =
+  Param { binder: pm.binder,
+          ptype: match pm.ptype {
+            None -> None
+            Some(te) -> Some(mangle_te(te, entries, home_mod))
+          },
+          pline: pm.pline, pcol: pm.pcol, pborrow: pm.pborrow }
+
+fn mangle_typebody(b: TypeBody, entries: PrivTys,
+                     home_mod: String) : TypeBody {
+  match b {
+    TBAlias(t) -> TBAlias(mangle_te(t, entries, home_mod))
+    TBRecord(fs) -> TBRecord(mangle_fields(fs, entries, home_mod))
+    TBSum(vs) -> TBSum(mangle_variants(vs, entries, home_mod))
+    TBEffectAlias(_) -> b
+  }
+}
+
+fn mangle_fields(fs: [FieldDecl], entries: PrivTys,
+                   home_mod: String) : [FieldDecl] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      FD(is_pub, name, te, attrs) -> [FD(is_pub, name, mangle_te(te, entries, home_mod), attrs),
+                        ...mangle_fields(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_variants(vs: [Variant], entries: PrivTys,
+                     home_mod: String) : [Variant] {
+  match vs {
+    [] -> []
+    [v, ...rest] -> match v {
+      Var(cname, vargs) -> [Var(cname, mangle_te_list(vargs, entries, home_mod)),
+                             ...mangle_variants(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_eops(ops: [EffectOp], entries: PrivTys,
+                 home_mod: String) : [EffectOp] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      EffOp(name, tps, ps, ret, l, c) ->
+        [EffOp(name, tps, mangle_params(ps, entries, home_mod),
+              mangle_te(ret, entries, home_mod), l, c),
+         ...mangle_eops(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_pops(ops: [ProtoOp], entries: PrivTys,
+                 home_mod: String) : [ProtoOp] {
+  match ops {
+    [] -> []
+    [op, ...rest] -> match op {
+      POp(name, tps, ps, ret, l, c) ->
+        [POp(name, tps, mangle_params(ps, entries, home_mod),
+              mangle_te(ret, entries, home_mod), l, c),
+         ...mangle_pops(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_expr(e: Expr, entries: PrivTys, home_mod: String) : Expr =
+  Expr { kind: mangle_expr_kind(e.kind, entries, home_mod),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn mangle_expr_kind(k: ExprKind, entries: PrivTys,
+                       home_mod: String) : ExprKind {
+  match k {
+    EBlock(stmts, opt_final) ->
+      EBlock(mangle_stmts(stmts, entries, home_mod),
+             match opt_final {
+               None -> None
+               Some(fe) -> Some(mangle_expr(fe, entries, home_mod))
+             })
+    EMatch(scrut, arms) ->
+      EMatch(mangle_expr(scrut, entries, home_mod),
+             mangle_arms(arms, entries, home_mod))
+    EVariantsOf(te, ns) ->
+      EVariantsOf(mangle_te(te, entries, home_mod), ns)
+    ELambda(ps, body) ->
+      ELambda(mangle_params(ps, entries, home_mod),
+              mangle_expr(body, entries, home_mod))
+    EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(mangle_expr(body, entries, home_mod), eff,
+              mangle_te_list(ty_args, entries, home_mod),
+              match init_opt {
+                None -> None
+                Some(ie) -> Some(mangle_expr(ie, entries, home_mod))
+              },
+              alias_opt,
+              mangle_hclauses(clauses, entries, home_mod),
+              match ret_opt {
+                None -> None
+                Some(r) -> Some(mangle_hreturn(r, entries, home_mod))
+              })
+    _ -> map_expr_kind(k, (sub) => mangle_expr(sub, entries, home_mod))
+  }
+}
+
+fn mangle_arms(arms: [Arm], entries: PrivTys,
+                 home_mod: String) : [Arm] {
+  match arms {
+    [] -> []
+    [a, ...rest] -> [mangle_arm(a, entries, home_mod),
+                     ...mangle_arms(rest, entries, home_mod)]
+  }
+}
+
+fn mangle_arm(a: Arm, entries: PrivTys, home_mod: String) : Arm {
+  match a {
+    Arm(pat, opt_guard, body) ->
+      Arm(mangle_pat(pat, entries, home_mod),
+          match opt_guard {
+            None -> None
+            Some(g) -> Some(mangle_expr(g, entries, home_mod))
+          },
+          mangle_expr(body, entries, home_mod))
+  }
+}
+
+fn mangle_pat(pat: Pattern, entries: PrivTys,
+                home_mod: String) : Pattern {
+  match pat.pkind {
+    PNarrow(name, te) ->
+      Pattern { pkind: PNarrow(name, mangle_te(te, entries, home_mod)),
+                 line: pat.line, col: pat.col }
+    PVariant(r, subs) ->
+      Pattern { pkind: PVariant(r, mangle_pat_list(subs, entries, home_mod)),
+                 line: pat.line, col: pat.col }
+    PVariantRecord(r, fs) ->
+      Pattern { pkind: PVariantRecord(r, mangle_pfields(fs, entries, home_mod)),
+                 line: pat.line, col: pat.col }
+    PRecord(fs) ->
+      Pattern { pkind: PRecord(mangle_pfields(fs, entries, home_mod)),
+                 line: pat.line, col: pat.col }
+    PList(subs, rest) ->
+      Pattern { pkind: PList(mangle_pat_list(subs, entries, home_mod), rest),
+                 line: pat.line, col: pat.col }
+    PAs(name, inner) ->
+      Pattern { pkind: PAs(name, mangle_pat(inner, entries, home_mod)),
+                 line: pat.line, col: pat.col }
+    _ -> pat
+  }
+}
+
+fn mangle_pat_list(ps: [Pattern], entries: PrivTys,
+                     home_mod: String) : [Pattern] {
+  match ps {
+    [] -> []
+    [p, ...rest] -> [mangle_pat(p, entries, home_mod),
+                     ...mangle_pat_list(rest, entries, home_mod)]
+  }
+}
+
+fn mangle_pfields(fs: [PField], entries: PrivTys,
+                    home_mod: String) : [PField] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      PField(name, sub, sh) -> [PField(name, mangle_pat(sub, entries, home_mod), sh),
+                                 ...mangle_pfields(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_stmts(ss: [Stmt], entries: PrivTys,
+                  home_mod: String) : [Stmt] {
+  match ss {
+    [] -> []
+    [s, ...rest] -> [mangle_stmt(s, entries, home_mod),
+                     ...mangle_stmts(rest, entries, home_mod)]
+  }
+}
+
+fn mangle_stmt(s: Stmt, entries: PrivTys, home_mod: String) : Stmt {
+  match s {
+    SLet(pat, ty_opt, e) ->
+      SLet(mangle_pat(pat, entries, home_mod),
+           match ty_opt {
+             None -> None
+             Some(te) -> Some(mangle_te(te, entries, home_mod))
+           },
+           mangle_expr(e, entries, home_mod))
+    SVar(name, ty_opt, init, l, c) ->
+      SVar(name,
+           match ty_opt {
+             None -> None
+             Some(te) -> Some(mangle_te(te, entries, home_mod))
+           },
+           mangle_expr(init, entries, home_mod), l, c)
+    SAssert(e, om) ->
+      SAssert(mangle_expr(e, entries, home_mod),
+              match om {
+                None -> None
+                Some(m) -> Some(mangle_expr(m, entries, home_mod))
+              })
+    SExprStmt(e) -> SExprStmt(mangle_expr(e, entries, home_mod))
+    SIndexAssign(t, ix, v, l, c) ->
+      SIndexAssign(mangle_expr(t, entries, home_mod),
+                    mangle_expr(ix, entries, home_mod),
+                    mangle_expr(v, entries, home_mod), l, c)
+    SAssign(t, v, l, c) ->
+      SAssign(mangle_expr(t, entries, home_mod),
+               mangle_expr(v, entries, home_mod), l, c)
+    SUse(eff, l, c) -> SUse(eff, l, c)
+  }
+}
+
+fn mangle_hclauses(cs: [HClause], entries: PrivTys,
+                     home_mod: String) : [HClause] {
+  match cs {
+    [] -> []
+    [c, ...rest] -> match c {
+      HC(name, ps, body, l, col) ->
+        [HC(name, mangle_params(ps, entries, home_mod),
+             mangle_expr(body, entries, home_mod), l, col),
+         ...mangle_hclauses(rest, entries, home_mod)]
+    }
+  }
+}
+
+fn mangle_hreturn(r: HReturn, entries: PrivTys,
+                    home_mod: String) : HReturn {
+  match r {
+    HR(name, body, l, c) -> HR(name, mangle_expr(body, entries, home_mod), l, c)
+  }
+}
+
+# m7b #1d — display-time alias preservation (Doc A §*Open questions*
+# #5). Render a label set using the largest alias that fully covers
+# it; remaining labels (those outside the alias) are appended with
+# `+`. The alias rewrite at resolve time is value-preserving, so the
+# choice is purely cosmetic — diagnostics keep the user's `Io`
+# spelling when it still describes the row, and fall back to the
+# expanded labels on partial coverage. Currently no diagnostic prints
+# whole rows; this helper is the building block when row-mismatch
+# rendering lands.
+
+# Return the alias whose label set is a subset of `labels` and that
+# covers the largest number of labels. Ties prefer the alias seen
+# first (lexically earlier in source).
+
+pub(pkg) fn sig_of_decl(d: Decl) : Option[Ty] {
+  match d {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
+      let pts = map(params, param_ty)
+      let ret = match opt_ret {
+        Some(rty) -> resolve_ty(rty)
+        None -> TyUnit
+      }
+      Some(TyFnT(pts, ret, row_of_expr(rexpr)))
+    }
+    # m12.7: axiom signature has the same shape as a fn — params,
+    # return type, row. The body's row is replaced by the declared
+    # row directly (no body to read row_of_expr from).
+    DAxiom(_, _, _, _, _, params, ret_ty, row, _, _) -> {
+      let pts = map(params, param_ty)
+      let ret = resolve_ty(ret_ty)
+      Some(TyFnT(pts, ret, row_of_expr(row)))
+    }
+    _ -> None
+  }
+}
+
+# The mangle of a type that names no declaration: a scalar, or a shape
+# over scalars and core types.
+pub(pkg) fn mangle_ty(t: Ty) : String = mangle_ty_in(st_empty(), t)
+
+fn mangle_ty_in(tab: SymTab, t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
+    TyHandle   -> "Handle"
+    TyListT(inner) -> concat_all(["L_", mangle_ty_in(tab, inner), "_E"])
+    TyFnT(ps, ret, _) -> concat_all([
+      "F_", join_with(map(ps, (p) => mangle_ty_in(tab, p)), "_"),
+      "_R_", mangle_ty_in(tab, ret), "_E"
+    ])
+    TyCon(s, tas) -> {
+      let cname = rt_name(tab, s)
+      match tas {
+        [] -> cname
+        [_h, ..._rest] -> concat_all([cname, "_O_",
+                                    join_with(map(tas, (a) => mangle_ty_in(tab, a)), "_"),
+                                    "_C"])
+      }
+    }
+    TyVarT(_) -> "TVAR"
+    # a resolved shape app is erased to its constructor before codegen;
+    # an unresolved one is a bug, flagged like `TVAR`.
+    TyShapeApp(_, arg) -> concat_all(["SVAR_", mangle_ty_in(tab, arg)])
+    TyAny     -> "Any"
+    # m12.5: units are erased at codegen time. The mangled name for a
+    # dimensioned type is the same as its base type's mangle — so a
+    # call like `f(1.0<USD>)` and a call `f(1.0)` mangle into the same
+    # specialisation. This is the codegen-erasure invariant manifest
+    # at the mangler level. The exception is a fixed-width `Vec[e]<n>`:
+    # its inline layout differs per `n`, so it keeps a `_D<n>` suffix
+    # that splits its specialisation from the dynamic `Vec` and from
+    # every other length.
+    TyDimT(base, u) -> if ty_is_fixed_vec(t) {
+      concat_all([mangle_ty_in(tab, base), "_D", int_to_string(fixed_vec_n(t))])
+    } else { mangle_ty_in(tab, base) }
+    # m12.6.x #1: refinements erase like units. `Int where >= 0` and
+    # `Int` mangle the same — they share monomorphisations and
+    # protocol-impl dispatch entries.
+    TyRefineT(base, _) -> mangle_ty_in(tab, base)
+    # issue #187 phase 1: mangle a union as `U_<part1>_<part2>_..._E`
+    # using the canonical component order. The leading `U_` and
+    # trailing `_E` bracket the spec the same way `L_..._E` brackets
+    # a list, so distinct unions never collide with each other or
+    # with primitive mangles even when their component manglings
+    # rearrange. Phase 1 never invokes the mangler on a `TyUnion` in
+    # selfhost (no resolver path constructs one) so this arm is dead
+    # until Phase 2 wires it up; the implementation is provided now
+    # to keep the walker exhaustive without `_` fallbacks that would
+    # mask future bugs.
+    TyUnion(parts) -> concat_all(["U_",
+                                  join_with(map(parts, (p) => mangle_ty_in(tab, p)), "_"),
+                                  "_E"])
+  }
+}
+
+pub(pkg) fn mangle_name(tab: SymTab, name: String, tys: [Ty], units: [UnitExprT]) : String {
+  let ty_part = match tys {
+    [] -> ""
+    [_h, ..._rest] -> concat_all(["__mono__", join_with(map(tys, (t) => mangle_ty_in(tab, t)), "__")])
+  }
+  # m4c Phase 3: encode the unit-tparam tuple after the type-tparam
+  # tuple. Empty units means no per-unit specialisation (the common
+  # case). For `impl[u: Measure] Show for Real<u>` and friends, two
+  # specs binding `u` to USD and EUR mangle distinctly via
+  # `__umono__USD` / `__umono__EUR`. The rendering uses the same
+  # canonical-unit display as `unit_name(x)` so emit and rewrite
+  # agree on the suffix string.
+  let u_part = match units {
+    [] -> ""
+    [_h, ..._rest] -> concat_all(["__umono__", join_with(map(units, mangle_unit), "__")])
+  }
+  if string_length(ty_part) == 0 and string_length(u_part) == 0 {
+    name
+  } else {
+    concat_all([name, ty_part, u_part])
+  }
+}
+
+# Render a unit canonically for mangling. `unit_one` (i.e. no unit)
+# emits "1" so a `Real<1>` spec sits in its own slot. Bare unit-vars
+# only appear in pre-monomorphisation insts and would not key a
+# real spec; we still emit a stable "TUVAR" sentinel so any such
+# slip-through is observable rather than silently colliding with a
+# concrete unit.
+
+# Render a unit canonically for mangling. `unit_one` (i.e. no unit)
+# emits "1" so a `Real<1>` spec sits in its own slot. Bare unit-vars
+# only appear in pre-monomorphisation insts and would not key a
+# real spec; we still emit a stable "TUVAR" sentinel so any such
+# slip-through is observable rather than silently colliding with a
+# concrete unit.
+fn mangle_unit(u: UnitExprT) : String {
+  let cu = unit_canon(u)
+  match cu {
+    UVar(_) -> "TUVAR"
+    UOne    -> "1"
+    _       -> mangle_unit_ident(unit_key(cu))
+  }
+}
+
+# Replace mangle-unsafe characters in the canonical unit display with
+# C-identifier-safe sentinels. `*` -> `_x_`, `/` -> `_d_`, `^` ->
+# `_p_`, `(`/`)` -> `_l_` / `_r_`. Spaces, if any, become `_s_`.
+
+# Replace mangle-unsafe characters in the canonical unit display with
+# C-identifier-safe sentinels. `*` -> `_x_`, `/` -> `_d_`, `^` ->
+# `_p_`, `(`/`)` -> `_l_` / `_r_`. Spaces, if any, become `_s_`.
+fn mangle_unit_ident(s: String) : String =
+  mangle_unit_ident_loop(s, 0, string_length(s), [])
+
+fn mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : String {
+  if i >= n { concat_all(list_reverse(acc)) }
+  else {
+    let c = match char_at(s, i) {
+      Some(ch) -> ch
+      None     -> ' '
+    }
+    let piece = match c {
+      '*' -> "_x_"
+      '/' -> "_d_"
+      '^' -> "_p_"
+      '(' -> "_l_"
+      ')' -> "_r_"
+      ' ' -> "_s_"
+      _   -> string_slice(s, i, 1)
+    }
+    mangle_unit_ident_loop(s, i + 1, n, [piece, ...acc])
+  }
+}

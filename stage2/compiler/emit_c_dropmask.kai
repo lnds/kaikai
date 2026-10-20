@@ -1,0 +1,406 @@
+# Per-site drop masks and raw-read analysis for self-tail-call rewriting.
+
+import compiler.ast
+import compiler.borrow_infer
+import compiler.core_builtins
+import compiler.expr_positions
+import compiler.perceus_borrow
+import compiler.perceus_payer
+import compiler.perceus_reads
+import compiler.ret_slots
+import compiler.self_call
+import compiler.trmc_self_call
+
+# Decomposition of the exit-drop wrap into the entry stmts before the
+# SLet of the fn's result slot, the SLet's RHS (the original body), and
+# the exit stmts after it. Returns None if no stmt binds that slot.
+pub(pkg) type TcrecPcsTriple = TcrecPcsTriple([Stmt], Expr, [Stmt])
+
+pub(pkg) fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTriple] {
+  match stmts {
+    [] -> None
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(b) ->
+          if ret_slot_id_is_fn(b.id) {
+            Some(TcrecPcsTriple(list_reverse(before_acc), rhs, rest))
+          } else {
+            tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
+          }
+        _ -> tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
+      }
+      _ -> tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
+    }
+  }
+}
+
+pub(pkg) fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
+                              after: [Stmt]) : Expr {
+  let ret_let = SLet(
+    Pattern { pkind: PBind(ret_slot_binder(RsFn)), line: new_inner.line, col: new_inner.col },
+    None,
+    new_inner
+  )
+  let stmts = list_append(before, [ret_let, ...after])
+  let tail = Expr { kind: ELocal(ret_slot_local(RsFn)), line: new_inner.line, col: new_inner.col,
+                    ty: new_inner.ty, mode: new_inner.mode,  site: new_inner.site }
+  Expr { kind: EBlock(stmts, Some(tail)),
+         line: orig.line, col: orig.col, ty: orig.ty, mode: orig.mode,  site: orig.site }
+}
+
+# Per-call-site dropmask: bit `i` is set iff param `i`'s payer is the exit
+# drop, which the goto jumps past. A never-read param is owned and paid by
+# the entry drop, which the goto re-runs.
+pub(pkg) fn tcrec_compute_site_dropmask(params: [Param], uses: UseIx, skip_set: [Binder],
+                                i: Int, acc: Int) : Int {
+  match params {
+    [] -> acc
+    [p, ...rest] -> {
+      let sets = PcsParamSets { moved: skip_set, forced: [] }
+      let acc1 = if pcs_pays(pcs_param_payer(p.binder.id, uses, sets), PyExit) { acc + tcrec_pow2(i) } else { acc }
+      tcrec_compute_site_dropmask(rest, uses, skip_set, i + 1, acc1)
+    }
+  }
+}
+
+pub(pkg) fn tcrec_pow2(n: Int) : Int =
+  if n <= 0 { 1 } else { 2 * tcrec_pow2(n - 1) }
+
+#
+# A self-tail-call site owes the goto an extra drop of `p` when every read
+# of `p` in its args sits in a borrowed callee slot: the callee never
+# releases it and the goto rebinds the slot over it. The mask is computed
+# once per site in a pre-pass and looked up by `(line, col)` during the
+# rewrite, so no `[Expr]` flows through the dropmask computation.
+pub(pkg) type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, drop mask
+
+# Pre-pass entry: walks `body` in tail position the same way
+# `tcrec_rewrite_kind` does, recording one TcrDm per self-tail-call site.
+pub(pkg) fn tcrec_collect_dm_table(body: Expr, me: SelfRef, arity: Int,
+                          params: [Param], pnames: [String],
+                          uses: UseIx,
+                          hoisted: [Expr], acc: [TcrDm],
+                          bmap: BorrowMap, base_mask: Int) : [TcrDm] =
+  tcrec_collect_dm_kind(body.kind, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
+
+# `hoisted` carries the RHS of the `__pcs_ta*` arg-hoist lets the perceus
+# tail-drop pass placed above a self-call. The mask must see those exprs as
+# args — they ARE the call's arguments, evaluated one statement earlier — or
+# it flips at hoisted sites.
+fn tcrec_collect_dm_kind(k: ExprKind, me: SelfRef, arity: Int,
+                         params: [Param], pnames: [String], uses: UseIx,
+                         hoisted: [Expr],
+                         acc: [TcrDm], bmap: BorrowMap, base_mask: Int) : [TcrDm] {
+  match k {
+    ECall(f, xs) ->
+      if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
+        let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
+        [TcrDm(f.line, f.col, mask), ...acc]
+      } else { acc }
+    EIf(_, t, opt_e) -> {
+      let a1 = tcrec_collect_dm_table(t, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
+      match opt_e {
+        None -> a1
+        Some(e2) -> tcrec_collect_dm_table(e2, me, arity, params, pnames, uses, hoisted, a1, bmap, base_mask)
+      }
+    }
+    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
+    EBlock(stmts, opt_tail) -> {
+      let hoisted1 = tcrec_hoisted_arg_rhs(stmts, 0, hoisted)
+      match opt_tail {
+        None -> acc
+        Some(e) -> tcrec_collect_dm_table(e, me, arity, params, pnames, uses, hoisted1, acc, bmap, base_mask)
+      }
+    }
+    _ -> acc
+  }
+}
+
+# `next` is the hoisted argument the block binds next.
+fn tcrec_hoisted_arg_rhs(stmts: [Stmt], next: Int, acc: [Expr]) : [Expr] {
+  match stmts {
+    [] -> acc
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) ->
+        if ret_slot_binds_tail_arg(pat, next) { tcrec_hoisted_arg_rhs(rest, next + 1, [rhs, ...acc]) }
+        else { tcrec_hoisted_arg_rhs(rest, next, acc) }
+      _ -> tcrec_hoisted_arg_rhs(rest, next, acc)
+    }
+  }
+}
+
+fn tcrec_collect_dm_arms(arms: [Arm], me: SelfRef, arity: Int, params: [Param],
+                         pnames: [String], uses: UseIx,
+                         hoisted: [Expr], acc: [TcrDm],
+                         bmap: BorrowMap, base_mask: Int) : [TcrDm] {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, _, body) -> {
+        let a1 = tcrec_collect_dm_table(body, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
+        tcrec_collect_dm_arms(rest, me, arity, params, pnames, uses, hoisted, a1, bmap, base_mask)
+      }
+    }
+  }
+}
+
+# `base_mask` carries the bits the base pass already set, so a site never
+# re-adds one (the masks are summed, not or'd).
+fn tcrec_site_drop_mask(params: [Param], args: [Expr], bmap: BorrowMap, base_mask: Int,
+                        i: Int, acc: Int) : Int = match params {
+  [] -> acc
+  [p, ...rest] -> {
+    let fire = not tcrec_bit_is_set(base_mask, i) and tcrec_args_borrow_only(args, p.binder.id, bmap)
+    let acc1 = if fire { acc + tcrec_pow2(i) } else { acc }
+    tcrec_site_drop_mask(rest, args, bmap, base_mask, i + 1, acc1)
+  }
+}
+
+fn tcrec_bit_is_set(mask: Int, i: Int) : Bool = (mask / tcrec_pow2(i)) % 2 == 1
+
+# True when `p` occurs in `args` and EVERY occurrence is a bare read in a
+# borrowed parameter slot of the call it sits in. One occurrence anywhere
+# else — an owned slot, a field read, a constructor slot — means some
+# consumer on this path already releases `p`, and the goto must not drop.
+fn tcrec_args_borrow_only(args: [Expr], p: LocalId, bmap: BorrowMap) : Bool = {
+  let seen = tcrec_borrow_reads(args, p, bmap)
+  let total = tcrec_all_reads(args, p)
+  seen > 0 and seen == total
+}
+
+# Reads of `p` sitting bare in a borrowed slot.
+fn tcrec_borrow_reads(args: [Expr], p: LocalId, bmap: BorrowMap) : Int = match args {
+  []           -> 0
+  [a, ...rest] -> tcrec_borrow_reads_e(a, p, bmap) + tcrec_borrow_reads(rest, p, bmap)
+}
+
+fn tcrec_borrow_reads_e(e: Expr, p: LocalId, bmap: BorrowMap) : Int = match e.kind {
+  ECall(f, xs) -> {
+    let positions = pcs_borrow_lookup(bmap, pcs_callee_key(f))
+    tcrec_borrow_reads_e(f, p, bmap) + tcrec_borrow_reads_args(xs, p, positions, 0, bmap)
+  }
+  _ -> tcrec_borrow_reads_ps(xp_positions(e), p, bmap)
+}
+
+fn tcrec_borrow_reads_args(xs: [Expr], p: LocalId, positions: [Int], i: Int,
+                           bmap: BorrowMap) : Int = match xs {
+  []           -> 0
+  [a, ...rest] -> {
+    let here = if pcs_has_int(positions, i) {
+      match a.kind { ELocal(u) -> if local_eq(u, p) { 1 } else { 0 }  _ -> tcrec_borrow_reads_e(a, p, bmap) }
+    } else { tcrec_borrow_reads_e(a, p, bmap) }
+    here + tcrec_borrow_reads_args(rest, p, positions, i + 1, bmap)
+  }
+}
+
+fn tcrec_borrow_reads_ps(ps: [XPos], p: LocalId, bmap: BorrowMap) : Int = match ps {
+  []                  -> 0
+  [XP(_, c), ...rest] -> tcrec_borrow_reads_e(c, p, bmap) + tcrec_borrow_reads_ps(rest, p, bmap)
+}
+
+# Every read of `p` in `args`, borrowed slot or not.
+fn tcrec_all_reads(args: [Expr], p: LocalId) : Int = match args {
+  []           -> 0
+  [a, ...rest] -> tcrec_all_reads_e(a, p) + tcrec_all_reads(rest, p)
+}
+
+fn tcrec_all_reads_e(e: Expr, p: LocalId) : Int = match e.kind {
+  ELocal(u) -> if local_eq(u, p) { 1 } else { 0 }
+  _       -> tcrec_all_reads_ps(xp_positions(e), p)
+}
+
+fn tcrec_all_reads_ps(ps: [XPos], p: LocalId) : Int = match ps {
+  []                  -> 0
+  [XP(_, c), ...rest] -> tcrec_all_reads_e(c, p) + tcrec_all_reads_ps(rest, p)
+}
+
+# The perceus rewrite records its ownership decision in the body itself:
+# a read wrapped in `__perceus_dup` leaves the original ref alive; a bare
+# read transfers it raw. A param with any bare non-lambda read must not
+# get the goto-block drop — the drop and the wrap must pair or RC
+# double-counts. Widening only (never removes a derived skip entry), so
+# a read this walker cannot see (interp strings) keeps today's mask.
+pub(pkg) fn tcrec_widen_skip_raw_reads(pbs: [Binder], body: Expr, skip: [Binder], bm: BorrowMap) : [Binder] {
+  match pbs {
+    [] -> skip
+    [h, ...rest] -> {
+      let skip1 =
+        if not pcs_has(skip, h.id) and tcrec_expr_raw_read(body, h.id, bm) { [h, ...skip] }
+        else { skip }
+      tcrec_widen_skip_raw_reads(rest, body, skip1, bm)
+    }
+  }
+}
+
+# Lambda bodies are excluded: closure captures are RC'd separately, and
+# the dropmask's lambda story lives in the LUBlocked arm.
+fn tcrec_expr_raw_read(e: Expr, p: LocalId, bm: BorrowMap) : Bool =
+  tcrec_kind_raw_read(e.kind, p, bm)
+
+fn tcrec_kind_raw_read(k: ExprKind, p: LocalId, bm: BorrowMap) : Bool {
+  match k {
+    ELocal(l) -> local_eq(l, p)
+    ECall(f, xs) ->
+      if tcrec_is_dup_callee(f) { tcrec_dup_arg_raw_read(xs, p, bm) }
+      else if tcrec_expr_raw_read(f, p, bm) { true }
+      else if pcs_any_arg_is_var(p, xs) { tcrec_args_raw_read(tcrec_owned_args(xs, tcrec_borrowed_slots(bm, f), 0), p, bm) }
+      else { tcrec_args_raw_read(xs, p, bm) }
+    EIntrinsic(_, xs) -> tcrec_args_raw_read(xs, p, bm)
+    ESurface(sf) -> tcrec_args_raw_read(surface_children(sf), p, bm)
+    EBinop(_, l, r) ->
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
+    EUnop(_, x) -> tcrec_expr_raw_read(x, p, bm)
+    EField(x, _) -> tcrec_expr_raw_read(x, p, bm)
+    EIndex(x, i) ->
+      if tcrec_expr_raw_read(x, p, bm) { true } else { tcrec_expr_raw_read(i, p, bm) }
+    EIf(c, t, opt_e) ->
+      if tcrec_expr_raw_read(c, p, bm) { true }
+      else if tcrec_expr_raw_read(t, p, bm) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_expr_raw_read(e2, p, bm)
+      } }
+    EMatch(s, arms) ->
+      if tcrec_expr_raw_read(s, p, bm) { true }
+      else { tcrec_arms_raw_read(arms, p, bm) }
+    EBlock(stmts, opt_tail) ->
+      if tcrec_stmts_raw_read(stmts, p, bm) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> tcrec_expr_raw_read(e, p, bm)
+      } }
+    EList(elems) -> tcrec_elems_raw_read(elems, p, bm)
+    ERange(lo, hi, opt_by) ->
+      if tcrec_expr_raw_read(lo, p, bm) { true }
+      else if tcrec_expr_raw_read(hi, p, bm) { true }
+      else { match opt_by {
+        None -> false
+        Some(e) -> tcrec_expr_raw_read(e, p, bm)
+      } }
+    ERecordLit(_, fis) -> tcrec_fields_raw_read(fis, p, bm)
+    EPipe(l, r) ->
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
+    EDispatchPipe(_, l, r) ->
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
+    EBang(inner) -> tcrec_expr_raw_read(inner, p, bm)
+    ELitUnit(inner, _) -> tcrec_expr_raw_read(inner, p, bm)
+    _ -> false
+  }
+}
+
+fn tcrec_is_dup_callee(f: Expr) : Bool = match f.kind {
+  EMark(MkDup) -> true
+  _            -> false
+}
+
+# Perceus has already renamed a borrowing prim to its `_borrow` variant,
+# which lends slot 0.
+fn tcrec_borrowed_slots(bm: BorrowMap, f: Expr) : [Int] =
+  if tcrec_is_lending_form(f) { [0] } else { pcs_borrow_lookup(bm, pcs_callee_key(f)) }
+
+fn tcrec_is_lending_form(f: Expr) : Bool = match builtin_ref(f) {
+  Some(b) -> builtin_is_lending_form(b)
+  None    -> false
+}
+
+# A bare read in a borrowed slot lends, so it hands nothing on.
+fn tcrec_owned_args(xs: [Expr], borrowed: [Int], i: Int) : [Expr] = match xs {
+  []           -> []
+  [x, ...rest] -> {
+    let tl = tcrec_owned_args(rest, borrowed, i + 1)
+    match x.kind {
+      ELocal(_) -> if pcs_has_int(borrowed, i) { tl } else { [x, ...tl] }
+      _         -> [x, ...tl]
+    }
+  }
+}
+
+# `__perceus_dup(x)` shields a bare-var read; a composite arg recurses.
+fn tcrec_dup_arg_raw_read(xs: [Expr], p: LocalId, bm: BorrowMap) : Bool {
+  match xs {
+    [a] -> match a.kind {
+      ELocal(_)  -> false
+      ESym(_, _) -> false
+      _          -> tcrec_expr_raw_read(a, p, bm)
+    }
+    _ -> tcrec_args_raw_read(xs, p, bm)
+  }
+}
+
+fn tcrec_args_raw_read(args: [Expr], p: LocalId, bm: BorrowMap) : Bool {
+  match args {
+    [] -> false
+    [h, ...rest] ->
+      if tcrec_expr_raw_read(h, p, bm) { true }
+      else { tcrec_args_raw_read(rest, p, bm) }
+  }
+}
+
+fn tcrec_arms_raw_read(arms: [Arm], p: LocalId, bm: BorrowMap) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let g_hit = match opt_g {
+          None -> false
+          Some(g) -> tcrec_expr_raw_read(g, p, bm)
+        }
+        if g_hit { true }
+        else if tcrec_expr_raw_read(body, p, bm) { true }
+        else { tcrec_arms_raw_read(rest, p, bm) }
+      }
+    }
+  }
+}
+
+fn tcrec_stmts_raw_read(stmts: [Stmt], p: LocalId, bm: BorrowMap) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, e) -> tcrec_expr_raw_read(e, p, bm)
+        SVar(_, _, e, _, _) -> tcrec_expr_raw_read(e, p, bm)
+        SAssert(c, opt_m) ->
+          if tcrec_expr_raw_read(c, p, bm) { true }
+          else { match opt_m {
+            None -> false
+            Some(m) -> tcrec_expr_raw_read(m, p, bm)
+          } }
+        SExprStmt(e) -> tcrec_expr_raw_read(e, p, bm)
+        SIndexAssign(b, i, v, _, _) ->
+          if tcrec_expr_raw_read(b, p, bm) { true }
+          else if tcrec_expr_raw_read(i, p, bm) { true }
+          else { tcrec_expr_raw_read(v, p, bm) }
+        SAssign(b, v, _, _) ->
+          if tcrec_expr_raw_read(b, p, bm) { true }
+          else { tcrec_expr_raw_read(v, p, bm) }
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { tcrec_stmts_raw_read(rest, p, bm) }
+    }
+  }
+}
+
+fn tcrec_elems_raw_read(elems: [ListElem], p: LocalId, bm: BorrowMap) : Bool {
+  match elems {
+    [] -> false
+    [e, ...rest] -> {
+      let here = match e {
+        ElPlain(x) -> tcrec_expr_raw_read(x, p, bm)
+        ElSpread(x) -> tcrec_expr_raw_read(x, p, bm)
+      }
+      if here { true } else { tcrec_elems_raw_read(rest, p, bm) }
+    }
+  }
+}
+
+fn tcrec_fields_raw_read(fis: [FieldInit], p: LocalId, bm: BorrowMap) : Bool {
+  match fis {
+    [] -> false
+    [h, ...rest] -> match h {
+      FI(_, e) ->
+        if tcrec_expr_raw_read(e, p, bm) { true }
+        else { tcrec_fields_raw_read(rest, p, bm) }
+    }
+  }
+}

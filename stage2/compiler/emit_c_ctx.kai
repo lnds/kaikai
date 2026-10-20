@@ -1,0 +1,633 @@
+# EmitCtx, the emitter scope record, with its functional updates and the local-scope and binder queries every emitter shares.
+
+import compiler.ast
+import compiler.core_builtins
+import compiler.ctor_ix
+import compiler.effect_default
+import compiler.emit_shared
+import compiler.emit_tcrec_live
+import compiler.emit_unwind_c
+import compiler.enc_unit
+import compiler.evidence_frame
+import compiler.ffi_v2
+import compiler.fn_index
+import compiler.fnreg
+import compiler.intrinsics
+import compiler.local_names
+import compiler.modules_homes
+import compiler.rec_stamp
+import compiler.region
+import compiler.spec_names
+import compiler.symtab
+import compiler.unwind_binders
+import compiler.unwind_pend
+import compiler.unwind_sites
+import compiler.util
+import compiler.written
+
+# Lane linus-a (Lane A of docs/stage2-quality-km-audit-2026-05-29.md):
+# the emit walker used to thread five companion arguments through every
+# recursive call — `lcs` (the binders in lexical scope), `fns` (the EFn registry),
+# `variants` (the EVar registry), `lams` (collected lambdas) and `cls`
+# (collected clause-infos). That data clump appeared in ~74 signatures
+# and ~250 call-sites; adding any sixth piece of emit context meant
+# touching all of them. `EmitCtx` bundles the five into one record so the
+# walker passes a single `cx`. The only field that varies as the walker
+# descends is `lcs` (each body/arm/clause extends the lexical scope); the
+# other four are invariant for a whole `emit_program` run, so they are
+# built once at entry. `emit_ctx_with_lcs` rebuilds the record with a new
+# `lcs` for those descent points — semantically identical to the old
+# `..., new_lcs, fns, variants, lams, cls` argument shuffle.
+# `borrowed`: pattern binders the enclosing arm-top reuse bound BORROW (read
+# from `_scr`'s slots without an incref, Koka insert_loop model). A
+# `__perceus_dup` over such a binder lowers to a MOVE (the bare name, no
+# kai_internal_dup): perceus inserted the dup assuming an owned bind, but the
+# arm-top took ownership of the shell and the children move into the rebuild;
+# the redundant dup is what kept the descent tree shared (rc>=2) and the
+# reuse inert. Empty in every non-arm-top context → no behaviour change.
+# `hoisted` carries, during emission of one match's arms, the set of
+# `_scr` slot indices whose `.ptr` sub-deref has been hoisted to a C
+# local `_hs<i>` at the top of the match's `do {}`. emit_pat_test /
+# emit_pat_binds read it: when the sub-scrutinee of slot i off `_scr`
+# is requested and i is hoisted, they spell `_hs<i>` instead of
+# re-emitting `kai_var_slots(_scr)[i].ptr`. This shares the dependent
+# load `slot[i].ptr->...` across the separate `if`-arms of a nested
+# match (balance_left/right's rotations), which clang cannot CSE across
+# branches. Empty outside a hoisting match. See emit_hoist_subderefs.
+# `reuse_donor` carries, while emitting an arm-top-reuse body, the donor
+# cell's constructor and its positional sub-pattern binders (`local_none()`
+# for a slot with no usable PBind). A TRMC step that rebuilds the SAME ctor into
+# `_arm_ru` (the donated scrutinee shell) can then SKIP the store of slot i
+# when its rebuild arg is exactly the binder bound off slot i of the donor:
+# the value is already in the cell (kai_drop_reuse_token hands back the
+# shell intact). Writes only the changed slots (the TRMC hole + any
+# permuted/transformed slot) — Koka's `_con->field = ...` single-store
+# shape. None outside an arm-top-reuse body → every slot is written, the
+# prior behaviour.
+pub(pkg) type ReuseDonor = ReuseDonor(SymId, [LocalId])
+
+# `kind1_raw` — i64-inline (Lane B): the set of binders currently in
+# scope that are bound to a kind-1 Int slot and emitted as the raw
+# `int64_t kair_<nm>` (the bind is uniform across all routes). A read of a
+# binder in this set is `kair_<nm>` when MUnboxed and `kai_int(kair_<nm>)` when
+# MBoxed; a store of such a binder into a kind-1 slot is the raw
+# `kair_<nm>` directly (no kai_take_int round-trip). Scoped per arm: each
+# match arm body sees its own binders; the set is set entering the body
+# and not inherited by sibling arms.
+pub(pkg) type EmitCtx = { lcs: [LocalId], fns: [EFn], fx: FnIndex, variants: [VariantEntry], lams: [LamInfo], cls: [ClauseInfo],
+                 regions: [RegionMark], in_region: Bool, borrowed: [LocalId],
+                 hoisted: [Int], reuse_donor: Option[ReuseDonor], kind1_raw: [LocalId],
+                 # A const is a literal with a name. The emit catalogue
+                 # carries every top-level const so a const read
+                 # materialises as its literal body inline —
+                 # no global, no boxing, no call. Same role `fns` /
+                 # `variants` play for their idents.
+                 consts: [Decl],
+                 # Every effect decl, so a perform / handle / default-install
+                 # site can read an effect's `module_origin` and
+                 # mint the module-qualified evidence name (`ev_name`). Two
+                 # same-name effects from different modules thus emit and
+                 # reference distinct `Ev` structs.
+                 effs: [Decl],
+                 # The extern-type registry (struct field layouts +
+                 # opaque names), collected once from the pre-lowering
+                 # decls. The FFI shim emitter keys off it to unwrap a
+                 # record into a C struct / pass an opaque void*.
+                 ffi_reg: [ExternTypeReg],
+                 # The fn / lambda / clause / runner whose body is being
+                 # emitted, and its symbol. `find_lam` reads the unit so a
+                 # nested ELambda resolves to ITS module's LamInfo, not a
+                 # same-(line,col) lambda from another module (the
+                 # multi-module emit puts both in one `lams` list).
+                 cur_enc_fn: EncFn,
+                 # The record table. An `EField` whose base type resolves to a
+                 # known record lowers to a constant-index read (`field_index_of`
+                 # + the desugar-canonicalised declaration-order layout) instead
+                 # of the `kai_op_field` strcmp. Collected once from the decls.
+                 recs: [RecInfo],
+                 # Head tags of the stamped record types (`rec_stamp`).
+                 stamps: [RecStamp],
+                 # The core builtins' rows keyed by id, built once at emit
+                 # entry: a call finds the row of the builtin its callee
+                 # names without rebuilding or walking a table.
+                 core_ix: CoreIx,
+                 # The variant table's rows keyed by constructor id, built
+                 # once at emit entry: a constructor site finds its row by
+                 # the id it carries.
+                 ctor_ix: CtorIx,
+                 # The per-function evidence-frame ABI: each
+                 # function's USER-effect slot layout, keyed by
+                 # function. The perform site reads its own frame's slot for
+                 # an effect (falling back to the by-name walk when the
+                 # frame does not carry it); a call site fills the callee's
+                 # frame from its own supplier classification. Built once at
+                 # emit entry, threaded borrowed.
+                 evf: EvFrames,
+                 # True while emitting the body of a donation-capable fn
+                 # (one that took a hidden `_donor` reuse-token param). The
+                 # reuse-variant arm emit reads this to route its fresh-alloc
+                 # rebuild cells through `_donor` — see emit_reuse_donate.kai.
+                 rd_active: Bool,
+                 # Every donation-capable top-level fn, pre-scanned once.
+                 # A call site consults it (with a live arm token, i.e.
+                 # `reuse_donor` set) to donate that token across the call.
+                 rd_capable: [FnId],
+                 # Pending releases the tcrec goto-tail path must emit before
+                 # jumping: enclosing owned match scrutinee aliases plus
+                 # not-yet-consumed arm-binder increfs (emit_tcrec_live ledger).
+                 tcpend: [TclEntry],
+                 # The current frame's unwind sites (unwind_pend.kai).
+                 unw: UnwFrame,
+                 # The program's root file basename, as tag_target_decl stamps
+                 # it on the root's own `pub` decls: a root EFn carries either
+                 # spelling (mo=None for non-pub, mo=Some(root_mod) for pub).
+                 root_mod: Option[String],
+                 # Where a name is spelled from: a declaration's in the symbol
+                 # table, a specialisation's in the monomorphiser's table, a
+                 # local's among the binders of the declaration being emitted.
+                 tab: SymTab, specs: SpecNames, locals: LocalNames }
+
+pub(pkg) fn emit_ctx_with_lcs(cx: EmitCtx, l: [LocalId]) : EmitCtx =
+  EmitCtx { lcs: l, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+pub(pkg) fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# Set the enclosing unit (entering a fn or lambda body). `find_lam`
+# keys on this + (line, col) so a nested ELambda resolves to its own
+# module's LamInfo, never a same-position lambda from another module.
+pub(pkg) fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: EncFn) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# Set/clear the arena-routing flag for a region body.
+pub(pkg) fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: b, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# Replace the tcrec pending-release ledger (entering a match arm body /
+# refining across a branch point).
+pub(pkg) fn emit_ctx_with_unw(cx: EmitCtx, u: UnwFrame) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: u, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# The C locals among `names` that hold a boxed reference here.
+pub(pkg) fn emit_unw_vars(names: [LocalId], cx: EmitCtx) : [String] = emit_unw_boxed(unw_admit(cx.unw, names), cx)
+
+fn emit_unw_boxed(names: [LocalId], cx: EmitCtx) : [String] = match names {
+  [] -> []
+  [n, ...rest] ->
+    if locals_have(cx.lcs, n) and not emit_ctx_kind1_raw_has(cx, n) { [c_local_of(cx, n), ...emit_unw_boxed(rest, cx)] }
+    else { emit_unw_boxed(rest, cx) }
+}
+
+# The match at `x` registers its owned scrutinee when an arm holds a call
+# that can unwind.
+pub(pkg) fn emit_unw_scr_at(x: Expr, cx: EmitCtx) : EmitCtx = {
+  let want = unw_match_at(cx.unw.sites, x.site)
+  if want == cx.unw.scr { cx } else { emit_ctx_with_unw(cx, unw_with_scr(cx.unw, want)) }
+}
+
+pub(pkg) fn emit_unw_scr_off(cx: EmitCtx) : EmitCtx =
+  if cx.unw.scr { emit_ctx_with_unw(cx, unw_with_scr(cx.unw, false)) } else { cx }
+
+# An arm that bound its pattern with increfs owns those binders.
+pub(pkg) fn emit_unw_owning(pat: Pattern, cx: EmitCtx) : EmitCtx =
+  if cx.unw.arms == [] { cx } else { emit_ctx_with_unw(cx, unw_owning(cx.unw, tcp_rc_binders(pat, cx))) }
+
+# A destructuring `let` increfs each binder it binds.
+pub(pkg) fn emit_unw_let_owned(s: Stmt, cx: EmitCtx) : [LocalId] = match s {
+  SLet(pat, _, _) -> if unw_destructured(pat) == [] { [] } else { tcp_rc_binders(pat, cx) }
+  _ -> []
+}
+
+pub(pkg) fn emit_unw_own(names: [LocalId], cx: EmitCtx) : EmitCtx =
+  if names == [] or cx.unw.arms == [] { cx } else { emit_ctx_with_unw(cx, unw_owning(cx.unw, names)) }
+
+# The owned scrutinee slot of a match its arms can unwind out of: the push
+# after `_scr` is bound, the pop before its exit decref, and the arms'
+# ledger entry so a goto out of the match pops too. The arms keep `scr`
+# set: a reuse arm must not leave a moved child in the registered cell.
+pub(pkg) type UnwScr = { push: String, pop: String, cx: EmitCtx }
+
+pub(pkg) fn emit_unw_scr(want: Bool, cx: EmitCtx) : UnwScr =
+  if want {
+    let held = emit_ctx_with_unw(cx, unw_with_scr(cx.unw, true))
+    UnwScr { push: euw_slot_push("_uwm", "_scr"), pop: euw_pop("_uwm"),
+             cx: emit_ctx_with_tcpend(held, list_append(cx.tcpend, [tcl_unw_entry("_uwm")])) }
+  } else { UnwScr { push: "", pop: "", cx: cx } }
+
+pub(pkg) type UnwClosure = UcTransfer(LocalId) | UcDup(LocalId)
+
+pub(pkg) fn emit_unw_closure(f: Expr, cx: EmitCtx) : Option[UnwClosure] = match f.kind {
+  ELocal(n) -> if emit_unw_local(n, cx) { Some(UcTransfer(n)) } else { None }
+  ECall(g, xs) -> match g.kind {
+    EMark(MkDup) -> match xs {
+      [inner] -> match inner.kind {
+        ELocal(n) -> if emit_unw_local(n, cx) { Some(UcDup(n)) } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn emit_unw_local(n: LocalId, cx: EmitCtx) : Bool =
+  locals_have(cx.lcs, n) and not emit_ctx_kind1_raw_has(cx, n)
+
+pub(pkg) fn emit_unw_var(f: Expr, n: LocalId) : Expr = Expr { kind: ELocal(n), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }
+
+pub(pkg) fn emit_ctx_with_tcpend(cx: EmitCtx, l: [TclEntry]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: l, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# Refine the ledger across an already-evaluated expression — a no-op
+# (and no scan) when the ledger is empty, the overwhelmingly common case.
+pub(pkg) fn emit_ctx_tcpend_after(cx: EmitCtx, e: Expr) : EmitCtx = match cx.tcpend {
+  [] -> cx
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.tcpend, e))
+}
+
+pub(pkg) fn emit_ctx_tcpend_after_stmts(cx: EmitCtx, ss: [Stmt]) : EmitCtx = match cx.tcpend {
+  [] -> cx
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.tcpend, ss))
+}
+
+# Set/clear the hoisted-slot set (entering/leaving a match that hoists).
+pub(pkg) fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
+pub(pkg) fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# i64-inline (Lane B): set the kind-1 raw-bound binder set for an arm
+# body. Entering a match arm whose pattern binds kind-1 Int slots, the
+# bind adds those binders so local reads + slot stores in the body pick the
+# raw `kair_<nm>` form. Replaced (not extended) per arm so sibling arms
+# and outer scopes do not see this arm's binders.
+pub(pkg) fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [LocalId]) : EmitCtx =
+  EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+            regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# True when `l` is a kind-1 raw-bound binder in the current arm scope.
+pub(pkg) fn emit_ctx_kind1_raw_has(cx: EmitCtx, l: LocalId) : Bool = locals_have(cx.kind1_raw, l)
+
+# The top-level consts of a program, kept for `EmitCtx.consts` so a
+# const read materialises as its literal body inline.
+pub(pkg) fn const_decls_only(decls: [Decl]) : [Decl] = match decls {
+  [] -> []
+  [d, ...rest] -> match d {
+    DConst(_, _, _, _, _, _, _) -> [d, ...const_decls_only(rest)]
+    _ -> const_decls_only(rest)
+  }
+}
+
+# The effect decls only, for the EmitCtx `effs` catalogue an evidence-
+# naming site consults to read an effect's `module_origin`.
+pub(pkg) fn effect_decls_only(decls: [Decl]) : [Decl] = match decls {
+  [] -> []
+  [d, ...rest] -> match d {
+    DEffect(_, _, _, _, _, _, _, _) -> [d, ...effect_decls_only(rest)]
+    _ -> effect_decls_only(rest)
+  }
+}
+
+# The module that declares the effect `s`, which qualifies the name of its
+# evidence struct; None for the root's and for an effect no decl declares.
+pub(pkg) fn eff_mo(effs: [Decl], s: SymId) : Option[String] = match effect_decl_of(s, effs) {
+  Some(DEffect(_, _, _, _, _, _, _, mo)) -> mo
+  _ -> None
+}
+
+# The literal body of the const `s` in the emit catalogue; None when `s`
+# is no top-level const.
+pub(pkg) fn const_body_of(consts: [Decl], s: SymId) : Option[Expr] = match consts {
+  [] -> None
+  [d, ...rest] -> match d {
+    DConst(_, cs, _, body, _, _, _) ->
+      if sym_raw(s) >= 0 and sym_same(cs, s) { Some(body) } else { const_body_of(rest, s) }
+    _ -> const_body_of(rest, s)
+  }
+}
+
+# True when a block at (line, col) is a recorded `region { }`.
+pub(pkg) fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
+  emit_region_marks_has(cx.regions, line, col)
+
+fn emit_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
+  match ms {
+    [] -> false
+    [m, ...rest] ->
+      if rmark_line(m) == line and rmark_col(m) == col { true }
+      else { emit_region_marks_has(rest, line, col) }
+  }
+}
+
+# Routing a ctor of a region-branded type to the arena is what makes
+# `insert[r]`'s `Node(...)` bump-allocate in `r` across a fn boundary,
+# which lexical `in_region` cannot reach. Safe when no arena is live: the
+# arena ctors fall back to the RC ctor.
+fn ty_has_region_brand(ty: Ty) : Bool = match ty {
+  TyDimT(base, _) -> ty_region_brandable(base)
+  _ -> false
+}
+
+# Region-brand routing for a ctor whose resolved type is `ty`: an
+# aggregate branded with a region bump-allocates in the current arena.
+# Combines with the lexical `in_region` flag — either lands the ctor in
+# the arena.
+pub(pkg) fn emit_ctx_route_brand(cx: EmitCtx, ty_opt: Option[Ty]) : EmitCtx =
+  match ty_opt {
+    Some(ty) -> if ty_has_region_brand(ty) { emit_ctx_with_in_region(cx, true) } else { cx }
+    None     -> cx
+  }
+
+# The written name of the local `l`, for the C identifiers spelled from it.
+# The names table of a parameter list alone: what a prototype or a shim
+# with no body spells its parameters from. A body's table places its
+# parameters first, so a prototype and its definition spell them alike.
+pub(pkg) fn params_table(ps: [Param]) : LocalNames = ln_with_params(ln_empty(), ps)
+
+# The text the local `l` is emitted under in the body being emitted.
+pub(pkg) fn emitted(cx: EmitCtx, l: LocalId) : Emitted = ln_emitted(cx.locals, l)
+
+# The C identifier of the local `l`, boxed and raw.
+pub(pkg) fn c_local_of(cx: EmitCtx, l: LocalId) : String = c_local(emitted(cx, l))
+
+pub(pkg) fn c_raw_of(cx: EmitCtx, l: LocalId) : String = c_raw_local(emitted(cx, l))
+
+pub(pkg) fn binder_ids(bs: [Binder]) : [LocalId] = map(bs, (b) => b.id)
+
+# A region's value leaves as a deep copy; the block still owns the value
+# itself, released after the copy (a no-op on an arena cell, which the pop
+# frees with the rest).
+pub(pkg) fn region_copy_out(value_c: String) : String =
+  concat_all(["KaiValue *__rin = ", value_c, "; KaiValue *__rout = kai_deep_copy_out(__rin); kai_decref(__rin);"])
+
+# A constructor in value position reads its seeded singleton by tag.
+pub(pkg) fn emit_nullary_read(tab: SymTab, row: VariantEntry) : String = match row {
+  EV(_, _, tag, c) -> concat_all(["kai_nullary_fast(", int_to_string(tag), ", \"", ctor_cell_name(tab, c), "\")"])
+}
+
+# The immortal closure of a capture-free fn: one per reference site, built on first use.
+pub(pkg) fn static_closure_c(thunk: String, arity: Int) : String =
+  concat_all(["({ static KaiValue *_sc; kai_static_closure(&_sc, &", thunk, ", ", int_to_string(arity), "); })"])
+
+# A function or a builtin in value position: the closure of its thunk.
+pub(pkg) fn emit_ident_value(fid: FnId, cx: EmitCtx) : String = match fnx_callee(cx.fx, fid) {
+  Some(EFn(n, ar, mo, _, _)) ->
+    static_closure_c(c_user_thunk_sym(c_sym(written_text(n), mo)), ar)
+  None -> match core_ix_boxed(cx.core_ix, fnid_sym(fid)) {
+    Some(ep) -> match ep {
+      EP(_, cname, ar) ->
+        static_closure_c(cat3("_", cname, "_thunk"), ar)
+    }
+    None -> c_temp(emit_fn_text(cx.tab, cx.specs, fid))
+  }
+}
+
+# m7d §23: pick the runtime helper a `++` lowers to. The typer
+# pins the binop's result type to `String` or `[T]`; anything else
+# means we lost the annotation somewhere upstream.
+
+# m7d §23: pick the runtime helper a `++` lowers to. The typer
+# pins the binop's result type to `String` or `[T]`; anything else
+# means we lost the annotation somewhere upstream.
+pub(pkg) fn concat_helper_of(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyString    -> "kai_core_string_concat"
+      TyListT(_)  -> "kai_core_list_append"
+      _           -> "kai_core_string_concat /* m7d §23: unexpected type */"
+    }
+    None -> "kai_core_string_concat /* m7d §23: missing type */"
+  }
+}
+
+pub(pkg) fn binop_cname(op: BinOp) : Option[String] = match op {
+  BoAdd    -> Some("kai_op_add")
+  BoSub    -> Some("kai_op_sub")
+  BoMul    -> Some("kai_op_mul")
+  BoDiv    -> Some("kai_op_div")
+  BoMod    -> Some("kai_op_mod")
+  BoPow    -> Some("kai_op_pow_int")
+  BoLt     -> Some("kai_op_lt")
+  BoGt     -> Some("kai_op_gt")
+  BoLe     -> Some("kai_op_le")
+  BoGe     -> Some("kai_op_ge")
+  BoEq     -> Some("kai_op_eq_v")
+  BoNe     -> Some("kai_op_ne_v")
+  BoConcat -> None
+  BoAnd    -> None
+  BoOr     -> None
+}
+
+pub(pkg) fn unop_cname(op: UnOp) : String = match op {
+  UoNeg -> "kai_op_neg"
+  UoNot -> "kai_op_boolnot"
+}
+
+# The row of the constructor a pattern names.
+pub(pkg) fn pat_ctor_row(cx: EmitCtx, r: DeclRef) : Option[VariantEntry] = ctor_ix_row(cx.ctor_ix, ref_sym(r))
+
+# The slot kinds of the constructor a pattern destructures with `arity`
+# sub-patterns: they decide each slot's read kind, so they come from the
+# row of the constructor the pattern names and from no homonym's.
+pub(pkg) fn pat_ctor_kinds(cx: EmitCtx, r: DeclRef, arity: Int) : Option[[Int]] = match pat_ctor_row(cx, r) {
+  Some(EV(ar, ks, _, _)) -> if ar == arity { Some(ks) } else { None }
+  None                      -> None
+}
+
+pub(pkg) fn pat_ctor_tag(cx: EmitCtx, r: DeclRef) : Int = match pat_ctor_row(cx, r) {
+  Some(row) -> ctor_row_tag(row)
+  None      -> 0
+}
+
+# i64-inline (Lane B): collect the binders that a pattern binds onto
+# kind-1 Int slots — the SAME set the bind routes emit as `kair_<nm>` and
+# the body's local reads + slot stores must look up in cx.kind1_raw. Built
+# off the pattern + the ctor registry, so the arm body and the bind agree
+# by construction (one collector, no per-route rescan). Recurses into
+# nested PVariant sub-patterns (rb-tree balance rotation shape).
+pub(pkg) fn pat_kind1_binders(pat: Pattern, cx: EmitCtx, acc: [LocalId]) : [LocalId] = match pat.pkind {
+  PVariant(r, subs) -> {
+    let tys = match pat_ctor_kinds(cx, r, list_length(subs)) { Some(t) -> t None -> [] }
+    pat_kind1_binders_subs(subs, tys, 0, cx, acc)
+  }
+  # A list pattern's fixed sub-patterns can themselves be PVariants with
+  # kind-1 Int fields (`[Cmt(cl, _, t, _), ...rest]` — the fmt comment
+  # drain shape). The cons-head bind emits kair_ for those, so they must
+  # join the set too. The rest binder is a list (always boxed) — skip.
+  PList(subs, _) -> pat_kind1_binders_list(subs, cx, acc)
+  # A record field is projected boxed via `kai_op_field` (never a kind-1
+  # slot itself), but its sub-pattern can be a PVariant with a kind-1 Int
+  # field — `[Pair { fst: _, snd: JNum(n) }]`, the JSON probe shape. The
+  # field bind emits `kair_n` for that nested variant, so `n` must join
+  # the set or the body reads the undeclared boxed `kai_n`. Recurse into
+  # each field's sub-pattern; a direct PBind field stays boxed (the `_ ->`
+  # arm ignores it), exactly matching the field bind route.
+  PRecord(fields)            -> pat_kind1_binders_fields(fields, cx, acc)
+  PVariantRecord(_, fields) -> pat_kind1_binders_fields(fields, cx, acc)
+  # `name @ pat` and `name : T` narrowings: recurse into the inner pat.
+  PAs(_, inner)  -> pat_kind1_binders(inner, cx, acc)
+  _ -> acc
+}
+
+fn pat_kind1_binders_list(subs: [Pattern], cx: EmitCtx, acc: [LocalId]) : [LocalId] = match subs {
+  [] -> acc
+  [sp, ...rest] -> pat_kind1_binders_list(rest, cx, pat_kind1_binders(sp, cx, acc))
+}
+
+fn pat_kind1_binders_fields(fields: [PField], cx: EmitCtx, acc: [LocalId]) : [LocalId] = match fields {
+  [] -> acc
+  [pf, ...rest] -> match pf {
+    PField(_, sub, _) -> pat_kind1_binders_fields(rest, cx, pat_kind1_binders(sub, cx, acc))
+  }
+}
+
+pub(pkg) fn pat_kind1_binders_subs(subs: [Pattern], tys: [Int], i: Int, cx: EmitCtx, acc: [LocalId]) : [LocalId] =
+  match subs {
+    [] -> acc
+    [sp, ...rest] -> {
+      let acc1 = if kind_at(tys, i) == 1 { list_append(binder_ids(kind1_slot_binders(sp)), acc) }
+                 else { pat_kind1_binders(sp, cx, acc) }
+      pat_kind1_binders_subs(rest, tys, i + 1, cx, acc1)
+    }
+  }
+
+# The binders of a sub-pattern on a kind-1 Int slot, each declared as the
+# raw `kair_<nm>`. The single decision both the bind route and the scope
+# collector read; a literal or wildcard binds nothing.
+pub(pkg) fn kind1_slot_binders(sp: Pattern) : [Binder] = match sp.pkind {
+  PBind(b)       -> [b]
+  PAs(b, inner)  -> [b, ...kind1_slot_binders(inner)]
+  _ -> []
+}
+
+pub(pkg) fn kind1_slot_decls(bs: [Binder], scr: String, i: Int, ns: LocalNames) : String = match bs {
+  [] -> ""
+  [b, ...rest] -> concat_all(["int64_t ", c_raw_local(ln_emitted(ns, b.id)), " = kai_var_slots(", scr, ")[", int_to_string(i),
+                              "].i64; (void) ", c_raw_local(ln_emitted(ns, b.id)), "; ", kind1_slot_decls(rest, scr, i, ns)])
+}
+
+pub(pkg) fn locals_have(ls: [LocalId], l: LocalId) : Bool = any(ls, (x) => local_eq(x, l))
+
+pub(pkg) fn pat_local_ids(pat: Pattern) : [LocalId] = map(pat_binders(pat, []), (b) => b.id)
+
+pub(pkg) fn param_local_ids(params: [Param]) : [LocalId] = map(params, (p) => p.binder.id)
+
+# `ns` with the C locals the emitter declares under `keys`: no node
+# declares them, so their binders are the ones minted from the keys.
+pub(pkg) fn locals_declaring(ns: LocalNames, keys: [String]) : LocalNames = match keys {
+  []           -> ns
+  [k, ...rest] -> locals_declaring(ln_with_binder(ns, binder_minted(k)), rest)
+}
+
+# The name the function instance `f` is emitted under: its declaration's,
+# or its specialisation's.
+pub(pkg) fn emit_fn_text(tab: SymTab, specs: SpecNames, f: FnId) : String =
+  if fnid_inst(f) == spec_none() { written_text(decl_name(tab, fnid_sym(f))) }
+  else { written_text(spec_text(specs, f)) }
+
+# The C symbol the function instance `f` is emitted under: its registry
+# entry's, which carries the module that declares it.
+pub(pkg) fn emit_fn_c_sym(cx: EmitCtx, f: FnId) : String = match fnx_callee(cx.fx, f) {
+  Some(e) -> efn_c_sym(e)
+  None    -> emit_fn_text(cx.tab, cx.specs, f)
+}
+
+# This pattern's RC-carrying binders: every bound name except raw
+# kind-1 scalars and `_`-prefixed names (which bind no C local).
+pub(pkg) fn tcp_rc_binders(pat: Pattern, cx: EmitCtx) : [LocalId] =
+  tcp_rc_binders_loop(pat_local_ids(pat), pat_kind1_binders(pat, cx, []))
+
+fn tcp_rc_binders_loop(all: [LocalId], raw: [LocalId]) : [LocalId] = match all {
+  [] -> []
+  [n, ...rest] ->
+    if locals_have(raw, n) { tcp_rc_binders_loop(rest, raw) }
+    else { [n, ...tcp_rc_binders_loop(rest, raw)] }
+}
+
+pub(pkg) fn emit_loop_bad(i: Intrinsic) : String =
+  cat3("kai_unit() /* malformed loop intrinsic $", intrinsic_name(i), " */")
+
+# m14 v1.x — fold over a block's stmts threading the local-name
+# scope. After each `SLet(pat, _, _)`, the pattern's binders are
+# appended to `lcs` so subsequent stmts (and the trailing final
+# expression) see them as locals. Other stmt forms (`SAssert`,
+# `SExprStmt`, dead `SVar` / `SUse` / `SIndexAssign`) are scope-
+# neutral. The accumulated `lcs` and the raw-declared subset are returned
+# alongside the concatenated C output so the caller can scope the final
+# expression with both.
+pub(pkg) type EmitBlockStmtsAcc = EBSA([LocalId], String, [LocalId], [LocalId])
+
+# Re-scope `cx` to a finished block's statement scope: the locals it bound
+# AND the subset of them declared raw (`kair_`). The trailing expression of
+# a block reads both, so applying only `lcs` sends a raw binder's read to a
+# `kaiv_` that was never declared.
+pub(pkg) fn emit_ctx_after_block_stmts(cx: EmitCtx, acc: EmitBlockStmtsAcc) : EmitCtx =
+  match acc { EBSA(l, _, k, own) -> emit_unw_own(own, emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, l), k)) }
+
+# The raw binders in scope after `s`: a `let` binder declared `kair_<nm>`
+# (an MUnboxed rhs, or a kind-1 slot of a destructuring pattern) has no
+# boxed `kaiv_<nm>` local, so later reads resolve through `kind1_raw`
+# exactly as an arm binder does. Every other binder the `let` introduces
+# is a real `kaiv_<nm>`; an outer raw one it shadows is another binder.
+pub(pkg) fn stmt_kind1_raw_after(s: Stmt, ks: [LocalId], cx: EmitCtx) : [LocalId] = match s {
+  SLet(pat, _, rhs) -> match pat.pkind {
+    PBind(b) -> match rhs.mode {
+      MUnboxed -> if locals_have(ks, b.id) { ks } else { [b.id, ...ks] }
+      _        -> list_drop_local(ks, b.id)
+    }
+    _ -> pat_kind1_binders(pat, cx, list_drop_locals(ks, pat_local_ids(pat)))
+  }
+  _ -> ks
+}
+
+fn list_drop_locals(ls: [LocalId], targets: [LocalId]) : [LocalId] = match targets {
+  [] -> ls
+  [t, ...rest] -> list_drop_locals(list_drop_local(ls, t), rest)
+}
+
+fn list_drop_local(ls: [LocalId], target: LocalId) : [LocalId] = match ls {
+  [] -> []
+  [n, ...rest] ->
+    if local_eq(n, target) { list_drop_local(rest, target) }
+    else { [n, ...list_drop_local(rest, target)] }
+}
+
+# m5 #3 — emit_stmt variant that consults the per-block drop set.
+# Only `SLet` is augmented; the other stmt forms route through the
+# original `emit_stmt` path. The set is the result of
+# `block_unused_lets`, so a name only appears here when it is safe
+# to decref immediately after the let.
+
+# A unique C temp for a shadowing `let`'s RHS — the (line, col) suffix
+# disambiguates nested shadows, the same scheme the destructuring-let temp
+# (`_letv_<line>_<col>`) uses. The leading `_shadow_` cannot collide with a
+# surface binder's `kair_`/`kai_` name.
+pub(pkg) fn shadow_tmp(name: Emitted, pat: Pattern) : String =
+  concat_all(["_shadow_", emitted_text(name), "_", int_to_string(pat.line), "_", int_to_string(pat.col)])
+
+# The name a reference names: its declaration's once resolved, the written
+# one before.
+pub(pkg) fn decl_ref_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
+}

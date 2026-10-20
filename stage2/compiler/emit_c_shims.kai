@@ -1,0 +1,367 @@
+# FFI bridge and protocol-dispatch shim bodies.
+
+import compiler.ast
+import compiler.core_refs
+import compiler.emit_shared
+import compiler.local_names
+import compiler.symtab
+import compiler.util
+
+# FFI v1: the C body of a scalar `extern "C" fn`. The shim
+# - forward-declares the extern symbol with the call site's C ABI types,
+# - unboxes each kaikai parameter into its C-side equivalent,
+# - calls the extern, releases the input args, and
+# - boxes the return value back into a `KaiValue *` (or `kai_unit()`
+#   for a `void`-returning extern).
+#
+# Boundary type translation:
+#   Int  ↔ int64_t    Real ↔ double      Bool ↔ int
+#   Char ↔ int32_t    String ↔ const char *    Unit ↔ void (return only)
+# Anything else surfaces as an `#error` so the C compiler flags it
+# at build time — silently emitting a wrong shim would be worse than
+# refusing the cast.
+pub(pkg) fn emit_ffi_shim_body(sig: String, name: String, params: [Param],
+                      ret_ty_opt: Option[TypeExpr], tab: SymTab, ns: LocalNames) : String {
+  let ret_kind = ffi_ret_kind_of(ret_ty_opt, tab)
+  # Forward-declare the extern symbol with the C ABI types the call site
+  # uses (`extern <ret> sym(<params>);`), so `cc` compiles the call
+  # without an implicit declaration. The declaration IS the binding
+  # contract: a user binding a libc symbol must declare a type whose C
+  # mapping matches the system header, or `cc` rejects the redeclaration
+  # at compile time — the binding is honoured literally, not silently
+  # reconciled. A `FfiRetUnknown` signature emits an `#error` body
+  # instead, so it gets no declaration.
+  let extern_decl = ffi_v1_extern_decl(name, params, ret_kind, tab)
+  let arg_setup = ffi_emit_arg_setup(params, tab, 0, ns)
+  let arg_list = ffi_emit_arg_list(params, 0)
+  let call_expr = concat_all([name, "(", arg_list, ")"])
+  let arg_decrefs = ffi_emit_arg_decrefs(params, 0, ns)
+  let body = match ret_kind {
+    FfiRetUnit -> concat_all([
+      arg_setup,
+      "    ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_unit();\n"
+    ])
+    FfiRetInt -> concat_all([
+      arg_setup,
+      "    int64_t _kai_ffi_ret = (int64_t) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_int(_kai_ffi_ret);\n"
+    ])
+    FfiRetReal -> concat_all([
+      arg_setup,
+      "    double _kai_ffi_ret = (double) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_real(_kai_ffi_ret);\n"
+    ])
+    FfiRetBool -> concat_all([
+      arg_setup,
+      "    int _kai_ffi_ret = (int) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_bool(_kai_ffi_ret != 0);\n"
+    ])
+    FfiRetChar -> concat_all([
+      arg_setup,
+      "    int32_t _kai_ffi_ret = (int32_t) ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_char((uint32_t) _kai_ffi_ret);\n"
+    ])
+    FfiRetString -> concat_all([
+      arg_setup,
+      "    const char *_kai_ffi_ret = ", call_expr, ";\n",
+      arg_decrefs,
+      "    return kai_str(_kai_ffi_ret == NULL ? \"\" : _kai_ffi_ret);\n"
+    ])
+    # Struct / opaque / fixed-width kinds never reach the basic shim —
+    # a signature using one routes to `emit_ffi_v2_shim_body`. Belt for
+    # exhaustiveness.
+    FfiRetFixed(_)    -> ffi_v1_v2_kind_error("fixed-width")
+    FfiRetFixedVal(_) -> ffi_v1_v2_kind_error("fixed-width")
+    FfiRetStruct(_)  -> ffi_v1_v2_kind_error("struct")
+    FfiRetForeign(_) -> ffi_v1_v2_kind_error("opaque")
+    FfiRetUnknown(t) -> concat_all([
+      "#error \"FFI return type `", t,
+      "` is not supported in m12.7.x — use Int / Real / Bool / String / Char / Unit\"\n"
+    ])
+  }
+  concat_all([extern_decl, sig, " {\n", body, "}\n\n"])
+}
+
+# Forward declaration for an `extern "C"` scalar symbol: `extern <ret>
+# sym(<params>);` over the C ABI types the shim's call site uses. A
+# `FfiRetUnknown` return yields the empty string — that signature emits
+# an `#error` body, so a declaration would only add noise.
+fn ffi_v1_extern_decl(name: String, params: [Param], ret_kind: FfiRetKind, tab: SymTab) : String =
+  match ret_kind {
+    FfiRetUnknown(_) -> ""
+    _ -> concat_all(["extern ", ffi_c_ret_type_str(ret_kind), " ", name,
+                     "(", ffi_c_param_list(params, tab), ");\n"])
+  }
+
+# A struct / opaque / fixed-width kind reaching the basic scalar shim
+# is a routing bug (`ffi_sig_uses_v2` should have sent it to
+# `emit_ffi_v2_shim_body`). Emit a `#error` naming the offending type
+# so the C compile fails loud.
+fn ffi_v1_v2_kind_error(name: String) : String =
+  concat_all(["#error \"FFI v2 type `", name,
+              "` reached the v1 scalar shim — internal routing bug\"\n"])
+
+# The fn a declared core builtin's declaration emits, so the builtin is a
+# value through its thunk: it hands its owned args to the runtime symbol.
+pub(pkg) fn emit_kai_forwarder_body(sig: String, body: Expr, params: [Param], ns: LocalNames) : String =
+  concat_all([sig, " {\n    return ", ffi_extern_symbol_of(body, ""), "(",
+              join_with(map(params, (p) => c_local(ln_emitted(ns, p.binder.id))), ", "), ");\n}\n\n"])
+
+# Option C: runtime-dispatch shim body for `__proto_<op>`. Looks up
+# the matching `__pimpl_*` in the impl-table by `(proto_id,
+# head_tag(self))` and tail-calls it.
+#
+# The shim signature must match the dispatcher's kaikai signature
+# byte-for-byte — `sig` already encodes that. The first parameter is
+# always `Self`-shaped (the receiver carries the dispatch tag); we
+# read its head tag and look up.
+#
+# If the lookup misses (no impl registered for the receiver's runtime
+# head), panic with a useful message. The validator pass
+# (`validate_resolved_protocols`) catches the static cases at compile
+# time; reaching the panic at runtime means either (a) a user wrote a
+# polymorphic helper without the required `T : P` bound and the bound
+# was not enforced at instantiation, or (b) impl-table corruption.
+#
+# `Eq.eq` has no lookup of its own: its dispatch is the `==` compare.
+pub(pkg) fn emit_proto_dispatch_shim_c(sig: String, parts: ProtoDispatchParts,
+                                params: [Param],
+                                ret_ty_opt: Option[TypeExpr], ns: LocalNames) : String =
+  if pdp_is_eq(parts) {
+    concat_all([sig, " {\n    return kai_op_eq_v(", proto_dispatch_arg_list(params, 0, ns), ");\n}\n\n"])
+  } else { emit_proto_lookup_shim_c(sig, parts, params, ns) }
+
+fn emit_proto_lookup_shim_c(sig: String, parts: ProtoDispatchParts,
+                            params: [Param], ns: LocalNames) : String {
+  match parts {
+    PDP(pname, opname) -> {
+      let proto_id_c = match pdp_core(parts) {
+        Some(cp) -> stdlib_proto_id_c(cp)
+        None     -> concat_all(["-1 /* unknown protocol ", pname,
+                                " — user protocols not supported in v1 */"])
+      }
+      let op_id_c = int_to_string(pdp_op_id_int(parts))
+      let arity = list_length(params)
+      let miss_msg = concat_all(["no impl of ", pname, ".", opname,
+                                  " for runtime head (arity 0 op: caller must annotate Self)"])
+      if arity == 0 {
+        # Arity-0 ops (`Default.default() : Self`) cannot be runtime-
+        # dispatched: there is no value to derive the head tag from,
+        # and Self is meant to be pinned by the caller's annotation
+        # so the monomorphiser resolves the impl statically. Reaching
+        # this body means the validator missed an unresolved call —
+        # panic with the diagnostic and never call back into the
+        # impl-table.
+        concat_all([
+          sig, " {\n",
+          "    fprintf(stderr, \"panic: ", miss_msg, "\\n\");\n",
+          "    kai_exit(1);\n",
+          "}\n\n"
+        ])
+      } else {
+        let cast = proto_dispatch_cast(arity)
+        let arg_list = proto_dispatch_arg_list(params, 0, ns)
+        let head_param = match params {
+          [p, ..._] -> c_local(ln_emitted(ns, p.binder.id))
+          []        -> c_temp("self")
+        }
+        concat_all([
+          sig, " {\n",
+          "    int32_t _kai_head = kai_head_tag(", head_param, ");\n",
+          "    void *_kai_fn_p = kai_lookup_impl(", proto_id_c, ", ", op_id_c, ", _kai_head);\n",
+          "    if (_kai_fn_p == NULL) {\n",
+          "        fprintf(stderr, \"panic: no impl of ", pname, ".", opname,
+                  " for runtime head %d\\n\", (int) _kai_head);\n",
+          "        kai_exit(1);\n",
+          "    }\n",
+          "    return ", cast, "_kai_fn_p)(", arg_list, ");\n",
+          "}\n\n"
+        ])
+      }
+    }
+  }
+}
+
+# The KAI_PROTO_* C constant the runtime impl table numbers a core
+# protocol with.
+pub(pkg) fn stdlib_proto_id_c(p: CoreProto) : String = match p {
+  CpShow         -> "KAI_PROTO_SHOW"
+  CpEq           -> "KAI_PROTO_EQ"
+  CpOrd          -> "KAI_PROTO_ORD"
+  CpHash         -> "KAI_PROTO_HASH"
+  CpSerialize    -> "KAI_PROTO_SERIALIZE"
+  CpBinSerialize -> "KAI_PROTO_BIN_SERIALIZE"
+  CpDefault      -> "KAI_PROTO_DEFAULT"
+  CpAdd          -> "KAI_PROTO_ADD"
+  CpSub          -> "KAI_PROTO_SUB"
+  CpMul          -> "KAI_PROTO_MUL"
+  CpDiv          -> "KAI_PROTO_DIV"
+  CpRem          -> "KAI_PROTO_REM"
+  CpNumeric      -> "KAI_PROTO_NUMERIC"
+  CpLayout       -> "KAI_PROTO_LAYOUT"
+  CpJson         -> "KAI_PROTO_JSON"
+  CpNeg          -> "KAI_PROTO_NEG"
+}
+
+# Build the C cast prefix for indirect call of a dispatcher of N
+# params. All params and the return are `KaiValue *`. The caller emits
+# the closing `)` after the cast and the arg list:
+# `return ((KaiValue *(*)(KaiValue *)) _kai_fn_p)(kai_a);`
+
+# Build the C cast prefix for indirect call of a dispatcher of N
+# params. All params and the return are `KaiValue *`. The caller emits
+# the closing `)` after the cast and the arg list:
+# `return ((KaiValue *(*)(KaiValue *)) _kai_fn_p)(kai_a);`
+fn proto_dispatch_cast(arity: Int) : String {
+  let args = proto_dispatch_kaivalueptr_list(arity, 0)
+  concat_all(["((KaiValue *(*)(", args, ")) "])
+}
+
+fn proto_dispatch_kaivalueptr_list(arity: Int, i: Int) : String {
+  if i >= arity { "" }
+  else if i == 0 { concat_all(["KaiValue *", proto_dispatch_kaivalueptr_list(arity, i + 1)]) }
+  else { concat_all([", KaiValue *", proto_dispatch_kaivalueptr_list(arity, i + 1)]) }
+}
+
+# Emit the kaikai params as a C call-arg list `kai_p0, kai_p1, ...`.
+
+# Emit the kaikai params as a C call-arg list `kai_p0, kai_p1, ...`.
+fn proto_dispatch_arg_list(params: [Param], i: Int, ns: LocalNames) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let head = if i == 0 { c_local(ln_emitted(ns, p.binder.id)) }
+                 else { cat2(", ", c_local(ln_emitted(ns, p.binder.id))) }
+      concat_all([head, proto_dispatch_arg_list(rest, i + 1, ns)])
+    }
+  }
+}
+
+fn ffi_c_ret_type_str(k: FfiRetKind) : String {
+  match k {
+    FfiRetUnit -> "void"
+    FfiRetInt -> "int64_t"
+    FfiRetReal -> "double"
+    FfiRetBool -> "int"
+    FfiRetChar -> "int32_t"
+    FfiRetString -> "const char *"
+    # FFI v2 kinds never reach these v1 helpers (the v2 shim path owns
+    # them); the body is `#error`, never compiled. Belt for exhaustiveness.
+    FfiRetFixed(_)    -> "void"
+    FfiRetFixedVal(_) -> "void"
+    FfiRetStruct(_)  -> "void"
+    FfiRetForeign(_) -> "void"
+    FfiRetUnknown(_) -> "void"  # body is `#error`, never compiled
+  }
+}
+
+fn ffi_c_param_type_str(p: Param, tab: SymTab) : String {
+  match p.ptype {
+    None -> "/* missing type */ void *"
+    Some(t) -> match ffi_kind_of_ty(t, tab) {
+      FfiRetInt -> "int64_t"
+      FfiRetReal -> "double"
+      FfiRetBool -> "int"
+      FfiRetChar -> "int32_t"
+      FfiRetString -> "const char *"
+      FfiRetUnit -> "/* Unit param not supported */ void *"
+      FfiRetFixed(_)    -> "/* v2 fixed-width — v2 shim path */ void *"
+      FfiRetFixedVal(_) -> "/* v2 fixed-width — v2 shim path */ void *"
+      FfiRetStruct(_)  -> "/* v2 struct — v2 shim path */ void *"
+      FfiRetForeign(_) -> "/* v2 opaque — v2 shim path */ void *"
+      FfiRetUnknown(_) -> "/* unsupported FFI param */ void *"
+    }
+  }
+}
+
+fn ffi_c_param_list(params: [Param], tab: SymTab) : String {
+  match params {
+    [] -> "void"
+    _ -> join_with(map(params, (p) => ffi_c_param_type_str(p, tab)), ", ")
+  }
+}
+
+# Emit a sequence of local C bindings that unbox each kaikai
+# parameter into the matching C scalar. The shim stores the inputs
+# in `_kai_ffi_argN` so they survive across the extern call long
+# enough for the caller to release the boxed inputs after the call.
+
+# Emit a sequence of local C bindings that unbox each kaikai
+# parameter into the matching C scalar. The shim stores the inputs
+# in `_kai_ffi_argN` so they survive across the extern call long
+# enough for the caller to release the boxed inputs after the call.
+fn ffi_emit_arg_setup(params: [Param], tab: SymTab, i: Int, ns: LocalNames) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> {
+      let kind = match p.ptype {
+        None -> FfiRetUnknown("missing")
+        Some(t) -> ffi_kind_of_ty(t, tab)
+      }
+      let arg_name = concat_all(["_kai_ffi_arg", int_to_string(i)])
+      let stmt = match kind {
+        FfiRetInt -> concat_all([
+          "    int64_t ", arg_name, " = kai_intf(", c_local(ln_emitted(ns, p.binder.id)), ");\n"
+        ])
+        FfiRetReal -> concat_all([
+          "    double ", arg_name, " = ", c_local(ln_emitted(ns, p.binder.id)), "->as.r;\n"
+        ])
+        FfiRetBool -> concat_all([
+          "    int ", arg_name, " = ", c_local(ln_emitted(ns, p.binder.id)), "->as.b ? 1 : 0;\n"
+        ])
+        FfiRetChar -> concat_all([
+          "    int32_t ", arg_name, " = (int32_t) ", c_local(ln_emitted(ns, p.binder.id)), "->as.c;\n"
+        ])
+        FfiRetString -> concat_all([
+          "    const char *", arg_name, " = ", c_local(ln_emitted(ns, p.binder.id)), "->as.s.bytes;\n"
+        ])
+        FfiRetUnit -> concat_all([
+          "    /* Unit FFI arg #", int_to_string(i), " elided */\n"
+        ])
+        # FFI v2 kinds are handled by the v2 shim path, never here.
+        FfiRetFixed(_)    -> ffi_v1_v2_kind_error("fixed-width")
+        FfiRetFixedVal(_) -> ffi_v1_v2_kind_error("fixed-width")
+        FfiRetStruct(_)  -> ffi_v1_v2_kind_error("struct")
+        FfiRetForeign(_) -> ffi_v1_v2_kind_error("opaque")
+        FfiRetUnknown(t) -> concat_all([
+          "#error \"FFI arg type `", t, "` is not supported\"\n"
+        ])
+      }
+      cat2(stmt, ffi_emit_arg_setup(rest, tab, i + 1, ns))
+    }
+  }
+}
+
+fn ffi_emit_arg_list(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [_, ...rest] -> {
+      let head = concat_all(["_kai_ffi_arg", int_to_string(i)])
+      match rest {
+        [] -> head
+        _ -> concat_all([head, ", ", ffi_emit_arg_list(rest, i + 1)])
+      }
+    }
+  }
+}
+
+# After the extern returns we must release the boxed kaikai inputs;
+# the calling convention hands ownership to the callee.
+
+# After the extern returns we must release the boxed kaikai inputs;
+# the calling convention hands ownership to the callee.
+fn ffi_emit_arg_decrefs(params: [Param], i: Int, ns: LocalNames) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> cat2(
+      concat_all(["    kai_decref(", c_local(ln_emitted(ns, p.binder.id)), ");\n"]),
+      ffi_emit_arg_decrefs(rest, i + 1, ns)
+    )
+  }
+}
