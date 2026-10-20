@@ -32,7 +32,7 @@ export HOME="$WORK/home"
 export XDG_CACHE_HOME="$WORK/home/cache"
 
 got="$(cd "$WORK/w1" && "$KAI" run --backend=native one.kai 2> "$WORK/err1")" || {
-  grep -q "native backend unavailable" "$WORK/err1" && { echo "ncoreobj_cspec_lambda: SKIP — native backend unavailable"; exit 0; }
+  grep -q -E "native backend (unavailable|is not built)" "$WORK/err1" && { echo "ncoreobj_cspec_lambda: SKIP — native backend unavailable"; exit 0; }
   cat "$WORK/err1"; fail "the first program does not run"; }
 [ "$got" = "Ok(2)" ] || fail "the first program printed '$got'"
 
