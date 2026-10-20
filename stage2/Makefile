@@ -13897,6 +13897,8 @@ FIXTURE_SLUGS := $(shell sh ../tools/fixture-dir.sh --list)
 FIXTURE_UNITS := $(addprefix test-dir-,$(FIXTURE_SLUGS))
 registry_pool = $(shell awk '$$1 !~ /^\#/ && $$2 == "$(1)" { print $$1 }' test-registry.txt)
 TEST_LIGHT_TARGETS := $(call registry_pool,light) $(FIXTURE_UNITS)
+FIXTURE_NATIVE_SLUGS := $(shell FIXTURE_BACKEND=native sh ../tools/fixture-dir.sh --list-native)
+FIXTURE_NATIVE_UNITS := $(addprefix test-dir-native-,$(FIXTURE_NATIVE_SLUGS))
 
 print-light-targets:
 	@echo $(TEST_LIGHT_TARGETS)
@@ -13908,6 +13910,12 @@ test-dir-$(1): $$(TARGET) build core-cache-warm
 	  sh ../tools/fixture-dir.sh $(1)
 endef
 $(foreach slug,$(FIXTURE_SLUGS),$(eval $(call fixture_unit_rule,$(slug))))
+
+define fixture_native_unit_rule
+test-dir-native-$(1): $$(TARGET) bin-kai build core-cache-warm
+	@FIXTURE_BACKEND=native FIXTURE_JOBS=$$(TEST_JOBS) sh ../tools/fixture-dir.sh $(1)
+endef
+$(foreach slug,$(FIXTURE_NATIVE_SLUGS),$(eval $(call fixture_native_unit_rule,$(slug))))
 
 # The random program generator behind the nightly differential run still
 # builds, is deterministic, and emits programs the C backend accepts.
@@ -13946,7 +13954,7 @@ test-pub-pkg: $(TARGET) bin-kai
 # without libLLVM the wrapper degrades to the C backend, so running these
 # in the C-built tier1 job asserts nothing about native — they belong to
 # the job that builds with KAI_LLVM=1.
-TEST_NATIVE_WRAPPER_TARGETS := $(call registry_pool,native-wrapper)
+TEST_NATIVE_WRAPPER_TARGETS := $(call registry_pool,native-wrapper) $(FIXTURE_NATIVE_UNITS)
 .PHONY: $(TEST_LIGHT_TARGETS) $(TEST_NATIVE_WRAPPER_TARGETS)
 
 test-native-wrapper: $(TARGET) build
