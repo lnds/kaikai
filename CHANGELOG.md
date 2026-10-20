@@ -84,6 +84,48 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.167.0 (2026-10-19)
+
+### BREAKING CHANGE
+
+- code that passes an effectful closure where a pure
+function type is expected is now rejected. Widen the expected function
+type's row (`/ e`) or handle the effect before the call.
+- the Stream constructor now wraps `() -> Unit / Emit[t] + e`
+instead of `((t) -> Bool / e) -> Unit / e`. Code that built or matched
+`Stream(...)` directly must produce through `Emit.emit` and consume through
+a handler; from_list, read_lines, write_lines and the pipe stages are
+unchanged for their users.
+
+### Added
+
+- **stdlib**: stream is a generator over the Emit effect
+
+### Fixed
+
+- **typer**: drop an unused import that fails the selfhost warning gate
+- **native**: keep --native-obj-dir out of the core pre-key
+- **cli**: native builds compile the entry from its own path
+- **native**: give the whole target file one module and one object
+- **typer**: take a module's union rows by identity, not by position
+- **stdlib**: allocate the policy mailbox without a Pid-returning helper
+- **typer**: a declared row variable is rigid in its function body
+- **typer**: resolve an extern type from its own module when another module declares the same name
+- **fmt**: keep trailing comments on clause-block arms; parse a punned last field before a newline-then-brace
+- **perceus**: a call through a dup'd closure read is an owned rvalue in a borrowed slot
+- **perceus**: a handler clause registers its op arguments for unwind on C
+- **perceus**: a closure body pasted as a block keeps its type
+
+### Changed
+
+- **compiler**: merge the desugar, refine and interp dwarf modules by cohesion
+- **compiler**: merge the protos, proto and derive dwarf modules by cohesion
+- **perceus**: merge the borrow-strip, linearity, core and reuse dwarf modules by cohesion
+- **typer**: map a surface form's children without a pure callback
+- **perceus**: merge the read, payer, lend and drop dwarf modules by cohesion
+- **effects**: resolve the fiber once per evidence lookup and test Cancel by its first byte
+- **compiler**: merge the unbox, resume and borrow dwarf modules by cohesion
+
 ## v0.166.0 (2026-10-19)
 
 ### BREAKING CHANGE
