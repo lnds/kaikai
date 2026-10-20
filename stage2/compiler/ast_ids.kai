@@ -1,0 +1,636 @@
+#[doc("Identity and vocabulary types of the compiler's data model: symbol, local and type-variable ids, kinds, operators, marks, core type names and the registries that key on them.")]
+
+import compiler.written
+import compiler.real_lit
+import compiler.escapes
+
+#[derive(BinSerialize)]
+pub(pkg) type ValueMode
+  = MUnknown   # parser default; unbox_pass assigns one of the below
+  | MBoxed     # KaiValue * (current behaviour everywhere)
+  | MUnboxed   # raw int64_t / int / uint32_t, chosen by `ty`
+
+# i64-inline (kind-1 Int variant slots) — the unbox pass needs to know,
+# per constructor, which payload slots are raw-`int64_t` Int fields so it
+# can seed `MUnboxed` for the sub-PBind binders that read them. The slot
+# kind classification lives in the emit layer (the variant table), which
+# sits AFTER unbox in the bundle, so the driver pre-computes this map (it
+# can reach both layers) and hands it to `unbox_pass`. Each `CIS(ctor,
+# is_int)` lists, in slot order, whether slot i is a kind-1 Int field.
+# Reading a boxed slot raw is a segfault.
+pub(pkg) type CtorIntSlots = CIS(SymId, [Bool])
+
+# A match-arm variant Int sub-binder the native backend seeds raw (`MUnboxed`),
+# keyed by its `PBind` source position. The verdict is decided ONCE pre-perceus
+# in `native_raw_arm_binders` (`unbox.kai`), where the ctor slot layout, the
+# interp/lambda guards, and the `native_arm_binder_raw_safe` predicate are all
+# in hand over the pre-perceus body; perceus and KIR-lowering READ it, never
+# re-derive. The position is the stable key — a `PBind`'s line/col survive both
+# passes untouched — so the rawness verdict never desyncs across phases the way
+# a body re-scan does when perceus drops a binder's `MUnboxed` reads (#1229).
+pub(pkg) type RawArmBinder = RAB(LocalId, Int, Int)
+
+#[doc("An opaque per-declaration identity. Distinct declarations get distinct ids regardless of spelling.")]
+#[derive(BinSerialize)]
+pub type SymId = SymId(Int)
+
+#[doc("A reference to a declaration: what the source wrote (an optional qualifier and a name) until it is resolved, the declaration's id after. A resolved reference keeps no text.")]
+#[derive(BinSerialize)]
+pub type DeclRef = DrWritten(Option[Written], Written) | DrSym(SymId)
+
+#[doc("The identity of a local binder. The resolver numbers the binders a program writes from 1 up; a binder the compiler mints is numbered from its mint key, below zero; 0 is a binder not numbered yet.")]
+#[derive(BinSerialize)]
+pub(pkg) type LocalId = LocalId(Int)
+
+#[doc("A local binder where it is declared: its identity, and the name it was written or minted with.")]
+#[derive(BinSerialize)]
+pub type Binder = { id: LocalId, name: Written }
+
+#[doc("The identity of a type parameter. The binding pass numbers the parameters a declaration writes from its own identity and their position, so two declarations never share one; a parameter the compiler mints is numbered from its mint key, below zero; 0 is a parameter not numbered yet.")]
+#[derive(BinSerialize)]
+pub(pkg) type TLocalId = TLocalId(Int)
+
+#[doc("What a type parameter ranges over: types, the habitants of the named unit kind, arity-1 constructors, or effect rows. A row hole (`/ ?e`) is a row parameter that keeps the position it was written at.")]
+#[derive(BinSerialize)]
+pub(pkg) type Kind = KType | KUnit(String) | KShape | KRow | KRowHole(Int, Int)
+
+#[doc("A type parameter where it is declared: its identity, the name it was written with, its kind and its protocol bounds. `implicit` marks one the source never listed in `[...]`.")]
+#[derive(BinSerialize)]
+pub(pkg) type TBinder = { id: TLocalId, name: Written, kind: Kind, bounds: [DeclRef], implicit: Bool }
+
+#[doc("A row's open tail: the name the source wrote, or the hole it wrote (`?` / `?name`, with its position), until the binding pass numbers it; the row parameter's id after.")]
+#[derive(BinSerialize)]
+pub(pkg) type TParamRef = TpWritten(Written) | TpHole(Option[String], Int, Int) | TpId(TLocalId)
+
+#[doc("Which handler instance a perform reaches: the ambient one, the one a `with … as a` alias names, or the capability a receiver parameter holds.")]
+#[derive(BinSerialize)]
+pub(pkg) type OpVia = ViaAmbient | ViaAlias(LocalId) | ViaRecv(LocalId)
+
+#[doc("A resolved effect operation: the effect's declaration, the operation's label inside it, and the instance it goes through.")]
+#[derive(BinSerialize)]
+pub(pkg) type OpRef = { eff: SymId, op: Written, via: OpVia }
+
+#[doc("The integer behind a `SymId`. Only the symbol table indexes with it.")]
+pub fn sym_raw(s: SymId) : Int = match s { SymId(i) -> i }
+
+#[doc("The id a symbol owned by nothing reports: a module owns no symbol, so its owner slot points at itself being unowned.")]
+pub fn sym_none() : SymId = SymId(0 - 1)
+
+# The class word fences the length-prefixed home from the name: no
+# class word holds a ':', so no two keys spell alike. Folding the sign
+# keeps ids non-negative, so a negative raw value means "none" or "local".
+#[doc("The id the symbol table gives the declaration of `name` homed at `home`, whose class reads as `word`.")]
+pub(pkg) fn sym_derive_word(word: String, name: String, home: String) : SymId {
+  let h = string_hash(string_concat_all([int_to_string(string_length(home)), ":", home, word, ":", name]))
+  SymId(if h >= 0 { h } else { 0 - (h + 1) })
+}
+
+#[doc("The home of the always-available types: a token no module path spells, so no user module can mint their ids.")]
+pub(pkg) fn core_type_home() : String = "@core"
+
+#[doc("The always-available types no declaration spells: the runtime builds them, and each still has one identity.")]
+pub(pkg) fn core_type_names() : [String] = ["Option", "Result", "Array", "Vec", "List", "Pid", "Fiber", "Ref", "Cont"]
+
+#[doc("An always-available type, named without building its spelling.")]
+pub(pkg) type CoreTy = CtOption | CtResult | CtArray | CtVec | CtList | CtPid | CtFiber | CtRef | CtCont
+
+#[doc("True when `name` is one of the always-available types.")]
+pub(pkg) fn is_core_type(name: String) : Bool = core_type_index(name) >= 0
+
+# The position of `name` in `core_type_names`, or -1. Every core name is
+# 3 to 6 bytes, so its bytes packed into one Int pick it with no string
+# built or compared.
+pub(pkg) fn core_type_index(name: String) : Int = {
+  let n = string_length(name)
+  if n < 3 or n > 6 { 0 - 1 } else { core_type_slot(core_type_key(name, 0, n, 0)) }
+}
+
+pub(pkg) fn core_type_key(name: String, i: Int, n: Int, k: Int) : Int =
+  if i >= n { k } else { core_type_key(name, i + 1, n, k * 256 + string_byte_at_int(name, i)) }
+
+pub(pkg) fn core_type_slot(key: Int) : Int = match key {
+  87344407998318 -> 0
+  90595682249844 -> 1
+  281092972921   -> 2
+  5662051        -> 3
+  1281979252     -> 4
+  5269860        -> 5
+  302415766898   -> 6
+  5399910        -> 7
+  1131376244     -> 8
+  _ -> 0 - 1
+}
+
+pub(pkg) fn core_ty_index(c: CoreTy) : Int = match c {
+  CtOption -> 0
+  CtResult -> 1
+  CtArray  -> 2
+  CtVec    -> 3
+  CtList   -> 4
+  CtPid    -> 5
+  CtFiber  -> 6
+  CtRef    -> 7
+  CtCont   -> 8
+}
+
+pub(pkg) fn core_type_name_at(i: Int) : String = match i {
+  0 -> "Option"
+  1 -> "Result"
+  2 -> "Array"
+  3 -> "Vec"
+  4 -> "List"
+  5 -> "Pid"
+  6 -> "Fiber"
+  7 -> "Ref"
+  8 -> "Cont"
+  _ -> ""
+}
+
+pub(pkg) fn core_type_sym_at(i: Int) : Int = match i {
+  0 -> 419335856564838365
+  1 -> 68913598981535332
+  2 -> 3306275245617059961
+  3 -> 2427272171309984354
+  4 -> 363654644927662548
+  5 -> 621773472954172547
+  6 -> 1534382332061659986
+  7 -> 1152125105698923119
+  8 -> 2611794408540860701
+  _ -> 0 - 1
+}
+
+#[doc("The name the core type `c` is spelled with.")]
+pub(pkg) fn core_ty_name(c: CoreTy) : String = core_type_name_at(core_ty_index(c))
+
+#[doc("The spelling of the core type whose identity is `s`, if `s` is one.")]
+pub(pkg) fn core_type_name_of(s: SymId) : Option[String] = core_type_name_scan(sym_raw(s), 0)
+
+pub(pkg) fn core_type_name_scan(id: Int, i: Int) : Option[String] =
+  if i > 8 { None }
+  else if core_type_sym_at(i) == id { Some(core_type_name_at(i)) }
+  else { core_type_name_scan(id, i + 1) }
+
+#[doc("The identity of the core type `c`.")]
+pub(pkg) fn core_ty_sym(c: CoreTy) : SymId = SymId(core_type_sym_at(core_ty_index(c)))
+
+#[doc("True when the identity `s` is the core type `c`. An absent identity is no core type.")]
+pub(pkg) fn core_ty_is(s: SymId, c: CoreTy) : Bool = sym_raw(s) == core_type_sym_at(core_ty_index(c))
+
+#[doc("The identity of the always-available type `name`, homed at the reserved core home.")]
+pub(pkg) fn core_type_sym(name: String) : SymId = {
+  let i = core_type_index(name)
+  if i >= 0 { SymId(core_type_sym_at(i)) } else { core_type_sym_derived(name) }
+}
+
+#[doc("The identity a runtime-built type `name` carries: the core one, or none for a name the core does not own.")]
+pub(pkg) fn core_type_sym_or_none(name: String) : SymId = {
+  let i = core_type_index(name)
+  if i >= 0 { SymId(core_type_sym_at(i)) } else { sym_none() }
+}
+
+# The derivation `core_type_sym` tabulates, so no lookup rehashes; the
+# symbol table selftest holds the two equal. Halved so every core id is an
+# immediate Int: a wider one costs a heap cell each time the table is read.
+#[doc("The identity of the always-available type `name`, derived from its name at the reserved core home.")]
+pub(pkg) fn core_type_sym_derived(name: String) : SymId = SymId(sym_raw(sym_derive_word("type", name, core_type_home())) / 2)
+
+#[doc("An unqualified reference as the source wrote it.")]
+pub fn ref_written(n: String) : DeclRef = DrWritten(None, written(n))
+
+#[doc("A reference the source qualified with `q`.")]
+pub(pkg) fn ref_qualified(q: String, n: String) : DeclRef = DrWritten(Some(written(q)), written(n))
+
+#[doc("The declaration a reference resolved to, `sym_none()` while it is still written text.")]
+pub(pkg) fn ref_sym(r: DeclRef) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(_, _) -> sym_none()
+}
+
+#[doc("True once the reference names a declaration.")]
+pub(pkg) fn ref_resolved(r: DeclRef) : Bool = sym_raw(ref_sym(r)) >= 0
+
+#[doc("The integer behind a `LocalId`.")]
+pub(pkg) fn local_raw(l: LocalId) : Int = match l { LocalId(i) -> i }
+
+#[doc("The id of a binder the resolver has not numbered yet.")]
+pub(pkg) fn local_none() : LocalId = LocalId(0)
+
+#[doc("True when both ids name the same numbered binder.")]
+pub(pkg) fn local_eq(a: LocalId, b: LocalId) : Bool = local_raw(a) != 0 and local_raw(a) == local_raw(b)
+
+#[doc("The id of the binder a pass mints under `key`: one key, one binder, and no key collides with a binder the resolver numbered.")]
+pub(pkg) fn local_minted(key: String) : LocalId = {
+  let h = string_hash(key)
+  LocalId(if h >= 0 { 0 - 1 - h } else { h })
+}
+
+#[doc("True when `l` is a binder the compiler minted rather than one the source declares.")]
+pub(pkg) fn local_is_minted(l: LocalId) : Bool = local_raw(l) < 0
+
+#[doc("A binder as the source wrote it, not numbered yet.")]
+pub fn binder_written(n: String) : Binder = Binder { id: local_none(), name: written(n) }
+
+#[doc("The binder a pass mints under `key`, which is also the name it is spelled with.")]
+pub(pkg) fn binder_minted(key: String) : Binder = Binder { id: local_minted(key), name: written(key) }
+
+#[doc("`b` numbered `id`.")]
+pub(pkg) fn binder_numbered(b: Binder, id: LocalId) : Binder = Binder { id: id, name: b.name }
+
+#[doc("The integer behind a `TLocalId`.")]
+pub(pkg) fn tlocal_raw(t: TLocalId) : Int = match t { TLocalId(i) -> i }
+
+#[doc("The id of a type parameter the binding pass has not numbered yet.")]
+pub(pkg) fn tlocal_none() : TLocalId = TLocalId(0)
+
+#[doc("True when both ids name the same numbered type parameter.")]
+pub(pkg) fn tlocal_eq(a: TLocalId, b: TLocalId) : Bool = tlocal_raw(a) != 0 and tlocal_raw(a) == tlocal_raw(b)
+
+# The seed is cut to 40 bits so the result stays an immediate Int; the
+# position is added, never masked, so two positions under one seed
+# always differ.
+#[doc("The id of the type parameter at position `i` (from 1) of the declaration seeded `seed`: its symbol id, or a hash that stands for it.")]
+pub(pkg) fn tlocal_seeded(seed: Int, i: Int) : TLocalId = {
+  let s = if seed >= 0 { seed } else { 0 - (seed + 1) }
+  TLocalId((s % 1099511627776 + 1) * 65536 + i)
+}
+
+#[doc("The id of `Self` inside the protocol `proto`: the parameter every protocol binds without listing it.")]
+pub(pkg) fn tlocal_self(proto: SymId) : TLocalId = tlocal_seeded(sym_raw(proto), 0)
+
+#[doc("True when `t` is a protocol's `Self`: position 0 of a declaration, which no listed parameter takes.")]
+pub(pkg) fn tlocal_is_self(t: TLocalId) : Bool = tlocal_raw(t) > 0 and tlocal_raw(t) % 65536 == 0
+
+#[doc("The id of the type parameter a pass mints under `key`: one key, one parameter, and no key collides with a numbered one.")]
+pub(pkg) fn tlocal_minted(key: String) : TLocalId = {
+  let h = string_hash(key)
+  TLocalId(if h >= 0 { 0 - 1 - h } else { h })
+}
+
+#[doc("A type parameter as the source wrote it, not numbered yet.")]
+pub(pkg) fn tbinder_written(n: String, k: Kind, bounds: [DeclRef]) : TBinder =
+  TBinder { id: tlocal_none(), name: written(n), kind: k, bounds: bounds, implicit: false }
+
+#[doc("The type parameter a pass mints under `key`, which is also the name it is shown with.")]
+pub(pkg) fn tbinder_minted(key: String) : TBinder =
+  TBinder { id: tlocal_minted(key), name: written(key), kind: KType, bounds: [], implicit: false }
+
+#[doc("The instance index of a reference to a declaration itself rather than to one of its specialisations.")]
+pub(pkg) fn spec_none() : Int = 0 - 1
+
+#[doc("""
+A function's identity below monomorphisation: its declaration's `SymId`
+and which instance of it, `spec_none()` for the declaration itself or k
+for its k-th specialisation.
+
+A specialisation is not a symbol: it is its generic's id plus the types
+it was instantiated at, and the instance index stands for those types.
+""")]
+#[derive(BinSerialize)]
+pub(pkg) type FnId = FnId(SymId, Int)
+
+#[doc("The declaration a function identity belongs to.")]
+pub(pkg) fn fnid_sym(f: FnId) : SymId = match f { FnId(s, _) -> s }
+
+#[doc("The instance a function identity names: `spec_none()` or a specialisation index.")]
+pub(pkg) fn fnid_inst(f: FnId) : Int = match f { FnId(_, k) -> k }
+
+#[doc("The identity of the declaration `s` itself.")]
+pub(pkg) fn fnid_decl(s: SymId) : FnId = FnId(s, spec_none())
+
+#[doc("The identity an unresolved function carries.")]
+pub(pkg) fn fnid_none() : FnId = fnid_decl(sym_none())
+
+#[doc("True when both identities name the same instance of the same resolved declaration.")]
+pub(pkg) fn fnid_eq(a: FnId, b: FnId) : Bool =
+  sym_raw(fnid_sym(a)) >= 0 and sym_raw(fnid_sym(a)) == sym_raw(fnid_sym(b)) and fnid_inst(a) == fnid_inst(b)
+
+#[doc("True when two nominal types carry the same identity. The absent id is one identity, an error placeholder's: it equals only itself.")]
+pub(pkg) fn sym_same(a: SymId, b: SymId) : Bool = sym_raw(a) == sym_raw(b)
+
+#[doc("What a self tail call carries to its jump: the function whose entry label it targets, the bit set of parameters released before the rebind, and the parameters in declaration order.")]
+#[derive(BinSerialize)]
+pub(pkg) type TcrecStep = { fid: FnId, dropmask: Int, params: [String] }
+
+#[doc("The cell a modulo-cons step builds: a builtin cons, a builtin cons whose step also releases the scrutinee it consumed, or a variant of a constructor.")]
+#[derive(BinSerialize)]
+pub(pkg) type TrmcSpine = TsCons | TsConsScr | TsCtor(SymId)
+
+#[doc("What a modulo-cons step carries to its jump: the fields of a `TcrecStep`, the cell it builds and the slot of that cell the self call fills.")]
+#[derive(BinSerialize)]
+pub(pkg) type TrmcStep = { fid: FnId, hole: Int, spine: TrmcSpine, dropmask: Int, params: [String] }
+
+#[doc("A mark the compiler plants in a body and reads back downstream. The set is closed because this compiler plants every one of them; `compiler.marks` holds the spelling each carries into the backend.")]
+#[derive(BinSerialize)]
+pub(pkg) type Mark = MkFuseMissing | MkScrutinee | MkGuardDrop | MkBorrow
+  | MkApplyBorrow | MkTrmcApply | MkOwnedBorrow | MkDrop
+  | MkLamTake([LocalId])
+  | MkDup | MkReuseCons | MkReuseVariant | MkReuseRecord
+  | MkFixedVecLit | MkFixedVecGet | MkFixedVecGetDyn
+  | MkTcrecStep(TcrecStep) | MkTrmcStep(TrmcStep)
+  # A `region { }` block as the parser read it: called on the block, or
+  # on a one-parameter lambda that names the region.
+  | MkRegion
+  # A record literal's field written without a name: a positional value,
+  # and the `...src` a spread copies from. Called on the value, in the
+  # field's slot, until the record desugar gives every field its name.
+  | MkFieldPos | MkFieldSpread
+  # `@x` on a bare name, called on that reference: the cell-read lowering
+  # decides whether `x` is a `Ref` to read or a cell that reads naked.
+  | MkDeref
+  # A `var` lowered to a one-cell slot, naming the var: stands for the
+  # call that allocates the slot, called on that call's callee and
+  # arguments, until the cell-read relowering has sent every late read
+  # of the var to the slot.
+  | MkVarSlot(String)
+  # The collection of an index read while the read is typed: bound in the
+  # typing environment only, and replaced by the typed collection after.
+  | MkIndexColl
+  # An operation several protocols declare, called where no type tells
+  # them apart yet: the dispatchers that stand for it. The dispatch
+  # rewrite settles the call once the receiver has a type.
+  | MkProtoOp([SymId])
+  # A part of a `lazy [...]` literal, called on it: a cell's thunk, or a
+  # range bound evaluated where the literal stands. The typer holds the
+  # part to an empty effect row and leaves the part itself. True on the
+  # part that opens the literal.
+  | MkLazy(Bool)
+  # The progression of a `lazy` range, called on the call that builds it,
+  # whose first argument is the range's start. The typer makes a range
+  # that starts at a `Char` count code points, and leaves the call.
+  | MkLazyRange
+  # The `show` that renders a `#{...}` hole, called on the hole's
+  # expression: stands for the dispatcher until the protocols are
+  # registered and the hole's home says which one it is.
+  | MkInterpShow
+
+#[doc("A compiler-internal operation, written `$name(args)`. The set is closed because this compiler implements every one of them; `compiler.intrinsics` holds the spelling each has after the `$`.")]
+#[derive(BinSerialize)]
+pub(pkg) type Intrinsic
+  # A default clause body bridging to a C symbol.
+  = InExternHandler
+  # A promoted var cell: its init, a read, a write. The read and the
+  # write name the cell by their first argument.
+  | InCellInit | InCellGet | InCellSet
+  # A loop combinator call pasted inline: the original callee, then the
+  # combinator's arguments.
+  | InLoopWhile | InLoopUntil | InLoopRepeat
+  # The clause tail deferred past a non-tail `resume`, and the report of
+  # a `resume` shape the split cannot express.
+  | InResumeFrame | InResumeBad
+  # A handle on a stack segment, a forwarding clause's request to it,
+  # and `$seg_state(s, body)` binding a stateful clause's state aliases
+  # to `s`.
+  | InSegHandle | InSegRequest | InSegState
+  # The value a fused call passes in a slot its target does not take: it
+  # types as any type, is the unit value boxed and a zero raw, and is
+  # never read.
+  | InAbsent
+  # A coverage probe: the static `<line>,<line>,...:<file>` site it
+  # reports reached. Types as unit; never written in source.
+  | InCovHit(String)
+  # A name that denotes no intrinsic; the typer rejects the node.
+  | InUnknown(String)
+
+#[doc("The operator of an `EBinop`. The set is closed because the parser accepts no other; `compiler.operators` holds the spelling of each.")]
+#[derive(BinSerialize)]
+pub(pkg) type BinOp = BoAdd | BoSub | BoMul | BoDiv | BoMod | BoPow | BoConcat
+  | BoEq | BoNe | BoLt | BoGt | BoLe | BoGe
+  | BoAnd | BoOr
+
+#[doc("The operator of an `EDispatchPipe`: which op of the head type's owner the pipe calls.")]
+#[derive(BinSerialize)]
+pub(pkg) type PipeOp = PoMap | PoFlatMap | PoFilter | PoEach
+
+#[doc("The operator of an `EUnop`: arithmetic negation or logical `not`.")]
+#[derive(BinSerialize)]
+pub(pkg) type UnOp = UoNeg | UoNot
+
+#[derive(BinSerialize)]
+pub(pkg) type UnitExprT
+  = UOne                                    # the dimensionless unit "1"
+  | USym(String)                            # atomic unit name (USD, m, kg)
+  | UMul(UnitExprT, UnitExprT)              # product
+  | UInv(UnitExprT)                          # multiplicative inverse
+  | UPow(UnitExprT, Int)                     # integer power
+  | UJoin(UnitExprT, UnitExprT)             # semilattice join (`read + write`)
+  | UVar(Int)                                # unit unification variable
+  # A positional habitant list (`Matrix[t]<m, n>`): components unify
+  # point to point and never mix. Only a whole `<>` slot with two or
+  # more comma-separated habitants produces one, so a UDims never nests
+  # inside another unit operation.
+  | UDims([UnitExprT])
+  # A use of a unit-kind type parameter.
+  | UParam(TLocalId)
+
+# The built-in abelian kind `unit` introduces into. Habitants declared
+# with the `unit` keyword inhabit it; its output is elided everywhere
+# so all pre-existing `unit` code stays byte-identical.
+#[doc("Name of the built-in abelian kind (`Measure`) that the `unit` keyword introduces habitants into.")]
+pub(pkg) fn measure_kind_name() : String = "Measure"
+
+#[doc("What a handler clause handles: an operation of the effect, by name, or one end of the handler's own lifetime. The parser decides which, so an effect stays free to declare an op called `initially` or `finally`.")]
+#[derive(BinSerialize)]
+pub(pkg) type ClauseHead = ChOp(String) | ChInitially | ChFinally
+
+#[doc("The word a clause is headed by: the operation's name, or the lifecycle keyword.")]
+pub(pkg) fn clause_head_word(h: ClauseHead) : String = match h {
+  ChOp(n)     -> n
+  ChInitially -> "initially"
+  ChFinally   -> "finally"
+}
+
+#[doc("The lifecycle clause a keyword opens, or `None` for any other word.")]
+pub(pkg) fn clause_lifecycle_of_word(w: String) : Option[ClauseHead] = match w {
+  "initially" -> Some(ChInitially)
+  "finally"   -> Some(ChFinally)
+  _           -> None
+}
+
+# Body of a `DExternType`. `ETStruct` carries the C struct's fields
+# (each typed with a fixed-width boundary type); `ETOpaque` is a bare
+# opaque handle with no inspectable layout.
+#[doc("The calling convention of an `extern` fn: C scalars marshalled at the boundary, or boxed kaikai values that enter and leave owned, as a core builtin's do.")]
+#[derive(BinSerialize)]
+pub(pkg) type ExternAbi = AbiC | AbiKai
+
+#[doc("The ABI's string literal as `extern` spells it.")]
+pub(pkg) fn extern_abi_literal(a: ExternAbi) : String = match a {
+  AbiC   -> "\"C\""
+  AbiKai -> "\"kai\""
+}
+
+# Body of a `DUnit` habitant declaration: atomic symbol, unit alias,
+# or a symbol carrying an exact numeric measure (`pct pct70 = 70`,
+# stored as the literal's source text).
+#[derive(BinSerialize)]
+pub(pkg) type UnitBody = UBNone | UBAlias(UnitExprT) | UBMeasure(String)
+
+# The habitant form of a `kind` declaration's `with` clause. `HabNone`
+# is the absent clause (habitants derived, like `Shape`); `HabIntro`
+# names the habitant-introducer word (`with unit`); `HabDomain` names
+# a value domain whose values ARE the habitants, written directly in
+# `<>` (`with Int` -> `<3>`); `HabClosed` names an introducer plus the
+# fixed engine-known habitant set (`with layout { be le }`).
+#[derive(BinSerialize)]
+pub(pkg) type KindHab
+  = HabNone
+  | HabIntro(String)
+  | HabDomain(ValueDomain)
+  | HabClosed(String, [String])
+
+#[doc("The domain of a value-habitant kind: its habitants are the literals of this type, written directly in `<>`.")]
+#[derive(BinSerialize)]
+pub(pkg) type ValueDomain = VdInt | VdString
+
+#[doc("The value domain a type name spells after a kind's `with`, or `None` when it spells none.")]
+pub(pkg) fn value_domain_of_name(n: String) : Option[ValueDomain] = match n {
+  "Int"    -> Some(VdInt)
+  "String" -> Some(VdString)
+  _        -> None
+}
+
+#[doc("The type name a value domain is written as.")]
+pub(pkg) fn value_domain_name(d: ValueDomain) : String = match d {
+  VdInt    -> "Int"
+  VdString -> "String"
+}
+
+#[doc("The introducer word a `KindHab` registers for habitant declarations, or empty when the form declares none (`HabNone`, `HabDomain`).")]
+pub(pkg) fn kind_hab_intro(h: KindHab) : String = match h {
+  HabNone -> ""
+  HabIntro(w) -> w
+  HabDomain(_) -> ""
+  HabClosed(w, _) -> w
+}
+
+#[doc("Sentinel stored as a `DTheory`'s sole property when its body is `builtin`. `#` cannot start an identifier, so it is disjoint from every parsed property name.")]
+pub(pkg) fn theory_builtin_marker() : String = "#builtin"
+
+#[doc("True when a `DTheory` property list encodes the `builtin` body.")]
+pub(pkg) fn theory_props_builtin(props: [String]) : Bool = match props {
+  [p] -> p == theory_builtin_marker()
+  _   -> false
+}
+
+#[doc("True for a theory whose engine is the compiler core itself (HM, effect rows, region identity, constructor witnesses). Builtin theories live only in the language's kind catalog.")]
+pub(pkg) fn is_builtin_theory(name: String) : Bool =
+  name == "HindleyMilner" or name == "EffectRow" or
+  name == "Nominal" or name == "ConstructorApp"
+
+#[doc("True for a kind provided by the language over a builtin theory. Builtin kinds are closed: user code cannot redeclare them.")]
+pub(pkg) fn is_builtin_kind(name: String) : Bool =
+  name == "Type" or name == "Effect" or name == "Dim"
+
+#[derive(BinSerialize)]
+pub(pkg) type ImportKind
+  = IkPath(String)
+  | IkAlias(String, String)
+  | IkSelective(String, [String])
+  # m7f §7: `import ?name` — dependency hole. The compiler scans
+  # known stdlib modules (and modules in the search path) for a
+  # `pub fn name` and reports candidates so the user can replace
+  # the hole with an explicit module path. The hole itself does
+  # NOT load any module — it is a diagnostic-only construct that
+  # downstream passes drop after the symbol index runs.
+  | IkHole(String)
+
+#[doc("The fresh binder a destructuring block-lambda parameter is bound to, keyed by the pattern's position.")]
+pub(pkg) fn lam_pat_binder_name(line: Int, col: Int) : String =
+  string_concat_all(["__lam_pat_", int_to_string(line), "_", int_to_string(col), "__"])
+
+#[doc("The binder a point-free section's receiver is bound to. Only the parser mints it, and a parameter has no slot for its kind, so the kind is this binder's identity.")]
+pub(pkg) fn point_free_binder() : Binder = binder_minted("__pl")
+
+#[doc("The binder `lhs |> f(_)` passes the left side through. Only the parser mints it.")]
+pub(pkg) fn pipe_apply_binder() : Binder = binder_minted("__pipe")
+
+#[doc("Render an integer literal: the author's spelling when there is one, else the decimal value.")]
+pub(pkg) fn int_lit_text(v: Int, span: String) : String =
+  if span == "" { int_to_string(v) } else { span }
+
+# Row-variable binding: maps a surface name (`e`) to its allocated
+# row variable id within the enclosing function declaration.
+pub(pkg) type RVBind = RVB(TLocalId, Int)
+
+# A record literal's field is written four ways: `...base`, a positional
+# value, a pun (`x`), and `name: value`. The first two have no name, so
+# their slot holds "" and their value is called by a mark; a pun wraps
+# its value in `SfFieldPun`.
+
+# Issue #180: ProtoTPReg lets `find_proto_impl_for_args` know whether
+# a protocol declared `[A]` parameters. When empty, only the legacy
+# (Self,Self) homogeneous match is valid — `pow_int(self: Self, exp:
+# Int)`'s second argument is not a proto-arg.
+#[doc("Protocol type-parameter registry: (proto, its type parameters, home).")]
+pub(pkg) type ProtoTPReg = PTPR(SymId, [TBinder], Option[String])
+
+#[doc("One free-fn protocol-bound obligation: type-kind tparam index (aligned with a monomorphised call's concrete `tys`) and its declared protocol bounds.")]
+pub(pkg) type FnTPBound = FTB(Int, [DeclRef])
+#                       idx  proto names
+
+#[doc("Declared protocol bounds of a free fn, checked against each concrete instantiation. `mo` is the module origin so a call resolves against the right same-named fn.")]
+pub(pkg) type FnBoundsRec = FBR(String, Option[String], [FnTPBound])
+#                          name    module_origin    per-tparam bounds
+
+#[doc("Protocol impl registry: (proto key, type, op_name, impl_fn_name, [proto_arg_names], ret_head, impl home, target identity, protocol identity).")]
+pub(pkg) type ProtoImplReg = PIR(SymId, DeclRef, Written, SymId, [DeclRef], DeclRef, Option[String])
+#                          protocol target op      impl fn [protocol args] ret head impl home
+# `protocol` is the declaration the impl's written protocol name denotes
+# from the impl's module: which protocol an entry belongs to is decided
+# by it. `proto` is that protocol's dispatch key, the spelling the impl
+# function's symbol carries. `sym_none()` when the name resolved to no
+# protocol, which `lower_protocols` has reported.
+# `target` is the identity of the type the impl is for, read from the
+# symbol table the typer is given, so it compares with a `TyCon`'s id;
+# `sym_none()` for a type with no declaration (a builtin) and until the
+# registry is stamped after resolve. `impl_home` is the module whose
+# impl block produced the entry (`None` for the root file).
+# `ret_head` is the head TyName of the impl method's declared return
+# type (issue #180): for `impl Add[Complex] for Real { add(...) :
+# Complex }` it is "Complex", differing from the receiver `Real`. The
+# post-inference protocol-call rewrite reads it to correct the result
+# node's type from the dispatcher's `Self` (Real) to the impl's
+# promoted return (Complex), before unboxing runs.
+# Issue #180: proto_arg_names is the list of monomorphised type names
+# for each `Ai` parameter at the impl-site. Empty list means
+# legacy un-parametrised `impl P for X` (treated as `Ai = Self`).
+
+# One entry per declared protocol — the identity table protocol-name
+# resolution scopes against. Two modules may each
+# declare a protocol `P`; each gets its own entry.
+#[doc("Protocol origin registry: (proto, module_origin, is_pub, protocol identity). `None` origin = root file.")]
+pub(pkg) type ProtoOriginReg = PrOR(SymId, Option[String], Bool)
+#                             protocol module_origin  is_pub
+
+# Impl mangling spells a protocol with this key, not its bare name: a
+# name declared by two modules would otherwise share one mangled symbol
+# space. Lookups decide by the protocol's identity, never by the key.
+#[doc("Dispatch spelling of one declared protocol: (proto, module_origin, key, protocol identity). The key is the bare name, module-qualified when the name is contested across modules.")]
+pub(pkg) type ProtoKey = PKey(SymId, Option[String], Written)
+#                       protocol module_origin  dispatch key
+
+# O(1) view over the immutable `impls` list, built once at the
+# `lower_protocols` boundary. `by_key` buckets every `PIR` by a hash of
+# `(proto, type)`; each bucket keeps its entries in `impls` order so a
+# bucket scan returns the same first-match as a full linear scan.
+# `nbuckets == 0` marks the unbuilt placeholder: lookups fall back to
+# the linear scan over `impls`, so the index is purely additive.
+#[doc("Hash index over a ProtocolReg's impl table: (proto, type) buckets.")]
+pub(pkg) type ImplIndex = { by_key: Array[[ProtoImplReg]],
+                       nbuckets: Int }
+
+#[doc("What the lowering knows of a dispatcher it generated, filed under the dispatcher's id: the name it is declared with, the operation it stands for, its home (`None` for the root file), that operation's arity, and whether only the protocols of its home answer it.")]
+pub(pkg) type DispInfo = DispInfo(String, String, Option[String], Int, Bool)
+
+#[doc("A protocol and the dispatcher one of its operations lowered to: `ProtoDisp(protocol, dispatcher)`.")]
+pub(pkg) type ProtoDisp = ProtoDisp(SymId, SymId)
+
+#[doc("A map from a symbol's raw id to a row: a search tree over ids, which are hashes and so arrive in no order that could unbalance it.")]
+pub(pkg) type IdTree[a] = IdLeaf | IdNode(IdTree[a], Int, a, IdTree[a])
+
+#[doc("The functions the protocol lowering generates, found by id: the dispatchers by id, each protocol with the dispatchers its operations share, each dispatcher's homed twin by the dispatcher's id, the impl methods' registry entries by id, and the impl methods the structural compare stands in for.")]
+pub(pkg) type ProtoIds = { disps: IdTree[DispInfo], shared: [ProtoDisp], homed: IdTree[SymId], impls: IdTree[ProtoImplReg],
+                      walked: IdTree[Bool] }
+
+#[doc("The tagged module names one file imports directly: `MImp(importer, imports)`, importer `\"\"` for the root file.")]
+pub(pkg) type ModImports = MImp(String, [String])
