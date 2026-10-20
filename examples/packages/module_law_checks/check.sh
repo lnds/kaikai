@@ -37,7 +37,7 @@ impl Sequence for Rope {
 }
 KAI
 printf 'pub fn map(xs: [Int], f: (Int) -> Int) : [Int] = xs\n' > "$TMP/p/other.kai"
-printf 'import chain\nimport other\n\nfn main() : Int = other.map([1], (x) => x).length()\n' > "$TMP/p/main.kai"
+printf 'import chain\nimport other\n\nfn main() : Int = other.map([1], (x) => x) |> length()\n' > "$TMP/p/main.kai"
 
 out="$(cd "$TMP/p" && "$KAI" check . 2>&1)" || fail "the law checks of a non-root impl failed: $out"
 echo "$out" | grep -q "6/6 checks passed" || fail "the law checks of the module's impl did not all run and pass"
