@@ -1,3 +1,253 @@
+#[doc("Pattern lowering helpers: binding sub-patterns, aliasing, variant tags and literal equality.")]
+
+import compiler.ast
+import compiler.kir
+import compiler.kir_lower
+import compiler.emit_shared
+import compiler.ctor_ix
+import compiler.written
+import compiler.unbox
+
+# compiler/kir_lower_variant.kai — which sub-patterns discriminate.
+#
+# The variant path of `lower_match` switches on the scrutinee's top-level
+# tag. Two arms sharing a tag (`Exited(0)` / `Exited(_)`) must still test
+# their payload, so the arms of one tag are grouped into a fail chain whose
+# per-arm tests come from `kir_lower_ptest`. This module answers the
+# question both need: does a sub-pattern carry a test the tag does not?
+
+#[doc("Whether a sub-pattern carries a test: a literal, a constructor, a list, or a record or tuple with a discriminating field.")]
+pub(pkg) fn psub_is_discriminating(p: Pattern) : Bool = match p.pkind {
+  PLit(_)                 -> true
+  PVariant(_, _)          -> true
+  PVariantRecord(_, _)    -> true
+  PList(_, _)             -> true
+  PRecord(fields)         -> any_field_discriminating(fields)
+  PAs(_, inner)           -> psub_is_discriminating(inner)
+  _                       -> false
+}
+
+#[doc("Whether a variant arm tests nothing beyond its tag (`Exited(_)`), ending its tag's sub-chain.")]
+pub(pkg) fn var_arm_is_tag_catchall(p: Pattern) : Bool = match p.pkind {
+  PVariant(_, subs)            -> not any_discriminating(subs)
+  PVariantRecord(_, fields)    -> not any_field_discriminating(fields)
+  PAs(_, inner)                -> var_arm_is_tag_catchall(inner)
+  _                            -> true
+}
+
+#[doc("Whether any of the sub-patterns discriminates.")]
+pub(pkg) fn any_discriminating(subs: [Pattern]) : Bool = match subs {
+  [] -> false
+  [sp, ...rest] -> if psub_is_discriminating(sp) { true } else { any_discriminating(rest) }
+}
+
+#[doc("Whether any field's sub-pattern discriminates.")]
+pub(pkg) fn any_field_discriminating(fields: [PField]) : Bool = match fields {
+  [] -> false
+  [PField(_, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) { true } else { any_field_discriminating(rest) }
+}
+
+# A literal pattern test compares with `kai_eq_raw`, which borrows both
+# operands. A String, Real or fixed-width literal materialises a fresh box
+# for the comparison, so the test binds it, compares, and releases it before
+# branching. An Int, Bool or Char literal is an immediate and needs none.
+
+#[doc("Seal `condbr (kai_eq_raw v lit) ? ok_lbl : fail_lbl`, releasing a boxed literal before the branch.")]
+pub(pkg) fn kle_seal_eq(v: KVal, lit: KVal, ok_lbl: String, fail_lbl: String, pos: KPos,
+                   st: LowerSt) : LowerSt / Console =
+  if kle_lit_is_boxed(lit) {
+    match bind_op(st, KLitOp(lit), pos) { LRes(lv, st1) ->
+      match bind_op(st1, KPrim(KpEqRaw, [v, lv]), pos) { LRes(cond, st2) ->
+        ls_seal(ls_emit(st2, KRC(KDrop(lv), pos)), KCondBr(cond, ok_lbl, fail_lbl, pos), fail_lbl) } }
+  } else {
+    match bind_op(st, KPrim(KpEqRaw, [v, lit]), pos) { LRes(cond, st1) ->
+      ls_seal(st1, KCondBr(cond, ok_lbl, fail_lbl, pos), fail_lbl) }
+  }
+
+fn kle_lit_is_boxed(lit: KVal) : Bool = match lit {
+  KStrV(_)      -> true
+  KRealV(_)     -> true
+  KFixedV(_, _) -> true
+  _             -> false
+}
+
+# compiler/kir_pat_alias.kai — the single source of truth for which match
+# arm binders are ALIASES of the scrutinee's storage and therefore need a
+# structural incref (dup) in the native lowering.
+#
+# The C-direct oracle (`emit_pat_binds` in emit_c.kai) decides alias-ness as
+# part of ONE textual walk: a binder reached with `is_alias=true` shares
+# storage with the scrutinee (a variant pointer slot, a cons head/tail/rest)
+# and is bound `kai_incref(scr)`; a binder reached with `is_alias=false`
+# already owns its ref (a `kai_op_field` result, a freshly-boxed Real slot).
+# The native backend re-derives that same discipline; before this module it
+# did so with several ad-hoc collectors keyed by arm shape, each a partial
+# re-implementation that drifted from the oracle as new arm shapes appeared.
+#
+# This module holds ONE recursive collector — `pat_alias_binders` — that
+# mirrors `emit_pat_binds` at any depth, plus pure position predicates that
+# PARTITION its result for the two reuse call-sites that need a subset. No
+# consumer re-walks a pattern to decide alias-ness; they all read this set.
+
+# Pointer/scalar split of a variant slot kind: 0 = pointer, 1 = Int,
+# 2 = Real. `pa_slot_needs_dup` maps kind to whether the native binder is a
+# heap-box BORROW of the cell's storage (0) or an owned / no-RC read (1, 2).
+# An enum slot maps to 0/pointer: its binder holds the immortal interned
+# singleton, so the alias dup it gets is a runtime no-op — same net effect
+# as the C oracle's alias-shaped enum bind.
+fn pa_slot_kind(k: Int) : Int = if k == 3 { 0 } else { k }
+
+#[doc("The pointer/scalar slot kinds of the constructor a pattern references, or [] when it references none.")]
+pub(pkg) fn pa_kinds(ix: CtorIx, r: DeclRef) : [Int] = match ctor_ix_row(ix, ref_sym(r)) {
+  Some(EV(_, ks, _, _)) -> map(ks, pa_slot_kind)
+  None                     -> []
+}
+
+#[doc("""
+Every binder a match arm reaches over a heap-box BORROW path — the set the
+native lowering must structurally dup so a consuming arm body cannot free a
+slot the scrutinee still holds. This is the single mirror of that discipline;
+all native alias-dup / reuse call-sites derive their sets from it, never
+re-walking.
+
+Descends PList (heads + `...rest`), PVariant slots that `pa_slot_needs_dup`
+(pointer slots; Int is a tagged immediate and a Real slot's read mints an
+owned box), and PAs (name + inner, inner always alias). Record and
+variant-record fields are NOT descended: the field bind dups its own cell
+binders and releases the field read (`bind_field_owned`), so they arrive owned.
+""")]
+pub(pkg) fn pat_alias_binders(p: Pattern, ix: CtorIx) : [LocalId] = pab_pat(p, ix, [])
+
+fn pab_pat(p: Pattern, ix: CtorIx, acc: [LocalId]) : [LocalId] = match p.pkind {
+  PBind(b)      -> [b.id, ...acc]
+  PNarrow(b, _) -> [b.id, ...acc]
+  PAs(b, inner) -> pab_pat(inner, ix, [b.id, ...acc])
+  PList(pats, opt_rest) -> {
+    let a1 = match opt_rest {
+      None    -> acc
+      Some(b) -> [b.id, ...acc]
+    }
+    pab_pats(pats, ix, a1)
+  }
+  PVariant(r, subs) -> pab_variant_slots(subs, pa_kinds(ix, r), 0, ix, acc)
+  _ -> acc
+}
+
+fn pab_pats(pats: [Pattern], ix: CtorIx, acc: [LocalId]) : [LocalId] = match pats {
+  []           -> acc
+  [hp, ...rest] -> pab_pats(rest, ix, pab_pat(hp, ix, acc))
+}
+
+fn pab_variant_slots(subs: [Pattern], ks: [Int], idx: Int, ix: CtorIx, acc: [LocalId]) : [LocalId] = match subs {
+  []            -> acc
+  [sp, ...rest] -> {
+    let k = kind_at(ks, idx)
+    let acc1 = if pa_slot_needs_dup(k) { pab_pat(sp, ix, acc) } else { acc }
+    pab_variant_slots(rest, ks, idx + 1, ix, acc1)
+  }
+}
+
+# A slot binder needs a structural dup iff the native reads it as a BORROW of
+# storage the arm may consume — pointer slots (0) only. A Real slot (2) is a
+# raw `.r` word under the full slot mask: its `KProj` read mints a fresh
+# OWNED box (the C oracle's `kai_real(slot.r)`, `is_alias=false`), so a dup
+# here would leak one box per read. Int (1) is a tagged immediate whose
+# decref is a no-op.
+fn pa_slot_needs_dup(k: Int) : Bool = k == 0
+
+#[doc("""
+The DIRECT-slot partition of `pat_alias_binders`: the alias binders bound as
+a top-level cons slot (head `PBind`, `...rest`) or a top-level variant
+pointer slot. These are the slots a dual-branch reuse binds per-branch (a
+borrow in the unique branch, a dup in the shared branch); everything else in
+the alias set is deconstructed and dup'd unconditionally outside the fork.
+""")]
+pub(pkg) fn pat_direct_alias_slots(p: Pattern, ix: CtorIx) : [LocalId] = match p.pkind {
+  PList(pats, opt_rest) -> {
+    let heads = pa_list_direct_heads(pats, [])
+    match opt_rest { None -> heads Some(b) -> [b.id, ...heads] }
+  }
+  PVariant(r, subs) -> pa_variant_direct_slots(subs, pa_kinds(ix, r), 0, [])
+  PBind(b)  -> [b.id]
+  PAs(b, _) -> [b.id]
+  _         -> []
+}
+
+fn pa_list_direct_heads(pats: [Pattern], acc: [LocalId]) : [LocalId] = match pats {
+  []            -> acc
+  [hp, ...rest] -> match hp.pkind {
+    PBind(b) -> pa_list_direct_heads(rest, [b.id, ...acc])
+    _        -> pa_list_direct_heads(rest, acc)
+  }
+}
+
+fn pa_variant_direct_slots(subs: [Pattern], ks: [Int], idx: Int, acc: [LocalId]) : [LocalId] = match subs {
+  []            -> acc
+  [sp, ...rest] -> {
+    let k = kind_at(ks, idx)
+    let acc1 = match sp.pkind {
+      PBind(b) -> if k == 0 { [b.id, ...acc] } else { acc }
+      _        -> acc
+    }
+    pa_variant_direct_slots(rest, ks, idx + 1, acc1)
+  }
+}
+
+#[doc("""
+The DECONSTRUCTED partition of `pat_alias_binders`: the alias set minus the
+direct slots. In a dual-branch cons reuse these sub-binders are incref'd
+UNCONDITIONALLY (in both branches, per the oracle's is_alias path), so they
+leave the condbr; only the direct slots differ per branch.
+""")]
+pub(pkg) fn pat_decon_alias_binders(p: Pattern, ix: CtorIx) : [LocalId] =
+  binders_minus(pat_alias_binders(p, ix), pat_direct_alias_slots(p, ix))
+
+fn binders_minus(all: [LocalId], drop: [LocalId]) : [LocalId] = match all {
+  []           -> []
+  [n, ...rest] -> if binder_among(drop, n) { binders_minus(rest, drop) } else { [n, ...binders_minus(rest, drop)] }
+}
+
+fn binder_among(xs: [LocalId], n: LocalId) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> if local_eq(h, n) { true } else { binder_among(rest, n) }
+}
+
+#[doc("""
+The pointer slots of a variant pattern that no direct binder takes: the
+children an arm-top reuse token must release when it steals a unique shell.
+A `PBind` slot moves into its binder; any other pointer sub-pattern (`_`, a
+nested pattern) leaves its child in the shell. Enum and scalar slots hold no
+reference.
+""")]
+pub(pkg) fn pat_unbound_ptr_slots(p: Pattern, ix: CtorIx) : [Int] = match p.pkind {
+  PVariant(_, subs) -> match pat_slot_kinds(p, ix) {
+    Some(ks) -> pa_unbound_slots(subs, ks, 0)
+    None     -> []
+  }
+  _ -> []
+}
+
+#[doc("The slot kinds, as the cell stores them, of the constructor a variant pattern names; None for any other pattern or an unknown constructor.")]
+pub(pkg) fn pat_slot_kinds(p: Pattern, ix: CtorIx) : Option[[Int]] = match p.pkind {
+  PVariant(r, subs) -> match ctor_ix_row(ix, ref_sym(r)) {
+    Some(EV(ar, ks, _, _)) -> if ar == list_length(subs) { Some(ks) } else { None }
+    None                      -> None
+  }
+  _ -> None
+}
+
+fn pa_unbound_slots(subs: [Pattern], ks: [Int], idx: Int) : [Int] = match subs {
+  [] -> []
+  [sp, ...rest] -> {
+    let tail = pa_unbound_slots(rest, ks, idx + 1)
+    match sp.pkind {
+      PBind(_) -> tail
+      _        -> if kind_at(ks, idx) == 0 { [idx, ...tail] } else { tail }
+    }
+  }
+}
+
 # compiler/kir_lower_bind.kai — pattern-binder lowering for `match` arms
 # and destructuring `let`s.
 #
@@ -20,22 +270,13 @@
 # The binds run after the arm's tests (`kir_lower_ptest`), so a nested
 # sub-pattern's names are projected only once its shape is confirmed.
 
-import compiler.ast
-import compiler.written
-import compiler.emit_shared
-import compiler.ctor_ix
-import compiler.kir
-import compiler.kir_lower
-import compiler.kir_pat_alias
-import compiler.unbox
-
 # --- top-level arm binds (the switch already tested the tag) ------------
 
 # Bind a TOP-LEVEL variant arm's sub-binders from the scrutinee. The
 # `KSwitch` already matched the arm's tag, so the direct sub-slots are safe
 # to bind. `PVariant` reads positional slots (`KProj scrv idx`);
 # `PVariantRecord` reads the payload record's named fields (`kai_op_field`).
-pub fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
+pub(pkg) fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
   PVariant(r, subs)         -> bind_sub_binders(kcr_of_pat(st, r), subs, scrv, 0, body, st)
   PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, body, st)
   # A top-level as-pattern (`a @ A`, `a: A` after the narrow rewrite): bind the
@@ -51,13 +292,13 @@ fn bind_sub_binders(c: KCtorRef, subs: [Pattern], scrv: KVal, idx: Int, body: Ex
 }
 
 #[doc("The constructor a variant pattern names, as the slot readers need it: its row, or none when the pattern references no constructor.")]
-pub type KCtorRef = KCR(Option[VariantEntry])
+pub(pkg) type KCtorRef = KCR(Option[VariantEntry])
 
 #[doc("The constructor a variant pattern references.")]
-pub fn kcr_of_pat(st: LowerSt, r: DeclRef) : KCtorRef = KCR(ctor_ix_row(st.ctor_ix, ref_sym(r)))
+pub(pkg) fn kcr_of_pat(st: LowerSt, r: DeclRef) : KCtorRef = KCR(ctor_ix_row(st.ctor_ix, ref_sym(r)))
 
 #[doc("The head tag of the constructor `c`; 0 when it is none.")]
-pub fn kcr_tag(c: KCtorRef) : Int = match c {
+pub(pkg) fn kcr_tag(c: KCtorRef) : Int = match c {
   KCR(Some(row)) -> ctor_row_tag(row)
   KCR(None)      -> 0
 }
@@ -80,7 +321,7 @@ pub fn kcr_tag(c: KCtorRef) : Int = match c {
 # (`bind_slot_op`), never a static literal test. A static kind on either
 # side reads the other writer's cells wrong (the rc-detector and
 # os_process parity catches, one per direction).
-pub fn slot_kind_of(c: KCtorRef, idx: Int) : Int = match c {
+pub(pkg) fn slot_kind_of(c: KCtorRef, idx: Int) : Int = match c {
   KCR(Some(EV(_, ks, tag, _))) -> if tag < user_variant_tag_base() { 0 - 1 } else { kind_at(ks, idx) }
   KCR(None)                       -> 0 - 1
 }
@@ -101,7 +342,7 @@ pub fn slot_kind_of(c: KCtorRef, idx: Int) : Int = match c {
 # a boxed pointer, the self-compile SIGSEGV. A kind-2 Real / kind-3 enum binder
 # stays `SBoxed`: its `KProj` re-boxes at the border, so the register always
 # holds a `KaiValue *`.
-pub fn bind_slot_kslot(st: LowerSt, c: KCtorRef, idx: Int, b: Binder, line: Int, col: Int) : KSlot / Console =
+pub(pkg) fn bind_slot_kslot(st: LowerSt, c: KCtorRef, idx: Int, b: Binder, line: Int, col: Int) : KSlot / Console =
   match slot_kind_of(c, idx) {
     1 -> if raw_arm_binder_at(st.raw_binders, b.id, line, col) { SInt64 } else { SBoxed }
     _ -> SBoxed
@@ -111,7 +352,7 @@ pub fn bind_slot_kslot(st: LowerSt, c: KCtorRef, idx: Int, b: Binder, line: Int,
 # position of its own passes `bind_body_none()`; a binder bound through it is
 # never in `st.raw_binders` (the table keys on real `PBind` positions), so an
 # Int/Real slot binder stays boxed.
-pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
+pub(pkg) fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 
 # The read op for slot `idx` of ctor `cn`. A kind-0 slot (a boxed pointer)
 # reads as a direct `.ptr` borrow (`KProjBorrow`); a typed slot (kind-1 Int,
@@ -119,7 +360,7 @@ pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
 # load + minimal re-box, no mask lookup); only the mixed-writer sentinel
 # keeps the mask-consulting `KProj`. The read op always matches the ctor's
 # write layout.
-pub fn bind_slot_op(c: KCtorRef, idx: Int, scrv: KVal) : KOp =
+pub(pkg) fn bind_slot_op(c: KCtorRef, idx: Int, scrv: KVal) : KOp =
   match slot_kind_of(c, idx) {
     0 -> KProjBorrow(scrv, idx)
     1 -> KProjKind(scrv, idx, 1)
@@ -173,7 +414,7 @@ fn bind_nested_as(c: KCtorRef, sp: Pattern, b: Binder, scrv: KVal, idx: Int, bod
 # `PVariantRecord` payload binds its fields; a top-level-shaped `PVariant`
 # here arrives only from a context whose tag is settled (the let-bind of a
 # single-ctor type, an as-pattern inner), so its direct subs bind.
-pub fn bind_pattern_fields_any(p: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
+pub(pkg) fn bind_pattern_fields_any(p: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
   PVariant(r, subs)         -> bind_sub_binders(kcr_of_pat(st, r), subs, v, 0, body, st)
   PVariantRecord(_, fields) -> bind_record_subfields(fields, v, body, st)
   PRecord(fields)           -> bind_record_subfields(fields, v, body, st)
@@ -224,7 +465,7 @@ fn bind_field_owned(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerS
 }
 
 #[doc("Bind a destructuring `let` against its owned value: each alias binder takes its own reference and the value is released, as on the C backend.")]
-pub fn bind_let_owned(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = {
+pub(pkg) fn bind_let_owned(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = {
   let pos = KAt(pat.line, pat.col)
   let st1 = bind_field_sub(pat, v, bind_body_none(), st)
   ls_emit(dup_binders(pat_alias_binders(pat, st1.ctor_ix), pos, st1), KRC(KDrop(v), pos))
@@ -271,7 +512,7 @@ fn bind_field_as(fname: String, b: Binder, sub: Pattern, v: KVal, body: Expr, st
   } }
 
 # The inner pattern of a `PAs(name, inner)`.
-pub fn as_inner(p: Pattern) : Pattern = match p.pkind {
+pub(pkg) fn as_inner(p: Pattern) : Pattern = match p.pkind {
   PAs(_, inner) -> inner
   _             -> p
 }
