@@ -1,0 +1,410 @@
+# Detection and scans for self-tail calls and TRMC shapes.
+
+import compiler.ast
+import compiler.ctor_ix
+import compiler.marks
+import compiler.ret_slots
+import compiler.self_call
+import compiler.symtab
+import compiler.trmc_self_call
+
+#
+# Issue #37: the Perceus exit-drop wrap places `kai_internal_drop(...)`
+# calls *after* the body's tail expression, so neither gcc nor clang
+# can fold a self-recursive call into `jmp` at the C level. The
+# compiler-side fix rewrites self-tail-calls into a `goto`-loop with
+# parameter rebinding; this walker is the recognition half.
+#
+# `tcrec_has_tail_self_call(body, nm, arity)` returns true if `body`
+# contains at least one self-recursive call to a fn named `nm` with
+# `arity` arguments in *tail position*. Tail position propagates
+# through:
+#   - EBlock(_, Some(tail))      — `tail` is tail
+#   - EIf(_, then, opt_else)     — both branches are tail
+#   - EMatch(_, arms)            — each arm body is tail
+# It does NOT propagate through:
+#   - ECall args / EBinop / EUnop / ERange / records / lists
+#   - EBlock stmts (only the trailing expression is tail)
+#   - EMatch scrutinee / EIf condition / match guards
+#   - ELambda body (different fn — never tail of the enclosing fn)
+#   - EPipe / EHandle (conservative; could be relaxed later)
+#
+# M1 lands the walker only; no caller wires it into the pipeline,
+# so selfhost stays byte-identical until M3 flips emission.
+pub(pkg) fn tcrec_has_tail_self_call(body: Expr, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
+  tcrec_walk_tail(body.kind, me, arity, cons_ok, tab)
+
+#
+# The dominant list-build idiom is the cons literal, not a user ctor:
+#   - `if .. { [] } else { [h, ...recur(t)] }`   (raw EList; no match)
+#   - `match xs { .. [h, ...t] -> [g(h), ...recur(t)] }`  (cons arm)
+# Both desugar to a tail-position cons whose CDR is a single self-call.
+# `tcrec_ctor_modcons_slot` only recognises a USER ctor (`name_first_is_
+# upper`), so neither fired and these loops grew the C stack per element
+# (Tier-1 TCO violation). These helpers recognise the two shapes and
+# return the cons args `[head, self_call]`; the hole is always the tail
+# (slot 1), so the recursion plugs into the open cdr. The step carries a
+# cons spine so the lowering builds a `kai_cons` cell (not a
+# `kai_variant_u`) — see `emit_trmc_step`.
+#
+# Reuse-in-place (the variant path's `_arm_ru` donation) is NOT applied
+# here: `try_arm_top_reuse` only captures a token for PVariant arms, so a
+# cons step always FRESH-allocs the new cell. Correctness of the consumed
+# input is the step's job (NOT the match exit, which the goto skips):
+#   - raw EList (`build`, no scrutinee): nothing to free, the cons cells
+#     it builds are owned by the result; spine `TsCons`.
+#   - reuse-cons arm (`map_inc`): the consumed scrutinee cons `_scr` would
+#     leak because the goto jumps over the arm's exit `kai_decref(_scr)`,
+#     so the step decref's `_scr` itself before looping; spine
+#     `TsConsScr`.
+# Donating the cons cell to the step (reuse-in-place, zero alloc per level)
+# is a follow-up perf lane, not a correctness gap.
+
+# Shape 1 — a raw cons literal `[head, ...self_call]` in tail position.
+# Returns the cons args `[head, self_call]` when the spread cdr is a clean
+# single self-call and the head carries no self-call; else None.
+pub(pkg) fn trmc_list_cons_modcons(els: [ListElem], me: SelfRef, arity: Int) : Option[[Expr]] =
+  match els {
+    [ElPlain(head), ElSpread(tail)] -> {
+      let clean = tcrec_is_direct_self_call(tail, me, arity) and not tcrec_expr_has_self_call(head, me, arity)
+      if clean { Some([head, tail]) } else { None }
+    }
+    _ -> None
+  }
+
+# Shape 2 — the perceus reuse-cons rewrite of a cons arm, its args
+# `(scr, head, self_call)`. The first arg is the scrutinee handle that
+# lowers to the match emitter's `_scr`; the step decref's it so the
+# consumed input spine is freed level by level. Returns the cons args
+# `[head, self_call]` under the clean-single-site discipline.
+pub(pkg) fn trmc_reuse_cons_modcons(xs: [Expr], me: SelfRef, arity: Int) : Option[[Expr]] =
+  match xs {
+    [_scr, head, tail] -> {
+      let clean = tcrec_is_direct_self_call(tail, me, arity) and not tcrec_expr_has_self_call(head, me, arity)
+      if clean { Some([head, tail]) } else { None }
+    }
+    _ -> None
+  }
+
+# True when a reuse-cons call over `xs` is a modulo-cons tail and the
+# builtin cons shapes are enabled.
+fn trmc_reuse_cons_tail(xs: [Expr], me: SelfRef, arity: Int, cons_ok: Bool) : Bool =
+  cons_ok and
+  (match trmc_reuse_cons_modcons(xs, me, arity) { Some(_) -> true None -> false })
+
+fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      # Builtin cons via perceus's reuse-cons rewrite.
+      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
+      _ ->
+        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
+          true
+        } else if tcrec_names_ctor(tab, f) {
+          # TRMC: a constructor application in tail position with a
+          # self-call in exactly one slot is modulo-cons-eligible.
+          match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
+        } else { false }
+    }
+    EList(els) ->
+      if cons_ok { match trmc_list_cons_modcons(els, me, arity) { Some(_) -> true None -> false } }
+      else { false }
+    EIf(_, t, opt_e) -> {
+      if tcrec_walk_tail(t.kind, me, arity, cons_ok, tab) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_walk_tail(e2.kind, me, arity, cons_ok, tab)
+      } }
+    }
+    EMatch(_, arms) -> tcrec_walk_arms(arms, me, arity, cons_ok, tab)
+    EBlock(stmts, opt_tail) -> {
+      match opt_tail {
+        None -> false
+        # Perceus wraps an arm/block tail as `EBlock([..SLet(__pcs_arm_ret,
+        # INNER)..], Some(ELocal(__pcs_arm_ret)))`. The tail read carries no
+        # self-call shape, so the naive descent reports `false` and the TRMC
+        # rewrite is skipped — exactly the mixed-signature regression where
+        # the unbox/perceus passes introduce this wrap and the gate then
+        # loses the modulo-cons site `trmc_walk_modcons` (which DOES unwrap)
+        # still sees. Peel the wrap here too so the gate and the modcons
+        # recogniser agree, keeping TRMC (and its fused reuse-in-place)
+        # alive through mixed-signature unboxing.
+        Some(e) -> match e.kind {
+          ELocal(tl) ->
+            if ret_slot_id_is_scope(tl) {
+              match trmc_find_ret_let_rhs(stmts, tl) {
+                Some(inner) -> tcrec_walk_tail(inner.kind, me, arity, cons_ok, tab)
+                None        -> false
+              }
+            } else { false }
+          _ -> tcrec_walk_tail(e.kind, me, arity, cons_ok, tab)
+        }
+      }
+    }
+    _ -> false
+  }
+}
+
+fn tcrec_walk_arms(arms: [Arm], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, body) -> {
+        if tcrec_walk_tail(body.kind, me, arity, cons_ok, tab) { true }
+        else { tcrec_walk_arms(rest, me, arity, cons_ok, tab) }
+      }
+    }
+  }
+}
+
+# TRMC soundness gate: only an affine (suspend-free) effect row is
+# eligible. v1 accepts REmpty (no `/` row) only — the strictest case.
+# A handler that can multi-resume or a fiber that can suspend between
+# the cctx extend and apply would observe the partially-built spine
+# with an open NULL hole (Tier-1 corruption); those rows are rejected
+# and fall back to ordinary recursion.
+pub(pkg) fn trmc_row_is_affine(row: RowExpr) : Bool = match row {
+  REmpty -> true
+  _      -> false
+}
+
+# Does the body have at least one modulo-cons tail leaf? (a ctor in
+# tail position with a self-call slot). Distinguishes a TRMC fn from a
+# direct-tail-self-call fn so the right rewrite fires. `cons_ok` enables
+# the builtin-cons shapes (`[h, ...self(t)]` / reuse-cons); it is false on
+# the LLVM/KIR/native backends, whose step lowering builds a variant node
+# and has no cons cell path yet (those fns fall back to ordinary recursion
+# there — correct, just stack-growing; native cons-TRMC is a follow-up).
+pub(pkg) fn trmc_body_has_modcons(body: Expr, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
+  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, cons_ok, tab)
+
+fn trmc_walk_modcons(k: ExprKind, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
+      _ ->
+        if tcrec_names_ctor(tab, f) {
+          match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
+        } else { false }
+    }
+    EList(els) ->
+      if cons_ok { match trmc_list_cons_modcons(els, me, arity) { Some(_) -> true None -> false } }
+      else { false }
+    EIf(_, t, opt_e) ->
+      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, me, arity, cons_ok, tab) { true }
+      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, me, arity, cons_ok, tab) } }
+    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, me, arity, cons_ok, tab)
+    EBlock(_, opt_tail) ->
+      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, me, arity, cons_ok, tab) }
+    _ -> false
+  }
+}
+
+fn trmc_walk_modcons_arms(arms: [Arm], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
+  match arms {
+    [] -> false
+    [Arm(_, _, body), ...rest] -> {
+      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, cons_ok, tab) { true }
+      else { trmc_walk_modcons_arms(rest, me, arity, cons_ok, tab) }
+    }
+  }
+}
+
+pub(pkg) fn trmc_expr_nth(xs: [Expr], i: Int) : Option[Expr] =
+  if i < 0 { None }
+  else { match xs {
+    [] -> None
+    [a, ...rest] -> if i == 0 { Some(a) } else { trmc_expr_nth(rest, i - 1) }
+  } }
+
+# Peel a Perceus arm-ret wrap to its INNER value, exposing the modulo-cons
+# ctor; `trmc_rewrite_body` replants the wrap's drops (trmc_exit_drops).
+pub(pkg) fn trmc_unwrap_ret(e: Expr) : Expr {
+  match e.kind {
+    EBlock(stmts, opt_tail) -> match opt_tail {
+      Some(t) -> match t.kind {
+        ELocal(tl) ->
+          if ret_slot_id_is_scope(tl) {
+            match trmc_find_ret_let_rhs(stmts, tl) {
+              Some(inner) -> inner
+              None        -> e
+            }
+          } else { e }
+        _ -> e
+      }
+      None -> e
+    }
+    _ -> e
+  }
+}
+
+fn trmc_find_ret_let_rhs(stmts: [Stmt], ret: LocalId) : Option[Expr] {
+  match stmts {
+    [] -> None
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> match pat.pkind {
+        PBind(b) -> if local_eq(b.id, ret) { Some(rhs) } else { trmc_find_ret_let_rhs(rest, ret) }
+        _ -> trmc_find_ret_let_rhs(rest, ret)
+      }
+      _ -> trmc_find_ret_let_rhs(rest, ret)
+    }
+  }
+}
+
+# The constructor a callee names: a reference whose id is a constructor's.
+pub(pkg) fn tcrec_ctor_callee(tab: SymTab, f: Expr) : Option[SymId] = match f.kind {
+  ESym(s, _) -> if sym_is_ctor(tab, s) { Some(s) } else { None }
+  _          -> None
+}
+
+pub(pkg) fn tcrec_names_ctor(tab: SymTab, f: Expr) : Bool = match tcrec_ctor_callee(tab, f) {
+  Some(_) -> true
+  None    -> false
+}
+
+# Recognition predicate used by `emit_fn_body` to decide whether to
+# plant the goto label. Recurses into every sub-expression, not just
+# tail position, because a sentinel can sit anywhere the rewrite
+# placed one (currently always tail; future relaxations may place
+# them elsewhere).
+pub(pkg) fn tcrec_body_has_sentinel(body: Expr) : Bool =
+  tcrec_scan_kind(body.kind)
+
+# Does the body contain a TRMC step sentinel? Used by emit_fn_body to
+# decide whether to declare the `KaiCctx _kai_acc = kai_cctx_empty();`
+# accumulator before the goto entry label. Walks every sub-expression
+# (a step sentinel sits in tail position of some branch).
+# pub: the LLVM backend's arm-top reuse (llvm-c-parity lane) reuses this
+# pure TRMC-shape probe so its eligibility gate stays in lock-step with C.
+pub fn trmc_body_has_step(body: Expr) : Bool = trmc_scan_step_kind(body.kind)
+
+fn trmc_scan_step_kind(k: ExprKind) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      EMark(MkTrmcStep(_)) -> true
+      _ -> trmc_scan_step_exprs(xs)
+    }
+    EIf(c, t, opt_e) ->
+      if trmc_body_has_step(c) { true }
+      else if trmc_body_has_step(t) { true }
+      else { match opt_e { None -> false Some(e2) -> trmc_body_has_step(e2) } }
+    EMatch(s, arms) -> if trmc_body_has_step(s) { true } else { trmc_scan_step_arms(arms) }
+    EBlock(stmts, opt_tail) ->
+      if trmc_scan_step_stmts(stmts) { true }
+      else { match opt_tail { None -> false Some(e) -> trmc_body_has_step(e) } }
+    EBinop(_, l, r) -> if trmc_body_has_step(l) { true } else { trmc_body_has_step(r) }
+    EUnop(_, x) -> trmc_body_has_step(x)
+    EField(x, _) -> trmc_body_has_step(x)
+    _ -> false
+  }
+}
+
+fn trmc_scan_step_exprs(xs: [Expr]) : Bool {
+  match xs {
+    [] -> false
+    [a, ...rest] -> if trmc_body_has_step(a) { true } else { trmc_scan_step_exprs(rest) }
+  }
+}
+
+fn trmc_scan_step_arms(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [Arm(_, _, body), ...rest] -> if trmc_body_has_step(body) { true } else { trmc_scan_step_arms(rest) }
+  }
+}
+
+fn trmc_scan_step_stmts(stmts: [Stmt]) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, rhs) -> trmc_body_has_step(rhs)
+        SExprStmt(e)    -> trmc_body_has_step(e)
+        _ -> false
+      }
+      if here { true } else { trmc_scan_step_stmts(rest) }
+    }
+  }
+}
+
+fn tcrec_scan_kind(k: ExprKind) : Bool {
+  match k {
+    ECall(f, xs) -> match f.kind {
+      # A TRMC step needs the goto label too.
+      EMark(m) -> if mark_is_tail_step(m) { true } else { tcrec_scan_exprs(xs) }
+      _ -> if tcrec_body_has_sentinel(f) { true } else { tcrec_scan_exprs(xs) }
+    }
+    EIf(c, t, opt_e) ->
+      if tcrec_body_has_sentinel(c) { true }
+      else if tcrec_body_has_sentinel(t) { true }
+      else { match opt_e {
+        None -> false
+        Some(e2) -> tcrec_body_has_sentinel(e2)
+      } }
+    EMatch(s, arms) ->
+      if tcrec_body_has_sentinel(s) { true } else { tcrec_scan_arms(arms) }
+    EBlock(stmts, opt_tail) ->
+      if tcrec_scan_stmts(stmts) { true }
+      else { match opt_tail {
+        None -> false
+        Some(e) -> tcrec_body_has_sentinel(e)
+      } }
+    EBinop(_, l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EUnop(_, x) -> tcrec_body_has_sentinel(x)
+    EField(x, _) -> tcrec_body_has_sentinel(x)
+    EIndex(x, i) ->
+      if tcrec_body_has_sentinel(x) { true } else { tcrec_body_has_sentinel(i) }
+    EPipe(l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    EDispatchPipe(_, l, r) ->
+      if tcrec_body_has_sentinel(l) { true } else { tcrec_body_has_sentinel(r) }
+    _ -> false
+  }
+}
+
+fn tcrec_scan_exprs(es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] ->
+      if tcrec_body_has_sentinel(h) { true } else { tcrec_scan_exprs(rest) }
+  }
+}
+
+fn tcrec_scan_arms(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, body) ->
+        if tcrec_body_has_sentinel(body) { true } else { tcrec_scan_arms(rest) }
+    }
+  }
+}
+
+fn tcrec_scan_stmts(stmts: [Stmt]) : Bool {
+  match stmts {
+    [] -> false
+    [s, ...rest] -> {
+      let here = match s {
+        SLet(_, _, e) -> tcrec_body_has_sentinel(e)
+        SVar(_, _, e, _, _) -> tcrec_body_has_sentinel(e)
+        SAssert(c, opt_m) ->
+          if tcrec_body_has_sentinel(c) { true }
+          else { match opt_m {
+            None -> false
+            Some(m) -> tcrec_body_has_sentinel(m)
+          } }
+        SExprStmt(e) -> tcrec_body_has_sentinel(e)
+        SIndexAssign(b, i, v, _, _) ->
+          if tcrec_body_has_sentinel(b) { true }
+          else if tcrec_body_has_sentinel(i) { true }
+          else { tcrec_body_has_sentinel(v) }
+        SAssign(b, v, _, _) ->
+          if tcrec_body_has_sentinel(b) { true }
+          else { tcrec_body_has_sentinel(v) }
+        SUse(_, _, _) -> false
+      }
+      if here { true } else { tcrec_scan_stmts(rest) }
+    }
+  }
+}

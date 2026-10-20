@@ -1,0 +1,554 @@
+# C spellings of raw scalars, literals, fixed-width integers and fixed-length vectors, and their box and unbox borders.
+
+import compiler.ast
+import compiler.emit_c_ctx
+import compiler.emit_c_mangle
+import compiler.escapes
+import compiler.int_cmp
+import compiler.kinds
+import compiler.marks
+import compiler.operators
+import compiler.parse_lexical
+import compiler.raw_border
+import compiler.util
+
+# Decode the literal here rather than splicing the span into C: the C
+# compiler's escape table is not kaikai's, and the length must be
+# explicit so an embedded NUL survives `strlen`.
+fn emit_decoded_str_lit(span: String, body_start: Int, body_end: Int) : String {
+  match esc_decode_body(span, body_start, body_end) {
+    EscBad(_, _) -> cat3("kai_str(", span, ")")
+    EscOk(bytes, _) ->
+      concat_all(["kai_str_from_bytes(\"", c_encode_bytes(bytes), "\", ",
+                  int_to_string(string_length(bytes)), ")"])
+  }
+}
+
+# A string is a literal by the time it is emitted: the lift turned every
+# interpolation into calls before name resolution.
+pub(pkg) fn emit_string_lit(span: String, is_triple: Bool) : String = {
+  let q = if is_triple { 3 } else { 1 }
+  emit_decoded_str_lit(span, q, string_length(span) - q)
+}
+
+#
+# We pre-walk the program building a list of LamInfo entries; each entry
+# gets a unique id and records the lambda's params, its free variables
+# (its closure captures), and its body. At emit time the lambda
+# expression is replaced with `kai_closure(&lam_symbol, arity,
+# n_caps, captures)`; the body is emitted as a separate function later.
+
+# C type used for a raw local of an unboxable type. Matches the
+# `as.*` field widths in `KaiValue` (see runtime.h).
+pub(pkg) fn raw_c_type(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> "int64_t"
+      TyReal -> "double"
+      TyBool -> "int"
+      TyChar -> "uint32_t"
+      TyByte -> "uint8_t"
+      TyInt32  -> "int32_t"
+      TyUInt32 -> "uint32_t"
+      TyUInt64 -> "uint64_t"
+      TyInt128 -> "__int128"
+      # KIR Lane 1: an LLVM C-API handle is a raw opaque pointer.
+      TyHandle -> "void *"
+      # A fixed-width `Vec[e]<n>` is a flat by-value C aggregate, not a
+      # boxed `KaiValue *`: no RC header, no `{len,cap}`, no heap block.
+      TyDimT(_, _)        -> if ty_is_fixed_vec(t) { fixed_vec_cname(t) }
+                             else { match t { TyDimT(inner, _) -> raw_c_type(Some(inner)) _ -> "int64_t" } }
+      TyRefineT(inner, _) -> raw_c_type(Some(inner))
+      _ -> "int64_t /* raw_c_type: unexpected ty */"
+    }
+    None -> "int64_t /* raw_c_type: missing ty */"
+  }
+}
+
+# The C typedef name of a fixed-width `Vec[e]<n>`: `KaiFixedVec_<elem>_<n>`,
+# one distinct type per element mangle and length. Callers gate on
+# `ty_is_fixed_vec`.
+fn fixed_vec_cname(t: Ty) : String =
+  concat_all(["KaiFixedVec_", mangle_ty(fixed_vec_elem(t)), "_", int_to_string(fixed_vec_n(t))])
+
+pub(pkg) fn fixed_vec_arity_mismatch(m: Mark) : String =
+  concat_all(["0 /* ", mark_name(m), ": arity mismatch */"])
+
+# The element type behind a fixed-vec-typed node; `TyInt` keeps the
+# load well-formed when the type is absent.
+pub(pkg) fn fixed_vec_elem_of(opt_t: Option[Ty]) : Ty = match opt_t {
+  Some(t) -> fixed_vec_elem(t)
+  None    -> TyInt
+}
+
+# The include-guarded `typedef struct { <elem> a[n]; } <cname>;` for a
+# fixed-width vec, emitted at the first local declaration of that type.
+# The `#ifndef`/`#define` guard is preprocessor-global (block scope does
+# not apply), so a later declaration of the same `(elem, n)` skips it.
+fn fixed_vec_typedef(t: Ty) : String {
+  let cname = fixed_vec_cname(t)
+  concat_all([
+    "\n#ifndef ", cname, "_DEFINED\n#define ", cname, "_DEFINED\n",
+    "typedef struct { ", raw_c_type(Some(fixed_vec_elem(t))), " a[",
+    int_to_string(fixed_vec_n(t)), "]; } ", cname, ";\n#endif\n"
+  ])
+}
+
+# Pre-declare each fixed-vec `typedef` the program references, once, in
+# the shared types header. A fixed vec surfaces wherever a
+# `__fixed_vec_lit` is emitted (a let RHS, a materialised argument, a
+# nested literal), so the whole decl tree is scanned by node `.ty`. The
+# collector accumulates ready-rendered (include-guarded) typedef strings,
+# deduplicated, so this only concatenates them.
+pub fn collect_fixed_vec_typedefs(decls: [Decl]) : String =
+  concat_all(cfv_decls(decls, []))
+
+fn cfv_decls(decls: [Decl], acc: [String]) : [String] = match decls {
+  []           -> acc
+  [d, ...rest] -> cfv_decls(rest, cfv_decl(d, acc))
+}
+
+fn cfv_decl(d: Decl, acc: [String]) : [String] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> cfv_expr(body, acc)
+  DTest(_, body, _, _, _)     -> cfv_expr(body, acc)
+  DBench(_, body, _, _, _)    -> cfv_expr(body, acc)
+  DCheck(_, _, body, _, _, _) -> cfv_expr(body, acc)
+  _ -> acc
+}
+
+# Register this node's fixed-vec type (if any), then recurse into children.
+fn cfv_expr(e: Expr, acc: [String]) : [String] {
+  let acc1 = match e.ty {
+    Some(t) -> if ty_is_fixed_vec(t) { cfv_add(t, acc) } else { acc }
+    None    -> acc
+  }
+  cfv_children(e.kind, acc1)
+}
+
+fn cfv_add(t: Ty, acc: [String]) : [String] {
+  let td = fixed_vec_typedef(t)
+  if list_has(acc, td) { acc } else { [td, ...acc] }
+}
+
+fn cfv_list(es: [Expr], acc: [String]) : [String] = match es {
+  []           -> acc
+  [h, ...rest] -> cfv_list(rest, cfv_expr(h, acc))
+}
+
+fn cfv_children(k: ExprKind, acc: [String]) : [String] = match k {
+  ECall(callee, args_) -> cfv_list(args_, cfv_expr(callee, acc))
+  EIntrinsic(_, args_) -> cfv_list(args_, acc)
+  ESurface(sf) -> cfv_list(surface_children(sf), acc)
+  EField(base, _)      -> cfv_expr(base, acc)
+  EIndex(a, b)         -> cfv_expr(b, cfv_expr(a, acc))
+  EBinop(_, a, b)      -> cfv_expr(b, cfv_expr(a, acc))
+  EUnop(_, x)          -> cfv_expr(x, acc)
+  EIf(c, t, eo)        -> {
+    let a1 = cfv_expr(t, cfv_expr(c, acc))
+    match eo { Some(b) -> cfv_expr(b, a1) None -> a1 }
+  }
+  EMatch(scr, arms)    -> cfv_arms(arms, cfv_expr(scr, acc))
+  ELambda(_, body)     -> cfv_expr(body, acc)
+  ERecordLit(_, fs)    -> cfv_fields(fs, acc)
+  EList(els)           -> cfv_elems(els, acc)
+  ERange(a, b, opt)    -> {
+    let a1 = cfv_expr(b, cfv_expr(a, acc))
+    match opt { Some(s) -> cfv_expr(s, a1) None -> a1 }
+  }
+  EBlock(stmts, tail)  -> {
+    let a1 = cfv_stmts(stmts, acc)
+    match tail { Some(t) -> cfv_expr(t, a1) None -> a1 }
+  }
+  EPipe(a, b)          -> cfv_expr(b, cfv_expr(a, acc))
+  EDispatchPipe(_, a, b) -> cfv_expr(b, cfv_expr(a, acc))
+  EBang(inner)         -> cfv_expr(inner, acc)
+  ELitUnit(inner, _)   -> cfv_expr(inner, acc)
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = cfv_expr(body, acc)
+    let a2 = match init_opt { Some(i) -> cfv_expr(i, a1) None -> a1 }
+    let a3 = cfv_clauses(clauses, a2)
+    match ret_opt { Some(r) -> match r { HR(_, b, _, _) -> cfv_expr(b, a3) }  None -> a3 }
+  }
+  _ -> acc
+}
+
+fn cfv_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(_, og, body) -> {
+      let a1 = match og { Some(g) -> cfv_expr(g, acc) None -> acc }
+      cfv_arms(rest, cfv_expr(body, a1))
+    }
+  }
+}
+
+fn cfv_fields(fs: [FieldInit], acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> match f { FI(_, e) -> cfv_fields(rest, cfv_expr(e, acc)) }
+}
+
+fn cfv_elems(els: [ListElem], acc: [String]) : [String] = match els {
+  []            -> acc
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> cfv_elems(rest, cfv_expr(e, acc))
+    ElSpread(e) -> cfv_elems(rest, cfv_expr(e, acc))
+  }
+}
+
+fn cfv_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> match s {
+    SLet(_, _, e)        -> cfv_stmts(rest, cfv_expr(e, acc))
+    SVar(_, _, e, _, _)  -> cfv_stmts(rest, cfv_expr(e, acc))
+    SAssert(e, og)       -> {
+      let a1 = cfv_expr(e, acc)
+      let a2 = match og { Some(g) -> cfv_expr(g, a1) None -> a1 }
+      cfv_stmts(rest, a2)
+    }
+    SExprStmt(e)         -> cfv_stmts(rest, cfv_expr(e, acc))
+    SIndexAssign(a, b, c, _, _) -> cfv_stmts(rest, cfv_expr(c, cfv_expr(b, cfv_expr(a, acc))))
+    SAssign(a, c, _, _)  -> cfv_stmts(rest, cfv_expr(c, cfv_expr(a, acc)))
+    SUse(_, _, _)        -> cfv_stmts(rest, acc)
+  }
+}
+
+fn cfv_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+  []           -> acc
+  [c, ...rest] -> match c { HC(_, _, body, _, _) -> cfv_clauses(rest, cfv_expr(body, acc)) }
+}
+
+# Materialise a fixed-width vec (`raw`, a pure C local) into a dynamic
+# heap `Vec`: a pre-sized `vec_reserve` filled by one boxed `vec_push`
+# per element. Crosses the fixed→dynamic boundary at a boxed border.
+fn materialize_fixed_vec(t: Ty, raw: String) : String {
+  let n = fixed_vec_n(t)
+  let elem = fixed_vec_elem(t)
+  let base = concat_all(["kai_core_vec_reserve(kai_int(", int_to_string(n), "LL))"])
+  materialize_fixed_vec_push(base, raw, elem, 0, n)
+}
+
+fn materialize_fixed_vec_push(acc: String, raw: String, elem: Ty, i: Int, n: Int) : String {
+  if i >= n { acc }
+  else {
+    let elem_box = box_wrap(Some(elem), concat_all(["(", raw, ").a[", int_to_string(i), "]"]))
+    let push = concat_all(["kai_core_vec_push(", acc, ", ", elem_box, ")"])
+    materialize_fixed_vec_push(push, raw, elem, i + 1, n)
+  }
+}
+
+# Wrap a raw C scalar into its boxed `KaiValue *` form. Picks the
+# constructor by `ty`. `kai_int` / `kai_bool` / `kai_char` are the
+# Phase 1 cache-aware constructors so small ints and chars stay
+# allocation-free at the boundary.
+
+# Wrap a raw C scalar into its boxed `KaiValue *` form. Picks the
+# constructor by `ty`. `kai_int` / `kai_bool` / `kai_char` are the
+# Phase 1 cache-aware constructors so small ints and chars stay
+# allocation-free at the boundary.
+pub(pkg) fn box_wrap(opt_ty: Option[Ty], raw: String) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> cat3("kai_int(",  raw, ")")
+      TyReal -> cat3("kai_real(", raw, ")")
+      TyBool -> cat3("kai_bool(", raw, ")")
+      TyChar -> cat3("kai_char(", raw, ")")
+      TyByte -> cat3("kai_byte(", raw, ")")
+      TyInt32  -> cat3("kai_int32(",  raw, ")")
+      TyUInt32 -> cat3("kai_uint32(", raw, ")")
+      TyUInt64 -> cat3("kai_uint64(", raw, ")")
+      TyInt128 -> cat3("kai_int128(", raw, ")")
+      # A `TyHandle` rides a boxed slot as an immediate (tag bit set, no
+      # allocation), so any dup/drop Perceus plants on it is a no-op. A bare
+      # pointer there is RC'd like a heap cell and corrupts the LLVM object.
+      TyHandle -> cat3("kai_handle_box(", raw, ")")
+      # A fixed-width `Vec[e]<n>` crossing to a boxed border (a `Vec`
+      # parameter, a record field) materialises into a dynamic heap vec:
+      # the flat inline layout is copied out element by element. The `raw`
+      # C expression is a pure local (`kair_x`), so re-reading its fields
+      # is side-effect-free.
+      TyDimT(_, _)        -> if ty_is_fixed_vec(t) { materialize_fixed_vec(t, raw) }
+                             else { match t { TyDimT(inner, _) -> box_wrap(Some(inner), raw) _ -> cat3("kai_int(", raw, ")") } }
+      TyRefineT(inner, _) -> box_wrap(Some(inner), raw)
+      _ -> cat3("kai_int(", raw, ") /* box_wrap: unexpected ty */")
+    }
+    None -> cat3("kai_int(", raw, ") /* box_wrap: missing ty */")
+  }
+}
+
+# Unbox a boxed `KaiValue *` into its raw C scalar. Used at the
+# `MBoxed → MUnboxed` boundary inside arithmetic operands.
+
+# Unbox a boxed `KaiValue *` into its raw C scalar. Used at the
+# `MBoxed → MUnboxed` boundary inside arithmetic operands.
+# True when a raw EBinop is Int `+`/`-`/`*` and must therefore wrap in
+# two's complement (kaikai's documented Int semantics). The emitter
+# renders these via a uint64_t round-trip so the wrap is well-defined
+# C; `/` and `%` are excluded here (they route through the checked helper,
+# see `raw_int_divmod_is_checked`) and Real `+`/`-`/`*` are excluded by the
+# TyInt gate. See the EBinop arm in emit_kind_raw.
+# True iff the optional type is Int (or an Int newtype/refinement). Shared
+# by the wrapping-arith gate and the direct-Int-comparison fast path.
+pub(pkg) fn ty_opt_is_int(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyInt -> true
+    TyDimT(inner, _)    -> match inner { TyInt -> true _ -> false }
+    TyRefineT(inner, _) -> match inner { TyInt -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+# True when the optional type is one of the fixed-width integer
+# primitives (Byte included). They share the raw-arithmetic wrapping
+# discipline with `Int`; the cast width differs (per `raw_signed_c_type`).
+pub(pkg) fn ty_opt_is_fixed_width(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyByte -> true
+    TyInt32 -> true   TyUInt32 -> true
+    TyUInt64 -> true  TyInt128 -> true
+    _ -> false
+  }
+  None -> false
+}
+
+pub(pkg) fn raw_arith_is_wrapping_int(op: BinOp, opt_ty: Option[Ty]) : Bool {
+  let is_wrap_op = match op {
+    BoAdd -> true
+    BoSub -> true
+    BoMul -> true
+    _     -> false
+  }
+  is_wrap_op and (ty_opt_is_int(opt_ty) or ty_opt_is_fixed_width(opt_ty))
+}
+
+# True when a raw EBinop is an `Int`/`Byte`/`Int32`/`UInt32`/`UInt64`
+# `/`/`%` — those route through the trapping helper rather than a bare
+# `a / b`, so a zero divisor traps clean. The unsigned widths use the
+# `kai_udiv_chk`/`kai_umod_chk` pair (`ty_opt_is_checked_unsigned`); the
+# signed ones use `kai_idiv_chk`/`kai_imod_chk`. Int128 div stays boxed
+# (`kai_fixed_div`).
+pub(pkg) fn raw_int_divmod_is_checked(op: BinOp, opt_ty: Option[Ty]) : Bool {
+  binop_is_division(op) and
+  (ty_opt_is_int(opt_ty) or ty_opt_is_byte(opt_ty) or
+   ty_opt_is_int32(opt_ty) or ty_opt_is_checked_unsigned(opt_ty))
+}
+
+fn ty_opt_is_byte(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyByte -> true
+    TyRefineT(inner, _) -> match inner { TyByte -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+fn ty_opt_is_int32(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyInt32 -> true
+    TyRefineT(inner, _) -> match inner { TyInt32 -> true _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+# UInt32/UInt64 `/`/`%` route through the UNSIGNED checked helper. Their
+# operands widen (zext) into the u64 helper; only the zero divisor traps.
+pub(pkg) fn ty_opt_is_checked_unsigned(opt_ty: Option[Ty]) : Bool = match opt_ty {
+  Some(t) -> match t {
+    TyUInt32 -> true   TyUInt64 -> true
+    TyRefineT(inner, _) -> match inner { TyUInt32 -> true  TyUInt64 -> true  _ -> false }
+    _ -> false
+  }
+  None -> false
+}
+
+# The signed/unsigned C scalar type a raw integer slot computes in.
+# `Int` and unknown default to `int64_t`; the fixed-width primitives
+# pick their exact width. The unsigned form drives the two's-complement
+# wrap (defined C, no UBSan trap); the signed form is the cast back.
+pub(pkg) fn raw_signed_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(TyByte)   -> "uint8_t"
+  Some(TyInt32)  -> "int32_t"
+  Some(TyUInt32) -> "uint32_t"
+  Some(TyUInt64) -> "uint64_t"
+  Some(TyInt128) -> "__int128"
+  Some(TyDimT(inner, _))    -> raw_signed_c_type(Some(inner))
+  Some(TyRefineT(inner, _)) -> raw_signed_c_type(Some(inner))
+  _ -> "int64_t"
+}
+
+pub(pkg) fn raw_unsigned_c_type(opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(TyByte)   -> "uint8_t"
+  Some(TyInt32)  -> "uint32_t"
+  Some(TyUInt32) -> "uint32_t"
+  Some(TyUInt64) -> "uint64_t"
+  Some(TyInt128) -> "unsigned __int128"
+  Some(TyDimT(inner, _))    -> raw_unsigned_c_type(Some(inner))
+  Some(TyRefineT(inner, _)) -> raw_unsigned_c_type(Some(inner))
+  _ -> "uint64_t"
+}
+
+# A fixed-width literal as a raw C scalar. Int32/UInt32 fit the
+# compiler's 64-bit decode and cast directly. UInt64 and Int128 may hold
+# values above 2^63 (which overflow `decode_int`), so they parse their
+# textual span at runtime via `kai_i128_parse` and cast to the width.
+pub(pkg) fn fixed_raw_c_lit(span: String, ty: Ty) : String = match ty {
+  TyByte   -> cat3("((uint8_t)", int_to_string(decode_int(span)), ")")
+  TyInt32  -> cat3("((int32_t)", int_to_string(decode_int(span)), "LL)")
+  TyUInt32 -> cat3("((uint32_t)", int_to_string(decode_int(span)), "ULL)")
+  TyUInt64 -> cat3("((uint64_t)kai_i128_parse(\"", span, "\"))")
+  TyInt128 -> cat3("kai_i128_parse(\"", span, "\")")
+  _        -> cat2(int_to_string(decode_int(span)), "LL")
+}
+
+# A fixed-width literal as a boxed KaiValue (constructor call).
+pub(pkg) fn fixed_box_c_lit(span: String, ty: Ty) : String = match ty {
+  TyByte   -> cat3("kai_byte((uint8_t)", int_to_string(decode_int(span)), ")")
+  TyInt32  -> cat3("kai_int32((int32_t)", int_to_string(decode_int(span)), "LL)")
+  TyUInt32 -> cat3("kai_uint32((uint32_t)", int_to_string(decode_int(span)), "ULL)")
+  TyUInt64 -> cat3("kai_uint64((uint64_t)kai_i128_parse(\"", span, "\"))")
+  TyInt128 -> cat3("kai_int128(kai_i128_parse(\"", span, "\"))")
+  _        -> cat3("kai_int(", int_to_string(decode_int(span)), "LL)")
+}
+
+# C operator for a comparison op, when both operands are Int and the
+# comparison can lower to a direct `kai_intf(a) <op> kai_intf(b)` instead of
+# the boxed kai_op dispatch (type-test + boxed-bool + truthy + decref).
+# `==`/`!=` are included: structural equality over two statically-Int
+# operands IS the numeric comparison, so no Eq dispatch is lost.
+pub(pkg) fn int_cmp_c_op(op: BinOp) : Option[String] = match op {
+  BoLt -> Some("<")
+  BoGt -> Some(">")
+  BoLe -> Some("<=")
+  BoGe -> Some(">=")
+  BoEq -> Some("==")
+  BoNe -> Some("!=")
+  _    -> None
+}
+
+# Gate for the direct-Int-comparison fast path: an order comparison whose
+# both operands are statically Int.
+pub(pkg) fn is_int_order_cmp(op: BinOp, a: Expr, b: Expr) : Bool = int_cmp_raw(op, a, b)
+
+# Is `e` itself a direct Int order-comparison (`k < kx`, …)? Used by the
+# `if`/match-guard lowering to emit a RAW C bool predicate and use the C
+# ternary directly, instead of `kai_op_truthy(kai_bool(...))` — the box and
+# the un-box cancel. General over every `if cmp { }` where both sides are
+# statically Int, the rb-tree descent being the load-bearing case (3 such
+# comparisons per node visited).
+pub(pkg) fn expr_is_int_order_cmp(e: Expr) : Bool = match e.kind {
+  EBinop(op, a, b) -> is_int_order_cmp(op, a, b)
+  _ -> false
+}
+
+fn unbox_field_for(opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> "->as.i"
+      TyReal -> "->as.r"
+      TyBool -> "->as.b"
+      TyChar -> "->as.c"
+      TyByte -> "->as.byte_val"
+      TyInt32  -> "->as.i32"
+      TyUInt32 -> "->as.u32"
+      TyUInt64 -> "->as.u64"
+      # Int128 has no single alignment-safe field suffix (its value spans
+      # two 8-byte halves); the raw path reads it via `kai_i128_load` in
+      # `unbox_boxed_scalar`, which intercepts TyInt128 before this point.
+      # The low half keeps any stray emit a valid (if lossy) C expression
+      # rather than a reference to the removed `->as.i128` field.
+      TyInt128 -> "->as.i128_halves[0]"
+      TyDimT(inner, _)    -> unbox_field_for(Some(inner))
+      TyRefineT(inner, _) -> unbox_field_for(Some(inner))
+      _ -> "->as.i /* unbox: unexpected ty */"
+    }
+    None -> "->as.i /* unbox: missing ty */"
+  }
+}
+
+# The raw payload of `node`'s boxed C form: an owned temporary is consumed,
+# a variable read borrows.
+pub(pkg) fn unbox_border(boxed: String, node: Expr, opt_ty: Option[Ty]) : String =
+  if raw_border_owns(node) { unbox_take_scalar(boxed, opt_ty) }
+  else { unbox_boxed_scalar(boxed, opt_ty) }
+
+# Reads the payload and releases the box. Bool and Byte boxes are immortal,
+# so their plain read owes no release.
+pub(pkg) fn unbox_take_scalar(boxed: String, opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(t) -> match t {
+    TyInt    -> cat3("kai_take_int(", boxed, ")")
+    TyReal   -> cat3("kai_take_real(", boxed, ")")
+    TyChar   -> cat3("kai_take_char(", boxed, ")")
+    TyInt32  -> cat3("kai_take_int32(", boxed, ")")
+    TyUInt32 -> cat3("kai_take_uint32(", boxed, ")")
+    TyUInt64 -> cat3("kai_take_uint64(", boxed, ")")
+    TyInt128 -> cat3("kai_take_int128(", boxed, ")")
+    TyDimT(inner, _)    -> if ty_is_fixed_vec(t) { unbox_boxed_scalar(boxed, opt_ty) }
+                           else { unbox_take_scalar(boxed, Some(inner)) }
+    TyRefineT(inner, _) -> unbox_take_scalar(boxed, Some(inner))
+    _ -> unbox_boxed_scalar(boxed, opt_ty)
+  }
+  None -> unbox_boxed_scalar(boxed, opt_ty)
+}
+
+# Borrow-reads a raw scalar out of a boxed C expression, leaving its RC
+# untouched. An Int may be a tagged immediate, so it reads via `kai_intf`.
+pub(pkg) fn unbox_boxed_scalar(boxed: String, opt_ty: Option[Ty]) : String {
+  match opt_ty {
+    Some(t) -> match t {
+      TyInt  -> cat3("kai_intf(", boxed, ")")
+      # A boxed `TyHandle` is the immediate `box_wrap` built, never a heap
+      # cell: clear the tag bit, no `->as.i` deref.
+      TyHandle -> cat3("kai_handle_unbox(", boxed, ")")
+      # An Int128 box stores its value in two 8-byte halves, never a bare
+      # `->as.i128` (that field carries a 16-byte alignment requirement the
+      # 8-byte-aligned KaiValue does not meet — a misaligned read segfaults
+      # on Linux/-O2). Read it through the alignment-agnostic load helper.
+      TyInt128 -> cat3("kai_i128_load(", boxed, ")")
+      TyDimT(inner, _)    -> unbox_boxed_scalar(boxed, Some(inner))
+      TyRefineT(inner, _) -> unbox_boxed_scalar(boxed, Some(inner))
+      _ -> cat3("(", boxed, cat2(")", unbox_field_for(opt_ty)))
+    }
+    None -> cat3("kai_intf(", boxed, ")")
+  }
+}
+
+# Unroll `b ^ n` into `n` repeated multiplications. Caller has already
+# gated `n` to `[0, 64]` and `base_c` is a pure raw C expression
+# (literal / EVar / pure raw arith), so duplication is safe. Only the
+# non-fixed-width Int shape reaches here. The factors multiply in
+# `uint64_t` and cast back so an overflowing power wraps (defined C)
+# like the sibling `*`. Squaring would emit fewer factors but produces
+# the same constant-folded code under any optimizer; the linear form
+# keeps the emitted IR easy to grep for in regression tests.
+pub(pkg) fn emit_pow_unroll(base_c: String, n: Int) : String {
+  match n {
+    0 -> "1LL"
+    1 -> cat3("(", base_c, ")")
+    _ -> cat3("((int64_t)(", emit_pow_unroll_loop(base_c, n, ""), "))")
+  }
+}
+
+fn emit_pow_unroll_loop(base_c: String, k: Int, acc: String) : String {
+  match k {
+    0 -> acc
+    1 -> {
+      if acc == "" { cat3("(uint64_t)(", base_c, ")") }
+      else { concat_all([acc, " * (uint64_t)(", base_c, ")"]) }
+    }
+    _ -> {
+      let next = if acc == "" { cat3("(uint64_t)(", base_c, ")") }
+                 else { concat_all([acc, " * (uint64_t)(", base_c, ")"]) }
+      emit_pow_unroll_loop(base_c, k - 1, next)
+    }
+  }
+}
+
+# A local read in boxed position. A raw-bound binder is boxed on use from
+# its raw alias, by the read's type: a raw `let` may hold a Bool or a
+# Char, not only a kind-1 Int.
+pub(pkg) fn emit_local_value(l: LocalId, ty: Option[Ty], cx: EmitCtx) : String = {
+  if emit_ctx_kind1_raw_has(cx, l) {
+    match ty { None -> cat3("kai_int(", c_raw_of(cx, l), ")")  Some(_) -> box_wrap(ty, c_raw_of(cx, l)) }
+  } else { c_local_of(cx, l) }
+}

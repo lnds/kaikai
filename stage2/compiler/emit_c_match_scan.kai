@@ -1,0 +1,260 @@
+# Scrutinee analysis for a match: borrowing, shared constructors, slot hoisting and arm locals.
+
+import compiler.ast
+import compiler.ctor_ix
+import compiler.emit_c_ctx
+import compiler.emit_c_pat
+import compiler.emit_c_tcrec_scan
+import compiler.emit_shared
+import compiler.emit_tcrec_live
+import compiler.handler_alias
+import compiler.local_names
+import compiler.parse_lexical
+import compiler.unwind_sites
+import compiler.util
+
+pub(pkg) fn pat_lit_raw(p: Pattern) : String {
+  match p.pkind {
+    PLit(lit) -> match lit.kind {
+      EInt(n, _) -> cat2(int_to_string(n), "LL")
+      EBool(b) -> if b { "1" } else { "0" }
+      EChar(c) -> int_to_string(char_to_int(c))
+      EFixed(span, _) -> int_to_string(decode_int(span))
+      _ -> "0LL /* pat_lit_raw: unexpected lit */"
+    }
+    _ -> "0LL /* pat_lit_raw: not a literal pattern */"
+  }
+}
+
+# Detect a borrowed scrutinee: perceus wraps `match p { ... }` as
+# `match __perceus_borrow(p) { ... }` when `p` is an inferred-borrowed
+# param (inspect-only, arms escape nothing). The match then BORROWS the
+# scrutinee — it reads it without owning it, so it must NOT decref it on
+# exit (the owner up the call stack reclaims it). Returns the inner
+# scrutinee expr when the wrap is present.
+pub(pkg) fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EMark(MkBorrow) -> match args_ { [inner] -> Some(inner)  _ -> None }
+    _               -> None
+  }
+  _ -> None
+}
+
+# Sub-deref hoisting (cross-arm CSE) — the match decision-tree lever
+#
+# A nested match like balance_left/right's rotations emits each arm as a
+# separate `if (...)`, and every arm re-dereferences the same sub-cell
+# off `_scr` from scratch: `kai_var_slots(_scr)[1].ptr->variant_tag`,
+# `kai_var_slots(kai_var_slots(_scr)[1].ptr)[k].ptr`, ... The dependent
+# pointer loads cannot be CSE'd by clang across the separate branches
+# (measured: -O3 does not share them; 18 double-indirections in the
+# rb-tree insert_loop). Koka emits a decision tree that reads each
+# sub-cell once. We get the same effect with a minimal, single-pass
+# peephole (no column selection — Tier 1 fast-compile stays intact):
+# hoist `_scr`'s nested-deref slots to C locals `_hs<i>` at the top of
+# the match, then have the per-arm tests/binds read `_hs<i>`.
+#
+# SOUNDNESS (load-bearing): the hoisted load is guarded by the shared
+# ctor's tag. `_scr` may be a SMALLER sibling ctor (nullary arm,
+# catch-all arm, or a non-exhaustive match), and variant blocks are
+# sized by arity, so an unguarded `kai_var_slots(_scr)[i]` reads past
+# the block's end; a sibling with enough slots may still carry a
+# primitive (non-pointer) payload at i. Guarding on the exact ctor tag
+# makes the load legal for every scrutinee: arms of that ctor read the
+# real slot, any other value yields NULL and its arm test fails first.
+# We only hoist slot i when some arm's sub-pattern at i is itself a
+# PVariant (a nested deref worth sharing) and slot i is a pointer slot.
+# The hoist is a borrow (read, no incref) — RC balance is unchanged.
+
+# The outer ctor name shared by all arms, if they are all PVariant of
+# one ctor with no guard. None otherwise (mixed ctors, wildcard arms,
+# guards) — in which case we do not hoist.
+# The shared ctor as the slot readers need it: its id and the arity the
+# arms destructure it with.
+pub(pkg) type SharedCtor = SC(SymId, Int)
+
+fn arms_shared_ctor(arms: [Arm]) : Option[SharedCtor] =
+  arms_shared_ctor_loop(arms, None)
+
+# Fold the arms, tracking the one ctor shared by all PAYLOAD-carrying
+# arms. A nullary PVariant (RBLeaf) or a PWild/PBind catch-all does NOT
+# constrain the ctor: those arms never read a hoisted slot, and the tag
+# guard on the hoisted load keeps the load itself legal when they match.
+# Any pattern guard disables hoisting.
+fn arms_shared_ctor_loop(arms: [Arm], acc: Option[SharedCtor]) : Option[SharedCtor] = match arms {
+  [] -> acc
+  [a, ...rest] -> match a { Arm(p, g, _) -> match g {
+    Some(_) -> None
+    None    -> match p.pkind {
+      PVariant(r, subs) ->
+        if list_length(subs) == 0 {
+          arms_shared_ctor_loop(rest, acc)
+        } else {
+          match acc {
+            None -> arms_shared_ctor_loop(rest, Some(SC(ref_sym(r), list_length(subs))))
+            Some(SC(s0, _)) -> if sym_same(ref_sym(r), s0) { arms_shared_ctor_loop(rest, acc) } else { None }
+          }
+        }
+      PWild    -> arms_shared_ctor_loop(rest, acc)
+      PBind(_) -> arms_shared_ctor_loop(rest, acc)
+      _        -> None
+    }
+  } }
+}
+
+# Slots (positions in the shared-ctor payload) that some arm derefs with
+# a nested PVariant sub-pattern AND that are pointer slots. Those are the
+# ones worth hoisting. Walks all arms, unions the positions.
+fn nested_deref_slots(arms: [Arm], tys: [Int]) : [Int] =
+  nested_deref_slots_loop(arms, tys, [])
+
+fn nested_deref_slots_loop(arms: [Arm], tys: [Int], acc: [Int]) : [Int] =
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a { Arm(p, _, _) -> match p.pkind {
+      PVariant(_, subs) -> nested_deref_slots_loop(rest, tys,
+                             arm_nested_slots(subs, tys, 0, acc))
+      _ -> nested_deref_slots_loop(rest, tys, acc)
+    } }
+  }
+
+fn arm_nested_slots(subs: [Pattern], tys: [Int], i: Int, acc: [Int]) : [Int] =
+  match subs {
+    [] -> acc
+    [sp, ...rest] -> {
+      let k = kind_at(tys, i)
+      let acc2 = match sp.pkind {
+        # nested PVariant on a pointer slot (k==0): worth hoisting.
+        PVariant(_, _) -> if k == 0 and not hoist_slot_member(acc, i) { [i, ...acc] } else { acc }
+        _ -> acc
+      }
+      arm_nested_slots(rest, tys, i + 1, acc2)
+    }
+  }
+
+# Emit the `_hs<i>` declarations for each hoisted slot, at the top of
+# the match `do {}`. The load is tag-guarded (see SOUNDNESS above); the
+# shared ctor always has a row because the hoist set is non-empty only
+# when `match_hoist_slots` found it in the same index.
+pub(pkg) fn emit_hoist_decls(slots: [Int], arms: [Arm], cx: EmitCtx) : String = match slots {
+  [] -> ""
+  _  -> match arms_shared_ctor(arms) {
+    None -> ""
+    Some(SC(s, _)) -> match ctor_ix_row(cx.ctor_ix, s) {
+      None      -> ""
+      Some(row) -> emit_hoist_decls_loop(slots, ctor_row_tag(row))
+    }
+  }
+}
+
+fn emit_hoist_decls_loop(slots: [Int], tag: Int) : String = match slots {
+  [] -> ""
+  [i, ...rest] -> concat_all([
+    "KaiValue *_hs", int_to_string(i),
+    " = (_scr->tag == KAI_VARIANT && _scr->variant_tag == ", int_to_string(tag),
+    ") ? kai_var_slots(_scr)[", int_to_string(i), "].ptr : NULL; ",
+    emit_hoist_decls_loop(rest, tag)
+  ])
+}
+
+# True when the arm list ends in an unconditional catch-all (a PWild or
+# PBind pattern with no guard): the match can never fall through, so the
+# trailing `non-exhaustive match` panic is dead code. Emitting it anyway
+# leaves a call to a noreturn cold fn in the body, which can inhibit the C
+# compiler from inlining small predicates (is_red: `match t { RBNode(Red,
+# ...) -> true; _ -> false }` stayed a non-inline `static int`, 10.9M
+# instructions / 4.6% of the rb-tree bench called 2× per Black node).
+# Dropping the dead panic lets clang fold it into insert_loop's dispatch.
+fn arms_have_catchall(arms: [Arm]) : Bool = match arms {
+  []           -> false
+  [a]          -> match a { Arm(p, g, _) -> match g {
+                    Some(_) -> false   # guarded: can fall through
+                    None    -> match p.pkind { PWild -> true PBind(_) -> true _ -> false }
+                  } }
+  [_, ...rest] -> arms_have_catchall(rest)
+}
+
+pub(pkg) fn match_tail_panic(arms: [Arm]) : String =
+  if arms_have_catchall(arms) { "" }
+  else { "    kai_core_panic(kai_str(\"non-exhaustive match\"));\n" }
+
+# Compute the hoistable slot set for a match, applying the soundness
+# gate. Returns [] unless every arm is a PVariant of one shared ctor
+# (no guards / wildcards), in which case it returns that ctor's nested-
+# deref pointer slots. Empty → no hoisting, cx unchanged downstream.
+pub(pkg) fn match_hoist_slots(arms: [Arm], cx: EmitCtx) : [Int] =
+  match arms_shared_ctor(arms) {
+    None -> []
+    Some(SC(s, ar)) -> match ctor_ix_row(cx.ctor_ix, s) {
+      Some(EV(_, tys, _, _)) -> if list_length(tys) == ar { nested_deref_slots(arms, tys) } else { [] }
+      None                      -> []
+    }
+  }
+
+# The binders of the declaration a lambda or a clause sits in, with the
+# ones a clause body reads and no node declares: the handler-state
+# aliases and the continuation.
+pub(pkg) fn emit_body_locals(ns: LocalNames) : LocalNames =
+  locals_declaring(ns, list_append(user_state_aliases(), [var_cell_alias(), canonical_continuation()]))
+
+# `cx` with the C locals the emitter declares under `keys` in scope.
+pub(pkg) fn emit_ctx_declaring(cx: EmitCtx, keys: [String]) : EmitCtx =
+  EmitCtx { ...cx, lcs: list_append(cx.lcs, map(keys, local_minted)), locals: locals_declaring(cx.locals, keys) }
+
+# The handler-state aliases a stateful clause declares, given which of
+# them the scope around it already binds.
+pub(pkg) fn clause_live_aliases(stateful: Bool, bound: (String) -> Bool) : [String] =
+  if stateful { clause_state_aliases(bound) } else { [] }
+
+# True when any arm body can reach a tcrec/TRMC goto or an early return —
+# the gate for declaring this match's scrutinee-release alias.
+fn match_arms_have_sentinel(arms: [Arm], cx: EmitCtx) : Bool = match arms {
+  [] -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, body) ->
+      if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) { true } else { match_arms_have_sentinel(rest, cx) }
+  }
+}
+
+# Whether `body` holds a `!`; only a frame with an early return is scanned.
+fn emit_exits_in(body: Expr, cx: EmitCtx) : Bool = any(cx.unw.sites, (s) => unw_is_exit(s)) and tcl_has_bang(body)
+
+# Ledger entering a non-reuse arm body: enclosing pending entries plus
+# this match's scrutinee alias plus this pattern's RC binders — only
+# when the body can actually reach a goto. A goto-free body never reads
+# the ledger, so it is cleared to skip the branch-refinement scans.
+pub(pkg) fn tcp_arm_body_cx(arm_cx: EmitCtx, scr_alias: Option[String], pat: Pattern,
+                   body: Expr, cx: EmitCtx) : EmitCtx =
+  if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) {
+    let with_scr = match scr_alias {
+      Some(a) -> list_append(arm_cx.tcpend, [tcl_scr_entry(a)])
+      None    -> arm_cx.tcpend
+    }
+    emit_ctx_with_tcpend(arm_cx, tcl_push_binders(with_scr, tcp_rc_binders(pat, cx)))
+  } else { match arm_cx.tcpend {
+    [] -> arm_cx
+    _  -> emit_ctx_with_tcpend(arm_cx, [])
+  } }
+
+pub(pkg) fn tcp_scr_alias_decl(scr_alias: Option[String]) : String = match scr_alias {
+  Some(a) -> concat_all(["KaiValue *", a, " = _scr; (void) ", a, "; "])
+  None    -> ""
+}
+
+pub(pkg) fn tcp_new_scr_alias(arms: [Arm], cx: EmitCtx) : Option[String] =
+  if match_arms_have_sentinel(arms, cx) {
+    Some(cat2("_kai_tcs", int_to_string(tcl_scr_count(cx.tcpend))))
+  } else { None }
+
+# A raw zero of the match's result type — the safe initialiser for `_r`
+# (the exhaustivity tail-panic makes it unreachable, but C must see an
+# init to avoid UB on a hypothetically-incomplete match).
+pub(pkg) fn raw_zero(ty: Option[Ty]) : String = match ty {
+  Some(t) -> match t {
+    TyReal -> "0.0"
+    TyDimT(inner, _)    -> raw_zero(Some(inner))
+    TyRefineT(inner, _) -> raw_zero(Some(inner))
+    _ -> "0"
+  }
+  None -> "0"
+}

@@ -1,0 +1,502 @@
+# Handler environment structs, clause state, captures and lambda references.
+
+import compiler.ast
+import compiler.core_types
+import compiler.ctor_ix
+import compiler.effect_instance
+import compiler.emit_c_ctx
+import compiler.emit_c_match_scan
+import compiler.emit_c_sigs
+import compiler.emit_shared
+import compiler.emit_unwind_c
+import compiler.enc_unit
+import compiler.handle_caps
+import compiler.infer_clause_holes
+import compiler.local_names
+import compiler.marks
+import compiler.spec_names
+import compiler.symtab
+import compiler.unwind_sites
+import compiler.util
+
+# A recorded clause by field: the one place this file reads `CI`'s layout.
+pub(pkg) type ClauseParts = { line: Int, col: Int, eff: SymId, head: ClauseHead, params: [Param], body: Expr,
+                     stateful: Bool, enc_fn: EncFn, caps: [Capture] }
+
+pub(pkg) fn clause_parts(c: ClauseInfo) : ClauseParts = match c {
+  CI(line, col, _, head, params, body, stateful, enc_fn, caps, _, eff) ->
+    ClauseParts { line: line, col: col, eff: eff, head: head, params: params, body: body,
+                  stateful: stateful, enc_fn: enc_fn, caps: caps }
+}
+
+# The captured locals: a captured handler id is no value binder.
+pub(pkg) fn capture_locals(caps: [Capture]) : [LocalId] = match caps {
+  []                      -> []
+  [CapLocal(l), ...rest]  -> [l, ...capture_locals(rest)]
+  [CapAlias(_), ...rest]  -> capture_locals(rest)
+}
+
+# The field a capture rides the env struct under: its place among the
+# captures of the handle's clauses, `layout`. The install and each clause
+# name their locals from their own tables; the field belongs to neither.
+fn env_field(layout: [Capture], c: Capture) : String = cat2("c", int_to_string(capture_index(layout, c)))
+
+# The evidence struct of the effect `s` declares.
+pub(pkg) fn ev_name_of(tab: SymTab, effs: [Decl], s: SymId) : String =
+  ev_name(rt_name(tab, s), eff_mo(effs, s))
+
+# R9: stable C symbol for a handle's env struct. Built from the same
+# (enc_fn, line, col) triple as the clause-fn names; both ends mint
+# matching identifiers off the matching `ClauseInfo` so the cast in
+# the clause prologue resolves to the same type the install site
+# allocated. `enc_fn` is the post-monomorph fn / lambda symbol.
+
+# R9: stable C symbol for a handle's env struct. Built from the same
+# (enc_fn, line, col) triple as the clause-fn names; both ends mint
+# matching identifiers off the matching `ClauseInfo` so the cast in
+# the clause prologue resolves to the same type the install site
+# allocated.
+fn handle_env_struct_name(enc_fn: String, line: Int, col: Int) : String =
+  handler_scoped_sym("env", enc_fn, line, col)
+
+pub(pkg) fn emit_lam_arg_reads(params: [Param], i: Int, ns: LocalNames) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "    KaiValue *", c_local(ln_emitted(ns, p.binder.id)), " = args[", int_to_string(i), "];\n",
+      emit_lam_arg_reads(rest, i + 1, ns)
+    ])
+  }
+}
+
+pub(pkg) fn emit_lam_cap_reads(caps: [Capture], i: Int, ns: LocalNames) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> {
+      let read_line = match c {
+        # A captured handler id: unpack the kai_int back to a
+        # KaiHandlerId so the tagged-op emit
+        # (`kai_evidence_lookup_node_by_id(kai_alias_<a>_id)`)
+        # finds the local in scope.
+        # The capture is a boxed handler-id (kai_int), which under the
+        # Koka tagged-Int representation is an IMMEDIATE, not a heap
+        # pointer — read it via kai_intf (understands both forms), not
+        # `->as.i` which would deref the tagged value and segv.
+        CapAlias(a) -> concat_all([
+          "    KaiHandlerId ", c_alias_id(ln_emitted(ns, a)),
+          " = (KaiHandlerId) kai_intf(self->as.clo.captures[",
+          int_to_string(i),
+          "]);\n"
+        ])
+        CapLocal(l) -> concat_all([
+          "    KaiValue *", c_local(ln_emitted(ns, l)), " = self->as.clo.captures[", int_to_string(i), "];\n"
+        ])
+      }
+      concat_all([read_line, emit_lam_cap_reads(rest, i + 1, ns)])
+    }
+  }
+}
+
+# Every param is owned by the invocation (kai_apply hands ownership per
+# call, #298) yet a closure body only ever DUPs its reads — `in_lam`
+# forces a `__perceus_dup` on every EVar and a nested-closure capture
+# rides `kai_closure`'s own incref — so the birth ref of each param is
+# never consumed and leaks one box per call. Release it after the body.
+# Captures are NOT dropped here: the closure owns them (donated once at
+# construction, released in the KAI_CLOSURE destructor); a per-call drop
+# would UAF after the first of N invocations.
+pub(pkg) fn emit_lam_param_decrefs(params: [Param], taken: [LocalId], ns: LocalNames) : String = match params {
+  []           -> ""
+  [p, ...rest] ->
+    if any(taken, (t) => local_eq(t, p.binder.id)) { emit_lam_param_decrefs(rest, taken, ns) }
+    else { concat_all(["    kai_decref(", c_local(ln_emitted(ns, p.binder.id)), ");\n", emit_lam_param_decrefs(rest, taken, ns)]) }
+}
+
+fn emit_one_lam_forward(l: LamInfo) : String =
+  concat_all(["static KaiValue *", lam_symbol(l), "(KaiValue *, KaiValue **, int);\n"])
+
+pub(pkg) fn emit_lam_forward_decls(lams: [LamInfo]) : String =
+  concat_all(map(lams, emit_one_lam_forward))
+
+# m7a #6c — clause body emission. Each HClause becomes a top-level
+# C function whose name encodes the EHandle's source position plus
+# the op name (collisions are impossible since two distinct HCs
+# either belong to different handles or carry different op names).
+# The signature matches the EvE field type pinned in #6a:
+#   `static KaiValue *_kai_clause_<line>_<col>_<op>(EvE *self, args..., KaiCont *k)`.
+# `resume` is the surface convention for the trailing param and is
+# never part of the C signature — the body uses `resume(v)` as
+# direct-style identity (m7a #6c only). m7a #6d will replace this
+# with a reified continuation closure.
+
+pub(pkg) fn emit_clause_sig(c: ClauseInfo, effs: [Decl], tab: SymTab) : String {
+  let k = clause_parts(c)
+  let op_name = clause_head_word(k.head)
+  let op_args = op_args_only(k.params)
+  let arg_str = match op_args {
+    [] -> ""
+    _  -> cat2(", ", join_with(map(op_args, (pm) => cat2("KaiValue *", c_local(ln_emitted(emit_body_locals(clause_locals(c)), pm.binder.id)))), ", "))
+  }
+  concat_all([
+    "static KaiValue *", user_clause_sym(k.enc_fn.sym, k.line, k.col, op_name),
+    "(", ev_name_of(tab, effs, k.eff), " *self", arg_str, ", KaiCont *k)"
+  ])
+}
+
+pub(pkg) fn emit_clause_forward(c: ClauseInfo, effs: [Decl], tab: SymTab) : String = {
+  let k = clause_parts(c)
+  if is_lifecycle_clause(k.head) {
+    cat2(emit_cleanup_sig(k.enc_fn.sym, k.line, k.col), ";\n")
+  } else { cat2(emit_clause_sig(c, effs, tab), ";\n") }
+}
+
+# R9: per-handle env typedefs. One typedef per (line, col, enc_fn)
+# triple, covering the union of every clause's captures. Emitted at
+# top level (ahead of the clause forwards) so the install-site
+# allocation in `emit_handle` and the read-side cast in
+# `emit_clause_env_prologue` both resolve to the same struct type.
+# Uses a "first occurrence wins" walk: the first ClauseInfo we meet
+# for a (line, col) pair owns the typedef, later ones for the same
+# handle skip emission. Captures are unioned across all clauses of
+# the matching handle so the struct layout covers every clause body.
+pub(pkg) fn emit_handle_env_typedefs(cs: [ClauseInfo]) : String =
+  emit_handle_env_typedefs_loop(cs, [])
+
+fn emit_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String]) : String {
+  match cs {
+    [] -> ""
+    [c, ...rest] -> {
+      let k = clause_parts(c)
+      let key = handle_env_struct_name(k.enc_fn.sym, k.line, k.col)
+      if list_has(seen, key) {
+        emit_handle_env_typedefs_loop(rest, seen)
+      } else {
+        let caps = handle_captures_at(cs, k.enc_fn, k.line, k.col)
+        let decl = match caps {
+          [] -> ""
+          _ -> emit_handle_env_typedef(key, caps)
+        }
+        concat_all([decl, emit_handle_env_typedefs_loop(rest, [key, ...seen])])
+      }
+    }
+  }
+}
+
+fn emit_handle_env_typedef(env_name: String, caps: [Capture]) : String =
+  concat_all([
+    "typedef struct ", env_name, " ", env_name, ";\n",
+    "struct ", env_name, " {\n",
+    emit_handle_env_typedef_fields(caps, caps),
+    "};\n\n"
+  ])
+
+fn emit_handle_env_typedef_fields(layout: [Capture], caps: [Capture]) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "    KaiValue *", env_field(layout, c), ";\n",
+      emit_handle_env_typedef_fields(layout, rest)
+    ])
+  }
+}
+
+# m7b #11: stateful-clause prologue. `state` and `log` are aliases of
+# `self->state`. Both names are bound (the two are aliases of the same
+# slot — the spec uses `state` for `State[T]` and `log` for `Writer[W]`,
+# but at this layer they read the same field). The clause body is then
+# emitted unchanged: any `state` / `log` reference falls through the
+# normal ident lookup and resolves to the local C alias.
+
+# Stateful-clause prologue. `state` and `log` are aliases of
+# `self->state`: the spec uses `state` for `State[T]` and `log` for
+# `Writer[W]`.
+pub(pkg) fn clause_state_prologue(stateful: Bool) : String =
+  concat_all(map(clause_live_aliases(stateful, (key) => false),
+                 (nm) => "    KaiValue *#{c_local(ln_implicit(nm))} = self->state;\n"))
+
+# The captures and the body of a stateful clause sit in a C block of
+# their own. A capture is a binding around the handler: where one is
+# spelled like a state alias, the body reads the capture, which that
+# block declares over the alias.
+pub(pkg) fn clause_env_scope(stateful: Bool, env_prologue: String, ret: String) : String =
+  if stateful and env_prologue != "" { concat_all(["    {\n", env_prologue, ret, "    }\n"]) }
+  else { concat_all([env_prologue, ret]) }
+
+# Signature of the `finally` thunk. Emitted `static`; modular linkage
+# strips the keyword from definition and prototype alike. Returns the
+# block's value, which the runtime drops.
+pub(pkg) fn emit_cleanup_sig(enc_fn: String, line: Int, col: Int) : String =
+  concat_all(["static KaiValue *", user_cleanup_sym(enc_fn, line, col), "(void *_self)"])
+
+# Rebind each capture from the handle's env struct into the clause's local
+# for it. The env borrows the enclosing binder for the handle's extent, so
+# the local is a borrow too: Perceus dups every read of a capture, as it
+# does a lambda's, and the enclosing scope releases it.
+pub(pkg) fn emit_clause_env_prologue(ns: LocalNames, layout: [Capture], enc_fn: String, line: Int, col: Int,
+                             caps: [Capture]) : String {
+  match caps {
+    [] -> ""
+    _ -> {
+      let env_name = handle_env_struct_name(enc_fn, line, col)
+      concat_all([
+        "    ", env_name, " *_env = (", env_name, " *) self->env;\n",
+        emit_clause_env_reads(ns, layout, caps)
+      ])
+    }
+  }
+}
+
+fn emit_clause_env_reads(ns: LocalNames, layout: [Capture], caps: [Capture]) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      clause_env_read(ns, layout, c),
+      emit_clause_env_reads(ns, layout, rest)
+    ])
+  }
+}
+
+# Wrapper around `emit_expr` that flips the in-clause flag, so that
+# `resume(v, ns)` lowers to a state-write before the resume call.
+# Defined further below near emit_expr.
+
+# m7c-d — emit each clause as a top-level LLVM function. Mirrors
+# `emit_clause_body`/`emit_clause_sig` from the C backend. The
+# function takes `(EvX *self, %KaiValue* %arg1, ..., i8* %k)`
+# and returns `%KaiValue*`. Inside, `self` and `k` are bound as
+# locals (literal register names `%self` / `%k` so the resume
+# handler in `llvm_emit_call` can reference `%k` directly). For
+# stateful clauses we load `self->state` once into a local
+# `%kai_state` (also bound as `%kai_log`) so the body can
+# reference `state`/`log` like any other ident.
+fn emit_one_closure_cap(c: Capture, cx: EmitCtx) : String = match c {
+  CapAlias(a) -> concat_all(["kai_int((int64_t) ", c_alias_id(emitted(cx, a)), ")"])
+  CapLocal(l) ->
+    # A kind-1 raw binder has no boxed `kai_<c>` local; re-box its raw
+    # alias for the capture array, mirroring the box-on-use read.
+    if emit_ctx_kind1_raw_has(cx, l) { cat3("kai_int(", c_raw_of(cx, l), ")") }
+    else { c_local_of(cx, l) }
+}
+
+fn emit_closure_caps(caps: [Capture], cx: EmitCtx) : String =
+  join_with(map(caps, (c) => emit_one_closure_cap(c, cx)), ", ")
+
+pub(pkg) fn emit_lambda_ref(x: Expr, cx: EmitCtx) : String {
+  match find_lam(cx.lams, cx.cur_enc_fn, x.line, x.col) {
+    None -> "kai_unit() /* lambda: missing info */"
+    Some(l) -> match l {
+      LamInfo(_, _, _, _, params, caps, _, _) -> {
+        let arity = list_length(params)
+        let n_caps = list_length(caps)
+        if n_caps == 0 {
+          static_closure_c(lam_symbol(l), arity)
+        } else {
+          concat_all([
+            "kai_closure(&", lam_symbol(l),
+            ", ", int_to_string(arity), ", ", int_to_string(n_caps),
+            ", (KaiValue *[]){", emit_closure_caps(caps, cx), "})"
+          ])
+        }
+      }
+    }
+  }
+}
+
+
+# C type used for a raw local of an unboxable type. Matches the
+# `as.*` field widths in `KaiValue` (see runtime.h).
+
+# m7e §11: emit a `[V0, V1, ..., Vn]` C list of nullary variant
+# constructors. Mirrors emit_list_tail's cons-spine shape; uses the
+# same kai_variant signature emit_ident_value uses for a bare
+# nullary constructor reference.
+pub(pkg) fn emit_variants_of_list(ctors: [SymId], cx: EmitCtx) : String {
+  match ctors {
+    [] -> "kai_nil()"
+    [c, ...rest] -> {
+      # A constructor the index lays out no row for keeps tag 0, as an
+      # unregistered name did.
+      let row = match ctor_ix_row(cx.ctor_ix, c) {
+        Some(r) -> r
+        None    -> EV(0, [], 0, c)
+      }
+      match row {
+        EV(_, _, tag, rc) -> concat_all([
+          "kai_cons(kai_variant_u(", int_to_string(tag),
+          ", \"", ctor_cell_name(cx.tab, rc), "\", 0, 0, NULL), ",
+          emit_variants_of_list(rest, cx), ")"
+        ])
+      }
+    }
+  }
+}
+
+# m7e §13 — lower `expr!` to a statement-expression that evaluates
+# `inner`, returns the success payload, or short-circuits the
+# enclosing C function with an early `return`. The discriminator
+# (`Some` vs `Ok`) is chosen from `inner.ty`, which the typer
+# stamped to `Option[_]` or `Result[_, _]` after substitution. Any
+# other shape here is a typer bug — we fall back to a panic stub
+# rather than emit silently-wrong C.
+
+# `var`/State/Reader cells dispatch strictly by-id (`@<name>`); the typer
+# never tags their ops with the `#<name>` capability-value path. So the
+# `kai_<name> = &_node` alias node a `#` dispatch would read is dead for
+# them, and emitting it collides with the user's own `kai_<name>` (a return
+# param or the stateful prologue's `kai_state`/`kai_log`) inside one block.
+pub(pkg) fn alias_is_byid_cell(hsym: SymId) : Bool = effect_is(hsym, CeState) or effect_is(hsym, CeReader)
+
+# The instance a `handle` installs, and the label the run time knows it by.
+pub(pkg) type HandleOf = { inst: InstKey, label: String }
+
+pub(pkg) type Cleanup = { arm: String, run: String }
+
+# Where a handle's two exits meet. Only the normal exit passes through
+# the return clause; a discarded value is the handle's result as is.
+pub(pkg) type HandleExit = { decl: String, normal: String, discard: String, merge: String }
+
+pub(pkg) type UnwHandleC = { vars: String, state: String, pop: String }
+
+pub(pkg) fn emit_unw_handle(hsite: Int, stateful: Bool, cx: EmitCtx) : UnwHandleC =
+  match unw_handle_at(cx.unw.sites, hsite) {
+    None -> UnwHandleC { vars: "", state: "", pop: "" }
+    Some(names) -> {
+      let vars = emit_unw_vars(names, cx)
+      let pop_vars = match vars { [] -> "" _ -> euw_pop("_uwh") }
+      if stateful {
+        UnwHandleC { vars: euw_vars_push("_uwh", vars), state: euw_slot_push("_uws", "_ev.state"),
+                     pop: cat2(euw_pop("_uws"), pop_vars) }
+      } else {
+        UnwHandleC { vars: euw_vars_push("_uwh", vars), state: "", pop: pop_vars }
+      }
+    }
+  }
+
+# The lifecycle `finally { }` only — an op clause that happens to be named
+# `finally` is not one.
+pub(pkg) fn find_finally_clause(cs: [HClause]) : Option[HClause] {
+  match cs {
+    [] -> None
+    [c, ...rest] -> match c {
+      HC(h, _, _, _, _) ->
+        if is_lifecycle_clause(h) { Some(c) }
+        else { find_finally_clause(rest) }
+    }
+  }
+}
+
+# R9: keep only the captures that are actually in scope at the install
+# site. `handle_captures_at` returns the union of every clause's
+# `fv_expr` result; `lcs` is the list of locals visible to
+# `emit_handle`. The install code reads each capture as a local
+# `kai_<name>` to populate the env struct, so a binder not in `lcs`
+# would expand to an undeclared identifier.
+pub(pkg) fn list_filter_in(caps: [Capture], lcs: [LocalId]) : [Capture] {
+  match caps {
+    [] -> []
+    [h, ...rest] ->
+      if env_cap_in_scope(lcs, h) { [h, ...list_filter_in(rest, lcs)] }
+      else { list_filter_in(rest, lcs) }
+  }
+}
+
+# R9 install side: allocate one env struct per handle (zero-init,
+# stack-allocated inside the handle's stmt-expression), populate one
+# field per capture, and stash a `void *` pointer in `_ev.env`. Empty
+# when the handle has no captures — the EvE's `env` slot stays NULL
+# and clause prologues never read it. The emitted env-struct typedef
+# is minted once per (line, col) pair by `emit_handle_env_typedefs`
+# at top level, and lives ahead of every clause forward in the
+# generated C.
+
+# R9 install side: allocate one env struct per handle (zero-init,
+# stack-allocated inside the handle's stmt-expression), populate one
+# field per capture, and stash a `void *` pointer in `_ev.env`. Empty
+# when the handle has no captures — the EvE's `env` slot stays NULL
+# and clause prologues never read it. The emitted env-struct typedef
+# is minted once per (line, col) pair by `emit_handle_env_typedefs`
+# at top level, and lives ahead of every clause forward in the
+# generated C.
+pub(pkg) fn emit_handle_env_alloc(ns: LocalNames, layout: [Capture], caps: [Capture], enc_fn: String,
+                          hline: Int, hcol: Int) : String {
+  match caps {
+    [] -> ""
+    _ -> {
+      let env_name = handle_env_struct_name(enc_fn, hline, hcol)
+      concat_all([
+        env_name, " _env = {0}; ",
+        emit_handle_env_field_assigns(ns, layout, caps)
+      ])
+    }
+  }
+}
+
+fn emit_handle_env_field_assigns(ns: LocalNames, layout: [Capture], caps: [Capture]) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "_env.", env_field(layout, c), " = ", handle_env_field_value(ns, c), "; ",
+      emit_handle_env_field_assigns(ns, layout, rest)
+    ])
+  }
+}
+
+# A handler-id capture rides the env boxed, like a lambda's.
+fn handle_env_field_value(ns: LocalNames, c: Capture) : String = match c {
+  CapAlias(a) -> concat_all(["kai_int((int64_t) ", c_alias_id(ln_emitted(ns, a)), ")"])
+  CapLocal(l) -> c_local(ln_emitted(ns, l))
+}
+
+fn clause_env_read(ns: LocalNames, layout: [Capture], c: Capture) : String = match c {
+  CapAlias(a) -> concat_all(["    KaiHandlerId ", c_alias_id(ln_emitted(ns, a)),
+                             " = (KaiHandlerId) kai_intf(_env->", env_field(layout, c), ");\n"])
+  CapLocal(l) -> concat_all(["    KaiValue *", c_local(ln_emitted(ns, l)), " = _env->", env_field(layout, c), ";\n"])
+}
+
+# An `@<a>` tag only exists under the handle binding `kai_alias_<a>_id`.
+fn env_cap_in_scope(lcs: [LocalId], c: Capture) : Bool = match c {
+  CapAlias(_) -> true
+  CapLocal(l) -> locals_have(lcs, l)
+}
+
+pub(pkg) fn emit_handle_env_ev_assign(caps: [Capture]) : String {
+  match caps {
+    [] -> ""
+    _  -> "_ev.env = (void *) &_env; "
+  }
+}
+
+# Install code mints `_ev.<op> = &<clause_sym>;`, which must name the C
+# function emitted for the clause body. Both ends mint via
+# `user_clause_sym(enc, ...)` off the SAME enclosing fn: the collector
+# stamps it on each `ClauseInfo`, and the install site passes its own.
+pub(pkg) fn emit_clause_assignments(cs: [HClause],
+                           enc: String, hline: Int, hcol: Int) : String {
+  match cs {
+    [] -> ""
+    [c, ...rest] -> match c {
+      HC(head, _, _, _, _) ->
+        # `finally` is not an op: it has no `Ev` slot and is wired to the
+        # evidence node instead.
+        if is_lifecycle_clause(head) {
+          emit_clause_assignments(rest, enc, hline, hcol)
+        } else {
+          let op_name = clause_head_word(head)
+          concat_all([
+            "_ev.", op_name, " = &", user_clause_sym(enc, hline, hcol, op_name), "; ",
+            emit_clause_assignments(rest, enc, hline, hcol)
+          ])
+        }
+    }
+  }
+}
+
+pub(pkg) fn expr_is_perceus_drop_call(x: Expr) : Bool {
+  match x.kind {
+    ECall(callee, _) -> match callee.kind {
+      EMark(m) -> mark_is_drop(m)
+      _ -> false
+    }
+    _ -> false
+  }
+}
