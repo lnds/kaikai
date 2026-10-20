@@ -1,3 +1,21 @@
+#[doc("Ownership lowering: constructor reuse cells, held values and release pads.")]
+
+import compiler.ast
+import compiler.emit_shared
+import compiler.ctor_ix
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_bind
+import compiler.perceus_reuse
+import compiler.unwind_pend
+import compiler.unwind_binders
+import compiler.emit_tcrec_live
+import compiler.operators
+import compiler.marks
+import compiler.util
+import compiler.core_builtins
+import compiler.unwind_pads
+
 # compiler/kir_lower_reuse.kai — nested (non-bijective) variant rotation
 # reuse: the pattern-side slot plan and the unique-branch RC accounting.
 #
@@ -9,14 +27,6 @@
 # sub-ctor (Koka's 2-of-3 rotation reuse; the C oracle's `_ru_inner`).
 # This module computes the per-slot plan from the arm pattern and settles
 # the unique branch's RC before the rebuild args run.
-
-import compiler.ast
-import compiler.emit_shared
-import compiler.ctor_ix
-import compiler.kir
-import compiler.kir_lower
-import compiler.kir_pat_alias
-import compiler.perceus_reuse
 
 # Result of scanning the direct slots for the single nested sub-ctor.
 type RNFind = RNFound(Int, DeclRef, [Pattern]) | RNMulti | RNNone
@@ -36,14 +46,14 @@ path. Tagged-immediate (Int) slots carry no plan entry. A single-head cons
 arm plans its two direct slots flat: a head that is not a plain binder
 (wildcard or deconstructed) has no binder the rebuild can take.
 """)]
-pub fn pat_reuse_nested(p: Pattern, ix: CtorIx) : ReuseNested = match p.pkind {
+pub(pkg) fn pat_reuse_nested(p: Pattern, ix: CtorIx) : ReuseNested = match p.pkind {
   PVariant(r, subs)      -> rn_plan_variant(r, subs, ix)
   PList(elems, opt_rest) -> rn_plan_cons(elems, opt_rest)
   _                      -> RNInone
 }
 
 #[doc("A reuse arm's slot plans: the rotation plan, and the direct slots and inner cells a flat rebuild settles.")]
-pub fn pat_reuse_plan(p: Pattern, ix: CtorIx) : ReusePlan = {
+pub(pkg) fn pat_reuse_plan(p: Pattern, ix: CtorIx) : ReusePlan = {
   let rot = pat_reuse_nested(p, ix)
   let cells = reuse_pattern_cells(p, ix)
   ReusePlan { rot: rot, flat: rn_plan_flat_directs(p, cells, rot, ix), cells: cells }
@@ -159,7 +169,7 @@ its first use for free (`uses-1` extra dups), an unused binder is dropped,
 and a binderless slot's old value is dropped by projection. Runs before
 the rebuild args so a consuming arg sees settled counts.
 """)]
-pub fn rn_direct_acct(slots: [RNSlot], donor: KVal, uses: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match slots {
+pub(pkg) fn rn_direct_acct(slots: [RNSlot], donor: KVal, uses: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match slots {
   [] -> st
   [RNBind(_, nm), ...rest] -> {
     let k = rn_uses_of(uses, nm)
@@ -184,7 +194,7 @@ The inner cell and token travel as REGISTER NAMES (a fresh `KVar` per
 use), never as one KVal reused across calls — the stage1-built compiler
 miscompiles that shape.
 """)]
-pub fn rn_grand_acct(slots: [RNSlot], innerreg: String, tokreg: String, uses: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match slots {
+pub(pkg) fn rn_grand_acct(slots: [RNSlot], innerreg: String, tokreg: String, uses: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match slots {
   [] -> st
   [RNBind(_, nm), ...rest] -> {
     let k = rn_uses_of(uses, nm)
@@ -211,7 +221,7 @@ surviving owner — one leaked cell per reuse. Drops those by projection
 (borrow read + drop) before the overwrite. Re-embedded binders are left
 alone: their per-use accounting (`kaix_incref_if_shared`) already balances.
 """)]
-pub fn rn_flat_unique_drops(slots: [RNSlot], donor: KVal, uses: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match slots {
+pub(pkg) fn rn_flat_unique_drops(slots: [RNSlot], donor: KVal, uses: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match slots {
   [] -> st
   [RNBind(i, nm), ...rest] ->
     rn_flat_unique_drops(rest, donor, uses, pos,
@@ -221,7 +231,7 @@ pub fn rn_flat_unique_drops(slots: [RNSlot], donor: KVal, uses: [LocalId], pos: 
 }
 
 #[doc("The direct slots of a reuse plan, empty when the arm has none.")]
-pub fn rn_directs(rn: ReuseNested) : [RNSlot] = match rn {
+pub(pkg) fn rn_directs(rn: ReuseNested) : [RNSlot] = match rn {
   RNI(_, _, _, ds, _) -> ds
   RNInone             -> []
 }
@@ -245,3 +255,292 @@ fn rn_reg(st: LowerSt, nm: LocalId) : KVal = KVar(ls_reg_of(st, nm))
 fn rn_extra_dups(nm: LocalId, n: Int, pos: KPos, st: LowerSt) : LowerSt =
   if n <= 0 { st }
   else { rn_extra_dups(nm, n - 1, pos, ls_emit(st, KRC(KDup(rn_reg(st, nm)), pos))) }
+
+#[doc("The lowering state after the inner cells are settled, and the registers to drop once the rebuild's args have run.")]
+pub(pkg) type CellOwn = CellOwn(LowerSt, [String])
+
+#[doc("Settle `cells`, the inner cells beneath `donor`'s slots, for either donor.")]
+pub(pkg) fn kc_cells_own(cells: [(Int, ReuseCell)], donor: KVal, uses: [LocalId], pos: KPos, st: LowerSt) : CellOwn =
+  kc_cells_go(cells, donor, uses, pos, CellOwn(st, []))
+
+#[doc("""
+The uses of binders outside `cells`. A taken binder beneath a cell ends
+with exactly one reference whatever its uses, so it must not also take
+the donor's per-use shared incref.
+""")]
+pub(pkg) fn kc_uses_outside_cells(uses: [LocalId], cells: [(Int, ReuseCell)]) : [LocalId] = {
+  let owned = flat_map(cells, (ic) => match ic { (_, c) -> kc_cell_names(c) })
+  filter(uses, (u) => not lid_has(owned, u))
+}
+
+#[doc("Drop each register `regs` names.")]
+pub(pkg) fn kc_drop_regs(regs: [String], pos: KPos, st: LowerSt) : LowerSt = match regs {
+  []           -> st
+  [r, ...rest] -> kc_drop_regs(rest, pos, ls_emit(st, KRC(KDrop(KVar(r)), pos)))
+}
+
+fn kc_cells_go(cells: [(Int, ReuseCell)], donor: KVal, uses: [LocalId], pos: KPos, acc: CellOwn) : CellOwn = match cells {
+  [] -> acc
+  [(i, c), ...rest] -> match acc { CellOwn(st, ds) -> match ls_fresh_reg(st) { LSReg(creg, st0) -> {
+    let st1 = ls_emit(ls_emit(st0, KLet(creg, SBoxed, KProj(donor, i), pos)), KRC(KIncrefIfShared(donor, KVar(creg)), pos))
+    kc_cells_go(rest, donor, uses, pos, kc_cell_own(c, creg, uses, pos, CellOwn(st1, ds)))
+  } } }
+}
+
+# `creg` holds an owned reference to the cell.
+fn kc_cell_own(c: ReuseCell, creg: String, uses: [LocalId], pos: KPos, acc: CellOwn) : CellOwn = match c {
+  ReuseCell(n, kids) -> match acc { CellOwn(st, ds) -> match ls_fresh_reg(st) { LSReg(tok, st0) -> {
+    let st1 = ls_emit(st0, KLet(tok, SBoxed, KTokenSteal(KVar(creg), n), pos))
+    match kc_kids_own(kids, creg, tok, uses, pos, CellOwn(st1, ds)) { CellOwn(st2, ds2) ->
+      CellOwn(ls_emit(st2, KRC(KFreeToken(KVar(tok)), pos)), ds2) }
+  } } }
+}
+
+fn kc_kids_own(kids: [CellKid], creg: String, tok: String, uses: [LocalId], pos: KPos, acc: CellOwn) : CellOwn = match kids {
+  []             -> acc
+  [kid, ...rest] -> kc_kids_own(rest, creg, tok, uses, pos, kc_kid_own(kid, creg, tok, uses, pos, acc))
+}
+
+fn kc_kid_own(kid: CellKid, creg: String, tok: String, uses: [LocalId], pos: KPos, acc: CellOwn) : CellOwn = match acc {
+  CellOwn(st, ds) -> match kid {
+    KidBind(j, nm) ->
+      if lid_has(uses, nm) { CellOwn(kc_own_if_shared(tok, KVar(ls_reg_of(st, nm)), pos, st), ds) }
+      else { kc_kid_drop_later(j, creg, tok, pos, st, ds) }
+    KidDrop(j) -> kc_kid_drop_later(j, creg, tok, pos, st, ds)
+    KidCell(j, c) -> match kc_kid_slot(j, creg, tok, pos, st) { LSReg(g, st1) ->
+      kc_cell_own(c, g, uses, pos, CellOwn(st1, ds)) }
+  }
+}
+
+fn kc_kid_drop_later(j: Int, creg: String, tok: String, pos: KPos, st: LowerSt, ds: [String]) : CellOwn =
+  match kc_kid_slot(j, creg, tok, pos, st) { LSReg(g, st1) -> CellOwn(st1, [g, ...ds]) }
+
+# Slot `j` of the stolen cell, as an owned reference: moved when the token
+# holds the shell, incref'd when the cell stayed shared.
+fn kc_kid_slot(j: Int, creg: String, tok: String, pos: KPos, st: LowerSt) : LSReg =
+  match ls_fresh_reg(st) { LSReg(g, st0) ->
+    LSReg(g, kc_own_if_shared(tok, KVar(g), pos, ls_emit(st0, KLet(g, SBoxed, KProj(KVar(creg), j), pos)))) }
+
+fn kc_own_if_shared(tok: String, v: KVal, pos: KPos, st: LowerSt) : LowerSt =
+  match bind_op(st, KCall("kaix_incref_if_token_null", [KVar(tok), v]), pos) { LRes(_, st1) -> st1 }
+
+fn kc_cell_names(c: ReuseCell) : [LocalId] = match c {
+  ReuseCell(_, kids) -> flat_map(kids, (kid) => match kid {
+    KidBind(_, nm) -> [nm]
+    KidDrop(_)     -> []
+    KidCell(_, c2) -> kc_cell_names(c2)
+  })
+}
+
+#[doc("True when the enclosing match registered its scrutinee: a rebuild here can be left by an exit that releases the cell.")]
+pub(pkg) fn rh_held(st: LowerSt) : Bool = st.mscr != "" and unw_mreg(st.unw, st.mscr) != ""
+
+#[doc("`st` with the arm binders `names` owned, so the sites that hold them register them.")]
+pub(pkg) fn rh_own(st: LowerSt, names: [LocalId]) : LowerSt =
+  if st.unw.arms == [] or names == [] { st } else { ls_with_unw(st, unw_owning(st.unw, names)) }
+
+#[doc("Take each child `names` binds out of `donor`, once per name: a unique cell clears the slot, a shared one increfs the child.")]
+pub(pkg) fn rh_take_slots(donor: KVal, names: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match names {
+  [] -> st
+  [n, ...rest] -> match bind_op(st, KCall("kaix_take_slot", [donor, KVar(ls_reg_of(st, n))]), pos) {
+    LRes(_, st1) -> rh_take_slots(donor, rest, pos, st1)
+  }
+}
+
+#[doc("The registrations a rebuild holds: each push register with the temp it registers.")]
+pub(pkg) type RhHolds = { regs: [(String, String)], st: LowerSt }
+
+#[doc("Hold `v`, the value of operand `e` of kind `k`, when a later operand runs and no binder already holds it.")]
+pub(pkg) fn rh_hold(e: Expr, v: KVal, k: Int, later: Bool, pos: KPos, h: RhHolds) : RhHolds = match v {
+  KVar(r) -> if later and k != 1 and not unw_bare_read(e) { rh_push(r, pos, h) } else { h }
+  _       -> h
+}
+
+fn rh_push(r: String, pos: KPos, h: RhHolds) : RhHolds = match ls_fresh_reg(h.st) {
+  LSReg(f, st1) -> {
+    let st2 = ls_emit(st1, KLet(f, SBoxed, KPrim(KpUnwPushReg, [KStrV(r), KVar(unw_fib(st1.unw))]), pos))
+    RhHolds { regs: [(f, r), ...h.regs], st: ls_set_tcpend(st2, tcl_hold(st2.tcpend, f, r)) }
+  }
+}
+
+#[doc("Pop every registration `h` holds, once the last operand has run.")]
+pub(pkg) fn rh_release(h: RhHolds, pos: KPos) : LowerSt = rh_pops(h.regs, pos, h.st)
+
+fn rh_pops(regs: [(String, String)], pos: KPos, st: LowerSt) : LowerSt = match regs {
+  [] -> st
+  [(f, r), ...rest] -> {
+    let st1 = ls_emit(st, KDo(KPrim(KpUnwPop, [KVar(f)]), pos))
+    rh_pops(rest, pos, ls_set_tcpend(st1, tcl_unhold(st1.tcpend, f, r)))
+  }
+}
+
+#[doc("The occurrences in `xs` after each name's first: what a taken slot leaves for the per-use incref.")]
+pub(pkg) fn rh_repeats(xs: [LocalId]) : [LocalId] = rh_repeats_go(xs, [])
+
+fn rh_repeats_go(xs: [LocalId], seen: [LocalId]) : [LocalId] = match xs {
+  [] -> []
+  [x, ...rest] -> if lid_has(seen, x) { [x, ...rh_repeats_go(rest, seen)] } else { rh_repeats_go(rest, [x, ...seen]) }
+}
+
+#[doc("The state a pad or bracket opened over, restored when it closes; `None` when nothing opened.")]
+pub(pkg) type PadB = PadB(Option[UnwPadOpen], LowerSt)
+
+#[doc("Opens, before lowering `x`, a landing pad releasing the admitted binders among `names` not already released.")]
+pub(pkg) fn lower_pad_begin(x: Expr, names: [LocalId], st: LowerSt) : PadB = {
+  let outer = st.unw.pad
+  let own = filter(lp_union(map(unw_admit(st.unw, names), (n) => ls_reg_of(st, n)), outer.flight), (r) => not list_has(outer.regs, r))
+  match own {
+    [] -> PadB(None, st)
+    _  -> {
+      lp_disjoint(own, outer.pushed, "a pad releases a register a bracket holds", x, st)
+      let regs = lp_union(outer.regs, own)
+      match ls_fresh_reg(st) { LSReg(pr, st1) -> {
+        let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim(KpPadOpen, map(regs, (r) => KVar(r))), kpos_of(x)))
+        PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed, flight: outer.flight })))
+      } }
+    }
+  }
+}
+
+#[doc("Closes, after lowering `x`, the pad `lower_pad_begin` opened, reopening the one around it.")]
+pub(pkg) fn lower_pad_end(x: Expr, outer: Option[UnwPadOpen], st: LowerSt) : LowerSt = match outer {
+  None -> st
+  Some(o) -> {
+    let back = if o.reg == "" { [] } else { [KVar(o.reg)] }
+    let st1 = ls_emit(st, KDo(KPrim(KpPadClose, back), kpos_of(x)))
+    ls_with_unw(st1, unw_with_pad(st1.unw, o))
+  }
+}
+
+#[doc("`st` with the registers `held` pushed by a bracket around `x`, asserting no open pad releases them; returns the pad state to restore.")]
+pub(pkg) fn lower_bracket_begin(x: Expr, held: [String], st: LowerSt) : PadB = {
+  let outer = st.unw.pad
+  lp_disjoint(held, outer.regs, "a bracket holds a register a pad releases", x, st)
+  PadB(Some(outer), ls_with_unw(st, unw_with_pad(st.unw, UnwPadOpen { reg: outer.reg, regs: outer.regs, pushed: lp_union(outer.pushed, held), flight: lp_minus(outer.flight, held) })))
+}
+
+#[doc("`st` with the bracket `lower_bracket_begin` pushed popped from the pad state.")]
+pub(pkg) fn lower_bracket_end(outer: Option[UnwPadOpen], st: LowerSt) : LowerSt = match outer {
+  None -> st
+  Some(o) -> ls_with_unw(st, unw_with_pad(st.unw, o))
+}
+
+#[doc("`st` with `v`, the value the operand `x` computed, in flight until its parent takes it, when it holds a reference of its own.")]
+pub(pkg) fn lower_flight_add(x: Expr, v: KVal, st: LowerSt) : LowerSt = match v {
+  KVar(r) -> if lp_owned_temp(x, st) { lp_with_flight(st, lp_union(st.unw.pad.flight, [r])) } else { st }
+  _ -> st
+}
+
+#[doc("`st` with `v` in flight while the operands after `x` run; the last operand runs with nothing after it.")]
+pub(pkg) fn lower_flight_next(x: Expr, v: KVal, last: Bool, st: LowerSt) : LowerSt =
+  if last { st } else { lower_flight_add(x, v, st) }
+
+#[doc("The values in flight that neither an open pad nor a bracket already releases.")]
+pub(pkg) fn lower_flight_free(st: LowerSt) : [String] = {
+  let p = st.unw.pad
+  lp_minus(lp_minus(p.flight, p.regs), p.pushed)
+}
+
+#[doc("Opens, before the operator `op` of `x` runs, a landing pad that also releases the operand references it consumes, when it compares values that are not scalars: the runtime holds them while the type's own implementation runs, and a trap there leaves through no pad of its own.")]
+pub(pkg) fn lower_consumed_pad(x: Expr, op: BinOp, operands: [(Expr, KVal)], st: LowerSt) : PadB = match lp_consumed(operands, st) {
+  [] -> PadB(None, st)
+  extra -> if binop_is_comparison(op) and st.unw.traps and unw_op_traps(op, lp_first(operands, x)) {
+    let outer = st.unw.pad
+    match ls_fresh_reg(st) { LSReg(pr, st1) -> {
+      let regs = list_append(lp_union(outer.regs, lp_minus(outer.flight, outer.pushed)), extra)
+      let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim(KpPadOpen, map(regs, (r) => KVar(r))), kpos_of(x)))
+      PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed, flight: outer.flight })))
+    } }
+  } else { PadB(None, st) }
+}
+
+fn lp_first(operands: [(Expr, KVal)], dflt: Expr) : Expr = match operands {
+  [(e, _), ..._] -> e
+  [] -> dflt
+}
+
+# The operand registers holding a reference of their own that the
+# operator takes: a dup of a binder, or a value an operand computed.
+fn lp_consumed(operands: [(Expr, KVal)], st: LowerSt) : [String] = match operands {
+  [] -> []
+  [(e, v), ...rest] -> match v {
+    KVar(r) -> if lp_is_dup(e) or lp_owned_temp(e, st) { [r, ...lp_consumed(rest, st)] } else { lp_consumed(rest, st) }
+    _ -> lp_consumed(rest, st)
+  }
+}
+
+fn lp_is_dup(e: Expr) : Bool = match e.kind {
+  ECall(f, [_]) -> match f.kind {
+    EMark(MkDup) -> true
+    _            -> false
+  }
+  _ -> false
+}
+
+#[doc("`st` with the register `r` in flight: a value the frame owns that no binder holds, until `lower_flight_land` takes it out.")]
+pub(pkg) fn lower_flight_hold(r: String, st: LowerSt) : LowerSt = lp_with_flight(st, lp_union(st.unw.pad.flight, [r]))
+
+#[doc("`st` with the register `r` no longer in flight.")]
+pub(pkg) fn lower_flight_land(r: String, st: LowerSt) : LowerSt = lp_with_flight(st, lp_minus(st.unw.pad.flight, [r]))
+
+#[doc("`st` with the values in flight back to those of `before`, once their parent has taken them.")]
+pub(pkg) fn lower_flight_end(before: LowerSt, st: LowerSt) : LowerSt = lp_with_flight(st, before.unw.pad.flight)
+
+fn lp_with_flight(st: LowerSt, fl: [String]) : LowerSt = {
+  let p = st.unw.pad
+  ls_with_unw(st, unw_with_pad(st.unw, UnwPadOpen { reg: p.reg, regs: p.regs, pushed: p.pushed, flight: fl }))
+}
+
+# A fresh reference: a call's result or a value built in place. A bare
+# read hands over a binder the walk already tracks, a dup is that same
+# register, and a compiler form may lend.
+fn lp_owned_temp(x: Expr, st: LowerSt) : Bool = match x.mode {
+  MUnboxed -> false
+  _ -> match x.ty {
+    Some(t) -> if ty_is_scalar(t) { false } else { lp_fresh(x, st) }
+    None -> false
+  }
+}
+
+fn lp_fresh(x: Expr, st: LowerSt) : Bool = match x.kind {
+  ECall(f, xs)          -> lp_owning_call(f, xs, st)
+  EBinop(_, _, _)       -> true
+  ERecordLit(_, _)      -> not st.in_region
+  EList([_, ..._])      -> not st.in_region
+  _                     -> false
+}
+
+fn lp_owning_call(f: Expr, xs: [Expr], st: LowerSt) : Bool = match f.kind {
+  ELocal(_)      -> true
+  EOp(_)         -> true
+  ESym(s, _)     -> match builtin_of(s) {
+    Some(b) -> lp_owning_kind(classify_builtin(b))
+    None    -> true
+  }
+  EMark(MkOwnedBorrow) -> match xs {
+    [inner] -> lp_fresh(inner, st)
+    _       -> false
+  }
+  EMark(m)       -> mark_is_reuse(m) or mark_is_prim(m)
+  _              -> false
+}
+
+fn lp_owning_kind(k: CalleeKind) : Bool = match k {
+  CkDirect -> true
+  _        -> false
+}
+
+fn lp_disjoint(a: [String], b: [String], what: String, x: Expr, st: LowerSt) : Unit = match a {
+  [] -> ()
+  [r, ...rest] -> if list_has(b, r) {
+    panic(concat_all(["kir: ", what, ": ", r, " in fn ", st.enc_fn.sym, " at ", int_to_string(x.line), ":", int_to_string(x.col)]))
+  } else { lp_disjoint(rest, b, what, x, st) }
+}
+
+fn lp_minus(a: [String], b: [String]) : [String] = filter(a, (r) => not list_has(b, r))
+
+#[doc("The registers of `a` and then those of `b` not in `a`.")]
+pub(pkg) fn lp_union(a: [String], b: [String]) : [String] = match b {
+  [] -> a
+  [r, ...rest] -> lp_union(if list_has(a, r) { a } else { list_append(a, [r]) }, rest)
+}

@@ -1,3 +1,200 @@
+#[doc("Lowering of match tests: pattern tests, sealed tests, literal and record patterns, and the arm chain.")]
+
+import compiler.ast
+import compiler.real_lit
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_bind
+import compiler.written
+import compiler.marks
+
+# compiler/kir_lower_ptest_seal.kai — the single tests pattern lowering
+# chains: a tag, a literal, a raw slot word, a cons/nil cell. Each one seals
+# the open block with a branch to its `ok` or `fail` label.
+
+#[doc("Where a test goes: `ok` on a match, `fail` on a mismatch.")]
+pub(pkg) type PtTo = PtTo(String, String)
+
+#[doc("A raw slot compare: the comparison prim and the slot's raw repr.")]
+pub(pkg) type PtRaw = PtRaw(PrimOp, KSlot)
+
+#[doc("The label a match goes to.")]
+pub(pkg) fn pt_ok(to: PtTo) : String = match to { PtTo(ok, _) -> ok }
+
+#[doc("The label a mismatch goes to.")]
+pub(pkg) fn pt_fail(to: PtTo) : String = match to { PtTo(_, fail) -> fail }
+
+#[doc("Seal the open block with an unconditional branch to `ok`.")]
+pub(pkg) fn pt_br(st: LowerSt, ok: String) : LowerSt = ls_seal(st, KBr(ok, KNoPos), ok)
+
+#[doc("Seal the open block with `condbr cond ? ok : fail`.")]
+pub(pkg) fn pt_condbr(cond: KVal, to: PtTo, pos: KPos, st: LowerSt) : LowerSt = match to {
+  PtTo(ok, fail) -> ls_seal(st, KCondBr(cond, ok, fail, pos), fail)
+}
+
+#[doc("Test `v` for equality with the literal atom `lit`.")]
+pub(pkg) fn pt_seal_eq(v: KVal, lit: KVal, to: PtTo, pos: KPos, st: LowerSt) : LowerSt / Console = match to {
+  PtTo(ok, fail) -> kle_seal_eq(v, lit, ok, fail, pos, st)
+}
+
+#[doc("The runtime tag of constructor `c`.")]
+pub(pkg) fn pt_tag(c: KCtorRef) : Int = kcr_tag(c)
+
+#[doc("Test `v`'s constructor tag against `c`'s, and nothing of its payload.")]
+pub(pkg) fn pt_seal_tag(v: KVal, c: KCtorRef, to: PtTo, p: Pattern, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim(KpTagEq, [v, KIntV(pt_tag(c))]), KAt(p.line, p.col)) {
+    LRes(cond, st1) -> pt_condbr(cond, to, KAt(p.line, p.col), st1) }
+
+#[doc("`condbr (<prim> cur) ? <fresh block> : fail_lbl`, continuing in the fresh block; `prim` is a cons/nil predicate.")]
+pub(pkg) fn pt_cell_test(cur: KVal, prim: PrimOp, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim(prim, [cur]), KNoPos) { LRes(cond, st1) ->
+    match ls_fresh_label(st1) { LSLabel(cont, st2) ->
+      reopen(pt_condbr(cond, PtTo(cont, fail_lbl), KNoPos, st2), cont) } }
+
+#[doc("The boxed-Bool predicate a list cell test calls for a cons cell.")]
+pub(pkg) fn pt_is_cons() : PrimOp = KpIsCons
+
+#[doc("The boxed-Bool predicate a list cell test calls for the empty list.")]
+pub(pkg) fn pt_is_nil() : PrimOp = KpIsNil
+
+#[doc("The KIR atom of a literal pattern's expression.")]
+pub(pkg) fn pt_lit_atom(lit: Expr) : KVal = match lit.kind {
+  EInt(n, _)       -> kir_int_atom(lit, n)
+  EBool(b)         -> KBoolV(b)
+  EChar(c)         -> KCharV(c)
+  EStr(span, _)    -> KStrV(span)
+  EReal(RealLit(r), _) -> KRealV(r)
+  EFixed(span, ty) -> KFixedV(span, ty)
+  _                -> KUnitV
+}
+
+#[doc("The raw word compare testing `sp` against slot `idx` of `c`, or `None` when the slot must be projected.")]
+pub(pkg) fn pt_slot_raw(st: LowerSt, c: KCtorRef, idx: Int, sp: Pattern) : Option[(PtRaw, KVal)] =
+  match sp.pkind {
+    PLit(lit)            -> pt_raw_cmp(slot_kind_of(c, idx), pt_lit_atom(lit))
+    PVariant(r, [])      ->
+      if slot_kind_of(c, idx) == 3 { Some((PtRaw(KpRawBin(RwInt, BoEq), SInt64), KIntV(pt_tag(kcr_of_pat(st, r))))) } else { None }
+    _                    -> None
+  }
+
+# A raw Int or Real slot compares its raw word: the boxed route would mint a
+# re-box the non-consuming `kai_eq_raw` never releases.
+fn pt_raw_cmp(kind: Int, lit: KVal) : Option[(PtRaw, KVal)] = match lit {
+  KIntV(_)  -> if kind == 1 { Some((PtRaw(KpRawBin(RwInt, BoEq), SInt64), lit)) } else { None }
+  KRealV(_) -> if kind == 2 { Some((PtRaw(KpRawBin(RwReal, BoEq), SReal), lit)) } else { None }
+  _         -> None
+}
+
+#[doc("Test slot `idx` of `v` by comparing its raw word with `lit`.")]
+pub(pkg) fn pt_seal_raw_eq(idx: Int, r: PtRaw, lit: KVal, v: KVal, to: PtTo, sp: Pattern,
+                      st: LowerSt) : LowerSt / Console = match r {
+  PtRaw(cmp, kslot) ->
+    match bind_op_slot(st, KProj(v, idx), kslot, KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+      match bind_op_slot(st1, KPrim(cmp, [sv, lit]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+        pt_condbr(cond, to, KAt(sp.line, sp.col), st2) } }
+}
+
+# compiler/kir_lower_ptest.kai — the test half of pattern lowering.
+#
+# One recursion tests a value against every pattern shape (literal, variant,
+# variant record, record or tuple, list, as-pattern), so a shape nests under
+# any other: a list in a variant slot, a tuple in a list cell, a record arm
+# under a guard. Each test reads borrowed and routes a mismatch to the arm's
+# fail label; the binds run afterwards (`kir_lower_bind`), dominated by the
+# tests. A test that is not emitted is a silent miscompile, never a loud one.
+
+#[doc("Test `v` against `p`: a match branches to the `ok` label, a mismatch to `fail`.")]
+pub(pkg) fn pt_seal(p: Pattern, v: KVal, to: PtTo, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PLit(lit)                  -> pt_seal_eq(v, pt_lit_atom(lit), to, KAt(p.line, p.col), st)
+  PVariant(r, subs)          -> pt_seal_ctor(kcr_of_pat(st, r), subs, v, to, p, st)
+  PVariantRecord(r, fs)      -> pt_seal_ctor_record(kcr_of_pat(st, r), fs, v, to, p, st)
+  PRecord(fs)                -> pt_br(pt_field_tests(fs, v, pt_fail(to), st), pt_ok(to))
+  PList(pats, rest)          -> pt_seal_list(pats, rest, v, to, st)
+  PAs(_, inner)              -> pt_seal(inner, v, to, st)
+  _                          -> pt_br(st, pt_ok(to))
+}
+
+#[doc("Emit `p`'s tests against `v` and continue in a fresh block on a match; emits nothing for a pattern that always matches.")]
+pub(pkg) fn pt_test(p: Pattern, v: KVal, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  if psub_is_discriminating(p) {
+    match ls_fresh_label(st) { LSLabel(ok, st1) -> reopen(pt_seal(p, v, PtTo(ok, fail_lbl), st1), ok) }
+  } else { st }
+
+#[doc("The payload tests of a variant arm whose tag a switch already matched, reopened at `body_lbl`.")]
+pub(pkg) fn pt_arm_subtests(p: Pattern, scrv: KVal, body_lbl: String, fail_lbl: String,
+                       st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(r, subs)        -> reopen(pt_slot_tests(kcr_of_pat(st, r), subs, scrv, 0, PtTo(body_lbl, fail_lbl), st), body_lbl)
+  PVariantRecord(_, fs)    -> reopen(pt_br(pt_field_tests(fs, scrv, fail_lbl, st), body_lbl), body_lbl)
+  PAs(_, inner)            -> pt_arm_subtests(inner, scrv, body_lbl, fail_lbl, st)
+  _                        -> reopen(pt_br(st, body_lbl), body_lbl)
+}
+
+#[doc("Test each discriminating field of a record-shaped value, continuing in a fresh block once all pass.")]
+pub(pkg) fn pt_field_tests(fields: [PField], v: KVal, fail_lbl: String,
+                      st: LowerSt) : LowerSt / Console = match fields {
+  [] -> st
+  [PField(fname, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) {
+      match bind_op(st, KPrim(KpFieldBorrow, [v, KStrV(fname)]), KAt(sub.line, sub.col)) {
+        LRes(fv, st1) -> pt_field_tests(rest, v, fail_lbl, pt_test(sub, fv, fail_lbl, st1)) }
+    } else { pt_field_tests(rest, v, fail_lbl, st) }
+}
+
+# A constructor's tag, then its payload's discriminating slots. A miss at any
+# depth routes to the one fail label: the arm fails as a unit.
+fn pt_seal_ctor(c: KCtorRef, subs: [Pattern], v: KVal, to: PtTo, p: Pattern,
+                st: LowerSt) : LowerSt / Console =
+  match ls_fresh_label(st) { LSLabel(sub, st1) ->
+    pt_slot_tests(c, subs, v, 0, to, reopen(pt_seal_tag(v, c, PtTo(sub, pt_fail(to)), p, st1), sub)) }
+
+fn pt_seal_ctor_record(c: KCtorRef, fields: [PField], v: KVal, to: PtTo, p: Pattern,
+                       st: LowerSt) : LowerSt / Console =
+  match ls_fresh_label(st) { LSLabel(sub, st1) -> {
+    let st2 = reopen(pt_seal_tag(v, c, PtTo(sub, pt_fail(to)), p, st1), sub)
+    pt_br(pt_field_tests(fields, v, pt_fail(to), st2), pt_ok(to))
+  } }
+
+# The discriminating payload slots of `c`, chained through fresh blocks.
+fn pt_slot_tests(c: KCtorRef, subs: [Pattern], v: KVal, idx: Int, to: PtTo,
+                 st: LowerSt) : LowerSt / Console = match subs {
+  [] -> pt_br(st, pt_ok(to))
+  [sp, ...rest] ->
+    if psub_is_discriminating(sp) {
+      match ls_fresh_label(st) { LSLabel(cont, st1) ->
+        pt_slot_tests(c, rest, v, idx + 1, to, reopen(pt_seal_slot(c, sp, v, idx, PtTo(cont, pt_fail(to)), st1), cont)) }
+    } else { pt_slot_tests(c, rest, v, idx + 1, to, st) }
+}
+
+# One slot: a raw word compare when the slot's kind allows one, else the
+# slot projected at its static kind and tested recursively.
+fn pt_seal_slot(c: KCtorRef, sp: Pattern, v: KVal, idx: Int, to: PtTo,
+                st: LowerSt) : LowerSt / Console = match sp.pkind {
+  PAs(_, inner) -> pt_seal_slot(c, inner, v, idx, to, st)
+  _ -> match pt_slot_raw(st, c, idx, sp) {
+    Some((r, lit)) -> pt_seal_raw_eq(idx, r, lit, v, to, sp, st)
+    None -> match bind_op(st, bind_slot_op(c, idx, v), KAt(sp.line, sp.col)) {
+      LRes(sv, st1) -> pt_seal(sp, sv, to, st1) }
+  }
+}
+
+# A list's shape: a cons per fixed element (testing a discriminating element
+# in place), then nil unless a rest pattern takes the tail.
+fn pt_seal_list(pats: [Pattern], rest: Option[Binder], cur: KVal, to: PtTo,
+                st: LowerSt) : LowerSt / Console = match pats {
+  [] -> match rest {
+    Some(_) -> pt_br(st, pt_ok(to))
+    None    -> pt_br(pt_cell_test(cur, pt_is_nil(), pt_fail(to), st), pt_ok(to))
+  }
+  [hp, ...more] -> {
+    let st1 = pt_cell_test(cur, pt_is_cons(), pt_fail(to), st)
+    let st2 = if psub_is_discriminating(hp) {
+      match bind_op(st1, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st3) -> pt_test(hp, headv, pt_fail(to), st3) }
+    } else { st1 }
+    match bind_op(st2, KProj(cur, 1), KAt(hp.line, hp.col)) { LRes(tailv, st4) ->
+      pt_seal_list(more, rest, tailv, to, st4) }
+  }
+}
+
 # compiler/kir_lower_match.kai — list-pattern lowering for `match`.
 #
 # A `match` whose arms are list patterns (`[]`, `[h, ...t]`,
@@ -16,21 +213,12 @@
 # Keeping the test+bind emission here keeps the recursion cycle — and the
 # file sizes — contained.
 
-import compiler.ast
-import compiler.written
-import compiler.marks
-import compiler.kir
-import compiler.kir_lower
-import compiler.kir_lower_ptest
-import compiler.kir_lower_ptest_seal
-import compiler.kir_lower_bind
-
 # A `match` is a list match iff any arm pattern is a `PList` (directly or as
 # the inner of a `name as [..]`). The typer guarantees a homogeneous
 # scrutinee, so list arms never mix with variant arms; a trailing `_`/binder
 # catch-all may still follow (handled as an unconditional arm in the fail
 # chain).
-pub fn match_is_list(arms: [Arm]) : Bool = match arms {
+pub(pkg) fn match_is_list(arms: [Arm]) : Bool = match arms {
   [] -> false
   [Arm(p, _, _), ...rest] -> if pat_is_list(p) { true } else { match_is_list(rest) }
 }
@@ -46,7 +234,7 @@ fn pat_is_list(p: Pattern) : Bool = match p.pkind {
 # chain — no test, just bind-the-whole-scrutinee where a name is present. A
 # `name as [..]` is the exception: its inner list-destructure carries a length
 # test, so it does NOT terminate the chain (the next arm reopens its fail).
-pub fn list_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
+pub(pkg) fn list_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
   PList(_, _)   -> false
   PAs(_, inner) -> list_arm_is_catchall(inner)
   _             -> true
@@ -54,7 +242,7 @@ pub fn list_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
 
 # Result of emitting one arm's test+binds: the state positioned at the
 # arm's matched body block, plus the fail label the NEXT arm reopens.
-pub type LMArm = LMArm(LowerSt, String)
+pub(pkg) type LMArm = LMArm(LowerSt, String)
 
 # Emit the discrimination + binds for one list arm against `scrv`, sealing
 # the chain so a match flows to `body_lbl` and a mismatch to a fresh fail
@@ -62,7 +250,7 @@ pub type LMArm = LMArm(LowerSt, String)
 # the returned fail label is where the caller lowers the next arm. A
 # catch-all arm emits no test (binds the whole scrutinee, branches straight
 # to the body) and its "fail" label is unreachable.
-pub fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
+pub(pkg) fn lm_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
                    reuse_arm: Bool, st: LowerSt) : LMArm / Console = match p.pkind {
   PList(pats, opt_rest) -> lm_emit_list_arm(pats, opt_rest, scrv, body_lbl, p, reuse_arm, st)
   # `name as [h, ...rest]`: an as-binding whose inner is a list-destructure
@@ -116,7 +304,7 @@ fn lm_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind 
 # its discriminating sub-patterns (mismatch → `fail_lbl`), then BINDS — the
 # head test runs BEFORE the bind (the oracle's `emit_pat_test` precedes
 # `emit_pat_binds`), so `r` only binds once `snd` is confirmed `JReal`.
-pub fn lm_emit_cells(pats: [Pattern], opt_rest: Option[Binder], cur: KVal,
+pub(pkg) fn lm_emit_cells(pats: [Pattern], opt_rest: Option[Binder], cur: KVal,
                  body_lbl: String, fail_lbl: String, reuse_arm: Bool, st: LowerSt) : LowerSt / Console =
   match pats {
     [] -> lm_close_tail(opt_rest, cur, body_lbl, fail_lbl, st)
@@ -245,7 +433,7 @@ fn lm_bind_name(b: Binder, op: KOp, p: Pattern, st: LowerSt) : LowerSt =
 # increfs the OUTER register — on a path where that one is never stored,
 # a load of undefined memory the optimiser folds away with the branch
 # guarding it. Resolve like any other body read.
-pub fn lm_dup_alias_binders(names: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match names {
+pub(pkg) fn lm_dup_alias_binders(names: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match names {
   []           -> st
   [n, ...rest] -> lm_dup_alias_binders(rest, pos, ls_emit(st, KRC(KDup(KVar(ls_reg_of(st, n))), pos)))
 }
@@ -267,7 +455,7 @@ pub fn lm_dup_alias_binders(names: [LocalId], pos: KPos, st: LowerSt) : LowerSt 
 # `t` drop, and recycled into a cycle). The oracle (`emit_c`) avoids this
 # structurally: every owned arm `kai_incref`s its pointer children and only the
 # reuse arm itself borrow-binds. We stop at the `EMatch` boundary to match it.
-pub fn arm_body_uses_reuse(e: Expr) : Bool = arm_reuse_kind(e.kind)
+pub(pkg) fn arm_body_uses_reuse(e: Expr) : Bool = arm_reuse_kind(e.kind)
 
 fn arm_reuse_kind(k: ExprKind) : Bool = match k {
   ECall(cf, cas) -> arm_reuse_call_head(cf) or arm_reuse_any(cas)
@@ -324,4 +512,205 @@ fn arm_reuse_list_elems(elems: [ListElem]) : Bool = match elems {
     }
     if here { true } else { arm_reuse_list_elems(rest) }
   }
+}
+
+# compiler/kir_lower_lit.kai — literal-pattern lowering for `match`.
+#
+# A `match` whose arms discriminate by LITERAL (`match n { 0 -> ..; 1 ->
+# ..; _ -> .. }`, or `'c'` / `"s"` / `true` / `false`) cannot ride the
+# variant tag-switch the rest of `lower_match` uses: a `PLit` is not a
+# variant, so `arm_tag` returns -1 for every literal arm — they all
+# collapse into the single default block, and only the FIRST default body
+# survives (the rest, plus the catch-all bind, vanish, leaving an empty
+# `KSwitch` that segfaults the native backend). They need an EQUALITY
+# DECISION TREE — the same fail-chain the C-direct (`emit_pat_test`'s
+# `kai_op_eq` arm) and list-match (`kir_lower_match.kai`) build.
+#
+# This module owns the PURE half of that lowering: emitting one literal
+# arm's equality test + catch-all bind into the block under construction,
+# returning the fail label the next arm reopens. Like `kir_lower_match`,
+# it never recurses into `lower_expr` (the arm BODY is lowered by the
+# walk's `lower_lit_match` driver in the Expr-SCC `kir_lower_walk`).
+
+# A `match` is a LITERAL match iff any arm pattern is a `PLit`. The typer
+# guarantees a homogeneous scrutinee, so literal arms never mix with
+# variant/list arms; a trailing `_`/binder catch-all may still follow
+# (handled as an unconditional arm terminating the fail chain). List
+# patterns are dispatched FIRST in `lower_match`, so a `PList` never reaches
+# here — only `PLit` plus its catch-all.
+pub(pkg) fn match_is_literal(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(p, _, _), ...rest] -> match p.pkind {
+    PLit(_) -> true
+    _       -> match_is_literal(rest)
+  }
+}
+
+# A non-literal arm in a literal match (a trailing `_`, a whole-value
+# binder, a hole, or an as-pattern). It matches unconditionally, so it
+# terminates the chain — no test, just bind-the-whole-scrutinee where a
+# name is present.
+pub(pkg) fn lit_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
+  PLit(_) -> false
+  _       -> true
+}
+
+# Emit the equality test (or unconditional bind) for one arm against
+# `scrv`, sealing the current block so a match flows to `body_lbl` and a
+# mismatch to a fresh fail label. The returned state is reopened at
+# `body_lbl` (ready for the body); the returned fail label is where the
+# caller lowers the next arm. A catch-all arm emits no test (binds the
+# whole scrutinee, branches straight to the body) and its "fail" label is
+# unreachable. Mirror of `lm_emit_arm` for the literal shape.
+pub(pkg) fn lit_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
+                    st: LowerSt) : LMArm / Console = match p.pkind {
+  PLit(lit) -> match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
+    let st2 = lit_emit_test(lit, scrv, body_lbl, fail_lbl, st1)
+    LMArm(reopen(st2, body_lbl), fail_lbl)
+  } }
+  _ -> {
+    let st1 = lit_bind_whole(p, scrv, st)
+    let st2 = ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+    LMArm(reopen(st2, body_lbl), body_lbl)
+  }
+}
+
+# `condbr (kai_eq_raw scr lit) ? body_lbl : fail_lbl`. `kai_eq_raw` does NOT
+# consume the scrutinee: `kaix_eq` / the `==` prim CONSUMES both operands and
+# would decref the scrutinee shared across the remaining arms.
+fn lit_emit_test(lit: Expr, scrv: KVal, body_lbl: String,
+                 fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  kle_seal_eq(scrv, lit_atom(lit), body_lbl, fail_lbl, KAt(lit.line, lit.col), st)
+
+# The KIR atom for a literal pattern's expression. The typer guarantees a
+# `PLit` wraps a literal-shaped expr (Int / Bool / Char / String / Real);
+# a non-literal here is a typer invariant violation — lower it to unit so
+# the equality is well-formed but always false (loud divergence vs the
+# oracle catches it, never a silent miscompile).
+pub(pkg) fn lit_atom(lit: Expr) : KVal = match lit.kind {
+  EInt(n, _) -> kir_int_atom(lit, n)
+  EBool(b)      -> KBoolV(b)
+  EChar(c)      -> KCharV(c)
+  EStr(span, _) -> KStrV(span)
+  EReal(RealLit(r), _) -> KRealV(r)
+  EFixed(span, ty) -> KFixedV(span, ty)
+  _             -> KUnitV
+}
+
+# Bind a catch-all arm's name (a whole-value binder or as-pattern) to the
+# scrutinee. PWild / PHole bind nothing. The KIR `KLet` aliases the slot —
+# it never increfs (refcounting rides KRC nodes), matching `lm_bind_whole`.
+fn lit_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind {
+  PBind(b)  -> ls_let(st, b, SBoxed, KLitOp(scrv), KAt(p.line, p.col))
+  PAs(b, _) -> ls_let(st, b, SBoxed, KLitOp(scrv), KAt(p.line, p.col))
+  _            -> st
+}
+
+# compiler/kir_lower_rec.kai — record-pattern lowering for `match`.
+#
+# A `match` whose arms are RECORD patterns (`{ x: 0, y }`, `{ x, y: 0 }`,
+# `{ x, y }`) cannot ride the variant tag-switch the rest of `lower_match`
+# uses: a `PRecord` is not a variant, so `arm_tag` returns -1 for every
+# record arm — they all collapse into one default block, only the FIRST
+# body survives, and no field is ever projected (the binds vanish, leaving
+# an empty `KSwitch` plus a read of an unbound field register the native backend
+# aborts on as `unbound register`). They need a FIELD-TEST decision tree —
+# the same fail-chain the C-direct (`emit_pat_test_record`) emitter builds.
+#
+# A record arm discriminates on TWO things the variant path drops:
+#   1. LITERAL-valued fields (`{ x: 0 }`): each is an equality TEST over
+#      that field — `field_read(scr, "x") == 0`. Multiple literal fields in
+#      one arm form a CONJUNCTION (all must match), and successive arms form
+#      a fail-chain decision tree, exactly like literal-match.
+#   2. BINDING fields (`{ y }` shorthand, `{ y: name }`): each must be
+#      PROJECTED — `KLet(name, field_read(scr, "y"))` — so the body's
+#      read of the binder resolves. A `PWild` field is ignored.
+#
+# So a record-pattern match IS the literal-match decision tree, but (a) each
+# equality test reads a FIELD of the scrutinee, not the scrutinee itself,
+# and (b) each arm binds its non-literal fields by projection on the success
+# path before lowering the body.
+#
+# This module owns the PURE half: emitting one record arm's field-test
+# conjunction + the field-bind projections into the block under
+# construction, returning the fail label the next arm reopens. Like its
+# siblings it never recurses into `lower_expr` (the arm BODY is lowered by
+# the walk's `lower_record_match` driver in the Expr-SCC `kir_lower_walk`).
+
+# A `match` is a record match iff any arm pattern is a `PRecord`. The typer
+# guarantees a homogeneous scrutinee, so record arms never mix with
+# variant/list/literal arms; a trailing `_`/binder catch-all may still
+# follow (handled as an unconditional arm). A `PVariantRecord` (`Some { x }`
+# — a VARIANT with a record payload) is NOT a `PRecord`, so it stays on the
+# variant path. List + literal patterns are dispatched FIRST in
+# `lower_match`, so neither reaches here.
+pub(pkg) fn match_is_record(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(p, _, _), ...rest] -> match p.pkind {
+    PRecord(_) -> true
+    _          -> match_is_record(rest)
+  }
+}
+
+# A record arm with NO DISCRIMINATING field (`{ x, y }`, `{ _ }`) always
+# matches — it is a catch-all that ends the chain. A non-record pattern in a
+# record match (a trailing `_`, a whole-value binder, a hole) is likewise
+# unconditional. A field DISCRIMINATES when it carries a test: a literal
+# (`{ x: 0 }`), a variant (`(K1, _)` = `{ fst: PVariant(K1) }`), a nested
+# record / list (`psub_is_discriminating`). The old check counted ONLY
+# literal fields, so a tuple-of-sums arm `(K1, K2)` — all-variant fields —
+# read as a catch-all and matched everything (hashmap_collision miscompile).
+pub(pkg) fn rec_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
+  PRecord(fields) -> not rec_has_discriminating_field(fields)
+  _               -> true
+}
+
+fn rec_has_discriminating_field(fields: [PField]) : Bool = match fields {
+  [] -> false
+  [PField(_, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) { true } else { rec_has_discriminating_field(rest) }
+}
+
+# Emit the field-test conjunction + field binds for one record arm against
+# `scrv`, sealing the chain so a full match flows to `body_lbl` and any
+# field mismatch to a fresh fail label. The returned state is reopened at
+# `body_lbl` WITH the arm's binding fields already projected (ready for the
+# body); the returned fail label is where the caller lowers the next arm. A
+# catch-all arm (no literal fields, or a non-record pattern) emits no test —
+# it binds its fields, branches straight to the body, and its "fail" label
+# is unreachable. Mirror of `lit_emit_arm` for the record shape.
+pub(pkg) fn rec_emit_arm(p: Pattern, scrv: KVal, body_lbl: String,
+                    st: LowerSt) : LMArm / Console = match p.pkind {
+  PRecord(fields) -> rec_emit_record_arm(fields, p, scrv, body_lbl, st)
+  _ -> {
+    let st1 = rec_bind_whole(p, scrv, st)
+    let st2 = ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+    LMArm(reopen(st2, body_lbl), body_lbl)
+  }
+}
+
+# A record arm with discriminating fields tests them (`pt_field_tests`), then
+# binds every field in the matched body; a catch-all record arm branches
+# unconditionally.
+fn rec_emit_record_arm(fields: [PField], p: Pattern, scrv: KVal,
+                       body_lbl: String, st: LowerSt) : LMArm / Console =
+  if rec_has_discriminating_field(fields) {
+    match ls_fresh_label(st) { LSLabel(fail_lbl, st1) -> {
+      let st2 = pt_field_tests(fields, scrv, fail_lbl, st1)
+      let st3 = ls_seal(st2, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+      let st4 = bind_pattern_fields_any(p, scrv, bind_body_none(), reopen(st3, body_lbl))
+      LMArm(st4, fail_lbl)
+    } }
+  } else {
+    let st1 = ls_seal(st, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
+    LMArm(bind_pattern_fields_any(p, scrv, bind_body_none(), reopen(st1, body_lbl)), body_lbl)
+  }
+
+# Bind a non-record catch-all arm's name (a whole-value binder or
+# as-pattern) to the scrutinee. PWild / PHole bind nothing. Mirror of
+# `lit_bind_whole`.
+fn rec_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind {
+  PBind(b)  -> ls_let(st, b, SBoxed, KLitOp(scrv), KAt(p.line, p.col))
+  PAs(b, _) -> ls_let(st, b, SBoxed, KLitOp(scrv), KAt(p.line, p.col))
+  _            -> st
 }
