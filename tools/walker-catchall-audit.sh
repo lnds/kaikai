@@ -27,13 +27,13 @@ MIN_ARMS=8
 
 WALKED_TYPES="ExprKind Decl"
 
-# Constructor names of type $2, read from its declaration in ast.kai.
+# Constructor names of type $2, read from its declaration in the ast modules.
 type_ctors() {
-  awk -v ty="$2" '$0 == "pub type " ty || index($0, "pub type " ty " ") == 1 {on=1; next}
+  awk -v ty="$2" '$0 ~ ("^pub(\\(pkg\\))? type " ty "( |$)") {on=1; next}
        on && /^pub[ (]/{exit}
        on && match($0, /^[ \t]*[=|][ \t]*[A-Z][A-Za-z0-9]*/) {
          s=substr($0, 1, RLENGTH); sub(/^[ \t]*[=|][ \t]*/, "", s); print s
-       }' "$1/stage2/compiler/ast.kai"
+       }' "$1"/stage2/compiler/ast.kai "$1"/stage2/compiler/ast_decl.kai
 }
 
 # observed <root>: `<file> <fn>` for every function holding a match with at
