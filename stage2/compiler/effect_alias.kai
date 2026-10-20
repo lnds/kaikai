@@ -22,10 +22,10 @@ import compiler.type_text
 pub type AliasCand = AC(String, [RowLabel], Bool, Int, Int, String)
 
 #[doc("A resolved alias: its name and the effect labels it expands to.")]
-pub type AliasResult = AR(String, [RowLabel])
+pub(pkg) type AliasResult = AR(String, [RowLabel])
 
 #[doc("Every alias that resolved, the number of errors resolution reported, and their diagnostics.")]
-pub type AliasResolution = { aliases: [AliasResult], errs: Int, diags: [Diagnostic] }
+pub(pkg) type AliasResolution = { aliases: [AliasResult], errs: Int, diags: [Diagnostic] }
 
 type AStatus = AsTodo | AsActive | AsDone([RowLabel]) | AsFail
 
@@ -40,7 +40,7 @@ type AOne = { st: AState, r: Option[[RowLabel]] }
 type ACtx = { cands: [AliasCand], tab: SymTab, file: String }
 
 #[doc("The alias candidates `decls` declares, in stream order.")]
-pub fn collect_alias_cands(decls: [Decl], tab: SymTab, df: DiagFiles) : [AliasCand] = match decls {
+pub(pkg) fn collect_alias_cands(decls: [Decl], tab: SymTab, df: DiagFiles) : [AliasCand] = match decls {
   [] -> []
   [d, ...rest] -> match decl_transparent_inner(d) {
     Some(inner) -> collect_alias_cands([inner, ...rest], tab, df)
@@ -68,7 +68,7 @@ fn ea_written(l: RowLabel) : Option[String] = match l {
 }
 
 #[doc("Resolve every candidate that is not itself an effect name; a candidate that fails is dropped and its error counted. `tab` holds the program's effects.")]
-pub fn resolve_alias_cands(cands: [AliasCand], tab: SymTab, file: String) : AliasResolution / Console + File =
+pub(pkg) fn resolve_alias_cands(cands: [AliasCand], tab: SymTab, file: String) : AliasResolution / Console + File =
   ea_loop(ACtx { cands: cands, tab: tab, file: file }, cands, AState { entries: [], errs: [] }, [])
 
 # A written name some effect of the program is declared with.
@@ -205,7 +205,79 @@ fn ea_args_key(tab: SymTab, l: RowLabel) : String = match l {
 }
 
 #[doc("The labels the alias `name` expands to, or None when `name` is no resolved alias.")]
-pub fn find_alias(aliases: [AliasResult], name: String) : Option[[RowLabel]] = match aliases {
+pub(pkg) fn find_alias(aliases: [AliasResult], name: String) : Option[[RowLabel]] = match aliases {
   [] -> None
   [AR(n, ls), ...rest] -> if n == name { Some(ls) } else { find_alias(rest, name) }
 }
+
+#[doc("A row alias and the effect labels its body sums, in written order.")]
+pub type RowAlias = RA(String, [RowLabel])
+
+#[doc("An effect declaration and the op names it declares.")]
+pub(pkg) type EffOps = EO(SymId, [String])
+
+#[doc("The op names an effect declares.")]
+pub(pkg) fn eff_op_names(ops: [EffectOp], acc: [String]) : [String] = match ops {
+  [] -> list_reverse(acc)
+  [o, ...rest] -> match o {
+    EffOp(n, _, _, _, _, _) -> eff_op_names(rest, [n, ...acc])
+  }
+}
+
+#[doc("The components of row alias `head`, with a nested alias replaced by its own. `depth` bounds the walk: a cyclic alias is rejected elsewhere, and this must not hang before it is.")]
+pub(pkg) fn alias_components(ras: [RowAlias], head: String, depth: Int) : [RowLabel] =
+  if depth > 8 { [] }
+  else { match ra_lookup(ras, head) {
+    None        -> []
+    Some(comps) -> alias_expand(ras, comps, depth, [])
+  } }
+
+fn alias_expand(ras: [RowAlias], comps: [RowLabel], depth: Int,
+                acc: [RowLabel]) : [RowLabel] = match comps {
+  [] -> list_reverse(acc)
+  [c, ...rest] -> match ra_nested(ras, c) {
+    None    -> alias_expand(ras, rest, depth, [c, ...acc])
+    Some(n) -> alias_expand(ras, rest, depth,
+                            prepend_rev(alias_components(ras, n, depth + 1), acc))
+  }
+}
+
+# The alias a component names. A settled label is an effect, and a
+# qualified one is no alias of this table.
+fn ra_nested(ras: [RowAlias], c: RowLabel) : Option[String] = match c {
+  RL(DrWritten(None, n), _) -> match ra_lookup(ras, written_text(n)) {
+    Some(_) -> Some(written_text(n))
+    None    -> None
+  }
+  _ -> None
+}
+
+fn prepend_rev(xs: [RowLabel], acc: [RowLabel]) : [RowLabel] = match xs {
+  [] -> acc
+  [x, ...rest] -> prepend_rev(rest, [x, ...acc])
+}
+
+#[doc("The components of the row alias named `name`, or `None` when it names no alias.")]
+fn ra_lookup(ras: [RowAlias], name: String) : Option[[RowLabel]] = match ras {
+  [] -> None
+  [ra, ...rest] -> match ra {
+    RA(n, comps) -> if n == name { Some(comps) } else { ra_lookup(rest, name) }
+  }
+}
+
+#[doc("Whether the effect `l` names declares an op named `op`; a label nothing settled names none.")]
+fn eff_declares_op(eos: [EffOps], l: RowLabel, op: String) : Bool = match eos {
+  [] -> false
+  [EO(s, ops), ...rest] ->
+    if sym_raw(s) >= 0 and sym_raw(s) == sym_raw(rl_sym(l)) { list_has(ops, op) }
+    else { eff_declares_op(rest, l, op) }
+}
+
+#[doc("The leftmost component of `comps` that declares `op`, or `None`. Leftmost is the rule the typer's own alias resolution follows, so an op two components share settles the same way.")]
+pub(pkg) fn alias_op_owner(eos: [EffOps], comps: [RowLabel], op: String) : Option[RowLabel] =
+  match comps {
+    [] -> None
+    [c, ...rest] ->
+      if eff_declares_op(eos, c, op) { Some(c) }
+      else { alias_op_owner(eos, rest, op) }
+  }

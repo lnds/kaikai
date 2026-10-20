@@ -17,12 +17,12 @@ import compiler.infer_handle_walk
 import compiler.infer_dump_text
 import compiler.infer_program
 import compiler.infer_dump
-import compiler.infer_json_base
-import compiler.infer_effects_json
 import compiler.hole_scope
 import compiler.doc_attr
 import compiler.written
 import compiler.symtab
+import compiler.expr_positions
+import compiler.type_text
 
 # ---- `--holes-json`: machine-readable hole reports ----
 #
@@ -32,7 +32,6 @@ import compiler.symtab
 # LOCAL bindings (params + lets) and `scope_elided` counts the
 # reachable bindings not listed; `--holes-json-scope` lists everything
 # (core included) with `scope_elided: 0`.
-
 
 fn json_scope_entry(tab: SymTab, te: TyEntry) : String =
   concat_all([
@@ -125,7 +124,7 @@ fn hole_kind_json(k: HoleKind) : HoleKindJson {
 }
 
 #[doc("infer: --holes-json structured typed-hole report over the build front-end's typed program. `tab` names the program's declarations; doc_items is the root file's doc side table; `hidden` holds the top-level declarations the root file cannot reach; `full` lists every reachable binding instead of the hole's locals.")]
-pub fn dump_holes_json(file: String, tp: TypedProgram, tab: SymTab, doc_items: [DocItem], hidden: [SymId], full: Bool) : Int / Console + File {
+pub(pkg) fn dump_holes_json(file: String, tp: TypedProgram, tab: SymTab, doc_items: [DocItem], hidden: [SymId], full: Bool) : Int / Console + File {
   let body = inf_join_with(map(tp.holes, (h) => json_hole_report(file, doc_items, h, tp, tab, hidden, full)), ", ")
   print(concat_all(["[", body, "]"]))
   tp.errs
@@ -144,7 +143,7 @@ pub fn dump_holes_json(file: String, tp: TypedProgram, tab: SymTab, doc_items: [
 # one declaring it, so a consumer filters on it.
 
 #[doc("infer: --effects-json structured effect-row report over the build front-end's typed program; `tab` names its declarations, `df` attributes each function to its file.")]
-pub fn dump_effects_json(df: DiagFiles, tp: TypedProgram, tab: SymTab) : Int / Console + File {
+pub(pkg) fn dump_effects_json(df: DiagFiles, tp: TypedProgram, tab: SymTab) : Int / Console + File {
   let entries = effects_walk_decls(tp.decls, tab, df, [])
   let body = inf_join_with(map(entries, effects_json_entry), ", ")
   print(concat_all(["[", body, "]"]))
@@ -168,7 +167,7 @@ pub fn dump_effects_json(df: DiagFiles, tp: TypedProgram, tab: SymTab) : Int / C
 #     "tail_var": String | null     # "?eN" id when open, else null
 #   }]
 #[doc("infer: structured effect-hole report over the build front-end's typed program; `tab` names its declarations.")]
-pub fn dump_effect_holes_json(file: String, tp: TypedProgram, tab: SymTab) : Int / Console + File {
+pub(pkg) fn dump_effect_holes_json(file: String, tp: TypedProgram, tab: SymTab) : Int / Console + File {
 
   let body = inf_join_with(map(tp.row_holes, (rh) => json_row_hole_report(file, tab, rh)), ", ")
   print(concat_all(["[", body, "]"]))
@@ -208,13 +207,11 @@ fn json_row_hole_report(file: String, tab: SymTab, rrh: ResolvedRowHole) : Strin
   }
 }
 
-
 # --strict-holes uses this on the normal compile path: emit a
 # one-line diagnostic per hole to stderr, and promote the hole count
 # to the return code so the driver skips emission. Users who want the
 # rich report should run --holes or --holes-json explicitly.
 fn strict_holes_report_loop(file: String, tab: SymTab, hs: [ResolvedHole]) : Unit / Console + File {
-
 
   match hs {
     [] -> ()
@@ -233,7 +230,7 @@ fn strict_holes_report_loop(file: String, tab: SymTab, hs: [ResolvedHole]) : Uni
 }
 
 #[doc("infer: --strict-holes gate that fails the build on any unfilled hole.")]
-pub fn strict_holes_check(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
+pub(pkg) fn strict_holes_check(file: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
 
   let tab = tin.tab
   let r = infer_program(file, decls, tin, false)
@@ -246,4 +243,96 @@ pub fn strict_holes_check(file: String, decls: [Decl], tin: TyperIn) : Int / Con
   }
 }
 
+#[doc("infer: per-function effect record behind `--effects-json`; `row_open` marks a row polymorphic in further effects.")]
+type EffEntry = { file: String, fn_name: String, line: Int, col: Int,
+                  effs: [String], row_open: Bool, handlers: [EffHandle] }
 
+#[doc("infer: collect per-function effect records across a typed declaration list; `tab` names the functions and effects, `df` the file each function is declared in.")]
+fn effects_walk_decls(decls: [Decl], tab: SymTab, df: DiagFiles, acc: [EffEntry]) : [EffEntry] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, fid, _, _, _, row, body, line, col, _) -> {
+        if sym_internal(tab, fnid_sym(fid)) {
+          effects_walk_decls(rest, tab, df, acc)
+        } else {
+          let entry = EffEntry { file: decl_diag_file(d, df), fn_name: written_text(decl_name(tab, fnid_sym(fid))),
+                                  line: line, col: col,
+                                  effs: effects_row_labels(tab, row), row_open: effects_row_open(row),
+                                  handlers: effects_handlers(tab, body, []) }
+          effects_walk_decls(rest, tab, df, [entry, ...acc])
+        }
+      }
+      _ -> effects_walk_decls(rest, tab, df, acc)
+    }
+  }
+}
+
+fn effects_row_labels(tab: SymTab, row: RowExpr) : [String] = match row {
+  REmpty         -> []
+  RClosed(ls)    -> effects_label_names(tab, ls, [])
+  ROpen(_, ls)   -> effects_label_names(tab, ls, [])
+}
+
+fn effects_row_open(row: RowExpr) : Bool = match row {
+  ROpen(_, _) -> true
+  _           -> false
+}
+
+fn effects_label_names(tab: SymTab, ls: [RowLabel], acc: [String]) : [String] = match ls {
+  []                  -> acc
+  [RL(r, _), ...rest] -> effects_label_names(tab, rest, effects_add_unique(ref_decl_name(tab, r), acc))
+}
+
+fn effects_handlers(tab: SymTab, e: Expr, acc: [EffHandle]) : [EffHandle] = match e.kind {
+  EHandle(_, r, _, _, _, _, _) -> effects_handlers_ps(tab, xp_positions(e), [EH(ref_decl_name(tab, r), e.line, e.col), ...acc])
+  _                            -> effects_handlers_ps(tab, xp_positions(e), acc)
+}
+
+fn effects_handlers_ps(tab: SymTab, ps: [XPos], acc: [EffHandle]) : [EffHandle] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> effects_handlers_ps(tab, rest, effects_handlers(tab, c, acc))
+}
+
+#[doc("infer: one `--effects-json` record, rendered as a JSON object.")]
+fn effects_json_entry(e: EffEntry) : String =
+  concat_all([
+    "{",
+    "\"file\": ", json_str(e.file),
+    ", \"fn\": ", json_str(e.fn_name),
+    ", \"line\": ", int_to_string(e.line),
+    ", \"col\": ", int_to_string(e.col),
+    ", \"effects\": [",
+    inf_join_with(map(e.effs, json_str), ", "),
+    "], \"row_open\": ", if e.row_open { "true" } else { "false" },
+    ", \"handlers_installed\": [",
+    inf_join_with(map(e.handlers, effects_json_handler), ", "),
+    "]}"
+  ])
+
+fn effects_json_handler(h: EffHandle) : String {
+  match h {
+    EH(eff, line, col) -> concat_all([
+      "{\"effect\": ", json_str(eff),
+      ", \"line\": ", int_to_string(line),
+      ", \"col\": ", int_to_string(col), "}"
+    ])
+  }
+}
+
+#[doc("infer: append an effect label unless the list already carries it.")]
+fn effects_add_unique(eff: String, effs: [String]) : [String] {
+  if list_has(effs, eff) { effs } else { list_append(effs, [eff]) }
+}
+
+# the JSON string escaper moved to compiler/util.kai
+# (json_escape / json_quote) so doc_attr.kai can share it without
+# importing the typer. json_str stays as the typer-side alias.
+#[doc("infer: `json_str` — typer entry point invoked by the driver.")]
+pub fn json_str(s: String) : String = json_quote(s)
+
+#[doc("infer: `json_null` — typer entry point invoked by the driver.")]
+pub fn json_null() : String = "null"
+
+#[doc("infer: one handler installation site, as `--effects-json` reports it.")]
+type EffHandle = EH(String, Int, Int)

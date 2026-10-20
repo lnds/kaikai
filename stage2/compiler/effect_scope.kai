@@ -10,15 +10,20 @@ import compiler.util
 import compiler.ast
 import compiler.modules_segments
 import compiler.scope_view
-import compiler.effect_scope_table
-import compiler.effect_scope_ids
-import compiler.effect_scope_types
 import compiler.symtab
 import compiler.written
 import compiler.module_tables
+import compiler.modules_paths
+import compiler.module_table
+import compiler.spec_names
+import compiler.modules_homes
+import compiler.diag
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.name_report
 
 #[doc("Settle every effect reference of each import segment under its own file's view to the declaration it names; the decls past the marks are the root file's.")]
-pub fn es_segmented(segs: [ImportSeg], decls: [Decl],
+pub(pkg) fn es_segmented(segs: [ImportSeg], decls: [Decl],
       tabs: ModTables, target: String,
       tab: SymTab, views: FileViews) : [Decl] = match segs {
   [] -> es_decls(decls, es_ctx(target, target, tabs, tab, views))
@@ -29,7 +34,7 @@ pub fn es_segmented(segs: [ImportSeg], decls: [Decl],
 }
 
 #[doc("The viewpoint of the module `home` in a program whose root is `target`: its qualifier table, and the symbol table with the file's scope view.")]
-pub fn es_ctx(home: String, target: String,
+fn es_ctx(home: String, target: String,
       tabs: ModTables, tab: SymTab, views: FileViews) : ESCtx = {
   let owner = if home == target { "" } else { home }
   ESCtx { home: home,
@@ -42,7 +47,7 @@ fn es_decls(ds: [Decl], cx: ESCtx) : [Decl] = match ds {
 }
 
 #[doc("One declaration through the pass, from the viewpoint `cx`.")]
-pub fn es_decl(d: Decl, cx: ESCtx) : Decl = decl_map_inner(d, (x) => es_decl_leaf(x, cx))
+fn es_decl(d: Decl, cx: ESCtx) : Decl = decl_map_inner(d, (x) => es_decl_leaf(x, cx))
 
 fn es_decl_leaf(d: Decl, cx: ESCtx) : Decl = match d {
   DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
@@ -113,6 +118,335 @@ fn es_qualified_perform(e: Expr, inner: Expr, mid: String, op: String,
   _ -> None
 }
 
-
 fn es_re(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+# which effect names are contested, and what a name means from one module's
+# viewpoint. Two modules may each declare `effect Emit`. A reference names its
+# declaration by id; the run time dispatches a label by its spelling, so a
+# contested name has a home-spelled one per declaring module (`Emit__ea`). A
+# core declaration keeps the bare spelling, and so does the root's unless it
+# shares a core's name.
+
+#[doc("One effect declaration: `ESE(name, home, pub)`. Root declarations carry the target module as home.")]
+pub(pkg) type ESEntry = ESE(String, String, Bool)
+
+#[doc("What one module sees: its own home, its qualifier table, and the symbol table with the file's scope view, which settle every bare name.")]
+type ESCtx = { home: String, mt: [ModuleEntry], tab: SymTab, view: ScopeView }
+
+#[doc("The effect declarations of `decls` whose name another home also declares, in stream order.")]
+pub(pkg) fn es_collect(decls: [Decl], tab: SymTab, target: String) : [ESEntry] = {
+  let all = es_entries(decls, tab, target, [])
+  es_keep_contested(all, all, [])
+}
+
+fn es_entries(ds: [Decl], tab: SymTab, target: String, acc: [ESEntry]) : [ESEntry] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> es_entries(rest, tab, target, es_entry(d, tab, target, acc))
+}
+
+fn es_entry(d: Decl, tab: SymTab, target: String, acc: [ESEntry]) : [ESEntry] = match d {
+  DEffect(p, s, _, _, _, _, _, mo) ->
+    [ESE(written_text(sym_name(tab, s)), match mo { Some(m) -> m  None -> target }, p), ...acc]
+  DDoc(_, _, inner, _, _) -> es_entry(inner, tab, target, acc)
+  DAttr(_, inner, _, _)   -> es_entry(inner, tab, target, acc)
+  DUnstable(inner, _, _)  -> es_entry(inner, tab, target, acc)
+  _ -> acc
+}
+
+fn es_keep_contested(all: [ESEntry], todo: [ESEntry], acc: [ESEntry]) : [ESEntry] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    ESE(n, home, _) ->
+      if es_other_home(all, n, home) { es_keep_contested(all, rest, [e, ...acc]) }
+      else { es_keep_contested(all, rest, acc) }
+  }
+}
+
+fn es_other_home(t: [ESEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [ESE(n, h, _), ...rest] ->
+    if n == name and h != home { true } else { es_other_home(rest, name, home) }
+}
+
+#[doc("Whether the effect `s` is one the run time tells from a homonym by its home: a reference to it must carry the declaration, since its bare name spells another's label.")]
+fn es_spelled_apart(cx: ESCtx, s: SymId) : Bool = rt_spelled_apart(cx.tab, s)
+
+#[doc("The declaration a bare effect `name` denotes from the context's file, by the scope ladder every name class climbs; `sym_none()` when it settles none.")]
+fn es_settle(cx: ESCtx, name: String) : SymId =
+  match sv_resolve(cx.tab, cx.view, NCEffect, name) {
+    SvSym(s) -> s
+    _        -> sym_none()
+  }
+
+#[doc("The homes a bare `name` must choose between from the context's file, or `[]` when the ladder settles it.")]
+fn es_contested(cx: ESCtx, name: String) : [String] =
+  # A qualifier IS the choice: `with m.E` names which `E` is handled,
+  # so the name it carries cannot be contested by another module's.
+  if es_has_qualifier(name) { [] }
+  else { match sv_resolve(cx.tab, cx.view, NCEffect, name) {
+    SvAmbig(ss) -> map(ss, (s) => written_text(sym_home(cx.tab, s)))
+    _           -> []
+  } }
+
+fn es_has_qualifier(name: String) : Bool = match split_dotted_qualifier(name) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("True when `mod` is a visible module exporting `name`: a qualified `mod.name` names that module's. False leaves the qualifier for the qualifier passes.")]
+fn es_qualified_exports(cx: ESCtx, mod: String, name: String) : Bool =
+  match mt_lookup_member(cx.mt, mod, name) {
+    None     -> false
+    Some(me) -> me_has_export(me, name)
+  }
+
+# the declaration an effect reference names from one module's viewpoint,
+# qualified or by the scope ladder.
+
+#[doc("Whether a bare `name` settles to a type from the context's file.")]
+fn es_names_type(cx: ESCtx, name: String) : Bool = match sv_resolve(cx.tab, cx.view, NCType, name) {
+  SvNone -> false
+  _      -> true
+}
+
+#[doc("The declaration a qualified `mod.name` names: the `effect name` of the module a read of `mod.name` goes through, whatever a bare `name` would reach from here; `sym_none()` when `mod` is not a visible module declaring it.")]
+fn es_qualified_sym(cx: ESCtx, mod: String, name: String) : SymId =
+  match es_module_sym(cx, mod, name) {
+    None    -> sym_none()
+    Some(m) -> match st_lookup(cx.tab, NCEffect, name, m) { Some(s) -> s  None -> sym_none() }
+  }
+
+fn es_module_sym(cx: ESCtx, mod: String, name: String) : Option[SymId] = match mt_lookup(cx.mt, mod) {
+  None    -> None
+  Some(_) -> st_module(cx.tab, mt_member_home(cx.mt, mod, name))
+}
+
+#[doc("An effect reference settled from the context's file. A bare `E` names the declaration the ladder settles; `m.E` names `m`'s when `m` exports it, and loses its qualifier when `m` exports the name for something else. A reference neither settles stays as written, for the qualifier passes to report.")]
+fn es_ref(cx: ESCtx, r: DeclRef) : DeclRef = match r {
+  DrSym(_)              -> r
+  DrWritten(Some(m), n) -> es_ref_qualified(cx, r, written_text(m), written_text(n))
+  DrWritten(None, n)    -> match split_dotted_qualifier(written_text(n)) {
+    Some(QSplit(m, bare)) -> es_ref_qualified(cx, r, m, bare)
+    None                  -> es_ref_of(r, es_settle(cx, written_text(n)))
+  }
+}
+
+fn es_ref_qualified(cx: ESCtx, r: DeclRef, mod: String, name: String) : DeclRef =
+  if es_qualified_exports(cx, mod, name) { es_ref_of(ref_written(name), es_qualified_sym(cx, mod, name)) }
+  else { r }
+
+fn es_ref_of(r: DeclRef, s: SymId) : DeclRef = if sym_raw(s) < 0 { r } else { DrSym(s) }
+
+#[doc("The base a qualified perform `mod.name.op` keeps once its qualifier is dropped: the effect it named, or the bare name when `mod` declares no such effect.")]
+fn es_qualified_base(cx: ESCtx, mod: String, name: String) : ExprKind = {
+  let q = es_qualified_sym(cx, mod, name)
+  if sym_raw(q) < 0 { EName(written(name)) } else { ESym(q, spec_none()) }
+}
+
+#[doc("A type argument no type answers to but an effect does fills a row-kind slot: the one-label row it denotes; None for any other name.")]
+fn es_effect_arg(cx: ESCtx, n: String) : Option[TyKind] = {
+  let s = es_settle(cx, n)
+  if sym_raw(s) < 0 or es_names_type(cx, n) { None }
+  else { Some(TyRow(RClosed([RL(DrSym(s), [])]))) }
+}
+
+# the type-level half of effect_scope: every row a declaration's types hold,
+# settled through the ladder.
+
+#[doc("Settle the effect labels inside a type body.")]
+fn es_tbody(b: TypeBody, cx: ESCtx) : TypeBody = match b {
+  TBAlias(t) -> TBAlias(es_ty(t, cx))
+  TBRecord(fs) -> TBRecord(map(fs, (f) => es_field(f, cx)))
+  TBSum(vs) -> TBSum(map(vs, (v) => es_variant(v, cx)))
+  TBEffectAlias(ls) -> TBEffectAlias(map(ls, (l) => es_label(l, cx)))
+}
+
+fn es_field(f: FieldDecl, cx: ESCtx) : FieldDecl = match f {
+  FD(p, n, t, attrs) -> FD(p, n, es_ty(t, cx), attrs)
+}
+
+fn es_variant(v: Variant, cx: ESCtx) : Variant = match v {
+  Var(n, ts) -> Var(n, es_tys(ts, cx))
+}
+
+fn es_tys(ts: [TypeExpr], cx: ESCtx) : [TypeExpr] = map(ts, (t) => es_ty(t, cx))
+
+#[doc("Settle the effect labels inside a parameter list's annotations.")]
+fn es_params(ps: [Param], cx: ESCtx) : [Param] =
+  map(ps, (p) => Param { ...p, ptype: es_ty_opt(p.ptype, cx) })
+
+#[doc("Settle the effect labels inside an optional annotation.")]
+fn es_ty_opt(o: Option[TypeExpr], cx: ESCtx) : Option[TypeExpr] = match o {
+  None -> None
+  Some(t) -> Some(es_ty(t, cx))
+}
+
+#[doc("Settle the effect labels inside a type: only a row can name an effect, and the walk reaches every row a type holds.")]
+fn es_ty(t: TypeExpr, cx: ESCtx) : TypeExpr = {
+  let k = match t.tkind {
+    TyName(r, ts) -> TyName(r, map(ts, (x) => es_ty_arg(x, cx)))
+    TyParam(p, ts) -> TyParam(p, map(ts, (x) => es_ty_arg(x, cx)))
+    TyList(x) -> TyList(es_ty(x, cx))
+    TyFn(ps, r, row) -> TyFn(map(ps, (x) => es_ty(x, cx)), es_ty(r, cx), es_row(row, cx))
+    TyDim(x, u) -> TyDim(es_ty(x, cx), u)
+    TyRefine(x, pred) -> TyRefine(es_ty(x, cx), pred)
+    TyRow(row) -> TyRow(es_row(row, cx))
+    _ -> t.tkind
+  }
+  TypeExpr { tkind: k, line: t.line, col: t.col }
+}
+
+fn es_ty_arg(t: TypeExpr, cx: ESCtx) : TypeExpr = match t.tkind {
+  TyName(DrWritten(None, n), []) -> match es_effect_arg(cx, written_text(n)) {
+    Some(k) -> TypeExpr { tkind: k, line: t.line, col: t.col }
+    None    -> t
+  }
+  _ -> es_ty(t, cx)
+}
+
+#[doc("Settle the labels of a row.")]
+fn es_row(r: RowExpr, cx: ESCtx) : RowExpr = match r {
+  REmpty -> REmpty
+  RClosed(ls) -> RClosed(map(ls, (l) => es_label(l, cx)))
+  ROpen(v, ls) -> ROpen(v, map(ls, (l) => es_label(l, cx)))
+}
+
+fn es_label(l: RowLabel, cx: ESCtx) : RowLabel = match l {
+  RL(r, ts) -> RL(es_ref(cx, r), map(ts, (x) => es_ty(x, cx)))
+}
+
+# the core stream through the effect pass.
+
+#[doc("The core stream through the same pass, each declaration from its own module's viewpoint: a core signature's effects settle to declarations like any other.")]
+pub(pkg) fn es_core_decls(ds: [Decl], tabs: ModTables,
+      target: String, tab: SymTab, views: FileViews) : [Decl] = {
+  let mk = (h: String) => es_ctx(h, target, tabs, tab, views)
+  es_core_loop(ds, mk(target), mk, target)
+}
+
+# Consecutive declarations share a module, so one context serves the run.
+fn es_core_loop(ds: [Decl], cx: ESCtx, mk: (String) -> ESCtx, target: String) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> {
+    let h = decl_home_hint_reset(d, target, target)
+    let cx1 = if h == cx.home { cx } else { mk(h) }
+    [es_decl(d, cx1), ...es_core_loop(rest, cx1, mk, target)]
+  }
+}
+
+# the root's ambiguous bare effect names. A bare name the ladder cannot settle
+# stays bare, and the resolver would report it as unknown; it is named as an
+# ambiguity here instead, before that.
+
+#[doc("The error for every bare effect name of the root file that the ladder leaves contested, in source order.")]
+pub(pkg) fn eschk_segmented(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
+      tabs: ModTables, target: String,
+      tab: SymTab, views: FileViews, df: DiagFiles) : [Diagnostic] =
+  if list_length(coll) == 0 { [] }
+  else {
+    let cx = es_ctx(target, target, tabs, tab, views)
+    finalize_diags(eschk_decls(seg_root(segs, decls), cx, df_root(df), []))
+  }
+
+fn seg_root(segs: [ImportSeg], decls: [Decl]) : [Decl] = match segs {
+  [] -> decls
+  [ISeg(_, n), ...rest] -> seg_root(rest, seg_drop(decls, n))
+}
+
+# The walk accumulates newest first.
+fn eschk_decls(ds: [Decl], cx: ESCtx, file: String, acc: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> acc
+  [d, ...rest] -> eschk_decls(rest, cx, file, eschk_decl(d, cx, file, acc))
+}
+
+fn eschk_decl(d: Decl, cx: ESCtx, file: String, acc: [Diagnostic]) : [Diagnostic] = match d {
+  DFn(_, _, _, ps, ret, row, body, l, c, _) ->
+    eschk_expr(body, cx, file, eschk_ty_opt(ret, cx, file, l, c,
+      eschk_tys(es_param_tys(ps, []), cx, file, l, c, eschk_row(row, cx, file, l, c, acc))))
+  DConst(_, _, ty, body, _, l, c) -> eschk_expr(body, cx, file, eschk_ty(ty, cx, file, l, c, acc))
+  DTest(_, body, _, _, _)  -> eschk_expr(body, cx, file, acc)
+  DBench(_, body, _, _, _) -> eschk_expr(body, cx, file, acc)
+  DCheck(_, _, body, _, _, _) -> eschk_expr(body, cx, file, acc)
+  DUse(eff, l, c) -> eschk_name(eff, cx, file, l, c, acc)
+  DDerive(_, inner, _, _)        -> eschk_decl(inner, cx, file, acc)
+  DUnstable(inner, _, _)         -> eschk_decl(inner, cx, file, acc)
+  DProtoLaws(_, inner, _, _, _)  -> eschk_decl(inner, cx, file, acc)
+  DImplAxiom(_, inner, _, _, _)  -> eschk_decl(inner, cx, file, acc)
+  DConstructor(inner, _, _)      -> eschk_decl(inner, cx, file, acc)
+  DDoc(_, _, inner, _, _)        -> eschk_decl(inner, cx, file, acc)
+  DAttr(_, inner, _, _)          -> eschk_decl(inner, cx, file, acc)
+  _ -> acc
+}
+
+fn es_param_tys(ps: [Param], acc: [TypeExpr]) : [TypeExpr] = match ps {
+  [] -> acc
+  [p, ...rest] -> match p.ptype {
+    Some(t) -> es_param_tys(rest, [t, ...acc])
+    None -> es_param_tys(rest, acc)
+  }
+}
+
+fn eschk_tys(ts: [TypeExpr], cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] = match ts {
+  [] -> acc
+  [t, ...rest] -> eschk_tys(rest, cx, file, l, c, eschk_ty(t, cx, file, l, c, acc))
+}
+
+fn eschk_ty_opt(o: Option[TypeExpr], cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] = match o {
+  None -> acc
+  Some(t) -> eschk_ty(t, cx, file, l, c, acc)
+}
+
+fn eschk_ty(t: TypeExpr, cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] = match t.tkind {
+  TyName(_, ts) -> eschk_tys(ts, cx, file, l, c, acc)
+  TyParam(_, ts) -> eschk_tys(ts, cx, file, l, c, acc)
+  TyList(x) -> eschk_ty(x, cx, file, l, c, acc)
+  TyFn(ps, r, row) -> eschk_row(row, cx, file, l, c, eschk_ty(r, cx, file, l, c, eschk_tys(ps, cx, file, l, c, acc)))
+  TyDim(x, _) -> eschk_ty(x, cx, file, l, c, acc)
+  TyRefine(x, _) -> eschk_ty(x, cx, file, l, c, acc)
+  TyRow(row) -> eschk_row(row, cx, file, l, c, acc)
+  _ -> acc
+}
+
+# A row label carries no position of its own; the declaration's stands in.
+fn eschk_row(r: RowExpr, cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] = match r {
+  REmpty -> acc
+  RClosed(ls) -> eschk_labels(ls, cx, file, l, c, acc)
+  ROpen(_, ls) -> eschk_labels(ls, cx, file, l, c, acc)
+}
+
+fn eschk_labels(ls: [RowLabel], cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] = match ls {
+  [] -> acc
+  [RL(r, ts), ...rest] ->
+    eschk_labels(rest, cx, file, l, c, eschk_tys(ts, cx, file, l, c, eschk_ref(r, cx, file, l, c, acc)))
+}
+
+fn eschk_expr(e: Expr, cx: ESCtx, file: String, acc: [Diagnostic]) : [Diagnostic] = {
+  let here = match e.kind {
+    EHandle(_, r, _, _, _, _, _) -> eschk_ref(r, cx, file, e.line, e.col, acc)
+    EField(obj, _) -> match obj.kind {
+      EName(n) -> eschk_name(written_text(n), cx, file, obj.line, obj.col, acc)
+      _ -> acc
+    }
+    _ -> acc
+  }
+  eschk_children(xp_positions(e), cx, file, here)
+}
+
+fn eschk_children(ps: [XPos], cx: ESCtx, file: String, acc: [Diagnostic]) : [Diagnostic] = match ps {
+  [] -> acc
+  [XP(_, child), ...rest] -> eschk_children(rest, cx, file, eschk_expr(child, cx, file, acc))
+}
+
+# Only a bare name can be contested: a settled reference names its
+# declaration, and a qualifier is the choice.
+fn eschk_ref(r: DeclRef, cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] = match r {
+  DrWritten(None, n) -> eschk_name(written_text(n), cx, file, l, c, acc)
+  _                  -> acc
+}
+
+fn eschk_name(n: String, cx: ESCtx, file: String, l: Int, c: Int, acc: [Diagnostic]) : [Diagnostic] =
+  match es_contested(cx, n) {
+    [] -> acc
+    homes -> [nr_ambiguous_diag(file, l, c, NCEffect, n, homes, "", cx.mt), ...acc]
+  }
