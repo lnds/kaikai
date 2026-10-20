@@ -84,6 +84,31 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.168.0 (2026-10-20)
+
+### BREAKING CHANGE
+
+- (h => h |> twice) is the lambda h => (h |> twice), no
+longer twice(h => h). The corpus has no such site outside three
+negative diagnostic fixtures, rewritten to the bare-stage form.
+
+### Added
+
+- **stdlib**: Option and Result ride the pipes
+- **parser**: a lambda in parentheses or an argument spans the pipes
+- **parser**: add the ?? default operator for Option
+
+### Fixed
+
+- **typer**: drop two unused imports that fail the selfhost warning gate
+- **typer**: a function argument may perform fewer effects than its parameter's row allows
+- **typer**: keep the |> hint for a stage lambda that wants the whole container
+- **typer**: seed every pipe stage lambda with the element type
+
+### Changed
+
+- **typer**: keep the call-argument widening in infer_unify_rows
+
 ## v0.167.1 (2026-10-20)
 
 ### Fixed
