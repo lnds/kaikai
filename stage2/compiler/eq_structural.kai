@@ -6,6 +6,7 @@ import compiler.ast
 import compiler.ast_decl
 import compiler.ast_ids
 import compiler.symtab
+import compiler.infer_index
 import compiler.core_refs
 import compiler.diag
 import compiler.impl_identity
@@ -17,23 +18,26 @@ import compiler.expr_positions
 import compiler.operators
 import compiler.written
 
-#[doc("What `Eq` is read against: the scope, which types have an `Eq` and an `Ord` impl, and the type declarations of the program.")]
-pub(pkg) type EqEnv = { ps: PScope, has_eq: (SymId) -> Bool, has_ord: (SymId) -> Bool, types: [Decl] }
+#[doc("What `Eq` is read against: the scope, which types have an `Eq` and an `Ord` impl, the type declarations of the program, and the types that are not `Eq` (a function among their fields, directly or through another such type) and carry no impl.")]
+pub(pkg) type EqEnv = { ps: PScope, has_eq: (SymId) -> Bool, has_ord: (SymId) -> Bool, types: [Decl], bad: NameIndex[SymId] }
 
 #[doc("The environment for deciding `Eq` over the program `ds` against the impls registered in `reg`.")]
 pub(pkg) fn eq_env(ps: PScope, reg: ProtocolReg, ds: [Decl]) : EqEnv =
-  EqEnv { ps: ps,
-          has_eq: (s) => prc_reg_has_impl(reg, core_proto_id(CpEq), DhSym(s)),
-          has_ord: (s) => prc_reg_has_impl(reg, core_proto_id(CpOrd), DhSym(s)),
-          types: eq_types(ds) }
+  mk_env(ps, (s) => prc_reg_has_impl(reg, core_proto_id(CpEq), DhSym(s)),
+         (s) => prc_reg_has_impl(reg, core_proto_id(CpOrd), DhSym(s)), ds)
 
 #[doc("The environment for deciding `Eq` over the program `ds` when `has_eq` says which types have an impl.")]
 pub(pkg) fn eq_env_of(ps: PScope, has_eq: (SymId) -> Bool, ds: [Decl]) : EqEnv =
-  EqEnv { ps: ps, has_eq: has_eq, has_ord: (s) => false, types: eq_types(ds) }
+  mk_env(ps, has_eq, (s) => false, ds)
+
+fn mk_env(ps: PScope, has_eq: (SymId) -> Bool, has_ord: (SymId) -> Bool, ds: [Decl]) : EqEnv = {
+  let types = type_decls(ds, [])
+  EqEnv { ps: ps, has_eq: has_eq, has_ord: has_ord, types: types, bad: bad_fixpoint(ps, has_eq, types, idx_empty()) }
+}
 
 #[doc("True when `s` is a data type with no type parameters whose fields are all `Eq`.")]
 pub(pkg) fn plain_data_eq(env: EqEnv, s: SymId) : Bool = match find(env.types, (d) => type_decl_is(d, s)) {
-  Some(DType(_, _, [], _, _, _, _, _)) -> fields_eq(env, [s], s)
+  Some(DType(_, _, [], _, _, _, _, _)) -> not in_bad(env.bad, s)
   _                                    -> false
 }
 
@@ -52,57 +56,64 @@ fn type_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
   }
 }
 
-#[doc("True when values of `t` can be compared with `==` and satisfy an `Eq` bound.")]
-pub(pkg) fn ty_is_eq(env: EqEnv, t: Ty) : Bool = ty_eq(env, [], t)
-
-fn ty_eq(env: EqEnv, seen: [SymId], t: Ty) : Bool = match t {
-  TyFnT(_, _, _)  -> false
-  TyListT(inner)  -> ty_eq(env, seen, inner)
-  TyDimT(inner, _)    -> ty_eq(env, seen, inner)
-  TyRefineT(inner, _) -> ty_eq(env, seen, inner)
-  TyUnion(ts)     -> all(ts, (x) => ty_eq(env, seen, x))
-  TyCon(s, args)  -> all(args, (x) => ty_eq(env, seen, x)) and head_eq(env, seen, s)
-  _               -> true
+fn in_bad(bad: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(bad, s) {
+  [] -> false
+  _  -> true
 }
 
-fn head_eq(env: EqEnv, seen: [SymId], s: SymId) : Bool =
-  list_has_sym(seen, s) or env.has_eq(s) or fields_eq(env, [s, ...seen], s)
-
-fn list_has_sym(xs: [SymId], s: SymId) : Bool = any(xs, (x) => sym_raw(x) == sym_raw(s))
-
-fn fields_eq(env: EqEnv, seen: [SymId], s: SymId) : Bool = match find(env.types, (d) => type_decl_is(d, s)) {
-  None    -> true
-  Some(d) -> match d {
-    DType(_, _, _, body, _, _, _, _) -> {
-      let from = decl_type_home(d, ps_root(env.ps))
-      match body {
-        TBAlias(te)    -> te_eq(env, seen, from, te)
-        TBRecord(fs)   -> all(fs, (f) => match f { FD(_, _, te, _) -> te_eq(env, seen, from, te) })
-        TBSum(vs)      -> all(vs, (v) => match v { Var(_, tes) -> all(tes, (te) => te_eq(env, seen, from, te)) })
-        TBEffectAlias(_) -> true
-      }
-    }
-    _ -> true
+# Grows the set of types holding a function until a round adds none.
+fn bad_fixpoint(ps: PScope, has_eq: (SymId) -> Bool, types: [Decl], bad: NameIndex[SymId]) : NameIndex[SymId] =
+  match bad_round(ps, has_eq, types, bad, false) {
+    BadRound(next, changed) -> if changed { bad_fixpoint(ps, has_eq, types, next) } else { next }
   }
+
+type BadRound = BadRound(NameIndex[SymId], Bool)
+
+fn bad_round(ps: PScope, has_eq: (SymId) -> Bool, types: [Decl], bad: NameIndex[SymId], changed: Bool) : BadRound = match types {
+  [] -> BadRound(bad, changed)
+  [d, ...rest] -> match d {
+    DType(_, s, _, body, _, _, _, _) ->
+      if in_bad(bad, s) or has_eq(s) or not body_bad(ps, bad, decl_type_home(d, ps_root(ps)), body) {
+        bad_round(ps, has_eq, rest, bad, changed)
+      } else { bad_round(ps, has_eq, rest, idx_prepend_sym(bad, s, s), true) }
+    _ -> bad_round(ps, has_eq, rest, bad, changed)
+  }
+}
+
+fn body_bad(ps: PScope, bad: NameIndex[SymId], from: Option[String], body: TypeBody) : Bool = match body {
+  TBAlias(te)      -> te_bad(ps, bad, from, te)
+  TBRecord(fs)     -> any(fs, (f) => match f { FD(_, _, te, _) -> te_bad(ps, bad, from, te) })
+  TBSum(vs)        -> any(vs, (v) => match v { Var(_, tes) -> any(tes, (te) => te_bad(ps, bad, from, te)) })
+  TBEffectAlias(_) -> false
+}
+
+fn te_bad(ps: PScope, bad: NameIndex[SymId], from: Option[String], te: TypeExpr) : Bool = match te.tkind {
+  TyFn(_, _, _)     -> true
+  TyName(_, args)   -> any(args, (a) => te_bad(ps, bad, from, a)) or head_bad(bad, vdv_head(ps, te, from))
+  TyList(inner)     -> te_bad(ps, bad, from, inner)
+  TyDim(base, _)    -> te_bad(ps, bad, from, base)
+  TyRefine(base, _) -> te_bad(ps, bad, from, base)
+  TyParam(_, args)  -> any(args, (a) => te_bad(ps, bad, from, a))
+  _                 -> false
+}
+
+fn head_bad(bad: NameIndex[SymId], head: DeclRef) : Bool = ref_resolved(head) and in_bad(bad, ref_sym(head))
+
+#[doc("True when values of `t` can be compared with `==` and satisfy an `Eq` bound.")]
+pub(pkg) fn ty_is_eq(env: EqEnv, t: Ty) : Bool = match t {
+  TyFnT(_, _, _)      -> false
+  TyListT(inner)      -> ty_is_eq(env, inner)
+  TyDimT(inner, _)    -> ty_is_eq(env, inner)
+  TyRefineT(inner, _) -> ty_is_eq(env, inner)
+  TyUnion(ts)         -> all(ts, (x) => ty_is_eq(env, x))
+  TyCon(s, args)      -> not in_bad(env.bad, s) and all(args, (x) => ty_is_eq(env, x))
+  _                   -> true
 }
 
 fn type_decl_is(d: Decl, s: SymId) : Bool = match d {
   DType(_, ds, _, _, _, _, _, _) -> sym_raw(ds) >= 0 and sym_raw(ds) == sym_raw(s)
   _                              -> false
 }
-
-fn te_eq(env: EqEnv, seen: [SymId], from: Option[String], te: TypeExpr) : Bool = match te.tkind {
-  TyName(_, args) -> all(args, (a) => te_eq(env, seen, from, a)) and te_head_eq(env, seen, vdv_head(env.ps, te, from))
-  TyList(inner)   -> te_eq(env, seen, from, inner)
-  TyFn(_, _, _)   -> false
-  TyDim(base, _)    -> te_eq(env, seen, from, base)
-  TyRefine(base, _) -> te_eq(env, seen, from, base)
-  TyParam(_, args)  -> all(args, (a) => te_eq(env, seen, from, a))
-  _                 -> true
-}
-
-fn te_head_eq(env: EqEnv, seen: [SymId], head: DeclRef) : Bool =
-  if ref_resolved(head) { head_eq(env, seen, ref_sym(head)) } else { true }
 
 #[doc("A comparison the program may not make: where it is, the operand type, and whether it is `==`/`!=` (else an ordering).")]
 pub(pkg) type CmpSite = CS(Int, Int, Ty, Bool)
