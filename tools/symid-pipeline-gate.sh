@@ -56,23 +56,23 @@ ALIASFIX="$ROOT/examples/effects/perform_through_row_alias"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$ALIASFIX" --path "$ROOT/stdlib" "$ALIASFIX/main.kai")
 
-need '^kperform spoken Loud\.say#[0-9]+ Loud@main$'
-[ "$(printf '%s\n' "$out" | grep -cE '^kperform spoken Loud\.say#[0-9]+ Loud@main$')" = 2 ] \
+need '^kperform main__spoken Loud\.say#[0-9]+ Loud@main$'
+[ "$(printf '%s\n' "$out" | grep -cE '^kperform main__spoken Loud\.say#[0-9]+ Loud@main$')" = 2 ] \
   || fail "the alias-written and directly written performs do not both carry Loud's id"
-[ "$(printf '%s\n' "$out" | grep -E '^kperform spoken ' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
+[ "$(printf '%s\n' "$out" | grep -E '^kperform main__spoken ' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
   || fail "the two performs of Loud.say carry different ids"
 
 # A capability passed as a value carries the same identity: the parameter's
 # annotation is a `TyCon` naming the effect, so the op dispatched against
 # that binder's evidence node must name the declaration the others do.
-need '^kperform through_cap Loud\.say#l_[0-9]+#[0-9]+ Loud@main$'
+need '^kperform main__through_cap Loud\.say#l_[0-9]+#[0-9]+ Loud@main$'
 # A named instance used inside its handle body dispatches against that
 # handle's evidence node and names the effect its head resolved to.
-need '^kperform named Loud\.say#n_[0-9]+#[0-9]+ Loud@main$'
+need '^kperform main__named Loud\.say#n_[0-9]+#[0-9]+ Loud@main$'
 
 # Every way of writing the op names one declaration: on the row alias, on
 # the effect, through a capability parameter, and through a named instance.
-[ "$(printf '%s\n' "$out" | grep -E '^kperform (spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
+[ "$(printf '%s\n' "$out" | grep -E '^kperform main__(spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
   || fail "the four ways of writing Loud.say do not all carry one id"
 
 # Two modules each declare `effect Log`. A contested effect is spelled
@@ -123,12 +123,12 @@ QUALFIX="$ROOT/examples/effects/core_effect_named_qualified"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$QUALFIX" --path "$ROOT/stdlib" "$QUALFIX/main.kai" 2>/dev/null)
 
-need '^kperform both Log\.info#[0-9]+ Log@effects$'
-need '^kperform both Log__main\.note#[0-9]+ Log@main$'
+need '^kperform main__both Log\.info#[0-9]+ Log@effects$'
+need '^kperform main__both Log__main\.note#[0-9]+ Log@main$'
 need '^unbox main with Log#[0-9]+ Log@effects$'
 need '^unbox main with Log__main#[0-9]+ Log@main$'
 need '^kperform ma__go Log__ma\.note#[0-9]+ Log@ma$'
-[ "$(row_id '^row both Log#')" = "$(id_of '^kperform both Log\.info')" ] \
+[ "$(row_id '^row both Log#')" = "$(id_of '^kperform main__both Log\.info')" ] \
   || fail "a qualified row label carries a different id than the core effect"
 [ "$(row_id '^row main Stdout#')" = "$(id_of '^kperform ma__go Stdout\.print')" ] \
   || fail "a builtin's row label carries a different id than its core declaration"
@@ -398,12 +398,12 @@ EOF
   return 0
 }
 out=$(cell_dump cell_perform_ids)
-need '^kperform _kaiu_stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
-need '^kperform reads Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
-need '^kperform _kaiu_lam_reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_cell_perform_ids__stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
+need '^kperform cell_perform_ids__reads Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_lam_cell_perform_ids__reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
 cell_core cell_perform_ids
 out=$(cell_dump cell_perform_ids_stdlib)
-need '^kperform _kaiu_lam_captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
+need '^kperform _kaiu_lam_cell_perform_ids_stdlib__captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
 cell_core cell_perform_ids_stdlib
 out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
   | grep -v /negative/ \
