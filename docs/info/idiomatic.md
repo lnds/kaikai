@@ -375,6 +375,9 @@ fn main() : Unit / Stdout = match find_pos([3, 7, 9], 7) {
 }
 ```
 
+Transform an `Option` or `Result` with the pipes, not `map`:
+`opt | f` instead of `opt |> map(f)`, and `r || g` for `and_then`.
+
 A default for an `Option` is the infix `??`: `find_pos(xs, 7) ?? 0`.
 The right side runs only on `None`, so `o ?? compute()` is lazy and
 `o ?? f()!` propagates from the enclosing function. Prefer it to

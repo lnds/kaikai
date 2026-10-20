@@ -140,6 +140,8 @@ These stdlib types export the canonical `map` / `flat_map` / `filter`
 
 ```text
 [T]                  element a            (core/list)
+Option[a]            the Some payload     (core/option)
+Result[a, e]         the Ok payload       (core/result)
 Stream[t, e]         element t            (stream)
 Gen[t, e]            element t            (gen)
 Seq[t]               element t            (seq, pure-only functions)
@@ -155,9 +157,30 @@ Queue[a]             element a            (collections/queue)
 collapse duplicate output keys. The mutable `HashMap` / `HashSet`
 combinators carry `/ Mutable`.
 
-`Option` and `Result` deliberately do NOT ride the pipes, `|!`
-included — use `!`
-for propagation (`x!`) or `and_then` for explicit chaining.
+`Option` rides all four pipes: `|` maps `Some`, `||` is `and_then`,
+`|?` keeps a `Some` that passes the predicate, and `|!` runs the stage
+only on `Some`. `None` passes through untouched. `Result` rides `|`,
+`||` and `|!` over `Ok`; `Err` passes through untouched. `|?` on a
+`Result` is an error: a rejected `Ok` has no error to carry.
+
+```kaikai
+fn inc(x: Int) : Int = x + 1
+fn half(x: Int) : Option[Int] = if x % 2 == 0 { Some(x / 2) } else { None }
+fn big(x: Int) : Bool = x > 5
+fn show_it(x: Int) : Unit / Stdout = Stdout.print("got #{x}")
+
+fn main() : Unit / Stdout = {
+  Stdout.print(show(Some(4) | inc))            # Some(5)
+  Stdout.print(show(Some(3) || half))          # None
+  Stdout.print(show(Some(9) |? big))           # Some(9)
+  Stdout.print(show(Ok(4) | inc))              # Ok(5)
+  Some(4) |! show_it                           # got 4; None prints nothing
+  Stdout.print(show((Some(4) | inc) ?? 0))     # 5
+}
+```
+
+`??` binds tighter than the pipes, so `opt | f ?? 0` reads
+`opt | (f ?? 0)`: parenthesise the pipe, `(opt | f) ?? 0`.
 
 Non-List head dispatch is gated on edition `hanga-roa` or later.
 
@@ -196,7 +219,7 @@ The rule above is for a BARE lambda stage. A lambda inside parentheses,
 or passed as an argument, has a body that extends to the closing `)` or
 `,`, across `|>` and the other pipes:
 
-```kaikai-snippet
+```text
 xs | (o => o |> unwrap_or(0))                    # body: o |> unwrap_or(0)
 foldl(xs, Ok([]), (done, x) => done |> and_then(ys => inserted(x, ys)))
 [1..10] |? gt1 | (n => n * 2) |> sum             # `)` closes the lambda first

@@ -35,7 +35,8 @@ LLVM. Memory is managed by Perceus reference counting inside
 BEAM-style isolated fibers — there is no garbage collector and no
 borrow checker. Effects are visible in the type of every function
 that performs them. A default for an `Option` is the infix `o ?? d`
-(lazy, `Option` only; `ok(r) ?? d` for a `Result`).
+(lazy, `Option` only; `ok(r) ?? d` for a `Result`). `Option` and `Result`
+ride the pipes: write `opt | f`, not `opt |> map(f)`.
 
 ## The topic list
 
