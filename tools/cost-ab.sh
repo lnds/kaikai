@@ -14,10 +14,12 @@
 #
 # Options:
 #   --base <ref>      Build the base compiler from <ref> and the branch compiler
-#                     from this tree's HEAD, each in a cached worktree with the
-#                     same recipe (seeded by this tree's stage2/kaic2, two
-#                     kaic2-fast hops), so the binaries differ only by source.
-#                     Uncommitted changes are not measured.
+#                     from this tree's HEAD, each in a worktree of this run's own
+#                     temp dir (removed on exit) with the same recipe: seeded
+#                     by the stored build of its merge-base with origin/main
+#                     (tools/prebuilt-kaic2.sh), then two kaic2-fast hops, so
+#                     the binaries differ only by source. Uncommitted changes
+#                     are not measured.
 #   --base-tree <dir> Tree whose stage2/main.kai is compiled and whose stdlib
 #                     the base reads (default: the tree holding <base-kaic2>,
 #                     else this one).
@@ -71,30 +73,48 @@ case "$CACHE_MODE" in ""|cold|warm) ;; *) echo "cost-ab: --cache takes cold or w
 
 die() { echo "cost-ab: $*" >&2; exit 2; }
 
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/cost-ab.XXXXXX")"
+echo $$ > "$WORK/pid"
+
+# A run dir holds its own worktrees, registered in $HERE's repository.
+drop_run() {
+  local t
+  for t in "$1"/tree-*; do
+    [ -d "$t" ] && git -C "$HERE" worktree remove --force "$t" >/dev/null 2>&1
+  done
+  rm -rf "$1"
+  git -C "$HERE" worktree prune
+}
+trap 'drop_run "$WORK"' EXIT
+trap 'exit 130' INT TERM
+
+# Run dirs of killed runs: their pid is gone. A live run's dir is never touched.
+for d in "${TMPDIR:-/tmp}"/cost-ab.*/; do
+  [ -f "$d/pid" ] && [ "${d%/}" != "$WORK" ] || continue
+  kill -0 "$(cat "$d/pid")" 2>/dev/null || drop_run "${d%/}"
+done
+
 # A compiler built from a ref: two fast hops, so its source is compiled by a
-# compiler of its own code. Base and branch go through the same recipe.
-build_ref() {
-  local ref="$1" sha wt
+# compiler of its own code. Base and branch go through the same recipe, each
+# seeded by the stored build of the ref's merge-base with origin/main: a seed
+# from any other commit may not compile this tree or run under its wrapper.
+build_ref() { # role ref
+  local role="$1" ref="$2" sha mb seed wt
   sha="$(git -C "$HERE" rev-parse --verify "$ref^{commit}")" || die "unknown ref $ref"
-  wt="${COST_AB_CACHE:-${TMPDIR:-/tmp}/cost-ab}/tree-${sha:0:12}"
-  if [ ! -x "$wt/stage2/kaic2" ] || [ ! -f "$wt/.cost-ab-built" ]; then
-    rm -rf "$wt"
-    mkdir -p "$(dirname "$wt")"
-    git -C "$HERE" worktree prune
-    git -C "$HERE" worktree add -q --detach "$wt" "$sha" >&2
-    [ -x "$HERE/stage2/kaic2" ] || die "no $HERE/stage2/kaic2 to seed the base build; run make kaic2"
-    cp "$HERE/stage2/kaic2" "$wt/stage2/kaic2"
-    echo "cost-ab: building $ref (${sha:0:12}) with two kaic2-fast hops" >&2
-    (cd "$wt" && make bin/kai >&2 && make kaic2-fast >&2 && make kaic2-fast >&2) || die "build of $ref failed"
-    touch "$wt/.cost-ab-built"
-  fi
+  mb="$(git -C "$HERE" merge-base "$sha" origin/main)" || die "$ref has no merge-base with origin/main"
+  seed="$("$HERE/tools/prebuilt-kaic2.sh" path "$mb")" || die "no stored build of ${mb:0:12}"
+  wt="$WORK/tree-$role"
+  git -C "$HERE" worktree add -q --detach "$wt" "$sha" >&2
+  cp "$seed/stage2/kaic2" "$wt/stage2/kaic2"
+  echo "cost-ab: building $ref (${sha:0:12}) seeded by ${mb:0:12}, two kaic2-fast hops" >&2
+  (cd "$wt" && make bin/kai >&2 && make kaic2-fast >&2 && make kaic2-fast >&2) || die "build of $ref failed"
   echo "$wt"
 }
 
 if [ -n "$BASE_REF" ]; then
   [ -z "$(git -C "$HERE" status --porcelain --untracked-files=no)" ] || echo "cost-ab: warning: uncommitted changes are not measured (the branch is built from HEAD)" >&2
-  BASE_TREE="$(build_ref "$BASE_REF")"
-  BRANCH_TREE="$(build_ref HEAD)"
+  BASE_TREE="$(build_ref base "$BASE_REF")"
+  BRANCH_TREE="$(build_ref branch HEAD)"
   BASE_BIN="$BASE_TREE/stage2/kaic2"
   BRANCH_BIN="$BRANCH_TREE/stage2/kaic2"
   progs=("${pos[@]+"${pos[@]}"}")
@@ -117,8 +137,6 @@ EDITION="$(cat "$BASE_TREE/EDITION")"
 BASE_STDLIB="$BASE_TREE/stdlib"
 BRANCH_STDLIB="$BRANCH_TREE/stdlib"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/cost-ab.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
 : > "$WORK/empty.kai"
 
 # Instructions retired where the host exposes them, else CPU milliseconds
