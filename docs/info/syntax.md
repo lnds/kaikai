@@ -27,7 +27,7 @@ continues) only while the parser still expects more:
 A binary operator also continues from LEADING position on the next
 line — the five pipes `|>` `|` `||` `|?` `|!` and every binary operator
 that cannot start an expression: `or`, `and`, `==` `!=` `<` `>` `<=`
-`>=`, `++`, `+`, `*`, `/`, `^`. The two that CAN start an expression
+`>=`, `++`, `??`, `+`, `*`, `/`, `^`. The two that CAN start an expression
 are excluded: `-` (unary minus) and `%` (opens `%{ }` / `%[ ]`
 literals) — those must stay at the end of the previous line:
 
@@ -868,6 +868,7 @@ unary         -x  not x
 multiplicative *  /  %
 additive      +  -
 concat        ++                                     (right-assoc)
+default       a ?? b                                 (right-assoc, Option only)
 comparison    ==  !=  <  >  <=  >=                   (non-associative)
 logical and   and                                    (short-circuit)
 logical or    or                                     (short-circuit)
@@ -1259,6 +1260,42 @@ fn main() : Unit / Stdout = match add_them() {
 
 The dispatch (Option vs Result) is by the type the typer assigns to
 the expression; the enclosing function's return type must match.
+
+## `??` — default for an Option
+
+`o ?? d` is `o` when it is `Some`, else `d`. The left side must be an
+`Option[a]` and the right side is checked against `a`; the result is
+`a`. A `Result` is converted first with `ok(r) ?? d`, so the place an
+error is dropped stays visible.
+
+The right side is a branch, not a thunk: it runs only on `None`, its
+effects join the enclosing row, and `o ?? f()!` propagates from the
+enclosing function.
+
+```kaikai
+fn parse(s: String) : Option[Int] = string_to_int(s)
+
+fn main() : Unit / Stdout = {
+  let none: Option[Int] = None
+  Stdout.print(show(parse("12") ?? 0))         # 12
+  Stdout.print(show(none ?? 7))                # 7
+  Stdout.print(show(none ?? none ?? 9))        # right-assoc: none ?? (none ?? 9)
+  Stdout.print(show(none ?? 1 + 2))            # 3: none ?? (1 + 2)
+  Stdout.print(show(none ?? 0 == 0))           # true: (none ?? 0) == 0
+  Stdout.print(show([Some(1), None] | . ?? 0)) # [1, 0]: a map stage
+}
+```
+
+`??` binds tighter than comparison and looser than `++`, so the right
+side takes everything tighter: `n ?? 0 + 1` is `n ?? (0 + 1)` and
+`s ?? "" ++ "!"` is `s ?? ("" ++ "!")`. `a ?? false or c` is
+`(a ?? false) or c`. A `??` at the start of the next line continues the
+expression. In a lambda, `(x) => x ?? 0` keeps `??` in the body.
+
+Errors with their own message: a `Result` or other non-Option on the
+left, a right side that is not the inner type, `o! ?? d` (the `!` has
+already unwrapped), and `x |> f() ?? d`, where `??` would become the
+`|>` stage: write `(x |> f()) ?? d`.
 
 ## UFCS
 

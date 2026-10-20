@@ -23,6 +23,8 @@ Every entry is verified against the compiler; when in doubt,
   not `|x| ...`.
 - No `return` — the last expression of a block is the value.
 - No `null` / `nil` / `undefined` — `Option[T]` (`Some(x)` / `None`).
+- Option default is the infix `o ?? d` (Swift/JS `??`, Rust `unwrap_or` /
+  `unwrap_or_else`): lazy, `Option` only. A `Result` needs `ok(r) ?? d`.
 - No `throw` / `try` / `catch` — use `Result[a, e]` with the `expr!`
   propagation postfix, or an effect whose op returns `Nothing`.
 - No `for x in xs`, no C-style `for (;;)`, no `break` / `continue`.

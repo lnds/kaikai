@@ -34,7 +34,8 @@ primitive, and Elixir-style pipelines. It compiles natively through
 LLVM. Memory is managed by Perceus reference counting inside
 BEAM-style isolated fibers — there is no garbage collector and no
 borrow checker. Effects are visible in the type of every function
-that performs them.
+that performs them. A default for an `Option` is the infix `o ?? d`
+(lazy, `Option` only; `ok(r) ?? d` for a `Result`).
 
 ## The topic list
 

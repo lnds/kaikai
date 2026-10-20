@@ -493,7 +493,7 @@ pub(pkg) fn desugar_placeholder_args(args_: [Expr]) : [Expr] = map(args_, desuga
 pub(pkg) fn op_of_tok(k: TokKind) : String {
   match k {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
-    TkPercent -> "%" TkPlusPlus -> "++"
+    TkPercent -> "%" TkPlusPlus -> "++" TkCoalesce -> "??"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">" TkLe -> "<=" TkGe -> ">="
     TkAnd -> "and" TkOr -> "or"
     _ -> "?"
@@ -501,17 +501,19 @@ pub(pkg) fn op_of_tok(k: TokKind) : String {
 }
 
 # Levels, loosest first: the four pipes, `or`, `and`, comparisons (no chaining),
-# `++` (right-associative), additive, multiplicative; the rest are left-associative.
+# `??` and `++` (right-associative), additive, multiplicative; the rest are left-associative.
 #[doc("Precedence level of the pipes.")]
 pub(pkg) fn bin_pipe() : Int = 1
 #[doc("Precedence level of `or`.")]
 pub(pkg) fn bin_or() : Int = 2
 #[doc("Precedence level of comparison operators.")]
 pub(pkg) fn bin_cmp() : Int = 4
+#[doc("Precedence level of the `??` default operator.")]
+pub(pkg) fn bin_coalesce() : Int = 5
 #[doc("Precedence level of concatenation.")]
-pub(pkg) fn bin_concat() : Int = 5
+pub(pkg) fn bin_concat() : Int = 6
 #[doc("Precedence level of the tightest binary operators.")]
-pub(pkg) fn bin_tightest() : Int = 7
+pub(pkg) fn bin_tightest() : Int = 8
 
 fn bin_level(k: TokKind) : Int =
   match k {
@@ -528,12 +530,13 @@ fn bin_level(k: TokKind) : Int =
     TkGt -> 4
     TkLe -> 4
     TkGe -> 4
-    TkPlusPlus -> 5
-    TkPlus -> 6
-    TkMinus -> 6
-    TkStar -> 7
-    TkSlash -> 7
-    TkPercent -> 7
+    TkCoalesce -> 5
+    TkPlusPlus -> 6
+    TkPlus -> 7
+    TkMinus -> 7
+    TkStar -> 8
+    TkSlash -> 8
+    TkPercent -> 8
     _ -> 0
   }
 
@@ -559,11 +562,11 @@ pub(pkg) fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
 #[doc("""
 The loosest operator that may follow once `op` is combined: the same
 level again for a left-associative one, strictly looser after a
-comparison (no chaining) or after `++`, whose right operand already took
+comparison (no chaining), `??` or `++`, whose right operand already took
 the rest of its chain.
 """)]
 pub(pkg) fn bin_ceiling(op: BinOpAt) : Int =
-  if op.level == bin_cmp() or op.level == bin_concat() { op.level - 1 } else { op.level }
+  if op.level == bin_cmp() or op.level == bin_coalesce() or op.level == bin_concat() { op.level - 1 } else { op.level }
 
 #[doc("Builds the expression node of a binary operation.")]
 pub(pkg) fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
@@ -601,9 +604,27 @@ fn dispatch_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Conso
     SrOwn(r) -> ok_e(p, expr_at(EDispatchPipe(pipe_op_of_tok(t.kind), lhs, r), t))
   }
 
+fn is_coalesce(e: Expr) : Bool = match e.kind {
+  ECall(f, _) -> match f.kind {
+    EMark(MkCoalesce) -> true
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("Builds the node of `lhs ?? rhs`; `o! ?? d` is rejected because `!` has already unwrapped the Option.")]
+pub(pkg) fn bin_coalesce_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  match lhs.kind {
+    EBang(_) -> fail_e_at(p, t, "`??` needs an Option on its left, and `!` has already unwrapped it; write `o ?? d`, or `o! ` alone to propagate")
+    _ -> ok_e(p, expr_at(ECall(mk_expr(EMark(MkCoalesce), t.line, t.col), [lhs, rhs]), t))
+  }
+
 #[doc("Builds the node of a pipe: `|>` (apply), `|` (map), `||` (flat-map), `|?` (filter) or `|!` (each).")]
 pub(pkg) fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
   if ends_pipeline(lhs) { fail_e_at(p, t, "`|!` ends a pipeline; it returns `Unit`") }
+  else if tk_is(t.kind, TkPipeApply) and is_coalesce(rhs) {
+    fail_e_at(p, t, "`??` cannot be a `|>` stage, which would read as `x |> (f() ?? d)`; write `(x |> f()) ?? d` or `x |> f() |> unwrap_or(d)`")
+  }
   else if tk_is(t.kind, TkPipeApply) { apply_pipe_node(p, t, lhs, rhs) }
   else { dispatch_pipe_node(p, t, lhs, rhs) }
 
