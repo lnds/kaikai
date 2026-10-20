@@ -285,7 +285,7 @@ tools/cost-ab.sh <base-kaic2> <branch-kaic2> [prog.kai ...]
 tools/cost-ab.sh --cache warm --base origin/main prog.kai  # per-project cache on; cold empties it before each run
 ```
 
-`--base <ref>` builds the ref in a cached worktree (`$TMPDIR/cost-ab/base-<sha>`) with two `make kaic2-fast` hops, so the base source is compiled by a compiler of the base's own code. It needs a built `stage2/kaic2` in this tree to seed from. Run on a quiet machine (load < 3).
+`--base <ref>` builds the ref, and the branch's HEAD, in worktrees of the run's own temp dir (`$TMPDIR/cost-ab.XXXXXX`, removed on exit; concurrent runs do not share it) with two `make kaic2-fast` hops, each seeded by the stored build (`tools/prebuilt-kaic2.sh`) of its merge-base with `origin/main`, so the base source is compiled by a compiler of the base's own code. Run on a quiet machine (load < 3).
 
 The cost is instructions retired (`/usr/bin/time -l` on macOS, `perf stat` on Linux), reported in millions (M); where a host exposes no counters (a virtualised runner) it falls back to CPU milliseconds and the header says so. Per probe it prints min/mean for both sides, the delta in units and %, and a verdict from the stated band: `up` when every branch round is above every base round, `down` when every one is below, else `noise`.
 
@@ -316,9 +316,10 @@ A fresh worktree has no compiler, and `make kaic2` boots one in minutes (more fo
 tools/prebuilt-kaic2.sh build            # once per origin/main commit (native-capable where llvm-config is found)
 tools/prebuilt-kaic2.sh seed             # in a worktree: the build of its HEAD, in seconds
 tools/prebuilt-kaic2.sh has || tools/prebuilt-kaic2.sh build
+tools/prebuilt-kaic2.sh path <ref>   # a stored build's root; <root>/bin/kai runs on its own
 ```
 
-`seed` restores the build of the commit the worktree branched from `origin/main` at, building it first if it is missing (concurrent seeds wait for one build); commits on top of that base are rebuilt by `make kaic2-fast`, which is C-backend only. An older commit's kaic2 is never used: it may not compile a newer tree. After seeding, edit and rebuild as usual (`make kaic2-fast`). The store is `$KAI_PREBUILT_STORE`, else `${XDG_CACHE_HOME:-~/.cache}/kaikai-prebuilt`, and keeps the newest three builds. Nothing CI or the selfhost oracle trusts comes from it: it is a dev convenience over the same `make kaic2`.
+`seed` restores the build of the commit the worktree branched from `origin/main` at, building it first if it is missing (concurrent seeds wait for one build); commits on top of that base are rebuilt by `make kaic2-fast`, which is C-backend only. An older commit's kaic2 is never used: it may not compile a newer tree. After seeding, edit and rebuild as usual (`make kaic2-fast`). The store is `$KAI_PREBUILT_STORE`, else `${XDG_CACHE_HOME:-~/.cache}/kaikai-prebuilt`, and keeps the newest three builds. A stored root is a dev layout (`bin/kai`, `stage2/kaic2`, and the commit's `stage0/`, `stdlib/`, `stage2/runtime.h`), so a lane can run another commit's compiler from it to compare outputs. Nothing CI or the selfhost oracle trusts comes from it: it is a dev convenience over the same `make kaic2`.
 
 ## Before the first push — the gates that turn CI red
 
@@ -345,7 +346,7 @@ Each runs in seconds with a built kaic2. Run the ones a change can touch; a red 
 
 **A fixture needs no wiring.** Drop `<name>.kai` (plus `<name>.out.expected`, or `<name>.err.expected` for a negative) into an `examples/<dir>` that has a `FIXTURES` manifest and CI runs it: `tools/fixture-dir.sh` enumerates the directory, and the directory is one `test-dir-<slug>` unit of the tier1 light pool (`/` in the path written `-`). The stdlib path is always passed.
 
-- **`FIXTURES`** — two keys, both required: `backends: c` and `diagnostics: fixed|regex` (how `.err.expected` lines match stderr). A new directory of plain run-and-diff fixtures is one such file; nothing else is edited.
+- **`FIXTURES`** — two keys, both required: `backends:` (`c`, `native`, or `c native`) and `diagnostics: fixed|regex` (how `.err.expected` lines match stderr). A new directory of plain run-and-diff fixtures is one such file; nothing else is edited. A directory that lists `native` is also one `test-dir-native-<slug>` unit of the `native-wrapper` pool, run by tier1-native through `bin/kai` with `KAI_BACKEND=native`; native supports no in-file marks.
 - **In-file marks** — a line `# fixture: test` compiles the fixture with `--test` and diffs stdout+stderr; `# fixture: no-stdlib` drops the stdlib path for a fixture that tests its absence. `# fixture: negative` and `.fmt-class` (`negative` / `nonsubject`, per directory) classify a file for `tests/fmt_property.sh`; `.err.expected` already marks a negative.
 - **Anything that is not a plain fixture directory** (a script, a gate, a bespoke recipe) is one row in `stage2/test-registry.txt`: `<target> <pool>`, pools `light`, `native-wrapper`, `native-gates-1`, `native-gates-2`. Order is irrelevant; `test-light-partition` (tier0) fails on a repeated row or an unknown pool.
 - **Shards** — `tools/tier1-light-plan.sh` assigns units to shards by measured cost from `tools/tier1-light-costs.txt` (generated by `tools/tier1-light-costs-refresh.sh`; an unmeasured unit gets the default cost, and every `test-dir-*` unit is elastic).
