@@ -1,26 +1,7 @@
-# compiler/escapes.kai — The escape table for string and char literals.
-#
-# One table, shared by every literal path: string bodies, char
-# literals, triple-quoted bodies and interpolation pieces. Splitting it
-# is how `'\x41'` came to mean `x` while `"\x41"` meant `A`.
-#
-# kaikai accepts exactly:
-#
-#   \n \t \r \0 \\ \" \'
-#   \xHH      exactly two hex digits, one raw BYTE
-#   \u{H..H}  1..6 hex digits, a codepoint encoded as UTF-8
-#
-# Everything else is a compile error. C99's octal, `\a \b \f \v \?`
-# and variable-width `\xH...` are deliberately absent: they used to be
-# accepted only because the C backend spliced the source span into
-# `kai_str("...")` and let the C compiler decode it.
-#
-# `\xHH` yields a byte and `\u{...}` yields a codepoint — `"\xE9"` is a
-# lone 0xE9 (not valid UTF-8 on its own) while `"\u{E9}"` is the two
-# bytes 0xC3 0xA9.
+#[doc("The escape table for string and char literals, and the text scan of an interpolated string literal.")]
 
-import compiler.chars
 import compiler.util
+import compiler.chars
 
 # ====================================================================
 # outcome
@@ -29,7 +10,7 @@ import compiler.util
 # Decoding either yields bytes and the offset just past the escape, or
 # a message plus the offset OF THE BACKSLASH so the caret lands on the
 # escape rather than on the opening quote.
-pub type EscStep = EscOk(String, Int) | EscBad(String, Int)
+pub(pkg) type EscStep = EscOk(String, Int) | EscBad(String, Int)
 
 fn esc_max_cp() : Int = 1114111
 fn esc_surrogate_lo() : Int = 55296
@@ -93,8 +74,7 @@ fn esc_retired_hint(c: Char) : String {
 # UTF-8 encoding
 # ====================================================================
 
-#[doc("Encode a Unicode scalar value as UTF-8 bytes.")]
-pub fn esc_utf8_encode(cp: Int) : String {
+fn esc_utf8_encode(cp: Int) : String {
   if cp < 128 { int_to_byte_string(cp) }
   else if cp < 2048 { esc_utf8_two(cp) }
   else if cp < 65536 { esc_utf8_three(cp) }
@@ -236,7 +216,7 @@ fn esc_reject_msg(c: Char) : String {
 # ====================================================================
 
 #[doc("Decode one escape sequence to bytes. `bs` is the backslash offset; `i` sits just past it.")]
-pub fn esc_decode_at(s: String, bs: Int, i: Int, n: Int) : EscStep {
+pub(pkg) fn esc_decode_at(s: String, bs: Int, i: Int, n: Int) : EscStep {
   match char_at(s, i) {
     None -> EscBad("trailing '\\' with no escape character", bs)
     Some(c) -> esc_decode_kind(s, bs, i, n, c)
@@ -280,7 +260,7 @@ fn esc_decode_loop(s: String, i: Int, n: Int, acc: [String]) : EscStep {
 }
 
 #[doc("Decode every escape in `s[start..end)`, yielding the literal bytes.")]
-pub fn esc_decode_body(s: String, start: Int, end: Int) : EscStep =
+pub(pkg) fn esc_decode_body(s: String, start: Int, end: Int) : EscStep =
   esc_decode_loop(s, start, end, [])
 
 # ====================================================================
@@ -292,7 +272,7 @@ pub fn esc_decode_body(s: String, start: Int, end: Int) : EscStep =
 # The lexer has already rejected anything outside the table.
 
 #[doc("Decode the escape at `i` (just past the backslash) to a scalar value.")]
-pub fn esc_decode_scalar_at(s: String, i: Int, n: Int) : Option[Int] {
+pub(pkg) fn esc_decode_scalar_at(s: String, i: Int, n: Int) : Option[Int] {
   match char_at(s, i) {
     None -> None
     Some(c) -> esc_scalar_kind(s, i, n, c)
@@ -310,3 +290,88 @@ fn esc_scalar_kind(s: String, i: Int, n: Int, c: Char) : Option[Int] {
   }
   else { None }
 }
+
+#[doc("One part of a string span: a literal piece (as written, and as the string literal that holds it) or the source of a `#{...}` body.")]
+#[derive(BinSerialize)]
+pub(pkg) type IPart = IpLit(String, String) | IpExp(String)
+
+# The parts so far, in reverse; where the current literal piece starts; the cursor.
+type IScan = { parts: [IPart], lit_start: Int, i: Int }
+
+#[doc("A position in the source a string literal is written in.")]
+pub(pkg) type InterpPos = { line: Int, col: Int }
+
+#[doc("The parts of `span` between the opening and closing quotes, in source order.")]
+pub(pkg) fn interp_parts(span: String, is_triple: Bool) : [IPart] {
+  let lead = interp_lead(is_triple)
+  iscan_collect(span, string_length(span) - lead, IScan { parts: [], lit_start: lead, i: lead })
+}
+
+#[doc("True when the literal `span` holds a `#{...}` body.")]
+pub(pkg) fn span_interpolates(span: String, is_triple: Bool) : Bool {
+  let lead = interp_lead(is_triple)
+  has_interp(span, lead, string_length(span) - lead)
+}
+
+#[doc("The width of the quote that opens a literal: three for `\"\"\"`, else one.")]
+pub(pkg) fn interp_lead(is_triple: Bool) : Int = if is_triple { 3 } else { 1 }
+
+fn raw_lit_for_c(piece: String) : String =
+  cat3("\"", escape_str_body_for_c(piece), "\"")
+
+fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] =
+  list_reverse(iscan_collect_rev(span, end, st))
+
+fn iscan_collect_rev(span: String, end: Int, st: IScan) : [IPart] {
+  if st.i >= end { finish_iscan_rev(span, end, st) }
+  else if iscan_opens(span, st.i, end) {
+    let expr_start = st.i + 2
+    let expr_end = iscan_expr_end(span, expr_start, end, 1)
+    let parts = [IpExp(string_slice(span, expr_start, expr_end - expr_start)), ...iscan_flush(span, st)]
+    let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
+    iscan_collect_rev(span, end, IScan { parts: parts, lit_start: next_i, i: next_i })
+  }
+  else { iscan_collect_rev(span, end, IScan { ...st, i: st.i + 1 }) }
+}
+
+fn iscan_opens(span: String, i: Int, end: Int) : Bool =
+  i + 1 < end and char_at(span, i) == Some('#') and char_at(span, i + 1) == Some('{')
+
+# The literal piece that ends at the cursor, prepended to the parts.
+fn iscan_flush(span: String, st: IScan) : [IPart] =
+  if st.i > st.lit_start {
+    let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
+    [IpLit(piece, raw_lit_for_c(piece)), ...st.parts]
+  } else { st.parts }
+
+fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int =
+  if depth == 0 or i >= end { i }
+  else {
+    match char_at(span, i) {
+      None      -> i
+      Some('{') -> iscan_expr_end(span, i + 1, end, depth + 1)
+      Some('}') -> if depth == 1 { i } else { iscan_expr_end(span, i + 1, end, depth - 1) }
+      _         -> iscan_expr_end(span, i + 1, end, depth)
+    }
+  }
+
+fn finish_iscan_rev(span: String, end: Int, st: IScan) : [IPart] =
+  iscan_flush(span, IScan { ...st, i: end })
+
+#[doc("Where the body of a `#{...}` that opens at `p` starts.")]
+pub(pkg) fn interp_pos_body(p: InterpPos) : InterpPos = InterpPos { line: p.line, col: p.col + 2 }
+
+#[doc("The position after the `}` that closes a body `src` starting at `body`.")]
+pub(pkg) fn interp_pos_past(body: InterpPos, src: String) : InterpPos {
+  let after = interp_pos_advance(body, src, 0)
+  InterpPos { line: after.line, col: after.col + 1 }
+}
+
+#[doc("`p` moved past `s` from index `i` on. A triple-quoted literal spans lines, and a newline starts the next one at column 1.")]
+pub(pkg) fn interp_pos_advance(p: InterpPos, s: String, i: Int) : InterpPos =
+  if i >= string_length(s) { p }
+  else {
+    let nxt = if char_at(s, i) == Some('\n') { InterpPos { line: p.line + 1, col: 1 } }
+              else { InterpPos { line: p.line, col: p.col + 1 } }
+    interp_pos_advance(nxt, s, i + 1)
+  }
