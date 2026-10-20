@@ -1,0 +1,418 @@
+# FFI return kinds, protocol impl rows and protocol ids.
+
+import compiler.ast
+import compiler.core_refs
+import compiler.core_types
+import compiler.emit_shared_rows
+import compiler.emit_shared_syms
+import compiler.fn_index
+import compiler.fnreg
+import compiler.head_tag_decl
+import compiler.proto_ids
+import compiler.symtab
+import compiler.written
+
+# m12.7.x FFI v1: enumeration of the supported return kinds plus an
+# escape hatch (`FfiRetUnknown`) carrying the offending type name so
+# the emitted `#error` can name it back to the user.
+#[doc("FFI marshalling kind of a boundary type: scalars (Int/Real/Bool/String/Unit), fixed-width annotations (`FfiRetFixed`), struct-by-value (`FfiRetStruct`, carrying the struct's declaration — fields looked up in the extern-type registry), and opaque handles (`FfiRetForeign`, carrying the handle's). `FfiRetUnknown` carries the offending type name so the emitted `#error` can name it.")]
+pub type FfiRetKind
+  = FfiRetUnit
+  | FfiRetInt
+  | FfiRetReal
+  | FfiRetBool
+  | FfiRetChar
+  | FfiRetString
+  | FfiRetFixed(FfiFixed)
+  # Numeric lane A: an honest fixed-width VALUE type (Int32/UInt32/
+  # UInt64/Int128) at the boundary. Unlike `FfiRetFixed` (the legacy
+  # I32/U32 annotation whose kaikai side is `Int`, unboxed via kai_intf),
+  # the kaikai side is a tagged fixed-width box, so marshalling reads its
+  # width field and re-boxes with the matching constructor.
+  | FfiRetFixedVal(Ty)
+  | FfiRetStruct(SymId)
+  | FfiRetForeign(SymId)
+  | FfiRetUnknown(String)
+
+#[doc("A fixed-width FFI-boundary scalar. Maps to a C `uintN_t`/`intN_t`/`float` at the boundary; the kaikai side stays `Int` (or `Real` for `F32`). C-cast semantics, no range-check.")]
+pub type FfiFixed = FxU8 | FxU16 | FxU32 | FxU64 | FxI8 | FxI16 | FxI32 | FxI64 | FxF32
+
+#[doc("The fixed-width annotation for `name`, or None if it is not one.")]
+pub fn ffi_fixed_of_name(name: String) : Option[FfiFixed] {
+  if name == "U8" { Some(FxU8) }
+  else if name == "U16" { Some(FxU16) }
+  else if name == "U32" { Some(FxU32) }
+  else if name == "U64" { Some(FxU64) }
+  else if name == "I8" { Some(FxI8) }
+  else if name == "I16" { Some(FxI16) }
+  else if name == "I32" { Some(FxI32) }
+  else if name == "I64" { Some(FxI64) }
+  else if name == "F32" { Some(FxF32) }
+  else { None }
+}
+
+#[doc("The C scalar type a fixed-width annotation maps to at the boundary.")]
+pub fn ffi_fixed_c_type(f: FfiFixed) : String = match f {
+  FxU8  -> "uint8_t"
+  FxU16 -> "uint16_t"
+  FxU32 -> "uint32_t"
+  FxU64 -> "uint64_t"
+  FxI8  -> "int8_t"
+  FxI16 -> "int16_t"
+  FxI32 -> "int32_t"
+  FxI64 -> "int64_t"
+  FxF32 -> "float"
+}
+
+#[doc("The C boundary type for an honest fixed-width value type (Int32 -> int32_t, etc.).")]
+pub fn fixed_val_c_type(t: Ty) : String = match t {
+  TyInt32  -> "int32_t"
+  TyUInt32 -> "uint32_t"
+  TyUInt64 -> "uint64_t"
+  _        -> "__int128"
+}
+
+#[doc("The KaiValue union field a fixed-width value box reads through (Int32 -> ->as.i32, etc.). Int32/UInt32/UInt64 only — Int128 is rejected at the FFI boundary, so its arm reads the low half defensively (no bare `->as.i128`, which the union no longer carries).")]
+pub fn fixed_val_box_field(t: Ty) : String = match t {
+  TyInt32  -> "->as.i32"
+  TyUInt32 -> "->as.u32"
+  TyUInt64 -> "->as.u64"
+  _        -> "->as.i128_halves[0]"
+}
+
+#[doc("The box constructor for a fixed-width value (Int32 -> kai_int32, etc.).")]
+pub fn fixed_val_box_ctor(t: Ty) : String = match t {
+  TyInt32  -> "kai_int32"
+  TyUInt32 -> "kai_uint32"
+  TyUInt64 -> "kai_uint64"
+  _        -> "kai_int128"
+}
+
+#[doc("True when a fixed-width annotation is the floating `F32` (carried on the kaikai side as `Real`, not `Int`).")]
+pub fn ffi_fixed_is_float(f: FfiFixed) : Bool = match f {
+  FxF32 -> true
+  _     -> false
+}
+
+#[doc("The bit width of a fixed-width annotation (8/16/32/64; `F32` is 32).")]
+pub fn ffi_fixed_bits(f: FfiFixed) : Int = match f {
+  FxU8  -> 8   FxI8  -> 8
+  FxU16 -> 16  FxI16 -> 16
+  FxU32 -> 32  FxI32 -> 32
+  FxU64 -> 64  FxI64 -> 64
+  FxF32 -> 32
+}
+
+#[doc("True when a fixed-width integer annotation is signed (`I*`); false for unsigned (`U*`). Drives sext vs zext on the boundary return. `F32` is false (not an integer).")]
+pub fn ffi_fixed_is_signed(f: FfiFixed) : Bool = match f {
+  FxI8 -> true   FxI16 -> true   FxI32 -> true   FxI64 -> true
+  _    -> false
+}
+
+#[doc("FFI marshalling helper: ret kind of.")]
+pub fn ffi_ret_kind_of(opt: Option[TypeExpr], tab: SymTab) : FfiRetKind {
+  match opt {
+    None -> FfiRetUnit
+    Some(t) -> ffi_kind_of_ty(t, tab)
+  }
+}
+
+# Registry-free classifier: handles v1 scalars + fixed-width
+# annotations (a closed global set). A non-primitive named type
+# becomes `FfiRetUnknown` here — the registry-AWARE classifier
+# (`ffi_kind_of_ty_reg`, compiler/ffi_v2.kai) upgrades a known extern
+# struct / opaque before the emitter consumes the result.
+#[doc("FFI marshalling helper: registry-free kind of a boundary type (v1 scalars + fixed-width). `tab` names a declared type the boundary does not support.")]
+pub fn ffi_kind_of_ty(t: TypeExpr, tab: SymTab) : FfiRetKind {
+  match t.tkind {
+    TyName(r, _) -> match resolve_ty(t) {
+      TyInt    -> FfiRetInt
+      TyReal   -> FfiRetReal
+      TyBool   -> FfiRetBool
+      TyChar   -> FfiRetChar
+      TyString -> FfiRetString
+      TyUnit   -> FfiRetUnit
+      TyInt32  -> FfiRetFixedVal(TyInt32)
+      TyUInt32 -> FfiRetFixedVal(TyUInt32)
+      TyUInt64 -> FfiRetFixedVal(TyUInt64)
+      TyInt128 -> FfiRetFixedVal(TyInt128)
+      # A width annotation resolves to no type of its own and declares
+      # nothing: the written name is all that carries the width.
+      _ -> match r {
+        DrWritten(_, w) -> match ffi_fixed_of_name(written_text(w)) {
+          Some(fx) -> FfiRetFixed(fx)
+          None     -> FfiRetUnknown(written_text(w))
+        }
+        DrSym(s) -> FfiRetUnknown(written_text(decl_name(tab, s)))
+      }
+    }
+    _ -> FfiRetUnknown("non-named type")
+  }
+}
+
+# Row for one impl method of a core protocol: the C symbol name, the
+# protocol, the name of the type the impl is for (its head), and the impl
+# fn's arity. Heterogeneous impls of one type collapse to the same
+# `(P, T)` dispatch key — the typer's compile-time rewrite already
+# routes the right arg-shape; the runtime only needs the head match.
+# The arity is needed by the LLVM emit to synthesise the bitcast
+# target type (`%KaiValue* (%KaiValue*, ...)*`) with the right number
+# of params — without it every impl would be bitcast to arity 1 and
+# clang rejects the mismatch (issue surfaced in release v0.83.x build).
+#
+# The fifth slot is the impl fn's unboxed signature, captured in situ
+# from the `EFn` registry by `collect_pimpl_rows`. `Some(US([Ty], Ty))`
+# means the builtin scalar impl (`Eq_Int_eq(int64_t,int64_t)`,
+# `Ord_Real_cmp(double,double)`, …) was classified by the unbox pass as
+# taking + returning raw C scalars — its C symbol does NOT have the
+# `KaiValue*(KaiValue*,KaiValue*)` shape the runtime dispatch sites
+# (`kai_op_eq` / `kai_op_lt` / `kai_op_gt`) cast to and call. Such rows
+# register a boxed shim (`&kai_<csym>__boxed`) in the impl table instead
+# of the raw pimpl; the raw pimpl stays reachable for the monomorphic
+# fast path. `None` means the impl already has the boxed
+# `KaiValue*(...)` shape (String / Unit / List / Option / Result); it is
+# registered directly unless it borrows a param. See `emit_impl_shim_defs`.
+#[doc("Row for one impl method of a core protocol: the impl function, the protocol, the type the impl targets, the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), the operation's number within the protocol, and the param positions Perceus made borrowed. The function registry spells the impl's symbol where the row is emitted.")]
+pub type PimplRow = PR(FnId, CoreProto, DeclRef, Int, Option[UFnSig], Int, [Int])
+
+#[doc("The rows of the impl methods among `ds`. `ids` says which functions are impl methods, of which protocol, type and operation; `fx` is the fn registry, holding each fn's unboxed signature (the unbox pass stamps it there).")]
+pub fn collect_pimpl_rows(ds: [Decl], fx: FnIndex, ids: ProtoIds, acc: [PimplRow]) : [PimplRow] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, fid, _, params, _, _, _, _, _, _) ->
+        match pimpl_row_of(fx, fid, ids, params) {
+          Some(row) -> collect_pimpl_rows(rest, fx, ids, [row, ...acc])
+          None      -> collect_pimpl_rows(rest, fx, ids, acc)
+        }
+      _ -> collect_pimpl_rows(rest, fx, ids, acc)
+    }
+  }
+}
+
+# The row of the fn `fid` when it is an impl method of a core protocol.
+# The table dispatches to the impl itself, never to a specialisation, and
+# holds no impl the structural compare stands in for.
+fn pimpl_row_of(fx: FnIndex, fid: FnId, ids: ProtoIds, params: [Param]) : Option[PimplRow] =
+  if fnid_inst(fid) != spec_none() or pid_is_walked(ids, fnid_sym(fid)) { None }
+  else { match pid_impl(ids, fnid_sym(fid)) {
+    Some(PIR(proto, target, op, _, _, _, _)) -> match core_proto_of(proto) {
+      Some(cp) -> {
+        let sig = fnx_ufn_sig_first(fx, fid)
+        Some(PR(fid, cp, target, list_length(params), sig, stdlib_proto_op_id_int(cp, written_text(op)),
+                pimpl_lent(params, pimpl_raw_flags(sig), 0)))
+      }
+      None -> None
+    }
+    None -> None
+  } }
+
+#[doc("The impl function of the row `pr`.")]
+pub fn pimpl_row_fn(pr: PimplRow) : FnId = match pr { PR(f, _, _, _, _, _, _) -> f }
+
+#[doc("The symbol the impl of the row `pr` is emitted under, as the registry `fx` has it.")]
+pub fn pimpl_csym(fx: FnIndex, pr: PimplRow) : String = match fnx_callee(fx, pimpl_row_fn(pr)) {
+  Some(e) -> efn_c_sym(e)
+  None    -> panic("identity: an impl row names a function the registry does not hold")
+}
+
+#[doc("The name an impl's target is emitted under: a comment beside its row.")]
+pub fn pimpl_target_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
+}
+
+# Only boxed params: a raw one reaches the impl unboxed and the adapter
+# already consumed its box.
+fn pimpl_lent(params: [Param], raw: [Bool], i: Int) : [Int] = match params {
+  [] -> []
+  [p, ...rest] -> {
+    let here = match raw {
+      [r, ..._] -> r
+      [] -> false
+    }
+    let more = match raw {
+      [_, ...rs] -> rs
+      [] -> []
+    }
+    let lent = pimpl_lent(rest, more, i + 1)
+    if p.pborrow and not here { [i, ...lent] } else { lent }
+  }
+}
+
+# Per-param raw flags; an unboxed signature with no mask is raw where scalar.
+fn pimpl_raw_flags(sig: Option[UFnSig]) : [Bool] = match sig {
+  Some(US(pts, _, [])) -> map(pts, (t) => ty_is_scalar(t))
+  Some(US(_, _, mask)) -> mask
+  None -> []
+}
+
+#[doc("The param positions the impl borrows; the dispatch table hands every argument owned, so its adapter drops these after the call.")]
+pub fn pimpl_row_lent(pr: PimplRow) : [Int] = match pr { PR(_, _, _, _, _, _, lent) -> lent }
+
+#[doc("True when the impl cannot sit in the dispatch table as is: its ABI is raw, or it borrows a param the table hands over owned.")]
+pub fn pimpl_row_needs_adapter(pr: PimplRow) : Bool = pimpl_row_is_unboxed(pr) or pimpl_row_lent(pr) != []
+
+#[doc("True when this pimpl row has an unboxed (raw-scalar) C signature and so needs a boxed shim before it can be registered in the impl table. A row is unboxed when the unbox pass classified it (`Some(US ...)`) AND it touches a raw scalar at the ABI boundary — either a scalar PARAM or a scalar RETURN. The return-only branch covers arity-0 impls like `Default` (`Default_Int_default() : Int` is emitted `i64 ()*` but the impl table bitcasts the slot to `%KaiValue* ()*` — clang's LLVM verifier rejects the mismatch; the C backend gets an implicit cast and only the LLVM smoke test catches it). issue fix-default-shim.")]
+pub fn pimpl_row_is_unboxed(pr: PimplRow) : Bool {
+  match pr {
+    PR(_, _, _, _, sig, _, _) -> match sig {
+      None -> false
+      Some(US(pts, rt, _)) -> any_param_scalar(pts) or ty_is_scalar(rt)
+    }
+  }
+}
+
+#[doc("True when any type in the list is a raw C scalar (Int/Bool/Char/Real), peeling Dim/Refine wrappers. The unbox pass only classifies a fn when every param + the return are scalar, so a non-empty scalar param implies the whole signature is unboxed.")]
+pub fn any_param_scalar(ts: [Ty]) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if ty_is_scalar(t) { true } else { any_param_scalar(rest) }
+  }
+}
+
+#[doc("True when a Ty is a raw C scalar (Int/Bool/Char/Byte/Real), peeling unit-of-measure and refinement wrappers.")]
+pub fn ty_is_scalar(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyReal -> true
+    TyBool -> true
+    TyChar -> true
+    TyByte -> true
+    TyInt32  -> true
+    TyUInt32 -> true
+    TyUInt64 -> true
+    TyInt128 -> true
+    TyDimT(inner, _)    -> ty_is_scalar(inner)
+    TyRefineT(inner, _) -> ty_is_scalar(inner)
+    _ -> false
+  }
+}
+
+# Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.
+
+# Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.
+#[doc("Substring-equality. Returns true if `s[i..i+|t|] == t`. Bounds-safe.")]
+pub fn substring_eq(s: String, i: Int, t: String) : Bool {
+  let tn = string_length(t)
+  let sn = string_length(s)
+  if i + tn > sn { false }
+  else { substring_eq_loop(s, i, t, 0, tn) }
+}
+
+#[doc("Tail loop comparing a substring against a needle character by character.")]
+pub fn substring_eq_loop(s: String, i: Int, t: String, k: Int, tn: Int) : Bool {
+  if k >= tn { true }
+  else {
+    let b = string_byte_at_int(s, i + k)
+    b >= 0 and b == string_byte_at_int(t, k) and substring_eq_loop(s, i, t, k + 1, tn)
+  }
+}
+
+# Find `needle` in `hay` starting at `from`. Returns length(hay) if
+# not found.
+
+# Find `needle` in `hay` starting at `from`. Returns length(hay) if
+# not found.
+#[doc("Find `needle` in `hay` starting at `from`. Returns length(hay) if not found.")]
+pub fn find_substring(hay: String, needle: String, from: Int) : Int {
+  let hn = string_length(hay)
+  if from >= hn { hn }
+  else if substring_eq(hay, from, needle) { from }
+  else { find_substring(hay, needle, from + 1) }
+}
+
+# C array body for the impl table. Each row maps the parsed proto/type
+# back to the integer constants pinned in runtime.h.
+
+# `kai_variant_to_head[]` — one int32_t per variant tag, mapping each
+# constructor to its sum-type head. The runtime indexes this array by
+# Tags are sparse (name-keyed), so no dense slot-per-tag array exists;
+# the runtime builds its indexed lookup from explicit (tag, head) pairs.
+#[doc("Variant-to-head map as flattened (variant_tag, head_tag) pairs, one pair per EVar entry. The runtime rebuilds its dense lookup from these; pairs impose no density assumption on the tag space.")]
+pub fn collect_variant_to_head(variants: [VariantEntry], decls: [Decl]) : [Int] =
+  collect_v2h_pairs(variants, decls, [])
+
+fn collect_v2h_pairs(vs: [VariantEntry], decls: [Decl], acc: [Int]) : [Int] {
+  match vs {
+    [] -> list_reverse(acc)
+    [EV(_, _, tag, c), ...rest] -> collect_v2h_pairs(rest, decls, [variant_head_tag(c, decls), tag, ...acc])
+  }
+}
+
+# A fixed row's sum has a reserved head; a declared constructor's is its declaration's.
+fn variant_head_tag(c: SymId, decls: [Decl]) : Int = match builtin_row_of(c) {
+  Some(r) -> rt_head_tag(r.head)
+  None    -> ctor_owner_head_tag(c, decls)
+}
+
+#[doc("The id the runtime impl table numbers the core protocol `p` with. The integer counterpart of `stdlib_proto_id_c`, shared by both the LLVM-text and in-process native impl-table registration.")]
+pub fn stdlib_proto_id_int(p: CoreProto) : Int = match p {
+  CpShow         -> 0
+  CpEq           -> 1
+  CpOrd          -> 2
+  CpHash         -> 3
+  CpSerialize    -> 4
+  CpBinSerialize -> 5
+  CpDefault      -> 6
+  CpAdd          -> 7
+  CpSub          -> 8
+  CpMul          -> 9
+  CpDiv          -> 10
+  CpRem          -> 11
+  CpNumeric      -> 12
+  CpLayout       -> 13
+  CpJson         -> 14
+  CpNeg          -> 15
+}
+
+# The operation index within a protocol. The impl table keys on
+# (proto_id, op_id, head_tag), so a multi-op protocol's ops (Ord.cmp/min/max,
+# Numeric.*) resolve distinctly instead of colliding on (proto_id, head_tag).
+# Single-op protocols are op 0. The exact value is irrelevant — only that it
+# is unique within a protocol and that both backends compute it from the same
+# function, so a C table entry and the native dispatch agree on the key.
+pub fn stdlib_proto_op_id_int(p: CoreProto, opname: String) : Int = match p {
+  CpOrd ->
+    if opname == "cmp" { 0 } else if opname == "min" { 1 } else { 2 }
+  CpNumeric -> numeric_op_id_int(opname)
+  CpSerialize ->
+    if opname == "to_string" { 0 } else { 1 }
+  CpBinSerialize ->
+    if opname == "to_bytes" { 0 } else { 1 }
+  CpLayout ->
+    if opname == "to_bytes" { 0 } else { 1 }
+  CpJson ->
+    if opname == "to_json" { 0 } else { 1 }
+  _ -> 0
+}
+
+#[doc("The core protocol a dispatcher's marker names. A dispatcher carries its protocol only as the name the marker spells.")]
+pub fn pdp_core(parts: ProtoDispatchParts) : Option[CoreProto] = match parts {
+  PDP(pname, _) -> core_proto_named(pname)
+}
+
+#[doc("True for the dispatcher of `Eq.eq`. Its dynamic dispatch is `==` itself: the structural compare looks a value's impl up by its head and compares a value with none member by member, so an impl reached from that compare continues it on what it holds.")]
+pub fn pdp_is_eq(parts: ProtoDispatchParts) : Bool = match pdp_core(parts) {
+  Some(CpEq) -> true
+  _          -> false
+}
+
+#[doc("The runtime protocol id a dispatcher looks its impl up under; -1 for a protocol the runtime impl table does not number.")]
+pub fn pdp_proto_id_int(parts: ProtoDispatchParts) : Int = match pdp_core(parts) {
+  Some(cp) -> stdlib_proto_id_int(cp)
+  None     -> 0 - 1
+}
+
+#[doc("The runtime op id a dispatcher looks its impl up under; 0 for a protocol the runtime impl table does not number.")]
+pub fn pdp_op_id_int(parts: ProtoDispatchParts) : Int = match parts {
+  PDP(_, opname) -> match pdp_core(parts) {
+    Some(cp) -> stdlib_proto_op_id_int(cp, opname)
+    None     -> 0
+  }
+}
+
+fn numeric_op_id_int(opname: String) : Int =
+  if opname == "add" { 0 } else if opname == "mul" { 1 } else if opname == "zero" { 2 }
+  else if opname == "one" { 3 } else if opname == "abs" { 4 } else if opname == "sign" { 5 }
+  else if opname == "pow_int" { 6 } else if opname == "clamp" { 7 } else { 8 }

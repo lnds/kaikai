@@ -1,0 +1,419 @@
+# Effect rows and defaults, type display text and protocol-dispatch markers.
+
+import compiler.ast
+import compiler.core_types
+import compiler.entry
+import compiler.evidence_scan
+import compiler.fnreg
+import compiler.handler_alias
+import compiler.infer_handle_walk
+import compiler.infer_state
+import compiler.infer_unit_tables
+import compiler.resolve_program
+import compiler.symtab
+import compiler.type_text
+import compiler.util
+import compiler.written
+
+#[doc("The effects of the entry fn's declared row, the ones its default-handler wrapper installs.")]
+pub fn main_row_labels(decls: [Decl], entry: SymId) : [SymId] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DFn(_, fid, _, _, _, row, _, _, _, _) ->
+        if is_entry(entry, fid) {
+          match row {
+            REmpty       -> []
+            RClosed(lbs) -> es_row_label_syms(lbs)
+            ROpen(_, lbs) -> es_row_label_syms(lbs)
+          }
+        } else { main_row_labels(rest, entry) }
+      _ -> main_row_labels(rest, entry)
+    }
+  }
+}
+
+# Effects whose default handler is installed at the base of the
+# evidence stack UNCONDITIONALLY — present around `kai_main` whether
+# or not the effect appears in `main`'s inferred row.
+#
+# The general criterion (issue #531): an effect E is *base-installable*
+# iff (a) it has a non-parametric default handler that can be installed
+# statically (no user-supplied init), AND (b) it has no per-instance
+# resources whose teardown must run before `kai_main` returns. `Mutable`
+# qualifies: its default forwards each op to a `kai_core_*` C
+# primitive, it carries no state, and a never-touched default is inert.
+# `Stdout` fails (b) — flushing must be observable per call, not deferred
+# to a base handler nobody asked for; `State` / `Spawn` / `Cancel` fail
+# (a) — they need a user-supplied initial value or scheduler.
+#
+# Installing the base default unconditionally is what makes masking
+# `Mutable` for ANY local mutable value (Array, Ref, HashMap, future
+# Matrix/Tensor) trivially sound: the masking pass may drop `Mutable`
+# from a fn's row knowing the dispatch site always finds a handler. A
+# user `handle { } with Mutable { }` pushes ABOVE this base node, so
+# LIFO dispatch still resolves a user op to the user handler.
+#
+# Generalising the unconditional install to other effects is purely
+# additive (extend this list) and deliberately out of scope here.
+pub fn unconditional_default_effects() : [SymId] = [core_effect_id(CeMutable)]
+
+# Add every base-installable effect (`unconditional_default_effects`)
+# to `main_row` that is not already present. DEDUP is load-bearing: the
+# result must stay a SET so the install/teardown push/pop derived from
+# it (both filter `install_order` against this same row) stays LIFO-
+# balanced — a duplicated `Mutable` would otherwise risk a second push
+# with no matching pop in any consumer that iterates the row directly.
+pub fn ensure_unconditional_defaults(main_row: [SymId]) : [SymId] =
+  add_missing_effects(unconditional_default_effects(), main_row)
+
+# An extern-default effect a lexical handler absorbed from main's row still
+# needs its default node installed: a spawned fiber starts with an empty
+# evidence stack (the parent handler does not cross the spawn boundary) and
+# resolves the effect to that default, not to a zero-init node. Both backends
+# add these back to the default-install set.
+#[doc("Extern-default effects handled by some `handle` in the program — the set a lexical parent handler absorbs from main's row.")]
+pub fn default_effects_absorbed_by_handler(decls: [Decl]) : [SymId] =
+  effects_absorbed_loop(collect_effect_ids(decls), decls)
+
+fn effects_absorbed_loop(rem: [SymId], decls: [Decl]) : [SymId] = match rem {
+  []           -> []
+  [e, ...rest] ->
+    if effect_default_block_all_extern(e, decls) and obl_eff_handled_anywhere(decls, decls, e) {
+      [e, ...effects_absorbed_loop(rest, decls)]
+    } else { effects_absorbed_loop(rest, decls) }
+}
+
+#[doc("The effects a test, bench or check entry installs a default handler for: every effect whose default block is all-extern. A runner body has no row of its own, so it may perform any of them.")]
+pub fn runner_entry_row(decls: [Decl]) : [SymId] =
+  filter(collect_effect_ids(decls), (e) => effect_default_block_all_extern(e, decls))
+
+#[doc("Append each effect in `extra` not already present in `row`; preserves `row` as a set.")]
+pub fn add_missing_effects(extra: [SymId], row: [SymId]) : [SymId] = match extra {
+  []           -> row
+  [e, ...rest] ->
+    if effect_in_row(row, e) { add_missing_effects(rest, row) }
+    else { add_missing_effects(rest, [e, ...row]) }
+}
+
+fn effect_in_row(row: [SymId], e: SymId) : Bool = match row {
+  []           -> false
+  [h, ...rest] -> sym_same(h, e) or effect_in_row(rest, e)
+}
+
+# m12.8 Phase 4b: atomic Stdout / Stderr default setups. The
+# combined `Console` is an alias `type Console = Stdout + Stderr`,
+# so a `main` declaring `/ Console` installs BOTH the Stdout and
+# Stderr default handlers via the alias-expansion path in
+# `default_setups_for`.
+#
+# Issue #115: the runtime `kai_default_*` handlers in stage0/runtime.h
+# take `void *self` because the runtime header cannot know the
+# emitted `EvStdout` / `EvStderr` / ... types. Casting their
+# addresses to typed function pointers (`(KaiValue *(*)(EvStdout *,
+# ...))`) is a representation-equivalent cast in C, but UBSan's
+# `-fsanitize=function` (active in clang's `-fsanitize=undefined`
+# on Linux; absent from Apple clang's default `undefined` set)
+# checks at every indirect call that the *function definition's*
+# type tag equals the function pointer's static type. The cast
+# does not change the function definition's type tag, so every
+# dispatch through `_ev_op->print(...)` etc. trips the check on
+# Linux while passing on macOS.
+#
+# Fix: emit a thin typed shim per default-op at file scope
+# (`_kai_default_<eff>_<op>_shim`). The shim has the typed
+# signature matching the struct field, forwards to the runtime
+# void-self function via a regular call (not subject to
+# `-fsanitize=function`). Setup assigns the shim's address; no
+# cast required at the assignment, no UBSan diagnostic at the
+# dispatch site.
+# Issue #556: derive a default-handler shim from a user-declared
+# `default { }` block whose clause bodies are `$extern_handler("c_sym")`.
+# The shim shape mirrors the hardcoded family above:
+#     static KaiValue *_kai_default_<eff_lc>_<op>_shim(Ev<Eff> *self,
+#         KaiValue *kai_<arg>, ..., KaiCont *k) {
+#         return <c_sym>(self, kai_<arg>, ..., k);
+#     }
+# Returns "" when the effect has no default block, or when the block's
+# clauses do not all bridge to extern_handler (the latter case is a
+# user-declared effect with kaikai-bodied default; Stage C will lower
+# those, but Stage A's codegen scope is the extern_handler bridge only).
+
+#[doc("The `default { }` block the effect `eff` declares; None when it is not declared or declares none.")]
+pub fn find_effect_default_block(eff: SymId, decls: [Decl]) : Option[DefaultBlock] =
+  effect_decl_default(effect_decl_of(eff, decls))
+
+# The default-handler shims and the evidence static mint their `Ev`
+# struct name from this module, so they target the struct that carries
+# the default block's ops.
+#[doc("Module qualifier of the effect `eff` when it declares a `default { }` block; None otherwise.")]
+pub fn default_block_owner_mo(eff: SymId, decls: [Decl]) : Option[String] = match effect_decl_of(eff, decls) {
+  Some(DEffect(_, _, _, _, Some(_), _, _, mo)) -> mo
+  _ -> None
+}
+
+# The strict test main absorption uses: every clause must bridge to an `extern_handler`
+# intrinsic. Stage A's codegen only knows how to lower those — a
+# kaikai-bodied clause has no emitter path yet (Stage C). Treating
+# effects with kaikai-bodied defaults as absorbed would type-check
+# clean and segfault at runtime, so the typer holds back until codegen
+# can match.
+#[doc("True when the effect `eff` declares a `default { }` block whose every clause bridges to `$extern_handler`, the only shape codegen installs.")]
+pub fn effect_default_block_all_extern(eff: SymId, decls: [Decl]) : Bool =
+  effect_decl_default_all_extern(effect_decl_of(eff, decls))
+
+# Search the handle stack for the topmost frame matching `eff_name`.
+# Step 2 (clause-merge) and step 3 (handle-with-default) both require
+# the topmost frame; step 1 fires when that frame's clauses list `op`.
+
+# m7a #7 + m7b #2b + m8 #2/#4 + m12.8 Phase 4b: assemble the full
+# setup block for the builtins listed in `main`'s row. Push order
+# Stdout → Stderr → Stdin → Env → File → Mutable → Cancel →
+# Spawn matches Doc B §*Installation order*: Spawn innermost (last
+# pushed, first looked up); Cancel the layer below it (root nursery
+# flags fibers, Cancel handler unwinds); Mutable below Cancel (I/O
+# cluster). Phase 4b: `Console` acts as the alias `Stdout + Stderr`,
+# so a row containing it triggers both setups.
+
+#[doc("The C symbol an extern fn binds to: the body's override payload, or the kaikai name when empty.")]
+pub fn ffi_extern_symbol_of(body: Expr, default_name: String) : String {
+  match body.kind {
+    EExternBody(_, over) -> if string_length(over) > 0 { over } else { default_name }
+    _ -> default_name
+  }
+}
+
+# Protocol-dispatch runtime shim (opción C).
+#
+# A dispatcher fn (`__proto_<op>`) whose body is the tag
+# `__kai_proto_dispatch__:<P>:<op>` signals codegen to emit a custom
+# C/LLVM body that looks up the impl in the runtime hashmap by
+# `(proto_id, head_tag)` and tail-calls it. The dispatcher fn shape
+# (params, return type) is unchanged so the typer / monomorphiser see
+# a regular polymorphic call.
+
+#[doc("Protocol-dispatch marker decoder: tag prefix.")]
+pub fn proto_dispatch_tag_prefix() : String = "__kai_proto_dispatch__:"
+
+#[doc("True if a function body is a single protocol-dispatch marker call.")]
+pub fn body_is_proto_dispatch(body: Expr) : Bool {
+  proto_dispatch_marker_in(body)
+}
+
+# The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus'
+# exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))`
+# before codegen sees it. Walk through the EBlock / EIf / EMatch shells
+# the lowering may wrap around the marker and look for the ETodo with
+# our prefix on the tail position.
+
+# The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus'
+# exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))`
+# before codegen sees it. Walk through the EBlock / EIf / EMatch shells
+# the lowering may wrap around the marker and look for the ETodo with
+# our prefix on the tail position.
+#[doc("The dispatcher's body starts as a bare `ETodo(marker)`, but Perceus' exit-drop wrap can re-shape it into `EBlock([_drop kai_x...], Some(ETodo))` before codegen sees it. Walk…")]
+pub fn proto_dispatch_marker_in(e: Expr) : Bool {
+  match e.kind {
+    ETodo(msg)             -> string_starts_with_q(msg, proto_dispatch_tag_prefix())
+    EBlock(_, Some(tail))  -> proto_dispatch_marker_in(tail)
+    _                      -> false
+  }
+}
+
+#[doc("Decoded protocol-dispatch marker parts (proto name, qualifier).")]
+pub type ProtoDispatchParts = PDP(String, String)
+
+# Build the dispatcher body marker: `__kai_proto_dispatch__:<P>:<op>`.
+
+# Parse the marker back into (P, op). Caller must have established
+# `body_is_proto_dispatch` first. Walks through Perceus' exit-drop
+# wrap (EBlock-with-tail) to reach the underlying ETodo marker.
+#[doc("Parse the marker back into (P, op). Caller must have established `body_is_proto_dispatch` first. Walks through Perceus' exit-drop wrap (EBlock-with-tail) to reach the…")]
+pub fn proto_dispatch_parts(body: Expr) : ProtoDispatchParts {
+  match body.kind {
+    ETodo(msg) -> {
+      let payload = string_slice(msg, string_length(proto_dispatch_tag_prefix()),
+                                  string_length(msg) - string_length(proto_dispatch_tag_prefix()))
+      let idx = find_colon(payload, 0)
+      let pname = string_slice(payload, 0, idx)
+      let opname = string_slice(payload, idx + 1, string_length(payload) - (idx + 1))
+      PDP(pname, opname)
+    }
+    EBlock(_, Some(tail)) -> proto_dispatch_parts(tail)
+    _                     -> PDP("?", "?")
+  }
+}
+
+# Find the first ':' starting at `from`. Returns string length if not
+# found. The dispatcher marker always contains exactly one ':' so this
+# helper is sufficient (no escaping concerns).
+
+# Find the first ':' starting at `from`. Returns string length if not
+# found. The dispatcher marker always contains exactly one ':' so this
+# helper is sufficient (no escaping concerns).
+#[doc("Find the first ':' starting at `from`. Returns string length if not found. The dispatcher marker always contains exactly one ':' so this helper is sufficient (no escaping…")]
+pub fn find_colon(s: String, from: Int) : Int {
+  let n = string_length(s)
+  if from >= n { n }
+  else {
+    match char_at(s, from) {
+      Some(c) -> if c == ':' { from } else { find_colon(s, from + 1) }
+      None    -> n
+    }
+  }
+}
+
+#[doc("Render each Ty of a list; `tab` names the nominal types.")]
+pub fn ty_string_list(tab: SymTab, ts: [Ty]) : [String] = map(ts, (t) => ty_to_string(tab, t))
+
+#[doc("Render a Ty to its display string (shared by the emitters and the dump queries); `tab` names the nominal types.")]
+pub fn ty_to_string(tab: SymTab, t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
+    TyHandle   -> "Handle"
+    TyListT(inner) -> cat3("[", ty_to_string(tab, inner), "]")
+    # m7b #11k: render the function type's effect row alongside the
+    # arrow when non-empty, with each label printed as `Eff` or
+    # `Eff[T1, T2]` so parametric-effect mismatches (Reader[Int] vs
+    # Reader[String]) are visible in `expected/found` notes.
+    TyFnT(ps, ret, row) -> concat_all([
+      "(", join_with(ty_string_list(tab, ps), ", "), ") -> ",
+      ty_to_string(tab, ret),
+      row_to_string_suffix(tab, row)
+    ])
+    TyCon(s, tas) -> {
+      let cname = written_text(decl_name(tab, s))
+      match tas {
+        [] -> cname
+        _ -> concat_all([cname, "[", join_with(ty_string_list(tab, tas), ", "), "]"])
+      }
+    }
+    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyShapeApp(sv, arg) -> concat_all(["?s", int_to_string(sv), "[", ty_to_string(tab, arg), "]"])
+    TyAny -> "?"
+    # m12.5: render dimensioned base types as `Real<u>` / `Int<u>`.
+    # The unit goes through unit_canon so the printed form matches
+    # what the unifier compares against — same shape on every side.
+    TyDimT(base, u) -> concat_all([ty_to_string(tab, base), "<", unit_canon_display(u), ">"])
+    # m12.6.x #1: render `T where ...` for diagnostics. The predicate
+    # is left as `<pred>` to keep the line short; full predicate text
+    # lands with the diagnostics-quality pass (m12.6.x #8).
+    TyRefineT(base, _) -> concat_all([ty_to_string(tab, base), " where <pred>"])
+    # issue #187 phase 1: render unions inline as `A | B | C` to match
+    # surface syntax. Components are already in canonical order when
+    # the walker receives them via `normalize_union`.
+    TyUnion(parts) -> join_with(ty_string_list(tab, parts), " | ")
+  }
+}
+
+# m12.5: render a UnitExprT in canonical form for diagnostics. Sorts
+# symbols alphabetically and groups powers, so `kg * m` and `m * kg`
+# render identically.
+
+# m12.5: render a UnitExprT in canonical form for diagnostics. Sorts
+# symbols alphabetically and groups powers, so `kg * m` and `m * kg`
+# render identically.
+#[doc("render a UnitExprT in canonical form for diagnostics. Sorts symbols alphabetically and groups powers, so `kg * m` and `m * kg` render identically.")]
+pub fn unit_canon_display(u: UnitExprT) : String = unit_text(unit_canon(u))
+
+# m12.8.x phase 2 (Gap 1, partial): extract the canonical unit symbol
+# of a dimensioned type for the `unit_name` compile-time intrinsic.
+# Bare types and unresolved unit-vars yield the empty string so the
+# emitter never produces an LLVM/C error from a missing dimension.
+
+# m12.8.x phase 2 (Gap 1, partial): extract the canonical unit symbol
+# of a dimensioned type for the `unit_name` compile-time intrinsic.
+# Bare types and unresolved unit-vars yield the empty string so the
+# emitter never produces an LLVM/C error from a missing dimension.
+#[doc("x phase 2 (Gap 1, partial): extract the canonical unit symbol of a dimensioned type for the `unit_name` compile-time intrinsic. Bare types and unresolved unit-vars yield the…")]
+pub fn unit_name_of_ty(ot: Option[Ty]) : String {
+  match ot {
+    Some(t) -> match t {
+      TyDimT(_, u) -> match unit_canon(u) {
+        UVar(_) -> ""
+        UOne    -> ""
+        cu      -> unit_text(cu)
+      }
+      _ -> ""
+    }
+    None -> ""
+  }
+}
+
+# m4c #2 — name-mangling helpers for monomorphisation.
+#
+# `mangle_name(name, [Ty]) : String` produces a deterministic,
+# C-identifier-safe name for a polymorphic decl instantiated at a
+# concrete type tuple. The empty tuple maps back to `name` (no
+# instantiation, e.g. fully monomorphic decls). For non-empty tuples
+# the form is `name__mono__T1[__T2...]`, with each `Tn` rendered by
+# `mangle_ty` using bracketed sentinels (`L_..._E` for lists,
+# `_O_..._C` for type-constructor argument lists, `F_..._R_..._E`
+# for function arrows). The sentinels make the encoding unambiguous:
+# `Foo[Bar]` and a hypothetical user fn named `Foo_Bar` cannot
+# collide. Effects are erased — two instantiations that differ only
+# in the row of an inner `TyFnT` mangle the same, by design (Perceus
+# operates on values, not on rows).
+#
+# The mangler errors implicitly on `TyVarT` / `TyAny`: a resolved
+# call-site tuple should not contain unresolved variables. If one
+# slips through the renderer emits `TVAR` / `Any` and the resulting
+# duplicate is caught by the m4c #3 collision check.
+
+# Render a Row as the ` / Eff1 + Eff2` suffix used in fn-type
+# strings. Empty row → empty string. Open row tail → trailing
+# `+ ?eN`. Each label uses `label_to_string` so type args render.
+#[doc("Render a Row as the ` / Eff1 + Eff2` suffix used in fn-type strings. Empty row → empty string. Open row tail → trailing `+ ?eN`. Each label uses `label_to_string` so type args…")]
+pub fn row_to_string_suffix(tab: SymTab, r: Row) : String {
+  # Issue #645: a row with no labels is treated as "pure" in display
+  # form, whether its tail is None (truly closed empty) or Some(_)
+  # (a free row var with no demand on it — the phantom that
+  # `fn_scheme_of_decl` inserts for REmpty signatures, or any fresh
+  # row var introduced by instantiation and never constrained). The
+  # tail variable is internal bookkeeping; showing `?eN` to users
+  # mis-suggests they need to annotate the function. Diagnostics for
+  # actual row mismatches still print the `expected` and `found`
+  # rows in full (those rows carry labels by the time the mismatch
+  # is reported).
+  let body =
+    if labels_empty(r.labels) {
+      ""
+    } else {
+      let lbs = join_with(map(r.labels, (l) => label_to_string(tab, l)), " + ")
+      let tail_s = match r.tail {
+        None -> ""
+        Some(v) -> {
+          let pre = if string_length(lbs) > 0 { " + " } else { "" }
+          concat_all([pre, "?e", int_to_string(v)])
+        }
+      }
+      concat_all([" / ", lbs, tail_s])
+    }
+  body
+}
+
+# Dump the declared signature (or shape) of every top-level decl. Used
+# by `--types`; does not attempt to infer bodies, just surfaces what
+# the user wrote.
+
+# downward glue mirrors (es_ prefix) — originals in main head/driver
+
+# The effects a row's labels name. A label still written names no effect
+# (a row alias), and a parametric effect is one effect whatever it is
+# applied to.
+fn es_row_label_syms(labels: [RowLabel]) : [SymId] = match labels {
+  []           -> []
+  [l, ...rest] ->
+    if sym_raw(rl_sym(l)) >= 0 { [rl_sym(l), ...es_row_label_syms(rest)] }
+    else { es_row_label_syms(rest) }
+}

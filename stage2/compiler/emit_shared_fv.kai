@@ -1,0 +1,406 @@
+# Free variables and captures of lambdas and handler clauses.
+
+import compiler.ast
+import compiler.emit_shared_syms
+import compiler.enc_unit
+import compiler.handler_alias
+import compiler.infer_clause_holes
+import compiler.local_names
+import compiler.ret_slots
+import compiler.util
+
+# The enclosing unit is the cross-module discriminator: `(line, col)`
+# alone collides when two modules have a lambda at the same source
+# position, so `find_lam` keys on the unit and the position.
+#[doc("What a lifted body takes from the frame around it: the value of a local, or the handler id a cell alias names. The list order is the closure's capture array and a handle's env layout.")]
+pub type Capture = CapLocal(LocalId) | CapAlias(LocalId)
+
+#[doc("Lifted lambda descriptor (binder names of the enclosing declaration, enclosing unit, line, col, params, captures, body, module) for closure emission.")]
+pub type LamInfo = LamInfo(LocalNames, EncFn, Int, Int, [Param], [Capture], Expr, Option[String])
+
+# The lambda's C symbol derives from its enclosing unit's and its
+# position, not from a program-global counter, so a lambda added in one
+# module cannot rename the lifted symbols of another.
+#[doc("C symbol of a lifted lambda at a position inside the unit emitted as `enc_fn`.")]
+pub fn lam_symbol_at(enc_fn: String, line: Int, col: Int) : String =
+  concat_all(["_kaiu_lam_", enc_fn, "_", int_to_string(line), "_", int_to_string(col)])
+
+#[doc("The unit of the lambda at a position inside `outer`, and its symbol.")]
+pub fn lam_enc(outer: EncFn, line: Int, col: Int) : EncFn =
+  EncFn { unit: EuLam(outer.unit, line, col), sym: lam_symbol_at(outer.sym, line, col) }
+
+#[doc("The unit a lifted lambda is.")]
+pub fn lam_unit(l: LamInfo) : EncFn = match l {
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_enc(ef, ln, cl)
+}
+
+#[doc("C symbol of a lifted lambda from its LamInfo.")]
+pub fn lam_symbol(l: LamInfo) : String = match l {
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_symbol_at(ef.sym, ln, cl)
+}
+
+#[doc("The binder names of the declaration a lifted lambda sits in: its body and its captures are spelled from them.")]
+pub fn lam_locals(l: LamInfo) : LocalNames = match l {
+  LamInfo(ns, _, _, _, _, _, _, _) -> ns
+}
+
+# The handle's position plus the clause head names the clause; the
+# enclosing fn keys its symbol, since two specialisations of one body
+# share a position. The last param is the continuation. The captures are
+# what the handle's env threads in from its frame: the clause body is
+# free in them given its params and the state aliases it binds.
+#[doc("A handler clause lifted to a top-level function: (handle line, handle col, binder names of the enclosing declaration, head, params, body, stateful, enclosing unit, captures, module, effect handled).")]
+pub type ClauseInfo = CI(Int, Int, LocalNames, ClauseHead, [Param], Expr, Bool, EncFn, [Capture], Option[String], SymId)
+
+#[doc("A handle: (line, col, enclosing unit, effect handled). Its handler exists whatever clauses it carries.")]
+pub type HandleInfo = HI(Int, Int, EncFn, SymId)
+
+#[doc("The symbol a handler clause's body lifts into; it is the enclosing fn of the lambdas and handles nested in that body.")]
+pub fn clause_body_sym(enc_fn: String, line: Int, col: Int, head: ClauseHead) : String =
+  if is_lifecycle_clause(head) { user_cleanup_sym(enc_fn, line, col) }
+  else { user_clause_sym(enc_fn, line, col, clause_head_word(head)) }
+
+#[doc("The unit a clause of the handle at a position inside `outer` lifts into, and its symbol: it is the enclosing unit of the lambdas and handles nested in the clause's body.")]
+pub fn clause_enc(outer: EncFn, line: Int, col: Int, head: ClauseHead) : EncFn =
+  EncFn { unit: if is_lifecycle_clause(head) { EuFinally(outer.unit, line, col) }
+                else { EuClause(outer.unit, line, col, clause_head_word(head)) },
+          sym: clause_body_sym(outer.sym, line, col, head) }
+
+#[doc("The unit a recorded clause's body lifts into.")]
+pub fn clause_unit(c: ClauseInfo) : EncFn = match c {
+  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_enc(enc_fn, line, col, head)
+}
+
+#[doc("The symbol a recorded clause's body lifts into.")]
+pub fn clause_sym(c: ClauseInfo) : String = match c {
+  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_body_sym(enc_fn.sym, line, col, head)
+}
+
+#[doc("The binder names of the declaration a recorded clause sits in.")]
+pub fn clause_locals(c: ClauseInfo) : LocalNames = match c {
+  CI(_, _, ns, _, _, _, _, _, _, _, _) -> ns
+}
+
+#[doc("Look up a lifted lambda by its enclosing unit and source position: unique even when two modules share a lambda at the same line/col.")]
+pub fn find_lam(lams: [LamInfo], enc_fn: EncFn, line: Int, col: Int) : Option[LamInfo] {
+  match lams {
+    [] -> None
+    [l, ...rest] -> match l {
+      LamInfo(_, ef, ln, cl, _, _, _, _) ->
+        if ln == line and cl == col and enc_same(ef, enc_fn) { Some(l) }
+        else { find_lam(rest, enc_fn, line, col) }
+    }
+  }
+}
+
+#[doc("What surrounds a walked body: the binders in scope around it, innermost first, and the handler aliases among them. The binders say whether an enclosing clause already binds a state alias; an alias is reached through its handler, never captured as a value.")]
+pub type FvOuter = { binders: [Binder], aliases: [LocalId] }
+
+#[doc("A body with nothing in scope around it.")]
+pub fn fv_outer_empty() : FvOuter = FvOuter { binders: [], aliases: [] }
+
+#[doc("A body with `binders` in scope around it, none of them a handler alias.")]
+pub fn fv_outer_of(binders: [Binder]) : FvOuter = FvOuter { binders: binders, aliases: [] }
+
+pub(pkg) fn fv_outer_bind(o: FvOuter, added: [Binder]) : FvOuter =
+  FvOuter { binders: list_append(added, o.binders), aliases: o.aliases }
+
+pub(pkg) fn fv_outer_alias(o: FvOuter, a: Binder) : FvOuter =
+  FvOuter { binders: [a, ...o.binders], aliases: [a.id, ...o.aliases] }
+
+fn fv_binds(bs: [Binder], l: LocalId) : Bool = match bs {
+  []           -> false
+  [b, ...rest] -> local_eq(b.id, l) or fv_binds(rest, l)
+}
+
+#[doc("True when the binder `l` is among `ls`.")]
+pub fn local_among(ls: [LocalId], l: LocalId) : Bool = match ls {
+  []           -> false
+  [x, ...rest] -> local_eq(x, l) or local_among(rest, l)
+}
+
+fn fv_cap_same(a: Capture, b: Capture) : Bool = match a {
+  CapLocal(x) -> match b {
+    CapLocal(y) -> local_eq(x, y)
+    CapAlias(_) -> false
+  }
+  CapAlias(x) -> match b {
+    CapAlias(y) -> local_eq(x, y)
+    CapLocal(_) -> false
+  }
+}
+
+fn fv_add(c: Capture, acc: [Capture]) : [Capture] = if fv_captured(acc, c) { acc } else { [c, ...acc] }
+
+fn fv_captured(acc: [Capture], c: Capture) : Bool = match acc {
+  []           -> false
+  [h, ...rest] -> fv_cap_same(h, c) or fv_captured(rest, c)
+}
+
+# A read of the local `l`: a capture unless the walked body binds it.
+fn fv_local(l: LocalId, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] =
+  if fv_is_wrap_slot(l) or fv_binds(own, l) or local_among(outer.aliases, l) { acc }
+  else { fv_add(CapLocal(l), acc) }
+
+# A perform through a cell alias dispatches by the alias's handler id,
+# which the lifted body captures; through a receiver it reads that local.
+fn fv_op(r: OpRef, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] = match r.via {
+  ViaAmbient  -> acc
+  ViaAlias(a) -> if fv_binds(own, a) { acc } else { fv_add(CapAlias(a), acc) }
+  ViaRecv(x)  -> fv_local(x, own, outer, acc)
+}
+
+# The fn and arm result slots are synthetic binders a Perceus pass wraps a
+# body in; they materialise as match-scoped C locals at emit time, not as
+# kaikai-level bindings. Left inside a lambda body they would be asked to
+# capture a binding that does not exist, emitting C that references an
+# undeclared identifier.
+fn fv_is_wrap_slot(l: LocalId) : Bool =
+  local_eq(l, local_minted(ret_slot_name(RsFn))) or local_eq(l, local_minted(ret_slot_name(RsArm)))
+
+# What a clause body binds: its params, the canonical continuation, and
+# the state aliases `aliases`.
+pub(pkg) fn fv_clause_own(params: [Param], aliases: [Binder]) : [Binder] =
+  list_append(params_binders(params), [binder_minted(canonical_continuation()), ...aliases])
+
+# The state aliases a clause binds: an alias an enclosing clause already
+# binds stays that clause's.
+pub(pkg) fn fv_clause_aliases(own: [Binder], outer: FvOuter) : [Binder] =
+  map(clause_state_aliases((key) => fv_binds(own, local_minted(key)) or fv_binds(outer.binders, local_minted(key))), binder_minted)
+
+#[doc("The captures of an expression: every local it reads that `own`, the binders bound inside the walked body, does not bind. A nested lambda's captures are the enclosing body's too.")]
+pub fn fv_expr(x: Expr, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match x.kind {
+    EInt(_, _)  -> acc
+    EReal(_, _) -> acc
+    EIntLit(_) -> acc
+    EDecimalLit(_) -> acc
+    EFixed(_, _) -> acc
+    EBool(_) -> acc
+    EChar(_) -> acc
+    EStr(_, _) -> acc
+    EUnit -> acc
+    EName(_) -> acc
+    EMark(_) -> acc
+    # A lambda captures locals, never a top-level declaration.
+    ESym(_, _) -> acc
+    ELocal(l) -> fv_local(l, own, outer, acc)
+    EOp(r) -> fv_op(r, own, outer, acc)
+    EUnder -> acc
+    EPlaceholder -> acc
+    ECall(f, xs) -> fv_exprs(xs, own, outer, fv_expr(f, own, outer, acc))
+    EField(base, _) -> fv_expr(base, own, outer, acc)
+    EIndex(a, b) -> fv_expr(b, own, outer, fv_expr(a, own, outer, acc))
+    EBinop(_, a, b) -> fv_expr(b, own, outer, fv_expr(a, own, outer, acc))
+    EUnop(_, inner) -> fv_expr(inner, own, outer, acc)
+    EIf(c, a, opt_b) -> {
+      let acc1 = fv_expr(a, own, outer, fv_expr(c, own, outer, acc))
+      match opt_b { Some(b) -> fv_expr(b, own, outer, acc1) None -> acc1 }
+    }
+    EMatch(scr, arms) -> fv_arms(arms, own, outer, fv_expr(scr, own, outer, acc))
+    # A nested lambda computes its own capture list, but what it reads
+    # beyond its params must be visible in the enclosing body too: that
+    # body is where the nested closure's capture array is built.
+    ELambda(ps, body) -> fv_expr(body, list_append(params_binders(ps), own), outer, acc)
+    ETodo(_) -> acc
+    EExternBody(_, _) -> acc
+    EBang(inner) -> fv_expr(inner, own, outer, acc)
+    ERecordLit(_, fields) -> fv_field_inits(fields, own, outer, acc)
+    EList(elems) -> fv_list_elems(elems, own, outer, acc)
+    ERange(a, b, opt_step) -> {
+      let acc1 = fv_expr(b, own, outer, fv_expr(a, own, outer, acc))
+      match opt_step { Some(s) -> fv_expr(s, own, outer, acc1) None -> acc1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      # The trailing expression sees the bindings the statements introduced.
+      let r = fv_stmts_scoped(stmts, own, outer, acc)
+      match opt_final { Some(f) -> fv_expr(f, r.own, outer, r.acc) None -> r.acc }
+    }
+    EPipe(a, b) -> fv_expr(b, own, outer, fv_expr(a, own, outer, acc))
+    EDispatchPipe(_, a, b) -> fv_expr(b, own, outer, fv_expr(a, own, outer, acc))
+    EHole(_) -> acc
+    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let acc0 = match init_opt {
+        Some(ie) -> fv_expr(ie, own, outer, acc)
+        None     -> acc
+      }
+      # The alias is in scope inside the body only: not in `init`, which
+      # runs before the handler is installed, and not in the clauses.
+      let own_body = match alias_opt {
+        Some(a) -> [a, ...own]
+        None    -> own
+      }
+      let acc1 = fv_expr(body, own_body, outer, acc0)
+      let acc2 = fv_hclauses(clauses, own, outer, acc1)
+      match ret_opt { Some(r) -> fv_hreturn(r, own, outer, acc2) None -> acc2 }
+    }
+    ELitUnit(inner, _) -> fv_expr(inner, own, outer, acc)
+    EVariantsOf(_, _) -> acc
+    EModCall(_, _) -> acc
+    EIntrinsic(_, args_) -> fv_exprs(args_, own, outer, acc)
+    ESurface(sf) -> fv_exprs(surface_children(sf), own, outer, acc)
+  }
+}
+
+#[doc("Free-variable collector over hclauses.")]
+pub fn fv_hclauses(cs: [HClause], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, params, body, _, _) -> {
+        let own1 = list_append(fv_clause_own(params, fv_clause_aliases(own, outer)), own)
+        let acc1 = fv_expr(body, own1, outer, acc)
+        fv_hclauses(rest, own, outer, acc1)
+      }
+    }
+  }
+}
+
+#[doc("Free-variable collector over hreturn.")]
+pub fn fv_hreturn(r: HReturn, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match r {
+    HR(b, body, _, _) ->
+      fv_expr(body, [b, ...list_append(fv_clause_aliases(own, outer), own)], outer, acc)
+  }
+}
+
+#[doc("Free-variable collector over exprs.")]
+pub fn fv_exprs(xs: [Expr], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match xs {
+    [] -> acc
+    [h, ...rest] -> fv_exprs(rest, own, outer, fv_expr(h, own, outer, acc))
+  }
+}
+
+#[doc("Free-variable collector over arms.")]
+pub fn fv_arms(arms: [Arm], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        # The pattern's binders are bound in the guard and the body.
+        let own1 = pat_bindings(pat, own)
+        let acc1 = match opt_g { Some(g) -> fv_expr(g, own1, outer, acc) None -> acc }
+        fv_arms(rest, own, outer, fv_expr(body, own1, outer, acc1))
+      }
+    }
+  }
+}
+
+#[doc("The binders a pattern declares, consed onto `acc`.")]
+pub fn pat_bindings(pat: Pattern, acc: [Binder]) : [Binder] {
+  match pat.pkind {
+    PWild -> acc
+    PLit(_) -> acc
+    PRange(_, _) -> acc
+    PBind(b) -> [b, ...acc]
+    PList(pats, opt_rest) -> {
+      let acc1 = pat_bindings_loop(pats, acc)
+      match opt_rest {
+        Some(rb) -> [rb, ...acc1]
+        None -> acc1
+      }
+    }
+    PVariant(_, subs) -> pat_bindings_loop(subs, acc)
+    PVariantRecord(_, fields) -> pfield_bindings_loop(fields, acc)
+    PRecord(fields) -> pfield_bindings_loop(fields, acc)
+    PHole(_) -> acc
+    PAs(b, sub) -> pat_bindings(sub, [b, ...acc])
+    PNarrow(b, _) -> [b, ...acc]
+    PSurface(sp) -> pat_bindings_loop(patsurface_children(sp), acc)
+  }
+}
+
+#[doc("Tail accumulator for pat_bindings: the binders a pattern list declares.")]
+pub fn pat_bindings_loop(ps: [Pattern], acc: [Binder]) : [Binder] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pat_bindings_loop(rest, pat_bindings(p, acc))
+  }
+}
+
+#[doc("Tail accumulator collecting the binders record-pattern fields declare.")]
+pub fn pfield_bindings_loop(fs: [PField], acc: [Binder]) : [Binder] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pfield_bindings_loop(rest, pat_bindings(sub, acc))
+    }
+  }
+}
+
+#[doc("Free-variable collector over field inits.")]
+pub fn fv_field_inits(fs: [FieldInit], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, val) -> fv_field_inits(rest, own, outer, fv_expr(val, own, outer, acc))
+    }
+  }
+}
+
+#[doc("Free-variable collector over list elems.")]
+pub fn fv_list_elems(es: [ListElem], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match es {
+    [] -> acc
+    [el, ...rest] -> match el {
+      ElPlain(x) -> fv_list_elems(rest, own, outer, fv_expr(x, own, outer, acc))
+      ElSpread(x) -> fv_list_elems(rest, own, outer, fv_expr(x, own, outer, acc))
+    }
+  }
+}
+
+#[doc("What a statement list leaves behind: the binders bound once every `let` / `var` in it has run, and the captures so far.")]
+pub type FvScoped = { own: [Binder], acc: [Capture] }
+
+#[doc("Free-variable collector over stmts scoped.")]
+pub fn fv_stmts_scoped(ss: [Stmt], own: [Binder], outer: FvOuter, acc: [Capture]) : FvScoped / Console {
+
+  match ss {
+    [] -> FvScoped { own: own, acc: acc }
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> {
+        let acc1 = fv_expr(rhs, own, outer, acc)
+        let own1 = pat_bindings(pat, own)
+        fv_stmts_scoped(rest, own1, outer, acc1)
+      }
+      SVar(b, _, rhs, _, _) -> {
+        let acc1 = fv_expr(rhs, own, outer, acc)
+        fv_stmts_scoped(rest, [b, ...own], outer, acc1)
+      }
+      _ -> fv_stmts_scoped(rest, own, outer, fv_stmt(s, own, outer, acc))
+    }
+  }
+}
+
+#[doc("Free-variable collector over stmt.")]
+pub fn fv_stmt(s: Stmt, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
+
+  match s {
+    SLet(_, _, rhs) -> fv_expr(rhs, own, outer, acc)
+    SAssert(c, opt_m) -> {
+      let acc1 = fv_expr(c, own, outer, acc)
+      match opt_m { Some(m) -> fv_expr(m, own, outer, acc1) None -> acc1 }
+    }
+    SExprStmt(x) -> fv_expr(x, own, outer, acc)
+    SIndexAssign(b, i, v, _, _) -> {
+      let acc1 = fv_expr(b, own, outer, acc)
+      let acc2 = fv_expr(i, own, outer, acc1)
+      fv_expr(v, own, outer, acc2)
+    }
+    SAssign(b, v, _, _) -> fv_expr(v, own, outer, fv_expr(b, own, outer, acc))
+    SVar(_, _, rhs, _, _) -> fv_expr(rhs, own, outer, acc)
+    SUse(_, _, _) -> acc
+  }
+}
+
+#[doc("The binders a parameter list declares.")]
+pub fn params_binders(ps: [Param]) : [Binder] =
+  map(ps, (pm) => pm.binder)
