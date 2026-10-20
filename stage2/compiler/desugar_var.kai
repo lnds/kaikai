@@ -95,8 +95,8 @@ fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
   let get_body = mk_expr(ECall(resume_e, [cell_e]), line, col)
   let set_body = mk_expr(ECall(resume_e, [unit_e, v_e]), line, col)
   [
-    HC(ChOp("get"), [p_resume], get_body, line, col),
-    HC(ChOp("set"), [p_v, p_resume], set_body, line, col)
+    HC(ChOp(cell_op_name(CellGet)), [p_resume], get_body, line, col),
+    HC(ChOp(cell_op_name(CellSet)), [p_v, p_resume], set_body, line, col)
   ]
 }
 
@@ -108,12 +108,12 @@ fn var_canonical_return(line: Int, col: Int) : HReturn {
 # to a stack slot, not a chain of handler invocations. The specialised
 # form replaces the canonical `with State[T] as x` handler with:
 #   let x_slot = array_make(1, init)
-#   { rest_with_n.get() → array_get(x_slot, 0)
-#         and n.set(v)   → { let _ = array_set(x_slot, 0, v); () } }
+#   { rest, each read of x → array_get(x_slot, 0)
+#           and each write → { let _ = array_set(x_slot, 0, v); () } }
 # Trigger conditions:
 #   1. canonical handler shape (always true — emitted by us);
 #   2. no multi-shot resume (always true — canonical clauses);
-#   3. `name` only appears as `name.get()` / `name.set(v)` callee
+#   3. the cell only appears as the operand of its own read or write
 #      (no escape into a closure or argument);
 #   4. `init` is a "normal expression" — no op calls.
 # Conditions 1 and 2 hold by construction; this section adds the
@@ -196,26 +196,26 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
           None -> init_d0
         }
         let inner_kind = desugar_var_block(rest, tail)
-        let inner_expr = rc_check_var_writes(b.name, ty, mk_expr(inner_kind, line, col))
+        let inner_expr = rc_check_var_writes(b, ty, mk_expr(inner_kind, line, col))
         # Try variable specialisation first. When all
         # trigger conditions hold, lower the var to a 1-element
         # array slot (core `array_*`, no `Mutable` row) instead
         # of the canonical State[T] handler. The conditions:
         #   * init is a "normal expression" (init_is_safe)
-        #   * `name` only appears as `name.get`/`name.set` callee
-        #     in the body (body_escapes is false)
+        #   * the cell only appears as the operand of its own read or
+        #     write in the body (body_escapes is false)
         # When either fails, fall back to the canonical handler so
         # captures, escapes, and complex inits still work.
-        if init_is_safe(init_d) and not body_escapes(name, inner_expr) {
-          let slot_name = var_slot_name(name)
+        if init_is_safe(init_d) and not body_escapes(b.id, inner_expr) {
+          let slot = var_slot_binder(name, line, col)
           let slot_init = mk_expr(
-            ECall(mk_expr(EMark(MkVarSlot(name)), line, col),
+            ECall(mk_expr(EMark(MkVarSlot(b, slot)), line, col),
                   [builtin_mk(CbArrayMake, line, col),
                    mk_expr(mk_int_synth(1), line, col), init_d]),
             line, col)
-          let let_pat = mk_pat(PBind(var_slot_binder(name, line, col)), line, col)
+          let let_pat = mk_pat(PBind(slot), line, col)
           let let_stmt = SLet(let_pat, None, slot_init)
-          let body_spec = specialise_body(name, slot_name, inner_expr)
+          let body_spec = specialise_body(b.id, slot.id, inner_expr)
           EBlock(list_append(ann_pre, [let_stmt]), Some(body_spec))
         } else {
           let tyargs = match ty { Some(t) -> [t] None -> [] }
@@ -256,10 +256,11 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
 # either by an enclosing `var name := init` (an SVar not yet rewritten
 # into a State[T] handler) or by a user-written `with State[T] as name`
 # / `with Reader[T] as name`. A bare `EName(name)` for such a name is
-# lowered here to `name.get()`; the parser already lowered the write
-# `name := v` to `name.set(v)`. Doing the read lowering at this layer
-# (where the scope of each cell is known) keeps it out of the parser,
-# which cannot tell a cell read from an ordinary local read.
+# lowered here to a read node naming the cell's binder, and `name := v`
+# to a write node. The binder is numbered here because the resolver has
+# not run: the slot specialisation and the escape veto change the shape
+# of the program before it does, and need to tell a read from a
+# capability passed on. From this pass on a cell is its binder's id.
 #
 # Escape veto: a cell cannot be read or written from a closure whose
 # VALUE reaches the block's exit (tail / returned / stored in the exit
@@ -271,16 +272,16 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
 # of the read lowering.
 #
 # Scope rules: SLet, lambda params, match arm patterns, fn params,
-# nested SVar with the same name, and non-cell handler `as` aliases all
-# shadow a cell binder; cell reads under those scopes are ordinary
-# locals, left untouched.
+# nested SVar with the same name, and handler `as` aliases all shadow a
+# name of the scope; a name under them is an ordinary local, left
+# untouched.
 pub(pkg) type VarLow = { decls: [Decl], errs: Int }
 
-#[doc("Lower naked reads of mutable cells to `cell.get()` and reject cell access that escapes its block; the entry point used before the SVar rewrite, where `@cell` is rejected.")]
+#[doc("Lower naked reads and writes of mutable cells to nodes naming the cell and reject cell access that escapes its block; the entry point used before the SVar rewrite, where `@cell` is rejected.")]
 pub(pkg) fn lower_cell_reads_decls(ds: [Decl], df: DiagFiles) : VarLow / Console + File =
   lcr_decls_loop(ds, true, df, [], 0)
 
-#[doc("Re-run of the cell-read lowering after string-interp lifting; `reject_at` is false because reads were already lowered, so `@cell` is no longer distinguishable from a generated `cell.get()`.")]
+#[doc("Re-run of the cell-read lowering after string-interp lifting; `reject_at` is false because reads were already lowered, so only the reads the interpolation lift surfaced are left to lower.")]
 pub(pkg) fn relower_cell_reads_decls(ds: [Decl], df: DiagFiles) : VarLow / Console + File =
   lcr_decls_loop(ds, false, df, [], 0)
 

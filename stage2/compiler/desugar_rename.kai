@@ -7,6 +7,8 @@ import compiler.ast
 import compiler.ast_build
 import compiler.ast_build
 import compiler.written
+import compiler.ast_ids
+import compiler.core_types
 
 #[doc("`acc` with the names the parameters bind.")]
 pub(pkg) fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
@@ -56,99 +58,78 @@ fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
   }
 }
 
-#[doc("`s` introduces a fresh binder named `n`, shadowing the cell from here on.")]
-pub(pkg) fn stmt_rebinds_cell(s: Stmt, n: String) : Bool =
-  match s {
-    SVar(m, _, _, _, _) -> written_text(m.name) == n
-    SLet(p, _, _) -> list_has(dsg_rename_pat_names(p, []), n)
-    _ -> false
-  }
-
 #[doc("""
 Does the spawn task `e` touch the cell `n` (read/write directly, or apply a
 tainted closure that captured it)? Shadow-aware: a nested binder that rebinds
 `n` masks the cell from that point on, so the inner `n` is its own fiber's.
 """)]
-pub(pkg) fn task_touches_cell(e: Expr, n: String, tainted: [String]) : Bool =
+pub(pkg) fn task_touches_cell(e: Expr, cell: LocalId, tainted: [String]) : Bool =
   match e.kind {
     ECall(callee, args_) -> {
-      let direct = match callee.kind {
-        EField(base, fname) -> match base.kind {
-          EName(m) -> written_text(m) == n and (fname == "get" or fname == "set")
-          _ -> false
-        }
-        _ -> false
-      }
+      let direct = match cell_access_of(cell, callee, args_) { Some(_) -> true  None -> false }
       let applied = match callee.kind { EName(f) -> list_has(tainted, written_text(f))  _ -> false }
-      direct or applied or task_touches_cell(callee, n, tainted) or task_args_touch_cell(args_, n, tainted)
+      direct or applied or task_touches_cell(callee, cell, tainted) or task_args_touch_cell(args_, cell, tainted)
     }
-    ELambda(ps, body) ->
-      if list_has(dsg_rename_param_names(ps, []), n) { false } else { task_touches_cell(body, n, tainted) }
-    EField(base, _) -> task_touches_cell(base, n, tainted)
-    EIndex(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
-    EBinop(_, a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
-    EUnop(_, x) -> task_touches_cell(x, n, tainted)
-    EIf(c, t_, eo) -> task_touches_cell(c, n, tainted) or task_touches_cell(t_, n, tainted) or
-      (match eo { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
-    EBlock(ss, t) -> task_stmts_touch_cell(ss, n, tainted, t)
-    EMatch(scr, arms) -> task_touches_cell(scr, n, tainted) or task_arms_touch_cell(arms, n, tainted)
-    EList(elems) -> task_elems_touch_cell(elems, n, tainted)
-    ERange(a, b, os) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted) or
-      (match os { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
-    EPipe(a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
-    EDispatchPipe(_, a, b) -> task_touches_cell(a, n, tainted) or task_touches_cell(b, n, tainted)
-    EBang(inner) -> task_touches_cell(inner, n, tainted)
-    ELitUnit(inner, _) -> task_touches_cell(inner, n, tainted)
+    ELambda(_, body) -> task_touches_cell(body, cell, tainted)
+    EField(base, _) -> task_touches_cell(base, cell, tainted)
+    EIndex(a, b) -> task_touches_cell(a, cell, tainted) or task_touches_cell(b, cell, tainted)
+    EBinop(_, a, b) -> task_touches_cell(a, cell, tainted) or task_touches_cell(b, cell, tainted)
+    EUnop(_, x) -> task_touches_cell(x, cell, tainted)
+    EIf(c, t_, eo) -> task_touches_cell(c, cell, tainted) or task_touches_cell(t_, cell, tainted) or
+      (match eo { Some(x) -> task_touches_cell(x, cell, tainted)  None -> false })
+    EBlock(ss, t) -> task_stmts_touch_cell(ss, cell, tainted, t)
+    EMatch(scr, arms) -> task_touches_cell(scr, cell, tainted) or task_arms_touch_cell(arms, cell, tainted)
+    EList(elems) -> task_elems_touch_cell(elems, cell, tainted)
+    ERange(a, b, os) -> task_touches_cell(a, cell, tainted) or task_touches_cell(b, cell, tainted) or
+      (match os { Some(x) -> task_touches_cell(x, cell, tainted)  None -> false })
+    EPipe(a, b) -> task_touches_cell(a, cell, tainted) or task_touches_cell(b, cell, tainted)
+    EDispatchPipe(_, a, b) -> task_touches_cell(a, cell, tainted) or task_touches_cell(b, cell, tainted)
+    EBang(inner) -> task_touches_cell(inner, cell, tainted)
+    ELitUnit(inner, _) -> task_touches_cell(inner, cell, tainted)
     _ -> false
   }
 
-fn task_args_touch_cell(es: [Expr], n: String, tainted: [String]) : Bool {
+fn task_args_touch_cell(es: [Expr], cell: LocalId, tainted: [String]) : Bool {
   match es {
     [] -> false
-    [h, ...rest] -> if task_touches_cell(h, n, tainted) { true } else { task_args_touch_cell(rest, n, tainted) }
+    [h, ...rest] -> if task_touches_cell(h, cell, tainted) { true } else { task_args_touch_cell(rest, cell, tainted) }
   }
 }
 
-# A nested `var n` / `let n` rebinds the cell for the rest of the block.
-fn task_stmts_touch_cell(ss: [Stmt], n: String, tainted: [String], tail: Option[Expr]) : Bool {
+fn task_stmts_touch_cell(ss: [Stmt], cell: LocalId, tainted: [String], tail: Option[Expr]) : Bool {
   match ss {
-    [] -> match tail { Some(x) -> task_touches_cell(x, n, tainted)  None -> false }
+    [] -> match tail { Some(x) -> task_touches_cell(x, cell, tainted)  None -> false }
     [s, ...rest] -> {
       let here = match s {
-        SLet(_, _, rhs) -> task_touches_cell(rhs, n, tainted)
-        SExprStmt(x) -> task_touches_cell(x, n, tainted)
-        SVar(_, _, rhs, _, _) -> task_touches_cell(rhs, n, tainted)
-        SIndexAssign(b, i, v, _, _) -> task_touches_cell(b, n, tainted) or
-          task_touches_cell(i, n, tainted) or task_touches_cell(v, n, tainted)
-        SAssign(b, v, _, _) -> task_touches_cell(b, n, tainted) or
-          task_touches_cell(v, n, tainted)
-        SAssert(c, m) -> task_touches_cell(c, n, tainted) or
-          (match m { Some(x) -> task_touches_cell(x, n, tainted)  None -> false })
+        SLet(_, _, rhs) -> task_touches_cell(rhs, cell, tainted)
+        SExprStmt(x) -> task_touches_cell(x, cell, tainted)
+        SVar(_, _, rhs, _, _) -> task_touches_cell(rhs, cell, tainted)
+        SIndexAssign(b, i, v, _, _) -> task_touches_cell(b, cell, tainted) or
+          task_touches_cell(i, cell, tainted) or task_touches_cell(v, cell, tainted)
+        SAssign(b, v, _, _) -> task_touches_cell(b, cell, tainted) or
+          task_touches_cell(v, cell, tainted)
+        SAssert(c, m) -> task_touches_cell(c, cell, tainted) or
+          (match m { Some(x) -> task_touches_cell(x, cell, tainted)  None -> false })
         _ -> false
       }
-      if here { true }
-      else if stmt_rebinds_cell(s, n) { false }
-      else { task_stmts_touch_cell(rest, n, tainted, tail) }
+      if here { true } else { task_stmts_touch_cell(rest, cell, tainted, tail) }
     }
   }
 }
 
-fn task_arms_touch_cell(arms: [Arm], n: String, tainted: [String]) : Bool {
+fn task_arms_touch_cell(arms: [Arm], cell: LocalId, tainted: [String]) : Bool {
   match arms {
     [] -> false
-    [Arm(p, _, b), ...rest] -> {
-      let here = if list_has(dsg_rename_pat_names(p, []), n) { false } else { task_touches_cell(b, n, tainted) }
-      here or task_arms_touch_cell(rest, n, tainted)
-    }
+    [Arm(_, _, b), ...rest] -> task_touches_cell(b, cell, tainted) or task_arms_touch_cell(rest, cell, tainted)
   }
 }
 
-fn task_elems_touch_cell(es: [ListElem], n: String, tainted: [String]) : Bool {
+fn task_elems_touch_cell(es: [ListElem], cell: LocalId, tainted: [String]) : Bool {
   match es {
     [] -> false
     [el, ...rest] -> {
-      let here = match el { ElPlain(x) -> task_touches_cell(x, n, tainted)  ElSpread(x) -> task_touches_cell(x, n, tainted) }
-      here or task_elems_touch_cell(rest, n, tainted)
+      let here = match el { ElPlain(x) -> task_touches_cell(x, cell, tainted)  ElSpread(x) -> task_touches_cell(x, cell, tainted) }
+      here or task_elems_touch_cell(rest, cell, tainted)
     }
   }
 }
@@ -159,105 +140,105 @@ Conservative containment check used by the lambda branch of
 as escape (we have no way to prove the closure does not outlive
 the handle). Returns true if `name` appears anywhere in `e`.
 """)]
-pub(pkg) fn contains_var(name: String, e: Expr) : Bool {
+pub(pkg) fn contains_var(cell: LocalId, e: Expr) : Bool {
   match e.kind {
-    EName(n) -> written_text(n) == name
-    ECall(c, args_) -> contains_var(name, c) or any_contains(name, args_)
-    EField(b, _) -> contains_var(name, b)
-    EIndex(a, b) -> contains_var(name, a) or contains_var(name, b)
-    EBinop(_, a, b) -> contains_var(name, a) or contains_var(name, b)
-    EUnop(_, x) -> contains_var(name, x)
-    EIf(c, t_, eo) -> contains_var(name, c) or contains_var(name, t_) or opt_contains(name, eo)
-    EBlock(stmts, tail) -> stmts_contain(name, stmts) or opt_contains(name, tail)
-    EMatch(scr, arms) -> contains_var(name, scr) or arms_contain(name, arms)
-    ELambda(_, b) -> contains_var(name, b)
-    EList(elems) -> elems_contain(name, elems)
+    ELocal(l) -> local_eq(l, cell)
+    ECall(c, args_) -> contains_var(cell, c) or any_contains(cell, args_)
+    EField(b, _) -> contains_var(cell, b)
+    EIndex(a, b) -> contains_var(cell, a) or contains_var(cell, b)
+    EBinop(_, a, b) -> contains_var(cell, a) or contains_var(cell, b)
+    EUnop(_, x) -> contains_var(cell, x)
+    EIf(c, t_, eo) -> contains_var(cell, c) or contains_var(cell, t_) or opt_contains(cell, eo)
+    EBlock(stmts, tail) -> stmts_contain(cell, stmts) or opt_contains(cell, tail)
+    EMatch(scr, arms) -> contains_var(cell, scr) or arms_contain(cell, arms)
+    ELambda(_, b) -> contains_var(cell, b)
+    EList(elems) -> elems_contain(cell, elems)
     ERange(a, b, opt_step) ->
-      contains_var(name, a) or contains_var(name, b) or opt_contains(name, opt_step)
-    ERecordLit(_, fields) -> fields_contain(name, fields)
-    EPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
-    EDispatchPipe(_, a, b) -> contains_var(name, a) or contains_var(name, b)
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
-    EBang(inner) -> contains_var(name, inner)
+      contains_var(cell, a) or contains_var(cell, b) or opt_contains(cell, opt_step)
+    ERecordLit(_, fields) -> fields_contain(cell, fields)
+    EPipe(a, b) -> contains_var(cell, a) or contains_var(cell, b)
+    EDispatchPipe(_, a, b) -> contains_var(cell, a) or contains_var(cell, b)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(cell, body) or opt_contains(cell, init_opt) or clauses_contain(cell, clauses) or ret_opt_contains(cell, ret_opt)
+    EBang(inner) -> contains_var(cell, inner)
     _ -> false
   }
 }
 
-fn any_contains(name: String, es: [Expr]) : Bool {
+fn any_contains(cell: LocalId, es: [Expr]) : Bool {
   match es {
     [] -> false
-    [h, ...rest] -> if contains_var(name, h) { true } else { any_contains(name, rest) }
+    [h, ...rest] -> if contains_var(cell, h) { true } else { any_contains(cell, rest) }
   }
 }
 
-fn opt_contains(name: String, opt: Option[Expr]) : Bool {
-  match opt { None -> false  Some(e) -> contains_var(name, e) }
+fn opt_contains(cell: LocalId, opt: Option[Expr]) : Bool {
+  match opt { None -> false  Some(e) -> contains_var(cell, e) }
 }
 
-fn stmts_contain(name: String, ss: [Stmt]) : Bool {
+fn stmts_contain(cell: LocalId, ss: [Stmt]) : Bool {
   match ss {
     [] -> false
-    [s, ...rest] -> if stmt_contains(name, s) { true } else { stmts_contain(name, rest) }
+    [s, ...rest] -> if stmt_contains(cell, s) { true } else { stmts_contain(cell, rest) }
   }
 }
 
-fn stmt_contains(name: String, s: Stmt) : Bool {
+fn stmt_contains(cell: LocalId, s: Stmt) : Bool {
   match s {
-    SLet(_, _, rhs) -> contains_var(name, rhs)
-    SAssert(c, msg) -> contains_var(name, c) or opt_contains(name, msg)
-    SExprStmt(x) -> contains_var(name, x)
+    SLet(_, _, rhs) -> contains_var(cell, rhs)
+    SAssert(c, msg) -> contains_var(cell, c) or opt_contains(cell, msg)
+    SExprStmt(x) -> contains_var(cell, x)
     SIndexAssign(b, i, v, _, _) ->
-      contains_var(name, b) or contains_var(name, i) or contains_var(name, v)
+      contains_var(cell, b) or contains_var(cell, i) or contains_var(cell, v)
     SAssign(b, v, _, _) ->
-      contains_var(name, b) or contains_var(name, v)
-    SVar(_, _, rhs, _, _) -> contains_var(name, rhs)
-    # SUse has no expression — never contains a value-level name.
+      contains_var(cell, b) or contains_var(cell, v)
+    SVar(_, _, rhs, _, _) -> contains_var(cell, rhs)
+    # SUse has no expression — never contains a value-level cell.
     SUse(_, _, _) -> false
   }
 }
 
-fn arms_contain(name: String, arms: [Arm]) : Bool {
+fn arms_contain(cell: LocalId, arms: [Arm]) : Bool {
   match arms {
     [] -> false
     [a, ...rest] -> match a {
       Arm(_, g, b) ->
-        if opt_contains(name, g) or contains_var(name, b) { true }
-        else { arms_contain(name, rest) }
+        if opt_contains(cell, g) or contains_var(cell, b) { true }
+        else { arms_contain(cell, rest) }
     }
   }
 }
 
-fn elems_contain(name: String, es: [ListElem]) : Bool {
+fn elems_contain(cell: LocalId, es: [ListElem]) : Bool {
   match es {
     [] -> false
     [el, ...rest] -> match el {
-      ElPlain(x)  -> if contains_var(name, x) { true } else { elems_contain(name, rest) }
-      ElSpread(x) -> if contains_var(name, x) { true } else { elems_contain(name, rest) }
+      ElPlain(x)  -> if contains_var(cell, x) { true } else { elems_contain(cell, rest) }
+      ElSpread(x) -> if contains_var(cell, x) { true } else { elems_contain(cell, rest) }
     }
   }
 }
 
-fn fields_contain(name: String, fs: [FieldInit]) : Bool {
+fn fields_contain(cell: LocalId, fs: [FieldInit]) : Bool {
   match fs {
     [] -> false
     [f, ...rest] -> match f {
-      FI(_, v) -> if contains_var(name, v) { true } else { fields_contain(name, rest) }
+      FI(_, v) -> if contains_var(cell, v) { true } else { fields_contain(cell, rest) }
     }
   }
 }
 
-fn clauses_contain(name: String, cs: [HClause]) : Bool {
+fn clauses_contain(cell: LocalId, cs: [HClause]) : Bool {
   match cs {
     [] -> false
     [c, ...rest] -> match c {
       HC(_, _, b, _, _) ->
-        if contains_var(name, b) { true } else { clauses_contain(name, rest) }
+        if contains_var(cell, b) { true } else { clauses_contain(cell, rest) }
     }
   }
 }
 
-fn ret_opt_contains(name: String, opt: Option[HReturn]) : Bool {
-  match opt { None -> false  Some(r) -> match r { HR(_, b, _, _) -> contains_var(name, b) } }
+fn ret_opt_contains(cell: LocalId, opt: Option[HReturn]) : Bool {
+  match opt { None -> false  Some(r) -> match r { HR(_, b, _, _) -> contains_var(cell, b) } }
 }
 
 #[doc("`acc` with the names the pattern binds.")]
@@ -304,4 +285,45 @@ fn dsg_pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
       PField(_, sub, _) -> dsg_pfield_bindings_loop(rest, dsg_pat_bindings(sub, acc))
     }
   }
+}
+
+#[doc("The op a call performs on the cell `cell`: a read or write node, or an op called on the cell by name.")]
+pub(pkg) fn cell_access_of(cell: LocalId, callee: Expr, args_: [Expr]) : Option[CellOp] = match callee.kind {
+  EMark(MkCellGet) -> if cell_is_arg(cell, args_) { Some(CellGet) } else { None }
+  EMark(MkCellPut) -> if cell_is_arg(cell, args_) { Some(CellSet) } else { None }
+  EField(base, fname) -> match base.kind {
+    ELocal(l) -> if local_eq(l, cell) { cell_op_named(fname) } else { None }
+    _         -> None
+  }
+  _ -> None
+}
+
+fn cell_is_arg(cell: LocalId, args_: [Expr]) : Bool = match args_ {
+  [a, ..._] -> match a.kind { ELocal(l) -> local_eq(l, cell)  _ -> false }
+  []        -> false
+}
+
+#[doc("A read or write node of a cell: the cell's binder, whether it writes, and the operands after the binder.")]
+pub(pkg) type CellNode = { cell: LocalId, write: Bool, rest: [Expr] }
+
+#[doc("The cell node `callee(args_)` is, when it is one.")]
+pub(pkg) fn cell_node(callee: Expr, args_: [Expr]) : Option[CellNode] = match callee.kind {
+  EMark(MkCellGet) -> match args_ {
+    [a] -> match a.kind { ELocal(l) -> Some(CellNode { cell: l, write: false, rest: [] })  _ -> None }
+    _   -> None
+  }
+  EMark(MkCellPut) -> match args_ {
+    [a, v] -> match a.kind { ELocal(l) -> Some(CellNode { cell: l, write: true, rest: [v] })  _ -> None }
+    _      -> None
+  }
+  _ -> None
+}
+
+#[doc("The op a cell node performs on a cell of effect `esym`.")]
+pub(pkg) fn cell_node_op(esym: SymId, write: Bool) : CellOp = if write { CellSet } else { cell_read_op(esym) }
+
+#[doc("The value a write call stores: the second operand of a write node, the only one of an op called by name.")]
+pub(pkg) fn cell_write_value(callee: Expr, args_: [Expr]) : Option[Expr] = match callee.kind {
+  EMark(MkCellPut) -> match args_ { [_, v] -> Some(v)  _ -> None }
+  _                -> match args_ { [v] -> Some(v)  _ -> None }
 }
