@@ -1,38 +1,237 @@
-# compiler/emit_native_fn.kai — the per-KFn walk of the in-process
-# libLLVM native backend (KIR Lane 1.2 Parte B, docs/kir-design.md §7.2).
-#
-# `emit_native.kai` is the orchestration; THIS file + `emit_native_ops` +
-# `emit_native_term` walk ONE `KFn` into LLVM IR via the C-API prims in
-# `native_prims.kai`.
-#
-# ALL backend state lives in a C struct reached through one opaque
-# `ctx: Handle` (the `native_ctx_*` prims). NO LLVM handle ever enters a
-# kaikai record or list: the production kaic2 is compiled by the
-# type-blind kaic1, whose record/list constructors `kai_incref` every
-# field, which on a raw LLVM pointer corrupts memory (asu "risk #1"). So
-# the walk is imperative over `ctx` — the IRBuilder IS mutable state — and
-# threads nothing but `ctx`, which is excluded from Perceus as a `:Handle`
-# param. The register / block tables (`String -> handle`) live in C too.
-#
-# The model (asu review): every named KIR register is an entry-block
-# `alloca`; `KLet` stores into it, a `KVar` read loads from it, `KStore`
-# stores again, and `mem2reg` promotes the lot to SSA+phi — so the
-# deliberately non-SSA KIR translates without the backend reasoning about
-# dominance.
-#
-# Two passes over a fn's blocks (in `emit_native_term`): pass 1 creates
-# every basic block + collects every named register into one alloca batch
-# at the entry head (allocas must precede other instructions to stay
-# promotable + static — a lazy alloca inside a loop would grow the fiber
-# stack per iteration); pass 2 fills each block's statements + terminator.
+#[doc("""
+The native function emitter: its emission state, call shapes, function index and pointer-slot reads.
 
-import compiler.util
-import compiler.escapes
+Runtime calls the native emitters share: declaring an entry by its
+signature and calling it over arguments held in C buffers.
+
+The program's KFns indexed by the symbol a direct call names.
+
+The constructor / closure / apply runtime entries take a mix of `i32`,
+`i8*`, and `KaiValue**` — under opaque pointers `i8*` and `KaiValue**`
+are both `ptr`. The signature param-types and the call args both go
+through C buffers (NEVER a `[Handle]` list — handles in a kaikai list
+are RC-tagged + corrupted; asu "risk #1"). The fixed-arity helpers
+(`ncall_sig1`/`2`/...) build both buffers inline.
+
+compiler/emit_native_slot.kai — inline pointer-slot reads for the native
+backend: `GEP+load` against the `KaiValue` header, mirroring the C backend's
+`kai_var_slots(v)[i].ptr`.
+
+A `KProjBorrow` (a known pointer slot — the child pointers a match arm
+borrows, e.g. an rb-tree node's `l`/`r`) used to route through the
+`kaix_variant_arg_borrow` shim: a runtime call that re-derives the slot base
+and loads `.ptr`. The kind is known at compile time (kind-0 pointer), so the
+read is a static `getelementptr` into the inline slot array plus one `load
+ptr` — exactly what the C emitter produces, no call.
+
+The slot base is `&v->as` (slots overlap the union at its first offset),
+reached by GEP-ing a header struct type that matches `struct KaiValue`'s
+vanilla 8-byte header and letting LLVM compute the offset — never a
+hardcoded `8`, which breaks under `-DKAI_TRACE_RC` header growth. The linked
+runtime bitcode is always compiled without those defines, so the header is
+`{ i32, i8, i8, i16 }` and `as` sits at field 4. The load carries the `ptr`
+type, inheriting the 8-byte ABI alignment the allocator guarantees.
+
+compiler/emit_native_fn.kai — the per-KFn walk of the in-process
+libLLVM native backend (KIR Lane 1.2 Parte B, docs/kir-design.md §7.2).
+
+`emit_native.kai` is the orchestration; THIS file + `emit_native_ops` +
+`emit_native_term` walk ONE `KFn` into LLVM IR via the C-API prims in
+`native_prims.kai`.
+
+ALL backend state lives in a C struct reached through one opaque
+`ctx: Handle` (the `native_ctx_*` prims). NO LLVM handle ever enters a
+kaikai record or list: the production kaic2 is compiled by the
+type-blind kaic1, whose record/list constructors `kai_incref` every
+field, which on a raw LLVM pointer corrupts memory (asu "risk #1"). So
+the walk is imperative over `ctx` — the IRBuilder IS mutable state — and
+threads nothing but `ctx`, which is excluded from Perceus as a `:Handle`
+param. The register / block tables (`String -> handle`) live in C too.
+
+The model (asu review): every named KIR register is an entry-block
+`alloca`; `KLet` stores into it, a `KVar` read loads from it, `KStore`
+stores again, and `mem2reg` promotes the lot to SSA+phi — so the
+deliberately non-SSA KIR translates without the backend reasoning about
+dominance.
+
+Two passes over a fn's blocks (in `emit_native_term`): pass 1 creates
+every basic block + collects every named register into one alloca batch
+at the entry head (allocas must precede other instructions to stay
+promotable + static — a lazy alloca inside a loop would grow the fiber
+stack per iteration); pass 2 fills each block's statements + terminator.
+""")]
+
 import compiler.ast
+import compiler.effect_instance
+import compiler.escapes
+import compiler.infer_index
 import compiler.kir
 import compiler.kir_syms
 import compiler.parse_lexical
-import compiler.emit_native_call
+import compiler.symtab
+import compiler.util
+
+# `sym : ret ()` over no args — a non-boxed return type (e.g. an `i64`
+# runtime entry like `kai_jmpbuf_size`) the all-boxed `nemit_call0` cannot
+# express.
+#[doc("Call the runtime entry `sym : ret ()`.")]
+pub fn ncall_sig0(ctx: Handle, sym: String, ret: Handle) : Handle = {
+  let ptb = llvm_buf_new()
+  let ab  = llvm_buf_new()
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# `sym : ret (p0)` over one arg.
+#[doc("Call the runtime entry `sym : ret (p0)` with `a0`.")]
+pub fn ncall_sig1(ctx: Handle, sym: String, ret: Handle, p0: Handle, a0: Handle) : Handle = {
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0)
+  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0)
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# `sym : ret (p0, p1)` over two args.
+#[doc("Call the runtime entry `sym : ret (p0, p1)` with `a0, a1`.")]
+pub fn ncall_sig2(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, a0: Handle, a1: Handle) : Handle = {
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1)
+  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1)
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# `sym : ret (p0, p1, p2)` over three args (e.g. the cctx shims
+# `kaix_cctx_extend`/`kaix_cctx_apply(res, hole, child)`).
+#[doc("Call the runtime entry `sym : ret (p0, p1, p2)` with `a0, a1, a2`.")]
+pub fn ncall_sig3(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, p2: Handle,
+                  a0: Handle, a1: Handle, a2: Handle) : Handle = {
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1); llvm_buf_push(ptb, p2)
+  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1); llvm_buf_push(ab, a2)
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# `sym : ret (p0, p1, p2, p3)` over four args.
+#[doc("Call the runtime entry `sym : ret (p0, p1, p2, p3)` with `a0` to `a3`.")]
+pub fn ncall_sig4(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, p2: Handle, p3: Handle,
+                  a0: Handle, a1: Handle, a2: Handle, a3: Handle) : Handle = {
+  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1); llvm_buf_push(ptb, p2); llvm_buf_push(ptb, p3)
+  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1); llvm_buf_push(ab, a2); llvm_buf_push(ab, a3)
+  ncall_finish(ctx, sym, ret, ptb, ab)
+}
+# Build the fn type from `ptb`, declare `sym`, call over `ab`, free both.
+#[doc("Declare `sym` with the parameter types in `ptb`, call it over the arguments in `ab`, and free both buffers.")]
+pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Handle) : Handle = {
+  let fnty = llvm_fn_type_n(ret, ptb)
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
+  let r = native_build_call(ctx, fnv, fnty, ab)
+  llvm_buf_free(ptb); llvm_buf_free(ab); r
+}
+
+#[doc("The raw payload of a boxed handle at a raw `slot`, read through the per-type field shim with no decref; a boxed slot passes the handle through.")]
+pub fn nemit_unbox_field(ctx: Handle, boxed: Handle, slot: KSlot) : Handle = match slot {
+  SInt64  -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
+  SReal   -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
+  SBool   -> ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  SChar   -> ncall_sig1(ctx, "kaix_char_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  SByte   -> ncall_sig1(ctx, "kaix_byte_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  SInt32T -> ncall_sig1(ctx, "kaix_int32_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  SUInt32 -> ncall_sig1(ctx, "kaix_uint32_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+  SUInt64 -> ncall_sig1(ctx, "kaix_uint64_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
+  SInt128 -> ncall_sig1(ctx, "kaix_int128_field", native_ctx_i128t(ctx), native_ctx_ptrt(ctx), boxed)
+  _       -> boxed
+}
+
+# A `finally` thunk: `ptr (ptr self)`. `self` is the handler's Ev, so a
+# stateful cleanup reads the resource `initially` left in `state`. The
+# result is the block's value and is discarded by the caller — returning
+# `ptr` (not void) keeps the body's ordinary `KRet` lowering.
+#[doc("Declare the `finally` thunk `sym : ptr (ptr self)`.")]
+pub fn nemit_declare_cleanup(ctx: Handle, sym: String) : Handle =
+  llvm_get_or_declare_fn(native_ctx_m(ctx), sym,
+                         llvm_fn_type_boxed(native_ctx_ptrt(ctx), 1))
+
+#[doc("A KFn list plus a hash index from each fn's symbol to the fns carrying it, what spells a fn, the program's symbol table, and each fn's evidence frame.")]
+pub type NFnIndex = { ix: NameIndex[KSymFn], all: [KFn], nm: KNames, tab: SymTab, ids: ProtoIds, frames: EvFrames }
+
+#[doc("Index the KFns so a direct call resolves its callee without scanning them.")]
+pub fn nfnx_build(fns: [KFn], nm: KNames, ids: ProtoIds, frames: EvFrames) : NFnIndex =
+  NFnIndex { ix: nfnx_add(ksym_fns(nm, fns), idx_empty()), all: fns, nm: nm, tab: nm.tab, ids: ids, frames: frames }
+
+#[doc("The instances `f` takes evidence for, in the order of its frame's slots.")]
+pub fn nfnx_frame_keys(fx: NFnIndex, f: KFn) : [InstKey] = frame_slots_of(fx.frames, kfn_fid(f))
+
+fn nfnx_add(fns: [KSymFn], ix: NameIndex[KSymFn]) : NameIndex[KSymFn] = match fns {
+  []           -> ix
+  [r, ...rest] -> nfnx_add(rest, idx_prepend(ix, r.sym, r))
+}
+
+# A chain is newest-first and holds hash-colliding symbols, so the last exact match is the list's first.
+#[doc("The first KFn, in list order, whose symbol is `sym`.")]
+pub fn nfnx_by_sym(fx: NFnIndex, sym: String) : Option[KFn] = nfnx_oldest(idx_chain(fx.ix, sym), sym, None)
+
+fn nfnx_oldest(chain: [KSymFn], sym: String, found: Option[KFn]) : Option[KFn] = match chain {
+  []           -> found
+  [r, ...rest] -> nfnx_oldest(rest, sym, if r.sym == sym { Some(r.f) } else { found })
+}
+
+# The mask encodes at most 16 slots (2 bits each in a 32-bit word); a wider
+# variant falls back to mask=0 all-pointer. The array element count only types
+# the GEP — it never bounds-checks — so 16 covers every masked read.
+fn nslot_array_cap() : Int = 16
+
+# The LLVM struct type mirroring `struct KaiValue`'s vanilla header:
+# `{ i32 rc, i8 tag, i8 var_n_args, i16 variant_tag, [16 x i64] slots }`.
+# Field 4 lands at offset 8 (the header packs with no interior padding, and
+# the i64 array forces the struct's 8-byte alignment), matching `&v->as`.
+# LLVM dedups identical struct types, so recreating it on demand is free.
+fn nkaivalue_header_type(ctx: Handle) : Handle = {
+  let m = native_ctx_m(ctx)
+  let i8t  = llvm_int_type(m, 8)
+  let i16t = llvm_int_type(m, 16)
+  let slotst = llvm_array_type(native_ctx_i64t(ctx), nslot_array_cap())
+  let elems = llvm_buf_new()
+  llvm_buf_push(elems, native_ctx_i32t(ctx))
+  llvm_buf_push(elems, i8t)
+  llvm_buf_push(elems, i8t)
+  llvm_buf_push(elems, i16t)
+  llvm_buf_push(elems, slotst)
+  let t = llvm_struct_type(m, elems)
+  llvm_buf_free(elems)
+  t
+}
+
+# The address of slot `i` inside `v`'s inline slot array: `&v->as` via the
+# header field-4 GEP, then the element GEP over the homogeneous `[16 x i64]`.
+fn nemit_slot_ptr(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let b = native_ctx_b(ctx)
+  let hty = nkaivalue_header_type(ctx)
+  let base = llvm_build_struct_gep(b, hty, v, 4)
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), nslot_array_cap())
+  llvm_build_array_gep(b, arrty, base, llvm_const_i32(native_ctx_i32t(ctx), i))
+}
+
+# A `let`-bound slot pointer keeps the GEP handle off the RC regime before it
+# becomes a `llvm_build_load` argument (the handle-binder exclusion — a Value*
+# passed inline as a call arg is RC-clobbered by the type-blind kaic1).
+#[doc("Load variant slot `i` of `v` as a raw `i64` (kind-1 Int, `.i64`).")]
+pub fn nemit_slot_read_i64(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let p = nemit_slot_ptr(ctx, v, i)
+  llvm_build_load(native_ctx_b(ctx), native_ctx_i64t(ctx), p)
+}
+
+#[doc("Load variant slot `i` of `v` as a raw `double` (kind-2 Real, `.r`).")]
+pub fn nemit_slot_read_real(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let p = nemit_slot_ptr(ctx, v, i)
+  llvm_build_load(native_ctx_b(ctx), native_ctx_f64t(ctx), p)
+}
+
+#[doc("Load variant slot `i` of `v` as a boxed `KaiValue *` (kind-0, `.ptr`).")]
+pub fn nemit_slot_read_ptr(ctx: Handle, v: Handle, i: Int) : Handle = {
+  let p = nemit_slot_ptr(ctx, v, i)
+  llvm_build_load(native_ctx_b(ctx), native_ctx_ptrt(ctx), p)
+}
+
+#[doc("Load the raw `i32` variant tag of `v`: the header's `variant_tag` (u16) widened, the C oracle's `scr->variant_tag` read.")]
+pub fn nemit_tag_read(ctx: Handle, v: Handle) : Handle = {
+  let b = native_ctx_b(ctx)
+  let hty = nkaivalue_header_type(ctx)
+  let p = llvm_build_struct_gep(b, hty, v, 3)
+  let t16 = llvm_build_load(b, llvm_int_type(native_ctx_m(ctx), 16), p)
+  llvm_build_zext(b, t16, native_ctx_i32t(ctx))
+}
 
 # --- translation-unit role ----------------------------------------------
 
@@ -73,7 +272,7 @@ pub fn nfn_sym(nm: KNames, f: KFn) : String = if f.entry { "kai_main" } else { k
 # The C-side reg table stores a slot as an Int tag; these map both ways.
 # KSlot is the SINGLE source of a register's type (asu review): the walk
 # loads/stores at this type, never re-derives it from the op.
-pub fn nslot_tag(s: KSlot) : Int = match s {
+fn nslot_tag(s: KSlot) : Int = match s {
   SBoxed -> 0  SInt64 -> 1  SReal -> 2  SBool -> 3  SInt32 -> 4  SChar -> 5  SByte -> 6
   SInt32T -> 7  SUInt32 -> 8  SUInt64 -> 9  SInt128 -> 10
 }
@@ -84,7 +283,7 @@ pub fn nslot_tag(s: KSlot) : Int = match s {
 # corruption (an `f64` alloca read at the wrong type). `SReal` (`f64`)
 # matches `kir_dump`'s `"f64"` spelling and the C-direct oracle's raw
 # `double kair_<nm>`.
-pub fn nslot_type_of_tag(ctx: Handle, tag: Int) : Handle =
+fn nslot_type_of_tag(ctx: Handle, tag: Int) : Handle =
   if tag == 1 { native_ctx_i64t(ctx) }
   else if tag == 2 { native_ctx_f64t(ctx) }
   else if tag == 3 { native_ctx_i32t(ctx) }
@@ -118,7 +317,7 @@ pub fn ntrmc_armru_reg() : String = "_arm_ru"
 pub fn ndonor_reg() : String = "__donor"
 
 #[doc("1 when the fn takes the hidden trailing donor param, else 0 — the signature-arity twin of `nfn_evf_extra`.")]
-pub fn nfn_donor_extra(f: KFn) : Int = if f.donor { 1 } else { 0 }
+fn nfn_donor_extra(f: KFn) : Int = if f.donor { 1 } else { 0 }
 
 # True iff any param slot OR the return slot is raw (non-`SBoxed`).
 pub fn nfn_has_raw_slot(f: KFn) : Bool =
@@ -656,23 +855,26 @@ pub fn nemit_store_reg(ctx: Handle, name: String, h: Handle) : Unit / Console = 
 # so a planned-boxed value never meets a raw register — the border is one-
 # directional. Matching slots — the overwhelmingly common case — store
 # untouched, zero cost.
-pub fn nemit_store_reg_boxing(ctx: Handle, name: String, planned: KSlot, h: Handle) : Unit / Console = {
-  let reg = native_ctx_reg_slot(ctx, name)
-  let pt = nslot_tag(planned)
-  if reg == 0 and pt == 1 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), h)) }
-  else if reg == 0 and pt == 2 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), h)) }
-  else if reg == 0 and pt == 3 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), h)) }
-  else if reg == 0 and pt == 5 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_char", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), h)) }
-  else if reg == 0 and pt == 6 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_byte", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), h)) }
-  else if reg == 0 and pt == 7 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, h, 1))) }
-  else if reg == 0 and pt == 8 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_uint32", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, h, 0))) }
-  else if reg == 0 and pt == 9 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_uint64", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), h)) }
-  else if reg == 0 and pt == 10 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int128", native_ctx_ptrt(ctx), native_ctx_i128t(ctx), h)) }
+pub fn nemit_store_reg_boxing(ctx: Handle, name: String, planned: KSlot, h: Handle) : Unit / Console =
+  if native_ctx_reg_slot(ctx, name) == 0 { nemit_box_store_by_tag(ctx, name, nslot_tag(planned), h) }
+  else { nemit_store_reg(ctx, name, h) }
+
+fn nemit_box_store_by_tag(ctx: Handle, name: String, pt: Int, h: Handle) : Unit / Console = {
+  let ptrt = native_ctx_ptrt(ctx)
+  if pt == 1 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int", ptrt, native_ctx_i64t(ctx), h)) }
+  else if pt == 2 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_real", ptrt, native_ctx_f64t(ctx), h)) }
+  else if pt == 3 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_bool", ptrt, native_ctx_i32t(ctx), h)) }
+  else if pt == 5 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_char", ptrt, native_ctx_i32t(ctx), h)) }
+  else if pt == 6 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_byte", ptrt, native_ctx_i32t(ctx), h)) }
+  else if pt == 7 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int32", ptrt, native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, h, 1))) }
+  else if pt == 8 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_uint32", ptrt, native_ctx_i64t(ctx), nemit_widen_i32_i64(ctx, h, 0))) }
+  else if pt == 9 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_uint64", ptrt, native_ctx_i64t(ctx), h)) }
+  else if pt == 10 { nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int128", ptrt, native_ctx_i128t(ctx), h)) }
   # A raw `i32` (a widened variant-tag temporary) widens to i64 before boxing;
   # `kaix_int` takes an i64. Non-negative tag, so `zext`.
-  else if reg == 0 and pt == 4 {
+  else if pt == 4 {
     let w = llvm_build_zext(native_ctx_b(ctx), h, native_ctx_i64t(ctx))
-    nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w))
+    nemit_store_reg(ctx, name, ncall_sig1(ctx, "kaix_int", ptrt, native_ctx_i64t(ctx), w))
   }
   else { nemit_store_reg(ctx, name, h) }
 }

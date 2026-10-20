@@ -1,37 +1,527 @@
-# compiler/emit_native_ffi.kai — `extern "C" fn` shim synthesis for the
-# in-process libLLVM native backend (FFI v1 + v2).
-#
-# A `KFnFfi(c_symbol, param_kinds, ret_kind)` carries NO lowered body: the
-# native shim is synthesised here, the mirror of `emit_ffi_v2_shim_body`
-# (emit_ffi_c.kai) and `emit_ffi_shim_body` (emit_c.kai). The KIR already
-# resolved `c_symbol` (the issue #261 override), so this module never
-# re-reads the tag — one resolver, not three (asu).
-#
-# Shape (per param, then the call):
-#   1. unbox each boxed wrapper arg to its raw C scalar (box->raw BORROWS,
-#      no decref) — or, for a struct-by-value param, marshal it per the
-#      platform C ABI (emit_native_abi + emit_native_struct);
-#   2. call the raw extern symbol;
-#   3. decref each boxed input (mirror of emit_c's arg decrefs);
-#   4. re-box the raw return into a fresh `KaiValue *`.
-#
-# RC discipline (asu, load-bearing): the input decref runs AFTER the extern
-# call returns. A String arg unboxes to a borrowed `char *` aliasing inside
-# the boxed cell; decref'ing before the call finishes reading it is a
-# use-after-free. The raw return has no RC; the re-box mints the owner.
-#
-# Struct-by-value crosses the boundary with the platform C-ABI
-# classification done in the emitter (issue #1030): AAPCS64 (arm64 Darwin)
-# and x86-64 SysV are marshalled; any other target keeps the honest reject
-# (a small struct's coercion into iN / [n x float] / sret is frontend work
-# LLVM does not derive from a struct value).
+#[doc("""
+Native FFI: struct-by-value classification, marshalling and calls.
 
-import compiler.util
-import compiler.kir
+compiler/emit_native_abi.kai — C-ABI classification for struct-by-value
+FFI on the native backend.
+
+LLVM does NOT derive the platform calling convention from a struct
+value: deciding HOW an aggregate crosses the C boundary (coerced into
+integer/float registers, passed indirectly, returned through a hidden
+sret pointer) is the frontend's job. This module is that decision,
+mirrored from clang's lowering for the two supported targets:
+
+  - AArch64 (AAPCS64): an HFA (1-4 same-width float fields after
+    flattening) rides float registers as [n x float] / [n x double];
+    any other aggregate <= 16 bytes rides GPRs (params round up to
+    i64 / [2 x i64], returns use the exact bit width); larger crosses
+    indirectly (plain pointer param / sret return).
+  - x86-64 SysV: per-eightbyte classification. An eightbyte whose
+    fields are all float crosses in an SSE register (a float / double
+    slot — bit-identical to clang's <2 x float>); any integer field
+    makes it INTEGER at the exact remaining width (i64 / i32 / i24 /
+    ...). > 16 bytes crosses in memory (byval param / sret return).
+
+Pure classification: KFfiField lists in, AbiPass descriptors out. NO
+LLVM handles live here — the emitter (emit_native_ffi) turns slots
+into LLVM types — so this layer sits entirely outside the Perceus
+handle-exclusion regime.
+
+compiler/emit_native_struct.kai — struct-by-value FFI marshalling for
+the native libLLVM backend (issue #1030).
+
+The classifier (emit_native_abi) decides HOW each aggregate crosses the
+boundary; this module turns that decision into IR, mirroring clang's
+lowering for the target the classifier picked:
+
+  PARAM  AbiCoerce  -> alloca the struct, store fields, load it back AS
+                       the coerce type (iN / float / [n x T]), pass the
+                       loaded value.
+         AbiIndirect-> alloca the struct, store fields, pass the pointer
+                       (stamped `byval` when the ABI wants a caller copy).
+  RETURN AbiCoerce  -> the extern returns the coerce type; store it into
+                       a struct-typed alloca, reload each field, re-box.
+         AbiSret    -> alloca the struct, pass its pointer as hidden arg 0
+                       with `sret`; the call returns void; reload + re-box.
+
+HAZARD (#923): an LLVM `Type*`/`Value*` must never enter the Perceus RC
+regime — a dropped handle deref's a raw LLVM pointer and corrupts. Every
+handle here is bound by a `let` whose RHS is a native-prim call (kaic1
+excludes those binders) or lives in a C `llvm_buf`; none rides a kaikai
+list/record/tuple. The struct LLVM types are recreated from the KFfiField
+list on demand (LLVM dedups identical struct types, so the recreated type
+IS the one the alloca used) — the kinds travel, never the handle.
+
+compiler/emit_native_ffi.kai — `extern "C" fn` shim synthesis for the
+in-process libLLVM native backend (FFI v1 + v2).
+
+A `KFnFfi(c_symbol, param_kinds, ret_kind)` carries NO lowered body: the
+native shim is synthesised here, the mirror of `emit_ffi_v2_shim_body`
+(emit_ffi_c.kai) and `emit_ffi_shim_body` (emit_c.kai). The KIR already
+resolved `c_symbol` (the issue #261 override), so this module never
+re-reads the tag — one resolver, not three (asu).
+
+Shape (per param, then the call):
+  1. unbox each boxed wrapper arg to its raw C scalar (box->raw BORROWS,
+     no decref) — or, for a struct-by-value param, marshal it per the
+     platform C ABI (emit_native_abi + emit_native_struct);
+  2. call the raw extern symbol;
+  3. decref each boxed input (mirror of emit_c's arg decrefs);
+  4. re-box the raw return into a fresh `KaiValue *`.
+
+RC discipline (asu, load-bearing): the input decref runs AFTER the extern
+call returns. A String arg unboxes to a borrowed `char *` aliasing inside
+the boxed cell; decref'ing before the call finishes reading it is a
+use-after-free. The raw return has no RC; the re-box mints the owner.
+
+Struct-by-value crosses the boundary with the platform C-ABI
+classification done in the emitter (issue #1030): AAPCS64 (arm64 Darwin)
+and x86-64 SysV are marshalled; any other target keeps the honest reject
+(a small struct's coercion into iN / [n x float] / sret is frontend work
+LLVM does not derive from a struct value).
+""")]
+
 import compiler.emit_native_fn
-import compiler.emit_native_abi
-import compiler.emit_native_struct
-import compiler.emit_native_call
+import compiler.emit_native_ops_cons
+import compiler.kir
+import compiler.util
+
+#[doc("Target C ABI for aggregate FFI marshalling on the native backend.")]
+type AbiPlat = PlatA64 | PlatSysV | PlatNone
+
+#[doc("One register slot of a coerced aggregate: an iN integer (bit width), a float, or a double.")]
+type AbiSlot = ASInt(Int) | ASF32 | ASF64
+
+#[doc("""How one struct-by-value crosses the C boundary.
+
+`AbiCoerce(slots, as_array)`: in registers as the given slots — a single
+slot is a bare scalar; multiple slots emit as `[n x T]` when `as_array`
+(the AAPCS64 form) or as a literal struct (the SysV form).
+`AbiIndirect(byval)`: via a pointer to a caller-built temp, stamped
+`byval` when the ABI wants the caller-copy attribute (SysV memory class).
+`AbiSret`: returned through a hidden pointer param. `AbiNoAbi`: not
+classifiable — the emitter keeps the honest reject.""")]
+type AbiPass
+  = AbiCoerce([AbiSlot], Bool)
+  | AbiIndirect(Bool)
+  | AbiSret
+  | AbiNoAbi(String)
+
+#[doc("Decode the `native_target_abi` prim code: 1 = AArch64, 2 = x86-64 SysV, other = unsupported.")]
+fn abi_plat_of_code(c: Int) : AbiPlat =
+  if c == 1 { PlatA64 } else { if c == 2 { PlatSysV } else { PlatNone } }
+
+#[doc("Classify how a struct-by-value PARAM crosses the boundary on the platform.")]
+fn abi_classify_param(fields: [KFfiField], plat: AbiPlat) : AbiPass =
+  abi_classify(fields, plat, false)
+
+#[doc("Classify how a struct-by-value RETURN crosses the boundary on the platform.")]
+fn abi_classify_ret(fields: [KFfiField], plat: AbiPlat) : AbiPass =
+  abi_classify(fields, plat, true)
+
+fn abi_classify(fields: [KFfiField], plat: AbiPlat, is_ret: Bool) : AbiPass =
+  if not abi_fields_ok(fields) { AbiNoAbi("unsupported field type") }
+  else {
+    match plat {
+      PlatA64  -> a64_classify(fields, is_ret)
+      PlatSysV -> sysv_classify(fields, is_ret)
+      PlatNone -> AbiNoAbi("no C-ABI classification for this target")
+    }
+  }
+
+# ---- field metrics --------------------------------------------------
+
+# Only kinds with an exact C width may live in a marshalled struct
+# (String/Foreign fields have no C-layout story; empty structs have no
+# well-defined ABI class).
+fn abi_kind_ok(k: KFfiKind) : Bool = match k {
+  KFfiInt            -> true
+  KFfiReal           -> true
+  KFfiBool           -> true
+  KFfiChar           -> true
+  KFfiFixed(_, _, _) -> true
+  KFfiFixedVal(_, _) -> true
+  KFfiStruct(fs)     -> abi_fields_ok(fs)
+  _                  -> false
+}
+
+fn abi_fields_ok(fields: [KFfiField]) : Bool = match fields {
+  []                    -> false
+  [KFF(_, k), ...rest]  -> abi_kind_ok(k) and (match rest {
+    [] -> true
+    _  -> abi_fields_ok(rest)
+  })
+}
+
+fn abi_kind_align(k: KFfiKind) : Int = match k {
+  KFfiBool              -> 4
+  KFfiChar              -> 4
+  KFfiFixed(bits, _, _) -> bits / 8
+  KFfiFixedVal(bits, _) -> bits / 8
+  KFfiStruct(fs)        -> abi_fields_align(fs, 1)
+  _                     -> 8   # KFfiInt / KFfiReal (int64_t / double)
+}
+
+fn abi_fields_align(fields: [KFfiField], best: Int) : Int = match fields {
+  [] -> best
+  [KFF(_, k), ...rest] -> {
+    let a = abi_kind_align(k)
+    abi_fields_align(rest, if a > best { a } else { best })
+  }
+}
+
+# Every supported scalar kind is size == align; a struct pads.
+fn abi_kind_size(k: KFfiKind) : Int = match k {
+  KFfiStruct(fs) -> abi_struct_size(fs)
+  _              -> abi_kind_align(k)
+}
+
+fn abi_struct_size(fields: [KFfiField]) : Int =
+  abi_align_up(abi_fields_end(fields, 0), abi_fields_align(fields, 1))
+
+# End of the last field's data (offset + size) BEFORE trailing padding —
+# the extent the SysV eightbyte slots must cover.
+fn abi_fields_end(fields: [KFfiField], cur: Int) : Int = match fields {
+  [] -> cur
+  [KFF(_, k), ...rest] ->
+    abi_fields_end(rest, abi_align_up(cur, abi_kind_align(k)) + abi_kind_size(k))
+}
+
+fn abi_align_up(x: Int, a: Int) : Int = ((x + a - 1) / a) * a
+
+# ---- flattening -----------------------------------------------------
+
+# One scalar leaf of the flattened aggregate: absolute offset, size,
+# is-float. Order is irrelevant to both classifiers.
+type AbiLeaf = AL(Int, Int, Bool)
+
+fn abi_kind_isf(k: KFfiKind) : Bool = match k {
+  KFfiReal             -> true
+  KFfiFixed(_, _, isf) -> isf
+  _                    -> false
+}
+
+fn abi_leaves(fields: [KFfiField], base: Int, cur: Int, acc: [AbiLeaf]) : [AbiLeaf] = match fields {
+  [] -> acc
+  [KFF(_, k), ...rest] -> {
+    let off = abi_align_up(cur, abi_kind_align(k))
+    let acc2 = match k {
+      KFfiStruct(nfs) -> abi_leaves(nfs, base + off, 0, acc)
+      _               -> [AL(base + off, abi_kind_size(k), abi_kind_isf(k)), ...acc]
+    }
+    abi_leaves(rest, base, off + abi_kind_size(k), acc2)
+  }
+}
+
+# ---- AAPCS64 --------------------------------------------------------
+
+# HFA: 1-4 leaves, all float, all one width. Returns the element size
+# (4 or 8), or 0 when not an HFA.
+fn abi_hfa_elem(leaves: [AbiLeaf]) : Int = match leaves {
+  [] -> 0
+  [AL(_, s, isf), ...rest] ->
+    if isf and list_length(rest) < 4 and abi_hfa_rest(rest, s) { s } else { 0 }
+}
+
+fn abi_hfa_rest(leaves: [AbiLeaf], s: Int) : Bool = match leaves {
+  [] -> true
+  [AL(_, s2, isf), ...rest] -> isf and s2 == s and abi_hfa_rest(rest, s)
+}
+
+fn a64_classify(fields: [KFfiField], is_ret: Bool) : AbiPass = {
+  let leaves = abi_leaves(fields, 0, 0, [])
+  let hfa = abi_hfa_elem(leaves)
+  if hfa > 0 { a64_hfa_pass(hfa, list_length(leaves)) }
+  else { a64_gpr_pass(abi_struct_size(fields), is_ret) }
+}
+
+fn a64_hfa_pass(elem_size: Int, n: Int) : AbiPass =
+  AbiCoerce(abi_repeat(if elem_size == 4 { ASF32 } else { ASF64 }, n), true)
+
+# Non-HFA aggregate: <= 8 bytes rides one GPR (a param rounds up to i64, a
+# return uses the exact bit width — clang's i64-param / i24-return split);
+# <= 16 rides a GPR pair; larger crosses indirect (sret return / byval-less
+# pointer param).
+fn a64_gpr_pass(size: Int, is_ret: Bool) : AbiPass =
+  if size <= 8 { AbiCoerce([ASInt(if is_ret { size * 8 } else { 64 })], false) }
+  else if size <= 16 { AbiCoerce([ASInt(64), ASInt(64)], true) }
+  else if is_ret { AbiSret }
+  else { AbiIndirect(false) }
+
+fn abi_repeat(s: AbiSlot, n: Int) : [AbiSlot] =
+  if n <= 0 { [] } else { [s, ...abi_repeat(s, n - 1)] }
+
+# ---- x86-64 SysV ----------------------------------------------------
+
+fn sysv_classify(fields: [KFfiField], is_ret: Bool) : AbiPass = {
+  let size = abi_struct_size(fields)
+  if size > 16 {
+    if is_ret { AbiSret } else { AbiIndirect(true) }
+  } else {
+    AbiCoerce(sysv_slots(abi_leaves(fields, 0, 0, []), 0, abi_fields_end(fields, 0)), false)
+  }
+}
+
+fn sysv_slots(leaves: [AbiLeaf], lo: Int, end: Int) : [AbiSlot] =
+  if lo >= end { [] }
+  else {
+    let hi = if end < lo + 8 { end } else { lo + 8 }
+    [sysv_slot(leaves, lo, hi), ...sysv_slots(leaves, lo + 8, end)]
+  }
+
+# SSE when every field in the eightbyte is float (a lone float stays a
+# float; two packed floats or a double take the full 8 bytes); any
+# integer makes the eightbyte INTEGER at the exact remaining width.
+fn sysv_slot(leaves: [AbiLeaf], lo: Int, hi: Int) : AbiSlot =
+  if sysv_all_float(leaves, lo, hi) {
+    if hi - lo <= 4 { ASF32 } else { ASF64 }
+  } else { ASInt((hi - lo) * 8) }
+
+fn sysv_all_float(leaves: [AbiLeaf], lo: Int, hi: Int) : Bool = match leaves {
+  [] -> true
+  [AL(off, sz, isf), ...rest] ->
+    (isf or off >= hi or off + sz <= lo) and sysv_all_float(rest, lo, hi)
+}
+
+# The LLVM struct type for a struct-by-value FFI type: a non-packed struct
+# over each field's LLVM type (recursive for nested structs).
+#[doc("The LLVM struct type mirroring a struct-by-value FFI type's C layout.")]
+fn nstruct_llvm_type(ctx: Handle, fields: [KFfiField]) : Handle = {
+  let elems = llvm_buf_new()
+  nstruct_elem_types(ctx, fields, elems)
+  let t = llvm_struct_type(native_ctx_m(ctx), elems)
+  llvm_buf_free(elems)
+  t
+}
+
+fn nstruct_elem_types(ctx: Handle, fields: [KFfiField], elems: Handle) : Unit = match fields {
+  [] -> ()
+  [KFF(_, k), ...rest] -> {
+    # Capture the field type in a `let` before pushing (handle-binder
+    # exclusion): a Type* passed inline as a call arg is RC-clobbered by
+    # the type-blind kaic1. Same rule holds throughout this module.
+    let ft = nstruct_field_llvm_type(ctx, k)
+    llvm_buf_push(elems, ft)
+    nstruct_elem_types(ctx, rest, elems)
+  }
+}
+
+# The LLVM type of one struct FIELD at its exact C width — the same
+# scalar-width map the shim uses, plus nested structs.
+fn nstruct_field_llvm_type(ctx: Handle, k: KFfiKind) : Handle = match k {
+  KFfiInt        -> native_ctx_i64t(ctx)
+  KFfiReal       -> native_ctx_f64t(ctx)
+  KFfiBool       -> native_ctx_i32t(ctx)
+  KFfiChar       -> native_ctx_i32t(ctx)
+  KFfiFixed(bits, _, isf) ->
+    if isf { llvm_float_type(native_ctx_m(ctx)) }
+    else { llvm_int_type(native_ctx_m(ctx), bits) }
+  KFfiFixedVal(bits, _) -> llvm_int_type(native_ctx_m(ctx), bits)
+  KFfiStruct(fs) -> nstruct_llvm_type(ctx, fs)
+  _              -> native_ctx_i64t(ctx)
+}
+
+# The LLVM type of one ABI slot (an eightbyte / register slot).
+fn nabi_slot_type(ctx: Handle, s: AbiSlot) : Handle = match s {
+  ASInt(bits) -> llvm_int_type(native_ctx_m(ctx), bits)
+  ASF32       -> llvm_float_type(native_ctx_m(ctx))
+  ASF64       -> native_ctx_f64t(ctx)
+}
+
+# The LLVM arg/return type a coerced aggregate crosses as. One slot is the
+# bare scalar; several become `[n x T]` (AAPCS64 HFA / GPR pair) or a
+# literal struct `{ T0, T1 }` (SysV two-eightbyte mixed classes).
+#[doc("The LLVM arg/return type a coerced aggregate crosses as (scalar, [n x T], or literal struct).")]
+fn nabi_coerce_type(ctx: Handle, slots: [AbiSlot], as_array: Bool) : Handle = match slots {
+  [s]         -> nabi_slot_type(ctx, s)
+  _           -> if as_array {
+                   let et = nabi_slot_type_first(ctx, slots)
+                   llvm_array_type(et, list_length(slots))
+                 } else { nabi_slot_struct_type(ctx, slots) }
+}
+
+fn nabi_slot_type_first(ctx: Handle, slots: [AbiSlot]) : Handle = match slots {
+  [s, ..._] -> nabi_slot_type(ctx, s)
+  []        -> native_ctx_i64t(ctx)
+}
+
+fn nabi_slot_struct_type(ctx: Handle, slots: [AbiSlot]) : Handle = {
+  let elems = llvm_buf_new()
+  nabi_push_slot_types(ctx, slots, elems)
+  let t = llvm_struct_type(native_ctx_m(ctx), elems)
+  llvm_buf_free(elems)
+  t
+}
+
+fn nabi_push_slot_types(ctx: Handle, slots: [AbiSlot], elems: Handle) : Unit = match slots {
+  [] -> ()
+  [s, ...rest] -> {
+    let st = nabi_slot_type(ctx, s)
+    llvm_buf_push(elems, st)
+    nabi_push_slot_types(ctx, rest, elems)
+  }
+}
+
+# --- param marshalling ------------------------------------------------
+
+# Materialise a boxed struct param into an alloca of the real struct type,
+# storing each field (read from its box, narrowed to its C width) through a
+# struct-GEP. Returns the struct pointer — the base every param pass reads.
+#[doc("Alloca a struct arg and store each boxed field; returns the struct pointer.")]
+fn nstruct_fill_arg(ctx: Handle, fields: [KFfiField], boxed: Handle) : Handle / Console = {
+  let sty = nstruct_llvm_type(ctx, fields)
+  let slot = llvm_build_alloca_entry(ctx, sty, "ffi.arg")
+  nstruct_store_fields(ctx, fields, boxed, sty, slot, 0)
+  slot
+}
+
+fn nstruct_store_fields(ctx: Handle, fields: [KFfiField], boxed: Handle,
+                        sty: Handle, slot: Handle, idx: Int) : Unit / Console = match fields {
+  [] -> ()
+  [KFF(fname, fk), ...rest] -> {
+    let nm = llvm_build_global_string(native_ctx_b(ctx), fname)
+    let fbox = ncall_sig2(ctx, "kaix_field_borrow", native_ctx_ptrt(ctx),
+                          native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), boxed, nm)
+    let dst = llvm_build_struct_gep(native_ctx_b(ctx), sty, slot, idx)
+    nstruct_store_field(ctx, fk, fbox, dst)
+    nstruct_store_fields(ctx, rest, boxed, sty, slot, idx + 1)
+  }
+}
+
+# Write one boxed field into its struct-GEP address. A nested struct field
+# is stored INLINE — GEP addresses the sub-struct within the parent's
+# storage, and its own fields recurse into it (NOT a pointer store: the
+# child struct is not a separate object at the C ABI).
+fn nstruct_store_field(ctx: Handle, k: KFfiKind, fbox: Handle, dst: Handle) : Unit / Console = match k {
+  KFfiStruct(nfs) -> {
+    let nsty = nstruct_llvm_type(ctx, nfs)
+    nstruct_store_fields(ctx, nfs, fbox, nsty, dst, 0)
+  }
+  _ -> {
+    let raw = nstruct_unbox_field(ctx, k, fbox)
+    llvm_build_store(native_ctx_b(ctx), raw, dst)
+  }
+}
+
+# Box -> raw C-width scalar value for one non-struct struct field.
+fn nstruct_unbox_field(ctx: Handle, k: KFfiKind, fbox: Handle) : Handle / Console = match k {
+  KFfiInt  -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), fbox)
+  KFfiReal -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), fbox)
+  KFfiBool -> ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), fbox)
+  KFfiChar -> ncall_sig1(ctx, "kaix_to_char", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), fbox)
+  KFfiFixed(bits, _, isf) ->
+    if isf {
+      let r = ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), fbox)
+      llvm_build_fpcast(native_ctx_b(ctx), r, llvm_float_type(native_ctx_m(ctx)))
+    } else {
+      let i = ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), fbox)
+      llvm_build_trunc(native_ctx_b(ctx), i, llvm_int_type(native_ctx_m(ctx), bits))
+    }
+  KFfiFixedVal(bits, _) -> {
+    let i = ncall_sig1(ctx, "kaix_fixed_val_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), fbox)
+    llvm_build_trunc(native_ctx_b(ctx), i, llvm_int_type(native_ctx_m(ctx), bits))
+  }
+  _ -> nemit_null(ctx)
+}
+
+# Load the coerce-typed value of a filled struct arg: reinterpret the
+# alloca as the coerce type (a plain typed load — the pointer is the same
+# storage) and load. This is the register-class value the extern takes.
+#[doc("Load a filled struct alloca back as its ABI coerce type, for a register-class param.")]
+fn nstruct_load_coerced(ctx: Handle, slot: Handle, coerce_ty: Handle) : Handle / Console =
+  llvm_build_load(native_ctx_b(ctx), coerce_ty, slot)
+
+# --- return marshalling ----------------------------------------------
+
+# Re-box a struct RETURN sitting in a struct-typed alloca into a fresh
+# KAI_RECORD. Each field is loaded via struct-GEP, widened + boxed, then
+# `nemit_record_call` builds the record (it frees the two buffers).
+#[doc("Re-box a struct return (in a struct-typed alloca) into a fresh KAI_RECORD.")]
+fn nstruct_rebox_from_slot(ctx: Handle, fields: [KFfiField], sty: Handle, slot: Handle) : Handle / Console = {
+  let fieldbuf = llvm_buf_new()
+  let namebuf  = llvm_buf_new()
+  nstruct_rebox_fields(ctx, fields, sty, slot, fieldbuf, namebuf, 0)
+  nemit_record_call(ctx, fieldbuf, namebuf)
+}
+
+fn nstruct_rebox_fields(ctx: Handle, fields: [KFfiField], sty: Handle, slot: Handle,
+                        fieldbuf: Handle, namebuf: Handle, idx: Int) : Unit / Console = match fields {
+  [] -> ()
+  [KFF(fname, fk), ...rest] -> {
+    let dst = llvm_build_struct_gep(native_ctx_b(ctx), sty, slot, idx)
+    let boxed = nstruct_rebox_field(ctx, fk, dst)
+    let nv = llvm_build_global_string(native_ctx_b(ctx), fname)
+    llvm_buf_push(fieldbuf, boxed)
+    llvm_buf_push(namebuf, nv)
+    nstruct_rebox_fields(ctx, rest, sty, slot, fieldbuf, namebuf, idx + 1)
+  }
+}
+
+# Load one field from its struct-GEP address at its C width, widen, and
+# box. A nested struct field re-boxes recursively (its GEP address IS the
+# nested struct's storage).
+fn nstruct_rebox_field(ctx: Handle, k: KFfiKind, dst: Handle) : Handle / Console = match k {
+  KFfiInt -> {
+    let v = llvm_build_load(native_ctx_b(ctx), native_ctx_i64t(ctx), dst)
+    ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), v)
+  }
+  KFfiReal -> {
+    let v = llvm_build_load(native_ctx_b(ctx), native_ctx_f64t(ctx), dst)
+    ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), v)
+  }
+  KFfiBool -> {
+    let v = llvm_build_load(native_ctx_b(ctx), native_ctx_i32t(ctx), dst)
+    ncall_sig1(ctx, "kaix_bool", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), v)
+  }
+  KFfiChar -> {
+    let v = llvm_build_load(native_ctx_b(ctx), native_ctx_i32t(ctx), dst)
+    ncall_sig1(ctx, "kaix_char", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), v)
+  }
+  KFfiFixed(bits, signed, isf) -> nstruct_rebox_fixed(ctx, bits, signed, isf, dst)
+  KFfiFixedVal(bits, signed) -> nstruct_rebox_fixed_val(ctx, bits, signed, dst)
+  KFfiStruct(nfs) -> {
+    let nsty = nstruct_llvm_type(ctx, nfs)
+    nstruct_rebox_from_slot(ctx, nfs, nsty, dst)
+  }
+  _ -> nemit_call0(ctx, "kaix_unit")
+}
+
+# Load a fixed-width field at its EXACT C width (an `iN` load — a wider
+# load would read past the field into neighbouring struct bytes, the
+# `0xFF404040`-for-a-u8 bug), then widen to the i64/f64 box payload.
+fn nstruct_rebox_fixed(ctx: Handle, bits: Int, signed: Bool, isf: Bool, dst: Handle) : Handle / Console =
+  if isf {
+    let r = llvm_build_load(native_ctx_b(ctx), llvm_float_type(native_ctx_m(ctx)), dst)
+    let w = llvm_build_fpcast(native_ctx_b(ctx), r, native_ctx_f64t(ctx))
+    ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), w)
+  } else {
+    let r = llvm_build_load(native_ctx_b(ctx), llvm_int_type(native_ctx_m(ctx), bits), dst)
+    let w = if signed { llvm_build_sext(native_ctx_b(ctx), r, native_ctx_i64t(ctx)) }
+            else { llvm_build_zext(native_ctx_b(ctx), r, native_ctx_i64t(ctx)) }
+    ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w)
+  }
+
+# A KFfiFixed field always widens to the box's i64/f64 payload; the field
+# storage already holds the exact C width, so the struct-GEP load reads iN
+# and we sext/zext to i64. (The fixed-width scalar path in the shim does
+# the same; here the load type must match the field's declared width.)
+fn nstruct_rebox_fixed_val(ctx: Handle, bits: Int, signed: Bool, dst: Handle) : Handle / Console = {
+  let r = llvm_build_load(native_ctx_b(ctx), llvm_int_type(native_ctx_m(ctx), bits), dst)
+  let w = if signed { llvm_build_sext(native_ctx_b(ctx), r, native_ctx_i64t(ctx)) }
+          else { llvm_build_zext(native_ctx_b(ctx), r, native_ctx_i64t(ctx)) }
+  let ctor = if bits == 32 { if signed { "kaix_int32" } else { "kaix_uint32" } } else { "kaix_uint64" }
+  ncall_sig1(ctx, ctor, native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w)
+}
+
+# Store a coerce-typed return value into a struct-typed alloca (the reverse
+# of the param load): the extern returned `coerce_ty`, we stash it in a
+# struct slot so the per-field re-box reads real field offsets. Returns the
+# struct alloca.
+#[doc("Stash a coerce-typed struct return into a struct-typed alloca for per-field re-box.")]
+fn nstruct_stash_coerced(ctx: Handle, sty: Handle, coerce_ty: Handle, raw: Handle) : Handle / Console = {
+  let slot = llvm_build_alloca_entry(ctx, sty, "ffi.ret")
+  llvm_build_store(native_ctx_b(ctx), raw, slot)
+  slot
+}
 
 # Synthesise the whole `kai_<name>` wrapper for an `extern "C" fn`.
 pub fn nemit_ffi_fn(ctx: Handle, sym: String, f: KFn, c_symbol: String,

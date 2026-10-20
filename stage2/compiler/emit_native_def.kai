@@ -1,48 +1,246 @@
-# compiler/emit_native_def.kai — builtin/default effect-handler install
-# for the in-process libLLVM native backend. Fills
-# `kai_main_install_defaults` / `kai_main_teardown_defaults` so a program
-# that performs a BUILTIN effect (`Stdout.print`, the most common one)
-# finds its default handler at `main` and runs to parity with the
-# C-direct oracle.
-#
-# There is ONE class of default at emit time. The builtin effects
-# (Stdout/Stderr/Stdin/…) are stdlib source `DEffect` decls
-# carrying an all-`$extern_handler` `default { }` block, the same shape
-# a user effect uses (Clock in stdlib/time.kai) — so `kir_default_handlers`
-# (kir_lower) resolves both through `find_effect_default_block`. The
-# resulting `[KDefault]` reaches us on `KProgram.defaults`, already in
-# install order; we never re-walk the AST.
-#
-# The IR mirrors the C-direct emit (`default_setups_from_block`,
-# emit_c.kai) and the LLVM-text emit (`lvm_default_install_for_effect`,
-# emit_llvm.kai), translated to C-API `kai_llvm_build_*`. Per effect:
-#   - a MODULE-LEVEL Ev blob + KaiEvidence node (NOT entry-block allocas:
-#     the evidence stays pushed for the whole program, so it must outlive
-#     this fn's frame — the C-direct oracle uses `static EvStdout` for the
-#     same reason);
-#   - `kaix_fresh_handler_id()` stamped into the Ev header (field 0);
-#   - each op's `kaix_default_<eff>_<op>` forwarder stored at its field
-#     (`nfx_op_base` + position) via `kaix_ev_set_op`;
-#   - a 3-arg `kaix_evidence_push(node, name, ev)` — NO jmp_buf, because a
-#     default ALWAYS resumes (no discard landing pad, unlike the user
-#     handler's `kaix_evidence_push_with_jmp` in emit_native_fx2).
-# Teardown pops in reverse install order so the evidence stack drains LIFO.
-#
-# SOUNDNESS (handle discipline): every helper here that
-# returns a `Handle` (an LLVM `Value*`/`GlobalVariable*`) is listed in
-# stage1's `native_handle_fns()`. The module globals built by
-# `llvm_add_global_zeroed` are handles too; they are captured in `let`
-# bindings (the handle-binder exclusion) so kaic1's type-blind Perceus
-# never `kai_decref`s a raw LLVM pointer.
+#[doc("""
+Native declaration environment: references, thunks, module keys and definitions.
 
-import compiler.util
-import compiler.symtab
-import compiler.kir
-import compiler.spec_names
+What the bodies of a partition's functions reach outside themselves.
+
+A partition's object depends on the declaration of each function it
+calls or closes over, on the place of each operation it performs among
+its effect's, and on each handler it installs. An indirect call carries
+a value and names no symbol. Each reference is kept once, in the order
+the bodies name it, so the text built from them is the same for the same
+functions.
+
+What a partition's object takes from the declaration of a function, and
+its text for a cache key.
+
+A partition defines its own functions and declares every other one. A
+declaration is not just a symbol: it fixes the call ABI (the slots of
+the signature, and an evidence frame when the function carries one) and
+the attributes the optimiser may rely on at each call.
+
+The emitter is handed the `NDeclEnv` the key was read from, so an
+object cannot depend on an analysis its key did not see.
+
+The cache key of a native-modular partition.
+
+A partition's object is content-addressed: a hash of the text of
+everything it is emitted from. That is the functions it defines, body
+and declaration; the declaration of every function they call in another
+partition; the operations, in order, of every effect they perform; the
+handlers they install; and, for the partition that owns the program's
+singletons, the text of those.
+
+Keying on what a partition references, not on the whole program, keeps
+the cache incremental: a body edited in one module re-emits that
+module's partition alone, and so does a type, since a function's KIR
+already spells the layout it uses. Nothing serialised can go stale: the
+key text carries the shape of all the object depends on.
+
+compiler/emit_native_def.kai — builtin/default effect-handler install
+for the in-process libLLVM native backend. Fills
+`kai_main_install_defaults` / `kai_main_teardown_defaults` so a program
+that performs a BUILTIN effect (`Stdout.print`, the most common one)
+finds its default handler at `main` and runs to parity with the
+C-direct oracle.
+
+There is ONE class of default at emit time. The builtin effects
+(Stdout/Stderr/Stdin/…) are stdlib source `DEffect` decls
+carrying an all-`$extern_handler` `default { }` block, the same shape
+a user effect uses (Clock in stdlib/time.kai) — so `kir_default_handlers`
+(kir_lower) resolves both through `find_effect_default_block`. The
+resulting `[KDefault]` reaches us on `KProgram.defaults`, already in
+install order; we never re-walk the AST.
+
+The IR mirrors the C-direct emit (`default_setups_from_block`,
+emit_c.kai) and the LLVM-text emit (`lvm_default_install_for_effect`,
+emit_llvm.kai), translated to C-API `kai_llvm_build_*`. Per effect:
+  - a MODULE-LEVEL Ev blob + KaiEvidence node (NOT entry-block allocas:
+    the evidence stays pushed for the whole program, so it must outlive
+    this fn's frame — the C-direct oracle uses `static EvStdout` for the
+    same reason);
+  - `kaix_fresh_handler_id()` stamped into the Ev header (field 0);
+  - each op's `kaix_default_<eff>_<op>` forwarder stored at its field
+    (`nfx_op_base` + position) via `kaix_ev_set_op`;
+  - a 3-arg `kaix_evidence_push(node, name, ev)` — NO jmp_buf, because a
+    default ALWAYS resumes (no discard landing pad, unlike the user
+    handler's `kaix_evidence_push_with_jmp` in emit_native_fx2).
+Teardown pops in reverse install order so the evidence stack drains LIFO.
+
+SOUNDNESS (handle discipline): every helper here that
+returns a `Handle` (an LLVM `Value*`/`GlobalVariable*`) is listed in
+stage1's `native_handle_fns()`. The module globals built by
+`llvm_add_global_zeroed` are handles too; they are captured in `let`
+bindings (the handle-binder exclusion) so kaic1's type-blind Perceus
+never `kai_decref`s a raw LLVM pointer.
+""")]
+
+import compiler.ast
+import compiler.effect_instance
 import compiler.emit_native_fn
 import compiler.emit_native_fx
-import compiler.emit_native_fx2
-import compiler.emit_native_call
+import compiler.emit_shared
+import compiler.fn_index
+import compiler.infer_index
+import compiler.kir
+import compiler.kir_dump
+import compiler.kir_syms
+import compiler.purity
+import compiler.purity_traps
+import compiler.spec_names
+import compiler.symtab
+import compiler.util
+
+#[doc("What a set of functions reaches outside itself, each once and newest first: the symbols called or closed over, the effects performed, the handlers installed. `seen` indexes the symbols.")]
+type NRefs = { seen: NameIndex[String], callees: [String], effects: [SymId], installs: [String] }
+
+#[doc("The symbols the bodies of `fns` take as a value, each indexed under itself: a closure's thunk and a cleanup's.")]
+fn nrefs_values(fns: [KFn]) : NameIndex[String] = nvals_fns(fns, idx_empty())
+
+#[doc("Whether `sym` is among the symbols `vals` holds.")]
+fn nrefs_valued(vals: NameIndex[String], sym: String) : Bool = list_has(idx_chain(vals, sym), sym)
+
+#[doc("`vals` with `sym` held too.")]
+fn nrefs_with_value(vals: NameIndex[String], sym: String) : NameIndex[String] =
+  if nrefs_valued(vals, sym) { vals } else { idx_prepend(vals, sym, sym) }
+
+fn nvals_fns(fns: [KFn], v: NameIndex[String]) : NameIndex[String] = match fns {
+  [] -> v
+  [f, ...rest] -> nvals_fns(rest, nvals_blocks(f.blocks, v))
+}
+
+fn nvals_blocks(bs: [KBlock], v: NameIndex[String]) : NameIndex[String] = match bs {
+  [] -> v
+  [b, ...rest] -> nvals_blocks(rest, nvals_stmts(b.stmts, v))
+}
+
+fn nvals_stmts(ss: [KStmt], v: NameIndex[String]) : NameIndex[String] = match ss {
+  [] -> v
+  [s, ...rest] -> nvals_stmts(rest, match s {
+    KLet(_, _, KClosure(sym, _, _), _) -> nrefs_with_value(v, sym)
+    KDo(KClosure(sym, _, _), _)        -> nrefs_with_value(v, sym)
+    KSetCleanup(_, _, thunk, _)        -> nrefs_with_value(v, thunk)
+    KLet(_, _, _, _)                   -> v
+    KDo(_, _)                          -> v
+    KRC(_, _)                          -> v
+    KStore(_, _, _)                    -> v
+    KInstall(_, _, _, _, _, _)         -> v
+    KPop(_, _, _)                      -> v
+    KBindEvState(_, _, _, _)           -> v
+    KBindSelfState(_, _)               -> v
+    KRunCleanup(_, _, _)               -> v
+  })
+}
+
+#[doc("What the bodies of `fns` reach.")]
+fn nrefs_of(fns: [KFn]) : NRefs = nrefs_fns(fns, NRefs { seen: idx_empty(), callees: [], effects: [], installs: [] })
+
+#[doc("Whether the functions `r` was read from call or close over `sym`.")]
+fn nrefs_calls(r: NRefs, sym: String) : Bool = list_has(idx_chain(r.seen, sym), sym)
+
+fn nrefs_fns(fns: [KFn], r: NRefs) : NRefs = match fns {
+  [] -> r
+  [f, ...rest] -> nrefs_fns(rest, nrefs_blocks(f.blocks, r))
+}
+
+fn nrefs_blocks(bs: [KBlock], r: NRefs) : NRefs = match bs {
+  [] -> r
+  [b, ...rest] -> nrefs_blocks(rest, nrefs_stmts(b.stmts, r))
+}
+
+fn nrefs_stmts(ss: [KStmt], r: NRefs) : NRefs = match ss {
+  [] -> r
+  [s, ...rest] -> nrefs_stmts(rest, nrefs_stmt(s, r))
+}
+
+fn nrefs_stmt(s: KStmt, r: NRefs) : NRefs = match s {
+  KLet(_, _, op, _)             -> nrefs_op(op, r)
+  KDo(op, _)                    -> nrefs_op(op, r)
+  KInstall(_, sym, _, _, _, _)  -> if list_has(r.installs, sym) { r } else { NRefs { ...r, installs: [sym, ...r.installs] } }
+  KRC(_, _)                     -> r
+  KStore(_, _, _)               -> r
+  KPop(_, _, _)                 -> r
+  KBindEvState(_, _, _, _)      -> r
+  KBindSelfState(_, _)          -> r
+  KSetCleanup(_, _, _, _)       -> r
+  KRunCleanup(_, _, _)          -> r
+}
+
+fn nrefs_op(op: KOp, r: NRefs) : NRefs = match op {
+  KCall(sym, _)            -> nrefs_callee(r, sym)
+  KClosure(sym, _, _)      -> nrefs_callee(r, sym)
+  KPerform(eff, _, _, _, _) -> if nrefs_has_eff(r.effects, eff) { r } else { NRefs { ...r, effects: [eff, ...r.effects] } }
+  KCallIndirect(_, _)      -> r
+  KCallIndirectBorrow(_, _) -> r
+  KPrim(_, _)              -> r
+  KCon(_, _, _, _, _)      -> r
+  KRecord(_, _, _)         -> r
+  KConReuse(_, _, _, _, _) -> r
+  KRecordReuse(_, _, _, _) -> r
+  KTokenSteal(_, _)        -> r
+  KProj(_, _)              -> r
+  KProjBorrow(_, _)        -> r
+  KProjKind(_, _, _)       -> r
+  KTagOf(_)                -> r
+  KSetjmp(_, _)            -> r
+  KResumeOp(_, _)          -> r
+  KResume2Op(_, _, _)      -> r
+  KLitOp(_)                -> r
+}
+
+fn nrefs_callee(r: NRefs, sym: String) : NRefs =
+  if nrefs_calls(r, sym) { r }
+  else { NRefs { ...r, seen: idx_prepend(r.seen, sym, sym), callees: [sym, ...r.callees] } }
+
+fn nrefs_has_eff(es: [SymId], e: SymId) : Bool = match es {
+  []           -> false
+  [x, ...rest] -> if sym_same(x, e) { true } else { nrefs_has_eff(rest, e) }
+}
+
+#[doc("The analyses a declaration is emitted from: each function's evidence frame, the functions proven memory-clean, those that cannot trap, and the thunk symbols the program takes as a value.")]
+pub type NDeclEnv = { frames: EvFrames, const_fns: FnSet, free_fns: FnSet, valued: NameIndex[String] }
+
+#[doc("The declaration analyses of the program `kp` was lowered from.")]
+pub fn ndecl_env(kp: KProgram, decls: [Decl]) : NDeclEnv =
+  NDeclEnv { frames: frames_index(build_evidence_frames(decls, kp.entry)),
+             const_fns: fn_set_of(purity_const_fns(purity_analyze(decls, kp.entry))),
+             free_fns: fn_set_of(trapfree_fns(decls, kp.tab)),
+             valued: ndecl_handler_thunks(kp.handlers, ndecl_runner_thunks(kp.runners, nrefs_values(kp.fns))) }
+
+# The runner driver calls each block through its thunk.
+fn ndecl_runner_thunks(rs: [KRunner], vals: NameIndex[String]) : NameIndex[String] = match rs {
+  [] -> vals
+  [r, ...rest] -> ndecl_runner_thunks(rest, nrefs_with_value(vals, c_user_thunk_sym(r.sym)))
+}
+
+# An install stores the thunk of each clause of its handler, and of its return.
+fn ndecl_handler_thunks(hs: [KHandlerDecl], vals: NameIndex[String]) : NameIndex[String] = match hs {
+  [] -> vals
+  [h, ...rest] -> ndecl_handler_thunks(rest, ndecl_op_thunks(h.op_thunks, match h.ret_thunk {
+    Some(sym) -> nrefs_with_value(vals, sym)
+    None      -> vals
+  }))
+}
+
+fn ndecl_op_thunks(ts: [KOpThunk], vals: NameIndex[String]) : NameIndex[String] = match ts {
+  [] -> vals
+  [KOT(_, sym, _), ...rest] -> ndecl_op_thunks(rest, nrefs_with_value(vals, sym))
+}
+
+#[doc("Whether the program takes `f` as a value, so the partition that defines it emits its thunk.")]
+pub fn ndecl_thunked(kp: KProgram, env: NDeclEnv, f: KFn) : Bool =
+  nrefs_valued(env.valued, c_user_thunk_sym(kfn_sym(kp_names(kp), f)))
+
+#[doc("What another partition sees of `f`: its signature, the slots of its evidence frame, and the attributes its declaration carries.")]
+fn ndecl_text(kp: KProgram, env: NDeclEnv, f: KFn) : String = {
+  let fid = kfn_fid(f)
+  concat_all([
+    kir_dump_fn_sig_pub(kp_names(kp), f),
+    " frame[", string_join(map(frame_slots_of(env.frames, fid), (k) => inst_key_text(kp.tab, k)), ","), "]",
+    if fn_set_has(env.const_fns, fid) { " memory(none)" } else { "" },
+    if fn_set_has(env.free_fns, fid) { " nounwind" } else { "" },
+    "\n"
+  ])
+}
 
 # The module-level Ev blob: a 3-field header (`handler_id` / `env` /
 # `state`) then one op fn-ptr per op.
@@ -208,3 +406,94 @@ fn ndef_op_thunks(ops: [KDefOp]) : [KOpThunk] = match ops {
   [] -> []
   [KDOp(op, sym, n), ...rest] -> [KOT(op, sym, n), ...ndef_op_thunks(rest)]
 }
+
+#[doc("What every partition key of one build reads: the program, its declaration analyses, each function's declaration text by symbol, and the handler declarations the emitter resolves effects through.")]
+pub type NKeyCtx = { kp: KProgram, env: NDeclEnv, decls: NameIndex[NKeyDecl], handlers: [KHandlerDecl] }
+
+#[doc("A function's declaration text under its symbol. An index bucket holds every symbol that hashes alike, so each entry keeps its own and a lookup compares it.")]
+pub type NKeyDecl = { sym: String, text: String }
+
+#[doc("The key context of a build of `kp` under the declaration analyses `env`.")]
+pub fn nmodkey_ctx(kp: KProgram, env: NDeclEnv) : NKeyCtx =
+  NKeyCtx { kp: kp, env: env, decls: nmodkey_index(kp, env, kp_names(kp), kp.fns, idx_empty()),
+            handlers: list_append(kp.handlers, ndef_synth_handlers(kp.tab, kp.synth_defaults)) }
+
+fn nmodkey_index(kp: KProgram, env: NDeclEnv, nm: KNames, fns: [KFn], ix: NameIndex[NKeyDecl]) : NameIndex[NKeyDecl] = match fns {
+  [] -> ix
+  [f, ...rest] -> {
+    let sym = kfn_sym(nm, f)
+    nmodkey_index(kp, env, nm, rest, idx_prepend(ix, sym, NKeyDecl { sym: sym, text: ndecl_text(kp, env, f) }))
+  }
+}
+
+# The declaration text of the program function emitted as `sym`, empty for a
+# symbol the program does not define.
+fn nmodkey_decl(c: NKeyCtx, sym: String) : String = nmodkey_decl_in(idx_chain(c.decls, sym), sym)
+
+fn nmodkey_decl_in(ds: [NKeyDecl], sym: String) : String = match ds {
+  []           -> ""
+  [d, ...rest] -> if d.sym == sym { d.text } else { nmodkey_decl_in(rest, sym) }
+}
+
+#[doc("The declaration text of the program function `f`.")]
+fn nmodkey_decl_of(c: NKeyCtx, f: KFn) : String = nmodkey_decl(c, kfn_sym(kp_names(c.kp), f))
+
+# A defined function's declaration, marked when its thunk is emitted with it.
+fn nmodkey_defined(c: NKeyCtx, f: KFn) : String =
+  if ndecl_thunked(c.kp, c.env, f) { cat2("thunked ", nmodkey_decl_of(c, f)) } else { nmodkey_decl_of(c, f) }
+
+#[doc("The content-addressed cache key of a partition that defines `define_fns`: a hash of those functions and their declarations, the declarations of the cross-TU callees they invoke, the operations of the effects they perform, the handlers they install, and `owned`, the text of what the partition emits that none of its functions names (empty for one that owns no singleton).")]
+pub fn nmodkey_of(c: NKeyCtx, define_fns: [KFn], role_tag: String, owned: String) : String = {
+  let nm = kp_names(c.kp)
+  let refs = nrefs_of(define_fns)
+  nmodkey_hash(concat_all([
+    role_tag, "\n", owned, "\n",
+    kir_dump_fns_pub(nm, define_fns),
+    "; declares\n", concat_all(map(define_fns, (f) => nmodkey_defined(c, f))),
+    "; externs\n", concat_all(map(list_reverse(refs.callees), (s) => nmodkey_decl(c, s))),
+    "; effects\n", concat_all(map(list_reverse(refs.effects), (e) => nmodkey_effect_text(c, e))),
+    "; handlers\n", concat_all(map(list_reverse(refs.installs), (h) => nmodkey_handler_text(c, h)))
+  ]))
+}
+
+# A perform site reads the place of its operation among the effect's, off the
+# handler the emitter finds for that effect.
+fn nmodkey_effect_text(c: NKeyCtx, eff: SymId) : String = match nfx_find_handler_by_eff(c.handlers, eff) {
+  Some(h) -> concat_all(["effect ", rt_name(c.kp.tab, eff), " [", string_join(map(h.op_thunks, nmodkey_op_name), ", "), "]\n"])
+  None    -> ""
+}
+
+fn nmodkey_op_name(t: KOpThunk) : String = match t { KOT(op, _, _) -> op }
+
+# An install site reads the whole declaration of its handler.
+fn nmodkey_handler_text(c: NKeyCtx, sym: String) : String = match nfx_find_handler(c.handlers, sym) {
+  Some(h) -> concat_all([
+    "handler ", rt_name(c.kp.tab, h.eff_sym), " ", h.sym, " [", string_join(map(h.op_thunks, nmodkey_op_text), ", "), "] ",
+    match h.ret_thunk { Some(r) -> r None -> "" }, "\n"
+  ])
+  None -> ""
+}
+
+fn nmodkey_op_text(t: KOpThunk) : String = match t {
+  KOT(op, sym, arity) -> concat_all([op, "->", sym, "/", int_to_string(arity)])
+}
+
+#[doc("The key text of the split core, which calls into no other partition's analyses: a hash of the functions it defines and the signatures of the callees they invoke. Its sources are hashed beside this by its caller, and they are what its frames, attributes and effects derive from, so every program shares one core object.")]
+pub fn nmodkey_core(kp: KProgram, core_fns: [KFn]) : String = {
+  let nm = kp_names(kp)
+  let refs = nrefs_of(core_fns)
+  nmodkey_hash(concat_all([
+    "splitcore\n", kir_dump_fns_pub(nm, core_fns),
+    "; externs\n", concat_all(map(filter(kp.fns, (f) => nrefs_calls(refs, kfn_sym(nm, f))), (f) => cat2(kir_dump_fn_sig_pub(nm, f), "\n")))
+  ]))
+}
+
+# A stable, platform-independent content hash (djb2 over the bytes), masked to
+# 48 bits so it stays a compact decimal string and its accumulator never wraps
+# differently between the C oracle and the native backend.
+fn nmodkey_hash(s: String) : String = int_to_string(nmodkey_djb2(s, 0, string_length(s), 5381))
+fn nmodkey_djb2(s: String, i: Int, n: Int, h: Int) : Int =
+  if i >= n { h }
+  else { nmodkey_djb2(s, i + 1, n, nmodkey_mask(h * 33 + char_to_int(char_at_or_zero(s, i)))) }
+
+fn nmodkey_mask(h: Int) : Int = h % 281474976710656
