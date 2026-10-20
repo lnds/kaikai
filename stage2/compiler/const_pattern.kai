@@ -15,25 +15,27 @@ import compiler.written
 import compiler.symtab
 import compiler.modules_homes
 import compiler.desugar_refine_pred
+import compiler.local_names
+import compiler.expr_positions
+import compiler.fnreg
+import compiler.diag
+import compiler.diag_file
+import compiler.scc
 
 # A declared constant as a pattern can write it: its home module (`None`
 # for the root file) and its spelling. A pattern is read before name
 # resolution, so the spelling is all it has to match.
 #[doc("A declared constant as a pattern can write it: its home module (`None` for the root file) and its spelling.")]
-pub type CDecl = CD(Option[String], String)
+pub(pkg) type CDecl = CD(Option[String], String)
 
 # One rewritten pattern plus the equality guards it accumulated.
 type CPRes = CPR(Pattern, [Expr])
 
-#[doc("Rewrite constant names used in match patterns, at any depth, into a fresh binder plus an equality guard against the constant.")]
-pub fn desugar_const_patterns_decls(decls: [Decl], tab: SymTab) : [Decl] =
-  desugar_const_patterns_with(const_pattern_names(decls, tab), decls)
-
 #[doc("The constants a program declares, by home and spelling.")]
-pub fn const_pattern_names(decls: [Decl], tab: SymTab) : [CDecl] = cpat_consts(decls, tab, [])
+pub(pkg) fn const_pattern_names(decls: [Decl], tab: SymTab) : [CDecl] = cpat_consts(decls, tab, [])
 
-#[doc("`desugar_const_patterns_decls` against a constant table built earlier, so declarations can be rewritten one at a time.")]
-pub fn desugar_const_patterns_with(cs: [CDecl], decls: [Decl]) : [Decl] =
+#[doc("Rewrite constant names used in match patterns, at any depth, into a fresh binder plus an equality guard against the table `cs`, so declarations can be rewritten one at a time.")]
+pub(pkg) fn desugar_const_patterns_with(cs: [CDecl], decls: [Decl]) : [Decl] =
   match cs {
     [] -> decls
     _  -> map(decls, (d) => cpat_decl(d, cs))
@@ -197,3 +199,133 @@ fn cpat_pfields(fs: [PField], cs: [CDecl]) : CPFieldList = match fs {
     }
   }
 }
+
+#[doc("The declarations with every such initialiser moved into a function, and the table rows of the functions minted.")]
+pub(pkg) type ConstInits = { decls: [Decl], rows: [NEnt] }
+
+#[doc("Move each constant initialiser that declares a local or holds a lambda into a function homed beside the constant; `target` homes the root file's.")]
+pub(pkg) fn const_init_fns(decls: [Decl], tab: SymTab, target: String) : ConstInits =
+  ci_loop(decls, tab, target, [], [])
+
+fn ci_loop(ds: [Decl], tab: SymTab, target: String, out: [Decl], rows: [NEnt]) : ConstInits = match ds {
+  [] -> ConstInits { decls: list_reverse(out), rows: list_reverse(rows) }
+  [d, ...rest] -> match d {
+    DConst(is_pub, s, ty, body, mo, l, c) ->
+      if ci_is_body(body) {
+        let row = NEnt(NCFn, ci_name(written_text(decl_name(tab, s))), ci_home(mo, target), is_pub, NmHelper)
+        let init = fnid_decl(nent_sym(row))
+        let fun = DFn(is_pub, init, [], [], Some(ty), REmpty, body, l, c, mo)
+        ci_loop(rest, tab, target, [fun, DConst(is_pub, s, ty, ci_call(init, body), mo, l, c), ...out], [row, ...rows])
+      } else { ci_loop(rest, tab, target, [d, ...out], rows) }
+    _ -> ci_loop(rest, tab, target, [d, ...out], rows)
+  }
+}
+
+# The function is spelled after its constant, so its symbol moves only
+# when the constant is renamed. No source identifier spells the prefix,
+# and a module declares a constant's name once.
+fn ci_name(const_name: String) : String = string_concat("__kai_const_", const_name)
+
+fn ci_home(mo: Option[String], target: String) : String = match mo {
+  Some(m) -> m
+  None    -> target
+}
+
+fn ci_is_body(e: Expr) : Bool =
+  if ln_is_empty(ln_with_expr(ln_empty(), e)) { ci_has_lambda(e) } else { true }
+
+fn ci_has_lambda(e: Expr) : Bool = match e.kind {
+  ELambda(_, _) -> true
+  _             -> ci_any_lambda(xp_positions(e))
+}
+
+fn ci_any_lambda(ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> ci_has_lambda(c) or ci_any_lambda(rest)
+}
+
+# The call stands where the body stood: same position, type and mode.
+fn ci_call(init: FnId, body: Expr) : Expr = {
+  let fty = match body.ty {
+    Some(t) -> Some(TyFnT([], t, row_empty()))
+    None    -> None
+  }
+  let callee = Expr { kind: ESym(fnid_sym(init), spec_none()), line: body.line, col: body.col,
+                      ty: fty, mode: body.mode, site: body.site }
+  Expr { kind: ECall(callee, []), line: body.line, col: body.col, ty: body.ty, mode: body.mode, site: body.site }
+}
+
+#[doc("The diagnostics for the constants of `decls` that reach themselves through the constants their initialisers read directly.")]
+pub(pkg) fn const_cycle_diags(decls: [Decl], tab: SymTab, df: DiagFiles) : [Diagnostic] = {
+  let consts = filter(decls, is_const)
+  let ids = map(consts, const_id)
+  let edges = flat_map(range_pairs(consts), (ic) => map(filter_map_idx(ids, ic.snd), (j) => (ic.fst, j)))
+  let loops = filter(edges, (e) => e.fst == e.snd)
+  let groups = scc_groups(list_length(consts), edges)
+  flat_map(list_append(map(loops, (e) => [e.fst]), groups), (g) => const_cycle_diag(consts, g, tab, df))
+}
+
+fn is_const(d: Decl) : Bool = match d {
+  DConst(_, s, _, _, _, _, _) -> sym_raw(s) >= 0
+  _ -> false
+}
+
+fn const_id(d: Decl) : SymId = match d {
+  DConst(_, s, _, _, _, _, _) -> s
+  _ -> sym_none()
+}
+
+fn const_body(d: Decl) : Option[Expr] = match d {
+  DConst(_, _, _, e, _, _, _) -> Some(e)
+  _ -> None
+}
+
+fn range_pairs(ds: [Decl]) : [(Int, Decl)] = zip_index(ds, 0)
+
+fn zip_index(ds: [Decl], i: Int) : [(Int, Decl)] = match ds {
+  []           -> []
+  [d, ...rest] -> [(i, d), ...zip_index(rest, i + 1)]
+}
+
+fn filter_map_idx(ids: [SymId], d: Decl) : [Int] = {
+  let refs = match const_body(d) { Some(e) -> inline_syms(e)  None -> [] }
+  index_all(ids, refs, 0)
+}
+
+fn index_all(ids: [SymId], refs: [SymId], i: Int) : [Int] = match ids {
+  []           -> []
+  [s, ...rest] -> if any(refs, (r) => sym_raw(r) == sym_raw(s)) { [i, ...index_all(rest, refs, i + 1)] } else { index_all(rest, refs, i + 1) }
+}
+
+fn inline_syms(e: Expr) : [SymId] = {
+  let here = match e.kind { ESym(s, _) -> [s]  _ -> [] }
+  list_append(here, flat_map(xp_positions(e), (p) => match p {
+    XP(r, x) -> if xrole_inline(r) { inline_syms(x) } else { [] }
+  }))
+}
+
+fn const_cycle_diag(consts: [Decl], members: [Int], tab: SymTab, df: DiagFiles) : [Diagnostic] =
+  match nth_decl(consts, list_min(members)) {
+    Some(first) -> match first {
+      DConst(_, _, _, _, _, l, c) -> {
+        let file = decl_diag_file(first, df)
+        let names = flat_map(sort(members), (i) => match nth_decl(consts, i) { Some(d) -> [const_name(d, tab)]  None -> [] })
+        [mk_diag(SevError, file, l, c, "constant `#{const_name(first, tab)}` is defined in terms of itself",
+                 [ri_note(file, l, c, "the cycle runs through #{string_join(names, ", ")}")])]
+      }
+      _ -> []
+    }
+    None -> []
+  }
+
+fn const_name(d: Decl, tab: SymTab) : String = match d {
+  DConst(_, s, _, _, _, _, _) -> written_text(decl_name(tab, s))
+  _ -> ""
+}
+
+fn nth_decl(ds: [Decl], i: Int) : Option[Decl] = match ds {
+  [d, ...rest] -> if i == 0 { Some(d) } else { nth_decl(rest, i - 1) }
+  []           -> None
+}
+
+fn list_min(xs: [Int]) : Int = foldl(xs, 1000000000, (a, x) => if x < a { x } else { a })

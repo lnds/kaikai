@@ -5,6 +5,12 @@ import compiler.symtab
 import compiler.util
 import compiler.core_types
 import compiler.proto_ids
+import compiler.diag
+import compiler.operators
+import compiler.written
+import compiler.resolve_env
+import compiler.ast_map
+import compiler.expr_positions
 
 # Map-pipe deforestation (issue #1134). `map g . map f = map (g . f)`
 # collapses two map traversals into one — one result list, zero
@@ -20,15 +26,15 @@ import compiler.proto_ids
 
 # A recognised map-call: the `map` callee, the source list, and the
 # stage closure — all already typed.
-pub type FusedMapCall = { callee: Expr, source: Expr, stage: Expr }
+pub(pkg) type FusedMapCall = { callee: Expr, source: Expr, stage: Expr }
 
 # Resolved stage types the composed lambda is built from: the parameter
 # (inner stage domain), the mid value (inner codomain / outer domain),
 # the result (outer codomain), and the merged effect row.
-pub type FuseTypes = { param: Ty, mid: Ty, result: Ty, row: Row }
+pub(pkg) type FuseTypes = { param: Ty, mid: Ty, result: Ty, row: Row }
 
 #[doc("Recognise a lowered `map` call `map(source, stage)` for map-map fusion.")]
-pub fn pipe_fusion_as_map_call(e: Expr) : Option[FusedMapCall] =
+pub(pkg) fn pipe_fusion_as_map_call(e: Expr) : Option[FusedMapCall] =
   match e.kind {
     ECall(callee, [source, stage]) ->
       if pipe_fusion_callee_is_map(callee) {
@@ -50,7 +56,7 @@ fn pipe_fusion_callee_is_map(callee: Expr) : Bool =
 
 # The effect row off a resolved function type; a pipe stage is
 # `(A) -> B / e`. Non-function types have no row.
-pub fn pipe_fusion_fn_row(t: Ty) : Option[Row] =
+pub(pkg) fn pipe_fusion_fn_row(t: Ty) : Option[Row] =
   match t {
     TyFnT(_, _, row) -> Some(row)
     _                -> None
@@ -62,7 +68,7 @@ pub fn pipe_fusion_fn_row(t: Ty) : Option[Row] =
 # realised labels are. `Mutable` is masked to pure for locally-
 # constructed, non-escaping cells; a cell captured by reference escapes
 # and keeps a non-maskable label, which lands here as impure.
-pub fn pipe_fusion_labels_pure(labels: [Label]) : Bool =
+pub(pkg) fn pipe_fusion_labels_pure(labels: [Label]) : Bool =
   match labels {
     []           -> true
     [l, ...rest] -> effect_is(l.sym, CeMutable) and pipe_fusion_labels_pure(rest)
@@ -72,7 +78,7 @@ pub fn pipe_fusion_labels_pure(labels: [Label]) : Bool =
 # the native unwinder keys its call sites by position, so two calls at
 # one position would share a site.
 #[doc("Build the typed composed closure `x => outer(inner(x))` from resolved stage types.")]
-pub fn pipe_fusion_compose(inner: Expr, outer: Expr, tys: FuseTypes,
+pub(pkg) fn pipe_fusion_compose(inner: Expr, outer: Expr, tys: FuseTypes,
                            line: Int, col: Int) : Expr {
   let pname = concat_all(["__fuse_", int_to_string(line), "_", int_to_string(col)])
   let param = pipe_fusion_param(pname, line, col)
@@ -86,7 +92,7 @@ pub fn pipe_fusion_compose(inner: Expr, outer: Expr, tys: FuseTypes,
 # A recognised fold-shaped terminal. `TermFoldl` carries the explicit
 # `init` + `combine`; the implicit terminals (`sum`, `product`,
 # `length`) take their seed and combine from the stdlib rewrite target.
-pub type FoldTerminal
+pub(pkg) type FoldTerminal
   = TermFoldl(Expr, Expr)
   | TermSum
   | TermProduct
@@ -97,10 +103,10 @@ pub type FoldTerminal
 # (pre-synth). `stages` holds each map stage separately so the purity
 # gate can check them one at a time; they compose into a single closure
 # only at rewrite time.
-pub type FusedFold = { source: Expr, stages: [Expr], term: FoldTerminal }
+pub(pkg) type FusedFold = { source: Expr, stages: [Expr], term: FoldTerminal }
 
 #[doc("Recognise a `map`-pipe chain into a fold-shaped terminal (`foldl(init, combine)`, `sum`, `product`, `length`) for terminal fusion. A bare range head (`[a..b] |> sum()`) is the zero-stage chain: it fuses with an identity stage so the range is never constructed. `ids` tells a protocol's `foldl` from any other callee. The terminal is recognised by the declaration its callee names: a callee the typer has yet to settle is no terminal.")]
-pub fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Option[FusedFold] =
+pub(pkg) fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Option[FusedFold] =
   match lhs.kind {
     EDispatchPipe(PoMap, _, _) -> match pipe_fusion_as_terminal(ids, rhs) {
       Some(term) -> {
@@ -121,7 +127,7 @@ pub fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Optio
   }
 
 #[doc("True when `lhs` can head a terminal fusion: a `map`-pipe chain, or a range the counting loops may walk.")]
-pub fn pipe_fusion_head(lhs: Expr) : Bool = match lhs.kind {
+pub(pkg) fn pipe_fusion_head(lhs: Expr) : Bool = match lhs.kind {
   EDispatchPipe(PoMap, _, _) -> true
   ERange(_, _, None)       -> true
   ERange(_, _, Some(step)) -> match try_int_literal(step) {
@@ -204,7 +210,7 @@ fn pipe_fusion_is_proto_foldl(ids: ProtoIds, s: SymId) : Bool = match pid_disp(i
 }
 
 #[doc("The reference the chain's `foldl` terminal calls when it is the protocol operation rather than `list.foldl`: only a container implementing the protocol then fuses, through the model's own `foldl`.")]
-pub fn pipe_fusion_proto_foldl(ids: ProtoIds, rhs: Expr) : Option[ExprKind] = match rhs.kind {
+pub(pkg) fn pipe_fusion_proto_foldl(ids: ProtoIds, rhs: Expr) : Option[ExprKind] = match rhs.kind {
   ECall(callee, _) -> match callee.kind {
     ESym(s, _) -> if pipe_fusion_is_proto_foldl(ids, s) { Some(callee.kind) } else { None }
     _          -> None
@@ -271,7 +277,7 @@ fn pipe_fusion_apply_stages(stages: [Expr], acc: Expr) : Expr =
 fn pipe_fusion_apply(f: Expr, args_: [Expr]) : Expr = mk_expr(ECall(f, args_), f.line, f.col)
 
 #[doc("Rewrite a recognised terminal to the matching non-materialising stdlib call.")]
-pub fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr =
+pub(pkg) fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr =
   under_binds(ff.source, (src) => fold_rewrite_over(FusedFold { ...ff, source: src }, line, col))
 
 fn fold_rewrite_over(ff: FusedFold, line: Int, col: Int) : Expr =
@@ -291,7 +297,7 @@ structure. This is the functor `fusion` law realised through the
 model's traversal, not a hand-written combinator: it works for any
 container that implements the protocol's `foldl`.
 """)]
-pub fn pipe_fusion_generic_fold_rewrite(ff: FusedFold, foldl_disp: Option[ExprKind],
+pub(pkg) fn pipe_fusion_generic_fold_rewrite(ff: FusedFold, foldl_disp: Option[ExprKind],
                                         line: Int, col: Int) : Expr {
   match ff.term {
     # `sum`/`product` have no explicit combiner: the neutral element and
@@ -453,10 +459,10 @@ fn fold_call(cf: CoreFn, args: [Expr], line: Int, col: Int) : Expr = match core_
 # A map-pipe chain in Vec-expected context — the collect shape. The
 # stages are raw (pre-synth) so the typer's purity gate can read each
 # row in isolation, exactly like the terminal-fold path.
-pub type FusedCollect = { source: Expr, stages: [Expr] }
+pub(pkg) type FusedCollect = { source: Expr, stages: [Expr] }
 
 #[doc("Recognise a map-pipe chain for Vec collection: flatten it into its source and stage list.")]
-pub fn pipe_fusion_as_collect(e: Expr) : Option[FusedCollect] =
+pub(pkg) fn pipe_fusion_as_collect(e: Expr) : Option[FusedCollect] =
   match e.kind {
     EDispatchPipe(PoMap, _, _) -> {
       let flat = pipe_fusion_flatten_map_chain(e)
@@ -466,7 +472,7 @@ pub fn pipe_fusion_as_collect(e: Expr) : Option[FusedCollect] =
   }
 
 #[doc("Rewrite a pure range-headed collect chain to the pre-sized `range_map_collect_vec` combinator; `None` when the head's length is not statically countable.")]
-pub fn pipe_fusion_collect_rewrite(fc: FusedCollect, line: Int, col: Int) : Option[Expr] =
+pub(pkg) fn pipe_fusion_collect_rewrite(fc: FusedCollect, line: Int, col: Int) : Option[Expr] =
   match fc.source.kind {
     EBlock(stmts, Some(tail)) -> match collect_over(tail, fc.stages, line, col) {
       Some(call) -> Some(Expr { ...fc.source, kind: EBlock(stmts, Some(call)) })
@@ -504,4 +510,203 @@ fn collect_via_list(xs: [Expr], line: Int, col: Int) : Expr = match xs {
   [range, stage] ->
     mk_expr(ECall(builtin_mk(CbVecFromList, line, col), [mk_expr(EDispatchPipe(PoMap, range, stage), line, col)]), line, col)
   _ -> mk_expr(EMark(MkFuseMissing), line, col)
+}
+
+#[doc("A pipe node split into its left side, its operator as written and its stage.")]
+type PipeParts = PipeParts(Expr, String, Expr)
+
+#[doc("The parts of `x` when it is a pipe.")]
+fn pipe_parts(x: Expr) : Option[PipeParts] = match x.kind {
+  EPipe(l, r)        -> Some(PipeParts(l, "|>", r))
+  EDispatchPipe(op, l, r) -> Some(PipeParts(l, pipe_op_text(op), r))
+  _                  -> None
+}
+
+#[doc("""
+`e` for walking the stage of pipe `p` with left side `a`: it remembers
+`p` when a lambda on that side had its body ended by a pipe.
+""")]
+pub(pkg) fn cut_enter(e: Env, p: Expr, a: Expr) : Env =
+  if left_cut(a) { Env { ...e, cut_pipes: [p, ...e.cut_pipes] } } else { e }
+
+#[doc("`inner`, the env after a stage, with the pipes remembered before `cut_enter` was taken from `outer`.")]
+pub(pkg) fn cut_leave(inner: Env, outer: Env) : Env = match inner.cut_pipes {
+  [] -> inner
+  _  -> Env { ...inner, cut_pipes: outer.cut_pipes }
+}
+
+fn left_cut(a: Expr) : Bool = is_lambda(a) or match pipe_parts(a) {
+  Some(PipeParts(l, _, r)) -> is_lambda(r) or left_cut(l)
+  None                     -> false
+}
+
+fn is_lambda(x: Expr) : Bool = match x.kind { ELambda(_, _) -> true  _ -> false }
+
+# A lambda and the pipe that ends its body.
+type Cut = Cut(Expr, Expr)
+
+# The lambda ending at pipe `p` is its left side, or the last stage of
+# that side; the spine below `p` holds the ones that end earlier.
+fn spine_cuts(p: Expr) : [Cut] = match pipe_parts(p) {
+  None -> []
+  Some(PipeParts(l, _, _)) -> {
+    let rest = spine_cuts(l)
+    if is_lambda(l) { [Cut(l, p), ...rest] }
+    else { match pipe_parts(l) {
+      Some(PipeParts(_, _, s)) -> if is_lambda(s) { [Cut(s, p), ...rest] } else { rest }
+      None                     -> rest
+    } }
+  }
+}
+
+fn binding_cut(cs: [Cut], name: String) : Option[Cut] = match cs {
+  [] -> None
+  [c, ...rest] -> if cut_binds(c, name) { Some(c) } else { binding_cut(rest, name) }
+}
+
+fn cut_binds(c: Cut, name: String) : Bool = match c {
+  Cut(lam, _) -> list_has(lam_param_names(lam), name)
+}
+
+fn lam_param_names(lam: Expr) : [String] = match lam.kind {
+  ELambda(ps, _) -> ps | (p) => written_text(p.binder.name)
+  _              -> []
+}
+
+fn find_cut(pipes: [Expr], name: String) : Option[Cut] = match pipes {
+  [] -> None
+  [p, ...rest] -> match binding_cut(spine_cuts(p), name) {
+    Some(c) -> Some(c)
+    None    -> find_cut(rest, name)
+  }
+}
+
+#[doc("""
+The help for an unbound `name` that a lambda on the spine of one of
+`pipes` binds, when its body ended at a pipe of that spine.
+""")]
+pub(pkg) fn cut_hint(pipes: [Expr], name: String, file: String) : Option[String] / File =
+  match find_cut(pipes, name) {
+    None    -> None
+    Some(c) -> Some(cut_help(c, name, file))
+  }
+
+fn cut_help(c: Cut, name: String, file: String) : String / File = match c {
+  Cut(lam, p) -> {
+    let op = pipe_op(p)
+    "`#{name}` is the parameter of the lambda before this `#{op}`; a lambda body ends at a top-level pipe, so this stage is outside it. Wrap the body in parentheses: `#{cut_fix(lam, p, op, file)}`"
+  }
+}
+
+fn pipe_op(p: Expr) : String = match pipe_parts(p) {
+  Some(PipeParts(_, op, _)) -> op
+  None                      -> "|"
+}
+
+# The lambda as written runs from its head to the pipe that ends it;
+# split at its `=>` to wrap the body.
+fn cut_fix(lam: Expr, p: Expr, op: String, file: String) : String / File =
+  match lambda_text(lam, p, file) {
+    Some(text) -> match index_of(text, "=>") {
+      Some(i) -> "#{string_slice(text, 0, i + 2)} (#{trim(string_slice(text, i + 2, string_length(text) - i - 2))} #{op} …)"
+      None    -> fallback_fix(lam, op)
+    }
+    None -> fallback_fix(lam, op)
+  }
+
+fn lambda_text(lam: Expr, p: Expr, file: String) : Option[String] / File =
+  if lam.line != p.line or p.col <= lam.col { None }
+  else { match read_file(file) {
+    Err(_)  -> None
+    Ok(src) -> match nth_line(src, lam.line) {
+      Some(line) -> Some(trim(string_slice(line, lam.col - 1, p.col - lam.col)))
+      None       -> None
+    }
+  } }
+
+fn fallback_fix(lam: Expr, op: String) : String = {
+  let head = match lam_param_names(lam) {
+    [n] -> n
+    ns  -> "(#{join(ns, ", ")})"
+  }
+  "#{head} => (… #{op} …)"
+}
+
+#[doc("A stage's right side with its dots claimed (unchanged when it has none), or the nested stage that uses `.` too.")]
+pub(pkg) type StageRhs = SrOwn(Expr) | SrNested(Expr)
+
+#[doc("Claim every `.` on the right side `rhs` of a dispatch pipe for the stage's element.")]
+pub(pkg) fn stage_claim(rhs: Expr) : StageRhs {
+  let sc = sd_scan(rhs, SdScan { owns: false, nested: None })
+  match sc.nested {
+    Some(inner) -> if sc.owns { SrNested(inner) } else { SrOwn(rhs) }
+    None        -> if sc.owns { SrOwn(stage_lambda(rhs)) } else { SrOwn(rhs) }
+  }
+}
+
+fn stage_lambda(rhs: Expr) : Expr {
+  let param = Param { binder: point_free_binder(), ptype: None,
+                      pline: rhs.line, pcol: rhs.col, pborrow: false }
+  mk_expr(ELambda([param], sd_claim(rhs)), rhs.line, rhs.col)
+}
+
+# Whether the stage owns a `.`, and the first nested stage that owns one.
+type SdScan = { owns: Bool, nested: Option[Expr] }
+
+fn sd_scan(e: Expr, acc: SdScan) : SdScan = match e.kind {
+  EPlaceholder -> SdScan { ...acc, owns: true }
+  ELambda(ps, body) ->
+    if params_point_free(ps) { sd_scan(body, SdScan { ...acc, owns: true }) }
+    else if params_pipe_apply(ps) { sd_scan(body, acc) }
+    else { acc }
+  EHandle(_, _, _, _, _, _, _) -> acc
+  EDispatchPipe(_, a, b) -> sd_scan(a, sd_inner(e, b, acc))
+  _ -> sd_kids(xp_positions(e), acc)
+}
+
+fn sd_kids(ps: [XPos], acc: SdScan) : SdScan = match ps {
+  [] -> acc
+  [XP(_, x), ...rest] -> sd_kids(rest, sd_scan(x, acc))
+}
+
+# A nested stage claimed its dots exactly when its right side is a section.
+fn sd_inner(stage: Expr, rhs: Expr, acc: SdScan) : SdScan = match rhs.kind {
+  ELambda(ps, _) -> match acc.nested {
+    None    -> if params_point_free(ps) { SdScan { ...acc, nested: Some(stage) } } else { acc }
+    Some(_) -> acc
+  }
+  _ -> acc
+}
+
+fn sd_claim(e: Expr) : Expr = match e.kind {
+  EPlaceholder -> mk_local(point_free_binder().id, e.line, e.col)
+  ELambda(ps, body) ->
+    if params_point_free(ps) { sd_claim(body) }
+    else if params_pipe_apply(ps) { sd_with(e, ELambda(ps, sd_claim(body))) }
+    else { e }
+  EHandle(_, _, _, _, _, _, _) -> e
+  EDispatchPipe(op, a, b) -> sd_with(e, EDispatchPipe(op, sd_claim(a), b))
+  k -> sd_with(e, prc_map_expr_kind(k, sd_claim))
+}
+
+fn sd_with(e: Expr, k: ExprKind) : Expr = Expr { ...e, kind: k }
+
+#[doc("True when `e` calls a method on the local `l` or on a field path rooted at it, which only the type of `l` can resolve.")]
+pub(pkg) fn stage_receiver_of(l: LocalId, e: Expr) : Bool = match e.kind {
+  ECall(callee, _) -> match callee.kind {
+    EField(obj, _) -> sr_is_local(l, obj) or sr_kids(l, xp_positions(e))
+    _              -> sr_kids(l, xp_positions(e))
+  }
+  _ -> sr_kids(l, xp_positions(e))
+}
+
+fn sr_is_local(l: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(x)    -> local_eq(x, l)
+  EField(o, _) -> sr_is_local(l, o)
+  _            -> false
+}
+
+fn sr_kids(l: LocalId, ps: [XPos]) : Bool = match ps {
+  [] -> false
+  [XP(_, c), ...rest] -> stage_receiver_of(l, c) or sr_kids(l, rest)
 }

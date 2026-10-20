@@ -17,8 +17,8 @@ import compiler.modules_segments
 import compiler.scope_view
 import compiler.symtab
 import compiler.written
-import compiler.module_tables
 import compiler.module_table
+import compiler.infer_index
 
 #[doc("Settle the contested type names of each import segment under its own module's viewpoint; the decls past the marks are the root file's. `sels` carries every file's selective imports, which outrank the plain import list on a contested bare name.")]
 pub(pkg) fn ts_segmented(segs: [ImportSeg], decls: [Decl], coll: [TSEntry],
@@ -356,6 +356,220 @@ fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String, nargs: Int) : Opti
   }
 
 fn ts_is_module(cx: TSCtx, name: String) : Bool = match mt_lookup(cx.mt, name) {
+  Some(_) -> true
+  None    -> false
+}
+
+# module scoping for bare value names. A free read of a contested function or
+# constructor name is rewritten to `EModCall(home, name)`, the form that
+# already carries a home through the typer, monomorph and codegen. The home
+# comes from the reading module's own viewpoint, so a call reaches the
+# declaration that module declared or imported, never the one that happened to
+# register last. The walk is scope-aware: a lexical binder shadows every
+# import, so a `let` named like an export is left alone rather than rewritten.
+# That is what makes the viewpoint sound where a positional heuristic — only
+# rewriting names in call position — is not.
+
+#[doc("Rewrite each import segment's free reads of contested value names under its own module's viewpoint; the decls past the marks are the root file's.")]
+pub(pkg) fn vs_segmented(segs: [ImportSeg], decls: [Decl], coll: [VSEntry],
+      tabs: ModTables, imps: [ModImports], target: String,
+      cores: [String]) : [Decl] =
+  if list_length(coll) == 0 { decls }
+  else { vs_seg_loop(segs, decls,
+                     VSView { ix: vs_index(coll), target: target, cores: cores,
+                              imps: imps, tabs: tabs }) }
+
+# What every segment shares: the contested names and the three tables a
+# viewpoint is cut from. Only the home varies per segment.
+type VSView = { ix: NameIndex[VSEntry], target: String, cores: [String],
+                imps: [ModImports], tabs: ModTables }
+
+fn vs_view_ctx(v: VSView, home: String) : VSCtx =
+  vs_ctx(v.ix, home, v.target, v.cores, v.imps, v.tabs)
+
+fn vs_seg_loop(segs: [ImportSeg], decls: [Decl], v: VSView) : [Decl] = match segs {
+  [] -> vs_decls(decls, vs_view_ctx(v, v.target))
+  [ISeg(home, n), ...rest] -> {
+    list_append(vs_decls(seg_take(decls, n), vs_view_ctx(v, home)),
+                vs_seg_loop(rest, seg_drop(decls, n), v))
+  }
+}
+
+# A name the reader's own home declares keeps its bare spelling: the
+# typer already registers that declaration, and rewriting it would push
+# every intra-module call through the qualified key for no gain.
+#
+# A module qualifier is not a value read: `map.from(...)` names the
+# module `map`, which a contested function `map` must never displace.
+# A name bound as a module therefore outranks every value of the same
+# spelling, exactly as it does on the type side.
+fn vs_leaf(e: Expr, sh: [String], cx: VSCtx) : Option[Expr] = match e.kind {
+  EName(w) -> {
+    let nm = written_text(w)
+    if list_has(sh, nm) or vs_is_module(cx, nm) { Some(e) }
+    else { match vs_resolve(cx, nm) {
+      Some(h) -> if h == cx.home or h == cx.target or list_has(cx.cores, h) { Some(e) }
+                 else { Some(vs_re(e, EModCall(written(h), w))) }
+      None    -> Some(e)
+    } }
+  }
+  _ -> None
+}
+
+fn vs_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+fn vs_expr(e: Expr, sh: [String], cx: VSCtx) : Expr =
+  sw_expr(e, sh, (x, s) => vs_leaf(x, s, cx), (t) => t, (r) => r)
+
+fn vs_decls(ds: [Decl], cx: VSCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [vs_decl(d, cx), ...vs_decls(rest, cx)]
+}
+
+fn vs_sub_decls(ds: [Decl], cx: VSCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [vs_decl(d, cx), ...vs_sub_decls(rest, cx)]
+}
+
+fn vs_decl(d: Decl, cx: VSCtx) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, vs_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, vs_expr(body, [], cx), mo, l, c)
+  DTest(n, body, l, c, mo)  -> DTest(n, vs_expr(body, [], cx), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, vs_expr(body, [], cx), l, c, mo)
+  DCheck(n, ps, body, l, c, mo) ->
+    DCheck(n, ps, vs_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) -> match dblk {
+    Some(DBlk(hcs, ret, bl, bc)) ->
+      DEffect(p, n, tps, ops,
+              Some(DBlk(vs_hclauses(hcs, cx), vs_hreturn_opt(ret, cx), bl, bc)), l, c, mo)
+    None -> d
+  }
+  DImpl(pn, tas, fty, subs, l, c, ss, isym) -> DImpl(pn, tas, fty, vs_sub_decls(subs, cx), l, c, ss, isym)
+  DDerive(ps, inner, l, c)       -> DDerive(ps, vs_decl(inner, cx), l, c)
+  DUnstable(inner, l, c)         -> DUnstable(vs_decl(inner, cx), l, c)
+  DProtoLaws(t, inner, l, c, mo) -> DProtoLaws(t, vs_decl(inner, cx), l, c, mo)
+  DImplAxiom(t, inner, l, c, mo) -> DImplAxiom(t, vs_decl(inner, cx), l, c, mo)
+  DConstructor(inner, l, c)      -> DConstructor(vs_decl(inner, cx), l, c)
+  DDoc(r, t, inner, l, c)        -> DDoc(r, t, vs_decl(inner, cx), l, c)
+  DAttr(r, inner, l, c)          -> DAttr(r, vs_decl(inner, cx), l, c)
+  _ -> d
+}
+
+fn vs_hclauses(hcs: [HClause], cx: VSCtx) : [HClause] =
+  sw_hclauses(hcs, [], (x, s) => vs_leaf(x, s, cx), (t) => t, (r) => r)
+
+fn vs_hreturn_opt(o: Option[HReturn], cx: VSCtx) : Option[HReturn] =
+  sw_hreturn_opt(o, [], (x, s) => vs_leaf(x, s, cx), (t) => t, (r) => r)
+
+# which module a bare value name means from one module's viewpoint. A function
+# or constructor name is registered globally by its bare spelling, so two
+# modules exporting one name shadow each other and the last registration wins.
+# Import order alone then decides which one a call reaches, and a module can
+# reach a name it never imported. The viewpoint fixes that: a bare name
+# resolves against the reader's own declarations and the modules that reader
+# actually imports, never against the whole program. The ladder mirrors the
+# type side — own home first, then the single visible import that exports it —
+# so both name sides answer a bare use the same way.
+
+#[doc("One value declaration that carries per-home identity: `VSE(name, home, pub)`. Entries exist only for names two homes both declare.")]
+pub(pkg) type VSEntry = VSE(String, String, Bool)
+
+#[doc("What one module sees when it reads a bare value name: the contested declarations by name, its own home, the root's, the core homes, the tagged names of its imports, and its qualifier table.")]
+type VSCtx = { ix: NameIndex[VSEntry], home: String, target: String,
+                   cores: [String], imports: [String], mt: ModTable }
+
+#[doc("The value declarations of `decls` whose bare name another home also declares, in stream order; `tab` holds their names. An uncontested name needs no viewpoint.")]
+pub(pkg) fn vs_collect(decls: [Decl], tab: SymTab, target: String) : [VSEntry] {
+  let all = vs_entries(nt_collect(decls, tab, target), [])
+  vs_keep_contested(vs_index(all), all, [])
+}
+
+# Functions and constructors share one namespace at a use site, so both
+# classes enter the table; a const is keyed by its own pass.
+fn vs_entries(es: [NEnt], acc: [VSEntry]) : [VSEntry] = match es {
+  [] -> list_reverse(acc)
+  [NEnt(c, n, h, p, _), ...rest] ->
+    if vs_is_value(c) { vs_entries(rest, [VSE(n, h, p), ...acc]) }
+    else { vs_entries(rest, acc) }
+}
+
+fn vs_is_value(c: NCls) : Bool = match c {
+  NCFn   -> true
+  NCCtor -> true
+  _      -> false
+}
+
+fn vs_keep_contested(ix: NameIndex[VSEntry], todo: [VSEntry], acc: [VSEntry]) : [VSEntry] =
+  match todo {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> match e {
+      VSE(n, h, _) ->
+        if vs_other_home(idx_chain(ix, n), n, h) { vs_keep_contested(ix, rest, [e, ...acc]) }
+        else { vs_keep_contested(ix, rest, acc) }
+    }
+  }
+
+fn vs_other_home(t: [VSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [VSE(n, h, _), ...rest] ->
+    if n == name and h != home { true } else { vs_other_home(rest, name, home) }
+}
+
+#[doc("True when `home` declares `name` in the contested table.")]
+fn vs_declares(t: [VSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [VSE(n, h, _), ...rest] ->
+    if n == name and h == home { true } else { vs_declares(rest, name, home) }
+}
+
+#[doc("A value table keyed by name, each chain in stream order.")]
+fn vs_index(coll: [VSEntry]) : NameIndex[VSEntry] =
+  vs_index_loop(list_reverse(coll), idx_empty())
+
+# A chain is newest-first, so prepending in reverse leaves it in stream order.
+fn vs_index_loop(es: [VSEntry], ix: NameIndex[VSEntry]) : NameIndex[VSEntry] = match es {
+  [] -> ix
+  [e, ...rest] -> match e { VSE(n, _, _) -> vs_index_loop(rest, idx_prepend(ix, n, e)) }
+}
+
+#[doc("The home a bare `name` denotes from the context's viewpoint, or `None` when no rule settles it: the reader's own declaration wins, else the single visible import that exports it. Several visible exporters leave the name contested for the report.")]
+fn vs_resolve(cx: VSCtx, name: String) : Option[String] = {
+  let es = idx_chain(cx.ix, name)
+  if vs_declares(es, name, cx.home) { Some(cx.home) }
+  else { match vs_visible_homes(es, name, cx.imports, []) {
+    [h] -> Some(h)
+    _   -> None
+  } }
+}
+
+#[doc("The homes that export `name` and are visible to the reader, deduplicated. More than one means the bare use cannot be settled by import alone.")]
+fn vs_visible_homes(t: [VSEntry], name: String, imports: [String],
+      acc: [String]) : [String] = match t {
+  [] -> list_reverse(acc)
+  [VSE(n, h, p), ...rest] ->
+    if n == name and p and list_has(imports, h) and not list_has(acc, h) {
+      vs_visible_homes(rest, name, imports, [h, ...acc])
+    } else { vs_visible_homes(rest, name, imports, acc) }
+}
+
+#[doc("The tagged names one module imports directly, from the per-file import view.")]
+fn vs_imports_of(imps: [ModImports], owner: String) : [String] = match imps {
+  [] -> []
+  [MImp(o, names), ...rest] -> if o == owner { names } else { vs_imports_of(rest, owner) }
+}
+
+#[doc("One module's viewpoint over the contested value names.")]
+fn vs_ctx(ix: NameIndex[VSEntry], home: String, target: String, cores: [String],
+      imps: [ModImports], tabs: ModTables) : VSCtx {
+  let owner = if home == target { "" } else { home }
+  VSCtx { ix: ix, home: home, target: target, cores: cores,
+          imports: vs_imports_of(imps, owner), mt: mtabs_of(tabs, owner) }
+}
+
+#[doc("True when `name` is bound as a module in the context's qualifier table. A module qualifier outranks a value of the same spelling, so `map.from(...)` keeps its qualifier even where `map` is also a contested function.")]
+fn vs_is_module(cx: VSCtx, name: String) : Bool = match mtab_lookup(cx.mt, name) {
   Some(_) -> true
   None    -> false
 }

@@ -24,12 +24,12 @@ written text the resolver settles like source.
 import compiler.util
 import compiler.ast
 import compiler.kinds
-import compiler.layout_synth
 import compiler.core_builtins
 import compiler.core_refs
 import compiler.symtab
 import compiler.derive_reach
 import compiler.spec_names
+import compiler.emit_shared
 
 # Fixed byte length of a Layout record: the sum of its field widths. The
 # decoder bounds-checks once against this instead of per field.
@@ -69,7 +69,7 @@ fn ld_result_ty(d: DeriveFor, line: Int, col: Int) : TypeExpr {
 }
 
 #[doc("The `#[derive(Layout)]` decls for the type `t`, with the row of each function: the protocol impl plus the `from_bytes` shim. `tab` names the type and the module its functions are minted in. Nothing when the body is not an all-Layout-fields record.")]
-pub fn derive_layout_impl(tab: SymTab, t: SymId, body: TypeBody,
+pub(pkg) fn derive_layout_impl(tab: SymTab, t: SymId, body: TypeBody,
                           line: Int, col: Int) : Minted = match body {
   TBRecord(fields) -> match layout_fields_of(fields) {
     Some(lfs) -> {
@@ -209,4 +209,157 @@ fn ld_field_inits(names: [String], line: Int, col: Int) : [FieldInit] = match na
   [] -> []
   [n, ...rest] -> [FI(n, ld_prim(CbAttachUnit, [ld_var(n, line, col)], line, col)),
                    ...ld_field_inits(rest, line, col)]
+}
+
+# One Layout field: its name, byte width, and byte order.
+type LayoutField = LFld(String, Int, ByteOrder)
+#                         name    width  order
+
+#[doc("The field name of a Layout field.")]
+fn lf_name(f: LayoutField) : String = match f { LFld(n, _, _) -> n }
+#[doc("The byte width of a Layout field.")]
+fn lf_width(f: LayoutField) : Int = match f { LFld(_, w, _) -> w }
+#[doc("The byte order of a Layout field.")]
+fn lf_order(f: LayoutField) : ByteOrder = match f { LFld(_, _, o) -> o }
+
+#[doc("The Layout fields of a record body, or None if the record is not Layout-bearing (no field carries a `be`/`le` habitant) or mixes a non-Layout field in.")]
+fn layout_fields_of(fields: [FieldDecl]) : Option[[LayoutField]] =
+  lfo_loop(fields, [], false)
+
+# Fold the field list. A record is Layout-bearing iff EVERY field is a
+# Layout field and there is at least one - a single non-Layout field
+# (a plain `Int`, a nested record, a TLV `Bytes<len>`) makes the whole
+# record non-Layout, so it is left to the plain-record path and any
+# `encode`/`decode` on it is rejected. A partial encoder is never
+# generated.
+fn lfo_loop(fields: [FieldDecl], acc: [LayoutField], saw: Bool) : Option[[LayoutField]] =
+  match fields {
+    [] -> if saw { Some(list_reverse(acc)) } else { None }
+    [f, ...rest] -> match layout_field_of(f) {
+      Some(lf) -> lfo_loop(rest, [lf, ...acc], true)
+      None -> None
+    }
+  }
+
+# A single field: `FD(_, name, TyDim(TyName("U32"), USym("be")), _)` ->
+# `LFld("magic", 4, BigEndian)`. Any other shape is not a Layout field: a
+# width annotation is a head written bare.
+fn layout_field_of(fd: FieldDecl) : Option[LayoutField] = match fd {
+  FD(_, name, te, _) -> match te.tkind {
+    TyDim(base, u) -> match base.tkind {
+      TyName(head, _) -> match layout_order_of(u) {
+        Some(order) -> match layout_width_of(derive_bare_text(head)) {
+          Some(w) -> Some(LFld(name, w, order))
+          None -> None
+        }
+        None -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Kind resolution qualifies the habitant (`be` -> `Layout$be`) before
+# this runs at rewrite time, so strip the qualifier first; pre-
+# resolution (synthesis) the symbol is already bare.
+#[doc("The byte order a habitant expr names, or `None` for anything else (a compound, a non-order symbol).")]
+fn layout_order_of(u: UnitExprT) : Option[ByteOrder] = match u {
+  USym(s) -> byte_order_of_atom(kind_sym_bare(s))
+  _       -> None
+}
+
+# Only the unsigned heads carry a decode-clean unsigned round-trip; signed
+# heads are a follow-up (sign extension), so they are not Layout-bearing yet.
+#[doc("The byte width of an unsigned width annotation (`U32` -> 4); `None` for a signed one, `F32`, or any other name.")]
+fn layout_width_of(name: String) : Option[Int] = match ffi_fixed_of_name(name) {
+  Some(fx) -> if ffi_fixed_is_signed(fx) or ffi_fixed_is_float(fx) { None } else { Some(ffi_fixed_bits(fx) / 8) }
+  None     -> None
+}
+
+# Why a field is not Layout-bearing. `LOk` keeps the walk total.
+pub(pkg) type LayoutReject
+  = LOk
+  | LNoOrder(String)
+  | LSigned(String)
+  | LNotFixed(String)
+
+#[doc("Classify one record field against the Layout rule. `tab` names a field type a scope pass already settled.")]
+pub(pkg) fn layout_reject_of(tab: SymTab, fd: FieldDecl) : LayoutReject = match fd {
+  FD(_, _, te, _) -> match te.tkind {
+    TyDim(base, u) -> match base.tkind {
+      TyName(r, _) ->
+        if layout_order_name(u) { layout_head_reject(derive_bare_text(r), derive_ref_text(tab, r)) }
+        else { LNoOrder(derive_ref_text(tab, r)) }
+      _ -> LNotFixed(layout_head_name(tab, te))
+    }
+    _ -> {
+      let width = layout_scalar_head(te)
+      let head = layout_head_name(tab, te)
+      if layout_is_signed_head(width) { LSigned(head) }
+      else if layout_is_unsigned_head(width) { LNoOrder(head) }
+      else { LNotFixed(head) }
+    }
+  }
+}
+
+# A habitant already carrying a byte order needs only a width check; a
+# signed head there is the declared follow-up, not a malformed field.
+# `width` is the annotation the head spells, `head` how a message names it.
+fn layout_head_reject(width: String, head: String) : LayoutReject =
+  if layout_is_unsigned_head(width) { LOk }
+  else if layout_is_signed_head(width) { LSigned(head) }
+  else { LNotFixed(head) }
+
+# The width annotation the head of `te` may spell, empty when it spells none.
+fn layout_scalar_head(te: TypeExpr) : String = match te.tkind {
+  TyName(r, _)   -> derive_bare_text(r)
+  TyDim(base, _) -> layout_scalar_head(base)
+  TyRefine(b, _) -> layout_scalar_head(b)
+  _              -> ""
+}
+
+fn layout_order_name(u: UnitExprT) : Bool = match layout_order_of(u) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn layout_is_unsigned_head(n: String) : Bool = match layout_width_of(n) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn layout_is_signed_head(n: String) : Bool = match ffi_fixed_of_name(n) {
+  Some(fx) -> ffi_fixed_is_signed(fx)
+  None     -> false
+}
+
+# The head name as the user wrote it, for the diagnostic. Lists and
+# functions have no head name worth printing, so they render structurally.
+#[doc("The head of a field type as a diagnostic names it.")]
+pub(pkg) fn layout_head_name(tab: SymTab, te: TypeExpr) : String = match te.tkind {
+  TyName(r, _)   -> derive_ref_text(tab, r)
+  TyList(_)      -> "List"
+  TyFn(_, _, _)  -> "Fn"
+  TyDim(base, _) -> layout_head_name(tab, base)
+  TyRefine(b, _) -> layout_head_name(tab, b)
+  _              -> "?"
+}
+
+#[doc("The remedy sentence for a Layout rejection, or the empty string for `LOk`.")]
+pub(pkg) fn layout_reject_why(r: LayoutReject) : String = match r {
+  LOk -> ""
+  LNoOrder(h) ->
+    concat_all(["`", h, "` carries no byte order; add `<be>` or `<le>`"])
+  LSigned(h) ->
+    concat_all(["`", h, "` is signed; Layout covers the unsigned heads ",
+                "`U8`/`U16`/`U32`/`U64` only"])
+  LNotFixed(h) ->
+    concat_all(["`", h, "` is not a fixed-width unsigned integer"])
+}
+
+#[doc("True when the rejection is a real failure.")]
+pub(pkg) fn layout_reject_is_err(r: LayoutReject) : Bool = match r {
+  LOk -> false
+  _   -> true
 }

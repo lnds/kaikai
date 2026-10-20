@@ -7,6 +7,10 @@ import compiler.modules_homes
 import compiler.symtab
 import compiler.written
 import compiler.scope_view
+import compiler.ast_map
+import compiler.anf_ops
+import compiler.expr_positions
+import compiler.type_home
 
 #[doc("""
 What a name written before the resolver is settled against: the symbol
@@ -315,4 +319,176 @@ fn in_declared_order(fis: [FieldInit], fds: [FieldDecl]) : Bool = match fis {
 fn init_index(fis: [FieldInit], target: String, i: Int) : Int = match fis {
   [] -> -1
   [FI(nm, _), ...rest] -> if nm == target { i } else { init_index(rest, target, i + 1) }
+}
+
+#[doc("Hoist, in every fn body of `ds`, the field reads of a record parameter that carries a `Vec`.")]
+pub(pkg) fn rfh_hoist_decls(ds: [Decl]) : [Decl] = map(ds, rfh_decl)
+
+fn rfh_decl(d: Decl) : Decl = match d {
+  DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> DFn(pub_, fid, tps, ps, ret, row, rfh_body(ps, body), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym)        -> DImpl(p, tas, tgt, map(inner, rfh_decl), l, c, tps, isym)
+  _ -> d
+}
+
+# A body with no `Vec` field read is returned as is: the rebuild would cost every program.
+fn rfh_body(ps: [Param], body: Expr) : Expr =
+  if xp_exists(body, false, rfh_is_vec_read) { rfh_params(ps, body) } else { body }
+
+fn rfh_is_vec_read(e: Expr) : Bool = match e.kind {
+  EField(x, _) -> match x.kind {
+    ELocal(_) -> match e.ty {
+      Some(TyCon(s, _)) -> core_ty_is(s, CtVec)
+      _                 -> false
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
+fn rfh_params(ps: [Param], body: Expr) : Expr = match ps {
+  []           -> body
+  [p, ...rest] -> rfh_params(rest, if p.pborrow { body } else { rfh_param(p.binder, body) })
+}
+
+fn rfh_param(b: Binder, body: Expr) : Expr = {
+  let reads = list_reverse(rfh_reads(b.id, body, []))
+  if not any(reads, rfh_is_vec_read) { body }
+  else {
+    let firsts = rfh_firsts(reads, [])
+    let stem = concat_all(["__rfh_", int_to_string(local_raw(b.id))])
+    let alias = binder_minted(stem)
+    let fbs = map(firsts, (r) => (rfh_field_name(r), binder_minted(concat_all([stem, "_", rfh_field_name(r)]))))
+    let body1 = rfh_subst(b.id, fbs, body)
+    if xp_exists(body1, false, (x) => rfh_is_local(b.id, x)) { body }
+    else {
+      let lets = map(firsts, (r) => rfh_field_let(alias, rfh_binder_of(fbs, rfh_field_name(r)), r))
+      with_kind(body, EBlock([rfh_alias_let(alias, b, firsts), ...lets], Some(body1)))
+    }
+  }
+}
+
+fn rfh_is_local(p: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(l) -> local_eq(l, p)
+  _         -> false
+}
+
+# The reads of `p`'s fields outside lambdas and handler clauses, last first.
+fn rfh_reads(p: LocalId, e: Expr, acc: [Expr]) : [Expr] = match e.kind {
+  EField(x, _) -> if rfh_is_local(p, x) { [e, ...acc] } else { rfh_reads_ps(p, xp_positions(e), acc) }
+  _            -> rfh_reads_ps(p, xp_positions(e), acc)
+}
+
+fn rfh_reads_ps(p: LocalId, ps: [XPos], acc: [Expr]) : [Expr] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> rfh_reads_ps(p, rest, if xrole_inline(r) { rfh_reads(p, c, acc) } else { acc })
+}
+
+fn rfh_field_name(e: Expr) : String = match e.kind {
+  EField(_, f) -> f
+  _            -> ""
+}
+
+# The first read of each field, in order.
+fn rfh_firsts(reads: [Expr], acc: [Expr]) : [Expr] = match reads {
+  []           -> list_reverse(acc)
+  [r, ...rest] -> rfh_firsts(rest, if any(acc, (a) => rfh_field_name(a) == rfh_field_name(r)) { acc } else { [r, ...acc] })
+}
+
+fn rfh_subst(p: LocalId, fbs: [(String, Binder)], e: Expr) : Expr = match e.kind {
+  EField(x, f) ->
+    if rfh_is_local(p, x) { with_kind(e, ELocal(rfh_binder_of(fbs, f).id)) }
+    else { with_kind(e, EField(rfh_subst(p, fbs, x), f)) }
+  ELambda(_, _)                 -> e
+  EHandle(_, _, _, _, _, _, _)  -> e
+  _ -> with_kind(e, prc_map_expr_kind(e.kind, (c) => rfh_subst(p, fbs, c)))
+}
+
+fn rfh_binder_of(fbs: [(String, Binder)], name: String) : Binder = match fbs {
+  []                  -> binder_minted("")
+  [(n, b), ...rest]   -> if n == name { b } else { rfh_binder_of(rest, name) }
+}
+
+fn rfh_base(r: Expr) : Expr = match r.kind {
+  EField(x, _) -> x
+  _            -> r
+}
+
+fn rfh_alias_let(alias: Binder, b: Binder, firsts: [Expr]) : Stmt = match firsts {
+  [r, ..._] -> {
+    let base = rfh_base(r)
+    SLet(Pattern { pkind: PBind(alias), line: base.line, col: base.col }, None, with_kind(base, ELocal(b.id)))
+  }
+  [] -> SLet(Pattern { pkind: PWild, line: 0, col: 0 }, None, mk_expr(EUnit, 0, 0))
+}
+
+fn rfh_field_let(alias: Binder, fb: Binder, r: Expr) : Stmt = match r.kind {
+  EField(x, f) -> SLet(Pattern { pkind: PBind(fb), line: r.line, col: r.col }, None,
+                       with_kind(r, EField(with_kind(x, ELocal(alias.id)), f)))
+  _            -> SLet(Pattern { pkind: PWild, line: r.line, col: r.col }, None, r)
+}
+
+# a named record literal lists each declared field exactly once.
+
+#[doc("The diagnostics for a record literal whose field names are not exactly its declared ones.")]
+pub(pkg) fn record_lit_field_errors(rec: String, given: [String], declared: [String]) : [String] =
+  duplicate_errors(rec, given) ++ unknown_errors(rec, given, declared) ++ missing_errors(rec, given, declared)
+
+fn duplicate_errors(rec: String, given: [String]) : [String] =
+  uniq(given)
+    |> filter((g) => count(given, (x) => x == g) > 1)
+    |> map((g) => "field '#{g}' given more than once in #{rec} literal")
+
+fn unknown_errors(rec: String, given: [String], declared: [String]) : [String] =
+  uniq(given)
+    |> filter((g) => not any(declared, (d) => d == g))
+    |> map((g) => "no field '#{g}' on #{rec}#{literal_hint(g, absent(declared, given))}")
+
+fn missing_errors(rec: String, given: [String], declared: [String]) : [String] =
+  match absent(declared, given) {
+    []    -> []
+    [one] -> ["missing field '#{one}' in #{rec} literal"]
+    many  -> ["missing fields #{quoted(many)} in #{rec} literal"]
+  }
+
+fn absent(declared: [String], given: [String]) : [String] =
+  filter(declared, (d) => not any(given, (g) => g == d))
+
+fn literal_hint(target: String, declared: [String]) : String =
+  match closest_name(target, declared) {
+    Some(sug) -> " (did you mean `#{sug}`?)"
+    None      -> ""
+  }
+
+fn quoted(names: [String]) : String = join(map(names, (n) => "'#{n}'"), ", ")
+
+#[doc("True when `fd` is `priv` and the reading module of `v` does not own `rec`, the declaration of the record type `rec_name`.")]
+pub(pkg) fn field_hidden(v: TyHomeView, rec_name: String, rec: SymId, fd: FieldDecl) : Bool =
+  match fd {
+    FD(true, _, _, _)  -> false
+    FD(false, _, _, _) -> not tsh_reader_owns(v, rec)
+  }
+
+#[doc("The error for reading the `priv` field `fname` of `rec_name` from outside `owner`, the module declaring it.")]
+pub(pkg) fn priv_read_diag(file: String, line: Int, col: Int, fname: String,
+                      rec_name: String, owner: Option[String]) : Diagnostic = {
+  let o = owner_text(owner)
+  mk_diag(SevError, file, line, col,
+    "field `#{fname}` of `#{rec_name}` is private to module `#{o}`",
+    [ri_help(file, line, col,
+      "the field is declared `priv` in module `#{o}`; only fns inside that module can read it")])
+}
+
+#[doc("The error for a record literal naming the `priv` field `fname` of `rec_name` from outside `owner`, the module declaring it.")]
+pub(pkg) fn priv_construct_diag(file: String, line: Int, col: Int, fname: String,
+                           rec_name: String, owner: Option[String]) : Diagnostic = {
+  let o = owner_text(owner)
+  mk_diag(SevError, file, line, col,
+    "cannot construct `#{rec_name}` from outside module `#{o}`: field `#{fname}` is private",
+    [ri_help(file, line, col,
+      "the field is declared `priv` in module `#{o}`; ask that module for a constructor fn")])
+}
+
+fn owner_text(owner: Option[String]) : String = match owner {
+  Some(m) -> m
+  None    -> "<root>"
 }

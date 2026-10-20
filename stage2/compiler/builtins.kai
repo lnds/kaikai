@@ -1,9 +1,10 @@
 #[doc("The core builtins: every name, runtime entry and type the compiler gives a program before it declares anything.")]
 
-import compiler.builtin_types
 import compiler.ast
-import compiler.builtin_sig
 import compiler.core_types
+import compiler.util
+import compiler.written
+import compiler.symtab
 
 #[doc("Every core builtin, in registry order.")]
 pub(pkg) fn builtin_table() : [Builtin] =
@@ -201,3 +202,166 @@ fn num_builtins() : [Builtin] = [
   BF("uint64_to_int",     BRuntime, mono(fun([TyUInt64], TyInt))),
   BF("int128_to_int",     BRuntime, mono(fun([TyInt128], TyInt)))
 ]
+
+#[doc("A scheme binding no variable.")]
+fn mono(t: Ty) : BSig = BS([], [], [], t)
+#[doc("A scheme binding the type variables `vs`.")]
+pub fn poly(vs: [Int], t: Ty) : BSig = BS(vs, [], [], t)
+#[doc("A scheme binding `vs` and row 0, the row a combinator shares with its callback.")]
+fn poly_row(vs: [Int], t: Ty) : BSig = BS(vs, [0], [], t)
+#[doc("A scheme binding `vs` and unit variable 0.")]
+fn poly_unit(vs: [Int], t: Ty) : BSig = BS(vs, [], [0], t)
+
+#[doc("Type variable `n`.")]
+fn tv(n: Int) : Ty = TyVarT(n)
+#[doc("The list type over `t`.")]
+pub fn lst(t: Ty) : Ty = TyListT(t)
+#[doc("The core nominal type `name` applied to `args`.")]
+pub fn nominal(name: String, args: [Ty]) : Ty = TyCon(core_type_sym_or_none(name), args)
+#[doc("`Array[t]`.")]
+pub fn arr(t: Ty) : Ty = nominal("Array", [t])
+#[doc("`Vec[t]`.")]
+pub fn vec(t: Ty) : Ty = nominal("Vec", [t])
+#[doc("`Option[t]`.")]
+pub fn opt(t: Ty) : Ty = nominal("Option", [t])
+#[doc("`Result[ok, String]`.")]
+pub fn res(ok: Ty) : Ty = nominal("Result", [ok, TyString])
+#[doc("`Pid[t]`.")]
+pub fn pid(t: Ty) : Ty = nominal("Pid", [t])
+#[doc("`Array[Byte]`.")]
+pub fn bytes() : Ty = arr(TyByte)
+#[doc("`t` carrying unit variable 0.")]
+pub fn dim(t: Ty) : Ty = TyDimT(t, UVar(0))
+
+fn pure_row() : Row = Row { labels: [], tail: None, display_alias: None }
+fn open_row() : Row = Row { labels: [], tail: Some(0), display_alias: None }
+fn eff_row(effs: [CoreEffect]) : Row =
+  Row { labels: map(effs, core_effect_label), tail: None, display_alias: None }
+
+#[doc("A pure function type.")]
+pub fn fun(ps: [Ty], r: Ty) : Ty = TyFnT(ps, r, pure_row())
+#[doc("A function type raising the core effects `effs`.")]
+fn fun_e(ps: [Ty], r: Ty, effs: [CoreEffect]) : Ty = TyFnT(ps, r, eff_row(effs))
+#[doc("A list combinator taking `ps` then a callback, whose effects flow out through the combinator's row.")]
+pub fn combinator(ps: [Ty], cb_ps: [Ty], cb_r: Ty, r: Ty) : Ty =
+  TyFnT(list_append(ps, [TyFnT(cb_ps, cb_r, open_row())]), r, open_row())
+
+#[doc("`(Real) -> Real`.")]
+fn real1() : BSig = mono(fun([TyReal], TyReal))
+#[doc("`(Real, Real) -> Real`.")]
+fn real2() : BSig = mono(fun([TyReal, TyReal], TyReal))
+#[doc("`(Int, Int) -> Int`.")]
+fn int2() : BSig = mono(fun([TyInt, TyInt], TyInt))
+
+#[doc("Where a builtin's calls go: the runtime entry `kai_core_<name>`, a runtime entry named explicitly, `kai_core_<name>` reached only by the pipe that lowers to it, or nowhere because the backends lower it in place.")]
+pub(pkg) type BEntry = BRuntime | BRuntimeAs(String) | BRuntimeUnbound | BIntrinsic
+
+#[doc("A builtin's type scheme: the bound type, row and unit variables, and the function type over them.")]
+pub type BSig = BS([Int], [Int], [Int], Ty)
+
+#[doc("A core builtin: its kaikai name, where its calls go, and its type scheme.")]
+pub type Builtin = BF(String, BEntry, BSig)
+
+#[doc("The C runtime entry a builtin's calls bind, or None for an intrinsic.")]
+pub(pkg) fn builtin_cname(name: String, entry: BEntry) : Option[String] = match entry {
+  BRuntime        -> Some(string_concat("kai_core_", name))
+  BRuntimeAs(c)   -> Some(c)
+  BRuntimeUnbound -> Some(string_concat("kai_core_", name))
+  BIntrinsic      -> None
+}
+
+#[doc("True when a program's bare use of the builtin's name binds it.")]
+pub(pkg) fn builtin_bound(entry: BEntry) : Bool = match entry {
+  BRuntimeUnbound -> false
+  _               -> true
+}
+
+#[doc("The number of arguments a builtin's scheme takes.")]
+pub(pkg) fn bsig_arity(s: BSig) : Int = match s {
+  BS(_, _, _, TyFnT(ps, _, _)) -> list_length(ps)
+  BS(_, _, _, _)               -> 0
+}
+
+#[doc("The identifier an intrinsic is written with after the `$`.")]
+pub(pkg) fn intrinsic_name(i: Intrinsic) : String = match i {
+  InExternHandler -> "extern_handler"
+  InCellInit      -> "__cell_init"
+  InCellGet       -> "__cell_get"
+  InCellSet       -> "__cell_set"
+  InLoopWhile     -> "__loop_while"
+  InLoopUntil     -> "__loop_until"
+  InLoopRepeat    -> "__loop_repeat"
+  InResumeFrame   -> "resume_frame"
+  InResumeBad     -> "resume_bad"
+  InSegHandle     -> "seg_handle"
+  InSegRequest    -> "seg_request"
+  InSegState      -> "seg_state"
+  InAbsent        -> "__kai_absent"
+  InCovHit(_)     -> "__cov_hit"
+  InUnknown(n)    -> n
+}
+
+#[doc("The intrinsic an identifier after `$` denotes; `InUnknown` keeps a name that denotes none. The inverse of `intrinsic_name`, save for a coverage probe, which is never written.")]
+pub(pkg) fn intrinsic_of_name(n: String) : Intrinsic = match n {
+  "extern_handler" -> InExternHandler
+  "__cell_init"    -> InCellInit
+  "__cell_get"     -> InCellGet
+  "__cell_set"     -> InCellSet
+  "__loop_while"   -> InLoopWhile
+  "__loop_until"   -> InLoopUntil
+  "__loop_repeat"  -> InLoopRepeat
+  "resume_frame"   -> InResumeFrame
+  "resume_bad"     -> InResumeBad
+  "seg_handle"     -> InSegHandle
+  "seg_request"    -> InSegRequest
+  "seg_state"      -> InSegState
+  "__kai_absent"   -> InAbsent
+  _                -> InUnknown(n)
+}
+
+#[doc("A declared core builtin: the declaring fn's identity and the runtime symbol its calls bind.")]
+pub type KaiBuiltin = KB(FnId, String)
+
+#[doc("The declared core builtins among the post-desugar decls `ds`.")]
+pub(pkg) fn kai_builtins(ds: [Decl]) : [KaiBuiltin] = match ds {
+  []           -> []
+  [d, ...rest] -> match kai_builtin_of_decl(d) {
+    Some(kb) -> [kb, ...kai_builtins(rest)]
+    None     -> kai_builtins(rest)
+  }
+}
+
+fn kai_builtin_of_decl(d: Decl) : Option[KaiBuiltin] = match d {
+  DFn(_, fid, _, _, _, _, body, _, _, _) -> match body.kind {
+    EExternBody(AbiKai, sym) -> Some(KB(fid, sym))
+    _                        -> None
+  }
+  DDoc(_, _, inner, _, _) -> kai_builtin_of_decl(inner)
+  DAttr(_, inner, _, _)   -> kai_builtin_of_decl(inner)
+  _                       -> None
+}
+
+# A declaration shadows the row it is spelled like, so the name stops being
+# a builtin every file sees bare and resolves to the declaration instead.
+#[doc("The builtin names `names` less the ones the post-desugar decls `ds` declare with `extern \"kai\"`; `tab` holds those declarations.")]
+pub(pkg) fn kai_unshadowed(names: [String], ds: [Decl], tab: SymTab) : [String] = match kai_builtins(ds) {
+  []  -> names
+  kbs -> {
+    let declared = map(kbs, (kb) => kai_builtin_name(tab, kb))
+    filter(names, (n) => not list_has(declared, n))
+  }
+}
+
+#[doc("The declared builtin the fn `fid` is, or None for any other fn.")]
+pub(pkg) fn kai_builtin_find(kbs: [KaiBuiltin], fid: FnId) : Option[KaiBuiltin] = match kbs {
+  []            -> None
+  [kb, ...rest] -> match kb {
+    KB(f, _) -> if fnid_eq(f, fid) { Some(kb) } else { kai_builtin_find(rest, fid) }
+  }
+}
+
+#[doc("The runtime symbol a C-backend call to the declared builtin binds.")]
+pub(pkg) fn kai_builtin_csym(kb: KaiBuiltin) : String = match kb { KB(_, sym) -> sym }
+
+#[doc("The kaikai name of the declared builtin, which keys its native entry `kaix_core_<name>`.")]
+fn kai_builtin_name(tab: SymTab, kb: KaiBuiltin) : String = match kb { KB(f, _) -> written_text(decl_name(tab, fnid_sym(f))) }

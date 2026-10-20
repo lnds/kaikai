@@ -20,14 +20,18 @@ import compiler.diag
 import compiler.diag_file
 import compiler.emit_shared
 import compiler.entry
-import compiler.ffi_v2
 import compiler.scope_view
 import compiler.written
 import compiler.symtab
 import compiler.type_home
+import compiler.home_dup
+import compiler.extern_records
+import compiler.scalar_ty
+import compiler.type_text
+import compiler.spec_names
 
 #[doc("What the boundary checks read a program's type names with: its table, every file's scope view, the root module and the compile's roots.")]
-pub type ExternScope = ExternScope(SymTab, FileViews, String, Roots)
+pub(pkg) type ExternScope = ExternScope(SymTab, FileViews, String, Roots)
 
 fn xs_tab(x: ExternScope) : SymTab = match x { ExternScope(t, _, _, _) -> t }
 
@@ -36,7 +40,7 @@ fn xs_homes(decls: [Decl], x: ExternScope) : TyHomes = match x {
 }
 
 #[doc("Every extern struct's field types settled to the declarations they name from the struct's own module. A program declaring no extern struct is returned as it is.")]
-pub fn settle_extern_structs(decls: [Decl], x: ExternScope) : [Decl] =
+pub(pkg) fn settle_extern_structs(decls: [Decl], x: ExternScope) : [Decl] =
   if any(decls, declares_extern_struct) {
     let homes = xs_homes(decls, x)
     map(decls, (d) => settle_struct_decl(d, homes))
@@ -77,7 +81,7 @@ fn ref_decl(v: TyHomeView, r: DeclRef) : Option[SymId] = match tsh_tycon_at(v, r
 }
 
 #[doc("Reject an `extern \"C\" fn` whose parameter or return type, or an `extern \"C\" type` whose field type, is not a scalar, a fixed-width annotation, or a declared `extern \"C\" type`/`opaque`.")]
-pub fn validate_extern_fn_types(decls: [Decl], x: ExternScope, df: DiagFiles) : [Diagnostic] / Console + File =
+pub(pkg) fn validate_extern_fn_types(decls: [Decl], x: ExternScope, df: DiagFiles) : [Diagnostic] / Console + File =
   if any(decls, crosses_boundary) {
     let cx = XtCx { tab: xs_tab(x), homes: xs_homes(decls, x), reg: collect_extern_types(decls, xs_tab(x)), df: df }
     list_reverse(extern_types_loop(decls, cx, []))
@@ -199,3 +203,202 @@ fn extern_ref_name(tab: SymTab, r: DeclRef) : String = match r {
   DrWritten(_, n) -> written_text(n)
   DrSym(s)        -> written_text(decl_name(tab, s))
 }
+
+# A declared extern fn: its rendered signature plus a homed declaration
+# whose name is the C SYMBOL, not the kaikai spelling. The symbol is
+# what the two modules share, so it is what the conflict is about and
+# what the diagnostic names.
+type ExternFn = EF(String, HomedDecl)
+
+#[doc("Reject two `extern \"C\" fn` declarations that bind one C symbol to different signatures. Agreeing redeclarations are the ordinary cross-module pattern and stay legal.")]
+pub(pkg) fn validate_extern_fn_homes(decls: [Decl], tab: SymTab, df: DiagFiles) : [Diagnostic] =
+  finalize_diags(extern_fn_loop(decls, tab, df, [], []))
+
+fn extern_fn_loop(decls: [Decl], tab: SymTab, df: DiagFiles, seen: [ExternFn],
+                  acc: [Diagnostic]) : [Diagnostic] = match decls {
+  [] -> acc
+  [d, ...rest] -> match decl_extern_fn(d, tab) {
+    None -> extern_fn_loop(rest, tab, df, seen, acc)
+    Some(e) -> match extern_fn_find(seen, ef_symbol(e)) {
+      None -> extern_fn_loop(rest, tab, df, [e, ...seen], acc)
+      Some(prev) ->
+        if ef_sig(prev) == ef_sig(e) { extern_fn_loop(rest, tab, df, seen, acc) }
+        else { extern_fn_loop(rest, tab, df, seen, [extern_fn_conflict(df, e, prev), ...acc]) }
+    }
+  }
+}
+
+fn ef_sig(e: ExternFn) : String = match e { EF(g, _) -> g }
+fn ef_decl(e: ExternFn) : HomedDecl = match e { EF(_, h) -> h }
+fn ef_symbol(e: ExternFn) : String = hd_name(ef_decl(e))
+
+fn extern_fn_find(seen: [ExternFn], sym: String) : Option[ExternFn] = match seen {
+  [] -> None
+  [e, ...rest] -> if ef_symbol(e) == sym { Some(e) } else { extern_fn_find(rest, sym) }
+}
+
+# Both signatures are shown: the reader reconciles two declarations, and
+# which one is wrong is theirs to decide, so neither is called expected.
+fn extern_fn_conflict(df: DiagFiles, second: ExternFn, first: ExternFn) : Diagnostic =
+  conflict_diag(df,
+    concat_all(["conflicting declarations of extern function `",
+                ef_symbol(second), "`"]),
+    concat_all(["one C symbol has one signature: ",
+                home_display(hd_home(ef_decl(first))), " declares `",
+                ef_sig(first), "`, ",
+                home_display(hd_home(ef_decl(second))), " declares `",
+                ef_sig(second),
+                "`; make them agree, or bind one to a different symbol"]),
+    ef_decl(second), ef_decl(first))
+
+# An extern fn reaches this pass as the DFn `lower_axiom_one` produced:
+# the marker body carries the C-symbol override, empty when the kaikai
+# identifier IS the symbol.
+fn decl_extern_fn(d: Decl, tab: SymTab) : Option[ExternFn] = match d {
+  DFn(_, fid, _, params, ret, _, body, l, c, mo) -> match body.kind {
+    EExternBody(AbiC, over) -> {
+      let sym = if string_length(over) > 0 { over } else { written_text(sym_name(tab, fnid_sym(fid))) }
+      Some(EF(extern_sig_display(tab, params, ret), HD(mo, sym, l, c)))
+    }
+    _ -> None
+  }
+  DDoc(_, _, inner, _, _) -> decl_extern_fn(inner, tab)
+  DAttr(_, inner, _, _)   -> decl_extern_fn(inner, tab)
+  _                       -> None
+}
+
+# The rendering IS the comparison key: two signatures agree exactly when
+# they render alike, so an unannotated parameter (which no extern fn has)
+# cannot silently match an annotated one.
+fn extern_sig_display(tab: SymTab, params: [Param], ret: Option[TypeExpr]) : String =
+  concat_all(["(", join_with(map(params, (p) => opt_ty_display(tab, p.ptype)), ", "), ") : ",
+              opt_ty_display(tab, ret)])
+
+fn opt_ty_display(tab: SymTab, t: Option[TypeExpr]) : String = match t {
+  None    -> "_"
+  Some(x) -> ffi_ty_display(tab, x)
+}
+
+# The boundary admits scalars, fixed-width annotations, extern structs
+# and opaque handles — all `TyName`. Anything else is rejected further
+# down the pipeline; here it only has to render distinguishably.
+fn ffi_ty_display(tab: SymTab, t: TypeExpr) : String = match t.tkind {
+  TyName(r, [])    -> ffi_ref_display(tab, r)
+  TyName(r, targs) ->
+    concat_all([ffi_ref_display(tab, r), "[", join_with(map(targs, (a) => ffi_ty_display(tab, a)), ", "), "]"])
+  TyList(inner)    -> concat_all(["[", ffi_ty_display(tab, inner), "]"])
+  _                -> "?"
+}
+
+# Two declarations spelled alike are two types, so a settled reference
+# to one of them carries its module.
+fn ffi_ref_display(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(_, n) -> written_text(n)
+  DrSym(s) ->
+    if sym_contested(tab, s) { concat_all([written_text(decl_home(tab, s)), ".", written_text(decl_name(tab, s))]) }
+    else { written_text(decl_name(tab, s)) }
+}
+
+#[doc("A declared foreign type by its id: an extern struct with its fields, or an opaque handle.")]
+pub(pkg) type ExternTypeReg = ExtStruct(SymId, [FieldDecl]) | ExtOpaque(SymId)
+
+#[doc("Every `extern \"C\" type` and lowered `extern \"C\" opaque` of the decl stream; `tab` holds their declarations.")]
+pub(pkg) fn collect_extern_types(ds: [Decl], tab: SymTab) : [ExternTypeReg] = collect_extern_types_loop(ds, tab, [])
+
+#[doc("The phantom field name marking the record an `extern \"C\" opaque` lowers to.")]
+fn ffi_opaque_phantom_field() : String = "__ffi_handle"
+
+fn collect_extern_types_loop(ds: [Decl], tab: SymTab, acc: [ExternTypeReg]) : [ExternTypeReg] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DExternType(_, name, ETStruct(fields), _, _, mo) -> match extern_struct_sym(tab, name, mo) {
+      Some(s) -> collect_extern_types_loop(rest, tab, [ExtStruct(s, fields), ...acc])
+      None    -> collect_extern_types_loop(rest, tab, acc)
+    }
+    DType(_, s, _, TBRecord(fields), _, _, _, _) ->
+      if is_opaque_phantom_record(fields) { collect_extern_types_loop(rest, tab, [ExtOpaque(s), ...acc]) }
+      else { collect_extern_types_loop(rest, tab, acc) }
+    DDoc(_, _, inner, _, _) -> collect_extern_types_loop([inner, ...rest], tab, acc)
+    DAttr(_, inner, _, _)   -> collect_extern_types_loop([inner, ...rest], tab, acc)
+    _ -> collect_extern_types_loop(rest, tab, acc)
+  }
+}
+
+fn is_opaque_phantom_record(fields: [FieldDecl]) : Bool = match fields {
+  [FD(_, fname, _, _)] -> fname == ffi_opaque_phantom_field()
+  _ -> false
+}
+
+#[doc("The registry entry of the declaration `s`; None when `s` is no declared foreign type.")]
+fn extern_type_of(reg: [ExternTypeReg], s: SymId) : Option[ExternTypeReg] =
+  if sym_raw(s) < 0 { None } else { find(reg, (e) => sym_same(extern_type_sym(e), s)) }
+
+#[doc("The declaration a registry entry is.")]
+fn extern_type_sym(e: ExternTypeReg) : SymId = match e {
+  ExtStruct(s, _) -> s
+  ExtOpaque(s)    -> s
+}
+
+#[doc("The registry entry a type reference names: a settled reference by its declaration; a written one names none.")]
+fn extern_type_ref(reg: [ExternTypeReg], r: DeclRef) : Option[ExternTypeReg] = match r {
+  DrSym(s)        -> extern_type_of(reg, s)
+  DrWritten(_, _) -> None
+}
+
+#[doc("Classify a boundary type: a declared struct or opaque by the declaration its reference names, anything else as `ffi_kind_of_ty` does. `tab` names an unsupported type for the `#error` that reports it.")]
+pub(pkg) fn ffi_kind_of_ty_reg(t: TypeExpr, reg: [ExternTypeReg], tab: SymTab) : FfiRetKind = match t.tkind {
+  TyName(r, []) -> match extern_type_ref(reg, r) {
+    Some(ExtStruct(s, _)) -> FfiRetStruct(s)
+    Some(ExtOpaque(s))    -> FfiRetForeign(s)
+    None                  -> ffi_kind_of_ty(t, tab)
+  }
+  TyName(r, _) -> FfiRetUnknown(ref_decl_name(tab, r))
+  _ -> ffi_kind_of_ty(t, tab)
+}
+
+#[doc("FFI v2 ret kind of an optional return type, registry-aware (None = Unit/void).")]
+pub(pkg) fn ffi_ret_kind_of_reg(opt: Option[TypeExpr], reg: [ExternTypeReg], tab: SymTab) : FfiRetKind = match opt {
+  None    -> FfiRetUnit
+  Some(t) -> ffi_kind_of_ty_reg(t, reg, tab)
+}
+
+#[doc("The C struct fields of the extern struct `s` (empty when `s` is no registered struct).")]
+pub(pkg) fn extern_struct_fields(reg: [ExternTypeReg], s: SymId) : [FieldDecl] =
+  match extern_type_of(reg, s) {
+    Some(ExtStruct(_, fields)) -> fields
+    _ -> []
+  }
+
+#[doc("True when a struct field's type has a C layout: a fixed-width annotation, or a declared extern struct.")]
+fn extern_field_has_layout(fd: FieldDecl, reg: [ExternTypeReg]) : Bool = match fd {
+  FD(_, _, fty, _) -> match fty.tkind {
+    TyName(r, []) -> match extern_type_ref(reg, r) {
+      Some(ExtStruct(_, _)) -> true
+      Some(ExtOpaque(_))    -> false
+      None                  -> match ffi_fixed_of_name(ref_spelled(r)) {
+        Some(_) -> true
+        None    -> false
+      }
+    }
+    _ -> false
+  }
+}
+
+# A field the front end let through with no C layout yields a
+# placeholder the C compiler reports.
+#[doc("The C type of one extern-struct field: its fixed width, or the nested struct's tag.")]
+pub(pkg) fn extern_field_c_type(fd: FieldDecl, reg: [ExternTypeReg], tab: SymTab) : String = match fd {
+  FD(_, _, fty, _) -> match fty.tkind {
+    TyName(r, _) -> match extern_type_ref(reg, r) {
+      Some(ExtStruct(s, _)) -> extern_struct_c_tag(tab, s)
+      _ -> match ffi_fixed_of_name(ref_spelled(r)) {
+        Some(fx) -> ffi_fixed_c_type(fx)
+        None     -> concat_all(["/* unsupported FFI field type ", ref_decl_name(tab, r), " */ int"])
+      }
+    }
+    _ -> "/* unsupported FFI field type */ int"
+  }
+}
+
+#[doc("The C type name of the extern struct `s`: the name it was declared with, a `typedef` the shared FFI header (`kai_ffi.h`) defines so a hand-written shim names the SAME type, not a layout-equivalent twin.")]
+pub(pkg) fn extern_struct_c_tag(tab: SymTab, s: SymId) : String = rt_name(tab, s)
