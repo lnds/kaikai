@@ -139,6 +139,17 @@ need either row-constraint propagation or explicit coercions),
 and the resulting errors are hard to explain. Keep the model
 concrete-per-call: if you want polymorphism, use a row variable.
 
+**One scoped exception.** A function *argument* whose row is `L + e`, with
+`e` a row variable declared on the enclosing function (rigid), is accepted
+for a parameter whose row is `M + r` with `r` flexible when every label of
+`L` is in `M`: the argument performs fewer effects than the parameter
+allows. `r` takes `e` as its tail. Without it a handler helper that shares
+one row between a callback and a body cannot be called with a callback that
+merely forwards a row-polymorphic parameter. The rule only moves toward
+*fewer* effects; a rigid variable never gains a label and a closed or rigid
+expected row keeps plain equality, so no constraint is propagated and
+inference stays decidable and principal.
+
 > **Note — pure named callbacks (issue #645).** A function declared
 > without a `/` row clause is treated as row-polymorphic at the call
 > site: its scheme gains an implicit row variable so callers can pass

@@ -18,7 +18,10 @@ the capability for its body's lexical scope.
 Effects are INFERRED in local bodies. Public signatures MUST annotate
 the row — that is Tier 1 #1 "safe at compile time". Rows are sets,
 not ordered lists: `Stdout + File` ≡ `File + Stdout`. Duplicates are
-idempotent.
+idempotent. Rows unify by equality, with one exception: a function
+argument may perform fewer effects than its parameter's row allows,
+when that row ends in a flexible variable and the argument's ends in a
+rigid one (`e` declared on the enclosing fn).
 
 Resume is ONE-SHOT and EXPLICIT: a clause receives `resume` as a
 callable; calling it continues the body with a value and evaluates to
