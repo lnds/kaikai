@@ -1,0 +1,546 @@
+# Lambda and clause collection, match-arm shape tests and unused-let analysis.
+
+import compiler.ast
+import compiler.emit_shared_fv
+import compiler.emit_shared_syms
+import compiler.enc_unit
+import compiler.fnreg
+import compiler.infer_glue
+import compiler.local_names
+import compiler.loop_lower
+import compiler.perceus_payer
+import compiler.spec_names
+import compiler.symtab
+import compiler.unbox
+
+#[doc("The AST `ExprKind` constructor name as a string (e.g. `EInt(0)` → \"EInt\"). Used by the typed-hole / library-mode enclosing-node walk in the driver to label nodes by kind.")]
+pub fn expr_kind_name(k: ExprKind) : String {
+  match k {
+    EInt(_, _)        -> "EInt"
+    EReal(_, _)       -> "EReal"
+    EIntLit(_)        -> "EIntLit"
+    EDecimalLit(_)    -> "EDecimalLit"
+    EFixed(_, _)      -> "EFixed"
+    EBool(_)       -> "EBool"
+    EChar(_)       -> "EChar"
+    EStr(_, _)     -> "EStr"
+    EUnit          -> "EUnit"
+    EName(_)        -> "EVar"
+    EMark(_)       -> "EMark"
+    ESym(_, _)     -> "EVar"
+    ELocal(_)      -> "EVar"
+    EOp(_)         -> "EVar"
+    EUnder         -> "EUnder"
+    EPlaceholder   -> "EPlaceholder"
+    ECall(_, _)    -> "ECall"
+    EField(_, _)   -> "EField"
+    EIndex(_, _)   -> "EIndex"
+    EBinop(_, _, _) -> "EBinop"
+    EUnop(_, _)    -> "EUnop"
+    EIf(_, _, _)   -> "EIf"
+    EMatch(_, _)   -> "EMatch"
+    ELambda(_, _)  -> "ELambda"
+    ERecordLit(_, _) -> "ERecordLit"
+    EList(_)       -> "EList"
+    ERange(_, _, _) -> "ERange"
+    EBlock(_, _)   -> "EBlock"
+    EPipe(_, _)    -> "EPipe"
+    EDispatchPipe(_, _, _) -> "EDispatchPipe"
+    EHole(_)       -> "EHole"
+    ETodo(_)       -> "ETodo"
+    EExternBody(_, _) -> "ETodo"
+    EBang(_)       -> "EBang"
+    EHandle(_, _, _, _, _, _, _) -> "EHandle"
+    ELitUnit(_, _) -> "ELitUnit"
+    EVariantsOf(_, _) -> "EVariantsOf"
+    EModCall(_, _) -> "EModCall"
+    EIntrinsic(_, _) -> "EIntrinsic"
+    ESurface(_) -> "ESurface"
+  }
+}
+
+#
+# For user-facing builtins, we map to their runtime C symbol and arity.
+# Stage 1 mirrors stage 0's table 1:1.
+
+# M5 fast-path predicate. True iff every arm in `arms` is a
+# literal pattern (Int / Bool / Char) or a wildcard (PWild /
+# PBind), and no arm carries a guard. Strings are intentionally
+# excluded — the C `switch` only works on integral types.
+#[doc("M5 fast-path predicate. True iff every arm in `arms` is a literal pattern (Int / Bool / Char) or a wildcard (PWild / PBind), and no arm carries a guard. Strings are…")]
+pub fn arms_all_literal_or_wild(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false   # need at least one arm to dispatch on
+    _  -> arms_all_literal_or_wild_loop(arms)
+  }
+}
+
+#[doc("Tail loop: true while every remaining match arm is a literal or wildcard pattern.")]
+pub fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
+  match arms {
+    [] -> true
+    [Arm(p, g, _), ...rest] -> match g {
+      Some(_) -> false
+      None    -> if pat_is_unboxable_lit_or_wild(p) {
+        arms_all_literal_or_wild_loop(rest)
+      } else { false }
+    }
+  }
+}
+
+# The fast path binds a `PBind` catch-all raw. A read of the binder
+# from inside a lambda body expects the boxed binding, so such a match
+# routes through the boxed path. Mirrors the lambda-capture guard of the
+# unbox pass's `let`.
+#[doc("True when no `PBind` catch-all arm's body reads its binder from a lambda body, the read the fast match path's raw binding cannot serve.")]
+pub fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool {
+
+  match arms {
+    [] -> true
+    [Arm(p, _, b), ...rest] -> {
+      let ok = match p.pkind {
+        PBind(bd) -> not uses_have_in_lam(scan_uses_expr(b, false), bd.id)
+        _ -> true
+      }
+      if ok { arms_pbind_safe_for_fast_path(rest) } else { false }
+    }
+  }
+}
+
+#[doc("True if a pattern is an unboxable literal or wildcard (drives the fast match path).")]
+pub fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
+  match p.pkind {
+    PWild     -> true
+    # A PBind catch-all rides the fast path: the unbox pass marks the
+    # body's reads of the binder MUnboxed and the emitters bind it raw
+    # in the default block before the body.
+    PBind(_)  -> true
+    PLit(lit) -> match lit.kind {
+      EInt(_, _)  -> true
+      EBool(_) -> true
+      EChar(_) -> true
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+# Emit the raw C scalar that goes inside `switch (...)` for a
+# literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
+# `EChar` → numeric codepoint.
+
+# `cur_enc_fn` is the fn / lambda / clause / runner the walker is inside:
+# a handle stamps it on each clause it records, so the install site and
+# the clause body mint the same symbol. `cur_mo` is
+# that fn's module, carried raw because a lifted body is emitted from a
+# side table with no declaration to read it off. `locals` names the
+# binders of the declaration being walked, for the lifted bodies' text.
+#[doc("Lambda-collect state: the lambdas and clauses lifted so far, the handles met, the binders in scope at the walk position, the enclosing unit and its module, the binder names of the declaration being walked, and the tables a fn's symbol is spelled from.")]
+pub type LamCollect = { lams: [LamInfo], clauses: [ClauseInfo], handles: [HandleInfo],
+                    scope: FvOuter, cur_enc_fn: EncFn, cur_mo: Option[String],
+                    locals: LocalNames, tab: SymTab, specs: SpecNames }
+
+#[doc("Lambda-collect state helper: new. `tab` and `specs` spell each walked fn's symbol.")]
+pub fn lc_new(tab: SymTab, specs: SpecNames) : LamCollect =
+  LamCollect { lams: [], clauses: [], handles: [], scope: fv_outer_empty(), cur_enc_fn: enc_none(), cur_mo: None,
+               locals: ln_empty(), tab: tab, specs: specs }
+
+# Snapshot the scope at entry of a scope-introducing form (fn body,
+# block, lambda body); restore it on exit.
+#[doc("Replace the walker's enclosing scope, for restoring a snapshot taken at a scope boundary.")]
+pub fn lc_set_scope(st: LamCollect, sc: FvOuter) : LamCollect = LamCollect { ...st, scope: sc }
+
+#[doc("Lambda-collect state helper: bind more binders in the current scope.")]
+pub fn lc_extend_locals(st: LamCollect, added: [Binder]) : LamCollect =
+  lc_set_scope(st, fv_outer_bind(st.scope, added))
+
+#[doc("AST collector walking expr.")]
+pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
+
+  match x.kind {
+    EInt(_, _)  -> st
+    EReal(_, _) -> st
+    EIntLit(_) -> st
+    EDecimalLit(_) -> st
+    EFixed(_, _) -> st
+    EBool(_) -> st
+    EChar(_) -> st
+    EStr(_, _) -> st
+    EUnit -> st
+    EName(_) -> st
+    EMark(_) -> st
+    ESym(_, _) -> st
+    ELocal(_) -> st
+    EOp(_) -> st
+    EUnder -> st
+    EPlaceholder -> st
+    ECall(f, xs) -> collect_exprs(xs, collect_expr(f, st))
+    EField(base, _) -> collect_expr(base, st)
+    EIndex(a, b) -> collect_expr(b, collect_expr(a, st))
+    EBinop(_, a, b) -> collect_expr(b, collect_expr(a, st))
+    EUnop(_, inner) -> collect_expr(inner, st)
+    EIf(c, a, opt_b) -> {
+      let s1 = collect_expr(a, collect_expr(c, st))
+      match opt_b { Some(b) -> collect_expr(b, s1) None -> s1 }
+    }
+    EMatch(scr, arms) -> collect_arms(arms, collect_expr(scr, st))
+    ELambda(params, body) -> {
+      let own = params_binders(params)
+      let caps = fv_expr(body, own, st.scope, [])
+      let info = LamInfo(st.locals, st.cur_enc_fn, x.line, x.col, params, caps, body, st.cur_mo)
+      # The lambda body is its own enclosing scope for clause symbols
+      # (lifted to `lam_symbol` at emit); a sibling expression keeps
+      # stamping against the outer fn.
+      let outer_enc_fn = st.cur_enc_fn
+      let outer_scope = st.scope
+      let st1 = LamCollect { ...st, lams: [info, ...st.lams],
+                             scope: fv_outer_bind(outer_scope, own),
+                             cur_enc_fn: lam_enc(outer_enc_fn, x.line, x.col) }
+      let st2 = collect_expr(body, st1)
+      LamCollect { ...st2, scope: outer_scope, cur_enc_fn: outer_enc_fn, cur_mo: st.cur_mo }
+    }
+    ERecordLit(_, fields) -> collect_field_inits(fields, st)
+    EList(elems) -> collect_list_elems(elems, st)
+    ERange(a, b, opt_step) -> {
+      let s1 = collect_expr(b, collect_expr(a, st))
+      match opt_step { Some(s) -> collect_expr(s, s1) None -> s1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      # Statements bind into the block's scope; siblings must not see
+      # those bindings, so the outer scope is restored on exit.
+      let outer_scope = st.scope
+      let s1 = collect_stmts(stmts, st)
+      let s2 = match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+      lc_set_scope(s2, outer_scope)
+    }
+    EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EDispatchPipe(_, a, b) -> collect_expr(b, collect_expr(a, st))
+    EHole(_) -> st
+    ETodo(_) -> st
+    EExternBody(_, _) -> st
+    EBang(inner) -> collect_expr(inner, st)
+    EHandle(body, eref, _, init_opt, alias_opt, clauses, ret_opt) -> {
+      let stateful = match init_opt { Some(_) -> true None -> false }
+      let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
+      # Each clause is stamped with the enclosing fn's symbol, which the
+      # install site reads back.
+      let s_site = LamCollect { ...s_init, handles: [HI(x.line, x.col, s_init.cur_enc_fn, ref_sym(eref)), ...s_init.handles] }
+      let s0 = lc_record_clauses(clauses, ref_sym(eref), stateful, x.line, x.col, s_init.cur_enc_fn, s_site)
+      # The alias is in scope inside the body only — not in `init`, which
+      # runs before the handler is installed, and not in the clauses. A
+      # lambda in the body reaches it through its handler, never as a
+      # captured value.
+      let outer_scope = s0.scope
+      let s_body_in = match alias_opt {
+        Some(a) -> lc_set_scope(s0, fv_outer_alias(outer_scope, a))
+        None    -> s0
+      }
+      let s1_ext = collect_expr(body, s_body_in)
+      let s1 = lc_set_scope(s1_ext, outer_scope)
+      let s2 = collect_hclauses(clauses, x.line, x.col, s1)
+      match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
+    }
+    # m12.5: literal-with-unit — the inner literal contributes nothing,
+    # but recurse so future non-literal carriers stay covered.
+    ELitUnit(inner, _) -> collect_expr(inner, st)
+    # m7e §11: `variants[T]()` produces no lambdas / no clauses to
+    # collect. The TypeExpr is not a lambda host.
+    EVariantsOf(_, _) -> st
+    # m6.2 Phase 2.1: qualified module call hosts no lambdas and
+    # introduces no clauses — both fields are plain strings.
+    EModCall(_, _) -> st
+    # A loop intrinsic's own arg-lambdas never become closures — the C
+    # emitter pastes their bodies inline into the enclosing frame — so
+    # they get no LamInfo and their bodies walk under the ENCLOSING
+    # enc_fn/scope: a genuine nested lambda (or handle) inside a loop
+    # body must register where the inline emission will look it up.
+    EIntrinsic(nm, args_) ->
+      if is_loop_intrinsic(nm) { collect_loop_args(args_, st) }
+      else { collect_exprs(args_, st) }
+    ESurface(sf) -> collect_exprs(surface_children(sf), st)
+  }
+}
+
+fn collect_loop_args(args_: [Expr], st: LamCollect) : LamCollect / Console = match args_ {
+  []           -> st
+  [a, ...rest] -> {
+    let st1 = match a.kind {
+      ELambda(ps, body) -> match ps { [] -> collect_expr(body, st) _ -> collect_expr(a, st) }
+      _ -> collect_expr(a, st)
+    }
+    collect_loop_args(rest, st1)
+  }
+}
+
+#[doc("Append one ClauseInfo per clause of the handle at (hline, hcol), which handles `esym` inside the unit `enc_fn`.")]
+pub fn lc_record_clauses(cs: [HClause], esym: SymId, stateful: Bool,
+                     hline: Int, hcol: Int, enc_fn: EncFn,
+                     st: LamCollect) : LamCollect / Console {
+
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(op_name, params, body, _, _) -> {
+        # The clause's captures are what its body reads beyond its own
+        # params and the state aliases it binds. A stateless handler
+        # binds no alias, and a name the enclosing scope already binds
+        # rides the env like any other capture.
+        let aliases = if stateful { fv_clause_aliases([], st.scope) } else { [] }
+        let caps = fv_expr(body, fv_clause_own(params, aliases), st.scope, [])
+        let info = CI(hline, hcol, st.locals, op_name, params, body, stateful, enc_fn, caps, st.cur_mo, esym)
+        lc_record_clauses(rest, esym, stateful, hline, hcol, enc_fn,
+                          LamCollect { ...st, clauses: [info, ...st.clauses] })
+      }
+    }
+  }
+}
+
+#[doc("AST collector walking hclauses.")]
+pub fn collect_hclauses(cs: [HClause], hline: Int, hcol: Int, st: LamCollect) : LamCollect / Console {
+
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(head, _, body, _, _) -> {
+        let outer_enc_fn = st.cur_enc_fn
+        let body_st = enter_enc_fn(st, clause_enc(outer_enc_fn, hline, hcol, head), st.cur_mo)
+        collect_hclauses(rest, hline, hcol, restore_enc_fn(collect_expr(body, body_st), outer_enc_fn))
+      }
+    }
+  }
+}
+
+#[doc("AST collector walking hreturn.")]
+pub fn collect_hreturn(r: HReturn, st: LamCollect) : LamCollect / Console {
+
+  match r {
+    HR(_, body, _, _) -> collect_expr(body, st)
+  }
+}
+
+#[doc("AST collector walking exprs.")]
+pub fn collect_exprs(xs: [Expr], st: LamCollect) : LamCollect / Console {
+
+  match xs {
+    [] -> st
+    [h, ...rest] -> collect_exprs(rest, collect_expr(h, st))
+  }
+}
+
+#[doc("AST collector walking arms.")]
+pub fn collect_arms(arms: [Arm], st: LamCollect) : LamCollect / Console {
+
+  match arms {
+    [] -> st
+    [a, ...rest] -> match a {
+      Arm(pat, opt_g, body) -> {
+        # The arm's binders shadow globals in its guard and body only.
+        let s0 = lc_extend_locals(st, pat_bindings(pat, []))
+        let s1 = match opt_g { Some(g) -> collect_expr(g, s0) None -> s0 }
+        collect_arms(rest, lc_set_scope(collect_expr(body, s1), st.scope))
+      }
+    }
+  }
+}
+
+#[doc("AST collector walking field inits.")]
+pub fn collect_field_inits(fs: [FieldInit], st: LamCollect) : LamCollect / Console {
+
+  match fs {
+    [] -> st
+    [f, ...rest] -> match f {
+      FI(_, val) -> collect_field_inits(rest, collect_expr(val, st))
+    }
+  }
+}
+
+#[doc("AST collector walking list elems.")]
+pub fn collect_list_elems(es: [ListElem], st: LamCollect) : LamCollect / Console {
+
+  match es {
+    [] -> st
+    [el, ...rest] -> match el {
+      ElPlain(x) -> collect_list_elems(rest, collect_expr(x, st))
+      ElSpread(x) -> collect_list_elems(rest, collect_expr(x, st))
+    }
+  }
+}
+
+#[doc("AST collector walking stmts.")]
+pub fn collect_stmts(ss: [Stmt], st: LamCollect) : LamCollect / Console {
+
+  match ss {
+    [] -> st
+    [s, ...rest] -> collect_stmts(rest, collect_stmt(s, st))
+  }
+}
+
+#[doc("AST collector walking stmt.")]
+pub fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect / Console {
+
+  match s {
+    SLet(pat, _, rhs) -> {
+      # The RHS walks in the outer scope; the pattern's names bind only
+      # for the statements after it.
+      let s1 = collect_expr(rhs, st)
+      lc_extend_locals(s1, pat_bindings(pat, []))
+    }
+    SAssert(c, opt_m) -> {
+      let s1 = collect_expr(c, st)
+      match opt_m { Some(m) -> collect_expr(m, s1) None -> s1 }
+    }
+    SExprStmt(x) -> collect_expr(x, st)
+    SIndexAssign(b, i, v, _, _) -> {
+      let s1 = collect_expr(b, st)
+      let s2 = collect_expr(i, s1)
+      collect_expr(v, s2)
+    }
+    SAssign(b, v, _, _) -> collect_expr(v, collect_expr(b, st))
+    # A `var` is desugared into a handle upstream of this walker; one
+    # that survives binds like a `let`.
+    SVar(b, _, rhs, _, _) -> {
+      let s1 = collect_expr(rhs, st)
+      lc_extend_locals(s1, [b])
+    }
+    # m7e §25: stripped by desugar_use_decls before lambda lift runs.
+    SUse(_, _, _) -> st
+  }
+}
+
+# The walker swaps the enclosing unit on the way in and restores the
+# parent's on the way out, so siblings stamp their own clauses against
+# the right scope.
+#[doc("Enter the fn / lambda / clause / runner `enc`, declared by module `mo`.")]
+pub fn enter_enc_fn(st: LamCollect, enc: EncFn, mo: Option[String]) : LamCollect =
+  LamCollect { ...st, cur_enc_fn: enc, cur_mo: mo }
+
+#[doc("Restore the enclosing unit in clause-lookup state after a nested walk.")]
+pub fn restore_enc_fn(st: LamCollect, enc: EncFn) : LamCollect =
+  LamCollect { ...st, cur_enc_fn: enc }
+
+# Walk a fn / test / bench / check body under its symbol, restoring the
+# surrounding enclosing fn and lexical scope on the way out. The scope
+# starts from the body's own params: an outer local is not in scope.
+fn collect_body(body: Expr, params: [Binder], enc: EncFn,
+                mo: Option[String], st: LamCollect) : LamCollect / Console {
+  let outer = st.cur_enc_fn
+  let outer_scope = st.scope
+  let st1 = enter_enc_fn(lc_set_scope(st, fv_outer_of(params)), enc, mo)
+  let st2 = collect_expr(body, st1)
+  lc_set_scope(restore_enc_fn(st2, outer), outer_scope)
+}
+
+#[doc("AST collector walking decl.")]
+pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
+  let outer_locals = st.locals
+  let st1 = collect_decl_body(d, LamCollect { ...st, locals: ln_of_decl(d) })
+  LamCollect { ...st1, locals: outer_locals }
+}
+
+fn collect_decl_body(d: Decl, st: LamCollect) : LamCollect / Console {
+
+  match d {
+    DFn(_, fid, _, ps, _, _, body, _, _, mo) ->
+      collect_body(body, params_binders(ps), fn_enc(st.tab, st.specs, fid, mo), mo, st)
+    DType(_, _, _, _, _, _, _, _) -> st
+    # The runner the backends will emit is also the enclosing unit of
+    # everything lifted out of the block's body, so the collector mints
+    # it from the same `runner_enc_fn` both backends call.
+    DTest(_, body, line, col, mo) ->
+      collect_body(body, [], runner_enc_fn(RkTest, mo, line, col), mo, st)
+    DBench(_, body, line, col, mo) ->
+      collect_body(body, [], runner_enc_fn(RkBench, mo, line, col), mo, st)
+    DCheck(_, ps, body, line, col, mo) ->
+      collect_body(body, params_binders(ps), runner_enc_fn(RkCheck, mo, line, col), mo, st)
+    DImport(_, _, _) -> st
+    DEffect(_, _, _, _, _, _, _, _) -> st
+    DProtocol(_, _, _, _, _, _, _) -> st
+    DImpl(_, _, _, _, _, _, _, _) -> st
+    DDerive(_, _, _, _) -> st
+    DUnstable(_, _, _) -> st
+    DProtoLaws(_, _, _, _, _) -> st
+    DImplAxiom(_, _, _, _, _) -> st
+    DConstructor(_, _, _) -> st
+    DUnit(_, _, _, _, _, _, _) -> st
+    DUse(_, _, _) -> st
+    DUseKind(_, _, _, _) -> st
+    DDoc(_, _, _, _, _) -> st
+    DAttr(_, inner, _, _) -> collect_decl_body(inner, st)
+    DModuleDoc(_, _, _, _) -> st
+    DExternType(_, _, _, _, _, _) -> st
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> st
+    DConst(_, _, _, body, _, _, _) -> collect_expr(body, st)
+    DTheory(_, _, _, _, _) -> st
+    DKind(_, _, _, _, _, _, _, _) -> st
+  }
+}
+
+#[doc("AST collector walking decls.")]
+pub fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect / Console {
+
+  match ds {
+    [] -> st
+    [d, ...rest] -> collect_decls(rest, collect_decl(d, st))
+  }
+}
+
+#[doc("Keep only the operand arguments of a call, dropping any threaded evidence args.")]
+pub fn op_args_only(params: [Param]) : [Param] {
+  match params {
+    [] -> []
+    [_] -> []                       # the lone trailing `resume`
+    [p, ...rest] -> [p, ...op_args_only(rest)]
+  }
+}
+
+#[doc("The success-side variant constructor a postfix-! expression unwraps.")]
+pub fn bang_success_ctor(opt_ty: Option[Ty]) : Option[SymId] = match opt_ty {
+  Some(TyCon(tcs, _)) ->
+    if core_ty_is(tcs, CtOption) { Some(sym_derive(NCCtor, "Some", core_type_home())) }
+    else if core_ty_is(tcs, CtResult) { Some(sym_derive(NCCtor, "Ok", core_type_home())) }
+    else { None }
+  _ -> None
+}
+
+# m7a #6b/#6c: lower `handle { body } with Eff [as alias] { clauses }`
+# to its prologue/body/epilogue. m7a #6b shipped the EvE alloca,
+# the handler-id stamp, the kai_evidence_push/pop pair, and the
+# optional return clause; m7a #6c populates each op fn-ptr with the
+# top-level clause function emitted by emit_clause_body, so that op
+# calls inside the body dispatch through the EvE.
+# m7b #11: when `init_opt` is `Some(ie)`, write the init value into
+# `_ev.state` after the handler-id and op-fn-ptr assignments. The
+# clause body emitter exposes that slot inside clauses as `state` /
+# `log` aliases of `self->state`.
+
+#[doc("The block `let`s the emitter releases inline: a single `PBind` never read in the rest of the block whose rhs `pcs_let_paid_inline` accepts. A drop perceus planted counts as a read, so a binder perceus pays is never paid here too.")]
+pub fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [LocalId] {
+  let final_reads = match opt_final {
+    None -> []
+    Some(e) -> bul_add_reads([], scan_uses_expr(e, false))
+  }
+  bul_from_end(list_reverse(stmts), final_reads, [])
+}
+
+# Walks the block from its end, carrying every read after the statement
+# at hand, so each statement is scanned once.
+fn bul_from_end(rev: [Stmt], later: [LocalId], acc: [LocalId]) : [LocalId] =
+  match rev {
+    [] -> acc
+    [s, ...earlier] -> {
+      let acc1 = match s {
+        SLet(pat, _, rhs) -> match pat.pkind {
+          PBind(b) -> if pcs_let_paid_inline(rhs) and not local_among(later, b.id) { [b.id, ...acc] } else { acc }
+          _ -> acc
+        }
+        _ -> acc
+      }
+      bul_from_end(earlier, bul_add_reads(later, scan_uses_in_stmts([s], false)), acc1)
+    }
+  }
+
+fn bul_add_reads(reads: [LocalId], uses: [Use]) : [LocalId] =
+  match uses {
+    [] -> reads
+    [U(l, _, _, _), ...rest] -> bul_add_reads([l, ...reads], rest)
+  }
