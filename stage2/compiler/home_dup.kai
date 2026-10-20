@@ -21,49 +21,51 @@ import compiler.util
 import compiler.ast
 import compiler.diag
 import compiler.diag_file
+import compiler.ast_map
+import compiler.written
 
 # One declaration's identity: home module, spelling, position.
-pub type HomedDecl = HD(Option[String], String, Int, Int)
+pub(pkg) type HomedDecl = HD(Option[String], String, Int, Int)
 
 #[doc("The home module of a homed declaration; `None` for the root file.")]
-pub fn hd_home(h: HomedDecl) : Option[String] = match h { HD(m, _, _, _) -> m }
+pub(pkg) fn hd_home(h: HomedDecl) : Option[String] = match h { HD(m, _, _, _) -> m }
 
 #[doc("The spelling of a homed declaration.")]
-pub fn hd_name(h: HomedDecl) : String = match h { HD(_, n, _, _) -> n }
+pub(pkg) fn hd_name(h: HomedDecl) : String = match h { HD(_, n, _, _) -> n }
 
 #[doc("The source line of a homed declaration.")]
-pub fn hd_line(h: HomedDecl) : Int = match h { HD(_, _, l, _) -> l }
+fn hd_line(h: HomedDecl) : Int = match h { HD(_, _, l, _) -> l }
 
 #[doc("The source column of a homed declaration.")]
-pub fn hd_col(h: HomedDecl) : Int = match h { HD(_, _, _, c) -> c }
+fn hd_col(h: HomedDecl) : Int = match h { HD(_, _, _, c) -> c }
 
 #[doc("True when two homes are the same module. Unlike a lookup match, a homeless entry answers only another homeless one — a duplicate key must be exact.")]
-pub fn home_eq(a: Option[String], b: Option[String]) : Bool = match a {
+pub(pkg) fn home_eq(a: Option[String], b: Option[String]) : Bool = match a {
   None -> match b { None -> true  Some(_) -> false }
   Some(x) -> match b { None -> false  Some(y) -> x == y }
 }
 
 #[doc("The entry in `tbl` under `name` declared by any module, same or not.")]
-pub fn homed_find_any(tbl: [HomedDecl], name: String) : Option[HomedDecl] =
+fn homed_find_any(tbl: [HomedDecl], name: String) : Option[HomedDecl] =
   match tbl {
     [] -> None
     [h, ...rest] -> if hd_name(h) == name { Some(h) } else { homed_find_any(rest, name) }
   }
 
 #[doc("A home rendered for a diagnostic: the module name, or the root file when the decl has none.")]
-pub fn home_display(m: Option[String]) : String = match m {
+pub(pkg) fn home_display(m: Option[String]) : String = match m {
   Some(x) -> x
   None    -> "the root file"
 }
 
 #[doc("The file a decl with this home was written in; the root file when the module table has no entry.")]
-pub fn home_diag_file(df: DiagFiles, m: Option[String]) : String = match m {
+fn home_diag_file(df: DiagFiles, m: Option[String]) : String = match m {
   None    -> df_root(df)
   Some(x) -> df_file_of(df, x)
 }
 
 #[doc("The error for a cross-module duplicate: anchored at the second declaration, citing the first, naming both homes.")]
-pub fn conflict_diag(df: DiagFiles, msg: String, help: String,
+pub(pkg) fn conflict_diag(df: DiagFiles, msg: String, help: String,
                      second: HomedDecl, first: HomedDecl) : Diagnostic {
   let file = home_diag_file(df, hd_home(second))
   let at = (text) => DR(file, hd_line(second), hd_col(second), text)
@@ -82,7 +84,7 @@ pub fn conflict_diag(df: DiagFiles, msg: String, help: String,
 # ====================================================================
 
 #[doc("Reject two `extern \"C\" type` declarations sharing a name. The name denotes a C layout the boundary classifier unpacks against, so a second declaration under the same spelling has no reading that keeps both correct.")]
-pub fn validate_extern_type_homes(decls: [Decl], df: DiagFiles) : [Diagnostic] =
+pub(pkg) fn validate_extern_type_homes(decls: [Decl], df: DiagFiles) : [Diagnostic] =
   finalize_diags(extern_home_loop(decls, df, [], []))
 
 fn extern_home_loop(decls: [Decl], df: DiagFiles, seen: [HomedDecl],
@@ -114,7 +116,7 @@ fn decl_extern_type(d: Decl) : Option[HomedDecl] = match d {
 # ====================================================================
 
 #[doc("Reject two `kind` declarations sharing a name, and two kinds registering the same habitant introducer. A kind names the unification algebra of the types it classifies and an introducer is habitant-declaration syntax; neither has a use site a qualifier reaches.")]
-pub fn validate_kind_homes(decls: [Decl], df: DiagFiles) : [Diagnostic] =
+pub(pkg) fn validate_kind_homes(decls: [Decl], df: DiagFiles) : [Diagnostic] =
   finalize_diags(kind_home_loop(decls, df, [], [], []))
 
 fn kind_home_loop(decls: [Decl], df: DiagFiles, kinds: [HomedDecl],
@@ -175,3 +177,170 @@ fn kind_intro_decl(hab: KindHab, l: Int, c: Int,
   let word = kind_hab_intro(hab)
   if string_length(word) == 0 { None } else { Some(HD(mo, word, l, c)) }
 }
+
+# the single source of truth for the decl-to-TU partition. `home_tu` answers
+# which physical translation unit a decl emits its code into, shared by every
+# backend modular codegen (the C `emit_program_modular` and the native KIR
+# partitioner). The result is the PHYSICAL emission unit, aligned to the
+# mangled symbol: a root-file `pub fn f` mangles to `kai_<file>__f` and lives
+# in `<file>.c`, so its home is `Some(<file>)` even though it was authored in
+# the root. It is NOT the logical module identity of a decl. A consumer asking
+# whether two decls share a logical module (protocol-op shadowing) must
+# canonicalise `Some(target_mod)` against `None` on its own; reusing `home_tu`
+# there would reintroduce the per-module shadow bug. Only DFn and DType carry
+# a home here. By the time codegen runs, every decl kind that emits a symbol
+# has already been LOWERED to a DFn (DImpl methods, DAxiom FFI shims, DConst
+# readers, DEffect default clauses), so the surviving DConst / DEffect /
+# wrapper nodes emit no per-TU body. Mapping them to their module would spawn
+# an empty TU and shift the partition, so they ride root like every other
+# bodyless decl.
+
+#[doc("The translation unit a decl emits into: `None` for the root TU, `Some(m)` for module `m`. The single source of the codegen partition, shared across backends.")]
+pub fn home_tu(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  DType(_, _, _, _, _, _, mo, _)     -> mo
+  _                                  -> None
+}
+
+#[doc("One candidate for a contested bare name: the function that declares it, and the function type it declares.")]
+pub(pkg) type HomCand = HCand(SymId, Ty)
+
+#[doc("A bare call the body's settled types are asked about. `DHom`: its candidates the argument's type had not told apart yet — the name as written, the call's expected function type, and the call site. `DOp`: an operation left between the dispatchers of the protocols declaring it — the dispatchers, the type the call was given, and the call site.")]
+pub(pkg) type DeferredHom = DHom(Written, Ty, Int, Int) | DOp([SymId], Ty, Int, Int)
+
+#[doc("The function a drained call resolved to, keyed by the callee's source position.")]
+pub(pkg) type HomPick = HPick(Int, Int, SymId)
+
+#[doc("The head of a type as two candidates' first parameters are told apart by it: a type the language builds in, by its fixed tag, or a declared type, by its declaration.")]
+pub(pkg) type HomHead = HhBuiltin(String) | HhDecl(SymId)
+
+#[doc("True when two heads are the same type constructor.")]
+fn hom_head_same(a: HomHead, b: HomHead) : Bool = match a {
+  HhBuiltin(x) -> match b { HhBuiltin(y) -> x == y  HhDecl(_) -> false }
+  HhDecl(s)    -> match b { HhDecl(t) -> sym_raw(s) == sym_raw(t)  HhBuiltin(_) -> false }
+}
+
+#[doc("The head constructor of `t`, or `None` while `t` is still a variable — the one case an argument cannot decide by.")]
+pub(pkg) fn hom_head(t: Ty) : Option[HomHead] = match t {
+  TyInt          -> Some(HhBuiltin("Int"))
+  TyReal         -> Some(HhBuiltin("Real"))
+  TyBool         -> Some(HhBuiltin("Bool"))
+  TyString       -> Some(HhBuiltin("String"))
+  TyChar         -> Some(HhBuiltin("Char"))
+  TyUnit         -> Some(HhBuiltin("Unit"))
+  TyByte         -> Some(HhBuiltin("Byte"))
+  TyInt32        -> Some(HhBuiltin("Int32"))
+  TyUInt32       -> Some(HhBuiltin("UInt32"))
+  TyUInt64       -> Some(HhBuiltin("UInt64"))
+  TyInt128       -> Some(HhBuiltin("Int128"))
+  TyListT(_)     -> Some(HhBuiltin("[]"))
+  TyFnT(_, _, _) -> Some(HhBuiltin("fn"))
+  TyCon(s, _)    -> Some(HhDecl(s))
+  TyRefineT(b, _) -> hom_head(b)
+  _              -> None
+}
+
+#[doc("The declared first parameter of a candidate's function type, or `None` when it takes no arguments.")]
+pub(pkg) fn hom_first_param(t: Ty) : Option[Ty] = match t {
+  TyFnT(ps, _, _) -> match ps {
+    []          -> None
+    [p, ..._]   -> Some(p)
+  }
+  _ -> None
+}
+
+#[doc("The distinct heads the candidates' first parameters carry, or `[]` when any candidate is effectful, argument-less, or headed by a variable — none of which an argument's type can decide between.")]
+fn hom_heads(cs: [HomCand]) : [HomHead] = hom_heads_loop(cs, [])
+
+#[doc("True when the argument's type decides the set: two or more distinct first-parameter heads, every candidate pure. Such a call is resolved by the type, never by which module registered last.")]
+pub(pkg) fn hom_decidable(cs: [HomCand]) : Bool = list_length(hom_heads(cs)) >= 2
+
+#[doc("The one candidate whose first parameter has `arg`'s head, or `None` when `arg` is still a variable or no single candidate matches.")]
+pub(pkg) fn hom_choose(cs: [HomCand], arg: Ty) : Option[SymId] = match hom_head(arg) {
+  None    -> None
+  Some(h) -> hom_unique(cs, h, None)
+}
+
+#[doc("Retarget the calls the drain resolved: a callee at a recorded position becomes a reference to the function picked, so codegen and the contested-name report both see one declaration.")]
+pub(pkg) fn hom_retarget(e: Expr, picks: [HomPick]) : Expr = match picks {
+  []  -> e
+  _   -> hom_retarget_walk(e, picks)
+}
+
+# ---- first-parameter heads ----
+
+# `[]` is the "cannot decide" answer, so a candidate that rules the set
+# out short-circuits rather than contributing nothing.
+fn hom_heads_loop(cs: [HomCand], acc: [HomHead]) : [HomHead] = match cs {
+  [] -> list_reverse(acc)
+  [HCand(_, t), ...rest] ->
+    if hom_pure(t) { hom_heads_add(hom_cand_head(t), rest, acc) } else { [] }
+}
+
+fn hom_heads_add(h: Option[HomHead], rest: [HomCand], acc: [HomHead]) : [HomHead] =
+  match h {
+    None    -> []
+    Some(x) -> if any(acc, (y) => hom_head_same(x, y)) { hom_heads_loop(rest, acc) }
+               else { hom_heads_loop(rest, [x, ...acc]) }
+  }
+
+fn hom_cand_head(t: Ty) : Option[HomHead] = match hom_first_param(t) {
+  None    -> None
+  Some(p) -> hom_head(p)
+}
+
+# A candidate that performs an effect cannot be deferred: its label has to
+# reach the caller's row while the body is still being walked, and the
+# drain runs after the row is checked.
+fn hom_pure(t: Ty) : Bool = match t {
+  TyFnT(_, _, r) -> match r.labels {
+    [] -> true
+    _  -> false
+  }
+  _ -> false
+}
+
+fn hom_unique(cs: [HomCand], head: HomHead, found: Option[SymId]) : Option[SymId] =
+  match cs {
+    [] -> found
+    [HCand(m, t), ...rest] -> match hom_cand_head(t) {
+      Some(h) -> if hom_head_same(h, head) { hom_unique_first(rest, head, found, m) }
+                 else { hom_unique(rest, head, found) }
+      None    -> hom_unique(rest, head, found)
+    }
+  }
+
+# A second candidate with the same head is a tie no rule breaks.
+fn hom_unique_first(rest: [HomCand], head: HomHead, found: Option[SymId],
+      m: SymId) : Option[SymId] = match found {
+  None    -> hom_unique(rest, head, Some(m))
+  Some(_) -> None
+}
+
+# ---- retarget ----
+
+fn hom_retarget_walk(e: Expr, picks: [HomPick]) : Expr {
+  let mapped = hom_with_kind(e, prc_map_expr_kind(e.kind, (s) => hom_retarget_walk(s, picks)))
+  match mapped.kind {
+    ECall(c, call_args) -> hom_retarget_call(mapped, c, call_args, picks)
+    _ -> mapped
+  }
+}
+
+fn hom_retarget_call(e: Expr, c: Expr, call_args: [Expr], picks: [HomPick]) : Expr =
+  match c.kind {
+    EName(_) -> match hom_pick_at(picks, c.line, c.col) {
+      None    -> e
+      Some(s) -> hom_with_kind(e, ECall(hom_with_kind(c, ESym(s, spec_none())), call_args))
+    }
+    _ -> e
+  }
+
+fn hom_pick_at(picks: [HomPick], line: Int, col: Int) : Option[SymId] = match picks {
+  [] -> None
+  [HPick(l, c, m), ...rest] ->
+    if l == line and c == col { Some(m) } else { hom_pick_at(rest, line, col) }
+}
+
+fn hom_with_kind(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
