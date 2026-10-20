@@ -1,0 +1,423 @@
+#[doc("Predicate algebra for refinements: substitution of the refined value, canonical form, structural equality, constant evaluation and interval entailment.")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_ids
+import compiler.ast_map
+import compiler.real_lit
+import compiler.operators
+import compiler.marks
+import compiler.intervals
+import compiler.written
+import compiler.refine_types
+
+# What a predicate ranges over: a name as the parser wrote it, before
+# the resolver, or a local binder.
+pub(pkg) type PredVar = PvName(Written) | PvLocal(LocalId)
+
+pub(pkg) fn pv_self() : PredVar = PvLocal(pred_self())
+
+# `self` as the parser wrote it.
+pub(pkg) fn pv_written_self() : PredVar = PvName(pred_self_binder().name)
+
+# Text decides only before the resolver, where no id exists.
+pub(pkg) fn name_is(w: Written, s: String) : Bool = written_text(w) == s
+
+pub(pkg) fn pv_is(v: PredVar, e: Expr) : Bool = match e.kind {
+  EName(w) -> match v {
+    PvName(n)  -> written_text(w) == written_text(n)
+    PvLocal(_) -> false
+  }
+  ELocal(l) -> match v {
+    PvLocal(k) -> local_eq(l, k)
+    PvName(_)  -> false
+  }
+  _ -> false
+}
+
+# `self` is never rebound by `let` / lambda / match inside a
+# predicate, so no shadowing chase is needed.
+#[doc("Substitute every read of a resolved predicate's `self` with a read of the local binder `l`, each at the position of the read it replaces.")]
+pub(pkg) fn subst_self(e: Expr, l: LocalId) : Expr = subst_self_kind(e, pv_self(), ELocal(l))
+
+#[doc("Substitute every read of a resolved predicate's `self` with the given expression.")]
+pub(pkg) fn subst_self_with(e: Expr, to: Expr) : Expr = subst_var(e, pv_self(), to)
+
+#[doc("`subst_self_with` before the resolver, where a predicate written in place still spells `self` and one copied from an alias already reads its binder.")]
+pub(pkg) fn subst_self_unresolved(e: Expr, to: Expr) : Expr =
+  subst_var(subst_var(e, pv_self(), to), pv_written_self(), to)
+
+# Before the resolver: the parameter a refinement sits on, read by name,
+# for the `self` of its predicate.
+pub(pkg) fn subst_written_self(e: Expr, pname: Written) : Expr = subst_self_kind(e, pv_written_self(), EName(pname))
+
+# A node of kind `to` at the position of each read of `v` it replaces.
+fn subst_self_kind(e: Expr, v: PredVar, to: ExprKind) : Expr =
+  if pv_is(v, e) { mk_expr(to, e.line, e.col) }
+  else { Expr { ...e, kind: prc_map_expr_kind(e.kind, (x) => subst_self_kind(x, v, to)) } }
+
+# Issue #83 sub-case 2: predicate canonicaliser. Normalises a
+# comparison Expr so structurally-different but semantically-equal
+# forms compare equal: `0 < x` → `x > 0`, `<=` ↔ flipped `>=`,
+# `==` / `!=` argument order normalised lexicographically. Any
+# non-comparison Expr is recursed into so a top-level `and` / `or`
+# of comparisons is canonicalised arm-wise.
+pub(pkg) fn pred_canon(e: Expr) : Expr = canon(e, false)
+
+# `written` holds before the resolver, where two names are ordered by
+# their text.
+pub(pkg) fn canon(e: Expr, written: Bool) : Expr = match e.kind {
+  EBinop(op, a, b) -> {
+    let ca = canon(a, written)
+    let cb = canon(b, written)
+    if binop_eq(op, BoLt) { mk_expr(EBinop(BoGt, cb, ca), e.line, e.col) }
+    else if binop_eq(op, BoLe) { mk_expr(EBinop(BoGe, cb, ca), e.line, e.col) }
+    else if binop_is_equality(op) and not cmp_lt(ca, cb, written) { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
+    else { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
+  }
+  EUnop(op, x) -> mk_expr(EUnop(op, canon(x, written)), e.line, e.col)
+  _ -> e
+}
+
+# The order `canon` puts the operands of a symmetric operator in: a
+# written name, then a local binder, then a declaration, then a literal.
+# Binders and declarations sort by id and literals by value; written
+# names sort by text before the resolver and are in no order after it,
+# where a name still written has no identity to order by.
+fn cmp_lt(a: Expr, b: Expr, written: Bool) : Bool = match a.kind {
+  EName(an) -> match b.kind {
+    EName(bn) -> written and string_lt(written_text(an), written_text(bn))
+    _ -> true
+  }
+  ELocal(al) -> match b.kind {
+    EName(_)   -> false
+    ELocal(bl) -> local_raw(al) < local_raw(bl)
+    _ -> true
+  }
+  ESym(sa, _) -> match b.kind {
+    EName(_)    -> false
+    ELocal(_)   -> false
+    ESym(sb, _) -> sym_raw(sa) < sym_raw(sb)
+    _ -> true
+  }
+  EInt(av, _) -> match b.kind {
+    EName(_) -> false
+    ELocal(_) -> false
+    ESym(_, _) -> false
+    EInt(bv, _) -> av < bv
+    _ -> true
+  }
+  _ -> false
+}
+
+# Issue #83 sub-case 3 partial: when both predicates compare the
+# same variable to a literal, use the interval lattice to decide
+# entailment. Captures `x > 0` ⊢ `x > -1`, `x >= 1` ⊢ `x > 0`,
+# `x != 0` ⊢ `x != 0` (already covered by struct_eq), etc. Both
+# inputs are in canonical form (variable on the LHS for ordered
+# comparisons).
+pub(pkg) fn pred_entailed_by_refinement(req: Expr, pname: PredVar, ref_pred: Expr) : Bool {
+  match interval_of_pred(ref_pred, pname) {
+    None -> false
+    Some(iv) -> match check_pred_with_interval(req, pname, iv) {
+      Some(true) -> true
+      _ -> false
+    }
+  }
+}
+
+# Read a refinement predicate as an interval over `pname`. Only
+# the closed shapes we care about — `pname OP literal` — produce
+# a non-trivial interval; anything else collapses to `None` so the
+# caller falls back to structural matching.
+fn interval_of_pred(e: Expr, pname: PredVar) : Option[Interval] = match e.kind {
+  EBinop(op, a, b) ->
+    if pv_is(pname, a) {
+      match try_eval_int(b) {
+        None -> None
+        Some(k) -> interval_from_cmp(op, k)
+      }
+    } else { None }
+  _ -> None
+}
+
+# Turn `x OP k` into the tightest Int interval that satisfies it.
+# `!=` is not expressible as a single closed interval; we return
+# `None` so the caller defers to structural / call-site checks.
+fn interval_from_cmp(op: BinOp, k: Int) : Option[Interval] = match op {
+  BoGt -> Some(Ival(k + 1, ival_int_max_const()))
+  BoGe -> Some(Ival(k, ival_int_max_const()))
+  BoLt -> Some(Ival(ival_int_min_const(), k - 1))
+  BoLe -> Some(Ival(ival_int_min_const(), k))
+  BoEq -> Some(Ival(k, k))
+  _    -> None
+}
+
+# Saturating sentinels for the interval lattice. The lattice does
+# not track unbounded ranges precisely; these constants stand in for
+# `+∞` / `-∞` and are large enough that any realistic Int comparison
+# folds before reaching them.
+fn ival_int_max_const() : Int = 9223372036854775807
+
+fn ival_int_min_const() : Int = 0 - 9223372036854775807 - 1
+
+# Discharge a `requires` predicate against a known interval for the
+# refined param. Returns `Some(true)` when the request is provable,
+# `Some(false)` if the interval witnesses a contradiction (caller
+# treats it as "not entailed" — a `false` requires would have been
+# rejected at parse time), and `None` when the predicate's shape
+# escapes our analysis.
+fn check_pred_with_interval(req: Expr, pname: PredVar, iv: Interval) : Option[Bool] = match req.kind {
+  EBinop(op, a, b) ->
+    if pv_is(pname, a) {
+      match try_eval_int(b) {
+        None -> None
+        Some(k) -> {
+          let kiv = Ival(k, k)
+          match op {
+            BoGt -> ival_gt(iv, kiv)
+            BoGe -> ival_ge(iv, kiv)
+            BoLt -> ival_lt(iv, kiv)
+            BoLe -> ival_le(iv, kiv)
+            BoEq -> ival_eq(iv, kiv)
+            BoNe -> ival_ne(iv, kiv)
+            _    -> None
+          }
+        }
+      }
+    } else { None }
+  _ -> None
+}
+
+# Structural equality on Expr, ignoring line/col. Conservative: only
+# the shapes the predicate-pure subset can produce are compared in
+# detail; everything else falls back to false (so a future feature
+# that produces a new ExprKind in predicate position is treated as
+# "definitely not equal" rather than wrongly entailed).
+#[doc("Structural equality of two predicate expressions, ignoring positions. A name still written equals nothing: after the resolver a predicate's names are identities.")]
+pub(pkg) fn expr_struct_eq(a: Expr, b: Expr) : Bool = expr_eq(a, b, false)
+
+# The equality the parser's contract discharge reads, before the
+# resolver, where a name is its spelling.
+pub(pkg) fn expr_written_eq(a: Expr, b: Expr) : Bool = expr_eq(a, b, true)
+
+fn expr_eq(a: Expr, b: Expr, by_text: Bool) : Bool {
+  match a.kind {
+    EBinop(aop, al, ar) -> match b.kind {
+      EBinop(bop, bl, br) -> binop_eq(aop, bop) and expr_eq(al, bl, by_text) and expr_eq(ar, br, by_text)
+      _ -> false
+    }
+    EUnop(aop, ai) -> match b.kind {
+      EUnop(bop, bi) -> unop_eq(aop, bop) and expr_eq(ai, bi, by_text)
+      _ -> false
+    }
+    EField(ab, an) -> match b.kind {
+      EField(bb, bn) -> an == bn and expr_eq(ab, bb, by_text)
+      _ -> false
+    }
+    ECall(af, aa) -> match b.kind {
+      ECall(bf, ba) -> expr_eq(af, bf, by_text) and expr_list_eq(aa, ba, by_text)
+      _ -> false
+    }
+    _ -> expr_lit_eq(a, b, by_text)
+  }
+}
+
+fn expr_lit_eq(a: Expr, b: Expr, by_text: Bool) : Bool {
+  match a.kind {
+    EInt(av, _) -> match b.kind { EInt(bv, _) -> av == bv _ -> false }
+    EReal(RealLit(av), _) -> match b.kind { EReal(RealLit(bv), _) -> av == bv _ -> false }
+    EFixed(sa, _) -> match b.kind { EFixed(sb, _) -> sa == sb _ -> false }
+    EBool(av) -> match b.kind { EBool(bv) -> av == bv _ -> false }
+    EChar(av) -> match b.kind { EChar(bv) -> av == bv _ -> false }
+    EStr(av, _) -> match b.kind { EStr(bv, _) -> av == bv _ -> false }
+    EUnit -> match b.kind { EUnit -> true _ -> false }
+    _ -> expr_ref_eq(a, b, by_text)
+  }
+}
+
+fn expr_ref_eq(a: Expr, b: Expr, by_text: Bool) : Bool {
+  match a.kind {
+    EName(an) -> match b.kind { EName(bn) -> by_text and written_text(an) == written_text(bn) _ -> false }
+    ESym(sa, ia) -> match b.kind { ESym(sb, ib) -> sym_raw(sa) >= 0 and sym_raw(sa) == sym_raw(sb) and ia == ib _ -> false }
+    ELocal(la) -> match b.kind { ELocal(lb) -> local_eq(la, lb) _ -> false }
+    EMark(am) -> match b.kind { EMark(bm) -> mark_eq(am, bm) _ -> false }
+    _ -> false
+  }
+}
+
+fn expr_list_eq(a: [Expr], b: [Expr], by_text: Bool) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> expr_eq(ah, bh, by_text) and expr_list_eq(arest, brest, by_text)
+    }
+  }
+}
+
+# m12.6.d: best-effort static evaluator for refinement / contract
+# predicates. Returns Some(b) when the expression is a closed boolean
+# expression reducible to a literal, None otherwise. Deliberately
+# narrow: no symbolic reasoning, no SMT, no propagation through
+# refined arguments — that's the next step (and the cliff the spec
+# forbids in v1).
+#[doc("Best-effort static evaluation of a closed boolean predicate Expr; Some(b) when it reduces to a literal, None otherwise.")]
+pub(pkg) fn try_eval_pred(e: Expr) : Option[Bool] {
+  match e.kind {
+    EBool(b) -> Some(b)
+    EUnop(op, x) -> match op {
+      UoNot -> match try_eval_pred(x) {
+        Some(b) -> Some(not b)
+        None    -> None
+      }
+      UoNeg -> None
+    }
+    EBinop(op, a, b) -> try_eval_binop_pred(op, a, b)
+    _ -> None
+  }
+}
+
+fn try_eval_binop_pred(op: BinOp, a: Expr, b: Expr) : Option[Bool] = match op {
+  BoAnd -> match try_eval_pred(a) {
+    Some(false) -> Some(false)
+    Some(true)  -> try_eval_pred(b)
+    None        -> None
+  }
+  BoOr -> match try_eval_pred(a) {
+    Some(true)  -> Some(true)
+    Some(false) -> try_eval_pred(b)
+    None        -> None
+  }
+  _ -> if binop_is_comparison(op) { try_eval_cmp_pred(op, a, b) } else { None }
+}
+
+fn try_eval_cmp_pred(op: BinOp, a: Expr, b: Expr) : Option[Bool] = match try_eval_int(a) {
+  None    -> try_eval_real_cmp(op, a, b)
+  Some(ai) -> match try_eval_int(b) {
+    None    -> try_eval_real_cmp(op, a, b)
+    Some(bi) -> Some(eval_int_cmp(op, ai, bi))
+  }
+}
+
+# Evaluate an Int-typed closed expression to a literal value.
+#[doc("Fold a closed Int Expr (literals, +/-/*, unary negation) to a literal value; None when it is not closed.")]
+pub(pkg) fn try_eval_int(e: Expr) : Option[Int] {
+  match e.kind {
+    EInt(n, _) -> Some(n)
+    EUnop(op, x) -> match op {
+      UoNeg -> match try_eval_int(x) {
+        Some(v) -> Some(0 - v)
+        None    -> None
+      }
+      UoNot -> None
+    }
+    EBinop(op, a, b) -> match try_eval_int(a) {
+      None    -> None
+      Some(av) -> match try_eval_int(b) {
+        None    -> None
+        Some(bv) -> eval_int_op(op, av, bv)
+      }
+    }
+    _ -> None
+  }
+}
+
+fn eval_int_op(op: BinOp, a: Int, b: Int) : Option[Int] = match op {
+  BoAdd -> Some(a + b)
+  BoSub -> Some(a - b)
+  BoMul -> Some(a * b)
+  BoDiv -> if b == 0 { None } else { Some(a / b) }
+  BoMod -> if b == 0 { None } else { Some(a % b) }
+  _     -> None
+}
+
+fn eval_int_cmp(op: BinOp, a: Int, b: Int) : Bool = match op {
+  BoEq -> a == b
+  BoNe -> a != b
+  BoLt -> a < b
+  BoLe -> a <= b
+  BoGt -> a > b
+  BoGe -> a >= b
+  _    -> false
+}
+
+# Real fallback for the comparison arms of `try_eval_pred`. Fires only
+# when at least one side is a genuine Real literal — an all-Int
+# comparison already folded exactly via `try_eval_int`.
+fn try_eval_real_cmp(op: BinOp, a: Expr, b: Expr) : Option[Bool] {
+  match try_eval_real(a) {
+    None -> None
+    Some(ar) -> match try_eval_real(b) {
+      None -> None
+      Some(br) -> Some(eval_real_cmp(op, ar, br))
+    }
+  }
+}
+
+#[doc("Fold a closed Real Expr (Real/Int literals, +/-/*, unary negation) to its value; None when it is not closed.")]
+fn try_eval_real(e: Expr) : Option[Real] {
+  match e.kind {
+    EReal(RealLit(r), _) -> Some(r)
+    EInt(n, _) -> Some(int_to_real(n))
+    EUnop(op, x) -> match op {
+      UoNeg -> match try_eval_real(x) {
+        Some(v) -> Some(0.0 - v)
+        None    -> None
+      }
+      UoNot -> None
+    }
+    EBinop(op, a, b) -> match try_eval_real(a) {
+      None    -> None
+      Some(av) -> match try_eval_real(b) {
+        None    -> None
+        Some(bv) -> eval_real_op(op, av, bv)
+      }
+    }
+    _ -> None
+  }
+}
+
+fn eval_real_op(op: BinOp, a: Real, b: Real) : Option[Real] = match op {
+  BoAdd -> Some(a + b)
+  BoSub -> Some(a - b)
+  BoMul -> Some(a * b)
+  _     -> None
+}
+
+fn eval_real_cmp(op: BinOp, a: Real, b: Real) : Bool = match op {
+  BoEq -> a == b
+  BoNe -> a != b
+  BoLt -> a < b
+  BoLe -> a <= b
+  BoGt -> a > b
+  BoGe -> a >= b
+  _    -> false
+}
+
+fn mk_int(n: Int, line: Int, col: Int) : Expr = mk_expr(mk_int_synth(n), line, col)
+
+# Fold a closed numeric value to a literal node for substitution into
+# a predicate: exact Int when possible, Real when a Real literal
+# participates.
+pub(pkg) fn try_eval_num_lit(e: Expr) : Option[Expr] {
+  match try_eval_int(e) {
+    Some(k) -> Some(mk_int(k, e.line, e.col))
+    None -> match e.kind {
+      EReal(_, _) -> Some(e)
+      _ -> match try_eval_real(e) {
+        # A folded value has no source text: this span only labels a diagnostic.
+        Some(r) -> Some(mk_expr(EReal(RealLit(r), real_to_string(r)), e.line, e.col))
+        None -> None
+      }
+    }
+  }
+}
+
+# Substitute every free read of `from` in a predicate Expr with the given
+# expression. Used to push a literal / binding into a callee's predicate
+# before discharging it.
+pub(pkg) fn subst_var(e: Expr, from: PredVar, to: Expr) : Expr =
+  if pv_is(from, e) { to }
+  else { Expr { ...e, kind: prc_map_expr_kind(e.kind, (x) => subst_var(x, from, to)) } }
