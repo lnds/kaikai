@@ -12,17 +12,19 @@ import compiler.diag_file
 import compiler.symtab
 import compiler.scope_view
 import compiler.desugar_record_lit
-import compiler.desugar
+import compiler.util
+import compiler.diag
+import compiler.written
 
 #[doc("Result of the positional-record desugar over a decl stream: the rewritten decls plus an error count.")]
-pub type DPRDecls = { decls: [Decl], errs: Int }
+pub(pkg) type DPRDecls = { decls: [Decl], errs: Int }
 
 #[doc("Positional-record sugar: rewrite `Foo(a, b)` calls to `Foo { f1: a, f2: b }` record literals using the record table; the entry point the driver invokes. A literal's written head is settled against `tab` under the view of its file; `root` is the target module.")]
-pub fn desugar_pos_records_decls(ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File =
+pub(pkg) fn desugar_pos_records_decls(ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File =
   desugar_pos_records_with(collect_records(ds), ds, tab, views, root, df)
 
 #[doc("`desugar_pos_records_decls` against a record table built earlier, so declarations can be rewritten one at a time.")]
-pub fn desugar_pos_records_with(recs: [RecInfo], ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File {
+pub(pkg) fn desugar_pos_records_with(recs: [RecInfo], ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File {
   desugar_pos_records_loop(ds, (d) => RecScope { recs: recs, sc: dsg_scope_of(d, tab, views, root) }, df, [], 0)
 }
 
@@ -356,4 +358,58 @@ fn dpr_opt_ret(or_: Option[HReturn], recs: RecScope, file: String, errs: Int) : 
     }
     None -> DPROptRet { ret: None, errs: errs }
   }
+}
+
+#[doc("A record literal with a spread, lowered: the declared fields in order, an override winning over the spread copy.")]
+fn dpr_record_spread(
+  rh: DeclRef,
+  fis: [FieldInit],
+  line: Int,
+  col: Int,
+  recs: RecScope,
+  file: String,
+  errs: Int
+) : DPRSpread / Console + File = match fis {
+  # The head field is the spread carrying the source; the rest are named
+  # overrides, each pairing a real field name with an already-recursed
+  # expression (the parser rejected every other shape).
+  [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs }
+  [FI(_, marked), ...overrides] -> match rec_of_head(recs, rh) {
+    None -> {
+      diag_error(file, line, col,
+        concat_all(["unknown record type `", rec_head_text(recs, rh),
+                    "` in `...` spread; declare the type before constructing it"]))
+      DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs + 1 }
+    }
+    Some(ri) -> dpr_spread_of(rh, ri, fis, field_written(marked), overrides, line, col, recs, file, errs)
+  }
+}
+
+fn dpr_spread_of(rh: DeclRef, ri: RecInfo, fis: [FieldInit], src: Expr, overrides: [FieldInit], line: Int,
+                 col: Int, recs: RecScope, file: String, errs: Int) : DPRSpread / Console + File = match ri {
+  RI(_, tparams, fds, _) -> {
+    # An override listed twice, or naming a field the record does not declare.
+    let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, 0)
+    let bad_errs = check_spread_unknown_overrides(overrides, fds, rec_head_text(recs, rh), file, line, col, 0)
+    let errs1 = errs + dup_errs + bad_errs
+    if dup_errs + bad_errs > 0 { DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs1 } }
+    else { DPRSpread { expr: dpr_spread_block(head_settled(rh, ri), tparams, fds, src, overrides, line, col), errs: errs1 } }
+  }
+}
+
+# `{ let v: T = src; T { f: override or v.f, ... } }`. The annotation
+# makes a source of another record type fail the ordinary let check. A
+# generic record has none: `T[a, b]` cannot be spelled without committing
+# to its arguments, so the typer's field-by-field check stands alone.
+fn dpr_spread_block(head: DeclRef, tparams: [TBinder], fds: [FieldDecl], src: Expr, overrides: [FieldInit],
+                    line: Int, col: Int) : Expr = {
+  let var_name = spread_src_var_name(line, col)
+  let bind_pat = mk_pat(PBind(binder_minted(var_name)), line, col)
+  let ann_opt = match tparams {
+    []            -> Some(mk_ty(TyName(head, []), line, col))
+    [_, ..._rest] -> None
+  }
+  let bind_stmt = SLet(bind_pat, ann_opt, src)
+  let expanded = expand_spread_fields(fds, overrides, mk_name(var_name, line, col), line, col)
+  mk_expr(EBlock([bind_stmt], Some(mk_expr(ERecordLit(head, expanded), line, col))), line, col)
 }

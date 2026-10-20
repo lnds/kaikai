@@ -1,0 +1,245 @@
+#[doc("Escape analysis of a body and the stack-slot specialisation of `var` cells it enables.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.loop_lower
+import compiler.core_builtins
+import compiler.written
+import compiler.desugar_refine_pred
+import compiler.desugar_rename
+
+#[doc("""
+Trigger 3: name appears in body ONLY as the immediate base of a
+`name.get` or `name.set` field on the callee of a call. Any other
+occurrence — closure capture, function-argument position, plain
+value reference — is treated as escape and disables specialisation.
+""")]
+pub(pkg) fn body_escapes(name: String, e: Expr) : Bool {
+  match e.kind {
+    EInt(_, _)  -> false
+    EReal(_, _) -> false
+    EIntLit(_) -> false
+    EDecimalLit(_) -> false
+    EFixed(_, _) -> false
+    EBool(_) -> false
+    EChar(_) -> false
+    EStr(_, _) -> false
+    EUnit -> false
+    EUnder -> false
+    EPlaceholder -> false
+    EHole(_) -> false
+    ETodo(_) -> false
+    EExternBody(_, _) -> false
+    EName(n) -> written_text(n) == name
+    # Same reason as the cell scan: an `ESym` is a declaration, and
+    # the binder whose escapes this measures is a local the source wrote.
+    ESym(_, _) -> false
+    ELocal(_) -> false
+    EOp(_) -> false
+    # A mark is planted after this pass; nothing it stands for can escape.
+    EMark(_) -> false
+    ECall(callee, args_) -> callee_escapes(name, callee) or args_escape(name, args_)
+    EField(base, _) -> body_escapes(name, base)
+    EIndex(a, b) -> either_escapes(name, a, b)
+    EBinop(_, a, b) -> either_escapes(name, a, b)
+    EUnop(_, x) -> body_escapes(name, x)
+    EIf(c, t_, eo) -> either_escapes(name, c, t_) or opt_escapes(name, eo)
+    EBlock(stmts, tail) -> block_escapes(name, stmts, tail)
+    EPipe(a, b) -> either_escapes(name, a, b)
+    EDispatchPipe(_, a, b) -> either_escapes(name, a, b)
+    EMatch(scr, arms) -> body_escapes(name, scr) or arms_escape(name, arms)
+    ELambda(_, _) -> contains_var(name, e)
+    EList(elems) -> elems_escape(name, elems)
+    ERange(a, b, opt_step) -> either_escapes(name, a, b) or opt_escapes(name, opt_step)
+    ERecordLit(_, fields) -> fields_escape(name, fields)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
+    EBang(inner) -> body_escapes(name, inner)
+    ELitUnit(inner, _) -> body_escapes(name, inner)
+    # `variants[T]()` has no value-level sub-expressions —
+    # nothing can mention `name` inside it.
+    EVariantsOf(_, _) -> false
+    # A qualified module call names a module and a function, never the
+    # local `name`.
+    EModCall(_, _) -> false
+    # A loop intrinsic's lambda args are applied in place (the C emitter
+    # pastes their bodies into an inline loop in the enclosing frame), so
+    # a cell name under them is judged by the get/set-only rule, not the
+    # closure-capture rule — the whole point of the loop lowering.
+    EIntrinsic(nm, args_) -> intrinsic_args_escape(name, nm, args_)
+    ESurface(sf) -> args_escape(name, surface_children(sf))
+  }
+}
+
+# The cell's own `name.get` / `name.set` is a use of the cell, not an escape.
+fn callee_escapes(name: String, callee: Expr) : Bool =
+  if is_cell_op_callee(name, callee) { false } else { body_escapes(name, callee) }
+
+fn is_cell_op_callee(name: String, callee: Expr) : Bool = match callee.kind {
+  EField(base, fname) -> match base.kind {
+    EName(n) -> written_text(n) == name and (fname == "get" or fname == "set")
+    _        -> false
+  }
+  _ -> false
+}
+
+fn either_escapes(name: String, a: Expr, b: Expr) : Bool = body_escapes(name, a) or body_escapes(name, b)
+
+fn intrinsic_args_escape(name: String, nm: Intrinsic, args_: [Expr]) : Bool =
+  if is_loop_intrinsic(nm) { loop_args_escape(name, args_) } else { args_escape(name, args_) }
+
+fn loop_args_escape(name: String, es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> {
+      let here = match h.kind {
+        ELambda(ps, b) -> match ps { [] -> body_escapes(name, b) _ -> body_escapes(name, h) }
+        _ -> body_escapes(name, h)
+      }
+      if here { true } else { loop_args_escape(name, rest) }
+    }
+  }
+}
+
+fn args_escape(name: String, es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if body_escapes(name, h) { true } else { args_escape(name, rest) }
+  }
+}
+
+fn opt_escapes(name: String, opt: Option[Expr]) : Bool {
+  match opt {
+    None -> false
+    Some(e) -> body_escapes(name, e)
+  }
+}
+
+# A statement that binds `name` again hides the var from the rest of the block.
+fn block_escapes(name: String, ss: [Stmt], tail: Option[Expr]) : Bool = match ss {
+  [] -> opt_escapes(name, tail)
+  [s, ...rest] -> stmt_escapes(name, s) or (not stmt_rebinds(name, s) and block_escapes(name, rest, tail))
+}
+
+fn stmt_rebinds(name: String, s: Stmt) : Bool = match s {
+  SLet(pat, _, _)       -> list_has(dsg_rename_pat_names(pat, []), name)
+  SVar(b, _, _, _, _)   -> written_text(b.name) == name
+  _                     -> false
+}
+
+fn stmt_escapes(name: String, s: Stmt) : Bool {
+  match s {
+    SLet(_, _, rhs) -> body_escapes(name, rhs)
+    SAssert(c, msg) -> body_escapes(name, c) or opt_escapes(name, msg)
+    SExprStmt(x) -> body_escapes(name, x)
+    SIndexAssign(b, i, v, _, _) ->
+      body_escapes(name, b) or body_escapes(name, i) or body_escapes(name, v)
+    SAssign(b, v, _, _) ->
+      body_escapes(name, b) or body_escapes(name, v)
+    SVar(_, _, rhs, _, _) -> body_escapes(name, rhs)
+    # SUse has no expr — name cannot escape through it.
+    SUse(_, _, _) -> false
+  }
+}
+
+fn arms_escape(name: String, arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> if arm_escapes(name, a) { true } else { arms_escape(name, rest) }
+  }
+}
+
+fn arm_escapes(name: String, a: Arm) : Bool {
+  match a {
+    Arm(pat, opt_g, b) ->
+      not list_has(dsg_rename_pat_names(pat, []), name) and (opt_escapes(name, opt_g) or body_escapes(name, b))
+  }
+}
+
+fn elems_escape(name: String, es: [ListElem]) : Bool {
+  match es {
+    [] -> false
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> if body_escapes(name, x) { true } else { elems_escape(name, rest) }
+      ElSpread(x) -> if body_escapes(name, x) { true } else { elems_escape(name, rest) }
+    }
+  }
+}
+
+fn fields_escape(name: String, fs: [FieldInit]) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FI(_, v) -> if body_escapes(name, v) { true } else { fields_escape(name, rest) }
+    }
+  }
+}
+
+fn clauses_escape(name: String, cs: [HClause]) : Bool {
+  match cs {
+    [] -> false
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) ->
+        if body_escapes(name, b) { true } else { clauses_escape(name, rest) }
+    }
+  }
+}
+
+fn ret_opt_escapes(name: String, opt: Option[HReturn]) : Bool {
+  match opt {
+    None -> false
+    Some(r) -> match r { HR(_, b, _, _) -> body_escapes(name, b) }
+  }
+}
+
+# The two operations of a var: its read and its write.
+type VarSlotOp = VsGet | VsSet
+
+#[doc("`e` with every `name.get()` and `name.set(v)` lowered to a read and a write of the slot `slot_name`.")]
+pub(pkg) fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
+  Expr { kind: specialise_kind(name, slot_name, e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+}
+
+fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col: Int) : ExprKind = match k {
+  # Only a call of `name.get()` or `name.set(v)` is rewritten; every
+  # other kind recurses structurally.
+  ECall(callee, args_) -> match slot_op_of(name, callee) {
+    Some(VsGet) -> slot_read(slot_name, line, col)
+    Some(VsSet) -> slot_write(name, slot_name, args_, line, col)
+    None ->
+      ECall(specialise_body(name, slot_name, callee),
+            map(args_, (a) => specialise_body(name, slot_name, a)))
+  }
+  _ -> dsg_map_expr_kind(k, (sub) => specialise_body(name, slot_name, sub))
+}
+
+fn slot_op_of(name: String, callee: Expr) : Option[VarSlotOp] = match callee.kind {
+  EField(base, fname) -> match base.kind {
+    EName(n) ->
+      if written_text(n) != name { None }
+      else if fname == "get" { Some(VsGet) }
+      else if fname == "set" { Some(VsSet) }
+      else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn slot_read(slot_name: String, line: Int, col: Int) : ExprKind = {
+  let slot_e = mk_name(slot_name, line, col)
+  let zero = mk_expr(mk_int_synth(0), line, col)
+  ECall(builtin_mk(CbArrayGet, line, col), [slot_e, zero])
+}
+
+# `{ let _ = array_set(slot, 0, v); () }`, so the result type stays Unit.
+fn slot_write(name: String, slot_name: String, args_: [Expr], line: Int, col: Int) : ExprKind = {
+  let slot_e = mk_name(slot_name, line, col)
+  let zero = mk_expr(mk_int_synth(0), line, col)
+  let v = match args_ {
+    [a, ..._ignore] -> specialise_body(name, slot_name, a)
+    []              -> mk_expr(EUnit, line, col)
+  }
+  let set_call = mk_expr(ECall(builtin_mk(CbArraySet, line, col), [slot_e, zero, v]), line, col)
+  EBlock([SLet(mk_pat(PWild, line, col), None, set_call)], Some(mk_expr(EUnit, line, col)))
+}
