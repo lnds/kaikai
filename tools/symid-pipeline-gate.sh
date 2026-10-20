@@ -261,7 +261,7 @@ need '^perceus main reverse#[0-9]+ reverse@list$'
 # typed blob serves a program where the pick is uncontested and one where
 # it is contested, in either order. Both programs carry byte-identical
 # copies of `ma` and `mc`.
-CUT="$ROOT/examples/namespace-collisions/pipe_callee_contest_cut"
+CUT="$ROOT/examples/methods/contest_cut"
 CUTCACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE"' EXIT
 cut_ids() {

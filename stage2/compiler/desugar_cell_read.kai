@@ -98,10 +98,9 @@ fn lcr_clauses(cs: [HClause], caps: [String], reject_at: Bool, file: String, err
   }
 }
 
-# `@x`, the operand `x` of a `MkDeref` call. On a `Ref[T]` named `n` it
-# is the read `n.get()`, which the alias rewrite maps to
-# `Mutable.ref_get(n)`. A `var`/`State`/`Reader` cell reads naked and is
-# not a `Ref`, so `@` on one is rejected and the node stays as written.
+# `@x`, the operand `x` of a `MkDeref` call. A `var`/`State`/`Reader` cell
+# reads naked and is not a `Ref`, so `@` on one is rejected; any other
+# operand stays for the typer to read by its type.
 fn lcr_deref(callee: Expr, x: Expr, caps: [String], reject_at: Bool, line: Int, col: Int, file: String, errs: Int) : VLExpr / Console + File = match x.kind {
   EName(w) -> {
     let n = written_text(w)
@@ -114,8 +113,7 @@ fn lcr_deref(callee: Expr, x: Expr, caps: [String], reject_at: Bool, line: Int, 
       ]))
       VLExpr { expr: mk_expr(ECall(callee, [x]), line, col), errs: errs + 1 }
     } else {
-      let getter = mk_expr(EField(mk_name(n, x.line, x.col), "get"), line, col)
-      VLExpr { expr: mk_expr(ECall(getter, []), line, col), errs: errs }
+      VLExpr { expr: mk_expr(ECall(callee, [x]), line, col), errs: errs }
     }
   }
   _ -> {
@@ -226,6 +224,11 @@ fn lcr_call(k: ExprKind, callee: Expr, args_: [Expr], caps: [String], reject_at:
     [x] -> lcr_deref(callee, x, caps, reject_at, line, col, file, errs)
     _   -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
   }
+  # `n := v` on a cell is the cell's `set`; on anything else it stays for the typer.
+  EMark(MkCellSet) -> match args_ {
+    [target, v] -> lcr_cell_set(callee, target, v, caps, reject_at, line, col, file, errs)
+    _           -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
+  }
   # A var's slot: every late read of the var is sent to it by the
   # enclosing block, so it becomes the allocation it stood for.
   EMark(MkVarSlot(_)) -> {
@@ -244,6 +247,24 @@ fn lcr_call(k: ExprKind, callee: Expr, args_: [Expr], caps: [String], reject_at:
       let ra = lcr_exprs(args_, caps, reject_at, file, rc.errs)
       VLExpr { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
     }
+}
+
+fn lcr_cell_set(callee: Expr, target: Expr, v: Expr, caps: [String], reject_at: Bool, line: Int, col: Int,
+                file: String, errs: Int) : VLExpr / Console + File = {
+  let rv = lcr_expr(v, caps, reject_at, file, errs)
+  match target.kind {
+    EName(w) ->
+      if list_has(caps, written_text(w)) {
+        let setter = mk_expr(EField(target, "set"), line, col)
+        VLExpr { expr: mk_expr(ECall(setter, [rv.expr]), line, col), errs: rv.errs }
+      } else {
+        VLExpr { expr: mk_expr(ECall(callee, [target, rv.expr]), line, col), errs: rv.errs }
+      }
+    _ -> {
+      let rt = lcr_expr(target, caps, reject_at, file, rv.errs)
+      VLExpr { expr: mk_expr(ECall(callee, [rt.expr, rv.expr]), line, col), errs: rt.errs }
+    }
+  }
 }
 
 # `n.get` (also what a naked read lowers to) or `n.set` (also what
