@@ -3,7 +3,8 @@
 # FIXTURES manifest, so a .kai dropped there runs in CI with nothing to wire.
 #
 #   fixture-dir.sh <slug>                 run the directory (fixtures in parallel)
-#   fixture-dir.sh --list                 print every directory slug
+#   fixture-dir.sh --list                 print every directory slug that runs on C
+#   fixture-dir.sh --list-native          print every directory slug that runs on native
 #   fixture-dir.sh --count <slug>         print the fixtures a directory runs
 #   fixture-dir.sh --one <slug> <name>    run one fixture
 #
@@ -13,7 +14,7 @@
 # runs, and its stdout is diffed against `.out.expected` when that exists.
 # Manifest keys (both required):
 #
-#   backends: c               the backends the directory runs on
+#   backends: c native        the backends the directory runs on (c, native, or both)
 #   diagnostics: fixed|regex  how `.err.expected` lines match stderr
 #
 # Marks, one `# fixture: <mark>` line anywhere in the fixture:
@@ -21,18 +22,24 @@
 #   # fixture: test        compile with --test; stdout+stderr is the output
 #   # fixture: no-stdlib   do not pass the stdlib path (the fixture tests its absence)
 #
+# FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
+# through bin/kai, which owns the stdlib path and the link, and supports no marks.
+#
 # Environment (set by stage2/Makefile): KAIC2 CC CFLAGS CPPFLAGS_CORE
-# LDLIBS_M LDFLAGS_STACK TEST_CORE_CACHE FIXTURE_JOBS.
+# LDLIBS_M LDFLAGS_STACK TEST_CORE_CACHE FIXTURE_JOBS FIXTURE_BACKEND.
 
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EX="$ROOT/examples"
 
+BACKEND="${FIXTURE_BACKEND:-c}"
+
 slug_dirs() {
   for m in "$EX"/*/FIXTURES "$EX"/*/*/FIXTURES; do
     [ -f "$m" ] || continue
     d="${m%/FIXTURES}"
+    sed -n 's/^backends: //p' "$m" | tr ' ' '\n' | grep -qx "$BACKEND" || continue
     rel="${d#"$EX"/}"
     printf '%s %s\n' "$(printf '%s' "$rel" | tr / -)" "$d"
   done
@@ -67,18 +74,28 @@ run_one() {
   exp_out="$dir/$name.out.expected"
   exp_err="$dir/$name.err.expected"
   b="build/fx-$slug-$name"
+  [ "$BACKEND" = c ] || b="$b-$BACKEND"
   if mark "$f" no-stdlib; then path=; else path="--path ../stdlib"; fi
-  [ "$(manifest "$dir" backends)" = c ] \
-    || { echo "fixture-dir: $dir/FIXTURES: only 'backends: c' is supported" >&2; exit 2; }
+  manifest "$dir" backends | tr ' ' '\n' | grep -qx "$BACKEND" \
+    || { echo "fixture-dir: $dir/FIXTURES: does not declare 'backends: $BACKEND'" >&2; exit 2; }
   case $(manifest "$dir" diagnostics) in
     fixed) grepflag=-qF ;;
     regex) grepflag=-q ;;
     *) echo "fixture-dir: $dir/FIXTURES: diagnostics must be fixed or regex" >&2; exit 2 ;;
   esac
 
+  if [ "$BACKEND" = native ]; then
+    if mark "$f" test || mark "$f" no-stdlib; then
+      echo "fixture-dir: $f: marks are not supported on native" >&2; exit 2
+    fi
+    compile() { KAI_BACKEND=native "$ROOT/bin/kai" build "$f" -o "$b" > /dev/null 2> "$b.err"; }
+  else
+    compile() { $KAIC2 $TEST_CORE_CACHE $path "$f" > /dev/null 2> "$b.err"; }
+  fi
+
   if [ -f "$exp_err" ]; then
     rc=0
-    $KAIC2 $TEST_CORE_CACHE $path "$f" > /dev/null 2> "$b.err" || rc=$?
+    compile || rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "$slug FAIL $name (expected error, got success)"; exit 1
     fi
@@ -90,7 +107,11 @@ run_one() {
     return 0
   fi
 
-  if mark "$f" test; then
+  if [ "$BACKEND" = native ]; then
+    compile || { echo "$slug FAIL $name (native build failed)"; cat "$b.err"; exit 1; }
+    "./$b" > "$b.out" \
+      || { echo "$slug FAIL $name (run errored)"; cat "$b.out"; exit 1; }
+  elif mark "$f" test; then
     $KAIC2 $TEST_CORE_CACHE $path --test "$f" > "$b.c" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
     eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
@@ -116,6 +137,7 @@ run_one() {
 
 case "${1:-}" in
   --list) slug_dirs | awk '{ print $1 }' ;;
+  --list-native) BACKEND=native; slug_dirs | awk '{ print $1 }' ;;
   --count)
     dir=$(dir_of "$2") || exit 2
     fixtures_of "$dir" | wc -l | tr -d ' ' ;;
