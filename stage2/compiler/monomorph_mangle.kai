@@ -1,7 +1,4 @@
-#[doc("""
-The name a specialisation is emitted under, and a type as a leak
-diagnostic shows it.
-""")]
+#[doc("Instance naming and bound resolution: the mangled name of a specialisation, the bounds it must satisfy and the operator checks on them.")]
 
 import compiler.ast
 import compiler.type_text
@@ -16,11 +13,23 @@ import compiler.infer_state
 import compiler.infer_env_exhaust
 import compiler.infer_handle_walk
 import compiler.infer_dump_text
+import compiler.scalar_ty
+import compiler.impl_identity
+import compiler.protos_registry
+import compiler.protos_calls
+import compiler.protos_derive_check
+import compiler.protos_find_impl
+import compiler.proto_resolve
+import compiler.core_refs
+import compiler.operators
+import compiler.fn_index
+import compiler.tbinder
+import compiler.expr_positions
 
 fn mono_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 
 #[doc("The name of the specialisation of `name` at `tys` and `units`.")]
-pub fn mono_mangle_name(tab: SymTab, name: String, tys: [Ty], units: [UnitExprT]) : String {
+pub(pkg) fn mono_mangle_name(tab: SymTab, name: String, tys: [Ty], units: [UnitExprT]) : String {
   let ty_part = match tys {
     [] -> ""
     [_h, ..._rest] -> concat_all(["__mono__", mono_join_with(map(tys, (t) => mono_mangle_ty(tab, t)), "__")])
@@ -142,7 +151,7 @@ fn mono_mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : Strin
 fn mono_ty_string_list(tab: SymTab, ts: [Ty]) : [String] = map(ts, (t) => mono_ty_to_string(tab, t))
 
 #[doc("A type as a diagnostic shows it.")]
-pub fn mono_ty_to_string(tab: SymTab, t: Ty) : String {
+pub(pkg) fn mono_ty_to_string(tab: SymTab, t: Ty) : String {
   match t {
     TyInt    -> "Int"
     TyReal   -> "Real"
@@ -219,4 +228,166 @@ fn mono_row_to_string_suffix(tab: SymTab, r: Row) : String {
       concat_all([" / ", lbs, tail_s])
     }
   body
+}
+
+#[doc("One free-fn protocol-bound violation caught at a concrete instantiation: the message plus the call-site (or callee) location.")]
+pub(pkg) type BoundViolation = BV(String, Int, Int)
+
+#[doc("A source position.")]
+pub(pkg) type LineCol = MoLC(Int, Int)
+
+#[doc("The violations of the bounds `ftbs` by the types `tys` of one instantiation of `callee`.")]
+pub(pkg) fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], callee: SymId,
+                      fmo: Option[String],
+                      reg: ProtocolReg, loc: LineCol,
+                      ps: PScope, acc: [BoundViolation]) : [BoundViolation] {
+  match ftbs {
+    [] -> acc
+    [ftb, ...rest] -> match ftb {
+      FTB(idx, protos) -> {
+        let acc1 = match ty_at(tys, idx) {
+          None -> acc
+          Some(ty) -> match ty_disp_head(ty) {
+            None -> acc
+            Some(head) -> check_protos_for_head(protos, head, callee, fmo, ty, reg, loc, ps, acc)
+          }
+        }
+        check_tuple_bounds(rest, tys, callee, fmo, reg, loc, ps, acc1)
+      }
+    }
+  }
+}
+
+fn check_protos_for_head(protos: [DeclRef], head: DispHead, callee: SymId,
+                         fmo: Option[String],
+                         ty: Ty, reg: ProtocolReg, loc: LineCol,
+                         ps: PScope, acc: [BoundViolation]) : [BoundViolation] {
+  match protos {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = if head_satisfies_proto(reg, p, fmo, head, ps) { acc }
+                 else {
+                   let msg = concat_all(["type `", mono_ty_to_string(ps_tab(ps), ty),
+                     "` does not satisfy the bound `", ref_display(ps_tab(ps), p),
+                     "` on a type parameter of `", written_text(decl_name(ps_tab(ps), callee)), "`"])
+                   match loc { MoLC(l, c) -> [BV(msg, l, c), ...acc] }
+                 }
+      check_protos_for_head(rest, head, callee, fmo, ty, reg, loc, ps, acc1)
+    }
+  }
+}
+
+# Canonical "head satisfies protocol": a user impl or a derive-
+# synthesised impl (both land in `reg.impls` via `expand_derives`
+# + `lower_impls`), or a structural builtin (Int/Real/... for
+# Eq/Show/Ord/Hash).
+# The bound's name resolves from the declaring fn's module, so a
+# contested protocol name checks against its own impl table.
+fn head_satisfies_proto(reg: ProtocolReg, proto: DeclRef,
+                        fmo: Option[String], head: DispHead,
+                        ps: PScope) : Bool {
+  let psym = proto_ref_sym(ps, proto, fmo)
+  prc_reg_has_impl(reg, psym, head) or match core_proto_of(psym) {
+    Some(cp) -> head_has_builtin_impl(cp, head)
+    None     -> false
+  }
+}
+
+# Only a scalar has a structural builtin impl.
+fn head_has_builtin_impl(cp: CoreProto, head: DispHead) : Bool = match head {
+  DhScalar(t) -> match scalar_ty_name(t) {
+    Some(n) -> derive_builtin_impl(cp, n)
+    None    -> false
+  }
+  DhSym(_) -> false
+}
+
+fn ty_at(tys: [Ty], idx: Int) : Option[Ty] {
+  match tys {
+    [] -> None
+    [t, ...rest] -> if idx == 0 { Some(t) } else { ty_at(rest, idx - 1) }
+  }
+}
+
+#[doc("The violations of the operators in the specialised body `body` of `callee`, each located at `loc`, the call that instantiated it.")]
+pub(pkg) fn spec_op_violations(tab: SymTab, callee: SymId, body: Expr, loc: LineCol) : [BoundViolation] =
+  op_scan(tab, callee, body, loc, [])
+
+fn op_scan(tab: SymTab, callee: SymId, e: Expr, loc: LineCol, acc: [BoundViolation]) : [BoundViolation] = {
+  let here = match e.kind {
+    EBinop(op, l, _) -> if bp_is_arith(binop_proto(op)) and operand_unsupported(l.ty) { [op_violation(tab, callee, op, l.ty, loc), ...acc] } else { acc }
+    _ -> acc
+  }
+  op_scan_children(tab, callee, xp_positions(e), loc, here)
+}
+
+fn op_scan_children(tab: SymTab, callee: SymId, ps: [XPos], loc: LineCol, acc: [BoundViolation]) : [BoundViolation] = match ps {
+  [] -> acc
+  [XP(_, c), ...rest] -> op_scan_children(tab, callee, rest, loc, op_scan(tab, callee, c, loc, acc))
+}
+
+fn operand_unsupported(t: Option[Ty]) : Bool = match t {
+  Some(TyDimT(inner, _))    -> operand_unsupported(Some(inner))
+  Some(TyRefineT(inner, _)) -> operand_unsupported(Some(inner))
+  Some(TyCon(_, _))         -> true
+  Some(TyString)            -> true
+  Some(TyBool)              -> true
+  Some(TyChar)              -> true
+  Some(TyUnit)              -> true
+  Some(TyListT(_))          -> true
+  _                         -> false
+}
+
+fn op_violation(tab: SymTab, callee: SymId, op: BinOp, t: Option[Ty], loc: LineCol) : BoundViolation = {
+  let shown = match t { Some(ty) -> mono_ty_to_string(tab, ty)  None -> "?" }
+  let msg = concat_all(["type `", shown, "` has no impl for operator `", binop_text(op),
+                        "` used in `", ref_display(tab, DrSym(callee)),
+                        "`; declare the matching protocol bound on its type parameter"])
+  match loc { MoLC(l, c) -> BV(msg, l, c) }
+}
+
+#[doc("A located warning.")]
+pub(pkg) type OpWarning = OpWarn(String, Int, Int)
+
+#[doc("The operators of the generic `d` applied to a type parameter while none of its type parameters declares a bound, each with the bound it needs. Nothing for a fn the target module does not own.")]
+pub(pkg) fn unbounded_op_warnings(d: Decl, fn_bounds: [SymBounds], target_mod: String) : [OpWarning] = match d {
+  DFn(_, fid, tps, _, _, _, body, _, _, mo) ->
+    if owned_by(mo, target_mod) and any(tps, (b) => tb_is_type(b)) and is_unbounded(bounds_of_sym(fn_bounds, fnid_sym(fid))) {
+      var_op_scan(body, [])
+    } else { [] }
+  _ -> []
+}
+
+fn owned_by(mo: Option[String], target_mod: String) : Bool = match mo {
+  None    -> true
+  Some(m) -> m == target_mod
+}
+
+fn is_unbounded(bs: Option[[FnTPBound]]) : Bool = match bs {
+  None    -> true
+  Some(_) -> false
+}
+
+fn var_op_scan(e: Expr, acc: [OpWarning]) : [OpWarning] = {
+  let here = match e.kind {
+    EBinop(op, l, _) -> if bp_is_arith(binop_proto(op)) and operand_is_var(l.ty) { [var_op_warning(op, e), ...acc] } else { acc }
+    _ -> acc
+  }
+  var_op_children(xp_positions(e), here)
+}
+
+fn var_op_children(ps: [XPos], acc: [OpWarning]) : [OpWarning] = match ps {
+  [] -> acc
+  [XP(_, c), ...rest] -> var_op_children(rest, var_op_scan(c, acc))
+}
+
+fn operand_is_var(t: Option[Ty]) : Bool = match t {
+  Some(TyVarT(_)) -> true
+  _               -> false
+}
+
+fn var_op_warning(op: BinOp, e: Expr) : OpWarning = {
+  let bound = match op_proto_core(binop_proto(op)) { Some(cp) -> core_proto_name(cp)  None -> "" }
+  OpWarn(concat_all(["operator `", binop_text(op), "` on a type parameter with no declared bound; declare `[T: ", bound, "]`"]),
+         e.line, e.col)
 }
