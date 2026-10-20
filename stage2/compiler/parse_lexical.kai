@@ -1,12 +1,10 @@
-#[doc("Literal parsing, unit and habitant syntax, binary-operator tables and placeholder rewriting.")]
+#[doc("Literal parsing, unit and habitant syntax, binary-operator tables, placeholder rewriting and the format spec after a top-level `:` in a `#{...}` body.")]
 
 import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.written
 import compiler.lex
-import compiler.interp_scan
-import compiler.interp_spec
 import compiler.escapes
 import compiler.ast
 import compiler.parse_state
@@ -14,6 +12,7 @@ import compiler.kinds
 import compiler.ast_map
 import compiler.operators
 import compiler.pipe_stage
+import compiler.call_site_target
 
 fn char_before_end(s: String, i: Int, n: Int) : Option[Char] =
   if i >= n { None } else { char_at(s, i) }
@@ -58,7 +57,7 @@ fn decode_magnitude(span: String, i: Int, n: Int) : Int =
   }
 
 #[doc("Decode a decimal/hex/bin integer literal span (optional leading `-`, `_` separators) to Int. Shared with the backends for fixed-width literals that fit 64 bits.")]
-pub fn decode_int(span: String) : Int =
+pub(pkg) fn decode_int(span: String) : Int =
   match char_at(span, 0) {
     None -> 0
     Some('-') -> 0 - decode_magnitude(span, 1, string_length(span))
@@ -94,7 +93,7 @@ wrapping. Decimal compares magnitude against 2^63-1; hex and binary are
 bit patterns, so the check is the width: more than 16 significant hex or
 64 significant binary digits.
 """)]
-pub fn int_lit_overflows(span: String) : Bool = {
+pub(pkg) fn int_lit_overflows(span: String) : Bool = {
   let n = string_length(span)
   match lit_base(span, 0, n) {
     16 -> count_base_digits(span, 2, n, 0) > 16
@@ -104,22 +103,16 @@ pub fn int_lit_overflows(span: String) : Bool = {
 }
 
 #[doc("Reports whether an integer literal carries a `0x` or `0b` prefix.")]
-pub fn has_base_prefix(span: String) : Bool = lit_base(span, 0, string_length(span)) != 0
+pub(pkg) fn has_base_prefix(span: String) : Bool = lit_base(span, 0, string_length(span)) != 0
 
-#[doc("""
-Build a fixed-width integer literal: strip the `suf_len`-char width
-suffix off the token span and keep the remaining digits verbatim in an
-`EFixed` node tagged with the width type. The value is range-checked by
-the typer, so an Int128 above 2^63 survives.
-""")]
-pub fn fixed_lit(src: String, t: Token, suf_len: Int, ty: Ty) : Expr {
+fn fixed_lit(src: String, t: Token, suf_len: Int, ty: Ty) : Expr {
   let span = tok_source(src, t)
   let digits = string_slice(span, 0, string_length(span) - suf_len)
   with_ty(expr_at(EFixed(digits, ty), t), ty)
 }
 
 #[doc("The width-tagged literal a fixed-width integer token spells, or `None` for any other token.")]
-pub fn fixed_lit_of_tok(src: String, t: Token) : Option[Expr] =
+pub(pkg) fn fixed_lit_of_tok(src: String, t: Token) : Option[Expr] =
   match t.kind {
     TkUInt8 -> Some(fixed_lit(src, t, 2, TyByte))
     TkInt32 -> Some(fixed_lit(src, t, 3, TyInt32))
@@ -130,14 +123,14 @@ pub fn fixed_lit_of_tok(src: String, t: Token) : Option[Expr] =
   }
 
 #[doc("Decodes real literal text, rejecting values out of range.")]
-pub fn decode_real(span: String) : Option[Real] = string_to_real(replace(span, "_", ""))
+pub(pkg) fn decode_real(span: String) : Option[Real] = string_to_real(replace(span, "_", ""))
 
 #[doc("Returns the diagnostic for a real literal outside the representable range.")]
-pub fn real_range_error() : String = "real literal out of range for Real"
+pub(pkg) fn real_range_error() : String = "real literal out of range for Real"
 
 # The lexer rejected every escape outside the table; `\xHH` and `\u{...}` name a scalar value, not UTF-8 bytes.
 #[doc("Decodes the text of a character literal.")]
-pub fn decode_char(span: String) : Char =
+pub(pkg) fn decode_char(span: String) : Char =
   int_to_char(match char_at(span, 1) {
     None -> 0
     Some('\\') -> unwrap_or(esc_decode_scalar_at(span, 2, string_length(span) - 1), 0)
@@ -166,11 +159,7 @@ fn p_interp_report(p: Parser, d: Diagnostic) : Parser / Console = match d {
     }
 }
 
-#[doc("""
-A nested body that fails has already named itself; any other failure
-names the body and carries the parser's reason.
-""")]
-pub fn p_interp_fail(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Parser / Console =
+fn p_interp_fail(p: Parser, src: String, body: InterpPos, inner: Option[Diagnostic]) : Parser / Console =
   p_interp_report(p, interp_diag(p, src, body, inner))
 
 fn parse_interp_bodies(p: Parser, parts: [IPart], at: InterpPos, acc: [Expr]) : PArgs / Console = match parts {
@@ -196,7 +185,7 @@ fn parse_interp_bodies(p: Parser, parts: [IPart], at: InterpPos, acc: [Expr]) : 
 }
 
 #[doc("Parses a string literal, including the bodies of its `#{...}` interpolations.")]
-pub fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
+pub(pkg) fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
   let span = tok_source(p.src, t)
   let triple = string_length(span) >= 6 and starts_with(span, "\"\"\"")
   if span_interpolates(span, triple) {
@@ -211,7 +200,7 @@ pub fn parse_str_lit(p: Parser, t: Token) : PExpr / Console {
 
 # `#` is refused in the body: it would start a `#{...}` interpolation in the generated string.
 #[doc("Parses a `~r/pattern/` sigil into a call of `regexp.compile_or_panic` on the pattern as a string literal.")]
-pub fn parse_regex_sigil(p: Parser, t: Token) : PExpr / Console {
+pub(pkg) fn parse_regex_sigil(p: Parser, t: Token) : PExpr / Console {
   let span = tok_source(p.src, t)
   let pattern = string_slice(span, 3, string_length(span) - 4)
   if string_find(pattern, "#") >= 0 {
@@ -229,11 +218,11 @@ A type head takes a `<habitant>` annotation when it is `Real`, `Int` or
 `Decimal`, or a user-declared nominal head (uppercase). A lowercase head is
 a type variable, so `t < u` in a signature stays a refinement comparison.
 """)]
-pub fn ty_head_takes_habitant(src: String, t: Token, name: String) : Bool =
+pub(pkg) fn ty_head_takes_habitant(src: String, t: Token, name: String) : Bool =
   name == "Real" or name == "Int" or name == "Decimal" or is_upper_ident(src, t)
 
 #[doc("A parameterised uppercase head may carry a habitant after its argument list (`Money[Decimal]<USD>`).")]
-pub fn ty_args_habitant(pr: PTy, t: Token) : PTy / Console = match pr.r {
+pub(pkg) fn ty_args_habitant(pr: PTy, t: Token) : PTy / Console = match pr.r {
   None -> pr
   Some(base) ->
     if p_at(pr.p, TkLt) and is_upper_ident(pr.p.src, t) { parse_habitant_slot(pr.p, base, t) } else { pr }
@@ -247,7 +236,7 @@ expression, or a comma-separated positional list (`Matrix[t]<m, n>`) that
 rides a single `UDims`. The spelling between the brackets is not recoverable
 from the resolved units, so it is sliced from the source into a `TsUnitSpan`.
 """)]
-pub fn parse_habitant_slot(p: Parser, base: TypeExpr, t: Token) : PTy / Console {
+pub(pkg) fn parse_habitant_slot(p: Parser, base: TypeExpr, t: Token) : PTy / Console {
   let lt = p_peek(p)
   parse_habitant_list(p_advance_nl(p), [], HabHead { base: base, t: t, from: lt.start + lt.length })
 }
@@ -273,7 +262,7 @@ fn close_habitant(p: Parser, acc: [UnitExprT], h: HabHead) : PTy {
 }
 
 #[doc("Parses a unit-of-measure expression.")]
-pub fn parse_unit_expr(p: Parser) : PUnit / Console {
+pub(pkg) fn parse_unit_expr(p: Parser) : PUnit / Console {
   let r = parse_unit_term(p)
   match r.r {
     None -> r
@@ -492,10 +481,10 @@ fn desugar_placeholder_arg(arg: Expr) : Expr =
   } else { arg }
 
 #[doc("Rewrites call arguments containing `.` into a lambda body.")]
-pub fn desugar_placeholder_args(args_: [Expr]) : [Expr] = map(args_, desugar_placeholder_arg)
+pub(pkg) fn desugar_placeholder_args(args_: [Expr]) : [Expr] = map(args_, desugar_placeholder_arg)
 
 #[doc("Maps an operator token to its spelling.")]
-pub fn op_of_tok(k: TokKind) : String {
+pub(pkg) fn op_of_tok(k: TokKind) : String {
   match k {
     TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
     TkPercent -> "%" TkPlusPlus -> "++"
@@ -508,15 +497,15 @@ pub fn op_of_tok(k: TokKind) : String {
 # Levels, loosest first: the four pipes, `or`, `and`, comparisons (no chaining),
 # `++` (right-associative), additive, multiplicative; the rest are left-associative.
 #[doc("Precedence level of the pipes.")]
-pub fn bin_pipe() : Int = 1
+pub(pkg) fn bin_pipe() : Int = 1
 #[doc("Precedence level of `or`.")]
-pub fn bin_or() : Int = 2
+pub(pkg) fn bin_or() : Int = 2
 #[doc("Precedence level of comparison operators.")]
-pub fn bin_cmp() : Int = 4
+pub(pkg) fn bin_cmp() : Int = 4
 #[doc("Precedence level of concatenation.")]
-pub fn bin_concat() : Int = 5
+pub(pkg) fn bin_concat() : Int = 5
 #[doc("Precedence level of the tightest binary operators.")]
-pub fn bin_tightest() : Int = 7
+pub(pkg) fn bin_tightest() : Int = 7
 
 fn bin_level(k: TokKind) : Int =
   match k {
@@ -553,7 +542,7 @@ fn bin_op_on_next_line(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
 }
 
 #[doc("Reads the binary operator at the parser position, or leading the next line, with its level.")]
-pub fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
+pub(pkg) fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
   let t = p_peek(p)
   let lv = bin_level(t.kind)
   if lv == 0 { bin_op_on_next_line(p_skip_newlines(p), lo, hi) }
@@ -567,11 +556,11 @@ level again for a left-associative one, strictly looser after a
 comparison (no chaining) or after `++`, whose right operand already took
 the rest of its chain.
 """)]
-pub fn bin_ceiling(op: BinOpAt) : Int =
+pub(pkg) fn bin_ceiling(op: BinOpAt) : Int =
   if op.level == bin_cmp() or op.level == bin_concat() { op.level - 1 } else { op.level }
 
 #[doc("Builds the expression node of a binary operation.")]
-pub fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+pub(pkg) fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
   match binop_of_text(op_of_tok(t.kind)) {
     Some(o) -> ok_e(p, expr_at(EBinop(o, lhs, rhs), t))
     None    -> fail_e_at(p, t, "expected a binary operator")
@@ -607,13 +596,13 @@ fn dispatch_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Conso
   }
 
 #[doc("Builds the node of a pipe: `|>` (apply), `|` (map), `||` (flat-map), `|?` (filter) or `|!` (each).")]
-pub fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+pub(pkg) fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
   if ends_pipeline(lhs) { fail_e_at(p, t, "`|!` ends a pipeline; it returns `Unit`") }
   else if tk_is(t.kind, TkPipeApply) { apply_pipe_node(p, t, lhs, rhs) }
   else { dispatch_pipe_node(p, t, lhs, rhs) }
 
 #[doc("Reports whether a token is a comparison operator.")]
-pub fn is_cmp_tok(k: TokKind) : Bool =
+pub(pkg) fn is_cmp_tok(k: TokKind) : Bool =
   match k {
     TkEqEq -> true
     TkNeq -> true
@@ -625,7 +614,7 @@ pub fn is_cmp_tok(k: TokKind) : Bool =
   }
 
 #[doc("Builds a comparison node; a second comparison right after it gets a tailored diagnostic.")]
-pub fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console = {
+pub(pkg) fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console = {
   let after = p_peek(p)
   if is_cmp_tok(after.kind) {
     fail_e_at(p, after, "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead")
@@ -633,7 +622,7 @@ pub fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console
 }
 
 #[doc("Maps a comparison token to its comparison operator.")]
-pub fn cmp_op_of_tok(k: TokKind) : BinOp =
+pub(pkg) fn cmp_op_of_tok(k: TokKind) : BinOp =
   match k {
     TkLt -> BoLt
     TkLe -> BoLe
@@ -642,3 +631,145 @@ pub fn cmp_op_of_tok(k: TokKind) : BinOp =
     TkGe -> BoGe
     _ -> BoEq
   }
+
+type FmtSpec = { align: Int, width: Int, prec: Int }
+
+type SpecParse = SpecOk(FmtSpec) | SpecBad(String)
+
+fn spec_hint() : String = "expected a width and/or `.N` precision, as in `5`, `05`, `<10`, `.2` or `8.2`"
+
+fn spec_unknown(s: String) : SpecParse = SpecBad(concat_all(["unknown format spec `", s, "`: ", spec_hint()]))
+
+fn parse_fmt_spec(s: String) : SpecParse = {
+  let n = string_length(s)
+  let al = spec_align(s)
+  let start = if al.aligned { 1 } else { 0 }
+  let zero = not al.aligned and n > 1 and spec_char_is(s, 0, '0') and spec_digit_at(s, 1)
+  let wend = spec_digits_end(s, start, n)
+  let width = spec_value(s, start, wend, 0)
+  if wend - start > 6 { SpecBad("the width is too large") }
+  else if wend >= n { spec_finish(al, zero, wend - start, width, 0 - 1) }
+  else if not spec_char_is(s, wend, '.') { spec_unknown(s) }
+  else {
+    let pend = spec_digits_end(s, wend + 1, n)
+    if pend == wend + 1 { SpecBad("expected the number of decimals after `.`") }
+    else if pend < n or pend - wend > 4 { spec_unknown(s) }
+    else { spec_finish(al, zero, wend - start, width, spec_value(s, wend + 1, pend, 0)) }
+  }
+}
+
+type Lead = { align: Int, aligned: Bool }
+
+fn spec_char_is(s: String, i: Int, c: Char) : Bool = match char_at(s, i) {
+  Some(d) -> d == c
+  None    -> false
+}
+
+fn spec_digit_at(s: String, i: Int) : Bool = match char_at(s, i) {
+  Some(c) -> ch_is_digit(c)
+  None    -> false
+}
+
+fn spec_align(s: String) : Lead = match char_at(s, 0) {
+  Some('<') -> Lead { align: 1, aligned: true }
+  Some('>') -> Lead { align: 0, aligned: true }
+  Some('^') -> Lead { align: 2, aligned: true }
+  _         -> Lead { align: 0, aligned: false }
+}
+
+fn spec_digits_end(s: String, i: Int, n: Int) : Int =
+  if i < n and spec_digit_at(s, i) { spec_digits_end(s, i + 1, n) } else { i }
+
+fn spec_value(s: String, i: Int, end: Int, acc: Int) : Int = match char_at(s, i) {
+  Some(c) -> if i < end { spec_value(s, i + 1, end, acc * 10 + (char_to_int(c) - 48)) } else { acc }
+  None    -> acc
+}
+
+fn spec_finish(al: Lead, zero: Bool, digits: Int, width: Int, prec: Int) : SpecParse =
+  if digits == 0 and al.aligned { SpecBad(concat_all(["expected a width after the alignment; ", spec_hint()])) }
+  else if digits == 0 and prec < 0 { SpecBad(spec_hint()) }
+  else if zero { SpecOk(FmtSpec { align: 3, width: width, prec: prec }) }
+  else { SpecOk(FmtSpec { align: al.align, width: width, prec: prec }) }
+
+fn lower_fmt_spec(x: Expr, sp: FmtSpec, line: Int, col: Int) : Expr = {
+  let align = sp.align
+  let width = sp.width
+  let shown = if sp.prec >= 0 { mk_expr(ECall(mk_expr(home_fn_ref(fmt_lib_home(), "fixed"), line, col), [x, spec_int(sp.prec, line, col)]), line, col) }
+              else { mk_expr(ECall(mk_expr(EMark(MkInterpShow), line, col), [x]), line, col) }
+  if width == 0 { shown } else { spec_pad(shown, align, width, line, col) }
+}
+
+fn spec_pad(shown: Expr, align: Int, width: Int, line: Int, col: Int) : Expr = {
+  let w = spec_int(width, line, col)
+  let fill = mk_expr(EChar(' '), line, col)
+  if align == 1 { spec_mod_call("pad_right", [shown, w, fill], line, col) }
+  else if align == 2 { spec_mod_call("pad_center", [shown, w, fill], line, col) }
+  else if align == 3 { spec_mod_call("pad_zero", [shown, w], line, col) }
+  else { spec_mod_call("pad_left", [shown, w, fill], line, col) }
+}
+
+fn spec_int(v: Int, line: Int, col: Int) : Expr = mk_expr(mk_int_synth(v), line, col)
+
+fn spec_mod_call(fn_name: String, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_expr(home_fn_ref(fmt_lib_home(), fn_name), line, col), args), line, col)
+
+fn spec_colon_at(toks: [Token]) : Int = spec_colon_index(toks, 0, 0)
+
+fn spec_head(toks: [Token], at: Int) : [Token] = match drop(toks, at) {
+  [t, ..._] -> if at < 0 { toks } else { list_append(take(toks, at), [tok(TkEof, t.line, t.col, t.start, t.start)]) }
+  []        -> toks
+}
+
+fn spec_colon_tok(toks: [Token], at: Int) : Token = match drop(toks, at) {
+  [t, ..._] -> t
+  []        -> tok(TkEof, 0, 0, 0, 0)
+}
+
+fn spec_colon_index(ts: [Token], depth: Int, i: Int) : Int = match ts {
+  [] -> 0 - 1
+  [t, ...rest] ->
+    if tk_is(t.kind, TkColon) and depth == 0 { i }
+    else { spec_colon_index(rest, depth + spec_depth(t.kind), i + 1) }
+}
+
+fn spec_depth(k: TokKind) : Int = match k {
+  TkLparen   -> 1
+  TkLbracket -> 1
+  TkLbrace   -> 1
+  TkRparen   -> 0 - 1
+  TkRbracket -> 0 - 1
+  TkRbrace   -> 0 - 1
+  _          -> 0
+}
+
+type SpecHole = SpecHoleOk(Expr) | SpecHoleBad(SpecDiag)
+
+type SpecDiag = { line: Int, col: Int, msg: String }
+
+fn spec_hole(src: String, body: InterpPos, x: Expr, colon: Token) : SpecHole = {
+  let from = colon.start + 1
+  let pos = interp_pos_advance(body, string_slice(src, 0, from), 0)
+  match parse_fmt_spec(string_slice(src, from, string_length(src) - from)) {
+    SpecBad(msg) -> SpecHoleBad(SpecDiag { line: pos.line, col: pos.col, msg: msg })
+    SpecOk(sp)   -> SpecHoleOk(lower_fmt_spec(x, sp, pos.line, pos.col))
+  }
+}
+
+fn fmt_lib_home() : String = "text__format_spec"
+
+fn fmt_lib_alias() : String = "__format_spec"
+
+#[doc("The import of the format library a file gets when one of its specs needs it; its alias cannot be written in source.")]
+pub(pkg) fn fmt_lib_import() : Decl = DImport(IkAlias("text.format_spec", fmt_lib_alias()), 0, 0)
+
+#[doc("Whether `d` is the import the parser added for the format library.")]
+pub(pkg) fn is_fmt_lib_decl(d: Decl) : Bool = match d {
+  DImport(ik, _, _) -> is_fmt_lib_import(ik)
+  _                 -> false
+}
+
+#[doc("Whether `ik` is the import the parser added for the format library.")]
+pub(pkg) fn is_fmt_lib_import(ik: ImportKind) : Bool = match ik {
+  IkAlias(_, alias) -> alias == fmt_lib_alias()
+  _                 -> false
+}
