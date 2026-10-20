@@ -21,6 +21,7 @@ import compiler.infer_forms
 import compiler.infer_coalesce
 import compiler.infer_stage_hint
 import compiler.infer_head_dispatch
+import compiler.infer_handle_walk
 import compiler.resolve_names
 import compiler.handler_alias
 import compiler.enc_unit
@@ -365,8 +366,12 @@ fn stage_hinted_call(st: InferState, callee: Expr, callee_ty: Ty, arg_tys: [Ty],
 #[doc("Typer-internal helper `synth_call_site` shared across the infer modules.")]
 pub fn synth_call_site(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = match callee.kind {
   EMark(MkDeref) -> match args_ {
-    [x] -> synth_call(st, mk_expr(EField(x, mark_name(MkDeref)), callee.line, callee.col), [], line, col)
+    [x] -> synth_ref_op(st, x, "ref_get", [], "`@` reads", line, col)
     _   -> synth_call(st, callee, args_, line, col)
+  }
+  EMark(MkCellSet) -> match args_ {
+    [c, v] -> synth_ref_op(st, c, "ref_set", [v], "`:=` writes a `var` or", line, col)
+    _      -> synth_call(st, callee, args_, line, col)
   }
   EMark(MkCoalesce) -> match args_ {
     [l, r] -> synth_coalesce(st, l, r, line, col)
@@ -655,47 +660,40 @@ fn try_method_call(st: InferState, callee: Expr, args_: [Expr],
       let r = w_synth(st, obj)
       let obj_ty = apply_ty(r.st.sub, r.ty)
       if record_has_field(r.st, obj_ty, ident) or ty_unsettled(obj_ty) { None }
-      else {
-        # `c := v` and `@c` for `c : Ref[T]` lower to `c.set(v)` / `c.get()`;
-        # `Mutable` carries the matching `ref_set` / `ref_get` ops.
-        match try_ref_sugar_op(st, obj, obj_ty, ident, args_, line, col) {
-          Some(inf) -> Some(inf)
-          None      -> Some(method_call_error(r.st, ident, r.expr, args_, line, col))
-        }
-      }
+      else { Some(method_call_error(r.st, ident, r.expr, args_, line, col)) }
     }
     _ -> None
   }
 }
 
 
-# rewrite `c.get()` / `c.set(v)` to `Mutable.ref_get(c)` /
-# `Mutable.ref_set(c, v)` when `c : Ref[T]`. Returns None when the
-# receiver is not a `Ref` or the ident is not `get` / `set`, so the
-# caller reports the missing method.
-fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String, args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
-  match obj_ty {
-    TyCon(tcs, _) -> if core_ty_is(tcs, CtRef) { ref_sugar_named(st, obj, ref_sugar_op_name(ident), args_, line, col) } else { None }
-    _             -> None
-  }
-
-fn ref_sugar_op_name(ident: String) : Option[String] =
-  if ident == "get" { Some("ref_get") }
-  else if ident == "set" { Some("ref_set") }
-  else { None }
-
-# `obj` re-walks once inside `synth_op_call_with_scheme`; typing a read twice is idempotent.
-fn ref_sugar_named(st: InferState, obj: Expr, op_opt: Option[String], args_: [Expr], line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
-  match op_opt {
-    None     -> None
-    Some(op) -> {
-      let ms = core_effect_id(CeMutable)
-      match env_op(st.env, ms, written(op)) {
-        None     -> None
-        Some(sc) -> Some(synth_op_call_with_scheme(st, sc, [obj, ...args_], ms, op, line, col))
-      }
+# `@r` and `r := v` read and write a `Ref`: the target's type decides, and
+# `Mutable` carries the `ref_get` / `ref_set` ops. A target whose type is
+# not yet known is unified with `Ref[t]` by the op's own signature.
+fn synth_ref_op(st: InferState, target: Expr, op: String, rest: [Expr], what: String,
+                line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let r = w_synth(st, target)
+  let ty = apply_ty(r.st.sub, r.ty)
+  if ty_unsettled(ty) or ty_is_ref(ty) {
+    let ms = core_effect_id(CeMutable)
+    match env_op(st.env, ms, written(op)) {
+      Some(sc) -> synth_op_call_with_scheme(st, sc, [target, ...rest], ms, op, line, col)
+      None     -> mk_inferred(r.st, TyAny, with_ty(mk_expr(ECall(target, rest), line, col), TyAny))
     }
+  } else {
+    let perr = mk_diag(SevError, st.file, line, col,
+      "#{what} a `Ref`, found `#{inf_ty_to_string(st.env.tab, ty)}`", [])
+    render_diag(perr)
+    mk_inferred(st_bump_err(st_push_diag(r.st, perr)), TyAny, with_ty(mk_expr(ECall(target, rest), line, col), TyAny))
   }
+}
+
+fn ty_is_ref(t: Ty) : Bool = match t {
+  TyCon(tcs, _) -> core_ty_is(tcs, CtRef)
+  _             -> false
+}
+
+
 
 
 # Type `name.op(args)` where `name` is a capability value. Dispatch the op to the
