@@ -19,6 +19,7 @@ import compiler.protos_registry
 import compiler.protos_impls
 import compiler.layout_derive
 import compiler.json_shape
+import compiler.eq_structural
 
 #[doc("""
 Validate, before expansion, that every `#[derive(P)]` of Eq, Hash or
@@ -28,7 +29,7 @@ container impl bounds by its protocol, so `[(Int, String)]` needs one on
 `List` and on `Pair`.
 """)]
 pub(pkg) fn validate_derives(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
-  list_reverse(validate_derives_loop(ps, sg, ds, df, collect_impl_reach(ps, sg, ds, []), []))
+  list_reverse(validate_derives_loop(ps, sg, ds, df, collect_impl_reach(ps, sg, ds, []), eq_types(ds), []))
 
 # Every impl, written or derived, of a protocol whose generator's fields
 # are checked here.
@@ -108,6 +109,14 @@ pub(pkg) fn derive_builtin_impl(p: CoreProto, tname: String) : Bool = match p {
   _     -> false
 }
 
+# An `Eq` field of a data type with no parameters is covered when the type's own fields are.
+fn head_plain_data_eq(rd: ReachRead, impls: [ImplReach], serves: (SymId) -> Bool, h: DeclRef) : Bool =
+  ref_resolved(h) and plain_data_eq(eq_env_of(rd.ps, (s) => any(impls, (ir) => impl_reach_serves(rd.ps, serves, ir, s)), rd.types), ref_sym(h))
+
+fn impl_reach_serves(ps: PScope, serves: (SymId) -> Bool, ir: ImplReach, s: SymId) : Bool = match ir {
+  IR(p, ih, _) -> serves(p) and refs_same(ps_tab(ps), ih, DrSym(s))
+}
+
 # Only a scalar has a builtin impl, and a scalar head stays as written.
 fn head_builtin_impl(g: CoreProto, h: DeclRef) : Bool = match h {
   DrWritten(None, _) -> derive_builtin_impl(g, ref_spelled(h))
@@ -141,24 +150,24 @@ pub(pkg) fn derive_entry_diags(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagF
 }
 
 fn validate_derives_loop(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles, reach: [ImplReach],
-                         errs: [Diagnostic]) : [Diagnostic] / Console {
+                         types: [Decl], errs: [Diagnostic]) : [Diagnostic] / Console {
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, line, col) -> {
         let site = DS(decl_diag_file(d, df), line, col)
-        let errs1 = validate_derive_decl(ps, sg, names, inner, site, reach, errs)
-        validate_derives_loop(ps, sg, rest, df, reach, errs1)
+        let errs1 = validate_derive_decl(ps, sg, names, inner, site, reach, types, errs)
+        validate_derives_loop(ps, sg, rest, df, reach, types, errs1)
       }
       DUnstable(inner, _, _) ->
-        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, types, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, types, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, types, errs)
       DConstructor(inner, _, _) ->
-        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
-      _ -> validate_derives_loop(ps, sg, rest, df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, types, errs)
+      _ -> validate_derives_loop(ps, sg, rest, df, reach, types, errs)
     }
   }
 }
@@ -168,16 +177,16 @@ type DeriveSite = DS(String, Int, Int)
 
 # What a derive's fields are read with: the scope, the file and the type
 # parameters of the deriving type, its name, and where it reports.
-type ReachRead = { ps: PScope, from: Option[String], params: [TBinder], tname: String, site: DeriveSite }
+type ReachRead = { ps: PScope, from: Option[String], params: [TBinder], tname: String, site: DeriveSite, types: [Decl] }
 
 fn validate_derive_decl(ps: PScope, sg: ShapedGens, names: [String], inner: Decl, site: DeriveSite,
-                        reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
+                        reach: [ImplReach], types: [Decl], errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
   DType(_, tsym, tps, body, _, _, _, _) -> {
     let tab = ps_tab(ps)
     let from = derive_from(ps, inner)
     let gens = reach_gens(ps, sg, names, from)
     let own = list_append(map(gens, (g) => derived_reach(gen_proto(g), tsym, tps)), param_reaches(gens, tps))
-    let rd = ReachRead { ps: ps, from: from, params: tps, tname: ref_text(tab, DrSym(tsym)), site: site }
+    let rd = ReachRead { ps: ps, from: from, params: tps, tname: ref_text(tab, DrSym(tsym)), site: site, types: types }
     validate_derive_protos(rd, sg, gens, derive_field_types(tab, body), list_append(own, reach), errs)
   }
   _ -> errs
@@ -234,20 +243,22 @@ fn validate_derive_protos(rd: ReachRead, sg: ShapedGens, gens: [DeriveGen], fiel
   []           -> errs
   [d, ...rest] ->
     validate_derive_protos(rd, sg, rest, fields, impls,
-                           validate_derive_fields(rd, d, derive_reach_of(rd.ps, sg, d, impls), fields, errs))
+                           validate_derive_fields(rd, d, derive_reach_of(rd, sg, d, impls), fields, errs))
 }
 
 # An impl of the derived protocol answers the derive. A core protocol's
 # derived body names its operation through the core home, so nothing else
 # does; any other protocol's names it bare, so an impl of every protocol
 # that picks the same generator answers too.
-fn derive_reach_of(ps: PScope, sg: ShapedGens, d: DeriveGen, impls: [ImplReach]) : ReachCx = match d {
+fn derive_reach_of(rd: ReachRead, sg: ShapedGens, d: DeriveGen, impls: [ImplReach]) : ReachCx = match d {
   DeriveGen(p, g) -> {
+    let ps = rd.ps
     let tab = ps_tab(ps)
+    let serves = (q) => psc_same(q, p) or (not proto_is(p, g) and gen_is(proto_gen(sg, q), g))
     ReachCx { impls: impls,
-              serves: (q) => psc_same(q, p) or (not proto_is(p, g) and gen_is(proto_gen(sg, q), g)),
+              serves: serves,
               same: (a, b) => refs_same(tab, a, b),
-              builtin: (h) => head_builtin_impl(g, h) }
+              builtin: (h) => head_builtin_impl(g, h) or (proto_is(p, g) and core_proto_same(g, CpEq) and head_plain_data_eq(rd, impls, serves, h)) }
   }
 }
 

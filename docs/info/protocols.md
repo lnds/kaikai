@@ -63,6 +63,20 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+## Equality and order without an impl
+
+A record or sum type is `Eq` when every field is, with no `impl` or
+`#[derive(Eq)]`: `fn same[T: Eq](a: T, b: T)` accepts it, and `==` and
+`!=` compare it field by field. A hand-written `impl Eq` overrides that
+for its type. A function is never `Eq`, so neither is a type that holds
+one: `f == f` and `same(rec_with_fn, rec_with_fn)` are compile errors
+unless the type has its own `impl Eq`.
+
+Pairs, triples and quads are ordered lexicographically when each
+element is `Ord`: `(1, "x") < (1, "y")`, and `sort` orders them. A
+record has no automatic order: `<` on one is a compile error unless it
+has an `impl Ord`.
+
 ## Derive
 
 Some protocols can be derived. The annotation is `#[derive(...)]`
