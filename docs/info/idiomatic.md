@@ -527,6 +527,15 @@ authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
 - a bare call whose result is dropped → `f(x) |> ignore`, or `let _ = f(x)`
 - `return expr` → the last expression of a block IS its value
 - `self.x` / `this.x` → no implicit receiver; pass the value explicitly
+- `xs.reverse()` / `s.trim()` method call → `xs |> list.reverse`,
+  `trim(s)`; the pipe is the one way to put the subject first
+- two statements on one line → separate them with `;`
+  (`{ log(x); f(x) }`); without it the second is a parse error
+- a `Mutable` cell shared with a `spawn`ed fiber → keep the state in an
+  actor and send it messages (`kai info actors`); a spawned thunk may
+  not perform `Mutable`
+- `s | (c => ...)` over a `String` → `chars(s) | (c => ...) |> from_chars`;
+  a `String` is not a collection the map pipe walks
 
 ## See also
 
