@@ -1157,20 +1157,46 @@ __attribute__((noinline)) static void kai_rc_settle(void) {
     if (!kai_rc_mt) kai_rc_hot = kai_rc_hot_st;
 }
 
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_rc_traffic_on;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_rc_traffic_on;
+#  endif
+#else
+static int kai_rc_traffic_on;
+#endif
+#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER)
+__attribute__((constructor(101))) static void kai_rc_traffic_init(void) {
+    kai_rc_traffic_on = getenv("KAI_TRACE_RC") != NULL;
+}
+#endif
+/* The ledger counters are read only by the exit reports, which run under
+ * KAI_TRACE_RC; outside a trace build they cost nothing unless that
+ * variable is set at startup. */
+#ifdef KAI_TRACE_RC
+#  define KAI_RC_LEDGER_ON() 1
+#else
+#  define KAI_RC_LEDGER_ON() __builtin_expect(kai_rc_traffic_on, 0)
+#endif
 static inline void kai_rc_count_alloc(int tag) {
+    if (!KAI_RC_LEDGER_ON()) return;
     if (kai_rc_mt) kai_rc_tls_alloc(tag); else kai_rc_hot_alloc(&kai_rc_hot_st, tag);
 }
 static inline void kai_rc_count_free(void) {
+    if (!KAI_RC_LEDGER_ON()) return;
     if (kai_rc_mt) kai_rc_tls_free();
     else { kai_rc_hot_st.free_total++; kai_rc_hot_st.live_now--; }
 }
 static inline void kai_rc_count_live_inc(void) {
+    if (!KAI_RC_LEDGER_ON()) return;
     if (kai_rc_mt) kai_rc_tls_live_inc(); else kai_rc_hot_live_inc(&kai_rc_hot_st);
 }
 static inline void kai_rc_count_live_sub(int64_t n) {
+    if (!KAI_RC_LEDGER_ON()) return;
     if (kai_rc_mt) kai_rc_tls_live_sub(n); else kai_rc_hot_st.live_now -= n;
 }
 static inline void kai_rc_count_reuse(void) {
+    if (!KAI_RC_LEDGER_ON()) return;
     if (kai_rc_mt) kai_rc_tls_reuse(); else kai_rc_hot_st.reuse_total++;
 }
 __attribute__((noinline))
@@ -1202,19 +1228,6 @@ KAI_RT_COUNTER(int64_t kai_rc_tok_null_mismatch, 0);
  * on it. */
 KAI_RT_ATOMIC_COUNTER(kai_rc_incref_total);
 KAI_RT_ATOMIC_COUNTER(kai_rc_decref_total);
-#if defined(KAI_SEPARATE_COMPILATION)
-extern int kai_rc_traffic_on;
-#  if defined(KAI_RUNTIME_OWNER)
-int kai_rc_traffic_on;
-#  endif
-#else
-static int kai_rc_traffic_on;
-#endif
-#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER)
-__attribute__((constructor)) static void kai_rc_traffic_init(void) {
-    kai_rc_traffic_on = getenv("KAI_TRACE_RC") != NULL;
-}
-#endif
 #define KAI_RC_TRAFFIC_INC(v) \
     do { if (__builtin_expect(kai_rc_traffic_on, 0)) KAI_CTR_INC(v); } while (0)
 
