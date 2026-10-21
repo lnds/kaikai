@@ -1375,7 +1375,7 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-`==` on two arrays compares their contents, like every other container.
+`==` on two arrays compares their contents, like every other container; `array.same(a, b)` tests identity.
 
 `Ref[T]` cells — prefix `&` makes one, prefix `@` dereferences
 (`@x.f.g` walks a field path), `r := v` writes, and a record field

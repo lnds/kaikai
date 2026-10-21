@@ -376,6 +376,7 @@ covers `list.*`. Listed here as shipped:
   the other. Seeds from the source's first element; empty source
   returns a length-0 array.
 - `array.each[a, e](xs: Array[a], f: (a) -> Unit / e) : Unit / e` — runs `f` in index order; pure read, so `Array` participates in `|!`. `map` / `flat_map` / `filter` are not exported: pipe over `array.to_list(a)` *(shipped)*.
+- `array.same[t](a: Array[t], b: Array[t]) : Bool` *(shipped)* — identity: true only for the same array. `==` on two arrays compares contents.
 
 The empty case is served by the `array_empty[a]() : Array[a]`
 core prim: `array_make` always demands an `init: T` to reify the
