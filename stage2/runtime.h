@@ -21781,11 +21781,33 @@ extern LLVMContextRef kai_llvm_ctx;
 KAI_LLVM_STATE LLVMContextRef kai_llvm_ctx = NULL;
 #endif
 
+/* The runtime bitcode a modular partition merges is parsed on a thread started
+ * at process load, while the front end runs, into a context the first
+ * partition module then adopts. State: 0 none, 1 parsing or parsed, 2 adopted. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern LLVMContextRef kai_spare_ctx;
+extern LLVMModuleRef kai_spare_mod;
+extern pthread_t kai_spare_th;
+extern int kai_spare_state;
+#endif
+#if KAI_LLVM_STATE_HERE
+KAI_LLVM_STATE LLVMContextRef kai_spare_ctx = NULL;
+KAI_LLVM_STATE LLVMModuleRef kai_spare_mod = NULL;
+KAI_LLVM_STATE pthread_t kai_spare_th;
+KAI_LLVM_STATE int kai_spare_state = 0;
+#endif
+
+static LLVMContextRef kai_llvm_spare_claim(void) {
+    pthread_join(kai_spare_th, NULL);
+    kai_spare_state = 2;
+    return kai_spare_ctx;
+}
+
 /* Create a fresh context + module named `name`. Returns the module
  * handle. `name` is a kaikai `String` (a boxed `KaiValue *`); read its
  * bytes with `->as.s.bytes` (the canonical String payload accessor). */
 static void *kai_llvm_module_new(KaiValue *name) {
-    kai_llvm_ctx = LLVMContextCreate();
+    kai_llvm_ctx = kai_spare_state == 1 ? kai_llvm_spare_claim() : LLVMContextCreate();
     LLVMModuleRef m = LLVMModuleCreateWithNameInContext(name->as.s.bytes, kai_llvm_ctx);
     if (name) kai_decref(name);
     return (void *) m;
@@ -23319,37 +23341,42 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         pre[pre_n++] = strdup(nm);
     }
 
-    LLVMMemoryBufferRef buf = NULL;
-    char *err = NULL;
-    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
-        fprintf(stderr, "kai: native runtime inline bitcode unreadable (%s): %s\n",
-                bc_path, err ? err : "?");
-        if (err) LLVMDisposeMessage(err);
-        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
-        free(pre);
-        return 1;
-    }
     LLVMContextRef ctx = LLVMGetModuleContext(mod);
     LLVMModuleRef src = NULL;
-    err = NULL;
-    if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
-        fprintf(stderr, "kai: native runtime inline bitcode parse failed (%s): %s\n",
-                bc_path, err ? err : "?");
-        if (err) LLVMDisposeMessage(err);
-        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
-        free(pre);
-        return 1;
+    char *err = NULL;
+    if (kai_spare_state == 2 && kai_spare_ctx == ctx && kai_spare_mod) {
+        src = kai_spare_mod;
+        kai_spare_mod = NULL;
+    } else {
+        LLVMMemoryBufferRef buf = NULL;
+        if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
+            fprintf(stderr, "kai: native runtime inline bitcode unreadable (%s): %s\n",
+                    bc_path, err ? err : "?");
+            if (err) LLVMDisposeMessage(err);
+            for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+            free(pre);
+            return 1;
+        }
+        err = NULL;
+        if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
+            fprintf(stderr, "kai: native runtime inline bitcode parse failed (%s): %s\n",
+                    bc_path, err ? err : "?");
+            if (err) LLVMDisposeMessage(err);
+            for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+            free(pre);
+            return 1;
+        }
+        if (kai_llvm_trim_runtime_bc(src)) {
+            fprintf(stderr, "kai: native runtime inline bitcode trim left a block in use (%s)\n", bc_path);
+            for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+            free(pre);
+            return 1;
+        }
     }
     {
         const char *dst_triple = LLVMGetTarget(mod);
         if (dst_triple) LLVMSetTarget(src, dst_triple);
         LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout(mod));
-    }
-    if (kai_llvm_trim_runtime_bc(src)) {
-        fprintf(stderr, "kai: native runtime inline bitcode trim left a block in use (%s)\n", bc_path);
-        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
-        free(pre);
-        return 1;
     }
     if (LLVMLinkModules2(mod, src)) {
         fprintf(stderr, "kai: native runtime inline bitcode link failed (%s)\n", bc_path);
@@ -23381,6 +23408,43 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
     free(pre);
     return 0;
 }
+
+#if KAI_LLVM_STATE_HERE
+static void *kai_spare_parse(void *arg) {
+    char *bc_path = (char *) arg;
+    LLVMMemoryBufferRef buf = NULL;
+    char *err = NULL;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
+        if (err) LLVMDisposeMessage(err);
+    } else if (LLVMParseIRInContext(kai_spare_ctx, buf, &kai_spare_mod, &err)) {
+        if (err) LLVMDisposeMessage(err);
+        kai_spare_mod = NULL;
+    } else if (kai_llvm_trim_runtime_bc(kai_spare_mod)) {
+        kai_spare_mod = NULL;
+    }
+    free(bc_path);
+    return NULL;
+}
+
+static void kai_spare_join_at_exit(void) {
+    if (kai_spare_state == 1) { pthread_join(kai_spare_th, NULL); kai_spare_state = 2; }
+}
+
+/* A native emit names the runtime bitcode in its environment; parsing it now
+ * takes the work off the path between the last pass and the object. */
+__attribute__((constructor)) static void kai_spare_boot(void) {
+    const char *bc = getenv("KAI_NATIVE_RUNTIME_INLINE_BC");
+    if (!bc || !bc[0]) return;
+    kai_spare_ctx = LLVMContextCreate();
+    if (pthread_create(&kai_spare_th, NULL, kai_spare_parse, strdup(bc)) != 0) {
+        LLVMContextDispose(kai_spare_ctx);
+        kai_spare_ctx = NULL;
+        return;
+    }
+    kai_spare_state = 1;
+    atexit(kai_spare_join_at_exit);
+}
+#endif
 
 /* Copy one function attribute (by name) from `src` onto `dst` if `dst` lacks it. */
 static void kai_llvm_copy_fn_str_attr(LLVMValueRef dst, LLVMValueRef src,
