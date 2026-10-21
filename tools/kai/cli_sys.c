@@ -510,14 +510,18 @@ static const uint32_t K[64] = {
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-static uint32_t sha_h[8];
-static unsigned char sha_block[64];
-static size_t sha_fill;
-static uint64_t sha_bits;
+typedef struct {
+    uint32_t h[8];
+    unsigned char block[64];
+    size_t fill;
+    uint64_t bits;
+    int done;
+    char hex[65];
+} Sha;
 
 #define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 
-static void sha_compress(const unsigned char *p) {
+static void sha_compress(Sha *s, const unsigned char *p) {
     uint32_t w[64], a, b, c, d, e, f, g, h;
     for (int i = 0; i < 16; i++)
         w[i] = (uint32_t) p[4 * i] << 24 | (uint32_t) p[4 * i + 1] << 16 | (uint32_t) p[4 * i + 2] << 8 | p[4 * i + 3];
@@ -526,58 +530,65 @@ static void sha_compress(const unsigned char *p) {
         uint32_t s1 = ROR(w[i - 2], 17) ^ ROR(w[i - 2], 19) ^ (w[i - 2] >> 10);
         w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
-    a = sha_h[0]; b = sha_h[1]; c = sha_h[2]; d = sha_h[3];
-    e = sha_h[4]; f = sha_h[5]; g = sha_h[6]; h = sha_h[7];
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
+    e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
     for (int i = 0; i < 64; i++) {
         uint32_t t1 = h + (ROR(e, 6) ^ ROR(e, 11) ^ ROR(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
         uint32_t t2 = (ROR(a, 2) ^ ROR(a, 13) ^ ROR(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
         h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
-    sha_h[0] += a; sha_h[1] += b; sha_h[2] += c; sha_h[3] += d;
-    sha_h[4] += e; sha_h[5] += f; sha_h[6] += g; sha_h[7] += h;
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
 }
 
-static void sha_feed(const unsigned char *p, size_t n) {
-    sha_bits += (uint64_t) n * 8;
+static void sha_feed(Sha *s, const unsigned char *p, size_t n) {
+    if (s->done) {
+        fputs("kai: SHA-256 stream fed after its digest was taken\n", stderr);
+        abort();
+    }
+    s->bits += (uint64_t) n * 8;
     while (n > 0) {
-        size_t take = 64 - sha_fill < n ? 64 - sha_fill : n;
-        memcpy(sha_block + sha_fill, p, take);
-        sha_fill += take; p += take; n -= take;
-        if (sha_fill == 64) { sha_compress(sha_block); sha_fill = 0; }
+        size_t take = 64 - s->fill < n ? 64 - s->fill : n;
+        memcpy(s->block + s->fill, p, take);
+        s->fill += take; p += take; n -= take;
+        if (s->fill == 64) { sha_compress(s, s->block); s->fill = 0; }
     }
 }
 
-void kaicli_sha_reset(void) {
+/* A digest owns its state and is never freed: the process is short-lived. */
+void *kaicli_sha_new(void) {
     static const uint32_t init[8] = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     };
-    memcpy(sha_h, init, sizeof(init));
-    sha_fill = 0;
-    sha_bits = 0;
+    Sha *s = calloc(1, sizeof(Sha));
+    if (!s) abort();
+    memcpy(s->h, init, sizeof(init));
+    return s;
 }
 
-void kaicli_sha_str(const char *s) { sha_feed((const unsigned char *) s, strlen(s)); }
+void kaicli_sha_str(void *h, const char *str) { sha_feed(h, (const unsigned char *) str, strlen(str)); }
 
 /* Feeds the file's bytes; false when it cannot be read. */
-int kaicli_sha_file(const char *path) {
+int kaicli_sha_file(void *h, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     unsigned char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) sha_feed(buf, n);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) sha_feed(h, buf, n);
     int ok = !ferror(f);
     fclose(f);
     return ok;
 }
 
-const char *kaicli_sha_hex(void) {
-    static char hex[65];
-    uint64_t bits = sha_bits;
+const char *kaicli_sha_hex(void *h) {
+    Sha *s = h;
+    uint64_t bits = s->bits;
     unsigned char pad = 0x80, zero = 0, len[8];
-    sha_feed(&pad, 1);
-    while (sha_fill != 56) sha_feed(&zero, 1);
+    sha_feed(s, &pad, 1);
+    while (s->fill != 56) sha_feed(s, &zero, 1);
     for (int i = 0; i < 8; i++) len[i] = (unsigned char) (bits >> (56 - 8 * i));
-    sha_feed(len, 8);
-    for (int i = 0; i < 8; i++) snprintf(hex + 8 * i, 9, "%08x", sha_h[i]);
-    return hex;
+    sha_feed(s, len, 8);
+    s->done = 1;
+    for (int i = 0; i < 8; i++) snprintf(s->hex + 8 * i, 9, "%08x", s->h[i]);
+    return s->hex;
 }

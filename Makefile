@@ -810,6 +810,7 @@ test-kai-cli: kaic2
 	@tests/bin_memo.sh
 	@tests/cache_trim.sh
 	@tests/header_digest.sh
+	@tests/sha_nested.sh
 	@tests/run_memo.sh
 	@tests/src_entry.sh
 	@tests/build_memo.sh
