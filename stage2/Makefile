@@ -11456,6 +11456,10 @@ test-native-1229-writeside: $(TARGET) bin-kai build
 test-build-modes: $(TARGET) bin-kai build
 	@../examples/build-modes/check.sh ../bin/kai build/build-modes-work
 
+# `kai build -o` creates the missing parent directory, or fails before compiling.
+test-build-out-dir: $(TARGET) bin-kai build
+	@../tools/test-build-out-dir.sh ../bin/kai
+
 # Native codegen quality. Pins the spill ratio in the rb-tree descent's hot
 # loop, the one signal that catches a register-allocation regression: such a
 # change keeps the program correct, the self-host byte-identical and
