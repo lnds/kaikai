@@ -332,6 +332,19 @@ test-cmodular-prune: kaic2
 	else set -- $(CMOD_PRUNE_PROGS); fi; \
 	./tools/cmodular-prune-diff.sh stage2/kaic2 stdlib examples/portfolio/portfolio.kai "$$@"
 
+# Core pruning must not change behaviour: every program compiles and runs
+# with the core pruned and against the whole core (KAI_CORE_PRUNE=off), and
+# the two must agree. `test-prune-differential` runs a fixed subset of the
+# generated demand-route pairs; `prune-differential` sweeps every example
+# and every pair on both backends.
+.PHONY: prune-differential
+test-prune-differential: kaic2 bin/kai
+	@./tools/prune-differential.sh combos-subset
+
+prune-differential: kaic2 bin/kai
+	@./tools/prune-differential.sh combos
+	@./tools/prune-differential.sh corpus
+
 test-symtab: kaic2
 	@./stage2/kaic2 --symtab-selftest
 
@@ -1530,6 +1543,7 @@ daily: tier1 daily-tail
 	@echo "daily OK — tier1 + C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
 daily-tail: selfhost stress-fixtures stress-nmodular-pool coverage-probe rc-budget test-binserialize-budget
+	-@$(MAKE) prune-differential
 	@echo "daily-tail OK — C selfhost + stress fixtures + native-modular pool stress + coverage probe + RC budget + BinSerialize budget"
 
 # The `tier1` prerequisites that no tier1-shard-N runs.
