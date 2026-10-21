@@ -821,8 +821,8 @@ KaiValue *kaix_deep_copy_out(KaiValue *v) {
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
 KaiValue *kaix_nil(void)                                  { return kai_nil(); }
-int       kaix_is_cons(KaiValue *v)                       { return kai_seq_norm(v) && v->tag == KAI_CONS; }
-int       kaix_is_nil(KaiValue *v)                        { return !kai_seq_norm(v) || v->tag == KAI_NIL; }
+__attribute__((always_inline)) int kaix_is_cons(KaiValue *v)                       { return kai_seq_norm(v) && v->tag == KAI_CONS; }
+__attribute__((always_inline)) int kaix_is_nil(KaiValue *v)                        { return !kai_seq_norm(v) || v->tag == KAI_NIL; }
 /* Boxed-Bool list-cell predicates for the in-process native walk's
  * KIR list-match decision tree. The walk lowers a `kai_is_cons_b` /
  * `kai_is_nil_b` prim through its uniform boxed-prim path (a
@@ -835,8 +835,8 @@ int       kaix_is_nil(KaiValue *v)                        { return !kai_seq_norm
  * range border: it rewrites a lazy KAI_RANGE into one real cell in
  * place, so the KProj slot reads that follow see cons fields, never
  * raw generator ints. */
-KaiValue *kaix_is_cons_b(KaiValue *v)                     { return kai_bool(kai_seq_norm(v) && v->tag == KAI_CONS); }
-KaiValue *kaix_is_nil_b(KaiValue *v)                      { return kai_bool(!kai_seq_norm(v) || v->tag == KAI_NIL); }
+__attribute__((always_inline)) KaiValue *kaix_is_cons_b(KaiValue *v)                     { return kai_bool(kai_seq_norm(v) && v->tag == KAI_CONS); }
+__attribute__((always_inline)) KaiValue *kaix_is_nil_b(KaiValue *v)                      { return kai_bool(!kai_seq_norm(v) || v->tag == KAI_NIL); }
 KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(kai_seq_norm(v)->as.cons.head); }
 KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(kai_seq_norm(v)->as.cons.tail); }
 
