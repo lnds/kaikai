@@ -5842,12 +5842,12 @@ test-m4c: $(TARGET) build
 	  && grep -q "_kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }
-	@grep -q "= kaiu_m4c_run_with__run_with__mono__Int__Int(" build/s2-m4c_run_with.c \
-	  && grep -q "= kaiu_m4c_run_with__run_with__mono__String__Int(" build/s2-m4c_run_with.c \
+	@grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.c \
+	  && grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_run_with__run_with__mono__String__Int\(" build/s2-m4c_run_with.c \
 	  && echo "m4c OK m4c_run_with C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_run_with — main still calls polymorphic kai_run_with"; exit 1; }
-	@grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.c \
-	  && grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.c \
+	@grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.c \
+	  && grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.c \
 	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls polymorphic kai_process_with_log"; exit 1; }
 	@grep -q "kaiu_m4c_flow_through__outer__mono__Int" build/s2-m4c_flow_through.c \
