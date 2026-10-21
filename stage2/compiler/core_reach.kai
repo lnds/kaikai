@@ -1,0 +1,179 @@
+#[doc("The reach of a program over the core by bare name: which core functions anything in it can call, so the others are not declared at all.")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.core_cut
+import compiler.core_refs
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.surface_lower
+import compiler.symtab
+import compiler.util
+import compiler.written
+
+type RSt = { seen: NameIndex[Bool], work: [String], nodes: NameIndex[Decl], tab: SymTab }
+
+#[doc("The core modules whose functions the compiler writes into a program by name: they are never left out.")]
+pub(pkg) fn reach_pinned_modules() : [String] = map([CmArray, CmVec, CmProtocols, CmLoop], core_module_name)
+
+#[doc("The names of the core functions the compiler writes into a program after its text is read.")]
+pub(pkg) fn reach_minted_names() : [String] = [sfl_concat_name(), ...map(core_fns_all(), core_fn_name)]
+
+#[doc("The module `d` is declared in, or none for a declaration that has no home.")]
+pub(pkg) fn reach_home(d: Decl) : Option[String] = match decl_transparent_inner(d) {
+  Some(inner) -> reach_home(inner)
+  None -> match d {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+    _ -> None
+  }
+}
+
+#[doc("The bare name of the function `d` declares.")]
+pub(pkg) fn reach_fn_name(tab: SymTab, d: Decl) : String = match decl_transparent_inner(d) {
+  Some(inner) -> reach_fn_name(tab, inner)
+  None -> match d {
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> written_text(sym_name(tab, fnid_sym(fid)))
+    _ -> ""
+  }
+}
+
+#[doc("The names the roots `roots` and the seeds `seeds` reach, through the bodies of `nodes`: a node's body is read only once its name is reached.")]
+pub(pkg) fn core_reach(tab: SymTab, roots: [Decl], nodes: [Decl], seeds: [String]) : NameIndex[Bool] = {
+  let ix = foldl(nodes, idx_empty(), (acc, d) => idx_prepend(acc, reach_fn_name(tab, d), d))
+  let st0 = RSt { seen: idx_empty(), work: [], nodes: ix, tab: tab }
+  let st1 = foldl(roots, foldl(seeds, st0, rc_name), (acc, d) => rc_decl(acc, d))
+  rc_drain(st1).seen
+}
+
+#[doc("True when `name` was reached.")]
+pub(pkg) fn reach_has(seen: NameIndex[Bool], name: String) : Bool = match idx_chain(seen, name) {
+  [] -> false
+  _  -> true
+}
+
+#[doc("The core functions a program cannot reach: their ids, and an index of them.")]
+pub(pkg) type CoreGone = { syms: [SymId], ix: NameIndex[SymId] }
+
+#[doc("The core functions that nothing in the program, the pinned modules or a compiler-written reference reaches. `core` and `surface` are the whole core and the whole program, `lib_mods` the imported modules whose functions the cut empties.")]
+pub(pkg) fn core_gone(pc: PreCut, tab: SymTab, core: [Decl], surface: [Decl], lib_mods: [String]) : CoreGone = {
+  let pinned = reach_pinned_modules()
+  let is_core_node = (d) => precut_droppable(pc, d) and not rc_in(pinned, reach_home(d))
+  let core_nodes = filter(core, is_core_node)
+  let lib_nodes = filter(precut_lib_fns(surface, lib_mods), (d) => precut_droppable(pc, d))
+  let node_ix = foldl(list_append(core_nodes, lib_nodes), idx_empty(), (acc, d) => idx_prepend_sym(acc, precut_sym(d), precut_sym(d)))
+  let is_node = (d) => match idx_chain_sym(node_ix, precut_sym(d)) {
+    [] -> false
+    _  -> true
+  }
+  let roots = list_append(filter(core, (d) => not is_node(d) and not rc_runner(d)), filter(surface, (d) => not is_node(d)))
+  let seen = core_reach(tab, roots, list_append(core_nodes, lib_nodes), reach_minted_names())
+  let gone = filter(core_nodes, (d) => not reach_has(seen, reach_fn_name(tab, d)))
+  let syms = map(gone, precut_sym)
+  CoreGone { syms: syms, ix: foldl(syms, idx_empty(), (acc, s) => idx_prepend_sym(acc, s, s)) }
+}
+
+#[doc("True when `g` leaves out the function `d` declares.")]
+pub(pkg) fn gone_has(g: CoreGone, d: Decl) : Bool = match idx_chain_sym(g.ix, precut_sym(d)) {
+  [] -> false
+  _  -> true
+}
+
+#[doc("True when `g` leaves out the function `s`.")]
+pub(pkg) fn gone_has_sym(g: CoreGone, s: SymId) : Bool = match idx_chain_sym(g.ix, s) {
+  [] -> false
+  _  -> true
+}
+
+fn rc_in(ms: [String], o: Option[String]) : Bool = match o {
+  Some(m) -> list_has(ms, m)
+  None    -> false
+}
+
+fn rc_runner(d: Decl) : Bool = match decl_transparent_inner(d) {
+  Some(inner) -> rc_runner(inner)
+  None -> match d {
+    DTest(_, _, _, _, _)     -> true
+    DBench(_, _, _, _, _)    -> true
+    DCheck(_, _, _, _, _, _) -> true
+    _ -> false
+  }
+}
+
+fn rc_name(st: RSt, n: String) : RSt =
+  if reach_has(st.seen, n) { st } else { RSt { ...st, seen: idx_prepend(st.seen, n, true), work: [n, ...st.work] } }
+
+fn rc_drain(st: RSt) : RSt = match st.work {
+  [] -> st
+  [n, ...rest] -> rc_drain(foldl(idx_chain(st.nodes, n), RSt { ...st, work: rest }, rc_decl))
+}
+
+fn rc_decl(st: RSt, d: Decl) : RSt =
+  rc_types(rc_exprs(st, if rc_is_type(d) { decl_exprs(d) } else { cut_decl_exprs(d) }), d)
+
+fn rc_is_type(d: Decl) : Bool = match decl_transparent_inner(d) {
+  Some(inner) -> rc_is_type(inner)
+  None -> match d {
+    DType(_, _, _, _, _, _, _, _) -> true
+    _ -> false
+  }
+}
+
+fn rc_exprs(st: RSt, es: [Expr]) : RSt = match es {
+  [] -> st
+  [e, ...rest] -> rc_exprs(rc_expr(st, e), rest)
+}
+
+fn rc_expr(st: RSt, e: Expr) : RSt = {
+  let here = match e.kind {
+    EName(w)       -> rc_name(st, rc_last(written_text(w)))
+    EModCall(_, n) -> rc_name(st, rc_last(written_text(n)))
+    EField(_, n)   -> rc_name(st, n)
+    _              -> st
+  }
+  rc_positions(here, xp_positions(e))
+}
+
+fn rc_positions(st: RSt, ps: [XPos]) : RSt = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> rc_positions(rc_expr(st, x), rest)
+}
+
+fn rc_last(s: String) : String = match index_of(s, ".") {
+  None    -> s
+  Some(_) -> match last(split(s, ".")) {
+    Some(x) -> x
+    None    -> s
+  }
+}
+
+fn rc_types(st: RSt, d: Decl) : RSt = match decl_transparent_inner(d) {
+  Some(inner) -> rc_types(st, inner)
+  None -> match d {
+    DFn(_, _, _, ps, ret, _, _, _, _, _) -> rc_opt_type(foldl(ps, st, (acc, p) => rc_opt_type(acc, p.ptype)), ret)
+    DConst(_, _, t, _, _, _, _) -> rc_type(st, t)
+    DType(_, _, _, body, _, _, _, _) -> match body {
+      TBAlias(t)       -> rc_type(st, t)
+      TBRecord(fs)     -> foldl(fs, st, (acc, f) => match f { FD(_, _, t, _) -> rc_type(acc, t) })
+      TBSum(vs)        -> foldl(vs, st, (acc, v) => match v { Var(_, ts) -> foldl(ts, acc, rc_type) })
+      TBEffectAlias(_) -> st
+    }
+    DImpl(_, _, _, subs, _, _, _, _) -> foldl(subs, st, rc_types)
+    _ -> st
+  }
+}
+
+fn rc_opt_type(st: RSt, o: Option[TypeExpr]) : RSt = match o {
+  Some(t) -> rc_type(st, t)
+  None    -> st
+}
+
+fn rc_type(st: RSt, t: TypeExpr) : RSt = match t.tkind {
+  TyName(_, args)   -> foldl(args, st, rc_type)
+  TyList(x)         -> rc_type(st, x)
+  TyFn(ps, r, _)    -> rc_type(foldl(ps, st, rc_type), r)
+  TyDim(x, _)       -> rc_type(st, x)
+  TyRefine(x, pred) -> rc_expr(rc_type(st, x), pred)
+  TyParam(_, args)  -> foldl(args, st, rc_type)
+  _                 -> st
+}
