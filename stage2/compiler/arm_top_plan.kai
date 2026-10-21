@@ -1,0 +1,108 @@
+#[doc("Which match arms capture their scrutinee's shell as a reuse token, and which TRMC steps may hand it on: one answer for both emitters.")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.ctor_ix
+import compiler.emit_shared_syms
+
+#[doc("The constructor an arm-top reuse arm consumes, its sub-patterns and slot kinds, the pointer binders it keeps, the scrutinee arity, and the pointer slots no binder takes.")]
+pub type ArmTopReuse = ArmTopReuse(SymId, [Pattern], [Int], [Binder], Int, [Int])
+
+#[doc("True iff some tail leaf of `body` is a TRMC modulo-cons step.")]
+pub fn body_has_trmc_step(body: Expr) : Bool = trmc_tail_steps(body) > 0
+
+#[doc("The arm-top plan of `pat -> body`: a variant arm whose body steps a TRMC spine and that binds a pointer child. The caller decides where a token may be taken (owned, unguarded, outside a region, no token already held).")]
+pub fn arm_top_reuse_plan(pat: Pattern, body: Expr, ix: CtorIx) : Option[ArmTopReuse] =
+  if not body_has_trmc_step(body) { None }
+  else {
+    match pat.pkind {
+      PVariant(r, subs) -> match ctor_ix_row(ix, ref_sym(r)) {
+        Some(EV(ar, tys, _, _)) ->
+          if ar != list_length(subs) { panic("arm-top reuse: a pattern's arity differs from its constructor row") }
+          else {
+            match arm_ptr_binders(subs, tys, 0) {
+              [] -> None
+              bs -> Some(ArmTopReuse(ref_sym(r), subs, tys, bs, ar, pat_unbound_ptr_slots(pat, ix)))
+            }
+          }
+        None -> panic("arm-top reuse: a pattern names a constructor with no row")
+      }
+      _ -> None
+    }
+  }
+
+#[doc("The binders of the boxed slots of a variant pattern: the children a shared shell must dup. Enum and scalar slots hold no reference.")]
+pub fn arm_ptr_binders(subs: [Pattern], tys: [Int], i: Int) : [Binder] = list_reverse(ptr_binders_loop(subs, tys, i, []))
+
+fn ptr_binders_loop(subs: [Pattern], tys: [Int], i: Int, acc: [Binder]) : [Binder] =
+  match subs {
+    [] -> acc
+    [sp, ...rest] -> match sp.pkind {
+      PBind(b) -> ptr_binders_loop(rest, tys, i + 1, if kind_at(tys, i) == 0 { [b, ...acc] } else { acc })
+      _        -> ptr_binders_loop(rest, tys, i + 1, acc)
+    }
+  }
+
+#[doc("""
+The pointer slots of a variant pattern that no direct binder takes: the
+children an arm-top reuse token must release when it steals a unique shell.
+A `PBind` slot moves into its binder; any other pointer sub-pattern (`_`, a
+nested pattern) leaves its child in the shell. Enum and scalar slots hold no
+reference.
+""")]
+pub fn pat_unbound_ptr_slots(p: Pattern, ix: CtorIx) : [Int] = match p.pkind {
+  PVariant(_, subs) -> match pat_slot_kinds(p, ix) {
+    Some(ks) -> pa_unbound_slots(subs, ks, 0)
+    None     -> []
+  }
+  _ -> []
+}
+
+#[doc("The slot kinds, as the cell stores them, of the constructor a variant pattern names; None for any other pattern or an unknown constructor.")]
+pub fn pat_slot_kinds(p: Pattern, ix: CtorIx) : Option[[Int]] = match p.pkind {
+  PVariant(r, subs) -> match ctor_ix_row(ix, ref_sym(r)) {
+    Some(EV(ar, ks, _, _)) -> if ar == list_length(subs) { Some(ks) } else { None }
+    None                      -> None
+  }
+  _ -> None
+}
+
+fn pa_unbound_slots(subs: [Pattern], ks: [Int], idx: Int) : [Int] = list_reverse(unbound_slots_loop(subs, ks, idx, []))
+
+fn unbound_slots_loop(subs: [Pattern], ks: [Int], idx: Int, acc: [Int]) : [Int] = match subs {
+  [] -> acc
+  [sp, ...rest] -> match sp.pkind {
+    PBind(_) -> unbound_slots_loop(rest, ks, idx + 1, acc)
+    _        -> unbound_slots_loop(rest, ks, idx + 1, if kind_at(ks, idx) == 0 { [idx, ...acc] } else { acc })
+  }
+}
+
+#[doc("Panics unless every TRMC step in `body` sits in tail position: the arm-top scan reads tails only.")]
+pub fn trmc_check_steps_in_tail(body: Expr) : Expr =
+  if trmc_steps_anywhere(body) == trmc_tail_steps(body) { body }
+  else { panic("trmc: a step sentinel outside tail position") }
+
+fn trmc_tail_steps(body: Expr) : Int = match body.kind {
+  ECall(f, _) -> match f.kind { EMark(MkTrmcStep(_)) -> 1  _ -> 0 }
+  EIf(_, t, oe) -> trmc_tail_steps(t) + match oe { None -> 0 Some(e) -> trmc_tail_steps(e) }
+  EMatch(_, arms) -> sum(map(arms, (a) => match a { Arm(_, _, b) -> trmc_tail_steps(b) }))
+  EBlock(_, ot) -> match ot { None -> 0 Some(e) -> trmc_tail_steps(e) }
+  _ -> 0
+}
+
+fn trmc_steps_anywhere(body: Expr) : Int = match body.kind {
+  ECall(f, xs) -> (match f.kind { EMark(MkTrmcStep(_)) -> 1  _ -> trmc_steps_anywhere(f) }) + sum(map(xs, trmc_steps_anywhere))
+  EIf(c, t, oe) -> trmc_steps_anywhere(c) + trmc_steps_anywhere(t) + match oe { None -> 0 Some(e) -> trmc_steps_anywhere(e) }
+  EMatch(s, arms) -> trmc_steps_anywhere(s) + sum(map(arms, (a) => match a { Arm(_, _, b) -> trmc_steps_anywhere(b) }))
+  EBlock(stmts, ot) -> sum(map(stmts, trmc_stmt_steps)) + match ot { None -> 0 Some(e) -> trmc_steps_anywhere(e) }
+  EBinop(_, l, r) -> trmc_steps_anywhere(l) + trmc_steps_anywhere(r)
+  EUnop(_, x) -> trmc_steps_anywhere(x)
+  EField(x, _) -> trmc_steps_anywhere(x)
+  _ -> 0
+}
+
+fn trmc_stmt_steps(s: Stmt) : Int = match s {
+  SLet(_, _, rhs) -> trmc_steps_anywhere(rhs)
+  SExprStmt(e)    -> trmc_steps_anywhere(e)
+  _               -> 0
+}

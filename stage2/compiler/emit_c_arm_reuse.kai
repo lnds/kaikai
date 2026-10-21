@@ -1,19 +1,18 @@
 # Arm-top, cons and variant reuse planning for match arms.
 
 import compiler.arm_release
+import compiler.arm_top_plan
 import compiler.ast
 import compiler.ast_ids
 import compiler.ast_ids
 import compiler.ctor_ix
 import compiler.emit_c_ctx
 import compiler.emit_c_pat
-import compiler.emit_c_tcrec_scan
 import compiler.emit_reuse
 import compiler.emit_seq
 import compiler.emit_shared_proto
 import compiler.emit_shared_syms
 import compiler.emit_tcrec_live
-import compiler.kir_lower_bind
 import compiler.local_names
 import compiler.modules_homes
 import compiler.perceus_reuse
@@ -101,22 +100,6 @@ pub(pkg) fn cons_slot_bind(src: String, head_pat: Pattern, slot: String, read: B
 # own bindings before the same body emit, so the body code is
 # duplicated textually but evaluated exactly once at runtime.
 
-# A pattern slot is a pointer child (needs dup in the shared branch) iff its
-# slot kind is boxed (0) and it has a live binder.
-# pub: shared with the LLVM backend's arm-top reuse (llvm-c-parity lane).
-pub fn arm_ptr_binders(subs: [Pattern], tys: [Int], i: Int) : [Binder] =
-  match subs {
-    [] -> []
-    [sp, ...rest] -> {
-      let k = kind_at(tys, i)
-      let here = match sp.pkind {
-        PBind(b) -> if k == 0 { [b] } else { [] }
-        _         -> []
-      }
-      list_append(here, arm_ptr_binders(rest, tys, i + 1))
-    }
-  }
-
 # Emit the kai_incref calls for the shared branch: dup each kept pointer
 # child so it has an owning ref independent of the (about-to-be-decref'd)
 # shell. Koka's `else { dup(l); dup(r); ...; decref(t); }`.
@@ -125,45 +108,6 @@ pub(pkg) fn arm_shared_dups(binders: [Binder], ns: LocalNames) : String =
     [] -> ""
     [b, ...rest] -> concat_all(["kai_incref(", c_local(ln_emitted(ns, b.id)), "); ", arm_shared_dups(rest, ns)])
   }
-
-# Arm-top reuse plan: the consumed PVariant's constructor, its payload tys,
-# the pointer-slot binders (dup in shared branch), and the scrutinee arity.
-pub(pkg) type ArmTopReuse = ArmTopReuse(SymId, [Pattern], [Int], [Binder], Int, [Int])
-
-fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] {
-  # The Koka borrow-bind + is_unique-gated dispose model coordinates the move
-  # of a deconstructed child: bind borrow (no incref); decide once at the arm
-  # top — unique → steal the shell as a reuse-token (children move raw);
-  # shared → dup kept children + non-recursive decref. The token is consumed
-  # by a downstream kai_variant_at (TRMC step) or freed (kai_reuse_free).
-  #
-  # Eligibility is the TRMC body (the shell-dispose machinery — acc_decl +
-  # the fn-wide `_arm_ru` slot — is wired only there) AND perceus having
-  # MOVED ≥1 ptr binder. Generalising the borrow model to *every*
-  # deconstructing arm is the right Koka shape (asu confirmed) but needs the
-  # acc_decl / `_arm_ru` plumbing lifted out of the TRMC-only path first; until
-  # then a non-TRMC arm keeps the legacy incref-bind path, and perceus must
-  # NOT mark its binders as moved (pcs_arm_eligible_for_move keeps the two in
-  # lock-step — moving a binder whose arm uses the legacy emit double-frees).
-  if not trmc_body_has_step(body) { None }
-  else {
-    match pat.pkind {
-      PVariant(r, subs) -> match pat_ctor_kinds(cx, r, list_length(subs)) {
-        Some(tys) ->
-          if list_length(tys) == list_length(subs) {
-            let ptr_binders = arm_ptr_binders(subs, tys, 0)
-            match ptr_binders {
-              [] -> None
-              _  -> Some(ArmTopReuse(ref_sym(r), subs, tys, ptr_binders, list_length(subs),
-                                     pat_unbound_ptr_slots(pat, cx.ctor_ix)))
-            }
-          } else { None }
-        None -> None
-      }
-      _ -> None
-    }
-  }
-}
 
 # Read perceus's signature directly from the AST: a ptr binder that
 # perceus MOVED appears in the body as a bare read in a transfer
@@ -631,8 +575,8 @@ fn rv_flat_arm(subs: [Pattern], cargs: [Expr], ctors: CtorIx) : Bool =
 
 # An arm nested in an arm-top body leaves the enclosing token in place: its
 # steps rebuild into that cell.
-pub(pkg) fn arm_top_reuse_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] =
-  if cx.in_region or arm_top_token_held(cx) { None } else { try_arm_top_reuse(pat, body, cx) }
+pub(pkg) fn arm_top_reuse_here(pat: Pattern, body: Expr, owned: Bool, cx: EmitCtx) : Option[ArmTopReuse] =
+  if not owned or cx.in_region or arm_top_token_held(cx) { None } else { arm_top_reuse_plan(pat, body, cx.ctor_ix) }
 
 fn arm_top_token_held(cx: EmitCtx) : Bool = match cx.reuse_donor { Some(_) -> true  None -> false }
 
