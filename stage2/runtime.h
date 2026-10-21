@@ -128,10 +128,6 @@
 #include <signal.h>
 #endif
 #include <stddef.h>
-/* The leak-site tracer extends the RC ledger, so it switches the ledger on. */
-#if defined(KAI_TRACE_RC_LEAKSITE) && !defined(KAI_TRACE_RC)
-#define KAI_TRACE_RC 1
-#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -549,22 +545,6 @@ static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
     kai_variant_to_head_len = len;
 }
 
-/* Sparse registration: `pairs` is (variant_tag, head_tag) flattened, n
- * total ints. Tags are name-keyed (sparse), so codegen cannot emit a
- * dense table; build it here sized to the max tag present. Unclaimed
- * slots stay 0 (KAI_HEAD_ANON). Called once at startup; the table is
- * intentionally immortal. */
-static void kai_register_variant_head_pairs(const int32_t *pairs, int32_t n) {
-    int32_t max_tag = 10;
-    int32_t i;
-    int32_t *tbl;
-    for (i = 0; i + 1 < n; i += 2) if (pairs[i] > max_tag) max_tag = pairs[i];
-    tbl = (int32_t *) calloc((size_t) max_tag + 1, sizeof(int32_t));
-    if (!tbl) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
-    for (i = 0; i + 1 < n; i += 2) tbl[pairs[i]] = pairs[i + 1];
-    kai_register_variant_heads(tbl, max_tag + 1);
-}
-
 /* Impl-table entry — emitted by codegen as a static const array, then
  * loaded into the runtime hashmap at startup by kai_register_impls. */
 typedef struct {
@@ -760,16 +740,6 @@ struct KaiValue {
      * (vanilla builds keep the original two-word header — runtime
      * layout is otherwise unchanged). */
     void   *alloc_site;
-#endif
-#ifdef KAI_TRACE_RC_LEAKSITE
-    /* Lane DIAG (#293) — kaikai-source attribution. Captured at
-     * kai_alloc as the value of `kai_current_scope_fn`, set by the
-     * stage-1 emitter at the top of every generated kaikai function
-     * via `kai_set_scope_fn(<name>)`. Pairs with `alloc_site`
-     * (return-address) to map every leaked chunk to the kaikai fn
-     * whose body emitted (or should have emitted) the matching
-     * decref. Only present under -DKAI_TRACE_RC_LEAKSITE=1. */
-    const char *scope_fn;
 #endif
     union {
         int      b;                                 /* KAI_BOOL */
@@ -1812,521 +1782,12 @@ static void kai_rc_site_register_once(void) {
  * real emit site. Vanilla builds drop the attribute (zero overhead). */
 #define KAI_RC_NOINLINE __attribute__((noinline))
 
-/* ---------- Lane DIAG (#293): per-leak-site attribution ----------
- *
- * Aim: map every leaked chunk back to the kaikai source function that
- * allocated it, so the fix lane (Lane FIX) can rank scope_fns by leak
- * volume and patch the missing decrefs in their emit shapes.
- *
- * Two pieces of state at alloc time:
- *  - `kai_current_scope_fn`: the kaikai fn currently executing,
- *    set by the emitter via `kai_set_scope_fn(<name>)` at the top
- *    of every generated body. Static (the kaic2 self-compile is
- *    single-threaded). Inherits from the caller for fns that don't
- *    yet carry the hook (dispatch from core / FFI), so the
- *    attribution remains stable across mixed call paths.
- *  - allocator tag (KAI_VARIANT, KAI_RECORD, …): captured from
- *    `kai_alloc_traced`'s `tag` parameter.
- *
- * Aggregation is keyed on `(scope_fn, tag)`. Per-chunk metadata stays
- * to one extra pointer (`scope_fn` field on KaiValue under
- * KAI_TRACE_RC_LEAKSITE); the agg table is a fixed open-addressed
- * hash sized at 8 K buckets — empirically the kaic2 self-compile
- * has ≤ ~600 unique kaikai fn names, so worst-case load factor is
- * ~8 % across (fn × 13 tags). */
-#ifdef KAI_TRACE_RC_LEAKSITE
-
-static KAI_TLS const char *kai_current_scope_fn = "<root>";
-
-static void kai_set_scope_fn(const char *name) {
-    kai_current_scope_fn = (name != NULL) ? name : "<root>";
-}
-
-/* The scope is restored on the way out: without it a leaf callee's name
- * stays current and the caller's later allocations are billed to the
- * leaf, which silently invents alloc sites and hides real ones. */
-typedef struct { const char *prev; } KaiScopeGuard;
-
-static KaiScopeGuard kai_scope_enter(const char *name) {
-    KaiScopeGuard g;
-    g.prev = kai_current_scope_fn;
-    kai_set_scope_fn(name);
-    return g;
-}
-
-static KaiValue *kai_scope_leave(KaiScopeGuard g, KaiValue *v) {
-    kai_current_scope_fn = g.prev;
-    return v;
-}
-
-#define KAI_LEAKSITE_BUCKETS 8192
-
-typedef struct {
-    const char *scope_fn;   /* NULL = empty bucket */
-    int32_t     tag;
-    int64_t     allocs;
-    int64_t     frees;
-} KaiLeakSite;
-
-static KAI_TLS KaiLeakSite kai_leaksites[KAI_LEAKSITE_BUCKETS];
-static KAI_TLS int         kai_leaksites_count = 0;
-static KAI_TLS int         kai_leaksites_full  = 0;
-
-static uint32_t kai_leaksite_hash(const char *scope, int32_t tag) {
-    uintptr_t x = (uintptr_t) scope;
-    x ^= (uintptr_t) ((uint32_t) tag * 0x9E3779B1u);
-    x ^= x >> 33;
-    x *= (uintptr_t) 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    return (uint32_t) (x & (KAI_LEAKSITE_BUCKETS - 1));
-}
-
-static KaiLeakSite *kai_leaksite_lookup(const char *scope, int32_t tag, int insert) {
-    if (scope == NULL) scope = "<unknown>";
-    uint32_t mask = KAI_LEAKSITE_BUCKETS - 1;
-    uint32_t h = kai_leaksite_hash(scope, tag);
-    for (uint32_t i = 0; i < KAI_LEAKSITE_BUCKETS; i++) {
-        uint32_t k = (h + i) & mask;
-        KaiLeakSite *b = &kai_leaksites[k];
-        if (b->scope_fn == scope && b->tag == tag) return b;
-        if (b->scope_fn == NULL) {
-            if (!insert) return NULL;
-            b->scope_fn = scope;
-            b->tag      = tag;
-            kai_leaksites_count++;
-            return b;
-        }
-    }
-    kai_leaksites_full = 1;
-    return NULL;
-}
-
-static void kai_leaksite_record_alloc(const char *scope, int32_t tag) {
-    KaiLeakSite *b = kai_leaksite_lookup(scope, tag, 1);
-    if (b) b->allocs++;
-}
-
-static void kai_leaksite_record_free(const char *scope, int32_t tag) {
-    KaiLeakSite *b = kai_leaksite_lookup(scope, tag, 0);
-    if (b) b->frees++;
-}
-
-static const char *kai_leaksite_alloc_fn(int32_t tag) {
-    switch (tag) {
-        case KAI_VARIANT: return "kai_variant";
-        case KAI_RECORD:  return "kai_record";
-        case KAI_CONS:    return "kai_cons";
-        case KAI_STR:     return "kai_str";
-        case KAI_INT:     return "kai_int";
-        case KAI_REAL:    return "kai_real";
-        case KAI_CHAR:    return "kai_char";
-        case KAI_CLOSURE: return "kai_closure";
-        case KAI_ARRAY:   return "kai_array";
-        case KAI_VEC:     return "kai_vec";
-        case KAI_BOOL:    return "kai_bool";
-        case KAI_UNIT:    return "kai_unit";
-        case KAI_NIL:     return "kai_nil";
-        case KAI_FIBER:   return "kai_fiber";
-        case KAI_PID:     return "kai_pid";
-        case KAI_BYTE:      return "kai_byte";
-        case KAI_INT32:     return "kai_int32";
-        case KAI_UINT32:    return "kai_uint32";
-        case KAI_UINT64:    return "kai_uint64";
-        case KAI_INT128:    return "kai_int128";
-        default:          return "kai_alloc";
-    }
-}
-
-static int kai_leaksite_cmp_leak(const void *a, const void *b) {
-    const KaiLeakSite *x = (const KaiLeakSite *) a;
-    const KaiLeakSite *y = (const KaiLeakSite *) b;
-    int64_t lx = x->allocs - x->frees;
-    int64_t ly = y->allocs - y->frees;
-    if (ly > lx) return 1;
-    if (ly < lx) return -1;
-    return 0;
-}
-
-static void kai_leaksite_report(void) {
-    if (getenv("KAI_TRACE_RC_QUIET")) return;
-    if (kai_leaksites_count == 0) return;
-
-    int top_n = 20;
-    const char *e = getenv("KAI_TRACE_RC_LEAKSITE_TOP");
-    if (e && e[0]) {
-        int n = atoi(e);
-        if (n > 0) top_n = n;
-    }
-
-    KaiLeakSite *flat = (KaiLeakSite *) malloc(
-        (size_t) kai_leaksites_count * sizeof(KaiLeakSite));
-    if (!flat) return;
-    int n = 0;
-    int64_t total_leak = 0;
-    int64_t per_tag_leak[16] = {0};
-    for (int i = 0; i < KAI_LEAKSITE_BUCKETS; i++) {
-        if (kai_leaksites[i].scope_fn != NULL) {
-            flat[n++] = kai_leaksites[i];
-            int64_t live = kai_leaksites[i].allocs - kai_leaksites[i].frees;
-            if (live > 0) {
-                total_leak += live;
-                int t = kai_leaksites[i].tag;
-                if (t >= 0 && t < 16) per_tag_leak[t] += live;
-            }
-        }
-    }
-    qsort(flat, (size_t) n, sizeof(KaiLeakSite), kai_leaksite_cmp_leak);
-
-    int limit = top_n < n ? top_n : n;
-    fprintf(stderr,
-        "[KAI_TRACE_RC_LEAKSITE] top sites by leak (showing %d of %d distinct (scope_fn,tag); total_leak=%lld%s)\n",
-        limit, n, (long long) total_leak,
-        kai_leaksites_full ? "; TABLE SATURATED" : "");
-    fprintf(stderr,
-        "[KAI_TRACE_RC_LEAKSITE] columns: rank | alloc_fn | scope_fn | allocs | frees | leak | leak%% | share%%\n");
-    for (int i = 0; i < limit; i++) {
-        KaiLeakSite *s = &flat[i];
-        int64_t live = s->allocs - s->frees;
-        double pct = s->allocs > 0
-            ? (100.0 * (double) live / (double) s->allocs) : 0.0;
-        double share = total_leak > 0
-            ? (100.0 * (double) live / (double) total_leak) : 0.0;
-        fprintf(stderr,
-            "[KAI_TRACE_RC_LEAKSITE] %2d | %-11s | %-40s | %10lld | %10lld | %10lld | %5.1f | %5.1f\n",
-            i + 1,
-            kai_leaksite_alloc_fn(s->tag),
-            s->scope_fn,
-            (long long) s->allocs,
-            (long long) s->frees,
-            (long long) live,
-            pct, share);
-    }
-    /* Per-tag totals so checkpoint 2 (sum-by-alloc_fn vs per-tag totals)
-     * can be verified at a glance from the same dump. */
-    fprintf(stderr,
-        "[KAI_TRACE_RC_LEAKSITE] per-tag leak totals (sum across all scope_fns):\n");
-    for (int t = 0; t < 16; t++) {
-        if (per_tag_leak[t] != 0) {
-            fprintf(stderr,
-                "[KAI_TRACE_RC_LEAKSITE]   tag=%-7s leak=%lld\n",
-                kai_rc_tag_name(t), (long long) per_tag_leak[t]);
-        }
-    }
-    free(flat);
-}
-
-static KAI_TLS int kai_leaksite_registered = 0;
-static void kai_leaksite_register_once(void) {
-    if (kai_leaksite_registered) return;
-    kai_leaksite_registered = 1;
-    atexit(kai_leaksite_report);
-}
-
-#define KAI_SCOPE_LEAVE(v) kai_scope_leave(_kai_sg, (v))
-
-#endif /* KAI_TRACE_RC_LEAKSITE */
-
 #endif /* KAI_TRACE_RC */
-
-#ifndef KAI_SCOPE_LEAVE
-#define KAI_SCOPE_LEAVE(v) (v)
-#endif
 
 #ifndef KAI_TRACE_RC
 #define KAI_RC_NOINLINE
 #endif
 
-/* ---------- KAI_PROFILE_RC — per-category wall breakdown (lane #426)
- *
- * Independent of KAI_TRACE_RC. Times the four hot RC functions with
- * `clock_gettime(CLOCK_MONOTONIC)` and prints a per-category summary
- * at exit. Used to attribute the 16× C wall on the RB-tree benchmark
- * (docs/benchmarks/rb_tree_2026-05-09.md) to alloc / free / non-free
- * RC traffic, so the team can scope Phase 4 (variant-field unboxing)
- * vs drop-specialisation correctly.
- *
- * Build with `-DKAI_PROFILE_RC=1` to compile the wrappers in. Output
- * gates on env var KAI_PROFILE_RC=1 at run time so a single binary
- * can be timed with and without the report. Vanilla builds compile
- * to empty hooks and add zero overhead.
- *
- * Categories:
- *   - alloc    — time inside `kai_alloc` (the leaf calloc + bookkeep).
- *   - free     — time inside `kai_free_value` (the actual free + the
- *                cascading decrefs on contained children).
- *   - decref   — time inside `kai_decref` for every call that reaches
- *                the rc-- path (skips NULL and singleton early exits).
- *                Includes time spent calling `kai_free_value`; subtract
- *                the free total to get pure non-free RC traffic.
- *   - incref   — time inside `kai_incref` for every call that reaches
- *                the rc++ path (skips NULL and singleton early exits).
- *
- * clock_gettime(CLOCK_MONOTONIC) costs ~30 ns per call on macOS — at
- * ~25 M decrefs the instrumentation inflates the wall by ~1.5 s on
- * the RB-tree benchmark. Per-category PROPORTIONS remain robust;
- * absolute milliseconds under -DKAI_PROFILE_RC are not directly
- * comparable to the un-instrumented wall. The exit report prints the
- * instrumented wall alongside the categories so the gap is visible.
- *
- * Match dispatch is NOT a separate category — pattern test and
- * field-extract are emitted inline by the codegen (see
- * `_scr->variant_tag` reads in compiler-emitted C), so there
- * is no central function to wrap. It folds into the un-attributed
- * "other" bucket alongside everything else (calls, arithmetic,
- * stack management).
- */
-#ifdef KAI_PROFILE_RC
-#include <time.h>
-
-static KAI_TLS int64_t kai_prof_alloc_ns   = 0;
-static KAI_TLS int64_t kai_prof_free_ns    = 0;
-static KAI_TLS int64_t kai_prof_incref_ns  = 0;
-static KAI_TLS int64_t kai_prof_decref_ns  = 0;
-static KAI_TLS int64_t kai_prof_alloc_n    = 0;
-static KAI_TLS int64_t kai_prof_free_n     = 0;
-static KAI_TLS int64_t kai_prof_incref_n   = 0;
-static KAI_TLS int64_t kai_prof_decref_n   = 0;
-static KAI_TLS int64_t kai_prof_decref_to_zero_n = 0;
-static KAI_TLS struct timespec kai_prof_t0;
-static int kai_prof_init_done = 0;
-static int kai_prof_enabled = 0;
-
-/* Exclusive-time stack. The four hot RC functions call each other
- * (kai_decref → kai_free_value → kai_decref → ...). Naive timing
- * double-counts nested time. To get exclusive (self-only) time per
- * category, every active call records its start_ns and accumulates
- * the gross duration of any child instrumented call into a `child_ns`
- * slot; on exit, exclusive = (now - start) - child_ns is added to the
- * category counter, and gross time is bubbled to the parent's slot.
- *
- * Stack depth 32 is overkill — the deepest realistic chain is decref
- * → free_value → decref → free_value → ... bounded by tree depth (~30
- * for 1M nodes). Static fixed array; saturates on overflow (very
- * defensively — if it ever fires we silently mis-attribute, no crash). */
-#define KAI_PROF_STACK_CAP 64
-typedef struct {
-    int64_t start_ns;
-    int64_t child_ns;
-} KaiProfFrame;
-static KAI_TLS KaiProfFrame kai_prof_stack[KAI_PROF_STACK_CAP];
-static KAI_TLS int kai_prof_sp = 0;
-
-static inline int64_t kai_prof_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
-}
-
-static inline int kai_prof_push(void) {
-    if (kai_prof_sp >= KAI_PROF_STACK_CAP) return -1;  /* saturate */
-    int idx = kai_prof_sp++;
-    kai_prof_stack[idx].start_ns = kai_prof_now_ns();
-    kai_prof_stack[idx].child_ns = 0;
-    return idx;
-}
-
-static inline int64_t kai_prof_pop_exclusive(int idx) {
-    if (idx < 0) return 0;
-    int64_t end = kai_prof_now_ns();
-    int64_t gross = end - kai_prof_stack[idx].start_ns;
-    int64_t self  = gross - kai_prof_stack[idx].child_ns;
-    if (self < 0) self = 0;  /* clock noise can produce tiny negatives */
-    kai_prof_sp = idx;  /* unwind any deeper saturated frames defensively */
-    /* Bubble gross time to parent so its exclusive subtraction works. */
-    if (idx > 0) kai_prof_stack[idx - 1].child_ns += gross;
-    return self;
-}
-
-static void kai_prof_report(void) {
-    if (!getenv("KAI_PROFILE_RC")) return;
-    struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    int64_t wall_ns =
-        ((int64_t) t1.tv_sec - (int64_t) kai_prof_t0.tv_sec) * 1000000000LL
-      + ((int64_t) t1.tv_nsec - (int64_t) kai_prof_t0.tv_nsec);
-    int64_t alloc_ns  = kai_prof_alloc_ns;
-    int64_t free_ns   = kai_prof_free_ns;
-    int64_t incref_ns = kai_prof_incref_ns;
-    int64_t decref_ns = kai_prof_decref_ns;
-    /* Categories are exclusive (self-only) — no overlap. */
-    int64_t rc_traffic_ns = incref_ns + decref_ns;
-    int64_t accounted_ns  = alloc_ns + free_ns + rc_traffic_ns;
-    int64_t other_ns      = wall_ns - accounted_ns;
-    fprintf(stderr,
-        "[KAI_PROFILE_RC] wall_ms=%lld alloc_ms=%lld free_ms=%lld "
-        "rc_traffic_ms=%lld other_ms=%lld\n",
-        (long long) (wall_ns / 1000000),
-        (long long) (alloc_ns / 1000000),
-        (long long) (free_ns  / 1000000),
-        (long long) (rc_traffic_ns / 1000000),
-        (long long) (other_ns / 1000000));
-    fprintf(stderr,
-        "[KAI_PROFILE_RC] decref_ms=%lld (self) incref_ms=%lld (self)\n",
-        (long long) (decref_ns / 1000000),
-        (long long) (incref_ns / 1000000));
-    fprintf(stderr,
-        "[KAI_PROFILE_RC] calls alloc=%lld free=%lld incref=%lld "
-        "decref=%lld decref_to_zero=%lld\n",
-        (long long) kai_prof_alloc_n,
-        (long long) kai_prof_free_n,
-        (long long) kai_prof_incref_n,
-        (long long) kai_prof_decref_n,
-        (long long) kai_prof_decref_to_zero_n);
-    if (wall_ns > 0) {
-        fprintf(stderr,
-            "[KAI_PROFILE_RC] share alloc=%.1f%% free=%.1f%% "
-            "rc_traffic=%.1f%% other=%.1f%%\n",
-            100.0 * alloc_ns / wall_ns,
-            100.0 * free_ns / wall_ns,
-            100.0 * rc_traffic_ns / wall_ns,
-            100.0 * other_ns / wall_ns);
-    }
-}
-
-static void kai_prof_init(void) {
-    if (kai_prof_init_done) return;
-    kai_prof_init_done = 1;
-    const char *e = getenv("KAI_PROFILE_RC");
-    kai_prof_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
-    if (!kai_prof_enabled) return;
-    clock_gettime(CLOCK_MONOTONIC, &kai_prof_t0);
-    atexit(kai_prof_report);
-}
-
-#define KAI_PROF_ENTER()           \
-    int _kai_prof_idx = -1;        \
-    do {                           \
-        if (!kai_prof_init_done) kai_prof_init(); \
-        if (kai_prof_enabled) _kai_prof_idx = kai_prof_push(); \
-    } while (0)
-
-#define KAI_PROF_EXIT(category)                                              \
-    do {                                                                     \
-        if (kai_prof_enabled) {                                              \
-            kai_prof_##category##_ns += kai_prof_pop_exclusive(_kai_prof_idx); \
-            kai_prof_##category##_n++;                                       \
-        }                                                                    \
-    } while (0)
-
-#else /* !KAI_PROFILE_RC */
-
-#define KAI_PROF_ENTER()        ((void) 0)
-#define KAI_PROF_EXIT(category) ((void) 0)
-
-#endif /* KAI_PROFILE_RC */
-
-/* ---------- variant_name histogram (issue #300, lane #297/#298 validation)
- *
- * Independent of KAI_TRACE_RC. Counts variant alloc/free traffic keyed on
- * the `variant_name` string-literal pointer (stable across runs, immune to
- * the tail-call ABI bug that contaminates address-keyed attribution).
- *
- * Opt-in: build with `-DKAI_TRACE_VAR_NAMES=1`. Vanilla builds compile to
- * empty hooks; emitted IR (and selfhost byte-identity) is unchanged.
- *
- * Output: at exit a destructor dumps `[VAR_NAME] <name> allocs=A frees=F
- * leak=A-F` lines sorted by leak desc to stderr. Suppressed by
- * KAI_TRACE_RC_QUIET=1 (shared with the address-keyed tracer).
- */
-#ifdef KAI_TRACE_VAR_NAMES
-
-#define KAI_VAR_NAME_BUCKETS 4096
-
-typedef struct {
-    const char *name;
-    int64_t allocs;       /* invocation count: every kai_variant_u(_, name, ...) call */
-    int64_t real_allocs;  /* physical allocs: invocations that miss singleton/immortal cache */
-    int64_t frees;
-} KaiVarNameBucket;
-
-static KAI_TLS KaiVarNameBucket kai_var_names[KAI_VAR_NAME_BUCKETS];
-static KAI_TLS int kai_var_names_count;
-
-static KaiVarNameBucket *kai_var_name_lookup(const char *name) {
-    if (name == NULL) return NULL;
-    uintptr_t k = (uintptr_t) name;
-    uint32_t h = (uint32_t) ((k ^ (k >> 16)) * 0x9e3779b1u);
-    for (int probe = 0; probe < KAI_VAR_NAME_BUCKETS; ++probe) {
-        int i = (int) ((h + probe) & (KAI_VAR_NAME_BUCKETS - 1));
-        if (kai_var_names[i].name == NULL) {
-            kai_var_names[i].name = name;
-            kai_var_names_count++;
-            return &kai_var_names[i];
-        }
-        if (kai_var_names[i].name == name) return &kai_var_names[i];
-    }
-    return NULL; /* table full — silently drop */
-}
-
-static void kai_var_name_record_alloc(const char *name) {
-    KaiVarNameBucket *b = kai_var_name_lookup(name);
-    if (b) b->allocs++;
-}
-
-static void kai_var_name_record_real_alloc(const char *name) {
-    KaiVarNameBucket *b = kai_var_name_lookup(name);
-    if (b) b->real_allocs++;
-}
-
-static void kai_var_name_record_free(const char *name) {
-    KaiVarNameBucket *b = kai_var_name_lookup(name);
-    if (b) b->frees++;
-}
-
-static int kai_var_name_cmp_leak_desc(const void *a, const void *b) {
-    const KaiVarNameBucket *x = (const KaiVarNameBucket *) a;
-    const KaiVarNameBucket *y = (const KaiVarNameBucket *) b;
-    int64_t lx = x->real_allocs - x->frees;
-    int64_t ly = y->real_allocs - y->frees;
-    if (ly != lx) return (ly > lx) - (ly < lx);
-    return (y->real_allocs > x->real_allocs) - (y->real_allocs < x->real_allocs);
-}
-
-__attribute__((destructor))
-static void kai_var_name_report_at_exit(void) {
-    if (getenv("KAI_TRACE_RC_QUIET")) return;
-    KaiVarNameBucket snapshot[KAI_VAR_NAME_BUCKETS];
-    int n = 0;
-    for (int i = 0; i < KAI_VAR_NAME_BUCKETS; ++i) {
-        if (kai_var_names[i].name != NULL) snapshot[n++] = kai_var_names[i];
-    }
-    if (n == 0) return;
-    qsort(snapshot, (size_t) n, sizeof(snapshot[0]), kai_var_name_cmp_leak_desc);
-    int64_t total_invs = 0, total_real = 0, total_frees = 0;
-    for (int i = 0; i < n; ++i) {
-        total_invs += snapshot[i].allocs;
-        total_real += snapshot[i].real_allocs;
-        total_frees += snapshot[i].frees;
-    }
-    fprintf(stderr,
-        "[VAR_NAME] total distinct=%d invocations=%lld real_allocs=%lld frees=%lld leak=%lld\n",
-        n, (long long) total_invs, (long long) total_real,
-        (long long) total_frees, (long long) (total_real - total_frees));
-    fprintf(stderr,
-        "[VAR_NAME] columns: name | invocations | real_allocs | frees | leak\n");
-    for (int i = 0; i < n; ++i) {
-        int64_t leak = snapshot[i].real_allocs - snapshot[i].frees;
-        fprintf(stderr,
-            "[VAR_NAME] %-24s inv=%-12lld real=%-10lld frees=%-10lld leak=%lld\n",
-            snapshot[i].name,
-            (long long) snapshot[i].allocs,
-            (long long) snapshot[i].real_allocs,
-            (long long) snapshot[i].frees,
-            (long long) leak);
-    }
-}
-
-#define KAI_VAR_NAME_ALLOC(name)      kai_var_name_record_alloc(name)
-#define KAI_VAR_NAME_REAL_ALLOC(name) kai_var_name_record_real_alloc(name)
-#define KAI_VAR_NAME_FREE(name)       kai_var_name_record_free(name)
-
-#else /* !KAI_TRACE_VAR_NAMES */
-
-#define KAI_VAR_NAME_ALLOC(name)      ((void) 0)
-#define KAI_VAR_NAME_REAL_ALLOC(name) ((void) 0)
-#define KAI_VAR_NAME_FREE(name)       ((void) 0)
-
-#endif /* KAI_TRACE_VAR_NAMES */
 
 /* A constructor's name and per-slot kind bits live in a process-wide
  * table indexed by tag, not in the node. A tag is recorded the first time
@@ -2474,14 +1935,6 @@ static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
 }
 
 #ifdef KAI_TRACE_RC
-/* Under trace/profile the cell + slot free-lists are disabled (they
- * would perturb leak attribution and poisoning). Provide malloc-only
- * slot helpers here so the variant constructors below link in this
- * mode too — the pooled versions live in the #else branch. */
-static KaiVarSlot *kai_slots_alloc(int n) {
-    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
-}
-static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
 static void kai_slab_register_teardown(void) {}
 static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
 #else
@@ -2493,12 +1946,12 @@ static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
  * constructor of the same size, WITHOUT any compiler-level token
  * threading. Bounded so a transient spike does not pin memory forever.
  *
- * Disabled under KAI_TRACE_RC / KAI_PROFILE_RC: those modes poison freed
- * cells and rely on exact malloc/free pairing for leak attribution, so
- * recycling would corrupt their bookkeeping. The free-list is a pure
+ * Disabled under KAI_TRACE_RC: that mode poisons freed
+ * cells and relies on exact malloc/free pairing for leak attribution, so
+ * recycling would corrupt its bookkeeping. The free-list is a pure
  * production-path allocator optimisation — RC semantics and emitted code
  * are byte-identical; only the malloc/free traffic changes. */
-#if !defined(KAI_TRACE_RC) && !defined(KAI_PROFILE_RC) && !defined(KAI_NO_CELL_POOL)
+#if !defined(KAI_TRACE_RC) && !defined(KAI_NO_CELL_POOL)
 #define KAI_CELL_POOL_ACTIVE 1
 /* Cap sized for the functional-rebuild working set. The rb-tree churns
  * a ~1M-cell live set with a deep free/realloc cycle; a cap below the
@@ -2529,29 +1982,6 @@ KAI_TLS int kai_cell_pool_n = 0;
 #else
 static KAI_TLS KaiValue **kai_cell_pool = NULL;
 static KAI_TLS int kai_cell_pool_n = 0;
-#endif
-
-/* Companion free-list for the variant `slots[]` arrays, keyed by arity
- * (the dominant per-node malloc alongside the cell header). Arity 1..8
- * covers every variant the functional rebuild churns; larger arities
- * fall through to malloc/free. Sized to match the cell pool's working
- * set so slot reuse does not become the spill bottleneck. */
-#define KAI_SLOT_POOL_MAXN 8
-#define KAI_SLOT_POOL_CAP  1048576
-/* Per-arity free-list. TLS holds only (MAXN+1) pointers; each arity's
- * CAP-entry backing store is calloc'd lazily on first push of that arity
- * (kai_slot_pool_ensure). Restores the lazy footprint the huge
- * `_Thread_local` 2D array destroyed — see the cell-pool note above. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
-extern KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
-KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
-#  endif
-#else
-static KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
-static KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
 #endif
 
 /* FAM lane: free-list for whole variant BLOCKS (header + n inline slots
@@ -2587,12 +2017,6 @@ static inline int kai_cell_pool_ensure(void) {
         kai_cell_pool = (KaiValue **) calloc(KAI_CELL_POOL_CAP, sizeof(KaiValue *));
     }
     return kai_cell_pool != NULL;
-}
-static inline int kai_slot_pool_ensure(int n) {
-    if (!kai_slot_pool[n]) {
-        kai_slot_pool[n] = (KaiVarSlot **) calloc(KAI_SLOT_POOL_CAP, sizeof(KaiVarSlot *));
-    }
-    return kai_slot_pool[n] != NULL;
 }
 
 /* Free-list pool ops routed through noinline accessors: the pool base and
@@ -2731,37 +2155,12 @@ KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
     return p;
 }
 
-static KaiVarSlot *kai_slots_alloc(int n) {
-#ifndef KAI_NO_SLOT_POOL
-    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] > 0) {
-        return kai_slot_pool[n][--kai_slot_pool_n[n]];
-    }
-#endif
-    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
-}
-
-static void kai_slots_free(KaiVarSlot *slots, int n) {
-    if (slots == NULL) return;
-#ifndef KAI_NO_SLOT_POOL
-    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] < KAI_SLOT_POOL_CAP
-        && kai_slot_pool_ensure(n)) {
-        kai_slot_pool[n][kai_slot_pool_n[n]++] = slots;
-        return;
-    }
-#endif
-    free(slots);
-}
 #else
-static KaiVarSlot *kai_slots_alloc(int n) {
-    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
-}
-static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
 static void kai_slab_register_teardown(void) {}
 #endif
 
 KAI_RT_SHARED KaiValue *kai_alloc(KaiTag tag) {
 #endif
-    KAI_PROF_ENTER();
 #ifdef KAI_CELL_POOL_ACTIVE
     KaiValue *v = kai_cell_pool_pop();
     if (v) {
@@ -2787,12 +2186,6 @@ KAI_RT_SHARED KaiValue *kai_alloc(KaiTag tag) {
     kai_rc_site_register_once();
     kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) tag);
 #endif
-#ifdef KAI_TRACE_RC_LEAKSITE
-    v->scope_fn = kai_current_scope_fn;
-    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) tag);
-    kai_leaksite_register_once();
-#endif
-    KAI_PROF_EXIT(alloc);
     return v;
 }
 
@@ -2836,7 +2229,6 @@ static KaiValue *kai_alloc_var_traced(int n, void *site) {
 #else
 static KaiValue *kai_alloc_var(int n) {
 #endif
-    KAI_PROF_ENTER();
     KaiValue *v;
     size_t bsz = kai_var_block_size(n);
 #ifdef KAI_CELL_POOL_ACTIVE
@@ -2848,7 +2240,7 @@ static KaiValue *kai_alloc_var(int n) {
         memset(v, 0, bsz);                 /* slab is uninit; this is the calloc-equivalent */
     }
 #else
-    /* No cell pool (KAI_TRACE_RC / KAI_PROFILE_RC / KAI_NO_CELL_POOL):
+    /* No cell pool (KAI_TRACE_RC / KAI_NO_CELL_POOL):
      * the slab allocator lives inside the cell-pool block, so fall back
      * to a plain libc allocation. kai_var_block_free's matching #else
      * calls free() on it. */
@@ -2865,12 +2257,6 @@ static KaiValue *kai_alloc_var(int n) {
     kai_rc_site_register_once();
     kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_VARIANT);
 #endif
-#ifdef KAI_TRACE_RC_LEAKSITE
-    v->scope_fn = kai_current_scope_fn;
-    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) KAI_VARIANT);
-    kai_leaksite_register_once();
-#endif
-    KAI_PROF_EXIT(alloc);
     return v;
 }
 #ifdef KAI_TRACE_RC
@@ -2889,14 +2275,13 @@ static KaiValue *kai_alloc_var(int n) {
  *
  * The header fields the generic runtime reads (rc, tag, var_n_args,
  * variant_tag) are all written here or by the caller, so none rely on
- * the zero. Under tracing the alloc_site / scope_fn fields are written
+ * the zero. Under tracing the alloc_site field is written
  * explicitly too. */
 #ifdef KAI_TRACE_RC
 static KaiValue *kai_alloc_var_nz_traced(int n, void *site) {
 #else
 static KaiValue *kai_alloc_var_nz(int n) {
 #endif
-    KAI_PROF_ENTER();
     KaiValue *v;
 #ifdef KAI_CELL_POOL_ACTIVE
     v = kai_var_block_pool_pop(n);
@@ -2919,12 +2304,6 @@ static KaiValue *kai_alloc_var_nz(int n) {
     kai_rc_site_register_once();
     kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_VARIANT);
 #endif
-#ifdef KAI_TRACE_RC_LEAKSITE
-    v->scope_fn = kai_current_scope_fn;
-    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) KAI_VARIANT);
-    kai_leaksite_register_once();
-#endif
-    KAI_PROF_EXIT(alloc);
     return v;
 }
 #ifdef KAI_TRACE_RC
@@ -2933,7 +2312,7 @@ static KaiValue *kai_alloc_var_nz(int n) {
 
 /* FAM lane: return a variant block (header + inline slots) to its
  * per-arity free-list pool. Used by kai_free_value's VARIANT case in
- * place of (kai_slots_free + cell-pool return).
+ * place of a cell-pool return.
  *
  * Slab-only invariant: every block lives inside a malloc'd slab
  * (kai_slab_alloc), so it is NOT a standalone malloc'd address — calling
@@ -3232,8 +2611,8 @@ KAI_RT_SHARED __attribute__((noinline)) KaiValue *kai_incref_special(KaiValue *v
 /* Increment a reference. Pure fast path — no free, no out-of-line case
  * — so the whole body is inlined into the caller. Previously a non-inline
  * `static KaiValue *` (a real call at every dup, the symmetric cost to
- * the old non-inline kai_decref). KAI_PROF_ENTER/EXIT dropped: they
- * bracketed a single increment and blocked the inline. Under tracing the
+ * the old non-inline kai_decref). Timing hooks would have
+ * blocked the inline. Under tracing the
  * counters still fire. Koka's kk_block_dup is likewise inline. */
 KAI_RT_SHARED_INLINE KaiValue *kai_incref(KaiValue *v) {
     if (kai_is_value(v) || !v) return v;
@@ -4945,18 +4324,12 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     if (freed_tag >= 0 && freed_tag < 16) kai_rc_free_by_tag[freed_tag]++;   \
     kai_rc_site_record_free((_kc)->alloc_site);                              \
     kai_rc_history_log((_kc), /* op=free */ 3, freed_tag);                   \
-    KAI_RC_RECYCLE_LEAKSITE(_kc, freed_tag);                                 \
     { uint64_t *p64 = (uint64_t *) (_kc);                                    \
       size_t _psz = (freed_tag == (int32_t) KAI_VARIANT)                     \
           ? kai_var_block_size((_kc)->var_n_args) : sizeof(KaiValue);        \
       size_t nq = _psz / sizeof(uint64_t);                                   \
       for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64; }        \
 } while (0)
-#ifdef KAI_TRACE_RC_LEAKSITE
-#define KAI_RC_RECYCLE_LEAKSITE(_kc, ft) kai_leaksite_record_free((_kc)->scope_fn, (ft))
-#else
-#define KAI_RC_RECYCLE_LEAKSITE(_kc, ft) ((void) 0)
-#endif
 #else
 #define KAI_RC_RECYCLE_TRACE(_kc) ((void) 0)
 #endif
@@ -5041,9 +4414,6 @@ void kai_free_child(KaiValue *c, int depth, KaiFreeStack *st) {
 
 KAI_RT_SHARED_INLINE void kai_drop_child(KaiValue *c, int depth, KaiFreeStack *st) {
     if (!kai_drop_hits_zero(c)) return;
-#ifdef KAI_PROFILE_RC
-    kai_prof_decref_to_zero_n++;
-#endif
     kai_free_child(c, depth, st);
 }
 
@@ -5053,7 +4423,6 @@ static inline __attribute__((always_inline))
 void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
   for (;;) {
     KaiValue *next = NULL;
-    KAI_PROF_ENTER();
     switch ((KaiTag) v->tag) {
         case KAI_STR:
             free(v->as.s.bytes);
@@ -5225,11 +4594,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
     }
     /* Recycle this cell (trace+poison+pool+counters). */
     KAI_RECYCLE_CELL(v);
-    KAI_PROF_EXIT(free);
     if (!next) return;
-#ifdef KAI_PROFILE_RC
-    kai_prof_decref_to_zero_n++;
-#endif
     v = next;
   }
 }
@@ -5268,9 +4633,6 @@ static void kai_free_value(KaiValue *v) { kai_free_rec(v, 0); }
  * kaikai keeps its own counters + kai_free_value walker, not kklib's
  * free-list shape — the split is the idea, the body stays ours. */
 KAI_RT_SHARED void kai_decref_free(KaiValue *v) {
-#ifdef KAI_PROFILE_RC
-    kai_prof_decref_to_zero_n++;
-#endif
     kai_free_value(v);
 }
 
@@ -5280,8 +4642,7 @@ KAI_RT_SHARED void kai_decref_free(KaiValue *v) {
  * kai_decref_free. Previously kai_decref was a non-inline `static void`
  * (callgrind: 48M instructions on the rb-tree bench, a real call at
  * every drop). Under tracing the counters still fire for full fidelity.
- * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
- * helper now, and the inline body must stay small to be inlined. */
+ * The inline body must stay small to be inlined. */
 KAI_RT_SHARED_INLINE void kai_decref(KaiValue *v) {
     if (kai_drop_hits_zero(v)) kai_decref_free(v);
 }
@@ -6160,7 +5521,6 @@ static int kai_immortal_slot_install(int32_t tag, const char *name, int n,
 KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
                                                int n, uint32_t mask,
                                                KaiVarSlot *slots) {
-    KAI_VAR_NAME_ALLOC(name);
     /* Record tag→name and tag→slot_mask: neither is stored per node now
      * (Koka-packed header). Rare readers recover them via the tables. */
     kai_varname_register(tag, name);
@@ -6174,7 +5534,6 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
         kai_variant_intern_lock();
         cached = kai_nullary_lookup(tag, name);
         if (cached) { kai_variant_intern_unlock(); return cached; }
-        KAI_VAR_NAME_REAL_ALLOC(name);
         KaiValue *v = kai_alloc(KAI_VARIANT);
         v->variant_tag = tag;
         v->var_n_args = 0;
@@ -6202,7 +5561,6 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
         kai_variant_intern_lock();
         cached = kai_immortal_slot_lookup(tag, name, n, slots);
         if (cached) { kai_variant_intern_unlock(); return cached; }
-        KAI_VAR_NAME_REAL_ALLOC(name);
         KaiValue *v = kai_alloc_var(n);
         v->variant_tag = tag;
         v->var_n_args = n;
@@ -6219,7 +5577,6 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *n
     /* Cold path — fresh alloc, no caching. FAM: header + n inline slots
      * in one block; `slots` aliases the trailing inline_slots so the
      * emitted codegen reads payload identically. */
-    KAI_VAR_NAME_REAL_ALLOC(name);
     KaiValue *v = kai_alloc_var(n);
     v->variant_tag = tag;
     v->var_n_args = n;
@@ -6973,7 +6330,6 @@ static inline void kai_reuse_free(KaiReuse at) {
      * arity, skipping kai_free_value's child-decref loop entirely — exactly
      * the "no cascade" intent, done per-node. The trace/RC counters that
      * kai_free_value would bump are handled here too. */
-    KAI_VAR_NAME_FREE(kai_variant_name_of(at->variant_tag));
     kai_var_block_free(at, at->var_n_args);
     kai_rc_count_free();
 #ifdef KAI_TRACE_RC
@@ -7000,7 +6356,6 @@ __attribute__((noinline)) KAI_RT_SHARED void kai_arm_take_shell(KaiValue *v, uin
     for (int i = 0; unbound != 0; ++i, unbound >>= 1) {
         if (unbound & 1u) kai_decref(kai_var_slots(v)[i].ptr);
     }
-    KAI_VAR_NAME_FREE(kai_variant_name_of(v->variant_tag));
     kai_var_block_free(v, v->var_n_args);
     kai_rc_count_free();
 #ifdef KAI_TRACE_RC
@@ -10064,20 +9419,6 @@ static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
         r = kai_real(a->as.r / b->as.r);
     } else if ((r = kai_fixed_div(a, b)) != NULL) { /* boxed fixed-width */ }
     else { fprintf(stderr, "kai: type mismatch in /\n"); kai_exit(1); }
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-
-static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
-    int64_t av = 0, bv = 0;
-    if      (kai_is_int(a))  av = kai_intf(a);
-    else if (kai_is_ptr(a) && a->tag == KAI_REAL) av = (int64_t) a->as.r;
-    else { fprintf(stderr, "kai: type mismatch in //\n"); kai_exit(1); }
-    if      (kai_is_int(b))  bv = kai_intf(b);
-    else if (kai_is_ptr(b) && b->tag == KAI_REAL) bv = (int64_t) b->as.r;
-    else { fprintf(stderr, "kai: type mismatch in //\n"); kai_exit(1); }
-    if (bv == 0) { kai_trap_abort("divide by zero"); }
-    KaiValue *r = kai_int(av / bv);
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -20909,7 +20250,7 @@ KAI_RT_SHARED void kai_evidence_unwind_all(void) {
  * =================================================================
  *
  * A segment runs a body closure on its own mmap'd stack inside the current
- * fiber, sharing the fiber's heap. `kai_seg_suspend` switches back to
+ * fiber, sharing the fiber's heap. A suspend switches back to
  * whoever started or last resumed it and hands that side a one-shot
  * continuation; `kai_seg_resume` switches in again from wherever it is
  * called, re-parenting the segment's evidence chain onto the resumer's.
@@ -20930,9 +20271,7 @@ KAI_RT_SHARED void kai_evidence_unwind_all(void) {
  * to the per-thread pool. */
 
 KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k);
-KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v);
 KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out);
-KAI_SCHED_FN void      kai_seg_discontinue(KaiValue *k);
 
 /* What a forwarding clause hands its handle: op `op`'s `n` arguments, and
  * `to`, the node the clause was dispatched through (NULL: the running
@@ -21287,12 +20626,6 @@ KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk) {
     return step;
 }
 
-/* From inside a segment: hand `v` to the resumer and wait to be resumed.
- * Returns the value of the resume. */
-KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) {
-    return kai_seg_suspend_on(kai_current_fiber(), v, KAI_SEG_SUSPENDED);
-}
-
 /* A forwarding clause: hand op `op`'s `n` arguments (consumed) to the handle
  * and return the value its continuation is called with. */
 KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
@@ -21305,11 +20638,6 @@ KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
 KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
     KaiSegment *seg = kai_seg_take(k);
     return kai_seg_run(seg->fiber, seg, v, k_out);
-}
-
-/* Unwind the segment `k` (consumed) names and return its stack to the pool. */
-KAI_SCHED_FN void kai_seg_discontinue(KaiValue *k) {
-    kai_seg_discontinue_seg(kai_seg_take(k));
 }
 
 /* The last reference to an unresumed continuation went away. The free walk
@@ -21349,11 +20677,9 @@ __attribute__((noreturn)) static void kai_seg_unsupported(void) {
 }
 KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) { (void) body; (void) k; kai_seg_unsupported(); }
 KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk) { return kai_apply_borrow(thunk, 0, NULL); }
-KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) { (void) v; kai_seg_unsupported(); }
 KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
     (void) k; (void) v; (void) k_out; kai_seg_unsupported();
 }
-KAI_SCHED_FN void kai_seg_discontinue(KaiValue *k) { (void) k; kai_seg_unsupported(); }
 KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
     (void) op; (void) n; (void) args; kai_seg_unsupported();
 }
