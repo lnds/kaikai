@@ -17,6 +17,7 @@ import compiler.ctor_ix
 import compiler.unwind_pend
 import compiler.arm_release
 import compiler.kir_lower_reuse
+import compiler.arm_top_plan
 import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.emit_tcrec_live
@@ -216,7 +217,7 @@ pub(pkg) fn tcp_seed_inherit(body: Expr, pend0: [TclEntry], st: LowerSt) : Lower
 # branch seeds this match's exit drop + its dup'd alias binders.
 pub(pkg) fn tcp_seed_after_arm_rc(owned: Bool, guarded: Bool, sd: String, p: Pattern, body: Expr,
                          pend0: [TclEntry], st: LowerSt) : LowerSt =
-  if owned and arm_is_top_reuse(p, body, st) {
+  if is_some(arm_top_here(p, body, owned, guarded, st)) {
     let st1 = tcp_seed_inherit(body, pend0, st)
     ls_set_arm_tok(ls_set_tcpend(st1, list_append(st1.tcpend, [tcl_tok_entry()])), true)
   } else if arm_reuses(body, st) {
@@ -328,7 +329,7 @@ fn whole_binders(p: Pattern) : [LocalId] = match p.pkind {
 # the continuation must free an unconsumed token (#872).
 pub(pkg) fn arms_have_arm_top(arms: [Arm], st: LowerSt) : Bool = match arms {
   []                         -> false
-  [Arm(p, _, body), ...rest] -> if arm_is_top_reuse(p, body, st) { true } else { arms_have_arm_top(rest, st) }
+  [Arm(p, og, body), ...rest] -> if is_some(arm_top_here(p, body, true, arm_guarded(og), st)) { true } else { arms_have_arm_top(rest, st) }
 }
 
 # One switch case per DISTINCT variant tag, in first-appearance order.
@@ -465,17 +466,11 @@ fn reuse_scrutinee_binders(p: Pattern, ix: CtorIx) : [LocalId] = match p.pkind {
   _           -> pat_alias_binders(p, ix)
 }
 
-# True iff this arm should capture its consumed scrutinee as an arm-top reuse
-# token: a PVariant arm whose body has a `MkTrmcStep` step on some tail
-# (`Node(c, ins(l,..),..)`) and binds ≥1 pointer child. The TRMC step reuses the
-# token in place; a non-step tail (`balance_left(ins(l,..),..)`) frees it. The C
-# oracle's `try_arm_top_reuse` predicate.
-fn arm_is_top_reuse(p: Pattern, body: Expr, st: LowerSt) : Bool = match p.pkind {
-  PVariant(_, _) -> not st.in_region and not st.arm_tok and body_has_trmc_step(body) and not binders_empty(pat_direct_alias_slots(p, st.ctor_ix))
-  _              -> false
-}
-
-fn binders_empty(xs: [LocalId]) : Bool = match xs { [] -> true _ -> false }
+# The arm-top reuse plan this arm takes, if any. A token is taken only by an
+# owned, unguarded arm outside a region that holds no token yet: a guard may
+# still reject after the shell was stolen.
+fn arm_top_here(p: Pattern, body: Expr, owned: Bool, guarded: Bool, st: LowerSt) : Option[ArmTopReuse] =
+  if not owned or guarded or st.in_region or st.arm_tok { None } else { arm_top_reuse_plan(p, body, st.ctor_ix) }
 
 # Emit an owned arm's RC prologue, branching on shape:
 #  - arm-top reuse: capture the consumed scrutinee as `_arm_ru` + shared-incref
@@ -488,15 +483,15 @@ fn binders_empty(xs: [LocalId]) : Bool = match xs { [] -> true _ -> false }
 #    children pass to the binders with no dup.
 #  - otherwise: the #858 structural dup of pointer-slot alias binders.
 pub(pkg) fn lower_arm_rc(p: Pattern, body: Expr, sd: String, owned: Bool, guarded: Bool, st: LowerSt) : LowerSt / Console =
-  if owned and arm_is_top_reuse(p, body, st) {
-    let direct = pat_direct_alias_slots(p, st.ctor_ix)
-    let st0 = lm_dup_alias_binders(nested_alias_binders(pat_alias_binders(p, st.ctor_ix), direct), kpos_of(body), st)
-    let st1 = ls_emit(st0, KRC(KArmTopReuse(KVar(sd), variant_arm_arity(p, st.ctor_ix),
-                                           map(direct, (l) => ls_reg_of(st0, l)),
-                                           pat_unbound_ptr_slots(p, st.ctor_ix)), kpos_of(body)))
-    ls_emit(st1, KStore(sd, KUnitV, kpos_of(body)))
-  } else {
-    match arm_scr_release(owned, guarded, p, body, st) {
+  match arm_top_here(p, body, owned, guarded, st) {
+    Some(ArmTopReuse(_, _, _, bs, n, unbound)) -> {
+      let direct = list_reverse(map(bs, .id))
+      let slots = pat_direct_alias_slots(p, st.ctor_ix)
+      let st0 = lm_dup_alias_binders(nested_alias_binders(pat_alias_binders(p, st.ctor_ix), slots), kpos_of(body), st)
+      let st1 = ls_emit(st0, KRC(KArmTopReuse(KVar(sd), n, map(direct, (l) => ls_reg_of(st0, l)), unbound), kpos_of(body)))
+      ls_emit(st1, KStore(sd, KUnitV, kpos_of(body)))
+    }
+    None -> match arm_scr_release(owned, guarded, p, body, st) {
       ScrTaken -> match arm_take_plan(p, st.ctor_ix) { ArmTake(bs, _, mask) -> {
         let st1 = ls_emit(st, KRC(KArmTake(KVar(sd), arm_take_regs(bs, st), mask), kpos_of(body)))
         set_reuse_gc_for_arm(p, body, ls_emit(st1, KStore(sd, KUnitV, kpos_of(body))))
@@ -510,12 +505,6 @@ pub(pkg) fn lower_arm_rc(p: Pattern, body: Expr, sd: String, owned: Bool, guarde
 fn nested_alias_binders(all: [LocalId], direct: [LocalId]) : [LocalId] = match all {
   []           -> []
   [n, ...rest] -> if lid_has(direct, n) { nested_alias_binders(rest, direct) } else { [n, ...nested_alias_binders(rest, direct)] }
-}
-
-# The rebuild arity for the arm-top token: the matched ctor's slot count.
-fn variant_arm_arity(p: Pattern, ix: CtorIx) : Int = match p.pkind {
-  PVariant(r, subs) -> match pa_kinds(ix, r) { [] -> list_length(subs) ts -> list_length(ts) }
-  _                 -> 0
 }
 
 # The arms whose top-level tag is `tag`, in source order.
