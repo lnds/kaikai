@@ -236,7 +236,7 @@ FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceu
 
 # The tier0 gates that need a built kaic2, cheapest first so a break reports
 # before the slow demos and cache gates.
-KAIC2_GATES := test-cmodular-prune test-fmt-classify test-compiler-lint-ratchet test-symid-names-compiled test-builtin-table test-kai-builtins test-symtab test-resolve-sym test-symid-pipeline test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-kai-namespace test-native-namespace test-module-name-ident test-rboxed-prim-scope test-heap-limit test-evidence-frame test-tls-hoist-gate test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-core-cache-tid test-rc-budget demos-no-regression
+KAIC2_GATES := test-selfhost-warnings test-cmodular-prune test-fmt-classify test-compiler-lint-ratchet test-symid-names-compiled test-builtin-table test-kai-builtins test-symtab test-resolve-sym test-symid-pipeline test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-kai-namespace test-native-namespace test-module-name-ident test-rboxed-prim-scope test-heap-limit test-evidence-frame test-tls-hoist-gate test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-core-cache-tid test-rc-budget demos-no-regression
 
 fast-gates: $(FAST_GATES)
 	@echo "fast-gates OK — every tier0 gate that needs no compiler"
@@ -370,6 +370,10 @@ test-field-types: kaic2
 # also fails on any row of tools/symid-census/pending-written.txt.
 test-symid-names-static:
 	@./tools/symid-names-gate.sh --final --static
+
+# The compiler's own sources compile without a warning (an unused import fails here, not at release).
+test-selfhost-warnings: kaic2
+	@$(MAKE) -C stage2 test-selfhost-warnings
 
 test-symid-names-compiled: kaic2
 	@./tools/symid-names-gate.sh --final --compiled
