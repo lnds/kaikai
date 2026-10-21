@@ -11035,6 +11035,21 @@ static KaiValue *kai_core_string_reverse(KaiValue *s) {
     return out;
 }
 
+/* First occurrence of `needle` in `hay`, or NULL; an empty needle matches at
+ * the start. memchr on the first byte skips ahead a vector at a time. */
+static inline const char *kai_mem_find(const char *hay, size_t hlen, const char *needle, size_t nlen) {
+    if (nlen == 0) return hay;
+    if (hlen < nlen) return NULL;
+    const char *last = hay + (hlen - nlen);
+    while (hay <= last) {
+        hay = (const char *) memchr(hay, needle[0], (size_t) (last - hay) + 1);
+        if (!hay) return NULL;
+        if (memcmp(hay + 1, needle + 1, nlen - 1) == 0) return hay;
+        hay++;
+    }
+    return NULL;
+}
+
 static KaiValue *kai_core_string_split(KaiValue *s, KaiValue *sep) {
     KaiValue *acc;
     if (!s || s->tag != KAI_STR) {
@@ -11050,24 +11065,16 @@ static KaiValue *kai_core_string_split(KaiValue *s, KaiValue *sep) {
         /* Collect pieces into a temp array then fold right into a cons list. */
         size_t cap = 8, n = 0;
         struct { const char *b; size_t l; } *pieces = malloc(cap * sizeof(*pieces));
-        size_t i = 0;
-        size_t last = 0;
-        while (i + seplen <= slen) {
-            if (memcmp(p + i, sp, seplen) == 0) {
-                if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
-                pieces[n].b = p + last;
-                pieces[n].l = i - last;
-                n++;
-                i += seplen;
-                last = i;
-            } else {
-                i++;
-            }
+        const char *cur = p, *end = p + slen;
+        for (;;) {
+            const char *hit = kai_mem_find(cur, (size_t) (end - cur), sp, seplen);
+            if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
+            pieces[n].b = cur;
+            pieces[n].l = (size_t) ((hit ? hit : end) - cur);
+            n++;
+            if (!hit) break;
+            cur = hit + seplen;
         }
-        if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
-        pieces[n].b = p + last;
-        pieces[n].l = slen - last;
-        n++;
         acc = kai_nil();
         for (size_t k = n; k > 0;) {
             --k;
@@ -11319,10 +11326,8 @@ static KaiValue *kai_core_real_bits(KaiValue *v) {
 static int64_t kai_str_find(KaiValue *s, KaiValue *sub) {
     if (!s || s->tag != KAI_STR || !sub || sub->tag != KAI_STR) return -1;
     if (sub->as.s.len == 0) return 0;
-    for (size_t i = 0; i + sub->as.s.len <= s->as.s.len; ++i) {
-        if (memcmp(s->as.s.bytes + i, sub->as.s.bytes, sub->as.s.len) == 0) return (int64_t) i;
-    }
-    return -1;
+    const char *hit = kai_mem_find(s->as.s.bytes, s->as.s.len, sub->as.s.bytes, sub->as.s.len);
+    return hit ? (int64_t) (hit - s->as.s.bytes) : -1;
 }
 
 static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
