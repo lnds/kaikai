@@ -85,6 +85,46 @@ pub fn kaic2_spawn(set: [(String, String)], out: String, err: String) : Spawn =
 #[doc("The C compiler as a command: `$CC` split into words.")]
 pub fn cc(t: Toolchain) : [String] = cli_proc.words(t.cc)
 
+# The compiler's executable: the first word of `$CC`, looked up on `$PATH` when it has no slash.
+fn cc_exe(t: Toolchain) : String / Env + File + Ffi = {
+  let w = list.head(cc(t)) ?? ""
+  if string_contains(w, "/") {
+    w
+  } else {
+    let hit = string.split(cli_caches.env_or("PATH", ""), ":")
+      |> list.map(d => "#{d}/#{w}")
+      |> find(f => cli_sys.is_exec(f))
+    hit ?? w
+  }
+}
+
+#[doc("""
+The compiler's identity: what `$CC --version` prints, kept per executable stat so a build
+spawns the compiler only when it changed on disk.
+""")]
+pub fn cc_identity(t: Toolchain) : String / Env + File + Ffi = {
+  let dir = cli_caches.root("KAI_CC_ID_CACHE_DIR", "cc-id", t.os)
+  let exe = cc_exe(t)
+  let key = cli_hash.digest([
+    cli_hash.lines([t.cc, exe, cli_sys.stat_id(exe), cli_sys.stat_id("/var/db/xcode_select_link")])
+  ])
+  let memo = "#{dir}/#{key}"
+  if cli_gc.refresh(memo) {
+    cli_fs.read_or_empty(memo)
+  } else {
+    let part = "#{memo}.#{cli_sys.getpid()}"
+    let version = if cli_fs.mkdir_p(dir) {
+      cli_proc.capture(cc(t) ++ ["--version"], cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" }, part).snd
+    } else {
+      ""
+    }
+    if version == "" or (not (file_rename(part, memo) |> is_ok())) {
+      let _ = file_delete(part)
+    }
+    version
+  }
+}
+
 fn forces_header(w: String) : Bool =
   ["-include", "--include", "-imacros", "--imacros"] |> list.any(f => string.starts_with(w, f))
 
@@ -138,6 +178,7 @@ native-modular cache by content; empty when the cache or the compile fails
 """)]
 pub fn runtime_obj(t: Toolchain, src: String, defs: [String]) : String / Env + File + Ffi {
   let dir = "#{cli_caches.root("KAI_NATIVE_MODULAR_CACHE_DIR", "nmodular", t.os)}/runtime"
+  let made = cli_fs.mkdir_p(dir)
   let hdr_c = "#{t.inc_c}/runtime.h"
   let hdr = "#{t.inc}/runtime.h"
   let headers = (if cli_sys.is_file(hdr_c) { [cli_hash.kept(dir, hdr_c)] } else { [] })
@@ -147,7 +188,8 @@ pub fn runtime_obj(t: Toolchain, src: String, defs: [String]) : String / Env + F
     string.join(t.cflags_compile, " "),
     OWNER_OPT,
     string.join(defs, " "),
-    cli_toolchain.host(t)
+    cli_toolchain.host(t),
+    cc_identity(t)
   ])
   let obj = "#{dir}/#{cli_hash.digest([head, cli_hash.Bytes(src), ...headers])}.o"
   let part = "#{obj}.#{cli_sys.getpid()}"
@@ -155,7 +197,7 @@ pub fn runtime_obj(t: Toolchain, src: String, defs: [String]) : String / Env + F
     ++ t.cflags_compile
     ++ [OWNER_OPT, ...defs]
     ++ ["-I", t.inc_c, "-I", t.inc, "-c", src, "-o", part]
-  if not cli_fs.mkdir_p(dir) {
+  if not made {
     ""
   } else if cli_gc.refresh(obj) {
     obj
