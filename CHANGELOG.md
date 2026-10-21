@@ -84,6 +84,73 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.170.0 (2026-10-21)
+
+### BREAKING CHANGE
+
+- a thunk handed to spawn must not carry Mutable; let one
+fiber own the state and message it.
+- several statements on one line need `;` between them.
+- a unit annotation on an imported alias of a non-numeric
+scalar (`pub type Tag = String` used as `Tag<m>`) is now rejected, like the
+same annotation on a local alias.
+
+### Added
+
+- **tools**: print the monotonic clock after each driver pass under KAI_PASS_CLOCK
+- **stdlib**: add array.same for Array identity
+
+### Fixed
+
+- **unbox**: keep native's let binding as it was
+- **emit**: dead-strip the modular C link so an uncalled extern fn does not need its symbol
+- **compiler**: drop an unused import that fails the selfhost warning gate
+- **typer**: resolve a return-dispatched protocol op used as a value, reject it when unfixed
+- **cli**: keep a fresh object dir out of the cache trim's reach
+- **compiler**: drop an unused import that fails the selfhost warning gate
+- **driver**: a core module compiled as the root is that module, so its test blocks run
+- **tools**: key a stored kaic2 build by its boot release and store it at the fixed point
+- **emit**: keep native label slots in the user symbol namespace
+- **perceus**: drop an arm binder a nested lambda captures at the arm's exit
+- **derive**: bound derived Json recursion through a nested record by memory
+- **typer**: check nursery brands after the resolver, keyed by id
+- **diag**: point call diagnostics at the offending argument and name the row variable
+- **derive**: count a library name a derive mints by id as a mention of its import
+- **derive**: mint the core and library names a derived BinSerialize body mentions by id
+- **derive**: mint the core and library names a derived Json/Layout body mentions by id
+- **typer**: reject a spawned thunk with Mutable in its effect row
+- **parser**: reject a second expression on the same line with no separator
+- **typer**: follow an imported alias to its scalar when judging a unit-annotated head
+- **typer**: a qualified written type never falls back to the core type of its spelling
+- **emit**: name a dispatcher's protocol by id so a user Eq is not the core Eq
+- **typer**: diagnose a constant cycle inside one module
+- **tools**: seed cost-ab builds from the stored base build, one temp dir per run
+- **tools**: store prebuilt builds as a runnable dev layout
+
+### Changed
+
+- **driver**: prune the core on every native-modular compile
+- **unbox**: bind a boxed scalar let raw and keep it raw inside in-place loops
+- **emit**: link the modular C build with ThinLTO when the linker keeps an LTO cache
+- **derive**: call a nested record's Json impl through its dispatcher by id
+- **test**: keep the compiler and core digests of a kai test run in the memo directory
+- **compiler**: name modules after their layer
+- **runtime**: classify the interned label table in the runtime global audit
+- **runtime**: compare interned effect labels in the evidence walk
+- **perceus**: hoist the Vec fields of let-, arm- and lambda-bound records
+- **perceus**: hand on the binders a lambda declares instead of dup'ing every read
+- **typer**: collect diagnostics and render them once at the end of the phase
+- **native**: test list cells through inline i32 predicates
+- **native**: seed the Int binders of a destructuring let raw by binder identity
+- **typer**: empty the bodies of core impl methods before the front end walks them
+- separate statements with ; in the sources embedded in scripts and docs
+- separate statements written on one line with ;
+- **typer**: hold the bodies of core impl functions until the program asks for them
+- **typer**: resolve a type name over declared and foreign types through one helper
+- **emit**: decide a native mono instance by its function identity, not its symbol text
+- **emit**: drop the dead Numeric add/mul operation numbering
+- **typer**: lower var cells by binder identity, not by the text n.get() / n.set(v)
+
 ## v0.169.0 (2026-10-20)
 
 ### BREAKING CHANGE
