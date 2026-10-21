@@ -527,14 +527,15 @@ file. The package gate is what makes the typed rebuild cut below pay:
 a loose file partitions into one bucket the cut cannot split, so it
 would pay the publish and never serve a hit.
 
-- **Composite key materialised as the blob filename**
-  (`<content_hex>-<dep_hex>.kab`). Invalidation is a property of the
-  key, not a sweep: an edit anywhere in a module's transitive closure
-  changes its dep hash, so its filename changes and the old blob is
-  never read. Hashing uses the `string_hash` runtime prim (FNV-1a 64),
-  not sha256 — content-change detection, not cryptography.
-- **Dep discovery by token scan, not parse**, so computing the key does
-  not defeat the cache.
+- **The key is the file's own content, materialised as the blob
+  filename** (`<content_hex>-<no-dep>.kab`). A parse blob is what the
+  parser and the doc strip make of one file under its home: imports are
+  only recorded in it, and everything that reads another module (resolution,
+  derive expansion, typing) runs after the lookup, over the decls. So an
+  edit re-parses that file only, and an edit to an import never touches its
+  importers' blobs. Invalidation is a property of the key, not a sweep.
+  Hashing uses the `string_hash` runtime prim (FNV-1a 64), not sha256 —
+  content-change detection, not cryptography.
 - **Atomicity + mkdir live in `bin/kai`** — the stage1 bootstrap
   compiler that builds the kaic2 bundle lacks `file_rename` /
   `dir_create_dir` (and `bit_*`); a content-addressed name makes a torn

@@ -1,33 +1,25 @@
-# compiler/user_cache.kai - Phase B user-file incremental cache (#455).
+# compiler/user_cache.kai - the user-file parse cache.
 #
-# Extends Phase A's KAB2 post-parse [Decl] codec (compiler.cache) to
-# *user* source files so an unchanged module is deserialised instead of
-# re-lexed and re-parsed. The deliverable is incremental multi-module
-# rebuild: editing one of N user modules re-parses only that module and
-# its transitive consumers, not the N-1 untouched modules. The codec is
-# reused verbatim from compiler.cache; this module owns the *cache key*
-# (content-addressable, with transitive dependency invalidation), the
+# Extends the KAB2 post-parse [Decl] codec (compiler.cache) to *user* source
+# files so an unchanged module is deserialised instead of re-parsed. The codec
+# is reused verbatim from compiler.cache; this module owns the *cache key*, the
 # hit/miss decision, and the atomic on-disk write.
 #
-# Cache key is content-addressable, NOT mtime-based (per
-# docs/cache-design.md): two checkouts with identical content hit the
-# same entry. The composite key is
+# The blob is what `parse_program` and the doc strip make of one file's text
+# under its home: imports are only recorded (DImport nodes), and resolution,
+# derive expansion and everything else that reads another module runs after the
+# lookup, over the decls. So the key is the file's own content:
 #
-#   content_hash = string_hash(home ++ source_bytes)
-#   dep_hash     = string_hash(concat of each transitive import's content_hash)
+#   content_hash = string_hash(key version ++ home ++ source_bytes)
 #
-# materialised as the blob filename "<content_hex>-<dep_hex>.kab" under
-# "<project>/.kai-cache/". Any edit to a source, a direct import, or a
-# transitive import changes either content_hash or dep_hash, so the
-# filename changes and the old entry is never read - invalidation is a
-# property of the key, not an imperative sweep. Version/format drift and
-# corruption are rejected by the KAB2 header (cache_read_header), so a
-# stale blob is never deserialised into wrong decls.
+# materialised as the blob filename "<content_hex>-<no-dep>.kab" under
+# "<project>/.kai-cache/". An edit to a file re-parses that file only; an
+# edit to an import never invalidates its importers' parse. Version/format
+# drift and corruption are rejected by the KAB2 header (cache_read_header), so
+# a stale blob is never deserialised into wrong decls.
 #
-# Scope boundary: this is the A.0 (post-parse) layer applied to user
-# files. It does NOT skip typechecking - the typer still runs over the
-# merged core++user decl stream. The cold-trivial sub-150ms target
-# lives in A.1 (post-typecheck core cache), a separate lane.
+# This layer does NOT skip typechecking: the typer still runs over the merged
+# core++user decl stream.
 #
 # string_hash is the runtime FNV-1a 64-bit digest over the raw bytes
 # (issue #373), cast to a signed Int64, so it may be negative; the hex
@@ -101,76 +93,13 @@ fn uc_blob_name(content_hex: String, dep_hex: String) : String =
 pub fn uc_blob_path(cache_dir: String, content_hex: String, dep_hex: String) : String =
   concat_all([cache_dir, "/", uc_blob_name(content_hex, dep_hex)])
 
-# ---- transitive dependency hashing -----------------------------------
+# ---- dependency memo ---------------------------------------------------
 
-# Memoising transitive closures is what keeps the walk linear: without
-# it, module i on an import chain re-tokenises its i dependencies.
-#
-# A memoised closure keeps each dependency's path, not just its hex,
-# because replaying one still filters against the caller's `visited`.
-# That filter is what makes the memo substitutable for a fresh walk: in
-# a diamond (a -> b, c -> leaf) the hash must see leaf once, at its
-# first discovery, and replay-with-filter reproduces exactly that
-# position. Storing bare hexes would append leaf twice and change the
-# key.
-#[doc("One memoised transitive closure: the absolute path it was entered from, and that path's dependency pairs in discovery order.")]
-pub type UcDepEntry = UDE(String, [UcDepPair])
+#[doc("What a compile threads between lookups. The parse blob is a function of one file's own text, so nothing is kept; the type stays as the resolver's slot for it.")]
+pub type UcDepMemo = UDM([String])
 
-#[doc("A dependency's absolute path paired with its content hash.")]
-pub type UcDepPair = UDPair(String, String)
-
-#[doc("Memo of transitive dependency closures keyed by absolute path, threaded across one compile so each file is tokenised once regardless of how many modules import it.")]
-pub type UcDepMemo = UDM([UcDepEntry])
-
-#[doc("An empty dependency memo, for the start of a compile.")]
+#[doc("An empty memo, for the start of a compile.")]
 pub fn uc_memo_empty() : UcDepMemo = UDM([])
-
-fn uc_memo_get(m: UcDepMemo, p: String) : Option[[UcDepPair]] = match m {
-  UDM(es) -> uc_memo_find(es, p)
-}
-
-fn uc_memo_find(es: [UcDepEntry], p: String) : Option[[UcDepPair]] = match es {
-  [] -> None
-  [e, ...rest] -> match e {
-    UDE(q, pairs) -> if q == p { Some(pairs) } else { uc_memo_find(rest, p) }
-  }
-}
-
-fn uc_memo_put(m: UcDepMemo, p: String, pairs: [UcDepPair]) : UcDepMemo =
-  match m { UDM(es) -> UDM([UDE(p, pairs), ...es]) }
-
-# State threaded through the dependency walk: paths already hashed
-# (cycle + diamond dedup, mirroring the driver's ResolveState.visited),
-# the accumulated (path, hash) pairs in discovery order, and the
-# cross-compile memo.
-type UcDepState = UDS([String], [UcDepPair], UcDepMemo)
-#                     visited   dep_pairs     memo
-
-fn uds_seen(st: UcDepState, p: String) : Bool = match st {
-  UDS(v, _, _) -> list_has(v, p)
-}
-
-fn uds_push(st: UcDepState, p: String, hex: String) : UcDepState = match st {
-  UDS(v, pairs, m) -> UDS([p, ...v], list_append(pairs, [UDPair(p, hex)]), m)
-}
-
-fn uds_memo(st: UcDepState) : UcDepMemo = match st { UDS(_, _, m) -> m }
-
-fn uds_with_memo(st: UcDepState, m: UcDepMemo) : UcDepState =
-  match st { UDS(v, ps, _) -> UDS(v, ps, m) }
-
-# Fold a memoised closure into the walk, skipping pairs whose path the
-# caller already visited. This is what keeps the memo faithful to a
-# fresh walk: discovery order is the caller's, dedup is the caller's,
-# only the tokenisation is reused.
-fn uds_replay(st: UcDepState, pairs: [UcDepPair]) : UcDepState = match pairs {
-  [] -> st
-  [p, ...rest] -> match p {
-    UDPair(path, hex) ->
-      uds_replay(if uds_seen(st, path) { st } else { uds_push(st, path, hex) },
-                 rest)
-  }
-}
 
 # Module paths a source imports, as dotted strings, recovered by
 # scanning the token stream rather than a full parse. tokenize is what
@@ -234,83 +163,6 @@ fn uc_scan_dot(src: String, toks: [Token], acc: String) : UcDottedPath = match t
   }
 }
 
-# Hash one dependency file (and recurse into its own imports) into st.
-# Reuses find_module_file for search-path resolution and abspath for the
-# visited-set canonicalisation the driver's resolver also does, so cache
-# invalidation tracks exactly the files the compiler loads.
-#
-# The closure of `abs` is computed in a state isolated from the caller's
-# (empty visited, own pair list) so it depends only on `abs` and is safe
-# to memo; it is then replayed into the caller under the caller's dedup.
-# Walking in the caller's state directly would bake that caller's
-# already-visited set into the memo and make it unsound to reuse.
-#
-# Because each closure starts with an empty visited set, `open` (the files
-# whose closures are still being walked) is what stops an import cycle: a
-# file met again on its own path is cut. A cycle fails the build when the
-# resolver reaches it, and a parse blob depends only on its own source, so
-# a cut closure costs reuse at most.
-fn uc_hash_dep(base_dir: String, mod_path: String,
-               search_paths: [String], open: [String], st: UcDepState)
-               : UcDepState / Console + File =
-  match find_module_file(base_dir, mod_path, search_paths) {
-    CF(raw_path, opt_src) -> {
-      let abs = abspath(raw_path)
-      if uds_seen(st, abs) or list_has(open, abs) { st }
-      else { match uc_memo_get(uds_memo(st), abs) {
-        Some(pairs) -> uds_replay(st, pairs)
-        None -> {
-          let sub = uc_hash_dep_fresh(abs, opt_src, search_paths, [abs, ...open],
-                                      UDS([], [], uds_memo(st)))
-          match sub { UDS(_, pairs, m) ->
-            uds_replay(uds_with_memo(st, uc_memo_put(m, abs, pairs)), pairs)
-          }
-        }
-      } }
-    }
-  }
-
-# Walk one file's own closure from an isolated state.
-fn uc_hash_dep_fresh(abs: String, opt_src: Option[String],
-                     search_paths: [String], open: [String], st: UcDepState)
-                     : UcDepState / Console + File = match opt_src {
-  # A missing dep hashes to empty but is still recorded distinct
-  # from a present one, so its later appearance reinvalidates.
-  None -> uds_push(st, abs, "")
-  Some(src) -> {
-    let st1 = uds_push(st, abs, uc_content_hex(src))
-    let imports = uc_import_paths(src, tokenize(src))
-    uc_hash_deps(dir_of(abs), imports, search_paths, open, st1)
-  }
-}
-
-fn uc_hash_deps(base_dir: String, mods: [String],
-                search_paths: [String], open: [String], st: UcDepState)
-                : UcDepState / Console + File = match mods {
-  [] -> st
-  [m, ...rest] -> uc_hash_deps(base_dir, rest, search_paths, open,
-                                uc_hash_dep(base_dir, m, search_paths, open, st))
-}
-
-#[doc("Transitive dependency hash for a file: string_hash over the concatenated content hashes of every import reachable from it, in stable discovery order, as 16 hex chars. Imports are recovered by token scan, so this never parses. Changes when any transitive import changes. Returns the hash alongside the memo, grown with every closure walked, for the next file in the same compile.")]
-pub fn uc_dep_hex_memo(root_path: String, src: String, toks: [Token],
-                       search_paths: [String], memo: UcDepMemo)
-                       : UcDepHex / Console + File = {
-  let st = uc_hash_deps(dir_of(root_path), uc_import_paths(src, toks),
-                         search_paths, [abspath(root_path)], UDS([], [], memo))
-  match st { UDS(_, pairs, m) ->
-    UDHex(uc_hash_hex16(string_hash(concat_all(uc_pair_hexes(pairs, [])))), m)
-  }
-}
-
-#[doc("A dependency hash paired with the memo the walk that produced it grew.")]
-pub type UcDepHex = UDHex(String, UcDepMemo)
-
-fn uc_pair_hexes(pairs: [UcDepPair], acc: [String]) : [String] = match pairs {
-  [] -> list_reverse(acc)
-  [p, ...rest] -> match p { UDPair(_, hex) -> uc_pair_hexes(rest, [hex, ...acc]) }
-}
-
 # ---- lookup + atomic write -------------------------------------------
 
 #[doc("Result of a cache lookup: a hit carries the deserialised decls and their table rows; a miss carries the composite key (content_hex, dep_hex) so the caller can write the blob after parsing.")]
@@ -321,24 +173,24 @@ pub type UcLookup
 #[doc("A lookup result paired with the memo the dependency walk grew, to thread into the next lookup of the same compile.")]
 pub type UcLookupMemo = UcLM(UcLookup, UcDepMemo)
 
-#[doc("Look up the cache for a file from its source and token stream. Computes the composite key (content over `home` and src, dep over the imports the tokens name), reads the matching blob from `cache_dir`, and returns UcHit(decls, rows) on a present header-valid entry or UcMiss(key) otherwise (absent, version or format drift, or corruption). Tokenizes but never parses, so a hit skips the parse the cache exists to amortise. The memo carries dependency closures across the compile; pass uc_memo_empty() for the first file and thread the returned one onward.")]
+#[doc("The second half of a blob name. A parse blob is a function of the file's own text and home, so no dependency enters the key.")]
+pub fn uc_no_dep() : String = "0000000000000000"
+
+#[doc("Look up the cache for a file from its source. The key is the content over a key version, `home` and src; a hit hands back the deserialised decls and rows, a miss (absent, version or format drift, corruption) the key to write the blob under after parsing. Never parses. The memo is passed through.")]
 pub fn uc_lookup(cache_dir: String, root_path: String, home: String, src: String, toks: [Token],
                  search_paths: [String], memo: UcDepMemo)
                  : UcLookupMemo / Console + File = {
   # The blob holds ids derived from the home the file was parsed under.
-  let content_hex = uc_content_hex(concat_all([home, "\n", src]))
-  match uc_dep_hex_memo(root_path, src, toks, search_paths, memo) {
-    UDHex(dep_hex, memo1) -> {
-      let blob_path = uc_blob_path(cache_dir, content_hex, dep_hex)
-      UcLM(match file_read_bytes(blob_path) {
-        Err(_) -> UcMiss(content_hex, dep_hex)
-        Ok(blob) -> match cache_deserialize_module(blob) {
-          None -> UcMiss(content_hex, dep_hex)
-          Some(cds) -> match cds { CDs(decls, rows, _) -> UcHit(decls, rows) }
-        }
-      }, memo1)
+  let content_hex = uc_content_hex(concat_all(["parse-v2\n", home, "\n", src]))
+  let dep_hex = uc_no_dep()
+  let blob_path = uc_blob_path(cache_dir, content_hex, dep_hex)
+  UcLM(match file_read_bytes(blob_path) {
+    Err(_) -> UcMiss(content_hex, dep_hex)
+    Ok(blob) -> match cache_deserialize_module(blob) {
+      None -> UcMiss(content_hex, dep_hex)
+      Some(cds) -> match cds { CDs(decls, rows, _) -> UcHit(decls, rows) }
     }
-  }
+  }, memo)
 }
 
 #[doc("Publish a cache blob atomically: write to a temp path next to the final one, then rename onto it, so a concurrent reader never sees a torn entry. Any IO failure is swallowed - a cache that cannot be written is a performance loss, never a correctness one.")]
