@@ -13913,7 +13913,7 @@ $(foreach slug,$(FIXTURE_SLUGS),$(eval $(call fixture_unit_rule,$(slug))))
 
 define fixture_native_unit_rule
 test-dir-native-$(1): $$(TARGET) bin-kai build core-cache-warm
-	@FIXTURE_BACKEND=native FIXTURE_JOBS=$$(TEST_JOBS) sh ../tools/fixture-dir.sh $(1)
+	@FIXTURE_BACKEND=native FIXTURE_KAI=../bin/kai FIXTURE_JOBS=$$(TEST_JOBS) sh ../tools/fixture-dir.sh $(1)
 endef
 $(foreach slug,$(FIXTURE_NATIVE_SLUGS),$(eval $(call fixture_native_unit_rule,$(slug))))
 
