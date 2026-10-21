@@ -6,18 +6,16 @@
 # summaries to follow a brand across a helper call instead of losing
 # it at the call boundary.
 #
-# Transparency is decided on the surface AST alone, so this runs
-# before the typer alongside the cap-binding rewrite. Anything not
-# provably a pass-through is opaque: the brand is not followed, and
-# the checker warns rather than staying silent.
+# Transparency is decided on the resolved AST alone, keyed by the id of
+# the function, so a homonym a call does not reach never lends its
+# summary. Anything not provably a pass-through is opaque: the brand is
+# not followed, and the checker warns rather than staying silent.
 
 import compiler.ast
 import compiler.ast_decl
 import compiler.ast_ids
 import compiler.ast_decl
 import compiler.ast_ids
-import compiler.written
-import compiler.symtab
 import compiler.infer_index
 
 # `BTOpaque` is the conservative default for every shape that is not
@@ -25,95 +23,55 @@ import compiler.infer_index
 #[doc("Whether a function returns one of its parameters unchanged, and which one.")]
 pub type BrandTransp = BTOpaque | BTParam(Int)
 
-#[doc("A brand-transparency summary for one function: the name a call writes it with and which parameter (if any) it returns unchanged.")]
-pub type BrandTranspRec = BTR(String, BrandTransp)
+#[doc("A brand-transparency summary for one function: its id and which parameter (if any) it returns unchanged.")]
+pub type BrandTranspRec = BTR(SymId, BrandTransp)
 
-#[doc("Summarise every top-level fn as brand-transparent at a parameter index or opaque, under the name `tab` holds for it.")]
-pub fn brand_transp_decls(ds: [Decl], tab: SymTab) : [BrandTranspRec] {
-  brand_transp_loop(ds, tab, [])
+#[doc("Summarise every top-level fn as brand-transparent at a parameter index or opaque.")]
+pub fn brand_transp_decls(ds: [Decl]) : [BrandTranspRec] {
+  brand_transp_loop(ds, [])
 }
 
-fn brand_transp_loop(ds: [Decl], tab: SymTab, acc: [BrandTranspRec]) : [BrandTranspRec] {
+fn brand_transp_loop(ds: [Decl], acc: [BrandTranspRec]) : [BrandTranspRec] {
   match ds {
     [] -> list_reverse(acc)
-    [d, ...rest] -> brand_transp_loop(rest, tab, brand_transp_decl(d, tab, acc))
+    [d, ...rest] -> brand_transp_loop(rest, brand_transp_decl(d, acc))
   }
 }
 
-fn brand_transp_decl(d: Decl, tab: SymTab, acc: [BrandTranspRec]) : [BrandTranspRec] {
+fn brand_transp_decl(d: Decl, acc: [BrandTranspRec]) : [BrandTranspRec] {
   match d {
     DFn(_, fid, _, ps, _, _, body, _, _, _) ->
-      [BTR(written_text(decl_name(tab, fnid_sym(fid))), btr_transp_of_body(body, ps)), ...acc]
+      [BTR(fnid_sym(fid), btr_transp_of_body(body, ps)), ...acc]
     _ -> acc
   }
 }
 
-# The result is the parameter index when the body reduces to a bare
-# name written like a parameter. A block body counts only when its tail is
-# that var and no statement rebinds the name — a rebinding would make
-# the returned value a different one than the argument.
+# The result is the parameter index when the body reduces to a read of
+# a parameter's binder. A rebinding is another binder, so a block whose
+# tail reads the parameter's own id returns the argument.
 fn btr_transp_of_body(body: Expr, ps: [Param]) : BrandTransp {
   match body.kind {
-    EName(w) -> btr_param_index(ps, written_text(w), 0)
-    EBlock(stmts, tail) -> match tail {
-      Some(t) -> match t.kind {
-        EName(w) -> {
-          let n = written_text(w)
-          if btr_stmts_rebind(stmts, n) { BTOpaque } else { btr_param_index(ps, n, 0) }
-        }
-        _ -> BTOpaque
-      }
-      None -> BTOpaque
+    ELocal(l) -> btr_param_index(ps, l, 0)
+    EBlock(_, Some(t)) -> match t.kind {
+      ELocal(l) -> btr_param_index(ps, l, 0)
+      _         -> BTOpaque
     }
     _ -> BTOpaque
   }
 }
 
-fn btr_param_index(ps: [Param], name: String, i: Int) : BrandTransp {
+fn btr_param_index(ps: [Param], l: LocalId, i: Int) : BrandTransp {
   match ps {
     [] -> BTOpaque
-    [p, ...rest] -> if written_text(p.binder.name) == name { BTParam(i) } else { btr_param_index(rest, name, i + 1) }
-  }
-}
-
-fn btr_stmts_rebind(ss: [Stmt], name: String) : Bool {
-  match ss {
-    [] -> false
-    [s, ...rest] -> if btr_stmt_binds(s, name) { true } else { btr_stmts_rebind(rest, name) }
-  }
-}
-
-fn btr_stmt_binds(s: Stmt, name: String) : Bool {
-  match s {
-    SLet(pat, _, _) -> btr_pat_binds(pat, name)
-    SVar(n, _, _, _, _) -> written_text(n.name) == name
-    _ -> false
-  }
-}
-
-# Conservative: only the shapes that provably bind nothing named
-# `name` answer false. Every destructuring form is treated as a
-# possible rebinding, which can only cost transparency, never
-# invent it.
-fn btr_pat_binds(pat: Pattern, name: String) : Bool {
-  match pat.pkind {
-    PWild -> false
-    PLit(_) -> false
-    PRange(_, _) -> false
-    PHole(_) -> false
-    PBind(n) -> written_text(n.name) == name
-    PNarrow(n, _) -> written_text(n.name) == name
-    _ -> true
+    [p, ...rest] -> if local_eq(p.binder.id, l) { BTParam(i) } else { btr_param_index(rest, l, i + 1) }
   }
 }
 
 # The summaries are read once per call site in the brand walk, so the
-# table is bucketed by name rather than scanned. First-match wins, so a
-# chain must keep table order: `idx_prepend` builds newest-first, hence
-# the back-to-front index build. A hash collision mixes foreign names
-# into a chain; the read re-tests the name, so it costs a comparison,
-# never an answer.
-#[doc("Hash index from a function name to its brand-transparency summaries, in table order.")]
+# table is bucketed by id rather than scanned. First-match wins, so a
+# chain must keep table order: `idx_prepend_sym` builds newest-first,
+# hence the back-to-front index build.
+#[doc("Hash index from a function id to its brand-transparency summaries, in table order.")]
 pub type BrandTranspIndex = { ix: NameIndex[BrandTranspRec] }
 
 #[doc("Index brand-transparency summaries so a lookup does not scan them.")]
@@ -123,20 +81,16 @@ pub fn brand_transp_index(rs: [BrandTranspRec]) : BrandTranspIndex =
 fn btr_add_rev(rev: [BrandTranspRec], ix: NameIndex[BrandTranspRec]) : NameIndex[BrandTranspRec] = match rev {
   []           -> ix
   [r, ...rest] -> match r {
-    BTR(n, _) -> btr_add_rev(rest, idx_prepend(ix, n, r))
+    BTR(f, _) -> btr_add_rev(rest, idx_prepend_sym(ix, f, r))
   }
 }
 
-#[doc("Look up a function's brand-transparency summary by name.")]
-pub fn brand_transp_lookup(rs: BrandTranspIndex, name: String) : Option[BrandTransp] =
-  btr_chain_first(idx_chain(rs.ix, name), name)
-
-fn btr_chain_first(chain: [BrandTranspRec], name: String) : Option[BrandTransp] = match chain {
-  []           -> None
-  [r, ...rest] -> match r {
-    BTR(n, t) -> if n == name { Some(t) } else { btr_chain_first(rest, name) }
+#[doc("Look up a function's brand-transparency summary by its id.")]
+pub fn brand_transp_lookup(rs: BrandTranspIndex, f: SymId) : Option[BrandTransp] =
+  match idx_chain_sym(rs.ix, f) {
+    []                    -> None
+    [BTR(_, t), ..._rest] -> Some(t)
   }
-}
 
 #[doc("Select the argument a brand-transparent callee returns, if the call supplies it.")]
 pub fn transp_passthrough_arg(t: BrandTransp, args_: [Expr]) : Option[Expr] {

@@ -9,7 +9,7 @@ import compiler.ast_ids
 import compiler.brand_transp
 import compiler.core_types
 import compiler.written
-import compiler.desugar_rename
+import compiler.symtab
 
 # A brand record carries everything `--dump-brands` and the brand-
 # mismatch diagnostic need to surface. `bid` is the unique brand id;
@@ -51,60 +51,39 @@ pub(pkg) fn brand_rec_lookup(brs: [BrandRec], bid: Int) : Option[BrandRec] {
   }
 }
 
-pub(pkg) type BrandBinding = BB(String, Int)
+pub(pkg) type BrandBinding = BB(LocalId, Int)
 
 #[doc("""
 The bindings plus the program-wide brand-transparency table, which
 `expr_brand` consults to follow a brand through a pass-through
 helper call.
 """)]
-pub(pkg) type BrandEnv = BEnv([BrandBinding], BrandTranspIndex)
+pub(pkg) type BrandEnv = BEnv([BrandBinding], BrandTranspIndex, SymTab)
 
-#[doc("An environment with no binding and the brand-transparency table `ts`.")]
-pub(pkg) fn benv_with_transp(ts: BrandTranspIndex) : BrandEnv = BEnv([], ts)
+#[doc("An environment with no binding, the brand-transparency table `ts` and the table `tab` that names the functions it summarises.")]
+pub(pkg) fn benv_with_transp(ts: BrandTranspIndex, tab: SymTab) : BrandEnv = BEnv([], ts, tab)
 
 fn benv_transp(e: BrandEnv) : BrandTranspIndex {
-  match e { BEnv(_, ts) -> ts }
+  match e { BEnv(_, ts, _) -> ts }
 }
 
-fn benv_push(e: BrandEnv, name: String, bid: Int) : BrandEnv {
-  match e { BEnv(xs, ts) -> BEnv([BB(name, bid), ...xs], ts) }
+fn benv_tab(e: BrandEnv) : SymTab {
+  match e { BEnv(_, _, tab) -> tab }
 }
 
-#[doc("`e` without the binding of `name`.")]
-pub(pkg) fn benv_remove(e: BrandEnv, name: String) : BrandEnv {
-  match e { BEnv(xs, ts) -> BEnv(benv_remove_loop(xs, name, []), ts) }
+fn benv_push(e: BrandEnv, l: LocalId, bid: Int) : BrandEnv {
+  match e { BEnv(xs, ts, tab) -> BEnv([BB(l, bid), ...xs], ts, tab) }
 }
 
-fn benv_remove_loop(xs: [BrandBinding], name: String,
-                      acc: [BrandBinding]) : [BrandBinding] {
-  match xs {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      BB(n, _) ->
-        if n == name { benv_remove_loop(rest, name, acc) }
-        else        { benv_remove_loop(rest, name, [h, ...acc]) }
-    }
-  }
+fn benv_lookup(e: BrandEnv, l: LocalId) : Option[Int] {
+  match e { BEnv(xs, _, _) -> benv_lookup_loop(xs, l) }
 }
 
-#[doc("`e` without the bindings of `names`.")]
-pub(pkg) fn benv_remove_all(e: BrandEnv, names: [String]) : BrandEnv {
-  match names {
-    [] -> e
-    [h, ...rest] -> benv_remove_all(benv_remove(e, h), rest)
-  }
-}
-
-fn benv_lookup(e: BrandEnv, name: String) : Option[Int] {
-  match e { BEnv(xs, _) -> benv_lookup_loop(xs, name) }
-}
-
-fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
+fn benv_lookup_loop(xs: [BrandBinding], l: LocalId) : Option[Int] {
   match xs {
     [] -> None
     [h, ...rest] -> match h {
-      BB(n, b) -> if n == name { Some(b) } else { benv_lookup_loop(rest, name) }
+      BB(n, b) -> if local_eq(n, l) { Some(b) } else { benv_lookup_loop(rest, l) }
     }
   }
 }
@@ -123,7 +102,7 @@ by index, a record field) is treated as unbranded.
 """)]
 pub(pkg) fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
   match e.kind {
-    EName(name) -> benv_lookup(env, written_text(name))
+    ELocal(l) -> benv_lookup(env, l)
     ECall(callee, args_) -> match callee.kind {
       EField(base, op_name) -> match base.kind {
         ESym(eff_sym, _) ->
@@ -140,14 +119,14 @@ pub(pkg) fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int]
       }
       # A call to a brand-transparent helper carries the brand of the
       # argument it returns, so `let g = id(f)` keeps `f`'s brand.
-      EName(fname) -> transp_call_brand(written_text(fname), args_, env, calls)
+      ESym(f, _) -> transp_call_brand(f, args_, env, calls)
       _ -> None
     }
     _ -> None
   }
 }
 
-fn transp_call_brand(fname: String, args_: [Expr], env: BrandEnv,
+fn transp_call_brand(fname: SymId, args_: [Expr], env: BrandEnv,
                        calls: [BrandCall]) : Option[Int] {
   match brand_transp_lookup(benv_transp(env), fname) {
     None -> None
@@ -230,9 +209,9 @@ pub(pkg) fn warn_brand_opaque_call(callee: Expr, args_: [Expr], env: BrandEnv,
                             brs: [BrandRec]) : Unit / Console + File {
 
   match callee.kind {
-    EName(fname) -> match brand_transp_lookup(benv_transp(env), written_text(fname)) {
+    ESym(f, _) -> match brand_transp_lookup(benv_transp(env), f) {
       Some(BTParam(_)) -> ()
-      _ -> warn_branded_args(written_text(fname), args_, env, file, calls, brs)
+      _ -> warn_branded_args(written_text(decl_name(benv_tab(env), f)), args_, env, file, calls, brs)
     }
     _ -> ()
   }
@@ -298,14 +277,12 @@ strip the brand (matches consumer behaviour).
 """)]
 pub(pkg) fn bind_brand_pat(pat: Pattern, rhs: Expr, env: BrandEnv,
                     calls: [BrandCall]) : BrandEnv {
-  let names = dsg_pat_bindings(pat, [])
-  let env1 = benv_remove_all(env, names)
   match pat.pkind {
     PBind(n) -> match expr_brand(rhs, env, calls) {
-      Some(bid) -> benv_push(env1, written_text(n.name), bid)
-      None -> env1
+      Some(bid) -> benv_push(env, n.id, bid)
+      None -> env
     }
-    _ -> env1
+    _ -> env
   }
 }
 
