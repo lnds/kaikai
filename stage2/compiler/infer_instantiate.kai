@@ -354,9 +354,23 @@ fn rigid_row_forced(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable =
   [] -> None
   _  -> match unify_env(st.env, a, b, subst_with_rigid_rows(st.sub, [])) {
     None    -> None
-    Some(_) -> Some(RigidWhy("a function that may perform effects is used where a pure function type is expected: the row variable declared on the enclosing function stands for any effects its callers choose",
-                             "widen the expected function type with the row (`/ e`), or handle the effect before this point"))
+    Some(_) -> Some(rigid_row_why(sig_row_name(st)))
   }
+}
+
+
+fn rigid_row_why(name: Option[String]) : RigidWhy = match name {
+  Some(n) -> RigidWhy("a function that may perform effects is used where a pure function type is expected: the row variable `#{n}` declared on the enclosing function stands for any effects its callers choose",
+                      "widen the expected function type with the row (`/ #{n}`), or handle the effect before this point")
+  None    -> RigidWhy("a function that may perform effects is used where a pure function type is expected: a row variable declared on the enclosing function stands for any effects its callers choose",
+                      "widen the expected function type with the row, or handle the effect before this point")
+}
+
+
+# The enclosing signature's row variable by its written name, when it declares exactly one.
+fn sig_row_name(st: InferState) : Option[String] = match st.sig_rows {
+  [RVB(n, _)] -> Some(tbs_text_of(st.sig_tps, n))
+  _           -> None
 }
 
 
@@ -423,14 +437,16 @@ fn first_failing_arg_loop(env: TyEnv, sub: Subst, params: [Ty],
 # The notes under a "type mismatch in function call": the failing
 # argument and the callee's signature.
 fn call_mismatch_notes(env: TyEnv, sub: Subst, name_opt: Option[String],
-                       callee_ty: Ty, arg_tys: [Ty],
+                       callee_ty: Ty, arg_tys: [Ty], arg_exprs: [Expr],
                        file: String, line: Int, col: Int,
                        expected_shown: String) : [RelatedInfo] / Mutable {
   let resolved = apply_ty(sub, callee_ty)
-  let arg_notes = match first_failing_arg(env, sub, resolved, arg_tys) {
+  let failing = first_failing_arg(env, sub, resolved, arg_tys)
+  let (al, ac) = arg_pos(arg_exprs, failing, line, col)
+  let arg_notes = match failing {
     Some(idx) -> match name_opt {
-      Some(nm) -> [ri_note(file, line, col, "in argument #{int_to_string(idx)} of `#{nm}`")]
-      None     -> [ri_note(file, line, col, "in argument #{int_to_string(idx)}")]
+      Some(nm) -> [ri_note(file, al, ac, "in argument #{int_to_string(idx)} of `#{nm}`")]
+      None     -> [ri_note(file, al, ac, "in argument #{int_to_string(idx)}")]
     }
     None -> []
   }
@@ -489,23 +505,23 @@ fn arity_mismatch_of(sub: Subst, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] {
 # (Template 5) when applicable.
 #[doc("Typer-internal helper `st_unify_call` shared across the infer modules.")]
 pub fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
-                   arg_tys: [Ty], expected_fn_ty: Ty,
+                   arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                    line: Int, col: Int) : InferState / Console + File + Mutable =
-  st_unify_named(st, callee_display_name(st, callee), callee_ty, arg_tys, expected_fn_ty, line, col)
+  st_unify_named(st, callee_display_name(st, callee), callee_ty, arg_tys, arg_exprs, expected_fn_ty, line, col)
 
 
 # `st_unify_call` for a callee the notes name `who`: an operator has no
 # callee node, only the text the user wrote.
 #[doc("Typer-internal helper `st_unify_named` shared across the infer modules.")]
 pub fn st_unify_named(st: InferState, who: Option[String], callee_ty: Ty,
-                   arg_tys: [Ty], expected_fn_ty: Ty,
+                   arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                    line: Int, col: Int) : InferState / Console + File + Mutable {
   let w = widen_call_args(st.env, st.sub, callee_ty, expected_fn_ty)
-  unify_widened_call(st_set_sub(st, w.sub), who, callee_ty, arg_tys, w.ty, line, col)
+  unify_widened_call(st_set_sub(st, w.sub), who, callee_ty, arg_tys, arg_exprs, w.ty, line, col)
 }
 
 fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
-                      arg_tys: [Ty], expected_fn_ty: Ty,
+                      arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                       line: Int, col: Int) : InferState / Console + File + Mutable {
 
 
@@ -520,7 +536,7 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
       let d = build_wrong_arity_diag(st.env, st.file, who, resolved_callee, arg_tys, line, col)
       st_bump_err(st_push_diag(st, d))
     }
-    None -> match rigid_row_call(st, who, callee_ty, arg_tys, expected_fn_ty, line, col) {
+    None -> match rigid_row_call(st, who, callee_ty, arg_tys, arg_exprs, expected_fn_ty, line, col) {
       Some(st_row) -> st_row
       None -> {
       let pre_errs = st.errs
@@ -530,7 +546,7 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
         # trailing signature note can drop itself when it would repeat it.
         let expected_shown = inf_ty_to_string_ow(st1.env.tab, st1.env.head_owners, apply_ty(st1.sub, callee_ty))
         st_relate_all(st1, call_mismatch_notes(st1.env, st1.sub, who, callee_ty,
-                                               arg_tys, st1.file, line, col, expected_shown))
+                                               arg_tys, arg_exprs, st1.file, line, col, expected_shown))
       } else { st1 }
       }
     }
@@ -540,21 +556,33 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
 
 # The call whose argument is the effectful function a pure parameter rejects:
 # names the argument, the parameter's pure type and the way out.
-fn rigid_row_call(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [Ty], expected_fn_ty: Ty,
+fn rigid_row_call(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                   line: Int, col: Int) : Option[InferState] / Console + File + Mutable =
   if st.sub.rigid_rows == [] or rigid_row_unifies(st, callee_ty, expected_fn_ty) { None }
   else { match rigid_row_forced(st, callee_ty, expected_fn_ty) {
     None -> None
     Some(RigidWhy(msg, help)) -> {
       let resolved = apply_ty(st.sub, callee_ty)
-      let notes = match rigid_row_pure_arg(st, resolved, arg_tys) {
-        Some(idx) -> [rigid_row_arg_note(st.env, who, resolved, idx)]
-        None      -> []
+      let idx = rigid_row_pure_arg(st, resolved, arg_tys)
+      let notes = match idx {
+        Some(i) -> [rigid_row_arg_note(st.env, who, resolved, i)]
+        None    -> []
       }
-      let rel = list_append(map(notes, (n) => ri_note(st.file, line, col, n)), [ri_help(st.file, line, col, help)])
-      Some(st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, rel))))
+      let (al, ac) = arg_pos(arg_exprs, idx, line, col)
+      let rel = list_append(map(notes, (n) => ri_note(st.file, al, ac, n)), [ri_help(st.file, al, ac, help)])
+      Some(st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, al, ac, msg, rel))))
     }
   } }
+
+
+# Where the 1-indexed argument starts, else the call.
+fn arg_pos(arg_exprs: [Expr], idx: Option[Int], line: Int, col: Int) : (Int, Int) = match idx {
+  Some(i) -> match nth(arg_exprs, i - 1) {
+    Some(a) -> (a.line, a.col)
+    None    -> (line, col)
+  }
+  None -> (line, col)
+}
 
 
 fn rigid_row_pure_arg(st: InferState, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] / Mutable =
