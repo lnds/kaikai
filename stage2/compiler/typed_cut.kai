@@ -57,6 +57,9 @@ import compiler.doc_attr
 import compiler.written
 import compiler.core_cut
 import compiler.core_front
+import compiler.core_reach
+import compiler.resolve_env.{Env}
+import compiler.resolve_program
 import compiler.infer_index
 
 #[doc("Per-module cut context: the cache directory (empty disables the cut), the cross-module context hash folded into every module key, the scope view of each file, the target module that owns untagged declarations, and the root modules.")]
@@ -278,7 +281,7 @@ pub fn tcut_typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls
         TcDone(TCL(acc, _, _, _, _, ctxs), ms, late) -> {
           let tp = tcf_finish(tcf_keep_toplevel(acc, first_acc), all_program_decls)
           let firsts = tcf_finish(first_acc, all_program_decls).decls
-          TcOut(TypedProgram { ...tp, decls: tcut_weave(file, defer.order, dm, list_reverse(ctxs), firsts, late) }, ms)
+          TcOut(TypedProgram { ...tp, decls: tcut_weave(file, tcut_with_left_out(defer.order, defer.front, dm, late), dm, list_reverse(ctxs), firsts, late) }, ms)
         }
       }
     }
@@ -289,8 +292,41 @@ pub fn tcut_typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls
 fn tcut_weave(file: String, order: [Decl], dm: Demand, ctxs: [TcCtx], firsts: [Decl], late: [Decl]) : [Decl] = {
   let slices = tcut_slices(ctxs, firsts, [])
   let lates = foldl(late, idx_empty(), (ix, d) => idx_prepend_sym(ix, tcg_decl_sym(d), d))
-  let kept = filter(order, (d) => not demand_pooled(dm, tcg_decl_sym(d)) or tcx_asked(lates, d))
+  let kept = filter(order, (d) => not tcut_deferred(dm, tcg_decl_sym(d)) or tcx_asked(lates, d))
   flat_map(partition_decls_by_home(kept, root_module_name(file)), (m) => tcut_weave_module(dm, lates, m.decls, tcut_slice_of(slices, m.name), []))
+}
+
+fn tcut_deferred(dm: Demand, s: SymId) : Bool = demand_pooled(dm, s) or demand_left_out(dm, s)
+
+# The program with the left-out declared builtins a late batch restored put back where the stream held them: before the next function it keeps, or last.
+fn tcut_with_left_out(order: [Decl], front: Option[FrontSrc], dm: Demand, late: [Decl]) : [Decl] =
+  if not any(late, (d) => demand_left_out(dm, tcg_decl_sym(d))) { order }
+  else { match front {
+    None -> order
+    Some(sr) -> {
+      let present = foldl(order, idx_empty(), (ix, d) => idx_prepend_sym(ix, tcg_decl_sym(d), true))
+      match tcut_anchors(dm, present, sr.core, [], idx_empty()) {
+        TcAnch(ix, tail) -> list_append(flat_map(order, (d) => list_append(list_reverse(idx_chain_sym(ix, tcg_decl_sym(d))), [d])), tail)
+      }
+    }
+  } }
+
+type TcAnch = TcAnch(NameIndex[Decl], [Decl])
+
+fn tcut_anchors(dm: Demand, present: NameIndex[Bool], core: [Decl], pending: [Decl], ix: NameIndex[Decl]) : TcAnch = match core {
+  [] -> TcAnch(ix, list_reverse(pending))
+  [d, ...rest] -> {
+    let s = tcg_decl_sym(d)
+    if sym_raw(s) < 0 { tcut_anchors(dm, present, rest, pending, ix) }
+    else if demand_left_out(dm, s) { tcut_anchors(dm, present, rest, [d, ...pending], ix) }
+    else if tcx_has(present, s) { tcut_anchors(dm, present, rest, [], foldl(list_reverse(pending), ix, (acc, g) => idx_prepend_sym(acc, s, g))) }
+    else { tcut_anchors(dm, present, rest, pending, ix) }
+  }
+}
+
+fn tcx_has(ix: NameIndex[Bool], s: SymId) : Bool = match idx_chain_sym(ix, s) {
+  [] -> false
+  _  -> true
 }
 
 type TcSlice = TcSlice(Option[String], [Decl])
@@ -307,7 +343,7 @@ fn tcut_slice_of(ss: [TcSlice], name: Option[String]) : [Decl] = match ss {
 
 fn tcut_weave_module(dm: Demand, lates: NameIndex[Decl], orig: [Decl], first: [Decl], acc: [Decl]) : [Decl] = match orig {
   [] -> list_append(list_reverse(acc), first)
-  [o, ...rest] -> if demand_pooled(dm, tcg_decl_sym(o)) {
+  [o, ...rest] -> if tcut_deferred(dm, tcg_decl_sym(o)) {
     tcut_weave_module(dm, lates, rest, first, list_append(list_reverse(idx_chain_sym(lates, tcg_decl_sym(o))), acc))
   } else { match first {
     [f, ...more] -> tcut_weave_module(dm, lates, rest, more, [f, ...acc])
@@ -333,28 +369,67 @@ fn tcut_demand(file: String, df: DiagFiles, all_program_decls: [Decl], protos: P
       let _note = if stats { eprint("kaic2: core-demand: typing #{list_length(want)}: #{string_join(core_cut_names(tab, want), ", ")}") } else { () }
       let asked = foldl(want, idx_empty(), (ix, s) => idx_prepend_sym(ix, s, s))
       let fc2 = match fc { Some(_) -> fc  None -> map(src, front_ctx) }
-      let batches = filter(map(full, (m) => ModuleDecls { name: m.name, decls: map(filter(m.decls, (d) => tcx_asked(asked, d)), (d) => tcut_completed(dm, src, fc2, d)) }), (m) => not list_is_empty(m.decls))
-      match tcut_batches(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, sh, inherited, batches, acc, ctxs, []) {
-        TcB(acc2, ctxs2, typed) -> tcut_demand(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, dm, st2, stats, full,
-                                                TCL(acc2, inherited, iface, sh, typed, ctxs2), list_append(miss, missed), list_append(typed, late), src, fc2)
+      let picked = filter(map(full, (m) => ModuleDecls { name: m.name, decls: filter(m.decls, (d) => tcx_asked(asked, d)) }), (m) => not list_is_empty(m.decls))
+      let pend = tcut_pending(dm, fc2, flat_map(picked, .decls))
+      let rs = demand_restores(tab, dm, st2, map(pend, (p) => match p { TcPend(_, FrontBody(_, d)) -> d }))
+      let st3 = match rs { DmRestore(_, t) -> t }
+      let back = match rs { DmRestore(ss, _) -> tcut_restored(src, fc2, st2.nback, ss) }
+      let _back_note = if stats and not list_is_empty(back) { eprint("kaic2: core-demand: restoring #{list_length(back)} left out: #{string_join(core_cut_names(tab, map(back, tcg_decl_sym)), ", ")}") } else { () }
+      let env2 = tcut_registered(src, fc2, back)
+      let completed = map(picked, (m) => ModuleDecls { name: m.name, decls: map(m.decls, (d) => tcut_completed(fc2, env2, pend, d)) })
+      let batches = list_append(partition_decls_by_home(back, root_module_name(file)), completed)
+      let sh2 = TcShared { ...sh, pool: foldl(back, sh.pool, (ix, d) => idx_prepend_sym(ix, tcg_decl_sym(d), d)) }
+      match tcut_batches(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, sh2, inherited, batches, acc, ctxs, []) {
+        TcB(acc2, ctxs2, typed) -> tcut_demand(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, dm, st3, stats, full,
+                                                TCL(acc2, inherited, iface, sh2, typed, ctxs2), list_append(miss, missed), list_append(typed, late), src, fc2)
       }
     }
   }
 }
 
+# The bodies of the asked functions an earlier cut emptied, before their names are resolved.
+type TcPend = TcPend(SymId, FrontBody)
+
+fn tcut_pending(dm: Demand, fc: Option[FrontCtx], ds: [Decl]) : [TcPend] / Console + File = match fc {
+  None -> []
+  Some(f) -> flat_map(filter(ds, (d) => demand_emptied(dm, tcg_decl_sym(d))), (d) => match front_pending(f, tcg_decl_sym(d)) {
+    Some(b) -> [TcPend(tcg_decl_sym(d), b)]
+    None -> panic("a function the cut emptied has no parsed declaration")
+  })
+}
+
+fn tcut_pend_of(ps: [TcPend], s: SymId) : Option[FrontBody] = match ps {
+  [] -> None
+  [TcPend(t, b), ...rest] -> if sym_same(t, s) { Some(b) } else { tcut_pend_of(rest, s) }
+}
+
+# The declared builtins the early cut left out that a completed body names, as the stream would have them.
+fn tcut_restored(src: Option[FrontSrc], fc: Option[FrontCtx], k: Int, ss: [SymId]) : [Decl] / Console + File = match src {
+  Some(sr) -> match fc {
+    Some(f) -> list_reverse(tcut_restore_loop(f, sr.env, k, ss, []))
+    None -> []
+  }
+  None -> []
+}
+
+fn tcut_restore_loop(f: FrontCtx, env: Env, k: Int, ss: [SymId], acc: [Decl]) : [Decl] / Console + File = match ss {
+  [] -> acc
+  [s, ...rest] -> match front_pending_left_out(f, k, s) {
+    Some(b) -> tcut_restore_loop(f, env, k + 1, rest, [front_resolve(f, env, b), ...acc])
+    None -> tcut_restore_loop(f, env, k + 1, rest, acc)
+  }
+}
+
+# The environment the bodies are resolved in: the stream's, with the restored builtins registered.
+fn tcut_registered(src: Option[FrontSrc], fc: Option[FrontCtx], back: [Decl]) : Option[Env] =
+  and_then(src, (sr) => map(fc, (f) => if list_is_empty(back) { sr.env } else { register_restored(sr.env, back, f.cx.target) }))
+
 # A function whose body an earlier cut emptied is completed from its parsed declaration.
-fn tcut_completed(dm: Demand, src: Option[FrontSrc], fc: Option[FrontCtx], d: Decl) : Decl / Console + File =
-  if not demand_emptied(dm, tcg_decl_sym(d)) { d }
-  else { match src {
-    Some(sr) -> match fc {
-      Some(f) -> match front_complete(f, sr.env, tcg_decl_sym(d)) {
-        Some(c) -> c
-        None -> panic("a function the cut emptied has no parsed declaration")
-      }
-      None -> panic("a function the cut emptied is asked for before the tables to complete it exist")
-    }
+fn tcut_completed(fc: Option[FrontCtx], env: Option[Env], pend: [TcPend], d: Decl) : Decl / Console + File =
+  match tcut_pend_of(pend, tcg_decl_sym(d)) {
     None -> d
-  } }
+    Some(b) -> unwrap_or(and_then(fc, (f) => map(env, (e) => front_resolve(f, e, b))), d)
+  }
 
 type TcB = TcB(TCFold, [TcCtx], [Decl])
 
@@ -365,7 +440,7 @@ fn tcut_batches(file: String, df: DiagFiles, all_program_decls: [Decl], protos: 
   [] -> TcB(acc, ctxs, typed)
   [b, ...rest] -> match tcx_front(file, head_owners, tab, b.name, TcX(ModuleDecls { name: b.name, decls: [] }, inherited, sh, None, 0), ctxs, []) {
     TcFr(fr, inh, ctxs2) -> {
-      let own = ModuleFront { ...fr, data: ProgramData { ...fr.data, decls_a: expand_unit_aliases_decls(b.decls, unit_alias_compose(fr.delta.unit_aliases, inh.unit_aliases)) } }
+      let own = module_front_pooled(ModuleFront { ...fr, data: ProgramData { ...fr.data, decls_a: expand_unit_aliases_decls(b.decls, unit_alias_compose(fr.delta.unit_aliases, inh.unit_aliases)) } }, sh)
       let tm = module_bodies(file, df, b, own, all_program_decls, protos, kind_theories, tab, sh, verbose)
       tcut_batches(file, df, all_program_decls, protos, head_owners, kind_theories, tab, verbose, sh, inherited, rest,
                     tcf_step(acc, tm), ctxs2, list_append(tm.typed.decls, typed))
