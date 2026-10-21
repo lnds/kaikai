@@ -17,9 +17,7 @@ LEAKS=0
 [ "$(uname -s)" = Linux ] && LEAKS=1
 CFLAGS_ASAN="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable"
 
-DECLS='extern "kai"("kai_core_string_concat") pub fn string_concat(a: String, b: String) : String
-extern "kai"("kai_core_list_reverse") pub fn list_reverse[T](xs: [T]) : [T]
-extern "kai"("kai_core_vec_push") pub fn vec_push[T](v: Vec[T], x: T) : Vec[T]
+DECLS='extern "kai"("kai_core_vec_push") pub fn vec_push[T](v: Vec[T], x: T) : Vec[T]
 extern "kai"("kai_core_array_set") pub fn array_set[T](a: Array[T], i: Int, x: T) : Array[T] / Mutable
 extern "kai"("kai_core_print") pub fn print(s: String) : Unit / Stdout'
 
@@ -77,8 +75,8 @@ run declared "$tmp/stdlib" || exit 1
 # emitted its fn: the run did compile against the declarations.
 KAIKAI_STDLIB_PATH="$tmp/stdlib" stage2/kaic2 --path "$tmp/stdlib" --emit=kir "$FIX.kai" > "$tmp/declared.kir" \
   || { echo "kai-builtins-asan FAIL ($backend): --emit=kir"; exit 1; }
-for name in string_concat list_reverse vec_push array_set print; do
-  grep -q "^fn os__$name(" "$tmp/declared.kir" || { echo "kai-builtins-asan FAIL ($backend): no fn for the declaration of $name"; exit 1; }
+for name in string__string_concat list__list_reverse os__vec_push os__array_set os__print; do
+  grep -q "^fn $name(" "$tmp/declared.kir" || { echo "kai-builtins-asan FAIL ($backend): no fn for the declaration of $name"; exit 1; }
 done
 for sym in $(grep -o 'kaix_core_[A-Za-z0-9_]*' "$tmp/declared.kir" | sort -u); do
   grep -q "^KaiValue \*$sym(" stage0/runtime_llvm.c || { echo "kai-builtins-asan FAIL ($backend): a call binds $sym, which the native runtime does not define"; exit 1; }
@@ -87,8 +85,8 @@ done
 # A declaration's fn is reached only through its thunk: its prototype, its
 # definition and the thunk's call name it, no call site does.
 if [ "$backend" = c ]; then
-  for name in string_concat list_reverse vec_push array_set print; do
-    n=$(grep -o "kaiu_os__$name(" "$tmp/declared.c" | wc -l | tr -d ' ')
+  for name in string__string_concat list__list_reverse os__vec_push os__array_set os__print; do
+    n=$(grep -o "kaiu_$name(" "$tmp/declared.c" | wc -l | tr -d ' ')
     [ "$n" -eq 3 ] || { echo "kai-builtins-asan FAIL (c): a call to $name reached its declaration's fn ($n uses), not the runtime symbol"; exit 1; }
   done
 fi
