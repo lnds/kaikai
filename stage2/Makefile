@@ -10463,6 +10463,28 @@ test-heap-limit: $(TARGET) build
 	  || { echo "heap-limit FAIL (churn under 64m: freed bytes counted, exit $$ch)"; cat build/s2-878ch.out build/s2-878ch.err; exit 1; }; \
 	echo "heap-limit OK (64m -> clean abort exit 1; 2g + unset -> complete len=268435456; churn under 64m completes; cap contains live bytes, unset unchanged)"
 
+# read_line over stdin: one line per call, '\n' dropped, '\r' kept, a final
+# unterminated line still read, EOF only once the input is exhausted.
+.PHONY: test-read-line
+test-read-line: $(TARGET) build
+	@set -e; \
+	$(KAIC2) --path ../stdlib ../examples/runtime/read_line_stdin.kai > build/s2-rdln.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-rdln.c -o build/s2-rdln $(LDLIBS_M); \
+	chk() { out=$$(printf "$$1" | ./build/s2-rdln); \
+	  [ "$$out" = "$$(printf "$$2")" ] || { echo "read-line FAIL (input '$$1')"; printf '%s\n' "$$out"; exit 1; }; }; \
+	chk '' 'lines=0'; \
+	chk '\n' '[]\nlines=1'; \
+	chk 'a\nb\n' '[a]\n[b]\nlines=2'; \
+	chk 'a\nb' '[a]\n[b]\nlines=2'; \
+	chk 'a\n\nb' '[a]\n[]\n[b]\nlines=3'; \
+	chk 'a\r\nb\r\n' '[a\r]\n[b\r]\nlines=2'; \
+	chk 'abc' '[abc]\nlines=1'; \
+	long=$$(head -c 5000 /dev/zero | tr '\0' x); \
+	chk "$$long\nz\n" "[$$long]\n[z]\nlines=2"; \
+	exact=$$(head -c 511 /dev/zero | tr '\0' y); \
+	chk "$$exact\n$$exact" "[$$exact]\n[$$exact]\nlines=2"; \
+	echo "read-line OK"
+
 # Issue #860 — the NATIVE backend must cascade decref->free for cons cells
 # consumed by a self-tail arm (accumulator / consuming / TRMC cons-modulo).
 # Before the fix native left `free_total=0`, `leaked` growing linearly with

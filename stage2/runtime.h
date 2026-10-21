@@ -10776,21 +10776,28 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
 }
 
 static KaiValue *kai_core_read_line(void) {
-    size_t cap = KAI_READ_BUF_INIT, n = 0;
-    char *buf = (char *) malloc(cap);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    char stack_buf[512];
+    char *buf = stack_buf;
+    size_t cap = sizeof stack_buf, n = 0;
     int ch;
-    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
-        if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
+    flockfile(stdin);
+    while ((ch = getc_unlocked(stdin)) != EOF && ch != '\n') {
+        if (n + 1 >= cap) {
+            cap *= 2;
+            char *grown = (char *) (buf == stack_buf ? malloc(cap) : realloc(buf, cap));
+            if (!grown) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            if (buf == stack_buf) memcpy(grown, stack_buf, n);
+            buf = grown;
+        }
         buf[n++] = (char) ch;
     }
+    funlockfile(stdin);
     if (ch == EOF && n == 0) {
-        free(buf);
         KaiValue *msg = kai_str("read_line: end of input");
         return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
     }
     KaiValue *s = kai_str_from_bytes(buf, n);
-    free(buf);
+    if (buf != stack_buf) free(buf);
     return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
 }
 
