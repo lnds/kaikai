@@ -12134,7 +12134,15 @@ define test_coverage_run
 	rc=0; ./bin/kai test --backend=$(1) --coverage $$f > /dev/null 2> $$out.nojson.err || rc=$$?; \
 	[ "$$rc" -eq 2 ] && grep -q -- '--coverage needs --json' $$out.nojson.err \
 	  || { echo "test-coverage FAIL ($(1): --coverage without --json was not refused)"; cat $$out.nojson.err; exit 1; }; \
-	echo "test-coverage OK ($(1): per-block lines + --only)"
+	p=examples/test-runner/coverage_prune; pout=stage2/build/test-coverage-prune-$(1).json; \
+	./bin/kai test --backend=$(1) --json $$p > /dev/null 2>&1 || true; \
+	for pass in cold warm; do \
+	  ./bin/kai test --backend=$(1) --json --coverage $$p 2> $$pout.err | sed 's/"duration_ms":[0-9]*/"duration_ms":N/g' > $$pout \
+	    || { echo "test-coverage FAIL ($(1): prune run failed)"; cat $$pout.err; exit 1; }; \
+	  diff -q $$p.json.expected $$pout > /dev/null \
+	    || { echo "test-coverage DIFF ($(1): prune, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
+	done; \
+	echo "test-coverage OK ($(1): per-block lines + --only + pruned library)"
 endef
 
 test-coverage-report: $(TARGET) build
