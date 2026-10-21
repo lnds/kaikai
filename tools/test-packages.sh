@@ -25,13 +25,11 @@
 # start. Bare repos under tests/fixtures/git-fixtures/ must exist
 # (setup.sh regenerates them).
 #
-# BACKEND PARITY (design decision, 2026-05-27): this harness owns
-# package-mode backend parity. tools/test-backend-parity.sh is
-# file-mode only and cannot resolve a package's manifest deps, so the
-# `run_parity` pass below builds + runs each positive fixture under the
-# C and native backends and compares stdout. The two harnesses split on
-# the package/file axis: file-mode parity there, package-mode parity
-# here. The parity pass SKIPs when native is unavailable (C-only kaic2).
+# BACKEND PARITY: the `run_parity` pass below builds + runs each positive
+# fixture with `kai run .` under the C and native backends and compares
+# stdout. tools/test-backend-parity.sh also builds every package fixture
+# whose directory holds a kai.toml; this pass is the `kai run` path. It
+# SKIPs when native is unavailable (C-only kaic2).
 
 set -eu
 
@@ -325,10 +323,8 @@ run_check_script "native_modules" "native_modules/check.sh"
 
 # --- native-vs-C parity for package builds ---
 # Each positive fixture above is also built + run under the C and native
-# backends and their stdout compared. This is the package-mode counterpart
-# to tools/test-backend-parity.sh (which is file-mode only and cannot
-# resolve manifest deps). Covers the git-dep path (auto_install,
-# local_path) end to end under native, which the file-mode harness misses.
+# backends and their stdout compared. Covers the git-dep path
+# (auto_install, local_path) end to end under native through `kai run`.
 #
 # Probe native availability ONCE: a C-only kaic2 (the bootstrap `tier1`
 # uses) rejects --backend=native with a known sentinel, so the parity

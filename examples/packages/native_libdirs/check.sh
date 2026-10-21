@@ -45,6 +45,18 @@ expect_run() {
   fi
 }
 
+NATIVE_OK=0
+printf 'fn main() : Int = 0\n' > "$TMP/probe.kai"
+if "$KAI" build --backend=native "$TMP/probe.kai" -o "$TMP/probe" >/dev/null 2>&1; then NATIVE_OK=1; fi
+
+# The same build under the native backend must print the same.
+expect_native() {
+  en_what="$1"; en_dir="$2"; en_want="$3"; shift 3
+  [ "$NATIVE_OK" = 1 ] || return 0
+  kai_in "$en_dir" env "$@" KAI_BACKEND=native "$KAI" build . -o "$TMP/native_out"
+  expect_run "$en_what (native)" "$en_want" "$TMP/native_out"
+}
+
 cp -R "$DIR/." "$TMP/w"
 W="$TMP/w"
 VEND="$W/lib_vend"
@@ -55,6 +67,7 @@ ar rcs "$VEND/lib/libvend.a" "$TMP/vend.o"
 # 1. Relative libdirs.
 kai_in "$W/app" "$KAI" build . -o "$TMP/app_rel"
 expect_run "relative libdirs" 42 "$TMP/app_rel"
+expect_native "relative libdirs" "$W/app" 42
 
 # 2. Absolute libdirs.
 cp "$VEND/kai.toml" "$TMP/vend.toml"
@@ -83,6 +96,7 @@ Libs: -L$VEND/lib -lvend
 PC
   kai_in "$W/app_pc" env PKG_CONFIG_PATH="$TMP/pc" "$KAI" build . -o "$TMP/app_pc"
   expect_run "pkg-config" 84 "$TMP/app_pc"
+  expect_native "pkg-config" "$W/app_pc" 84 PKG_CONFIG_PATH="$TMP/pc"
 
   cp "$W/lib_pc/kai.toml" "$TMP/pc.toml"
   sed 's#"kaivend"#"kai-no-such-pc"#' "$TMP/pc.toml" > "$W/lib_pc/kai.toml"
