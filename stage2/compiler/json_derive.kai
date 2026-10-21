@@ -45,6 +45,19 @@ fn jd_var(n: String, line: Int, col: Int) : Expr = match derive_ctor_id(n) {
 fn jd_call(callee: String, targs: [Expr], line: Int, col: Int) : Expr =
   jd_expr(ECall(jd_var(callee, line, col), targs), line, col)
 
+# `callee(args)` continued over a fresh stack segment once the running one is
+# past half used, so a recursion through nested records is bounded by memory.
+# The callee is wrapped in a capture-free lambda: a minted name resolves in
+# call position only, and such a lambda is a static closure.
+fn jd_deep(callee: String, args: [Expr], slot: Int, line: Int, col: Int) : Expr = {
+  let names = if list_length(args) == 1 { ["__dx"] } else { ["__dx", "__dp"] }
+  let lcol = jd_slot_col(col, slot)
+  let ps = map(names, (n) => jd_param(n, None, line, lcol))
+  let f = jd_expr(ELambda(ps, jd_call(callee, map(names, (n) => jd_var(n, line, col)), line, col)), line, lcol)
+  jd_expr(ECall(derive_builtin_ref(if list_length(args) == 1 { "__deep_apply1" } else { "__deep_apply2" }, line, col),
+                list_append(args, [f])), line, col)
+}
+
 # A call of one of them, by the id that module gives it: a function of
 # the deriving file that shares the name is another declaration.
 fn jd_lib(callee: String, targs: [Expr], line: Int, col: Int) : Expr =
@@ -183,7 +196,7 @@ fn jd_encode(d: DeriveFor, shape: JsonShape, v: Expr, slot: Int, line: Int, col:
   JSInt  -> jd_call("JNum", [v], line, col)
   JSReal -> jd_call("JReal", [v], line, col)
   JSBool -> jd_call("JBool", [v], line, col)
-  JSRecord(rt) -> jd_call(jd_nested(d, rt, "to_json"), [v], line, col)
+  JSRecord(rt) -> jd_deep(jd_nested(d, rt, "to_json"), [v], slot, line, col)
   JSList(inner) -> jd_lib("json_of_list", [v, jd_encoder_fn(d, inner, slot, line, col)], line, col)
   JSOpt(inner)  -> jd_lib("json_of_opt", [v, jd_encoder_fn(d, inner, slot, line, col)], line, col)
 }
@@ -278,7 +291,7 @@ fn jd_decode(d: DeriveFor, shape: JsonShape, node: Expr, path: Expr, slot: Int,
   JSInt  -> jd_lib("json_bind_int", [node, path], line, col)
   JSReal -> jd_lib("json_bind_real", [node, path], line, col)
   JSBool -> jd_lib("json_bind_bool", [node, path], line, col)
-  JSRecord(rt) -> jd_nested_decode(d, rt, node, path, line, col)
+  JSRecord(rt) -> jd_nested_decode(d, rt, node, path, slot, line, col)
   JSList(inner) ->
     jd_lib("json_bind_list", [node, path, jd_decoder_fn(d, inner, slot, line, col)], line, col)
   JSOpt(inner) -> jd_opt_decode(d, inner, node, path, slot, line, col)
@@ -287,11 +300,11 @@ fn jd_decode(d: DeriveFor, shape: JsonShape, node: Expr, path: Expr, slot: Int,
 # A nested record decodes under the placeholder `json_path_child` hands
 # it, and `json_nested_result` locates a failure at this field's path, so
 # a success never builds a path that grows with depth. The nested decoder
-# is called directly: passing it as a value would allocate a closure.
-fn jd_nested_decode(d: DeriveFor, rt: DeclRef, node: Expr, path: Expr, line: Int, col: Int) : Expr = {
+# is reached through a capture-free lambda, which allocates no closure.
+fn jd_nested_decode(d: DeriveFor, rt: DeclRef, node: Expr, path: Expr, slot: Int, line: Int, col: Int) : Expr = {
   let np = jd_var("__np", line, col)
-  let child = jd_call(jd_nested(d, rt, "of_json"),
-                [node, jd_lib("json_path_child", [np], line, col)], line, col)
+  let child = jd_deep(jd_nested(d, rt, "of_json"),
+                [node, jd_lib("json_path_child", [np], line, col)], slot, line, col)
   let read = jd_lib("json_nested_result", [child, np], line, col)
   jd_expr(EBlock([SLet(jd_bind("__np", line, col), None, path)], Some(read)), line, col)
 }
