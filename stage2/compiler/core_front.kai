@@ -43,6 +43,8 @@ import compiler.cache
 import compiler.user_cache
 import compiler.emit_c_alias
 import compiler.emit_c_mangle
+import compiler.proto_resolve
+import compiler.protos_impls
 
 #[doc("The tables the passes read: each is built from the whole stream's signatures, never from a body.")]
 pub(pkg) type CoreFrontCx = {
@@ -78,12 +80,14 @@ pub(pkg) type CoreFrontCx = {
   vs_coll: [VSEntry],
   mod_imps: [ModImports],
   sel_imports: [SelImport],
-  entry: SymId
+  entry: SymId,
+  reg: ProtocolReg
 }
 
 #[doc("The module a core function was declared in.")]
 pub(pkg) fn cf_module(d: Decl) : String = match d {
   DFn(_, _, _, _, _, _, _, _, _, Some(m)) -> m
+  DImpl(_, _, _, ms, _, _, _, _) -> unwrap_or(impl_home_of(ms), "")
   _ -> ""
 }
 
@@ -137,12 +141,12 @@ fn core_front_tail(cx: CoreFrontCx, used: [Decl]) : [Decl] / Console + File = {
 }
 
 #[doc("One line per core or library function of `orig` and `libs` the stream holds: its symbol and the hash of the declaration completed on its own and of the one the stream holds, the line ending in ` !DIFF` when they differ. `stream` is the stream before resolution, `res` its resolution.")]
-pub(pkg) fn core_front_check(cx: CoreFrontCx, orig: [Decl], libs: [Decl], impls: [Decl], stream: [Decl], res: Resolution) : [String] / Console + File = {
+pub(pkg) fn core_front_check(cx: CoreFrontCx, orig: [Decl], libs: [Decl], impls: [Decl], origins: [ImplOrigin], stream: [Decl], res: Resolution) : [String] / Console + File = {
   let index = (ds) => foldl(ds, idx_empty(), (acc, o) => match o {
     DFn(_, fid, _, _, _, _, _, _, _, Some(_)) -> idx_prepend_sym(acc, fnid_sym(fid), o)
     _ -> acc
   })
-  check_loop(cx, FrontCtx { cx: cx, core: index(orig), libs: index(libs), impls: index(impls), slots: idx_empty() }, stream, res.decls, res, 0, [])
+  check_loop(cx, FrontCtx { cx: cx, core: index(orig), libs: index(libs), impls: index(impls), blocks: front_blocks(orig), origin: front_origins(origins), slots: idx_empty() }, stream, res.decls, res, 0, [])
 }
 
 fn check_loop(cx: CoreFrontCx, fc: FrontCtx, stream: [Decl], resolved: [Decl], res: Resolution, i: Int, acc: [String]) : [String] / Console + File = match stream {
@@ -159,14 +163,11 @@ fn check_loop(cx: CoreFrontCx, fc: FrontCtx, stream: [Decl], resolved: [Decl], r
   }
 }
 
-fn check_bodies(fc: FrontCtx, s: SymId) : [Decl] / Console + File = match idx_chain_sym(fc.impls, s) {
-  [h, ..._] -> core_front_tail(fc.cx, [h])
-  [] -> match idx_chain_sym(fc.core, s) {
-    [o, ..._] -> flat_map(core_front_names(fc.cx, o), (q) => core_front_body(fc.cx, q))
-    [] -> match idx_chain_sym(fc.libs, s) {
-      [o, ..._] -> flat_map(core_front_lib_names(fc.cx, o), (q) => core_front_body(fc.cx, q))
-      [] -> []
-    }
+fn check_bodies(fc: FrontCtx, s: SymId) : [Decl] / Console + File = match idx_chain_sym(fc.core, s) {
+  [o, ..._] -> flat_map(core_front_names(fc.cx, o), (q) => core_front_body(fc.cx, q))
+  [] -> match idx_chain_sym(fc.libs, s) {
+    [o, ..._] -> flat_map(core_front_lib_names(fc.cx, o), (q) => core_front_body(fc.cx, q))
+    [] -> front_bodies(fc, s)
   }
 }
 
@@ -178,10 +179,10 @@ fn check_line(cx: CoreFrontCx, bodies: [Decl], r: Decl, res: Resolution, i: Int,
 }
 
 #[doc("What a body completed on its own needs besides the tables: the declarations as they were parsed, the stream they were resolved in and where in it each stands.")]
-pub(pkg) type FrontCtx = { cx: CoreFrontCx, core: NameIndex[Decl], libs: NameIndex[Decl], impls: NameIndex[Decl], slots: NameIndex[Int] }
+pub(pkg) type FrontCtx = { cx: CoreFrontCx, core: NameIndex[Decl], libs: NameIndex[Decl], impls: NameIndex[Decl], blocks: NameIndex[Decl], origin: NameIndex[SymId], slots: NameIndex[Int] }
 
 #[doc("The source of completions: how to build the tables when the first body is asked for, the parsed declarations and the resolved stream.")]
-pub(pkg) type FrontSrc = { cx_of: () -> CoreFrontCx, core: [Decl], libs: [Decl], impls: [Decl], stream: [Decl], held: NameIndex[SymId], env: Env }
+pub(pkg) type FrontSrc = { cx_of: () -> CoreFrontCx, core: [Decl], libs: [Decl], impls: [Decl], origins: [ImplOrigin], stream: [Decl], held: NameIndex[SymId], env: Env }
 
 #[doc("The tables and indexes of `src`, built once the first body is asked for.")]
 pub(pkg) fn front_ctx(src: FrontSrc) : FrontCtx = FrontCtx {
@@ -189,6 +190,8 @@ pub(pkg) fn front_ctx(src: FrontSrc) : FrontCtx = FrontCtx {
   core: front_index(src.core),
   libs: front_index(src.libs),
   impls: front_index(src.impls),
+  blocks: front_blocks(src.core),
+  origin: front_origins(src.origins),
   slots: front_slots(src.held, src.stream, 0, idx_empty())
 }
 
@@ -196,6 +199,23 @@ fn front_index(ds: [Decl]) : NameIndex[Decl] = foldl(ds, idx_empty(), (acc, o) =
   DFn(_, fid, _, _, _, _, _, _, _, Some(_)) -> idx_prepend_sym(acc, fnid_sym(fid), o)
   _ -> acc
 })
+
+fn front_blocks(ds: [Decl]) : NameIndex[Decl] = foldl(ds, idx_empty(), (acc, o) => match pc_bare_impl(o) {
+  DImpl(_, _, _, ms, _, _, _, _) -> foldl(ms, acc, (ix, m) => match pc_bare_impl(m) {
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> idx_prepend_sym(ix, fnid_sym(fid), o)
+    _ -> ix
+  })
+  _ -> acc
+})
+
+fn pc_bare_impl(d: Decl) : Decl = match d {
+  DDoc(_, _, inner, _, _) -> pc_bare_impl(inner)
+  DAttr(_, inner, _, _)   -> pc_bare_impl(inner)
+  _ -> d
+}
+
+fn front_origins(os: [ImplOrigin]) : NameIndex[SymId] =
+  foldl(os, idx_empty(), (acc, o) => match o { ImplOrigin(f, i) -> idx_prepend_sym(acc, f, i) })
 
 fn front_slots(held: NameIndex[SymId], ds: [Decl], i: Int, acc: NameIndex[Int]) : NameIndex[Int] = match ds {
   [] -> acc
@@ -222,7 +242,23 @@ pub(pkg) fn front_complete(fc: FrontCtx, env: Env, s: SymId) : Option[Decl] / Co
 
 fn front_bodies(fc: FrontCtx, s: SymId) : [Decl] / Console + File = match idx_chain_sym(fc.impls, s) {
   [h, ..._] -> core_front_tail(fc.cx, [h])
-  [] -> flat_map(front_names(fc, s), (q) => core_front_body(fc.cx, q))
+  [] -> match idx_chain_sym(fc.origin, s) {
+    [i, ..._] -> front_block_body(fc, s, i)
+    [] -> flat_map(front_names(fc, s), (q) => core_front_body(fc.cx, q))
+  }
+}
+
+# An impl block is completed whole, lowered, and the function asked for taken from the result.
+fn front_block_body(fc: FrontCtx, s: SymId, block: SymId) : [Decl] / Console + File = match idx_chain_sym(fc.blocks, block) {
+  [o, ..._] -> {
+    let headed = flat_map(core_front_names(fc.cx, o), (q) => core_front_head(fc.cx, q))
+    let lowered = lower_impls(headed, fc.cx.reg, PScope(fc.cx.tab3, fc.cx.sym_views, fc.cx.target), [])
+    core_front_tail(fc.cx, filter(lowered.fns, (f) => match f {
+      DFn(_, fid, _, _, _, _, _, _, _, _) -> sym_same(fnid_sym(fid), s)
+      _ -> false
+    }))
+  }
+  [] -> []
 }
 
 fn front_names(fc: FrontCtx, s: SymId) : [Decl] / Console + File = match idx_chain_sym(fc.core, s) {
