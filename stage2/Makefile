@@ -5743,7 +5743,7 @@ COMMA := ,
 SEG_RT_WARN := -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g
 define seg_rt_build
 	@$(CC) $(SEG_RT_WARN) -O2 $(2) $(CPPFLAGS_CORE) -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 \
-	    -DKAI_PROGRAM_PROVIDES_MAIN=1 -I ../stage0 -c runtime_owner_c.c -o build/seg_rt_owner$(1).o
+	    -DKAI_PROGRAM_PROVIDES_MAIN=1 -I ../stage0 -I . -c tests/segment_runtime_owner.c -o build/seg_rt_owner$(1).o
 	@$(CC) $(SEG_RT_WARN) -O2 $(2) $(CPPFLAGS_CORE) -DKAI_SEPARATE_COMPILATION=1 -I ../stage0 \
 	    -c tests/segment_runtime_test.c -o build/seg_rt_test$(1).o
 	@$(CC) $(2) build/seg_rt_test$(1).o build/seg_rt_owner$(1).o -o build/segment_runtime_test$(1) \

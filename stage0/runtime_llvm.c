@@ -127,7 +127,6 @@ KaiValue *kaix_add(KaiValue *a, KaiValue *b)   { return kai_op_add(a, b); }
 KaiValue *kaix_sub(KaiValue *a, KaiValue *b)   { return kai_op_sub(a, b); }
 KaiValue *kaix_mul(KaiValue *a, KaiValue *b)   { return kai_op_mul(a, b); }
 KaiValue *kaix_div(KaiValue *a, KaiValue *b)   { return kai_op_div(a, b); }
-KaiValue *kaix_idiv(KaiValue *a, KaiValue *b)  { return kai_op_idiv(a, b); }
 KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_op_mod(a, b); }
 /* Raw i64 `/` `%` the native backend calls in place of a bare `sdiv`/`srem`,
    so div-by-zero and INT64_MIN/-1 trap instead of hitting hardware UB. */
@@ -203,85 +202,6 @@ KaiValue *kaix_or(KaiValue *a, KaiValue *b) {
 /* ---------- control helpers ---------- */
 int kaix_truthy(KaiValue *v)                   { return kai_op_truthy(v); }
 
-/* ---------- m13 bit ops ----------
- * The C backend (stage2/compiler.kai emit_call_expr ~line 12151)
- * lowers `bit_and(a, b)` etc. to an inline GNU statement-expression
- * that reads the operands' int payload, boxes via `kai_int`, and
- * decrefs the operands. The LLVM backend cannot use statement-
- * expressions, so these mirror wrappers do the same operation in a
- * stable external symbol callable from IR. Caller hands us owned refs
- * and must release them exactly once — we do that here, matching the C
- * path's refcount discipline.
- *
- * Reads go through `kai_intf` (not raw `->as.i`): under the unified
- * stage2 runtime an Int is a tagged immediate, so `->as.i` would
- * dereference the tag bits. `kai_intf` returns the payload for both
- * tagged and boxed Ints. `kai_decref` on a tagged immediate is a
- * no-op (it checks `kai_is_value` first), so the discipline holds. */
-KaiValue *kaix_bit_and(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) & kai_intf(b));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_or(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) | kai_intf(b));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_not(KaiValue *a) {
-    KaiValue *r = kai_int(~ kai_intf(a));
-    kai_decref(a);
-    return r;
-}
-KaiValue *kaix_bit_shl(KaiValue *a, KaiValue *b) {
-    /* Shifted-out bits wrap (uint64_t compute); count masked `& 63`. */
-    KaiValue *r = kai_int((int64_t)((uint64_t) kai_intf(a) << (kai_intf(b) & 63)));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_shr(KaiValue *a, KaiValue *b) {
-    /* Arithmetic shift: signed `>>` preserves the sign bit. */
-    KaiValue *r = kai_int(kai_intf(a) >> (kai_intf(b) & 63));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_ushr(KaiValue *a, KaiValue *b) {
-    /* Logical shift: cast through uint64_t to zero-fill. */
-    KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> (kai_intf(b) & 63)));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_count(KaiValue *a) {
-    KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a)));
-    kai_decref(a);
-    return r;
-}
-KaiValue *kaix_bit_test(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_bool(((kai_intf(a) >> (kai_intf(b) & 63)) & 1) != 0);
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_set(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) | (int64_t)((uint64_t)1 << (kai_intf(b) & 63)));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_clear(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) & ~(int64_t)((uint64_t)1 << (kai_intf(b) & 63)));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-KaiValue *kaix_bit_toggle(KaiValue *a, KaiValue *b) {
-    KaiValue *r = kai_int(kai_intf(a) ^ (int64_t)((uint64_t)1 << (kai_intf(b) & 63)));
-    kai_decref(a); kai_decref(b);
-    return r;
-}
-
 /* ---------- issue #87 — Phase 2 unbox boundary readers ----------
  * Mirror of the C backend's `(boxed)->as.i` / `->as.b` / `->as.r` /
  * `->as.c` field reads used by `emit_expr_raw`'s MBoxed boundary
@@ -291,13 +211,6 @@ KaiValue *kaix_bit_toggle(KaiValue *a, KaiValue *b) {
  * Used at the MBoxed → MUnboxed boundary inside the LLVM emitter
  * (raw operand of an MUnboxed binop, raw scrutinee of a switch). */
 int64_t  kaix_to_int(KaiValue *v)              { return kai_intf(v); }
-int      kaix_to_bool(KaiValue *v)             { return v->as.b; }
-double   kaix_to_real(KaiValue *v)             { return v->as.r; }
-/* m12.7.x FFI v1: read the raw C-string pointer out of a boxed
- * KaiValue. Used by the LLVM-side FFI shim to forward `String`
- * params straight to the extern. The pointer aliases the boxed
- * value's storage, so the caller must not free it. */
-const char *kaix_to_str_data(KaiValue *v)      { return v->as.s.bytes; }
 uint32_t kaix_to_char(KaiValue *v)             { return v->as.c; }
 
 /* Bounds gate for a dynamic index into a fixed-width `Vec[t]<n>`; traps
@@ -314,8 +227,6 @@ KaiValue *kaix_core_eprint(KaiValue *v)         { return kai_core_eprint(v); }
 KaiValue *kaix_core_write_stdout(KaiValue *v)   { return kai_core_write_stdout(v); }
 KaiValue *kaix_core_int_to_string(KaiValue *v)  { return kai_core_int_to_string(v); }
 
-/* ---------- M3c: strings, ranges, higher-order core ---------- */
-KaiValue *kaix_string_concat(KaiValue *a, KaiValue *b)         { return kai_string_concat(a, b); }
 KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_string(v); }
 
 /* Issue #86: contract / plain asserts under the LLVM backend. The C
@@ -725,12 +636,6 @@ int64_t kaix_variant_arg_i64(KaiValue *v, int i) {
     return kai_var_slots(v)[i].i64;
 }
 
-/* i64-inline parity (#747) — read a kind-2 Real slot as a raw `double`.
- * Same rationale as `kaix_variant_arg_i64` for the `.r` word. */
-double kaix_variant_arg_f64(KaiValue *v, int i) {
-    return kai_var_slots(v)[i].r;
-}
-
 /* kai_op_eq returns an int; wrap for direct use from the IR in match
    guards or literal patterns that want a KaiValue* Bool. */
 KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_op_eq(a, b)); }
@@ -782,10 +687,6 @@ void      kaix_decref(KaiValue *v)                        { kai_decref(v); }
  * branded ctor reached outside any region stays sound. */
 void      kaix_arena_push(void)                          { (void) kai_arena_push(); }
 void      kaix_arena_pop(void)                           { kai_arena_pop(); }
-KaiValue *kaix_arena_alloc(KaiTag tag) {
-    KaiArena *a = kai_arena_current();
-    return a ? kai_arena_alloc(a, tag) : kai_alloc(tag);
-}
 
 KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t)                       { return kai_arena_cons(h, t); }
 KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) { return kai_arena_record(n, fields, names); }
@@ -840,8 +741,6 @@ __attribute__((always_inline)) int kaix_is_nil(KaiValue *v)                     
  * raw generator ints. */
 __attribute__((always_inline)) KaiValue *kaix_is_cons_b(KaiValue *v)                     { return kai_bool(kai_seq_norm(v) && v->tag == KAI_CONS); }
 __attribute__((always_inline)) KaiValue *kaix_is_nil_b(KaiValue *v)                      { return kai_bool(!kai_seq_norm(v) || v->tag == KAI_NIL); }
-KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(kai_seq_norm(v)->as.cons.head); }
-KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(kai_seq_norm(v)->as.cons.tail); }
 
 /* issue #118 — LLVM mirror of the C-side reuse-in-place runtime.
  * Stage 2's recogniser emits `__perceus_reuse_cons` calls inside
@@ -1671,12 +1570,6 @@ KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v) {
     return kai_resume_frames_run(node, v);
 }
 
-/* Stack segments: a body on its own stack, suspended and resumed through a
- * one-shot continuation box. */
-KaiValue *kaix_seg_start(KaiValue *body, KaiValue **k) {
-    return kai_seg_start(body, k);
-}
-
 /* A handle on a segment. A return that is not a closure stands for a missing
  * return clause. */
 KaiValue *kaix_seg_handle(KaiValue *body, KaiValue *ret, int32_t n, KaiValue **clauses) {
@@ -1686,41 +1579,6 @@ KaiValue *kaix_seg_handle(KaiValue *body, KaiValue *ret, int32_t n, KaiValue **c
 
 KaiValue *kaix_seg_request(int32_t op, int32_t n, KaiValue **args) {
     return kai_seg_request(op, n, args);
-}
-
-KaiValue *kaix_seg_suspend(KaiValue *v) {
-    return kai_seg_suspend(v);
-}
-
-KaiValue *kaix_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
-    return kai_seg_resume(k, v, k_out);
-}
-
-void kaix_seg_discontinue(KaiValue *k) {
-    kai_seg_discontinue(k);
-}
-
-/* Op-site discard test, mirroring the C branch condition
- * `_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL`.
- * Returns 1 when the clause discarded `resume` AND a handle pad is in
- * scope to unwind to. `node_v` is the looked-up `KaiEvidence*`; `k_v`
- * is the `KaiCont*` the dispatch passed to the clause. */
-int kaix_op_discarded(void *node_v, void *k_v) {
-    KaiEvidence *node = (KaiEvidence *) node_v;
-    KaiCont *k = (KaiCont *) k_v;
-    if (node == NULL || k == NULL) { return 0; }
-    return (k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) ? 1 : 0;
-}
-
-/* Op-site discard unwind: deposit the discarded value, drop the evidence
- * the jump is about to invalidate, and land on the handle's pad. Only
- * called when `kaix_op_discarded` returned 1, so `handle_jmp` and
- * `discard_slot` are both live. Does not return. */
-void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
-    KaiEvidence *node = (KaiEvidence *) node_v;
-    *node->discard_slot = op_r;
-    kai_evidence_unwind_to(node);
-    _longjmp(*node->handle_jmp, 1);
 }
 
 
@@ -2487,24 +2345,6 @@ static void *kaix_proto_resolve(int64_t pid, int64_t op, const char *pname, cons
         kaix_panic_no_impl(pname, opname, head);
     }
     return fn;
-}
-
-KaiValue *kaix_proto_dispatch1(int64_t pid, int64_t op, const char *pname, const char *opname,
-                               KaiValue *a0) {
-    void *fn = kaix_proto_resolve(pid, op, pname, opname, a0);
-    return ((KaiValue *(*)(KaiValue *)) fn)(a0);
-}
-
-KaiValue *kaix_proto_dispatch2(int64_t pid, int64_t op, const char *pname, const char *opname,
-                               KaiValue *a0, KaiValue *a1) {
-    void *fn = kaix_proto_resolve(pid, op, pname, opname, a0);
-    return ((KaiValue *(*)(KaiValue *, KaiValue *)) fn)(a0, a1);
-}
-
-KaiValue *kaix_proto_dispatch3(int64_t pid, int64_t op, const char *pname, const char *opname,
-                               KaiValue *a0, KaiValue *a1, KaiValue *a2) {
-    void *fn = kaix_proto_resolve(pid, op, pname, opname, a0);
-    return ((KaiValue *(*)(KaiValue *, KaiValue *, KaiValue *)) fn)(a0, a1, a2);
 }
 
 #endif /* !KAI_HOT_ONLY — end of effects/scheduler owner-only block */

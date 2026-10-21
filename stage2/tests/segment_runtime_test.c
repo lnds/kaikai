@@ -25,6 +25,9 @@ static void check(const char *what, int cond) {
     }
 }
 
+extern KaiValue *test_seg_suspend(KaiValue *v);
+extern void test_seg_discontinue(KaiValue *k);
+
 static KaiValue *mk_body(KaiFn fn, KaiValue *cap) {
     return cap ? kai_closure(fn, 0, 1, &cap) : kai_closure(fn, 0, 0, NULL);
 }
@@ -38,7 +41,7 @@ static int64_t cap_int(KaiValue *self) {
 static KaiValue *gen_body(KaiValue *self, KaiValue **args, int n) {
     (void) args; (void) n;
     int64_t count = cap_int(self);
-    for (int64_t i = 0; i < count; i++) kai_decref(kai_seg_suspend(kai_int(i)));
+    for (int64_t i = 0; i < count; i++) kai_decref(test_seg_suspend(kai_int(i)));
     return kai_int(-1);
 }
 
@@ -74,7 +77,7 @@ static KaiValue *held_body(KaiValue *self, KaiValue **args, int n) {
     kai_evidence_set_cleanup(&node, count_cleanup, NULL);
     KaiValue *held[1] = { kai_incref(self->as.clo.captures[0]) };
     KaiFiber *uf = kai_unw_push(held, 1);
-    kai_decref(kai_seg_suspend(kai_unit()));
+    kai_decref(test_seg_suspend(kai_unit()));
     kai_unw_pop(uf);
     kai_decref(held[0]);
     kai_evidence_run_cleanup(&node);
@@ -96,7 +99,7 @@ static void test_discontinue(int by_drop) {
     check("suspend restores the resumer's unwind stack", f->unw_top == unw);
     check("suspended segment holds its slot", kai_rc_load(res) == 3);
     if (by_drop) kai_decref(k);
-    else kai_seg_discontinue(k);
+    else test_seg_discontinue(k);
     check("discontinue runs the finally exactly once", cleanups == 1);
     check("discontinue releases the held slot", kai_rc_load(res) == 1);
     check("discontinue leaves the resumer's evidence", f->evidence_top == top);
@@ -113,7 +116,7 @@ static KaiValue *lookup_body(KaiValue *self, KaiValue **args, int n) {
     kai_evidence_push_l(&node, kai_eff_intern("Inner"), &inner);
     int64_t seen = 0;
     for (int round = 0; round < 2; round++) {
-        kai_decref(kai_seg_suspend(kai_unit()));
+        kai_decref(test_seg_suspend(kai_unit()));
         int *outer = (int *) kai_evidence_lookup_l(kai_eff_intern("Outer"));
         seen = seen * 10 + (outer ? *outer : 0);
     }
@@ -272,8 +275,8 @@ static void test_handle_keeps_continuation(void) {
 
 static KaiValue *once_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
-    kai_decref(kai_seg_suspend(kai_unit()));
-    kai_decref(kai_seg_suspend(kai_unit()));
+    kai_decref(test_seg_suspend(kai_unit()));
+    kai_decref(test_seg_suspend(kai_unit()));
     return kai_unit();
 }
 
@@ -311,7 +314,7 @@ static int          probe_started_on = -1;
 
 static KaiValue *tid_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
-    for (int64_t i = 0; i < MN_ROUNDS; i++) kai_decref(kai_seg_suspend(kai_int(i)));
+    for (int64_t i = 0; i < MN_ROUNDS; i++) kai_decref(test_seg_suspend(kai_int(i)));
     return kai_unit();
 }
 
@@ -340,7 +343,7 @@ static pthread_t (*volatile current_thread)(void) = pthread_self;
 static KaiValue *probe_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
     pthread_t before = current_thread();
-    kai_decref(kai_seg_suspend(kai_unit()));
+    kai_decref(test_seg_suspend(kai_unit()));
     if (!pthread_equal(before, current_thread())) atomic_store(&probe_moved, 1);
     return kai_unit();
 }
