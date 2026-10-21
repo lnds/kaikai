@@ -161,6 +161,26 @@ case "$("$KAI" typecheck --library-mode "$TMP/prog/probe.kai" 2>&1)" in
   '{"file": '*'"type": "Int"}]}') ok "typecheck --library-mode answers the probes" ;;
   *) fail "typecheck --library-mode" ;;
 esac
+# Every subcommand and report names a file the way the command line gave it.
+PP="$TMP/paths"; mkdir -p "$PP/sub"
+printf 'type Estado = Activo\n' > "$PP/est.kai"; cp "$PP/est.kai" "$PP/sub/est.kai"
+printf 'fn f(x: Int) : Int = ?\nfn main() : Int = 0\n' > "$PP/hole.kai"
+printf 'import bad\nfn main() : Int = 0\n' > "$PP/imp.kai"; cp "$PP/est.kai" "$PP/bad.kai"
+for f in est.kai sub/est.kai "$PP/est.kai"; do
+  for v in "build --backend=c" "run" "typecheck"; do
+    got="$(cd "$PP" && "$KAI" $v "$f" 2>&1 | sed -n 's/^ *--> //p' | sed -n 1p)"
+    if [ "$got" = "$f:1:15" ]; then ok "$v echoes $f"; else fail "$v $f: printed '$got'"; fi
+  done
+done
+for f in hole.kai "$PP/hole.kai"; do
+  got="$(cd "$PP" && "$KAI" build --holes "$f" 2>&1 | sed -n 1p)"
+  case "$got" in "$f:1:"*) ok "build --holes echoes $f" ;; *) fail "build --holes $f: printed '$got'" ;; esac
+  got="$(cd "$PP" && "$KAI" build --holes-json "$f" 2>&1)"
+  case "$got" in '[{"file": "'"$f"'",'*) ok "build --holes-json echoes $f" ;; *) fail "build --holes-json $f: printed '$got'" ;; esac
+done
+got="$(cd "$PP" && "$KAI" typecheck imp.kai 2>&1 | sed -n 's/^ *--> //p' | sed -n 1p)"
+want="$(cd "$PP" && "$KAI" build --backend=c imp.kai 2>&1 | sed -n 's/^ *--> //p' | sed -n 1p)"
+if [ -n "$got" ] && [ "$got" = "$want" ]; then ok "an imported module prints alike in build and typecheck"; else fail "imported module: typecheck '$got', build '$want'"; fi
 traces="$(KAI_TRACE_RC=1 "$KAI" run "$TMP/prog/hello.kai" 2>&1 | grep -c 'KAI_TRACE_RC\] alloc_total=' || true)"
 if [ "$traces" = "1" ]; then ok "run: the RC trace is the program's alone"; else fail "run: $traces RC trace lines, want 1"; fi
 
