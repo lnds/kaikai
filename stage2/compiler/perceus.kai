@@ -19,18 +19,18 @@ import compiler.perceus_linear
 #
 # A scope lists the nearest binder first and a handle's state aliases last.
 
-pub(pkg) fn pcs_rewrite_expr(e: Expr, scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : Expr / Console =
+pub(pkg) fn pcs_rewrite_expr(e: Expr, scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : Expr / Console =
 
-  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
+  Expr { kind: pcs_rewrite_kind(e.kind, e.line, e.col, scope, uses, skip_set, force_set, bmap, move_last_set),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [Binder],
-                    uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : ExprKind / Console {
+                    uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : ExprKind / Console {
 
   match k {
     # The actual rewrite: wrap a non-last local read in `__perceus_dup`.
     ELocal(l) -> {
-      if pcs_has(scope, l) and pcs_is_non_last(l, line, col, uses, in_lam, skip_set, force_set, bmap, move_last_set) {
+      if pcs_has(scope, l) and pcs_is_non_last(l, line, col, uses, skip_set, force_set, bmap, move_last_set) {
         ECall(
           Expr { kind: EMark(MkDup), line: line, col: col,
                  ty: None, mode: MUnknown , site: 0 },
@@ -48,45 +48,45 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [Binder],
     # A mark holds no reference, so RC has nothing to dup on it.
     EMark(m) -> EMark(m)
     EStr(_, _) -> k
-    # Scope-aware kinds: ELambda extends scope with params and flips
-    # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
+    # Scope-aware kinds: ELambda extends scope with params; EBlock threads scope through SLet/SVar bindings; EMatch
     # delegates to pcs_rewrite_arms which adds pattern bindings to the
     # arm's scope; EHandle's HReturn binder shadows; clauses get the
     # state/log/op-param scope.
     ELambda(ps, body) -> {
       let pn = map(ps, (p) => p.binder)
-      # A param the body consumes keeps its reads bare; any other is dup'd on
-      # every read and released by the closure frame.
-      ELambda(ps, plt_take(ps, body, pcs_rewrite_expr(body, list_append(pn, scope), uses, true, skip_set, force_set, bmap, []), bmap))
+      # What the lambda captures and its params dup on every read: the frame
+      # releases the params, the closure owns the captures. A param the body
+      # consumes keeps its reads bare. Binders the body declares are paid as in a fn.
+      ELambda(ps, plt_take(ps, body, pcs_rewrite_expr(body, list_append(pn, scope), uses, skip_set, list_append(pn, list_append(scope, force_set)), bmap, []), bmap))
     }
     EBlock(stmts, opt_tail) -> {
-      let r = pcs_rewrite_block(stmts, scope, uses, in_lam, [], skip_set, force_set, bmap, move_last_set)
+      let r = pcs_rewrite_block(stmts, scope, uses, [], skip_set, force_set, bmap, move_last_set)
       let new_tail = match opt_tail {
         None -> None
-        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+        Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, skip_set, force_set, bmap, move_last_set))
       }
       let exit_drops = pcs_collect_block_let_exit_drops(stmts, uses, opt_tail, move_last_set, force_set, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
-    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                              pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+    EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, skip_set, force_set, bmap, move_last_set),
+                              pcs_rewrite_arms(arms, scope, uses, skip_set, force_set, bmap, move_last_set))
     EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set, bmap, [])
+      let body1 = pcs_rewrite_expr(body, scope, uses, skip_set, force_set, bmap, [])
       let init1 = match init_opt {
         None -> None
-        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+        Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, skip_set, force_set, bmap, move_last_set))
       }
       # The aliases are borrowed views of the handler's slot, and a clause
       # borrows its captures from the handle's env: every read of either dups.
       let aliases = pcs_handle_aliases(init_opt)
       let alias_force = list_append(aliases, force_set)
-      let cls1 = pcs_rewrite_clauses(clauses, list_append(scope, aliases), uses, in_lam, skip_set,
+      let cls1 = pcs_rewrite_clauses(clauses, list_append(scope, aliases), uses, skip_set,
                                      list_append(scope, alias_force), bmap)
       let ret1 = match ret_opt {
         None -> None
         Some(hr) -> match hr {
           HR(pname, body2, hl, hc) -> {
-            let body3 = pcs_rewrite_expr(body2, [pname, ...list_append(scope, aliases)], uses, in_lam, skip_set, alias_force, bmap, [])
+            let body3 = pcs_rewrite_expr(body2, [pname, ...list_append(scope, aliases)], uses, skip_set, alias_force, bmap, [])
             Some(HR(pname, pcs_return_binder_paid(pname, body3, uses, alias_force, hl, hc), hl, hc))
           }
         }
@@ -113,101 +113,101 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [Binder],
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+      EIntrinsic(name, pcs_rewrite_expr_list(args_, scope, uses, skip_set, force_set, bmap, move_last_set))
     ESurface(sf) ->
-      ESurface(surface_rebuild(sf, pcs_rewrite_expr_list(surface_children(sf), scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)))
+      ESurface(surface_rebuild(sf, pcs_rewrite_expr_list(surface_children(sf), scope, uses, skip_set, force_set, bmap, move_last_set)))
     ECall(callee, args_) ->
-      ECall(pcs_rewrite_expr(callee, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-            pcs_rewrite_expr_list(args_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), nm)
-    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                        pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                  pcs_rewrite_expr(t_, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                  pcs_rewrite_expr_opt(eo, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    ERecordLit(rh, fs) -> ERecordLit(rh, pcs_rewrite_fields_init(fs, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                       pcs_rewrite_expr_opt(opt_step, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                    pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EDispatchPipe(op, a, b) -> EDispatchPipe(op, pcs_rewrite_expr(a, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                                       pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), u)
-    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+      ECall(pcs_rewrite_expr(callee, scope, uses, skip_set, force_set, bmap, move_last_set),
+            pcs_rewrite_expr_list(args_, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EField(base, nm)     -> EField(pcs_rewrite_expr(base, scope, uses, skip_set, force_set, bmap, move_last_set), nm)
+    EIndex(a, b)         -> EIndex(pcs_rewrite_expr(a, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                    pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EBinop(op, a, b)     -> EBinop(op, pcs_rewrite_expr(a, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                        pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EUnop(op, x)         -> EUnop(op, pcs_rewrite_expr(x, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EIf(c, t_, eo)       -> EIf(pcs_rewrite_expr(c, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                  pcs_rewrite_expr(t_, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                  pcs_rewrite_expr_opt(eo, scope, uses, skip_set, force_set, bmap, move_last_set))
+    ERecordLit(rh, fs) -> ERecordLit(rh, pcs_rewrite_fields_init(fs, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EList(els)           -> EList(pcs_rewrite_list_elems(els, scope, uses, skip_set, force_set, bmap, move_last_set))
+    ERange(a, b, opt_step) -> ERange(pcs_rewrite_expr(a, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                       pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                       pcs_rewrite_expr_opt(opt_step, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EPipe(a, b)          -> EPipe(pcs_rewrite_expr(a, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                    pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set))
+    EDispatchPipe(op, a, b) -> EDispatchPipe(op, pcs_rewrite_expr(a, scope, uses, skip_set, force_set, bmap, move_last_set),
+                                       pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set))
+    ELitUnit(inner, u)   -> ELitUnit(pcs_rewrite_expr(inner, scope, uses, skip_set, force_set, bmap, move_last_set), u)
+    EBang(inner)         -> EBang(pcs_rewrite_expr(inner, scope, uses, skip_set, force_set, bmap, move_last_set))
   }
 }
 
-fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : Option[Expr] / Console = match opt {
+fn pcs_rewrite_expr_opt(opt: Option[Expr], scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : Option[Expr] / Console = match opt {
   None    -> None
-  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+  Some(x) -> Some(pcs_rewrite_expr(x, scope, uses, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_expr_list(es: [Expr], scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [Expr] / Console = match es {
+fn pcs_rewrite_expr_list(es: [Expr], scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [Expr] / Console = match es {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                   ...pcs_rewrite_expr_list(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
+  [h, ...rest] -> [pcs_rewrite_expr(h, scope, uses, skip_set, force_set, bmap, move_last_set),
+                   ...pcs_rewrite_expr_list(rest, scope, uses, skip_set, force_set, bmap, move_last_set)]
 }
 
-fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [FieldInit] / Console = match fs {
+fn pcs_rewrite_fields_init(fs: [FieldInit], scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [FieldInit] / Console = match fs {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                   ...pcs_rewrite_fields_init(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
+  [h, ...rest] -> [pcs_rewrite_field_init(h, scope, uses, skip_set, force_set, bmap, move_last_set),
+                   ...pcs_rewrite_fields_init(rest, scope, uses, skip_set, force_set, bmap, move_last_set)]
 }
 
-fn pcs_rewrite_field_init(fi: FieldInit, scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : FieldInit / Console = match fi {
-  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+fn pcs_rewrite_field_init(fi: FieldInit, scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : FieldInit / Console = match fi {
+  FI(name, e) -> FI(name, pcs_rewrite_expr(e, scope, uses, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_list_elems(els: [ListElem], scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [ListElem] / Console = match els {
+fn pcs_rewrite_list_elems(els: [ListElem], scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [ListElem] / Console = match els {
   []           -> []
-  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
-                   ...pcs_rewrite_list_elems(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
+  [h, ...rest] -> [pcs_rewrite_list_elem(h, scope, uses, skip_set, force_set, bmap, move_last_set),
+                   ...pcs_rewrite_list_elems(rest, scope, uses, skip_set, force_set, bmap, move_last_set)]
 }
 
-fn pcs_rewrite_list_elem(el: ListElem, scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : ListElem / Console = match el {
-  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+fn pcs_rewrite_list_elem(el: ListElem, scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : ListElem / Console = match el {
+  ElPlain(e)  -> ElPlain(pcs_rewrite_expr(e, scope, uses, skip_set, force_set, bmap, move_last_set))
+  ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_arms(arms: [Arm], scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [Arm] / Console = match arms {
+fn pcs_rewrite_arms(arms: [Arm], scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : [Arm] / Console = match arms {
   [] -> []
   [Arm(pat, opt_g, body), ...rest] -> {
     let scope1 = prc_pat_bindings(pat, scope)
     let g1 = match opt_g {
       None -> None
-      Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+      Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, skip_set, force_set, bmap, move_last_set))
     }
-    let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap, move_last_set)
-    [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
+    let body1 = pcs_rewrite_expr(body, scope1, uses, skip_set, force_set, bmap, move_last_set)
+    [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, skip_set, force_set, bmap, move_last_set)]
   }
 }
 
 type PcsRwBlock = { stmts: [Stmt], scope: [Binder] }
 
-fn pcs_rewrite_block(stmts: [Stmt], scope: [Binder], uses: UseIx, in_lam: Bool,
+fn pcs_rewrite_block(stmts: [Stmt], scope: [Binder], uses: UseIx,
                      acc: [Stmt], skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : PcsRwBlock / Console {
 
   match stmts {
     [] -> PcsRwBlock { stmts: list_reverse(acc), scope: scope }
     [s, ...rest] -> {
-      let r = pcs_rewrite_stmt(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
-      pcs_rewrite_block(rest, r.scope, uses, in_lam, [r.stmt, ...acc], skip_set, force_set, bmap, move_last_set)
+      let r = pcs_rewrite_stmt(s, scope, uses, skip_set, force_set, bmap, move_last_set)
+      pcs_rewrite_block(rest, r.scope, uses, [r.stmt, ...acc], skip_set, force_set, bmap, move_last_set)
     }
   }
 }
 
 type PcsRwStmt = { stmt: Stmt, scope: [Binder] }
 
-fn pcs_rewrite_stmt(s: Stmt, scope: [Binder], uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : PcsRwStmt / Console {
+fn pcs_rewrite_stmt(s: Stmt, scope: [Binder], uses: UseIx, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : PcsRwStmt / Console {
 
   match s {
     SLet(pat, ty_opt, rhs) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, skip_set, force_set, bmap, move_last_set)
       # See `pcs_collect_uses_in_block` SLet — raw locals stay
       # outside the Perceus scope so EVar reads of them are not
       # rewritten into `__perceus_dup` calls (which expect boxed
@@ -216,30 +216,30 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [Binder], uses: UseIx, in_lam: Bool, skip_se
                   scope: prc_pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
-      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let rhs1 = pcs_rewrite_expr(rhs, scope, uses, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SVar(name, ty_opt, rhs1, ln, cl), scope: [name, ...scope] }
     }
     SAssert(c, opt_m) -> {
-      let c1 = pcs_rewrite_expr(c, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let c1 = pcs_rewrite_expr(c, scope, uses, skip_set, force_set, bmap, move_last_set)
       let m1 = match opt_m {
         None -> None
-        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
+        Some(m) -> Some(pcs_rewrite_expr(m, scope, uses, skip_set, force_set, bmap, move_last_set))
       }
       PcsRwStmt { stmt: SAssert(c1, m1), scope: scope }
     }
     SExprStmt(e) -> {
-      let e1 = pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let e1 = pcs_rewrite_expr(e, scope, uses, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SExprStmt(e1), scope: scope }
     }
     SIndexAssign(b, i, v, ln, cl) -> {
-      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
-      let i1 = pcs_rewrite_expr(i, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
-      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let b1 = pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set)
+      let i1 = pcs_rewrite_expr(i, scope, uses, skip_set, force_set, bmap, move_last_set)
+      let v1 = pcs_rewrite_expr(v, scope, uses, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SIndexAssign(b1, i1, v1, ln, cl), scope: scope }
     }
     SAssign(b, v, ln, cl) -> {
-      let b1 = pcs_rewrite_expr(b, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
-      let v1 = pcs_rewrite_expr(v, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+      let b1 = pcs_rewrite_expr(b, scope, uses, skip_set, force_set, bmap, move_last_set)
+      let v1 = pcs_rewrite_expr(v, scope, uses, skip_set, force_set, bmap, move_last_set)
       PcsRwStmt { stmt: SAssign(b1, v1, ln, cl), scope: scope }
     }
     # m7e §25: SUse has no expression and binds nothing.
@@ -250,7 +250,7 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [Binder], uses: UseIx, in_lam: Bool, skip_se
 # Each op argument reaches its clause owned, so the clause pays the ones
 # its reads do not hand on, as a fn pays its params.
 fn pcs_rewrite_clauses(cs: [HClause], scope: [Binder], uses: UseIx,
-                        in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap) : [HClause] / Console {
+                        skip_set: [Binder], force_set: [Binder], bmap: BorrowMap) : [HClause] / Console {
 
   match cs {
     [] -> []
@@ -259,10 +259,10 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [Binder], uses: UseIx,
         let scope1 = list_append(pcs_filter_non_resume(params), scope)
         # A forwarder's arguments move into its request; the names around it dup through `force_set`.
         let moved = pcs_list_union(skip_set, pcs_clause_requested(params, body))
-        let body1 = pcs_rewrite_expr(body, scope1, uses, pcs_clause_in_lam(in_lam, params, body), moved, force_set, bmap, [])
+        let body1 = pcs_rewrite_expr(body, scope1, uses, moved, force_set, bmap, [])
         let paid = pcs_wrap_param_drops(body1, pcs_clause_owned_params(params, body), uses,
                                         PcsParamSets { moved: moved, forced: force_set })
-        [HC(op, params, paid, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+        [HC(op, params, paid, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, skip_set, force_set, bmap)]
       }
     }
   }
@@ -276,15 +276,13 @@ fn pcs_clause_owned_params(params: [Param], body: Expr) : [Param] = match body.k
 }
 
 # Dup predicate: wrap this read in `__perceus_dup` unless it hands the
-# birth ref on, per `pcs_fate`. A read inside a lambda is a capture and
-# always dups. `force_set` names are owned elsewhere (a check loop's
-# params, a handler's state aliases) and dup on every read. `skip_set`
+# birth ref on, per `pcs_fate`. `force_set` names are owned elsewhere (a check loop's
+# params, a handler's state aliases, a lambda's captures and params) and dup on every read. `skip_set`
 # names move on every read; a `move_last_set` name moves only at its
 # last read.
 fn pcs_is_non_last(l: LocalId, line: Int, col: Int, uses: UseIx,
-                   in_lam_here: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : Bool {
+                   skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : Bool {
   if pcs_has(force_set, l) { true }
-  else if in_lam_here { true }
   else {
     let lu = last_use_for(l, uses)
     let moved = pcs_has(skip_set, l) or (pcs_has(move_last_set, l) and pcs_lu_at(lu, line, col))
