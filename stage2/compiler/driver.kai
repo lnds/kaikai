@@ -33,47 +33,64 @@ import compiler.infer_dump_text
 import compiler.driver_policy
 import compiler.driver_modes
 import compiler.driver_core_load
+import compiler.pass_clock
 
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], core_rows: [NEnt], package_name: String, unstable_optins: [String], edition: Option[Edition], user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_own: [String], cover: CoverSpec, test_plan: String, kir_verify: String, inputs_out: String, ffi_out: String, quiet: Bool) : Int / Console + File + Mutable =
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], core_rows: [NEnt], package_name: String, unstable_optins: [String], edition: Option[Edition], user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_own: [String], cover: CoverSpec, test_plan: String, kir_verify: String, inputs_out: String, ffi_out: String, quiet: Bool) : Int / Console + File + Mutable + PassClock + Env =
   compile_req(Req { path: path, mode: mode, backend: backend, strict_holes: strict_holes, search_paths: search_paths, src: src, core_decls: core_decls, core_mods: core_mods, core_segs: core_segs, core_rows: core_rows, package_name: package_name, unstable_optins: unstable_optins, edition: edition, user_cache: user_cache, batch_out: batch_out, core_cache: core_cache, test_roots: test_roots, test_own: test_own, cover: cover, test_plan: test_plan, kir_verify: kir_verify, inputs_out: inputs_out, ffi_out: ffi_out, quiet: quiet })
 
-fn compile_req(req: Req) : Int / Console + File + Mutable = match stage_open(req) {
+fn compile_req(req: Req) : Int / Console + File + Mutable + PassClock + Env = match pass_tick("open", stage_open(req)) {
   Halt(code) -> code
-  Go(opened) -> compile_front(req, stage_access(req, stage_scope(req, stage_tables(req, stage_precut(req, stage_load(req, opened))))))
+  Go(opened) -> {
+    let loaded = pass_tick("load", stage_load(req, opened))
+    let cut = pass_tick("precut", stage_precut(req, loaded))
+    let tabled = pass_tick("tables", stage_tables(req, cut))
+    let scoped = pass_tick("scope", stage_scope(req, tabled))
+    compile_front(req, pass_tick("access", stage_access(req, scoped)))
+  }
 }
 
-fn compile_front(req: Req, accessed: Accessed) : Int / Console + File + Mutable = match stage_alias(req, stage_kinds(req, accessed)) {
+fn compile_front(req: Req, accessed: Accessed) : Int / Console + File + Mutable + PassClock + Env = match pass_tick("alias", stage_alias(req, pass_tick("kinds", stage_kinds(req, accessed)))) {
   Halt(code) -> code
   Go(aliased) -> compile_lower(req, aliased)
 }
 
-fn compile_lower(req: Req, aliased: Aliased) : Int / Console + File + Mutable = match stage_region(req, aliased) {
+fn compile_lower(req: Req, aliased: Aliased) : Int / Console + File + Mutable + PassClock + Env = match pass_tick("region", stage_region(req, aliased)) {
   Halt(code) -> code
-  Go(regioned) -> match stage_lower(req, regioned) {
+  Go(regioned) -> match pass_tick("lower", stage_lower(req, regioned)) {
     Halt(code) -> code
-    Go(lowered) -> compile_ready(req, stage_ready(req, lowered))
+    Go(lowered) -> compile_ready(req, pass_tick("ready", stage_ready(req, lowered)))
   }
 }
 
-fn compile_ready(req: Req, ready: Ready) : Int / Console + File + Mutable =
+fn compile_ready(req: Req, ready: Ready) : Int / Console + File + Mutable + PassClock + Env =
   if is_dump_mode(req.mode) { run_dump_mode(req, ready) } else { compile_default(req, ready) }
 
-fn compile_default(req: Req, ready: Ready) : Int / Console + File + Mutable = match stage_solve(req, stage_seed(req, stage_cvar(req, stage_stamp(req, ready)), compile_req), compile_req) {
+fn compile_default(req: Req, ready: Ready) : Int / Console + File + Mutable + PassClock + Env = {
+  let stamped = pass_tick("stamp", stage_stamp(req, ready))
+  let cvared = pass_tick("cvar", stage_cvar(req, stamped))
+  let seeded = pass_tick("seed", stage_seed(req, cvared, compile_req))
+  compile_solved(req, pass_tick("solve", stage_solve(req, seeded, compile_req)))
+}
+
+fn compile_solved(req: Req, flow: Flow[Solved]) : Int / Console + File + Mutable + PassClock + Env = match flow {
   Halt(code) -> code
-  Go(solved) -> match stage_infer(req, solved) {
+  Go(solved) -> match pass_tick("infer", stage_infer(req, solved)) {
     Halt(code) -> code
     Go(inferred) -> compile_checked(req, inferred)
   }
 }
 
-fn compile_checked(req: Req, inferred: InferRun) : Int / Console + File + Mutable = match stage_check(req, inferred) {
+fn compile_checked(req: Req, inferred: InferRun) : Int / Console + File + Mutable + PassClock + Env = match pass_tick("check", stage_check(req, inferred)) {
   Halt(code) -> code
   Go(checked) -> compile_mono(req, checked)
 }
 
-fn compile_mono(req: Req, checked: Checked) : Int / Console + File + Mutable = match stage_mono(req, checked) {
+fn compile_mono(req: Req, checked: Checked) : Int / Console + File + Mutable + PassClock + Env = match pass_tick("mono", stage_mono(req, checked)) {
   Halt(code) -> code
-  Go(monoed) -> stage_emit(req, stage_perceus(req, stage_unbox(req, monoed)))
+  Go(monoed) -> {
+    let unboxed = pass_tick("unbox", stage_unbox(req, monoed))
+    pass_tick("emit", stage_emit(req, pass_tick("perceus", stage_perceus(req, unboxed))))
+  }
 }
 
 
@@ -86,7 +103,7 @@ fn compile_mono(req: Req, checked: Checked) : Int / Console + File + Mutable = m
 # written to its paired output (native writes its `.o` to
 # `native_object_path(input)`). Returns the count of inputs that failed
 # to compile; 0 means the whole batch is clean.
-fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File =
+fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File + PassClock + Env =
   match read_file(listfile) {
     Err(msg) -> { eprint("kaic2: #{listfile}: #{msg}"); 1 }
     Ok(content) -> {
@@ -110,7 +127,7 @@ fn run_batch_list(listfile: String, opts: CliOptions) : Int / Console + File =
 # batch, so the harness sees every result in one pass.
 fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
                        psegs: [CoreSegment], prows: [NEnt], opts: CliOptions,
-                       nfail: Int) : Int / Console + File = match entries {
+                       nfail: Int) : Int / Console + File + PassClock + Env = match entries {
   [] -> nfail
   [BE(inp, outp), ...rest] -> {
     let rc = match read_file(inp) {
@@ -126,7 +143,7 @@ fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
   }
 }
 
-pub fn run(opts: CliOptions) : Int / Console + File {
+pub fn run(opts: CliOptions) : Int / Console + File + PassClock + Env {
   match opts.mode {
     MHelp -> { usage(); 0 }
     MUsageError -> { usage(); 2 }
@@ -155,7 +172,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
   }
 }
 
-fn with_source_path(opts: CliOptions, flag: String, what: String, k: (String) -> Int / Stdout + Stderr + Stdin + File) : Int / Console + File =
+fn with_source_path(opts: CliOptions, flag: String, what: String, k: (String) -> Int / Stdout + Stderr + Stdin + File + PassClock + Env) : Int / Console + File + PassClock + Env =
   match opts.path {
     None -> {
       eprint("kaic2: #{flag} requires #{what}")
@@ -192,8 +209,8 @@ fn run_builtin_table() : Int / Console {
 # stdlib feeds the compiler. The core cache directory comes from
 # `--core-cache-dir` (shared, bin/kai-resolved) or the legacy per-project
 # `.kai-cache` under `--user-cache`.
-fn compile_path(opts: CliOptions, p: String) : Int / Console + File =
-  match load_core(core_cache_dir_for(opts, p), opts.core_cache.stats) {
+fn compile_path(opts: CliOptions, p: String) : Int / Console + File + PassClock + Env =
+  match pass_tick("core", load_core(core_cache_dir_for(opts, pass_tick("start", p)), opts.core_cache.stats)) {
     None -> 1
     Some(PLS(pds, pmods, psegs, prows)) -> match read_file(p) {
       Ok(src) -> close_front(opts.mode, p, compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, prows, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_own, opts.cover, opts.test_plan, opts.kir_verify, opts.inputs_out, opts.ffi_out, false))
