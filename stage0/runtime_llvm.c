@@ -1531,8 +1531,16 @@ void kaix_evidence_push(KaiEvidence *node, const char *eff_label, void *handler)
     kai_evidence_push(node, eff_label, handler);
 }
 
+void kaix_evidence_init_default_l(KaiEvidence *node, const char *eff_label, void *handler) {
+    kai_evidence_init_default_l(node, eff_label, handler);
+}
+
 void kaix_evidence_init_default(KaiEvidence *node, const char *eff_label, void *handler) {
     kai_evidence_init_default(node, eff_label, handler);
+}
+
+KaiEvidence *kaix_evidence_lookup_or_default_l(const char *eff_label, KaiEvidence *def) {
+    return kai_evidence_lookup_or_default_l(eff_label, def);
 }
 
 KaiEvidence *kaix_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
@@ -1558,6 +1566,10 @@ void *kaix_evidence_lookup_handler(const char *eff_label) {
     return node->handler;
 }
 
+void *kaix_evidence_lookup_node_l(const char *eff_label) {
+    return (void *) kai_evidence_lookup_node_l(eff_label);
+}
+
 void *kaix_evidence_lookup_node(const char *eff_label) {
     return (void *) kai_evidence_lookup_node(eff_label);
 }
@@ -1566,8 +1578,16 @@ void *kaix_evidence_require(void *node_v, const char *eff_label) {
     return (void *) kai_evidence_require((KaiEvidence *) node_v, eff_label);
 }
 
+void *kaix_evidence_fill_frame_l(void *out, int64_t n, const char *const *texts, const char **labels, KaiEvidence *const *defs, int64_t unchecked) {
+    return (void *) kai_evidence_fill_frame_l((KaiEvidence **) out, (int) n, texts, labels, defs, (uint64_t) unchecked);
+}
+
 void *kaix_evidence_fill_frame(void *out, int64_t n, const char *const *labels, KaiEvidence *const *defs, int64_t unchecked) {
     return (void *) kai_evidence_fill_frame((KaiEvidence **) out, (int) n, labels, defs, (uint64_t) unchecked);
+}
+
+const char *kaix_eff_label(const char **slot, const char *text) {
+    return kai_eff_cached(slot, text);
 }
 
 void *kaix_evidence_require_reachable(void *node_v, const char *cap_name) {
@@ -1652,6 +1672,12 @@ void kaix_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
                                  void *handler, void *jmp, void *discard_slot) {
     kai_evidence_push_with_jmp(node, eff_label, handler,
                                (jmp_buf *) jmp, (KaiValue **) discard_slot);
+}
+
+void kaix_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_label,
+                                   void *handler, void *jmp, void *discard_slot) {
+    kai_evidence_push_with_jmp_l(node, eff_label, handler,
+                                 (jmp_buf *) jmp, (KaiValue **) discard_slot);
 }
 
 /* `finally { }` — arm the node's cleanup, and run it on the normal exit.

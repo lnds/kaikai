@@ -685,7 +685,7 @@ backend builds the same shape in KIR):
 EvE _ev = { handler_id, op clause pointers, env, state };
 KaiEvidence _node; jmp_buf _jmp; KaiValue *volatile _discard;
 if (setjmp(_jmp) == 0) {
-  kai_evidence_push_with_jmp(&_node, "E", &_ev, &_jmp, &_discard);
+  kai_evidence_push_with_jmp_l(&_node, KAI_EFF("E"), &_ev, &_jmp, &_discard);
   _body_result = <body>;
   <finally>; kai_evidence_pop();
   _hr = <return clause over _body_result>;   // identity if absent
@@ -757,7 +757,7 @@ not cross a `spawn` — and for a frameless perform of a default-bearing builtin
 ```
 node = fiber.evidence_top              ; *Evidence
 while node != null {
-  if node.eff_label == Eff { break }
+  if node.eff_label == Eff { break }   ; interned labels: a pointer compare
   node = node.parent
 }
 ev = node.handler                       ; *EvEff (cast from *void)

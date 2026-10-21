@@ -20421,11 +20421,89 @@ static void kai_evidence_run_cleanup(KaiEvidence *node) {
 
 static uint8_t kai_disp_hops(KaiFiber *f);
 
+/* ---------- Interned effect labels ----------
+ *
+ * An evidence label names an effect instance: `Eff` or `Eff[args]`. Every
+ * label the evidence API takes is interned: equal text is one pointer, and a
+ * header just before the text points at the interned `Eff` part. Two labels
+ * match when equal, or when they share `Eff` and one of them is the bare
+ * `Eff` (an instance the compiler could not pin). A site interns its literal
+ * once through `KAI_EFF`; a lookup then never reads label text. */
+typedef struct KaiEffLabel {
+    const char          *base;
+    struct KaiEffLabel  *next;
+    char                 text[];
+} KaiEffLabel;
+
+#define KAI_EFF_BUCKETS 1024
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiEffLabel    *kai_eff_table[KAI_EFF_BUCKETS];
+extern pthread_mutex_t kai_eff_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiEffLabel    *kai_eff_table[KAI_EFF_BUCKETS];
+pthread_mutex_t kai_eff_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static KaiEffLabel    *kai_eff_table[KAI_EFF_BUCKETS];
+static pthread_mutex_t kai_eff_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static inline const char *kai_eff_base(const char *label) {
+    return ((const KaiEffLabel *) (label - offsetof(KaiEffLabel, text)))->base;
+}
+
+static const char *kai_eff_intern_locked(const char *text, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) h = (h ^ (unsigned char) text[i]) * 16777619u;
+    KaiEffLabel **bucket = &kai_eff_table[h % KAI_EFF_BUCKETS];
+    for (KaiEffLabel *e = *bucket; e != NULL; e = e->next) {
+        if (strncmp(e->text, text, len) == 0 && e->text[len] == '\0') return e->text;
+    }
+    KaiEffLabel *e = (KaiEffLabel *) malloc(sizeof *e + len + 1);
+    if (e == NULL) {
+        fputs("kai: out of memory interning an effect label\n", stderr);
+        kai_exit(1);
+    }
+    memcpy(e->text, text, len);
+    e->text[len] = '\0';
+    size_t n = strcspn(e->text, "[");
+    e->base = n == len ? e->text : kai_eff_intern_locked(text, n);
+    e->next = *bucket;
+    *bucket = e;
+    return e->text;
+}
+
+static const char *kai_eff_intern(const char *text) {
+    pthread_mutex_lock(&kai_eff_mu);
+    const char *l = kai_eff_intern_locked(text, strlen(text));
+    pthread_mutex_unlock(&kai_eff_mu);
+    return l;
+}
+
+/* The interned `text`, memoised in the caller's `slot`. */
+static inline const char *kai_eff_cached(const char **slot, const char *text) {
+    const char *l = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(l == NULL, 0)) {
+        l = kai_eff_intern(text);
+        __atomic_store_n(slot, l, __ATOMIC_RELEASE);
+    }
+    return l;
+}
+
+#define KAI_EFF(lit) ({ static const char *_kai_efl; kai_eff_cached(&_kai_efl, lit); })
+
+static inline int kai_eff_match(const char *a, const char *b) {
+    if (a == b) return 1;
+    const char *ba = kai_eff_base(a), *bb = kai_eff_base(b);
+    return ba == bb && (a == ba || b == bb);
+}
+
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled
  * `handle` prologue. This primitive only fills its fields and
  * links it as the new top. */
-static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
+static void kai_evidence_push_l(KaiEvidence *node, const char *eff_label, void *handler) {
     KaiFiber *f = kai_current_fiber();
     node->parent       = f->evidence_top;
     node->eff_label    = eff_label;
@@ -20439,11 +20517,14 @@ static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *ha
     node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
 }
+static void kai_evidence_push(KaiEvidence *node, const char *text, void *handler) {
+    kai_evidence_push_l(node, kai_eff_intern(text), handler);
+}
 /* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
  * evidence stack: the call site addresses this node directly through the frame,
  * so it needs `handler` / `eff_label` set and the discard fields NULL, but no
  * `parent` / `evidence_top` linkage (a default never discards, never unwinds). */
-static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, void *handler) {
+static void kai_evidence_init_default_l(KaiEvidence *node, const char *eff_label, void *handler) {
     node->parent       = NULL;
     node->eff_label    = eff_label;
     node->handler      = handler;
@@ -20455,15 +20536,18 @@ static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, 
     node->disp_hops    = 0;
     node->unw_mark     = 0;
 }
+static void kai_evidence_init_default(KaiEvidence *node, const char *text, void *handler) {
+    kai_evidence_init_default_l(node, kai_eff_intern(text), handler);
+}
 
 /* m7a #6e: like kai_evidence_push but also stamps the handle's
  * setjmp/longjmp landing pad. The op-call site uses the node's
  * `handle_jmp` to abandon the body when the clause discards
  * `resume`. Default handlers (m7a #7) always resume, so they call
  * the simpler push variant. */
-static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
-                                        void *handler, jmp_buf *jmp,
-                                        KaiValue **discard_slot) {
+static void kai_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_label,
+                                          void *handler, jmp_buf *jmp,
+                                          KaiValue **discard_slot) {
     KaiFiber *f = kai_current_fiber();
     node->parent       = f->evidence_top;
     node->eff_label    = eff_label;
@@ -20476,6 +20560,11 @@ static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
     node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
+}
+static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *text,
+                                       void *handler, jmp_buf *jmp,
+                                       KaiValue **discard_slot) {
+    kai_evidence_push_with_jmp_l(node, kai_eff_intern(text), handler, jmp, discard_slot);
 }
 
 /* Arm a pushed node's `finally`. Separate from the push so the common
@@ -20519,8 +20608,6 @@ typedef struct KaiSegRelay {
     KaiEvidence        *def;      /* the default it falls back to, or NULL */
     struct KaiSegRelay *next;
 } KaiSegRelay;
-
-static int kai_eff_label_match(const char *a, const char *b);
 
 /* A relay is on no chain: its parent slot holds this mark instead. */
 #define KAI_EV_RELAY ((KaiEvidence *) (uintptr_t) 1)
@@ -20569,7 +20656,7 @@ static KaiEvidence *kai_ev_find(KaiEvidence *n, KaiEvidence *stop, const char *e
             continue;
         }
         if (cur != NULL && kai_disp_at_push(n) != cur) continue;
-        if (n->eff_label == eff_label || kai_eff_label_match(n->eff_label, eff_label)) return n;
+        if (kai_eff_match(n->eff_label, eff_label)) return n;
     }
     return NULL;
 }
@@ -20636,7 +20723,7 @@ static KaiEvidence *kai_seg_relay(KaiSegment *seg, const char *eff_label, KaiEvi
     KaiSegRelay *spare = NULL;
     for (KaiSegRelay *r = seg->relays; r != NULL; r = r->next) {
         if (r->node.eff_label == NULL) spare = r;
-        else if (r->node.eff_label == eff_label || strcmp(r->node.eff_label, eff_label) == 0) return &r->node;
+        else if (r->node.eff_label == eff_label) return &r->node;
     }
     KaiEvidence *to = kai_ev_find(seg->base, NULL, eff_label, kai_seg_skip(seg));
     if (to == NULL) to = def;
@@ -21394,8 +21481,7 @@ static int kai_cancel_dispatch_user_handler(void) {
     while (node) {
         if (node != kai_ev_real(f->in_dispatch_node)
             && node->handle_jmp != NULL
-            && node->eff_label
-            && strcmp(node->eff_label, "Cancel") == 0) {
+            && node->eff_label == KAI_EFF("Cancel")) {
             user_node = node;
             break;
         }
@@ -21468,34 +21554,32 @@ static inline void kai_cancel_poll(KaiFiber *f) {
 
 static void kai_check_cancel_yield_point(void) { kai_cancel_poll(kai_current_fiber()); }
 
-/* An evidence label names an effect instance: `Eff` or `Eff[args]`. Two
- * pinned instances match only when equal; a bare `Eff` (an instance the
- * compiler could not pin) matches every instance of `Eff`. */
-static int kai_eff_label_match(const char *a, const char *b) {
-    if (*a != *b) return 0;
+/* Label text compared without interning, for names the compiler holds as
+ * strings. Same relation as `kai_eff_match`. */
+static int kai_eff_text_match(const char *a, const char *b) {
     if (strcmp(a, b) == 0) return 1;
-    /* Libc only: the native backend links this runtime unoptimised. */
     size_t n = strcspn(a, "[");
     return strncmp(a, b, n) == 0 && (a[n] == '\0' ? b[n] == '[' : b[n] == '\0');
 }
 
-static void *kai_evidence_lookup(const char *eff_label) {
+static void *kai_evidence_lookup_l(const char *eff_label) {
     kai_check_cancel_yield_point();
     /* Issue #103 — Cancel-on-linked-trap-exit'd-peer must bypass
      * user handlers (see kai_check_trap_exit_cancel_bypass). */
-    if (eff_label && strcmp(eff_label, "Cancel") == 0) {
+    if (eff_label == KAI_EFF("Cancel")) {
         kai_check_trap_exit_cancel_bypass();
     }
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
-        if (node->eff_label == eff_label || kai_eff_label_match(node->eff_label, eff_label)) {
+        if (kai_eff_match(node->eff_label, eff_label)) {
             return node->handler;
         }
         node = node->parent;
     }
     return NULL;
 }
+static void *kai_evidence_lookup(const char *text) { return kai_evidence_lookup_l(kai_eff_intern(text)); }
 
 /* The node a perform of `eff_label` dispatches to, `def` when none handles it.
  * m8 bug #12: the walk skips the node whose clause is being dispatched on
@@ -21506,7 +21590,7 @@ static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *d
     /* Issue #103 — bypass user Cancel handlers when the current
      * fiber is linked to a trap-exit'd peer (see
      * kai_check_trap_exit_cancel_bypass for rationale). */
-    if (eff_label && eff_label[0] == 'C' && strcmp(eff_label, "Cancel") == 0) {
+    if (eff_label == KAI_EFF("Cancel")) {
         kai_check_trap_exit_cancel_bypass();
         f = kai_current_fiber();
     }
@@ -21517,16 +21601,22 @@ static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *d
 
 /* m7a #6e: same lookup but returns the whole node so the op-call
  * site can reach the handle's jmp_buf if a discard happens. */
-static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
+static KaiEvidence *kai_evidence_lookup_node_l(const char *eff_label) {
     return kai_evidence_find_node(eff_label, NULL);
+}
+static KaiEvidence *kai_evidence_lookup_node(const char *text) {
+    return kai_evidence_lookup_node_l(kai_eff_intern(text));
 }
 
 /* Resolve a default-bearing effect performed with no caller frame slot: a
  * lexical handler on the stack wins (the walk finds it), else the frame-supplied
  * default node (no longer pushed). The bridge for a direct perform in a fn that
  * carries no frame (e.g. `main`), where the walk alone would miss the default. */
-static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
+static KaiEvidence *kai_evidence_lookup_or_default_l(const char *eff_label, KaiEvidence *def) {
     return kai_evidence_find_node(eff_label, def);
+}
+static KaiEvidence *kai_evidence_lookup_or_default(const char *text, KaiEvidence *def) {
+    return kai_evidence_lookup_or_default_l(kai_eff_intern(text), def);
 }
 
 /* A fiber-local effect resolved to no handler — the perform site walked an
@@ -21596,15 +21686,16 @@ static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char
 /* Resolve a whole evidence frame in one pass: one cancel poll and one fiber
  * fetch for every slot, and an empty evidence stack resolves each slot to its
  * default. Bit i of `unchecked` exempts slot i from the unhandled-effect
- * report. */
-static KaiEvidence **kai_evidence_fill_frame(KaiEvidence **out, int n, const char *const *labels,
-                                             KaiEvidence *const *defs, uint64_t unchecked) {
+ * report. `labels` is the site's zero-initialised cache of the interned
+ * `texts`. */
+static KaiEvidence **kai_evidence_fill_frame_l(KaiEvidence **out, int n, const char *const *texts,
+                                             const char **labels, KaiEvidence *const *defs, uint64_t unchecked) {
     kai_check_cancel_yield_point();
     KaiFiber *f = kai_current_fiber();
     int bare = f->seg == NULL && f->evidence_top == NULL;
     for (int i = 0; i < n; i++) {
-        const char *label = labels[i];
-        if (label[0] == 'C' && strcmp(label, "Cancel") == 0) kai_check_trap_exit_cancel_bypass();
+        const char *label = kai_eff_cached(&labels[i], texts[i]);
+        if (label == KAI_EFF("Cancel")) kai_check_trap_exit_cancel_bypass();
         KaiEvidence *node;
         if (bare) {
             node = defs[i];
@@ -21617,6 +21708,12 @@ static KaiEvidence **kai_evidence_fill_frame(KaiEvidence **out, int n, const cha
         out[i] = (i < 64 && ((unchecked >> i) & 1)) ? node : kai_evidence_require(node, label);
     }
     return out;
+}
+static KaiEvidence **kai_evidence_fill_frame(KaiEvidence **out, int n, const char *const *texts,
+                                             KaiEvidence *const *defs, uint64_t unchecked) {
+    const char *labels[n + 1];
+    memset(labels, 0, sizeof labels);
+    return kai_evidence_fill_frame_l(out, n, texts, labels, defs, unchecked);
 }
 
 /* m7b #15: per-instance dispatch — find the evidence node whose
@@ -21637,8 +21734,7 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
             /* Issue #103 — same Cancel bypass as the by-name path:
              * an aliased `with Cancel as e` op call on a fiber linked
              * to a trap-exit'd peer must unwind directly. */
-            if (node->eff_label
-                && strcmp(node->eff_label, "Cancel") == 0) {
+            if (node->eff_label == KAI_EFF("Cancel")) {
                 kai_check_trap_exit_cancel_bypass();
             }
             return node;
@@ -21829,7 +21925,7 @@ static int64_t kai_native_ctx_frame_slot_index(void *cv, KaiValue *symv, KaiValu
             for (int j = 0; j < c->frames[i].nslots; j++)
                 if (strcmp(c->frames[i].slots[j], eff) == 0) { r = (int64_t) j; break; }
             for (int j = 0; r < 0 && j < c->frames[i].nslots; j++)
-                if (kai_eff_label_match(c->frames[i].slots[j], eff)) r = (int64_t) j;
+                if (kai_eff_text_match(c->frames[i].slots[j], eff)) r = (int64_t) j;
             break;
         }
     if (symv) kai_decref(symv);

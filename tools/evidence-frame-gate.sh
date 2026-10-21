@@ -10,7 +10,7 @@
 # and asserts the user effect they declare never reaches the walk.
 #
 # Binary: emitted C for a §6 named-instance fixture contains zero
-# `kai_evidence_lookup_node("<UserEff>")` and zero by-id lookup. A regression
+# `kai_evidence_lookup_node_l(KAI_EFF("<UserEff>"))` and zero by-id lookup. A regression
 # (a user effect falling back to the walk) flips this immediately.
 
 set -eu
@@ -32,7 +32,7 @@ check() {
   c=$("$KAIC2" $EDITION_FLAG --path "$STDLIB" "$fixture" 2>/dev/null) || {
     echo "GATE FAIL $name: kaic2 errored"; FAIL=1; return
   }
-  walk=$(printf '%s' "$c" | grep -c "kai_evidence_lookup_node(\"$eff\")" || true)
+  walk=$(printf '%s' "$c" | grep -c "kai_evidence_lookup_node_l(KAI_EFF(\"$eff\"))" || true)
   byid=$(printf '%s' "$c" | grep -c "kai_evidence_lookup_node_by_id" || true)
   if [ "$walk" -ne 0 ]; then
     echo "GATE FAIL $name: user effect '$eff' resolved by the by-name walk ($walk site(s)) — must use its capability slot"

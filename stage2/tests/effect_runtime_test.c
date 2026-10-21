@@ -59,13 +59,37 @@ int main(void) {
     check("empty after popping outer",
           kai_evidence_lookup("Io") == NULL);
 
-    /* strcmp fallback: lookup with a non-pointer-equal label. */
+    /* A label copy at another address resolves through interning. */
     char io_copy[3] = { 'I', 'o', 0 };
     KaiEvidence node;
     int handler = 7;
     kai_evidence_push(&node, "Io", &handler);
-    check("strcmp fallback finds Io via copy",
+    check("copy of Io finds the handler",
           kai_evidence_lookup(io_copy) == &handler);
+    kai_evidence_pop();
+
+    /* Interning: equal text is one pointer; instances of one effect share a base. */
+    char st_copy[11] = "State[Int]";
+    check("equal text interns to one pointer",
+          kai_eff_intern(st_copy) == kai_eff_intern("State[Int]"));
+    const char *si = kai_eff_intern("State[Int]");
+    const char *ss = kai_eff_intern("State[String]");
+    const char *sb = kai_eff_intern("State");
+    check("pinned instance matches itself", kai_eff_match(si, si));
+    check("distinct pinned instances do not match", !kai_eff_match(si, ss));
+    check("bare effect matches a pinned instance", kai_eff_match(sb, si) && kai_eff_match(si, sb));
+    check("another effect never matches", !kai_eff_match(kai_eff_intern("Reader[Int]"), si)
+          && !kai_eff_match(kai_eff_intern("Reader"), sb));
+    check("a longer name sharing a prefix does not match", !kai_eff_match(kai_eff_intern("StateX"), sb));
+
+    KaiEvidence ni, ns;
+    int hi = 1, hs = 2;
+    kai_evidence_push(&ni, "State[Int]", &hi);
+    kai_evidence_push(&ns, "State[String]", &hs);
+    check("lookup picks the matching instance under a sibling",
+          kai_evidence_lookup(st_copy) == &hi);
+    check("bare lookup takes the innermost instance", kai_evidence_lookup("State") == &hs);
+    kai_evidence_pop();
     kai_evidence_pop();
 
     if (failed) {
