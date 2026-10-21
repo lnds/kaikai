@@ -54,7 +54,7 @@ case "$mode" in
   llvm|bitcode)
     [ -n "$major" ] || { echo "::error::no LLVM_VERSION in mk/llvm.mk"; exit 1; }
     pkgs="clang-$major llvm-$major"
-    [ "$mode" = bitcode ] || pkgs="clang clang-$major llvm-$major-dev"
+    [ "$mode" = bitcode ] || pkgs="clang clang-$major llvm-$major-dev lld"
     add_llvm_apt_source
     apt_retry update
     # shellcheck disable=SC2086

@@ -102,7 +102,7 @@ stderr on success too so it is never silently swallowed there.
 ### Cache lifetime — recency, trim, `kai clean`
 
 The shared caches under `~/Library/Caches/kai` (`$XDG_CACHE_HOME/kai`,
-else `~/.cache/kai`) — `cmodular`, `nmodular`, `nativedep`, `core`, `pkg`
+else `~/.cache/kai`) — `cmodular`, `lto`, `nmodular`, `nativedep`, `core`, `pkg`
 — are content-addressed and keyed by compiler identity, so every new
 `kaic2` mints new keys. They are bounded by recency, as in Go's build
 cache:
@@ -116,7 +116,7 @@ cache:
   after the stamp `<cache root>/trim-stamp` ages out forks a detached,
   low-priority child once its own work is done; the child removes
   entries unused for 5 days. The unit is a file for `cmodular`,
-  `nmodular` and `nativedep`, a toolchain directory for `core`, a
+  `lto`, `nmodular` and `nativedep`, a toolchain directory for `core`, a
   checkout for `pkg`. Entries are published by write-to-temp + rename
   and a fresh temp file is never old enough to go; a path another
   process removed first is skipped.
@@ -294,6 +294,12 @@ CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1
 ### Where the cost goes — `KAI_PASS_CLOCK`
 
 `KAI_PASS_CLOCK=1 kaic2 …` prints one `pass-clock <pass> <monotonic ns>` line per driver pass to stderr (`core` is the core load, then `open` … `emit`); a pass costs the difference from the previous line. It reads the runtime's monotonic clock (the `PassClock` effect), so it is wall time, not instructions: use it to see which pass a cost sits in, and `cost-ab` to size it. The variable is left out of the native-core pre-key. Without it each pass boundary costs one `Env.get`.
+
+## ThinLTO on the c-modular link
+
+One TU per module keeps cc from inlining across modules, so a call through a forwarder in another module costs what whole-program C does not. The modular link therefore compiles each TU with `-flto=thin` and links with the linker's incremental LTO cache, under `<cache root>/lto` (trimmed with the other shared caches), so a warm relink re-optimises only what changed. `cli_lto.plan` turns it on only when a probe of the toolchain shows both: the compiler is clang (`__clang__`) and a trivial program links with the cache option — `-Wl,-cache_path_lto` on a Mach-O target (ld64), `-fuse-ld=lld -Wl,--thinlto-cache-dir` elsewhere. gcc, or a linker without a cache option, gets the plain modular build: gcc's LTO has no incremental cache, so every relink would re-optimise the whole program. The probe's answer is kept per compiler identity (`probe-<key>` in the same directory); the flags enter the object-cache key through `cflags_compile`, so a toolchain change never reuses stale objects.
+
+`KAI_LTO=0` turns it off; a `CFLAGS` that carries its own `-flto*` or `-O0`, and a debug build, leave it off. Gate: `examples/cache/wrapper_modular_lto.sh` (in `make test-core-cache`) builds with and without LTO under the default `cc` and `clang`, and asserts equal output, bitcode objects exactly when the probe found a cache, and a warm relink that recompiles nothing and links the same code.
 
 ## The c-modular core TU set — pruning against a cached core
 

@@ -1,0 +1,82 @@
+#[doc("""
+ThinLTO for the modular C link: on when the compiler is clang and its
+linker keeps an incremental LTO cache, so cross-module calls inline
+without making a warm relink re-optimise the whole program.
+""")]
+
+import cli_caches
+import cli_fs
+import cli_gc
+import cli_hash
+import cli_plan
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+#[doc("The flags LTO adds to a modular compile and to the link; both empty when LTO is off.")]
+pub type Lto = { compile: [String], link: [String] }
+
+const PROBE_SRC : String = "#ifndef __clang__\n#error not clang\n#endif\nint main(void) { return 0; }\n"
+
+const THIN : String = "-flto=thin"
+
+fn off() : Lto = Lto { compile: [], link: [] }
+
+fn quiet() : cli_proc.Spawn = cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null", err: "/dev/null" }
+
+# An LTO decision of the user's own (`-flto*`) or an unoptimised build leaves nothing for LTO to do.
+fn declined(t: Toolchain) : Bool / Env =
+  cli_caches.env_or("KAI_LTO", "1") == "0"
+    or cli_caches.env_or("KAI_BUILD_MODE", "default") == "debug"
+    or list.any(t.cflags, w => string.starts_with(w, "-flto") or w == "-O0")
+
+fn linker_flags(kind: String, dir: String) : [String] =
+  match kind {
+    "ld64" -> ["-Wl,-cache_path_lto,#{dir}"]
+    "lld" -> ["-fuse-ld=lld", "-Wl,--thinlto-cache-dir=#{dir}"]
+    _ -> []
+  }
+
+fn links_ok(t: Toolchain, tmp: String, flags: [String]) : Bool / File + Ffi = {
+  let src = "#{tmp}/lto-probe.c"
+  let _ = write_file(src, PROBE_SRC)
+  cli_proc.run(
+    cli_plan.cc(t) ++ t.cflags_compile ++ [THIN] ++ flags ++ [src, "-o", "#{tmp}/lto-probe"],
+    quiet()
+  ) == 0
+}
+
+# The kind of LTO cache this toolchain's linker keeps: "ld64", "lld" or "none".
+fn probe(t: Toolchain, tmp: String, dir: String) : String / File + Ffi = {
+  let candidates = if cli_toolchain.links_mach_o(t, tmp) { ["ld64"] } else { ["lld"] }
+  (candidates |> find(k => links_ok(t, tmp, linker_flags(k, dir)))) ?? "none"
+}
+
+# The probe runs once per compiler identity; its answer is kept beside the linker's cache.
+fn kind_of(t: Toolchain, tmp: String, dir: String) : String / File + Ffi = {
+  let version = cli_proc.capture(cli_plan.cc(t) ++ ["--version"], quiet(), "#{tmp}/cc-version").snd
+  let key = cli_hash.digest([
+    cli_hash.lines([t.cc, string.join(t.cflags_compile, " "), cli_toolchain.host(t)]),
+    cli_hash.Text(version)
+  ])
+  let memo = "#{dir}/probe-#{key}"
+  if cli_sys.is_file(memo) {
+    let _ = cli_gc.refresh(memo)
+    cli_fs.read_or_empty(memo)
+  } else {
+    let kind = probe(t, tmp, dir)
+    let _ = write_file(memo, kind)
+    kind
+  }
+}
+
+#[doc("The LTO flags for this toolchain; `tmp` holds the probe. `KAI_LTO=0` turns it off.")]
+pub fn plan(t: Toolchain, tmp: String) : Lto / Env + File + Ffi = {
+  let dir = cli_caches.root("KAI_LTO_CACHE_DIR", "lto", t.os)
+  if declined(t) or (not cli_fs.mkdir_p(dir)) {
+    off()
+  } else {
+    let flags = linker_flags(kind_of(t, tmp, dir), dir)
+    if list.is_empty(flags) { off() } else { Lto { compile: [THIN], link: [THIN, ...flags] } }
+  }
+}
