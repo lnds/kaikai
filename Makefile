@@ -1529,8 +1529,8 @@ tier1-backend-parity: bin/kai
 daily: tier1 daily-tail
 	@echo "daily OK — tier1 + C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
-daily-tail: selfhost stress-fixtures coverage-probe rc-budget test-binserialize-budget
-	@echo "daily-tail OK — C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
+daily-tail: selfhost stress-fixtures stress-nmodular-pool coverage-probe rc-budget test-binserialize-budget
+	@echo "daily-tail OK — C selfhost + stress fixtures + native-modular pool stress + coverage probe + RC budget + BinSerialize budget"
 
 # The `tier1` prerequisites that no tier1-shard-N runs.
 tier1-unsharded: demos-no-regression test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit rc-leak-gate
@@ -1553,6 +1553,11 @@ stress-fixtures: kaic2
 	    && echo "stress OK $$name" \
 	    || { echo "stress FAIL $$name (binary exit non-zero)"; cat /tmp/stress-$$name.out; exit 1; }; \
 	done
+
+# Cold native-modular builds under CPU load with the default pool: a defect in the
+# per-partition emit shows as an occasional failure, never in a quiet single build.
+stress-nmodular-pool: bin/kai
+	@sh examples/cache/stress_nmodular_cold_pool.sh
 
 # Coverage probe: every section of the runtime / language docs has a
 # fixture; if not, alarm. Implemented as a shell script so it can run
