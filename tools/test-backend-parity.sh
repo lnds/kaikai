@@ -10,15 +10,10 @@
 # + exit code match. Diverge => fail. The default gates the in-process
 # libLLVM `native` backend against C-direct (the portable oracle).
 #
-# SCOPE (design decision, 2026-05-27): this harness is FILE-MODE ONLY.
-# It builds each fixture as a standalone file (`kai build <file>`),
-# which does NOT read a kai.toml or resolve manifest dependencies. A
-# fixture that needs package-mode (deps, git sources) cannot build
-# here and is NOT a parity bug — its parity is covered by
-# tools/test-packages.sh's `run_parity` (which builds in package mode
-# with `kai run .` under both backends, where the git-fixture setup
-# lives). The two harnesses split on the package/file axis on purpose;
-# do not add package-mode logic here.
+# A fixture whose directory holds a kai.toml is built as a package
+# (`kai build .` from that directory, dependencies resolved into a scratch
+# cache); anything else is built as a standalone file. The fixtures that
+# cannot be built from the tree alone are listed in the skips file.
 #
 # The entry-point walk and the skip discipline live in tools/lib/corpus.sh,
 # shared with the M:N corpus-determinism gate so the two cannot drift into
@@ -111,6 +106,11 @@ run_with_timeout() {
   fi
 }
 
+kai_corpus_render_manifests
+KAI_CORPUS_PKG_CACHE="$tmp/pkg-cache"
+mkdir -p "$KAI_CORPUS_PKG_CACHE"
+export KAI_CORPUS_PKG_CACHE
+
 kai_corpus_entry_points > "$tmp/entry-points"
 
 # Jobs: number of parallel workers. Defaults to the host's logical CPU count;
@@ -149,7 +149,7 @@ process_one() {
   o_blog="$tmp/${slug}.oracle.build.log"
   t_blog="$tmp/${slug}.target.build.log"
 
-  if ! KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$f" -o "$o_bin" >"$o_blog" 2>&1; then
+  if ! kai_corpus_build "$f" "$o_bin" KAI_BACKEND="$ORACLE_BACKEND" >"$o_blog" 2>&1; then
     {
       echo "FAIL $f — $ORACLE_BACKEND (oracle) build failed:"
       tail -10 "$o_blog" | sed 's/^/    /'
@@ -166,7 +166,7 @@ process_one() {
   # equivalence is proved byte-for-byte by `test-native-modular`; this harness
   # need not re-pay for it. (KAI_NATIVE_MODULAR is a no-op on the C oracle.)
   nopt="$(kai_corpus_native_opt "$f")" || nopt=""
-  if ! env ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$t_bin" >"$t_blog" 2>&1; then
+  if ! kai_corpus_build "$f" "$t_bin" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 >"$t_blog" 2>&1; then
     {
       echo "FAIL $f — $TARGET_BACKEND (target) build failed:"
       tail -10 "$t_blog" | sed 's/^/    /'
@@ -216,7 +216,7 @@ process_one() {
 # reach them from each forked subshell.
 export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND
-export -f process_one kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
+export -f process_one kai_corpus_build kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
@@ -280,13 +280,13 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
   recheck_diverges() {
     rf="$1"
     rob="$tmp/recheck.oracle"; rtb="$tmp/recheck.target"
-    KAI_BACKEND="$ORACLE_BACKEND" "$KAI" build "$rf" -o "$rob" >/dev/null 2>&1 || return 2
+    kai_corpus_build "$rf" "$rob" KAI_BACKEND="$ORACLE_BACKEND" >/dev/null 2>&1 || return 2
     oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || oref=$?
     attempt=0
     while [ "$attempt" -lt "$PARITY_RECHECKS" ]; do
       attempt=$((attempt + 1))
       nopt="$(kai_corpus_native_opt "$rf")" || nopt=""
-      if ! env ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" "$KAI" build "$rf" -o "$rtb" >/dev/null 2>&1; then
+      if ! kai_corpus_build "$rf" "$rtb" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" >/dev/null 2>&1; then
         return 0   # target build failed => a deterministic, real gap.
       fi
       rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || rt=$?

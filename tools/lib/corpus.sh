@@ -117,3 +117,28 @@ kai_corpus_native_opt() {
 kai_corpus_normalize_timestamps() {
   sed -E 's/\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]/[TIMESTAMP]/g'
 }
+
+# Build a fixture the way `kai build` does for its shape: a package fixture
+# (a manifest beside main.kai) is built as a package from its own directory,
+# anything else as a standalone file. Package builds are whole-program, so an
+# extern nothing calls does not reach the link. Args: <fixture> <out>
+# [VAR=value ...] (the build's environment, KAI_BACKEND among them). Needs
+# $KAI and $KAI_CORPUS_PKG_CACHE (a scratch dir for resolved dependencies).
+kai_corpus_build() {
+  local fixture="$1" out="$2" dir; shift 2
+  case "$fixture" in
+    */main.kai) dir="${fixture%/main.kai}" ;;
+    *)          dir="" ;;
+  esac
+  if [ -n "$dir" ] && [ -f "$dir/kai.toml" ]; then
+    ( cd "$dir" && env KAI_MODULAR=0 KAIKAI_CACHE="${KAI_CORPUS_PKG_CACHE:?}/${dir//\//_}" "$@" "$KAI" build . -o "$out" )
+  else
+    env "$@" "$KAI" build "$fixture" -o "$out"
+  fi
+}
+
+# Render the manifests of the git-dependency fixtures (local bare repos).
+kai_corpus_render_manifests() {
+  if [ -x tests/fixtures/git-fixtures/setup.sh ]; then tests/fixtures/git-fixtures/setup.sh >/dev/null 2>&1 || true; fi
+  if [ -x examples/packages/render-fixtures.sh ]; then examples/packages/render-fixtures.sh >/dev/null 2>&1 || true; fi
+}
