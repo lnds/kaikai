@@ -4020,7 +4020,7 @@ test-effects-m7a_6b_handle_runs: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_evidence_push_with_jmp(&_node, \"Counter\"" build/s2-$$name.c \
+	  grep -q "kai_evidence_push_with_jmp_l(&_node, KAI_EFF(\"Counter\")" build/s2-$$name.c \
 	    && grep -q "kai_evidence_pop()" build/s2-$$name.c \
 	    && grep -q "EvCounter _ev = {0};" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (handle lowering shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
@@ -4039,7 +4039,7 @@ test-effects-m7a_6c_op_dispatch: $(TARGET) build core-cache-warm
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "_ev.tick = &_kaiu_main__clause_" build/s2-$$name.c \
 	    && grep -q "_ev.get = &_kaiu_main__clause_" build/s2-$$name.c \
-	    && grep -q "kai_evidence_lookup_node(\"Counter\")" build/s2-$$name.c \
+	    && grep -q "kai_evidence_lookup_node_l(KAI_EFF(\"Counter\"))" build/s2-$$name.c \
 	    && grep -q "_ev_op->tick(_ev_op, &_k)" build/s2-$$name.c \
 	    && grep -q "_ev_op->get(_ev_op, &_k)"  build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (op dispatch shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
@@ -4104,8 +4104,8 @@ test-effects-m7a_7_default_console: $(TARGET) build core-cache-warm
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
 	    && grep -q "kai_default_stderr_eprint" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default(&_kai_default_node_stdout" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default(&_kai_default_node_stderr" build/s2-$$name.c \
+	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_stdout" build/s2-$$name.c \
+	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_stderr" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-handler wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4280,7 +4280,7 @@ test-effects-m8_2_yield_noop: $(TARGET) build core-cache-warm
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_spawn_yield" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default(&_kai_default_node_spawn" build/s2-$$name.c \
+	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_spawn" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Spawn wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4529,7 +4529,7 @@ test-effects-m8_4_cancel_uncaught: $(TARGET) build core-cache-warm
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_cancel_raise" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default(&_kai_default_node_cancel" build/s2-$$name.c \
+	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_cancel" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Cancel wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -5109,7 +5109,7 @@ test-effects-process_basic: $(TARGET) build core-cache-warm
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_process_start" build/s2-$$name.c \
 	    && grep -q "kai_default_process_wait"  build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default(&_kai_default_node_process" build/s2-$$name.c \
+	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_process" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Process wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
