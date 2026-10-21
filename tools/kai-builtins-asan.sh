@@ -71,23 +71,23 @@ run() {
 
 run rows "" || exit 1
 run declared "$tmp/stdlib" || exit 1
-# Every native entry the declared program calls exists, and each declaration
-# emitted its fn: the run did compile against the declarations.
+# Every native entry the declared program calls exists, and a declaration
+# emits no fn: it rides the runtime thunk, as a row does.
 KAIKAI_STDLIB_PATH="$tmp/stdlib" stage2/kaic2 --path "$tmp/stdlib" --emit=kir "$FIX.kai" > "$tmp/declared.kir" \
   || { echo "kai-builtins-asan FAIL ($backend): --emit=kir"; exit 1; }
 for name in string__string_concat list__list_reverse os__vec_push os__array_set os__print; do
-  grep -q "^fn $name(" "$tmp/declared.kir" || { echo "kai-builtins-asan FAIL ($backend): no fn for the declaration of $name"; exit 1; }
+  ! grep -q "^fn $name(" "$tmp/declared.kir" || { echo "kai-builtins-asan FAIL ($backend): the declaration of $name emitted a fn"; exit 1; }
 done
 for sym in $(grep -o 'kaix_core_[A-Za-z0-9_]*' "$tmp/declared.kir" | sort -u); do
   grep -q "^KaiValue \*$sym(" stage0/runtime_llvm.c || { echo "kai-builtins-asan FAIL ($backend): a call binds $sym, which the native runtime does not define"; exit 1; }
 done
 
-# A declaration's fn is reached only through its thunk: its prototype, its
-# definition and the thunk's call name it, no call site does.
+# No call or value use names a declaration's fn: calls bind the runtime
+# symbol, values the runtime thunk.
 if [ "$backend" = c ]; then
   for name in string__string_concat list__list_reverse os__vec_push os__array_set os__print; do
     n=$(grep -o "kaiu_$name(" "$tmp/declared.c" | wc -l | tr -d ' ')
-    [ "$n" -eq 3 ] || { echo "kai-builtins-asan FAIL (c): a call to $name reached its declaration's fn ($n uses), not the runtime symbol"; exit 1; }
+    [ "$n" -eq 0 ] || { echo "kai-builtins-asan FAIL (c): a call to $name reached its declaration's fn ($n uses), not the runtime symbol"; exit 1; }
   done
 fi
 echo "kai-builtins-asan OK ($backend, detect_leaks=$LEAKS: rows and core declarations alike)"

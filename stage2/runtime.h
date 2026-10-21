@@ -12141,6 +12141,9 @@ static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n) 
     static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
     { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2], a[3], a[4]); }
 
+KAI_CORE_THUNK2(to_int_radix)
+KAI_CORE_THUNK2(int_to_string_radix)
+KAI_CORE_THUNK2(string_find)
 KAI_CORE_THUNK1(int_to_le4)
 KAI_CORE_THUNK1(int_to_le8)
 KAI_CORE_THUNK5(bytes_blit)

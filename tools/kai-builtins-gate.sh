@@ -10,7 +10,7 @@
 #
 #   manifest    the lines match tools/kai-builtins.txt, so adding,
 #               removing or retyping a declared builtin is a reviewed diff;
-#   prototypes  a C unit assigns each `<symbol>` (against stage2/runtime.h)
+#   prototypes  a C unit assigns each `<symbol>` and its value thunk (against stage2/runtime.h)
 #               and each `kaix_core_<name>` (against stage0/runtime_llvm.c)
 #               to a `KaiValue *(*)(KaiValue *, ...)` of the declared arity,
 #               compiled with -Werror: a missing entry, another arity or a
@@ -39,6 +39,12 @@ proto_unit() {
     local entry="$sym"
     [ -n "$3" ] && entry="$3$name"
     echo "KaiValue *(*const kai_builtin_proto_${name})($params) = $entry;"
+    case "$sym" in
+      kai_core_*)
+        local thunk="_${sym}_thunk"
+        [ -n "$3" ] && thunk="kaix_${name}_thunk"
+        echo "KaiValue *(*const kai_builtin_thunk_${name})(KaiValue *, KaiValue **, int) = $thunk;" ;;
+    esac
   done < "$1"
 }
 
