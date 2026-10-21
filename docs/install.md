@@ -53,7 +53,7 @@ export KAI_BACKEND=c
 | `CC`            | C compiler invoked by the C backend / the native object link (default: `cc`). |
 | `CFLAGS`        | Extra flags appended to `CC`. |
 | `KAI_NATIVE_OPT`| Optimisation level for the native backend's in-process LLVM pipeline (`0|1|2|3|s|z`; default `2`). |
-| `KAI_LTO` | `0` turns off the ThinLTO the modular C link uses on clang with a linker that keeps an LTO cache (ld64, lld). |
+| `KAI_LTO` | The modular C link uses ThinLTO on clang with a linker that keeps an LTO cache (ld64, lld) for `--release` only. `1` asks for it in any mode, `0` turns it off. |
 | `KAI_C_OPT` | Optimisation level of the C compile when `CFLAGS` is unset (`0\|1\|2\|3\|s`; default `2`, `kai test` defaults to `0`). |
 | `KAI_NATIVE_JOBS`| Threads the native backend optimises and emits module objects on (default: the `-j` of `kai test`, else the CPU count). The objects are identical for any value. |
 | `KAI_GUARD_MEMO`| The memo of `kai test`'s per-file checks, kept in the package's user cache: `0` turns it off, `shadow` also runs every hit and fails the run on any difference (default: on in a package). |
