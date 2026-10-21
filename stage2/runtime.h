@@ -4974,14 +4974,20 @@ static KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
 static pthread_mutex_t    kai_str_intern_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
-    /* FNV-1a, len-bounded. */
+/* FNV-1a over `len` bytes. The offset basis is not the standard FNV-64 one
+ * (a digit short); `String` hashes, and so HashMap iteration order, depend on
+ * it, so it must not change. */
+static inline uint64_t kai_fnv1a64(const char *p, size_t len) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < len; i++) {
-        h ^= (uint64_t) (uint8_t) cstr[i];
+        h ^= (uint64_t) (uint8_t) p[i];
         h *= 1099511628211ull;
     }
-    return (size_t) (h & (KAI_STR_INTERN_BUCKETS - 1));
+    return h;
+}
+
+static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
+    return (size_t) (kai_fnv1a64(cstr, len) & (KAI_STR_INTERN_BUCKETS - 1));
 }
 
 /* Slow path: this probe found an empty bucket, so the string is (probably)
@@ -11253,15 +11259,8 @@ static KaiValue *kai_core_bytes_get_string(KaiValue *src, KaiValue *off, KaiValu
  * byte (one alloc + decref per character) — catastrophic for the hot
  * path a HashMap exercises. */
 static KaiValue *kai_core_string_hash(KaiValue *s) {
-    uint64_t h = 1469598103934665603ull;
-    if (kai_is_ptr(s) && s->tag == KAI_STR) {
-        const char *bytes = s->as.s.bytes;
-        size_t len = s->as.s.len;
-        for (size_t i = 0; i < len; i++) {
-            h ^= (uint64_t) (uint8_t) bytes[i];
-            h *= 1099511628211ull;
-        }
-    }
+    uint64_t h = kai_fnv1a64("", 0);
+    if (kai_is_ptr(s) && s->tag == KAI_STR) h = kai_fnv1a64(s->as.s.bytes, s->as.s.len);
     if (s) kai_decref(s);
     return kai_int((int64_t) h);
 }
