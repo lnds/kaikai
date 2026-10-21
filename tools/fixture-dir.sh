@@ -23,7 +23,8 @@
 #   # fixture: no-stdlib   do not pass the stdlib path (the fixture tests its absence)
 #
 # FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
-# through bin/kai, which owns the stdlib path and the link, and supports no marks.
+# through the kai wrapper named by FIXTURE_KAI, which owns the stdlib path and
+# the link, and supports no marks.
 #
 # Environment (set by stage2/Makefile): KAIC2 CC CFLAGS CPPFLAGS_CORE
 # LDLIBS_M LDFLAGS_STACK TEST_CORE_CACHE FIXTURE_JOBS FIXTURE_BACKEND.
@@ -88,7 +89,7 @@ run_one() {
     if mark "$f" test || mark "$f" no-stdlib; then
       echo "fixture-dir: $f: marks are not supported on native" >&2; exit 2
     fi
-    compile() { KAI_BACKEND=native "$ROOT/bin/kai" build "$f" -o "$b" > /dev/null 2> "$b.err"; }
+    compile() { KAI_BACKEND=native "${FIXTURE_KAI:?native needs FIXTURE_KAI}" build "$f" -o "$b" > /dev/null 2> "$b.err"; }
   else
     compile() { $KAIC2 $TEST_CORE_CACHE $path "$f" > /dev/null 2> "$b.err"; }
   fi
