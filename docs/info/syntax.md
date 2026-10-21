@@ -84,7 +84,9 @@ fn main() : Unit / Stdout = {
 ```
 
 `;` is always a valid statement terminator; use it only to put several
-statements on one line (`{ f(h); each_of(t, f) }`). A single-quoted
+statements on one line (`{ f(h); each_of(t, f) }`). A second expression
+on the same line with no `;` is a parse error pointing at it
+(`let v = 1 2`, `{ f(h) g(t) }`). A single-quoted
 `"..."` string must close on its own line — an embedded newline is
 `unterminated string`; use `"""` (see Literals).
 
