@@ -23506,7 +23506,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
         char tmp_out[4096];
         snprintf(tmp_out, sizeof tmp_out, "%s.tmp%ld", out, (long) getpid());
         if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, tmp_out, LLVMObjectFile, &err)) {
-            fprintf(stderr, "kai: native object emit failed: %s\n", err ? err : "?");
+            fprintf(stderr, "kai: native object emit failed: %s: %s\n", tmp_out, err ? err : "?");
             if (err) LLVMDisposeMessage(err);
             unlink(tmp_out);
             rc = 1;

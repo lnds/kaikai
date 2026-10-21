@@ -62,7 +62,7 @@ static void trim_entry(const char *p, int unit, time_t cutoff) {
         if (old) remove_tree(p);
     } else if (S_ISDIR(st.st_mode)) {
         trim_dir(p, unit == 0 ? 0 : unit - 1, cutoff);
-        if (unit == 0) rmdir(p);
+        if (unit == 0 && old) rmdir(p);
     } else if (unit == 0 && old) {
         unlink(p);
     }
@@ -70,7 +70,9 @@ static void trim_entry(const char *p, int unit, time_t cutoff) {
 
 /* Entries are the files below `dir` when `unit` is 0, else whatever sits
    `unit` levels down (a directory goes whole). One older than `cutoff` is
-   removed; a vanished path is someone else's doing and not an error. */
+   removed; a vanished path is someone else's doing and not an error. A
+   directory emptied this way goes only if it was already old: a fresh one
+   is a build's object dir, still waiting for its first object. */
 static void trim_dir(const char *dir, int unit, time_t cutoff) {
     DIR *d = opendir(dir);
     if (!d) return;
