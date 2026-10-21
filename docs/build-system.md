@@ -314,6 +314,8 @@ Two keys, because the TU text depends on the program only through a few global i
 
 A compile prunes only against its own variant. With none recorded it first compiles the core alone for that variant — a one-line program plus a seed (`UnwSeed`: the `all` flag and the unwinding core effects) that stands in for the handlers the program would bring — which records the variant, the entry key and a digest of the TUs; the program then compiles pruned against that set. The same source therefore yields the same bytes whatever the cache state. If a later full compile of the same variant digests differently the variant is marked `conflict` and never pruned against again.
 
+The native-modular backend (`--emit=native-modular`, the default `kai build` for a package) prunes the same way on every compile, with no cached core set to find: each partition's object is keyed by its own projected KIR, so a pruned core publishes under its own keys and an edit that leaves the reached core alone reuses every core object. Gate: `make test-native-modular` asserts `core-prune: dropped` and the modular == whole-program output.
+
 The functions the unwind analysis reads (`unw_feeds_analysis`: a function that handles an effect, declares a `var`, or whose row may cancel) are never cut in a c-modular build, so the pruned program yields the same frames as the whole one. Lifted lambdas and handler clauses of the cacheable modules are emitted into their module's TU, not the root.
 
 Gate: `make test-cmodular-prune` (tier0) primes a cache with one program and compiles the others against it, comparing every file with a no-cache compile — core TUs and their slices exactly, the root and library TUs as subsets. `CMOD_PRUNE_ALL=1` sweeps every example that has an `.out.expected`.
