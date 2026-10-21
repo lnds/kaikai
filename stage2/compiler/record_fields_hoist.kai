@@ -1,0 +1,182 @@
+#[doc("""
+Field reads of a record bound to a parameter, a `let` or a pattern,
+hoisted ahead of the code that follows when one of them is a `Vec`.
+
+A write through `s.buf` copies while `s` still holds the vector. Binding
+every field read from `s` first, then letting `s` go before the rest runs,
+leaves the vector with the one reference the write needs. A binder used any
+other way (passed on, captured, matched) is left as written.
+""")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_map
+import compiler.anf_ops
+import compiler.expr_positions
+import compiler.ast_ids
+import compiler.perceus_reads
+import compiler.util
+
+#[doc("Hoist, in every fn body of `ds`, the field reads of a record parameter, `let` or pattern binder that carries a `Vec`.")]
+pub(pkg) fn rfh_hoist_decls(ds: [Decl]) : [Decl] = map(ds, rfh_decl)
+
+fn rfh_decl(d: Decl) : Decl = match d {
+  DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> DFn(pub_, fid, tps, ps, ret, row, rfh_body(ps, body), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym)        -> DImpl(p, tas, tgt, map(inner, rfh_decl), l, c, tps, isym)
+  _ -> d
+}
+
+# Only a binder some `Vec` field is read through is a candidate; a body with none is returned as is, as the rebuild would cost every program.
+fn rfh_body(ps: [Param], body: Expr) : Expr = match rfh_bases(body, []) {
+  [] -> body
+  bs       -> rfh_params(bs, ps, rfh_walk(bs, body))
+}
+
+fn rfh_bases(e: Expr, acc: [LocalId]) : [LocalId] = match e.kind {
+  EField(x, _) -> match x.kind {
+    ELocal(l) -> if rfh_is_vec_read(e) and not rfh_has(acc, l) { rfh_bases_ps(xp_positions(e), [l, ...acc]) } else { rfh_bases_ps(xp_positions(e), acc) }
+    _         -> rfh_bases_ps(xp_positions(e), acc)
+  }
+  _ -> rfh_bases_ps(xp_positions(e), acc)
+}
+
+fn rfh_bases_ps(ps: [XPos], acc: [LocalId]) : [LocalId] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> rfh_bases_ps(rest, rfh_bases(c, acc))
+}
+
+fn rfh_has(bs: [LocalId], l: LocalId) : Bool = any(bs, (b) => local_eq(b, l))
+
+fn rfh_walk(bs: [LocalId], e: Expr) : Expr = rfh_bound(bs, with_kind(e, prc_map_expr_kind(e.kind, (c) => rfh_walk(bs, c))))
+
+fn rfh_bound(bs: [LocalId], e: Expr) : Expr = match e.kind {
+  EBlock(stmts, tail) -> unwrap_or(rfh_stmts(bs, e, list_reverse(stmts), [], tail, None), e)
+  EMatch(s, arms) -> with_kind(e, EMatch(s, map(arms, (a) => rfh_arm(bs, a))))
+  ELambda(ps, b)  -> with_kind(e, ELambda(ps, rfh_params(bs, ps, b)))
+  _               -> e
+}
+
+# The block rebuilt when a `let` binder in the statements is hoisted, the later binders first. `rev` holds the statements still to visit, last first; `after` the ones already visited.
+fn rfh_stmts(bs: [LocalId], e: Expr, rev: [Stmt], after: [Stmt], tail: Option[Expr], acc: Option[Expr]) : Option[Expr] = match rev {
+  [] -> acc
+  [s, ...earlier] -> {
+    let rest = unwrap_or(acc, with_kind(e, EBlock(after, tail)))
+    let hoisted = match s {
+      SLet(pat, _, _) -> match pat.pkind {
+        PBind(b) -> if rfh_has(bs, b.id) { rfh_param(b, rest) } else { None }
+        _        -> None
+      }
+      _ -> None
+    }
+    let next = match hoisted {
+      Some(h) -> Some(rfh_cons(e, s, h))
+      None    -> map(acc, (r) => rfh_cons(e, s, r))
+    }
+    rfh_stmts(bs, e, earlier, [s, ...after], tail, next)
+  }
+}
+
+fn rfh_cons(e: Expr, s: Stmt, rest: Expr) : Expr = match rest.kind {
+  EBlock(ss, t) -> with_kind(e, EBlock([s, ...ss], t))
+  _             -> with_kind(e, EBlock([s], Some(rest)))
+}
+
+fn rfh_arm(bs: [LocalId], a: Arm) : Arm = match a {
+  Arm(pat, og, body) -> Arm(pat, og, foldl(filter(prc_pat_bindings(pat, []), (b) => rfh_has(bs, b.id)), body, (acc, b) => rfh_apply(b, acc)))
+}
+
+fn rfh_is_vec_read(e: Expr) : Bool = match e.kind {
+  EField(x, _) -> match x.kind {
+    ELocal(_) -> match e.ty {
+      Some(TyCon(s, _)) -> core_ty_is(s, CtVec)
+      _                 -> false
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
+fn rfh_apply(b: Binder, body: Expr) : Expr = unwrap_or(rfh_param(b, body), body)
+
+fn rfh_params(bs: [LocalId], ps: [Param], body: Expr) : Expr = match ps {
+  []           -> body
+  [p, ...rest] -> rfh_params(bs, rest, if p.pborrow or not rfh_has(bs, p.binder.id) { body } else { rfh_apply(p.binder, body) })
+}
+
+fn rfh_param(b: Binder, body: Expr) : Option[Expr] = {
+  let reads = list_reverse(rfh_reads(b.id, body, []))
+  if not any(reads, rfh_is_vec_read) { None }
+  else {
+    let firsts = rfh_firsts(reads, [])
+    let stem = concat_all(["__rfh_", int_to_string(local_raw(b.id))])
+    let alias = binder_minted(stem)
+    let fbs = map(firsts, (r) => (rfh_field_name(r), binder_minted(concat_all([stem, "_", rfh_field_name(r)]))))
+    let body1 = rfh_subst(b.id, fbs, body)
+    if xp_exists(body1, false, (x) => rfh_is_local(b.id, x)) { None }
+    else {
+      let lets = map(firsts, (r) => rfh_field_let(alias, rfh_binder_of(fbs, rfh_field_name(r)), r))
+      Some(with_kind(body, EBlock([rfh_alias_let(alias, b, firsts), ...lets], Some(body1))))
+    }
+  }
+}
+
+fn rfh_is_local(p: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(l) -> local_eq(l, p)
+  _         -> false
+}
+
+# The reads of `p`'s fields outside lambdas and handler clauses, last first.
+fn rfh_reads(p: LocalId, e: Expr, acc: [Expr]) : [Expr] = match e.kind {
+  EField(x, _) -> if rfh_is_local(p, x) { [e, ...acc] } else { rfh_reads_ps(p, xp_positions(e), acc) }
+  _            -> rfh_reads_ps(p, xp_positions(e), acc)
+}
+
+fn rfh_reads_ps(p: LocalId, ps: [XPos], acc: [Expr]) : [Expr] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> rfh_reads_ps(p, rest, if xrole_inline(r) { rfh_reads(p, c, acc) } else { acc })
+}
+
+fn rfh_field_name(e: Expr) : String = match e.kind {
+  EField(_, f) -> f
+  _            -> ""
+}
+
+# The first read of each field, in order.
+fn rfh_firsts(reads: [Expr], acc: [Expr]) : [Expr] = match reads {
+  []           -> list_reverse(acc)
+  [r, ...rest] -> rfh_firsts(rest, if any(acc, (a) => rfh_field_name(a) == rfh_field_name(r)) { acc } else { [r, ...acc] })
+}
+
+fn rfh_subst(p: LocalId, fbs: [(String, Binder)], e: Expr) : Expr = match e.kind {
+  EField(x, f) ->
+    if rfh_is_local(p, x) { with_kind(e, ELocal(rfh_binder_of(fbs, f).id)) }
+    else { with_kind(e, EField(rfh_subst(p, fbs, x), f)) }
+  ELambda(_, _)                 -> e
+  EHandle(_, _, _, _, _, _, _)  -> e
+  _ -> with_kind(e, prc_map_expr_kind(e.kind, (c) => rfh_subst(p, fbs, c)))
+}
+
+fn rfh_binder_of(fbs: [(String, Binder)], name: String) : Binder = match fbs {
+  []                  -> binder_minted("")
+  [(n, b), ...rest]   -> if n == name { b } else { rfh_binder_of(rest, name) }
+}
+
+fn rfh_base(r: Expr) : Expr = match r.kind {
+  EField(x, _) -> x
+  _            -> r
+}
+
+fn rfh_alias_let(alias: Binder, b: Binder, firsts: [Expr]) : Stmt = match firsts {
+  [r, ..._] -> {
+    let base = rfh_base(r)
+    SLet(Pattern { pkind: PBind(alias), line: base.line, col: base.col }, None, with_kind(base, ELocal(b.id)))
+  }
+  [] -> SLet(Pattern { pkind: PWild, line: 0, col: 0 }, None, mk_expr(EUnit, 0, 0))
+}
+
+fn rfh_field_let(alias: Binder, fb: Binder, r: Expr) : Stmt = match r.kind {
+  EField(x, f) -> SLet(Pattern { pkind: PBind(fb), line: r.line, col: r.col }, None,
+                       with_kind(r, EField(with_kind(x, ELocal(alias.id)), f)))
+  _            -> SLet(Pattern { pkind: PWild, line: r.line, col: r.col }, None, r)
+}
