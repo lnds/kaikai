@@ -51,7 +51,7 @@ pub fn shout(s: String) : Unit / Stdout = print(s)
 EOF
 cat > "$PROJ/b.kai" <<'EOF'
 import a
-pub fn twice(s: String) : Unit / Stdout = { a.shout(s) a.shout(s) }
+pub fn twice(s: String) : Unit / Stdout = { a.shout(s); a.shout(s) }
 EOF
 cat > "$PROJ/main.kai" <<'EOF'
 import a
@@ -122,7 +122,7 @@ fi
 # A body-only edit re-infers exactly its own module: one new blob.
 cat > "$PROJ/b.kai" <<'EOF'
 import a
-pub fn twice(s: String) : Unit / Stdout = { a.shout(s) a.shout(s) a.shout(s) }
+pub fn twice(s: String) : Unit / Stdout = { a.shout(s); a.shout(s); a.shout(s) }
 EOF
 # shellcheck disable=SC2046
 check "$PROJ" $(shared)
@@ -173,7 +173,7 @@ same "$WORK/plain.c" "$WORK/shared_build.c" \
 PROJ2="$WORK/p2"
 mkdir -p "$PROJ2"
 cat > "$PROJ2/a.kai" <<'EOF'
-pub fn shout(s: String) : Unit / Stdout = { print(s) print(s) }
+pub fn shout(s: String) : Unit / Stdout = { print(s); print(s) }
 EOF
 cat > "$PROJ2/b.kai" <<'EOF'
 import a
