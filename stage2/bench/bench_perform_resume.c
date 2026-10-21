@@ -81,13 +81,13 @@ int main(int argc, char **argv) {
     ev.handler_id = kai_fresh_handler_id();
     ev.tick = &bench_clause_tick;
     KaiEvidence node;
-    kai_evidence_push(&node, "Counter", &ev);
+    kai_evidence_push_l(&node, kai_eff_intern("Counter"), &ev);
 
     g_count = 0;
     struct timespec e0, e1;
     clock_gettime(CLOCK_MONOTONIC, &e0);
     for (long i = 0; i < n; ++i) {
-        EvCounter *evp = (EvCounter *) kai_evidence_lookup("Counter");
+        EvCounter *evp = (EvCounter *) kai_evidence_lookup_l(kai_eff_intern("Counter"));
         KaiCont k;
         kai_cont_init_identity(&k, evp->handler_id);
         evp->tick(evp, &k);
