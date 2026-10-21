@@ -301,10 +301,16 @@ pub(pkg) fn lower_unbox_border(x: Expr, prim: PrimOp, slot: KSlot, st: LowerSt) 
 
 # Unbox `x`'s boxed form through `prim`, releasing the box when it is owned.
 pub(pkg) fn lower_unbox_at(x: Expr, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
-  match lower_expr_boxed(x, st) { LRes(bv, st1) ->
-    match bind_op_slot(st1, KPrim(prim, [bv]), slot, kpos_of(x)) {
-      LRes(rv, st2) -> if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
-    } }
+  match lower_expr_boxed(x, st) { LRes(bv, st1) -> lower_unbox_owned(x, bv, prim, slot, owned, st1) }
+
+# The call result `bv` of `x`, unwrapped and released as the border does.
+fn lower_unbox_value(x: Expr, bv: KVal, prim: PrimOp, slot: KSlot, st: LowerSt) : LRes / Console =
+  lower_unbox_owned(x, bv, prim, slot, raw_border_owns(x), st)
+
+fn lower_unbox_owned(x: Expr, bv: KVal, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
+  match bind_op_slot(st, KPrim(prim, [bv]), slot, kpos_of(x)) {
+    LRes(rv, st2) -> if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
+  }
 
 # The natively-raw forms (the `MUnboxed` kinds the unbox pass produces).
 # Real arith / neg yield `SReal`; Int arith yields `SInt64`; comparison /
@@ -383,9 +389,32 @@ fn lower_raw_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console
     Some(r) -> r
     None    -> match vec_raw_read(st.recs, x.kind, x.ty) {
       Some(rd) -> lower_vec_raw_read(x, rd, st)
-      None     -> lower_call(x, f, cargs, st)
+      None     -> lower_raw_call_result(x, f, lower_call(x, f, cargs, st))
     }
   } }
+
+# A callee that returns a boxed scalar leaves it for the raw reader to unwrap
+# and release; a raw-return callee already landed its register.
+fn lower_raw_call_result(x: Expr, f: Expr, r: LRes) : LRes / Console = match r {
+  LRes(v, st1) -> if call_returns_boxed(f, st1) {
+    match border_unbox_prim(border_slot_of(x.ty)) {
+      Some(prim) -> lower_unbox_value(x, v, prim, border_slot_of(x.ty), st1)
+      None       -> r
+    }
+  } else { r }
+}
+
+fn call_returns_boxed(f: Expr, st: LowerSt) : Bool = match f.kind {
+  ESym(s, inst) -> match ls_ctor_lay(st, s) {
+    Some(_) -> false
+    None    -> match ls_classify(st, FnId(s, inst)) {
+      CkDirect -> match ret_slot_of_sig(ls_call_sig(st, FnId(s, inst))) { SBoxed -> true _ -> false }
+      _        -> false
+    }
+  }
+  ELocal(_) -> true
+  _         -> false
+}
 
 # A plain block lowers its statements in its own scope and its tail at the raw
 # slot; a region block lowers boxed and unbox-borrows at the border.
