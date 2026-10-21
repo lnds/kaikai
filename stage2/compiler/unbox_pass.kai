@@ -14,8 +14,6 @@ import compiler.spec_names
 import compiler.fnreg
 import compiler.fn_index
 import compiler.kinds
-import compiler.core_builtins
-import compiler.kir_lower_raw
 import compiler.loop_lower
 import compiler.operators
 import compiler.unbox
@@ -114,7 +112,7 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: FnIndex, cis: CtorIntIx, n
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
-      EIntrinsic(name, map(args_, (a) => if is_loop_intrinsic(name) { unbox_loop_arg(a, env, fns, cis, nat) } else { unbox_expr_aware(a, env, fns, cis, nat) }))
+      EIntrinsic(name, map(args_, (a) => if is_loop_intrinsic(name) and not nat { unbox_loop_arg(a, env, fns, cis) } else { unbox_expr_aware(a, env, fns, cis, nat) }))
     ESurface(sf) -> ESurface(surface_rebuild(sf, map(surface_children(sf), (a) => unbox_expr_aware(a, env, fns, cis, nat))))
     ECall(callee, args_) -> ECall(unbox_expr_aware(callee, env, fns, cis, nat),
                                    map(args_, (a) => unbox_expr_aware(a, env, fns, cis, nat)))
@@ -168,12 +166,12 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: FnIndex, cis: CtorIntIx, n
 }
 
 # A loop's condition and body run in place, so they read the raw binders of the enclosing scope.
-fn unbox_loop_arg(a: Expr, env: [LocBind], fns: FnIndex, cis: CtorIntIx, nat: Bool) : Expr / Console = match a.kind {
+fn unbox_loop_arg(a: Expr, env: [LocBind], fns: FnIndex, cis: CtorIntIx) : Expr / Console = match a.kind {
   ELambda(ps, b) -> {
     let raw_env = filter(env, (lb) => match lb { LB(_, MUnboxed) -> true  _ -> false })
-    Expr { kind: ELambda(ps, unbox_expr_aware(b, raw_env, fns, cis, nat)), line: a.line, col: a.col, ty: a.ty, mode: a.mode, site: a.site }
+    Expr { kind: ELambda(ps, unbox_expr_aware(b, raw_env, fns, cis, false)), line: a.line, col: a.col, ty: a.ty, mode: a.mode, site: a.site }
   }
-  _ -> unbox_expr_aware(a, env, fns, cis, nat)
+  _ -> unbox_expr_aware(a, env, fns, cis, false)
 }
 
 fn unbox_opt_aware(opt: Option[Expr], env: [LocBind], fns: FnIndex, cis: CtorIntIx, nat: Bool) : Option[Expr] / Console {
@@ -288,7 +286,7 @@ fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], f
             # `int64_t` — break the boxed convention. Demote to
             # MBoxed so the binding lives as `KaiValue *kai_<nm>`
             # and the unbox/wrap happens at the read site.
-            if name_captured_in_block(rest, tail, nm) {
+            if name_captured_in_block(rest, tail, nm, not nat) {
               let rhs_box = expr_to_boxed(rhs1)
               UbStmt(SLet(pat, ann, rhs_box), env)
             }
@@ -296,7 +294,7 @@ fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], f
               UbStmt(SLet(pat, ann, rhs1), [LB(nm.id, MUnboxed), ...env])
             }
           }
-          _ -> if let_rhs_unboxes_at_binding(rhs1, nat) and not name_captured_in_block(rest, tail, nm) {
+          _ -> if let_rhs_unboxes_at_binding(rhs1, nat) and not name_captured_in_block(rest, tail, nm, not nat) {
             UbStmt(SLet(pat, ann, expr_to_unboxed(rhs1)), [LB(nm.id, MUnboxed), ...env])
           } else {
             UbStmt(SLet(pat, ann, rhs1), env)
@@ -327,18 +325,13 @@ fn stmt_rhs_is_cell_init(e: Expr) : Bool = match e.kind {
 
 # A boxed scalar-typed computation a `let` binds: the binding takes the box and
 # keeps the raw payload, so later arithmetic on the binder stays raw. The native
-# lowering reads only an Int back raw, and a call's result only when the builtin lowers in place.
+# lowering has no matching drop for the taken box, so only C binds it raw.
 fn let_rhs_unboxes_at_binding(rhs: Expr, nat: Bool) : Bool =
-  ty_is_unboxable(rhs.ty) and not ty_is_fixed_vec_opt(rhs.ty) and (not nat or kir_ty_is_int(rhs.ty)) and match rhs.kind {
-    ECall(callee, _) -> not nat or callee_is_inline_builtin(callee)
-    EBinop(op, a, b) -> (binop_eq(op, BoAdd) or binop_eq(op, BoSub) or binop_eq(op, BoMul)) and (not nat or (kir_ty_is_int(a.ty) and kir_ty_is_int(b.ty)))
+  not nat and ty_is_unboxable(rhs.ty) and not ty_is_fixed_vec_opt(rhs.ty) and match rhs.kind {
+    ECall(_, _) -> true
+    EBinop(op, _, _) -> binop_eq(op, BoAdd) or binop_eq(op, BoSub) or binop_eq(op, BoMul)
     _ -> false
   }
-
-fn callee_is_inline_builtin(callee: Expr) : Bool = match builtin_ref(callee) {
-  Some(b) -> builtin_is_inline(b)
-  None -> false
-}
 
 fn expr_to_unboxed(e: Expr) : Expr =
   Expr { kind: e.kind, line: e.line, col: e.col, ty: e.ty, mode: MUnboxed, site: e.site }
