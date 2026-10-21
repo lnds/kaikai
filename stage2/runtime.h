@@ -1847,90 +1847,116 @@ static uint32_t kai_slot_mask_of(int32_t tag) {
 
 /* ---------- KAI_MAX_HEAP: process heap ceiling (host containment) ----------
  *
- * Caps total committed heap so a runaway aborts clean instead of dragging
+ * Caps the live committed heap so a runaway aborts clean instead of dragging
  * the host into an OOM hang (on macOS the RAM compressor masks exhaustion;
  * RLIMIT_AS / `ulimit -v` are no-ops, so there is no OS ceiling at all).
  * Set `KAI_MAX_HEAP` to a byte count or a k/m/g-suffixed size (e.g. `4g`).
- * Unset/empty/unparseable -> no cap, one predicted branch per grow point.
+ * Unset/empty/unparseable -> no cap: every grow point is one flag test and
+ * nothing is accounted.
  *
- * The counter is monotonic high-water (commit, not live): the value heap
- * never returns slabs to the OS, so the running total is the process's
- * committed footprint, which is the metric containment cares about. It is
- * charged at every OS-commit grow point — slab grow, oversized slab, cell
- * calloc, variant-block fallback, arena chunk, and string/array payloads —
- * so no allocation path can grow past the ceiling uncounted. Single OS
- * thread (fibers share it), so a plain global needs no synchronisation. */
-/* Committed footprint is a whole-process total, so KAI_MAX_HEAP caps the
- * program, not each TU: one shared accumulator (owner defines, others
- * extern). A per-TU copy would let every TU spend the full ceiling. */
+ * The counter is one process-wide atomic. Slabs, cells and arena chunks stay
+ * committed once taken, so they only add. String, array and vec payloads are
+ * plain malloc blocks: they add on allocation and subtract on free, by the
+ * allocator's own usable size so a block always credits what it charged. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern size_t kai_heap_limit_cached;
-extern int    kai_heap_inited;
-extern KAI_TLS size_t kai_heap_committed;
+extern size_t kai_heap_cap;
+extern size_t kai_heap_live;
 #  if defined(KAI_RUNTIME_OWNER)
-size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
-int    kai_heap_inited       = 0;
-KAI_TLS size_t kai_heap_committed    = 0;
+size_t kai_heap_cap  = 0;   /* 0 = no cap */
+size_t kai_heap_live = 0;
 #  endif
 #else
-static size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
-static int    kai_heap_inited       = 0;
-static KAI_TLS size_t kai_heap_committed    = 0;
+static size_t kai_heap_cap  = 0;
+static size_t kai_heap_live = 0;
 #endif
 
-static size_t kai_heap_limit(void) {
-    if (!kai_heap_inited) {
-        kai_heap_inited = 1;
-        const char *raw = getenv("KAI_MAX_HEAP");
-        if (raw && *raw) {
-            char *end = NULL;
-            unsigned long long n = strtoull(raw, &end, 10);
-            unsigned long long mul = 1;
-            if (end && *end) {
-                switch (*end) {
-                    case 'k': case 'K': mul = 1024ULL; break;
-                    case 'm': case 'M': mul = 1024ULL * 1024ULL; break;
-                    case 'g': case 'G': mul = 1024ULL * 1024ULL * 1024ULL; break;
-                    default: mul = 0; break;   /* junk suffix -> no cap */
-                }
-                if (mul && end[1]) mul = 0;    /* trailing junk after suffix -> no cap */
-            }
-            if (mul && n > 0 && n <= (unsigned long long) ((size_t) -1) / mul) {
-                kai_heap_limit_cached = (size_t) (n * mul);
-            }
-        }
-    }
-    return kai_heap_limit_cached;
-}
+#if defined(__APPLE__)
+#  include <malloc/malloc.h>
+#  define kai_heap_usable(p) malloc_size(p)
+#else
+#  include <malloc.h>
+#  define kai_heap_usable(p) malloc_usable_size(p)
+#endif
 
-/* noinline: kai_heap_committed is a per-thread accumulator; keeping the slot
- * address inside this activation stops the optimiser from carrying it across a
- * park into a work-stolen frame, which would charge the wrong thread's ledger. */
-__attribute__((noinline))
-KAI_RT_SHARED void kai_heap_charge(size_t sz) {
-    size_t limit = kai_heap_limit();
-    if (limit && kai_heap_committed + sz > limit) {
+#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER)
+__attribute__((constructor)) static void kai_heap_cap_init(void) {
+    const char *raw = getenv("KAI_MAX_HEAP");
+    if (!raw || !*raw) return;
+    char *end = NULL;
+    unsigned long long n = strtoull(raw, &end, 10);
+    unsigned long long mul = 1;
+    if (end && *end) {
+        switch (*end) {
+            case 'k': case 'K': mul = 1024ULL; break;
+            case 'm': case 'M': mul = 1024ULL * 1024ULL; break;
+            case 'g': case 'G': mul = 1024ULL * 1024ULL * 1024ULL; break;
+            default: mul = 0; break;   /* junk suffix -> no cap */
+        }
+        if (mul && end[1]) mul = 0;    /* trailing junk after suffix -> no cap */
+    }
+    if (mul && n > 0 && n <= (unsigned long long) ((size_t) -1) / mul) {
+        kai_heap_cap = (size_t) (n * mul);
+    }
+}
+#endif
+
+__attribute__((noinline, cold))
+KAI_RT_SHARED void kai_heap_charge_slow(size_t sz) {
+    size_t used = __atomic_add_fetch(&kai_heap_live, sz, __ATOMIC_RELAXED);
+    if (used > kai_heap_cap) {
         fprintf(stderr,
             "kai: heap limit exceeded (KAI_MAX_HEAP=%s, used %zu bytes)\n",
-            getenv("KAI_MAX_HEAP"), kai_heap_committed);
+            getenv("KAI_MAX_HEAP"), used - sz);
         kai_exit(1);
     }
-    kai_heap_committed += sz;
 }
 
-/* malloc/realloc that charge the payload against the ceiling and fold in
- * the OOM check shared by every value-heap allocation. */
+__attribute__((noinline, cold))
+KAI_RT_SHARED void kai_heap_credit_slow(size_t sz) {
+    size_t cur = __atomic_load_n(&kai_heap_live, __ATOMIC_RELAXED);
+    size_t next;
+    do { next = cur > sz ? cur - sz : 0; }
+    while (!__atomic_compare_exchange_n(&kai_heap_live, &cur, next, 1,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+}
+
+/* A grow point that stays committed. */
+static inline void kai_heap_charge(size_t sz) {
+    if (__builtin_expect(kai_heap_cap != 0, 0)) kai_heap_charge_slow(sz);
+}
+
+/* malloc that charges the payload against the ceiling and folds in the OOM
+ * check shared by every value-heap allocation. */
 static void *kai_heap_malloc(size_t sz) {
     kai_heap_charge(sz);
     void *p = malloc(sz);
     if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (__builtin_expect(kai_heap_cap != 0, 0)) {
+        size_t usable = kai_heap_usable(p);
+        if (usable > sz) __atomic_add_fetch(&kai_heap_live, usable - sz, __ATOMIC_RELAXED);
+    }
     return p;
 }
 
+static void kai_heap_free(void *p) {
+    if (__builtin_expect(kai_heap_cap != 0, 0) && p) kai_heap_credit_slow(kai_heap_usable(p));
+    free(p);
+}
+
 static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
-    if (new_sz > old_sz) kai_heap_charge(new_sz - old_sz);
+    size_t old_usable = 0;
+    if (__builtin_expect(kai_heap_cap != 0, 0)) {
+        old_usable = ptr ? kai_heap_usable(ptr) : 0;
+        if (new_sz > old_sz) kai_heap_charge_slow(new_sz - old_sz);
+    }
     void *p = realloc(ptr, new_sz);
     if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (__builtin_expect(kai_heap_cap != 0, 0)) {
+        size_t new_usable = kai_heap_usable(p);
+        size_t charged = new_sz > old_sz ? old_usable + (new_sz - old_sz) : old_usable;
+        if (new_usable > charged) __atomic_add_fetch(&kai_heap_live, new_usable - charged, __ATOMIC_RELAXED);
+        else if (new_usable < charged) kai_heap_credit_slow(charged - new_usable);
+    }
     return p;
 }
 
@@ -4425,7 +4451,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
     KaiValue *next = NULL;
     switch ((KaiTag) v->tag) {
         case KAI_STR:
-            free(v->as.s.bytes);
+            kai_heap_free(v->as.s.bytes);
             break;
         case KAI_CONS:
             /* A unique tail continues this loop at the same depth, so a
@@ -4466,7 +4492,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             break;
         case KAI_ARRAY:
             for (int64_t i = 0; i < v->as.arr.len; ++i) kai_drop_child(v->as.arr.items[i], depth, st);
-            free(v->as.arr.items);
+            kai_heap_free(v->as.arr.items);
             break;
         case KAI_VEC: {
             /* A view owns nothing but its ref on the owner: release it
@@ -4482,7 +4508,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                 KaiValue **items = (KaiValue **) kai_vec_elems(v);
                 for (int64_t i = 0; i < v->as.vec.len; ++i) kai_drop_child(items[i], depth, st);
             }
-            free(v->as.vec.data);
+            kai_heap_free(v->as.vec.data);
             break;
         }
         case KAI_REF:
@@ -10058,9 +10084,7 @@ static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
             } else {
                 KaiValue *v = kai_alloc(KAI_STR);
                 v->as.s.len = (size_t) n;
-                kai_heap_charge((size_t) n + 1);
-                v->as.s.bytes = (char *) malloc((size_t) n + 1);
-                if (!v->as.s.bytes) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                v->as.s.bytes = (char *) kai_heap_malloc((size_t) n + 1);
                 size_t got = fread(v->as.s.bytes, 1, (size_t) n, fp);
                 fclose(fp);
                 v->as.s.bytes[got] = '\0';
@@ -10252,9 +10276,7 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
         } else {
             KaiValue *v = kai_alloc(KAI_STR);
             v->as.s.len = (size_t) got;
-            kai_heap_charge((size_t) got + 1);
-            v->as.s.bytes = (char *) malloc((size_t) got + 1);
-            if (!v->as.s.bytes) { free(buf); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            v->as.s.bytes = (char *) kai_heap_malloc((size_t) got + 1);
             memcpy(v->as.s.bytes, buf, (size_t) got);
             v->as.s.bytes[got] = '\0';
             free(buf);
@@ -10450,9 +10472,7 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
                 KaiValue *arr = kai_alloc(KAI_ARRAY);
                 arr->as.arr.len = (int64_t) got;
                 arr->as.arr.cap = got > 0 ? (int64_t) got : 1;
-                kai_heap_charge((size_t) arr->as.arr.cap * sizeof(KaiValue *));
-                arr->as.arr.items = (KaiValue **) malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
-                if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                arr->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
                 for (size_t i = 0; i < got; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
                 free(buf);
                 r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = arr}});

@@ -10455,7 +10455,13 @@ test-heap-limit: $(TARGET) build
 	un=0; $(TIMEOUT) 60 ./build/s2-878hl > build/s2-878hl.un.out 2> build/s2-878hl.un.err || un=$$?; \
 	{ [ "$$un" -eq 0 ] && grep -q 'len=268435456' build/s2-878hl.un.out; } \
 	  || { echo "heap-limit FAIL (unset cap exit $$un, output:)"; cat build/s2-878hl.un.out build/s2-878hl.un.err; exit 1; }; \
-	echo "heap-limit OK (64m -> clean abort exit 1; 2g + unset -> complete len=268435456; cap contains, unset unchanged)"
+	$(KAIC2) --path ../stdlib ../examples/perceus/heap_limit_churn.kai > build/s2-878ch.c \
+	  || { echo "heap-limit FAIL (churn: kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-878ch.c -o build/s2-878ch $(LDLIBS_M); \
+	ch=0; KAI_MAX_HEAP=64m $(TIMEOUT) 120 ./build/s2-878ch > build/s2-878ch.out 2> build/s2-878ch.err || ch=$$?; \
+	{ [ "$$ch" -eq 0 ] && grep -q 'total=3276800000' build/s2-878ch.out; } \
+	  || { echo "heap-limit FAIL (churn under 64m: freed bytes counted, exit $$ch)"; cat build/s2-878ch.out build/s2-878ch.err; exit 1; }; \
+	echo "heap-limit OK (64m -> clean abort exit 1; 2g + unset -> complete len=268435456; churn under 64m completes; cap contains live bytes, unset unchanged)"
 
 # Issue #860 — the NATIVE backend must cascade decref->free for cons cells
 # consumed by a self-tail arm (accumulator / consuming / TRMC cons-modulo).
