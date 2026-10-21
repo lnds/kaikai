@@ -23249,6 +23249,49 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
  * globals stay `external` references resolved by the runtime owner, so one
  * runtime-state instance survives. Returns 0 on success or no-op (bc path
  * unset), non-zero only on a real parse/link failure. */
+/* Exported runtime bodies above this many instructions are never worth
+ * inlining; the runtime owner object defines them. */
+#define KAI_LLVM_TRIM_MAX_INSNS 30
+
+static int kai_llvm_fn_has_enum_attr(LLVMValueRef f, const char *name) {
+    unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+    return LLVMGetEnumAttributeAtIndex(f, LLVMAttributeFunctionIndex, kind) != NULL;
+}
+
+/* Turn a large exported non-`kaix_` function of the runtime bitcode into a
+ * declaration, so the partition neither links nor optimises nor emits what it
+ * will call through the owner. The `kaix_*` ops, internal helpers (inlined or
+ * dropped by globaldce) and small or hinted functions keep their bodies.
+ * Returns 1 if a block is still in use when it is deleted. */
+static int kai_llvm_trim_runtime_bc(LLVMModuleRef src) {
+    for (LLVMValueRef f = LLVMGetFirstFunction(src); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f) || LLVMGetLinkage(f) != LLVMExternalLinkage) continue;
+        const char *nm = LLVMGetValueName(f);
+        if (!nm || strncmp(nm, "kaix_", 5) == 0) continue;
+        if (kai_llvm_fn_has_enum_attr(f, "alwaysinline") || kai_llvm_fn_has_enum_attr(f, "inlinehint")) continue;
+        unsigned n = 0;
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb; bb = LLVMGetNextBasicBlock(bb))
+            for (LLVMValueRef i = LLVMGetFirstInstruction(bb); i; i = LLVMGetNextInstruction(i)) n++;
+        if (n <= KAI_LLVM_TRIM_MAX_INSNS) continue;
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb; bb = LLVMGetNextBasicBlock(bb))
+            for (LLVMValueRef i = LLVMGetFirstInstruction(bb); i; i = LLVMGetNextInstruction(i))
+                if (LLVMGetTypeKind(LLVMTypeOf(i)) != LLVMVoidTypeKind)
+                    LLVMReplaceAllUsesWith(i, LLVMGetUndef(LLVMTypeOf(i)));
+        /* Every instruction goes before any block: a terminator still using a
+         * deleted block would write to freed memory when it is erased. */
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb; bb = LLVMGetNextBasicBlock(bb)) {
+            LLVMValueRef i;
+            while ((i = LLVMGetFirstInstruction(bb)) != NULL) LLVMInstructionEraseFromParent(i);
+        }
+        LLVMBasicBlockRef bb;
+        while ((bb = LLVMGetFirstBasicBlock(f)) != NULL) {
+            if (LLVMGetFirstUse(LLVMBasicBlockAsValue(bb))) return 1;
+            LLVMDeleteBasicBlock(bb);
+        }
+    }
+    return 0;
+}
+
 static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
     const char *bc_path = getenv("KAI_NATIVE_RUNTIME_INLINE_BC");
     if (!bc_path || !bc_path[0]) return 0;             /* opt-out: runtime stays an owner-TU call */
@@ -23301,6 +23344,12 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         const char *dst_triple = LLVMGetTarget(mod);
         if (dst_triple) LLVMSetTarget(src, dst_triple);
         LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout(mod));
+    }
+    if (kai_llvm_trim_runtime_bc(src)) {
+        fprintf(stderr, "kai: native runtime inline bitcode trim left a block in use (%s)\n", bc_path);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
     }
     if (LLVMLinkModules2(mod, src)) {
         fprintf(stderr, "kai: native runtime inline bitcode link failed (%s)\n", bc_path);
