@@ -70,7 +70,7 @@ static KaiValue *held_body(KaiValue *self, KaiValue **args, int n) {
     (void) args; (void) n;
     KaiEvidence node;
     int handler = 0;
-    kai_evidence_push(&node, "Res", &handler);
+    kai_evidence_push_l(&node, kai_eff_intern("Res"), &handler);
     kai_evidence_set_cleanup(&node, count_cleanup, NULL);
     KaiValue *held[1] = { kai_incref(self->as.clo.captures[0]) };
     KaiFiber *uf = kai_unw_push(held, 1);
@@ -110,14 +110,14 @@ static KaiValue *lookup_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
     KaiEvidence node;
     int inner = 1;
-    kai_evidence_push(&node, "Inner", &inner);
+    kai_evidence_push_l(&node, kai_eff_intern("Inner"), &inner);
     int64_t seen = 0;
     for (int round = 0; round < 2; round++) {
         kai_decref(kai_seg_suspend(kai_unit()));
-        int *outer = (int *) kai_evidence_lookup("Outer");
+        int *outer = (int *) kai_evidence_lookup_l(kai_eff_intern("Outer"));
         seen = seen * 10 + (outer ? *outer : 0);
     }
-    check("inner handler still resolves", kai_evidence_lookup("Inner") == &inner);
+    check("inner handler still resolves", kai_evidence_lookup_l(kai_eff_intern("Inner")) == &inner);
     kai_evidence_pop();
     return kai_int(seen);
 }
@@ -128,10 +128,10 @@ static void test_reparent(void) {
     kai_decref(kai_seg_start(mk_body(lookup_body, NULL), &k));
     KaiEvidence a, b;
     int ha = 7, hb = 8;
-    kai_evidence_push(&a, "Outer", &ha);
+    kai_evidence_push_l(&a, kai_eff_intern("Outer"), &ha);
     kai_decref(kai_seg_resume(k, kai_unit(), &k));
     kai_evidence_pop();
-    kai_evidence_push(&b, "Outer", &hb);
+    kai_evidence_push_l(&b, kai_eff_intern("Outer"), &hb);
     KaiValue *v = kai_seg_resume(k, kai_unit(), &k);
     kai_evidence_pop();
     check("lookups see each resumer's handlers", k == NULL && kai_intf(v) == 78);
@@ -140,7 +140,7 @@ static void test_reparent(void) {
 
 static KaiValue *dispatch_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
-    KaiEvidence *node = kai_evidence_lookup_node("Outer");
+    KaiEvidence *node = kai_evidence_lookup_node_l(kai_eff_intern("Outer"));
     return kai_int(node ? *(int *) node->handler : 0);
 }
 
@@ -149,8 +149,8 @@ static void test_inherits_dispatch(void) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence outer, inner;
     int ho = 1, hi = 2;
-    kai_evidence_push(&outer, "Outer", &ho);
-    kai_evidence_push(&inner, "Outer", &hi);
+    kai_evidence_push_l(&outer, kai_eff_intern("Outer"), &ho);
+    kai_evidence_push_l(&inner, kai_eff_intern("Outer"), &hi);
     KaiEvidence *saved = f->in_dispatch_node;
     f->in_dispatch_node = &inner;
     KaiValue *k = NULL;
@@ -171,7 +171,7 @@ static KaiValue *abandon_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
     KaiEvidence node;
     int h = 0;
-    kai_evidence_push(&node, "Res", &h);
+    kai_evidence_push_l(&node, kai_eff_intern("Res"), &h);
     kai_evidence_set_cleanup(&node, count_cleanup, NULL);
     /* The op-site discard sequence the backends emit. */
     *abandon_target->discard_slot = kai_int(42);
@@ -188,7 +188,7 @@ static void test_abandon_escapes(void) {
     int h = 0;
     cleanups = 0;
     if (_setjmp(jb) == 0) {
-        kai_evidence_push_with_jmp(&node, "Abort", &h, &jb, (KaiValue **) &discard);
+        kai_evidence_push_with_jmp_l(&node, kai_eff_intern("Abort"), &h, &jb, (KaiValue **) &discard);
         abandon_target = &node;
         KaiValue *k = NULL;
         (void) kai_seg_start(mk_body(abandon_body, NULL), &k);
@@ -206,7 +206,7 @@ static KaiValue *gen_yield_body(KaiValue *self, KaiValue **args, int n) {
     int64_t count = cap_int(self);
     KaiEvidence node;
     int h = 0;
-    kai_evidence_push(&node, "Res", &h);
+    kai_evidence_push_l(&node, kai_eff_intern("Res"), &h);
     kai_evidence_set_cleanup(&node, count_cleanup, NULL);
     for (int64_t i = 0; i < count; i++) {
         KaiValue *a[1] = { kai_int(i) };

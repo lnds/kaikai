@@ -1530,24 +1530,12 @@ KaiValue *kaix_clause_state_get(void *self) {
 #if !defined(KAI_HOT_ONLY)
 KaiHandlerId kaix_fresh_handler_id(void) { return kai_fresh_handler_id(); }
 
-void kaix_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
-    kai_evidence_push(node, eff_label, handler);
-}
-
 void kaix_evidence_init_default_l(KaiEvidence *node, const char *eff_label, void *handler) {
     kai_evidence_init_default_l(node, eff_label, handler);
 }
 
-void kaix_evidence_init_default(KaiEvidence *node, const char *eff_label, void *handler) {
-    kai_evidence_init_default(node, eff_label, handler);
-}
-
 KaiEvidence *kaix_evidence_lookup_or_default_l(const char *eff_label, KaiEvidence *def) {
     return kai_evidence_lookup_or_default_l(eff_label, def);
-}
-
-KaiEvidence *kaix_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
-    return kai_evidence_lookup_or_default(eff_label, def);
 }
 
 void kaix_cancel_deliver(KaiFiber *f) { kai_cancel_deliver(f); }
@@ -1563,18 +1551,8 @@ void kaix_evidence_pop(void) { kai_evidence_pop(); }
 
 /* The Ev's state slot (byte 16, as kaix_clause_state_get reads it). */
 
-void *kaix_evidence_lookup_handler(const char *eff_label) {
-    KaiEvidence *node = kai_evidence_lookup_node(eff_label);
-    if (node == NULL) { return NULL; }
-    return node->handler;
-}
-
 void *kaix_evidence_lookup_node_l(const char *eff_label) {
     return (void *) kai_evidence_lookup_node_l(eff_label);
-}
-
-void *kaix_evidence_lookup_node(const char *eff_label) {
-    return (void *) kai_evidence_lookup_node(eff_label);
 }
 
 void *kaix_evidence_require(void *node_v, const char *eff_label) {
@@ -1583,10 +1561,6 @@ void *kaix_evidence_require(void *node_v, const char *eff_label) {
 
 void *kaix_evidence_fill_frame_l(void *out, int64_t n, const char *const *texts, const char **labels, KaiEvidence *const *defs, int64_t unchecked) {
     return (void *) kai_evidence_fill_frame_l((KaiEvidence **) out, (int) n, texts, labels, defs, (uint64_t) unchecked);
-}
-
-void *kaix_evidence_fill_frame(void *out, int64_t n, const char *const *labels, KaiEvidence *const *defs, int64_t unchecked) {
-    return (void *) kai_evidence_fill_frame((KaiEvidence **) out, (int) n, labels, defs, (uint64_t) unchecked);
 }
 
 const char *kaix_eff_label(const char **slot, const char *text) {
@@ -1670,12 +1644,6 @@ int64_t kai_jmpbuf_size(void) { return (int64_t) sizeof(jmp_buf); }
  * continuation as `[8 x i32]` (emit_native_fx.kai, emit_native_def.kai). */
 typedef char kaix_evidence_fits_node[(sizeof(KaiEvidence) <= 8 * sizeof(void *)) ? 1 : -1];
 typedef char kaix_cont_fits_slot[(sizeof(KaiCont) <= 8 * sizeof(int32_t)) ? 1 : -1];
-
-void kaix_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
-                                 void *handler, void *jmp, void *discard_slot) {
-    kai_evidence_push_with_jmp(node, eff_label, handler,
-                               (jmp_buf *) jmp, (KaiValue **) discard_slot);
-}
 
 void kaix_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_label,
                                    void *handler, void *jmp, void *discard_slot) {
@@ -2019,12 +1987,7 @@ KaiValue *kaix_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k)
     return _op_r;
 }
 
-/* Issue #570 — LLVM-visible wrappers around the static Spawn default
- * handlers in runtime.h. The LLVM emitter installs these by name from
- * `kai_main_install_defaults` when `Spawn` appears in main's row.
- * Without these the runtime's `kaix_evidence_lookup_handler("Spawn")`
- * returns NULL and the first op call (typically inside `with_mailbox`
- * → `spawn_actor`) dereferences a null evidence pointer. */
+/* LLVM-visible wrappers around the static Spawn default handlers in runtime.h. */
 KaiValue *kaix_default_spawn_yield(void *self, KaiCont *k) {
     return kai_default_spawn_yield(self, k);
 }
@@ -2060,21 +2023,12 @@ KaiValue *kaix_default_spawn_scope_exit(void *self, KaiCont *k) {
     return kai_default_spawn_scope_exit(self, k);
 }
 
-/* Issue #582 — LLVM-visible wrapper around `kai_default_cancel_raise`.
- * The LLVM emitter installs this by name from `kai_main_install_defaults`
- * when `Cancel` appears in main's row. Without it the runtime's
- * `kaix_evidence_lookup_handler("Cancel")` returned NULL and
- * `Cancel.raise()` inside a fiber (e.g. one spawned under a mailboxed
- * parent) dereferenced a null evidence op pointer. */
+/* LLVM-visible wrapper around `kai_default_cancel_raise`. */
 KaiValue *kaix_default_cancel_raise(void *self, KaiCont *k) {
     return kai_default_cancel_raise(self, k);
 }
 
-/* Issue #587 — LLVM-visible wrappers around the static Link / Monitor
- * default handlers in runtime.h. Same gap as #570 (Spawn) and #582
- * (Cancel): without these the LLVM `kaix_evidence_lookup_handler`
- * returned NULL for Link/Monitor and any fiber body that called
- * `Link.link(_)` or `Monitor.monitor(_)` segfaulted on the first op. */
+/* LLVM-visible wrappers around the static Link / Monitor default handlers in runtime.h. */
 KaiValue *kaix_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
     KaiValue *_op_r = kai_default_link_link(self, peer, k);
     kai_decref(peer);

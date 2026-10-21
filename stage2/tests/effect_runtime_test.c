@@ -21,51 +21,51 @@ static void check(const char *what, int cond) {
 int main(void) {
     /* Empty stack: lookup of any label returns NULL. */
     check("empty lookup is NULL",
-          kai_evidence_lookup("Io") == NULL);
+          kai_evidence_lookup_l(kai_eff_intern("Io")) == NULL);
 
     /* Push two evidence nodes; lookup must find the innermost. */
     KaiEvidence outer, inner;
     int outer_handler = 1;
     int inner_handler = 2;
 
-    kai_evidence_push(&outer, "Io", &outer_handler);
-    kai_evidence_push(&inner, "Io", &inner_handler);
+    kai_evidence_push_l(&outer, kai_eff_intern("Io"), &outer_handler);
+    kai_evidence_push_l(&inner, kai_eff_intern("Io"), &inner_handler);
 
     check("innermost wins",
-          kai_evidence_lookup("Io") == &inner_handler);
+          kai_evidence_lookup_l(kai_eff_intern("Io")) == &inner_handler);
 
     /* Different effects coexist; the matching one is returned. */
     KaiEvidence fail;
     int fail_handler = 99;
-    kai_evidence_push(&fail, "Fail", &fail_handler);
+    kai_evidence_push_l(&fail, kai_eff_intern("Fail"), &fail_handler);
 
     check("Io still resolves with Fail on top",
-          kai_evidence_lookup("Io") == &inner_handler);
+          kai_evidence_lookup_l(kai_eff_intern("Io")) == &inner_handler);
     check("Fail resolves to its own handler",
-          kai_evidence_lookup("Fail") == &fail_handler);
+          kai_evidence_lookup_l(kai_eff_intern("Fail")) == &fail_handler);
 
     /* Pop unwinds back through the stack. */
     kai_evidence_pop();      /* drops Fail */
     check("Fail gone after pop",
-          kai_evidence_lookup("Fail") == NULL);
+          kai_evidence_lookup_l(kai_eff_intern("Fail")) == NULL);
     check("Io still found",
-          kai_evidence_lookup("Io") == &inner_handler);
+          kai_evidence_lookup_l(kai_eff_intern("Io")) == &inner_handler);
 
     kai_evidence_pop();      /* drops inner */
     check("after popping inner, outer wins",
-          kai_evidence_lookup("Io") == &outer_handler);
+          kai_evidence_lookup_l(kai_eff_intern("Io")) == &outer_handler);
 
     kai_evidence_pop();      /* drops outer */
     check("empty after popping outer",
-          kai_evidence_lookup("Io") == NULL);
+          kai_evidence_lookup_l(kai_eff_intern("Io")) == NULL);
 
     /* A label copy at another address resolves through interning. */
     char io_copy[3] = { 'I', 'o', 0 };
     KaiEvidence node;
     int handler = 7;
-    kai_evidence_push(&node, "Io", &handler);
+    kai_evidence_push_l(&node, kai_eff_intern("Io"), &handler);
     check("copy of Io finds the handler",
-          kai_evidence_lookup(io_copy) == &handler);
+          kai_evidence_lookup_l(kai_eff_intern(io_copy)) == &handler);
     kai_evidence_pop();
 
     /* Interning: equal text is one pointer; instances of one effect share a base. */
@@ -84,11 +84,11 @@ int main(void) {
 
     KaiEvidence ni, ns;
     int hi = 1, hs = 2;
-    kai_evidence_push(&ni, "State[Int]", &hi);
-    kai_evidence_push(&ns, "State[String]", &hs);
+    kai_evidence_push_l(&ni, kai_eff_intern("State[Int]"), &hi);
+    kai_evidence_push_l(&ns, kai_eff_intern("State[String]"), &hs);
     check("lookup picks the matching instance under a sibling",
-          kai_evidence_lookup(st_copy) == &hi);
-    check("bare lookup takes the innermost instance", kai_evidence_lookup("State") == &hs);
+          kai_evidence_lookup_l(kai_eff_intern(st_copy)) == &hi);
+    check("bare lookup takes the innermost instance", kai_evidence_lookup_l(kai_eff_intern("State")) == &hs);
     kai_evidence_pop();
     kai_evidence_pop();
 

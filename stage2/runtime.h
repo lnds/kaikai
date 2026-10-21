@@ -20520,9 +20520,6 @@ static void kai_evidence_push_l(KaiEvidence *node, const char *eff_label, void *
     node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
 }
-static void kai_evidence_push(KaiEvidence *node, const char *text, void *handler) {
-    kai_evidence_push_l(node, kai_eff_intern(text), handler);
-}
 /* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
  * evidence stack: the call site addresses this node directly through the frame,
  * so it needs `handler` / `eff_label` set and the discard fields NULL, but no
@@ -20538,9 +20535,6 @@ static void kai_evidence_init_default_l(KaiEvidence *node, const char *eff_label
     node->cleanup_done = 0;
     node->disp_hops    = 0;
     node->unw_mark     = 0;
-}
-static void kai_evidence_init_default(KaiEvidence *node, const char *text, void *handler) {
-    kai_evidence_init_default_l(node, kai_eff_intern(text), handler);
 }
 
 /* m7a #6e: like kai_evidence_push but also stamps the handle's
@@ -20563,11 +20557,6 @@ static void kai_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_labe
     node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
-}
-static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *text,
-                                       void *handler, jmp_buf *jmp,
-                                       KaiValue **discard_slot) {
-    kai_evidence_push_with_jmp_l(node, kai_eff_intern(text), handler, jmp, discard_slot);
 }
 
 /* Arm a pushed node's `finally`. Separate from the push so the common
@@ -21582,7 +21571,6 @@ static void *kai_evidence_lookup_l(const char *eff_label) {
     }
     return NULL;
 }
-static void *kai_evidence_lookup(const char *text) { return kai_evidence_lookup_l(kai_eff_intern(text)); }
 
 /* The node a perform of `eff_label` dispatches to, `def` when none handles it.
  * m8 bug #12: the walk skips the node whose clause is being dispatched on
@@ -21607,9 +21595,6 @@ static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *d
 static KaiEvidence *kai_evidence_lookup_node_l(const char *eff_label) {
     return kai_evidence_find_node(eff_label, NULL);
 }
-static KaiEvidence *kai_evidence_lookup_node(const char *text) {
-    return kai_evidence_lookup_node_l(kai_eff_intern(text));
-}
 
 /* Resolve a default-bearing effect performed with no caller frame slot: a
  * lexical handler on the stack wins (the walk finds it), else the frame-supplied
@@ -21617,9 +21602,6 @@ static KaiEvidence *kai_evidence_lookup_node(const char *text) {
  * carries no frame (e.g. `main`), where the walk alone would miss the default. */
 static KaiEvidence *kai_evidence_lookup_or_default_l(const char *eff_label, KaiEvidence *def) {
     return kai_evidence_find_node(eff_label, def);
-}
-static KaiEvidence *kai_evidence_lookup_or_default(const char *text, KaiEvidence *def) {
-    return kai_evidence_lookup_or_default_l(kai_eff_intern(text), def);
 }
 
 /* A fiber-local effect resolved to no handler — the perform site walked an
@@ -21711,12 +21693,6 @@ static KaiEvidence **kai_evidence_fill_frame_l(KaiEvidence **out, int n, const c
         out[i] = (i < 64 && ((unchecked >> i) & 1)) ? node : kai_evidence_require(node, label);
     }
     return out;
-}
-static KaiEvidence **kai_evidence_fill_frame(KaiEvidence **out, int n, const char *const *texts,
-                                             KaiEvidence *const *defs, uint64_t unchecked) {
-    const char *labels[n + 1];
-    memset(labels, 0, sizeof labels);
-    return kai_evidence_fill_frame_l(out, n, texts, labels, defs, unchecked);
 }
 
 /* m7b #15: per-instance dispatch — find the evidence node whose
