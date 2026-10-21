@@ -131,7 +131,7 @@ kai_corpus_build() {
     *)          dir="" ;;
   esac
   if [ -n "$dir" ] && [ -f "$dir/kai.toml" ]; then
-    ( cd "$dir" && env KAI_MODULAR=0 KAIKAI_CACHE="${KAI_CORPUS_PKG_CACHE:?}/${dir//\//_}" "$@" "$KAI" build . -o "$out" )
+    ( cd "$dir" && env KAIKAI_CACHE="${KAI_CORPUS_PKG_CACHE:?}/${dir//\//_}" "$@" "$KAI" build . -o "$out" )
   else
     env "$@" "$KAI" build "$fixture" -o "$out"
   fi
