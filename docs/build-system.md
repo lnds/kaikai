@@ -320,6 +320,12 @@ The functions the unwind analysis reads (`unw_feeds_analysis`: a function that h
 
 Gate: `make test-cmodular-prune` (tier0) primes a cache with one program and compiles the others against it, comparing every file with a no-cache compile — core TUs and their slices exactly, the root and library TUs as subsets. `CMOD_PRUNE_ALL=1` sweeps every example that has an `.out.expected`.
 
+### The pruning differential — `KAI_CORE_PRUNE=off`
+
+Every layer of core pruning (the early cut, demand-driven typing, the typed cut, native-modular partition pruning, lazily completed core impl bodies) is off when kaic2 runs with `--full-core` or with `KAI_CORE_PRUNE=off` in the environment. The variable is a test knob, not a user flag: it reaches kaic2 through `bin/kai` unchanged, and the wrapper's binary memo and the core-object pre-key both fold every `KAI_*` variable, so a whole-core build never shares a cached artefact with a pruned one.
+
+`tools/prune-differential.sh` compiles and runs each program both ways and fails on any difference in exit code, stdout or stderr (paths normalised), and on any `references a core function pruning dropped` in the pruned build even when the whole-core build fails too. Sets: `corpus` (every `examples/**` program with an `.out.expected`, run, tested and under `--json --coverage` where it has test blocks), `combos` (every pair of demand routes from `tools/prune-combos.sh`: operators on primitives, united values, lists, tuples and Option; `sum`/`product`/`max`/`min`/`sort`/`contains`; interpolation; protocol calls; derived `Eq`/`Show`/`Ord`; closures over operators) and `combos-subset`. `make test-prune-differential` runs the subset; `make prune-differential` sweeps everything on both backends and runs in `daily-tail` as a diagnostic. A program that cannot be compared (nondeterministic output) is listed in `tools/prune-differential-skips.txt`.
+
 ## Prebuilt kaic2 — one build per commit, shared by worktrees
 
 A fresh worktree has no compiler, and `make kaic2` boots one in minutes (more for a native-capable one). `tools/prebuilt-kaic2.sh` builds kaic2 + `bin/kai` once per commit and hands the build to every worktree of the repo:
