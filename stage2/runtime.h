@@ -1940,38 +1940,55 @@ static inline void kai_heap_charge(size_t sz) {
     if (__builtin_expect(kai_heap_cap != 0, 0)) kai_heap_charge_slow(sz);
 }
 
-/* malloc that charges the payload against the ceiling and folds in the OOM
- * check shared by every value-heap allocation. */
-static void *kai_heap_malloc(size_t sz) {
-    kai_heap_charge(sz);
+/* The capped paths stay out of line so the uncapped one is a flag test
+ * and a libc call at every payload site. */
+__attribute__((noinline, cold))
+KAI_RT_SHARED void *kai_heap_malloc_capped(size_t sz) {
+    kai_heap_charge_slow(sz);
     void *p = malloc(sz);
     if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
-    if (__builtin_expect(kai_heap_cap != 0, 0)) {
-        size_t usable = kai_heap_usable(p);
-        if (usable > sz) __atomic_add_fetch(&kai_heap_live, usable - sz, __ATOMIC_RELAXED);
-    }
+    size_t usable = kai_heap_usable(p);
+    if (usable > sz) __atomic_add_fetch(&kai_heap_live, usable - sz, __ATOMIC_RELAXED);
     return p;
 }
 
+__attribute__((noinline, cold))
+KAI_RT_SHARED void *kai_heap_realloc_capped(void *ptr, size_t old_sz, size_t new_sz) {
+    size_t old_usable = ptr ? kai_heap_usable(ptr) : 0;
+    if (new_sz > old_sz) kai_heap_charge_slow(new_sz - old_sz);
+    void *p = realloc(ptr, new_sz);
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    size_t new_usable = kai_heap_usable(p);
+    size_t charged = new_sz > old_sz ? old_usable + (new_sz - old_sz) : old_usable;
+    if (new_usable > charged) __atomic_add_fetch(&kai_heap_live, new_usable - charged, __ATOMIC_RELAXED);
+    else if (new_usable < charged) kai_heap_credit_slow(charged - new_usable);
+    return p;
+}
+
+/* malloc that charges the payload against the ceiling and folds in the OOM
+ * check shared by every value-heap allocation. */
+static void *kai_heap_malloc(size_t sz) {
+    if (__builtin_expect(kai_heap_cap != 0, 0)) return kai_heap_malloc_capped(sz);
+    void *p = malloc(sz);
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    return p;
+}
+
+__attribute__((noinline, cold))
+KAI_RT_SHARED void kai_heap_free_capped(void *p) {
+    if (p) kai_heap_credit_slow(kai_heap_usable(p));
+    free(p);
+}
+
 static void kai_heap_free(void *p) {
-    if (__builtin_expect(kai_heap_cap != 0, 0) && p) kai_heap_credit_slow(kai_heap_usable(p));
+    if (__builtin_expect(kai_heap_cap != 0, 0)) { kai_heap_free_capped(p); return; }
     free(p);
 }
 
 static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
-    size_t old_usable = 0;
-    if (__builtin_expect(kai_heap_cap != 0, 0)) {
-        old_usable = ptr ? kai_heap_usable(ptr) : 0;
-        if (new_sz > old_sz) kai_heap_charge_slow(new_sz - old_sz);
-    }
+    if (__builtin_expect(kai_heap_cap != 0, 0)) return kai_heap_realloc_capped(ptr, old_sz, new_sz);
     void *p = realloc(ptr, new_sz);
     if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
-    if (__builtin_expect(kai_heap_cap != 0, 0)) {
-        size_t new_usable = kai_heap_usable(p);
-        size_t charged = new_sz > old_sz ? old_usable + (new_sz - old_sz) : old_usable;
-        if (new_usable > charged) __atomic_add_fetch(&kai_heap_live, new_usable - charged, __ATOMIC_RELAXED);
-        else if (new_usable < charged) kai_heap_credit_slow(charged - new_usable);
-    }
     return p;
 }
 
