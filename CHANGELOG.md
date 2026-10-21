@@ -84,6 +84,39 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.170.1 (2026-10-21)
+
+### Fixed
+
+- **typer**: a stdlib aggregate and an operator on a united value in one program no longer lose the scalar's `Add`/`Mul` impl to core pruning (fixed by demanding impls per receiver; regression in 0.170.0)
+- **test**: `kai test --coverage` reports the lines of library functions again on native (regression in 0.170.0)
+- **typer**: say a primitive head has no pipe op instead of blaming a missing module
+- **cli**: create the missing parent directory of -o before compiling
+- **test**: probe a library function the core cut completes late
+- **cli**: fail at once when the kai-pkg helper's build lock cannot be created
+- **cli**: key the cached runtime object and the binary memo by the C compiler's identity
+- **compiler**: drop two imports the selfhost warning gate rejects
+- **core**: mint char conversions by declaration id and keep the asan gate off declared names
+
+### Changed
+
+- **typer**: demand only the impls that serve a dispatcher's receiver
+- **native**: parse the runtime bitcode while the front end runs
+- **cache**: key a parsed user module by its own text
+- **native**: leave large runtime helpers out of each modular partition
+- **cli**: hash through a Sha value instead of one global state
+- **runtime**: drop the raw-text evidence entries
+- **unbox**: bind a raw Int let and run loops in place on native, releasing the box it takes
+- **cli**: scan objects for the scheduler thread-local with the toolchain's own nm
+- **core**: list the new CoreFn variants among the names the compiler writes
+- **driver**: ask once per file whether it may declare a builtin
+- **core**: declared core builtins ride the runtime value thunk
+- **core**: declare 79 runtime builtins in the core with extern "kai"
+- **typer**: say a pruned-core miss is a compiler bug
+- **typer**: keep did-you-mean candidates and hoisted names independent of the left-out core
+- **typer**: leave unreached core functions out before the front end walks them
+- **cli**: link the modular C build with ThinLTO only for --release
+
 ## v0.170.0 (2026-10-21)
 
 ### BREAKING CHANGE
