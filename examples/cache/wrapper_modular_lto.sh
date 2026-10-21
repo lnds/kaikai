@@ -1,9 +1,11 @@
 #!/bin/sh
-# ThinLTO on the modular C link engages only on clang with a linker that
-# keeps an LTO cache, and it must not change what a program prints or what a
-# warm rebuild produces:
+# ThinLTO on the modular C link engages only for `--release`, and only on
+# clang with a linker that keeps an LTO cache; it must not change what a
+# program prints or what a warm rebuild produces:
 #
-#   - the same program built with KAI_LTO=0 and KAI_LTO=1 prints the same
+#   - a dev build neither compiles bitcode nor runs the LTO probe
+#   - the same program built as dev, `--release` and `--release` with
+#     KAI_LTO=0 prints the same
 #   - when the probe settles on a linker cache, the cached objects are
 #     bitcode and a warm rebuild relinks to the same bytes as the cold one
 #   - when it settles on none (gcc, a linker without a cache), the objects
@@ -30,10 +32,10 @@ fn main() : Unit / Stdout = Stdout.print("#{loop(0, 1000, 0.0<m>)}")
 EOF
 
 build() {
-  tag="$1"; lto="$2"; cc="$3"
-  KAI_BIN_MEMO=0 KAI_MODULAR=1 KAI_LTO="$lto" CC="$cc" \
-    KAI_MODULAR_CACHE_DIR="$PROJ/$tag.objs" KAI_LTO_CACHE_DIR="$PROJ/$tag.lto" \
-    "$KAI" build --backend=c "$PROJ/main.kai" -o "$PROJ/$tag.bin" 2>"$PROJ/$tag.err" \
+  tag="$1"; lto="$2"; cc="$3"; mode="${4:-}"
+  env ${lto:+KAI_LTO="$lto"} KAI_BIN_MEMO=0 KAI_MODULAR=1 CC="$cc" \
+    KAI_MODULAR_CACHE_DIR="$PROJ/$tag.objs" KAI_LTO_CACHE_DIR="$PROJ/$tag.lto" KAI_NATIVE_MODULAR_CACHE_DIR="$PROJ/$tag.rt" \
+    "$KAI" build --backend=c $mode "$PROJ/main.kai" -o "$PROJ/$tag.bin" 2>"$PROJ/$tag.err" \
     || { echo "wrapper_modular_lto FAIL ($tag build)"; cat "$PROJ/$tag.err"; exit 1; }
 }
 
@@ -58,18 +60,21 @@ bitcode_objects() {
 
 check() {
   label="$1"; cc="$2"
-  build "$label-off" 0 "$cc"
-  build "$label-cold" 1 "$cc"
-  KAI_BIN_MEMO=0 KAI_MODULAR=1 KAI_MODULAR_STATS=1 KAI_LTO=1 CC="$cc" \
-    KAI_MODULAR_CACHE_DIR="$PROJ/$label-cold.objs" KAI_LTO_CACHE_DIR="$PROJ/$label-cold.lto" \
-    "$KAI" build --backend=c "$PROJ/main.kai" -o "$PROJ/$label-warm.bin" 2>"$PROJ/$label-warm.err"
+  build "$label-off" 0 "$cc" --release
+  build "$label-dev" "" "$cc"
+  [ "$(bitcode_objects "$label-dev")" = 0 ] && ! ls "$PROJ/$label-dev.lto"/probe-* >/dev/null 2>&1 \
+    || { echo "wrapper_modular_lto FAIL ($label: a dev build ran LTO or its probe)"; exit 1; }
+  build "$label-cold" "" "$cc" --release
+  KAI_BIN_MEMO=0 KAI_MODULAR=1 KAI_MODULAR_STATS=1 CC="$cc" \
+    KAI_MODULAR_CACHE_DIR="$PROJ/$label-cold.objs" KAI_LTO_CACHE_DIR="$PROJ/$label-cold.lto" KAI_NATIVE_MODULAR_CACHE_DIR="$PROJ/$label-cold.rt" \
+    "$KAI" build --backend=c --release "$PROJ/main.kai" -o "$PROJ/$label-warm.bin" 2>"$PROJ/$label-warm.err"
   grep -q 'compiled=0' "$PROJ/$label-warm.err" \
     || { echo "wrapper_modular_lto FAIL ($label: warm rebuild recompiled)"; cat "$PROJ/$label-warm.err"; exit 1; }
   [ "$(code_of "$PROJ/$label-cold.bin")" = "$(code_of "$PROJ/$label-warm.bin")" ] \
     || { echo "wrapper_modular_lto FAIL ($label: warm rebuild differs from cold)"; exit 1; }
-  want="$("$PROJ/$label-off.bin")"
+  want="$("$PROJ/$label-dev.bin")"
   [ "$("$PROJ/$label-warm.bin")" = "$want" ] \
-    || { echo "wrapper_modular_lto FAIL ($label: output differs from KAI_LTO=0)"; exit 1; }
+    || { echo "wrapper_modular_lto FAIL ($label: output differs from the dev build)"; exit 1; }
   kind="$(cat "$PROJ/$label-cold.lto"/probe-* 2>/dev/null || echo none)"
   bc="$(bitcode_objects "$label-cold")"
   off_bc="$(bitcode_objects "$label-off")"

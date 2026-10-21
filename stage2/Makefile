@@ -296,7 +296,7 @@ $(KAIC2_FAST_STAGING): FORCE | build
 	@set -e; \
 	[ -x ./$(TARGET) ] || { echo "kaic2-fast: no existing ./$(TARGET) — bootstrap first with 'make kaic2'"; exit 1; }; \
 	out=$$(pwd)/$@; rm -f $$out; \
-	( cd .. && KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_STATS=1 \
+	( cd .. && KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_STATS=1 KAI_LTO=1 \
 	    CFLAGS="$(KAIC2_FAST_CFLAGS)" \
 	    bin/kai build stage2/$(SRC) -o $$out )
 
