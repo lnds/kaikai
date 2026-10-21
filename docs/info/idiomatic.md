@@ -454,8 +454,9 @@ usually the wrong one here. The property that decides is not speed:
   and they ride `Mutable`. Reach for them when a hot loop needs
   lookups and nothing downstream depends on order.
 
-`.to_map()` freezes a `HashMap` once the fast build is done and the
-deterministic result is what escapes.
+`h |> convert.to_map` (`import collections.convert`) freezes a
+`HashMap` once the fast build is done and the deterministic result is
+what escapes.
 
 ```kaikai
 import collections.map
