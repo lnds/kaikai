@@ -247,13 +247,15 @@ kai: heap limit exceeded (KAI_MAX_HEAP=512m, used 536870912 bytes)
 …and `exit(1)` — the same path the OOM checks use, triggered at the
 configured limit instead of at OS exhaustion. **Unset, empty, or
 unparseable → no cap** (a malformed value never installs a wrong
-ceiling), and the unset path adds one predicted branch per heap-grow
-boundary — selfhost stays byte-identical.
+ceiling), and with no cap every heap-grow point is one flag test and
+nothing is accounted.
 
-The counter is monotonic committed-heap high-water, charged at every
-OS-commit grow point (slab/arena/cell-pool grow plus string/array
-payloads), so no allocation path grows past the ceiling uncounted. One
-global process ceiling; per-fiber limits are out of scope.
+The ceiling is on **live committed** bytes, one atomic counter for the
+whole process. String, array and vec payloads add when allocated and
+subtract when freed, so a program that builds and drops large values in a
+loop never trips it. Slabs, cells and arena chunks only add: once the
+runtime takes them from the OS they stay committed, so they do not come
+down. Per-fiber limits are out of scope.
 
 This is the **structural** host-safety defense. The per-harness
 `timeout` / `ulimit -v` wrappers around benchmark and stress runs are a
