@@ -16,6 +16,7 @@ import compiler.type_text
 import compiler.user_cache
 import compiler.impl_identity
 import compiler.proto_ids
+import compiler.scalar_ty
 import compiler.unwind_clauses
 import compiler.driver_exports
 import compiler.written
@@ -119,19 +120,70 @@ fn dm_positions(dm: Demand, ps: [XPos], st: DmSt) : DmSt / Console = match ps {
 }
 
 fn dm_node(dm: Demand, e: Expr, st: DmSt) : DmSt = match e.kind {
-  ESym(s, _)           -> dm_ref(dm, st, s)
-  EMark(MkProtoOp(ss)) -> foldl(ss, st, (acc, s) => dm_ref(dm, acc, s))
+  ESym(s, _)           -> dm_ref(dm, st, s, e.ty)
+  EMark(MkProtoOp(ss)) -> foldl(ss, st, (acc, s) => dm_ref(dm, acc, s, None))
   EBinop(op, l, r)     -> dm_binop(dm, st, binop_proto(op), l, r)
   EUnop(UoNeg, x)      -> if dm_negatable(x) { st } else { dm_operator(dm, st, core_proto_id(CpNeg), x) }
   _                    -> st
 }
 
-fn dm_ref(dm: Demand, st: DmSt, s: SymId) : DmSt =
-  if sym_raw(s) < 0 or dm_has(st.live, s) { st }
+fn dm_ref(dm: Demand, st: DmSt, s: SymId, t: Option[Ty]) : DmSt =
+  if sym_raw(s) < 0 { st }
+  else if pid_is_disp(dm.ids, s) { dm_dispatch(dm, dm_ask(dm, st, s), s, t) }
+  else if dm_has(st.live, s) { st }
+  else { dm_ask(dm, st, s) }
+
+fn dm_ask(dm: Demand, st: DmSt, s: SymId) : DmSt =
+  if dm_has(st.live, s) { st }
+  else if dm_has(dm.emptied, s) or dm_has(dm.pool, s) { dm_want(dm, DmSt { ...st }, s) }
+  else { DmSt { ...st, live: idx_prepend_sym(st.live, s, s) } }
+
+# A dispatcher called at a settled receiver type needs only the impl that serves it; a receiver not settled may be any type, so every impl.
+fn dm_dispatch(dm: Demand, st: DmSt, s: SymId, t: Option[Ty]) : DmSt = {
+  let head = dm_receiver_head(t)
+  foldl(dm_protos(dm, s), st, (acc, p) => match head {
+    Some(h) -> dm_served(dm, acc, p, h)
+    None    -> dm_full(dm, acc, p)
+  })
+}
+
+# Only a protocol whose every operation takes `Self` first dispatches on its first argument; one whose `Self` rides in a return type is picked by the expected type.
+fn dm_receiver_first(dm: Demand, p: SymId) : Bool =
+  all(filter(dm.ops, (o) => match o { POR(q, _, _, _, _, _, _, _) -> sym_same(q, p) }), (o) => match o {
+    POR(_, _, [a, ..._], _, _, _, _, _) -> match a.ptype {
+      Some(te) -> match te.tkind {
+        TyParam(id, _) -> tlocal_is_self(id)
+        _              -> false
+      }
+      None -> false
+    }
+    _ -> false
+  })
+
+fn dm_receiver_head(t: Option[Ty]) : Option[DispHead] = match t {
+  Some(TyFnT([r, ..._], _, _)) -> dm_ty_head(r)
+  _ -> None
+}
+
+fn dm_ty_head(t: Ty) : Option[DispHead] = match t {
+  TyDimT(b, _)    -> dm_ty_head(b)
+  TyRefineT(b, _) -> dm_ty_head(b)
+  TyCon(s, _)     -> Some(DhSym(s))
+  TyListT(_)      -> Some(DhSym(ty_head_sym(t)))
+  _               -> match scalar_ty_name(t) {
+    Some(_) -> Some(DhScalar(t))
+    None    -> None
+  }
+}
+
+fn dm_served(dm: Demand, st: DmSt, p: SymId, h: DispHead) : DmSt =
+  if sym_raw(p) < 0 or list_has_sym(st.fulls, p) { st }
+  else if not dm_receiver_first(dm, p) { dm_full(dm, st, p) }
   else {
-    let seen = DmSt { ...st, live: idx_prepend_sym(st.live, s, s) }
-    let asked = if dm_has(dm.emptied, s) or dm_has(dm.pool, s) { dm_want(dm, DmSt { ...st }, s) } else { seen }
-    foldl(dm_protos(dm, s), asked, (acc, p) => dm_full(dm, acc, p))
+    let fs = flat_map(dm.impls, (i) => match i {
+      PIR(proto, _, _, f, _, _, _) -> if sym_same(proto, p) and pir_serves(i, h) { [f] } else { [] }
+    })
+    if list_is_empty(fs) { dm_full(dm, st, p) } else { dm_dispatchers(dm, dm_wants(dm, st, fs), p) }
   }
 
 # Every protocol with a dispatcher that answers the same operation: a protocol of another home with that operation is picked among them by the receiver.
@@ -160,9 +212,12 @@ fn dm_lite(dm: Demand, st: DmSt, p: SymId) : DmSt =
 
 # The impls of `p` among the candidates that `keep` takes, and its dispatchers.
 fn dm_group(dm: Demand, st: DmSt, p: SymId, keep: (ProtoImplReg) -> Bool) : DmSt =
-  dm_wants(dm, dm_wants(dm, st, flat_map(dm.impls, (i) => match i {
+  dm_dispatchers(dm, dm_wants(dm, st, flat_map(dm.impls, (i) => match i {
     PIR(proto, _, _, f, _, _, _) -> if sym_same(proto, p) and keep(i) { [f] } else { [] }
-  })), flat_map(dm.ids.shared, (pd) => match pd {
+  })), p)
+
+fn dm_dispatchers(dm: Demand, st: DmSt, p: SymId) : DmSt =
+  dm_wants(dm, st, flat_map(dm.ids.shared, (pd) => match pd {
     ProtoDisp(q, f) -> if sym_same(q, p) { [f] } else { [] }
   }))
 
