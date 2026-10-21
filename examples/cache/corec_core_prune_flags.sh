@@ -51,7 +51,7 @@ if "$KAIC2" --emit=native "$WORK/main.kai" > /dev/null 2> "$WORK/probe.err"; the
   done
   grep -q "core-prune: off" "$WARM/cold.err" || fail "cold native build with a core cache pruned"
   grep -q "core-prune: dropped" "$WARM/warm.err" || { cat "$WARM/warm.err"; fail "warm native build did not prune on a core-object hit"; }
-  expect off     --emit=native-modular
+  expect dropped --emit=native-modular
   # The reusable-tags table reads only the functions a program runs, so a
   # build's RC ledger is the same whether it lowered the whole core or not.
   FIX="$ROOT/examples/perceus/next_tier_rc_fix.kai"
@@ -64,8 +64,11 @@ if "$KAIC2" --emit=native "$WORK/main.kai" > /dev/null 2> "$WORK/probe.err"; the
   for run in cold warm uncached; do
     KAI_THREADS=1 KAI_TRACE_RC=1 "$WORK/ledger-$run" 2>&1 > /dev/null | grep '^\[KAI_TRACE_RC\]' > "$WORK/ledger-$run.rc" || true
   done
+  KAI_BIN_MEMO=0 KAI_NATIVE_MODULAR=1 KAI_NATIVE_MODULAR_CACHE_DIR="$WORK/ledger-nmod" "$ROOT/bin/kai" build --backend=native "$FIX" \
+    -o "$WORK/ledger-modular" 2> /dev/null || fail "modular native build of the ledger fixture failed"
+  KAI_THREADS=1 KAI_TRACE_RC=1 "$WORK/ledger-modular" 2>&1 > /dev/null | grep '^\[KAI_TRACE_RC\]' > "$WORK/ledger-modular.rc" || true
   [ -s "$WORK/ledger-cold.rc" ] || fail "the ledger fixture printed no RC ledger"
-  for run in warm uncached; do
+  for run in warm uncached modular; do
     cmp -s "$WORK/ledger-cold.rc" "$WORK/ledger-$run.rc" || { diff "$WORK/ledger-cold.rc" "$WORK/ledger-$run.rc"; fail "RC ledger differs between a cold and a $run native build"; }
   done
 else
