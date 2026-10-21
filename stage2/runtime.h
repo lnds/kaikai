@@ -1883,11 +1883,13 @@ static size_t kai_heap_cap  = 0;
 static size_t kai_heap_live = 0;
 #endif
 
+/* Declared here rather than included: the allocator headers cost more to
+ * parse than the whole declaration. */
 #if defined(__APPLE__)
-#  include <malloc/malloc.h>
+extern size_t malloc_size(const void *ptr);
 #  define kai_heap_usable(p) malloc_size(p)
 #else
-#  include <malloc.h>
+extern size_t malloc_usable_size(void *ptr);
 #  define kai_heap_usable(p) malloc_usable_size(p)
 #endif
 
