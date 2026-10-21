@@ -220,7 +220,7 @@ fn main() : Int / Spawn + Stdout + Mutable = {
   let counter = Mutable.ref_make(21)
   let snapshot = Mutable.ref_get(counter)   # an Int, not the cell
   nursery { n ->
-    let a = n.spawn(() => { let buf = array_make(8, 0)  fill(buf) })
+    let a = n.spawn(() => { let buf = array_make(8, 0); fill(buf) })
     let b = n.spawn(() => compute(snapshot))
     Stdout.print("#{n.await(a)} #{n.await(b)}")
   }

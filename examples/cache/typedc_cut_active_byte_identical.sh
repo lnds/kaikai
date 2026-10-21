@@ -30,7 +30,7 @@ pub fn shout(s: String) : Unit / Stdout = print(s)
 EOF
 cat > "$PROJ/b.kai" <<'EOF'
 import a
-pub fn twice(s: String) : Unit / Stdout = { a.shout(s) a.shout(s) }
+pub fn twice(s: String) : Unit / Stdout = { a.shout(s); a.shout(s) }
 EOF
 cat > "$PROJ/main.kai" <<'EOF'
 import a
@@ -84,7 +84,7 @@ fi
 # A body-only edit re-infers exactly its own module: one new blob.
 cat > "$PROJ/b.kai" <<'EOF'
 import a
-pub fn twice(s: String) : Unit / Stdout = { a.shout(s) a.shout(s) a.shout(s) }
+pub fn twice(s: String) : Unit / Stdout = { a.shout(s); a.shout(s); a.shout(s) }
 EOF
 build "$PROJ/edit.c" --user-cache
 build "$PROJ/edit_plain.c"
@@ -99,11 +99,11 @@ fi
 # A signature change must reach the importers: the emitted C still
 # matches plain, which it cannot if a stale interface was served.
 cat > "$PROJ/a.kai" <<'EOF'
-pub fn shout(s: String, n: Int) : Unit / Stdout = { print(s) print(int_to_string(n)) }
+pub fn shout(s: String, n: Int) : Unit / Stdout = { print(s); print(int_to_string(n)) }
 EOF
 cat > "$PROJ/b.kai" <<'EOF'
 import a
-pub fn twice(s: String) : Unit / Stdout = { a.shout(s, 1) a.shout(s, 2) }
+pub fn twice(s: String) : Unit / Stdout = { a.shout(s, 1); a.shout(s, 2) }
 EOF
 build "$PROJ/sig.c" --user-cache
 build "$PROJ/sig_plain.c"
