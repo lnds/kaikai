@@ -89,9 +89,7 @@ fn inf_tycon_arg_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : St
 pub fn check_entry_result(st: InferState, entry: Bool, ret: Ty, line: Int, col: Int) : InferState / Console + File =
   if not entry or entry_result_ok(ret) { st } else {
     let perr = mk_diag(SevError, st.file, line, col, "the entry point `main` must return `Int` or `Unit`", [])
-    render_diag(perr)
-    diag_note(string_concat("found: ", inf_ty_to_string(st.env.tab, ret)))
-    st_bump_err(st_push_diag(st, perr))
+    st_bump_err(st_note(st_push_diag(st, perr), string_concat("found: ", inf_ty_to_string(st.env.tab, ret))))
   }
 
 
@@ -147,46 +145,6 @@ pub fn call_sig_note_text(env: TyEnv, name_opt: Option[String], resolved: Ty,
 }
 
 
-# Emit Template 4 — wrong number of arguments. The callee's signature
-# (when displayable) goes on a `note: \`fn\` expects: (T1, T2) -> R`
-# line so users see exactly which arity was declared. When the callee
-# is anonymous, the notes omit the name but still surface the param
-# count + signature.
-#[doc("Typer-internal helper `emit_wrong_arity` shared across the infer modules.")]
-pub fn emit_wrong_arity(env: TyEnv, file: String, name_opt: Option[String], callee_ty: Ty,
-                      arg_tys: [Ty], line: Int, col: Int) : Unit / Console + File {
-
-  let np = match callee_ty {
-    TyFnT(params, _, _) -> list_length(params)
-    _ -> 0
-  }
-  let na = list_length(arg_tys)
-  match name_opt {
-    Some(nm) -> diag_error(file, line, col, "wrong number of arguments to `#{nm}`")
-    None     -> diag_error(file, line, col, "wrong number of arguments")
-  }
-  match name_opt {
-    Some(nm) -> diag_note("`#{nm}` expects #{int_to_string(np)} argument(s), got #{int_to_string(na)}")
-    None     -> diag_note("expected #{int_to_string(np)} argument(s), got #{int_to_string(na)}")
-  }
-  match name_opt {
-    Some(nm) -> match callee_ty {
-      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{inf_ty_to_string_ow(env.tab, env.head_owners, callee_ty)}")
-      _              -> ()
-    }
-    None -> ()
-  }
-  if na < np {
-    diag_help("add the missing argument(s) or use `_` as a placeholder hole")
-  } else {
-    diag_help("remove the extra argument(s) — `#{int_to_string(na - np)}` too many")
-  }
-}
-
-
-# structured T4 Diagnostic builder. Mirrors the text emitted
-# by `emit_wrong_arity` exactly so an LSP client can rebuild the same
-# `error: / note: / help:` block from the collected value.
 #[doc("Typer-internal helper `build_wrong_arity_diag` shared across the infer modules.")]
 pub fn build_wrong_arity_diag(env: TyEnv, file: String, name_opt: Option[String], callee_ty: Ty,
                             arg_tys: [Ty], line: Int, col: Int) : Diagnostic {
@@ -228,10 +186,11 @@ pub fn build_wrong_arity_diag(env: TyEnv, file: String, name_opt: Option[String]
 # notes with structural context — the union's component list and the
 # found type's parent union, plus a concrete remediation hint. The
 # plain notes still fire when neither side is union-flavoured.
-#[doc("Typer-internal helper `emit_union_aware_notes` shared across the infer modules.")]
-pub fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
-  diag_note("expected: #{inf_ty_to_string_ow(env.tab, env.head_owners, expected)}")
-  diag_note("found:    #{inf_ty_to_string_ow(env.tab, env.head_owners, found)}")
+#[doc("Typer-internal helper `st_union_aware_notes` shared across the infer modules.")]
+pub fn st_union_aware_notes(st: InferState, expected: Ty, found: Ty) : InferState {
+  let env = st.env
+  let st1 = st_note(st_note(st, "expected: #{inf_ty_to_string_ow(env.tab, env.head_owners, expected)}"),
+                    "found:    #{inf_ty_to_string_ow(env.tab, env.head_owners, found)}")
   # Drill through matching wrappers (TyFn, TyCon-of-same-name with
   # mismatched args) to surface the first divergent TyCon pair. That
   # is where the union/component context is meaningful — at the
@@ -239,8 +198,11 @@ pub fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Cons
   # divergence is a leaf-vs-leaf union upcast that almost-but-didn't
   # land.
   match find_mismatched_tycons(expected, found) {
-    Some(pair) -> if core_shadow_notes(env.tab, env.ty_homes, pair.exp, pair.fnd) { () } else { emit_union_focus_notes(env, pair.exp, pair.fnd) }
-    None       -> ()
+    Some(pair) -> match core_shadow_notes(env.tab, env.ty_homes, pair.exp, pair.fnd) {
+      Some((n, h)) -> st_help(st_note(st1, n), h)
+      None         -> st_union_focus_notes(st1, pair.exp, pair.fnd)
+    }
+    None       -> st1
   }
 }
 
@@ -252,10 +214,7 @@ pub fn bang_bad_operand(st: InferState, found: Ty, inner_typed: Expr,
 
   let perr = mk_diag(SevError, st.file, line, col,
     "`!` requires an `Option[T]` or `Result[T, E]` operand", [])
-  render_diag(perr)
-  diag_note("operand type: #{inf_ty_to_string(st.env.tab, found)}")
-  diag_help("`!` is reserved for the two compiler-blessed propagation types; convert the value explicitly first")
-  let st1 = st_bump_err(st_push_diag(st, perr))
+  let st1 = st_bump_err(st_help(st_note(st_push_diag(st, perr), "operand type: #{inf_ty_to_string(st.env.tab, found)}"), "`!` is reserved for the two compiler-blessed propagation types; convert the value explicitly first"))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), TyAny)
   mk_inferred(st1, TyAny, stub)
 }
@@ -268,10 +227,7 @@ pub fn bang_no_enclosing_fn(st: InferState, fam: String, t: Ty, inner_typed: Exp
 
   let perr = mk_diag(SevError, st.file, line, col,
     "`!` is only valid inside a function body", [])
-  render_diag(perr)
-  diag_note("operand type: #{fam}[#{inf_ty_to_string(st.env.tab, t)}]")
-  diag_help("`!` propagates from the enclosing function; it cannot appear inside a lambda or at top level")
-  let st1 = st_bump_err(st_push_diag(st, perr))
+  let st1 = st_bump_err(st_help(st_note(st_push_diag(st, perr), "operand type: #{fam}[#{inf_ty_to_string(st.env.tab, t)}]"), "`!` propagates from the enclosing function; it cannot appear inside a lambda or at top level"))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
   mk_inferred(st1, t, stub)
 }
@@ -284,10 +240,7 @@ pub fn bang_ret_mismatch(st: InferState, fam: String, t: Ty, ret_ty: Ty,
 
   let perr = mk_diag(SevError, st.file, line, col,
     "`!` on `#{fam}[#{inf_ty_to_string(st.env.tab, t)}]` requires the enclosing function to return `#{fam}[U]`", [])
-  render_diag(perr)
-  diag_note("enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}")
-  diag_help("change the function's return type, or pattern-match the operand explicitly")
-  let st1 = st_bump_err(st_push_diag(st, perr))
+  let st1 = st_bump_err(st_help(st_note(st_push_diag(st, perr), "enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}"), "change the function's return type, or pattern-match the operand explicitly"))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
   mk_inferred(st1, t, stub)
 }
@@ -300,10 +253,7 @@ pub fn bang_ret_mismatch_result(st: InferState, e_ty: Ty, t: Ty, ret_ty: Ty,
 
   let perr = mk_diag(SevError, st.file, line, col,
     "`!` on `Result[#{inf_ty_to_string(st.env.tab, t)}, #{inf_ty_to_string(st.env.tab, e_ty)}]` requires the enclosing function to return `Result[U, #{inf_ty_to_string(st.env.tab, e_ty)}]`", [])
-  render_diag(perr)
-  diag_note("enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}")
-  diag_help("kaikai does not implicitly convert error types (no `From`); convert the error explicitly or change the function's return type")
-  let st1 = st_bump_err(st_push_diag(st, perr))
+  let st1 = st_bump_err(st_help(st_note(st_push_diag(st, perr), "enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}"), "kaikai does not implicitly convert error types (no `From`); convert the error explicitly or change the function's return type"))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
   mk_inferred(st1, t, stub)
 }
@@ -318,7 +268,6 @@ pub fn field_absent_error(st: InferState, recv: Ty, fnm: String, line: Int, col:
     other          -> "no field '#{fnm}' on #{inf_ty_to_string(st.env.tab, other)}"
   }
   let perr = mk_diag(SevError, st.file, line, col, msg, [])
-  render_diag(perr)
   st_bump_err(st_push_diag(st, perr))
 }
 
@@ -336,9 +285,9 @@ pub fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, recv: Ty,
 
 # The `|` → `|>` suggestion. Names the stage when it has one so the
 # message reads as the user's own code, not the desugared `map` call.
-#[doc("Typer-internal helper `emit_pipe_wants_apply` shared across the infer modules.")]
-pub fn emit_pipe_wants_apply(st: InferState, pop: PipeOp, stage: Expr, param: Ty,
-                          elem: Option[Ty], line: Int, col: Int) : Unit / Console + File {
+#[doc("Typer-internal helper `pipe_wants_apply` shared across the infer modules.")]
+pub fn pipe_wants_apply(st: InferState, pop: PipeOp, stage: Expr, param: Ty,
+                        elem: Option[Ty], line: Int, col: Int) : InferState / Console + File {
   let what = match callee_display_name(st, stage) {
     Some(nm) -> "`#{nm}` takes"
     None     -> "the stage takes"
@@ -347,10 +296,10 @@ pub fn emit_pipe_wants_apply(st: InferState, pop: PipeOp, stage: Expr, param: Ty
     Some(et) -> inf_ty_to_string(st.env.tab, et)
     None     -> "the element"
   }
-  diag_error(st.file, line, col,
-    concat_all(["`", pipe_op_text(pop), "` is element-wise; ", what, " `",
-      inf_ty_to_string(st.env.tab, param), "`, not `", elem_txt, "`"]))
-  diag_help("did you mean `|>` (apply to the whole value)?")
+  let msg = concat_all(["`", pipe_op_text(pop), "` is element-wise; ", what, " `",
+                        inf_ty_to_string(st.env.tab, param), "`, not `", elem_txt, "`"])
+  st_bump_err(st_help(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [])),
+                      "did you mean `|>` (apply to the whole value)?"))
 }
 
 
@@ -367,7 +316,6 @@ pub fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, wha
       concat_all(["`", rv_text(tab, have), "` does not fit `", rv_text(tab, want), "`: a mutable type keeps its refinements exactly, and these differ in `", pred, "`"])
     }
     let perr = mk_diag(SevError, st.file, line, col, concat_all([what, ": ", why, note]), [])
-    render_diag(perr)
     st_bump_err(st_push_diag(st, perr))
   }
 }
@@ -421,7 +369,6 @@ pub fn lazy_impure(st: InferState, ls: [Label], at: Expr) : InferState / Console
   }
   let d = mk_diag(SevError, st.file, at.line, at.col, "everything inside `lazy [...]` is pure, and this performs #{what}",
                   [ri_help(st.file, at.line, at.col, "a producer that performs effects is a generator: write it with `gen.generate`")])
-  render_diag(d)
   st_bump_err(st_push_diag(st, d))
 }
 

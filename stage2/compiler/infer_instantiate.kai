@@ -330,17 +330,10 @@ pub fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int)
       # substitution side-effects: the runtime layout is identical.
       if union_upcast_ok(st.env, a1, b1) { st }
       else { match rigid_either(st, a, b) {
-        Some(RigidWhy(msg, help)) -> {
-          diag_error(st.file, line, col, msg)
-          diag_help(help)
-          st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [ri_help(st.file, line, col, help)])))
-        }
+        Some(RigidWhy(msg, help)) -> st_bump_err(st_help(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [])), help))
         None -> {
         let d = mk_diag(SevError, st.file, line, col, "type mismatch in #{what}", [])
-        render_diag(d)
-        emit_union_aware_notes(st.env, a1, b1)
-        emit_type_hint(a1, b1)
-        st_bump_err(st_push_diag(st, d))
+        st_bump_err(st_type_hint(st_union_aware_notes(st_push_diag(st, d), a1, b1), a1, b1))
         }
       } }
     }
@@ -427,36 +420,12 @@ fn first_failing_arg_loop(env: TyEnv, sub: Subst, params: [Ty],
 }
 
 
-# Emit Template 1 trailing notes — should be called when the generic
-# unify has already errored. Suppresses if we cannot derive useful
-# context (no callee name AND no resolvable signature).
-fn emit_call_arg_notes(env: TyEnv, sub: Subst, name_opt: Option[String],
-                         callee_ty: Ty, arg_tys: [Ty],
-                         expected_shown: String) : Unit / Console + Mutable {
-  let resolved = apply_ty(sub, callee_ty)
-  match first_failing_arg(env, sub, resolved, arg_tys) {
-    Some(idx) -> match name_opt {
-      Some(nm) -> diag_note("in argument #{int_to_string(idx)} of `#{nm}`")
-      None     -> diag_note("in argument #{int_to_string(idx)}")
-    }
-    None -> ()
-  }
-  match call_sig_note_text(env, name_opt, resolved, expected_shown) {
-    Some(txt) -> diag_note(txt)
-    None      -> ()
-  }
-}
-
-
-# structured T1 Diagnostic builder. Mirrors the
-# "type mismatch in function call" header that `st_unify` prints when
-# `unify_list` fails, plus the trailing notes from `emit_call_arg_notes`.
-# Pinned at the call-site (line, col); related infos cite the same span
-# because the typer does not (yet) track per-argument spans.
-fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, name_opt: Option[String],
-                                   callee_ty: Ty, arg_tys: [Ty],
-                                   file: String, line: Int, col: Int,
-                                   expected_shown: String) : Diagnostic / Mutable {
+# The notes under a "type mismatch in function call": the failing
+# argument and the callee's signature.
+fn call_mismatch_notes(env: TyEnv, sub: Subst, name_opt: Option[String],
+                       callee_ty: Ty, arg_tys: [Ty],
+                       file: String, line: Int, col: Int,
+                       expected_shown: String) : [RelatedInfo] / Mutable {
   let resolved = apply_ty(sub, callee_ty)
   let arg_notes = match first_failing_arg(env, sub, resolved, arg_tys) {
     Some(idx) -> match name_opt {
@@ -469,9 +438,7 @@ fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, name_opt: Option[String
     Some(txt) -> [ri_note(file, line, col, txt)]
     None      -> []
   }
-  mk_diag(SevError, file, line, col,
-          "type mismatch in function call",
-          list_append(arg_notes, sig_notes))
+  list_append(arg_notes, sig_notes)
 }
 
 
@@ -486,15 +453,8 @@ pub fn dot_identity_help(before: InferState, st: InferState, callee_ty: Ty,
       Some(idx) -> match nth(args_, idx - 1) { Some(a) -> is_dot_identity(a)  None -> false }
       None      -> false
     }
-    match st.diags {
-      [D(sev, file, l, c, msg, rel), ...rest] ->
-        if lone {
-          let help = "a lone `.` argument is the function `(x) => x`; to call this once per element, make it a pipe stage (`xs | f(.)`) or name the element (`(x) => f(x)`)"
-          diag_help(help)
-          InferState { ...st, diags: [D(sev, file, l, c, msg, list_append(rel, [ri_help(file, l, c, help)])), ...rest] }
-        } else { st }
-      [] -> st
-    }
+    if lone { st_help(st, "a lone `.` argument is the function `(x) => x`; to call this once per element, make it a pipe stage (`xs | f(.)`) or name the element (`(x) => f(x)`)") }
+    else { st }
   }
 
 
@@ -557,8 +517,6 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
   let resolved_callee = apply_ty(st.sub, callee_ty)
   match arity_mismatch_of(st.sub, callee_ty, arg_tys) {
     Some(_np) -> {
-      emit_wrong_arity(st.env, st.file, who, resolved_callee, arg_tys, line, col)
-      # T4 collected diagnostic.
       let d = build_wrong_arity_diag(st.env, st.file, who, resolved_callee, arg_tys, line, col)
       st_bump_err(st_push_diag(st, d))
     }
@@ -568,14 +526,11 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
       let pre_errs = st.errs
       let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
       if st1.errs > pre_errs {
-        # Mirrors the `expected:` note `st_unify` just printed, so the
+        # Mirrors the `expected:` note `st_unify` just attached, so the
         # trailing signature note can drop itself when it would repeat it.
         let expected_shown = inf_ty_to_string_ow(st1.env.tab, st1.env.head_owners, apply_ty(st1.sub, callee_ty))
-        emit_call_arg_notes(st1.env, st1.sub, who, callee_ty, arg_tys, expected_shown)
-        # The related notes mirror `emit_call_arg_notes`.
-        let d = build_call_type_mismatch_diag(st1.env, st1.sub, who, callee_ty,
-                                              arg_tys, st1.file, line, col, expected_shown)
-        st_refine_diag(st1, d)
+        st_relate_all(st1, call_mismatch_notes(st1.env, st1.sub, who, callee_ty,
+                                               arg_tys, st1.file, line, col, expected_shown))
       } else { st1 }
       }
     }
@@ -596,9 +551,6 @@ fn rigid_row_call(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [
         Some(idx) -> [rigid_row_arg_note(st.env, who, resolved, idx)]
         None      -> []
       }
-      diag_error(st.file, line, col, msg)
-      for_each_note(notes)
-      diag_help(help)
       let rel = list_append(map(notes, (n) => ri_note(st.file, line, col, n)), [ri_help(st.file, line, col, help)])
       Some(st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, rel))))
     }
@@ -627,12 +579,6 @@ fn first_pure_fn_param(ps: [Ty], idx: Int) : Option[Int] = match ps {
 fn rigid_row_unifies(st: InferState, a: Ty, b: Ty) : Bool / Mutable = match unify_env(st.env, a, b, st.sub) {
   Some(_) -> true
   None    -> false
-}
-
-
-fn for_each_note(notes: [String]) : Unit / Console = match notes {
-  []           -> ()
-  [n, ...rest] -> { diag_note(n); for_each_note(rest) }
 }
 
 
@@ -791,8 +737,6 @@ pub fn synth_local_read(st: InferState, l: LocalId, e: Expr) : Inferred / Consol
     let nm = local_name_in(st.env, l)
     let header = "`#{nm}` may only be called, not used as a value: it cannot escape its handler clause"
     let help_msg = "call the continuation directly, e.g. `#{nm}(v)`"
-    diag_error(st.file, e.line, e.col, header)
-    diag_help(help_msg)
     let d = mk_diag(SevError, st.file, e.line, e.col, header, [ri_help(st.file, e.line, e.col, help_msg)])
     inferred_leaf(st_bump_err(st_push_diag(st, d)), TyAny, e)
   } else { match env_local(st.env, l) {
@@ -917,29 +861,20 @@ pub fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred 
         VCNotSum -> {
           let perr = mk_diag(SevError, st.file, e.line, e.col,
             "`variants[T]()` requires T to be a declared sum type", [])
-          render_diag(perr)
-          diag_note("type: #{inf_ty_to_string(st.env.tab, ty)}")
-          diag_help("declare T as `type T = A | B | ...` or use a different builtin")
-          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
+          inferred_leaf(st_bump_err(st_help(st_note(st_push_diag(st, perr), "type: #{inf_ty_to_string(st.env.tab, ty)}"), "declare T as `type T = A | B | ...` or use a different builtin")), TyAny, e)
         }
         VCHasPayload(bad) -> {
           let bad_list = inf_join_with(map(bad, (c) => written_text(decl_name(st.env.tab, c))), ", ")
           let perr = mk_diag(SevError, st.file, e.line, e.col,
             "`variants[T]()` requires every variant of T to be nullary", [])
-          render_diag(perr)
-          diag_note("variants of `#{decl_name(st.env.tab, tsym)}` with payload: #{bad_list}")
-          diag_help("`variants[T]()` lists the inhabitants of a closed sum; this is ill-defined when a variant carries arguments")
-          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
+          inferred_leaf(st_bump_err(st_help(st_note(st_push_diag(st, perr), "variants of `#{decl_name(st.env.tab, tsym)}` with payload: #{bad_list}"), "`variants[T]()` lists the inhabitants of a closed sum; this is ill-defined when a variant carries arguments")), TyAny, e)
         }
       }
     }
     _ -> {
       let perr = mk_diag(SevError, st.file, e.line, e.col,
         "`variants[T]()` requires T to be a named user type", [])
-      render_diag(perr)
-      diag_note("type: #{inf_ty_to_string(st.env.tab, ty)}")
-      diag_help("T must be a `type T = A | B | ...` declaration; built-ins (Int, String, [a], etc.) are not supported")
-      inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
+      inferred_leaf(st_bump_err(st_help(st_note(st_push_diag(st, perr), "type: #{inf_ty_to_string(st.env.tab, ty)}"), "T must be a `type T = A | B | ...` declaration; built-ins (Int, String, [a], etc.) are not supported")), TyAny, e)
     }
   }
 }
