@@ -1746,6 +1746,9 @@ test-native-modular: $(TARGET) build
 	diff -q build/nmod-whole.out build/nmod.out > /dev/null \
 	  && echo "native-modular OK: modular == whole-program (byte-identical)" \
 	  || { echo "native-modular: modular != whole-program"; diff build/nmod-whole.out build/nmod.out; exit 1; }; \
+	$(KAIC2) --emit=native-modular --core-cache-stats --path ../stdlib --path $$work $$work/main.kai 2>&1 >/dev/null | grep -q 'core-prune: dropped' \
+	  && echo "native-modular OK: the core is pruned to what the program reaches" \
+	  || { echo "native-modular: the core was not pruned"; exit 1; }; \
 	n1=$$(wc -l < build/nmod-objs1.txt); \
 	printf 'pub fn total(xs: [Int]) : Int = fold_add(xs, 0)\nfn fold_add(xs: [Int], acc: Int) : Int = match xs {\n  [] -> acc\n  [x, ...rest] -> fold_add(rest, x + acc)\n}\npub fn pick[T](a: T, b: T) : T = a\n' > $$work/mathx.kai; \
 	emit | sort > build/nmod-objs2.txt; \
