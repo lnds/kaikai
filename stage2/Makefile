@@ -5879,6 +5879,17 @@ bench-effects: build
 # runs once. The default keeps it at the flags kaic2 ships with, which
 # also puts the C compiler's optimiser under the check.
 SELFHOST_CFLAGS := $(if $(SELFHOST_ONCE),$(CFLAGS_HOP),$(CFLAGS))
+# The warning half of `selfhost` alone: one compile of the compiler's own
+# sources, failing on any warning.
+test-selfhost-warnings: $(TARGET) build
+	@$(KAIC2) $(SRC) > build/kaic2w.c 2> build/kaic2w.err || { cat build/kaic2w.err >&2; exit 1; }
+	@if grep -q '^warning:' build/kaic2w.err; then \
+	  cat build/kaic2w.err >&2; \
+	  echo "selfhost warnings: the compiler's own sources must compile without a warning"; exit 1; \
+	fi
+	@rm -f build/kaic2w.c build/kaic2w.err
+	@echo "selfhost warnings: none"
+
 selfhost: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(SRC) > build/kaic2b.c 2> build/kaic2b.err || { cat build/kaic2b.err >&2; exit 1; }; \
