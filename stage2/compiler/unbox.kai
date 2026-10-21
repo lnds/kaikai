@@ -12,6 +12,8 @@ import compiler.ast_ids
 import compiler.operators
 import compiler.fn_index
 import compiler.kinds
+import compiler.expr_positions
+import compiler.loop_lower
 import compiler.vec_raw
 import compiler.core_builtins
 import compiler.kir_lower_raw
@@ -531,44 +533,45 @@ fn ctor_int_flags(cis: CtorIntIx, s: SymId) : [Bool] = match ctor_int_slots_of(c
 pub(pkg) fn expr_captures(e: Expr, b: Binder) : Bool =
   uses_have_in_lam(scan_uses_expr(e, false), b.id)
 
-pub(pkg) fn name_captured_in_block(rest: [Stmt], opt_tail: Option[Expr], nm: Binder) : Bool / Console {
+# A read inside a closure that outlives its frame. A loop's condition and body
+# run in place, so a binder read there is not captured.
+fn closure_captures(e: Expr, id: LocalId, in_lam: Bool) : Bool = match e.kind {
+  ELocal(l) -> in_lam and local_eq(l, id)
+  EIntrinsic(inm, xs) -> any(xs, (x) => closure_captures(if is_loop_intrinsic(inm) { loop_arg_body(x) } else { x }, id, in_lam))
+  _ -> any(xp_positions(e), (p) => match p { XP(r, x) -> closure_captures(x, id, in_lam or not xrole_inline(r)) })
+}
 
-  if any_stmt_captures(rest, nm) { true }
+pub(pkg) fn name_captured_in_block(rest: [Stmt], opt_tail: Option[Expr], nm: Binder, loops_inline: Bool) : Bool / Console {
+  let captures = (e: Expr) => if loops_inline { closure_captures(e, nm.id, false) } else { expr_captures(e, nm) }
+  if any_stmt_captures(rest, captures) { true }
   else { match opt_tail {
     None -> false
-    Some(e) -> expr_captures(e, nm)
+    Some(e) -> captures(e)
   } }
 }
 
-fn any_stmt_captures(stmts: [Stmt], nm: Binder) : Bool / Console {
-
+fn any_stmt_captures(stmts: [Stmt], captures: (Expr) -> Bool) : Bool / Console {
   match stmts {
     [] -> false
-    [s, ...rest] -> if stmt_captures(s, nm) { true }
-                    else { any_stmt_captures(rest, nm) }
+    [s, ...rest] -> if stmt_captures(s, captures) { true }
+                    else { any_stmt_captures(rest, captures) }
   }
 }
 
-fn stmt_captures(s: Stmt, nm: Binder) : Bool / Console {
-
+fn stmt_captures(s: Stmt, captures: (Expr) -> Bool) : Bool / Console {
   match s {
-    SLet(_, _, rhs)        -> expr_captures(rhs, nm)
-    SVar(_, _, rhs, _, _)  -> expr_captures(rhs, nm)
+    SLet(_, _, rhs)        -> captures(rhs)
+    SVar(_, _, rhs, _, _)  -> captures(rhs)
     SAssert(c, opt_m)      -> {
-      if expr_captures(c, nm) { true }
+      if captures(c) { true }
       else { match opt_m {
         None -> false
-        Some(m) -> expr_captures(m, nm)
+        Some(m) -> captures(m)
       } }
     }
-    SExprStmt(e)           -> expr_captures(e, nm)
-    SIndexAssign(b, i, v, _, _) ->
-      expr_captures(b, nm) or
-      expr_captures(i, nm) or
-      expr_captures(v, nm)
-    SAssign(b, v, _, _) ->
-      expr_captures(b, nm) or
-      expr_captures(v, nm)
+    SExprStmt(e)           -> captures(e)
+    SIndexAssign(b, i, v, _, _) -> captures(b) or captures(i) or captures(v)
+    SAssign(b, v, _, _) -> captures(b) or captures(v)
     SUse(_, _, _)          -> false
   }
 }
