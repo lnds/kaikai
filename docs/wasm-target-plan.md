@@ -391,6 +391,15 @@ numbers are left out on purpose; the function names are stable.
   WebAssembly target downloads a pinned toolchain, verifies its checksum and
   keeps it in the user cache. A user installs nothing by hand, as on the host
   targets. A toolchain named by an environment variable is used in its place.
+- **Phase 1 is go** (2026-10-22), with the recommendations below adopted for
+  it: wasi-libc with the page as host (3.1, pinned wasi-sdk), exnref for
+  non-resuming handlers (3.2), one thread (3.7), accept and diagnose the
+  engine's recursion limit (3.9), and the target spelled `wasm32-browser`.
+  Phase 1's engine baseline is the engines that ship exnref (Chrome and Edge
+  137, Firefox 131, Safari 18.4); the JSPI baseline of 3.8 waits for phase 2.
+  `File` runs its work in place when there is no reactor, and `main` refuses
+  on `wasm32-browser` the effects the page cannot run (PR 4). The playground
+  (#2540) is out of scope.
 
 ### 3.1 Toolchain and libc
 

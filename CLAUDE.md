@@ -230,5 +230,5 @@ cz reads `.cz.toml` (`change_type_map = { feat = "Added", fix = "Fixed", … }`,
 - **Do not introduce a Rust-style borrow checker.** Perceus + fibers resolves memory at compile time without cognitive cost.
 - **Do not add forms whose intent overlaps an existing one.** Two function bodies (short vs block) is fine; two pipes (apply vs map) is fine; a third way to do the same thing with no new intent is not.
 - **Do not add dependencies to stage 0.** It must build on any system with an ANSI `cc`.
-- **Do not design against WASM, Windows, or other post-MVP targets.**
+- **Do not design against Windows or other post-MVP targets.** WebAssembly is in scope: the browser target follows `docs/wasm-target-plan.md` (phase 1 through the C backend; the native backend is phase 4).
 - **Do not cite retired principles** in design arguments (see *Not principles*).

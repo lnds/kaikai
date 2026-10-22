@@ -203,7 +203,7 @@ arguments:
   - Calling a C function is an operation of the `Ffi` effect (appears in the type of every function that uses it).
   - Incoming FFI (kaikai as a C library): minimal subset in MVP — exportable pure functions, initializable runtime.
   - Binding generator (`kai bindgen foo.h`): post-MVP.
-  - WASM as a target: post-MVP; do not design against it but no dedicated effort for now.
+  - WASM as a target: in progress through the C backend, browser first; plan and decisions in `docs/wasm-target-plan.md`.
   - Motivation: consistency with the effects system, type-level safety (pure code cannot accidentally call C).
 - **Distribution and bootstrapping**: 3 stages, portable bootstrap from C.
   - **Stage 0** (in C, ~5–10K lines, no dependencies): compiles an austere subset **kaikai-minimal** → **portable C**. Any machine with `cc` can build kaikai from scratch.
@@ -371,7 +371,6 @@ was first pinned; many items below have since shipped — see
 - More targets (Linux arm64, macOS x86_64, Windows).
 - Package manager (`kai new`, `kai add`).
 - Final syntax consolidation.
-- WASM.
 
 ## End-to-end MVP verification
 
