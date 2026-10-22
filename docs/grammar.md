@@ -330,6 +330,7 @@ attr_body   ::= 'derive' '(' protocol_list ')'        (* §4.11 *)
               | IDENT ('(' arg_list? ')')?            (* future attrs parse,
                                                         AST drops unknown *)
 visibility  ::= 'pub'
+              | 'pub' '(' 'pkg' ')'                    (* visible to the package's other modules and its tests, not to importers *)
 decl_inner  ::= fn_decl
               | type_decl
               | effect_decl
@@ -452,6 +453,8 @@ top-level function).
 ```
 extern_decl ::= 'extern' '"C"' c_sym_override? 'pub'? 'fn' IDENT
                 '(' params? ')' return_spec
+              | 'extern' '"C"' 'pub'? 'type' TYPE_IDENT '=' record_type
+              | 'extern' '"C"' 'pub'? 'opaque' TYPE_IDENT
 c_sym_override ::= '(' STRING_LIT ')'                  (* issue #261 *)
 axiom_decl  ::= 'axiom' IDENT type_params? '(' params? ')' return_spec
 ```
@@ -572,8 +575,10 @@ pipe_expr   ::= or_expr (pipe_op or_expr)*
 pipe_op     ::= '|>' | '|' | '||' | '|?' | '|!'
 or_expr     ::= and_expr ('or' and_expr)*
 and_expr   ::= cmp_expr ('and' cmp_expr)*
-cmp_expr    ::= concat_expr (cmp_op concat_expr)?     (* non-associative *)
+cmp_expr    ::= coalesce_expr (cmp_op coalesce_expr)? (* non-associative *)
 cmp_op      ::= '==' | '!=' | '<' | '>' | '<=' | '>='
+coalesce_expr ::= concat_expr ('??' coalesce_expr)?   (* right-associative;
+                                                        Option only *)
 concat_expr ::= add_expr ('++' add_expr)*              (* right-associative *)
 add_expr    ::= mul_expr (('+' | '-') mul_expr)*
 mul_expr    ::= unary_expr (('*' | '/' | '%') unary_expr)*
@@ -917,16 +922,19 @@ one precedence-climbing loop (`bin_level` in `parse.kai`).
 |     4 | `*`, `/`, `%`                                 | Left                 | `parse_bin` (loop) |
 |     5 | `+`, `-` (binary)                             | Left                 | `parse_bin` (loop) |
 |     6 | `++` (concat)                                 | Right                | `parse_bin` (loop) |
-|     7 | `==`, `!=`, `<`, `>`, `<=`, `>=`              | **Non-associative**  | `parse_bin` (loop) |
-|     8 | `and`                                         | Left (short-circuit) | `parse_bin` (loop) |
-|     9 | `or`                                          | Left (short-circuit) | `parse_bin` (loop) |
-|    10 | `\|>`, `\|`, `\|\|`, `\|?`, `\|!`              | Left                 | `parse_bin` (loop) |
+|     7 | `??` (Option default)                         | Right                | `parse_bin` (loop) |
+|     8 | `==`, `!=`, `<`, `>`, `<=`, `>=`              | **Non-associative**  | `parse_bin` (loop) |
+|     9 | `and`                                         | Left (short-circuit) | `parse_bin` (loop) |
+|    10 | `or`                                          | Left (short-circuit) | `parse_bin` (loop) |
+|    11 | `\|>`, `\|`, `\|\|`, `\|?`, `\|!`              | Left                 | `parse_bin` (loop) |
 
 Notes:
 
 - Comparison is **non-associative**: `a < b < c` is a syntax error.
   Use `a < b and b < c`.
 - Pipes are at the bottom: `a + b |> f` parses as `f(a + b)`.
+- `??` binds tighter than comparison and looser than `++`: `n ?? 0 == 1`
+  is `(n ?? 0) == 1`, and `a ?? b ?? c` is `a ?? (b ?? c)`.
 - Postfix chains associate left: `a.b.c` ≡ `(a.b).c`,
   `f(x)(y)` ≡ `(f(x))(y)`.
 - `^` (power) appears only at expression level when the base is
