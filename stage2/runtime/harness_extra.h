@@ -74,7 +74,7 @@ static void kai_bench_ensure_capacity(int n) {
     if (n <= kai_bench_samples_cap) return;
     long long *r = (long long *)realloc(kai_bench_samples, (size_t)n * sizeof(long long));
     if (!r) {
-        fprintf(stderr, "kai_bench: out of memory reserving %d samples\n", n);
+        kai_eprintf("kai_bench: out of memory reserving %d samples\n", n);
         kai_exit(1);
     }
     kai_bench_samples = r;
@@ -105,7 +105,7 @@ static long long kai_bench_median_sorted(const long long *xs, int n) {
 static void kai_bench_finalize(const char *desc, int iters) {
     /* Samples already populated by kai_bench_record(0..iters-1). */
     if (iters <= 0) {
-        fprintf(stderr, "  %s: 0 iter / median 0 ns / MAD 0 ns / mean 0 ns / range [0, 0]\n",
+        kai_eprintf("  %s: 0 iter / median 0 ns / MAD 0 ns / mean 0 ns / range [0, 0]\n",
                 desc ? desc : "(unnamed)");
         kai_bench_count_total++;
         return;
@@ -132,14 +132,14 @@ static void kai_bench_finalize(const char *desc, int iters) {
     }
     qsort(xs, (size_t)iters, sizeof(long long), kai_bench_ll_cmp);
     long long mad = kai_bench_median_sorted(xs, iters);
-    fprintf(stderr,
+    kai_eprintf(
             "  %s: %d iter / median %lld ns / MAD %lld ns / mean %lld ns / range [%lld, %lld]\n",
             desc ? desc : "(unnamed)", iters, median, mad, mean, mn, mx);
     kai_bench_count_total++;
 }
 
 static int kai_bench_summary(void) {
-    fprintf(stderr, "\n%d benches\n", kai_bench_count_total);
+    kai_eprintf("\n%d benches\n", kai_bench_count_total);
     if (kai_bench_samples) {
         free(kai_bench_samples);
         kai_bench_samples = NULL;
@@ -252,19 +252,19 @@ static void kai_check_begin(const char *desc) {
 
 static void kai_check_pass(int iters) {
     kai_check_count_passed++;
-    fprintf(stderr, "  %s: %d iter, OK\n",
+    kai_eprintf("  %s: %d iter, OK\n",
             kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
             iters);
 }
 
 static void kai_check_fail(int iter_at) {
-    fprintf(stderr, "  %s: counterexample at iter %d: %s\n",
+    kai_eprintf("  %s: counterexample at iter %d: %s\n",
             kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
             iter_at, kai_check_cx_buf);
 }
 
 static int kai_check_summary(void) {
-    fprintf(stderr, "\n%d/%d checks passed\n",
+    kai_eprintf("\n%d/%d checks passed\n",
             kai_check_count_passed, kai_check_count_total);
     return (kai_check_count_passed == kai_check_count_total) ? 0 : 1;
 }
@@ -478,12 +478,12 @@ static void kai_check_cx_save_orig(void) {
 static void kai_check_fail_shrunk(int iter_at) {
     if (kai_check_has_orig_cx
         && strcmp(kai_check_orig_cx_buf, kai_check_cx_buf) != 0) {
-        fprintf(stderr,
+        kai_eprintf(
                 "  %s: counterexample at iter %d: %s, shrunk to %s\n",
                 kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
                 iter_at, kai_check_orig_cx_buf, kai_check_cx_buf);
     } else {
-        fprintf(stderr, "  %s: counterexample at iter %d: %s\n",
+        kai_eprintf("  %s: counterexample at iter %d: %s\n",
                 kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
                 iter_at, kai_check_cx_buf);
     }

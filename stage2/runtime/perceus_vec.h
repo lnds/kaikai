@@ -434,7 +434,7 @@ __attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiV
 /* Allocate an array of `len` slots, each initialised to `init`
    (incref'd once per slot). Caller owns the returned array. */
 KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
-    if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); kai_exit(1); }
+    if (len < 0) { kai_eprintf("kai: array_make: negative length\n"); kai_exit(1); }
     KaiValue *v = kai_alloc(KAI_ARRAY);
     v->as.arr.len = len;
     v->as.arr.cap = len > 0 ? len : 1;
@@ -449,7 +449,7 @@ KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *in
    <= current len this is a no-op beyond the incref. */
 static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *init) {
     if (!a || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: array_grow: not an array\n"); kai_exit(1);
+        kai_eprintf("kai: array_grow: not an array\n"); kai_exit(1);
     }
     if (new_len > a->as.arr.cap) {
         int64_t nc = a->as.arr.cap * 2;
@@ -466,7 +466,7 @@ static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *ini
 /* O(1) read. Callers own the returned reference. */
 static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
     if (!a || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: array_get: not an array\n"); kai_exit(1);
+        kai_eprintf("kai: array_get: not an array\n"); kai_exit(1);
     }
     if (i < 0 || i >= a->as.arr.len) {
         static char buf[96];
@@ -481,7 +481,7 @@ static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
    Returns the same array (incref'd) so callers can thread it. */
 static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
     if (!a || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: array_set: not an array\n"); kai_exit(1);
+        kai_eprintf("kai: array_set: not an array\n"); kai_exit(1);
     }
     if (i < 0 || i >= a->as.arr.len) {
         static char buf[96];
@@ -658,7 +658,7 @@ static KaiValue *kai_vec_read_elem(KaiVecMeta *m, const char *slot) {
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_vec_make(int64_t len, KaiValue *init) {
-    if (len < 0) { fprintf(stderr, "kai: vec_make: negative length\n"); kai_exit(1); }
+    if (len < 0) { kai_eprintf("kai: vec_make: negative length\n"); kai_exit(1); }
     KaiVecMeta m;
     memset(&m, 0, sizeof(m));
     if (len > 0) kai_vec_classify(&m, init);
@@ -700,7 +700,7 @@ static KAI_RC_NOINLINE KaiValue *kai_vec_clone(KaiValue *v, int64_t cap) {
 
 static void kai_vec_bounds(KaiValue *v, int64_t i, const char *op) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: %s: not a vec\n", op); kai_exit(1);
+        kai_eprintf("kai: %s: not a vec\n", op); kai_exit(1);
     }
     if (i < 0 || i >= v->as.vec.len) {
         static char buf[96];
@@ -792,7 +792,7 @@ static KaiValue *kai_vec_set_impl(KaiValue *v, int64_t i, KaiValue *x) {
  * shared copies first. An empty PENDING vec classifies from `x`. */
 static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_push: not a vec\n"); kai_exit(1);
+        kai_eprintf("kai: vec_push: not a vec\n"); kai_exit(1);
     }
     int64_t len = v->as.vec.len;
     {
@@ -855,7 +855,7 @@ static void kai_vec_store_rec_fields(KaiVecMeta *m, char *slot, int64_t n,
 static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n,
                                       KaiValue **xs, const char **names) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_push: not a vec\n"); kai_exit(1);
+        kai_eprintf("kai: vec_push: not a vec\n"); kai_exit(1);
     }
     int64_t len = v->as.vec.len;
     {

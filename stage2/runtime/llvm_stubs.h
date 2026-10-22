@@ -6,7 +6,7 @@
  * a clear message instead of a link error. The default backend never
  * reaches these (it dispatches to the C-text emitter). */
 static void *kai_llvm_native_unavailable(void) {
-    fprintf(stderr,
+    kai_eprintf(
         "kai: the native (in-process libLLVM) backend is not built into this "
         "compiler.\n     Rebuild stage2 with `make KAI_LLVM=1` to enable "
         "`--emit=native`.\n");

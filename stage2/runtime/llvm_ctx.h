@@ -214,7 +214,7 @@ static KaiValue *kai_native_ctx_fail(void *c) { ((KaiNativeCtx *) c)->ok = 0; re
  * function inside another (would clobber `fnval`/tables) — fail loud. */
 static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
-    if (c->in_fn) { fprintf(stderr, "kai: native begin_fn nested (compiler bug)\n"); c->ok = 0; return kai_unit(); }
+    if (c->in_fn) { kai_eprintf("kai: native begin_fn nested (compiler bug)\n"); c->ok = 0; return kai_unit(); }
     for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
     for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
     c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1; c->pad = NULL;
@@ -627,7 +627,7 @@ static KaiValue *kai_llvm_backend_tag(void) {
         static int noted = 0;
         if (!noted) {
             noted = 1;
-            fprintf(stderr, "kai: native runtime inline bitcode unavailable — "
+            kai_eprintf("kai: native runtime inline bitcode unavailable — "
                     "skipping the core-object split, using the whole-program "
                     "runtime merge (slower build, runtime ops stay inlined)\n");
         }

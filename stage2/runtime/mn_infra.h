@@ -379,7 +379,7 @@ static KaiFiberExit *kai_fiber_exit_ref(KaiFiber *f) {
     KaiFiberExit *x = atomic_load_explicit(&f->exit_rec, memory_order_acquire);
     if (!x) {
         KaiFiberExit *fresh = (KaiFiberExit *) calloc(1, sizeof(KaiFiberExit));
-        if (!fresh) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!fresh) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         atomic_init(&fresh->refs, 1);
         fresh->fiber = f;
         if (atomic_compare_exchange_strong(&f->exit_rec, &x, fresh)) x = fresh;
@@ -509,7 +509,7 @@ static inline void kai_mbox_unlock(KaiMailbox *mb) { if (mb->mu_inited) pthread_
  * parent would corrupt its own lookups whenever it already owns one. */
 static KaiMailbox *kai_mailbox_new(int cap, int overflow, int owned) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
-    if (!mb) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!mb) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     kai_mbox_count_alloc();
     kai_mailbox_init_mu(mb);
     mb->cap      = cap;
@@ -706,7 +706,7 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
     /* m8 #8 + Phase 4: enforce policy on full. */
     if (!kai_mailbox_reserve_slot(mb, msg)) return;
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
-    if (!node) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!node) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     node->msg  = msg;
     node->next = NULL;
     if (mb->tail) { mb->tail->next = node; }
@@ -734,7 +734,7 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
 static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
     if (!kai_mailbox_reserve_slot(mb, msg)) return;
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
-    if (!node) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!node) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     node->msg  = msg;
     node->next = NULL;
     if (mb->tail) mb->tail->next = node;

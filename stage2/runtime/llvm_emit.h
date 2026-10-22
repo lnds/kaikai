@@ -82,7 +82,7 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
     if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
         /* File named but unreadable — not a no-op situation (the driver set
          * the var, so it expected a bitcode). Fail loudly. */
-        fprintf(stderr, "kai: native runtime bitcode unreadable (%s): %s\n",
+        kai_eprintf("kai: native runtime bitcode unreadable (%s): %s\n",
                 bc_path, err ? err : "?");
         if (err) LLVMDisposeMessage(err);
         return 1;
@@ -94,7 +94,7 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
     LLVMModuleRef src = NULL;
     err = NULL;
     if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
-        fprintf(stderr, "kai: native runtime bitcode parse failed (%s): %s\n",
+        kai_eprintf("kai: native runtime bitcode parse failed (%s): %s\n",
                 bc_path, err ? err : "?");
         if (err) LLVMDisposeMessage(err);
         return 1;
@@ -119,7 +119,7 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
 
     /* LLVMLinkModules2 consumes (and disposes) `src`. Returns 1 on error. */
     if (LLVMLinkModules2((LLVMModuleRef) m, src)) {
-        fprintf(stderr, "kai: native runtime bitcode link failed (%s)\n", bc_path);
+        kai_eprintf("kai: native runtime bitcode link failed (%s)\n", bc_path);
         return 1;
     }
 
@@ -196,7 +196,7 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
      * a single grow-on-demand array. */
     size_t pre_cap = 64, pre_n = 0;
     char **pre = (char **) malloc(pre_cap * sizeof(char *));
-    if (!pre) { fprintf(stderr, "kai: native modular merge OOM\n"); return 1; }
+    if (!pre) { kai_eprintf("kai: native modular merge OOM\n"); return 1; }
     for (LLVMValueRef f = LLVMGetFirstFunction(mod); f; f = LLVMGetNextFunction(f)) {
         if (LLVMIsDeclaration(f)) continue;
         const char *nm = LLVMGetValueName(f);
@@ -204,7 +204,7 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         if (pre_n == pre_cap) {
             pre_cap *= 2;
             char **np = (char **) realloc(pre, pre_cap * sizeof(char *));
-            if (!np) { free(pre); fprintf(stderr, "kai: native modular merge OOM\n"); return 1; }
+            if (!np) { free(pre); kai_eprintf("kai: native modular merge OOM\n"); return 1; }
             pre = np;
         }
         pre[pre_n++] = strdup(nm);
@@ -219,7 +219,7 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
     } else {
         LLVMMemoryBufferRef buf = NULL;
         if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
-            fprintf(stderr, "kai: native runtime inline bitcode unreadable (%s): %s\n",
+            kai_eprintf("kai: native runtime inline bitcode unreadable (%s): %s\n",
                     bc_path, err ? err : "?");
             if (err) LLVMDisposeMessage(err);
             for (size_t i = 0; i < pre_n; i++) free(pre[i]);
@@ -228,7 +228,7 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         }
         err = NULL;
         if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
-            fprintf(stderr, "kai: native runtime inline bitcode parse failed (%s): %s\n",
+            kai_eprintf("kai: native runtime inline bitcode parse failed (%s): %s\n",
                     bc_path, err ? err : "?");
             if (err) LLVMDisposeMessage(err);
             for (size_t i = 0; i < pre_n; i++) free(pre[i]);
@@ -236,7 +236,7 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
             return 1;
         }
         if (kai_llvm_trim_runtime_bc(src)) {
-            fprintf(stderr, "kai: native runtime inline bitcode trim left a block in use (%s)\n", bc_path);
+            kai_eprintf("kai: native runtime inline bitcode trim left a block in use (%s)\n", bc_path);
             for (size_t i = 0; i < pre_n; i++) free(pre[i]);
             free(pre);
             return 1;
@@ -248,7 +248,7 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout(mod));
     }
     if (LLVMLinkModules2(mod, src)) {
-        fprintf(stderr, "kai: native runtime inline bitcode link failed (%s)\n", bc_path);
+        kai_eprintf("kai: native runtime inline bitcode link failed (%s)\n", bc_path);
         for (size_t i = 0; i < pre_n; i++) free(pre[i]);
         free(pre);
         return 1;
@@ -371,7 +371,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
     }
 
     if (LLVMVerifyModule((LLVMModuleRef) m, LLVMReturnStatusAction, &err)) {
-        fprintf(stderr, "kai: native module verify failed: %s\n", err ? err : "?");
+        kai_eprintf("kai: native module verify failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
         return 1;
     }
@@ -383,7 +383,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
     char *triple = LLVMGetDefaultTargetTriple();
     LLVMTargetRef target = NULL;
     if (LLVMGetTargetFromTriple(triple, &target, &err)) {
-        fprintf(stderr, "kai: native target lookup failed: %s\n", err ? err : "?");
+        kai_eprintf("kai: native target lookup failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
         LLVMDisposeMessage(triple);
         return 1;
@@ -467,12 +467,12 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
         char tmp_out[4096];
         snprintf(tmp_out, sizeof tmp_out, "%s.tmp%ld", out, (long) getpid());
         if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, tmp_out, LLVMObjectFile, &err)) {
-            fprintf(stderr, "kai: native object emit failed: %s: %s\n", tmp_out, err ? err : "?");
+            kai_eprintf("kai: native object emit failed: %s: %s\n", tmp_out, err ? err : "?");
             if (err) LLVMDisposeMessage(err);
             unlink(tmp_out);
             rc = 1;
         } else if (rename(tmp_out, out) != 0) {
-            fprintf(stderr, "kai: native object publish failed: %s -> %s\n", tmp_out, out);
+            kai_eprintf("kai: native object publish failed: %s -> %s\n", tmp_out, out);
             unlink(tmp_out);
             rc = 1;
         }
@@ -589,7 +589,7 @@ static void kai_emit_pool_start(void) {
     for (int i = 0; i < kai_emit_nworkers; i++) {
         kai_rc_go_mt();
         if (pthread_create(&kai_emit_threads[i], &attr, kai_emit_worker, NULL) != 0) {
-            fprintf(stderr, "kai: native emit pthread_create failed: %s\n", strerror(errno));
+            kai_eprintf("kai: native emit pthread_create failed: %s\n", strerror(errno));
             _exit(1);
         }
     }

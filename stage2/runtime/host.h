@@ -81,6 +81,21 @@
 #include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
 #endif
 
+/* stdout is block-buffered off a TTY: flush before anything that can
+ * outlive or reorder buffered bytes (a wait, a stderr write, a stdin read). */
+#ifdef __APPLE__
+static inline int kai_stdout_pending(void) { return stdout->_p != stdout->_bf._base; }
+#else
+#include <stdio_ext.h>
+static inline int kai_stdout_pending(void) { return __fpending(stdout) != 0; }
+#endif
+static inline void kai_flush_stdout(void) { if (kai_stdout_pending()) fflush(stdout); }
+
+/* Every runtime stderr write goes through these so earlier stdout bytes
+ * stay ahead of it in a merged log. */
+#define kai_eprintf(...) (kai_flush_stdout(), fprintf(stderr, __VA_ARGS__))
+#define kai_eputs(s) (kai_flush_stdout(), fputs((s), stderr))
+
 /* Every runtime exit goes through kai_exit: exit() tears down LLVM's lazily
  * built statics, so the native emit pool is drained first. */
 #ifdef KAI_LLVM
@@ -97,7 +112,7 @@ static void kai_exit(int code) {
 #if !KAI_HOST_COMPLETE
 __attribute__((noreturn))
 static void kai_host_absent(const char *facility) {
-    fprintf(stderr, "kai: this host has no %s\n", facility);
+    kai_eprintf("kai: this host has no %s\n", facility);
     kai_exit(1);
 }
 #endif

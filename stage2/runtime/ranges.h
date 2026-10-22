@@ -679,7 +679,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
         case KAI_RECORD: {
             int n = v->as.rec.n_fields;
             KaiValue **fields = (KaiValue **) malloc((size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
-            if (!fields) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); kai_exit(1); }
+            if (!fields) { kai_eprintf("kai: out of memory (region copy-out)\n"); kai_exit(1); }
             for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy(v->as.rec.fields[i], mode);
             KaiValue *c = kai_record(n, fields, v->as.rec.names);
             c->as.rec.head_type_tag = v->as.rec.head_type_tag;
@@ -691,7 +691,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             if (n <= 0) return kai_variant_u(v->variant_tag, kai_variant_name_of(v->variant_tag), 0, 0, NULL);
             uint32_t mask = kai_slot_mask_of(v->variant_tag);
             KaiVarSlot *slots = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
-            if (!slots) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); kai_exit(1); }
+            if (!slots) { kai_eprintf("kai: out of memory (region copy-out)\n"); kai_exit(1); }
             /* Respect the per-slot kind: a primitive slot (Int/Real/Enum)
              * holds a raw scalar, NOT a pointer — deep-copying it as a
              * pointer dereferences the integer as an address (UAF/segfault).
@@ -755,7 +755,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             KaiValue **caps = NULL;
             if (nc > 0) {
                 caps = (KaiValue **) malloc((size_t) nc * sizeof(KaiValue *));
-                if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); kai_exit(1); }
+                if (!caps) { kai_eprintf("kai: out of memory (closure copy-out)\n"); kai_exit(1); }
                 for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy(v->as.clo.captures[i], mode);
             }
             /* kai_closure increfs each capture; we already own a fresh

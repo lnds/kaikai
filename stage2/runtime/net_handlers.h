@@ -372,7 +372,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue
     if (fd < 0) return _kai_net_err_msg(k, "recv: invalid conn");
     int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
-        fputs("kai: NetTcp.recv: max must be > 0\n", stderr);
+        kai_eputs("kai: NetTcp.recv: max must be > 0\n");
         kai_exit(1);
     }
     if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
@@ -424,7 +424,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
     if (fd < 0) return _kai_net_err_msg(k, "recv_timeout: invalid conn");
     int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
-        fputs("kai: NetTcp.recv_timeout: max must be > 0\n", stderr);
+        kai_eputs("kai: NetTcp.recv_timeout: max must be > 0\n");
         kai_exit(1);
     }
     if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
@@ -480,7 +480,7 @@ static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
     if (fd >= 0) {
         if (close(fd) < 0) {
             /* Stderr only — the surface op returns Unit. */
-            fprintf(stderr, "kai: NetTcp.close: %s\n", strerror(errno));
+            kai_eprintf("kai: NetTcp.close: %s\n", strerror(errno));
         }
     }
     return kai_cont_resume(k, kai_unit());
@@ -706,7 +706,7 @@ static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, Kai
     }
     int fd = _kai_net_record_fd(l);
     if (fd >= 0 && close(fd) < 0) {
-        fprintf(stderr, "kai: NetUnix.close_listener: %s\n", strerror(errno));
+        kai_eprintf("kai: NetUnix.close_listener: %s\n", strerror(errno));
     }
     return kai_cont_resume(k, kai_unit());
 }
@@ -960,7 +960,7 @@ static KaiValue *kai_default_netudp_recv(void *self, KaiValue *sock, KaiValue *m
     if (fd < 0) return _kai_net_err_msg(k, "recv: invalid socket");
     int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
-        fputs("kai: NetUdp.recv: max must be > 0\n", stderr);
+        kai_eputs("kai: NetUdp.recv: max must be > 0\n");
         kai_exit(1);
     }
     if (cap > (1 << 16)) cap = 1 << 16;  /* IPv4 datagram ceiling */
@@ -1004,7 +1004,7 @@ static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k
     int fd = _kai_net_record_fd(sock);
     if (fd >= 0) {
         if (close(fd) < 0) {
-            fprintf(stderr, "kai: NetUdp.close: %s\n", strerror(errno));
+            kai_eprintf("kai: NetUdp.close: %s\n", strerror(errno));
         }
     }
     return kai_cont_resume(k, kai_unit());

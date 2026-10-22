@@ -173,7 +173,7 @@ static void kai_sched_check_deadlock(void) {
         }
     }
 
-    fprintf(stderr,
+    kai_eprintf(
         "kai: all workers idle with fibers parked (%d parked) — deadlock\n",
         atomic_load(&kai_blocked_fiber_count));
     kai_park_trace_dump();
@@ -416,7 +416,7 @@ static void kai_sched_park_linked(void) {
             next = kai_sched_dequeue(w);
             continue;
         }
-        fprintf(stderr,
+        kai_eprintf(
             "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
             w->parked_count);
         kai_exit(1);
@@ -532,7 +532,7 @@ static void kai_fiber_uc_link_landing(void) {
     w->active = &w->main_fiber;
     KAI_TSAN_SWITCH_TO_ROOT(w);
     setcontext(&w->main_fiber.ctx);
-    fprintf(stderr, "kai: fiber uc_link landing failed to reach the scheduler root\n");
+    kai_eprintf("kai: fiber uc_link landing failed to reach the scheduler root\n");
     kai_exit(1);
 }
 
@@ -630,7 +630,7 @@ static void kai_fiber_trampoline(void) {
         for (KaiFiber *c = self->awaiters_head; c; c = c->awaiters_next) n++;
         if (n > 8) {
             wake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
-            if (!wake) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            if (!wake) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         }
         KaiFiber *a = self->awaiters_head;
         while (a) {
@@ -656,7 +656,7 @@ static void kai_fiber_trampoline(void) {
         for (KaiSelectWaiter *c = self->select_waiters_head; c; c = c->next) n++;
         if (n > 8) {
             swake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
-            if (!swake) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            if (!swake) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         }
         KaiSelectWaiter *s = self->select_waiters_head;
         while (s) {
@@ -728,7 +728,7 @@ static void kai_fiber_trampoline(void) {
             next = kai_sched_dequeue(w);
             continue;
         }
-        fprintf(stderr,
+        kai_eprintf(
             "kai: fiber finished with empty run queue (%d parked) — deadlock\n",
             w->parked_count);
         kai_exit(1);

@@ -177,67 +177,67 @@ static void kai_rc_report(void) {
     KaiRcLedgerSum s;
     kai_rc_ledger_sum(&s);
     int64_t leaked = s.alloc_total - s.free_total;
-    fprintf(stderr,
+    kai_eprintf(
         "[KAI_TRACE_RC] alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
         (long long) s.alloc_total,
         (long long) s.free_total,
         (long long) leaked,
         (long long) s.live_peak);
     if (ef.unstarted > 0)
-        fprintf(stderr, "[KAI_TRACE_RC]   fibers_unstarted_at_exit=%d\n", ef.unstarted);
+        kai_eprintf("[KAI_TRACE_RC]   fibers_unstarted_at_exit=%d\n", ef.unstarted);
     if (ef.started > 0)
-        fprintf(stderr, "[KAI_TRACE_RC]   fibers_started_at_exit=%d\n", ef.started);
+        kai_eprintf("[KAI_TRACE_RC]   fibers_started_at_exit=%d\n", ef.started);
     int64_t chosen = atomic_load(&kai_chosen_exit_plus1);
-    if (chosen > 0) fprintf(stderr, "[KAI_TRACE_RC]   exit_code=%lld\n", (long long) (chosen - 1));
-    else            fprintf(stderr, "[KAI_TRACE_RC]   exit_code=abort\n");
+    if (chosen > 0) kai_eprintf("[KAI_TRACE_RC]   exit_code=%lld\n", (long long) (chosen - 1));
+    else            kai_eprintf("[KAI_TRACE_RC]   exit_code=abort\n");
     for (int i = 0; i < 16; i++) {
         if (s.alloc_by_tag[i] > 0) {
-            fprintf(stderr, "[KAI_TRACE_RC]   tag %-7s allocs=%lld\n",
+            kai_eprintf("[KAI_TRACE_RC]   tag %-7s allocs=%lld\n",
                     kai_rc_tag_name(i),
                     (long long) s.alloc_by_tag[i]);
         }
     }
     /* issue #118 — Perceus reuse-in-place counter. */
     if (s.reuse_total > 0) {
-        fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
+        kai_eprintf("[KAI_TRACE_RC]   reuse_in_place=%lld\n",
                 (long long) s.reuse_total);
     }
     if (s.vec_inplace_total > 0 || s.vec_cow_total > 0) {
-        fprintf(stderr, "[KAI_TRACE_RC]   vec_inplace=%lld vec_cow=%lld\n",
+        kai_eprintf("[KAI_TRACE_RC]   vec_inplace=%lld vec_cow=%lld\n",
                 (long long) s.vec_inplace_total,
                 (long long) s.vec_cow_total);
     }
     /* #2 parity probe — tokens captured but freed (could not donate in
      * frame). Upper bound on interprocedural-token-pass recovery. */
     if (s.reuse_free_total > 0) {
-        fprintf(stderr, "[KAI_TRACE_RC]   reuse_freed=%lld\n",
+        kai_eprintf("[KAI_TRACE_RC]   reuse_freed=%lld\n",
                 (long long) s.reuse_free_total);
     }
     /* #2 parity probe — token-drop outcome split. */
     if (s.tok_unique > 0 || s.tok_null_shared > 0 ||
         s.tok_null_mismatch > 0) {
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC]   tok_unique=%lld tok_null_shared=%lld tok_null_mismatch=%lld\n",
             (long long) s.tok_unique,
             (long long) s.tok_null_shared,
             (long long) s.tok_null_mismatch);
     }
     /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
-    fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
+    kai_eprintf("[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
             (long long) kai_rc_incref_total,
             (long long) kai_rc_decref_total);
     /* issue #120 — region arena lifecycle. arena_live != 0 at exit
      * flags a wrong-codegen silent leak (a non-region value mistakenly
      * arena-allocated, which never frees and which ASAN cannot see). */
     if (s.arena_alloc_total > 0 || s.arena_free_total > 0) {
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC]   arena_alloc=%lld arena_free=%lld arena_live=%lld\n",
             (long long) s.arena_alloc_total,
             (long long) s.arena_free_total,
             (long long) (s.arena_alloc_total - s.arena_free_total));
     }
     if (s.mbox_alloc_total > 0) {
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC]   mailbox_alloc=%lld mailbox_free=%lld mailbox_live=%lld\n",
             (long long) s.mbox_alloc_total,
             (long long) s.mbox_free_total,
@@ -335,7 +335,7 @@ static void kai_rc_strict_report(void) {
     KaiRcLedgerSum s;
     kai_rc_ledger_sum(&s);
     int64_t leaked = s.alloc_total - s.free_total;
-    fprintf(stderr,
+    kai_eprintf(
         "[KAI_TRACE_RC] STRICT alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
         (long long) s.alloc_total,
         (long long) s.free_total,
@@ -349,7 +349,7 @@ static void kai_rc_strict_report(void) {
         const char *flag =
             (live != 0)              ? " LEAK"     :
             (f > a)                  ? " DOUBLE"   : "";
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC] tag=%-7s allocs=%lld frees=%lld live=%lld%s\n",
             kai_rc_tag_name(i),
             (long long) a, (long long) f, (long long) live, flag);
@@ -364,7 +364,7 @@ static void kai_rc_strict_report(void) {
         const char *aflag = (arena_live != 0) ? " LEAK"
                           : (s.arena_free_total > s.arena_alloc_total) ? " DOUBLE"
                           : "";
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC] arena   allocs=%lld frees=%lld live=%lld%s\n",
             (long long) s.arena_alloc_total,
             (long long) s.arena_free_total,
@@ -373,13 +373,13 @@ static void kai_rc_strict_report(void) {
     if (kai_rc_history_enabled() && kai_rc_history_count > 0) {
         uint64_t total = kai_rc_history_count;
         uint64_t shown = total < KAI_RC_HISTORY_CAP ? total : KAI_RC_HISTORY_CAP;
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC] history total=%llu showing last=%llu\n",
             (unsigned long long) total, (unsigned long long) shown);
         uint64_t start = total > KAI_RC_HISTORY_CAP ? total - KAI_RC_HISTORY_CAP : 0;
         for (uint64_t k = start; k < total; k++) {
             KaiRcHistoryEntry *e = &kai_rc_history[k % KAI_RC_HISTORY_CAP];
-            fprintf(stderr, "[KAI_TRACE_RC] hist %s chunk=%p tag=%s\n",
+            kai_eprintf("[KAI_TRACE_RC] hist %s chunk=%p tag=%s\n",
                 kai_rc_op_name(e->op), e->chunk,
                 kai_rc_tag_name(e->tag));
         }
@@ -522,11 +522,11 @@ static void kai_rc_site_report(void) {
     }
     qsort(flat, (size_t) n, sizeof(KaiRcSite), kai_rc_site_cmp_leak);
 
-    fprintf(stderr,
+    kai_eprintf(
         "[KAI_TRACE_RC] top sites by leak (showing %d of %d distinct sites; total_leak=%lld%s)\n",
         top_n < n ? top_n : n, n, (long long) total_leak,
         kai_rc_sites_full ? "; TABLE SATURATED" : "");
-    fprintf(stderr,
+    kai_eprintf(
         "[KAI_TRACE_RC] aslr_slide=%p (subtract from site addresses for static symbolization)\n",
         (void *) kai_rc_aslr_slide());
     int limit = top_n < n ? top_n : n;
@@ -537,7 +537,7 @@ static void kai_rc_site_report(void) {
             ? (100.0 * (double) live / (double) s->allocs) : 0.0;
         double share = total_leak > 0
             ? (100.0 * (double) live / (double) total_leak) : 0.0;
-        fprintf(stderr,
+        kai_eprintf(
             "[KAI_TRACE_RC] site %2d %p tag=%-7s allocs=%lld frees=%lld leak=%lld leak%%=%.1f share%%=%.1f\n",
             i + 1, s->site, kai_rc_tag_name(s->tag),
             (long long) s->allocs, (long long) s->frees, (long long) live,
