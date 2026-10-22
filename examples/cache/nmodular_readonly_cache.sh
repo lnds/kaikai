@@ -36,7 +36,6 @@ real_cc="$(command -v "${CC:-cc}")"
 fake="$PROJ/fakecc"
 nmroot="$PROJ/nmcache"
 log="$PROJ/cc.log"
-run_ro=""
 cat > "$fake" <<EOT
 #!/bin/sh
 echo "\$*" >> "$log"
@@ -45,7 +44,7 @@ EOT
 chmod +x "$fake"
 
 build() {
-  $run_ro env CC="$fake" KAI_NATIVE_MODULAR_CACHE_DIR="$nmroot" KAI_CC_ID_CACHE_DIR="$PROJ/ccid" \
+  env CC="$fake" KAI_NATIVE_MODULAR_CACHE_DIR="$nmroot" KAI_CC_ID_CACHE_DIR="$PROJ/ccid" \
     KAI_CORE_CACHE_DIR="$PROJ/core-cache" KAI_BACKEND=native \
     "$KAI" build "$PROJ/main.kai" -o "$PROJ/out" 2>"$PROJ/build.err" 1>/dev/null \
     || { echo "nmodular_readonly_cache FAIL — build failed"; cat "$PROJ/build.err"; exit 1; }
@@ -61,9 +60,13 @@ unlock() { chflags -R nouchg "$PROJ" 2>/dev/null || true; }
 if command -v chflags >/dev/null 2>&1; then
   lock
   trap 'unlock; rm -rf "$PROJ"' EXIT INT TERM
-elif command -v bwrap >/dev/null 2>&1; then
-  run_ro="bwrap --bind / / --ro-bind $nmroot $nmroot --ro-bind $PROJ/ccid $PROJ/ccid --ro-bind $PROJ/core-cache $PROJ/core-cache --dev /dev"
+elif sudo -n true 2>/dev/null; then
+  sudo chown -R root "$nmroot" "$PROJ/ccid" "$PROJ/core-cache"
+  trap 'sudo rm -rf "$PROJ"' EXIT INT TERM
 else
+  if [ -n "${CI:-}" ]; then
+    echo "nmodular_readonly_cache FAIL — CI has no way to make the cache read-only"; exit 1
+  fi
   echo "nmodular_readonly_cache SKIP — no way to make an owned cache refuse mtime updates"
   exit 0
 fi
