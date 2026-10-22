@@ -344,7 +344,7 @@ test-prune-differential: kaic2 bin/kai
 prune-differential-combos: kaic2 bin/kai
 	@./tools/prune-differential.sh combos
 
-prune-differential: prune-differential-combos
+prune-differential: prune-differential-combos kaic2 bin/kai
 	@./tools/prune-differential.sh corpus
 
 test-symtab: kaic2
