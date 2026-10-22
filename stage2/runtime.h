@@ -20314,6 +20314,11 @@ static KaiValue *kai_default_monitor_demonitor(void *self, KaiValue *ref, KaiCon
 
 /* (typedef forward-declared above, before KaiFiber.) */
 struct KaiEvidence {
+    /* KaiValue's rc and tag, pinned: a capability is a node pointer passed
+     * where a value goes, so a closure capturing one counts it like any
+     * capture and the pin makes that a no-op. */
+    int32_t      rc;
+    uint8_t      tag;
     KaiEvidence *parent;
     const char  *eff_label;     /* canonical effect name (literal or interned). */
     void        *handler;       /* *Ev<Eff> struct; opaque to the runtime. */
@@ -20518,6 +20523,8 @@ static void kai_evidence_push_l(KaiEvidence *node, const char *eff_label, void *
     node->cleanup_done = 0;
     node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
+    node->rc           = INT32_MAX;
+    node->tag          = KAI_UNIT;
     f->evidence_top    = node;
 }
 /* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
@@ -20535,6 +20542,8 @@ static void kai_evidence_init_default_l(KaiEvidence *node, const char *eff_label
     node->cleanup_done = 0;
     node->disp_hops    = 0;
     node->unw_mark     = 0;
+    node->rc           = INT32_MAX;
+    node->tag          = KAI_UNIT;
 }
 
 /* m7a #6e: like kai_evidence_push but also stamps the handle's
@@ -20556,6 +20565,8 @@ static void kai_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_labe
     node->cleanup_done = 0;
     node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
+    node->rc           = INT32_MAX;
+    node->tag          = KAI_UNIT;
     f->evidence_top    = node;
 }
 
