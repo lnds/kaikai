@@ -477,6 +477,7 @@ KAIX_CORE_THUNK2(string_contains)
 KAIX_CORE_THUNK3(string_slice)
 KAIX_CORE_THUNK1(char_to_int)
 KAIX_CORE_THUNK1(int_to_char)
+KAIX_CORE_THUNK1(char_to_string)
 KAIX_CORE_THUNK1(int_to_byte_string)
 KAIX_CORE_THUNK2(string_byte_at_int)
 KAIX_CORE_THUNK2(string_cp_at)
@@ -1296,6 +1297,7 @@ KaiValue *kaix_core_int_to_string_radix(KaiValue *v, KaiValue *r) { return kai_c
 KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i)       { return kai_core_char_at(s, i); }
 KaiValue *kaix_core_char_to_int(KaiValue *c)                { return kai_core_char_to_int(c); }
 KaiValue *kaix_core_int_to_char(KaiValue *i)                { return kai_core_int_to_char(i); }
+KaiValue *kaix_core_char_to_string(KaiValue *c)             { return kai_core_char_to_string(c); }
 KaiValue *kaix_core_int_to_byte_string(KaiValue *i)         { return kai_core_int_to_byte_string(i); }
 KaiValue *kaix_core_string_byte_at_int(KaiValue *s, KaiValue *i) { return kai_core_string_byte_at_int(s, i); }
 KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off)  { return kai_core_string_cp_at(s, off); }

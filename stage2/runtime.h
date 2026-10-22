@@ -7845,6 +7845,22 @@ static int kai_utf8_encode(uint32_t cp, unsigned char *out) {
     return 4;
 }
 
+/* A Char as its UTF-8 text. One-byte results come from an immortal table,
+ * so rendering an ASCII char never allocates. */
+static KaiValue *kai_char_to_string(uint32_t cp) {
+    static KaiValue *ascii[128];
+    unsigned char buf[4];
+    int n = kai_utf8_encode(cp, buf);
+    if (n != 1) return kai_str_from_bytes((const char *) buf, (size_t) n);
+    KaiValue *s = ascii[buf[0]];
+    if (!s) {
+        char one[2] = { (char) buf[0], '\0' };
+        s = kai_str(one);
+        ascii[buf[0]] = s;
+    }
+    return s;
+}
+
 KAI_RT_SHARED KaiValue *kai_list_to_string(KaiValue *v) {
     KaiValue *acc = kai_str("[");
     int first = 1;
@@ -7884,9 +7900,7 @@ KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v) {
         case KAI_REAL:
             kai_real_text(buf, sizeof(buf), v->as.r);
             return kai_str_dyn(buf);
-        case KAI_CHAR:
-            snprintf(buf, sizeof(buf), "%c", (char) v->as.c);
-            return kai_str_dyn(buf);
+        case KAI_CHAR: return kai_char_to_string(v->as.c);
         case KAI_STR:    return kai_incref(v);
         case KAI_NIL:    return kai_str("[]");
         case KAI_CONS:   return kai_list_to_string(v);
@@ -11090,6 +11104,12 @@ static KaiValue *kai_string_fold_ascii(KaiValue *s, unsigned char lo, unsigned c
     return out;
 }
 
+static KaiValue *kai_core_char_to_string(KaiValue *c) {
+    uint32_t cp = (c && kai_is_ptr(c) && c->tag == KAI_CHAR) ? c->as.c : 0xFFFD;
+    if (c) kai_decref(c);
+    return kai_char_to_string(cp);
+}
+
 static KaiValue *kai_core_string_to_lower_ascii(KaiValue *s) { return kai_string_fold_ascii(s, 'A', 'Z', 32); }
 static KaiValue *kai_core_string_to_upper_ascii(KaiValue *s) { return kai_string_fold_ascii(s, 'a', 'z', -32); }
 
@@ -11545,6 +11565,7 @@ static KaiValue *_kai_core_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, i
 static KaiValue *_kai_core_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_cp_at(a[0], a[1]); }
 static KaiValue *_kai_core_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_cp_len(a[0], a[1]); }
 static KaiValue *_kai_core_string_reverse_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_reverse(a[0]); }
+static KaiValue *_kai_core_char_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_char_to_string(a[0]); }
 static KaiValue *_kai_core_string_to_lower_ascii_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_to_lower_ascii(a[0]); }
 static KaiValue *_kai_core_string_to_upper_ascii_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_to_upper_ascii(a[0]); }
 static KaiValue *_kai_core_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_hash(a[0]); }
