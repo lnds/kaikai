@@ -36,6 +36,7 @@ ALLOW="$ROOT/tools/runtime-globals.allow"
 # catalogs. stage0/runtime.h is the older stage0 mirror.
 FILES=(
   "stage2/runtime.h"
+  stage2/runtime/*.h
   "stage0/runtime_llvm.c"
   "stage0/runtime.h"
 )
@@ -131,7 +132,7 @@ sort -u -o "$ALLOWED_SYMS" "$ALLOWED_SYMS"
 : > "$SEEN_SYMS"
 for f in "${FILES[@]}"; do
   [ -f "$f" ] || continue
-  enumerate "$f" >> "$SEEN_SYMS"
+  enumerate "$f" >> "$SEEN_SYMS" || true
 done
 sort -u -o "$SEEN_SYMS" "$SEEN_SYMS"
 

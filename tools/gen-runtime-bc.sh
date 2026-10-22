@@ -68,7 +68,7 @@ BC_INLINE="$ROOT/stage0/runtime_inline.bc"
 mode="${1:-}"
 
 # The bitcode is a pure function of these two inputs (runtime_llvm.c includes
-# only <runtime.h>; runtime.h includes no other project header). The hash is
+# only <runtime.h>; runtime.h includes the headers under stage2/runtime/). The hash is
 # the staleness key — and changes whenever the runtime changes, so a stale
 # .bc is regenerated rather than silently linking an old runtime.
 #
@@ -88,7 +88,7 @@ fi
 # linking a bitcode written for a different LLVM. This script is too, so a
 # change to its flags re-emits.
 input_hash() {
-  { $SHA256 "$RUNTIME_C" "$RUNTIME_H" "$ROOT/tools/gen-runtime-bc.sh"
+  { $SHA256 "$RUNTIME_C" "$RUNTIME_H" "$ROOT"/stage2/runtime/*.h "$ROOT/tools/gen-runtime-bc.sh"
     printf '%s\n' "$(resolve_clang 2>/dev/null || echo none)"
     printf '%s\n' "$(clang_major "$(resolve_clang 2>/dev/null || echo false)" 2>/dev/null || echo 0)"
   } | $SHA256 | awk '{print $1}'

@@ -31,7 +31,7 @@ FILES=(
 )
 
 # The tracked files bin/kai resolves its dev layout against.
-STANDALONE=(stage0 stage2/runtime.h stdlib tools/kai/plugins VERSION EDITION)
+STANDALONE=(stage0 stage2/runtime.h stage2/runtime stdlib tools/kai/plugins VERSION EDITION)
 
 die() { echo "prebuilt-kaic2: $*" >&2; exit 2; }
 sha_of() { git -C "$REPO" rev-parse --verify "${1:-origin/main}^{commit}"; }

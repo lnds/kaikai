@@ -38,6 +38,13 @@ verdict() {
   fi
 }
 
+# runtime_text <dir>: the umbrella and its parts as one file, so a thunk is found wherever it sits.
+runtime_text() {
+  mkdir -p "$1"
+  cat stage2/runtime.h stage2/runtime/*.h > "$1/runtime.h"
+  printf '%s' "$1/runtime.h"
+}
+
 # check <rows> <runtime.h> <runtime_llvm.c>
 check() {
   local rows="$1" rt="$2" nrt="$3" status=0 name cname arity n
@@ -53,10 +60,11 @@ check() {
 self_test() {
   local tmp rc=0
   tmp=$(mktemp -d)
+  rt=$(runtime_text "$tmp/rt")
   echo "no_such_builtin kai_core_no_such_builtin 1" > "$tmp/missing"
   echo "print kai_core_print 2" > "$tmp/arity"
   for row in missing arity; do
-    if check "$tmp/$row" stage2/runtime.h stage0/runtime_llvm.c > /dev/null; then
+    if check "$tmp/$row" "$rt" stage0/runtime_llvm.c > /dev/null; then
       echo "builtin-table self-test FAIL — a row with the $row defect passed"; rc=1
     fi
   done
@@ -72,11 +80,12 @@ fi
 KAIC2=stage2/kaic2
 [ -x "$KAIC2" ] || { echo "builtin-table: SKIP — no stage2/kaic2"; exit 0; }
 rows=$(mktemp)
-trap 'rm -f "$rows"' EXIT
+rtdir=$(mktemp -d)
+trap 'rm -rf "$rows" "$rtdir"' EXIT
 "$KAIC2" --builtin-table > "$rows" || { echo "builtin-table FAIL — the registry disagrees with the resolver or the typer"; exit 1; }
 count=$(wc -l < "$rows" | tr -d ' ')
 [ "$count" -gt 0 ] || { echo "builtin-table FAIL — kaic2 printed no registry"; exit 1; }
-if out=$(check "$rows" stage2/runtime.h stage0/runtime_llvm.c); then
+if out=$(check "$rows" "$(runtime_text "$rtdir")" stage0/runtime_llvm.c); then
   echo "builtin-table OK ($count builtins, each with its C and native thunk at its arity)"
 else
   echo "builtin-table FAIL — runtime forwarders out of step with the builtin table:"

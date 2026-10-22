@@ -266,13 +266,11 @@ jobs:
           first=""
           for d in seeds/*; do
             [ -n "$first" ] || { first="$d"; continue; }
-            for f in stage2.c runtime.h; do
-              cmp -s "$first/$f" "$d/$f" && continue
-              echo "::error::$f differs between $(basename "$first") and $(basename "$d"): stage 2 emits platform-dependent C for its own source. No seed is published."
-              sha256sum "$first/$f" "$d/$f"
-              diff "$first/$f" "$d/$f" | head -n 60 || true
-              exit 1
-            done
+            diff -rq "$first" "$d" > /dev/null && continue
+            echo "::error::the seed differs between $(basename "$first") and $(basename "$d"): stage 2 emits platform-dependent C for its own source. No seed is published."
+            diff -rq "$first" "$d" | head -n 20 || true
+            diff -r "$first" "$d" | head -n 60 || true
+            exit 1
           done
           [ -n "$first" ] || { echo "::error::no seed artifact"; exit 1; }
           echo "SEED_SRC=$first" >> "$GITHUB_ENV"
@@ -289,11 +287,19 @@ jobs:
           tag="${{ steps.tag.outputs.tag }}"
           seed="bootstrap-seed-$tag"
           c_sha="$(sha256sum "$SEED_SRC/stage2.c" | cut -d' ' -f1)"
-          h_sha="$(sha256sum "$SEED_SRC/runtime.h" | cut -d' ' -f1)"
+          hdrs="$(cd "$SEED_SRC" && find runtime.h runtime -type f | LC_ALL=C sort)"
+          h_sha="$(cd "$SEED_SRC" && sha256sum $hdrs | sha256sum | cut -d' ' -f1)"
+          same_seed() {
+            git show "$seed:bootstrap/stage2.c" | cmp -s - "$SEED_SRC/stage2.c" || return 1
+            [ "$(git ls-tree -r --name-only "$seed" bootstrap | grep -v '^bootstrap/stage2\.c$' | LC_ALL=C sort)" \
+              = "$(echo "$hdrs" | sed 's|^|bootstrap/|')" ] || return 1
+            for f in $hdrs; do
+              git show "$seed:bootstrap/$f" | cmp -s - "$SEED_SRC/$f" || return 1
+            done
+          }
           if git ls-remote --exit-code --tags origin "refs/tags/$seed" >/dev/null; then
             git fetch --depth=1 origin "refs/tags/$seed:refs/tags/$seed"
-            if git show "$seed:bootstrap/stage2.c" | cmp -s - "$SEED_SRC/stage2.c" \
-               && git show "$seed:bootstrap/runtime.h" | cmp -s - "$SEED_SRC/runtime.h"; then
+            if same_seed; then
               echo "$seed is already published with this seed"
               exit 0
             fi
@@ -301,7 +307,7 @@ jobs:
             exit 1
           fi
           mkdir bootstrap
-          cp "$SEED_SRC/stage2.c" "$SEED_SRC/runtime.h" bootstrap/
+          cp -R "$SEED_SRC/." bootstrap/
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bootstrap
@@ -310,11 +316,12 @@ jobs:
 
           The parent is $tag. bootstrap/stage2.c is the C the parent's kaic2
           emits for its own source, byte-identical on every release platform.
-          bootstrap/runtime.h is the parent's stage2/runtime.h, the only project
-          header that C includes.
+          bootstrap/runtime.h and bootstrap/runtime/ are the parent's
+          stage2/runtime.h and the headers under stage2/runtime/, the only
+          project headers that C includes.
 
           sha256 bootstrap/stage2.c $c_sha
-          sha256 bootstrap/runtime.h $h_sha
+          sha256 of the sorted sha256 list of runtime.h and runtime/ $h_sha
           EOF
           git tag -a "$seed" -m "Bootstrap rescue seed emitted by $tag" -m "sha256 bootstrap/stage2.c $c_sha"
           if git push origin "refs/tags/$seed" 2> push.err; then
