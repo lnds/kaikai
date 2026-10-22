@@ -21,10 +21,13 @@ expect() {
 
 run() { pkg="$1"; shift; (cd "$WORK/pkgs/$pkg" && XDG_CACHE_HOME="$WORK/cache" "$KAI" "$@" 2> "$WORK/err"); }
 
-text() { run "$@" | sed -n 's/^\([^:]*\):.* \[\([a-z_]*\)\]$/\1 \2/p' | sed 's|^.*/pkgs/||' | sort; }
+# A path is shown as given: relative names are led by the package directory, absolute ones by their root.
+named() { sed -e 's|^\./||' -e "/^\//!s|^|$1/|" -e 's|^.*/pkgs/||'; }
+
+text() { run "$@" | sed -n 's/^\([^:]*\):.* \[\([a-z_]*\)\]$/\1 \2/p' | named "$1" | sort; }
 
 json() {
-  run "$@" | tr '{' '\n' | sed -n 's/^"file": "\([^"]*\)".*"rule": "\([^"]*\)".*/\1 \2/p' | sed 's|^.*/pkgs/||' | sort
+  run "$@" | tr '{' '\n' | sed -n 's/^"file": "\([^"]*\)".*"rule": "\([^"]*\)".*/\1 \2/p' | named "$1" | sort
 }
 
 APP="app/helper.kai list_concat_literal_to_spread
