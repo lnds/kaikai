@@ -11063,6 +11063,36 @@ static KaiValue *kai_core_string_reverse(KaiValue *s) {
     return out;
 }
 
+/* ASCII case fold in one allocation: bytes >= 0x80 are untouched, so a
+ * multibyte sequence round-trips exact. `lo`..`hi` is the range shifted by
+ * `delta`. Returns `s` itself when no byte changes. */
+static KaiValue *kai_string_fold_ascii(KaiValue *s, unsigned char lo, unsigned char hi, int delta) {
+    if (!s || s->tag != KAI_STR) {
+        if (s) kai_decref(s);
+        return kai_str("");
+    }
+    size_t len = s->as.s.len;
+    const unsigned char *src = (const unsigned char *) s->as.s.bytes;
+    size_t i = 0;
+    while (i < len && !(src[i] >= lo && src[i] <= hi)) i++;
+    if (i == len) return s;
+    KaiValue *out = kai_alloc(KAI_STR);
+    out->as.s.len = len;
+    out->as.s.bytes = (char *) kai_heap_malloc(len + 1);
+    unsigned char *dst = (unsigned char *) out->as.s.bytes;
+    memcpy(dst, src, i);
+    for (; i < len; i++) {
+        unsigned char c = src[i];
+        dst[i] = (c >= lo && c <= hi) ? (unsigned char) (c + delta) : c;
+    }
+    dst[len] = '\0';
+    kai_decref(s);
+    return out;
+}
+
+static KaiValue *kai_core_string_to_lower_ascii(KaiValue *s) { return kai_string_fold_ascii(s, 'A', 'Z', 32); }
+static KaiValue *kai_core_string_to_upper_ascii(KaiValue *s) { return kai_string_fold_ascii(s, 'a', 'z', -32); }
+
 /* First occurrence of `needle` in `hay`, or NULL; an empty needle matches at
  * the start. memchr on the first byte skips ahead a vector at a time. */
 static inline const char *kai_mem_find(const char *hay, size_t hlen, const char *needle, size_t nlen) {
@@ -11515,6 +11545,8 @@ static KaiValue *_kai_core_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, i
 static KaiValue *_kai_core_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_cp_at(a[0], a[1]); }
 static KaiValue *_kai_core_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_cp_len(a[0], a[1]); }
 static KaiValue *_kai_core_string_reverse_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_reverse(a[0]); }
+static KaiValue *_kai_core_string_to_lower_ascii_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_to_lower_ascii(a[0]); }
+static KaiValue *_kai_core_string_to_upper_ascii_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_to_upper_ascii(a[0]); }
 static KaiValue *_kai_core_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_hash(a[0]); }
 static KaiValue *_kai_core_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_real_bits(a[0]); }
 static KaiValue *_kai_core_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_core_mailbox_alloc(); }
