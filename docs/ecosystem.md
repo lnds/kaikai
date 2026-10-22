@@ -190,9 +190,78 @@ Scope:
 
 - HTTP server + routing + templating
 - LiveView equivalent (server-side state + client-side diff)
-- Built on top of ahu
+- Built on top of ahu (supervision), rongo (HTTP/TLS), henua
+  (domain ports) and kohau (persistence adapters)
 
 Status: not started.
+
+##### Decision: the official application style is DDD + effects
+
+**Date:** 2026-10-22
+**Status:** proposed
+
+*Context.* A web framework teaches an application architecture,
+whether it means to or not. An external prototype
+([`michelson/kaikai-projects`](https://github.com/michelson/kaikai-projects))
+showed that kaikai can host a Rails-shaped stack: controllers with
+`before`/`around`/`after` callbacks, Strong Parameters, an
+Ecto-style data mapper as the application-facing persistence API,
+and Active-*-style companions. It works, but it centres the
+application on tables and controllers, keeps henua out of the
+picture, and makes the effect row of a route an incidental detail
+instead of its contract.
+
+*Decision.* manutara has two layers with different status:
+
+1. **A style-neutral core.** A handler is a function
+   `(Request) -> Reply / e` carrying its own effect row. The core
+   owns only what imposes no application style: HTTP serving,
+   routing, middleware, cookies and sessions, templates with a safe
+   `Html` type, and the persistent-connection transport the
+   LiveView core needs. It knows nothing about controllers,
+   callbacks or models.
+2. **One official application layer: DDD + effects.** Handlers
+   call domain use cases; persistence goes through henua ports
+   (`Repository[a, i]` as an effect) implemented by kohau-backed
+   adapters; the capabilities a route may touch are visible in its
+   row and auditable from it. The guides, the book, `manutara new`
+   generators, and the reference application use this layer and
+   only this layer.
+
+Other application styles — a Rails-shaped layer included — are
+**accepted, not official**. They live in separate packages outside
+`kaikailang-org/`, under names that do not claim to be manutara
+itself (e.g. `manutara-rails`), depend on the core and are never
+depended on by it. Official docs may list them as community
+packages; they do not appear in guides or generators.
+
+*Consequences.*
+
+- The core's API is judged by whether a non-official layer can be
+  built on it without patches. A community layer doubles as a
+  consumer test: a core change that breaks it without a reason is
+  a sign the core is becoming opinionated.
+- henua and kohau gate manutara's official layer: a persistent
+  handler for henua's `Repository` effect, typed row codecs,
+  specification-style queries, aggregate-level transactions with a
+  domain-event outbox, and a kohau connection pool and migration
+  runner are prerequisites, not follow-ups.
+- Framework-neutral pieces from external prototypes (HTTP plumbing,
+  templates, the WebSocket transport, SQL compilation techniques)
+  can be absorbed into the core or into kohau; their
+  application-facing APIs are not.
+
+*Rejected alternatives.*
+
+- **Rails-shaped official layer.** Optimises for familiarity at the
+  cost of the property kaikai can offer and others cannot: domain
+  boundaries and capabilities checked by the effect system.
+- **No official style.** A framework without a recommended
+  architecture leaves every team to reinvent one and gives the
+  ecosystem nothing coherent to teach.
+- **Forbidding other styles.** Unenforceable and hostile to
+  contributors; a neutral core makes them cheap to host without
+  endorsing them.
 
 ### Layer 5 — Futuro
 
