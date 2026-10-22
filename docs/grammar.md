@@ -67,7 +67,7 @@ treated as a comment.
 
 Source identifiers must match `[A-Za-z_][A-Za-z0-9_]*`.
 
-Naming conventions enforced by `kai fmt` and the resolver:
+Naming conventions. The parser rejects an uppercase function, parameter or record-field name and a lowercase effect name (record fields of `extern "C" type` mirror C members and are exempt):
 
 - `snake_case` — functions, variables, fields, parameters,
   module names, capability binders.
