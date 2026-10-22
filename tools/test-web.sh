@@ -82,13 +82,13 @@ run_node() {
 }
 
 # A fixture with a .ticks.expected sleeps while a host timer ticks every 5 ms: the timeline
-# must show the ticks between the program's lines, under node and in each browser.
+# must show the ticks between the program's lines, under node and in each browser. Ticks
+# before the first line and after the last are page load and settle time, and dropped.
 collapse_ticks() {
   awk '
     function flush() { if (n >= 3) print "ticks"; else if (n > 0) print "few ticks"; n = 0 }
     $0 == "tick" { n++; next }
-    { flush(); print }
-    END { flush() }
+    { if (seen) flush(); n = 0; seen = 1; print }
   '
 }
 
