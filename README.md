@@ -1,5 +1,7 @@
 # kaikai
 
+[![km score](https://lnds.github.io/kaikai/km-score.svg)](https://kimun.tools)
+
 A **functional**, **statically typed** programming language that compiles to
 **native code** via LLVM.
 
