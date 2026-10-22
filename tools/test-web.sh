@@ -68,6 +68,9 @@ build_all() {
     if ! "$KAI" build --target=wasm32-browser "$f" -o "$TMP/out/$n" 2>"$TMP/build-$n.err"; then
       bad "build $n"
       cat "$TMP/build-$n.err"
+    elif grep -qE '^(error|warning):' "$TMP/build-$n.err"; then
+      bad "build $n printed a diagnostic"
+      cat "$TMP/build-$n.err"
     fi
   done
 }
@@ -115,6 +118,21 @@ check_wrong_checksum() {
   fi
 }
 
+# A program whose `main` performs a refused effect fails the build and leaves no module.
+check_refusal_fails() {
+  local d="$TMP/refused"
+  mkdir -p "$d"
+  cp "$ROOT/examples/negative/wasm/wasm_main_stdin.kai" "$d/app.kai"
+  if (cd "$d" && "$KAI" build --target=wasm32-browser app.kai -o out/app >"$d/build.out" 2>&1); then
+    bad "a refused program built"
+  elif grep -q "performs effect \`Stdin\`" "$d/build.out" && [ ! -e "$d/out/app.wasm" ]; then
+    say "ok:   refused main fails the build and writes no module"
+  else
+    bad "refused main: wrong diagnostic or a module was written"
+    cat "$d/build.out"
+  fi
+}
+
 # The installed layout finds the host under share/kaikai/web.
 check_installed_layout() {
   local p="$TMP/prefix" n
@@ -141,5 +159,6 @@ build_all
 run_node
 run_browsers
 check_wrong_checksum
+check_refusal_fails
 check_installed_layout
 exit $fail
