@@ -412,6 +412,24 @@ The native runtime is two halves — the owner object, compiled per build with `
 - **Gate**: `make -C stage2 test-host-minimal` (tier 1) runs `tools/test-host-minimal.sh`: the `examples/runtime/host_minimal_*` fixtures with every macro at 0, the import check on each binary, and the runtime compiled with each facility off on its own.
 - **A change to `runtime.h` that must not reach existing platforms** is checked with `tools/runtime-preprocess-diff.sh`: `cc -E -P` of the runtime at the base against the working tree, in every shape a build instantiates it, equal up to blank lines. Equal text is equal object code, so such a change needs no runtime or compile-cost measurement. The text depends on the host's headers; run it on each platform. A PR labelled `runtime-text-identical` is held to it in CI on Linux x86_64 (`tier1`, under GCC and clang) and Linux aarch64 (`linux-aarch64`); the label is read when the step runs, so one set after the PR opened counts on a re-run.
 
+## WebAssembly — a module and its host
+
+Under `__wasm__` the eight `KAI_HOST_*` macros default to 0 (a build may still define one); `File` runs its work in place, since there is no reactor and one fiber has nothing to hold. WebAssembly is reached only through the C backend and a cross compiler (wasi-sdk 34, pinned in `tier1.yml` by URL and checksum). The wrapper honours `CC` and `CFLAGS`; the cache and the link flags of a macOS host do not apply to wasm, so the build is single-unit:
+
+```
+CC=$WASI_SDK/bin/clang \
+CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
+        -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
+        -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp" \
+KAI_MODULAR=0 KAI_BACKEND=c bin/kai build app.kai -o app.wasm
+node stage2/web/kai_host.mjs app.wasm
+```
+
+`stage2/web/kai_host.mjs` instantiates the module with the `wasi_snapshot_preview1` imports it uses, line-buffers fd 1 and 2 to the console (and to `#kai-stdout` when the page has one) and resolves `run(wasm, opts)` with the exit status. It needs a node with exnref (24.15 or later; an older node takes `--experimental-wasm-exnref`, set through `WASM_NODE_FLAGS`).
+
+- **Gate**: `TARGET_BACKEND=wasm WASI_SDK=<dir> NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture for the oracle (C backend on the host) and for wasm, runs the second under node at `KAI_THREADS=1`, and compares output and exit status. `tools/wasm-parity-baseline.txt` lists the fixtures allowed to differ: a new difference fails, a closed one must be removed. CI runs it as `tier1-wasm` (not a required check), on the corpus plus `examples/web/`, one fixture per class of program.
+- The host grants no filesystem and no stdin: fixtures that read files, stdin, `PATH` or `/tmp` differ and sit in the baseline.
+
 ## Traps (verified, recurring)
 
 - **`stage2/main.kai` is a stub**, not the compiler. The compiler is the ~200 modules it reaches through `import compiler.driver`.

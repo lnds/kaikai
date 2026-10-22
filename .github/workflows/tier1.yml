@@ -63,6 +63,7 @@ jobs:
       compiler-touch: ${{ steps.compiler-touch.outputs.touch }}
       asan: ${{ steps.asan.outputs.run }}
       tsan: ${{ steps.tsan.outputs.run }}
+      wasm: ${{ steps.wasm.outputs.run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -130,6 +131,22 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "Diff does not reach the ASAN surface; tier1-asan skipped."
+          fi
+      # Scope of tier1-wasm: the runtime, the host module and the parity harness.
+      - name: Does this diff reach the WebAssembly surface?
+        id: wasm
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          if echo "$CHANGED" | grep -qE '^(stage2/runtime\.h$|stage2/runtime/|stage2/web/|examples/web/|tools/test-backend-parity\.sh$|tools/lib/corpus\.sh$|tools/wasm-parity-baseline\.txt$|\.github/workflows/tier1\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Diff does not reach the WebAssembly surface; tier1-wasm skipped."
           fi
       # Scope of the tier1-tsan gate: the code that can produce a data race
       # under the M:N scheduler. Non-PR events always run.
@@ -630,6 +647,55 @@ jobs:
             echo "::error::working tree dirty after tier1-asan-${{ matrix.shard }}; build artifacts leaked into tracked paths"
             git status; exit 1
           fi
+
+  # The parity corpus built for wasm32 and run under node with the shipped
+  # host, against the C oracle, as a ratchet (tools/wasm-parity-baseline.txt).
+  # Not a required check, and not in `tier1`'s needs.
+  tier1-wasm:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true' && needs.changes.outputs.wasm == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      WASI_SDK_VERSION: "34.0"
+      WASI_SDK_SHA256: "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: ./tools/ci-install-toolchain.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.1"
+      - name: Fetch wasi-sdk (pinned, checksum verified)
+        run: |
+          url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" "$url"
+          echo "${WASI_SDK_SHA256}  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasi-sdk"
+          tar xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
+          echo "WASI_SDK=$RUNNER_TEMP/wasi-sdk" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: tier1-wasm-${{ matrix.shard }} (corpus under node vs the C oracle)
+        run: |
+          . tools/lib/corpus.sh
+          all="$KAI_CORPUS_DEFAULT_DIRS examples/web"
+          case "${{ matrix.shard }}" in
+            a) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 1') ;;
+            b) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 2') ;;
+            c) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 0') ;;
+          esac
+          TARGET_BACKEND=wasm NATIVE_PARITY_RATCHET=1 BACKEND_PARITY_DIRS="$dirs" \
+            ./tools/ci-bounded-step.sh 2400 "tier1-wasm-${{ matrix.shard }}" tools/test-backend-parity.sh
 
   # M:N ThreadSanitizer, reactor no-starvation and deadlock-banner gates.
   # A REQUIRED check, so it must report on every PR: it runs whenever the
