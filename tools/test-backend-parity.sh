@@ -91,19 +91,20 @@ target_build() {
 target_exec() {
   if [ "$TARGET_BACKEND" = wasm ]; then
     # node before 24.15 needs a flag for JSPI, which fibers and kept continuations run on.
-    local err rc
-    err="$(mktemp)"
+    # The first attempt keeps stdout and stderr interleaved in one file, in the order written.
+    local out rc
+    out="$(mktemp)"
     # shellcheck disable=SC2086
-    node $WASM_NODE_FLAGS "$WASM_HOST" "$1" 2>"$err"
+    node $WASM_NODE_FLAGS "$WASM_HOST" "$1" >"$out" 2>&1
     rc=$?
-    if [ "$rc" -ne 0 ] && grep -q "Promise Integration" "$err"; then
+    if [ "$rc" -ne 0 ] && grep -q "Promise Integration" "$out"; then
       # shellcheck disable=SC2086
       node --experimental-wasm-jspi $WASM_NODE_FLAGS "$WASM_HOST" "$1"
       rc=$?
     else
-      cat "$err" >&2
+      cat "$out"
     fi
-    rm -f "$err"
+    rm -f "$out"
     return "$rc"
   else
     "$1"
