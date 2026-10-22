@@ -84,6 +84,59 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.171.0 (2026-10-22)
+
+### BREAKING CHANGE
+
+- **typer**: a closure that captures a capability now carries that capability's effect in its row, so code that let the closure outlive its handler (returned, stored, sent or spawned) stops compiling; it was a use-after-scope. A closure built from a capability parameter and called inside the same handler is also rejected; capture the handler's own alias instead.
+
+### Fixed
+
+- **typer**: carry a captured capability's effect in the closure's row
+- **runtime**: keep the check runtime in a unit that only names the check summary
+- **runtime**: serve ASCII Char strings from a static table
+- **stdlib**: measure emoji clusters in text.display_width
+- **test**: record the definition line of a const a test reads under coverage
+- **parser**: name a reserved word written where a binder is expected
+- **cli**: map the build directory out of modular C objects
+- **cli**: compile modular C and the LTO probe by relative name so cold release builds are deterministic
+- **typer**: identify the ordering containers by symbol, not by spelling
+- **typer**: report an unordered tuple, Option or Result element at the comparison
+- **runtime**: keep the forwarders the emitter reaches and the names tests rely on
+- **runtime**: KAI_MAX_HEAP caps live bytes process-wide
+- **emit**: a lambda capturing a capability no longer corrupts the evidence node
+- **typer**: an effect operation named without a call is the lambda that performs it
+- **typer**: order lists through the primitive Ord impls and give Bool one
+- **cli**: report diagnostic paths as given in typecheck and the hole reports
+- **mono**: key and name a generic's instances by the unit of a dimensioned type
+
+### Changed
+
+- **emit**: call a declared scalar builtin through its raw entry with the string borrowed
+- **runtime**: keep the stderr wrappers out of line
+- **runtime**: buffered stdin and block-buffered stdout flushed before the process waits
+- **runtime**: keep the libLLVM bridge and the bench and check runtime out of programs that do not call them
+- **runtime**: split runtime.h into cohesive headers under stage2/runtime
+- **emit**: keep the donor-identity rule in the shared arm-top plan
+- **stdlib**: list.length and list.reverse use the runtime builtins
+- **emit**: one back-edge drop, slot-class and donor-identity decision
+- **emit**: one callee classification and held-binder set for unwinding exits
+- **core**: declare the console, file, collection and list-combinator builtins in the core
+- **stdlib**: drop the private trim and zero-pad copies
+- **stdlib**: join and replace through the runtime string join
+- **stdlib**: render Char through the runtime UTF-8 encoder
+- **stdlib**: fold ASCII case in one byte-map allocation
+- **typer**: leave an unorderable container comparison builtin instead of walking for it
+- **typer**: complete pruned bodies through the stream's pre-typing chain
+- **runtime**: keep the capped heap paths out of line
+- **runtime**: declare the allocator size query instead of including its header
+- **runtime**: read a line with getc_unlocked under one lock
+- **runtime**: find a substring with memchr on its first byte
+- **runtime**: count RC alloc/free only when the trace is on
+- **runtime**: share one FNV-1a helper between the string hash and the intern table
+- **runtime**: delete code no production path reaches
+- **emit**: one arm-top reuse plan for both backends
+
 ## v0.170.1 (2026-10-21)
 
 ### Fixed
