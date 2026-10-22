@@ -202,6 +202,22 @@ and its default writes to stderr in ISO-8601 form without a literal
 `docs/effects-stdlib.md`; the runtime implementation rationale and
 the Stage A/B/C trilogy live in `docs/effects.md`.
 
+## Targets — effects a browser `main` cannot perform
+
+`kai build --target=wasm32-browser` builds for a page. A page has no
+processes, sockets, signals, files, stdin or fibers, so a `main` whose
+final row holds `Process`, `Signal`, `NetTcp`, `NetUdp`, `NetUnix`,
+`NetDns`, `File`, `Stdin`, `Spawn`, `Cancel`, `Link`, `Monitor` or `Actor`
+is refused at compile time:
+
+```
+error: `main` performs effect `Process`, which the `wasm32-browser` target cannot run
+```
+
+Handle the effect inside `main` with a handler of your own, or remove it
+from the row. `Clock` is allowed, but `Clock.sleep_ns` stops at run time
+on a page. Host builds pass no target and are unaffected.
+
 ## Handler state — `state` and `log`
 
 A stateful handler (`with State[T](init)`, `with Writer[W]([])`, any

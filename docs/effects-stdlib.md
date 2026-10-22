@@ -120,6 +120,27 @@ exists only when one of these three applies; none is arbitrary.
    loses visibility and cannot verify purity. It uses the row machinery
    as an honesty marker for a trust boundary, not as a dispatch site.
 
+### Which effects a browser `main` may perform
+
+A program built with `--target=wasm32-browser` runs on a page, which has no
+processes, sockets, signals, files, stdin, fibers or blocking waits. The
+compiler refuses, at `main`, any of these effects left in `main`'s final row,
+with a diagnostic naming the effect and the target. An effect closed by a
+`handle` inside `main` never reaches the row, so a program that supplies its
+own handler still builds.
+
+| Effect | Browser `main` | Why |
+|---|---|---|
+| `Stdout`, `Stderr`, `Env`, `Random`, `SecureRandom`, `Log`, `Mutable`, `State`, `Reader`, `Writer` | allowed | the page supplies or the runtime keeps them |
+| `Clock` | allowed | `wall_now` and `monotonic_now` run; `sleep_ns` stops at run time with `kai: this host has no reactor` |
+| `Process`, `Signal` | refused | no processes or signals on a page |
+| `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` | refused | no sockets |
+| `File`, `Stdin` | refused | no file system or stdin |
+| `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | refused | one thread, no fibers |
+
+The check works on rows, not operations, so `Clock` stays allowed as a whole.
+Waits become available with the suspension work of the next phase.
+
 Sections are self-contained; skim the catalog, then dive where
 you care.
 

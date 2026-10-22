@@ -21,6 +21,7 @@
 #
 #   # fixture: test        compile with --test; stdout+stderr is the output
 #   # fixture: no-stdlib   do not pass the stdlib path (the fixture tests its absence)
+#   # fixture: target=<name>  compile for that target (`--target=<name>`)
 #
 # FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
 # through the kai wrapper named by FIXTURE_KAI, which owns the stdlib path and
@@ -77,6 +78,7 @@ run_one() {
   b="build/fx-$slug-$name"
   [ "$BACKEND" = c ] || b="$b-$BACKEND"
   if mark "$f" no-stdlib; then path=; else path="--path ../stdlib"; fi
+  tflag=$(sed -n 's/^# fixture: target=\(.*\)$/--target=\1/p' "$f")
   manifest "$dir" backends | tr ' ' '\n' | grep -qx "$BACKEND" \
     || { echo "fixture-dir: $dir/FIXTURES: does not declare 'backends: $BACKEND'" >&2; exit 2; }
   case $(manifest "$dir" diagnostics) in
@@ -91,7 +93,7 @@ run_one() {
     fi
     compile() { KAI_BACKEND=native "${FIXTURE_KAI:?native needs FIXTURE_KAI}" build "$f" -o "$b" > /dev/null 2> "$b.err"; }
   else
-    compile() { $KAIC2 $TEST_CORE_CACHE $path "$f" > /dev/null 2> "$b.err"; }
+    compile() { $KAIC2 $TEST_CORE_CACHE $path $tflag "$f" > /dev/null 2> "$b.err"; }
   fi
 
   if [ -f "$exp_err" ]; then
@@ -120,7 +122,7 @@ run_one() {
     "./$b" > "$b.out" 2>&1 \
       || { echo "$slug FAIL $name (test run failed)"; cat "$b.out"; exit 1; }
   else
-    $KAIC2 $TEST_CORE_CACHE $path "$f" > "$b.c" \
+    $KAIC2 $TEST_CORE_CACHE $path $tflag "$f" > "$b.c" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
     eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
       || { echo "$slug FAIL $name (C compile failed)"; exit 1; }
