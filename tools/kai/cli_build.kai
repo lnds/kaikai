@@ -6,18 +6,21 @@ import cli_caches
 import cli_compile
 import cli_err
 import cli_fs
+import cli_layout
 import cli_manifest
 import cli_plan
 import cli_proc
 import cli_spec
 import cli_sys
 import cli_toolchain
+import cli_wasm
 
 type Opts = {
   spec: String,
   out: String,
   report: String,
   backend: String,
+  target: String,
   opt: String,
   mode: String,
   strict: Bool,
@@ -30,6 +33,7 @@ fn no_opts() : Opts =
     out: "",
     report: "",
     backend: "",
+    target: "",
     opt: "",
     mode: "",
     strict: false,
@@ -75,11 +79,21 @@ fn report_flag(
     Some(Ok((Opts { ...o, report: a }, rest)))
   }
 
+fn target_name(v: String) : Result[String, Int] / Stderr =
+  if v == cli_wasm.TARGET { Ok(v) } else { cli_err.die("--target must be '#{cli_wasm.TARGET}' (got: #{v})") }
+
 fn build_flag(a: String, rest: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
   if a == "-o" {
     match rest {
       [] -> cli_err.die("-o needs an argument")
       [v, ...more] -> Ok((Opts { ...o, out: v }, more))
+    }
+  } else if string.starts_with(a, "--target=") {
+    target_name(string.drop_prefix(a, "--target=") ?? "") | v => (Opts { ...o, target: v }, rest)
+  } else if a == "--target" {
+    match rest {
+      [] -> cli_err.die("--target needs an argument (#{cli_wasm.TARGET})")
+      [v, ...more] -> target_name(v) | n => (Opts { ...o, target: n }, more)
     }
   } else if string.starts_with(a, "-") {
     let flag = report_flag(a, rest, o) |> or_else(() => common_flag(a, rest, o))
@@ -158,14 +172,42 @@ fn build_binary(t: Toolchain, src: String, o: Opts) : Result[Int, Int] / Stderr 
   export_profile(o)
   let out = if o.out == "" { default_out(src) } else { o.out }
   ensure_out_dir(out)!
-  cli_fs.with_scratch(
-    tmp => build_in(
-      t,
-      b,
-      cli_plan.Job { src, tmp, out, verb: "build", extra: strict_flag(o) },
-      o.mode
+  if o.target == "" {
+    cli_fs.with_scratch(
+      tmp => build_in(
+        t,
+        b,
+        cli_plan.Job { src, tmp, out, verb: "build", extra: strict_flag(o) },
+        o.mode
+      )
     )
-  )
+  } else {
+    build_wasm(t, src, out, o)
+  }
+}
+
+fn wasm_in(l: Layout, w: Toolchain, job: Job, base: String) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  cli_compile.compile(w, cli_plan.Backend { name: "c", explicit: true }, job)!
+  cli_wasm.write_page(l, base)!
+  Ok(0)
+}
+
+# WebAssembly is reached only through the C backend.
+fn build_wasm(t: Toolchain, src: String, out: String, o: Opts) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  if o.backend == "native" or cli_caches.env_or("KAI_BACKEND", "c") == "native" {
+    cli_err.die("--target=#{o.target} builds through the C backend; drop --backend=native")
+  } else {
+    let w = cli_wasm.configure(t)!
+    let base = string.drop_suffix(out, ".wasm") ?? out
+    let job = cli_plan.Job {
+      src,
+      tmp: "",
+      out: "#{base}.wasm",
+      verb: "build",
+      extra: strict_flag(o)
+    }
+    cli_fs.with_scratch(tmp => wasm_in(t.layout, w, cli_plan.Job { ...job, tmp: tmp }, base))
+  }
 }
 
 # `--release` strips the linked binary; a missing `strip` only leaves it larger.
