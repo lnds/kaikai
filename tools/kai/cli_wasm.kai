@@ -1,0 +1,158 @@
+#[doc("The `wasm32-browser` target: the pinned wasi-sdk fetched into the user cache, the toolchain it selects, and the host and page written beside the module.")]
+
+import os.env
+import cli_caches
+import cli_err
+import cli_fs
+import cli_layout
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+#[doc("The spelling of the browser target.")]
+pub const TARGET : String = "wasm32-browser"
+
+const SDK_VERSION : String = "34.0"
+
+const SDK_BASE : String = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34"
+
+# Host platform, then the release asset's sha256.
+const SDK_SHA256 : [(String, String)] = [
+  ("arm64-macos", "9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9"),
+  ("x86_64-macos", "87d27fa8adc68dee59bfbf2e22a6d34ef717c34d6bf1d8af2a56fc929d9ce0eb"),
+  ("arm64-linux", "f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971"),
+  ("x86_64-linux", "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4")
+]
+
+const WASM_CFLAGS : [String] = [
+  "--target=wasm32-wasip1", "-Wno-unused-command-line-argument", "-mexception-handling", "-mllvm", "-wasm-enable-sjlj", "-mllvm",
+  "-wasm-use-legacy-eh=false", "-D_WASI_EMULATED_SIGNAL", "-D_WASI_EMULATED_MMAN",
+  "-D_WASI_EMULATED_PROCESS_CLOCKS", "-D_WASI_EMULATED_GETPID", "-D_DEFAULT_SOURCE",
+  "-lwasi-emulated-signal", "-lwasi-emulated-mman", "-lwasi-emulated-process-clocks",
+  "-lwasi-emulated-getpid", "-lsetjmp"
+]
+
+fn host_platform() : String / Ffi {
+  let arch = match cli_sys.uname_m() {
+    "aarch64" -> "arm64"
+    a -> a
+  }
+  let os = match cli_sys.uname_s() {
+    "Darwin" -> "macos"
+    "Linux" -> "linux"
+    o -> o
+  }
+  "#{arch}-#{os}"
+}
+
+fn pinned(platform: String) : Option[String] =
+  SDK_SHA256 |> find(e => e.fst == platform) | (e => e.snd)
+
+fn sdk_name(platform: String) : String = "wasi-sdk-#{SDK_VERSION}-#{platform}"
+
+fn sha256_of(file: String) : String / Ffi {
+  let h = cli_sys.sha_new()
+  let _ = cli_sys.sha_file(h, file)
+  cli_sys.sha_hex(h)
+}
+
+fn download(url: String, file: String) : Result[Unit, Int] / Stderr + Ffi =
+  if cli_proc.run(["curl", "-fSL", "--retry", "3", "-o", file, url], cli_proc.inherit()) == 0 {
+    Ok(())
+  } else {
+    cli_err.die("cannot download the wasm32-browser toolchain from #{url} (set KAI_WASI_SDK to a wasi-sdk #{SDK_VERSION} directory to use one you installed)")
+  }
+
+fn verify(file: String, want: String) : Result[Unit, Int] / Stderr + Ffi {
+  let got = sha256_of(file)
+  if got == want {
+    Ok(())
+  } else {
+    cli_err.die("the wasi-sdk archive does not match its pinned checksum: expected #{want}, got #{got}; refusing to use it")
+  }
+}
+
+fn unpack(archive: String, into: String) : Result[Unit, Int] / Stderr + Ffi =
+  if cli_proc.run(["tar", "xzf", archive, "-C", into], cli_proc.inherit()) == 0 {
+    Ok(())
+  } else {
+    cli_err.die("cannot unpack #{archive}")
+  }
+
+fn fetch(platform: String, want: String, dir: String) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let url = cli_caches.env_or("KAI_WASI_SDK_URL", "#{SDK_BASE}/#{sdk_name(platform)}.tar.gz")
+  let part = "#{dir}.part.#{cli_sys.getpid()}"
+  let archive = "#{part}/sdk.tar.gz"
+  let _ = cli_sys.remove_tree(part)
+  if not cli_fs.mkdir_p(part) {
+    cli_err.die("cannot create #{part}")
+  } else {
+    Stderr.eprint("kai: fetching wasi-sdk #{SDK_VERSION} for #{TARGET} into #{dir}")
+    let r = download(url, archive)
+    let r2 = if is_ok(r) { verify(archive, want) } else { r }
+    let r3 = if is_ok(r2) { unpack(archive, part) } else { r2 }
+    let moved = is_ok(r3) and (file_rename("#{part}/#{sdk_name(platform)}", dir) |> is_ok())
+    let _ = cli_sys.remove_tree(part)
+    if moved { Ok(()) } else if is_ok(r3) { cli_err.die("cannot install the wasi-sdk into #{dir}") } else { r3 }
+  }
+}
+
+fn sdk_dir(t: Toolchain) : Result[String, Int] / Stderr + Env + File + Ffi =
+  match env.get("KAI_WASI_SDK") {
+    Some(d) if d != "" -> if cli_sys.is_exec("#{d}/bin/clang") {
+      Ok(d)
+    } else {
+      cli_err.die("KAI_WASI_SDK=#{d} has no bin/clang")
+    }
+    _ -> {
+      let platform = host_platform()
+      match pinned(platform) {
+        None -> cli_err.die("no wasi-sdk #{SDK_VERSION} is pinned for #{platform}; set KAI_WASI_SDK to one you installed")
+        Some(want) -> {
+          let dir = "#{cli_caches.base(t.os)}/wasi-sdk/#{sdk_name(platform)}"
+          if cli_sys.is_exec("#{dir}/bin/clang") { Ok(dir) } else { fetch(platform, want, dir) | done => dir }
+        }
+      }
+    }
+  }
+
+#[doc("The toolchain for the browser target: the pinned wasi-sdk's clang and flags, fetched into the user cache on first use.")]
+pub fn configure(t: Toolchain) : Result[Toolchain, Int] / Stderr + Env + File + Ffi {
+  let dir = sdk_dir(t)!
+  let cflags = t.cflags ++ WASM_CFLAGS
+  Ok(Toolchain {
+    ...t,
+    cc: "#{dir}/bin/clang",
+    cflags: cflags,
+    cflags_compile: cli_toolchain.compile_flags(cflags),
+    cflags_from_env: true,
+    target: TARGET
+  })
+}
+
+#[doc("The `nm` that reads the target's objects: the sdk's own.")]
+pub fn nm(t: Toolchain) : String = "#{cli_fs.dirname(t.cc)}/llvm-nm"
+
+fn host_file(l: Layout) : String =
+  if l.dev { "#{l.root}/stage2/web/kai_host.mjs" } else { "#{l.root}/share/kaikai/web/kai_host.mjs" }
+
+fn html_escape(s: String) : String =
+  s |> string.replace("&", "&amp;") |> string.replace("<", "&lt;")
+
+#[doc("Write `kai_host.mjs`, `<base>.mjs` (it runs `<base>.wasm` on the host) and `<base>.html` beside the module.")]
+pub fn write_page(l: Layout, base: String) : Result[Unit, Int] / Stderr + File + Ffi {
+  let name = cli_fs.basename(base)
+  let host = host_file(l)
+  let dir = cli_fs.dirname(base)
+  let mjs = "import { run } from \"./kai_host.mjs\";\nrun(new URL(\"#{name}.wasm\", import.meta.url));\n"
+  let html = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>#{html_escape(name)}</title>\n<pre id=\"kai-stdout\"></pre>\n<script type=\"module\" src=\"#{name}.mjs\"></script>\n"
+  if not cli_sys.is_file(host) {
+    cli_err.die("the web host #{host} is missing")
+  } else if cli_fs.copy(host, "#{dir}/kai_host.mjs")
+    and is_ok(write_file("#{base}.mjs", mjs))
+    and is_ok(write_file("#{base}.html", html)) {
+    Ok(())
+  } else {
+    cli_err.die("cannot write the page beside #{base}.wasm")
+  }
+}

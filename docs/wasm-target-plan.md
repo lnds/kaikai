@@ -874,8 +874,9 @@ What each kind of runner is honest for:
   `share/kaikai/web`); a new `tools/test-web.sh`; `tier1.yml`; a new
   `docs/info/wasm.md`.
 - *Does*: `kai build --target=wasm32-browser app.kai -o out/app` writes
-  `app.wasm`, `app.mjs` (the host, with the module's name in it) and
-  `app.html` (a `<pre id="kai-stdout">` and one module script). The host
+  `app.wasm`, `app.mjs` (two lines: it imports `run` from the `kai_host.mjs`
+  copied beside it and runs `app.wasm`) and `app.html` (a
+  `<pre id="kai-stdout">` and one module script). The host
   line-buffers fd 1 and 2 to `console.log` and `console.error` and appends
   the same text to the element when it exists. The first build for the
   target fetches the pinned toolchain into the user cache and verifies its

@@ -27,6 +27,7 @@
 #       include/runtime.h, include/runtime/
 #       demos/baseline.txt
 #       info/...                   # `kai info` reference pages
+#       web/kai_host.mjs           # the browser host `kai build --target=wasm32-browser` copies
 #       REQUIRES                   # Linux: the glibc and libstdc++ it needs
 #     README.md
 #     LICENSE
@@ -71,7 +72,8 @@ mkdir -p "$STAGE/bin" \
          "$STAGE/share/kaikai/stdlib" \
          "$STAGE/share/kaikai/include" \
          "$STAGE/share/kaikai/demos" \
-         "$STAGE/share/kaikai/info"
+         "$STAGE/share/kaikai/info" \
+         "$STAGE/share/kaikai/web"
 
 # Static libLLVM for the in-process native backend (Lane 1.5 flip: native
 # is the DEFAULT `kai build` destination, so the shipped kaic2 MUST carry
@@ -242,6 +244,10 @@ fi
 if [ -d docs/info ]; then
   (cd docs/info && tar -cf - .) | (cd "$STAGE/share/kaikai/info" && tar -xf -)
 fi
+
+# The browser host the wasm32-browser target ships beside every module.
+cp stage2/web/kai_host.mjs "$STAGE/share/kaikai/web/kai_host.mjs"
+[ -s "$STAGE/share/kaikai/web/kai_host.mjs" ] || { echo "build-release: web host missing from the stage" >&2; exit 1; }
 
 # User-visible docs.
 cp README.md           "$STAGE/README.md"
