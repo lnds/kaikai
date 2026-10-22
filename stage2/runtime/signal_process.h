@@ -705,13 +705,14 @@ static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, Kai
 static KaiValue *kai_default_process_uid(void *self, KaiCont *k) { kai_host_absent("processes"); }
 #endif
 
-/* exit(code) -> Nothing. _exit(2) — skip libc atexit / stdio flush
- * to match the doc spec contract. The `: Nothing` return type is
+/* exit(code) -> Nothing. _exit(2) skips libc atexit; buffered stdout is
+ * flushed first. The `: Nothing` return type is
  * load-bearing: we never resume k. */
 static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
     (void) self;
     (void) k;
     int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
+    kai_flush_stdout();
     _exit(c);
     /* unreachable */
     return NULL;
