@@ -11488,6 +11488,10 @@ test-build-modes: $(TARGET) bin-kai build
 test-build-out-dir: $(TARGET) bin-kai build
 	@../tools/test-build-out-dir.sh ../bin/kai
 
+# Two cold `--release` builds of one program leave identical caches (ThinLTO entries included).
+test-release-determinism: $(TARGET) bin-kai build
+	@../tools/test-release-determinism.sh ../bin/kai
+
 # Native codegen quality. Pins the spill ratio in the rb-tree descent's hot
 # loop, the one signal that catches a register-allocation regression: such a
 # change keeps the program correct, the self-host byte-identical and
