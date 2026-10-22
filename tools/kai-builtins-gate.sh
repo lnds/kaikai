@@ -14,7 +14,12 @@
 #               and each `kaix_core_<name>` (against stage0/runtime_llvm.c)
 #               to a `KaiValue *(*)(KaiValue *, ...)` of the declared arity,
 #               compiled with -Werror: a missing entry, another arity or a
-#               void return fails to compile.
+#               void return fails to compile. A line ending `raw=<params>><ret>`
+#               (`i` an int64_t, `b` a KaiValue *, as the compiler's raw table
+#               gives it) also binds `<symbol>_raw` and `kaix_core_<name>_raw` to
+#               that exact shape. A `raw!=` line, a table shape contradicting the
+#               declaration, fails outright; and every `_raw` entry the runtime
+#               defines must be a manifest line, so the table cannot drift.
 #
 # `--self-test` declares builtins in a scratch copy of the core modules and
 # asserts the manifest check rejects any new declaration, the prototype
@@ -39,6 +44,18 @@ proto_unit() {
     local entry="$sym"
     [ -n "$3" ] && entry="$3$name"
     echo "KaiValue *(*const kai_builtin_proto_${name})($params) = $entry;"
+    case "$sig" in
+      *" raw="*)
+        local shape="${sig##* raw=}" rparams="" rret="" ch
+        local pshape="${shape%%>*}" rshape="${shape##*>}"
+        for ((i = 0; i < ${#pshape}; i++)); do
+          ch="${pshape:$i:1}"
+          case "$ch" in i) rparams="$rparams${rparams:+, }int64_t" ;; *) rparams="$rparams${rparams:+, }KaiValue *" ;; esac
+        done
+        [ -z "$rparams" ] && rparams="void"
+        case "$rshape" in i) rret="int64_t" ;; *) rret="KaiValue *" ;; esac
+        echo "$rret (*const kai_builtin_raw_${name})($rparams) = ${entry}_raw;" ;;
+    esac
     case "$sym" in
       kai_core_*)
         local thunk="_${sym}_thunk"
@@ -59,6 +76,21 @@ prototypes() {
       -I stage2 -I stage0 "$tmp/$u.c" 2>&1 || rc=1
   done
   rm -rf "$tmp"
+  return $rc
+}
+
+# raw_symmetry <manifest>: every `<symbol>_raw` / `kaix_core_<name>_raw` the runtime defines has
+# a manifest line carrying `raw=`, so a raw entry cannot exist without the compiler knowing it.
+raw_symmetry() {
+  local rc=0 sym
+  for sym in $(grep -ho 'kai_core_[a-z0-9_]*_raw(' stage2/runtime.h stage2/runtime/*.h | tr -d '(' | sort -u); do
+    grep -q " ${sym%_raw} .* raw=" "$1" || { echo "raw entry $sym has no manifest line with raw="; rc=1; }
+  done
+  for sym in $(grep -ho 'kaix_core_[a-z0-9_]*_raw(' stage0/runtime_llvm.c | tr -d '(' | sort -u); do
+    local name=${sym#kaix_core_}; name=${name%_raw}
+    grep -q "^$name .* raw=" "$1" || { echo "native raw entry $sym has no manifest line with raw="; rc=1; }
+  done
+  if grep -q ' raw!=' "$1"; then grep ' raw!=' "$1"; echo "a raw shape contradicts its declaration"; rc=1; fi
   return $rc
 }
 
@@ -113,6 +145,11 @@ if ! diff -u "$BASELINE" "$rows"; then
 fi
 if ! out=$(prototypes "$rows"); then
   echo "kai-builtins FAIL — a declared builtin's runtime entry does not match its declaration:"
+  echo "$out"
+  exit 1
+fi
+if ! out=$(raw_symmetry "$rows"); then
+  echo "kai-builtins FAIL — the raw entries and the manifest disagree:"
   echo "$out"
   exit 1
 fi

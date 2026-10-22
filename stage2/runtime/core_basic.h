@@ -939,9 +939,12 @@ static KaiValue *kai_core_real_is_inf(KaiValue *x) {
 
 /* ---------- core: strings ---------- */
 
+static inline int64_t kai_core_string_length_raw(KaiValue *s) {
+    return (kai_is_ptr(s) && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
+}
+
 static KaiValue *kai_core_string_length(KaiValue *s) {
-    int64_t n = (kai_is_ptr(s) && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
-    KaiValue *r = kai_int(n);
+    KaiValue *r = kai_int(kai_core_string_length_raw(s));
     if (s) kai_decref(s);
     return r;
 }
