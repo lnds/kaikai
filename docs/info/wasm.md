@@ -42,8 +42,10 @@ Safari 18.4. A program that spawns a fiber or keeps a continuation also
 needs JSPI (Chrome and Edge 137, Firefox 153, Safari 27); the host refuses
 to load it on an engine without.
 
-Not available on the page: sockets, processes, signals and the reactor
-(sleeps, `File`, `Stdin`). Non-tail recursion is limited by the engine's stack, about 6 000
+Sleeps and `receive_timeout` park on the page's event loop, so the page stays
+responsive; a sleep of one frame or less wakes on the next animation frame.
+Not available on the page: sockets, processes, signals and the reactor's
+poll (`File`, `Stdin`). Non-tail recursion is limited by the engine's stack, about 6 000
 frames in Chrome.
 
 ## Flags

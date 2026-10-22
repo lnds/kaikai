@@ -57,7 +57,7 @@ const refuse = () => { throw new Error(NO_JSPI); };
 // Contexts are WebAssembly stacks the host keeps suspended. The running one
 // suspends in `ctx_switch`; the host then starts or wakes the target. One
 // context runs at a time.
-function suspension(getInstance) {
+function suspension(getInstance, events) {
   const waiting = new Map();
   const entries = new Map();
   let fail;
@@ -82,6 +82,7 @@ function suspension(getInstance) {
     failed,
     imports: {
       needs_suspension: () => {},
+      wait_until: new WebAssembly.Suspending((deadlineMs) => events.wait(deadlineMs)),
       ctx_switch: new WebAssembly.Suspending((from, to, sp, fn) => {
         const parked = new Promise((resolve) => waiting.set(from, resolve));
         dispatch(to, sp, fn);
@@ -95,8 +96,63 @@ function suspension(getInstance) {
   };
 }
 
+const FRAME_MS = 1000 / 60;
+const FRAME_SLACK_MS = FRAME_MS / 2;
+const FRAME_FALLBACK_MS = 50;
+
+// Host events: the page posts values, the program drains them, and a post wakes a
+// wait the program is parked in. A post made while no wait is pending is latched,
+// so the next wait returns at once.
+export function hostEvents() {
+  const queue = [];
+  let wake = null;
+  let latched = false;
+  const nudge = () => {
+    if (wake) wake();
+    else latched = true;
+  };
+  return {
+    post(event) {
+      queue.push(event);
+      nudge();
+    },
+    take: () => queue.splice(0),
+    wait(deadlineMs) {
+      if (latched) {
+        latched = false;
+        return Promise.resolve(0);
+      }
+      return new Promise((resolve) => {
+        const timers = [];
+        let frame = 0;
+        const done = (slack) => {
+          timers.forEach(clearTimeout);
+          if (frame) cancelAnimationFrame(frame);
+          wake = null;
+          resolve(slack);
+        };
+        wake = () => done(0);
+        const delay = deadlineMs < 0 ? Infinity : Math.max(0, deadlineMs - performance.now());
+        if (delay <= FRAME_MS && typeof requestAnimationFrame === "function") {
+          // A deadline within one frame waits for the frame, so a 16 ms loop
+          // lands on every vsync instead of drifting past it.
+          const onFrame = (ts) => {
+            if (ts >= deadlineMs - FRAME_SLACK_MS) done(Math.max(0, deadlineMs - ts));
+            else frame = requestAnimationFrame(onFrame);
+          };
+          frame = requestAnimationFrame(onFrame);
+          timers.push(setTimeout(() => done(0), delay + FRAME_FALLBACK_MS));
+        } else if (delay !== Infinity) {
+          timers.push(setTimeout(() => done(0), delay));
+        }
+      });
+    },
+  };
+}
+
 export async function run(wasm, opts = {}) {
   const args = opts.args ?? [];
+  const events = opts.events ?? hostEvents();
   const env = { KAI_THREADS: "1", ...(opts.env ?? {}) };
   const target =
     opts.element ??
@@ -197,10 +253,10 @@ export async function run(wasm, opts = {}) {
     throw new Error(NO_JSPI);
   }
   let instance;
-  const contexts = hasSuspending ? suspension(() => instance) : null;
+  const contexts = hasSuspending ? suspension(() => instance, events) : null;
   instance = await WebAssembly.instantiate(module, {
     wasi_snapshot_preview1: wasi,
-    kai: contexts ? contexts.imports : { needs_suspension: refuse, ctx_switch: refuse, ctx_exit: refuse },
+    kai: contexts ? contexts.imports : { needs_suspension: refuse, wait_until: refuse, ctx_switch: refuse, ctx_exit: refuse },
   });
   memory = instance.exports.memory;
 

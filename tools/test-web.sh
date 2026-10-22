@@ -81,6 +81,33 @@ run_node() {
   done
 }
 
+# A fixture with a .ticks.expected sleeps while a host timer ticks every 5 ms: the timeline
+# must show the ticks between the program's lines, under node and in each browser.
+collapse_ticks() {
+  awk '
+    function flush() { if (n >= 3) print "ticks"; else if (n > 0) print "few ticks"; n = 0 }
+    $0 == "tick" { n++; next }
+    { flush(); print }
+    END { flush() }
+  '
+}
+
+run_ticks_node() {
+  for f in "${FIXTURES[@]}"; do
+    n="$(basename "$f" .kai)"
+    [ -f "${f%.kai}.ticks.expected" ] && [ -f "$TMP/out/$n.wasm" ] || continue
+    node --experimental-wasm-exnref --experimental-wasm-jspi "$ROOT/tools/web-ticks.mjs" "$TMP/out/$n.wasm" 2>/dev/null \
+      | collapse_ticks >"$TMP/$n.ticks.node"
+    compare "$n ticks" node "$TMP/$n.ticks.node" "${f%.kai}.ticks.expected"
+  done
+}
+
+# The page gets a ticker that writes into the element the program prints to.
+ticker_page() { # name
+  sed 's|<script type="module"|<script>setInterval(() => { document.getElementById("kai-stdout").textContent += "tick\\n"; }, 5);</script>\
+&|' "$TMP/out/$1.html" >"$TMP/out/$1.ticks.html"
+}
+
 serve() {
   python3 -m http.server 8765 --bind 127.0.0.1 --directory "$TMP/out" >/dev/null 2>&1 &
   SERVER=$!
@@ -100,6 +127,11 @@ run_browsers() {
         continue
       fi
       compare "$n" "$b" "$TMP/$n.$b" "${f%.kai}.out.expected"
+      [ -f "${f%.kai}.ticks.expected" ] || continue
+      ticker_page "$n"
+      python3 -I "$ROOT/tools/web-driver.py" "$b" "http://127.0.0.1:8765/$n.ticks.html" 2>"$TMP/$n.$b.err" \
+        | collapse_ticks >"$TMP/$n.ticks.$b"
+      compare "$n ticks" "$b" "$TMP/$n.ticks.$b" "${f%.kai}.ticks.expected"
     done
   done
 }
@@ -158,6 +190,7 @@ build_all
 [ -f "$TMP/build-$(basename "${FIXTURES[0]}" .kai).err" ] && grep -q "fetching wasi-sdk" "$TMP/build-$(basename "${FIXTURES[0]}" .kai).err" \
   && say "ok:   toolchain fetched from an empty cache"
 run_node
+run_ticks_node
 run_browsers
 check_wrong_checksum
 check_refusal_fails
