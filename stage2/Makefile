@@ -13607,7 +13607,7 @@ test-modular-build-case-%: $(TARGET) build
 # test-modular-build, which links the widest set of runtime modules.
 MODULAR_SHARED_SYMS = kai_singleton_unit kai_singleton_nil kai_str_intern_table \
                       kai_char_cache kai_byte_cache kai_worker kai_worker_here kai_arena_sp \
-                      kai_heap_committed kai_next_handler_id
+                      kai_heap_live kai_next_handler_id
 test-modular-identity: test-modular-build
 	@set -e; \
 	bin=build/modular-6.bin; \
