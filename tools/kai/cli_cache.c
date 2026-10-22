@@ -20,8 +20,9 @@
 int kaicli_refresh(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
-    if (time(NULL) - st.st_mtime < REFRESH_AFTER) return 1;
-    return utimensat(AT_FDCWD, path, NULL, 0) == 0;
+    if (time(NULL) - st.st_mtime >= REFRESH_AFTER)
+        (void) utimensat(AT_FDCWD, path, NULL, 0);
+    return 1;
 }
 
 static int64_t tree_total;
