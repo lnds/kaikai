@@ -24,10 +24,16 @@ if [ -z "${KAI_WASI_SDK:-}" ]; then
   export XDG_CACHE_HOME="$TMP/cache"
 fi
 
+# Fixtures of the parity corpus the page cannot run: the target refuses them at build time.
+UNSUPPORTED="web_spawn web_resume_kept"
+
 if [ $# -gt 0 ]; then
   FIXTURES=("$@")
 else
-  FIXTURES=("$ROOT"/examples/web/*.kai)
+  FIXTURES=()
+  for f in "$ROOT"/examples/web/*.kai; do
+    case " $UNSUPPORTED " in *" $(basename "$f" .kai) "*) ;; *) FIXTURES+=("$f") ;; esac
+  done
 fi
 
 if [ -z "${BROWSERS+x}" ]; then
@@ -45,8 +51,14 @@ compare() { # name leg actual-file expected-file
   fi
 }
 
-node_args() {
-  if node -e 'process.exit(WebAssembly.JSTag ? 0 : 1)' 2>/dev/null; then :; else say "--experimental-wasm-exnref"; fi
+# node before 24.15 needs a flag for exception handling with exnref.
+run_module() {
+  node "$1" 2>"$TMP/node.err" && return 0
+  if grep -q "experimental-wasm-exnref" "$TMP/node.err"; then
+    node --experimental-wasm-exnref "$1" 2>/dev/null
+  else
+    return 1
+  fi
 }
 
 build_all() {
@@ -64,8 +76,7 @@ run_node() {
   for f in "${FIXTURES[@]}"; do
     n="$(basename "$f" .kai)"
     [ -f "$TMP/out/$n.mjs" ] || continue
-    # shellcheck disable=SC2046
-    node $(node_args) "$TMP/out/$n.mjs" >"$TMP/$n.node" 2>/dev/null
+    run_module "$TMP/out/$n.mjs" >"$TMP/$n.node"
     compare "$n" node "$TMP/$n.node" "${f%.kai}.out.expected"
   done
 }
