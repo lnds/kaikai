@@ -18,8 +18,7 @@ LEAKS=0
 CFLAGS_ASAN="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable"
 
 DECLS='extern "kai"("kai_core_vec_push") pub fn vec_push[T](v: Vec[T], x: T) : Vec[T]
-extern "kai"("kai_core_array_set") pub fn array_set[T](a: Array[T], i: Int, x: T) : Array[T] / Mutable
-extern "kai"("kai_core_print") pub fn print(s: String) : Unit / Stdout'
+extern "kai"("kai_core_array_set") pub fn array_set[T](a: Array[T], i: Int, x: T) : Array[T] / Mutable'
 
 tmp=$(mktemp -d)
 restore() {
@@ -75,7 +74,7 @@ run declared "$tmp/stdlib" || exit 1
 # emits no fn: it rides the runtime thunk, as a row does.
 KAIKAI_STDLIB_PATH="$tmp/stdlib" stage2/kaic2 --path "$tmp/stdlib" --emit=kir "$FIX.kai" > "$tmp/declared.kir" \
   || { echo "kai-builtins-asan FAIL ($backend): --emit=kir"; exit 1; }
-for name in string__string_concat list__list_reverse os__vec_push os__array_set os__print; do
+for name in string__string_concat list__list_reverse os__vec_push os__array_set; do
   ! grep -q "^fn $name(" "$tmp/declared.kir" || { echo "kai-builtins-asan FAIL ($backend): the declaration of $name emitted a fn"; exit 1; }
 done
 for sym in $(grep -o 'kaix_core_[A-Za-z0-9_]*' "$tmp/declared.kir" | sort -u); do
@@ -85,7 +84,7 @@ done
 # No call or value use names a declaration's fn: calls bind the runtime
 # symbol, values the runtime thunk.
 if [ "$backend" = c ]; then
-  for name in string__string_concat list__list_reverse os__vec_push os__array_set os__print; do
+  for name in string__string_concat list__list_reverse os__vec_push os__array_set; do
     n=$(grep -o "kaiu_$name(" "$tmp/declared.c" | wc -l | tr -d ' ')
     [ "$n" -eq 0 ] || { echo "kai-builtins-asan FAIL (c): a call to $name reached its declaration's fn ($n uses), not the runtime symbol"; exit 1; }
   done

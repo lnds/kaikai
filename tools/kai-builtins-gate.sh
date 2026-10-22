@@ -79,9 +79,9 @@ scratch_core() {
 self_test() {
   local tmp rc=0
   tmp=$(mktemp -d)
-  scratch_core "$tmp/good" 'extern "kai"("kai_core_stdlib_path") pub fn stdlib_path() : String'
-  scratch_core "$tmp/arity" 'extern "kai"("kai_core_stdlib_path") pub fn stdlib_path(a: String) : String'
-  scratch_core "$tmp/native" 'extern "kai"("kai_core_stdlib_path") pub fn kai_no_native_entry() : String'
+  scratch_core "$tmp/good" 'extern "kai"("kai_core_vec_empty") pub fn vec_empty[a]() : Vec[a]'
+  scratch_core "$tmp/arity" 'extern "kai"("kai_core_vec_empty") pub fn vec_empty[a](x: Int) : Vec[a]'
+  scratch_core "$tmp/native" 'extern "kai"("kai_core_vec_empty") pub fn kai_no_native_entry[a]() : Vec[a]'
   mkdir -p "$tmp/m"
   manifest "$tmp/good/stdlib" > "$tmp/m/good" || { echo "kai-builtins self-test FAIL — kaic2 rejected a core declaration"; rc=1; }
   if diff -q "$BASELINE" "$tmp/m/good" > /dev/null; then
