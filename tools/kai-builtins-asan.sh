@@ -78,7 +78,7 @@ for name in string__string_concat list__list_reverse os__vec_push os__array_set;
   ! grep -q "^fn $name(" "$tmp/declared.kir" || { echo "kai-builtins-asan FAIL ($backend): the declaration of $name emitted a fn"; exit 1; }
 done
 for sym in $(grep -o 'kaix_core_[A-Za-z0-9_]*' "$tmp/declared.kir" | sort -u); do
-  grep -q "^KaiValue \*$sym(" stage0/runtime_llvm.c || { echo "kai-builtins-asan FAIL ($backend): a call binds $sym, which the native runtime does not define"; exit 1; }
+  grep -qE "^(KaiValue \*|int64_t )$sym\(" stage0/runtime_llvm.c || { echo "kai-builtins-asan FAIL ($backend): a call binds $sym, which the native runtime does not define"; exit 1; }
 done
 
 # No call or value use names a declaration's fn: calls bind the runtime
