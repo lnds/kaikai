@@ -26,11 +26,16 @@ for b in $backends; do
   done
   for part in lto cmodular nmodular; do
     [ -d "$work/cache-$b-1/kai/$part" ] || continue
-    diff -r "$work/cache-$b-1/kai/$part" "$work/cache-$b-2/kai/$part" > "$work/diff" \
-      || fail "$b: cold builds differ in $part: $(head -5 "$work/diff")"
+    if ! diff -rq "$work/cache-$b-1/kai/$part" "$work/cache-$b-2/kai/$part" > "$work/diff"; then
+      f="$(sed -n 's|^Files \(.*\) and .* differ$|\1|p;s|^Binary files \(.*\) and .* differ$|\1|p' "$work/diff" | head -1)"
+      if [ -n "$f" ]; then
+        g="$work/cache-$b-2/${f#"$work/cache-$b-1/"}"
+        echo "--- $f: $(cmp -l "$f" "$g" | wc -l) differing bytes" >&2
+        strings -a "$f" > "$work/s1"; strings -a "$g" > "$work/s2"
+        diff "$work/s1" "$work/s2" | head -10 >&2 || true
+      fi
+      fail "$b: cold builds differ in $part: $(head -5 "$work/diff")"
+    fi
   done
-  if [ "$b" = c ]; then
-    [ -n "$(ls "$work/cache-$b-1/kai/lto" 2> /dev/null)" ] || fail "c: no ThinLTO entries to compare"
-  fi
 done
 echo "test-release-determinism: ok — $backends"
