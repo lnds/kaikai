@@ -1285,6 +1285,7 @@ KaiValue *kaix_core_real_to_int(KaiValue *v)             { return kai_core_real_
 KaiValue *kaix_core_string_to_int(KaiValue *s)           { return kai_core_string_to_int(s); }
 KaiValue *kaix_core_string_to_real(KaiValue *s)          { return kai_core_string_to_real(s); }
 KaiValue *kaix_core_string_length(KaiValue *s)           { return kai_core_string_length(s); }
+int64_t kaix_core_string_length_raw(KaiValue *s)         { return kai_core_string_length_raw(s); }
 KaiValue *kaix_core_string_concat(KaiValue *a, KaiValue *b) { return kai_core_string_concat(a, b); }
 KaiValue *kaix_core_string_concat_all(KaiValue *xs)         { return kai_core_string_concat_all(xs); }
 KaiValue *kaix_core_string_join(KaiValue *xs, KaiValue *sep){ return kai_core_string_join(xs, sep); }
@@ -1300,6 +1301,7 @@ KaiValue *kaix_core_int_to_char(KaiValue *i)                { return kai_core_in
 KaiValue *kaix_core_char_to_string(KaiValue *c)             { return kai_core_char_to_string(c); }
 KaiValue *kaix_core_int_to_byte_string(KaiValue *i)         { return kai_core_int_to_byte_string(i); }
 KaiValue *kaix_core_string_byte_at_int(KaiValue *s, KaiValue *i) { return kai_core_string_byte_at_int(s, i); }
+int64_t kaix_core_string_byte_at_int_raw(KaiValue *s, int64_t i) { return kai_core_string_byte_at_int_raw(s, i); }
 KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off)  { return kai_core_string_cp_at(s, off); }
 KaiValue *kaix_core_string_cp_len(KaiValue *s, KaiValue *off) { return kai_core_string_cp_len(s, off); }
 KaiValue *kaix_core_string_reverse(KaiValue *s)            { return kai_core_string_reverse(s); }

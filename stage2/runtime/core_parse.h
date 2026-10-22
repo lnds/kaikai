@@ -372,14 +372,16 @@ static KaiValue *kai_core_int_to_le8(KaiValue *n) {
  * + tag check). The KAB2 cache decoder (#592) calls this ~1M times
  * per warm load; replacing Option-wrapped char_at cuts decoder wall
  * from ~0.26s to under 0.04s. */
-static KaiValue *kai_core_string_byte_at_int(KaiValue *s, KaiValue *i) {
+static inline int64_t kai_core_string_byte_at_int_raw(KaiValue *s, int64_t idx) {
     int64_t v = -1;
-    if (s && s->tag == KAI_STR && i && kai_is_int(i)) {
-        int64_t idx = kai_intf(i);
-        if (idx >= 0 && (size_t) idx < s->as.s.len) {
-            v = (int64_t)(unsigned char) s->as.s.bytes[idx];
-        }
+    if (s && s->tag == KAI_STR && idx >= 0 && (size_t) idx < s->as.s.len) {
+        v = (int64_t)(unsigned char) s->as.s.bytes[idx];
     }
+    return v;
+}
+
+static KaiValue *kai_core_string_byte_at_int(KaiValue *s, KaiValue *i) {
+    int64_t v = kai_core_string_byte_at_int_raw(s, (i && kai_is_int(i)) ? kai_intf(i) : -1);
     if (s) kai_decref(s);
     if (i) kai_decref(i);
     return kai_int(v);
