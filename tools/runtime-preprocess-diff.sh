@@ -44,7 +44,8 @@ fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/kai-rt-pp.XXXXXX")"
 trap 'rm -rf "$work"' EXIT INT TERM
 mkdir -p "$work/base/stage0" "$work/base/stage2"
-for f in stage2/runtime.h stage2/runtime_owner_c.c stage0/runtime_llvm.c; do
+for f in stage2/runtime.h stage2/runtime_owner_c.c stage0/runtime_llvm.c $(git ls-tree -r --name-only "$base" stage2/runtime/); do
+  mkdir -p "$work/base/$(dirname "$f")"
   git show "$base:$f" > "$work/base/$f"
 done
 
@@ -52,7 +53,7 @@ done
 # path, as in every build.
 preprocess() {
   tree="$1"; tu="$2"; shift 2
-  "$CC" -std=c99 -E -P -I "$tree/stage2" -I "$tree/stage0" "$@" "$tree/$tu" | grep -v '^[[:space:]]*$'
+  "$CC" -std=c99 -E -P -I "$tree/stage2" -I "$tree/stage0" "$@" "$tree/$tu" | sed 's/^[[:space:]]*//' | grep -v '^$'
 }
 
 SEP="-DKAI_SEPARATE_COMPILATION=1"

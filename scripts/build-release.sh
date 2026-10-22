@@ -14,7 +14,7 @@
 # Outputs:
 #   dist/kaikai-v<VERSION>-<os>-<arch>.tar.gz
 #   dist/kaikai-v<VERSION>-<os>-<arch>.tar.gz.sha256
-#   dist/bootstrap-seed-v<VERSION>/bootstrap/{stage2.c,runtime.h}
+#   dist/bootstrap-seed-v<VERSION>/bootstrap/{stage2.c,runtime.h,runtime/}
 #
 # Layout inside the tarball:
 #   kaikai-v<VERSION>-<os>-<arch>/
@@ -24,7 +24,7 @@
 #       VERSION
 #       EDITION
 #       stdlib/...
-#       include/runtime.h
+#       include/runtime.h, include/runtime/
 #       demos/baseline.txt
 #       info/...                   # `kai info` reference pages
 #       REQUIRES                   # Linux: the glibc and libstdc++ it needs
@@ -130,6 +130,7 @@ rm -rf "$SEED"
 mkdir -p "$SEED/bootstrap"
 cp stage2/build/kaic2b.c "$SEED/bootstrap/stage2.c"
 cp stage2/runtime.h      "$SEED/bootstrap/runtime.h"
+cp -R stage2/runtime     "$SEED/bootstrap/runtime"
 make -s -C stage2 boot-hop HOP_C="$SEED/bootstrap/stage2.c" HOP_BIN="$SEED/kaic2" HOP_INC="$SEED/bootstrap" >&2
 (cd stage2 && KAIKAI_STDLIB_PATH="$ROOT/stdlib" "$SEED/kaic2" --edition "$(cat ../EDITION)" main.kai) > "$SEED/self.c"
 if ! cmp -s "$SEED/bootstrap/stage2.c" "$SEED/self.c"; then
@@ -195,6 +196,7 @@ chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 # same stage2 runtime.h, so this one header now serves BOTH backends when
 # installed: kai points both runtime include dirs at share/kaikai/include, and the shim's `#include <runtime.h>` binds here.
 cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
+cp -R stage2/runtime       "$STAGE/share/kaikai/include/runtime"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 # The minimal C-backend runtime owner: the C split's owner
 # object, next to runtime.h so kai resolves it here in the installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.

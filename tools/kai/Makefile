@@ -19,7 +19,7 @@ SRCS := $(wildcard *.kai)
 
 kai: $(BIN)
 
-$(BIN): $(SRCS) cli_sys.c cli_io.c cli_cache.c $(KAIC2) $(ROOT)/stage2/runtime.h $(ROOT)/stage2/runtime_owner_c.c
+$(BIN): $(SRCS) cli_sys.c cli_io.c cli_cache.c $(KAIC2) $(ROOT)/stage2/runtime.h $(wildcard $(ROOT)/stage2/runtime/*.h) $(ROOT)/stage2/runtime_owner_c.c
 	@mkdir -p build $(ROOT)/bin
 	KAIKAI_STDLIB_PATH=$(STDLIB) $(KAIC2) --edition $(EDITION) --path $(CURDIR) --path $(STDLIB) main.kai > build/kai.c
 	$(CC) $(CLI_CFLAGS) -DKAI_SEPARATE_COMPILATION=1 $(RT_INC) -c build/kai.c -o build/kai.o

@@ -183,7 +183,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # or a runtime-only edit leaves a stale binary in place. Deliberately NOT
 # ../stage0/runtime.h: this translation unit never reaches it, and listing
 # it would force the ~70 s -O2 rebuild on unrelated stage 0 edits.
-RUNTIME_H := runtime.h
+RUNTIME_H := runtime.h $(wildcard runtime/*.h)
 
 # Issue #42 closure (2026-05-01): the recursive lex_loop / parse_*
 # inside kaic1 / kaic2 used to need a 32-64 MB stack bump to handle

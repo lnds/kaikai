@@ -182,6 +182,15 @@ rm "$lay/stage2/runtime.h"
 ln -s "$ROOT/stage2/runtime.h" "$lay/stage2/runtime.h"
 scenario runtime-restored 0 "$solo" -- main.kai
 
+rm "$lay/stage2/runtime"
+cp -R "$ROOT/stage2/runtime" "$lay/stage2/runtime"
+printf '/* a */\n' >> "$lay/stage2/runtime/types.h"
+scenario runtime-part-edited 1 "$solo" -- main.kai
+scenario runtime-part-warm 0 "$solo" -- main.kai
+rm -rf "$lay/stage2/runtime"
+ln -s "$ROOT/stage2/runtime" "$lay/stage2/runtime"
+scenario runtime-part-restored 0 "$solo" -- main.kai
+
 run off 0 "$solo" -- main.kai
 if [ "$(cat "$work/off.n")" -lt 1 ]; then
   echo "  FAIL off: KAI_BIN_MEMO=0 reused a binary"; fail=$((fail + 1))
