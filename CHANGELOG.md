@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.171.1 (2026-10-22)
+
+### Fixed
+
+- **typer**: a generator that relays another generator typechecks again when the inner generator is passed inline inside an outer `gen.generate` (a repeated effect label in a row is kept once; a regression from an earlier release)
+
 ## v0.171.0 (2026-10-22)
 
 ### BREAKING CHANGE
