@@ -132,16 +132,16 @@ own handler still builds.
 | Effect | Browser `main` | Why |
 |---|---|---|
 | `Stdout`, `Stderr`, `Env`, `Random`, `SecureRandom`, `Log`, `Mutable`, `State`, `Reader`, `Writer` | allowed | the page supplies or the runtime keeps them |
-| `Clock` | allowed | `wall_now` and `monotonic_now` run; `sleep_ns` stops at run time with `kai: this host has no reactor` |
+| `Clock` | allowed | `wall_now`, `monotonic_now` and `sleep_ns` run; a sleep parks on the page's event loop (JSPI) and the page stays responsive |
 | `Process` | allowed | `exit` runs; every other op stops at run time with `kai: this host has no processes` |
 | `Signal` | refused | no signals on a page |
 | `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` | refused | no sockets |
 | `File`, `Stdin` | refused | no file system or stdin |
-| `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | allowed | fibers suspend through the host (JSPI); a sleep or `receive_timeout` stops at run time |
+| `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | allowed | fibers, sleeps and `receive_timeout` suspend through the host (JSPI) |
 
 The rule: an effect is refused when no operation of it runs in the page, and
-allowed, with runtime stops for the operations that cannot run (`Clock.sleep_ns`,
-the `Process` operations other than `exit`), when some do. The check works on
+allowed, with runtime stops for the operations that cannot run (the `Process`
+operations other than `exit`), when some do. The check works on
 rows, not operations.
 Waits become available with the suspension work of the next phase.
 

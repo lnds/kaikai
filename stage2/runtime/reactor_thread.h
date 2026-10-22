@@ -192,6 +192,12 @@ static void kai_reactor_wait(void) {
      * slot lock — never nested under reactor_mu). No-op at N=1: the drains
      * unparked inline and the batch is empty. */
     kai_reactor_flush_ready();
+#elif defined(__wasm__)
+    uint64_t wake_dl = kai_reactor_timer_head ? kai_reactor_timer_head->reactor_deadline_ns : 0;
+    kai_flush_stdout();
+    kai_wctx_mark();
+    double slack_ms = kai_wctx_host_wait(wake_dl ? (double) wake_dl / 1e6 : -1.0);
+    kai_reactor_timer_drain(kai_reactor_now_ns() + (uint64_t) (slack_ms * 1e6));
 #else
     kai_host_absent("reactor");
 #endif

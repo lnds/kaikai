@@ -543,6 +543,14 @@ shapes:
   rejects callbacks from C today for the same reason: a closure is a box with
   captures, not a function pointer.
 
+*Waits (PR 7).* When every fiber is parked, `kai_reactor_wait` calls the
+import `kai.wait_until(deadline_ms)`, a JSPI suspension that the host settles
+at the deadline or earlier on a wake. The host's `hostEvents()` queue is the
+entry for the page: `post(event)` queues a value and wakes a pending wait, or
+is latched for the next one. A deadline within one frame waits for
+`requestAnimationFrame` instead of `setTimeout` and the runtime counts up to
+half a frame of earliness as elapsed, so a 16 ms loop lands on every frame.
+
 Recommendation: **events as values first.** It adds no new kind of entry into
 the program and it fits effects. If 3.3 is not JSPI, this recommendation
 flips: without suspension only the callback shape gives an interactive page.
@@ -794,7 +802,7 @@ What each kind of runner is honest for:
   |---|---|---|
   | `KAI_HOST_FIBERS` | context switch by `ucontext` (gap 2); on WebAssembly, through the host (PR 6) | one thread, `KAI_THREADS` not read; creating a fiber stops (`fibers`) |
   | `KAI_HOST_STACK_GUARD` | mapped stacks, guard page, overflow handler (gap 6) | `KAI_SEG_SWITCH` is not defined either, so a handler that keeps `resume` takes the path of a target with no switch: `kai: stack segments are not supported on this target` |
-  | `KAI_HOST_REACTOR` | self-pipes, `poll`, the file pool (gap 7) | `kai_reactor_init` stops (`reactor`): sleeps, `File`, `Stdin` reads |
+  | `KAI_HOST_REACTOR` | self-pipes, `poll`, the file pool (gap 7) | `kai_reactor_init` stops (`reactor`): `File`, `Stdin` reads; on WebAssembly `kai_reactor_wait` parks through `kai.wait_until` (PR 7), so sleeps and `receive_timeout` run |
   | `KAI_HOST_SOCKETS` | sockets and DNS (gap 8) | every `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` handler stops (`sockets`) |
   | `KAI_HOST_PROCESS` | child processes (gap 8) | every `Process` handler but `exit` stops (`processes`) |
   | `KAI_HOST_SIGNALS` | signal subscription (gap 8) | every `Signal` handler stops (`signals`) |

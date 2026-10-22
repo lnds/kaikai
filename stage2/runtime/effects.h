@@ -727,7 +727,9 @@ KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiC
     (void) self;
     int64_t ns_v = (kai_is_int(ns)) ? kai_intf(ns) : 0;
     if (ns_v > 0) {
+#if !defined(__wasm__)
         kai_reactor_init();
+#endif
         uint64_t deadline = kai_reactor_now_ns() + (uint64_t) ns_v;
         /* Re-park on a spurious resume: only a reactor splice or an
          * elapsed clock ends the sleep. Cancel delivered while the fiber

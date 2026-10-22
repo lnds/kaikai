@@ -23,6 +23,11 @@
 KAI_WCTX_IMPORT("ctx_switch") extern void kai_wctx_host_switch(int from, int to, void *sp, void (*enter)(int));
 KAI_WCTX_IMPORT("ctx_exit") extern void kai_wctx_host_exit(int to, void *sp, void (*enter)(int)) __attribute__((noreturn));
 
+/* Parks the running context until `deadline_ms` on the monotonic clock (forever
+ * when negative) or until the host posts a wake. Returns the milliseconds by
+ * which the host may have woken early, which the caller counts as elapsed. */
+KAI_WCTX_IMPORT("wait_until") extern double kai_wctx_host_wait(double deadline_ms);
+
 /* Called before the first context is created; a module that imports it needs
  * suspension, one that does not never switches. */
 KAI_WCTX_IMPORT("needs_suspension") extern void kai_wctx_host_mark(void);
