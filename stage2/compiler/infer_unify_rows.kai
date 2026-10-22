@@ -3,6 +3,7 @@
 import compiler.diag
 import compiler.ast
 import compiler.ast_ids
+import compiler.core_types
 import compiler.resolve_names
 import compiler.symtab
 import compiler.infer_index
@@ -404,15 +405,61 @@ fn widen_each(params: [Ty], args: [Ty], s: Subst) : WidenedArgs / Mutable =
     _ -> WidenedArgs { args: args, sub: s }
   }
 
+# True when a value of the type may hold a function.
+fn ty_may_hold_fn(t: Ty) : Bool = match t {
+  TyFnT(_, _, _)  -> true
+  TyListT(inner)  -> ty_may_hold_fn(inner)
+  TyCon(s, args)  -> not (core_ty_is(s, CtOption) or core_ty_is(s, CtResult)) or any(args, ty_may_hold_fn)
+  TyUnion(ts)     -> any(ts, ty_may_hold_fn)
+  TyDimT(inner, _)    -> ty_may_hold_fn(inner)
+  TyRefineT(inner, _) -> ty_may_hold_fn(inner)
+  TyShapeApp(_, _) -> true
+  TyAny            -> true
+  _                -> false
+}
+
+# A callee that only runs its function arguments: its row has no mutation,
+# actor or spawn effect, and neither its result nor another parameter can hold a
+# function.
+fn callee_keeps_args(s: Subst, params: [Ty], cret: Ty, crow: Row) : Bool = {
+  let r = apply_row_tail_only(s, crow)
+  not any(r.labels, (l) => effect_is_any(l.sym, [CeMutable, CeActor, CeSpawn]))
+    and not ty_may_hold_fn(apply_ty(s, cret))
+    and all(params, (p) => param_only_runs(s, p))
+}
+
+fn param_only_runs(s: Subst, p: Ty) : Bool = match apply_ty_keep_row_labels(s, p) {
+  TyFnT(_, _, prow) -> apply_row_tail_only(s, prow).tail == None
+  t                 -> not ty_may_hold_fn(t)
+}
+
+fn row_captures_cap(r: Row) : Bool = any(r.labels, (l) => local_eq(l.cell, capture_cell()))
+
+# A closure handed to a parameter whose row is closed and lacks a capability it
+# captured only runs for the call, so the capture label stays out of the argument's row.
+fn erase_capture_args(s: Subst, params: [Ty], args: [Ty]) : [Ty] = match (params, args) {
+  ([p, ...prest], [a, ...arest]) -> [erase_capture_arg(s, p, a), ...erase_capture_args(s, prest, arest)]
+  _ -> args
+}
+
+fn erase_capture_arg(s: Subst, param: Ty, arg: Ty) : Ty = match (apply_ty_keep_row_labels(s, param), arg) {
+  (TyFnT(_, _, prow), TyFnT(ad, ar, arow)) ->
+    if apply_row_tail_only(s, prow).tail == None and row_captures_cap(arow) {
+      TyFnT(ad, ar, Row { ...arow, labels: filter(arow.labels, (l) => not local_eq(l.cell, capture_cell())) })
+    } else { arg }
+  _ -> arg
+}
+
 #[doc("A call's expected function type with widened arguments, and the substitution that does it.")]
 pub type WidenedCall = { ty: Ty, sub: Subst }
 
 #[doc("Widens the function arguments of a call whose parameter rows admit more effects.")]
 pub fn widen_call_args(env: TyEnv, s: Subst, callee_ty: Ty, expected_fn_ty: Ty) : WidenedCall / Mutable =
   match (apply_ty(s, callee_ty), expected_fn_ty) {
-    (TyFnT(params, _, _), TyFnT(args, ret, row)) -> {
+    (TyFnT(params, cret, crow), TyFnT(args, ret, row)) -> {
       let w = widen_fn_args(env, params, args, s)
-      WidenedCall { ty: TyFnT(w.args, ret, row), sub: w.sub }
+      let kept = if callee_keeps_args(w.sub, params, cret, crow) { erase_capture_args(w.sub, params, w.args) } else { w.args }
+      WidenedCall { ty: TyFnT(kept, ret, row), sub: w.sub }
     }
     _ -> WidenedCall { ty: expected_fn_ty, sub: s }
   }
