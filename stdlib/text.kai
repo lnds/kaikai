@@ -8,11 +8,12 @@ codepoints are 2 columns wide (CJK ideographs, fullwidth forms, most
 emoji), some are 0 (combining marks, zero-width joiner/space, control
 chars), most are 1.
 
-Scope: codepoint-level width via the East Asian Width property +
-zero-width handling. NOT grapheme-cluster segmentation (UAX #29) —
-emoji ZWJ sequences, flags, and skin-tone modifiers that render as
-one wide glyph are out of scope. ANSI-escape skipping is the caller's
-concern; `display_width` measures the codepoints it is given.
+Scope: codepoint width via the East Asian Width property and
+zero-width handling, plus emoji clusters: ZWJ sequences, skin-tone
+modifiers, `FE0E`/`FE0F` presentation selectors, regional-indicator
+flag pairs and keycaps. Full grapheme segmentation (UAX #29: Hangul
+jamo, Indic conjuncts, ...) is not implemented. ANSI-escape skipping
+is the caller's concern.
 
 The interval tables below are the well-known compact ranges from the
 Unicode East Asian Width property (wide + fullwidth) and the
@@ -68,6 +69,7 @@ fn is_wide(cp: Int) : Bool = {
   in_range(cp, 0xFF00, 0xFF60) or               # fullwidth forms
   in_range(cp, 0xFFE0, 0xFFE6) or               # fullwidth signs
   in_range(cp, 0x1F300, 0x1F64F) or             # misc symbols & pictographs
+  in_range(cp, 0x1F680, 0x1F6FF) or             # transport & map symbols
   in_range(cp, 0x1F900, 0x1F9FF) or             # supplemental symbols & pictographs
   in_range(cp, 0x1FA70, 0x1FAFF) or             # symbols & pictographs ext-A
   in_range(cp, 0x20000, 0x3FFFD)                # CJK Unified Ideographs Ext B+
@@ -84,18 +86,74 @@ pub fn char_width(cp: Int) : Int {
   else { 1 }
 }
 
-fn width_loop(cs: [Char], acc: Int) : Int = match cs {
-  []          -> acc
-  [c, ...rest] -> width_loop(rest, acc + char_width(char_to_int(c)))
+# Cluster state while scanning: 0 none, 1 keycap base, 2 keycap base +
+# FE0F, 3 narrow pictograph (FE0F widens it), 4 wide pictograph (FE0E
+# narrows it), 5 pictograph after ZWJ, 6 pictograph whose width is
+# already settled (joined, modified or widened).
+fn is_keycap_base(cp: Int) : Bool = in_range(cp, 0x30, 0x39) or cp == 0x23 or cp == 0x2A
+
+fn is_emoji_modifier(cp: Int) : Bool = in_range(cp, 0x1F3FB, 0x1F3FF)
+
+# Text-default pictographs: width 1 until followed by FE0F.
+fn is_text_pictograph(cp: Int) : Bool = {
+  cp == 0xA9 or cp == 0xAE or cp == 0x203C or cp == 0x2049 or
+  cp == 0x2122 or cp == 0x2139 or
+  in_range(cp, 0x2190, 0x21FF) or
+  in_range(cp, 0x2300, 0x23FF) or
+  in_range(cp, 0x2600, 0x27BF) or
+  in_range(cp, 0x2B00, 0x2BFF)
+}
+
+fn is_pictograph(cp: Int) : Bool = is_text_pictograph(cp) or (is_wide(cp) and cp >= 0x1F000)
+
+fn in_cluster(st: Int) : Bool = st >= 3 and st != 5
+
+fn base_state(cp: Int) : Int = {
+  if is_keycap_base(cp) { 1 }
+  else if is_text_pictograph(cp) { 3 }
+  else if is_pictograph(cp) { 4 }
+  else { 0 }
+}
+
+fn width_loop(cs: [Char], st: Int, acc: Int) : Int = match cs {
+  []           -> acc
+  [c, ...rest] -> cluster_step(rest, char_to_int(c), st, acc)
+}
+
+fn cluster_step(rest: [Char], cp: Int, st: Int, acc: Int) : Int = {
+  if cp == 0x200D {
+    width_loop(rest, if in_cluster(st) { 5 } else { 0 }, acc)
+  } else if st == 5 and is_pictograph(cp) {
+    width_loop(rest, 6, acc)
+  } else if is_emoji_modifier(cp) and in_cluster(st) {
+    width_loop(rest, 6, acc)
+  } else if cp == 0xFE0F {
+    selector_step(rest, st, acc, true)
+  } else if cp == 0xFE0E {
+    selector_step(rest, st, acc, false)
+  } else if cp == 0x20E3 and st == 2 {
+    width_loop(rest, 0, acc + 1)
+  } else {
+    width_loop(rest, base_state(cp), acc + char_width(cp))
+  }
+}
+
+fn selector_step(rest: [Char], st: Int, acc: Int, emoji: Bool) : Int = {
+  if emoji and st == 1 { width_loop(rest, 2, acc) }
+  else if emoji and st == 3 { width_loop(rest, 6, acc + 1) }
+  else if not emoji and st == 4 { width_loop(rest, 0, acc - 1) }
+  else { width_loop(rest, if in_cluster(st) { 6 } else { 0 }, acc) }
 }
 
 #[doc("""
-`display_width(s)` — the number of terminal columns `s` occupies,
-summing `char_width` over its codepoints. Iterates real codepoints
-via `string.chars`, so multibyte input is measured by glyph width,
-not byte or codepoint count.
+`display_width(s)` — the number of terminal columns `s` occupies.
+Sums `char_width` per codepoint, except that emoji clusters count as
+the terminal draws them: ZWJ sequences, skin-tone modifiers, `FE0F`
+(widens a text-default pictograph), `FE0E` (narrows a wide one), and
+keycaps are one glyph; a regional-indicator pair is 2 columns. Full
+UAX #29 segmentation is not implemented. Single pass, no allocation.
 """)]
-pub fn display_width(s: String) : Int = width_loop(string.chars(s), 0)
+pub fn display_width(s: String) : Int = width_loop(string.chars(s), 0, 0)
 
 test "char_width — narrow, wide, zero-width" {
   assert char_width(char_to_int('a')) == 1     # ASCII
@@ -113,4 +171,17 @@ test "display_width — issue 745 acceptance cases" {
   assert display_width("🎉") == 2              # 1 wide emoji
   assert display_width("") == 0
   assert display_width("áé") == 2              # accented Latin, narrow
+}
+
+test "display_width — emoji clusters" {
+  assert display_width("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}") == 2
+  assert display_width("\u{1F44D}\u{1F3FD}") == 2
+  assert display_width("\u{1F1E8}\u{1F1F1}") == 2
+  assert display_width("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}") == 2
+  assert display_width("e\u{0301}") == 1
+  assert display_width("1\u{FE0F}\u{20E3}") == 2
+  assert display_width("\u{2764}\u{FE0F}") == 2
+  assert display_width("\u{2764}") == 1
+  assert display_width("\u{1F44D}\u{FE0E}") == 1
+  assert display_width("a\u{4F60}\u{1F468}\u{200D}\u{1F469}b") == 6
 }
