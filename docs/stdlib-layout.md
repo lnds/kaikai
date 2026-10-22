@@ -260,6 +260,7 @@ stdlib/
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
   gen.kai        effect: Yield[t] (top-level module: pull generators on a kept continuation — shipped via PR #2627)
   seq.kai        pure, stage 2 (top-level module: lazy sequences over a memoised runtime cell — shipped via PR #2726)
+  ffi.kai        pure, stage 2 (top-level module: Userdata, a kaikai value parked behind a void * for C callbacks — shipped)
   reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
   io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)

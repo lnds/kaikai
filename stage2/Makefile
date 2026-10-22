@@ -1601,6 +1601,42 @@ test-ffi-cflags-shim-native:
 	@echo "ffi-cflags-shim-native SKIP (C-only build; native backend not compiled)"
 endif
 
+# `extern "C" fn` with a body exports a kaikai fn to C: a comparator `qsort`
+# calls back, a callback carrying an actor's Pid as userdata, and C threads
+# entering the scheduler. The thread fixture needs the worker pool, so it runs
+# at KAI_THREADS above 1 only, and at 1 the call must abort with the advice.
+FFI_EXPORT_FIXTURES := export_qsort export_userdata export_thread
+
+define ffi_export_run
+	@set -e; \
+	for f in $(FFI_EXPORT_FIXTURES); do \
+	  $(2) CFLAGS="../examples/ffi/$${f}_shim.c" ../bin/kai build $(3) ../examples/ffi/$$f.kai -o build/$$f-$(1) 2> build/$$f-$(1).err \
+	    || { echo "ffi-export $$f BUILD FAIL ($(1))"; cat build/$$f-$(1).err; exit 1; }; \
+	  ns="1 2 4 8"; [ $$f = export_thread ] && ns="2 4 8"; \
+	  for n in $$ns; do \
+	    KAI_THREADS=$$n ./build/$$f-$(1) > build/$$f-$(1).out; \
+	    diff -q ../examples/ffi/$$f.out.expected build/$$f-$(1).out > /dev/null \
+	      || { echo "ffi-export $$f DIFF ($(1), KAI_THREADS=$$n)"; diff ../examples/ffi/$$f.out.expected build/$$f-$(1).out; exit 1; }; \
+	  done; \
+	done; \
+	if KAI_THREADS=1 ./build/export_thread-$(1) > /dev/null 2> build/export_thread-$(1).err; then \
+	  echo "ffi-export export_thread DID NOT ABORT ($(1), KAI_THREADS=1)"; exit 1; fi; \
+	grep -F "set KAI_THREADS>1 (or unset it)" build/export_thread-$(1).err > /dev/null \
+	  || { echo "ffi-export export_thread ADVICE MISSING ($(1))"; cat build/export_thread-$(1).err; exit 1; }; \
+	echo "ffi-export OK ($(1))"
+endef
+
+test-ffi-export: $(TARGET) bin-kai build
+	$(call ffi_export_run,c,,--backend=c)
+
+ifeq ($(KAI_LLVM),1)
+test-ffi-export-native: $(TARGET) bin-kai build
+	$(call ffi_export_run,nat,KAI_BACKEND=native,)
+else
+test-ffi-export-native:
+	@echo "ffi-export-native SKIP (C-only build; native backend not compiled)"
+endif
+
 # A header forced in through CFLAGS precedes runtime.h and reaches a system
 # header; on glibc that froze the libc feature set before runtime.h set it.
 CFLAGS_INCLUDE_PROBE := -include $(abspath ../examples/ffi/cflags_include_probe.h)

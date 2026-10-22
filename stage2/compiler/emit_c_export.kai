@@ -1,0 +1,70 @@
+#[doc("C adapters for `extern \"C\" fn` declarations with a body: a non-static C-ABI entry that boxes its arguments, runs the fn's thunk through the runtime's export entry and unboxes the result.")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.emit_c_shims
+import compiler.emit_shared_proto
+import compiler.extern_fn_types
+import compiler.symtab
+import compiler.util
+
+#[doc("The adapter for the exported fn whose thunk is `thunk` and whose C symbol is `csym`.")]
+pub(pkg) fn emit_c_export_adapter(csym: String, thunk: String, params: [Param], ret_ty_opt: Option[TypeExpr],
+                                  reg: [ExternTypeReg], tab: SymTab) : String {
+  let kinds = map(params, (p) => param_kind(p, reg, tab))
+  let ret = match ret_ty_opt { Some(t) -> ffi_kind_of_ty_reg(t, reg, tab)  None -> FfiRetUnit }
+  let n = list_length(params)
+  concat_all([
+    ffi_v2_c_ret_type(ret, tab), " ", csym, "(", c_params(kinds, tab), ") {\n",
+    "    KaiValue *_a[", int_to_string(if n == 0 { 1 } else { n }), "];\n",
+    box_args(kinds, 0, ""),
+    "    KaiValue *_r = kai_export_call(\"", csym, "\", ", thunk, ", _a, ", int_to_string(n), ");\n",
+    ret_body(ret, reg, tab),
+    "}\n\n"
+  ])
+}
+
+fn param_kind(p: Param, reg: [ExternTypeReg], tab: SymTab) : FfiRetKind = match p.ptype {
+  Some(t) -> ffi_kind_of_ty_reg(t, reg, tab)
+  None    -> FfiRetUnknown("missing")
+}
+
+fn arg_name(i: Int) : String = concat_all(["a", int_to_string(i)])
+
+fn c_params(kinds: [FfiRetKind], tab: SymTab) : String = match kinds {
+  [] -> "void"
+  _  -> join_with(c_param_decls(kinds, tab, 0, []), ", ")
+}
+
+fn c_param_decls(kinds: [FfiRetKind], tab: SymTab, i: Int, acc: [String]) : [String] = match kinds {
+  [] -> list_reverse(acc)
+  [k, ...rest] -> c_param_decls(rest, tab, i + 1, [concat_all([ffi_v2_c_type(k, tab), " ", arg_name(i)]), ...acc])
+}
+
+fn box_args(kinds: [FfiRetKind], i: Int, acc: String) : String = match kinds {
+  [] -> acc
+  [k, ...rest] -> box_args(rest, i + 1, cat2(acc, box_one(k, i)))
+}
+
+fn box_one(k: FfiRetKind, i: Int) : String =
+  concat_all(["    _a[", int_to_string(i), "] = ", box_expr(k, arg_name(i)), ";\n"])
+
+fn box_expr(k: FfiRetKind, v: String) : String = match k {
+  FfiRetInt         -> concat_all(["kai_int((int64_t) ", v, ")"])
+  FfiRetReal        -> concat_all(["kai_real(", v, ")"])
+  FfiRetBool        -> concat_all(["kai_bool(", v, " != 0)"])
+  FfiRetChar        -> concat_all(["kai_char((uint32_t) ", v, ")"])
+  FfiRetString      -> concat_all(["kai_str(", v, " == NULL ? \"\" : ", v, ")"])
+  FfiRetFixed(fx)   ->
+    if ffi_fixed_is_float(fx) { concat_all(["kai_real((double) ", v, ")"]) }
+    else { concat_all(["kai_int((int64_t) ", v, ")"]) }
+  FfiRetFixedVal(t) -> concat_all([fixed_val_box_ctor(t), "(", v, ")"])
+  FfiRetForeign(_)  -> concat_all(["kai_foreign(", v, ")"])
+  _                 -> "kai_unit()"
+}
+
+fn ret_body(ret: FfiRetKind, reg: [ExternTypeReg], tab: SymTab) : String = match ret {
+  FfiRetUnit -> "    kai_decref(_r);\n"
+  _ -> concat_all([ffi_v2_unbox_one(ret, "_kai_xo", "_r", reg, tab), "    kai_decref(_r);\n    return _kai_xo;\n"])
+}

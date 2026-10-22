@@ -382,7 +382,7 @@ static void kai_sched_enqueue(KaiFiber *f) {
         pthread_mutex_unlock(&s->mu);
         /* An owner at its root searches next and takes a lone fiber itself;
          * waking a peer to race it for that fiber is a wasted futex trip. */
-        if (!(was_empty && owner == w->id && w->active == &w->main_fiber))
+        if (!(was_empty && owner == w->id && w->sched && w->active == &w->main_fiber))
             kai_sched_notify_work(owner);
         return;
     }

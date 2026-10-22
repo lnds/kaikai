@@ -181,6 +181,10 @@ is how a union names two homonymous imported types, since a bare `Cfg`
 cannot mean either one. A qualified member always reads as a reference
 to a declared type, never as a constructor, so it takes no payload.
 
+`extern "C" fn` with a body (`= expr` or `{ }`) exports a top-level kaikai
+function under the C ABI instead of importing one; see *Exporting kaikai
+functions to C* in `kai info ffi`.
+
 FFI surface beyond `extern "C" fn` — extern structs (`extern "C" [pub]
 type Vec2 = { x: F32, y: F32 }`, usable as a record, spread included), opaque handles (`extern "C" opaque
 Conn`), a C-symbol override (`extern "C"("PQconnectdb") fn

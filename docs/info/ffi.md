@@ -6,7 +6,8 @@ Foreign function interface — calling C via the `Ffi` capability.
 
 kaikai reaches C through `extern "C"` declarations. Every FFI call
 crosses the `Ffi` capability, so an extern signature MUST carry `/ Ffi`
-in its effect row. There is one ABI (`"C"`); the symbol the linker
+in its effect row. C reaches kaikai through an `extern "C" fn` with a body
+(*Exporting kaikai functions to C*, below). There is one ABI (`"C"`); the symbol the linker
 binds is the kaikai identifier, or an explicit override.
 
 ```text
@@ -156,6 +157,71 @@ A `char *` a C function returns while borrowing from a live handle
 (same as a returned `String`), so it never dangles when the handle is
 later destroyed.
 
+## Exporting kaikai functions to C
+
+`extern "C" fn` WITH a body exports a top-level kaikai function under the
+C ABI, so C can call it or take its address (`qsort`, iterators, webview
+bindings). Without a body it imports a C function, as above.
+
+```text
+extern "C" fn on_save(id: Int, req: String) : Unit / Stdout =
+  Stdout.print("saving #{id}: #{req}")
+extern "C"("app_cmp") pub fn cmp(a: Int, b: Int) : Int = a - b   # symbol named
+```
+
+The `("sym")` override names the EXPORTED symbol.
+
+Rules, all checked at compile time:
+
+- Top-level functions only — no closures, no type parameters.
+- The row is closed and lists only effects with a default handler
+  (`Stdout`, `Stderr`, `Clock`, `Random`, `Log`, `Spawn`, ...). C calls
+  with no `handle` on the stack, so `State`, `Abort`, a user effect or an
+  open row is an error at the declaration naming the effect. `Ffi` is
+  not required: the body is kaikai code.
+- Boundary types are the import ones minus two: a `String` is accepted
+  as a PARAMETER only (copied in from the C string, which the caller keeps),
+  and a struct by value is not supported. Scalars, fixed-width types and
+  `extern "C" opaque` handles cross as they do for imports; a
+  function-typed parameter is still rejected.
+
+**Where the call runs.** The adapter picks per call:
+
+1. C called back from inside an FFI call on a kaikai fiber (`qsort`'s
+   comparator): the body runs on that fiber, synchronously.
+2. A thread the runtime does not own (a `pthread`, a GUI thread): the
+   body runs on a scheduler fiber and the calling thread blocks until it
+   returns. The body may park (`await`, actor round trips, sleeps) like
+   any fiber. Rule: an exported function called from a foreign thread
+   must not wait on that same thread, or the two deadlock. This needs
+   the scheduler pool: with `KAI_THREADS=1` the call aborts with
+   `set KAI_THREADS>1 (or unset it)`.
+
+**Panics stop at the boundary.** A panic, trap or cancellation inside the
+body never unwinds through C frames: the process prints
+`kai: panic in exported function <name>` and aborts.
+
+**Context as a value.** A C API with a `void *userdata` carries a kaikai
+value through `ffi.retain_userdata`, which parks a private copy of it behind a
+`Userdata` handle (an `extern "C" opaque`, so it crosses as `void *`).
+The exported function receives the handle and reads the value back with
+`ffi.take_userdata[T]`; `ffi.release_userdata` frees the parked copy. State belongs in
+actors: park the owner's `Pid` and forward from the callback with
+`mailbox_send(pid, msg)`.
+
+```text
+import ffi
+
+type Msg = Tick(Int) | Done
+
+extern "C" fn on_event(ud: Userdata, n: Int) : Unit = {
+  let pid: Pid[Msg] = take_userdata(ud)
+  mailbox_send(pid, if n < 0 { Done } else { Tick(n) })
+}
+```
+
+`take_userdata[T]` trusts `T` to be the type the handle was retained at.
+
 ## Thread affinity
 
 `main` runs on the OS thread the process entered on, at every
@@ -175,8 +241,9 @@ in a spawned fiber.
 These are out of scope and rejected at compile time:
 
 - C unions, bitfields, variadic functions.
-- Callbacks from C (a function-typed extern parameter): a kaikai
-  closure is a heap box with captures, not a bare C function pointer.
+- A function-typed extern parameter: a kaikai closure is a heap box with
+  captures, not a bare C function pointer. Export a top-level function
+  instead and hand C its symbol.
 - A struct field that is not a fixed-width type or a nested
   `extern "C" type`.
 
