@@ -43,62 +43,92 @@ typedef struct kai_wctx {
     int id;
 } ucontext_t;
 
-typedef struct { void (*entry)(void *); void *sp; int id; } KaiWSegRec;
+typedef struct { void (*entry)(void *); void *sp; uintptr_t limit; int id; } KaiWSegRec;
 
 #define KAI_WCTX_ROOT 1
+#define KAI_WCTX_NOINSTR __attribute__((no_instrument_function))
 
+/* `kai_wctx_limit` is the lowest stack pointer the running context may reach
+ * before the entry hook reports an overflow; zero for the main stack, whose
+ * overflow runs off the bottom of memory and traps. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern int kai_wctx_cur;
-extern int kai_wctx_next_id;
-extern void (*kai_wctx_boot_fn0)(void);
-extern void (*kai_wctx_boot_fn1)(void *);
-extern int kai_wctx_boot_link;
-extern void *kai_wctx_xfer;
+extern KAI_TLS int kai_wctx_cur;
+extern KAI_TLS int kai_wctx_next_id;
+extern KAI_TLS void (*kai_wctx_boot_fn0)(void);
+extern KAI_TLS void (*kai_wctx_boot_fn1)(void *);
+extern KAI_TLS int kai_wctx_boot_link;
+extern KAI_TLS uintptr_t kai_wctx_boot_limit;
+extern KAI_TLS uintptr_t kai_wctx_limit;
+extern KAI_TLS void *kai_wctx_xfer;
 #  if defined(KAI_RUNTIME_OWNER)
-int kai_wctx_cur = KAI_WCTX_ROOT;
-int kai_wctx_next_id = KAI_WCTX_ROOT;
-void (*kai_wctx_boot_fn0)(void);
-void (*kai_wctx_boot_fn1)(void *);
-int kai_wctx_boot_link;
-void *kai_wctx_xfer;
+KAI_TLS int kai_wctx_cur = KAI_WCTX_ROOT;
+KAI_TLS int kai_wctx_next_id = KAI_WCTX_ROOT;
+KAI_TLS void (*kai_wctx_boot_fn0)(void);
+KAI_TLS void (*kai_wctx_boot_fn1)(void *);
+KAI_TLS int kai_wctx_boot_link;
+KAI_TLS uintptr_t kai_wctx_boot_limit;
+KAI_TLS uintptr_t kai_wctx_limit;
+KAI_TLS void *kai_wctx_xfer;
 #  endif
 #else
-static int kai_wctx_cur = KAI_WCTX_ROOT;
-static int kai_wctx_next_id = KAI_WCTX_ROOT;
-static void (*kai_wctx_boot_fn0)(void);
-static void (*kai_wctx_boot_fn1)(void *);
-static int kai_wctx_boot_link;
-static void *kai_wctx_xfer;
+static KAI_TLS int kai_wctx_cur = KAI_WCTX_ROOT;
+static KAI_TLS int kai_wctx_next_id = KAI_WCTX_ROOT;
+static KAI_TLS void (*kai_wctx_boot_fn0)(void);
+static KAI_TLS void (*kai_wctx_boot_fn1)(void *);
+static KAI_TLS int kai_wctx_boot_link;
+static KAI_TLS uintptr_t kai_wctx_boot_limit;
+static KAI_TLS uintptr_t kai_wctx_limit;
+static KAI_TLS void *kai_wctx_xfer;
 #endif
 
-static inline void *kai_wctx_sp_get(void) {
+KAI_WCTX_NOINSTR static inline void *kai_wctx_sp_get(void) {
     void *p;
     __asm__ volatile("global.get __stack_pointer\n\tlocal.set %0" : "=r"(p));
     return p;
 }
 
-static inline void kai_wctx_sp_set(void *p) {
+KAI_WCTX_NOINSTR static inline void kai_wctx_sp_set(void *p) {
     __asm__ volatile("local.get %0\n\tglobal.set __stack_pointer" :: "r"(p));
 }
 
+/* The lowest address a stack of `size` bytes at `lo` may be used down to: the
+ * room left below it is what the overflow report itself runs in. */
+KAI_WCTX_NOINSTR static uintptr_t kai_wctx_floor(uintptr_t lo, size_t size) {
+    size_t room = size / 4;
+    return lo + (room < 8192 ? room : 8192);
+}
+
+#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER)
+/* Every instrumented function calls this on entry. */
+KAI_WCTX_NOINSTR void __cyg_profile_func_enter_bare(void) {
+    if ((uintptr_t) kai_wctx_sp_get() < kai_wctx_limit) {
+        static const char msg[] = "kai: fiber stack overflow\n";
+        write(2, msg, sizeof msg - 1);
+        _Exit(139);
+    }
+}
+#endif
+
 /* The stack pointer a fresh target starts on, NULL for one already running. */
-static void *kai_wctx_arm(const ucontext_t *to) {
+KAI_WCTX_NOINSTR static void *kai_wctx_arm(const ucontext_t *to) {
     if (to->fn == NULL) return NULL;
     kai_wctx_boot_fn0 = to->fn;
     kai_wctx_boot_fn1 = NULL;
     kai_wctx_boot_link = to->uc_link != NULL ? to->uc_link->id : 0;
+    kai_wctx_boot_limit = kai_wctx_floor((uintptr_t) to->uc_stack.ss_sp, to->uc_stack.ss_size);
     ((ucontext_t *) to)->fn = NULL;
     return to->sp;
 }
 
 /* The host starts a fresh context by calling this through the function table. */
-__attribute__((noinline))
+KAI_WCTX_NOINSTR __attribute__((noinline))
 static void kai_ctx_enter(int id) {
     (void) id;
     void (*f0)(void) = kai_wctx_boot_fn0;
     void (*f1)(void *) = kai_wctx_boot_fn1;
     void *arg = kai_wctx_xfer;
     int link = kai_wctx_boot_link;
+    kai_wctx_limit = kai_wctx_boot_limit;
     if (f0 != NULL) f0(); else f1(arg);
     if (link == 0) abort();
     kai_wctx_cur = link;
@@ -108,13 +138,13 @@ static void kai_ctx_enter(int id) {
 /* The entry the host needs when `sp` names a fresh stack. */
 #define KAI_WCTX_ENTER(sp) ((sp) != NULL ? kai_ctx_enter : NULL)
 
-static int getcontext(ucontext_t *c) {
+KAI_WCTX_NOINSTR static int getcontext(ucontext_t *c) {
     c->fn = NULL;
     c->id = 0;
     return 0;
 }
 
-static void makecontext(ucontext_t *c, void (*fn)(void), int argc, ...) {
+KAI_WCTX_NOINSTR static void makecontext(ucontext_t *c, void (*fn)(void), int argc, ...) {
     (void) argc;
     uintptr_t top = ((uintptr_t) c->uc_stack.ss_sp + c->uc_stack.ss_size) & ~(uintptr_t) 15;
     c->fn = fn;
@@ -122,19 +152,21 @@ static void makecontext(ucontext_t *c, void (*fn)(void), int argc, ...) {
     c->id = ++kai_wctx_next_id;
 }
 
-static int swapcontext(ucontext_t *save, const ucontext_t *to) {
+KAI_WCTX_NOINSTR static int swapcontext(ucontext_t *save, const ucontext_t *to) {
     int from = kai_wctx_cur;
     save->id = from;
     save->fn = NULL;
     void *mysp = kai_wctx_sp_get();
+    uintptr_t mylimit = kai_wctx_limit;
     void *sp = kai_wctx_arm(to);
     kai_wctx_cur = to->id;
     kai_wctx_host_switch(from, to->id, sp, KAI_WCTX_ENTER(sp));
     kai_wctx_sp_set(mysp);
+    kai_wctx_limit = mylimit;
     return 0;
 }
 
-__attribute__((noreturn))
+KAI_WCTX_NOINSTR __attribute__((noreturn))
 static int setcontext(const ucontext_t *to) {
     void *sp = kai_wctx_arm(to);
     kai_wctx_cur = to->id;
@@ -145,16 +177,20 @@ static int setcontext(const ucontext_t *to) {
 
 #define KAI_SEG_SWITCH 1
 
-static void *kai_seg_frame_init(void *top, void (*entry)(void *)) {
+static size_t kai_fiber_stack_size(void);
+
+KAI_WCTX_NOINSTR static void *kai_seg_frame_init(void *top, void (*entry)(void *)) {
     uintptr_t t = ((uintptr_t) top & ~(uintptr_t) 15) - 16 * ((sizeof(KaiWSegRec) + 15) / 16);
+    size_t size = kai_fiber_stack_size();
     KaiWSegRec *rec = (KaiWSegRec *) t;
     rec->entry = entry;
     rec->sp = (void *) t;
+    rec->limit = kai_wctx_floor((uintptr_t) top - size, size);
     rec->id = ++kai_wctx_next_id;
     return rec;
 }
 
-static int kai_wctx_seg_target(void *to, void *arg, void **sp) {
+KAI_WCTX_NOINSTR static int kai_wctx_seg_target(void *to, void *arg, void **sp) {
     kai_wctx_xfer = arg;
     if ((uintptr_t) to & 1) {
         *sp = NULL;
@@ -164,24 +200,27 @@ static int kai_wctx_seg_target(void *to, void *arg, void **sp) {
     kai_wctx_boot_fn0 = NULL;
     kai_wctx_boot_fn1 = rec->entry;
     kai_wctx_boot_link = 0;
+    kai_wctx_boot_limit = rec->limit;
     *sp = rec->sp;
     return rec->id;
 }
 
-static void *kai_seg_switch(void **save, void *to, void *arg) {
+KAI_WCTX_NOINSTR static void *kai_seg_switch(void **save, void *to, void *arg) {
     int from = kai_wctx_cur;
     *save = (void *) (((uintptr_t) from << 1) | 1);
     void *mysp = kai_wctx_sp_get();
+    uintptr_t mylimit = kai_wctx_limit;
     void *sp;
     int id = kai_wctx_seg_target(to, arg, &sp);
     kai_wctx_cur = id;
     kai_wctx_host_switch(from, id, sp, KAI_WCTX_ENTER(sp));
     kai_wctx_sp_set(mysp);
+    kai_wctx_limit = mylimit;
     return kai_wctx_xfer;
 }
 
 /* Leave the running stack for good: the host drops it once it is off. */
-__attribute__((noreturn))
+KAI_WCTX_NOINSTR __attribute__((noreturn))
 static void kai_seg_switch_final(void *to) {
     void *sp;
     int id = kai_wctx_seg_target(to, NULL, &sp);
