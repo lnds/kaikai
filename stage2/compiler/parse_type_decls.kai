@@ -289,20 +289,21 @@ pub fn parse_at_legacy_extern_c_attribute(p: Parser) : Bool =
     and tok_source(p.src, p_peek2(p)) == "extern_c"
 
 #[doc("""
-Parses `extern "C"|"kai" [("symbol")] [pub] fn name(...) : T [/ row]`, `extern "C" type`
-and `extern "C" opaque` after the `extern` token `t`. A C symbol override must be a valid
-C identifier; under `"kai"` the symbol is mandatory.
+Parses `extern "C"|"kai"|"js" [("symbol")] [pub] fn name(...) : T [/ row]`, `extern "C" type`
+and `extern "C"|"js" opaque` after the `extern` token `t`. A C symbol override must be a valid
+C identifier; under `"kai"` the symbol is mandatory; under `"js"` the import path is.
 """)]
 pub fn parse_extern_decl(p: Parser, t: Token) : PDecl / Console {
   let pa = p_skip_newlines(p)
   let abi_tok = p_peek(pa)
   if not tk_is(abi_tok.kind, TkString) {
-    fail_d_at(pa, abi_tok, "expected an ABI string literal after `extern` (only `\"C\"` is supported)")
+    fail_d_at(pa, abi_tok, "expected an ABI string literal after `extern` (`\"C\"`, `\"kai\"` or `\"js\"`)")
   } else {
     let abi = tok_source(pa.src, abi_tok)
     if abi == "\"C\"" { extern_c_decl(p_advance(pa), t) }
     else if abi == "\"kai\"" { extern_kai_decl(p_advance(pa), t) }
-    else { fail_d_at(pa, abi_tok, concat_all(["unsupported FFI ABI ", abi, " — only \"C\" is supported"])) }
+    else if abi == "\"js\"" { extern_js_decl(p_advance(pa), t) }
+    else { fail_d_at(pa, abi_tok, concat_all(["unsupported FFI ABI ", abi, " — only \"C\", \"kai\" and \"js\" are supported"])) }
   }
 }
 
@@ -311,7 +312,7 @@ fn extern_c_decl(p: Parser, t: Token) : PDecl / Console {
   let p1 = if pubbed { p_advance_nl(p) } else { p }
   let head = p_peek(p1)
   if tk_is(head.kind, TkType) { extern_struct_decl(p_advance(p1), t, pubbed) }
-  else if tk_is(head.kind, TkIdent) and tok_source(p1.src, head) == "opaque" { extern_opaque_decl(p_advance(p1), t, pubbed) }
+  else if tk_is(head.kind, TkIdent) and tok_source(p1.src, head) == "opaque" { extern_opaque_decl(p_advance(p1), t, pubbed, ETOpaque) }
   else {
     let over = parse_optional_c_override(p)
     match over.r {
@@ -319,6 +320,43 @@ fn extern_c_decl(p: Parser, t: Token) : PDecl / Console {
       Some(sym) -> validate_extern_c_decl(
         extern_fn(over.p, "expected `fn`, `type`, or `opaque` after `extern \"C\"` (FFI declarations look like `extern \"C\" fn name(...) : T / Ffi`)", AbiC, sym, t), t)
     }
+  }
+}
+
+fn extern_js_decl(p: Parser, t: Token) : PDecl / Console {
+  let pubbed = p_at(p, TkPub)
+  let p1 = if pubbed { p_advance_nl(p) } else { p }
+  let head = p_peek(p1)
+  if tk_is(head.kind, TkIdent) and tok_source(p1.src, head) == "opaque" { extern_opaque_decl(p_advance(p1), t, pubbed, ETOpaqueJs) }
+  else {
+    let over = parse_js_path(p)
+    match over.r {
+      None -> err_d(over.p)
+      Some(path) -> validate_extern_js_decl(
+        extern_fn(over.p, "expected `fn` or `opaque` after `extern \"js\"(\"<path>\")`", AbiJs, path, t), t)
+    }
+  }
+}
+
+fn parse_js_path(p: Parser) : PStr / Console =
+  if not p_at(p, TkLparen) {
+    PStr { p: p_error_here(p, "`extern \"js\"` needs its import path: `extern \"js\"(\"console.log\") fn ...`"), r: None }
+  } else {
+    let p1 = p_advance(p)
+    let tok = p_peek(p1)
+    if tk_is(tok.kind, TkString) { js_path_literal(p1, tok) }
+    else { PStr { p: p_error(p1, tok, "expected a path string literal inside `extern \"js\"(...)`"), r: None } }
+  }
+
+fn js_path_literal(p: Parser, tok: Token) : PStr / Console {
+  let span = tok_source(p.src, tok)
+  let n = string_length(span)
+  let path = if n >= 2 { string_slice(span, 1, n - 2) } else { "" }
+  if not is_valid_js_path(path) {
+    PStr { p: p_error(p, tok, concat_all(["invalid JavaScript path ", span, " — expected `[.]name(.name)*[=]`"])), r: None }
+  } else {
+    let p1 = p_eat(p_advance(p), TkRparen, "expected `)` to close `extern \"js\"(\"<path>\")`")
+    PStr { p: p1, r: if p_failed(p1) { None } else { Some(path) } }
   }
 }
 
@@ -385,12 +423,12 @@ fn extern_struct_body(p: Parser, name: String, t: Token, is_pub: Bool) : PDecl /
   }
 }
 
-fn extern_opaque_decl(p: Parser, t: Token, is_pub: Bool) : PDecl / Console {
+fn extern_opaque_decl(p: Parser, t: Token, is_pub: Bool, body: ExternTypeBody) : PDecl / Console {
   let id = p_peek(p)
   if not at_upper_ident(p, id) { fail_d_at(p, id, "expected an uppercase type name after `extern \"C\" opaque`") }
   else {
     let name = tok_source(p.src, id)
-    ok_dn(p_advance(p), DExternType(is_pub, name, ETOpaque, t.line, t.col, None), [p_ent(p, NCExternType, name, is_pub)])
+    ok_dn(p_advance(p), DExternType(is_pub, name, body, t.line, t.col, None), [p_ent(p, NCExternType, name, is_pub)])
   }
 }
 
@@ -473,8 +511,8 @@ fn row_labels(row: RowExpr) : [RowLabel] = match row {
   ROpen(_, lbs) -> lbs
 }
 
-fn extern_row_has_ffi(row: RowExpr) : Bool =
-  any(row_labels(row), (l) => match l { RL(r, _) -> ref_bare_text(r) == "Ffi" })
+fn extern_row_has(row: RowExpr, label: String) : Bool =
+  any(row_labels(row), (l) => match l { RL(r, _) -> ref_bare_text(r) == label })
 
 # The fixed-width boundary scalars: plain `Int` (`Real` for `F32`) boxes on the
 # kaikai side, C-cast at the shim.
@@ -562,24 +600,89 @@ declares `Ffi` and every parameter and the return type are C-ABI compatible.
 pub fn validate_extern_c_decl(decl_r: PDecl, t: Token) : PDecl / Console =
   match decl_r.r {
     Some(DAxiom(_, _, name, _, _, params, ret_ty, row, _, _)) ->
-      match extern_c_problem(name, params, ret_ty, row) {
+      match extern_problem("C", "Ffi", name, params, ret_ty, row) {
         Some(msg) -> err_d(p_error(decl_r.p, t, msg))
         None -> decl_r
       }
     _ -> decl_r
   }
 
-fn extern_c_problem(name: String, params: [Param], ret_ty: TypeExpr, row: RowExpr) : Option[String] =
-  if not extern_row_has_ffi(row) {
+fn extern_problem(abi: String, cap: String, name: String, params: [Param], ret_ty: TypeExpr, row: RowExpr) : Option[String] =
+  if not extern_row_has(row, cap) {
     Some(concat_all([
-      "`extern \"C\" fn ", name,
-      "` must declare `/ Ffi` in its row — FFI declarations always cross the Ffi capability boundary"
+      "`extern \"", abi, "\" fn ", name,
+      "` must declare `/ ", cap, "` in its row — foreign declarations always cross the ", cap, " capability boundary"
     ]))
   } else {
     match find(params, (pm) => not param_c_abi_safe(pm)) {
-      Some(pm) -> Some(extern_param_message(name, pm))
-      None -> if is_c_abi_safe_type(ret_ty, true) { None } else { Some(extern_return_message(name, ret_ty)) }
+      Some(pm) -> Some(extern_param_message(abi, name, pm))
+      None -> if is_c_abi_safe_type(ret_ty, true) { None } else { Some(extern_return_message(abi, name, ret_ty)) }
     }
+  }
+
+#[doc("Turns a parsed `extern \"js\" fn` into an error at the `extern` token unless its row declares `Js`, it takes and returns only boundary types (no function values), and its path shape agrees with its parameters.")]
+pub fn validate_extern_js_decl(decl_r: PDecl, t: Token) : PDecl / Console =
+  match decl_r.r {
+    Some(DAxiom(_, _, name, path, _, params, ret_ty, row, _, _)) ->
+      match extern_js_problem(name, path, params, ret_ty, row) {
+        Some(msg) -> err_d(p_error(decl_r.p, t, msg))
+        None -> decl_r
+      }
+    _ -> decl_r
+  }
+
+fn extern_js_problem(name: String, path: String, params: [Param], ret_ty: TypeExpr, row: RowExpr) : Option[String] =
+  match find(params, param_is_fn) {
+    Some(pm) -> Some(concat_all(["`extern \"js\" fn ", name, "` parameter `", written_text(pm.binder.name),
+                                 "` is a function — callbacks cannot cross to JavaScript; deliver events as values"]))
+    None -> if is_fn_type(ret_ty) { Some(concat_all(["`extern \"js\" fn ", name, "` returns a function — function values cannot cross to JavaScript"])) }
+            else {
+              match extern_problem("js", "Js", name, params, ret_ty, row) {
+                Some(msg) -> Some(msg)
+                None -> js_shape_problem(name, path, params, ret_ty)
+              }
+            }
+  }
+
+fn is_fn_type(t: TypeExpr) : Bool = match t.tkind {
+  TyFn(_, _, _) -> true
+  _             -> false
+}
+
+fn param_is_fn(p: Param) : Bool = match p.ptype {
+  Some(t) -> is_fn_type(t)
+  None    -> false
+}
+
+fn js_shape_problem(name: String, path: String, params: [Param], ret_ty: TypeExpr) : Option[String] {
+  let n = string_length(path)
+  let member = char_at_or_zero(path, 0) == '.'
+  let write = char_at_or_zero(path, n - 1) == '='
+  let arity = list_length(params)
+  let what = concat_all(["`extern \"js\" fn ", name, "`"])
+  if member and arity == 0 { Some(concat_all([what, " binds a member (`.name`) of its first parameter, which it does not have"])) }
+  else if write and arity != (if member { 2 } else { 1 }) {
+    Some(concat_all([what, " writes a property: it takes the value", if member { " after the receiver" } else { "" }, " and nothing else"]))
+  }
+  else if write and type_surface(ret_ty) != "Unit" { Some(concat_all([what, " writes a property, so it returns Unit"])) }
+  else { None }
+}
+
+#[doc("Reports whether a string is a JavaScript import path: dotted identifiers, an optional leading `.` (a member of the first argument) and an optional trailing `=` (a property write).")]
+pub fn is_valid_js_path(s: String) : Bool {
+  let n = string_length(s)
+  let a = if n > 0 and char_at_or_zero(s, 0) == '.' { 1 } else { 0 }
+  let b = if n > a and char_at_or_zero(s, n - 1) == '=' { n - 1 } else { n }
+  js_path_ok(s, a, b, true)
+}
+
+fn js_path_ok(s: String, i: Int, end: Int, at_start: Bool) : Bool =
+  if i >= end { not at_start }
+  else {
+    let c = char_at_or_zero(s, i)
+    if c == '.' { not at_start and js_path_ok(s, i + 1, end, true) }
+    else if at_start { (ch_is_alpha(c) or c == '$') and js_path_ok(s, i + 1, end, false) }
+    else { (ch_is_alnum(c) or c == '$') and js_path_ok(s, i + 1, end, false) }
   }
 
 fn param_c_abi_safe(p: Param) : Bool = match p.ptype {
@@ -587,20 +690,20 @@ fn param_c_abi_safe(p: Param) : Bool = match p.ptype {
   None -> false
 }
 
-fn extern_return_message(name: String, ret_ty: TypeExpr) : String =
+fn extern_return_message(abi: String, name: String, ret_ty: TypeExpr) : String =
   concat_all([
-    "`extern \"C\" fn ", name,
+    "`extern \"", abi, "\" fn ", name,
     "` return type `", type_surface(ret_ty),
     "` is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, Unit, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"
   ])
 
-fn extern_param_message(name: String, p: Param) : String {
+fn extern_param_message(abi: String, name: String, p: Param) : String {
   let ty_s = match p.ptype {
     Some(ty) -> type_surface(ty)
     None -> "<missing>"
   }
   concat_all([
-    "`extern \"C\" fn ", name,
+    "`extern \"", abi, "\" fn ", name,
     "` parameter `", written_text(p.binder.name),
     "` has type `", ty_s,
     "` which is not C-ABI compatible — allowed: Int, Real, Bool, Char, String, fixed-width (U8..F32), an `extern \"C\" type` struct, or an `extern \"C\" opaque` handle"

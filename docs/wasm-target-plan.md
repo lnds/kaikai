@@ -557,6 +557,18 @@ flips: without suspension only the callback shape gives an interactive page.
 
 ### 3.5 JavaScript interop: `extern "C"` or `extern "js"`
 
+**As built (PR 5).** The path carries four forms: `a.b` (call, or read a
+non-function with no arguments), `a.b=` (write), `.m` (member of the first
+argument, call or read) and `.m=` (write a member of the first argument). The
+host cannot see WebAssembly types, so the import name encodes the signature as
+`<param letters>:<return letter>:<path>` (`I` i64, `N` number, `B` bool, `S`
+string as pointer and length, `H` handle, `U` unit). A handle box carries a
+marker that makes its drop call the host's `release`; the host builtin
+`kai.handles` counts live handles. `[js]` in `kai.toml` takes one key,
+`module`, of the entry package. `Js` is accepted in `main`'s row on every target
+and refused by `build_target` on a host build; the native backend refuses the
+declaration.
+
 What works today with no language change (M): three `extern "C"` functions
 with no definition, linked with `-Wl,--allow-undefined`, became the imports
 `env.js_add`, `env.js_title`, `env.js_sleep`; `Int` crossed as `BigInt`,
