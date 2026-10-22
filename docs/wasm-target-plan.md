@@ -977,6 +977,22 @@ What each kind of runner is honest for:
 > `Link`, `Monitor` or `Actor`. Waits still stop with `this host has no
 > reactor` until PR 7.
 
+> **Stack checks (2026-10-22):** a fiber or segment runs on a malloc'd C stack
+> with no guard page, so an overflow would overwrite the heap. The emitter
+> writes `KAI_STACK_CHECK();` at the entry of every kaikai function; it is
+> empty on the host, and on wasm it compares `__stack_pointer` with the
+> running context's floor (the stack's start plus the smaller of a quarter
+> of its size and 8 KiB, kept by the shim across switches) and stops with
+> `kai: fiber stack overflow`, exit 139, as the host's guard page does.
+> Runtime functions are unchecked: their recursion is bounded. The main
+> stack needs no check: the linker places it first in memory, so an overflow
+> runs off address 0 and traps. Measured (M, node 23, `-O2`, check on against
+> the macro empty): loop-compiled mandelbrot +2 %, `fib(42)` +34 %, the two
+> together +24 %, module +272 bytes. A check per call is the cost of
+> memory safety here; only call-bound code pays more than a few percent.
+> `wasm-opt --stack-check` did not instrument these modules, and an
+> out-of-line hook per function cost +70 %.
+
 **PR 7 — `feat(runtime): waits park on the host event loop`**
 
 - *Touches*: `stage2/runtime.h` (the reactor: `kai_reactor_wait` and the timer
