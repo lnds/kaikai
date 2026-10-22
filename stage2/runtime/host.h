@@ -360,6 +360,10 @@ static int kai_nthreads = 1;
 #  pragma clang diagnostic pop
 #endif
 
+#ifndef KAI_STACK_CHECK
+#define KAI_STACK_CHECK() ((void) 0)
+#endif
+
 /* Not every program uses every core function; silence the
    unused-function warnings that would otherwise pile up in `cc` output
    when stage 0 links only the parts a given program needs. */

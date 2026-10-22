@@ -98,15 +98,17 @@ KAI_WCTX_NOINSTR static uintptr_t kai_wctx_floor(uintptr_t lo, size_t size) {
     return lo + (room < 8192 ? room : 8192);
 }
 
-#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER)
-/* Every instrumented function calls this on entry. */
-KAI_WCTX_NOINSTR void __cyg_profile_func_enter_bare(void) {
-    if ((uintptr_t) kai_wctx_sp_get() < kai_wctx_limit) {
-        static const char msg[] = "kai: fiber stack overflow\n";
-        write(2, msg, sizeof msg - 1);
-        _Exit(139);
-    }
+__attribute__((noreturn, noinline, cold)) KAI_WCTX_NOINSTR
+static void kai_wctx_overflow(void) {
+    static const char msg[] = "kai: fiber stack overflow\n";
+    write(2, msg, sizeof msg - 1);
+    _Exit(139);
 }
+
+/* Emitted at the entry of every kaikai function; the runtime's own recursion is bounded and unchecked. */
+#ifndef KAI_STACK_CHECK
+#define KAI_STACK_CHECK() \
+    do { if (__builtin_expect((uintptr_t) kai_wctx_sp_get() < kai_wctx_limit, 0)) kai_wctx_overflow(); } while (0)
 #endif
 
 /* The stack pointer a fresh target starts on, NULL for one already running. */
