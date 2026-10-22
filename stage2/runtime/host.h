@@ -65,6 +65,7 @@
 #endif
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,8 +94,20 @@ static inline void kai_flush_stdout(void) { if (kai_stdout_pending()) fflush(std
 
 /* Every runtime stderr write goes through these so earlier stdout bytes
  * stay ahead of it in a merged log. */
-#define kai_eprintf(...) (kai_flush_stdout(), fprintf(stderr, __VA_ARGS__))
-#define kai_eputs(s) (kai_flush_stdout(), fputs((s), stderr))
+__attribute__((unused, cold, noinline, format(printf, 1, 2)))
+static void kai_eprintf(const char *fmt, ...) {
+    kai_flush_stdout();
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+__attribute__((unused, cold, noinline))
+static void kai_eputs(const char *s) {
+    kai_flush_stdout();
+    fputs(s, stderr);
+}
 
 /* Every runtime exit goes through kai_exit: exit() tears down LLVM's lazily
  * built statics, so the native emit pool is drained first. */
