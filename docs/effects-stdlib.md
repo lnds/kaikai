@@ -133,12 +133,16 @@ own handler still builds.
 |---|---|---|
 | `Stdout`, `Stderr`, `Env`, `Random`, `SecureRandom`, `Log`, `Mutable`, `State`, `Reader`, `Writer` | allowed | the page supplies or the runtime keeps them |
 | `Clock` | allowed | `wall_now` and `monotonic_now` run; `sleep_ns` stops at run time with `kai: this host has no reactor` |
-| `Process`, `Signal` | refused | no processes or signals on a page |
+| `Process` | allowed | `exit` runs; every other op stops at run time with `kai: this host has no processes` |
+| `Signal` | refused | no signals on a page |
 | `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` | refused | no sockets |
 | `File`, `Stdin` | refused | no file system or stdin |
 | `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | refused | one thread, no fibers |
 
-The check works on rows, not operations, so `Clock` stays allowed as a whole.
+The rule: an effect is refused when no operation of it runs in the page, and
+allowed, with runtime stops for the operations that cannot run (`Clock.sleep_ns`,
+the `Process` operations other than `exit`), when some do. The check works on
+rows, not operations.
 Waits become available with the suspension work of the next phase.
 
 Sections are self-contained; skim the catalog, then dive where

@@ -206,17 +206,18 @@ the Stage A/B/C trilogy live in `docs/effects.md`.
 
 `kai build --target=wasm32-browser` builds for a page. A page has no
 processes, sockets, signals, files, stdin or fibers, so a `main` whose
-final row holds `Process`, `Signal`, `NetTcp`, `NetUdp`, `NetUnix`,
+final row holds `Signal`, `NetTcp`, `NetUdp`, `NetUnix`,
 `NetDns`, `File`, `Stdin`, `Spawn`, `Cancel`, `Link`, `Monitor` or `Actor`
 is refused at compile time:
 
 ```
-error: `main` performs effect `Process`, which the `wasm32-browser` target cannot run
+error: `main` performs effect `Signal`, which the `wasm32-browser` target cannot run
 ```
 
 Handle the effect inside `main` with a handler of your own, or remove it
-from the row. `Clock` is allowed, but `Clock.sleep_ns` stops at run time
-on a page. Host builds pass no target and are unaffected.
+from the row. An effect with some operation the page can run is allowed,
+and its other operations stop at run time: `Clock.sleep_ns`, and every
+`Process` operation except `exit`. Host builds pass no target and are unaffected.
 
 ## Handler state — `state` and `log`
 
