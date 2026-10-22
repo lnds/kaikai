@@ -24,16 +24,10 @@ if [ -z "${KAI_WASI_SDK:-}" ]; then
   export XDG_CACHE_HOME="$TMP/cache"
 fi
 
-# Fixtures of the parity corpus the page cannot run: the target refuses them at build time.
-UNSUPPORTED="web_spawn web_resume_kept"
-
 if [ $# -gt 0 ]; then
   FIXTURES=("$@")
 else
-  FIXTURES=()
-  for f in "$ROOT"/examples/web/*.kai; do
-    case " $UNSUPPORTED " in *" $(basename "$f" .kai) "*) ;; *) FIXTURES+=("$f") ;; esac
-  done
+  FIXTURES=("$ROOT"/examples/web/*.kai)
 fi
 
 if [ -z "${BROWSERS+x}" ]; then
@@ -51,11 +45,14 @@ compare() { # name leg actual-file expected-file
   fi
 }
 
-# node before 24.15 needs a flag for exception handling with exnref.
+# node before 24.15 needs a flag for exception handling with exnref, and one for JSPI.
 run_module() {
+  local flags=""
   node "$1" 2>"$TMP/node.err" && return 0
-  if grep -q "experimental-wasm-exnref" "$TMP/node.err"; then
-    node --experimental-wasm-exnref "$1" 2>/dev/null
+  grep -q "experimental-wasm-exnref" "$TMP/node.err" && flags="--experimental-wasm-exnref"
+  node $flags "$1" 2>"$TMP/node.err" && return 0
+  if grep -q "Promise Integration" "$TMP/node.err"; then
+    node $flags --experimental-wasm-jspi "$1" 2>/dev/null
   else
     return 1
   fi
@@ -98,6 +95,10 @@ run_browsers() {
       [ -f "$TMP/out/$n.html" ] || continue
       python3 -I "$ROOT/tools/web-driver.py" "$b" "http://127.0.0.1:8765/$n.html" >"$TMP/$n.$b" 2>"$TMP/$n.$b.err" \
         || { cat "$TMP/$n.$b.err"; bad "$n [$b] driver"; continue; }
+      if [ "$b" != chrome ] && grep -q "Promise Integration" "$TMP/$n.$b"; then
+        say "skip: $n [$b] (this browser has no JSPI)"
+        continue
+      fi
       compare "$n" "$b" "$TMP/$n.$b" "${f%.kai}.out.expected"
     done
   done

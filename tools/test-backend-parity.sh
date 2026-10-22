@@ -63,7 +63,7 @@ case "$TARGET_BACKEND" in
       exit 0
     fi
     WASM_CC="$WASI_SDK/bin/clang"
-    WASM_CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp -Wno-unused-command-line-argument"
+    WASM_CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp -Wl,--export=__stack_pointer -Wl,--export-table -Wno-unused-command-line-argument"
     WASM_NODE_FLAGS="${WASM_NODE_FLAGS:-}"
     WASM_HOST="$ROOT/stage2/web/kai_host.mjs"
     export WASM_CC WASM_CFLAGS WASM_NODE_FLAGS WASM_HOST
@@ -90,8 +90,21 @@ target_build() {
 
 target_exec() {
   if [ "$TARGET_BACKEND" = wasm ]; then
+    # node before 24.15 needs a flag for JSPI, which fibers and kept continuations run on.
+    local err rc
+    err="$(mktemp)"
     # shellcheck disable=SC2086
-    node $WASM_NODE_FLAGS "$WASM_HOST" "$1"
+    node $WASM_NODE_FLAGS "$WASM_HOST" "$1" 2>"$err"
+    rc=$?
+    if [ "$rc" -ne 0 ] && grep -q "Promise Integration" "$err"; then
+      # shellcheck disable=SC2086
+      node --experimental-wasm-jspi $WASM_NODE_FLAGS "$WASM_HOST" "$1"
+      rc=$?
+    else
+      cat "$err" >&2
+    fi
+    rm -f "$err"
+    return "$rc"
   else
     "$1"
   fi

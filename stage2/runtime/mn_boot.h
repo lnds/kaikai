@@ -183,7 +183,9 @@ static int kai_host_ncpu(void) {
  * Any count is clamped to [1, KAI_MAX_THREADS-1] so the reactor thread's
  * id (kai_nthreads) stays a valid slot index. */
 static int kai_read_nthreads(void) {
-#if KAI_HOST_FIBERS
+#if defined(__wasm__)
+    return 1;
+#elif KAI_HOST_FIBERS
     const char *e = getenv("KAI_THREADS");
     if (!e || !*e) {
         int n = kai_host_ncpu();
@@ -220,7 +222,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
         return kai_main_runs(user_main);
     }
 
-#if KAI_HOST_FIBERS
+#if KAI_HOST_FIBERS && !defined(__wasm__)
     kai_user_main_fn = user_main;
     /* The Char cache is classified immortal — shared by every thread, never
      * mutated after init. Lazy warming breaks the second half of that: the

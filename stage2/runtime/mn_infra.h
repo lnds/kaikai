@@ -216,6 +216,8 @@ static void kai_drain_pending_free(KaiWorker *w) {
     if (f->stack_base) {
         munmap(f->stack_base, f->stack_size + kai_page_size());
     }
+#elif defined(__wasm__)
+    free(f->stack_base);
 #endif
     kai_tsan_fiber_free(f);
     free(f->free_stack);
