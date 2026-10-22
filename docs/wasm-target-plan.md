@@ -400,6 +400,15 @@ numbers are left out on purpose; the function names are stable.
   `File` runs its work in place when there is no reactor, and `main` refuses
   on `wasm32-browser` the effects the page cannot run (PR 4). The playground
   (#2540) is out of scope.
+- **Phase 2 is go** (2026-10-22), with the recommendations adopted: JSPI
+  behind the existing seams (3.3); events as values `main` waits for, no
+  callbacks from JavaScript (3.4); `extern "js"` with its own capability
+  `Js`, type-checked on every target and refused at `main` where it cannot
+  run (3.5); the browser stdlib as ordinary effects over `extern "js"` in
+  `web.dom`, `web.fetch`, `web.storage` and `web.timer`, installed by a
+  wrapper (3.6). Pages that suspend (fibers, waits, events) need the JSPI
+  engines of 3.8 (Chrome and Edge 137, Firefox 153, Safari 27); pages that
+  never suspend keep phase 1's exnref baseline.
 
 ### 3.1 Toolchain and libc
 
