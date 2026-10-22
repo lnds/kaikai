@@ -90,7 +90,7 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     root->stack_base = region;
     root->stack_size = size;
     if (getcontext(&ctx) != 0) {
-        fprintf(stderr, "kai: getcontext failed for main\n");
+        kai_eprintf("kai: getcontext failed for main\n");
         kai_exit(1);
     }
     kai_ctx_set_stack(&ctx, (char *) region + ps, size);
@@ -253,7 +253,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
      * stack, not a fiber one: raising the thread count must not shrink the
      * stack budget a working program already had. */
     KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
-    if (!root) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!root) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     root->home_thread = 0;
     /* Thread 0 IS the OS thread the process entered `main` on, so pinning
      * the entry fiber here is what makes `main` observably main-thread —
@@ -280,7 +280,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
         kai_rc_go_mt();
         if (pthread_create(&kai_worker_threads[i], NULL,
                            kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
-            fprintf(stderr, "kai: scheduler pthread_create failed: %s\n",
+            kai_eprintf("kai: scheduler pthread_create failed: %s\n",
                     strerror(errno));
             kai_exit(1);
         }
@@ -289,7 +289,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     /* F2 — start the dedicated reactor thread. */
     kai_rc_go_mt();
     if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
-        fprintf(stderr, "kai: reactor pthread_create failed: %s\n", strerror(errno));
+        kai_eprintf("kai: reactor pthread_create failed: %s\n", strerror(errno));
         kai_exit(1);
     }
 
@@ -351,11 +351,11 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
 static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiValue *stamp_pid) {
     KaiMailbox *stamp_mb = stamp_pid ? stamp_pid->as.mb : NULL;
     if (!thunk || thunk->tag != KAI_CLOSURE) {
-        fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
+        kai_eprintf("kai: Spawn.spawn called with non-closure value\n");
         kai_exit(1);
     }
     KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
-    if (!f) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!f) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     f->parent       = kai_current_fiber();
     /* The fiber owns its thunk for its whole lifetime. At N=1 an incref
      * suffices (one thread). At N>1 the fiber may run on another
@@ -452,7 +452,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiC
 {
     (void) self;
     if (!fib_v || fib_v->tag != KAI_FIBER || !fib_v->as.fib) {
-        fprintf(stderr, "kai: Spawn.await called on non-fiber value\n");
+        kai_eprintf("kai: Spawn.await called on non-fiber value\n");
         kai_exit(1);
     }
     KaiFiber *f = fib_v->as.fib;
@@ -499,11 +499,11 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
 {
     (void) self;
     if (!fibs_v || (fibs_v->tag != KAI_CONS && fibs_v->tag != KAI_NIL)) {
-        fprintf(stderr, "kai: Spawn.select called on non-list value\n");
+        kai_eprintf("kai: Spawn.select called on non-list value\n");
         kai_exit(1);
     }
     if (fibs_v->tag == KAI_NIL) {
-        fprintf(stderr, "kai: Spawn.select called on empty list\n");
+        kai_eprintf("kai: Spawn.select called on empty list\n");
         kai_exit(1);
     }
     /* Collect the candidates once: the list is walked repeatedly below and
@@ -514,14 +514,14 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
     KaiFiber **fibs = fibs_stack;
     if (n > 8) {
         fibs = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
-        if (!fibs) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!fibs) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     }
     {
         int i = 0;
         for (KaiValue *c = fibs_v; kai_is_ptr(c) && c->tag == KAI_CONS; c = c->as.cons.tail) {
             KaiValue *elem = c->as.cons.head;
             if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
-                fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");
+                kai_eprintf("kai: Spawn.select: list element is not a fiber\n");
                 kai_exit(1);
             }
             fibs[i++] = elem->as.fib;
@@ -543,7 +543,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
     KaiSelectWaiter *nodes = nodes_stack;
     if (n > 8) {
         nodes = (KaiSelectWaiter *) malloc((size_t) n * sizeof(KaiSelectWaiter));
-        if (!nodes) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!nodes) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     }
     KaiFiber *me     = kai_current_fiber();
     KaiFiber *winner = NULL;
@@ -724,7 +724,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
     (void) self;
     KaiFiber *f = kai_current_fiber();
     KaiNursery *n = (KaiNursery *) calloc(1, sizeof(KaiNursery));
-    if (!n) { fprintf(stderr, "kai: out of memory (nursery scope)\n"); kai_exit(1); }
+    if (!n) { kai_eprintf("kai: out of memory (nursery scope)\n"); kai_exit(1); }
     n->children_head = NULL;
     n->parent        = f->nursery_top;
     n->ev_top        = f->evidence_top;
@@ -897,7 +897,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
             kai_fiber_pad_jump(f, 0);
             /* Unreachable. */
         }
-        fputs("kai: nursery child cancelled; no survivors\n", stderr);
+        kai_eputs("kai: nursery child cancelled; no survivors\n");
         kai_exit(1);
     }
     return kai_cont_resume(k, kai_unit());
@@ -923,7 +923,7 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
         kai_fiber_pad_jump(f, 0);
         /* Unreachable. */
     }
-    fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
+    kai_eputs("kai: Cancel.raise: unhandled (fiber cancelled)\n");
     kai_exit(0);
 }
 
@@ -952,7 +952,7 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
     KaiLinkNode *na = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
     KaiLinkNode *nb = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
     if (!na || !nb) {
-        fprintf(stderr, "kai: out of memory (link)\n");
+        kai_eprintf("kai: out of memory (link)\n");
         kai_exit(1);
     }
     na->peer = b; na->next = a->linked_head; a->linked_head = na;

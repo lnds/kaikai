@@ -59,7 +59,7 @@ static void kai_reactor_wait(void) {
     if (max_fds > (int) (sizeof(stack_pfds) / sizeof(stack_pfds[0]))) {
         pfds = (struct pollfd *) malloc((size_t) max_fds * sizeof(*pfds));
         if (!pfds) {
-            fprintf(stderr, "kai: reactor pfds malloc failed\n");
+            kai_eprintf("kai: reactor pfds malloc failed\n");
             kai_exit(1);
         }
         heap_alloced = 1;
@@ -127,10 +127,11 @@ static void kai_reactor_wait(void) {
     /* Parked workers never retry the deadlock check, so a reactor going
      * quiescent after the last worker parked must run it itself. */
     if (kai_nthreads > 1) kai_sched_check_deadlock();
+    if (timeout_ms != 0 && kai_nthreads <= 1) kai_flush_stdout();
     int rc = poll(pfds, (nfds_t) nfds, timeout_ms);
     if (kai_nthreads > 1) atomic_store(&kai_reactor_idle, 0);
     if (rc < 0 && errno != EINTR) {
-        fprintf(stderr, "kai: reactor poll() failed: %s\n", strerror(errno));
+        kai_eprintf("kai: reactor poll() failed: %s\n", strerror(errno));
         kai_exit(1);
     }
 
@@ -494,12 +495,12 @@ static void *kai_stack_map(size_t stack_size) {
     size_t total = stack_size + page;
     void *region = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
     if (region == MAP_FAILED) {
-        fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
+        kai_eprintf("kai: mmap failed allocating fiber stack (%zu bytes)\n",
                 total);
         kai_exit(1);
     }
     if (mprotect(region, page, PROT_NONE) != 0) {
-        fprintf(stderr, "kai: mprotect guard page failed for fiber stack\n");
+        kai_eprintf("kai: mprotect guard page failed for fiber stack\n");
         munmap(region, total);
         kai_exit(1);
     }
@@ -529,7 +530,7 @@ static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
 #if KAI_HOST_FIBERS
     kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
-        fprintf(stderr, "kai: getcontext failed for new fiber\n");
+        kai_eprintf("kai: getcontext failed for new fiber\n");
         kai_exit(1);
     }
     {

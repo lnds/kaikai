@@ -139,7 +139,7 @@ static void kai_cov_grow(void) {
     size_t n = kai_cov_cap;
     kai_cov_cap = n ? n * 2 : 1024;
     kai_cov_set = (const char **) calloc(kai_cov_cap, sizeof *kai_cov_set);
-    if (!kai_cov_set) { fprintf(stderr, "kai: out of memory recording coverage\n"); kai_exit(2); }
+    if (!kai_cov_set) { kai_eprintf("kai: out of memory recording coverage\n"); kai_exit(2); }
     kai_cov_len = 0;
     for (size_t i = 0; i < n; i++) if (old[i]) kai_cov_insert(old[i]);
     free(old);
@@ -202,7 +202,7 @@ KAI_SCHED_FN void kai_cov_take(FILE *o) {
     size_t total = 0, n = 0;
     for (size_t i = 0; i < kai_cov_cap; i++) if (kai_cov_set[i]) total += kai_cov_site_count(kai_cov_set[i]);
     KaiCovLine *ls = (KaiCovLine *) malloc((total ? total : 1) * sizeof *ls);
-    if (!ls) { fprintf(stderr, "kai: out of memory reporting coverage\n"); kai_exit(2); }
+    if (!ls) { kai_eprintf("kai: out of memory reporting coverage\n"); kai_exit(2); }
     for (size_t i = 0; i < kai_cov_cap; i++) if (kai_cov_set[i]) n = kai_cov_site_lines(kai_cov_set[i], ls, n);
     kai_cov_clear_locked();
     pthread_mutex_unlock(&kai_cov_mu);
@@ -307,7 +307,7 @@ static void kai_test_unreported_fail(void) {
 static void kai_test_pass(void) {
     kai_test_count_passed++;
     if (kai_test_json_mode()) { kai_test_json_record("pass", NULL); kai_test_reported = 1; return; }
-    fprintf(stderr, "  ok   %s\n", kai_test_current ? kai_test_current : "");
+    kai_eprintf("  ok   %s\n", kai_test_current ? kai_test_current : "");
 }
 
 __attribute__((noinline))
@@ -317,7 +317,7 @@ static void kai_test_fail(const char *desc, const char *msg) {
         kai_test_reported = 1;
         return;
     }
-    fprintf(stderr, "  FAIL %s : %s\n",
+    kai_eprintf("  FAIL %s : %s\n",
             desc ? desc : "",
             msg  ? msg  : "assertion failed");
 }
@@ -345,7 +345,7 @@ static int kai_test_summary(void) {
                 kai_test_count_passed, failed, kai_test_suite_ns / 1000000LL);
         fflush(o);
     } else {
-        fprintf(stderr, "\n%d/%d tests passed\n",
+        kai_eprintf("\n%d/%d tests passed\n",
                 kai_test_count_passed, kai_test_count_total);
     }
     return failed == 0 ? 0 : 1;
@@ -401,7 +401,7 @@ static void kai_test_register(void (*run)(void), const char *desc,
     if ((kai_test_nentries & (kai_test_nentries - 1)) == 0) {
         int cap = kai_test_nentries == 0 ? 16 : kai_test_nentries * 2;
         KaiTestEntry *grown = (KaiTestEntry *)realloc(kai_test_entries, (size_t)cap * sizeof(KaiTestEntry));
-        if (!grown) { fprintf(stderr, "kai: out of memory registering tests\n"); kai_exit(2); }
+        if (!grown) { kai_eprintf("kai: out of memory registering tests\n"); kai_exit(2); }
         kai_test_entries = grown;
     }
     KaiTestEntry e = { run, desc, body, line, home ? home : "" };

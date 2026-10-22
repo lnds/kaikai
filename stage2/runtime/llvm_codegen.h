@@ -607,7 +607,7 @@ static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm, int
     LLVMDisposePassBuilderOptions(opts);
     if (e) {
         char *msg = LLVMGetErrorMessage(e);   /* consumes e + allocates msg */
-        fprintf(stderr, "kai: native opt pass pipeline (%s) failed: %s\n",
+        kai_eprintf("kai: native opt pass pipeline (%s) failed: %s\n",
                 pipeline, msg ? msg : "?");
         LLVMDisposeErrorMessage(msg);         /* frees msg; do NOT ConsumeError(e) */
         return 1;

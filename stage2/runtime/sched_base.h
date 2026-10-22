@@ -51,11 +51,12 @@ static void _kai_log_emit(const char *level_padded, KaiValue *msg) {
     /* Header `[<ts>] <LEVEL> ` then the message bytes then newline.
      * fputs on the prefix, fwrite on the message body so embedded
      * NULs in user strings don't truncate the line. */
+    kai_flush_stdout();
     flockfile(stderr);
     fputc('[', stderr);
-    fputs(ts, stderr);
-    fputs("] ", stderr);
-    fputs(level_padded, stderr);
+    kai_eputs(ts);
+    kai_eputs("] ");
+    kai_eputs(level_padded);
     fputc(' ', stderr);
     if (msg && msg->tag == KAI_STR && msg->as.s.bytes && msg->as.s.len > 0) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
@@ -132,7 +133,7 @@ static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
         ssize_t got = getrandom(buf + off, n - off, 0);
         if (got < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "kai: SecureRandom: getrandom failed: %s\n", strerror(errno));
+            kai_eprintf("kai: SecureRandom: getrandom failed: %s\n", strerror(errno));
             kai_exit(1);
         }
         off += (size_t) got;
@@ -154,7 +155,7 @@ static KaiValue *kai_default_securerandom_int_range(void *self, KaiValue *min_v,
     int64_t lo = (kai_is_int(min_v)) ? kai_intf(min_v) : 0;
     int64_t hi = (kai_is_int(max_v)) ? kai_intf(max_v) : 0;
     if (lo > hi) {
-        fprintf(stderr, "kai: SecureRandom.int: min (%lld) > max (%lld)\n",
+        kai_eprintf("kai: SecureRandom.int: min (%lld) > max (%lld)\n",
                 (long long) lo, (long long) hi);
         kai_exit(1);
     }
@@ -182,7 +183,7 @@ static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCo
     if (n > (1 << 20)) n = 1 << 20;
     unsigned char *buf = (unsigned char *) malloc((size_t) n);
     if (!buf) {
-        fputs("kai: SecureRandom.bytes: out of memory\n", stderr);
+        kai_eputs("kai: SecureRandom.bytes: out of memory\n");
         kai_exit(1);
     }
     _kai_securerandom_fill(buf, (size_t) n);
@@ -242,7 +243,7 @@ static size_t kai_fiber_stack_size(void) {
         if (end != env && *end == '\0' && parsed >= 4096 && parsed <= (long long)(64 * 1024 * 1024)) {
             sz = (size_t) parsed;
         } else {
-            fprintf(stderr,
+            kai_eprintf(
                 "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default 64K\n",
                 env);
         }

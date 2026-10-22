@@ -262,7 +262,7 @@ KAI_VEC_FAST int64_t kai_real_bits(double x) { int64_t b; memcpy(&b, &x, 8); ret
 
 static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_slice: not a vec\n"); kai_exit(1);
+        kai_eprintf("kai: vec_slice: not a vec\n"); kai_exit(1);
     }
     int64_t len = v->as.vec.len;
     if (start < 0 || slen < 0 || start > len || slen > len - start) {
@@ -295,7 +295,7 @@ static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
 /* `[h, ...t]`'s tail: everything from `start` on. */
 static KaiValue *kai_vec_tail_from_impl(KaiValue *v, int64_t start) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_slice: not a vec\n"); kai_exit(1);
+        kai_eprintf("kai: vec_slice: not a vec\n"); kai_exit(1);
     }
     return kai_vec_slice_impl(v, start, v->as.vec.len - start);
 }
@@ -430,7 +430,7 @@ static inline KaiValue *kai_static_closure(KaiValue **slot, KaiFn fn, int arity)
  * pointer is freed before the result hits the caller). */
 static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
-        fprintf(stderr, "kai: attempted to call a non-callable value\n");
+        kai_eprintf("kai: attempted to call a non-callable value\n");
         kai_exit(1);
     }
     KaiValue *r = clo->as.clo.fn(clo, argv, argc);
@@ -447,7 +447,7 @@ static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
  * only the closure is borrowed. */
 static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
-        fprintf(stderr, "kai: attempted to call a non-callable value\n");
+        kai_eprintf("kai: attempted to call a non-callable value\n");
         kai_exit(1);
     }
     return clo->as.clo.fn(clo, argv, argc);
@@ -457,14 +457,14 @@ static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
 
 static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
-        fprintf(stderr, "kai: field access on non-record\n"); kai_exit(1);
+        kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
     for (int i = 0; i < rec->as.rec.n_fields; ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
             return kai_incref(rec->as.rec.fields[i]);
         }
     }
-    fprintf(stderr, "kai: no such field `%s`\n", name); kai_exit(1);
+    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
 }
 
 /* Constant-index field read. Same RC contract as kai_op_field (increfs the
@@ -473,7 +473,7 @@ static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
    declaration-order layout. */
 static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
-        fprintf(stderr, "kai: field access on non-record\n"); kai_exit(1);
+        kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
     return kai_incref(rec->as.rec.fields[i]);
 }
@@ -487,14 +487,14 @@ static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
    bindings still own their own refs. */
 static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
-        fprintf(stderr, "kai: field access on non-record\n"); kai_exit(1);
+        kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
     for (int i = 0; i < rec->as.rec.n_fields; ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
             return rec->as.rec.fields[i];
         }
     }
-    fprintf(stderr, "kai: no such field `%s`\n", name); kai_exit(1);
+    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
 }
 
 /* ---------- equality ---------- */

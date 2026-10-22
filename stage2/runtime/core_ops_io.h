@@ -74,7 +74,7 @@ static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
     else if ((r = kai_fixed_arith(a, b, '+')) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in +\n"); kai_exit(1); }
+    else { kai_eprintf("kai: type mismatch in +\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -84,7 +84,7 @@ static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) - (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
     else if ((r = kai_fixed_arith(a, b, '-')) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in -\n"); kai_exit(1); }
+    else { kai_eprintf("kai: type mismatch in -\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -94,7 +94,7 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) * (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
     else if ((r = kai_fixed_arith(a, b, '*')) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in *\n"); kai_exit(1); }
+    else { kai_eprintf("kai: type mismatch in *\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -110,7 +110,7 @@ static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
     } else if ((r = kai_fixed_div(a, b)) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in /\n"); kai_exit(1); }
+    else { kai_eprintf("kai: type mismatch in /\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -138,7 +138,7 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
         __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("mod by zero"); }
         /* `x % -1` is 0 by definition; the direct op is UB at I128_MIN. */
         r = kai_int128(y == -1 ? (__int128) 0 : kai_i128_load(a) % y);
-    } else { fprintf(stderr, "kai: type mismatch in %%\n"); kai_exit(1); }
+    } else { kai_eprintf("kai: type mismatch in %%\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -226,7 +226,7 @@ KAI_RT_SHARED KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
             kai_decref(a); kai_decref(b);
             return kai_bool(_o_r);
         }
-        fprintf(stderr, "kai: type mismatch in <\n"); kai_exit(1);
+        kai_eprintf("kai: type mismatch in <\n"); kai_exit(1);
     }
     kai_decref(a); kai_decref(b);
     return r;
@@ -256,7 +256,7 @@ KAI_RT_SHARED KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
             kai_decref(a); kai_decref(b);
             return kai_bool(_o_r);
         }
-        fprintf(stderr, "kai: type mismatch in >\n"); kai_exit(1);
+        kai_eprintf("kai: type mismatch in >\n"); kai_exit(1);
     }
     kai_decref(a); kai_decref(b);
     return r;
@@ -327,7 +327,7 @@ static KaiValue *kai_op_ne_v(KaiValue *a, KaiValue *b) {
  * dispatches through this helper, never through the protocol. */
 static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
     if (!kai_is_int(b)) {
-        fprintf(stderr, "kai: type mismatch in ^ (exponent must be Int)\n"); kai_exit(1);
+        kai_eprintf("kai: type mismatch in ^ (exponent must be Int)\n"); kai_exit(1);
     }
     int64_t e = kai_intf(b);
     KaiValue *r;
@@ -347,7 +347,7 @@ static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
         for (int64_t i = 0; i < k; i++) { acc *= base; }
         if (e < 0) { acc = 1.0 / acc; }
         r = kai_real(acc);
-    } else { fprintf(stderr, "kai: type mismatch in ^\n"); kai_exit(1); }
+    } else { kai_eprintf("kai: type mismatch in ^\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -361,7 +361,7 @@ static KaiValue *kai_op_neg(KaiValue *a) {
     else if (kai_is_ptr(a) && a->tag == KAI_UINT32) r = kai_uint32((uint32_t)(-a->as.u32));
     else if (kai_is_ptr(a) && a->tag == KAI_UINT64) r = kai_uint64((uint64_t)(-a->as.u64));
     else if (kai_is_ptr(a) && a->tag == KAI_INT128) r = kai_int128((__int128)(-(unsigned __int128) kai_i128_load(a)));
-    else { fprintf(stderr, "kai: type mismatch in unary -\n"); kai_exit(1); }
+    else { kai_eprintf("kai: type mismatch in unary -\n"); kai_exit(1); }
     kai_decref(a);
     return r;
 }
@@ -369,7 +369,7 @@ static KaiValue *kai_op_neg(KaiValue *a) {
 static KaiValue *kai_op_boolnot(KaiValue *a) {
     KaiValue *r;
     if (a->tag == KAI_BOOL) r = kai_bool(!a->as.b);
-    else { fprintf(stderr, "kai: type mismatch in `not`\n"); kai_exit(1); }
+    else { kai_eprintf("kai: type mismatch in `not`\n"); kai_exit(1); }
     kai_decref(a);
     return r;
 }
@@ -398,7 +398,7 @@ static KaiValue *kai_range(KaiValue *from, KaiValue *to) {
 
 static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
     int64_t s = kai_intf(step);
-    if (s == 0) { fprintf(stderr, "kai: zero step in range\n"); kai_exit(1); }
+    if (s == 0) { kai_eprintf("kai: zero step in range\n"); kai_exit(1); }
     return kai_range_new(kai_intf(from), kai_intf(to), s);
 }
 
@@ -424,15 +424,9 @@ static void kai_set_args(int argc, char **argv) {
     (void) kai_worker_here();
     kai_g_argc = argc;
     kai_g_argv = argv;
-    /* Issue #678: libc defaults stdout to fully-buffered when the fd
-     * is a pipe or regular file. Combined with the runtime's reliance
-     * on atexit-driven flush (which signal-driven termination skips),
-     * that loses every Stdout.print issued before the buffer fills or
-     * before a clean exit. Match Go / Rust / Python -u semantics by
-     * forcing line-buffering at process entry. One syscall at startup;
-     * TTY stdout is already line-buffered so this is a no-op there.
-     * stderr is unbuffered by default — no change needed. */
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    /* Block-buffered off a TTY (one write per buffer, not per line); the
+     * runtime flushes before it blocks, writes stderr, or exits. */
+    if (isatty(STDOUT_FILENO)) setvbuf(stdout, NULL, _IOLBF, 0);
     /* Lazy registration: kai_set_args runs once at program start from
        the emitted main wrapper. atexit fires only when the env var
        gates a report, so the side effect is harmless when tracing is
@@ -609,7 +603,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
 #else
 {
     if (!pid || pid->tag != KAI_PID) {
-        fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
+        kai_eprintf("kai: mailbox_send: argument is not a Pid\n");
         kai_exit(1);
     }
     /* A send to an ended mailbox succeeds and the message is dropped: the
@@ -643,7 +637,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv(KaiValue *pid)
 #else
 {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
-        fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
+        kai_eprintf("kai: mailbox_recv: argument is not a Pid\n");
         kai_exit(1);
     }
     /* kai_mailbox_pop returns the stored ref (mailbox transferred its
@@ -667,7 +661,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ti
 #else
 {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
-        fprintf(stderr, "kai: mailbox_recv_timeout: argument is not a Pid\n");
+        kai_eprintf("kai: mailbox_recv_timeout: argument is not a Pid\n");
         kai_exit(1);
     }
     int64_t ns = kai_intf(timeout_nanos);

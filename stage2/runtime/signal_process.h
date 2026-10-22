@@ -440,7 +440,7 @@ static void _kai_proc_pipe_forget(int pid) {
 
 static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd, int err_fd, int own_group) {
     KaiProcPipe *e = (KaiProcPipe *) malloc(sizeof(KaiProcPipe));
-    if (!e) { fputs("kai: out of memory\n", stderr); kai_exit(1); }
+    if (!e) { kai_eputs("kai: out of memory\n"); kai_exit(1); }
     e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd; e->err_fd = err_fd;
     e->own_group = own_group;
     pthread_mutex_lock(&kai_proc_pipes_mu);
@@ -542,7 +542,7 @@ static ssize_t _kai_proc_write_once(int fd, const char *buf, size_t len) {
 static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
     (void) self;
     if (!cmd || cmd->tag != KAI_STR) {
-        fputs("kai: Process.start: cmd must be a String\n", stderr);
+        kai_eputs("kai: Process.start: cmd must be a String\n");
         kai_exit(1);
     }
     kai_reactor_init();
@@ -552,7 +552,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
     int argc = 0;
     char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
     if (!argv) {
-        fputs("kai: Process.start: out of memory building argv\n", stderr);
+        kai_eputs("kai: Process.start: out of memory building argv\n");
         kai_exit(1);
     }
 
@@ -560,7 +560,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
     if (pid < 0) {
         int e = errno;
         _kai_process_free_argv(argv, argc);
-        fprintf(stderr, "kai: Process.start: fork: %s\n", strerror(e));
+        kai_eprintf("kai: Process.start: fork: %s\n", strerror(e));
         kai_exit(1);
     }
     if (pid == 0) {
@@ -777,7 +777,7 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
     const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
     int argc = 0;
     char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
-    if (!argv) { fputs("kai: out of memory\n", stderr); kai_exit(1); }
+    if (!argv) { kai_eputs("kai: out of memory\n"); kai_exit(1); }
     kai_reactor_init();
     pid_t pid = fork();
     if (pid < 0) {
@@ -909,7 +909,7 @@ static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
     kai_reactor_init();
     enum { KAI_PROC_READ_CHUNK = 65536 };
     char *buf = (char *) malloc(KAI_PROC_READ_CHUNK);
-    if (!buf) { fputs("kai: out of memory\n", stderr); kai_exit(1); }
+    if (!buf) { kai_eputs("kai: out of memory\n"); kai_exit(1); }
     ssize_t n;
     for (;;) {
         n = read(fd, buf, KAI_PROC_READ_CHUNK);

@@ -121,7 +121,7 @@ static void kai_check_trap_exit_cancel_bypass(void) {
 static void kai_monitor_add(KaiFiber *target, KaiFiber *observer, KaiValue *target_pid) {
     KaiMonitorNode *n = (KaiMonitorNode *) malloc(sizeof(KaiMonitorNode));
     if (!n) {
-        fprintf(stderr, "kai: out of memory (monitor)\n");
+        kai_eprintf("kai: out of memory (monitor)\n");
         kai_exit(1);
     }
     n->observer   = observer;
@@ -290,7 +290,7 @@ static KAI_RC_NOINLINE void kai_unw_grow(KaiFiber *f) {
     uint32_t cap = f->unw_cap ? f->unw_cap * 2 : 64;
     KaiUnwEntry *buf = (KaiUnwEntry *) realloc(f->unw_buf, (size_t) cap * sizeof(KaiUnwEntry));
     if (buf == NULL) {
-        fputs("kai: out of memory growing the unwind stack\n", stderr);
+        kai_eputs("kai: out of memory growing the unwind stack\n");
         kai_exit(1);
     }
     f->unw_buf = buf;
@@ -404,7 +404,7 @@ static const char *kai_eff_intern_locked(const char *text, size_t len) {
     }
     KaiEffLabel *e = (KaiEffLabel *) malloc(sizeof *e + len + 1);
     if (e == NULL) {
-        fputs("kai: out of memory interning an effect label\n", stderr);
+        kai_eputs("kai: out of memory interning an effect label\n");
         kai_exit(1);
     }
     memcpy(e->text, text, len);
@@ -649,7 +649,7 @@ static void kai_seg_relay_aim(KaiSegRelay *r, KaiEvidence *to) {
 
 __attribute__((noreturn))
 static void kai_seg_unhandled(const char *eff_label) {
-    fprintf(stderr, "kai: a continuation was resumed or dropped where `%s` is not handled\n", eff_label);
+    kai_eprintf("kai: a continuation was resumed or dropped where `%s` is not handled\n", eff_label);
     kai_exit(1);
     __builtin_unreachable();
 }
@@ -669,7 +669,7 @@ static KaiEvidence *kai_seg_relay(KaiSegment *seg, const char *eff_label, KaiEvi
     if (r == NULL) {
         r = (KaiSegRelay *) calloc(1, sizeof *r);
         if (r == NULL) {
-            fputs("kai: out of memory allocating an evidence relay\n", stderr);
+            kai_eputs("kai: out of memory allocating an evidence relay\n");
             kai_exit(1);
         }
         r->node.parent       = KAI_EV_RELAY;
@@ -715,7 +715,7 @@ static KaiValue *kai_resume_frame_push(KaiValue *clo) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = kai_ev_real(f->in_dispatch_node);
     if (node == NULL) {
-        fputs("kai: internal error: a resume frame pushed outside a handler clause\n", stderr);
+        kai_eputs("kai: internal error: a resume frame pushed outside a handler clause\n");
         kai_exit(1);
     }
     KaiSegCtx *c = f->seg != NULL ? kai_ctx_of(f, node) : NULL;
@@ -726,7 +726,7 @@ static KaiValue *kai_resume_frame_push(KaiValue *clo) {
         uint32_t cap = *cap_p ? *cap_p * 2 : 16;
         KaiResumeFrame *buf = (KaiResumeFrame *) realloc(*buf_p, (size_t) cap * sizeof(KaiResumeFrame));
         if (buf == NULL) {
-            fputs("kai: out of memory growing the resume frames\n", stderr);
+            kai_eputs("kai: out of memory growing the resume frames\n");
             kai_exit(1);
         }
         *buf_p = buf;

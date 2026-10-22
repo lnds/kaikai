@@ -87,7 +87,7 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
         r = _kai_file_ok(kai_str(""));
     } else {
         char *buf = (char *) malloc((size_t) cap);
-        if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         ssize_t got;
         do { got = read(fd, buf, (size_t) cap); } while (got < 0 && errno == EINTR);
         if (got < 0) {
@@ -286,7 +286,7 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
                  * redundant default-incref/decref pair on every
                  * position. */
                 unsigned char *buf = (unsigned char *) malloc((size_t) n + 1);
-                if (!buf) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                if (!buf) { fclose(fp); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
                 size_t got = fread(buf, 1, (size_t) n, fp);
                 fclose(fp);
                 KaiValue *arr = kai_alloc(KAI_ARRAY);
@@ -330,7 +330,7 @@ static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
             unsigned char *out = NULL;
             if (n > 0) {
                 out = (unsigned char *) malloc((size_t) n);
-                if (!out) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                if (!out) { fclose(fp); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
                 for (int64_t i = 0; i < n; ++i) {
                     KaiValue *e = bytes->as.arr.items[i];
                     if (!e || e->tag != KAI_BYTE) { ok = 0; break; }
@@ -387,7 +387,7 @@ static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
              * deterministic enough for fixtures. */
             size_t cap = 16, n = 0;
             char **names = (char **) malloc(cap * sizeof(char *));
-            if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            if (!names) { closedir(d); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
             struct dirent *e;
             while ((e = readdir(d)) != NULL) {
                 const char *nm = e->d_name;
@@ -395,11 +395,11 @@ static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
                 if (n + 1 > cap) {
                     cap *= 2;
                     names = (char **) realloc(names, cap * sizeof(char *));
-                    if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                    if (!names) { closedir(d); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
                 }
                 size_t len = strlen(nm);
                 char *copy = (char *) malloc(len + 1);
-                if (!copy) { closedir(d); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                if (!copy) { closedir(d); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
                 memcpy(copy, nm, len + 1);
                 names[n++] = copy;
             }
@@ -474,7 +474,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
 
     size_t cap = 16, top = 0;
     char **stack = (char **) malloc(cap * sizeof(char *));
-    if (!stack) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!stack) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
 
     char rbuf[KAI_PATH_BUF];
     size_t rlen = root->as.s.len < sizeof(rbuf) - 1 ? root->as.s.len : sizeof(rbuf) - 1;
@@ -482,7 +482,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
     rbuf[rlen] = '\0';
     {
         char *copy = (char *) malloc(rlen + 1);
-        if (!copy) { free(stack); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!copy) { free(stack); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         memcpy(copy, rbuf, rlen + 1);
         stack[top++] = copy;
     }
@@ -491,7 +491,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
      * reads in walk order. */
     size_t fcap = 32, fn = 0;
     char **files = (char **) malloc(fcap * sizeof(char *));
-    if (!files) { free(stack[0]); free(stack); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!files) { free(stack[0]); free(stack); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
 
     while (top > 0) {
         char *dir_path = stack[--top];
@@ -501,9 +501,9 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
          * deterministic depth-first order. */
         size_t ccap = 16, cn = 0;
         char **child_paths = (char **) malloc(ccap * sizeof(char *));
-        if (!child_paths) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!child_paths) { closedir(d); free(dir_path); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         char *child_kinds = (char *) malloc(ccap); /* 'f' / 'd' / 's' (skip) */
-        if (!child_kinds) { free(child_paths); closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!child_kinds) { free(child_paths); closedir(d); free(dir_path); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             const char *nm = e->d_name;
@@ -511,7 +511,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
             size_t dlen = strlen(dir_path);
             size_t nlen = strlen(nm);
             char *full = (char *) malloc(dlen + 1 + nlen + 1);
-            if (!full) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            if (!full) { closedir(d); free(dir_path); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
             memcpy(full, dir_path, dlen);
             int needs_sep = (dlen > 0 && dir_path[dlen - 1] != '/');
             size_t off = dlen;
@@ -529,7 +529,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
                 ccap *= 2;
                 child_paths = (char **) realloc(child_paths, ccap * sizeof(char *));
                 child_kinds = (char *)  realloc(child_kinds, ccap);
-                if (!child_paths || !child_kinds) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                if (!child_paths || !child_kinds) { closedir(d); free(dir_path); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
             }
             child_paths[cn] = full;
             child_kinds[cn] = kind;
@@ -544,7 +544,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
                 if (fn + 1 > fcap) {
                     fcap *= 2;
                     files = (char **) realloc(files, fcap * sizeof(char *));
-                    if (!files) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                    if (!files) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
                 }
                 files[fn++] = child_paths[i];
             }
@@ -557,7 +557,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
                 if (top + 1 > cap) {
                     cap *= 2;
                     stack = (char **) realloc(stack, cap * sizeof(char *));
-                    if (!stack) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+                    if (!stack) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
                 }
                 stack[top++] = child_paths[i];
             } else if (k != 'f') {
@@ -582,7 +582,63 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
     return acc;
 }
 
+/* Process-wide stdin buffer shared by the Stdin handler's read_line and
+ * read_bytes. Bytes read ahead of a consumer stay here, so every
+ * consumer drains it before touching the fd. */
+#define KAI_STDIN_BUF_SIZE 65536
+static char kai_stdin_buf[KAI_STDIN_BUF_SIZE];
+static size_t kai_stdin_pos = 0, kai_stdin_len = 0;
+static pthread_mutex_t kai_stdin_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Moves up to `want` buffered bytes into `dst`; returns the count. */
+static size_t kai_stdin_drain(char *dst, size_t want) {
+    pthread_mutex_lock(&kai_stdin_mu);
+    size_t take = kai_stdin_len - kai_stdin_pos;
+    if (take > want) take = want;
+    memcpy(dst, kai_stdin_buf + kai_stdin_pos, take);
+    kai_stdin_pos += take;
+    pthread_mutex_unlock(&kai_stdin_mu);
+    return take;
+}
+
+/* Appends one line fragment to `*acc`; returns 1 once the newline was
+ * consumed (the fragment excludes it), 0 when the buffer ran dry
+ * first, -1 when there is nothing buffered and the fd read returned
+ * `*rc` (0 = EOF, <0 = errno set). */
+static int kai_stdin_take_line(char **acc, size_t *an, size_t *acap, ssize_t *rc) {
+    pthread_mutex_lock(&kai_stdin_mu);
+    if (kai_stdin_pos == kai_stdin_len) {
+        ssize_t r = read(STDIN_FILENO, kai_stdin_buf, KAI_STDIN_BUF_SIZE);
+        if (r <= 0) {
+            int saved = errno;
+            pthread_mutex_unlock(&kai_stdin_mu);
+            errno = saved;
+            *rc = r;
+            return -1;
+        }
+        kai_stdin_pos = 0;
+        kai_stdin_len = (size_t) r;
+    }
+    const char *start = kai_stdin_buf + kai_stdin_pos;
+    size_t avail = kai_stdin_len - kai_stdin_pos;
+    const char *nl = (const char *) memchr(start, '\n', avail);
+    size_t take = nl ? (size_t) (nl - start) : avail;
+    if (*an + take + 1 > *acap) {
+        size_t cap = *acap ? *acap : KAI_READ_BUF_INIT;
+        while (*an + take + 1 > cap) cap *= 2;
+        *acc = (char *) realloc(*acc, cap);
+        if (!*acc) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+        *acap = cap;
+    }
+    memcpy(*acc + *an, start, take);
+    *an += take;
+    kai_stdin_pos += take + (nl ? 1 : 0);
+    pthread_mutex_unlock(&kai_stdin_mu);
+    return nl ? 1 : 0;
+}
+
 static KaiValue *kai_core_read_line(void) {
+    kai_flush_stdout();
     char stack_buf[512];
     char *buf = stack_buf;
     size_t cap = sizeof stack_buf, n = 0;
@@ -592,7 +648,7 @@ static KaiValue *kai_core_read_line(void) {
         if (n + 1 >= cap) {
             cap *= 2;
             char *grown = (char *) (buf == stack_buf ? malloc(cap) : realloc(buf, cap));
-            if (!grown) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+            if (!grown) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
             if (buf == stack_buf) memcpy(grown, stack_buf, n);
             buf = grown;
         }
@@ -628,8 +684,8 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
     if (n) kai_decref(n);
     if (want <= 0) return kai_str_from_bytes("", 0);
     char *buf = (char *) malloc((size_t) want);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
-    size_t got = 0;
+    if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    size_t got = kai_stdin_drain(buf, (size_t) want);
     while (got < (size_t) want) {
         ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
         if (r > 0) {
@@ -645,6 +701,7 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
              * polling until the fd is readable, then retry. */
 #if KAI_HOST_REACTOR
             struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+            kai_flush_stdout();
             int prc = poll(&p, 1, -1);
             if (prc < 0 && errno != EINTR) break;
             continue;

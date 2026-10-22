@@ -490,6 +490,7 @@ static KaiValue *kai_core_print(KaiValue *arg) {
 }
 
 static KaiValue *kai_core_eprint(KaiValue *arg) {
+    kai_flush_stdout();
     if (!arg) { fputc('\n', stderr); return kai_unit(); }
     KaiValue *s = (arg->tag == KAI_STR) ? NULL : kai_to_string(arg);
     KaiValue *src = s ? s : arg;
@@ -662,12 +663,12 @@ KAI_RT_SHARED void kai_panic_backtrace(void) {
     int printed = 0;
     while (fgets(line, sizeof line, p)) {
         if (!strstr(line, ".kai")) continue;
-        if (!printed) { fprintf(stderr, "stack trace (kaikai source):\n"); printed = 1; }
-        fprintf(stderr, "  %s", line);
+        if (!printed) { kai_eprintf("stack trace (kaikai source):\n"); printed = 1; }
+        kai_eprintf("  %s", line);
     }
     pclose(p);
 #else
-    fputs("kai: this host has no stack trace\n", stderr);
+    kai_eputs("kai: this host has no stack trace\n");
 #endif
 }
 
@@ -686,7 +687,7 @@ KAI_RT_SHARED KaiValue *kai_core_panic(KaiValue *msg) {
         kai_trap_abort(buf);
     }
     flockfile(stderr);
-    fprintf(stderr, "panic: ");
+    kai_eprintf("panic: ");
     if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
         fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
     }

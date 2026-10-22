@@ -10,7 +10,7 @@ static inline void kai_rc_make_atomic(KaiValue *v) {
 }
 
 KAI_RT_SHARED __attribute__((noinline, cold)) void kai_rc_overflow(const KaiValue *v) {
-    fprintf(stderr, "kai: reference count overflow on a %s cell\n",
+    kai_eprintf("kai: reference count overflow on a %s cell\n",
             v->tag == KAI_FIBER ? "fiber" : "heap");
     abort();
 }
@@ -748,7 +748,7 @@ KAI_RT_SHARED void kai_trap_abort(const char *msg) {
         kai_evidence_unwind_all();
         kai_trap_unwind(f->unwind_frame, f->stack_base, kai_trap_land_fiber, f);
     }
-    fprintf(stderr, "kai: trap: %s\n", msg ? msg : "runtime trap");
+    kai_eprintf("kai: trap: %s\n", msg ? msg : "runtime trap");
     kai_exit(1);
 }
 

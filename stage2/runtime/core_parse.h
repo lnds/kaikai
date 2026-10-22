@@ -35,7 +35,7 @@ static KaiValue *kai_core_string_to_real(KaiValue *s) {
     if (s && s->tag == KAI_STR && s->as.s.len > 0) {
         char small[64];
         char *buf = s->as.s.len < sizeof small ? small : (char *) malloc(s->as.s.len + 1);
-        if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         memcpy(buf, s->as.s.bytes, s->as.s.len);
         buf[s->as.s.len] = '\0';
         char *end = NULL;
@@ -399,7 +399,7 @@ static int64_t kai_bytes_int(KaiValue *v) {
 /* The slots `[off, off + n)` of `a`; traps when the range leaves the array. */
 static KaiValue **kai_bytes_span(const char *op, KaiValue *a, int64_t off, int64_t n) {
     if (!kai_is_ptr(a) || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: %s: not an array\n", op); kai_exit(1);
+        kai_eprintf("kai: %s: not an array\n", op); kai_exit(1);
     }
     if (off < 0 || n < 0 || off > a->as.arr.len || n > a->as.arr.len - off) {
         /* Outlives this frame: a trap in a fiber is read after the unwind. */

@@ -714,7 +714,7 @@ static KaiValue *kai_seq_once(KaiValue *init) {
     if (f->const_n == f->const_cap) {
         uint32_t cap = f->const_cap ? f->const_cap * 2 : 4;
         KaiConstCell *buf = (KaiConstCell *) realloc(f->consts, (size_t) cap * sizeof(KaiConstCell));
-        if (buf == NULL) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (buf == NULL) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         f->consts = buf;
         f->const_cap = cap;
     }

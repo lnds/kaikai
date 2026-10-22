@@ -69,7 +69,7 @@ static inline int kai_drop_hits_zero(KaiValue *v) {
 static KAI_RC_NOINLINE void kai_free_stack_grow(KaiFreeStack *st) {
     int cap = st->cap * 2;
     KaiValue **grown = (KaiValue **) malloc(sizeof(KaiValue *) * (size_t) cap);
-    if (!grown) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!grown) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     memcpy(grown, st->items, sizeof(KaiValue *) * (size_t) st->n);
     if (st->items != st->local) free(st->items);
     st->items = grown;
@@ -286,7 +286,7 @@ KAI_RT_SHARED void kai_free_drain(KaiValue *v) {
     KaiFreeStack *st = f->free_stack;
     if (!st) {
         st = (KaiFreeStack *) calloc(1, sizeof *st);
-        if (!st) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        if (!st) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         f->free_stack = st;
     }
     if (st->active) { kai_free_stack_push(st, v); return; }

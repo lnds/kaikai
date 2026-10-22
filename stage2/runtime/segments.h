@@ -100,7 +100,7 @@ static KaiSegment *kai_seg_pool_take(void) {
     }
     seg = (KaiSegment *) calloc(1, sizeof *seg);
     if (seg == NULL) {
-        fputs("kai: out of memory allocating a stack segment\n", stderr);
+        kai_eputs("kai: out of memory allocating a stack segment\n");
         kai_exit(1);
     }
     kai_install_fiber_sigsegv_handler();
@@ -226,7 +226,7 @@ static void kai_seg_rethrow(KaiFiber *f, KaiEvidence *to, int trap) {
 static inline __attribute__((always_inline)) KaiValue *kai_seg_suspend_on(KaiFiber *f, KaiValue *v, KaiSegState state) {
     KaiSegment *seg = f->seg;
     if (seg == NULL) {
-        fputs("kai: internal error: suspend outside a stack segment\n", stderr);
+        kai_eputs("kai: internal error: suspend outside a stack segment\n");
         kai_exit(1);
     }
     if (seg->discontinue) kai_trap_abort("continuation suspended while being discontinued");
@@ -318,7 +318,7 @@ static KaiValue *kai_seg_run(KaiFiber *f, KaiSegment *seg, void *arg, KaiValue *
 /* Empty a continuation box, consuming it, and return its segment. */
 static KaiSegment *kai_seg_take(KaiValue *k) {
     if (k == NULL || k->tag != KAI_CONT) {
-        fputs("kai: internal error: resuming a value that is not a continuation\n", stderr);
+        kai_eputs("kai: internal error: resuming a value that is not a continuation\n");
         kai_exit(1);
     }
     KaiSegment *seg = k->as.seg;
@@ -374,7 +374,7 @@ KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk) {
     KaiValue *k = NULL;
     KaiValue *step = kai_seg_start(kai_incref(thunk), &k);
     if (k != NULL) {
-        fputs("kai: internal error: a lazy cell's thunk suspended\n", stderr);
+        kai_eputs("kai: internal error: a lazy cell's thunk suspended\n");
         kai_exit(1);
     }
     return step;
@@ -425,7 +425,7 @@ KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
 /* No switch for this target: no segment ever runs, so no box or escape
  * reaches the two hooks below. */
 __attribute__((noreturn)) static void kai_seg_unsupported(void) {
-    fputs("kai: stack segments are not supported on this target\n", stderr);
+    kai_eputs("kai: stack segments are not supported on this target\n");
     kai_exit(1);
     __builtin_unreachable();
 }
@@ -465,7 +465,7 @@ static KaiValue *kai_seg_handle_step(KaiValue *handler, KaiValue *v, KaiValue *k
  * clause per op. Never called. */
 static KaiValue *kai_seg_handler_fn(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
-    fputs("kai: internal error: a segment handler called as a function\n", stderr);
+    kai_eputs("kai: internal error: a segment handler called as a function\n");
     kai_exit(1);
 }
 
@@ -621,7 +621,7 @@ static __attribute__((noinline)) void kai_cancel_deliver(KaiFiber *f) {
      * fall back to the pad — the trampoline's second return marks the
      * fiber CANCELLED and continues with the awaiter walk. */
     if (!f->cancel_pad_set) {
-        fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
+        kai_eputs("kai: Cancel.raise: unhandled (fiber cancelled)\n");
         kai_exit(0);
     }
     kai_evidence_unwind_all();
@@ -711,7 +711,7 @@ __attribute__((noinline))
 static void kai_evidence_diag(KaiEvidence *node, const char *eff_label) {
     KaiFiber *f = kai_current_fiber();
     struct KaiMailbox *mb = f ? f->mailbox : NULL;
-    fprintf(stderr,
+    kai_eprintf(
         "kai: evidence-diag eff=%s node=%p handler=%p\n"
         "  fiber=%p is_main=%d state=%d home_thread=%d thread_id=%d nthreads=%d\n"
         "  evidence_top=%p in_dispatch=%p parent=%p\n"
@@ -725,7 +725,7 @@ static void kai_evidence_diag(KaiEvidence *node, const char *eff_label) {
         mb ? (mb->owner_fiber == f) : 0);
     int depth = 0;
     for (KaiEvidence *n = f ? f->evidence_top : NULL; n && depth < 16; n = n->parent) {
-        fprintf(stderr, "  [%d] node=%p eff=%s handler=%p%s\n", depth, (void *)n,
+        kai_eprintf("  [%d] node=%p eff=%s handler=%p%s\n", depth, (void *)n,
                 n->eff_label ? n->eff_label : "(null)", (void *)n->handler,
                 n == f->in_dispatch_node ? "  <-- masked by in_dispatch" : "");
         depth++;
@@ -739,7 +739,7 @@ static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_labe
      * of letting a later `node->handler` deref segfault. */
     if (node == NULL || node->handler == NULL) {
         if (getenv("KAI_DEBUG_EVIDENCE")) kai_evidence_diag(node, eff_label);
-        fprintf(stderr, "kai: effect not handled in fiber: %s\n", eff_label);
+        kai_eprintf("kai: effect not handled in fiber: %s\n", eff_label);
         kai_exit(1);
     }
     return node;
@@ -753,7 +753,7 @@ static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_labe
  * is the runtime floor for the ones it cannot see statically. */
 static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char *cap_name) {
     if (node == NULL || node->handler == NULL) {
-        fprintf(stderr, "kai: capability not reachable in this fiber: %s\n", cap_name);
+        kai_eprintf("kai: capability not reachable in this fiber: %s\n", cap_name);
         kai_exit(1);
     }
     return node;

@@ -109,11 +109,11 @@ static void kai_park_trace_dump(void) {
     if (atomic_load(&kai_park_trace_on) <= 0) return;
     unsigned total = atomic_load(&kai_park_trace_seq);
     unsigned shown = total < KAI_PARK_TRACE_CAP ? total : KAI_PARK_TRACE_CAP;
-    fprintf(stderr, "kai: park trace (%u events, last %u):\n", total, shown);
+    kai_eprintf("kai: park trace (%u events, last %u):\n", total, shown);
     for (unsigned i = 0; i < shown; i++) {
         const KaiParkTraceEntry *e =
             &kai_park_trace_ring[(total - shown + i) % KAI_PARK_TRACE_CAP];
-        fprintf(stderr,
+        kai_eprintf(
                 "  fiber=%p %-19s tid=%d state=%s wake_pending=%d "
                 "reactor_fired=%d blocked=%d parked=%d\n",
                 (const void *) e->fiber, e->event ? e->event : "?", e->thread,
@@ -136,7 +136,7 @@ static void kai_reactor_mark_ready(KaiFiber *f) {
         int ncap = kai_reactor_ready_cap ? kai_reactor_ready_cap * 2 : 16;
         KaiFiber **nb = (KaiFiber **) realloc(kai_reactor_ready_batch,
                                               (size_t) ncap * sizeof(KaiFiber *));
-        if (!nb) { fprintf(stderr, "kai: reactor ready-batch realloc failed\n"); kai_exit(1); }
+        if (!nb) { kai_eprintf("kai: reactor ready-batch realloc failed\n"); kai_exit(1); }
         kai_reactor_ready_batch = nb;
         kai_reactor_ready_cap   = ncap;
     }
@@ -572,7 +572,7 @@ static void kai_reactor_init(void) {
     if (pipe(kai_reactor_sigchld_pipe)  != 0 ||
         pipe(kai_reactor_filepool_pipe) != 0 ||
         pipe(kai_reactor_signal_pipe)   != 0) {
-        fprintf(stderr, "kai: reactor pipe() failed: %s\n", strerror(errno));
+        kai_eprintf("kai: reactor pipe() failed: %s\n", strerror(errno));
         kai_exit(1);
     }
     for (int i = 0; i < 3; i++) {
@@ -598,7 +598,7 @@ static void kai_reactor_init(void) {
     struct sigaction old;
     if (sigaction(SIGCHLD, NULL, &old) == 0) {
         if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN) {
-            fprintf(stderr,
+            kai_eprintf(
                 "kai: reactor cannot install SIGCHLD — slot already taken\n");
             kai_exit(1);
         }
@@ -639,7 +639,7 @@ static void kai_reactor_init_filepool(void) {
         kai_rc_go_mt();
         if (pthread_create(&kai_filepool_threads[i], NULL,
                            kai_filepool_worker, NULL) != 0) {
-            fprintf(stderr, "kai: reactor pthread_create failed: %s\n",
+            kai_eprintf("kai: reactor pthread_create failed: %s\n",
                     strerror(errno));
             kai_exit(1);
         }
@@ -677,6 +677,7 @@ static void kai_filepool_submit(KaiFilepoolItem *item) {
  * once the run queue empties). On resume the reactor drain has
  * already cleared the fiber's reactor_* slots and unparked it. */
 static void kai_reactor_park_timer_linked(KaiFiber *f, uint64_t deadline_ns) {
+    kai_flush_stdout();
     f->reactor_deadline_ns = deadline_ns;
     if (kai_nthreads > 1) {
         /* F2: the root links us into the wheel post-swap (commit_park). */
@@ -695,6 +696,7 @@ static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
 }
 
 static void kai_reactor_park_pid(KaiFiber *f, int pid) {
+    kai_flush_stdout();
     f->reactor_wait_pid    = pid;
     f->reactor_wait_status = 0;
     if (kai_nthreads > 1) {
@@ -717,6 +719,7 @@ static void kai_reactor_park_pid(KaiFiber *f, int pid) {
  * when POLLIN / POLLHUP / POLLERR fires on STDIN_FILENO; on resume
  * the parking site simply retries its read(). */
 static int kai_reactor_park_stdin(KaiFiber *f) {
+    kai_flush_stdout();
     if (kai_nthreads > 1) {
         /* Reserve the singleton slot check under the lock; the reactor
          * clears it on readiness. Concurrent stdin readers are undefined
@@ -743,6 +746,7 @@ static int kai_reactor_park_stdin(KaiFiber *f) {
  * in `f->reactor_wait_status`; the await handler maps it back to
  * the matching variant. */
 static int kai_reactor_park_signal(KaiFiber *f) {
+    kai_flush_stdout();
     f->reactor_wait_status = 0;
     if (kai_nthreads > 1) {
         kai_reactor_lock();
@@ -789,6 +793,7 @@ static void kai_socket_set_nonblock(int fd) {
  * yields. On resume the drain helper has spliced the fiber out;
  * the caller retries its non-blocking read(). */
 static void kai_reactor_park_socket_read(KaiFiber *f, int fd) {
+    kai_flush_stdout();
     f->reactor_wait_pid    = fd;
     f->reactor_wait_status = 0;
     if (kai_nthreads > 1) {
@@ -807,6 +812,7 @@ static void kai_reactor_park_socket_read(KaiFiber *f, int fd) {
  * full). Symmetric with kai_reactor_park_socket_read on the
  * socket_write_waiters list. */
 static void kai_reactor_park_socket_write(KaiFiber *f, int fd) {
+    kai_flush_stdout();
     f->reactor_wait_pid    = fd;
     f->reactor_wait_status = 0;
     if (kai_nthreads > 1) {
@@ -828,6 +834,7 @@ static void kai_reactor_park_socket_write(KaiFiber *f, int fd) {
  * The deadline-drain stamps `reactor_wait_status = 1` before waking;
  * readiness leaves it 0. Returns 1 (readiness) or 0 (deadline). */
 static int kai_reactor_park_socket_read_timeout(KaiFiber *f, int fd, uint64_t deadline_ns) {
+    kai_flush_stdout();
     f->reactor_wait_pid    = fd;
     f->reactor_wait_status = 0;
     f->reactor_deadline_ns = deadline_ns;

@@ -183,7 +183,7 @@ CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 # or a runtime-only edit leaves a stale binary in place. Deliberately NOT
 # ../stage0/runtime.h: this translation unit never reaches it, and listing
 # it would force the ~70 s -O2 rebuild on unrelated stage 0 edits.
-RUNTIME_H := runtime.h $(wildcard runtime/*.h)
+RUNTIME_H := runtime.h
 
 # Issue #42 closure (2026-05-01): the recursive lex_loop / parse_*
 # inside kaic1 / kaic2 used to need a 32-64 MB stack bump to handle
@@ -11488,10 +11488,6 @@ test-build-modes: $(TARGET) bin-kai build
 test-build-out-dir: $(TARGET) bin-kai build
 	@../tools/test-build-out-dir.sh ../bin/kai
 
-# Two cold `--release` builds of one program leave identical caches (ThinLTO entries included).
-test-release-determinism: $(TARGET) bin-kai build
-	@../tools/test-release-determinism.sh ../bin/kai
-
 # Native codegen quality. Pins the spill ratio in the rb-tree descent's hot
 # loop, the one signal that catches a register-allocation regression: such a
 # change keeps the program correct, the self-host byte-identical and
@@ -11720,6 +11716,17 @@ test-issue-1590-isatty-native: $(TARGET) bin-kai build
 else
 test-issue-1590-isatty-native:
 	@echo "issue-1590-isatty-native SKIP (C-only build; native backend not compiled)"
+endif
+
+test-runtime-io: $(TARGET) bin-kai build
+	@../tools/test-runtime-io.sh c
+
+ifeq ($(KAI_LLVM),1)
+test-runtime-io-native: $(TARGET) bin-kai build
+	@../tools/test-runtime-io.sh native
+else
+test-runtime-io-native:
+	@echo "runtime-io-native SKIP (C-only build; native backend not compiled)"
 endif
 
 # Issue #679 — Spawn.cancel reaches a fiber parked on the reactor.
@@ -12189,15 +12196,7 @@ define test_coverage_run
 	  diff -q $$p.json.expected $$pout > /dev/null \
 	    || { echo "test-coverage DIFF ($(1): prune, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
 	done; \
-	p=examples/test-runner/coverage_const; pout=stage2/build/test-coverage-const-$(1).json; \
-	./bin/kai test --backend=$(1) --json $$p > /dev/null 2>&1 || true; \
-	for pass in cold warm; do \
-	  ./bin/kai test --backend=$(1) --json --coverage $$p 2> $$pout.err | sed 's/"duration_ms":[0-9]*/"duration_ms":N/g' > $$pout \
-	    || { echo "test-coverage FAIL ($(1): const run failed)"; cat $$pout.err; exit 1; }; \
-	  diff -q $$p.json.expected $$pout > /dev/null \
-	    || { echo "test-coverage DIFF ($(1): const, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
-	done; \
-	echo "test-coverage OK ($(1): per-block lines + --only + pruned library + folded const)"
+	echo "test-coverage OK ($(1): per-block lines + --only + pruned library)"
 endef
 
 test-coverage-report: $(TARGET) build

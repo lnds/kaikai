@@ -117,7 +117,7 @@ __attribute__((noinline, cold))
 KAI_RT_SHARED void kai_heap_charge_slow(size_t sz) {
     size_t used = __atomic_add_fetch(&kai_heap_live, sz, __ATOMIC_RELAXED);
     if (used > kai_heap_cap) {
-        fprintf(stderr,
+        kai_eprintf(
             "kai: heap limit exceeded (KAI_MAX_HEAP=%s, used %zu bytes)\n",
             getenv("KAI_MAX_HEAP"), used - sz);
         kai_exit(1);
@@ -144,7 +144,7 @@ __attribute__((noinline, cold))
 KAI_RT_SHARED void *kai_heap_malloc_capped(size_t sz) {
     kai_heap_charge_slow(sz);
     void *p = malloc(sz);
-    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!p) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     size_t usable = kai_heap_usable(p);
     if (usable > sz) __atomic_add_fetch(&kai_heap_live, usable - sz, __ATOMIC_RELAXED);
     return p;
@@ -155,7 +155,7 @@ KAI_RT_SHARED void *kai_heap_realloc_capped(void *ptr, size_t old_sz, size_t new
     size_t old_usable = ptr ? kai_heap_usable(ptr) : 0;
     if (new_sz > old_sz) kai_heap_charge_slow(new_sz - old_sz);
     void *p = realloc(ptr, new_sz);
-    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!p) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     size_t new_usable = kai_heap_usable(p);
     size_t charged = new_sz > old_sz ? old_usable + (new_sz - old_sz) : old_usable;
     if (new_usable > charged) __atomic_add_fetch(&kai_heap_live, new_usable - charged, __ATOMIC_RELAXED);
@@ -168,7 +168,7 @@ KAI_RT_SHARED void *kai_heap_realloc_capped(void *ptr, size_t old_sz, size_t new
 static void *kai_heap_malloc(size_t sz) {
     if (__builtin_expect(kai_heap_cap != 0, 0)) return kai_heap_malloc_capped(sz);
     void *p = malloc(sz);
-    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!p) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     return p;
 }
 
@@ -186,7 +186,7 @@ static void kai_heap_free(void *p) {
 static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
     if (__builtin_expect(kai_heap_cap != 0, 0)) return kai_heap_realloc_capped(ptr, old_sz, new_sz);
     void *p = realloc(ptr, new_sz);
-    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!p) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     return p;
 }
 
@@ -388,7 +388,7 @@ KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
     if (!kai_slab_cur || kai_slab_off + sz > KAI_SLAB_SIZE) {
         kai_heap_charge(KAI_SLAB_SIZE);
         char *slab = (char *) malloc(KAI_SLAB_SIZE);
-        if (!slab) { fprintf(stderr, "kai: out of memory (slab)\n"); kai_exit(1); }
+        if (!slab) { kai_eprintf("kai: out of memory (slab)\n"); kai_exit(1); }
         if (kai_slab_count == kai_slab_cap) {
             int ncap = kai_slab_cap == 0 ? 64 : kai_slab_cap * 2;
             kai_slab_list = (char **) realloc(kai_slab_list, (size_t) ncap * sizeof(char *));
@@ -431,7 +431,7 @@ KAI_RT_SHARED KaiValue *kai_alloc(KaiTag tag) {
     kai_heap_charge(sizeof(KaiValue));
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
 #endif
-    if (!v) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!v) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) tag;
     /* trace */
@@ -503,7 +503,7 @@ static KaiValue *kai_alloc_var(int n) {
     kai_heap_charge(bsz);
     v = (KaiValue *) calloc(1, bsz);
 #endif
-    if (!v) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!v) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) KAI_VARIANT;
     kai_rc_count_alloc((int) KAI_VARIANT);
@@ -550,7 +550,7 @@ static KaiValue *kai_alloc_var_nz(int n) {
      * kai_var_block_free's #else frees it. */
     v = (KaiValue *) kai_heap_malloc(kai_var_block_size(n));
 #endif
-    if (!v) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    if (!v) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) KAI_VARIANT;
     kai_rc_count_alloc((int) KAI_VARIANT);
@@ -712,9 +712,9 @@ static KaiArenaChunk *kai_arena_chunk_new(size_t need) {
     if (need > cap) cap = need;               /* oversized single object */
     kai_heap_charge(sizeof(KaiArenaChunk) + cap);
     KaiArenaChunk *c = (KaiArenaChunk *) malloc(sizeof(KaiArenaChunk));
-    if (!c) { fprintf(stderr, "kai: out of memory (arena chunk)\n"); kai_exit(1); }
+    if (!c) { kai_eprintf("kai: out of memory (arena chunk)\n"); kai_exit(1); }
     c->data = (unsigned char *) malloc(cap);
-    if (!c->data) { fprintf(stderr, "kai: out of memory (arena data)\n"); kai_exit(1); }
+    if (!c->data) { kai_eprintf("kai: out of memory (arena data)\n"); kai_exit(1); }
     c->next = NULL;
     c->used = 0;
     c->cap  = cap;
@@ -803,7 +803,7 @@ static KAI_TLS int      kai_arena_sp = 0;
 
 static KaiArena *kai_arena_push(void) {
     if (kai_arena_sp >= KAI_ARENA_STACK_MAX) {
-        fprintf(stderr, "kai: region nesting exceeds %d\n", KAI_ARENA_STACK_MAX);
+        kai_eprintf("kai: region nesting exceeds %d\n", KAI_ARENA_STACK_MAX);
         kai_exit(1);
     }
     KaiArena *a = &kai_arena_stack[kai_arena_sp++];

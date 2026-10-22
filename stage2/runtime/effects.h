@@ -67,7 +67,7 @@ static inline void kai_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
 }
 
 __attribute__((noinline, cold, noreturn)) static void kai_cont_resumed_twice(const KaiCont *k) {
-    fprintf(stderr,
+    kai_eprintf(
         "kai: continuation resumed twice (handler #%llu)\n",
         (unsigned long long) k->handler_id);
     kai_exit(1);
@@ -102,6 +102,7 @@ static KaiValue *kai_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
 
 static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
     (void) self;
+    kai_flush_stdout();
     flockfile(stderr);
     if (kai_is_ptr(s) && s->tag == KAI_STR) {
         fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);
@@ -147,53 +148,38 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
     kai_reactor_init();
     kai_reactor_stdin_set_nonblocking();
 
-    size_t cap = KAI_READ_BUF_INIT, n = 0;
-    char *buf = (char *) malloc(cap);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    char *buf = NULL;
+    size_t n = 0, cap = 0;
 
     for (;;) {
-        if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
-        ssize_t r = read(STDIN_FILENO, buf + n, 1);
-        if (r > 0) {
-            if (buf[n] == '\n') {
-                /* Strip the trailing newline. */
-                KaiValue *s = kai_str_from_bytes(buf, n);
-                free(buf);
-                KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}});
-                return kai_cont_resume(k, some);
-            }
-            n++;
-        } else if (r == 0) {
-            /* EOF — peer closed. Partial line returned as Some;
-             * empty buffer becomes None. */
+        ssize_t r = 0;
+        int st = kai_stdin_take_line(&buf, &n, &cap, &r);
+        if (st >= 0) {
+            if (st == 0) continue;
+            KaiValue *s = kai_str_from_bytes(buf, n);
+            free(buf);
+            return kai_cont_resume(k, kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}}));
+        }
+        if (r == 0) {
+            /* EOF: a partial line is returned, nothing buffered is None. */
             if (n == 0) {
                 free(buf);
                 return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
             }
             KaiValue *s = kai_str_from_bytes(buf, n);
             free(buf);
-            KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}});
-            return kai_cont_resume(k, some);
+            return kai_cont_resume(k, kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}}));
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            /* No bytes available — park the fiber on the reactor
-             * until POLLIN fires on stdin. */
             if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
-                fprintf(stderr,
+                kai_eprintf(
                     "kai: stdin: multiple fibers reading concurrently "
                     "is undefined; serialize via an actor\n");
                 kai_exit(1);
             }
-            /* Resumed: drain helper cleared the waiter slot. Loop
-             * to retry the read. */
         } else if (errno == EINTR) {
-            /* Signal interrupted the read — retry immediately. */
             continue;
         } else {
-            /* Real I/O error. The op's surface type is
-             * `Option[String]`; propagate as None and let the
-             * caller see end-of-stream. Keeps parity with the
-             * pre-R3 fgetc path which silently treated errors as
-             * EOF. */
+            /* Real I/O error reads as end of stream. */
             free(buf);
             return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
         }
@@ -225,8 +211,8 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
     kai_reactor_stdin_set_nonblocking();
 
     char *buf = (char *) malloc((size_t) want);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
-    size_t got = 0;
+    if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    size_t got = kai_stdin_drain(buf, (size_t) want);
 
     while (got < (size_t) want) {
         ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
@@ -237,7 +223,7 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
             break;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
-                fprintf(stderr,
+                kai_eprintf(
                     "kai: stdin: multiple fibers reading concurrently "
                     "is undefined; serialize via an actor\n");
                 kai_exit(1);
@@ -648,7 +634,7 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
     int64_t lo_v = (kai_is_int(lo)) ? kai_intf(lo) : 0;
     int64_t hi_v = (kai_is_int(hi)) ? kai_intf(hi) : 0;
     if (lo_v >= hi_v) {
-        fprintf(stderr, "kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
+        kai_eprintf("kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
                 (long long) lo_v, (long long) hi_v);
         kai_exit(1);
     }
@@ -699,7 +685,7 @@ static KaiValue *kai_default_clock_wall_now(void *self, KaiCont *k) {
     (void) self;
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
-        fprintf(stderr, "kai: Clock.wall_now: clock_gettime failed: %s\n",
+        kai_eprintf("kai: Clock.wall_now: clock_gettime failed: %s\n",
                 strerror(errno));
         kai_exit(1);
     }
@@ -711,7 +697,7 @@ static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
     (void) self;
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        fprintf(stderr, "kai: Clock.monotonic_now: clock_gettime failed: %s\n",
+        kai_eprintf("kai: Clock.monotonic_now: clock_gettime failed: %s\n",
                 strerror(errno));
         kai_exit(1);
     }
