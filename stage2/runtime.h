@@ -79,6 +79,9 @@
 #include "runtime/core_fileio.h"
 #include "runtime/core_parse.h"
 #include "runtime/harness.h"
+#ifndef KAI_NO_BENCH_CHECK
+#include "runtime/harness_extra.h"
+#endif
 #include "runtime/effects.h"
 #include "runtime/net_handlers.h"
 #include "runtime/signal_process.h"
@@ -90,6 +93,8 @@
 #include "runtime/evidence.h"
 #include "runtime/segments.h"
 
+#if defined(KAI_LLVM) || !defined(KAI_NO_LLVM_BRIDGE)
 #include "runtime/llvm_bridge.h"
+#endif
 
 #endif /* KAI_RUNTIME_H */
