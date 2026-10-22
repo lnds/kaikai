@@ -17,6 +17,32 @@
  *   KAI_HOST_UNWIND       the frame unwinder; without it a contained trap
  *                         lands at once and the frames it crosses keep
  *                         their references */
+#if defined(__wasm__)
+#  ifndef KAI_HOST_FIBERS
+#    define KAI_HOST_FIBERS 0
+#  endif
+#  ifndef KAI_HOST_STACK_GUARD
+#    define KAI_HOST_STACK_GUARD 0
+#  endif
+#  ifndef KAI_HOST_REACTOR
+#    define KAI_HOST_REACTOR 0
+#  endif
+#  ifndef KAI_HOST_SOCKETS
+#    define KAI_HOST_SOCKETS 0
+#  endif
+#  ifndef KAI_HOST_PROCESS
+#    define KAI_HOST_PROCESS 0
+#  endif
+#  ifndef KAI_HOST_SIGNALS
+#    define KAI_HOST_SIGNALS 0
+#  endif
+#  ifndef KAI_HOST_BACKTRACE
+#    define KAI_HOST_BACKTRACE 0
+#  endif
+#  ifndef KAI_HOST_UNWIND
+#    define KAI_HOST_UNWIND 0
+#  endif
+#endif
 #ifndef KAI_HOST_FIBERS
 #  define KAI_HOST_FIBERS 1
 #endif

@@ -122,6 +122,8 @@ static KaiValue *kai_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
 #elif defined(__APPLE__) || defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
    /* arc4random_buf is in <stdlib.h> on macOS/BSD, already included
     * above. No extra header needed. */
+#elif defined(__wasi__)
+#  include <wasi/api.h>
 #else
 #  error "kai SecureRandom: platform unsupported (POSIX getrandom / arc4random_buf required)"
 #endif
@@ -137,6 +139,11 @@ static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
             kai_exit(1);
         }
         off += (size_t) got;
+    }
+#elif defined(__wasi__)
+    if (__wasi_random_get(buf, n) != 0) {
+        kai_eprintf("kai: SecureRandom: random_get failed\n");
+        kai_exit(1);
     }
 #else
     arc4random_buf(buf, n);
