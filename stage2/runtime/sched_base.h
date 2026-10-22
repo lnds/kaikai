@@ -223,6 +223,9 @@ static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCo
  * the runtime value or mprotect rejects the call. Workers race to fill the
  * cache with one value, so a relaxed atomic is enough. */
 static size_t kai_page_size(void) {
+#if defined(__wasm__)
+    return 16;
+#endif
     static _Atomic size_t cached = 0;
     size_t ps = atomic_load_explicit(&cached, memory_order_relaxed);
     if (ps == 0) {
@@ -580,6 +583,10 @@ static void kai_install_fiber_sigsegv_handler(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
 }
+#elif defined(__wasm__)
+static size_t kai_main_fiber_stack_size(void) { return kai_fiber_stack_size(); }
+static void kai_install_thread_sigaltstack(KaiWorker *w) { (void) w; }
+static void kai_install_fiber_sigsegv_handler(void) {}
 #endif
 
 /* =================================================================

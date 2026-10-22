@@ -506,6 +506,16 @@ static void *kai_stack_map(size_t stack_size) {
     }
     return region;
 }
+#elif defined(__wasm__)
+/* The "guard" is the page-size prefix, which nothing protects here. */
+static void *kai_stack_map(size_t stack_size) {
+    void *region = malloc(stack_size + kai_page_size());
+    if (region == NULL) {
+        kai_eprintf("kai: out of memory allocating fiber stack (%zu bytes)\n", stack_size);
+        kai_exit(1);
+    }
+    return region;
+}
 #endif
 
 #if KAI_HOST_FIBERS
@@ -528,6 +538,9 @@ static void kai_ctx_set_stack(ucontext_t *c, void *lo, size_t size) {
 
 static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
 #if KAI_HOST_FIBERS
+#if defined(__wasm__)
+    kai_wctx_mark();
+#endif
     kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
         kai_eprintf("kai: getcontext failed for new fiber\n");

@@ -425,7 +425,7 @@ KAI_MODULAR=0 KAI_BACKEND=c bin/kai build app.kai -o app.wasm
 node stage2/web/kai_host.mjs app.wasm
 ```
 
-`stage2/web/kai_host.mjs` instantiates the module with the `wasi_snapshot_preview1` imports it uses, line-buffers fd 1 and 2 to the console (and to `#kai-stdout` when the page has one) and resolves `run(wasm, opts)` with the exit status. It needs a node with exnref (24.15 or later; an older node takes `--experimental-wasm-exnref`, set through `WASM_NODE_FLAGS`).
+`stage2/web/kai_host.mjs` instantiates the module with the `wasi_snapshot_preview1` imports it uses, line-buffers fd 1 and 2 to the console (and to `#kai-stdout` when the page has one) and resolves `run(wasm, opts)` with the exit status. It needs a node with exnref (24.15 or later; an older node takes `--experimental-wasm-exnref`, set through `WASM_NODE_FLAGS`). A module that spawns fibers or keeps continuations also needs JSPI; the host refuses it at load on an engine without, and the gate retries such a program with `--experimental-wasm-jspi`.
 
 - **Gate**: `TARGET_BACKEND=wasm WASI_SDK=<dir> NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture for the oracle (C backend on the host) and for wasm, runs the second under node at `KAI_THREADS=1`, and compares output and exit status. `tools/wasm-parity-baseline.txt` lists the fixtures allowed to differ: a new difference fails, a closed one must be removed. CI runs it as `tier1-wasm` (not a required check), on the corpus plus `examples/web/`, one fixture per class of program.
 - The host grants no filesystem and no stdin: fixtures that read files, stdin, `PATH` or `/tmp` differ and sit in the baseline.

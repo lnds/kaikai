@@ -47,6 +47,54 @@ async function load(wasm) {
   return WebAssembly.compileStreaming(fetch(wasm));
 }
 
+class ContextEnd extends Error {}
+
+const NO_JSPI =
+  "kai: this program spawns fibers or keeps continuations, which need JavaScript Promise Integration (JSPI); this engine has none";
+
+const refuse = () => { throw new Error(NO_JSPI); };
+
+// Contexts are WebAssembly stacks the host keeps suspended. The running one
+// suspends in `ctx_switch`; the host then starts or wakes the target. One
+// context runs at a time.
+function suspension(getInstance) {
+  const waiting = new Map();
+  const entries = new Map();
+  let fail;
+  const failed = new Promise((_, reject) => { fail = reject; });
+  const enter = (fn) => {
+    if (!entries.has(fn)) {
+      entries.set(fn, WebAssembly.promising(getInstance().exports.__indirect_function_table.get(fn)));
+    }
+    return entries.get(fn);
+  };
+  const dispatch = (to, sp, fn) => {
+    const wake = waiting.get(to);
+    if (wake) {
+      waiting.delete(to);
+      wake();
+      return;
+    }
+    getInstance().exports.__stack_pointer.value = sp;
+    enter(fn)(to).catch((e) => { if (!(e instanceof ContextEnd)) fail(e); });
+  };
+  return {
+    failed,
+    imports: {
+      needs_suspension: () => {},
+      ctx_switch: new WebAssembly.Suspending((from, to, sp, fn) => {
+        const parked = new Promise((resolve) => waiting.set(from, resolve));
+        dispatch(to, sp, fn);
+        return parked;
+      }),
+      ctx_exit: (to, sp, fn) => {
+        queueMicrotask(() => dispatch(to, sp, fn));
+        throw new ContextEnd();
+      },
+    },
+  };
+}
+
 export async function run(wasm, opts = {}) {
   const args = opts.args ?? [];
   const env = { KAI_THREADS: "1", ...(opts.env ?? {}) };
@@ -140,12 +188,29 @@ export async function run(wasm, opts = {}) {
   for (const { module: m, name } of WebAssembly.Module.imports(module)) {
     if (m === "wasi_snapshot_preview1") wasi[name] = imports[name] ?? (() => ERRNO_NOSYS);
   }
-  const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi });
+  const needsSuspension = WebAssembly.Module.imports(module).some(
+    ({ module: m, name }) => m === "kai" && name === "needs_suspension",
+  );
+  const hasSuspending = typeof WebAssembly.Suspending === "function";
+  if (needsSuspension && !hasSuspending) {
+    echo?.(`${NO_JSPI}\n`);
+    throw new Error(NO_JSPI);
+  }
+  let instance;
+  const contexts = hasSuspending ? suspension(() => instance) : null;
+  instance = await WebAssembly.instantiate(module, {
+    wasi_snapshot_preview1: wasi,
+    kai: contexts ? contexts.imports : { needs_suspension: refuse, ctx_switch: refuse, ctx_exit: refuse },
+  });
   memory = instance.exports.memory;
 
   let code = 0;
   try {
-    instance.exports._start();
+    if (needsSuspension) {
+      await Promise.race([WebAssembly.promising(instance.exports._start)(), contexts.failed]);
+    } else {
+      instance.exports._start();
+    }
   } catch (e) {
     if (e instanceof ProcExit) code = e.code;
     else throw e;

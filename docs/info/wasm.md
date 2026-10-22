@@ -35,13 +35,15 @@ to a compiler on `PATH`.
 ## What runs
 
 Programs that run to completion on one thread: pure code, records, sum
-types, handlers (exception handling, exnref encoding), `Seq`, and an actor
-on the main fiber. The engine must ship exception handling with exnref:
-Chrome and Edge 137, Firefox 131, Safari 18.4.
+types, handlers (exception handling, exnref encoding), `Seq`, fibers
+(`spawn`, `nursery`), actors and handlers that keep `resume`. The engine must
+ship exception handling with exnref: Chrome and Edge 137, Firefox 131,
+Safari 18.4. A program that spawns a fiber or keeps a continuation also
+needs JSPI (Chrome and Edge 137, Firefox 153, Safari 27); the host refuses
+to load it on an engine without.
 
-Not available on the page: fibers (`spawn`, `nursery`), handlers that keep
-`resume`, sockets, processes, signals and the reactor (sleeps, `File`,
-`Stdin`). Non-tail recursion is limited by the engine's stack, about 6 000
+Not available on the page: sockets, processes, signals and the reactor
+(sleeps, `File`, `Stdin`). Non-tail recursion is limited by the engine's stack, about 6 000
 frames in Chrome.
 
 ## Flags

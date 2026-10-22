@@ -19,7 +19,7 @@
  *                         their references */
 #if defined(__wasm__)
 #  ifndef KAI_HOST_FIBERS
-#    define KAI_HOST_FIBERS 0
+#    define KAI_HOST_FIBERS 1
 #  endif
 #  ifndef KAI_HOST_STACK_GUARD
 #    define KAI_HOST_STACK_GUARD 0
@@ -67,7 +67,7 @@
 #ifndef KAI_HOST_UNWIND
 #  define KAI_HOST_UNWIND 1
 #endif
-#if KAI_HOST_FIBERS && !KAI_HOST_STACK_GUARD
+#if KAI_HOST_FIBERS && !KAI_HOST_STACK_GUARD && !defined(__wasm__)
 #  error "KAI_HOST_FIBERS needs KAI_HOST_STACK_GUARD: a fiber runs on a mapped stack"
 #endif
 #if (KAI_HOST_SOCKETS || KAI_HOST_PROCESS || KAI_HOST_SIGNALS) && !KAI_HOST_REACTOR
@@ -351,7 +351,9 @@ static int kai_nthreads = 1;
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
-#if KAI_HOST_FIBERS
+#if KAI_HOST_FIBERS && defined(__wasm__)
+#include "wasm_ctx.h"
+#elif KAI_HOST_FIBERS
 #include <ucontext.h>
 #endif
 #if defined(__APPLE__) || defined(__clang__)

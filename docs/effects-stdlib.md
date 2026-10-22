@@ -123,7 +123,7 @@ exists only when one of these three applies; none is arbitrary.
 ### Which effects a browser `main` may perform
 
 A program built with `--target=wasm32-browser` runs on a page, which has no
-processes, sockets, signals, files, stdin, fibers or blocking waits. The
+processes, sockets, signals, files or stdin. The
 compiler refuses, at `main`, any of these effects left in `main`'s final row,
 with a diagnostic naming the effect and the target. An effect closed by a
 `handle` inside `main` never reaches the row, so a program that supplies its
@@ -137,7 +137,7 @@ own handler still builds.
 | `Signal` | refused | no signals on a page |
 | `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` | refused | no sockets |
 | `File`, `Stdin` | refused | no file system or stdin |
-| `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | refused | one thread, no fibers |
+| `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | allowed | fibers suspend through the host (JSPI); a sleep or `receive_timeout` stops at run time |
 
 The rule: an effect is refused when no operation of it runs in the page, and
 allowed, with runtime stops for the operations that cannot run (`Clock.sleep_ns`,

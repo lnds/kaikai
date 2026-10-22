@@ -115,7 +115,11 @@ static void kai_seg_unmap(KaiSegment *seg) {
         seg->relays = r->next;
         free(r);
     }
+#if defined(__wasm__)
+    free(seg->own.stack_base);
+#else
     munmap(seg->own.stack_base, seg->own.stack_size + kai_page_size());
+#endif
     free(seg->own.unw_buf);
     free(seg->own.rframe_buf);
     free(seg);
@@ -193,6 +197,9 @@ static void kai_seg_leave(KaiSegment *seg) {
     KAI_SEG_ASAN_LEAVE(NULL, seg->asan_outer_bottom, seg->asan_outer_size);
 #if defined(KAI_TSAN_FIBERS)
     __tsan_switch_to_fiber(seg->tsan_outer, 0);
+#endif
+#if defined(__wasm__)
+    kai_seg_switch_final(seg->outer_sp);
 #endif
     kai_seg_switch(&seg->sp, seg->outer_sp, NULL);
     __builtin_unreachable();
@@ -345,6 +352,9 @@ static void kai_seg_discontinue_seg(KaiSegment *seg) {
  * Returns what the body returned with `*k` NULL, or the value it suspended
  * with and `*k` the continuation. */
 KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
+#if defined(__wasm__)
+    kai_wctx_mark();
+#endif
     KaiFiber *f = kai_current_fiber();
     KaiSegment *seg = kai_seg_pool_take();
     seg->fiber       = f;

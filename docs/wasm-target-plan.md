@@ -783,7 +783,7 @@ What each kind of runner is honest for:
 
   | macro | facility | at 0 |
   |---|---|---|
-  | `KAI_HOST_FIBERS` | context switch by `ucontext` (gap 2) | one thread, `KAI_THREADS` not read; creating a fiber stops (`fibers`) |
+  | `KAI_HOST_FIBERS` | context switch by `ucontext` (gap 2); on WebAssembly, through the host (PR 6) | one thread, `KAI_THREADS` not read; creating a fiber stops (`fibers`) |
   | `KAI_HOST_STACK_GUARD` | mapped stacks, guard page, overflow handler (gap 6) | `KAI_SEG_SWITCH` is not defined either, so a handler that keeps `resume` takes the path of a target with no switch: `kai: stack segments are not supported on this target` |
   | `KAI_HOST_REACTOR` | self-pipes, `poll`, the file pool (gap 7) | `kai_reactor_init` stops (`reactor`): sleeps, `File`, `Stdin` reads |
   | `KAI_HOST_SOCKETS` | sockets and DNS (gap 8) | every `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` handler stops (`sockets`) |
@@ -952,6 +952,21 @@ What each kind of runner is honest for:
 - *Depends on*: PR 2; decision 3.3. Independent of PR 5.
 - *Risk*: none to hosts if the edits stay under the target's `#if`; the
   `kai_seg_*` seam already has two implementations and gains a third.
+
+> **Shipped (2026-10-22):** the seam is `stage2/runtime/wasm_ctx.h`, under
+> `__wasm__` only. A context is a WebAssembly stack the host keeps suspended;
+> a `ucontext_t` stand-in and `kai_seg_switch` both go through the
+> `kai.ctx_switch` import, which the page wraps in `WebAssembly.Suspending`
+> and which dispatches the target explicitly: it wakes the target's pending
+> promise or starts it by calling a table entry through
+> `WebAssembly.promising`. Each context owns a malloc'd C stack, with
+> `__stack_pointer` saved around the switch and set by the host for a fresh
+> one, so a fiber stack has no guard page. A module imports
+> `kai.needs_suspension` only when it creates a fiber or a segment; the host
+> refuses such a module at load on an engine without JSPI, and a program that
+> never suspends runs without it. `main` no longer refuses `Spawn`, `Cancel`,
+> `Link`, `Monitor` or `Actor`. Waits still stop with `this host has no
+> reactor` until PR 7.
 
 **PR 7 — `feat(runtime): waits park on the host event loop`**
 

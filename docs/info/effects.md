@@ -205,9 +205,9 @@ the Stage A/B/C trilogy live in `docs/effects.md`.
 ## Targets — effects a browser `main` cannot perform
 
 `kai build --target=wasm32-browser` builds for a page. A page has no
-processes, sockets, signals, files, stdin or fibers, so a `main` whose
+processes, sockets, signals, files or stdin, so a `main` whose
 final row holds `Signal`, `NetTcp`, `NetUdp`, `NetUnix`,
-`NetDns`, `File`, `Stdin`, `Spawn`, `Cancel`, `Link`, `Monitor` or `Actor`
+`NetDns`, `File` or `Stdin`
 is refused at compile time:
 
 ```
