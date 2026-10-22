@@ -22,6 +22,8 @@ import collections, json, sys
 counts = collections.Counter()
 for f in json.load(sys.stdin):
     path = f["file"]
+    if not path.startswith("/"):
+        path = "stage2/" + path.removeprefix("./")
     i = path.find("stage2/")
     counts[(path[i:] if i >= 0 else path, f["rule"])] += 1
 for (path, rule), n in sorted(counts.items()):
