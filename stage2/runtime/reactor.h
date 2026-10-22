@@ -858,6 +858,9 @@ static int kai_reactor_park_socket_read_timeout(KaiFiber *f, int fd, uint64_t de
  * The KaiFilepoolItem lives on the caller's fiber stack — safe
  * because the parked fiber's stack is preserved until resume. */
 static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg) {
+#if !KAI_HOST_REACTOR
+    return work(arg);
+#else
     kai_reactor_init_filepool();
     KaiFilepoolItem item;
     item.work       = work;
@@ -898,6 +901,7 @@ static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg) {
     KaiValue *r = item.result;
     me->reactor_data = NULL;
     return r ? r : kai_unit();
+#endif
 }
 
 /* Issue #630 — Phase R2: count the live socket-waiter fds in each

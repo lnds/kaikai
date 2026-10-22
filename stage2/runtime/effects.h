@@ -388,7 +388,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_read_file(void *self, KaiValue *path, Ka
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileReadFileArg a = { kai_incref(path) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_file_thunk, &a);
     return kai_cont_resume(k, r);
@@ -410,7 +412,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileWriteFileArg a = { kai_incref(path), kai_incref(contents) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_file_thunk, &a);
     return kai_cont_resume(k, r);
@@ -438,7 +442,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_open_read(void *self, KaiValue *path, Ka
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileOpenArg a = { kai_incref(path) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_read_thunk, &a);
     return kai_cont_resume(k, r);
@@ -456,7 +462,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiV
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileReadChunkArg a = { kai_incref(h), kai_incref(max) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_chunk_thunk, &a);
     return kai_cont_resume(k, r);
@@ -472,7 +480,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_open_write(void *self, KaiValue *path, K
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileOpenArg a = { kai_incref(path) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_write_thunk, &a);
     return kai_cont_resume(k, r);
@@ -490,7 +500,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, Kai
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileWriteChunkArg a = { kai_incref(h), kai_incref(data) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_chunk_thunk, &a);
     return kai_cont_resume(k, r);
@@ -507,7 +519,9 @@ KAI_SCHED_FN KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiC
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR
     kai_reactor_init();
+#endif
     KaiFileCloseArg a = { kai_incref(h) };
     KaiValue *r = kai_reactor_run_in_pool(_kai_file_close_thunk, &a);
     return kai_cont_resume(k, r);

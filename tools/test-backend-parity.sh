@@ -1,5 +1,8 @@
 #!/bin/bash
-# Backend-parity harness — native vs C-direct (the oracle).
+# Backend-parity harness — native vs C-direct (the oracle). With
+# TARGET_BACKEND=wasm the target is the C backend built for wasm32 and run
+# under node with stage2/web/kai_host.mjs (needs WASI_SDK and a node with
+# exnref; WASM_NODE_FLAGS carries the flag an older node wants).
 #
 # bash (not sh): the xargs worker fan-out uses `export -f` to make
 # the worker function visible to forked subshells. dash (Ubuntu's
@@ -54,6 +57,17 @@ case "$TARGET_BACKEND" in
     fi
     rm -f "$probe" "${probe%.kai}.bin"
     ;;
+  wasm)
+    if [ ! -x "${WASI_SDK:-/nonexistent}/bin/clang" ] || ! command -v node >/dev/null 2>&1; then
+      echo "test-backend-parity: SKIP (wasm needs WASI_SDK=<wasi-sdk dir> and node)"
+      exit 0
+    fi
+    WASM_CC="$WASI_SDK/bin/clang"
+    WASM_CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp -Wno-unused-command-line-argument"
+    WASM_NODE_FLAGS="${WASM_NODE_FLAGS:-}"
+    WASM_HOST="$ROOT/stage2/web/kai_host.mjs"
+    export WASM_CC WASM_CFLAGS WASM_NODE_FLAGS WASM_HOST
+    ;;
   *)
     if ! command -v "${CLANG:-clang}" >/dev/null 2>&1; then
       echo "test-backend-parity: SKIP (clang not in PATH)"
@@ -61,6 +75,37 @@ case "$TARGET_BACKEND" in
     fi
     ;;
 esac
+
+# The target side. Under wasm it is the C backend for wasm32 on one thread,
+# executed by the JavaScript host.
+target_build() {
+  if [ "$TARGET_BACKEND" = wasm ]; then
+    kai_corpus_build "$1" "$2" KAI_BACKEND=c KAI_MODULAR=0 CC="$WASM_CC" CFLAGS="$WASM_CFLAGS"
+  else
+    local nopt
+    nopt="$(kai_corpus_native_opt "$1")" || nopt=""
+    kai_corpus_build "$1" "$2" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0
+  fi
+}
+
+target_exec() {
+  if [ "$TARGET_BACKEND" = wasm ]; then
+    # shellcheck disable=SC2086
+    node $WASM_NODE_FLAGS "$WASM_HOST" "$1"
+  else
+    "$1"
+  fi
+}
+
+parity_pin() {
+  local p
+  p="$(kai_corpus_pinned_threads "$1")" || p=""
+  if [ "$TARGET_BACKEND" = wasm ]; then p="${p:-1}"; fi
+  echo "$p"
+}
+
+PARITY_BASELINE="$ROOT/tools/native-parity-baseline.txt"
+if [ "$TARGET_BACKEND" = wasm ]; then PARITY_BASELINE="$ROOT/tools/wasm-parity-baseline.txt"; fi
 
 if [ ! -x "$KAI" ]; then
   echo "test-backend-parity FAIL — bin/kai not found or not executable"
@@ -165,8 +210,7 @@ process_one() {
   # cache to amortise it (a 30-min shard timeout). The modular path's own
   # equivalence is proved byte-for-byte by `test-native-modular`; this harness
   # need not re-pay for it. (KAI_NATIVE_MODULAR is a no-op on the C oracle.)
-  nopt="$(kai_corpus_native_opt "$f")" || nopt=""
-  if ! kai_corpus_build "$f" "$t_bin" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 >"$t_blog" 2>&1; then
+  if ! target_build "$f" "$t_bin" >"$t_blog" 2>&1; then
     {
       echo "FAIL $f — $TARGET_BACKEND (target) build failed:"
       tail -10 "$t_blog" | sed 's/^/    /'
@@ -178,11 +222,11 @@ process_one() {
 
   o_out_file="$tmp/${slug}.oracle.out"
   t_out_file="$tmp/${slug}.target.out"
-  pin="$(kai_corpus_pinned_threads "$f")" || pin=""
+  pin="$(parity_pin "$f")"
   o_rc=0
   run_with_timeout env ${pin:+KAI_THREADS="$pin"} "$o_bin" >"$o_out_file" 2>&1 </dev/null || o_rc=$?
   t_rc=0
-  run_with_timeout env ${pin:+KAI_THREADS="$pin"} "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
+  run_with_timeout env ${pin:+KAI_THREADS="$pin"} bash -c 'target_exec "$1"' _ "$t_bin" >"$t_out_file" 2>&1 </dev/null || t_rc=$?
   kai_corpus_normalize_timestamps <"$o_out_file" >"$o_out_file.norm" && mv "$o_out_file.norm" "$o_out_file"
   kai_corpus_normalize_timestamps <"$t_out_file" >"$t_out_file.norm" && mv "$t_out_file.norm" "$t_out_file"
 
@@ -216,7 +260,7 @@ process_one() {
 # reach them from each forked subshell.
 export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND
-export -f process_one kai_corpus_build kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
+export -f target_build target_exec parity_pin process_one kai_corpus_build kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')
@@ -246,13 +290,16 @@ echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fai
 #   - failing set == baseline => OK at baseline.
 # This locks the burn-down: lanes can only move the count DOWN.
 if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
-  baseline_file="$ROOT/tools/native-parity-baseline.txt"
+  baseline_file="$PARITY_BASELINE"
   [ -f "$baseline_file" ] || { echo "ratchet FAIL — baseline missing: $baseline_file"; exit 1; }
   # Current failing fixtures, one path per line (extracted from the
   # failure log's `FAIL <path> — …` lines).
   grep '^FAIL ' "$failures" 2>/dev/null | awk '{print $2}' | sort -u > "$tmp/failing.now"
   # Allowed gaps: non-comment, non-blank lines of the baseline.
-  grep -vE '^[[:space:]]*(#|$)' "$baseline_file" | sort -u > "$tmp/failing.base"
+  grep -vE '^[[:space:]]*(#|$)' "$baseline_file" | sort -u > "$tmp/failing.all"
+  : > "$tmp/failing.base"
+  for d in $KAI_CORPUS_DIRS; do grep "^$d/" "$tmp/failing.all" >> "$tmp/failing.base" || true; done
+  sort -u -o "$tmp/failing.base" "$tmp/failing.base"
   # New gaps = failing now but not allowed. Closed gaps = allowed but
   # now passing.
   new_gaps="$(comm -23 "$tmp/failing.now" "$tmp/failing.base")"
@@ -281,15 +328,15 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
     rf="$1"
     rob="$tmp/recheck.oracle"; rtb="$tmp/recheck.target"
     kai_corpus_build "$rf" "$rob" KAI_BACKEND="$ORACLE_BACKEND" >/dev/null 2>&1 || return 2
-    oref=0; orefout="$(run_with_timeout "$rob" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || oref=$?
+    pin="$(parity_pin "$rf")"
+    oref=0; orefout="$(run_with_timeout env ${pin:+KAI_THREADS="$pin"} "$rob" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || oref=$?
     attempt=0
     while [ "$attempt" -lt "$PARITY_RECHECKS" ]; do
       attempt=$((attempt + 1))
-      nopt="$(kai_corpus_native_opt "$rf")" || nopt=""
-      if ! kai_corpus_build "$rf" "$rtb" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" >/dev/null 2>&1; then
+      if ! target_build "$rf" "$rtb" >/dev/null 2>&1; then
         return 0   # target build failed => a deterministic, real gap.
       fi
-      rt=0; rtout="$(run_with_timeout "$rtb" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || rt=$?
+      rt=0; rtout="$(run_with_timeout env ${pin:+KAI_THREADS="$pin"} bash -c 'target_exec "$1"' _ "$rtb" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || rt=$?
       if [ "$rt" != "$oref" ] || [ "$rtout" != "$orefout" ]; then
         return 0   # diverged on a recheck => a real (new) gap.
       fi
