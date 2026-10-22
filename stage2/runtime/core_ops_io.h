@@ -443,8 +443,8 @@ static void kai_set_args(int argc, char **argv) {
  * (POSIX keeps the low 8 bits); any other return type — Unit, String — is 0.
  * `main` is excluded from unboxing (classify_unbox_sig), so the result is
  * always a KaiValue* here. Both backends' entry points share this rule.
- * Returning the code lets libc run the full exit path; unlike
- * `os.process.exit`'s _exit(2), buffered stdio is still flushed. */
+ * Returning the code lets libc run the full exit path, atexit included;
+ * `os.process.exit` flushes stdout but skips atexit. */
 static int kai_main_exit_status(KaiValue *result) {
     int status = kai_is_int(result) ? (int) (kai_intf(result) & 0xff) : 0;
     atomic_store(&kai_chosen_exit_plus1, status + 1);
