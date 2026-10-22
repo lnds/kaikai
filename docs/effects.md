@@ -630,7 +630,13 @@ worth noting so the syntax is not mystery:
   `X.op(args)` performs against *that* instance; `X` may also be
   passed down as a call argument (`fn f(c: Eff)`), where it remains
   second-class — it cannot be returned, stored, or captured by a
-  closure that outlives the `handle`.
+  closure that outlives the `handle`. The type system enforces it: a
+  lambda that references a capability bound outside it (an op call,
+  returning it, copying it, passing it on) carries that capability's
+  effect in its own row, exactly as an alias does. The closure is then
+  `(…) -> T / Eff`, so it can only be called where `Eff` is handled,
+  and a return type or field that does not declare `Eff` rejects it.
+  The scope that owns the parameter does not demand the effect itself.
 - A tail `resume` returns into the op site at no cost; a non-tail
   one costs one closure. Multi-shot requires copying the fiber
   stack frames, hence the opt-in.
