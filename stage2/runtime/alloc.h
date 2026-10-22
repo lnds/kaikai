@@ -486,6 +486,7 @@ typedef struct KaiFreeStack {
 typedef struct KaiWorker {
     KaiFiber   *active;
     int         id;
+    int         sched;          /* 1 on a thread the scheduler owns */
     int         parked_count;   /* N=1 deadlock detection */
     KaiFiber   *ready_head;     /* N=1 ready queue; at N>1 it is the slot's */
     KaiFiber   *ready_tail;

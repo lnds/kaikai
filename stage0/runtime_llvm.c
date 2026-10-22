@@ -1435,6 +1435,9 @@ KaiValue *kaix_core_defer(KaiValue *thunk)                            { return k
 KaiValue *kaix_core_force(KaiValue *s)                                { return kai_seq_force(s); }
 KaiValue *kaix_core_filter_cell(KaiValue *s, KaiValue *p)             { return kai_seq_filter(s, p); }
 KaiValue *kaix_core_once(KaiValue *init)                              { return kai_seq_once(init); }
+KaiValue *kaix_core_retain_userdata(KaiValue *v)                      { return kai_ffi_retain(v); }
+KaiValue *kaix_core_take_userdata(KaiValue *u)                        { return kai_ffi_take(u); }
+KaiValue *kaix_core_release_userdata(KaiValue *u)                     { return kai_ffi_release(u); }
 /* `unit_name(x)` is a COMPILE-TIME intrinsic in the C-direct backend
  * (emit_c resolves it to the value's unit-of-measure name as a string
  * literal). The native backend lowers it as a plain call, so it needs a
@@ -1984,6 +1987,11 @@ KaiValue *kaix_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k)
     KaiValue *_op_r = kai_default_securerandom_bytes(self, n_v, k);
     kai_decref(n_v);
     return _op_r;
+}
+
+/* The entry of an `extern "C" fn` with a body, as the native adapter calls it. */
+KaiValue *kaix_export_call(const char *name, KaiFn thunk, KaiValue **args, int n) {
+    return kai_export_call(name, thunk, args, n);
 }
 
 /* LLVM-visible wrappers around the static Spawn default handlers in runtime.h. */

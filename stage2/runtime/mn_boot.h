@@ -122,6 +122,7 @@ static pthread_t kai_worker_threads[KAI_MAX_THREADS];
 static void *kai_worker_thread_main(void *arg) {
     KaiWorker *w = kai_worker_here();
     w->id = (int) (intptr_t) arg;
+    w->sched = 1;
     /* Per-thread: without it a fiber overflowing here dies undiagnosed. */
     kai_install_thread_sigaltstack(w);
     w->main_fiber.home_thread = w->id;
@@ -213,6 +214,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
 #else
 {
     kai_nthreads = kai_read_nthreads();
+    kai_worker_here()->sched = 1;
     if (kai_nthreads <= 1) {
         kai_nthreads = 1;
         KAI_TSAN_BIND_ROOT(kai_worker_here());

@@ -1,0 +1,69 @@
+#[doc("""
+Native C-ABI entries for `extern "C" fn` declarations with a body.
+
+Each export becomes a function under its C symbol that boxes its raw
+arguments, hands the runtime's export entry the fn's thunk and an argument
+array, and unboxes the result. The entry owns the rest: running on the
+current fiber, or on a fiber of its own when the caller is a foreign thread.
+""")]
+
+import compiler.emit_native_fn
+import compiler.emit_native_ffi
+import compiler.emit_native_ops_calls
+import compiler.emit_native_term
+import compiler.emit_shared_syms
+import compiler.kir
+
+#[doc("Define the C-ABI entry of every export.")]
+pub fn nemit_exports(ctx: Handle, es: [KExport]) : Unit / Console = match es {
+  [] -> ()
+  [e, ...rest] -> { nemit_export(ctx, e); nemit_exports(ctx, rest) }
+}
+
+fn nemit_export(ctx: Handle, e: KExport) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let ptb = llvm_buf_new()
+  push_raw_types(ctx, e.params, ptb)
+  let fnty = llvm_fn_type_n(ffi_raw_type(ctx, e.ret), ptb)
+  llvm_buf_free(ptb)
+  let f = llvm_get_or_declare_fn(native_ctx_m(ctx), e.csym, fnty)
+  let saved = native_ctx_fnval(ctx)
+  native_ctx_set_fnval(ctx, f)
+  llvm_position_at_end(native_ctx_b(ctx), llvm_append_block(native_ctx_m(ctx), f, "entry"))
+  let boxed = llvm_buf_new()
+  box_params(ctx, f, e.params, 0, boxed)
+  let n = llvm_buf_len(boxed)
+  let arr = nemit_ptr_array(ctx, boxed)
+  llvm_buf_free(boxed)
+  let r = ncall_sig4(ctx, "kaix_export_call", p, p, p, p, native_ctx_i32t(ctx),
+                     llvm_build_global_string(native_ctx_b(ctx), e.csym),
+                     nemit_declare_thunk(ctx, c_user_thunk_sym(e.sym)), arr,
+                     llvm_const_i32(native_ctx_i32t(ctx), n))
+  finish_export(ctx, e.ret, r)
+  native_ctx_set_fnval(ctx, saved)
+}
+
+fn push_raw_types(ctx: Handle, ks: [KFfiKind], ptb: Handle) : Unit = match ks {
+  [] -> ()
+  [k, ...rest] -> { llvm_buf_push(ptb, ffi_raw_type(ctx, k)); push_raw_types(ctx, rest, ptb) }
+}
+
+fn box_params(ctx: Handle, f: Handle, ks: [KFfiKind], i: Int, boxed: Handle) : Unit / Console = match ks {
+  [] -> ()
+  [k, ...rest] -> {
+    llvm_buf_push(boxed, ffi_box_raw(ctx, k, llvm_get_param(f, i)))
+    box_params(ctx, f, rest, i + 1, boxed)
+  }
+}
+
+fn finish_export(ctx: Handle, ret: KFfiKind, r: Handle) : Unit / Console = match ret {
+  KFfiUnit -> {
+    let _d = ncall_sig1(ctx, "kaix_decref", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), r)
+    llvm_build_ret_void(native_ctx_b(ctx)); ()
+  }
+  _ -> {
+    let raw = ffi_unbox_raw(ctx, ret, r)
+    let _d = ncall_sig1(ctx, "kaix_decref", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), r)
+    llvm_build_ret(native_ctx_b(ctx), raw); ()
+  }
+}

@@ -83,23 +83,25 @@ fn ref_decl(v: TyHomeView, r: DeclRef) : Option[SymId] = match tsh_tycon_at(v, r
 
 #[doc("Reject an `extern \"C\" fn` whose parameter or return type, or an `extern \"C\" type` whose field type, is not a scalar, a fixed-width annotation, or a declared `extern \"C\" type`/`opaque`.")]
 pub(pkg) fn validate_extern_fn_types(decls: [Decl], x: ExternScope, df: DiagFiles) : [Diagnostic] / Console + File =
-  if any(decls, crosses_boundary) {
+  if any(decls, (d) => crosses_boundary(d, xs_tab(x))) {
     let cx = XtCx { tab: xs_tab(x), homes: xs_homes(decls, x), reg: collect_extern_types(decls, xs_tab(x)), df: df }
     list_reverse(extern_types_loop(decls, cx, []))
   } else { [] }
 
 type XtCx = { tab: SymTab, homes: TyHomes, reg: [ExternTypeReg], df: DiagFiles }
 
-fn crosses_boundary(d: Decl) : Bool = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _) -> match body.kind {
+fn crosses_boundary(d: Decl, tab: SymTab) : Bool = match d {
+  DFn(_, fid, _, _, _, _, body, _, _, _) -> match body.kind {
     EExternBody(AbiC, _) -> true
-    _                    -> false
+    _                    -> fn_exports(tab, fid)
   }
   DExternType(_, _, ETStruct(_), _, _, _) -> true
-  DDoc(_, _, inner, _, _)              -> crosses_boundary(inner)
-  DAttr(_, inner, _, _)                -> crosses_boundary(inner)
+  DDoc(_, _, inner, _, _)              -> crosses_boundary(inner, tab)
+  DAttr(_, inner, _, _)                -> crosses_boundary(inner, tab)
   _                                    -> false
 }
+
+fn fn_exports(tab: SymTab, fid: FnId) : Bool = is_some(mint_export(sym_mint(tab, fnid_sym(fid))))
 
 fn extern_types_loop(decls: [Decl], cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match decls {
   [] -> errs
@@ -108,37 +110,51 @@ fn extern_types_loop(decls: [Decl], cx: XtCx, errs: [Diagnostic]) : [Diagnostic]
 
 fn check_extern_decl(d: Decl, cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match d {
   DFn(_, fid, _, params, ret, _, body, l, c, mo) -> match body.kind {
-    EExternBody(AbiC, _) -> {
-      let at = XtAt { d: d, what: concat_all(["`extern \"C\" fn ", written_text(sym_name(cx.tab, fnid_sym(fid))), "`"]),
-                      line: l, col: c, view: tsh_view(cx.homes, mo) }
-      let n = check_params(params, at, cx, errs)
-      match ret {
-        Some(t) ->
-          if boundary_ok(t, true, at.view, cx) { n }
-          else { [report_foreign_type(cx, at, "return type", t), ...n] }
-        None    -> n
-      }
-    }
-    _ -> errs
+    EExternBody(AbiC, _) -> check_fn_signature(d, fid, params, ret, false, l, c, mo, cx, errs)
+    _ -> if fn_exports(cx.tab, fid) { check_fn_signature(d, fid, params, ret, true, l, c, mo, cx, errs) } else { errs }
   }
   DExternType(_, name, ETStruct(fs), l, c, mo) ->
     check_fields(fs, XtAt { d: d, what: concat_all(["`extern \"C\" type ", name, "`"]), line: l, col: c,
-                            view: tsh_view(cx.homes, mo) }, cx, errs)
+                            view: tsh_view(cx.homes, mo), exported: false }, cx, errs)
   DDoc(_, _, inner, _, _) -> check_extern_decl(inner, cx, errs)
   DAttr(_, inner, _, _)   -> check_extern_decl(inner, cx, errs)
   _ -> errs
 }
 
+fn check_fn_signature(d: Decl, fid: FnId, params: [Param], ret: Option[TypeExpr], exported: Bool, l: Int, c: Int,
+                      mo: Option[String], cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = {
+  let at = XtAt { d: d, what: concat_all([if exported { "exported `extern \"C\" fn " } else { "`extern \"C\" fn " },
+                                          written_text(sym_name(cx.tab, fnid_sym(fid))), "`"]),
+                  line: l, col: c, view: tsh_view(cx.homes, mo), exported: exported }
+  let n = check_params(params, at, cx, errs)
+  match ret {
+    Some(t) ->
+      if boundary_ok(t, true, at.view, cx) and not (exported and (returns_string(t, cx) or is_struct_type(t, cx))) { n }
+      else { [report_foreign_type(cx, at, "return type", t), ...n] }
+    None -> n
+  }
+}
+
+fn is_struct_type(t: TypeExpr, cx: XtCx) : Bool = match ffi_kind_of_ty_reg(t, cx.reg, cx.tab) {
+  FfiRetStruct(_) -> true
+  _               -> false
+}
+
+fn returns_string(t: TypeExpr, cx: XtCx) : Bool = match ffi_kind_of_ty(t, cx.tab) {
+  FfiRetString -> true
+  _            -> false
+}
+
 # The declaration a diagnostic is about, how it names it, and the view
 # its written type names are read from.
-type XtAt = { d: Decl, what: String, line: Int, col: Int, view: TyHomeView }
+type XtAt = { d: Decl, what: String, line: Int, col: Int, view: TyHomeView, exported: Bool }
 
 fn check_params(params: [Param], at: XtAt, cx: XtCx, errs: [Diagnostic]) : [Diagnostic] / Console + File = match params {
   [] -> errs
   [p, ...rest] -> match p.ptype {
     None -> check_params(rest, at, cx, errs)
     Some(t) ->
-      if boundary_ok(t, false, at.view, cx) { check_params(rest, at, cx, errs) }
+      if boundary_ok(t, false, at.view, cx) and not (at.exported and is_struct_type(t, cx)) { check_params(rest, at, cx, errs) }
       else {
         let e = report_foreign_type(cx, at, concat_all(["parameter `", written_text(p.binder.name), "`"]), t)
         check_params(rest, at, cx, [e, ...errs])
@@ -185,7 +201,8 @@ fn names_foreign(reg: [ExternTypeReg], v: TyHomeView, r: DeclRef) : Bool = match
 
 fn report_foreign_type(cx: XtCx, at: XtAt, what: String, t: TypeExpr) : Diagnostic / Console + File = {
   let file = decl_diag_file(at.d, cx.df)
-  let help = "allowed: Int, Real, Bool, Char, String, Unit (return only), fixed-width U8..F32, Int32, UInt32, UInt64, or a declared `extern \"C\" type` / `extern \"C\" opaque`"
+  let help = if at.exported { "an exported function takes Int, Real, Bool, Char, fixed-width U8..F32, Int32, UInt32, UInt64 or an `extern \"C\" opaque` handle, plus String as a parameter, and returns Unit or one of those but String" }
+             else { "allowed: Int, Real, Bool, Char, String, Unit (return only), fixed-width U8..F32, Int32, UInt32, UInt64, or a declared `extern \"C\" type` / `extern \"C\" opaque`" }
   let msg = concat_all([at.what, " ", what, " has type `", type_surface_name(cx.tab, t), "`, which has no C layout"])
   let diag = mk_diag(SevError, file, at.line, at.col, msg, [ri_help(file, at.line, at.col, help)])
   render_diag(diag)
@@ -196,6 +213,7 @@ fn type_surface_name(tab: SymTab, t: TypeExpr) : String = match t.tkind {
   TyName(r, [])    -> extern_ref_name(tab, r)
   TyName(r, targs) -> concat_all([extern_ref_name(tab, r), "[", join_with(map(targs, (a) => type_surface_name(tab, a)), ", "), "]"])
   TyList(inner)    -> concat_all(["[", type_surface_name(tab, inner), "]"])
+  TyFn(_, _, _)    -> "fn(...)"
   _                -> "?"
 }
 

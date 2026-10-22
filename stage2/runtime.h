@@ -90,6 +90,7 @@
 #include "runtime/reactor_thread.h"
 #include "runtime/mn_worker.h"
 #include "runtime/mn_boot.h"
+#include "runtime/mn_foreign.h"
 #include "runtime/evidence.h"
 #include "runtime/segments.h"
 
