@@ -34,5 +34,15 @@ expect "bench: bench runtime kept" "! grep -q '^#define KAI_NO_BENCH_CHECK' $wor
 emit "$ROOT/examples/stdlib/check_basic.kai" > "$work/check.c"
 expect "check: check runtime kept" "! grep -q '^#define KAI_NO_BENCH_CHECK' $work/check.c"
 
+# Every name harness_extra.h defines is covered by a needle of the emitter's gate.
+needles="$(grep -o 'any(\[[^]]*\]' "$ROOT/stage2/compiler/emit_cache.kai" | grep -o '"kai_[a-z_]*"' | tr -d '"')"
+for n in $(grep -E '^(static|KAI_[A-Z_]+) ' "$ROOT/stage2/runtime/harness_extra.h" | grep -v ';$' | grep -oE 'kai_[a-z_0-9]+\(' | tr -d '(' | sort -u); do
+  covered=0
+  for p in $needles; do
+    case "$n" in "$p"*) covered=1 ;; esac
+  done
+  expect "gate covers $n" "[ $covered = 1 ]"
+done
+
 [ "$fail" -eq 0 ] && echo "runtime gates: ok"
 exit "$fail"
