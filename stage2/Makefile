@@ -11649,7 +11649,13 @@ test-issue-1588-main-exit-status: $(TARGET) bin-kai build
 	[ $$st -eq 0 ] || { echo "issue-1588 FAIL unit (C backend): exit status $$st, expected 0"; exit 1; }; \
 	diff -q ../examples/runtime/issue_1588_main_unit_exit_zero.out.expected build/iss1588u-c.out > /dev/null \
 	  || { echo "issue-1588 DIFF unit (C backend)"; exit 1; }; \
-	echo "issue-1588 OK (C backend: Int main exits 3 with stdout flushed, Unit main exits 0)"
+	../bin/kai build --backend=c ../examples/runtime/issue_1588_process_exit_status.kai -o build/iss1588p-c 2> build/iss1588p-c.err \
+	  || { echo "issue-1588 BUILD FAIL Process.exit (C backend)"; cat build/iss1588p-c.err; exit 1; }; \
+	st=0; ./build/iss1588p-c > build/iss1588p-c.out || st=$$?; \
+	[ $$st -eq 3 ] || { echo "issue-1588 FAIL Process.exit (C backend): exit status $$st, expected 3"; exit 1; }; \
+	diff -q ../examples/runtime/issue_1588_process_exit_status.out.expected build/iss1588p-c.out > /dev/null \
+	  || { echo "issue-1588 DIFF Process.exit (C backend, stdout not flushed)"; exit 1; }; \
+	echo "issue-1588 OK (C backend: Int main exits 3 with stdout flushed, Unit main exits 0, Process.exit(3) flushes and exits 3)"
 
 ifeq ($(KAI_LLVM),1)
 test-issue-1588-main-exit-status-native: $(TARGET) bin-kai build
@@ -11666,7 +11672,13 @@ test-issue-1588-main-exit-status-native: $(TARGET) bin-kai build
 	[ $$st -eq 0 ] || { echo "issue-1588 FAIL unit (native): exit status $$st, expected 0"; exit 1; }; \
 	diff -q ../examples/runtime/issue_1588_main_unit_exit_zero.out.expected build/iss1588u-nat.out > /dev/null \
 	  || { echo "issue-1588 DIFF unit (native)"; exit 1; }; \
-	echo "issue-1588 OK (native: Int main exits 3 with stdout flushed, Unit main exits 0)"
+	KAI_BACKEND=native ../bin/kai build ../examples/runtime/issue_1588_process_exit_status.kai -o build/iss1588p-nat 2> build/iss1588p-nat.err \
+	  || { echo "issue-1588 BUILD FAIL Process.exit (native)"; cat build/iss1588p-nat.err; exit 1; }; \
+	st=0; ./build/iss1588p-nat > build/iss1588p-nat.out || st=$$?; \
+	[ $$st -eq 3 ] || { echo "issue-1588 FAIL Process.exit (native): exit status $$st, expected 3"; exit 1; }; \
+	diff -q ../examples/runtime/issue_1588_process_exit_status.out.expected build/iss1588p-nat.out > /dev/null \
+	  || { echo "issue-1588 DIFF Process.exit (native, stdout not flushed)"; exit 1; }; \
+	echo "issue-1588 OK (native: Int main exits 3 with stdout flushed, Unit main exits 0, Process.exit(3) flushes and exits 3)"
 else
 test-issue-1588-main-exit-status-native:
 	@echo "issue-1588-main-exit-status-native SKIP (C-only build; native backend not compiled)"
