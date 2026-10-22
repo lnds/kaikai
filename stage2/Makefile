@@ -3686,6 +3686,9 @@ test-holes: $(TARGET) build
 	  echo "holes OK $$name"; \
 	done
 
+test-hole-panic-parity-native: $(TARGET) bin-kai
+	@sh ../examples/holes_panic/run.sh
+
 # Issue #477: end-to-end check that `kai build --holes` and
 # `kai build --holes-json` (the driver-level surface) wire through to
 # kaic2's typed-hole reporting passes. test-holes above exercises the
