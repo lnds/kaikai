@@ -12189,7 +12189,15 @@ define test_coverage_run
 	  diff -q $$p.json.expected $$pout > /dev/null \
 	    || { echo "test-coverage DIFF ($(1): prune, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
 	done; \
-	echo "test-coverage OK ($(1): per-block lines + --only + pruned library)"
+	p=examples/test-runner/coverage_const; pout=stage2/build/test-coverage-const-$(1).json; \
+	./bin/kai test --backend=$(1) --json $$p > /dev/null 2>&1 || true; \
+	for pass in cold warm; do \
+	  ./bin/kai test --backend=$(1) --json --coverage $$p 2> $$pout.err | sed 's/"duration_ms":[0-9]*/"duration_ms":N/g' > $$pout \
+	    || { echo "test-coverage FAIL ($(1): const run failed)"; cat $$pout.err; exit 1; }; \
+	  diff -q $$p.json.expected $$pout > /dev/null \
+	    || { echo "test-coverage DIFF ($(1): const, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
+	done; \
+	echo "test-coverage OK ($(1): per-block lines + --only + pruned library + folded const)"
 endef
 
 test-coverage-report: $(TARGET) build
