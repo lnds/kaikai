@@ -254,7 +254,7 @@ VSFIX="$ROOT/examples/namespace-collisions/pipe_callee_vs_stdlib"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$ROOT/stdlib" "$VSFIX/main.kai")
 need '^perceus main reverse#[0-9]+ reverse@main$'
-need '^perceus main reverse#[0-9]+ reverse@list$'
+need '^perceus main list_reverse#[0-9]+ list_reverse@list$'
 
 # A pipe callee carries the id of the declaration its receiver's type
 # picked whether or not another module declares the name, so `ma`'s cached
