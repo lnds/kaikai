@@ -222,6 +222,58 @@ extern "C" fn on_event(ud: Userdata, n: Int) : Unit = {
 
 `take_userdata[T]` trusts `T` to be the type the handle was retained at.
 
+## JavaScript imports
+
+`extern "js"("path") fn ...` declares a JavaScript import for the
+`wasm32-browser` target. Its capability is `Js`, not `Ffi`: the row MUST
+carry `/ Js`. The path is mandatory.
+
+```text
+extern "js"("console.log")     fn log(s: String) : Unit / Js
+extern "js"("document.title=") fn set_title(s: String) : Unit / Js
+extern "js"("document.title")  fn title() : String / Js
+```
+
+The page host resolves a path by walking it from `globalThis` and
+calls the function with `this` bound to the parent object. The path
+forms:
+
+| Path | Meaning |
+|------|---------|
+| `a.b.c` | call `a.b.c(args)`; a zero-argument decl whose target is not a function reads the property |
+| `a.b.c=` | write the property; exactly one parameter, returns `Unit` |
+| `.name` | member of the FIRST argument: `.appendChild(parent, child)` calls `parent.appendChild(child)`; with no further arguments and a non-function member, reads it |
+| `.name=` | write a member of the first argument: `(n, s)` sets `n.name = s` |
+
+A package that needs code which is not a global lists its own module
+in `kai.toml`; the entry package's exports win over `globalThis`:
+
+```text
+[js]
+module = "glue.mjs"
+```
+
+Boundary types: `Real` is an `f64`, `Bool` a boolean, `Int` and
+`U64`/`I64` an `i64` (a `BigInt` in JavaScript), the narrower
+fixed-width types a `Number`. A `String` is copied both ways as UTF-8
+(pointer and length through the host). `extern "js" opaque Node`
+declares a handle: an index into a table the host keeps, released the
+moment the last reference dies (the same Perceus drop as any value), so
+the table never outlives the program's use. The host builtin
+`kai.handles` (declare `extern "js"("kai.handles") fn live() : Int / Js`)
+returns the number of live handles.
+
+Rejected: a function-typed parameter or return (a callback cannot cross
+to JavaScript; deliver events as values), a struct by value, and a
+member path with no first parameter.
+
+`Js` type-checks on every target and has no handler: a `main` whose row
+reaches it is refused on a host build (`kai build` with no `--target`)
+and runs on `--target=wasm32-browser`. The native backend does not
+reach JavaScript; the target builds through the C backend.
+`extern "C"` on `wasm32-browser` is unchanged: a C symbol linked into
+the module.
+
 ## Thread affinity
 
 `main` runs on the OS thread the process entered on, at every

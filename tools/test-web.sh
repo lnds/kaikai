@@ -27,7 +27,7 @@ fi
 if [ $# -gt 0 ]; then
   FIXTURES=("$@")
 else
-  FIXTURES=("$ROOT"/examples/web/*.kai)
+  FIXTURES=("$ROOT"/examples/web/*.kai "$ROOT"/examples/web_js/*.kai "$ROOT"/examples/web_js_pkg/main.kai)
 fi
 
 if [ -z "${BROWSERS+x}" ]; then
@@ -45,14 +45,14 @@ compare() { # name leg actual-file expected-file
   fi
 }
 
-# node before 24.15 needs a flag for exception handling with exnref, and one for JSPI.
+# node before 24.15 needs a flag for exception handling with exnref, and one for JSPI; the stub stands in for the page's document.
 run_module() {
   local flags=""
-  node "$1" 2>"$TMP/node.err" && return 0
+  node --import "$ROOT/tools/web-stub.mjs" "$1" 2>"$TMP/node.err" && return 0
   grep -q "experimental-wasm-exnref" "$TMP/node.err" && flags="--experimental-wasm-exnref"
-  node $flags "$1" 2>"$TMP/node.err" && return 0
+  node --import "$ROOT/tools/web-stub.mjs" $flags "$1" 2>"$TMP/node.err" && return 0
   if grep -q "Promise Integration" "$TMP/node.err"; then
-    node $flags --experimental-wasm-jspi "$1" 2>/dev/null
+    node --import "$ROOT/tools/web-stub.mjs" $flags --experimental-wasm-jspi "$1" 2>/dev/null
   else
     return 1
   fi
@@ -77,7 +77,9 @@ run_node() {
     n="$(basename "$f" .kai)"
     [ -f "$TMP/out/$n.mjs" ] || continue
     run_module "$TMP/out/$n.mjs" >"$TMP/$n.node"
-    compare "$n" node "$TMP/$n.node" "${f%.kai}.out.expected"
+    want="${f%.kai}.node.expected"
+    [ -f "$want" ] || want="${f%.kai}.out.expected"
+    compare "$n" node "$TMP/$n.node" "$want"
   done
 }
 

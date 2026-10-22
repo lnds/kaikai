@@ -1,0 +1,100 @@
+#[doc("C shims of `extern \"js\"` fns: each is a WebAssembly import resolved by the page host; a String crosses as pointer and length, a handle as an index the host's table owns.")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.emit_c_shims
+import compiler.emit_shared_proto
+import compiler.emit_shared_syms
+import compiler.extern_fn_types
+import compiler.local_names
+import compiler.symtab
+import compiler.util
+
+#[doc("The C body of an `extern \"js\" fn` binding the import `path` through the C symbol `csym`. Off WebAssembly the body panics: no host exists to resolve the import.")]
+pub(pkg) fn emit_ffi_js_shim_body(sig: String, csym: String, path: String, params: [Param],
+                                  ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg], tab: SymTab, ns: LocalNames) : String {
+  let ret_kind = ffi_ret_kind_of_reg(ret_ty_opt, reg, tab)
+  let decl = js_extern_decl(csym, path, params, ret_kind, reg, tab)
+  let setup = cat2(ffi_v2_arg_setup(params, 0, reg, tab, ns), js_len_setup(params, 0, reg, tab, ns))
+  let call = concat_all([csym, "(", js_arg_list(params, 0, reg, tab), ")"])
+  let decrefs = ffi_v2_arg_decrefs(params, 0, reg, tab, ns)
+  let body = js_ret_body(ret_kind, call, setup, decrefs, reg, tab)
+  concat_all(["#if defined(__wasm__)\n", decl, sig, " {\n", body, "}\n#else\n", sig,
+              " {\n    return kai_core_panic(kai_str(\"extern \\\"js\\\" needs a JavaScript host\"));\n}\n#endif\n\n"])
+}
+
+fn kind_of_param(p: Param, reg: [ExternTypeReg], tab: SymTab) : FfiRetKind = match p.ptype {
+  None    -> FfiRetUnknown("missing")
+  Some(t) -> ffi_kind_of_ty_reg(t, reg, tab)
+}
+
+fn js_len_setup(params: [Param], i: Int, reg: [ExternTypeReg], tab: SymTab, ns: LocalNames) : String = match params {
+  [] -> ""
+  [p, ...rest] -> {
+    let head = match kind_of_param(p, reg, tab) {
+      FfiRetString -> concat_all(["    uint32_t _kai_ffi_arg", int_to_string(i), "_len = (uint32_t) ",
+                                  c_local(ln_emitted(ns, p.binder.id)), "->as.s.len;\n"])
+      _ -> ""
+    }
+    cat2(head, js_len_setup(rest, i + 1, reg, tab, ns))
+  }
+}
+
+fn js_arg_list(params: [Param], i: Int, reg: [ExternTypeReg], tab: SymTab) : String = match params {
+  [] -> ""
+  [p, ...rest] -> {
+    let arg = concat_all(["_kai_ffi_arg", int_to_string(i)])
+    let here = match kind_of_param(p, reg, tab) {
+      FfiRetString -> concat_all([arg, ", ", arg, "_len"])
+      FfiRetUnit   -> ""
+      _            -> arg
+    }
+    let tail = js_arg_list(rest, i + 1, reg, tab)
+    if here == "" { tail } else if tail == "" { here } else { concat_all([here, ", ", tail]) }
+  }
+}
+
+fn js_c_param_types(params: [Param], reg: [ExternTypeReg], tab: SymTab) : [String] = flat_map(params, (p) => match kind_of_param(p, reg, tab) {
+  FfiRetString -> ["const char *", "uint32_t"]
+  FfiRetUnit   -> []
+  k            -> [ffi_v2_c_type(k, tab)]
+})
+
+fn js_c_ret_type(k: FfiRetKind, tab: SymTab) : String = match k {
+  FfiRetUnit   -> "void"
+  FfiRetString -> "uint32_t"
+  _            -> ffi_v2_c_type(k, tab)
+}
+
+# The host cannot see WebAssembly types, so the import name carries them:
+# `<param letters>:<return letter>:<path>`. I is i64 (BigInt), N a Number, B a
+# Bool, S a String (pointer and length), H a handle, U Unit.
+fn js_letter(k: FfiRetKind, tab: SymTab) : String = match k {
+  FfiRetString     -> "S"
+  FfiRetForeign(_) -> "H"
+  FfiRetUnit       -> "U"
+  FfiRetBool       -> "B"
+  _ -> {
+    let c = ffi_v2_c_type(k, tab)
+    if c == "int64_t" or c == "uint64_t" { "I" } else { "N" }
+  }
+}
+
+fn js_import_name(path: String, params: [Param], ret_kind: FfiRetKind, reg: [ExternTypeReg], tab: SymTab) : String =
+  concat_all([join_with(map(filter(params, (p) => kind_of_param(p, reg, tab) != FfiRetUnit), (p) => js_letter(kind_of_param(p, reg, tab), tab)), ""),
+              ":", js_letter(ret_kind, tab), ":", path])
+
+fn js_extern_decl(csym: String, path: String, params: [Param], ret_kind: FfiRetKind, reg: [ExternTypeReg], tab: SymTab) : String = {
+  let ps = match js_c_param_types(params, reg, tab) { [] -> "void"  tys -> join_with(tys, ", ") }
+  concat_all(["extern ", js_c_ret_type(ret_kind, tab), " ", csym, "(", ps,
+              ") __attribute__((import_module(\"kai_js\"), import_name(\"", js_import_name(path, params, ret_kind, reg, tab), "\")));\n"])
+}
+
+fn js_ret_body(ret_kind: FfiRetKind, call: String, setup: String, decrefs: String, reg: [ExternTypeReg], tab: SymTab) : String = match ret_kind {
+  FfiRetString ->
+    concat_all([setup, "    uint32_t _kai_ffi_n = ", call, ";\n", decrefs, "    return kai_js_take_str(_kai_ffi_n);\n"])
+  FfiRetForeign(_) ->
+    concat_all([setup, "    void *_kai_ffi_ret = ", call, ";\n", decrefs, "    return kai_foreign_js(_kai_ffi_ret);\n"])
+  FfiRetStruct(_) -> "#error \"extern \\\"js\\\" cannot pass a struct by value\"\n"
+  _ -> ffi_v2_ret_body(ret_kind, call, setup, decrefs, reg, tab)
+}

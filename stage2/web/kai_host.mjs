@@ -35,6 +35,81 @@ function lineSink(emit, echo) {
   };
 }
 
+const SEG = /[^.]+/g;
+
+// The JavaScript values a program holds as handles; slot 0 is never used.
+function handleTable() {
+  const slots = new Map();
+  const free = [];
+  let next = 1;
+  return {
+    put(v) {
+      const i = free.length ? free.pop() : next++;
+      slots.set(i, v);
+      return i;
+    },
+    get: (i) => slots.get(i),
+    release(i) {
+      if (slots.delete(i)) free.push(i);
+    },
+    live: () => slots.size,
+  };
+}
+
+// An import's name is `<param letters>:<return letter>:<path>`; see emit_ffi_js.kai.
+function parseImport(name) {
+  const [params, ret, ...rest] = name.split(":");
+  const path = rest.join(":");
+  return { params, ret, path, member: path.startsWith("."), write: path.endsWith("=") };
+}
+
+function jsImports(module, ctx) {
+  const out = {};
+  for (const { module: m, name } of WebAssembly.Module.imports(module)) {
+    if (m !== "kai_js") continue;
+    if (name === "release") out[name] = (i) => ctx.handles.release(i);
+    else if (name === "take") out[name] = (dst, n) => ctx.take(dst, n);
+    else out[name] = importFunction(parseImport(name), ctx);
+  }
+  return out;
+}
+
+function rootOf(first, ctx) {
+  if (ctx.imports && first in ctx.imports) return ctx.imports;
+  return first in ctx.builtins ? ctx.builtins : globalThis;
+}
+
+function importFunction(sig, ctx) {
+  const segs = sig.path.replace(/^\./, "").replace(/=$/, "").match(SEG);
+  const last = segs[segs.length - 1];
+  return (...raw) => {
+    const args = [];
+    let k = 0;
+    for (const c of sig.params) {
+      if (c === "S") {
+        args.push(ctx.decode(raw[k], raw[k + 1]));
+        k += 2;
+      } else {
+        const v = raw[k++];
+        args.push(c === "H" ? ctx.handles.get(v) : c === "B" ? v !== 0 : v);
+      }
+    }
+    let parent = sig.member ? args.shift() : rootOf(segs[0], ctx);
+    for (const s of segs.slice(0, -1)) parent = parent[s];
+    let result;
+    if (sig.write) {
+      parent[last] = args[0];
+    } else if (typeof parent[last] === "function") {
+      result = parent[last](...args);
+    } else if (args.length === 0) {
+      result = parent[last];
+    } else {
+      throw new TypeError(`${sig.path} is not a function`);
+    }
+    return ctx.result(sig.ret, result);
+  };
+}
+
 async function load(wasm) {
   if (wasm instanceof WebAssembly.Module) return wasm;
   if (wasm instanceof Uint8Array || wasm instanceof ArrayBuffer) {
@@ -190,6 +265,28 @@ export async function run(wasm, opts = {}) {
   const envStrings = Object.entries(env).map(([k, v]) => `${k}=${v}`);
   const argv = ["kai", ...args];
 
+  const handles = handleTable();
+  let pending = new Uint8Array(0);
+  const jsctx = {
+    handles,
+    imports: opts.imports,
+    builtins: { kai: { handles: () => BigInt(handles.live()) } },
+    decode: (ptr, len) => new TextDecoder().decode(u8().subarray(ptr, ptr + len)),
+    take: (dst, n) => u8().set(pending.subarray(0, n), dst),
+    result(letter, v) {
+      switch (letter) {
+        case "U": return undefined;
+        case "I": return BigInt.asIntN(64, BigInt(v));
+        case "B": return v ? 1 : 0;
+        case "H": return handles.put(v);
+        case "S":
+          pending = encoder.encode(String(v));
+          return pending.length;
+        default: return Number(v);
+      }
+    },
+  };
+
   const imports = {
     args_get: (ptrs, buf) => (pack(argv, ptrs, buf), 0),
     args_sizes_get: (c, s) => sizes(argv, c, s),
@@ -256,6 +353,7 @@ export async function run(wasm, opts = {}) {
   const contexts = hasSuspending ? suspension(() => instance, events) : null;
   instance = await WebAssembly.instantiate(module, {
     wasi_snapshot_preview1: wasi,
+    kai_js: jsImports(module, jsctx),
     kai: contexts ? contexts.imports : { needs_suspension: refuse, wait_until: refuse, ctx_switch: refuse, ctx_exit: refuse },
   });
   memory = instance.exports.memory;

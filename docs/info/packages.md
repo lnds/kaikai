@@ -109,6 +109,19 @@ The module path is relative to the package (`[native.sqlite]` for its
 package, and its `include`/`pkg-config` reach the module tables'
 sources too.
 
+## JavaScript module (`[js]`)
+
+A package built with `--target=wasm32-browser` that needs JavaScript which
+is not a global names its own ES module; `kai build` copies it beside the
+page and its exports win over `globalThis` when the host resolves an
+`extern "js"` path (see `kai info ffi`). Only the entry package's module is
+used.
+
+```text
+[js]
+module = "glue.mjs"
+```
+
 ## Shell completions (`[completions]`)
 
 A package declares the completion scripts it ships; `kai install`

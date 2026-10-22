@@ -40,6 +40,7 @@ and used by the stdlib sparingly.
 | `Cancel`        | cooperative cancellation                      | yes (scheduler-wired) |
 | `Spawn`         | fibers and nurseries                          | yes (root nursery) — cross-ref `docs/structured-concurrency.md` |
 | `Ffi`           | crossings to C via `extern "C"` declarations  | yes (compiler-synthesised) |
+| `Js`            | crossings to JavaScript via `extern "js"` declarations | no (refused at `main` on a host build; runs on `wasm32-browser`) |
 
 Mailboxes and message passing (`Actor[Msg]`) are deferred to a
 separate spec, `docs/actors.md`, because the mailbox model
@@ -119,6 +120,9 @@ exists only when one of these three applies; none is arbitrary.
    documents that the function crosses to C, where the effect system
    loses visibility and cannot verify purity. It uses the row machinery
    as an honesty marker for a trust boundary, not as a dispatch site.
+   `Js` (`effect Js {}`) is the same kind of marker for `extern "js"`
+   declarations; it has no default handler, so a program whose `main`
+   reaches it is refused on a host build and builds for `wasm32-browser`.
 
 ### Which effects a browser `main` may perform
 
@@ -134,6 +138,7 @@ own handler still builds.
 | `Stdout`, `Stderr`, `Env`, `Random`, `SecureRandom`, `Log`, `Mutable`, `State`, `Reader`, `Writer` | allowed | the page supplies or the runtime keeps them |
 | `Clock` | allowed | `wall_now`, `monotonic_now` and `sleep_ns` run; a sleep parks on the page's event loop (JSPI) and the page stays responsive |
 | `Process` | allowed | `exit` runs; every other op stops at run time with `kai: this host has no processes` |
+| `Js` | allowed | the page is the JavaScript host (refused on a host build) |
 | `Signal` | refused | no signals on a page |
 | `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` | refused | no sockets |
 | `File`, `Stdin` | refused | no file system or stdin |

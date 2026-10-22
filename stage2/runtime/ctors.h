@@ -98,6 +98,11 @@ KAI_RT_SHARED_INLINE void kai_drop_child(KaiValue *c, int depth, KaiFreeStack *s
     kai_free_child(c, depth, st);
 }
 
+#if defined(__wasm__)
+__attribute__((import_module("kai_js"), import_name("release"))) extern void kai_js_release(uint32_t idx);
+__attribute__((import_module("kai_js"), import_name("take"))) extern void kai_js_take(char *dst, uint32_t n);
+#endif
+
 /* One body for both modes; each wrapper inlines it with `st` fixed, so the
  * recursive mode never tests for a stack. */
 static inline __attribute__((always_inline))
@@ -267,6 +272,11 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             kai_drop_child(v->as.seq.slot, depth, st);
             kai_drop_child(v->as.seq.pred, depth, st);
             break;
+#if defined(__wasm__)
+        case KAI_FOREIGN:
+            if (v->variant_tag == 1) kai_js_release((uint32_t) (uintptr_t) v->as.foreign_ptr);
+            break;
+#endif
         case KAI_BYTE:
             /* Unreachable: every Byte is an immortal kai_byte_cache cell. */
             break;
@@ -570,8 +580,10 @@ static char *kai_i128_to_decimal(__int128 v, char *buf, size_t buflen) {
 static KAI_RC_NOINLINE KaiValue *kai_foreign(void *p) {
     KaiValue *v = kai_alloc(KAI_FOREIGN);
     v->as.foreign_ptr = p;
+    v->variant_tag = 0;
     return v;
 }
+
 
 /* Unwrap an opaque handle back to its raw `void *` (a borrow — the box
  * keeps owning the cell; the pointer stays valid until the C resource
@@ -598,6 +610,26 @@ static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t le
     v->as.s.bytes[len] = '\0';
     return v;
 }
+
+#if defined(__wasm__)
+/* A JavaScript handle: `variant_tag` 1 marks a box whose death releases the
+ * host's table slot named by the parked index. */
+
+static KAI_RC_NOINLINE KaiValue *kai_foreign_js(void *p) {
+    KaiValue *v = kai_foreign(p);
+    v->variant_tag = 1;
+    return v;
+}
+
+static KaiValue *kai_js_take_str(uint32_t n) {
+    char *buf = (char *) malloc((size_t) n + 1);
+    kai_js_take(buf, n);
+    buf[n] = 0;
+    KaiValue *v = kai_str_from_bytes(buf, n);
+    free(buf);
+    return v;
+}
+#endif
 
 /* Lane FIX (top-3 leak sites): short-string interning.
  *

@@ -189,7 +189,9 @@ FFI surface beyond `extern "C" fn` — extern structs (`extern "C" [pub]
 type Vec2 = { x: F32, y: F32 }`, usable as a record, spread included), opaque handles (`extern "C" opaque
 Conn`), a C-symbol override (`extern "C"("PQconnectdb") fn
 connect(...)`), and the fixed-width marshal types (`U8`–`I64`,
-`F32`) — is covered in `kai info ffi`.
+`F32`) — is covered in `kai info ffi`, as is `extern "js"` (a JavaScript
+import with its path `"a.b"`, `"a.b="` to write a property, `".m"` for a
+member of the first argument, and `extern "js" opaque Node` handles).
 
 `main` is the program entry point. Only the root module's `main` is —
 the file the build was given; a `main` in an imported module is an
