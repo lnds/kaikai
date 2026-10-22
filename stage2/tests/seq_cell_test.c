@@ -56,6 +56,7 @@ static void shared_runs_once(void) {
 
 static void unshared_is_freed_first(void) {
     runs = 0;
+    kai_rc_traffic_on = 1;
     KaiValue *s = cell();
     int64_t before = kai_rc_hot_st.free_total;
     KaiValue *a = kai_seq_force(s);

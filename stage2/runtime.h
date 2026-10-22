@@ -1801,6 +1801,8 @@ static void kai_rc_site_register_once(void) {
 #define KAI_RC_NOINLINE
 #endif
 
+#define KAI_SCOPE_LEAVE(v) (v)
+
 
 /* A constructor's name and per-slot kind bits live in a process-wide
  * table indexed by tag, not in the node. A tag is recorded the first time
