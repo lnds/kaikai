@@ -246,7 +246,9 @@ forms:
 | `.name=` | write a member of the first argument: `(n, s)` sets `n.name = s` |
 
 A package that needs code which is not a global lists its own module
-in `kai.toml`; the entry package's exports win over `globalThis`:
+in `kai.toml`; the modules of the entry package and of its dependencies are
+loaded, the entry package's exports win over a dependency's, and both win
+over `globalThis`:
 
 ```text
 [js]

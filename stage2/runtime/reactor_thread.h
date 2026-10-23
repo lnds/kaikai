@@ -1,4 +1,39 @@
 /* Fragment of runtime.h; include runtime.h, never this file. */
+
+#if defined(__wasm__)
+/* Fibers parked until the page posts a host event. A wake from the host moves
+ * all of them to READY; each re-checks the host queue and parks again if a
+ * sibling took the event. A cancel reaches a parked waiter at its next wake. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_web_waiters;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_web_waiters = NULL;
+#  endif
+#else
+static KaiFiber *kai_web_waiters = NULL;
+#endif
+
+/* Weak: every translation unit carries this text, and the program binds it as `extern "C"`. */
+__attribute__((weak)) void kai_web_wait_event(void) {
+    KaiFiber *f = kai_current_fiber();
+    kai_flush_stdout();
+    f->reactor_next = kai_web_waiters;
+    kai_web_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park_linked();
+    kai_check_cancel_yield_point();
+}
+
+static void kai_web_wake_waiters(void) {
+    while (kai_web_waiters) {
+        KaiFiber *f = kai_web_waiters;
+        kai_web_waiters = f->reactor_next;
+        f->reactor_next = NULL;
+        kai_reactor_parked_count--;
+        kai_reactor_mark_ready(f);
+    }
+}
+#endif
 /* Block in poll() until either the SIGCHLD pipe or the file-pool
  * completion pipe fires, a socket fd becomes ready, or the next
  * timer deadline arrives. Promotes every newly-ready fiber to the
@@ -197,6 +232,10 @@ static void kai_reactor_wait(void) {
     kai_flush_stdout();
     kai_wctx_mark();
     double slack_ms = kai_wctx_host_wait(wake_dl ? (double) wake_dl / 1e6 : -1.0);
+    if (slack_ms < 0) {
+        kai_web_wake_waiters();
+        slack_ms = 0;
+    }
     kai_reactor_timer_drain(kai_reactor_now_ns() + (uint64_t) (slack_ms * 1e6));
 #else
     kai_host_absent("reactor");

@@ -565,7 +565,7 @@ host cannot see WebAssembly types, so the import name encodes the signature as
 string as pointer and length, `H` handle, `U` unit). A handle box carries a
 marker that makes its drop call the host's `release`; the host builtin
 `kai.handles` counts live handles. `[js]` in `kai.toml` takes one key,
-`module`, of the entry package. `Js` is accepted in `main`'s row on every target
+`module`, read from the entry package and from each dependency. `Js` is accepted in `main`'s row on every target
 and refused by `build_target` on a host build; the native backend refuses the
 declaration.
 

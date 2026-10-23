@@ -82,12 +82,13 @@ function rootOf(first, ctx) {
 function importFunction(sig, ctx) {
   const segs = sig.path.replace(/^\./, "").replace(/=$/, "").match(SEG);
   const last = segs[segs.length - 1];
+  const bytes = last.startsWith("raw_");
   return (...raw) => {
     const args = [];
     let k = 0;
     for (const c of sig.params) {
       if (c === "S") {
-        args.push(ctx.decode(raw[k], raw[k + 1]));
+        args.push(bytes ? ctx.bytes(raw[k], raw[k + 1]) : ctx.decode(raw[k], raw[k + 1]));
         k += 2;
       } else {
         const v = raw[k++];
@@ -127,7 +128,9 @@ class ContextEnd extends Error {}
 const NO_JSPI =
   "kai: this program spawns fibers or keeps continuations, which need JavaScript Promise Integration (JSPI); this engine has none";
 
-const refuse = () => { throw new Error(NO_JSPI); };
+class NoJspi extends Error {}
+
+const refuse = () => { throw new NoJspi(NO_JSPI); };
 
 // Contexts are WebAssembly stacks the host keeps suspended. The running one
 // suspends in `ctx_switch`; the host then starts or wakes the target. One
@@ -177,7 +180,8 @@ const FRAME_FALLBACK_MS = 50;
 
 // Host events: the page posts values, the program drains them, and a post wakes a
 // wait the program is parked in. A post made while no wait is pending is latched,
-// so the next wait returns at once.
+// so the next wait returns at once. A wake from the host resolves the wait with -1,
+// which tells the runtime to unpark the fibers waiting for host events.
 export function hostEvents() {
   const queue = [];
   let wake = null;
@@ -191,11 +195,12 @@ export function hostEvents() {
       queue.push(event);
       nudge();
     },
-    take: () => queue.splice(0),
+    poke: nudge,
+    take: (n = queue.length) => queue.splice(0, n),
     wait(deadlineMs) {
       if (latched) {
         latched = false;
-        return Promise.resolve(0);
+        return Promise.resolve(-1);
       }
       return new Promise((resolve) => {
         const timers = [];
@@ -206,7 +211,7 @@ export function hostEvents() {
           wake = null;
           resolve(slack);
         };
-        wake = () => done(0);
+        wake = () => done(-1);
         const delay = deadlineMs < 0 ? Infinity : Math.max(0, deadlineMs - performance.now());
         if (delay <= FRAME_MS && typeof requestAnimationFrame === "function") {
           // A deadline within one frame waits for the frame, so a 16 ms loop
@@ -221,6 +226,89 @@ export function hostEvents() {
           timers.push(setTimeout(() => done(0), delay));
         }
       });
+    },
+  };
+}
+
+const PREVENTED_KEYS = /^(Arrow|Page|Home$|End$| $)/;
+
+// What the page gives a program that waits for it: events delivered as values, fetches and
+// frames settled in the background, and pixel buffers. Everything a program reads back
+// goes through these calls; nothing in here calls into the program.
+function pageBuiltins(events, handles) {
+  let current = {};
+  const fetches = [];
+  let frame = -1;
+  const num = (v) => Number(v);
+  return {
+    is_null: (v) => v == null,
+    set_style: (node, name, value) => node.style.setProperty(name, value),
+    storage_has: (key) => localStorage.getItem(key) !== null,
+    listen(node, kind) {
+      node.addEventListener(kind, (e) => {
+        if (kind === "keydown" && PREVENTED_KEYS.test(e.key ?? "")) e.preventDefault();
+        events.post({
+          kind,
+          key: e.key ?? "",
+          x: Math.round(e.offsetX ?? e.clientX ?? 0),
+          y: Math.round(e.offsetY ?? e.clientY ?? 0),
+          target: e.target,
+        });
+      });
+    },
+    interval(ms, kind) {
+      setInterval(() => events.post({ kind, key: "", x: 0, y: 0, target: null }), num(ms));
+    },
+    next_event() {
+      const [e] = events.take(1);
+      if (!e) return false;
+      current = e;
+      return true;
+    },
+    event_kind: () => current.kind,
+    event_key: () => current.key,
+    event_x: () => current.x,
+    event_y: () => current.y,
+    event_target: () => current.target,
+    fetch_start(url) {
+      const slot = { done: false, ok: false, status: 0, body: "" };
+      fetches.push(slot);
+      fetch(url)
+        .then(async (r) => Object.assign(slot, { ok: r.ok, status: r.status, body: await r.text() }))
+        .catch((e) => Object.assign(slot, { status: 0, body: String(e) }))
+        .finally(() => { slot.done = true; events.poke(); });
+      return fetches.length - 1;
+    },
+    fetch_done: (id) => fetches[num(id)].done,
+    fetch_ok: (id) => fetches[num(id)].ok,
+    fetch_status: (id) => fetches[num(id)].status,
+    fetch_body: (id) => fetches[num(id)].body,
+    frame_request() {
+      frame = -1;
+      // A hidden tab never runs animation frames; the timer keeps the program alive.
+      let timer = 0;
+      const settle = (ts) => {
+        clearTimeout(timer);
+        if (frame >= 0) return;
+        frame = ts;
+        events.poke();
+      };
+      requestAnimationFrame(settle);
+      timer = setTimeout(() => settle(performance.now()), FRAME_FALLBACK_MS * 4);
+    },
+    frame_time: () => frame,
+    // A `raw_` builtin receives its String arguments as the bytes they hold.
+    raw_put_pixels(ctx, data, w, h, x, y) {
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(data.buffer), num(w), num(h)), num(x), num(y));
+    },
+    image_new: (w, h) => new ImageData(num(w), num(h)),
+    image_set: (img, i, rgba) => {
+      const v = num(rgba);
+      img.data.set([(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255], num(i) * 4);
+    },
+    image_get: (img, i) => {
+      const d = img.data, o = num(i) * 4;
+      return ((d[o] << 24) | (d[o + 1] << 16) | (d[o + 2] << 8) | d[o + 3]) >>> 0;
     },
   };
 }
@@ -270,8 +358,9 @@ export async function run(wasm, opts = {}) {
   const jsctx = {
     handles,
     imports: opts.imports,
-    builtins: { kai: { handles: () => BigInt(handles.live()) } },
+    builtins: { kai: { handles: () => BigInt(handles.live()), ...pageBuiltins(events, handles) } },
     decode: (ptr, len) => new TextDecoder().decode(u8().subarray(ptr, ptr + len)),
+    bytes: (ptr, len) => u8().slice(ptr, ptr + len),
     take: (dst, n) => u8().set(pending.subarray(0, n), dst),
     result(letter, v) {
       switch (letter) {
@@ -341,14 +430,7 @@ export async function run(wasm, opts = {}) {
   for (const { module: m, name } of WebAssembly.Module.imports(module)) {
     if (m === "wasi_snapshot_preview1") wasi[name] = imports[name] ?? (() => ERRNO_NOSYS);
   }
-  const needsSuspension = WebAssembly.Module.imports(module).some(
-    ({ module: m, name }) => m === "kai" && name === "needs_suspension",
-  );
   const hasSuspending = typeof WebAssembly.Suspending === "function";
-  if (needsSuspension && !hasSuspending) {
-    echo?.(`${NO_JSPI}\n`);
-    throw new Error(NO_JSPI);
-  }
   let instance;
   const contexts = hasSuspending ? suspension(() => instance, events) : null;
   instance = await WebAssembly.instantiate(module, {
@@ -360,14 +442,18 @@ export async function run(wasm, opts = {}) {
 
   let code = 0;
   try {
-    if (needsSuspension) {
+    if (hasSuspending) {
       await Promise.race([WebAssembly.promising(instance.exports._start)(), contexts.failed]);
     } else {
       instance.exports._start();
     }
   } catch (e) {
     if (e instanceof ProcExit) code = e.code;
-    else throw e;
+    else if (e instanceof NoJspi) {
+      echo?.(`${NO_JSPI}\n`);
+      console.error(NO_JSPI);
+      code = 1;
+    } else throw e;
   } finally {
     sinks[1].flush();
     sinks[2].flush();

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Load a page in a headless browser through its WebDriver and print the text of #kai-stdout.
 
-usage: web-driver.py <chrome|firefox> <url>
+usage: web-driver.py <chrome|firefox> <url> [steps.js]
+
+A steps file holds scripts separated by lines of `//--`; each runs in the page once the
+output has settled, and the output settles again before the next.
 """
 import json
 import shutil
@@ -17,6 +20,7 @@ CAPS = {
 }
 PORT = 9515
 SETTLE_SECONDS = 1.5
+STEP_SETTLE_SECONDS = 0.6
 DEADLINE_SECONDS = 30
 
 
@@ -45,14 +49,18 @@ def page_text(sid):
     return call("POST", f"/session/{sid}/execute/sync", {"script": script, "args": []})
 
 
-def settled_text(sid):
+def run_script(sid, script):
+    call("POST", f"/session/{sid}/execute/sync", {"script": script, "args": []})
+
+
+def settled_text(sid, settle=SETTLE_SECONDS):
     last, since = "", time.time()
     deadline = time.time() + DEADLINE_SECONDS
     while time.time() < deadline:
         text = page_text(sid) or ""
         if text != last:
             last, since = text, time.time()
-        elif last and time.time() - since >= SETTLE_SECONDS:
+        elif last and time.time() - since >= settle:
             return last
         time.sleep(0.2)
     return last
@@ -60,6 +68,7 @@ def settled_text(sid):
 
 def main():
     browser, url = sys.argv[1], sys.argv[2]
+    steps = open(sys.argv[3]).read().split("\n//--\n") if len(sys.argv) > 3 else []
     exe = shutil.which(DRIVERS[browser])
     if exe is None:
         sys.exit(f"web-driver: {DRIVERS[browser]} not found")
@@ -69,7 +78,11 @@ def main():
         sid = call("POST", "/session", {"capabilities": {"alwaysMatch": CAPS[browser]}})["sessionId"]
         try:
             call("POST", f"/session/{sid}/url", {"url": url})
-            sys.stdout.write(settled_text(sid))
+            text = settled_text(sid)
+            for step in steps:
+                run_script(sid, step)
+                text = settled_text(sid, STEP_SETTLE_SECONDS)
+            sys.stdout.write(text)
         finally:
             call("DELETE", f"/session/{sid}")
     finally:
