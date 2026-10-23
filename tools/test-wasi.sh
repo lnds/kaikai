@@ -80,4 +80,28 @@ else
   bad "the missing-runtime diagnostic"; cat "$TMP/nort.err"
 fi
 
+if "$KAI" build --backend=native --target=wasm32-wasi examples/wasi/run/exit_status.kai -o "$TMP/native" 2>"$TMP/native.err"; then
+  "$KAI" run --backend=native --target=wasm32-wasi examples/wasi/run/exit_status.kai >"$TMP/native.out" 2>&1
+  if [ "$?" = 7 ] && [ "$(cat "$TMP/native.out")" = "exiting" ]; then ok "native backend builds and runs"; else bad "native backend run"; cat "$TMP/native.out"; fi
+  # The core-object cache is shared by every target: switching targets with a warm cache must not reuse another's object.
+  if "$KAI" build --backend=native examples/wasi/run/exit_status.kai -o "$TMP/host" 2>/dev/null \
+    && "$KAI" build --backend=native --target=wasm32-wasi examples/wasi/run/exit_status.kai -o "$TMP/again" 2>/dev/null \
+    && [ "$(wasmtime run "$TMP/again.wasm" 2>&1)" = "exiting" ]; then
+    ok "a warm core cache keeps host and wasi objects apart"
+  else
+    bad "a warm core cache keeps host and wasi objects apart"
+  fi
+  if CFLAGS="-O2 -DKAI_HOST_FIBERS=1" "$KAI" build --backend=native --target=wasm32-wasi examples/wasi/run/exit_status.kai -o "$TMP/guard" 2>"$TMP/guard.err"; then
+    bad "native build with other KAI_* macros than the bitcode's"
+  elif grep -q "bitcode" "$TMP/guard.err"; then
+    ok "bitcode macro mismatch is refused"
+  else
+    ok "bitcode absent: no macro guard to exercise"
+  fi
+elif grep -q "WebAssembly LLVM target\|native backend is not built" "$TMP/native.err"; then
+  say "skip: native wasm (no WebAssembly LLVM target in this kaic2)"
+else
+  bad "native backend build for wasm32-wasi"; cat "$TMP/native.err"
+fi
+
 exit "$fail"

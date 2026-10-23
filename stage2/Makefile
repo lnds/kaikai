@@ -123,9 +123,11 @@ LLVM_COMPONENTS := passes core analysis target nativecodegen bitwriter
 ifneq ($(filter WebAssembly,$(shell $(LLVM_CONFIG) --targets-built)),)
 LLVM_COMPONENTS += webassemblycodegen webassemblyasmparser
 LLVM_CPPFLAGS += -DKAI_LLVM_WEBASSEMBLY
+LLVM_WASM_EH_OBJ := build/llvm_wasm_eh.o
+$(shell mkdir -p build; [ $(LLVM_WASM_EH_OBJ) -nt runtime/llvm_wasm_eh.cpp ] || $(CXX) -c $$($(LLVM_CONFIG) --cxxflags | sed 's/-frtti//') -fno-rtti runtime/llvm_wasm_eh.cpp -o $(LLVM_WASM_EH_OBJ) >&2)
 endif
 LLVM_SYSLIBS  := $(shell $(LLVM_CONFIG) --link-static --system-libs $(LLVM_COMPONENTS))
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs $(LLVM_COMPONENTS)) $(LLVM_SYSLIBS) $(LLVM_CXXLIB)
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs $(LLVM_COMPONENTS)) $(LLVM_SYSLIBS) $(LLVM_CXXLIB) $(LLVM_WASM_EH_OBJ)
 # Homebrew LLVM's --system-libs asks for -lzstd, but zstd is a separate
 # formula under the brew prefix, which the macOS linker does not search
 # by default. Gated on -lzstd actually appearing, so a vendored static

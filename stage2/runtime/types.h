@@ -381,7 +381,7 @@ struct KaiValue {
          * kai_i128_store (memcpy, alignment-agnostic). */
         uint64_t i128_halves[2];                    /* KAI_INT128 (lo, hi) */
         struct { size_t len; char *bytes; } s;      /* KAI_STR (heap, not NUL-terminated but we always allocate +1 byte for safety) */
-        struct { KaiValue *head; KaiValue *tail; } cons;
+        struct { KaiValue *head __attribute__((aligned(8))); KaiValue *tail __attribute__((aligned(8))); } cons; /* 8-byte stride: the native emitter reads cons cells as variant slots */
         /* KAI_RANGE: unmaterialised Int list. Inclusive bounds; step is
          * never 0. Empty when step > 0 && from > to (or the mirror for
          * step < 0). */

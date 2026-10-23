@@ -160,6 +160,53 @@ resolve_llvm_tool() {
   return 1
 }
 
+# WebAssembly twins. The libLLVM that reads them is the one kaic2 links, so the
+# writer is the same CLANG as above, pointed at a wasi-sdk sysroot for the C
+# library headers; wasi-sdk's own clang is a newer LLVM and cannot write them.
+# Each target gets the macros the C path builds that target with, so the
+# bitcode and the runtime owner object agree on the layout of KaiFiber.
+# Skipped, without failing, where no sysroot is found.
+wasm_sysroot() {
+  for d in "${WASI_SYSROOT:-}" "${KAI_WASI_SDK:-/nonexistent}/share/wasi-sysroot" \
+    "${WASI_SDK:-/nonexistent}/share/wasi-sysroot" /opt/wasi-sdk/share/wasi-sysroot \
+    "$HOME"/Library/Caches/kai/wasi-sdk/*/share/wasi-sysroot \
+    "${XDG_CACHE_HOME:-$HOME/.cache}"/kai/wasi-sdk/*/share/wasi-sysroot; do
+    if [ -n "$d" ] && [ -f "$d/include/wasm32-wasip1/stdio.h" ]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
+WASM_COMMON="--target=wasm32-wasip1 -mexception-handling -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -D_DEFAULT_SOURCE"
+WASM_TARGETS="wasm32-wasi:-DKAI_HOST_JS=0 wasm32-browser:"
+
+gen_wasm_bc() {
+  _gw_clang="$(resolve_clang || true)"
+  [ -n "$_gw_clang" ] || return 0
+  _gw_sysroot="$(wasm_sysroot || true)"
+  if [ -z "$_gw_sysroot" ]; then
+    rm -f "$ROOT"/stage0/runtime_llvm.wasm32-* "$ROOT"/stage0/runtime_inline.wasm32-*
+    return 0
+  fi
+  _gw_want="$(printf '%s\n%s\n%s\n' "$(input_hash)" "$_gw_sysroot" "$WASM_COMMON $WASM_TARGETS" | $SHA256 | awk '{print $1}')"
+  for entry in $WASM_TARGETS; do
+    _gw_t="${entry%%:*}"
+    _gw_defs="${entry#*:}"
+    _gw_bc="$ROOT/stage0/runtime_llvm.$_gw_t.bc"
+    _gw_inl="$ROOT/stage0/runtime_inline.$_gw_t.bc"
+    _gw_stamp="$ROOT/stage0/runtime_llvm.$_gw_t.stamp"
+    if [ "$mode" != "--force" ] && [ -f "$_gw_bc" ] && [ -f "$_gw_inl" ] && [ "$(cat "$_gw_stamp" 2>/dev/null)" = "$_gw_want" ]; then continue; fi
+    for out in "$_gw_bc" "$_gw_inl"; do
+      # shellcheck disable=SC2086
+      "$_gw_clang" $WASM_COMMON $_gw_defs --sysroot="$_gw_sysroot" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 \
+        -emit-llvm -c -DKAI_HOT_ONLY=1 -DKAI_SEPARATE_COMPILATION=1 \
+        -I "$ROOT/stage2" -I "$ROOT/stage0" "$RUNTIME_C" -o "$out" || { rm -f "$_gw_bc" "$_gw_inl" "$_gw_stamp"; return 0; }
+    done
+    printf '%s\n' "$_gw_defs" > "$_gw_bc.macros"
+    echo "$_gw_want" > "$_gw_stamp"
+    echo "gen-runtime-bc: generated $_gw_bc + $_gw_inl" >&2
+  done
+}
+
 # "active" requires BOTH bitcodes: the whole-program bc AND the
 # separate-compilation twin the native-modular path merges per partition.
 # A tree with only the former would report active yet build user code
@@ -210,6 +257,7 @@ fi
 
 want="$(input_hash)"
 if [ "$mode" != "--force" ] && [ -f "$BC_OUT" ] && [ -f "$BC_INLINE" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$want" ]; then
+  gen_wasm_bc
   exit 0    # fresh — nothing to do
 fi
 
@@ -272,4 +320,5 @@ if ! CLANG18="$CLANG" "$ROOT/tools/tls-hoist-gate.sh"; then
 fi
 
 echo "$want" > "$STAMP"
+gen_wasm_bc
 echo "gen-runtime-bc: generated $BC_OUT + $BC_INLINE ($("$CLANG" --version | sed -n 1p))" >&2
