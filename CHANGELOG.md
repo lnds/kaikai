@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.174.0 (2026-10-23)
+
+### Added
+
+- **wasm**: the native backend builds WebAssembly modules for `wasm32-wasi` and `wasm32-browser`, with no C emitted for user code, and it is now the default backend for both targets when `kai` was built with the WebAssembly LLVM target (released builds are). `extern "js"` and the web stdlib work on it; `--backend=c` or `KAI_BACKEND=c` selects the C path.
+- **kai**: one compile-job budget shared by every `kai` process on the machine, so parallel builds (a test harness, `make -j`, two terminals) no longer multiply into more compiler processes than the machine can hold. It holds one slot per CPU, capped at one per GiB of RAM; `KAI_JOBS` overrides it, and under `make -j` `kai` follows make's jobserver instead.
+
+### Fixed
+
+- **typer**: a function with an open row variable is no longer charged an effect it does not perform — passing a function value through a pure function, or a later handler clause touching a local `var`, compiles again (a regression since 0.167.0).
+
 ## v0.173.0 (2026-10-23)
 
 ### Added
