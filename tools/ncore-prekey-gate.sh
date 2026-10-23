@@ -47,6 +47,12 @@ for p in A B; do
     echo "ncore-prekey: FAIL — pruned warm build of $(basename "$src") diverges from its golden"
     diff "$src.out.expected" "$WORK/$p-warm.out" | head -20; exit 1; }
 done
+# 2b. The thread and job counts shape no object, so a count the cache has not seen keeps the prune.
+for n in 1 2; do
+  KAI_NATIVE_JOBS=$n KAI_JOBS=$n run "$WORK/a" "$A" "$WORK/jobs$n"
+  grep -q "native-core-obj: hit (core pruned)" "$WORK/jobs$n.err" || {
+    echo "ncore-prekey: FAIL — a build with KAI_NATIVE_JOBS=$n lost the pruned fast path"; cat "$WORK/jobs$n.err"; exit 1; }
+done
 grep -l "native-core-index: conflict" "$WORK"/*.err > /dev/null 2>&1 && {
   echo "ncore-prekey: FAIL — a pre-key recorded two core objects"; exit 1; }
 
