@@ -117,8 +117,15 @@ LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # on Linux (the apt libLLVM is libstdc++-built). The release-static path
 # (Rust/Zig/Julia model) thus links with no libLLVM runtime dep; the
 # dev-dynamic path links the right C++ lib for the host.
-LLVM_SYSLIBS  := $(shell $(LLVM_CONFIG) --link-static --system-libs passes core analysis target nativecodegen bitwriter)
-LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs passes core analysis target nativecodegen bitwriter) $(LLVM_SYSLIBS) $(LLVM_CXXLIB)
+# WebAssembly links only where llvm-config reports it built; `webassembly`
+# would add the disassembler, which the narrow vendored build omits.
+LLVM_COMPONENTS := passes core analysis target nativecodegen bitwriter
+ifneq ($(filter WebAssembly,$(shell $(LLVM_CONFIG) --targets-built)),)
+LLVM_COMPONENTS += webassemblycodegen webassemblyasmparser
+LLVM_CPPFLAGS += -DKAI_LLVM_WEBASSEMBLY
+endif
+LLVM_SYSLIBS  := $(shell $(LLVM_CONFIG) --link-static --system-libs $(LLVM_COMPONENTS))
+LLVM_LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags) $(shell $(LLVM_CONFIG) --link-static --libs $(LLVM_COMPONENTS)) $(LLVM_SYSLIBS) $(LLVM_CXXLIB)
 # Homebrew LLVM's --system-libs asks for -lzstd, but zstd is a separate
 # formula under the brew prefix, which the macOS linker does not search
 # by default. Gated on -lzstd actually appearing, so a vendored static

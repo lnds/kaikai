@@ -98,7 +98,11 @@ if [ ! -x "$LLVM_CONFIG" ]; then
   exit 2
 fi
 export LLVM_CONFIG
-echo "    using $LLVM_CONFIG ($("$LLVM_CONFIG" --version))"
+echo "    using $LLVM_CONFIG ($("$LLVM_CONFIG" --version)), targets: $("$LLVM_CONFIG" --targets-built)"
+case " $("$LLVM_CONFIG" --targets-built) " in
+  *" WebAssembly "*) ;;
+  *) echo "build-release.sh: the vendored libLLVM lacks the WebAssembly target" >&2; exit 1 ;;
+esac
 
 # A release anchors the chain of trust in cc: kaic2 boots from the newest
 # bootstrap seed up to VERSION, C that cc alone compiles. The frozen
