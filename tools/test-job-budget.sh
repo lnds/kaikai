@@ -83,6 +83,17 @@ EOF
 st=0; peak=$(unset KAI_JOBS; measure make -s -j3 -C "$W" all) || st=$?
 check "three builds under make -j3" "$peak" 3 "$st"
 
+# The fifo jobserver of GNU make >= 4.4, played by the script: two tokens, three clients each
+# holding make's implicit token, so at most five compilers; every token must come back.
+mkfifo "$W/jobserver"
+exec 9<> "$W/jobserver"
+printf '++' >&9
+st=0; peak=$(unset KAI_JOBS; MAKEFLAGS="-j3 --jobserver-auth=fifo:$W/jobserver" measure build_all 1 2 3) || st=$?
+check "three builds on a fifo jobserver with two tokens" "$peak" 5 "$st"
+left=0
+while read -r -n1 -t 0.3 -u 9 _; do left=$((left + 1)); done
+[ "$left" -eq 2 ] || { echo "FAIL fifo jobserver: $left of 2 tokens returned"; fail=1; }
+
 for i in 1 2; do
   [ "$("$W/out$i")" = "hi $i" ] || { echo "FAIL output of build $i"; fail=1; }
 done
