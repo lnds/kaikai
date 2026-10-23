@@ -4,7 +4,8 @@
 #
 # Cases: (1) four concurrent builds under KAI_JOBS=2; (2) two builds starting at the same
 # instant under KAI_JOBS=2 both finish; (3) three concurrent builds under `make -j3`.
-# The sampler counts compiler processes whose command line mentions the scratch dir.
+# The sampler counts compile and link processes whose command line mentions the scratch dir
+# (version and target probes are not compiles).
 
 set -eu
 
@@ -26,7 +27,7 @@ sampler() {
   local peak=0 n
   while [ ! -e "$W/stop" ]; do
     n=$(ps -axo pid=,ppid=,command= | awk -v w="$W" '
-      $0 ~ w && $3 ~ /(^|\/)(cc|clang|gcc|cc1)$/ { c[$1] = $2 }
+      $0 ~ w && $3 ~ /(^|\/)(cc|clang|gcc|cc1)$/ && ($0 ~ / -c / || $0 ~ / -o /) { c[$1] = $2 }
       END { for (p in c) if (!(c[p] in c)) n++; print n + 0 }')
     [ "$n" -gt "$peak" ] && peak=$n
     sleep "$SAMPLE_MS"
