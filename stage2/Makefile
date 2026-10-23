@@ -14296,6 +14296,10 @@ test-independence-oracle: $(TARGET)
 test-batch-isolation: $(TARGET)
 	@KAIC2="$$(pwd)/$(TARGET)" bash ../tools/batch-isolation.sh
 
+# Compile-slot budget: concurrent builds never exceed KAI_JOBS compilers, nor the make jobserver.
+test-job-budget: $(TARGET) bin-kai
+	@bash ../tools/test-job-budget.sh
+
 # Native self-host gate: compile the compiler (stage2/main.kai) with the
 # native backend and count the `unbound register` subset-gap aborts against
 # tools/native-selfhost-baseline.txt. FAILS only on regression (count rises);
