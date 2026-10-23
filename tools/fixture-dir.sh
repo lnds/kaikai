@@ -22,6 +22,7 @@
 #   # fixture: test        compile with --test; stdout+stderr is the output
 #   # fixture: no-stdlib   do not pass the stdlib path (the fixture tests its absence)
 #   # fixture: target=<name>  compile for that target (`--target=<name>`)
+#   # fixture: threads=<n>    run with KAI_THREADS=<n> (output that depends on one scheduler thread)
 #
 # FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
 # through the kai wrapper named by FIXTURE_KAI, which owns the stdlib path and
@@ -79,6 +80,8 @@ run_one() {
   [ "$BACKEND" = c ] || b="$b-$BACKEND"
   if mark "$f" no-stdlib; then path=; else path="--path ../stdlib"; fi
   tflag=$(sed -n 's/^# fixture: target=\(.*\)$/--target=\1/p' "$f")
+  threads=$(sed -n 's/^# fixture: threads=\(.*\)$/\1/p' "$f")
+  [ -z "$threads" ] || export KAI_THREADS="$threads"
   manifest "$dir" backends | tr ' ' '\n' | grep -qx "$BACKEND" \
     || { echo "fixture-dir: $dir/FIXTURES: does not declare 'backends: $BACKEND'" >&2; exit 2; }
   case $(manifest "$dir" diagnostics) in
