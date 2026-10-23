@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.172.0 (2026-10-22)
+
+### BREAKING CHANGE
+
+- A record field or a parameter (including a lambda parameter) whose name starts with an uppercase letter no longer compiles: rename it to `snake_case`. Fields of an `extern "C" type` keep their C spelling.
+
+### Added
+
+- **wasm**: `kai build --target=wasm32-browser app.kai -o out/app` builds a WebAssembly module and the page that loads it. A program whose `main` needs an effect the browser cannot run (signals, sockets, files on disk, stdin) is refused at build time.
+- **wasm**: fibers, actors, `Clock.sleep` and `receive_timeout` run in the page. They suspend through JavaScript Promise Integration, so the page stays responsive. A page that suspends needs Chrome/Edge 137, Firefox 153 or Safari 27; a page that never suspends runs on any engine with WebAssembly exception handling.
+- **ffi**: `extern "js"("path") fn … / Js` calls JavaScript. It covers functions, methods on the first argument, property reads and writes, and opaque handles that Perceus releases. A package lists its JavaScript modules under `[js]` in `kai.toml`.
+- **stdlib**: `web.dom`, `web.timer`, `web.fetch` and `web.storage` are effects for the browser, installed by `web.run { … }`. DOM events arrive as values through `Dom.next_event()`, and `Dom.put_pixels` draws a whole frame with one call.
+- **ffi**: `extern "C" fn` with a body exports a kaikai function to C, callable as a callback or from a foreign thread. `extern "C"("sym")` names the exported symbol.
+
+### Fixed
+
+- **parser**: a lowercase effect name is rejected at its declaration, instead of failing later as an unhandled row variable.
+- **parser**: an interpolation hole `#{…}` holding more than one expression is a parse error; the extra tokens used to be dropped silently.
+- **parser**: `_` as a lambda parameter says what is wrong and suggests `(x) =>` or `(_x) =>`.
+- **typer**: a function whose declared return type is `Vec` accepts a list-shaped body, as a `let` annotation does.
+- **cli**: a read-only build cache stays warm; an entry older than an hour no longer turns into a miss when its timestamp cannot be refreshed.
+- **emit**: an unfilled hole's panic names the expected type on the native backend, as it does on C.
+- **runtime**: `Process.exit` flushes stdout before exiting.
+
 ## v0.171.1 (2026-10-22)
 
 ### Fixed
