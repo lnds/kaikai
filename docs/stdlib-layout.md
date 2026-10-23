@@ -568,11 +568,11 @@ manutara's first design pass exercises them.
 
 ### web (`/ Js`, browser target only)
 
-- `web.dom` — `Dom` effect: query, create, append, remove, text, attributes, styles; `listen` and `next_event` / `poll_event` (events as values: the host queues them, `next_event` parks the fiber); a 2D canvas (`context_2d`, `fill_rect`, `clear_rect`, `begin_path`, `arc`, `fill`, `stroke`, `fill_text`, `set_fill_style`, `set_stroke_style`, `set_font`) and per-pixel drawing (`new_image`, `set_pixel`, `put_image_data`, `get_image_data`, `get_pixel`) *(shipped — PR_NUM)*
-- `web.timer` — `Timer` effect: `now_ms`, `sleep_ms`, `animation_frame`, `every` (periodic events for `Dom.next_event`) *(shipped — PR_NUM)*
-- `web.fetch` — `Fetch` effect: `get`; `get_text`, `get_json`, `status` *(shipped — PR_NUM)*
-- `web.storage` — `Storage` effect over `localStorage`: `get`, `set`, `remove` *(shipped — PR_NUM)*
-- `web.run` — `run { … }` installs the four handlers; its row needs `Js`, so a program using these effects builds only for `wasm32-browser` *(shipped — PR_NUM)*
+- `web.dom` — `Dom` effect: query, create, append, remove, text, attributes, styles; `listen` and `next_event` / `poll_event` (events as values: the host queues them, `next_event` parks the fiber); a 2D canvas (`context_2d`, `fill_rect`, `clear_rect`, `begin_path`, `arc`, `fill`, `stroke`, `fill_text`, `set_fill_style`, `set_stroke_style`, `set_font`) and per-pixel drawing (`new_image`, `set_pixel`, `put_image_data`, `get_image_data`, `get_pixel`) *(shipped — #3136)*
+- `web.timer` — `Timer` effect: `now_ms`, `sleep_ms`, `animation_frame`, `every` (periodic events for `Dom.next_event`) *(shipped — #3136)*
+- `web.fetch` — `Fetch` effect: `get`; `get_text`, `get_json`, `status` *(shipped — #3136)*
+- `web.storage` — `Storage` effect over `localStorage`: `get`, `set`, `remove` *(shipped — #3136)*
+- `web.run` — `run { … }` installs the four handlers; its row needs `Js`, so a program using these effects builds only for `wasm32-browser` *(shipped — #3136)*
 
 ### encoding (pure, stage 2)
 
