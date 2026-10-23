@@ -215,14 +215,14 @@ check_exit_status() {
 check_no_jspi() {
   local pure="$TMP/out/web_arithmetic" spawning="$TMP/out/web_spawn"
   [ -f "$pure.mjs" ] && [ -f "$spawning.mjs" ] || return 0
-  if node --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref "$pure.mjs" >"$TMP/nojspi.out" 2>"$TMP/nojspi.err" \
+  if node --import "$ROOT/tools/web-nojspi.mjs" --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref "$pure.mjs" >"$TMP/nojspi.out" 2>"$TMP/nojspi.err" \
       && diff -q "$TMP/nojspi.out" "$ROOT/examples/web/web_arithmetic.out.expected" >/dev/null; then
     say "ok:   pure program runs without JSPI"
   else
     bad "pure program without JSPI"
     cat "$TMP/nojspi.err"
   fi
-  if node --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref "$spawning.mjs" >/dev/null 2>"$TMP/nojspi.err"; then
+  if node --import "$ROOT/tools/web-nojspi.mjs" --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref "$spawning.mjs" >/dev/null 2>"$TMP/nojspi.err"; then
     bad "a spawning program ran without JSPI"
   elif grep -q "Promise Integration" "$TMP/nojspi.err"; then
     say "ok:   spawning program is refused without JSPI"
