@@ -1,0 +1,74 @@
+#[doc("""
+The compile-slot budget every `kai` process on the machine draws from: a GNU make
+jobserver client under `make -j`, else flock'ed slot files in the kai cache. A
+process blocks for a slot only while it holds none.
+""")]
+
+import os.env
+import cli_caches
+import cli_fs
+import cli_proc
+import cli_sys
+
+# One heavy compile peaks near this much resident memory.
+const BYTES_PER_SLOT : Int = 2147483648
+
+extern "C"("kaicli_slot_try") fn slot_try(dir: String, n: Int) : Int / Ffi
+extern "C"("kaicli_slot_wait") fn slot_wait(dir: String, n: Int) : Int / Ffi
+extern "C"("kaicli_slot_release") fn slot_release(h: Int) : Unit / Ffi
+
+#[doc("Slots in the machine-wide pool: `KAI_JOBS`, else the CPU count capped by one slot per 2 GiB of memory.")]
+pub fn slots() : Int / Env + Ffi =
+  match string.to_int(cli_caches.env_or("KAI_JOBS", "")) {
+    Some(n) if n > 0 -> n
+    _ -> {
+      let mem = cli_sys.phys_mem()
+      let cpus = cli_sys.ncpu()
+      let by_mem = if mem <= 0 { cpus } else { mem / BYTES_PER_SLOT }
+      if by_mem < 1 { 1 } else if by_mem < cpus { by_mem } else { cpus }
+    }
+  }
+
+fn dir() : String / Env + File + Ffi {
+  let d = "#{cli_caches.base(cli_sys.uname_s())}/jobs"
+  let _ = cli_fs.mkdir_p(d)
+  d
+}
+
+#[doc("A slot if one is free right now, else a negative handle.")]
+pub fn try_take() : Int / Env + File + Ffi = slot_try(dir(), slots())
+
+#[doc("A slot, waiting for one; call only while holding none.")]
+pub fn take() : Int / Env + File + Ffi = slot_wait(dir(), slots())
+
+#[doc("Give a slot back.")]
+pub fn give(h: Int) : Unit / Ffi = slot_release(h)
+
+#[doc("Run `argv` to completion holding one slot.")]
+pub fn run(argv: [String], sp: cli_proc.Spawn) : Int / Env + File + Ffi {
+  let h = take()
+  let rc = cli_proc.run(argv, sp)
+  give(h)
+  rc
+}
+
+fn more(want: Int, got: [Int]) : [Int] / Env + File + Ffi =
+  if list.length(got) >= want {
+    got
+  } else {
+    let h = try_take()
+    if h < 0 { got } else { more(want, got ++ [h]) }
+  }
+
+#[doc("Run a compiler that spreads over `KAI_NATIVE_JOBS` threads: it holds one slot per thread, at least one, and is told how many it got.")]
+pub fn run_threads(argv: [String], sp: cli_proc.Spawn) : Int / Env + File + Ffi {
+  let cap = match string.to_int(cli_caches.env_or("KAI_NATIVE_JOBS", "")) {
+    Some(n) if n > 0 -> n
+    _ -> slots()
+  }
+  let held = more(cap, [take()])
+  let n = list.length(held)
+  let rc = cli_proc.run(argv, cli_proc.Spawn { ...sp, set: sp.set ++ [("KAI_NATIVE_JOBS", int_to_string(n))] })
+  held |> foreach(h => give(h))
+  rc
+}

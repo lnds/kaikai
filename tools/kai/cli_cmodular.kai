@@ -4,6 +4,7 @@ header slices; each compiles in parallel to an object cached by the
 hash of what it can see, and the objects link with the runtime owner.
 """)]
 
+import cli_budget
 import cli_caches
 import cli_gc
 import cli_err
@@ -83,35 +84,44 @@ fn store(cache: String, u: Tu) : Unit / File + Ffi =
     }
   }
 
-# Wait for the oldest running compile; true when it succeeded.
-fn finish(cache: String, job: (Int, Tu)) : Bool / Stderr + File + Ffi =
-  if cli_sys.wait(job.fst) == 0 {
+# Wait for the oldest running compile and free its slot; true when it succeeded.
+fn finish(cache: String, job: (Int, Tu, Int)) : Bool / Stderr + File + Ffi {
+  let ok = cli_sys.wait(job.fst) == 0
+  cli_budget.give(job.trd)
+  if ok {
     store(cache, job.snd)
-    true
   } else {
     Stderr.eprint("kai: error: modular compile failed for #{cli_fs.basename(job.snd.c)}")
-    false
   }
+  ok
+}
 
-# At most `jobs` compiles in flight; the oldest is reaped first. Returns the failure count.
+fn start_one(t: Toolchain, dir: String, u: Tu, slot: Int) : (Int, Tu, Int) / Ffi =
+  (cli_proc.start(compile_argv(t, dir, u), cli_proc.Spawn { ...cli_proc.inherit(), dir: dir }), u, slot)
+
+# At most `jobs` compiles in flight, each holding a budget slot; the oldest is reaped first, and
+# the build blocks for a slot only while it has none in flight. Returns the failure count.
 fn pool(
   t: Toolchain,
   dir: String,
   cache: String,
   jobs: Int,
   todo: [Tu],
-  running: [(Int, Tu)],
+  running: [(Int, Tu, Int)],
   failed: Int
-) : Int / Stderr + File + Ffi =
+) : Int / Stderr + Env + File + Ffi =
   match todo, running {
     [], _ -> running |> list.foldl(failed, (n, j) => if finish(cache, j) { n } else { n + 1 })
-    _, [oldest, ...others] if list.length(running) >= jobs -> {
-      let n = if finish(cache, oldest) { failed } else { failed + 1 }
-      pool(t, dir, cache, jobs, todo, others, n)
-    }
     [u, ...rest], _ -> {
-      let pid = cli_proc.start(compile_argv(t, dir, u), cli_proc.Spawn { ...cli_proc.inherit(), dir: dir })
-      pool(t, dir, cache, jobs, rest, running ++ [(pid, u)], failed)
+      let full = list.length(running) >= jobs
+      let slot = if full { -1 } else if list.is_empty(running) { cli_budget.take() } else { cli_budget.try_take() }
+      match running {
+        [oldest, ...others] if slot < 0 -> {
+          let n = if finish(cache, oldest) { failed } else { failed + 1 }
+          pool(t, dir, cache, jobs, todo, others, n)
+        }
+        _ -> pool(t, dir, cache, jobs, rest, running ++ [start_one(t, dir, u, slot)], failed)
+      }
     }
   }
 
@@ -123,7 +133,7 @@ fn cache_hit(cache: String, u: Tu) : Bool / File + Ffi {
 fn jobs_setting(t: Toolchain) : Int / Env + Ffi =
   match string.to_int(cli_caches.env_or("KAI_MODULAR_JOBS", "")) {
     Some(n) if n > 0 -> n
-    _ -> cli_sys.ncpu()
+    _ -> cli_budget.slots()
   }
 
 fn cache_dir(t: Toolchain) : String / Env + File + Ffi {
