@@ -2,7 +2,10 @@
 # Backend-parity harness — native vs C-direct (the oracle). With
 # TARGET_BACKEND=wasm the target is the C backend built for wasm32 and run
 # under node with stage2/web/kai_host.mjs (needs WASI_SDK and a node with
-# exnref; WASM_NODE_FLAGS carries the flag an older node wants).
+# exnref; WASM_NODE_FLAGS carries the flag an older node wants). With
+# TARGET_BACKEND=wasi the target is `kai build --target=wasm32-wasi` run under
+# wasmtime (needs wasmtime on PATH and a wasi-sdk, fetched or KAI_WASI_SDK); a
+# fixture `main` the target refuses is counted as refused, not as a failure.
 #
 # bash (not sh): the xargs worker fan-out uses `export -f` to make
 # the worker function visible to forked subshells. dash (Ubuntu's
@@ -68,6 +71,12 @@ case "$TARGET_BACKEND" in
     WASM_HOST="$ROOT/stage2/web/kai_host.mjs"
     export WASM_CC WASM_CFLAGS WASM_NODE_FLAGS WASM_HOST
     ;;
+  wasi)
+    if ! command -v wasmtime >/dev/null 2>&1; then
+      echo "test-backend-parity: SKIP (wasi needs wasmtime on PATH)"
+      exit 0
+    fi
+    ;;
   *)
     if ! command -v "${CLANG:-clang}" >/dev/null 2>&1; then
       echo "test-backend-parity: SKIP (clang not in PATH)"
@@ -79,7 +88,9 @@ esac
 # The target side. Under wasm it is the C backend for wasm32 on one thread,
 # executed by the JavaScript host.
 target_build() {
-  if [ "$TARGET_BACKEND" = wasm ]; then
+  if [ "$TARGET_BACKEND" = wasi ]; then
+    KAI_CORPUS_BUILD_FLAGS="--target=wasm32-wasi" kai_corpus_build "$1" "$2" KAI_BACKEND=c
+  elif [ "$TARGET_BACKEND" = wasm ]; then
     kai_corpus_build "$1" "$2" KAI_BACKEND=c KAI_MODULAR=0 CC="$WASM_CC" CFLAGS="$WASM_CFLAGS"
   else
     local nopt
@@ -89,7 +100,9 @@ target_build() {
 }
 
 target_exec() {
-  if [ "$TARGET_BACKEND" = wasm ]; then
+  if [ "$TARGET_BACKEND" = wasi ]; then
+    wasmtime run -S inherit-env --dir=. --dir=/tmp -- "$1.wasm"
+  elif [ "$TARGET_BACKEND" = wasm ]; then
     # node before 24.15 needs a flag for JSPI, which fibers and kept continuations run on.
     # The first attempt keeps stdout and stderr interleaved in one file, in the order written.
     local out rc
@@ -114,12 +127,13 @@ target_exec() {
 parity_pin() {
   local p
   p="$(kai_corpus_pinned_threads "$1")" || p=""
-  if [ "$TARGET_BACKEND" = wasm ]; then p="${p:-1}"; fi
+  if [ "$TARGET_BACKEND" = wasm ] || [ "$TARGET_BACKEND" = wasi ]; then p="${p:-1}"; fi
   echo "$p"
 }
 
 PARITY_BASELINE="$ROOT/tools/native-parity-baseline.txt"
 if [ "$TARGET_BACKEND" = wasm ]; then PARITY_BASELINE="$ROOT/tools/wasm-parity-baseline.txt"; fi
+if [ "$TARGET_BACKEND" = wasi ]; then PARITY_BASELINE="$ROOT/tools/wasi-parity-baseline.txt"; fi
 
 if [ ! -x "$KAI" ]; then
   echo "test-backend-parity FAIL — bin/kai not found or not executable"
@@ -225,6 +239,10 @@ process_one() {
   # equivalence is proved byte-for-byte by `test-native-modular`; this harness
   # need not re-pay for it. (KAI_NATIVE_MODULAR is a no-op on the C oracle.)
   if ! target_build "$f" "$t_bin" >"$t_blog" 2>&1; then
+    if [ "$TARGET_BACKEND" = wasi ] && grep -q 'target cannot run' "$t_blog"; then
+      printf 'R\n' >> "$results"
+      return 0
+    fi
     {
       echo "FAIL $f — $TARGET_BACKEND (target) build failed:"
       tail -10 "$t_blog" | sed 's/^/    /'
@@ -290,9 +308,10 @@ xargs -P "$JOBS" -n 1 -I{} bash -c 'process_one "$@"' _ {} < "$tmp/entry-points"
 pass=$(grep -c '^P$' "$results" 2>/dev/null || true)
 fail=$(grep -c '^F$' "$results" 2>/dev/null || true)
 skip=$(grep -c '^S$' "$results" 2>/dev/null || true)
+refused=$(grep -c '^R$' "$results" 2>/dev/null || true)
 
 echo ""
-echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fail=$fail skip=$skip total=$total"
+echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fail=$fail skip=$skip$([ "$TARGET_BACKEND" = wasi ] && echo " refused=$refused") total=$total"
 
 # Ratchet mode (Lane 1.5). With NATIVE_PARITY_RATCHET=1 the gate does NOT
 # require zero failures — the native backend is at ~60% corpus parity and

@@ -98,7 +98,7 @@ KAI_RT_SHARED_INLINE void kai_drop_child(KaiValue *c, int depth, KaiFreeStack *s
     kai_free_child(c, depth, st);
 }
 
-#if defined(__wasm__)
+#if KAI_HOST_JS
 __attribute__((import_module("kai_js"), import_name("release"))) extern void kai_js_release(uint32_t idx);
 __attribute__((import_module("kai_js"), import_name("take"))) extern void kai_js_take(char *dst, uint32_t n);
 #endif
@@ -272,7 +272,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             kai_drop_child(v->as.seq.slot, depth, st);
             kai_drop_child(v->as.seq.pred, depth, st);
             break;
-#if defined(__wasm__)
+#if KAI_HOST_JS
         case KAI_FOREIGN:
             if (v->variant_tag == 1) kai_js_release((uint32_t) (uintptr_t) v->as.foreign_ptr);
             break;
@@ -611,7 +611,7 @@ static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t le
     return v;
 }
 
-#if defined(__wasm__)
+#if KAI_HOST_JS
 /* A JavaScript handle: `variant_tag` 1 marks a box whose death releases the
  * host's table slot named by the parked index. */
 
