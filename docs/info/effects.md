@@ -221,6 +221,19 @@ and its other operations stop at run time: every `Process` operation except
 the next frame), so the page stays responsive. Host builds pass no target and are
 unaffected.
 
+## Targets — effects a WASI `main` cannot perform
+
+`kai build --target=wasm32-wasi` builds a module for a WASI runtime (`kai info
+wasm`). `File`, `Env`, `Stdin`, `Clock`, `Random` and `Process.exit` run on
+WASI calls. A `main` whose final row holds `Spawn`, `Cancel`, `Link`,
+`Monitor`, `Actor`, `Signal`, `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` or `Js`
+is refused at compile time:
+
+```
+error: `main` performs effect `Spawn`, which the `wasm32-wasi` target cannot run
+  = help: fibers are not available on wasm32-wasi; ...
+```
+
 ## Handler state — `state` and `log`
 
 A stateful handler (`with State[T](init)`, `with Writer[W]([])`, any

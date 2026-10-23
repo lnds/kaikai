@@ -16,10 +16,20 @@
  *                         it the panic says there is none
  *   KAI_HOST_UNWIND       the frame unwinder; without it a contained trap
  *                         lands at once and the frames it crosses keep
- *                         their references */
+ *                         their references
+ *   KAI_HOST_JS           a JavaScript host beside the module (`kai` and
+ *                         `kai_js` imports); 1 on the browser target, 0 on a
+ *                         WASI runtime, where fibers default to 0 too */
+#ifndef KAI_HOST_JS
+#  if defined(__wasm__)
+#    define KAI_HOST_JS 1
+#  else
+#    define KAI_HOST_JS 0
+#  endif
+#endif
 #if defined(__wasm__)
 #  ifndef KAI_HOST_FIBERS
-#    define KAI_HOST_FIBERS 1
+#    define KAI_HOST_FIBERS KAI_HOST_JS
 #  endif
 #  ifndef KAI_HOST_STACK_GUARD
 #    define KAI_HOST_STACK_GUARD 0
@@ -351,7 +361,7 @@ static int kai_nthreads = 1;
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
-#if KAI_HOST_FIBERS && defined(__wasm__)
+#if KAI_HOST_FIBERS && KAI_HOST_JS
 #include "wasm_ctx.h"
 #elif KAI_HOST_FIBERS
 #include <ucontext.h>

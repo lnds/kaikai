@@ -430,6 +430,12 @@ node stage2/web/kai_host.mjs app.wasm
 - **Gate**: `TARGET_BACKEND=wasm WASI_SDK=<dir> NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture for the oracle (C backend on the host) and for wasm, runs the second under node at `KAI_THREADS=1`, and compares output and exit status. `tools/wasm-parity-baseline.txt` lists the fixtures allowed to differ: a new difference fails, a closed one must be removed. CI runs it as `tier1-wasm` (not a required check), on the corpus plus `examples/web/`, one fixture per class of program.
 - The host grants no filesystem and no stdin: fixtures that read files, stdin, `PATH` or `/tmp` differ and sit in the baseline.
 
+### wasm32-wasi
+
+`kai build --target=wasm32-wasi` compiles the same way with `-DKAI_HOST_JS=0`: no `kai` or `kai_js` import, no stack exports, and `KAI_HOST_FIBERS` defaults to 0, so the module is one file a WASI runtime loads. `kai run --target=wasm32-wasi` runs it on `wasmtime` from `PATH` with the current directory preopened (`KAI_WASI_DIRS` replaces the list).
+
+- **Gate**: `TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture with `bin/kai build --target=wasm32-wasi` and runs it under `wasmtime` with `.` and `/tmp` preopened. A fixture whose `main` the target refuses (`Spawn`, sockets, signals, `Js`) is counted `refused`, not as a failure; `tools/wasi-parity-baseline.txt` lists only real differences. CI runs it as `tier1-wasi` (not a required check) together with `tools/test-wasi.sh`, which checks `kai run`'s arguments, environment, stdin, exit status, preopens and diagnostics.
+
 ## Traps (verified, recurring)
 
 - **`stage2/main.kai` is a stub**, not the compiler. The compiler is the ~200 modules it reaches through `import compiler.driver`.

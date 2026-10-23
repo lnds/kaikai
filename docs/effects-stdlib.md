@@ -149,6 +149,23 @@ allowed, with runtime stops for the operations that cannot run (the `Process`
 operations other than `exit`), when some do. The check works on
 rows, not operations.
 
+### Which effects a WASI `main` may perform
+
+A program built with `--target=wasm32-wasi` runs on a WASI runtime (preview 1)
+with no JavaScript host and no fibers. The compiler refuses, at `main`, the
+effects below, with a diagnostic naming the effect and the target.
+
+| Effect | WASI `main` | Why |
+|---|---|---|
+| `Stdout`, `Stderr`, `Stdin`, `Env`, `Random`, `SecureRandom`, `Log`, `Mutable`, `State`, `Reader`, `Writer` | allowed | WASI calls or the runtime |
+| `File` | allowed | through the preopened directories |
+| `Clock` | allowed | `wall_now`, `monotonic_now`; `sleep_ns` blocks the instance |
+| `Process` | allowed | `exit` runs; every other op stops at run time |
+| `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor` | refused | fibers are not available on `wasm32-wasi` |
+| `Signal` | refused | no signals |
+| `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` | refused | preview 1 has no sockets |
+| `Js` | refused | no JavaScript host |
+
 ### The browser effects
 
 `stdlib/web/` adds four ordinary effects whose handlers are kaikai code over

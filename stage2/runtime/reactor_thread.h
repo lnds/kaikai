@@ -1,6 +1,6 @@
 /* Fragment of runtime.h; include runtime.h, never this file. */
 
-#if defined(__wasm__)
+#if KAI_HOST_JS
 /* Fibers parked until the page posts a host event. A wake from the host moves
  * all of them to READY; each re-checks the host queue and parks again if a
  * sibling took the event. A cancel reaches a parked waiter at its next wake. */
@@ -227,7 +227,7 @@ static void kai_reactor_wait(void) {
      * slot lock — never nested under reactor_mu). No-op at N=1: the drains
      * unparked inline and the batch is empty. */
     kai_reactor_flush_ready();
-#elif defined(__wasm__)
+#elif KAI_HOST_JS
     uint64_t wake_dl = kai_reactor_timer_head ? kai_reactor_timer_head->reactor_deadline_ns : 0;
     kai_flush_stdout();
     kai_wctx_mark();

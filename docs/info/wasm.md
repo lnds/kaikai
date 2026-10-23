@@ -1,6 +1,6 @@
 # wasm
 
-Build a program for a browser page with `--target=wasm32-browser`.
+Build a program for a browser page with `--target=wasm32-browser`, or for a WASI runtime with `--target=wasm32-wasi`.
 
 ## Description
 
@@ -88,3 +88,28 @@ dependencies are loaded; the entry package's wins a shared name.
 - `--target=wasm32-browser` is accepted by `kai build` only, and requires
   the C backend (`--backend=native` is refused).
 - `-o out/app` names the files; a trailing `.wasm` is dropped.
+
+## WASI: `--target=wasm32-wasi`
+
+`kai build --target=wasm32-wasi app.kai -o app.wasm` writes one module and
+nothing beside it: no host, no page. The toolchain is the same pinned wasi-sdk
+(`KAI_WASI_SDK`, `KAI_WASI_SDK_URL`); the C backend is required.
+
+`kai run --target=wasm32-wasi app.kai [args...]` builds in a scratch directory
+and runs the module on `wasmtime`, found on `PATH` (the command stops with a
+message naming it when it is missing). The arguments go to the program, the
+whole environment is inherited, and the preopened directories are the current
+directory; `KAI_WASI_DIRS=<dir>[:<dir>...]` replaces them, and a path outside
+them is not reachable (`File` returns an `Err`). The program's exit status is
+`kai`'s. `kai test` has no `--target`: it builds and runs tests on the host.
+
+What runs: pure code, records, sum types, handlers, `Seq`, `File`, `Env`,
+`Stdin`, `Stdout`, `Clock` (a sleep blocks the instance), `Random`,
+`SecureRandom` (`random_get`) and `Process.exit`. Every other `Process`
+operation stops at run time.
+
+There are no fibers. `main` is refused, with a diagnostic naming the target,
+when its final row holds `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor`,
+`Signal`, `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` or `Js`; preview 1 has no
+sockets, and fibers wait for the stack-switching proposal in wasmtime.
+Handle the effect inside `main`, or remove it from the row.

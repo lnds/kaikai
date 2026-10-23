@@ -133,7 +133,7 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "Diff does not reach the ASAN surface; tier1-asan skipped."
           fi
-      # Scope of tier1-wasm: the runtime, the host module and the parity harness.
+      # Scope of tier1-wasm and tier1-wasi: the runtime, the host module, the parity harness and the WASI target.
       - name: Does this diff reach the WebAssembly surface?
         id: wasm
         run: |
@@ -143,7 +143,7 @@ jobs:
           CHANGED=$(git diff --name-only \
             "${{ github.event.pull_request.base.sha }}" \
             "${{ github.event.pull_request.head.sha }}")
-          if echo "$CHANGED" | grep -qE '^(stage2/runtime\.h$|stage2/runtime/|stage2/web/|examples/web/|tools/test-backend-parity\.sh$|tools/lib/corpus\.sh$|tools/wasm-parity-baseline\.txt$|\.github/workflows/tier1\.yml$)'; then
+          if echo "$CHANGED" | grep -qE '^(stage2/runtime\.h$|stage2/runtime/|stage2/web/|examples/web/|tools/test-backend-parity\.sh$|tools/lib/corpus\.sh$|tools/wasm-parity-baseline\.txt$|examples/wasi/|tools/wasi-parity-baseline\.txt$|tools/test-wasi\.sh$|tools/kai/cli_wasi?m?\.kai$|\.github/workflows/tier1\.yml$)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -713,6 +713,67 @@ jobs:
           esac
           TARGET_BACKEND=wasm NATIVE_PARITY_RATCHET=1 BACKEND_PARITY_DIRS="$dirs" \
             ./tools/ci-bounded-step.sh 2400 "tier1-wasm-${{ matrix.shard }}" tools/test-backend-parity.sh
+
+  # The parity corpus built for wasm32-wasi and run under wasmtime, against the
+  # C oracle, as a ratchet (tools/wasi-parity-baseline.txt), and the target's
+  # own checks. Not a required check, and not in `tier1`'s needs.
+  tier1-wasi:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true' && needs.changes.outputs.wasm == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      WASI_SDK_VERSION: "34.0"
+      WASI_SDK_SHA256: "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+      WASMTIME_VERSION: "49.0.2"
+      WASMTIME_SHA256: "a4d6e9e3a5a60f527cf7793d674c48930c80c2e8977995b8a275cad3254b9322"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: ./tools/ci-install-toolchain.sh
+      - name: Fetch wasi-sdk (pinned, checksum verified)
+        run: |
+          url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" "$url"
+          echo "${WASI_SDK_SHA256}  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasi-sdk"
+          tar xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
+          echo "KAI_WASI_SDK=$RUNNER_TEMP/wasi-sdk" >> "$GITHUB_ENV"
+      - name: Fetch wasmtime (pinned, checksum verified)
+        run: |
+          url="https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/wasmtime.tar.xz" "$url"
+          echo "${WASMTIME_SHA256}  $RUNNER_TEMP/wasmtime.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasmtime"
+          tar xJf "$RUNNER_TEMP/wasmtime.tar.xz" -C "$RUNNER_TEMP/wasmtime" --strip-components=1
+          echo "$RUNNER_TEMP/wasmtime" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Build the kai wrapper
+        run: make bin/kai
+      - name: tier1-wasi-${{ matrix.shard }} (corpus under wasmtime vs the C oracle)
+        run: |
+          . tools/lib/corpus.sh
+          all="$KAI_CORPUS_DEFAULT_DIRS examples/wasi"
+          case "${{ matrix.shard }}" in
+            a) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 1') ;;
+            b) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 2') ;;
+            c) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 0') ;;
+          esac
+          TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 BACKEND_PARITY_DIRS="$dirs" \
+            ./tools/ci-bounded-step.sh 2400 "tier1-wasi-${{ matrix.shard }}" tools/test-backend-parity.sh
+      - name: tier1-wasi target checks (run, args, env, exit status, refusals)
+        if: matrix.shard == 'a'
+        run: ./tools/ci-bounded-step.sh 600 "tier1-wasi-target" tools/test-wasi.sh
 
   # The wasm32-browser target: pinned toolchain fetched from an empty cache,
   # fixtures run under node and in headless Chrome and Firefox. Not required.

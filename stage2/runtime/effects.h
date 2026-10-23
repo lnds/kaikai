@@ -145,8 +145,10 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
 #else
 {
     (void) self;
+#if KAI_HOST_REACTOR || KAI_HOST_JS
     kai_reactor_init();
     kai_reactor_stdin_set_nonblocking();
+#endif
 
     char *buf = NULL;
     size_t n = 0, cap = 0;
@@ -207,8 +209,10 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
         return kai_cont_resume(k, kai_str_from_bytes("", 0));
     }
 
+#if KAI_HOST_REACTOR || KAI_HOST_JS
     kai_reactor_init();
     kai_reactor_stdin_set_nonblocking();
+#endif
 
     char *buf = (char *) malloc((size_t) want);
     if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
@@ -726,10 +730,17 @@ KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiC
 {
     (void) self;
     int64_t ns_v = (kai_is_int(ns)) ? kai_intf(ns) : 0;
-#if defined(__wasm__)
+#if KAI_HOST_JS
     /* A page only runs while the program yields: even a zero sleep waits for the host. */
     if (ns_v <= 0) kai_reactor_park_timer(kai_current_fiber(), kai_reactor_now_ns());
 #endif
+#if defined(__wasm__) && !KAI_HOST_JS
+    if (ns_v > 0) {
+        struct timespec nap = { (time_t) (ns_v / 1000000000), (long) (ns_v % 1000000000) };
+        while (nanosleep(&nap, &nap) != 0 && errno == EINTR) {}
+    }
+    return kai_cont_resume(k, kai_unit());
+#else
     if (ns_v > 0) {
 #if !defined(__wasm__)
         kai_reactor_init();
@@ -744,6 +755,7 @@ KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiC
         }
     }
     return kai_cont_resume(k, kai_unit());
+#endif
 }
 #endif
 

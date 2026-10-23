@@ -12,6 +12,7 @@ import cli_proc
 import cli_spec
 import cli_sys
 import cli_toolchain
+import cli_wasi
 import cli_wasm
 
 type Opts = {
@@ -80,10 +81,27 @@ fn report_flag(
   }
 
 fn target_name(v: String) : Result[String, Int] / Stderr =
-  if v == cli_wasm.TARGET {
+  if cli_wasm.is_target(v) {
     Ok(v)
   } else {
-    cli_err.die("--target must be '#{cli_wasm.TARGET}' (got: #{v})")
+    cli_err.die("--target must be '#{cli_wasm.TARGET}' or '#{cli_wasm.WASI}' (got: #{v})")
+  }
+
+# `--target` for `build` and `run`; `None` when `a` is not it.
+fn target_flag(
+  a: String,
+  rest: [String],
+  o: Opts
+) : Option[Result[(Opts, [String]), Int]] / Stderr =
+  if string.starts_with(a, "--target=") {
+    Some(target_name(string.drop_prefix(a, "--target=") ?? "") | (v => (Opts { ...o, target: v }, rest)))
+  } else if a == "--target" {
+    match rest {
+      [] -> Some(cli_err.die("--target needs an argument (#{cli_wasm.TARGET}|#{cli_wasm.WASI})"))
+      [v, ...more] -> Some(target_name(v) | (n => (Opts { ...o, target: n }, more)))
+    }
+  } else {
+    None
   }
 
 fn build_flag(a: String, rest: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
@@ -92,15 +110,10 @@ fn build_flag(a: String, rest: [String], o: Opts) : Result[(Opts, [String]), Int
       [] -> cli_err.die("-o needs an argument")
       [v, ...more] -> Ok((Opts { ...o, out: v }, more))
     }
-  } else if string.starts_with(a, "--target=") {
-    target_name(string.drop_prefix(a, "--target=") ?? "") | (v => (Opts { ...o, target: v }, rest))
-  } else if a == "--target" {
-    match rest {
-      [] -> cli_err.die("--target needs an argument (#{cli_wasm.TARGET})")
-      [v, ...more] -> target_name(v) | (n => (Opts { ...o, target: n }, more))
-    }
   } else if string.starts_with(a, "-") {
-    let flag = report_flag(a, rest, o) |> or_else(() => common_flag(a, rest, o))
+    let flag = target_flag(a, rest, o)
+      |> or_else(() => report_flag(a, rest, o))
+      |> or_else(() => common_flag(a, rest, o))
     flag |> unwrap_or_else(() => cli_err.die("unknown flag: #{a} (see 'kai build --help')"))
   } else if o.spec != "" {
     cli_err.die("only one input supported")
@@ -125,7 +138,8 @@ fn parse_run(args: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
     [a, ..._] if a == "-h" or a == "--help" -> Ok((Opts { ...o, help: true }, []))
     ["--", ...rest] -> Ok((o, rest))
     [a, ...rest] if string.starts_with(a, "-") -> {
-      let next = (common_flag(a, rest, o)
+      let next = (target_flag(a, rest, o)
+        |> or_else(() => common_flag(a, rest, o))
         |> unwrap_or_else(() => cli_err.die("unknown flag: #{a} (see 'kai run --help')")))!
       parse_run(next.snd, next.fst)
     }
@@ -206,7 +220,9 @@ fn wasm_in(
   base: String
 ) : Result[Int, Int] / Stderr + Env + File + Ffi {
   cli_compile.compile(w, cli_plan.Backend { name: "c", explicit: true }, job)!
-  cli_wasm.write_page(t.layout, base, package_js(t, job.src, job.tmp)!)!
+  if w.target == cli_wasm.TARGET {
+    cli_wasm.write_page(t.layout, base, package_js(t, job.src, job.tmp)!)!
+  }
   Ok(0)
 }
 
@@ -248,7 +264,7 @@ fn build_wasm(
   if o.backend == "native" or cli_caches.env_or("KAI_BACKEND", "c") == "native" {
     cli_err.die("--target=#{o.target} builds through the C backend; drop --backend=native")
   } else {
-    let w = cli_wasm.configure(t)!
+    let w = cli_wasm.configure(t, o.target)!
     let base = string.drop_suffix(out, ".wasm") ?? out
     let job = cli_plan.Job {
       src,
@@ -314,6 +330,21 @@ fn run_in(
   Ok(cli_proc.run([bin, ...args], cli_proc.inherit()))
 }
 
+# Builds the module in `tmp` and runs it on the runtime found on `PATH`.
+fn run_wasi(
+  t: Toolchain,
+  src: String,
+  args: [String],
+  o: Opts,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let runtime = cli_wasi.runtime()!
+  let base = cli_fs.basename(src)
+  let wasm = "#{tmp}/#{string.drop_suffix(base, ".kai") ?? base}.wasm"
+  build_wasm(t, src, wasm, Opts { ...o, out: wasm })!
+  Ok(cli_wasi.run_module(runtime, wasm, args))
+}
+
 #[doc("The optimisation level `kai run` builds at on both backends: 0 with `--debug`, 2 with `--release`, else 1.")]
 pub fn run_opt_level(args: [String]) : String = match args {
   ["--debug", ..._] -> "0"
@@ -333,6 +364,12 @@ pub fn run(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + 
     let spec = run_spec(parsed.snd)!
     let b = cli_compile.resolve_backend(o.backend)!
     export_profile(o)
-    cli_fs.with_scratch(tmp => run_in(t, b, spec.fst, spec.snd, tmp))
+    if o.target == cli_wasm.WASI {
+      cli_fs.with_scratch(tmp => run_wasi(t, spec.fst, spec.snd, o, tmp))
+    } else if o.target != "" {
+      cli_err.die("kai run supports --target=#{cli_wasm.WASI}; a browser module is served, not run (kai info wasm)")
+    } else {
+      cli_fs.with_scratch(tmp => run_in(t, b, spec.fst, spec.snd, tmp))
+    }
   }
 }

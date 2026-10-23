@@ -409,6 +409,13 @@ numbers are left out on purpose; the function names are stable.
   wrapper (3.6). Pages that suspend (fibers, waits, events) need the JSPI
   engines of 3.8 (Chrome and Edge 137, Firefox 153, Safari 27); pages that
   never suspend keep phase 1's exnref baseline.
+- **Phase 3 is go, without fibers** (2026-10-23). `wasm32-wasi` ships on
+  wasi-libc preview 1 with `File`, `Env`, `Clock`, `Random`, `Process.exit`
+  and stdin on real WASI calls. `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor`
+  and kept continuations are refused at `main` on this target, as phase 1
+  did for the browser, until the stack-switching proposal is usable in
+  wasmtime; `Signal`, the `Net*` effects and `Js` are refused too. `kai run`
+  and the parity leg use `wasmtime` from `PATH`.
 
 ### 3.1 Toolchain and libc
 
@@ -1041,7 +1048,7 @@ A UI layer above these effects is a design of its own and is not planned here.
 
 ### Phase 3 — `wasm32-wasi`
 
-**PR 9 — `feat(kai): --target=wasm32-wasi builds a module for a WASI runtime`**
+**PR 9 — `feat(kai): --target=wasm32-wasi builds a module for a WASI runtime`** — done
 
 - *Touches*: `tools/kai` (the target, `kai run` through a runtime found on
   `PATH`), `stage2/runtime.h` (`File`, `Env`, `Clock` and the random source on
@@ -1107,7 +1114,8 @@ For fibers the candidates there are the stack-switching proposal, which
 wasmtime 49 names as an option and does not support on arm64 (M), or
 Asyncify with the third option of 3.2. Until one is chosen, a WASI build is
 what section 1 measured: everything except `spawn`, kept continuations and
-the host facilities of gap 8.
+the host facilities of gap 8. Phase 3 is go without fibers (3.0): the
+effects that need them are refused at `main` on `wasm32-wasi`.
 
 ## Appendix: rebuilding the measurements
 
