@@ -9,6 +9,9 @@
 
 set -eu
 
+# An enclosing make would make kai a jobserver client and bypass KAI_JOBS.
+unset MAKEFLAGS MFLAGS MAKELEVEL
+
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAI="${KAI:-$ROOT/bin/kai}"
