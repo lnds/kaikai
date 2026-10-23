@@ -54,10 +54,11 @@ pack() {
   cp "$BUILD/bin/llvm-config" "$stage/build/bin/"
   cp "$BUILD"/lib/*.a "$stage/build/lib/"
   # llvm-config run from any path but the one it was built at answers as an
-  # installed prefix, whose only include dir is build/include. The C API
-  # headers go there, next to the generated llvm/Config.
+  # installed prefix, whose only include dir is build/include. The C API and
+  # C++ headers go there, with the generated llvm/Config and *.inc overlaid.
   cp -R "$LLVM_DIR/include/llvm-c" "$stage/build/include/"
-  cp -R "$BUILD/include/llvm/Config" "$stage/build/include/llvm/"
+  cp -R "$LLVM_DIR/include/llvm/." "$stage/build/include/llvm/"
+  cp -R "$BUILD/include/llvm/." "$stage/build/include/llvm/"
   printf '%s\n' "$NAME" > "$stage/build/.prebuilt"
   tar -cJf "$out/$NAME" -C "$stage" build
   printf '%s  %s\n' "$(sha256 < "$out/$NAME")" "$NAME" > "$out/$NAME.sha256"
