@@ -1214,6 +1214,11 @@ int64_t     kaix_fixed_val_field(KaiValue *v) {
     }
 }
 const char *kaix_str_bytes(KaiValue *v) { return v->as.s.bytes; }
+uint32_t kaix_str_len32(KaiValue *v) { return (uint32_t) v->as.s.len; }
+#if KAI_HOST_JS
+KaiValue *kaix_js_take_str(uint32_t n) { return kai_js_take_str(n); }
+KaiValue *kaix_foreign_js(void *p) { return kai_foreign_js(p); }
+#endif
 
 /* FFI v2 (#417): opaque-handle marshalling for the native backend.
    `kaix_foreign_ptr` is the box→raw BORROW (read the parked `void *`);
@@ -1451,7 +1456,12 @@ KaiValue *kaix_core_unit_name(KaiValue *x)                            { if (x) k
  * safe to inline. The push reads the active fiber and stays owner-side. */
 void kaix_unw_pop(KaiFiber *f) { kai_unw_pop(f); }
 KaiFiber *kaix_unw_push_f(KaiFiber **cache, KaiValue **base, int64_t n) { return kai_unw_push_c(cache, base, (intptr_t) n); }
-KaiFiber *kaix_unw_push_ev_state_f(KaiFiber **cache, void *ev) { return kai_unw_push_c(cache, (KaiValue **)((char *) ev + 16), 1); }
+/* The Ev blob the emitter builds follows the C struct convention: handler_id, env, state, then the op pointers. */
+typedef struct { KaiHandlerId handler_id; void *env; KaiValue *state; void *ops[1]; } KaixEvBlob;
+#define KAIX_EV_FIELD(ev, member) ((char *) (ev) + offsetof(KaixEvBlob, member))
+#define KAIX_EV_OP(ev, idx) ((void **) (KAIX_EV_FIELD(ev, ops)) + ((idx) - 3))
+
+KaiFiber *kaix_unw_push_ev_state_f(KaiFiber **cache, void *ev) { return kai_unw_push_c(cache, (KaiValue **) KAIX_EV_FIELD(ev, state), 1); }
 
 /* ---------- op dispatch fast path ----------
  * The leaf steps of a perform, inlined into the perform site. The rare
@@ -1491,7 +1501,7 @@ KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) { return kai_cont_resume(k, 
 
 /* An Ev blob starts with `handler_id`, `env`, `state`, then one op fn-ptr
  * per op in declaration order: op `i` is field `3 + i`. */
-void *kaix_ev_op_at(void *ev, int64_t idx) { return ((void **) ev)[idx]; }
+void *kaix_ev_op_at(void *ev, int64_t idx) { return *KAIX_EV_OP(ev, idx); }
 
 KaiHandlerId kaix_ev_handler_id(void *ev) { return ((KaiHandlerId *) ev)[0]; }
 
@@ -1510,7 +1520,7 @@ KaiValue *kaix_op_finish(void *node_v, void *k_v, KaiValue *op_r) {
  * Every Ev<Eff> struct begins with `KaiHandlerId` (8 bytes) +
  * `void *env` (8 bytes), so `state` lives at byte offset 16. */
 void kaix_clause_state_set(void *self, KaiValue *v) {
-    *((KaiValue **)((char *) self + 16)) = v;
+    *((KaiValue **) KAIX_EV_FIELD(self, state)) = v;
 }
 
 /* Stateful-clause prologue helper (native walk, subset 2b): read the
@@ -1521,7 +1531,7 @@ void kaix_clause_state_set(void *self, KaiValue *v) {
  * result under `state` (and the legacy alias `log`) in the entry block,
  * mirroring emit_c's `clause_state_prologue`. */
 KaiValue *kaix_clause_state_get(void *self) {
-    return *((KaiValue **)((char *) self + 16));
+    return *((KaiValue **) KAIX_EV_FIELD(self, state));
 }
 
 /* m7c-c / m7c-d — kaix_* wrappers around the static runtime
@@ -1613,7 +1623,7 @@ void *kaix_evidence_lookup_node_by_id(KaiHandlerId id) {
 /* Write the op fn-ptr at field index `idx` of an Ev blob under
  * construction (the install side stamps each clause-thunk address). */
 void kaix_ev_set_op(void *ev, int64_t idx, void *fn) {
-    ((void **) ev)[idx] = fn;
+    *KAIX_EV_OP(ev, idx) = fn;
 }
 
 /* Write the `handler_id` (field 0) when constructing an Ev blob. */
@@ -1652,7 +1662,7 @@ int64_t kai_jmpbuf_size(void) { return (int64_t) sizeof(jmp_buf); }
  * `i8*` cast of the handle's `%KaiValue*` discard alloca. */
 /* The native backend reserves the evidence node as `[9 x ptr]` and the
  * continuation as `[8 x i32]` (emit_native_fx.kai). */
-typedef char kaix_evidence_fits_node[(sizeof(KaiEvidence) <= 9 * sizeof(void *)) ? 1 : -1];
+typedef char kaix_evidence_fits_node[(sizeof(KaiEvidence) <= 9 * 8) ? 1 : -1];
 typedef char kaix_cont_fits_slot[(sizeof(KaiCont) <= 8 * sizeof(int32_t)) ? 1 : -1];
 
 void kaix_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_label,
@@ -1745,7 +1755,7 @@ void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
 
 /* Write the env array pointer into Ev field 1 (byte 8) during install. */
 void kaix_ev_set_env(void *ev, void *env) {
-    *((void **)((char *) ev + 8)) = env;
+    *((void **) KAIX_EV_FIELD(ev, env)) = env;
 }
 
 /* Stamp one capture into the install's env array at union slot `j`. */
@@ -1756,7 +1766,7 @@ void kaix_env_set(void *env, int64_t j, KaiValue *v) {
 /* Clause prologue read: capture `j` from `self->env` (byte 8), borrowed.
  * Perceus dups every read of a capture, as emit_c's prologue assumes. */
 KaiValue *kaix_clause_env_get(void *self, int j) {
-    KaiValue **env = *((KaiValue ***)((char *) self + 8));
+    KaiValue **env = *((KaiValue ***) KAIX_EV_FIELD(self, env));
     return env[j];
 }
 

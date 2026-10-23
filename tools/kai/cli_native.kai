@@ -19,7 +19,7 @@ pub type Outcome = Linked | NoLlvm(String)
 pub fn lacks_llvm(t: Toolchain, tmp: String) : Bool / Env + File + Ffi {
   let id = cli_sys.stat_id(t.layout.kaic2)
   let dir = cli_caches.root("KAI_NATIVE_MODULAR_CACHE_DIR", "nmodular", t.os)
-  let file = "#{dir}/backend-tag-#{cli_hash.digest([cli_hash.lines([t.layout.kaic2, id])])}"
+  let file = "#{dir}/backend-tag-#{cli_hash.digest([cli_hash.lines([t.layout.kaic2, id, t.target])])}"
   match cli_fs.read_or_empty(file) {
     "llvm" -> false
     "none" -> true
@@ -34,7 +34,7 @@ fn asked_lacks_llvm(
   file: String,
   id: String
 ) : Bool / File + Ffi {
-  let sp = cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" }
+  let sp = cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null", set: target_set(t) }
   let r = cli_proc.capture([t.layout.kaic2, "--backend-tag"], sp, "#{tmp}/backend-tag")
   let lacks = r.fst == 0 and string.trim(r.snd) == ""
   # A kaic2 still being written may change under the same answer: keep only a settled one's.
@@ -48,6 +48,13 @@ fn asked_lacks_llvm(
 }
 
 const OWNER_DEFS : [String] = ["-DKAI_SEPARATE_COMPILATION=1", "-DKAI_RUNTIME_OWNER=1"]
+
+# No WebAssembly target has `dl`.
+fn sys_libs(t: Toolchain) : [String] = if t.target == "" { ["-lm", "-ldl"] } else { ["-lm"] }
+
+# The variable kaic2 reads to build for the toolchain's target.
+fn target_set(t: Toolchain) : [(String, String)] =
+  if t.target == "" { [] } else { [("KAI_NATIVE_TARGET", t.target)] }
 
 # `import a.b` resolves as `a/b.kai`; the head segment's sibling counts too.
 fn local_module(src_dir: String, line: String) : Bool / Ffi {
@@ -88,7 +95,7 @@ pub fn modular(p: Plan) : Bool / Env + File + Ffi {
     "1" -> true
     _ -> imports_local(p)
   }
-  want and cli_caches.env_or("KAI_BUILD_MODE", "default") != "debug" and p.t.llvm_c != ""
+  want and cli_caches.env_or("KAI_BUILD_MODE", "default") != "debug" and p.t.llvm_c != "" and p.t.target == ""
 }
 
 # Every partition plus one runtime owner; without a cached owner, the runtime compiles into the link.
@@ -101,7 +108,7 @@ fn modular_link(
   let t = p.t
   let lead = cli_plan.cc(t) ++ t.cflags
   let ld_flags = cli_toolchain.stack_ldflags(t, p.job.tmp) ++ cli_toolchain.dead_strip(t)
-  let tail = ["-o", p.job.out, "-lm", "-ldl", ...p.libs]
+  let tail = ["-o", p.job.out, ...sys_libs(t), ...p.libs]
   let rt = cli_plan.runtime_obj(t, t.llvm_c, defs)
   let argv = if rt != "" {
     lead ++ ld_flags ++ objs ++ p.native_objs ++ [rt, ...tail]
@@ -149,6 +156,7 @@ with status 1; a kaic2 without libLLVM yields `NoLlvm`.
 """)]
 pub fn build_modular(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
   let abs = "#{p.src_dir}/#{cli_fs.basename(p.job.src)}"
+  check_bc_macros(p.t)!
   emit_modular(p, modular_dir(p, abs), true)
 }
 
@@ -158,7 +166,7 @@ fn emit_modular(p: Plan, objdir: String, cached: Bool) : Result[Outcome, Int] / 
   let t = p.t
   let objs_file = "#{p.job.tmp}/native-modular.objs"
   let err = "#{p.job.tmp}/native-modular.err"
-  let sp = cli_plan.kaic2_spawn([("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc)], objs_file, err)
+  let sp = cli_plan.kaic2_spawn([("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc), ...target_set(t)], objs_file, err)
   let emit = ["--emit=native-modular", "--native-obj-dir", objdir, ...kir_verify_flags()]
   let rc = cli_proc.run(cli_plan.kaic2(p, emit, p.job.src), sp)
   let objs = if rc == 0 and cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [] }
@@ -178,6 +186,16 @@ fn emit_modular(p: Plan, objdir: String, cached: Bool) : Result[Outcome, Int] / 
   }
 }
 
+# The bitcode and the owner object must be built with the same -DKAI_* macros.
+fn check_bc_macros(t: Toolchain) : Result[Unit, Int] / Stderr + File + Ffi =
+  if t.llvm_bc != "" and not cli_toolchain.bc_macros_match(t.llvm_bc, t.cflags) {
+    cli_err.die(
+      "the runtime bitcode was built without the -DKAI_* macros CFLAGS sets, and the runtime owner object would disagree with it on struct layout; unset them, or build with --backend=c"
+    )
+  } else {
+    Ok(())
+  }
+
 fn warn_missing_inline_bc(t: Toolchain) : Unit / Stderr =
   if t.llvm_bc != "" and t.inline_bc == "" {
     Stderr.eprint(
@@ -190,7 +208,7 @@ fn whole_link(p0: Plan, objs: [String]) : Result[Unit, Int] / Stderr + Env + Fil
   let t = p.t
   let gc = cli_toolchain.dead_strip(t)
   if t.llvm_bc == "" {
-    let ld = ["-o", p.job.out, "-lm", "-ldl", ...p.libs]
+    let ld = ["-o", p.job.out, ...sys_libs(t), ...p.libs]
     cli_plan.link(
       p,
       cli_plan.runtime_cc(t)
@@ -204,7 +222,7 @@ fn whole_link(p0: Plan, objs: [String]) : Result[Unit, Int] / Stderr + Env + Fil
     )
   } else {
     let rt = cli_plan.runtime_obj(t, t.llvm_c, OWNER_DEFS)
-    let ld = ["-o", p.job.out, "-lm", "-ldl", ...p.libs]
+    let ld = ["-o", p.job.out, ...sys_libs(t), ...p.libs]
     let argv = if rt != "" {
       cli_plan.cc(t) ++ t.cflags ++ gc ++ objs ++ p.native_objs ++ [rt, ...ld]
     } else {
@@ -245,11 +263,13 @@ pub fn build_whole(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
       "native backend: cannot locate runtime_llvm.c (looked under #{t.inc} and #{t.layout.root}/stage0)"
     )
   } else {
+    check_bc_macros(t)!
     warn_missing_inline_bc(t)
     let set = [
       ("KAI_DEBUG_SRC", dbg),
       ("KAI_NATIVE_RUNTIME_BC", t.llvm_bc),
-      ("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc)
+      ("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc),
+      ...target_set(t)
     ]
     let rc = cli_proc.run(
       cli_plan.kaic2(p, ["--emit=native", "--native-obj-dir", p.job.tmp, ...kir_verify_flags()], p.job.src),

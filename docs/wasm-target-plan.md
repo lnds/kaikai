@@ -360,7 +360,7 @@ numbers are left out on purpose; the function names are stable.
     `default { }` block accepts only `$extern_handler("<C symbol>")` in
     codegen (`kai info effects`). A stdlib effect whose default is kaikai code
     over a JavaScript import therefore cannot install itself at `main` today.
-16. **The native backend is a host backend.** The triple and CPU come from
+16. **The native backend was a host backend (closed by phase 4).** The triple and CPU came from
     `LLVMGetDefaultTargetTriple` (native section of `runtime.h`); the IR uses
     `landingpad`; the layout is pinned to 64-bit pointers in the emitter and
     in `stage0/runtime_llvm.c`; `tools/gen-runtime-bc.sh` builds
@@ -1061,13 +1061,46 @@ A UI layer above these effects is a design of its own and is not planned here.
 
 ### Phase 4 — the native backend
 
-Not broken into PRs: each item is a gap of entry 16 and none is started by
-anything above. In dependency order: the emitter's layout follows the target's
-pointer width; the target triple and data layout are chosen, not taken from
-the host; cleanup uses the pad form WebAssembly accepts; the runtime bitcode is
-generated per target. Until then the target is C-backend only and says so in
-its diagnostic. The reason to do it at all is that it removes the external C
-compiler from the user's side.
+**Done** (`feat(kai): the native backend emits WebAssembly`). The native
+backend builds both targets: `kai build --backend=native --target=wasm32-wasi`
+and `--target=wasm32-browser`. It is the default for them. The
+gaps of entry 16 closed as follows:
+
+- *Triple and data layout* come from the target (`KAI_NATIVE_TARGET`), with the
+  WebAssembly LLVM target initialised under `KAI_LLVM_WEBASSEMBLY`; a kaic2
+  without it says so.
+- *Layout.* The emitter did not hard-code the pointer width; three places
+  assumed it: the evidence blob and node (now `i64` cells, offsets from
+  `offsetof` in `runtime_llvm.c`), cons cells (an 8-byte stride between
+  `head` and `tail`, as the emitter reads them as variant slots), and the
+  `kaix_evidence_fits_node` check.
+- *Cleanup and non-local exit.* `invoke` and `landingpad` survive only under
+  the wasm exception model, which the LLVM C API cannot select; a 10-line C++
+  shim (`stage2/runtime/llvm_wasm_eh.cpp`) sets it. `_setjmp` is renamed
+  `setjmp` for the wasm sjlj lowering and cleanup pads take
+  `__gxx_wasm_personality_v0`.
+- *Runtime bitcode per target* (`runtime_{llvm,inline}.<target>.bc`), written by
+  the libLLVM-matching clang against a wasi-sdk sysroot (wasi-sdk's own clang
+  is newer than the libLLVM). A `.macros` file records the `-DKAI_*` macros each
+  was built with; `kai` stops a build whose `CFLAGS` set others, and kaic2
+  refuses bitcode of another architecture. This also covers the host pairing
+  the first paragraph below describes.
+
+Host output is byte-identical (an emitted object compared with `cmp`).
+`extern "js"` is a WebAssembly import on the native backend too (module
+`kai_js`, the C path's import names, strings as pointer and length, handles as
+host-table indices); struct-by-value `extern "C"` is unsupported on the native
+backend for every target. Native is the default for both targets where the
+kaic2 has the WebAssembly LLVM target, and C otherwise.
+
+Measured (macOS arm64, native kaic2 against Homebrew LLVM 22, clean core
+cache, corpus of 1 411 fixtures, parity against the C oracle on the host):
+`wasm32-wasi` native, 1 050 pass, 41 differ (the C baseline minus one, plus 3
+struct-by-value fixtures), 173 refused by the target; `wasm32-browser` native,
+933 pass, 20 differ (17 of the C baseline and the same 3), 311 refused.
+`tools/test-web.sh` under node with the native backend passes every fixture,
+including `examples/web_js*`. The legs are `native-wasm` in `tier1-native.yml`,
+with `tools/{wasi,wasm}-native-parity-baseline.txt`.
 
 **The macros of PR 1 do not reach the native runtime whole.** It is two
 halves: the owner object, which `kai` compiles per build with `$CFLAGS`, and

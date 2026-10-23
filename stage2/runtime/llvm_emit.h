@@ -73,6 +73,18 @@ static void kai_llvm_internalize_except_main(LLVMModuleRef m) {
     }
 }
 
+/* Bitcode laid out for another architecture links without complaint once its
+ * triple is overwritten, and miscompiles; refuse it. */
+static int kai_llvm_bc_arch_clash(LLVMModuleRef src, const char *dst_triple, const char *bc_path) {
+    const char *src_triple = LLVMGetTarget(src);
+    size_t n = 0;
+    while (src_triple && dst_triple && src_triple[n] && src_triple[n] != '-') n++;
+    if (!src_triple || !dst_triple || (strncmp(src_triple, dst_triple, n) == 0 && (dst_triple[n] == '-' || dst_triple[n] == 0)))
+        return 0;
+    kai_eprintf("kai: runtime bitcode %s is for %s, but this build targets %s\n", bc_path, src_triple, dst_triple);
+    return 1;
+}
+
 static int64_t kai_llvm_link_runtime_bc(void *m) {
     const char *bc_path = getenv("KAI_NATIVE_RUNTIME_BC");
     if (!bc_path || !bc_path[0]) return 0;             /* opt-out: legacy cc-links path */
@@ -99,6 +111,7 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
         if (err) LLVMDisposeMessage(err);
         return 1;
     }
+    if (kai_llvm_bc_arch_clash(src, LLVMGetTarget((LLVMModuleRef) m), bc_path)) return 1;
 
     /* Reconcile the source's triple + data layout to the destination's BEFORE
      * the link. The bitcode was produced by `clang -O2` with its own SDK
@@ -349,6 +362,83 @@ static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
     }
 }
 
+/* Registers the native target and, for a wasm build, the WebAssembly one.
+ * A kai built without it says so instead of failing in the lookup. */
+static int kai_llvm_init_targets(void) {
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    if (!kai_llvm_wasm_target()) return 0;
+#ifdef KAI_LLVM_WEBASSEMBLY
+    LLVMInitializeWebAssemblyTargetInfo();
+    LLVMInitializeWebAssemblyTarget();
+    LLVMInitializeWebAssemblyTargetMC();
+    LLVMInitializeWebAssemblyAsmPrinter();
+    LLVMInitializeWebAssemblyAsmParser();
+    static const char *eh[] = { "kai", "-wasm-enable-sjlj", "-wasm-use-legacy-eh=false" };
+    LLVMParseCommandLineOptions(3, eh, NULL);
+    return 0;
+#else
+    kai_eprintf("kai: this kai was built without the WebAssembly LLVM target\n");
+    return 1;
+#endif
+}
+
+#ifdef KAI_LLVM_WEBASSEMBLY
+extern void kai_llvm_select_wasm_exception_model(LLVMTargetMachineRef tm);
+#endif
+
+static LLVMTargetMachineRef kai_llvm_create_target_machine(LLVMTargetRef target, const char *triple) {
+    if (kai_llvm_wasm_target()) {
+        LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "generic",
+            "+exception-handling,+mutable-globals,+sign-ext,+bulk-memory,+nontrapping-fptoint,+reference-types,+multivalue",
+            kai_llvm_cgen_level(), LLVMRelocStatic, LLVMCodeModelDefault);
+#ifdef KAI_LLVM_WEBASSEMBLY
+        if (tm) kai_llvm_select_wasm_exception_model(tm);
+#endif
+        return tm;
+    }
+    char *cpu = LLVMGetHostCPUName();
+    char *features = LLVMGetHostCPUFeatures();
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
+        target, triple, cpu ? cpu : "", features ? features : "",
+        kai_llvm_cgen_level(), LLVMRelocPIC, LLVMCodeModelDefault);
+    if (cpu) LLVMDisposeMessage(cpu);
+    if (features) LLVMDisposeMessage(features);
+    return tm;
+}
+
+/* The wasm lowerings find `setjmp` by name and accept only the wasm C++
+ * personality on a function with cleanup pads. */
+static void kai_llvm_wasm_prepare(LLVMModuleRef m) {
+    LLVMValueRef sj = LLVMGetNamedFunction(m, "_setjmp");
+    if (sj) {
+        LLVMValueRef plain = LLVMGetNamedFunction(m, "setjmp");
+        if (plain) { LLVMReplaceAllUsesWith(sj, plain); LLVMDeleteFunction(sj); }
+        else LLVMSetValueName2(sj, "setjmp", 6);
+    }
+    LLVMContextRef cx = LLVMGetModuleContext(m);
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        size_t n = 0;
+        const char *nm = LLVMGetValueName2(f, &n);
+        if (!LLVMIsDeclaration(f) || n <= 7 || strncmp(nm, "kai_js:", 7) != 0) continue;
+        static const char mod[] = "kai_js";
+        LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
+            LLVMCreateStringAttribute(cx, "wasm-import-module", 18, mod, sizeof mod - 1));
+        LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
+            LLVMCreateStringAttribute(cx, "wasm-import-name", 16, nm + 7, (unsigned) (n - 7)));
+    }
+    LLVMValueRef pers = NULL;
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f) || !LLVMHasPersonalityFn(f)) continue;
+        if (!pers) {
+            LLVMTypeRef pty = LLVMFunctionType(LLVMInt32TypeInContext(LLVMGetModuleContext(m)), NULL, 0, 1);
+            pers = LLVMGetNamedFunction(m, "__gxx_wasm_personality_v0");
+            if (!pers) pers = LLVMAddFunction(m, "__gxx_wasm_personality_v0", pty);
+        }
+        LLVMSetPersonalityFn(f, pers);
+    }
+}
+
 /* --- object emission --- */
 /* Verify the module, then emit it as a native object file at `path`
  * using the host target machine. Returns 0 on success, non-zero on a
@@ -377,10 +467,9 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
     }
     if (err) { LLVMDisposeMessage(err); err = NULL; }
 
-    LLVMInitializeNativeTarget();
-    LLVMInitializeNativeAsmPrinter();
+    if (kai_llvm_init_targets()) return 1;
 
-    char *triple = LLVMGetDefaultTargetTriple();
+    char *triple = kai_llvm_target_triple();
     LLVMTargetRef target = NULL;
     if (LLVMGetTargetFromTriple(triple, &target, &err)) {
         kai_eprintf("kai: native target lookup failed: %s\n", err ? err : "?");
@@ -388,13 +477,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
         LLVMDisposeMessage(triple);
         return 1;
     }
-    char *cpu = LLVMGetHostCPUName();
-    char *features = LLVMGetHostCPUFeatures();
-    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
-        target, triple, cpu ? cpu : "", features ? features : "",
-        kai_llvm_cgen_level(), LLVMRelocPIC, LLVMCodeModelDefault);
-    if (cpu) LLVMDisposeMessage(cpu);
-    if (features) LLVMDisposeMessage(features);
+    LLVMTargetMachineRef tm = kai_llvm_create_target_machine(target, triple);
     LLVMSetTarget((LLVMModuleRef) m, triple);
     LLVMSetModuleDataLayout((LLVMModuleRef) m, LLVMCreateTargetDataLayout(tm));
 
@@ -423,6 +506,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
      * program functions so the opt pipeline can inline the runtime ops. Runs
      * on the linked module (donor present) and before the passes. */
     kai_llvm_stamp_host_features((LLVMModuleRef) m);
+    if (kai_llvm_wasm_target()) kai_llvm_wasm_prepare((LLVMModuleRef) m);
 
     /* L4 (issue #498): optimise the module in-process before codegen.
      * Default `default<O2>` for parity with the clang `-O2` the C/LLVM-

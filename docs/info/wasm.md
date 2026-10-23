@@ -4,7 +4,7 @@ Build a program for a browser page with `--target=wasm32-browser`, or for a WASI
 
 ## Description
 
-`kai build --target=wasm32-browser` compiles through the C backend with a
+`kai build --target=wasm32-browser` compiles with a
 pinned wasi-sdk and writes three files beside each other: the module, the
 page that loads it, and the host that runs it.
 
@@ -85,15 +85,15 @@ dependencies are loaded; the entry package's wins a shared name.
 
 ## Flags
 
-- `--target=wasm32-browser` is accepted by `kai build` only, and requires
-  the C backend (`--backend=native` is refused).
+- `--target=wasm32-browser` is accepted by `kai build` only, with
+  either backend (see "Native backend" below); the native one is the default.
 - `-o out/app` names the files; a trailing `.wasm` is dropped.
 
 ## WASI: `--target=wasm32-wasi`
 
 `kai build --target=wasm32-wasi app.kai -o app.wasm` writes one module and
 nothing beside it: no host, no page. The toolchain is the same pinned wasi-sdk
-(`KAI_WASI_SDK`, `KAI_WASI_SDK_URL`); the C backend is required.
+(`KAI_WASI_SDK`, `KAI_WASI_SDK_URL`).
 
 `kai run --target=wasm32-wasi app.kai [args...]` builds in a scratch directory
 and runs the module on `wasmtime`, found on `PATH` (the command stops with a
@@ -117,3 +117,27 @@ Handle the effect inside `main`, or remove it from the row.
 A handler that keeps `resume` (a generator, a non-tail resume) cannot be seen from
 `main`: it stops at run time with `kai: fibers and kept continuations are not
 available on wasm32-wasi`.
+
+## Native backend
+
+`kai build --backend=native --target=wasm32-wasi|wasm32-browser` emits the module
+from the in-process LLVM: no C is generated and no user code goes through a C
+compiler. The pinned wasi-sdk still supplies `wasm-ld`, wasi-libc and the
+runtime owner object, which is built once per target and cached. The output
+files are the same as the C backend writes.
+
+The native backend is the default for these targets when this kaic2 has the
+WebAssembly LLVM target, and the C backend otherwise; `--backend=c|native` or
+`KAI_BACKEND` chooses. An explicit `--backend=native` on a kaic2 without the
+target stops with "this kai was built without the WebAssembly LLVM target".
+`extern "js"` declarations are WebAssembly imports of module `kai_js`, named
+`<param letters>:<return letter>:<path>` as on the C backend, so the same host
+resolves them; they are refused on the native backend for any other target.
+Struct-by-value `extern "C"` parameters are refused on the native backend for
+every target.
+
+The runtime bitcode is generated per target (`runtime_llvm.wasm32-wasi.bc`,
+`runtime_llvm.wasm32-browser.bc` and their `runtime_inline` twins) where a wasi-sdk
+sysroot is available, with the macros each target is built with. A `CFLAGS` that
+sets other `-DKAI_*` macros stops the build, because the bitcode and the owner
+object would disagree on struct layout.

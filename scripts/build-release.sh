@@ -232,6 +232,12 @@ cp stage0/runtime_llvm.bc  "$STAGE/share/kaikai/include/runtime_llvm.bc"
 # partition. Without it every kaix_* op in user code stays an out-of-line
 # call — an order-of-magnitude slowdown on hot loops.
 cp stage0/runtime_inline.bc "$STAGE/share/kaikai/include/runtime_inline.bc"
+# The WebAssembly twins and the macros each was built with, which kai checks
+# against CFLAGS; generated when the release host has a wasi-sdk sysroot.
+for f in stage0/runtime_llvm.wasm32-*.bc stage0/runtime_llvm.wasm32-*.bc.macros stage0/runtime_inline.wasm32-*.bc; do
+  [ -f "$f" ] && cp "$f" "$STAGE/share/kaikai/include/$(basename "$f")"
+done
+[ -f stage0/runtime_llvm.bc.macros ] && cp stage0/runtime_llvm.bc.macros "$STAGE/share/kaikai/include/runtime_llvm.bc.macros"
 
 # Metadata.
 cp VERSION             "$STAGE/share/kaikai/VERSION"

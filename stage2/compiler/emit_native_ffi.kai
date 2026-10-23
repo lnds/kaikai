@@ -549,10 +549,89 @@ pub fn nemit_ffi_fn(ctx: Handle, sym: String, f: KFn, c_symbol: String,
   } else if ffi_uses_struct(param_kinds, ret_kind) and not ffi_abi_ok(param_kinds, ret_kind, plat) {
     ffi_reject_struct(ctx, c_symbol)
     llvm_build_ret(native_ctx_b(ctx), nemit_call0(ctx, "kaix_unit")); ()
+  } else if ffi_is_js(c_symbol) {
+    ffi_emit_js_shim(ctx, wrapper, c_symbol, param_kinds, ret_kind)
   } else {
     ffi_emit_shim(ctx, wrapper, c_symbol, param_kinds, ret_kind, plat); ()
   }
   native_ctx_set_fnval(ctx, saved_fnval); ()
+}
+
+# --- extern "js": a WebAssembly import the page host resolves ----------
+#
+# The symbol is `kai_js:<path>`. The import is declared as `kai_js:<letters>`
+# and the object emitter turns that name into the `wasm-import-module` /
+# `wasm-import-name` attributes. A String crosses as pointer and length, a
+# handle as the host table's index, as in the C shims.
+
+fn ffi_is_js(sym: String) : Bool = string_length(sym) > 7 and string_slice(sym, 0, 7) == "kai_js:"
+
+fn js_letter(k: KFfiKind) : String = match k {
+  KFfiString  -> "S"
+  KFfiForeign -> "H"
+  KFfiUnit    -> "U"
+  KFfiBool    -> "B"
+  KFfiInt     -> "I"
+  KFfiFixed(bits, _, isf) -> if bits == 64 and not isf { "I" } else { "N" }
+  KFfiFixedVal(bits, _) -> if bits == 64 { "I" } else { "N" }
+  _           -> "N"
+}
+
+fn js_is_unit(k: KFfiKind) : Bool = match k {
+  KFfiUnit -> true
+  _        -> false
+}
+
+fn js_params_letters(ks: [KFfiKind]) : String =
+  join_with(map(filter(ks, (k) => not js_is_unit(k)), (k) => js_letter(k)), "")
+
+fn js_marshal_params(ctx: Handle, wrapper: Handle, kinds: [KFfiKind], i: Int,
+                     ptb: Handle, ab: Handle, boxbuf: Handle) : Unit / Console = match kinds {
+  [] -> ()
+  [KFfiUnit, ...rest] -> js_marshal_params(ctx, wrapper, rest, i + 1, ptb, ab, boxbuf)
+  [k, ...rest] -> {
+    let boxed = llvm_get_param(wrapper, i)
+    llvm_buf_push(boxbuf, boxed)
+    llvm_buf_push(ab, ffi_unbox_one(ctx, k, boxed))
+    llvm_buf_push(ptb, ffi_scalar_type(ctx, k))
+    match k {
+      KFfiString -> {
+        let n = ncall_sig1(ctx, "kaix_str_len32", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
+        llvm_buf_push(ab, n)
+        llvm_buf_push(ptb, native_ctx_i32t(ctx))
+      }
+      _ -> ()
+    }
+    js_marshal_params(ctx, wrapper, rest, i + 1, ptb, ab, boxbuf)
+  }
+}
+
+fn js_rebox(ctx: Handle, k: KFfiKind, raw: Handle) : Handle / Console = match k {
+  KFfiString  -> ncall_sig1(ctx, "kaix_js_take_str", native_ctx_ptrt(ctx), native_ctx_i32t(ctx), raw)
+  KFfiForeign -> ncall_sig1(ctx, "kaix_foreign_js", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), raw)
+  _           -> ffi_rebox_ret(ctx, k, PlatNone, raw)
+}
+
+fn ffi_emit_js_shim(ctx: Handle, wrapper: Handle, c_symbol: String,
+                    kinds: [KFfiKind], ret_kind: KFfiKind) : Unit / Console = {
+  let path = string_slice(c_symbol, 7, string_length(c_symbol))
+  let imp = concat_all([js_params_letters(kinds), ":", js_letter(ret_kind), ":", path])
+  let boxbuf = llvm_buf_new()
+  let ptb = llvm_buf_new()
+  let ab = llvm_buf_new()
+  js_marshal_params(ctx, wrapper, kinds, 0, ptb, ab, boxbuf)
+  let ret_ty = match ret_kind {
+    KFfiString -> native_ctx_i32t(ctx)
+    _          -> ffi_scalar_type(ctx, ret_kind)
+  }
+  let fnty = llvm_fn_type_n(ret_ty, ptb)
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), cat2("kai_js:", imp), fnty)
+  let call = native_build_call(ctx, fnv, fnty, ab)
+  llvm_buf_free(ptb)
+  llvm_buf_free(ab)
+  ffi_decref_inputs(ctx, boxbuf, 0)
+  llvm_buf_free(boxbuf)
+  llvm_build_ret(native_ctx_b(ctx), js_rebox(ctx, ret_kind, call)); ()
 }
 
 # The shim body: build the call (returns the raw extern result), decref the

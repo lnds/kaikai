@@ -414,7 +414,7 @@ The native runtime is two halves — the owner object, compiled per build with `
 
 ## WebAssembly — a module and its host
 
-Under `__wasm__` the eight `KAI_HOST_*` macros default to 0 (a build may still define one); `File` runs its work in place, since there is no reactor and one fiber has nothing to hold. WebAssembly is reached only through the C backend and a cross compiler (wasi-sdk 34, pinned in `tier1.yml` by URL and checksum). The wrapper honours `CC` and `CFLAGS`; the cache and the link flags of a macOS host do not apply to wasm, so the build is single-unit:
+Under `__wasm__` the eight `KAI_HOST_*` macros default to 0 (a build may still define one); `File` runs its work in place, since there is no reactor and one fiber has nothing to hold. WebAssembly is reached through the C backend and a cross compiler, or through the native backend (below); wasi-sdk 34 is pinned in `tier1.yml` by URL and checksum. The wrapper honours `CC` and `CFLAGS`; the cache and the link flags of a macOS host do not apply to wasm, so the build is single-unit:
 
 ```
 CC=$WASI_SDK/bin/clang \
@@ -435,6 +435,16 @@ node stage2/web/kai_host.mjs app.wasm
 `kai build --target=wasm32-wasi` compiles the same way with `-DKAI_HOST_JS=0`: no `kai` or `kai_js` import, no stack exports, and `KAI_HOST_FIBERS` defaults to 0, so the module is one file a WASI runtime loads. `kai run --target=wasm32-wasi` runs it on `wasmtime` from `PATH` with the current directory preopened (`KAI_WASI_DIRS` replaces the list).
 
 - **Gate**: `TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture with `bin/kai build --target=wasm32-wasi` and runs it under `wasmtime` with `.` and `/tmp` preopened. A fixture whose `main` the target refuses (`Spawn`, sockets, signals, `Js`) is counted `refused`, not as a failure; `tools/wasi-parity-baseline.txt` lists only real differences. CI runs it as `tier1-wasi` (not a required check) together with `tools/test-wasi.sh`, which checks `kai run`'s arguments, environment, stdin, exit status, preopens and diagnostics.
+
+### The native backend for WebAssembly
+
+`KAI_NATIVE_TARGET=wasm32-wasi|wasm32-browser` (set by `kai` from `--target`) makes kaic2 build the module for `wasm32-unknown-wasip1` / `wasm32-unknown-unknown` instead of the host: the triple and target machine come from the target, relocation is static, `_setjmp` becomes `setjmp` for the wasm sjlj lowering, and cleanup pads take `__gxx_wasm_personality_v0`. LLVM keeps `invoke` only under the wasm exception model, which the C API cannot select, so `stage2/runtime/llvm_wasm_eh.cpp` (compiled by `stage2/Makefile` when `llvm-config` lists WebAssembly, `-DKAI_LLVM_WEBASSEMBLY`) sets it on the target machine. A kaic2 without that target stops with "this kai was built without the WebAssembly LLVM target".
+
+The layout follows 32-bit pointers through two rules: the evidence blob and node are `i64` cells, indexed by `kaix_ev_op_at` / `kaix_ev_set_op` at an 8-byte stride; and `cons` cells keep an 8-byte stride between `head` and `tail`, because the emitter reads them as variant slots.
+
+`tools/gen-runtime-bc.sh` writes `stage0/runtime_{llvm,inline}.<target>.bc` for both targets when a wasi-sdk sysroot is found (`WASI_SYSROOT`, `KAI_WASI_SDK`, `WASI_SDK`, or the `kai` cache), using the clang that matches the libLLVM (wasi-sdk's own clang is newer and cannot write them). The `.macros` file beside each records its `-DKAI_*` macros; `kai` stops a build whose `CFLAGS` set others, and kaic2 refuses bitcode of another architecture than the target.
+
+- **Gate**: `TARGET_BACKEND=wasi|wasm WASM_BACKEND=native NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` against `tools/{wasi,wasm}-native-parity-baseline.txt`; it prints `SKIP` when the kaic2 has no WebAssembly target. CI runs it as `native-wasm` in `tier1-native.yml` (not a required check).
 
 ## Traps (verified, recurring)
 

@@ -62,6 +62,7 @@ jobs:
       doc-only: ${{ steps.doc-only.outputs.skip }}
       nscol: ${{ steps.nscol.outputs.run }}
       rcdet: ${{ steps.rcdet.outputs.run }}
+      wasm: ${{ steps.wasm.outputs.run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,6 +108,22 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "Diff does not reach name resolution; skipping the namespace-collision corpus."
+          fi
+
+      - name: Does this diff reach the native WebAssembly surface?
+        id: wasm
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          if echo "$CHANGED" | grep -qE '^(stage0/runtime_llvm\.c|stage2/runtime\.h|stage2/runtime/|stage2/compiler/emit_native|stage2/Makefile|tools/(gen-runtime-bc|test-backend-parity)\.sh|tools/(wasi|wasm)-native-parity-baseline\.txt|tools/kai/|\.github/workflows/tier1-native\.yml)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Diff does not reach the native WebAssembly surface; native-wasm skipped."
           fi
 
       # The RC detector runs only on PRs that can introduce an RC regression;
@@ -561,3 +578,68 @@ jobs:
             echo "::error::tier1-native FAIL — the RC detector did not succeed"; exit 1
           fi
           echo "tier1-native OK — all three shards + self-host gate + native RC leak ledger (+ RC detector when in scope) green"
+
+  # The parity corpus built natively for the WebAssembly targets, against the C
+  # oracle, as ratchets (tools/{wasi,wasm}-native-parity-baseline.txt). Reports
+  # "skipped" when this kaic2 has no WebAssembly target. Not a required check.
+  native-wasm:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true' && needs.changes.outputs.wasm == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [wasi-a, wasi-b, wasi-c, wasm-a, wasm-b, wasm-c]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      WASI_SDK_VERSION: "34.0"
+      WASI_SDK_SHA256: "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+      WASMTIME_VERSION: "49.0.2"
+      WASMTIME_SHA256: "a4d6e9e3a5a60f527cf7793d674c48930c80c2e8977995b8a275cad3254b9322"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: ./tools/ci-install-toolchain.sh llvm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.1"
+      - name: Fetch wasi-sdk (pinned, checksum verified)
+        run: |
+          url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" "$url"
+          echo "${WASI_SDK_SHA256}  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasi-sdk"
+          tar xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
+          echo "KAI_WASI_SDK=$RUNNER_TEMP/wasi-sdk" >> "$GITHUB_ENV"
+      - name: Fetch wasmtime (pinned, checksum verified)
+        run: |
+          url="https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/wasmtime.tar.xz" "$url"
+          echo "${WASMTIME_SHA256}  $RUNNER_TEMP/wasmtime.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasmtime"
+          tar xJf "$RUNNER_TEMP/wasmtime.tar.xz" -C "$RUNNER_TEMP/wasmtime" --strip-components=1
+          echo "$RUNNER_TEMP/wasmtime" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-native
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Generate the WebAssembly runtime bitcode
+        run: LLVM_CONFIG="$LLVM_CONFIG" tools/gen-runtime-bc.sh
+      - name: native ${{ matrix.leg }} (corpus vs the C oracle)
+        run: |
+          . tools/lib/corpus.sh
+          leg="${{ matrix.leg }}"
+          target="${leg%-*}"; shard="${leg#*-}"
+          all="$KAI_CORPUS_DEFAULT_DIRS examples/$([ "$target" = wasi ] && echo wasi || echo web)"
+          case "$shard" in
+            a) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 1') ;;
+            b) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 2') ;;
+            c) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 0') ;;
+          esac
+          TARGET_BACKEND="$target" WASM_BACKEND=native NATIVE_PARITY_RATCHET=1 BACKEND_PARITY_DIRS="$dirs" \
+            ./tools/ci-bounded-step.sh 2400 "native-${{ matrix.leg }}" tools/test-backend-parity.sh

@@ -39,6 +39,22 @@ KAI="$ROOT/bin/kai"
 # tier1-native workflow adds NATIVE_PARITY_RATCHET=1 to forbid new gaps.
 ORACLE_BACKEND="${ORACLE_BACKEND:-c}"
 TARGET_BACKEND="${TARGET_BACKEND:-native}"
+# The backend the wasm and wasi legs build with; `native` runs the same corpus through the
+# in-process libLLVM emitter against its own baseline.
+WASM_BACKEND="${WASM_BACKEND:-c}"
+
+# SKIP, as the native leg does, when this kaic2 cannot emit WebAssembly.
+wasm_native_probe() {
+  local probe
+  probe="$(mktemp)"; mv "$probe" "$probe.kai"; probe="$probe.kai"
+  printf 'fn main() : Int = 0\n' > "$probe"
+  if ! "$KAI" build --backend=native --target=wasm32-wasi "$probe" -o "${probe%.kai}.bin" >/dev/null 2>&1; then
+    echo "test-backend-parity: SKIP (no WebAssembly target in this kaic2; rebuild with make KAI_LLVM=1 against a libLLVM that has it)"
+    rm -f "$probe" "${probe%.kai}.bin" "${probe%.kai}.bin.wasm"
+    exit 0
+  fi
+  rm -f "$probe" "${probe%.kai}.bin" "${probe%.kai}.bin.wasm"
+}
 
 case "$TARGET_BACKEND" in
   native)
@@ -61,11 +77,12 @@ case "$TARGET_BACKEND" in
     rm -f "$probe" "${probe%.kai}.bin"
     ;;
   wasm)
-    if [ ! -x "${WASI_SDK:-/nonexistent}/bin/clang" ] || ! command -v node >/dev/null 2>&1; then
+    if { [ "$WASM_BACKEND" != native ] && [ ! -x "${WASI_SDK:-/nonexistent}/bin/clang" ]; } || ! command -v node >/dev/null 2>&1; then
       echo "test-backend-parity: SKIP (wasm needs WASI_SDK=<wasi-sdk dir> and node)"
       exit 0
     fi
-    WASM_CC="$WASI_SDK/bin/clang"
+    [ "$WASM_BACKEND" = native ] && wasm_native_probe
+    WASM_CC="${WASI_SDK:-}/bin/clang"
     WASM_CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp -Wl,--export=__stack_pointer -Wl,--export-table -Wno-unused-command-line-argument"
     WASM_NODE_FLAGS="${WASM_NODE_FLAGS:-}"
     WASM_HOST="$ROOT/stage2/web/kai_host.mjs"
@@ -76,6 +93,7 @@ case "$TARGET_BACKEND" in
       echo "test-backend-parity: SKIP (wasi needs wasmtime on PATH)"
       exit 0
     fi
+    [ "$WASM_BACKEND" = native ] && wasm_native_probe
     ;;
   *)
     if ! command -v "${CLANG:-clang}" >/dev/null 2>&1; then
@@ -89,7 +107,9 @@ esac
 # executed by the JavaScript host.
 target_build() {
   if [ "$TARGET_BACKEND" = wasi ]; then
-    KAI_CORPUS_BUILD_FLAGS="--target=wasm32-wasi" kai_corpus_build "$1" "$2" KAI_BACKEND=c
+    KAI_CORPUS_BUILD_FLAGS="--target=wasm32-wasi" kai_corpus_build "$1" "$2" KAI_BACKEND="$WASM_BACKEND"
+  elif [ "$TARGET_BACKEND" = wasm ] && [ "$WASM_BACKEND" = native ]; then
+    KAI_CORPUS_BUILD_FLAGS="--target=wasm32-browser" kai_corpus_build "$1" "$2" KAI_BACKEND=native
   elif [ "$TARGET_BACKEND" = wasm ]; then
     kai_corpus_build "$1" "$2" KAI_BACKEND=c KAI_MODULAR=0 CC="$WASM_CC" CFLAGS="$WASM_CFLAGS"
   else
@@ -105,14 +125,15 @@ target_exec() {
   elif [ "$TARGET_BACKEND" = wasm ]; then
     # node before 24.15 needs a flag for JSPI, which fibers and kept continuations run on.
     # The first attempt keeps stdout and stderr interleaved in one file, in the order written.
-    local out rc
+    local out rc mod="$1"
+    [ "$WASM_BACKEND" = native ] && mod="$1.wasm"
     out="$(mktemp)"
     # shellcheck disable=SC2086
-    node $WASM_NODE_FLAGS "$WASM_HOST" "$1" >"$out" 2>&1
+    node $WASM_NODE_FLAGS "$WASM_HOST" "$mod" >"$out" 2>&1
     rc=$?
     if [ "$rc" -ne 0 ] && grep -q "Promise Integration" "$out"; then
       # shellcheck disable=SC2086
-      node --experimental-wasm-jspi $WASM_NODE_FLAGS "$WASM_HOST" "$1"
+      node --experimental-wasm-jspi $WASM_NODE_FLAGS "$WASM_HOST" "$mod"
       rc=$?
     else
       cat "$out"
@@ -134,6 +155,7 @@ parity_pin() {
 PARITY_BASELINE="$ROOT/tools/native-parity-baseline.txt"
 if [ "$TARGET_BACKEND" = wasm ]; then PARITY_BASELINE="$ROOT/tools/wasm-parity-baseline.txt"; fi
 if [ "$TARGET_BACKEND" = wasi ]; then PARITY_BASELINE="$ROOT/tools/wasi-parity-baseline.txt"; fi
+if [ "$WASM_BACKEND" = native ]; then PARITY_BASELINE="${PARITY_BASELINE%-parity-baseline.txt}-native-parity-baseline.txt"; fi
 
 if [ ! -x "$KAI" ]; then
   echo "test-backend-parity FAIL — bin/kai not found or not executable"
@@ -239,7 +261,7 @@ process_one() {
   # equivalence is proved byte-for-byte by `test-native-modular`; this harness
   # need not re-pay for it. (KAI_NATIVE_MODULAR is a no-op on the C oracle.)
   if ! target_build "$f" "$t_bin" >"$t_blog" 2>&1; then
-    if [ "$TARGET_BACKEND" = wasi ] && grep -q 'target cannot run' "$t_blog"; then
+    if { [ "$TARGET_BACKEND" = wasi ] || [ "$WASM_BACKEND" = native ]; } && grep -q 'target cannot run' "$t_blog"; then
       printf 'R\n' >> "$results"
       return 0
     fi
@@ -291,7 +313,7 @@ process_one() {
 # Export the worker + the helpers and state it touches so xargs can
 # reach them from each forked subshell.
 export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
-export ORACLE_BACKEND TARGET_BACKEND
+export ORACLE_BACKEND TARGET_BACKEND WASM_BACKEND
 export -f target_build target_exec parity_pin process_one kai_corpus_build kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
@@ -311,7 +333,7 @@ skip=$(grep -c '^S$' "$results" 2>/dev/null || true)
 refused=$(grep -c '^R$' "$results" 2>/dev/null || true)
 
 echo ""
-echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fail=$fail skip=$skip$([ "$TARGET_BACKEND" = wasi ] && echo " refused=$refused") total=$total"
+echo "test-backend-parity: $TARGET_BACKEND vs $ORACLE_BACKEND — pass=$pass fail=$fail skip=$skip$({ [ "$TARGET_BACKEND" = wasi ] || [ "$WASM_BACKEND" = native ]; } && echo " refused=$refused") total=$total"
 
 # Ratchet mode (Lane 1.5). With NATIVE_PARITY_RATCHET=1 the gate does NOT
 # require zero failures — the native backend is at ~60% corpus parity and

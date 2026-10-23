@@ -7,6 +7,7 @@
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <llvm-c/Linker.h>
 #include <llvm-c/IRReader.h>
+#include <llvm-c/Support.h>
 #include <llvm-c/DebugInfo.h>
 #include <stdlib.h>
 
@@ -544,12 +545,32 @@ static KaiValue *kai_llvm_set_internal_linkage(void *fn) {
     LLVMSetLinkage((LLVMValueRef) fn, LLVMInternalLinkage);
     return kai_unit();
 }
+/* The wasm flavour a build targets, from `KAI_NATIVE_TARGET`: 0 = the host,
+ * 1 = wasm32-wasi, 2 = wasm32-browser. */
+static int kai_llvm_wasm_target(void) {
+    const char *t = getenv("KAI_NATIVE_TARGET");
+    if (!t || !t[0]) return 0;
+    if (strcmp(t, "wasm32-wasi") == 0) return 1;
+    if (strcmp(t, "wasm32-browser") == 0) return 2;
+    return 0;
+}
+
+/* The triple the module and the object are built for; dispose with
+ * `LLVMDisposeMessage`. */
+static char *kai_llvm_target_triple(void) {
+    switch (kai_llvm_wasm_target()) {
+        case 1: return LLVMCreateMessage("wasm32-unknown-wasip1");
+        case 2: return LLVMCreateMessage("wasm32-unknown-unknown");
+        default: return LLVMGetDefaultTargetTriple();
+    }
+}
+
 /* The target C-ABI class of the native backend's default triple: 1 =
  * AArch64 (AAPCS64), 2 = x86-64 SysV, 0 = anything else (the emitter keeps
  * the honest struct-by-value reject there). Read once at module build; the
  * object emission below pins the SAME `LLVMGetDefaultTargetTriple()`. */
 static int64_t kai_native_target_abi(void) {
-    char *triple = LLVMGetDefaultTargetTriple();
+    char *triple = kai_llvm_target_triple();
     int64_t plat = 0;
     if (triple) {
         if (strncmp(triple, "arm64", 5) == 0 || strncmp(triple, "aarch64", 7) == 0) plat = 1;
@@ -610,6 +631,9 @@ static LLVMCodeGenOptLevel kai_llvm_cgen_level(void) {
         ? LLVMCodeGenLevelNone : LLVMCodeGenLevelDefault;
 }
 static KaiValue *kai_llvm_backend_tag(void) {
+#ifndef KAI_LLVM_WEBASSEMBLY
+    if (kai_llvm_wasm_target()) return kai_str("");
+#endif
     const char *off = getenv("KAI_NATIVE_CORE_OBJ");
     if (off && strcmp(off, "0") == 0) return kai_str("");
     /* A debug build's DWARF names the program's own source file, so its core
@@ -633,7 +657,7 @@ static KaiValue *kai_llvm_backend_tag(void) {
         }
         return kai_str("");
     }
-    char *triple = LLVMGetDefaultTargetTriple();
+    char *triple = kai_llvm_target_triple();
     snprintf(tag, sizeof tag, "%s|O%s|cg:%s|bc:%s|inlbc:%s",
              triple ? triple : "?", lvl, kai_llvm_cgen_level_id(), bc, inlbc);
     if (triple) LLVMDisposeMessage(triple);
