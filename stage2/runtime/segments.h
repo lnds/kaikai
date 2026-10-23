@@ -435,7 +435,11 @@ KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
 /* No switch for this target: no segment ever runs, so no box or escape
  * reaches the two hooks below. */
 __attribute__((noreturn)) static void kai_seg_unsupported(void) {
+#if defined(__wasi__) && !KAI_HOST_JS
+    kai_eputs("kai: fibers and kept continuations are not available on wasm32-wasi\n");
+#else
     kai_eputs("kai: stack segments are not supported on this target\n");
+#endif
     kai_exit(1);
     __builtin_unreachable();
 }

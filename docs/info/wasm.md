@@ -113,3 +113,7 @@ when its final row holds `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor`,
 `Signal`, `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` or `Js`; preview 1 has no
 sockets, and fibers wait for the stack-switching proposal in wasmtime.
 Handle the effect inside `main`, or remove it from the row.
+
+A handler that keeps `resume` (a generator, a non-tail resume) cannot be seen from
+`main`: it stops at run time with `kai: fibers and kept continuations are not
+available on wasm32-wasi`.
