@@ -48,6 +48,41 @@ Not available on the page: sockets, processes, signals and the reactor's
 poll (`File`, `Stdin`). Non-tail recursion is limited by the engine's stack, about 6 000
 frames in Chrome.
 
+## The page stdlib
+
+`web.run { … }` (from `import web.run`) answers four effects with the page:
+`Dom` (`web.dom`), `Timer` (`web.timer`), `Fetch` (`web.fetch`) and `Storage`
+(`web.storage`). Events are values: `Dom.listen(node, "click")` asks the host
+to queue them, and `Dom.next_event()` parks the fiber until one arrives.
+
+```text
+import web.dom
+import web.run
+
+fn count(label: Node, n: Int) : Unit / Dom {
+  let e = Dom.next_event()
+  if e.kind == "click" {
+    Dom.set_text(label, "clicks: #{n + 1}")
+    count(label, n + 1)
+  } else {
+    count(label, n)
+  }
+}
+
+fn main() : Unit / Js + Ffi + Clock =
+  run.run(() => {
+    let button = Dom.create("button")
+    Dom.append(Dom.query("body") ?? button, button)
+    Dom.listen(button, "click")
+    count(button, 0)
+  })
+```
+
+The row needs `Js`, so the program builds only for this target. A `main` that
+returns a nonzero status is reported on the console of the page
+(`kai: exited with status N`). The `[js]` modules of the entry package and of its
+dependencies are loaded; the entry package's wins a shared name.
+
 ## Flags
 
 - `--target=wasm32-browser` is accepted by `kai build` only, and requires

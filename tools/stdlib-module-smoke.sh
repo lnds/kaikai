@@ -16,7 +16,8 @@ DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-stdlib-smoke.XXXXXX")"
 trap 'rm -rf "$DIR"' EXIT
 
 {
-  (cd "$ROOT/stdlib" && find . -mindepth 2 -name '*.kai' | sort) | while read -r f; do
+  # web.* declares `extern "js"`, which only the C backend reaches.
+  (cd "$ROOT/stdlib" && find . -mindepth 2 -name '*.kai' -not -path './web/*' | sort) | while read -r f; do
     p=$(printf '%s' "${f#./}" | sed 's/\.kai$//; s|/|.|g')
     printf 'import %s as smoke_%s\n' "$p" "$(printf '%s' "$p" | tr . _)"
   done

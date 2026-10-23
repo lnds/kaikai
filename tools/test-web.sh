@@ -27,7 +27,7 @@ fi
 if [ $# -gt 0 ]; then
   FIXTURES=("$@")
 else
-  FIXTURES=("$ROOT"/examples/web/*.kai "$ROOT"/examples/web_js/*.kai "$ROOT"/examples/web_js_pkg/main.kai)
+  FIXTURES=("$ROOT"/examples/web/*.kai "$ROOT"/examples/web_js/*.kai "$ROOT"/examples/web_js/snake/snake.kai "$ROOT"/examples/web_js_pkg/main.kai "$ROOT"/examples/web_js_deps/shouted.kai)
 fi
 
 if [ -z "${BROWSERS+x}" ]; then
@@ -47,19 +47,21 @@ compare() { # name leg actual-file expected-file
 
 # node before 24.15 needs a flag for exception handling with exnref, and one for JSPI; the stub stands in for the page's document.
 run_module() {
-  local flags=""
-  node --import "$ROOT/tools/web-stub.mjs" "$1" 2>"$TMP/node.err" && return 0
-  grep -q "experimental-wasm-exnref" "$TMP/node.err" && flags="--experimental-wasm-exnref"
-  node --import "$ROOT/tools/web-stub.mjs" $flags "$1" 2>"$TMP/node.err" && return 0
-  if grep -q "Promise Integration" "$TMP/node.err"; then
-    node --import "$ROOT/tools/web-stub.mjs" $flags --experimental-wasm-jspi "$1" 2>/dev/null
-  else
-    return 1
-  fi
+  local flags
+  for flags in "" "--experimental-wasm-exnref" "--experimental-wasm-exnref --experimental-wasm-jspi"; do
+    if node --import "$ROOT/tools/web-stub.mjs" $flags "$1" >"$TMP/attempt.out" 2>"$TMP/node.err"; then
+      cat "$TMP/attempt.out"
+      return 0
+    fi
+  done
+  return 1
 }
 
 build_all() {
   mkdir -p "$TMP/out"
+  for f in "${FIXTURES[@]}"; do
+    cp "$(dirname "$f")"/*.json "$TMP/out/" 2>/dev/null
+  done
   for f in "${FIXTURES[@]}"; do
     n="$(basename "$f" .kai)"
     if ! "$KAI" build --target=wasm32-browser "$f" -o "$TMP/out/$n" 2>"$TMP/build-$n.err"; then
@@ -76,6 +78,7 @@ run_node() {
   for f in "${FIXTURES[@]}"; do
     n="$(basename "$f" .kai)"
     [ -f "$TMP/out/$n.mjs" ] || continue
+    [ -f "${f%.kai}.browser-only" ] && continue
     run_module "$TMP/out/$n.mjs" >"$TMP/$n.node"
     want="${f%.kai}.node.expected"
     [ -f "$want" ] || want="${f%.kai}.out.expected"
@@ -122,7 +125,9 @@ run_browsers() {
     for f in "${FIXTURES[@]}"; do
       n="$(basename "$f" .kai)"
       [ -f "$TMP/out/$n.html" ] || continue
-      python3 -I "$ROOT/tools/web-driver.py" "$b" "http://127.0.0.1:8765/$n.html" >"$TMP/$n.$b" 2>"$TMP/$n.$b.err" \
+      query=""; [ -f "${f%.kai}.query" ] && query="?$(cat "${f%.kai}.query")"
+      steps=(); [ -f "${f%.kai}.steps.js" ] && steps=("${f%.kai}.steps.js")
+      python3 -I "$ROOT/tools/web-driver.py" "$b" "http://127.0.0.1:8765/$n.html$query" "${steps[@]}" >"$TMP/$n.$b" 2>"$TMP/$n.$b.err" \
         || { cat "$TMP/$n.$b.err"; bad "$n [$b] driver"; continue; }
       if [ "$b" != chrome ] && grep -q "Promise Integration" "$TMP/$n.$b"; then
         say "skip: $n [$b] (this browser has no JSPI)"
@@ -188,6 +193,45 @@ check_installed_layout() {
   fi
 }
 
+# A nonzero exit of main reaches the console and the node exit status.
+check_exit_status() {
+  local src="$ROOT/examples/web_exit/exit_status.kai"
+  if ! "$KAI" build --target=wasm32-browser "$src" -o "$TMP/exit/exit_status" 2>"$TMP/exit.err"; then
+    bad "exit status build"
+    cat "$TMP/exit.err"
+    return
+  fi
+  node --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref --experimental-wasm-jspi "$TMP/exit/exit_status.mjs" >/dev/null 2>"$TMP/exit.err"
+  local code=$?
+  if [ "$code" = 3 ] && grep -q "exited with status 3" "$TMP/exit.err"; then
+    say "ok:   nonzero exit is reported"
+  else
+    bad "nonzero exit is reported (status $code)"
+    cat "$TMP/exit.err"
+  fi
+}
+
+# An engine without JSPI runs a program that never suspends, and refuses one that does.
+check_no_jspi() {
+  local pure="$TMP/out/web_arithmetic" spawning="$TMP/out/web_spawn"
+  [ -f "$pure.mjs" ] && [ -f "$spawning.mjs" ] || return 0
+  if node --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref "$pure.mjs" >"$TMP/nojspi.out" 2>"$TMP/nojspi.err" \
+      && diff -q "$TMP/nojspi.out" "$ROOT/examples/web/web_arithmetic.out.expected" >/dev/null; then
+    say "ok:   pure program runs without JSPI"
+  else
+    bad "pure program without JSPI"
+    cat "$TMP/nojspi.err"
+  fi
+  if node --import "$ROOT/tools/web-stub.mjs" --experimental-wasm-exnref "$spawning.mjs" >/dev/null 2>"$TMP/nojspi.err"; then
+    bad "a spawning program ran without JSPI"
+  elif grep -q "Promise Integration" "$TMP/nojspi.err"; then
+    say "ok:   spawning program is refused without JSPI"
+  else
+    bad "spawning program without JSPI: no diagnostic"
+    cat "$TMP/nojspi.err"
+  fi
+}
+
 build_all
 [ -f "$TMP/build-$(basename "${FIXTURES[0]}" .kai).err" ] && grep -q "fetching wasi-sdk" "$TMP/build-$(basename "${FIXTURES[0]}" .kai).err" \
   && say "ok:   toolchain fetched from an empty cache"
@@ -197,4 +241,6 @@ run_browsers
 check_wrong_checksum
 check_refusal_fails
 check_installed_layout
+check_exit_status
+check_no_jspi
 exit $fail

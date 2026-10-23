@@ -279,6 +279,7 @@ stdlib/
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
   log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
+  web/           effects: Dom + Timer + Fetch + Storage over `extern "js"`, installed by `web.run`; browser target only
   net/           effects: NetTcp + NetUdp + NetDns + NetUnix all shipped; alias `Net = NetTcp + NetUdp + NetDns` now definable (follow-up adds the row alias)
     tcp.kai      uses NetTcp (shipped — v1; R2 reactor flipped NetTcp to fiber-parking 2026-05-16 via #630; see effects-stdlib.md sidebar)
     udp.kai      uses NetUdp (shipped — v1 datagram UDP via #354; blocking ops, IPv4 only; `bind`/`send`/`recv`/`close`/`local_port`/`addr`)
@@ -564,6 +565,14 @@ than what a primitive module should expose. The `#[unstable]`
 server-side helpers above are the seam manutara will sit on top of;
 they are explicitly carved out of the edition contract until
 manutara's first design pass exercises them.
+
+### web (`/ Js`, browser target only)
+
+- `web.dom` — `Dom` effect: query, create, append, remove, text, attributes, styles; `listen` and `next_event` / `poll_event` (events as values: the host queues them, `next_event` parks the fiber); a 2D canvas (`context_2d`, `fill_rect`, `clear_rect`, `begin_path`, `arc`, `fill`, `stroke`, `fill_text`, `set_fill_style`, `set_stroke_style`, `set_font`) and per-pixel drawing (`new_image`, `set_pixel`, `put_image_data`, `get_image_data`, `get_pixel`) *(shipped — PR_NUM)*
+- `web.timer` — `Timer` effect: `now_ms`, `sleep_ms`, `animation_frame`, `every` (periodic events for `Dom.next_event`) *(shipped — PR_NUM)*
+- `web.fetch` — `Fetch` effect: `get`; `get_text`, `get_json`, `status` *(shipped — PR_NUM)*
+- `web.storage` — `Storage` effect over `localStorage`: `get`, `set`, `remove` *(shipped — PR_NUM)*
+- `web.run` — `run { … }` installs the four handlers; its row needs `Js`, so a program using these effects builds only for `wasm32-browser` *(shipped — PR_NUM)*
 
 ### encoding (pure, stage 2)
 

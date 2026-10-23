@@ -148,7 +148,23 @@ The rule: an effect is refused when no operation of it runs in the page, and
 allowed, with runtime stops for the operations that cannot run (the `Process`
 operations other than `exit`), when some do. The check works on
 rows, not operations.
-Waits become available with the suspension work of the next phase.
+
+### The browser effects
+
+`stdlib/web/` adds four ordinary effects whose handlers are kaikai code over
+`extern "js"`; `web.run { … }` installs all of them and carries `Js` in its row,
+so a program that uses them builds only for `wasm32-browser`.
+
+| Effect | Module | Operations |
+|---|---|---|
+| `Dom` | `web.dom` | `query`, `create`, `append`, `remove`, `set_text`, `set_attr`, `set_style`, `listen`, `next_event`, `poll_event`, the 2D canvas and per-pixel image ops |
+| `Timer` | `web.timer` | `now_ms`, `sleep_ms`, `animation_frame`, `every` |
+| `Fetch` | `web.fetch` | `get` |
+| `Storage` | `web.storage` | `get`, `set`, `remove` |
+
+`Dom.next_event` returns an `Event { kind, key, x, y, target }` the page posted
+after `listen` (or a `Timer.every` tick); with none queued it parks the fiber
+until the host wakes the runtime, so an idle page sleeps.
 
 Sections are self-contained; skim the catalog, then dive where
 you care.
