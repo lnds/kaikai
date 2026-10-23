@@ -726,6 +726,10 @@ KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiC
 {
     (void) self;
     int64_t ns_v = (kai_is_int(ns)) ? kai_intf(ns) : 0;
+#if defined(__wasm__)
+    /* A page only runs while the program yields: even a zero sleep waits for the host. */
+    if (ns_v <= 0) kai_reactor_park_timer(kai_current_fiber(), kai_reactor_now_ns());
+#endif
     if (ns_v > 0) {
 #if !defined(__wasm__)
         kai_reactor_init();

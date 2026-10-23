@@ -216,8 +216,10 @@ error: `main` performs effect `Signal`, which the `wasm32-browser` target cannot
 
 Handle the effect inside `main` with a handler of your own, or remove it
 from the row. An effect with some operation the page can run is allowed,
-and its other operations stop at run time: `Clock.sleep_ns`, and every
-`Process` operation except `exit`. Host builds pass no target and are unaffected.
+and its other operations stop at run time: every `Process` operation except
+`exit`. `Clock.sleep` parks on the page's event loop (a sleep of zero waits for
+the next frame), so the page stays responsive. Host builds pass no target and are
+unaffected.
 
 ## Handler state — `state` and `log`
 
