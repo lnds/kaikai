@@ -36,8 +36,8 @@ LLVM_CMAKE_DIR := $(LLVM_THIRD_PARTY)/cmake
 # The version the extracted source is: a tree left by an earlier pin would
 # otherwise build under the new pin's name.
 LLVM_SOURCE_STAMP := $(LLVM_SRC_DIR)/.source-version
-# CMake targets we actually need (parse text IR + emit x86-64 + arm64
-# objects). Kept narrow on purpose; expanding this list expands the
+# CMake targets we actually need (parse text IR + emit x86-64, arm64 and
+# wasm32 objects). Kept narrow on purpose; expanding this list expands the
 # final static-link footprint roughly linearly.
 LLVM_CMAKE_TARGETS := LLVMCore LLVMSupport LLVMIRReader LLVMAsmParser \
                       LLVMBitReader LLVMBitWriter \
@@ -45,6 +45,8 @@ LLVM_CMAKE_TARGETS := LLVMCore LLVMSupport LLVMIRReader LLVMAsmParser \
                       LLVMObject LLVMOption LLVMBinaryFormat \
                       LLVMX86CodeGen LLVMX86AsmParser LLVMX86Desc LLVMX86Info \
                       LLVMAArch64CodeGen LLVMAArch64AsmParser LLVMAArch64Desc LLVMAArch64Info \
+                      LLVMWebAssemblyCodeGen LLVMWebAssemblyAsmParser LLVMWebAssemblyDesc \
+                      LLVMWebAssemblyInfo LLVMWebAssemblyUtils \
                       LLVMCodeGen LLVMAnalysis LLVMTransformUtils LLVMScalarOpts \
                       LLVMSelectionDAG LLVMGlobalISel LLVMAsmPrinter \
                       LLVMipo LLVMInstCombine LLVMInstrumentation \
@@ -60,7 +62,7 @@ llvm-info:
 	@echo "LLVM_BUILD_DIR  = $(LLVM_BUILD_DIR)"
 	@echo "LLVM_TARBALL    = $(LLVM_TARBALL)"
 	@echo "LLVM_TARBALL_URL= $(LLVM_TARBALL_URL)"
-	@echo "TARGETS         = X86 + AArch64 (MinSizeRel, no zlib/zstd/libxml2)"
+	@echo "TARGETS         = X86 + AArch64 + WebAssembly (MinSizeRel, no zlib/zstd/libxml2)"
 	@echo "CMAKE_TARGETS   = $(words $(LLVM_CMAKE_TARGETS)) libraries"
 	@echo "Disk required   = ~3.5 GB build tree, ~150-300 MB sum-of-.a (L3 measurement)"
 	@echo "First build     = ~10-30 min on a modern laptop, ~30-60 min on cold CI"
@@ -102,7 +104,7 @@ llvm-fetch:
 	echo "$(LLVM_VERSION)" > $(LLVM_SOURCE_STAMP); \
 	echo "llvm-fetch OK — source at $(LLVM_SRC_DIR), cmake modules at $(LLVM_CMAKE_DIR)"
 
-# llvm-configure: run cmake. MinSizeRel + only X86 + AArch64 targets +
+# llvm-configure: run cmake. MinSizeRel + only X86 + AArch64 + WebAssembly targets +
 # disable optional features that bloat the static link (zlib, zstd,
 # libxml2). Requires cmake + ninja in PATH; we don't add
 # them to stage0 deps. If cmake/ninja are missing the failure is loud.
@@ -111,7 +113,7 @@ llvm-configure: llvm-fetch
 	@command -v ninja >/dev/null 2>&1 || { echo "llvm-configure FAIL — ninja not in PATH"; exit 2; }
 	cd $(LLVM_SRC_DIR) && cmake -B build -G Ninja \
 	  -DCMAKE_BUILD_TYPE=MinSizeRel \
-	  -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
+	  -DLLVM_TARGETS_TO_BUILD="X86;AArch64;WebAssembly" \
 	  -DLLVM_ENABLE_PROJECTS="" \
 	  -DLLVM_BUILD_TOOLS=OFF \
 	  -DLLVM_BUILD_UTILS=OFF \
