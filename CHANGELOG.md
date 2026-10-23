@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.173.0 (2026-10-23)
+
+### Added
+
+- **wasm**: `kai build --target=wasm32-wasi app.kai -o app.wasm` builds a single WebAssembly module for a WASI runtime, and `kai run --target=wasm32-wasi app.kai` runs it through `wasmtime` found on `PATH`. `File`, `Env`, `Clock`, `Random`, stdin and the exit status work on real WASI calls; the current directory is preopened, and `KAI_WASI_DIRS` (a `:`-separated list) chooses other directories. Fibers are not available on this target: a `main` that needs `Spawn`, `Actor`, `Cancel`, `Link`, `Monitor`, `Signal`, a network effect or `Js` is refused at build time, and a kept continuation stops at run time with a message naming the target.
+
 ## v0.172.0 (2026-10-22)
 
 ### BREAKING CHANGE
