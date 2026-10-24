@@ -580,7 +580,7 @@ manutara's first design pass exercises them.
 
 ### encoding (pure, stage 2)
 
-- `encoding.json` — `encode`, `decode` *(shipped — Real number parsing via #361 adds `JReal(Real)` alongside `JNum(Int)`; surrogate-pair `\uD8xx\uDCxx` decode + UTF-8 emit via #362)*
+- `encoding.json` — `encode`, `decode` *(shipped — Real number parsing via #361 adds `JReal(Real)` alongside `JNum(Int)`; surrogate-pair `\uD8xx\uDCxx` decode + UTF-8 emit via #362; strict RFC 8259 decode, where leading zeros and raw control characters yield `None`, and a `JReal` always encodes with a fraction so it decodes back as `JReal`, via #3148)*
 - `#[derive(Json)]` — typed struct binding over the same DOM *(shipped: `to_json` / `<lower(T)>_of_json` for records and sum types; field names verbatim, `Option` accepts null-or-missing, unknown keys ignored, failures are `Result[T, JsonError]` carrying the JSON path. Sum types encode under a fixed adjacently-tagged envelope `{"tag", "value"}` (nullary → `null`, single → the value, multi → a JSON array); decode routes on `tag`, an unknown tag is a located error. Per-field `#[json(rename/default/skip)]` overrides layer on top: `rename` sets the wire name, `default` supplies an absent key's value, `skip` drops a field (requiring a `default` or `Option`). `protocol Json` in `stdlib/protocols.kai`; `JsonValue` / `JsonError` / runtime in `stdlib/encoding/json_bind.kai`, kept out of the core so `JNull` does not offset every binary's RC baseline. See `docs/json-derive-design.md`.)*
 - `encoding.toml` — `decode`, `decode_report`, `encode`, `round_trip`, `error_message` *(shipped subset for the package manager (#405): top-level scalars, `[name]` and `[[name]]` headers — dotted with bare or quoted segments (`[native.sqlite]`, `[native."db.pg"]`) and nesting since #2772, a table or key defined twice rejected — basic strings, ints/bools, array values (#1742, the `[native]` table), inline tables, comments. Floats via #2056 — `TReal(Real)`, optional `-`/`+` sign, fractional (`0.8`) and/or exponent (`5e+22`) parts, a digit required on each side of the `.` and after the exponent marker; the encoder appends `.0` so an integral float does not re-decode as an integer. `inf` / `nan` and `_` digit separators stay out of the subset. `decode_report` (#2056) returns `Result[TomlValue, TomlError]` naming the 1-based line and bare key the parse stopped on, so a caller can point at the offending entry instead of calling the whole file malformed; `error_message` renders it. Encoder emits a canonical form so `kai.lock` round-trips byte-identical. Datetimes / dotted keys left of `=` / multi-line strings deferred until a user-facing TOML need lands.)*
 - `encoding.utf8` — `validate`, `decode`, `encode`, `chars` *(planned — no `stdlib/encoding/utf8.kai` file)*
@@ -589,9 +589,11 @@ manutara's first design pass exercises them.
 
 ### regexp (pure, stage 2) — **landed 2026-04-28**
 
-- `regexp` — `regex_compile`, `regex_match`, `regex_find_all`,
-  `regex_replace`, `regex_split` (top-level module). Pre-m14
-  flat-prefix names; rename to `regexp.match` etc. lands in m14.
+- `regexp` — `compile`, `compile_or_panic`, `find`, `find_all`,
+  `replace`, `split`, `matches` (top-level module). Matching is by
+  codepoint with leftmost-first (Perl/RE2) captures; offsets are byte
+  offsets. Repeat counts above 1000, patterns over 1,000,000 nodes after
+  repeats, and inverted class ranges are compile errors.
 - `regexp.syntax` — pattern AST types, `parse_pattern`, `ast_show`
   *(shipped)*. `regexp.engine` — NFA types, `compile_nfa`, `nfa_show`
   *(shipped)*. Debug/tooling surface; `regexp` simulates the NFA

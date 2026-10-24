@@ -857,7 +857,9 @@ unless the indentation is wanted.
 `~r/pattern/` compiles a regex at the use site (desugars to
 `regexp.compile_or_panic("pattern")`; `import regexp` required). A
 first-class expression in any position. `#` cannot appear in the
-body.
+body. Matching is by codepoint with leftmost-first (Perl/RE2)
+captures, and match offsets are byte offsets. The supported subset
+and its size limits are in the `regexp` module doc.
 
 ```kaikai
 import regexp

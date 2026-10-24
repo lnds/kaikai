@@ -103,9 +103,6 @@ Three tiers, three cadences. Spec in `docs/testing-tiers.md`; CI structure in `d
 ## Code-quality bar — C at least, cohesive files up to 1000 lines
 
 **Every new file a lane authors scores `km score` C or better (the default model of the kimun version pinned in CI); below C does not land. Reaching A is not a goal.** This is the *differential* standard: it applies to code the lane writes from scratch, not to pre-existing files it merely edits. The existing F monoliths (`stage2/compiler/infer.kai`, `emit_c.kai`, `cache.kai`) are debt being paid down, NOT the baseline — never calibrate a new file's acceptable quality against them. "We're already at F" is never a reason to relax; new code is debt-free and has no excuse.
-
-(Some stdlib files have slipped below the bar — `regexp`, `encoding/json`, `net/http` — they are debt like the compiler monoliths, not license.)
-
 Concrete gate, measured with `km` on each file the lane adds (cross-check `km score` with `km cogcom`):
 
 - **`km score`: C or better.** Never split a cohesive file to raise its grade: `km`'s Halstead term grows with file size, so chasing A forces ~300-line files.
