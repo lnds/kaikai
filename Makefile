@@ -1348,6 +1348,7 @@ test-core-text: bin/kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_boundaries_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/regexp_test.kai
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/json_test.kai
 	KAI_TEST_DRIVER="$(KAI_TEST_DRIVER)" KAI_TEST_BACKEND="$(KAI_TEST_BACKEND)" tools/test-core-modules.sh
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" check --backend=c tests/stdlib/core_text_properties_test.kai
 
