@@ -62,16 +62,6 @@ pub type Response = { status: Int,
 
 # ---- string helpers ----------------------------------------------
 
-# Index of the first occurrence of `needle` in `haystack`, or -1.
-fn http_str_index_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
-  if nn == 0 { 0 }
-  else if i + nn > hn { 0 - 1 }
-  else if string_slice(hay, i, nn) == needle { i }
-  else { http_str_index_loop(hay, needle, i + 1, hn, nn) }
-
-fn http_str_index(hay: String, needle: String) : Int =
-  http_str_index_loop(hay, needle, 0, string_length(hay), string_length(needle))
-
 fn http_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Int]) : [Int] =
   if i >= n { list_reverse(acc) }
   else { match char_at(s, i) {
@@ -79,7 +69,7 @@ fn http_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Int]) : [Int] =
     None    -> list_reverse(acc)
   } }
 
-#[doc("Encodes a String to a list of its char codepoints, one `Int` per char.")]
+#[doc("Encodes a String to its bytes, one `Int` (0-255) per byte.")]
 pub fn string_to_bytes(s: String) : [Int] =
   http_string_to_bytes_loop(s, 0, string_length(s), [])
 
@@ -89,36 +79,56 @@ fn http_byte_to_str(b: Int) : String = int_to_byte_string(b)
 pub fn bytes_to_string(bs: [Int]) : String =
   string_concat_all(list.map(bs, http_byte_to_str))
 
+fn http_after(s: String, at: Int) : String =
+  string_slice(s, at, string_length(s) - at)
+
 # ---- URL parsing -------------------------------------------------
 
-# Split `host[:port]` into (host, port). A missing or empty `:port`
-# yields port 0 — callers substitute a scheme default.
-fn http_split_authority(auth: String) : Result[HttpHostPort, String] = {
-  let i = http_str_index(auth, ":")
-  if i < 0 { Ok(HttpHostPort { host: auth, port: 0 }) }
-  else {
-    let h = string_slice(auth, 0, i)
-    let rest = string_slice(auth, i + 1, string_length(auth) - i - 1)
-    if string_length(rest) == 0 { Ok(HttpHostPort { host: h, port: 0 }) }
-    else { match string_to_int(rest) {
-      Some(p) if p >= 1 and p <= 65535 -> Ok(HttpHostPort { host: h, port: p })
-      _ -> Err(string_concat_all(["parse_url: invalid port '", rest, "'"]))
-    } }
-  }
-}
+fn http_default_port() : Int = 80
 
 fn http_min_offset(a: Int, b: Int) : Int =
   if a < 0 { b } else if b < 0 { a } else if a < b { a } else { b }
 
 # Offset where the authority ends: the first '/', '?' or '#', or -1.
 fn http_authority_end(rest: String) : Int =
-  http_min_offset(http_min_offset(http_str_index(rest, "/"), http_str_index(rest, "?")),
-                  http_str_index(rest, "#"))
+  http_min_offset(http_min_offset(string_find(rest, "/"), string_find(rest, "?")),
+                  string_find(rest, "#"))
 
-fn http_default_port(scheme: String) : Int =
-  if scheme == "http" { 80 }
-  else if scheme == "https" { 443 }
-  else { 0 }
+fn http_parse_port(text: String) : Result[Int, String] =
+  match string_to_int(text) {
+    Some(p) if p >= 1 and p <= 65535 -> Ok(p)
+    _ -> Err(string_concat_all(["parse_url: invalid port '", text, "'"]))
+  }
+
+# Split `host[:port]`. A missing or empty `:port` yields port 0, which
+# callers replace with the scheme default.
+fn http_split_authority(auth: String) : Result[HttpHostPort, String] = {
+  let i = string_find(auth, ":")
+  let port_text = if i < 0 { "" } else { http_after(auth, i + 1) }
+  let host = if i < 0 { auth } else { string_slice(auth, 0, i) }
+  if string_length(port_text) == 0 { Ok(HttpHostPort { host: host, port: 0 }) }
+  else { result.map(http_parse_port(port_text), (p) => HttpHostPort { host: host, port: p }) }
+}
+
+fn http_url_of(hp: HttpHostPort, path: String) : Result[HttpUrl, String] =
+  if string_length(hp.host) == 0 { Err("parse_url: empty host") }
+  else {
+    let port = if hp.port == 0 { http_default_port() } else { hp.port }
+    Ok(HttpUrl { scheme: "http", host: hp.host, port: port, path: path })
+  }
+
+fn http_build_url(auth: String, tail: String) : Result[HttpUrl, String] = {
+  let path = if string_length(tail) == 0 { "/" }
+             else if string.starts_with(tail, "/") { tail }
+             else { string_concat("/", tail) }
+  result.flat_map(http_split_authority(auth), (hp) => http_url_of(hp, path))
+}
+
+fn http_parse_http_url(rest: String) : Result[HttpUrl, String] = {
+  let at = http_authority_end(rest)
+  if at < 0 { http_build_url(rest, "") }
+  else { http_build_url(string_slice(rest, 0, at), http_after(rest, at)) }
+}
 
 #[doc("""
 Minimal URL parser: `http://<host>[:<port>][/<path>]`.
@@ -126,36 +136,15 @@ Minimal URL parser: `http://<host>[:<port>][/<path>]`.
 specifically; any other scheme is reported as unsupported.
 """)]
 pub fn parse_url(s: String) : Result[HttpUrl, String] = {
-  let sep = "://"
-  let i   = http_str_index(s, sep)
-  if i < 0 {
-    Err("parse_url: missing scheme separator '://' in URL")
-  } else {
-    let scheme = string_slice(s, 0, i)
-    let rest   = string_slice(s, i + 3, string_length(s) - i - 3)
-    if scheme == "https" {
-      Err("parse_url: https:// requires TLS, which is not in net.http v1 (see stdlib/net/http.kai header)")
-    } else if scheme == "http" {
-      let path_at = http_authority_end(rest)
-      let auth = if path_at < 0 { rest } else { string_slice(rest, 0, path_at) }
-      let tail = if path_at < 0 { "" }
-                 else { string_slice(rest, path_at, string_length(rest) - path_at) }
-      let path = if string_length(tail) == 0 { "/" }
-                 else if string.starts_with(tail, "/") { tail }
-                 else { string_concat("/", tail) }
-      match http_split_authority(auth) {
-        Err(e) -> Err(e)
-        Ok(hp) ->
-          if string_length(hp.host) == 0 {
-            Err("parse_url: empty host")
-          } else {
-            let port = if hp.port == 0 { http_default_port(scheme) } else { hp.port }
-            Ok(HttpUrl { scheme: scheme, host: hp.host, port: port, path: path })
-          }
-      }
-    } else {
-      Err(string_concat_all(["parse_url: unsupported scheme '", scheme, "' (only http:// is supported in v1)"]))
-    }
+  let i = string_find(s, "://")
+  let scheme = if i < 0 { "" } else { string_slice(s, 0, i) }
+  if i < 0 { Err("parse_url: missing scheme separator '://' in URL") }
+  else if scheme == "http" { http_parse_http_url(http_after(s, i + 3)) }
+  else if scheme == "https" {
+    Err("parse_url: https:// requires TLS, which is not in net.http v1 (see stdlib/net/http.kai header)")
+  }
+  else {
+    Err(string_concat_all(["parse_url: unsupported scheme '", scheme, "' (only http:// is supported in v1)"]))
   }
 }
 
@@ -167,11 +156,21 @@ fn http_format_header(h: HttpHeader) : String =
 fn http_format_headers(hs: [HttpHeader]) : String =
   string_concat_all(list.map(hs, http_format_header))
 
-# Authority string for the `Host` header: bare host when the port
-# is the scheme default, `host:port` otherwise.
+# Bare host when the port is the default, `host:port` otherwise.
 fn http_host_header(u: HttpUrl) : String =
-  if u.port == http_default_port(u.scheme) { u.host }
+  if u.port == http_default_port() { u.host }
   else { string_concat_all([u.host, ":", int_to_string(u.port)]) }
+
+fn http_content_length_line(body: String) : String =
+  string_concat_all(["Content-Length: ", int_to_string(string_length(body)), "\r\n"])
+
+fn http_serialize_for(req: Request, u: HttpUrl) : String =
+  string_concat_all([
+    req.method, " ", u.path, " HTTP/1.1\r\n",
+    "Host: ", http_host_header(u), "\r\n",
+    http_content_length_line(req.body),
+    http_format_headers(req.headers), "\r\n", req.body
+  ])
 
 #[doc("""
 Serialise a `Request` to wire bytes (HTTP/1.1 framing). The
@@ -187,56 +186,54 @@ appended verbatim. `Connection: close` is not emitted — the read
 loop drains until peer close, and adding the header would surprise
 callers who supplied their own.
 """)]
-pub fn serialize_request(req: Request) : String = {
+pub fn serialize_request(req: Request) : String =
   match parse_url(req.url) {
-    Err(e) -> string_concat_all(["INVALID_URL: ", e])
-    Ok(u)  -> {
-      let path  = if string_length(u.path) == 0 { "/" } else { u.path }
-      let line1 = string_concat_all([req.method, " ", path, " HTTP/1.1\r\n"])
-      let host  = string_concat_all(["Host: ", http_host_header(u), "\r\n"])
-      let clen  = string_concat_all(["Content-Length: ", int_to_string(string_length(req.body)), "\r\n"])
-      let extra = http_format_headers(req.headers)
-      string_concat_all([line1, host, clen, extra, "\r\n", req.body])
-    }
+    Err(e) -> string_concat("INVALID_URL: ", e)
+    Ok(u)  -> http_serialize_for(req, u)
   }
+
+# ---- message parsing ---------------------------------------------
+
+# Start line, the remaining head lines, and everything after the blank line.
+type HttpHead = { start: String, lines: [String], body: String }
+
+fn http_split_head(raw: String, ctx: String) : Result[HttpHead, String] = {
+  let i = string_find(raw, "\r\n\r\n")
+  if i < 0 {
+    Err(string_concat_all([ctx, ": missing header/body separator (\\r\\n\\r\\n)"]))
+  } else { match string_split(string_slice(raw, 0, i), "\r\n") {
+    [] -> Err(string_concat(ctx, ": empty header block"))
+    [start, ...lines] -> Ok(HttpHead { start: start, lines: lines, body: http_after(raw, i + 4) })
+  } }
 }
 
-# ---- response parser ---------------------------------------------
-
-fn http_parse_status_line(line: String) : Result[Int, String] = {
-  # `HTTP/1.1 200 OK` → split into 3 pieces, take the middle.
-  let parts = string_split(line, " ")
-  match parts {
+fn http_parse_status_line(line: String) : Result[Int, String] =
+  match string_split(line, " ") {
     [_proto, code, ..._reason] -> match string_to_int(code) {
       Some(n) -> Ok(n)
       None    -> Err(string_concat("parse_response: bad status code: ", code))
     }
     _ -> Err(string_concat("parse_response: malformed status line: ", line))
   }
-}
 
-# Parse a single header line `Name: Value`, trimming whitespace from
-# the value. A line without `:` is a parse error, not a silent drop.
+# Parse `Name: Value`, trimming the value. A line without `:` or with
+# an empty name is a parse error, not a silent drop.
 fn http_parse_header_line(line: String, ctx: String) : Result[HttpHeader, String] = {
-  let i = http_str_index(line, ":")
+  let i = string_find(line, ":")
   if i < 0 { Err(string_concat_all([ctx, ": header missing ':': ", line])) }
   else if i == 0 { Err(string_concat_all([ctx, ": empty header name: ", line])) }
   else {
-    let nm  = string_slice(line, 0, i)
-    let raw = string_slice(line, i + 1, string_length(line) - i - 1)
-    Ok(HttpHeader { name: nm, value: string.trim(raw) })
+    Ok(HttpHeader { name: string_slice(line, 0, i), value: string.trim(http_after(line, i + 1)) })
   }
 }
 
 fn http_parse_header_lines_loop(lines: [String], ctx: String, acc: [HttpHeader])
     : Result[[HttpHeader], String] = match lines {
   [] -> Ok(list_reverse(acc))
-  [l, ...rest] ->
-    if string_length(l) == 0 { http_parse_header_lines_loop(rest, ctx, acc) }
-    else { match http_parse_header_line(l, ctx) {
-      Err(e) -> Err(e)
-      Ok(h)  -> http_parse_header_lines_loop(rest, ctx, [h, ...acc])
-    } }
+  [l, ...rest] -> match http_parse_header_line(l, ctx) {
+    Err(e) -> Err(e)
+    Ok(h)  -> http_parse_header_lines_loop(rest, ctx, [h, ...acc])
+  }
 }
 
 fn http_parse_header_lines(lines: [String], ctx: String) : Result[[HttpHeader], String] =
@@ -251,138 +248,106 @@ pub fn header_lookup(hs: [HttpHeader], name: String) : Option[String] = match hs
   [h, ...rest] -> if h.name == name { Some(h.value) } else { header_lookup(rest, name) }
 }
 
+fn http_content_length(hs: [HttpHeader]) : Option[Int] = match header_lookup(hs, "Content-Length") {
+  Some(v) -> string_to_int(v)
+  None    -> None
+}
+
+# The first `n` bytes of `body`; everything when `n` exceeds its length.
+fn http_clamp_body(body: String, n: Int) : String =
+  if n <= 0 { "" } else { string_slice(body, 0, n) }
+
+fn http_frame_body(hs: [HttpHeader], body: String) : String =
+  match http_content_length(hs) {
+    Some(n) -> http_clamp_body(body, n)
+    None    -> body
+  }
+
+fn http_is_chunked(hs: [HttpHeader]) : Bool = match header_lookup(hs, "Transfer-Encoding") {
+  Some(v) -> string.to_lower(v) == "chunked"
+  None    -> false
+}
+
+# Chunked wins over Content-Length; with neither, the body is everything
+# after the blank line (recv already drained to peer close).
+fn http_response_body(hs: [HttpHeader], body_all: String) : String =
+  if http_is_chunked(hs) { dechunk_body(body_all) } else { http_frame_body(hs, body_all) }
+
+fn http_build_response(head: HttpHead, code: Int) : Result[Response, String] =
+  result.map(http_parse_header_lines(head.lines, "parse_response"),
+    (hs) => Response { status: code, headers: hs, body: http_response_body(hs, head.body) })
+
 #[doc("""
 Parse a complete HTTP/1.1 response: status line + headers +
 body. Length comes from `Content-Length`, else everything after
 the blank line. A `Transfer-Encoding: chunked` response is
 dechunked, so `body` holds the decoded payload.
 """)]
-pub fn parse_response(raw: String) : Result[Response, String] = {
-  let sep = "\r\n\r\n"
-  let i   = http_str_index(raw, sep)
-  if i < 0 {
-    Err("parse_response: missing header/body separator (\\r\\n\\r\\n)")
-  } else {
-    let head_block = string_slice(raw, 0, i)
-    let body_start = i + string_length(sep)
-    let body_all   = string_slice(raw, body_start, string_length(raw) - body_start)
-    let lines      = string_split(head_block, "\r\n")
-    match lines {
-      [] -> Err("parse_response: empty header block")
-      [status_line, ...rest] -> match http_parse_status_line(status_line) {
-        Err(e) -> Err(e)
-        Ok(code) -> match http_parse_header_lines(rest, "parse_response") {
-          Err(e) -> Err(e)
-          Ok(hs) -> {
-            # Body framing precedence:
-            #   1. Transfer-Encoding: chunked → dechunk the frames.
-            #   2. Content-Length: N          → take the first N bytes.
-            #   3. Otherwise                  → everything after the
-            #      blank line (recv already drained to peer close).
-            let te = match header_lookup(hs, "Transfer-Encoding") {
-              Some(v) -> string.to_lower(string.trim(v))
-              None    -> ""
-            }
-            let body = if te == "chunked" {
-              dechunk_body(body_all)
-            } else { match header_lookup(hs, "Content-Length") {
-              Some(v) -> match string_to_int(string.trim(v)) {
-                Some(n) ->
-                  if n <= 0 { "" }
-                  else if n >= string_length(body_all) { body_all }
-                  else { string_slice(body_all, 0, n) }
-                None -> body_all
-              }
-              None -> body_all
-            } }
-            Ok(Response { status: code, headers: hs, body: body })
-          }
-        }
-      }
-    }
-  }
-}
+pub fn parse_response(raw: String) : Result[Response, String] =
+  result.flat_map(http_split_head(raw, "parse_response"),
+    (head) => result.flat_map(http_parse_status_line(head.start), (code) => http_build_response(head, code)))
 
 # ---- chunked transfer encoding ------------------------------------
 #
 # A chunked body is a sequence of `<hex-length>\r\n<data>\r\n` frames
 # followed by a `0\r\n\r\n` terminator.
+
+fn http_find_crlf(s: String, i: Int, n: Int) : Int =
+  if i + 1 >= n { -1 }
+  else if string_cp_at(s, i) == 13 and string_cp_at(s, i + 1) == 10 { i }
+  else { http_find_crlf(s, i + 1, n) }
+
+fn http_hex_value(c: Int) : Int =
+  if c >= 48 and c <= 57 { c - 48 }
+  else if c >= 97 and c <= 102 { c - 87 }
+  else if c >= 65 and c <= 70 { c - 55 }
+  else { -1 }
+
+# Value of the leading hex digits; 0 when there are none.
+fn http_parse_hex(s: String, i: Int, n: Int, acc: Int) : Int = {
+  let v = if i >= n { -1 } else { http_hex_value(string_cp_at(s, i)) }
+  if v < 0 { acc } else { http_parse_hex(s, i + 1, n, acc * 16 + v) }
+}
+
+# `parts` holds the decoded chunks, newest first; a frame that cannot be
+# decoded ends the stream.
+fn http_dechunk_loop(s: String, pos: Int, parts: [String]) : String = {
+  let crlf = http_find_crlf(s, pos, string_length(s))
+  let size = if crlf < 0 { 0 } else { http_parse_hex(string_slice(s, pos, crlf - pos), 0, crlf - pos, 0) }
+  if size > 0 { http_dechunk_loop(s, crlf + 2 + size + 2, [string_slice(s, crlf + 2, size), ...parts]) }
+  else { string_concat_all(list_reverse(parts)) }
+}
+
 #[doc("Decodes an HTTP chunked-transfer body into a single contiguous string.")]
 pub fn dechunk_body(s: String) : String = http_dechunk_loop(s, 0, [])
 
-# `parts` holds the decoded chunks, newest first.
-fn http_dechunk_loop(s: String, pos: Int, parts: [String]) : String = {
-  let crlf = http_find_crlf(s, pos)
-  let size = if crlf < 0 { None } else { http_parse_hex(string_slice(s, pos, crlf - pos)) }
-  match size {
-    Some(n) if n > 0 ->
-      # Skip the trailing "\r\n" after the chunk data.
-      http_dechunk_loop(s, crlf + 2 + n + 2, [string_slice(s, crlf + 2, n), ...parts])
-    _ -> string_concat_all(list_reverse(parts))
-  }
-}
-
-fn http_find_crlf(s: String, from: Int) : Int = {
-  let n = string_length(s)
-  if from + 1 >= n { -1 }
-  else { http_find_crlf_loop(s, from, n) }
-}
-
-fn http_find_crlf_loop(s: String, i: Int, n: Int) : Int = {
-  if i + 1 >= n { -1 }
-  else {
-    match char_at(s, i) {
-      None    -> -1
-      Some(c) -> if c == '\r' {
-        match char_at(s, i + 1) {
-          Some(c2) -> if c2 == '\n' { i } else { http_find_crlf_loop(s, i + 1, n) }
-          None     -> -1
-        }
-      } else { http_find_crlf_loop(s, i + 1, n) }
-    }
-  }
-}
-
-fn http_hex_digit_value(c: Char) : Option[Int] = {
-  if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
-  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
-  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
-  else { None }
-}
-
-fn http_parse_hex(s: String) : Option[Int] =
-  http_parse_hex_loop(s, 0, string_length(s), 0)
-
-fn http_parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] = {
-  if i >= n { Some(acc) }
-  else { match char_at(s, i) {
-    None    -> Some(acc)
-    Some(c) -> match http_hex_digit_value(c) {
-      None    -> Some(acc)
-      Some(v) -> http_parse_hex_loop(s, i + 1, n, acc * 16 + v)
-    }
-  } }
-}
-
 # ---- network surface ---------------------------------------------
 
-# Drain a Conn in 4096-byte chunks until the peer closes
-# (`recv` returns `Ok([])`).
-fn http_recv_all_loop(c: Conn, acc: [Int]) : [Int] / NetTcp + Cancel = {
-  match NetTcp.recv(c, 4096) {
-    Err(_)    -> list_reverse(acc)
-    Ok(chunk) -> match chunk {
-      [] -> list_reverse(acc)
-      _  -> http_recv_all_loop(c, http_recv_all_prepend(chunk, acc))
-    }
-  }
-}
-
-# Reverse-prepend `chunk` onto `acc` (caller list_reverses once at
-# the end), avoiding an O(n) `list_append` per chunk.
+# Reverse-prepend `chunk` onto `acc` (callers list_reverse once at the
+# end), avoiding an O(n) `list_append` per chunk.
 fn http_recv_all_prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
   [] -> acc
   [b, ...rest] -> http_recv_all_prepend(rest, [b, ...acc])
+}
+
+# Drain a Conn in 4096-byte chunks until the peer closes or recv fails.
+fn http_recv_all_loop(c: Conn, acc: [Int]) : [Int] / NetTcp + Cancel =
+  match NetTcp.recv(c, 4096) {
+    Err(_) -> list_reverse(acc)
+    Ok([]) -> list_reverse(acc)
+    Ok(chunk) -> http_recv_all_loop(c, http_recv_all_prepend(chunk, acc))
+  }
+
+fn http_failure(body: String) : Response = Response { status: 0, headers: [], body: body }
+
+fn http_exchange(req: Request, u: HttpUrl, c: Conn) : Response / NetTcp + Cancel = {
+  let _   = NetTcp.send(c, string_to_bytes(http_serialize_for(req, u)))
+  let raw = bytes_to_string(http_recv_all_loop(c, []))
+  NetTcp.close(c)
+  match parse_response(raw) {
+    Ok(r)  -> r
+    Err(e) -> http_failure(e)
+  }
 }
 
 #[doc("""
@@ -393,24 +358,17 @@ status `0` and the error in `body`, so callers see the failure
 without a Result wrapper on every call; callers needing per-step
 diagnostics use `NetTcp.*` directly.
 """)]
-pub fn request(req: Request) : Response / NetTcp + Cancel = {
+pub fn request(req: Request) : Response / NetTcp + Cancel =
   match parse_url(req.url) {
-    Err(e) -> Response { status: 0, headers: [], body: e }
+    Err(e) -> http_failure(e)
     Ok(u)  -> match NetTcp.connect(u.host, u.port) {
-      Err(e) -> Response { status: 0, headers: [], body: string_concat("connect: ", e) }
-      Ok(c)  -> {
-        let wire = serialize_request(req)
-        let _    = NetTcp.send(c, string_to_bytes(wire))
-        let raw  = bytes_to_string(http_recv_all_loop(c, []))
-        NetTcp.close(c)
-        match parse_response(raw) {
-          Ok(r)  -> r
-          Err(e) -> Response { status: 0, headers: [], body: e }
-        }
-      }
+      Err(e) -> http_failure(string_concat("connect: ", e))
+      Ok(c)  -> http_exchange(req, u, c)
     }
   }
-}
+
+fn http_simple(method: String, url: String, body: String) : Request =
+  Request { method: method, url: url, headers: [], body: body }
 
 #[doc("""
 Issues a GET request to `url` with no extra headers and returns the response.
@@ -420,40 +378,45 @@ headers build a `Request` and call `request` directly. `post` / `put`
 / `delete` mirror this for their methods.
 """)]
 pub fn get(url: String) : Response / NetTcp + Cancel =
-  request(Request { method: "GET", url: url, headers: [], body: "" })
+  request(http_simple("GET", url, ""))
 
 #[doc("Issues a POST request to `url` carrying `body`, with no extra headers.")]
 pub fn post(url: String, body: String) : Response / NetTcp + Cancel =
-  request(Request { method: "POST", url: url, headers: [], body: body })
+  request(http_simple("POST", url, body))
 
 #[doc("Issues a PUT request to `url` carrying `body`, with no extra headers.")]
 pub fn put(url: String, body: String) : Response / NetTcp + Cancel =
-  request(Request { method: "PUT", url: url, headers: [], body: body })
+  request(http_simple("PUT", url, body))
 
 #[doc("Issues a DELETE request to `url` with no extra headers.")]
 pub fn delete(url: String) : Response / NetTcp + Cancel =
-  request(Request { method: "DELETE", url: url, headers: [], body: "" })
+  request(http_simple("DELETE", url, ""))
 
 # ---- server side --------------------------------------------------
-#
-# Each export below is the dual of a client-side helper above.
 
-# Parse a request line — `METHOD SP PATH SP HTTP/1.1`. Strict: any
-# other framing (extra spaces, HTTP/1.0, HTTP/2 prior knowledge) is
-# rejected. Callers wrap the Err in a 400 Bad Request.
-fn http_parse_request_line(line: String) : Result[HttpReqLine, String] = {
-  let parts = string_split(line, " ")
-  match parts {
-    [m, p, proto] ->
-      if proto == "HTTP/1.1" { Ok(HttpReqLine { method: m, path: p }) }
-      else { Err(string_concat_all(["parse_request: unsupported protocol '", proto, "' (v1 accepts HTTP/1.1 only)"])) }
+# Carrier for request-line parts; callers receive a `Request`.
+type HttpReqLine = { method: String, path: String }
+
+# Strict: `METHOD SP PATH SP HTTP/1.1` and nothing else. Callers wrap the
+# Err in a 400 Bad Request.
+fn http_parse_request_line(line: String) : Result[HttpReqLine, String] =
+  match string_split(line, " ") {
+    [m, p, "HTTP/1.1"] -> Ok(HttpReqLine { method: m, path: p })
+    [_, _, proto] -> Err(string_concat_all(["parse_request: unsupported protocol '", proto, "' (v1 accepts HTTP/1.1 only)"]))
     _ -> Err(string_concat("parse_request: malformed request line: ", line))
   }
-}
 
-# Carrier for request-line parts. Internal — callers receive a
-# `Request` from `parse_request`, not this record.
-type HttpReqLine = { method: String, path: String }
+fn http_build_request(head: HttpHead, rl: HttpReqLine) : Result[Request, String] =
+  result.map(http_parse_header_lines(head.lines, "parse_request"),
+    (hs) => Request { method: rl.method, url: rl.path, headers: hs, body: head.body })
+
+# Request with the body still holding everything after the blank line.
+fn http_parse_request_unframed(raw: String) : Result[Request, String] =
+  result.flat_map(http_split_head(raw, "parse_request"),
+    (head) => result.flat_map(http_parse_request_line(head.start), (rl) => http_build_request(head, rl)))
+
+fn http_with_body(r: Request, body: String) : Request =
+  Request { method: r.method, url: r.url, headers: r.headers, body: body }
 
 #[doc("""
 Parse a complete HTTP/1.1 request: request line + headers + body.
@@ -461,64 +424,32 @@ Body length is read from `Content-Length`; an absent header means
 an empty body. `Request.url` is the request-line path — the
 absolute URL is never on the wire.
 """)]
-pub fn parse_request(raw: String) : Result[Request, String] = {
-  let sep = "\r\n\r\n"
-  let i   = http_str_index(raw, sep)
-  if i < 0 {
-    Err("parse_request: missing header/body separator (\\r\\n\\r\\n)")
-  } else {
-    let head_block = string_slice(raw, 0, i)
-    let body_start = i + string_length(sep)
-    let body_all   = string_slice(raw, body_start, string_length(raw) - body_start)
-    let lines      = string_split(head_block, "\r\n")
-    match lines {
-      [] -> Err("parse_request: empty header block")
-      [req_line, ...rest] -> match http_parse_request_line(req_line) {
-        Err(e) -> Err(e)
-        Ok(rl) -> match http_parse_header_lines(rest, "parse_request") {
-          Err(e) -> Err(e)
-          Ok(hs) -> {
-            let body = match header_lookup(hs, "Content-Length") {
-              Some(v) -> match string_to_int(string.trim(v)) {
-                Some(n) ->
-                  if n <= 0 { "" }
-                  else if n >= string_length(body_all) { body_all }
-                  else { string_slice(body_all, 0, n) }
-                None -> body_all
-              }
-              None -> body_all
-            }
-            Ok(Request { method: rl.method, url: rl.path, headers: hs, body: body })
-          }
-        }
-      }
-    }
-  }
-}
+pub fn parse_request(raw: String) : Result[Request, String] =
+  result.map(http_parse_request_unframed(raw), (r) => http_with_body(r, http_frame_body(r.headers, r.body)))
 
 #[doc("""
 Status code → reason phrase. Codes outside the table fall through
 to "OK" so the wire stays well-formed — the status code carries
 the semantics, the reason phrase is informational.
 """)]
-pub fn status_reason(code: Int) : String =
-  if      code == 200 { "OK" }
-  else if code == 201 { "Created" }
-  else if code == 202 { "Accepted" }
-  else if code == 204 { "No Content" }
-  else if code == 301 { "Moved Permanently" }
-  else if code == 302 { "Found" }
-  else if code == 304 { "Not Modified" }
-  else if code == 400 { "Bad Request" }
-  else if code == 401 { "Unauthorized" }
-  else if code == 403 { "Forbidden" }
-  else if code == 404 { "Not Found" }
-  else if code == 405 { "Method Not Allowed" }
-  else if code == 409 { "Conflict" }
-  else if code == 500 { "Internal Server Error" }
-  else if code == 502 { "Bad Gateway" }
-  else if code == 503 { "Service Unavailable" }
-  else { "OK" }
+pub fn status_reason(code: Int) : String = match code {
+  201 -> "Created"
+  202 -> "Accepted"
+  204 -> "No Content"
+  301 -> "Moved Permanently"
+  302 -> "Found"
+  304 -> "Not Modified"
+  400 -> "Bad Request"
+  401 -> "Unauthorized"
+  403 -> "Forbidden"
+  404 -> "Not Found"
+  405 -> "Method Not Allowed"
+  409 -> "Conflict"
+  500 -> "Internal Server Error"
+  502 -> "Bad Gateway"
+  503 -> "Service Unavailable"
+  _   -> "OK"
+}
 
 #[doc("""
 Serialise a `Response` to wire bytes (HTTP/1.1 framing). Emitted
@@ -529,16 +460,15 @@ block:
   \r\n
   <body>
 `Content-Length` is auto-emitted; user headers are appended
-verbatim. Reuses `http_format_headers`. Callers wanting
-`Connection: close` add it to `resp.headers` themselves.
+verbatim. Callers wanting `Connection: close` add it to
+`resp.headers` themselves.
 """)]
-pub fn serialize_response(resp: Response) : String = {
-  let reason = status_reason(resp.status)
-  let line1  = string_concat_all(["HTTP/1.1 ", int_to_string(resp.status), " ", reason, "\r\n"])
-  let clen   = string_concat_all(["Content-Length: ", int_to_string(string_length(resp.body)), "\r\n"])
-  let extra  = http_format_headers(resp.headers)
-  string_concat_all([line1, clen, extra, "\r\n", resp.body])
-}
+pub fn serialize_response(resp: Response) : String =
+  string_concat_all([
+    "HTTP/1.1 ", int_to_string(resp.status), " ", status_reason(resp.status), "\r\n",
+    http_content_length_line(resp.body),
+    http_format_headers(resp.headers), "\r\n", resp.body
+  ])
 
 #[doc("""
 Read a full HTTP/1.1 request off `conn`, capped at `max_bytes` to
@@ -551,76 +481,47 @@ answer 413.
 pub fn read_request(conn: Conn, max_bytes: Int) : Result[Request, String] / NetTcp =
   http_read_request_loop(conn, [], 0, max_bytes)
 
-fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
-    : Result[Request, String] / NetTcp = {
-  if have > max_bytes {
-    Err(string_concat_all(["read_request: exceeded max_bytes=", int_to_string(max_bytes)]))
-  } else { match http_request_ready(acc_rev, have) {
-    Some(req) -> Ok(req)
-    None      -> match NetTcp.recv(conn, 4096) {
-      Err(e) -> Err(string_concat("read_request: ", e))
-      Ok(chunk) -> match chunk {
-        [] -> {
-          # Peer closed early: surface the accumulator if it parses
-          # (e.g. a GET with no Content-Length), else report truncation.
-          let raw = bytes_to_string(list_reverse(acc_rev))
-          match parse_request(raw) {
-            Ok(r) -> match header_lookup(r.headers, "Content-Length") {
-              Some(v) -> match string_to_int(string.trim(v)) {
-                Some(n) if n > string_length(r.body) ->
-                  Err("read_request: peer closed before request complete")
-                _ -> Ok(r)
-              }
-              None -> Ok(r)
-            }
-            Err(_) -> Err("read_request: peer closed before request complete")
-          }
-        }
-        _ -> {
-          let next_acc = http_recv_all_prepend(chunk, acc_rev)
-          let next_have = have + list_length(chunk)
-          http_read_request_loop(conn, next_acc, next_have, max_bytes)
-        }
-      }
-    }
-  } }
-}
+fn http_closed_early() : Result[Request, String] =
+  Err("read_request: peer closed before request complete")
 
-# Probe the in-flight buffer: Some(req) once it holds a complete
-# request (separator present and body covers `Content-Length`, or no
-# Content-Length), else None so the caller does another recv.
-fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
-  let raw = bytes_to_string(list_reverse(acc_rev))
-  let sep = "\r\n\r\n"
-  let i   = http_str_index(raw, sep)
-  if i < 0 { None }
-  else {
-    let head_block = string_slice(raw, 0, i)
-    let body_start = i + string_length(sep)
-    let body_all   = string_slice(raw, body_start, string_length(raw) - body_start)
-    let lines      = string_split(head_block, "\r\n")
-    match lines {
-      [] -> None
-      [req_line, ...rest] -> match http_parse_request_line(req_line) {
-        Err(_) -> None
-        Ok(rl) -> match http_parse_header_lines(rest, "parse_request") {
-          Err(_) -> None
-          Ok(hs) -> match header_lookup(hs, "Content-Length") {
-            None -> Some(Request { method: rl.method, url: rl.path,
-                                   headers: hs, body: body_all })
-            Some(v) -> string_to_int(string.trim(v)) || n => if n <= 0 {
-                Some(Request { method: rl.method, url: rl.path,
-                               headers: hs, body: "" })
-              } else if string_length(body_all) >= n {
-                Some(Request { method: rl.method, url: rl.path, headers: hs,
-                               body: string_slice(body_all, 0, n) })
-              } else { None }
-          }
-        }
+# Peer closed: Ok only when `Content-Length` is unusable, since a numeric
+# length would already have completed the request or left it truncated.
+fn http_finish_on_close(acc_rev: [Int]) : Result[Request, String] =
+  match parse_request(bytes_to_string(list_reverse(acc_rev))) {
+    Ok(r) if http_content_length(r.headers) == None -> Ok(r)
+    _ -> http_closed_early()
+  }
+
+# Some(req) once the buffer holds a complete request; None to recv more.
+fn http_request_ready(acc_rev: [Int]) : Option[Request] =
+  match http_parse_request_unframed(bytes_to_string(list_reverse(acc_rev))) {
+    Err(_) -> None
+    Ok(r)  -> match header_lookup(r.headers, "Content-Length") {
+      None    -> Some(r)
+      Some(v) -> match string_to_int(v) {
+        Some(n) if string_length(r.body) >= n -> Some(http_with_body(r, http_clamp_body(r.body, n)))
+        _ -> None
       }
     }
   }
-}
+
+fn http_read_more(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
+    : Result[Request, String] / NetTcp =
+  match NetTcp.recv(conn, 4096) {
+    Err(e) -> Err(string_concat("read_request: ", e))
+    Ok([]) -> http_finish_on_close(acc_rev)
+    Ok(chunk) -> http_read_request_loop(conn, http_recv_all_prepend(chunk, acc_rev),
+                                        have + list_length(chunk), max_bytes)
+  }
+
+fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
+    : Result[Request, String] / NetTcp =
+  if have > max_bytes {
+    Err(string_concat_all(["read_request: exceeded max_bytes=", int_to_string(max_bytes)]))
+  } else { match http_request_ready(acc_rev) {
+    Some(req) -> Ok(req)
+    None      -> http_read_more(conn, acc_rev, have, max_bytes)
+  } }
 
 # ---- redirect following -------------------------------------------
 
@@ -653,23 +554,17 @@ pub fn default_redirect_policy() : RedirectPolicy = RedirectPolicy {
   preserve_method_307_308: true,
 }
 
-fn http_resolve_redirect_url(orig_url: String, loc: String) : String = {
-  if string.starts_with(loc, "http://") or string.starts_with(loc, "https://") {
-    loc
-  } else if string.starts_with(loc, "//") {
-    match parse_url(orig_url) {
-      Err(_) -> loc
-      Ok(u) -> string_concat_all([u.scheme, ":", loc])
-    }
-  } else if string.starts_with(loc, "/") {
-    match parse_url(orig_url) {
-      Err(_) -> loc
-      Ok(u)  -> string_concat_all([u.scheme, "://", u.host, ":", int_to_string(u.port), loc])
-    }
-  } else {
-    loc
+# Absolute-path and network-path references resolve against `orig`;
+# anything else is returned as written.
+fn http_resolve_redirect_url(orig_url: String, loc: String) : String =
+  match parse_url(orig_url) {
+    Err(_) -> loc
+    Ok(u)  ->
+      if string.starts_with(loc, "//") { string_concat_all([u.scheme, ":", loc]) }
+      else if string.starts_with(loc, "/") {
+        string_concat_all([u.scheme, "://", u.host, ":", int_to_string(u.port), loc])
+      } else { loc }
   }
-}
 
 fn http_same_origin(from: String, to: String) : Bool =
   match parse_url(from) {
@@ -691,52 +586,49 @@ fn http_redirect_header(h: HttpHeader, same_origin: Bool) : Bool = {
 fn http_redirect_headers(hs: [HttpHeader], same_origin: Bool) : [HttpHeader] =
   list.filter(hs, (h) => http_redirect_header(h, same_origin))
 
+# POST becomes GET on 301 / 302 and, per policy, 303; 307 / 308 and every
+# other method keep the verb.
+fn http_redirect_method(orig: Request, status: Int, policy: RedirectPolicy) : String =
+  if orig.method == "POST"
+     and (status == 301 or status == 302 or (status == 303 and policy.rewrite_post_to_get_on_303)) {
+    "GET"
+  } else { orig.method }
+
 fn http_build_next_request(orig: Request, status: Int, loc: String,
                            policy: RedirectPolicy) : Request = {
-  let new_method =
-    if status == 303 and policy.rewrite_post_to_get_on_303 and orig.method == "POST" {
-      "GET"
-    } else if (status == 307 or status == 308) and policy.preserve_method_307_308 {
-      orig.method
-    } else if (status == 301 or status == 302) and orig.method == "POST" {
-      "GET"
-    } else {
-      orig.method
-    }
-  let new_body = if new_method == "GET" { "" } else { orig.body }
-  let new_url  = http_resolve_redirect_url(orig.url, loc)
-  let headers = http_redirect_headers(orig.headers, http_same_origin(orig.url, new_url))
-  Request { method: new_method, url: new_url, headers: headers, body: new_body }
+  let method  = http_redirect_method(orig, status, policy)
+  let new_url = http_resolve_redirect_url(orig.url, loc)
+  Request {
+    method: method,
+    url: new_url,
+    headers: http_redirect_headers(orig.headers, http_same_origin(orig.url, new_url)),
+    body: if method == "GET" { "" } else { orig.body }
+  }
 }
 
-# Inner loop — one hop per recursive call. `n_redirects` is the hop
-# index of the *current* request, compared against `max_redirects`
-# *before* issuing so a policy of 0 redirects still lets the initial
-# request through.
-fn http_follow_loop(req: Request, policy: RedirectPolicy, n_redirects: Int)
-    : Result[Response, String] / NetTcp + Cancel = {
-  if n_redirects > policy.max_redirects {
-    Err(string_concat_all([
-      "too many redirects (max ", int_to_string(policy.max_redirects), ")"
+fn http_follow_hop(req: Request, resp: Response, policy: RedirectPolicy, n_redirects: Int)
+    : Result[Response, String] / NetTcp + Cancel =
+  match header_lookup(resp.headers, "Location") {
+    None -> Err(string_concat_all([
+      "redirect missing Location header at status ", int_to_string(resp.status)
     ]))
+    Some(loc) -> http_follow_loop(http_build_next_request(req, resp.status, loc, policy),
+                                  policy, n_redirects + 1)
+  }
+
+# One hop per call. `n_redirects` is the index of the current request,
+# compared against `max_redirects` before issuing so a policy of 0 still
+# lets the initial request through.
+fn http_follow_loop(req: Request, policy: RedirectPolicy, n_redirects: Int)
+    : Result[Response, String] / NetTcp + Cancel =
+  if n_redirects > policy.max_redirects {
+    Err(string_concat_all(["too many redirects (max ", int_to_string(policy.max_redirects), ")"]))
   } else {
     let resp = request(req)
     if list.contains(policy.follow_3xx, resp.status) {
-      match header_lookup(resp.headers, "Location") {
-        None -> Err(string_concat_all([
-          "redirect missing Location header at status ",
-          int_to_string(resp.status)
-        ]))
-        Some(loc) -> {
-          let next_req = http_build_next_request(req, resp.status, loc, policy)
-          http_follow_loop(next_req, policy, n_redirects + 1)
-        }
-      }
-    } else {
-      Ok(resp)
-    }
+      http_follow_hop(req, resp, policy, n_redirects)
+    } else { Ok(resp) }
   }
-}
 
 #[doc("""
 Public entry point — issue the request and follow 3xx redirects
@@ -767,25 +659,22 @@ a non-default policy build a `Request` and call `follow` directly.
 `post_follow` / `put_follow` / `delete_follow` mirror this for their methods.
 """)]
 pub fn get_follow(url: String) : Result[Response, String] / NetTcp + Cancel =
-  follow(Request { method: "GET", url: url, headers: [], body: "" },
-              default_redirect_policy())
+  follow(http_simple("GET", url, ""), default_redirect_policy())
 
 #[doc("Like `post`, but follows 3xx redirects per the default policy and returns a `Result`.")]
 pub fn post_follow(url: String, body: String)
     : Result[Response, String] / NetTcp + Cancel =
-  follow(Request { method: "POST", url: url, headers: [], body: body },
-              default_redirect_policy())
+  follow(http_simple("POST", url, body), default_redirect_policy())
 
 #[doc("Like `put`, but follows 3xx redirects per the default policy and returns a `Result`.")]
 pub fn put_follow(url: String, body: String)
     : Result[Response, String] / NetTcp + Cancel =
-  follow(Request { method: "PUT", url: url, headers: [], body: body },
-              default_redirect_policy())
+  follow(http_simple("PUT", url, body), default_redirect_policy())
 
 #[doc("Like `delete`, but follows 3xx redirects per the default policy and returns a `Result`.")]
 pub fn delete_follow(url: String) : Result[Response, String] / NetTcp + Cancel =
-  follow(Request { method: "DELETE", url: url, headers: [], body: "" },
-              default_redirect_policy())
+  follow(http_simple("DELETE", url, ""), default_redirect_policy())
+
 test "redirect origin uses host case and effective port" {
   assert(http_same_origin("http://EXAMPLE.test/a", "http://example.test:80/b"))
   assert(not http_same_origin("http://example.test/a", "http://example.test:81/a"))
