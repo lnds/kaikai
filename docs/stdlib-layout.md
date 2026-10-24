@@ -294,6 +294,7 @@ stdlib/
     base64.kai   (shipped)
     hex.kai      (shipped)
   regexp.kai     pure, stage 2 (top-level — shipped 2026-04-28)
+  regexp/        syntax.kai (AST + parser), engine.kai (NFA builder) — shipped
   crypto/        pure, stage 2 (shipped via PR #146)
     hash.kai     sha256, sha512 (blake3 NOT shipped — deferred to S3)
     mac.kai      hmac_sha256, hmac_sha512
@@ -588,6 +589,10 @@ manutara's first design pass exercises them.
 - `regexp` — `regex_compile`, `regex_match`, `regex_find_all`,
   `regex_replace`, `regex_split` (top-level module). Pre-m14
   flat-prefix names; rename to `regexp.match` etc. lands in m14.
+- `regexp.syntax` — pattern AST types, `parse_pattern`, `ast_show`
+  *(shipped)*. `regexp.engine` — NFA types, `compile_nfa`, `nfa_show`
+  *(shipped)*. Debug/tooling surface; `regexp` simulates the NFA
+  (`simulate`) and holds `Match`, `Capture`, `Regex` and the API.
 - `matches`, `regex_compile_or_panic` — refinement-side helpers
   added 2026-05-03 to support the `~r/.../` sigil + `where matches
   ~r/.../` predicate (m12.6.x #7, closing issue #85). Both are

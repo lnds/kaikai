@@ -62,7 +62,7 @@ net/  tcp.kai http.kai
 os/  args.kai env.kai
 top-level: actor.kai array.kai date.kai decimal.kai effects.kai
            gen.kai log.kai loop.kai money.kai path.kai protocols.kai
-           random.kai random_secure.kai reader.kai regexp.kai
+           random.kai random_secure.kai reader.kai regexp.kai regexp/syntax.kai regexp/engine.kai
            seq.kai spawn.kai time.kai trace.kai uuid.kai writer.kai
 ```
 
