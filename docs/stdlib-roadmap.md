@@ -55,7 +55,7 @@ What ships in `stdlib/` today:
 core/   list.kai string.kai option.kai result.kai char.kai tuple.kai io.kai
 collections/  map.kai hashmap.kai set.kai hashset.kai stack.kai queue.kai vec.kai
 math/  int.kai real.kai numeric.kai bits.kai complex.kai
-crypto/  hash.kai mac.kai
+crypto/  hash.kai mac.kai legacy.kai
 encoding/  json.kai json_bind.kai toml.kai toml_lex.kai toml_tree.kai base64.kai hex.kai
 fs/  file.kai dir.kai path.kai
 net/  tcp.kai http.kai
@@ -79,6 +79,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `time` Clock default handler            | shipped via PR #134 — `kai_default_clock_wall_now`, `kai_default_clock_monotonic_now`, `kai_default_clock_sleep_ns` are wired  |
 | `web/dom`, `web/timer`, `web/fetch`, `web/storage`, `web/run` | shipped via #3136: the browser stdlib as ordinary effects over `extern "js"`; events delivered as values through a host queue, `next_event` parks the fiber until the page posts |
 | `crypto/hash`, `crypto/mac`             | shipped via PR #146 (S2 #5): 626 LOC pure-Kai SHA-256/SHA-512 + 83 LOC HMAC                                                    |
+| `crypto/legacy`                         | shipped via PR #3153: pure-Kai SHA-1 (RFC 3174) and MD5 (RFC 1321) for interoperability; broken for security                   |
 | `random_secure`                         | shipped via PR #144 (closes #140): 44 LOC, 2 public fns over `getrandom(2)` / `arc4random_buf`                                 |
 | `log` (stdlib minimal)                  | shipped via PR #145 (S2 #7, closes #141): 52 LOC, 4 public fns (`log_debug/info/warn/error`) over a default `Log` handler      |
 | `concurrent/nursery`                    | shipped — `pub fn nursery[T, e]` lives in `stdlib/spawn.kai:95` (top-level, not a `concurrent/` subdir)                        |
