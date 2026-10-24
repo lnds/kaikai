@@ -300,6 +300,7 @@ stdlib/
   regexp/        syntax.kai (AST + parser), engine.kai (NFA builder) — shipped
   crypto/        pure, stage 2 (shipped via PR #146)
     hash.kai     sha256, sha512 (blake3 NOT shipped — deferred to S3)
+    legacy.kai   sha1, md5 (interoperability only; broken for security)
     mac.kai      hmac_sha256, hmac_sha512
   concurrent/    effects: Spawn, Cancel (Actor[Msg] deferred to docs/actors.md)
                  NOTE: `concurrent/` subdirectory does NOT exist on disk;
@@ -622,7 +623,8 @@ LLVM backends.
 
 ### crypto (pure, stage 2 — shipped via PR #146)
 
-- `crypto.hash` — `sha256`, `sha512` *(shipped)*. `blake3` and the legacy hashes (`sha1`, `md5`) *(planned — no tracking issue; deferred to S3)*.
+- `crypto.hash` — `sha256`, `sha512` *(shipped)*. `blake3` *(planned — no tracking issue; deferred to S3)*.
+- `crypto.legacy` — `sha1`, `md5` *(shipped)*. Broken for security; a separate module so the import flags legacy use (WebSocket handshake, git object ids, UUID v3/v5, ETags).
 - `crypto.mac` — `hmac_sha256`, `hmac_sha512` *(shipped)*
 
 Symmetric and asymmetric ciphers deferred to post-MVP — the design
