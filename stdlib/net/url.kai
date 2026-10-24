@@ -1,0 +1,481 @@
+#[doc("""
+RFC 3986 URI references — parse, print, resolve, and percent-coding.
+`import net.url`, reached qualified (`url.parse(s)`).
+
+Components are kept as written: `parse` does no case folding, no
+percent-decoding and no dot-segment removal, so `to_string(parse(s)) == s`
+for every `s` that `parse` accepts (an empty port is the one exception: it
+prints without the `:`). Offsets in error messages are byte offsets into
+the input.
+
+This is RFC 3986, not the WHATWG URL Standard: no backslash handling, no
+IDNA, no special schemes, and `+` is an ordinary character.
+""")]
+
+# ---- types --------------------------------------------------------
+
+#[doc("""
+A URI reference split into its RFC 3986 components, each exactly as
+written (still percent-encoded). Absent components are `None`:
+`scheme` is `None` for a relative reference; `host` is `None` when there
+is no `//` authority and `Some("")` for an empty one (`file:///x`);
+`port` is `None` when absent or empty; `path` is always present and may
+be empty; `query` / `fragment` are `None` without the `?` / `#`, and
+`Some("")` with it. `host` keeps the brackets of an IP literal.
+""")]
+pub type Url = {
+  scheme: Option[String],
+  userinfo: Option[String],
+  host: Option[String],
+  port: Option[Int],
+  path: String,
+  query: Option[String],
+  fragment: Option[String],
+}
+
+# ---- byte classes -------------------------------------------------
+
+fn url_is_alpha(b: Int) : Bool = (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+
+fn url_is_digit(b: Int) : Bool = b >= 48 and b <= 57
+
+fn url_is_unreserved(b: Int) : Bool =
+  url_is_alpha(b) or url_is_digit(b) or b == 45 or b == 46 or b == 95 or b == 126
+
+# ! $ & ' ( ) * + , ; =
+fn url_is_sub_delim(b: Int) : Bool =
+  b == 33 or b == 36 or (b >= 38 and b <= 44) or b == 59 or b == 61
+
+fn url_is_scheme_char(b: Int) : Bool =
+  url_is_alpha(b) or url_is_digit(b) or b == 43 or b == 45 or b == 46
+
+fn url_is_reg_name(b: Int) : Bool = url_is_unreserved(b) or url_is_sub_delim(b)
+
+fn url_is_userinfo(b: Int) : Bool = url_is_reg_name(b) or b == 58
+
+fn url_is_pchar(b: Int) : Bool = url_is_userinfo(b) or b == 64
+
+fn url_is_path(b: Int) : Bool = url_is_pchar(b) or b == 47
+
+fn url_is_query(b: Int) : Bool = url_is_path(b) or b == 63
+
+fn url_is_ipv6(b: Int) : Bool = url_hex_value(b) >= 0 or b == 58 or b == 46
+
+fn url_hex_value(b: Int) : Int =
+  if b >= 48 and b <= 57 { b - 48 }
+  else if b >= 65 and b <= 70 { b - 55 }
+  else if b >= 97 and b <= 102 { b - 87 }
+  else { -1 }
+
+# ---- scanning -----------------------------------------------------
+
+# First offset of byte `b` in [from, to), or -1.
+fn url_find(s: String, b: Int, from: Int, to: Int) : Int =
+  if from >= to { -1 }
+  else if string_byte_at_int(s, from) == b { from }
+  else { url_find(s, b, from + 1, to) }
+
+# Last offset of byte `b` at or before `i`, or -1.
+fn url_find_last(s: String, b: Int, i: Int) : Int =
+  if i < 0 { -1 }
+  else if string_byte_at_int(s, i) == b { i }
+  else { url_find_last(s, b, i - 1) }
+
+fn url_after(s: String, at: Int) : String = string_slice(s, at, string_length(s) - at)
+
+fn url_range(s: String, from: Int, to: Int) : String = string_slice(s, from, to - from)
+
+# A '%' at `i` needs two hex digits inside [.., stop).
+fn url_escape_ok(s: String, i: Int, stop: Int) : Bool =
+  i + 2 < stop
+    and url_hex_value(string_byte_at_int(s, i + 1)) >= 0
+    and url_hex_value(string_byte_at_int(s, i + 2)) >= 0
+
+fn url_check_byte(s: String, i: Int, stop: Int, ok: (Int) -> Bool, what: String)
+    : Result[Int, String] = {
+  let b = string_byte_at_int(s, i)
+  if b == 37 {
+    if url_escape_ok(s, i, stop) { Ok(i + 3) }
+    else { Err(string_concat_all(["parse: bad percent escape in ", what, " at offset ", int_to_string(i)])) }
+  }
+  else if ok(b) { Ok(i + 1) }
+  else { Err(string_concat_all(["parse: invalid character in ", what, " at offset ", int_to_string(i)])) }
+}
+
+# Every byte of [i, stop) is in `ok` or a well-formed percent escape.
+fn url_check(s: String, i: Int, stop: Int, ok: (Int) -> Bool, what: String)
+    : Result[Unit, String] =
+  if i >= stop { Ok(()) }
+  else { match url_check_byte(s, i, stop, ok, what) {
+    Err(e) -> Err(e)
+    Ok(next) -> url_check(s, next, stop, ok, what)
+  } }
+
+# ---- parsing ------------------------------------------------------
+
+fn url_check_scheme(s: String, end: Int) : Result[Unit, String] =
+  if end == 0 { Err("parse: empty scheme at offset 0") }
+  else if not url_is_alpha(string_byte_at_int(s, 0)) { Err("parse: invalid character in scheme at offset 0") }
+  else { url_check(s, 1, end, url_is_scheme_char, "scheme") }
+
+fn url_slice_opt(s: String, from: Int, to: Int) : Option[String] =
+  Some(url_range(s, from, to))
+
+# Optional trailing component introduced by a delimiter at `at` (-1 = absent).
+fn url_component(s: String, at: Int, stop: Int, what: String) : Result[Option[String], String] =
+  if at < 0 { Ok(None) }
+  else { match url_check(s, at + 1, stop, url_is_query, what) {
+    Err(e) -> Err(e)
+    Ok(_)  -> Ok(url_slice_opt(s, at + 1, stop))
+  } }
+
+
+# First offset in [i, to) whose byte fails `ok`, or -1. No escapes.
+fn url_first_bad(s: String, i: Int, to: Int, ok: (Int) -> Bool) : Int =
+  if i >= to { -1 }
+  else if ok(string_byte_at_int(s, i)) { url_first_bad(s, i + 1, to, ok) }
+  else { i }
+
+fn url_port_error(what: String, at: Int) : String =
+  string_concat_all(["parse: ", what, " in port at offset ", int_to_string(at)])
+
+fn url_port_range(s: String, from: Int, to: Int) : Result[Option[Int], String] =
+  match string_to_int(url_range(s, from, to)) {
+    Some(p) if p <= 65535 -> Ok(Some(p))
+    _ -> Err(url_port_error("value out of range", from))
+  }
+
+# Nine digits cannot overflow, so the range test is exact.
+fn url_port_digits(s: String, from: Int, to: Int) : Result[Option[Int], String] = {
+  let bad = url_first_bad(s, from, to, url_is_digit)
+  if bad >= 0 { Err(url_port_error("invalid character", bad)) }
+  else if to - from > 9 { Err(url_port_error("value out of range", from)) }
+  else { url_port_range(s, from, to) }
+}
+
+fn url_port_value(s: String, from: Int, to: Int) : Result[Option[Int], String] =
+  if from >= to { Ok(None) } else { url_port_digits(s, from, to) }
+
+type UrlHostPort = { host: String, port: Option[Int] }
+
+type UrlAuthority = { userinfo: Option[String], host: String, port: Option[Int] }
+
+fn url_host_port(s: String, host: String, colon: Int, to: Int) : Result[UrlHostPort, String] =
+  if colon < 0 { Ok(UrlHostPort { host: host, port: None }) }
+  else { match url_port_value(s, colon + 1, to) {
+    Err(e) -> Err(e)
+    Ok(p)  -> Ok(UrlHostPort { host: host, port: p })
+  } }
+
+fn url_ip_error(what: String, at: Int) : Result[Unit, String] =
+  Err(string_concat_all(["parse: ", what, " at offset ", int_to_string(at)]))
+
+# IPvFuture: `v`, then allowed characters, one of them '.'.
+fn url_check_ip_future(s: String, from: Int, to: Int) : Result[Unit, String] = {
+  let bad = url_first_bad(s, from + 1, to, url_is_userinfo)
+  if bad >= 0 { url_ip_error("invalid character in IP literal", bad) }
+  else if url_find(s, 46, from, to) < 0 { url_ip_error("malformed IP literal", from) }
+  else { Ok(()) }
+}
+
+# IPv6 by character class: hex digits, ':' and '.', at least one ':'.
+fn url_check_ip_v6(s: String, from: Int, to: Int) : Result[Unit, String] = {
+  let bad = url_first_bad(s, from, to, url_is_ipv6)
+  if bad >= 0 { url_ip_error("invalid character in IP literal", bad) }
+  else if url_find(s, 58, from, to) < 0 { url_ip_error("malformed IP literal", from) }
+  else { Ok(()) }
+}
+
+fn url_check_ip_literal(s: String, from: Int, to: Int) : Result[Unit, String] =
+  if from >= to { url_ip_error("empty IP literal", from) }
+  else {
+    let first = string_byte_at_int(s, from)
+    if first == 118 or first == 86 { url_check_ip_future(s, from, to) }
+    else { url_check_ip_v6(s, from, to) }
+  }
+
+fn url_ip_literal_tail(s: String, from: Int, close: Int, to: Int) : Result[UrlHostPort, String] =
+  if close + 1 == to { url_host_port(s, url_range(s, from, to), -1, to) }
+  else if string_byte_at_int(s, close + 1) == 58 {
+    url_host_port(s, url_range(s, from, close + 1), close + 1, to)
+  } else {
+    Err(string_concat_all(["parse: invalid character after IP literal at offset ", int_to_string(close + 1)]))
+  }
+
+fn url_parse_ip_literal(s: String, from: Int, to: Int) : Result[UrlHostPort, String] = {
+  let close = url_find(s, 93, from, to)
+  if close < 0 { Err(string_concat_all(["parse: unterminated IP literal at offset ", int_to_string(from)])) }
+  else { match url_check_ip_literal(s, from + 1, close) {
+    Err(e) -> Err(e)
+    Ok(_)  -> url_ip_literal_tail(s, from, close, to)
+  } }
+}
+
+fn url_parse_host_port(s: String, from: Int, to: Int) : Result[UrlHostPort, String] =
+  if from < to and string_byte_at_int(s, from) == 91 { url_parse_ip_literal(s, from, to) }
+  else {
+    let colon = url_find(s, 58, from, to)
+    let host_end = if colon < 0 { to } else { colon }
+    match url_check(s, from, host_end, url_is_reg_name, "host") {
+      Err(e) -> Err(e)
+      Ok(_)  -> url_host_port(s, url_range(s, from, host_end), colon, to)
+    }
+  }
+
+fn url_authority_rest(s: String, userinfo: Option[String], from: Int, to: Int)
+    : Result[UrlAuthority, String] =
+  match url_parse_host_port(s, from, to) {
+    Err(e) -> Err(e)
+    Ok(hp) -> Ok(UrlAuthority { userinfo: userinfo, host: hp.host, port: hp.port })
+  }
+
+fn url_parse_authority(s: String, from: Int, to: Int) : Result[UrlAuthority, String] = {
+  let at = url_find(s, 64, from, to)
+  if at < 0 { url_authority_rest(s, None, from, to) }
+  else { match url_check(s, from, at, url_is_userinfo, "userinfo") {
+    Err(e) -> Err(e)
+    Ok(_)  -> url_authority_rest(s, Some(url_range(s, from, at)), at + 1, to)
+  } }
+}
+
+fn url_with_path(s: String, u: Url, from: Int, end: Int) : Result[Url, String] =
+  match url_check(s, from, end, url_is_path, "path") {
+    Err(e) -> Err(e)
+    Ok(_)  -> Ok(Url { ...u, path: url_range(s, from, end) })
+  }
+
+fn url_has_authority(s: String, from: Int, end: Int) : Bool =
+  from + 1 < end and string_byte_at_int(s, from) == 47 and string_byte_at_int(s, from + 1) == 47
+
+fn url_parse_hier(s: String, u: Url, from: Int, end: Int) : Result[Url, String] =
+  if url_has_authority(s, from, end) {
+    let slash = url_find(s, 47, from + 2, end)
+    let auth_end = if slash < 0 { end } else { slash }
+    match url_parse_authority(s, from + 2, auth_end) {
+      Err(e) -> Err(e)
+      Ok(a)  -> url_with_path(
+        s, Url { ...u, userinfo: a.userinfo, host: Some(a.host), port: a.port }, auth_end, end)
+    }
+  } else { url_with_path(s, u, from, end) }
+
+# A ':' starts a scheme only before the first '/'; otherwise it belongs to the path.
+fn url_parse_front(s: String, u: Url, end: Int) : Result[Url, String] = {
+  let slash = url_find(s, 47, 0, end)
+  let colon = url_find(s, 58, 0, if slash < 0 { end } else { slash })
+  if colon < 0 { url_parse_hier(s, u, 0, end) }
+  else { match url_check_scheme(s, colon) {
+    Err(e) -> Err(e)
+    Ok(_)  -> url_parse_hier(s, Url { ...u, scheme: Some(url_range(s, 0, colon)) }, colon + 1, end)
+  } }
+}
+
+fn url_parse_tail(s: String, q: Int, end: Int, fragment: Option[String])
+    : Result[Url, String] =
+  match url_component(s, q, end, "query") {
+    Err(e)    -> Err(e)
+    Ok(query) -> url_parse_front(s, Url {
+      scheme: None, userinfo: None, host: None, port: None,
+      path: "", query: query, fragment: fragment
+    }, if q < 0 { end } else { q })
+  }
+
+#[doc("""
+Parses a URI reference (absolute URI or relative reference) per RFC 3986.
+Returns `Err("parse: <what> at offset <n>")` for a character outside the
+component's grammar, a malformed `%` escape, an empty or invalid scheme,
+an unterminated or malformed `[...]` IP literal, or a port that is not
+0-65535. Bracketed IPv6 is checked by character class, not full grammar.
+""")]
+pub fn parse(s: String) : Result[Url, String] = {
+  let n = string_length(s)
+  let hash = url_find(s, 35, 0, n)
+  let end = if hash < 0 { n } else { hash }
+  match url_component(s, hash, n, "fragment") {
+    Err(e)       -> Err(e)
+    Ok(fragment) -> url_parse_tail(s, url_find(s, 63, 0, end), end, fragment)
+  }
+}
+
+# ---- printing -----------------------------------------------------
+
+fn url_prefixed(prefix: String, o: Option[String]) : String = match o {
+  Some(x) -> string_concat(prefix, x)
+  None    -> ""
+}
+
+fn url_authority_string(u: Url, host: String) : String =
+  string_concat_all([
+    "//",
+    match u.userinfo { Some(x) -> string_concat(x, "@")  None -> "" },
+    host,
+    match u.port { Some(p) -> string_concat(":", int_to_string(p))  None -> "" }
+  ])
+
+#[doc("""
+Prints `u` per RFC 3986 §5.3. Components are written as held, never
+encoded: `to_string(parse(s)) == s` for every accepted `s` without an
+empty port.
+""")]
+pub fn to_string(u: Url) : String =
+  string_concat_all([
+    match u.scheme { Some(x) -> string_concat(x, ":")  None -> "" },
+    match u.host { Some(h) -> url_authority_string(u, h)  None -> "" },
+    u.path,
+    url_prefixed("?", u.query),
+    url_prefixed("#", u.fragment)
+  ])
+
+# ---- percent-coding -----------------------------------------------
+
+fn url_hex_digit(n: Int) : String = string_slice("0123456789ABCDEF", n, 1)
+
+fn url_encode_byte(s: String, i: Int) : String = {
+  let b = string_byte_at_int(s, i)
+  if url_is_unreserved(b) { string_slice(s, i, 1) }
+  else { string_concat_all(["%", url_hex_digit(b / 16), url_hex_digit(b % 16)]) }
+}
+
+fn url_encode_loop(s: String, i: Int, n: Int, parts: [String]) : String =
+  if i >= n { string_concat_all(list_reverse(parts)) }
+  else { url_encode_loop(s, i + 1, n, [url_encode_byte(s, i), ...parts]) }
+
+#[doc("""
+Percent-encodes every UTF-8 byte of `s` except the RFC 3986 unreserved
+set (`A-Z a-z 0-9 - . _ ~`), using uppercase hex: `"a b/é"` becomes
+`"a%20b%2F%C3%A9"`.
+""")]
+pub fn percent_encode(s: String) : String = url_encode_loop(s, 0, string_length(s), [])
+
+fn url_decode_loop(s: String, i: Int, n: Int, parts: [String]) : Result[String, String] =
+  if i >= n { Ok(string_concat_all(list_reverse(parts))) }
+  else if string_byte_at_int(s, i) != 37 {
+    let j = url_find(s, 37, i, n)
+    let stop = if j < 0 { n } else { j }
+    url_decode_loop(s, stop, n, [url_range(s, i, stop), ...parts])
+  }
+  else if url_escape_ok(s, i, n) {
+    let v = url_hex_value(string_byte_at_int(s, i + 1)) * 16 + url_hex_value(string_byte_at_int(s, i + 2))
+    url_decode_loop(s, i + 3, n, [int_to_byte_string(v), ...parts])
+  }
+  else { Err(string_concat_all(["percent_decode: bad escape at offset ", int_to_string(i)])) }
+
+#[doc("""
+Decodes `%XX` escapes (either hex case) in `s`; every other byte, `+`
+included, is kept. The result may hold bytes that are not valid UTF-8.
+Returns `Err("percent_decode: bad escape at offset <n>")` for a `%` not
+followed by two hex digits.
+""")]
+pub fn percent_decode(s: String) : Result[String, String] =
+  url_decode_loop(s, 0, string_length(s), [])
+
+# ---- query strings ------------------------------------------------
+
+fn url_decode_lenient(s: String) : String = match percent_decode(s) {
+  Ok(d)  -> d
+  Err(_) -> s
+}
+
+fn url_nonempty(s: String) : Bool = string_length(s) > 0
+
+fn url_split_pair(part: String) : (String, String) = {
+  let eq = string_find(part, "=")
+  if eq < 0 { (url_decode_lenient(part), "") }
+  else {
+    (url_decode_lenient(string_slice(part, 0, eq)),
+     url_decode_lenient(url_after(part, eq + 1)))
+  }
+}
+
+#[doc("""
+Splits a query (without the leading `?`) on `&` into decoded
+`(key, value)` pairs. A part without `=` has an empty value, empty
+parts are skipped, and a component with a malformed escape is kept
+verbatim. `+` is not a space.
+""")]
+pub fn query_pairs(q: String) : [(String, String)] =
+  list.map(list.filter(string.split(q, "&"), url_nonempty), url_split_pair)
+
+fn url_join_pair(p: (String, String)) : String = match p {
+  (k, v) -> string_concat_all([percent_encode(k), "=", percent_encode(v)])
+}
+
+#[doc("Joins `(key, value)` pairs into an encoded query, `k=v` parts separated by `&`; the inverse of `query_pairs`.")]
+pub fn query_string(pairs: [(String, String)]) : String =
+  string.join(list.map(pairs, url_join_pair), "&")
+
+# ---- reference resolution -----------------------------------------
+
+fn url_pop_segment(out: String) : String = {
+  let i = url_find_last(out, 47, string_length(out) - 1)
+  if i < 0 { "" } else { string_slice(out, 0, i) }
+}
+
+# End of the first path segment, not counting a leading '/'.
+fn url_segment_end(input: String) : Int = {
+  let start = if string.starts_with(input, "/") { 1 } else { 0 }
+  let slash = url_find(input, 47, start, string_length(input))
+  if slash < 0 { string_length(input) } else { slash }
+}
+
+# RFC 3986 §5.2.4 steps A and B: the input after dropping a leading dot
+# segment, or None when the input does not start with one.
+fn url_skip_dot_prefix(input: String) : Option[String] =
+  if string.starts_with(input, "../") { Some(url_after(input, 3)) }
+  else if string.starts_with(input, "./") { Some(url_after(input, 2)) }
+  else if string.starts_with(input, "/./") { Some(url_after(input, 2)) }
+  else if input == "/." { Some("/") }
+  else { None }
+
+# Steps C, D and E: the remaining input and the output so far.
+fn url_dot_step_up(input: String, out: String) : (String, String) =
+  if string.starts_with(input, "/../") { (url_after(input, 3), url_pop_segment(out)) }
+  else if input == "/.." { ("/", url_pop_segment(out)) }
+  else if input == "." or input == ".." { ("", out) }
+  else {
+    let e = url_segment_end(input)
+    (url_after(input, e), string_concat(out, url_range(input, 0, e)))
+  }
+
+fn url_dot_step(input: String, out: String) : (String, String) =
+  match url_skip_dot_prefix(input) {
+    Some(rest) -> (rest, out)
+    None       -> url_dot_step_up(input, out)
+  }
+
+# The step functions never call back, so the recursion is a single self-call.
+fn url_remove_dots(input: String, out: String) : String =
+  if string_length(input) == 0 { out }
+  else { match url_dot_step(input, out) {
+    (rest, next) -> url_remove_dots(rest, next)
+  } }
+
+fn url_merge(base: Url, rel: String) : String =
+  if option.is_some(base.host) and string_length(base.path) == 0 { string_concat("/", rel) }
+  else {
+    let i = url_find_last(base.path, 47, string_length(base.path) - 1)
+    if i < 0 { rel } else { string_concat(url_range(base.path, 0, i + 1), rel) }
+  }
+
+fn url_resolve_path(base: Url, r: Url) : String =
+  if string.starts_with(r.path, "/") { url_remove_dots(r.path, "") }
+  else { url_remove_dots(url_merge(base, r.path), "") }
+
+fn url_resolve_ref(base: Url, r: Url) : Url =
+  if option.is_some(r.scheme) { Url { ...r, path: url_remove_dots(r.path, "") } }
+  else if option.is_some(r.host) {
+    Url { ...r, scheme: base.scheme, path: url_remove_dots(r.path, "") }
+  }
+  else if string_length(r.path) == 0 {
+    Url { ...base, query: if option.is_some(r.query) { r.query } else { base.query },
+          fragment: r.fragment }
+  }
+  else { Url { ...base, path: url_resolve_path(base, r), query: r.query, fragment: r.fragment } }
+
+#[doc("""
+Resolves the reference `r` against `base` per RFC 3986 §5.2 (strict: a
+reference with a scheme is never merged with `base`). Returns
+`Err("resolve: base has no scheme")` when `base` is a relative reference.
+""")]
+pub fn resolve(base: Url, r: Url) : Result[Url, String] =
+  if option.is_some(base.scheme) { Ok(url_resolve_ref(base, r)) }
+  else { Err("resolve: base has no scheme") }
