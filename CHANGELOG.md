@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.175.0 (2026-10-24)
+
+### BREAKING CHANGE
+
+- **regexp**: `find`, `find_all`, `replace` and `split` follow Perl/RE2 leftmost-first semantics: the first alternative that matches wins (`a|ab` matches `a` in `ab`), and a group takes what its greedy branch prefers (`(a*)(a*)` on `aa` gives the whole run to group 1). `matches` still requires the whole string.
+- **regexp**: matching is by codepoint instead of by byte, so `.` and negated classes take a whole character and `replace`/`split` never emit invalid UTF-8; match offsets are still byte offsets. `split` with a pattern that can match empty now cuts at every empty match (`"abc"` split by `x*` gives `["", "a", "b", "c", ""]`, as in Python and Rust).
+- **regexp**: a repeat count above 1000, a pattern larger than 1,000,000 nodes after its repeats are expanded (such as `(a{1000}){1000}`), and an inverted class range such as `[z-a]` are compile errors.
+- **regexp**: the debugging surface moved to two new modules. `parse_pattern`, `ast_show` and the pattern AST types are in `regexp.syntax`; `compile_nfa`, `nfa_show` and the NFA types are in `regexp.engine`. Add `import regexp.syntax` or `import regexp.engine` and call `syntax.parse_pattern`, `engine.compile_nfa`, and so on. `compile`, `find`, `find_all`, `replace`, `split`, `matches` and `Regex`/`Match`/`Capture` are unchanged.
+
+### Fixed
+
+- **json**: decoding follows RFC 8259 strictly: numbers with leading zeros and strings with raw control characters yield `None`. The most negative 64-bit integer decodes, a `JReal` always encodes with a fraction so it decodes back as a `JReal`, and a missing tuple element is reported at its own index.
+- **toml**: the most negative 64-bit integer decodes, a key repeated inside an inline table is rejected, `encode` keeps an empty array instead of dropping it, and `encode` quotes keys that are not bare (`"b.c" = ...`).
+- **http**: an invalid or out-of-range port is an error instead of becoming 80, an empty header name is rejected, a URL with only a query (`h?q=1`) keeps `h` as its host, `Transfer-Encoding: Chunked` is decoded whatever its case, and `read_request` reports a body cut short by the peer instead of returning it as complete.
+
+### Changed
+
+- **stdlib**: `regexp`, `encoding.json`, `encoding.toml` and `net.http` were rewritten into small functions behind contract tests and mutation sweeps, with no other change in behaviour; compile time is unchanged within measurement noise.
+
 ## v0.174.0 (2026-10-23)
 
 ### Added
