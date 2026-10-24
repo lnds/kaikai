@@ -1,0 +1,255 @@
+import encoding.json
+import encoding.json_bind
+
+fn report(s: String) : Result[JsonValue, JsonParseError] = json.json_decode_report(s)
+
+fn failure(s: String) : Option[JsonParseError] = match report(s) {
+  Err(e) -> Some(e)
+  Ok(_)  -> None
+}
+
+fn is_err(s: String) : Bool = match report(s) {
+  Err(_) -> true
+  Ok(_)  -> false
+}
+
+fn spot(e: JsonParseError, line: Int, column: Int, offset: Int, reason: String) : Bool =
+  e.line == line and e.column == column and e.offset == offset and e.reason == reason
+
+fn where_at(s: String, line: Int, column: Int, offset: Int, reason: String) : Bool = match failure(s) {
+  Some(e) -> spot(e, line, column, offset, reason)
+  None    -> false
+}
+
+fn bad(s: String, offset: Int, reason: String) : Bool = where_at(s, 1, offset + 1, offset, reason)
+
+fn repeat_str(s: String, n: Int, acc: String) : String =
+  if n == 0 { acc } else { repeat_str(s, n - 1, acc ++ s) }
+
+test "report succeeds with the value json_decode returns" {
+  assert report("null") == Ok(JNull)
+  assert report(" [1, {\"a\": [true, \"x\"]}] ") == Ok(JArr([JNum(1), JObj([Pair { fst: "a", snd: JArr([JBool(true), JStr("x")]) }])]))
+  assert report("-1.5e2") == Ok(JReal(0.0 - 150.0))
+  assert report("\"\\ud83d\\ude00\"") == Ok(JStr("\u{1F600}"))
+}
+
+test "report and json_decode accept and reject the same inputs" {
+  let inputs = ["", " ", "null", "nul", "[1,]", "[1,2]", "{\"a\":1}", "{\"a\":}", "01", "0", "1.", "1.5",
+                "\"a\"", "\"a", "\"\\u00e9\"", "\"\\ud83d\"", "[", "]", "{} {}", "\x0bnull", "-", "-0", "1e5", "1e"]
+  inputs |! (s) => {
+    let accepted = match json.json_decode(s) {
+      Some(_) -> true
+      None    -> false
+    }
+    assert accepted == not is_err(s)
+  }
+}
+
+test "report on empty and blank input" {
+  assert bad("", 0, "unexpected end of input")
+  assert bad(" ", 1, "unexpected end of input")
+  assert where_at("\n\t", 2, 2, 2, "unexpected end of input")
+}
+
+test "report on malformed literals" {
+  assert bad("nul", 0, "invalid literal")
+  assert bad("tru", 0, "invalid literal")
+  assert bad("fals", 0, "invalid literal")
+  assert bad("nulx", 0, "invalid literal")
+  assert bad("[true, fals]", 7, "invalid literal")
+  assert bad("True", 0, "unexpected character")
+  assert bad("NULL", 0, "unexpected character")
+  assert bad("undefined", 0, "unexpected character")
+}
+
+test "report on trailing characters" {
+  assert bad("nulll", 4, "trailing characters after value")
+  assert bad("null x", 5, "trailing characters after value")
+  assert bad("1 2", 2, "trailing characters after value")
+  assert bad("{} {}", 3, "trailing characters after value")
+  assert bad("[] []", 3, "trailing characters after value")
+  assert bad("\"a\" \"b\"", 4, "trailing characters after value")
+  assert bad("true,", 4, "trailing characters after value")
+  assert bad("[1]]", 3, "trailing characters after value")
+  assert bad("{\"a\":1}}", 7, "trailing characters after value")
+  assert bad("1-", 1, "trailing characters after value")
+  assert bad("0x10", 1, "trailing characters after value")
+}
+
+test "report on malformed numbers" {
+  assert bad("-", 1, "unexpected end of input")
+  assert bad("--1", 1, "expected a digit")
+  assert bad("-.5", 1, "expected a digit")
+  assert bad("+1", 0, "unexpected character")
+  assert bad(".5", 0, "unexpected character")
+  assert bad("1.", 2, "unexpected end of input")
+  assert bad("1.e5", 2, "expected a digit")
+  assert bad("1e", 2, "unexpected end of input")
+  assert bad("1e+", 3, "unexpected end of input")
+  assert bad("1e-", 3, "unexpected end of input")
+  assert bad("1.5e", 4, "unexpected end of input")
+  assert bad("1.5ex", 4, "expected a digit")
+  assert bad("[1.]", 3, "expected a digit")
+}
+
+test "report on leading zeros and out-of-range integers" {
+  assert bad("01", 0, "leading zero in number")
+  assert bad("00", 0, "leading zero in number")
+  assert bad("-01", 1, "leading zero in number")
+  assert bad("[01]", 1, "leading zero in number")
+  assert bad("9223372036854775808", 0, "number out of range")
+  assert bad("99999999999999999999", 0, "number out of range")
+  assert bad("[1,-9223372036854775809]", 3, "number out of range")
+}
+
+test "report on invalid escapes reports the backslash" {
+  assert bad("\"\\x\"", 1, "invalid escape")
+  assert bad("\"\\a\"", 1, "invalid escape")
+  assert bad("\"\\0\"", 1, "invalid escape")
+  assert bad("\"\\U0041\"", 1, "invalid escape")
+  assert bad("\"ab\\'\"", 3, "invalid escape")
+  assert bad("{\"a\":\"\\x\"}", 6, "invalid escape")
+}
+
+test "report on unterminated strings reports the end of input" {
+  assert bad("\"", 1, "unterminated string")
+  assert bad("\"abc", 4, "unterminated string")
+  assert bad("\"abc\\", 5, "unterminated string")
+  assert bad("\"\\", 2, "unterminated string")
+  assert bad("\"abc\\\"", 6, "unterminated string")
+  assert bad("[\"a", 3, "unterminated string")
+}
+
+test "report on bad unicode escapes" {
+  assert bad("\"\\u\"", 1, "invalid \\u escape")
+  assert bad("\"\\u0\"", 1, "invalid \\u escape")
+  assert bad("\"\\u004\"", 1, "invalid \\u escape")
+  assert bad("\"\\u00G1\"", 1, "invalid \\u escape")
+  assert bad("\"\\u000G\"", 1, "invalid \\u escape")
+  assert bad("\"\\u 041\"", 1, "invalid \\u escape")
+  assert bad("\"\\u004", 1, "invalid \\u escape")
+  assert bad("\"ab\\u00zz\"", 3, "invalid \\u escape")
+}
+
+test "report on lone and mismatched surrogates" {
+  assert bad("\"\\uD83D\"", 1, "lone surrogate")
+  assert bad("\"\\uDE00\"", 1, "lone surrogate")
+  assert bad("\"\\uD83Dx\"", 1, "lone surrogate")
+  assert bad("\"\\uD83D\\u0041\"", 1, "lone surrogate")
+  assert bad("\"\\uD83D\\uD83D\"", 1, "lone surrogate")
+  assert bad("\"\\uD83D\\n\"", 1, "lone surrogate")
+  assert bad("\"\\uD83D\\uDE0\"", 1, "lone surrogate")
+  assert bad("\"\\uD83D\\uDE", 1, "lone surrogate")
+  assert bad("\"\\uDBFF\"", 1, "lone surrogate")
+  assert bad("\"\\uDC00\"", 1, "lone surrogate")
+  assert bad("\"ab\\uDFFF\"", 3, "lone surrogate")
+}
+
+test "report on raw control characters in strings" {
+  assert where_at("\"a\nb\"", 1, 3, 2, "control character in string")
+  assert bad("\"a\tb\"", 2, "control character in string")
+  assert bad("\"a\rb\"", 2, "control character in string")
+  assert bad("\"\x01\"", 1, "control character in string")
+  assert bad("\"\x1f\"", 1, "control character in string")
+  assert bad("{\"a\x01\":1}", 3, "control character in string")
+}
+
+test "report on malformed arrays" {
+  assert bad("[", 1, "unexpected end of input")
+  assert bad("]", 0, "unexpected character")
+  assert bad("[1", 2, "unexpected end of input")
+  assert bad("[1,", 3, "unexpected end of input")
+  assert bad("[1,]", 3, "unexpected character")
+  assert bad("[,1]", 1, "unexpected character")
+  assert bad("[,]", 1, "unexpected character")
+  assert bad("[1 2]", 3, "expected ',' or ']'")
+  assert bad("[1;2]", 2, "expected ',' or ']'")
+  assert bad("[1}", 2, "expected ',' or ']'")
+  assert bad("[[1]", 4, "unexpected end of input")
+  assert bad("[\"a\":1]", 4, "expected ',' or ']'")
+}
+
+test "report on malformed objects" {
+  assert bad("{", 1, "unexpected end of input")
+  assert bad("}", 0, "unexpected character")
+  assert bad("{\"a\"", 4, "unexpected end of input")
+  assert bad("{\"a\":", 5, "unexpected end of input")
+  assert bad("{\"a\":1", 6, "unexpected end of input")
+  assert bad("{\"a\":1,", 7, "unexpected end of input")
+  assert bad("{\"a\":1,}", 7, "expected object key")
+  assert bad("{,}", 1, "expected object key")
+  assert bad("{a:1}", 1, "expected object key")
+  assert bad("{1:1}", 1, "expected object key")
+  assert bad("{'a':1}", 1, "expected object key")
+  assert bad("{\"a\"}", 4, "expected ':'")
+  assert bad("{\"a\" 1}", 5, "expected ':'")
+  assert bad("{\"a\"=1}", 4, "expected ':'")
+  assert bad("{\"a\":}", 5, "unexpected character")
+  assert bad("{\"a\":1 \"b\":2}", 7, "expected ',' or '}'")
+  assert bad("{\"a\":1]", 6, "expected ',' or '}'")
+  assert bad("{\"a\":1,2}", 7, "expected object key")
+  assert bad("{\"a\":1,\"b\"}", 10, "expected ':'")
+}
+
+test "report on invalid whitespace" {
+  assert bad("\x0bnull", 0, "unexpected character")
+  assert bad("\x0cnull", 0, "unexpected character")
+  assert bad("\u{a0}null", 0, "unexpected character")
+  assert bad("[1,\x0b2]", 3, "unexpected character")
+}
+
+test "line counts newlines and column restarts after each" {
+  assert where_at("[1,\n  2,\n  x]", 3, 3, 11, "unexpected character")
+  assert where_at("{\n  \"a\": 1,\n  \"b\": ]\n}", 3, 8, 19, "unexpected character")
+  assert where_at("\n\n\nx", 4, 1, 3, "unexpected character")
+  assert where_at("[1,\r\n2 3]", 2, 3, 7, "expected ',' or ']'")
+  assert where_at("[\n]\n,", 3, 1, 4, "trailing characters after value")
+}
+
+test "column counts characters, not bytes" {
+  assert where_at("[\"\u{E9}\", x]", 1, 7, 7, "unexpected character")
+  assert where_at("[\"\u{20AC}\", x]", 1, 7, 8, "unexpected character")
+  assert where_at("[\"\u{1F600}\", x]", 1, 7, 9, "unexpected character")
+  assert where_at("{\"\u{E9}\":\n\"\u{FC}\" x}", 2, 5, 12, "expected ',' or '}'")
+  assert where_at("\u{1F600} x", 1, 1, 0, "unexpected character")
+  assert where_at("\"\u{E9}\u{1F600}\\q\"", 1, 4, 7, "invalid escape")
+  assert where_at("[\"\u{E9}\u{E9}\u{E9}\",\n\"\u{20AC}\u{20AC}\" ?]", 2, 6, 20, "expected ',' or ']'")
+}
+
+test "offset stays a byte offset on multibyte input" {
+  match failure("\"\u{1F600}\" x") {
+    Some(e) -> {
+      assert e.offset == 7
+      assert e.column == 5
+    }
+    None -> { assert false }
+  }
+}
+
+test "report finds a failure deep in a large input" {
+  let body = repeat_str("1,", 500, "")
+  match failure("[" ++ body ++ "x]") {
+    Some(e) -> {
+      assert e.offset == 1001
+      assert e.line == 1
+      assert e.column == 1002
+      assert e.reason == "unexpected character"
+    }
+    None -> { assert false }
+  }
+}
+
+test "report on unbalanced deep nesting" {
+  match failure(repeat_str("[", 2000, "")) {
+    Some(e) -> {
+      assert e.offset == 2000
+      assert e.reason == "unexpected end of input"
+    }
+    None -> { assert false }
+  }
+}
+
+test "report names the first of several problems" {
+  assert bad("[01, x]", 1, "leading zero in number")
+  assert bad("{\"a\": tru, \"b\": ]}", 6, "invalid literal")
+}

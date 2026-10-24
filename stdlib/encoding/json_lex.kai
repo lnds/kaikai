@@ -1,0 +1,211 @@
+#[doc("""
+Leaf scanners of the JSON decoder: numbers, strings and escapes. Each
+takes the text and a cursor and returns the value with the cursor past it,
+or a `JFail` naming the byte offset and reason. `encoding.json` drives them.
+""")]
+
+import encoding.json_bind
+
+#[doc("A scanned value and the cursor just past it.")]
+pub type JParse = { v: JsonValue, i: Int }
+
+#[doc("A scan failure: the byte offset `at` where parsing could not continue, and why.")]
+pub type JFail = { at: Int, why: String }
+
+#[doc("Succeeds with value `v` and the cursor `i` past it.")]
+pub fn jp_ok(v: JsonValue, i: Int) : Result[JParse, JFail] =
+  Ok(JParse { v: v, i: i })
+
+#[doc("Fails at byte offset `at` with `why`.")]
+pub fn json_fail[t](at: Int, why: String) : Result[t, JFail] =
+  Err(JFail { at: at, why: why })
+
+#[doc("Lifts an `Option` into the failure channel: `None` fails at `at` with `why`.")]
+pub fn json_need[t](o: Option[t], at: Int, why: String) : Result[t, JFail] = match o {
+  Some(x) -> Ok(x)
+  None    -> json_fail(at, why)
+}
+
+#[doc("The failure for a cursor that cannot continue: end of input, or `what` at `at`.")]
+pub fn json_stuck(s: String, at: Int, what: String) : JFail =
+  if at >= string_length(s) { JFail { at: at, why: "unexpected end of input" } }
+  else { JFail { at: at, why: what } }
+
+
+#[doc("Prepends the slice `s[from, to)` to `parts` when it is non-empty.")]
+pub fn json_flush(s: String, from: Int, to: Int, parts: [String]) : [String] =
+  if to > from { [string_slice(s, from, to - from), ...parts] } else { parts }
+
+# Number: RFC 8259 grammar — optional `-`, integer part, optional
+# fractional part, optional exponent. If neither `.` nor `e/E`
+# appears, the lexeme parses as `JNum(Int)`; otherwise as
+# `JReal(Real)` via the core `string_to_real`.
+#[doc("Scans an RFC 8259 number at `i`: an integer, or a real when a fraction or exponent follows.")]
+pub fn json_parse_number(s: String, i: Int) : Result[JParse, JFail] = {
+  let int_start = if string_byte_at_int(s, i) == 45 { i + 1 } else { i }
+  let int_end = json_digits_end(s, int_start)
+  if int_end == int_start { Err(json_stuck(s, int_start, "expected a digit")) }
+  else if int_end - int_start > 1 and string_byte_at_int(s, int_start) == 48 {
+    json_fail(int_start, "leading zero in number")
+  }
+  else { json_scan_frac(s, int_end) || (fe => json_scan_exp(s, fe) || ee => json_number_value(s, i, int_end, ee)) }
+}
+
+# The lexeme `s[i, ee)`: a real when a fraction or exponent follows the
+# integer part ending at `int_end`, otherwise an integer.
+fn json_number_value(s: String, i: Int, int_end: Int, ee: Int) : Result[JParse, JFail] =
+  if ee != int_end {
+    json_need(string_to_real(string_slice(s, i, ee - i)), i, "number out of range") || r => jp_ok(JReal(r), ee)
+  } else {
+    json_need(string_to_int(string_slice(s, i, int_end - i)), i, "number out of range") || m => jp_ok(JNum(m), int_end)
+  }
+
+fn json_digits_end(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if char.is_digit(c) { json_digits_end(s, i + 1) } else { i }
+  } }
+}
+
+# Optional `.` followed by one or more digits. Returns the cursor
+# after the fractional part if present (or unchanged if absent),
+# an error if a `.` is not followed by at least one digit.
+fn json_scan_frac(s: String, i: Int) : Result[Int, JFail] = {
+  match char_at(s, i) {
+    Some('.') -> {
+      let d_end = json_digits_end(s, i + 1)
+      if d_end == i + 1 { Err(json_stuck(s, i + 1, "expected a digit")) } else { Ok(d_end) }
+    }
+    _ -> Ok(i)
+  }
+}
+
+# Optional `[eE][+-]?` followed by one or more digits.
+fn json_scan_exp(s: String, i: Int) : Result[Int, JFail] = match char_at(s, i) {
+  Some('e') -> json_exp_digits(s, i + 1)
+  Some('E') -> json_exp_digits(s, i + 1)
+  _         -> Ok(i)
+}
+
+fn json_exp_digits(s: String, i: Int) : Result[Int, JFail] = {
+  let start = match char_at(s, i) {
+    Some('+') -> i + 1
+    Some('-') -> i + 1
+    _         -> i
+  }
+  let d_end = json_digits_end(s, start)
+  if d_end == start { Err(json_stuck(s, start, "expected a digit")) } else { Ok(d_end) }
+}
+
+# String: opening `"`, then chars / escapes until closing `"`. The
+# escape table mirrors `json_escape_char` plus `\uXXXX`. Codepoints
+# in the basic multilingual plane (excluding the surrogate range)
+# are emitted as 1–3 UTF-8 bytes; non-BMP codepoints are decoded
+# from a `\uD8xx\uDCxx` surrogate pair into their 4-byte UTF-8
+# sequence per RFC 8259 §7. A lone surrogate is an error.
+#[doc("Scans a string literal at `i` (the opening quote), decoding escapes and surrogate pairs.")]
+pub fn json_parse_string(s: String, i: Int) : Result[JParse, JFail] =
+  json_parse_string_loop(s, i + 1, i + 1, [])
+
+# `run` is the start of the pending run of unescaped bytes; `parts` holds
+# the decoded pieces in reverse order. Every continuation is a self tail
+# call, so the depth does not grow with the number of escapes.
+fn json_parse_string_loop(s: String, i: Int, run: Int, parts: [String]) : Result[JParse, JFail] = {
+  if i >= string_length(s) { json_fail(i, "unterminated string") }
+  else {
+    let b = string_byte_at_int(s, i)
+    if b == 34 {
+      jp_ok(JStr(string_concat_all(list_reverse(json_flush(s, run, i, parts)))), i + 1)
+    }
+    else if b < 32 { json_fail(i, "control character in string") }
+    else if b == 92 {
+      match json_escape_step(s, i + 1) {
+        Err(f) -> Err(f)
+        Ok(st) -> json_parse_string_loop(s, st.snd, st.snd,
+                    [st.fst, ...json_flush(s, run, i, parts)])
+      }
+    }
+    else { json_parse_string_loop(s, i + 1, run, parts) }
+  }
+}
+
+# Decodes the escape whose character sits at `i` (just after the
+# backslash) into its UTF-8 text and the index past it. A failure is
+# reported at the backslash.
+fn json_escape_step(s: String, i: Int) : Result[Pair[String, Int], JFail] = {
+  if i >= string_length(s) { json_fail(i, "unterminated string") }
+  else {
+    let b = string_byte_at_int(s, i)
+    if b == 117 { json_unicode_step(s, i + 1) }
+    else { json_need(json_escape_decode(b), i - 1, "invalid escape") | text => Pair { fst: text, snd: i + 1 } }
+  }
+}
+
+fn json_escape_decode(b: Int) : Option[String] = match b {
+  34  -> Some("\"")
+  92  -> Some("\\")
+  47  -> Some("/")
+  98  -> Some("\x08")
+  102 -> Some("\x0C")
+  110 -> Some("\n")
+  114 -> Some("\r")
+  116 -> Some("\t")
+  _   -> None
+}
+
+# Decodes `\uXXXX` with `i` just after the `\u`, as UTF-8 text plus the
+# index past it. A high surrogate must be followed by a `\uYYYY` low
+# surrogate (the pair decodes to one codepoint); a lone surrogate or bad
+# hex is an error at the backslash, `i - 2`.
+fn json_unicode_step(s: String, i: Int) : Result[Pair[String, Int], JFail] = {
+  json_need(json_read_hex4(s, i), i - 2, "invalid \\u escape") || cp => {
+      let i1 = i + 4
+      if cp >= 0xDC00 and cp <= 0xDFFF { json_fail(i - 2, "lone surrogate") }
+      else if cp >= 0xD800 and cp <= 0xDBFF {
+        json_need(json_surrogate_pair(s, cp, i1), i - 2, "lone surrogate")
+      }
+      else { Ok(Pair { fst: json_utf8_encode(cp), snd: i1 }) }
+    }
+}
+
+fn json_surrogate_pair(s: String, high: Int, i: Int) : Option[Pair[String, Int]] = {
+  if i + 6 > string_length(s) or string_slice(s, i, 2) != "\\u" { None }
+  else {
+    json_read_hex4(s, i + 2) || low => if low >= 0xDC00 and low <= 0xDFFF {
+        let cp = 0x10000 + (high - 0xD800) * 0x400 + (low - 0xDC00)
+        Some(Pair { fst: json_utf8_encode(cp), snd: i + 6 })
+      } else { None }
+  }
+}
+
+# Decode one hex character to a 4-bit value. Mirrors hex_char_value
+# in stdlib/encoding/hex.kai; inlined here because the bare `to_int`
+# name is shadowed by `core/string.to_int`.
+fn json_hex_char_value(c: Char) : Option[Int] = {
+  if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+fn json_hex4_loop(s: String, i: Int, end: Int, acc: Int) : Option[Int] = {
+  if i >= end { Some(acc) }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> match json_hex_char_value(c) {
+      None    -> None
+      Some(v) -> json_hex4_loop(s, i + 1, end, (acc * 16) + v)
+    }
+  } }
+}
+
+# Read exactly four hex digits at cursor `i`. Returns the resulting
+# Int (0..0xFFFF) or None on out-of-bounds / non-hex input.
+fn json_read_hex4(s: String, i: Int) : Option[Int] = {
+  if i + 4 > string_length(s) { None }
+  else { json_hex4_loop(s, i, i + 4, 0) }
+}
+
+# A valid codepoint (not a surrogate, at most 0x10FFFF) as its UTF-8 text.
+fn json_utf8_encode(cp: Int) : String = string.from_chars([int_to_char(cp)])
