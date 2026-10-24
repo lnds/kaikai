@@ -12,7 +12,7 @@
 # rejecting the better B+. An empty grade means km failed, which is a
 # failure to judge, not a pass.
 #
-# `km` ships in the `kimun` crate on crates.io, pinned to one version by
+# `km` comes from the kimun release binaries, pinned to one version by
 # the tier0 workflow so a kimun release cannot redden a PR that touched
 # no code. A developer without it gets a skip; CI does not, because a
 # gate that can quietly skip is not a gate.
@@ -20,7 +20,7 @@
 set -eu
 
 # Keep in step with the pin in .github/workflows/tier1.yml.
-KIMUN_VERSION=0.37.0
+KIMUN_VERSION=0.45.0
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -28,10 +28,10 @@ cd "$ROOT"
 if ! command -v km >/dev/null 2>&1; then
   if [ -n "${CI:-}${GITHUB_ACTIONS:-}" ]; then
     echo "km-new-files-gate FAIL - km is missing in CI, so the differential bar went unjudged"
-    echo "  install it with: cargo install kimun --version $KIMUN_VERSION --locked"
+    echo "  install it from https://github.com/lnds/kimun/releases/tag/v$KIMUN_VERSION"
     exit 1
   fi
-  echo "km-new-files-gate SKIP - km not installed on this machine (install: cargo install kimun)"
+  echo "km-new-files-gate SKIP - km not installed on this machine (install: https://github.com/lnds/kimun/releases)"
   exit 0
 fi
 
