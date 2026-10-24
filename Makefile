@@ -1341,6 +1341,8 @@ KAI_TEST_BACKEND ?= c
 test-http-redirects: bin/kai
 	KAI_TEST_DRIVER="$(KAI_TEST_DRIVER)" KAI_TEST_BACKEND="$(KAI_TEST_BACKEND)" python3 tests/http_redirects.py
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) stdlib/net/http.kai
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/http_wire_test.kai
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/http_loopback_test.kai
 
 test-core-text: bin/kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_test.kai

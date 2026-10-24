@@ -1,0 +1,466 @@
+import net.http
+import net.tcp
+import spawn
+import time
+
+fn recv_request(c: Conn) : String / NetTcp + Cancel =
+  match NetTcp.recv(c, 4096) {
+    Err(_) -> ""
+    Ok(chunk) -> http.bytes_to_string(chunk)
+  }
+
+fn serve_all(l: Listener, replies: [String], seen: [String]) : [String] / NetTcp + Cancel =
+  match replies {
+    [] -> list_reverse(seen)
+    [reply, ...rest] -> match NetTcp.accept(l) {
+      Err(_) -> list_reverse(seen)
+      Ok(c) -> {
+        let raw = recv_request(c)
+        let _ = NetTcp.send(c, http.string_to_bytes(reply))
+        NetTcp.close(c)
+        serve_all(l, rest, [raw, ...seen])
+      }
+    }
+  }
+
+fn ok_reply(body: String) : String =
+  "HTTP/1.1 200 OK\r\nContent-Length: #{string_length(body)}\r\n\r\n#{body}"
+
+fn redirect_reply(status: Int, location: String) : String =
+  "HTTP/1.1 #{status} Moved\r\nLocation: #{location}\r\nContent-Length: 0\r\n\r\n"
+
+fn at(xs: [String], i: Int) : String = match list.nth(xs, i) {
+  Some(x) -> x
+  None -> ""
+}
+
+fn base(l: Listener) : String = "http://127.0.0.1:#{l.port}"
+
+fn status_line(raw: String) : String = match string_split(raw, "\r\n") {
+  [first, ..._] -> first
+  [] -> ""
+}
+
+fn has_header(raw: String, name: String) : Bool =
+  string_contains(string.to_lower(raw), "\r\n#{string.to_lower(name)}:")
+
+test "request round-trips method, headers and body to a sibling-fiber server" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (seen, resp) = nursery { n ->
+        let s = n.spawn(() => serve_all(l, [ok_reply("hi")], []))
+        let r = http.request(Request {
+          method: "PATCH", url: "#{base(l)}/p?q=1",
+          headers: [HttpHeader { name: "X-A", value: "b" }], body: "data" })
+        (n.await(s), r)
+      }
+      assert resp.status == 200
+      assert resp.body == "hi"
+      assert http.header_lookup(resp.headers, "Content-Length") == Some("2")
+      assert seen == ["PATCH /p?q=1 HTTP/1.1\r\nHost: 127.0.0.1:#{l.port}\r\nContent-Length: 4\r\nX-A: b\r\n\r\ndata"]
+    }
+  }
+}
+
+test "get, post, put and delete send their verb" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (seen, bodies) = nursery { n ->
+        let s = n.spawn(() => serve_all(l, [ok_reply("g"), ok_reply("p"), ok_reply("u"), ok_reply("d")], []))
+        let a = http.get("#{base(l)}/a")
+        let b = http.post("#{base(l)}/b", "B")
+        let c = http.put("#{base(l)}/c", "C")
+        let d = http.delete("#{base(l)}/d")
+        (n.await(s), a.body ++ b.body ++ c.body ++ d.body)
+      }
+      assert bodies == "gpud"
+      assert list.map(seen, status_line) ==
+        ["GET /a HTTP/1.1", "POST /b HTTP/1.1", "PUT /c HTTP/1.1", "DELETE /d HTTP/1.1"]
+      assert string_contains(at(seen, 1), "Content-Length: 1\r\n\r\nB")
+      assert string_contains(at(seen, 2), "Content-Length: 1\r\n\r\nC")
+      assert string_contains(at(seen, 0), "Content-Length: 0\r\n\r\n")
+    }
+  }
+}
+
+test "a response without Content-Length is drained until the peer closes" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let r = nursery { n ->
+        let s = n.spawn(() => serve_all(l, ["HTTP/1.1 200 OK\r\n\r\nuntil close"], []))
+        let r = http.get("#{base(l)}/")
+        let _ = n.await(s)
+        r
+      }
+      assert r.status == 200
+      assert r.body == "until close"
+    }
+  }
+}
+
+test "a chunked response is decoded off the wire" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n"
+      let r = nursery { n ->
+        let s = n.spawn(() => serve_all(l, [reply], []))
+        let r = http.get("#{base(l)}/")
+        let _ = n.await(s)
+        r
+      }
+      assert r.body == "wikipedia"
+    }
+  }
+}
+
+test "a body larger than one recv is reassembled" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let big = string.repeat("0123456789abcdef", 2048)
+      let r = nursery { n ->
+        let s = n.spawn(() => serve_all(l, [ok_reply(big)], []))
+        let r = http.get("#{base(l)}/")
+        let _ = n.await(s)
+        r
+      }
+      assert string_length(r.body) == 32768
+      assert r.body == big
+    }
+  }
+}
+
+test "request collapses every failure into status 0" {
+  let bad = http.get("not a url")
+  assert bad.status == 0
+  assert bad.body == "parse_url: missing scheme separator '://' in URL"
+  assert bad.headers == []
+  assert http.get("https://example.com/").status == 0
+  let refused = http.get("http://127.0.0.1:1/")
+  assert refused.status == 0
+  assert string.starts_with(refused.body, "connect: ")
+}
+
+test "request surfaces an unparsable reply as status 0" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (garbage, silent) = nursery { n ->
+        let s = n.spawn(() => serve_all(l, ["not http at all", ""], []))
+        let a = http.get("#{base(l)}/")
+        let b = http.get("#{base(l)}/")
+        let _ = n.await(s)
+        (a, b)
+      }
+      assert garbage.status == 0
+      assert garbage.body == "parse_response: missing header/body separator (\\r\\n\\r\\n)"
+      assert silent.status == 0
+      assert silent.body == "parse_response: missing header/body separator (\\r\\n\\r\\n)"
+    }
+  }
+}
+
+fn follow_case(replies: [String], mk: (Listener) -> Request, policy: RedirectPolicy)
+    : (Result[Response, String], [String]) / NetTcp + Cancel + Spawn =
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> (Err(e), [])
+    Ok(l) -> nursery { n ->
+      let s = n.spawn(() => serve_all(l, replies, []))
+      let r = http.follow(mk(l), policy)
+      (r, n.await(s))
+    }
+  }
+
+fn get_req(l: Listener) : Request =
+  Request { method: "GET", url: "#{base(l)}/start", headers: [], body: "" }
+
+fn post_req(l: Listener) : Request =
+  Request { method: "POST", url: "#{base(l)}/start",
+            headers: [HttpHeader { name: "X-Keep", value: "1" }], body: "payload" }
+
+fn end_of(r: Result[Response, String]) : String = match r {
+  Ok(x) -> "#{x.status}:#{x.body}"
+  Err(e) -> "ERR #{e}"
+}
+
+test "follow chases a 301 with an absolute Location" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (r, seen) = nursery { n ->
+        let s = n.spawn(() => serve_all(l, [redirect_reply(301, "#{base(l)}/end"), ok_reply("done")], []))
+        let r = http.follow(get_req(l), http.default_redirect_policy())
+        (r, n.await(s))
+      }
+      assert end_of(r) == "200:done"
+      assert list.map(seen, status_line) == ["GET /start HTTP/1.1", "GET /end HTTP/1.1"]
+    }
+  }
+}
+
+test "follow resolves absolute-path and network-path Locations" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (r, seen) = nursery { n ->
+        let replies = [redirect_reply(302, "/second"),
+                       redirect_reply(302, "//127.0.0.1:#{l.port}/third"),
+                       ok_reply("done")]
+        let s = n.spawn(() => serve_all(l, replies, []))
+        let r = http.follow(get_req(l), http.default_redirect_policy())
+        (r, n.await(s))
+      }
+      assert end_of(r) == "200:done"
+      assert list.map(seen, status_line) ==
+        ["GET /start HTTP/1.1", "GET /second HTTP/1.1", "GET /third HTTP/1.1"]
+    }
+  }
+}
+
+test "follow leaves a relative Location unresolved and returns the failed request" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (r, seen) = nursery { n ->
+        let s = n.spawn(() => serve_all(l, [redirect_reply(302, "elsewhere")], []))
+        let r = http.follow(get_req(l), http.default_redirect_policy())
+        (r, n.await(s))
+      }
+      assert end_of(r) == "0:parse_url: missing scheme separator '://' in URL"
+      assert list_length(seen) == 1
+    }
+  }
+}
+
+fn check_rewrite(status: Int) : Unit / NetTcp + Cancel + Spawn = {
+    match NetTcp.listen("127.0.0.1", 0) {
+      Err(_) -> { assert false }
+      Ok(l) -> {
+        let (r, seen) = nursery { n ->
+          let s = n.spawn(() => serve_all(l, [redirect_reply(status, "/end"), ok_reply("done")], []))
+          let r = http.follow(post_req(l), http.default_redirect_policy())
+          (r, n.await(s))
+        }
+        assert end_of(r) == "200:done"
+        assert status_line(at(seen, 0)) == "POST /start HTTP/1.1"
+        assert status_line(at(seen, 1)) == "GET /end HTTP/1.1"
+        assert string_contains(at(seen, 1), "Content-Length: 0\r\n")
+        assert string_contains(at(seen, 1), "X-Keep: 1\r\n")
+      }
+    }
+}
+
+test "follow rewrites POST to GET on 301, 302 and 303 and drops the body" {
+  check_rewrite(301)
+  check_rewrite(302)
+  check_rewrite(303)
+}
+
+fn check_preserve(status: Int) : Unit / NetTcp + Cancel + Spawn = {
+    match NetTcp.listen("127.0.0.1", 0) {
+      Err(_) -> { assert false }
+      Ok(l) -> {
+        let (r, seen) = nursery { n ->
+          let s = n.spawn(() => serve_all(l, [redirect_reply(status, "/end"), ok_reply("done")], []))
+          let r = http.follow(post_req(l), http.default_redirect_policy())
+          (r, n.await(s))
+        }
+        assert end_of(r) == "200:done"
+        assert status_line(at(seen, 1)) == "POST /end HTTP/1.1"
+        assert string_contains(at(seen, 1), "Content-Length: 7\r\n")
+        assert string_contains(at(seen, 1), "\r\n\r\npayload")
+      }
+    }
+}
+
+test "follow keeps method and body on 307 and 308" {
+  check_preserve(307)
+  check_preserve(308)
+}
+
+test "follow honours the 303 and 307 policy switches" {
+  let keep303 = RedirectPolicy { max_redirects: 5, follow_3xx: [303, 307],
+    rewrite_post_to_get_on_303: false, preserve_method_307_308: true }
+  let (r, seen) = follow_case([redirect_reply(303, "/end"), ok_reply("done")], post_req, keep303)
+  assert end_of(r) == "200:done"
+  assert status_line(at(seen, 1)) == "POST /end HTTP/1.1"
+  let rewrite307 = RedirectPolicy { max_redirects: 5, follow_3xx: [303, 307],
+    rewrite_post_to_get_on_303: true, preserve_method_307_308: false }
+  let (r2, seen2) = follow_case([redirect_reply(307, "/end"), ok_reply("done")], post_req, rewrite307)
+  assert end_of(r2) == "200:done"
+  assert status_line(at(seen2, 1)) == "POST /end HTTP/1.1"
+}
+
+test "follow returns a redirect status the policy does not list" {
+  let only302 = RedirectPolicy { max_redirects: 5, follow_3xx: [302],
+    rewrite_post_to_get_on_303: true, preserve_method_307_308: true }
+  let (r, seen) = follow_case([redirect_reply(301, "/end")], get_req, only302)
+  assert end_of(r) == "301:"
+  assert list_length(seen) == 1
+}
+
+test "follow fails on a redirect without Location" {
+  let (r, _) = follow_case(["HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n"], get_req,
+                           http.default_redirect_policy())
+  assert end_of(r) == "ERR redirect missing Location header at status 302"
+}
+
+test "follow stops after max_redirects hops" {
+  let two = RedirectPolicy { max_redirects: 2, follow_3xx: [302],
+    rewrite_post_to_get_on_303: true, preserve_method_307_308: true }
+  let loop_ = [redirect_reply(302, "/a"), redirect_reply(302, "/b"), redirect_reply(302, "/c")]
+  let (r, seen) = follow_case(loop_, get_req, two)
+  assert end_of(r) == "ERR too many redirects (max 2)"
+  assert list_length(seen) == 3
+  let (ok2, seen2) = follow_case([redirect_reply(302, "/a"), redirect_reply(302, "/b"), ok_reply("end")],
+                                 get_req, two)
+  assert end_of(ok2) == "200:end"
+  assert list_length(seen2) == 3
+  let zero = RedirectPolicy { max_redirects: 0, follow_3xx: [302],
+    rewrite_post_to_get_on_303: true, preserve_method_307_308: true }
+  let (r0, seen0) = follow_case([redirect_reply(302, "/a")], get_req, zero)
+  assert end_of(r0) == "ERR too many redirects (max 0)"
+  assert list_length(seen0) == 1
+  let (r00, _) = follow_case([ok_reply("plain")], get_req, zero)
+  assert end_of(r00) == "200:plain"
+}
+
+fn secret_req(l: Listener) : Request =
+  Request { method: "GET", url: "#{base(l)}/start", body: "", headers: [
+    HttpHeader { name: "Authorization", value: "a" },
+    HttpHeader { name: "aUtHoRiZaTiOn", value: "b" },
+    HttpHeader { name: "Cookie", value: "c" },
+    HttpHeader { name: "Cookie2", value: "d" },
+    HttpHeader { name: "Proxy-Authorization", value: "e" },
+    HttpHeader { name: "Host", value: "stale.example" },
+    HttpHeader { name: "X-Trace", value: "keep-me" } ] }
+
+test "follow keeps credentials on a same-origin hop and always drops Host" {
+  let (r, seen) = follow_case([redirect_reply(302, "/end"), ok_reply("done")], secret_req,
+                              http.default_redirect_policy())
+  assert end_of(r) == "200:done"
+  let hop = at(seen, 1)
+  assert has_header(hop, "Authorization")
+  assert has_header(hop, "aUtHoRiZaTiOn")
+  assert has_header(hop, "Cookie")
+  assert has_header(hop, "Cookie2")
+  assert has_header(hop, "Proxy-Authorization")
+  assert has_header(hop, "X-Trace")
+  assert not string_contains(hop, "stale.example")
+}
+
+fn check_stripped(hop: String) : Unit = {
+  assert not has_header(hop, "Authorization")
+  assert not has_header(hop, "Cookie")
+  assert not has_header(hop, "Cookie2")
+  assert not has_header(hop, "Proxy-Authorization")
+  assert has_header(hop, "X-Trace")
+}
+
+test "follow strips credentials when the origin changes and never restores them" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let (r, seen) = nursery { n ->
+        let replies = [redirect_reply(302, "http://localhost:#{l.port}/mid"),
+                       redirect_reply(302, "http://127.0.0.1:#{l.port}/end"),
+                       ok_reply("done")]
+        let s = n.spawn(() => serve_all(l, replies, []))
+        let r = http.follow(secret_req(l), http.default_redirect_policy())
+        (r, n.await(s))
+      }
+      assert end_of(r) == "200:done"
+      assert has_header(at(seen, 0), "Authorization")
+      check_stripped(at(seen, 1))
+      check_stripped(at(seen, 2))
+      assert string_contains(at(seen, 1), "Host: localhost:#{l.port}\r\n")
+    }
+  }
+}
+
+test "the *_follow wrappers follow with the default policy" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(_) -> { assert false }
+    Ok(l) -> {
+      let replies = [redirect_reply(302, "/g"), ok_reply("g"),
+                     redirect_reply(307, "/p"), ok_reply("p"),
+                     redirect_reply(307, "/u"), ok_reply("u"),
+                     redirect_reply(307, "/d"), ok_reply("d")]
+      let (outs, seen) = nursery { n ->
+        let s = n.spawn(() => serve_all(l, replies, []))
+        let a = http.get_follow("#{base(l)}/1")
+        let b = http.post_follow("#{base(l)}/2", "B")
+        let c = http.put_follow("#{base(l)}/3", "C")
+        let d = http.delete_follow("#{base(l)}/4")
+        ([end_of(a), end_of(b), end_of(c), end_of(d)], n.await(s))
+      }
+      assert outs == ["200:g", "200:p", "200:u", "200:d"]
+      assert status_line(at(seen, 1)) == "GET /g HTTP/1.1"
+      assert status_line(at(seen, 3)) == "POST /p HTTP/1.1"
+      assert status_line(at(seen, 5)) == "PUT /u HTTP/1.1"
+      assert status_line(at(seen, 7)) == "DELETE /d HTTP/1.1"
+    }
+  }
+}
+
+fn read_with(l: Listener, max_bytes: Int) : Result[Request, String] / NetTcp + Cancel =
+  match NetTcp.accept(l) {
+    Err(e) -> Err(e)
+    Ok(c) -> {
+      let r = http.read_request(c, max_bytes)
+      NetTcp.close(c)
+      r
+    }
+  }
+
+fn send_all(c: Conn, pieces: [String]) : Unit / NetTcp + Cancel + Clock =
+  match pieces {
+    [] -> ()
+    [p, ...rest] -> {
+      let _ = NetTcp.send(c, http.string_to_bytes(p))
+      time.sleep(time.millis(20))
+      send_all(c, rest)
+    }
+  }
+
+fn send_pieces(port: Int, pieces: [String]) : Unit / NetTcp + Cancel + Clock =
+  match NetTcp.connect("127.0.0.1", port) {
+    Err(_) -> ()
+    Ok(c) -> {
+      send_all(c, pieces)
+      NetTcp.close(c)
+    }
+  }
+
+fn read_case(pieces: [String], max_bytes: Int) : String / NetTcp + Cancel + Clock + Spawn =
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> e
+    Ok(l) -> nursery { n ->
+      let s = n.spawn(() => read_with(l, max_bytes))
+      let _ = n.spawn(() => send_pieces(l.port, pieces))
+      match n.await(s) {
+        Err(e) -> "ERR #{e}"
+        Ok(r) -> "#{r.method}|#{r.url}|#{r.body}"
+      }
+    }
+}
+
+test "read_request assembles a request that arrives in pieces" {
+  assert read_case(["POST /p HTTP/1.1\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"], 4096) == "POST|/p|hello"
+  assert read_case(["GET /x HTTP/1.1\r\nHost: h\r\n\r\n"], 4096) == "GET|/x|"
+  assert read_case(["POST /p HTTP/1.1\r\nContent-Length: 2\r\n\r\nabcdef"], 4096) == "POST|/p|ab"
+  assert read_case(["POST /p HTTP/1.1\r\nContent-Length: 0\r\n\r\n"], 4096) == "POST|/p|"
+}
+
+test "read_request caps buffering and reports truncation" {
+  assert read_case(["POST /p HTTP/1.1\r\nContent-Length: 100\r\n\r\n", string.repeat("x", 100)], 40)
+    == "ERR read_request: exceeded max_bytes=40"
+  assert read_case(["GARBAGE"], 4096) == "ERR read_request: peer closed before request complete"
+  assert read_case([], 4096) == "ERR read_request: peer closed before request complete"
+  assert read_case(["GET /x HTTP/1.1\r\nHost: h\r\n"], 4096)
+    == "ERR read_request: peer closed before request complete"
+}

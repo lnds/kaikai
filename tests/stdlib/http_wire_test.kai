@@ -1,0 +1,237 @@
+import net.http
+
+fn url_str(r: Result[HttpUrl, String]) : String = match r {
+  Err(e) -> "ERR " ++ e
+  Ok(u)  -> "#{u.scheme}|#{u.host}|#{u.port}|#{u.path}"
+}
+
+fn headers_str(hs: [HttpHeader]) : String =
+  string.join(list.map(hs, (h) => "#{h.name}=#{h.value}"), ";")
+
+fn resp_str(r: Result[Response, String]) : String = match r {
+  Err(e) -> "ERR " ++ e
+  Ok(x)  -> "#{x.status}|#{headers_str(x.headers)}|#{x.body}"
+}
+
+fn req_str(r: Result[Request, String]) : String = match r {
+  Err(e) -> "ERR " ++ e
+  Ok(x)  -> "#{x.method}|#{x.url}|#{headers_str(x.headers)}|#{x.body}"
+}
+
+test "parse_url fills scheme defaults and keeps the path verbatim" {
+  assert url_str(http.parse_url("http://example.com")) == "http|example.com|80|/"
+  assert url_str(http.parse_url("http://example.com/")) == "http|example.com|80|/"
+  assert url_str(http.parse_url("http://example.com:8080/api")) == "http|example.com|8080|/api"
+  assert url_str(http.parse_url("http://h/a/b?q=1#f")) == "http|h|80|/a/b?q=1#f"
+  assert url_str(http.parse_url("http://h:/x")) == "http|h|80|/x"
+  assert url_str(http.parse_url("http://127.0.0.1:9/")) == "http|127.0.0.1|9|/"
+}
+
+test "parse_url rejects what it cannot connect to" {
+  assert url_str(http.parse_url("")) == "ERR parse_url: missing scheme separator '://' in URL"
+  assert url_str(http.parse_url("example.com/")) == "ERR parse_url: missing scheme separator '://' in URL"
+  assert url_str(http.parse_url("http://")) == "ERR parse_url: empty host"
+  assert url_str(http.parse_url("http:///x")) == "ERR parse_url: empty host"
+  assert url_str(http.parse_url("http://:80/x")) == "ERR parse_url: empty host"
+}
+
+test "parse_url names the scheme it refuses" {
+  assert string_contains(url_str(http.parse_url("https://example.com/")), "requires TLS")
+  assert url_str(http.parse_url("ftp://example.com/"))
+    == "ERR parse_url: unsupported scheme 'ftp' (only http:// is supported in v1)"
+  assert url_str(http.parse_url("HTTP://example.com/"))
+    == "ERR parse_url: unsupported scheme 'HTTP' (only http:// is supported in v1)"
+  assert url_str(http.parse_url("://example.com/"))
+    == "ERR parse_url: unsupported scheme '' (only http:// is supported in v1)"
+}
+
+test "serialize_request frames the request line, Host, Content-Length, headers, body" {
+  let get = http.serialize_request(Request {
+    method: "GET", url: "http://example.com:80/index.html",
+    headers: [HttpHeader { name: "Accept", value: "*/*" }, HttpHeader { name: "X-A", value: "1" }],
+    body: "" })
+  assert get == "GET /index.html HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nAccept: */*\r\nX-A: 1\r\n\r\n"
+  let post = http.serialize_request(Request {
+    method: "POST", url: "http://example.com:8080/api?x=1", headers: [], body: "{\"x\":42}" })
+  assert post == "POST /api?x=1 HTTP/1.1\r\nHost: example.com:8080\r\nContent-Length: 8\r\n\r\n{\"x\":42}"
+}
+
+test "serialize_request counts body bytes, not characters" {
+  let wire = http.serialize_request(Request {
+    method: "PUT", url: "http://h/", headers: [], body: "h\u{e9}" })
+  assert string_contains(wire, "Content-Length: 3\r\n")
+}
+
+test "serialize_request reports an unparsable URL in-band" {
+  let wire = http.serialize_request(Request { method: "GET", url: "nonsense", headers: [], body: "" })
+  assert wire == "INVALID_URL: parse_url: missing scheme separator '://' in URL"
+}
+
+test "parse_response reads status, trimmed headers and body" {
+  let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX:   spaced  \r\nContent-Length: 14\r\n\r\nhello, world!\n"
+  assert resp_str(http.parse_response(raw))
+    == "200|Content-Type=text/plain;X=spaced;Content-Length=14|hello, world!\n"
+  assert resp_str(http.parse_response("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"))
+    == "404|Content-Length=0|"
+  assert resp_str(http.parse_response("HTTP/1.1 204\r\n\r\n")) == "204||"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nX: a:b\r\n\r\n")) == "200|X=a:b|"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nX:\r\n\r\n")) == "200|X=|"
+}
+
+test "parse_response reports every malformed head" {
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK no separator"))
+    == "ERR parse_response: missing header/body separator (\\r\\n\\r\\n)"
+  assert resp_str(http.parse_response("HTTP/1.1 abc OK\r\n\r\n"))
+    == "ERR parse_response: bad status code: abc"
+  assert resp_str(http.parse_response("garbage\r\n\r\n"))
+    == "ERR parse_response: malformed status line: garbage"
+  assert resp_str(http.parse_response("\r\n\r\nbody"))
+    == "ERR parse_response: malformed status line: "
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nBad header\r\n\r\n"))
+    == "ERR parse_response: header missing ':': Bad header"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nA: 1\r\n folded\r\n\r\n"))
+    == "ERR parse_response: header missing ':':  folded"
+}
+
+test "parse_response frames the body by Content-Length" {
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcdef")) == "200|Content-Length=3|abc"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")) == "200|Content-Length=10|abc"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")) == "200|Content-Length=3|abc"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nabc")) == "200|Content-Length=0|"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nabc")) == "200|Content-Length=-1|"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: zz\r\n\r\nabc")) == "200|Content-Length=zz|abc"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length:  2 \r\n\r\nabc")) == "200|Content-Length=2|ab"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\n\r\n\r\n\r\nxx")) == "200||\r\n\r\nxx"
+  assert resp_str(http.parse_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\r\n\r\nxx"))
+    == "200|Content-Length=2|\r\n"
+}
+
+test "parse_response dechunks and lets chunked win over Content-Length" {
+  let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+  assert resp_str(http.parse_response(chunked)) == "200|Transfer-Encoding=chunked|abcde"
+  let both = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+  assert resp_str(http.parse_response(both)) == "200|Transfer-Encoding=chunked;Content-Length=1|abc"
+  let padded = "HTTP/1.1 200 OK\r\nTransfer-Encoding:  chunked  \r\n\r\n1\r\nz\r\n0\r\n\r\n"
+  assert resp_str(http.parse_response(padded)) == "200|Transfer-Encoding=chunked|z"
+}
+
+test "header_lookup is exact-case and first-match" {
+  let hs = [HttpHeader { name: "A", value: "1" }, HttpHeader { name: "A", value: "2" },
+            HttpHeader { name: "b", value: "3" }]
+  assert http.header_lookup(hs, "A") == Some("1")
+  assert http.header_lookup(hs, "b") == Some("3")
+  assert http.header_lookup(hs, "B") == None
+  assert http.header_lookup(hs, "a") == None
+  assert http.header_lookup([], "A") == None
+}
+
+test "dechunk_body joins well-formed frames" {
+  assert http.dechunk_body("5\r\nhello\r\n0\r\n\r\n") == "hello"
+  assert http.dechunk_body("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n") == "hello world"
+  assert http.dechunk_body("A\r\n0123456789\r\n0\r\n\r\n") == "0123456789"
+  assert http.dechunk_body("a\r\n0123456789\r\n0\r\n\r\n") == "0123456789"
+  assert http.dechunk_body("1F\r\n0123456789012345678901234567890\r\n0\r\n\r\n") == "0123456789012345678901234567890"
+  assert http.dechunk_body("5;ext=1\r\nhello\r\n0\r\n\r\n") == "hello"
+  assert http.dechunk_body("0\r\n\r\n") == ""
+  assert http.dechunk_body("3\r\nabc\r\n0\r\nTrailer: x\r\n\r\n") == "abc"
+  assert http.dechunk_body("2\r\n\r\n\r\n0\r\n\r\n") == "\r\n"
+}
+
+test "dechunk_body sizes are octets" {
+  assert http.dechunk_body("3\r\nh\u{e9}\r\n0\r\n\r\n") == "h\u{e9}"
+}
+
+test "dechunk_body keeps the decoded prefix of a damaged stream" {
+  assert http.dechunk_body("") == ""
+  assert http.dechunk_body("5") == ""
+  assert http.dechunk_body("zz\r\nhello\r\n0\r\n\r\n") == ""
+  assert http.dechunk_body("5\r\nhel") == "hel"
+  assert http.dechunk_body("5\r\nhello\r\n") == "hello"
+  assert http.dechunk_body("3\r\nabc") == "abc"
+  assert http.dechunk_body("3\r\nabc\r\nzz\r\ndef\r\n0\r\n\r\n") == "abc"
+  assert http.dechunk_body("3\r\nabc\r\n0\r\nignored\r\n") == "abc"
+}
+
+test "parse_request reads method, path, headers and body" {
+  assert req_str(http.parse_request("GET /a?b=1 HTTP/1.1\r\nHost: h\r\nAccept: */*\r\n\r\n"))
+    == "GET|/a?b=1|Host=h;Accept=*/*|"
+  assert req_str(http.parse_request("POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcdef"))
+    == "POST|/p|Content-Length=3|abc"
+  assert req_str(http.parse_request("POST /p HTTP/1.1\r\nContent-Length: 9\r\n\r\nabc"))
+    == "POST|/p|Content-Length=9|abc"
+  assert req_str(http.parse_request("POST /p HTTP/1.1\r\n\r\nabcdef")) == "POST|/p||abcdef"
+  assert req_str(http.parse_request("POST /p HTTP/1.1\r\nContent-Length: 0\r\n\r\nzz"))
+    == "POST|/p|Content-Length=0|"
+  assert req_str(http.parse_request("POST /p HTTP/1.1\r\nContent-Length: zz\r\n\r\nabc"))
+    == "POST|/p|Content-Length=zz|abc"
+  assert req_str(http.parse_request("get /p HTTP/1.1\r\n\r\n")) == "get|/p||"
+}
+
+test "parse_request is strict about the request line" {
+  assert req_str(http.parse_request("GET / HTTP/1.0\r\n\r\n"))
+    == "ERR parse_request: unsupported protocol 'HTTP/1.0' (v1 accepts HTTP/1.1 only)"
+  assert req_str(http.parse_request("GET / HTTP/2\r\n\r\n"))
+    == "ERR parse_request: unsupported protocol 'HTTP/2' (v1 accepts HTTP/1.1 only)"
+  assert req_str(http.parse_request("GET /\r\n\r\n")) == "ERR parse_request: malformed request line: GET /"
+  assert req_str(http.parse_request("GET /a b HTTP/1.1\r\n\r\n"))
+    == "ERR parse_request: malformed request line: GET /a b HTTP/1.1"
+  assert req_str(http.parse_request("\r\n\r\n")) == "ERR parse_request: malformed request line: "
+  assert req_str(http.parse_request("GET / HTTP/1.1"))
+    == "ERR parse_request: missing header/body separator (\\r\\n\\r\\n)"
+}
+
+test "status_reason covers its table and falls back to OK" {
+  assert http.status_reason(200) == "OK"
+  assert http.status_reason(201) == "Created"
+  assert http.status_reason(202) == "Accepted"
+  assert http.status_reason(204) == "No Content"
+  assert http.status_reason(301) == "Moved Permanently"
+  assert http.status_reason(302) == "Found"
+  assert http.status_reason(304) == "Not Modified"
+  assert http.status_reason(400) == "Bad Request"
+  assert http.status_reason(401) == "Unauthorized"
+  assert http.status_reason(403) == "Forbidden"
+  assert http.status_reason(404) == "Not Found"
+  assert http.status_reason(405) == "Method Not Allowed"
+  assert http.status_reason(409) == "Conflict"
+  assert http.status_reason(500) == "Internal Server Error"
+  assert http.status_reason(502) == "Bad Gateway"
+  assert http.status_reason(503) == "Service Unavailable"
+  assert http.status_reason(999) == "OK"
+  assert http.status_reason(0) == "OK"
+}
+
+test "serialize_response frames status line, Content-Length, headers, body" {
+  let wire = http.serialize_response(Response {
+    status: 404, headers: [HttpHeader { name: "X-A", value: "b" }], body: "nope" })
+  assert wire == "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nX-A: b\r\n\r\nnope"
+  assert http.serialize_response(Response { status: 204, headers: [], body: "" })
+    == "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+  assert http.serialize_response(Response { status: 200, headers: [], body: "\u{e9}" })
+    == "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\u{e9}"
+}
+
+test "serialized messages parse back to the same value" {
+  let resp = Response { status: 201, headers: [HttpHeader { name: "X-A", value: "b" }], body: "payload" }
+  assert resp_str(http.parse_response(http.serialize_response(resp)))
+    == "201|Content-Length=7;X-A=b|payload"
+  let req = Request { method: "PUT", url: "http://h:8081/res", headers: [], body: "data" }
+  assert req_str(http.parse_request(http.serialize_request(req)))
+    == "PUT|/res|Host=h:8081;Content-Length=4|data"
+}
+
+test "string_to_bytes and bytes_to_string round-trip" {
+  assert http.string_to_bytes("") == []
+  assert http.string_to_bytes("AZ") == [65, 90]
+  assert http.bytes_to_string([72, 105]) == "Hi"
+  assert http.bytes_to_string([]) == ""
+  assert http.bytes_to_string(http.string_to_bytes("a\r\nb")) == "a\r\nb"
+}
+
+test "default_redirect_policy pins its knobs" {
+  let p = http.default_redirect_policy()
+  assert p.max_redirects == 10
+  assert p.follow_3xx == [301, 302, 303, 307, 308]
+  assert p.rewrite_post_to_get_on_303
+  assert p.preserve_method_307_308
+}
