@@ -20,7 +20,7 @@ Unblocks **m12.6.x #7** (regex refinement predicates `String where matches ~r/..
 - Anchors: `^`, `$`.
 - Quantifiers: `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (greedy only). Counts above 1000 are a compile error.
 - Class ranges must not be inverted: `[z-a]` is a compile error.
-- A pattern whose NFA would exceed 1,000,000 states (nested repeats such as `(a{1000}){1000}`) is a compile error.
+- A pattern that expands to more than 1,000,000 AST nodes once repeats are unrolled (nested repeats such as `(a{1000}){1000}`) is a compile error.
 - Module layout: `regexp.syntax` (AST, parser, `ast_show`), `regexp.engine` (NFA builder, `nfa_show`), `regexp` (simulator, `Match`, `Capture`, `Regex` and the API).
 - Matching is by Unicode codepoint (`.`, negated classes and class ranges consume one codepoint); `\d`, `\w`, `\s` stay ASCII. Match offsets are byte offsets.
 - Grouping: `(...)` for capture, `(?:...)` for non-capture.
@@ -95,7 +95,7 @@ RE2's two-step:
 - **Set-of-states simulation**: maintains the set of all live NFA states at each input position. O(n·m) where n = input length, m = NFA size.
 - **Capture group tracking**: each live state carries its own group-position map (small lists, copied on branch).
 
-Match function returns the leftmost-longest match (greedy semantics).
+Match function returns the leftmost match with Perl/RE2 priority: alternatives left to right, greedy quantifiers prefer more.
 
 ## Phases
 
