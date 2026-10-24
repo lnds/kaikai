@@ -290,6 +290,9 @@ stdlib/
   encoding/      pure, stage 2
     json_bind.kai (shipped — the JSON DOM + the `#[derive(Json)]` runtime; `encoding.json` imports it)
     json.kai     (shipped — Real number parsing landed via #361, surrogate-pair UTF-8 via #362)
+    toml.kai     (shipped — the manifest/lockfile TOML subset; the whole public surface lives here)
+    toml_lex.kai (shipped — scanners and encoder text forms; `encoding.toml` imports it, not for direct use)
+    toml_tree.kai (shipped — hash-indexed table builder, generic over the leaf; `encoding.toml` imports it, not for direct use)
     utf8.kai     (planned — no tracking issue)
     base64.kai   (shipped)
     hex.kai      (shipped)
