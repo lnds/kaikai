@@ -436,18 +436,35 @@ fn send_pieces(port: Int, pieces: [String]) : Unit / NetTcp + Cancel + Clock =
     }
   }
 
-fn read_case(pieces: [String], max_bytes: Int) : String / NetTcp + Cancel + Clock + Spawn =
+fn hold_open(port: Int, pieces: [String]) : Unit / NetTcp + Cancel + Clock =
+  match NetTcp.connect("127.0.0.1", port) {
+    Err(_) -> ()
+    Ok(c) -> {
+      send_all(c, pieces)
+      let _ = NetTcp.recv(c, 4096)
+      NetTcp.close(c)
+    }
+  }
+
+fn read_case_with(client: (Int, [String]) -> Unit / NetTcp + Cancel + Clock, pieces: [String], max_bytes: Int)
+    : String / NetTcp + Cancel + Clock + Spawn =
   match NetTcp.listen("127.0.0.1", 0) {
     Err(e) -> e
     Ok(l) -> nursery { n ->
       let s = n.spawn(() => read_with(l, max_bytes))
-      let _ = n.spawn(() => send_pieces(l.port, pieces))
+      let _ = n.spawn(() => client(l.port, pieces))
       match n.await(s) {
         Err(e) -> "ERR #{e}"
         Ok(r) -> "#{r.method}|#{r.url}|#{r.body}"
       }
     }
 }
+
+fn read_case(pieces: [String], max_bytes: Int) : String / NetTcp + Cancel + Clock + Spawn =
+  read_case_with(send_pieces, pieces, max_bytes)
+
+fn read_case_held(pieces: [String], max_bytes: Int) : String / NetTcp + Cancel + Clock + Spawn =
+  read_case_with(hold_open, pieces, max_bytes)
 
 test "read_request assembles a request that arrives in pieces" {
   assert read_case(["POST /p HTTP/1.1\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"], 4096) == "POST|/p|hello"
@@ -463,4 +480,21 @@ test "read_request caps buffering and reports truncation" {
   assert read_case([], 4096) == "ERR read_request: peer closed before request complete"
   assert read_case(["GET /x HTTP/1.1\r\nHost: h\r\n"], 4096)
     == "ERR read_request: peer closed before request complete"
+}
+
+test "read_request returns as soon as the request is complete, without waiting for close" {
+  assert read_case_held(["POST /p HTTP/1.1\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"], 4096) == "POST|/p|hello"
+  assert read_case_held(["GET /x HTTP/1.1\r\nHost: h\r\n\r\n"], 4096) == "GET|/x|"
+  assert read_case_held(["POST /p HTTP/1.1\r\nContent-Length: 1\r\n\r\nab"], 4096) == "POST|/p|a"
+}
+
+test "read_request honours max_bytes exactly" {
+  let raw = "GET /x HTTP/1.1\r\n\r\n"
+  let n = string_length(raw)
+  assert read_case_held([raw], n) == "GET|/x|"
+  assert read_case_held([raw], n - 1) == "ERR read_request: exceeded max_bytes=#{n - 1}"
+}
+
+test "read_request accepts an unparsable Content-Length once the peer closes" {
+  assert read_case(["POST /p HTTP/1.1\r\nContent-Length: zz\r\n\r\nab", "cd"], 4096) == "POST|/p|abcd"
 }
