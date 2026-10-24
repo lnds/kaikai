@@ -1,0 +1,158 @@
+#[doc("""
+Lexical layer of `encoding/toml.kai`: scanners over a source `String`
+addressed by byte offset, and the text forms the encoder writes (quoted
+strings and keys, reals). Internal to the TOML codec; import
+`encoding.toml` instead.
+""")]
+
+#[doc("Where a number starts and ends: `from` is the first byte kept (a leading `+` is dropped), `int_end` the end of the integer digits, `end` the end of the whole number. `end == int_end` for an integer.")]
+pub type TomlNumber = { from: Int, int_end: Int, end: Int }
+
+# ---- Character classes and skips ----------------------------------
+
+#[doc("True for a space or tab.")]
+pub fn toml_is_inline_ws(c: Char) : Bool = c == ' ' or c == '\t'
+
+#[doc("True for a line terminator byte.")]
+pub fn toml_is_eol(c: Char) : Bool = c == '\n' or c == '\r'
+
+#[doc("True when the byte at `i` is `c`.")]
+pub fn toml_char_is(s: String, i: Int, c: Char) : Bool = match char_at(s, i) {
+  None    -> false
+  Some(x) -> x == c
+}
+
+#[doc("True when the byte at `i` is `-` or `+`.")]
+pub fn toml_is_sign_at(s: String, i: Int) : Bool =
+  toml_char_is(s, i, '-') or toml_char_is(s, i, '+')
+
+#[doc("The offset after the spaces and tabs starting at `i`.")]
+pub fn toml_skip_inline_ws_at(s: String, i: Int) : Int = match char_at(s, i) {
+  None    -> i
+  Some(c) -> if toml_is_inline_ws(c) { toml_skip_inline_ws_at(s, i + 1) } else { i }
+}
+
+#[doc("The end of the run of ASCII digits starting at `i`.")]
+pub fn toml_digits_end(s: String, i: Int) : Int = match char_at(s, i) {
+  None    -> i
+  Some(c) -> if char.is_digit(c) { toml_digits_end(s, i + 1) } else { i }
+}
+
+#[doc("The end of the bare key (`[A-Za-z0-9_-]*`) starting at `i`.")]
+pub fn toml_scan_bare_key(s: String, i: Int) : Int = match char_at(s, i) {
+  None    -> i
+  Some(c) -> if char.is_alnum(c) or c == '-' or c == '_' { toml_scan_bare_key(s, i + 1) }
+             else { i }
+}
+
+#[doc("The 1-based line number of byte offset `off`.")]
+pub fn toml_line_of(s: String, off: Int) : Int = toml_count_lines(s, 0, off, 1)
+
+fn toml_count_lines(s: String, i: Int, off: Int, line: Int) : Int =
+  if i >= off { line }
+  else { match char_at(s, i) {
+    None    -> line
+    Some(c) -> toml_count_lines(s, i + 1, off, if c == '\n' { line + 1 } else { line })
+  } }
+
+# ---- Numbers ------------------------------------------------------
+
+#[doc("""
+Scans the number at `i`: an optional sign, digits, then an optional
+fraction (`.` and at least one digit) and exponent (`e` or `E`, an
+optional sign and at least one digit). `None` when no digit follows
+the sign.
+""")]
+pub fn toml_scan_number(s: String, i: Int) : Option[TomlNumber] = {
+  let int_start = if toml_is_sign_at(s, i) { i + 1 } else { i }
+  let int_end = toml_digits_end(s, int_start)
+  let frac_digits = toml_digits_end(s, int_end + 1)
+  let frac_end = if toml_char_is(s, int_end, '.') and frac_digits > int_end + 1 { frac_digits } else { int_end }
+  let exp_start = if toml_is_sign_at(s, frac_end + 1) { frac_end + 2 } else { frac_end + 1 }
+  let exp_digits = toml_digits_end(s, exp_start)
+  let has_exp = (toml_char_is(s, frac_end, 'e') or toml_char_is(s, frac_end, 'E')) and exp_digits > exp_start
+  if int_end == int_start { None }
+  else { Some(TomlNumber {
+    from: if toml_char_is(s, i, '+') { i + 1 } else { i },
+    int_end: int_end,
+    end: if has_exp { exp_digits } else { frac_end },
+  }) }
+}
+
+# ---- Strings ------------------------------------------------------
+
+#[doc("Prepends the slice `s[from, to)` to `parts` when it is non-empty.")]
+pub fn toml_flush(s: String, from: Int, to: Int, parts: [String]) : [String] =
+  if to > from { [string_slice(s, from, to - from), ...parts] } else { parts }
+
+fn toml_escape(c: Option[Char]) : Option[String] = match c {
+  Some('"')  -> Some("\"")
+  Some('\\') -> Some("\\")
+  Some('n')  -> Some("\n")
+  Some('r')  -> Some("\r")
+  Some('t')  -> Some("\t")
+  _          -> None
+}
+
+#[doc("Scans the basic string whose opening quote is at `open`: the offset after the closing quote and the decoded text. `None` for an unknown escape, a line break or a missing closing quote.")]
+pub fn toml_scan_string(s: String, open: Int) : Option[Pair[Int, String]] =
+  toml_string_loop(s, open + 1, open + 1, [])
+
+# `run` starts the pending stretch of plain characters; `parts` holds
+# the decoded pieces, newest first.
+fn toml_string_loop(s: String, i: Int, run: Int, parts: [String]) : Option[Pair[Int, String]] =
+  match char_at(s, i) {
+    None       -> None
+    Some('"')  -> Some(Pair { fst: i + 1, snd: string_concat_all(list_reverse(toml_flush(s, run, i, parts))) })
+    Some('\\') -> match toml_escape(char_at(s, i + 1)) {
+      None      -> None
+      Some(esc) -> toml_string_loop(s, i + 2, i + 2, [esc, ...toml_flush(s, run, i, parts)])
+    }
+    Some(c)    -> if toml_is_eol(c) { None } else { toml_string_loop(s, i + 1, run, parts) }
+  }
+
+# ---- Encoder text forms -------------------------------------------
+
+fn toml_enc_escape(c: Char) : String = match c {
+  '"'  -> "\\\""
+  '\\' -> "\\\\"
+  '\n' -> "\\n"
+  '\r' -> "\\r"
+  '\t' -> "\\t"
+  _    -> ""
+}
+
+fn toml_enc_str_escape(s: String, i: Int, run: Int, parts: [String]) : [String] =
+  match char_at(s, i) {
+    None    -> toml_flush(s, run, i, parts)
+    Some(c) -> {
+      let esc = toml_enc_escape(c)
+      if esc == "" { toml_enc_str_escape(s, i + 1, run, parts) }
+      else { toml_enc_str_escape(s, i + 1, i + 1, [esc, ...toml_flush(s, run, i, parts)]) }
+    }
+  }
+
+#[doc("`s` as a quoted basic string with the five escapes the decoder reads.")]
+pub fn toml_quote(s: String) : String =
+  string_concat_all(["\"", string_concat_all(list_reverse(toml_enc_str_escape(s, 0, 0, []))), "\""])
+
+#[doc("A key as written left of `=` or in a header: bare when it can be, quoted otherwise.")]
+pub fn toml_enc_key(k: String) : String =
+  if k != "" and toml_scan_bare_key(k, 0) == string_length(k) { k } else { toml_quote(k) }
+
+# A TOML float needs a `.` or an exponent; `real_to_string` drops
+# both for integral values, which would re-decode as an integer.
+#[doc("A `Real` as a TOML float: `nan`, `inf`, `-inf`, or a decimal that always carries a `.` or exponent.")]
+pub fn toml_enc_real(r: Real) : String = {
+  if real_is_nan(r) { "nan" }
+  else if real_is_inf(r) { if r < 0.0 { "-inf" } else { "inf" } }
+  else {
+    let s = real_to_string(r)
+    if toml_has_real_mark(s, 0) { s } else { string_concat(s, ".0") }
+  }
+}
+
+fn toml_has_real_mark(s: String, i: Int) : Bool = match char_at(s, i) {
+  None    -> false
+  Some(c) -> if c == '.' or c == 'e' or c == 'E' { true } else { toml_has_real_mark(s, i + 1) }
+}

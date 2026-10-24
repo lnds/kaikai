@@ -1,0 +1,92 @@
+#[doc("""
+Hash-indexed tables under construction for `encoding/toml.kai`: a
+table is a search tree ordered by the key's hash plus the keys in
+insertion order, so a lookup or an insert does not scan the table.
+The leaf type is the caller's. Internal to the TOML codec; import
+`encoding.toml` instead.
+""")]
+
+#[doc("A table under construction: `ix` finds a key's value, `keys` lists the keys newest first, `def` marks a table a `[header]` has opened.")]
+pub type WTbl[a] = { ix: Ix[a], keys: [String], def: Bool }
+
+#[doc("A table entry: a finished leaf, an open table, or an array of tables whose last element stays open for edits and whose earlier ones are finished values, newest first (the flag says they are all tables).")]
+pub type WVal[a] = WLeaf(a) | WTab(WTbl[a]) | WAot(Bool, [a], WTbl[a])
+
+# Ordered by the key's hash; the hash spreads keys, so it stays
+# shallow without rebalancing.
+#[doc("The search tree behind a `WTbl`.")]
+pub type Ix[a] = IxNil | IxNode(Int, String, WVal[a], Ix[a], Ix[a])
+
+#[doc("A table with no keys.")]
+pub fn wt_empty() : WTbl[a] = WTbl { ix: IxNil, keys: [], def: false }
+
+fn ix_find(t: Ix[a], h: Int, key: String) : Option[WVal[a]] = match t {
+  IxNil -> None
+  IxNode(h2, k, v, l, r) ->
+    if h == h2 and k == key { Some(v) }
+    else if h < h2 { ix_find(l, h, key) }
+    else { ix_find(r, h, key) }
+}
+
+fn ix_insert(t: Ix[a], h: Int, key: String, v: WVal[a]) : Ix[a] = match t {
+  IxNil -> IxNode(h, key, v, IxNil, IxNil)
+  IxNode(h2, k, x, l, r) ->
+    if h == h2 and k == key { IxNode(h2, k, v, l, r) }
+    else if h < h2 { IxNode(h2, k, x, ix_insert(l, h, key, v), r) }
+    else { IxNode(h2, k, x, l, ix_insert(r, h, key, v)) }
+}
+
+# The raw FNV hash orders similar keys badly; reducing it modulo a prime
+# spreads them.
+fn ix_hash(key: String) : Int = string_hash(key) % 999999937
+
+#[doc("The entry under `key`, if any.")]
+pub fn wt_get(t: WTbl[a], key: String) : Option[WVal[a]] = ix_find(t.ix, ix_hash(key), key)
+
+#[doc("Sets `key` to `v`, replacing an entry in place or adding the key.")]
+pub fn wt_put(t: WTbl[a], key: String, v: WVal[a]) : WTbl[a] = {
+  let keys = match wt_get(t, key) { None -> [key, ...t.keys]  Some(_) -> t.keys }
+  WTbl { ...t, ix: ix_insert(t.ix, ix_hash(key), key, v), keys: keys }
+}
+
+#[doc("Adds each pair as a leaf, in order, to `acc`.")]
+pub fn wt_of_pairs(ps: [Pair[String, a]], acc: WTbl[a]) : WTbl[a] = match ps {
+  []           -> acc
+  [p, ...rest] -> wt_of_pairs(rest, wt_put(acc, p.fst, WLeaf(p.snd)))
+}
+
+# The tables passed on the way down, nearest first, so the way back up is a loop.
+type WFrame[a] = FTab(WTbl[a], String) | FAot(WTbl[a], String, Bool, [a])
+
+#[doc("Rebuilds the table at `path` below `t` with `f`. `enter` turns the entry on the way (or its absence) into an open table or array of tables; an array of tables is entered at its last element.")]
+pub fn wt_edit(t: WTbl[a], path: [String], enter: (Option[WVal[a]]) -> Option[WVal[a]],
+               f: (WTbl[a]) -> Option[WTbl[a]]) : Option[WTbl[a]] =
+  wt_descend(t, path, enter, f, [])
+
+fn wt_descend(t: WTbl[a], path: [String], enter: (Option[WVal[a]]) -> Option[WVal[a]],
+              f: (WTbl[a]) -> Option[WTbl[a]], frames: [WFrame[a]]) : Option[WTbl[a]] =
+  match path {
+    [] -> match f(t) {
+      None     -> None
+      Some(nt) -> wt_ascend(nt, frames)
+    }
+    [k, ...rest] -> match enter(wt_get(t, k)) {
+      Some(WTab(c)) -> wt_descend(c, rest, enter, f, [FTab(t, k), ...frames])
+      Some(WAot(all, before, last)) -> wt_descend(last, rest, enter, f, [FAot(t, k, all, before), ...frames])
+      _ -> None
+    }
+  }
+
+fn wt_ascend(cur: WTbl[a], frames: [WFrame[a]]) : Option[WTbl[a]] = match frames {
+  []                            -> Some(cur)
+  [FTab(t, k), ...up]           -> wt_ascend(wt_put(t, k, WTab(cur)), up)
+  [FAot(t, k, all, before), ...up] -> wt_ascend(wt_put(t, k, WAot(all, before, cur)), up)
+}
+
+#[doc("Like `wt_edit`, but stops at the table holding the path's last key; `g` rebuilds it given that key. An empty path is `None`.")]
+pub fn wt_edit_last(t: WTbl[a], path: [String], enter: (Option[WVal[a]]) -> Option[WVal[a]],
+                    g: (WTbl[a], String) -> Option[WTbl[a]]) : Option[WTbl[a]] =
+  match list_reverse(path) {
+    []         -> None
+    [k, ...up] -> wt_edit(t, list_reverse(up), enter, tb => g(tb, k))
+  }

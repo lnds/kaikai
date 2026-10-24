@@ -29,6 +29,8 @@ number.
 Out of scope: dotted and quoted keys left of `=`, datetimes,
 literal and multi-line strings, `inf` / `nan`, `_` digit separators.
 
+`encode` writes a key outside the bare charset as a quoted string.
+
 A document the subset cannot read is still rejected whole, as TOML
 requires — but `decode_report` names the line and key the parse
 stopped on, so a caller can point at the offending entry instead of
@@ -37,6 +39,9 @@ calling the file malformed without saying where.
 A local `fn decode` / `fn round_trip` shadows the export; qualify
 (`toml.decode(s)`) where that matters.
 """)]
+
+import encoding.toml_lex
+import encoding.toml_tree
 
 # ---- AST ---------------------------------------------------------
 
@@ -59,28 +64,15 @@ pub type TomlError = {
 # ---- Parser state ------------------------------------------------
 # Single linear pass. Each `key = value` lands in `root` at once, in
 # the table the last header's path names (`[]`: the root itself).
-# Tables under construction are indexed by a hash-ordered tree, so a
-# lookup or an insert does not scan the table.
 
 type Pairs = [Pair[String, TomlValue]]
-
-# `ix` finds a key's value; `keys` lists the keys, newest first;
-# `def` marks a table a `[header]` has opened.
-type WTbl = { ix: Ix, keys: [String], def: Bool }
-
-# An array of tables keeps its last element open for edits and the
-# earlier ones as finished values, newest first; the flag says they
-# are all tables.
-type WVal = WLeaf(TomlValue) | WTab(WTbl) | WAot(Bool, [TomlValue], WTbl)
-
-# Search tree ordered by the key's hash; the hash spreads keys, so it
-# stays shallow without rebalancing.
-type Ix = IxNil | IxNode(Int, String, WVal, Ix, Ix)
+type Tab = WTbl[TomlValue]
+type Entry = WVal[TomlValue]
 
 type TomlSt = {
   s: String,
   i: Int,
-  root: WTbl,
+  root: Tab,
   hdr: [String],
 }
 
@@ -118,7 +110,7 @@ fn toml_error_at(s: String, off: Int) : TomlError = {
   let key_end = toml_scan_bare_key(s, off)
   let is_kv = key_end > off and toml_char_is(s, toml_skip_inline_ws_at(s, key_end), '=')
   TomlError {
-    line: toml_line_of(s, 0, off, 1),
+    line: toml_line_of(s, off),
     key: if is_kv { string_slice(s, off, key_end - off) } else { "" },
     reason: if is_kv { "unsupported or malformed value, or a repeated key" }
             else if toml_char_is(s, off, '[') { "malformed, repeated or conflicting table header" }
@@ -126,60 +118,14 @@ fn toml_error_at(s: String, off: Int) : TomlError = {
   }
 }
 
-fn toml_line_of(s: String, i: Int, off: Int, line: Int) : Int = {
-  if i >= off { line }
-  else { match char_at(s, i) {
-    None    -> line
-    Some(c) -> toml_line_of(s, i + 1, off, if c == '\n' { line + 1 } else { line })
-  } }
-}
-
-fn wt_empty() : WTbl = WTbl { ix: IxNil, keys: [], def: false }
-
-fn ix_find(t: Ix, h: Int, key: String) : Option[WVal] = match t {
-  IxNil -> None
-  IxNode(h2, k, v, l, r) ->
-    if h == h2 and k == key { Some(v) }
-    else if h < h2 { ix_find(l, h, key) }
-    else { ix_find(r, h, key) }
-}
-
-fn ix_insert(t: Ix, h: Int, key: String, v: WVal) : Ix = match t {
-  IxNil -> IxNode(h, key, v, IxNil, IxNil)
-  IxNode(h2, k, x, l, r) ->
-    if h == h2 and k == key { IxNode(h2, k, v, l, r) }
-    else if h < h2 { IxNode(h2, k, x, ix_insert(l, h, key, v), r) }
-    else { IxNode(h2, k, x, l, ix_insert(r, h, key, v)) }
-}
-
-# The raw FNV hash orders similar keys badly; reducing it modulo a prime
-# spreads them.
-fn ix_hash(key: String) : Int = string_hash(key) % 999999937
-
-fn wt_get(t: WTbl, key: String) : Option[WVal] = ix_find(t.ix, ix_hash(key), key)
-
-fn wt_put(t: WTbl, key: String, v: WVal) : WTbl = {
-  let keys = match wt_get(t, key) { None -> [key, ...t.keys]  Some(_) -> t.keys }
-  WTbl { ...t, ix: ix_insert(t.ix, ix_hash(key), key, v), keys: keys }
-}
-
-# Rejects a table that repeats a key.
-fn wt_of_pairs(ps: Pairs, acc: WTbl) : Option[WTbl] = match ps {
-  []           -> Some(acc)
-  [p, ...rest] -> match wt_get(acc, p.fst) {
-    None    -> wt_of_pairs(rest, wt_put(acc, p.fst, WLeaf(p.snd)))
-    Some(_) -> None
-  }
-}
-
-fn wt_finish(t: WTbl, keys: [String], acc: Pairs) : Pairs = wt_fin(t, keys, acc, [])
+fn wt_finish(t: Tab, keys: [String], acc: Pairs) : Pairs = wt_fin(t, keys, acc, [])
 
 # A table suspended while its child table is finished: the rest of its
 # keys, the pairs so far, and the key the child lands under.
-type FinFrame = FinTab(WTbl, [String], Pairs, String)
-              | FinAot(WTbl, [String], Pairs, String, [TomlValue])
+type FinFrame = FinTab(Tab, [String], Pairs, String)
+              | FinAot(Tab, [String], Pairs, String, [TomlValue])
 
-fn wt_fin(t: WTbl, keys: [String], acc: Pairs, frames: [FinFrame]) : Pairs = match keys {
+fn wt_fin(t: Tab, keys: [String], acc: Pairs, frames: [FinFrame]) : Pairs = match keys {
   [] -> match frames {
     []                                    -> acc
     [FinTab(pt, rest, pacc, k), ...up]    ->
@@ -196,50 +142,17 @@ fn wt_fin(t: WTbl, keys: [String], acc: Pairs, frames: [FinFrame]) : Pairs = mat
 }
 
 # A literal table or array of tables, entered by a header, becomes
-# editable; a missing key becomes an empty table.
-fn wt_enter(v: Option[WVal]) : Option[WVal] = match v {
+# editable; a missing key becomes an empty table. A literal table never
+# repeats a key: the inline-table parser rejects it.
+fn wt_enter(v: Option[Entry]) : Option[Entry] = match v {
   None -> Some(WTab(wt_empty()))
-  Some(WLeaf(TTbl(ps))) -> wt_of_pairs(ps, wt_empty()) | c => WTab(c)
+  Some(WLeaf(TTbl(ps))) -> Some(WTab(wt_of_pairs(ps, wt_empty())))
   Some(WLeaf(TArr(xs))) -> match list_reverse(xs) {
-    [TTbl(ps), ...before] -> wt_of_pairs(ps, wt_empty()) | c => WAot(all_tables(before), before, c)
+    [TTbl(ps), ...before] -> Some(WAot(all_tables(before), before, wt_of_pairs(ps, wt_empty())))
     _ -> None
   }
   _ -> v
 }
-
-# Rebuild the table at `path` below `t` with `f`; an array of tables is
-# entered at its last element.
-fn wt_edit(t: WTbl, path: [String], f: (WTbl) -> Option[WTbl]) : Option[WTbl] =
-  wt_descend(t, path, f, [])
-
-# The tables passed on the way down, nearest first, so the way back up is a loop.
-type WFrame = FTab(WTbl, String) | FAot(WTbl, String, Bool, [TomlValue])
-
-fn wt_descend(t: WTbl, path: [String], f: (WTbl) -> Option[WTbl], frames: [WFrame]) : Option[WTbl] =
-  match path {
-    [] -> match f(t) {
-      None     -> None
-      Some(nt) -> wt_ascend(nt, frames)
-    }
-    [k, ...rest] -> match wt_enter(wt_get(t, k)) {
-      Some(WTab(c)) -> wt_descend(c, rest, f, [FTab(t, k), ...frames])
-      Some(WAot(all, before, last)) -> wt_descend(last, rest, f, [FAot(t, k, all, before), ...frames])
-      _ -> None
-    }
-  }
-
-fn wt_ascend(cur: WTbl, frames: [WFrame]) : Option[WTbl] = match frames {
-  []                            -> Some(cur)
-  [FTab(t, k), ...up]           -> wt_ascend(wt_put(t, k, WTab(cur)), up)
-  [FAot(t, k, all, before), ...up] -> wt_ascend(wt_put(t, k, WAot(all, before, cur)), up)
-}
-
-# `g` rebuilds the table holding the path's last key, given that key.
-fn wt_edit_last(t: WTbl, path: [String], g: (WTbl, String) -> Option[WTbl]) : Option[WTbl] =
-  match list_reverse(path) {
-    []         -> None
-    [k, ...up] -> wt_edit(t, list_reverse(up), tb => g(tb, k))
-  }
 
 #[doc("Looks up key `k` in a TOML table's pair list, returning its value or `None`.")]
 pub fn pairs_get(ps: [Pair[String, TomlValue]], k: String)
@@ -281,51 +194,34 @@ fn toml_pairs_set_loop(ps: Pairs, k: String,
 # which `toml_error_at` turns into a user-facing location.
 fn toml_parse_lines(st: TomlSt) : Result[TomlSt, Int] = {
   let st1 = toml_skip_ws_and_comments(st)
-  if st1.i >= string_length(st1.s) { Ok(st1) }
-  else { match char_at(st1.s, st1.i) {
-    None -> Ok(st1)
-    Some(c) -> {
-      if c == '[' { match toml_parse_header(st1) {
-        None      -> Err(st1.i)
-        Some(st2) -> toml_parse_lines(st2)
-      } }
-      else if char.is_alpha(c) or char.is_digit(c) or c == '-' { match toml_parse_kv(st1) {
-        None      -> Err(st1.i)
-        Some(st2) -> toml_parse_lines(st2)
-      } }
-      else { Err(st1.i) }
+  match char_at(st1.s, st1.i) {
+    None    -> Ok(st1)
+    Some(c) -> match toml_parse_line(st1, c) {
+      None      -> Err(st1.i)
+      Some(st2) -> toml_parse_lines(st2)
     }
-  } }
+  }
 }
+
+fn toml_parse_line(st: TomlSt, c: Char) : Option[TomlSt] =
+  if c == '[' { toml_parse_header(st) }
+  else if char.is_alpha(c) or char.is_digit(c) or c == '-' { toml_parse_kv(st) }
+  else { None }
 
 # ---- Whitespace / comments / EOL ----------------------------------
 
-fn toml_is_inline_ws(c: Char) : Bool = c == ' ' or c == '\t'
-
-fn toml_is_eol(c: Char) : Bool = c == '\n' or c == '\r'
-
 # Skip inline whitespace, full-line comments, and blank lines.
 # Stops at the first character that begins a token (key or `[`).
-fn toml_skip_ws_and_comments(st: TomlSt) : TomlSt = {
-  if st.i >= string_length(st.s) { st }
-  else { match char_at(st.s, st.i) {
-    None    -> st
-    Some(c) -> {
-      if toml_is_inline_ws(c) or toml_is_eol(c) {
-        toml_skip_ws_and_comments(toml_advance(st))
-      } else if c == '#' {
-        toml_skip_ws_and_comments(toml_skip_to_eol(st))
-      } else { st }
-    }
-  } }
+fn toml_skip_ws_and_comments(st: TomlSt) : TomlSt = match char_at(st.s, st.i) {
+  None      -> st
+  Some('#') -> toml_skip_ws_and_comments(toml_skip_to_eol(st))
+  Some(c)   -> if toml_is_inline_ws(c) or toml_is_eol(c) { toml_skip_ws_and_comments(toml_advance(st)) }
+               else { st }
 }
 
-fn toml_skip_to_eol(st: TomlSt) : TomlSt = {
-  if st.i >= string_length(st.s) { st }
-  else { match char_at(st.s, st.i) {
-    None    -> st
-    Some(c) -> if toml_is_eol(c) { st } else { toml_skip_to_eol(toml_advance(st)) }
-  } }
+fn toml_skip_to_eol(st: TomlSt) : TomlSt = match char_at(st.s, st.i) {
+  None    -> st
+  Some(c) -> if toml_is_eol(c) { st } else { toml_skip_to_eol(toml_advance(st)) }
 }
 
 # After a value, demand: optional inline ws, optional `#` comment,
@@ -333,18 +229,20 @@ fn toml_skip_to_eol(st: TomlSt) : TomlSt = {
 # trailing-garbage error.
 fn toml_demand_eol(st: TomlSt) : Option[TomlSt] = {
   let st1 = toml_skip_inline_ws_at_st(st)
-  if st1.i >= string_length(st1.s) { Some(st1) }
-  else { match char_at(st1.s, st1.i) {
-    None    -> Some(st1)
-    Some(c) -> {
-      if c == '#' { Some(toml_skip_to_eol(st1)) }
-      else if toml_is_eol(c) { Some(toml_advance(st1)) }
-      else { None }
-    }
-  } }
+  match char_at(st1.s, st1.i) {
+    None      -> Some(st1)
+    Some('#') -> Some(toml_skip_to_eol(st1))
+    Some(c)   -> if toml_is_eol(c) { Some(toml_advance(st1)) } else { None }
+  }
 }
 
 fn toml_advance(st: TomlSt) : TomlSt = toml_jump(st, 1)
+
+fn toml_jump(st: TomlSt, n: Int) : TomlSt =
+  TomlSt { ...st, i: st.i + n }
+
+fn toml_skip_inline_ws_at_st(st: TomlSt) : TomlSt =
+  TomlSt { ...st, i: toml_skip_inline_ws_at(st.s, st.i) }
 
 # ---- Headers: [a.b] and [[a.b]] -----------------------------------
 
@@ -388,17 +286,17 @@ fn toml_parse_key_segment(st: TomlSt) : Option[Pair[TomlSt, String]] =
   }
 
 fn toml_open_table(st: TomlSt, path: [String]) : Option[TomlSt] =
-  wt_edit_last(st.root, path, (t, k) => match wt_get(t, k) {
+  wt_edit_last(st.root, path, wt_enter, (t, k) => match wt_get(t, k) {
     None -> Some(wt_put(t, k, WTab(WTbl { ...wt_empty(), def: true })))
     Some(WTab(c)) -> if c.def { None } else { Some(wt_put(t, k, WTab(WTbl { ...c, def: true }))) }
-    Some(WLeaf(TTbl(ps))) -> wt_of_pairs(ps, wt_empty()) | c => wt_put(t, k, WTab(WTbl { ...c, def: true }))
+    Some(WLeaf(TTbl(ps))) -> Some(wt_put(t, k, WTab(WTbl { ...wt_of_pairs(ps, wt_empty()), def: true })))
     Some(_) -> None
   }) | r => TomlSt { ...st, root: r, hdr: path }
 
 # Each `[[path]]` element starts fresh: the tables defined below the
 # previous one may be defined again.
 fn toml_open_array_table(st: TomlSt, path: [String]) : Option[TomlSt] =
-  wt_edit_last(st.root, path, (t, k) => match wt_get(t, k) {
+  wt_edit_last(st.root, path, wt_enter, (t, k) => match wt_get(t, k) {
     None -> Some(wt_put(t, k, WAot(true, [], wt_empty())))
     Some(WAot(true, before, last)) ->
       Some(wt_put(t, k, WAot(true, [TTbl(wt_finish(last, last.keys, [])), ...before], wt_empty())))
@@ -408,185 +306,69 @@ fn toml_open_array_table(st: TomlSt, path: [String]) : Option[TomlSt] =
     Some(_) -> None
   }) | r => TomlSt { ...st, root: r, hdr: path }
 
-fn toml_skip_inline_ws_at(s: String, i: Int) : Int = {
-  if i >= string_length(s) { i }
-  else { match char_at(s, i) {
-    None    -> i
-    Some(c) -> if toml_is_inline_ws(c) { toml_skip_inline_ws_at(s, i + 1) } else { i }
-  } }
-}
-
-# ---- Bare keys ----------------------------------------------------
-
-fn toml_scan_bare_key(s: String, i: Int) : Int = {
-  if i >= string_length(s) { i }
-  else { match char_at(s, i) {
-    None    -> i
-    Some(c) -> if char.is_alnum(c) or c == '-' or c == '_' { toml_scan_bare_key(s, i + 1) }
-               else { i }
-  } }
-}
-
 # ---- key = value --------------------------------------------------
 
-fn toml_parse_kv(st: TomlSt) : Option[TomlSt] = {
+# `key =` at the cursor: the key and the state at the start of its value.
+fn toml_parse_key_eq(st: TomlSt) : Option[Pair[String, TomlSt]] = {
   let key_end = toml_scan_bare_key(st.s, st.i)
   let eq = toml_skip_inline_ws_at(st.s, key_end)
   if key_end == st.i or not toml_char_is(st.s, eq, '=') { None }
-  else {
-    let key = string_slice(st.s, st.i, key_end - st.i)
-    let at_val = TomlSt { ...st, i: toml_skip_inline_ws_at(st.s, eq + 1) }
-    toml_parse_value(at_val, 0) || p => {
+  else { Some(Pair {
+    fst: string_slice(st.s, st.i, key_end - st.i),
+    snd: TomlSt { ...st, i: toml_skip_inline_ws_at(st.s, eq + 1) },
+  }) }
+}
+
+fn toml_parse_kv(st: TomlSt) : Option[TomlSt] =
+  toml_parse_key_eq(st) || k => {
+    toml_parse_value(k.snd) || p => {
       toml_demand_eol(p.fst) || e => {
-        wt_edit(e.root, e.hdr, t => match wt_get(t, key) {
-          None    -> Some(wt_put(t, key, WLeaf(p.snd)))
+        wt_edit(e.root, e.hdr, wt_enter, t => match wt_get(t, k.fst) {
+          None    -> Some(wt_put(t, k.fst, WLeaf(p.snd)))
           Some(_) -> None
         }) | r => TomlSt { ...e, root: r }
       }
     }
   }
-}
 
 # ---- Values ------------------------------------------------------
 #
 # Returns Pair(state-after-value, value). The caller threads state
 # through demand_eol + install_kv.
 
-fn toml_parse_value(st: TomlSt, depth: Int) : Option[Pair[TomlSt, TomlValue]] = {
-  if st.i >= string_length(st.s) { None }
-  else { char_at(st.s, st.i) || c => {
-      if c == '"' { toml_parse_string(st) }
-      else if c == '[' { toml_parse_array(toml_jump(st, 1), [], depth) }
-      else if c == '{' { toml_parse_inline_table(st) }
-      else if c == 't' or c == 'f' {
-        let word = if c == 't' { "true" } else { "false" }
-        let n = string_length(word)
-        if st.i + n <= string_length(st.s) and string_slice(st.s, st.i, n) == word {
-          Some(Pair { fst: toml_jump(st, n), snd: TBool(c == 't') })
-        } else { None }
-      }
-      else if toml_is_sign_at(st.s, st.i) or char.is_digit(c) {
-        toml_parse_number(st)
-      }
-      else { None }
-    } }
-}
-
-# A number is an integer unless a fractional or exponent part
-# follows its digits, in which case it is a float. A fraction is `.`
-# and at least one digit; an exponent is `e` or `E`, an optional sign
-# and at least one digit. `string_to_real` reads the `-` itself, so a
-# leading `+` is dropped.
-fn toml_parse_number(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] = {
-  let s = st.s
-  let from = if toml_char_is(s, st.i, '+') { st.i + 1 } else { st.i }
-  let int_start = if toml_is_sign_at(s, st.i) { st.i + 1 } else { st.i }
-  let int_end = toml_digits_end(s, int_start)
-  let frac_digits = toml_digits_end(s, int_end + 1)
-  let frac_end = if toml_char_is(s, int_end, '.') and frac_digits > int_end + 1 { frac_digits } else { int_end }
-  let exp_start = if toml_is_sign_at(s, frac_end + 1) { frac_end + 2 } else { frac_end + 1 }
-  let exp_digits = toml_digits_end(s, exp_start)
-  let has_exp = (toml_char_is(s, frac_end, 'e') or toml_char_is(s, frac_end, 'E')) and exp_digits > exp_start
-  let end = if has_exp { exp_digits } else { frac_end }
-  if int_end == int_start { None }
-  else if end == int_end {
-    string_to_int(string_slice(s, from, int_end - from)) | m => Pair { fst: toml_jump(st, int_end - st.i), snd: TInt(m) }
-  } else {
-    string_to_real(string_slice(s, from, end - from)) | r => Pair { fst: toml_jump(st, end - st.i), snd: TReal(r) }
+fn toml_parse_value(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] =
+  char_at(st.s, st.i) || c => match c {
+    '"' -> toml_parse_string(st)
+    '[' -> toml_array_loop(toml_jump(st, 1), [], [], AElem)
+    '{' -> toml_parse_inline_table(st)
+    't' -> toml_parse_word(st, "true", TBool(true))
+    'f' -> toml_parse_word(st, "false", TBool(false))
+    _   -> if toml_is_sign_at(st.s, st.i) or char.is_digit(c) { toml_parse_number(st) } else { None }
   }
+
+fn toml_parse_word(st: TomlSt, word: String, v: TomlValue) : Option[Pair[TomlSt, TomlValue]] = {
+  let n = string_length(word)
+  if st.i + n <= string_length(st.s) and string_slice(st.s, st.i, n) == word {
+    Some(Pair { fst: toml_jump(st, n), snd: v })
+  } else { None }
 }
 
-fn toml_is_sign_at(s: String, i: Int) : Bool =
-  toml_char_is(s, i, '-') or toml_char_is(s, i, '+')
-
-fn toml_char_is(s: String, i: Int, c: Char) : Bool = {
-  match char_at(s, i) {
-    None    -> false
-    Some(x) -> x == c
+# `string_to_real` reads the sign itself; a leading `+` is outside the slice.
+fn toml_parse_number(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] =
+  toml_scan_number(st.s, st.i) || n => {
+    let text = string_slice(st.s, n.from, n.end - n.from)
+    let next = toml_jump(st, n.end - st.i)
+    if n.end == n.int_end { string_to_int(text) | m => Pair { fst: next, snd: TInt(m) } }
+    else { string_to_real(text) | r => Pair { fst: next, snd: TReal(r) } }
   }
-}
-
-fn toml_digits_end(s: String, i: Int) : Int = {
-  if i >= string_length(s) { i }
-  else { match char_at(s, i) {
-    None    -> i
-    Some(c) -> if char.is_digit(c) { toml_digits_end(s, i + 1) } else { i }
-  } }
-}
-
-fn toml_jump(st: TomlSt, n: Int) : TomlSt =
-  TomlSt { ...st, i: st.i + n }
-
-# ---- Strings (basic, single-line) ---------------------------------
 
 fn toml_parse_string(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] =
-  toml_parse_string_loop(st, st.i + 1, st.i + 1, [])
-
-# `run` starts the pending stretch of plain characters; `parts` holds
-# the decoded pieces, newest first.
-fn toml_parse_string_loop(st: TomlSt, i: Int, run: Int, parts: [String])
-                          : Option[Pair[TomlSt, TomlValue]] = {
-  if i >= string_length(st.s) { None }
-  else { match char_at(st.s, i) {
-    None    -> None
-    Some(c) -> {
-      if c == '"' {
-        let done = toml_flush(st.s, run, i, parts)
-        Some(Pair { fst: TomlSt { ...st, i: i + 1 }, snd: TStr(string_concat_all(list_reverse(done))) })
-      } else if c == '\\' {
-        match toml_escape(char_at(st.s, i + 1)) {
-          None      -> None
-          Some(esc) -> toml_parse_string_loop(st, i + 2, i + 2,
-                         [esc, ...toml_flush(st.s, run, i, parts)])
-        }
-      } else if toml_is_eol(c) { None }
-      else { toml_parse_string_loop(st, i + 1, run, parts) }
-    }
-  } }
-}
-
-# Prepends the slice `s[from, to)` to `parts` when it is non-empty.
-fn toml_flush(s: String, from: Int, to: Int, parts: [String]) : [String] =
-  if to > from { [string_slice(s, from, to - from), ...parts] } else { parts }
-
-fn toml_escape(c: Option[Char]) : Option[String] = match c {
-  Some('"')  -> Some("\"")
-  Some('\\') -> Some("\\")
-  Some('n')  -> Some("\n")
-  Some('r')  -> Some("\r")
-  Some('t')  -> Some("\t")
-  _          -> None
-}
+  toml_scan_string(st.s, st.i) | p => Pair { fst: toml_jump(st, p.fst - st.i), snd: TStr(p.snd) }
 
 # ---- Arrays ["a", "b"] --------------------------------------------
 #
 # Newlines and comments may separate elements, so a value list can
 # span lines. Trailing comma accepted. Arrays nest.
-
-# Nesting deeper than this switches to the work-stack driver below.
-const TOML_DEPTH : Int = 12
-
-fn toml_parse_array(st: TomlSt, acc: [TomlValue], depth: Int) : Option[Pair[TomlSt, TomlValue]] = {
-  if depth >= TOML_DEPTH { toml_array_loop(st, [], acc, AElem) }
-  else {
-    let st1 = toml_skip_ws_and_comments(st)
-    if toml_char_is(st1.s, st1.i, ']') {
-      Some(Pair { fst: toml_jump(st1, 1), snd: TArr(list_reverse(acc)) })
-    } else {
-      match toml_parse_value(st1, depth + 1) {
-        None    -> None
-        Some(p) -> {
-          let st2 = toml_skip_ws_and_comments(p.fst)
-          let more = [p.snd, ...acc]
-          if toml_char_is(st2.s, st2.i, ']') {
-            Some(Pair { fst: toml_jump(st2, 1), snd: TArr(list_reverse(more)) })
-          } else if toml_char_is(st2.s, st2.i, ',') { toml_parse_array(toml_jump(st2, 1), more, depth) }
-          else { None }
-        }
-      }
-    }
-  }
-}
 
 # An array left open while its nested array is parsed.
 type TomlArrFrame = AFrame([TomlValue])
@@ -605,7 +387,7 @@ fn toml_array_loop(st: TomlSt, stack: [TomlArrFrame], acc: [TomlValue], mode: To
     if toml_char_is(st1.s, st1.i, ']') { toml_array_loop(st1, stack, acc, AValue(None)) }
     else if toml_char_is(st1.s, st1.i, '[') {
       toml_array_loop(toml_jump(st1, 1), [AFrame(acc), ...stack], [], AElem)
-    } else { match toml_parse_value(st1, 0) {
+    } else { match toml_parse_value(st1) {
       None    -> None
       Some(p) -> toml_array_loop(p.fst, stack, acc, AValue(Some(p.snd)))
     } }
@@ -634,46 +416,41 @@ fn toml_array_loop(st: TomlSt, stack: [TomlArrFrame], acc: [TomlValue], mode: To
 # inline tables (this subset prohibits nesting).
 
 fn toml_parse_inline_table(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] = {
-  # Cursor at `{`. Step over.
-  let st1 = toml_jump(st, 1)
-  let st2 = toml_skip_inline_ws_at_st(st1)
-  char_at(st2.s, st2.i) || c => if c == '}' {
-      Some(Pair { fst: toml_jump(st2, 1), snd: TTbl([]) })
-    } else { toml_parse_inline_pairs(st2, []) }
+  let st1 = toml_skip_inline_ws_at_st(toml_jump(st, 1))
+  match char_at(st1.s, st1.i) {
+    None      -> None
+    Some('}') -> Some(Pair { fst: toml_jump(st1, 1), snd: TTbl([]) })
+    Some(_)   -> toml_parse_inline_pairs(st1, wt_empty())
+  }
 }
 
-fn toml_skip_inline_ws_at_st(st: TomlSt) : TomlSt = {
-  let j = toml_skip_inline_ws_at(st.s, st.i)
-  TomlSt { ...st, i: j }
-}
-
-fn toml_parse_inline_pairs(st: TomlSt, acc: Pairs) : Option[Pair[TomlSt, TomlValue]] = {
-  let key_end = toml_scan_bare_key(st.s, st.i)
-  let eq = toml_skip_inline_ws_at(st.s, key_end)
-  if key_end == st.i or not toml_char_is(st.s, eq, '=') { None }
-  else {
-    let key = string_slice(st.s, st.i, key_end - st.i)
-    let at_val = TomlSt { ...st, i: toml_skip_inline_ws_at(st.s, eq + 1) }
-    match toml_parse_inline_value(at_val) {
-      None    -> None
-      Some(_) if pairs_get(acc, key) != None -> None
-      Some(p) -> {
-        let after = toml_skip_inline_ws_at_st(p.fst)
-        let more = [Pair { fst: key, snd: p.snd }, ...acc]
-        if toml_char_is(after.s, after.i, ',') {
-          toml_parse_inline_pairs(toml_skip_inline_ws_at_st(toml_jump(after, 1)), more)
-        } else if toml_char_is(after.s, after.i, '}') {
-          Some(Pair { fst: toml_jump(after, 1), snd: TTbl(list_reverse(more)) })
-        } else { None }
+# `acc` indexes the pairs read so far, so a repeated key is found without a scan.
+# The loop is one self-recursive function matching, not binding with `||`:
+# only a direct self tail call runs in constant stack.
+fn toml_parse_inline_pairs(st: TomlSt, acc: Tab) : Option[Pair[TomlSt, TomlValue]] =
+  match toml_parse_key_eq(st) {
+    None    -> None
+    Some(k) -> match wt_get(acc, k.fst) {
+      Some(_) -> None
+      None    -> match toml_parse_inline_value(k.snd) {
+        None    -> None
+        Some(p) -> {
+          let after = toml_skip_inline_ws_at_st(p.fst)
+          let more = wt_put(acc, k.fst, WLeaf(p.snd))
+          match char_at(after.s, after.i) {
+            Some(',') -> toml_parse_inline_pairs(toml_skip_inline_ws_at_st(toml_jump(after, 1)), more)
+            Some('}') -> Some(Pair { fst: toml_jump(after, 1), snd: TTbl(wt_finish(more, more.keys, [])) })
+            _         -> None
+          }
+        }
       }
     }
   }
-}
 
 # Inline-table value: a regular value but no `[` or `{` (no nesting).
 fn toml_parse_inline_value(st: TomlSt) : Option[Pair[TomlSt, TomlValue]] =
   if toml_char_is(st.s, st.i, '[') or toml_char_is(st.s, st.i, '{') { None }
-  else { toml_parse_value(st, 0) }
+  else { toml_parse_value(st) }
 
 # ---- Encoder ------------------------------------------------------
 # Round-trips the parser's subset to a canonical form: scalar keys
@@ -726,11 +503,6 @@ fn all_tables(xs: [TomlValue]) : Bool = {
 fn toml_enc_scalar_line(k: String, v: TomlValue) : String =
   string_concat_all([toml_enc_key(k), " = ", toml_enc_scalar(v), "\n"])
 
-# A key outside the bare charset, or empty, is written as a basic string.
-fn toml_enc_key(k: String) : String =
-  if k != "" and toml_scan_bare_key(k, 0) == string_length(k) { k }
-  else { string_concat_all(["\"", string_concat_all(list_reverse(toml_enc_str_escape(k, 0, 0, []))), "\""]) }
-
 # Inside a [section], scalars are flat; nested tables become inline
 # tables (the parser only accepts one section level deep).
 fn toml_enc_table(open: String, close: String, name: String, ps: Pairs) : String =
@@ -739,35 +511,14 @@ fn toml_enc_table(open: String, close: String, name: String, ps: Pairs) : String
 
 # Encode a single value as it appears on the right-hand side of
 # `key = ...`. Inline tables and arrays are single-line.
-fn toml_enc_scalar(v: TomlValue) : String = toml_enc_at(v, 0)
-
-fn toml_enc_at(v: TomlValue, depth: Int) : String =
-  if depth >= TOML_DEPTH { string_concat_all(list_reverse(toml_enc_loop([toml_enc_item(v)], []))) }
-  else { match v {
-    TStr(s)  -> string_concat_all(["\"", string_concat_all(list_reverse(toml_enc_str_escape(s, 0, 0, []))), "\""])
-    TBool(b) -> if b { "true" } else { "false" }
-    TInt(n)  -> int_to_string(n)
-    TReal(r) -> toml_enc_real(r)
-    TArr(xs) -> string_concat_all(["[", toml_join_elems(xs, depth + 1, []), "]"])
-    TTbl(ps) -> string_concat_all(["{ ", toml_join_members(ps, depth + 1, []), " }"])
-  } }
-
-# Elements rendered at `depth`, comma-joined.
-fn toml_join_elems(xs: [TomlValue], depth: Int, acc: [String]) : String = match xs {
-  []           -> string.join(list_reverse(acc), ", ")
-  [x, ...rest] -> toml_join_elems(rest, depth, [toml_enc_at(x, depth), ...acc])
-}
-
-fn toml_join_members(ps: Pairs, depth: Int, acc: [String]) : String = match ps {
-  []           -> string.join(list_reverse(acc), ", ")
-  [p, ...rest] -> toml_join_members(rest, depth, [string_concat_all([toml_enc_key(p.fst), " = ", toml_enc_at(p.snd, depth)]), ...acc])
-}
+fn toml_enc_scalar(v: TomlValue) : String =
+  string_concat_all(list_reverse(toml_enc_loop([toml_enc_item(v)], [])))
 
 # Pending output of the encoder: final text, or a container still to expand.
 type TomlEnc = TencText(String) | TencArr([TomlValue]) | TencTbl(Pairs)
 
 fn toml_enc_item(v: TomlValue) : TomlEnc = match v {
-  TStr(s)  -> TencText(string_concat_all(["\"", string_concat_all(list_reverse(toml_enc_str_escape(s, 0, 0, []))), "\""]))
+  TStr(s)  -> TencText(toml_quote(s))
   TBool(b) -> TencText(if b { "true" } else { "false" })
   TInt(n)  -> TencText(int_to_string(n))
   TReal(r) -> TencText(toml_enc_real(r))
@@ -802,44 +553,6 @@ fn toml_enc_members(rev: Pairs, acc: [TomlEnc]) : [TomlEnc] = match rev {
 
 fn toml_enc_comma(acc: [TomlEnc], sep: Bool) : [TomlEnc] =
   if sep { [TencText(", "), ...acc] } else { acc }
-
-# A TOML float needs a `.` or an exponent; `real_to_string` drops
-# both for integral values, which would re-decode as an integer.
-fn toml_enc_real(r: Real) : String = {
-  if real_is_nan(r) { "nan" }
-  else if real_is_inf(r) { if r < 0.0 { "-inf" } else { "inf" } }
-  else {
-    let s = real_to_string(r)
-    if toml_has_real_mark(s, 0) { s } else { string_concat(s, ".0") }
-  }
-}
-
-fn toml_has_real_mark(s: String, i: Int) : Bool = {
-  if i >= string_length(s) { false }
-  else { match char_at(s, i) {
-    None    -> false
-    Some(c) -> if c == '.' or c == 'e' or c == 'E' { true }
-               else { toml_has_real_mark(s, i + 1) }
-  } }
-}
-
-fn toml_enc_str_escape(s: String, i: Int, run: Int, parts: [String]) : [String] = {
-  if i >= string_length(s) { toml_flush(s, run, i, parts) }
-  else { match char_at(s, i) {
-    None    -> toml_flush(s, run, i, parts)
-    Some(c) -> {
-      let esc =
-        if c == '"'      { "\\\"" }
-        else if c == '\\' { "\\\\" }
-        else if c == '\n' { "\\n" }
-        else if c == '\r' { "\\r" }
-        else if c == '\t' { "\\t" }
-        else { "" }
-      if esc == "" { toml_enc_str_escape(s, i + 1, run, parts) }
-      else { toml_enc_str_escape(s, i + 1, i + 1, [esc, ...toml_flush(s, run, i, parts)]) }
-    }
-  } }
-}
 
 #[doc("Round-trip helper: parse → encode for tests + lockfile rewriting.")]
 pub fn round_trip(src: String) : Option[String] = {
