@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.176.0 (2026-10-24)
+
+### BREAKING CHANGE
+
+- **net.http**: `RedirectPolicy.preserve_method_307_308` is removed. It had no effect: a 307 or 308 redirect always keeps the method and body, as RFC 9110 requires. Delete the field from any `RedirectPolicy { … }` literal.
+
+### Added
+
+- **core string search**: `string.contains`, `string.count` (non-overlapping), `string.last_index_of` (byte offset, pairs with `byte_slice`), `string.char_last_index_of` (codepoint index, pairs with `slice`) and `string.split_once`, which returns `Option[(String, String)]`.
+- **net.url**: a new RFC 3986 module. It provides the `Url` record, `parse` (errors name the byte offset), `to_string`, `resolve` (reference resolution), `percent_encode` / `percent_decode`, and `query_pairs` / `query_string`. `net.http` keeps its own lenient `parse_url`, so HTTP programs neither pay for this module nor change behaviour.
+- **encoding.utf8**: a new module. `decode` validates `[Byte]` and returns `Err(offset)` at the first ill-formed sequence (overlongs, surrogates, codepoints above U+10FFFF, truncation). `decode_lossy` substitutes U+FFFD for each maximal ill-formed subpart. `is_valid` and `encode` complete it. `string.from_bytes` stays unchecked.
+- **encoding.json**: `json_decode_report` returns `Result[JsonValue, JsonParseError]`, where the error carries the byte offset, the 1-based line, the 1-based column in characters, and the reason. `json_decode` accepts and rejects exactly what it did before.
+- **crypto.legacy**: `sha1` and `md5`, for interoperability: the WebSocket handshake, git object ids, UUID v3/v5, ETags. Both are broken for security, and they live in their own module so that the import flags the legacy use.
+
+### Changed
+
+- The core string search functions add a small fixed compile cost to every program, measured under 0.5 % on an empty program.
+
 ## v0.175.0 (2026-10-24)
 
 ### BREAKING CHANGE
