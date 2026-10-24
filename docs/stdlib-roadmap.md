@@ -129,6 +129,7 @@ What's still open (planned-but-not-shipped):
 |---------------------------------|---------|--------------------------------------------------------------------------------------------------|
 | `fs/file` extras (M2)           | #345 follow-up | `metadata` (`FileMetadata` record + `stat(2)`), `read_bytes`/`write_bytes` (`[Int]` byte arrays). M1 (`file_exists`, `file_delete`, `file_rename`) shipped via #345 |
 | `net/http` server-side primitives | #605  | minimal `#[unstable]` helpers (`http_parse_request`, `http_serialize_response`, `http_status_reason`, `http_read_request`) shipped in `stdlib/net/http.kai`. A full server framework (router, middleware, graceful shutdown) remains a `manutara` concern. |
+| `net/http` contract tests + quality floor | #3149 | wire-level and loopback contract tests (`tests/stdlib/http_wire_test.kai`, `http_loopback_test.kai`), mutation sweep with zero unexplained survivors, parsing flattened into shared helpers (`km score` B). Fixes: invalid ports, empty header names, query-only URLs, case-insensitive `chunked`, truncated `read_request` bodies. |
 
 (`net/udp` shipped via #354 and `net/dns` via #352 — both moved out of
 this open list into *Current inventory*. The `Net` alias follow-up is
