@@ -11,6 +11,9 @@ RE2-compatible subset:
   - Groups (...) capturing, (?:...) non-capturing.
   - Alternation a|b.
 
+Matching is by codepoint; match offsets are byte offsets. Repeat
+counts above 1000 and inverted class ranges are compile errors.
+
 Out of scope: backreferences, lookaround, Unicode property
 classes, non-greedy quantifiers, named captures, inline flags.
 
@@ -97,14 +100,21 @@ fn rx_state_init(input: String) : RxParseState =
 
 fn rx_at_end(st: RxParseState) : Bool = st.pos >= st.n
 
+# Positions are byte offsets that always sit on a codepoint boundary.
+fn rx_cp_at(s: String, i: Int) : Char = int_to_char(string_cp_at(s, i))
+
+# Byte offset following the codepoint at `i`; past the end it moves one byte.
+fn rx_next_pos(s: String, i: Int) : Int =
+  if i >= string_length(s) { i + 1 } else { i + string_cp_len(s, i) }
+
 fn rx_peek(st: RxParseState) : Option[Char] =
-  if rx_at_end(st) { None } else { char_at(st.input, st.pos) }
+  if rx_at_end(st) { None } else { Some(rx_cp_at(st.input, st.pos)) }
 
 fn rx_peek_at(st: RxParseState, off: Int) : Option[Char] =
-  if st.pos + off >= st.n { None } else { char_at(st.input, st.pos + off) }
+  if st.pos + off >= st.n { None } else { Some(rx_cp_at(st.input, st.pos + off)) }
 
 fn rx_advance(st: RxParseState) : RxParseState =
-  RxParseState { input: st.input, pos: st.pos + 1, n: st.n, group_id: st.group_id }
+  RxParseState { input: st.input, pos: rx_next_pos(st.input, st.pos), n: st.n, group_id: st.group_id }
 
 fn rx_advance_n(st: RxParseState, k: Int) : RxParseState =
   RxParseState { input: st.input, pos: st.pos + k, n: st.n, group_id: st.group_id }
@@ -233,42 +243,52 @@ fn rx_apply_quantifier(st: RxParseState, p: RxAst) : PRx = {
   }
 }
 
+# Largest count a `{n}`, `{n,}` or `{n,m}` quantifier accepts.
+fn rx_max_repeat() : Int = 1000
+
+fn rx_repeat_too_big(st: RxParseState) : PRx =
+  rx_err(st, "repeat count exceeds 1000")
+
 # {n}, {n,}, {n,m}. Reject malformed forms (`{}`, `{,5}`,
-# `{2,1}`).
+# `{2,1}`) and counts above the limit.
 fn rx_parse_repeat(st: RxParseState, p: RxAst) : PRx = {
   let rn = rx_parse_int(st)
   match rn.r_int {
-    None    -> rx_err(rn.st, "expected count after `{`")
-    Some(lo) -> match rx_peek(rn.st) {
-      Some(c) -> if c == '}' {
-        rx_ok(rx_advance(rn.st), RxRepeat(p, lo, Some(lo)))
-      } else if c == ',' {
-        let st_after_comma = rx_advance(rn.st)
-        match rx_peek(st_after_comma) {
-          Some(c2) -> if c2 == '}' {
-            rx_ok(rx_advance(st_after_comma), RxRepeat(p, lo, None))
-          } else {
-            let rh = rx_parse_int(st_after_comma)
-            match rh.r_int {
-              None -> rx_err(rh.st, "expected count or `}` after `,`")
-              Some(hi) ->
-                if hi < lo { rx_err(rh.st, "repeat count {n,m}: m < n") }
-                else { match rx_peek(rh.st) {
-                  Some('}') -> rx_ok(rx_advance(rh.st), RxRepeat(p, lo, Some(hi)))
-                  _         -> rx_err(rh.st, "expected `}` to close repeat")
-                } }
-            }
-          }
-          None -> rx_err(st_after_comma, "unterminated `{`")
-        }
-      } else { rx_err(rn.st, "expected `,` or `}` after count") }
-      None -> rx_err(rn.st, "unterminated `{`")
+    None     -> rx_err(rn.st, "expected count after `{`")
+    Some(lo) -> if lo > rx_max_repeat() { rx_repeat_too_big(rn.st) } else { rx_parse_repeat_tail(rn.st, p, lo) }
+  }
+}
+
+# After `{lo`: `}`, or `,` and an optional upper bound.
+fn rx_parse_repeat_tail(st: RxParseState, p: RxAst, lo: Int) : PRx = match rx_peek(st) {
+  None      -> rx_err(st, "unterminated `{`")
+  Some('}') -> rx_ok(rx_advance(st), RxRepeat(p, lo, Some(lo)))
+  Some(',') -> rx_parse_repeat_upper(rx_advance(st), p, lo)
+  Some(_)   -> rx_err(st, "expected `,` or `}` after count")
+}
+
+fn rx_parse_repeat_upper(st: RxParseState, p: RxAst, lo: Int) : PRx = match rx_peek(st) {
+  None      -> rx_err(st, "unterminated `{`")
+  Some('}') -> rx_ok(rx_advance(st), RxRepeat(p, lo, None))
+  Some(_)   -> {
+    let rh = rx_parse_int(st)
+    match rh.r_int {
+      None     -> rx_err(rh.st, "expected count or `}` after `,`")
+      Some(hi) ->
+        if hi > rx_max_repeat() { rx_repeat_too_big(rh.st) }
+        else if hi < lo { rx_err(rh.st, "repeat count {n,m}: m < n") }
+        else { match rx_peek(rh.st) {
+          Some('}') -> rx_ok(rx_advance(rh.st), RxRepeat(p, lo, Some(hi)))
+          _         -> rx_err(rh.st, "expected `}` to close repeat")
+        } }
     }
   }
 }
 
 # Parse a base-10 integer of one or more digits. Returns the
 # advanced state and the parsed value (or None if no digits).
+# The value saturates just above the repeat limit, so long digit runs
+# cannot overflow.
 type RxIntParse = { st: RxParseState, r_int: Option[Int] }
 
 fn rx_parse_int(st: RxParseState) : RxIntParse =
@@ -278,7 +298,7 @@ fn rx_parse_int_loop(st: RxParseState, acc: Int, any: Bool) : RxIntParse = {
   match rx_peek(st) {
     Some(c) -> if char.is_digit(c) {
       let d = char_to_int(c) - char_to_int('0')
-      rx_parse_int_loop(rx_advance(st), acc * 10 + d, true)
+      rx_parse_int_loop(rx_advance(st), if acc > rx_max_repeat() { acc } else { acc * 10 + d }, true)
     } else {
       RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
     }
@@ -357,7 +377,9 @@ fn rx_parse_class_atom(st: RxParseState, c: Char) : RxRangeParse = {
                 }
                 match res_hi.r_char {
                   None     -> RxRangeParse { st: res_hi.st, r_range: None }
-                  Some(hi) -> RxRangeParse { st: res_hi.st, r_range: Some(CR(lo, hi)) }
+                  Some(hi) ->
+                    if char_to_int(hi) < char_to_int(lo) { RxRangeParse { st: res_hi.st, r_range: None } }
+                    else { RxRangeParse { st: res_hi.st, r_range: Some(CR(lo, hi)) } }
                 }
               }
               None -> RxRangeParse { st: st_dash, r_range: None }
@@ -397,8 +419,7 @@ fn rx_parse_escape(st: RxParseState) : PRx = {
 fn rx_word_ranges() : [CharRange] =
   [CR('A', 'Z'), CR('a', 'z'), CR('0', '9'), CR('_', '_')]
 
-# Whitespace: space, tab, newline, carriage-return, vertical-tab,
-# form-feed.
+# Whitespace: space, tab, newline, carriage-return.
 fn rx_space_ranges() : [CharRange] =
   [CR(' ', ' '), CR('\t', '\t'), CR('\n', '\n'), CR('\r', '\r')]
 
@@ -920,10 +941,7 @@ fn rx_search_loop(sim: RxSim, pos: Int, stepped: [Thread], best: Option[Match],
   }
   if pos >= sim.n or done { best1 }
   else {
-    match char_at(sim.input, pos) {
-      None    -> best1
-      Some(c) -> rx_search_loop(sim, pos + 1, rx_step(sim, live, c, []), best1, cl.seen)
-    }
+    rx_search_loop(sim, rx_next_pos(sim.input, pos), rx_step(sim, live, rx_cp_at(sim.input, pos), []), best1, cl.seen)
   }
 }
 
@@ -1099,11 +1117,15 @@ fn rx_find_all_loop(sim: RxSim, from_pos: Int, acc: [Match]) : [Match] = {
   else { match rx_search(sim, from_pos) {
     None -> list_reverse(acc)
     Some(m) -> {
-      let next = if m.end > m.start { m.end } else { m.start + 1 }
-      rx_find_all_loop(sim, next, [m, ...acc])
+      rx_find_all_loop(sim, rx_after(sim, m), [m, ...acc])
     }
   } }
 }
+
+# Where the scan resumes after `m`: its end, or the next codepoint when
+# the match is empty.
+fn rx_after(sim: RxSim, m: Match) : Int =
+  if m.end > m.start { m.end } else { rx_next_pos(sim.input, m.start) }
 
 #[doc("""
 Replace every non-overlapping match with `replacement`. The
@@ -1124,13 +1146,10 @@ fn rx_replace_loop(sim: RxSim, repl: String, from_pos: Int, parts: [String]) : [
       # replacement. Advance to m.end (or +1 on a zero-width match).
       let prefix = string_slice(sim.input, from_pos, m.start - from_pos)
       let parts1 = [string_concat_all(list_reverse(rx_expand_loop(repl, 0, string_length(repl), m, sim.input, []))), prefix, ...parts]
-      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      let next = rx_after(sim, m)
       # Zero-width: also copy the skipped char so it is not lost.
       let parts2 = if m.end == m.start and m.start < sim.n {
-        match char_at(sim.input, m.start) {
-          Some(c) -> [int_to_byte_string(char_to_int(c)), ...parts1]
-          None    -> parts1
-        }
+        [string_slice(sim.input, m.start, next - m.start), ...parts1]
       } else { parts1 }
       rx_replace_loop(sim, repl, next, parts2)
     }
@@ -1183,25 +1202,25 @@ fn rx_group_span(caps: [Capture], gid: Int, src: String) : String = match caps {
 #[doc("""
 Split `s` at every non-overlapping match of `re`. The match
 itself is excluded from the output (mirrors Python `re.split`).
-Empty matches are tolerated: the scan advances by one char so
-`"abc"` split by `"x*"` yields `["a", "b", "c"]` rather than
-looping. Trailing empty segments are kept (Python semantics).
+An empty match also cuts, so `"abc"` split by `"x*"` yields
+`["", "a", "b", "c", ""]`. Leading and trailing empty segments are
+kept.
 """)]
 pub fn split(re: Regex, s: String) : [String] = match re {
-  R(nfa) -> rx_split_loop(rx_sim(nfa, s), 0, [])
+  R(nfa) -> rx_split_loop(rx_sim(nfa, s), 0, 0, [])
 }
 
-fn rx_split_loop(sim: RxSim, from_pos: Int, acc: [String]) : [String] = {
-  if from_pos > sim.n { list_reverse(acc) }
+# `seg` is where the current segment starts; `from_pos` where the scan resumes.
+fn rx_split_loop(sim: RxSim, seg: Int, from_pos: Int, acc: [String]) : [String] = {
+  if from_pos > sim.n { rx_split_done(sim, seg, acc) }
   else { match rx_search(sim, from_pos) {
-    None -> list_reverse([string_slice(sim.input, from_pos, sim.n - from_pos), ...acc])
-    Some(m) -> {
-      let segment = string_slice(sim.input, from_pos, m.start - from_pos)
-      let next = if m.end > m.start { m.end } else { m.start + 1 }
-      rx_split_loop(sim, next, [segment, ...acc])
-    }
+    None    -> rx_split_done(sim, seg, acc)
+    Some(m) -> rx_split_loop(sim, m.end, rx_after(sim, m), [string_slice(sim.input, seg, m.start - seg), ...acc])
   } }
 }
+
+fn rx_split_done(sim: RxSim, seg: Int, acc: [String]) : [String] =
+  list_reverse([string_slice(sim.input, seg, sim.n - seg), ...acc])
 
 #[doc("""
 The runtime carrier of the `~r/pattern/` regex sigil, which the

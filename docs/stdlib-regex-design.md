@@ -18,7 +18,9 @@ Unblocks **m12.6.x #7** (regex refinement predicates `String where matches ~r/..
 - Character classes: `[abc]`, `[^abc]`, `[a-z]`, `[0-9]`.
 - Predefined classes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `.`.
 - Anchors: `^`, `$`.
-- Quantifiers: `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (greedy only).
+- Quantifiers: `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (greedy only). Counts above 1000 are a compile error.
+- Class ranges must not be inverted: `[z-a]` is a compile error.
+- Matching is by Unicode codepoint (`.`, negated classes and class ranges consume one codepoint); `\d`, `\w`, `\s` stay ASCII. Match offsets are byte offsets.
 - Grouping: `(...)` for capture, `(?:...)` for non-capture.
 - Alternation: `a|b`.
 - Capture groups: numbered (no names in v1).
@@ -142,5 +144,5 @@ Match function returns the leftmost-longest match (greedy semantics).
 
 1. **Replacement syntax**: `$1`, `$2` (Perl-style) or `\1`, `\2` (sed-style)? Recommend: `$1`/`$0` (Perl), more readable.
 2. **Anchors in `find_all`**: `^` and `$` only match string start/end (not line boundaries) in v1 — multiline mode is an inline-flag concern.
-3. **Empty matches in `split`**: filter or keep? Recommend: keep, matching Python `re.split` default.
+3. **Empty matches in `split`**: filter or keep? Keep, matching Python `re.split`: an empty match cuts, so `"abc"` split by `x*` is `["", "a", "b", "c", ""]`.
 4. **Naming convention**: keep `regex_*` flat-prefix today (consistent with `list_*`, `string_*`), migrate to `regexp.match` etc. in m14.
