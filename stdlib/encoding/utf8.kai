@@ -1,0 +1,109 @@
+#[doc("""
+UTF-8 validation over `[Byte]`. `decode` checks and builds a `String`,
+`decode_lossy` replaces what it cannot read, `is_valid` only checks, and
+`encode` is the inverse of `decode` on valid text.
+
+Well-formedness is the Unicode one (Table 3-7): shortest form only, no
+surrogates (U+D800–U+DFFF), nothing above U+10FFFF, no truncated sequence.
+An error offset is the index of the first byte of the first ill-formed
+sequence, i.e. the length of the longest valid prefix.
+
+`string.from_bytes` copies bytes unchecked; use `decode` when the bytes come
+from outside.
+""")]
+
+# ---- Byte classes -------------------------------------------------
+
+# Length of the sequence a lead byte opens; 0 for a byte that cannot lead.
+fn u8_width(b: Int) : Int =
+  if b < 0x80 { 1 }
+  else if b < 0xC2 { 0 }
+  else if b < 0xE0 { 2 }
+  else if b < 0xF0 { 3 }
+  else if b < 0xF5 { 4 }
+  else { 0 }
+
+# Bounds of the first continuation byte; the lead byte narrows them where
+# the general 0x80..0xBF would admit an overlong, a surrogate or > U+10FFFF.
+fn u8_second_lo(b: Int) : Int = if b == 0xE0 { 0xA0 } else if b == 0xF0 { 0x90 } else { 0x80 }
+
+fn u8_second_hi(b: Int) : Int = if b == 0xED { 0x9F } else if b == 0xF4 { 0x8F } else { 0xBF }
+
+fn u8_is_cont(b: Int) : Bool = b >= 0x80 and b <= 0xBF
+
+# ---- Scanner ------------------------------------------------------
+
+# The sequence starting at lead byte `b` with `rest` after it: its length
+# when well-formed, otherwise minus the length of the maximal ill-formed
+# subpart (the prefix that is still a valid start of some sequence).
+fn u8_seq(b: Byte, rest: [Byte]) : Int = {
+  let lead = byte_to_int(b)
+  let width = u8_width(lead)
+  if width == 0 { 0 - 1 }
+  else if width == 1 { 1 }
+  else { match rest {
+    [] -> 0 - 1
+    [b1, ...tail] -> {
+      let c = byte_to_int(b1)
+      if c < u8_second_lo(lead) or c > u8_second_hi(lead) { 0 - 1 }
+      else { u8_tail(tail, 2, width) }
+    }
+  } }
+}
+
+# Checks the remaining continuation bytes; `have` bytes are already read.
+fn u8_tail(rest: [Byte], have: Int, width: Int) : Int =
+  if have == width { width }
+  else { match rest {
+    [] -> 0 - have
+    [b, ...tail] -> if u8_is_cont(byte_to_int(b)) { u8_tail(tail, have + 1, width) } else { 0 - have }
+  } }
+
+fn u8_drop(bs: [Byte], n: Int) : [Byte] =
+  if n <= 0 { bs } else { match bs {
+    []            -> []
+    [_, ...tail]  -> u8_drop(tail, n - 1)
+  } }
+
+# `inside` counts the bytes of the current valid sequence still to pass.
+fn u8_first_bad(bs: [Byte], inside: Int, off: Int) : Option[Int] = match bs {
+  [] -> None
+  [b, ...rest] ->
+    if inside > 0 { u8_first_bad(rest, inside - 1, off + 1) }
+    else {
+      let n = u8_seq(b, rest)
+      if n < 0 { Some(off) } else { u8_first_bad(rest, n - 1, off + 1) }
+    }
+}
+
+# Output is reversed; the replacement char U+FFFD is pushed as EF BF BD.
+fn u8_lossy(bs: [Byte], inside: Int, acc: [Byte]) : [Byte] = match bs {
+  [] -> acc
+  [b, ...rest] ->
+    if inside > 0 { u8_lossy(rest, inside - 1, [b, ...acc]) }
+    else {
+      let n = u8_seq(b, rest)
+      if n > 0 { u8_lossy(rest, n - 1, [b, ...acc]) }
+      else { u8_lossy(u8_drop(rest, 0 - n - 1), 0, [0xBDu8, 0xBFu8, 0xEFu8, ...acc]) }
+    }
+}
+
+# ---- Public surface -----------------------------------------------
+
+#[doc("Decodes well-formed UTF-8 to a `String`, or `Err(offset)` with the byte offset of the first ill-formed sequence.")]
+pub fn decode(bs: [Byte]) : Result[String, Int] = match u8_first_bad(bs, 0, 0) {
+  Some(off) -> Err(off)
+  None      -> Ok(string.from_bytes(bs))
+}
+
+#[doc("Decodes UTF-8 to a `String`, replacing each maximal ill-formed subpart with U+FFFD.")]
+pub fn decode_lossy(bs: [Byte]) : String = string.from_bytes(list_reverse(u8_lossy(bs, 0, [])))
+
+#[doc("True iff `bs` is well-formed UTF-8.")]
+pub fn is_valid(bs: [Byte]) : Bool = match u8_first_bad(bs, 0, 0) {
+  Some(_) -> false
+  None    -> true
+}
+
+#[doc("Returns the UTF-8 bytes of `s`; the same as `string.bytes`.")]
+pub fn encode(s: String) : [Byte] = string.bytes(s)
