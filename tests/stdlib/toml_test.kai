@@ -1,0 +1,367 @@
+# Contract of the public `encoding.toml` surface: scalars, structure,
+# error reports, pair helpers and the canonical encoder.
+
+import encoding.toml
+
+fn get(src: String, k: String) : Option[toml.TomlValue] = match toml.decode(src) {
+  Some(toml.TTbl(ps)) -> toml.pairs_get(ps, k)
+  _                   -> None
+}
+
+fn enc(src: String) : String = match toml.decode(src) {
+  Some(v) -> toml.encode(v)
+  None    -> "<none>"
+}
+
+fn err(src: String) : String = match toml.decode_report(src) {
+  Ok(_)  -> "ok"
+  Err(e) -> toml.error_message(e)
+}
+
+fn rejected(src: String) : Bool = match toml.decode(src) {
+  Some(_) -> false
+  None    -> true
+}
+
+# ---- scalars ------------------------------------------------------
+
+test "strings: the five escapes, empty, Unicode" {
+  assert get("s = \"a\\\"b\\\\c\\nd\\te\\rf\"\n", "s") == Some(toml.TStr("a\"b\\c\nd\te\rf"))
+  assert get("s = \"\"\n", "s") == Some(toml.TStr(""))
+  assert get("s = \"héllo ñ 日本 😀\"\n", "s") == Some(toml.TStr("héllo ñ 日本 😀"))
+  assert get("s = \"a # b\" # c\n", "s") == Some(toml.TStr("a # b"))
+  assert get("s = \"a\tb\"\n", "s") == Some(toml.TStr("a\tb"))
+}
+
+test "strings: rejected forms" {
+  assert rejected("s = \"a\\qb\"\n")
+  assert rejected("s = \"a\\u00e9\"\n")
+  assert rejected("s = \"abc\n")
+  assert rejected("s = \"abc")
+  assert rejected("s = \"abc\\\"\n")
+  assert rejected("s = 'lit'\n")
+  assert rejected("s = \"\"\"ml\"\"\"\n")
+}
+
+test "booleans" {
+  assert get("a = true\nb = false\n", "a") == Some(toml.TBool(true))
+  assert get("a = true\nb = false\n", "b") == Some(toml.TBool(false))
+  assert rejected("a = tru\n")
+  assert rejected("a = trueX\n")
+  assert rejected("a = True\n")
+}
+
+test "integers: signs, zero, limits, rejected forms" {
+  assert get("x = 0\n", "x") == Some(toml.TInt(0))
+  assert get("x = +5\n", "x") == Some(toml.TInt(5))
+  assert get("x = -5\n", "x") == Some(toml.TInt(-5))
+  assert get("x = -0\n", "x") == Some(toml.TInt(0))
+  assert get("x = 9223372036854775807\n", "x") == Some(toml.TInt(9223372036854775807))
+  assert rejected("x = 9223372036854775808\n")
+  assert rejected("x = 0xff\n")
+  assert rejected("x = 0o7\n")
+  assert rejected("x = 0b1\n")
+  assert rejected("x = 1_000\n")
+  assert rejected("x = +\n")
+  assert rejected("x = -\n")
+  assert rejected("x = --1\n")
+}
+
+test "floats: fraction, exponent, signs" {
+  assert get("x = 0.5\n", "x") == Some(toml.TReal(0.5))
+  assert get("x = -0.25\n", "x") == Some(toml.TReal(-0.25))
+  assert get("x = +2.5\n", "x") == Some(toml.TReal(2.5))
+  assert get("x = 1.0\n", "x") == Some(toml.TReal(1.0))
+  assert get("x = 1e6\n", "x") == Some(toml.TReal(1000000.0))
+  assert get("x = 1E-3\n", "x") == Some(toml.TReal(0.001))
+  assert get("x = -2.5E2\n", "x") == Some(toml.TReal(-250.0))
+  assert get("x = 5e+2\n", "x") == Some(toml.TReal(500.0))
+  assert get("x = 1.5e1\n", "x") == Some(toml.TReal(15.0))
+}
+
+test "floats: rejected forms" {
+  assert rejected("x = .5\n")
+  assert rejected("x = 1.\n")
+  assert rejected("x = 1e\n")
+  assert rejected("x = 1e+\n")
+  assert rejected("x = 1_0.5\n")
+  assert rejected("x = inf\n")
+  assert rejected("x = -inf\n")
+  assert rejected("x = nan\n")
+  assert rejected("x = 1e400\n")
+}
+
+test "datetimes are not decoded" {
+  assert rejected("d = 1979-05-27\n")
+  assert rejected("d = 1979-05-27T07:32:00Z\n")
+  assert rejected("d = 07:32:00\n")
+}
+
+# ---- structure ----------------------------------------------------
+
+test "document layout: comments, blanks, line endings, whitespace" {
+  assert enc("") == ""
+  assert enc("# only a comment") == ""
+  assert enc("  \n\n \t\n") == ""
+  assert enc("a = 1") == "a = 1\n"
+  assert enc("a = 1\r\nb = 2\r\n") == "a = 1\nb = 2\n"
+  assert enc("  a   =   1   \n") == "a = 1\n"
+  assert enc("a\t=\t1\n") == "a = 1\n"
+  assert enc("# c\nx = 1 # tail\n\n# d\ny = 2\n") == "x = 1\ny = 2\n"
+}
+
+test "keys: bare charset, order is document order" {
+  assert enc("1 = 2\n") == "1 = 2\n"
+  assert enc("-a_B9 = 2\n") == "-a_B9 = 2\n"
+  assert enc("z = 1\ny = 2\nx = 3\n") == "z = 1\ny = 2\nx = 3\n"
+  assert rejected("é = 1\n")
+  assert rejected("\"a b\" = 1\n")
+  assert rejected("a.b = 1\n")
+  assert rejected(" = 1\n")
+  assert rejected("\u{feff}a = 1\n")
+}
+
+test "tables: headers, whitespace, quoted segments, nesting" {
+  assert enc("[a]\nx = 1\n") == "[a]\nx = 1\n\n"
+  assert enc("[ a . b ]\nx=1\n") == "[a]\nb = { x = 1 }\n\n"
+  assert enc("[a.\"b.c\"]\nx = 1\n") == "[a]\nb.c = { x = 1 }\n\n"
+  assert enc("[a]\n[b]\n") == "[a]\n\n[b]\n\n"
+  assert enc("r = 1\n[a]\nx = 1\n") == "r = 1\n\n[a]\nx = 1\n\n"
+  assert enc("[a.b]\nx = 1\n[a.c]\ny = 2\n[a]\nz = 3\n") == "[a]\nb = { x = 1 }\nc = { y = 2 }\nz = 3\n\n"
+}
+
+test "tables: repeats and conflicts are rejected" {
+  assert rejected("[a]\n[a]\n")
+  assert rejected("[a]\nx = 1\nx = 2\n")
+  assert rejected("x = 1\nx = 2\n")
+  assert rejected("a = 1\n[a]\n")
+  assert rejected("[a]\nb = 1\n[a.b]\nc = 1\n")
+  assert rejected("[a]\n[a.b]\n[a.b]\n")
+  assert rejected("t = { a = 1 }\n[t]\n[t]\n")
+}
+
+test "arrays of tables" {
+  assert enc("[[p]]\nn = 1\n[[p]]\nn = 2\n") == "[[p]]\nn = 1\n\n[[p]]\nn = 2\n\n"
+  assert enc("[[p]]\nn = 1\n[p.q]\nr = 1\n[[p]]\nn = 2\n") == "[[p]]\nn = 1\nq = { r = 1 }\n\n[[p]]\nn = 2\n\n"
+  assert rejected("[p]\nx = 1\n[[p]]\n")
+  assert rejected("p = 1\n[[p]]\n")
+  assert rejected("[[p]]\nn = 1\n[p]\nx = 1\n")
+  assert rejected("[[p]\n")
+}
+
+test "arrays: shapes" {
+  assert get("a = [1, 2, 3]\n", "a") == Some(toml.TArr([toml.TInt(1), toml.TInt(2), toml.TInt(3)]))
+  assert get("a = []\n", "a") == Some(toml.TArr([]))
+  assert get("a = [ ]\n", "a") == Some(toml.TArr([]))
+  assert get("a = [1,]\n", "a") == Some(toml.TArr([toml.TInt(1)]))
+  assert get("a = [\n  1, # one\n  2,\n]\n", "a") == Some(toml.TArr([toml.TInt(1), toml.TInt(2)]))
+  assert get("a = [[1], []]\n", "a") == Some(toml.TArr([toml.TArr([toml.TInt(1)]), toml.TArr([])]))
+  assert get("a = [1, \"x\", true, 1.5]\n", "a") == Some(toml.TArr([toml.TInt(1), toml.TStr("x"), toml.TBool(true), toml.TReal(1.5)]))
+  assert rejected("a = [,]\n")
+  assert rejected("a = [1,,2]\n")
+  assert rejected("a = [1, 2\n")
+  assert rejected("a = [1 2]\n")
+}
+
+test "inline tables" {
+  assert get("t = { a = 1, b = \"x\" }\n", "t") == Some(toml.TTbl([Pair { fst: "a", snd: toml.TInt(1) }, Pair { fst: "b", snd: toml.TStr("x") }]))
+  assert get("t = {}\n", "t") == Some(toml.TTbl([]))
+  assert get("t = {a=1}\n", "t") == Some(toml.TTbl([Pair { fst: "a", snd: toml.TInt(1) }]))
+  assert rejected("t = { a = 1, }\n")
+  assert rejected("t = { a = { b = 1 } }\n")
+  assert rejected("t = { a = [1] }\n")
+  assert rejected("t = { a = 1\n")
+  assert rejected("t = { a = 1,\n b = 2 }\n")
+}
+
+test "nesting past the recursion cutoff decodes and re-encodes" {
+  let deep = string.repeat("[", 40) ++ "1" ++ string.repeat("]", 40)
+  let want = "a = " ++ deep ++ "\n"
+  assert toml.round_trip(want) == Some(want)
+}
+
+# ---- error reports ------------------------------------------------
+
+test "error_message: key, header and stray-line forms" {
+  assert err("x = 1\n") == "ok"
+  assert err("a = 1\nb = 2\nc = @\n") == "line 3: key c: unsupported or malformed value, or a repeated key"
+  assert err("a = 1\na = 2\n") == "line 2: key a: unsupported or malformed value, or a repeated key"
+  assert err("[a]\n[a]\n") == "line 2: malformed, repeated or conflicting table header"
+  assert err("[a\n") == "line 1: malformed, repeated or conflicting table header"
+  assert err("a = 1\n??? = 1\n") == "line 2: unsupported or malformed line"
+  assert err("a 1\n") == "line 1: unsupported or malformed line"
+}
+
+test "error line counts newlines, comments and CRLF" {
+  assert err("# c\n\n# d\nx = @\n") == "line 4: key x: unsupported or malformed value, or a repeated key"
+  assert err("a = 1\r\nb = @\r\n") == "line 2: key b: unsupported or malformed value, or a repeated key"
+  assert err("a = [\n1,\n2\n]\nb = @\n") == "line 5: key b: unsupported or malformed value, or a repeated key"
+}
+
+test "decode_report returns the same tree as decode" {
+  let src = "a = 1\n[b]\nc = \"x\"\n"
+  match toml.decode_report(src) {
+    Ok(v)  -> { assert toml.decode(src) == Some(v) }
+    Err(_) -> { assert false }
+  }
+  match toml.decode_report("a = \n") {
+    Ok(_)  -> { assert false }
+    Err(e) -> {
+      assert e.line == 1
+      assert e.key == "a"
+    }
+  }
+}
+
+# ---- pairs helpers ------------------------------------------------
+
+test "pairs_get" {
+  let ps = [Pair { fst: "a", snd: toml.TInt(1) }, Pair { fst: "b", snd: toml.TInt(2) }]
+  assert toml.pairs_get(ps, "a") == Some(toml.TInt(1))
+  assert toml.pairs_get(ps, "b") == Some(toml.TInt(2))
+  assert toml.pairs_get(ps, "c") == None
+  assert toml.pairs_get([], "a") == None
+}
+
+test "pairs_set replaces in place or appends" {
+  let ps = [Pair { fst: "a", snd: toml.TInt(1) }, Pair { fst: "b", snd: toml.TInt(2) }]
+  assert toml.pairs_set(ps, "a", toml.TInt(9)) == [Pair { fst: "a", snd: toml.TInt(9) }, Pair { fst: "b", snd: toml.TInt(2) }]
+  assert toml.pairs_set(ps, "b", toml.TInt(9)) == [Pair { fst: "a", snd: toml.TInt(1) }, Pair { fst: "b", snd: toml.TInt(9) }]
+  assert toml.pairs_set(ps, "c", toml.TInt(3)) == [Pair { fst: "a", snd: toml.TInt(1) }, Pair { fst: "b", snd: toml.TInt(2) }, Pair { fst: "c", snd: toml.TInt(3) }]
+  assert toml.pairs_set([], "a", toml.TInt(1)) == [Pair { fst: "a", snd: toml.TInt(1) }]
+}
+
+# ---- encoder ------------------------------------------------------
+
+test "encode: scalar roots" {
+  assert toml.encode(toml.TInt(3)) == "3"
+  assert toml.encode(toml.TBool(false)) == "false"
+  assert toml.encode(toml.TStr("a\"b\\c\nd\te\rf")) == "\"a\\\"b\\\\c\\nd\\te\\rf\""
+  assert toml.encode(toml.TStr("\"a")) == "\"\\\"a\""
+  assert toml.encode(toml.TStr("\\")) == "\"\\\\\""
+  assert toml.encode(toml.TReal(2.0)) == "2.0"
+  assert toml.encode(toml.TReal(0.5)) == "0.5"
+  assert toml.encode(toml.TArr([toml.TInt(1), toml.TArr([])])) == "[1, []]"
+  assert toml.encode(toml.TTbl([])) == ""
+}
+
+test "encode: non-finite reals use TOML spellings" {
+  assert toml.encode(toml.TReal(0.0 / 0.0)) == "nan"
+  assert toml.encode(toml.TReal(1.0 / 0.0)) == "inf"
+  assert toml.encode(toml.TReal(-1.0 / 0.0)) == "-inf"
+}
+
+test "encode: scalars first, then tables, then arrays of tables" {
+  let v = toml.TTbl([
+    Pair { fst: "t", snd: toml.TTbl([Pair { fst: "x", snd: toml.TInt(1) }]) },
+    Pair { fst: "s", snd: toml.TInt(2) },
+    Pair { fst: "p", snd: toml.TArr([toml.TTbl([Pair { fst: "n", snd: toml.TInt(1) }])]) },
+    Pair { fst: "u", snd: toml.TStr("v") },
+  ])
+  assert toml.encode(v) == "s = 2\nu = \"v\"\n\n[t]\nx = 1\n\n[[p]]\nn = 1\n\n"
+}
+
+test "encode: arrays of mixed content stay inline" {
+  let v = toml.TTbl([Pair { fst: "m", snd: toml.TArr([toml.TInt(1), toml.TTbl([Pair { fst: "k", snd: toml.TInt(1) }])]) }])
+  assert toml.encode(v) == "m = [1, { k = 1 }]\n"
+}
+
+test "round_trip" {
+  assert toml.round_trip("a = 1\n[b]\nc = \"x\"\n") == Some("a = 1\n\n[b]\nc = \"x\"\n\n")
+  assert toml.round_trip("a = \n") == None
+  assert toml.round_trip("") == Some("")
+}
+
+test "decode of encode is stable for the subset" {
+  let src = "a = 1\nb = [1, 2]\nc = 0.5\nd = true\ne = \"q\\\"\"\n[t]\nx = 1\ny = { z = 2 }\n[[p]]\nn = 1\n[[p]]\nn = 2\n"
+  match toml.decode(src) {
+    Some(v) -> { assert toml.decode(toml.encode(v)) == Some(v) }
+    None    -> { assert false }
+  }
+}
+
+# ---- shapes that kill specific mutants ----------------------------
+
+fn nest(open: String, close: String, inner: String, n: Int) : String =
+  string.repeat(open, n) ++ inner ++ string.repeat(close, n)
+
+fn wrap_arr(v: toml.TomlValue, n: Int) : toml.TomlValue =
+  list.foldl(list.repeat(0, n), v, (acc, i) => toml.TArr([acc]))
+
+test "keys whose hashes collide stay distinct" {
+  let src = "hxoo = 1\nacdhp = 2\n"
+  assert get(src, "hxoo") == Some(toml.TInt(1))
+  assert get(src, "acdhp") == Some(toml.TInt(2))
+  assert enc(src) == "hxoo = 1\nacdhp = 2\n"
+  assert rejected("hxoo = 1\nacdhp = 2\nhxoo = 3\n")
+  assert rejected("[t]\nacdhp = 1\nhxoo = 2\nacdhp = 3\n")
+}
+
+test "errors: empty key, first-line newline, trailing garbage" {
+  assert err("= 1\n") == "line 1: unsupported or malformed line"
+  assert err("\nx = @\n") == "line 2: key x: unsupported or malformed value, or a repeated key"
+  assert err("a = 1 b\n") == "line 1: key a: unsupported or malformed value, or a repeated key"
+  assert err("a = \"x\" y\n") == "line 1: key a: unsupported or malformed value, or a repeated key"
+  assert rejected("a 12\n")
+  assert rejected("t = { a 12 }\n")
+}
+
+test "values and headers that end the document" {
+  assert enc("a = true") == "a = true\n"
+  assert enc("a = false") == "a = false\n"
+  assert enc("[a]") == "[a]\n\n"
+  assert enc("[[a]]") == "[[a]]\n\n"
+  assert enc("x = 1\n2 = 3\n") == "x = 1\n2 = 3\n"
+  assert enc("x = 1.5\n2 = 3\n") == "x = 1.5\n2 = 3\n"
+}
+
+test "headers over literal values" {
+  assert enc("t = { a = 1 }\n[t]\nb = 2\n") == "[t]\na = 1\nb = 2\n\n"
+  assert enc("p = [{ a = 1 }, { a = 2 }]\n[p.q]\nb = 2\n") == "[[p]]\na = 1\n\n[[p]]\na = 2\nq = { b = 2 }\n\n"
+  assert enc("t = { a = 1 }\n[t.u]\nb = 2\n") == "[t]\na = 1\nu = { b = 2 }\n\n"
+  assert enc("p = [{ a = 1 }]\n[[p]]\nb = 2\n") == "[[p]]\na = 1\n\n[[p]]\nb = 2\n\n"
+  assert enc("p = [{ a = 1 }, { a = 2 }]\n[[p]]\nb = 3\n") == "[[p]]\na = 1\n\n[[p]]\na = 2\n\n[[p]]\nb = 3\n\n"
+  assert rejected("p = [1, 2]\n[[p]]\n")
+}
+
+test "headers: three-segment path, definition flag, third array element" {
+  assert enc("[a.b.c]\nx = 1\n") == "[a]\nb = { c = { x = 1 } }\n\n"
+  assert rejected("[a.b]\n[a]\n[a]\n")
+  assert enc("[[p]]\nn = 1\n[[p]]\nn = 2\n[[p]]\nn = 3\n") == "[[p]]\nn = 1\n\n[[p]]\nn = 2\n\n[[p]]\nn = 3\n\n"
+  assert enc("p = [{ a = 1 }]\n[[p]]\nb = 2\n[[p]]\nc = 3\n") == "[[p]]\na = 1\n\n[[p]]\nb = 2\n\n[[p]]\nc = 3\n\n"
+}
+
+test "encode: inline tables with several members" {
+  assert enc("m = [1, { a = 1, b = 2 }]\n") == "m = [1, { a = 1, b = 2 }]\n"
+  assert enc("[t]\nm = { a = 1, b = 2, c = 3 }\n") == "[t]\nm = { a = 1, b = 2, c = 3 }\n\n"
+}
+
+test "encode: reals with an exponent keep their mark" {
+  let big = toml.encode(toml.TReal(1.0e22))
+  assert get("x = " ++ big ++ "\n", "x") == Some(toml.TReal(1.0e22))
+  let small = toml.encode(toml.TReal(1.5e-9))
+  assert get("x = " ++ small ++ "\n", "x") == Some(toml.TReal(1.5e-9))
+}
+
+test "arrays nested past the driver switch keep layout and order" {
+  let inner = "\n  1, # one\n  2,\n  [3, 4],\n  \"q\"\n"
+  let src = "a = " ++ nest("[", "]", inner, 14) ++ "\n"
+  let want = "a = " ++ nest("[", "]", "1, 2, [3, 4], \"q\"", 14) ++ "\n"
+  assert enc(src) == want
+  assert rejected("a = " ++ nest("[", "]", "1 2", 14) ++ "\n")
+  assert rejected("a = " ++ nest("[", "]", "1,,2", 14) ++ "\n")
+  assert rejected("a = " ++ nest("[", "]", "1", 14) ++ "]\n")
+}
+
+test "values nested past the driver switch encode in order" {
+  let leaf = toml.TArr([toml.TInt(1), toml.TStr("a\"b\\c"), toml.TBool(true), toml.TBool(false), toml.TTbl([Pair { fst: "a", snd: toml.TInt(1) }, Pair { fst: "b", snd: toml.TStr("\"") }]), toml.TArr([])])
+  assert toml.encode(wrap_arr(leaf, 14)) == nest("[", "]", "1, \"a\\\"b\\\\c\", true, false, { a = 1, b = \"\\\"\" }, []", 15)
+}
+
+test "very deep nesting neither overflows the stack nor changes shape" {
+  let n = 100000
+  let src = "a = " ++ nest("[", "]", "1", n) ++ "\n"
+  assert toml.round_trip(src) == Some(src)
+  let tbl = list.foldl(list.repeat(0, n), toml.TInt(1), (acc, i) => toml.TTbl([Pair { fst: "a", snd: acc }]))
+  assert string.length(toml.encode(toml.TArr([tbl]))) > n
+}
