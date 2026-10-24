@@ -91,20 +91,29 @@ pub fn bytes_to_string(bs: [Int]) : String =
 
 # ---- URL parsing -------------------------------------------------
 
-# Split `host[:port]` into (host, port). Missing or unparseable
-# `:port` yields port 0 — callers substitute a scheme default.
-fn http_split_authority(auth: String) : HttpHostPort = {
+# Split `host[:port]` into (host, port). A missing or empty `:port`
+# yields port 0 — callers substitute a scheme default.
+fn http_split_authority(auth: String) : Result[HttpHostPort, String] = {
   let i = http_str_index(auth, ":")
-  if i < 0 { HttpHostPort { host: auth, port: 0 } }
+  if i < 0 { Ok(HttpHostPort { host: auth, port: 0 }) }
   else {
     let h = string_slice(auth, 0, i)
     let rest = string_slice(auth, i + 1, string_length(auth) - i - 1)
-    match string_to_int(rest) {
-      Some(p) -> HttpHostPort { host: h, port: p }
-      None    -> HttpHostPort { host: h, port: 0 }
-    }
+    if string_length(rest) == 0 { Ok(HttpHostPort { host: h, port: 0 }) }
+    else { match string_to_int(rest) {
+      Some(p) if p >= 1 and p <= 65535 -> Ok(HttpHostPort { host: h, port: p })
+      _ -> Err(string_concat_all(["parse_url: invalid port '", rest, "'"]))
+    } }
   }
 }
+
+fn http_min_offset(a: Int, b: Int) : Int =
+  if a < 0 { b } else if b < 0 { a } else if a < b { a } else { b }
+
+# Offset where the authority ends: the first '/', '?' or '#', or -1.
+fn http_authority_end(rest: String) : Int =
+  http_min_offset(http_min_offset(http_str_index(rest, "/"), http_str_index(rest, "?")),
+                  http_str_index(rest, "#"))
 
 fn http_default_port(scheme: String) : Int =
   if scheme == "http" { 80 }
@@ -127,17 +136,22 @@ pub fn parse_url(s: String) : Result[HttpUrl, String] = {
     if scheme == "https" {
       Err("parse_url: https:// requires TLS, which is not in net.http v1 (see stdlib/net/http.kai header)")
     } else if scheme == "http" {
-      let path_at = http_str_index(rest, "/")
+      let path_at = http_authority_end(rest)
       let auth = if path_at < 0 { rest } else { string_slice(rest, 0, path_at) }
-      let path = if path_at < 0 { "/" }
+      let tail = if path_at < 0 { "" }
                  else { string_slice(rest, path_at, string_length(rest) - path_at) }
-      let hp   = http_split_authority(auth)
-      let host = hp.host
-      let port = if hp.port == 0 { http_default_port(scheme) } else { hp.port }
-      if string_length(host) == 0 {
-        Err("parse_url: empty host")
-      } else {
-        Ok(HttpUrl { scheme: scheme, host: host, port: port, path: path })
+      let path = if string_length(tail) == 0 { "/" }
+                 else if string.starts_with(tail, "/") { tail }
+                 else { string_concat("/", tail) }
+      match http_split_authority(auth) {
+        Err(e) -> Err(e)
+        Ok(hp) ->
+          if string_length(hp.host) == 0 {
+            Err("parse_url: empty host")
+          } else {
+            let port = if hp.port == 0 { http_default_port(scheme) } else { hp.port }
+            Ok(HttpUrl { scheme: scheme, host: hp.host, port: port, path: path })
+          }
       }
     } else {
       Err(string_concat_all(["parse_url: unsupported scheme '", scheme, "' (only http:// is supported in v1)"]))
@@ -203,9 +217,10 @@ fn http_parse_status_line(line: String) : Result[Int, String] = {
 
 # Parse a single header line `Name: Value`, trimming whitespace from
 # the value. A line without `:` is a parse error, not a silent drop.
-fn http_parse_header_line(line: String) : Result[HttpHeader, String] = {
+fn http_parse_header_line(line: String, ctx: String) : Result[HttpHeader, String] = {
   let i = http_str_index(line, ":")
-  if i < 0 { Err(string_concat("parse_response: header missing ':': ", line)) }
+  if i < 0 { Err(string_concat_all([ctx, ": header missing ':': ", line])) }
+  else if i == 0 { Err(string_concat_all([ctx, ": empty header name: ", line])) }
   else {
     let nm  = string_slice(line, 0, i)
     let raw = string_slice(line, i + 1, string_length(line) - i - 1)
@@ -213,19 +228,19 @@ fn http_parse_header_line(line: String) : Result[HttpHeader, String] = {
   }
 }
 
-fn http_parse_header_lines_loop(lines: [String], acc: [HttpHeader])
+fn http_parse_header_lines_loop(lines: [String], ctx: String, acc: [HttpHeader])
     : Result[[HttpHeader], String] = match lines {
   [] -> Ok(list_reverse(acc))
   [l, ...rest] ->
-    if string_length(l) == 0 { http_parse_header_lines_loop(rest, acc) }
-    else { match http_parse_header_line(l) {
+    if string_length(l) == 0 { http_parse_header_lines_loop(rest, ctx, acc) }
+    else { match http_parse_header_line(l, ctx) {
       Err(e) -> Err(e)
-      Ok(h)  -> http_parse_header_lines_loop(rest, [h, ...acc])
+      Ok(h)  -> http_parse_header_lines_loop(rest, ctx, [h, ...acc])
     } }
 }
 
-fn http_parse_header_lines(lines: [String]) : Result[[HttpHeader], String] =
-  http_parse_header_lines_loop(lines, [])
+fn http_parse_header_lines(lines: [String], ctx: String) : Result[[HttpHeader], String] =
+  http_parse_header_lines_loop(lines, ctx, [])
 
 #[doc("""
 Look up a header by name. Case-sensitive — callers use canonical
@@ -256,7 +271,7 @@ pub fn parse_response(raw: String) : Result[Response, String] = {
       [] -> Err("parse_response: empty header block")
       [status_line, ...rest] -> match http_parse_status_line(status_line) {
         Err(e) -> Err(e)
-        Ok(code) -> match http_parse_header_lines(rest) {
+        Ok(code) -> match http_parse_header_lines(rest, "parse_response") {
           Err(e) -> Err(e)
           Ok(hs) -> {
             # Body framing precedence:
@@ -265,7 +280,7 @@ pub fn parse_response(raw: String) : Result[Response, String] = {
             #   3. Otherwise                  → everything after the
             #      blank line (recv already drained to peer close).
             let te = match header_lookup(hs, "Transfer-Encoding") {
-              Some(v) -> string.trim(v)
+              Some(v) -> string.to_lower(string.trim(v))
               None    -> ""
             }
             let body = if te == "chunked" {
@@ -460,7 +475,7 @@ pub fn parse_request(raw: String) : Result[Request, String] = {
       [] -> Err("parse_request: empty header block")
       [req_line, ...rest] -> match http_parse_request_line(req_line) {
         Err(e) -> Err(e)
-        Ok(rl) -> match http_parse_header_lines(rest) {
+        Ok(rl) -> match http_parse_header_lines(rest, "parse_request") {
           Err(e) -> Err(e)
           Ok(hs) -> {
             let body = match header_lookup(hs, "Content-Length") {
@@ -550,7 +565,14 @@ fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int)
           # (e.g. a GET with no Content-Length), else report truncation.
           let raw = bytes_to_string(list_reverse(acc_rev))
           match parse_request(raw) {
-            Ok(r)  -> Ok(r)
+            Ok(r) -> match header_lookup(r.headers, "Content-Length") {
+              Some(v) -> match string_to_int(string.trim(v)) {
+                Some(n) if n > string_length(r.body) ->
+                  Err("read_request: peer closed before request complete")
+                _ -> Ok(r)
+              }
+              None -> Ok(r)
+            }
             Err(_) -> Err("read_request: peer closed before request complete")
           }
         }
@@ -581,7 +603,7 @@ fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
       [] -> None
       [req_line, ...rest] -> match http_parse_request_line(req_line) {
         Err(_) -> None
-        Ok(rl) -> match http_parse_header_lines(rest) {
+        Ok(rl) -> match http_parse_header_lines(rest, "parse_request") {
           Err(_) -> None
           Ok(hs) -> match header_lookup(hs, "Content-Length") {
             None -> Some(Request { method: rl.method, url: rl.path,
