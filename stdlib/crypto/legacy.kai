@@ -1,0 +1,243 @@
+#[doc("""
+stdlib/crypto/legacy.kai — SHA-1 and MD5, for interoperability only.
+
+Both algorithms are broken for security: collisions are practical, so
+never use them for signatures, certificates, password hashing or any
+integrity check an attacker can influence. Prefer `crypto.hash`
+(`sha256`, `sha512`). They exist for protocols and formats that
+mandate them: the WebSocket handshake accept key (RFC 6455), git
+object ids, UUID v3/v5 names, ETags and legacy checksums. Importing
+this module is the marker that legacy hashing is in use.
+
+Surface:
+
+  pub fn sha1(bytes: [Int]) : [Int]   # 20-byte digest (RFC 3174)
+  pub fn md5(bytes: [Int]) : [Int]    # 16-byte digest (RFC 1321)
+
+Input and output follow `crypto.hash.sha256`: a list of byte values in
+[0, 255] in, the raw digest bytes out. Compose with `encoding.hex` for a
+printable digest. Pure kaikai, no FFI; suitable for kilobyte-scale inputs.
+
+`Int` is signed 64-bit, so every word stays masked to 32 bits and no
+shift ever reaches the sign bit.
+""")]
+
+# ---- shared 32-bit helpers ---------------------------------------
+
+fn lg_mask(x: Int) : Int = bit_and(x, 4294967295)
+
+# Left rotation of a 32-bit value; `x` < 2^32 and `n` in [1, 31].
+fn lg_rotl(x: Int, n: Int) : Int =
+  bit_or(lg_mask(bit_shl(x, n)), bit_ushr(x, 32 - n))
+
+fn lg_len(bs: [Int], acc: Int) : Int = match bs {
+  []           -> acc
+  [_, ...rest] -> lg_len(rest, acc + 1)
+}
+
+fn lg_nth(xs: [Int], i: Int) : Int = match xs {
+  []           -> 0
+  [x, ...rest] -> if i == 0 { x } else { lg_nth(rest, i - 1) }
+}
+
+fn lg_zeros(n: Int, acc: [Int]) : [Int] =
+  if n == 0 { acc } else { lg_zeros(n - 1, [0, ...acc]) }
+
+fn lg_byte(x: Int, shift: Int) : Int = bit_and(bit_ushr(x, shift), 255)
+
+# Word as 4 bytes, most significant first when `be`.
+fn lg_word_bytes(w: Int, be: Bool) : [Int] =
+  if be { [lg_byte(w, 24), lg_byte(w, 16), lg_byte(w, 8), lg_byte(w, 0)] }
+  else  { [lg_byte(w, 0), lg_byte(w, 8), lg_byte(w, 16), lg_byte(w, 24)] }
+
+fn lg_digest_bytes(ws: [Int], be: Bool) : [Int] = match ws {
+  []           -> []
+  [w, ...rest] -> list_append(lg_word_bytes(w, be), lg_digest_bytes(rest, be))
+}
+
+# Message length in bits as 8 bytes.
+fn lg_length_bytes(bits: Int, be: Bool) : [Int] =
+  if be {
+    list_append(lg_word_bytes(lg_mask(bit_ushr(bits, 32)), true),
+                lg_word_bytes(lg_mask(bits), true))
+  } else {
+    list_append(lg_word_bytes(lg_mask(bits), false),
+                lg_word_bytes(lg_mask(bit_ushr(bits, 32)), false))
+  }
+
+# 0x80, zeros up to 56 mod 64, then the bit length: 64 or 128 bytes appended.
+fn lg_padded(bs: [Int], be: Bool) : [Int] = {
+  let n = lg_len(bs, 0)
+  let fill = 55 - n % 64
+  let zeros = if fill < 0 { fill + 64 } else { fill }
+  list_append(list_append(bs, [128, ...lg_zeros(zeros, [])]),
+              lg_length_bytes(n * 8, be))
+}
+
+fn lg_words_loop(bs: [Int], be: Bool, acc_rev: [Int]) : [Int] = match bs {
+  [a, b, c, d, ...rest] -> {
+    let w = if be {
+      bit_or(bit_or(bit_shl(bit_and(a, 255), 24), bit_shl(bit_and(b, 255), 16)),
+             bit_or(bit_shl(bit_and(c, 255), 8), bit_and(d, 255)))
+    } else {
+      bit_or(bit_or(bit_shl(bit_and(d, 255), 24), bit_shl(bit_and(c, 255), 16)),
+             bit_or(bit_shl(bit_and(b, 255), 8), bit_and(a, 255)))
+    }
+    lg_words_loop(rest, be, [w, ...acc_rev])
+  }
+  _ -> list_reverse(acc_rev)
+}
+
+type LgSplit = { head: [Int], tail: [Int] }
+
+fn lg_split_loop(ws: [Int], n: Int, acc_rev: [Int]) : LgSplit =
+  if n == 0 { LgSplit { head: list_reverse(acc_rev), tail: ws } }
+  else { match ws {
+    []           -> LgSplit { head: list_reverse(acc_rev), tail: [] }
+    [w, ...rest] -> lg_split_loop(rest, n - 1, [w, ...acc_rev])
+  } }
+
+# ====================================================================
+# SHA-1 (RFC 3174)
+# ====================================================================
+
+type Sha1State = { a: Int, b: Int, c: Int, d: Int, e: Int }
+
+fn sha1_initial() : Sha1State = Sha1State {
+  a: 1732584193, b: 4023233417, c: 2562383102, d: 271733878, e: 3285377520
+}
+
+# Schedule words newest-first: W[t-3], W[t-8], W[t-14], W[t-16] sit at 2, 7, 13, 15.
+fn sha1_extend(acc_rev: [Int], count: Int) : [Int] =
+  if count == 80 { list_reverse(acc_rev) }
+  else {
+    let x = bit_xor(bit_xor(lg_nth(acc_rev, 2), lg_nth(acc_rev, 7)),
+                    bit_xor(lg_nth(acc_rev, 13), lg_nth(acc_rev, 15)))
+    sha1_extend([lg_rotl(x, 1), ...acc_rev], count + 1)
+  }
+
+fn sha1_f(t: Int, b: Int, c: Int, d: Int) : Int =
+  if t < 20 { bit_or(bit_and(b, c), bit_and(bit_not(b), d)) }
+  else if t < 40 { bit_xor(bit_xor(b, c), d) }
+  else if t < 60 { bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d)) }
+  else { bit_xor(bit_xor(b, c), d) }
+
+fn sha1_k(t: Int) : Int =
+  if t < 20 { 1518500249 }
+  else if t < 40 { 1859775393 }
+  else if t < 60 { 2400959708 }
+  else { 3395469782 }
+
+fn sha1_rounds(s: Sha1State, ws: [Int], t: Int) : Sha1State = match ws {
+  []           -> s
+  [w, ...rest] -> {
+    let f = lg_mask(sha1_f(t, s.b, s.c, s.d))
+    let temp = lg_mask(lg_rotl(s.a, 5) + f + s.e + sha1_k(t) + w)
+    sha1_rounds(Sha1State { a: temp, b: s.a, c: lg_rotl(s.b, 30), d: s.c, e: s.d },
+                rest, t + 1)
+  }
+}
+
+fn sha1_block(s: Sha1State, block: [Int]) : Sha1State = {
+  let out = sha1_rounds(s, sha1_extend(list_reverse(block), 16), 0)
+  Sha1State {
+    a: lg_mask(s.a + out.a), b: lg_mask(s.b + out.b), c: lg_mask(s.c + out.c),
+    d: lg_mask(s.d + out.d), e: lg_mask(s.e + out.e)
+  }
+}
+
+fn sha1_drive(s: Sha1State, ws: [Int]) : Sha1State = match ws {
+  [] -> s
+  _  -> {
+    let sp = lg_split_loop(ws, 16, [])
+    sha1_drive(sha1_block(s, sp.head), sp.tail)
+  }
+}
+
+#[doc("Computes the SHA-1 digest of `bytes` as 20 raw bytes; broken for security, for interoperability only.")]
+pub fn sha1(bytes: [Int]) : [Int] = {
+  let ws = lg_words_loop(lg_padded(bytes, true), true, [])
+  let s = sha1_drive(sha1_initial(), ws)
+  lg_digest_bytes([s.a, s.b, s.c, s.d, s.e], true)
+}
+
+# ====================================================================
+# MD5 (RFC 1321)
+# ====================================================================
+
+type Md5State = { a: Int, b: Int, c: Int, d: Int }
+
+fn md5_initial() : Md5State = Md5State {
+  a: 1732584193, b: 4023233417, c: 2562383102, d: 271733878
+}
+
+fn md5_k() : [Int] = [
+  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+  0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+  0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+  0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+  0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+  0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+  0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+  0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+  0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+]
+
+fn md5_shift(i: Int) : Int = {
+  let r = i % 4
+  if i < 16 { lg_nth([7, 12, 17, 22], r) }
+  else if i < 32 { lg_nth([5, 9, 14, 20], r) }
+  else if i < 48 { lg_nth([4, 11, 16, 23], r) }
+  else { lg_nth([6, 10, 15, 21], r) }
+}
+
+fn md5_index(i: Int) : Int =
+  if i < 16 { i }
+  else if i < 32 { (5 * i + 1) % 16 }
+  else if i < 48 { (3 * i + 5) % 16 }
+  else { (7 * i) % 16 }
+
+fn md5_f(i: Int, b: Int, c: Int, d: Int) : Int =
+  if i < 16 { bit_or(bit_and(b, c), bit_and(bit_not(b), d)) }
+  else if i < 32 { bit_or(bit_and(d, b), bit_and(bit_not(d), c)) }
+  else if i < 48 { bit_xor(bit_xor(b, c), d) }
+  else { bit_xor(c, bit_or(b, bit_not(d))) }
+
+fn md5_steps(s: Md5State, ks: [Int], m: [Int], i: Int) : Md5State = match ks {
+  []           -> s
+  [k, ...rest] -> {
+    let f = lg_mask(lg_mask(md5_f(i, s.b, s.c, s.d)) + s.a + k + lg_nth(m, md5_index(i)))
+    md5_steps(Md5State { a: s.d, b: lg_mask(s.b + lg_rotl(f, md5_shift(i))), c: s.b, d: s.c },
+              rest, m, i + 1)
+  }
+}
+
+fn md5_block(s: Md5State, m: [Int]) : Md5State = {
+  let out = md5_steps(s, md5_k(), m, 0)
+  Md5State {
+    a: lg_mask(s.a + out.a), b: lg_mask(s.b + out.b),
+    c: lg_mask(s.c + out.c), d: lg_mask(s.d + out.d)
+  }
+}
+
+fn md5_drive(s: Md5State, ws: [Int]) : Md5State = match ws {
+  [] -> s
+  _  -> {
+    let sp = lg_split_loop(ws, 16, [])
+    md5_drive(md5_block(s, sp.head), sp.tail)
+  }
+}
+
+#[doc("Computes the MD5 digest of `bytes` as 16 raw bytes; broken for security, for interoperability only.")]
+pub fn md5(bytes: [Int]) : [Int] = {
+  let ws = lg_words_loop(lg_padded(bytes, false), false, [])
+  let s = md5_drive(md5_initial(), ws)
+  lg_digest_bytes([s.a, s.b, s.c, s.d], false)
+}
