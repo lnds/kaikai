@@ -84,9 +84,8 @@ fn rx_at_end(st: RxParseState) : Bool = st.pos >= st.n
 # Positions are byte offsets that always sit on a codepoint boundary.
 fn rx_cp_at(s: String, i: Int) : Char = int_to_char(string_cp_at(s, i))
 
-# Byte offset following the codepoint at `i`; past the end it moves one byte.
-fn rx_next_pos(s: String, i: Int) : Int =
-  if i >= string_length(s) { i + 1 } else { i + string_cp_len(s, i) }
+# Byte offset following the codepoint at `i`, which must be inside the input.
+fn rx_next_pos(s: String, i: Int) : Int = i + string_cp_len(s, i)
 
 fn rx_peek(st: RxParseState) : Option[Char] =
   if rx_at_end(st) { None } else { Some(rx_cp_at(st.input, st.pos)) }
@@ -121,47 +120,49 @@ pub fn parse_pattern(pattern: String) : Result[RxAst, RxParseError] = {
     Some(ast) ->
       if not rx_at_end(r.st) {
         Err(RxParseError { msg: "trailing characters after regex", pos: r.st.pos })
-      } else if rx_state_estimate([RxCostItem { node: ast, mult: 1 }], 0) > rx_max_states() {
-        Err(RxParseError { msg: "pattern exceeds 1000000 NFA states", pos: string_length(pattern) })
+      } else if ast_cost(ast) > rx_max_cost() {
+        Err(RxParseError { msg: "pattern too large: more than 1000000 nodes after repeats", pos: string_length(pattern) })
       } else { Ok(ast) }
   }
 }
 
-fn rx_max_states() : Int = 1000000
+fn rx_max_cost() : Int = 1000000
 
 type RxCostItem = { node: RxAst, mult: Int }
 
-# Upper bound on the NFA states `ast` lowers to, each node weighted by how
-# many copies of it repeats make. Stops once past the limit, so a nested
-# repeat is rejected before any state is built.
-fn rx_state_estimate(work: [RxCostItem], total: Int) : Int = match work {
-  []           -> total
+#[doc("""
+Counts the nodes `a` expands to, each node once per copy its enclosing
+repeats make; patterns above 1000000 are rejected by `parse_pattern`.
+Counting stops once past that limit, so the result is exact only below it.
+""")]
+fn ast_cost(a: RxAst) : Int = rx_cost_loop([RxCostItem { node: a, mult: 1 }], 0)
+
+# One loop over an explicit work list: nesting costs list cells, not frames.
+fn rx_cost_loop(work: [RxCostItem], total: Int) : Int = match work {
+  []            -> total
   [it, ...rest] ->
-    if total > rx_max_states() { total }
-    else { match rx_cost_step(it.node, it.mult, rest, total) {
-      RxCostSt(work1, total1) -> rx_state_estimate(work1, total1)
-    } }
+    if total > rx_max_cost() { total }
+    else { rx_cost_loop(rx_cost_push(rx_kids(it.node), rx_kid_mult(it.node, it.mult), rest), total + it.mult) }
 }
 
-# Work left and the running total. Only `rx_state_estimate` recurses, so
-# pattern size costs list cells, not stack frames.
-type RxCostSt = RxCostSt([RxCostItem], Int)
+fn rx_kids(a: RxAst) : [RxAst] = match a {
+  RxChar(_)       -> []
+  RxAny           -> []
+  RxClass(_, _)   -> []
+  RxAnchor(_)     -> []
+  RxConcat(xs)    -> xs
+  RxAlt(xs)       -> xs
+  RxStar(x)       -> [x]
+  RxPlus(x)       -> [x]
+  RxOpt(x)        -> [x]
+  RxGroup(_, x)   -> [x]
+  RxRepeat(x, _, _) -> [x]
+}
 
-fn rx_cost_step(a: RxAst, mult: Int, rest: [RxCostItem], total: Int) : RxCostSt = match a {
-  RxChar(_)         -> RxCostSt(rest, total + 2 * mult)
-  RxAny             -> RxCostSt(rest, total + 2 * mult)
-  RxClass(_, _)     -> RxCostSt(rest, total + 2 * mult)
-  RxAnchor(_)       -> RxCostSt(rest, total + 2 * mult)
-  RxConcat(xs)      -> RxCostSt(rx_cost_push(xs, mult, rest), total + mult)
-  RxAlt(xs)         -> RxCostSt(rx_cost_push(xs, mult, rest), total + 2 * mult)
-  RxStar(x)         -> RxCostSt(rx_cost_push([x], mult, rest), total + 2 * mult)
-  RxOpt(x)          -> RxCostSt(rx_cost_push([x], mult, rest), total + 2 * mult)
-  RxGroup(_, x)     -> RxCostSt(rx_cost_push([x], mult, rest), total + 2 * mult)
-  RxPlus(x)         -> RxCostSt(rx_cost_push([x], mult, rest), total)
-  RxRepeat(x, lo, hi) -> {
-    let copies = match hi { Some(h) -> h None -> lo + 1 }
-    RxCostSt(rx_cost_push([x], rx_scale(mult, copies), rest), total + 2 * mult * (copies + 1))
-  }
+# A repeat compiles `hi` copies of its child, or `lo + 1` when unbounded.
+fn rx_kid_mult(a: RxAst, mult: Int) : Int = match a {
+  RxRepeat(_, lo, hi) -> rx_scale(mult, match hi { Some(h) -> h None -> lo + 1 })
+  _                   -> mult
 }
 
 fn rx_cost_push(xs: [RxAst], mult: Int, rest: [RxCostItem]) : [RxCostItem] = match xs {
@@ -171,7 +172,7 @@ fn rx_cost_push(xs: [RxAst], mult: Int, rest: [RxCostItem]) : [RxCostItem] = mat
 
 # `mult * copies`, saturating just above the limit so it cannot overflow.
 fn rx_scale(mult: Int, copies: Int) : Int =
-  if mult * copies > rx_max_states() { rx_max_states() + 1 } else { mult * copies }
+  if mult * copies > rx_max_cost() { rx_max_cost() + 1 } else { mult * copies }
 
 # ---- Top-down recursive descent ----
 #
@@ -221,8 +222,7 @@ fn rx_parse_loop(st: RxParseState, stack: [RxFrame], alts: [RxAst], items: [RxAs
         _         -> false
       }
       let st2 = if noncap { rx_advance_n(st1, 2) } else { rx_bump_group(st1) }
-      let gid = if noncap { 0 } else { st2.group_id }
-      rx_parse_loop(st2, [RxFrame { gid: gid, noncap: noncap, alts: alts, items: items }, ...stack], [], [])
+      rx_parse_loop(st2, [RxFrame { gid: st2.group_id, noncap: noncap, alts: alts, items: items }, ...stack], [], [])
     }
     Some(_) -> {
       let r = rx_parse_atom(st)
@@ -233,14 +233,14 @@ fn rx_parse_loop(st: RxParseState, stack: [RxFrame], alts: [RxAst], items: [RxAs
     }
   }
 
+# `alts` is never empty: a level always contributes its concatenation.
 fn rx_alt_of(alts: [RxAst]) : RxAst = match alts {
-  []  -> RxConcat([])
   [a] -> a
   _   -> RxAlt(list_reverse(alts))
 }
 
+# No items is the empty concatenation, which the general arm builds too.
 fn rx_concat_of(items: [RxAst]) : RxAst = match items {
-  []  -> RxConcat([])
   [x] -> x
   _   -> RxConcat(list_reverse(items))
 }
@@ -341,9 +341,8 @@ fn rx_parse_primary(st: RxParseState) : PRx = match rx_peek(st) {
     else { rx_ok(rx_advance(st), RxChar(c)) }
 }
 
+# `)` and `|` never reach here: the parse loop consumes them first.
 fn rx_is_meta(c: Char) : Bool = match c {
-  ')' -> true
-  '|' -> true
   '*' -> true
   '+' -> true
   '?' -> true

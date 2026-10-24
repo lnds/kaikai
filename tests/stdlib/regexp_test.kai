@@ -100,14 +100,115 @@ test "inverted class ranges are rejected" {
 }
 
 test "total pattern size is capped" {
-  assert err_of("(a{1000}){1000}") == "regex parse error at 15: pattern exceeds 1000000 NFA states"
-  assert err_of("((a{100}){100}){100}") == "regex parse error at 20: pattern exceeds 1000000 NFA states"
+  assert err_of("(a{1000}){1000}") == "regex parse error at 15: pattern too large: more than 1000000 nodes after repeats"
+  assert err_of("((a{100}){100}){100}") == "regex parse error at 20: pattern too large: more than 1000000 nodes after repeats"
   assert err_of("(a{1000}){5}") == "ok"
   assert err_of("(a{100}){100}") == "ok"
-  assert err_of("(((((a{10}){10}){10}){10}){10}){10}") == "regex parse error at 35: pattern exceeds 1000000 NFA states"
+  assert err_of("(((((a{10}){10}){10}){10}){10}){10}") == "regex parse error at 35: pattern too large: more than 1000000 nodes after repeats"
   assert err_of("(a*){1000}") == "ok"
-  assert err_of("(a{1,1000}){1000}") == "regex parse error at 17: pattern exceeds 1000000 NFA states"
+  assert err_of("(a{1,1000}){1000}") == "regex parse error at 17: pattern too large: more than 1000000 nodes after repeats"
   assert first("(a{20}){20}", string.repeat("a", 400)) == "0-400[0:0,400;1:380,400]"
+}
+
+# Largest n in lo..hi for which `ok(n)` holds, `ok` being true then false.
+fn last_ok(lo: Int, hi: Int, ok: (Int) -> Bool) : Int =
+  if lo >= hi { lo }
+  else {
+    let mid = (lo + hi + 1) / 2
+    if ok(mid) { last_ok(mid, hi, ok) } else { last_ok(lo, mid - 1, ok) }
+  }
+
+# Node count of `x`, found by padding it with nodes of known weight until
+# the parser's one-million limit is hit exactly.
+fn cost(x: String) : Int = {
+  let lead = "(?:" ++ x ++ ")(?:a{1000}){"
+  let k = last_ok(0, 998, (n) => parses("#{lead}#{n}}"))
+  let r = last_ok(0, 1000, (n) => parses("#{lead}#{k}}a{#{n}}"))
+  1000000 - 3 - k * 1001 - r
+}
+
+fn parses(p: String) : Bool = match syntax.parse_pattern(p) {
+  Ok(_)  -> true
+  Err(_) -> false
+}
+
+test "ast_cost counts nodes once per copy" {
+  assert cost("a") == 1
+  assert cost(".") == 1
+  assert cost("[a]") == 1
+  assert cost("^") == 1
+  assert cost("") == 1
+  assert cost("ab") == 3
+  assert cost("a|b") == 3
+  assert cost("a|b|c") == 4
+  assert cost("a*") == 2
+  assert cost("a+") == 2
+  assert cost("a?") == 2
+  assert cost("(a)") == 2
+  assert cost("(?:a)") == 1
+  assert cost("a{3}") == 4
+  assert cost("a{2,5}") == 6
+  assert cost("a{2,}") == 4
+  assert cost("(?:a{3}){2}") == 9
+}
+
+test "the size limit sits exactly at one million nodes" {
+  assert parses("(?:a{1000}){999}")
+  assert not parses("(?:a{1000}){999}b")
+  assert not parses("(?:a{1000}){1000}")
+  assert parses("(?:a{1000}){998}b")
+}
+
+test "the limit counts every node, not just the first to reach it" {
+  assert not parses("b(?:a{1000}){998}a{999}")
+  assert parses("b(?:a{1000}){998}a{998}")
+}
+
+test "alternatives and greedy branches are tried in priority order" {
+  assert first("(a*)(a*)", "aa") == "0-2[0:0,2;1:0,2;2:2,2]"
+  assert first("(a+)(a*)", "aaa") == "0-3[0:0,3;1:0,3;2:3,3]"
+  assert first("(a?)(a?)", "a") == "0-1[0:0,1;1:0,1;2:1,1]"
+  assert first("(a|ab)(c|bcd)?", "abcd") == "0-4[0:0,4;1:0,1;2:1,4]"
+  assert first("(x*)(y|xy)", "xy") == "0-2[0:0,2;1:0,1;2:1,2]"
+  assert first("(.*)(\\d+)", "ab12") == "0-4[0:0,4;1:0,3;2:3,4]"
+  assert first("(a+|b+)*c", "aabbc") == "0-5[0:0,5;1:2,4]"
+  assert first("(a|b)*", "abab") == "0-4[0:0,4;1:3,4]"
+  assert first("(a|ab)(bc|c)?", "abc") == "0-3[0:0,3;1:0,1;2:1,3]"
+  assert first("a*(a|b)", "aab") == "0-3[0:0,3;1:2,3]"
+}
+
+test "a match that began earlier beats one that began later" {
+  assert first("b|ab", "xab") == "1-3[0:1,3]"
+  assert first("ab|b", "xab") == "1-3[0:1,3]"
+  assert first("(b|ab)c", "zabc") == "1-4[0:1,4;1:1,3]"
+  assert spans("a|ab", "abab") == "0-1,2-3"
+}
+
+test "oversized counts and stray braces" {
+  assert err_of("a{10000}") == "regex parse error at 7: repeat count exceeds 1000"
+  assert err_of("a{1000,10000}") == "regex parse error at 12: repeat count exceeds 1000"
+  assert err_of("{") == "regex parse error at 0: unexpected metacharacter in primary position"
+  assert err_of("a|{") == "regex parse error at 2: unexpected metacharacter in primary position"
+  assert err_of("}") == "regex parse error at 0: unexpected metacharacter in primary position"
+  assert first("a{2,4}", "aa") == "0-2[0:0,2]"
+  assert first("a{2,4}", "aaa") == "0-3[0:0,3]"
+}
+
+fn nfa(p: String) : String = match syntax.parse_pattern(p) {
+  Ok(a)  -> engine.nfa_show(engine.compile_nfa(a))
+  Err(e) -> e.msg
+}
+
+test "nfa_show pins the machine built for each construct" {
+  assert nfa("a|b") == "NFA(start=0, groups=1)\n   [0] ε->2, ε->4\n  *[1] \n   [2] 'a'->3\n   [3] ε->1\n   [4] 'b'->5\n   [5] ε->1\n"
+  assert nfa("a*") == "NFA(start=0, groups=1)\n   [0] ε->2, ε->1\n  *[1] \n   [2] 'a'->3\n   [3] ε->2, ε->1\n"
+  assert nfa("a?") == "NFA(start=0, groups=1)\n   [0] ε->2, ε->1\n  *[1] \n   [2] 'a'->3\n   [3] ε->1\n"
+  assert nfa("a+") == "NFA(start=0, groups=1)\n   [0] 'a'->1\n  *[1] ε->0\n"
+  assert nfa("a{2}") == "NFA(start=0, groups=1)\n   [0] 'a'->1\n   [1] ε->2\n   [2] 'a'->3\n   [3] ε->4\n  *[4] \n"
+  assert nfa("a{1,3}") == "NFA(start=0, groups=1)\n   [0] 'a'->1\n   [1] ε->2\n   [2] ε->4, ε->3\n   [3] ε->6\n   [4] 'a'->5\n   [5] ε->3\n   [6] ε->8, ε->7\n  *[7] \n   [8] 'a'->9\n   [9] ε->7\n"
+  assert nfa("a{2,}") == "NFA(start=0, groups=1)\n   [0] 'a'->1\n   [1] ε->2\n   [2] 'a'->3\n   [3] ε->4\n   [4] ε->6, ε->5\n  *[5] \n   [6] 'a'->7\n   [7] ε->6, ε->5\n"
+  assert nfa("(a)") == "NFA(start=0, groups=2)\n   [0] (1->2\n  *[1] \n   [2] 'a'->3\n   [3] 1)->1\n"
+  assert nfa("") == "NFA(start=0, groups=1)\n  *[0] \n"
 }
 
 test "repeat counts are capped" {
@@ -203,10 +304,10 @@ test "alternation" {
   assert first("cat|dog|bird", "a dog") == "2-5[0:2,5]"
   assert first("a|", "b") == "0-0[0:0,0]"
   assert first("a|", "a") == "0-1[0:0,1]"
-  assert first("|a", "a") == "0-1[0:0,1]"
+  assert first("|a", "a") == "0-0[0:0,0]"
   assert first("ab|a", "ab") == "0-2[0:0,2]"
-  assert first("a|ab", "ab") == "0-2[0:0,2]"
-  assert first("(a|ab)(c|bcd)(d*)", "abcd") == "0-4[0:0,4;1:0,2;2:2,3;3:3,4]"
+  assert first("a|ab", "ab") == "0-1[0:0,1]"
+  assert first("(a|ab)(c|bcd)(d*)", "abcd") == "0-4[0:0,4;1:0,1;2:1,4;3:4,4]"
   assert first("x(a|b)*y", "xababy") == "0-6[0:0,6;1:4,5]"
 }
 
