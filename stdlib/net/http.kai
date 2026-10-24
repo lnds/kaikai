@@ -84,8 +84,6 @@ fn http_after(s: String, at: Int) : String =
 
 # ---- URL parsing -------------------------------------------------
 
-fn http_default_port() : Int = 80
-
 fn http_min_offset(a: Int, b: Int) : Int =
   if a < 0 { b } else if b < 0 { a } else if a < b { a } else { b }
 
@@ -94,34 +92,26 @@ fn http_authority_end(rest: String) : Int =
   http_min_offset(http_min_offset(string_find(rest, "/"), string_find(rest, "?")),
                   string_find(rest, "#"))
 
+# An empty port selects the scheme default.
 fn http_parse_port(text: String) : Result[Int, String] =
-  match string_to_int(text) {
+  if string_length(text) == 0 { Ok(80) }
+  else { match string_to_int(text) {
     Some(p) if p >= 1 and p <= 65535 -> Ok(p)
     _ -> Err(string_concat_all(["parse_url: invalid port '", text, "'"]))
-  }
-
-# Split `host[:port]`. A missing or empty `:port` yields port 0, which
-# callers replace with the scheme default.
-fn http_split_authority(auth: String) : Result[HttpHostPort, String] = {
-  let i = string_find(auth, ":")
-  let port_text = if i < 0 { "" } else { http_after(auth, i + 1) }
-  let host = if i < 0 { auth } else { string_slice(auth, 0, i) }
-  if string_length(port_text) == 0 { Ok(HttpHostPort { host: host, port: 0 }) }
-  else { result.map(http_parse_port(port_text), (p) => HttpHostPort { host: host, port: p }) }
-}
-
-fn http_url_of(hp: HttpHostPort, path: String) : Result[HttpUrl, String] =
-  if string_length(hp.host) == 0 { Err("parse_url: empty host") }
-  else {
-    let port = if hp.port == 0 { http_default_port() } else { hp.port }
-    Ok(HttpUrl { scheme: "http", host: hp.host, port: port, path: path })
-  }
+  } }
 
 fn http_build_url(auth: String, tail: String) : Result[HttpUrl, String] = {
+  let i = string_find(auth, ":")
+  let host = if i < 0 { auth } else { string_slice(auth, 0, i) }
   let path = if string_length(tail) == 0 { "/" }
              else if string.starts_with(tail, "/") { tail }
              else { string_concat("/", tail) }
-  result.flat_map(http_split_authority(auth), (hp) => http_url_of(hp, path))
+  match http_parse_port(if i < 0 { "" } else { http_after(auth, i + 1) }) {
+    Err(e) -> Err(e)
+    Ok(port) ->
+      if string_length(host) == 0 { Err("parse_url: empty host") }
+      else { Ok(HttpUrl { scheme: "http", host: host, port: port, path: path }) }
+  }
 }
 
 fn http_parse_http_url(rest: String) : Result[HttpUrl, String] = {
@@ -158,7 +148,7 @@ fn http_format_headers(hs: [HttpHeader]) : String =
 
 # Bare host when the port is the default, `host:port` otherwise.
 fn http_host_header(u: HttpUrl) : String =
-  if u.port == http_default_port() { u.host }
+  if u.port == 80 { u.host }
   else { string_concat_all([u.host, ":", int_to_string(u.port)]) }
 
 fn http_content_length_line(body: String) : String =
@@ -274,8 +264,10 @@ fn http_response_body(hs: [HttpHeader], body_all: String) : String =
   if http_is_chunked(hs) { dechunk_body(body_all) } else { http_frame_body(hs, body_all) }
 
 fn http_build_response(head: HttpHead, code: Int) : Result[Response, String] =
-  result.map(http_parse_header_lines(head.lines, "parse_response"),
-    (hs) => Response { status: code, headers: hs, body: http_response_body(hs, head.body) })
+  match http_parse_header_lines(head.lines, "parse_response") {
+    Err(e) -> Err(e)
+    Ok(hs) -> Ok(Response { status: code, headers: hs, body: http_response_body(hs, head.body) })
+  }
 
 #[doc("""
 Parse a complete HTTP/1.1 response: status line + headers +
@@ -284,8 +276,13 @@ the blank line. A `Transfer-Encoding: chunked` response is
 dechunked, so `body` holds the decoded payload.
 """)]
 pub fn parse_response(raw: String) : Result[Response, String] =
-  result.flat_map(http_split_head(raw, "parse_response"),
-    (head) => result.flat_map(http_parse_status_line(head.start), (code) => http_build_response(head, code)))
+  match http_split_head(raw, "parse_response") {
+    Err(e) -> Err(e)
+    Ok(head) -> match http_parse_status_line(head.start) {
+      Err(e)   -> Err(e)
+      Ok(code) -> http_build_response(head, code)
+    }
+  }
 
 # ---- chunked transfer encoding ------------------------------------
 #
@@ -297,23 +294,21 @@ fn http_find_crlf(s: String, i: Int, n: Int) : Int =
   else if string_cp_at(s, i) == 13 and string_cp_at(s, i + 1) == 10 { i }
   else { http_find_crlf(s, i + 1, n) }
 
-fn http_hex_value(c: Int) : Int =
-  if c >= 48 and c <= 57 { c - 48 }
-  else if c >= 97 and c <= 102 { c - 87 }
-  else if c >= 65 and c <= 70 { c - 55 }
-  else { -1 }
-
-# Value of the leading hex digits; 0 when there are none.
-fn http_parse_hex(s: String, i: Int, n: Int, acc: Int) : Int = {
-  let v = if i >= n { -1 } else { http_hex_value(string_cp_at(s, i)) }
-  if v < 0 { acc } else { http_parse_hex(s, i + 1, n, acc * 16 + v) }
+# Hex digits before any `;` extension; 0 when malformed.
+fn http_chunk_size(line: String) : Int = {
+  let semi = string_find(line, ";")
+  let digits = if semi < 0 { line } else { string_slice(line, 0, semi) }
+  match string.to_int_radix(string.trim(digits), 16) {
+    Some(n) -> n
+    None    -> 0
+  }
 }
 
 # `parts` holds the decoded chunks, newest first; a frame that cannot be
 # decoded ends the stream.
 fn http_dechunk_loop(s: String, pos: Int, parts: [String]) : String = {
   let crlf = http_find_crlf(s, pos, string_length(s))
-  let size = if crlf < 0 { 0 } else { http_parse_hex(string_slice(s, pos, crlf - pos), 0, crlf - pos, 0) }
+  let size = if crlf < 0 { 0 } else { http_chunk_size(string_slice(s, pos, crlf - pos)) }
   if size > 0 { http_dechunk_loop(s, crlf + 2 + size + 2, [string_slice(s, crlf + 2, size), ...parts]) }
   else { string_concat_all(list_reverse(parts)) }
 }
@@ -407,13 +402,20 @@ fn http_parse_request_line(line: String) : Result[HttpReqLine, String] =
   }
 
 fn http_build_request(head: HttpHead, rl: HttpReqLine) : Result[Request, String] =
-  result.map(http_parse_header_lines(head.lines, "parse_request"),
-    (hs) => Request { method: rl.method, url: rl.path, headers: hs, body: head.body })
+  match http_parse_header_lines(head.lines, "parse_request") {
+    Err(e) -> Err(e)
+    Ok(hs) -> Ok(Request { method: rl.method, url: rl.path, headers: hs, body: head.body })
+  }
 
 # Request with the body still holding everything after the blank line.
 fn http_parse_request_unframed(raw: String) : Result[Request, String] =
-  result.flat_map(http_split_head(raw, "parse_request"),
-    (head) => result.flat_map(http_parse_request_line(head.start), (rl) => http_build_request(head, rl)))
+  match http_split_head(raw, "parse_request") {
+    Err(e) -> Err(e)
+    Ok(head) -> match http_parse_request_line(head.start) {
+      Err(e) -> Err(e)
+      Ok(rl) -> http_build_request(head, rl)
+    }
+  }
 
 fn http_with_body(r: Request, body: String) : Request =
   Request { method: r.method, url: r.url, headers: r.headers, body: body }
@@ -425,7 +427,10 @@ an empty body. `Request.url` is the request-line path — the
 absolute URL is never on the wire.
 """)]
 pub fn parse_request(raw: String) : Result[Request, String] =
-  result.map(http_parse_request_unframed(raw), (r) => http_with_body(r, http_frame_body(r.headers, r.body)))
+  match http_parse_request_unframed(raw) {
+    Err(e) -> Err(e)
+    Ok(r)  -> Ok(http_with_body(r, http_frame_body(r.headers, r.body)))
+  }
 
 #[doc("""
 Status code → reason phrase. Codes outside the table fall through
@@ -481,15 +486,12 @@ answer 413.
 pub fn read_request(conn: Conn, max_bytes: Int) : Result[Request, String] / NetTcp =
   http_read_request_loop(conn, [], 0, max_bytes)
 
-fn http_closed_early() : Result[Request, String] =
-  Err("read_request: peer closed before request complete")
-
 # Peer closed: Ok only when `Content-Length` is unusable, since a numeric
 # length would already have completed the request or left it truncated.
 fn http_finish_on_close(acc_rev: [Int]) : Result[Request, String] =
   match parse_request(bytes_to_string(list_reverse(acc_rev))) {
     Ok(r) if http_content_length(r.headers) == None -> Ok(r)
-    _ -> http_closed_early()
+    _ -> Err("read_request: peer closed before request complete")
   }
 
 # Some(req) once the buffer holds a complete request; None to recv more.
