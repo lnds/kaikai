@@ -822,9 +822,10 @@ arguments alone.
 ### Default handler
 
 Runtime-installed around `main` when `Random` is in the row. The
-handler holds a per-process PCG64 instance, seeded from
-`SecureRandom.bytes` at startup. Each op draws from that instance
-and resumes; the handler never short-circuits.
+handler holds a PCG32 instance per thread, each seeded from the OS
+CSPRNG the first time the thread draws, so no two threads replay one
+stream. Each op draws from that instance and resumes; the handler
+never short-circuits.
 
 The default handler is **not deterministic across runs**. Tests
 that need reproducibility install their own `Random` handler with
