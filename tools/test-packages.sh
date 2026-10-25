@@ -310,6 +310,7 @@ run_check_script "native_shim_verbs" "native_shim/check.sh"
 
 # An `extern "C" fn` with a body declared in a dependency is emitted and links.
 run_positive     "export_from_module" "export_from_module/app" "export_from_module/app/main.out.expected"
+run_positive     "export_same_package" "export_same_package/examples/app" "export_same_package/examples/app/main.out.expected"
 
 # A/B → C diamond: the shared shim package resolves once, compiles
 # once, links once — no duplicate symbols.
