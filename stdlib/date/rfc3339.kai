@@ -1,0 +1,126 @@
+#[doc("""
+RFC 3339 `date-time` text for `WallTime`: `format` and `parse`. Module
+path: `import date.rfc3339`.
+""")]
+
+import time
+import date
+
+fn rfc_pad(n: Int, width: Int) : String =
+  string.pad_left(int_to_string(n), width, '0')
+
+fn rfc_err(msg: String, at: Int) : String =
+  "rfc3339: " ++ msg ++ " at byte " ++ int_to_string(at)
+
+fn rfc_fraction(nanos: Int, width: Int) : String =
+  if nanos % 10 == 0 { rfc_fraction(nanos / 10, width - 1) }
+  else { "." ++ rfc_pad(nanos, width) }
+
+#[doc("""
+RFC 3339 `date-time` of `t` in UTC with a `Z` suffix. Fractional
+seconds appear only when `nanos` is non-zero, with trailing zeros
+trimmed: `2026-10-24T21:00:00Z`, `1970-01-01T00:00:00.5Z`.
+""")]
+pub fn format(t: WallTime) : String = {
+  let day = date.from_walltime(t)
+  let rem = t.secs - date.to_epoch_days(day) * 86400
+  let frac = if t.nanos == 0 { "" } else { rfc_fraction(t.nanos, 9) }
+  date.to_string(day) ++ "T" ++ rfc_pad(rem / 3600, 2) ++ ":" ++
+    rfc_pad(rem % 3600 / 60, 2) ++ ":" ++ rfc_pad(rem % 60, 2) ++ frac ++ "Z"
+}
+
+fn rfc_digit_at(s: String, i: Int) : Option[Int] = match char_at(s, i) {
+  Some(c) -> if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) } else { None }
+  None    -> None
+}
+
+fn rfc_digits(s: String, i: Int, n: Int, acc: Int) : Result[Int, String] =
+  if n == 0 { Ok(acc) }
+  else { match rfc_digit_at(s, i) {
+    Some(d) -> rfc_digits(s, i + 1, n - 1, acc * 10 + d)
+    None    -> Err(rfc_err("expected a digit", i))
+  } }
+
+fn rfc_expect(s: String, i: Int, a: Char, b: Char) : Result[Unit, String] =
+  match char_at(s, i) {
+    Some(c) -> if c == a or c == b { Ok(()) } else { Err(rfc_err("expected '#{a}'", i)) }
+    None    -> Err(rfc_err("unexpected end of input", i))
+  }
+
+fn rfc_bounded(v: Int, lo: Int, hi: Int, at: Int) : Result[Int, String] =
+  if v < lo or v > hi { Err(rfc_err("value out of range", at)) } else { Ok(v) }
+
+fn rfc_parse_days(s: String) : Result[Int, String] = {
+  let y = rfc_digits(s, 0, 4, 0)!
+  rfc_expect(s, 4, '-', '-')!
+  let m = rfc_bounded(rfc_digits(s, 5, 2, 0)!, 1, 12, 5)!
+  rfc_expect(s, 7, '-', '-')!
+  let d = rfc_bounded(rfc_digits(s, 8, 2, 0)!, 1, date.days_in_month(y, m), 8)!
+  Ok(date.to_epoch_days(date.Date { year: y, month: m, day: d }))
+}
+
+fn rfc_parse_clock(s: String) : Result[Int, String] = {
+  let h = rfc_bounded(rfc_digits(s, 11, 2, 0)!, 0, 23, 11)!
+  rfc_expect(s, 13, ':', ':')!
+  let m = rfc_bounded(rfc_digits(s, 14, 2, 0)!, 0, 59, 14)!
+  rfc_expect(s, 16, ':', ':')!
+  let sec = rfc_bounded(rfc_digits(s, 17, 2, 0)!, 0, 60, 17)!
+  Ok(h * 3600 + m * 60 + sec)
+}
+
+type RfcFrac = { nanos: Int, next: Int }
+
+fn rfc_digit_run(s: String, i: Int) : Int =
+  match rfc_digit_at(s, i) {
+    Some(_) -> 1 + rfc_digit_run(s, i + 1)
+    None    -> 0
+  }
+
+fn rfc_scale(n: Int, k: Int) : Int = if k == 0 { n } else { rfc_scale(n * 10, k - 1) }
+
+fn rfc_parse_frac(s: String, i: Int) : Result[RfcFrac, String] =
+  match char_at(s, i) {
+    Some('.') -> {
+      let k = rfc_digit_run(s, i + 1)
+      if k == 0 { Err(rfc_err("expected a digit", i + 1)) }
+      else if k > 9 { Err(rfc_err("more than 9 fractional digits", i + 10)) }
+      else {
+        let n = rfc_digits(s, i + 1, k, 0)!
+        Ok(RfcFrac { nanos: rfc_scale(n, 9 - k), next: i + 1 + k })
+      }
+    }
+    _ -> Ok(RfcFrac { nanos: 0, next: i })
+  }
+
+fn rfc_parse_numeric_zone(s: String, i: Int, sign: Int) : Result[Int, String] = {
+  let h = rfc_bounded(rfc_digits(s, i + 1, 2, 0)!, 0, 23, i + 1)!
+  rfc_expect(s, i + 3, ':', ':')!
+  let m = rfc_bounded(rfc_digits(s, i + 4, 2, 0)!, 0, 59, i + 4)!
+  rfc_end(s, i + 6, sign * (h * 3600 + m * 60))
+}
+
+fn rfc_end(s: String, i: Int, v: Int) : Result[Int, String] =
+  if string_length(s) == i { Ok(v) } else { Err(rfc_err("trailing characters", i)) }
+
+fn rfc_parse_zone(s: String, i: Int) : Result[Int, String] = match char_at(s, i) {
+  Some('Z') -> rfc_end(s, i + 1, 0)
+  Some('z') -> rfc_end(s, i + 1, 0)
+  Some('+') -> rfc_parse_numeric_zone(s, i, 1)
+  Some('-') -> rfc_parse_numeric_zone(s, i, -1)
+  _         -> Err(rfc_err("expected 'Z' or a numeric offset", i))
+}
+
+#[doc("""
+Parses an RFC 3339 `date-time`: `T` or `t` separator, `Z`/`z` or
+`+hh:mm`/`-hh:mm` offset (converted to UTC), 1 to 9 fractional
+digits, and a seconds field of 60 for a leap second. `Err` names the
+byte offset of the first offending character. Round-trips `format`.
+""")]
+pub fn parse(s: String) : Result[WallTime, String] = {
+  let days = rfc_parse_days(s)!
+  rfc_expect(s, 10, 'T', 't')!
+  let clock = rfc_parse_clock(s)!
+  let frac = rfc_parse_frac(s, 19)!
+  let offset = rfc_parse_zone(s, frac.next)!
+  Ok(WallTime { secs: days * 86400 + clock - offset, nanos: frac.nanos })
+}
