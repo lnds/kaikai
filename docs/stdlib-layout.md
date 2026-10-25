@@ -293,7 +293,9 @@ stdlib/
     args.kai
     process.kai  (start, wait, kill, exit, the pipe family, process groups, uid)
   time.kai       effect Clock
-  date.kai       pure civil calendar + RFC 3339 text; `today()` rides Clock
+  date.kai       pure civil calendar; `today()` rides Clock
+  date/
+    rfc3339.kai  (format, parse: RFC 3339 `date-time` text for `WallTime`)
   random.kai     effect Random
   random_secure.kai  effect SecureRandom
   log.kai        effect Log
@@ -540,12 +542,13 @@ the only effectful fn is `today()`.
   `day_of_week` (ISO: 1 = Mon … 7 = Sun), `day_of_year`;
   `add_days`, `diff_days`, `add_months` (end-of-month clamping,
   deliberately non-reversible); `eq`/`cmp`/`lt`; ISO-8601
-  `to_string` / strict `parse` (`YYYY-MM-DD`); `to_rfc3339` /
-  `parse_rfc3339` over `WallTime` (UTC `Z`, `±hh:mm` offsets, 1–9
-  fractional digits; shipped via #3162, here rather than in `time`
-  because `date` imports `time`); bridge
+  `to_string` / strict `parse` (`YYYY-MM-DD`); bridge
   `from_walltime(t)` (UTC interpretation, documented not
   configurable) and `today()` `/ Clock` *(shipped via PR #770 — closes #767)*.
+- `date.rfc3339` — `format(t: WallTime) : String` (UTC `Z`, fraction only
+  when non-zero, trailing zeros trimmed) and `parse(s) : Result[WallTime,
+  String]` (`T`/`t`, `Z`/`z` or `±hh:mm`, 1–9 fractional digits, errors
+  name the byte offset); reuses `date`'s calendar *(shipped via #3162)*.
   Out of scope v1: tzdata/DST, civil time-of-day, locales, ISO week
   dates, non-Gregorian calendars.
 
