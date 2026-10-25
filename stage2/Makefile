@@ -7017,8 +7017,8 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135.rc \
 	  || { echo "perceus-1135-vec-raw FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135.rc || true; exit 1; }; \
-	grep -q 'vec_inplace=283 vec_cow=7' build/s2-vec_bare_words.rc \
-	  || { echo "perceus-1135-vec-raw FAIL (bare words: expected vec_inplace=283 vec_cow=7)"; \
+	grep -q 'vec_inplace=284 vec_cow=6' build/s2-vec_bare_words.rc \
+	  || { echo "perceus-1135-vec-raw FAIL (bare words: expected vec_inplace=284 vec_cow=6)"; \
 	       grep vec_ build/s2-vec_bare_words.rc || true; exit 1; }; \
 	echo "perceus-1135-vec-raw OK (raw moves ride unique-or-copy; qualified self-call keeps the goto)"
 
@@ -7035,8 +7035,8 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135-n.rc \
 	  || { echo "perceus-1135-vec-raw-native FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135-n.rc || true; exit 1; }; \
-	grep -q 'vec_inplace=283 vec_cow=7' build/s2-vec_bare_words-n.rc \
-	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: expected vec_inplace=283 vec_cow=7)"; \
+	grep -q 'vec_inplace=284 vec_cow=6' build/s2-vec_bare_words-n.rc \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: expected vec_inplace=284 vec_cow=6)"; \
 	       grep vec_ build/s2-vec_bare_words-n.rc || true; exit 1; }; \
 	KAI_NATIVE_DUMP_IR=build/s2-vec_bare_words-n.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/vec_bare_words.kai -o build/s2-vec_bare_words-ir 2> build/s2-vec_bare_words-ir.err \
 	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: whole-program build errored)"; cat build/s2-vec_bare_words-ir.err; exit 1; }; \
