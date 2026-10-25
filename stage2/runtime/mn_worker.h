@@ -197,7 +197,10 @@ static KaiFiber *kai_worker_park(KaiWorker *w) {
     if (!f) {
         /* Idle only once the recheck came up empty: a worker holding an
          * undispatched fiber must never count as idle to the deadlock check. */
-        atomic_fetch_add(&kai_sched_idle_count, 1);
+        /* The last worker to go idle flushes: bytes printed on another
+         * worker after the reactor armed would otherwise wait for the next
+         * wake. */
+        if (atomic_fetch_add(&kai_sched_idle_count, 1) + 1 == kai_nthreads) kai_flush_stdout();
         kai_sched_check_deadlock();
         pthread_mutex_lock(&s->park_mu);
         while (!atomic_load(&s->permit) && !kai_sched_shutting_down)

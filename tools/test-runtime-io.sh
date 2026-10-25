@@ -33,6 +33,21 @@ for threads in 1 4; do
     || { echo "runtime-io FAIL ($BACKEND, KAI_THREADS=$threads): output written before a sleep did not reach the pipe (waited ${n} ticks, $(wc -c < "$OUT/sleep.out") bytes)"; exit 1; }
 done
 
+# A fiber blocked in Stdin.read_line parks: another fiber's output reaches the
+# pipe while the writer still holds stdin open.
+build stdin_read_parks_fiber
+for threads in 1 4; do
+  : > "$OUT/park.out"
+  (echo hi; sleep 20) | KAI_THREADS=$threads "$OUT/stdin_read_parks_fiber" >> "$OUT/park.out" &
+  pid=$!
+  n=0
+  while [ ! -s "$OUT/park.out" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  kill -TERM "$pid" 2> /dev/null || true
+  wait "$pid" 2> /dev/null || true
+  [ "$(cat "$OUT/park.out")" = "got hi" ] \
+    || { echo "runtime-io FAIL ($BACKEND, KAI_THREADS=$threads): a fiber blocked in Stdin.read_line stalled the others (waited ${n} ticks)"; exit 1; }
+done
+
 # stdout lines printed before a panic precede the panic message on a shared pipe.
 build stdout_before_panic
 "$OUT/stdout_before_panic" > "$OUT/panic.out" 2>&1 || true
