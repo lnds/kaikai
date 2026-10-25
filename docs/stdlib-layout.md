@@ -285,15 +285,15 @@ stdlib/
   uuid.kai       RFC 4122 UUID v4 generator + parser
   path.kai       POSIX path manipulation, auto-loaded (path_join, path_dirname, …)
   fs/            effect File
-    file.kai     (read, write, append, exists, delete, rename, read_bytes, write_bytes)
-    dir.kai      (list_dir, create_dir, remove_dir, walk)
+    file.kai     (read, write, append, exists, delete, rename, read_bytes, write_bytes, metadata)
+    dir.kai      (list_dir, create_dir, remove_dir, walk, current, temp_dir)
     path.kai     (the `fs.path` qualifier over the auto-loaded `path` helpers)
   os/            effects Env, Process
     env.kai
     args.kai
     process.kai  (start, wait, kill, exit, the pipe family, process groups, uid)
   time.kai       effect Clock
-  date.kai       pure civil calendar; `today()` rides Clock
+  date.kai       pure civil calendar + RFC 3339 text; `today()` rides Clock
   random.kai     effect Random
   random_secure.kai  effect SecureRandom
   log.kai        effect Log
@@ -502,10 +502,10 @@ declare `/ Stdin`.
 
 ### fs (`/ File`)
 
-- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `exists`, `delete`, `rename` *(shipped via #345 as core builtins; module-qualified surface `file.exists` / `file.delete` / `file.rename` shipped via #423)*; `metadata`, `read_bytes`, `write_bytes` *(deferred — follow-up to #345)*
+- `fs.file` — `read_file`, `write_file`, `append` *(shipped via PR #132)*; `exists`, `delete`, `rename` *(shipped via #345 as core builtins; module-qualified surface `file.exists` / `file.delete` / `file.rename` shipped via #423)*; `read_bytes`, `write_bytes`, `metadata` *(shipped; `metadata` via #3162 returns `FileMetadata { size, modified, is_dir, is_file }`, following symlinks)*
 - `File` chunked / streaming ops — `open_read`, `read_chunk`, `open_write`, `write_chunk`, `close_file` *(shipped via PR #804, issue #771 Phase 1: five `File` effect ops + `FileHandle` opaque handle + R1-pool default handlers; `read_chunk` returns `Ok("")` at EOF. Typed capabilities via the `Perm` kind shipped with #1251: `open_read` mints `FileHandle<read>`, `open_write` mints `FileHandle<read + write>` (fd opened `O_RDWR`), `read_chunk`/`write_chunk` require `<read>`/`<write>`, `close_file` takes a bare handle; `file_handle(fd)` mints for handlers/tests.)*
 - `stream` — lazy push streams over the chunked `File` ops *(shipped via issue #801: `stdlib/stream.kai`. Carrier `Stream[t, e]` (single-ctor variant); sources `from_list` / `read_lines`; pipe-canonical stages `map` / `flat_map` / `filter` / `take` / `take_while`; sinks `foldl` (`fold` deprecated alias) / `each` / `count` / `to_list` / `write_lines`. Recoverable faults ride the `ReadFault` effect — `bad_chunk` resumable (skip), `open_fault : Nothing` abort-only. `import stream`. Supersedes #771 Phase 2's `with_lines` / `fold_lines` / `each_line` bracket surface.)*
-- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(shipped via #344: `kai_core_dir_*` runtime primitives + `pub fn` wrappers in `stdlib/fs/dir.kai`. All four ride the `File` effect. v1 limits: symlinks are not followed in `walk`; `create_dir` uses fixed `0755`; `list_dir` / `walk` return `[]` on read error.)*
+- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(shipped via #344: `kai_core_dir_*` runtime primitives + `pub fn` wrappers in `stdlib/fs/dir.kai`. All four ride the `File` effect. v1 limits: symlinks are not followed in `walk`; `create_dir` uses fixed `0755`; `list_dir` / `walk` return `[]` on read error. `current()` (`getcwd`) and `temp_dir()` (`$TMPDIR`, else `/tmp`) shipped via #3162.)*
 - `fs.path` — `import fs.path` is the qualified home of the pure path helpers `is_absolute`, `basename`, `dirname`, `split`, `ext`, `strip_ext`, `join` *(shipped — the implementation is the auto-loaded `stdlib/path.kai`, so `path.join(a, b)` and the flat `path_join(a, b)` reach the same function)*.
 
 ### os (`/ Env + Process`)
@@ -540,7 +540,10 @@ the only effectful fn is `today()`.
   `day_of_week` (ISO: 1 = Mon … 7 = Sun), `day_of_year`;
   `add_days`, `diff_days`, `add_months` (end-of-month clamping,
   deliberately non-reversible); `eq`/`cmp`/`lt`; ISO-8601
-  `to_string` / strict `parse` (`YYYY-MM-DD`); bridge
+  `to_string` / strict `parse` (`YYYY-MM-DD`); `to_rfc3339` /
+  `parse_rfc3339` over `WallTime` (UTC `Z`, `±hh:mm` offsets, 1–9
+  fractional digits; shipped via #3162, here rather than in `time`
+  because `date` imports `time`); bridge
   `from_walltime(t)` (UTC interpretation, documented not
   configurable) and `today()` `/ Clock` *(shipped via PR #770 — closes #767)*.
   Out of scope v1: tzdata/DST, civil time-of-day, locales, ISO week
