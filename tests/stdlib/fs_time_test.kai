@@ -1,0 +1,151 @@
+import time
+import date
+import fs.file
+import fs.dir
+
+fn wt(secs: Int, nanos: Int) : time.WallTime = time.WallTime { secs: secs, nanos: nanos }
+
+fn parsed(s: String) : String = match date.parse_rfc3339(s) {
+  Ok(t)  -> "#{t.secs}.#{t.nanos}"
+  Err(e) -> e
+}
+
+fn scratch(name: String) : String / File = dir.temp_dir() ++ "/kai_fs_time_" ++ name
+
+# ---- to_rfc3339 -----------------------------------------------------
+
+test "to_rfc3339 formats UTC with a Z suffix" {
+  assert date.to_rfc3339(wt(0, 0)) == "1970-01-01T00:00:00Z"
+  assert date.to_rfc3339(wt(1792875600, 0)) == "2026-10-24T21:00:00Z"
+  assert date.to_rfc3339(wt(-1, 0)) == "1969-12-31T23:59:59Z"
+  assert date.to_rfc3339(wt(951782400, 0)) == "2000-02-29T00:00:00Z"
+}
+
+test "to_rfc3339 prints fractions only when non-zero, trimmed" {
+  assert date.to_rfc3339(wt(0, 500000000)) == "1970-01-01T00:00:00.5Z"
+  assert date.to_rfc3339(wt(0, 520000000)) == "1970-01-01T00:00:00.52Z"
+  assert date.to_rfc3339(wt(0, 1)) == "1970-01-01T00:00:00.000000001Z"
+  assert date.to_rfc3339(wt(0, 123456789)) == "1970-01-01T00:00:00.123456789Z"
+  assert date.to_rfc3339(wt(0, 5000000)) == "1970-01-01T00:00:00.005Z"
+}
+
+# ---- parse_rfc3339 --------------------------------------------------
+
+test "parse_rfc3339 reads the RFC examples" {
+  assert parsed("1985-04-12T23:20:50.52Z") == "482196050.520000000"
+  assert parsed("1996-12-19T16:39:57-08:00") == "851042397.0"
+  assert parsed("1990-12-31T23:59:60Z") == "662688000.0"
+  assert parsed("1990-12-31T15:59:60-08:00") == "662688000.0"
+  assert parsed("1937-01-01T12:00:27.87+00:20") == "-1041337173.870000000"
+}
+
+test "parse_rfc3339 accepts lowercase separators and offsets" {
+  assert parsed("1970-01-01t00:00:00z") == "0.0"
+  assert parsed("1970-01-01T05:30:00+05:30") == "0.0"
+  assert parsed("1970-01-01T00:00:00-00:00") == "0.0"
+}
+
+test "parse_rfc3339 scales 1 to 9 fractional digits" {
+  assert parsed("1970-01-01T00:00:00.5Z") == "0.500000000"
+  assert parsed("1970-01-01T00:00:00.000000001Z") == "0.1"
+  assert parsed("1970-01-01T00:00:00.123456789Z") == "0.123456789"
+}
+
+test "parse_rfc3339 handles leap days" {
+  assert parsed("2000-02-29T00:00:00Z") == "951782400.0"
+  assert parsed("2024-02-29T12:00:00Z") == "1709208000.0"
+  assert parsed("2023-02-29T00:00:00Z") == "rfc3339: value out of range at byte 8"
+  assert parsed("1900-02-29T00:00:00Z") == "rfc3339: value out of range at byte 8"
+}
+
+test "parse_rfc3339 names the byte offset of each error" {
+  assert parsed("") == "rfc3339: expected a digit at byte 0"
+  assert parsed("2026-13-01T00:00:00Z") == "rfc3339: value out of range at byte 5"
+  assert parsed("2026-00-01T00:00:00Z") == "rfc3339: value out of range at byte 5"
+  assert parsed("2026-01-32T00:00:00Z") == "rfc3339: value out of range at byte 8"
+  assert parsed("2026-01-01 00:00:00Z") == "rfc3339: expected 'T' at byte 10"
+  assert parsed("2026-01-01T24:00:00Z") == "rfc3339: value out of range at byte 11"
+  assert parsed("2026-01-01T00:60:00Z") == "rfc3339: value out of range at byte 14"
+  assert parsed("2026-01-01T00:00:61Z") == "rfc3339: value out of range at byte 17"
+  assert parsed("2026-01-01T00:00:00") == "rfc3339: expected 'Z' or a numeric offset at byte 19"
+  assert parsed("2026-01-01T00:00:00.Z") == "rfc3339: expected a digit at byte 20"
+  assert parsed("2026-01-01T00:00:00.1234567890Z") == "rfc3339: more than 9 fractional digits at byte 29"
+  assert parsed("2026-01-01T00:00:00+24:00") == "rfc3339: value out of range at byte 20"
+  assert parsed("2026-01-01T00:00:00+01:60") == "rfc3339: value out of range at byte 23"
+  assert parsed("2026-01-01T00:00:00+0100") == "rfc3339: expected ':' at byte 22"
+  assert parsed("2026-01-01T00:00:00Zx") == "rfc3339: trailing characters at byte 20"
+  assert parsed("2026-01-01T00:00:00+01:00 ") == "rfc3339: trailing characters at byte 25"
+  assert parsed("2026-1-01T00:00:00Z") == "rfc3339: expected a digit at byte 6"
+}
+
+test "parse_rfc3339 round-trips to_rfc3339" {
+  let samples = [wt(0, 0), wt(-1, 999999999), wt(1792875600, 520000000),
+                 wt(951782400, 1), wt(-62135596800, 0), wt(253402300799, 0)]
+  assert (samples |? (t => parsed(date.to_rfc3339(t)) != "#{t.secs}.#{t.nanos}")) == []
+}
+
+# ---- fs.file.metadata -----------------------------------------------
+
+test "metadata reports the size of a known file" {
+  let p = scratch("size.txt")
+  assert write_file(p, "hello") == Ok(())
+  match file.metadata(p) {
+    Ok(m) -> {
+      assert m.size == 5
+      assert m.is_file
+      assert not m.is_dir
+    }
+    Err(e) -> { assert e == "" }
+  }
+  assert file.delete(p) == Ok(())
+}
+
+test "metadata modified is close to now" {
+  let p = scratch("mtime.txt")
+  assert write_file(p, "x") == Ok(())
+  let now = time.now()
+  match file.metadata(p) {
+    Ok(m) -> { assert m.modified.secs >= now.secs - 5 and m.modified.secs <= now.secs + 5 }
+    Err(e) -> { assert e == "" }
+  }
+  assert file.delete(p) == Ok(())
+}
+
+test "metadata distinguishes a directory from a file" {
+  match file.metadata(dir.temp_dir()) {
+    Ok(m) -> {
+      assert m.is_dir
+      assert not m.is_file
+    }
+    Err(e) -> { assert e == "" }
+  }
+}
+
+test "metadata of a missing path names the path and the reason" {
+  let p = scratch("missing")
+  match file.metadata(p) {
+    Ok(_)  -> { assert false }
+    Err(e) -> {
+      assert string.contains(e, p)
+      assert string.contains(e, "No such file")
+    }
+  }
+}
+
+# ---- fs.dir ----------------------------------------------------------
+
+test "current is an absolute existing directory" {
+  match dir.current() {
+    Ok(d) -> {
+      assert string.starts_with(d, "/")
+      assert file.exists(d)
+    }
+    Err(e) -> { assert e == "" }
+  }
+}
+
+test "temp_dir is an existing absolute directory" {
+  let d = dir.temp_dir()
+  assert string.starts_with(d, "/")
+  assert file.exists(d)
+}

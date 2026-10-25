@@ -611,7 +611,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-field-types test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-net-url test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-cli-flags test-kai-cli
+tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-field-types test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-net-url test-fs-time test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-cli-flags test-kai-cli
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke + Perceus RC leak ledger (240 fixtures pinned)"
 
 # CI sharding (docs/ci-time-analysis.md §7). The tier1 work is split across
@@ -667,7 +667,7 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #     test-canonical-aliases, test-info, test-doc, test-upgrade-resolver,
 #     test-release-platforms, test-kaic-boot, test-cli-flags, test-kai-cli,
 #     test-partition-linearity, test-binserialize-linearity,
-#     test-core-text, test-http-redirects, test-net-url }
+#     test-core-text, test-http-redirects, test-net-url, test-fs-time }
 # plus both halves of rc-leak-gate and tier0's demos-no-regression cover the
 # prerequisites of `tier1` (the
 # light slices union to TEST_LIGHT_TARGETS, asserted by
@@ -721,7 +721,7 @@ tier1-shard-2: kaic2
 tier1-shard-3: kaic2
 	$(tier1-shard-start)
 	$(call tier1-light-slice,3)
-	$(MAKE) test-partition-linearity test-binserialize-linearity test-core-text test-http-redirects test-net-url
+	$(MAKE) test-partition-linearity test-binserialize-linearity test-core-text test-http-redirects test-net-url test-fs-time
 	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=1/3
 	$(MAKE) -C stage2 test-namespace-collisions-modular-axes
 	$(MAKE) test-field-types FIELD_TYPES_SHARD=3/8
@@ -1334,7 +1334,7 @@ test-negative: kaic2
 test-stdlib-modules: kaic2
 	@./tools/test-stdlib-modules.sh
 
-.PHONY: test-core-text test-http-redirects test-net-url
+.PHONY: test-core-text test-http-redirects test-net-url test-fs-time
 KAI_TEST_DRIVER ?= $(CURDIR)/bin/kai
 KAI_TEST_BACKEND ?= c
 
@@ -1346,6 +1346,9 @@ test-http-redirects: bin/kai
 
 test-net-url: bin/kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/url_test.kai
+
+test-fs-time: bin/kai
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/fs_time_test.kai
 
 test-core-text: bin/kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_test.kai
