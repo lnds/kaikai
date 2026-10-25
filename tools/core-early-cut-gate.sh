@@ -44,5 +44,12 @@ grep -q 'core-precut: emptied' "$WORK/home.raw" || { echo "core-early-cut: FAIL 
 cmp -s "$WORK/home.raw" "$WORK/twin.raw" && cmp -s "$WORK/home.c" "$WORK/twin.c" \
   || { echo "core-early-cut: FAIL — a copy of the stdlib at another path changes the compile of $fx"; exit 1; }
 
+# A mutual tail pair in a library module fuses with the cut as without it.
+cp tools/core-early-cut-tail-lib.kai "$WORK/stdlib-copy/tailpair.kai"
+STDLIB="$WORK/stdlib-copy" compile "$WORK/tail-off" tools/core-early-cut-tail.kai --no-early-cut
+STDLIB="$WORK/stdlib-copy" compile "$WORK/tail-cut" tools/core-early-cut-tail.kai
+grep -q '__kai_fused_' "$WORK/tail-off.c" || { echo "core-early-cut: FAIL — the mutual tail pair is not fused"; exit 1; }
+cmp -s "$WORK/tail-cut.c" "$WORK/tail-off.c" || { echo "core-early-cut: FAIL — the cut changes the compile of a mutual tail pair"; exit 1; }
+
 [ "$fail" -eq 0 ] || { echo "core-early-cut: FAIL — $fail of $((pass+fail)) programs"; exit 1; }
 echo "core-early-cut OK ($pass programs)"

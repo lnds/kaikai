@@ -35,6 +35,7 @@ import compiler.written
 import compiler.scalar_ty
 import compiler.type_text
 import compiler.ast_map
+import compiler.symtab
 
 #[doc("One node of the tail-call graph: a top-level function's module origin, its arity, and the id of the declaration it stands for. Arity is carried because a call whose argument count differs from the declaration is not a tail call the rewrite can fuse; the id is what a call matches on, so two same-named functions are two nodes whatever they spell.")]
 pub(pkg) type TgNode = TgN(Option[String], Int, SymId)
@@ -65,6 +66,18 @@ pub(pkg) fn tailgraph_build(decls: [Decl]) : TailGraph {
   TG(nodes, tg_collect_edges(decls, nodes))
 }
 
+#[doc("The tail-call graph of `decls` before their names are resolved, with a call matched to the functions of `tab` that share its last name segment. It reports every group `tailgraph_build` does, and possibly more.")]
+pub(pkg) fn tailgraph_build_named(decls: [Decl], tab: SymTab) : TailGraph {
+  let nodes = tg_collect_nodes(decls)
+  TG(nodes, tg_collect_edges_named(decls, nodes, tab))
+}
+
+#[doc("The ids of the functions that belong to some group of `g`.")]
+pub(pkg) fn tailgraph_group_syms(g: TailGraph) : [SymId] = {
+  let syms = map(tailgraph_nodes(g), tgnode_sym)
+  flat_map(tailgraph_groups(g), (grp) => flat_map(tggroup_members(grp), (i) => match nth(syms, i) { Some(s) -> [s]  None -> [] }))
+}
+
 #[doc("The mutually recursive tail-call groups of `g`: every strongly connected component with two or more members, ordered and listed as `scc_groups` gives them. Self-loops are excluded — a component of one member is the self-tail case the existing rewrite already handles.")]
 pub(pkg) fn tailgraph_groups(g: TailGraph) : [TgGroup] =
   map(scc_groups(list_length(tailgraph_nodes(g)), map(tailgraph_edges(g), (e) => match e { TgE(a, b) -> (a, b) })), (ms) => TgGrp(ms))
@@ -86,11 +99,16 @@ fn tg_node_of_decl(d: Decl) : Option[TgNode] = match d {
 
 # The nodes with their list index, by declaration id; each chain keeps
 # list order, so its first hit is the list's first hit.
-type TgIx = { by_sym: NameIndex[(Int, TgNode)] }
+type TgIx = { by_sym: NameIndex[(Int, TgNode)], by_name: NameIndex[(Int, TgNode)], tab: Option[SymTab] }
 
 fn tg_index(rev: [(Int, TgNode)], ix: TgIx) : TgIx = match rev {
   [] -> ix
-  [(i, n), ...rest] -> tg_index(rest, TgIx { by_sym: idx_prepend_sym(ix.by_sym, tgnode_sym(n), (i, n)) })
+  [(i, n), ...rest] -> tg_index(rest, TgIx { ...ix, by_sym: idx_prepend_sym(ix.by_sym, tgnode_sym(n), (i, n)) })
+}
+
+fn tg_index_names(rev: [(Int, TgNode)], tab: SymTab, ix: TgIx) : TgIx = match rev {
+  [] -> ix
+  [(i, n), ...rest] -> tg_index_names(rest, tab, TgIx { ...ix, by_name: idx_prepend(ix.by_name, written_text(sym_name(tab, tgnode_sym(n))), (i, n)) })
 }
 
 fn tg_numbered(ns: [TgNode], i: Int, acc: [(Int, TgNode)]) : [(Int, TgNode)] = match ns {
@@ -106,7 +124,12 @@ fn tg_first(chain: [(Int, TgNode)], hit: (TgNode) -> Bool) : Option[(Int, TgNode
 # ---- edges ---------------------------------------------------------
 
 fn tg_collect_edges(decls: [Decl], nodes: [TgNode]) : [TgEdge] =
-  tg_edges_loop(decls, tg_index(tg_numbered(nodes, 0, []), TgIx { by_sym: idx_empty() }), 0, [])
+  tg_edges_loop(decls, tg_index(tg_numbered(nodes, 0, []), TgIx { by_sym: idx_empty(), by_name: idx_empty(), tab: None }), 0, [])
+
+fn tg_collect_edges_named(decls: [Decl], nodes: [TgNode], tab: SymTab) : [TgEdge] = {
+  let numbered = tg_numbered(nodes, 0, [])
+  tg_edges_loop(decls, tg_index_names(numbered, tab, TgIx { by_sym: idx_empty(), by_name: idx_empty(), tab: Some(tab) }), 0, [])
+}
 
 fn tg_edges_loop(decls: [Decl], nodes: TgIx, i: Int, acc: [TgEdge]) : [TgEdge] {
   match decls {
@@ -198,10 +221,28 @@ fn tg_pattern_binds(p: Pattern, target: LocalId) : Bool = match p.pkind {
 
 # A callee names one declaration or none: the node is found by id, and
 # a local's id is no node's.
-fn tg_call_target(f: Expr, argc: Int, nodes: TgIx) : [Int] = match callee_id(f) {
-  Some(s) -> tg_resolve_sym(s, argc, nodes)
-  None    -> []
+fn tg_call_target(f: Expr, argc: Int, nodes: TgIx) : [Int] = match nodes.tab {
+  Some(_) -> tg_resolve_name(tg_callee_name(f), argc, nodes)
+  None -> match callee_id(f) {
+    Some(s) -> tg_resolve_sym(s, argc, nodes)
+    None    -> []
+  }
 }
+
+# Before names are resolved a callee is only its last segment: every node
+# of that name is a target, so a group may be reported that is not one.
+fn tg_callee_name(f: Expr) : String = match f.kind {
+  EName(w)       -> tg_last_segment(written_text(w))
+  EModCall(_, n) -> written_text(n)
+  EField(_, n)   -> n
+  _              -> ""
+}
+
+fn tg_last_segment(s: String) : String =
+  if is_some(index_of(s, ".")) { unwrap_or(last(split(s, ".")), s) } else { s }
+
+fn tg_resolve_name(name: String, argc: Int, nodes: TgIx) : [Int] =
+  flat_map(idx_chain(nodes.by_name, name), (at) => tg_arity_ok(at, argc))
 
 fn tg_resolve_sym(s: SymId, argc: Int, nodes: TgIx) : [Int] =
   match tg_first(idx_chain_sym(nodes.by_sym, s), (n) => sym_raw(tgnode_sym(n)) == sym_raw(s)) {
