@@ -28,6 +28,18 @@ static KAI_TLS int         kai_test_in_progress  = 0;
 static KAI_TLS uintptr_t   kai_test_frame        = 0;
 static KAI_TLS uint32_t    kai_test_unw_mark     = 0;
 
+/* The runtime's cancel paths live in another translation unit when the
+ * program links per module, so they reach the running block through this
+ * shared pointer, not through this unit's own harness state. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern void (*kai_test_escape_hook)(void);
+#  if defined(KAI_RUNTIME_OWNER)
+void (*kai_test_escape_hook)(void) = NULL;
+#  endif
+#else
+static void (*kai_test_escape_hook)(void) = NULL;
+#endif
+
 static long long kai_test_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -283,9 +295,12 @@ static int kai_test_selected(const char *file, const char *desc) {
     return 0;
 }
 
+static void kai_test_cancel_escape_here(void);
+
 static void kai_test_begin(const char *desc) {
     kai_test_count_total++;
     kai_test_current = desc;
+    kai_test_escape_hook = kai_test_cancel_escape_here;
     kai_test_reported = 0;
     if (kai_test_json_mode() && kai_test_coverage_mode()) kai_cov_reset();
     kai_test_started_ns = kai_test_now_ns();
@@ -452,6 +467,19 @@ __attribute__((noinline))
 static int kai_test_running(const char **desc) {
     *desc = kai_test_current;
     return kai_test_in_progress;
+}
+
+/* A cancellation with no handler and no fiber pad fails the running test
+ * block like a failed assertion. */
+static void kai_test_cancel_escape_here(void) {
+    const char *test;
+    if (!kai_test_running(&test)) return;
+    kai_test_fail(test, "unhandled cancellation (Cancel.raise escaped the test)");
+    kai_test_unwind();
+}
+
+static void kai_test_cancel_escape(void) {
+    if (kai_test_escape_hook) kai_test_escape_hook();
 }
 
 static void kai_assert_check(KaiValue *cond, const char *msg) {

@@ -901,6 +901,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
             kai_fiber_pad_jump(f, 0);
             /* Unreachable. */
         }
+        kai_test_cancel_escape();
         kai_eputs("kai: nursery child cancelled; no survivors\n");
         kai_exit(1);
     }
@@ -927,6 +928,7 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
         kai_fiber_pad_jump(f, 0);
         /* Unreachable. */
     }
+    kai_test_cancel_escape();
     kai_eputs("kai: Cancel.raise: unhandled (fiber cancelled)\n");
     kai_exit(0);
 }

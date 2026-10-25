@@ -272,6 +272,11 @@ kai test --json --coverage .
 kai test --json --coverage --only 'tests/a_test.kai:adds' .
 ```
 
+A cancellation that escapes a block (`Cancel.raise` with no handler, or
+a nursery re-raising a child's cancellation) fails that block like a
+failed assertion: the next blocks run, the summary prints, the exit
+status is 1, and `--json` records the block as `fail`.
+
 ## Exit codes
 
 ```text
