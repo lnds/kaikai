@@ -308,6 +308,9 @@ run_rendered "simple_dep"             "simple_dep"             "simple_dep/main.
 run_positive     "native_shim"    "native_shim/app" "native_shim/app/main.out.expected"
 run_check_script "native_shim_verbs" "native_shim/check.sh"
 
+# An `extern "C" fn` with a body declared in a dependency is emitted and links.
+run_positive     "export_from_module" "export_from_module/app" "export_from_module/app/main.out.expected"
+
 # A/B → C diamond: the shared shim package resolves once, compiles
 # once, links once — no duplicate symbols.
 run_check_script "native_diamond" "native_diamond/check.sh"
@@ -353,6 +356,7 @@ run_parity  "parity-stdlib_across_deps" "stdlib_across_deps/consumer"
 run_parity  "parity-auto_install"       "auto_install"
 run_parity  "parity-git_tag_alias"      "git_tag_alias"
 run_parity  "parity-native_shim"        "native_shim/app"
+run_parity  "parity-export_from_module" "export_from_module/app"
 run_parity  "parity-simple_dep"         "simple_dep"
 run_parity  "parity-transitive"         "transitive"
 run_parity  "parity-builtin_shadow"     "builtin_shadow"
