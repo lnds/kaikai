@@ -262,6 +262,9 @@ run_positive "build_sub_package"      "build_sub_package"      "build_sub_packag
 run_positive "build_sub_package-sub"  "build_sub_package/sub"  "build_sub_package/sub/main.out.expected"
 run_positive "build_module_qualified" "build_module_qualified" "build_module_qualified/main.out.expected"
 
+# A module reads the fields of a record its import-cycle partner declares, whichever sorts first.
+run_check_script "cycle_field_read" "cycle_field_read/check.sh"
+
 # A module's private helper spelled like a core builtin: the call reaches
 # the module's own fn, on both backends.
 run_positive "builtin_shadow"         "builtin_shadow"         "builtin_shadow/main.out.expected"

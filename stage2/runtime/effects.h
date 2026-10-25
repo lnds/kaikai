@@ -591,12 +591,12 @@ static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
     return kai_cont_resume(k, kai_core_ref_set(kai_incref(r), kai_incref(v)));
 }
 
-/* Default Random handler — PCG32 (M.E.O'Neill 2014). Per-process
- * shared state, seeded once on first use from time(NULL). Doc B
- * §`Random` specifies seeding from SecureRandom; that is deferred
- * until SecureRandom lands. Non-cryptographic by design — for
+/* Default Random handler — PCG32 (M.E.O'Neill 2014). One stream per
+ * thread, each seeded on first use from the OS CSPRNG, so runs and
+ * threads never replay one another. Non-cryptographic by design — for
  * games, simulations, sampling, fixtures. */
-/* Per-process RNG stream: one shared state so a seed in one TU is observed
+static void _kai_securerandom_fill(unsigned char *buf, size_t n);
+/* Per-thread RNG stream: one state so a seed in one TU is observed
  * by random() in another (owner defines, others extern). */
 #if defined(KAI_SEPARATE_COMPILATION)
 extern KAI_TLS uint64_t _kai_pcg_state;
@@ -636,8 +636,9 @@ static void _kai_pcg32_seed(uint64_t initstate, uint64_t initseq) {
 __attribute__((noinline))
 static void _kai_pcg32_ensure_seeded(void) {
     if (!_kai_pcg_seeded) {
-        uint64_t t = (uint64_t) time(NULL);
-        _kai_pcg32_seed(t ^ 0xa5a5a5a5a5a5a5a5ULL, t * 6364136223846793005ULL);
+        uint64_t seed[2];
+        _kai_securerandom_fill((unsigned char *) seed, sizeof seed);
+        _kai_pcg32_seed(seed[0], seed[1]);
         _kai_pcg_seeded = 1;
     }
 }
