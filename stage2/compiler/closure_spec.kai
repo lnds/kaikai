@@ -33,7 +33,7 @@ pub type CSpecOut = { decls: [Decl], rows: [NEnt] }
 pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab, ids: ProtoIds) : CSpecOut = {
   let hofns = collect_hofns(ds)
   if list_length(hofns) == 0 { CSpecOut { decls: ds, rows: [] } }
-  else { cspec_fixpoint(ds, ds, hofns, [], [], cspec_fuel(), target, tab, ids) }
+  else { cspec_fixpoint(ds, ds, hofns, [], [], [], cspec_fuel(), target, tab, ids) }
 }
 
 # Specialisation propagates across fn boundaries: specialising `foldl`
@@ -51,23 +51,44 @@ fn cspec_fuel() : Int = 64
 # stranding the transitive spec (`foldl → foldl_loop`).
 # A spec is a declaration of its own, so each round's specs enter the
 # table: the next round spells a spec's host and callee from it.
-fn cspec_fixpoint(orig: [Decl], ds: [Decl], hofns: [Decl], emitted: [SymId], rows: [NEnt], fuel: Int, target: String, tab: SymTab, ids: ProtoIds) : CSpecOut =
+fn cspec_fixpoint(orig: [Decl], ds: [Decl], hofns: [Decl], emitted: [SymId], rows: [NEnt], chains: [SpecChain], fuel: Int, target: String, tab: SymTab, ids: ProtoIds) : CSpecOut =
   if fuel <= 0 { CSpecOut { decls: orig, rows: [] } }
   else {
-    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns, target), tab, target, emitted, [])
-    if list_length(reqs) == 0 { CSpecOut { decls: rewrite_all(ds, ds, tab, ids, hofns, target), rows: rows } }
+    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns, chains, target), tab, target, emitted, [])
+    if list_length(reqs) == 0 { CSpecOut { decls: rewrite_all(ds, ds, tab, ids, hofns, chains, target), rows: rows } }
     else {
       let specs = map(reqs, (r) => emit_cspec(r, req_spec_name(tab, r), target))
       let rows1 = map(reqs, (r) => req_spec_row(tab, r, target))
       let ds1 = list_append(ds, specs)
       let hofns1 = list_append(hofns, filter_hofns(specs))
       let emitted1 = list_append(emitted, map(reqs, (r) => req_spec_sym(tab, r, target)))
-      cspec_fixpoint(orig, ds1, hofns1, emitted1, list_append(rows, rows1), fuel - 1, target, st_extend(tab, rows1), ids)
+      let chains1 = list_append(chains, map(reqs, (r) => req_chain(tab, r, target, chains)))
+      cspec_fixpoint(orig, ds1, hofns1, emitted1, list_append(rows, rows1), chains1, fuel - 1, target, st_extend(tab, rows1), ids)
     }
   }
 
+# The callees a spec descends from, nearest first: a spec reached through its
+# own callee again is a cycle of specs, and that call stays indirect.
+type SpecChain = SpecChain(SymId, [SymId])
+
+fn req_chain(tab: SymTab, r: CSpecReq, target: String, chains: [SpecChain]) : SpecChain = match r {
+  CSReq(callee, _, _, _, host) -> SpecChain(req_spec_sym(tab, r, target), [cs_decl_sym(callee), ...chain_of(chains, host)])
+}
+
+fn chain_of(chains: [SpecChain], host: SymId) : [SymId] = match chains {
+  [] -> []
+  [SpecChain(s, up), ...rest] -> if sym_raw(s) == sym_raw(host) { up } else { chain_of(rest, host) }
+}
+
+# The higher-order fns a call inside `host` may specialise: not those the
+# host is itself a spec of.
+fn hofns_in(hofns: [Decl], chains: [SpecChain], host: SymId) : [Decl] = match chain_of(chains, host) {
+  [] -> hofns
+  up -> filter(hofns, (d) => not syms_have(up, cs_decl_sym(d)))
+}
+
 fn req_spec_name(tab: SymTab, r: CSpecReq) : String =
-  match r { CSReq(callee, _, _, disc) -> cs_spec_name(tab, callee, disc) }
+  match r { CSReq(callee, _, _, disc, _) -> cs_spec_name(tab, callee, disc) }
 
 # The name of the spec of the callee `hd` on the closure `disc` identifies.
 fn cs_spec_name(tab: SymTab, hd: Decl, disc: String) : String =
@@ -77,7 +98,7 @@ fn req_spec_sym(tab: SymTab, r: CSpecReq, target: String) : SymId = cspec_sym(re
 
 # A spec is exported exactly when its callee is: it is declared with the callee's own flag.
 fn req_spec_row(tab: SymTab, r: CSpecReq, target: String) : NEnt =
-  match r { CSReq(callee, _, _, _) -> NEnt(NCFn, req_spec_name(tab, r), target, decl_is_pub(callee), NmSpec) }
+  match r { CSReq(callee, _, _, _, _) -> NEnt(NCFn, req_spec_name(tab, r), target, decl_is_pub(callee), NmSpec) }
 
 fn decl_is_pub(d: Decl) : Bool =
   match d { DFn(p, _, _, _, _, _, _, _, _, _) -> p  _ -> false }
@@ -151,12 +172,12 @@ fn lookup_hofn_sym(hofns: [Decl], s: SymId) : Option[Decl] = match hofns {
 # carry elaborate types whose specs miscompile, and the user's win comes
 # entirely from root call sites. A generated spec is itself `mo == None`,
 # so the transitive chain (a fold's spec calling its loop) is still walked.
-fn cs_collect_decls(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : [CSpecReq] =
+fn cs_collect_decls(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], chains: [SpecChain], target: String) : [CSpecReq] =
   match ds {
     [] -> []
     [d, ...rest] -> {
-      let here = if cs_specialisable_host(tab, target, d) { cs_collect_expr(decl_body(d), cs_decl_sym(d), all, tab, ids, hofns) } else { [] }
-      list_append(here, cs_collect_decls(rest, all, tab, ids, hofns, target))
+      let here = if cs_specialisable_host(tab, target, d) { cs_collect_expr(decl_body(d), cs_decl_sym(d), all, tab, ids, hofns_in(hofns, chains, cs_decl_sym(d))) } else { [] }
+      list_append(here, cs_collect_decls(rest, all, tab, ids, hofns, chains, target))
     }
   }
 
@@ -210,7 +231,7 @@ fn req_of(args_: [Expr], hd: Decl, host: SymId, all: [Decl], tab: SymTab, ids: P
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(ids, hd, idx) { [] }
   else {
     match classify_closure(ids, elem_at(args_, idx), all, tab) {
-      Some(ca) -> [CSReq(hd, idx, ca, closure_disc(tab, host, ca))]
+      Some(ca) -> [CSReq(hd, idx, ca, closure_disc(tab, host, ca), host)]
       None     -> []
     }
   }
@@ -218,17 +239,17 @@ fn req_of(args_: [Expr], hd: Decl, host: SymId, all: [Decl], tab: SymTab, ids: P
 
 # ---- call-site rewrite (pure map) ----
 
-fn rewrite_all(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : [Decl] =
-  map(ds, (d) => rewrite_decl(d, all, tab, ids, hofns, target))
+fn rewrite_all(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], chains: [SpecChain], target: String) : [Decl] =
+  map(ds, (d) => rewrite_decl(d, all, tab, ids, hofns, chains, target))
 
 # Retarget call sites only in the decls that seeded requests — root-file
 # decls and the generated specs. A stdlib/compiler
 # decl is left untouched: no spec was discovered for its internal calls.
-fn rewrite_decl(d: Decl, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Decl =
+fn rewrite_decl(d: Decl, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], chains: [SpecChain], target: String) : Decl =
   match d {
     DFn(p, f, tp, ps, rt, row, body, l, c, mo) ->
       if cs_specialisable_host(tab, target, d) {
-        DFn(p, f, tp, ps, rt, row, rewrite_expr(body, fnid_sym(f), all, tab, ids, hofns, target), l, c, mo)
+        DFn(p, f, tp, ps, rt, row, rewrite_expr(body, fnid_sym(f), all, tab, ids, hofns_in(hofns, chains, fnid_sym(f)), target), l, c, mo)
       } else { d }
     _ -> d
   }
