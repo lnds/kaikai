@@ -685,8 +685,8 @@ them as `append_file` and `write_file_new` when needed.
 Kept as a shortlist for future `File` expansion — shape and
 timing decided when the first real use case pushes them:
 
-- Existence and metadata: `exists(path)` *(shipped — #345)*, `stat(path) :
-  Result[Metadata, String]` *(deferred — needs `FileMetadata` record)*.
+- Existence and metadata: `exists(path)` *(shipped — #345)*, `stat(path)` *(shipped as `fs.file.metadata(path) :
+  Result[FileMetadata, String]`, #3162)*.
 - Append / create-only: `append_file`, `write_file_new`.
 - Directories: `list_dir`, `create_dir`, `remove_dir`, `walk`
   *(shipped — #344; all four ride `File`; `walk` does not follow
