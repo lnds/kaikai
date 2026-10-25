@@ -67,7 +67,7 @@ pub(pkg) fn tailgraph_build(decls: [Decl]) : TailGraph {
 }
 
 #[doc("The tail-call graph of `decls` before their names are resolved, with a call matched to the functions of `tab` that share its last name segment. It reports every group `tailgraph_build` does, and possibly more.")]
-pub(pkg) fn tailgraph_build_named(decls: [Decl], tab: SymTab) : TailGraph {
+pub(pkg) fn tailgraph_build_named(decls: [Decl], tab: SymTab) : TailGraph / Mutable {
   let nodes = tg_collect_nodes(decls)
   TG(nodes, tg_collect_edges_named(decls, nodes, tab))
 }
@@ -99,16 +99,25 @@ fn tg_node_of_decl(d: Decl) : Option[TgNode] = match d {
 
 # The nodes with their list index, by declaration id; each chain keeps
 # list order, so its first hit is the list's first hit.
-type TgIx = { by_sym: NameIndex[(Int, TgNode)], by_name: NameIndex[(Int, TgNode)], tab: Option[SymTab] }
+type TgIx = { by_sym: NameIndex[(Int, TgNode)], by_name: Array[[(String, Int, TgNode)]], tab: Option[SymTab] }
 
 fn tg_index(rev: [(Int, TgNode)], ix: TgIx) : TgIx = match rev {
   [] -> ix
   [(i, n), ...rest] -> tg_index(rest, TgIx { ...ix, by_sym: idx_prepend_sym(ix.by_sym, tgnode_sym(n), (i, n)) })
 }
 
-fn tg_index_names(rev: [(Int, TgNode)], tab: SymTab, ix: TgIx) : TgIx = match rev {
-  [] -> ix
-  [(i, n), ...rest] -> tg_index_names(rest, tab, TgIx { ...ix, by_name: idx_prepend(ix.by_name, written_text(sym_name(tab, tgnode_sym(n))), (i, n)) })
+fn tg_ix_named(rev: [(Int, TgNode)], tab: SymTab, table: Array[[(String, Int, TgNode)]]) : TgIx / Mutable =
+  TgIx { by_sym: idx_empty(), by_name: tg_index_names(rev, tab, table), tab: Some(tab) }
+
+fn tg_name_slot(name: String) : Int = ((string_hash(name) % 2048) + 2048) % 2048
+
+fn tg_index_names(rev: [(Int, TgNode)], tab: SymTab, table: Array[[(String, Int, TgNode)]]) : Array[[(String, Int, TgNode)]] / Mutable = match rev {
+  [] -> table
+  [(i, n), ...rest] -> {
+    let name = written_text(sym_name(tab, tgnode_sym(n)))
+    let slot = tg_name_slot(name)
+    tg_index_names(rest, tab, array_set(table, slot, [(name, i, n), ...array_get(table, slot)]))
+  }
 }
 
 fn tg_numbered(ns: [TgNode], i: Int, acc: [(Int, TgNode)]) : [(Int, TgNode)] = match ns {
@@ -124,11 +133,11 @@ fn tg_first(chain: [(Int, TgNode)], hit: (TgNode) -> Bool) : Option[(Int, TgNode
 # ---- edges ---------------------------------------------------------
 
 fn tg_collect_edges(decls: [Decl], nodes: [TgNode]) : [TgEdge] =
-  tg_edges_loop(decls, tg_index(tg_numbered(nodes, 0, []), TgIx { by_sym: idx_empty(), by_name: idx_empty(), tab: None }), 0, [])
+  tg_edges_loop(decls, tg_index(tg_numbered(nodes, 0, []), TgIx { by_sym: idx_empty(), by_name: array_make(0, []), tab: None }), 0, [])
 
-fn tg_collect_edges_named(decls: [Decl], nodes: [TgNode], tab: SymTab) : [TgEdge] = {
+fn tg_collect_edges_named(decls: [Decl], nodes: [TgNode], tab: SymTab) : [TgEdge] / Mutable = {
   let numbered = tg_numbered(nodes, 0, [])
-  tg_edges_loop(decls, tg_index_names(numbered, tab, TgIx { by_sym: idx_empty(), by_name: idx_empty(), tab: Some(tab) }), 0, [])
+  tg_edges_loop(decls, tg_ix_named(numbered, tab, array_make(2048, [])), 0, [])
 }
 
 fn tg_edges_loop(decls: [Decl], nodes: TgIx, i: Int, acc: [TgEdge]) : [TgEdge] {
@@ -242,7 +251,14 @@ fn tg_last_segment(s: String) : String =
   if is_some(index_of(s, ".")) { unwrap_or(last(split(s, ".")), s) } else { s }
 
 fn tg_resolve_name(name: String, argc: Int, nodes: TgIx) : [Int] =
-  flat_map(idx_chain(nodes.by_name, name), (at) => tg_arity_ok(at, argc))
+  tg_name_hits(array_get(nodes.by_name, tg_name_slot(name)), name, argc)
+
+fn tg_name_hits(chain: [(String, Int, TgNode)], name: String, argc: Int) : [Int] = match chain {
+  [] -> []
+  [(nm, i, n), ...rest] ->
+    if nm == name and tgnode_arity(n) == argc { [i, ...tg_name_hits(rest, name, argc)] }
+    else { tg_name_hits(rest, name, argc) }
+}
 
 fn tg_resolve_sym(s: SymId, argc: Int, nodes: TgIx) : [Int] =
   match tg_first(idx_chain_sym(nodes.by_sym, s), (n) => sym_raw(tgnode_sym(n)) == sym_raw(s)) {
