@@ -33,8 +33,6 @@ import compiler.call_site_target
 import compiler.util
 import compiler.written
 import compiler.scalar_ty
-import compiler.home_dup
-import compiler.type_text
 import compiler.ast_map
 import compiler.symtab
 
@@ -274,22 +272,16 @@ fn tg_arity_ok(at: (Int, TgNode), argc: Int) : [Int] = match at {
   (i, n) -> if tgnode_arity(n) == argc { [i] } else { [] }
 }
 
-#[doc("True when every declaration in `ds` agrees with `lead` on return type and effect row, and every member annotates each parameter and has no type parameters. Parameter lists may differ.")]
-pub(pkg) fn tfsig_members_match(ds: [Decl], lead: Decl) : Bool =
-  tf_members_match(ds, lead, all(ds, (d) => home_tu(d) == home_tu(lead)))
+#[doc("True when every declaration in `ds` agrees with `lead` on type parameters, return type and effect row, and every member annotates each parameter. Parameter lists may differ. The members' types are settled declarations and their type parameters are the lead's (`tfty_align`).")]
+pub(pkg) fn tfsig_members_match(ds: [Decl], lead: Decl) : Bool = tf_members_match(ds, lead) and tf_sig_is_plain(lead)
 
-fn tf_members_match(ds: [Decl], lead: Decl, homed: Bool) : Bool {
-  match ds {
-    [] -> tf_sig_is_plain(lead)
-    [d, ...rest] ->
-      if tf_sig_is_plain(d) and tf_sig_eq(d, lead, homed) { tf_members_match(rest, lead, homed) } else { false }
-    _ -> true
-  }
+fn tf_members_match(ds: [Decl], lead: Decl) : Bool = match ds {
+  [] -> true
+  [d, ...rest] -> if tf_sig_is_plain(d) and tf_sig_eq(d, lead) { tf_members_match(rest, lead) } else { false }
 }
 
 fn tf_sig_is_plain(d: Decl) : Bool = match d {
-  DFn(_, _, tparams, params, opt_ret, _, _, _, _, _) ->
-    list_is_empty(tbs_declared(tparams)) and tf_all_annotated(params) and tf_opt_ty_known(opt_ret)
+  DFn(_, _, _, params, opt_ret, _, _, _, _, _) -> tf_all_annotated(params) and tf_opt_ty_known(opt_ret)
   _ -> false
 }
 
@@ -306,72 +298,70 @@ fn tf_opt_ty_known(t: Option[TypeExpr]) : Bool = match t {
   Some(te) -> tf_ty_known(te)
 }
 
-fn tf_sig_eq(a: Decl, b: Decl, homed: Bool) : Bool = match a {
-  DFn(_, _, ta, pa, ra, rowa, _, _, _, _) -> match b {
-    DFn(_, _, tb, pb, rb, rowb, _, _, _, _) ->
-      list_is_empty(tbs_declared(ta)) and list_is_empty(tbs_declared(tb)) and
-      tf_opt_ty_eq(ra, rb, homed) and tf_row_eq(rowa, rowb, homed)
+fn tf_sig_eq(a: Decl, b: Decl) : Bool = match a {
+  DFn(_, _, ta, _, ra, rowa, _, _, _, _) -> match b {
+    DFn(_, _, tb, _, rb, rowb, _, _, _, _) -> tf_binders_eq(ta, tb) and tf_opt_ty_eq(ra, rb) and tf_row_eq(rowa, rowb)
     _ -> false
   }
   _ -> false
 }
 
-fn tf_opt_ty_eq(a: Option[TypeExpr], b: Option[TypeExpr], homed: Bool) : Bool = match a {
+fn tf_binders_eq(a: [TBinder], b: [TBinder]) : Bool = match a {
+  [] -> list_is_empty(b)
+  [x, ...arest] -> match b {
+    [] -> false
+    [y, ...brest] -> if tlocal_eq(x.id, y.id) { tf_binders_eq(arest, brest) } else { false }
+  }
+}
+
+fn tf_opt_ty_eq(a: Option[TypeExpr], b: Option[TypeExpr]) : Bool = match a {
   None -> false
   Some(ta) -> match b {
     None     -> false
-    Some(tb) -> tf_ty_eq(ta, tb, homed)
+    Some(tb) -> tf_ty_eq(ta, tb)
   }
 }
 
 # Only the shapes a fusable signature is made of; anything else reports
 # unequal so the group stays unfused.
-fn tf_ty_eq(a: TypeExpr, b: TypeExpr, homed: Bool) : Bool = match a.tkind {
+fn tf_ty_eq(a: TypeExpr, b: TypeExpr) : Bool = match a.tkind {
   TyName(ra, argsa) -> match b.tkind {
-    TyName(rb, argsb) -> tf_ref_eq(ra, rb, homed) and tf_ty_list_eq(argsa, argsb, homed)
+    TyName(rb, argsb) -> tf_ref_eq(ra, rb) and tf_ty_list_eq(argsa, argsb)
     _                 -> false
   }
   TyList(ea) -> match b.tkind {
-    TyList(eb) -> tf_ty_eq(ea, eb, homed)
+    TyList(eb) -> tf_ty_eq(ea, eb)
     _          -> false
   }
   TyFn(psa, ra, rowa) -> match b.tkind {
-    TyFn(psb, rb, rowb) -> tf_ty_list_eq(psa, psb, homed) and tf_ty_eq(ra, rb, homed) and tf_row_eq(rowa, rowb, homed)
+    TyFn(psb, rb, rowb) -> tf_ty_list_eq(psa, psb) and tf_ty_eq(ra, rb) and tf_row_eq(rowa, rowb)
     _                   -> false
+  }
+  TyParam(ia, argsa) -> match b.tkind {
+    TyParam(ib, argsb) -> tlocal_eq(ia, ib) and tf_ty_list_eq(argsa, argsb)
+    _                  -> false
   }
   _ -> false
 }
 
-# One declaration, one runtime-built type, or one scalar: a scalar has no
-# declaration, so its reference stays written and its spelling is the type.
-# A user type can still be written at this point; two spellings of it agree
-# only when both members sit in the same module, which scopes the name.
-fn tf_ref_eq(a: DeclRef, b: DeclRef, homed: Bool) : Bool = {
-  let sa = tf_ref_sym(a)
-  let sb = tf_ref_sym(b)
-  if sym_raw(sa) >= 0 or sym_raw(sb) >= 0 { sym_raw(sa) == sym_raw(sb) } else { tf_written_eq(a, b, homed) }
+# One declaration, or one scalar: a scalar has no declaration, so its
+# reference stays written and names the builtin type.
+fn tf_ref_eq(a: DeclRef, b: DeclRef) : Bool = {
+  let sa = ref_sym_or_core(a)
+  let sb = ref_sym_or_core(b)
+  if sym_raw(sa) >= 0 or sym_raw(sb) >= 0 { sym_raw(sa) == sym_raw(sb) } else { tf_scalar_eq(a, b) }
 }
 
-fn tf_ref_sym(r: DeclRef) : SymId = ref_sym_or_core(r)
-
-fn tf_written_eq(a: DeclRef, b: DeclRef, homed: Bool) : Bool = match a {
+fn tf_scalar_eq(a: DeclRef, b: DeclRef) : Bool = match a {
   DrSym(_)          -> false
   DrWritten(qa, na) -> match b {
     DrSym(_)          -> false
-    DrWritten(qb, nb) -> tf_same_spelling(written_text(na), written_text(nb), homed and tf_unqualified(qa) and tf_unqualified(qb))
+    DrWritten(qb, nb) -> is_none(qa) and is_none(qb) and is_some(tf_scalar_of(na)) and tf_scalar_of(na) == tf_scalar_of(nb)
   }
 }
 
-fn tf_unqualified(q: Option[Written]) : Bool = match q {
-  None    -> true
-  Some(_) -> false
-}
-
-fn tf_same_spelling(a: String, b: String, homed: Bool) : Bool =
-  a == b and (homed or (match scalar_ty_named(a) {
-    Some(_) -> true
-    None    -> false
-  }))
+# The builtin a scalar spelling names, as its canonical name.
+fn tf_scalar_of(n: Written) : Option[String] = and_then(scalar_ty_named(written_text(n)), scalar_ty_name)
 
 fn tf_ty_known(t: TypeExpr) : Bool = match t.tkind {
   TyName(_, targs) -> tf_ty_all_known(targs)
@@ -386,46 +376,48 @@ fn tf_ty_all_known(ts: [TypeExpr]) : Bool = match ts {
   _ -> true
 }
 
-fn tf_ty_list_eq(a: [TypeExpr], b: [TypeExpr], homed: Bool) : Bool = match a {
+fn tf_ty_list_eq(a: [TypeExpr], b: [TypeExpr]) : Bool = match a {
   [] -> list_is_empty(b)
   [ta, ...arest] -> match b {
     [] -> false
-    [tb, ...brest] -> if tf_ty_eq(ta, tb, homed) { tf_ty_list_eq(arest, brest, homed) } else { false }
-    _ -> false
+    [tb, ...brest] -> if tf_ty_eq(ta, tb) { tf_ty_list_eq(arest, brest) } else { false }
+  }
+}
+
+fn tf_row_eq(a: RowExpr, b: RowExpr) : Bool = match a {
+  REmpty -> match b { REmpty -> true  _ -> false }
+  RClosed(la) -> match b {
+    RClosed(lb) -> tf_labels_eq(la, lb)
+    _           -> false
+  }
+  ROpen(ta, la) -> match b {
+    ROpen(tb, lb) -> tf_tail_eq(ta, tb) and tf_labels_eq(la, lb)
+    _             -> false
+  }
+}
+
+fn tf_tail_eq(a: TParamRef, b: TParamRef) : Bool = match a {
+  TpId(ia) -> match b {
+    TpId(ib) -> tlocal_eq(ia, ib)
+    _        -> false
   }
   _ -> false
 }
 
-fn tf_row_eq(a: RowExpr, b: RowExpr, homed: Bool) : Bool = match a {
-  REmpty -> match b { REmpty -> true  _ -> false }
-  RClosed(la) -> match b {
-    RClosed(lb) -> tf_labels_eq(la, lb, homed)
-    _           -> false
-  }
-  # Each member's tail is its own parameter: two open rows agree when
-  # their labels do.
-  ROpen(_, la) -> match b {
-    ROpen(_, lb) -> tf_labels_eq(la, lb, homed)
-    _            -> false
-  }
-}
-
-fn tf_labels_eq(a: [RowLabel], b: [RowLabel], homed: Bool) : Bool = match a {
+fn tf_labels_eq(a: [RowLabel], b: [RowLabel]) : Bool = match a {
   [] -> list_is_empty(b)
   [RL(ra, argsa), ...arest] -> match b {
     [] -> false
     [RL(rb, argsb), ...brest] ->
-      if tf_eff_eq(ref_sym(ra), ref_sym(rb)) and tf_ty_list_eq(argsa, argsb, homed) { tf_labels_eq(arest, brest, homed) } else { false }
-    _ -> false
+      if tf_eff_eq(ref_sym(ra), ref_sym(rb)) and tf_ty_list_eq(argsa, argsb) { tf_labels_eq(arest, brest) } else { false }
   }
-  _ -> false
 }
 
 fn tf_eff_eq(a: SymId, b: SymId) : Bool = sym_raw(a) >= 0 and sym_raw(a) == sym_raw(b)
 
 #[doc("True when parameters `a` and `b` can share a slot of the fused entry: same borrow mode and a type the comparison recognises as equal.")]
 fn tfsig_param_shares(a: Param, b: Param) : Bool =
-  a.pborrow == b.pborrow and tf_opt_ty_eq(a.ptype, b.ptype, false)
+  a.pborrow == b.pborrow and tf_opt_ty_eq(a.ptype, b.ptype)
 
 #[doc("The fused entry's parameter slots and, per member, the slot each of its parameters lands in. Members share a slot when type and borrow mode agree, and the first member's parameters take slots 0 to k-1 in order.")]
 pub(pkg) type TfSlots = TfSlots([Param], [[Int]])

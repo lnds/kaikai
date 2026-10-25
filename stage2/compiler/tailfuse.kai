@@ -24,8 +24,8 @@ the two backends inherit mutual recursion through the goto-loop they
 already agree on, and neither emitter changes.
 
 A group only fuses when its members agree on return type and effect
-row and have no type parameters, since the fused entry returns for all
-of them. A return type the comparison does not recognise counts as a
+row, and bind the same kinds of type parameters, which the fused entry
+takes from the lead: it returns for all of them. A return type the comparison does not recognise counts as a
 mismatch, so an unfamiliar type leaves the group unfused rather than
 fusing it under a convention that does not hold.
 """)]
@@ -36,6 +36,7 @@ import compiler.ast_decl
 import compiler.ast_ids
 import compiler.util
 import compiler.tailgraph
+import compiler.tailfuse_ty
 import compiler.call_site_target
 import compiler.symtab
 import compiler.written
@@ -70,8 +71,10 @@ pub fn tailfuse_decls(decls: [Decl], tab: SymTab, target: String) : TailFused {
       let n = list_length(tailgraph_nodes(g))
       let fns = tf_fn_array(decls, n)
       let fn_at = (i) => array_get(fns, i)
-      let rows = tf_rows(groups, fn_at, TfIn { tab: tab, target: target })
-      TailFused { decls: tf_emit(decls, tf_rewrites(groups, fn_at, n, rows), 0, []), rows: rows }
+      let inp = TfIn { tab: tab, target: target }
+      let plans = tf_plans(groups, fn_at, inp)
+      let rows = tf_rows(plans, inp)
+      TailFused { decls: tf_emit(decls, tf_rewrites(plans, n, rows), 0, []), rows: rows }
     }
   }
 }
@@ -92,37 +95,37 @@ fn tf_fn_fill(decls: [Decl], i: Int, fns: Array[Option[Decl]]) : Array[Option[De
 # What replaces each function: its wrapper, preceded by the fused entry
 # at the group's lead; `None` where the function is not fused. `rows`
 # holds the fused entries' rows, one per group that fuses, in group order.
-fn tf_rewrites(groups: [TgGroup], fn_at: (Int) -> Option[Decl], n: Int, rows: [NEnt]) : Array[Option[[Decl]]] =
-  tf_rewrite_groups(groups, fn_at, array_make(n, None), rows)
+fn tf_rewrites(plans: [TfPlan], n: Int, rows: [NEnt]) : Array[Option[[Decl]]] =
+  tf_rewrite_groups(plans, array_make(n, None), rows)
 
-fn tf_rewrite_groups(groups: [TgGroup], fn_at: (Int) -> Option[Decl],
-                     out: Array[Option[[Decl]]], rows: [NEnt]) : Array[Option[[Decl]]] / Mutable =
-  match groups {
+fn tf_rewrite_groups(plans: [TfPlan], out: Array[Option[[Decl]]], rows: [NEnt]) : Array[Option[[Decl]]] / Mutable =
+  match plans {
     [] -> out
-    [grp, ...rest] -> {
-      let idxs = tggroup_members(grp)
-      let members = tf_member_decls(idxs, fn_at)
-      match rows {
-        [row, ...more] ->
-          if tf_group_ok(members, idxs) {
-            tf_rewrite_groups(rest, fn_at, tf_place_group(idxs, tf_fuse_group(members, nent_sym(row)), out), more)
-          } else { tf_rewrite_groups(rest, fn_at, out, rows) }
-        [] -> out
-      }
+    [TfPlan(idxs, members, aligned), ...rest] -> match rows {
+      [row, ...more] -> tf_rewrite_groups(rest, tf_place_group(idxs, tf_fuse_group(members, aligned, nent_sym(row)), out), more)
+      [] -> out
     }
   }
 
-# The row of each fused entry, in group order: a fused entry is a
-# declaration of its own.
-fn tf_rows(groups: [TgGroup], fn_at: (Int) -> Option[Decl], inp: TfIn) : [NEnt] = match groups {
+# A group that fuses: its member indices, its members and the same members
+# bound to the lead's type parameters, in group order.
+type TfPlan = TfPlan([Int], [Decl], [Decl])
+
+fn tf_plans(groups: [TgGroup], fn_at: (Int) -> Option[Decl], inp: TfIn) : [TfPlan] = match groups {
   [] -> []
   [grp, ...rest] -> {
     let idxs = tggroup_members(grp)
     let members = tf_member_decls(idxs, fn_at)
-    if tf_group_ok(members, idxs) { [tf_fused_row(tf_lead(members), inp), ...tf_rows(rest, fn_at, inp)] }
-    else { tf_rows(rest, fn_at, inp) }
+    match tf_group_aligned(members, idxs, inp) {
+      Some(aligned) -> [TfPlan(idxs, members, aligned), ...tf_plans(rest, fn_at, inp)]
+      None          -> tf_plans(rest, fn_at, inp)
+    }
   }
 }
+
+# The row of each fused entry, in group order: a fused entry is a
+# declaration of its own.
+fn tf_rows(plans: [TfPlan], inp: TfIn) : [NEnt] = map(plans, (p) => match p { TfPlan(_, members, _) -> tf_fused_row(tf_lead(members), inp) })
 
 fn tf_place_group(idxs: [Int], outs: [[Decl]], out: Array[Option[[Decl]]]) : Array[Option[[Decl]]] / Mutable =
   match idxs {
@@ -135,11 +138,10 @@ fn tf_place_group(idxs: [Int], outs: [[Decl]], out: Array[Option[[Decl]]]) : Arr
 
 # Per member, in member order: the lead's fused entry and wrapper, then
 # each other member's wrapper. `members` is never empty.
-fn tf_fuse_group(members: [Decl], fused: SymId) : [[Decl]] = {
-  let lead = tf_lead(members)
-  let slots = tfslots_layout(members)
+fn tf_fuse_group(members: [Decl], aligned: [Decl], fused: SymId) : [[Decl]] = {
+  let slots = tfslots_layout(aligned)
   let ctx = TfCtx(fused, slots, tf_member_syms(members))
-  let entry = tf_make_fused(lead, tfid_onto_slots(members, slots, tf_fresh_id), ctx)
+  let entry = tf_make_fused(tf_lead(aligned), tfid_onto_slots(aligned, slots, tf_fresh_id), ctx)
   match map(members, (d) => tf_wrapper(d, ctx)) {
     [] -> []
     [w, ...ws] -> [[entry, w], ...map(ws, (x) => [x])]
@@ -175,6 +177,10 @@ fn tf_reverse_onto(xs: [Decl], acc: [Decl]) : [Decl] = match xs {
 }
 
 # ---- eligibility ---------------------------------------------------
+
+# The members bound to the lead's type parameters, when the group fuses.
+fn tf_group_aligned(members: [Decl], idxs: [Int], inp: TfIn) : Option[[Decl]] =
+  and_then(tfty_align(members, inp.tab, inp.target), (aligned) => if tf_group_ok(aligned, idxs) { Some(aligned) } else { None })
 
 fn tf_group_ok(members: [Decl], idxs: [Int]) : Bool =
   if list_length(members) != list_length(idxs) { false }

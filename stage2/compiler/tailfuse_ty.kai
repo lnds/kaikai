@@ -1,0 +1,219 @@
+#[doc("""
+Alignment of the members of a mutual tail-call group onto the lead's
+type parameters.
+
+Every member of a group binds type parameters of its own, and its body
+mentions them by id. The fused entry has one set, so each other member
+is renamed onto the lead's, position by position, and its signature
+types are settled to declarations. What fusion then compares is ids.
+""")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.ast_map
+import compiler.ast_decl
+import compiler.scalar_ty
+import compiler.symtab
+import compiler.util
+import compiler.written
+
+# The table the types are looked up in and the module a group is fused in.
+type TyIn = { tab: SymTab, target: String }
+
+#[doc("`ms` with every member bound to the lead's type parameters and its signature types settled, or `None` when two members do not bind the same parameters in kind and bounds.")]
+pub(pkg) fn tfty_align(ms: [Decl], tab: SymTab, target: String) : Option[[Decl]] = match ms {
+  [] -> None
+  [lead, ...rest] -> {
+    let inp = TyIn { tab: tab, target: target }
+    let lead_tps = tfty_tparams(lead)
+    if tfty_binds_ok(lead_tps, inp) and all(rest, (d) => tfty_same_binders(lead_tps, tfty_tparams(d), inp)) {
+      Some([tfty_settle(lead, [], inp), ...map(rest, (d) => tfty_settle(d, tfty_pairs(tfty_tparams(d), lead_tps), inp))])
+    } else { None }
+  }
+}
+
+fn tfty_tparams(d: Decl) : [TBinder] = match d {
+  DFn(_, _, tps, _, _, _, _, _, _, _) -> tps
+  _ -> []
+}
+
+fn tfty_kind_ok(k: Kind) : Bool = match k {
+  KType -> true
+  KRow  -> true
+  _     -> false
+}
+
+fn tfty_binds_ok(tps: [TBinder], inp: TyIn) : Bool = all(tps, (b) => tfty_kind_ok(b.kind) and all(b.bounds, (r) => is_some(tfty_proto(r, inp))))
+
+fn tfty_same_kind(a: Kind, b: Kind) : Bool = match a {
+  KType -> match b { KType -> true  _ -> false }
+  KRow  -> match b { KRow -> true  _ -> false }
+  _     -> false
+}
+
+fn tfty_same_binders(a: [TBinder], b: [TBinder], inp: TyIn) : Bool = match a {
+  [] -> list_is_empty(b)
+  [x, ...arest] -> match b {
+    [] -> false
+    [y, ...brest] ->
+      if tfty_same_kind(x.kind, y.kind) and tfty_same_bounds(x.bounds, y.bounds, inp) { tfty_same_binders(arest, brest, inp) } else { false }
+  }
+}
+
+fn tfty_same_bounds(a: [DeclRef], b: [DeclRef], inp: TyIn) : Bool = match a {
+  [] -> list_is_empty(b)
+  [x, ...arest] -> match b {
+    [] -> false
+    [y, ...brest] -> match tfty_proto(x, inp) {
+      Some(sx) -> (match tfty_proto(y, inp) {
+        Some(sy) -> if sym_raw(sx) == sym_raw(sy) { tfty_same_bounds(arest, brest, inp) } else { false }
+        None     -> false
+      })
+      None -> false
+    }
+  }
+}
+
+# A bound names one protocol; a name several modules declare names none.
+fn tfty_proto(r: DeclRef, inp: TyIn) : Option[SymId] = match r {
+  DrSym(s) -> Some(s)
+  DrWritten(_, n) -> match st_candidates(inp.tab, NCProtocol, written_text(n)) {
+    [s] -> Some(s)
+    _   -> None
+  }
+}
+
+# The (from, to) pairs of a member's parameters and the lead's.
+fn tfty_pairs(from: [TBinder], to: [TBinder]) : [(TLocalId, TLocalId)] = match from {
+  [] -> []
+  [f, ...frest] -> match to {
+    [] -> []
+    [t, ...trest] -> [(f.id, t.id), ...tfty_pairs(frest, trest)]
+  }
+}
+
+fn tfty_map(m: [(TLocalId, TLocalId)], id: TLocalId) : TLocalId = match m {
+  [] -> id
+  [(f, t), ...rest] -> if tlocal_eq(f, id) { t } else { tfty_map(rest, id) }
+}
+
+# ---- declaration ---------------------------------------------------
+
+fn tfty_settle(d: Decl, m: [(TLocalId, TLocalId)], inp: TyIn) : Decl = match d {
+  DFn(p, fid, tps, ps, ret, row, body, ln, cl, mo) -> {
+    let home = match mo { Some(h) -> h  None -> inp.target }
+    let sig = (te) => tfty_decl_refs(tfty_te(te, m), home, inp)
+    DFn(p, fid, map(tps, (b) => TBinder { ...b, id: tfty_map(m, b.id) }),
+        map(ps, (x) => tfty_param(x, sig)), tfty_opt(ret, sig), tfty_row(row, m),
+        tfty_expr(body, m), ln, cl, mo)
+  }
+  _ -> d
+}
+
+fn tfty_param(p: Param, f: (TypeExpr) -> TypeExpr) : Param = Param { ...p, ptype: tfty_opt(p.ptype, f) }
+
+fn tfty_opt(t: Option[TypeExpr], f: (TypeExpr) -> TypeExpr) : Option[TypeExpr] = map(t, f)
+
+# ---- signature types settled to declarations -----------------------
+
+fn tfty_decl_refs(te: TypeExpr, home: String, inp: TyIn) : TypeExpr =
+  TypeExpr { ...te, tkind: match te.tkind {
+    TyName(r, args) -> TyName(tfty_type_ref(r, home, inp), map(args, (a) => tfty_decl_refs(a, home, inp)))
+    TyList(e)       -> TyList(tfty_decl_refs(e, home, inp))
+    TyFn(ps, r, row) -> TyFn(map(ps, (a) => tfty_decl_refs(a, home, inp)), tfty_decl_refs(r, home, inp), tfty_row_args(row, (a) => tfty_decl_refs(a, home, inp)))
+    TyParam(id, args) -> TyParam(id, map(args, (a) => tfty_decl_refs(a, home, inp)))
+    k -> k
+  } }
+
+# A scalar has no declaration and stays written; a type written by a
+# qualified path, or by a name nothing in scope settles, does too.
+fn tfty_type_ref(r: DeclRef, home: String, inp: TyIn) : DeclRef = match r {
+  DrSym(_) -> r
+  DrWritten(Some(_), _) -> r
+  DrWritten(None, n) -> tfty_written_ref(r, written_text(n), home, inp)
+}
+
+fn tfty_written_ref(r: DeclRef, name: String, home: String, inp: TyIn) : DeclRef =
+  if is_some(scalar_ty_named(name)) { r }
+  else { match tfty_type_sym(name, home, inp) {
+    Some(s) -> DrSym(s)
+    None    -> r
+  } }
+
+# The module's own declaration, else the only one of that name.
+fn tfty_type_sym(name: String, home: String, inp: TyIn) : Option[SymId] = match st_type_lookup(inp.tab, name, st_module_id(home)) {
+  Some(s) -> Some(s)
+  None -> match st_type_candidates(inp.tab, name) {
+    [s] -> Some(s)
+    _   -> None
+  }
+}
+
+# ---- type parameters renamed ---------------------------------------
+
+fn tfty_te(te: TypeExpr, m: [(TLocalId, TLocalId)]) : TypeExpr =
+  if list_is_empty(m) { te }
+  else { TypeExpr { ...te, tkind: match te.tkind {
+    TyName(r, args)   -> TyName(r, map(args, (a) => tfty_te(a, m)))
+    TyList(e)         -> TyList(tfty_te(e, m))
+    TyFn(ps, r, row)  -> TyFn(map(ps, (a) => tfty_te(a, m)), tfty_te(r, m), tfty_row(row, m))
+    TyDim(t, u)       -> TyDim(tfty_te(t, m), u)
+    TyRefine(t, e)    -> TyRefine(tfty_te(t, m), e)
+    TyRow(row)        -> TyRow(tfty_row(row, m))
+    TyParam(id, args) -> TyParam(tfty_map(m, id), map(args, (a) => tfty_te(a, m)))
+    k                 -> k
+  } } }
+
+fn tfty_row(row: RowExpr, m: [(TLocalId, TLocalId)]) : RowExpr =
+  if list_is_empty(m) { row }
+  else { match row {
+    REmpty -> REmpty
+    RClosed(ls) -> RClosed(tfty_labels(ls, m))
+    ROpen(tp, ls) -> ROpen(match tp { TpId(id) -> TpId(tfty_map(m, id))  _ -> tp }, tfty_labels(ls, m))
+  } }
+
+fn tfty_labels(ls: [RowLabel], m: [(TLocalId, TLocalId)]) : [RowLabel] = map(ls, (l) => match l { RL(r, args) -> RL(r, map(args, (a) => tfty_te(a, m))) })
+
+fn tfty_row_args(row: RowExpr, f: (TypeExpr) -> TypeExpr) : RowExpr = match row {
+  REmpty -> REmpty
+  RClosed(ls) -> RClosed(map(ls, (l) => match l { RL(r, args) -> RL(r, map(args, f)) }))
+  ROpen(tp, ls) -> ROpen(tp, map(ls, (l) => match l { RL(r, args) -> RL(r, map(args, f)) }))
+}
+
+# ---- bodies --------------------------------------------------------
+
+fn tfty_expr(e: Expr, m: [(TLocalId, TLocalId)]) : Expr =
+  if list_is_empty(m) { e }
+  else { Expr { ...e, kind: tfty_here(prc_map_expr_kind(e.kind, (x) => tfty_expr(x, m)), m) } }
+
+# The type slots of one node; its sub-expressions are already done.
+fn tfty_here(k: ExprKind, m: [(TLocalId, TLocalId)]) : ExprKind = match k {
+  ELambda(ps, b) -> ELambda(map(ps, (p) => tfty_param(p, (t) => tfty_te(t, m))), b)
+  EBlock(stmts, tail) -> EBlock(map(stmts, (s) => tfty_stmt(s, m)), tail)
+  EMatch(scr, arms) -> EMatch(scr, map(arms, (a) => match a { Arm(p, g, b) -> Arm(tfty_pat(p, m), g, b) }))
+  EHandle(b, eff, targs, init, alias, clauses, ret) ->
+    EHandle(b, eff, map(targs, (t) => tfty_te(t, m)), init, alias,
+            map(clauses, (c) => match c { HC(n, ps, hb, l, co) -> HC(n, map(ps, (p) => tfty_param(p, (t) => tfty_te(t, m))), hb, l, co) }), ret)
+  EVariantsOf(t, ss) -> EVariantsOf(tfty_te(t, m), ss)
+  _ -> k
+}
+
+fn tfty_stmt(s: Stmt, m: [(TLocalId, TLocalId)]) : Stmt = match s {
+  SLet(p, ann, rhs) -> SLet(tfty_pat(p, m), tfty_opt(ann, (t) => tfty_te(t, m)), rhs)
+  SVar(b, ann, rhs, l, c) -> SVar(b, tfty_opt(ann, (t) => tfty_te(t, m)), rhs, l, c)
+  _ -> s
+}
+
+fn tfty_pat(p: Pattern, m: [(TLocalId, TLocalId)]) : Pattern = Pattern { ...p, pkind: match p.pkind {
+  PList(ps, r)        -> PList(map(ps, (x) => tfty_pat(x, m)), r)
+  PVariant(r, ps)     -> PVariant(r, map(ps, (x) => tfty_pat(x, m)))
+  PVariantRecord(r, fs) -> PVariantRecord(r, map(fs, (f) => tfty_pfield(f, m)))
+  PRecord(fs)         -> PRecord(map(fs, (f) => tfty_pfield(f, m)))
+  PAs(b, x)           -> PAs(b, tfty_pat(x, m))
+  PNarrow(b, t)       -> PNarrow(b, tfty_te(t, m))
+  k                   -> k
+} }
+
+fn tfty_pfield(f: PField, m: [(TLocalId, TLocalId)]) : PField = match f {
+  PField(n, p, sh) -> PField(n, tfty_pat(p, m), sh)
+}
