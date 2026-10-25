@@ -54,7 +54,7 @@ pub fn mut_scan(st: InferState, params: [Param], body: Expr) : MutScan {
   let built = collect_local_arrays(body, [], dmut)
   let tainted = tainted_locals(body, built, (v, live) => stores_foreign_carrier(v, live, dmut))
   MutScan { tab: st.env.tab, locals: filter(built, (l) => not lid_in(tainted.all, l)), tainted: tainted.roots,
-            escaped: collect_escaped_result(st.protos.ids, body, []),
+            escaped: escape_through_holders(body, collect_escaped_result(st.protos.ids, body, [])),
             opaque: opaque_binders(params, body), dmut: dmut }
 }
 
@@ -390,7 +390,10 @@ fn collect_escaped_in_stmts(ids: ProtoIds, stmts: [Stmt], acc: [LocalId]) : [Loc
 
 fn collect_escaped_in_stmt(ids: ProtoIds, s: Stmt, acc: [LocalId]) : [LocalId] {
   match s {
-    SLet(_, _, rhs)             -> collect_escaped_names(ids, rhs, acc)
+    SLet(p, _, rhs)             -> match p.pkind {
+      PBind(_) -> collect_escaped_held(ids, rhs, acc)
+      _        -> collect_escaped_names(ids, rhs, acc)
+    }
     SAssert(c, m) -> {
       let a1 = collect_escaped_names(ids, c, acc)
       match m { Some(mx) -> collect_escaped_names(ids, mx, a1) None -> a1 }
@@ -422,6 +425,69 @@ fn collect_escaped_in_hclauses(ids: ProtoIds, cs: [HClause], acc: [LocalId]) : [
   [h, ...rest] -> match h {
     HC(_, _, b, _, _) -> collect_escaped_in_hclauses(ids, rest, collect_escaped_names(ids, b, acc))
   }
+}
+
+
+# A literal bound to a name holds its direct local elements instead of
+# escaping them: they escape only if the holder does.
+fn collect_escaped_held(ids: ProtoIds, rhs: Expr, acc: [LocalId]) : [LocalId] = match rhs.kind {
+  ERecordLit(_, fs) -> foldl(fs, acc, (a, f) => match f {
+    FI(_, v) -> match v.kind {
+      ELocal(_) -> a
+      _         -> collect_escaped_names(ids, v, a)
+    }
+  })
+  EList(els) -> foldl(els, acc, (a, el) => match el {
+    ElPlain(x) -> match x.kind {
+      ELocal(_) -> a
+      _         -> collect_escaped_names(ids, x, a)
+    }
+    ElSpread(x) -> collect_escaped_names(ids, x, a)
+  })
+  _ -> collect_escaped_names(ids, rhs, acc)
+}
+
+
+fn held_locals(rhs: Expr) : [LocalId] = match rhs.kind {
+  ERecordLit(_, fs) -> flat_map(fs, (f) => match f {
+    FI(_, v) -> match v.kind { ELocal(l) -> [l]  _ -> [] }
+  })
+  EList(els) -> flat_map(els, (el) => match el {
+    ElPlain(x)  -> match x.kind { ELocal(l) -> [l]  _ -> [] }
+    ElSpread(_) -> []
+  })
+  _ -> []
+}
+
+
+fn collect_holds(e: Expr, acc: [(LocalId, [LocalId])]) : [(LocalId, [LocalId])] {
+  let here = match e.kind {
+    EBlock(stmts, _) -> foldl(stmts, acc, (a, s) => match s {
+      SLet(p, _, rhs) -> match p.pkind {
+        PBind(b) -> match held_locals(rhs) { []   -> a  held -> [(b.id, held), ...a] }
+        _        -> a
+      }
+      _ -> a
+    })
+    _ -> acc
+  }
+  foldl(xp_positions(e), here, (a, p) => match p { XP(_, c) -> collect_holds(c, a) })
+}
+
+
+# A local held by an escaped local escapes with it.
+fn escape_through_holders(body: Expr, escaped: [LocalId]) : [LocalId] {
+  let holds = collect_holds(body, [])
+  hold_fixpoint(holds, escaped, list_length(holds) + 1)
+}
+
+
+fn hold_fixpoint(holds: [(LocalId, [LocalId])], escaped: [LocalId], fuel: Int) : [LocalId] {
+  let next = foldl(holds, escaped, (a, h) => match h {
+    (holder, held) -> if lid_in(a, holder) { foldl(held, a, (b, l) => if lid_in(b, l) { b } else { [l, ...b] }) } else { a }
+  })
+  if fuel <= 0 or list_length(next) == list_length(escaped) { next }
+  else { hold_fixpoint(holds, next, fuel - 1) }
 }
 
 

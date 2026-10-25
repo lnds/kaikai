@@ -1931,7 +1931,11 @@ function built and did not let escape. One external demand keeps
   parameter, or a call result that may alias one). The container is
   still a valid destination, but whatever is read out of it, or bound
   from it, is not local;
-- it is handed to a closure the function did not write (rule 5).
+- it is handed to a closure the function did not write (rule 5);
+- it is placed in a record or list literal that is not bound to a name
+  (an argument, a field of another literal), or in one bound to a local
+  that itself stops being local. A literal bound with `let` only holds
+  the local.
 
 Passing a local to a `/ Mutable` helper does not break any of these: the
 helper may write it, return it, or store it in another local, and the
