@@ -232,84 +232,104 @@ construct, selfhost breaks.
 
 ```
 stdlib/
-  core/          pure, stage 1
+  core/          pure, auto-loaded
     list.kai
     string.kai
+    char.kai
+    char_unicode.kai  (simple case mappings beyond ASCII)
     option.kai
     result.kai
-    char.kai
     tuple.kai
-    ordering.kai
-  collections/   pure, stage 2
-    map.kai      (AVL-tree ordered map — #128)
-    hashmap.kai  (mutable hash table, Mutable effect — shipped via #374)
-    set.kai      (AVL-backed Set[a], O(log n) — #936)
-    hashset.kai  (mutable hash set over HashMap[t, Unit], Mutable effect — shipped via #375)
-  math/          pure, stage 2
-    int.kai      (shipped; `log2` + `div_mod` shipped via #347; `abs`, `signum`, `clamp`, `pow` provided by `Numeric for Int` — #347 closed)
-    real.kai     (shipped; libm bindings via PR #359, closes #343 — was `float.kai` pre-rename, `math.float` does NOT exist)
-    bits.kai     (shipped — intrinsic bit ops live here, NOT in `math.int`)
-    numeric.kai  (shipped)
-    complex.kai  (shipped)
-    linalg.kai   (shipped — shape-indexed `Vec[t]<n>` ops + `Matrix[t]<m, n>` over the `Dim` kind: of/rows/cols/at/dot/matmul/matvec/transpose)
-    bigint.kai   (shipped — arbitrary-precision integers, pure kaikai; +bigint_limbs/_karatsuba/_division/_shift/_pow10/_parse/_render)
-  decimal.kai    pure, stage 2 (top-level module — shipped)
-  money.kai      pure, stage 2 (top-level module — shipped: carrier-generic `Money[t]<c: Currency>` over the `Module` kind (`Money[Decimal]<USD>`, `Money[BigInt]<USD>`, ...); of/amount/parse/to_string/convert/round)
-  decimal_big.kai pure, stage 2 (top-level module; BigInt carrier, no scale ceiling — shipped)
-  rational.kai   pure, stage 2 (top-level module; exact num/den over BigInt, gcd-normalised — shipped)
-  loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
-  gen.kai        effect: Yield[t] (top-level module: pull generators on a kept continuation — shipped via PR #2627)
-  seq.kai        pure, stage 2 (top-level module: lazy sequences over a memoised runtime cell — shipped via PR #2726)
-  ffi.kai        pure, stage 2 (top-level module: Userdata, a kaikai value parked behind a void * for C callbacks — shipped)
-  reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
-  writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
-  io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)
-  fs/            effect: File
-    file.kai     (shipped via PR #132 — `read_file`, `write_file`, `append` (the `file_append` core builtin: `O_APPEND`, only the new bytes); `exists`, `delete`, `rename` shipped via #345 + #423)
-    dir.kai      (stub — runtime primitives planned via #344)
-    path.kai     pure helpers — shipped, currently lives at `stdlib/path.kai` (top-level), not `stdlib/fs/path.kai`
-  os/            effects: Env, Process
-    env.kai      (shipped via PR #131 + PR #143)
-    args.kai     (shipped via PR #131 + PR #143)
-    process.kai  (shipped — closes #346 + #1591; `start`, `wait`, `kill`, `exit` plus the pipe family `start_piped`, `pipe_to`, `pipe_from`, `pipe_errs`, `write_stdin`, `close_stdin`, `read_stdout`, `read_stderr`, `read_all`, and process groups `start_in_group`, `kill_group`, and `uid`, the effective uid of the current process)
-  time.kai       effect: Clock (top-level module — shipped; default handler via PR #134)
-  date.kai       pure civil calendar; `today()` rides Clock (top-level module; depends on time — shipped via PR #770, closes #767)
-  array.kai      pure (Array[T] / [T] bridge, plus `each` for `|!` — shipped via #366)
-  string_builder.kai  amortised text accumulator; `append` rides Mutable, `build` is pure (top-level module — shipped, closes #902)
-  random.kai     effect: Random (top-level module — shipped)
-  random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
-  log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
-  web/           effects: Dom + Timer + Fetch + Storage over `extern "js"`, installed by `web.run`; browser target only
-  net/           effects: NetTcp + NetUdp + NetDns + NetUnix all shipped; alias `Net = NetTcp + NetUdp + NetDns` now definable (follow-up adds the row alias)
-    tcp.kai      uses NetTcp (shipped — v1; R2 reactor flipped NetTcp to fiber-parking 2026-05-16 via #630; see effects-stdlib.md sidebar)
-    udp.kai      uses NetUdp (shipped — v1 datagram UDP via #354; blocking ops, IPv4 only; `bind`/`send`/`recv`/`close`/`local_port`/`addr`)
-    dns.kai      uses NetDns (shipped — issue #352; `resolve`/`resolve_first`/`with_dns`; getaddrinfo shim, IPv4-only, blocking on the OS thread in v1)
-    unix.kai     uses NetUnix (shipped — issue #2186; Unix-domain stream sockets: `listen(path, mode)` race-free mode, `peer_uid`, `close_listener`; fd ops park like NetTcp)
-    url.kai      pure URL parsing (planned — folded into http.kai parser today)
-    http.kai     (shipped, client only — `http_get/post/put/delete/request`; uses NetTcp + Cancel; still uses libc `getaddrinfo` via NetTcp.connect's implicit path — splitting resolve→connect onto NetDns is the #352 follow-up, not yet done)
-  encoding/      pure, stage 2
-    json_bind.kai (shipped — the JSON DOM + the `#[derive(Json)]` runtime; `encoding.json` imports it)
-    json.kai     (shipped — Real number parsing landed via #361, surrogate-pair UTF-8 via #362; `json_decode_report` names the offset, line, column and reason a decode stopped on)
-    json_lex.kai (shipped — internal helper module of `encoding.json`, not user API: number, string and escape scanners)
-    utf8.kai     (shipped — `decode`, `decode_lossy`, `is_valid`, `encode` over `[Byte]`)
-    toml.kai     (shipped — the manifest/lockfile TOML subset; the whole public surface lives here)
-    toml_lex.kai (shipped — internal helper module of `encoding.toml`, not user API: scanners and encoder text forms)
-    toml_tree.kai (shipped — internal helper module of `encoding.toml`, not user API: hash-indexed table builder, generic over the leaf)
-    base64.kai   (shipped)
-    hex.kai      (shipped)
-  regexp.kai     pure, stage 2 (top-level — shipped 2026-04-28)
-  regexp/        syntax.kai (AST + parser), engine.kai (NFA builder) — shipped
-  crypto/        pure, stage 2 (shipped via PR #146)
-    hash.kai     sha256, sha512 (blake3 NOT shipped — deferred to S3)
+    io.kai       (I/O helpers and the explicit discard; effects Console, Stdin)
+    kinds.kai    (the kind/theory catalog: named unification theories and the kinds they classify)
+    runtime.kai  (collection and mailbox primitives the runtime implements)
+  protocols.kai  single-dispatch protocols (Show, Eq, Ord, Hash, Serialize, BinSerialize, Layout, Json, Default, Add/Sub/Mul/Div/Rem, Numeric) and their impls for the primitives
+  effects.kai    the atomic effect catalog (builtin capabilities with runtime default handlers)
+  effects/
+    concurrent.kai  State / Reader / Writer and Spawn / Cancel / Actor / Link / Monitor
+    os.kai          Signal and Process, with Sig / Child / Exit
+  collections/   pure
+    map.kai      (AVL-tree ordered map)
+    set.kai      (AVL-backed Set[a], O(log n))
+    hashmap.kai  (mutable hash table, Mutable effect)
+    hashset.kai  (mutable hash set over HashMap[t, Unit], Mutable effect)
+    vec.kai      (Vec[a], the pure value vector over one flat buffer)
+    queue.kai    (amortised O(1) two-list FIFO queue)
+    stack.kai    (LIFO stack over [a])
+    convert.kai  (conversions between Map, Set and lists)
+  math/          pure
+    int.kai      (`log2`, `div_mod`; `abs`, `signum`, `clamp`, `pow` come from `Numeric for Int`)
+    real.kai     (libm bindings; `math.float` does not exist)
+    bits.kai     (intrinsic bit ops)
+    numeric.kai
+    complex.kai  (Complex record; + - * / through the operator protocols)
+    linalg.kai   (shape-indexed `Vec[t]<n>` ops + `Matrix[t]<m, n>` over the `Dim` kind)
+    bigint.kai   (arbitrary-precision integers; internal helper modules bigint_limbs, _karatsuba, _division, _shift, _pow10, _parse, _render)
+  decimal.kai    pure (fixed-scale decimal)
+  decimal_big.kai pure (BigInt carrier, no scale ceiling)
+  rational.kai   pure (exact num/den over BigInt, gcd-normalised)
+  money.kai      pure (carrier-generic `Money[t]<c: Currency>` over the `Module` kind)
+  loop.kai       row-polymorphic while, until, repeat, forever
+  gen.kai        effect Yield[t]: pull generators on a kept continuation
+  seq.kai        lazy sequences over a memoised runtime cell
+  stream.kai     lazy streams as generators over the Emit[t] effect
+  reader.kai     with_reader for Reader[T]
+  writer.kai     with_writer for Writer[W]
+  ffi.kai        Userdata: a kaikai value parked behind a void * for C callbacks
+  array.kai      [T] / Array[T] bridge, plus `each` for `|!`
+  string_builder.kai  amortised text accumulator; `append` rides Mutable, `build` is pure
+  text.kai       Unicode text measurement (terminal-column width)
+  text/
+    format_spec.kai  fixed-point rendering behind `#{x:.N}` and the interpolation pad specs
+  bin.kai        binary encoding helpers (byte/int/list/option)
+  uuid.kai       RFC 4122 UUID v4 generator + parser
+  path.kai       POSIX path manipulation, auto-loaded (path_join, path_dirname, …)
+  fs/            effect File
+    file.kai     (read, write, append, exists, delete, rename, read_bytes, write_bytes)
+    dir.kai      (list_dir, create_dir, remove_dir, walk)
+    path.kai     (the `fs.path` qualifier over the auto-loaded `path` helpers)
+  os/            effects Env, Process
+    env.kai
+    args.kai
+    process.kai  (start, wait, kill, exit, the pipe family, process groups, uid)
+  time.kai       effect Clock
+  date.kai       pure civil calendar; `today()` rides Clock
+  random.kai     effect Random
+  random_secure.kai  effect SecureRandom
+  log.kai        effect Log
+  trace.kai      effect Trace: ad-hoc structured logging
+  spawn.kai      wrappers over the Spawn ops, including `nursery`
+  actor.kai      typed wrappers and helpers for Actor[Msg] (`with_mailbox`)
+  net/           effects NetTcp, NetUdp, NetDns, NetUnix
+    tcp.kai      (fiber-parking on the reactor)
+    udp.kai      (datagram UDP, IPv4)
+    dns.kai      (resolve, resolve_first, with_dns)
+    unix.kai     (Unix-domain stream sockets)
+    url.kai      (RFC 3986 URI references; pure)
+    http.kai     (client + minimal server helpers; its own lenient parse_url)
+  encoding/      pure
+    json.kai     (json_encode, json_decode, json_decode_report)
+    json_bind.kai (the JSON DOM + the `#[derive(Json)]` runtime)
+    json_lex.kai (internal helper module of encoding.json)
+    toml.kai     (the manifest/lockfile TOML subset)
+    toml_lex.kai (internal helper module of encoding.toml)
+    toml_tree.kai (internal helper module of encoding.toml)
+    utf8.kai     (decode, decode_lossy, is_valid, encode over [Byte])
+    base64.kai
+    hex.kai
+  regexp.kai     pure
+  regexp/        syntax.kai (AST + parser), engine.kai (NFA builder)
+  crypto/        pure
+    hash.kai     sha256, sha512
     legacy.kai   sha1, md5 (interoperability only; broken for security)
     mac.kai      hmac_sha256, hmac_sha512
-  concurrent/    effects: Spawn, Cancel (Actor[Msg] deferred to docs/actors.md)
-                 NOTE: `concurrent/` subdirectory does NOT exist on disk;
-                 `nursery` lives at `stdlib/spawn.kai:95`, `actor` at
-                 `stdlib/actor.kai`. Both shipped.
-    nursery.kai  (shipped — physical path is `stdlib/spawn.kai`)
-    actor.kai    (shipped — physical path is `stdlib/actor.kai`)
-  testing.kai    integrates with `kai test` (planned — test syntax is shipped, no `testing.kai` module file yet)
+  web/           browser target only; `web.run` installs the effects
+    run.kai      (the installer: answers Dom, Timer, Fetch, Storage with the page)
+    dom.kai      (effect Dom)
+    timer.kai    (effect Timer)
+    fetch.kai    (effect Fetch)
+    storage.kai  (effect Storage over localStorage)
+    wait.kai     (park a fiber until the host has something for it)
 ```
 
 ## Per-module summary
@@ -344,7 +364,7 @@ land in each module's own spec when implemented.
 
 - `math.numeric` — the `Numeric` protocol (`stdlib/math/numeric.kai`), dispatched single-arg: `zero`, `one`, `abs`, `sign`, `pow_int`, `clamp`; `impl Numeric for Int` / `for Real` (and `for Decimal` in `decimal.kai`). A ring is `Numeric + Add + Mul`: `add`/`mul` are the operator protocols' operations, declared once. `list.sum` / `list.product` ask for that ring. The typer does not verify the ring axioms — implementor's contract.
 - `math.int` — `min`, `max`, `gcd`, `lcm`, `factorial`, `fib`, `is_prime`, `log2`, `div_mod` *(all shipped; `log2` and `div_mod` via #347)*. `abs`, `signum`, `clamp`, `pow` are NOT here — they dispatch through `Numeric for Int` (`stdlib/math/numeric.kai`); `signum` is `Numeric.sign` and `pow` is `Numeric.pow_int`. Coverage for the four Numeric ops over Int lives in `examples/stdlib/math_int_basic.kai`. Bit ops (`shl`, `shr`, `and`, `or`, `xor`, `not`, `popcount`, `leading_zeros`, `trailing_zeros`) are intrinsic — they live in `math/bits.kai`, NOT in `math/int.kai`.
-- `math.real` *(shipped — was `math.float` in earlier drafts; the module file is `stdlib/math/real.kai` and the namespace is `math.real`. `math.float` does not exist.)* — `min`, `max`, `floor`, `ceil`, `round`, `round_half_even`, `trunc` *(shipped; generic over `Real<u>`)*, `round_to(x, decimals)` *(shipped)*, `to_fixed(x, digits)` *(shipped; half-even)*; libm bindings — `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log2`, `log10`, `pow` — *(shipped via PR #359, closes #343)*; `rem` (`fmod`) wires `impl Rem for Real` so `r1 % r2` type-checks — *(shipped, closes #364)*. `is_nan` / `is_inf` *(planned, no tracking issue)*.
+- `math.real` *(shipped — was `math.float` in earlier drafts; the module file is `stdlib/math/real.kai` and the namespace is `math.real`. `math.float` does not exist.)* — `min`, `max`, `floor`, `ceil`, `round`, `round_half_even`, `trunc` *(shipped; generic over `Real<u>`)*, `round_to(x, decimals)` *(shipped)*, `to_fixed(x, digits)` *(shipped; half-even)*; libm bindings — `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log2`, `log10`, `pow` — *(shipped via PR #359, closes #343)*; `rem` (`fmod`) wires `impl Rem for Real` so `r1 % r2` type-checks — *(shipped, closes #364)*. NaN and infinity tests are the flat `real_is_nan` / `real_is_inf` *(shipped — declared in `math.numeric`)*.
 - `math.linalg` — shape-indexed linear algebra over the `Dim` kind *(shipped — closes #1271)*. `Matrix[t]<m, n>` carries two positional `Dim` habitants; `Vec[Real]<n>` ops (`dot`) and matrix ops (`of`, `rows`, `cols`, `at`, `matmul`, `matvec`, `transpose`) state their shape rules in signatures, checked at compile time and erased at runtime. Fixed-width inline representation for `Vec[t]<n>` is the codegen follow-up.
 - `math.bigint` — arbitrary-precision signed integers, pure kaikai, no GMP *(shipped — numeric lane B)*. Sign-magnitude carrier with an inline `Int`-range fast path (`Small(Int) | Big(sign, Array[Int])`); promotes on overflow, never overflows. `from_int` / `from_string` / `to_int`, `add` / `sub` / `mul` / `compare`, `neg` / `abs` / `sign`, `to_string`, and `divmod` / `div` / `rem`. The `n` literal suffix (`99n`) desugars to `bigint.from_int`. `Show` / `Serialize` / `Eq` / `Ord` / `Hash` and the total operators `Add` / `Sub` / `Mul` / `Neg` (infix `+ - *`, unary `-`) in the same module; division stays the named `div` / `divmod` (truncating). Magnitude limb arithmetic in `bigint_limbs`; multiplication is Karatsuba above a limb threshold, division is Knuth below and Burnikel–Ziegler above one, and decimal conversion splits at cached powers of ten above a size threshold, so `mul`, `from_string` and `to_string` scale subquadratically.
 
@@ -486,7 +506,7 @@ declare `/ Stdin`.
 - `File` chunked / streaming ops — `open_read`, `read_chunk`, `open_write`, `write_chunk`, `close_file` *(shipped via PR #804, issue #771 Phase 1: five `File` effect ops + `FileHandle` opaque handle + R1-pool default handlers; `read_chunk` returns `Ok("")` at EOF. Typed capabilities via the `Perm` kind shipped with #1251: `open_read` mints `FileHandle<read>`, `open_write` mints `FileHandle<read + write>` (fd opened `O_RDWR`), `read_chunk`/`write_chunk` require `<read>`/`<write>`, `close_file` takes a bare handle; `file_handle(fd)` mints for handlers/tests.)*
 - `stream` — lazy push streams over the chunked `File` ops *(shipped via issue #801: `stdlib/stream.kai`. Carrier `Stream[t, e]` (single-ctor variant); sources `from_list` / `read_lines`; pipe-canonical stages `map` / `flat_map` / `filter` / `take` / `take_while`; sinks `foldl` (`fold` deprecated alias) / `each` / `count` / `to_list` / `write_lines`. Recoverable faults ride the `ReadFault` effect — `bad_chunk` resumable (skip), `open_fault : Nothing` abort-only. `import stream`. Supersedes #771 Phase 2's `with_lines` / `fold_lines` / `each_line` bracket surface.)*
 - `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk` *(shipped via #344: `kai_core_dir_*` runtime primitives + `pub fn` wrappers in `stdlib/fs/dir.kai`. All four ride the `File` effect. v1 limits: symlinks are not followed in `walk`; `create_dir` uses fixed `0755`; `list_dir` / `walk` return `[]` on read error.)*
-- `fs.path` — pure helpers: `is_absolute`, `basename`, `dirname`, `split`, `ext`, `strip_ext`, `join` *(shipped — but the file lives at `stdlib/path.kai`, not `stdlib/fs/path.kai`; the catalog name `fs.path` reflects the planned move, not today's import path. Today: `import path`.)*
+- `fs.path` — `import fs.path` is the qualified home of the pure path helpers `is_absolute`, `basename`, `dirname`, `split`, `ext`, `strip_ext`, `join` *(shipped — the implementation is the auto-loaded `stdlib/path.kai`, so `path.join(a, b)` and the flat `path_join(a, b)` reach the same function)*.
 
 ### os (`/ Env + Process`)
 
@@ -624,7 +644,7 @@ LLVM backends.
 
 ### crypto (pure, stage 2 — shipped via PR #146)
 
-- `crypto.hash` — `sha256`, `sha512` *(shipped)*. `blake3` *(planned — no tracking issue; deferred to S3)*.
+- `crypto.hash` — `sha256`, `sha512` *(shipped)*. `blake3` is not shipped (see the crypto items in `docs/stdlib-roadmap.md`).
 - `crypto.legacy` — `sha1`, `md5` *(shipped)*. Broken for security; a separate module so the import flags legacy use (WebSocket handshake, git object ids, UUID v3/v5, ETags).
 - `crypto.mac` — `hmac_sha256`, `hmac_sha512` *(shipped)*
 
@@ -645,7 +665,7 @@ spec lands, it is added to this header.
 
 ### testing
 
-- `testing` *(planned — no `stdlib/testing.kai` module file exists; the `test "..." { ... }` block syntax and the `assert` builtin are wired in the compiler/runtime, but a stdlib module exposing assertion helpers does not exist yet)* — assertions (`assert`, `assert_eq`, `assert_ne`, `assert_raises`) and integration with the `test "..." { ... }` block syntax and `kai test` subcommand. Effect: a module-declared abort effect for failing assertions (caught by the test runner handler).
+- `testing` — no stdlib module: `test "..." { ... }` blocks, `assert` and the `kai test` runner are built into the compiler and toolchain (`kai info testing`).
 
 ## Naming conventions
 
