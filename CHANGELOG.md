@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.177.0 (2026-10-25)
+
+### Added
+
+- **fs**: `file.metadata(path)` returns a `FileMetadata` with `size`, `modified` (a `WallTime`), `is_dir` and `is_file`. `dir.current()` returns the working directory, and `dir.temp_dir()` returns `$TMPDIR`, or `/tmp` when it is unset.
+- **date.rfc3339**: a new module. `rfc3339.format(t)` renders a `WallTime` as an RFC 3339 UTC timestamp (`2026-10-24T21:00:00Z`, with fractional seconds only when present). `rfc3339.parse(s)` reads one, converting a `±hh:mm` offset to UTC, and its errors name the byte offset.
+
+### Fixed
+
+- **runtime**: a fiber blocked in `Stdin.read_line()` no longer holds back the output of other fibers when the program runs on more than one worker. The last worker to go idle flushes stdout, and stdout stays block-buffered. This was a regression in 0.171.0 (#3151).
+- **typer**: a lambda that performs a concrete effect and calls a rigid-row parameter is accepted again for a `Label + ?e` parameter. The flexible tail takes the extra label; the rigid row variable still gains none. The diagnostic no longer mentions a pure function type when none is involved. This was a regression in 0.167.0 (#3156).
+- **kai test**: a test block that lets a cancellation escape now fails that block, and the remaining blocks still run. Before, the run stopped and exited 0. The same holds for a nursery that re-raises a child's cancellation, and `--json` reports every block. `kai mutate --oracle` now counts an unwinding mutant as killed (#3157).
+- **compiler**: a library module with a pair of mutually tail-recursive functions compiles the same way with the early core cut as without it, so the pair is fused in both cases.
+
+### Changed
+
+- **stdlib**: `Period` and `Duration` derive `Eq` (and `Duration` derives `Ord`) instead of hand-written impls with the same behaviour. Every public protocol in `protocols` now has API documentation.
+
 ## v0.176.0 (2026-10-24)
 
 ### BREAKING CHANGE
