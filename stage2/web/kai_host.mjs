@@ -388,6 +388,13 @@ export async function run(wasm, opts = {}) {
       view().setBigUint64(out, ns, true);
       return 0;
     },
+    random_get: (ptr, len) => {
+      const bytes = new Uint8Array(memory.buffer, ptr, len);
+      for (let off = 0; off < len; off += 65536) {
+        crypto.getRandomValues(bytes.subarray(off, Math.min(off + 65536, len)));
+      }
+      return 0;
+    },
     fd_close: () => 0,
     fd_fdstat_get: (fd, out) => {
       if (fd > 2) return ERRNO_BADF;
