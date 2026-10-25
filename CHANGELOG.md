@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.177.1 (2026-10-25)
+
+### Fixed
+
+- **ffi**: keep an exported extern "C" fn from an imported module through the core cut
+
 ## v0.177.0 (2026-10-25)
 
 ### Added
