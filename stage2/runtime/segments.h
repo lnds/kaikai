@@ -635,6 +635,7 @@ static __attribute__((noinline)) void kai_cancel_deliver(KaiFiber *f) {
      * fall back to the pad — the trampoline's second return marks the
      * fiber CANCELLED and continues with the awaiter walk. */
     if (!f->cancel_pad_set) {
+        kai_test_cancel_escape();
         kai_eputs("kai: Cancel.raise: unhandled (fiber cancelled)\n");
         kai_exit(0);
     }
