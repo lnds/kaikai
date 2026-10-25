@@ -663,6 +663,9 @@ static KaiValue *_kai_core_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n) 
 static KaiValue *_kai_core_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_create_dir(a[0]); }
 static KaiValue *_kai_core_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_remove_dir(a[0]); }
 static KaiValue *_kai_core_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_dir_walk(a[0]); }
+static KaiValue *_kai_core_file_metadata_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_file_metadata(a[0]); }
+static KaiValue *_kai_core_dir_current_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) a; (void) n; return kai_core_dir_current_dir(); }
+static KaiValue *_kai_core_dir_temp_dir_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_core_dir_temp_dir(); }
 static KaiValue *_kai_core_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_core_read_line(); }
 static KaiValue *_kai_core_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_read_bytes(a[0]); }
 static KaiValue *_kai_core_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_to_int(a[0]); }

@@ -467,6 +467,9 @@ KAIX_CORE_THUNK1(dir_list_dir)
 KAIX_CORE_THUNK1(dir_create_dir)
 KAIX_CORE_THUNK1(dir_remove_dir)
 KAIX_CORE_THUNK1(dir_walk)
+KAIX_CORE_THUNK1(file_metadata)
+KAIX_CORE_THUNK0(dir_current_dir)
+KAIX_CORE_THUNK0(dir_temp_dir)
 KAIX_CORE_THUNK0(read_line)
 KAIX_CORE_THUNK1(read_bytes)
 KAIX_CORE_THUNK1(string_to_int)
@@ -1282,6 +1285,9 @@ KaiValue *kaix_core_dir_list_dir(KaiValue *p)            { return kai_core_dir_l
 KaiValue *kaix_core_dir_create_dir(KaiValue *p)          { return kai_core_dir_create_dir(p); }
 KaiValue *kaix_core_dir_remove_dir(KaiValue *p)          { return kai_core_dir_remove_dir(p); }
 KaiValue *kaix_core_dir_walk(KaiValue *p)                { return kai_core_dir_walk(p); }
+KaiValue *kaix_core_file_metadata(KaiValue *p)            { return kai_core_file_metadata(p); }
+KaiValue *kaix_core_dir_current_dir(void)                { return kai_core_dir_current_dir(); }
+KaiValue *kaix_core_dir_temp_dir(void)                   { return kai_core_dir_temp_dir(); }
 KaiValue *kaix_core_read_line(void)                      { return kai_core_read_line(); }
 KaiValue *kaix_core_read_bytes(KaiValue *n)              { return kai_core_read_bytes(n); }
 KaiValue *kaix_core_real_to_string(KaiValue *v)          { return kai_core_real_to_string(v); }

@@ -460,6 +460,65 @@ static KaiValue *kai_core_dir_remove_dir(KaiValue *path) {
     return r;
 }
 
+static KaiValue *_kai_fs_err(const char *op, const char *path, size_t plen, int err) {
+    const char *why = strerror(err);
+    size_t n = strlen(op) + plen + strlen(why) + 6;
+    char *buf = (char *) malloc(n);
+    if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    if (plen) snprintf(buf, n, "%s: %.*s: %s", op, (int) plen, path, why);
+    else snprintf(buf, n, "%s: %s", op, why);
+    KaiValue *msg = kai_str_dyn(buf);
+    free(buf);
+    return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+}
+
+/* file_metadata(path) : Result[[Int], String] — [size, mtime_secs,
+ * mtime_nanos, is_dir, is_file], following symlinks. */
+static KaiValue *kai_core_file_metadata(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_metadata: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        struct stat st;
+        if (stat(pbuf, &st) != 0) {
+            r = _kai_fs_err("file_metadata", pbuf, plen, errno);
+        } else {
+#if defined(__APPLE__)
+            int64_t ns = (int64_t) st.st_mtimespec.tv_nsec;
+            int64_t sec = (int64_t) st.st_mtimespec.tv_sec;
+#else
+            int64_t ns = (int64_t) st.st_mtim.tv_nsec;
+            int64_t sec = (int64_t) st.st_mtim.tv_sec;
+#endif
+            KaiValue *l = kai_cons(kai_int(S_ISREG(st.st_mode) ? 1 : 0), kai_nil());
+            l = kai_cons(kai_int(S_ISDIR(st.st_mode) ? 1 : 0), l);
+            l = kai_cons(kai_int(ns), l);
+            l = kai_cons(kai_int(sec), l);
+            l = kai_cons(kai_int((int64_t) st.st_size), l);
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = l}});
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_core_dir_current_dir(void) {
+    char buf[KAI_PATH_BUF];
+    if (getcwd(buf, sizeof(buf)) == NULL) return _kai_fs_err("dir_current_dir", "", 0, errno);
+    KaiValue *s = kai_str_dyn(buf);
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+}
+
+static KaiValue *kai_core_dir_temp_dir(void) {
+    const char *t = getenv("TMPDIR");
+    return kai_str((t && t[0]) ? t : "/tmp");
+}
+
 /* Iterative depth-first walk. Push subdirectories onto an explicit stack
  * so a deep tree doesn't blow the C stack. Symlinks are NOT followed
  * (v1 contract): use lstat + S_ISLNK skip so a symlink loop can't
