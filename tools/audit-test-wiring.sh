@@ -21,10 +21,9 @@
 #   D. Target allowlist entries must still be unwired — a wired one is
 #      stale and fails, so the target list self-cleans. Checked with A.
 #
-# Known limit: a mention is necessary, not sufficient — a harness whose
-# glob fails to descend into a subdirectory of a mentioned tree is not
-# detected here. Closing that would couple this audit to each harness's
-# enumeration semantics; the per-harness globs are the place to fix it.
+# Known limit: a directory mention is necessary, not sufficient. The
+# per-golden read check and the CI path-filter check live in
+# tools/audit-golden-wiring.py.
 
 set -eu
 

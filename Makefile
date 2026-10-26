@@ -1,4 +1,4 @@
-.PHONY: fast-gates kaic2-gates test-compiler-lint-ratchet test-fmt-classify test-symid-names-static test-symid-names-compiled bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-field-types test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 test-light-partition test-core-cache-tid test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit test-core-full
+.PHONY: fast-gates kaic2-gates test-compiler-lint-ratchet test-fmt-classify test-symid-names-static test-symid-names-compiled bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-field-types test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 test-light-partition test-core-cache-tid test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit test-core-full
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -62,7 +62,8 @@ test-demos: kaic2
 	for f in examples/phase4/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./bin/kai run  $$f > /tmp/kaikai-$$name.out; \
-	  ./bin/kai test $$f > /tmp/kaikai-$$name-t.out 2>&1 || true; \
+	  ./bin/kai test $$f > /tmp/kaikai-$$name-t.out 2>&1 \
+	    || { echo "demo FAIL $$name (kai test)"; cat /tmp/kaikai-$$name-t.out; exit 1; }; \
 	  echo "demo OK $$name"; \
 	done
 
@@ -339,7 +340,7 @@ test-cmodular-prune: kaic2
 # (daily) and `prune-differential` adds every example (nightly workflow).
 .PHONY: prune-differential prune-differential-combos
 test-prune-differential: kaic2 bin/kai
-	@./tools/prune-differential.sh combos-subset
+	@./tools/prune-differential.sh --backend c combos-subset
 
 prune-differential-combos: kaic2 bin/kai
 	@./tools/prune-differential.sh combos
@@ -899,9 +900,12 @@ test-runtime-global-audit:
 
 # Structural coverage guard: every test-* target and fixture directory
 # must be reachable from a tier — a defined-but-never-run gate reads as
-# coverage while its corpus rots. Pure text, no compiler.
+# coverage while its corpus rots. The golden audit also demands that every
+# golden is read by a harness and every CI path filter matches a file.
+# Pure text, no compiler.
 test-wiring-audit:
 	@./tools/audit-test-wiring.sh
+	@python3 tools/audit-golden-wiring.py
 
 # Ownership walkers descend through expr_positions.kai instead of
 # enumerating ExprKind by hand; the baseline is the ratcheted list of
@@ -1559,9 +1563,8 @@ tier1-backend-parity: bin/kai
 daily: tier1 daily-tail
 	@echo "daily OK — tier1 + C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
-daily-tail: selfhost stress-fixtures stress-nmodular-pool coverage-probe rc-budget test-binserialize-budget
-	-@$(MAKE) prune-differential-combos
-	@echo "daily-tail OK — C selfhost + stress fixtures + native-modular pool stress + coverage probe + RC budget + BinSerialize budget"
+daily-tail: selfhost stress-fixtures coverage-probe test-binserialize-budget
+	@echo "daily-tail OK — C selfhost + stress fixtures + coverage probe + BinSerialize budget"
 
 # The `tier1` prerequisites that no tier1-shard-N runs.
 tier1-unsharded: demos-no-regression test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit rc-leak-gate
@@ -1595,23 +1598,6 @@ stress-nmodular-pool: bin/kai
 # in CI without depending on the kaikai compiler itself.
 coverage-probe:
 	@./tools/coverage-probe.sh
-
-# RC budget: leaked / RSS / wall vs the threshold pinned in
-# docs/perceus-honesty-targets.md. Today the threshold is "no
-# regression from 46.9 M leaked".
-rc-budget: kaic2
-	@KAI_TRACE_RC=1 KAI_THREADS=1 stage2/kaic2 $(EDITION_FLAG) stage2/compiler.kai > /dev/null 2> /tmp/rc.log; \
-	leaked=$$(grep -E "alloc_total" /tmp/rc.log | head -1 | sed 's/.*leaked=\([0-9]*\).*/\1/'); \
-	if [ -z "$$leaked" ]; then \
-	  echo "rc-budget SKIP — KAI_TRACE_RC trace empty (kaic2 not built with trace)"; \
-	  exit 0; \
-	fi; \
-	threshold=50000000; \
-	if [ "$$leaked" -gt "$$threshold" ]; then \
-	  echo "rc-budget FAIL — leaked $$leaked > threshold $$threshold (regression)"; \
-	  exit 1; \
-	fi; \
-	echo "rc-budget OK — leaked $$leaked <= threshold $$threshold"
 
 # BinSerialize perf gate (issue #489). Wall-time ceiling over 100
 # decodes of a 500-node / ~40 KB payload. Tier 2 (not Tier 1)

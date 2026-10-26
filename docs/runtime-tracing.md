@@ -27,7 +27,7 @@ KAI_TRACE_RC=1 ./build/myprog
 ```
 
 Reports total allocs, frees, leaked count, live peak, and **per-tag
-allocs only**. Used by `make rc-budget`. Survived from earlier
+allocs only**. Used by `make test-rc-budget`. Survived from earlier
 milestones.
 
 ### Strict mode (build-flag gated)

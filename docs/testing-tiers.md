@@ -553,7 +553,7 @@ through the optimiser once a day.
 ```
 make tier1
 make daily-tail           # C selfhost + stress fixtures + coverage probe
-                          # + RC budget + BinSerialize budget
+                          # + BinSerialize budget
 ```
 
 `make daily` runs both in series, locally. In CI

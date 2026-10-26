@@ -15,7 +15,6 @@ contracts, so they cannot gate tier 1.
 | --- | --- |
 | `program_name_no_row.kai` | `program_name()` reads process state, yet a `main` with a pure declared row calls it with no effect in its row. |
 | `spawn_qualified_no_row.kai` | `Spawn.spawn(worker)` from a `main` whose declared row omits `Spawn`. The same call inside an ordinary function is rejected (`effect not handled: Spawn`); only `main` accepts it. |
-| `pub_fn_transitive_effect.kai` | No longer silent: `caller` is rejected with `effect not handled: Stdout`. It belongs in an enforced directory with an `.err.expected` golden. |
 
 ## Migration recipe
 

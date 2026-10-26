@@ -17,6 +17,9 @@
 #   backends: c native        the backends the directory runs on (c, native, or both)
 #   diagnostics: fixed|regex  how `.err.expected` lines match stderr
 #
+# Optional key: `only: a b c` runs just those fixtures of a directory that
+# also holds files this runner does not own.
+#
 # Marks, one `# fixture: <mark>` line anywhere in the fixture:
 #
 #   # fixture: test        compile with --test; stdout+stderr is the output
@@ -53,6 +56,11 @@ dir_of() {
 }
 
 fixtures_of() {
+  only=$(sed -n 's/^only: //p' "$1/FIXTURES")
+  if [ -n "$only" ]; then
+    printf '%s\n' $only
+    return
+  fi
   for f in "$1"/*.kai; do
     [ -f "$f" ] || continue
     basename "$f" .kai

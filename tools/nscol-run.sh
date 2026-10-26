@@ -147,17 +147,24 @@ check_asan() {
   return 1
 }
 
-# Every line of DIAG.expected must be a substring of the diagnostic; the
-# compile's own exit status is not asserted.
+# Every line of DIAG.expected must be a substring of the diagnostic and no
+# line of DIAG.forbidden may be; the compile's own exit status is not asserted.
 check_diag() {
-  local b="$OUT/$1" missing
+  local b="$OUT/$1" missing present forbidden
   compile "$1" $NSCOL_CORE_CACHE > /dev/null 2> "$b.err" || true
   missing="$(grep -v '^$' "$(golden "$1" DIAG.expected)" | while IFS= read -r n; do
     grep -qF -- "$n" "$b.err" || echo "  lacks: $n"
   done)"
-  [ -z "$missing" ] && return 0
-  echo "FAIL diagnostic lacks an expected line"
-  { echo "$missing"; head -5 "$b.err"; } >&2
+  forbidden="$CORPUS/$1/DIAG.forbidden"
+  present=""
+  if [ -f "$forbidden" ]; then
+    present="$(grep -v '^$' "$forbidden" | while IFS= read -r n; do
+      ! grep -qF -- "$n" "$b.err" || echo "  forbidden: $n"
+    done)"
+  fi
+  [ -z "$missing$present" ] && return 0
+  echo "FAIL diagnostic lacks an expected line or holds a forbidden one"
+  { echo "$missing$present"; head -5 "$b.err"; } >&2
   return 1
 }
 
