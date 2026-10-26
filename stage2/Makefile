@@ -33,6 +33,10 @@ ifeq ($(TIMEOUT),)
 TIMEOUT := $(abspath $(CURDIR)/../tools/lib/timeout.sh)
 endif
 
+# `kai test` and `kai check` compile before they run, so the budget covers a cold build.
+KAI_BOUNDED := $(abspath $(CURDIR)/../tools/kai-bounded.sh)
+KAI_BUILD_RUN_BUDGET ?= 300
+
 # C++ runtime for the native (libLLVM) link. LLVM is C++, so the static
 # link needs the C++ runtime explicitly (`cc` does not add it). The library
 # is platform-specific: macOS ships libc++ (`-lc++`), but a Linux libLLVM —
@@ -1540,12 +1544,12 @@ test-ffi-in-test-blocks: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/ffi/ffi_in_test_blocks.kai; \
 	gold=../examples/ffi/ffi_in_test_blocks.out.expected; \
-	$(TIMEOUT) 60 ../bin/kai test --backend=c $$src > build/ffi-in-test-c.out 2>&1 \
+	$(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=c $$src > build/ffi-in-test-c.out 2>&1 \
 	  || { echo "ffi-in-test-blocks FAIL (C backend exit)"; cat build/ffi-in-test-c.out; exit 1; }; \
 	diff -q $$gold build/ffi-in-test-c.out > /dev/null \
 	  || { echo "ffi-in-test-blocks DIFF (C backend)"; diff $$gold build/ffi-in-test-c.out; exit 1; }; \
 	nexit=0; \
-	$(TIMEOUT) 60 ../bin/kai test --backend=native $$src > build/ffi-in-test-n.out 2>&1 || nexit=$$?; \
+	$(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=native $$src > build/ffi-in-test-n.out 2>&1 || nexit=$$?; \
 	if grep -q "not built into this kaic2" build/ffi-in-test-n.out; then \
 	  echo "ffi-in-test-blocks OK (C backend; native SKIP: cc-only kaic2)"; \
 	else \
@@ -11566,12 +11570,12 @@ test-native-test-runner-950: $(TARGET) bin-kai build
 	src=../examples/native/test_runner_parity.kai; \
 	gold=../examples/native/test_runner_parity.out.expected; \
 	cexit=0; \
-	KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai test --backend=c $$src > build/s2-950tr-c.out 2>&1 || cexit=$$?; \
+	KAI_MAX_HEAP=4g $(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=c $$src > build/s2-950tr-c.out 2>&1 || cexit=$$?; \
 	diff -q $$gold build/s2-950tr-c.out > /dev/null \
 	  || { echo "native-test-runner-950 FAIL (C output diff)"; diff $$gold build/s2-950tr-c.out; exit 1; }; \
 	[ "$$cexit" -eq 1 ] || { echo "native-test-runner-950 FAIL (C exit $$cexit != 1)"; exit 1; }; \
 	nexit=0; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
+	KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=native $$src > build/s2-950tr-n.raw 2>&1 || nexit=$$?; \
 	grep -E '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.rc 2>/dev/null || true; \
 	grep -vE '^\[KAI_TRACE_RC\]' build/s2-950tr-n.raw > build/s2-950tr-n.out 2>/dev/null || true; \
 	diff -q $$gold build/s2-950tr-n.out > /dev/null \
@@ -11597,7 +11601,7 @@ test-native-check-runner: $(TARGET) bin-kai build
 	gold=../examples/native/check_runner_parity.out.expected; \
 	run() { \
 	  rc=0; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai check --backend=$$1 $$src > build/s2-ckr-$$1.raw 2>&1 || rc=$$?; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai check --backend=$$1 $$src > build/s2-ckr-$$1.raw 2>&1 || rc=$$?; \
 	  grep -vE '^\[KAI_TRACE_RC\]' build/s2-ckr-$$1.raw > build/s2-ckr-$$1.out || true; \
 	  diff -q $$gold build/s2-ckr-$$1.out > /dev/null \
 	    || { echo "native-check-runner FAIL ($$1 output diff)"; diff $$gold build/s2-ckr-$$1.out; exit 1; }; \
@@ -12040,7 +12044,7 @@ ORPHAN_SEND_FIXTURE := ../examples/test-runner/orphan_actor_send
 define orphan_send_run
 	@set -e; \
 	f=$(ORPHAN_SEND_FIXTURE); out=build/orphan-send-$(1); \
-	$(TIMEOUT) 60 ../bin/kai test --backend=$(1) $$f.kai > $$out.stdout 2> $$out.raw \
+	$(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=$(1) $$f.kai > $$out.stdout 2> $$out.raw \
 	  || { echo "orphan-send FAIL ($(1): kai test exited non-zero)"; cat $$out.stdout $$out.raw; exit 1; }; \
 	grep -v '^kai: note' $$out.raw > $$out.stderr || true; \
 	cat $$out.stdout $$out.stderr > $$out.out; \
@@ -12067,13 +12071,13 @@ CANCEL_ESCAPE_FIXTURE := ../examples/test-runner/cancel_escape
 define cancel_escape_run
 	@set -e; \
 	f=$(CANCEL_ESCAPE_FIXTURE); out=build/cancel-escape-$(1); \
-	rc=0; $(TIMEOUT) 60 ../bin/kai test --backend=$(1) $$f.kai > $$out.stdout 2> $$out.raw || rc=$$?; \
+	rc=0; $(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=$(1) $$f.kai > $$out.stdout 2> $$out.raw || rc=$$?; \
 	[ "$$rc" -eq 1 ] || { echo "cancel-escape FAIL ($(1): exit $$rc != 1)"; cat $$out.stdout $$out.raw; exit 1; }; \
 	grep -v '^kai: note' $$out.raw > $$out.stderr || true; \
 	cat $$out.stdout $$out.stderr > $$out.out; \
 	diff -q $$f.test.expected $$out.out > /dev/null \
 	  || { echo "cancel-escape DIFF ($(1))"; diff $$f.test.expected $$out.out; exit 1; }; \
-	rc=0; $(TIMEOUT) 60 ../bin/kai test --backend=$(1) --json $$f.kai > $$out.json 2> /dev/null || rc=$$?; \
+	rc=0; $(KAI_BOUNDED) $(KAI_BUILD_RUN_BUDGET) ../bin/kai test --backend=$(1) --json $$f.kai > $$out.json 2> /dev/null || rc=$$?; \
 	[ "$$rc" -eq 1 ] || { echo "cancel-escape FAIL ($(1): --json exit $$rc != 1)"; exit 1; }; \
 	[ "$$(grep -c '"type":"test"' $$out.json)" -eq 4 ] \
 	  || { echo "cancel-escape FAIL ($(1): --json did not record every block)"; cat $$out.json; exit 1; }; \
