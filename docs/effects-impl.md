@@ -739,8 +739,8 @@ The walk shown here is retained for fiber-local builtins
 (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) — whose handler is per-fiber and must
 not cross a `spawn` — and for a frameless perform of a default-bearing builtin.
 A fiber-local builtin finds its innermost handler through a per-fiber slot that
-`handle` installs and removes (O(1) in handler depth); the stack walk remains for
-a clause in dispatch and for code on a stack segment.
+`handle` installs and removes (O(1) in handler depth, also inside a clause in dispatch); the stack walk remains for
+code on a stack segment.
 
 `Eff.op(args)` (fiber-local / frameless case) looks up the innermost handler:
 

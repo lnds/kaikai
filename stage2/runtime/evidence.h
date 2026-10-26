@@ -288,6 +288,9 @@ struct KaiEvidence {
     /* The fiber's unwind-stack height when the node was pushed: what lies
      * above it belongs to frames an exit through this node discards. */
     uint32_t     unw_mark;
+    /* Position on the fiber's own chain: the root handler is 1. Orders two
+     * nodes of one chain without walking it. */
+    uint32_t     depth;
 };
 
 static KAI_RC_NOINLINE void kai_unw_grow(KaiFiber *f) {
@@ -464,6 +467,7 @@ static inline int kai_eff_match(const char *a, const char *b) {
  * on every exit from the chain; any other node takes no slot. */
 static inline void kai_fl_push(KaiFiber *f, KaiEvidence *node) {
     int i = kai_eff_fl(node->eff_label);
+    node->depth = node->parent != NULL ? node->parent->depth + 1 : 1;
     node->fl = (int8_t) i;
     if (i >= 0) {
         node->fl_prev = f->fl_top[i];
@@ -636,15 +640,20 @@ static KaiEvidence *kai_ev_find(KaiEvidence *n, KaiEvidence *stop, const char *e
     return NULL;
 }
 
-/* `kai_ev_find` over the fiber's whole chain. A fiber-local builtin outside
- * any clause dispatch resolves through its slot's chain of same-effect nodes,
- * whatever the handler depth; a segment or a clause in dispatch needs the
- * masks `kai_ev_find` applies. */
+/* `kai_ev_find` over the fiber's whole chain. A fiber-local builtin resolves
+ * through its slot's chain of same-effect nodes, whatever the handler depth,
+ * applying the dispatch mask of `kai_ev_find` as the candidates descend: the
+ * mask changes only at the dispatching nodes, so `cur` advances through them
+ * by depth instead of by walking every node between. A segment keeps the
+ * full walk. */
 static KaiEvidence *kai_ev_find_fiber(KaiFiber *f, const char *eff_label) {
     int i = kai_eff_fl(eff_label);
-    if (i < 0 || f->seg != NULL || f->in_dispatch_node != NULL)
+    if (i < 0 || f->seg != NULL)
         return kai_ev_find(f->evidence_top, NULL, eff_label, f->in_dispatch_node);
+    KaiEvidence *cur = f->in_dispatch_node;
     for (KaiEvidence *n = f->fl_top[i]; n != NULL; n = n->fl_prev) {
+        while (cur != NULL && cur->depth > n->depth) cur = kai_disp_at_push(cur);
+        if (cur != NULL && (n == cur || kai_disp_at_push(n) != cur)) continue;
         if (kai_eff_match(n->eff_label, eff_label)) return n;
     }
     return NULL;

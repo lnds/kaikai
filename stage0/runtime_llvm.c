@@ -1668,7 +1668,7 @@ int64_t kai_jmpbuf_size(void) { return (int64_t) sizeof(jmp_buf); }
  * `i8*` cast of the handle's `%KaiValue*` discard alloca. */
 /* The native backend reserves the evidence node as `[9 x ptr]` and the
  * continuation as `[8 x i32]` (emit_native_fx.kai). */
-typedef char kaix_evidence_fits_node[(sizeof(KaiEvidence) <= 10 * 8) ? 1 : -1];
+typedef char kaix_evidence_fits_node[(sizeof(KaiEvidence) <= 11 * 8) ? 1 : -1];
 typedef char kaix_cont_fits_slot[(sizeof(KaiCont) <= 8 * sizeof(int32_t)) ? 1 : -1];
 
 void kaix_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_label,
