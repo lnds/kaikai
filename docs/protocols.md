@@ -545,6 +545,9 @@ protocol Audit {
 fn main() : Unit = ()
 ```
 
+The same holds for an impl: a method written `fn show(c: Counter) : String / Stdout`
+is rejected, since dispatch would drop its row.
+
 Use an effect, not a protocol, for behaviour with effects. This keeps
 protocols compositional and predictable.
 

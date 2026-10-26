@@ -43,6 +43,20 @@ inside a child), and a fiber-local effect (`Cancel`, `Link`,
 `Monitor`, `Spawn`, `Actor`), which binds the child's own disposition
 by construction.
 
+The thunk's row `e` is part of the spawner's own row (`spawn`,
+`Spawn.spawn`, `spawn_actor` and `spawn_actor_policy` all return
+`/ Spawn + e`), so a child that may perform `Cancel` or `Clock` makes
+its spawner declare it, up to `main`, where the runtime installs the
+default for each fiber.
+
+The rule holds through generic code. A function whose parameter is
+read inside a spawned thunk, or is passed on to a parameter that is,
+spawns that argument: the effects of the argument handed in at each
+call are held to the same rule, naming the call site. `pmap(xs, f)`
+with `f : (A) -> B / Fail` is therefore rejected inside a
+`handle { ... } with Fail`, even though `pmap` is polymorphic in `f`'s
+row. The set of such parameters is part of a module's interface.
+
 Anything else is rejected at compile time:
 
 ```text

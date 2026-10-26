@@ -1688,6 +1688,10 @@ void kaix_evidence_run_cleanup(KaiEvidence *node) {
     kai_evidence_run_cleanup(node);
 }
 
+void kaix_evidence_mark_named(KaiEvidence *node) {
+    kai_evidence_mark_named(node);
+}
+
 /* Non-tail `resume`: a clause defers its tail; the handle runs it on exit. */
 KaiValue *kaix_resume_frame_push(KaiValue *clo) {
     return kai_resume_frame_push(clo);
