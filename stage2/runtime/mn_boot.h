@@ -382,6 +382,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
      * inheriting it would carry a parent handler whose *Ev struct lives
      * on a stack frame the parent overwrites once it returns. */
     f->evidence_top          = NULL;
+    memset(f->fl_top, 0, sizeof f->fl_top);
     kai_fiber_init_ctx(f);
     /* Stamp the actor mailbox onto the fiber before it becomes runnable:
      * owner_fiber must be set here, not after enqueue, or a Monitor/Link

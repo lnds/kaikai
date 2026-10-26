@@ -36,7 +36,7 @@ boundary marker that dispatches nothing. This mirrors Koka's split of `io`
 |---|---|---|
 | **Capability passing** (`__evf[]` slot; `kai_<name>` for a named instance, tag `#<recv>`) | User / value-transportable effects (`State`, `Reader`, `Writer`, `Stdout`, `File`, `Clock`, `Mutable`, …, and user-declared effects) | The evidence is the value the caller resolved; the perform reads its slot. Distinct instances stay distinct by parameter position — this is what closes #789 and lands §6 named instances. |
 | **By-id lookup** (`kai_evidence_lookup_node_by_id`, tag `@<name>`) | `var` / `State` / `Reader` cells | A `var c` / `var go` pair installs two `State` nodes on one stack; the by-id `handler_id` distinguishes them in the same body, across the cell's naked-read closure capture, and inside a nested handler's clauses (the id rides the handler env), where a by-name walk would collapse to the innermost. Bounded to cells. |
-| **Instance-keyed walk** (`kai_evidence_lookup_node`, `lookup_or_default`; the label is the `Eff[args]` instance key, interned once per site: the walk compares pointers and never reads label text; two labels match when equal or when one is the bare `Eff` of the other) | Fiber-local builtins (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) and a frameless perform of a default-bearing builtin (`main`, clause roots) | A fiber-local handler is installed per fiber and must not ride a slot across a `spawn`; it resolves against the fiber's own disposition. `Ffi` carries no ops. Bounded to these. |
+| **Instance-keyed lookup** (`kai_evidence_lookup_node`; a fiber-local builtin reads its per-fiber slot, one load plus the chain of same-effect nodes, and walks the whole stack only inside a clause in dispatch or on a stack segment, `lookup_or_default`; the label is the `Eff[args]` instance key, interned once per site: the walk compares pointers and never reads label text; two labels match when equal or when one is the bare `Eff` of the other) | Fiber-local builtins (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) and a frameless perform of a default-bearing builtin (`main`, clause roots) | A fiber-local handler is installed per fiber and must not ride a slot across a `spawn`; it resolves against the fiber's own disposition. `Ffi` carries no ops. Bounded to these. |
 
 The `KAI_EVIDENCE_FRAME_ONLY` gate (`tools/evidence-frame-gate.sh`, tier0) pins
 the boundary: a user effect that reached the by-name walk is a regression and
@@ -50,7 +50,8 @@ fails the build.
 | **Shipped** | Two instances of one effect in a row (`Box[Int] + Box[String]`, `Actor[Request] + Actor[Reply]`) dispatch by instance on every mechanism: frame slots, handler labels and the walk are keyed `Eff[args]`, a generic that installs a handler at a type parameter is specialised per instance, and an op both instances could take is rejected. | True on C and native. Fixtures: `examples/effects/actor_receive_outer_mailbox.kai`, `examples/effects/instance_dispatch_two_instances.kai`, `examples/negative/effects/ambiguous_effect_instance.kai`. An instance a polymorphic body cannot pin keys as the bare `Eff`, which matches any instance. |
 | **Shipped** | Op-name collision between two effects is rejected at compile time (#789). | True. The by-name walk cannot tell two effects sharing an op name apart, so the collision is a compile error, not silent corruption. Fixtures: `examples/effects/collision_segfault.kai` (+ `.err.expected`). A cell read across a clause boundary dispatches by id, so it is no collision: `collision_value_corruption.kai` and `collision_type_mismatch.kai` run. |
 | **Shipped** | A capability bound by `as` is second-class: only a call argument or op receiver, never returned or stored (§6.2). | True, checked locally with no flow analysis. Fixture: `examples/effects/cap_escape_rejected.kai`. |
-| **Bounded by design** | Fiber-local builtins and `Ffi` resolve through the runtime, not a slot. | True and permanent — a soundness constraint (a capability does not cross a `spawn`), not pending work. |
+| **Shipped** | A fiber-local builtin (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) resolves through a per-fiber slot holding its innermost handler, so dispatch cost does not depend on handler depth. | True on C and native. A handler installed inside a clause in dispatch, or on a stack segment, still takes the masked chain walk. Fixture: `examples/effects/fiber_local_slot_depth.kai`. |
+| **Bounded by design** | Fiber-local builtins and `Ffi` resolve through the runtime, not a caller slot. | True and permanent — a soundness constraint (a capability does not cross a `spawn`), not pending work. |
 
 ## When #789 / #820 closed
 
@@ -64,7 +65,7 @@ fiber-local op performed in a fiber that installed no handler reports
 ## What this document is NOT
 
 - Not a claim of "capability-passing pure" or "the by-name walk is deleted":
-  the walk is retained, bounded, for fiber-local + Ffi builtins, and by-id for
+  the lookup is retained, bounded, for fiber-local + Ffi builtins (O(1) per-fiber slots outside clause dispatch), and by-id for
   cells. Writing otherwise would be the lying doc this discipline exists to
   prevent.
 - Not a roadmap or a calendar.

@@ -51,6 +51,7 @@ static KAI_TLS int         kai_seg_pool_n = 0;
 
 static void kai_seg_ctx_save(KaiFiber *f, KaiSegCtx *c) {
     c->evidence_top     = f->evidence_top;
+    memcpy(c->fl_top, f->fl_top, sizeof c->fl_top);
     c->in_dispatch_node = f->in_dispatch_node;
     c->unw_buf          = f->unw_buf;
     c->unw_top          = f->unw_top;
@@ -67,6 +68,7 @@ static void kai_seg_ctx_save(KaiFiber *f, KaiSegCtx *c) {
 
 static void kai_seg_ctx_load(KaiFiber *f, const KaiSegCtx *c) {
     f->evidence_top     = c->evidence_top;
+    memcpy(f->fl_top, c->fl_top, sizeof f->fl_top);
     f->in_dispatch_node = c->in_dispatch_node;
     f->unw_buf          = c->unw_buf;
     f->unw_top          = c->unw_top;
@@ -365,6 +367,7 @@ KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
     seg->trap        = 0;
     seg->base        = f->evidence_top;
     seg->own.evidence_top     = f->evidence_top;
+    memcpy(seg->own.fl_top, f->fl_top, sizeof seg->own.fl_top);
     seg->own.in_dispatch_node = NULL;
     seg->own.unw_top          = 0;
     seg->own.rframe_top       = 0;
@@ -692,7 +695,7 @@ static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *d
         f = kai_current_fiber();
     }
     if (f->seg != NULL) return kai_seg_lookup(f, eff_label, def);
-    KaiEvidence *node = kai_ev_find(f->evidence_top, NULL, eff_label, f->in_dispatch_node);
+    KaiEvidence *node = kai_ev_find_fiber(f, eff_label);
     return node != NULL ? node : def;
 }
 
@@ -793,7 +796,7 @@ static KaiEvidence **kai_evidence_fill_frame_l(KaiEvidence **out, int n, const c
         } else if (f->seg != NULL) {
             node = kai_seg_lookup(f, label, defs[i]);
         } else {
-            node = kai_ev_find(f->evidence_top, NULL, label, f->in_dispatch_node);
+            node = kai_ev_find_fiber(f, label);
             if (node == NULL) node = defs[i];
         }
         out[i] = (i < 64 && ((unchecked >> i) & 1)) ? node : kai_evidence_require(node, label);
