@@ -9,7 +9,7 @@ PROJ="$(mktemp -d)"
 CACHE="$PROJ/cache"
 LIMIT="${LIMIT:-120}"
 
-unlock() { chflags -R nouchg "$PROJ" 2>/dev/null || true; }
+unlock() { chflags -R nouchg "$PROJ" 2>/dev/null || true; chmod -R u+w "$PROJ" 2>/dev/null || true; }
 cleanup() { unlock; rm -rf "$PROJ" 2>/dev/null || sudo -n rm -rf "$PROJ"; }
 trap cleanup EXIT INT TERM
 
@@ -32,22 +32,21 @@ build() {
   [ "$("$PROJ/hello")" = "hello" ] || { echo "wrapper_readonly_jobs FAIL — wrong output"; exit 1; }
 }
 
-make_readonly() {
+# Immutable flag or root ownership: refuses the owner too.
+lock_hard() {
   if command -v chflags >/dev/null 2>&1; then
     chflags -R uchg "$@"
   elif sudo -n true 2>/dev/null; then
     sudo chown -R root "$@"
     sudo chmod -R a-w "$@"
-  elif [ -n "${CI:-}" ]; then
-    echo "wrapper_readonly_jobs FAIL — CI has no way to make the cache read-only"; exit 1
   else
-    echo "wrapper_readonly_jobs SKIP — no way to make an owned cache read-only"; exit 0
+    return 1
   fi
 }
 
 # Empty cache with only an unwritable jobs directory.
 mkdir -p "$CACHE/kai/jobs"
-make_readonly "$CACHE/kai/jobs"
+lock_hard "$CACHE/kai/jobs" || chmod a-w "$CACHE/kai/jobs"
 build
 
 # Cache filled first, then locked whole.
@@ -55,7 +54,13 @@ unlock
 rm -rf "$CACHE" 2>/dev/null || sudo -n rm -rf "$CACHE"
 mkdir -p "$CACHE"
 build
-make_readonly "$CACHE"
+if ! lock_hard "$CACHE"; then
+  if [ -n "${CI:-}" ]; then
+    echo "wrapper_readonly_jobs FAIL — CI has no way to make the cache read-only"; exit 1
+  fi
+  echo "wrapper_readonly_jobs SKIP — filled read-only cache: no immutable flag or passwordless sudo"
+  exit 0
+fi
 rm -f "$PROJ/hello"
 build
 
