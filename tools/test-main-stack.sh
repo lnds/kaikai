@@ -17,7 +17,7 @@ for name in main_stack_sized main_stack_sized_overflow; do
 done
 
 for n in 1 8; do
-  for limit in 1024 hard; do
+  for limit in 1024 "$(ulimit -H -s)"; do
     out="$(ulimit -s "$limit"; KAI_THREADS=$n "$work/main_stack_sized" 2>&1)" \
       || { echo "main-stack FAIL ($backend, KAI_THREADS=$n, ulimit -s $limit: deep recursion overflowed)"; echo "$out"; exit 1; }
     [ "$out" = "$(cat "$fx/main_stack_sized.out.expected")" ] \
