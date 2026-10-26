@@ -2,10 +2,12 @@
 Fiber-boundary check on the monomorphised program.
 
 A value that stays on its fiber (a cell, a `Seq`, a `Cont`) must not
-reach another one, whether a spawned thunk captures it or an actor
-message carries it. The typer sees a generic helper's `t`, never the
-`Ref[Int]` a caller binds it to; here every type is concrete, so the
-same capture check and a message check see through type parameters.
+reach another one. A spawned thunk capturing it, an actor mailbox typed
+to carry it and a `Fiber` returning it all cross. The typer sees a
+generic helper's `t`, never the `Ref[Int]` a caller binds it to; here
+every type is concrete, so the checks see through type parameters. The
+mailbox and the fiber result are judged by their type, so no send or
+await can carry one however the call is spelled.
 """)]
 
 import compiler.ast
@@ -24,10 +26,10 @@ import compiler.mutation_carriers
 import compiler.spawn_capture
 import compiler.spawn_row
 
-# A spawn with its thunk, or a call taking a `Pid` beside other arguments.
-type Site = SpawnAt(SpawnSite, Expr) | SendAt(SpawnSite, [Expr])
+# A spawn with its thunk, or the expressions of a declaration whose type names a `Pid` or a `Fiber`.
+type Site = SpawnAt(SpawnSite, Expr) | TypedAt(SpawnSite, [Expr])
 
-#[doc("The diagnostics for every spawned thunk of `ds` capturing, and every actor message carrying, a value that stays on its fiber. `program` declares the types, `target` is the root module.")]
+#[doc("The diagnostics for every spawned thunk of `ds` capturing, and every `Pid` or `Fiber` type carrying, a value that stays on its fiber. `program` declares the types, `target` is the root module. One per site: a generic's instances report once.")]
 pub(pkg) fn fiber_crossings(df: DiagFiles, tab: SymTab, views: FileViews, target: String, roots: Roots,
                             program: [Decl], ds: [Decl]) : [Diagnostic] / Console + File {
   let sites = flat_map(ds, (d) => decl_sites(df, tab, d))
@@ -37,65 +39,126 @@ pub(pkg) fn fiber_crossings(df: DiagFiles, tab: SymTab, views: FileViews, target
       let homes = tsh_homes(program, tab, views, target, roots)
       let shapes = carrier_shapes(tsh_view(homes, None), typer_records(program, tab), collect_sums(program))
       let bound = fiber_bound_type_names(shapes)
-      list_uniq(flat_map(sites, (s) => site_diags(s, bound)))
+      once_per_site(df_root(df), flat_map(sites, (s) => site_diags(s, bound)), [])
     }
   }
 }
 
 fn decl_sites(df: DiagFiles, tab: SymTab, d: Decl) : [Site] = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _) -> expr_sites(SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }, body)
+  DFn(_, _, _, _, _, _, body, _, _, _) -> {
+    let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
+    let spawns = spawn_sites(site, body)
+    match filter(all_exprs(body), has_fiber_type) {
+      [] -> spawns
+      es -> [...spawns, TypedAt(site, es)]
+    }
+  }
   _ -> []
 }
 
-fn expr_sites(site: SpawnSite, e: Expr) : [Site] = {
+fn spawn_sites(site: SpawnSite, e: Expr) : [Site] = {
   let here = match e.kind {
-    ECall(callee, args_) ->
-      if callee_is_spawn(callee) {
-        match spawn_thunk_arg(args_) {
-          Some(thk) -> [SpawnAt(site, thk)]
-          None      -> []
-        }
+    ECall(callee, args_) -> if callee_is_spawn(callee) {
+      match spawn_thunk_arg(args_) {
+        Some(thk) -> [SpawnAt(site, thk)]
+        None      -> []
       }
-      else if any(args_, is_pid) { [SendAt(site, args_)] }
-      else { [] }
+    } else { [] }
     _ -> []
   }
-  list_append(here, flat_map(spawn_expr_children(e), (k) => expr_sites(site, k)))
+  list_append(here, flat_map(spawn_expr_children(e), (k) => spawn_sites(site, k)))
 }
 
-fn is_pid(e: Expr) : Bool = match pid_message(e) {
-  Some(_) -> true
+fn all_exprs(e: Expr) : [Expr] = [e, ...flat_map(spawn_expr_children(e), all_exprs)]
+
+fn has_fiber_type(e: Expr) : Bool = match e.ty {
+  Some(t) -> names_fiber_type(t)
   None    -> false
 }
 
-# The message type of an expression that is a `Pid`.
-fn pid_message(e: Expr) : Option[Ty] = match e.ty {
-  Some(TyCon(s, [m])) -> if core_ty_is(s, CtPid) { Some(m) } else { None }
-  _ -> None
+fn names_fiber_type(t: Ty) : Bool = match t {
+  TyCon(s, args) -> core_ty_is(s, CtPid) or core_ty_is(s, CtFiber) or any(args, names_fiber_type)
+  TyListT(x)     -> names_fiber_type(x)
+  _              -> false
 }
 
 fn site_diags(s: Site, bound: [SymId]) : [Diagnostic] / Console + File = match s {
-  SpawnAt(site, thk)  -> check_thunk_captures(site, bound, thk)
-  SendAt(site, args_) -> message_diags(site, args_, bound)
+  SpawnAt(site, thk) -> check_thunk_captures(site, bound, thk)
+  TypedAt(site, es)  -> first_crossing(site, es, bound)
 }
 
-fn carries_message(e: Expr, bound: [SymId]) : Bool = match pid_message(e) {
-  Some(m) -> ty_holds_bound(m, bound)
-  None    -> false
+# The first expression of a declaration whose type moves a bound value between fibers.
+fn first_crossing(site: SpawnSite, es: [Expr], bound: [SymId]) : [Diagnostic] = match es {
+  []           -> []
+  [e, ...rest] -> match e.ty {
+    Some(t) -> match carried(t, bound) {
+      Some(c) -> [crossing_diag(site, e, c)]
+      None    -> first_crossing(site, rest, bound)
+    }
+    None -> first_crossing(site, rest, bound)
+  }
 }
 
-fn message_diags(site: SpawnSite, args_: [Expr], bound: [SymId]) : [Diagnostic] =
-  if any(args_, (a) => carries_message(a, bound)) {
-    flat_map(args_, (a) => match a.ty {
-      Some(t) -> if not is_pid(a) and ty_holds_bound(t, bound) { [message_diag(site, a, t)] } else { [] }
-      None    -> []
-    })
-  } else { [] }
+# A `Pid[M]` or `Fiber[T]` within `t` whose argument holds a bound value.
+type Carried = Carried(Bool, Ty)
 
-fn message_diag(site: SpawnSite, a: Expr, t: Ty) : Diagnostic = {
-  let file = site.file
-  mk_diag(SevError, file, a.line, a.col,
-          concat_all(["an actor message cannot hold `", carrier_display(site.tab, t), "`"]),
-          [ri_note(file, a.line, a.col, "fibers have private heaps; the receiver would not share it with the sender"),
-           ri_help(file, a.line, a.col, "send the value's contents, or let one actor own the state (`kai info actors`)")])
+fn carried(t: Ty, bound: [SymId]) : Option[Carried] = match t {
+  TyCon(s, args) -> {
+    let is_pid = core_ty_is(s, CtPid)
+    match args {
+      [m] -> if (is_pid or core_ty_is(s, CtFiber)) and ty_holds_bound(m, bound) { Some(Carried(is_pid, m)) }
+             else { carried_in(args, bound) }
+      _   -> carried_in(args, bound)
+    }
+  }
+  TyListT(x) -> carried(x, bound)
+  _          -> None
+}
+
+fn carried_in(ts: [Ty], bound: [SymId]) : Option[Carried] = match ts {
+  []           -> None
+  [t, ...rest] -> match carried(t, bound) {
+    Some(c) -> Some(c)
+    None    -> carried_in(rest, bound)
+  }
+}
+
+fn crossing_diag(site: SpawnSite, e: Expr, c: Carried) : Diagnostic = match c {
+  Carried(is_pid, m) -> {
+    let file = site.file
+    let what = if is_pid { "an actor message" } else { "a fiber's result" }
+    mk_diag(SevError, file, e.line, e.col,
+            concat_all([what, " cannot hold `", carrier_display(site.tab, m), "`"]),
+            [ri_note(file, e.line, e.col, "fibers have private heaps; the other side would not share it"),
+             ri_help(file, e.line, e.col, "pass the value's contents, or let one fiber own the state and message it (`kai info actors`)")])
+  }
+}
+
+# The diagnostics that say the same thing about the same names are one
+# site seen through different instances of a generic, or through the
+# copies a closure specialisation makes of it. The one kept is in the
+# file the user compiles, else the earliest.
+fn once_per_site(root: String, ds: [Diagnostic], acc: [Diagnostic]) : [Diagnostic] = match ds {
+  []           -> acc
+  [d, ...rest] -> once_per_site(root, rest,
+    if any(acc, (a) => same_site(a, d)) { map(acc, (a) => if same_site(a, d) { preferred(root, a, d) } else { a }) }
+    else { list_append(acc, [d]) })
+}
+
+fn same_site(a: Diagnostic, b: Diagnostic) : Bool = match a {
+  D(_, _, _, _, ma, ia) -> match b {
+    D(_, _, _, _, mb, ib) -> ma == mb and map(ia, ri_text) == map(ib, ri_text)
+  }
+}
+
+fn ri_text(r: RelatedInfo) : String = match r { DR(_, _, _, m) -> m }
+
+fn preferred(root: String, a: Diagnostic, b: Diagnostic) : Diagnostic = match a {
+  D(_, fa, la, ca, _, _) -> match b {
+    D(_, fb, lb, cb, _, _) ->
+      if fa == root and fb != root { a }
+      else if fb == root and fa != root { b }
+      else if lb < la or (lb == la and cb < ca) { b }
+      else { a }
+  }
 }

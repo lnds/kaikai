@@ -182,13 +182,9 @@ Where the boundary falls:
   not come back through a cell both sides hold.
 
 A thunk that captures a value carrying mutation — a `Ref`, an `Array`,
-or a record holding either, at any depth, including through a type
-argument — is rejected where it is spawned, because the copy would make
-the program quietly wrong rather than loudly broken. So is a lazy `Seq`
-or a continuation, which stay on the fiber that made them, and so is an
-actor message holding any of them. The check runs on the instantiated
-types: a generic helper that spawns is rejected at the instance whose
-type parameter is bound to such a value.
+or a record holding either, at any depth, or a `Seq` — is rejected where it is
+spawned, because the copy would make the program quietly wrong rather
+than loudly broken:
 
 ```kaikai-neg
 import spawn
