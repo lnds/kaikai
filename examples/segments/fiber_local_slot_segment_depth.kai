@@ -1,0 +1,55 @@
+# A fiber-local builtin performed on a segment costs the same under 40 handlers nested on that segment as under none.
+
+import time
+
+effect Emit { emit(v: Int) : Unit }
+
+effect Other {
+  other() : Unit
+}
+
+type Stream = Done | Next(Int, Cont[Unit, Stream, Spawn])
+
+fn burst(n: Int) : Unit / Spawn =
+  if n == 0 { () } else { Spawn.scope_enter(); Spawn.scope_exit(); burst(n - 1) }
+
+fn wrap(depth: Int, n: Int) : Unit / Spawn =
+  if depth == 0 { burst(n) }
+  else {
+    handle { wrap(depth - 1, n) } with Other {
+      other(resume) -> resume(())
+      return(x)     -> x
+    }
+  }
+
+fn body(depth: Int, n: Int) : Unit / Emit + Spawn = {
+  Emit.emit(1)
+  wrap(depth, n)
+}
+
+fn stream(b: () -> Unit / Emit + Spawn) : Stream / Spawn =
+  handle { b(); Done } with Emit { emit(v, resume) -> Next(v, resume) }
+
+fn run(depth: Int, n: Int) : Unit / Spawn = {
+  let s = stream { body(depth, n) }
+  match s {
+    Done       -> ()
+    Next(_, k) -> match k(()) { _ -> () }
+  }
+}
+
+fn timed(depth: Int, n: Int) : Int / Spawn + Clock = {
+  let start = monotonic()
+  run(depth, n)
+  duration_to_nanos(elapsed_since(start, monotonic()))
+}
+
+fn main() : Int / Stdout + Spawn + Clock = {
+  let n = 1000000
+  let flat = timed(0, n)
+  let deep = timed(40, n)
+  # 10 ms of slack keeps a loaded runner from flaking on a near-zero flat run.
+  let ok = deep < flat * 2 + 10000000
+  Stdout.print(if ok { "depth-independent" } else { "FAIL flat=#{flat} deep=#{deep}" })
+  if ok { 0 } else { 1 }
+}
