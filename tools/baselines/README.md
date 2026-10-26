@@ -9,6 +9,14 @@ One file per key, so two changes to different keys never conflict. The file name
 | `rc-effects-growth/` | `examples/effects` fixture | `<c>:<native>` | `tools/rc-leak-gate.sh` |
 | `kir-lin/` | `<corpus>-<fixture>` | KIR linearity violations on native | `tools/rc-leak-gate.sh` |
 | `nscol/` | namespace-collision axis | allowed failure count | `tools/nscol-ratchet.sh`, `tests/namespace_matrix.sh` |
+| `symid-written-readers/` | `<file> <fn>` | `<reads>` | `tools/symid-census/gate.py` |
+| `symid-allow/` | `<file> <fn> <test> <literal>` | `<n> <reason> <why>` | `tools/symid-census/gate.py` |
+| `symid-written-mints/` | `<file> <fn>` | `<why>` | `tools/symid-census/gate.py` |
+| `symid-dual-slots/` | `<file> <type>` | `<why>` | `tools/symid-census/gate.py` |
+| `walker-catchall/` | `<file> <fn>` | `<reason>` | `tools/walker-catchall-audit.sh` |
+| `compiler-lint/` | `<file> <rule> <message hash>` | finding count | `tools/compiler-lint-ratchet.sh` |
+| `diags-json-parity/` | rejected fixture path | what differs | `tools/diags-json-parity.py` |
+| `runtime-globals/` | `<symbol>` | `<class>` | `tools/runtime-global-audit.sh` |
 
 A `-` in a backend column skips the fixture on that backend; the reason lives in `tools/rc-leak-skips.txt`.
 
@@ -35,3 +43,19 @@ The count is the number of distinct violations the KIR linearity check (`stage2/
 ## `nscol/` — failures allowed per namespace-collision axis
 
 A missing file means 0. More failures than the count is a regression. Fewer is progress, and the count comes down so it cannot bounce back. Raise a count only for a deliberate new red-by-design fixture.
+
+## Entry files written by `tools/lib/entries.py`
+
+The multi-column ledgers (`symid-*`, `walker-catchall/`, `compiler-lint/`, `diags-json-parity/`, `runtime-globals/`) hold one file per entry. A file is exactly one tab-separated row: the first N columns are the key (N per gate, in the table above), the rest the value. `entries.py` derives the file name from the key, so:
+
+- two changes that add different keys touch different files and never conflict;
+- two changes that add the same key collide on one path, which is the conflict to resolve;
+- a loader rejects a file whose name does not match its key, an entry of more than one line, and two files with one key.
+
+Add or edit: `tools/lib/entries.py put tools/baselines/walker-catchall 2 <file> <fn> "<reason>"`. Retire: delete the file.
+
+Ratchets over these directories are strict per entry: a finding with no entry fails, and an entry with no finding fails (delete its file in the change that fixed it). A change that removes one finding while another adds one cannot net out to a pass.
+
+A `README.md` in a directory documents its format and is not an entry.
+
+Single files that remain, each with the commits touching it since 2026-10-01: `tools/symid-census/pending-written.txt` (2), `tools/symid-census/written-eq.txt` (2), `tools/tls-hoist.allow` (7), `tools/perceus-read-baseline.txt` (4), `tools/progen-diff-skips.txt` (4), `tests/namespace_matrix_thin_baseline.txt` (4), `tools/wasm-parity-baseline.txt` (4), and the other parity baselines and `*-skips.txt` lists (0 to 3 each). Their entries are low-churn; one that starts to collide converts the same way.

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Parity between a rejected fixture's stderr and its `--diags-json` document.
 
-  diags-json-parity.py <manifest> <baseline>
+  diags-json-parity.py <manifest> <baseline-dir>
 
 Each manifest line is `<fixture> <stderr file> <json file>`. A fixture is
 at parity when the errors its `--diags-json` document carries are exactly
 the errors its plain run printed to stderr, by (file, message, line, col).
-Fixtures not yet at parity are listed in the baseline, one per line,
-sorted; the list may only shrink.
+Fixtures not yet at parity have a file in the baseline directory (one
+entry per fixture, the reason as its second column); the set may only shrink.
 """
 
 import json
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+sys.dont_write_bytecode = True
+import entries
 
 SINGLE = re.compile(r"(.*?):(\d+):(\d+): error: (.*)$")
 ARROW = re.compile(r"\s+--> (.*):(\d+):(\d+)$")
@@ -57,9 +62,13 @@ def main(argv):
         sys.stderr.write(__doc__)
         return 2
     manifest, baseline = argv[1], argv[2]
-    pinned = [l.strip() for l in open(baseline) if l.strip() and not l.startswith("#")]
+    try:
+        pinned = [r[0] for r in entries.load(baseline, 1)]
+    except ValueError as e:
+        print("diags-json-parity FAIL: " + str(e))
+        return 1
     total, off = off_parity(manifest)
-    fails = ["%s is not sorted and unique" % baseline] if pinned != sorted(set(pinned)) else []
+    fails = []
     fails += ["%s — --diags-json does not report the errors kai build prints" % f for f in sorted(off - set(pinned))]
     fails += ["%s is at parity now; delete it from %s" % (f, baseline) for f in sorted(set(pinned) - off)]
     for f in fails:

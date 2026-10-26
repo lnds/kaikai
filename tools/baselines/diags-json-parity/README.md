@@ -1,0 +1,1 @@
+Rejected fixtures whose `--diags-json` does not yet match `kai build`'s errors (`tools/diags-json-parity.py`). The key is the fixture path, the second column says what differs. The set may only shrink.

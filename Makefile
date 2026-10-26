@@ -890,7 +890,7 @@ test-canonical-aliases:
 
 # M:N scheduler §1 — static classification gate for the runtime's mutable
 # file-scope globals. Every global in stage2/runtime.h, stage0/runtime_llvm.c,
-# and stage0/runtime.h must appear in tools/runtime-globals.allow with its
+# and stage0/runtime.h must appear in tools/baselines/runtime-globals/ with its
 # partition class (tls / immutable / immortal / shared-locked / reactor-owned /
 # scratch). A new unclassified global fails the build, keeping the TLS
 # partition total by construction. `--self-test` proves the gate can fail.
@@ -1061,7 +1061,7 @@ test-namespace-classes:
 test-corrective-ratchet:
 	@./tools/corrective-pass-ratchet.sh
 
-# `kai lint` findings over the compiler only go down (tools/compiler-lint-baseline.txt).
+# `kai lint` findings over the compiler only go down (tools/baselines/compiler-lint/).
 # A new lint rule lands with `tools/compiler-lint-ratchet.sh --update`.
 test-compiler-lint-ratchet: bin/kai
 	@./tools/compiler-lint-ratchet.sh
