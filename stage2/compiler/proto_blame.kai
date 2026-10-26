@@ -18,30 +18,31 @@ import compiler.written
 import compiler.diag_file
 import compiler.diag
 import compiler.util
+import compiler.modules_paths
 
-type Site = Site(Int, Int, FnId)
+type Site = Site(String, Int, Int, FnId)
 
-#[doc("The dispatch diagnostics of `ds`, each one found in a declaration outside `root_file` moved to the call in `root_file` that instantiates that declaration, when there is one.")]
+#[doc("The dispatch diagnostics of `ds`, each one found in a declaration outside the package of `root_file` moved to the nearest call inside the package that instantiates that declaration, when there is one.")]
 pub(pkg) fn dispatch_diags_at_user_sites(ds: [Decl], tab: SymTab, reg: ProtocolReg, df: DiagFiles,
                                          root_file: String) : [Diagnostic] / Console + File =
-  dedup_diags(finalize_diags(blame_decls(ds, ds, tab, reg, df, root_file, [])), [])
+  dedup_diags(finalize_diags(blame_decls(ds, ds, tab, reg, df, package_dir_of(root_file), [])), [])
 
-fn blame_decls(all: [Decl], ds: [Decl], tab: SymTab, reg: ProtocolReg, df: DiagFiles, root_file: String,
+fn blame_decls(all: [Decl], ds: [Decl], tab: SymTab, reg: ProtocolReg, df: DiagFiles, pkg: String,
                acc: [Diagnostic]) : [Diagnostic] / Console + File = match ds {
   [] -> acc
   [d, ...rest] -> {
     let found = list_append(validate_resolved_decls([d], tab, reg, df, []), unresolved_dispatch_diags([d], reg, df))
-    let moved = map(found, (x) => blame_one(all, d, x, tab, reg, df, root_file))
-    blame_decls(all, rest, tab, reg, df, root_file, list_append(list_reverse(moved), acc))
+    let moved = map(found, (x) => blame_one(all, d, x, tab, reg, df, pkg))
+    blame_decls(all, rest, tab, reg, df, pkg, list_append(list_reverse(moved), acc))
   }
 }
 
 fn blame_one(all: [Decl], d: Decl, x: Diagnostic, tab: SymTab, reg: ProtocolReg, df: DiagFiles,
-             root_file: String) : Diagnostic = match x {
+             pkg: String) : Diagnostic = match x {
   D(sev, file, line, col, msg, related) ->
-    if file == root_file { x } else { match d {
-      DFn(_, fid, _, _, _, _, _, _, _, _) -> match instantiating_site(all, [fid], df, root_file, 8) {
-        Some(Site(l, c, via)) -> D(sev, root_file, l, c, msg, [DR(file, line, col, required_by(tab, reg, fnid_sym(via))), ...related])
+    if is_package_file(file, pkg) { x } else { match d {
+      DFn(_, fid, _, _, _, _, _, _, _, _) -> match instantiating_site(all, [fid], df, pkg, 8) {
+        Some(Site(at_file, l, c, via)) -> D(sev, at_file, l, c, msg, [DR(file, line, col, required_by(tab, reg, fnid_sym(via))), ...related])
         None -> x
       }
       _ -> x
@@ -54,33 +55,36 @@ fn required_by(tab: SymTab, reg: ProtocolReg, s: SymId) : String = match pid_imp
   None -> concat_all(["required by `", written_text(decl_name(tab, s)), "`"])
 }
 
-# The first call in `root_file`, searching callers outward from `targets`, that reaches one of them.
-fn instantiating_site(all: [Decl], targets: [FnId], df: DiagFiles, root_file: String, depth: Int) : Option[Site] =
+# The first call inside the package, searching callers outward from `targets`, that reaches one of them.
+fn instantiating_site(all: [Decl], targets: [FnId], df: DiagFiles, pkg: String, depth: Int) : Option[Site] =
   if depth == 0 or targets == [] { None } else {
     let callers = filter(all, (c) => match c {
-      DFn(_, _, _, _, _, _, body, _, _, _) -> is_some(first_ref(body, targets))
+      DFn(_, _, _, _, _, _, body, _, _, _) -> is_some(first_ref(body, "", targets))
       _ -> false
     })
-    match find(callers, (c) => decl_diag_file(c, df) == root_file) {
-      Some(DFn(_, _, _, _, _, _, body, _, _, _)) -> first_ref(body, targets)
-      _ -> instantiating_site(all, flat_map(callers, (c) => match c { DFn(_, fid, _, _, _, _, _, _, _, _) -> [fid]  _ -> [] }),
-                              df, root_file, depth - 1)
+    match find(callers, (c) => is_package_file(decl_diag_file(c, df), pkg)) {
+      Some(c) -> match c {
+        DFn(_, _, _, _, _, _, body, _, _, _) -> first_ref(body, decl_diag_file(c, df), targets)
+        _ -> None
+      }
+      None -> instantiating_site(all, flat_map(callers, (c) => match c { DFn(_, fid, _, _, _, _, _, _, _, _) -> [fid]  _ -> [] }),
+                              df, pkg, depth - 1)
     }
   }
 
-fn first_ref(e: Expr, targets: [FnId]) : Option[Site] = match e.kind {
+fn first_ref(e: Expr, file: String, targets: [FnId]) : Option[Site] = match e.kind {
   ESym(s, k) -> match find(targets, (t) => fnid_eq(t, FnId(s, k))) {
-    Some(t) -> Some(Site(e.line, e.col, t))
+    Some(t) -> Some(Site(file, e.line, e.col, t))
     None    -> None
   }
-  _ -> first_ref_in(xp_positions(e), targets)
+  _ -> first_ref_in(xp_positions(e), file, targets)
 }
 
-fn first_ref_in(ps: [XPos], targets: [FnId]) : Option[Site] = match ps {
+fn first_ref_in(ps: [XPos], file: String, targets: [FnId]) : Option[Site] = match ps {
   [] -> None
-  [XP(_, c), ...rest] -> match first_ref(c, targets) {
+  [XP(_, c), ...rest] -> match first_ref(c, file, targets) {
     Some(s) -> Some(s)
-    None    -> first_ref_in(rest, targets)
+    None    -> first_ref_in(rest, file, targets)
   }
 }
 
