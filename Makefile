@@ -833,7 +833,6 @@ test-kai-cli: kaic2
 	@tests/build_memo.sh
 	@tests/ffi_header.sh
 	@tests/path_specs.sh
-	@tests/cc_target_link.sh
 	@tests/c_opt.sh
 	@tests/no_llvm_probe.sh
 

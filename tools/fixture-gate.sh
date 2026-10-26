@@ -28,7 +28,7 @@
 #   bound=free-eq-alloc    every allocation was freed
 #   bound=free-near-alloc  frees are within 10 of the allocations
 #
-# Environment (set by stage2/Makefile): KAIC2 CC CFLAGS LDFLAGS_STACK LDLIBS_M TIMEOUT KAI_LLVM.
+# Environment (set by stage2/Makefile): KAIC2 CC CFLAGS LDLIBS_M TIMEOUT KAI_LLVM.
 
 set -euf
 
@@ -70,7 +70,7 @@ check_bounds() {
 
 run_binary() {
   if [ $stack = 1 ]; then
-    ( ulimit -s 8192 2>/dev/null; "$@" )
+    ( export KAI_MAIN_STACK_SIZE=8388608; "$@" )
   else
     "$@"
   fi
@@ -139,7 +139,7 @@ gate_fixtures() {
         nocp=""; [ $cellpool = 1 ] || nocp="-DKAI_NO_CELL_POOL"
         # shellcheck disable=SC2086
         $CC -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $nocp \
-          -Wno-unused-function -Wno-unused-variable $LDFLAGS_STACK \
+          -Wno-unused-function -Wno-unused-variable \
           -I ../stage2 -I ../stage0 "$b.c" -o "$b" $LDLIBS_M || fail "$fixture: C compile failed"
       fi
     fi

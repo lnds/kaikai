@@ -39,7 +39,7 @@
 # the link, and supports no marks.
 #
 # Environment (set by stage2/Makefile): KAIC2 CC CFLAGS CPPFLAGS_CORE
-# LDLIBS_M LDFLAGS_STACK TEST_CORE_CACHE FIXTURE_JOBS FIXTURE_BACKEND.
+# LDLIBS_M TEST_CORE_CACHE FIXTURE_JOBS FIXTURE_BACKEND.
 
 set -eu
 
@@ -80,9 +80,9 @@ manifest() {
   printf '%s' "$v"
 }
 
-# Under `opt: 0` the program runs on an 8 MiB main stack in every environment: a missing loop overflows here as it does on Linux CI.
+# Under `opt: 0` the program runs on an 8 MiB main stack on every host: a missing loop overflows.
 run_bin() {
-  if [ -n "${stackcap:-}" ]; then ( ulimit -s 8192; KAI_THREADS=2 "$@" ); else "$@"; fi
+  if [ -n "${stackcap:-}" ]; then ( export KAI_MAIN_STACK_SIZE=8388608; "$@" ); else "$@"; fi
 }
 
 mark() {
@@ -146,14 +146,14 @@ run_one() {
   elif mark "$f" test; then
     $KAIC2 $TEST_CORE_CACHE $path --test "$f" > "$b.c" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
-    eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
+    eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDLIBS_M" \
       || { echo "$slug FAIL $name (C compile failed)"; exit 1; }
     run_bin "./$b" > "$b.out" 2>&1 \
       || { echo "$slug FAIL $name (test run failed)"; cat "$b.out"; exit 1; }
   else
     $KAIC2 $TEST_CORE_CACHE $path $tflag "$f" > "$b.c" 2> "$b.err" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
-    eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
+    eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDLIBS_M" \
       || { echo "$slug FAIL $name (C compile failed)"; exit 1; }
     run_bin "./$b" > "$b.out" \
       || { echo "$slug FAIL $name (run errored)"; cat "$b.out"; exit 1; }

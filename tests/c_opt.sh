@@ -1,7 +1,7 @@
 #!/bin/sh
 # The optimisation level of the C compile follows KAI_C_OPT when CFLAGS is
 # unset: -O2 by default, the value when valid, -O2 again for a bad one, and
-# -O0 under `kai test`. An explicit CFLAGS wins over all of them. The fake
+# -O0 under `kai test` and `kai build --debug`. An explicit CFLAGS wins over all of them. The fake
 # compiler logs every line and forwards to the real `cc`.
 
 set -eu
@@ -42,6 +42,13 @@ case_for default -O2 KAI_C_OPT=
 case_for zero -O0 KAI_C_OPT=0
 case_for bad -O2 KAI_C_OPT=fast
 case_for cflags -O1 KAI_C_OPT=0 "CFLAGS=-std=c99 -O1"
+
+# `kai build --debug` compiles the program at -O0.
+: > "$work/cc.log"
+(cd "$work" && env CC="$work/fakecc" KAI_MODULAR=1 KAI_BIN_MEMO=0 XDG_CACHE_HOME="$work/cache-debug" \
+  "$KAI" build --backend=c --debug hello.kai -o "$work/out-debug" >/dev/null) \
+  || { echo "c-opt FAIL (debug): build failed"; fail=1; }
+[ "$(levels)" = -O0 ] || { echo "c-opt FAIL (debug): --debug compiled at '$(levels)'"; fail=1; }
 
 # `kai test` defaults the level to -O0 for the program it builds.
 : > "$work/cc.log"
