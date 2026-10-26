@@ -22,7 +22,7 @@
 #
 # Optional manifest key:
 #
-#   opt: 0                    build every fixture of the directory at -O0 on both backends
+#   opt: 0                    build every fixture of the directory at -O0 on both backends and run it on an 8 MiB main stack
 #
 # Marks, one `# fixture: <mark>` line anywhere in the fixture:
 #
@@ -80,6 +80,11 @@ manifest() {
   printf '%s' "$v"
 }
 
+# Under `opt: 0` the program runs on an 8 MiB main stack in every environment: a missing loop overflows here as it does on Linux CI.
+run_bin() {
+  if [ -n "${stackcap:-}" ]; then ( ulimit -s 8192; KAI_THREADS=2 "$@" ); else "$@"; fi
+}
+
 mark() {
   grep -q "^# fixture: $2\$" "$1"
 }
@@ -108,6 +113,7 @@ run_one() {
   if [ "$(sed -n 's/^opt: //p' "$dir/FIXTURES")" = 0 ]; then
     CFLAGS="${CFLAGS:-} -O0"
     export KAI_NATIVE_OPT=0
+    stackcap=1
   fi
 
   if [ "$BACKEND" = native ]; then
@@ -135,21 +141,21 @@ run_one() {
 
   if [ "$BACKEND" = native ]; then
     compile || { echo "$slug FAIL $name (native build failed)"; cat "$b.err"; exit 1; }
-    "./$b" > "$b.out" \
+    run_bin "./$b" > "$b.out" \
       || { echo "$slug FAIL $name (run errored)"; cat "$b.out"; exit 1; }
   elif mark "$f" test; then
     $KAIC2 $TEST_CORE_CACHE $path --test "$f" > "$b.c" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
     eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
       || { echo "$slug FAIL $name (C compile failed)"; exit 1; }
-    "./$b" > "$b.out" 2>&1 \
+    run_bin "./$b" > "$b.out" 2>&1 \
       || { echo "$slug FAIL $name (test run failed)"; cat "$b.out"; exit 1; }
   else
     $KAIC2 $TEST_CORE_CACHE $path $tflag "$f" > "$b.c" 2> "$b.err" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
     eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
       || { echo "$slug FAIL $name (C compile failed)"; exit 1; }
-    "./$b" > "$b.out" \
+    run_bin "./$b" > "$b.out" \
       || { echo "$slug FAIL $name (run errored)"; cat "$b.out"; exit 1; }
   fi
   wf="$dir/$name.warn.expected"
