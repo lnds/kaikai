@@ -12,6 +12,7 @@ import compiler.handler_alias
 import compiler.diag_file
 import compiler.spawn_row
 import compiler.spawn_cross
+import compiler.spawn_param
 import compiler.kind_theory
 import compiler.resolve_names
 import compiler.symtab
@@ -372,8 +373,10 @@ pub fn typecheck_unit(file: String, df: DiagFiles, ms: [ModuleDecls], inherited:
                       kind_theories: [KindTheory], tab: SymTab, sh: TcShared,
                       verbose: Bool) : [TypecheckedModule] / Console + File + Mutable = {
   let deltas = unit_deltas(file, ms, inherited, head_owners, tab, sh, [])
-  unit_members(file, df, ms, deltas, [], [], inherited, all_program_decls, protos, head_owners,
-               kind_theories, tab, sh, verbose)
+  spawn_finish(df, tab, sh, all_program_decls,
+               unit_members(file, df, ms, deltas, [], [], inherited, all_program_decls, protos, head_owners,
+                            kind_theories, tab, sh, verbose),
+               inherited.spawn_params)
 }
 
 fn unit_deltas(file: String, ms: [ModuleDecls], inh: ModuleEnvDelta, head_owners: [HeadOwnerEntry],
@@ -396,7 +399,7 @@ fn unit_members(file: String, df: DiagFiles, ms: [ModuleDecls], after: [ModuleEn
       let inh = foldl(others, inherited, (a, d) => merge_env_deltas(a, d))
       let shm = foldl(others, sh, (s, d) => tc_shared_extend(s, d))
       let fr = module_front(file, m, inh, head_owners, tab, shm)
-      let tm = module_bodies(file, df, m, fr, all_program_decls, protos, kind_theories, tab, shm, verbose)
+      let tm = module_bodies_unchecked(file, df, m, fr, all_program_decls, protos, kind_theories, tab, shm, verbose)
       unit_members(file, df, rest, later, [own, ...before], [tm, ...done], inherited, all_program_decls, protos,
                    head_owners, kind_theories, tab, sh, verbose)
     }
@@ -410,7 +413,35 @@ pub fn module_bodies(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFr
                      protos: ProtoView,
                      kind_theories: [KindTheory],
                      tab: SymTab, sh: TcShared,
-                     verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
+                     verbose: Bool) : TypecheckedModule / Console + File + Mutable =
+  match spawn_finish(df, tab, sh, all_program_decls, [module_bodies_unchecked(file, df, mod, fr, all_program_decls, protos, kind_theories, tab, sh, verbose)], fr.crossing) {
+    [tm, ..._] -> tm
+    []         -> panic("module_bodies: no module")
+  }
+
+# The spawn-boundary check runs once per import-cycle unit over every
+# member's typed decls, so the order the members were typed in never decides
+# which spawns are seen.
+fn spawn_finish(df: DiagFiles, tab: SymTab, sh: TcShared, all_program_decls: [Decl],
+                tms: [TypecheckedModule], known: [SpawnParam]) : [TypecheckedModule] / Console + File = {
+  let unit_decls = foldl(tms, [], (a, tm) => list_append(a, tm.typed.decls))
+  let marks = list_append(spawn_params_of(unit_decls, known), known)
+  let all_decls = if not list_is_empty(all_program_decls) { all_program_decls } else { unit_decls }
+  map(tms, (tm) => {
+    let ds = check_spawn_rows(df, tab, sh.cell_carriers, marks, tm.typed.decls, all_decls)
+    TypecheckedModule {
+      typed: TypedProgram { ...tm.typed, errs: tm.typed.errs + list_length(ds), diags: list_append(tm.typed.diags, ds) },
+      delta: ModuleEnvDelta { ...tm.delta, spawn_params: spawn_params_of(tm.typed.decls, marks) }
+    }
+  })
+}
+
+fn module_bodies_unchecked(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFront,
+                           all_program_decls: [Decl],
+                           protos: ProtoView,
+                           kind_theories: [KindTheory],
+                           tab: SymTab, sh: TcShared,
+                           verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
   let data = fr.data
   let n_inh = match sh.inh {
     TEP(_, _, _, n) -> n
@@ -429,16 +460,14 @@ pub fn module_bodies(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFr
     if not list_is_empty(all_program_decls) { sh.effs } else { build_effect_default_op_map(all_decls_for_typer) }, sh.homes)
   let priv_diags = check_field_privacy(df, tab, tsh_view(sh.homes, mod.name), tp.decls,
     if not list_is_empty(all_program_decls) { sh.field_recs } else { field_recs_of(data.decls_a) })
-  let own_crossing = spawn_params_of(tp.decls, fr.crossing)
-  let spawn_diags = check_spawn_rows(df, tab, sh.cell_carriers, list_append(own_crossing, fr.crossing), tp.decls, all_decls_for_typer)
   let typed = TypedProgram {
-    decls: tp.decls, errs: tp.errs + list_length(cov_diags) + list_length(priv_diags) + list_length(spawn_diags),
+    decls: tp.decls, errs: tp.errs + list_length(cov_diags) + list_length(priv_diags),
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
     core_len: tp.core_len, toplevel_len: n_inh + data.built.env.added,
     module_doc: doc_module_doc_text(data.decls_a),
-    diags: list_append(tp.diags, list_append(cov_diags, list_append(priv_diags, spawn_diags))), op_res: tp.op_res
+    diags: list_append(tp.diags, list_append(cov_diags, priv_diags)), op_res: tp.op_res
   }
-  TypecheckedModule { typed: typed, delta: ModuleEnvDelta { ...fr.delta, spawn_params: own_crossing } }
+  TypecheckedModule { typed: typed, delta: fr.delta }
 }
 
 
