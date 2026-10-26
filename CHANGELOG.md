@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.178.0 (2026-10-25)
+
+### BREAKING CHANGE
+
+- uuid.v4 and v4_bytes perform SecureRandom instead of Random; declare SecureRandom in the caller's row.
+
+### Fixed
+
+- **tco**: settle user types in effect-row label arguments of a fused signature
+- **tco**: fuse mutual tail groups whose members have type or effect-row parameters
+- **perceus**: leave tail-group fusion to the identity comparison; fixture stays at one million hops
+- **perceus**: move a branch-only param passed to a tail call instead of dup and drop
+- **perceus**: stop dup-then-drop around calls that keep a Vec unique or fuse a record-returning tail group
+- **tco**: compare written user types in the fusion gate by spelling, not by Written equality
+- **cspec**: stop a cycle of higher-order specs at its first repetition
+- **cspec**: stop a cycle of higher-order specs at its first repetition
+- **cspec**: leave a runaway cycle of higher-order specs indirect
+- **cspec**: close the spec cycle of mutually recursive higher-order functions
+- **tco**: fuse mutual tail groups whose signatures name a user type or a function type
+- **wasm**: implement random_get in the browser host
+- **stdlib**: uuid.v4 draws from SecureRandom; Random is seeded from the OS; cycle members typed against the whole cycle
+- **typer**: a constructor holds a local like a record literal in the escape walk
+- **typer**: expand effect aliases in fn-typed rows, mint const Vec literals, keep locals held by a let-bound literal local
+
 ## v0.177.1 (2026-10-25)
 
 ### Fixed
