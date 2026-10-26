@@ -1832,12 +1832,12 @@ test-issue-1706-runner-mode-key: $(TARGET) build
 	emit --bench > build/nmod_1706_b.txt || { echo "issue-1706: bench EMIT FAIL"; cat build/nmod_1706.err; exit 1; }; \
 	sort build/nmod_1706_t.txt > build/nmod_1706_ts.txt; \
 	sort build/nmod_1706_b.txt > build/nmod_1706_bs.txt; \
-	shared=$$(comm -12 build/nmod_1706_ts.txt build/nmod_1706_bs.txt | wc -l | tr -d ' '); \
 	tonly=$$(comm -23 build/nmod_1706_ts.txt build/nmod_1706_bs.txt | wc -l | tr -d ' '); \
 	[ "$$tonly" -ge 1 ] \
 	  || { echo "issue-1706: test and bench modes produced identical object sets (key ignores the mode)"; exit 1; }; \
-	[ "$$shared" -ge 1 ] \
-	  || { echo "issue-1706: no object shared across modes — the mode leaked into leaf keys, so alternating test/bench re-emits the whole stdlib"; exit 1; }; \
+	nt=$$(wc -l < build/nmod_1706_ts.txt | tr -d ' '); nb=$$(wc -l < build/nmod_1706_bs.txt | tr -d ' '); \
+	[ "$$nt" -eq "$$nb" ] && [ "$$nt" -le 2 ] \
+	  || { echo "issue-1706: a mode emits more than the user partition ($$nt test, $$nb bench objects): the core is compiled per mode"; exit 1; }; \
 	link build/nmod_1706_t.txt build/nmod_1706_t; \
 	link build/nmod_1706_b.txt build/nmod_1706_b; \
 	./build/nmod_1706_t > build/nmod_1706_t.out 2>&1 || true; \
@@ -1848,7 +1848,7 @@ test-issue-1706-runner-mode-key: $(TARGET) build
 	  || { echo "issue-1706: --bench binary ran the wrong runner"; cat build/nmod_1706_b.out; exit 1; }; \
 	grep -q 'tests passed' build/nmod_1706_b.out \
 	  && { echo "issue-1706: --bench binary reported test results"; cat build/nmod_1706_b.out; exit 1; } || true; \
-	echo "issue-1706-runner-mode-key OK: test/bench roots keyed apart ($$tonly mode-specific, $$shared shared), each runs its own runner"
+	echo "issue-1706-runner-mode-key OK: test/bench roots keyed apart ($$tonly mode-specific), each runs its own runner"
 
 # Cross-module derived Show reached through a list monomorphisation: the
 # `__pimpl_Show_Mov_show` the derive synthesises has no home TU, while the
@@ -5972,7 +5972,7 @@ test-demos-core: $(TARGET) build
 	  in=../examples/$$name/$$name.in; \
 	  if [ ! -f $$src ]; then echo "demos-core FAIL $$name (missing $$src)"; exit 1; fi; \
 	  if [ ! -f $$exp ]; then echo "demos-core FAIL $$name (missing $$exp)"; exit 1; fi; \
-	  preludes=""; \
+	  preludes="--path ../stdlib"; \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$preludes $$src > build/demo-$$name.c \
 	    || { echo "demos-core FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/demo-$$name.c -o build/demo-$$name $(LDLIBS_M) \
@@ -5995,7 +5995,7 @@ test-demos-core: $(TARGET) build
 # demo under examples/aspirational/ exercises a feature combination
 # the milestone did not anticipate; failures here mean the close
 # criterion is not met.
-ASPIRATIONAL_DEMOS := event_logger audit_handler pipeline_reorder_smoke
+ASPIRATIONAL_DEMOS := event_logger audit_handler pipeline_reorder_smoke calculator issue_312_real_division
 
 test-aspirational: $(TARGET) build
 	@set -e; \
@@ -6004,7 +6004,7 @@ test-aspirational: $(TARGET) build
 	  exp=../examples/aspirational/$$name/$$name.out.expected; \
 	  if [ ! -f $$src ]; then echo "aspirational FAIL $$name (missing $$src)"; exit 1; fi; \
 	  if [ ! -f $$exp ]; then echo "aspirational FAIL $$name (missing $$exp)"; exit 1; fi; \
-	  preludes=""; \
+	  preludes="--path ../stdlib"; \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$preludes $$src > build/asp-$$name.c \
 	    || { echo "aspirational FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/asp-$$name.c -o build/asp-$$name $(LDLIBS_M) \
@@ -12285,15 +12285,17 @@ define test_coverage_run
 	rc=0; ./bin/kai test --backend=$(1) --coverage $$f > /dev/null 2> $$out.nojson.err || rc=$$?; \
 	[ "$$rc" -eq 2 ] && grep -q -- '--coverage needs --json' $$out.nojson.err \
 	  || { echo "test-coverage FAIL ($(1): --coverage without --json was not refused)"; cat $$out.nojson.err; exit 1; }; \
-	p=examples/test-runner/coverage_prune; pout=stage2/build/test-coverage-prune-$(1).json; \
-	./bin/kai test --backend=$(1) --json $$p > /dev/null 2>&1 || true; \
-	for pass in cold warm; do \
-	  ./bin/kai test --backend=$(1) --json --coverage $$p 2> $$pout.err | sed 's/"duration_ms":[0-9]*/"duration_ms":N/g' > $$pout \
-	    || { echo "test-coverage FAIL ($(1): prune run failed)"; cat $$pout.err; exit 1; }; \
-	  diff -q $$p.json.expected $$pout > /dev/null \
-	    || { echo "test-coverage DIFF ($(1): prune, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
+	for name in coverage_prune coverage_const; do \
+	  p=examples/test-runner/$$name; pout=stage2/build/test-$$name-$(1).json; \
+	  ./bin/kai test --backend=$(1) --json $$p > /dev/null 2>&1 || true; \
+	  for pass in cold warm; do \
+	    ./bin/kai test --backend=$(1) --json --coverage $$p 2> $$pout.err | sed 's/"duration_ms":[0-9]*/"duration_ms":N/g' > $$pout \
+	      || { echo "test-coverage FAIL ($(1): $$name run failed)"; cat $$pout.err; exit 1; }; \
+	    diff -q $$p.json.expected $$pout > /dev/null \
+	      || { echo "test-coverage DIFF ($(1): $$name, $$pass)"; diff $$p.json.expected $$pout; exit 1; }; \
+	  done; \
 	done; \
-	echo "test-coverage OK ($(1): per-block lines + --only + pruned library)"
+	echo "test-coverage OK ($(1): per-block lines + --only + pruned library + const)"
 endef
 
 test-coverage-report: $(TARGET) build
@@ -14085,6 +14087,10 @@ $(foreach slug,$(FIXTURE_NATIVE_SLUGS),$(eval $(call fixture_native_unit_rule,$(
 test-progen-smoke: $(TARGET) bin-kai
 	@sh ../tools/progen-smoke.sh
 
+# Closure-capture shapes: native output equals the C oracle on every point of the product.
+test-closure-shape-matrix: $(TARGET) bin-kai
+	@bash ../tools/closure-shape-gen.sh
+
 # Every call in tail position inside a recursive group is a jump on both
 # backends: one generated program, one shape per run, on a 64 KB fiber.
 test-tail-call-matrix: $(TARGET) bin-kai
@@ -14221,6 +14227,30 @@ test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono 
 # and #567 only surfaced because ahu tried to integrate.
 test-packages: $(TARGET) bin-kai
 	@../tools/test-packages.sh
+
+# Two cold `--release` builds of one program leave identical caches.
+test-release-determinism: $(TARGET) bin-kai build
+	@../tools/test-release-determinism.sh ../bin/kai
+
+test-unstable-warnings: $(TARGET) bin-kai
+	@../tools/test-unstable-warnings.sh
+
+test-ffi-v2-fixed-width: $(TARGET) bin-kai
+	@set -e; \
+	d=build/v2_fixed; rm -rf $$d; mkdir -p $$d; \
+	cp ../examples/ffi/v2_fixed_width.kai ../examples/ffi/v2_fixed_shim.c $$d/; \
+	(cd $$d && CFLAGS=v2_fixed_shim.c ../../../bin/kai build --backend=c v2_fixed_width.kai -o v2_fixed) > $$d/build.log 2>&1 \
+	  || { echo "ffi-v2-fixed-width BUILD FAIL"; cat $$d/build.log; exit 1; }; \
+	./$$d/v2_fixed > $$d/out; \
+	diff -q ../examples/ffi/v2_fixed_width.out.expected $$d/out > /dev/null \
+	  && echo "ffi-v2-fixed-width OK" \
+	  || { echo "ffi-v2-fixed-width DIFF"; diff ../examples/ffi/v2_fixed_width.out.expected $$d/out; exit 1; }
+
+test-ffi-header: $(TARGET) bin-kai
+	@../tests/ffi_header.sh
+
+test-prune-differential: $(TARGET) bin-kai
+	@../tools/prune-differential.sh --backend c combos-subset
 
 # Issue #455 Phase B — user-file incremental cache invalidation gate.
 # Runs the negative fixtures (edit source / edit import / edit

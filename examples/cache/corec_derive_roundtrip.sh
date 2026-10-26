@@ -16,8 +16,8 @@ n=0
 for f in "$ROOT"/examples/sugars/*.out.expected \
          "$ROOT"/examples/effects/*.out.expected \
          "$ROOT"/examples/protocols/*.out.expected \
-         "$ROOT"/stage2/compiler/infer.kai \
-         "$ROOT"/stage2/compiler/parser.kai \
+         "$ROOT"/stage2/compiler/infer_instantiate.kai \
+         "$ROOT"/stage2/compiler/parse_decls.kai \
          "$ROOT"/stdlib/protocols.kai; do
   src="${f%.out.expected}"
   case "$src" in *.kai) ;; *) src="$src.kai" ;; esac

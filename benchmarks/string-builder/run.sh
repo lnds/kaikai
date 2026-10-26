@@ -16,20 +16,20 @@ gen() { # N kind file
 import string_builder
 import loop
 fn main() : Unit / Console = {
-  var sb = string_builder.new()
-  var i = 0
-  while { @i < $n } { sb := string_builder.append(@sb, "frag"); i := @i + 1 }
-  print("len=#{int_to_string(string.length(string_builder.build(@sb)))}")
+  var sb := string_builder.new()
+  var i := 0
+  while { i < $n } { sb := string_builder.append(sb, "frag"); i := i + 1 }
+  print("len=#{int_to_string(string.length(string_builder.build(sb)))}")
 }
 EOF
   else
     cat > "$f" <<EOF
 import loop
 fn main() : Unit / Console = {
-  var acc = ""
-  var i = 0
-  while { @i < $n } { acc := @acc ++ "frag"; i := @i + 1 }
-  print("len=#{int_to_string(string.length(@acc))}")
+  var acc := ""
+  var i := 0
+  while { i < $n } { acc := acc ++ "frag"; i := i + 1 }
+  print("len=#{int_to_string(string.length(acc))}")
 }
 EOF
   fi
@@ -39,8 +39,8 @@ time_bin() { { /usr/bin/time -p bash -c "KAI_MAX_HEAP=4g $1 >/dev/null 2>&1"; } 
 
 printf "%-8s %-12s %-14s %-8s\n" "N" "naive(++)" "StringBuilder" "speedup"
 for n in 20000 40000 80000; do
-  gen "$n" naive "$tmp/n.kai"; "$kai" build "$tmp/n.kai" -o "$tmp/bn" >/dev/null 2>&1
-  gen "$n" sb    "$tmp/s.kai"; "$kai" build "$tmp/s.kai" -o "$tmp/bs" >/dev/null 2>&1
+  gen "$n" naive "$tmp/n.kai"; "$kai" build "$tmp/n.kai" -o "$tmp/bn" >/dev/null
+  gen "$n" sb    "$tmp/s.kai"; "$kai" build "$tmp/s.kai" -o "$tmp/bs" >/dev/null
   tn=$(time_bin "$tmp/bn"); ts=$(time_bin "$tmp/bs")
   sp=$(awk "BEGIN{ if ($ts>0) printf \"%.1fx\", $tn/$ts; else print \"-\" }")
   printf "%-8s %-12s %-14s %-8s\n" "$n" "${tn}s" "${ts}s" "$sp"

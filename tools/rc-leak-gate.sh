@@ -61,7 +61,7 @@ export KAI="$ROOT/bin/kai"
 export WORK="$ROOT/stage2/build/rc-leak-gate"
 export BASELINE="$ROOT/tools/baselines/rc-leak"
 export LIN_BASELINE="$ROOT/tools/baselines/kir-lin"
-SKIPS="$ROOT/tools/rc-leak-skips.txt"
+export SKIPS="$ROOT/tools/rc-leak-skips.txt"
 export BACKEND="${KAI_LEAK_BACKEND:-c}"
 export RUN_TIMEOUT="${KAI_LEAK_TIMEOUT:-120}"
 CORPORA="perceus effects"
@@ -235,6 +235,12 @@ measure_one() {
   fi
   local once twice growth=-
   once="$(ledger_run "$bin" 1)"
+  local golden="$ROOT/examples/$1.out.expected"
+  if [ -f "$golden" ] && ! grep -q '^# fixture: test' "$ROOT/examples/$1.kai" \
+     && ! grep -qE "^$name:stdout:" "$SKIPS" 2>/dev/null \
+     && [ "$(cat "$bin.out")" != "$(cat "$golden")" ]; then
+    cp "$bin.out" "$bin.stdout-mismatch"
+  fi
   # `leaked` goes negative when a run frees cells allocated before tracing.
   case "$once" in
     ''|*[!0-9-]*) ;;
@@ -284,6 +290,11 @@ while IFS= read -r id; do
   measured="$(cut -d: -f1 "$WORK/$corpus-$name.measured" 2>/dev/null)"
   growth="$(cut -d: -f2 "$WORK/$corpus-$name.measured" 2>/dev/null)"
   [ "$measured" = - ] && continue
+  if [ -f "$WORK/$corpus-$name.stdout-mismatch" ]; then
+    echo "FAIL $id — stdout differs from $name.out.expected"
+    diff "$ROOT/examples/$id.out.expected" "$WORK/$corpus-$name.stdout-mismatch" | head -6 | sed 's/^/    /'
+    fail=1
+  fi
   if exact_pinned "$corpus"; then
     expect="$(pinned "$name")"
     if [ -z "$expect" ]; then

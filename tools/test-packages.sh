@@ -146,12 +146,34 @@ run_parity() {
 }
 
 # Driver-level: hand off to a fixture-owned check.sh.
+# Known failures: tools/test-packages-xfail.txt lists `<backend> <case> <issue>`.
+# A listed case on the backend this run uses reports XFAIL while it fails and
+# fails the gate as XPASS once it passes, so the entry leaves with the fix.
+if "$ROOT/tools/kaic2-native-capable.sh" "$ROOT/stage2/kaic2" >/dev/null 2>&1; then
+  RUN_BACKEND=native
+else
+  RUN_BACKEND=c
+fi
+xfail_issue() {
+  awk -v b="$RUN_BACKEND" -v c="$1" '$1 !~ /^#/ && $1 == b && $2 == c { print $3; found = 1 } END { exit !found }' \
+    "$ROOT/tools/test-packages-xfail.txt"
+}
+
 run_check_script() {
   name="$1"; rel="$2"
   abs="$PKG_DIR/$rel"
   [ -x "$abs" ] || { skip "$name" "no check.sh"; return; }
+  issue=$(xfail_issue "$name") || issue=""
   if "$abs" >/dev/null 2>&1; then
-    ok "$name"
+    if [ -n "$issue" ]; then
+      err "$name"
+      printf '    XPASS: passes on %s; drop it from tools/test-packages-xfail.txt (%s)\n' "$RUN_BACKEND" "$issue" >&2
+    else
+      ok "$name"
+    fi
+  elif [ -n "$issue" ]; then
+    printf '  xfail %s (%s, %s)\n' "$name" "$RUN_BACKEND" "$issue"
+    SKIP=$((SKIP + 1))
   else
     err "$name"
     "$abs" 2>&1 | sed 's/^/    /' >&2 || true

@@ -18,20 +18,20 @@ set cpo&vim
 syn case match
 
 " --------------------------------------------------------------------
-" Comments  ('#' to end of line; '#derive' is a token, kept distinct)
+" Comments  ('#' to end of line; '#[' opens an attribute, kept distinct)
 " --------------------------------------------------------------------
-syn match   kaikaiDerive    "#derive\>"
-syn match   kaikaiComment   "#\(derive\>\)\@!.*$" contains=kaikaiTodo
+syn match   kaikaiDerive    "#\[[^]]*\]"
+syn match   kaikaiComment   "#\(\[\)\@!.*$" contains=kaikaiTodo
 syn keyword kaikaiTodo      contained TODO FIXME XXX NOTE HACK
 
 " --------------------------------------------------------------------
-" Keywords (kept in sync with stage2/compiler.kai keyword_kind)
+" Keywords (the lexer's keyword set; `unit` is contextual)
 " --------------------------------------------------------------------
 syn keyword kaikaiKeyword
-      \ and as assert axiom const effect else ensures
-      \ false fn for handle if impl import let match
-      \ not or protocol pub requires test true type
-      \ unit use var where with
+      \ and as assert axiom bench case check const effect else ensures
+      \ extern false fn for handle if impl import lazy let match not or
+      \ priv protocol pub requires test theory true type unit use var
+      \ when where with
 
 syn keyword kaikaiBoolean   true false
 

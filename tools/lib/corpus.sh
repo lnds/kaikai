@@ -56,8 +56,8 @@ kai_corpus_entry_points() {
 #      intentionally backend-specific.
 #   3. A `# fixture: test` line: tools/rc-leak-gate.sh measures it through `kai test`.
 #   4. A sibling `.err.expected` / `.diag.expected` declares the fixture
-#      rejected at compile time; tools/test-negative.sh owns it against its
-#      golden. A `.run.err.expected` fixture builds, so it stays: its panic
+#      rejected at compile time; the harness walking its directory (test-negative.sh,
+#      fixture-dir.sh, ...) owns it. A `.run.err.expected` fixture builds, so it stays: its panic
 #      text is pinned on C by the golden and on every other backend here.
 kai_corpus_is_skipped() {
   local fixture="$1" dir base

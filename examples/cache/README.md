@@ -86,12 +86,3 @@ C compiler's identity, shared test roots, dotted-import routing).
 
 `stress_nmodular_cold_pool.sh` builds cold native-modular projects under
 CPU load; it runs from `make stress-nmodular-pool`, not tier 1.
-
-## Header fixtures
-
-`magic_mismatch.sh`, `format_version_mismatch.sh`,
-`kaikai_version_hash_mismatch.sh` and `source_content_change.sh` plant a
-blob under `KAI_PRELUDE_CACHE_DIR`, a variable nothing reads, so they
-pass without exercising a cache; no target runs them. The header
-rejection they aimed at is covered by `corec_version_bump.sh`,
-`corec_format_version_bump.sh` and `corec_corrupt_blob.sh`.

@@ -47,7 +47,8 @@ say "building kaikai-c column (kaic2 -> C -> $CC -O2) ..."
 "$KAIC2" --path "$REPO_ROOT/stdlib" --path "$REPO_ROOT/examples/perceus" "$KAI_SRC" > "$WORK/rb_kaikai.c"
 # Override N in the emitted C (the .kai hardcodes 1,000,000).
 if [[ "$N" != "1000000" ]]; then
-  sed -i.bak "s/kair_n = 1000000LL/kair_n = ${N}LL/" "$WORK/rb_kaikai.c"
+  sed -i.bak -E "s/(kair_n_[0-9]+) = 1000000LL/\1 = ${N}LL/" "$WORK/rb_kaikai.c"
+  cmp -s "$WORK/rb_kaikai.c" "$WORK/rb_kaikai.c.bak" && { say "N override matched nothing in the emitted C"; exit 1; }
 fi
 "$CC" -O2 -I "$REPO_ROOT/stage2" -I "$REPO_ROOT/stage0" "$WORK/rb_kaikai.c" -o "$WORK/rb_kaikai" -lm
 
@@ -163,9 +164,8 @@ fi
 echo
 if [[ "$HAVE_NATIVE" == 1 ]]; then
 echo "Note: kaikai-c and kaikai-native share the front-end but NOT the code path."
-echo "On this bench native retires ~2.5x more instructions than the C backend (real"
-echo "codegen gap, tracked in the perf lanes — see README 'Wall-clock vs"
-echo "instruction count'), so its larger wall is expected, not measurement noise."
+echo "Compare instruction counts, not wall time, to judge the backend gap — see"
+echo "README 'Wall-clock vs instruction count'."
 echo
 fi
 echo "kaikai @ $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
