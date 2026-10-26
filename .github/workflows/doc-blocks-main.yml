@@ -1,0 +1,82 @@
+name: doc-blocks-main
+
+# Docs may be pushed straight to main, which skips the PR-side `doc-blocks`
+# job in tier1.yml. This runs the same gate after such a push; a failure
+# opens (or comments on) a `doc-blocks-failure` issue.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: doc-blocks-main
+  cancel-in-progress: false
+
+jobs:
+  doc-blocks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: ./tools/ci-install-toolchain.sh
+      # Same key as tier1.yml's `build` job: a doc push changes none of the
+      # hashed sources, so main's last green build is restored as is.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Resolve the release boot
+        id: boot
+        run: |
+          id="$(tools/kaic-boot.sh release-id)"
+          echo "id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+      - name: Restore bootstrap chain
+        id: bootstrap-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+          key: kaic2-c-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh') }}
+      - name: Mark cached chain fresh
+        if: steps.bootstrap-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Build kaic2 (cache miss)
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        env:
+          KAIC_BOOT_MODULAR: 1
+        run: make CC=clang kaic2
+      - name: Doc blocks
+        run: make CC=clang test-doc-blocks
+      - name: File the failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh label create doc-blocks-failure --color B60205 \
+            --description "A doc pushed to main has a kaikai block that fails the doc-blocks gate" 2>/dev/null || true
+          open=$(gh issue list --label doc-blocks-failure --state open --limit 1 --json number --jq '.[0].number // empty') || open=
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again on commit \`${{ github.sha }}\`: ${run_url}"
+          else
+            gh issue create --label doc-blocks-failure \
+              --title "doc-blocks failed on main after a doc push" \
+              --body "Commit \`${{ github.sha }}\` changed Markdown on main and \`make test-doc-blocks\` failed: ${run_url}. Fix the block or its fence tag (see tools/test-doc-blocks.sh)."
+          fi
