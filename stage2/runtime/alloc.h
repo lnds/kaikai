@@ -111,8 +111,13 @@ typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
 typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined below */
 typedef struct KaiFiberExit KaiFiberExit;
 
+/* Fiber-local builtin effects, each with one slot per context holding its
+ * innermost installed node. */
+#define KAI_FL_COUNT 5
+
 struct KaiFiber {
     KaiEvidence    *evidence_top;
+    KaiEvidence    *fl_top[KAI_FL_COUNT];
     /* M:N — the ONE per-fiber field that goes atomic. A cross-thread
      * Spawn.cancel writes it (relaxed) while the target reads it at its
      * own yield points (acquire); making it _Atomic keeps that the sole
@@ -366,6 +371,7 @@ struct KaiFiber {
  * interleave with the segment's. */
 typedef struct {
     KaiEvidence    *evidence_top;
+    KaiEvidence    *fl_top[KAI_FL_COUNT];
     KaiEvidence    *in_dispatch_node;
     KaiUnwEntry    *unw_buf;
     uint32_t        unw_top;

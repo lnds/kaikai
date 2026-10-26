@@ -253,7 +253,11 @@ struct KaiEvidence {
      * capture and the pin makes that a no-op. */
     int32_t      rc;
     uint8_t      tag;
+    /* Slot of the fiber-local builtin this node handles, or -1. */
+    int8_t       fl;
     KaiEvidence *parent;
+    /* The slot's previous holder: the next-outer node of the same builtin. */
+    KaiEvidence *fl_prev;
     const char  *eff_label;     /* canonical effect name (literal or interned). */
     void        *handler;       /* *Ev<Eff> struct; opaque to the runtime. */
     /* m7a #6e: handle's setjmp target + slot to deposit the discarded
@@ -350,14 +354,19 @@ KAI_RT_SHARED void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
  * Restoring `evidence_top` to `node->parent` is load-bearing: a cleanup
  * that performs an effect must dispatch against the handlers live when
  * the node was pushed, otherwise it walks a chain of dead frames. */
+static inline void kai_fl_pop(KaiFiber *f, KaiEvidence *node);
+
 static void kai_evidence_run_cleanup(KaiEvidence *node) {
     if (node == NULL || node->cleanup == NULL || node->cleanup_done) return;
     node->cleanup_done = 1;
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *saved = f->evidence_top;
+    KaiEvidence *saved_fl = node->fl >= 0 ? f->fl_top[node->fl] : NULL;
     f->evidence_top = node->parent;
+    kai_fl_pop(f, node);
     KaiValue *r = node->cleanup(node->cleanup_env);
     f->evidence_top = saved;
+    if (node->fl >= 0) f->fl_top[node->fl] = saved_fl;
     if (r != NULL) kai_decref(r);
 }
 
@@ -374,8 +383,11 @@ static uint8_t kai_disp_hops(KaiFiber *f);
 typedef struct KaiEffLabel {
     const char          *base;
     struct KaiEffLabel  *next;
+    int                  fl;     /* fiber-local slot of the effect, or -1 */
     char                 text[];
 } KaiEffLabel;
+
+static const char *const kai_fl_names[KAI_FL_COUNT] = { "Cancel", "Link", "Monitor", "Spawn", "Actor" };
 
 #define KAI_EFF_BUCKETS 1024
 
@@ -411,6 +423,9 @@ static const char *kai_eff_intern_locked(const char *text, size_t len) {
     e->text[len] = '\0';
     size_t n = strcspn(e->text, "[");
     e->base = n == len ? e->text : kai_eff_intern_locked(text, n);
+    e->fl = -1;
+    for (int i = 0; i < KAI_FL_COUNT; i++)
+        if (strcmp(e->base, kai_fl_names[i]) == 0) e->fl = i;
     e->next = *bucket;
     *bucket = e;
     return e->text;
@@ -435,10 +450,29 @@ static inline const char *kai_eff_cached(const char **slot, const char *text) {
 
 #define KAI_EFF(lit) ({ static const char *_kai_efl; kai_eff_cached(&_kai_efl, lit); })
 
+static inline int kai_eff_fl(const char *label) {
+    return ((const KaiEffLabel *) (label - offsetof(KaiEffLabel, text)))->fl;
+}
+
 static inline int kai_eff_match(const char *a, const char *b) {
     if (a == b) return 1;
     const char *ba = kai_eff_base(a), *bb = kai_eff_base(b);
     return ba == bb && (a == ba || b == bb);
+}
+
+/* A fiber-local builtin's node is linked into its slot on push and unlinked
+ * on every exit from the chain; any other node takes no slot. */
+static inline void kai_fl_push(KaiFiber *f, KaiEvidence *node) {
+    int i = kai_eff_fl(node->eff_label);
+    node->fl = (int8_t) i;
+    if (i >= 0) {
+        node->fl_prev = f->fl_top[i];
+        f->fl_top[i] = node;
+    }
+}
+
+static inline void kai_fl_pop(KaiFiber *f, KaiEvidence *node) {
+    if (node->fl >= 0) f->fl_top[node->fl] = node->fl_prev;
 }
 
 /* Push an Evidence node onto the current fiber's stack. The caller
@@ -460,6 +494,7 @@ static void kai_evidence_push_l(KaiEvidence *node, const char *eff_label, void *
     node->rc           = INT32_MAX;
     node->tag          = KAI_UNIT;
     f->evidence_top    = node;
+    kai_fl_push(f, node);
 }
 /* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
  * evidence stack: the call site addresses this node directly through the frame,
@@ -475,6 +510,7 @@ static void kai_evidence_init_default_l(KaiEvidence *node, const char *eff_label
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
     node->disp_hops    = 0;
+    node->fl           = -1;
     node->unw_mark     = 0;
     node->rc           = INT32_MAX;
     node->tag          = KAI_UNIT;
@@ -502,6 +538,7 @@ static void kai_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_labe
     node->rc           = INT32_MAX;
     node->tag          = KAI_UNIT;
     f->evidence_top    = node;
+    kai_fl_push(f, node);
 }
 
 /* Arm a pushed node's `finally`. Separate from the push so the common
@@ -521,6 +558,7 @@ static void kai_evidence_set_cleanup(KaiEvidence *node, KaiValue *(*fn)(void *),
 static void kai_evidence_pop(void) {
     KaiFiber *f = kai_current_fiber();
     if (f->evidence_top != NULL) {
+        kai_fl_pop(f, f->evidence_top);
         f->evidence_top = f->evidence_top->parent;
     }
 }
@@ -593,6 +631,20 @@ static KaiEvidence *kai_ev_find(KaiEvidence *n, KaiEvidence *stop, const char *e
             continue;
         }
         if (cur != NULL && kai_disp_at_push(n) != cur) continue;
+        if (kai_eff_match(n->eff_label, eff_label)) return n;
+    }
+    return NULL;
+}
+
+/* `kai_ev_find` over the fiber's whole chain. A fiber-local builtin outside
+ * any clause dispatch resolves through its slot's chain of same-effect nodes,
+ * whatever the handler depth; a segment or a clause in dispatch needs the
+ * masks `kai_ev_find` applies. */
+static KaiEvidence *kai_ev_find_fiber(KaiFiber *f, const char *eff_label) {
+    int i = kai_eff_fl(eff_label);
+    if (i < 0 || f->seg != NULL || f->in_dispatch_node != NULL)
+        return kai_ev_find(f->evidence_top, NULL, eff_label, f->in_dispatch_node);
+    for (KaiEvidence *n = f->fl_top[i]; n != NULL; n = n->fl_prev) {
         if (kai_eff_match(n->eff_label, eff_label)) return n;
     }
     return NULL;
@@ -818,6 +870,7 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
         kai_evidence_run_cleanup(n);
         /* `node`'s own frames survive: its landing pad applies them. */
         if (n != node) kai_resume_frames_drop(f, n);
+        kai_fl_pop(f, n);
     }
     f->evidence_top = stop;
     f->in_dispatch_node = kai_disp_at_push(node);
@@ -833,6 +886,7 @@ KAI_RT_SHARED void kai_evidence_unwind_all(void) {
         kai_unw_release_to(f, n->unw_mark);
         kai_evidence_run_cleanup(n);
         kai_resume_frames_drop(f, n);
+        kai_fl_pop(f, n);
     }
     kai_unw_release_to(f, 0);
     f->evidence_top = stop;
