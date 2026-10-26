@@ -179,7 +179,7 @@ echo "test-check-parity summary: $pass PASS, $skip SKIP, $diffs DIFF, $stale STA
 
 dj=0
 grep '^DJ ' "$results" | cut -d' ' -f2- > "$tmp/dj-manifest"
-python3 "$ROOT/tools/diags-json-parity.py" "$tmp/dj-manifest" "$ROOT/tools/diags-json-parity-baseline.txt" || dj=1
+python3 "$ROOT/tools/diags-json-parity.py" "$tmp/dj-manifest" "$ROOT/tools/baselines/diags-json-parity" || dj=1
 
 if [ "$diffs" -ne 0 ] || [ "$stale" -ne 0 ] || [ "$dj" -ne 0 ] || [ "$rejects" -ne 0 ]; then
   exit 1

@@ -7,7 +7,7 @@
 # functional test under one thread and corrupts silently under load —
 # stdout-diff cannot see it. This gate makes the partition TOTAL BY
 # CONSTRUCTION: every mutable global in the runtimes must appear in the
-# allow-list `tools/runtime-globals.allow` annotated with its class, and
+# allow-list `tools/baselines/runtime-globals/` annotated with its class, and
 # every allow-list entry must still exist in the source. A new
 # unclassified global fails the build; a removed one flags a stale entry.
 #
@@ -28,7 +28,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-ALLOW="$ROOT/tools/runtime-globals.allow"
+ALLOW="$ROOT/tools/baselines/runtime-globals"
 
 # The runtimes carrying mutable state. stage2/runtime.h is the C-backend
 # runtime AND the one stage0/runtime_llvm.c #includes, so a TLS decision
@@ -45,7 +45,7 @@ FILES=(
 # via `set --`, so read the flag before it is clobbered.
 MODE="${1:-}"
 
-if [ ! -f "$ALLOW" ]; then
+if [ ! -d "$ALLOW" ]; then
   echo "runtime-global-audit: missing allow-list $ALLOW" >&2
   exit 2
 fi
@@ -104,8 +104,7 @@ trap 'rm -rf "$WORK"' EXIT
 ALLOWED_SYMS="$WORK/allowed"
 SEEN_SYMS="$WORK/seen"
 
-# The allow-list is `<symbol> <class>` lines; `#` comments and blank lines
-# are ignored. Build the set of allowed symbols and validate the class.
+# The allow-list is one `<symbol> <class>` file per symbol. Build the set of allowed symbols and validate the class.
 VALID_CLASSES="tls immutable immortal shared-locked reactor-owned scratch"
 bad_class=0
 : > "$ALLOWED_SYMS"
@@ -124,7 +123,7 @@ while IFS= read -r line; do
     *" $cls "*) echo "$sym" >> "$ALLOWED_SYMS" ;;
     *) echo "runtime-global-audit: unknown class '$cls' for '$sym'" >&2; bad_class=1 ;;
   esac
-done < "$ALLOW"
+done < <(python3 -I "$ROOT/tools/lib/entries.py" cat "$ALLOW" 1 | tr '\t' ' ')
 sort -u -o "$ALLOWED_SYMS" "$ALLOWED_SYMS"
 
 # Enumerate every global across the runtimes (deduped across files: the
@@ -140,7 +139,7 @@ unclassified=0
 while IFS= read -r sym; do
   [ -z "$sym" ] && continue
   echo "runtime-global-audit: UNCLASSIFIED mutable global '$sym'" >&2
-  echo "  → add it to tools/runtime-globals.allow with one of: $VALID_CLASSES" >&2
+  echo "  → tools/lib/entries.py put tools/baselines/runtime-globals 1 <symbol> <class>   (class: $VALID_CLASSES)" >&2
   unclassified=$((unclassified + 1))
 done < <(comm -23 "$SEEN_SYMS" "$ALLOWED_SYMS")
 

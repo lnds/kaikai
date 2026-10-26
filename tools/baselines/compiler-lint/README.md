@@ -1,0 +1,1 @@
+Findings of `kai lint` over the compiler (`tools/compiler-lint-ratchet.sh`). Key `<file> <rule> <hash of message and flagged source line>`, value the number of findings sharing it. `--update` rewrites the entries after a fix.

@@ -13,9 +13,9 @@
 # Pattern recognizers (does this node have shape X?) legitimately match
 # many constructors and answer "no" for the rest, and no syntactic rule
 # tells them apart from walkers. So this is a ratchet: every existing site
-# is pinned in the baseline, one `<file> <fn>` per line. A site not listed
-# fails; a listed site that no longer matches fails too (shrink the
-# baseline in that commit).
+# is pinned in tools/baselines/walker-catchall, one file per `<file> <fn>`
+# holding its reason. A site not listed fails; a listed site that no longer
+# matches fails too (delete its file in that commit).
 #
 # `--self-test` injects each violation into a scratch copy and asserts the
 # audit rejects it.
@@ -73,10 +73,12 @@ observed_type() {
 }
 
 audit() {
-  local root="$1" baseline="$1/tools/walker-catchall-baseline.txt" tmp new gone
+  local root="$1" tmp new gone
   tmp=$(mktemp -d)
   observed "$root" > "$tmp/obs" || { rm -rf "$tmp"; echo "walker-catchall-audit FAIL — scan errored"; return 1; }
-  grep -v '^#' "$baseline" | sed 's/[[:space:]]*#.*$//' | grep -v '^$' | sort -u > "$tmp/pinned"
+  python3 -I "$root/tools/lib/entries.py" cat "$root/tools/baselines/walker-catchall" 2 > "$tmp/rows" \
+    || { rm -rf "$tmp"; echo "walker-catchall-audit FAIL — baseline entries malformed"; return 1; }
+  cut -f1,2 "$tmp/rows" | tr '\t' ' ' | sort -u > "$tmp/pinned"
   new=$(comm -13 "$tmp/pinned" "$tmp/obs") && gone=$(comm -23 "$tmp/pinned" "$tmp/obs") \
     || { rm -rf "$tmp"; echo "walker-catchall-audit FAIL — comm errored"; return 1; }
   rm -rf "$tmp"
@@ -86,12 +88,12 @@ audit() {
     echo "$new" | sed 's/^/  /'
     echo "A walker goes through xp_positions (expr_positions.kai) or the decl_map.kai mappers"
     echo "and keeps explicit arms only for the variants it treats specially. If this is a pattern recognizer"
-    echo "that answers \"no\" for every other shape, add it to tools/walker-catchall-baseline.txt"
-    echo "with a one-line reason: \`<file> <fn>  # <reason>\`."
+    echo "that answers \"no\" for every other shape, add it with"
+    echo "a one-line reason: tools/lib/entries.py put tools/baselines/walker-catchall 2 <file> <fn> \"<reason>\"."
     status=1
   fi
   if [ -n "$gone" ]; then
-    echo "walker-catchall-audit FAIL — stale baseline entry(ies), shrink tools/walker-catchall-baseline.txt:"
+    echo "walker-catchall-audit FAIL — stale baseline entry(ies), delete its file in tools/baselines/walker-catchall:"
     echo "$gone" | sed 's/^/  /'
     status=1
   fi
@@ -101,8 +103,9 @@ audit() {
 self_test() {
   local tmp rc1 rc2 rc3
   tmp=$(mktemp -d)
-  mkdir -p "$tmp/tools" "$tmp/stage2/compiler"
-  cp tools/walker-catchall-baseline.txt "$tmp/tools/"
+  mkdir -p "$tmp/tools/baselines" "$tmp/stage2/compiler"
+  cp -R tools/baselines/walker-catchall "$tmp/tools/baselines/"
+  cp -R tools/lib "$tmp/tools/"
   cp stage2/compiler/*.kai "$tmp/stage2/compiler/"
   cat >> "$tmp/stage2/compiler/lint_redundant.kai" <<'EOF'
 
@@ -136,7 +139,7 @@ fn wca_decl_probe(d: Decl) : Int = match d {
 EOF
   audit "$tmp" > /dev/null; rc3=$?
   cp stage2/compiler/lint_redundant.kai "$tmp/stage2/compiler/"
-  echo "lint_redundant.kai wca_gone  # pre-existing, unaudited" >> "$tmp/tools/walker-catchall-baseline.txt"
+  python3 -I "$tmp/tools/lib/entries.py" put "$tmp/tools/baselines/walker-catchall" 2 lint_redundant.kai wca_gone "probe"
   audit "$tmp" > /dev/null; rc2=$?
   rm -rf "$tmp"
   if [ $rc1 -eq 0 ] || [ $rc2 -eq 0 ] || [ $rc3 -eq 0 ]; then
@@ -148,4 +151,4 @@ EOF
 if [ "${1:-}" = --self-test ]; then self_test || exit 1; fi
 if [ "${1:-}" = --list ]; then observed "$(pwd)"; exit 0; fi
 audit "$(pwd)" || exit 1
-echo "walker-catchall-audit OK ($(grep -v '^#' tools/walker-catchall-baseline.txt | grep -vc '^$') pinned sites)"
+echo "walker-catchall-audit OK ($(ls tools/baselines/walker-catchall | grep -vc '^README.md$') pinned sites)"

@@ -5,14 +5,15 @@
 
 After the resolver a declaration, a type, an effect, a constructor or a local is its id. Text
 survives where a name is resolved, shown or spelled into output, and nowhere else. Four facts about
-the sources hold that, each against a ledger beside this file (tab-separated, `#` starts a comment):
+the sources hold that, each against a ledger: a directory of one-row files under tools/baselines/ (see its README), or for
+the two small ones a tab-separated file beside this one:
 
-  1. dual-slots.txt       file  type  why
+  1. symid-dual-slots/    file  type  why
      No type definition holds text beside the id of the same thing. A type with a text slot
      (`String`, `Written`) beside an id slot (`SymId`, `FnId`, `LocalId`, `DeclRef`, `Binder`) is
      listed with what the text is instead: an op label, emitted text, a module origin.
 
-  2. written-readers.txt  file  fn  reads
+  2. symid-written-readers/  file  fn  reads
      `written_text` is the one way characters leave a `Written`. Every function calling it is
      listed with how many calls it makes for which reason, `R=2 D=1`:
        R  resolution: a pass before the resolver, the resolver's own tables, or the typer settling
@@ -21,11 +22,11 @@ the sources hold that, each against a ledger beside this file (tab-separated, `#
        E  an emitter or generator spelling a symbol, a label, a key
        L  an operation or field label looked up inside a declaration known by its id
 
-  3. allow.tsv            file  fn  test  literal  n  cat  why
+  3. symid-allow/         file  fn  test  literal  n  cat  why
      Every string literal that name text is tested against (extract.py finds them), with the
      reason letter above and one line of why.
 
-  4. written-mints.txt    file  fn  why
+  4. symid-written-mints/ file  fn  why
      A reference by text (`EName`, `EModCall`, `mk_name`) is built only where no id exists yet:
      before the resolver, or over source text re-parsed later. `*` as the fn lists a whole file.
 
@@ -33,8 +34,8 @@ pending-written.txt (file  fn  what  why) holds what still breaks the rule: a `r
 decides something after the resolver, a `mint` of a written reference there, or a literal test
 (`== main`). One row per site. Such a site is in no other ledger; the gate counts the rows.
 
-A site the ledgers do not cover fails. With --final a pending row fails too, and so does a ledger
-row that covers nothing: the ledgers then describe the sources exactly.
+A site the ledgers do not cover fails, and so does a ledger row that covers nothing or more than the
+sources hold: the ledgers describe the sources exactly. With --final a pending row fails too.
 """
 import collections, os, re, sys
 
@@ -42,6 +43,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True      # a gate leaves the tree as it found it
 import extract, sources
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import entries
 
 SRC = sys.argv[1]
 FINAL = "--final" in sys.argv[2:]
@@ -56,8 +59,18 @@ MINT = re.compile(r"(?<!fn )\b(EName|EModCall|mk_name)\(")
 fails, stale = [], []
 
 
+BASELINES = os.path.join(HERE, "..", "baselines")
+ENTRY_KEYS = {"symid-dual-slots": 2, "symid-written-readers": 2, "symid-allow": 4, "symid-written-mints": 2}
+
+
 def ledger(name):
-    """The rows of a ledger, split at tabs."""
+    """The rows of a ledger: one file per entry in tools/baselines/<name>, or a single tab-separated file here."""
+    if name in ENTRY_KEYS:
+        try:
+            return entries.load(os.path.join(BASELINES, name), ENTRY_KEYS[name])
+        except ValueError as e:
+            fails.append(str(e))
+            return []
     lines = open(os.path.join(HERE, name)).read().split("\n")
     return [l.split("\t") for l in lines if l.strip() and not l.startswith("#")]
 
@@ -100,7 +113,7 @@ def dual_types(text):
                 yield m.group(1)
                 break
 
-listed_dual = {(file, ty): 1 for file, ty, _why in ledger("dual-slots.txt")}
+listed_dual = {(file, ty): 1 for file, ty, _why in ledger("symid-dual-slots")}
 found_dual = {(fname, ty): 1 for fname, text in FILES for ty in dual_types(text)}
 settle("text beside an id slot", found_dual, listed_dual)
 
@@ -112,10 +125,10 @@ for fname, name, body in FUNCTIONS:
     if n: found_reads[(fname, name)] = n
 
 listed_reads, by_reason = collections.Counter(), collections.defaultdict(set)
-for file, fn, reads in ledger("written-readers.txt"):
+for file, fn, reads in ledger("symid-written-readers"):
     for item in reads.split():
         reason, n = item.split("=")
-        if reason not in REASONS: fails.append("written-readers.txt: no reason `%s` (%s %s)" % (reason, file, fn))
+        if reason not in REASONS: fails.append("symid-written-readers: no reason `%s` (%s %s)" % (reason, file, fn))
         listed_reads[(file, fn)] += int(n)
         by_reason[reason].add(file)
 for (file, fn, what), n in pending.items():
@@ -129,8 +142,8 @@ for file, _line, fn, test, lit in extract.literal_tests(SRC):
     found_tests[(file, fn, test, lit)] += 1
 
 listed_tests = collections.Counter()
-for file, fn, test, lit, n, reason, _why in ledger("allow.tsv"):
-    if reason not in REASONS: fails.append("allow.tsv: no reason `%s` (%s %s)" % (reason, file, fn))
+for file, fn, test, lit, n, reason, _why in ledger("symid-allow"):
+    if reason not in REASONS: fails.append("symid-allow: no reason `%s` (%s %s)" % (reason, file, fn))
     listed_tests[(file, fn, test, lit)] += int(n)
 for key in found_tests:
     if pending.get((key[0], key[1], key[2] + " " + key[3])): listed_tests[key] = found_tests[key]
@@ -155,7 +168,7 @@ for fname, name, body in FUNCTIONS:
     n = sum(1 for m in MINT.finditer(body) if builds(body, m))
     if n: found_mints[(fname, name)] = n
 
-mint_rows = ledger("written-mints.txt")
+mint_rows = ledger("symid-written-mints")
 whole_files = {file for file, fn, _why in mint_rows if fn == "*"}
 listed_mints = collections.Counter({(file, fn): found_mints.get((file, fn), 0) or 1
                                     for file, fn, _why in mint_rows if fn != "*"})
@@ -170,14 +183,13 @@ for file in sorted(whole_files - {f for f, _ in found_mints}):
 
 # --- verdict ------------------------------------------------------------
 n_pending = sum(pending.values())
+fails += ["stale ledger row — " + s for s in stale]
 if FINAL:
-    fails += ["stale ledger row — " + s for s in stale]
     if n_pending: fails.append("%d sites are still listed in pending-written.txt" % n_pending)
 for m in fails: print("symid-names FAIL — " + m)
 print("symid-names: %d dual slots listed; %d reads of written_text in %d functions (files per reason: %s); "
-      "%d literal tests; %d functions build a reference by text; %d pending%s"
+      "%d literal tests; %d functions build a reference by text; %d pending"
       % (len(listed_dual), sum(found_reads.values()), len(found_reads),
          " ".join("%s %d" % (r, len(by_reason[r])) for r in REASONS),
-         sum(found_tests.values()), len(found_mints), n_pending,
-         "" if FINAL or not stale else "; %d ledger rows cover less than they list" % len(stale)))
+         sum(found_tests.values()), len(found_mints), n_pending))
 sys.exit(1 if fails else 0)
