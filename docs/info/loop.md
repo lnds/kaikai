@@ -12,14 +12,15 @@ Because they are functions, they obey the effect row of their body:
 a `while { ... } { body that uses Stdout }` itself has `Stdout` in
 the row.
 
-kaikai has NO `for x in xs` form. Iterate via a map-pipe with a
-lambda (`xs | (x => body)`) or, for side effects only, via `foreach`
-/ `each` (the core alias). The `for` keyword is reserved
-exclusively for the `impl Proto for T` declaration form.
+kaikai has NO `for x in xs` form. Iterate with the pipes: `xs | f`
+to transform, `xs |! f` to run an effect per element. Use
+`while`/`until` or tail recursion when the loop carries state. The
+`for` keyword is reserved exclusively for the `impl Proto for T`
+declaration form.
 
 There is no `break` or `continue`. Loops terminate when their
 predicate becomes false (`while` / `until`) or the input is exhausted
-(pipes / `foreach`). To early-exit, restructure with `find`,
+(pipes). To early-exit, restructure with `find`,
 `take_while`, or tail recursion.
 
 ## Examples
@@ -45,7 +46,7 @@ fn main() : Int / Stdout = {
   let _ = count_up(3)
 
   # iterating a range for side effects:
-  [1..3] |> each((i) => Stdout.print("range #{i}"))
+  [1..3] |! Stdout.print("range #{.}")
 
   # `if` is an expression — both branches must type:
   let n = 5
@@ -97,26 +98,21 @@ forever:                  (() -> Unit / e) -> Nothing / e
 end the program by raising or by being cancelled — there is no
 graceful return.
 
-## Pipe-for-each
+## Iterating for effect
 
-Iteration over a list to a side effect is conventionally written
-with `|` to an each-like fn:
-
-```kaikai
-fn main() : Unit / Stdout = {
-  # `|` produces a [Unit]; discard it to keep `main : Unit`.
-  let _ = [1..5] | (i => Stdout.print("#{i}"))
-}
-```
-
-…or with the core `each` helper (auto-loaded, returns `Unit`;
-`foreach` is the spelled-out stdlib equivalent in `core/list`):
+End the pipeline with `|!`: it runs the stage for each element and
+returns `Unit`, so it closes a `Unit` body.
 
 ```kaikai
 fn main() : Unit / Stdout = {
-  [1..5] |> each((i) => Stdout.print(int_to_string(i)))
+  [1..5] |? (. % 2 == 1) |! Stdout.print("odd #{.}")
 }
 ```
+
+Not `xs | f |> ignore` (it builds a list only to drop it) and not
+`xs |> each(f)` (it names the iteration fn instead of letting the
+head type pick its own). The functions `each` and `foreach` exist,
+but `|!` is the idiom; see `kai info idiomatic`.
 
 ## Tail calls
 
@@ -154,7 +150,7 @@ closure VALUES, keeps the ordinary closure-calling combinator.
 ## NOT IN KAIKAI
 
 - `break` / `continue` statements.
-- C-style `for (init; cond; step)`. Use `[start, next..end] |> each(...)`.
+- C-style `for (init; cond; step)`. Use `[start, next..end] |! ...`.
 - `for x in xs { ... }`. No for-in loop. Use a pipe.
 - `do { ... } while (cond)`. Use `var x := ...; while { cond } { ... }`.
 - List comprehensions `[x*2 for x in xs]`. Use `xs | (x => x * 2)`.

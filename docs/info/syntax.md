@@ -56,7 +56,7 @@ at its `}`, so the next line starts a new statement or match arm:
 ```kaikai
 fn main() : Unit / Stdout = {
   if true { Stdout.print("a") }                # complete at `}`
-  [3, 4] |> each((x) => Stdout.print("#{x}"))  # a list, not an index
+  [3, 4] |! Stdout.print("#{.}")               # a list, not an index
 }
 ```
 
@@ -1608,7 +1608,7 @@ Use instead:
 - `throw` / `try-catch` → `Result[a, e]` (with `expr!`) or an effect op returning `Nothing`
 - `async` / `await` → `Spawn` effect (see `kai info fibers`)
 - `interface I { ... }` → `protocol P { ... }`
-- `for x in xs { ... }` → `xs | (x => ...)` or `xs |> each(f)`
+- `for x in xs { ... }` → `xs | (x => ...)`, or `xs |! f(.)` for effects
 - `return expr` → the last expression of a block IS the value
 - `self.x` / `this.x` → no implicit receiver; methods take explicit params
 

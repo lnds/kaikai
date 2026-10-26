@@ -112,7 +112,7 @@ fn sieve(xs: Seq[Int]) : Seq[Int] = match xs {
 
 fn main() : Unit / Stdout = {
   let primes = sieve(lazy [2..])
-  primes |> take_while((p) => p <= 30) |> each((p) => Stdout.print("#{p}"))
+  primes |> take_while((p) => p <= 30) |! Stdout.print("#{.}")
   Stdout.print(int_to_string(primes |> nth(99)))
 }
 ```
