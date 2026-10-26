@@ -463,15 +463,6 @@ const char *kaicli_cwd(void) {
 
 /* ---- host ---- */
 
-void kaicli_raise_stack(int64_t bytes) {
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_STACK, &rl) != 0) return;
-    rlim_t want = (rlim_t) bytes;
-    if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) return;
-    rl.rlim_cur = want;
-    setrlimit(RLIMIT_STACK, &rl);
-}
-
 const char *kaicli_uname_s(void) {
     static struct utsname u;
     return uname(&u) == 0 ? u.sysname : "";

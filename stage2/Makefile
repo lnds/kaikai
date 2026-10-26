@@ -12,16 +12,10 @@ CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O2
 # pays only for the pages its deepest recursion touches.
 KAI_MAIN_STACK := -DKAI_MAIN_STACK_SIZE=1073741824
 
-# Test binaries keep the OS budget. On Darwin the main-thread stack is the
-# LINKED size, so they link with 128 MB; it governs only KAI_THREADS=1,
-# where main runs on the thread stack. At N>1 main is a fiber sized by
-# max(8 MB, RLIMIT_STACK).
 UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-LDFLAGS_STACK := -Wl,-stack_size,0x8000000
-else
-LDFLAGS_STACK :=
-endif
+
+# User programs get a 32 MiB main stack from the runtime itself (host.h); a
+# test that needs a tighter one sets KAI_MAIN_STACK_SIZE at run time.
 
 # `timeout(1)` is GNU coreutils: present on Linux, absent from a stock macOS
 # (Homebrew coreutils ships it as `gtimeout`). Hosts with neither use the
@@ -208,7 +202,7 @@ RUNTIME_H := runtime.h
 STACK :=
 
 .PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158 test-kir-while-param-slot-1173 test-kir-while-vcell-moved-set test-kir-var-escape-state-1173 test-kir-while-raw-cond-1414 test-kir-while-boxed-cond-1414
-.PHONY: test-mn-sigaltstack-asan test-main-stack-sized test-evf-passthrough test-free-deep test-deep-chains test-deep-chains-native test-deep-ctor-values test-supervision-ended
+.PHONY: test-mn-sigaltstack-asan test-main-stack-sized test-main-stack-sized-native test-evf-passthrough test-free-deep test-deep-chains test-deep-chains-native test-deep-ctor-values test-supervision-ended
 .PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-segment-switch test-segment-switch-asan test-segment-runtime test-segment-runtime-asan test-segment-runtime-tsan test-segment-handles test-segment-handles-asan test-segment-handles-native test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-dir-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-dir-protocols test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-tco-fuse-order test-trace test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1564-promoted-cell-across-handle test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-trmc-dead-drop-deep test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1153-modcall-linear test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1303-single-use-branch-leak test-perceus-1302-tcrec-goto-drops test-perceus-1635-goto-move-collision test-perceus-1758-cond-exit-drop test-perceus-1765-binop-base-tail test-perceus-1768-move-gate-positions test-perceus-1324-char-binder-goto test-perceus-1395-char-param-raw test-perceus-1410-byte-raw-ops test-perceus-1457-fixed-raw-ops test-perceus-1637-int-wrap-ops test-issue-1637-div-overflow-trap test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-issue-1394-byte-box test-perceus-1315-borrowed-match-release test-perceus-1355-closure-temp-release test-perceus-1328-selftail-borrowed-local test-perceus-1130-borrow-pipe test-perceus-1130-hof-tail-drop test-perceus-1127-borrow-closure test-perceus-1127-borrow-hof test-perceus-747-native-real-slot-uaf test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1156-raw-widen test-perceus-1160-de-opaque test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-dir-unions test-aliases test-dir-sequence test-dir-methods test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-dir-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-native-runtime-decl test-perceus-1180-range-lazy test-seq test-seq-native test-seq-asan test-perceus-1180-range-sum test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1783-interp-intern-leak test-perceus-1784-variant-rebuild test-perceus-1786-record-rebuild test-perceus-1791-arm-use-scope test-perceus-1902-block-let-move test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1803-op-arg-free test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-trmc-real-elision test-issue-1970-nursery-reraise-handler test-mutate-negate-shapes test-mutate-site-data test-mutate-receiver-shapes test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-coverage-report test-coverage-report-native test-trap-pads-native test-trap-pads-asan-native test-perceus-2032-bang-operand-use test-perceus-owned-scope-unused-param test-perceus-block-let-unused-alias test-perceus-closure-capture-tail test-perceus-borrow-homonym test-perceus-closure-capture-selftail test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-cancel-escape test-cancel-escape-native test-mailbox-scope-unwind test-mailbox-scope-unwind-native test-cancel-clause-ubsan test-monitor-ref-asan test-monitor-ref-asan-native test-perceus-asan test-perceus-asan-native test-perceus-switch-scrutinee-selftail test-perceus-arm-branch-read test-perceus-read-identity test-handle-boxed-slot test-perceus-trmc-step-ledger test-perceus-spread-consumes test-perceus-borrow-own test-modules-ctor-homonym test-modules-list-alias test-index-coll-diag-once test-perceus-reuse-untaken-slot test-perceus-reuse-nested-rebuild test-slice-bound-once test-slice-bound-once-native test-rc-runs-every-thread-count test-rc-runs-every-thread-count-native test-perceus-branch-param-selftail test-perceus-trmc-raw-operand-drop test-perceus-pipe-borrowed-slot-alignment test-trmc-slot-forms test-trmc-qualified-nullary test-pattern-shapes test-pattern-shapes-native test-variant-capacity test-string-escape-depth test-string-escape-depth-native test-exit-report-asan
 all: $(TARGET)
 
@@ -1649,7 +1643,7 @@ test-native-modular: $(TARGET) build
 	work=build/nmod; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
 	cache=build/nmod-cache; rm -rf $$cache; mkdir -p $$cache; \
 	emit() { $(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai 2>build/nmod.err; }; \
-	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
+	link() { $(CC) $(CFLAGS) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
 	$(KAIC2) --emit=native --path ../stdlib --path $$work $$work/main.kai >/dev/null 2>build/nmod-whole.err \
 	  || { echo "native-modular: whole-program EMIT FAIL"; cat build/nmod-whole.err; exit 1; }; \
 	link "$$work/main.o" build/nmod-whole; ./build/nmod-whole > build/nmod-whole.out; \
@@ -1693,7 +1687,7 @@ test-issue-1706-runner-mode-key: $(TARGET) build
 	cache=build/nmod-1706-cache; rm -rf $$cache; mkdir -p $$cache; \
 	emit() { $(KAIC2) --emit=native-modular $$1 --path ../stdlib --path $$work \
 	  $$work/main.kai 2>build/nmod_1706.err; }; \
-	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < $$1) \
+	link() { $(CC) $(CFLAGS) $$(tr '\n' ' ' < $$1) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
 	emit --test  > build/nmod_1706_t.txt || { echo "issue-1706: test EMIT FAIL"; cat build/nmod_1706.err; exit 1; }; \
 	emit --bench > build/nmod_1706_b.txt || { echo "issue-1706: bench EMIT FAIL"; cat build/nmod_1706.err; exit 1; }; \
@@ -1728,7 +1722,7 @@ test-issue-1426-cross-module-derive-show-native: $(TARGET) build
 	$(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_1426_objs.txt 2>build/nmod_1426.err \
 	  || { echo "issue-1426-cross-module-derive-show-native: EMIT FAIL"; cat build/nmod_1426.err; exit 1; }; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_1426_objs.txt) \
+	$(CC) $(CFLAGS) $$(tr '\n' ' ' < build/nmod_1426_objs.txt) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o build/nmod_1426 $(LDLIBS_M) -ldl \
 	  || { echo "issue-1426-cross-module-derive-show-native: LINK FAIL"; exit 1; }; \
 	./build/nmod_1426 > build/nmod_1426.out; \
@@ -1743,7 +1737,7 @@ test-issue-1852-cross-module-derive-json-native: $(TARGET) build
 	$(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_1852_objs.txt 2>build/nmod_1852.err \
 	  || { echo "issue-1852-cross-module-derive-json-native: EMIT FAIL"; cat build/nmod_1852.err; exit 1; }; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_1852_objs.txt) \
+	$(CC) $(CFLAGS) $$(tr '\n' ' ' < build/nmod_1852_objs.txt) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o build/nmod_1852 $(LDLIBS_M) -ldl \
 	  || { echo "issue-1852-cross-module-derive-json-native: LINK FAIL"; exit 1; }; \
 	./build/nmod_1852 > build/nmod_1852.out; \
@@ -1762,7 +1756,7 @@ test-issue-1869-derive-json-lambda-slots-native: $(TARGET) build
 	./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_1869_objs.txt 2>build/nmod_1869.err \
 	  || { echo "issue-1869-derive-json-lambda-slots-native: EMIT FAIL"; cat build/nmod_1869.err; exit 1; }; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_1869_objs.txt) \
+	$(CC) $(CFLAGS) $$(tr '\n' ' ' < build/nmod_1869_objs.txt) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o build/nmod_1869 $(LDLIBS_M) -ldl \
 	  || { echo "issue-1869-derive-json-lambda-slots-native: LINK FAIL"; exit 1; }; \
 	./build/nmod_1869 > build/nmod_1869.out; \
@@ -1779,7 +1773,7 @@ test-issue-1870-derive-json-contested-field-native: $(TARGET) build
 	./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_1870_objs.txt 2>build/nmod_1870.err \
 	  || { echo "issue-1870-derive-json-contested-field-native: EMIT FAIL"; cat build/nmod_1870.err; exit 1; }; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_1870_objs.txt) \
+	$(CC) $(CFLAGS) $$(tr '\n' ' ' < build/nmod_1870_objs.txt) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o build/nmod_1870 $(LDLIBS_M) -ldl \
 	  || { echo "issue-1870-derive-json-contested-field-native: LINK FAIL"; exit 1; }; \
 	./build/nmod_1870 > build/nmod_1870.out; \
@@ -1797,7 +1791,7 @@ test-modules-const-export-native: $(TARGET) build
 	$(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_const_objs.txt 2>build/nmod_const.err \
 	  || { echo "modules-const-export-native: EMIT FAIL"; cat build/nmod_const.err; exit 1; }; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_const_objs.txt) \
+	$(CC) $(CFLAGS) $$(tr '\n' ' ' < build/nmod_const_objs.txt) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o build/nmod_const $(LDLIBS_M) -ldl \
 	  || { echo "modules-const-export-native: LINK FAIL"; exit 1; }; \
 	./build/nmod_const > build/nmod_const.out; \
@@ -1816,7 +1810,7 @@ test-deep-chains-native: $(TARGET) build
 	  cp $$src/$$name.kai $$work/; \
 	  $(KAIC2) --emit=native --path ../stdlib $$work/$$name.kai > /dev/null 2> $$work/$$name.err \
 	    || { echo "deep-chains-native FAIL ($$name: emit)"; cat $$work/$$name.err; exit 1; }; \
-	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$work/$$name.o ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 \
+	  $(CC) $(CFLAGS) $$work/$$name.o ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 \
 	    -o $$work/$$name $(LDLIBS_M) -ldl \
 	    || { echo "deep-chains-native FAIL ($$name: link)"; exit 1; }; \
 	  ./$$work/$$name > $$work/$$name.out; \
@@ -1859,7 +1853,7 @@ test-native-core-obj: $(TARGET) build
 	work=build/ncoreobj; rm -rf $$work; mkdir -p $$work; \
 	cache=build/ncoreobj-cache; rm -rf $$cache; mkdir -p $$cache; \
 	printf 'fn main() : Unit / Console = println("core-obj hello")\n' > $$work/hello.kai; \
-	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
+	link() { $(CC) $(CFLAGS) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
 	KAI_NATIVE_CORE_OBJ=0 $(KAIC2) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-whole.txt 2> build/ncoreobj-whole.err \
 	  || { echo "native-core-obj: whole-program EMIT FAIL"; cat build/ncoreobj-whole.err; exit 1; }; \
 	link "$$work/hello.o" build/ncoreobj-whole; ./build/ncoreobj-whole > build/ncoreobj-whole.out; \
@@ -2318,8 +2312,8 @@ test-issue-668: $(TARGET) build
 # TRMC for the builtin cons (`[h, ...recur(t)]`): a 1M-deep list built two
 # ways — `build` (raw list literal) and `map_inc` (Perceus reuse-cons) — must
 # not overflow. The check asserts the C emitter planted the goto-loop, then
-# runs under an explicit 8 MB stack (Darwin: the linked size; Linux:
-# `ulimit -s 8192`), where a per-element recursion crashes with exit 139.
+# runs on an 8 MB main stack (KAI_MAIN_STACK_SIZE), where a per-element
+# recursion overflows.
 # The native backend runs the fixture through the backend-parity corpus.
 test-trmc-list-build: $(TARGET) build
 	@set -e; \
@@ -2331,10 +2325,9 @@ test-trmc-list-build: $(TARGET) build
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for build — rewrite regressed?)"; exit 1; }; \
 	grep -q 'goto _kai_trmc_list_build_large__map_inc_entry' build/s2-$$name.c \
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for map_inc — reuse-cons shape regressed?)"; exit 1; }; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -Wl,-stack_size,0x800000 -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) 2>/dev/null \
-	  || $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	  || { echo "trmc-list-build FAIL (C compile failed)"; exit 1; }; \
-	( ulimit -s 8192 2>/dev/null; ./build/s2-$$name > build/s2-$$name.out 2>&1 ) \
+	( export KAI_MAIN_STACK_SIZE=8388608; ./build/s2-$$name > build/s2-$$name.out 2>&1 ) \
 	  || { echo "trmc-list-build FAIL (stack overflow regressed — `[h, ...recur(t)]` not TCO'd?)"; cat build/s2-$$name.out; exit 1; }; \
 	diff -q ../examples/perceus/trmc_list_build_large.out.expected build/s2-$$name.out > /dev/null \
 	  && echo "trmc-list-build OK (1M-deep [h, ...recur(t)] build + map, O(1) stack)" \
@@ -2351,7 +2344,7 @@ test-trmc-dead-drop-deep: $(TARGET) build
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	    || { echo "trmc-dead-drop-deep FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	  ( ulimit -s 8192 2>/dev/null; KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.err ) \
+	  ( export KAI_MAIN_STACK_SIZE=8388608; KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.err ) \
 	    || { echo "trmc-dead-drop-deep FAIL ($$name: crash — the rebuild recursed?)"; tail -3 build/s2-$$name.err; exit 1; }; \
 	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	    || { echo "trmc-dead-drop-deep FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
@@ -2489,7 +2482,7 @@ test-trace: $(TARGET) build
 	@set -e; \
 	for name in $(TRACE_FIXTURES); do \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
+	  $(CC) $(CFLAGS) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
 	  KAI_THREADS=1 ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "trace OK $$name" \
@@ -2513,7 +2506,7 @@ test-runtime-shadow: $(TARGET) build
 	@set -e; \
 	for name in $(RUNTIME_SHADOW_FIXTURES); do \
 	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$name.kai > build/$$name.c; \
-	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
+	  $(CC) $(CFLAGS) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "runtime-shadow OK $$name" \
@@ -2534,7 +2527,7 @@ test-mn-sigaltstack-asan: $(TARGET) build
 	name=mn_sigaltstack_teardown; \
 	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	      -Wno-unused-function -Wno-unused-variable \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c $(LDLIBS_M); \
 	for n in $(MN_SIGALTSTACK_THREADS); do \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -2553,32 +2546,19 @@ test-mn-sigaltstack-asan: $(TARGET) build
 	         diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
-# A build defining KAI_MAIN_STACK_SIZE (the compiler's) gives `main` that
-# stack at every thread count: a recursion past 8 MB completes, and one past
-# the budget is caught by the guard page with the diagnostic, at N=1 too.
-MAIN_STACK_THREADS := 1 8
+# `main` has one stack budget (32 MiB unless a build defines KAI_MAIN_STACK_SIZE)
+# at every thread count, whatever `ulimit -s` says: a recursion past 1 MiB
+# completes, and one past the budget gets the guard-page diagnostic, at N=1 too.
+test-main-stack-sized: $(TARGET) bin-kai
+	@../tools/test-main-stack.sh c
 
-test-main-stack-sized: $(TARGET) build
-	@set -e; \
-	for name in main_stack_sized main_stack_sized_overflow; do \
-	  $(KAIC2) --path ../stdlib ../examples/runtime/$$name.kai > build/s2-$$name.c; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -DKAI_MAIN_STACK_SIZE=67108864 -I ../stage0 \
-	        build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
-	done; \
-	for n in $(MAIN_STACK_THREADS); do \
-	  KAI_THREADS=$$n ./build/s2-main_stack_sized > build/s2-main_stack_sized.out 2>&1 \
-	    || { echo "main-stack-sized FAIL (KAI_THREADS=$$n: deep recursion overflowed)"; \
-	         cat build/s2-main_stack_sized.out; exit 1; }; \
-	  diff -q ../examples/runtime/main_stack_sized.out.expected build/s2-main_stack_sized.out > /dev/null \
-	    || { echo "main-stack-sized DIFF (KAI_THREADS=$$n)"; \
-	         diff ../examples/runtime/main_stack_sized.out.expected build/s2-main_stack_sized.out; exit 1; }; \
-	  rc=0; KAI_THREADS=$$n ./build/s2-main_stack_sized_overflow > /dev/null \
-	    2> build/s2-main_stack_sized_overflow.err || rc=$$?; \
-	  [ $$rc -ne 0 ] && grep -q "fiber stack overflow" build/s2-main_stack_sized_overflow.err \
-	    || { echo "main-stack-sized FAIL (KAI_THREADS=$$n: overflow not diagnosed, exit=$$rc)"; \
-	         cat build/s2-main_stack_sized_overflow.err; exit 1; }; \
-	  echo "main-stack-sized OK (KAI_THREADS=$$n: 300K deep completes, 3M deep diagnosed)"; \
-	done
+ifeq ($(KAI_LLVM),1)
+test-main-stack-sized-native: $(TARGET) bin-kai
+	@../tools/test-main-stack.sh native
+else
+test-main-stack-sized-native:
+	@echo "main-stack-sized-native SKIP (C-only build; native backend not compiled)"
+endif
 
 # The runtime with every host facility switched off (KAI_HOST_* at 0): a
 # program that needs none prints what a default build prints, and one that
@@ -2703,7 +2683,7 @@ test-issue-501: $(TARGET) build
 	for name in $(ISSUE_501_FIXTURES); do \
 	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) -std=c99 -Wno-unused-function -Wno-unused-variable -O2 \
-	        $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c \
+	        -I ../stage2 -I ../stage0 build/$$name.c \
 	        -o build/$$name-c $(LDLIBS_M); \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
@@ -2797,7 +2777,7 @@ test-signal-trap-asan: $(TARGET) build
 	for name in $(SIGNAL_TRAP_FIXTURES); do \
 	  $(KAIC2) ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -Wno-unused-function -Wno-unused-variable \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        ../tests/sigharness.c -o build/$$name-asan.harness; \
@@ -2833,7 +2813,7 @@ test-log-asan: $(TARGET) build
 	for name in $(LOG_DEFAULT_FIXTURES); do \
 	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -Wno-unused-function -Wno-unused-variable \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
@@ -2878,7 +2858,7 @@ test-monitor-ref-asan: $(TARGET) build
 	for name in $(MONITOR_REF_ASAN_FIXTURES); do \
 	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/mr-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -Wno-unused-function -Wno-unused-variable \
 	        -I ../stage2 -I ../stage0 build/mr-$$name-asan.c -o build/mr-$$name-asan-c; \
 	  rc=0; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" KAI_THREADS=1 \
@@ -2903,7 +2883,7 @@ test-perceus-asan: $(TARGET) build
 	for name in $(PERCEUS_ASAN_FIXTURES); do \
 	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/pa-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	        -Wno-unused-function -Wno-unused-variable \
 	        -I ../stage2 -I ../stage0 build/pa-$$name-asan.c -o build/pa-$$name-asan-c; \
 	  rc=0; \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" KAI_THREADS=1 \
@@ -2985,7 +2965,7 @@ test-cancel-clause-ubsan: $(TARGET) build
 	name=cancel_clause_type; \
 	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/cc-$$name.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=function,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	      -Wno-unused-function -Wno-unused-variable \
 	      -I ../stage2 -I ../stage0 build/cc-$$name.c -o build/cc-$$name $(LDLIBS_M); \
 	rc=0; \
 	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" KAI_THREADS=1 \
@@ -7461,7 +7441,7 @@ test-trmc-slot-forms: $(TARGET) build
 	done; \
 	for p in $(TRMC_SLOT_PROGRAMS); do \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-trmc-slot-$$p.c -o build/s2-trmc-slot-$$p $(LDLIBS_M); \
-	  ( ulimit -s 8192 2>/dev/null; KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-trmc-slot-$$p > build/s2-trmc-slot-$$p.out 2> build/s2-trmc-slot-$$p.rc ) \
+	  ( export KAI_MAIN_STACK_SIZE=8388608; KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-trmc-slot-$$p > build/s2-trmc-slot-$$p.out 2> build/s2-trmc-slot-$$p.rc ) \
 	    || { echo "trmc-slot-forms FAIL ($$p: crash — stack-growing recursion?)"; tail -5 build/s2-trmc-slot-$$p.rc; exit 1; }; \
 	  diff -q $(TRMC_SLOT_DIR)/$$p.out.expected build/s2-trmc-slot-$$p.out > /dev/null \
 	    || { echo "trmc-slot-forms FAIL ($$p: output diff)"; diff $(TRMC_SLOT_DIR)/$$p.out.expected build/s2-trmc-slot-$$p.out; exit 1; }; \
@@ -7511,7 +7491,7 @@ test-handle-boxed-slot: $(TARGET) build
 	name=handle_boxed_slot; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/runtime/$$name.kai > build/s2-$$name.c \
 	  || { echo "handle-boxed-slot FAIL (kaic2 errored)"; exit 1; }; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) $(LLVM_LDFLAGS); \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) $(LLVM_LDFLAGS); \
 	KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.err \
 	  || { echo "handle-boxed-slot FAIL (crash)"; cat build/s2-$$name.err; exit 1; }; \
 	diff -q ../examples/runtime/$$name.out.expected build/s2-$$name.out > /dev/null \
@@ -10243,7 +10223,7 @@ test-exit-report-asan: $(TARGET) build
 	name=exit_report_unstarted; \
 	$(KAIC2) --path ../stdlib ../examples/runtime/$$name.kai > build/$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
+	      -Wno-unused-function -Wno-unused-variable \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
 	KAI_THREADS=1 KAI_TRACE_RC=1 \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0:symbolize=0" \
@@ -10758,7 +10738,7 @@ test-modular-build-case-%: $(TARGET) build
 	    || { echo "modular FAIL $$name (compile $$(basename $$c))"; exit 1; }; \
 	  objs="$$objs $$o"; \
 	done; \
-	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$objs -o build/$$name.bin $(LDLIBS_M) \
+	$(CC) $(CFLAGS) $$objs -o build/$$name.bin $(LDLIBS_M) \
 	  || { echo "modular FAIL $$name (link)"; exit 1; }; \
 	./build/$$name.bin > build/$$name.out \
 	  || { echo "modular FAIL $$name (run)"; cat build/$$name.out; exit 1; }; \
@@ -11136,7 +11116,7 @@ GATE_ASAN_TARGETS := $(sort $(shell awk '$$1 !~ /^\#/ && $$2 == "asan" { print $
 $(GATE_NATIVE_TARGETS): $(TARGET) bin-kai build
 $(GATE_ASAN_TARGETS): $(TARGET) build
 $(GATE_NATIVE_TARGETS) $(GATE_ASAN_TARGETS):
-	@KAIC2='$(KAIC2)' CC='$(CC)' CFLAGS='$(CFLAGS)' LDFLAGS_STACK='$(LDFLAGS_STACK)' LDLIBS_M='$(LDLIBS_M)' \
+	@KAIC2='$(KAIC2)' CC='$(CC)' CFLAGS='$(CFLAGS)' LDLIBS_M='$(LDLIBS_M)' \
 	  TIMEOUT='$(TIMEOUT)' KAI_LLVM='$(KAI_LLVM)' sh ../tools/fixture-gate.sh $@
 
 print-light-targets:
@@ -11145,7 +11125,7 @@ print-light-targets:
 define fixture_unit_rule
 test-dir-$(1): $$(TARGET) build core-cache-warm
 	@FIXTURE_JOBS=$$(TEST_JOBS) KAIC2='$$(KAIC2)' CC='$$(CC)' CFLAGS='$$(CFLAGS)' \
-	  CPPFLAGS_CORE='$$(CPPFLAGS_CORE)' LDLIBS_M='$$(LDLIBS_M)' LDFLAGS_STACK='$$(LDFLAGS_STACK)' TEST_CORE_CACHE='$$(TEST_CORE_CACHE)' \
+	  CPPFLAGS_CORE='$$(CPPFLAGS_CORE)' LDLIBS_M='$$(LDLIBS_M)' TEST_CORE_CACHE='$$(TEST_CORE_CACHE)' \
 	  sh ../tools/fixture-dir.sh $(1)
 endef
 $(foreach slug,$(FIXTURE_SLUGS),$(eval $(call fixture_unit_rule,$(slug))))
@@ -11538,7 +11518,7 @@ rc-detector: bin-kai
 NSCOL_RATCHET = ../tools/nscol-ratchet.sh
 NSCOL_RUN = NSCOL_KAIC2='$(KAIC2)' NSCOL_CORE_CACHE='$(TEST_CORE_CACHE)' \
   NSCOL_CC='$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0' NSCOL_LDLIBS='$(LDLIBS_M)' \
-  NSCOL_ASAN_CC='$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) -I ../stage2 -I ../stage0' \
+  NSCOL_ASAN_CC='$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable -I ../stage2 -I ../stage0' \
   ../tools/nscol-run.sh
 
 # One ratcheted axis: run it, then gate its log.

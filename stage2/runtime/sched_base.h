@@ -264,14 +264,10 @@ static size_t kai_fiber_stack_size(void) {
     return sz;
 }
 
-/* Stack budget for the fiber that runs kai_main. It is not an ordinary
- * fiber: at one thread main runs directly on the OS thread stack, and at
- * N>1 it runs as a fiber — so handing it the 64 KiB fiber default would
- * make the thread count decide whether a deeply recursive program
- * survives. Track the main thread instead (RLIMIT_STACK, floored at the
- * conventional 8 MiB), and let a larger explicit KAI_FIBER_STACK_SIZE
- * still win. A build defining KAI_MAIN_STACK_SIZE fixes the budget
- * outright, at every thread count, whatever the environment says. */
+/* Stack budget for the fiber that runs kai_main: KAI_MAIN_STACK_SIZE at
+ * every thread count, whatever the host rlimit or link flags say. A build
+ * may define it (the default is in host.h); the environment variable of the
+ * same name, in bytes, overrides it at run time. */
 #if KAI_HOST_STACK_GUARD
 static int kai_stack_map_flags(void) {
     int flags = MAP_PRIVATE | MAP_ANON;
@@ -471,21 +467,17 @@ static size_t kai_main_fiber_stack_size(void) {
     static size_t granted = 0;
     if (granted == 0) {
         size_t want = (size_t) (KAI_MAIN_STACK_SIZE);
+        const char *env = getenv("KAI_MAIN_STACK_SIZE");
+        char *end = NULL;
+        long long parsed = (env && *env) ? strtoll(env, &end, 10) : 0;
+        if (parsed >= 1024 * 1024 && *end == '\0') want = (size_t) parsed;
         while (want / 2 >= 8 * 1024 * 1024 && !kai_stack_fits(want)) want /= 2;
         granted = want;
     }
     return granted;
+#else
+    return kai_fiber_stack_size();
 #endif
-    size_t sz = 8 * 1024 * 1024;
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_STACK, &rl) == 0
-        && rl.rlim_cur != RLIM_INFINITY
-        && (size_t) rl.rlim_cur > sz) {
-        sz = (size_t) rl.rlim_cur;
-    }
-    if (sz > 64 * 1024 * 1024) sz = 64 * 1024 * 1024;
-    size_t fiber = kai_fiber_stack_size();
-    return fiber > sz ? fiber : sz;
 }
 
 /* SIGSEGV / SIGBUS handler for fiber stack overflow. The fault lands

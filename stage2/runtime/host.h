@@ -83,6 +83,9 @@
 #if (KAI_HOST_SOCKETS || KAI_HOST_PROCESS || KAI_HOST_SIGNALS) && !KAI_HOST_REACTOR
 #  error "KAI_HOST_SOCKETS, KAI_HOST_PROCESS and KAI_HOST_SIGNALS need KAI_HOST_REACTOR: their waits park on it"
 #endif
+#if KAI_HOST_FIBERS && !defined(__wasm__) && !defined(KAI_MAIN_STACK_SIZE)
+#  define KAI_MAIN_STACK_SIZE (32 * 1024 * 1024)
+#endif
 #if defined(KAI_MAIN_STACK_SIZE) && !KAI_HOST_FIBERS
 #  error "KAI_MAIN_STACK_SIZE needs KAI_HOST_FIBERS: main moves to its stack by a context switch"
 #endif
