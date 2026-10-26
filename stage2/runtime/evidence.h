@@ -758,6 +758,13 @@ static void kai_seg_reaim(KaiSegment *seg) {
 /* A lookup on a segment: the running context's chain, then the relay of the
  * segment whose base the walk leaves. */
 static KaiEvidence *kai_seg_lookup(KaiFiber *f, const char *eff_label, KaiEvidence *def) {
+    int i = kai_eff_fl(eff_label);
+    if (i >= 0 && f->in_dispatch_node == NULL) {
+        for (KaiEvidence *n = f->fl_top[i]; n != NULL; n = n->fl_prev) {
+            if (kai_eff_match(n->eff_label, eff_label)) return n;
+        }
+        return kai_seg_relay(f->seg, eff_label, def);
+    }
     KaiEvidence *skip;
     KaiEvidence *from = kai_ev_view(f, &skip);
     KaiSegCtx *c = from == f->evidence_top ? NULL : kai_ctx_of(f, from);

@@ -367,7 +367,7 @@ KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
     seg->trap        = 0;
     seg->base        = f->evidence_top;
     seg->own.evidence_top     = f->evidence_top;
-    memcpy(seg->own.fl_top, f->fl_top, sizeof seg->own.fl_top);
+    memset(seg->own.fl_top, 0, sizeof seg->own.fl_top);
     seg->own.in_dispatch_node = NULL;
     seg->own.unw_top          = 0;
     seg->own.rframe_top       = 0;
