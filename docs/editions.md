@@ -26,12 +26,13 @@ boundary**, not at every minor version.
 
 The principle above is the target; Hanga Roa does not meet it yet.
 
-- **Breaking changes land inside Hanga Roa.** Releases since Hanga Roa
-  opened carry many `!` (breaking) commits — removed surface such as
-  method-call syntax (`x.f()`), changed stdlib signatures and
-  behaviour — with no edition bump. Whether Hanga Roa stays open to
-  breaks, or each break must ship with a migration rule, is an open
-  project decision.
+- **Hanga Roa is open to breaking changes.** Until the project closes
+  Hanga Roa, a change that breaks user code ships as a `!` commit with
+  a `BREAKING CHANGE:` footer and a CHANGELOG entry, with no edition
+  bump and no required `kai migrate` rule. Releases since Hanga Roa
+  opened carry many such commits (removed method-call syntax `x.f()`,
+  changed stdlib signatures and behaviour). The edition promise in the
+  principle above starts to bind when Hanga Roa closes.
 - **The `edition` field selects almost nothing.** The only gate keyed
   on it is pipe dispatch: under `tongariki`, `|` against a user
   `pub type` does not dispatch (only the built-in `List → list`
