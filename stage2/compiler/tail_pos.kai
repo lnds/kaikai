@@ -1,0 +1,90 @@
+#[doc("""
+The one definition of tail position.
+
+The value of a function body comes from its leaves: the branches of an
+`if`, the arm bodies of a `match`, and a block's trailing expression. A
+block tail that only reads back a result slot Perceus minted for the
+same block is peeled to the binding it reads, so the call that binding
+hides is the leaf it is; so does a `let` of the block's own result,
+read back by the tail. Every pass that asks "is this call in tail
+position" asks here: the tail-call graph, the fusion rewrite and the
+self-tail recognizer.
+""")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.util
+import compiler.ret_slots
+
+#[doc("The leaves of `e`: the expressions whose value is `e`'s value. A leaf is not itself an `if`, a `match` or a block.")]
+pub(pkg) fn tail_leaves(e: Expr) : [Expr] = tail_leaves_onto(e, [])
+
+fn tail_leaves_onto(e: Expr, acc: [Expr]) : [Expr] = match e.kind {
+  EIf(_, t, opt_e) -> tail_leaves_onto(t, match opt_e {
+    Some(x) -> tail_leaves_onto(x, acc)
+    None    -> acc
+  })
+  EMatch(_, arms) -> tail_arms_onto(arms, acc)
+  EBlock(stmts, Some(tl)) -> tail_block_onto(stmts, tl, acc)
+  EBlock(_, None) -> acc
+  _ -> [e, ...acc]
+}
+
+fn tail_arms_onto(arms: [Arm], acc: [Expr]) : [Expr] = match arms {
+  [] -> acc
+  [Arm(_, _, body), ...rest] -> tail_leaves_onto(body, tail_arms_onto(rest, acc))
+}
+
+fn tail_block_onto(stmts: [Stmt], tl: Expr, acc: [Expr]) : [Expr] = match tl.kind {
+  ELocal(x) -> if ret_slot_id_is_scope(x) {
+    match tail_find_let(stmts, x) {
+      Some(rhs) -> tail_leaves_onto(rhs, acc)
+      None      -> acc
+    }
+  } else { match tail_alias(stmts, x) {
+    Some((_, rhs)) -> tail_leaves_onto(rhs, acc)
+    None           -> [tl, ...acc]
+  } }
+  _ -> tail_leaves_onto(tl, acc)
+}
+
+# `{ init; let r = rhs; r }`: the block's value is `rhs`'s.
+fn tail_alias(stmts: [Stmt], x: LocalId) : Option[([Stmt], Expr)] = match list_reverse(stmts) {
+  [SLet(p, None, rhs), ...before] -> match p.pkind {
+    PBind(b) -> if local_eq(b.id, x) { Some((list_reverse(before), rhs)) } else { None }
+    _        -> None
+  }
+  _ -> None
+}
+
+fn tail_find_let(stmts: [Stmt], target: LocalId) : Option[Expr] = match stmts {
+  [] -> None
+  [SLet(p, _, rhs), ...rest] -> match p.pkind {
+    PBind(b) -> if local_eq(b.id, target) { Some(rhs) } else { tail_find_let(rest, target) }
+    _        -> tail_find_let(rest, target)
+  }
+  [_, ...rest] -> tail_find_let(rest, target)
+}
+
+#[doc("`e` with `f` applied to each of its leaves, the `if`s, `match`es and blocks around them rebuilt unchanged.")]
+pub(pkg) fn tail_map(e: Expr, f: (Expr) -> Expr) : Expr = match e.kind {
+  EIf(c, t, opt_e) -> Expr { ...e, kind: EIf(c, tail_map(t, f), match opt_e {
+    Some(x) -> Some(tail_map(x, f))
+    None    -> None
+  }) }
+  EMatch(s, arms) -> Expr { ...e, kind: EMatch(s, map_arm_bodies(arms, f)) }
+  EBlock(stmts, Some(tl)) -> match tl.kind {
+    ELocal(x) -> match tail_alias(stmts, x) {
+      Some((init, rhs)) -> if list_is_empty(init) { tail_map(rhs, f) } else { Expr { ...e, kind: EBlock(init, Some(tail_map(rhs, f))) } }
+      None              -> Expr { ...e, kind: EBlock(stmts, Some(f(tl))) }
+    }
+    _ -> Expr { ...e, kind: EBlock(stmts, Some(tail_map(tl, f))) }
+  }
+  EBlock(_, None) -> e
+  _ -> f(e)
+}
+
+fn map_arm_bodies(arms: [Arm], f: (Expr) -> Expr) : [Arm] = match arms {
+  [] -> []
+  [Arm(p, g, body), ...rest] -> [Arm(p, g, tail_map(body, f)), ...map_arm_bodies(rest, f)]
+}

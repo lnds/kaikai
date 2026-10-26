@@ -1,0 +1,229 @@
+#[doc("""
+Tail-call shaping of KIR.
+
+A call is a tail call when its value reaches the function's return
+untouched. Perceus leaves the releases of the owned parameters after the
+call, in a join block the branches share, so the call is followed by
+work. This pass moves those releases before the call, on each path whose
+exit is only copies and releases, and ends the block with the return of
+the call's result. The backend marks exactly such a call a guaranteed
+tail call.
+
+The releases move only when the callee takes every argument owned: a
+borrowed parameter reads a value the caller still owns until the call
+returns. A call whose releases cannot move stays a call, and when it is
+a recursive call of a function in the module being built, it is reported.
+""")]
+
+import compiler.enc_unit
+import compiler.import_cycles
+import compiler.infer_index
+import compiler.kir
+import compiler.kir_syms
+import compiler.util
+
+#[doc("True when `f` is a function whose calls are made under the tail calling convention: a declared function, never the entry, a runner, a lambda or a clause. Its address is taken only through a wrapper.")]
+pub(pkg) fn kir_is_tail_fn(f: KFn) : Bool = match f.kind {
+  KFnNormal -> match f.unit {
+    EuFn(_) -> not f.entry
+    _       -> false
+  }
+  _ -> false
+}
+
+# A call in tail position that stays a call: the function, the callee, where, and why.
+type KtMiss = KtMiss(KFn, String, KPos, String)
+
+# What became of the block: shaped, left alone, or left alone with a reason worth reporting.
+type KtRes = KtDone([KStmt], KTerm) | KtMissed(KtMiss) | KtNone
+
+# The exit of a call: the releases to move and where it returns, a postcondition between them, or no tail.
+type KtExit = KtOk([KStmt], KPos) | KtChecked | KtNo
+
+#[doc("`kp` with every call whose result reaches the return shaped as a tail call. A recursive call of a function homed in `target` that cannot be shaped is reported on stderr.")]
+pub(pkg) fn kir_tail_program(kp: KProgram, target: String) : KProgram / Console = {
+  let nm = kp_names(kp)
+  let ix = kt_index(ksym_fns(nm, kp.fns), idx_empty())
+  let done = map(kp.fns, (f) => kt_fn(f, ix))
+  let misses = flat_map(done, (r) => r.snd)
+  kt_report(kp, nm, filter(misses, (m) => kt_homed(m, target)))
+  KProgram { ...kp, fns: map(done, (r) => r.fst) }
+}
+
+fn kt_homed(m: KtMiss, target: String) : Bool = match m {
+  KtMiss(f, _, _, _) -> match f.mo {
+    Some(h) -> h == target
+    None    -> false
+  }
+}
+
+fn kt_index(fns: [KSymFn], ix: NameIndex[KSymFn]) : NameIndex[KSymFn] = match fns {
+  []           -> ix
+  [r, ...rest] -> kt_index(rest, idx_prepend(ix, r.sym, r))
+}
+
+fn kt_callee(ix: NameIndex[KSymFn], sym: String) : Option[KFn] = kt_pick(idx_chain(ix, sym), sym, None)
+
+fn kt_pick(chain: [KSymFn], sym: String, found: Option[KFn]) : Option[KFn] = match chain {
+  []           -> found
+  [r, ...rest] -> kt_pick(rest, sym, if r.sym == sym { Some(r.f) } else { found })
+}
+
+fn kt_fn(f: KFn, ix: NameIndex[KSymFn]) : (KFn, [KtMiss]) =
+  if kir_is_tail_fn(f) and not f.donor and not kt_in_region(f.region_id) {
+    let rs = map(f.blocks, (b) => kt_block(b, f, f.blocks, ix))
+    (kfn_with_blocks(f, map(rs, (r) => r.fst)), flat_map(rs, (r) => r.snd))
+  } else { (f, []) }
+
+fn kt_in_region(r: Option[Int]) : Bool = match r { Some(_) -> true  None -> false }
+
+# A block ends in a shaped tail call when some call in it reaches the return through the block's remainder.
+fn kt_block(b: KBlock, f: KFn, blocks: [KBlock], ix: NameIndex[KSymFn]) : (KBlock, [KtMiss]) =
+  if kt_in_region(b.region_id) { (b, []) } else {
+    match kt_shape(list_reverse(b.stmts), [], b.term, f, blocks, ix) {
+      KtDone(stmts, term) -> (KBlock { ...b, stmts: stmts, term: term }, [])
+      KtMissed(m)         -> (b, [m])
+      KtNone              -> (b, [])
+    }
+  }
+
+# `rev` holds the statements before the candidate, last first; `after` those following it.
+fn kt_shape(rev: [KStmt], after: [KStmt], term: KTerm, f: KFn, blocks: [KBlock], ix: NameIndex[KSymFn]) : KtRes = match rev {
+  [] -> KtNone
+  [s, ...before] -> match s {
+    KLet(x, slot, KCall(sym, _), pos) -> match kt_try(x, slot, sym, pos, after, term, f, blocks, ix) {
+      KtDone(drops, ret) -> KtDone(list_append(list_reverse(before), list_append(drops, [s])), ret)
+      other              -> other
+    }
+    _ -> kt_shape(before, [s, ...after], term, f, blocks, ix)
+  }
+}
+
+fn kt_try(x: String, slot: KSlot, sym: String, pos: KPos, after: [KStmt], term: KTerm, f: KFn, blocks: [KBlock], ix: NameIndex[KSymFn]) : KtRes =
+  match kt_callee(ix, sym) {
+    None     -> KtNone
+    Some(cf) -> match kt_exit(after, term, [x], [], blocks, 8, kt_raw(slot), false, false) {
+      KtNo -> KtNone
+      KtChecked -> KtMissed(KtMiss(f, sym, pos, "a postcondition is checked after the call returns"))
+      KtOk(drops, ret) ->
+        if not kir_is_tail_fn(cf) or cf.donor or slot != cf.ret or slot != f.ret { KtNone }
+        else if not list_is_empty(drops) and kt_borrows(cf.params) {
+          KtMissed(KtMiss(f, sym, pos, "the callee borrows an argument the caller releases after the call"))
+        } else { KtDone(drops, KRet(KVar(x), ret)) }
+    }
+  }
+
+# A raw scalar carries no reference count, so releasing a copy of it is nothing.
+fn kt_raw(slot: KSlot) : Bool = match slot {
+  SBoxed -> false
+  _      -> true
+}
+
+fn kt_borrows(ps: [KParam]) : Bool = any(ps, (p) => match p.mode { KBorrow -> true  KOwn -> false })
+
+# The releases an exit performs before returning a copy of the call's result, and where it returns.
+# An exit that does anything else, or releases the result, is not a tail.
+fn kt_exit(stmts: [KStmt], term: KTerm, alias: [String], drops: [KStmt], blocks: [KBlock], fuel: Int, raw: Bool, checked: Bool, lenient: Bool) : KtExit = match stmts {
+  [] -> match term {
+    KRet(KVar(v), pos) ->
+      if not kt_has(alias, v) { KtNo }
+      else if lenient { if checked { KtChecked } else { KtNo } }
+      else if checked { KtChecked } else { KtOk(list_reverse(drops), pos) }
+    KBr(l, _) -> if fuel <= 0 { KtNo } else { match kt_find(blocks, l) {
+      Some(nb) -> if kt_in_region(nb.region_id) { KtNo } else { kt_exit(nb.stmts, nb.term, alias, drops, blocks, fuel - 1, raw, checked, lenient) }
+      None     -> KtNo
+    } }
+    _ -> KtNo
+  }
+  [s, ...rest] -> match s {
+    KStore(n, KVar(v), _) -> if kt_has(alias, v) { kt_exit(rest, term, [n, ...alias], drops, blocks, fuel, raw, checked, lenient) } else { KtNo }
+    KLet(r, _, KLitOp(KVar(v)), _) -> if kt_has(alias, v) { kt_exit(rest, term, [r, ...alias], drops, blocks, fuel, raw, checked, lenient) } else { KtNo }
+    KLet(r, _, KPrim(KpUnbox(_), [KVar(v)]), _) -> if raw and kt_has(alias, v) { kt_exit(rest, term, [r, ...alias], drops, blocks, fuel, raw, checked, lenient) } else { KtNo }
+    KDo(KPrim(KpPadClose, _), _) -> kt_exit(rest, term, alias, drops, blocks, fuel, raw, checked, lenient)
+    KDo(KPrim(KpAssertCheck, _), _) -> kt_exit(rest, term, alias, drops, blocks, fuel, raw, true, lenient)
+    KDo(KPrim(KpAssertCheckWithValue, _), _) -> kt_exit(rest, term, alias, drops, blocks, fuel, raw, true, lenient)
+    KRC(KDrop(KVar(v)), _) ->
+      if not kt_has(alias, v) { kt_exit(rest, term, alias, [s, ...drops], blocks, fuel, raw, checked, lenient) }
+      else if raw { kt_exit(rest, term, alias, drops, blocks, fuel, raw, checked, lenient) }
+      else { KtNo }
+    KLet(_, _, op, _) -> if lenient or kt_reads(op, alias) { kt_exit(rest, term, alias, drops, blocks, fuel, raw, checked, true) } else { KtNo }
+    KDo(op, _) -> if lenient or kt_reads(op, alias) { kt_exit(rest, term, alias, drops, blocks, fuel, raw, checked, true) } else { KtNo }
+    _ -> if lenient { kt_exit(rest, term, alias, drops, blocks, fuel, raw, checked, true) } else { KtNo }
+  }
+}
+
+# Work that reads the call's result between the call and the return: the call is not the last thing the function does.
+fn kt_reads(op: KOp, alias: [String]) : Bool = match op {
+  KPrim(_, xs) -> any(xs, (x) => kt_uses(x, alias))
+  KCall(_, xs) -> any(xs, (x) => kt_uses(x, alias))
+  _            -> false
+}
+
+fn kt_uses(v: KVal, alias: [String]) : Bool = match v {
+  KVar(n) -> kt_has(alias, n)
+  _       -> false
+}
+
+fn kt_has(xs: [String], x: String) : Bool = any(xs, (y) => y == x)
+
+fn kt_find(blocks: [KBlock], l: String) : Option[KBlock] = match blocks {
+  []           -> None
+  [b, ...rest] -> if b.label == l { Some(b) } else { kt_find(rest, l) }
+}
+
+# ---- reporting ---------------------------------------------------------
+
+# Only a recursive call matters: a call between functions that never call back grows no stack.
+fn kt_report(kp: KProgram, nm: KNames, misses: [KtMiss]) : Unit / Console = match misses {
+  [] -> ()
+  _  -> kt_print(misses, kt_recursive_syms(kp.fns, map(kp.fns, (f) => kfn_sym(nm, f))), nm)
+}
+
+fn kt_print(misses: [KtMiss], recursive: [String], nm: KNames) : Unit / Console = match misses {
+  [] -> ()
+  [KtMiss(f, callee, pos, why), ...rest] -> {
+    let caller = kfn_sym(nm, f)
+    if kt_has(recursive, caller) and kt_has(recursive, callee) { eprint(kt_text(caller, callee, pos, why)) } else { () }
+    kt_print(rest, recursive, nm)
+  }
+}
+
+fn kt_text(caller: String, callee: String, pos: KPos, why: String) : String =
+  string_concat_all(["warning: `", callee, "` is called in tail position in `", caller, "`", kt_where(pos),
+                     " but not as a guaranteed tail call: ", why])
+
+fn kt_where(pos: KPos) : String = match pos {
+  KAt(l, c) -> string_concat_all([" (line ", int_to_string(l), ", column ", int_to_string(c), ")"])
+  KNoPos    -> ""
+}
+
+# The functions on a cycle of direct calls, a function calling itself included.
+fn kt_recursive_syms(fns: [KFn], syms: [String]) : [String] = {
+  let edges = kt_edges_all(fns, syms, 0, [])
+  let ring = flat_map(scc_groups(list_length(fns), edges), (g) => flat_map(g, (i) => kt_sym_at(syms, i)))
+  list_append(ring, flat_map(edges, (e) => if e.fst == e.snd { kt_sym_at(syms, e.fst) } else { [] }))
+}
+
+fn kt_sym_at(syms: [String], i: Int) : [String] = match nth(syms, i) {
+  Some(s) -> [s]
+  None    -> []
+}
+
+fn kt_edges_all(fns: [KFn], syms: [String], i: Int, acc: [(Int, Int)]) : [(Int, Int)] = match fns {
+  []           -> acc
+  [f, ...rest] -> kt_edges_all(rest, syms, i + 1, list_append(kt_edges(i, f, syms), acc))
+}
+
+fn kt_edges(i: Int, f: KFn, syms: [String]) : [(Int, Int)] =
+  flat_map(f.blocks, (b) => flat_map(b.stmts, (s) => match s {
+    KLet(_, _, KCall(sym, _), _) -> match kt_index_of(syms, sym, 0) {
+      Some(j) -> [(i, j)]
+      None    -> []
+    }
+    _ -> []
+  }))
+
+fn kt_index_of(syms: [String], sym: String, i: Int) : Option[Int] = match syms {
+  []           -> None
+  [s, ...rest] -> if s == sym { Some(i) } else { kt_index_of(rest, sym, i + 1) }
+}

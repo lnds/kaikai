@@ -10,11 +10,8 @@ of two or more members is a mutual tail recursion — the
 `is_even`/`is_odd` shape — which the fusion rewrite turns into a single
 self-recursive function the existing goto-loop already optimises.
 
-Tail position is the same notion the self-tail gate walks: the branches
-of an `if`, the bodies of `match` arms, and a block's trailing
-expression. A block tail that merely reads back a `let` bound earlier
-in the same block is peeled, so the call the binding hid is seen as the
-tail position it is.
+Tail position is `tail_pos`'s: the one definition the self-tail gate
+and the fusion rewrite share.
 
 A call finds its node by the declaration's id, so two same-named
 functions are two targets and a local binder is none.
@@ -28,7 +25,7 @@ import compiler.ast_decl
 import compiler.ast_ids
 import compiler.infer_index
 import compiler.import_cycles
-import compiler.ret_slots
+import compiler.tail_pos
 import compiler.call_site_target
 import compiler.util
 import compiler.written
@@ -166,66 +163,10 @@ fn tg_has_edge(es: [TgEdge], from: Int, to: Int) : Bool = match es {
   [TgE(a, b), ...rest] -> if a != from { false } else if b == to { true } else { tg_has_edge(rest, from, to) }
 }
 
-fn tg_tail_targets(body: Expr, nodes: TgIx) : [Int] = tg_walk_tail(body.kind, nodes)
-
-fn tg_walk_tail(k: ExprKind, nodes: TgIx) : [Int] {
-  match k {
-    ECall(f, xs) -> tg_call_target(f, list_length(xs), nodes)
-    EIf(_, t, opt_e) -> list_append(tg_walk_tail(t.kind, nodes), tg_walk_opt(opt_e, nodes))
-    EMatch(_, arms) -> tg_walk_arms(arms, nodes)
-    EBlock(stmts, opt_tail) -> tg_walk_block(stmts, opt_tail, nodes)
-    _ -> []
-  }
-}
-
-fn tg_walk_opt(opt_e: Option[Expr], nodes: TgIx) : [Int] =
-  match opt_e {
-    None    -> []
-    Some(e) -> tg_walk_tail(e.kind, nodes)
-  }
-
-fn tg_walk_arms(arms: [Arm], nodes: TgIx) : [Int] {
-  match arms {
-    [] -> []
-    [Arm(_, _, abody), ...rest] -> list_append(tg_walk_tail(abody.kind, nodes), tg_walk_arms(rest, nodes))
-  }
-}
-
-# A tail that only reads back a `let` from the same block hides the
-# call in that binding; the call is the real tail position.
-fn tg_walk_block(stmts: [Stmt], opt_tail: Option[Expr], nodes: TgIx) : [Int] {
-  match opt_tail {
-    None    -> []
-    Some(e) -> tg_walk_block_tail(e, stmts, nodes)
-  }
-}
-
-fn tg_walk_block_tail(e: Expr, stmts: [Stmt], nodes: TgIx) : [Int] {
-  match e.kind {
-    ELocal(tn) -> if ret_slot_id_is_scope(tn) { tg_walk_ret_wrap(stmts, tn, nodes) } else { [] }
-    _          -> tg_walk_tail(e.kind, nodes)
-  }
-}
-
-fn tg_walk_ret_wrap(stmts: [Stmt], tn: LocalId, nodes: TgIx) : [Int] {
-  match tg_find_let_rhs(stmts, tn) {
-    Some(inner) -> tg_walk_tail(inner.kind, nodes)
-    None        -> []
-  }
-}
-
-fn tg_find_let_rhs(stmts: [Stmt], target: LocalId) : Option[Expr] = match stmts {
-  [] -> None
-  [s, ...rest] -> match s {
-    SLet(p, _, rhs) -> if tg_pattern_binds(p, target) { Some(rhs) } else { tg_find_let_rhs(rest, target) }
-    _ -> tg_find_let_rhs(rest, target)
-  }
-}
-
-fn tg_pattern_binds(p: Pattern, target: LocalId) : Bool = match p.pkind {
-  PBind(b) -> local_eq(b.id, target)
-  _        -> false
-}
+fn tg_tail_targets(body: Expr, nodes: TgIx) : [Int] = flat_map(tail_leaves(body), (leaf) => match leaf.kind {
+  ECall(f, xs) -> tg_call_target(f, list_length(xs), nodes)
+  _            -> []
+})
 
 # A callee names one declaration or none: the node is found by id, and
 # a local's id is no node's.
@@ -365,6 +306,7 @@ fn tf_scalar_of(n: Written) : Option[String] = and_then(scalar_ty_named(written_
 
 fn tf_ty_known(t: TypeExpr) : Bool = match t.tkind {
   TyName(_, targs) -> tf_ty_all_known(targs)
+  TyFn(ps, r, _)  -> tf_ty_all_known(ps) and tf_ty_known(r)
   TyParam(_, targs) -> tf_ty_all_known(targs)
   TyList(e)       -> tf_ty_known(e)
   _               -> false

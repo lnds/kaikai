@@ -20,6 +20,10 @@
 # Optional key: `only: a b c` runs just those fixtures of a directory that
 # also holds files this runner does not own.
 #
+# Optional manifest key:
+#
+#   opt: 0                    build every fixture of the directory at -O0 on both backends
+#
 # Marks, one `# fixture: <mark>` line anywhere in the fixture:
 #
 #   # fixture: test        compile with --test; stdout+stderr is the output
@@ -97,6 +101,11 @@ run_one() {
     regex) grepflag=-q ;;
     *) echo "fixture-dir: $dir/FIXTURES: diagnostics must be fixed or regex" >&2; exit 2 ;;
   esac
+
+  if [ "$(sed -n 's/^opt: //p' "$dir/FIXTURES")" = 0 ]; then
+    CFLAGS="$CFLAGS -O0"
+    export KAI_NATIVE_OPT=0
+  fi
 
   if [ "$BACKEND" = native ]; then
     if mark "$f" test || mark "$f" no-stdlib; then
