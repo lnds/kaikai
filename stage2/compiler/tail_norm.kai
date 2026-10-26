@@ -1,15 +1,13 @@
 #[doc("""
 Tail calls written in a shape the rest of the pipeline does not read as one.
 
-A call on the right of `or` / `and`, on the right of `|>`, or bound by a
-`let` the block's tail reads back is still the value of the function. This
-pass writes those as the `if` and call they mean, so fusion and the
-self-tail rewrite, which recognise a call by the leaves of `tail_pos`,
-see them.
-
-Only a function that tail-calls itself or sits in a tail-call group is
-rewritten: the pipe of any other function keeps its shape, which pipe
-fusion and the diagnostics of a pipe stage read.
+A call on the right of `or` / `and`, or on the right of `|>`, is still the
+value of the function. `tailnorm_leaves` reads those as the call they mean,
+for the tail-call graph; `tailnorm_decls` writes them as the `if` and call
+they spell in a function that tail-calls itself, so the self-tail rewrite
+sees them; fusion writes them the same way in the members of a group. A
+function that does not tail-call itself keeps its pipes, which pipe fusion
+and the diagnostics of a pipe stage read.
 """)]
 
 import compiler.ast
@@ -19,27 +17,38 @@ import compiler.ast_ids
 import compiler.call_site_target
 import compiler.mutation_carriers
 import compiler.tail_pos
-import compiler.tailgraph
 
-#[doc("`decls` with the tail calls of every function on a tail-call cycle written as plain calls under `if`.")]
-pub(pkg) fn tailnorm_decls(decls: [Decl]) : [Decl] = {
-  let norm = map(decls, tn_decl)
-  tn_pick(decls, norm, tailgraph_group_syms(tailgraph_build(norm)))
+#[doc("The leaves of `e` with a tail `or`, `and` or pipe read as the call on its right.")]
+pub(pkg) fn tailnorm_leaves(e: Expr) : [Expr] = {
+  let ls = tail_leaves(e)
+  if any(ls, tn_shaped) { flat_map(ls, tn_peel) } else { ls }
 }
 
-# The rewritten declaration where its function is on a cycle, the original elsewhere.
-fn tn_pick(decls: [Decl], norm: [Decl], cyc: [SymId]) : [Decl] = match decls {
-  [] -> []
-  [d, ...rest] -> match norm {
-    [n, ...nrest] -> [if tn_cyclic(n, cyc) { n } else { d }, ...tn_pick(rest, nrest, cyc)]
-    []            -> decls
-  }
+fn tn_peel(leaf: Expr) : [Expr] = match leaf.kind {
+  EBinop(BoOr, _, r)  -> tailnorm_leaves(r)
+  EBinop(BoAnd, _, r) -> tailnorm_leaves(r)
+  EPipe(l, r)         -> [pipe_as_call(l, r)]
+  _                   -> [leaf]
 }
 
-fn tn_cyclic(d: Decl, cyc: [SymId]) : Bool = match d {
-  DFn(_, fid, _, _, _, _, body, _, _, _) ->
-    any(cyc, (s) => sym_raw(s) == sym_raw(fnid_sym(fid))) or any(tail_leaves(body), (leaf) => tn_calls(leaf, fnid_sym(fid)))
-  _ -> false
+#[doc("`decls` with the tail self-calls of every function written as plain calls under `if`.")]
+pub(pkg) fn tailnorm_decls(decls: [Decl]) : [Decl] = map(decls, tn_decl)
+
+fn tn_decl(d: Decl) : Decl = match d {
+  DFn(p, fid, tps, ps, ret, row, body, ln, cl, mo) ->
+    if tn_self_shaped(fnid_sym(fid), body) { DFn(p, fid, tps, ps, ret, row, tail_map(body, tn_leaf), ln, cl, mo) } else { d }
+  _ -> d
+}
+
+# A tail leaf written as `or`, `and` or a pipe, and a tail call to the function itself behind one.
+fn tn_self_shaped(me: SymId, body: Expr) : Bool =
+  any(tail_leaves(body), tn_shaped) and any(tailnorm_leaves(body), (leaf) => tn_calls(leaf, me))
+
+fn tn_shaped(e: Expr) : Bool = match e.kind {
+  EBinop(BoOr, _, _)  -> true
+  EBinop(BoAnd, _, _) -> true
+  EPipe(_, _)         -> true
+  _                   -> false
 }
 
 fn tn_calls(leaf: Expr, me: SymId) : Bool = match leaf.kind {
@@ -50,12 +59,8 @@ fn tn_calls(leaf: Expr, me: SymId) : Bool = match leaf.kind {
   _ -> false
 }
 
-fn tn_decl(d: Decl) : Decl = match d {
-  DFn(p, fid, tps, ps, ret, row, body, ln, cl, mo) -> DFn(p, fid, tps, ps, ret, row, tail_map(body, tn_leaf), ln, cl, mo)
-  _ -> d
-}
-
-fn tn_leaf(e: Expr) : Expr = match e.kind {
+#[doc("The leaf `e` written as the `if` or call it spells; the right side of `or` and `and` is normalised in turn.")]
+pub(pkg) fn tn_leaf(e: Expr) : Expr = match e.kind {
   EBinop(BoOr, l, r)  -> Expr { ...e, kind: EIf(l, mk_expr(EBool(true), e.line, e.col), Some(tail_map(r, tn_leaf))) }
   EBinop(BoAnd, l, r) -> Expr { ...e, kind: EIf(l, tail_map(r, tn_leaf), Some(mk_expr(EBool(false), e.line, e.col))) }
   EPipe(l, r)         -> pipe_as_call(l, r)
