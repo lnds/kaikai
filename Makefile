@@ -611,7 +611,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-field-types test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-net-url test-fs-time test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-cli-flags test-kai-cli
+tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-field-types test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-net-url test-fs-time test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-runtime-global-audit test-mn-determinism test-info test-doc-blocks test-doc test-upgrade-resolver test-cli-flags test-kai-cli
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke + Perceus RC leak ledger (240 fixtures pinned)"
 
 # CI sharding (docs/ci-time-analysis.md §7). The tier1 work is split across
@@ -671,7 +671,8 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # plus both halves of rc-leak-gate and tier0's demos-no-regression cover the
 # prerequisites of `tier1` (the
 # light slices union to TEST_LIGHT_TARGETS, asserted by
-# `test-light-partition` in tier0).
+# `test-light-partition` in tier0). `test-doc-blocks` is the exception: it
+# runs in its own tier1.yml job so doc-only PRs run it too.
 # Adding a phase to `tier1` means adding it to a shard.
 TIER1_LIGHT_SLICES := 8
 TIER1_SELFHOSTS ?= 1
@@ -780,15 +781,14 @@ tier1-shard-8: kaic2
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
 # dispatcher, JSON-escape regressions in the awk converter.
-# Also runs the fenced-code-block compile audit so every example in
-# `docs/info/*.md` and `docs/grammar.md` is guaranteed to type-check
-# against the current stage 2 compiler — `kai info` + grammar.md are
-# the two LLM-authoritative surface references (CLAUDE.md Tier 2 #5
-# + Tier 3 #8).
 test-info: kaic2
 	@tools/test-info.sh
-	@tools/test-info-blocks.sh
-	@tools/test-grammar-blocks.sh
+
+# Every fenced kaikai block in the current docs (README, docs/, docs/info/)
+# builds, parses or is rejected as its fence tag says. CI runs it on every
+# PR, doc-only ones included, as its own job.
+test-doc-blocks: kaic2 bin/kai
+	@tools/test-doc-blocks.sh
 
 # `kai doc` smoke (pure shell + awk + python3 for JSON validation).
 # Guards the human reader over the stdlib #[doc(...)] attributes and
