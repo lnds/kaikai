@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Differential gate for core pruning: each program compiles and runs once
 # with the core pruned as usual and once against the whole core
 # (KAI_CORE_PRUNE=off); exit code, stdout and stderr must match. A pruning
@@ -23,6 +23,7 @@ KAI="$ROOT/bin/kai"
 SELF="$ROOT/tools/prune-differential.sh"
 SKIPS="${PRUNE_DIFF_SKIPS:-$ROOT/tools/prune-differential-skips.txt}"
 SHIMS="$ROOT/tools/prune-differential-shims.txt"
+. "$ROOT/tools/lib/corpus.sh"
 
 norm() { sed -e "s#$ROOT#<root>#g" -e "s#${WORK:-/nonexistent}#<work>#g" -e 's#/private/var#/var#g' -e 's#/tmp\.[A-Za-z0-9]*#/tmp.X#g' \
   -e 's#[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z#<time>#g' -e 's#elapsed: [0-9.]*s#elapsed: <t>#g' \
@@ -38,13 +39,11 @@ run_variant() {
     cover) set -- test --backend="$be" --json --coverage "$base" ;;
   esac
   shim=$(awk -v f="${file#"$ROOT"/}" '$1 == f { print $2 }' "$SHIMS" 2>/dev/null)
-  [ -z "$shim" ] || export CFLAGS="$ROOT/$shim"
-  if [ "$tag" = whole ]; then
-    ( cd "$dir" && KAI_CORE_PRUNE=off timeout 300 "$KAI" "$@" </dev/null ) > "$OUT/$tag.out" 2> "$OUT/$tag.err"
-  else
-    ( cd "$dir" && timeout 300 "$KAI" "$@" </dev/null ) > "$OUT/$tag.out" 2> "$OUT/$tag.err"
-  fi
-  unset CFLAGS
+  local env=()
+  [ -z "$shim" ] || env+=("CFLAGS=$ROOT/$shim")
+  threads=$(kai_corpus_pinned_threads "$file") && env+=("KAI_THREADS=$threads")
+  [ "$tag" = whole ] && env+=("KAI_CORE_PRUNE=off")
+  ( cd "$dir" && env "${env[@]}" timeout 300 "$KAI" "$@" </dev/null ) > "$OUT/$tag.out" 2> "$OUT/$tag.err"
   echo $? > "$OUT/$tag.rc"
 }
 
