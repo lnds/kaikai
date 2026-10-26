@@ -114,7 +114,7 @@ target_build() {
     kai_corpus_build "$1" "$2" KAI_BACKEND=c KAI_MODULAR=0 CC="$WASM_CC" CFLAGS="$WASM_CFLAGS"
   else
     local nopt
-    nopt="$(kai_corpus_native_opt "$1")" || nopt=""
+    nopt="$(kai_corpus_meta "$1" KAI_NATIVE_OPT)" || nopt=""
     kai_corpus_build "$1" "$2" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0
   fi
 }
@@ -147,7 +147,7 @@ target_exec() {
 
 parity_pin() {
   local p
-  p="$(kai_corpus_pinned_threads "$1")" || p=""
+  p="$(kai_corpus_meta "$1" KAI_THREADS)" || p=""
   if [ "$TARGET_BACKEND" = wasm ] || [ "$TARGET_BACKEND" = wasi ]; then p="${p:-1}"; fi
   echo "$p"
 }
@@ -314,7 +314,7 @@ process_one() {
 # reach them from each forked subshell.
 export KAI tmp failures results KAI_CORPUS_SKIPS RUN_TIMEOUT TIMEOUT_CMD
 export ORACLE_BACKEND TARGET_BACKEND WASM_BACKEND
-export -f target_build target_exec parity_pin process_one kai_corpus_build kai_corpus_is_skipped kai_corpus_pinned_threads kai_corpus_native_opt run_with_timeout kai_corpus_normalize_timestamps
+export -f target_build target_exec parity_pin process_one kai_corpus_build kai_corpus_is_skipped kai_corpus_meta run_with_timeout kai_corpus_normalize_timestamps
 
 # Total fixtures (pre-skip).
 total=$(wc -l < "$tmp/entry-points" | tr -d ' ')

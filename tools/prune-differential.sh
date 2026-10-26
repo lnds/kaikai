@@ -10,7 +10,7 @@
 #   prune-differential.sh [--backend c|native] [--jobs N] [--shard I/N] corpus|combos|combos-subset
 #   prune-differential.sh --one <backend> <mode> <file>     (mode: run|test|cover)
 #
-# corpus        every examples/**/*.kai with an .out.expected, run (and test
+# corpus        every examples/**/*.kai entry point (tools/lib/corpus.sh) with an .out.expected, run (and test
 #               where the file carries test blocks)
 # combos        every pair of demand routes, generated into a temp dir
 # combos-subset a fixed small subset of combos
@@ -22,7 +22,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAI="$ROOT/bin/kai"
 SELF="$ROOT/tools/prune-differential.sh"
 SKIPS="${PRUNE_DIFF_SKIPS:-$ROOT/tools/prune-differential-skips.txt}"
-SHIMS="$ROOT/tools/prune-differential-shims.txt"
 . "$ROOT/tools/lib/corpus.sh"
 
 norm() { sed -e "s#$ROOT#<root>#g" -e "s#${WORK:-/nonexistent}#<work>#g" -e 's#/private/var#/var#g' -e 's#/tmp\.[A-Za-z0-9]*#/tmp.X#g' \
@@ -38,10 +37,9 @@ run_variant() {
     test)  set -- test --backend="$be" "$base" ;;
     cover) set -- test --backend="$be" --json --coverage "$base" ;;
   esac
-  shim=$(awk -v f="${file#"$ROOT"/}" '$1 == f { print $2 }' "$SHIMS" 2>/dev/null)
-  local env=()
-  [ -z "$shim" ] || env+=("CFLAGS=$ROOT/$shim")
-  threads=$(kai_corpus_pinned_threads "$file") && env+=("KAI_THREADS=$threads")
+  local env=() shims threads
+  shims=$(kai_corpus_cflags "${file#"$ROOT"/}") && env+=("CFLAGS=$shims")
+  threads=$(kai_corpus_meta "${file#"$ROOT"/}" KAI_THREADS) && env+=("KAI_THREADS=$threads")
   [ "$tag" = whole ] && env+=("KAI_CORE_PRUNE=off")
   ( cd "$dir" && env "${env[@]}" timeout 300 "$KAI" "$@" </dev/null ) > "$OUT/$tag.out" 2> "$OUT/$tag.err"
   echo $? > "$OUT/$tag.rc"
@@ -95,11 +93,12 @@ LIST=$(mktemp "${TMPDIR:-/tmp}/prunediff-list.XXXXXX"); GEN=""
 trap 'rm -f "$LIST"; [ -z "$GEN" ] || rm -rf "$GEN"' EXIT
 
 corpus_cases() {
-  find "$ROOT/examples" -name '*.kai' | sort | while read -r f; do
-    [ -f "${f%.kai}.out.expected" ] || continue
-    grep -qxF "${f#"$ROOT"/}" "$SKIPS" 2>/dev/null && continue
-    echo "run $f"
-    if grep -q '^[[:space:]]*test "' "$f"; then echo "test $f"; echo "cover $f"; fi
+  local f
+  (cd "$ROOT" && KAI_CORPUS_DIRS=$(find examples -type d | sort) kai_corpus_entry_points) | while read -r f; do
+    [ -f "$ROOT/${f%.kai}.out.expected" ] || continue
+    grep -qxF "$f" "$SKIPS" 2>/dev/null && continue
+    echo "run $ROOT/$f"
+    if grep -q '^[[:space:]]*test "' "$ROOT/$f"; then echo "test $ROOT/$f"; echo "cover $ROOT/$f"; fi
   done
 }
 

@@ -208,9 +208,8 @@ RUNTIME_H := runtime.h
 STACK :=
 
 .PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158 test-kir-while-param-slot-1173 test-kir-while-vcell-moved-set test-kir-var-escape-state-1173 test-kir-while-raw-cond-1414 test-kir-while-boxed-cond-1414
-.PHONY: test-issue-1331-op-arg-release-asan test-issue-1331-borrowed-op-arg-asan
 .PHONY: test-mn-sigaltstack-asan test-main-stack-sized test-evf-passthrough test-free-deep test-deep-chains test-deep-chains-native test-deep-ctor-values test-supervision-ended
-.PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-segment-switch test-segment-switch-asan test-segment-runtime test-segment-runtime-asan test-segment-runtime-tsan test-segment-handles test-segment-handles-asan test-segment-handles-native test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-dir-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-dir-protocols test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-tco-fuse-order test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-trmc-dead-drop-deep test-trmc-dead-drop-deep-native test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-dir-unions test-aliases test-dir-sequence test-dir-methods test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-dir-shadowing test-shadowing-arm-lambda-native test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-native-runtime-decl test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-seq test-seq-native test-seq-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-perceus-1902-block-let-move test-perceus-1902-block-let-move-asan test-perceus-1902-block-let-move-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-native test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-perceus-1961-trmc-real-elision-native test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-mutate-receiver-shapes test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-coverage-report test-coverage-report-native test-trap-pads-native test-trap-pads-asan-native test-perceus-2032-bang-operand-use test-perceus-2032-bang-operand-use-asan test-perceus-2032-bang-operand-use-native test-perceus-owned-scope-unused-param test-perceus-owned-scope-unused-param-asan test-perceus-owned-scope-unused-param-native test-perceus-block-let-unused-alias test-perceus-block-let-unused-alias-asan test-perceus-block-let-unused-alias-native test-perceus-closure-capture-tail test-perceus-closure-capture-tail-asan test-perceus-borrow-homonym test-perceus-borrow-homonym-asan test-perceus-borrow-homonym-native test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-cancel-escape test-cancel-escape-native test-mailbox-scope-unwind test-mailbox-scope-unwind-native test-cancel-clause-ubsan test-monitor-ref-asan test-monitor-ref-asan-native test-perceus-asan test-perceus-asan-native test-perceus-switch-scrutinee-selftail test-perceus-switch-scrutinee-selftail-asan test-perceus-switch-scrutinee-selftail-native test-perceus-arm-branch-read test-perceus-arm-branch-read-asan test-perceus-arm-branch-read-native test-perceus-read-identity test-perceus-read-identity-asan test-perceus-read-identity-native test-handle-boxed-slot test-perceus-trmc-step-ledger test-perceus-trmc-step-ledger-asan test-perceus-trmc-step-ledger-native test-perceus-spread-consumes test-perceus-spread-consumes-asan test-perceus-spread-consumes-native test-perceus-borrow-own test-perceus-borrow-own-asan test-perceus-borrow-own-native test-modules-ctor-homonym test-modules-ctor-homonym-native test-modules-list-alias test-modules-list-alias-native test-index-coll-diag-once test-perceus-reuse-untaken-slot test-perceus-reuse-untaken-slot-asan test-perceus-reuse-untaken-slot-native test-perceus-reuse-nested-rebuild test-perceus-reuse-nested-rebuild-asan test-perceus-reuse-nested-rebuild-native test-slice-bound-once test-slice-bound-once-native test-rc-runs-every-thread-count test-rc-runs-every-thread-count-native test-perceus-branch-param-selftail test-perceus-branch-param-selftail-asan test-perceus-branch-param-selftail-native test-perceus-trmc-raw-operand-drop test-perceus-trmc-raw-operand-drop-asan test-perceus-trmc-raw-operand-drop-native test-perceus-pipe-borrowed-slot-alignment test-perceus-pipe-borrowed-slot-alignment-asan test-perceus-pipe-borrowed-slot-alignment-native test-trmc-slot-forms test-trmc-slot-forms-asan test-trmc-slot-forms-native test-trmc-qualified-nullary test-trmc-qualified-nullary-native test-pattern-shapes test-pattern-shapes-native test-variant-capacity test-string-escape-depth test-string-escape-depth-native test-exit-report-asan
+.PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-segment-switch test-segment-switch-asan test-segment-runtime test-segment-runtime-asan test-segment-runtime-tsan test-segment-handles test-segment-handles-asan test-segment-handles-native test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-dir-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-dir-protocols test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-tco-fuse-order test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-trmc-dead-drop-deep test-trmc-dead-drop-deep-native test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1303-single-use-branch-leak test-perceus-1302-tcrec-goto-drops test-perceus-1635-goto-move-collision test-perceus-1758-cond-exit-drop test-perceus-1765-binop-base-tail test-perceus-1768-move-gate-positions test-perceus-1324-char-binder-goto test-perceus-1395-char-param-raw test-perceus-1410-byte-raw-ops test-perceus-1457-fixed-raw-ops test-perceus-1637-int-wrap-ops test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-issue-1394-byte-box test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1328-selftail-borrowed-local test-perceus-1130-borrow-pipe test-perceus-1130-hof-tail-drop test-perceus-1127-borrow-closure test-perceus-1127-borrow-hof test-perceus-747-native-real-slot-uaf test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-dir-unions test-aliases test-dir-sequence test-dir-methods test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-dir-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-native-runtime-decl test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-seq test-seq-native test-seq-asan test-perceus-1180-range-sum test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1783-interp-intern-leak test-perceus-1784-variant-rebuild test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1902-block-let-move test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-mutate-receiver-shapes test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-coverage-report test-coverage-report-native test-trap-pads-native test-trap-pads-asan-native test-perceus-2032-bang-operand-use test-perceus-owned-scope-unused-param test-perceus-block-let-unused-alias test-perceus-closure-capture-tail test-perceus-borrow-homonym test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-cancel-escape test-cancel-escape-native test-mailbox-scope-unwind test-mailbox-scope-unwind-native test-cancel-clause-ubsan test-monitor-ref-asan test-monitor-ref-asan-native test-perceus-asan test-perceus-asan-native test-perceus-switch-scrutinee-selftail test-perceus-arm-branch-read test-perceus-read-identity test-handle-boxed-slot test-perceus-trmc-step-ledger test-perceus-spread-consumes test-perceus-borrow-own test-modules-ctor-homonym test-modules-ctor-homonym-native test-modules-list-alias test-modules-list-alias-native test-index-coll-diag-once test-perceus-reuse-untaken-slot test-perceus-reuse-nested-rebuild test-slice-bound-once test-slice-bound-once-native test-rc-runs-every-thread-count test-rc-runs-every-thread-count-native test-perceus-branch-param-selftail test-perceus-trmc-raw-operand-drop test-perceus-pipe-borrowed-slot-alignment test-trmc-slot-forms test-trmc-slot-forms-asan test-trmc-slot-forms-native test-trmc-qualified-nullary test-pattern-shapes test-pattern-shapes-native test-variant-capacity test-string-escape-depth test-string-escape-depth-native test-exit-report-asan
 all: $(TARGET)
 
 $(KAIC1):
@@ -1220,18 +1219,6 @@ test-issue-1564-promoted-cell-across-handle: $(TARGET) build
 	done; \
 	echo "issue-1564 OK (C -O0 + -O2: cell write survives the abandoning handle)"
 
-# Native half — the same loss reproduced on the default backend.
-test-issue-1564-promoted-cell-across-handle-native: $(TARGET) bin-kai build
-	@set -e; \
-	f=issue_1564_promoted_cell_across_discarding_handle; \
-	KAI_BACKEND=native ../bin/kai build ../examples/effects/$$f.kai -o build/s2-$$f-nat 2> build/s2-$$f-nat.err \
-	  || { echo "issue-1564-native FAIL (native build errored)"; cat build/s2-$$f-nat.err; exit 1; }; \
-	./build/s2-$$f-nat > build/s2-$$f-nat.out \
-	  || { echo "issue-1564-native FAIL (run)"; exit 1; }; \
-	diff -q ../examples/effects/$$f.out.expected build/s2-$$f-nat.out > /dev/null \
-	  && echo "issue-1564-native OK (cell write survives the abandoning handle)" \
-	  || { echo "issue-1564-native DIFF"; diff ../examples/effects/$$f.out.expected build/s2-$$f-nat.out; exit 1; }
-
 # m12.7.x FFI v1 regression — `[<extern_c>]` axiom lowers to a
 # direct `extern "C"` call. Compiles + runs the fixture on the C
 # backend so a regression on the FFI path (parser, lower_axiom_one,
@@ -1417,16 +1404,6 @@ test-numeric-real-nan: $(TARGET) build
 	  && echo "real-nan OK (C backend)" \
 	  || { echo "real-nan DIFF (C backend)"; exit 1; }
 
-.PHONY: test-numeric-real-nan-native
-test-numeric-real-nan-native: $(TARGET) bin-kai build
-	@set -e; \
-	KAI_BACKEND=native ../bin/kai build ../examples/numeric/real_nan_comparisons.kai -o build/real_nan_comparisons-nat 2> build/real_nan_comparisons-nat.buildlog \
-	  || { echo "real-nan FAIL (native build errored)"; cat build/real_nan_comparisons-nat.buildlog; exit 1; }; \
-	./build/real_nan_comparisons-nat > build/real_nan_comparisons-nat.out; \
-	diff ../examples/numeric/real_nan_comparisons.out.expected build/real_nan_comparisons-nat.out \
-	  && echo "real-nan OK (native)" \
-	  || { echo "real-nan DIFF (native)"; exit 1; }
-
 # Issue #1637 — `Int.MIN / -1` and `Int.MIN % -1` have no representable
 # result; both must trap "divide overflow" (same discipline as the raw
 # checked helper) instead of running hardware `sdiv`/`srem` UB.
@@ -1593,7 +1570,7 @@ endif
 # kai end-to-end, not raw kaic2 — the routing lives in kai.
 test-ffi-cflags-shim: $(TARGET) bin-kai build
 	@set -e; \
-	CFLAGS="../examples/ffi/cflags_shim.c" ../bin/kai build --backend=c ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-c 2> build/cflags-shim-c.err \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi/cflags_shim_link.kai)" ../bin/kai build --backend=c ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-c 2> build/cflags-shim-c.err \
 	  || { echo "ffi-cflags-shim BUILD FAIL (C backend)"; cat build/cflags-shim-c.err; exit 1; }; \
 	./build/cflags-shim-c > build/cflags-shim-c.out; \
 	diff -q ../examples/ffi/cflags_shim_link.out.expected build/cflags-shim-c.out > /dev/null \
@@ -1603,7 +1580,7 @@ test-ffi-cflags-shim: $(TARGET) bin-kai build
 ifeq ($(KAI_LLVM),1)
 test-ffi-cflags-shim-native: $(TARGET) bin-kai build
 	@set -e; \
-	CFLAGS="../examples/ffi/cflags_shim.c" KAI_BACKEND=native ../bin/kai build ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-nat 2> build/cflags-shim-nat.err \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi/cflags_shim_link.kai)" KAI_BACKEND=native ../bin/kai build ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-nat 2> build/cflags-shim-nat.err \
 	  || { echo "ffi-cflags-shim BUILD FAIL (native)"; cat build/cflags-shim-nat.err; exit 1; }; \
 	./build/cflags-shim-nat > build/cflags-shim-nat.out; \
 	diff -q ../examples/ffi/cflags_shim_link.out.expected build/cflags-shim-nat.out > /dev/null \
@@ -1623,7 +1600,7 @@ FFI_EXPORT_FIXTURES := export_qsort export_userdata export_thread
 define ffi_export_run
 	@set -e; \
 	for f in $(FFI_EXPORT_FIXTURES); do \
-	  $(2) CFLAGS="../examples/ffi/$${f}_shim.c" ../bin/kai build $(3) ../examples/ffi/$$f.kai -o build/$$f-$(1) 2> build/$$f-$(1).err \
+	  $(2) CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi/$$f.kai)" ../bin/kai build $(3) ../examples/ffi/$$f.kai -o build/$$f-$(1) 2> build/$$f-$(1).err \
 	    || { echo "ffi-export $$f BUILD FAIL ($(1))"; cat build/$$f-$(1).err; exit 1; }; \
 	  ns="1 2 4 8"; [ $$f = export_thread ] && ns="2 4 8"; \
 	  for n in $$ns; do \
@@ -1702,7 +1679,7 @@ endif
 # entry fiber alone — which the nursery half of the fixture exercises.
 test-issue-1556-main-thread-affinity: $(TARGET) bin-kai build
 	@set -e; \
-	CFLAGS="../examples/ffi/main_thread_shim.c" ../bin/kai build --backend=c ../examples/ffi/main_thread_affinity.kai -o build/main-thread-c 2> build/main-thread-c.err \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi/main_thread_affinity.kai)" ../bin/kai build --backend=c ../examples/ffi/main_thread_affinity.kai -o build/main-thread-c 2> build/main-thread-c.err \
 	  || { echo "issue-1556 BUILD FAIL (C backend)"; cat build/main-thread-c.err; exit 1; }; \
 	for n in 1 2 4 8; do \
 	  KAI_THREADS=$$n ./build/main-thread-c > build/main-thread-c.out; \
@@ -1714,7 +1691,7 @@ test-issue-1556-main-thread-affinity: $(TARGET) bin-kai build
 ifeq ($(KAI_LLVM),1)
 test-issue-1556-main-thread-affinity-native: $(TARGET) bin-kai build
 	@set -e; \
-	CFLAGS="../examples/ffi/main_thread_shim.c" KAI_BACKEND=native ../bin/kai build ../examples/ffi/main_thread_affinity.kai -o build/main-thread-nat 2> build/main-thread-nat.err \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi/main_thread_affinity.kai)" KAI_BACKEND=native ../bin/kai build ../examples/ffi/main_thread_affinity.kai -o build/main-thread-nat 2> build/main-thread-nat.err \
 	  || { echo "issue-1556 BUILD FAIL (native)"; cat build/main-thread-nat.err; exit 1; }; \
 	for n in 1 2 4 8; do \
 	  KAI_THREADS=$$n ./build/main-thread-nat > build/main-thread-nat.out; \
@@ -2696,29 +2673,6 @@ test-runtime-shadow: $(TARGET) build
 	    || { echo "runtime-shadow DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# ASAN+UBSan sibling of test-runtime-shadow — the rename touches
-# the runtime helper bodies, so the asan variant catches a UAF
-# regression introduced by a botched consume / decref edit on
-# `kai_op_*`.
-test-runtime-shadow-asan: $(TARGET) build
-	@set -e; \
-	for name in $(RUNTIME_SHADOW_FIXTURES); do \
-	  $(KAIC2) ../examples/effects/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "runtime-shadow-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "runtime-shadow-asan OK $$name" \
-	    || { echo "runtime-shadow-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # The runtime must adopt, not displace, an alternate signal stack that a
 # sanitizer already installed — a displaced owner munmaps our malloc'd block
 # at thread exit and ASAN treats the EINVAL as fatal. Only ASAN can observe
@@ -3061,28 +3015,6 @@ test-log-asan: $(TARGET) build
 # free if the buffer lifetime ever broke; UBSan catches signed
 # overflow in the int_range modulo arithmetic. Wired into the
 # top-level `tier1-asan` rule alongside the other ASAN gates.
-SECURERANDOM_FIXTURES := random_secure_basic
-
-test-securerandom-asan: $(TARGET) build
-	@set -e; \
-	for name in $(SECURERANDOM_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib \
-	    ../examples/stdlib/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "securerandom-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/stdlib/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "securerandom-asan OK $$name" \
-	    || { echo "securerandom-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # Issue #103 — ASAN+UBSan sibling for the trap-exit / outer Cancel
 # handler regression fixture. The fix touches the link table walk
 # and the evidence-lookup hook for the Cancel effect; ASan catches
@@ -3090,27 +3022,6 @@ test-securerandom-asan: $(TARGET) build
 # tail, or a miscompiled longjmp landing pad), and UBSan catches
 # signed misuse in the link traversal. Wired into the top-level
 # `tier1-asan` rule alongside the other ASAN gates.
-TRAP_EXIT_CANCEL_FIXTURES := issue_103_trap_exit_cancel_handler
-
-test-trap-exit-cancel-asan: $(TARGET) build
-	@set -e; \
-	for name in $(TRAP_EXIT_CANCEL_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "trap-exit-cancel-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "trap-exit-cancel-asan OK $$name" \
-	    || { echo "trap-exit-cancel-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # The ref `Monitor.monitor` returns owns its own reference to the pid; the
 # fixtures drop it, demonitor with it, and receive the down notice.
 MONITOR_REF_ASAN_FIXTURES := monitor_ref_release monitor_ended_actor monitor_after_scope_close nested_mailbox_monitor
@@ -3257,27 +3168,6 @@ test-cancel-clause-ubsan: $(TARGET) build
 # stderr pipe, the chunked read buffer, the EPIPE dead-reader write
 # path, and the readiness parks of a reader whose child stays silent and
 # of a writer whose child stops reading.
-PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers process_piped_stderr process_write_stdin_timers process_kill_group
-
-test-process-basic-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PROCESS_BASIC_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "process-basic-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "process-basic-asan OK $$name" \
-	    || { echo "process-basic-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # stdlib/time.kai smoke test — exercises the Clock effect (wall_now,
 # monotonic_now, sleep_ns) plus pure Duration / Instant arithmetic.
 # v0 has no default Clock handler (m8.x scope); the fixture installs
@@ -3630,73 +3520,6 @@ test-units: $(TARGET) build
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/units-$$name.err \
 	    || { echo "units FAIL $$name (kaic2 errored)"; cat build/units-$$name.err; exit 1; }; \
 	  echo "units OK $$name"; \
-	done
-
-# repeated `list_append` of byte chunks for padding). The runtime has
-# no Perceus discipline yet (cf. `project_emitter_no_rc_discipline`),
-# so a regression that double-frees a digest buffer or leaks an
-# intermediate window would surface here first. UBSan additionally
-# guards the 64-bit modular arithmetic in SHA-512 — the
-# decompose-and-recombine path inside `sha_add64` / `sha_shl64` /
-# `sha_combine64` exists specifically to avoid the signed-overflow
-# UB that direct `int64_t << k` and `int64_t + int64_t` would trip.
-test-stdlib-crypto-asan: $(TARGET) build
-	@set -e; \
-	name=crypto_hash_basic; \
-	$(KAIC2) --path ../stdlib \
-	  ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
-	  || { echo "stdlib-crypto-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
-	  || { echo "stdlib-crypto-asan FAIL $$name (cc errored)"; exit 1; }; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
-	  echo "stdlib-crypto-asan FAIL $$name — sanitizer diagnostic:"; \
-	  cat build/stdlib-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
-	  && echo "stdlib-crypto-asan OK $$name" \
-	  || { echo "stdlib-crypto-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }
-
-# Issue #85 / #157 — regex predicate fixtures under ASAN+UBSan. The
-# refinement-side regex path crosses three RC-sensitive shapes per
-# fixture: the `~r/.../` sigil's compile-time-built pattern string,
-# the `Regex` carrier value crossing the `matches` call boundary,
-# and the synthesised `__ref_pred_<Type>` fn dispatching through a
-# match-arm narrowing guard. The runtime has no Perceus discipline
-# yet (cf. `project_emitter_no_rc_discipline`), so a regression that
-# double-frees the pattern string or leaks the compiled NFA would
-# surface here first.
-#
-# regex_predicate_basic gates the v1 sigil + matches predicate
-# (issue #85). regex_subsume_basic / _alpha gate the typer-side
-# subsumption check (issue #157) — when the requires assert is
-# proven redundant the runtime path drops it but the
-# refinement-side check from match-arm narrowing still fires; ASAN
-# verifies the surviving path doesn't leak after the drop.
-test-stdlib-regex-predicate-asan: $(TARGET) build
-	@set -e; \
-	for name in regex_predicate_basic regex_subsume_basic regex_subsume_alpha; do \
-	  $(KAIC2) --path ../stdlib \
-	    ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
-	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
-	    || { echo "stdlib-regex-predicate-asan FAIL $$name (cc errored)"; exit 1; }; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
-	    echo "stdlib-regex-predicate-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/stdlib-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
-	    && echo "stdlib-regex-predicate-asan OK $$name" \
-	    || { echo "stdlib-regex-predicate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
 	done
 
 # Typed holes (M10): every example under examples/holes/ must
@@ -5214,17 +5037,6 @@ test-effects-process_uid: $(TARGET) build core-cache-warm
 	  && echo "effects OK $$f (Process.uid is the uid peer_uid reads; a handler answers it)" \
 	  || { echo "effects FAIL $$f (output mismatch)"; diff ../examples/effects/$$f.out.expected build/s2-$$f.out; exit 1; }
 
-test-effects-process_uid-native: $(TARGET) bin-kai build
-	@set -e; \
-	f=process_uid; \
-	KAI_BACKEND=native ../bin/kai build ../examples/effects/$$f.kai -o build/s2-$$f-nat 2> build/s2-$$f-nat.err \
-	  || { echo "effects FAIL $$f (native build errored)"; cat build/s2-$$f-nat.err; exit 1; }; \
-	./build/s2-$$f-nat > build/s2-$$f-nat.out 2>&1 \
-	  || { echo "effects FAIL $$f (native binary exit non-zero)"; cat build/s2-$$f-nat.out; exit 1; }; \
-	diff -q ../examples/effects/$$f.out.expected build/s2-$$f-nat.out > /dev/null \
-	  && echo "effects OK $$f (native: Process.uid is the uid peer_uid reads; a handler answers it)" \
-	  || { echo "effects FAIL $$f (native output mismatch)"; diff ../examples/effects/$$f.out.expected build/s2-$$f-nat.out; exit 1; }
-
 test-effects-issue_141_log_default: $(TARGET) build core-cache-warm
 	@set -e; \
 	for f in ../examples/effects/issue_141_log_default.kai; do \
@@ -6663,20 +6475,6 @@ test-perceus-1186-map-pipe-terminal-field: $(TARGET) build
 	  && echo "perceus-1186-map-pipe-terminal-field OK (field-stage map-pipe fused into map_sum and typed)" \
 	  || { echo "perceus-1186-map-pipe-terminal-field FAIL (output diff)"; diff $$exp build/s2-1186mptf.out; exit 1; }
 
-# Issue #1134 (native) — the fused chain must run byte-identically on the
-# native backend. Native-gated (tier1-native). Same purity source; asserts
-# output parity + the fused cons budget carries to native codegen.
-test-perceus-1134-pipe-fusion-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/pipe_fusion_purity_1134.kai; \
-	exp=../examples/perceus/pipe_fusion_purity_1134.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1134pfn 2> build/s2-1134pfn.err \
-	  || { echo "perceus-1134-pipe-fusion-native FAIL (native build errored)"; cat build/s2-1134pfn.err; exit 1; }; \
-	./build/s2-1134pfn > build/s2-1134pfn.out; \
-	diff -q $$exp build/s2-1134pfn.out > /dev/null \
-	  && echo "perceus-1134-pipe-fusion-native OK (fused chain byte-identical on native)" \
-	  || { echo "perceus-1134-pipe-fusion-native FAIL (native output diff)"; diff $$exp build/s2-1134pfn.out; exit 1; }
-
 # Issue #1205 (native) — closure specialisation. The idiomatic `vec.foldl`
 # over a pure lambda must (a) produce the exact sum and (b) emit a
 # specialised loop with ZERO per-element `call_ind` — the lambda body is
@@ -6815,74 +6613,6 @@ test-collect-multiread-1208: $(TARGET) bin-kai build
 	  || { echo "collect-multiread-1208 FAIL (no bind-once binder emitted — the multi-read guard did not fire)"; exit 1; }; \
 	echo "collect-multiread-1208 OK (every boxed field round-trips; bind-once binder present)"
 
-# Issue #1134 (native) — the range-headed terminal fold must fold a 1M-wide
-# range in O(1) stack on native (the counting loop is tail-recursive) and
-# produce the exact result. Native-gated (tier1-native).
-test-perceus-1134-pipe-fusion-terminal-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/pipe_fusion_terminal_1134.kai; \
-	exp=../examples/perceus/pipe_fusion_terminal_1134.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1134pftn 2> build/s2-1134pftn.err \
-	  || { echo "perceus-1134-pipe-fusion-terminal-native FAIL (native build errored)"; cat build/s2-1134pftn.err; exit 1; }; \
-	./build/s2-1134pftn > build/s2-1134pftn.out; \
-	diff -q $$exp build/s2-1134pftn.out > /dev/null \
-	  && echo "perceus-1134-pipe-fusion-terminal-native OK (range terminal-fold byte-identical on native, O(1) stack)" \
-	  || { echo "perceus-1134-pipe-fusion-terminal-native FAIL (native output diff)"; diff $$exp build/s2-1134pftn.out; exit 1; }
-
-# Issue #1143 (native) — lambda-stage fusion parity: exact output + the
-# per-element path stays allocation-free on native too. Native-gated
-# (tier1-native).
-test-perceus-1143-pipe-fusion-lambda-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/pipe_fusion_lambda_1143.kai; \
-	exp=../examples/perceus/pipe_fusion_lambda_1143.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1143pfln 2> build/s2-1143pfln.err \
-	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (native build errored)"; cat build/s2-1143pfln.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfln > build/s2-1143pfln.out 2> build/s2-1143pfln.rc; \
-	diff -q $$exp build/s2-1143pfln.out > /dev/null \
-	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (output diff)"; diff $$exp build/s2-1143pfln.out; exit 1; }; \
-	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfln.rc | head -1 | cut -d= -f2); \
-	[ -n "$$tot" ] && [ "$$tot" -lt 100 ] \
-	  && echo "perceus-1143-pipe-fusion-lambda-native OK (alloc_total=$$tot < 100 on native)" \
-	  || { echo "perceus-1143-pipe-fusion-lambda-native FAIL (alloc_total=$$tot)"; exit 1; }
-
-# Issue #1143 (native) — ring/length terminal fusion parity on native.
-# Native-gated (tier1-native).
-test-perceus-1143-pipe-fusion-ring-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/pipe_fusion_ring_1143.kai; \
-	exp=../examples/perceus/pipe_fusion_ring_1143.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1143pfrn 2> build/s2-1143pfrn.err \
-	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (native build errored)"; cat build/s2-1143pfrn.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfrn > build/s2-1143pfrn.out 2> build/s2-1143pfrn.rc; \
-	diff -q $$exp build/s2-1143pfrn.out > /dev/null \
-	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (output diff)"; diff $$exp build/s2-1143pfrn.out; exit 1; }; \
-	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1143pfrn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$tot" ] && [ "$$tot" -lt 100 ] \
-	  && echo "perceus-1143-pipe-fusion-ring-native OK (alloc_total=$$tot < 100 on native)" \
-	  || { echo "perceus-1143-pipe-fusion-ring-native FAIL (alloc_total=$$tot)"; exit 1; }
-
-# Issue #1117 (native) — same closure-param leak on the native backend: the
-# lifted `KFnLambda` never dropped its owned params. The fix emits a `KDrop`
-# per param before `KRet`. Native-gated (tier1-native); asserts output parity
-# + `leaked` < 1000. The map pipe here projects a field, so no nested-closure
-# capture is involved (the capture-lifecycle residual is a separate concern).
-test-perceus-1117-native-map-pipe-record-leak: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/map_pipe_record_leak_1117.kai; \
-	exp=../examples/perceus/map_pipe_record_leak_1117.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1117mprln 2> build/s2-1117mprln.err \
-	  || { echo "perceus-1117-native-map-pipe-record-leak FAIL (native build errored)"; cat build/s2-1117mprln.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1117mprln > build/s2-1117mprln.out 2> build/s2-1117mprln.rc; \
-	diff -q $$exp build/s2-1117mprln.out > /dev/null \
-	  || { echo "perceus-1117-native-map-pipe-record-leak FAIL (output diff)"; diff $$exp build/s2-1117mprln.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1117mprln.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] \
-	  || { echo "perceus-1117-native-map-pipe-record-leak FAIL (no leaked line)"; cat build/s2-1117mprln.rc; exit 1; }; \
-	[ "$$leaked" -lt 1000 ] \
-	  && echo "perceus-1117-native-map-pipe-record-leak OK (native leaked=$$leaked < 1000; closure-param KDrop landed)" \
-	  || { echo "perceus-1117-native-map-pipe-record-leak FAIL (native leaked=$$leaked — closure-param leak regressed)"; exit 1; }
-
 # Issue #1120 — borrow annotations on read-only Array prims collapse the
 # per-access container refcounting. The Array[Int] sum over N=100 used to
 # cost 2 rc ops per access (200 incref) — one container incref + decref
@@ -6909,22 +6639,6 @@ test-perceus-1120-array-borrow: $(TARGET) build
 	[ "$$inc" -lt 150 ] \
 	  && echo "perceus-1120-array-borrow OK (incref_total=$$inc < 150 over 100 reads; container per-access RC elided, only the element escapes)" \
 	  || { echo "perceus-1120-array-borrow FAIL (incref_total=$$inc — container dup regressed, expected ~200 pre-borrow)"; exit 1; }
-
-test-perceus-1120-array-borrow-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/array_borrow_read_1120.kai; \
-	exp=../examples/perceus/array_borrow_read_1120.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1120abn 2> build/s2-1120abn.err \
-	  || { echo "perceus-1120-array-borrow-native FAIL (native build errored)"; cat build/s2-1120abn.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1120abn > build/s2-1120abn.out 2> build/s2-1120abn.rc; \
-	diff -q $$exp build/s2-1120abn.out > /dev/null \
-	  || { echo "perceus-1120-array-borrow-native FAIL (output diff)"; diff $$exp build/s2-1120abn.out; exit 1; }; \
-	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1120abn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$inc" ] \
-	  || { echo "perceus-1120-array-borrow-native FAIL (no incref_total line)"; cat build/s2-1120abn.rc; exit 1; }; \
-	[ "$$inc" -lt 150 ] \
-	  && echo "perceus-1120-array-borrow-native OK (native incref_total=$$inc < 150; container borrow inherited from the shared KIR)" \
-	  || { echo "perceus-1120-array-borrow-native FAIL (native incref_total=$$inc — container dup regressed)"; exit 1; }
 
 # Issue #1135 stage 1 — Vec[T] pure value vector: uniqueness in-place /
 # copy-on-write discipline plus unboxed element storage. Four gates:
@@ -7126,37 +6840,6 @@ test-perceus-1151-vec-push-growth: $(TARGET) build
 	done; \
 	echo "perceus-1151-vec-push-growth OK (recursive push growth linear on both append regimes)"
 
-test-perceus-1151-vec-push-growth-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(PERCEUS_1151_GROWTH_FIXTURES); do \
-	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-1151-vec-push-growth-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  ./build/s2-$$name-n > build/s2-$$name-n.out; \
-	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-1151-vec-push-growth-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
-	done; \
-	echo "perceus-1151-vec-push-growth-native OK (outputs match the C-direct gate)"
-
-test-perceus-1151-vec-push-growth-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_1151_GROWTH_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-1151-vec-push-growth-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-1151-vec-push-growth-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-1151-vec-push-growth-asan OK"
-
 # Issue #1153 — module-call consumer linearity + forwarder inlining.
 # Both fixtures assert exact counters: every vec write in the loops
 # lands in place (vec_cow=0), on the qualified non-forwarder call
@@ -7200,25 +6883,6 @@ test-perceus-1153-modcall-linear-native: $(TARGET) bin-kai build
 	         grep vec_ build/s2-$$name-n.rc || true; exit 1; }; \
 	done; \
 	echo "perceus-1153-modcall-linear-native OK (counters match the C-direct gate)"
-
-test-perceus-1153-modcall-linear-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_1153_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-1153-modcall-linear-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-1153-modcall-linear-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-1153-modcall-linear-asan OK"
 
 # KAI_TRACE_RC_RUNS=2 runs main twice at any thread count. Under M:N the
 # second run must allocate, and the growth it measures must equal the
@@ -7347,25 +7011,6 @@ test-perceus-1150-vec-surface-native: $(TARGET) bin-kai build
 	  || { echo "perceus-1150-vec-surface-native FAIL (descent alloc_total=$$tot)"; exit 1; }; \
 	echo "perceus-1150-vec-surface-native OK (outputs match; descent alloc=$$tot)"
 
-test-perceus-1150-vec-surface-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_1150_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-1150-vec-surface-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-1150-vec-surface-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-1150-vec-surface-asan OK"
-
 # Issue #1126 — the tail-recursive read loop must drop its re-threaded
 # Array container. Post-#1120 the borrow read stopped consuming the
 # container but the dup fallback still fired on the re-thread, so the goto
@@ -7396,23 +7041,6 @@ test-perceus-1126-read-loop-drop: $(TARGET) build
 	  echo "perceus-1126-read-loop-drop OK ($$name: C leaked=$$leaked < 100; array + records reclaimed)"; \
 	done
 
-test-perceus-1126-read-loop-drop-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(PERCEUS_1126_FIXTURES); do \
-	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  KAI_BACKEND=native ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-1126-read-loop-drop-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
-	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-1126-read-loop-drop-native FAIL ($$name: output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] \
-	    || { echo "perceus-1126-read-loop-drop-native FAIL ($$name: no leaked line)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  [ "$$leaked" -lt 100 ] \
-	    || { echo "perceus-1126-read-loop-drop-native FAIL ($$name: native leaked=$$leaked — container drop regressed)"; exit 1; }; \
-	  echo "perceus-1126-read-loop-drop-native OK ($$name: native leaked=$$leaked < 100; array + records reclaimed)"; \
-	done
-
 # Issue #1127 — borrow generalized to user parameters. The closure probe
 # (`go(n, acc, f)`) threads a closure through a tail-recursive loop; under
 # the owned convention it paid 2 rc ops per iteration (caller incref +
@@ -7440,23 +7068,6 @@ test-perceus-1127-borrow-closure: $(TARGET) build
 	[ -n "$$inc" ] && [ "$$inc" -lt 100 ] \
 	  && echo "perceus-1127-borrow-closure OK (#1130: incref_total=$$inc < 100 over 1000 iters — closure per-iteration RC collapsed to ~0; leaked=$$leaked bounded)" \
 	  || { echo "perceus-1127-borrow-closure FAIL (incref_total=$$inc — closure ^ NOT borrowed, per-iter dup regressed; expected ~2000 pre-#1130)"; exit 1; }
-
-test-perceus-1127-borrow-closure-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/borrow_closure_1127.kai; \
-	exp=../examples/perceus/borrow_closure_1127.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1127bcn 2> build/s2-1127bcn.err \
-	  || { echo "perceus-1127-borrow-closure-native FAIL (native build errored)"; cat build/s2-1127bcn.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1127bcn > build/s2-1127bcn.out 2> build/s2-1127bcn.rc; \
-	diff -q $$exp build/s2-1127bcn.out > /dev/null \
-	  || { echo "perceus-1127-borrow-closure-native FAIL (output diff)"; diff $$exp build/s2-1127bcn.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1127bcn.rc | head -1 | cut -d= -f2); \
-	inc=$$(grep -oE 'incref_total=[0-9]+' build/s2-1127bcn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  || { echo "perceus-1127-borrow-closure-native FAIL (native leaked=$$leaked — closure orphaned)"; exit 1; }; \
-	[ -n "$$inc" ] && [ "$$inc" -lt 100 ] \
-	  && echo "perceus-1127-borrow-closure-native OK (#1130 native: incref_total=$$inc < 100; closure borrow inherited from shared KIR, leaked=$$leaked bounded)" \
-	  || { echo "perceus-1127-borrow-closure-native FAIL (native incref_total=$$inc — closure per-iter dup regressed)"; exit 1; }
 
 # The known-fn-name set and the prim-only borrow map are built once per
 # Perceus pass and threaded to every decl. A decl reached late must see the
@@ -7494,19 +7105,6 @@ test-perceus-1127-borrow-hof: $(TARGET) build
 	  && echo "perceus-1127-borrow-hof OK (#1130: stdlib map/filter/foldl ^ closure ACTIVE — foldl borrow-through, map/filter dup-on-consume at the owned loop; leaked=$$leaked bounded, no UAF)" \
 	  || { echo "perceus-1127-borrow-hof FAIL (leaked=$$leaked — closure ^ orphaned the closure or double-freed)"; exit 1; }
 
-# Native half of the HOF gate (runs on the native suite — the tier1 shard's
-# kaic2 is C-only). Split out per the #1126 precedent.
-test-perceus-1127-borrow-hof-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/borrow_stdlib_hof_1127.kai; \
-	exp=../examples/perceus/borrow_stdlib_hof_1127.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1127hofn 2> build/s2-1127hofn.err \
-	  || { echo "perceus-1127-borrow-hof-native FAIL (native build errored)"; cat build/s2-1127hofn.err; exit 1; }; \
-	./build/s2-1127hofn > build/s2-1127hofn.out; \
-	diff -q $$exp build/s2-1127hofn.out > /dev/null \
-	  && echo "perceus-1127-borrow-hof-native OK" \
-	  || { echo "perceus-1127-borrow-hof-native FAIL (output diff)"; diff $$exp build/s2-1127hofn.out; exit 1; }
-
 # Issue #1127 — TCO preserved for a borrowed self-recursive descent. A
 # borrow-through tail call plants no drop, so a 1M-deep left-descent runs
 # without growing the stack. A regression that broke tailness would SIGSEGV
@@ -7523,20 +7121,6 @@ test-perceus-1127-borrow-tco: $(TARGET) build
 	diff -q $$exp build/s2-1127tco.out > /dev/null \
 	  && echo "perceus-1127-borrow-tco OK (1M-deep borrowed descent, no stack growth)" \
 	  || { echo "perceus-1127-borrow-tco FAIL (output diff)"; diff $$exp build/s2-1127tco.out; exit 1; }
-
-# Native half of the TCO gate (native suite — the tier1 shard's kaic2 is
-# C-only). Split out per the #1126 precedent.
-test-perceus-1127-borrow-tco-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/borrow_tco_descent_1127.kai; \
-	exp=../examples/perceus/borrow_tco_descent_1127.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1127tcon 2> build/s2-1127tcon.err \
-	  || { echo "perceus-1127-borrow-tco-native FAIL (native build errored)"; cat build/s2-1127tcon.err; exit 1; }; \
-	./build/s2-1127tcon > build/s2-1127tcon.out \
-	  || { echo "perceus-1127-borrow-tco-native FAIL (stack overflow)"; exit 1; }; \
-	diff -q $$exp build/s2-1127tcon.out > /dev/null \
-	  && echo "perceus-1127-borrow-tco-native OK" \
-	  || { echo "perceus-1127-borrow-tco-native FAIL (output diff)"; diff $$exp build/s2-1127tcon.out; exit 1; }
 
 # A qualified nullary constructor in a modulo-cons slot keeps TRMC: the
 # self-call detector reads it as a leaf, not as a shape that may hide a
@@ -7555,17 +7139,6 @@ test-trmc-qualified-nullary: $(TARGET) build
 	  && echo "trmc-qualified-nullary OK (1M-deep build, qualified nullary slot, O(1) stack)" \
 	  || { echo "trmc-qualified-nullary FAIL (output diff)"; diff $$dir/main.out.expected build/s2-trmcqn.out; exit 1; }
 
-test-trmc-qualified-nullary-native: $(TARGET) bin-kai build
-	@set -e; \
-	dir=../examples/perceus/trmc_qualified_nullary; \
-	KAI_BACKEND=native ../bin/kai build $$dir/main.kai -o build/s2-trmcqnn 2> build/s2-trmcqnn.err \
-	  || { echo "trmc-qualified-nullary-native FAIL (native build errored)"; cat build/s2-trmcqnn.err; exit 1; }; \
-	./build/s2-trmcqnn > build/s2-trmcqnn.out \
-	  || { echo "trmc-qualified-nullary-native FAIL (stack overflow — TRMC lost)"; exit 1; }; \
-	diff -q $$dir/main.out.expected build/s2-trmcqnn.out > /dev/null \
-	  && echo "trmc-qualified-nullary-native OK" \
-	  || { echo "trmc-qualified-nullary-native FAIL (output diff)"; diff $$dir/main.out.expected build/s2-trmcqnn.out; exit 1; }
-
 # Issue #1130 — a `^`-borrowed closure through the apply-pipe (`a |> f`)
 # AND a later direct call. A regression that let the pipe consume the
 # skip-set closure crashes "non-callable value" on the second read.
@@ -7583,19 +7156,6 @@ test-perceus-1130-borrow-pipe: $(TARGET) build
 	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
 	  && echo "perceus-1130-borrow-pipe OK (apply-pipe borrow sound over two reads; leaked=$$leaked bounded)" \
 	  || { echo "perceus-1130-borrow-pipe FAIL (leaked=$$leaked)"; exit 1; }
-
-# Native half (tier1-native suite; the tier1 shard's kaic2 is C-only).
-test-perceus-1130-borrow-pipe-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/borrow_closure_pipe_1130.kai; \
-	exp=../examples/perceus/borrow_closure_pipe_1130.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1130bpn 2> build/s2-1130bpn.err \
-	  || { echo "perceus-1130-borrow-pipe-native FAIL (native build errored)"; cat build/s2-1130bpn.err; exit 1; }; \
-	./build/s2-1130bpn > build/s2-1130bpn.out \
-	  || { echo "perceus-1130-borrow-pipe-native FAIL (crash — pipe-borrow UAF?)"; exit 1; }; \
-	diff -q $$exp build/s2-1130bpn.out > /dev/null \
-	  && echo "perceus-1130-borrow-pipe-native OK" \
-	  || { echo "perceus-1130-borrow-pipe-native FAIL (output diff)"; diff $$exp build/s2-1130bpn.out; exit 1; }
 
 # Issue #1130 — a freshly materialised closure passed to a borrowed HOF
 # slot in the caller's TAIL position, inside a 5000-iteration loop. The
@@ -7617,18 +7177,6 @@ test-perceus-1130-hof-tail-drop: $(TARGET) build
 	  && echo "perceus-1130-hof-tail-drop OK (5000 tail-position closures dropped, leaked=$$leaked bounded; TCO intact)" \
 	  || { echo "perceus-1130-hof-tail-drop FAIL (leaked=$$leaked — closure leaked per iter, drop-after-call regressed)"; exit 1; }
 
-# Native half (tier1-native suite).
-test-perceus-1130-hof-tail-drop-native: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/borrow_hof_tail_drop_1130.kai; \
-	exp=../examples/perceus/borrow_hof_tail_drop_1130.out.expected; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1130htdn 2> build/s2-1130htdn.err \
-	  || { echo "perceus-1130-hof-tail-drop-native FAIL (native build errored)"; cat build/s2-1130htdn.err; exit 1; }; \
-	./build/s2-1130htdn > build/s2-1130htdn.out \
-	  || { echo "perceus-1130-hof-tail-drop-native FAIL (crash / stack overflow)"; exit 1; }; \
-	diff -q $$exp build/s2-1130htdn.out > /dev/null \
-	  && echo "perceus-1130-hof-tail-drop-native OK" \
-	  || { echo "perceus-1130-hof-tail-drop-native FAIL (output diff)"; diff $$exp build/s2-1130htdn.out; exit 1; }
 # --- issue #1131 targets (appended on rebase over #1132) ---
 test-perceus-1131-borrow-descent: $(TARGET) build
 	@set -e; \
@@ -7690,28 +7238,6 @@ test-perceus-1295-borrow-slot-nested-arg: $(TARGET) build
 	  && echo "perceus-1295-borrow-slot-nested-arg OK" \
 	  || { echo "perceus-1295-borrow-slot-nested-arg FAIL (output diff — nested-arg borrow discount regressed)"; diff $$exp build/s2-1295bsna.out; exit 1; }
 
-# ASAN companion for the #1295 gate: same fixture under
-# -fsanitize=address,undefined, failing on any sanitizer diagnostic OR
-# an output diff (the over-free surfaces as either, depending on pool
-# recycling).
-test-perceus-1295-borrow-slot-nested-arg-asan: $(TARGET) build
-	@set -e; \
-	name=borrow_slot_nested_arg_1295; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1295-borrow-slot-nested-arg-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1295-borrow-slot-nested-arg-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1295-borrow-slot-nested-arg-asan OK"
-
 # Issue #1303 — a single-use owned param whose only read sits on one branch
 # must be released on every path that never reaches the read. The fixture's
 # `tag_of` consumes its owned list only in the final else-arm; the 5000-iter
@@ -7734,28 +7260,6 @@ test-perceus-1303-single-use-branch-leak: $(TARGET) build
 	[ "$$leaked" -lt 100 ] \
 	  && echo "perceus-1303-single-use-branch-leak OK (leaked=$$leaked < 100 over 5000 skip-path calls; branchy single-use param released)" \
 	  || { echo "perceus-1303-single-use-branch-leak FAIL (leaked=$$leaked — single-use param leaks on paths that skip its read)"; exit 1; }
-
-# ASAN companion for the #1303 gate: same fixture under
-# -fsanitize=address,undefined, failing on any sanitizer diagnostic OR an
-# output diff. Guards the other direction of the fix: the forced exit drop
-# must not double-free the param on the path that DOES consume it.
-test-perceus-1303-single-use-branch-leak-asan: $(TARGET) build
-	@set -e; \
-	name=single_use_param_branch_leak_1303; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1303-single-use-branch-leak-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1303-single-use-branch-leak-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1303-single-use-branch-leak-asan OK"
 
 # Issue #1302 — the tcrec goto-tail path must release the enclosing
 # owned match scrutinees and the arm's not-yet-consumed bind-increfs
@@ -7781,47 +7285,6 @@ test-perceus-1302-tcrec-goto-drops: $(TARGET) build
 	  && echo "perceus-1302-tcrec-goto-drops OK (leaked=$$leaked < 100 over 10k goto-tail iters)" \
 	  || { echo "perceus-1302-tcrec-goto-drops FAIL (leaked=$$leaked — goto-tail releases regressed, grows with iters)"; exit 1; }
 
-# ASAN companion for the #1302 gate: the goto-site releases must never
-# over-free (a wrongly dropped consumed binder is a UAF, worse than the
-# leak). Same fixture under -fsanitize=address,undefined.
-test-perceus-1302-tcrec-goto-drops-asan: $(TARGET) build
-	@set -e; \
-	name=tcrec_goto_owned_binder_1302; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1302-tcrec-goto-drops-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1302-tcrec-goto-drops-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1302-tcrec-goto-drops-asan OK"
-
-# Native half of the #1302 gate (#1314): the KIR lowering threads the same
-# goto-site release ledger, so the native goto-tail path must hold the
-# leak flat too. Split out per the #1126/#1127 precedent (the tier1
-# shard's kaic2 is C-only).
-test-perceus-1302-tcrec-goto-drops-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=tcrec_goto_owned_binder_1302; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1302tgdn 2> build/s2-1302tgdn.err \
-	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (native build errored)"; cat build/s2-1302tgdn.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1302tgdn > build/s2-1302tgdn.out 2> build/s2-1302tgdn.rc \
-	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1302tgdn.out > /dev/null \
-	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1302tgdn.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1302tgdn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] \
-	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (no leaked line)"; cat build/s2-1302tgdn.rc; exit 1; }; \
-	[ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1302-tcrec-goto-drops-native OK (native leaked=$$leaked < 100 over 10k goto-tail iters)" \
-	  || { echo "perceus-1302-tcrec-goto-drops-native FAIL (native leaked=$$leaked — goto-tail releases regressed, grows with iters)"; exit 1; }
-
 # A goto-tail arm-binder move set is keyed by NAME over the whole fn body
 # while its gates run per arm: a binder that qualifies in one arm must not
 # drag a same-named binder in a sibling arm (two uses on one path) into
@@ -7840,41 +7303,6 @@ test-perceus-1635-goto-move-collision: $(TARGET) build
 	  && echo "perceus-1635-goto-move-collision OK" \
 	  || { echo "perceus-1635-goto-move-collision FAIL (output diff — a moved binder was over-released)"; diff ../examples/perceus/$$name.out.expected build/s2-1635gmc.out; exit 1; }
 
-# ASAN companion, pool OFF: the over-release frees a still-referenced cell
-# through the real allocator, so the redzone catches the stale read the
-# pool would otherwise mask by recycling the chunk in place.
-test-perceus-1635-goto-move-collision-asan: $(TARGET) build
-	@set -e; \
-	name=goto_move_name_collision_1635; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1635-goto-move-collision-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1635-goto-move-collision-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1635-goto-move-collision-asan OK"
-
-# Native half: the move set is planted by the shared perceus pass, so the
-# KIR lowering inherits the same over-release (probed red on native before
-# the fix — the recycled cell surfaces as garbage payload there).
-test-perceus-1635-goto-move-collision-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=goto_move_name_collision_1635; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1635gmcn 2> build/s2-1635gmcn.err \
-	  || { echo "perceus-1635-goto-move-collision-native FAIL (native build errored)"; cat build/s2-1635gmcn.err; exit 1; }; \
-	KAI_THREADS=1 ./build/s2-1635gmcn > build/s2-1635gmcn.out 2> build/s2-1635gmcn.rc \
-	  || { echo "perceus-1635-goto-move-collision-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1635gmcn.out > /dev/null \
-	  && echo "perceus-1635-goto-move-collision-native OK" \
-	  || { echo "perceus-1635-goto-move-collision-native FAIL (output diff — a moved binder was over-released)"; diff ../examples/perceus/$$name.out.expected build/s2-1635gmcn.out; exit 1; }
-
 # Issue #1758 — an owned param consumed by an if CONDITION in a
 # non-recursive tail arm and re-threaded through the self-call in a
 # sibling arm. The borrow-move-last derivation strips the dup on every
@@ -7892,39 +7320,6 @@ test-perceus-1758-cond-exit-drop: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-1758ced.out > /dev/null \
 	  && echo "perceus-1758-cond-exit-drop OK" \
 	  || { echo "perceus-1758-cond-exit-drop FAIL (output diff — the param was over-released)"; diff ../examples/perceus/$$name.out.expected build/s2-1758ced.out; exit 1; }
-
-# ASAN companion, pool OFF: the double release goes through the real
-# allocator, so the redzone reports the use-after-free the pool masks.
-test-perceus-1758-cond-exit-drop-asan: $(TARGET) build
-	@set -e; \
-	name=owned_param_bare_pass_selfrec_1758; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1758-cond-exit-drop-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1758-cond-exit-drop-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1758-cond-exit-drop-asan OK"
-
-# Native half: the move set is planted by the shared perceus pass, so
-# the KIR lowering inherits the same over-release.
-test-perceus-1758-cond-exit-drop-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=owned_param_bare_pass_selfrec_1758; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1758cedn 2> build/s2-1758cedn.err \
-	  || { echo "perceus-1758-cond-exit-drop-native FAIL (native build errored)"; cat build/s2-1758cedn.err; exit 1; }; \
-	KAI_THREADS=1 ./build/s2-1758cedn > build/s2-1758cedn.out 2> build/s2-1758cedn.rc \
-	  || { echo "perceus-1758-cond-exit-drop-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1758cedn.out > /dev/null \
-	  && echo "perceus-1758-cond-exit-drop-native OK" \
-	  || { echo "perceus-1758-cond-exit-drop-native FAIL (output diff — the param was over-released)"; diff ../examples/perceus/$$name.out.expected build/s2-1758cedn.out; exit 1; }
 
 # A block-`let` binder whose single read lands in a consuming slot was
 # never a move-at-last-use candidate (the candidate walk collects pattern
@@ -7945,42 +7340,6 @@ test-perceus-1902-block-let-move: $(TARGET) build
 	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
 	  || { echo "perceus-1902-block-let-move FAIL (leaked=$$leaked, per-iteration birth leak)"; exit 1; }; \
 	echo "perceus-1902-block-let-move OK"
-
-# ASAN companion, pool OFF: an unsound move would double-release through
-# the real allocator where the redzone reports it.
-test-perceus-1902-block-let-move-asan: $(TARGET) build
-	@set -e; \
-	name=block_let_move_last_1902; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1902-block-let-move-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1902-block-let-move-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1902-block-let-move-asan OK"
-
-# Native half: the move set is planted by the shared perceus pass, so the
-# KIR lowering inherits the same binder decision.
-test-perceus-1902-block-let-move-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=block_let_move_last_1902; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1902blmn 2> build/s2-1902blmn.err \
-	  || { echo "perceus-1902-block-let-move-native FAIL (native build errored)"; cat build/s2-1902blmn.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1902blmn > build/s2-1902blmn.out 2> build/s2-1902blmn.rc \
-	  || { echo "perceus-1902-block-let-move-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1902blmn.out > /dev/null \
-	  || { echo "perceus-1902-block-let-move-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1902blmn.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1902blmn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  || { echo "perceus-1902-block-let-move-native FAIL (leaked=$$leaked)"; exit 1; }; \
-	echo "perceus-1902-block-let-move-native OK"
 
 # The raw<->boxed border at a raw-return call: a call whose signature returns
 # a raw scalar must not box its body's result, and a `let` over that call must
@@ -8038,44 +7397,6 @@ test-perceus-2032-bang-operand-use: $(TARGET) build
 	  || { echo "perceus-2032-bang-operand-use FAIL (output diff — the binder was freed before its consumer)"; diff ../examples/perceus/$$name.out.expected build/s2-2032bou.out; exit 1; }; \
 	echo "perceus-2032-bang-operand-use OK"
 
-# ASAN companion, pool OFF: the premature decref is a use-after-free that
-# the redzone reports instead of silently recycling the cell.
-test-perceus-2032-bang-operand-use-asan: $(TARGET) build
-	@set -e; \
-	name=bang_operand_use_scan_2032; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-2032-bang-operand-use-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-2032-bang-operand-use-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-2032-bang-operand-use-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-# The use scan is shared, so the native lowering inherited the same
-# premature release.
-test-perceus-2032-bang-operand-use-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=bang_operand_use_scan_2032; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-2032boun 2> build/s2-2032boun.err \
-	  || { echo "perceus-2032-bang-operand-use-native FAIL (native build errored)"; cat build/s2-2032boun.err; exit 1; }; \
-	KAI_THREADS=1 ./build/s2-2032boun > build/s2-2032boun.out 2> build/s2-2032boun.rc \
-	  || { echo "perceus-2032-bang-operand-use-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-2032boun.out > /dev/null \
-	  || { echo "perceus-2032-bang-operand-use-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-2032boun.out; exit 1; }; \
-	echo "perceus-2032-bang-operand-use-native OK"
-else
-test-perceus-2032-bang-operand-use-native:
-	@echo "perceus-2032-bang-operand-use-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A param the body never reads takes the entry drop; the owned-in-scope
 # move over a top-level match planted a branch drop for it in every arm
 # as well, releasing it twice. The cell pool recycles the double free
@@ -8091,40 +7412,6 @@ test-perceus-owned-scope-unused-param: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-osup.out > /dev/null \
 	  || { echo "perceus-owned-scope-unused-param FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-osup.out; exit 1; }; \
 	echo "perceus-owned-scope-unused-param OK"
-
-test-perceus-owned-scope-unused-param-asan: $(TARGET) build
-	@set -e; \
-	name=owned_scope_unused_param; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-owned-scope-unused-param-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-owned-scope-unused-param-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-owned-scope-unused-param-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-owned-scope-unused-param-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=owned_scope_unused_param; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-osupn 2> build/s2-osupn.err \
-	  || { echo "perceus-owned-scope-unused-param-native FAIL (native build errored)"; cat build/s2-osupn.err; exit 1; }; \
-	KAI_THREADS=1 ./build/s2-osupn > build/s2-osupn.out 2> build/s2-osupn.rc \
-	  || { echo "perceus-owned-scope-unused-param-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-osupn.out > /dev/null \
-	  || { echo "perceus-owned-scope-unused-param-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-osupn.out; exit 1; }; \
-	echo "perceus-owned-scope-unused-param-native OK"
-else
-test-perceus-owned-scope-unused-param-native:
-	@echo "perceus-owned-scope-unused-param-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # A block `let`'s birth ref has exactly one payer: a never-read `let` is
 # released inline by the emitter when its rhs is fresh and by a perceus exit
@@ -8148,42 +7435,6 @@ test-perceus-block-let-unused-alias: $(TARGET) build
 	done; \
 	echo "perceus-block-let-unused-alias OK"
 
-test-perceus-block-let-unused-alias-asan: $(TARGET) build
-	@set -e; \
-	for name in $(BLOCK_LET_UNUSED_ALIAS_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-block-let-unused-alias-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-block-let-unused-alias-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-block-let-unused-alias-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-block-let-unused-alias-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(BLOCK_LET_UNUSED_ALIAS_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-block-let-unused-alias-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-block-let-unused-alias-native FAIL ($$name: crash)"; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-block-let-unused-alias-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	done; \
-	echo "perceus-block-let-unused-alias-native OK"
-else
-test-perceus-block-let-unused-alias-native:
-	@echo "perceus-block-let-unused-alias-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A pattern binder captured by a lambda built in the arguments of a self
 # tail call. The native side of both fixtures runs in the backend-parity
 # corpus.
@@ -8201,25 +7452,6 @@ test-perceus-closure-capture-tail: $(TARGET) build
 	    || { echo "perceus-closure-capture-tail FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	done; \
 	echo "perceus-closure-capture-tail OK"
-
-test-perceus-closure-capture-tail-asan: $(TARGET) build
-	@set -e; \
-	for name in $(CLOSURE_CAPTURE_TAIL_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-closure-capture-tail-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-closure-capture-tail-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-closure-capture-tail-asan OK"
 
 # A match-arm binder captured by a closure in a self-tail call's args: the
 # goto path releases it after the args built the closure. `_deep` runs the
@@ -8299,42 +7531,6 @@ test-perceus-switch-scrutinee-selftail: $(TARGET) build
 	done; \
 	echo "perceus-switch-scrutinee-selftail OK"
 
-test-perceus-switch-scrutinee-selftail-asan: $(TARGET) build
-	@set -e; \
-	for name in $(SWITCH_SCRUTINEE_SELFTAIL_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-switch-scrutinee-selftail-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-switch-scrutinee-selftail-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-switch-scrutinee-selftail-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-switch-scrutinee-selftail-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(SWITCH_SCRUTINEE_SELFTAIL_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-switch-scrutinee-selftail-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-switch-scrutinee-selftail-native FAIL ($$name: crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-switch-scrutinee-selftail-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	done; \
-	echo "perceus-switch-scrutinee-selftail-native OK"
-else
-test-perceus-switch-scrutinee-selftail-native:
-	@echo "perceus-switch-scrutinee-selftail-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A binder read at most once per path, each read a move: the alternatives
 # that skip every read release it on entry, `and`/`or` and guards included.
 # The ledger bound catches the per-evaluation leak; the ASAN companion
@@ -8357,45 +7553,6 @@ test-perceus-arm-branch-read: $(TARGET) build
 	done; \
 	echo "perceus-arm-branch-read OK"
 
-test-perceus-arm-branch-read-asan: $(TARGET) build
-	@set -e; \
-	for name in $(ARM_BRANCH_READ_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-arm-branch-read-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-arm-branch-read-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-arm-branch-read-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-arm-branch-read-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(ARM_BRANCH_READ_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-arm-branch-read-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-arm-branch-read-native FAIL ($$name: crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-arm-branch-read-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	    || { echo "perceus-arm-branch-read-native FAIL ($$name: leaked=$$leaked, skipped-branch birth leak)"; exit 1; }; \
-	done; \
-	echo "perceus-arm-branch-read-native OK"
-else
-test-perceus-arm-branch-read-native:
-	@echo "perceus-arm-branch-read-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A `^` param read into a position that owns its value (return, owned
 # callee slot, list element, variant slot) takes a dup. The ledger stays
 # at 0 without it; the output and the ASAN companion catch the early free.
@@ -8416,45 +7573,6 @@ test-perceus-borrow-own: $(TARGET) build
 	    || { echo "perceus-borrow-own FAIL ($$name: leaked=$$leaked, borrowed binder leak)"; exit 1; }; \
 	done; \
 	echo "perceus-borrow-own OK"
-
-test-perceus-borrow-own-asan: $(TARGET) build
-	@set -e; \
-	for name in $(BORROW_OWN_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-borrow-own-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-borrow-own-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-borrow-own-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-borrow-own-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(BORROW_OWN_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-borrow-own-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-borrow-own-native FAIL ($$name: crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-borrow-own-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	    || { echo "perceus-borrow-own-native FAIL ($$name: leaked=$$leaked, borrowed binder leak)"; exit 1; }; \
-	done; \
-	echo "perceus-borrow-own-native OK"
-else
-test-perceus-borrow-own-native:
-	@echo "perceus-borrow-own-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # A ctor homonymous with one in an importing module, rebuilt in place and built
 # by a modulo-cons step, resolves by its type's home.
@@ -8536,45 +7654,6 @@ test-perceus-trmc-step-ledger: $(TARGET) build
 	done; \
 	echo "perceus-trmc-step-ledger OK"
 
-test-perceus-trmc-step-ledger-asan: $(TARGET) build
-	@set -e; \
-	for name in $(TRMC_STEP_LEDGER_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-trmc-step-ledger-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-trmc-step-ledger-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-trmc-step-ledger-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-trmc-step-ledger-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(TRMC_STEP_LEDGER_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-trmc-step-ledger-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-trmc-step-ledger-native FAIL ($$name: crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-trmc-step-ledger-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	    || { echo "perceus-trmc-step-ledger-native FAIL ($$name: leaked=$$leaked, step leaves a pending release)"; exit 1; }; \
-	done; \
-	echo "perceus-trmc-step-ledger-native OK"
-else
-test-perceus-trmc-step-ledger-native:
-	@echo "perceus-trmc-step-ledger-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # One read table keyed by binder identity: an arm-local `let` read once and
 # a lambda-local arm binder are each paid once, an arm never inherits a
 # sibling's move by name, a borrow after a consuming read keeps its dup, and
@@ -8595,42 +7674,6 @@ test-perceus-read-identity: $(TARGET) build
 	done; \
 	echo "perceus-read-identity OK"
 
-test-perceus-read-identity-asan: $(TARGET) build
-	@set -e; \
-	for name in $(READ_IDENTITY_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-read-identity-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-read-identity-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-read-identity-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-read-identity-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(READ_IDENTITY_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-read-identity-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-read-identity-native FAIL ($$name: crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-read-identity-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	done; \
-	echo "perceus-read-identity-native OK"
-else
-test-perceus-read-identity-native:
-	@echo "perceus-read-identity-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A list spread consumes its operand in either position: owned operands move
 # in and a `^` param is dup'd first, so the caller's list keeps its values.
 # rc-leak-gate pins the ledger; the ASAN run catches a missing dup.
@@ -8645,40 +7688,6 @@ test-perceus-spread-consumes: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-spread-consumes FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	echo "perceus-spread-consumes OK"
-
-test-perceus-spread-consumes-asan: $(TARGET) build
-	@set -e; \
-	name=spread_consumes_operand; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-spread-consumes-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-spread-consumes-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-spread-consumes-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-spread-consumes-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=spread_consumes_operand; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	  || { echo "perceus-spread-consumes-native FAIL (native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	  || { echo "perceus-spread-consumes-native FAIL (crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	  || { echo "perceus-spread-consumes-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	echo "perceus-spread-consumes-native OK"
-else
-test-perceus-spread-consumes-native:
-	@echo "perceus-spread-consumes-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # A reuse arm releases, on its unique branch, every slot the rebuild does not
 # take (wildcard, unused binder, deconstructed head) and does not incref it on
@@ -8695,40 +7704,6 @@ test-perceus-reuse-untaken-slot: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-reuse-untaken-slot FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	echo "perceus-reuse-untaken-slot OK"
-
-test-perceus-reuse-untaken-slot-asan: $(TARGET) build
-	@set -e; \
-	name=reuse_untaken_slot; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-reuse-untaken-slot-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-reuse-untaken-slot-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-reuse-untaken-slot-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-reuse-untaken-slot-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=reuse_untaken_slot; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	  || { echo "perceus-reuse-untaken-slot-native FAIL (native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	  || { echo "perceus-reuse-untaken-slot-native FAIL (crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	  || { echo "perceus-reuse-untaken-slot-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	echo "perceus-reuse-untaken-slot-native OK"
-else
-test-perceus-reuse-untaken-slot-native:
-	@echo "perceus-reuse-untaken-slot-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # A variant reuse arm whose pattern deconstructs inner cells at any depth, in
 # any number of slots, binds every binder beneath them and settles each cell
@@ -8748,42 +7723,6 @@ test-perceus-reuse-nested-rebuild: $(TARGET) build
 	done; \
 	echo "perceus-reuse-nested-rebuild OK"
 
-test-perceus-reuse-nested-rebuild-asan: $(TARGET) build
-	@set -e; \
-	for name in $(REUSE_NESTED_REBUILD); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-reuse-nested-rebuild-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-reuse-nested-rebuild-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-reuse-nested-rebuild-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-reuse-nested-rebuild-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(REUSE_NESTED_REBUILD); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-reuse-nested-rebuild-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-reuse-nested-rebuild-native FAIL ($$name: crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-reuse-nested-rebuild-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	done; \
-	echo "perceus-reuse-nested-rebuild-native OK"
-else
-test-perceus-reuse-nested-rebuild-native:
-	@echo "perceus-reuse-nested-rebuild-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A self-tail-call branch that skips an owned param's only read releases it.
 test-perceus-branch-param-selftail: $(TARGET) build
 	@set -e; \
@@ -8797,40 +7736,6 @@ test-perceus-branch-param-selftail: $(TARGET) build
 	  || { echo "perceus-branch-param-selftail FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	echo "perceus-branch-param-selftail OK"
 
-test-perceus-branch-param-selftail-asan: $(TARGET) build
-	@set -e; \
-	name=branch_param_selftail; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-branch-param-selftail-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-branch-param-selftail-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-branch-param-selftail-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-branch-param-selftail-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=branch_param_selftail; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	  || { echo "perceus-branch-param-selftail-native FAIL (native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	  || { echo "perceus-branch-param-selftail-native FAIL (crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	  || { echo "perceus-branch-param-selftail-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	echo "perceus-branch-param-selftail-native OK"
-else
-test-perceus-branch-param-selftail-native:
-	@echo "perceus-branch-param-selftail-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A TRMC step pays an arm binder whose last read sits in a raw self-call argument.
 test-perceus-trmc-raw-operand-drop: $(TARGET) build
 	@set -e; \
@@ -8843,40 +7748,6 @@ test-perceus-trmc-raw-operand-drop: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-trmc-raw-operand-drop FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	echo "perceus-trmc-raw-operand-drop OK"
-
-test-perceus-trmc-raw-operand-drop-asan: $(TARGET) build
-	@set -e; \
-	name=trmc_raw_operand_exit_drop; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-trmc-raw-operand-drop-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-trmc-raw-operand-drop-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-trmc-raw-operand-drop-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-trmc-raw-operand-drop-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=trmc_raw_operand_exit_drop; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	  || { echo "perceus-trmc-raw-operand-drop-native FAIL (native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	  || { echo "perceus-trmc-raw-operand-drop-native FAIL (crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	  || { echo "perceus-trmc-raw-operand-drop-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	echo "perceus-trmc-raw-operand-drop-native OK"
-else
-test-perceus-trmc-raw-operand-drop-native:
-	@echo "perceus-trmc-raw-operand-drop-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # A modulo-cons step admits any self-call-free slot (record, list literal,
 # qualified call, lambda, handler): each positive fixture builds a spine deep
@@ -8981,40 +7852,6 @@ test-compiler-intervals: $(TARGET) bin-kai build
 	  || { echo "compiler-intervals FAIL"; cat build/s2-unit-intervals.out; exit 1; }; \
 	echo "compiler-intervals OK"
 
-test-perceus-pipe-borrowed-slot-alignment-asan: $(TARGET) build
-	@set -e; \
-	name=pipe_borrowed_slot_alignment; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err || true; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-pipe-borrowed-slot-alignment-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-pipe-borrowed-slot-alignment-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-pipe-borrowed-slot-alignment-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-pipe-borrowed-slot-alignment-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=pipe_borrowed_slot_alignment; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	  || { echo "perceus-pipe-borrowed-slot-alignment-native FAIL (native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	  || { echo "perceus-pipe-borrowed-slot-alignment-native FAIL (crash)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	  || { echo "perceus-pipe-borrowed-slot-alignment-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	echo "perceus-pipe-borrowed-slot-alignment-native OK"
-else
-test-perceus-pipe-borrowed-slot-alignment-native:
-	@echo "perceus-pipe-borrowed-slot-alignment-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A `Handle` threaded through functions with an effect row rides a boxed
 # slot there; Perceus dups and drops it like any boxed value, so the boxed
 # form must be an immediate. The C-API prims it calls exist only in a
@@ -9056,42 +7893,6 @@ test-perceus-borrow-homonym: $(TARGET) build
 	done; \
 	echo "perceus-borrow-homonym OK"
 
-test-perceus-borrow-homonym-asan: $(TARGET) build
-	@set -e; \
-	for name in $(BORROW_HOMONYM_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-borrow-homonym-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-borrow-homonym-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-borrow-homonym-asan OK"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-borrow-homonym-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(BORROW_HOMONYM_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-borrow-homonym-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-borrow-homonym-native FAIL ($$name: crash)"; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-borrow-homonym-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	done; \
-	echo "perceus-borrow-homonym-native OK"
-else
-test-perceus-borrow-homonym-native:
-	@echo "perceus-borrow-homonym-native SKIP (C-only build; native backend not compiled)"
-endif
-
 # A TRMC spine step that rebuilds into the arm-top reuse token elides the
 # store of a slot whose value is already in the donated shell. A Real slot's
 # arm binder owns a box (`kai_real(slot.r)`) whose only consumer was that
@@ -9112,25 +7913,6 @@ test-perceus-1961-trmc-real-elision: $(TARGET) build
 	[ -n "$$leaked" ] && [ "$$leaked" -lt 50000 ] \
 	  || { echo "perceus-1961-trmc-real-elision FAIL (leaked=$$leaked, a Real orphaned per rebuilt spine node)"; exit 1; }; \
 	echo "perceus-1961-trmc-real-elision OK (leaked=$$leaked)"
-
-ifeq ($(KAI_LLVM),1)
-test-perceus-1961-trmc-real-elision-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=trmc_real_slot_donor_elision; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1961tren 2> build/s2-1961tren.err \
-	  || { echo "perceus-1961-trmc-real-elision-native FAIL (native build errored)"; cat build/s2-1961tren.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1961tren > build/s2-1961tren.out 2> build/s2-1961tren.rc \
-	  || { echo "perceus-1961-trmc-real-elision-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1961tren.out > /dev/null \
-	  || { echo "perceus-1961-trmc-real-elision-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1961tren.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1961tren.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 50000 ] \
-	  || { echo "perceus-1961-trmc-real-elision-native FAIL (leaked=$$leaked)"; exit 1; }; \
-	echo "perceus-1961-trmc-real-elision-native OK (leaked=$$leaked)"
-else
-test-perceus-1961-trmc-real-elision-native:
-	@echo "perceus-1961-trmc-real-elision-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # Issue #1768 — positions the use collector sees but the move gates did
 # not reason about: assert conditions and messages, match guards,
@@ -9157,38 +7939,6 @@ test-perceus-1768-move-gate-positions: $(TARGET) build
 	    || { echo "perceus-1768-move-gate-positions FAIL ($$name: leaked=$$leaked, per-iteration leak)"; exit 1; }; \
 	done; \
 	echo "perceus-1768-move-gate-positions OK (5 fixtures, ledger bounded)"
-
-test-perceus-1768-move-gate-positions-asan: $(TARGET) build
-	@set -e; \
-	for name in $(MOVE_GATE_1768_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1768mgp-asan.c \
-	    || { echo "perceus-1768-move-gate-positions-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-1768mgp-asan.c -o build/s2-1768mgp-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-1768mgp-asan > build/s2-1768mgp-asan.out 2> build/s2-1768mgp-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-1768mgp-asan.err; then \
-	    echo "perceus-1768-move-gate-positions-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-1768mgp-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1768mgp-asan.out > /dev/null \
-	    || { echo "perceus-1768-move-gate-positions-asan FAIL ($$name: output diff)"; exit 1; }; \
-	done; \
-	echo "perceus-1768-move-gate-positions-asan OK"
-
-test-perceus-1768-move-gate-positions-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(MOVE_GATE_1768_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1768mgp-n 2> build/s2-1768mgp-n.err \
-	    || { echo "perceus-1768-move-gate-positions-native FAIL ($$name: native build errored)"; cat build/s2-1768mgp-n.err; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-1768mgp-n > build/s2-1768mgp-n.out 2> build/s2-1768mgp-n.rc \
-	    || { echo "perceus-1768-move-gate-positions-native FAIL ($$name: crash)"; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1768mgp-n.out > /dev/null \
-	    || { echo "perceus-1768-move-gate-positions-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1768mgp-n.out; exit 1; }; \
-	done; \
-	echo "perceus-1768-move-gate-positions-native OK"
 
 # Issue #1771 — a borrowed raw Int param as match scrutinee. The
 # `__perceus_borrow` wrap must be stripped by the literal-arm switch
@@ -9225,7 +7975,6 @@ REUSE_FLOOR_1781_FIXTURES := reuse_zero_use_elide_1781 reuse_wild_slot_children_
 # not yet pay a donor pointer slot the rebuild leaves wild (a hand-written
 # `BErr(_) -> BVal([7])` leaks it identically), so their ledger budget only
 # holds where kai_reuse_or_alloc_variant / kai_variant_reuse_at pay.
-BRANCH_PAY_1780_FIXTURES_NATIVE := shortcircuit_guard_move_1780 shortcircuit_arg_move_1780 guard_consume_zero_use_1780
 LET_SC_1785_FIXTURES := let_shortcircuit_tail_1785 let_shortcircuit_stmt_1785
 
 test-perceus-1770-arm-birth-leak: $(TARGET) build
@@ -9249,41 +7998,6 @@ test-perceus-1770-arm-birth-leak: $(TARGET) build
 	done; \
 	echo "perceus-1770-arm-birth-leak OK (15 fixtures, ledger bounded, reuse floor held)"
 
-test-perceus-1770-arm-birth-leak-asan: $(TARGET) build
-	@set -e; \
-	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES) $(LET_SC_1785_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl-asan.c \
-	    || { echo "perceus-1770-arm-birth-leak-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-1770abl-asan.c -o build/s2-1770abl-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-1770abl-asan > build/s2-1770abl-asan.out 2> build/s2-1770abl-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-1770abl-asan.err; then \
-	    echo "perceus-1770-arm-birth-leak-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-1770abl-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1770abl-asan.out > /dev/null \
-	    || { echo "perceus-1770-arm-birth-leak-asan FAIL ($$name: output diff)"; exit 1; }; \
-	done; \
-	echo "perceus-1770-arm-birth-leak-asan OK"
-
-test-perceus-1770-arm-birth-leak-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES_NATIVE) $(LET_SC_1785_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1770abl-n 2> build/s2-1770abl-n.err \
-	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: native build errored)"; cat build/s2-1770abl-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1770abl-n > build/s2-1770abl-n.out 2> build/s2-1770abl-n.rc \
-	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: crash)"; cat build/s2-1770abl-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1770abl-n.out > /dev/null \
-	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1770abl-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1770abl-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] && [ "$$leaked" -lt 2000 ] \
-	    || { echo "perceus-1770-arm-birth-leak-native FAIL ($$name: leaked=$$leaked, per-iteration birth leak)"; exit 1; }; \
-	done; \
-	echo "perceus-1770-arm-birth-leak-native OK (13 fixtures, ledger bounded)"
-
 # Issue #1783 — every interpolation of a DISTINCT value pinned one
 # immortal cell: the runtime's number-to-string conversions routed
 # their transient buffers through the string-intern table (kai_str),
@@ -9305,19 +8019,6 @@ test-perceus-1783-interp-intern-leak: $(TARGET) build
 	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
 	  && echo "perceus-1783-interp-intern-leak OK (leaked=$$leaked < 100 over 2000 unique interpolations)" \
 	  || { echo "perceus-1783-interp-intern-leak FAIL (leaked=$$leaked — data-derived strings pinned in the intern table)"; exit 1; }
-
-test-perceus-1783-interp-intern-leak-native: $(TARGET) bin-kai build
-	@set -e; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/interp_intern_leak_1783.kai -o build/s2-1783iil-n 2> build/s2-1783iil-n.err \
-	  || { echo "perceus-1783-interp-intern-leak-native FAIL (native build errored)"; cat build/s2-1783iil-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1783iil-n > build/s2-1783iil-n.out 2> build/s2-1783iil-n.rc \
-	  || { echo "perceus-1783-interp-intern-leak-native FAIL (crash)"; cat build/s2-1783iil-n.rc; exit 1; }; \
-	diff -q ../examples/perceus/interp_intern_leak_1783.out.expected build/s2-1783iil-n.out > /dev/null \
-	  || { echo "perceus-1783-interp-intern-leak-native FAIL (output diff)"; diff ../examples/perceus/interp_intern_leak_1783.out.expected build/s2-1783iil-n.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1783iil-n.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1783-interp-intern-leak-native OK (leaked=$$leaked < 100 over 2000 unique interpolations)" \
-	  || { echo "perceus-1783-interp-intern-leak-native FAIL (leaked=$$leaked — data-derived strings pinned in the intern table)"; exit 1; }
 
 # Issue #1784 — recognised variant rebuilds must pay the donor's claim on a
 # diagonally-kept child (the alias guard skips the old-slot decref) and, on
@@ -9345,43 +8046,6 @@ test-perceus-1784-variant-rebuild: $(TARGET) build
 	done; \
 	echo "perceus-1784-variant-rebuild OK (2 fixtures, ledger bounded, reuse floor held)"
 
-test-perceus-1784-variant-rebuild-asan: $(TARGET) build
-	@set -e; \
-	for name in $(VARIANT_REBUILD_1784_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-1784-variant-rebuild-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-1784-variant-rebuild-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	done; \
-	echo "perceus-1784-variant-rebuild-asan OK"
-
-test-perceus-1784-variant-rebuild-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(VARIANT_REBUILD_1784_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1784vr-n 2> build/s2-1784vr-n.err \
-	    || { echo "perceus-1784-variant-rebuild-native FAIL ($$name: native build errored)"; cat build/s2-1784vr-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1784vr-n > build/s2-1784vr-n.out 2> build/s2-1784vr-n.rc \
-	    || { echo "perceus-1784-variant-rebuild-native FAIL ($$name: crash)"; cat build/s2-1784vr-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1784vr-n.out > /dev/null \
-	    || { echo "perceus-1784-variant-rebuild-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1784vr-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1784vr-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	    || { echo "perceus-1784-variant-rebuild-native FAIL ($$name: leaked=$$leaked, kept-child claim unpaid)"; exit 1; }; \
-	  reused=$$(grep -oE 'reuse_in_place=[0-9]+' build/s2-1784vr-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$reused" ] && [ "$$reused" -ge 1500 ] \
-	    || { echo "perceus-1784-variant-rebuild-native FAIL ($$name: reuse_in_place=$$reused, expected >= 1500)"; exit 1; }; \
-	done; \
-	echo "perceus-1784-variant-rebuild-native OK (2 fixtures, ledger bounded, reuse floor held)"
-
 # Recognised rebuilds that keep a child in place: the record same-field
 # alias skip pays the donor's claim via the kept-binder mask; a sibling-arm
 # name collision dups every rebuild read and the sentinel unwraps the last
@@ -9407,26 +8071,6 @@ test-perceus-1786-record-rebuild: $(TARGET) build
 	    || { echo "perceus-1786-record-rebuild FAIL ($$name: reuse_in_place=$$reused, expected >= 1500)"; exit 1; }; \
 	done; \
 	echo "perceus-1786-record-rebuild OK (3 fixtures, ledger bounded, reuse floor held)"
-
-test-perceus-1786-record-rebuild-asan: $(TARGET) build
-	@set -e; \
-	for name in $(RECORD_NESTED_REBUILD_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1786rr-asan.c \
-	    || { echo "perceus-1786-record-rebuild-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-1786rr-asan.c -o build/s2-1786rr-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-1786rr-asan > build/s2-1786rr-asan.out 2> build/s2-1786rr-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-1786rr-asan.err; then \
-	    echo "perceus-1786-record-rebuild-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-1786rr-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1786rr-asan.out > /dev/null \
-	    || { echo "perceus-1786-record-rebuild-asan FAIL ($$name: output diff)"; exit 1; }; \
-	done; \
-	echo "perceus-1786-record-rebuild-asan OK"
 
 test-perceus-1786-record-rebuild-native: $(TARGET) bin-kai build
 	@set -e; \
@@ -9477,41 +8121,6 @@ test-perceus-1791-arm-use-scope: $(TARGET) build
 	done; \
 	echo "perceus-1791-arm-use-scope OK (ledger clean, incref budget held, reuse floor held)"
 
-test-perceus-1791-arm-use-scope-asan: $(TARGET) build
-	@set -e; \
-	for name in $(ARM_USE_SCOPE_1791_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1791aus-asan.c \
-	    || { echo "perceus-1791-arm-use-scope-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-1791aus-asan.c -o build/s2-1791aus-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-1791aus-asan > build/s2-1791aus-asan.out 2> build/s2-1791aus-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-1791aus-asan.err; then \
-	    echo "perceus-1791-arm-use-scope-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-1791aus-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1791aus-asan.out > /dev/null \
-	    || { echo "perceus-1791-arm-use-scope-asan FAIL ($$name: output diff)"; exit 1; }; \
-	done; \
-	echo "perceus-1791-arm-use-scope-asan OK"
-
-test-perceus-1791-arm-use-scope-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(ARM_USE_SCOPE_1791_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1791aus-n 2> build/s2-1791aus-n.err \
-	    || { echo "perceus-1791-arm-use-scope-native FAIL ($$name: native build errored)"; cat build/s2-1791aus-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1791aus-n > build/s2-1791aus-n.out 2> build/s2-1791aus-n.rc \
-	    || { echo "perceus-1791-arm-use-scope-native FAIL ($$name: crash)"; cat build/s2-1791aus-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1791aus-n.out > /dev/null \
-	    || { echo "perceus-1791-arm-use-scope-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1791aus-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1791aus-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	    || { echo "perceus-1791-arm-use-scope-native FAIL ($$name: leaked=$$leaked, colliding binder ref orphaned)"; exit 1; }; \
-	done; \
-	echo "perceus-1791-arm-use-scope-native OK (ledger clean)"
-
 # A named capability (`with E as e`) passed as a fn parameter is a pointer
 # into the handler's stack frame with no refcount header. Perceus must keep
 # it out of the RC lattice entirely: any dup/drop derived for it corrupts
@@ -9533,38 +8142,6 @@ test-perceus-1801-capability-param: $(TARGET) build
 	done; \
 	echo "perceus-1801-capability-param OK (capability params carry no RC traffic)"
 
-test-perceus-1801-capability-param-asan: $(TARGET) build
-	@set -e; \
-	for name in $(CAP_PARAM_1801_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/s2-1801cap-asan.c \
-	    || { echo "perceus-1801-capability-param-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-1801cap-asan.c -o build/s2-1801cap-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-1801cap-asan > build/s2-1801cap-asan.out 2> build/s2-1801cap-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-1801cap-asan.err; then \
-	    echo "perceus-1801-capability-param-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-1801cap-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/effects/$$name.out.expected build/s2-1801cap-asan.out > /dev/null \
-	    || { echo "perceus-1801-capability-param-asan FAIL ($$name: output diff)"; exit 1; }; \
-	done; \
-	echo "perceus-1801-capability-param-asan OK"
-
-test-perceus-1801-capability-param-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(CAP_PARAM_1801_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/effects/$$name.kai -o build/s2-1801cap-n 2> build/s2-1801cap-n.err \
-	    || { echo "perceus-1801-capability-param-native FAIL ($$name: native build errored)"; cat build/s2-1801cap-n.err; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-1801cap-n > build/s2-1801cap-n.out 2> build/s2-1801cap-n.rc \
-	    || { echo "perceus-1801-capability-param-native FAIL ($$name: crash — evidence node dropped)"; cat build/s2-1801cap-n.rc; exit 1; }; \
-	  diff -q ../examples/effects/$$name.out.expected build/s2-1801cap-n.out > /dev/null \
-	    || { echo "perceus-1801-capability-param-native FAIL ($$name: output diff)"; diff ../examples/effects/$$name.out.expected build/s2-1801cap-n.out; exit 1; }; \
-	done; \
-	echo "perceus-1801-capability-param-native OK (capability params carry no RC traffic)"
-
 # A clause-body match binder named `k` must not clobber the native clause's
 # continuation register (the native emitter keys one alloca per name per fn):
 # the resume would dispatch on the payload value instead of the KaiCont and
@@ -9584,18 +8161,6 @@ test-perceus-1803-op-arg-free: $(TARGET) build
 	    || { echo "perceus-1803-op-arg-free FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1803oaf.out; exit 1; }; \
 	done; \
 	echo "perceus-1803-op-arg-free OK (primitive-payload op arg matched in the clause)"
-
-test-perceus-1803-op-arg-free-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(OP_ARG_1803_FIXTURES); do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1803oaf-n 2> build/s2-1803oaf-n.err \
-	    || { echo "perceus-1803-op-arg-free-native FAIL ($$name: native build errored)"; cat build/s2-1803oaf-n.err; exit 1; }; \
-	  KAI_THREADS=1 ./build/s2-1803oaf-n > build/s2-1803oaf-n.out 2> build/s2-1803oaf-n.rc \
-	    || { echo "perceus-1803-op-arg-free-native FAIL ($$name: crash — continuation register clobbered)"; cat build/s2-1803oaf-n.rc; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1803oaf-n.out > /dev/null \
-	    || { echo "perceus-1803-op-arg-free-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1803oaf-n.out; exit 1; }; \
-	done; \
-	echo "perceus-1803-op-arg-free-native OK (primitive-payload op arg matched in the clause)"
 
 # ASAN sibling, pool OFF: an early op-arg free touches the real allocator.
 test-perceus-1803-op-arg-free-asan: $(TARGET) build
@@ -9637,39 +8202,6 @@ test-perceus-1765-binop-base-tail: $(TARGET) build
 	  && echo "perceus-1765-binop-base-tail OK" \
 	  || { echo "perceus-1765-binop-base-tail FAIL (output diff — the param was over-released)"; diff ../examples/perceus/$$name.out.expected build/s2-1765bbt.out; exit 1; }
 
-# ASAN companion, pool OFF: the double release goes through the real
-# allocator, so the redzone reports the use-after-free the pool masks.
-test-perceus-1765-binop-base-tail-asan: $(TARGET) build
-	@set -e; \
-	name=owned_param_binop_base_tail_1765; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1765-binop-base-tail-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  || { echo "perceus-1765-binop-base-tail-asan DIFF"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	echo "perceus-1765-binop-base-tail-asan OK"
-
-# Native half: the move set is planted by the shared perceus pass, so
-# the native lowering must stay conservative for the same shape.
-test-perceus-1765-binop-base-tail-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=owned_param_binop_base_tail_1765; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1765bbtn 2> build/s2-1765bbtn.err \
-	  || { echo "perceus-1765-binop-base-tail-native FAIL (native build errored)"; cat build/s2-1765bbtn.err; exit 1; }; \
-	KAI_THREADS=1 ./build/s2-1765bbtn > build/s2-1765bbtn.out 2> build/s2-1765bbtn.rc \
-	  || { echo "perceus-1765-binop-base-tail-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1765bbtn.out > /dev/null \
-	  && echo "perceus-1765-binop-base-tail-native OK" \
-	  || { echo "perceus-1765-binop-base-tail-native FAIL (output diff — the param was over-released)"; diff ../examples/perceus/$$name.out.expected build/s2-1765bbtn.out; exit 1; }
-
 # A tcrec goto-tail match whose arm binds a Char-typed slot (a Some(c)
 # walk routing bytes >= 0x7F through a byte-table string_slice). Char is
 # outside the Perceus RC regime, so the native ledger must NOT defer this
@@ -9689,40 +8221,6 @@ test-perceus-1324-char-binder-goto: $(TARGET) build
 	  && echo "perceus-1324-char-binder-goto OK" \
 	  || { echo "perceus-1324-char-binder-goto FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1324cbg.out; exit 1; }
 
-# ASAN companion: the goto path must not over-release the Char binder or
-# the scrutinee cell (the #1324 corruption was a use-after-free). Leak
-# detection is OFF (macOS ASAN has no LSan); the leak bound is enforced
-# by the -native KAI_TRACE_RC gate.
-test-perceus-1324-char-binder-goto-asan: $(TARGET) build
-	@set -e; \
-	name=tcrec_char_binder_goto_1324; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "perceus-1324-char-binder-goto-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1324-char-binder-goto-asan OK" \
-	  || { echo "perceus-1324-char-binder-goto-asan FAIL (output diff)"; exit 1; }
-
-# Native half of the #1324 gate: the shape that crashed (guarded arm,
-# goto-site release of a Char-binding match) must print correctly and
-# stay leak-flat — Char matches ride the goto ledger like any other.
-test-perceus-1324-char-binder-goto-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=tcrec_char_binder_goto_1324; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1324cbgn 2> build/s2-1324cbgn.err \
-	  || { echo "perceus-1324-char-binder-goto-native FAIL (native build errored)"; cat build/s2-1324cbgn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1324cbgn > build/s2-1324cbgn.out 2> build/s2-1324cbgn.rc \
-	  || { echo "perceus-1324-char-binder-goto-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1324cbgn.out > /dev/null \
-	  || { echo "perceus-1324-char-binder-goto-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1324cbgn.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1324cbgn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1324-char-binder-goto-native OK (leaked=$$leaked < 100)" \
-	  || { echo "perceus-1324-char-binder-goto-native FAIL (leaked=$$leaked — unbounded goto-path leak)"; exit 1; }
-
 # Issue #1395 — a Char param is mask-raw (Perceus emits no dups for its
 # reads), so the native backend must carry it as a raw u32 register and
 # box a fresh cell per consuming use; a boxed param aliased N times
@@ -9740,38 +8238,6 @@ test-perceus-1395-char-param-raw: $(TARGET) build
 	  && echo "perceus-1395-char-param-raw OK" \
 	  || { echo "perceus-1395-char-param-raw FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1395cpr.out; exit 1; }
 
-# ASAN companion: no use may touch a freed Char cell and the fresh
-# box-per-use borders must not over-release.
-test-perceus-1395-char-param-raw-asan: $(TARGET) build
-	@set -e; \
-	name=char_param_raw_1395; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "perceus-1395-char-param-raw-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1395-char-param-raw-asan OK" \
-	  || { echo "perceus-1395-char-param-raw-asan FAIL (output diff)"; exit 1; }
-
-# Native half: the raw-promoted Char param must print the same values as
-# the C oracle, and the fresh boxes minted at the boxed borders must all
-# be consumed (leak flat).
-test-perceus-1395-char-param-raw-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=char_param_raw_1395; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1395cprn 2> build/s2-1395cprn.err \
-	  || { echo "perceus-1395-char-param-raw-native FAIL (native build errored)"; cat build/s2-1395cprn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1395cprn > build/s2-1395cprn.out 2> build/s2-1395cprn.rc \
-	  || { echo "perceus-1395-char-param-raw-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1395cprn.out > /dev/null \
-	  || { echo "perceus-1395-char-param-raw-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1395cprn.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1395cprn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1395-char-param-raw-native OK (leaked=$$leaked < 100)" \
-	  || { echo "perceus-1395-char-param-raw-native FAIL (leaked=$$leaked)"; exit 1; }
-
 # Issue #1410 — Byte rides a raw SByte/uint8_t register on both backends:
 # the `u8` op family must mask at 8 bits at EACH op, and every boxed
 # border (call, record field, effect op, list element, match literal)
@@ -9788,38 +8254,6 @@ test-perceus-1410-byte-raw-ops: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-1410bro.out > /dev/null \
 	  && echo "perceus-1410-byte-raw-ops OK" \
 	  || { echo "perceus-1410-byte-raw-ops FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1410bro.out; exit 1; }
-
-# ASAN companion: no use may touch a freed Byte cell and the fresh
-# box-per-use borders must not over-release.
-test-perceus-1410-byte-raw-ops-asan: $(TARGET) build
-	@set -e; \
-	name=byte_raw_ops_1410; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "perceus-1410-byte-raw-ops-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1410-byte-raw-ops-asan OK" \
-	  || { echo "perceus-1410-byte-raw-ops-asan FAIL (output diff)"; exit 1; }
-
-# Native half: the raw Byte op family must print the same wrapped values
-# as the C oracle, and the fresh boxes minted at the boxed borders must
-# all be consumed (leak flat).
-test-perceus-1410-byte-raw-ops-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=byte_raw_ops_1410; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1410bron 2> build/s2-1410bron.err \
-	  || { echo "perceus-1410-byte-raw-ops-native FAIL (native build errored)"; cat build/s2-1410bron.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1410bron > build/s2-1410bron.out 2> build/s2-1410bron.rc \
-	  || { echo "perceus-1410-byte-raw-ops-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1410bron.out > /dev/null \
-	  || { echo "perceus-1410-byte-raw-ops-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1410bron.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1410bron.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1410-byte-raw-ops-native OK (leaked=$$leaked < 100)" \
-	  || { echo "perceus-1410-byte-raw-ops-native FAIL (leaked=$$leaked)"; exit 1; }
 
 # Issue #1457 — Int32/UInt32/UInt64 ride a raw per-type register on both
 # backends: `+`/`-`/`*` wrap at the register width (signed for Int32,
@@ -9839,38 +8273,6 @@ test-perceus-1457-fixed-raw-ops: $(TARGET) build
 	  && echo "perceus-1457-fixed-raw-ops OK" \
 	  || { echo "perceus-1457-fixed-raw-ops FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1457fro.out; exit 1; }
 
-# ASAN companion: no use may touch a freed fixed-width cell and the fresh
-# box-per-use borders must not over-release.
-test-perceus-1457-fixed-raw-ops-asan: $(TARGET) build
-	@set -e; \
-	name=fixed_raw_ops_1457; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "perceus-1457-fixed-raw-ops-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1457-fixed-raw-ops-asan OK" \
-	  || { echo "perceus-1457-fixed-raw-ops-asan FAIL (output diff)"; exit 1; }
-
-# Native half: the raw fixed-width op family must print the same wrapped
-# values as the C oracle, and the fresh boxes minted at the boxed borders
-# must all be consumed (leak flat).
-test-perceus-1457-fixed-raw-ops-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=fixed_raw_ops_1457; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1457fron 2> build/s2-1457fron.err \
-	  || { echo "perceus-1457-fixed-raw-ops-native FAIL (native build errored)"; cat build/s2-1457fron.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1457fron > build/s2-1457fron.out 2> build/s2-1457fron.rc \
-	  || { echo "perceus-1457-fixed-raw-ops-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1457fron.out > /dev/null \
-	  || { echo "perceus-1457-fixed-raw-ops-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1457fron.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1457fron.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1457-fixed-raw-ops-native OK (leaked=$$leaked < 100)" \
-	  || { echo "perceus-1457-fixed-raw-ops-native FAIL (leaked=$$leaked)"; exit 1; }
-
 # Int128 raw promotion: `+ - *` and comparisons ride the i128 register;
 # `/`/`%` stay boxed (no i128 checked helper) and trap the zero divisor.
 # Wrap at the 128-bit boundary, a literal above 2^63 (const-from-text),
@@ -9887,38 +8289,6 @@ test-perceus-1464-fixed-raw-ops: $(TARGET) build
 	  && echo "perceus-1464-fixed-raw-ops OK" \
 	  || { echo "perceus-1464-fixed-raw-ops FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1464fro.out; exit 1; }
 
-# ASAN companion: no use may touch a freed Int128 cell and the fresh
-# box-per-use borders (including the boxed `/`/`%`) must not over-release.
-test-perceus-1464-fixed-raw-ops-asan: $(TARGET) build
-	@set -e; \
-	name=fixed_raw_ops_1464; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "perceus-1464-fixed-raw-ops-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1464-fixed-raw-ops-asan OK" \
-	  || { echo "perceus-1464-fixed-raw-ops-asan FAIL (output diff)"; exit 1; }
-
-# Native half: the i128 register op family must print the same wrapped
-# values as the C oracle (byte-identical), and the fresh boxes minted at
-# the boxed borders (and the boxed div/mod) must all be consumed (leak flat).
-test-perceus-1464-fixed-raw-ops-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=fixed_raw_ops_1464; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1464fron 2> build/s2-1464fron.err \
-	  || { echo "perceus-1464-fixed-raw-ops-native FAIL (native build errored)"; cat build/s2-1464fron.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1464fron > build/s2-1464fron.out 2> build/s2-1464fron.rc \
-	  || { echo "perceus-1464-fixed-raw-ops-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1464fron.out > /dev/null \
-	  || { echo "perceus-1464-fixed-raw-ops-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1464fron.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1464fron.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1464-fixed-raw-ops-native OK (leaked=$$leaked < 100)" \
-	  || { echo "perceus-1464-fixed-raw-ops-native FAIL (leaked=$$leaked)"; exit 1; }
-
 # Issue #1637 — the Int operator family rides the wrapping discipline end
 # to end: shifts wrap their shifted-out bits (uint64 compute) and mask
 # the count `& 63`, unary `-` and `^` wrap like `*`, and every printed
@@ -9934,36 +8304,6 @@ test-perceus-1637-int-wrap-ops: $(TARGET) build
 	diff -q ../examples/perceus/$$name.out.expected build/s2-1637iwo.out > /dev/null \
 	  && echo "perceus-1637-int-wrap-ops OK" \
 	  || { echo "perceus-1637-int-wrap-ops FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1637iwo.out; exit 1; }
-
-# UBSan companion: the overflowing shift/neg/pow family must be silent
-# under -fsanitize=undefined (the #1637 halt was UBSan aborting the run).
-test-perceus-1637-int-wrap-ops-asan: $(TARGET) build
-	@set -e; \
-	name=int_wrap_ops_1637; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "perceus-1637-int-wrap-ops-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1637-int-wrap-ops-asan OK" \
-	  || { echo "perceus-1637-int-wrap-ops-asan FAIL (output diff)"; exit 1; }
-
-# Native half: the wrapped values must match the C oracle exactly.
-test-perceus-1637-int-wrap-ops-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=int_wrap_ops_1637; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1637iwon 2> build/s2-1637iwon.err \
-	  || { echo "perceus-1637-int-wrap-ops-native FAIL (native build errored)"; cat build/s2-1637iwon.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1637iwon > build/s2-1637iwon.out 2> build/s2-1637iwon.rc \
-	  || { echo "perceus-1637-int-wrap-ops-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1637iwon.out > /dev/null \
-	  || { echo "perceus-1637-int-wrap-ops-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1637iwon.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1637iwon.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1637-int-wrap-ops-native OK (leaked=$$leaked < 100)" \
-	  || { echo "perceus-1637-int-wrap-ops-native FAIL (leaked=$$leaked)"; exit 1; }
 
 # Issue #1454 — a `Vec[t]<n>` with a concrete `<n>` habitant lays out as a
 # flat inline C aggregate (no heap block, no `{len,cap}`, no RC header) and
@@ -10246,37 +8586,6 @@ test-issue-1394-byte-box: $(TARGET) build
 	  && echo "issue-1394-byte-box OK" \
 	  || { echo "issue-1394-byte-box FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1394bb.out; exit 1; }
 
-# ASAN companion: the Byte boxes minted at every border must be real
-# KAI_BYTE cells — no immediate deref, no over-release at the consumers.
-test-issue-1394-byte-box-asan: $(TARGET) build
-	@set -e; \
-	name=byte_field_box_1394; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err \
-	  || { echo "issue-1394-byte-box-asan FAIL"; cat build/s2-$$name-asan.err; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "issue-1394-byte-box-asan OK" \
-	  || { echo "issue-1394-byte-box-asan FAIL (output diff)"; exit 1; }
-
-# Native half: every Byte border prints the same values as the C oracle
-# (the shape that segfaulted), and the RC ledger stays flat.
-test-issue-1394-byte-box-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=byte_field_box_1394; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1394bbn 2> build/s2-1394bbn.err \
-	  || { echo "issue-1394-byte-box-native FAIL (native build errored)"; cat build/s2-1394bbn.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-1394bbn > build/s2-1394bbn.out 2> build/s2-1394bbn.rc \
-	  || { echo "issue-1394-byte-box-native FAIL (crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-1394bbn.out > /dev/null \
-	  || { echo "issue-1394-byte-box-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1394bbn.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-1394bbn.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] && [ "$$leaked" -lt 100 ] \
-	  && echo "issue-1394-byte-box-native OK (leaked=$$leaked < 100)" \
-	  || { echo "issue-1394-byte-box-native FAIL (leaked=$$leaked)"; exit 1; }
-
 # Issue #1315 — a match on a BORROWED scrutinee must not under-release:
 # the owner's drop of a local whose LAST use sits in a borrowed slot,
 # and the unused rest-binder's non-bind. Two payload twins (String /
@@ -10299,28 +8608,6 @@ test-perceus-1315-borrowed-match-release: $(TARGET) build
 	  [ "$$leaked" -lt 100 ] \
 	    && echo "perceus-1315-borrowed-match-release OK ($$name leaked=$$leaked < 100 over 1000 borrowed reads)" \
 	    || { echo "perceus-1315-borrowed-match-release FAIL ($$name leaked=$$leaked — borrowed-scrutinee release regressed)"; exit 1; }; \
-	done
-
-# ASAN companion for the #1315 gate: the owner-side drop after a
-# borrowed call must never over-free (a wrongly dropped borrow-through
-# param is a UAF). Both payload twins under -fsanitize=address,undefined.
-test-perceus-1315-borrowed-match-release-asan: $(TARGET) build
-	@set -e; \
-	for name in borrowed_match_str_payload_1315 borrowed_match_list_payload_1315; do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-1315-borrowed-match-release-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-1315-borrowed-match-release-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	  echo "perceus-1315-borrowed-match-release-asan OK ($$name)"; \
 	done
 
 # Native half of the #1315 gate (#1329): the KIR lowering must elide the
@@ -10377,44 +8664,6 @@ test-perceus-1355-closure-temp-release: $(TARGET) build
 	  && echo "perceus-1355-closure-temp-release OK ($$name leaked=$$leaked < 100 over 1000 closure temps)" \
 	  || { echo "perceus-1355-closure-temp-release FAIL ($$name leaked=$$leaked — closure temp in borrowed HOF slot leaks again)"; exit 1; }
 
-# ASAN companion for the #1355 gate: the drop this fix adds must fire only
-# on the un-consumed closure temp — a drop against a slot the callee
-# consumes is a double-free.
-test-perceus-1355-closure-temp-release-asan: $(TARGET) build
-	@set -e; \
-	name=closure_temp_borrowed_hof_1355; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1355-closure-temp-release-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1355-closure-temp-release-asan OK ($$name)" \
-	  || { echo "perceus-1355-closure-temp-release-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }
-
-# Native half of the #1355 gate: the mark's post-call KDrop must release
-# the closure temp on the KIR lowering too, keeping both backends leak-flat.
-test-perceus-1355-closure-temp-release-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=closure_temp_borrowed_hof_1355; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	  || { echo "perceus-1355-closure-temp-release-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	  || { echo "perceus-1355-closure-temp-release-native FAIL ($$name: crash)"; exit 1; }; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	  || { echo "perceus-1355-closure-temp-release-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
-	[ -n "$$leaked" ] \
-	  || { echo "perceus-1355-closure-temp-release-native FAIL ($$name: no leaked line)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	[ "$$leaked" -lt 100 ] \
-	  && echo "perceus-1355-closure-temp-release-native OK ($$name native leaked=$$leaked < 100 over 1000 closure temps)" \
-	  || { echo "perceus-1355-closure-temp-release-native FAIL ($$name native leaked=$$leaked — closure temp release regressed on native)"; exit 1; }
 # Issue #1328 — a multi-use local read only through borrowed slots must
 # release its birth ref at end of scope, including when the block tail is
 # the self-tail-call (drop planted per path, before the goto, TCO intact).
@@ -10437,48 +8686,6 @@ test-perceus-1328-selftail-borrowed-local: $(TARGET) build
 	  [ "$$leaked" -lt 100 ] \
 	    && echo "perceus-1328-selftail-borrowed-local OK ($$name leaked=$$leaked < 100)" \
 	    || { echo "perceus-1328-selftail-borrowed-local FAIL ($$name leaked=$$leaked — borrowed multi-use local release regressed)"; exit 1; }; \
-	done
-
-# ASAN companion for the #1328 gate: the end-of-scope drop must never
-# over-release — a consumed dup plus the exit drop is exactly two refs,
-# and an escaping value keeps the ref its tail read pays for.
-test-perceus-1328-selftail-borrowed-local-asan: $(TARGET) build
-	@set -e; \
-	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	    echo "perceus-1328-selftail-borrowed-local-asan FAIL ($$name) — sanitizer diagnostic:"; \
-	    cat build/s2-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	    || { echo "perceus-1328-selftail-borrowed-local-asan DIFF ($$name)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out; exit 1; }; \
-	  echo "perceus-1328-selftail-borrowed-local-asan OK ($$name)"; \
-	done
-
-# Native half of the #1328 gate: the planted per-path drop is a plain
-# `__perceus_drop` in the AST, so the KIR lowering must release the same
-# refs and keep the same output — leak flat on the native backend too.
-test-perceus-1328-selftail-borrowed-local-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
-	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
-	    || { echo "perceus-1328-selftail-borrowed-local-native FAIL ($$name: native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
-	  KAI_TRACE_RC=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc \
-	    || { echo "perceus-1328-selftail-borrowed-local-native FAIL ($$name: crash)"; exit 1; }; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-n.out > /dev/null \
-	    || { echo "perceus-1328-selftail-borrowed-local-native FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-n.out; exit 1; }; \
-	  leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-$$name-n.rc | head -1 | cut -d= -f2); \
-	  [ -n "$$leaked" ] \
-	    || { echo "perceus-1328-selftail-borrowed-local-native FAIL ($$name: no leaked line)"; cat build/s2-$$name-n.rc; exit 1; }; \
-	  [ "$$leaked" -lt 100 ] \
-	    && echo "perceus-1328-selftail-borrowed-local-native OK ($$name native leaked=$$leaked < 100)" \
-	    || { echo "perceus-1328-selftail-borrowed-local-native FAIL ($$name native leaked=$$leaked — borrowed multi-use local release regressed)"; exit 1; }; \
 	done
 
 # Issue #878 — KAI_MAX_HEAP heap ceiling. The fixture doubles a string
@@ -10537,33 +8744,6 @@ test-read-line: $(TARGET) build
 	chk "$$exact\n$$exact" "[$$exact]\n[$$exact]\nlines=2"; \
 	echo "read-line OK"
 
-# Issue #860 — the NATIVE backend must cascade decref->free for cons cells
-# consumed by a self-tail arm (accumulator / consuming / TRMC cons-modulo).
-# Before the fix native left `free_total=0`, `leaked` growing linearly with
-# the list length; the C oracle reclaimed them. The fixture builds + doubles
-# + sums a 20-element list 50 times (1000 cons), so a per-cell leak would
-# leave ~1000 leaked. Built with the NATIVE backend under KAI_TRACE_RC, we
-# assert every cons is reclaimed: `free_total == alloc_total - 1` (the lone
-# residual is the final result string), the exact cascade the C oracle does.
-# Native-gated: only meaningful where libLLVM is linked (tier1-native); a
-# C-only kaic2 cannot run --backend=native, so the target is invoked from the
-# tier1-native workflow, not the C-backend tier1 suite.
-test-perceus-860-native-cons-leak: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/native_cons_selftail_leak_860.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-860ncl 2> build/s2-860ncl.err \
-	  || { echo "perceus-860-native-cons-leak FAIL (native build errored)"; cat build/s2-860ncl.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-860ncl > build/s2-860ncl.out 2> build/s2-860ncl.rc; \
-	diff -q ../examples/perceus/native_cons_selftail_leak_860.out.expected build/s2-860ncl.out > /dev/null \
-	  || { echo "perceus-860-native-cons-leak FAIL (output diff)"; diff ../examples/perceus/native_cons_selftail_leak_860.out.expected build/s2-860ncl.out; exit 1; }; \
-	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-860ncl.rc | head -1 | cut -d= -f2); \
-	free=$$(grep -oE 'free_total=[0-9]+' build/s2-860ncl.rc | head -1 | cut -d= -f2); \
-	[ -n "$$alloc" ] && [ -n "$$free" ] \
-	  || { echo "perceus-860-native-cons-leak FAIL (no alloc/free line)"; cat build/s2-860ncl.rc; exit 1; }; \
-	[ "$$free" -eq "$$alloc" ] \
-	  && echo "perceus-860-native-cons-leak OK (native free_total=$$free == alloc_total=$$alloc; cons cascade decref->free over 1000 cells)" \
-	  || { echo "perceus-860-native-cons-leak FAIL (native free_total=$$free, alloc_total=$$alloc — cons leak regressed, cascade dropped)"; exit 1; }
-
 # Issue #747 / #1054 — a variant REAL slot bound in a match arm and consumed by
 # the arm body is a native use-after-free: the native reads the Real slot as a
 # boxed borrow (`KProj`/`kaix_variant_arg`, mask 0 -> `.ptr`, no incref), while
@@ -10597,106 +8777,6 @@ test-perceus-747-native-real-slot-uaf: $(TARGET) bin-kai build
 	diff -q $$exp build/s2-747rsu.out > /dev/null \
 	  && echo "perceus-747-native-real-slot-uaf OK (native ASAN clean + output parity; Real slot dup protects the borrow)" \
 	  || { echo "perceus-747-native-real-slot-uaf FAIL (output diff)"; diff $$exp build/s2-747rsu.out; exit 1; }
-# Issue #1048 — the NATIVE backend must decref->free a heap RECORD when it
-# leaves scope. Before the fix native left `free_total` near zero (every record
-# leaked, `leaked` grew linearly with the loop count) while the C oracle
-# reclaimed them; the fix is in the KIR lowering (dead-let block-exit drop +
-# EField base drop, both mirrors of the C oracle). The fixture builds + drops
-# 4000 records (bare, field-read, and list-of-records shapes) under the NATIVE
-# backend with KAI_TRACE_RC; the leak must be a SMALL CONSTANT, not O(loops).
-# We assert free_total >= alloc_total - 10 (it is alloc-3); a regression that
-# drops the record decref makes free_total ~2 while alloc_total ~6000.
-# Native-gated (tier1-native): a C-only kaic2 cannot run --backend=native.
-test-perceus-1048-native-record-leak: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/native_record_scope_leak_1048.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1048nrl 2> build/s2-1048nrl.err \
-	  || { echo "perceus-1048-native-record-leak FAIL (native build errored)"; cat build/s2-1048nrl.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1048nrl > build/s2-1048nrl.out 2> build/s2-1048nrl.rc; \
-	diff -q ../examples/perceus/native_record_scope_leak_1048.out.expected build/s2-1048nrl.out > /dev/null \
-	  || { echo "perceus-1048-native-record-leak FAIL (output diff)"; diff ../examples/perceus/native_record_scope_leak_1048.out.expected build/s2-1048nrl.out; exit 1; }; \
-	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1048nrl.rc | head -1 | cut -d= -f2); \
-	free=$$(grep -oE 'free_total=[0-9]+' build/s2-1048nrl.rc | head -1 | cut -d= -f2); \
-	[ -n "$$alloc" ] && [ -n "$$free" ] \
-	  || { echo "perceus-1048-native-record-leak FAIL (no alloc/free line)"; cat build/s2-1048nrl.rc; exit 1; }; \
-	[ "$$free" -ge "$$(($$alloc - 10))" ] \
-	  && echo "perceus-1048-native-record-leak OK (native free_total=$$free >= alloc_total-10=$$(($$alloc - 10)); record decref->free over 4000 cells)" \
-	  || { echo "perceus-1048-native-record-leak FAIL (native free_total=$$free, alloc_total=$$alloc — record leak regressed, decref dropped)"; exit 1; }
-
-# Issue #1112 — the NATIVE backend must decref->free an OWNED boxed value
-# DISCARDED in statement position (a bare ctor result, or the owned array ref
-# `array_set` returns). Before the fix the native `KDo` arm dropped the LLVM
-# Handle without a runtime decref, so the value leaked; the discarded
-# `array_set` ref pinned the array, and its element slots were never walked
-# (the issue's 7 GB RSS `Array[Record]` leak). The C oracle's `SExprStmt`
-# lowers `{ KaiValue *_ = <e>; kai_decref(_); }` and reclaims them. The fixture
-# discards 1000 ctors + builds/drops 100 arrays-of-records under KAI_TRACE_RC;
-# `free_total` must track `alloc_total` (near-total reclaim). A regression that
-# drops the discard decref leaves `free_total` near zero and `leaked` linear.
-# Native-gated (tier1-native): a C-only kaic2 cannot run --backend=native.
-test-perceus-1112-native-discard-decref: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/native_discard_decref_1112.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1112ndd 2> build/s2-1112ndd.err \
-	  || { echo "perceus-1112-native-discard-decref FAIL (native build errored)"; cat build/s2-1112ndd.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1112ndd > build/s2-1112ndd.out 2> build/s2-1112ndd.rc; \
-	diff -q ../examples/perceus/native_discard_decref_1112.out.expected build/s2-1112ndd.out > /dev/null \
-	  || { echo "perceus-1112-native-discard-decref FAIL (output diff)"; diff ../examples/perceus/native_discard_decref_1112.out.expected build/s2-1112ndd.out; exit 1; }; \
-	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1112ndd.rc | head -1 | cut -d= -f2); \
-	free=$$(grep -oE 'free_total=[0-9]+' build/s2-1112ndd.rc | head -1 | cut -d= -f2); \
-	[ -n "$$alloc" ] && [ -n "$$free" ] \
-	  || { echo "perceus-1112-native-discard-decref FAIL (no alloc/free line)"; cat build/s2-1112ndd.rc; exit 1; }; \
-	[ "$$free" -ge "$$(($$alloc - 10))" ] \
-	  && echo "perceus-1112-native-discard-decref OK (native free_total=$$free >= alloc_total-10=$$(($$alloc - 10)); discarded owned values decref->free)" \
-	  || { echo "perceus-1112-native-discard-decref FAIL (native free_total=$$free, alloc_total=$$alloc — discard decref dropped, leak regressed)"; exit 1; }
-
-# Issue #872 — the NATIVE backend must free the rb-tree variant-reuse churn:
-# the rotation reuse arm, the TRMC variant modulo-cons step, the arm-top reuse
-# token, and the con-reuse recolor. Before the fix native leaked nearly every
-# node (reachable-but-unfreed, ~4x over-alloc); the C oracle frees it all. The
-# fixture builds + discards an rb-tree of 60-key passes (20 passes) under the
-# NATIVE backend with KAI_TRACE_RC; the leak must be a SMALL CONSTANT (the lone
-# result string + a few residuals), not O(inserts). We assert leaked < 100 (it
-# is 4 fixed); a regression that drops one node per recursion level blows past
-# this within a few passes. Native-gated (tier1-native): a C-only kaic2 cannot
-# run --backend=native, so the target is invoked from the tier1-native workflow.
-test-perceus-872-native-variant-reuse-leak: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/native_variant_reuse_leak_872.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-872vrl 2> build/s2-872vrl.err \
-	  || { echo "perceus-872-native-variant-reuse-leak FAIL (native build errored)"; cat build/s2-872vrl.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-872vrl > build/s2-872vrl.out 2> build/s2-872vrl.rc; \
-	diff -q ../examples/perceus/native_variant_reuse_leak_872.out.expected build/s2-872vrl.out > /dev/null \
-	  || { echo "perceus-872-native-variant-reuse-leak FAIL (output diff)"; diff ../examples/perceus/native_variant_reuse_leak_872.out.expected build/s2-872vrl.out; exit 1; }; \
-	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-872vrl.rc | head -1 | cut -d= -f2); \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-872vrl.rc | head -1 | cut -d= -f2); \
-	[ -n "$$alloc" ] && [ -n "$$leaked" ] \
-	  || { echo "perceus-872-native-variant-reuse-leak FAIL (no alloc/leaked line)"; cat build/s2-872vrl.rc; exit 1; }; \
-	[ "$$leaked" -lt 100 ] \
-	  && echo "perceus-872-native-variant-reuse-leak OK (native leaked=$$leaked < 100 over alloc_total=$$alloc; rb-tree variant reuse no longer leaks O(inserts))" \
-	  || { echo "perceus-872-native-variant-reuse-leak FAIL (native leaked=$$leaked of alloc=$$alloc — variant reuse leak regressed, grows with inserts)"; exit 1; }
-
-# The NATIVE TRMC variant step must rebuild INTO the arm-top reuse token
-# (the unique scrutinee's shell), not free it and fresh-alloc. The fixture
-# rebuilds a 1000-node variant spine 1000 times; with the reuse the alloc
-# total is O(N) (~1k), without it every level allocates (~1M+). Assert
-# alloc_total < 100000 (100x headroom over the reused figure, 10x below the
-# regressed one) plus golden output. Native-gated (tier1-native), like #872.
-test-perceus-1053-native-trmc-spine-reuse: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/trmc_variant_spine_reuse_1053.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1053sr 2> build/s2-1053sr.err \
-	  || { echo "perceus-1053-native-trmc-spine-reuse FAIL (native build errored)"; cat build/s2-1053sr.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1053sr > build/s2-1053sr.out 2> build/s2-1053sr.rc; \
-	diff -q ../examples/perceus/trmc_variant_spine_reuse_1053.out.expected build/s2-1053sr.out > /dev/null \
-	  || { echo "perceus-1053-native-trmc-spine-reuse FAIL (output diff)"; diff ../examples/perceus/trmc_variant_spine_reuse_1053.out.expected build/s2-1053sr.out; exit 1; }; \
-	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-1053sr.rc | head -1 | cut -d= -f2); \
-	[ -n "$$alloc" ] \
-	  || { echo "perceus-1053-native-trmc-spine-reuse FAIL (no alloc_total line)"; cat build/s2-1053sr.rc; exit 1; }; \
-	[ "$$alloc" -lt 100000 ] \
-	  && echo "perceus-1053-native-trmc-spine-reuse OK (native alloc_total=$$alloc < 100000 over 1M spine rebuilds; TRMC step reuses the token shell)" \
-	  || { echo "perceus-1053-native-trmc-spine-reuse FAIL (native alloc_total=$$alloc — the TRMC variant step fresh-allocs again, token reuse regressed)"; exit 1; }
-
 # Nested (non-bijective) rotation reuse gate. Sequential inserts force a
 # rotation on nearly every insert; the dual-branch lowering donates BOTH
 # unique shells (outer overwrite + inner token), so alloc_total stays near
@@ -10821,18 +8901,6 @@ test-perceus-1136-sized-variant: $(TARGET) build
 	done; \
 	echo "perceus-1136-sized-variant OK (static-kind tests + raw rebuild + poly frontier, C oracle)"
 
-test-perceus-1136-sized-variant-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in variant_static_match_1136 variant_raw_rebuild_1136 variant_poly_frontier_1136; do \
-	  src=../examples/perceus/$$name.kai; \
-	  KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1136-$$name-nat 2> build/s2-1136-$$name-nat.err \
-	    || { echo "perceus-1136-sized-variant-native FAIL ($$name native build errored)"; cat build/s2-1136-$$name-nat.err; exit 1; }; \
-	  ./build/s2-1136-$$name-nat > build/s2-1136-$$name-nat.out; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1136-$$name-nat.out > /dev/null \
-	    || { echo "perceus-1136-sized-variant-native FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1136-$$name-nat.out; exit 1; }; \
-	done; \
-	echo "perceus-1136-sized-variant-native OK (static-kind tests + raw rebuild + poly frontier, native)"
-
 # Issue #1180 — lazy ranges. Correctness gate: a range VALUE through
 # every consumer shape (match fallback incl. multi-element patterns,
 # reverse/append/length/map/filter/eq/show, steps, descending, empty)
@@ -10888,24 +8956,6 @@ test-seq-native: $(TARGET) bin-kai build
 test-seq-asan: $(TARGET) bin-kai build
 	@../tools/test-seq.sh asan
 
-test-perceus-1180-range-lazy-asan: $(TARGET) build
-	@set -e; \
-	name=range_lazy_1180; \
-	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/s2-$$name-asan > build/s2-$$name-asan.out 2> build/s2-$$name-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/s2-$$name-asan.err; then \
-	  echo "perceus-1180-range-lazy-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/s2-$$name-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-asan.out > /dev/null \
-	  && echo "perceus-1180-range-lazy-asan OK (norm/fallback paths sanitizer-clean)" \
-	  || { echo "perceus-1180-range-lazy-asan FAIL (output diff)"; exit 1; }
-
 test-perceus-1180-range-sum: $(TARGET) build
 	@set -e; \
 	name=range_lazy_sum_1180; \
@@ -10921,19 +8971,6 @@ test-perceus-1180-range-sum: $(TARGET) build
 	[ "$$tot" -lt 100 ] \
 	  && echo "perceus-1180-range-sum OK (alloc_total=$$tot < 100; sum fused, reduce lazy, nothing materialised)" \
 	  || { echo "perceus-1180-range-sum FAIL (alloc_total=$$tot — range materialised)"; exit 1; }
-
-test-perceus-1180-range-sum-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=range_lazy_sum_1180; \
-	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-nat 2> build/s2-$$name-nat.err \
-	  || { echo "perceus-1180-range-sum-native FAIL (native build errored)"; cat build/s2-$$name-nat.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-nat > build/s2-$$name-nat.out 2> build/s2-$$name-nat.rc; \
-	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out > /dev/null \
-	  || { echo "perceus-1180-range-sum-native FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name-nat.out; exit 1; }; \
-	tot=$$(grep -oE 'alloc_total=[0-9]+' build/s2-$$name-nat.rc | head -1 | cut -d= -f2); \
-	[ -n "$$tot" ] && [ "$$tot" -lt 100 ] \
-	  && echo "perceus-1180-range-sum-native OK (alloc_total=$$tot < 100 on native)" \
-	  || { echo "perceus-1180-range-sum-native FAIL (alloc_total=$$tot)"; exit 1; }
 
 # Issue #1200 — generalised pipe fusion for a `Shape` protocol container.
 # A user arity-1 `Chain` implementing `Sequence` fuses its `map`-into-`foldl`
@@ -11071,18 +9108,6 @@ test-perceus-1160-de-opaque: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/s2-1160-$$name.out > /dev/null \
 	    || { echo "perceus-1160-de-opaque FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1160-$$name.out; exit 1; }; \
 	  echo "perceus-1160-de-opaque OK ($$name, C oracle)"; \
-	done
-
-test-perceus-1160-de-opaque-native: $(TARGET) bin-kai build
-	@set -e; \
-	for name in $(DE_OPAQUE_1160_FIXTURES); do \
-	  src=../examples/perceus/$$name.kai; \
-	  KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1160-$$name-nat 2> build/s2-1160-$$name-nat.err \
-	    || { echo "perceus-1160-de-opaque-native FAIL ($$name native build errored)"; cat build/s2-1160-$$name-nat.err; exit 1; }; \
-	  ./build/s2-1160-$$name-nat > build/s2-1160-$$name-nat.out; \
-	  diff -q ../examples/perceus/$$name.out.expected build/s2-1160-$$name-nat.out > /dev/null \
-	    || { echo "perceus-1160-de-opaque-native FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1160-$$name-nat.out; exit 1; }; \
-	  echo "perceus-1160-de-opaque-native OK ($$name, native)"; \
 	done
 
 # Issue #1158 — the KIR inliner must not corrupt the TRMC spine of a
@@ -11232,61 +9257,6 @@ test-kir-while-boxed-cond-1414: $(TARGET) bin-kai build
 	  && { echo "kir-while-boxed-cond-1414 FAIL (loop pred wrongly raw-promoted — field-read operand is not raw)"; exit 1; } \
 	  || true; \
 	echo "kir-while-boxed-cond-1414 OK (field-read pred keeps the boxed condbr path)"
-
-test-perceus-882-native-rotation-reuse-crash: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/gap3_balance_minimal.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-882rot 2> build/s2-882rot.err \
-	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native build errored)"; cat build/s2-882rot.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(TIMEOUT) 30 ./build/s2-882rot > build/s2-882rot.out 2> build/s2-882rot.rc \
-	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native run crashed/hung — exit $$?)"; exit 1; }; \
-	diff -q ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out > /dev/null \
-	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (output diff)"; diff ../examples/perceus/gap3_balance_minimal.out.expected build/s2-882rot.out; exit 1; }; \
-	alloc=$$(grep -oE 'alloc_total=[0-9]+' build/s2-882rot.rc | head -1 | cut -d= -f2); \
-	leaked=$$(grep -oE 'leaked=[0-9]+' build/s2-882rot.rc | head -1 | cut -d= -f2); \
-	[ -n "$$alloc" ] && [ -n "$$leaked" ] \
-	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (no alloc/leaked line)"; cat build/s2-882rot.rc; exit 1; }; \
-	[ "$$leaked" -lt 100 ] \
-	  && echo "perceus-882-native-rotation-reuse-crash OK (native exit 0, output 8, leaked=$$leaked < 100 over alloc_total=$$alloc; rotation reuse no longer cycles)" \
-	  || { echo "perceus-882-native-rotation-reuse-crash FAIL (native leaked=$$leaked of alloc=$$alloc — rotation reuse leak regressed)"; exit 1; }
-
-# Issue #995 — the native backend reused a recursive-ADT node in place while
-# the original was still live, mutating it (orig=5 instead of 3). The C oracle
-# was correct. The parity ratchet catches native!=C divergence, but it would
-# miss a regression that corrupts BOTH backends identically; this gate anchors
-# the ABSOLUTE correct output (orig=3) on native against the golden. Both the
-# binary tree and the linear list shapes are exercised in one fixture.
-test-perceus-995-native-shared-reuse-corruption: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/native_shared_reuse_corruption_995.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995corr 2> build/s2-995corr.err \
-	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (native build errored)"; cat build/s2-995corr.err; exit 1; }; \
-	./build/s2-995corr > build/s2-995corr.out 2> build/s2-995corr.rc \
-	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (native run errored — exit $$?)"; exit 1; }; \
-	diff -q ../examples/perceus/native_shared_reuse_corruption_995.out.expected build/s2-995corr.out > /dev/null \
-	  && echo "perceus-995-native-shared-reuse-corruption OK (native orig=3 — original not mutated by the rewrite)" \
-	  || { echo "perceus-995-native-shared-reuse-corruption FAIL (output diff — original corrupted)"; diff ../examples/perceus/native_shared_reuse_corruption_995.out.expected build/s2-995corr.out; exit 1; }
-
-# Issue #995 companion — the fix must not disable valid reuse-in-place. With a
-# DEAD donor (no live alias) the rewrite must still recycle the nodes: assert
-# the native binary reports a non-zero `reuse_in_place` under KAI_TRACE_RC. A
-# regression that fresh-allocated everywhere (the over-conservative fix) shows
-# reuse_in_place=0 and fails here.
-test-perceus-995-native-dead-donor-reuse: $(TARGET) bin-kai build
-	@set -e; \
-	src=../examples/perceus/native_dead_donor_reuse_995.kai; \
-	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995dead 2> build/s2-995dead.err \
-	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native build errored)"; cat build/s2-995dead.err; exit 1; }; \
-	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-995dead > build/s2-995dead.out 2> build/s2-995dead.rc \
-	  || { echo "perceus-995-native-dead-donor-reuse FAIL (native run errored — exit $$?)"; exit 1; }; \
-	diff -q ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out > /dev/null \
-	  || { echo "perceus-995-native-dead-donor-reuse FAIL (output diff)"; diff ../examples/perceus/native_dead_donor_reuse_995.out.expected build/s2-995dead.out; exit 1; }; \
-	reuse=$$(grep -oE 'reuse_in_place=[0-9]+' build/s2-995dead.rc | head -1 | cut -d= -f2); \
-	[ -n "$$reuse" ] \
-	  || { echo "perceus-995-native-dead-donor-reuse FAIL (no reuse_in_place line)"; cat build/s2-995dead.rc; exit 1; }; \
-	[ "$$reuse" -gt 0 ] \
-	  && echo "perceus-995-native-dead-donor-reuse OK (native reuse_in_place=$$reuse > 0; dead-donor reuse-in-place preserved)" \
-	  || { echo "perceus-995-native-dead-donor-reuse FAIL (reuse_in_place=0 — valid reuse disabled by the fix)"; exit 1; }
 
 # Reuse-in-place must not donate a PROJECTION scrutinee (`match e.kind`):
 # the parent's claim on the cell is invisible to the rc==1 guard, so a
@@ -12452,21 +10422,6 @@ test-issue-1565-handler-alias-shadow: $(TARGET) build
 	done; \
 	echo "issue-1565 OK (a binding read only inside handler clauses is used)"
 
-ifeq ($(KAI_LLVM),1)
-test-issue-1565-handler-alias-shadow-native: $(TARGET) bin-kai build
-	@set -e; \
-	KAI_BACKEND=native ../bin/kai build ../examples/effects/issue_1565_handler_alias_shadow.kai \
-	  -o build/iss1565-nat 2> build/iss1565-nat.err \
-	  || { echo "issue-1565 BUILD FAIL (native)"; cat build/iss1565-nat.err; exit 1; }; \
-	./build/iss1565-nat > build/iss1565-nat.out; \
-	diff -q ../examples/effects/issue_1565_handler_alias_shadow.out.expected build/iss1565-nat.out > /dev/null \
-	  && echo "issue-1565 OK (native: enclosing binding wins over the handler state alias)" \
-	  || { echo "issue-1565 DIFF (native)"; diff ../examples/effects/issue_1565_handler_alias_shadow.out.expected build/iss1565-nat.out; exit 1; }
-else
-test-issue-1565-handler-alias-shadow-native:
-	@echo "issue-1565 native: SKIP (KAI_LLVM != 1)"
-endif
-
 # Issue #978 — a fiber spawned inside a nursery performs an effect whose handler
 # is installed in the PARENT fiber. A child starts with an empty evidence stack,
 # so the parent's handler is not reachable from inside it. The spawn boundary is
@@ -12546,45 +10501,6 @@ test-issue-1331-op-arg-release: $(TARGET) build
 	[ "$$leaked" -lt 100 ] \
 	  && echo "issue-1331 OK $$name (leaked=$$leaked < 100 over 1000 fibers; op arg + tail-read local released)" \
 	  || { echo "issue-1331 FAIL $$name (leaked=$$leaked — op arg, tail-read local, or closure temp orphaned)"; exit 1; }
-
-# Issue #1331 — the other direction: a borrowed binder handed to an op must be
-# duped, or the handler side releases a reference the caller still owns. Gated
-# under ASAN because the symptom is a use-after-free on the NEXT read, which a
-# plain build reads back as whatever the allocator left behind.
-test-issue-1331-borrowed-op-arg-asan: $(TARGET) build
-	@set -e; \
-	name=issue_1331_borrowed_op_arg; \
-	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/$$name-asan > build/$$name-asan.out 2> build/$$name-asan.err; \
-	grep -qE "runtime error|AddressSanitizer" build/$$name-asan.err \
-	  && { echo "issue-1331-borrowed-op-arg FAIL $$name"; cat build/$$name-asan.err; exit 1; } \
-	  || true; \
-	diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
-	  && echo "issue-1331-borrowed-op-arg OK $$name (no sanitizer diagnostic, output matches)" \
-	  || { echo "issue-1331-borrowed-op-arg DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }
-
-# ASAN companion: the releases this fix adds must not free anything twice.
-test-issue-1331-op-arg-release-asan: $(TARGET) build
-	@set -e; \
-	name=issue_1331_op_arg_release; \
-	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/$$name-asan > build/$$name-asan.out 2> build/$$name-asan.err; \
-	grep -qE "runtime error|AddressSanitizer" build/$$name-asan.err \
-	  && { echo "issue-1331-asan FAIL $$name"; cat build/$$name-asan.err; exit 1; } \
-	  || true; \
-	diff -q ../examples/effects/$$name.out.expected build/$$name-asan.out > /dev/null \
-	  && echo "issue-1331-asan OK $$name (no sanitizer diagnostic, output matches)" \
-	  || { echo "issue-1331-asan DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }
 
 test-issue-1067-fiber-trap-isolation: $(TARGET) build
 	@set -e; \
@@ -12787,31 +10703,6 @@ test-perceus-issue82: $(TARGET) build
 	    || { echo "perceus-issue82 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# ASAN+UBSan sibling for the issue #82 leak-audit. The fixes
-# touch emit-side decref discipline (stages 1/2 plus LLVM if) and
-# the kai_core_mailbox_* helpers in stage0/runtime.h; ASan
-# catches a regression that double-frees the cond / scrutinee /
-# message, UBSan flags any signed-overflow that slips through the
-# new mailbox transfer paths.
-test-perceus-issue82-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ISSUE82_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-issue82-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-issue82-asan OK $$name" \
-	    || { echo "perceus-issue82-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # Issue #703 — two consecutive `match v` on the same let-bound variant
 # in an unboxed-signature (UFn) fn body panicked `non-exhaustive match`
 # on the C backend (a Perceus use-after-drop) while LLVM was right by
@@ -12836,30 +10727,6 @@ test-perceus-issue703: $(TARGET) build
 	    || { echo "perceus-issue703 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# ASAN+UBSan sibling for issue #703. The fix shifts a drop from
-# mid-block (use-after-free, the original C panic) to keeping the
-# binding live across both reads; ASan catches a regression in either
-# direction — a too-early decref double-frees the variant, a too-late
-# one (or a missing dup) reads freed memory in the second match.
-test-perceus-issue703-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ISSUE703_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-issue703-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-issue703-asan OK $$name" \
-	    || { echo "perceus-issue703-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # Issue #779 — a multi-statement EBlock with a raw tail emits the tail RAW
 # (no `kai_int(...)` box + `(...)->as.i` unbox round-trip). The fixture
 # returns raw scalars through blocks whose statements include a heap String
@@ -12877,28 +10744,6 @@ test-issue-779: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "issue-779 OK $$name (multi-stmt block, raw tail, no box round-trip)" \
 	    || { echo "issue-779 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
-	done
-
-# ASAN+UBSan sibling for issue #779. The raw-tail promotion must NOT move
-# any Perceus drop: a skipped drop leaks the heap binding, a drop run
-# against the raw scalar reads freed/invalid memory. ASan catches both.
-test-issue-779-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ISSUE779_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "issue-779-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "issue-779-asan OK $$name" \
-	    || { echo "issue-779-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
 # The exit report settles an unstarted fiber's captures after main returns;
@@ -12939,29 +10784,6 @@ test-perceus-enum-slot: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "perceus-enum-slot OK $$name (enum stored as immediate tag, re-intern sound)" \
 	    || { echo "perceus-enum-slot DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
-	done
-
-# ASAN+UBSan sibling for the enum-slot lane. The dangerous regression is
-# a forgotten re-intern (kai_enum_slot_box) on the EXTRACT path: handing
-# a raw i64 where a KaiValue* is expected reads it as a pointer (UAF).
-# ASan catches that; the inline-read win itself is value-only and safe.
-test-perceus-enum-slot-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ENUM_SLOT_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-enum-slot-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-enum-slot-asan OK $$name" \
-	    || { echo "perceus-enum-slot-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
 # Issue #298 — closure capture lifecycle. Pre-fix `kai_apply` borrowed
@@ -13010,30 +10832,6 @@ test-perceus-issue350: $(TARGET) build
 	    || { echo "perceus-issue350 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# ASAN+UBSan sibling for the issue #350 arm-binding-drop fixtures.
-# The new exit-drop sits between the arm body and its tail; ASan
-# catches a regression that double-frees the binding (e.g. an emitter
-# that drops a name while it is still live in the tail), UBSan
-# catches a missed kai_incref that lets a freed cell escape.
-test-perceus-issue350-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ISSUE350_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-issue350-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-issue350-asan OK $$name" \
-	    || { echo "perceus-issue350-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # TRMC dropmask / perceus wrap-skip alignment: `[h, ...self(rest, b)]`
 # with `b` read once per arm transfers `b` raw; the goto-block dropmask
 # must not plant a drop for it (over-decref frees the shared arg while
@@ -13051,26 +10849,6 @@ test-perceus-trmc-spread: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "perceus-trmc-spread OK $$name (raw pass-through arg not over-dropped)" \
 	    || { echo "perceus-trmc-spread DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
-	done
-
-test-perceus-trmc-spread-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_TRMC_SPREAD_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -DKAI_NO_CELL_POOL \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-trmc-spread-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-trmc-spread-asan OK $$name" \
-	    || { echo "perceus-trmc-spread-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
 # Nested-pattern reuse-in-place (rb-tree balance rotations). Guards the
@@ -13169,29 +10947,6 @@ test-perceus-int-cache: $(TARGET) build
 	    || { echo "perceus-int-cache DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# ASAN+UBSan sibling: the widened cache pins entries with rc=INT32_MAX
-# so incref/decref short-circuit; ASan catches a regression that frees
-# a pinned slot (e.g. a decref path that stops honoring the rc guard),
-# UBSan catches an out-of-bounds slot index from a bad range check.
-test-perceus-int-cache-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_INT_CACHE_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-int-cache-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-int-cache-asan OK $$name" \
-	    || { echo "perceus-int-cache-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
 # i64-inline soundness battery — variant Int fields read raw (kair_<nm>).
 # Covers every shape the per-route attempts broke on: explicit Int field
 # (rb-tree descent), generic Some/Ok fields, Int arg to a raw-param fn
@@ -13212,48 +10967,6 @@ test-int-field-inline: $(TARGET) build
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
 	    && echo "int-field-inline OK $$name" \
 	    || { echo "int-field-inline DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
-	done
-
-test-int-field-inline-asan: $(TARGET) build
-	@set -e; \
-	for name in $(INT_FIELD_INLINE_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "int-field-inline-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "int-field-inline-asan OK $$name" \
-	    || { echo "int-field-inline-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
-# ASAN+UBSan sibling for the issue #298 closure-lifecycle fixture.
-# The fix changes the kai_apply contract from borrow to consume; ASan
-# catches a regression that double-frees a closure (e.g. an emitter
-# that lost the eager-dup wrapper around a multi-use closure binding).
-test-perceus-issue298-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ISSUE298_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-issue298-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-issue298-asan OK $$name" \
-	    || { echo "perceus-issue298-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
 	done
 
 # Issue #118 — Perceus reuse-in-place (Anga Roa wave v1).
@@ -13310,55 +11023,6 @@ test-perceus-issue118: $(TARGET) build
 	    || { echo "perceus-issue118 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# ASAN+UBSan sibling — required by issue #118 (RC-discipline-critical;
-# the runtime additions add a new alloc-vs-reuse branch on every
-# constructor-after-deconsume site, and a missed `kai_incref` in the
-# unique branch lands as a use-after-free at the next match exit).
-test-perceus-issue118-asan: $(TARGET) build
-	@set -e; \
-	for name in $(PERCEUS_ISSUE118_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
-	    echo "perceus-issue118-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
-	    && echo "perceus-issue118-asan OK $$name" \
-	    || { echo "perceus-issue118-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
-	done
-
-# Issue #91 — PBind catch-all in the M5 fast path. ASAN+UBSan
-# sibling for `match_pbind_catchall_raw.kai`. Match emit + raw
-# locals is exactly the surface where RC discipline gaps
-# manifest: a raw local treated as boxed leaks a `kair_<n>`
-# scalar wrapped in a `kai_int` that's never decrefed; a boxed
-# local treated as raw segfaults under ASan when the runtime
-# tries to chase a pointer through what is in fact an int64.
-test-match-pbind-catchall-asan: $(TARGET) build
-	@set -e; \
-	$(KAIC2) ../examples/perceus/match_pbind_catchall_raw.kai > build/match_pbind_catchall_raw-asan.c \
-	  || { echo "match-pbind-catchall-asan FAIL (kaic2 errored)"; exit 1; }; \
-	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	      -I ../stage2 -I ../stage0 build/match_pbind_catchall_raw-asan.c -o build/match_pbind_catchall_raw-asan-c \
-	  || { echo "match-pbind-catchall-asan FAIL (C compile failed)"; exit 1; }; \
-	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	  ./build/match_pbind_catchall_raw-asan-c > build/match_pbind_catchall_raw-asan.out 2> build/match_pbind_catchall_raw-asan.err; \
-	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/match_pbind_catchall_raw-asan.err; then \
-	  echo "match-pbind-catchall-asan FAIL — sanitizer diagnostic:"; \
-	  cat build/match_pbind_catchall_raw-asan.err; exit 1; \
-	fi; \
-	diff -q ../examples/perceus/match_pbind_catchall_raw.out.expected build/match_pbind_catchall_raw-asan.out > /dev/null \
-	  && echo "match-pbind-catchall-asan OK" \
-	  || { echo "match-pbind-catchall-asan DIFF"; diff ../examples/perceus/match_pbind_catchall_raw.out.expected build/match_pbind_catchall_raw-asan.out; exit 1; }
-
 # Tier S1 lane #3 — net.http client. The pure helpers
 # (`http_serialize_request`, `http_parse_response`, `http_parse_url`)
 # manipulate Strings and HttpHeader records, and the
@@ -13370,29 +11034,6 @@ test-match-pbind-catchall-asan: $(TARGET) build
 # botched decref / consume edit lands as a sanitizer diagnostic
 # instead of a quiet leak. Wired into the root `tier1-asan`
 # alongside the runtime-shadow / Signal / trap-exit gates.
-HTTP_CLIENT_FIXTURES := http_client_basic
-
-test-http-client-asan: $(TARGET) build
-	@set -e; \
-	for name in $(HTTP_CLIENT_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
-	    || { echo "http-client-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
-	    || { echo "http-client-asan FAIL $$name (C compile failed)"; exit 1; }; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
-	    echo "http-client-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/stdlib-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
-	    && echo "http-client-asan OK $$name" \
-	    || { echo "http-client-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
-	done
-
 # Issue #127 — `Env.set_var` / `Env.unset_var` / `Env.vars` round
 # trip under ASAN+UBSan. POSIX `setenv` / `unsetenv` have a long
 # history of buffer-ownership footguns on macOS (libsystem holds
@@ -13403,29 +11044,6 @@ test-http-client-asan: $(TARGET) build
 # pass so a botched lifetime lands as a sanitizer diagnostic
 # instead of a silent leak. Wired into the root `tier1-asan`
 # alongside the http-client / runtime-shadow / Signal gates.
-ENV_MUTATE_FIXTURES := os_env_mutate
-
-test-env-mutate-asan: $(TARGET) build
-	@set -e; \
-	for name in $(ENV_MUTATE_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
-	    || { echo "env-mutate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/stdlib-$$name-asan.c -o build/stdlib-$$name-asan-c \
-	    || { echo "env-mutate-asan FAIL $$name (C compile failed)"; exit 1; }; \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
-	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/stdlib-$$name-asan-c > build/stdlib-$$name-asan.out 2> build/stdlib-$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/stdlib-$$name-asan.err; then \
-	    echo "env-mutate-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/stdlib-$$name-asan.err; exit 1; \
-	  fi; \
-	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out > /dev/null \
-	    && echo "env-mutate-asan OK $$name" \
-	    || { echo "env-mutate-asan DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name-asan.out; exit 1; }; \
-	done
-
 # issue #376 — fixtures for transparent type aliases. `type Foo = T`
 # (single-component, no `|`) restores the structural-alias contract
 # from `docs/kaikai-minimal.md` lines 194-195. Mirrors `test-unions`:
@@ -13618,24 +11236,6 @@ test-doc-attr: $(TARGET) build
 	grep -qF '"module": "core/list"' build/builtins-doc.json \
 	  && echo "doc-attr OK builtins-doc-json" \
 	  || { echo "doc-attr FAIL builtins-doc-json"; exit 1; }
-
-ifeq ($(KAI_LLVM),1)
-# The native lowering takes a lambda's captures from the same collector
-# as the C emitter, so a missed shadow reads the global on both backends.
-test-shadowing-arm-lambda-native: $(TARGET) bin-kai build
-	@set -e; \
-	name=match_arm_binder_captured_by_lambda; \
-	KAI_BACKEND=native ../bin/kai build ../examples/shadowing/$$name.kai -o build/shadowing-$$name-native 2> build/shadowing-$$name-native.err \
-	  || { echo "shadowing-arm-lambda-native FAIL (native build errored)"; cat build/shadowing-$$name-native.err; exit 1; }; \
-	./build/shadowing-$$name-native > build/shadowing-$$name-native.out 2>&1 \
-	  || { echo "shadowing-arm-lambda-native FAIL (run errored)"; cat build/shadowing-$$name-native.out; exit 1; }; \
-	diff -q ../examples/shadowing/$$name.out.expected build/shadowing-$$name-native.out > /dev/null \
-	  || { echo "shadowing-arm-lambda-native FAIL (output diff)"; diff ../examples/shadowing/$$name.out.expected build/shadowing-$$name-native.out; exit 1; }; \
-	echo "shadowing-arm-lambda-native OK"
-else
-test-shadowing-arm-lambda-native:
-	@echo "shadowing-arm-lambda-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # Issue #748 — separate compilation (`--emit=c-modular`). Emits a
 # program as per-module `.c` translation units + per-TU header slices
@@ -14064,6 +11664,17 @@ TEST_LIGHT_TARGETS := $(call registry_pool,light) $(FIXTURE_UNITS)
 FIXTURE_NATIVE_SLUGS := $(shell FIXTURE_BACKEND=native sh ../tools/fixture-dir.sh --list-native)
 FIXTURE_NATIVE_UNITS := $(addprefix test-dir-native-,$(FIXTURE_NATIVE_SLUGS))
 
+# Backend gates (-native / -asan) are rows of gate-variants.txt run by
+# tools/fixture-gate.sh; the target names stay the ones the registry lists.
+GATE_NATIVE_TARGETS := $(shell awk '$$1 !~ /^\#/ && $$2 == "native" { print $$1 }' gate-variants.txt)
+GATE_ASAN_TARGETS := $(shell awk '$$1 !~ /^\#/ && $$2 == "asan" { print $$1 }' gate-variants.txt)
+.PHONY: $(GATE_NATIVE_TARGETS) $(GATE_ASAN_TARGETS)
+$(GATE_NATIVE_TARGETS): $(TARGET) bin-kai build
+$(GATE_ASAN_TARGETS): $(TARGET) build
+$(GATE_NATIVE_TARGETS) $(GATE_ASAN_TARGETS):
+	@KAIC2='$(KAIC2)' CC='$(CC)' CFLAGS='$(CFLAGS)' LDFLAGS_STACK='$(LDFLAGS_STACK)' LDLIBS_M='$(LDLIBS_M)' \
+	  TIMEOUT='$(TIMEOUT)' KAI_LLVM='$(KAI_LLVM)' sh ../tools/fixture-gate.sh $@
+
 print-light-targets:
 	@echo $(TEST_LIGHT_TARGETS)
 
@@ -14401,21 +12012,6 @@ test-issue-1682-user-symbol-namespace: $(TARGET) build
 	diff -q ../examples/effects/issue_1682_user_symbol_namespace.out.expected build/iss1682.out > /dev/null \
 	  && echo "issue-1682 OK (C: user-derived symbols stay out of the runtime namespace)" \
 	  || { echo "issue-1682 DIFF (C)"; diff ../examples/effects/issue_1682_user_symbol_namespace.out.expected build/iss1682.out; exit 1; }
-
-ifeq ($(KAI_LLVM),1)
-test-issue-1682-user-symbol-namespace-native: $(TARGET) bin-kai build
-	@set -e; \
-	KAI_BACKEND=native ../bin/kai build ../examples/effects/issue_1682_user_symbol_namespace.kai -o build/iss1682-nat 2> build/iss1682-nat.err \
-	  || { echo "issue-1682 BUILD FAIL (native)"; cat build/iss1682-nat.err; exit 1; }; \
-	./build/iss1682-nat > build/iss1682-nat.out 2> build/iss1682-nat.run.err \
-	  || { echo "issue-1682 RUN FAIL (native)"; cat build/iss1682-nat.run.err; exit 1; }; \
-	diff -q ../examples/effects/issue_1682_user_symbol_namespace.out.expected build/iss1682-nat.out > /dev/null \
-	  && echo "issue-1682 OK (native: matches the C oracle once the symbols move)" \
-	  || { echo "issue-1682 DIFF (native)"; diff ../examples/effects/issue_1682_user_symbol_namespace.out.expected build/iss1682-nat.out; exit 1; }
-else
-test-issue-1682-user-symbol-namespace-native:
-	@echo "issue-1682-user-symbol-namespace-native SKIP (C-only build; native backend not compiled)"
-endif
 
 # Perceus leak gate: every examples/perceus fixture's RC ledger pinned to an
 # exact allocation count in tools/baselines/rc-leak/. The corpus's other

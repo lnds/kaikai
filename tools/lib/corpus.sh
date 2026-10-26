@@ -85,28 +85,29 @@ kai_corpus_is_skipped() {
   return 1
 }
 
-# A fixture whose documented property IS the one-thread cooperative
-# rotation pins its scheduler in a sibling env file (`main.env` beside a
-# package main.kai, `<name>.env` beside a flat fixture), `KAI_THREADS=1`
-# one VAR=value per line — the same declaration the demos harness reads.
-# Every corpus harness runs such a fixture at its pin. Prints the pinned
-# thread count; non-zero when the fixture declares none.
-kai_corpus_pinned_threads() {
-  local fixture="$1" envfile
+# Per-fixture facts live in a sibling env file (`main.env` beside a package
+# main.kai, `<name>.env` beside a flat fixture), one KEY=value per line:
+#   KAI_THREADS=1       scheduler pin; the documented property IS the one-thread rotation
+#   KAI_NATIVE_OPT=2    native opt level for fixtures whose property is the optimised frame or fold
+#   CFLAGS=<path>...    root-relative C shims linked through CFLAGS
+# Every harness reads them here. Prints the value; non-zero when undeclared.
+# Args: <fixture> <KEY>
+kai_corpus_meta() {
+  local fixture="$1" key="$2" envfile
   case "$fixture" in
     */main.kai) envfile="${fixture%main.kai}main.env" ;;
     *)          envfile="${fixture%.kai}.env" ;;
   esac
   [ -f "$envfile" ] || return 1
-  sed -n 's/^KAI_THREADS=//p' "$envfile" | head -1 | grep .
+  sed -n "s/^$key=//p" "$envfile" | head -1 | grep .
 }
 
-# Fixtures whose property is the optimised frame size or fold (stack depth,
-# tail calls) build natively at O2 even when the harness runs at KAI_NATIVE_OPT=0.
-# Prints the pinned level; non-zero when the fixture is not listed.
-kai_corpus_native_opt() {
-  local list="${KAI_NATIVE_O2_FIXTURES:-tools/native-o2-fixtures.txt}"
-  [ -f "$list" ] && grep -qx -- "$1" "$list" && echo 2
+# The CFLAGS shims of a fixture as absolute paths under $ROOT; non-zero when none.
+kai_corpus_cflags() {
+  local shims shim out=""
+  shims="$(kai_corpus_meta "$1" CFLAGS)" || return 1
+  for shim in $shims; do out="${out:+$out }${ROOT:?}/$shim"; done
+  echo "$out"
 }
 
 # Rewrite ISO-8601 UTC timestamps (the stdlib Log default handler's
