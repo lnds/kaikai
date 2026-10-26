@@ -1,18 +1,12 @@
 # BinSerialize for collections — combinator design
 
-> **v1 status (2026-05-11):** the buffer carrier described in this
-> document as `[Byte]` has shipped as `Array[Byte]` (PR #487, follow-up
-> to closed PR #485). Every signature in this doc that mentions
-> `[Byte]` now reads `Array[Byte]` in `stdlib/protocols.kai`. The
-> protocol shape, the derive machinery, and the combinator design
-> below are unchanged — only the buffer type. `bin_byte_at(buf, pos)`
-> is now an O(1) `array_get` rather than a list walk; that closes the
-> O(N²) gap reported in #485. See
-> `docs/lane-experience-binserialize-array-buf.md` for the substrate
-> retro.
+> The byte buffer this design first described as `[Byte]` shipped as
+> `Array[Byte]`, so `bin_byte_at(buf, pos)` is an O(1) array read. The
+> signatures below use the shipped type; *What blocks a direct impl* and
+> *Alt B* keep the original `[Byte]` rationale.
 
 A pre-blocker lane for Phase A.0 stdlib cache (#452). PR #471 shipped
-`BinSerialize` with cursor semantics and the `#derive(BinSerialize)`
+`BinSerialize` with cursor semantics and the `#[derive(BinSerialize)]`
 machinery for records and sums. The protocol covers `Int`, `Bool`,
 `String`, `Real` and the derive validator accepts user-defined types
 that recursively rely on those primitives.
@@ -22,7 +16,7 @@ The catch: the AST types we want to serialise for the cache layer
 `Option[T]` fields, and `Char` payloads everywhere. None of those
 three have a `BinSerialize` impl today, and one of them (`[T]`)
 cannot have a useful single-dispatch impl at all. This lane closes
-the gap so the cache lane can apply `#derive(BinSerialize)` to the
+the gap so the cache lane can apply `#[derive(BinSerialize)]` to the
 AST.
 
 ## What blocks a direct impl
@@ -40,7 +34,7 @@ Both `[T]` and the `[Byte]` buffer collapse to `"List"`. A single
 global `impl BinSerialize for List` would have to:
 
 - pick the right element encoder/decoder at runtime — impossible
-  because `from_bytes(buf, pos) : Result[String, BinCursor[Self]]`
+  because `from_bytes(buf, pos) : Result[BinCursor[Self], String]`
   takes no `T`-aware argument; `Self` is just `List` with no element
   info; and
 - co-exist with the buffer's own list-of-Byte head, which the same
@@ -66,19 +60,19 @@ element's head type, exactly as the record-field chain does today.
 
 Surface:
 
-```kai
-fn bin_list_to_bytes[t](xs: [t], enc: (t) -> [Byte]) : [Byte]
-fn bin_list_from_bytes[t](buf: [Byte], pos: Int,
-                            dec: ([Byte], Int) -> Result[String, BinCursor[t]])
-                          : Result[String, BinCursor[[t]]]
+```text
+fn bin_list_to_bytes[T, e](xs: [T], enc: (T) -> Array[Byte] / e) : Array[Byte] / Mutable + e
+fn bin_list_from_bytes[T](buf: Array[Byte], pos: Int,
+                          dec: (Array[Byte], Int) -> Result[BinCursor[T], String])
+                        : Result[BinCursor[[T]], String]
 
-fn bin_option_to_bytes[t](o: Option[t], enc: (t) -> [Byte]) : [Byte]
-fn bin_option_from_bytes[t](buf: [Byte], pos: Int,
-                              dec: ([Byte], Int) -> Result[String, BinCursor[t]])
-                            : Result[String, BinCursor[Option[t]]]
+fn bin_option_to_bytes[T, e](o: Option[T], enc: (T) -> Array[Byte] / e) : Array[Byte] / e
+fn bin_option_from_bytes[T](buf: Array[Byte], pos: Int,
+                            dec: (Array[Byte], Int) -> Result[BinCursor[T], String])
+                          : Result[BinCursor[Option[T]], String]
 
-fn bin_char_to_bytes(c: Char) : [Byte]
-fn bin_char_from_bytes(buf: [Byte], pos: Int) : Result[String, BinCursor[Char]]
+fn bin_char_to_bytes(c: Char) : Array[Byte]
+fn bin_char_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Char], String]
 ```
 
 These live in `stdlib/protocols.kai` next to the existing `bin_*`
@@ -129,7 +123,7 @@ a cursor.
 `put(t)` and `decode_call(t)` are recursive over `t`: nested
 `TyList(TyList(Int))` produces
 
-```kai
+```kaikai-fragment
 bin_buf_put_list(acc, self.f, (b, x) => bin_buf_put_list(b, x, (b2, y) => bin_buf_put_int(b2, y)))
 ```
 
@@ -188,7 +182,7 @@ existing shape entirely.
 
 ### Alt D: hand-write serialisers per AST node
 
-Sketched at ~1500-3000 LOC in `stage2/compiler.kai`. Rejected: the
+Sketched at ~1500-3000 LOC in `stage2/compiler/`. Rejected: the
 derive infrastructure already exists and ships byte-identical output
 across re-derivation, which a hand-written set of 30 functions
 would not maintain across AST evolutions without diligent review.
@@ -228,7 +222,7 @@ fall-through is harmless.
 ## Acceptance
 
 - Existing `Int`/`Bool`/`String`/`Real` impls and the existing
-  `#derive(BinSerialize)` for primitive-only records and sums must
+  `#[derive(BinSerialize)]` for primitive-only records and sums must
   remain byte-identical (`make selfhost` is the gate).
 - New positive fixtures cover: `[Int]`, `[String]`, `[[Int]]`,
   `Option[Int]`, `Option[String]`, `Char`, sum variants with
@@ -236,6 +230,6 @@ fall-through is harmless.
 - New negative fixture: `[FooNoImpl]` reports the inner type as
   missing, not the outer `List`.
 - `make tier0` + `make tier1` green.
-- Phase A.0 (next lane) can apply `#derive(BinSerialize)` to the
+- Phase A.0 (next lane) can apply `#[derive(BinSerialize)]` to the
   full AST type tree (`Decl` and friends) without further protocol
   changes.

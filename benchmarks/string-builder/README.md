@@ -3,7 +3,7 @@
 Builds an N-fragment string two ways and measures the asymptotic gap:
 
 - `sb_builder.kai` — accumulate into a `string_builder`, `build` once.
-- `sb_naive.kai` — left-fold of `acc := @acc ++ "frag"`.
+- `sb_naive.kai` — left-fold of `acc := acc ++ "frag"`.
 
 The naive fold is O(n²): every `++` allocates a fresh string the size
 of the accumulator-so-far, so total work and total garbage are both
@@ -30,8 +30,7 @@ At **N = 50 000** the naive fold **exhausts a 4 GiB heap and aborts**
 (`heap limit exceeded`), because the accumulator copies dominate. The
 StringBuilder builds **N = 200 000** (4× more fragments, 800 000-byte
 result) in **0.53 s under 4 GiB**. The quadratic garbage, not the CPU,
-is what makes naive concatenation unusable at scale — the motivation
-behind this module and its compiler twin (#901).
+is what makes naive concatenation unusable at scale.
 
 ## Run
 

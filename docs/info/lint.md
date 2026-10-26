@@ -380,6 +380,6 @@ equivalent, the rule stays silent.
 Today's rules: `discard_pure_value`, `point_free_nudge`,
 `and_then_to_map_nudge`, `match_option_to_combinator`, `redundant_if_bool`,
 `redundant_match_catchall`, `list_concat_literal_to_spread`,
-`dead_code_unused_priv`, `effect_over_declared`,
+`non_tail_list_recursion`, `dead_code_unused_priv`, `effect_over_declared`,
 `effect_ffi_without_extern`. More land over time as new equivalences
 earn their place.

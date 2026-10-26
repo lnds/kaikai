@@ -200,6 +200,8 @@ effect Cell { get() : Int  set(n: Int) : Unit }
 
 fn add(c1: Cell, c2: Cell, dst: Cell) : Unit =
   dst.set(c1.get() + c2.get())
+
+fn main() : Int = 0
 ```
 
 Under capability passing this is not even a special case: `c1`, `c2`,

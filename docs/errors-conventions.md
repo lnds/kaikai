@@ -1,8 +1,6 @@
 # Error handling conventions for kaikai
 
-Status: documentation of conventions (2026-05-03). Not a spec change.
-
-This document consolidates the rules — scattered today across
+This document consolidates the rules — otherwise scattered across
 `docs/effects-stdlib.md` per effect — for **how to express failure**
 in kaikai code. Five mechanisms coexist; this doc explains when each
 applies and how they compose.
@@ -35,7 +33,7 @@ Examples in stdlib:
 - `File.read_file(path) : Result[String, String]` — every motive
   matters: "no such file" is a different recovery path from
   "permission denied".
-- `Map.get(k) : Option[V]` — "key absent" is the only motive.
+- `map.get(m, k) : Option[v]` — "key absent" is the only motive.
 
 **Litmus test**: if you find yourself writing `match e { _ -> None }`
 on the error case of a `Result`, you should have used `Option`.
@@ -75,134 +73,89 @@ message is too lossy.
 
 `panic` is **not** for:
 
-- Failed I/O (`File`, `Net`, `Stdin`) — use the `Result` / `Option`
+- Failed I/O (`File`, the network effects, `Stdin`) — use the `Result` / `Option`
   shape declared by the effect.
 - Bad user input — surface it through `Result[T, InputError]`.
 - Validation failures — same as above.
 
 **In fintech / regulated production code, `panic` should be
 exceptional.** A reachable `panic` in production is a bug in the
-contract design, not in the input. (The runtime panic from the
-polymorphic-impl bug — issue #174 — is a counter-example that needs
-fixing precisely because it surfaces under user-reachable code.)
+contract design, not in the input.
 
 ## Rule 4 — `Result[T, E]` order: `T` first, `E` second (Ok-first)
 
-```kai
-fn parse(s: String) : Result[Int, ParseError] = ...
+```kaikai
+type ParseError = Empty | NotANumber(String)
+
+fn parse(s: String) : Result[Int, ParseError] =
 #                            ^^^  ^^^^^^^^^^
 #                            value type  error type
 #                            (Ok slot)   (Err slot)
+  if s == "" { Err(Empty) } else {
+    match string_to_int(s) { Some(n) -> Ok(n)  None -> Err(NotANumber(s)) }
+  }
+
+fn main() : Int = match parse("42") { Ok(n) -> n  Err(_) -> 1 }
 ```
 
 `Ok(value)` and `Err(motive)` are the constructors. The success type
 comes first, the error type second — the same order as Rust's
-`Result<T, E>`. This is fixed in stage 2 and mirrors the source
-declaration in `stdlib/core/result.kai`.
+`Result<T, E>`, and the order of the declaration in
+`stdlib/core/result.kai`.
 
 > **Reading the type aloud**: `Result[T, E]` is "a result that
 > carries `T` or errors with `E`". Because `Ok`/`Err` are named
 > constructors, `Ok(value)` / `Err(motive)` are unambiguous
-> regardless of the type-argument order — but the annotation itself
-> now reads left-to-right success-then-error, matching Rust.
+> regardless of the type-argument order — and the annotation itself
+> reads left-to-right success-then-error, matching Rust.
 
 ## Rule 5 — Composing errors across subsystems
 
 Multiple subsystems each have their own error type
 (`ValidationError`, `ApprovalError`, `ExecutionError`). A function
 that orchestrates them needs **one error type** for its return
-value. Two patterns:
+value. Two patterns, listed in order of preference for new code:
 
-**Three patterns**, listed in order of preference for new code:
+- **Pattern C — unions** (canonical for new code).
+- **Pattern A — wrapper sum type** (still valid).
 
-- **Pattern C — unions** (canonical for new code; landed in
-  issue #187, 2026-05-03).
-- **Pattern A — wrapper sum type** (legacy, still valid).
-- **Pattern B — `!` with auto-`From`** (deferred to post-#180).
+### Pattern C — unions (canonical)
 
-### Pattern A — wrapper sum type (legacy)
+A `type` whose members are previously declared sum types is a union.
+An application error type is composed by listing its constituents:
 
-```kai
-type AppError =
-  | Validation(ValidationError)
-  | Approval(ApprovalError)
-  | Execution(ExecutionError)
-
-fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
-  let v = validate(req).map_err(Validation)!
-  let a = approve(v).map_err(Approval)!
-  let e = execute(a).map_err(Execution)!
-  Ok(receipt(e))
-}
-```
-
-This was the standard kaikai pattern before issue #187. Three
-pieces:
-
-1. A wrapper sum type (`AppError`) with one variant per subsystem.
-2. `expr.map_err(Wrapper)!` at every cross-subsystem boundary.
-3. Pattern matching on `AppError` at the outermost handler.
-
-The wrapper is **explicit** — adding a new subsystem requires
-extending `AppError`, which the typer enforces exhaustively at
-every match. Pattern A is still appropriate when the wrapper
-variant carries **additional structure** beyond the inner error
-(a request id, a retry count, a context tag). For pure
-"forward the inner error verbatim" cases, Pattern C (unions) is
-strictly better.
-
-`map_err` is part of the proposed `Result` API expansion (issue
-#182). Until it lands, the workaround is a manual `match`:
-
-```kai
-let v = match validate(req) {
-  Err(e) -> Err(Validation(e))
-  Ok(x)  -> Ok(x)
-}!
-```
-
-### Pattern B — `!` with auto-`From` (post-#180)
-
-When `protocol P[A]` lands (issue #180) and `!` is extended to
-invoke `From::from(err)` on type mismatch, the wrapper boilerplate
-collapses:
-
-```kai
-impl From[ValidationError] for AppError {
-  fn from(e: ValidationError) : AppError = Validation(e)
-}
-# ... analogous for ApprovalError, ExecutionError
-
-fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
-  let v = validate(req)!     # ! invokes From::from automatically
-  let a = approve(v)!
-  let e = execute(a)!
-  Ok(receipt(e))
-}
-```
-
-This is the Rust idiom (`?` + `From` trait). Tracked as a follow-up
-to #180. **Not** available today; Pattern C (below) covers most of
-the same ground without `From` impls.
-
-### Pattern C — unions (canonical, since 2026-05-03)
-
-Issue #187 unified algebraic types so that `|` always means
-"union of types". A subsystem error type is composed by listing
-its constituents:
-
-```kai
+```kaikai
 type ValidationError = InvalidAmount | SourceFrozen | DestinationFrozen
 type ApprovalError   = OverDailyLimit | KycRequired
 type ExecutionError  = SettlementBackendDown | DoubleSpendDetected
 
 type AppError = ValidationError | ApprovalError | ExecutionError
 
+type PayReq = { amount: Int }
+type Receipt = { id: Int }
+
+fn validate(req: PayReq) : Result[Int, ValidationError] =
+  if req.amount <= 0 { Err(InvalidAmount) } else { Ok(req.amount) }
+fn approve(v: Int) : Result[Int, ApprovalError] =
+  if v > 1000 { Err(OverDailyLimit) } else { Ok(v) }
+fn execute(a: Int) : Result[Int, ExecutionError] = Ok(a + 1)
+
 fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
-  let v = validate(req)!       # Result[_, ValidationError] — D3 upcast
-  let a = approve(v)!          # Result[_, ApprovalError]   — D3 upcast
-  let e = execute(a)!           # Result[_, ExecutionError]  — D3 upcast
-  Ok(receipt(e))
+  let v = validate(req)!       # Result[_, ValidationError] — implicit upcast
+  let a = approve(v)!          # Result[_, ApprovalError]   — implicit upcast
+  let e = execute(a)!          # Result[_, ExecutionError]  — implicit upcast
+  Ok(Receipt { id: e })
+}
+
+fn render(err: AppError) : String = match err {
+  ve : ValidationError -> "invalid request"
+  ae : ApprovalError   -> "not approved"
+  ee : ExecutionError  -> "execution failed"
+}
+
+fn main() : Unit / Stdout = match process_payment(PayReq { amount: 0 }) {
+  Ok(r)  -> Stdout.print("receipt #{r.id}")
+  Err(e) -> Stdout.print(render(e))
 }
 ```
 
@@ -213,20 +166,62 @@ fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
 - `!` propagates through the upcast: a `Result[_, ValidationError]`
   flows into a function returning `Result[_, AppError]` directly.
 - Pattern matching uses `bind : ComponentType` to delegate per
-  subsystem:
-
-```kai
-match err : AppError {
-  ve : ValidationError -> render_validation(ve)
-  ae : ApprovalError   -> render_approval(ae)
-  ee : ExecutionError  -> render_execution(ee)
-}
-```
+  subsystem, as `render` does: each arm binds a value of one
+  component type.
 
 Adding a new subsystem requires extending `AppError`'s union and
 adding one match arm. The compiler enforces exhaustiveness at the
 arm level and types each component-typed handler as if it lived
 in its own bounded context.
+
+### Pattern A — wrapper sum type
+
+```kaikai
+type ValidationError = InvalidAmount | SourceFrozen
+type ApprovalError   = OverDailyLimit | KycRequired
+type ExecutionError  = SettlementBackendDown | DoubleSpendDetected
+
+type AppError =
+  | Validation(ValidationError)
+  | Approval(ApprovalError)
+  | Execution(ExecutionError)
+
+type PayReq = { amount: Int }
+type Receipt = { id: Int }
+
+fn validate(req: PayReq) : Result[Int, ValidationError] =
+  if req.amount <= 0 { Err(InvalidAmount) } else { Ok(req.amount) }
+fn approve(v: Int) : Result[Int, ApprovalError] =
+  if v > 1000 { Err(OverDailyLimit) } else { Ok(v) }
+fn execute(a: Int) : Result[Int, ExecutionError] = Ok(a + 1)
+
+fn process_payment(req: PayReq) : Result[Receipt, AppError] = {
+  let v = map_err(validate(req), Validation)!
+  let a = map_err(approve(v), Approval)!
+  let e = map_err(execute(a), Execution)!
+  Ok(Receipt { id: e })
+}
+
+fn main() : Int = match process_payment(PayReq { amount: 5 }) { Ok(r) -> r.id  Err(_) -> 1 }
+```
+
+This was the standard kaikai pattern before unions. Three pieces:
+
+1. A wrapper sum type (`AppError`) with one variant per subsystem.
+2. `map_err(expr, Wrapper)!` at every cross-subsystem boundary.
+3. Pattern matching on `AppError` at the outermost handler.
+
+The wrapper is **explicit** — adding a new subsystem requires
+extending `AppError`, which the typer enforces exhaustively at
+every match. Pattern A is still appropriate when the wrapper
+variant carries **additional structure** beyond the inner error
+(a request id, a retry count, a context tag). For pure
+"forward the inner error verbatim" cases, Pattern C (unions) is
+strictly better.
+
+There is no automatic conversion on `!` (no Rust-style `From`
+on `?`): the error type of the operand must be the function's
+error type or a component of its union.
 
 See `docs/unions.md` for the full reference and
 `examples/unions/ddd_ledger_demo.kai` for an end-to-end demo
@@ -242,7 +237,7 @@ across three bounded contexts.
 | The same component error participates in many app-level unions | **Pattern C** (no name mangling needed) |
 | You need a single-tag runtime layout (FFI, serialisation pinned to a tag enum) | Pattern A |
 | The wrapper is purely for type identity with no extra payload | **Pattern C** wins (less boilerplate) |
-| Generic over the error type (`F[T] = Option[T] | Result[T, String]`) | Neither yet — generic unions deferred |
+| Generic over the error type (`F[T] = Option[T] | Result[T, String]`) | Neither — unions are not generic |
 
 Default to Pattern C for new code. Migrate Pattern A code only
 when the wrapper carries no extra structure and the migration is
@@ -269,26 +264,38 @@ that should report **all** failures (every rule that fired) — the
 typical fintech use case for transfer / order / portfolio
 validation — kaikai today requires manual accumulation:
 
-```kai
+```kaikai
+type TransferError = InvalidAmount | SourceFrozen | DestinationFrozen | OverDailyLimit
+
+type TransferRequest = { from: String, to: String, amount: Int }
+type ValidatedTransfer = { from: String, to: String, amount: Int }
+
+fn is_account_active(acct: String) : Bool = acct != "frozen"
+fn daily_limit(acct: String) : Int = 1000
+
 fn validate_transfer(req: TransferRequest) : Result[ValidatedTransfer, [TransferError]] = {
   let errors : [TransferError] = []
-  let errors = if req.amount <= 0<USD>     { errors ++ [InvalidAmount] }     else { errors }
-  let errors = if !is_account_active(req.from)  { errors ++ [SourceFrozen] }      else { errors }
-  let errors = if !is_account_active(req.to)    { errors ++ [DestinationFrozen] }else { errors }
+  let errors = if req.amount <= 0 { errors ++ [InvalidAmount] } else { errors }
+  let errors = if not is_account_active(req.from) { errors ++ [SourceFrozen] } else { errors }
+  let errors = if not is_account_active(req.to) { errors ++ [DestinationFrozen] } else { errors }
   let errors = if req.amount > daily_limit(req.from) { errors ++ [OverDailyLimit] } else { errors }
   if errors == [] {
-    Ok(ValidatedTransfer { ... })
+    Ok(ValidatedTransfer { from: req.from, to: req.to, amount: req.amount })
   } else {
     Err(errors)
   }
 }
+
+fn main() : Unit / Stdout =
+  match validate_transfer(TransferRequest { from: "frozen", to: "b", amount: 0 }) {
+    Ok(_)   -> Stdout.print("ok")
+    Err(es) -> Stdout.print("#{list.length(es)} errors")
+  }
 ```
 
 This pattern works but is verbose. A `Validation[E, T]`-style type
 that accumulates over `<*>`-like composition (the Scala cats /
-Haskell `Validation` model) is **not** in stdlib v1 and is **not**
-proposed. If a real fintech need surfaces, it can be designed as a
-follow-up.
+Haskell `Validation` model) is **not** in the stdlib.
 
 The current guidance: when validation rules are independent (the
 typical case), build a `[E]` list manually and return
@@ -302,14 +309,21 @@ There is no stdlib abort effect. When a failure is genuinely
 unrecoverable *and* must escape through frames that do not mention
 it, declare the effect where the policy belongs:
 
-```kai
+```kaikai
 effect Abort {
   fail(msg: String) : Nothing    # Nothing = empty type, never returns
+}
+
+fn load(path: String) : Int / Abort =
+  if path == "" { Abort.fail("no path") } else { 42 }
+
+fn main() : Int / Stdout = handle { load("") } with Abort {
+  fail(msg, resume) -> { Stdout.print("aborted: #{msg}"); 1 }
 }
 ```
 
 `Nothing` is uninhabited, so a clause cannot resume: control jumps
-to the nearest `handle ... with Abort { fail(msg, _) -> ... }` and
+to the nearest `handle ... with Abort { fail(msg, resume) -> ... }` and
 the rest of the body is abandoned. Because the effect is
 user-declared, no default handler exists — an unhandled abort is a
 compile error (`effect not handled`), not a runtime banner.
@@ -335,10 +349,9 @@ Is the failure value worth keeping for the caller?
 ├── No, "absent" is enough → Option[T]
 └── Yes, motive matters
     ├── Caller can recover meaningfully → Result[T, E]
-    │   └── Multiple subsystems' errors compose? → union (Pattern C, since #187)
+    │   └── Multiple subsystems' errors compose? → union (Pattern C)
     │       (Pattern A — wrapper sum + map_err — when the wrapper
-    │        carries extra structure; Pattern B — auto-From — once
-    │        #180 lands and only if a per-conversion impl is wanted.)
+    │        carries extra structure.)
     └── Caller cannot recover (broken terminal, OOM, ...) → abort effect
         (user-declared, op returns Nothing) or Cancel.raise()
 
@@ -359,10 +372,4 @@ Does it indicate a programming bug or invariant violation?
 - `docs/syntax-sugars.md` — `!` postfix.
 - `docs/unions.md` — user-facing reference for Pattern C.
 - `docs/unions-design.md` — design rationale and decision log.
-- Issue #187 — milestone issue that introduced Pattern C.
-- Issue #182 — `Result` / `Option` stdlib API expansion (`map_err`,
-  `or_else`, `transpose`, `collect`, ...).
-- Issue #180 — `protocol P[A]` (enables auto-`From` on `!` as a
-  follow-up).
-- Issue #174 — polymorphic-impl runtime panic. The example given in
-  the document of "where `panic` is *not* acceptable" applies here.
+- `stdlib/core/result.kai` — the `Result` API (`map_err`, `or_else`, ...).

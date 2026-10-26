@@ -115,19 +115,25 @@ two things by position, the `Unit`/`Unit` collision `docs/kinds.md` §"three thi
 called Unit" documents).
 
 ```kaikai
-# UoM precedent
-let g : Real<m/s^2> = 9.81<m/s^2>
+unit m
+unit s
 
 # Layout, identical shape
 type Header = {
   magic:   U32<be>,     # big-endian, network order
-  version: U8,          # single byte — no layout annotation needed
+  version: U8,          # no layout annotation
   id:      I64<le>,     # little-endian, signed
+}
+
+fn main() : Unit / Stdout = {
+  let g : Real<m/s^2> = 9.81<m/s^2>         # UoM precedent
+  let h = Header { magic: 0<be>, version: 1, id: 0<le> }
+  Stdout.print("#{g}")
 }
 ```
 
-A field with no `<…>` is host-native single-byte or the default width layout (an
-open decision — see Boundaries). Layout annotations apply only to fixed-width
+A field with no `<…>` makes the record plain: it is not Layout-bearing, so
+`#[derive(Layout)]` emits no impl for it (see *Resolved during implementation*). Layout annotations apply only to fixed-width
 integer heads (`U8..U128`, `I8..I128`), mirroring UoM's "numeric heads only" rule
 (`U32<be>` yes; `String<be>` a parse error).
 
@@ -151,8 +157,14 @@ derived protocol.
 #[derive(Layout)]
 type Header = { magic: U32<be>, port: U16<be>, flags: U16<le> }
 
-value.to_bytes()              : Array[Byte]                        # total
-header_from_bytes(buf, pos)   : Result[BinCursor[Header], String]  # Err when short
+fn main() : Unit / Stdout = {
+  let h = Header { magic: 0xCAFEBABE<be>, port: 80<be>, flags: 0<le> }
+  let buf : Array[Byte] = h |> to_bytes()     # total
+  match header_from_bytes(buf, 0) {           # Result[BinCursor[Header], String]
+    Ok(c)  -> Stdout.print("port #{c.value.port}")
+    Err(m) -> Stdout.print(m)                 # Err when short
+  }
+}
 ```
 
 `Layout` and `BinSerialize` are **sibling derives**: same protocol signature,
@@ -177,13 +189,29 @@ single dispatch selects the impl from the first argument — which here is the
 buffer, not `Self`. Same constraint, same shim, as `BinSerialize`.
 
 ```kaikai
+#[derive(Layout)]
+type Header = { magic: U32<be>, port: U16<be>, flags: U16<le> }
+
+type ParseError = BadMagic(U32<be>) | Truncated
+
 fn parse_header(buf: Array[Byte]) : Result[Header, ParseError] =
   match header_from_bytes(buf, 0) {
-    Ok(c) if c.value.magic == 0xCAFEBABE -> Ok(c.value)
-    Ok(c)                                -> Err(BadMagic(c.value.magic))
-    Err(_)                               -> Err(Truncated)
+    Ok(c) if c.value.magic == 0xCAFEBABE<be> -> Ok(c.value)
+    Ok(c)                                    -> Err(BadMagic(c.value.magic))
+    Err(_)                                   -> Err(Truncated)
   }
+
+fn main() : Unit / Stdout = {
+  let h = Header { magic: 0xCAFEBABE<be>, port: 80<be>, flags: 0<le> }
+  match parse_header(h |> to_bytes()) {
+    Ok(p)  -> Stdout.print("port #{p.port}")
+    Err(_) -> Stdout.print("bad header")
+  }
+}
 ```
+
+The literal compared against a `<be>` field carries the habitant too
+(`0xCAFEBABE<be>`): a bare literal is a different representation and does not unify.
 
 `from_bytes` returning `Result` is the safety story: too-short input yields `Err`,
 never a garbage read. The `BinCursor` carries `pos` past the record, so a Layout
@@ -212,7 +240,9 @@ This is the axis Elixir wins with `payload::binary-size(count)`. A field's byte
 length may refer to a **prior field of the same record**, read first in the
 sequential decode:
 
-```kaikai
+Proposed form; not implemented (`Bytes<len>` is an unknown-unit error today):
+
+```text
 type Packet = {
   len:  U16<be>,           # read first
   body: Bytes<len>,        # its length is the already-read `len`
@@ -260,9 +290,9 @@ bitwise ops.
    (`docs/bitwise-scope-design.md` / `stdlib/math/bits.kai`), tracked
    alongside so both gate legible binary code together.
 
-3. **Default-width layout of an un-annotated field.** Whether `id: U32` (no
-   `<…>`) means host-endian, big-endian-by-convention, or a parse-requires-
-   annotation is an open call, resolved at implementation.
+3. **Default-width layout of an un-annotated field.** Resolved: an un-annotated
+   `id: U32` makes the record not Layout-bearing (see *Resolved during
+   implementation*); there is no host-endian default.
 
 ## Component status
 
@@ -294,7 +324,7 @@ bitwise ops.
 
 ## References
 
-- `docs/kinds.md` — the two-kind system and the bar for a third.
+- `docs/kinds.md` — the kind-system primer and the bar for a new kind.
 - `docs/units-of-measure.md` — the `Measure` kind, the syntax `Layout` mirrors.
 - `docs/unsafe-systems-design.md` — the raw `reinterpret` alternative this
   supersedes for structured formats, and the systems frame.

@@ -1,8 +1,7 @@
 # Language Server (`kai lsp`)
 
-> v3 status (2026-05-20): hover, goto-definition, publishDiagnostics,
-> documentSymbol, **completion**, and **signatureHelp** all ship.
-> See issue #447 for the roadmap.
+Hover, goto-definition, publishDiagnostics, documentSymbol,
+completion and signatureHelp ship.
 
 `kai lsp` is the kaikai Language Server. It speaks LSP JSON-RPC
 over stdio and is the integration point for every editor — VS
@@ -24,7 +23,7 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
 | `textDocument/didClose`           | ✅          |
 | `textDocument/hover`              | ✅          |
 | `textDocument/definition`         | ✅          |
-| `textDocument/publishDiagnostics` | ✅ (partial) |
+| `textDocument/publishDiagnostics` | ✅          |
 | `textDocument/documentSymbol`     | ✅          |
 | `textDocument/completion`         | ✅          |
 | `textDocument/signatureHelp`      | ✅          |
@@ -47,13 +46,11 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
   editor once the pass that raises it collects it (lexer, parser,
   resolver, typer mismatches, post-typer and monomorphisation
   checks). `tools/diags-json-parity-baseline.txt` lists the negative
-  fixtures whose errors still print to stderr only. An empty array
+  fixtures whose errors still print to stderr only; it is empty. An empty array
   publishes on a clean buffer so previous markers clear.
-* **documentSymbol** walks the parser-level decls and emits the
-  outline panel content. `DFn` (incl. lowered `const`),
-  `DEffect`, `DProtocol`, `DUnit`, `DTest`, `DBench` are
-  surfaced. `DType` is dropped by the elaborator and does not
-  appear in v2 — pending follow-up.
+* **documentSymbol** walks the file's own declarations and emits the
+  outline panel content: functions, constants, types, effects,
+  protocols, units, tests and benches.
 
 ## Architecture
 
@@ -77,14 +74,14 @@ returns JSON with the AST type at that probe; the LSP wraps it in
 a `Hover` response and writes it back.
 
 Per-hover cost on macOS is roughly 5–15 ms. The subprocess model
-is intentional: the alternative is linking the ~60 kLOC of stage 2
+is intentional: the alternative is linking the ~160 kLOC of stage 2
 into the LSP binary, which would double its size and couple LSP
 releases to compiler internals. Issue #447 sketches a long-term
 in-process daemon mode; v1 ships the subprocess wrapper.
 
 The LSP itself is written in kaikai (`tools/kai-lsp/main.kai`,
-~500 lines) and uses the `Stdin`, `Stdout`, `File`, `Process`,
-and `Env` capabilities.
+~1500 lines) and uses the `Stdin`, `Stdout`, `Stderr`, `File`,
+`Process` and `Env` capabilities.
 
 ## Editor configuration
 
@@ -145,14 +142,11 @@ lspconfig.kaikai.setup({})
 
 ## Known v3 limitations
 
-The v1 limitations around goto-def and publishDiagnostics are
-closed (see the status sidebar above). The limitations that
-remain:
+The limitations that remain:
 
 * **ASCII-only positions.** LSP uses UTF-16 code units for line
   characters; kaikai uses byte offsets. Files with non-ASCII
-  content will misalign for multi-byte characters. Tracked in
-  #447 step 4.
+  content will misalign for multi-byte characters.
 * **No cross-file resolution.** A hover on an imported symbol
   resolves only if its definition is part of the open document.
   Goto-definition follows user-authored decls in the current file
@@ -162,22 +156,14 @@ remain:
   Acceptable for files under a few hundred KB.
 * **One probe per request.** No caching between hovers /
   completions / signature lookups; each request re-types the
-  file. Acceptable while compile time stays under 20 ms for
-  sub-1 kLOC files; #452 Phase B (user-file incremental cache)
-  is the long-term answer.
+  file.
 * **Completion is top-level only.** User fns + stdlib + core
-  builtins (~445 items by default). Locals, params, and field
+  builtins (~840 items for a minimal file). Locals, params, and field
   completion after `.` are not yet wired — `.` is announced as a
   trigger but the server returns the same top-level set.
 * **`activeParameter` is static in signature help.** Hardcoded to
   index 0; the dynamic tracking that highlights the current
   argument is not yet implemented.
-* **`DType` decls are not in the outline.** The elaborator drops
-  them before `documentSymbol` walks the decl list. Pending
-  follow-up on the parser-vs-elaborator split.
-* **Diagnostic coverage is partial.** Only the T1–T5 *error*
-  diagnostics migrated to the structured collector are visible
-  (~11 of 239 emit sites); the rest still print to stderr.
 * **No references, rename, workspace symbols, or inlay hints.**
   All deferred to LSP v4.
 
@@ -216,5 +202,4 @@ shipped 2026-05-09) → v3 (completion + signatureHelp + hole
 warning diagnostics, shipped 2026-05-11 → 2026-05-20). Next
 candidates for v4: cross-file resolution, locals/params in
 completion scope, field completion after `.`, references,
-rename, workspace symbols, inlay hints. Each step is a separate
-PR-sized lane; tracked in #447.
+rename, workspace symbols, inlay hints.

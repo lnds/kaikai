@@ -1,15 +1,17 @@
 # kaikai-minimal
 
-The austere subset of kaikai compiled by **stage 0** (the C bootstrap compiler).
+The austere dialect of kaikai compiled by **stage 0** (the C bootstrap compiler) and by **stage 1**, which is written in it. Both are frozen: they compile kaikai-minimal and nothing more. Full kaikai is compiled by stage 2, which is built from the previous release or from the frozen C seed (see `CLAUDE.md` §*Three-stage bootstrap* and `docs/build-system.md`).
 
-Goal: be just expressive enough to write a compiler for the full language in itself, and no more. Simplicity over power. Every feature here must earn its place by being necessary to build stage 1.
+Goal: be just expressive enough to write a compiler in itself, and no more. Simplicity over power. Every feature here earned its place by being necessary to build stage 1.
 
 > **Canonical full grammar**: `docs/grammar.md` is the single
 > reference for the full-kaikai surface grammar. This document
-> describes the **stage 0 subset only** — every production here is
-> also accepted by full kaikai, but the reverse does not hold (full
-> kaikai adds effects, sugars, protocols, UoM, and more). Where the
-> two diverge, this doc names the divergence inline.
+> describes the **stage 0 dialect only**. It is not a strict subset:
+> a kaikai-minimal program does not in general build under stage 2,
+> which tracks IO in effect rows (`/ Stdout`) and spells stepped
+> ranges `[1, 3..10]`. Full kaikai also adds effects, sugars,
+> protocols, UoM, and more. Where the two diverge, this doc names the
+> divergence inline.
 
 ## What is **not** in kaikai-minimal
 
@@ -24,17 +26,18 @@ To make the scope explicit:
 - No tuples (use records; or use sum-type variants with positional fields).
 - No full Perceus — a simple reference counter is used.
 - No string format beyond interpolation. No regex.
-- No m7b sugars (trailing lambdas, double trailing, naked cell read, `:=`, `var`, `a[i]`, lambda-block as expression). They appear in stage 1+; their grammar lives in §*Post-stage-0 grammar additions* below.
+- No multi-clause `case` function bodies; `case` and `when` are not keywords.
+- No post-stage-0 sugars (trailing lambdas, double trailing, naked cell read, `:=`, `var`, `a[i] := v`, lambda-block as expression). They are full kaikai; their grammar lives in §*Post-stage-0 grammar additions* below.
 - No hex / binary integer literals (`0xFF`, `0b1010`); decimal only. The `0x`/`0b` lexer branches land in full kaikai (see `docs/syntax-sugars.md` §7).
-- No regex sigil `~r/.../`, no n-tuple sugar `(a, b)`. Both are full-kaikai; see `docs/syntax-sugars.md` §6 and §"Regex sigil".
+- No regex sigil `~r/.../`, no n-tuple sugar `(a, b)`. Both are full-kaikai; see `docs/syntax-sugars.md` §6 and `kai info syntax`.
 
-These all appear in **full kaikai** (the language stage 1 compiles), but stage 0 does not need them.
+These all appear in **full kaikai** (the language stage 2 compiles), but stages 0 and 1 do not need them.
 
 ## Lexical structure
 
 ### Comments
 
-```kai
+```kaikai-minimal
 # Single line comment. No multi-line comments in minimal.
 ```
 
@@ -47,15 +50,15 @@ These all appear in **full kaikai** (the language stage 1 compiles), but stage 0
 ### Keywords
 
 ```
-and       as        assert    case      else
-false     fn        if        import    let
-match     not       or        pub       test
-true      type      when
+and       as        assert    else      false
+fn        if        import    let       match
+not       or        pub       test      true
+type
 ```
 
 ### Literals
 
-```kai
+```kaikai-minimal
 # Integers
 42    -7    0    1_000_000
 
@@ -120,7 +123,7 @@ There is no `module Foo` declaration.
 
 Declarations are private by default. Prefix with `pub` to export:
 
-```kai
+```kaikai-minimal
 pub fn api_function(x: Int) : Int = x * 2
 fn internal_helper(x: Int) : Int = x + 1
 pub type Point = { x: Int, y: Int }
@@ -129,7 +132,7 @@ type InternalState = { counter: Int }
 
 ### Imports
 
-```kai
+```kaikai-minimal
 import math.vector                      # use qualified: vector.dot(a, b)
 import math.vector as V                 # alias: V.dot(a, b)
 import math.vector.{dot, cross}         # bring specific names into scope
@@ -166,9 +169,9 @@ Full kaikai extends this with a `main.kai` convention and script mode (`kai run 
 
 ### Functions
 
-Three body forms:
+Two body forms:
 
-```kai
+```kaikai-minimal
 # 1. Expression body — use `=`
 fn square(x: Int) : Int = x * x
 fn abs(x: Int) : Int = if x < 0 { -x } else { x }
@@ -179,14 +182,6 @@ fn classify(n: Int) : String {
   if abs_n == 0 { "zero" }
   else if abs_n < 10 { "small" }
   else { "big" }
-}
-
-# 3. Multi-clause body — `case`-led arms over the implicit tuple of args.
-#    Each arm: `case <pattern> (when <guard>)? -> <body>`.
-fn sign(n: Int) : String {
-  case 0          -> "zero"
-  case n when n < 0 -> "neg"
-  case _          -> "pos"
 }
 
 # Unit return can be omitted from the signature
@@ -202,14 +197,12 @@ fn main() {
 
 Return-type annotations are mandatory except on `main`.
 
-The multi-clause form (3) desugars at parse time to a `match` over
-the implicit tuple of args; see `docs/syntax-sugars.md` §11. A body
-block is **either** all statements **or** all `case` arms — mixing is
-a hard parse error.
+Multi-clause `case` bodies are full kaikai only (`docs/syntax-sugars.md`
+§12); in kaikai-minimal write a `match` over the arguments.
 
 ### Let bindings
 
-```kai
+```kaikai-minimal
 let x = 42                        # type inferred from RHS: Int
 let name: String = "kaikai"       # explicit annotation, optional
 let sum = a + b                   # tipo from a + b
@@ -221,7 +214,7 @@ Bindings are immutable. There is no `var` in minimal.
 
 One keyword: `type`. Three shapes.
 
-```kai
+```kaikai-minimal
 # Alias
 type Age = Int
 type Name = String
@@ -250,7 +243,7 @@ Everything in a function body is an expression (except `let` bindings, which are
 
 Always an expression. `else` is mandatory when the `if` produces a value; optional when it is `Unit`.
 
-```kai
+```kaikai-minimal
 let abs = if x < 0 { -x } else { x }
 
 # else-if chain
@@ -267,7 +260,7 @@ if done { print("finished") }
 
 Pattern matching. No `case` keyword, no leading `|`.
 
-```kai
+```kaikai-minimal
 match shape {
   Circle(r) -> pi * r * r
   Rect(w, h) -> w * h
@@ -292,7 +285,7 @@ The compiler requires exhaustiveness (every inhabitant of the scrutinee's type m
 
 Two forms. Both yield the same thing semantically; they differ only in what fits syntactically.
 
-```kai
+```kaikai-minimal
 # Named-argument arrow — for non-trivial bodies or multiple arguments
 let square = x => x * x
 let add = (a, b) => a + b
@@ -301,7 +294,6 @@ xs |> reduce(0, (acc, x) => acc + x)
 # Placeholder — for trivial unary expressions only
 xs |> filter(. < 5)
 xs |> filter(. % 2 == 0)
-xs |> map(.name)            # field access on the placeholder
 ```
 
 Placeholder rules:
@@ -317,7 +309,7 @@ Two operators with distinct semantics.
 
 **`|>` — apply (Elixir-style)**: the left side becomes the first argument of the call on the right.
 
-```kai
+```kaikai-minimal
 xs |> sum                       # sum(xs)
 xs |> filter(. < 5)             # filter(xs, . < 5)
 xs |> map(. * 2) |> sum         # sum(map(xs, . * 2))
@@ -327,7 +319,7 @@ In kaikai-minimal, `|>` is the only pipe. The map-style `|` operator arrives in 
 
 ### Records: construction, access, destructuring
 
-```kai
+```kaikai-minimal
 # Construction
 let p = Point { x: 3, y: 4 }
 
@@ -344,11 +336,11 @@ match p {
 }
 ```
 
-Record update (`{ p with x = 10 }`) is **not** in minimal. Stage 1 introduces it.
+Record update (`{ p with x = 10 }`) is **not** in minimal; it is full kaikai.
 
 ### Lists and ranges
 
-```kai
+```kaikai-minimal
 let xs = [1, 2, 3]
 let ys = [1.0, 2.0, 3.0]
 let empty = []
@@ -377,7 +369,7 @@ Lists are immutable. Cons is spelled with spread (`[h, ...t]`), never with `|`.
 
 ### String interpolation
 
-```kai
+```kaikai-minimal
 let msg = "Hello, #{name}. You are #{age} years old."
 ```
 
@@ -414,7 +406,7 @@ Optional on `let` bindings (the RHS type is used).
 
 These are provided by stage 0 directly; they cannot be redefined.
 
-```kai
+```text
 # IO
 print(s: String) -> Unit              # write to stdout with a newline
 eprint(s: String) -> Unit             # write to stderr with a newline
@@ -439,7 +431,7 @@ char_at(s: String, i: Int) -> Option[Char]
 char_to_int(c: Char) -> Int
 int_to_char(n: Int) -> Char
 
-# List operations — minimal set; full library is in stdlib for stage 1
+# List operations — minimal set
 list_length(xs: [a]) -> Int
 list_append(xs: [a], ys: [a]) -> [a]    # full-kaikai's `xs ++ ys` lowers to this; in kaikai-minimal call it directly
 list_reverse(xs: [a]) -> [a]
@@ -451,7 +443,7 @@ panic(msg: String) -> a               # never returns, aborts with message
 
 Higher-order operations like `map`, `filter`, `reduce` are provided as ordinary functions in the minimal prelude once stage 0 can parse them:
 
-```kai
+```text
 map(xs: [a], f: (a) -> b) -> [b]
 filter(xs: [a], p: (a) -> Bool) -> [a]
 reduce(xs: [a], init: b, f: (b, a) -> b) -> b
@@ -462,7 +454,7 @@ each(xs: [a], f: (a) -> Unit) -> Unit    # apply f for its effects; discards res
 
 Inline in the same file as the code under test.
 
-```kai
+```kaikai-minimal
 pub fn square(x: Int) : Int = x * x
 
 test "square of zero is zero" {
@@ -475,13 +467,13 @@ test "square is non-negative" {
 }
 ```
 
-`assert cond` or `assert cond, "message"`. Tests are excluded from non-test builds. `kai test` (or `stage0 --test file.kai` for minimal) runs all `test` blocks.
+`assert cond` or `assert cond, "message"`. Tests are excluded from non-test builds. `kai test` (or `kaic0 --test file.kai` for minimal) runs all `test` blocks.
 
 ## Examples
 
 ### Hello, kaikai
 
-```kai
+```kaikai-minimal
 fn main() {
   print("Hello, kaikai")
 }
@@ -489,7 +481,7 @@ fn main() {
 
 ### Fizzbuzz
 
-```kai
+```kaikai-minimal
 fn fizzbuzz(n: Int) : String {
   if n % 15 == 0 { "FizzBuzz" }
   else if n % 3 == 0 { "Fizz" }
@@ -511,7 +503,7 @@ test "fizzbuzz boundary cases" {
 
 ### Quicksort
 
-```kai
+```kaikai-minimal
 pub fn sort(xs: [Int]) : [Int] {
   match xs {
     [] -> []
@@ -533,7 +525,7 @@ test "sort works on small inputs" {
 
 Illustrates sum types for AST, pattern matching, recursion — the shape of a compiler written in kaikai-minimal.
 
-```kai
+```kaikai-minimal
 type Expr
   = Lit(Int)
   | Add(Expr, Expr)
@@ -573,7 +565,7 @@ Pipe operators (`|>`, `|`) additionally work in **leading position** on a contin
 
 Multi-line constructs this enables:
 
-```kai
+```kaikai-minimal
 # Pipe across lines
 xs
   |> filter(. > 0)
@@ -631,7 +623,7 @@ Notes:
   with `and` / `or` needs explicit parentheses.
 - **Postfix chains associate left**: `a.b.c` = `(a.b).c`,
   `f(x)(y)` = `(f(x))(y)`.
-- **Full kaikai (stage 1+) extends level 8** with `|` (map pipe),
+- **Full kaikai extends level 8** with `|` (map pipe),
   `||` (flat-map pipe), and `|?` (filter pipe) at the same
   precedence as `|>`, all left-associative. A chain like
   `xs | f |> g` parses as `(xs | f) |> g`; `xs |? p | f` parses
@@ -722,10 +714,10 @@ grouping (within `Expr BinOp Expr`) is not encoded in these rules
 directly; it is resolved by precedence climbing against the table
 above.
 
-### Post-stage-0 grammar additions (m7b)
+### Post-stage-0 grammar additions
 
-Stage 0 (kaikai-minimal) does **not** parse the productions
-below. Stage 1 and beyond do. They are gathered here so the
+Stages 0 and 1 (kaikai-minimal) do **not** parse the productions
+below. Full kaikai (stage 2) does. They are gathered here so the
 canonical EBNF stays in one place — `docs/syntax-sugars.md`
 remains the authoritative *specification* of each sugar's
 intent and editorial use; this section is the *grammar*.
@@ -779,10 +771,9 @@ rules** the recursive-descent parser observes:
    - Anything else → block expression.
 
    This is a bounded lookahead (one identifier list scan
-   terminating at `->` or any non-`,`/non-`Ident` token). The
-   stage 1 parser implements it as a checkpoint-and-rewind on
-   the lexer, identical to how Kotlin and Scala distinguish
-   block-with-expression from block-with-lambda.
+   terminating at `->` or any non-`,`/non-`Ident` token), the
+   same way Kotlin and Scala distinguish block-with-expression
+   from block-with-lambda.
 
 #### Same-line discipline for `:=` and `[i]`
 

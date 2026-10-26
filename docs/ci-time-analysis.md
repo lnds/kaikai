@@ -1,5 +1,24 @@
 # CI time analysis — where the PR wall-clock goes (2026-06-22)
 
+## Current state
+
+A PR that touches the compiler builds it twice: `tier1.yml` builds the C
+`kaic2` and runs against it tier0, eight tier1 shards, `tier1-tsan`,
+`doc-blocks`, `cost-ab` (which also builds the base commit's compiler) and
+the path-gated `tier1-asan`, wasm, WASI and web jobs, with `fast-gates`
+beside the build; `tier1-native.yml` builds the
+native `kaic2` and runs its shards, the native self-host gate,
+`tier1-mn-corpus` and the path-gated `rc-detector`. The critical path is the
+slower of the two workflows.
+
+Measured at 0.178.0 over the 66 commits whose two workflows both finished
+green among the last 80 PR runs of each (wall clock from run creation to
+completion, queueing included): the critical path has a **median of 35 min**
+(p75 41 min, range 22–67 min). Taken separately, `tier1` has a median of 32
+min and `tier1-native` of 30 min. The 21–26 min target in the first addendum
+below was not reached. The addenda record how the layout got here; their
+per-phase numbers describe the layout of their time.
+
 > **Addendum (2026-07-19).** The baseline below drifted: by mid-July the PR
 > critical path had degraded from ~20 to ~36-40 min, and the required checks
 > are now `tier1` AND `tier1-native` (five workflows total, plus path-gated
@@ -27,7 +46,7 @@
 >   stale kaic2 as fresh).
 >
 > Expected post-fix critical path: ~build + max(shard) ≈ 21-26 min per
-> required check. The sections below keep the 2026-06-22 measurements as the
+> required check (not reached; see *Current state*). The sections below keep the 2026-06-22 measurements as the
 > methodology reference; per-phase numbers no longer reflect the current
 > layout.
 

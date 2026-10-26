@@ -1,147 +1,97 @@
-# Phase A.0 cache invalidation fixtures (#452)
+# Cache invalidation fixtures
 
-Four shell-based regression fixtures that pin the rejection paths of the
-KAB1 cache header (`stage2/compiler.kai` `cache_read_header`) and the
-content-addressable filename in `bin/kai prelude_cache_lookup`.
+Shell fixtures that pin the contracts of kaikai's compile caches. Each
+script is self-contained: it builds a throwaway project and cache
+directory under a temp dir, leaves nothing behind in the user's caches,
+and exits 0 on success / 1 on regression. A stale-serving cache is a
+correctness bug worse than no cache, so these are hard gates, not smoke
+tests.
 
-Each script seeds the cache directory with a deliberately broken `.kab`
-blob (or a file whose name no longer matches the source sha) and then
-invokes `bin/kai build` to confirm:
+Two targets run them, both in tier 1:
 
-1. The compile completes successfully (the loader falls back to
-   `load_prelude` on header mismatch — no fatal error).
-2. The driver still emits a working binary (`empty.kai` prints `hi`).
-3. Where applicable, `bin/kai` rewrites a fresh cache entry on the next
-   run.
+    make -C stage2 test-user-cache   # userb_*.sh, typedc_*.sh
+    make -C stage2 test-core-cache   # corec_*, emitc_*, wrapper_*, ncoreobj_*, nmodular_*
 
-The fixtures are deliberately **opt-in** (each invokes `bin/kai` with
-`KAI_PRELUDE_CACHE=1`) because the cache layer is off-by-default in
-v1 of Phase A.0 — see `docs/lane-experience-issue-452-step3-4-5-6-driver.md`
-for the reasoning and follow-up plan.
+Run one alone with `sh examples/cache/<name>.sh`.
 
-Each fixture is self-contained: it creates its own throwaway cache
-directory under `/tmp`, leaves nothing behind in the user's
-`~/.cache/kaikai/`, and exits 0 on success / 1 on regression.
+## User parse cache (`userb_*.sh`)
 
-Run individually:
+The per-project cache (`<project>/.kai-cache/<toolchain-id>/`, written by
+`stage2/compiler/user_cache.kai`). `bin/kai` passes `--user-cache` when
+`KAI_CACHE` is `1`, or `auto` (the default) in a package; the fixtures
+set `KAI_CACHE=1`.
 
-    sh examples/cache/magic_mismatch.sh
-    sh examples/cache/format_version_mismatch.sh
-    sh examples/cache/kaikai_version_hash_mismatch.sh
-    sh examples/cache/source_content_change.sh
-
-Or in a batch:
-
-    for f in examples/cache/magic_mismatch.sh \
-             examples/cache/format_version_mismatch.sh \
-             examples/cache/kaikai_version_hash_mismatch.sh \
-             examples/cache/source_content_change.sh; do sh "$f" || exit 1; done
-
-# Phase B user-file incremental cache fixtures (#455)
-
-Six `userb_*.sh` fixtures pin the invalidation contract of the per-
-project user cache (`<project>/.kai-cache/<toolchain-id>/<content>-<dep>.kab`
-under `bin/kai`, written
-by `stage2/compiler/user_cache.kai`). Unlike the Phase A fixtures, the
-Phase B cache is wired end-to-end: each fixture builds a throwaway
-multi-module project under `/tmp` with `KAI_CACHE=1` (the opt-in the
-`kai` reads to create the cache dir and pass
-`--user-cache`).
-
-Five are negative — they edit something and assert the build does NOT
-serve stale decls:
+Negative — an edit must not serve stale decls:
 
 - `userb_edit_source.sh` — edit the file's own bytes (content hash).
 - `userb_edit_import.sh` — edit a direct import (consumer dep hash).
 - `userb_edit_transitive.sh` — edit a two-hop import (cascade).
+- `userb_chain_edit_isolated.sh` — an edit deep in an import chain
+  re-parses that file and nothing else.
+- `userb_home_and_edition.sh` — whatever else a parse reads is in the
+  key or shown not to matter.
 - `userb_version_bump.sh` — flip the blob's kaikai-version byte.
 - `userb_corrupt_blob.sh` — truncate the blob past the header.
 
-One is positive and is the load-bearing correctness gate:
+Positive — the emitted C is byte-identical across cold-cache, warm-cache
+(hit path) and no-cache (oracle) builds. Self-host byte-identity does not
+cover the cache, so this differential is what proves a hit reconstructs
+exactly the decls a fresh parse would:
 
-- `userb_cold_warm_identical.sh` — the emitted C must be byte-identical
-  across cold-cache, warm-cache (hit path), and no-cache (oracle)
-  builds. selfhost byte-identity does not cover the cache (the compiler
-  is built with it off), so this differential is what proves a cache
-  hit reconstructs exactly the decls a fresh parse would.
+- `userb_cold_warm_identical.sh`
+- `userb_kind_decl_module.sh` — the same for a module declaring a `kind`.
 
-These run in CI via `make test` (the `test-user-cache` target, also in
-`test-fast`). Run them alone with:
+## Typed cut (`typedc_*.sh`)
 
-    make -C stage2 test-user-cache
-    # or: for f in examples/cache/userb_*.sh; do sh "$f" || exit 1; done
+Restoring a module's typed blob instead of re-inferring it: the interface
+hash that decides whether importers must be re-inferred
+(`typedc_iface_hash_gates.sh`), the symbol table
+(`typedc_symtab_gates.sh`), and output byte-identity with the cut active
+on the C path, the native path, a wide package, and the shared
+core-cache directory (`typedc_cut_*.sh`).
 
-## Phase A.1 — core (auto-loaded stdlib) cache (issue #825)
+## Core cache (`corec_*.sh`, `emitc_*.sh`)
 
-Four `corec_*.sh` fixtures pin the invalidation contract of the
-**core** post-parse cache (`<project>/.kai-cache/<toolchain-id>/core-<content>.kab`
-under `bin/kai`,
-written by `stage2/compiler/core_cache.kai`). This is the lever that
-actually crosses the ≤150 ms cold-trivial target: a warm build
-deserialises the 12 auto-loaded core modules instead of re-lexing and
-re-parsing their 4401 LOC (the lex, not the typecheck, was the cost).
-It shares the `--user-cache` opt-in (`KAI_CACHE=1`) and the
-`.kai-cache` directory with the Phase B user cache. (Post-parse, not
-post-typecheck — see `docs/lane-experience-issue-825.md` for the
-measurement and the soundness reasoning.)
+The auto-loaded core, cached post-parse (KAB2 blobs) and, on the
+c-modular backend, as emitted C translation units
+(`core-emit-<key>.kct`, written by `stage2/compiler/emit_cache.kai`).
+The emit key covers the core sources, the toolchain id, the edition and
+the program's name-level surface, so a body-only edit hits while a
+surface change misses.
 
-- `corec_cold_warm_identical.sh` — the load-bearing positive gate:
-  emitted C is byte-identical across no-cache (oracle), cold-cache, and
-  warm-cache builds, and the cold run wrote 12 core blobs.
-- `corec_edit_core_file.sh` — edit a copied `core/list.kai` and assert
-  the build matches a fresh no-cache build of the edited stdlib (the
-  stale-core guard — serving a stale core would typecheck every program
-  against old stdlib symbols).
-- `corec_version_bump.sh` — flip a core blob's kaikai-version byte.
-- `corec_format_version_bump.sh` — stamp every warm core blob back to
-  format_version 11 (the hand-written codec's layout); each must miss,
-  re-parse, and be republished under the current version.
-- `corec_corrupt_blob.sh` — truncate a core blob past the header.
-- `corec_derive_roundtrip.sh` — the derived codec round-trips the full
-  parse of every positive sugar / effect / protocol fixture plus the
-  compiler's typer and parser byte-identical (`kaic2
-  --cache-roundtrip-test <file>`).
+- `corec_cold_warm_identical.sh`, `emitc_cold_warm_identical.sh` — the
+  positive differentials: no-cache, cold and warm builds are
+  byte-identical.
+- `corec_edit_core_file.sh` — editing a core file forces a re-parse.
+- `corec_version_bump.sh`, `corec_format_version_bump.sh`,
+  `corec_corrupt_blob.sh` — a blob from another version, an older payload
+  layout, or a truncated write is rejected, never decoded.
+- `corec_derive_roundtrip.sh` — the derived AST codec round-trips real
+  sources byte for byte (`kaic2 --cache-roundtrip-test <file>`).
+- `corec_cspec_span_free_key.sh` — a body edit adding a lambda call hits
+  the warm emit cache; a new top-level fn misses.
+- `corec_monolithic_hit_stats.sh` — the monolithic path hits the shared
+  `--core-cache-dir`.
+- `corec_core_prune_flags.sh` — core pruning versus every cache the
+  compiler can write.
 
-Run alone with:
+## Wrapper and native objects (`wrapper_*`, `ncoreobj_*`, `nmodular_*`)
 
-    make -C stage2 test-core-cache
-    # or: for f in examples/cache/corec_*.sh; do sh "$f" || exit 1; done
+What `bin/kai` routes and caches around the compiler: core-cache hit
+stats through the wrapper, c-modular routing and shared-cache soundness,
+ThinLTO under `--release`, read-only caches, the cached native core
+object (build mode, closure specialisations, the inline-bitcode
+fallback), and native-modular object caching (toolchain identity, the
+C compiler's identity, shared test roots, dotted-import routing).
 
-## Core emit-cache fixtures (`emitc_*.sh`)
+`stress_nmodular_cold_pool.sh` builds cold native-modular projects under
+CPU load; it runs from `make stress-nmodular-pool`, not tier 1.
 
-Pin the contract of the **emitted-C core TU cache**
-(`<core-cache-dir>/core-emit-<key>.kct`, written by
-`stage2/compiler/emit_cache.kai`): on the c-modular backend a warm
-entry splices the 13 core TU bodies into the marker stream instead of
-re-emitting them. The key covers the core sources, the toolchain id,
-the edition, and the program's name-level surface (types, impls,
-protocols, effects, units, fn name/arity), so a body-only edit hits
-while any surface change misses safely.
+## Header fixtures
 
-- `emitc_cold_warm_identical.sh` — the load-bearing positive gate:
-  stream byte-identical across no-cache (oracle), cold, and warm
-  builds of a program using generics + a protocol impl + a user
-  effect + units; a different toolchain id misses; a body-only edit
-  hits; adding an impl misses; a `--test` build skips the cache.
-- `corec_cspec_span_free_key.sh` — a body edit that adds a
-  HOF-with-lambda call (`list.map([..], (x) => ..)`) must HIT the warm
-  core emit cache. The per-call-site closure-spec decls
-  (`<fn>__cspec__L<line>_<col>`) are derived and root-homed, so their
-  span-bearing names stay out of the surface key; a genuine name-level
-  change (a new top-level fn) still misses.
-
-Both families run under `make -C stage2 test-core-cache`.
-
-## Native core-object split fixtures (`ncoreobj_*.sh`)
-
-Pin the engage/disengage contract of the native core-object split
-(`stage2/compiler/emit_native_core.kai` + `kai_llvm_backend_tag`).
-
-- `ncoreobj_inline_bc_fallback.sh` — with the whole-program runtime
-  bitcode present but `runtime_inline.bc` absent, kaic2 must disengage
-  the split and take the whole-program merge (runtime ops stay inlined)
-  with one `kai:` stderr note, instead of silently emitting every
-  `kaix_*` op out-of-line. The control run (both bitcodes) proves the
-  split still engages. Skips on a C-only kaic2 or ungenerated bitcodes.
-
-Runs under `make -C stage2 test-core-cache`.
+`magic_mismatch.sh`, `format_version_mismatch.sh`,
+`kaikai_version_hash_mismatch.sh` and `source_content_change.sh` plant a
+blob under `KAI_PRELUDE_CACHE_DIR`, a variable nothing reads, so they
+pass without exercising a cache; no target runs them. The header
+rejection they aimed at is covered by `corec_version_bump.sh`,
+`corec_format_version_bump.sh` and `corec_corrupt_blob.sh`.

@@ -77,11 +77,15 @@ supervision and named processes.
 Functions in stdlib live under namespaced modules. Callers reach them
 as `module.function`:
 
-```kai
-list.map(xs, f)
-list.filter(xs, p)
-string.split(s, sep)
-option.unwrap_or(o, dflt)
+```kaikai
+fn main() : Unit / Stdout = {
+  let xs = [1, 2, 3]
+  let doubled = list.map(xs, (x) => x * 2)
+  let big     = list.filter(xs, (x) => x > 1)
+  let parts   = string.split("a,b", ",")
+  let n       = option.unwrap_or(None, 0)
+  Stdout.print("#{doubled |> length()} #{big |> length()} #{parts |> length()} #{n}")
+}
 ```
 
 Module names are lowercase (the file path); function names are
@@ -429,20 +433,26 @@ introduce no effect; they are pure recursion with mandatory TCO.
 - `loop.repeat[e](n: Int, body: () -> Unit / e) : Unit / e`
 - `loop.forever[e](body: () -> Unit / e) : Nothing / e` — only exits via `Cancel`
 
-Used with the m7b §5 double-trailing-lambda sugar for the natural
-Koka feel:
+Used with the double-trailing-lambda sugar for the natural Koka
+feel:
 
-```kai
-while  { i > 0 }  { i := i - 1; io.println("#{i}") }
-until  { done }   { process_one() }
-repeat(10)         { io.println("hi") }
-forever            { handle_message() }
+```kaikai
+import loop
+
+fn process_one() : Bool = true
+
+fn main() : Unit / Stdout = {
+  var i := 3
+  var done := false
+  while  { i > 0 }  { i := i - 1; Stdout.print("#{i}") }
+  until  { done }   { done := process_one() }
+  repeat(10)        { Stdout.print("hi") }
+  if i > 0 { forever { Stdout.print("tick") } }
+}
 ```
 
-The bare names (`while`, `until`, `repeat`, `forever`) are
-auto-imported in stage 2 so user code does not need to write
-`loop.while` explicitly. The qualified form remains legal
-when an explicit reference is preferred.
+The module is not auto-imported: `import loop` brings the bare names
+(`while`, `until`, `repeat`, `forever`) into scope.
 
 `while`, `until`, `repeat`, and `forever` are deliberately
 **not** language keywords — they are stdlib functions, callable

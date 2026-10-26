@@ -1,8 +1,9 @@
 # kaikai roadmap
 
-Pinned 2026-05-02 (post v0.30.0). Last refreshed 2026-06-29 (HEAD
-0.94.0, post the 0.79 → 0.94 arc: the in-process libLLVM backend
-became the default (#851) and the llvm-text backend was removed
+Pinned 2026-05-02 (post v0.30.0). The status snapshot below was last
+refreshed 2026-06-29 at 0.94.0 and is not current; the current release
+is in `VERSION`. That refresh followed the 0.79 → 0.94 arc (the
+in-process libLLVM backend became the default (#851) and the llvm-text backend was removed
 (#850); user-effect dispatch moved to capability passing with named
 instances and hybrid dispatch (#820); the compile-time cache chain
 closed its last load-bearing item, Phase B (#455); stage 2 began its
@@ -18,14 +19,15 @@ horizon beyond.
 **Version-to-edition map** (kept explicit so there is no ambiguity
 when discussing Orongo readiness):
 
-- **Tongariki** — pre-1.0 MVP edition, closed 2026-05-02.
-- **Hanga Roa** — current pre-1.0 edition. HEAD `0.79.0` sits inside
-  it. Spans the `0.30.0` → `<0.100.0` arc.
-- **Orongo** — ships as **0.100.x** under this edition name (the 1.0
-  label is postponed indefinitely). The edition
-  boundary is the public stability commitment: surface code written
-  against Orongo is preserved across patch / minor bumps within the
-  edition.
+- **Tongariki** — pre-1.0 MVP edition. The MVP milestone closed
+  2026-05-02; `EDITION` flipped to `hanga-roa` on 2026-05-16.
+- **Hanga Roa** — the current edition (`EDITION`); every release from
+  `0.69.0` to the one in `VERSION` sits inside it. Breaking changes
+  still land within it (`docs/editions.md` *Current state*).
+- **Orongo** — not cut; the 1.0 label is postponed indefinitely. The
+  edition boundary is the public stability commitment: surface code
+  written against Orongo is preserved across patch / minor bumps
+  within the edition.
 - **Anakena** — post-Orongo horizon.
 
 ## Status snapshot
@@ -449,11 +451,11 @@ blocker. Remaining notes:
   borrowed-binds, closed 2026-06-03), #593 (primitive-slot extract
   raw, closed 2026-06-03). Current measured state: 2.64× C wall.
 
-### Orongo — 0.100.x
+### Orongo
 
 The ceremonial village on Rano Kau, where the birdman cult
-sealed the year's transitions. Ships as 0.100.0; the 1.0 label is
-postponed indefinitely.
+sealed the year's transitions. Not cut; the 1.0 label is postponed
+indefinitely.
 
 The scope below supersedes the original draft (which gated 1.0 on a
 multi-thread scheduler and a package registry); the authoritative
@@ -479,14 +481,14 @@ mirrors it. The two Orongo pillars the edition was re-scoped around
 - **`kai migrate` rule set** — machinery shipped (#1047); the rule
   set grows with the surface pin (the list flip, if taken, is its
   largest rule).
-- **Separate/modular compilation for user programs** — L1–L3
-  shipped; the Phase 3 remainder of #963 closes the gate.
+- **Separate/modular compilation for user programs** — shipped:
+  user programs compile one unit per module on both backends (#963).
 - **Near-C performance on structural workloads** — the measured
   ladder, in order: pipe fusion (#1140/#1145, shipped: fused
   chains, range generator heads), `Vec[T]` (#1142/#1147, shipped:
   flat unboxed storage, uniqueness in-place, raw element paths —
   case-6 memory at Rust parity), sized-exact variant
-  representation (#1136, in flight — the rb-tree wall closer),
+  representation (#1136, shipped — the rb-tree wall closer),
   `Vec` surface stage 3 (#1150, shipped: O(1) slices with in-place re-slice, literal minting, fused pipeline collect).
 - **The authorability benchmark** — the Tier 3 acceptance measured
   head-to-head (kaikai vs Rust vs Go, success rate per compile

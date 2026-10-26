@@ -887,6 +887,8 @@ fn safe_div(a: Int, b: Int) : Int
   requires b != 0
   ensures result != 0 or a == 0
   = a / b
+
+fn main() : Unit = ()
 ```
 
 The implicit binder inside `ensures` is `result` (the returned
@@ -1131,7 +1133,7 @@ at parse time.
 
 ### 4.16 Case-led multi-clause function body
 
-```
+```text
 fn classify(n: Int) : String {
   case 0            -> "zero"
   case n when n < 0 -> "neg"
@@ -1151,8 +1153,8 @@ parameter directly; multi-arg form matches a tuple of parameters per
 arm. Note: `when` is the guard keyword here, not `if` — guards in
 `case`-led bodies use `when` while guards in plain `match` arms use
 `if`. The multi-arg form is capped at 4 parameters (matching the
-`match`-multi cap in §2.6). Grammar productions live in
-`parse_case_arms` / `parse_case_multi_arms`.
+`match`-multi cap in §2.6). The grammar production lives in
+`parse_case_arms`.
 
 ### 4.17 Regex sigil — `~r/pattern/flags?`
 

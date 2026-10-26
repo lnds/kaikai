@@ -105,9 +105,10 @@ would be the first kind whose inhabitants run — a real distinction to resolve,
 a blocker.
 
 With `Layout` a kind, the syntax **falls out of UoM** — angle brackets on a numeric
-head, exactly as `Real<m/s>` — with **no new delimiter**:
+head, exactly as `Real<m/s>` — with **no new delimiter**. Proposed form, not
+implemented (kaikai has no `Layout` kind today; units of measure are real):
 
-```kaikai
+```text
 # UoM precedent:        a unit over a numeric
 let g : Real<m/s^2> = 9.81<m/s^2>
 
@@ -120,9 +121,10 @@ type Header = {
 
 The binary "pattern" then needs no special form at all — it is ordinary record
 destructuring of a type whose fields carry layout, using the `{ len, port }`
-pattern that **already exists**:
+pattern that **already exists**. Proposed form, not implemented (there is no
+`decode[T]`):
 
-```kaikai
+```text
 fn parse_header(packet: Array[U8]) : Option[Header] = decode[Header](packet)
 ```
 
@@ -131,7 +133,9 @@ corruption. That failure-instead-of-UB is the whole safety story, and it is free
 
 ### Specs declare layout — the two things `reinterpret` cannot do
 
-```kaikai
+Proposed form, not implemented (field layouts such as `U32<be>` do not exist):
+
+```text
 type Packet = {
   version: U8,
   flags:   U8,
@@ -157,11 +161,14 @@ type Packet = {
 
 Binary code is bit-twiddling, and kaikai's bitwise ops are **intrinsic functions,
 not operators**: `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `bit_shl`, `bit_shr`,
-`bit_ushr` (wired in `infer.kai`/`emit_c.kai`). So a line of SHA-256 in
-`stdlib/crypto/hash.kai` reads:
+`bit_ushr` (compiler builtins, `stage2/compiler/builtins.kai`). So a
+big-endian read in the style of `stdlib/crypto/hash.kai` reads:
 
 ```kaikai
-bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)), bit_or(bit_shl(b2, 8), b3))
+fn be32(b0: Int, b1: Int, b2: Int, b3: Int) : Int =
+  bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)), bit_or(bit_shl(b2, 8), b3))
+
+fn main() : Int = be32(0, 0, 1, 2) - 258
 ```
 
 — which everywhere else is `(b0 << 24) | (b1 << 16) | (b2 << 8) | b3`. The

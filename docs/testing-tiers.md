@@ -153,21 +153,22 @@ weeks (#513, #522, #524, #570, #571), each discovered by a
 downstream consumer (notably ahu) rather than by CI.
 
 The C backend is the spec-by-construction (it is the bootstrap
-path; it must work). The LLVM backend is the production target.
+path; it must work). The native (LLVM) backend is the default.
 They must agree on every program kaikai can express. When they
 disagree, that is a backend bug, not a language ambiguity.
 
 `tools/test-backend-parity.sh` walks every entry-point fixture
 under:
 
-- `examples/effects/`, `examples/actors/`, `examples/spawn/`,
+- `examples/effects/`, `examples/segments/`, `examples/actors/`,
   `examples/perceus/`, `examples/refinements/`, `examples/llvm/`,
   `examples/packages/`, `examples/minimal/`, `examples/quickstart/`,
   `examples/stdlib/`, `examples/attributes/`, `examples/unstable/`
 - `demos/`
 
-For each fixture, the harness runs `KAI_BACKEND=c kai build …`,
-`KAI_BACKEND=llvm kai build …`, executes both binaries (with a
+For each fixture, the harness builds with the oracle backend
+(`ORACLE_BACKEND`, default `c`) and the target backend
+(`TARGET_BACKEND`, default `native`), executes both binaries (with a
 30-second per-binary timeout), and diffs stdout + exit code. Any
 divergence is a failure. `examples/negative/` is intentionally
 excluded — those fixtures must reject at compile time, so
@@ -182,10 +183,9 @@ for the package shape. Library files are never compiled standalone
 — they would always C-FAIL at link time (no `kai_main` symbol) and
 that's not a backend-parity concern.
 
-The harness is wired into CI as the `tier1-backend-parity` job,
-which runs on the same `paths` filter as `tier1-asan` (any change
-to `stage*/`, `stdlib/`, `examples/`, `demos/`, `bin/kai`, the
-script itself, or the workflow). Locally it runs as
+In CI the harness runs on every PR in the `tier1-native` corpus shards
+(`native-shard-1`, `-1b`, `-2`, with `NATIVE_PARITY_RATCHET=1`), and
+for the wasm/WASI targets in path-gated jobs. Locally it runs as
 `tools/test-backend-parity.sh` from the repo root after `make all`.
 
 The `make tier1-backend-parity` convenience target rebuilds `kaic2`
@@ -575,17 +575,12 @@ nightly to surface latent regressions.
 
 ## Stress fixtures
 
-Live under `examples/effects/` and `examples/stress/` (the latter
-created on demand). They cover patterns that the per-feature suite
-does not exercise but that REAL programs hit:
+Stress fixtures live beside the features they exercise, mostly under
+`examples/effects/`. They cover patterns that the per-feature suite
+does not exercise but that real programs hit, for example:
 
-- **Concurrency**: `large_concurrent_drain.kai` (100 fibers + mailboxes
-  + leak budget assertion).
-- **Refcount**: `rc_leak_budget.kai` (programmatic check that
-  `KAI_TRACE_RC` reports leaked < N for a known-shape program).
 - **Polymorphic flow-through**: `m4c_flow_through.kai`
-  (`fn f[a](x) = g(x)` chain that exercises body type substitution
-  after Phase 3 m4c lands).
+  (`fn f[a](x) = g(x)` chain that exercises body type substitution).
 - **Negative regressions**: `m8_fiber_discard.kai`, `interp_recursive_walk.kai`
   (each documents a closed regression with an executable repro that
   panics if the fix regresses).
@@ -610,14 +605,14 @@ A heading is allowed to lack a fixture only if it explicitly carries
 
 ## RC budget probe
 
-A script that runs `KAI_TRACE_RC=1 stage2/kaic2 stage2/compiler.kai
-2>&1 | grep alloc_total` and compares the numbers against
-`docs/perceus-honesty-targets.md` Tier 2 targets. If `leaked` rises
-above the threshold (today: 50 M; goal: 5 M post Tier 2), alarm.
-
-The threshold is updated when Perceus Tier 2 sub-items land. Today the
-threshold is "no regression from current 46.9 M"; once perceus_pass
-multi-read dup ships, threshold drops to ~32 M; etc.
+`make test-rc-budget` (`tools/rc-budget-gate.sh`, tier0) runs the shapes
+under `tools/rc-budget/` with `KAI_TRACE_RC=1 KAI_THREADS=1` and compares
+the incref/decref counts they execute against
+`tools/rc-budget-baseline.txt` (C backend; `RC_BUDGET_BACKEND=<b>` reads
+`tools/rc-budget-baseline-<b>.txt`). The leak gate
+asks whether every allocation came back; this one asks at what cost, so
+a pass that plants a redundant dup/drop pair fails here while the ledger
+stays balanced.
 
 ## Cadence summary
 

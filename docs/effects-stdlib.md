@@ -9,10 +9,11 @@ what the runtime installs around `main`. Doc C
 (`docs/effects-impl.md`) covers op dispatch and the handler-stack
 runtime.
 
-Scope of v1: a fixed catalog of effects, with handlers either
-provided natively by the runtime or expressible in kaikai-minimal.
-No exception hierarchies, no user-overridable default handlers.
-Closed effect aliases (Doc A §*Open questions* #5) are permitted
+The catalog is fixed, with handlers either provided natively by the
+runtime or written in kaikai. There are no exception hierarchies, and
+a builtin's default handler cannot be swapped at link time (a user
+effect declares its own defaults with a `default { }` block). Closed
+effect aliases (Doc A §*Open questions* #5) are permitted
 and used by the stdlib sparingly.
 
 ## Catalog
@@ -32,7 +33,8 @@ and used by the stdlib sparingly.
 | `NetDns`        | DNS resolution                                | yes (runtime, if in `main`'s row) |
 | `NetUnix`       | Unix-domain stream sockets                    | yes (runtime, if in `main`'s row) |
 | `Process`       | OS-level process spawn, wait, exit            | yes (runtime, if in `main`'s row) |
-| `Signal`        | trap POSIX signals on the running process     | yes (runtime, if in `main`'s row) — Posix only in v1 |
+| `Signal`        | trap POSIX signals on the running process     | yes (runtime, if in `main`'s row) — POSIX only |
+| `Log`           | leveled diagnostic logging                    | yes (runtime, if in `main`'s row) — writes to stderr |
 | `State[T]`      | value-threaded mutable state                  | no (user supplies)    |
 | `Reader[T]`     | read-only ambient value                       | no (user supplies)    |
 | `Writer[W]`     | accumulating log / output                     | no (user supplies)    |
@@ -42,17 +44,16 @@ and used by the stdlib sparingly.
 | `Ffi`           | crossings to C via `extern "C"` declarations  | yes (compiler-synthesised) |
 | `Js`            | crossings to JavaScript via `extern "js"` declarations | no (refused at `main` on a host build; runs on `wasm32-browser`) |
 
-Mailboxes and message passing (`Actor[Msg]`) are deferred to a
-separate spec, `docs/actors.md`, because the mailbox model
-(bounded vs unbounded, supervision, links/monitors) is its own
-design surface; it does not fit inside a single table row. Doc B
-stays silent on actors beyond this note.
+Mailboxes and message passing (`Actor[Msg]`, with `Link` and
+`Monitor`) are specified in `docs/actors.md`, because the mailbox
+model (bounded vs unbounded, supervision, links/monitors) is its own
+design surface; it does not fit inside a single table row.
 
 The stdlib groups the IO effects under two closed aliases
 (`stdlib/effects.kai`). They are rows, not effects: a function
 names `Stdout`, never `Console`, when it calls an op.
 
-```kai
+```kaikai-fragment
 type Console = Stdout + Stderr + Stdin
 type Io = Console + Env + File
 ```
@@ -65,9 +66,9 @@ worth spelling out. Diagnostics keep the alias when it resolves
 cleanly and expand to the label set only on mismatch, per Doc A
 §*Open questions* #5.
 
-`Clock`, `Random`, `SecureRandom`, the `Net` family
-(`NetTcp + NetUdp + NetDns`, with `Net` as alias), and `Process`
-are kept *out* of the `Io` alias. Networking and process control
+`Clock`, `Random`, `SecureRandom`, the network effects (`NetTcp`,
+`NetUdp`, `NetDns`, `NetUnix`), and `Process` are kept *out* of the
+`Io` alias. Networking and process control
 have distinct operational costs (latency, peer failure,
 fork/exec weight) and a function that "logs and reads config"
 should not silently gain capability over the network or over
@@ -79,13 +80,11 @@ no user handler appears, the runtime installs a stdlib-provided
 handler. Every other effect must be closed by the user before
 `main` returns, or the compiler refuses the build.
 
-Post-#558 (Stage C of the #533 trilogy), the default-handler wiring
-is uniform: every builtin effect and every user-declared effect
-whose `default { }` block bridges its clauses via the Stage A
-`$extern_handler` intrinsic gets auto-installed at main entry. The
-historic hardcoded `default_<eff>_setup` / `default_<eff>_shims`
-emitter tables — one per builtin — are gone; the codegen walks the
-AST. Practical consequence: a user effect can mirror a builtin's
+The default-handler wiring is uniform: every builtin effect and every
+user-declared effect whose `default { }` block bridges its clauses via
+the `$extern_handler` intrinsic gets auto-installed at main entry; the
+codegen walks the declarations, with no per-builtin table. Practical
+consequence: a user effect can mirror a builtin's
 ergonomics by adding a `default { }` block whose clauses point at a
 runtime C entry (the bridge does not validate the C symbol exists —
 that's the FFI contract).
@@ -97,7 +96,7 @@ distinct reason to exist and a distinct dispatch mechanism. A builtin
 exists only when one of these three applies; none is arbitrary.
 
 1. **Value-transportable** (`Stdout`, `Stderr`, `Stdin`, `Env`,
-   `File`, `Clock`, `Random`, `SecureRandom`, the `Net` family,
+   `File`, `Clock`, `Random`, `SecureRandom`, the network effects,
    `Process`, `Signal`, `Mutable`, and the user-defined `State[T]`,
    `Reader[T]`, `Writer[W]`). Their evidence is a value that travels
    as an injected hidden parameter; the `default { }` property decides
@@ -188,49 +187,34 @@ you care.
 
 ## Syntax note: trailing lambdas
 
-> **v1 status (2026-08-02):** of the helpers named in this section,
-> only `nursery` (`stdlib/spawn.kai`) exists. `with_state` and
-> `File.read_file_or_fail` are **not implemented** — they appear here
-> and in §`State[T]` as illustrations of the shape such a helper layer
-> would take, not as callable stdlib API. The trailing-lambda *syntax*
-> itself is real and shipped (`kai info syntax` §*Trailing lambdas*);
-> only these example callees are fictional.
+Many stdlib helpers take a lambda as their last argument (`nursery`,
+`with_reader`, `with_dns`, and the like). Such a call has two
+equivalent forms:
 
-Many of the stdlib helpers in this document take a lambda as
-their last argument (`with_state`, `nursery`, and the like). Doc B
-writes them in one
-of two equivalent forms:
+```kaikai
+fn twice(f: () -> Unit / Stdout) : Unit / Stdout = { f(); f() }
 
-```kai
-# Paren form — always legal.
-let r = try(() => {
-  let s = File.read_file_or_fail("config.toml")
-  parse(s)
-})
+fn main() : Unit / Stdout = {
+  # Paren form — always legal.
+  twice(() => Stdout.print("paren"))
 
-# Trailing-lambda form — sugar: the final `() -> T` argument may
-# be written as a block outside the parens.
-let r = try {
-  let s = File.read_file_or_fail("config.toml")
-  parse(s)
+  # Trailing-lambda form — sugar: the final `() -> T` argument may
+  # be written as a block outside the parens.
+  twice { Stdout.print("trailing") }
 }
 ```
 
 Trailing lambdas are a separate construct from `handle ... with
 ... { ... }`. Doc A §*Handling* pins `handle` and `with` as
 reserved keywords forming a dedicated control-flow production —
-not a function call with a trailing block. Trailing lambdas in
-this section apply only to ordinary stdlib helpers (`try`,
-`with_state`, `nursery`, etc.); the grammar does not special-case
-those helpers, only `handle`/`with`.
+not a function call with a trailing block. Trailing lambdas apply
+to ordinary functions; the grammar does not special-case any
+helper, only `handle`/`with`.
 
-Rule of thumb for writers of Doc B examples: prefer the
-trailing form when the lambda is the whole intent of the call,
-and the paren form when the lambda is one argument among peers.
-
-Trailing-lambda syntax lands in m7b (see §*Next steps*). Until
-then, every example in this doc is equally valid rewritten in
-paren form.
+Rule of thumb: prefer the trailing form when the lambda is the
+whole intent of the call, and the paren form when the lambda is one
+argument among peers. `kai info syntax` §*Trailing lambdas* is the
+reference.
 
 ## Syntax note: capability read/write sugar
 
@@ -239,7 +223,7 @@ concisely as local variables. `:=` is the single mark of
 mutability: it declares and writes a cell, and a bare identifier
 reads one.
 
-```kai
+```text
 # Naked read:  counter   ≡   counter.get()    (State)
 #              config    ≡   config.ask()     (Reader)
 #
@@ -269,9 +253,22 @@ needs no marker because `:=` already makes the cell visible at
 its declaration and at every write, consistent with Doc A
 §*Context*'s capability-passing-explicit stance.
 
-Both sugars ship in **m7b** (see §*Next steps*), alongside
-trailing lambdas. Until then, `counter.get()` and
-`counter.set(v)` are the only ways to spell the ops.
+```kaikai
+fn main() : Unit / Stdout = {
+  let r = handle {
+    counter := counter + 1
+    counter := counter + 1
+    counter
+  } with State[Int](0) as counter {
+    get(resume)    -> resume(state)
+    set(v, resume) -> resume((), v)
+  }
+  let c = handle { config + 1 } with Reader[Int] as config {
+    ask(resume) -> resume(41)
+  }
+  Stdout.print("#{r} #{c}")   # 2 42
+}
+```
 
 ## Syntax note: local mutable cells with `var`
 
@@ -284,7 +281,9 @@ B would rather not ship.
 
 The `var` keyword declares a local mutable cell:
 
-```kai
+```kaikai
+type Event = { cost: Int }
+
 fn sum_costs(events: [Event]) : Int / Stdout {
   var total := 0
   each(events, (e) => {
@@ -293,6 +292,8 @@ fn sum_costs(events: [Event]) : Int / Stdout {
   })
   total
 }
+
+fn main() : Unit / Stdout = Stdout.print("#{sum_costs([Event { cost: 2 }, Event { cost: 3 }])}")
 ```
 
 `var total := 0` desugars to a `handle { rest-of-block } with
@@ -301,7 +302,7 @@ State[Int](0) as total { ... }` wrapping everything from the
 generated handler uses the canonical clauses — there is no other
 useful choice for a local cell:
 
-```kai
+```text
 get(resume)    -> resume(state)
 set(v, resume) -> resume((), v)
 return(x)      -> x
@@ -330,14 +331,12 @@ declaring one deeper (inside an `each` callback, say) works but
 is rarely what you want — the cell dies at the inner block's
 `}` and is not visible to siblings.
 
-`var` ships in **m7b**.
-
 ### Performance
 
 A naive reading of the desugar suggests every `var` update
 allocates and threads a fresh handler invocation. It does not.
-`var` is always local, always uses the canonical clauses, and
-never uses multi-shot `resume`, so the compiler specialises it
+`var` is always local and always uses the canonical clauses, so the
+compiler specialises it
 down to a stack-allocated mutable slot (Koka's "variable
 specialization"). End result: `var counter := 0; counter :=
 counter + 1` lowers to the same native code as a C mutable
@@ -354,23 +353,26 @@ writing the op name out would stand out:
 - `a[i]`       ≡ `Mutable.array_get(a, i)`  — read
 - `a[i] := v`  ≡ `Mutable.array_set(a, i, v)` — write
 
-Both require `a : Array[T]` and `Mutable` in the effect row;
-the checker enforces this. The same sugar is **not** extended
-to `Ref[T]` — reading and writing refs keeps the explicit
-`Mutable.ref_get(r)` / `Mutable.ref_set(r, v)` form. Rationale:
-`Array[T]` shows up in everyday user code, `Ref[T]` is a
-low-level tool used mostly by the stdlib and FFI adapters where
-explicit ops double as documentation.
-
-Array indexing sugar ships in **m7b**.
+Both require `a : Array[T]`; a write needs `Mutable` in the effect
+row when the caller can observe it (§`Mutable` *Observable-effects
+discipline*). `Ref[T]` has sigils of its own: prefix `&` makes a
+cell, prefix `@` reads it, and `r := v` writes it (`kai info syntax`
+§*Capability sugar*).
 
 ## `Stdout` and `Stderr`
 
 ### Declaration
 
-```kai
-effect Stdout { print(s: String) : Unit ; is_tty() : Bool }
-effect Stderr { eprint(s: String) : Unit ; is_tty() : Bool }
+```kaikai-fragment
+effect Stdout {
+  print(s: String) : Unit
+  is_tty() : Bool
+}
+
+effect Stderr {
+  eprint(s: String) : Unit
+  is_tty() : Bool
+}
 ```
 
 `print` / `eprint` append `\n` to the string before writing.
@@ -417,15 +419,15 @@ effect in scope.
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Stdin {
   read_line()        : Option[String]
-  read_bytes(n: Int) : String                  # issue #453
+  read_bytes(n: Int) : String
   is_tty()           : Bool
 }
 ```
 
-Two ops. `read_line()` returns `None` on EOF/closed pipe
+Two reading ops. `read_line()` returns `None` on EOF/closed pipe
 (routine, not an error). `read_bytes(n)` returns a `String` of at
 most `n` raw bytes (newlines included); on EOF the returned string
 is shorter than `n` — possibly empty. The LSP framing use case
@@ -486,23 +488,29 @@ exactly `n` bytes — or fewer on EOF.
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Env {
-  args()                : [String]
-  var(name: String)     : Option[String]
+  args()                               : [String]
+  get(name: String)                    : Option[String]
+  set_var(name: String, value: String) : Result[Unit, String]
+  unset_var(name: String)              : Result[Unit, String]
+  vars()                               : [Pair[String, String]]
 }
 ```
 
 - `args()` returns the command-line arguments passed to the
   process, excluding the program name.
-- `var(name)` returns `Some(value)` if the environment variable
+- `get(name)` returns `Some(value)` if the environment variable
   `name` is set, `None` otherwise. Looking up an unset variable
   is a value, not a failure.
+- `set_var` / `unset_var` mutate the process environment and report
+  an OS failure as `Err`.
+- `vars()` returns the whole environment block as name/value pairs.
 
 ### Why `Env` and not pure
 
 In kaikai a pure function is deterministic and depends only on
-its arguments. Both `args()` and `var(name)` depend on the
+its arguments. Both `args()` and `get(name)` depend on the
 surrounding process state — the invoking command line and the
 environment block — not on their arguments alone, so they cannot
 be pure. Filing them under `Env` preserves the invariant without
@@ -511,39 +519,26 @@ a special case in the inferencer.
 ### Default handler
 
 Runtime-installed around `main` when `Env` is in the row. `args`
-reads a pre-captured `argv` slice; `var` calls the libc `getenv`
-via `Ffi` and lifts the `NULL` result to `None`. Both always
-resume; no failure path.
+reads a pre-captured `argv` slice; `get` calls the libc `getenv`
+and lifts the `NULL` result to `None`. Every op resumes.
 
-### What's not in v1 (planned extensions)
-
-Kept as a shortlist for future `Env` expansion — shape and
-timing decided when the first real use case pushes them:
-
-- Working directory: `cwd() : String`, `chdir(path: String) :
-  Result[Unit, String]` (the latter likely behind
-  `Mutable` rather than `Env`, since it changes process state).
-- Process identity: `pid() : Int`, `hostname() : String`.
-- Full environment block: `vars() : [(String, String)]` for
-  iteration over every variable.
-- Mutating the environment: `set_var(name, value)`,
-  `unset_var(name)` — same `Mutable`/`Env` split question as
-  `chdir`.
+Not provided: the working directory (`cwd`, `chdir`) and process
+identity (`pid`, `hostname`).
 
 ## `File`
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect File {
-  read_file(path: String)                       : Result[String, String]
-  write_file(path: String, content: String)     : Result[Unit, String]
+  read_file(path: String)                         : Result[String, String]
+  write_file(path: String, contents: String)      : Result[Unit, String]
   # Chunked / streaming IO over a capability-carrying handle.
-  open_read(path: String)                       : Result[FileHandle<read>, String]
-  read_chunk(h: FileHandle<read>, max: Int)     : Result[String, String]
-  open_write(path: String)                      : Result[FileHandle<read + write>, String]
+  open_read(path: String)                         : Result[FileHandle<read>, String]
+  read_chunk(h: FileHandle<read>, max: Int)       : Result[String, String]
+  open_write(path: String)                        : Result[FileHandle<read + write>, String]
   write_chunk(h: FileHandle<write>, data: String) : Result[Unit, String]
-  close_file(h: FileHandle)                     : Unit
+  close_file(h: FileHandle)                       : Unit
 }
 ```
 
@@ -557,12 +552,11 @@ or distinguish only "nothing more" from "real fault". Keeping
 
 ### Error model
 
-Both ops return `Result[_, String]`. See §`Stdin` *Error model*
-for the rule that picks `Result` vs `Option`: `File` lands on the
-`Result` side because callers branch on the motive. v1 keeps the
-payload as a raw `String` message; a structured `FileError` sum is
-deferred. Callers that want to abort on any fault propagate with
-postfix `!`.
+Every op but `close_file` returns `Result[_, String]`. See §`Stdin`
+*Error model* for the rule that picks `Result` vs `Option`: `File`
+lands on the `Result` side because callers branch on the motive. The
+payload is a raw `String` message. Callers that want to abort on any
+fault propagate with postfix `!`.
 
 ### Default handler
 
@@ -589,7 +583,7 @@ as data, not through the row.
 Because the default is installed automatically, `main` does not
 need to write `handle { ... } with File { ... }` itself.
 
-### Chunked / streaming IO (issue #771 Phase 1)
+### Chunked / streaming IO
 
 The bulk `read_file` / `write_file` pair materialises a whole file
 as one `String`. For unbounded input (logs, data files) the five
@@ -620,24 +614,23 @@ a compile-time mismatch; the OS's runtime verdict still rides each
 op's `Result`. Handler implementations and test doubles mint handles
 with `file_handle(fd)`, whose perm the context's expected type
 chooses. `FileHandle` is single-owner: sharing one across fibers is
-undefined in v1, the same stance as the stdin singleton.
+undefined, the same stance as the stdin singleton.
 
 The error register is `Result[_, String]` (Ok first),
 mirroring `read_file` — callers branch on the motive (missing /
 permission / mid-stream fault). The ergonomic line surface layers on
-top of these primitives in `stdlib/stream.kai` (issue #801, shipped):
-the lazy generator carrier `Stream[t, e]` over the `Emit[t]` effect with `read_lines` / `write_lines`
-and the pipe-canonical combinators, replacing the originally-planned
-Phase 2 bracket surface.
+top of these primitives in `stdlib/stream.kai`: the lazy generator
+carrier `Stream[t, e]` over the `Emit[t]` effect with `read_lines` /
+`write_lines` and the pipe-canonical combinators.
 
-### ReadFault (issue #801)
+### `ReadFault`
 
 The recoverable per-element fault for streamed reads, declared in
 `stdlib/stream.kai`. It exists because `read_lines` keeps the element
 type a clean `String` and routes faults through the row instead, so a
 consumer-side `handle` decides the per-element policy:
 
-```kaikai
+```kaikai-fragment
 effect ReadFault {
   bad_chunk(msg: String) : Unit      # resumable → resume = skip the chunk, continue
   open_fault(msg: String) : Nothing  # Nothing → abort-only (cannot resume)
@@ -650,7 +643,7 @@ continuation aborts. `open_fault` returns `Nothing`: a stream whose
 source cannot open has nothing to resume into, so it is abort-only by
 construction. This is why `read_lines` carries `File + ReadFault`: a
 single `Nothing`-returning op cannot express the skip policy, and the
-policy itself is domain knowledge (spike S2). `ReadFault` is a stdlib
+policy itself is domain knowledge. `ReadFault` is a stdlib
 user effect (no runtime default handler): a forcing consumer must
 `handle ... with ReadFault` to choose a policy, or the typer reports
 `effect not handled: ReadFault`.
@@ -674,42 +667,42 @@ this — doing so would shadow the consumer's skip-or-abort policy.
 
 ### Overwrite semantics for `write_file`
 
-`write_file(path, content)` truncates and rewrites `path` if it
+`write_file(path, contents)` truncates and rewrites `path` if it
 exists, or creates it if it does not. Matches `fopen(path, "w")`
-and matches Python/JS expectations. Appending to an existing
-file and "create only if missing" are not in v1; stdlib can add
-them as `append_file` and `write_file_new` when needed.
+and matches Python/JS expectations. Appending is
+`file_append(path, contents)`; "create only if missing" is not
+provided.
 
-### What's not in v1 (planned extensions)
+### Helpers beside the ops
 
-Kept as a shortlist for future `File` expansion — shape and
-timing decided when the first real use case pushes them:
-
-- Existence and metadata: `exists(path)` *(shipped — #345)*, `stat(path)` *(shipped as `fs.file.metadata(path) :
-  Result[FileMetadata, String]`, #3162)*.
-- Append / create-only: `append_file`, `write_file_new`.
-- Directories: `list_dir`, `create_dir`, `remove_dir`, `walk`
-  *(shipped — #344; all four ride `File`; `walk` does not follow
-  symlinks in v1)*.
-- Deletion and rename: `delete(path)` *(shipped — #345)*,
-  `rename(from, to)` *(shipped — #345)*.
-- Binary IO: `read_bytes`, `write_bytes` (today everything is
-  UTF-8 `String`).
-- Streaming: chunked read/write without loading the whole file.
-  Likely needs a companion effect (a stateful file handle), not
-  just new `File` ops.
+The `File` row also covers core functions outside the effect
+declaration (`stdlib/effects.kai`): `file_exists`, `file_append`,
+`file_delete`, `file_rename`, `file_read_bytes` / `file_write_bytes`
+(binary IO over `Array[Byte]`), and `dir_list_dir`, `dir_create_dir`,
+`dir_remove_dir`, `dir_walk` (`dir_walk` does not follow symlinks).
+`fs.file.metadata(path) : Result[FileMetadata, String]` reads a
+file's metadata.
 
 ## `Clock`
 
 ### Declaration
 
-```kai
+Declared in `stdlib/time.kai` (`import time`):
+
+```kaikai
+import time
+
 effect Clock {
-  now()              : WallTime
-  monotonic()        : Instant
-  sleep(d: Duration) : Unit
+  wall_now()        : WallTime
+  monotonic_now()   : Instant
+  sleep_ns(ns: Int) : Unit
 }
+
+fn main() : Int = 0
 ```
+
+The `time` module wraps the ops as `now()`, `monotonic()` and
+`sleep(d: Duration)`.
 
 - `now()` returns the current wall-clock time as a `WallTime`.
   Subject to wall-clock jumps (NTP corrections, manual clock
@@ -747,9 +740,9 @@ process state cannot be pure.
 
 Runtime-installed around `main` when `Clock` is in the row.
 
-- `now` calls `clock_gettime(CLOCK_REALTIME, ...)` via `Ffi`.
-- `monotonic` calls `clock_gettime(CLOCK_MONOTONIC, ...)`.
-- `sleep` registers the fiber as suspended with the scheduler's
+- `wall_now` calls `clock_gettime(CLOCK_REALTIME, ...)`.
+- `monotonic_now` calls `clock_gettime(CLOCK_MONOTONIC, ...)`.
+- `sleep_ns` registers the fiber as suspended with the scheduler's
   timer wheel, keyed on `monotonic() + d`. The scheduler resumes
   the fiber when the deadline elapses, or earlier if `Cancel` is
   delivered.
@@ -773,39 +766,30 @@ macOS, FreeBSD; the only documented `EINVAL` returns are for
 clock IDs the runtime never passes). A failure here is treated
 the same as `Stdout`: panic with a banner on stderr.
 
-### What's not in v1 (planned extensions)
+### Not provided
 
 - Time zones and DST. `Instant` and `Duration` stay opaque and
   timezone-agnostic. Civil calendar types and arithmetic (dates,
-  months, leap years) shipped as the top-level `stdlib/date.kai`
-  module (#767) — pure, timezone-naive, with a UTC-interpreting
-  `from_walltime` bridge and `today() / Clock`. tzdata/DST-aware
-  conversions remain future work.
-- Named timers (cancellable via handle): `at(deadline: Instant) :
-  Timer`, `cancel(t: Timer) : Unit`. The `sleep`-via-`Cancel`
-  pattern covers most needs; named timers are for cases where
-  one fiber arms a timer that another fiber cancels.
+  months, leap years) live in `stdlib/date.kai` — pure,
+  timezone-naive, with a UTC-interpreting `from_walltime` bridge and
+  `today() / Clock`; there are no tzdata/DST-aware conversions.
+- Named timers (cancellable via handle). The `sleep`-via-`Cancel`
+  pattern covers most needs.
 
 ## `Random`
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Random {
   int_range(lo: Int, hi: Int) : Int
-  float()                     : Float
-  bytes(n: Int)               : [Byte]
 }
 ```
 
-- `int_range(lo, hi)` returns a uniformly-distributed value in
-  the half-open interval `[lo, hi)`. Calling with `lo >= hi` is
-  a panic — there is no meaningful value to return; the
-  inferencer does not catch this.
-- `float()` returns a value in `[0.0, 1.0)` with 53 bits of
-  precision.
-- `bytes(n)` returns a list of `n` bytes drawn from the same
-  stream.
+`int_range(lo, hi)` returns a uniformly-distributed value in the
+half-open interval `[lo, hi)`. Calling with `lo >= hi` stops the
+program — there is no meaningful value to return; the inferencer
+does not catch this.
 
 `Random` is for non-cryptographic uses: simulations, sampling,
 test fixtures. Cryptographic randomness lives in `SecureRandom`
@@ -836,30 +820,28 @@ a fixed seed, in the same shape as the `Stdout` capture pattern.
 PRNG ops are infallible. `int_range(l, h)` with `l >= h` is a
 panic (programming error), not a recoverable fault.
 
-### What's not in v1 (planned extensions)
+### Helpers
 
-- Distributions: `gaussian(mean, stddev)`, `exponential(rate)`,
-  `poisson(lambda)`. Compose on top of the four primitive ops
-  and live in the `random` stdlib module rather than as new ops.
-- Sampling helpers: `choice(xs)`, `shuffle(xs)`, `sample(xs, k)`.
-  Same locality argument — pure given the underlying primitives.
-- Reseeding: `seed(s: Int)`. Useful for fuzzing harnesses;
-  deferred pending a use case that demands it.
+The `random` module adds sampling helpers over `int_range`:
+`choice(xs)`, `shuffle(xs)`, `sample(xs, k)`. Distributions
+(`gaussian`, `exponential`, …) and reseeding are not provided; a
+test that needs a reproducible stream installs its own handler.
 
 ## `SecureRandom`
 <!-- coverage: skip --> effect declared, post-MVP; remove this marker when fixture lands
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect SecureRandom {
-  bytes(n: Int) : [Byte]
-  int()         : Int
+  int_range(min: Int, max: Int) : Int
+  bytes(n: Int)                 : [Int]
 }
 ```
 
 A cryptographically-secure RNG. The op set is intentionally
-minimal: bytes and ints are enough for crypto primitives that
+minimal: bytes (as `[Int]`, each in `[0, 256)`) and ints are enough
+for crypto primitives that
 live above this effect; specialised distributions or stream APIs
 are out of scope.
 
@@ -880,61 +862,64 @@ Runtime-installed around `main` when `SecureRandom` is in the row.
 - Linux: `getrandom(2)` with `flags = 0` (block until the kernel
   pool has enough entropy on first call; never blocks afterward).
 - macOS / *BSD: `arc4random_buf(3)`.
-- Windows (post-MVP): `BCryptGenRandom`.
 
 The handler never short-circuits unless the syscall actually
 fails, which on these platforms only happens under catastrophic
-conditions (kernel pool unrecoverable). v1 treats such failures
+conditions (kernel pool unrecoverable). Such failures are treated
 as panics, the same as `Stdout` and `Clock`.
 
 ### Error model
 
-Infallible in v1 from the caller's perspective. The handler may
+Infallible from the caller's perspective. The handler may
 panic if the OS RNG is unavailable, but no `Result`
 shape is exposed — code that needs cryptographic randomness
 cannot run if the OS cannot provide it.
 
-### What's not in v1 (planned extensions)
+The `random_secure` module wraps the ops as `int(min, max)` and
+`bytes(n)`. There is no typed key wrapper and no streaming API for
+very large draws.
 
-- `key(n: Int) : Key` returning a typed key wrapper. Belongs
-  with the future `crypto.key` module, not with `SecureRandom`.
-- A streaming API for very large draws. The current `bytes(n)`
-  is fine through MVP-scale use cases.
-
-## `NetTcp`, `NetUdp`, `NetDns` (alias `Net`)
+## `NetTcp`, `NetUdp`, `NetDns`
 <!-- coverage: skip --> NetTcp shipped (examples/effects/net_tcp_localhost.kai), NetDns shipped #352 (examples/effects/net_dns_resolve.kai); NetUdp still post-MVP — remove this marker when the NetUdp fixture lands
 
 ### Declaration
 
-```kai
+Declared in `stdlib/net/tcp.kai`, `udp.kai` and `dns.kai`
+(`import net.tcp`, …):
+
+```kaikai
+import net.tcp
+import net.udp
+import net.dns
+
 effect NetTcp {
-  connect(host: String, port: Int)              : Result[Conn, String]
-  listen(host: String, port: Int)               : Result[Listener, String]
-  accept(l: Listener)                           : Result[Conn, String]
-  send(c: Conn, data: [Byte])                   : Result[Int, String]
-  recv(c: Conn, max: Int)                       : Result[[Byte], String]
-  close(c: Conn)                                : Unit
+  connect(host: String, port: Int)                 : Result[Conn, String]
+  listen(host: String, port: Int)                  : Result[Listener, String]
+  accept(l: Listener)                              : Result[Conn, String]
+  send(c: Conn, data: [Int])                       : Result[Int, String]
+  recv(c: Conn, max: Int)                          : Result[[Int], String]
+  recv_timeout(c: Conn, max: Int, nanos: Int)      : Option[Result[[Int], String]]
+  close(c: Conn)                                   : Unit
 }
 
 effect NetUdp {
-  bind(host: String, port: Int)                 : Result[UdpSocket, String]
-  send(s: UdpSocket, dst: SocketAddr, data: [Byte]) : Result[Int, String]
-  recv(s: UdpSocket, max: Int)                  : Result[(SocketAddr, [Byte]), String]
-  close(s: UdpSocket)                           : Unit
+  bind(host: String, port: Int)                    : Result[UdpSocket, String]
+  send(s: UdpSocket, dst: SocketAddr, data: [Int]) : Result[Int, String]
+  recv(s: UdpSocket, max: Int)                     : Result[Pair[SocketAddr, [Int]], String]
+  close(s: UdpSocket)                              : Unit
 }
 
 effect NetDns {
-  resolve(host: String)                         : Result[[IpAddr], String]
+  resolve(host: String)                            : Result[[IpAddr], String]
 }
 
-type Net = NetTcp + NetUdp + NetDns
+fn main() : Int = 0
 ```
 
 The three effects cover the byte-level networking capability,
-each focused on one protocol family. The `Net` alias bundles
-them when a function does several at once and the precise
-breakdown is not worth spelling out — same pattern as `Io =
-Console + Env + File`.
+each focused on one protocol family; bytes travel as `[Int]`, each
+in `[0, 256)`. A function that does several names each one in its
+row; there is no bundling alias.
 
 Higher-level protocols (HTTP, WebSocket, gRPC) live in stdlib
 modules that *use* the relevant effects — they do not introduce
@@ -942,16 +927,13 @@ new effects of their own. An HTTP client uses `/ NetTcp + NetDns`;
 a UDP-only DNS-over-UDP probe uses `/ NetUdp + NetDns`.
 
 `Conn`, `Listener`, `UdpSocket`, `IpAddr`, and `SocketAddr` are
-opaque companion types injected by the compiler alongside their
-effect (e.g. `Conn` / `Listener` with `NetTcp`, `IpAddr` with
-`NetDns`), not declared in the `net.*` stdlib modules — the effect
-op signatures reference them, so the typer must know them at
-injection time. v1 treats them as nominal handles; `IpAddr` carries
-the textual IPv4 form (`{ addr: String }`) so it round-trips through
-logging without a second decoder, while the rest stay
-representation-opaque.
+declared beside their effect in the `net.*` modules (`Conn` /
+`Listener` in `net.tcp`, `UdpSocket` / `SocketAddr` in `net.udp`,
+`IpAddr` in `net.dns`). The socket handles keep their fd private;
+`IpAddr` carries the textual IPv4 form (`{ addr: String }`) so it
+round-trips through logging without a second decoder.
 
-### Why three effects with an alias
+### Why three effects
 
 The three families are kept distinct rather than fused into a
 single `Net` effect because:
@@ -962,17 +944,13 @@ single `Net` effect because:
   further.
 - Each effect has few ops (DNS is a single op), keeping the
   catalog readable and the per-effect handler small.
-- The `Net` alias keeps the brief case ergonomic: a function
-  that uses TCP, UDP, and DNS together writes `/ Net`, exactly
-  as it would have under a single fused effect.
 
 ### Error model
 
 Every op except the `close` variants returns `Result[_,
 String]`. Network errors are rich and callers routinely branch
 on motive (host not found, connection refused, peer closed,
-timeout). v1 keeps the payload as a raw `String`; a structured
-`NetError` sum is deferred, same as `File`.
+timeout). The payload is a raw `String`, same as `File`.
 
 `NetTcp.close` and `NetUdp.close` return `Unit` rather than
 `Result`: closing a socket can technically fail, but no caller
@@ -1035,10 +1013,7 @@ state visible to user code.
 > POSIX `SOCK_DGRAM` sockets and are **blocking in v1** — datagram
 > sockets do not yet ride the R2 reactor; the m8.x reactor lifts
 > NetTcp and NetUdp together. `recv` returns the source address
-> paired with the bytes (`Pair[SocketAddr, [Int]]`). With NetTcp,
-> NetUdp, and NetDns all installed, the `Net = NetTcp + NetUdp +
-> NetDns` alias is now definable; a follow-up lane can add the row
-> alias to `stdlib/effects.kai`.
+> paired with the bytes (`Pair[SocketAddr, [Int]]`).
 
 `stdlib/net/dns.kai` (issue #352) ships the `NetDns` surface:
 `resolve(host) : Result[[IpAddr], String] / NetDns` (thin pass-
@@ -1049,13 +1024,20 @@ and `with_dns(resolver, body)` — a handler installer that runs
 getaddrinfo default, so a test or an allow-list resolver can
 intercept name resolution without touching the network:
 
-```kai
-let stub = (h) => Ok([IpAddr { addr: "127.0.0.1" }])
-let r = with_dns(stub, () => resolve_first("anything"))
-# r == Ok(IpAddr { addr: "127.0.0.1" })
+```kaikai
+import net.dns
+
+fn main() : Unit / Stdout = {
+  let stub = (h) => Ok([IpAddr { addr: "127.0.0.1" }])
+  let r = with_dns(stub, () => resolve_first("anything"))
+  match r {
+    Ok(ip) -> Stdout.print(ip.addr)    # 127.0.0.1
+    Err(e) -> Stdout.print(e)
+  }
+}
 ```
 
-### What's not in v1 (planned extensions)
+### Not provided
 
 - TLS: `tls_wrap(c: Conn, cfg: TlsConfig) : Result[Conn,
   String]`. Lands as a separate `Tls` effect, not as new
@@ -1086,7 +1068,9 @@ the same caveats pinned in the v1-status sidebar above.
 
 ### Declaration
 
-```kai
+```kaikai
+import net.unix
+
 effect NetUnix {
   listen(path: String, mode: Int)               : Result[Listener, String]
   connect(path: String)                         : Result[Conn, String]
@@ -1098,6 +1082,8 @@ effect NetUnix {
   close(c: Conn)                                : Unit
   close_listener(l: Listener)                   : Unit
 }
+
+fn main() : Int = 0
 ```
 
 Unix-domain stream sockets, declared with their `Conn` / `Listener`
@@ -1157,11 +1143,11 @@ Abstract-namespace (Linux) and datagram Unix sockets are not covered.
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Process {
-  start(cmd: String, args: [String])  : Result[Child, String]
+  start(cmd: String, args: [String])  : Child
   wait(c: Child)                      : Result[Exit, String]
-  kill(c: Child, sig: Signal)         : Result[Unit, String]
+  kill(c: Child, sig: Int)            : Result[Unit, String]
   exit(code: Int)                     : Nothing
   start_piped(cmd: String, args: [String], pipe_stdin: Bool,
               pipe_stdout: Bool, pipe_stderr: Bool) : Result[Child, String]
@@ -1175,19 +1161,6 @@ effect Process {
   uid()                               : Int
 }
 ```
-
-> **v1 status (signal type, as of 2026-05-09).** The runtime
-> `kai_default_process_kill` takes `sig: Int` (raw POSIX signo), and
-> the `os.process` Kai wrapper (`stdlib/os/process.kai`, shipped via
-> #346) preserves that shape — `process.kill(c, 15)` is the surface,
-> not `process.kill(c, SigTerm)`. The closed `Sig` type from the
-> `Signal` effect covers only the five subscribable signals
-> (Int/Term/Hup/Usr1/Usr2); SIGKILL and the rest of the POSIX set
-> fall outside it, so widening the wrapper to take a `Sig` would
-> remove user-reachable signals. The richer `Signal` enum sketched
-> above is the m8.x.x target shape; introducing it requires a
-> separate type that covers the full POSIX set without coupling to
-> `Signal.on`'s subscribable subset.
 
 - `start` launches a child process and returns a handle.
   Deliberately not named `spawn` to avoid clash with the `Spawn`
@@ -1228,10 +1201,11 @@ effect Process {
   > and Linux uniformly today. Cancel mid-wait still does NOT
   > unwind the op (the child's exit is the only wake source); the
   > cancel-aware redesign queues for R2 in Orongo.
-- `kill` delivers a signal to the child. The signal set is the
-  POSIX-canonical subset (`SIGTERM`, `SIGKILL`, `SIGINT`, …)
-  declared by the `os.process` module. It reaches the child only,
-  not the processes the child started.
+- `kill` delivers a signal to the child, given as a raw POSIX
+  signal number (`process.kill(c, 15)` for SIGTERM). The closed `Sig`
+  type of `Signal` covers only the subscribable signals, so it is not
+  used here. The signal reaches the child only, not the processes the
+  child started.
 - `start_group` is `start_piped` with the child as leader of a new
   process group (`setpgid`); `kill_group` signals that whole group
   (`kill(-pgid, sig)`), so a chain like `sh -> launcher -> program`
@@ -1243,8 +1217,7 @@ effect Process {
   The `os.process` surface is `start_in_group` / `kill_group`.
 - `exit` terminates the current process with the given code. It
   never resumes; the return type is `Nothing`. The canonical user
-  surface for this op is `os.exit` (top-level helper exposed by
-  the stdlib `os` module per `docs/stdlib-layout.md`); calling
+  surface for this op is `exit` in `os.process`; calling
   `Process.exit` directly is legal but not idiomatic.
 - `uid` returns the effective uid of the current process, with no
   child process involved. It is the uid `NetUnix.peer_uid` reports for
@@ -1252,8 +1225,8 @@ effect Process {
   that accepts only its own user compares the two. The `os.process`
   surface is `uid()`.
 
-`Child`, `Exit`, and `Signal` are opaque types declared by the
-`os.process` module.
+`Child` (`{ pid: Int }`) and `Exit` (`Exited(Int) | Signaled(Int)`)
+are declared beside the effect in `stdlib/effects/os.kai`.
 
 ### Why `Process` and not `Spawn`
 
@@ -1269,11 +1242,12 @@ this: `Process.start` rather than `Process.spawn` so the word
 
 ### Error model
 
-`start`, `wait`, and `kill` return `Result[_, String]`. Common
-faults a caller might branch on: "binary not found" (start),
-"child already reaped" (wait), "no such process" (kill). v1
-keeps the payload as a raw `String`, same as `File` and the
-`Net` family.
+`wait`, `kill` and the piped ops return `Result[_, String]`. Common
+faults a caller might branch on: "child already reaped" (wait), "no
+such process" (kill). `start` returns the `Child` directly: a binary
+that cannot run makes the child exit with status 127, which `wait`
+reports as `Exited(127)`. The payload is a raw `String`, same as
+`File` and the network effects.
 
 `exit` does not have an error model — it does not resume.
 
@@ -1281,8 +1255,7 @@ keeps the payload as a raw `String`, same as `File` and the
 
 Runtime-installed around `main` when `Process` is in the row.
 
-- `start` on POSIX is `fork(2)` + `execvp(3)`; on Windows
-  (post-MVP) `CreateProcess`.
+- `start` on POSIX is `fork(2)` + `execvp(3)`.
 - `start_piped` adds `pipe(2)` + `dup2(2)` around the same fork.
   Parent-side ends are `FD_CLOEXEC` so a sibling fork cannot hold a
   stray write end open and starve a reader of EOF. SIGPIPE on
@@ -1290,68 +1263,21 @@ Runtime-installed around `main` when `Process` is in the row.
   (`F_SETNOSIGPIPE`) and per `write(2)` call elsewhere (mask + drain,
   never held across a park, since the fiber may resume on another OS
   thread), so a dead reader is an `Err`, not a process kill.
-- `wait` blocks via the scheduler's reactor: on Linux, register
-  the child's `pidfd` with epoll and yield; on macOS / *BSD, a
-  SIGCHLD handler wakes the awaiting fiber. Cancellation
-  unwinds out of the wait without reaping the child — see
-  `wait_or_kill` below for the canonical cancel-aware pattern.
-  > **v1 status (R1 reactor, 2026-05-15):** see the v1 sidebar
-  > under §`Process` *Declaration*. SIGCHLD-driven dispatch is
-  > shipped on both macOS and Linux uniformly via a self-pipe
-  > drained by the scheduler's `poll()` loop; the `pidfd_open`
-  > Linux fast path is post-MVP. Cancel mid-wait still does NOT
-  > unwind — the cancel-aware redesign queues for R2 in Orongo.
+- `wait` parks the fiber on the scheduler's reactor: a SIGCHLD
+  self-pipe, drained by the scheduler's `poll()` loop, wakes it on
+  macOS and Linux alike. The child's exit is the only wake source, so
+  a cancellation is not delivered mid-wait.
 - `kill` is `kill(2)`.
 - `uid` is `geteuid(2)`.
-- `exit` is libc `_exit(code)`. No flushing of stdio buffers; the
-  caller must `print` everything they want printed before
-  calling `exit`. (kaikai's `Console` writes are unbuffered, so
-  the practical impact is small.)
+- `exit` is libc `_exit(code)`. No flushing of stdio buffers: output
+  still buffered is dropped, so print everything first, or return an
+  exit code from `main` instead.
 
-### Stdlib helper
+### Not provided
 
-A cancel-aware wait that signals the child if its own fiber is
-cancelled, then re-raises:
-
-```kai
-pub fn wait_or_kill(c: Child, on_cancel: Signal) : Result[Exit, String] / Process + Cancel {
-  handle {
-    Process.wait(c)
-  } with Cancel {
-    raise(_) -> {
-      let _ = Process.kill(c, on_cancel)
-      Cancel.raise()
-    }
-  }
-}
-```
-
-The common call is `wait_or_kill(child, SIGTERM)`. The handler
-runs only when the wait is interrupted by cancellation; on a
-clean exit, control flows past the `with` clause and the
-`Result` from `Process.wait` is returned untouched.
-
-> **v1 status (2026-05-16).** `wait_or_kill` still does NOT ship in
-> `stdlib/os/process.kai`'s v1 surface (#346). The R1 reactor
-> (#611, 2026-05-15) flipped `kai_default_process_wait` to park
-> the *fiber* on a SIGCHLD self-pipe instead of blocking the OS
-> thread inside `waitpid(pid, &status, 0)`. However, the wake
-> source is the child's exit — Cancel mid-wait does NOT unwind
-> the op, so the handler shown above would still not run on a
-> Cancel that arrives during `Process.wait`. The helper lands
-> alongside the cancel-aware reactor redesign queued for R2 in
-> Orongo (see `docs/fibers-honesty-targets.md` §*Residual m8.x
-> items*).
-
-### What's not in v1 (planned extensions)
-
-- Stdio redirection helpers: `start_with_pipes`, returning a
-  `Child` plus reader/writer endpoints for stdin/stdout/stderr.
-  Likely lives in `os.process` rather than as new `Process` ops.
-- Working-directory and environment overrides per start:
-  `start_with_env`, `start_in_dir`. Same locality argument.
-- Process-group and session control (`setsid`, `setpgid`).
-  Useful for daemonising; out of MVP scope.
+- Working-directory and environment overrides per start
+  (`start_with_env`, `start_in_dir`).
+- Session control (`setsid`).
 - Async signal handling for the *current* process is a separate
   effect — see `Signal` below.
 
@@ -1359,7 +1285,7 @@ clean exit, control flows past the `with` clause and the
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2 | SigWinch
 
 effect Signal {
@@ -1416,36 +1342,18 @@ reads the byte and promotes the parked waiter on its next round.
 > interleaves with the await) and `demos/signal_concurrent`
 > (Spawn.cancel reaches the parked fiber).
 
-The BEAM-style `on_cancel(sig)` shape from issue #107 (signal
-arrival fires `Cancel.raise()` in the calling fiber) still waits
-on the unrelated lane that lets `Cancel` honour user-installed
-handlers on runtime-triggered cancellation
-(`docs/fibers-honesty-targets.md` §*Residual m8.x items*).
+A BEAM-style `on_cancel(sig)` shape (signal arrival fires
+`Cancel.raise()` in the calling fiber) is not provided.
 
 ### Platform
 
-Posix-only in v1. macOS and Linux both implement the POSIX
-signal API used here.
+POSIX only: macOS and Linux both implement the POSIX signal API
+used here. A `main` that performs `Signal` is refused on
+`wasm32-browser` and `wasm32-wasi` (§*Which effects a browser
+`main` may perform*).
 
-Windows and WASM map to a smaller subset of `Sig`:
-- Windows can deliver Ctrl-C via `SetConsoleCtrlHandler` →
-  surface as `SigInt`. `SigTerm` / `SigHup` / `SigUsr*` /
-  `SigWinch` have no Windows equivalent and would map to
-  `Result[Sig, String]` in a v2 shape, or be silently absent.
-  A Windows console resize arrives as a console event, not a
-  signal.
-- WASI does not expose signals. The `Signal` effect would not
-  install on WASI builds; programs that need it would not link.
+### Limitations
 
-Both ports wait on the same lane that brings non-POSIX I/O
-backends; they are out of scope for the v1 effect.
-
-### Limitations (v1)
-
-- ~~`await()` blocks the OS thread.~~ Closed by R4 (#671,
-  2026-05-20): the await now parks the fiber on the reactor's
-  signal self-pipe; concurrent fibers progress while it sits
-  there.
 - Only one fiber may sit in `Signal.await()` at a time. The
   reactor's signal slot is a singleton (the self-pipe byte
   carries no waiter identity, so two parked fibers would race
@@ -1456,20 +1364,16 @@ backends; they are out of scope for the v1 effect.
   children internally.
 - Real-time signals (SIGRTMIN+n) and the `siginfo_t` payload
   (`si_pid`, `si_uid`, `si_value`) are out of scope.
-- The `on_cancel(sig)` shape from issue #107 (signal arrival
-  fires `Cancel.raise()` in the calling fiber) is queued for
-  the same lane that lets Cancel honour user-installed
-  handlers on runtime-triggered cancel.
 
 ### Typical use
 
 Graceful shutdown of a long-running program:
 
-```kai
-fn run_server(...) : Unit / Spawn + NetTcp + Console = ...
+```kaikai
+fn run_server() : Unit / Stdout = Stdout.print("serving")
 
-fn main() : Int / Signal + Spawn + NetTcp + Console = {
-  let server = Spawn.spawn(() => run_server(...))
+fn main() : Int / Signal + Spawn + Stdout = {
+  let server = Spawn.spawn(() => run_server())
   Signal.on(SigInt)
   Signal.on(SigTerm)
   let _ = Signal.await()
@@ -1480,10 +1384,6 @@ fn main() : Int / Signal + Spawn + NetTcp + Console = {
   0
 }
 ```
-
-Drove the reopening of lnds/ahu's `run_app` Tongariki lane (issue
-#107). The shape above is what `ahu.run_app(root)` wraps once the
-nursery integration lands.
 
 ## `Fail` — retired from the stdlib
 
@@ -1517,96 +1417,46 @@ See `docs/editions.md` for the migration note.
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect State[T] {
   get()      : T
   set(v: T)  : Unit
 }
 ```
 
-Declared in Doc A. A handler for `State[T]` takes an initial
-value via `with State[T](v0)` and threads `state` through
-`resume`'s optional second argument. See Doc A §*State: a handler
-with its own state* for the worked example.
+Declared in `stdlib/effects/concurrent.kai`. A handler for
+`State[T]` takes an initial value via `with State[T](v0)` and threads
+`state` through `resume`'s optional second argument. See Doc A
+§*State: a handler with its own state* for the worked example.
 
-### Stdlib helpers — not implemented
+### Idiomatic usage
 
-> **v1 status (2026-08-02):** the effect itself is real
-> (`stdlib/effects/concurrent.kai:16`), but neither `modify` nor
-> `with_state` exists in `stdlib/`. Use `handle ... with State[T](v0)`
-> directly; the shapes below are the sketch such helpers would take.
+The most common pattern is a local mutable cell. With `var` plus
+`:=`, this reads like ordinary imperative code — no `handle` in
+sight (§*Syntax note: local mutable cells with `var`*).
 
-```kai
-pub fn modify[T, e](f: (T) -> T / e) : Unit / State[T] + e {
-  State.set(f(State.get()))
-}
+When the final state is part of the result, install the handler
+directly with a `return(x) -> (x, state)` clause; the stdlib ships
+no `with_state` or `modify` helper:
 
-pub fn with_state[T, S](init: T, body: () -> S / State[T]) : (S, T) {
-  handle { body() } with State[T](init) {
+```kaikai
+fn count_long(words: [String]) : (Int, Int) =
+  handle {
+    each(words, (w) => if string_length(w) > 3 { State.set(State.get() + 1) })
+    list.length(words)
+  } with State[Int](0) {
     get(resume)    -> resume(state)
     set(v, resume) -> resume((), v)
-    return(x)      -> (x, state)
+    return(x)      -> (x, state)                # (body result, final state)
   }
-}
+
+fn main() : Unit / Stdout = Stdout.print("#{count_long(["a", "long", "words"])}")   # (3, 2)
 ```
 
-`with_state` is the canonical drainer: it threads `init`, runs
-`body`, and returns the final value paired with the final state.
-Swap the `return` clause for `x` alone if the final state is not
-wanted.
-
-### Idiomatic usage (m7b)
-
-The most common pattern is a local mutable cell. With `var`
-plus `@` / `:=` (all m7b), this reads like ordinary imperative
-code — no `handle` in sight:
-
-```kai
-fn sum_costs(events: [Event]) : Int / Console {
-  var total := 0
-  each(events, (e) => {
-    total := total + e.cost
-    Console.print("running: #{total}")
-  })
-  total
-}
-```
-
-When the final state is part of the function's result — a
-builder-style API where the caller gets back `(result, final)`
-— reach for `with_state` and trailing-lambda call form:
-
-```kai
-fn tokenise(src: String) : (AST, Int) {
-  with_state(0) {
-    let ast = parse_tracking_cursor(src)
-    ast
-  }
-  # returns (ast, final_cursor)
-}
-```
-
-`parse_tracking_cursor` has signature `(String) -> AST /
-State[Int]`; inside the `with_state` body the default `State`
-capability name is in scope, so calls look like `State.get()` /
-`State.set(v)` (the naked read / `:=` sugar needs an `as`-bound
-name, per §*Syntax note: capability read/write sugar* rule 4).
-
-`modify` is useful inside a `with_state` body (or any handler
-that keeps `State` under its default capability name), when the
-update rule is a named function:
-
-```kai
-with_state(initial_config) {
-  each(patches, (p) => modify((cfg) => apply_patch(cfg, p)))
-  State.get()
-}
-```
-
-For straight updates that read-then-write a rebound capability,
-write `counter := counter + 1` directly — that shape is what
-the sugar is for. `modify` buys the most when the transform is
-already a named function (`modify(normalise_fields)`).
+Inside such a body the default `State` capability name is in scope,
+so calls look like `State.get()` / `State.set(v)` (the naked read /
+`:=` sugar needs an `as`-bound name, per §*Syntax note: capability
+read/write sugar* rule 4).
 
 ### When to reach for `State[T]` vs `Mutable`
 
@@ -1625,7 +1475,7 @@ declaration — not sugar over `State[T]` — so diagnostics say
 `Reader` / `Writer` by name rather than `State[[W]]` and so
 handlers can be specialised independently.
 
-```kai
+```kaikai-fragment
 effect Reader[T] {
   ask() : T
 }
@@ -1633,29 +1483,40 @@ effect Reader[T] {
 effect Writer[W] {
   tell(w: W) : Unit
 }
+```
 
-pub fn with_reader[T, S](env: T, body: () -> S / Reader[T]) : S {
-  handle { body() } with Reader[T] {
-    ask(resume)  -> resume(env)
-    return(x)    -> x
+The handler-runners `with_reader` (`stdlib/reader.kai`, `import
+reader`) and `with_writer` (`stdlib/writer.kai`, `import writer`)
+are ordinary kaikai:
+
+```kaikai
+fn with_reader[T, S](env: T, body: () -> S / Reader[T]) : S = {
+  handle { body() } with Reader[T](env) {
+    ask(resume) -> resume(state)
+    return(x)   -> x
   }
 }
 
-pub fn with_writer[W, S](body: () -> S / Writer[W]) : (S, [W]) {
+fn with_writer[W](body: () -> Unit / Writer[W]) : [W] = {
   handle { body() } with Writer[W]([]) {
-    tell(w, resume) -> resume((), log ++ [w])  # `log` is the handler state
-    return(x)       -> (x, log)
+    tell(w, resume) -> resume((), [w, ...log])   # `log` is the handler state
+    return(x)       -> list_reverse(log)
   }
+}
+
+fn main() : Unit / Stdout = {
+  let n = with_reader(41, () => Reader.ask() + 1)
+  let ws = with_writer(() => { Writer.tell("a"); Writer.tell("b") })
+  Stdout.print("#{n} #{ws}")    # 42 [a, b]
 }
 ```
 
 `with Writer[W]([])` parallels `with State[T](init)` — it
 declares that the handler carries its own state, initialised
 here to `[]`, threaded through `resume`'s second argument and
-referred to as `log` inside the clauses. `Writer[W]` always
-starts empty; accumulating onto a pre-existing list is
-concatenation at the call site (`prefix ++ snd(with_writer {
-...})`).
+referred to as `log` inside the clauses. `with_writer` returns the
+log alone; a body that also needs its own result captures it in a
+`var` or a closure.
 
 `state` and `log` are two spellings of the same slot, and both are
 bound in every clause of a stateful handler — including the `return`
@@ -1723,17 +1584,16 @@ any other effect.
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Mutable {
-  ref_make[T](init: T)                              : Ref[T]
-  ref_get[T](r: Ref[T])                             : T
-  ref_set[T](r: Ref[T], v: T)                       : Unit
-
-  array_make[T](length: Int, init: T)               : Array[T]
-  array_length[T](a: Array[T])                      : Int
-  array_get[T](a: Array[T], i: Int)                 : T
-  array_set[T](a: Array[T], i: Int, v: T)           : Unit
-  array_grow[T](a: Array[T], new_length: Int, init: T) : Unit
+  array_make[T](n: Int, init: T)               : Array[T]
+  array_length[T](a: Array[T])                 : Int
+  array_get[T](a: Array[T], i: Int)            : T
+  array_set[T](a: Array[T], i: Int, v: T)      : Array[T]
+  array_grow[T](a: Array[T], n: Int, init: T)  : Array[T]
+  ref_make[T](init: T)                         : Ref[T]
+  ref_get[T](r: Ref[T])                        : T
+  ref_set[T](r: Ref[T], v: T)                  : Unit
 }
 ```
 
@@ -1745,7 +1605,7 @@ the effect itself (à la `State[T]`) would lock one handler to
 one type, which is useless here.
 
 This form — operations with their own `forall T. …` quantifier
-— is the amended version of Doc A §*Out of scope for v1* item
+— is the amended version of Doc A §*Out of scope* item
 3. The type checker treats `Mutable.array_get` as having type
 `forall T. (Array[T], Int) -> T / Mutable` and reuses the
 existing Hindley–Milner generalisation machinery at each call
@@ -1795,7 +1655,7 @@ or short-circuit.
 > explicitly. Doc C defines the wire format for the handler-
 > routed (qualified) path.
 
-### Observable-effects discipline (issue #251 + #252)
+### Observable-effects discipline
 
 `Mutable` follows the *observable-effects* school (Koka, Eff):
 the row captures what the *caller* observes during the call, not
@@ -1858,17 +1718,21 @@ external demand keeps `Mutable` and must declare it.
 
 #### Example 1 — Local construction, NOT observable, NO `Mutable`
 
-```kai
+```kaikai
+import loop
+
 fn build_circle(verts: Int) : Array[Real] {
   let f = array_make(verts * 2, 0.0)   # local
   var i := 0
   repeat(verts) {
-    f[i * 2]     := raylib.cos(...)   # array_set on LOCAL f
-    f[i * 2 + 1] := raylib.sin(...)
+    f[i * 2]     := real_cos(int_to_real(i))   # array_set on LOCAL f
+    f[i * 2 + 1] := real_sin(int_to_real(i))
     i := i + 1
   }
   f                                     # returned; caller never witnesses the mutation
 }
+
+fn main() : Unit / Stdout = Stdout.print("#{array_length(build_circle(4))}")
 ```
 
 `Array[Real]` (no `/ Mutable`) — the masking pass classifies
@@ -1877,11 +1741,13 @@ and never crosses a function-call boundary inside the body.
 
 #### Example 2 — Parameter mutation, IS observable, REQUIRES `Mutable`
 
-```kai
+```kaikai
 fn set_vertex(f: Array[Real], i: Int, x: Real, y: Real) : Unit / Mutable {
   f[i * 2]     := x   # array_set on PARAMETER f
   f[i * 2 + 1] := y
 }
+
+fn main() : Unit / Mutable = set_vertex(array_make(4, 0.0), 0, 1.0, 2.0)
 ```
 
 `/ Mutable` is required: the caller's `f` has new values after
@@ -1890,28 +1756,34 @@ the call returns. Omitting the row is a type error with the
 
 #### Example 3 — Read-only, NO `Mutable` regardless of provenance
 
-```kai
-fn draw_buffer(buf: Array[Int]) : Unit / Ffi {
+```kaikai
+import loop
+
+fn draw_buffer(buf: Array[Int], max_iter: Int) : Unit / Stdout {
   var i := 0
-  repeat(buf_len) {
+  repeat(array_length(buf)) {
     let n = buf[i]   # array_get — pure read, never observable
     if n < max_iter {
-      raylib.draw_rectangle(..., color_for(n))
+      Stdout.print("#{n}")
     }
     i := i + 1
   }
 }
+
+fn main() : Unit / Stdout = draw_buffer(array_make(3, 1), 5)
 ```
 
-`/ Ffi` only. No `Mutable`. `array_get` is pure regardless of
+`/ Stdout` only. No `Mutable`. `array_get` is pure regardless of
 `buf`'s provenance.
 
 #### Example 4 — Mutation through a callback, IS observable, REQUIRES `Mutable`
 
-```kai
+```kaikai
 fn apply[T](x: T, f: (T) -> Unit / Mutable) : Unit / Mutable = f(x)
 
 fn poke(a: Array[Int]) : Unit / Mutable = apply(a, (arr) => { arr[0] := 7 })
+
+fn main() : Unit / Mutable = poke(array_make(3, 0))
 ```
 
 Both rows need `/ Mutable`: `apply` calls a closure it did not write,
@@ -1975,7 +1847,9 @@ and shows its line.
 
 ### Idiomatic usage
 
-```kai
+```kaikai
+import loop
+
 fn fill_squares(n: Int) : Array[Int] {
   let xs = array_make(n, 0)
   var i := 0
@@ -1999,13 +1873,25 @@ fn sum(xs: Array[Int]) : Int {
 fn set_first(xs: Array[Int], v: Int) : Unit / Mutable {
   xs[0] := v   # parameter mutation — Mutable required
 }
+
+fn main() : Unit / Stdout + Mutable = {
+  let xs = fill_squares(4)
+  set_first(xs, 10)
+  Stdout.print("#{sum(xs)}")   # 24
+}
 ```
 
-`Ref[T]` keeps the explicit op form:
+`Ref[T]` has the explicit op form and the sigils `&` (make), `@`
+(read) and `:=` (write):
 
-```kai
-let counter = Mutable.ref_make(0)
-Mutable.ref_set(counter, Mutable.ref_get(counter) + 1)
+```kaikai
+fn main() : Unit / Stdout + Mutable = {
+  let counter = Mutable.ref_make(0)
+  Mutable.ref_set(counter, Mutable.ref_get(counter) + 1)
+  let r = &10
+  r := @r + 32
+  Stdout.print("#{Mutable.ref_get(counter)} #{@r}")   # 1 42
+}
 ```
 
 In practice `Ref[T]` is rare in application code — `var` plus
@@ -2014,31 +1900,21 @@ In practice `Ref[T]` is rare in application code — `var` plus
 block and be passed across functions without being threaded
 through `State[T]`'s handler.
 
-### Migration plan for existing code
+### Bare array builtins
 
-`Mutable` landed in m7b #2b (2026). Stage 2's inferencer now
-ships the effect as a real `DEffect` declaration (see
-`builtin_mutable_decl`) with per-op generics over `T`, and a
-default handler whose clauses delegate to the existing
-`kai_core_array_*` runtime entry points.
-
-Issue #251 + #252 (2026-05) added the demand-collection +
-provenance-masking pass: bare `array_set` / `array_grow` calls
-raise a Mutable demand, the masking pass at the end of each
-function body classifies the demand as local-non-escaping or
-external, and the row is computed accordingly. Bare
-`array_make / array_length / array_get / array_set / array_grow`
-remain reachable as core builtins because the desugars for
-array-index sugar (`a[i]` / `a[i] := v`, m7b #6) and the `var`
-specialisation (m7b #16) emit bare calls. Users may still write
-the explicit `Mutable.array_*` form — it routes through the
-op-call pathway and adds the same label.
+`array_make / array_length / array_get / array_set / array_grow` are
+also core builtins: the desugars for array-index sugar (`a[i]` /
+`a[i] := v`) and the `var` specialisation emit bare calls, and a
+bare `array_set` / `array_grow` raises a `Mutable` demand that the
+masking pass classifies like the qualified op's. The explicit
+`Mutable.array_*` form routes through the op-call pathway and adds
+the same label.
 
 ## `Cancel`
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Cancel {
   raise() : Nothing
 }
@@ -2057,26 +1933,33 @@ cancellation wraps the resource-using body in a `Cancel`
 handler. The handler runs for its side effects and does not
 `resume`, so the fiber unwinds out of the wrapped block:
 
-```kai
-fn process_log(path: String) : Unit / Console + File + Cancel {
+```kaikai
+fn append_tmp(path: String, line: String) : Unit / File = match file_append(path, "#{line}\n") {
+  Ok(_)  -> ()
+  Err(_) -> ()
+}
+
+fn process_log(path: String) : Unit / Stdout + Stderr + File + Cancel {
   match File.read_file(path) {
-    Err(m) -> Console.eprint("open failed: #{m}")
+    Err(m) -> Stderr.eprint("open failed: #{m}")
     Ok(contents) -> {
       let tmp = "#{path}.partial"
       handle {
         each(lines(contents), (line) => {
-          Console.print("line: #{line}")
+          Stdout.print("line: #{line}")
           append_tmp(tmp, line)
         })
       } with Cancel {
         raise(resume) -> {
-          Console.eprint("cancelled: discarding partial #{tmp}")
+          Stderr.eprint("cancelled: discarding partial #{tmp}")
           # resume is not called; the fiber unwinds
         }
       }
     }
   }
 }
+
+fn main() : Unit / Stdout + Stderr + File + Cancel = process_log("app.log")
 ```
 
 If the fiber is cancelled while iterating lines, the `Cancel`
@@ -2091,7 +1974,7 @@ Perceus-managed values on the way.
 When `Cancel.raise()` propagates up the handler stack,
 **intermediate handlers' `return` clauses do not run**. The only
 cleanup that executes during unwind is the code inside a
-`with Cancel { raise(_) -> ... }` clause the programmer
+`with Cancel { raise(resume) -> ... }` clause the programmer
 installed on purpose. Other effects' `return` clauses are
 skipped (Doc A §*Discarding the continuation*: `return` runs
 only on the normal-completion path, which a `Cancel` unwind is
@@ -2137,15 +2020,19 @@ fiber is flagged for cancellation the scheduler injects
 `Cancel.raise()` there. Same discipline as Trio, Kotlin
 coroutines, Eio.
 
-```kai
+```kaikai
+fn expensive(i: Int) : Int = i * i
+
 fn crunch(n: Int) : Int / Spawn + Cancel {
   var total := 0
-  each(range(0, n), (i) => {
+  [1..n] |> each((i) => {
     total := total + expensive(i)
     if i % 1000 == 0 { Spawn.yield() }    # cancellation point
   })
   total
 }
+
+fn main() : Unit / Stdout + Spawn + Cancel = Stdout.print("#{crunch(3000)}")
 ```
 
 Note: the fiber itself never *invokes* `Cancel.raise()` — that
@@ -2164,18 +2051,25 @@ Cross-reference: `docs/structured-concurrency.md`. That doc is
 the authoritative spec for fibers, nurseries, and the scheduler.
 Here we only pin the effect signature so the catalog is complete.
 
-```kai
+```kaikai-fragment
 effect Spawn {
-  spawn[T, e](f: () -> T / e)   : Fiber[T]
-  await[T](f: Fiber[T])         : T
-  select[T](fs: [Fiber[T]])     : T
-  yield()                       : Unit
-  cancel[T](f: Fiber[T])        : Unit
+  yield()                         : Unit
+  spawn[T](thunk: () -> T / e)    : Fiber[T]
+  await[T](fiber: Fiber[T])       : T
+  select[T](fibers: [Fiber[T]])   : T
+  cancel[T](fiber: Fiber[T])      : Unit
+  set_trap_exit(on: Bool)         : Unit
+  scope_enter()                   : Unit
+  scope_exit()                    : Unit
 }
 ```
 
-`Spawn` uses per-op generics (the amended Doc A §*Out of scope
-for v1* item 3, see §`Mutable`) plus a row variable on `spawn`'s
+`set_trap_exit`, `scope_enter` and `scope_exit` serve the runtime's
+link and nursery machinery; user code reaches fibers through
+`spawn`, `await`, `select`, `cancel` and `nursery` (`import spawn`).
+
+`Spawn` uses per-op generics (the amended Doc A §*Out of scope*
+item 3, see §`Mutable`) plus a row variable on `spawn`'s
 argument. The row variable reuses the existing row polymorphism
 from Doc A; the per-op `T` is the type-generic piece shared with
 `Mutable`.
@@ -2210,12 +2104,14 @@ introduce a new handler.
 The escape hatch for calling into C. Every `extern "C" fn`
 declaration installs a synthetic operation on `Ffi`:
 
-```kai
-extern "C" fn abs(n: Int) : Int / Ffi
+```kaikai
+extern "C" fn cbrt(x: Real) : Real / Ffi
 
-fn absolute(x: Int) : Int / Ffi {
-  abs(x)
+fn cube_root(x: Real) : Real / Ffi {
+  cbrt(x)
 }
+
+fn main() : Unit / Stdout + Ffi = Stdout.print("#{cube_root(27.0)}")
 ```
 
 The kaikai-side identifier is, by default, also the C symbol the
@@ -2223,20 +2119,24 @@ linker resolves. To bind a kaikai name to a differently-named C
 symbol — typical for libraries that expose `CamelCase` or
 namespaced identifiers — add the override after the ABI literal:
 
-```kai
+```kaikai
 extern "C"("InitWindow") fn init_window(w: Int, h: Int, title: String) : Unit / Ffi
-extern "C"("strlen")     fn c_strlen(s: String) : Int / Ffi
+extern "C"("cbrt")       fn cube_root(x: Real) : Real / Ffi
+
+fn main() : Unit / Stdout + Ffi = Stdout.print("#{cube_root(8.0)}")
 ```
+
+A declaration must match the C prototype exactly: a libc function
+declared with other types (`strlen` as `Int`, `abs` as `Int`) clashes
+with its system header on some platforms.
 
 The override symbol must be a valid C identifier
 (`[A-Za-z_][A-Za-z0-9_]*`); anything else is a parse error. The
-ABI literal is mandatory and currently must be `"C"` — any other
-ABI is rejected.
+ABI literal is mandatory: `"C"` for C, `"js"` for a JavaScript
+import on `wasm32-browser` (whose marker effect is `Js`).
 
-The supported types in v1 are `Int`, `Real`, `Bool`, `String`,
-and `Unit` (return only). Interop involving pointers or compound
-structs requires an additional type layer (`CString` and friends)
-specified in a future dedicated FFI doc.
+The marshalled types, extern structs, opaque handles and the
+fixed-width types (`U8`–`I64`, `F32`) are covered in `kai info ffi`.
 
 ### Default handler
 
@@ -2248,11 +2148,11 @@ to run; the "handler" is a compile-time lowering step.
 
 Direct `Ffi` use is an **audited escape** (CLAUDE.md Tier 1). It
 appears in the `runtime/` directory and in the default handlers
-for `Console`, `Stdin`, `Env`, `File`, `Mutable`, and `Spawn` —
+for `Stdout`, `Stderr`, `Stdin`, `Env`, `File`, `Mutable`, and `Spawn` —
 every effect whose behaviour ultimately touches the OS. Pure
 effects (`State[T]`, `Reader[T]`, `Writer[W]`) and
 `Cancel` do not use `Ffi`. Userland almost never writes
-`extern "C"` directly, because the stdlib exposes `Console` /
+`extern "C"` directly, because the stdlib exposes `Stdout` /
 `File` / `Mutable` etc. for the common cases.
 
 ### Safety
@@ -2280,70 +2180,6 @@ alongside `panic` and unfilled `?` in CLAUDE.md Tier 1. Every
 reviewed surface — ideally consolidated inside `runtime/` or a
 single stdlib module per third-party library.
 
-## Migration of existing builtins
-<!-- coverage: skip --> historical migration plan, not a feature
-
-The table below maps every kaikai-minimal builtin
-(`docs/kaikai-minimal.md` §*Built-in functions*) to its
-post-effects form.
-
-| Current builtin                                | New form                                   | Effect row |
-|-----------------------------------------------|--------------------------------------------|------------|
-| `print(s)`                                    | `Console.print(s)`                         | `Console` |
-| `eprint(s)`                                   | `Console.eprint(s)`                        | `Console` |
-| `read_line()`                                 | `Stdin.read_line()`                        | `Stdin` |
-| `read_bytes(n)` (issue #453)                  | `Stdin.read_bytes(n)`                      | `Stdin` |
-| `read_file(path)`                             | `File.read_file(path)`                     | `File` |
-| `write_file(p, c)`                            | `File.write_file(p, c)`                    | `File` |
-| `args()`                                      | `Env.args()`                               | `Env` |
-| `int_to_string`, `real_to_string`, …          | unchanged                                  | pure |
-| `string_length`, `string_concat`, …           | unchanged                                  | pure |
-| `list_length`, `list_append`, `list_reverse`  | unchanged                                  | pure |
-| `exit(code)`                                  | `exit(code)` — builtin, not an op          | audited escape, no effect |
-| `panic(msg)`                                  | `panic(msg)` — builtin, not an op          | audited escape, no effect |
-| `array_make / get / set / grow`               | `Mutable.array_*` (or `a[i]` / `a[i] := v`) | `Mutable` |
-| (new) `ref_make / get / set`                  | `Mutable.ref_*`                            | `Mutable` |
-| `map`, `filter`, `reduce`, `each`             | unchanged signatures, rows stay open       | `/ e` (inherited from the callback) |
-
-A function that does "several of the above" — say, a CLI tool
-that reads args, opens a config file, and logs progress — can
-spell its row as `/ Env + File + Console` or use the stdlib
-alias `/ Io` (= `Console + Stdin + Env + File`). Prefer the
-granular form when only one or two capabilities are used;
-reach for `Io` when the function is genuinely doing
-"everything".
-
-Two builtins stay as direct calls outside any effect: `exit` and
-`panic`. They are non-resumable by construction (return type is
-the bottom `a` / `Nothing`), so treating them as effect ops would
-not buy anything — the type already prevents the caller from
-continuing, and a handler could not meaningfully catch them. Both
-remain audited escapes per CLAUDE.md Tier 1.
-
-### What users have to change
-
-- Bodies that call `print` / `read_file` / etc. must name the
-  effect at the call site: `Console.print(s)`,
-  `File.read_file(path)`, and so on. No implicit rewriting from
-  the bare builtin name — the whole point of the migration is
-  to surface which effects a function uses, so the explicit
-  form is required from m7a onward.
-- Public signatures gain the effects their body now names:
-  `/ Console`, `/ File`, `/ Console + Env`, or the
-  umbrella `/ Io`. Existing signatures without `/` become
-  *pure* and will fail to type-check if their body calls any
-  effect op — this is the intended failure mode.
-- Array callers gain `/ Mutable`. Since arrays are confined to
-  the compiler today, the radius is small.
-
-A one-shot codemod (`kai fmt --upgrade-effects`) performs the
-mechanical conversion (`print` → `Console.print`, etc., plus
-effect-row updates on signatures). It ships in m7a alongside the
-first type checker that can see effects; migration to the m7b
-sugars (`a[i]`, naked cell read, `var x := 0`) is a separate
-pass, done by hand or by a second codemod. Implementation detail
-lives in Doc C.
-
 ## `main` and the runtime
 
 ### Allowed `main` signatures
@@ -2351,34 +2187,36 @@ lives in Doc C.
 Any effect whose default handler the runtime installs may
 appear in `main`'s row, individually or in combination:
 
-```kai
-fn main()                                             # pure
+```text
 fn main() : Int                                       # pure, returns exit code
-fn main() : Unit / Console                            # only logs
-fn main() : Int  / Console + Env                      # reads args, logs, exits with code
-fn main() : Unit / Console + Stdin                    # interactive: read lines, echo
-fn main() : Unit / File + Console                     # batch: open files, log progress
-fn main() : Unit / Io                                 # the alias: Console + Stdin + Env + File
+fn main() : Unit / Stdout                             # only prints
+fn main() : Int  / Stdout + Env                       # reads args, prints, exits with code
+fn main() : Unit / Stdout + Stdin                     # interactive: read lines, echo
+fn main() : Unit / File + Stdout                      # batch: open files, log progress
+fn main() : Unit / Io                                 # the alias: Stdout + Stderr + Stdin + Env + File
 fn main() : Unit / Io + Mutable                       # ... plus array / ref use
-fn main() : Unit / Io + Mutable + Spawn               # ... plus fibers; `Cancel` is implied by Spawn
+fn main() : Unit / Io + Mutable + Spawn               # ... plus fibers
 ```
 
 Prefer the granular effects when only one or two apply (they
 document the program's actual surface); reach for `/ Io` when
-the program does essentially all of `Console + Stdin + Env +
-File`. Any effect without a runtime-installed default handler
-(`State[T]`, `Reader[T]`, `Writer[W]`, or any user-declared
-effect) in `main`'s row is rejected by the compiler — here a
-user-declared `effect Fail { fail(msg: String) : Nothing }`:
+the program does essentially all of `Console + Env + File`. Any
+effect without a runtime-installed default handler (`State[T]`,
+`Reader[T]`, `Writer[W]`, or a user-declared effect with no
+`default { }` block) in `main`'s row is rejected by the compiler —
+here a user-declared `effect Fail { fail(msg: String) : Nothing }`:
 
+```kaikai-neg
+effect Fail { fail(msg: String) : Nothing }
+
+fn main() : Unit / Stdout + Fail {
+  Fail.fail("boom")
+}
 ```
-error: main cannot have unhandled effect `Fail`
-  |
-7 | fn main() : Unit / Io + Fail {
-  |                        ^^^^
-  = note: effects without a runtime-installed default handler
-          must be handled inside the program.
-  = help: wrap the effectful code in `handle ... with Fail { ... }`.
+
+```text
+error: `main` declares effect `Fail` but no default handler is installed for it
+  = help: wrap the body in `handle { ... } with Fail { ... }` so the effect is closed before reaching `main`'s scope
 ```
 
 ### Installation order
@@ -2390,7 +2228,7 @@ the others are absent from the stack entirely.
 ```
 Ffi                                   (always innermost, compiler-synthesised)
   Mutable                             (if present)
-    Console / Stdin / Env / File      (any present; order among them does not matter)
+    Stdout / Stderr / Stdin / Env / File / …  (any present; order among them does not matter)
       Cancel                          (if Spawn is present)
         Spawn                         (if present; root nursery)
           main()
@@ -2398,8 +2236,8 @@ Ffi                                   (always innermost, compiler-synthesised)
 
 - `Ffi` is innermost because every other default handler
   ultimately dispatches through it.
-- `Console`, `Stdin`, `Env`, `File` sit in the middle as a
-  commutative group: none depends on another, so the compiler
+- `Stdout`, `Stderr`, `Stdin`, `Env`, `File` and the other IO
+  effects sit in the middle as a commutative group: none depends on another, so the compiler
   is free to nest them in any order. Pretty-printers pick a
   canonical order for diagnostics.
 - `Cancel` is inside `Spawn` because the root nursery is what
@@ -2419,71 +2257,50 @@ Ffi                                   (always innermost, compiler-synthesised)
   - `SIGTERM` — same dispatch as `SIGINT`, exit code 143
     without `Spawn`.
   - `SIGPIPE` — ignored at startup so `EPIPE` surfaces as a
-    write error inside the `Console` default handler, which
-    absorbs it silently. See §`Console` *Default handler* for
-    the fault-handling detail.
+    write error inside the `Stdout` / `Stderr` default handler,
+    which absorbs it silently. See §`Stdout` and `Stderr` *Default
+    handler* for the fault-handling detail.
 
-## Out of scope for v1
+## Out of scope
 
-- **User-overridable default handlers.** The runtime's
-  defaults for `Console`, `Stdin`, `Env`, `File`, `Mutable`,
-  `Cancel`, `Spawn`, and `Ffi` are built-in; users cannot swap
-  them for alternate implementations at link time.
+- **Swapping a builtin's default handler.** The runtime's
+  defaults for the builtin effects are fixed; a program overrides
+  one by handling the effect, not by replacing it at link time.
 - **First-class handler values.** Handlers appear only at
-  `handle ... with ...` sites, consistent with Doc A.
-- **`Error[E]` parameterised over payload.** `Fail(String)` is
-  the v1 story; richer errors are a later extension.
+  `handle ... with ...` sites; a named instance (`with Eff as a`) is
+  a second-class capability value (Doc A §*Desugaring sketch*).
 - **Handler composition combinators** (`merge`, `lift`, `rename`
-  à la Koka). The nesting rule from Doc A is enough for v1.
-- **Actors and mailboxes (`Actor[Msg]`).** Deferred in full to
-  `docs/actors.md`; Doc B does not ship a signature, so callers
-  cannot plan against one yet.
+  à la Koka). The nesting rule from Doc A is enough.
 - **Distributed actors.** Phase 5+ per `docs/design.md`.
-- **Immutable O(1)-access container (`Vector[T]`).** See
-  §`Mutable` *Known gap*: `Array[T]` is mutable-only and
-  `List[T]` is O(n); a persistent `Vector[T]` covers the gap
-  and is the next collection to land after m7b.
 
 ## Open questions
 
 1. **Per-operation type generics.** `Mutable`, `Spawn`, and
    possibly others need operations with their own `[T]`
-   quantifier; Doc A §*Out of scope for v1* item 3 currently
+   quantifier; Doc A §*Out of scope* item 3 currently
    forbids this.
    *Decided:* allow per-op HM generalisation of *type*
    parameters (row parameters stay out of scope). The type
    checker treats `Mutable.array_get` as having type
    `forall T. (Array[T], Int) -> T / Mutable` and each call
-   site picks `T` independently. Doc A §*Out of scope for v1*
-   item 3 is amended accordingly; implementation lands in m7b.
+   site picks `T` independently. Doc A §*Out of scope*
+   item 3 is amended accordingly.
 
 2. **`Writer[W]` as primitive or sugar.** Is `Writer[W]` its own
    effect declaration, or stdlib sugar over `State[[W]]`?
-   *Decided:* its own effect declaration, shipping in m7b.
+   *Decided:* its own effect declaration.
    Diagnostics say `Writer` instead of `State[[String]]`, and
    the handler can keep a one-line body using `with Writer[W]([])`
    plus the canonical `tell` / `return` clauses — symmetric with
    `State[T](init)`.
 
-3. **Grace-period short form for IO ops.** Do we keep `print(s)`
-   callable during migration, auto-elaborating to
-   `Console.print(s)`?
-   *Decided:* no. The point of the migration is to force the
-   effects used by each function to appear in its row; a
-   silent rewrite defeats the goal. The codemod (below) handles
-   the one-time mechanical conversion.
+3. **Short form for IO ops.** Is `print(s)` callable, or must
+   every call name the effect (`Stdout.print(s)`)?
+   *Decided:* `print(s)` stays a core function whose row carries
+   `Stdout`, so the effect still appears in every caller's row; the
+   short name hides nothing.
 
-4. **Codemod timing.** Does `kai fmt --upgrade-effects` ship in
-   m7a alongside the first type checker that can see effects,
-   or slip to m7b once the ergonomic sugars land?
-   *Decided:* m7a. The codemod rewrites bare builtins to their
-   explicit effect form (`print` → `Console.print`, etc.) and
-   adds the corresponding rows to signatures. Migration to the
-   m7b sugars (`a[i]`, naked cell read, `var x := 0`) is a
-   separate pass and can be done by hand or by a second codemod
-   later.
-
-5. **Exit-code shape of `main`.** `fn main() : Int / Io` is
+4. **Exit-code shape of `main`.** `fn main() : Int / Io` is
    accepted; is it idiomatic, or should the convention be
    `fn main() : Unit / Io` plus explicit `exit(code)`?
    *Decided:* accept both. The style guide prefers `Int` return
@@ -2491,8 +2308,8 @@ Ffi                                   (always innermost, compiler-synthesised)
    keeps `exit(code)` as the escape hatch for early exits from
    deep call trees that do not want to propagate a `Result`.
 
-6. **Multiple `Mutable` scopes.** v1 has one global `Mutable`
-   handler (the runtime default). Do we allow user-nested
+5. **Multiple `Mutable` scopes.** The runtime installs one global
+   `Mutable` handler. Do we allow user-nested
    `with Mutable { ... }` for observation/mocking, or forbid it
    to keep the handler-stack shape predictable?
    *Decided:* allow nested observation handlers, scoped to the
@@ -2501,62 +2318,18 @@ Ffi                                   (always innermost, compiler-synthesised)
    calls. Bare core `array_set` / `array_grow` and the
    `a[i] := v` desugar bypass the handler stack and route
    directly to the runtime — see §`Mutable` *Default handler*
-   v1-status sidebar for the gap. A test harness that needs to
-   intercept every mutation must use the qualified form
-   explicitly (or wait for the future lane that rewrites
-   bare-builtin calls when a user handler is present). Doc C
-   pins the wire format for the handler-routed path.
+   for the gap. A test harness that needs to intercept every
+   mutation must use the qualified form explicitly. Doc C pins
+   the wire format for the handler-routed path.
 
-## Next steps
+## Related docs
+<!-- coverage: skip --> cross-references
 
-- **Doc C** — `docs/effects-impl.md`: op dispatch in the
-  stage-2 pipeline, `TyFnT` gaining an effect-row slot, the
-  handler-stack runtime representation, per-op type generics
-  implementation, interaction with monomorphisation and fibers
-  (m8), diagnostic quality for row-mismatch and
-  effect-not-handled errors, codemod specification for
-  `kai fmt --upgrade-effects`.
-
-- **`docs/actors.md`** — covers `Actor[Msg]`, `Pid`, mailbox
-  policies, supervision, links/monitors. Separate doc because
-  the design surface is large and its shape does not affect the
-  Doc B catalog.
-
-- **`docs/syntax-sugars.md`** — future consolidation of the
-  call-site sugars decided in Doc B (trailing lambdas, naked
-  cell read / `cap := v`, `var x := init`, `a[i]` / `a[i] := v`).
-  These are
-  general language features, not effect-specific; Doc B introduces
-  them next to the effects that motivate them, but a standalone
-  syntax spec avoids scattering the grammar across effect docs.
-
-Milestone m7 splits into two sub-milestones to keep the blast
-radius tractable:
-
-- **m7a — mechanics**: row unification in the checker, `TyFnT`
-  with an effect-row slot, lowering of ops and handlers,
-  handler-stack runtime, default handlers for `Console`,
-  `Stdin`, `Env`, `File`, `Mutable`, `Fail` (and `Ffi` as
-  compiler-synthesised), basic diagnostics for row-mismatch and
-  effect-not-handled. End state: `fn main() : Unit / Console {
-  Console.print("hi") }` compiles and runs end-to-end. Effects
-  function, just verbosely.
-
-- **m7b — ergonomics**: closed effect aliases (`type Io =
-  Console + Stdin + Env + File`), per-operation type generics
-  (Doc A §*Out of scope for v1* item 3 amended), trailing
-  lambdas for call-site syntax (`try { body }`, `with_state(0)
-  { body }`, `nursery { n -> ... }`), capability read/write
-  sugar (naked `counter` for `State.get`/`Reader.ask`; `counter
-  := v` for `State.set`), local mutable cells (`var x := 0`),
-  array indexing sugar (`a[i]` / `a[i] := v` over
-  `Mutable.array_{get,set}`), `Reader[T]` / `Writer[W]` as
-  their own effects (Open question #2 resolved in their
-  favour). End state: Doc B reads on the page the way its code
-  samples suggest.
-
-Within each sub-milestone the ordering is dependency-driven:
-`Ffi` and `Mutable` first (unblocks stage 2's array migration),
-then the console/file/fail triple (unblocks userland programs),
-then `State` and its kin, then `Cancel`/`Spawn` with the
-scheduler.
+- **Doc C** — `docs/effects-impl.md`: op dispatch in the stage-2
+  pipeline, the handler-stack runtime representation, per-op type
+  generics, interaction with monomorphisation and fibers.
+- **`docs/actors.md`** — `Actor[Msg]`, `Pid`, mailbox policies,
+  supervision, links/monitors.
+- **`docs/syntax-sugars.md`** — the call-site sugars introduced
+  here (trailing lambdas, naked cell read / `cap := v`,
+  `var x := init`, `a[i]` / `a[i] := v`).

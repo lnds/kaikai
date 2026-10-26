@@ -8,14 +8,14 @@ programmer (or an assistant) has not yet decided what to write.
 
 Two forms:
 
-```kai
+```text
 ?              # anonymous hole
 ?name          # named hole (persists across error messages, survives until filled)
 ```
 
 A hole is a legal expression **and** a legal pattern. It has no
-runtime representation: reaching an unfilled hole at runtime aborts
-via `kai_core_panic("unfilled hole: ?name")`.
+runtime representation: reaching an unfilled hole at runtime panics
+with `unfilled hole: ?name at line L col C, expected T`.
 
 ## Behaviour at check time
 

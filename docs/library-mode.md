@@ -75,12 +75,12 @@ Field shapes (stable for v1):
 
 ## In-process API
 
-`compile_to_module(file: String, decls: [Decl]) : TypedModule` runs
-inference and returns a queryable handle. Three entry points:
+`compile_to_module(file: String, decls: [Decl], tin: TyperIn) : TypedModule`
+runs inference and returns a queryable handle. Three entry points:
 
-```kai
+```text
 type_at(tm: TypedModule, line: Int, col: Int) : Option[Ty]
-def_at (tm: TypedModule, line: Int, col: Int) : Option[DefLoc]
+def_hit_at(ds: [Decl], tab: SymTab, line: Int, col: Int) : Option[DefHit]
 enclosing_node(tm: TypedModule, line: Int, col: Int) : Option[EncResult]
 ```
 
@@ -91,7 +91,7 @@ byte-offset machinery.
 
 ## v1 limitations
 
-- `def_at` resolves top-level fn / type / const / effect /
+- `def_hit_at` resolves top-level fn / type / const / effect /
   protocol / axiom / unit names, plus local bindings inside the
   same module (`let` binds, function and lambda parameters,
   pattern binds — `Some(x)`, `[h, ...t]`, `T { f: y }`, `(a, b)`,
@@ -124,23 +124,7 @@ file-plus-protocol. Tier 1's `test-library-mode` diffs each
 fixture's `.out.expected` byte-for-byte; the comment shape is the
 single source of truth for what the test asks. An LSP consumer
 that wants to issue probes programmatically uses the in-process
-`compile_to_module` + `type_at/def_at/enclosing_node` instead.
-
-## Selfhost waiver
-
-This lane changes `stage2/compiler.kai` extensively (~700 LOC of
-new code: walkers + JSON serialisation + CLI wiring). The standard
-selfhost-byte-identical gate is **explicitly waived** for the lane;
-what the gate verifies instead is that
-
-- `kaic2 stage2/compiler.kai` produces a working C source that
-  compiles cleanly and self-hosts to a fixed point (`stage3.c ==
-  stage4.c`); and
-- Tier 0 + Tier 1 + Tier 1-ASAN remain green.
-
-Both properties are verified before the lane PR opens. The byte
-diff vs. the pre-lane `kaic2` is expected and documented in the
-PR body.
+`compile_to_module` + `type_at` / `def_hit_at` / `enclosing_node` instead.
 
 ## Related issues
 

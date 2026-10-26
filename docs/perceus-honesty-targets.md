@@ -21,9 +21,8 @@ The honesty claims are all met for emitted user programs:
   1.12× C). Full numbers: `docs/benchmarks/rb_tree_2026-06-02.md`.
 - **Compute parity** — fib(35) 1.00× C, Euler #4 1.05× C
   (`docs/benchmarks/compute_2026-05-09.md`).
-- **Tier 1 #3 "mandatory TCO"** — honest for emitted programs (C
-  backend; see the TCO section below for the bootstrap-chain and LLVM
-  caveats that survive).
+- **Tier 1 #3 "mandatory TCO"** — honest on both backends, mutual
+  tail-call groups included (see the TCO section below).
 - **RC-corruption detection covers BOTH backends** (2026-08-06). The
   directed `rc-detector` gate (ASAN + no-cell-pool + strict ledger) runs
   per RC-path PR on both backends; the full golden corpus (320 fixtures,
@@ -280,10 +279,11 @@ What does NOT hold yet:
 - **The head is boxed and the step is its own node**: a cell, its
   thunk and its `SeqCons` are three allocations per element.
 
-### The one remaining lever, and what is NOT the lever
+### The lever the rb-tree measurement named, and what is NOT the lever
 
-The gap to Koka is now a **constant factor**, not a chasm, and the
-instruction counts locate it precisely:
+These counts predate the value-immediate `Int`, which has since landed
+(see *Unboxing*). At the time, the gap to Koka was a **constant factor**,
+not a chasm, and the instruction counts located it precisely:
 
 - kaikai retires **8.37 G instructions vs Koka's 1.09 G (7.7×)** for a
   bit-identical tree. Allocations are already at parity (6.30 M, an
@@ -294,8 +294,8 @@ instruction counts locate it precisely:
   argument pass still routes a small `Int` through a `kai_int` heap
   box, where Koka uses a value-immediate (tagged pointer, register-move
   field read). Phase 3 signature-unboxing does not reach into the
-  `RBNode`-with-pointer-children layout. **Value-immediate `Int` is the
-  single remaining large lever.** It is post-MVP (Tier 3).
+  `RBNode`-with-pointer-children layout. **Value-immediate `Int` was the
+  single remaining large lever.**
 - Further reuse work is explicitly *not* the lever — the reuse retro
   notes C and Koka pay the same random-descent cache miss, so chasing
   `reuse_freed` does not move the wall.
@@ -381,25 +381,18 @@ leak sources that issue catalogued. Branch-aware dup elimination
 (#599 — the `pcs_pass` conservative-dup wall regression) is also
 CLOSED.
 
-### Open leak shapes in user code
+### Leak bound under a trap
 
-Unlike the sources above, these surface in ordinary user programs:
-
-- #2143 — native only: a nested arm binder homonymous with an outer one is
-  released by the outer arm's exit drop (use-after-free under ASAN).
-- #2424 — a trap raised from pure code (an out-of-range index, a division by
-  zero, a `panic`) inside a spawned fiber, or a failed `assert` under
-  `kai test`. **Native: leak-free under trap; C: leak bounded per trap.** The
-  trap leaves through the unwinder, and on the native backend every frame it
-  crosses has a landing pad that releases what the frame still owned. The C
-  backend has no pads: each trap leaks what its frames held, a fixed amount
-  per trap. On either backend, the runtime's own higher-order functions
-  register the list, closure and accumulator they hold on the unwind stack,
-  which the trap releases first. `examples/perceus/trap_releases_pending` and
-  `trap_through_runtime_callback` pin both bounds.
-- #2222 — native only: a binder bound under a record or tuple field's list,
-  variant or `@` pattern owns no reference, so a release planned for it frees
-  cells the scrutinee still holds. The branch payers leave these binders out.
+A trap raised from pure code (an out-of-range index, a division by zero, a
+`panic`) inside a spawned fiber, or a failed `assert` under `kai test`, is
+**leak-free on native and leaks a bounded amount per trap on C**. The trap
+leaves through the unwinder, and on the native backend every frame it crosses
+has a landing pad that releases what the frame still owned. The C backend has
+no pads: each trap leaks what its frames held, a fixed amount per trap. On
+either backend, the runtime's own higher-order functions register the list,
+closure and accumulator they hold on the unwind stack, which the trap releases
+first. `examples/perceus/trap_releases_pending` and
+`trap_through_runtime_callback` pin both bounds.
 
 ## Tier 1 — *Show HN honest*
 
@@ -435,12 +428,11 @@ Remaining Tier 2 polish (perf, not honesty):
 | Phase 2 — locals + return values unboxed | `Int`/`Bool`/`Char`/`Real` live in C `int64_t`/`int`/`double` inside fn bodies; boxing only at call boundaries and storage edges. | ✅ landed | 5–10× (call-boundary boxing) |
 | Phase 3 — call boundaries unboxed (#383) | Top-level fns with all-primitive concrete signatures emit raw C signatures (`int64_t fib(int64_t)`); recursive sites pass raw scalars. | ✅ landed 2026-05-09 | **~1× C on compute** (fib 1.0×, Euler #4 1.05×) |
 | Phase 4 Option A — variant field unboxing (#440) | Each user variant whose declaration spells `Int`/`Real` literally gets a typed payload slot in `slot_mask`; runtime walkers (free, eq, to_string, reuse) branch per-slot; all-pointer cells stay on the legacy hot path. | ✅ landed; superseded by the reuse cascade | folded into the 2.64× C rb-tree result above |
-| Value-immediate `Int` (Tier 3) | Small `Int` as a tagged value-immediate instead of a `kai_int` heap box — the remaining 7.7× instruction gap to Koka. | ⏳ post-MVP | closes the 2.64× C → ~Koka gap |
+| Value-immediate `Int` | Small `Int` as a tagged value-immediate (Koka's `n*2+1` encoding) instead of a `kai_int` heap box; dup/drop on it are no-ops, and only `|n| > 2^62` falls back to a heap Int. | ✅ landed | — |
 | Phase 4 full unboxing (Tier 3) | Drop specialisation, regions, cross-fiber unboxed messages, type-erased layouts. | ⏳ post-MVP | matches C across the whole alloc mix |
 
-Phases 2 + 3 are contained chunks that do **not** require the
-multi-threaded scheduler / cross-thread atomics the full Koka feature
-set needs.
+Phases 2 + 3 are contained chunks that do **not** depend on the
+multi-threaded scheduler's cross-thread machinery.
 
 ## Tier 3 — *Full Perceus* (post-MVP)
 
@@ -450,43 +442,21 @@ doesn't accidentally get pulled into a 1.0-scoped lane.
 | Item | Status / note |
 |---|---|
 | **Reuse-in-place** | **v1 landed #118, v1.1 #209 (2026-05-03); production-active since the 2026-06 cascade** (`c44a445`→`e345393`). Runtime helpers `kai_reuse_or_alloc_{cons,record,variant}` + `kai_check_unique`; recogniser + magic-name dispatch in the compiler. Fires 19.6 M cells on rb-tree at HEAD. The "self-compile firing remains 0" note from the v1.1 retro is obsolete — the cascade activated it on the linear-rebuild shape. Record rebuilds pass a kept-binder mask so the alias guard still pays the donor's claim on same-field kept children. Native keeps the fresh path for a nested-pattern arm with a flat rebuild (the move overwrite cannot pay the deconstructed inner cell); the C helper's 1:1 old-slot decref covers that shape, so only native forfeits the reuse there. |
-| **Value-immediate `Int`** | post-MVP. The single largest remaining lever (7.7× instruction gap to Koka, all boxing traffic). The one named in the 2026-06-02 bench as what moves 2.64× C toward Koka's 1.12× C. |
+| **Value-immediate `Int`** | Landed (see *Unboxing* above). |
 | **Drop specialisation** | Investigated 2026-05-01 — closed doc-only: end-to-end working (selfhost byte-identical, tier1 green) but −1.7% wall at `-O2`, +5.4% at `-O0`. Phase 2 unboxing already absorbed the addressable overhead. Re-evaluate after the alloc-mix shift from reuse stabilises. Retro: `docs/lane-experience-drop-specialisation.md`. |
 | **Opt-in regions** | Arena allocation for parser scratch / lexer state. Power-user feature; only where RC demonstrably costs more than an arena reset. |
 
-CLAUDE.md keeps "Full Perceus (value-immediate Int, regions) is
-post-MVP" pinned alongside the multi-threaded scheduler decision.
+## TCO half of Tier 1 #3
 
-## TCO half of Tier 1 #3 — landed 2026-04-30 (issue #37)
-
-`tcrec_rewrite_decls` (between unboxing and Perceus) rewrites every
-self-tail-call's callee `EVar` into a `__kai_tcrec|<c_sym>|<dropmask>|…`
-sentinel; the C backend emits a rebind+goto block at each call site and
-plants `_kai_<c_sym>_entry:;` before the enclosing return. Verified:
-`euler4` runs under `ulimit -s 256` on macOS (recursion depth ~1 M), and
-the PR #36 runtime `RLIMIT_STACK` bump was removed.
-
-Caveats that survive:
-
-- The rewrite lives in `stage2/compiler.kai`, so it covers **emitted
-  programs** (demos, kaic2's selfhost output). The bootstrap chain
-  `kaic0 → kaic1 → kaic2` is built by stage 0 / stage 1, whose emit
-  still uses the recursive shape, so the kaic2 binary's internal loops
-  remain stack-bound (hence the macOS 128 MB linker stack in
-  `stage2/Makefile`). The honesty claim applies to kaikai *source
-  programs*, not the bootstrap chain.
-- Mutual tail-recursion (`f → g → f`) is out of scope — v1 rewrites
-  self-recursive calls only.
-- **The LLVM backend lowers the sentinel to a real loop** (`br
-  %tcrec.loop` back-edge, issue #706), including for mixed raw/boxed
-  param signatures: a `String` (or any boxed) accumulator threaded
-  through a self-tail-call round-trips as `%KaiValue*`, matching the C
-  backend. (Earlier the LLVM UFn convention read a boxed param as a raw
-  `i64`; fixed by threading the per-param raw mask through every UFn
-  lowering site — see `docs/lane-experience-llvm-tco-mixed-param.md`.)
-- Fns with any `LUUnused` parameter keep the normal-call shape (the
-  entry drops would re-fire each goto iteration). Hoisting entry drops
-  above the label is a follow-up.
+Self-tail-calls and mutual tail-call groups (`f → g → f`, generic ones
+included) run in constant stack on both backends: `tcrec_rewrite_decls`
+turns a self-tail-call into a rebind and a jump back to the function's
+entry (a `goto` on C, a loop back-edge on native), and a mutual group is
+fused into one function whose members are entry points
+(`examples/tco/mutual_*`). A boxed accumulator threaded through the loop
+(a `String`, a list) stays boxed across the back-edge on both backends.
+The compiler itself is built by a release whose codegen carries the same
+rewrite, so its own loops are constant-stack too.
 
 ## What this document is NOT
 
@@ -497,6 +467,5 @@ Caveats that survive:
   issues (#77, #78, #82→#123, #440, #599).
 - **Not an excuse to defer Tier 2** — Tier 2 shipped. The flip's wall
   regression was reversed by Phase 3 unboxing (#383) + the #82 sweep
-  (#123) + the 2026-06 reuse cascade. What remains is the
-  value-immediate `Int` lever (Tier 3), which is performance toward
-  Koka, not an honesty footnote.
+  (#123) + the 2026-06 reuse cascade + the value-immediate `Int`. What
+  remains in Tier 3 is performance toward Koka, not an honesty footnote.

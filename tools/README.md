@@ -1,7 +1,11 @@
 # tools/
 
-Editor support files for kaikai. None of these are wired into the
-build; they are static assets you install into your editor of choice.
+Build, test and measurement scripts for the repository, the sources of
+the `kai` tool itself (`tools/kai/`) and its helpers, and editor
+support files. This page covers the editor support files: static
+assets, not wired into the build, that you install into your editor
+of choice. For the language server, see `extensions/vscode/` and
+`kai lsp --help`.
 
 ## Vim / Neovim
 
@@ -35,7 +39,7 @@ TextMate scope names so any colour theme picks them up.
 
 For a one-off VSCode install, create a minimal extension layout:
 
-```
+```text
 ~/.vscode/extensions/kaikai-syntax/
 ├── package.json
 ├── language-configuration.json
@@ -80,9 +84,8 @@ type or scope information:
   one or not (e.g. inside an `import` path).
 - Effect names in the catalog list always highlight as effects, even
   when the same identifier shadows a user-defined value.
-- The keyword list tracks `stage2/compiler.kai`. If the lexer's
-  keyword set drifts, this file drifts with it; bump in lockstep.
+- The keyword list is a copy of the reserved words `kai info syntax`
+  lists; when that list changes, update both files.
 
-Real scope-aware highlighting requires the kaikai LSP, which is
-scheduled for milestone m17. Tree-sitter and `kai fmt` are also
-out of scope here — see the project roadmap in `docs/design.md`.
+Type- and scope-aware information comes from the language server
+(`kai lsp`), not from these files.

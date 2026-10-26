@@ -1,23 +1,18 @@
 /*
- * kaikai-minimal runtime for stage 0.
+ * The stage 2 runtime: included by the C the compiler emits and by the
+ * native backend's runtime (stage0/runtime_llvm.c).
  *
- * Header-only. Generated C files #include this and compile together in
- * one translation unit, so static storage and linkage are fine.
+ * A boxed value is a `KaiValue *`: a reference-counted block with a tag,
+ * or, with the low bit set, an immediate small Int. Where the type is
+ * known, scalars travel unboxed (raw parameters and returns, typed
+ * variant slots, `Vec` elements).
  *
- * All values are heap-allocated KaiValues with a reference-count header
- * and a discriminating tag. Uniform boxing per docs/stage0-design.md;
- * primitives (Int, Real, Bool, Char, Unit) are wrapped in the same
- * struct so the generated code does not branch on shape.
+ * An owned argument is released by the callee or kept in its result; a
+ * borrowed (`^`) parameter is not. Closures are called through
+ * `kai_apply`.
  *
- * Calling convention for functions emitted by stage 0:
- *   static KaiValue *kai_<name>(KaiValue *arg0, KaiValue *arg1, ...);
- * Arguments are handed to the callee as owned references (callee must
- * decref them or keep them alive as part of the returned value). The
- * return value is owned by the caller.
- *
- * Closures and higher-order core helpers (map/filter/reduce/each)
- * go through a dynamic dispatch path `kai_apply(closure, argc, argv)`
- * to keep the generated code uniform.
+ * Under KAI_SEPARATE_COMPILATION, state shared between units is `extern`
+ * and defined once, by the KAI_RUNTIME_OWNER unit.
  */
 
 /* m8.x cooperative scheduler substrate: ucontext.

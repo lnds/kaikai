@@ -30,7 +30,7 @@ Theories are a *closed* catalog because E-unification over arbitrary
 equational theories is undecidable. The compiler owns a terminating
 engine for each recognised theory; there is no way to write the
 equations of a new one. This is the same discipline that forbids
-Haskell-style type-class resolution (CLAUDE.md Tier 1 #3).
+Haskell-style type-class resolution.
 
 ## The catalog
 
@@ -84,7 +84,7 @@ same closure applies to `Nominal` and `ConstructorApp`.
   are formation errors.
 - `Composition = { assoc, measure }` — composes elements in
   declaration order (associative, **not** commutative — order is
-  load-bearing) and sums a per-element measure. A habitant is a
+  load-bearing) and lets each element carry a measure. A habitant is a
   single identity symbol, so `be·le` and `be²` are rejected at
   formation, exactly the `Module` shape.
 
@@ -364,7 +364,7 @@ fn main() : Unit / Stdout = {
 ```
 
 A kind over `Composition` — the public theory `Layout` is built on —
-gets the summed-measure algebra and the atomic-habitant guard:
+gets measure-carrying habitants and the atomic-habitant guard:
 
 ```kaikai
 kind Frame : Composition with frame
@@ -440,9 +440,9 @@ fn main() : Unit / Stdout = Stdout.print("no")
 ## Worked example — a `Waterfall` kind (form c)
 
 `Composition` being public means a user can build the
-*measure-in-the-habitant* shape too — a fintech waterfall where a
-CDO's tranches must sum to 100%, verified in the type. Each habitant
-declares its measure and `Composition` sums it:
+*measure-in-the-habitant* shape too — a fintech waterfall where each
+of a CDO's tranches declares its share. Each habitant declares its
+measure:
 
 ```kaikai
 kind Waterfall : Composition over Int with pct
@@ -454,8 +454,9 @@ pct equity = 10
 fn main() : Unit / Stdout = Stdout.print("ok")
 ```
 
-The surface parses, registers, and validates the measures; the engine
-that *sums* them (the closes-to-100 check) is not wired yet.
+The compiler parses, registers, and validates each measure; it does
+not check that a kind's measures add up to a total (two tranches of
+70 compile).
 
 Because the measure must verify a total exactly, `Composition`
 measures are integer, never float: `0.1 + 0.2 ≠ 0.3` in IEEE-754

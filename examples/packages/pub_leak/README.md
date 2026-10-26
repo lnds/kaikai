@@ -1,4 +1,4 @@
-# pub_leak — negative companion to transitive_privacy (#565 + #2)
+# pub_leak — negative companion to transitive_privacy
 
 A consumer tries to call `leaf.private_value()` (a non-`pub` fn).
 The build **must** be rejected with a diagnostic naming
@@ -14,5 +14,3 @@ Run:
 ```sh
 bin/kai build examples/packages/pub_leak/consumer 2>&1 | grep private_value
 ```
-
-This is the regression guard for the negative case of #565.

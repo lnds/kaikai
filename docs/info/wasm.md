@@ -55,7 +55,7 @@ frames in Chrome.
 (`web.storage`). Events are values: `Dom.listen(node, "click")` asks the host
 to queue them, and `Dom.next_event()` parks the fiber until one arrives.
 
-```text
+```kaikai-fragment
 import web.dom
 import web.run
 
@@ -134,7 +134,7 @@ target stops with "this kai was built without the WebAssembly LLVM target".
 `<param letters>:<return letter>:<path>` as on the C backend, so the same host
 resolves them; they are refused on the native backend for any other target.
 Struct-by-value `extern "C"` parameters are refused on the native backend for
-every target.
+both WebAssembly targets; the C backend takes them.
 
 The runtime bitcode is generated per target (`runtime_llvm.wasm32-wasi.bc`,
 `runtime_llvm.wasm32-browser.bc` and their `runtime_inline` twins) where a wasi-sdk

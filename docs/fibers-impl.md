@@ -303,7 +303,7 @@ m8.x extends the invariant: a `handle { ... }` block must complete
 within the same fiber's body that opened it. Stated negatively: the
 following is rejected at compile time:
 
-```kai
+```text
 spawn {
   handle { ... }   # OK — body opens and closes inside this fiber
 }

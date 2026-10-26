@@ -1,19 +1,21 @@
 # Installing kaikai
 
-`kai` is a single shell-script driver that wraps the bootstrap chain
-(`kaic0` → `kaic1` → `kaic2`) and the active codegen backend. From a
-git checkout:
+`kai` is the driver binary: it runs the compiler (`kaic2`), resolves the
+stdlib and the backend, and drives the `cc` / link step. From a git
+checkout:
 
 ```sh
 git clone https://github.com/lnds/kaikai
 cd kaikai
-make             # builds stage 0, stage 1, stage 2 and bin/kai
+make             # builds kaic1, kaic2 (from the previous release) and bin/kai
 ./bin/kai run examples/minimal/hello.kai
 ```
 
 `bin/kai` is the `kai` binary, built from `tools/kai/` by `make` (and by
 `make kaic2`); after editing `tools/kai/`, `make bin/kai` rebuilds it.
-Stages 0 and 1 only need a C99 `cc`; the user-facing path is stage 2.
+`kaic2` is built by the previous release's compiler, downloaded once per
+release; with only `cc` and no network, `make kaic2 KAIC_BOOT=seed` boots
+from the frozen C seed instead (see `docs/build-system.md`).
 
 ## Backends
 
@@ -59,7 +61,6 @@ export KAI_BACKEND=c
 | `KAI_NATIVE_JOBS`| Threads the native backend optimises and emits module objects on (default: the `-j` of `kai test`, else the CPU count). The objects are identical for any value. |
 | `KAI_GUARD_MEMO`| The memo of `kai test`'s per-file checks, kept in the package's user cache: `0` turns it off, `shadow` also runs every hit and fails the run on any difference (default: on in a package). |
 | `KAI_BIN_MEMO`  | The memo of the binaries `kai build`, `kai test` and `kai run` build, kept in the package's user cache, else the shared core cache; a hit prints the compiler's diagnostics as the build did. `0` turns it off, and a run with `KAI_CORE_CACHE_STATS=1` or `KAI_MODULAR_STATS=1` always compiles (default: on). |
-| `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib core modules. |
 
 ## The native backend and libLLVM
 
@@ -170,7 +171,7 @@ could leave `kai upgrade` pinned to the previous version.
 
 ```sh
 kai --version
-# kaikai 0.79.0 - hanga-roa (stage 2, self-hosted)
+# kaikai <version> - hanga-roa (stage 2, self-hosted)
 
 kai run examples/minimal/hello.kai
 # Hello, kaikai

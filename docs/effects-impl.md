@@ -6,11 +6,9 @@ their defaults; this document (Doc C) pins the *transform and
 runtime* that turn an `effect`-bearing program into machine code
 honouring those semantics.
 
-Scope of v1: enough to make m7a and m7b compile to LLVM IR (and
-the stage-1 C fallback) that run correctly. The actor mailbox
-runtime and the full fiber scheduler are out of scope here — they
-live in `docs/fibers-impl.md` (m8+; not yet written). This
-document forward-references it only to confirm the boundary.
+The actor mailbox runtime and the fiber scheduler are out of scope
+here — they live in `docs/fibers-impl.md`. This document references
+it only to confirm the boundary.
 
 Reading order: Doc A defines the mental model, Doc B defines what
 the stdlib ships, Doc C defines what the compiler emits. If you
@@ -47,21 +45,16 @@ sit in the literature, plus a hybrid worth naming explicitly:
    `Spawn`, `Cancel`, and `Actor[Msg]`. Régime B gives us this for
    free; régime A would require a parallel segmented-stack
    subsystem before m8 can start.
-2. *Multi-shot is uniform with one-shot.* `resume` and
-   `resume_multishot` share the same closure representation; the
-   difference is whether the closure is consumed or RC-bumped.
-   This falls out naturally with Perceus (see §*Interaction with
-   Perceus*).
-3. *Perceus has a published co-design with evidence passing.*
+2. *Perceus has a published co-design with evidence passing.*
    The Perceus paper (Leijen et al.) assumes Koka's evidence
    runtime. Re-deriving the reuse analysis over direct-style
    capabilities would be new research, which is out of scope for
    stage 2.
-4. *Surface-A preserves Doc A's readability.* `Eff.op(x)` stays a
+3. *Surface-A preserves Doc A's readability.* `Eff.op(x)` stays a
    method call, `Eff as log` stays a lexical rebind, `handle ...
    with ...` stays a statement. Nothing in the source gives away
    that the runtime is evidence-based.
-5. *Compile-time cost is bounded.* The CPS transform only rewrites
+4. *Compile-time cost is bounded.* The CPS transform only rewrites
    functions with a non-empty effect row. Pure code — most of the
    stdlib and most user code — is untouched. Principle #3 (fast
    compilation) survives because the pass's radius is the
@@ -216,11 +209,13 @@ surface becomes an *evidence value* in the runtime.
 
 Each `effect` declaration generates two compile-time artifacts:
 
-```kai
+```kaikai
 effect Io {
   print(s: String) : Unit
   read_line() : String
 }
+
+fn main() : Int = 0
 ```
 
 produces:
@@ -263,18 +258,19 @@ struct EvIo {
   closure's `status` byte (§*`resume` representation*), not by
   `handler_id`.
 
-Per-op type generics (Doc B §*Out of scope for v1* amended,
-ships in m7b) are handled in §*Per-op type generics*.
+Per-op type generics are handled in §*Per-op type generics*.
 
 ### Parameterised effects
 
 A parameterised effect declaration like
 
-```kai
+```kaikai
 effect State[T] {
   get() : T
   set(v: T) : Unit
 }
+
+fn main() : Int = 0
 ```
 
 generates a generic evidence type with one extra field per
@@ -340,14 +336,20 @@ clauses* pins how an op call reaches it.
 `Eff as log` binds `log` as a local name for the same evidence
 value that `Eff` denotes at this point:
 
-```kai
-handle { log.print("hi") } with Io as log { ... }
+```kaikai
+effect Io { print(s: String) : Unit }
+
+fn main() : Unit / Stdout =
+  handle { log.print("hi") } with Io as log { print(s, resume) -> { Stdout.print(s); resume(()) } }
 ```
 
 compiles identically to
 
-```kai
-handle { Io.print("hi") } with Io { ... }
+```kaikai
+effect Io { print(s: String) : Unit }
+
+fn main() : Unit / Stdout =
+  handle { Io.print("hi") } with Io { print(s, resume) -> { Stdout.print(s); resume(()) } }
 ```
 
 except that inside the body the identifier `Io` does not resolve
@@ -358,16 +360,19 @@ makes no distinction; rebind is purely a name-binding operation.
 
 Nested handlers of the same effect work by stacking evidence:
 
-```kai
-handle {                    # outer
-  handle {                  # inner
-    Io.print("x")           # uses inner
-  } with Io { ... }
-  Io.print("y")             # uses outer (inner is gone)
-} with Io { ... }
+```kaikai
+effect Io { print(s: String) : Unit }
+
+fn main() : Unit / Stdout =
+  handle {                    # outer
+    handle {                  # inner
+      Io.print("x")           # uses inner
+    } with Io { print(s, resume) -> { Stdout.print("inner #{s}"); resume(()) } }
+    Io.print("y")             # uses outer (inner is gone)
+  } with Io { print(s, resume) -> { Stdout.print("outer #{s}"); resume(()) } }
 ```
 
-"Innermost handler wins" (Doc A §*Out of scope for v1*) splits
+"Innermost handler wins" splits
 across the two phases:
 
 - *Compile-time resolution.* The checker decides which effect
@@ -463,13 +468,13 @@ site.
 
 The split turns
 
-```kai
+```text
 op(x, resume) -> { pre; let r = resume(v); post(r) }
 ```
 
 into, in effect,
 
-```kai
+```text
 op(x, resume) -> { pre; let k = (r) => post(r); $resume_frame(k); resume(v) }
 ```
 
@@ -622,24 +627,6 @@ without that handler.
 
 `kai build --explain` prints a note for each segment handle of the
 root file, with the shape that sent it there.
-
-### Multi-shot case
-
-`resume_multishot(v)` is the same operation except:
-
-1. Before the call, the stack-allocated closure is *promoted* to
-   the heap: `heap_closure = closure_clone(stack_closure)` —
-   one allocation, one copy of the closure environment.
-2. The `status` byte becomes a *counter* that tracks remaining
-   permitted resumptions (unbounded for `resume_multishot`).
-3. Subsequent `resume_multishot(v)` calls use the heap copy
-   directly; Perceus tracks its RC like any other heap value.
-
-The heap promotion is one allocation + one copy of the closure
-environment. It is proportional to the amount of live state at
-the suspension point, which in the multi-shot use cases
-(backtracking, generators) is small. Doc A §*Out of scope for
-v1* already accepts this cost.
 
 ### Static detection of illegal one-shot use
 
@@ -804,14 +791,14 @@ floor, that would be a compiler bug, not a user error.
 Generic functions are monomorphised by `(type_args, row)` instead
 of just `type_args`. `map[A, B, e]` instantiated at
 
-```kai
-map([1,2,3], (x) => x + 1)              # e = {}
-map(["a","b"], (s) => Io.print(s); s)    # e = {Io}
-map(lines, parse_int)                    # e = {Fail}
+```kaikai-fragment
+map([1,2,3], (x) => x + 1)                          # e = {}
+map(["a","b"], (s) => { Stdout.print(s); s })        # e = {Stdout}
+map(lines, parse_int)                                # e = {Fail}
 ```
 
 emits three specialised copies, all in direct style. The copies
-for `e = {Io}` and `e = {Fail}` differ from the pure one in the
+for `e = {Stdout}` and `e = {Fail}` differ from the pure one in the
 evidence their op-call sites read (§*Handler-stack runtime*). The
 row is *not* an extra function parameter; specialisation
 distinguishes the *shape of the body* (which labels the lookup
@@ -877,13 +864,6 @@ frame buffer holds one reference, `kai_resume_frames_run`
 consumes it through `kai_apply`, and an exit that skips the handle
 drops it (§*Non-tail `resume`*).
 
-### Multi-shot, unique owner
-
-`resume_multishot` promotes the closure to the heap. First call:
-heap allocation, environment copy, RC = 1. Subsequent calls:
-if RC stays 1, reuse; otherwise Perceus adds `incref` and a
-fresh copy.
-
 ### Shared `EvE` across handler clauses
 
 All clauses of the same `handle` share the single `EvE` struct
@@ -906,20 +886,17 @@ drop sequence once per effect type.
 
 ### The "second-class handler" invariant
 
-Doc A §*Out of scope for v1* item 7 rules out first-class named
-handlers. Perceus relies on this: an `EvE` value never escapes
-its lexical `handle` scope, so its drop is guaranteed to run at
-the epilogue.
+A named instance (`with Eff as a`) is second-class: it cannot be
+returned, stored, or captured by a closure that outlives its
+`handle` (`docs/effects.md` §*Desugaring sketch*). Perceus relies
+on this: an `EvE` value never escapes its lexical `handle` scope,
+so its drop is guaranteed to run at the epilogue.
 
-The continuation closure is a separate matter: it *can* escape
-when `resume_multishot` promotes it to the heap. But the
-continuation captures values from the *perform site* (locals of
-the function that called `Eff.op`), not
-the `handle`'s frame and not the `EvE`. While the continuation
-is callable, the `handle`'s frame is still alive — the
-continuation cannot outlive its handler because the type
-`(T) -> S / ρ` only makes sense within the handler's dynamic
-extent. No cycle between `EvE` and continuation arises.
+The continuation is a separate matter: a kept continuation
+(`Cont[T, S, e]`) can escape the clause. But the continuation
+captures values from the *perform site* (locals of the function
+that called `Eff.op`), not the `handle`'s frame and not the `EvE`,
+so no cycle between `EvE` and continuation arises.
 
 Régime C does not weaken either invariant.
 
@@ -1001,18 +978,17 @@ handler invocations. The mechanism:
 
 ### Trigger conditions
 
-All four must hold:
+All three must hold:
 
 1. The `var` binding desugars to a canonical `State[T]` handler
    (the one the desugar pass emits — user-written handlers do
    not trigger specialisation).
-2. No clause calls `resume_multishot`.
-3. The captured `state` does not escape into a closure that
+2. The captured `state` does not escape into a closure that
    outlives the `handle`'s body.
-4. The initial value is a normal expression (not itself the
+3. The initial value is a normal expression (not itself the
    result of another op call that could fail).
 
-Conditions 1–3 are compile-time decidable; 4 is a simple
+Conditions 1–2 are compile-time decidable; 3 is a simple
 syntactic check.
 
 ### The specialisation
@@ -1034,10 +1010,8 @@ canonical handler is replaced, once the handler's shape is known.
 ### Why the conditions
 
 1 is for safety: only the shapes we fully understand get
-specialised. 2 is because multi-shot requires a heap-promoted
-closure, which incompatible with a stack slot. 3 is the same
-reason: a closure that outlives the `handle` would have to keep
-the slot alive. 4 is sanity: if `init` can `perform`, the slot's
+specialised. 2 is because a closure that outlives the `handle`
+would have to keep the slot alive. 3 is sanity: if `init` can `perform`, the slot's
 initialisation becomes an op dispatch, which defeats the point.
 
 Specialisation is not a best-effort optimisation — the trigger
@@ -1085,16 +1059,19 @@ gaps remain between the lowered code and what Doc B implies should
 
 ## Per-op type generics
 
-Doc B amended Doc A §*Out of scope for v1* item 3: per-op type
-generics are in scope for m7b. The implementation:
+An effect op may take its own type parameters (`docs/effects.md`
+§*Out of scope* item 3 keeps only row polymorphism at the op out).
+The implementation:
 
 ### At the effect declaration
 
-```kai
+An excerpt of `Mutable` in `stdlib/effects.kai`:
+
+```kaikai-fragment
 effect Mutable {
   array_make[T](n: Int, init: T) : Array[T]
   array_get[T](a: Array[T], i: Int) : T
-  array_set[T](a: Array[T], i: Int, v: T) : Unit
+  array_set[T](a: Array[T], i: Int, v: T) : Array[T]
 }
 ```
 
@@ -1135,7 +1112,7 @@ passes the element size as an implicit arg after monomorphisation.
 
 Per-op generics do *not* compose with row polymorphism at the op
 call site: the op is generic over `T`, not over a row. Doc A
-§*Out of scope for v1* item 3's row-polymorphic clause stays
+§*Out of scope* item 3's row-polymorphic clause stays
 out of scope.
 
 ### Evidence-layout stability
@@ -1340,7 +1317,7 @@ After #2b stabilises:
 
 #### Out of scope for #2
 
-- Row-polymorphic op call sites (Doc A §*Out of scope for v1*
+- Row-polymorphic op call sites (Doc A §*Out of scope*
   item 3, row-polymorphic clause). Stays out per Doc B §`Mutable`
   §*Declaration*.
 - A richer runtime type witness beyond the implicit element-size
@@ -1415,18 +1392,14 @@ reported.
 Runtime diagnostic (static case is caught by the checker with a
 separate message):
 
-```
-runtime error: continuation resumed twice
-  at   src/bar.kai:18:7 (inside `with Search { choose(... , resume) -> ... }`)
-  hint: use `resume_multishot` if you intend to branch.
+```text
+kai: continuation resumed twice (handler #3)
 ```
 
-The runtime resolves the message via the `handler_id` table
-(§*Surface-to-runtime mapping*), which maps each id to both the
-`handle` block's span and a per-op clause-span map. The op
-in-flight at the panic — the one whose continuation was reused
-— picks the clause span. This is the only runtime-specific
-diagnostic; the other two are compile-time.
+The message names the handler by its `handler_id`
+(§*Surface-to-runtime mapping*) and the process exits with status 1.
+This is the only runtime-specific diagnostic; the other two are
+compile-time.
 
 ### Budget
 
@@ -1470,19 +1443,16 @@ Nothing in this section changes the runtime shape defined in
 earlier sections. Fibers extend it with an additional per-fiber
 allocation; effects within a fiber behave as specified above.
 
-## Out of scope for v1
+## Out of scope
 
-- **Multi-shot `resume` by default.** Opt-in via
-  `resume_multishot` (Doc A §*Out of scope for v1*).
+- **Multi-shot `resume`.** Not provided (`docs/effects.md`
+  §*Out of scope*).
 - **Handler inlining of the Effekt fast-path shape.** Régime C
   always goes through evidence; the optimiser can fold trivial
   clauses, but the default path is indirect.
-- **Segmented stacks.** Régime C reifies continuations as heap
-  closures (when promoted) on a normal C stack; the segmented-
-  stack approach used by some Effekt backends is not adopted.
-- **First-class named handlers.** Shipped (§6, #820): the
-  capability is the runtime evidence node, threaded by slot — no
-  heap promotion, second-class by the §6.2 positional rule.
+- **First-class named handlers.** A named instance is the runtime
+  evidence node, threaded by slot — no heap promotion, and
+  second-class (`docs/effects.md` §*Desugaring sketch*).
 - **Cross-fiber evidence sharing.** Each fiber has its own
   vector; there is no global effect registry.
 - **Thread-level parallelism that is not fiber-based.** Stage 2
@@ -1490,14 +1460,10 @@ allocation; effects within a fiber behave as specified above.
 - **Dynamic effect declaration.** All `effect` declarations are
   top-level and closed (Doc A §*Open questions* #6 tentative,
   confirmed here).
-- **Codemod spec for `kai fmt --upgrade-effects`.** Moved to
-  `docs/migrations/m7-effects.md` (TBD). Doc C only specifies
-  what the compiler emits; the codemod is a separate tool.
 - **Actor mailbox layout, lock-free vs mutex, `DropOldest`/
   Perceus interaction.** Belongs to `docs/fibers-impl.md`.
-- **`kai fmt` full formatter spec.** Belongs to
-  `docs/formatter.md` (TBD). Doc C specifies only the desugar
-  order, which the formatter needs as input.
+- **`kai fmt` full formatter spec.** This doc specifies only the
+  desugar order, which the formatter needs as input.
 
 ## Open questions
 
@@ -1619,7 +1585,7 @@ allocation; effects within a fiber behave as specified above.
 ## Milestones m7a and m7b
 <!-- coverage: skip --> historical milestone tracking
 
-Doc B §*Next steps* pre-split m7 into m7a (mechanics) and m7b
+The effects work was pre-split into m7a (mechanics) and m7b
 (ergonomy). Doc C inherits the split and maps implementation
 tasks onto it.
 
@@ -2342,24 +2308,9 @@ handle frame, since a `longjmp` into a returned frame is undefined, and
 leaves the `jmp_buf` size, the status read and the
 store/unwind/`longjmp` step to `stage0/runtime_llvm.c`.
 
-## Next steps
-
-Two documents are unblocked by Doc C:
+## Related docs
+<!-- coverage: skip --> cross-references
 
 - **`docs/fibers-impl.md`** — scheduler, per-fiber state,
   `Spawn` / `Cancel` / `Actor` runtime, mailbox layout, deep-copy
   across fibers, Perceus interaction with cross-fiber messages.
-  Targets m8.
-- **`docs/migrations/m7-effects.md`** — codemod spec for `kai
-  fmt --upgrade-effects` (m7a); second-pass codemod for the m7b
-  sugars. One-time tools; not part of the compiler proper.
-
-A third document is *not* blocked by Doc C but benefits from it:
-
-- **`docs/formatter.md`** — `kai fmt` canonical output spec.
-  Doc C pins the desugar order, which the formatter consumes; the
-  rest (line breaks, spacing, import ordering) is independent.
-
-Implementation of Doc C itself lives in m7a / m7b tasks, each a
-sub-design-doc when it comes up per stage 2 §*Milestones within
-stage 2* convention.

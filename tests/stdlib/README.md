@@ -15,7 +15,7 @@ against a list model, byte boundaries, trimming, concatenation, and
 character-to-string casing consistency. Checks return `Bool` so the
 built-in property harness can report and shrink counterexamples.
 
-The installed 0.119 generators produce printable ASCII `Char`/`String`
+The `check` generators produce printable ASCII `Char`/`String`
 values. Generated integer lists are therefore also mapped through an
 explicit palette spanning all UTF-8 widths, Unicode case exceptions,
 whitespace and scalar boundaries. This samples sequences from that
@@ -38,11 +38,12 @@ make test-core-text KAI_TEST_DRIVER="$(command -v kai)" KAI_TEST_BACKEND=c
 ```
 
 CI runs `make test-core-text` with the repository driver in tier 1,
-shard 3. Mutation remains an opt-in diagnostic, using `kai mutate`.
-The target also invokes `kai check --backend=c`: the property runner in
-0.119 supports C only, independently of the backend selected for `test`.
-Each property runs 100 generated cases with the runtime's reproducible
-seed. Run just the properties with:
+shard 3. The target also runs the regexp, JSON, UTF-8, TOML and
+legacy-crypto suites and `tools/test-core-modules.sh`. Mutation remains
+an opt-in diagnostic, using `kai mutate`. The target runs the properties
+with `kai check --backend=c`, independently of the backend selected for
+`test`. Each property runs 100 generated cases with the runtime's
+reproducible seed. Run just the properties with:
 
 ```sh
 KAI_STDLIB="$PWD/stdlib" kai check --backend=c tests/stdlib/core_text_properties_test.kai
@@ -53,7 +54,7 @@ KAI_STDLIB="$PWD/stdlib" kai check --backend=c tests/stdlib/core_text_properties
 Use a disposable copy so interrupted mutations cannot alter the working
 tree. A differently named hard link lets `kai mutate` typecheck the
 subject as an ordinary entry module: passing a core file as the entry
-directly collides with its auto-loaded names in kai 0.119.0. The oracle
+directly collides with its auto-loaded names. The oracle
 still reads the mutated bytes through the real core module path.
 
 ```sh
@@ -129,7 +130,7 @@ second conditional with an identical zero-start result.
 The native suppression key has no column; never exclude a line/operator
 pair that also contains an observable mutation.
 
-## Validation with kai 0.119.0
+## Validation record (kai 0.119.0)
 
 All 59 assertion tests pass on C and native. All 12 properties pass with
 100 cases each on the C property runner. Restoring the pre-fix Unicode

@@ -1,12 +1,8 @@
 # M:N throughput — kaikai actors vs BEAM processes
 
-Issue #1207 step 5 asks for an in-repo, re-runnable parallel throughput
-benchmark. Until now the 3.6x / 5x-vs-BEAM figures quoted in #1207 and
-#1269 came from external suites that do not live here, so nobody who
-clones the repo — including us — could reproduce them.
-
-This directory is that benchmark: the same workload shape on both
-runtimes, plus a harness that measures wall-clock and prints the table.
+An in-repo, re-runnable parallel throughput benchmark: the same workload
+shape on both runtimes, plus a harness that measures wall-clock and prints
+the table.
 
 ## What it measures
 
@@ -48,16 +44,16 @@ make bench-mn-throughput          # from the repo root
 
 Knobs: `RUNS` (warm runs per cell, default 5), `SCENARIOS`
 (`name:workers:load`, space separated), `KAI_THREAD_LIST`,
-`BEAM_SCHEDS`, `SKIP_BEAM=1`.
+`KAI_BACKENDS` (default `native c`), `BEAM_SCHEDS`, `NOISE_PCT`
+(default 10), `SKIP_BEAM=1`. Without `elixirc` on `PATH` the BEAM
+columns are skipped.
 
 **Reported, never a gate.** Wall-clock on a developer box is noisy;
 a regression should be visible without blocking merges on host noise.
 
 ## Method
 
-The rules below are not decoration — the measurement lane in
-`docs/lane-experience-issue-1258.md` produced three rounds of numbers
-that led nowhere for want of them.
+Without these rules the numbers do not reproduce.
 
 - Serial runs only. Two measured processes on one box change the thing
   being measured.
@@ -73,12 +69,7 @@ that led nowhere for want of them.
 
 ## Results
 
-Measured 2026-07-20 on `d425a904`. It supersedes a 2026-07-19 take on
-`b2a50d4b` whose native table was ~2x slower across the board: that pass ran
-with the P2 runtime bitcode in opt-out and before #1336, and the two together
-put the native backend in a slow path it is no longer in. The environment
-banner now prints the P2 state on every run so a table cannot silently be
-taken that way again.
+A recorded run; re-run `run.sh` before quoting a number.
 
 | | |
 |---|---|
@@ -97,7 +88,7 @@ the newest Elixir: a win there takes no qualifiers.
 
 ### Median wall-clock of the parallel region (ms, lower is better)
 
-`native` is the default backend, so the first table is what a user gets today.
+`native` is the default backend, so the first table is what a user gets.
 
 | scenario | kaikai@1 | @2 | @4 | @8 | @16 | BEAM@default | BEAM@+S1 |
 |---|---|---|---|---|---|---|---|
@@ -124,15 +115,13 @@ compiler, same commit, changes the native column by under a percent
 (`serial` 105.6 vs 106.2 ms, `oversub64@16` 78.6 vs 79.2) — the load is a
 pure arithmetic loop that never calls a runtime op, so there is nothing for
 the runtime inlining to bite on. P2 earns its keep on heap-bound code
-instead (`list_fold` 1.66x, `rbtree_corpus` 3.78x on the same host). The
-native column moved because #1336 fixed the literal-divisor emission this
-loop's `i % 7` depends on; the earlier take confounded the two.
+instead (`list_fold` 1.66x, `rbtree_corpus` 3.78x on the same host).
 
 ### Verdict
 
-**kaikai wins, by less than the folklore said.** The figures quoted in #1207
-and #1269 were ~3.6x serial and ~5x parallel against the BEAM. Reproduced
-in-repo against Elixir 1.20.2 / OTP 29:
+**kaikai wins, by less than the folklore said.** Figures quoted from
+external suites were ~3.6x serial and ~5x parallel against the BEAM.
+Reproduced in-repo against Elixir 1.20.2 / OTP 29:
 
 | claim | measured | holds? |
 |---|---|---|
@@ -149,10 +138,9 @@ single-core speed carried through an equally good scheduler. That is still
 the right thing to claim — native code beats a JIT'd VM per core — but "we
 parallelise better" is not supported by this data.
 
-**The backend no longer picks the winner.** The earlier take had native
-emitting ~2.1x slower code than C on this loop (#1326); with #1336 shipped
-the two backends land within a percent of each other in every cell, so the
-default backend is no longer costing the headline anything here.
+**The backend does not pick the winner.** The two backends land within a
+percent of each other in every cell, so the default backend costs the
+headline nothing here.
 
 What the M:N scheduler itself does well:
 

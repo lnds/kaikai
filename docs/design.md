@@ -45,8 +45,9 @@ The design breaks if any of these is compromised.
      recursion within a module.
    - Compact representations: primitives unboxed inside each fiber,
      heap boxing only for compound immutable values.
-   - Effects compiled with one-shot continuations as the zero-cost
-     default; multi-shot is a runtime property paid only on use.
+   - Effects compiled with one-shot continuations: low cost, not
+     zero — a tail-resumptive operation costs a few nanoseconds more
+     than a direct call. `resume` is one-shot; there is no multi-shot.
 
 3. **Fast compilation**
    - Single-pass parse, LL(1) grammar with minor bookkeeping.
@@ -65,13 +66,15 @@ The design breaks if any of these is compromised.
      internals — runtime, codegen, RC discipline, cache layers,
      typer refactors — without that protection blocking progress.
    - The mechanism is **editions**, geographic Rapa Nui names
-     matching the kaikai naming family (Tongariki today, Hanga Roa
-     21 May 2026, Orongo after). An edition is a snapshot of the
+     matching the kaikai naming family (Tongariki, then Hanga Roa —
+     the current one — then Orongo). An edition is a snapshot of the
      language surface plus the user-facing protocol/stdlib API
      boundaries. Within one edition, breaking changes are
      forbidden. Between editions, breaking changes are allowed
      but require explicit opt-in (the user picks which edition
-     their package compiles against in `kai.toml`).
+     their package compiles against in `kai.toml`). Hanga Roa does
+     not meet this yet: breaking changes still land inside it (see
+     `docs/editions.md` *Current state*).
    - Pre-1.0 we still ship `feat:` / `fix:` rapidly per
      Conventional Commits and PATCH/MINOR bumps. The protection
      lives at the **edition boundary**, not at every minor.
@@ -91,9 +94,10 @@ The design breaks if any of these is compromised.
 5. **Structured compiler output**
    - Every diagnostic and query is emitted as stable JSON alongside
      the human-readable text. Typed holes + `--holes-json` are the
-     prototype for this contract; `kai type --json`, `kai effects
-     --json`, and the counterexample JSON for non-exhaustive matches
-     extend it. See `docs/proposed-extensions.md`.
+     prototype for this contract; `kai typecheck --effects-json`, the
+     `--library-mode` position probes, and the missing-variant notes
+     that `--diags-json` carries for a non-exhaustive match extend
+     it.
    - **Not** "one canonical form per construct". The language has
      intentional redundancies: `=` expression body vs `{ ... }` block
      body, `|>` (apply) vs `|` (map), and three lambda forms
@@ -137,9 +141,9 @@ The design breaks if any of these is compromised.
      either way the loop closes.
    - The mechanism: shift weight from *the model knowing kaikai*
      to *the compiler telling the model what goes where*. Typed
-     holes surface expected types and candidates; `kai type --json`
-     answers position queries; counterexample JSON tells the model
-     which patterns it missed.
+     holes surface expected types and candidates; `--library-mode`
+     answers position queries; `--diags-json` tells the model which
+     variants a match missed.
    - Acceptance criterion: an LLM with access to the JSON surface
      can complete the top 80% of typical functions a programmer
      would ask it to write, within one round of compilation. If
@@ -184,38 +188,38 @@ arguments:
   - `Cancel` is its own effect, delivered cooperatively at yield points.
 - **Memory model**: hybrid.
   - **Perceus** (compile-time optimized reference counting, Koka-style) within each fiber.
-  - **Isolated fibers** BEAM-style: private heap per fiber, messages copied across boundaries.
-  - Goal: compile-time memory-lifetime decisions without a visible borrow checker, predictable latencies via fiber-local GC.
+  - **Isolated fibers** BEAM-style in discipline: fibers share no mutable state. Allocation comes from per-thread slabs and pools, which the fibers running on one scheduler thread share; a value that crosses threads — a message, a spawned thunk, an awaited result — is deep-copied when more than one scheduler thread runs (with one thread, a send passes the reference).
+  - Goal: compile-time memory-lifetime decisions without a visible borrow checker and without a tracing GC.
   - **Opaque mutable `Array[T]` behind `Mutable`** (issue #251 + #252, 2026-05). `array_make / length / get / set / grow` are builtins; the typer routes writes (`array_set`, `array_grow`, the `a[i] := v` sugar) through the `Mutable` effect on the **observable-effects** discipline (Koka-style): a write requires `Mutable` if and only if the target Array escapes the function (parameter, capture, global, record field). Writes to a locally-constructed Array that never crosses a function-call boundary are *masked* — the row stays clean from the caller's POV. Reads (`array_get`, `array_length`) never raise `Mutable` regardless of provenance. This collapses the prior "audited escape" debt into the standard row discipline: every observable mutation is in the row, every truly-local one is invisible. See `docs/effects-stdlib.md` §`Mutable` for the full spec, four worked examples, and the escape rule for locals passed to helpers.
 - **Formal effects model**: capability-passing **Effekt + inference**.
   - Effects as an explicit set of capabilities, passed implicitly by the compiler.
-  - **Effect inference in local bodies**: the user does not annotate sets in private functions; the compiler infers them.
-  - **Mandatory annotation on public signatures** (module exports, APIs): effects are part of the contract.
+  - **Effect inference in local bodies**: lambdas and local bindings get their rows inferred.
+  - **Every top-level function declares its row**, private or `pub`: a signature with no `/ row` performs no effects, and calling an effectful function from it is an error. Only the entry `main` may omit it.
   - Fits LLVM (CPS over segmented stacks) and the LLM-friendly / easy-to-learn principles.
 - **Core tooling**: single `kai` binary with subcommands (Go/Rust/Zig style).
   - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`, `kai bench`, `kai check`.
-  - **Shipped (Hanga Roa)**: `kai lsp` (Language Server Protocol — universal editor support; v1 → v3 via issue #447, v0.75.0 → v0.79.0), `kai init` / `kai add` / `kai fetch` / `kai install` / `kai update` / `kai show` (package manager v1, issue #405).
-  - Long-term: `kai new` (project scaffolding), `kai doc`, registry abstraction.
+  - Also shipped: `kai typecheck`, `kai lint`, `kai migrate`, `kai mutate`, `kai watch`, `kai info`, `kai doc`, `kai lsp` (Language Server Protocol), `kai upgrade`, and the package commands `kai init` / `kai add` / `kai fetch` / `kai install` / `kai update` / `kai show`. `kai help` lists them all.
+  - Long-term: a package registry.
   - **Out of scope (permanently)**: `kai repl`. Removed from v1.0 per #406 and not planned for v1.x or v2. See `docs/decisions/repl-removal-2026-05-09.md` for the rationale. The `kai run` + `kai watch` workflow replaces the REPL use case.
   - Motivation: LLM-friendly (predictable commands, LSP provides immediate feedback), zero ecosystem fragmentation, trivial install.
 - **FFI / Interop**: crossing to C is expressed as the **`Ffi` effect capability**.
   - Declarations use `extern "C" fn name(args) : T`.
   - Calling a C function is an operation of the `Ffi` effect (appears in the type of every function that uses it).
   - Incoming FFI (kaikai as a C library): minimal subset in MVP — exportable pure functions, initializable runtime.
-  - Binding generator (`kai bindgen foo.h`): post-MVP.
+  - Binding generator: not implemented.
   - WASM as a target: in progress through the C backend, browser first; plan and decisions in `docs/wasm-target-plan.md`.
   - Motivation: consistency with the effects system, type-level safety (pure code cannot accidentally call C).
 - **Distribution and bootstrapping**: 3 stages, portable bootstrap from C.
   - **Stage 0** (in C, ~5–10K lines, no dependencies): compiles an austere subset **kaikai-minimal** → **portable C**. Any machine with `cc` can build kaikai from scratch.
-  - **Stage 1** (in kaikai-minimal, compiled by stage 0): compiles full kaikai (effects + inference + Perceus) → emits C or textual LLVM IR.
-  - **Stage 2** (in full kaikai, compiled by stage 1): definitive compiler with direct LLVM, optimizations, Perceus, fiber scheduler. Self-hosted.
-  - **Verification**: stage 2 compiled by itself must be deterministic — running `kaic2b` twice on `stage2/compiler.kai` produces byte-identical C output (`kaic2b.c == kaic2c.c`). Stage 1's output (`kaic2a.c`) is **not** required to match stage 2's; the two compilers are structurally distinct (stage 1 has no typer) and may legitimately emit different code from the same source. The functional contract — that `kaic2a` produces a `kaic2b` that passes tier1 — is enforced by tier1, not by structural equivalence. See `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md` for the rationale.
+  - **Stage 1** (in kaikai-minimal, compiled by stage 0): frozen; it compiles kaikai-minimal and no longer has to compile stage 2.
+  - **Stage 2** (in full kaikai): the definitive compiler — direct LLVM and C backends, Perceus, fiber scheduler. Self-hosted, and built by the previous release (`KAIC_BOOT`, default `release`); from a bare `cc`, `make kaic2 KAIC_BOOT=seed` boots from the frozen C seed a release pins. See `docs/build-system.md`.
+  - **Verification**: stage 2 compiled by itself must be deterministic — `make selfhost` compiles the compiler with `kaic2` (`kaic2b.c`), builds `kaic2b` from that C, and requires `kaic2b` to emit the same C again (`kaic2b.c == kaic2c.c`). `make kaic-boot-verify` checks that different boots converge on the same C.
   - **Final format**: single static binary with embedded runtime.
   - **MVP targets**: Linux x86_64, macOS arm64. Linux arm64, macOS x86_64, Windows post-MVP.
 - **Tests as first-class**: **builtin** syntax, recognized by the compiler.
   - MVP: `test "description" { ... }` + `assert cond, "msg"?` + `kai test [pattern]` runner.
   - Tests are automatically excluded from production builds.
-  - Post-MVP: property testing (`check ... with a: Int`), benchmarks (`bench`), snapshots, fuzzing, doctests.
+  - Also shipped: property checks (`check "..." with a: Int { }`, run by `kai check`) and benchmarks (`bench "..." { }`, run by `kai bench`); see `kai info testing`. Snapshots, fuzzing and doctests are not implemented.
   - Motivation: single canonical form, integration with `kai test`, LLM-friendly (LLMs write tests without picking frameworks).
 - **Typed holes** (stage 2): `?` and `?name` are first-class expressions/patterns. At check time the compiler reports the expected type, bindings in scope, and synthesis candidates, both as human-readable text and as JSON (`kai build --holes-json`). Unfilled holes don't break the build — they become a runtime panic — so partial programs run. Designed as the integration point for LLM-assisted editing. Full rationale and syntax in `docs/typed-holes.md`.
 - **Structured concurrency** (stage 2): every fiber lives inside a lexical scope (`nursery`) that waits for its children and propagates cancellation. `spawn` / `await` / `select` are operations of a `Spawn` effect, not built-in primitives; the nursery is literally a handler for that effect. `Fiber[T]` is a region-branded handle (same brand machinery as `Pid[Msg]` from actors) that cannot escape its scope. Cancellation is an effect (`Cancel`) that fibers can handle for cleanup. Full rationale, syntax, and patterns in `docs/structured-concurrency.md`; the actor surface (mailbox, supervision, `Pid[Msg]`) lives in `docs/actors.md`.
@@ -229,10 +233,12 @@ arguments:
   6. a function of a core module (`list.max`, `complex.add`);
   7. any other module that exports the name.
 
-  A **call** carries its arity — the piped value counts (`x |> f(a)` calls `f` with two arguments), and so does the receiver of a method call — and a rung whose binding has another arity is passed over, never chosen: beside a user `fn min(xs)`, `min(1, 2)` reaches `Ord.min`, while `min([3])` reaches the user's function. Passing over a binding the user wrote (a local, the own file, an import) earns a warning that names both; the core's own homonyms of different arity (`list.max/1` beside `Ord.max/2`) coexist silently. Two declarations of one name and arity on the same rung are contested: a call lets its argument types settle the contest (`length("ab")` is `string.length`), a function value cannot (`let f = length` is an error; qualify it). When no rung fits the arity, the call reports its arity error against the nearest binding. **Escape hatches**: qualify the name (`list.max(xs)`, `m.f(x)`), or use the method form (`x.min(y)`), which reaches a protocol operation when no binding nearer than the protocol rung fits.
+  A **call** carries its arity — the piped value counts (`x |> f(a)` calls `f` with two arguments) — and a rung whose binding has another arity is passed over, never chosen: beside a user `fn min(xs)`, `min(1, 2)` reaches `Ord.min`, while `min([3])` reaches the user's function. Passing over a binding the user wrote (a local, the own file, an import) earns a warning that names both; the core's own homonyms of different arity (`list.max/1` beside `Ord.max/2`) coexist silently. Two declarations of one name and arity on the same rung are contested: a call lets its argument types settle the contest (`length("ab")` is `string.length`), a function value cannot (`let f = length` is an error; qualify it). When no rung fits the arity, the call reports its arity error against the nearest binding. **Escape hatch**: qualify the name (`list.max(xs)`, `m.f(x)`).
 - **Pipe operators**: kaikai ships five pipes, each with a clear intent — `|>` (apply pipe: `x |> f(args)` ≡ `f(x, args)`, no dispatch), `|` (map pipe), `||` (flat-map pipe), `|?` (filter pipe), and `|!` (each pipe: runs a stage for its effect, returns `Unit`). The four latter operators **dispatch by convention** against the LHS's head type (#594): any package that declares `pub type T` and exports `pub fn map / flat_map / filter / each` with the canonical signatures (`(T[A], (A) -> B / e) -> T[B] / e` and friends) participates automatically — no annotation, no protocol, no compiler change required. Dispatch resolution uses a per-compile head-owner cache built once from the post-`expand_imports` decl stream + module table; lookup at each call site is `O(1)` over the small cache list. Diagnostic surface and rationale (why protocols cannot express HKT/effect-row ops) live in `docs/protocols.md` §"Pipe operators are convention-based".
 
 ## MVP scope
+
+The sections from here to *Roadmap* record the original bootstrap plan. Stage 1 is now frozen, stage 2 is built by the previous release, and the bootstrap from a bare `cc` is `make kaic2 KAIC_BOOT=seed` (see `docs/build-system.md`).
 
 **Medium MVP**: stage 0 working + stage 1 compiling a significant subset of full kaikai.
 
@@ -372,18 +378,13 @@ was first pinned; many items below have since shipped — see
 - Package manager (`kai new`, `kai add`).
 - Final syntax consolidation.
 
-## End-to-end MVP verification
+## End-to-end verification from `cc`
 
 A user on Linux x86_64 or macOS arm64 with only `cc` installed must be able to:
 
 ```sh
-git clone github.com/lnds/kaikai
+git clone https://github.com/lnds/kaikai
 cd kaikai
-cc stage0/*.c -o kaic0
-./kaic0 stage1/compiler.kai > stage1.c && cc stage1.c -o kaic1
-./kaic1 demos/fizzbuzz.kai -o fizzbuzz
-./fizzbuzz   # expected output: fizzbuzz for 0..100
-./kaic1 test tests/   # builtin tests pass
+make kaic2 KAIC_BOOT=seed            # boots from the frozen C seed
+./bin/kai run demos/fizzbuzz/main.kai
 ```
-
-If this works, the medium MVP is fulfilled.

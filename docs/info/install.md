@@ -119,7 +119,7 @@ downloading a URL that does not exist; build from source (see the
 README) meanwhile. The Homebrew formula is macOS-only.
 
 A Linux tarball needs the glibc and libstdc++ of the distribution it was
-built on, or newer: glibc 2.38 and a libstdc++ providing
-`GLIBCXX_3.4.30`. It records them in `share/kaikai/REQUIRES`. On an
+built on, or newer, and records the versions in
+`share/kaikai/REQUIRES`. On an
 older system the installer and `kai upgrade` stop before replacing
 anything and name what the release needs and what the system has.

@@ -29,7 +29,7 @@ on.
 |----------------------------------------|----------|-------------------------|
 | `kai type <pos> --json`                | proposed | stage-2 type checker    |
 | Counterexample JSON for exhaustiveness | proposed | match exhaustiveness    |
-| `kai lint --json` — canonical-form rules | proposed | canonical style guide   |
+| `kai lint --json` — canonical-form rules | landed (`kai info lint`) | canonical style guide   |
 
 ### Language-surface family (pending)
 
@@ -37,7 +37,7 @@ on.
 |--------------------------------------------|----------|-------------------------|
 | Sum types with constant attributes         | proposed | parser + resolution     |
 | `?.` optional chaining                     | proposed | parser + type checker   |
-| Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
+| Slice syntax `a[i..j]`                     | landed on `Vec[T]` (`kai info vec`) | `Vector[T]` landing     |
 | `Range[T]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
 
@@ -95,6 +95,9 @@ plus a schema.
 
 ## 3. `kai lint --json` — canonical style as data
 
+Landed as `kai lint` (see `kai info lint`); its JSON findings are
+`{file, line, col, rule, severity, message}`. The proposed shape was:
+
 ```json
 [
   {
@@ -119,7 +122,9 @@ not technical).
 
 ## 4. Sum types with constant attributes
 
-```kai
+Proposed form (not implemented):
+
+```text
 type Rank with { value: Int, label: String } {
   Two   = { value: 2,  label: "2" }
   Three = { value: 3,  label: "3" }
@@ -210,7 +215,10 @@ addition to emit the projection functions.
 
 ## 5. `?.` optional chaining
 
-```kai
+Proposed form (not implemented; kaikai has `??` for a default and
+postfix `!` for propagation):
+
+```text
 # user: Option[User]; u.profile: Option[Profile]; p.display_name: String
 let name: Option[String] = user?.profile?.display_name
 ```
@@ -267,7 +275,11 @@ pass (to nested `opt_and_then`).
 
 ## 6. Slice syntax `a[i..j]`
 
-```kai
+Proposed form; kaikai today slices a `Vec[T]` with an inclusive
+`v[a..b]` view (`kai info vec`), and lists and arrays have no slice
+syntax:
+
+```text
 let prefix = xs[0..5]        # first five elements
 let suffix = xs[10..]        # from index 10 to end
 let mid    = xs[i..j]        # half-open interval
@@ -318,7 +330,10 @@ confirmed in the grammar.
 
 ## 7. `Range[T]` as a first-class iterable
 
-```kai
+Proposed form (not implemented; kaikai has `[1..n]` lists and lazy
+`lazy [1..]` sequences, `kai info seq`):
+
+```text
 # Today (only as list literal):
 each([1..4]) { i -> ... }
 
@@ -373,7 +388,9 @@ parser. Coupled with the iterable-abstraction question.
 
 ## 8. Binary pattern matching `<<...>>`
 
-```kai
+Proposed form (not implemented):
+
+```text
 # parse a length-prefixed packet
 match buf {
   <<0xFE, version: 8, length: 16, payload: length / binary, rest: binary>> ->

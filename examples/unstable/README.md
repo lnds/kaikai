@@ -1,21 +1,20 @@
 # examples/unstable
 
-Fixtures exercising the `#unstable` annotation + `[unstable]`
-opt-in workflow (issue #602, first lane of the Hanga Roa edition).
+Fixtures exercising the `#[unstable]` attribute and the `[unstable]`
+opt-in in `kai.toml`.
 
 ## Workflow
 
 A library author marks a `pub fn / pub type / pub const` with
-`#unstable` to indicate the API is **not** covered by the edition
-stability contract. A consumer importing that declaration must
-acknowledge the risk by adding `<pkg> = true` under `[unstable]`
+`#[unstable]` to indicate the API is **not** covered by the edition
+stability contract. A consumer importing that declaration
+acknowledges the risk by adding `<pkg> = true` under `[unstable]`
 in their own `kai.toml`. The compiler emits a warning at every
-qualified call to an unacknowledged `#unstable` export; the build
+qualified call to an unacknowledged `#[unstable]` export; the build
 still succeeds.
 
-Each subdirectory has its own `kai.toml`, a `mylib/` (or similar)
-holding the marked declarations, and `main.kai` consuming them.
-Run with `bin/kai run <dir>/main.kai`.
+Each subdirectory has a `main.kai`, usually a `kai.toml`, and a module
+holding the marked declarations. Run with `bin/kai run <dir>/main.kai`.
 
 ## Fixtures
 
@@ -25,25 +24,27 @@ Run with `bin/kai run <dir>/main.kai`.
 
 - **`pub_fn_no_optin/`** — no `[unstable]` section in
   `kai.toml`. `main.kai` calls `mylib.experimental(...)`; the
-  compiler emits a warning anchored at the call site. Expected
-  stderr contains `mylib.experimental is #unstable`. Program
-  still runs and prints `42`.
+  compiler emits a warning anchored at the call site
+  (`mylib.experimental is #[unstable] — ...`). The program still
+  runs and prints `42`.
 
-- **`pub_type/`** — `#unstable pub type T = ...` plus a `pub fn`
-  that returns it. `kai.toml` opts in. Expected output: `7`.
+- **`pub_type/`** — `#[unstable] pub type Box` plus an
+  `#[unstable] pub fn` that reads it. `kai.toml` opts in. Expected
+  output: `7`.
 
-- **`multi_unstable_pub_decls/`** — three `#unstable` decls
-  (fn, type, const) in one module. `kai.toml` does NOT opt in;
-  warnings appear for each consumed unstable export.
+- **`multi_unstable_pub_decls/`** — two `#[unstable]` functions and a
+  stable one in one module. Nothing opts in; a warning appears for
+  each consumed unstable export. Expected output: `103`.
 
-- **`non_pub_ignored/`** — `#unstable fn` on a NON-`pub`
-  declaration is a parse error (annotation only applies to pub
-  surface). The fixture documents the negative behaviour.
+- **`non_pub_ignored/`** — `#[unstable]` on a non-`pub` declaration
+  is rejected: `` `#[unstable]` must precede a `pub fn`, `pub type`,
+  or `pub const` declaration``.
 
 - **`unknown_pkg_optin/`** — `[unstable] zzz = true` for a
   package that the program never imports. The compiler does
   not validate the opt-in target; the entry is benign and
   the program runs normally.
 
-See `docs/editions.md` for the surrounding edition-stability
-contract and `docs/protocols.md` for the annotation grammar.
+The corpus parity sweep (`tools/lib/corpus.sh`) builds every fixture
+here. See `docs/editions.md` for the edition-stability contract and
+`docs/protocols.md` for the attribute.

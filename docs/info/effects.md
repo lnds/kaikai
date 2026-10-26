@@ -172,10 +172,11 @@ module's `main` gets no default installed and takes each effect from
 its caller, like any function.
 
 `$extern_handler("c_symbol")` is the compiler intrinsic that bridges
-a default clause to a runtime C entry — the only form codegen
-currently accepts inside `default { }`. Kaikai-bodied default
-clauses parse and store but their codegen path is deferred (Stage C
-of issue #533).
+a default clause to a runtime C entry, and the only clause `main`
+installs. A default clause with a kaikai body parses, but nothing
+installs it: a `main` that performs the op with no enclosing handler
+is rejected with `` `main` declares effect `Eff` but no default
+handler is installed for it``.
 
 Coverage rules (typer):
 
@@ -189,18 +190,17 @@ Coverage rules (typer):
 2. **At `main`, no enclosing `handle`** — the `default { }` block's
    clause fires; the auto-installed handler runs `$extern_handler`.
 3. **Partial handle + missing op in default** — typer rejects with
-   `effect not handled: Eff.op`. Merging defaults *into* a partial
-   handle is Stage C work; today, list the op explicitly in the
-   `handle` or let it fall through to the default at `main`.
+   `effect not handled: Eff.op`. Defaults are not merged into a
+   partial handle: list the op explicitly in the `handle`, or let it
+   fall through to the default at `main`.
 
-For builtin effects, the 18 canonical handlers (Stdout, Stderr,
-Stdin, Env, File, Clock, Random, SecureRandom, NetTcp, Signal,
-Process, Log, Mutable, Cancel, Link, Monitor, Spawn) ship
-default installation paths in the runtime — `Log` is one of them
-and its default writes to stderr in ISO-8601 form without a literal
-`default { }` block in `stdlib/log.kai`. The full catalog lives in
-`docs/effects-stdlib.md`; the runtime implementation rationale and
-the Stage A/B/C trilogy live in `docs/effects.md`.
+The stdlib effects carry their defaults the same way, as
+`$extern_handler` clauses on the declaration: Stdout, Stderr, Stdin,
+Env, File, Clock, Random, SecureRandom, NetTcp, NetUdp, NetUnix,
+NetDns, Signal, Process, Log, Mutable, Cancel, Link, Monitor and
+Spawn. `Log`'s default writes each call to stderr with an ISO-8601
+timestamp. The full catalog lives in `docs/effects-stdlib.md`; the
+runtime implementation rationale lives in `docs/effects.md`.
 
 ## Targets — effects a browser `main` cannot perform
 
@@ -210,7 +210,7 @@ final row holds `Signal`, `NetTcp`, `NetUdp`, `NetUnix`,
 `NetDns`, `File` or `Stdin`
 is refused at compile time:
 
-```
+```text
 error: `main` performs effect `Signal`, which the `wasm32-browser` target cannot run
 ```
 
@@ -229,7 +229,7 @@ WASI calls. A `main` whose final row holds `Spawn`, `Cancel`, `Link`,
 `Monitor`, `Actor`, `Signal`, `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` or `Js`
 is refused at compile time:
 
-```
+```text
 error: `main` performs effect `Spawn`, which the `wasm32-wasi` target cannot run
   = help: fibers are not available on wasm32-wasi; ...
 ```
@@ -267,9 +267,11 @@ it reaches its cell without going through either name.
 ## Rebinding the capability name
 
 When two handlers of the same effect nest, use `as`. The rebinding
-introduces a local capability under the chosen name; the original
-effect name remains usable inside the handle body. Convention is to
-prefer the local binding for clarity.
+introduces a local capability under the chosen name, and the body
+performs the op through that name: inside the handle body the bare
+effect name does not reach this handler (`Logger.log(...)` there is
+`effect not handled: Logger` unless another `Logger` handler encloses
+it).
 
 ```kaikai
 effect Logger {
@@ -524,26 +526,36 @@ producer may perform other effects too: they are the `e` of `Gen[t, e]`.
 
 ## Stdlib effects
 
-Stdin, Stdout, Stderr, File, Env, Console, Clock, Random,
-SecureRandom, NetTcp, Process, Spawn, Cancel, Actor[Msg],
-Signal, Mutable, State, Reader, Writer, Log, Link,
-Monitor, Ffi.
+Stdin, Stdout, Stderr, File, Env, Clock (`import time`), Random,
+SecureRandom, NetTcp, NetUdp, NetUnix, NetDns (`kai info net`),
+Process, Spawn, Cancel, Actor[Msg], Signal, Mutable, State, Reader,
+Writer, Log, Link, Monitor, Ffi. Two row aliases name common sums:
+`Console` is `Stdout + Stderr + Stdin`, and `Io` is
+`Console + Env + File`.
 
-Full catalog: `docs/effects-stdlib.md`. The main effect at the
-program entry installs Stdin/Stdout/Stderr/Env/File automatically
-when inferred. NetUdp / NetDns are reserved as part of the planned
-`Net` aggregate but are not shipped in v1 — `NetTcp` is the only
-network effect available today.
+Full catalog: `docs/effects-stdlib.md`. `main` installs the default
+handler of every stdlib effect its row names (see *Default handlers*
+above).
 
 An effect you declare or import with a stdlib effect's name shadows it
 for bare uses in that file; the stdlib one stays reachable qualified:
 
-```kai
+```kaikai
 effect Log { note(n: Int) : Unit }
 
 fn report() : Unit / Log + effects.Log = {
   Log.note(1)                  # this file's Log
   effects.Log.info("done")     # the stdlib Log
+}
+
+fn main() : Unit / Stdout = {
+  handle {
+    handle { report() } with Log {
+      note(n, resume) -> { println("note #{n}"); resume(()) }
+    }
+  } with effects.Log {
+    info(m, resume) -> { println(m); resume(()) }
+  }
 }
 ```
 

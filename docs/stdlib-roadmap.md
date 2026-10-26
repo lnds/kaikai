@@ -47,23 +47,33 @@ products depend directly on stdlib reaching parity:
 
 Both products are post-MVP. Stdlib gaps are what gates them.
 
-## Current inventory (refreshed 2026-05-08)
+## Current inventory
 
 What ships in `stdlib/` today:
 
-```
-core/   list.kai string.kai option.kai result.kai char.kai tuple.kai io.kai
-collections/  map.kai hashmap.kai set.kai hashset.kai stack.kai queue.kai vec.kai
-math/  int.kai real.kai numeric.kai bits.kai complex.kai
-crypto/  hash.kai mac.kai legacy.kai
-encoding/  json.kai json_bind.kai json_lex.kai utf8.kai toml.kai toml_lex.kai toml_tree.kai base64.kai hex.kai
-fs/  file.kai dir.kai path.kai
-net/  tcp.kai http.kai
-os/  args.kai env.kai
-top-level: actor.kai array.kai date.kai decimal.kai effects.kai
-           gen.kai log.kai loop.kai money.kai path.kai protocols.kai
-           random.kai random_secure.kai reader.kai regexp.kai regexp/syntax.kai regexp/engine.kai
-           seq.kai spawn.kai time.kai trace.kai uuid.kai writer.kai
+```text
+core/         char.kai char_unicode.kai io.kai kinds.kai list.kai option.kai
+              result.kai runtime.kai string.kai tuple.kai
+collections/  convert.kai hashmap.kai hashset.kai map.kai queue.kai set.kai
+              stack.kai vec.kai
+math/         bigint.kai (+ bigint_* helpers) bits.kai complex.kai int.kai
+              linalg.kai numeric.kai real.kai
+crypto/       hash.kai legacy.kai mac.kai
+encoding/     base64.kai hex.kai json.kai json_bind.kai json_lex.kai toml.kai
+              toml_lex.kai toml_tree.kai utf8.kai
+fs/           dir.kai file.kai path.kai
+net/          dns.kai http.kai tcp.kai udp.kai unix.kai url.kai
+os/           args.kai env.kai process.kai
+date/         rfc3339.kai
+effects/      concurrent.kai os.kai
+regexp/       engine.kai syntax.kai
+text/         format_spec.kai
+web/          dom.kai fetch.kai run.kai storage.kai timer.kai wait.kai
+top-level:    actor.kai array.kai bin.kai date.kai decimal.kai decimal_big.kai
+              effects.kai ffi.kai gen.kai log.kai loop.kai money.kai path.kai
+              protocols.kai random.kai random_secure.kai rational.kai
+              reader.kai regexp.kai seq.kai spawn.kai stream.kai
+              string_builder.kai text.kai time.kai trace.kai uuid.kai writer.kai
 ```
 
 What landed since the previous snapshot (2026-05-02 → 2026-05-08):
@@ -107,8 +117,8 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `core/string` search family             | shipped via PR #3152: `string.contains(s, needle) : Bool`, `string.count(s, needle) : Int` (non-overlapping), `string.last_index_of(s, needle) : Option[Int]` (byte offset, pairs with `byte_slice`), `string.char_last_index_of(s, needle) : Option[Int]` (codepoint index, pairs with `slice`), `string.split_once(s, sep) : Option[(String, String)]`. Empty needle follows `index_of(s, "") == Some(0)`: `last_index_of` is `Some(length(s))`, `char_last_index_of` is `Some(char_count(s))`, `count` is `char_count(s) + 1`, `split_once` is `Some(("", s))`. Tests in `tests/stdlib/string_test.kai` |
 | `array` bridge module                   | shipped (closes #366): top-level `stdlib/array.kai` with `array.from`, `array.to_list`, `array.copy` (sentinel-free since #1015 L1 — `from`/`copy` seed from the input, empty routes through the `array_empty` prim). `random.shuffle` flipped from O(n²) selection-sampling to O(n) in-place Fisher-Yates over a locally-built `Array[T]`; observable row stays `[T] -> [T] / Random` (masking pass drops the inner `Mutable`) |
 | `decimal` div-by-zero hardening         | shipped (closes #363): `dec_div` returns `Option[Decimal]` (`None` on zero divisor) instead of silent `dec_zero`. **Breaking** — direct callers must `match` the result. |
-| `collections/hashmap` mutable hash table | shipped (closes #374; #375 HashSet built on it): `stdlib/collections/hashmap.kai` — a **mutable** separately-chained hash table behind the `Mutable` effect. `HashMap[k, v] = { buckets: Ref[Array[[Pair]]], count: Ref[Int], cap: Ref[Int] }`; resize doubles at load factor 0.75. 12 pub fns with short module-relative names (`hashmap.put`/`get`/`empty`/…, same convention as `map`/`set` — no `hashmap_*` aliases), but **signatures diverge from the issue's PURE shapes** — `put`/`remove` mutate in place and return `Unit`, every op carries `/ Mutable`. **Carrier redesign mid-lane:** the issue body specified a pure HAMT; it was implemented, benchmarked ~1.6–2.3× SLOWER than the AVL `Map` (a persistent trie pays alloc + rebuild per `put` and a list-indexed walk per `get` level), and replaced with the mutable table on the user's call. The mutable table is ~2–3× FASTER than `Map` on build + lookup at N≥10K (`benchmarks/hashmap/`). Iteration order unspecified (bucket-derived) but deterministic per insertion sequence. Keys need `impl Hash` + `==`; primitives + user sum types dispatch through the generic boundary, user records do not yet (pre-existing compiler dispatch gap, same class as the AVL `Map`'s `<`). `m[key]` read sugar dispatches to `hashmap.get` (returns `Option[v]` / `Mutable`) via the typer's `synth_index` — the same one-arm mechanism `Map` uses; selfhost stays byte-identical (additive arm). No HashDoS mitigation in v1. Fixtures `examples/stdlib/hashmap_basic.kai` (10K + 100K round-trip, iteration stability, in-place mutation) and `hashmap_collision.kai` (forced one-bucket chain via a constant-hash sum-type key). NOTE: `kai bench` segfaults on any `/ Mutable` block body (pre-existing bench/effect bug) — the benchmark times via `Clock` instead. Selfhost byte-identical (additive). |
-| `collections/hashset` mutable hash set | shipped (PR #757, closes #375): `stdlib/collections/hashset.kai` — a **mutable** hash set, a thin wrapper over the sibling `HashMap[t, Unit]` (each member is a key whose stored value is the single `Unit` value `()`). `HashSet[t] = { inner: HashMap[t, Unit] }`; every op delegates to `collections.hashmap`, inheriting its performance, mutation model, and effect discipline wholesale — the O(1)-average set, sibling to `HashMap` exactly as the pure `Set` (AVL-backed since #936) is the sibling of the AVL `Map`. 12 pub fns with short module-relative names (`hashset.add`/`remove`/`contains`/`union`/…, same convention as `hashmap`/`set` — no `hashset_*` aliases): `empty`, `size`, `is_empty`, `contains`, `add`, `remove`, `to_list`, `from`, `union`, `intersection`, `difference`, `is_subset`. **Mutating, not persistent** — `add`/`remove` mutate in place and return `Unit`, every op carries `/ Mutable`; the set-algebra ops (`union`/`intersection`/`difference`) build and return a FRESH set, leaving both arguments untouched. **The issue #375 body is STALE:** it assumed a *persistent* HashMap and a `Hashable` protocol, neither of which shipped — HashMap landed mutable (the pure HAMT benchmarked ~2× slower than the AVL `Map`) and the hashing protocol is `Hash`, not `Hashable`. This module mirrors the as-shipped mutable HashMap accordingly (do not restore the issue's persistent signatures). Elements need `impl Hash` + `==`; primitives + user sum types dispatch through the generic boundary, user records do not yet (HashMap's compiler dispatch gap, inherited verbatim — lift a record element to a primitive id field). Iteration order unspecified (bucket-derived). Fixtures `examples/stdlib/hashset_basic.kai` (Int + String round-trip, 100K resize, in-place mutation, `from` dedup) and `hashset_ops.kai` (union/intersection/difference/is_subset on small Int sets with known results, args-unchanged checks). Selfhost byte-identical (additive — pure stdlib, no compiler change); C + LLVM parity verified. |
+| `collections/hashmap` mutable hash table | shipped (closes #374; #375 HashSet built on it): `stdlib/collections/hashmap.kai` — a **mutable** separately-chained hash table behind the `Mutable` effect. `HashMap[k, v] = { buckets: Ref[Array[[Pair]]], count: Ref[Int], cap: Ref[Int] }`; resize doubles at load factor 0.75. 12 pub fns with short module-relative names (`hashmap.put`/`get`/`empty`/…, same convention as `map`/`set` — no `hashmap_*` aliases), but **signatures diverge from the issue's PURE shapes** — `put`/`remove` mutate in place and return `Unit`, every op carries `/ Mutable`. **Carrier redesign mid-lane:** the issue body specified a pure HAMT; it was implemented, benchmarked ~1.6–2.3× SLOWER than the AVL `Map` (a persistent trie pays alloc + rebuild per `put` and a list-indexed walk per `get` level), and replaced with the mutable table on the user's call. The mutable table is ~2–3× FASTER than `Map` on build + lookup at N≥10K (`benchmarks/hashmap/`). Iteration order unspecified (bucket-derived) but deterministic per insertion sequence. Keys need `impl Hash` + `==` (primitives, and user sum types and records with `#[derive(Eq, Hash)]`). `m[key]` read sugar dispatches to `hashmap.get` (returns `Option[v]` / `Mutable`) via the typer's `synth_index` — the same one-arm mechanism `Map` uses; selfhost stays byte-identical (additive arm). No HashDoS mitigation in v1. Fixtures `examples/stdlib/hashmap_basic.kai` (10K + 100K round-trip, iteration stability, in-place mutation) and `hashmap_collision.kai` (forced one-bucket chain via a constant-hash sum-type key). Selfhost byte-identical (additive). |
+| `collections/hashset` mutable hash set | shipped (PR #757, closes #375): `stdlib/collections/hashset.kai` — a **mutable** hash set, a thin wrapper over the sibling `HashMap[t, Unit]` (each member is a key whose stored value is the single `Unit` value `()`). `HashSet[t] = { inner: HashMap[t, Unit] }`; every op delegates to `collections.hashmap`, inheriting its performance, mutation model, and effect discipline wholesale — the O(1)-average set, sibling to `HashMap` exactly as the pure `Set` (AVL-backed since #936) is the sibling of the AVL `Map`. 12 pub fns with short module-relative names (`hashset.add`/`remove`/`contains`/`union`/…, same convention as `hashmap`/`set` — no `hashset_*` aliases): `empty`, `size`, `is_empty`, `contains`, `add`, `remove`, `to_list`, `from`, `union`, `intersection`, `difference`, `is_subset`. **Mutating, not persistent** — `add`/`remove` mutate in place and return `Unit`, every op carries `/ Mutable`; the set-algebra ops (`union`/`intersection`/`difference`) build and return a FRESH set, leaving both arguments untouched. **The issue #375 body is STALE:** it assumed a *persistent* HashMap and a `Hashable` protocol, neither of which shipped — HashMap landed mutable (the pure HAMT benchmarked ~2× slower than the AVL `Map`) and the hashing protocol is `Hash`, not `Hashable`. This module mirrors the as-shipped mutable HashMap accordingly (do not restore the issue's persistent signatures). Elements need `impl Hash` + `==`, as `HashMap` keys do. Iteration order unspecified (bucket-derived). Fixtures `examples/stdlib/hashset_basic.kai` (Int + String round-trip, 100K resize, in-place mutation, `from` dedup) and `hashset_ops.kai` (union/intersection/difference/is_subset on small Int sets with known results, args-unchanged checks). Selfhost byte-identical (additive — pure stdlib, no compiler change); C + LLVM parity verified. |
 | `collections/map` round-out + qualified migration + pipes | shipped (closes #613): `stdlib/collections/map.kai` rounds out the public surface with `update`, `fold`, `merge`, `filter`, `transform_values`; migrates the 11 flat-prefix exports (`map_put`, `map_get`, …) to qualified canonical form (`map.put`, `map.get`, …) per the m14 audit's Option E. Flat-prefix aliases retained as one-liners for the tongariki edition, scheduled to drop at the Orongo boundary. Adds `map`/`flat_map`/`filter` pair-shaped exports so `Map[k, v]` participates in the `|`/`||`/`|?` pipe convention introduced by #594. Selfhost byte-identical (only stage2 reference is the `"map_get"` callee string synthesised by the indexing-sugar lowering, kept resolvable through the alias). |
 | collections pipe-participation coherence | shipped (PR #876): closes the asymmetry where `Map`/`Stream`/`[T]`/`Option`/`Result` rode the `|`/`||`/`|?` pipes but `Set`, `Stack`, `Queue`, `HashSet`, `HashMap` did not. All five now export the canonical `map`/`flat_map`/`filter`. Element shapes: `Set`/`Stack`/`Queue`/`HashSet` are element-shaped (`a`/`t`); `HashMap` is pair-shaped (`Pair[k, v]`), mirroring `Map`. `Set.map`/`HashSet.map` collapse output collisions; `Map.map`/`HashMap.map` collapse duplicate output keys (last wins). The mutable `HashSet`/`HashMap` combinators carry `/ Mutable` (they read the table). `flat_map` is written with its own row-threading loop rather than delegating to the pure `list.flat_map`, so `f`'s effect row survives. Fixtures: `examples/pipes/collections/{set,stack,queue,hashset,hashmap,map}_pipes.kai`, wired into the new `test-pipes-collections` tier (compiled with `--edition hanga-roa` to engage non-List head dispatch). Selfhost byte-identical (additive — pure stdlib, no compiler change). |
 | `net/url` RFC 3986 module | shipped via PR #3155: `stdlib/net/url.kai` (`Url`, `parse`, `to_string`, `resolve`, `percent_encode`, `percent_decode`, `query_pairs`, `query_string`), contract tests in `tests/stdlib/url_test.kai` (RFC 3986 §5.4 vectors). `net.http` keeps its own lenient `parse_url`. |
@@ -249,7 +259,7 @@ critical path but needed for production-quality services.
 
 ### Tier S3 — post-Orongo
 
-Defer until after Orongo (0.100.x) ships. Each is significant
+Defer until after the Orongo edition is cut. Each is significant
 design surface on its own.
 
 - ~~`net/udp` — `NetUdp` effect; `bind`, `send`, `recv`.~~
@@ -278,7 +288,7 @@ design surface on its own.
 ```
                   Hanga Roa milestone
                   ┌──────────────────────────────────┐
-  ──── 0.37.0 ───►│ m11 │ kai lsp ✓ │ reuse-IP ✓   │──► 0.100.0 (Orongo)
+  ──── 0.37.0 ───►│ m11 │ kai lsp ✓ │ reuse-IP ✓   │──► Orongo
                   └──────────────────────────────────┘
                           │              │
         Tier S1 ──────────┘              │

@@ -178,9 +178,9 @@ Traps:
 - **Two hops repair the boot's codegen only while `kaic2-a` still emits correct C.** The boot's codegen compiles `kaic2-a`; a boot bug that breaks the compiler's own C emission corrupts `stage2.c` itself, and no number of hops recovers from it — the way out is an earlier sound release or seed. `make kaic-boot-verify` detects it: each boot's `kaic2-a` and its `kaic2` must emit the same C for the compiler.
 - **A kaic2-class boot reads this tree's stdlib, never the tarball's.** The C is compiled against this tree's `runtime.h`, which pairs with this stdlib; a release's own stdlib declares that release's builtin effects, and a changed effect-op signature makes its C a hard `cc` error against the current runtime.
 - **The boot's codegen meets this tree's runtime.** A kaic2 boot emits the runtime calls its own codegen knows, and `stage2-a.c` is compiled against this tree's `runtime.h` — for the seed too: only the seed's own C is linked against the seed's `runtime.h`. A runtime change that drops or re-signs a function an older codegen still emits breaks the release and seed boots until the next release; an additive runtime keeps every recent release a valid boot. CI boots every PR from the release, so it gates the seed's codegen against this runtime as well.
-- **A builtin core calls is declared in core.** The boot compiles this tree's stdlib core, and a `builtin_table` row (`stage2/compiler/builtins.kai`) exists only in the compiler that carries it, so core may call a row only once a published release (and its seed) knows it. A core module can instead declare the builtin itself, which any boot that understands the form compiles:
+- **A builtin core calls is declared in core.** The boot compiles this tree's stdlib core, and a `builtin_table` row (`stage2/compiler/builtins.kai`) exists only in the compiler that carries it, so core may call a row only once a published release (and its seed) knows it. A core module can instead declare the builtin itself, which any boot that understands the form compiles (outside the core modules and `seq`, the same declaration is a compile error):
 
-  ```kaikai
+  ```kaikai-neg
   extern "kai"("kai_core_name") pub fn name[T](xs: [T]) : T / Mutable
   ```
 
@@ -360,7 +360,7 @@ Each runs in seconds with a built kaic2. Run the ones a change can touch; a red 
 | `tools/compiler-lint-ratchet.sh` | a new `kai lint` finding in the compiler | fix the finding; the baseline only goes down |
 | `make test-walker-catchall-audit` | a new `match` over many AST constructors closed by `_` | explicit arms for a walker; a pure recognizer goes in `tools/walker-catchall-baseline.txt` with its reason |
 | `tools/test-check-parity.sh` | `--diags-json` disagreeing with `kai build` on a negative fixture | report the same diagnostic on both paths |
-| `make test-km-new-files` | a new file below `km score` B | simplify or split along a cohesive seam |
+| `make test-km-new-files` | a new file below `km score` C- | simplify or split along a cohesive seam |
 | `examples/cache/*.sh`, `tests/*.sh` | cache keys, memo and trim behaviour of the wrapper | run the ones next to the code touched |
 | `tools/baselines/rc-leak/<fixture>` | an RC leak in a new `examples/perceus` fixture | pin the measured ledger line with the fixture |
 

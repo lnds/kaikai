@@ -12,6 +12,8 @@ One file per key, so two changes to different keys never conflict. The file name
 
 A `-` in a backend column skips the fixture on that backend; the reason lives in `tools/rc-leak-skips.txt`.
 
+Git keeps no empty directories: a table row whose directory is absent from the tree has no pinned key, so every count it would hold is 0.
+
 ## `rc-leak/` — the exact RC ledger of `examples/perceus`
 
 Each count is `alloc_total - free_total` from the runtime ledger under `KAI_TRACE_RC=1` on that backend. The gate fails on any count that differs from its pin, on a fixture with no file, and on a file whose fixture is gone.

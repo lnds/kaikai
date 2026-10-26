@@ -227,16 +227,27 @@ between any two passes is writable via `--dump=<pass>`.
 
 Phase 4's single-file `--prelude` retires in favour of real imports:
 
-```kai
-import math.vector
-import math.vector as V
-import math.vector.{dot, cross}
+```kaikai
+import net.url
+import net.url as U
+import net.url.{percent_encode, percent_decode}
+
+fn main() : Int / Stdout = {
+  Stdout.print(url.percent_encode("a b"))
+  Stdout.print(U.percent_encode("c d"))
+  match percent_decode(percent_encode("e f")) {
+    Ok(s)  -> { Stdout.print(s); 0 }
+    Err(_) -> 1
+  }
+}
 ```
 
 - Module resolution: a module name `a.b.c` maps to `a/b/c.kai` under
   the project root (or the standard library root).
 - Dependency graph is built; compilation is topologically sorted.
-  Circular imports are a hard error, explained with a suggestion.
+  Modules of one package may import each other; a cycle is typed
+  together. A cycle that crosses packages or runs through the stdlib
+  is an error (`kai info packages` §*Import cycles*).
 - Each module is compiled to its own translation unit in the output
   (either a `.c` or a `.ll`); the linker glues them.
 - Stdlib shipped as a compiled archive plus sources for hacking.

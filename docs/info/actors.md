@@ -10,14 +10,15 @@ type. `Actor[Msg]` is an effect; its ops are reached via the plain
 `Actor.` prefix (the `[Msg]` parameter lives in the handler binding,
 not in the op call site).
 
-Each actor has a private heap (BEAM-style isolation). Messages are
-COPIED across the boundary; references do not alias.
+Each actor has a private heap (BEAM-style isolation). A message
+crosses by value: references do not alias, and above one thread the
+runtime copies it.
 
 Mailbox is unbounded by default; an explicit `MailboxPolicy`
 (`Unbounded` or `Bounded(cap, DropOldest | DropNewest | BlockSender)`)
 can be set per actor — `BlockSender` parks the sender on a full
-mailbox (backpressure). `receive()` is selective: future
-`receive_match { }` selects on pattern (deferred to Orongo).
+mailbox (backpressure). `receive()` takes the oldest message; there
+is no selective receive.
 
 `send` takes its message type from the destination, not from the
 sender's `Msg`: `send[T](pid: Pid[T], msg: T)`. An actor with an
@@ -66,8 +67,10 @@ spawn/install surface:
 
 ## Monitoring
 
-`Monitor` lets one actor observe another's lifecycle. See
-`docs/actors.md` for the full surface.
+`Monitor` lets one actor observe another's lifecycle:
+`Monitor.monitor(target)` delivers `target` to the observer's mailbox
+when its fiber ends, and `Monitor.demonitor(ref)` cancels that. `Link`
+ties two fibers both ways. See `docs/actors.md` for the full surface.
 
 ## Testing: the mailbox is a handler
 
@@ -136,13 +139,13 @@ observes shared mutation.
 
 ## NOT IN KAIKAI
 
-- Erlang `unlink`. The `Link` effect exists with a `Link.link(peer)`
-  op, but bidirectional crash propagation is m8.x scope and there is
-  no `unlink` op. For supervision today, use Monitor + handler.
+- Erlang `unlink`. `Link.link(peer)` ties two fibers both ways (a
+  crash on either side cancels the other, unless it traps exits), but
+  a link cannot be removed. A `Monitor` can (`Monitor.demonitor`).
 - Process registry / named actors as primitive. Use a stdlib
   helper that wraps `Actor[Msg]` handles.
 - Distributed actors. Single-node only.
-- `receive_match { ... }` selective receive. Deferred to Orongo.
+- `receive_match { ... }` selective receive.
 
 ## See also
 

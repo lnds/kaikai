@@ -25,7 +25,7 @@ Original document follows.
 Domain-driven design produces bounded contexts. Each context defines
 its own error type, ignorant of the others:
 
-```kai
+```kaikai-fragment
 # Identity bounded context:
 type IdentityError = AccountNotFound | KycExpired | Frozen
 
@@ -46,7 +46,7 @@ Application-layer operations cross several bounded contexts. Each
 operation needs a return type that names exactly the errors it can
 surface:
 
-```kai
+```text
 fn transfer(req: TransferRequest)
   : Result[Receipt, ???]    # crosses Identity + Auth + Routing + Settlement + Audit
 
@@ -60,9 +60,11 @@ fn refund(tx_id: TxId)
   : Result[Refund, ???]     # crosses Identity + Auth + Settlement + Audit
 ```
 
-Today kaikai requires a **wrapper sum type** per operation:
+Before unions, kaikai required a **wrapper sum type** per operation
+(under today's model the shared wrapper names `RSettlement` and
+`RAudit` are each implicitly declared twice, the D2 collision error):
 
-```kai
+```text
 type TransferError =
   | TIdentity(IdentityError)
   | TAuth(AuthError)
@@ -95,7 +97,7 @@ in subsystems.
 
 Teams hitting this pattern collapse to a single shared `AppError`:
 
-```kai
+```text
 type AppError =
   | Identity(IdentityError)
   | Auth(AuthError)
@@ -140,7 +142,9 @@ violates programmer intent.
 
 Add a single new top-level declaration form:
 
-```kai
+Proposed form (not implemented); kaikai has no `union` keyword — `type` with `|` declares a union, see `docs/unions.md`:
+
+```text
 union <Name> = <Type1> | <Type2> | ... | <TypeN>
 ```
 
@@ -150,7 +154,9 @@ types T and W previously defined**, not new constructors.
 
 ### Surface examples
 
-```kai
+Proposed form; kaikai today writes these declarations with `type` instead of `union`:
+
+```text
 type IdentityError = AccountNotFound | KycExpired | Frozen
 type AuthError     = InsufficientBalance | OverDailyLimit | RegulatoryHold
 type RoutingError  = NoRouteFound | CorrespondentDown | CutoffPassed
@@ -221,9 +227,16 @@ infrastructure.
 **Chosen**: a value of a component type can be used wherever the
 union type is expected without explicit ceremony.
 
-```kai
-let id_err : IdentityError = AccountNotFound
-let qb_err : QueryBalanceErr = id_err   # implicit upcast: IdentityError <: QueryBalanceErr
+```kaikai
+type IdentityError   = AccountNotFound | KycExpired | Frozen
+type AuthError       = InsufficientBalance | OverDailyLimit
+type QueryBalanceErr = IdentityError | AuthError
+
+fn main() : Int = {
+  let id_err : IdentityError = AccountNotFound
+  let qb_err : QueryBalanceErr = id_err   # implicit upcast: IdentityError <: QueryBalanceErr
+  0
+}
 ```
 
 The typer accepts the assignment because `IdentityError` is one of
@@ -247,7 +260,9 @@ simplest possible subtyping rule.
 every variant of every component. Type-narrowing patterns are
 allowed for whole-component matches.
 
-```kai
+Proposed form; kaikai today writes `match err { ... }` with no type ascription on the scrutinee:
+
+```text
 match err : QueryBalanceErr {
   AccountNotFound      -> ...   # IdentityError variant
   KycExpired           -> ...
@@ -260,7 +275,9 @@ match err : QueryBalanceErr {
 
 Or with type-narrowing:
 
-```kai
+Proposed form; kaikai today writes `match err { ... }` with no type ascription on the scrutinee:
+
+```text
 match err : QueryBalanceErr {
   ie : IdentityError -> handle_identity_layer(ie)
   ae : AuthError     -> handle_auth_layer(ae)
@@ -287,13 +304,17 @@ over the union if every component is covered.
 
 This means:
 
-```kai
+Proposed form (not implemented); kaikai has no `union` keyword, and a component name implicitly declared by two unions is the D2 collision error:
+
+```text
 union E1 = A | B
 union E2 = B | C
 union E3 = E1 | E2     # normalizes to A | B | C (B appears once)
 ```
 
-```kai
+Proposed form (not implemented); kaikai has no `union` keyword:
+
+```text
 union F1 = A | B
 union F2 = B | A       # F1 ≡ F2 — same type
 ```
@@ -312,7 +333,9 @@ declaration order or duplicate components.
 The components must be types declared elsewhere (sum types, records,
 unions, primitives).
 
-```kai
+Proposed form; kaikai has no `union` keyword, and `type ParseResult = Success(Value) | Failure(String) | Pending` is accepted (an undeclared component with a payload is implicitly declared):
+
+```text
 # OK:
 type Success = { value: Value }
 type Failure = { reason: String }
@@ -368,7 +391,9 @@ AuthError in QueryBalanceErr"`.
 
 ### With `Result[T, E]` + `!` propagation
 
-```kai
+Proposed form; kaikai today propagates with postfix `!`, not `?`:
+
+```text
 fn outer() : Result[Balance, QueryBalanceErr] = {
   let v = check_identity(req)?         # returns Result[_, IdentityError]
   #       ^^^^^^^^^^^^^^^^^^^^

@@ -125,7 +125,9 @@ typed first-class resume gets clean elements **and** per-element recovery.
 
 ### Carrier: push (internal iteration)
 
-```kaikai
+```kaikai-fragment
+pub effect Emit[t] { emit(v: t) : Unit }
+
 # A stream wraps a producer that performs `Emit.emit` once per element;
 # a consumer is a handler of `Emit[t]` and stops the stream by not
 # resuming. The nominal wrapper (a single-constructor variant, not a bare
@@ -169,7 +171,7 @@ with a generator handler; no other referent has that escape hatch.
 
 ### Surface (v1, all `#[unstable]`)
 
-```kaikai
+```text
 # -- sources ---------------------------------------------------------
 pub fn from_list[t, e](xs: [t])     : Stream[t, e]                  # pure: row stays free
 pub fn read_lines(path: String)     : Stream[String, File + ReadFault]
@@ -182,6 +184,7 @@ pub fn take[t, e](s: Stream[t, e], n: Int)                       : Stream[t, e]
 pub fn take_while[t, e](s: Stream[t, e], p: (t) -> Bool / e)     : Stream[t, e]
 
 # -- sinks (force the pipeline) --------------------------------------
+pub fn foldl[t, a, e](s: Stream[t, e], init: a, f: (a, t) -> a / e) : a / e
 pub fn fold[t, a, e](s: Stream[t, e], init: a, f: (a, t) -> a / e) : a / e
 pub fn each[t, e](s: Stream[t, e], f: (t) -> Unit / e)             : Unit / e
 pub fn count[t, e](s: Stream[t, e])                                : Int / e
@@ -191,7 +194,7 @@ pub fn write_lines[e](s: Stream[String, e], path: String) : Unit / File + ReadFa
 
 The recoverable fault travels on a dedicated resumable effect:
 
-```kaikai
+```kaikai-fragment
 pub effect ReadFault {
   bad_chunk(msg: String) : Unit      # resumable → resume = skip the bad chunk
   open_fault(msg: String) : Nothing  # Nothing → abort-only (no resume)
@@ -272,15 +275,21 @@ fn count_errors(path: String) : Int / File + ReadFault =
   stream.read_lines(path)
     |? (l) => string_contains(l, "ERROR")
     |> stream.count
+
+fn main() : Int = 0
 ```
 
 **(b) Transform a file into another, streaming**
 
 ```kaikai
+import stream
+
 fn shout(input: String, output: String) : Unit / File + ReadFault =
   stream.read_lines(input)
     | (l) => string.to_upper(l)
     |> stream.write_lines(output)
+
+fn main() : Int = 0
 ```
 
 One expression, no bracket, no `run()`, no `?`-per-line. (Go: ~15 lines.
@@ -290,25 +299,35 @@ element.)
 **(c) First 10 lines matching a predicate — stops reading at the 10th**
 
 ```kaikai
+import stream
+
 fn first_matches(path: String, needle: String) : [String] / File + ReadFault =
   stream.read_lines(path)
     |? (l) => string_contains(l, needle)
     |> stream.take(10)
     |> stream.to_list
+
+fn main() : Int = 0
 ```
 
 **(d) Header: every line until the first blank one**
 
 ```kaikai
+import stream
+
 fn header(path: String) : [String] / File + ReadFault =
   stream.read_lines(path)
     |> stream.take_while((l) => l != "")
     |> stream.to_list
+
+fn main() : Int = 0
 ```
 
 **(e) Skip unreadable chunks instead of aborting — handler-decided**
 
 ```kaikai
+import stream
+
 fn count_resilient(path: String) : Int / File =
   handle {
     stream.read_lines(path) |> stream.count
@@ -316,6 +335,8 @@ fn count_resilient(path: String) : Int / File =
     bad_chunk(msg, resume) -> resume(())   # resuming = drop the bad chunk, go on
     open_fault(msg, r)     -> 0            # open failure: abort-only (Nothing, no resume)
   }
+
+fn main() : Int = 0
 ```
 
 Same pipeline, different policy, zero changes to the stages. Drop the
@@ -325,16 +346,23 @@ can express this without changing the element type everywhere.
 **(f) Mock the disk in a test — no fixture files**
 
 ```kaikai
+import stream
+
+fn count_errors(path: String) : Int / File + ReadFault =
+  stream.read_lines(path)
+    |? (l) => string_contains(l, "ERROR")
+    |> stream.count
+
 test "count_errors over a mocked file" {
   let fed = array_make(1, false)
   let n = handle {
     handle { count_errors("fake.log") }
     with ReadFault {
       bad_chunk(m, resume)  -> resume(())
-      open_fault(m, r)      -> ()
+      open_fault(m, r)      -> 0
     }
   } with File {
-    open_read(p, resume)        -> resume(Ok(FileHandle { fd: 1 }))
+    open_read(p, resume)        -> resume(Ok(file_handle(1)))
     read_chunk(h, max, resume)  ->
       if fed[0] { resume(Ok("")) }                       # EOF
       else { fed[0] := true; resume(Ok("ok\nERROR a\nok\nERROR b\n")) }
@@ -344,16 +372,24 @@ test "count_errors over a mocked file" {
   }
   assert n == 2
 }
+
+fn main() : Int = 0
 ```
 
 Because production and consumption run inside one expression, the
 `handle` is guaranteed to cover every `read_chunk` — the pull design
 could silently escape the mock. (A mocked `FileHandle` is built with
-`FileHandle { fd: N }`, not a bare `Int`.)
+`file_handle(N)`, which gives it the permission the op expects; a bare
+`FileHandle { fd: N }` or `Int` does not typecheck.)
 
 **(g) A grep-ish main, end to end**
 
-```kaikai
+Not accepted today: `read_lines` returns a stream whose row is closed at
+`File + ReadFault`, and `each`'s callback must have exactly the stream's
+row, so a callback that adds `Stdout` is a type mismatch. The proposed
+form:
+
+```text
 fn main() : Unit / Console + Env + File = {
   let needle = list.nth(args(), 0) |> option.unwrap_or("ERROR")
   handle {
@@ -370,6 +406,15 @@ fn main() : Unit / Console + Env + File = {
 **(h) wc — lines/words/chars in one fold (the `demos/wc.kai` demo)**
 
 ```kaikai
+import stream
+
+type Counts = { lines: Int, words: Int, chars: Int }
+
+fn words_in(line: String) : Int =
+  string.split(line, " ")
+    |? (w) => not string.is_empty(w)
+    |> list.length
+
 fn wc(path: String) : Counts / File + ReadFault =
   stream.read_lines(path)
     |> stream.fold(Counts { lines: 0, words: 0, chars: 0 }) { acc, l ->
@@ -379,6 +424,8 @@ fn wc(path: String) : Counts / File + ReadFault =
         chars: acc.chars + string.length(l) + 1
       }
     }
+
+fn main() : Int = 0
 ```
 
 One `fold` over the line stream computes all three counters in a single

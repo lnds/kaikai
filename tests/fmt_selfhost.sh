@@ -1,31 +1,16 @@
 #!/bin/sh
-# tests/fmt_selfhost.sh — `kai fmt` self-hosting ratchet (issue #786).
+# tests/fmt_selfhost.sh — `kai fmt` self-hosting ratchet.
 #
-# `kai fmt` round-trips the full language surface and refuses nothing
-# across stdlib/ + stage2/compiler/ (#784). This gate locks that
-# coverage in so it cannot regress: for every source file in the
-# corpus we require
+# For every source file in the corpus: fmt(file) exits 0, and
+# fmt(fmt(file)) == fmt(file) byte for byte. A file that only stabilises
+# after more than one pass is a formatter bug.
 #
-#   1. fmt(file)        exits 0          — no refusal, AND
-#   2. fmt(fmt(file)) == fmt(file)        — byte-identical idempotency.
+# `kai fmt <file>` rewrites in place; this gate drives `kaic2 --fmt`,
+# which prints to stdout, so the sources are never touched and every
+# pass lands in a private `mktemp -d` scratch dir.
 #
-# The first pass is the canonical form; the second pass must reproduce
-# it byte-for-byte. A file that only stabilises after N>1 passes is a
-# formatter bug, not a pass.
-#
-# `kai fmt` writes to stdout (it is NOT destructive in-place), so the
-# real sources are never mutated — every pass redirects into a private
-# scratch dir created with `mktemp -d`. Each file's scratch artefacts
-# are keyed by a per-file counter, so a parallel `make -j` invocation
-# of sibling targets cannot collide (each target gets its own mktemp).
-#
-# Skip-list: a space-separated list of repo-relative paths that are
-# known non-idempotent and tracked by a GitHub issue. It MUST stay
-# empty in steady state; any entry needs an inline `# refs #N` note.
-# A skipped file is still required to PARSE (fmt must exit 0) — only
-# the idempotency check is waived — so the skip cannot silently mask a
-# total refusal.
-
+# SKIP lists repo-relative paths waived from the idempotency check only
+# (each still has to format). It must stay empty in steady state.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,8 +20,6 @@ KAIC2="$ROOT/stage2/kaic2"
 # of the edition the repo declares.
 EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 
-# Known non-idempotent files, each tagged with its tracking issue.
-# Empty today (#785's trailing-comment edge was fixed in #788).
 SKIP=""
 
 if [ ! -x "$KAIC2" ]; then

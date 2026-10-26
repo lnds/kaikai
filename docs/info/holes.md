@@ -64,6 +64,10 @@ remaining       array|null     pattern holes: values the earlier arms miss
 expected_type   string         the type the hole must have
 in_scope        array          [{name, type}, ...] local bindings
 scope_elided    int            reachable bindings not listed
+candidates      array          [{expr, kind}, ...] fillers that fit
+candidates_needing_effects
+                array          fillers that fit once the row grows
+doc             string|null    the #[doc] of the enclosing item
 ```
 
 `kai build --holes-json-scope` lists every reachable binding in
@@ -86,18 +90,22 @@ kai typecheck --strict-holes .      # same gate, no codegen
 
 ## Where holes are legal
 
-Three positions today:
+Four positions:
 
 - **Expressions** — `?` or `?name`. The compiler reports the inferred
   type and any in-scope bindings of that type.
 - **Effect-row tails** — `fn f(x: Int) : Int / ?e = x` parses; the
   `--effect-holes-json` flag reports the inferred row variable.
 - **Patterns** — `?` and `?name` are accepted in match-arm patterns
-  (they match anything, like `_`). Pattern holes do not produce a
-  typed-hole report today; the position is reserved for richer
-  reporting in a follow-up.
+  (they match anything, like `_`). `--holes` reports one as a pattern
+  hole with the values the earlier arms leave unmatched (`remaining`
+  in the JSON).
+- **Imports** — `import ?name` stops the build with an error naming
+  the module that exports `name`. It searches the modules the file
+  already imports plus `core`, `actor`, `effects`, `loop`,
+  `protocols`, `reader`, `spawn` and `writer`.
 
-Type-expression holes (`fn f(x: ?) : ? = x`) are not implemented.
+Type-expression holes (`fn f(x: ?) : ? = x`) do not exist.
 
 ## NOT IN KAIKAI
 
