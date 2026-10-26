@@ -66,7 +66,6 @@ static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *s) { (void) m; 
 static KaiValue *kai_llvm_add_sret_call(void *m, void *c, void *s) { (void) m; (void) c; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_nounwind(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_add_memory_none(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
-static KaiValue *kai_llvm_mark_tail_fn(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_llvm_set_musttail(void *call) { (void) call; kai_llvm_native_unavailable(); return 0; }
 static KaiValue *kai_llvm_set_internal_linkage(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); return 0; }
