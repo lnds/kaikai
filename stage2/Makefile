@@ -14170,8 +14170,10 @@ test-light-shard: $(TARGET) bin-kai build core-cache-warm
 	echo "test-light-shard $(SHARD)/$(SHARDS): $$(echo $$slice | wc -w | tr -d ' ') targets"; \
 	start=$$(date +%s); rc=0; \
 	[ -z "$$slice" ] || { printf 'test "warm" {\n  assert true\n}\n' > build/light-warm.kai; \
-	  CFLAGS='$(LIGHT_CFLAGS)' ../bin/kai test --backend=c build/light-warm.kai > build/light-warm.out 2>&1 \
-	  || { echo "light-warm FAIL"; cat build/light-warm.out; exit 1; }; }; \
+	  for be in c $$(../tools/kaic2-native-capable.sh $(TARGET) && echo native); do \
+	    CFLAGS='$(LIGHT_CFLAGS)' ../bin/kai test --backend=$$be build/light-warm.kai > build/light-warm.out 2>&1 \
+	    || { echo "light-warm FAIL ($$be)"; cat build/light-warm.out; exit 1; }; \
+	  done; }; \
 	[ -z "$$slice" ] || $(MAKE) -j$(TEST_JOBS) CFLAGS='$(LIGHT_CFLAGS)' $$(printf ' tier1-light-timed-%s' $$slice) || rc=$$?; \
 	echo "tier1-light-slice $(SHARD) $$(( $$(date +%s) - start ))"; \
 	exit $$rc
