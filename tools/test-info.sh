@@ -52,7 +52,9 @@ for topic in $listed; do
   echo "$page" | grep -q "^# " || fail "'kai info $topic' missing H1 title"
 
   if [ "$need_json_validator" = 1 ]; then
-    "$KAI" info "$topic" --json 2>&1 | python3 -c "
+    h1="$(printf '%s\n' "$page" | grep -a -m1 '^# ' | sed 's/^# //')"
+    "$KAI" info "$topic" --json 2>&1 | H1="$h1" python3 -c "
+import os
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -61,14 +63,22 @@ except Exception as e:
     sys.exit(1)
 if d.get('topic') != '$topic':
     sys.stderr.write('topic mismatch: %r\n' % d.get('topic')); sys.exit(1)
-if not d.get('title'):
-    sys.stderr.write('missing title\n'); sys.exit(1)
+if d.get('title') != os.environ['H1']:
+    sys.stderr.write('title %r is not the page H1 %r\n' % (d.get('title'), os.environ['H1'])); sys.exit(1)
 if not d.get('sections'):
     sys.stderr.write('no sections\n'); sys.exit(1)
 " || fail "'kai info $topic --json' invalid"
   fi
 
   count=$((count + 1))
+done
+
+# Every lint rule the compiler emits is named by `kai lint --help` and `kai info lint`.
+lint_help="$("$KAI" lint --help 2>&1)"
+lint_page="$("$KAI" info lint 2>&1)"
+for rule in $(grep -ho 'LF("[a-z_]*"' "$ROOT"/stage2/compiler/*.kai | sed 's/LF("//; s/"//' | sort -u); do
+  printf '%s\n' "$lint_help" | grep -aqw "$rule" || fail "'kai lint --help' does not list rule $rule"
+  printf '%s\n' "$lint_page" | grep -aqw "$rule" || fail "'kai info lint' does not describe rule $rule"
 done
 
 # 5. The `syntax` topic exists (CLAUDE.md cites it as load-bearing).
