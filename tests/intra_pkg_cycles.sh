@@ -50,5 +50,13 @@ printf 'import c\nimport b\n\nfn main() : Unit / Console {\n  print("#{fc(2)} #{
 want="$(cd "$pkg" && "$KAI" run --backend=c other.kai 2>&1)"
 [ "$want" = "1002 1012" ] || { echo "intra-pkg-cycles FAIL (second root): got '$want'"; fail=1; }
 
+# A spawn-crossing helper is held to its rule from either root of the cycle.
+pkg="$WORK/pkgs/neg/spawn_cycle"
+if (cd "$pkg" && "$KAI" run --backend=c other.kai > /dev/null 2> "$WORK/err"); then
+  echo "intra-pkg-cycles FAIL (spawn_cycle, second root): compiled"; fail=1
+elif ! grep -qF -- "$(cat "$pkg/expect.err")" "$WORK/err"; then
+  echo "intra-pkg-cycles FAIL (spawn_cycle, second root): wrong error:"; cat "$WORK/err"; fail=1
+fi
+
 [ "$fail" = 0 ] && echo "intra-pkg-cycles OK"
 exit "$fail"
