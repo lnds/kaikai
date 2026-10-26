@@ -1,22 +1,27 @@
 #[doc("""
-The mutual tail recursion the C backend leaves as calls.
+The tail recursion the C backend leaves as calls.
 
 Fusion turns a group of functions that tail-call each other into one
 self-recursive function. A group it does not fuse keeps one stack frame
 per hop on the C backend, which has no guaranteed tail call across
 functions of different signatures. This reports such a group of the
-module being built.
+module being built, and a protocol implementation that tail-calls a method
+of its own protocol, a cycle fusion does not see.
 """)]
 
 import compiler.ast
 import compiler.ast_decl
 import compiler.ast_ids
+import compiler.call_site_target
+import compiler.proto_ids
+import compiler.tail_pos
 import compiler.symtab
 import compiler.tailgraph
 import compiler.written
 
 #[doc("Print one warning on stderr for each group of `decls` that tail-calls in a cycle and has a member homed in `target`.")]
-pub(pkg) fn tailwarn_unfused(decls: [Decl], tab: SymTab, target: String) : Unit / Console = {
+pub(pkg) fn tailwarn_unfused(decls: [Decl], tab: SymTab, ids: ProtoIds, target: String) : Unit / Console = {
+  tw_protocols(decls, tab, ids, target)
   let g = tailgraph_build(decls)
   let nodes = tailgraph_nodes(g)
   tw_groups(tailgraph_groups(g), nodes, tab, target)
@@ -44,3 +49,39 @@ fn tw_homed(n: TgNode, target: String) : Bool = match n {
 
 fn tw_names(members: [TgNode], tab: SymTab) : String =
   string_join(map(members, (n) => match n { TgN(_, _, s) -> string_concat_all(["`", written_text(sym_name(tab, s)), "`"]) }), ", ")
+
+# An implementation of protocol `p` that tail-calls a dispatcher answering `p`: the cycle runs through the dispatch table.
+fn tw_protocols(decls: [Decl], tab: SymTab, ids: ProtoIds, target: String) : Unit / Console = match decls {
+  [] -> ()
+  [DFn(_, fid, _, _, _, _, body, ln, cl, mo), ...rest] -> {
+    if tw_homed_in(mo, target) { tw_impl(fnid_sym(fid), body, ln, cl, tab, ids) } else { () }
+    tw_protocols(rest, tab, ids, target)
+  }
+  [_, ...rest] -> tw_protocols(rest, tab, ids, target)
+}
+
+fn tw_homed_in(mo: Option[String], target: String) : Bool = match mo {
+  Some(h) -> h == target
+  None    -> true
+}
+
+fn tw_impl(me: SymId, body: Expr, ln: Int, cl: Int, tab: SymTab, ids: ProtoIds) : Unit / Console = match pid_impl(ids, me) {
+  None -> ()
+  Some(PIR(p, _, _, _, _, _, _)) ->
+    if any(tail_leaves(body), (leaf) => tw_calls_protocol(leaf, p, ids)) {
+      eprint(tw_impl_text(me, ln, cl, tab))
+    } else { () }
+}
+
+fn tw_calls_protocol(leaf: Expr, p: SymId, ids: ProtoIds) : Bool = match leaf.kind {
+  ECall(f, _) -> match callee_id(f) {
+    Some(c) -> pid_is_disp(ids, c) and any(contest_protocols(ids, [c]), (q) => sym_raw(q) == sym_raw(p))
+    None    -> false
+  }
+  _ -> false
+}
+
+fn tw_impl_text(me: SymId, ln: Int, cl: Int, tab: SymTab) : String =
+  string_concat_all(["warning: `", written_text(sym_name(tab, me)), "` (line ", int_to_string(ln), ", column ", int_to_string(cl),
+                     ") calls a method of its own protocol in tail position; a cycle through protocol dispatch is not fused ",
+                     "and keeps a stack frame per hop on this backend"])

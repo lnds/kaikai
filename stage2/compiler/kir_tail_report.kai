@@ -1,0 +1,96 @@
+#[doc("The report of a tail call that stays a call: which call, in which function, and why.")]
+
+import compiler.emit_shared_syms
+import compiler.import_cycles
+import compiler.kir
+import compiler.kir_syms
+
+#[doc("A call in tail position that stays a call: the function, the callee's symbol, where, and why.")]
+pub(pkg) type KtMiss = KtMiss(KFn, String, KPos, String)
+
+#[doc("True when the function of `m` is homed in the module `target`, or in none: a specialisation or a lifted lambda belongs to the code that made it.")]
+pub(pkg) fn kt_homed(m: KtMiss, target: String) : Bool = match m {
+  KtMiss(f, _, _, _) -> match f.mo {
+    Some(h) -> h == target
+    None    -> true
+  }
+}
+
+#[doc("Print on stderr each of `misses` that is a call between functions of `kp` on a cycle of direct calls, a function calling itself included: a call between functions that never call back grows no stack.")]
+pub(pkg) fn kt_report(kp: KProgram, nm: KNames, misses: [KtMiss]) : Unit / Console = match misses {
+  [] -> ()
+  _  -> kr_print(misses, kr_recursive(kp.fns, map(kp.fns, (f) => kfn_sym(nm, f))), nm)
+}
+
+fn kr_print(misses: [KtMiss], recursive: [String], nm: KNames) : Unit / Console = match misses {
+  [] -> ()
+  [KtMiss(f, callee, pos, why), ...rest] -> {
+    let caller = kfn_sym(nm, f)
+    if kr_has(recursive, caller) and (callee == "" or kr_has(recursive, callee)) { eprint(kr_text(caller, callee, pos, why)) } else { () }
+    kr_print(rest, recursive, nm)
+  }
+}
+
+fn kr_text(caller: String, callee: String, pos: KPos, why: String) : String =
+  string_concat_all(["warning: ", kr_callee(callee), " is called in tail position in `", caller, "`", kr_where(pos),
+                     " but not as a guaranteed tail call: ", why])
+
+fn kr_callee(callee: String) : String = if callee == "" { "a closure" } else { string_concat_all(["`", callee, "`"]) }
+
+fn kr_where(pos: KPos) : String = match pos {
+  KAt(l, c) -> string_concat_all([" (line ", int_to_string(l), ", column ", int_to_string(c), ")"])
+  KNoPos    -> ""
+}
+
+fn kr_has(xs: [String], x: String) : Bool = any(xs, (y) => y == x)
+
+# A call through a closure may reach any function a closure is made of, so it is an edge to each of them.
+fn kr_recursive(fns: [KFn], syms: [String]) : [String] = {
+  let thunks = map(syms, c_user_thunk_sym)
+  let taken = flat_map(fns, (f) => kr_closures(f, syms, thunks))
+  let edges = kr_edges_all(fns, syms, thunks, taken, 0, [])
+  let ring = flat_map(scc_groups(list_length(fns), edges), (g) => flat_map(g, (i) => kr_sym_at(syms, i)))
+  list_append(ring, flat_map(edges, (e) => if e.fst == e.snd { kr_sym_at(syms, e.fst) } else { [] }))
+}
+
+fn kr_sym_at(syms: [String], i: Int) : [String] = match nth(syms, i) {
+  Some(s) -> [s]
+  None    -> []
+}
+
+fn kr_stmts(f: KFn) : [KStmt] = flat_map(f.blocks, kr_block_stmts)
+
+fn kr_block_stmts(b: KBlock) : [KStmt] = b.stmts
+
+# The functions the closures made in `f` stand for: a lifted lambda by its symbol, a named function by its thunk.
+fn kr_closures(f: KFn, syms: [String], thunks: [String]) : [Int] = flat_map(kr_stmts(f), (s) => match s {
+  KLet(_, _, KClosure(sym, _, _), _) -> kr_target(sym, syms, thunks)
+  _                                  -> []
+})
+
+fn kr_target(sym: String, syms: [String], thunks: [String]) : [Int] = match kr_index_of(syms, sym, 0) {
+  Some(j) -> [j]
+  None    -> match kr_index_of(thunks, sym, 0) {
+    Some(j) -> [j]
+    None    -> []
+  }
+}
+
+fn kr_edges_all(fns: [KFn], syms: [String], thunks: [String], taken: [Int], i: Int, acc: [(Int, Int)]) : [(Int, Int)] = match fns {
+  []           -> acc
+  [f, ...rest] -> kr_edges_all(rest, syms, thunks, taken, i + 1, list_append(kr_edges(i, f, syms, thunks, taken), acc))
+}
+
+fn kr_edges(i: Int, f: KFn, syms: [String], thunks: [String], taken: [Int]) : [(Int, Int)] =
+  flat_map(kr_stmts(f), (s) => match s {
+    KLet(_, _, KCall(sym, _), _)  -> map(kr_target(sym, syms, thunks), (j) => (i, j))
+    KLet(_, _, KClosure(sym, _, _), _) -> map(kr_target(sym, syms, thunks), (j) => (i, j))
+    KLet(_, _, KCallIndirect(_, _), _) -> map(taken, (j) => (i, j))
+    KLet(_, _, KCallIndirectBorrow(_, _), _) -> map(taken, (j) => (i, j))
+    _ -> []
+  })
+
+fn kr_index_of(syms: [String], sym: String, i: Int) : Option[Int] = match syms {
+  []           -> None
+  [s, ...rest] -> if s == sym { Some(i) } else { kr_index_of(rest, sym, i + 1) }
+}
