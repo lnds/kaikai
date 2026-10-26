@@ -67,6 +67,7 @@ lint        the linter beside the compiler (`kai lint`)
 mutate      mutation testing: does any test notice?
 lsp         editor integration surface
 install     install and self-update the compiler
+wasm        build for a browser page or a WASI runtime
 ```
 
 Topic pages open with a TL;DR — if the first ten lines do not answer
@@ -119,6 +120,11 @@ file.kai:2:16: type hole ?
   in scope (local):
     factor : Int
     xs : [Int]
+
+  candidates that fit:
+    xs
+    reverse(xs)
+    ...
 ```
 
 `kai build --holes-json` emits the same per-hole report as a JSON

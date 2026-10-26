@@ -12,7 +12,7 @@ stdlib helper that installs Spawn for a scope and joins all children
 at exit.
 
 Fibers are not OS threads. The runtime parks them on I/O via the
-reactor (R1 file/sleep/process, R2 TCP, R3 stdin, R4 signal) — no
+reactor (file, sleep, process, TCP, stdin, signals) — no
 blocking call freezes the OS thread.
 
 Cancellation is COOPERATIVE: `Spawn.cancel(f)` marks the target;
@@ -58,14 +58,20 @@ fn main() : Int / Spawn + Stdout = {
   the fiber unwinds cancelled, and at the program root the runtime
   prints `no survivors` and exits non-zero.
 
-```kai
-handle {
-  nursery { n ->
-    let r = n.spawn(() => risky())
-    n.await(r)
+```kaikai
+import spawn
+
+fn risky() : Int / Cancel = Cancel.raise()
+
+fn main() : Int / Spawn + Stdout = {
+  handle {
+    nursery { n ->
+      let r = n.spawn(() => risky())
+      n.await(r)
+    }
+  } with Cancel {
+    raise(resume) -> { println("a child failed; cleaning up"); 0 }
   }
-} with Cancel {
-  raise(resume) -> println("a child failed; cleaning up")
 }
 ```
 
@@ -151,11 +157,11 @@ KAI_THREADS=1 ./my_program
   scheduler — the escape hatch when you want one.
 - Output that depends on the *order* independent fibers interleave is
   not stable above one thread; only causally ordered output is.
-- Semantics are unchanged at any N: messages crossing a thread
-  boundary are physically copied (same-thread sends still transfer
-  ownership), each actor's mailbox is processed serially, and
-  per-fiber RC stays non-atomic — parallelism costs nothing on the
-  object hot path.
+- Semantics are unchanged at any N: above one thread every send
+  physically copies the message, since a receiver can migrate between
+  threads (at `KAI_THREADS=1` a send transfers ownership), each
+  actor's mailbox is processed serially, and per-fiber RC stays
+  non-atomic — parallelism costs nothing on the object hot path.
 - A blocking FFI call stalls one worker thread, not the program.
 - The I/O reactor is shared: heavily mixed I/O+CPU workloads may
   serialize on it.

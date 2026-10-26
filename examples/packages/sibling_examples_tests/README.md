@@ -2,7 +2,7 @@
 
 Layout:
 
-```
+```text
 sibling_examples_tests/
 ├── kai.toml            name = "mathlib"
 ├── main.kai            entry — imports mathlib.adder
@@ -17,8 +17,7 @@ sibling_examples_tests/
 
 The package's own `mathlib.adder` resolves from sibling
 directories — `examples/` and `tests/` — without a self-dep
-entry in `kai.toml`. This is the regression guard for the part
-of #567 that ensures `import <pkgname>.<module>` works from any
+entry in `kai.toml`: `import <pkgname>.<module>` works from any
 directory under the manifest.
 
 Run:

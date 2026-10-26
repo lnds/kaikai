@@ -76,8 +76,8 @@ A dropped arm is the shape of an encoder that emits a tag its decoder
 never learned to read: silent, because a miss is indistinguishable from
 a cold start, and invisible to any green run.
 
-Two arms are never dropped: the last one of a `match`, which would make
-it non-exhaustive and turn the mutant into a compile error that says
+The last arm of a `match` is never dropped: that would make it
+non-exhaustive and turn the mutant into a compile error that says
 nothing about the suite.
 
 ## Reading the output

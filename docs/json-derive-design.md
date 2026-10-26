@@ -7,43 +7,67 @@ of JSON, which kaikai previously lacked.
 ## What exists today
 
 `stdlib/encoding/json.kai` is the **dynamic DOM** — Go's
-`map[string]interface{}` side:
+`map[string]interface{}` side (`JsonValue` itself is declared in
+`encoding/json_bind.kai`):
 
-```kaikai
+```text
 pub type JsonValue = JNull | JBool(Bool) | JNum(Int) | JReal(Real)
                    | JStr(String) | JArr([JsonValue]) | JObj([Pair[String, JsonValue]])
 pub fn json_decode(s: String) : Option[JsonValue]
 pub fn json_encode(v: JsonValue) : String
-# navigators: get(v, key), at(v, i), as_string / as_int / as_real / as_bool → Option
+# navigators: get(v, key), at(v, i) → JsonValue; as_string / as_int / as_real / as_bool → Option
 ```
 
 `#[derive(Json)]` is the **typed** side over that same tree. Binding a
 `JsonValue` to a domain type used to be a hand-written walk:
 
 ```kaikai
+import encoding.json
+import encoding.json_bind.{JsonValue}
+
 type Person = { name: String, age: Int, active: Bool }
 
-fn person_of(v: JsonValue) : Person / Fail = {
-  let name = match json.as_string(json.get(v, "name")) {
-    Some(s) -> s ; None -> Fail.fail("missing/invalid 'name'") }
-  # ... one such block per field
+fn person_of(v: JsonValue) : Option[Person] = {
+  let name   = json.as_string(json.get(v, "name"))!     # one such line per field
+  let age    = json.as_int(json.get(v, "age"))!
+  let active = json.as_bool(json.get(v, "active"))!
+  Some(Person { name: name, age: age, active: active })
+}
+
+fn main() : Unit / Stdout = match json.json_decode("{\"name\":\"ana\",\"age\":3,\"active\":true}") {
+  Some(v) -> match person_of(v) {
+    Some(p) -> Stdout.print(p.name)
+    None    -> Stdout.print("missing or invalid field")   # but which one?
+  }
+  None -> Stdout.print("bad json")
 }
 ```
 
 That walk is what the derive now generates:
 
 ```kaikai
+import encoding.json.{json_decode, json_encode}
+import encoding.json_bind
+
 #[derive(Json)]
 type Person = { name: String, age: Int, active: Bool }
 
-let doc : JsonValue = json_decode(src)?
-let p : Result[Person, JsonError] = person_of_json(doc, "")
-let s : String      = json_encode(to_json(p))
+fn main() : Unit / Stdout = {
+  let src = "{\"name\":\"ana\",\"age\":3,\"active\":true}"
+  match json_decode(src) {
+    None -> Stdout.print("bad json")
+    Some(doc) -> match person_of_json(doc, "") {     # Result[Person, JsonError]
+      Ok(p)  -> Stdout.print(json_encode(to_json(p)))
+      Err(e) -> Stdout.print(json_error_show(e))
+    }
+  }
+}
 ```
 
 `JsonValue` and `JsonError` live in `stdlib/encoding/json_bind.kai`
 alongside the runtime the derive lowers onto; only `protocol Json` sits
-in `stdlib/protocols.kai`, where the compiler pins its protocol id.
+in `stdlib/protocols.kai`, where the compiler pins its protocol id. A
+program that derives `Json` imports `encoding.json_bind`.
 
 The types deliberately stay out of the auto-loaded core: the C emitter
 eager-seeds every user nullary constructor as an immortal singleton in
@@ -56,7 +80,7 @@ brings the DOM, the codec, and the derive runtime into scope together.
 
 ## Shape
 
-```kaikai
+```kaikai-fragment
 protocol Json {
   to_json(self: Self) : JsonValue
   of_json(v: JsonValue, path: String) : Result[Self, JsonError]
@@ -112,7 +136,7 @@ even under `Option`: `null` means absent, `7` does not mean absent.
 Decoding returns `Result[T, JsonError]`, where `JsonError` carries the
 JSON path to the offending node:
 
-```kaikai
+```kaikai-fragment
 pub type JsonError = { path: String, expected: String, found: String }
 ```
 
@@ -142,11 +166,19 @@ reflection-read magic strings: a `#[jsom(...)]` typo, an unknown key, or a
 that silently misses the wire is impossible.
 
 ```kaikai
+import encoding.json.{json_encode}
+import encoding.json_bind
+
 #[derive(Json)]
 type Config = {
   #[json(rename = "user-name")] host: String,
   #[json(default = 30)]         retries: Int,
   #[json(skip)] #[json(default = [])] cache: [Int],
+}
+
+fn main() : Unit / Stdout = {
+  let c = Config { host: "h", retries: 5, cache: [1, 2, 3] }
+  Stdout.print(json_encode(to_json(c)))       # {"user-name":"h","retries":5}
 }
 ```
 

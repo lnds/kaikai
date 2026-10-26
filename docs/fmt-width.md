@@ -61,7 +61,9 @@ one level in, when it fits there whole; on the head line breaking
 inside itself when it must break anyway and its first line fits; on
 its own line otherwise.
 
-```kaikai
+```kaikai-fragment
+type Cfg = { host: String, port: Int, retries: Int, verbose: Bool }
+
 fn build(host: String, port: Int, retries: Int, verbose: Bool) : Cfg =
   Cfg { host: host, port: port, retries: retries, verbose: verbose }
 ```
@@ -83,12 +85,17 @@ Two refinements:
   arguments stay flat on the head line and the last one breaks inside
   its own delimiters (`string_concat_all([` … `])`).
 
-```kaikai
+```kaikai-fragment
+type Conn = { host: String, port: Int, user: String }
+
 fn connect(
   host: String,
   port: Int,
   user: String
 ) : Conn / Stdout {
+  Stdout.print("connecting #{user}@#{host}:#{port}")
+  Conn { host: host, port: port, user: user }
+}
 ```
 
 **An operator chain** — the same-precedence spine of a binary
@@ -103,7 +110,7 @@ c` prints without parentheses, `(a + b) * c` keeps them, and the two
 associativity exceptions (`++` and `^` are right-associative,
 comparisons do not chain) are honoured.
 
-```kaikai
+```kaikai-fragment
 fn pipeline(xs: [Int]) : [Int] =
   xs
     | (x => x * 2)
@@ -116,7 +123,7 @@ expression or statement, stays on one line when it fits. Broken by
 the author, over budget, or holding a multi-statement branch, it takes
 the block form — which is a fixed point.
 
-```kaikai
+```kaikai-fragment
 fn abs(x: Int) : Int = if x > 0 { x } else { 0 - x }
 ```
 
@@ -251,11 +258,12 @@ token on every source line, and the probe counters a speculative
 render is measured by. `compiler/fmt_layout.kai` is the model: the
 probes (`fmt_try_flat`, `fmt_head_fits`) and the three shapes
 (`fmt_hang`, `fmt_seq`, `fmt_chain`); nothing in it walks the AST.
-`compiler/fmt_chain.kai` reads the parser's precedence ladder back
+`compiler/fmt_shape.kai` reads the parser's precedence ladder back
 (which operand needs parentheses, how a nest flattens into a chain,
-where an expression's first token sits). `compiler/fmt_expr.kai` and
-`compiler/fmt_decl.kai` — the walker — pass emitters and source
-facts to the model and emit nothing width-related themselves.
+where an expression's first token sits). `compiler/fmt.kai`,
+`compiler/fmt_expr.kai` and `compiler/fmt_form.kai` — the walker —
+pass emitters and source facts to the model and emit nothing
+width-related themselves.
 
 Three constraints hold, all gated:
 

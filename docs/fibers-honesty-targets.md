@@ -26,8 +26,10 @@ inventories what is left after the R2 lane closed (`0.4.0`) and the
 > were spot-checked against runtime symbols, fixtures, and closing
 > PR numbers — all green.
 
-Tier 1 + Tier 2 closed. The runtime is BEAM-style cooperative
-single-threaded; everything that surfaced in a 30-minute live demo
+Tier 1 + Tier 2 closed. The runtime is a BEAM-style cooperative M:N
+scheduler: fibers yield at well-defined points and run on a pool of
+scheduler threads (`KAI_THREADS`, default the host CPU count capped at
+32; `KAI_THREADS=1` runs one). Everything that surfaced in a 30-minute live demo
 or in the 1.0-honesty target list is shipped and verifiable.
 
 - R2 cooperative scheduler landed v0.4.0 (`ucontext`, READY/RUNNING/
@@ -386,24 +388,6 @@ the park ends on its own:
   the receiver frees a slot or its mailbox closes;
 - a fiber parked in `Spawn.await` or in a nursery join, which resumes
   when the fiber it waits for terminates.
-
-## Sequencing recommendation
-
-Right after m4c body subst (`r4-m4c-body-subst` lane in flight as
-of this writing) closes:
-
-1. **Tier 1 quick win** — R4 + stack guard pages, ~1 day, single
-   commit each. Removes the only two embarrassing surfaces.
-2. **Tier 2 runtime lane** — Monitor + spawn_actor + region-brand
-   + LLVM in_dispatch + trap-exit + Spawn API cleanup. Can be
-   one big lane or split into 2–3 smaller ones; the items are
-   mostly independent. ~8–10 days.
-3. **L3 tutorial** — only after Tier 2. The tutorial cannot
-   honestly cover concurrency until Monitor and supervision work.
-
-Tier 3 stays explicitly post-MVP. If a feature request for
-multi-threaded scheduling comes in pre-1.0, the answer is "after
-1.0".
 
 ## What this document is NOT
 

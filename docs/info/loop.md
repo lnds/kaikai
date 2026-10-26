@@ -75,7 +75,7 @@ fn main() : Unit / Stdout = {
   # `forever` returns `Nothing`: the type system knows there is no
   # normal-completion path. The only exits are `Cancel` (cooperative
   # cancellation) or an effect op returning `Nothing`. In a real
-  # program the body would call `Cancel.cancel()`.
+  # program the body would call `Cancel.raise()`.
   if maybe_done() {
     forever {
       Stdout.print("tick")
@@ -129,10 +129,10 @@ any longer cycle — runs in constant stack on both backends. The group
 is fused into one self-recursive function, so the cycle becomes the
 same loop a self-tail call compiles to.
 
-The cycle's members have to share one signature for this: same
-parameter types, same return type, same effect row, and no type
-parameters. A cycle whose members disagree on any of those still
-consumes a frame per hop.
+The cycle's members have to agree on the return type and the effect
+row, and declare the same type parameters (same kinds, same bounds);
+their parameter lists may differ. A cycle whose members disagree on
+any of those still consumes a frame per hop.
 
 A tail call that is not part of a cycle — `f` calling `g` where `g`
 never leads back to `f` — is an ordinary call and keeps its frame.

@@ -45,16 +45,29 @@ by construction.
 
 Anything else is rejected at compile time:
 
-```
+```text
 error: effect not handled in spawned fiber: Fail
   = note: a fiber does not inherit the parent's handlers
-  = help: handle the effect inside the spawned body
+  = help: handle the effect inside the spawned body: `handle { ... } with Fail { ... }`
 ```
 
 Put the handler inside the spawned body:
 
-```kai
-n.spawn(() => handle { work() } with Fail { fail(m, resume) -> () })
+```kaikai
+import spawn
+
+effect Fail {
+  fail(msg: String) : Unit
+}
+
+fn work() : Int / Fail = { Fail.fail("boom"); 1 }
+
+fn main() : Int / Spawn = {
+  nursery { n ->
+    let f = n.spawn(() => handle { work() } with Fail { fail(m, resume) -> 0 })
+    n.await(f)
+  }
+}
 ```
 
 The rule covers every surface that reaches a fiber: `n.spawn`, the
@@ -62,11 +75,18 @@ free `spawn`, `Spawn.spawn`, and `spawn_actor` / `spawn_actor_policy`.
 
 ## Syntax
 
-```kai
-nursery { n ->
-  let a = n.spawn { task_a() }
-  let b = n.spawn { task_b() }
-  combine(n.await(a), n.await(b))
+```kaikai
+import spawn
+
+fn task_a() : Int = 1
+fn task_b() : Int = 2
+
+fn main() : Int / Spawn = {
+  nursery { n ->
+    let a = n.spawn { task_a() }
+    let b = n.spawn { task_b() }
+    n.await(a) + n.await(b) - 3
+  }
 }
 ```
 
@@ -82,9 +102,6 @@ nursery { n ->
 - `n.cancel(f: Fiber[T]) : Unit / Spawn` requests cancellation
   of one specific child. The child receives `Cancel.raise()`
   at its next yield point.
-- `n.cancel_all() : Unit / Spawn` requests cancellation of every
-  child of the nursery. Same delivery mechanism as `cancel`,
-  applied to all live children.
 - Leaving the nursery block **waits for all pending children** —
   no explicit `await` is required.
 - If a child raises `Cancel` on its own (a crash that is not a
@@ -104,13 +121,19 @@ nursery { n ->
   scope closes, clean up, and choose what happens next.
 
   ```kaikai
-  handle {
-    nursery { n ->
-      let r = n.spawn(() => risky())
-      n.await(r)
+  import spawn
+
+  fn risky() : Int / Cancel = Cancel.raise()
+
+  fn main() : Int / Spawn + Stdout = {
+    handle {
+      nursery { n ->
+        let r = n.spawn(() => risky())
+        n.await(r)
+      }
+    } with Cancel {
+      raise(resume) -> { Stdout.print("a child failed; cleaning up"); 1 }
     }
-  } with Cancel {
-    raise(resume) -> println("a child failed; cleaning up")
   }
   ```
 
@@ -213,28 +236,32 @@ The flag does not run inference, so it is cheap to consult on a
 file whose typer would otherwise reject the program. Pinned by
 the `m8x_8_brand_dump.brands.expected` golden under tier 1.
 
-```kai
+```kaikai
+import spawn
+
 # Polymorphic over whatever effect the worker carries.
-pub fn pmap[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e + Spawn + Cancel {
+pub fn pmap[A, B, e](xs: [A], f: (A) -> B / e) : [B] / Spawn + Cancel + e {
   nursery { n ->
     xs | (x) => n.spawn { f(x) } | n.await
   }
 }
+
+fn main() : Int / Spawn + Cancel = list.length(pmap([1, 2, 3], (x) => x * 2)) - 3
 ```
 
 If the caller is in a pure context, `e` resolves to the empty set
-and the row collapses to `/ Spawn + Cancel`. If the caller is
-already under `Console`, `e = Console` and the signature becomes
-`/ Console + Spawn + Cancel`.
+and the row collapses to `/ Spawn + Cancel`. If `f` prints,
+`e = Stdout` and the row becomes `/ Spawn + Cancel + Stdout`. The
+row variable comes last in the row. `e` may only carry effects
+that cross a spawn (§*The spawn boundary*).
 
 ## Cancellation
 
 `Cancel` is delivered when:
 
 - A sibling fiber in the same nursery crashes.
-- The nursery is cancelled wholesale via `n.cancel_all()` (cancels
-  every child) or a child is cancelled individually via
-  `Spawn.cancel(fiber)`.
+- A child is cancelled individually via `n.cancel(fiber)` /
+  `Spawn.cancel(fiber)`, or loses a `select`.
 - The surrounding fiber is itself cancelled (propagation).
 
 A fiber that wants to clean up on cancellation wraps the affected
@@ -242,20 +269,43 @@ region in a `Cancel` handler. The handler runs the cleanup and
 does not call `resume`; the fiber unwinds out of the wrapped
 block:
 
-```kai
-fn worker(m: ActorCap[Job]) : Unit / Actor[Job] + Console + Mutable + Cancel {
+```kaikai
+import actor
+import spawn
+
+type Job = Job(Int)
+
+fn serve(counter: Ref[Int]) : Unit / Actor[Job] + Mutable = {
+  match Actor.receive() {
+    Job(_n) -> Mutable.ref_set(counter, Mutable.ref_get(counter) + 1)
+  }
+  serve(counter)
+}
+
+fn worker() : Unit / Actor[Job] + Stdout + Mutable + Cancel = {
   let counter = Mutable.ref_make(0)
   handle {
-    forever {
-      process(counter, m.receive())
-    }
+    serve(counter)
   } with Cancel {
     raise(resume) -> {
       let final = Mutable.ref_get(counter)
-      Console.eprint("worker: cancelled after #{final} jobs")
+      Stdout.print("worker: cancelled after #{final} jobs")
       # resume is intentionally not called — the fiber unwinds
     }
   }
+}
+
+fn main() : Int / Spawn + Stdout + Cancel = {
+  nursery { n ->
+    let f = n.spawn(() => with_mailbox {
+      Actor.send(Actor.self(), Job(1))
+      Actor.send(Actor.self(), Job(2))
+      worker()
+    })
+    Spawn.yield()
+    n.cancel(f)
+  }
+  0
 }
 ```
 
@@ -272,31 +322,27 @@ handler in the call chain — and unwinds straight
 to the trampoline cancel pad so the link-propagation walk can push
 a `"Crashed"` string into the supervisor's mailbox. See
 docs/actors.md §*Trap-exit semantics* for the BEAM-faithful
-contract this enforces (issue #103).
+contract this enforces.
 
 ## Patterns
 
 ### Race (first result wins)
 
-> **v1 status (2026-08-02):** `Spawn.select` now races — it parks on
-> every candidate, returns the first to terminate, and requests cancel
-> on the losers (issue #1539). The two wrappers below are still not
-> writable as shown: `nursery` brackets `Spawn` rather than
-> discharging it, so `Spawn` stays in the row and these signatures do
-> not typecheck (issue #1532). Call `Spawn.select` directly until
-> #1532 lands.
+```kaikai
+import spawn
 
-```kai
-pub fn race[T, e](options: [() -> T / e]) : T / e + Spawn + Cancel {
+pub fn race[T, e](options: [() -> T / e]) : T / Spawn + Cancel + e {
   nursery { n ->
     let fibers = options | (f) => n.spawn(f)
     n.select(fibers)
   }
 }
+
+fn main() : Int / Spawn + Cancel = race([() => 1, () => 2]) - 1
 ```
 
 Polymorphic in `e` so the candidate functions can carry any
-effect set (`Console`, `File`, `Io`, etc.).
+effect set that crosses a spawn (`Stdout`, `Clock`, …).
 
 Selection is by completion order. A candidate that terminates first
 wins regardless of its position in the list; position breaks ties only
@@ -307,55 +353,69 @@ of waiting out work whose result nobody can observe.
 
 ### Timeout
 
-> **v1 status (2026-08-02):** the race half works — `Spawn.select`
-> returns whichever of the two children finishes first and cancels the
-> other. The wrapper below still does not typecheck as written, for
-> the same reason `race` does not: `nursery` leaves `Spawn` in the row
-> (issue #1532). Spawn the task and the timer into a nursery and call
-> `Spawn.select` on them directly until #1532 lands.
+```kaikai
+import spawn
+import time
 
-```kai
 type Outcome[T] =
-  | Value(value: T)
+  | Value(T)
   | Timeout
 
 pub fn with_timeout[T, e](
   ms:   Int,
   task: () -> T / e
-) : Option[T] / e + Spawn + Cancel + Time {
+) : Option[T] / Spawn + Cancel + Clock + e {
   nursery { n ->
     let winner = n.spawn { Value(task()) }
-    let timer  = n.spawn { Time.sleep(ms); Timeout }
+    let timer  = n.spawn { time.sleep(time.millis(ms)); Timeout }
     match n.select([winner, timer]) {
       Value(v) -> Some(v)
       Timeout  -> None
     }
   }
 }
+
+fn slow() : Int / Clock = { time.sleep(time.millis(500)); 1 }
+
+fn main() : Int / Spawn + Cancel + Clock + Stdout = {
+  match with_timeout(10, slow) {
+    Some(v) -> Stdout.print("value #{v}")
+    None    -> Stdout.print("timed out")
+  }
+  0
+}
 ```
 
-The clock capability the sketch calls `Time` ships as `Clock`
-(`stdlib/time.kai`): `time.sleep(time.millis(n))` parks the fiber on
-the reactor timer, so a timer child cancelled by `select` unwinds
-rather than sleeping out its deadline.
+`time.sleep` parks the fiber on the reactor timer, so a timer
+child cancelled by `select` unwinds rather than sleeping out its
+deadline.
 
 ### Actor supervision
 
-```kai
-pub fn run_pipeline(
-  s: Pid[Source], w: [Pid[Work]], k: Pid[Collected]
-) : Unit / Spawn + Cancel {
-  nursery { n ->
-    let source = n.spawn { producer(s) }
-    each([1..4]) { _ -> n.spawn { worker(s, w) } }
-    let sink   = n.spawn { collector(w, k) }
-    n.await(sink)
+```kaikai
+import spawn
+
+fn produce() : Int / Spawn = { Spawn.yield(); 1 }
+fn crunch() : Int / Cancel = Cancel.raise()
+fn collect() : Int / Spawn = { Spawn.yield(); 2 }
+
+fn run_pipeline() : Int / Spawn + Cancel = nursery { n ->
+  let _source = n.spawn { produce() }
+  let _worker = n.spawn { crunch() }
+  let sink    = n.spawn { collect() }
+  n.await(sink)
+}
+
+fn main() : Int / Spawn + Stdout = {
+  handle { run_pipeline() } with Cancel {
+    raise(resume) -> { Stdout.print("a stage crashed; pipeline cancelled"); 1 }
   }
 }
 ```
 
-If any worker crashes, the producer and sink are cancelled
-before `run_pipeline` returns. For the actor surface (mailbox
+If any stage crashes, the others are cancelled before
+`run_pipeline` returns, and the failure re-raises to the
+`with Cancel` around it. For the actor surface (mailbox
 policies, link/monitor supervision, `spawn_actor`,
 `with_mailbox`), see `docs/actors.md`.
 
@@ -381,17 +441,18 @@ effect row contains `Spawn` triggers the root nursery
 installation (Doc B §`main` and the runtime *Installation
 order*):
 
-```kai
-fn main() : Unit / Console + Spawn + Cancel {
-  let processed = pmap([1..100], heavy)
-  Console.print("processed #{processed.length} items")
+```kaikai
+fn child() : Unit / Spawn + Stdout = { Spawn.yield(); Stdout.print("child ran") }
+
+fn main() : Int / Spawn + Stdout = {
+  let _ = Spawn.spawn(() => child())
+  Stdout.print("main returns")
+  0
 }
-# In this example pmap closes its internal nursery before
-# returning, so there is nothing left to wait on. The implicit
-# root nursery matters when main spawns fibers directly at the
-# top level (without an inner nursery) — those fibers are
-# joined before the program exits with 0.
 ```
+
+`main` spawns `child` at the top level, without a nursery of its
+own; the root nursery joins it before the program exits.
 
 ## Non-goals
 
@@ -418,9 +479,9 @@ Requires:
 
 - The effects + handlers machinery from m7a (row unification,
   direct-style op dispatch, handler-stack runtime).
-- `Fiber[T]` as a region-branded handle; the region check is
-  a small extension to the existing type checker, sharing the
-  brand machinery with `Pid[Msg]` from `docs/actors.md`.
+- `Fiber[T]` as a scope-bound handle (§*Type system*): the
+  return-type escape check it shares with `Pid[Msg]`, plus the
+  per-nursery brand check.
 - A scheduler in the runtime: per-fiber stacks (segmented or
   heap-allocated), a cooperative scheduler loop, and a
   cancellation flag every yield-point op checks.

@@ -68,5 +68,6 @@ i=0; while [ "$i" -lt "$n" ]; do
 done
 ```
 
-Not wired into a test tier: `kai mutate` is a diagnostic run at
-discretion, not a gate.
+The `operators.kai` checks above are run by hand. The
+`test-mutate-*` targets run in tier 1 (`stage2/test-registry.txt`), and
+`tools/test-kai-cli.sh` runs the `no_sites.kai` checks.

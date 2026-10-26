@@ -12,7 +12,10 @@ kaikai's bitwise ops are intrinsic *functions*, not operators: `bit_and`, `bit_o
 unreadable — a SHA-256 line in `stdlib/crypto/hash.kai`:
 
 ```kaikai
-bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)), bit_or(bit_shl(b2, 8), b3))
+fn word(b0: Int, b1: Int, b2: Int, b3: Int) : Int =
+  bit_or(bit_or(bit_shl(b0, 24), bit_shl(b1, 16)), bit_or(bit_shl(b2, 8), b3))
+
+fn main() : Unit / Stdout = Stdout.print(int_to_string(word(1, 2, 3, 4)))
 ```
 
 is `(b0 << 24) | (b1 << 16) | (b2 << 8) | b3` everywhere else. `crypto/hash.kai` is
@@ -28,9 +31,10 @@ paying permanent global surface for a domain that is rare outside systems code.
 
 Inside the scope, the natural symbols recover their bitwise meaning; outside, they
 do not exist as operators and collide with nothing (spelling ``b`…` `` is the
-current lean, not final — see below):
+current lean, not final — see below). Proposed form; not implemented — kaikai has
+only the `bit_*` functions today:
 
-```kaikai
+```text
 let bneg = b`x & 0xFF << 8 | 0x80`
 let w    = b`b0 << 24 | b1 << 16 | b2 << 8 | b3`
 let hi   = b`flags & 0x80`
@@ -45,8 +49,8 @@ Markdown, never in the lexer), so the sigil is available.
 ### Sigil spelling — leaning ``b`…` `` (not final)
 
 The exact prefix is **left open** for a dedicated syntax decision, but the current
-lean is a **prefixed** form ``b`…` `` (`b` for *bits*/*binary*) over the bare
-``` `…` ```, for three reasons:
+lean is a **prefixed** form ``b`…` `` (`b` for *bits*/*binary*) over the
+bare ``` `…` ```, for three reasons:
 
 - **Unambiguous open.** Bare ``` `…` ``` forces the lexer to decide "am I in a
   scope?" only after seeing content that might be a pipe. ``b`…` `` is
@@ -88,9 +92,10 @@ already lowers, so there is **no new codegen** — only new parsing.
 
 ## Precedence — FLAT, left to right (decided)
 
-The scope has **no precedence levels**. Operators associate strictly left to right:
+The scope has **no precedence levels**. Operators associate strictly left to right
+(proposed syntax):
 
-```kaikai
+```text
 `x & 0xFF << 8 | 0x80`   ==   `((x & 0xFF) << 8) | 0x80`
 ```
 

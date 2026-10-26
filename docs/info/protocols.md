@@ -5,8 +5,8 @@ Single-dispatch protocols, Go/Clojure/Elixir-style.
 ## Description
 
 kaikai has SINGLE-DISPATCH PROTOCOLS only. Lookup is `O(1)` over an
-impl table — no constraint propagation, no HKT, no type families.
-This is a Tier 1 #3 decision (fast compilation).
+impl table — no constraint propagation, no HKT, no type families,
+which keeps compilation fast.
 
 The dispatching parameter has type `Self` (capitalized). It is
 conventionally named `x` (matching `stdlib/protocols.kai`), though
@@ -16,8 +16,9 @@ receiver. Op declarations inside `protocol { ... }` omit `fn`;
 
 ## Stdlib protocols
 
-Show, Eq, Ord, Hash, Serialize, BinSerialize, Default, and the
-arithmetic family Add[a] / Sub[a] / Mul[a] / Div[a] / Rem[a] / Neg.
+Show, Eq, Ord, Hash, Serialize, BinSerialize, Layout, Json, Default,
+Numeric (`math.numeric`), and the arithmetic family Add[a] / Sub[a] /
+Mul[a] / Div[a] / Rem[a] / Neg.
 
 An operator on a non-primitive type calls the matching impl: `a + b` is
 `Add.add`, and unary `-x` is `Neg.neg`. A type with no impl is a compile

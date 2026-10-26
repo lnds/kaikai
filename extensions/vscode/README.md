@@ -1,8 +1,9 @@
 # kaikai VS Code extension
 
-Minimal extension that wires the `kai lsp` language server (issue
-#447) into VS Code. v1 surfaces hover; goto-def, diagnostics, and
-completion ride newer LSP releases without extension changes.
+Minimal extension that starts `kai lsp` as the language server for
+`.kai` files. Every method the server supports (hover, completion,
+go-to-definition, diagnostics, document symbols, signature help)
+reaches VS Code without extension changes.
 
 ## Install (dev)
 

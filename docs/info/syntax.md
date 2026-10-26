@@ -283,8 +283,9 @@ opens its public names bare, `import loop as lp` binds the qualifier
 opens an effect's operations so they resolve by bare name, at file top
 or inside any block. `use` takes an effect
 (PascalCase) or a kind (`use kind Fiat`, see `kai info kinds`) —
-never a module. `import ?name` is the dependency hole: the resolver
-searches packages for a symbol named `name` (`kai info holes`); a
+never a module. `import ?name` is the dependency hole: the build stops
+with an error naming the modules that export `name`, searching the
+modules the file imports plus a few stdlib ones (`kai info holes`); a
 bare `import ?` is rejected.
 
 A bare name reaches the nearest binding of it, in this order: a local
@@ -672,7 +673,7 @@ Reader[String]`); a lowercase name is a row VARIABLE (`fn each[a, e](
 xs: [a], f: (a) -> Unit / e) : Unit / e` — the tail stays open and
 unifies with the caller's row); `/ ?e` is a row hole (`kai info
 holes`); and a composed row can sit in type-arg position
-(`Stream[Int, Stdout + Fail]`).
+(`Stream[Int, Stdout + Random]`).
 
 More handler surface (all in `kai info effects`): `with E as name`
 rebinds the capability as a first-class value (ops go through the
@@ -910,7 +911,8 @@ types written with a literal suffix: `42i32` (`Int32`), `42u32`
 (`UInt32`), `42u64` (`UInt64`), `42i128` (`Int128`). They are
 kind-distinct from `Int` — an `Int32` does not unify with an `Int`, so
 mixing them is a type error; convert explicitly with `int_to_int32` /
-`int32_to_int` (and the `u32`/`u64`/`i128` analogues). Arithmetic
+`int32_to_int` (and `int_to_uint32`, `int_to_uint64`, `int_to_int128`
+with their inverses). Arithmetic
 (`+ - * / %`) wraps two's-complement in the width; `/`/`%` are signed for
 `Int32`, unsigned for `UInt32`/`UInt64`, and trap on a zero divisor.
 Comparisons are signed/unsigned per width, and `Show` / `Eq` / `Ord` /
@@ -930,7 +932,8 @@ to 2^64−1 takes `…u64`, which holds it exactly without reaching for
 attaches to a decimal/hex/bin literal with no intervening space
 (`0xFFi32`, `0b1010u8`); `42i` without a width stays a complex
 literal, and there is no `i64` suffix (`Int` is already 64-bit — a
-stray `42i64` reads as a complex literal, not an integer).
+stray `42i64` lexes as the complex literal `42i` followed by `64`, a
+parse error).
 
 In an `extern "C"` signature these widths marshal honestly: `Int32`
 crosses as C `int32_t`, `UInt32` as `uint32_t`, `UInt64` as `uint64_t`.
@@ -1592,7 +1595,7 @@ fn main() : Int = {
 
 Use instead:
 
-- `fn f(0) = ...` / `fn f(n) when ... = ...` (Elixir multi-clause head) → a clause-block `fn f(n) { case 0 -> ...; case _ -> ... }`
+- `fn f(0) = ...` / `fn f(n) when ... = ...` (Elixir multi-clause head) → a clause-block `fn f(n: Int) : T { case 0 -> ...; case _ -> ... }`
 - `case n if cond ->` (clause-block guard) → `case n when cond ->` (`if` is the plain-`match` guard)
 - `\x -> body` / `fn x -> body` → `(x) => body`
 - `(+ 1)` → `(x => x + 1)`

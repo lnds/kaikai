@@ -508,7 +508,7 @@ LEFT form does NOT exist in kaikai; write the RIGHT form. The
 authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
 
 - `fn f(0) = ...` / `fn f(n) when c = ...` (Elixir multi-clause head)
-  → a clause-block `fn f(n) { case 0 -> ...; case _ -> ... }`
+  → a clause-block `fn f(n: Int) : T { case 0 -> ...; case _ -> ... }`
 - `\x -> body` (Haskell) / `fn x -> body` (ML) → `(x) => body`
 - `(+ 1)` operator section → `(x => x + 1)`
 - `[x * 2 for x in xs]` list comprehension → `xs | (x => x * 2)`
@@ -534,7 +534,7 @@ authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
   (`{ log(x); f(x) }`); without it the second is a parse error
 - a `Mutable` cell shared with a `spawn`ed fiber → keep the state in an
   actor and send it messages (`kai info actors`); a spawned thunk may
-  not perform `Mutable`
+  not capture a `Ref` or an `Array`
 - `s | (c => ...)` over a `String` → `chars(s) | (c => ...) |> from_chars`;
   a `String` is not a collection the map pipe walks
 

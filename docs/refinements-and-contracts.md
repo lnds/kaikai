@@ -15,17 +15,26 @@ two.**
 
 ### Refinement types — restrict the valid values of a type
 
-```kai
+```kaikai
+import regexp.{matches}
+
 type CurrencyCode = String where matches ~r/^[A-Z]{3}$/
 type NonNegative  = Int    where >= 0
-type Percent      = Real   where 0.0 <= self <= 1.0
-type Port         = Int    where 1 <= self <= 65535
+type Percent      = Real   where 0.0 <= self and self <= 1.0
+type Port         = Int    where 1 <= self and self <= 65535
+
+fn main() : Unit / Stdout = {
+  let c : CurrencyCode = "USD"
+  let p : Port = 8080
+  Stdout.print("#{c} #{p}")
+}
 ```
 
 Regex predicates use the `~r/.../` sigil (Elixir-style — `~r`
 followed by a delimiter pair). The sigil is an expression in its
 own right (typed `Regex`); `where matches ~r/.../` desugars to
-`matches(self, ~r/.../)`, mirroring the `where >= 0` →
+`matches(self, ~r/.../)` (`matches` comes from `import
+regexp.{matches}`), mirroring the `where >= 0` →
 `self >= 0` receiver-elision sugar already familiar from numeric
 predicates.
 
@@ -41,21 +50,26 @@ template literal types** (limited to string shapes).
 
 ### Contracts — restrict what operations expect and guarantee
 
-```kai
+```kaikai
+import decimal
+
+unit USD
+
+type Account = { balance: Decimal<USD>, transactions: Int }
+
 fn divide(a: Real, b: Real) : Real
   requires b != 0.0
-  ensures  is_finite(result)
 = a / b
 
 fn deposit(acc: Account, amount: Decimal<USD>) : Account
-  requires amount > 0.0
   ensures  result.balance == acc.balance + amount
   ensures  result.transactions == acc.transactions + 1
-=
-  { acc with
-    balance = acc.balance + amount,
-    transactions = acc.transactions + 1
-  }
+= Account { ...acc, balance: acc.balance + amount, transactions: acc.transactions + 1 }
+
+fn main() : Unit / Stdout = {
+  let acc = deposit(Account { balance: 10.00<USD>, transactions: 0 }, 5.00<USD>)
+  Stdout.print("#{divide(1.0, 4.0)} #{acc.transactions}")
+}
 ```
 
 A contract is `requires <predicate>` (preconditions, the caller
@@ -116,11 +130,10 @@ exactly the same way as `panic` and unfilled `?`.
 
 Predicates are **decidable**. The constraints that keep them so:
 
-1. **Pure**: no effects, no user-defined function calls except
-   core predicates explicitly marked `[<refinement_pure>]`
-   (e.g. `is_finite`, `is_nan`, regex constants).
+1. **Pure**: no effects. A predicate may call any fn whose effect
+   row is empty; purity is read from the row, with no attribute.
 2. **Linear in the AST**: interval propagation over comparisons,
-   constant-folding over `&&` / `||` / `!`.
+   constant-folding over `and` / `or` / `not`.
 3. **No SMT**: when the typer cannot prove a predicate, it does
    not try harder; it inserts a runtime check. This is the
    single biggest decision separating the lite design from
@@ -164,7 +177,10 @@ audit trail"** — selling effects in signatures as the structural
 evidence a CISO/auditor needs. Refinements + contracts are the
 **third leg** of that pitch:
 
-```kai
+Signature sketch (no body; `Audit` and `DB` stand for application
+effects, and kaikai spells tuple fields `.fst` / `.snd`):
+
+```text
 fn transfer(from: Account, to: Account, amount: Decimal<USD>) : (Account, Account)
   / Audit + DB
   requires from.balance >= amount
@@ -190,7 +206,10 @@ The branded-types case (`String<UserId>` ≠ `String<OrderId>`)
 that UoM enables extends naturally: refinement types add value
 constraints to those brands.
 
-```kai
+Sketch (`String<Sanitized>` is a proposed brand; kaikai attaches
+units to `Real`, `Int` and `Decimal` only):
+
+```text
 type Email     = String where matches ~r/^[^@]+@[^@]+\.[^@]+$/
 type UserId    = String where matches ~r/^u_[a-zA-Z0-9]{16}$/
 type Sanitized = String where ... # post-sanitiser invariant
@@ -211,15 +230,24 @@ kaikai-specific decisions. Each one pinned for review.
 **Decision**: `where` clause after the base type, with `self`
 referencing the value.
 
-```kai
-type Port         = Int    where 1 <= self <= 65535
+```kaikai
+import regexp.{matches}
+
+type Port         = Int    where 1 <= self and self <= 65535
 type CurrencyCode = String where matches ~r/^[A-Z]{3}$/
 type NonNegative  = Int    where self >= 0    # self explicit
 type NonNegative2 = Int    where >= 0         # self elided (unary comparison)
+
+fn main() : Unit / Stdout = {
+  let p : Port = 443
+  let n : NonNegative2 = 1
+  Stdout.print("#{p} #{n}")
+}
 ```
 
 When the predicate is a unary comparison against a literal, `self`
-on the LHS may be elided. Otherwise `self` is mandatory.
+on the LHS may be elided. Otherwise `self` is mandatory. Comparisons
+do not chain: a range is two comparisons joined by `and`.
 
 Reasons:
 - `where` reads as the natural English: "Int where (it is) >= 0".
@@ -234,16 +262,17 @@ Reasons:
 **Decision**: `requires` and `ensures` clauses between the
 signature and the `=` (or `{`) of the body.
 
-```kai
+```kaikai
 fn divide(a: Real, b: Real) : Real
   requires b != 0.0
-  ensures  is_finite(result)
 = a / b
 
 fn factorial(n: Int) : Int
   requires n >= 0
   ensures  result >= 1
 = if n == 0 { 1 } else { n * factorial(n - 1) }
+
+fn main() : Unit / Stdout = Stdout.print("#{divide(1.0, 4.0)} #{factorial(5)}")
 ```
 
 Multiple `requires` and `ensures` clauses are allowed — they
@@ -262,19 +291,18 @@ Reasons:
 
 Allowed:
 - Comparisons: `<`, `<=`, `==`, `!=`, `>`, `>=`.
-- Boolean operators: `&&`, `||`, `!`.
+- Boolean operators: `and`, `or`, `not`.
 - Constants and `self` / arguments / `result`.
 - Field access on records (`acc.balance`).
-- Core predicates marked `[<refinement_pure>]`: `is_finite`,
-  `is_nan`, `length` (on lists/strings), `is_some`, `is_none`,
-  string `matches ~r/regex/` (regex literals lex as the
-  Elixir-style sigil `~r/.../`; full-match semantics).
+- Calls to pure fns (an empty effect row), including string
+  `matches ~r/regex/` (regex literals lex as the Elixir-style sigil
+  `~r/.../`; full-match semantics).
 - Arithmetic operations between constants and refined values
   (so the typer can interval-propagate).
 
 Disallowed:
-- Calls to user-defined functions (would need effect-purity
-  proof; punt to a future extension).
+- Calls to functions with effects (purity is read from the effect
+  row: any fn with an empty row is allowed).
 - Quantifiers (`forall`, `exists`).
 - References to mutable state outside `args` and `result`.
 - `old` keyword (kaikai has no cross-function mutable state
@@ -318,19 +346,28 @@ Reasons:
 **Decision**: explicit narrowing via `ensure` (one-shot, returns
 `Option`) or pattern match (multi-arm).
 
-```kai
-# one-shot conversion
-fn from_int(n: Int) : Option<Port> = ensure(n) where 1 <= self <= 65535
-# desugars to: if 1 <= n && n <= 65535 { Some(n) } else { None }
+```kaikai
+type Port = Int where 1 <= self and self <= 65535
 
-# pattern-style narrowing
-match n {
-  p : Port -> use_port(p)
-  _        -> Fail.fail("port out of range: #{n}")
+# one-shot conversion
+fn from_int(n: Int) : Option[Port] = ensure(n) where 1 <= self and self <= 65535
+
+fn describe(n: Int) : String = match n {
+  p : Port -> "port #{p}"
+  _        -> "port out of range: #{n}"
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(describe(8080))
+  Stdout.print(describe(70000))
+  match from_int(22) {
+    Some(p) -> Stdout.print("ok #{p}")
+    None    -> Stdout.print("none")
+  }
 }
 ```
 
-`ensure(value) where Predicate` returns `Option<RefinedT>`
+`ensure(value) where Predicate` returns `Option[RefinedT]`
 (`Some` if predicate holds, `None` otherwise). The match-arm
 form `p : Port` accepts the value as `Port` if the predicate
 holds at runtime.
@@ -347,10 +384,30 @@ error. The explicit path maps the value through a function that
 checks it and returns the refined type. A literal is the exception,
 since each part is checked as it is built:
 
-```kai
-let xs: [Pos] = [1, 2, 3]           # each element checked
-let ys: [Pos] = ints()              # error: [Int] does not narrow to [Pos]
-let zs: [Pos] = map(ints(), to_pos) # explicit, with to_pos : (Int) -> Pos
+```kaikai
+type Pos = Int where self > 0
+
+fn ints() : [Int] = [4, 5]
+fn to_pos(n: Int) : Pos = if n > 0 { n } else { 1 }
+
+fn main() : Unit / Stdout = {
+  let xs: [Pos] = [1, 2, 3]           # each element checked
+  let zs: [Pos] = ints() | to_pos     # explicit, through a checking function
+  Stdout.print("#{xs |> length()} #{zs |> length()}")
+}
+```
+
+The implicit form is rejected:
+
+```kaikai-neg
+type Pos = Int where self > 0
+
+fn ints() : [Int] = [4, 5]
+
+fn main() : Unit / Stdout = {
+  let ys: [Pos] = ints()              # error: [Int] does not narrow to [Pos]
+  Stdout.print("#{ys |> length()}")
+}
 ```
 
 Widening follows variance, computed from the type's definition.
@@ -376,7 +433,10 @@ its decidability.
 
 **Decision**: orthogonal, naturally composable.
 
-```kai
+Proposed form; a refinement on a dimensioned `Decimal` does not
+compile today (it does on `Real<u>`):
+
+```text
 type PositiveMoney[u: Measure] = { amount: Decimal<u> where >= 0 }
 
 fn deposit(acc: Account, amount: PositiveMoney<USD>) : Account
@@ -395,7 +455,9 @@ ranges and shapes. A single field can carry both.
 are pure (no effects); the function body still has whatever
 effect row it declares.
 
-```kai
+Sketch (`OrderId` and `DB` are illustrative):
+
+```text
 fn fetch_amount(id: OrderId) : Decimal<USD> / DB
   requires String.length(id) > 0
   ensures  result >= 0.0
@@ -432,9 +494,8 @@ value, and the call site.
 > parameter's *declared* annotation, not the comparison literal: an
 > `n != 0` over `n: Int` reads `Int where != 0`. A declared type is the
 > right source for an edit suggestion — it is the spelling the user
-> rewrites — and it is already present at the assert-insertion site
-> (`wrap_with_contracts` runs in `parse_decl`), so no typer thread is
-> needed. The help renders only for the single-ident shape piece-2
+> rewrites — and it is already present at the assert-insertion site,
+> so no typer thread is needed. The help renders only for the single-ident shape piece-2
 > covers; other shapes (multi-conjunct, non-scalar, `ensures`) fall
 > through to piece-1 with no help.
 >
@@ -473,7 +534,11 @@ proposed extension.
 
 ### Money + Ledger (C2 Fintech toolkit)
 
-```kai
+Sketch of the target shape; today a refinement on `Decimal<USD>` does
+not compile, record update is `Account { ...from, balance: ... }`, and
+tuple fields are `.fst` / `.snd`:
+
+```text
 type Account = {
   id:           AccountId,
   balance:      Decimal<USD> where >= 0,
@@ -516,7 +581,10 @@ catches it before any caller observes the broken state.
 
 ### Domain types throughout an app
 
-```kai
+Sketch (`User`, `DB` and the `ensures` method call are illustrative;
+kaikai has no method calls, it would be `matches(result.id, ~r/.../)`):
+
+```text
 type Email      = String where matches ~r/^[^@\s]+@[^@\s]+\.[^@\s]+$/
 type Username   = String where matches ~r/^[a-z][a-z0-9_]{2,31}$/
 type IPv4       = String where matches ~r/^\d{1,3}(\.\d{1,3}){3}$/
@@ -585,7 +653,7 @@ matching its predicate without re-checking.
 3. **`result` keyword** in `ensures` predicates only; reject
    elsewhere.
 4. **`ensure(expr) where Pred`** as a primary expression that
-   returns `Option<RefinedT>`.
+   returns `Option[RefinedT]`.
 
 ### Codegen changes
 
@@ -604,9 +672,12 @@ matching its predicate without re-checking.
 
 ### Stdlib changes
 
-A small set of `[<refinement_pure>]` core predicates:
+A small set of `[<refinement_pure>]` core predicates. Not
+implemented: the attribute is rejected, and predicate purity comes from
+the effect row instead (any fn with an empty row may appear in a
+predicate):
 
-```kai
+```text
 fn is_finite(x: Real) : Bool [<refinement_pure>]
 fn is_nan(x: Real) : Bool    [<refinement_pure>]
 fn length[T](xs: [T]) : Int  [<refinement_pure>]
@@ -671,12 +742,9 @@ is doc duplication.
 5. **Diagnostics quality**. "Predicate violated at line 42"
    without context is useless. **Mitigation**: budget ~0.5-1
    day specifically for diagnostics — show the predicate text,
-   the offending value, suggest a narrowing helper. *v2 (refs
-   #86) shipped predicate text + clause kind + function name +
-   decl-site line/col + the runtime value of the offending
-   binding (for simple `requires` predicates, both backends).
-   The call-site span caret and the narrowing-help suggestion
-   remain the follow-up tracked under the same issue.*
+   the offending value, suggest a narrowing helper. *The
+   diagnostic shows all of these for simple `requires` predicates
+   (see §8); the call-site caret is not implemented.*
 
 6. **Composition with UoM**. `Decimal<USD> where >= 0`
    composes correctly when canonicalised; but error messages
@@ -727,104 +795,40 @@ Recommendation: schedule formally as m12.6 in
 joint m12.5+m12.6 pre-flight if the C2-pre fintech demo wants
 both UoM and refinements together.
 
-## Implementation status — 2026-04-27
+## Implementation status
 
-> **Enforcement status:** a value is checked wherever it flows into
-> a position whose type is refined and the type reaches the value:
-> annotated bindings (`let`, `var` and every write to a `var`),
-> parameters of fns and lambdas, returns, record fields (named,
-> positional and after a spread), constructor payloads, list
-> elements under a `[Refined]` annotation, `Some(v)` and other
-> generic payloads under an annotation that refines them, a lambda's
-> result where its expected type refines it, and consts. The typer
-> decides each of these sites in one place (`refine_coerce`); a
-> parameter is checked once, on entry to the fn or lambda. A closed
-> value that refutes the predicate is a **compile error**; any other
-> value gets a runtime check that panics with the structured
-> diagnostic (`refinement violated in ... / predicate: ... /
-> declared at ...`, same shape as `requires`/`ensures`), and is
-> evaluated once, in source order. No check is emitted where the
-> predicate is proven: constant folding, or a value whose own type
-> already carries the predicate (a `Pos` field or parameter flowing
-> into a `Pos` position).
->
-> Inside a generic type, a refinement is never narrowed implicitly
-> (see §5): `let o: Option[Pos] = f()` where `f` returns
-> `Option[Real]` is a compile error, while a literal (`[1, 2]`,
-> `Some(v)`) is still checked part by part.
+`kai info contracts` is the user-facing reference for what runs. In
+short:
 
-**Parser-side landed (sub-lanes a–e).** `BaseT where Pred`,
-`requires` / `ensures` clauses, the `result` binding, parse-time
-constant folding, and the `ensure(value) where pred` primary
-expression all ship in `stage2/compiler.kai`. The factorials and
-collatz demos use them; both flip from PASS-no-golden to OK on
-`make demos-no-regression`.
+- **Syntax**: `BaseT where Pred` (with the unary `where >= 0`
+  elision), `requires` / `ensures` clauses with `result` bound in
+  `ensures`, `ensure(value) where pred` returning `Option[T]`, and
+  the `~r/.../` regex sigil with `matches` from `regexp`.
+- **Checking**: a refinement is a subtype of its base, so widening is
+  free. A value flowing into a refined position is checked: annotated
+  bindings (`let`, `var` and every write to a `var`), parameters of
+  fns and lambdas, returns, record fields (named, positional and
+  after a spread), constructor payloads, list elements under a
+  `[Refined]` annotation, `Some(v)` and other generic payloads under
+  an annotation that refines them, a lambda's result where its
+  expected type refines it, and consts. A closed value that refutes
+  the predicate is a **compile error**; any other value gets a
+  runtime check that panics with the structured diagnostic, evaluated
+  once, in source order. No check is emitted where the predicate is
+  proven: constant folding, interval propagation at the call site, a
+  value whose own type already carries the predicate, or a regex
+  refinement whose anchored single-class pattern is contained in the
+  required one.
+- **Generics**: inside a generic type a refinement is never narrowed
+  implicitly (see §5); a literal is still checked part by part.
+- **Narrowing**: a match arm `p : RefinedT` binds `p` when the
+  predicate holds.
+- **Purity**: a predicate may call any fn whose effect row is empty;
+  the `[<refinement_pure>]` attribute is rejected.
 
-What this means in practice for code today:
-
-- `type Port = Int where 1 <= self and self <= 65535` parses
-  and the predicate is preserved on the syntactic TypeExpr. The
-  semantic type drops to `Int` (so `Port` is a nominal alias of
-  `Int`, no implicit narrowing), but everything that walks
-  TyKind treats `TyRefine(base, _)` as transparent — display,
-  protocol dispatch, alias expansion, etc.
-- `requires P` and `ensures Q` on a fn signature lower to
-  asserts that wrap the body. The current shape (m12.6.b/c):
-    fn foo(x: T) : R requires P ensures Q = body
-  desugars to
-    fn foo(x: T) : R = {
-      assert P
-      let result = body
-      assert Q
-      result
-    }
-  so `result` is a real local binding inside `ensures`. Ordering
-  — all `requires` first, then the body bind, then all `ensures`
-  — matches the spec.
-- The const folder of m12.6.d evaluates closed boolean / Int
-  expressions and drops trivially-true predicates at parse time
-  (zero runtime cost). Predicates that mention runtime values
-  (function args, `result` after the bind) stay as runtime
-  asserts.
-- `ensure(v) where Pred` returns `Option[T]`: `Some(v)` when the
-  predicate holds, `None` otherwise. Recognised only when the
-  call is followed by `where`, so user code that defines a
-  function called `ensure` keeps working.
-
-What is **not** done yet (deferred from the original plan):
-
-- **Refinement-aware unify.** The typer keeps the predicate on
-  `TyRefineT`, but unification peels it on both sides, so
-  `Int where >= 0` unifies as `Int`. This blocks (a) static interval propagation
-  through refined arguments, (b) implicit upcast `Int where >= 0`
-  ⊑ `Int`, (c) match-arm narrowing `p : RefinedT`, and (d)
-  composition with UoM at the semantic level.
-- **`[<refinement_pure>]` stdlib annotations.** The attribute is
-  spec'd but not parsed yet because there is no enforcement pass
-  to rule against impure calls in predicates.
-- **Compile-time errors for trivially-false predicates.** The
-  const folder sees `assert false` but emits the runtime assert
-  anyway; promoting to a compile-time diagnostic is a future pass.
-- **Regex predicate subsumption.** Regex literals lex + parse +
-  evaluate at runtime via the `~r/.../` sigil + `matches` predicate
-  (m12.6.x #7 lane, 2026-05-03). Static *containment* — proving
-  `String where matches ~r/^[a-z]+$/` ⊑ `String where matches
-  ~r/^[a-z0-9]+$/` at the typer level — is the remaining piece and
-  follows the same trajectory as numeric interval subsumption.
-
-The honest one-line summary: kaikai now has the **syntax** and the
-**runtime semantics** of refinements + contracts. The **type-level
-reasoning** (interval propagation, subtyping, narrowing) is the
-piece that remains, and it requires reintroducing the refinement on
-the semantic Ty side.
-
-**Follow-up lanes** for items deferred from m12.6 v1 are tracked
-as GitHub issues with the `refinements` label: issue #83
-(static interval propagation — alpha / operator / call-site
-substitution), issue #84 (`[<refinement_pure>]` inline placement),
-issue #85 (regex literals), issue #86 (predicate-aware
-diagnostics). The original load-bearing item (`TyRefineT` on the
-semantic side) landed 2026-04-27.
+Not implemented: a refinement on a dimensioned `Decimal`
+(`Decimal<USD> where >= 0`), the call-site caret and the `ensure`
+half of the help in the diagnostic (§8), and the `assume` opt-out.
 
 ## Sources
 

@@ -239,6 +239,20 @@ Out of scope: destructuring `SLet`, rest/`@`/narrowing binders, the tcrec
 goto ledger, handler-clause binders, and raw locals. The file lists these
 at the end.
 
+### `Naming.lean`
+
+Nominal identity — when two same-named types must not unify — against
+`d214406d`.
+
+States `module_slot_compat` (an empty home slot is compatible with
+anything) and the order in which the typer fills that slot, and shows
+that during inference two homonyms carry empty slots and therefore
+unify. Also shows that propagating the home totally does not separate
+them either: a name the decl stream declares more than once is left
+bare by construction, so what is missing is a home chosen per reading
+module. Mirrors `module_slot_compat`, the `TyCon` arm of unification
+(`infer.kai`) and `tag_tycon_modules` (`tycon_home.kai`).
+
 ### `FiberWorker.tla`
 
 The scheduler state a fiber reaches after a switch, against `7799bf9b`.

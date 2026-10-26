@@ -1,6 +1,6 @@
 # examples/packages/build_sub_package
 
-Issue #658 fixture — exercises `kai build ./sub` against a
+Exercises `kai build ./sub` against a
 directory whose `kai.toml` declares it as its own package. Two
 independent binaries (`build_sub_package_parent` and `sub_pkg`)
 sit in the same tree.

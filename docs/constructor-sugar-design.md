@@ -1,6 +1,7 @@
-# `#[constructor]` — `Type(args)` sugar for the conventional constructor (design proposal)
+# `#[constructor]` — `Type(args)` sugar for the conventional constructor
 
-**Status:** proposal, not accepted. Written for later evaluation.
+**Status:** implemented. The reference is `kai info syntax` §Attributes; this page
+keeps the design rationale.
 
 ## The problem
 
@@ -11,6 +12,8 @@ reason — an asymmetry between kaikai's two product forms:
 type BigInt = Small(Int) | Big(Int, Array[Int])    # sum: Small(5) works, positional, free
 type Rational = { num: BigInt, den: BigInt }        # record: no positional ctor
 type Complex  = { re: Real, im: Real }              # record: no positional ctor
+
+fn main() : Unit = ()
 ```
 
 `Small(5)` is positional because a variant *is* a named constructor-function
@@ -63,16 +66,30 @@ The type author marks **one** function per type as the sugared constructor. The
 sugar `Type(args)` desugars to a call to that marked function — not to the literal:
 
 ```kaikai
-#[constructor]
-pub fn from_int(n: Int) : BigInt =              # BigInt's convenience ctor is from_int,
-  if n == 0 - small_mag_max() - 1 { ... }       #   NOT make(sign, mag)
-  else { Small(n) }
+pub type Num = Small(Int) | Big(Int, Int)
+pub type Ratio = { num: Int, den: Int }
+
+fn gcd(a: Int, b: Int) : Int = if b == 0 { a } else { gcd(b, a % b) }
 
 #[constructor]
-pub fn make(num: BigInt, den: BigInt) : Rational = { ...canonicalise... }
+pub fn from_int(n: Int) : Num =                 # Num's convenience ctor picks the variant
+  if n >= 1000 { Big(n / 1000, n % 1000) } else { Small(n) }
 
-let b = BigInt(5)          # ≡ bigint.from_int(5) — passes the logic, picks Small/Big
-let r = Rational(1n, 4n)   # ≡ rational.make(1n, 4n) — canonicalises
+#[constructor]
+pub fn make(num: Int, den: Int) : Ratio = {     # Ratio's ctor canonicalises
+  let g = gcd(num, den)
+  Ratio { num: num / g, den: den / g }
+}
+
+fn main() : Unit / Stdout = {
+  let b = Num(5)          # ≡ from_int(5) — runs the logic, picks Small/Big
+  let r = Ratio(2, 4)     # ≡ make(2, 4) — canonicalises to 1/2
+  match b {
+    Small(n) -> Stdout.print("small #{n}")
+    Big(_, _) -> Stdout.print("big")
+  }
+  Stdout.print("#{r.num}/#{r.den}")
+}
 ```
 
 Why this is the right shape:

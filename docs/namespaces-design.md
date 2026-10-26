@@ -213,8 +213,10 @@ money-with-physics needs `USD/kWh` to cancel. The same holds for
 structured habitants:
 
 ```kaikai
-type Log = { level: Int }        # habitant of Type
-effect Log { write(s: String) }  # habitant of Effect
+type Log = { level: Int }              # habitant of Type
+effect Log { write(s: String) : Unit } # habitant of Effect
+
+fn main() : Unit = ()
 ```
 
 Both declarations are legal. `Log` is two habitants of two kinds.

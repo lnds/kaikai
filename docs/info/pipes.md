@@ -186,7 +186,7 @@ Non-List head dispatch is gated on edition `hanga-roa` or later.
 
 ## Precedence
 
-Pipes are at the bottom of the precedence table (level 10, looser
+Pipes are at the bottom of the precedence table (looser
 than `and` / `or`, which are looser than comparisons, which are
 looser than arithmetic). All pipes associate LEFT. So `a + b |> f`
 parses as `f(a + b)`, and `xs | g | h` parses as `(xs | g) | h`.

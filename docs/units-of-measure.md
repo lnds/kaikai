@@ -5,7 +5,7 @@
 Implemented end-to-end in stage 2: lexer, parser, typer (abelian-group
 unification of unit expressions, generalisation over unit-vars), and
 codegen erasure (units evaporate before any C/LLVM IR is emitted).
-Fixtures live in `examples/units/m12_5_*.kai`. Lane experience report
+Fixtures live in `examples/units/`. Lane experience report
 at `docs/lane-experience-m12.5.md`.
 
 Research notes, snapshot 2026-04-25. Discussion document.
@@ -120,7 +120,8 @@ Branded types — the "tag a string for safety" pattern:
 
 F# does not support this in branded form outside numerics; there
 is a community package (`FSharp.UMX`) that extends to arbitrary
-types. **kaikai can ship it natively**, which is differential.
+types. **kaikai can ship it natively**, which is differential. Today a unit on `String` is rejected at the annotation; brands
+ride `Int`, `Real`, `Decimal` and user types.
 
 ## Proposed design
 
@@ -130,7 +131,7 @@ kaikai-specific decisions. Each one pinned for review.
 
 **Decision**: a dedicated `unit` keyword, not reuse of `type`.
 
-```kai
+```kaikai-fragment
 unit USD
 unit EUR
 unit cm
@@ -141,14 +142,23 @@ Reasons:
 - Reusing `type` introduces confusion: `type USD` already means
   "alias or sum type". Overloading it is unnecessary ambiguity.
 - `unit` makes it clear that this is a dimensional symbol.
-- F#'s `[<Measure>]` attribute is ugly and .NET-specific. kaikai
-  has no attributes; do not invent them just for this.
+- F#'s `[<Measure>]` attribute is .NET-specific; a dedicated
+  keyword reads as what it declares.
 
 Aliases with algebra:
 
-```kai
+```kaikai
+unit kg
+unit m
+unit sec
 unit Newton  = kg * m / sec^2
 unit Pascal  = Newton / m^2
+
+fn main() : Unit / Stdout = {
+  let f : Real<Newton> = 2.0<kg> * 3.0<m/sec^2>
+  let p : Real<Pascal> = f / 4.0<m^2>
+  Stdout.print("#{f} #{p}")
+}
 ```
 
 **Capitalisation**: unit symbols are ordinary identifiers, so any
@@ -167,11 +177,19 @@ case-sensitive — `m` and `M` are distinct units. Conventional usage
 
 **Decision**: angle brackets like F#, syntax `<unit-expr>`.
 
-```kai
-let price : Real<USD>      = 1.50<USD>
-let speed : Real<m / sec>  = 9.81<m / sec>
-let rate  : Real<USD/EUR>  = 1.20<USD/EUR>
-let area  : Real<m^2>      = 4.0<m^2>
+```kaikai
+unit USD
+unit EUR
+unit m
+unit sec
+
+fn main() : Unit / Stdout = {
+  let price : Real<USD>      = 1.50<USD>
+  let speed : Real<m / sec>  = 9.81<m / sec>
+  let rate  : Real<USD/EUR>  = 1.20<USD/EUR>
+  let area  : Real<m^2>      = 4.0<m^2>
+  Stdout.print("#{price} #{speed} #{rate} #{area}")
+}
 ```
 
 Reasons:
@@ -183,13 +201,18 @@ Reasons:
 
 ### 3. Eligible primitive types
 
-**Decision**: only `Real` and `Int` in m-pre-1.0. Extension to
-"branded types" over arbitrary types (FSharp.UMX-style) in
-m-post-1.0.
+**Decision**: numeric primitives first. Today a unit annotates
+`Int`, `Real` or `Decimal`, or a user type as a free brand;
+`String<Sanitized>` and other non-numeric primitives are rejected at
+the annotation.
 
-```kai
-let id : Int<UserId> = 42<UserId>              # OK in v1
-let s  : String<Sanitized> = "..."<Sanitized>  # m-post-1.0
+```kaikai
+unit UserId
+
+fn main() : Unit / Stdout = {
+  let id : Int<UserId> = 42<UserId>
+  Stdout.print("#{id}")
+}
 ```
 
 Reasons:
@@ -211,13 +234,14 @@ Canonicalisation: alphabetically order numerator and denominator,
 group exponents (`m * m` → `m^2`), eliminate factor `1`.
 `kg m / sec^2 ≡ m kg / sec^2 ≡ m * kg * sec^-2`.
 
-**Pretty-printing** (used by `unit_name`, `impl Show for Real<u>`,
-and typer diagnostics): scientific style. Multiplication renders
-as a single space (`kg m`), division as `/` with no surrounding
-spaces (`m/s`, `kg m/s^2`). Powers use `^` with the integer
-literal (`m^2`, `s^-1`). Trivial `1` factors collapse out.
+**Pretty-printing** (used by string interpolation of a dimensioned
+value and by typer diagnostics): scientific style. Multiplication
+renders as a single space (`kg m`), division as `/` with no
+surrounding spaces (`m/s`, `kg m/s^2`). Powers use `^` with the
+integer literal (`m^2`); a unit with only negative powers renders
+as a quotient (`1/m`). Trivial `1` factors collapse out.
 
-#### 4.1. Value-level `^` (v0.9.0)
+#### 4.1. Value-level `^`
 
 The `^` operator also works at the expression level: `r ^ n`
 raises a numeric value to an integer power. When `r` has a non-
@@ -225,31 +249,49 @@ trivial unit, the exponent must be a literal Int so the typer can
 lift `Real<u> ^ N` to `Real<u^N>` statically (no dependent types).
 A non-literal exponent on a dimensioned base is rejected.
 
-```kai
-let r : Real<m>     = 3.0<m>
-let area : Real<m^2> = r ^ 2     # OK — literal exponent, unit lifted
-let vol  : Real<m^3> = r ^ 3
-let inv  : Real<m^-1> = r ^ -1   # negative literal accepted
+```kaikai
+unit m
 
-let n = 2
-let bad = r ^ n                  # error: literal Int exponent required
+fn main() : Unit / Stdout = {
+  let r : Real<m>       = 3.0<m>
+  let area : Real<m^2>  = r ^ 2    # OK — literal exponent, unit lifted
+  let vol  : Real<m^3>  = r ^ 3
+  let inv  : Real<m^-1> = r ^ -1   # negative literal accepted
+  Stdout.print("#{area} #{vol} #{inv}")
+}
+```
+
+```kaikai-neg
+unit m
+
+fn main() : Unit / Stdout = {
+  let r : Real<m> = 3.0<m>
+  let n = 2
+  let bad = r ^ n                  # error: literal Int exponent required
+  Stdout.print("#{bad}")
+}
 ```
 
 `^` is right-associative (`2 ^ 3 ^ 2` parses as `2 ^ (3 ^ 2) = 512`)
 and binds tighter than `*`/`/`. Bare numeric bases (`Int`, `Real`,
-`Real<1>`) accept any `Int` exponent — the runtime helper
-`kai_pow_int` handles negatives on `Real` as `1.0 / base^|n|` and
-clamps negatives to 0 on `Int`.
+`Real<1>`) accept any `Int` exponent: a negative exponent on `Real`
+is `1.0 / base^|n|`, and on `Int` it truncates (`2 ^ -1` is `0`).
 
 ### 5. Generic units
 
 **Decision**: introduce a `Measure` kind for type parameters; do
 not reuse the `Type` kind.
 
-```kai
+```kaikai
+unit m
+unit sec
+
 fn double[u: Measure](x: Real<u>) : Real<u> = x * 2.0
 fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
 fn divide[u: Measure, v: Measure](a: Real<u>, b: Real<v>) : Real<u/v> = a / b
+
+fn main() : Unit / Stdout =
+  Stdout.print("#{double(2.0<m>)} #{area(2.0<m>, 3.0<m>)} #{divide(6.0<m>, 2.0<sec>)}")
 ```
 
 Reasons:
@@ -268,11 +310,24 @@ Reasons:
 **Decision**: the absence of `<...>` is dimensionless. `<1>` is
 also dimensionless, as an explicit synonym.
 
-```kai
-let unitless : Real     = 3.14
-let unitless2 : Real<1> = 3.14
-let mixed = unitless + 1.0       # OK, both dimensionless
-let bad = price + unitless        # error: USD ≠ 1
+```kaikai
+fn main() : Unit / Stdout = {
+  let unitless : Real     = 3.14
+  let unitless2 : Real<1> = 3.14
+  let mixed = unitless + unitless2   # OK, both dimensionless
+  Stdout.print("#{mixed}")
+}
+```
+
+```kaikai-neg
+unit USD
+
+fn main() : Unit / Stdout = {
+  let price : Real<USD> = 1.50<USD>
+  let unitless : Real   = 3.14
+  let bad = price + unitless        # error: USD ≠ 1
+  Stdout.print("#{bad}")
+}
 ```
 
 Conversion to/from dimensionless requires multiplying by an
@@ -280,20 +335,25 @@ explicit factor with a unit.
 
 ### 7. Conversions
 
-**Decision**: multiplicative factor + a `unitless` function for
-the escape.
+**Decision**: a multiplicative factor, both to convert and to drop a
+unit.
 
-```kai
-let cm_per_m : Real<cm/m> = 100.0<cm/m>
+```kaikai
+unit cm
+unit m
 
-let h_m : Real<m>   = 5.0<m>
-let h_cm : Real<cm> = h_m * cm_per_m   # OK: m * cm/m = cm
-
-let raw : Real = unitless(h_m)         # explicit drop
+fn main() : Unit / Stdout = {
+  let cm_per_m : Real<cm/m> = 100.0<cm/m>
+  let h_m : Real<m>   = 5.0<m>
+  let h_cm : Real<cm> = h_m * cm_per_m   # OK: m * cm/m = cm
+  let raw : Real = h_m / 1.0<m>          # explicit drop: m / m = 1
+  Stdout.print("#{h_cm} #{raw}")
+}
 ```
 
-`unitless` is a core function (`unitless[u: Measure](x: Real<u>) : Real`).
-There is NO implicit unit→no-unit conversion.
+Dropping a unit is a division by a unit factor: `h_m / 1.0<m>` is a
+dimensionless `Real`. There is no `unitless` function and NO implicit
+unit→no-unit conversion.
 
 ### 8. Pretty-printing
 
@@ -316,10 +376,14 @@ error: type mismatch in operator `+`
 **Decision**: orthogonal. A function can be unit-polymorphic and
 have an effect row at the same time.
 
-```kai
+```kaikai
+unit USD
+
 fn log_price[u: Measure](p: Real<u>) : Unit / Console = {
-  Console.print("price: #{real_to_string(unitless(p))}")
+  Console.print("price: #{p}")
 }
+
+fn main() : Unit / Console = log_price(2.5<USD>)
 ```
 
 No special interaction. The two mechanisms live in their own
@@ -327,48 +391,75 @@ No special interaction. The two mechanisms live in their own
 
 ## Key use case: Money
 
-`Money` is not directly UoM — it is a record with a currency tag
-and an internal representation (typically Decimal). But UoM makes
-it much cleaner:
+`Money` is not directly UoM — it is a currency tag over an internal
+representation (typically Decimal). But UoM makes it much cleaner.
+Without UoM, the check is manual boilerplate:
 
-```kai
-# Without UoM (manual boilerplate)
-type Money = { amount: Decimal, currency: String }
+```kaikai
+import decimal as dec
+
+type Money = { amount: dec.Decimal, currency: String }
+
 fn add(a: Money, b: Money) : Result[Money, String] = {
   if a.currency == b.currency { Ok(Money { amount: a.amount + b.amount, currency: a.currency }) }
   else { Err("cannot add different currencies") }
 }
 
-# With UoM (compiler does the check)
-unit USD
-unit EUR
-type Money[u: Measure] = { amount: Decimal<u> }
-fn add[u: Measure](a: Money<u>, b: Money<u>) : Money<u> = {
-  Money { amount: a.amount + b.amount }
+fn main() : Unit / Stdout = {
+  let a = Money { amount: 1, currency: "USD" }
+  match add(a, Money { amount: 2, currency: "EUR" }) {
+    Ok(_)  -> Stdout.print("ok")
+    Err(e) -> Stdout.print(e)
+  }
 }
-# Use:
-let total = add(usd_a, usd_b)   # OK
-let bad   = add(usd_a, eur_b)   # compile-time error
 ```
 
-`Decimal<u>` requires extending the primitive type list to
-include `Decimal` (when it lands in stdlib). Already pinned.
+With UoM the compiler does the check. `stdlib/money.kai` ships
+`Money[t]<c>`, a carrier `t` tagged with a habitant `c` of the
+`Currency` kind, plus the ISO 4217 starter currencies (`USD`, `EUR`,
+`GBP`, `JPY`, `CHF`, `CNY`, `BRL`, `CLP`, `ARS`, `MXN`); a program
+declares more with `currency XXX`. `kai info units` covers the
+`Currency` kind.
 
-Standard currencies (ISO 4217) pre-declared in stdlib:
+```kaikai
+import money
+import decimal as dec
 
-```kai
-# stdlib/money/currency.kai
-unit USD; unit EUR; unit GBP; unit JPY
-unit BRL; unit CLP; unit ARS; unit MXN
-# ... 180 ISO 4217 codes
+fn add[c: Currency](a: Money[dec.Decimal]<c>, b: Money[dec.Decimal]<c>) : Money[dec.Decimal]<c> = a + b
+
+fn main() : Unit / Stdout = {
+  let usd_a: Money[dec.Decimal]<USD> = 10.50<USD>
+  let usd_b: Money[dec.Decimal]<USD> = 4.50<USD>
+  let total = add(usd_a, usd_b)      # OK
+  Stdout.print(money.to_string(total))
+}
 ```
 
-Exchange rates:
+```kaikai-neg
+import money
+import decimal as dec
 
-```kai
-let usd_per_eur : Real<USD/EUR> = fetch_rate("EUR", "USD")
-let eur_amount  : Money<EUR>    = Money { amount: 100.0<EUR> }
-let usd_amount  : Money<USD>    = Money { amount: eur_amount.amount * usd_per_eur }
+fn main() : Unit / Stdout = {
+  let usd_a: Money[dec.Decimal]<USD> = 10.50<USD>
+  let eur_b: Money[dec.Decimal]<EUR> = 4.50<EUR>
+  let bad = usd_a + eur_b            # compile-time error: USD vs EUR
+  Stdout.print(money.to_string(bad))
+}
+```
+
+Exchange rates go through an explicit door, `money.convert`, with the
+target currency pinned by the annotation:
+
+```kaikai
+import money
+import decimal as dec
+
+fn main() : Unit / Stdout = {
+  let usd_per_eur: dec.Decimal = 1.20
+  let eur_amount: Money[dec.Decimal]<EUR> = 100.00<EUR>
+  let usd_amount: Money[dec.Decimal]<USD> = money.convert(eur_amount, usd_per_eur)
+  Stdout.print(money.to_string(usd_amount))
+}
 ```
 
 ## Implementation in stage 2
@@ -454,7 +545,7 @@ to be re-validated with UoM active.
 
 4. **Generics interaction**. `Real[T]` (generic) vs `Real<u>`
    (unit) could confuse. Mitigation: the syntax distinguishes
-   (`[]` vs `<>`) and the kinds are separate (`Type` vs `Unit`).
+   (`[]` vs `<>`) and the kinds are separate (`Type` vs `Measure`).
    Explicit doc.
 
 5. **Impact on error messages**. Unit errors can be cryptic

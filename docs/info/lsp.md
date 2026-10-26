@@ -7,7 +7,7 @@ The kaikai Language Server (`kai lsp`) for editor integration.
 `kai lsp` speaks LSP JSON-RPC over stdio and is the integration
 point for every editor — VS Code, Helix, Neovim, Emacs (eglot /
 lsp-mode), Sublime LSP, Zed. The server itself is written in
-kaikai (`tools/kai-lsp/main.kai`, ~500 lines) and shells out to
+kaikai (`tools/kai-lsp/main.kai`) and shells out to
 `kaic2 --library-mode` per request.
 
 ```sh
@@ -28,7 +28,7 @@ spawn it. See *Editor configuration* below.
 | `textDocument/didClose`           | yes       |
 | `textDocument/hover`              | yes       |
 | `textDocument/definition`         | yes       |
-| `textDocument/publishDiagnostics` | partial   |
+| `textDocument/publishDiagnostics` | yes       |
 | `textDocument/documentSymbol`     | yes       |
 | `textDocument/completion`         | yes       |
 | `textDocument/signatureHelp`      | yes       |
@@ -41,13 +41,12 @@ spawn it. See *Editor configuration* below.
   by `--diags-json` for compile errors and by `--holes-json` for
   unfilled typed holes (each hole becomes one Warning-severity
   diagnostic carrying the inferred type).
-- **documentSymbol** surfaces `DFn` (incl. lowered `const`),
-  `DEffect`, `DProtocol`, `DUnit`, `DTest`, `DBench`.
-- **completion** offers user fns + stdlib + core builtins
-  (~445 items by default; top-level only — locals / params /
-  field completion are LSP v4 work).
+- **documentSymbol** surfaces types, effects, functions, constants,
+  units and tests.
+- **completion** offers user fns + stdlib + core builtins, top-level
+  only (no locals, params or field completion).
 - **signatureHelp** highlights the callee signature; `activeParameter`
-  is currently static at index 0.
+  is always index 0.
 
 ## Editor configuration
 
@@ -121,23 +120,18 @@ another compiler, or when running it outside the wrapper.
 - ASCII-only positions. LSP uses UTF-16 code units; kaikai uses byte
   offsets. Non-ASCII content misaligns for multi-byte characters.
 - No cross-file resolution. Hover and goto-def follow user-authored
-  decls in the current file; cross-module is LSP v4.
+  decls in the current file.
 - No incremental sync. Every `didChange` ships the full text.
 - One probe per request — no caching between hovers / completions.
 - Completion is top-level only (no locals, no params, no `.` field
   completion).
 - `activeParameter` is static at index 0 in signature help.
-- `DType` decls are dropped before `documentSymbol`.
-- Diagnostic coverage is partial — only T1–T5 *error* diagnostics
-  migrated to the structured collector are visible (~11 of 239 emit
-  sites); the rest still print to stderr.
 - No references, rename, workspace symbols, or inlay hints.
 
 ## NOT IN KAIKAI
 
-- A long-running daemon mode. The current LSP forks `kaic2` per
-  request; in-process daemon mode is sketched in #447 but not
-  shipped.
+- A long-running daemon mode. The server forks `kaic2` per
+  request.
 - WebSocket or TCP transport. Stdio JSON-RPC only.
 - Configuration via `workspace/configuration`. The LSP reads no
   workspace settings; behaviour is fixed per release.
@@ -145,4 +139,4 @@ another compiler, or when running it outside the wrapper.
 ## See also
 
 `kai info syntax`, `kai info holes`, `docs/lsp.md` (full reference
-including troubleshooting and roadmap).
+including troubleshooting).

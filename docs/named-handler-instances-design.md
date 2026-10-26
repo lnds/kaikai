@@ -80,7 +80,7 @@ effect Cell { get() : Int  set(n: Int) : Unit }
 
 # A function that consumes three Cell instances. The cells are PROVIDED
 # (passed in), so they do NOT appear in the row — the row is empty.
-fn add(c1: Cell, c2: Cell, dst: Cell) : Unit / {} =
+fn add(c1: Cell, c2: Cell, dst: Cell) : Unit =
   dst.set(c1.get() + c2.get())
 
 fn main() : Int / Stdout = {
@@ -90,17 +90,17 @@ fn main() : Int / Stdout = {
     add(c1, c2, target)
     Stdout.print(int_to_string(target.get()))
     0
-  } with State[Int](0) as target {
+  } with Cell(0) as target {
       get(resume) -> resume(state)
       set(v, resume) -> resume((), v)
       return(x) -> x
     }
-  } with State[Int](0) as c2 { get(resume) -> resume(state)
-                               set(v, resume) -> resume((), v)
-                               return(x) -> x }
-  } with State[Int](0) as c1 { get(resume) -> resume(state)
-                               set(v, resume) -> resume((), v)
-                               return(x) -> x }
+  } with Cell(0) as c2 { get(resume) -> resume(state)
+                         set(v, resume) -> resume((), v)
+                         return(x) -> x }
+  } with Cell(0) as c1 { get(resume) -> resume(state)
+                         set(v, resume) -> resume((), v)
+                         return(x) -> x }
 }
 ```
 
@@ -111,7 +111,7 @@ covers everything already in the language:
 
 - **capability in a row** (`fn f() : T / Cell`) = the effect is
   *demanded*; a `handle … with Cell` must satisfy it.
-- **capability as a parameter** (`fn f(c: Cell) : T / {}`) = the effect
+- **capability as a parameter** (`fn f(c: Cell) : T`) = the effect
   is *provided* by the caller; it does not enter the row.
 
 A `with Eff as a` binding produces a value of type `Eff` usable in

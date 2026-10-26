@@ -6,7 +6,7 @@ String` in `mypkg/util.kai`. The stdlib also exports `list.length`
 
 The qualified call `util.length(...)` must resolve to the
 package's own definition. The stdlib's bare `string_length` and
-`int_to_string` builtins remain available through the prelude.
+`int_to_string` builtins remain available through the core.
 
 Run:
 
@@ -16,7 +16,7 @@ bin/kai run examples/packages/same_name_shadowing
 
 Expected output:
 
-```
+```text
 len:hello
 5
 ```

@@ -1,4 +1,4 @@
-# `Ref[T]` surface sugar — `&` make, `:=` set, `@` deref (design proposal)
+# `Ref[T]` surface sugar — `&` make, `:=` set, `@` deref
 
 **Status:** shipped. Motivated by #1113 (`:=` rejects a `Ref` record field) and by
 `Ref[T]` surfacing in everyday user code (graph nodes with rewritable edges —
@@ -10,12 +10,15 @@ verbose. The trio `&` / `:=` / `@` is live: `&x` opens a ref, `r := v` and
 
 `Ref[T]` — the transportable mutable cell (unlike a local `var`, a `Ref` is a
 first-class value you can put in a record, pass, and return) — has no surface sugar.
-Every use spells the effect and the op by hand:
+Every use spelled the effect and the op by hand (still accepted):
 
 ```kaikai
-let r = Mutable.ref_make(0)         # create
-Mutable.ref_set(r, 99)              # write
-let v = Mutable.ref_get(r)          # read
+fn main() : Unit / Stdout + Mutable = {
+  let r = Mutable.ref_make(0)         # create
+  Mutable.ref_set(r, 99)              # write
+  let v = Mutable.ref_get(r)          # read
+  Stdout.print("#{v}")
+}
 ```
 
 Three problems:
@@ -44,12 +47,15 @@ model mutable-pointer-in-a-record with `Ref`, and are forced into `Mutable.ref_s
 or, worse, a one-cell `Array[T]` purely to reach the `[0]`-indexed form `:=` accepts.
 Both are workarounds for a missing sugar, not a modelling choice.
 
-## The proposed surface — `&` / `:=` / `@`
+## The surface — `&` / `:=` / `@`
 
 ```kaikai
-let r = &0        # ref_make  —  `&` takes a reference (the sigil is free today)
-r := 99           # ref_set   —  reuses the existing `:=` (also closes #1113)
-@r                # ref_get   —  `@` dereferences (freed by the `as` migration below)
+fn main() : Unit / Stdout + Mutable = {
+  let r = &0        # ref_make  —  `&` takes a reference
+  r := 99           # ref_set   —  reuses the existing `:=`
+  let v = @r        # ref_get   —  `@` dereferences
+  Stdout.print("#{v}")
+}
 ```
 
 Desugar (the effect stays in the inferred row, never written by the user):
@@ -79,22 +85,28 @@ remains in the row type inferred for any function that touches a ref, so Tier 1 
 
 ## Freeing `@`: migrate as-binding to the `as` keyword
 
-Today `@` binds a name to a whole pattern:
+The legacy as-binding spells it with `@`:
 
 ```kaikai
-match xs {
-  whole @ [first, ...rest] -> use(whole, first, rest)
+fn f(xs: [Int]) : Int = match xs {
+  whole @ [first, ...rest] -> length(whole) + first + length(rest)
+  [] -> 0
 }
+
+fn main() : Unit / Stdout = Stdout.print("#{f([1, 2])}")
 ```
 
 kaikai already has the `as` keyword (`TkAs`, used in `import X as Y` and
-`with Eff as a`; `parse.kai:1993` already parses `as`-aliases). The as-binding reads
+`with Eff as a`). The as-binding reads
 *more* naturally with `as` than with `@` — "bind `whole` **as** the whole pattern":
 
 ```kaikai
-match xs {
-  whole as [first, ...rest] -> use(whole, first, rest)
+fn f(xs: [Int]) : Int = match xs {
+  whole as [first, ...rest] -> length(whole) + first + length(rest)
+  [] -> 0
 }
+
+fn main() : Unit / Stdout = Stdout.print("#{f([1, 2])}")
 ```
 
 `@`-as-binding was an ML/Rust inheritance; `as` reads more naturally. The migration is

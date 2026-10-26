@@ -1,4 +1,4 @@
-# auto_install — regression guard for #512
+# auto_install
 
 A manifest declares a git-source dep, no `kai.lock` exists, no
 cache directory exists. The first `kai run` invocation must:

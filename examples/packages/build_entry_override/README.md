@@ -1,6 +1,6 @@
 # examples/packages/build_entry_override
 
-Issue #658 fixture — exercises `kai.toml` `entry = "src/main.kai"`
+Exercises `kai.toml` `entry = "src/main.kai"`
 as an explicit override of the conventional `main.kai`. Mirrors
 Cargo's `[[bin]] path =` shape for packages that keep sources
 under `src/`.
@@ -19,5 +19,5 @@ Errors when the manifest points at a missing file:
 $ rm src/main.kai
 $ kai build
 kai: error: kai.toml declares entry = 'src/main.kai' but
-src/main.kai does not exist
+<package dir>/src/main.kai does not exist
 ```

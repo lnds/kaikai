@@ -10,15 +10,10 @@ lexically in scope.
 This document pins two things: the **representation of effect
 rows** (the math) and the **surface syntax** (effect
 declarations, function types with effects, `handle` / `resume`,
-and the call-site dispatch convention). Migration of the current
-kaikai codebase to effect types, and the implementation strategy
-(op dispatch, runtime, interaction with monomorphisation) live
-in `docs/effects-stdlib.md` and `docs/effects-impl.md`.
-
-Scope of v1: everything needed to parse, type-check, and desugar
-a program that declares effects, calls their operations, and
-installs handlers. The runtime and stdlib migration are in Doc B
-and Doc C.
+and the call-site dispatch convention). The stdlib effect catalog
+lives in `docs/effects-stdlib.md`; the implementation strategy (op
+dispatch, runtime, interaction with monomorphisation) lives in
+`docs/effects-impl.md`.
 
 ## Context
 
@@ -150,7 +145,7 @@ merely forwards a row-polymorphic parameter. The rule only moves toward
 expected row keeps plain equality, so no constraint is propagated and
 inference stays decidable and principal.
 
-> **Note — pure named callbacks (issue #645).** A function declared
+> **Note — pure named callbacks.** A function declared
 > without a `/` row clause is treated as row-polymorphic at the call
 > site: its scheme gains an implicit row variable so callers can pass
 > it where any row is expected. The mechanism is generalisation, not
@@ -182,18 +177,29 @@ names are declared with a TitleCase identifier (like types).
 Lowercase identifiers in the row position are row variables
 bound by the enclosing generic scope.
 
-```kai
+```kaikai
+effect Fail {
+  fail(msg: String) : Nothing
+}
+
 # Concrete row
-fn parse(s: String) : Int / Io + Fail
+fn parse(s: String) : Int / Stdout + Fail = match string_to_int(s) {
+  Some(n) -> n
+  None    -> { Stdout.print("bad input: #{s}"); Fail.fail(s) }
+}
 
 # Polymorphic row
-fn map[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e
+fn apply_all[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e = xs | f
+
+fn main() : Int = 0
 ```
 
 Absence of `/` means pure:
 
-```kai
-fn add(a: Int, b: Int) : Int
+```kaikai
+fn add(a: Int, b: Int) : Int = a + b
+
+fn main() : Int = add(1, 2)
 ```
 
 Not `Int / {}`. Kaikai has one form; redundant braces do not
@@ -204,9 +210,11 @@ compile.
 The return type is **inferred** when the function body's natural
 type is unambiguous. The most common case is `Unit`:
 
-```kai
+```kaikai
 fn greet(name: String) / Stdout = print(name)
-fn greet(name: String) : Unit / Stdout = print(name)   # equivalent
+fn greet2(name: String) : Unit / Stdout = print(name)   # equivalent
+
+fn main() : Unit / Stdout = { greet("a"); greet2("b") }
 ```
 
 The first form is preferred when the function returns `Unit` —
@@ -217,9 +225,16 @@ disagrees with the row.
 The **effect row is NOT inferred** at the public-signature level.
 A function that uses any effect must declare the row explicitly:
 
-```kai
+```kaikai-neg
 fn greet(name: String) = print(name)            # ERROR: missing / Stdout
+
+fn main() : Unit / Stdout = greet("a")
+```
+
+```kaikai
 fn greet(name: String) / Stdout = print(name)   # OK
+
+fn main() : Unit / Stdout = greet("a")
 ```
 
 Tier 1 #1 (effects visible in row types) requires every public
@@ -243,7 +258,7 @@ demos.
 
 ### Declaring an effect
 
-```kai
+```kaikai
 effect Io {
   print(s: String) : Unit
   read_line() : String
@@ -257,6 +272,8 @@ effect State[T] {
   get() : T
   set(v: T) : Unit
 }
+
+fn main() : Int = 0
 ```
 
 Operations are declared without the `fn` keyword and without a
@@ -265,9 +282,7 @@ the call site.
 
 `Nothing` is kaikai's empty type (uninhabited; no value can be
 constructed). An operation returning `Nothing` cannot resume —
-this is how `Fail` encodes abort at the type level. `Nothing` is
-not yet formalised in `docs/kaikai-minimal.md`; adding it is a
-prerequisite for this doc's examples to type-check (TODO).
+this is how `Fail` encodes abort at the type level.
 
 Effects can be parameterised (`State[T]`). The parameter is
 monomorphic per handler instance: one `handle ... with State[Int]`
@@ -278,15 +293,18 @@ installs an `Int`-valued state cell.
 Inside a scope where the effect capability is available, call the
 operation as a **method on the effect type**:
 
-```kai
-fn greet(name: String) : Unit / Io {
-  Io.print("hello, #{name}")
+```kaikai
+fn greet(name: String) : Unit / Stdout {
+  Stdout.print("hello, #{name}")
 }
+
+fn main() : Unit / Stdout = greet("kaikai")
 ```
 
-`Io.print(...)` desugars to a call through the currently active
-`Io` capability. If no handler for `Io` is in lexical scope, the
-checker rejects the program with `effect not handled: Io`.
+`Stdout.print(...)` desugars to a call through the currently active
+`Stdout` capability. If no handler for `Stdout` is in lexical scope,
+the checker rejects the program with `effect not handled: Stdout`
+(`main` gets the stdlib's default `Stdout` handler).
 
 The effect name **is the capability** by default. This is
 different from Koka (operations are first-class symbols,
@@ -298,13 +316,17 @@ If you want to name the capability differently — useful when two
 nested handlers of the same effect are in scope, or for concision
 — use `as`:
 
-```kai
-handle {
+```kaikai
+effect Io {
+  print(s: String) : Unit
+}
+
+fn main() : Int / Stdout = handle {
   log.print("start")
-  compute()
   log.print("end")
+  0
 } with Io as log {
-  print(s, resume) -> { ...perform the write...; resume(()) }
+  print(s, resume) -> { Stdout.print(s); resume(()) }
 }
 ```
 
@@ -315,7 +337,7 @@ not shadow-and-hide it.
 
 ### Handling
 
-```kai
+```text
 handle { body } with Effect {
   initially { expr }                     # optional
   finally   { expr }                     # optional
@@ -369,27 +391,26 @@ trailing-lambda — `handle` is not a value, `with` is not an
 argument separator, and `Eff` is a capability identifier rather
 than an expression.
 
-Trailing-lambda syntax is a *separate* sugar (see
-`docs/effects-stdlib.md` §*Syntax note: trailing lambdas*) that
-lands in milestone **m7b**. It applies to stdlib helpers like
-`try { body }`, `with_state(0) { body }`, and `nursery { n ->
-body }`. It does **not** apply to `handle`.
+Trailing-lambda syntax is a *separate* sugar (`kai info syntax`
+§*Trailing lambdas*). It applies to ordinary functions whose last
+parameter is a closure, such as `nursery { body }`. It does **not**
+apply to `handle`.
 
 Example — supplying a value via an effect:
 
-```kai
+```kaikai
 effect Ask {
   name() : String
 }
 
-fn main() : Unit / Io {
+fn main() : Unit / Stdout {
   let greeting = handle {
     "hello, #{Ask.name()}"
   } with Ask {
     name(resume) -> resume("world")
     return(s)    -> s
   }
-  Io.print(greeting)
+  Stdout.print(greeting)
 }
 ```
 
@@ -398,16 +419,16 @@ fn main() : Unit / Io {
 greeting; `return(s) -> s` is the identity transform, shown here
 for completeness (could be omitted with the same semantics).
 `Ask` is handled *inside* the `handle` block, so the outer `main`
-does not carry it in its row — only `Io` from the final `print`.
+does not carry it in its row — only `Stdout` from the final `print`.
 
-### `default { }` blocks and per-op coverage (issue #533)
+### `default { }` blocks and per-op coverage
 
 An effect declaration can carry an optional `default { }` block
 listing fallback clauses installed by the compiler at the program
 root (`main`). The block sits at the same lexical level as the op
 declarations and uses the same clause shape as `handle ... with`:
 
-```kai
+```kaikai
 effect MyLog {
   info(msg: String) : Unit
   warn(msg: String) : Unit
@@ -416,12 +437,17 @@ effect MyLog {
     warn(msg, resume) -> $extern_handler("kai_default_log_warn")
   }
 }
+
+fn main() : Unit / MyLog = {
+  MyLog.info("starting")
+  MyLog.warn("almost done")
+}
 ```
 
-`$extern_handler("c_symbol")` is the compiler intrinsic introduced
-in Stage A (#556) that bridges a default clause to a runtime C
-entry. Kaikai-bodied defaults parse and store, but their codegen
-path lands in Stage C of the #533 trilogy.
+`$extern_handler("c_symbol")` is the compiler intrinsic that bridges
+a default clause to a runtime C entry, and the only clause body a
+default may use: a kaikai-bodied default clause parses, but a program
+that relies on it is rejected with `effect not handled: Eff.op`.
 
 #### Coverage algorithm
 
@@ -435,29 +461,23 @@ the typer walks the lexical stack of enclosing handles:
 
 1. **Clause discharge** — the first `handle ... with Eff { clauses }`
    that lists `op` in its clauses absorbs the obligation.
-2. **Clause-merge from default** *(spec; deferred to Stage C)* — an
-   enclosing `handle ... with Eff` exists but omits `op`, and the
-   effect's `default { }` block declares `op` → the default clause
-   fires inside the handle. **Not yet supported by codegen Stage A**;
-   the typer rejects partial handles whose omitted op would have
-   needed this merge.
-3. **Main absorption** — no enclosing `handle ... with Eff`, the
+2. **Main absorption** — no enclosing `handle ... with Eff`, the
    function is `main`, and the `default { }` block of the declaration
    the label names declares `op` → the auto-installed default at
    `main` discharges it. A homonym's default never stands in.
-4. **Reject** — otherwise the typer emits `effect not handled:
+3. **Reject** — otherwise the typer emits `effect not handled:
    Eff.op` with a diagnostic note describing the default-block
    status (no block, partial block, kaikai-bodied clause, or
    masked-by-enclosing-handle).
 
-Stage B (#557) lands steps 1, 3, and 4. Step 2 stays a typer
-rejection with a Stage-C-aware diagnostic until the handle emitter
-synthesises missing default clauses inside each `_ev` evidence
-struct.
+An enclosing handle masks the default: a handle that omits `op` does
+not inherit the default clause for it, so performing `op` inside that
+handle is rejected (step 3) even when the `default { }` block declares
+it. List the op in the handle, or perform it outside the handle.
 
-#### Worked example — partial handle, full default block
+#### Worked example — handle with a full default block
 
-```kai
+```kaikai
 effect MyLog {
   info(msg: String) : Unit
   default {
@@ -482,18 +502,14 @@ call site — its presence does not change the type-check outcome.
 The fixture in `examples/effects/default_block_full_user_handle.kai`
 covers this shape.
 
-#### Why partial handles get rejected (Stage B limitation)
+#### Why partial handles get rejected
 
-Stage A's `emit_clause_assignments` wires `_ev.<op>` only for the
-ops the user wrote in the `handle`. The inner handle's evidence
-node masks any enclosing default — dispatch routes through `_ev`
-even when an outer `_ev` carries the missing op. A partial handle
-plus a `default { }` block thus produces an apparently complete
-type but a NULL function pointer at runtime. The Stage B typer
-treats step 2 of the algorithm as a typer rejection until Stage C
-extends the handle emitter; the diagnostic explicitly references
-Stage C so the user can decide whether to add the clause now or
-wait for the upgrade.
+A handle's evidence carries a clause only for the ops the user wrote,
+and it masks any enclosing default: dispatch inside the handle routes
+through it even when an outer handler carries the missing op.
+Accepting a partial handle plus a `default { }` block would type a
+call that has no clause to run, so the typer rejects it instead.
+
 
 ### `resume`: one-shot, explicit
 
@@ -552,18 +568,10 @@ the next state `s`, as `resume(v, s)` does; in the clause, `resume(v)`
 is still `resume(v, state)`. The body's handle holds the state between
 resumes, so a `finally` run on a drop sees the last state resumed with.
 
-For genuinely multi-shot or escaping continuations (backtracking
-search, generators), the programmer writes `resume_multishot(v)`
-— a second builtin that pays the copy cost. `resume_multishot`
-exists so the common case is fast and the uncommon case is
-explicit.
-
-> **v1 status (2026-05-13):** v1 of effects ships only
-> one-shot. `resume_multishot` is the target verb but is not
-> yet wired in stage 2. The runtime mechanism for multi-shot
-> (stack-frame copy) is noted in `docs/effects-impl.md` as a
-> separate follow-up; user code that needs multi-shot today
-> has no in-language form.
+There is no multi-shot resume: a continuation, kept or not, resumes
+at most once. Escaping continuations (generators) use `Cont` as
+above; backtracking search that needs to resume one continuation
+twice has no in-language form.
 
 ### Discarding the continuation
 
@@ -576,7 +584,7 @@ handle's type `S`; a clause of any other type is a type error.
 
 This is how `Fail` works:
 
-```kai
+```kaikai
 effect Fail {
   fail(msg: String) : Nothing
 }
@@ -592,6 +600,8 @@ fn with_default(f: () -> Int / Fail) : Int {
     return(x)         -> x
   }
 }
+
+fn main() : Unit / Stdout = Stdout.print("#{with_default(() => safe_div(1, 0))}")   # -1
 ```
 
 The `fail` clause returns `-1`; `with_default` returns `-1`.
@@ -638,8 +648,7 @@ worth noting so the syntax is not mystery:
   and a return type or field that does not declare `Eff` rejects it.
   The scope that owns the parameter does not demand the effect itself.
 - A tail `resume` returns into the op site at no cost; a non-tail
-  one costs one closure. Multi-shot requires copying the fiber
-  stack frames, hence the opt-in.
+  one costs one closure.
 
 Interaction with monomorphisation, fibers, and the module system
 is covered in the implementation doc.
@@ -648,7 +657,16 @@ is covered in the implementation doc.
 
 ### A pure `map` polymorphic in effects
 
-```kai
+```kaikai
+effect Fail {
+  fail(msg: String) : Nothing
+}
+
+fn parse_int(s: String) : Int / Fail = match string_to_int(s) {
+  Some(n) -> n
+  None    -> Fail.fail("not a number: #{s}")
+}
+
 fn map[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e {
   match xs {
     []           -> []
@@ -656,10 +674,14 @@ fn map[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e {
   }
 }
 
-# Use sites:
-map([1, 2, 3], (x) => x + 1)                     # [B]         (pure, e = {})
-map(["a", "b"], (s) => { Io.print(s); s })        # [B] / Io
-map(lines, parse_int)                             # [B] / Fail  (parse_int : (String) -> Int / Fail)
+fn main() : Unit / Stdout = {
+  let a = map([1, 2, 3], (x) => x + 1)                      # pure, e = {}
+  let b = map(["a", "b"], (s) => { Stdout.print(s); s })    # e = Stdout
+  let c = handle { map(["1", "2"], parse_int) } with Fail { # e = Fail
+    fail(msg, resume) -> []
+  }
+  Stdout.print("#{a} #{b} #{c}")
+}
 ```
 
 The body of `map` never calls an effect operation itself, but the
@@ -672,11 +694,13 @@ Not every handler is stateless. `State[T]` threads a value through
 the body without exposing mutation to the user. Declaration
 repeated here for convenience:
 
-```kai
+```kaikai
 effect State[T] {
   get() : T
   set(v: T) : Unit
 }
+
+fn main() : Int = 0
 ```
 
 A handler for `State[T]` takes an initial value and binds a
@@ -685,7 +709,12 @@ second argument: `resume(value, new_state)` resumes the body with
 `value` *and* updates the handler's state. Plain `resume(value)`
 leaves state unchanged.
 
-```kai
+```kaikai
+effect State[T] {
+  get() : T
+  set(v: T) : Unit
+}
+
 fn sum(xs: [Int]) : Int {
   handle {
     each(xs, (x) => State.set(State.get() + x))
@@ -697,7 +726,7 @@ fn sum(xs: [Int]) : Int {
   }
 }
 
-# sum([1, 2, 3]) == 6
+fn main() : Unit / Stdout = Stdout.print("#{sum([1, 2, 3])}")   # 6
 ```
 
 - `with State[Int](0)` installs the handler with initial state 0.
@@ -723,8 +752,17 @@ Eff) calls *handler-scope* masking.
 
 ### Composed handlers
 
-```kai
-fn example() : Unit / Io {
+```kaikai
+effect State[T] {
+  get() : T
+  set(v: T) : Unit
+}
+
+effect Fail {
+  fail(msg: String) : Nothing
+}
+
+fn example() : Unit / Stdout {
   let result = handle {                                     # outer
     handle {                                                # inner
       State.set(10)
@@ -739,14 +777,16 @@ fn example() : Unit / Io {
     fail(msg, resume) -> (-1, 0)
     return(pair)      -> pair
   }
-  Io.print("final = #{result}")
+  Stdout.print("final = #{result}")
 }
+
+fn main() : Unit / Stdout = example()
 ```
 
 Handlers are installed in order: inner handler runs first,
 catches its effect, and the outer sees the body post-handling.
 `State` is no longer in the row past the inner `with`; `Fail` is
-no longer in the row past the outer. `Io` is only in the
+no longer in the row past the outer. `Stdout` is only in the
 remaining row (paid by the final `print`).
 
 ## Inference
@@ -771,13 +811,14 @@ remaining row (paid by the final `print`).
 
 ### Interaction with existing HM
 
-The inferencer already runs HM over types with `TyVarT` and a
-`Subst`. Row variables are added as a parallel notion:
+The inferencer runs HM over types with `TyVarT` and a `Subst`. Row
+variables are a parallel notion:
 
-- New type constructor `TyRow(labels: [String], tail:
-  Option[RowVarId])`. Parallel to `TyVarT`.
-- New substitution slot for row variables.
-- `apply_ty` / `unify` extended with a row case.
+- A function type carries its row: `TyFnT(params, ret, row)`, where
+  `Row` is a record of sorted, deduplicated `labels` and an optional
+  `tail` row-variable id, parallel to `TyVarT`.
+- The substitution has a slot for row variables.
+- `apply_ty` / `unify` have a row case (`unify_row`).
 
 ### Rows inside ordinary types
 
@@ -786,7 +827,11 @@ as a parameter** and store it in a data value. `stdlib/stream.kai`
 is built on this:
 
 ```kaikai
+pub effect Emit[t] { emit(v: t) : Unit }
+
 pub type Stream[t, e] = Stream(() -> Unit / Emit[t] + e)
+
+fn main() : Int = 0
 ```
 
 The mechanism is a **row carrier**: a row-kind argument slot resolves
@@ -809,13 +854,16 @@ the declaring type mentions it **after a `/`** in some constructor
 field. Passing it on as a type argument alone is not enough:
 
 ```kaikai
-pub type Pair[t, e] = Pair(Box[t, e], Box[t, e])   # `e` NOT row-kind
-pub type Pair[t, e] = Pair(Box[t, e], () -> Unit / e)   # `e` row-kind
+type Box[t, e] = Box(t, () -> Unit / e)                      # `e` row-kind
+
+type Pair[t, e] = Pair(Box[t, e], Box[t, e])                 # `e` NOT row-kind
+type RowPair[t, e] = RowPair(Box[t, e], () -> Unit / e)      # `e` row-kind
+
+fn main() : Int = 0
 ```
 
-The first form still builds values, but the `e` slot resolves as an
-ordinary type parameter, and passing the value to a generic function
-fails to unify. Give the type a field whose row position mentions `e`.
+In `Pair`, `e` is an ordinary type parameter: it reaches a row only
+through `Box`'s own row-kind slot.
 
 **Records carry a row the same way.** A record whose function-typed
 field mentions a tparam after `/` has a row-kind slot, exactly as a
@@ -825,6 +873,8 @@ sum constructor does:
 type Hook[e] = { run: (Int) -> Unit / e }
 
 fn fire(h: Hook[Stdout], n: Int) : Unit / Stdout = h.run(n)
+
+fn main() : Unit / Stdout = fire(Hook { run: (n) => Stdout.print("#{n}") }, 3)
 ```
 
 Every use of the record — a literal, a field read, a record pattern,
@@ -841,7 +891,7 @@ rows, so `Hook[Stdout]` is not accepted where `Hook[Stdout + Log]` is
 expected, nor `Box[Beep]` where `Box[Log]` is — there is no row
 subtyping (see *Out of scope*).
 
-## Out of scope for v1
+## Out of scope
 
 - **Subtyping or row coercion.** Adding an effect is an explicit
   annotation, not an implicit conversion.
@@ -856,20 +906,19 @@ subtyping (see *Out of scope*).
   previously "effect operations with generic type arguments at
   the use site". Row-level per-call polymorphism is what stays
   out of scope.)*
-- **Multi-shot `resume` by default.** Always opt-in via
-  `resume_multishot`.
+- **Multi-shot `resume`.** A continuation resumes at most once.
 - **Ambient effects.** Every effect must be explicitly handled.
-  No "default Io handler" baked into the language itself — the
-  stdlib provides one, installed by the runtime when `main` has
-  `Io` in its row.
+  No default handler is baked into the language itself — the
+  stdlib effects declare defaults, installed at `main` when its row
+  holds them.
 - **Exceptions as a separate feature.** `Result[T, E]` with postfix
   `!`, or a user-declared `Nothing`-returning effect, subsumes
   try/catch idioms. There is no `try` keyword.
 - **`raise` / `throw` / `catch` keywords.** The only surface
   verb is `handle`; operation calls happen through plain
-  method-call syntax (e.g., `Io.print(s)`).
-Two items once listed here as out of scope have **shipped** (§6
-named instances, #820) and now live in the surface above:
+  method-call syntax (e.g., `Stdout.print(s)`).
+
+Two related capabilities are in the language (§6 named instances):
 
 - **Named handler instances are first-class capability values.**
   `with Eff as a` binds `a` as a value of type `Eff`; `a` may be
@@ -880,15 +929,14 @@ named instances, #820) and now live in the surface above:
   capability. No `Handler[E]` wrapper, no HKT.
 - **Multiple instances of one effect, addressed independently.**
   Three `with Cell as c1/c2/target` instances pass through one
-  `add(c1, c2, dst)` call and each performs against its own node —
-  the design §6.1 flagship. You no longer have to declare three
-  effects to get three cells.
+  `add(c1, c2, dst)` call and each performs against its own node,
+  so three cells need one effect, not three.
 
 ## Open questions
 
 Each question's body explains the dilemma; a leading label marks
 whether there is a tentative leaning or the question is genuinely
-undecided. Tentatives become decisions in Doc B or Doc C when
+undecided. Tentatives become decisions in `docs/effects-stdlib.md` or `docs/effects-impl.md` when
 they first need to be acted on.
 
 1. **Syntax for calling a rebound capability.** Does `log` (from
@@ -903,12 +951,9 @@ they first need to be acted on.
    *Decided:* yes — identity is the default. `handle { body }
    with E { ops }` without a `return` clause has the same type
    as `body`. See
-   `docs/decisions/handler-return-clause-optional-2026-05-12.md`
-   (closes #539). No short form for trivial transformers —
-   `return(x) -> x` is already short, and the
-   silent-contract concern that prompted the question turned
-   out to be a misread of the spec (line 311-313 already says
-   the clause is optional).
+   `docs/decisions/handler-return-clause-optional-2026-05-12.md`.
+   No short form for trivial transformers — `return(x) -> x` is
+   already short.
 
 3. **Ordering of `with`-clauses.** Must all ops appear?
    *Decided:* yes — exhaustive, analogue of pattern-match
@@ -923,15 +968,15 @@ they first need to be acted on.
    `fn main() : Unit` (pure) with the user writing
    `handle { ... } with Io { ... }` at the top? The first is
    ergonomic; the second is principled.
-   *Decided:* the first. Ergonomy wins; the stdlib provides the
-   Io handler and the runtime installs it for `main` functions
-   whose row includes `Io`.
+   *Decided:* the first. Ergonomy wins; the stdlib effects
+   (`Stdout`, `File`, …) carry default handlers, and the runtime
+   installs them for a `main` whose row includes them.
 
 5. **Do we allow effect aliases?** `type Net = Http + Dns`.
    *Decided:* yes, with one restriction — aliases must be
    **closed** (no row variable on the right-hand side). Legal:
-   `type Io = Console + Stdin + Env`. Illegal: `type WithIo[e] =
-   Io + e`. The restricted form covers every use case we have
+   `type Io = Stdout + Stdin + Env`. Illegal: `type WithIo[e] =
+   Stdout + e`. The restricted form covers every use case we have
    (grouping stdlib effects, enabling future granulation of
    coarse effects like `Io`) and avoids row-polymorphic aliases,
    which would complicate unification beyond what §*Row
@@ -946,8 +991,7 @@ they first need to be acted on.
    signature?
    *Decided:* closed signature, matching sum types. Re-export
    works via the standard module surface (`import` /
-   `pub effect`). Open extension is intentionally out of scope —
-   user-declared default handlers track separately under #533.
+   `pub effect`). Open extension is intentionally out of scope.
    An effect name resolves like any other name
    (`docs/namespaces-design.md` §1): the file's own declaration, then
    its imports, then the core modules. An imported `Stdout` therefore
@@ -956,17 +1000,12 @@ they first need to be acted on.
    the declaration it resolved to, so two effects sharing a name never
    discharge, absorb or default for each other.
 
-## Next steps
+## Related docs
+<!-- coverage: skip --> cross-references
 
-- **Doc B** — `docs/effects-stdlib.md`: concrete stdlib effects
-  (`Io`, `State[T]`, `Mutable`, `Cancel`, `Spawn`),
-  migration of the existing `print`/`read_file`/`array_*`
-  builtins, Io default-handler implementation, interaction with
-  the `bin/kai run` entry.
-- **Doc C** — `docs/effects-impl.md`: op dispatch in the
-  stage-2 pipeline, changes to `TyFnT`, handler-stack runtime
-  representation, interaction with monomorphisation and fibers
-  (m8), diagnostic quality for row-mismatch errors.
-
-v1 of the implementation lands in milestones m7.1–m7.N, each a
-separate sub-design that references back here.
+- `docs/effects-stdlib.md` — the concrete stdlib effects (`Stdout`,
+  `File`, `State[T]`, `Mutable`, `Cancel`, `Spawn`, …) and their
+  default handlers.
+- `docs/effects-impl.md` — op dispatch in the stage-2 pipeline,
+  handler-stack runtime representation, interaction with
+  monomorphisation and fibers.

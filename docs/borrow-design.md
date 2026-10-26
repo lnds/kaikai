@@ -1,7 +1,7 @@
 # Borrow annotations — `^` on parameters (design)
 
-**Status:** accepted design, pre-implementation. Consolidates the 2026-07-08
-design conversation. Part of the Orongo scope together with the kind
+**Status:** implemented; the surface is in `kai info syntax`. Consolidates
+the 2026-07-08 design conversation. Part of the Orongo scope together with the kind
 system (#1108). Prim-level borrowing already shipped (#1120); this document
 covers the generalization to user function parameters.
 
@@ -86,16 +86,27 @@ opt-in report of inferred borrows. Not a v1 gate.
 ## Surface
 
 ```kaikai
-pub fn map(xs: [a], ^f: (a) -> b) : [b]
-fn lookup(^t: Tree, k: Int) : Option[Int]
+type Tree = Leaf | Node(Tree, Int, Int, Tree)
+
+pub fn map[a, b](xs: [a], ^f: (a) -> b) : [b] = xs | (x) => f(x)
+
+fn lookup(^t: Tree, k: Int) : Option[Int] = match t {
+  Leaf -> None
+  Node(l, key, v, r) ->
+    if k == key { Some(v) } else if k < key { lookup(l, k) } else { lookup(r, k) }
+}
+
+fn main() : Int = match lookup(Node(Leaf, 1, 10, Leaf), 1) {
+  Some(v) -> list.length(map([1, 2], (x) => x + v)) - 2
+  None    -> 1
+}
 ```
 
 - `^` prefixes the parameter *name*, only inside a `fn` declaration's
   parameter list.
-- **Grammar (verified):** the parameter-start position accepts only an
-  identifier today (`parse_fn_params_group`), so a leading `^` is a currently-
-  rejected token in a position no expression can begin — and no expression can
-  begin with `^` (power is infix-only; the unit exponent lives inside `<...>`).
+- **Grammar:** apart from `^`, the parameter-start position accepts only an
+  identifier (`parse_fn_params`), a position no expression can begin —
+  and no expression can begin with `^` (power is infix-only; the unit exponent lives inside `<...>`).
   The contexts are disjoint at every parse point; LL(1) is preserved with one
   token of lookahead. Precedent for positional glyph reuse: `<` (comparison
   vs `Real<m>`), `|` (variant separator vs map-pipe).

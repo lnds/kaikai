@@ -37,7 +37,7 @@ argument that provably violates a `requires` is a compile error, whether
 it is passed directly, through `|>`, or through the `_` placeholder, and
 a runtime violation panics:
 
-```
+```text
 panic: requires violated in `divide`
 required: b != 0
 declared at line 15, col 14

@@ -1,7 +1,8 @@
 # syntax sugars
 
-This is the authoritative specification for the five call-site
-syntactic sugars shipping in milestone **m7b**. They are
+This is the authoritative specification for kaikai's syntactic
+sugars: the five call-site sugars of §1–§5 and the literal, record,
+pipe and body forms of §6–§13. They are
 **general language features**, not effect-specific extensions:
 they apply anywhere the grammar allows, and the parser /
 grammar treats this document as the single source of truth for
@@ -26,9 +27,10 @@ The five sugars:
    blocks (`while { cond } { body }`, `if_then_else(p) { a }
    { b }`).
 
-Each sugar desugars before type checking — the checker sees
-only the post-desugar AST, so effect-row inference is
-unchanged by anything in this doc.
+Each sugar lowers to an ordinary call or form, so effect-row
+inference sees nothing new. Most lower before type checking; `:=`,
+a naked cell read and `a[i]` pick their target from the inferred type
+of the receiver.
 
 ## Context
 
@@ -92,7 +94,7 @@ A call expression whose **last argument has function type
 `(...) -> T` or `(...) -> T / e`** may be written with that
 argument as a block outside the parens:
 
-```kai
+```text
 f(arg1, arg2) { body }               ≡   f(arg1, arg2, () => { body })
 f(arg1, arg2) { x -> body }          ≡   f(arg1, arg2, (x) => { body })
 f(arg1, arg2) { x, y -> body }       ≡   f(arg1, arg2, (x, y) => { body })
@@ -146,15 +148,19 @@ rejects if the declared arity and types do not align.
 
 ### Examples
 
-```kai
-# stdlib effect helpers:
-try { body }
-with_default(0) { compute() }
-with_state(0) { body }
-nursery { n -> n.spawn(task_a) }
-with_reader(env) { body }
-map(xs) { x -> x * 2 }
-each(xs) { x -> Console.print(x) }
+```kaikai
+import spawn
+import reader
+
+fn task_a() : Int = 1
+
+fn main() : Unit / Spawn + Stdout = {
+  let a = nursery { n -> n.await(n.spawn(task_a)) }
+  let b = with_reader(10) { Reader.ask() + 1 }
+  let xs = map([1, 2, 3]) { x -> x * 2 }
+  each(xs) { x -> Stdout.print("#{x}") }
+  Stdout.print("#{a} #{b}")
+}
 ```
 
 ### Relation to `handle`
@@ -212,8 +218,8 @@ Trailing lambdas are additive: `f(() => { body })` and
 Style guidance for stdlib and project code:
 
 - Prefer the **trailing form** when the lambda is the only
-  argument, or when it carries the intent of the call (`try`,
-  `with_state`, `nursery`, `each`).
+  argument, or when it carries the intent of the call (`nursery`,
+  `with_reader`, `each`).
 - Prefer the **paren form** when the lambda is one of several
   arguments of roughly equal weight (`map(xs, (x) => x + 1)`
   reads as a transformation over `xs`, not as "do something to
@@ -231,10 +237,13 @@ where an expression is legal — not only in trailing position.
 This is the form preferred when the lambda is the right operand
 of a binary pipe such as `|` (map pipe) or `|>`:
 
-```kai
-[1..10] | { x -> x * x }              # squared list
-xs |> { ys -> list.length(ys) }       # apply a custom transform
-let inc = { x -> x + 1 }              # bind to a variable
+```kaikai
+fn main() : Unit / Stdout = {
+  let sq = [1..10] | { x -> x * x }              # squared list
+  let n = sq |> { ys -> length(ys) }             # apply a custom transform
+  let inc = { x -> x + 1 }                       # bind to a variable
+  Stdout.print("#{n} #{inc(1)}")
+}
 ```
 
 The desugar is identical to `(x) => body`: both produce the same
@@ -266,21 +275,42 @@ on the receiver's type:
 |---|---|---|
 | `State[T]` (an `as`-bound handler capability) | `cap.get()` (resolves to `State.get`) | `cap.set(v)` |
 | `Reader[T]` (an `as`-bound handler capability) | `cap.get()` (alias-rewritten to `Reader.ask`) | rejected — `Reader` has no `set` op |
-| `Ref[T]` (a value of type `Ref[T]`, e.g. a `let` or fn parameter) | `Mutable.ref_get(cap)` | `Mutable.ref_set(cap, v)` |
+| `Ref[T]` (a value of type `Ref[T]`, e.g. a `let` or fn parameter) | not a read — `@cap` is `Mutable.ref_get(cap)` | `Mutable.ref_set(cap, v)` |
 
-The first two require an `as`-bound name (rule 4 below). The third —
-added in issue #275 — works on any value typed `Ref[T]` regardless of
-how it was bound, including a function parameter, mirroring the way
-`a[i] := v` auto-injects `Mutable` into the row for arrays (issue
-#265). `Ref[T]` itself comes from `Mutable.ref_make[T](init)` and
+The first two require an `as`-bound name (rule 4 below). The third
+works on any value typed `Ref[T]` regardless of how it was bound,
+including a function parameter, mirroring the way `a[i] := v` adds
+`Mutable` to the row for arrays. A `Ref[T]` comes from `&init` and
 crosses function boundaries, which `var` cannot.
+
+```kaikai
+fn bump(r: Ref[Int]) : Unit / Mutable = { r := @r + 1 }
+
+fn main() : Unit / Stdout + Mutable = {
+  let r = &10
+  bump(r)
+  let s = handle {
+    counter := counter + 5                # write + naked read of a State cell
+    counter
+  } with State[Int](1) as counter {
+    get(resume)    -> resume(state)
+    set(v, resume) -> resume((), v)
+    return(x)      -> x
+  }
+  let e = handle { env + 1 } with Reader[Int](41) as env {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+  Stdout.print("#{@r} #{s} #{e}")
+}
+```
 
 ### Rules
 
 Four restrictions, lifted verbatim from Doc B:
 
-1. A naked read applies **only to `State[T].get()`,
-   `Reader[T].ask()`, and `Mutable.ref_get(c)` for `c : Ref[T]`**.
+1. A naked read applies **only to `State[T].get()` and
+   `Reader[T].ask()`**. A `Ref[T]` reads through `@r`.
 2. `cap := v` applies **only to `State[T].set(v)` and
    `Mutable.ref_set(c, v)` for `c : Ref[T]`**.
 3. A naked-read identifier must be **a simple capability
@@ -321,18 +351,18 @@ capabilities of the corresponding effects — they are checker
 implementation details, not names users spell in source code.
 
 - a naked read of `x` lowers to the get/ask op iff
-  `x : StateCap[T]` (for any `T`), `x : ReaderCap[T]`, or
-  `x : Ref[T]`; otherwise `x` stays an ordinary variable read.
+  `x : StateCap[T]` (for any `T`) or `x : ReaderCap[T]`; otherwise
+  `x` stays an ordinary variable read.
 - `x := v` legal iff `x : StateCap[T]` and `v : T`, or
   `x : Ref[T]` and `v : T`, **or** the array-indexing form below.
 
 When `x : Ref[T]`, the call site adds `Mutable` to the enclosing
-function's effect row (issue #275, mirroring the `a[i] := v` /
-`Mutable.array_set` row injection from issue #265).
+function's effect row, mirroring the `a[i] := v` /
+`Mutable.array_set` row injection.
 
-If `x := v` targets an identifier without a capability type, the
-error points at the sugar site and suggests either the method
-call (`x.set(v)`) or the explicit long form (`State.set(v)`).
+If `x := v` targets an identifier that is neither a cell nor a `Ref`,
+the error points at the sugar site: ``:=` writes a `var` or a `Ref`,
+found `Int``.
 
 ### Why the read is naked
 
@@ -344,24 +374,23 @@ the current value, and the surrounding `:=` discipline keeps the
 capability visible per Doc A §*Context*'s capability-explicit
 stance.
 
-`@` carries no expression-level role: its only use is the
-as-pattern (`name @ subpattern` in `match`), documented in
-`docs/proposed-extensions.md` §14. That usage is **infix** in
-patterns, so there is no clash with the naked read in
-expressions.
+`@` in expression position is the `Ref` dereference (`@r`); a cell
+needs no marker. In patterns, `name @ subpattern` is the legacy
+spelling of the as-binding `name as subpattern`; the two positions
+never meet (`docs/ref-sugar-design.md`).
 
 ## 3. Local mutable cells: `var`
 
 ### Rule
 
-```kai
+```kaikai-fragment
 var name: T := init      # with type annotation
 var name := init         # with inference
 ```
 
 desugars, in the same block, to:
 
-```kai
+```text
 handle { /* rest of block */ } with State[T](init) as name {
   get(resume)    -> resume(state)
   set(v, resume) -> resume((), v)
@@ -456,7 +485,7 @@ analysis.
 
 ### Rules
 
-```kai
+```text
 a[i]         ≡   Mutable.array_get(a, i)      # read
 a[i] := v    ≡   Mutable.array_set(a, i, v)   # write
 ```
@@ -499,40 +528,41 @@ The parser picks the correct desugar from the LHS shape: a
 plain identifier is a capability write (§2); an `IndexLhs`
 followed by `[...]` is an array write.
 
-### Map dispatch (issue #128)
+### Map dispatch
 
 When `e1 : Map[K, V]`, the same `e1[e2]` postfix lowers instead
-to `map_get(e1, e2) : Option[V]`. The typer picks the lowering
+to `map.get(e1, e2) : Option[V]`. The typer picks the lowering
 by inspecting the inferred type of `e1` at the index site;
 `Array[T]` keeps the `array_get` semantics above unchanged, and
 unresolved type variables default to `Array[T]` so the existing
 "expected `Array[T]`" diagnostic still fires when an unannotated
 local is indexed without a constructor hint.
 
-```kai
-let registry : Map[String, Pid[Cmd]] = registry_empty()
-let pid = registry["worker-3"]   #  ≡  map_get(registry, "worker-3") : Option[Pid[Cmd]]
+```kaikai
+import collections.map
+
+fn main() : Unit / Stdout + Mutable = {
+  let a = array_make(3, 0)
+  a[1] := 7                           # Mutable.array_set(a, 1, 7)
+  let x = a[1]                        # Mutable.array_get(a, 1)
+  let registry = %{ "worker-3": 3 }
+  let hit = registry["worker-3"]      # map.get(registry, "worker-3") : Option[Int]
+  match hit {
+    Some(n) -> Stdout.print("#{x} #{n}")
+    None    -> Stdout.print("#{x} none")
+  }
+}
 ```
 
-The write-side sugar `m[k] := v` is **not** supported on
-`Map[K, V]` in v1. The typer emits a diagnostic that points
-at `map_put(m, k, v)`; supporting an indexed write over a
-persistent container needs a separate design pass and ships
-alongside the HAMT carrier in v2 (issue #128's *Out of scope*
-list, mirrored in `docs/proposed-extensions.md` §6's
-retrospective).
+A `Map` is immutable, so the write-side sugar `m[k] := v` is a
+compile error on `Map[K, V]`: use `map.put(m, k, v)` and rebind, or a
+`HashMap` to mutate in place.
 
-### What it does **not** extend to
+### Related forms
 
-Two deliberate non-targets:
-
-- **`Ref[T]`** — reading and writing refs stays as the
-  explicit `Mutable.ref_*` op form. `Ref` is a low-level tool
-  used mostly by stdlib / FFI adapters, where explicit ops
-  double as documentation (Doc B §`Mutable` *Idiomatic usage*).
-- **Slice syntax** — `a[i..j]` is not in v1. Tracked in
-  `docs/proposed-extensions.md` §7; lands alongside
-  `Vector[T]` post-MVP, with a separate grammar rule.
+- **`Ref[T]`** has its own sugar: `&init`, `r := v`, `@r`
+  (§2, `docs/ref-sugar-design.md`).
+- **Slicing** — `xs[a..b]` slices a `Vec` by range (`kai info vec`).
 
 ## 5. Double trailing lambdas
 
@@ -541,7 +571,7 @@ Two deliberate non-targets:
 A call whose **last two arguments are both function type** may
 be written with both trailing as blocks:
 
-```kai
+```text
 f(arg)        { x -> body1 } { y -> body2 }
             ≡ f(arg, (x) => { body1 }, (y) => { body2 })
 
@@ -554,12 +584,23 @@ f { cond } { body }
 ```
 
 The canonical use is control-flow helpers built as ordinary
-stdlib functions:
+functions — `while` and `until` from the `loop` module, or one of your
+own:
 
-```kai
-while      { i > 0 } { i := i - 1; io.println("#{i}") }
-until      { done }  { process_one() }
-if_then_else(p)      { run_a() } { run_b() }
+```kaikai
+import loop
+
+fn if_then_else[t, e](p: Bool, a: () -> t / e, b: () -> t / e) : t / e =
+  if p { a() } else { b() }
+
+fn main() : Unit / Stdout = {
+  var i := 3
+  var done := false
+  while { i > 0 } { i := i - 1; Stdout.print("#{i}") }
+  until { done }  { done := true }
+  let s = if_then_else(i == 0) { "zero" } { "other" }
+  Stdout.print(s)
+}
 ```
 
 These compose with row polymorphism the same way single-trailing
@@ -611,7 +652,7 @@ Same resolution as §1: blocks-as-expressions and trailing-
 lambda blocks differ by **same-line attachment**. With two
 trailings the rule generalises:
 
-```kai
+```text
 f { a } { b }            # one call: f((() => a), (() => b))
 
 f { a }
@@ -630,7 +671,7 @@ same rule. Newlines terminate.
 **Issue #154**, shipped 2026-05-03. Parser-only desugar to existing
 stdlib record types — no new TyCtor, zero typer/RC cost.
 
-```kai
+```text
 # Construction
 (a, b)                ≡  Pair  { fst: a, snd: b }
 (a, b, c)             ≡  Triple { fst: a, snd: b, trd: c }
@@ -652,6 +693,17 @@ trip.fst  trip.snd  trip.trd
 quad.fst  quad.snd  quad.trd  quad.frt
 ```
 
+```kaikai
+fn main() : Unit / Stdout = {
+  let pair : (Int, String) = (1, "a")
+  let trip : (Int, Int, Int) = (1, 2, 3)
+  let q = (1, 2, 3, 4)
+  let (a, b) = pair
+  let (x, y, z) = trip
+  Stdout.print("#{a} #{b} #{x + y + z} #{pair.fst} #{trip.trd} #{q.frt}")
+}
+```
+
 **Cap**: arity 2..4. Wider products should be a named record,
 not a tuple. Arity 5+ is rejected at parse time with a
 diagnostic naming the cap.
@@ -671,7 +723,7 @@ expression / zero-arg lambda head / `() -> T` function type.
   after the first expression a `,` appears (and we did not
   open a lambda), accumulate further comma-separated exprs and
   desugar on `)`.
-- *Pattern position* — new entry from `parse_pattern_rest`:
+- *Pattern position* — in `parse_pattern`:
   `(` opens either a grouping `(p)` (single inner pattern, no
   comma) or an n-tuple pattern `(p1, p2, ...)` desugaring to
   `PVariantRecord("Pair" | "Triple" | "Quad", [...])`.
@@ -701,16 +753,20 @@ no new type, no new operator.
 Integer literals may be written in hexadecimal (`0x` prefix)
 or binary (`0b` prefix) in addition to decimal:
 
-```kai
-let mask  : Int = 0xFF
-let cafe  : Int = 0xCAFE
-let max64 : Int = 0x7FFFFFFFFFFFFFFF   # signed 64-bit max
-let bits  : Int = 0b11111111
-let port  : Int = 0b1111101000          # = 1000
+```kaikai
+fn main() : Unit / Stdout = {
+  let mask  : Int = 0xFF
+  let cafe  : Int = 0xCAFE
+  let max64 : Int = 0x7FFFFFFFFFFFFFFF   # signed 64-bit max
+  let bits  : Int = 0b11111111
+  let port  : Int = 0b1111101000          # = 1000
+  let word  : Int = 0xDEAD_BEEF           # `_` separates digits in any base
+  Stdout.print("#{mask} #{cafe} #{max64} #{bits} #{port} #{word}")
+}
 ```
 
-The literal type is `Int` (signed 64-bit, the runtime's only
-integer type). The AST node is `EInt` — the same node that
+The literal type is `Int` (signed 64-bit); a fixed-width suffix
+(`0xFFu32`) picks another integer type (`kai info syntax`). The AST node is `EInt` — the same node that
 backs decimal literals. Constant-folding, refinement
 propagation, monomorphisation, and Perceus see the same shape
 they see for `42` or `1_000_000`.
@@ -718,12 +774,12 @@ they see for `42` or `1_000_000`.
 ### Grammar delta
 
 The integer-literal token recognises three branches in the
-lexer (`stage2/compiler.kai` — see `lex_hex_or_bin_int` and
+lexer (`stage2/compiler/lex.kai` — see `lex_hex_or_bin_int` and
 `lex_scan_digits`):
 
 ```
-IntLit   ::= "0x" HexDigit+
-           | "0b" BinDigit+
+IntLit   ::= "0x" HexDigit ("_"? HexDigit)*
+           | "0b" BinDigit ("_"? BinDigit)*
            | DecDigit ("_"? DecDigit)*
 HexDigit ::= [0-9a-fA-F]
 BinDigit ::= [01]
@@ -735,10 +791,6 @@ or binary branch; any other prefix is decimal.
 
 ### What is **not** supported
 
-- **Underscore digit separators in hex/bin**. `0xFF_FF` does
-  not parse. Decimal literals already accept `_` as a
-  separator (`1_000_000`); the hex/bin branches deliberately
-  do not extend it. Open as a follow-up if demand arises.
 - **Octal `0o`**. Not in the lexer. Hex covers the same
   byte-pattern use cases more readably.
 - **Hex floating-point literals** (`0x1.8p3`). `Real` literals
@@ -774,15 +826,16 @@ change.
 A record-literal `T { ... }` may supply its field values
 positionally, in declaration order, instead of by name:
 
-```kai
-type Complex = { re: Real, im: Real }
-type Point   = { x: Int, y: Int }
+```kaikai
+type Cplx  = { re: Real, im: Real }
+type Point = { x: Int, y: Int }
 
-let z = Complex { 1.0, 2.0 }     #  ≡  Complex { re: 1.0, im: 2.0 }
-let p = Point   { 0, 0 }         #  ≡  Point   { x: 0, y: 0 }
-
-# Named form keeps working unchanged:
-let zn = Complex { re: 1.0, im: 2.0 }
+fn main() : Unit / Stdout = {
+  let z = Cplx  { 1.0, 2.0 }       #  ≡  Cplx  { re: 1.0, im: 2.0 }
+  let p = Point { 0, 0 }           #  ≡  Point { x: 0, y: 0 }
+  let zn = Cplx { re: 1.0, im: 2.0 }   # named form keeps working
+  Stdout.print("#{z.im} #{p.x} #{zn.re}")
+}
 ```
 
 ### Disambiguation
@@ -839,14 +892,15 @@ compile so downstream invariant walkers never see a tagged AST.
   the type's declaration would silently rewire the call). `Color { r:
   255, g: 128, b: 0, a: 255 }` keeps named.
 
-### What is **not** in v1
+### What is **not** supported
 
-- **Function-style `T(v1, v2)`** — separate proposal, conflicts with
-  the type-ctor model and with generic type application.
+- **Function-style `T(v1, v2)`** as a literal. `T(args)` exists only as
+  a call to the function the type marks `#[constructor]`
+  (`docs/constructor-sugar-design.md`), never as the raw literal.
 - **Partial positional with `..rest`** — n-tuple-style spread is a
   separate discussion.
 - **With-update positional** (`{ z | 5.0, _ }`) — confusing
-  semantics, not in v1.
+  semantics.
 - **Auto-derived positional `Show`/`Eq`** — independent proposal.
 
 ## 9. Complex literals — `<digits>i` suffix
@@ -862,10 +916,13 @@ parser desugars the literal to a call against the stdlib
 A numeric literal followed *immediately* (no whitespace, no
 intervening character) by `i` lexes as `TkComplex`:
 
-```kai
-let a = 3i        # → complex.mk(0.0, 3.0)
-let b = 2.5i      # → complex.mk(0.0, 2.5)
-let c = 1e10i     # → complex.mk(0.0, 1.0e10)
+```kaikai
+fn main() : Unit / Stdout = {
+  let a = 3i        # → complex.mk(0.0, 3.0)
+  let b = 2.5i      # → complex.mk(0.0, 2.5)
+  let c = 1e10i     # → complex.mk(0.0, 1.0e10)
+  Stdout.print("#{a.im} #{b.im} #{c.im}")
+}
 ```
 
 The literal's type is `Complex` (the record `{ re: Real, im:
@@ -879,11 +936,14 @@ The contiguity rule preserves `i` as a free identifier — only
 `<digits>i` (with the `i` directly after the digit/exponent
 scan) attaches:
 
-```kai
-let i = 5
-let x = i + 1      # `i` is the int variable, `i + 1` = 6
-let y = 3 + i      # whitespace breaks the suffix → 8
-let z = 3+i        # `i` after `+` is still an ident → 8
+```kaikai
+fn main() : Unit / Stdout = {
+  let i = 5
+  let x = i + 1      # `i` is the int variable, `i + 1` = 6
+  let y = 3 + i      # whitespace breaks the suffix → 8
+  let z = 3+i        # `i` after `+` is still an ident → 8
+  Stdout.print("#{x} #{y} #{z}")
+}
 ```
 
 The lexer numeric scan stops at the first non-digit / non-`.` /
@@ -916,18 +976,13 @@ bound. `bin/kai` auto-imports `stdlib/math/complex.kai` as part
 of the core (issue #245), so the desugared call resolves
 without an explicit `import math.complex`.
 
-### What is **not** supported (Phase 2 of #267, blocked by #180)
+### Mixed arithmetic
 
-- **Heterogeneous arithmetic.** `2.0 + 3.0i` does *not* parse-
-  through into a working `Complex` because `2.0 : Real` and
-  `3.0i : Complex` need a `Real + Complex` operator dispatch.
-  That requires `protocol P[A]` (#180). Until #180 lands, mix
-  with an explicit lift:
+`2.0 + 3.0i` works: `stdlib/math/complex.kai` declares
+`impl Add[Complex] for Real` and `impl Add[Real] for Complex`
+(`docs/protocols.md` *Heterogeneous arithmetic*).
 
-  ```kai
-  let z = complex.from_real(2.0) + 3.0i   # works (Complex + Complex)
-  let w = 2.0 + 3.0i                       # FAILS — needs #180
-  ```
+### What is **not** supported
 
 - **`i` as a method or accessor on Real**. `2.0.i` would be
   field access on a Real, which has no `i` field — error.
@@ -944,9 +999,8 @@ the same paths used by hand-written `complex.mk(0.0, 3.0)`.
 - `examples/sugars/complex_literal_basic.kai` — `3i`, `2.5i`,
   `1e10i` lex and produce `Complex` values with the expected
   fields.
-- `examples/sugars/complex_literal_with_complex.kai` —
-  `complex.from_real(2.0) + 3.0i` works through the existing
-  `impl Add for Complex`.
+- `examples/sugars/complex_literal_with_complex.kai` — a literal
+  in `Complex` arithmetic.
 - `examples/sugars/complex_literal_ident_i.kai` — pins the
   identifier-`i` boundary so the lexer never over-attaches.
 
@@ -962,15 +1016,17 @@ A record literal whose first item is `...expr` builds a new value
 of `T` whose fields default to those of the source, with named
 overrides replacing selected fields:
 
-```kai
+```kaikai
 type Color = { r: Int, g: Int, b: Int, a: Int }
 
-let red       = Color { r: 255, g: 0, b: 0, a: 255 }
-let translucent = Color { ...red, a: 128 }
-#                ≡ Color { r: 255, g: 0, b: 0, a: 128 }
-
-let inverted  = Color { ...red, r: 0, g: 255, b: 255 }
-#                ≡ Color { r: 0,   g: 255, b: 255, a: 255 }
+fn main() : Unit / Stdout = {
+  let red         = Color { r: 255, g: 0, b: 0, a: 255 }
+  let translucent = Color { ...red, a: 128 }
+  #                 ≡ Color { r: 255, g: 0, b: 0, a: 128 }
+  let inverted    = Color { ...red, r: 0, g: 255, b: 255 }
+  #                 ≡ Color { r: 0, g: 255, b: 255, a: 255 }
+  Stdout.print("#{translucent.a} #{inverted.g}")
+}
 ```
 
 This is the language's **functional update** form: every other path
@@ -985,7 +1041,7 @@ every untouched field.
   after" and avoids debate about override-direction precedence.
 - Only **named** overrides may follow the spread. Pun (`{ ...p, x }`)
   and positional (`{ ...p, 10, 20 }`) are rejected. Pun would silently
-  bind `x: x` from the local scope; v1 requires the explicit `x: x`.
+  bind `x: x` from the local scope; the explicit `x: x` is required.
 - A second spread is rejected: `record literal admits a single \`...\`
   spread`.
 - The source must match the outer record type. `P { ...q, ... }` where
@@ -1073,8 +1129,7 @@ during type-check on the synthetic `let` annotation.
 - **Pattern spread** (`P { ...rest }` to capture remaining fields) —
   separate proposal, out of scope.
 - **Type inference for `T`** (`{ ...p, x: 10 }` with no leading type
-  name) — separate enhancement; v1 follows the existing record-lit
-  rule that always names the type.
+  name) — a record literal always names the type.
 
 ### Fixtures
 
@@ -1114,8 +1169,8 @@ so `xs |? even | (n) => n * 2` parses as
 
 The right-hand side accepts every lambda surface that `|` accepts:
 a bare name, a paren-form arrow (`(x) => body`), a block lambda
-(`{ x -> body }`), or a `.field` / `.method` placeholder (#385 /
-m7f §19) — `xs |? .active` desugars to
+(`{ x -> body }`), or a `.field` placeholder — `xs |? .active`
+desugars to
 `xs |? ((__pl) => __pl.active)`.
 
 Effects on the predicate are captured at the call site exactly as
@@ -1126,10 +1181,11 @@ pipe expression carry `Console` in its inferred row.
 `Nothing` stage is fine), checked at the pipe; the pipe's type is
 `Unit`, so a pipe after it is rejected.
 
-Constraint #1 from #201 still holds: `Option` and `Result` heads
-are rejected with a typed diagnostic pointing the user at `!` or
-`option.and_then` / `result.and_then` for explicit chaining. The
-pipes are list-shaped sugar, not a generic monadic chain.
+The pipes dispatch on the head type's declaring module, so any type
+exporting the canonical `map` / `flat_map` / `filter` / `each` rides
+them. `Option` rides all four (`|` maps `Some`, `||` is `and_then`);
+`Result` rides `|`, `||` and `|!` over `Ok`, and `|?` on a `Result` is
+an error. The full list is in `kai info pipes`.
 
 ### Fusion (#1134)
 
@@ -1158,11 +1214,11 @@ is composed entirely of `case`-led arms; each arm pattern-matches
 against the implicit tuple of arguments and may carry an optional
 `when` guard.
 
-```kai
+```kaikai
 fn classify(n: Int) : String {
-  case 0          -> "zero"
+  case 0            -> "zero"
   case n when n < 0 -> "neg"
-  case _          -> "pos"
+  case _            -> "pos"
 }
 
 fn classify2(a: Int, b: Int) : String {
@@ -1171,6 +1227,8 @@ fn classify2(a: Int, b: Int) : String {
   case _, 0 -> "second-zero"
   case _, _ -> "neither"
 }
+
+fn main() : Unit / Stdout = Stdout.print(classify(-1) ++ " " ++ classify2(0, 3))
 ```
 
 ### Decision rule
@@ -1191,29 +1249,34 @@ Once case-mode is committed (the first token was `case`) a non-`case`
 non-`}` token produces the same diagnostic. There is no warning-only
 mode; the rule is enforced unconditionally.
 
-If you need setup before discrimination, extract a helper or use the
-single-expression body wrapping a `match`:
+If you need setup before discrimination, extract a helper or use a
+statement block ending in a `match`:
 
-```kai
-fn lookup(xs: [Entry], k: String) : Lookup =
-  let cache = compute() {
-    match (xs, k) { ... }
+```kaikai
+fn lookup(xs: [Int], k: Int) : String = {
+  let n = length(xs)
+  match (n, k) {
+    (0, _) -> "empty"
+    (_, 0) -> "no key"
+    _      -> "found"
   }
+}
+
+fn main() : Unit / Stdout = Stdout.print(lookup([1], 2))
 ```
 
 ### Desugar
 
 For a 1-arg fn the scrutinee is the parameter directly:
 
-```
+```text
 fn f(a: T) : R { case p1 -> b1 ; case p2 -> b2 }
 # desugars to
 fn f(a: T) : R = match a { p1 -> b1 ; p2 -> b2 }
 ```
 
 For an N-arg fn (2 ≤ N ≤ 4) the scrutinee is the implicit tuple of
-parameters; surface kaikai has no tuple expression so the desugar
-reuses the existing multi-arg `match a, b { p, q -> ... }` machinery
+parameters; the desugar reuses the existing multi-arg `match a, b { p, q -> ... }` machinery
 (`desugar_multi_match`) — each arm carries N comma-separated patterns,
 mirroring issue #129. The N=4 cap matches `parse_match`. Each arm is
 lowered once: it tests one refutable column as a pattern and the others
@@ -1374,15 +1437,22 @@ slots are disjoint:
 
 Combining them:
 
-```kai
-var counter := 0
-each(events) { e ->
-  if counter < max {
-    buffer[e.id] := e.payload
-    counter := counter + 1
+```kaikai
+type Event = { id: Int, payload: Int }
+
+fn main() : Unit / Stdout + Mutable = {
+  let events = [Event { id: 0, payload: 7 }, Event { id: 2, payload: 9 }]
+  let buffer = array_make(4, 0)
+  let max = 10
+  var counter := 0
+  each(events) { e ->
+    if counter < max {
+      buffer[e.id] := e.payload
+      counter := counter + 1
+    }
   }
+  Stdout.print("processed #{counter}")
 }
-Console.print("processed #{counter}")
 ```
 
 Parsing this unambiguously walks:
@@ -1396,7 +1466,7 @@ Parsing this unambiguously walks:
   be `Array[T]`; the checker picks `T` from `e.payload`.
 - `counter := counter + 1` — capability write + capability
   read.
-- `Console.print("processed #{counter}")` — interpolation
+- `Stdout.print("processed #{counter}")` — interpolation
   containing `counter`, which is an ordinary expression
   inside `#{...}`.
 
@@ -1409,65 +1479,30 @@ lookahead. No extra peek beyond that is required.
 Candidates discussed during Doc B review and rejected, with
 reasons:
 
-- **`r := v` for `Ref[T]`.** Would unify Ref and State writes
-  under one sugar. Rejected because Ref is a value, not a
-  capability binding, and the checker would then need to
-  inspect the LHS's declared type to pick a desugar target,
-  complicating diagnostics.
-
 - **A naked read for `Ref[T]`.** A bare `r` does not read a
-  `Ref[T]`; that stays the explicit `Mutable.ref_get(r)` form.
-  Same reason as above — Ref is a value, not a capability
-  binding.
+  `Ref[T]`; `@r` does. A `Ref` is a value, not a capability
+  binding, so reading through it is marked.
 
 - **`counter <- v` (Haskell-style) instead of `counter := v`.**
   `<-` reads as "pull value from computation" in Haskell and
   Elm contexts; kaikai's `:=` reads as "assign". The latter
   matches the semantics closer. Rejected.
 
-- **`yield name = expr` for generators.** Generators are a
-  separate effect (not in v1) and would need their own sugar
-  design. Rejected as out of scope.
+- **`yield name = expr` for generators.** Generators are the
+  `Yield` effect of the `gen` module (`Yield.yield(v)` inside
+  `generate { ... }`); they need no binding sugar.
 
-## Migration and diagnostics
+## Diagnostics and formatting
 
-- **Error messages show the source form.** A type error
-  inside `counter := counter + 1` prints the expression as
-  the user wrote it, with the caret at the sugar site. Where
-  understanding the error depends on the desugar (e.g., the
-  checker talks about `set(v: T)`'s parameter type and the
-  user sees `:=`), the message attaches a `note: equivalent to
-  counter.set(counter.get() + 1)` line. The compiler preserves
-  the sugar span through desugar so this annotation is local
-  and cheap. Modelled after Rust's handling of `?` and similar
-  sugars.
-- **The codemod does not introduce sugars.** `kai fmt
-  --upgrade-effects` (m7a) rewrites bare builtins to explicit
-  effect form (`print` → `Console.print`, etc.) but leaves
-  `.get()` / `.set(v)` / `Mutable.array_get(...)` alone. A
-  second codemod pass, m7b or later, can migrate to the
-  sugars — kept separate so that (a) m7a can ship without
-  waiting for sugars, and (b) users keep the choice of using
-  sugars or not.
-- **JSON diagnostics carry both forms.** The `--json` output
-  (same contract as typed-holes, see `docs/typed-holes.md` and
-  Tier 2 principle #4) serialises each diagnostic with the
-  source expression *and* its desugared form as separate fields.
-  The human text prefers the source; the LLM channel consumes
-  the structured pair without needing to map between them. No
-  friction on either side.
-- **`kai fmt` is canonical, not optional.** Like `gofmt`, there
-  is one formatting for each piece of code and no configuration
-  knobs. Indentation rules for the sugars in this document
-  (trailing-lambda body from the call's column, chained `|>` on
-  separate lines, `var` at the top of its block, etc.) are
-  encoded in `kai fmt`. CI is expected to run `kai fmt --check`
-  and reject diffs. This keeps code consistent across projects
-  and removes an entire class of style debates — important for
-  both human reviewers and LLM authors who produce output that a
-  canonical formatter can normalise before diffing.
+- **Error messages point at the source form.** A type error inside
+  `counter := counter + 1` carries the caret at the sugar site, as the
+  user wrote it.
+- **`kai fmt` is canonical.** Like `gofmt`, there is one layout for each
+  piece of code; the only setting is the line width (`--width`, or a
+  `[fmt]` table in `kai.toml` — `docs/fmt-width.md`). CI runs
+  `kai fmt --check` and rejects diffs.
 
-## Out of scope for v1
+## Out of scope
 
 - **User-definable sugars / macros.** Every sugar in this doc
   is built in. No facility for a library to declare its own
@@ -1475,12 +1510,10 @@ reasons:
 - **`:=` as reassignment of `let` bindings.** `let` is
   immutable; `let x = 3; x := 5` is a type error. No plan to
   relax this.
-- **Path-based LHSs on `:=`** (`counter.value := v` for
-  nested updates on compound capability values). Adding paths
-  to the LHS of `:=` would force the parser to track which
-  field accesses are capability-rooted; the complexity does
-  not fit v1. A later revision may reconsider once concrete
-  use cases appear.
+- **Path-based LHSs on capability writes** (`counter.value := v`
+  for nested updates on compound capability values). A path on the
+  LHS of `:=` is legal only when it ends at a `Ref` field
+  (`cfg.counter := v`) or an array index (`config.scores[i] := v`).
 
 ## Open questions
 
@@ -1490,8 +1523,8 @@ reasons:
    `)`. Matches Kotlin, Swift, Prettier for JavaScript — the
    family the reader is most likely to have seen. `kai fmt`
    enforces this and carries the same gofmt-style discipline
-   as the rest of kaikai's tooling (see §*Migration and
-   diagnostics* and §*Next steps*).
+   as the rest of kaikai's tooling (see §*Diagnostics and
+   formatting*).
 
 2. **Naked-read precedence relative to postfix `.` and `[i]`.**
    *Dissolved:* with the read naked, `a.b` is an ordinary
@@ -1514,26 +1547,8 @@ reasons:
    { ... }` sites — there is no enclosing function body to
    be the handler's `body`.
 
-## Next steps
+## See also
 
-- **Doc C (`docs/effects-impl.md`)** pins:
-  - The desugar order in the pipeline (sugars run after
-    parsing, before name resolution).
-  - The variable-specialisation pass for `var` + canonical
-    `State[T]` handlers.
-  - The codemod spec for `kai fmt --upgrade-effects` and the
-    (separate) sugars migration tool.
-  - The formatter spec for `kai fmt`: canonical line breaks
-    and spacing for each sugar, on top of the structural rules
-    already pinned in this document.
-- **Grammar update in `docs/kaikai-minimal.md`** — all five
-  sugars modify the expression / statement grammar.
-  `kaikai-minimal.md` carries the canonical EBNF; its
-  §*Grammar* should be extended with the post-sugars productions
-  introduced here so the LL(1) property is checkable from a
-  single source.
-
-Trailing lambdas (single and double), the lambda-block
-expression form, `@` / `:=`, `var`, and `a[i]` all land together
-in milestone **m7b**. None has a hard dependency on another, so
-the order inside m7b is by convenience.
+- `docs/effects-impl.md` — where the desugars run in the pipeline and
+  the variable-specialisation pass for `var`.
+- `kai info syntax` — the one-page reference of every form.

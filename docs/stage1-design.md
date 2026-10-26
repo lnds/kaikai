@@ -2,31 +2,31 @@
 
 Architectural decisions for the self-hosting compiler written in kaikai-minimal.
 
-Stage 1 is the **dogfooding** step: a compiler for kaikai, written in kaikai itself (using only the subset that stage 0 accepts). Its first milestone is to match stage 0's capabilities — compile kaikai-minimal to portable C — and then grow to cover the rest of full kaikai incrementally.
+Stage 1 is the **dogfooding** step: a compiler for kaikai, written in kaikai itself (using only the dialect that stage 0 accepts). It compiles kaikai-minimal to portable C, and it is **frozen** at that dialect.
 
 ## Relationship to stage 0
 
-- Stage 0 (`./kaic0`) compiles **stage 1's sources** (kaikai-minimal) into C, which `cc` then turns into `./kaic1`.
-- Stage 1 (`./kaic1`) compiles **enough of full kaikai to compile stage 2** into C as well. The LLVM backend, the full effect catalog (Console / Stdin / Env / File / State / Reader / Writer / Mutable), m7b sugars (trailing lambdas, naked cell read / `cap := v`, `var`, `a[i]`), fibers, and actors are deferred to stage 2 — see `docs/stage2-design.md` §*Milestones within stage 2*.
-- **Fixed-point bootstrap**: once stage 1 accepts the same subset stage 0 does, `kaic1` must compile `stage1/*.kai` and produce a binary behaviorally identical to `kaic1` itself. This is the self-hosting checkpoint.
+- Stage 0 (`stage0/kaic0`) compiles **stage 1's source** (`stage1/compiler.kai`, kaikai-minimal) into C, which `cc` then turns into `stage1/kaic1`.
+- Stage 1 (`stage1/kaic1`) compiles kaikai-minimal, itself included, into C. It no longer carries the obligation to compile what stage 2 writes: stage 2 is built by the previous release (`KAIC_BOOT=release`, the default) or, from a bare `cc`, by the frozen C seed (`make kaic2 KAIC_BOOT=seed`). See `docs/build-system.md`.
+- **Fixed-point bootstrap**: `make -C stage1 selfhost` builds `kaic1b` (stage 1 compiled by stage 1), has it compile `compiler.kai` again, and requires the two C outputs to be byte-identical.
 
-Stage 0 is not thrown away yet: it remains the one C-only ingress into the ecosystem. Stage 1 replaces it as the working compiler.
+Stages 0 and 1 are frozen, never deleted: together they keep a C-only path into the ecosystem.
 
 ## Non-goals for stage 1
 
 - **LLVM backend**: stage 2's job. Stage 1 keeps emitting portable C.
 - **Speed**: stage 1 still targets correctness and readability. Compile-time performance is a stage 2 concern.
-- **Full Perceus**: only *basic* reuse analysis lands in stage 1 (see below). Reuse-in-place and drop specialization are stage 2.
-- **Effect inference**: explicit effect annotations on every function that uses effects. Inference lands in stage 2.
-- **Fibers, actors, scheduler**: stage 2 m8 — see `docs/structured-concurrency.md` and `docs/actors.md`.
+- **Full Perceus**: stage 1 has only a basic dup/drop pass (see below). Reuse-in-place and drop specialization are stage 2.
+- **Effects**: kaikai-minimal has none beyond its IO built-ins; effects and their inference are stage 2.
+- **Fibers, actors, scheduler**: stage 2 — see `docs/structured-concurrency.md` and `docs/actors.md`.
 - **Pretty-printed errors**: `file:line:col: message` is enough. Span underlining is optional.
 - **Incremental compilation**: single-shot batch compiler.
 
 ## Constraints
 
 - **Written in kaikai-minimal**: the subset defined in `docs/kaikai-minimal.md`, nothing more.
-- **No imports across files** *initially*: stage 0 compiles one file at a time, so stage 1's source has to be one monolithic file (`stage1/compiler.kai`) or several files concatenated by a trivial shell step. We choose **one file** to keep bootstrap trivial — `cc stage0/*.c -o kaic0 && ./kaic0 stage1/compiler.kai > stage1.c && cc stage1.c -o kaic1`.
-- **Target size**: 5–10K lines of kaikai. Comparable to stage 0.
+- **One source file**: stage 1 is a single file (`stage1/compiler.kai`) so bootstrapping it stays trivial — `make -C stage0 && make -C stage1`, which runs `kaic0 compiler.kai > build/stage1.c` and compiles that C with `cc`.
+- **Size**: about 7K lines of kaikai.
 - **Runtime**: reuses `stage0/runtime.h` verbatim for the emitted C. Only stage 2 retires uniform boxing.
 
 ## Compilation pipeline
@@ -47,18 +47,18 @@ Each pass is a pure function: input in, output out. No global state.
 
 ```
 stage1/
-  compiler.kai          # entire compiler, one file for now
+  compiler.kai          # entire compiler, one file
+  Makefile              # build, tests, selfhost
   README.md             # how to build and run
-  tests/                # kaikai-level tests (run with --test)
 ```
 
-Keeping everything in one file is a concession to stage 0's single-file constraint. When stage 1 gains minimal import support, we can split it along the same axes as stage 0 (`lexer.kai`, `parser.kai`, `check.kai`, `emit.kai`, `main.kai`).
+Stage 1 resolves `import` for the programs it compiles, but its own source stays one file.
 
 ## Value representation
 
 Stage 1 is compiled by stage 0, so the runtime representation is stage 0's uniform boxing: every kaikai value at runtime is a `KaiValue*` with an RC header and a tag. The stage-1 source does not see this — it just sees kaikai types. But the consequence is clear: stage 1 is *slow*. That is fine.
 
-Once stage 1 becomes self-hosting, we can compile it **with stage 1** (not stage 0) and take advantage of stage 1's basic Perceus for a measurable speedup. That verification is post-self-hosting-checkpoint.
+Compiling stage 1 with itself (`kaic1b`) keeps the same boxed representation; its dup/drop pass trims RC traffic but does not unbox.
 
 ## Representing compiler data in kaikai-minimal
 
@@ -78,9 +78,9 @@ This is slower than mutation-based C, but it is what the language gives us and i
 
 ## AST design
 
-Same shape as stage 0, but as kaikai sum types:
+The planned shape mirrored stage 0 as kaikai sum types, with positions in a separate wrapper. The shipped `stage1/compiler.kai` carries positions as record fields instead (`type Expr = { kind: ExprKind, line: Int, col: Int }`, with the variants in `ExprKind`). The planned form:
 
-```kai
+```kaikai-minimal
 type Expr
   = EInt(Int)
   | EReal(Real)
@@ -108,7 +108,7 @@ type Expr
 
 Positions (`file:line:col`) are carried on every node in a separate wrapper:
 
-```kai
+```kaikai-minimal
 type Located[a] = Loc(String, Int, Int, a)
 ```
 
@@ -116,7 +116,9 @@ For stage 1, we accept the overhead of wrapping each sub-expression in `Loc`. It
 
 ## Type representation
 
-```kai
+Not implemented: stage 1 shipped without a type checker. Its check pass mirrors stage 0's `check.c` with name resolution only — no type inference, no exhaustiveness. The planned representation was:
+
+```text
 type Type
   = TInt | TReal | TBool | TString | TChar | TUnit
   | TList(Type)
@@ -127,13 +129,13 @@ type Type
   | TApp(Type, [Type])            (* Option[T], Result[T,E], etc. *)
 ```
 
-The check pass resolves every `TGen` appearing at a call site by unifying against the argument types, exactly like stage 0.
+The plan had the check pass resolve every `TGen` at a call site by unifying against the argument types.
 
 ## Symbol table
 
-Association lists. A `Scope` is a list of `Binding`s; scopes are nested via a parent pointer (implemented as a list of scopes `[Scope]` and traversal).
+Association lists. The shipped environment is a stack of name scopes, `type Env = { scopes: [[String]], had_error: Bool, file: String, spans: [Span] }`. The planned typed bindings were:
 
-```kai
+```text
 type Binding
   = BVal(String, Type)
   | BFn(String, [Type], Type)
@@ -144,7 +146,7 @@ type Scope = { bindings: [Binding] }
 type Env   = { scopes: [Scope] }
 ```
 
-Lookups are O(n × depth). For stage 1 that is fine — programs are <10K lines.
+Lookups are O(n × depth). For stage 1 that is fine.
 
 ## Emission
 
@@ -159,19 +161,12 @@ The emitter builds the output as a list of string chunks (`[String]`) and joins 
 
 ## Features added on top of kaikai-minimal
 
-Stage 1 must *compile* more than stage 0 does. Added features, in intended implementation order:
+The plan was for stage 1 to compile more than stage 0 does. What shipped:
 
-1. **Placeholder lambda shorthand** (`. < 5`, `.name`). Desugars to `(x) => x < 5`, `(x) => x.name` at parse time.
-2. **Record update syntax** `{ p with x: 10 }`. Desugars to a full-field literal that copies the rest.
-3. **Full pattern matching**: nested patterns, or-patterns, guard clauses with complex expressions. Stage 0's match is already good; stage 1 extends with compile-time exhaustiveness checking.
-4. **Effects with handlers** (no inference): `effect E { op1(args) : T }`, `handle { body } with E { op1(args, resume) -> expr }`, `E.op1(arg)` (method-call form, not `perform`). Sintax follows `docs/effects.md` (Doc A); the catalog of stdlib effects supported in stage 1 is the minimum that lets stage 2 self-compile (typically `Console`, `File`, plus `Mutable` for the inferencer). Compiled to CPS transforms — ordinary functions plus a continuation argument. This is a big chunk and gets its own milestones; the full design is `docs/effects-impl.md` (Doc C).
-5. **Monomorphized generics**: stage 0 uses uniform boxing and skips specialization. Stage 1 introduces type-directed monomorphization for the emitted C: each generic instantiation yields a specialized copy of the function.
-6. **Basic Perceus** *(deferred to stage 2 m5)*: originally planned for stage 1 — insert `kai_incref`/`kai_decref` using linearity analysis, "last use" gets no incref, "drop" inserted at scope exit. **Status as of 2026-04**: only a handful of manual `kai_incref`/`kai_decref` calls are emitted at hot paths (the spread fast-path); no linearity analysis or systematic drop insertion. Decision: do not invest in stage 1 Perceus; the analysis pass lands as **stage 2 m5** alongside the typed IR. Stage 1 keeps relying on stage 0's uniform boxing and manual ops where needed. See `docs/stage2-design.md` §Milestones m5 and the §2 *Full Perceus memory management* description.
-7. **`|` map pipe**: `xs | f` desugars to `map(xs, f)`. Together with `|>`, completes the Elixir-style pipeline vocabulary.
-8. **`kai test` runner subcommand**: `./kaic1 test path/` discovers `.kai` files, compiles each with `--test`, runs the binaries, aggregates results.
-9. **Minimal imports**: `import foo.bar` resolves to `<root>/foo/bar.kai`, compiled once per invocation, names resolved across files. Keeps stage 1 writable in one file while paving the road for stage 2.
+- **Basic Perceus**: a dup/drop pass between check and emit. The last read of a binding transfers its reference, non-last reads and closure captures `dup`, and unused parameters drop at body entry.
+- **Imports**: `import foo.bar` resolves to `<root>/foo/bar.kai`, names resolved across files.
 
-Each feature is its own milestone, landing on its own commit.
+The rest of the plan — placeholder field sections (`.name`), record update, exhaustiveness checking, effects with handlers, monomorphized generics, the `|` map pipe, a `kai test` subcommand — is stage 2. Stage 1 was frozen without them.
 
 ## Error reporting
 
@@ -185,25 +180,13 @@ No span underlining in stage 1 — it requires carrying the source text around, 
 
 ## Testing strategy
 
-Two layers, both run from the repo root:
+`make -C stage1 test` runs every check from the repo's `stage1/` directory against `examples/minimal/*.kai` (and stage 1's own source where it applies):
 
-1. **kaikai-level tests** inside `stage1/compiler.kai`: `test "..."` blocks asserting invariants about the lexer/parser/check — compiled under stage 0 with `--test` and run.
+1. **Tokens**: `kaic1 --tokens` must match `kaic0 --tokens`.
+2. **Parse and check**: `kaic1 --ast` and a full lex + parse + check run must succeed.
+3. **End-to-end**: each example compiled by `kaic1` and by `kaic0`, run, and the outputs (stdout, and stderr under `--test`) compared.
 
-2. **End-to-end bootstrap tests**: a Makefile target
-
-   ```sh
-   ./kaic0 stage1/compiler.kai > build/stage1.c
-   cc build/stage1.c -I stage0 -o build/kaic1
-   for f in examples/minimal/*.kai; do
-     ./build/kaic1 $f > build/$(basename $f .kai).c
-     cc build/$(basename $f .kai).c -I stage0 -o build/$(basename $f .kai)
-     ./build/$(basename $f .kai)
-   done
-   ```
-
-   — stage 1 compiled by stage 0 must compile the same examples stage 0 does, and their outputs must match byte-for-byte.
-
-3. **Determinism check (stage 1)**: `kaic1 stage1/compiler.kai` run twice on the same source must produce byte-identical C output. This catches non-determinism in stage 1 (hashmap iteration order, leaked pointer addresses, timestamps) without requiring stage 1 and stage 2 to agree on emission shape. See `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md` — the stage 1 ↔ stage 2 byte-identical fixed point that previously appeared here is intentionally dropped because stage 1 (no typer) and stage 2 (full typer + effects + Perceus) are structurally distinct compilers and cannot agree on type-driven emission decisions like match tag-compare or niche-filling.
+`make -C stage1 selfhost` is the determinism check: `kaic1b` (stage 1 compiled by stage 1) compiling `compiler.kai` must produce byte-identical C. It catches non-determinism in stage 1 (hashmap iteration order, leaked pointer addresses, timestamps). Stage 1 and stage 2 are not required to agree on emission: stage 1 has no typer, and stage 2 makes type-driven emission decisions (match tag-compare, niche-filling) that stage 1 cannot. See `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`.
 
 ## Milestones within phase 3
 
@@ -219,7 +202,7 @@ Each validated and committed before moving on:
 8. **Emit: match, lists, closures**: `quicksort.kai` and `interp.kai` build and run.
 9. **Test runner**: `--test` mode emits test functions. `--test` on all examples matches stage 0's output.
 10. **Self-hosting checkpoint**: stage 1 compiled by stage 0 compiles stage 1. Fixed-point bootstrap verified.
-11+ **Feature extensions** (each its own milestone): placeholder lambdas, record update, effects + handlers, monomorphized generics, basic Perceus, `|` map pipe, minimal imports, `kai test` subcommand.
+11. **Feature extensions**: basic Perceus and minimal imports shipped; the rest moved to stage 2 (see *Features added on top of kaikai-minimal*).
 
 ## What stage 1 still cannot do (and does not need to)
 
@@ -227,8 +210,8 @@ Each validated and committed before moving on:
 - Full Perceus (reuse-in-place, drop specialization).
 - Fibers, actors, concurrency.
 - LLVM backend.
-- `kai fmt`, `kai repl`, `kai lsp`.
+- `kai fmt`, `kai lsp`.
 - Package manager.
 - Pretty error messages with source underlines.
 
-All of these are stage 2 or post-MVP. The point of stage 1 is: **a compiler for full kaikai, written in kaikai, that bootstraps from C in one step**. Ceilings beyond that are deferred.
+All of these are stage 2. The point of stage 1 is: **a compiler written in kaikai that bootstraps from C in one step**.

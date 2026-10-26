@@ -1,10 +1,10 @@
 # Protocols for kaikai
 
-## Status: Landed (m12.8)
+## Status: Landed
 
-Stage 2 supports `protocol`, `impl`, and `#[derive(...)]` syntax with the
-five stdlib protocols (`Show`, `Eq`, `Ord`, `Hash`, `Serialize`) defined
-in `stdlib/protocols.kai`. The compiler resolves dispatch at the AST
+Stage 2 supports `protocol`, `impl`, and `#[derive(...)]`; the stdlib
+protocols are defined in `stdlib/protocols.kai` (see *Stdlib
+protocols* below). The compiler resolves dispatch at the AST
 level (between inference and monomorphisation), so each statically-typed
 call site emits a direct `__pimpl_<P>_<T>_<op>` call on both backends
 (C and LLVM). A protocol's dispatch identity belongs to the module that
@@ -12,9 +12,7 @@ declares it: when two modules declare the same protocol name, each
 non-core declaration mangles and keys its impls module-qualified
 (`__pimpl_<mod>__<P>_<T>_<op>`), a bare call ranks the calling module's
 own protocol first, and only protocols visible to the calling module
-(own, `pub`, or root-declared) are dispatch candidates. See
-`docs/lane-experience-m12.8.md` for the implementation retrospective and
-v1 limitations.
+(own, `pub`, or root-declared) are dispatch candidates.
 
 Single-dispatch ad-hoc polymorphism via explicit `protocol` declarations
 and `impl` blocks. Modeled on Clojure protocols, Elixir protocols, Go
@@ -25,18 +23,17 @@ Rust traits.
 propagation in signatures, no functional dependencies, no type families,
 no overlapping instances. Single-dispatch only.
 
-This document is the spec; `proposed-extensions.md §28` is the catalog
-entry; `stage2-design.md §m12.8` is the schedule.
+This document is the spec; `kai info protocols` is the short reference.
 
 ## Motivation
 
-Three concrete pain points in current kaikai:
+Three concrete pain points protocols remove:
 
-1. **`Money<USD>` printing**: `decimal_to_string(m.amount) ++ " USD"`
-   on every interpolation. With `protocol Show` + `impl Show for
-   Decimal[u: Measure]`, becomes `#{m.amount}` automatic.
-2. **Generic equality / comparison / hashing**: every record / sum
-   type written today needs ad-hoc `eq_<type>`, `hash_<type>`,
+1. **Measured-value printing**: `real_to_string(x) ++ " USD"` on every
+   interpolation. With `protocol Show` + `impl[u: Measure] Show for
+   Real<u>`, `#{x}` renders the unit automatically.
+2. **Generic equality / comparison / hashing**: without protocols every
+   record / sum type needs ad-hoc `eq_<type>`, `hash_<type>`,
    `cmp_<type>` functions. With `protocol Eq` / `Ord` / `Hash`,
    one `impl` block covers it.
 3. **Serialization**: `to_json(x: Money) : String`, `from_json(s:
@@ -52,7 +49,9 @@ three (and future cases) compose.
 
 ### Declaration
 
-```kai
+The stdlib's core protocols, as `stdlib/protocols.kai` declares them:
+
+```kaikai
 protocol Show {
   show(x: Self) : String
 }
@@ -63,77 +62,88 @@ protocol Eq {
 
 protocol Ord {
   cmp(a: Self, b: Self) : Int
+  min(a: Self, b: Self) : Self
+  max(a: Self, b: Self) : Self
 }
 
 protocol Hash {
   hash(x: Self) : Int
 }
+
+fn main() : Unit = ()
 ```
 
 `Self` is a reserved type-parameter referring to the type the protocol
-is implemented for. Every protocol op takes `Self` (or values of
-`Self`) at least once.
-
-A protocol may declare default implementations:
-
-```kai
-protocol Show {
-  show(x: Self) : String
-  show_with(x: Self, prefix: String) : String =
-    prefix ++ show(x)         # default; can be overridden per-impl
-}
-```
-
-Default impls dispatch to other ops of the same protocol, so they are
-written in terms of the protocol's own surface — no recursion into
-external state.
+is implemented for. An op declaration omits `fn` and has no body: a
+protocol carries no default implementations, so every `impl` writes
+every op.
 
 ### Implementation
 
-```kai
-impl Show for Int {
-  show(n) = int_to_string(n)
-}
+```kaikai
+type Point = { x: Int, y: Int }
+type Tagged[T] = { tag: String, value: T }
 
-impl Show for Money[u: Measure] {
-  show(m) = decimal_repr(m.amount) ++ " " ++ unit_name(u)
+impl Show for Point {
+  fn show(p: Point) : String = "(#{p.x}, #{p.y})"
 }
 
 impl Eq for Point {
-  eq(a, b) = a.x == b.x && a.y == b.y
+  fn eq(a: Point, b: Point) : Bool = a.x == b.x and a.y == b.y
+}
+
+impl[T] Show for Tagged[T] {
+  fn show(t: Tagged[T]) : String = "<#{t.tag}>"
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(show(Point { x: 1, y: 2 }))
+  Stdout.print(show(Tagged { tag: "id", value: 7 }))
+  Stdout.print("#{eq(Point { x: 1, y: 2 }, Point { x: 1, y: 2 })}")
 }
 ```
 
-Polymorphic impls (impl for a parametric type) work when the
-parameters are concrete instances of `Unit` / `Int` / etc.; the
-compiler monomorphizes per concrete instantiation just like any
-generic function.
+Impl ops use the full `fn name(params) : R = body` form. A polymorphic
+impl (`impl[T] ... for Tagged[T]`) is monomorphised per concrete
+instantiation, like any generic function.
 
-### Polymorphic impls with bounded type parameters (issue #174)
+### Polymorphic impls with bounded type parameters
 
-A polymorphic impl whose body recurses on the type variable —
-`impl[T] Show for [T]` calling `show(x : T)` per element — needs to
-know `T` itself implements `Show`. Family 2 (impl-site bounded
-constraint) makes that requirement explicit:
+A polymorphic impl whose body dispatches on the type variable —
+`impl[T] Show for Bag[T]` calling `show(x : T)` on an element — needs
+to know `T` itself implements `Show`. An impl-site bound makes that
+requirement explicit:
 
-```kai
-impl[T : Show] Show for [T] {
-  fn show(xs : [T]) : String = match xs {
-    []  -> "[]"
-    [x] -> "[" ++ show(x) ++ "]"
-    [x, ...rest] -> "[" ++ show(x) ++ ", " ++ show(rest) ++ "]"
+```kaikai
+type Bag[T] = { items: [T] }
+
+impl[T : Show] Show for Bag[T] {
+  fn show(b : Bag[T]) : String = match b.items {
+    []           -> "Bag()"
+    [x, ...rest] -> "Bag(" ++ show(x) ++ ", +" ++ show(length(rest)) ++ ")"
   }
 }
+
+fn main() : Unit / Stdout = Stdout.print(show(Bag { items: [1, 2, 3] }))
 ```
 
 Bounds stack with `+`:
 
-```kai
-impl[T : Show + Eq] Show for [T] { ... }
+```kaikai
+type Bag[T] = { items: [T] }
+
+impl[T : Show + Eq] Show for Bag[T] {
+  fn show(b : Bag[T]) : String = match b.items {
+    [x, y, ..._] -> if x == y { "Bag(" ++ show(x) ++ " twice)" } else { "Bag(..)" }
+    _            -> "Bag(..)"
+  }
+}
+
+fn main() : Unit / Stdout = Stdout.print(show(Bag { items: [4, 4] }))
 ```
 
 **Where bounds are allowed.** Protocol bounds appear on **impl-site**
-type parameters (`impl[T : Eq] ... for ...`) and, since #877, on
+type parameters (`impl[T : Eq] ... for ...`) and on
 **free-fn** type parameters (`fn dedup[T : Eq](xs : [T])`,
 `fn sum[T : Numeric](xs : [T])` — the stdlib aggregates use this).
 They do **not** appear on `type`/record declarations: `type M[T : Add]`
@@ -142,12 +152,10 @@ The line that keeps single-dispatch protocols clear of Haskell
 typeclasses / HKT / constraint propagation (Tier 1 #3) is *how* the
 bound is honoured, not *where* it may be written: dispatch resolves
 per monomorphised instance, never by a constraint that travels with
-the signature. **Known gap:** a free-fn bound is currently NOT
-enforced at the call site — `fn f[T : Eq](xs : [T])` whose body does
-not call `eq` accepts a `T` without `Eq`; the error only appears when
-the body dispatches the op on a concrete type lacking it. The bound is
-effectively documentation until the body forces the op. Tracked
-separately.
+the signature. A free-fn bound is checked against every concrete type
+the function is instantiated at, whether or not the body calls the op:
+`count[T : Eq]` applied to a list of a type without `Eq` is rejected,
+even when the call reaches it through an unbounded generic caller.
 
 **How dispatch resolves.** The monomorphiser specialises the impl
 once per concrete `T'` (e.g. `Int`, `String`, ...). Inside each
@@ -161,37 +169,44 @@ on the type variable but does NOT carry the corresponding bound is
 accepted by the parser; the post-monomorphisation dispatch validator
 then reports a typed compile-time error pointing at the offending
 `show(x)` call inside the impl body for any concrete `T'` without
-the required impl. Pre-#174 this case panicked at runtime with the
-opaque `__protocol_dispatch_Show_show` message.
+the required impl.
 
 **Non-recursive polymorphic impls** (the body never dispatches a
 protocol op on `T`) do not need a bound and continue to work as
 before:
 
-```kai
-impl[T] Show for [T] {
-  fn show(xs : [T]) : String = "list-of-something"   # OK, no recursion on T
+```kaikai
+type Bag[T] = { items: [T] }
+
+impl[T] Show for Bag[T] {
+  fn show(b : Bag[T]) : String = "bag-of-something"   # OK, no dispatch on T
 }
+
+fn main() : Unit / Stdout = Stdout.print(show(Bag { items: [(x: Int) => x] }))
 ```
 
 ### Use sites
 
 Protocol ops are called as ordinary functions:
 
-```kai
-let s = show(my_money)              # dispatches to Show for Money[u]
-let same = eq(p1, p2)               # dispatches to Eq for Point
-let order = cmp(t1, t2)             # dispatches to Ord for Transaction
+```kaikai
+#[derive(Show, Eq, Ord)]
+type Point = { x: Int, y: Int }
+
+fn main() : Unit / Stdout = {
+  let p1 = Point { x: 1, y: 2 }
+  let p2 = Point { x: 1, y: 3 }
+  let s = show(p1)                    # dispatches to Show for Point
+  let same = eq(p1, p2)               # dispatches to Eq for Point
+  let order = cmp(p1, p2)             # dispatches to Ord for Point
+  Stdout.print("#{s} #{same} #{order}")
+  Stdout.print("p1: #{p1}")           # interpolation calls show(p1)
+}
 ```
 
 In string interpolation, `Show` is invoked implicitly when an
 interpolation expression has a type that has `impl Show`:
-
-```kai
-"alice: #{m}"
-# m: Money[USD]
-# expands at compile time to "alice: " ++ show(m)
-```
+`"p1: #{p1}"` expands at compile time to `"p1: " ++ show(p1)`.
 
 If the type has no `impl Show`, the typer emits an explicit error
 pointing at the missing impl — no silent fallback to bytes or
@@ -200,7 +215,7 @@ pointing at the missing impl — no silent fallback to bytes or
 ### Coherence rules
 
 **One impl per (protocol, type) pair.** If a second `impl Show for
-Money[u]` appears in the same compilation unit, the resolver emits a
+Point` appears in the same compilation unit, the resolver emits a
 duplicate-impl error.
 
 **Orphan rule** (Rust-style): an `impl P[A1, ..] for T` is allowed
@@ -226,28 +241,36 @@ imported. No global registry.
 
 ### What protocols cannot do (deliberately)
 
-- **No constraints in signatures**: there is no `fn sort[T : Ord](xs:
-  [T]) : [T]`. Generic functions take an explicit comparator
-  (`fn sort[T](xs: [T], cmp: (T, T) -> Int) : [T]`). If you want the
-  comparator to come from a protocol, the call site passes `cmp` from
-  `Ord` explicitly:
-  ```kai
-  list.sort_by(transactions, cmp)   # cmp: (Transaction, Transaction) -> Int
-                                    # provided by impl Ord for Transaction
+- **No constraint propagation**: a bound on a generic function
+  (`fn sort[T : Ord](xs: [T]) : [T]`, as core declares it) is checked
+  against each concrete `T` the function is instantiated at, and the
+  op resolves to a direct call in that instance. No dictionary is
+  passed and no constraint is inferred into a caller's signature;
+  a caller that wants another order passes a comparator:
+
+  ```kaikai
+  #[derive(Ord)]
+  type Tx = { day: Int, amount: Int }
+
+  fn main() : Unit / Stdout = {
+    let txs = [Tx { day: 3, amount: 5 }, Tx { day: 1, amount: 9 }]
+    let by_day = sort(txs)                              # bound `T : Ord`, checked at the call
+    let newest = sort_by(txs, (a, b) => cmp(b, a))      # explicit comparator
+    Stdout.print("#{length(by_day)} #{length(newest)}")
+  }
   ```
-  This is intentional. Keeping constraints out of signatures is the
-  sharp distinction from Haskell typeclasses and the main reason
-  compile times stay flat.
+
+  This is the sharp distinction from Haskell typeclasses and the main
+  reason compile times stay flat.
 
 - **No higher-kinded types**: `protocol Functor[F[_]]` does not parse.
   Type parameters of protocols are first-order (`protocol P[a]`,
   lowercase per kaikai's tparam convention), and the only way `Self`
-  is parametric is when the impl target is parametric (`impl Show for
-  Money[u: Measure]`). Issue #180 implements `protocol P[a]` for
-  single-dispatch parametrized protocols — the impl table key remains
-  `(P, Self)`, so adding `[a]` does NOT introduce multi-method
-  dispatch (see §*Single-dispatch parametrized protocols (#180)*
-  below).
+  is parametric is when the impl target is parametric (`impl[T] Show for
+  Bag[T]`). `protocol P[a]` declares a single-dispatch parametrized
+  protocol — the impl table key remains `(P, Self)`, so adding `[a]`
+  does NOT introduce multi-method dispatch (see §*Single-dispatch
+  parametrized protocols* below).
 
 - **No multi-method dispatch**: dispatch always uses `Self` (the
   first-position type). For two-arg dispatch (e.g. `convert(from:
@@ -269,9 +292,8 @@ For a call `op(x, ...)` where `op` is declared in `protocol P`:
    transitively imported modules.
 3. If exactly one impl is found, the call is rewritten to the impl's
    function. Monomorphization proceeds normally.
-4. If zero impls are found, the typer emits "no impl of `P` for `T`",
-   listing the imports that would provide one if any exist in the
-   ecosystem (LLM-friendly hint).
+4. If zero impls are found, the typer emits "no impl of `P` for type
+   `T`" at the call.
 5. If more than one impl is found, the orphan rule was violated
    somewhere upstream — the resolver emits the conflicting modules.
 
@@ -280,72 +302,38 @@ no unification beyond what monomorphization already does.
 
 ### Runtime cost
 
-For monomorphic call sites (the typer can statically pick the impl
-during monomorphization), the call is **direct** — no indirection.
-Same cost as a regular function call.
+Generic code is monomorphised, so every call site sees a concrete type
+and the call is **direct** — a `__pimpl_<P>_<T>_<op>` function, no
+vtable, no dictionary, no dynamic registry. Same cost as a regular
+function call.
 
-For sites that genuinely need late binding (passing a value through
-generic code that does not see the concrete type until runtime), the
-cost is **one vtable indirection** — same as Go interfaces, Clojure
-protocols, Elixir protocols. Negligible for all practical purposes.
+## Stdlib protocols
 
-The runtime emits one **vtable per protocol per implementing type**,
-declared `static` in the C / LLVM output. Tables are linked at compile
-time; no dynamic registry.
-
-### Codegen sketch (C backend)
-
-```c
-/* per protocol declaration */
-typedef struct kai_show_vtable {
-  KaiValue *(*show)(KaiValue *self);
-} kai_show_vtable;
-
-/* per (protocol, type) impl */
-static kai_show_vtable kai_show_vtable_for_money_usd = {
-  .show = kai_money_usd_show,
-};
-
-/* per call site */
-KaiValue *kai_call_show(KaiValue *self) {
-  kai_show_vtable *vt = kai_lookup_vtable(KAI_PROTOCOL_SHOW, self->type_tag);
-  return vt->show(self);
-}
-```
-
-For statically-resolved sites, the lookup is elided and the call is
-direct.
-
-## Stdlib protocols (the v1 set)
-
-The m12.8 milestone shipped five protocols; issue #258 added
-`Default` for type-driven default values:
+`stdlib/protocols.kai` declares:
 
 | Protocol | Ops | Use cases |
 |---|---|---|
 | `Show` | `show(x: Self) : String` | interpolation, debug, logging |
 | `Eq` | `eq(a: Self, b: Self) : Bool` | equality, set membership, dedup |
-| `Ord` | `cmp(a: Self, b: Self) : Int` | sort, min, max, ordered containers |
-| `Hash` | `hash(x: Self) : Int` | hash maps (m14), hash sets, memoization |
-| `Serialize` | `to_string(x: Self) : String`, `from_string(s: String) : Result[Self, String]` | json/csv/fix bindings via wrappers |
+| `Ord` | `cmp(a: Self, b: Self) : Int`, `min`, `max` | sort, min, max, ordered containers |
+| `Hash` | `hash(x: Self) : Int` | hash maps, hash sets, memoization |
+| `Serialize` | `to_string(x: Self) : String`, `from_string(s: String) : Result[Self, String]` | text bindings via wrappers |
+| `BinSerialize` | `to_bytes`, `from_bytes` | binary encoding |
+| `Layout` | `to_bytes`, `from_bytes` | fixed binary layouts (`kai info kinds`) |
+| `Json` | `to_json`, `of_json` | the JSON DOM (`#[derive(Json)]`) |
 | `Default` | `default() : Self` | accumulators, container clearing, generic zero values |
+| `Add[a]` `Sub[a]` `Mul[a]` `Div[a]` `Rem[a]` `Neg` | `add` … `neg` | operator overloading (see below) |
 
-Stdlib provides default impls for all primitives (`Int`, `Real`,
-`Bool`, `Char`, `String`, `Unit`, `[a]`, `Option[a]`, `Result[a, e]`,
-records auto-derived via #derive, sum types auto-derived). User-defined
-opaque types must `impl` themselves. A builtin never makes an impl
-local under the orphan rule (see *Coherence rules*): wrap it in a type
-of your own. The parametric containers carry
-`Show` / `Eq` / `Ord` / `Hash` (see `stdlib/protocols.kai`); `Serialize`
-on parametric containers needs return-type-driven dispatch and is
-deferred to a later increment.
+The primitives carry the impls that make sense for them; the
+parametric containers (`[T]`, `Option[T]`, `Result[T, E]`, pairs,
+triples, quads) carry `Show` / `Eq` / `Ord` / `Hash` under the matching
+bound. User types `impl` or `#[derive(...)]` themselves. A builtin
+never makes an impl local under the orphan rule (see *Coherence
+rules*): wrap it in a type of your own.
 
-Adding another protocol to stdlib in v1 (e.g. `Numeric`, `Monoid`)
-requires a separate proposal — the v1 set stays intentionally tight.
+### `Default`
 
-### `Default` (issue #258)
-
-```kai
+```kaikai
 protocol Default {
   default() : Self
 }
@@ -356,6 +344,8 @@ impl Default for Bool   { fn default() : Bool   = false }
 impl Default for String { fn default() : String = "" }
 impl[T] Default for [T]       { fn default() : [T]       = [] }
 impl[T] Default for Option[T] { fn default() : Option[T] = None }
+
+fn main() : Unit = ()
 ```
 
 Canonical defaults: numeric zero, false, empty string, empty list,
@@ -363,36 +353,45 @@ absent option. `Result[T, E]` is intentionally absent — neither
 `Ok(default()) : Result[T, _]` nor `Err(default()) : Result[_, E]`
 is a privileged choice, so callers construct results explicitly.
 
-`default() : Self` has Self only in the return position, so v1
-single-dispatch resolves it the same way `Serialize.from_string` and
-`From[a].from` do — via a `let x : T = default()` annotation that
-pins Self before the dispatcher runs. Generic free-fn helpers like
-`fn make[T : Default]() : T = default()` are out of reach until
-free-function tparam bounds gain protocol awareness; the bound is
-already accepted in `impl[T : ...]` headers, so polymorphic impls
-that recurse through `default()` work today.
+`default() : Self` has Self only in the return position, so
+single dispatch resolves it the same way `Serialize.from_string` and
+`From[a].from` do — from the expected type, such as a
+`let x : T = default()` annotation. A generic helper carries the bound:
 
-The polymorphic impls intentionally drop the `T : Default` bound —
-the bodies (`[]`, `None`) are constants in `T` and never recurse,
-which matches issue #174 case 3. The Show/Eq/Ord/Hash impls in #175
-keep their bound only because their bodies do recurse on `T`.
+```kaikai
+fn make[T : Default]() : T = default()
 
-Use cases: accumulator initial values, generic record clearing
-(`uira/boids.kai` has `iclear` / `rclear` exactly because this was
-missing), and the post-v1 `Array[T]` zero-fill helper. Auto-derive
-for user records is a separate feature and not part of v1.
+fn main() : Unit / Stdout = {
+  let n : Int = default()
+  let s : String = make()
+  let xs : [Int] = default()
+  Stdout.print("#{n} [#{s}] #{length(xs)}")
+}
+```
+
+The polymorphic impls drop the `T : Default` bound — the bodies (`[]`,
+`None`) are constants in `T` and never dispatch on it. The
+Show/Eq/Ord/Hash container impls keep their bound because their bodies
+do. `Default` is not derivable.
 
 ## Auto-derivation via `#[derive(...)]` annotation
 
 For records and sum types whose fields all already have `impl P`, the
 user can derive trivially:
 
-```kai
+```kaikai
 #[derive(Show, Eq, Hash, Ord)]
-type Account = { id: AccountId, balance: Decimal[USD], txs: Int }
+type Account = { id: Int, owner: String, txs: Int }
 
 #[derive(Show, Eq, Hash)]
 type Shape = Circle(Real) | Rect(Real, Real) | Empty_
+
+fn main() : Unit / Stdout = {
+  let a = Account { id: 1, owner: "ana", txs: 3 }
+  Stdout.print(show(a))
+  Stdout.print(show(Rect(1.0, 2.0)))
+  Stdout.print("#{eq(Circle(1.0), Circle(1.0))} #{hash(a) == hash(a)}")
+}
 ```
 
 The compiler generates the obvious structural impls:
@@ -405,14 +404,13 @@ The compiler generates the obvious structural impls:
   values judged equal by the derived `Eq` produce the same `Int` from
   the derived `Hash`.
 
-The annotation is one of three `#`-prefixed meta-instructions
-currently recognised by the parser. The others are `#[unstable]`
-(issue #602), which marks a `pub` declaration as outside the
-edition stability contract — see `docs/editions.md` for the
-opt-in workflow — and `#[doc("...")]` (issue #681), which attaches
-documentation text to a declaration (or, in module position, to the
-file). Other annotations (`#deprecated`, etc.) live in their own
-whitelist per `proposed-extensions.md §27`.
+`#[derive(...)]` is one of four declaration-level attributes. The
+others are `#[unstable]`, which marks a `pub` declaration as outside
+the edition stability contract (see `docs/editions.md`),
+`#[doc("...")]`, which attaches documentation text to a declaration
+(or, in module position, to the file), and `#[constructor]` (see
+`kai info syntax` §Attributes). An unrecognised attribute parses and is
+discarded.
 
 ### Equality and order without an impl
 
@@ -432,13 +430,8 @@ record without an `impl Ord` is a compile error.
 impl is generated. This avoids surprising user-defined `impl Show for
 Account` getting shadowed by an auto-derived one.
 
-For sum types, `#[derive(Eq)]` and `#[derive(Hash)]` reject at compile
-time when any variant carries a field whose head type lacks a
-reachable `impl P` (explicit `impl P for T`, another `#[derive(P)]`, or
-a builtin from stdlib). The diagnostic names the variant and the
-offending field type. Records continue to fall through to the
-dispatcher's runtime panic for missing field impls; promoting that
-to a compile-time error is left for a follow-up.
+A derive rejects at compile time when a field (or variant payload)
+reaches a type that lacks the protocol — see *Field-impl validation*.
 
 ### Supported protocols and shapes
 
@@ -448,7 +441,7 @@ to a compile-time error is left for a follow-up.
 | `Eq`   | ✓ | ✓ | record fields conjoined with `and`; sum types validated against field-impl set |
 | `Hash` | ✓ | ✓ | polynomial mix (`h * 31 + h_next`); sums validated against field-impl set |
 | `Ord`  | ✓ | ✓ | lexicographic by declaration order; sums by variant position then payload |
-| `Serialize` | — | — | needs return-type-driven dispatch (post-v1) |
+| `Json` | ✓ | — | records only; see `kai info protocols` |
 
 ### Order semantics for `#[derive(Ord)]`
 
@@ -458,9 +451,17 @@ compare by **variant declaration position** first (variant 0 < variant
 1 < ...); within the same variant, payloads compare lexicographically
 by position. The synthesised `cmp` for
 
-```kai
+```kaikai
 #[derive(Ord)]
 type Tier = Bronze | Silver | Gold | Platinum
+
+#[derive(Ord)]
+type Shape = Circle(Int) | Square(Int)
+
+fn main() : Unit / Stdout = {
+  Stdout.print("#{cmp(Bronze, Silver)} #{cmp(Gold, Bronze)} #{cmp(Platinum, Platinum)}")
+  Stdout.print("#{cmp(Circle(99), Square(0))}")
+}
 ```
 
 returns `-1` for `cmp(Bronze, Silver)`, `1` for `cmp(Gold, Bronze)`,
@@ -476,53 +477,54 @@ should keep them in sync.
 
 ### Field-impl validation
 
-Before lowering a `#[derive(Ord)]` annotation, the compiler walks each
-field (or variant payload) and confirms the head type appears either
-in a same-unit `impl Ord for T` or in another `#[derive(Ord)]`. Missing
-impls are rejected at typer time with a diagnostic naming both the
-offending field and its type, e.g.:
+Before lowering a `#[derive(P)]` annotation, the compiler walks each
+field (or variant payload) and confirms its type has `P` — an impl,
+another derive, or a stdlib builtin. A missing impl is rejected at the
+declaration with a diagnostic naming the field and its type:
 
-```
-foo.kai:7:1: error: cannot `#[derive(Ord)]` for `Tagged`: no `Ord`
-impl for field `tag` of type `String` (declare `impl Ord for String`
-or `#[derive(Ord)]` on `String`)
+```kaikai-neg
+type Tag = { label: String }
+
+#[derive(Ord)]
+type Tagged = { id: Int, tag: Tag }
+
+fn main() : Unit = ()
 ```
 
-The same kind of validation runs for `#[derive(Eq)]` and `#[derive(Hash)]`
-on sum types (m12.8.x); the gap remaining is records with `Show` /
-`Eq` / `Hash` annotations referencing missing field impls — those still
-fall through to the dispatcher's runtime `panic`. Tightening that
-case to a compile-time error is a follow-up captured in
-`docs/m12.8-followup.md` (retired 2026-05-02; see git history).
+```text
+error: cannot `#[derive(Ord)]` for `Tagged`: no `Ord` impl for field
+`tag` of type `Tag` (declare `impl Ord for Tag` or `#[derive(Ord)]` on `Tag`)
+```
 
 ## Composition with other features
 
-### With UoM (m12.5)
+### With units of measure
 
-```kai
+The stdlib's `impl[u: Measure] Show for Real<u>` renders a measured
+value with its unit:
+
+```kaikai
 unit USD
 unit EUR
 
-impl Show for Decimal[u: Measure] {
-  show(d) = decimal_repr(d) ++ " " ++ unit_name(u)
+fn main() : Unit / Stdout = {
+  let usd = 100.5<USD>
+  let eur = 89.75<EUR>
+  Stdout.print("balances: #{usd}, #{eur}")   # balances: 100.5 USD, 89.75 EUR
 }
-
-let usd = 100.50<USD>
-let eur = 89.75<EUR>
-println("balances: #{usd}, #{eur}")
-# → "balances: 100.50 USD, 89.75 EUR"
 ```
 
-The `u: Unit` parameter monomorphizes per-currency at the call site;
-the `unit_name` runtime helper provides the symbol.
+The `u: Measure` parameter monomorphizes per unit at the call site;
+`unit_name` provides the symbol.
 
-### With refinements (m12.6)
+### With refinements
 
-```kai
-type Email = String where matches ~r/^[^@]+@[^@]+$/
+```kaikai
+type Email = String where self |> contains("@")
 
-impl Show for Email {
-  show(e) = e   # already a string
+fn main() : Unit / Stdout = {
+  let e : Email = "ana@example.com"
+  Stdout.print(show(e))               # Show for String
 }
 ```
 
@@ -535,28 +537,26 @@ Protocols are **pure** — `impl P for T` ops cannot have effect rows.
 If a use case needs effects (e.g. `print` to console), the operation
 goes via an effect, not a protocol.
 
-```kai
-impl Show for Money[u: Measure] {
-  show(m) = ...   # pure: returns String
+```kaikai-neg
+protocol Audit {
+  log(x: Self) : Unit / Stdout        # rejected: no effect row on a protocol op
 }
 
-# Wrong shape — not allowed:
-# impl Audit for Account { log(a) : Unit / Audit ... }
-# Use an effect, not a protocol, for behaviour with effects.
+fn main() : Unit = ()
 ```
 
-This keeps protocols compositional and predictable. A future protocol
-extension to support effect rows is possible but explicitly out of v1.
+Use an effect, not a protocol, for behaviour with effects. This keeps
+protocols compositional and predictable.
 
 #### Why the rule (the four reasons)
 
 The hard rule exists for four reasons, ordered by load-bearing:
 
-1. **Single-dispatch + effect rows = combinatorial complexity in the
-   vtable.** Today `kai_show_vtable` is a struct with one function
-   pointer. With per-impl effect rows, the vtable would need to carry
-   row information so the runtime can know what handlers must be
-   installed at the dispatch site. The clean monomorphic path lost.
+1. **Dispatch resolves after inference.** A protocol call is
+   rewritten to its impl after monomorphisation, but the call's effect
+   row is needed during inference, before the impl is known. With
+   per-impl rows, the row of a call would depend on a choice the typer
+   has not made yet.
 2. **Cross-impl row inference fights Tier 1 #3.** If `impl Audit for
    Account { log(a) : Unit / Log + Time }` and `impl Audit for
    Transaction { log(a) : Unit / Log }`, then a generic call
@@ -623,7 +623,9 @@ functions with manual dispatch.
 
 ##### B. Uniform effect row declared by the protocol
 
-```kai
+Proposed form; not implemented:
+
+```text
 protocol Logable / Log {
   to_log_event(x: Self) : LogEvent
 }
@@ -647,9 +649,9 @@ not per-impl.
 
 ##### C. Per-impl effect row, monomorphic-only
 
-Each impl declares its own row:
+Each impl declares its own row (proposed form; not implemented):
 
-```kai
+```text
 impl Logable for Account     { to_log_event(a) : LogEvent / Log + Time }
 impl Logable for Transaction { to_log_event(t) : LogEvent / Log }
 ```
@@ -669,7 +671,9 @@ at the next monomorph step or rejected.
 
 ##### D. Per-impl row bounded by a declared upper bound
 
-```kai
+Proposed form; not implemented:
+
+```text
 protocol Logable / e where e ⊆ Log + Time + Io {
   to_log_event(x: Self) : LogEvent / e
 }
@@ -708,7 +712,7 @@ re-evaluate in this order:
    nice to have".
 
 This sub-section is documentation of analysis, not a commitment.
-v1 ships with **A** (no effects in protocols). Reopening requires a
+kaikai ships **A** (no effects in protocols). Reopening requires a
 fresh proposal with a concrete use case from the catalog above.
 
 ## What this is not
@@ -738,18 +742,31 @@ allowed in v1**. Single-dispatch resolves on a head type tag; a
 union has no single head. Implement `P` for each component
 separately, and narrow at the call site:
 
-```kai
+```kaikai
 type IdentityError = AccountNotFound | KycExpired
 type AuthError     = InsufficientBalance | OverDailyLimit
 type QueryErr      = IdentityError | AuthError
 
-impl Show for IdentityError { ... }
-impl Show for AuthError     { ... }
+impl Show for IdentityError {
+  fn show(e: IdentityError) : String = match e {
+    AccountNotFound -> "account not found"
+    KycExpired      -> "kyc expired"
+  }
+}
+
+impl Show for AuthError {
+  fn show(e: AuthError) : String = match e {
+    InsufficientBalance -> "insufficient balance"
+    OverDailyLimit      -> "over daily limit"
+  }
+}
 
 fn render(err: QueryErr) : String = match err {
   ie : IdentityError -> show(ie)     # dispatches on IdentityError
   ae : AuthError     -> show(ae)     # dispatches on AuthError
 }
+
+fn main() : Unit / Stdout = Stdout.print(render(KycExpired))
 ```
 
 A future `impl P for U` semantics that walks each variant of each
@@ -784,17 +801,29 @@ No dispatch.
   type pairs are involved. No polymorphism.
 - **When right**: small, fixed sets of conversions.
 
-#### B. Single-dispatch parametrized — `protocol P[A]` (chosen)
+#### B. Single-dispatch parametrized — `protocol P[a]` (chosen)
 
-```kai
-protocol From[A] {
-  fn from(a: A) : Self
+```kaikai
+protocol From[a] {
+  from(x: a) : Self
 }
 
-impl From[Money[USD]] for Money[EUR] { ... }
-impl From[Money[EUR]] for Money[USD] { ... }
+type Usd = { cents: Int }
+type Eur = { cents: Int }
 
-let eur : Money[EUR] = from(my_usd)   # Self resolved by annotation
+impl From[Usd] for Eur {
+  fn from(m: Usd) : Eur = Eur { cents: m.cents * 92 / 100 }
+}
+
+impl From[Eur] for Usd {
+  fn from(m: Eur) : Usd = Usd { cents: m.cents * 109 / 100 }
+}
+
+fn main() : Unit / Stdout = {
+  let my_usd = Usd { cents: 1000 }
+  let eur : Eur = from(my_usd)        # Self resolved by annotation
+  Stdout.print("#{eur.cents}")
+}
 ```
 
 The protocol carries a type parameter `A` alongside the implicit
@@ -811,13 +840,14 @@ unchanged.
   determined by the arguments. Syntactically asymmetric for
   bidirectional cases (two impls `From[USD] for EUR` and
   `From[EUR] for USD`).
-- **When right**: most fintech use cases. The chosen path.
-
-Implementation tracked in **issue #180**.
+- **When right**: most fintech use cases. The chosen path; see
+  §*Single-dispatch parametrized protocols*.
 
 #### C. Multi-method dispatch — `protocol P { op(a: A, b: B) }` real
 
-```kai
+Rejected form; not implemented:
+
+```text
 protocol Convert[From, To] {
   convert(x: From) : To
 }
@@ -845,7 +875,9 @@ table grows with the cross-product of type pairs.
 
 #### D. Convention + helper — manual dispatch with type witness
 
-```kai
+Rejected form; `TypeOf` does not exist:
+
+```text
 fn convert[A, B](x: A, target: TypeOf[B]) : B = match (x, target) {
   ...
 }
@@ -926,32 +958,12 @@ matching is genuinely insufficient. Specifically:
 - Performance evidence that B's per-conversion impl explosion
   dominates compile time or binary size.
 
-Until one of these manifests, C remains rejected. B (issue #180) is
-the path forward.
+Until one of these manifests, C remains rejected. B is the path
+forward.
 
-### Cross-references
-
-- **Issue #180** — implementation of B (`protocol P[A]`,
-  bidirectional inference at call site, fintech Q3 motivation).
-- **Issue #174** — polymorphic-impl runtime panic. Affects B's
-  impls whose body dispatches on `A`. May need to land first.
-- **m12.5 UoM** — covers cases where the multi-type dispatch is at
-  the *value-arithmetic* level (`Decimal<USD> + Decimal<USD>` vs
-  `Decimal<USD> + Decimal<EUR>`).
-
-## Implementation cost
-
-| Component | Lines | Notes |
-|---|---|---|
-| Parser: `protocol` + `impl` keywords + bodies | ~50 | `Self` reserved; parameter parsing |
-| Resolver: build impl table per module + orphan check | ~60 | `(protocol, type) -> fn` map |
-| Typer: resolve protocol calls; substitute impl fn at monomorph | ~50 | reuses the existing monomorphization pass |
-| Codegen: emit vtable structs + lookup helpers | ~50 | C backend; LLVM mirror in m7c-style follow-up |
-| Stdlib: declare 5 protocols + impls for primitives | ~80 | Show/Eq/Ord/Hash/Serialize for Int/Real/Bool/Char/String/Unit/list/Option/Result |
-| `#[derive(...)]` annotation: auto-generate structural impls | ~50 | walks record / sum type definition |
-| Tests + fixtures | ~80 | one fixture per protocol, positive + negative |
-| Doc updates: this file + CLAUDE.md clarification + proposed-extensions §28 | ~30 | + cross-refs |
-| **Total** | **~450 lines** | **~2-3 days at observed velocity** |
+Units of measure cover the cases where the multi-type dispatch is at
+the *value-arithmetic* level (`Real<USD> + Real<USD>` vs
+`Real<USD> + Real<EUR>`).
 
 ## Risks
 
@@ -978,32 +990,10 @@ the path forward.
    diagnostics with suggested impl skeleton (LLM-friendly:
    `--impl-suggest-json` may be worth a follow-up).
 
-## Decision posture
+## Single-dispatch parametrized protocols
 
-Schedule as **m12.8 — Single-dispatch protocols**, after m12.7 axiom
-and before m13 bench + bit ops. Rationale: the typer is maturest
-post-m12.7 (refinements + contracts + UoM all landed), so the dispatch
-infrastructure plugs into a stable foundation. Lands as its own
-milestone with a fresh worktree.
-
-Cost: 2-3 days. Lower-bound for serious value: stdlib's 5 protocols
-ship with primitive impls, `#[derive(...)]` works, demos can use `#{...}`
-freely.
-
-## Single-dispatch parametrized protocols (#180)
-
-Issue #180 lands `protocol P[a]` — a protocol declares one or more
-type parameters (alongside the implicit `Self`) bound at impl-site:
-
-```kai
-protocol From[a] {
-  from(x: a) : Self
-}
-
-impl From[Money[USD]] for Money[EUR] {
-  fn from(m: Money[USD]) : Money[EUR] = ...
-}
-```
+`protocol P[a]` declares one or more type parameters (alongside the
+implicit `Self`) bound at impl-site — `From[a]` above is one.
 
 Surface contract:
 
@@ -1011,8 +1001,7 @@ Surface contract:
   forms (`A`, `Other`) are valid syntax but are rejected later by
   the implicit-tparam classifier — keep to lowercase.
 - **Impl-site arguments are concrete**. Polymorphism in `a`
-  (`impl[T] From[T] for X`) is out of scope for v1; that requires
-  #174 work and is deferred.
+  (`impl[T] From[T] for X`) is not supported.
 - **Default-Self backwards compat**. Legacy `impl P for X` parses
   unchanged and is treated as `impl P[X] for X` (the homogeneous
   case). Existing primitive impls do NOT need migration.
@@ -1026,36 +1015,55 @@ Surface contract:
 When `Self` does not appear in any of an op's parameter types
 (`from(x: a) : Self`), the call site has no Self informant in its
 argument list. The compiler resolves Self from the surrounding
-**expected type** — typically a let-binding annotation:
+**expected type** — a let-binding annotation or a function's declared
+return type:
 
-```kai
-let eur : Money[EUR] = from(my_usd)   # OK: Self pinned to Money[EUR]
-let eur = from(my_usd)                # error: no impl of From for Money[USD]
+```kaikai
+protocol From[a] {
+  from(x: a) : Self
+}
+
+type Usd = { cents: Int }
+type Eur = { cents: Int }
+
+impl From[Usd] for Eur {
+  fn from(m: Usd) : Eur = Eur { cents: m.cents * 92 / 100 }
+}
+
+fn to_eur(u: Usd) : Eur = from(u)          # Self pinned by the return type
+
+fn main() : Unit / Stdout = {
+  let eur : Eur = from(Usd { cents: 500 }) # Self pinned by the annotation
+  Stdout.print("#{eur.cents} #{to_eur(Usd { cents: 1000 }).cents}")
+}
 ```
 
-The unification step in `synth_stmt SLet` already pins the call's
-return type when an annotation is present; the post-inference
-rewrite (`try_rewrite_proto_call_with_ret`) then reads that pinned
-type and dispatches accordingly. Function return positions and
-explicit type ascriptions on sub-expressions provide the same hook
-in their respective phases (today's implementation only honours
-let-binding annotations; broader bidirectional inference is a
-follow-up).
+An unannotated `let eur = from(my_usd)` has no Self informant.
+
+The unification step pins the call's return type from the expected
+type; the post-inference rewrite (`try_rewrite_proto_call_with_ret`)
+then reads that pinned type and dispatches accordingly.
 
 ### Heterogeneous arithmetic
 
 `Add[a] for X` lets `synth_binop` route across types:
 
-```kai
-impl Add[Real]    for Complex { ... }
-impl Add[Complex] for Real    { ... }
+`stdlib/math/complex.kai` declares `impl Add[Real] for Complex` and
+`impl Add[Complex] for Real`, so both operand orders type-check:
 
-let z = 2.0 + 3.0i              # Real + Complex
-let w = complex.mk(0.0, 3.0) + 2.0   # Complex + Real
+```kaikai
+import math.complex
+
+fn main() : Unit / Stdout = {
+  let z = 2.0 + 3.0i                  # Real + Complex
+  let w = Complex(0.0, 3.0) + 2.0     # Complex + Real
+  Stdout.print("#{z.re} #{z.im}")
+  Stdout.print("#{w.re} #{w.im}")
+}
 ```
 
 `synth_binop` consults a snapshot of the post-`lower_protocols` impl
-table (carried in `InferState.proto_impls`) and routes to
+table (carried in `InferState.protos`) and routes to
 `__proto_<op>` whenever a (lhs, rhs) pair has a registered impl
 (homogeneous, prim/nonprim, or two distinct nonprim heads). When no
 impl exists the binop falls through to the standard mismatch
@@ -1064,14 +1072,11 @@ diagnostic.
 The expression has the type the selected impl returns, in either
 operand order: `2.0 + z` is a `Complex`, like `z + 2.0`.
 
-### Out of scope (v1)
+### Out of scope
 
-- Polymorphic impl in `a` (`impl[T] From[T] for X`) — issue #174.
+- Polymorphic impl in `a` (`impl[T] From[T] for X`).
 - Multi-method dispatch (`(P, T1, T2, ...) -> fn`) — Tier 1 #3 commit.
-- `#[derive(...)]` synthesis for parametrised protocols — follow-up.
-- Bidirectional inference beyond let-binding annotations (function
-  return type, explicit type ascriptions on sub-expressions) —
-  follow-up.
+- `#[derive(...)]` synthesis for parametrised protocols.
 
 ## Operator-overload protocols (Wave Op series)
 
@@ -1090,11 +1095,9 @@ following the same recipe as `Add` / `Sub` / `Mul` / `Div` (#246):
 Primitive `Int <op> Int` and `Real <op> Real` arithmetic for `+`,
 `-`, `*`, `/` stays on the unify-and-emit fast path — the typer
 rewrites to the protocol method only when both operands resolve to
-a concrete non-primitive type (or when issue #180's heterogeneous
-routing matches a registered impl). `//` (integer division)
-intentionally does **not** overload — modulo is the protocol case
-for user types (rationals, modular integers, residue rings); `//`
-keeps its Int-only contract.
+a concrete non-primitive type (or when the heterogeneous routing
+matches a registered impl). kaikai has no separate integer-division
+operator: `Int / Int` truncates.
 
 Unary `-` follows the same split: `Int`, `Real`, the fixed-width
 integers and a dimensioned primitive (`Real<m>`) negate on the fast
@@ -1169,9 +1172,10 @@ user's pipe call site):
 | `HLAmbiguous([mod_a, mod_b])` | `ambiguous head type ` `T` ` — ` `mod_a` ` and ` `mod_b` ` all declare it. Use qualified type annotation.` |
 | `mod::op` exists but signature does not unify | standard call-inference signature mismatch (the same diagnostic the explicit `mod.op(xs, f)` form would produce) |
 
-Implementation: `build_head_owner_map` (`stage2/compiler.kai`) +
+Implementation: `build_head_owner_map`
+(`stage2/compiler/infer_head_dispatch.kai`) +
 `find_head_owner` (linear lookup on the small cache list) +
 `synth_pipe_dispatch` (the rewrite path). The seeded `List → list`
-entry preserves the pre-#594 dispatch surface for `[T] | f` —
-`core/list.kai` ships the canonical fns and the parser-stamped
+entry preserves the dispatch surface for `[T] | f` —
+`stdlib/core/list.kai` ships the canonical fns and the parser-stamped
 `TyListT` flows through the same code path as a user `pub type`.

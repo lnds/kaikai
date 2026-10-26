@@ -22,6 +22,29 @@ runtime, codegen, RC discipline, cache layers, typer refactors —
 without breaking that contract. The protection lives at the **edition
 boundary**, not at every minor version.
 
+## Current state
+
+The principle above is the target; Hanga Roa does not meet it yet.
+
+- **Breaking changes land inside Hanga Roa.** Releases since Hanga Roa
+  opened carry many `!` (breaking) commits — removed surface such as
+  method-call syntax (`x.f()`), changed stdlib signatures and
+  behaviour — with no edition bump. Whether Hanga Roa stays open to
+  breaks, or each break must ship with a migration rule, is an open
+  project decision.
+- **The `edition` field selects almost nothing.** The only gate keyed
+  on it is pipe dispatch: under `tongariki`, `|` against a user
+  `pub type` does not dispatch (only the built-in `List → list`
+  mapping does). Every other language change applies to every
+  edition, so a `tongariki` package that uses a removed form fails to
+  build on a current compiler.
+- **`kai migrate` covers a handful of rules** (listed under *Migration
+  policy*), not the breaking changes accumulated so far.
+- **There are no deprecation warnings.** `#[deprecated]`, like any
+  attribute kaikai does not recognise, is accepted and ignored without
+  a diagnostic (the recognised ones are `#[doc]`, `#[derive]`,
+  `#[unstable]`, `#[constructor]` and the field-level `#[json(...)]`).
+
 ## What an edition fixes (the stable surface)
 
 An edition pins the user-visible interface:
@@ -41,8 +64,9 @@ An edition pins the user-visible interface:
   effect or a new operation on an existing effect is non-breaking.
   Renaming or restructuring an existing effect requires an edition
   bump.
-- **Protocol contracts.** The five core protocols (`Show`, `Eq`,
-  `Ord`, `Hash`, `Serialize`) and their method shapes. Adding a
+- **Protocol contracts.** The core protocols (`Show`, `Eq`, `Ord`,
+  `Hash`, `Serialize`, `Default`, the arithmetic protocols, …) and
+  their method shapes. Adding a
   new method with a default impl is non-breaking; changing an
   existing method's signature is breaking.
 - **Pipe dispatch rules.** What `|`, `|>`, `||`, `|?` resolve to and
@@ -86,7 +110,7 @@ needed and the version increments per Conventional Commits
 
 1. **Current edition lives in `EDITION` at repo root.** Plain text,
    one line, lowercase name. Today: `hanga-roa`.
-2. **`kai --version` surfaces the edition**: e.g. `kaikai 0.79.0 -
+2. **`kai --version` surfaces the edition**: e.g. `kaikai <version> -
    hanga-roa (stage 2, self-hosted)`.
 3. **Edition changes are deliberate**, decided by the integrator
    (the human), not automated by `cz bump`. The decision is
@@ -106,8 +130,8 @@ needed and the version increments per Conventional Commits
 | Edition  | Active from | Released as     | Notes                                                                        |
 |----------|-------------|-----------------|------------------------------------------------------------------------------|
 | Tongariki | pre-2026-05-15 | v0.x series through v0.68.x | The pre-Hanga-Roa phase. Rapid iteration on internals; user surface stabilising. Closed when `EDITION` flipped to `hanga-roa` on 2026-05-16. |
-| **Hanga Roa** | **2026-05-16 (default)** | v0.69.0+ (HEAD v0.79.0) | First public-target edition. Ships: Phase A.0 precompiled stdlib cache (≤300 ms tiny cold compile, #452); package-mode workflow with edition dispatch (#603); HTTP client + server-side helpers + automatic redirect-following (#605, #357); full reactor — NetTcp + file + sleep + process + stdin all park the fiber, never the OS thread (#611, #620, #630); convention-based pipe dispatch (`|` against downstream `Stream`, `Repository`, etc., #594); constructor overloading at use sites — local declarations shadow core names (#644); pure named functions auto-generalize over effect rows (#645); private core types no longer leak into user scope (#643, #647, #648); `#unstable` annotation for surface excluded from the edition contract (#602); the `tier1-backend-parity` CI gate enforcing C/LLVM equivalence on every fixture (#575); `kai lsp` v1 → v3 (hover, goto-def, publishDiagnostics, documentSymbol, completion, signatureHelp, hole warnings; #447, v0.75.0 → v0.79.0); `--diags-json` / `--effects-json` / `--library-mode` / `--effect-holes-json` flags on `kai build`. |
-| Orongo | post-Hanga-Roa | **0.100.0** (TBD; the 1.0 label is postponed indefinitely) | The stabilization edition. **Most of the originally-deferred Orongo scope already shipped inside Hanga Roa** and is listed below for the record; what actually gates the Orongo cut is the *Remaining* set. **Shipped:** Phase A.1/A.2/B/L5 cache layers (#461, #455, #499); advanced FFI struct-by-value, both backends (#1030 native + the earlier C path — verified against a clang callee); numeric primitives BigInt/Rational/Decimal/Float32/Int32/UInt32/UInt64/Int128 (#514); LLVM direct emit, static libLLVM, no clang shell-out (#497, #498); native self-host — the native backend compiles itself (#1021); timeout-bounded `Actor.receive` (#638); NetDns + NetUdp (#352); m14 qualified-call migration (#614); `kaic2-fast` incremental dev rebuild (#1029). **Remaining (the real Orongo gates):** `kai migrate` automated edition migration (machinery **shipped** #1047 — parse → AST rewrite → emit, idempotent, dry-run default, `manual:` reporting, seeded with the #1015 rename rule; the full rule set expands with the Orongo surface-pin); separate/modular compilation for user programs (#963/#989, in progress — L1 #1033 shipped); a compilation daemon (partially covered by `kaic2-fast`); near-C perf on structural workloads (ongoing tuning, `docs/native-codegen-perf-plan.md`); and the deliberate act of pinning the 1.0 surface + flipping `EDITION` to `orongo`. |
+| **Hanga Roa** | **2026-05-16 (current)** | v0.69.0 onward | First public-target edition. Its opening releases shipped the precompiled stdlib cache; package mode with the `edition` field; the HTTP client and server helpers; the reactor (network, file, sleep, process and stdin park the fiber, never the OS thread); convention-based pipe dispatch (`|` against a downstream `Stream`, `Repository`, …); constructor overloading at use sites; effect-row generalisation of pure named functions; `#[unstable]`; the C/native parity gate; `kai lsp`; the `--diags-json` / `--effects-json` / `--library-mode` / `--effect-holes-json` report flags. Breaking changes have kept landing within it (see *Current state*). |
+| Orongo | not cut | — | The stabilization edition; the 1.0 label is postponed indefinitely. Much of the scope first planned for it shipped inside Hanga Roa (cache layers, FFI struct-by-value on both backends, the BigInt/Rational/Decimal/Float32/Int32/UInt32/UInt64/Int128 primitives, direct LLVM emit with a static libLLVM, native self-host, NetDns/NetUdp, per-module compilation of user programs, `kai migrate`). What the cut itself needs is pinning the surface, a `kai migrate` rule for each breaking change, and flipping `EDITION` to `orongo`. A `kai.toml` may already name `orongo`: the compiler warns that it does not implement that edition and builds under Hanga Roa semantics. |
 
 The current edition name is in the `EDITION` file at repo root.
 This table is updated when an edition transitions; the historical
@@ -222,22 +246,16 @@ not exist on disk, the driver fails with
 before invoking the compiler. See `docs/packages.md` for the full
 package-aware build shape.
 
-**Multi-edition support:** kaikai's compiler accepts source from
-any edition it knows about. When a package declares `edition =
-"tongariki"`, the compiler applies the tongariki rules even if the
-default edition is hanga-roa. This is how `stability without
-stagnation` works in practice: a tongariki package keeps working
-on an hanga-roa compiler.
-
-> **v1 status (2026-05-15):** edition selection is **shipped**
-> (issue #603). `bin/kai` reads `kai.toml`'s `edition` field,
-> validates it against the known set `{tongariki, hanga-roa}`, and
-> forwards `--edition <name>` to `kaic2`. The compiler routes the
-> #594 convention-based pipe dispatch on `edition >= hanga-roa` and
-> falls back to the legacy seeded `List → list` mapping under
-> tongariki. An unknown edition value produces
-> `kaic2: unknown edition \`<x>\` in kai.toml — known editions:
-> tongariki, hanga-roa` before any compilation work runs.
+**Edition selection:** `bin/kai` reads `kai.toml`'s `edition`
+field, validates it against the known set `{tongariki, hanga-roa,
+orongo}`, and forwards `--edition <name>` to `kaic2`; an unknown
+value fails with `kai: error: unknown edition "<x>" in <dir>/kai.toml`
+before any compilation runs. The one rule keyed on the edition is
+convention-based pipe dispatch, on for `hanga-roa` and later; under
+`tongariki` only the built-in `List → list` mapping dispatches.
+Every other rule is the same for all editions, so declaring
+`tongariki` does not preserve forms removed since. `orongo` is
+accepted with a warning and compiles under Hanga Roa semantics.
 
 ## Marking unstable APIs (#unstable)
 
@@ -250,26 +268,33 @@ annotation is the escape hatch (issue #602).
 
 ### Author side — marking a declaration
 
-```kai
+```kaikai
 #[unstable]
-pub fn from_stdin() : Source[String, Stdin + Spawn] / Spawn = ?from_stdin
+pub fn parse_level(s: String) : Int = string_length(s)
 
 #[unstable]
-pub type Source[t, e] = { pid: Pid[Demand] }
+pub type Window = { width: Int, height: Int }
 
 #[unstable]
 pub const DEFAULT_BUFFER_BYTES : Int = 4096
+
+fn main() = {
+  let w = Window { width: 3, height: 4 }
+  println(int_to_string(parse_level("ab") + w.width + DEFAULT_BUFFER_BYTES))
+}
 ```
 
 `#[unstable]` precedes the `pub` keyword and is permitted on `pub fn`,
-`pub type`, `pub const`, `pub effect`, and `pub protocol`. Marking a
+`pub type`, `pub const`, `pub effect`, and `pub protocol`. Calls from
+the declaring package itself never warn. Marking a
 non-`pub` declaration is rejected at parse time — there's no exposed
 surface to mark unstable.
 
 ### Consumer side — opting in
 
-The consumer's `kai.toml` lists upstream packages whose unstable
-exports they have read and accepted:
+The consumer's `kai.toml` lists the upstream modules whose unstable
+exports they have read and accepted, by the qualifier the call is
+written with:
 
 ```toml
 name = "my-app"
@@ -277,18 +302,15 @@ version = "0.1.0"
 edition = "hanga-roa"
 
 [unstable]
-ahu = true
-henua = true
+mylib = true
 ```
 
 Importing a `#[unstable]` declaration **without** opt-in produces a
 non-fatal warning at every call site:
 
-```
-warning: ahu.stream.from_stdin is #unstable — API may change between
-  versions without an edition bump. Add 'ahu = true' under [unstable]
-  in kai.toml to acknowledge.
-  --> src/main.kai:3:14
+```text
+warning: mylib.experimental is #[unstable] — API may change between versions without an edition bump. Add 'mylib = true' under [unstable] in kai.toml to acknowledge.
+  --> main.kai:3:61
 ```
 
 The build succeeds. The diagnostic is the disclosure: the consumer
@@ -300,10 +322,8 @@ consumed exactly as it would be otherwise — no codegen change.
 
 `#[unstable]` does NOT split the edition. The package still declares
 `edition = "hanga-roa"`; only specific decls are excluded from the
-contract. This keeps Hanga Roa shippable on 2026-05-21 with
-downstream packages (ahu, kohau, henua, the HTTP server) carrying
-their as-yet-uncommitted public surface marked, while the language
-surface itself stays stable.
+contract. Downstream packages can ship with their as-yet-uncommitted
+public surface marked, under the same edition as everything else.
 
 When the author commits to an unstable decl, they remove the
 `#[unstable]` annotation in a `feat:` release. Downstream consumers
@@ -326,25 +346,30 @@ toolchain ships migration help:
   `--write` applies it in place, and a second `--write` run is a
   byte-stable no-op. Non-mechanical changes are reported as
   `manual: <line>:<col> — …` pointers, not silently dropped.
-- **Deprecation warnings** appear in the older edition where
-  possible, pointing at the future change. A user staying on the
-  older edition keeps compiling; they get a heads-up about what
-  changes if they bump.
+- **Deprecation warnings** pointing at a future change are the
+  intended third tool; kaikai has no mechanism for them today
+  (`#[deprecated]` is ignored).
 
 The principle: a user planning to upgrade can read the release
 notes, run `kai migrate`, and have a working build. Worst case,
-the migration leaves diagnostics that explain what to fix. We
-never silently change behaviour.
+the migration leaves diagnostics that explain what to fix.
 
-> **v1 status (2026-07-03):** `kai migrate` is **shipped** (issue
-> #1047). The machinery (parse → AST rewrite → emit) and its safety
-> invariants (idempotent, never emits non-parsing source, dry-run
-> default, `manual:` reporting) are live. The Hanga Roa → Orongo
-> rule set is seeded with the #1015 uniform-construction rename
-> (`map`/`hashmap`.`from_pairs` and `set`/`hashset`.`from_list` →
-> `.from`); the full rule
-> set expands as the Orongo surface is pinned — that surface-pin is
-> a separate Orongo gate.
+`kai migrate` supports only `hanga-roa → orongo`, and `--write` also
+stamps the target edition into `kai.toml`. Its rule set today:
+
+- `map.from_pairs`, `hashmap.from_pairs`, `set.from_list`,
+  `hashset.from_list` → `.from`;
+- `stream.fold`, `map.fold` → `foldl`; `string_builder.len` → `length`;
+- the two type arguments of every `Result[_, _]` annotation are
+  swapped (only when the source edition is `hanga-roa`). Hanga Roa's
+  `Result` is already Ok-first (`Result[T, E]`), so this rule turns
+  well-typed Hanga Roa source into source that no longer type-checks;
+  review its output before `--write`;
+- `array.from` / `array.copy` with a `default` argument → reported as
+  `manual:`.
+
+It does not cover the breaking changes that have landed within Hanga
+Roa (see *Current state*).
 
 ## What is NOT an edition
 

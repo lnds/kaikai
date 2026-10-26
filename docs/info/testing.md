@@ -114,8 +114,8 @@ bench "fib 10" {
 fn main() : Int = 0
 ```
 
-The driver runs N iterations (default 100, override `--iters`),
-reports median and MAD.
+The driver runs N iterations (default 1000, override `--iters` or
+`KAI_BENCH_ITERS`) and reports median and MAD.
 
 ## Walking a workspace
 
@@ -154,7 +154,8 @@ with the shared build's error before any test runs: two test files
 declaring the same `impl`, for example. Move what they share into a
 module both import.
 
-`kai test` runs these builds in parallel — one per CPU by default,
+`kai test` runs these builds in parallel — one per CPU by default
+(at most one per 3 GiB of memory),
 `-j <n>` (`--jobs <n>`) to bound it — and runs the binaries one at a
 time, in order. Each file's check output prints right before its
 results, so the output and the exit status are the same at any job
@@ -281,8 +282,7 @@ status is 1, and `--json` records the block as `fail`.
 
 ```text
 0   all tests passed (or no tests defined)
-1   one or more failures, or --only matched no block
-2   compile error before tests could run
+1   one or more failures, a compile error, or --only matched no block
 ```
 
 ## NOT IN KAIKAI
@@ -293,7 +293,7 @@ status is 1, and `--json` records the block as `fail`.
 - Mocking frameworks. Pass fakes explicitly or use handler
   substitution (replace the real `Logger` handler with a recording
   one in the test scope).
-- Snapshot testing. Deferred.
+- Snapshot testing.
 
 ## See also
 

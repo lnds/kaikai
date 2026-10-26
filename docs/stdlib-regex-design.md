@@ -28,7 +28,12 @@ Unblocks **m12.6.x #7** (regex refinement predicates `String where matches ~r/..
 - Capture groups: numbered (no names in v1).
 
 **API:**
-```kai
+
+Proposed API; the shipped module drops the `regex_` prefix
+(`regexp.compile`, `find`, `find_all`, `replace`, `split`, plus
+`matches` and `compile_or_panic`), and `Match.groups` is `[Capture]`:
+
+```text
 pub type Regex = ...   # opaque (likely a record around the compiled NFA)
 pub type Match = { start: Int, end: Int, groups: [Option[(Int, Int)]] }
 
@@ -54,9 +59,12 @@ RE2 engine in three lowering steps: pattern → AST → NFA → execution.
 
 ### 1. Lexer + parser (pattern → AST)
 
-```kai
+```kaikai
+type CharRange = | CR(Char, Char)
+type Anchor = AnchorStart | AnchorEnd
+
 type RxAst
-  | RxChar(Char)
+  = RxChar(Char)
   | RxAny
   | RxClass([CharRange], Bool)   # Bool = negated
   | RxAnchor(Anchor)
@@ -67,6 +75,11 @@ type RxAst
   | RxOpt(RxAst)
   | RxRepeat(RxAst, Int, Option[Int])
   | RxGroup(Int, RxAst)         # capture group with id; non-cap is RxConcat without RxGroup wrap
+
+fn main() : Int = match RxStar(RxAny) {
+  RxStar(_) -> 0
+  _         -> 1
+}
 ```
 
 A recursive-descent parser over the pattern string. Errors carry position for compile-time messages.
@@ -75,7 +88,10 @@ A recursive-descent parser over the pattern string. Errors carry position for co
 
 Thompson-style NFA: each node compiles to a sub-NFA (start, accept). Connected by ε-transitions.
 
-```kai
+Sketch; the shipped types in `stdlib/regexp/engine.kai` type the
+transitions as `[NfaTransition]`:
+
+```text
 type NfaState = {
   id: Int,
   transitions: [Transition],   # (Char | Class | Epsilon, target_id)

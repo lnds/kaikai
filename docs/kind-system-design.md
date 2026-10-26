@@ -1,13 +1,13 @@
-# The kind system — kinds, theories, habitants (consolidated design proposal)
+# The kind system — kinds, theories, habitants (consolidated design)
 
-**Status:** proposal, not accepted. Consolidates a long design conversation into
-one model. Supersedes the scattered notes in `docs/layout-kind-design.md` and the
+**Status:** mostly implemented; `kai info kinds` is the reference for what runs, and
+this doc marks the parts that are still proposals. Consolidates a long design
+conversation into one model. Supersedes the scattered notes in `docs/layout-kind-design.md` and the
 kind sections of `docs/unsafe-systems-design.md`; those remain the per-feature
 detail, this is the whole system.
 
-Today kaikai has two kinds (`Type`, `Measure`) hardcoded in the compiler
-(`docs/kinds.md`). This proposal generalises to a **catalog of decidable
-unification properties** with a uniform declaration surface, while keeping the
+Before this design kaikai had two kinds (`Type`, `Measure`) hardcoded in the
+compiler. It generalises them to a **catalog of decidable unification properties** with a uniform declaration surface, while keeping the
 catalog **closed** and the inference **decidable** (Tier 1 #3).
 
 ## Terminology (read this first)
@@ -148,8 +148,9 @@ equality.
 A theory is **not** an atomic primitive picked from a fixed list — it is a named
 **assembly of properties** from a closed menu the compiler can decide:
 
-```kaikai
-# stdlib/core: the standard theories are named assemblies
+Excerpt of `stdlib/core/kinds.kai`, the only file where `theory` is legal:
+
+```text
 theory AbelianGroup = { assoc, commut, inverse, identity }
 theory Semilattice   = { assoc, commut, idempotent }          # no inverse
 theory Composition   = { assoc, measure }                     # non-commutative, summed measure
@@ -161,8 +162,9 @@ unify under. The compiler recognises which *combinations* have a terminating eng
 (abelian group = assoc+commut+inverse+identity; semilattice = assoc+commut+idempotent;
 etc.). A combination with no known-decidable engine is rejected at the declaration.
 
-**The `builtin` body.** Two theories have no property set at all:
-`theory HindleyMilner = builtin` and `theory EffectRow = builtin`. A `builtin` body
+**The `builtin` body.** Some theories have no property set at all:
+`theory HindleyMilner = builtin` and `theory EffectRow = builtin` (and `Nominal`,
+`ConstructorApp`, below). A `builtin` body
 means the engine is the compiler core itself — HM unification for `Type`, row
 unification for `Effect` — rather than a hand-written `unify_<theory>`. This is the
 same hardcoded-engine discipline taken to its root: the compiler *is* the hardcode.
@@ -207,16 +209,17 @@ Two layers:
    declarable in kaikai. The engine catalog *is* which property-combinations the typer
    can unify — closed by construction, only what was programmed and proven decidable.
 
-2. **The theory registry** — one stdlib file, `stdlib/core/theories.kai`, names
-   the standard property assemblies and gives each visibility:
+2. **The theory registry** — one stdlib file, `stdlib/core/kinds.kai`, names
+   the standard property assemblies next to the kinds over them. A `builtin` body
+   closes a theory; the others accept user kinds. `theory` takes no `pub`. Excerpt:
 
-   ```kaikai
-   theory Nominal            = builtin                              # Region's engine — closed
-   theory ConstructorApp     = builtin                              # Shape's engine — closed
-   pub  theory AbelianGroup = { assoc, commut, inverse, identity }
-   pub  theory Semilattice   = { assoc, commut, idempotent }
-   pub  theory Composition   = { assoc, measure }
-   theory EffectRow          = builtin                              # Effect's engine — closed
+   ```text
+   theory Nominal        = builtin                              # Region's engine — closed
+   theory ConstructorApp = builtin                              # Shape's engine — closed
+   theory AbelianGroup   = { assoc, commut, inverse, identity }
+   theory Semilattice    = { assoc, commut, idempotent }
+   theory Composition    = { assoc, measure }
+   theory EffectRow      = builtin                              # Effect's engine — closed
    ```
 
    **Four theories are `builtin`** (`HindleyMilner`, `EffectRow`, `Nominal`,
@@ -234,28 +237,27 @@ Two layers:
 ### The `theory` declaration is module-restricted
 
 `theory X = { … }` is a declaration form **legal only inside the
-`stdlib/core/theories` module** — a deliberate special-case in the parser/resolver,
+`stdlib/core/kinds` module** — a deliberate special-case in the parser/resolver,
 like other context-restricted forms, not a general capability. A `theory` in any
 other file is a compile error: "`theory` declarations are only allowed in the
-theory catalog". This keeps the *standard* assemblies in one home. (Future
+kind catalog (core/kinds.kai)". This keeps the *standard* assemblies in one home. (Future
 user-assembled theories, if enabled, would relax this to "any file, but only from
 the property menu" — the property menu stays the closed part, not the location.)
 
 ## Kinds — declaration and visibility
 
-A kind is declared over a **public** theory. Kinds obey ordinary `pub`/`priv`
-visibility — the **same** mechanism (and the same pub-leak validator) that governs
-every other symbol. No new `intrinsic`/`builtin` marker: visibility is the barrier.
+A user kind is declared over a theory that is not `builtin`. The catalog's own
+kinds, from `stdlib/core/kinds.kai` (`Waterfall` is not in the catalog; it is a user
+kind, see *Worked example* in `kai info kinds`). Like `theory`, redeclaring
+`Type` or `Effect` is legal only there:
 
-```kaikai
-# stdlib/core/kinds.kai
-kind Type    : HindleyMilner with type               # builtin engine, closed
-kind Effect  : EffectRow with effect                 # builtin engine, closed → user cannot classify a kind by it
-pub  kind Measure   : AbelianGroup with unit
-pub  kind Currency  : Module over T with currency        # NOT AbelianGroup; scalar is the carrier T — see below
-pub  kind Perm      : Semilattice  with perm
-pub  kind Layout    : Composition over Int      with layout { be le }
-pub  kind Waterfall : Composition over Rational with pct
+```text
+kind Type     : HindleyMilner with type             # builtin engine, closed
+kind Effect   : EffectRow with effect               # builtin engine, closed → user cannot classify a kind by it
+kind Measure  : AbelianGroup with unit
+kind Currency : Module over T with currency         # NOT AbelianGroup; scalar is the carrier T — see below
+kind Perm     : Semilattice with perm
+kind Layout   : Composition over Int with layout { be le }
 ```
 
 > **Money is `Module`, not `AbelianGroup` — `USD²` is the bite.** An earlier draft wrote
@@ -280,9 +282,15 @@ A user may declare kinds over **non-builtin** theories only:
 
 ```kaikai
 kind Metric : AbelianGroup with metric      # ✓ AbelianGroup is assemblable
-kind Perm   : Semilattice with perm          # ✓
-# kind Access : Nominal                       # ✗ Nominal is builtin (closed)
-# kind Bad   : EffectRow                      # ✗ EffectRow is builtin (closed)
+kind Role   : Semilattice with role          # ✓
+
+fn main() : Unit / Stdout = Stdout.print("ok")
+```
+
+```kaikai-neg
+kind Access : Nominal with access           # ✗ `Nominal` is a builtin theory and
+                                            #   cannot classify a user-declared kind
+fn main() : Unit / Stdout = Stdout.print("no")
 ```
 
 Isolated type universes (a `Validated` vs `Unvalidated` kind) are **not** available —
@@ -297,11 +305,12 @@ kind at the declaration site. `unit m` declares `m` in `Measure`; `metric meter`
 (from `kind Metric : AbelianGroup with metric`) declares `meter` in `Metric`:
 
 ```kaikai
-kind Measure  : AbelianGroup with unit
 kind Metric   : AbelianGroup with metric
 
 unit m                                          # m declared in Measure
 metric meter                                    # meter declared in Metric
+
+fn main() : Unit / Stdout = Stdout.print("ok")
 ```
 
 **A habitant *symbol* may live in more than one kind.** The introducer disambiguates
@@ -313,9 +322,8 @@ habitant *and* can be a `Currency` habitant, depending on which algebra the user
 wants at a given site. Resolution at the *use* site is the next section.
 
 `unit` is no longer special — it is `Measure`'s registered introducer, exactly as
-`metric`/`cur` are their kinds'. (Today `unit` is still a hard keyword; the v2+
-direction is to make it an introducer registered by the kind declaration, like every
-other introducer, so it stops being a keyword. See *Open questions*.)
+`metric`/`cur` are their kinds'. It is not a reserved word: `let unit = 1` is a
+plain binding.
 
 ## Habitant resolution at the use site
 
@@ -325,24 +333,45 @@ symbol lives in only one kind, that is the answer. When it lives in several
 order-dependence:
 
 ```kaikai
-kind Currency : AbelianGroup with cur
-kind Measure  : AbelianGroup with unit
+kind Cash : AbelianGroup with cur
 
-unit USD                                   # USD in Measure
-cur  USD                                   # USD ALSO in Currency
+unit XAU                                   # XAU in Measure
+cur  XAU                                   # XAU ALSO in Cash
 
-# 1. Explicit qualification wins — Kind.habitant (or introducer.habitant):
-let a : Real<Currency.USD> = 10.0<Currency.USD>    # unambiguous → Currency
-let b : Real<cur.USD>      = 10.0<cur.USD>         # introducer form, same effect
+fn main() : Unit / Stdout = {
+  # 1. Explicit qualification wins — Kind.habitant (or introducer.habitant):
+  let a : Real<Cash.XAU> = 10.0<Cash.XAU>  # unambiguous → Cash
+  let b : Real<cur.XAU>  = 10.0<cur.XAU>   # introducer form, same effect
+  Stdout.print("#{a} #{b}")
+}
+```
+
+```kaikai
+kind Cash : AbelianGroup with cur
+
+unit XAU
+cur  XAU
 
 # 2. `use kind` sets the module default for a bare habitant:
-use kind Currency
-let c : Real<USD> = 10.0<USD>              # bare USD ⇒ Currency (the used kind)
+use kind Cash
 
-# 3. No qualification, no `use kind`, and the symbol is AMBIGUOUS:
-let d : Real<USD> = 10.0<USD>              # ✗ ERROR: `USD` is declared in
-                                           #   Currency and Measure — qualify
-                                           #   (Currency.USD) or `use kind`.
+fn main() : Unit / Stdout = {
+  let c : Real<XAU> = 10.0<XAU>            # bare XAU ⇒ Cash (the used kind)
+  Stdout.print("#{c}")
+}
+```
+
+```kaikai-neg
+kind Cash : AbelianGroup with cur
+
+unit XAU
+cur  XAU
+
+fn main() : Unit / Stdout = {
+  # 3. No qualification, no `use kind`, and the symbol is AMBIGUOUS:
+  let d : Real<XAU> = 10.0<XAU>            # ✗ ERROR: `XAU` is ambiguous — it is
+  Stdout.print("#{d}")                     #   declared in Cash and Measure
+}
 ```
 
 **The precedence: qualification `>` `use kind` `>` unique-symbol.** If none of the
@@ -415,11 +444,16 @@ habitant carries a numeric value depends on whether its theory *sums* one.
   `pct70 = 70`. So:
 
   ```kaikai
-  kind Waterfall : Composition with pct
+  kind Waterfall : Composition over Int with pct
   pct pct70 = 70        # the habitant DECLARES its measure; Composition sums it
   pct pct20 = 20
   pct pct10 = 10
+
+  fn main() : Unit / Stdout = Stdout.print("ok")
   ```
+
+  The measures parse, register, and validate; the engine that sums them (the
+  closes-to-100 check) is not wired yet.
 
   `Layout`'s `be`/`le` carry the measure implicitly via the field type
   (`U32` → 4 bytes). A bare `pct pct70` (no `= 70`) would be an opaque symbol meaning
@@ -459,7 +493,7 @@ the user states its measure, the theory sums it.
 `Composition` *verifies* its sum at compile time ("tranches sum to 100%"). With
 **floating-point** measures this is unsound — `0.1 + 0.2 ≠ 0.3` in IEEE-754, so a
 legitimate waterfall could fail to compile on a rounding artefact. So a `Composition`
-measure must be **integer or exact rational** (`pct70 = 70`, or `1/3`), never a float.
+measure is a single **integer literal** (`pct70 = 70`), never a float or an expression.
 A tolerance-based check (`|sum − 100| < ε`) would inject an arbitrary ε into the type
 checker — the same unpredictable "accept/reject by a magic number" that Tier 1 #3
 rejects. Exact arithmetic keeps the sum verification decidable and sound.
@@ -498,21 +532,33 @@ This is what lets a kind habitant live on a **library/user type** (`Money`) with
 machinery being wired to native heads — the number enters as an ordinary carrier generic, and
 only the wrapper type (`Money`, `Matrix`) carries the `<>`.
 
-```kaikai
+The proposed declaration put the habitant slot on a record body; it has no surface
+(`type M[T]<Kind> = { ... }` does not parse):
+
+```text
 type Money[Num]<Currency> = { amount: Num }
 fn sum(a, v : Money[Real]<USD>) = a + v          # a inferred Money[Real]<USD>; a+v needs same currency+carrier
 ```
 
-> **v1 status (2026-07-22):** the use-site surface (`Money[Decimal]<USD>`, carrier in
-> `[]`, habitant in `<>`) is shipped; the shipped declaration is the transparent
-> carrier alias `type Money[t] = t` with the habitant applied at the use site, so the
-> carrier's own arithmetic rides through unchanged. The declaration-side habitant slot
-> (`type M[T]<Kind> = { ... }` on a record body) has no surface yet.
+What kaikai has today: the use-site surface (`Money[Decimal]<USD>`, carrier in `[]`,
+habitant in `<>`), over the transparent carrier alias `type Money[t] = t` in
+`stdlib/money.kai`, so the carrier's own arithmetic rides through unchanged:
+
+```kaikai
+import money.{Money}
+
+fn sum(a: Money[Int]<USD>, v: Money[Int]<USD>) : Money[Int]<USD> = a + v
+
+fn main() : Unit / Stdout = {
+  let t = sum(10<USD>, 5<USD>)
+  Stdout.print(int_to_string(money.amount(t)))
+}
+```
 
 ### No protocol bound on the carrier — the theory restricts it
 
-The carrier takes **no** protocol bound in the surface. `type M[Num: Add]` is a parse error
-("type-parameter kind must be `Type` or `Measure`") — a bound on a `type` declaration is the
+The carrier takes **no** protocol bound in the surface. `type M[Num: Add]` is an error
+("type-parameter kind must be `Type`, `Measure`, or a declared kind — `Add` is not a kind") — a bound on a `type` declaration is the
 Haskell constraint-propagation the language vetoes (a `Num: Add` would travel with every
 signature that touches `M[Num]`). So the carrier is named for intent (`Num`), not bounded.
 
@@ -522,7 +568,9 @@ lives in the theory.** `Module` is "additive group + scalar-from-a-ring", so its
 must support the ring operations by the theory's own definition. A kind over `Module`
 therefore validates its carrier **at construction, per concrete instantiation**: `Money[Int]<USD>`
 checks that `Int` provides what `Module` requires (it does → ✓); `Money[String]<USD>` checks
-`String` (it does not → **error at construction**, not a deferred failure-on-use).
+`String` (it does not → **error at construction**, not a deferred failure-on-use). Not
+implemented: today `Money[String]<USD>` constructs, and each `money` operation rejects a
+non-numeric carrier where the concrete instance is known.
 
 The sharp line vs Haskell: this validation is **local and non-propagating**. It is an
 `impl`-table check at the concrete construction site — the same `concrete ⇒ check locally /
@@ -628,27 +676,32 @@ arithmetic engine to justify one, and inventing a `Dimensional` alias byte-equal
 ## Usage — uniform surface
 
 ```kaikai
+import money.{Money}
+
 type P = { x: Int }              # habitant of Type
 effect E { op() : Unit }         # habitant of Effect
 unit km                          # habitant of Measure
-perm read                        # habitant of Perm
-
-let d : Real<km>  = 5.0<km>      # Measure habitant on a numeric (bare unit in <>)
+perm audit                       # habitant of Perm
 type H = { magic: U32<be> }      # Layout habitant on a field
-let m : Money[Real]<USD> = ...   # user type: carrier T in [], currency habitant in <>
 
-fn area(w: Real<u>, h: Real<u>) : Real<u^2> = w * h   # unit-polymorphic; u is a Measure habitant in <>
+fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h   # unit-polymorphic
+
+fn main() : Unit / Stdout = {
+  let d : Real<km> = 5.0<km>             # Measure habitant on a numeric (bare unit in <>)
+  let m : Money[Real]<USD> = 10.0<USD>   # user type: carrier in [], currency habitant in <>
+  let a = area(d, d)
+  Stdout.print("#{a} #{money.amount(m)}")
+}
 ```
 
-The kind and its habitants appear in `<>` (`Real<u>`, `Real<km>`); `[]` holds only `Type`
-carriers (`Money[Real]`). The keyword `kind` never appears in *use* positions — only in the
-one-line declaration. (The pre-kind surface spelled unit-polymorphism `[u: Measure]`, a
-*kind*-bound in `[]`; the kind design moves habitants to `<>` uniformly, so `[]` is `Type`-only.)
+Habitants appear in `<>` (`Real<u>`, `Real<km>`); a habitant *variable* is bound in the
+`[]` list with its kind (`[u: Measure]`, `[n: Dim]`), next to the `Type` parameters. The
+keyword `kind` never appears in *use* positions — only in the one-line declaration.
 
 ## `unit` compatibility
 
 `unit` stays exactly as-is: `unit x` ≡ a `Measure` habitant (its exclusive
-introducer), spelled with the existing `TkUnitKw`. All current code (`unit m`,
+introducer). All current code (`unit m`,
 `unit USD`, `unit kg`) is unchanged — no `: Measure` annotation is ever required,
 because `unit` *is* Measure's introducer. A currency uses its own kind's introducer
 (`currency USD` after `kind Currency : Module over T with currency`); `unit`
@@ -660,10 +713,10 @@ remains Measure-only.
    known-decidable properties; an unrecognised combination is a compile error, never a
    hung type checker. Engines live in the compiler.
 2. **Standard theories live in one module.** The `theory` form is legal only in
-   `stdlib/core/theories`; a `Token` naming no decidable assembly is an error.
+   `stdlib/core/kinds`; a `Token` naming no decidable assembly is an error.
 3. **Some declared kinds are unusable.** `kind Effect : EffectRow` — real, registered,
    `kai info`-visible, but `EffectRow` is builtin so no user kind may be declared over it.
-   Visibility is the barrier, not a new marker.
+   The closed builtin engine is the barrier, not visibility.
 
 ## When to separate two abelian kinds (Measure/Money was a trap)
 
@@ -709,9 +762,21 @@ imperial pound
 fn area[u: Metric](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
 
 fn main() : Unit / Stdout = {
-  let ok  = 3.0<meter> + 2.0<meter>        # ✓ same kind
+  let ok = 3.0<meter> + 2.0<meter>         # ✓ same kind
+  Stdout.print("#{area(ok, ok)}")
+}
+```
+
+```kaikai-neg
+kind Metric   : AbelianGroup with metric
+kind Imperial : AbelianGroup with imperial
+
+metric meter
+imperial foot
+
+fn main() : Unit / Stdout = {
   let bad = 3.0<meter> + 2.0<foot>         # ✗ ERROR: distinct measure systems
-  Stdout.print("ok")                       #   (Metric vs Imperial never unify)
+  Stdout.print("#{bad}")                   #   (Metric vs Imperial never unify)
 }
 ```
 
@@ -784,7 +849,7 @@ So the recovery is cheap on both:
   self-compiling compiler" conflated *soft* with *hard*: a hard `kind` keyword would
   force renaming 1055 fields; a contextual one does not touch them.)
 - **`theory` is a hard keyword, catalog-only** — legal only in the theory registry
-  module (`stdlib/core/theories`). Its single collision is renamed once; the cost is nil.
+  module (`stdlib/core/kinds`). Its single collision is renamed once; the cost is nil.
 
 The user writes `kind` once per kind declaration; the word never appears in a use
 position (`Real<meter>`, `Money[Real]<USD>`). `theory` is catalog-surface (and future
@@ -806,11 +871,6 @@ isolates habitants across kinds with no new engine and no kind-tag on
 
 ## Open questions
 
-- **`unit` should stop being a keyword.** It is `Measure`'s introducer,
-  so it could become a registered introducer like `metric`/`cur` rather
-  than a hard `TkUnitKw`. #1108 keeps `unit` as a keyword (the introducer
-  table coexists with it); dropping the keyword is a follow-up. North
-  star, not required for the engine.
 - **Alias bodies across kinds.** Kind rewriting runs before alias
   expansion, so an alias whose body's symbols are shared across kinds is
   not re-qualified per use site (`metric.Newton` / `imperial.Newton`
@@ -856,7 +916,7 @@ isolates habitants across kinds with no new engine and no kind-tag on
 
 ## References
 
-- `docs/kinds.md` — the current two-kind system this generalises.
+- `docs/kinds.md` — the kind-system primer.
 - `docs/units-of-measure.md` — the `AbelianGroup` engine (`unify_unit`, Kennedy).
 - `docs/layout-kind-design.md` — `Composition` / `Layout` detail (incl. TLV).
 - `docs/effects.md` — the `EffectRow` machinery (why `Effect` is builtin, not a catalog

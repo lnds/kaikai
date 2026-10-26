@@ -46,7 +46,7 @@ load-tested and composes with fibers.
 
 ### Declaration
 
-```kai
+```kaikai-fragment
 effect Actor[Msg] {
   self()                       : Pid[Msg]
   send[T](pid: Pid[T], msg: T) : Unit
@@ -100,34 +100,33 @@ mailbox of the instance it is typed at, whichever is installed
 innermost; a `receive` both could serve is rejected as ambiguous. A single actor that needs to mix message
 shapes in its own mailbox uses one sum type:
 
-```kai
+```kaikai
+type Pong = | Pong
+
 type ServerMsg =
-  | Ping(client: Pid[Pong])
+  | Ping(Pid[Pong])
   | Stop
   | Tick
+
+fn main() : Int = 0
 ```
 
 ### `Pid[Msg]` — typed handle
 
-```kai
-# Pid is opaque, compiler-synthesised.
-# Construction: returned by `spawn_actor` / `self`.
-# Elimination: `Actor.send(pid, msg)` and supervision ops.
-```
+`Pid[Msg]` is opaque: user code cannot build one. It is returned
+by `spawn_actor` and `Actor.self()`, and consumed by
+`Actor.send(pid, msg)` and the supervision ops.
 
-`Pid[Msg]` is a region-branded handle (same mechanism as
-`Fiber[T]` from `docs/structured-concurrency.md` §*Type
-system*). It cannot escape the nursery that created the actor
-— the region check prevents storing a `Pid[Msg]` in a data
-structure that outlives the nursery.
-
-> **v1 status (2026-09-23):** no region check confines a
-> `Pid[Msg]` today. A pid can outlive its mailbox's scope — for
-> instance captured by a `spawn_actor` child that outlives the
-> parent's `with_mailbox` — and a send through it is the no-op
-> described under `send` above. The runtime keeps one handle per
-> mailbox and clears it when the scope ends, so a stale pid reads
-> as ended and never reaches a freed or reused mailbox.
+A function cannot return a `Pid[Msg]`, directly or inside a
+record or sum it returns — the same check that keeps a
+`Fiber[T]` inside its nursery (`docs/structured-concurrency.md`
+§*Type system*). The check covers return types only. A pid can
+still outlive its mailbox's scope — for instance captured by a
+`spawn_actor` child that outlives the parent's `with_mailbox` —
+and a send through it is the no-op described under `send` above.
+The runtime keeps one handle per mailbox and clears it when the
+scope ends, so a stale pid reads as ended and never reaches a
+freed or reused mailbox.
 
 Two pids are equal if and only if they refer to the same
 actor instance. Equality is intentional: supervision,
@@ -147,7 +146,7 @@ calls `m.receive()`, `m.send(pid, msg)`, `m.self()`.
 
 ### `spawn_actor` — a fiber with its own mailbox
 
-```kai
+```text
 pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn
 
 pub fn spawn_actor_policy[Msg, e](policy: MailboxPolicy,
@@ -161,7 +160,7 @@ child's first action. `spawn_actor_policy` takes the mailbox's
 
 ### `with_mailbox` — mailbox for the current fiber
 
-```kai
+```text
 pub fn with_mailbox[Msg, R, e](body: () -> R / Actor[Msg] + e) : R / e
 
 pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
@@ -173,11 +172,20 @@ spawning a new one. Useful when `main` (or any existing fiber)
 needs to receive replies — `with_mailbox` gives it its own
 mailbox:
 
-```kai
-with_mailbox {
-  Actor.send(worker, Query(Actor.self()))
-  let answer = Actor.receive()
-  ...
+```kaikai
+import actor
+
+type Query = Query(Pid[Int])
+
+fn main() : Int / Spawn = {
+  let worker = spawn_actor(() => match Actor.receive() {
+    Query(reply) -> Actor.send(reply, 42)
+  })
+  with_mailbox {
+    Actor.send(worker, Query(Actor.self()))
+    let answer = Actor.receive()
+    answer - 42
+  }
 }
 ```
 
@@ -187,7 +195,7 @@ with_mailbox {
 `handle { ... } with Actor[Msg](mailbox)` installation whose
 state is the mailbox's pid:
 
-```kai
+```kaikai-fragment
 pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn = {
   let mb = mailbox_alloc_unowned()
   let f  = spawn_actor_fiber(mb, () => {
@@ -219,16 +227,14 @@ Every mailbox has a policy that decides what `send` does when
 the mailbox is full. v1 ships **two policies** — one of them
 parameterised by a three-way overflow rule:
 
-```kai
-type MailboxPolicy =
-  | Unbounded
-  | Bounded(capacity: Int, on_full: Overflow)
+```kaikai-fragment
+type MailboxPolicy = Unbounded | Bounded(Int, Overflow)
 
-type Overflow =
-  | DropOldest
-  | DropNewest
-  | BlockSender
+type Overflow = DropOldest | DropNewest | BlockSender
 ```
+
+Both live in `stdlib/actor.kai`; `Bounded`'s fields are the
+capacity and the overflow rule.
 
 ### `Unbounded`
 
@@ -296,7 +302,9 @@ v1 `receive()` is **first-in-first-out**. Callers that need
 "receive only messages matching predicate P" write it
 explicitly:
 
-```kai
+```kaikai
+import actor
+
 fn receive_matching[Msg](p: (Msg) -> Bool) : Msg / Actor[Msg] = {
   let msg = Actor.receive()
   if p(msg) { msg }
@@ -305,6 +313,12 @@ fn receive_matching[Msg](p: (Msg) -> Bool) : Msg / Actor[Msg] = {
     Actor.send(Actor.self(), msg)
     receive_matching(p)
   }
+}
+
+fn main() : Int = with_mailbox {
+  Actor.send(Actor.self(), 1)
+  Actor.send(Actor.self(), 2)
+  receive_matching((n) => n == 2) - 2
 }
 ```
 
@@ -323,25 +337,24 @@ as effects on top of `Spawn` and `Actor`.
 
 ### Links — bidirectional
 
-```kai
+```kaikai-fragment
 effect Link {
-  link(pid: Pid[_]) : Unit
+  link(peer: Pid[Nothing]) : Unit
 }
 ```
 
-`Pid[_]` is an **existential pid** — "a pid whose message type
-we do not care about". It is a reserved form for `link` and
-`monitor` ops only; user code does not spell `Pid[_]` in its
-own signatures. See §*Open questions* #3 for why it is special.
+The `Pid[Nothing]` parameter of `link` and `monitor` accepts a
+pid of any message type: supervision does not care what the
+peer's mailbox holds.
 
-Installing a link between the current actor and `pid` means:
+Installing a link between the current actor and `peer` means:
 when either actor terminates — normal return, crash, or
 cancellation — the other receives `Cancel.raise()`, unless it
 traps exits (§*Trap-exit semantics*). Links are bidirectional by
 construction; the scheduler maintains a set of linked peers per
-actor. A link follows the fiber behind `pid`, not its mailbox
+actor. A link follows the fiber behind `peer`, not its mailbox
 scope: it fires when that fiber terminates, even if the scope
-closed earlier. A `pid` whose fiber has already terminated when
+closed earlier. A `peer` whose fiber has already terminated when
 `link` runs is reported at once, with the reason it terminated
 for, exactly as if it had terminated right after the call.
 
@@ -358,69 +371,41 @@ use link when the relationship is "observer watches observee"
 
 ### Monitors — unidirectional
 
-```kai
+```kaikai-fragment
 effect Monitor {
-  monitor(pid: Pid[_]) : MonitorRef
-  demonitor(ref: MonitorRef) : Unit
+  monitor(target: Pid[Nothing]) : Pid[Nothing]
+  demonitor(ref: Pid[Nothing]) : Unit
 }
 ```
 
-`monitor(pid)` registers the current actor as an observer of
-`pid`. When `pid` terminates (normal return, crash, or
-cancellation), the observer receives a `MonitorDown` message
-**on its own mailbox**. Like a link, a monitor follows the fiber
-behind `pid`, not its mailbox scope. A `pid` whose fiber has
+`monitor(target)` registers the current actor as an observer of
+`target` and returns a ref for `demonitor`. When `target`
+terminates (normal return, crash, or cancellation), the runtime
+pushes the target's pid **into the observer's own mailbox** —
+its innermost open one. Like a link, a monitor follows the fiber
+behind `target`, not its mailbox scope. A `target` whose fiber has
 already terminated when `monitor` runs is reported at once, as on
 the BEAM, so a monitor never waits on a target that is already
-gone:
+gone.
 
-```kai
-type MonitorDown = MonitorDown(ref: MonitorRef, cause: TerminationCause)
+### How the down notice is delivered
 
-type TerminationCause =
-  | Normal
-  | Crashed(msg: String)
-  | Cancelled
-```
-
-### How MonitorDown is delivered
-
-v1 uses the **embedded** model: `MonitorDown` travels through
-the observer's normal mailbox, so the observer's message type
-must include `MonitorDown` as one of its variants. A typical
-supervising actor declares something like:
-
-```kai
-type SupervisorMsg =
-  | Tick
-  | Stop
-  | Down(event: MonitorDown)            # supervision channel
-
-fn supervisor() : Unit / Actor[SupervisorMsg] + Monitor = match Actor.receive() {
-  Tick     -> supervisor()
-  Stop     -> ()
-  Down(ev) -> { handle_down(ev); supervisor() }
-}
-```
-
-The coupling — every supervising message type must reserve a
-variant for `MonitorDown` — is accepted in v1 because it is
-the least intrusive option under the existing typed-mailbox
-rule. A future revision may add a dual-channel model (system
-messages on a separate queue, read by a dedicated op) once
-usage data shows the embedded form is too tight; §*Out of
-scope for v1* tracks that extension.
+The notice is the target's pid and nothing else: it does not
+carry the cause of termination. The observer reads it with
+`Actor.receive()`, so its mailbox's message type is the
+target's pid type, as in `Actor[Pid[Job]]` for a target spawned
+with `Actor[Job]`; comparing the notice with `==` tells which
+target ended. To learn *why* a peer ended (`"Normal"`,
+`"Crashed"`, `"Trapped: …"`), link to it and trap exits
+(§*Trap-exit semantics*).
 
 ### `demonitor`
 
-`demonitor(ref)` withdraws the subscription; no further
-`MonitorDown` will arrive for that ref even if the target
-terminates. `MonitorDown` events already deposited into the
-observer's mailbox before `demonitor` are **not** flushed —
-the observer receives them on its own cadence. A future
-`demonitor_flush(ref)` helper may be added if the need
-surfaces; for v1, callers drain pending `Down(...)` events
-explicitly if it matters.
+`demonitor(ref)` withdraws the subscription; no further notice
+will arrive for that ref even if the target terminates. Notices
+already deposited into the observer's mailbox before `demonitor`
+are **not** flushed — the observer receives them on its own
+cadence.
 
 ### Fault propagation
 
@@ -460,27 +445,37 @@ like any other mailbox traffic. Two requirements for delivery:
    `cancel_requested` behaviour.
 2. The fiber's message type must be `String` (or accept
    `String`) so the runtime's pre-built `"Normal"` /
-   `"Crashed"` payloads round-trip through the typed mailbox.
-   v1 ships String specifically — a richer
-   `type ExitReason = Normal | Crashed(...)` payload waits on
-   user-defined sum types crossing the runtime/library
-   boundary.
+   `"Crashed"` / `"Trapped: …"` payloads round-trip through the
+   typed mailbox.
 
 Toggle scope: `set_trap_exit` affects propagations that happen
 *after* the call returns. Links established before the call
 still respect the flag — the read happens at termination time,
 not at link time.
 
-```kai
+```kaikai
+import actor
+import spawn
+
+fn worker(boss: Pid[String]) : Unit / Actor[String] + Link + Cancel = {
+  Link.link(boss)
+  Cancel.raise()
+}
+
 fn supervisor() : Unit / Actor[String] + Spawn + Stdout + Link + Cancel = {
   spawn.set_trap_exit(true)
   let me = Actor.self()
   let _ = spawn.spawn(() => with_mailbox { worker(me) })
   match Actor.receive() {
     "Normal"  -> Stdout.print("worker finished cleanly")
-    "Crashed" -> { Stdout.print("worker crashed; restarting"); restart(me) }
+    "Crashed" -> Stdout.print("worker crashed")
     _         -> Stdout.print("unexpected message")
   }
+}
+
+fn main() : Int / Spawn + Stdout + Link + Cancel = {
+  with_mailbox { supervisor() }
+  0
 }
 ```
 
@@ -506,47 +501,42 @@ cleanup, escalation, etc.), the supervisor's `Actor.receive()`
 would never wake. Plain `Cancel.raise()` inside a fiber that holds
 no trap-exit'd link still dispatches through user handlers as
 before, preserving the cleanup-on-cancel idiom for non-supervised
-work. Spec: `stage0/runtime.h` §`kai_check_trap_exit_cancel_bypass`,
-issue #103.
+work. Implementation: `kai_check_trap_exit_cancel_bypass` in
+`stage2/runtime/evidence.h`.
 
 ### Supervision trees
 
-A supervisor is an ordinary actor whose message type includes
-`MonitorDown`; its `receive` loop handles child termination
-explicitly:
+A supervisor is an ordinary actor that monitors its children and
+reads their down notices from its own mailbox. This one restarts
+a crashing worker a fixed number of times:
 
-```kai
-type SupervisorMsg =
-  | Down(event: MonitorDown)
-  | Event(payload: DomainEvent)
+```kaikai
+import actor
 
-fn supervisor(
-  children: [ChildSpec]
-) : Unit / Actor[SupervisorMsg] + Spawn + Monitor + Console + Cancel {
-  let pids = children | (spec) => start_child(spec)
-  pids |> each((p) => monitor(p))
-  forever {
-    match Actor.receive() {
-      Down(MonitorDown(ref, Crashed(msg))) -> {
-        Console.eprint("child crashed: #{msg}")
-        let fresh = restart_child(ref_to_spec(ref))
-        monitor(fresh)
-      }
-      Down(MonitorDown(ref, Normal))    -> remove_child(ref)
-      Down(MonitorDown(ref, Cancelled)) -> remove_child(ref)
-      Event(payload)                    -> handle_event(payload)
-    }
+type Job = | Job
+
+fn worker() : Unit / Actor[Job] + Cancel = Cancel.raise()
+
+fn supervise(restarts: Int) : Unit / Actor[Pid[Job]] + Spawn + Monitor + Cancel + Stdout =
+  if restarts == 0 { Stdout.print("giving up") }
+  else {
+    let w = spawn_actor(worker)
+    let _ = Monitor.monitor(w)
+    let down = Actor.receive()
+    if down == w { Stdout.print("worker ended; restarting") }
+    supervise(restarts - 1)
   }
+
+fn main() : Int / Spawn + Monitor + Cancel + Stdout = {
+  with_mailbox { supervise(3) }
+  0
 }
 ```
 
-kaikai does not ship a prebuilt "supervisor" abstraction in
-v1 — the pattern above is short enough to write by hand, and
-the canonical Erlang OTP-style DSL (`one_for_one`,
-`rest_for_one`, etc.) requires a larger design than v1 can
-absorb. Once patterns stabilise, a stdlib module
-`stdlib/supervisor.kai` can land as a layer on top of
-`Monitor` + `Spawn`.
+kaikai does not ship a prebuilt "supervisor" abstraction — the
+pattern above is short enough to write by hand, and an Erlang
+OTP-style DSL (`one_for_one`, `rest_for_one`, etc.) needs a
+larger design.
 
 ## Interaction with `Cancel`
 <!-- coverage: skip --> covered by m8x_3_cancel_at_yield (cooperative Cancel delivery exercised end-to-end with a spawned worker)
@@ -561,7 +551,8 @@ semantics is identical.
 `receive` can be cancelled by:
 
 - `Spawn.cancel(pid)` from a peer.
-- Its parent nursery closing with outstanding children.
+- A sibling in its nursery failing: the nursery cancels the
+  survivors.
 - A linked actor crashing.
 
 When cancelled during a `receive`, the scheduler delivers
@@ -586,7 +577,9 @@ message un-delivered.
 The common synchronous-over-async pattern: send a request with
 a reply-to pid, then wait for the response.
 
-```kai
+```kaikai
+import actor
+
 type Request = Query(String, Pid[Reply])
 type Reply   = Answer(String)
 
@@ -595,6 +588,16 @@ fn ask(server: Pid[Request], q: String) : String / Actor[Reply] = {
   match Actor.receive() {
     Answer(a) -> a
   }
+}
+
+fn server() : Unit / Actor[Request] = match Actor.receive() {
+  Query(q, reply) -> { Actor.send(reply, Answer("re: " ++ q)); server() }
+}
+
+fn main() : Int / Spawn + Stdout = {
+  let s = spawn_actor(server)
+  Stdout.print(with_mailbox { ask(s, "status") })
+  0
 }
 ```
 
@@ -607,13 +610,18 @@ just for the interaction. The same function over a named
 instance takes the capability as a parameter, and its row no
 longer mentions `Actor`:
 
-```kai
+```kaikai
+type Request = Query(String, Pid[Reply])
+type Reply   = Answer(String)
+
 fn ask_with(m: Actor[Reply], server: Pid[Request], q: String) : String = {
   m.send(server, Query(q, m.self()))
   match m.receive() {
     Answer(a) -> a
   }
 }
+
+fn main() : Int = 0
 ```
 
 ### Event bus
@@ -622,7 +630,7 @@ An actor whose mailbox collects events from many producers and
 broadcasts them to subscribers. It owns a `BusMsg` mailbox only;
 delivering an `Event` needs no `Actor[Event]` of its own:
 
-```kai
+```kaikai
 type Event  = Delivered(String, String)
 type Sub    = { topic: String, pid: Pid[Event] }
 type BusMsg =
@@ -638,33 +646,49 @@ fn event_bus(subs: [Sub]) : Unit / Actor[BusMsg] = match Actor.receive() {
   Subscribe(topic, p)   -> event_bus([Sub { topic: topic, pid: p }, ...subs])
   Unsubscribe(topic, p) -> event_bus(filter(subs, (s) => not (s.topic == topic and s.pid == p)))
 }
+
+fn main() : Int = 0
 ```
 
 ### Actor pool
 
-A supervisor that spins up N identical workers and
-round-robins requests:
+N identical workers behind a dispatcher that round-robins
+requests:
 
-```kai
-fn pool(
-  nur:  Nursery,
-  size: Int,
-  work: (Task) -> Result / Cancel
-) : Pid[Task] / Spawn + Monitor + Cancel {
-  let workers = [1..size] | (_) => start_worker(nur, work)
-  spawn_actor_default(nur) { m -> dispatcher_loop(m, workers) }
+```kaikai
+import actor
+
+type Task = Square(Int, Pid[Int])
+
+fn worker() : Unit / Actor[Task] = match Actor.receive() {
+  Square(n, reply) -> { Actor.send(reply, n * n); worker() }
+}
+
+fn dispatcher(workers: [Pid[Task]]) : Unit / Actor[Task] = match workers {
+  []           -> ()
+  [w, ...rest] -> {
+    Actor.send(w, Actor.receive())
+    dispatcher(rest ++ [w])
+  }
+}
+
+fn main() : Int / Spawn + Stdout = {
+  let workers = [1..3] | (_i => spawn_actor(worker))
+  let pool = spawn_actor(() => dispatcher(workers))
+  with_mailbox {
+    [1..4] |> each((n) => Actor.send(pool, Square(n, Actor.self())))
+    [1..4] |> each((_i) => Stdout.print("#{Actor.receive()}"))
+  }
+  0
 }
 ```
 
-`pool` takes the caller's nursery, spawns `size` worker actors
-inside it, and starts a dispatcher actor that round-robins
-`Task` messages across them. The returned `Pid[Task]` is
-region-branded to `nur`: it stays valid while the caller's
-nursery is open and cannot outlive it.
-
-`dispatcher_loop` is an ordinary actor body that receives
-`Task`, picks the next worker, forwards, and monitors each
-worker so a crash is observable via `MonitorDown`.
+The dispatcher is an ordinary actor body that receives a `Task`,
+forwards it to the next worker, and rotates the list. The pool
+is built inline rather than by a `pool(size) : Pid[Task]` helper
+because a function cannot return a pid (§*`Pid[Msg]` — typed
+handle*); a helper would take a continuation that receives the
+pid instead.
 
 ## Out of scope for v1
 
@@ -681,36 +705,32 @@ worker so a crash is observable via `MonitorDown`.
 - **Priority mailboxes.** No per-message priority. Callers
   that need it implement it with two mailboxes and their own
   arbitration actor.
-- **Typed monitors.** `monitor` gives you `MonitorDown`; it
-  does not parameterise the message type beyond that. Richer
-  reason payloads wait on `Error[E]` from Doc B open questions.
+- **Termination causes on monitors.** A down notice is the
+  target's pid only; the cause is reachable through a trap-exit
+  link.
 - **Pre-built supervisor DSLs** (`one_for_one`, `one_for_all`,
   `rest_for_one`). The building blocks are there; the OTP-style
   DSL lands as a stdlib module after patterns stabilise.
 - **Pid introspection beyond equality.** No `pid.name`,
   `pid.info`, `pid.mailbox_size`. Observability goes through
   monitors and runtime metrics (Doc C).
-- **Dual-channel `MonitorDown` delivery.** v1 embeds
-  `MonitorDown` into the observer's own mailbox, forcing the
-  observer's message type to reserve a variant for it. A
-  future revision may add a separate system-message channel
-  (BEAM-style), consumed via a dedicated op, so regular
-  message types stay free of supervision concerns.
+- **A separate system-message channel.** Down notices and
+  trap-exit reasons arrive in the observer's own mailbox, so its
+  message type must accept them; there is no BEAM-style system
+  queue read by a dedicated op.
 
 ## Open questions
 
 1. **Mailbox policy default.**
-   *Decided:* `spawn_actor` requires an explicit policy. The
-   stdlib helper `spawn_actor_default(nur, body)` covers the
-   common case using `Bounded(1024, BlockSender)` — bounded
-   capacity with backpressure on full. This split keeps
-   unbounded-by-accident out of the language while still
-   giving callers a one-liner for the 90th-percentile case.
+   `spawn_actor` and `with_mailbox` open an `Unbounded` mailbox;
+   `spawn_actor_policy` and `with_mailbox_policy` take the
+   policy explicitly, and are the ones to reach for when a
+   producer can outrun its consumer.
 
 2. **Link vs monitor as the default supervision primitive.**
    *Decided:* monitors are the idiomatic default. Adding a
    monitored peer is observation only — the observer learns
-   about termination via `MonitorDown` and decides what to do.
+   about termination via its down notice and decides what to do.
    Links are reserved for relationships that are symmetrically
    coupled (worker + job queue, two sides of a handshake). The
    reasoning: linking propagates faults automatically, which
@@ -720,27 +740,17 @@ worker so a crash is observable via `MonitorDown`.
    want BEAM-style auto-cancellation reach for `link` once
    they have decided that the coupling is real.
 
-3. **`Pid[_]` in link/monitor ops.**
-   *Decided:* `Pid[_]` is a special form, accepted only as the
-   parameter type of `link` / `monitor` / `demonitor` (and
-   future supervision ops in the same family). User code
-   cannot bind a value of type `Pid[_]`, store it in a record,
-   or return it from a function. Existential pids elsewhere
-   would let them leak past supervision, where the absence of
-   a concrete `Msg` removes the typed-mailbox guarantee.
+3. **The peer type of link/monitor ops.**
+   `link`, `monitor` and `demonitor` take a `Pid[Nothing]`,
+   which accepts a pid of any message type. Supervision only
+   needs the pid's identity, never its mailbox type.
 
-4. **`Actor[Msg]` as a row variable argument.**
-   *Decided:* not in v1. A function that wants to run "inside
-   any actor" cannot declare its `Actor[Msg]` row position as
-   polymorphic over `Msg` — that would require row
-   polymorphism at the call site, which Doc A §*Out of scope
-   for v1* item 3 keeps out of scope (per-op type generics
-   land in m7b, but row-level per-call polymorphism does not).
-   Functions that genuinely need actor-agnostic behaviour can
-   either avoid `Actor[Msg]` in their row (log via `Console`,
-   not via the actor's mailbox) or open their own
-   `with_mailbox` scope. Revisit if real use cases appear that
-   neither workaround covers.
+4. **`Actor[Msg]` generic over `Msg`.**
+   A function may be generic over the mailbox type it runs
+   in: `receive_matching[Msg]` in §*Selective receive and future
+   extension* has
+   row `Actor[Msg]` with `Msg` a type parameter, instantiated
+   at each call site.
 
 ## Next steps
 
@@ -754,10 +764,7 @@ actor's mailbox — issue #763), `with_mailbox`, and
 `m8x_4_recv_blocking.kai`,
 `issue_763_spawn_actor_policy_block_sender.kai`, and
 `demos/ping_pong/` exercise the full mailbox + supervision
-surface. (`spawn_actor_default` and a nursery-parameter
-`spawn_actor`, which §*Actor pool* and §*Open questions* #1 still
-assume, remain open — today's stdlib shape is
-`spawn_actor[_policy]([policy,] body)`.)
+surface.
 
 Open work after v1:
 

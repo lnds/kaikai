@@ -5,9 +5,7 @@ mainstream language. The header of every `main.kai` includes the
 equivalent code in the contrasting language so the trade-off is visible
 side-by-side.
 
-The demos are written in **target syntax** (post-m7e / m8 / m12.5 /
-m12.6). Most do not compile today; they document the language we are
-building and the pitch that comes with it.
+Every demo compiles and runs; `make -C demos/vs verify` checks them.
 
 ## The match-ups
 
@@ -20,7 +18,7 @@ building and the pitch that comes with it.
 | `elixir/`  | typed actors with exhaustive `match` instead of dynamic `receive` |
 | `python/`  | typed data pipelines with compile-time errors instead of `KeyError` |
 | `ruby/`    | DSLs via effect handlers, not open classes |
-| `java/`    | domain modelling with refinement types + UoM + contracts |
+| `java/`    | domain modelling with refinement types + contracts |
 
 ## Usage
 
@@ -32,7 +30,7 @@ make -C demos/vs clean
 ```
 
 Same conventions as `demos/Makefile` and `demos/9d9l/Makefile`:
-graceful FAIL reporting, kaic2 directly, never aborts.
+graceful FAIL reporting, `stage2/kaic2` directly, never aborts.
 
 ## Caveat
 

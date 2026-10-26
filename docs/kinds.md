@@ -1,16 +1,19 @@
 # The kind system
 
-> Status: the catalog (`stdlib/core/kinds.kai`) declares seven
+> Status: the catalog (`stdlib/core/kinds.kai`) declares nine
 > kinds — `Type` and `Effect` (builtin, closed), `Measure`
 > (`AbelianGroup`), `Currency` (`Module`), `Region` (`Nominal`,
-> identity), `Layout` (`Composition`), and `Shape`
+> identity), `Perm` (`Semilattice`), `Layout` (`Composition`),
+> `Dim` (the HM core over `Int` values), and `Shape`
 > (`ConstructorApp`). One theory names one engine: a theory is
 > never a label over a guard reusing another theory's engine. The
 > `kind` / `theory` declaration surface and the generalized engine
-> (user kinds over `AbelianGroup`, `Module`, or `Composition`,
+> (user kinds over `AbelianGroup`, `Module`, `Semilattice`, or
+> `Composition`,
 > per-kind isolation, use-site resolution, cross-kind bind
-> rejection) are shipped. The authoritative design is
-> `docs/kind-system-design.md`; this page is the primer.
+> rejection) are shipped. `kai info kinds` is the reference;
+> `docs/kind-system-design.md` is the design; this page is the
+> primer.
 
 ## What is a kind?
 
@@ -20,9 +23,9 @@ Kinds classify types the same way types classify values.
 - A *type* `Int` has the *kind* `Type`.
 
 In most languages you only ever meet one kind (`Type`), so the
-concept stays invisible. kaikai exposes a second kind so the
-type system can keep units of measure separate from ordinary
-types.
+concept stays invisible. kaikai exposes more kinds so the type
+system can keep units, currencies, regions, capabilities, and binary
+layouts separate from ordinary types.
 
 ## The catalog kinds
 
@@ -34,9 +37,11 @@ unification discipline that decides how its habitants unify:
 | `Type`    | `HindleyMilner` | builtin (the compiler's HM unifier) | `type` | ordinary types: `Int`, `String`, `[T]`, `Option[T]`, user records and variants |
 | `Effect`  | `EffectRow` | builtin (the compiler's row-unification) | `effect` | effect labels: `Stdout`, `State`, `Spawn` |
 | `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `m`, `kg`, `m/s`, `m^2` |
-| `Currency` | `Module` | abelian unifier + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
+| `Currency` | `Module` | nominal atom equality + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
 | `Region`  | `Nominal` | builtin (symbol identity) | `region` | memory arenas: each `r` is skolemized fresh by a `region { r -> }` block; `Tree<r>` carries it |
+| `Perm`    | `Semilattice` | idempotent join + subsumption | `perm` | typed capabilities: `read`, `write` — `FileHandle<read + write>` flows where `FileHandle<read>` is required |
 | `Layout`  | `Composition` | atomic-habitant guard (identity) + codegen | `layout` | byte-order modifiers: `be`, `le` — `U32<be>` is a 4-byte big-endian field |
+| `Dim`     | `HindleyMilner` | the HM core's first-order equality | *(values, `with Int`)* | static shape indices: `Vec[Real]<3>`, `Matrix[Real]<2, 3>` |
 | `Shape`   | `ConstructorApp` | builtin (constructor witness-binding) | *(derived)* | arity-1 type constructors: `List`, `Option`, a user `Tree[a]` — every arity-1 `type` is a habitant |
 
 A `builtin` theory (`theory HindleyMilner = builtin`) names an
@@ -54,8 +59,9 @@ mints one of `Measure`.
 
 Effect *rows* (the `/ Console + State` part of a signature) stay
 in their own machinery (see `docs/effects.md`); `Effect` classifies
-the labels, and only unit-shaped kinds appear in tparam
-annotations (`[u: Measure]`, `[c: Currency]`, `[r: Region]`).
+the labels, and only the other kinds appear in tparam
+annotations (`[u: Measure]`, `[c: Currency]`, `[r: Region]`,
+`[n: Dim]`, `[s: Shape]`).
 
 ### The `Nominal` theory
 
@@ -99,10 +105,9 @@ additive abelian group with **no multiplicative closure**. A
 well-formed quantity is either a scalar or carries exactly one
 habitant with exponent 1, so `USD^2`, `USD*EUR`, and `1/USD` are
 rejected where they would be *formed* (`*`, `/`, `^`, or a written
-annotation) rather than by a separate unifier: on well-formed
-inputs the abelian engine already behaves as symbol equality plus
-variable binding. Scalar multiplication (`Money * Decimal`) is the
-module's external action and lives in protocols, not in the kind
+annotation); unification is nominal atom equality plus variable
+binding. Scalar multiplication (`Money[t]<c> * t`) is the module's
+external action and lives in operation signatures, not in the kind
 engine. Same-habitant addition unifies; a cross-habitant sum is an
 ordinary unit mismatch.
 
@@ -135,32 +140,44 @@ over `AbelianGroup`/`Module`.
 Type parameters carry an optional `: Kind` annotation inside the
 brackets. The default is `Type`, so most code never names a kind:
 
-```kai
-fn map[a, b](xs: [a], f: (a) -> b) : [b]
-# expands to: map[a: Type, b: Type]
+```kaikai
+fn apply_all[a, b](xs: [a], f: (a) -> b) : [b] = xs | f(.)
+# same as apply_all[a: Type, b: Type]
+
+fn main() : Unit / Stdout = Stdout.print("#{apply_all([1, 2], (x) => x * 10)}")
 ```
 
-When a parameter ranges over units, the annotation is mandatory:
+When a parameter ranges over units, the annotation is mandatory.
+The grammar is mechanical: after a tparam name, an optional
+`: <KindName>` follows, and one list may mix kinds:
 
-```kai
-fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2>
-fn divide[u: Measure, v: Measure](a: Real<u>, b: Real<v>) : Real<u/v>
+```kaikai
+unit m
+unit s
+
+fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
+fn divide[u: Measure, v: Measure](a: Real<u>, b: Real<v>) : Real<u/v> = a / b
+fn scale[t: Type, u: Measure](x: t, factor: Real<u>) : Real<u> = factor
+
+fn main() : Unit / Stdout = {
+  Stdout.print("#{area(3.0<m>, 4.0<m>)} #{divide(10.0<m>, 2.0<s>)} #{scale(1, 2.0<m>)}")
+}
 ```
 
 `impl` blocks may carry the same annotation:
 
-```kai
-impl[u: Measure] Show for Real<u> {
-  fn show(x: Real<u>) : String = ...
+```kaikai
+protocol Describe {
+  describe(x: Self) : String
 }
-```
 
-The grammar is mechanical: after a tparam name, an optional
-`: <KindName>` follows. Mixing kinds in a single tparam list is
-allowed:
+unit m
 
-```kai
-fn convert[t: Type, u: Measure](x: t, factor: Real<u>) : Real<u> = ...
+impl[u: Measure] Describe for Real<u> {
+  fn describe(x: Real<u>) : String = "#{x}"
+}
+
+fn main() : Unit / Stdout = Stdout.print(describe(3.0<m>))
 ```
 
 The compiler keeps type-vars and measure-vars in separate ID
@@ -174,7 +191,7 @@ different things share or share-derive the spelling `Unit`:
 | Spelling   | What it is                              | Example |
 |------------|------------------------------------------|---------|
 | `Unit`     | the void return type (like `()` in ML) | `fn log(msg: String) : Unit / Console = ...` |
-| `unit`     | a top-level keyword that declares a unit of measure | `unit USD`, `unit kg` |
+| `unit`     | the introducer that declares a unit of measure | `unit USD`, `unit kg` |
 | `Measure`  | the kind for unit-of-measure type parameters | `[u: Measure]` |
 
 Before #253 the kind was also called `Unit`, which made
@@ -184,7 +201,7 @@ kind was renamed to `Measure` (echoing F#'s `[<Measure>]`
 attribute) so each role gets a distinct spelling.
 
 The lowercase/uppercase distinction separates `unit` (the
-keyword) from `Unit` (the type) — kaikai keywords are lowercase,
+introducer) from `Unit` (the type) — introducers are lowercase,
 type names are uppercase. The remaining ambiguity lived between
 `Unit` (type) and `Unit` (kind), which was always disambiguated
 only by syntactic position (return slot vs `[]` annotation).
@@ -196,7 +213,7 @@ A kind is declared over a **theory** — a unification discipline
 drawn from a closed catalog (`stdlib/core/kinds.kai`; only the
 catalog may declare theories):
 
-```kai
+```kaikai
 kind Metric : AbelianGroup with metric   # user kind, own habitants
 metric m
 metric s
@@ -207,6 +224,12 @@ points pt
 kind Frame : Composition with frame       # summed-measure user kind
 frame hdr
 frame body
+
+fn main() : Unit / Stdout = {
+  let speed = 10.0<m> / 2.0<s>
+  let total = 3.0<pt> + 4.0<pt>
+  Stdout.print("#{speed} #{total}")
+}
 ```
 
 The theory decides how the kind's habitants unify (`AbelianGroup`
@@ -220,8 +243,8 @@ qualification > `use kind` > uniqueness — see
 site*.
 
 `Type` and `Effect` are **not** user-declarable. Only kinds over
-the open catalog theories (`AbelianGroup`, `Module`, `Composition`)
-can be declared; a `kind Type : ...` redeclaration, a user
+the open catalog theories (`AbelianGroup`, `Module`, `Semilattice`,
+`Composition`) can be declared; a `kind Type : ...` redeclaration, a user
 `theory X = builtin`, and a user kind over a builtin theory
 (`kind Foo : EffectRow`) are all hard errors.
 
@@ -238,6 +261,6 @@ can be declared; a `kind Type : ...` redeclaration, a user
 - `docs/effects-stdlib.md` — uses `Unit` (the type) extensively
   as the return slot; no `Measure` references because effects
   are kind-orthogonal.
-- `stage2/compiler.kai` § `parse_optional_kind_annotation` — the
+- `stage2/compiler/parse_types.kai` § `parse_optional_kind_annotation` — the
   parser site that recognises `Measure` and produces the
   targeted diagnostic when a user writes `Unit` in kind position.

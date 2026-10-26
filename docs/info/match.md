@@ -197,8 +197,8 @@ explicit `= match { ... }` would just add a wrapper.
 ## NOT IN KAIKAI
 
 - `case x of pat -> ...` (Haskell/Erlang). The `case` keyword exists
-  in kaikai but only in a *clause-block fn body* (`fn f(x) { case 0
-  -> ...; case _ -> ... }`); it is not a standalone expression.
+  in kaikai but only in a *clause-block fn body* (`fn f(x: Int) : T {
+  case 0 -> ...; case _ -> ... }`); it is not a standalone expression.
 - `switch / case` (C/JS). Use `match`.
 - Or-patterns `A | B -> ...` as a single arm. Write two arms.
 - View patterns. Use a guard.

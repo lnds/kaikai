@@ -52,7 +52,7 @@ and the rest (`other`, ~55%) is TyEnv lookup + unification.
 aliases, resume_bind, ret_ty, op_eff_arities, op_to_eff, proto_impls,
 alias_tag, …). There are **~16 `st_*` reconstructor functions** with **129
 call sites** that rebuild the WHOLE record to change ONE field:
-```kai
+```text
 fn st_bump_err(st) : InferState =        # 51 call sites!
   InferState { file: st.file, env: st.env, ..., errs: st.errs + 1, ... }  # incref the other 17
 ```

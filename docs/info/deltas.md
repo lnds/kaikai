@@ -40,7 +40,7 @@ Every entry is verified against the compiler; when in doubt,
 - Generics use brackets — `Foo[T]`, `[Int]` — never `Foo<T>`. Angle
   brackets belong to units of measure (`Real<m>`).
 - `|` between values is the MAP pipe, not bitwise-or. There are no
-  bitwise operators on `Int`; `import math/bits` gives `bit_and`,
+  bitwise operators on `Int`; `import math.bits` gives `bit_and`,
   `bit_or`, `bit_shl`, ….
 - Attributes are `#[derive(Eq, Show)]` / `#[doc(...)]` — not
   `#derive(...)` — and they come BEFORE `pub`.

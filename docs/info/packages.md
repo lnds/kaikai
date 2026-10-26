@@ -7,8 +7,8 @@
 A kaikai package is a directory with a `kai.toml` manifest. The
 package name in the manifest is what other packages import.
 
-Files inside a package are merged at build time. Each file declares
-what it imports from other packages and what it exports.
+Each file of a package is a module: it declares what it imports and
+what it exports (`pub`), and the package builds as one unit.
 
 ## Driver commands
 
@@ -169,7 +169,7 @@ kai migrate --from hanga-roa --to orongo src/main.kai
   touches no files. Pass `--write` to rewrite in place. Running
   `--write` twice is a byte-stable no-op (idempotent).
 - **Editions default** to the package/repo edition as `--from` and its
-  successor as `--to`. Today only `hanga-roa -> orongo` has a rule set.
+  successor as `--to`. Only `hanga-roa -> orongo` has a rule set.
 - **Un-migratable changes are reported, not dropped** — a change with
   no automatic rule prints a `manual: <line>:<col> — …` pointer to
   stderr so you fix it by hand.
@@ -191,7 +191,7 @@ shadow a core name of the same spelling only in the files that import
 it.
 
 Imports are RESOLVED through `kai.toml` — the name on the right of
-`import` must appear as a dep (or be a stdlib name).
+`import` must be a module of the package, a dep, or a stdlib name.
 
 An import the file never refers to — neither as a qualifier (`m.f`)
 nor through any name it exports — is a warning (`unused import \`m\``);
@@ -270,14 +270,15 @@ through a `pub` signature.
 
 ## Stdlib is auto-loaded
 
-The Hanga Roa "core" set is loaded automatically — no import
-needed for: Stdin/Stdout/Stderr, File, Env, Console, Option, Result,
-List ops, Array, String, Char, Int/Real basics, protocols, complex.
-Everything else (decimal, money, math/int, math/bigint, regexp,
-collections/*, encoding/*, crypto/*, random, fx, uuid, path) is
-opt-in via `import <name>`.
+The core set is loaded automatically — no import needed for the
+stdlib effects (Stdin/Stdout/Stderr, File, Env, Random, …), Option,
+Result, list ops, Array, String, Char, tuples, Int/Real basics, the
+fixed-width conversions, protocols, `math.bits` and complex numbers.
+Everything else (`decimal`, `money`, `math.bigint`, `regexp`,
+`collections.*`, `encoding.*`, `crypto.*`, `random`, `uuid`, `path`,
+`time`, `loop`, `spawn`, …) is opt-in via `import <name>`.
 
-Full split: `docs/stdlib-layout.md` §Core vs opt-in.
+Full split: `docs/stdlib-layout.md`.
 
 ## Package layout
 
@@ -331,7 +332,7 @@ kai build                          # same as `kai build .`
 - Build scripts (`build.rs`). No code runs at build time outside
   the compiler.
 - C-style header includes. Each file's import is explicit.
-- Re-exports inside the same package — files merge automatically.
+- Re-exports. A file imports the module that declares a name.
 
 ## See also
 

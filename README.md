@@ -15,13 +15,13 @@ A **functional**, **statically typed** programming language that compiles to
 
 Pre-1.0, **Hanga Roa** edition. The language is self-hosting and
 runs the full toolchain today; it is unstable until the Orongo
-edition lands (Orongo ships as 0.100.x; the 1.0 label is postponed
-indefinitely) — see `docs/editions.md`.
+edition lands (the 1.0 label is postponed indefinitely), and breaking
+changes still land within Hanga Roa — see `docs/editions.md`.
 
-- **Bootstrap** (landed): the 3-stage chain builds from any `cc`.
-  `stage1/kaic1` is the self-hosting kaikai-minimal compiler;
-  `stage2/kaic2` is the self-hosted compiler in full kaikai
-  (`make selfhost` proves it is a fixed point).
+- **Bootstrap** (landed): `stage2/kaic2`, the self-hosted compiler in
+  full kaikai, is built by the previous release (`make selfhost`
+  proves it is a fixed point); from a bare `cc`, it boots from a
+  frozen C seed. Stages 0 and 1 are frozen.
 - **Backend** (landed): the in-process libLLVM **native** backend
   is the default; the C-direct backend is the bootstrap path and
   parity oracle (`KAI_BACKEND=c`).
@@ -159,26 +159,25 @@ machinery below is needed to *use* the language; it is the toolchain for
 Everything builds from the repo root with `make`:
 
 ```sh
-make all       # stage 0 (C), stage 1 (kaikai-minimal), stage 2, bin/kai
-make test      # runs stage 0, stage 1, and phase 4 demo suites
-make selfhost  # proves kaic1 compiled by kaic1 is a fixed point
+make all       # kaic1, kaic2 (built by the previous release), bin/kai
+make kaic2-fast  # after editing stage2/compiler/*.kai: one hop, changed modules only
+make tier0     # pre-commit sanity, selfhost included
+make selfhost  # proves kaic2 compiled by itself is a fixed point
 ```
 
-The bootstrap chain regenerates the compiler from nothing but a C
-compiler: stage 0 (C) builds `kaic0`, which compiles the kaikai-minimal
-compiler `kaic1`, which compiles the self-hosted full compiler `kaic2`.
-On a fresh checkout, only a C compiler is required to start:
+`kaic2` is built by the previous release's compiler, downloaded once per
+release (`KAIC_BOOT=release`, the default). With only a C compiler and
+no network, boot from the frozen C seed a release pins in a
+`bootstrap-seed-v*` tag:
 
 ```sh
-cc stage0/*.c -o stage0/kaic0
-./stage0/kaic0 stage1/compiler.kai > /tmp/stage1.c
-cc /tmp/stage1.c -I stage0 -o stage1/kaic1
-make kaic2     # kaic1 builds kaic2; kaic2 builds the kai binary, bin/kai
+make kaic2 KAIC_BOOT=seed     # add KAI_LLVM=1 where libLLVM is available
 bin/kai run examples/phase4/hello.kai
 ```
 
 `make selfhost` is the fixed-point proof that the compiler can rebuild
 itself byte-for-byte — the defining property of a self-hosted compiler.
+`docs/build-system.md` maps the rest of the build.
 
 ## Usage
 
@@ -222,9 +221,8 @@ kai test examples/phase4/factorials.kai
 #  2/2 tests passed
 ```
 
-The driver auto-builds `stage0/kaic0` and `stage1/kaic1` on first use
-and prepends every file under `stdlib/core/` to every compilation
-(set `KAI_NO_STDLIB=1` to turn this off).
+The stdlib core modules are loaded into every compilation; any other
+stdlib module comes in with `import`.
 
 Declare dependencies in a `kai.toml` next to your source:
 
@@ -236,9 +234,8 @@ kai run src/main.kai                # auto-injects --path for local-path deps
 ```
 
 See [`docs/packages.md`](docs/packages.md) for the manifest format,
-the supported dependency forms (string shorthand, inline table,
-local path), and the v1 status (local-path deps are live; git-based
-deps are deferred to a follow-up).
+the supported dependency forms (git sources such as
+`github.com/owner/repo@v1.0`, local paths), and `kai.lock`.
 
 Two on-CLI references travel with the binary:
 
@@ -262,15 +259,18 @@ stage2/          Self-hosted compiler in full kaikai (native libLLVM
                  backend, fmt, lsp, doc).
 stdlib/          Standard library in kaikai (core, math, effects,
                  collections).
-bin/             Shell driver (`kai build/run/test`).
-examples/minimal/  Canonical minimal examples used for regression.
-examples/phase4/   Small demos against stdlib.
-demos/           Pre-redesign sketches (do not compile today).
+stage2/runtime.h, stage2/runtime/
+                 The C runtime (Perceus RC, fibers, M:N scheduler,
+                 reactor), shared by both backends.
+tools/kai/       Source of the `kai` driver; `bin/kai` is the built
+                 binary. Other tools and CI gates live under `tools/`.
+examples/        Fixtures, one directory per area; `minimal/` and
+                 `phase4/` hold small runnable programs.
+demos/           Demo programs, gated by `make demos-no-regression`.
 docs/            Design docs and specs (see Documentation below).
-tests/           Reserved for future .kai-level test suites.
-runtime/         Reserved for the stage 2 runtime (Perceus, fibers).
-scripts/         Helper scripts (e.g. JSON-schema validation
-                 for typed-holes output).
+tests/           Shell tests of the driver and the formatter.
+scripts/         Release and helper scripts (release build, prebuilt
+                 libLLVM, JSON-schema validation).
 ```
 
 ## Documentation
@@ -325,10 +325,10 @@ issue in the official repository
 to discuss its validity with the team building the language and the standard
 packages — please do not start with a pull request for a new feature.
 
-kaikai is **pre-1.0 and unstable until the Orongo edition lands**: each
-edition pins a stable surface *within itself* (see [docs/editions.md](docs/editions.md)),
-but the project is still maturing, so treat the language and stdlib as
-unstable for building on top of. Pin your edition in `kai.toml`.
+kaikai is **pre-1.0 and unstable until the Orongo edition lands**: an
+edition is meant to pin a stable surface *within itself*, but breaking
+changes still land within Hanga Roa (see [docs/editions.md](docs/editions.md)),
+so treat the language and stdlib as unstable for building on top of.
 
 If your idea is a library, you can **build and publish your own package**
 and depend on it from `kai.toml` today — no change to kaikai required. That

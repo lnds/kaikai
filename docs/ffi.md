@@ -4,8 +4,8 @@ kaikai bridges to C through two distinct mechanisms:
 
 1. **Core primitives** — compiler-internal C bindings used by
    the standard library (libm, filesystem, process, time, …).
-   Wired in `stage0/runtime.h`, registered in the resolver as
-   globally-available identifiers. Users do not see them; the
+   Implemented in the runtime and declared with `extern "kai"`
+   in a core stdlib module, which makes them globally available. Users do not see them; the
    compiler-dev does. This is how `real_sqrt`, `read_file`,
    `int_to_string`, etc. reach C code.
 
@@ -25,14 +25,15 @@ Used by every stdlib module that needs to call C: `stdlib/math/real.kai`
 (libm), `stdlib/fs/file.kai` (POSIX file ops), `stdlib/os/process.kai`
 (fork/exec/wait), `stdlib/time.kai` (clock_gettime), and so on.
 Users never write `extern "C"` for these — the names are
-**globally available** because the resolver pre-loads them as
-core-level identifiers.
+**globally available** because the core modules that declare them
+load automatically.
 
 ### Mechanism
 
 Three pieces wire a core primitive end-to-end:
 
-1. **Runtime function** in `stage0/runtime.h`:
+1. **Runtime function** in `stage2/runtime.h` (the libm family lives
+   in `stage2/runtime/core_basic.h`):
 
    ```c
    static KaiValue *kai_core_real_sqrt(KaiValue *x) {
@@ -40,8 +41,9 @@ Three pieces wire a core primitive end-to-end:
    }
    ```
 
-2. **Thunk** registered in `stage0/runtime.h`'s core table so
-   the call site can dispatch:
+2. **Thunk** in the runtime, so the builtin can also travel as a
+   value (the native backend has its own `kaix_core_<name>` and
+   `kaix_<name>_thunk` in `stage0/runtime_llvm.c`):
 
    ```c
    static KaiValue *_kai_core_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n) {
@@ -50,18 +52,18 @@ Three pieces wire a core primitive end-to-end:
    }
    ```
 
-3. **Compiler entry** in `stage2/compiler.kai` registering the
-   identifier in the core environment with its `Ty` schema:
+3. **Declaration** in a core stdlib module
+   (`stdlib/math/numeric.kai` here), whose signature is the
+   builtin's type scheme. Only the core modules and `seq` may
+   declare one:
 
-   ```kai
-   TyEntry { name: "real_sqrt", scheme: mono(fn_ty([TyReal], TyReal)) }
-   EP("real_sqrt", "kai_core_real_sqrt", 1)
+   ```text
+   extern "kai"("kai_core_real_sqrt") pub fn real_sqrt(x: Real) : Real
    ```
 
-   Three locations to keep in sync: the core name list, the
-   type-environment entry (so the typer knows the schema), and
-   the EP (Emit-Core) record (so the C emit dispatches to the
-   right thunk).
+   `make test-kai-builtins` diffs every declaration against
+   `tools/kai-builtins.txt` and compiles each entry against both
+   runtimes (`docs/build-system.md`).
 
 ### libm bindings macro
 
@@ -75,10 +77,10 @@ KAI_LIBM_REAL2(pow,  pow)
 KAI_LIBM_REAL2(rem,  fmod)
 ```
 
-Each `KAI_LIBM_REAL1(name, c_fn)` expands into a thunk plus a
-core-table entry. Adding a new libm binding is a 3-line
-change in `stage0/runtime.h` plus the compiler-side core
-registration.
+Each `KAI_LIBM_REAL1(name, c_fn)` expands into the runtime
+function `kai_core_real_<name>`. Adding a new libm binding is a macro line in
+`stage2/runtime/core_basic.h`, its thunks, and the core
+declaration.
 
 ### When to add a core primitive
 
@@ -95,8 +97,9 @@ Do **not** add a core primitive when:
 
 - It's a third-party library (raylib, sqlite3) — that's
   user-facing FFI v1, the user declares the `extern "C"`.
-- The signature uses structs by value or out-parameters — neither
-  mechanism supports that today (see FFI v2 below).
+- The signature uses C structs by value or out-parameters — the
+  core ABI passes boxed kaikai values; bind such a function through
+  `extern "C"` (FFI v2 below) or a C shim.
 
 ### Examples in stdlib
 
@@ -122,13 +125,14 @@ How user code binds to an external C library it doesn't own.
 
 ### Quick reference
 
-```kai
-extern "C" fn libm_sqrt(x: Real) : Real / Ffi
-extern "C"("printf") pub fn c_printf(fmt: String) : Int / Ffi
+```kaikai
+extern "C" fn cbrt(x: Real) : Real / Ffi
+extern "C"("puts") pub fn c_puts(s: String) : I32 / Ffi
 
 fn main() : Unit / Ffi + Stdout = {
-  let r = libm_sqrt(2.0)
-  Stdout.print("sqrt(2) = #{real_to_string(r)}")
+  let r = cbrt(27.0)
+  Stdout.print("cbrt(27) = #{real_to_string(r)}")
+  let _ = c_puts("from C")
 }
 ```
 
@@ -148,8 +152,8 @@ Three things are happening:
    (see *The C shim pattern*).
 2. `extern "C"("symbol") pub fn name(args) : T / Ffi` overrides
    the C symbol when the kaikai-side identifier doesn't match
-   (e.g. wrapping `printf` as `c_printf` to avoid kai-side
-   keyword conflicts; issues #260 / #261).
+   (e.g. binding `puts` as `c_puts`, or avoiding a kaikai
+   keyword).
 3. The `Ffi` effect carries the capability. Any function that
    directly or transitively calls an `extern "C"` declaration
    has `Ffi` in its row. The handler is compiler-synthesised —
@@ -183,11 +187,11 @@ Three things are happening:
 
 #### Linking
 
-The C source you bind against compiles independently and links
-into the kaikai binary as a normal `.o` / `.a` / `.so`. The
-package manager does not automate C source compilation; the
-consumer's build (`Makefile`, shell script, etc.) must produce
-the C object before invoking `kai build`.
+The C source you bind against links into the kaikai binary as a
+normal `.o` / `.a` / `.so`. A package declares its C sources,
+include paths and libraries in a `[native]` table of `kai.toml`,
+so consumers build with plain `kai build`; outside a package, pass
+the C sources on `CFLAGS` (`kai info ffi`).
 
 ### FFI capability matrix
 
@@ -195,17 +199,17 @@ the C object before invoking `kai build`.
 | --- | --- | --- |
 | Scalars (`Int`/`Real`/`Bool`/`Char`/`String`/`Unit`) | **Shipped (v1)** | both backends |
 | Fixed-width types (`U8`..`F32`) | **Shipped (v2, #417)** | both backends |
-| Struct / record by value | **Shipped (v2, #417)** | C backend; native rejects with `--backend=c` hint |
-| Return-by-value of structs | **Shipped (v2, #417)** | C backend; native rejects with `--backend=c` hint |
+| Struct / record by value | **Shipped (v2, #417)** | both backends (native: AArch64 and x86-64 SysV) |
+| Return-by-value of structs | **Shipped (v2, #417)** | both backends (native: AArch64 and x86-64 SysV) |
 | Opaque pointers / handles | **Shipped (v2, #417)** | both backends; no-Drop ownership |
 | Out-parameters / pointer-to-T arguments | Not supported | model via opaque handle + accessor |
 | C unions | Not planned | — |
 | Variadic C functions (`printf` family) | Not planned | — |
-| Callbacks from C back into kaikai | Not planned | post-v2 |
+| Callbacks from C back into kaikai | **Shipped** | export a top-level function with `extern "C" fn … { }` and hand C its symbol; no closures |
 | Bitfields | Not planned | — |
 
 The C shim pattern below remains valid for what stays out of scope
-(unions, variadics, callbacks) and for the native backend's struct gap.
+(unions, variadics, bitfields).
 A struct shim `#include`s the generated `kai_ffi.h` (the struct
 `typedef`s) so it names the boundary types directly. For the common
 cases it is no longer needed — see
@@ -250,25 +254,25 @@ void kai_raylib_draw_circle_v(double cx, double cy,
 
 The kaikai-side declaration is then a flat call:
 
-```kai
+```kaikai
 extern "C"("kai_raylib_draw_circle_v")
 pub fn draw_circle_v(cx: Real, cy: Real,
                      radius: Real, rgba: Int) : Unit / Ffi
+
+fn main() : Int = 0
 ```
 
 #### Building the shim
 
-The shim is a regular C source file. It compiles with the host
-C compiler, linked into the kaikai binary as part of the
-consumer's build:
+The shim is a regular C source file. `kai build` compiles the
+`.c` sources listed on `CFLAGS` into the final link:
 
 ```sh
-cc -c -O2 raylib_shim.c -o raylib_shim.o
-cc kaikai_program.c raylib_shim.o -lraylib -o app
+CFLAGS="raylib_shim.c -lraylib" kai build app.kai -o app
 ```
 
-A real kaikai consumer typically wraps this in a `Makefile` or
-similar that runs alongside `kai build`. See
+In a package, the `[native]` table of `kai.toml` declares the
+shim and the library instead (`kai info packages`). See
 [`lnds/uira`](https://github.com/lnds/uira) for a complete
 working example: `uira/raylib.kai` (kaikai-side bindings) +
 `uira/raylib_shim.c` (the C shim) + `Makefile` (link
@@ -282,13 +286,9 @@ The shim approach works but has real costs:
   C shim wrapper. raylib has ~40 functions taking `Color` or
   `Vector2`; that's ~40 shim entries plus their forward
   declarations.
-- **Consumers must thread non-kaikai assets through their build**.
-  The package manager v1 (#405) ships `lib/` files cleanly via
-  `kai fetch` but does not automate C source. Documenting the
-  shim build as part of the package's README is the current
-  pattern (see uira's README).
-- **Future bindings** (SDL2, GLFW, libcurl, …) will hit the same
-  wall and need their own shim layer until FFI v2 lands.
+- **The shim is a C source the build must compile.** A package
+  declares it in the `[native]` table of `kai.toml`; outside a
+  package it rides `CFLAGS`.
 
 ## What FFI v2 adds (#417)
 
@@ -304,9 +304,9 @@ authoritative surface reference is `kai info ffi`.
 
 2. **Struct-by-value across the boundary** (incl. return-by-value):
 
-   ```kai
-   extern "C" type Color = { r: U8, g: U8, b: U8, a: U8 }
-   extern "C" type Vector2 = { x: F32, y: F32 }
+   ```kaikai
+   extern "C" pub type Color = { r: U8, g: U8, b: U8, a: U8 }
+   extern "C" pub type Vector2 = { x: F32, y: F32 }
 
    extern "C"("DrawCircleV")
    pub fn draw_circle_v(center: Vector2, radius: F32,
@@ -314,6 +314,8 @@ authoritative surface reference is `kai info ffi`.
 
    extern "C"("GetMousePosition")
    pub fn get_mouse_position() : Vector2 / Ffi
+
+   fn main() : Int = 0
    ```
 
    The shim unwraps the record's fields into a local C struct with the
@@ -334,18 +336,15 @@ authoritative surface reference is `kai info ffi`.
    explicitly. A handle threaded through many calls is never
    double-freed.
 
-> **Backend status.** Fixed-width, struct-by-value, and opaque all work
-> on the **C-direct backend** (`--backend=c`). On the **native**
-> (libLLVM) default backend, **scalars, fixed-width, and opaque handles**
-> are fully supported; **struct-by-value** is rejected with an actionable
-> message naming the function and the `--backend=c` fix — a small struct's
-> C ABI classification is frontend work LLVM does not derive from a struct
-> value. Native struct ABI classification is a planned follow-up.
+> **Backend status.** Fixed-width, struct-by-value, and opaque handles
+> work on both backends. The native (libLLVM) backend classifies each
+> aggregate for AArch64 and x86-64 SysV; a target the classifier does not
+> model gets an actionable `--backend=c` diagnostic naming the function.
 
 The raylib-style binding (small structs by value) and the libpq-style
 driver (opaque handles + strings) both stop needing hand-written C
 shims for the common case. C shims remain only for what stays out of
-scope: callbacks from C into kaikai, unions, variadics, bitfields.
+scope: unions, variadics, bitfields.
 
 ## Bindgen (post-FFI-v2)
 

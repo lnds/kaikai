@@ -1,9 +1,9 @@
 # LSP smoke fixtures
 
-These fixtures drive `kai lsp` (issue #447) through scripted JSON-RPC
-sessions. Each `.kai` file is a tiny program the LSP would see in
-`textDocument/didOpen`; the matching `.lsp.py` driver script issues
-the request sequence and asserts on the responses.
+These fixtures drive `kai lsp` through scripted JSON-RPC sessions. Each
+`.lsp.py` driver opens a tiny program in `textDocument/didOpen` (inline
+in the script, or `hover_basic.kai` for the hover driver), issues the
+request sequence and asserts on the responses.
 
 Run with:
 

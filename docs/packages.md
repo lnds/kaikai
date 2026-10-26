@@ -482,7 +482,7 @@ declare their own manifest
 When a package is named `notes` in `kai.toml`, a file inside the
 package can write either form:
 
-```kai
+```text
 import store          # bare — resolves against the manifest dir
 import notes.store    # qualified — resolves against the parent dir
                       # via the existing dotted-path rule (a.b -> a/b.kai)

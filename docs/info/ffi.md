@@ -10,7 +10,7 @@ in its effect row. C reaches kaikai through an `extern "C" fn` with a body
 (*Exporting kaikai functions to C*, below). There is one ABI (`"C"`); the symbol the linker
 binds is the kaikai identifier, or an explicit override.
 
-```text
+```kaikai-fragment
 extern "C" fn cos(x: Real) : Real / Ffi             # binds C `cos`
 extern "C"("DrawCircleV") pub fn draw(c: Real) : Unit / Ffi   # override
 ```
@@ -51,7 +51,7 @@ literals and feeds arithmetic. The shim C-casts at the call (no
 range-check — exactly C's own truncation). There is no `U8 + U8` in
 kaikai-land; the wider numeric-primitive question is separate.
 
-```text
+```kaikai-fragment
 extern "C"("SetVolume") fn set_volume(level: U8) : Unit / Ffi
 ```
 
@@ -64,7 +64,7 @@ type, or a nested `extern "C" type`) — `Int`/`Real`/`String` are
 rejected as struct fields, because an `int64_t`/`double`/pointer field
 breaks the small-struct layout the C compiler lays out.
 
-```text
+```kaikai-fragment
 extern "C" pub type Color = { r: U8, g: U8, b: U8, a: U8 }
 extern "C" pub type Vector2 = { x: F32, y: F32 }
 
@@ -137,7 +137,7 @@ never inspects — the database / socket-driver case (`PGconn *`,
 `PGresult *`). Backed by a reference-counted box that parks the C
 `void *`.
 
-```text
+```kaikai-fragment
 extern "C" opaque Conn
 
 extern "C"("PQconnectdb") fn connect(s: String) : Conn / Ffi
@@ -163,7 +163,7 @@ later destroyed.
 C ABI, so C can call it or take its address (`qsort`, iterators, webview
 bindings). Without a body it imports a C function, as above.
 
-```text
+```kaikai-fragment
 extern "C" fn on_save(id: Int, req: String) : Unit / Stdout =
   Stdout.print("saving #{id}: #{req}")
 extern "C"("app_cmp") pub fn cmp(a: Int, b: Int) : Int = a - b   # symbol named
@@ -176,7 +176,7 @@ Rules, all checked at compile time:
 - Top-level functions only — no closures, no type parameters.
 - The row is closed and lists only effects with a default handler
   (`Stdout`, `Stderr`, `Clock`, `Random`, `Log`, `Spawn`, ...). C calls
-  with no `handle` on the stack, so `State`, `Abort`, a user effect or an
+  with no `handle` on the stack, so `State`, a user effect or an
   open row is an error at the declaration naming the effect. `Ffi` is
   not required: the body is kaikai code.
 - Boundary types are the import ones minus two: a `String` is accepted
@@ -209,7 +209,7 @@ The exported function receives the handle and reads the value back with
 actors: park the owner's `Pid` and forward from the callback with
 `mailbox_send(pid, msg)`.
 
-```text
+```kaikai
 import ffi
 
 type Msg = Tick(Int) | Done
@@ -218,6 +218,8 @@ extern "C" fn on_event(ud: Userdata, n: Int) : Unit = {
   let pid: Pid[Msg] = take_userdata(ud)
   mailbox_send(pid, if n < 0 { Done } else { Tick(n) })
 }
+
+fn main() : Int = 0
 ```
 
 `take_userdata[T]` trusts `T` to be the type the handle was retained at.
@@ -228,7 +230,7 @@ extern "C" fn on_event(ud: Userdata, n: Int) : Unit = {
 `wasm32-browser` target. Its capability is `Js`, not `Ffi`: the row MUST
 carry `/ Js`. The path is mandatory.
 
-```text
+```kaikai-fragment
 extern "js"("console.log")     fn log(s: String) : Unit / Js
 extern "js"("document.title=") fn set_title(s: String) : Unit / Js
 extern "js"("document.title")  fn title() : String / Js

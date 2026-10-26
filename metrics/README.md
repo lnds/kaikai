@@ -24,13 +24,8 @@ not a strict-schema warehouse.
 section from each, prefixes each row with the lane name, and writes
 `build-history.tsv`.
 
-Re-run after each lane merge to keep the history current. The lane brief
-template should append a step at the end:
-
-```bash
-# After committing the lane experience doc, refresh the aggregate:
-cd /path/to/kaikai && ./metrics/regen.sh && git add metrics/build-history.tsv
-```
+Lane retros are no longer written, so the dataset is historical; re-running
+`regen.sh` rebuilds the same file from the retros that exist.
 
 If a row is missing, the lane retro probably lacks a properly-formatted
 `## Build TSV` section. Add the section in the retro and re-run.
@@ -62,7 +57,7 @@ awk -F'\t' 'NR>1 {c[$1]++} END {for (l in c) print c[l] "\t" l}' \
 
 ## Caveats
 
-- Lanes pre-2026-05 have varying schemas (`make test` vs `tier1`, etc.).
+- Early lanes have varying schemas (`make test` vs `tier1`, etc.).
   Filter by lane name pattern when comparing apples to apples.
 - `elapsed_s = -` rows do not contribute to time analysis. About a third
   of historic rows lack a numeric elapsed.
