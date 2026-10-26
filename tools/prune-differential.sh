@@ -7,7 +7,7 @@
 # key the knob; the pruned variant runs twice so the second compile sees a
 # warm core cache and prunes.
 #
-#   prune-differential.sh [--backend c|native] [--jobs N] corpus|combos|combos-subset
+#   prune-differential.sh [--backend c|native] [--jobs N] [--shard I/N] corpus|combos|combos-subset
 #   prune-differential.sh --one <backend> <mode> <file>     (mode: run|test|cover)
 #
 # corpus        every examples/**/*.kai with an .out.expected, run (and test
@@ -77,11 +77,12 @@ one() {
 
 if [ "${1:-}" = "--one" ]; then shift; one "$@"; fi
 
-BACKENDS="c native"; JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+SHARD=""; BACKENDS="c native"; JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 while [ $# -gt 1 ]; do
   case $1 in
     --backend) BACKENDS=$2; shift 2 ;;
     --jobs) JOBS=$2; shift 2 ;;
+    --shard) SHARD=$2; shift 2 ;;
     *) break ;;
   esac
 done
@@ -108,6 +109,9 @@ case $SET in
   *) echo "unknown set $SET" >&2; exit 2 ;;
 esac
 
+if [ -n "$SHARD" ]; then
+  awk -v i="${SHARD%/*}" -v n="${SHARD#*/}" '(NR - i) % n == 0' "$LIST" > "$LIST.shard" && mv "$LIST.shard" "$LIST"
+fi
 TOTAL=$(wc -l < "$LIST"); FAILS=$(mktemp "${TMPDIR:-/tmp}/prunediff-fails.XXXXXX")
 for be in $BACKENDS; do
   while read -r mode file; do printf '%s\0%s\0%s\0' "$be" "$mode" "$file"; done < "$LIST" \
