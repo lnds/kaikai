@@ -105,4 +105,9 @@ fi
 # 8. `deltas` exists (the prior-collision card the llm topic points at).
 "$KAI" info deltas >/dev/null 2>&1 || fail "'kai info deltas' must exist; 'kai info llm' cites it"
 
+# 9. The syntax page's reserved words are exactly the lexer's keywords.
+lex_kw="$(grep -o '\(kw\|kw_or_ident\)(src, start, n, "[a-z]*"' "$ROOT/stage2/compiler/lex.kai" | sed 's/.*"\(.*\)"/\1/' | sort -u | tr '\n' ' ')"
+doc_kw="$(awk '/^## Reserved words/{s=1} s&&/^```text/{r=1;next} r&&/^```/{exit} r' "$ROOT/docs/info/syntax.md" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')"
+[ "$lex_kw" = "$doc_kw" ] || fail "reserved words in docs/info/syntax.md differ from keyword_at in lex.kai: lexer=[$lex_kw] doc=[$doc_kw]"
+
 echo "test-info: OK — $count topics, plain + JSON output, -k body search, --section"
