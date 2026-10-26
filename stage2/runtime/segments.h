@@ -670,7 +670,7 @@ static void *kai_evidence_lookup_l(const char *eff_label) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
-        if (!node->named && kai_eff_match(node->eff_label, eff_label)) {
+        if (kai_eff_match(node->eff_label, eff_label)) {
             return node->handler;
         }
         node = node->parent;
