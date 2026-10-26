@@ -31,6 +31,9 @@
 #   # fixture: target=<name>  compile for that target (`--target=<name>`)
 #   # fixture: threads=<n>    run with KAI_THREADS=<n> (output that depends on one scheduler thread)
 #
+# A positive fixture may carry `<name>.warn.expected` (C) or `<name>.warn-native.expected` (native):
+# every line of it must appear in the compiler's stderr, so a warning is pinned like an output.
+#
 # FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
 # through the kai wrapper named by FIXTURE_KAI, which owns the stdlib path and
 # the link, and supports no marks.
@@ -142,12 +145,20 @@ run_one() {
     "./$b" > "$b.out" 2>&1 \
       || { echo "$slug FAIL $name (test run failed)"; cat "$b.out"; exit 1; }
   else
-    $KAIC2 $TEST_CORE_CACHE $path $tflag "$f" > "$b.c" \
+    $KAIC2 $TEST_CORE_CACHE $path $tflag "$f" > "$b.c" 2> "$b.err" \
       || { echo "$slug FAIL $name (kaic2 errored)"; exit 1; }
     eval "$CC $CFLAGS $CPPFLAGS_CORE -I ../stage0 $b.c -o $b $LDFLAGS_STACK $LDLIBS_M" \
       || { echo "$slug FAIL $name (C compile failed)"; exit 1; }
     "./$b" > "$b.out" \
       || { echo "$slug FAIL $name (run errored)"; cat "$b.out"; exit 1; }
+  fi
+  wf="$dir/$name.warn.expected"
+  [ "$BACKEND" = native ] && wf="$dir/$name.warn-native.expected"
+  if [ -f "$wf" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      grep -qF -- "$line" "$b.err" \
+        || { echo "$slug FAIL $name (missing warning: $line)"; cat "$b.err"; exit 1; }
+    done < "$wf"
   fi
   if [ -f "$exp_out" ]; then
     diff -q "$exp_out" "$b.out" > /dev/null \
