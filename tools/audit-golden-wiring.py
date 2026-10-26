@@ -5,6 +5,7 @@ A golden (`*.expected`, `*.forbidden`) under examples/, demos/ or tests/ is
 consumed when a harness reads it:
   - the directory has a FIXTURES manifest and the golden is `<name>.out.expected`,
     `<name>.err.expected`, `<name>.warn.expected` or `<name>.warn-native.expected` beside `<name>.kai` (tools/fixture-dir.sh);
+  - a row of stage2/gate-variants.txt names `<name>.kai` and the golden is its `<name>.out.expected` (tools/fixture-gate.sh);
   - a harness source names the golden's path or file name; or
   - a harness source mentions the golden's suffix within WINDOW lines of a
     mention of its directory (a glob or loop that reads the suffix there).
@@ -30,6 +31,7 @@ os.chdir(ROOT)
 WINDOW = 15
 ALLOWLIST = "tools/golden-wiring-allowlist.txt"
 ROOT_MAKEFILES = ("Makefile", "stage2/Makefile", "stage2/test-registry.txt")
+GATE_ROWS = "stage2/gate-variants.txt"
 GOLDEN_RE = re.compile(r"\.(expected|forbidden)$")
 SUFFIX_RE = re.compile(r"^(.*?)(\.[a-z_-]+\.(?:expected|forbidden))$")
 
@@ -104,6 +106,18 @@ class Corpus:
         return False
 
 
+def gate_fixtures():
+    out = set()
+    for raw in open(GATE_ROWS):
+        parts = raw.split()
+        if parts and not parts[0].startswith("#") and len(parts) > 2:
+            out.update(parts[2].split(","))
+    return out
+
+
+GATE_FIXTURES = gate_fixtures()
+
+
 def golden_consumed(g, corpus):
     d, b = os.path.dirname(g), os.path.basename(g)
     m = SUFFIX_RE.match(b)
@@ -112,6 +126,8 @@ def golden_consumed(g, corpus):
     stem, suffix = m.group(1), m.group(2)
     if (os.path.exists(d + "/FIXTURES") and suffix in (".out.expected", ".err.expected", ".warn.expected", ".warn-native.expected")
             and os.path.exists(f"{d}/{stem}.kai")):
+        return True
+    if suffix == ".out.expected" and f"{d}/{stem}.kai" in GATE_FIXTURES:
         return True
     if corpus.names(g) or corpus.names(b):
         return True

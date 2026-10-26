@@ -82,7 +82,7 @@ mn_adjudicate() {
 }
 
 # One (fixture, backend) pair across every requested thread count. A
-# fixture with a declared thread pin (kai_corpus_pinned_threads) is
+# fixture with a declared thread pin (kai_corpus_meta KAI_THREADS) is
 # measured at the pin on every arm — still fully gated for crash / hang /
 # self-reproduction, but never asked to reproduce above its pin.
 mn_measure_pair() {
@@ -90,7 +90,7 @@ mn_measure_pair() {
   MN_JUDGED=0
   MN_DRIVER="$(mn_driver_of "$fixture")"
 
-  pin="$(kai_corpus_pinned_threads "$fixture")" || pin=""
+  pin="$(kai_corpus_meta "$fixture" KAI_THREADS)" || pin=""
   [ -z "$pin" ] || printf '%s [%s] — pinned to KAI_THREADS=%s by its env file\n' \
     "$fixture" "$backend" "$pin" >> "$pinned"
 

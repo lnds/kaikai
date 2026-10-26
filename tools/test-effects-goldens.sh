@@ -38,7 +38,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAI="$ROOT/bin/kai"
 
-# kai_corpus_pinned_threads: fixtures whose documented property IS the
+# kai_corpus_meta KAI_THREADS: fixtures whose documented property IS the
 # one-thread cooperative rotation pin KAI_THREADS=1 in a sibling .env;
 # every corpus harness runs them at the pin.
 . "$ROOT/tools/lib/corpus.sh"
@@ -105,7 +105,7 @@ check_contract() {
   want_rc=0
   [ -f "$base.status.expected" ] && want_rc="$(tr -d '[:space:]' < "$base.status.expected")"
 
-  nopt="$(kai_corpus_native_opt "$f")" || nopt=""
+  nopt="$(kai_corpus_meta "$f" KAI_NATIVE_OPT)" || nopt=""
   if ! env ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0 "$KAI" build "$f" -o "$bin" >"$tmp/${slug}.build.log" 2>&1; then
     tail -10 "$tmp/${slug}.build.log" > "$detail"
     echo "$f — $TARGET_BACKEND build failed:"
@@ -126,7 +126,7 @@ check_contract() {
   fi
 
   local pin
-  pin="$(kai_corpus_pinned_threads "$f")" || pin=""
+  pin="$(kai_corpus_meta "$f" KAI_THREADS)" || pin=""
   rc=0
   # $driver word-splits on purpose: it carries optional args (--sig …).
   run_with_timeout env ${pin:+KAI_THREADS="$pin"} KAI_TRACE_PARK=1 $driver "$bin" \
@@ -219,7 +219,7 @@ if ls "$FIXDIR"/*.driver >/dev/null 2>&1; then
   }
 fi
 
-export -f process_one check_contract run_with_timeout report_fail kai_corpus_pinned_threads kai_corpus_native_opt
+export -f process_one check_contract run_with_timeout report_fail kai_corpus_meta
 export tmp results failures SKIPS KAI TARGET_BACKEND TIMEOUT_CMD RUN_TIMEOUT SIGHARNESS_BIN
 
 find "$FIXDIR" -name '*.out.expected' -o -name '*.out.sorted.expected' | while read -r g; do
