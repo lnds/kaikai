@@ -281,9 +281,6 @@ struct KaiEvidence {
      * one was pushed (1 = `parent`); 0 for none. An exit through this node
      * lands back inside that clause. */
     uint8_t      disp_hops;
-    /* Bound with `as`: reachable through its name only, so a bare-name walk
-     * passes over it. */
-    uint8_t      named;
     /* The fiber's unwind-stack height when the node was pushed: what lies
      * above it belongs to frames an exit through this node discards. */
     uint32_t     unw_mark;
@@ -460,7 +457,6 @@ static void kai_evidence_push_l(KaiEvidence *node, const char *eff_label, void *
     node->cleanup_done = 0;
     node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
-    node->named        = 0;
     node->rc           = INT32_MAX;
     node->tag          = KAI_UNIT;
     f->evidence_top    = node;
@@ -480,7 +476,6 @@ static void kai_evidence_init_default_l(KaiEvidence *node, const char *eff_label
     node->cleanup_done = 0;
     node->disp_hops    = 0;
     node->unw_mark     = 0;
-    node->named        = 0;
     node->rc           = INT32_MAX;
     node->tag          = KAI_UNIT;
 }
@@ -504,18 +499,9 @@ static void kai_evidence_push_with_jmp_l(KaiEvidence *node, const char *eff_labe
     node->cleanup_done = 0;
     node->disp_hops    = kai_disp_hops(f);
     node->unw_mark     = f->unw_top;
-    node->named        = 0;
     node->rc           = INT32_MAX;
     node->tag          = KAI_UNIT;
     f->evidence_top    = node;
-}
-
-/* Mark a pushed node as an `as`-bound instance. State and Reader cells are
- * addressed by handler id and keep resolving by name. */
-static void kai_evidence_mark_named(KaiEvidence *node) {
-    const char *base = kai_eff_base(node->eff_label);
-    if (base == KAI_EFF("State") || base == KAI_EFF("Reader")) return;
-    node->named = 1;
 }
 
 /* Arm a pushed node's `finally`. Separate from the push so the common
@@ -607,7 +593,7 @@ static KaiEvidence *kai_ev_find(KaiEvidence *n, KaiEvidence *stop, const char *e
             continue;
         }
         if (cur != NULL && kai_disp_at_push(n) != cur) continue;
-        if (!n->named && kai_eff_match(n->eff_label, eff_label)) return n;
+        if (kai_eff_match(n->eff_label, eff_label)) return n;
     }
     return NULL;
 }
