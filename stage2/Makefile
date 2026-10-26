@@ -33,9 +33,9 @@ ifeq ($(TIMEOUT),)
 TIMEOUT := $(abspath $(CURDIR)/../tools/lib/timeout.sh)
 endif
 
-# `kai test` and `kai check` compile before they run, so the budget covers a cold build.
+# `kai test` and `kai check` compile before they run: the budget bounds that compile plus the run.
 KAI_BOUNDED := $(abspath $(CURDIR)/../tools/kai-bounded.sh)
-KAI_BUILD_RUN_BUDGET ?= 300
+KAI_BUILD_RUN_BUDGET ?= 60
 
 # C++ runtime for the native (libLLVM) link. LLVM is C++, so the static
 # link needs the C++ runtime explicitly (`cc` does not add it). The library
@@ -14161,13 +14161,17 @@ SHARDS ?= 1
 TIER1_LIGHT_PLAN = ../tools/tier1-light-plan.sh
 TIER1_SELFHOSTS ?= 1
 # The optimisation level the slice's fixtures are compiled at; the slice's
-# own prerequisites keep $(CFLAGS).
+# own prerequisites keep $(CFLAGS). A warm-up build at that level runs untimed
+# first, so a target's timeout never absorbs the slice's cold build.
 LIGHT_OPT ?= -O2
 LIGHT_CFLAGS = $(patsubst -O2,$(LIGHT_OPT),$(CFLAGS))
 test-light-shard: $(TARGET) bin-kai build core-cache-warm
 	@slice=$$(TIER1_SELFHOSTS=$(TIER1_SELFHOSTS) sh $(TIER1_LIGHT_PLAN) $(SHARD) $(SHARDS) $(TEST_LIGHT_TARGETS)) || exit 1; \
 	echo "test-light-shard $(SHARD)/$(SHARDS): $$(echo $$slice | wc -w | tr -d ' ') targets"; \
 	start=$$(date +%s); rc=0; \
+	[ -z "$$slice" ] || { printf 'test "warm" {\n  assert true\n}\n' > build/light-warm.kai; \
+	  CFLAGS='$(LIGHT_CFLAGS)' ../bin/kai test --backend=c build/light-warm.kai > build/light-warm.out 2>&1 \
+	  || { echo "light-warm FAIL"; cat build/light-warm.out; exit 1; }; }; \
 	[ -z "$$slice" ] || $(MAKE) -j$(TEST_JOBS) CFLAGS='$(LIGHT_CFLAGS)' $$(printf ' tier1-light-timed-%s' $$slice) || rc=$$?; \
 	echo "tier1-light-slice $(SHARD) $$(( $$(date +%s) - start ))"; \
 	exit $$rc
