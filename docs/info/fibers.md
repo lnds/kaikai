@@ -170,6 +170,20 @@ KAI_THREADS=1 ./my_program
   driven straight from `main` at any N — see `kai info ffi`. Spawned
   fibers migrate freely; only the entry fiber carries the pin.
 
+## `main`'s stack — `KAI_MAIN_STACK_SIZE`
+
+`main` has one stack budget at every `KAI_THREADS`, on every host,
+whatever `ulimit -s` says: 32 MiB. It is a reserved, guard-paged stack
+the runtime allocates itself, so overflowing it prints `fiber stack
+overflow` and exits non-zero at any thread count. Set
+`KAI_MAIN_STACK_SIZE` (bytes, at least 1 MiB) to override it at run time:
+
+```sh
+KAI_MAIN_STACK_SIZE=8388608 ./my_program
+```
+
+Spawned fibers have their own, much smaller stacks (`KAI_FIBER_STACK_SIZE`).
+
 ## Mutable state and fibers
 
 Each fiber owns a private heap. A value a spawned thunk captures is
