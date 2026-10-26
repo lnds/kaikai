@@ -26,7 +26,6 @@ KaiValue * kaix_core_llvm_add_sret_call(void *m, void *call, void *sty) { return
 KaiValue * kaix_core_llvm_add_sret_decl(void *m, void *fn, void *sty) { return kai_llvm_add_sret_decl(m, fn, sty); }
 KaiValue * kaix_core_llvm_add_nounwind(void *fn) { return kai_llvm_add_nounwind(fn); }
 KaiValue * kaix_core_llvm_add_memory_none(void *fn) { return kai_llvm_add_memory_none(fn); }
-KaiValue * kaix_core_llvm_mark_tail_fn(void *fn) { return kai_llvm_mark_tail_fn(fn); }
 int64_t kaix_core_llvm_set_musttail(void *call) { return kai_llvm_set_musttail(call); }
 KaiValue * kaix_core_llvm_set_internal_linkage(void *fn) { return kai_llvm_set_internal_linkage(fn); }
 void * kaix_core_llvm_append_block(void *m, void *fn, KaiValue *name) { return kai_llvm_append_block(m, fn, name); }
