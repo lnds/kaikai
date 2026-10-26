@@ -106,7 +106,7 @@ run_one() {
   esac
 
   if [ "$(sed -n 's/^opt: //p' "$dir/FIXTURES")" = 0 ]; then
-    CFLAGS="$CFLAGS -O0"
+    CFLAGS="${CFLAGS:-} -O0"
     export KAI_NATIVE_OPT=0
   fi
 
