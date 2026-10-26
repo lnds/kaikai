@@ -1,5 +1,6 @@
 #[doc("""
-Which parameters of a function reach a spawned fiber.
+Which parameters of a function reach a spawned fiber, read from one walk of each
+function that also feeds the spawn-boundary check.
 
 A child fiber does not see the handlers around its spawner, so an
 effect a function runs in a child on its caller's behalf is covered only
@@ -18,11 +19,49 @@ import compiler.handler_alias
 import compiler.spawn_capture
 import compiler.spawn_param
 
-type LetBind = LB(LocalId, Expr)
+#[doc("A local bound to an expression.")]
+pub type LetBind = LB(LocalId, Expr)
 
-#[doc("The reaching parameters of every function in `decls`, given those already known for the functions they call.")]
-pub fn spawn_params_of(decls: [Decl], known: [SpawnParam]) : [SpawnParam] =
-  spawn_params_fix(fn_decls(decls, []), known, [])
+#[doc("What one function does at the spawn boundary: its declaration, the calls that start a fiber, the other calls into a function, and the locals it binds.")]
+pub type SpawnFacts = SF(Decl, [Expr], [Expr], [LetBind])
+
+type FactAcc = FA([Expr], [Expr], [LetBind])
+
+#[doc("The spawn facts of every function in `decls`, each read in a single walk.")]
+pub fn spawn_facts_of(decls: [Decl]) : [SpawnFacts] = map(fn_decls(decls, []), spawn_facts)
+
+fn spawn_facts(d: Decl) : SpawnFacts = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> match collect_facts(body, FA([], [], [])) {
+    FA(sp, cs, ls) -> SF(d, list_reverse(sp), list_reverse(cs), ls)
+  }
+  _ -> SF(d, [], [], [])
+}
+
+fn collect_facts(e: Expr, a: FactAcc) : FactAcc =
+  foldl(xp_positions(e), fact_here(e, a), (x, p) => match p { XP(_, c) -> collect_facts(c, x) })
+
+fn fact_here(e: Expr, a: FactAcc) : FactAcc = match a {
+  FA(sp, cs, ls) -> match e.kind {
+    ECall(callee, _) -> if callee_is_spawn(callee) { FA([e, ...sp], cs, ls) } else { fact_call(e, a) }
+    EPipe(_, _)      -> fact_call(e, a)
+    EBlock(stmts, _) -> FA(sp, cs, foldl(stmts, ls, (l, s) => match s {
+      SLet(pat, _, rhs) -> match pat.pkind { PBind(b) -> [LB(b.id, rhs), ...l]  _ -> l }
+      _                 -> l
+    }))
+    _ -> a
+  }
+}
+
+fn fact_call(e: Expr, a: FactAcc) : FactAcc = match a {
+  FA(sp, cs, ls) -> match call_target(e) {
+    Some(_) -> FA(sp, [e, ...cs], ls)
+    None    -> a
+  }
+}
+
+#[doc("The reaching parameters of every function in `facts`, given those already known for the functions they call.")]
+pub fn spawn_params_from(facts: [SpawnFacts], known: [SpawnParam]) : [SpawnParam] =
+  spawn_params_fix(facts, known, [])
 
 #[doc("The entries of `table` that belong to functions declared in `decls`.")]
 pub fn spawn_params_in(table: [SpawnParam], decls: [Decl]) : [SpawnParam] = {
@@ -78,21 +117,29 @@ fn fn_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
   }
 }
 
-fn spawn_params_fix(fns: [Decl], known: [SpawnParam], prev: [SpawnParam]) : [SpawnParam] = {
+fn spawn_params_fix(facts: [SpawnFacts], known: [SpawnParam], prev: [SpawnParam]) : [SpawnParam] = {
   let table = list_append(prev, known)
-  let next = filter(map(fns, (d) => fn_spawn_params(table, d)), (m) => match m { SPm(_, ps) -> not list_is_empty(ps) })
-  if spawn_params_size(next) == spawn_params_size(prev) { next } else { spawn_params_fix(fns, known, next) }
+  let next = filter(map(facts, (f) => fn_spawn_params(table, f)), (m) => match m { SPm(_, ps) -> not list_is_empty(ps) })
+  if spawn_params_size(next) == spawn_params_size(prev) { next } else { spawn_params_fix(facts, known, next) }
 }
 
 fn spawn_params_size(t: [SpawnParam]) : Int = foldl(t, 0, (n, m) => match m { SPm(_, ps) -> n + list_length(ps) })
 
-fn fn_spawn_params(table: [SpawnParam], d: Decl) : SpawnParam = match d {
-  DFn(_, fid, _, params, _, _, body, _, _, _) -> {
-    let sinks = reaching_exprs(table, body, [])
-    if list_is_empty(sinks) { SPm(fnid_sym(fid), []) }
-    else { SPm(fnid_sym(fid), reaching_params(params, sinks, body_lets(body, []), 0, [])) }
+fn fn_spawn_params(table: [SpawnParam], f: SpawnFacts) : SpawnParam = match f {
+  SF(d, sp, cs, lets) -> match d {
+    DFn(_, fid, _, params, _, _, _, _, _, _) -> {
+      let sinks = list_append(foldl(sp, [], (a, e) => list_append(spawn_thunk_of(e), a)),
+                              foldl(cs, [], (a, e) => list_append(marked_args(table, e), a)))
+      if list_is_empty(sinks) { SPm(fnid_sym(fid), []) }
+      else { SPm(fnid_sym(fid), reaching_params(params, sinks, lets, 0, [])) }
+    }
+    _ -> SPm(sym_none(), [])
   }
-  _ -> SPm(sym_none(), [])
+}
+
+fn spawn_thunk_of(e: Expr) : [Expr] = match e.kind {
+  ECall(_, args_) -> last_arg(args_)
+  _               -> []
 }
 
 fn reaching_params(params: [Param], sinks: [Expr], lets: [LetBind], i: Int, acc: [Int]) : [Int] = match params {
@@ -109,28 +156,6 @@ fn reads_through(l: LocalId, e: Expr, lets: [LetBind]) : Bool =
 
 fn lets_without(lets: [LetBind], x: LocalId) : [LetBind] =
   filter(lets, (b) => match b { LB(y, _) -> not local_eq(x, y) })
-
-fn body_lets(e: Expr, acc: [LetBind]) : [LetBind] = {
-  let here = match e.kind {
-    EBlock(stmts, _) -> foldl(stmts, acc, (a, s) => match s {
-      SLet(pat, _, rhs) -> match pat.pkind { PBind(b) -> [LB(b.id, rhs), ...a]  _ -> a }
-      _                 -> a
-    })
-    _ -> acc
-  }
-  foldl(xp_positions(e), here, (a, p) => match p { XP(_, c) -> body_lets(c, a) })
-}
-
-fn reaching_exprs(table: [SpawnParam], e: Expr, acc: [Expr]) : [Expr] = {
-  let here = list_append(sink_exprs(table, e), acc)
-  foldl(xp_positions(e), here, (a, p) => match p { XP(_, c) -> reaching_exprs(table, c, a) })
-}
-
-fn sink_exprs(table: [SpawnParam], e: Expr) : [Expr] = match e.kind {
-  ECall(callee, args_) ->
-    if callee_is_spawn(callee) { last_arg(args_) } else { marked_args(table, e) }
-  _ -> marked_args(table, e)
-}
 
 fn marked_args(table: [SpawnParam], e: Expr) : [Expr] =
   if list_is_empty(table) { [] }
