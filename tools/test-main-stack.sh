@@ -28,4 +28,4 @@ for n in 1 8; do
       || { echo "main-stack FAIL ($backend, KAI_THREADS=$n, ulimit -s $limit: overflow not diagnosed, exit=$rc)"; cat "$work/overflow.err"; exit 1; }
   done
 done
-echo "main-stack OK ($backend: 200K deep completes, 3M deep diagnosed, at 1 and 8 threads)"
+echo "main-stack OK ($backend: 50K deep completes, 3M deep diagnosed, at 1 and 8 threads)"
