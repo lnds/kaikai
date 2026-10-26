@@ -407,6 +407,15 @@ item; `#[doc(hidden)]` / `alias` / `since` forms do not exist yet
 (post-1.0). Doc text is extracted by `kai info builtins --json`,
 `kaic2 --doc-json`, and rides typed-hole reports (`--holes-json`).
 
+## Reserved words
+
+These words cannot name a function, binding, parameter, field or
+effect operation; the parser rejects them with a "reserved word" error.
+
+```text
+and as assert axiom bench case check const effect else ensures extern false fn for handle if impl import lazy let match not or priv protocol pub requires test theory true type use var when where with
+```
+
 ## Bindings
 
 ```kaikai
