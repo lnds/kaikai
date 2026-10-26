@@ -115,29 +115,35 @@ static int64_t try_jobserver(void) {
     return -1;
 }
 
+#define SLOT_NONE (-1)
+#define SLOT_UNAVAILABLE (-2)
+
 static int64_t try_flock(const char *dir, int64_t n) {
     mkdir(dir, 0755);
+    int64_t lockable = 0;
     for (int64_t i = 0; i < n; i++) {
         char path[1100];
         snprintf(path, sizeof(path), "%s/slot-%lld", dir, (long long) i);
         int f = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (f < 0) continue;
         if (flock(f, LOCK_EX | LOCK_NB) == 0) return record(f, 0);
+        if (errno == EWOULDBLOCK) lockable++;
         close(f);
     }
-    return -1;
+    return lockable ? SLOT_NONE : SLOT_UNAVAILABLE;
 }
 
-/* A slot handle (>= 0), or -1 when none is free right now. */
+/* A slot handle (>= 0), -1 when every slot is held, -2 when no slot can be locked (read-only dir). */
 int64_t kaicli_slot_try(const char *dir, int64_t n) {
     return jobserver() ? try_jobserver() : try_flock(dir, n);
 }
 
-/* Waits for a slot; call only when holding none. */
+/* Waits for a slot; call only when holding none. A negative result means build without one. */
 int64_t kaicli_slot_wait(const char *dir, int64_t n) {
     for (;;) {
         int64_t h = kaicli_slot_try(dir, n);
         if (h >= 0) return h;
+        if (h == SLOT_UNAVAILABLE) return h;
         struct timespec ts = { 0, 25 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
