@@ -84,6 +84,21 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.179.0 (2026-10-26)
+
+### Added
+
+- **native**: prims to give tail-call functions the tail calling convention
+
+### Fixed
+
+- **ci**: warm the native test core too when kaic2 has the native backend
+- **ci**: warm the light shard's caches at its opt level before the timed targets
+- **ci**: budget a cold build in the kai test targets and name a timeout in the log
+- **ci**: let the daily failure alarm file its issue without a checkout
+- **cli**: build without a slot when the jobs directory cannot be locked
+- **parse**: name a reserved word written where a field, function or operation name is expected
+
 ## v0.178.0 (2026-10-25)
 
 ### BREAKING CHANGE
