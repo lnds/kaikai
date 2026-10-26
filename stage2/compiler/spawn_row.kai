@@ -29,38 +29,49 @@ import compiler.symtab
 import compiler.diag
 import compiler.diag_file
 import compiler.spawn_capture
+import compiler.spawn_cross
 import compiler.core_types
 
 #[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports; `carriers` are the types whose capture is a mutation the child cannot share.")]
-pub fn check_spawn_rows(df: DiagFiles, tab: SymTab, carriers: [SymId], mod_decls: [Decl],
-                         all_decls: [Decl]) : [Diagnostic] / Console + File =
-  check_spawn_rows_loop(df, tab, carriers, all_decls, mod_decls, [])
+pub fn check_spawn_rows(df: DiagFiles, tab: SymTab, carriers: [SymId], crossing: [SpawnParam],
+                         mod_decls: [Decl], all_decls: [Decl]) : [Diagnostic] / Console + File =
+  check_spawn_rows_loop(df, tab, carriers, crossing, all_decls, mod_decls, [])
 
 
-fn check_spawn_rows_loop(df: DiagFiles, tab: SymTab, carriers: [SymId], all_decls: [Decl],
-                          ds: [Decl],
+fn check_spawn_rows_loop(df: DiagFiles, tab: SymTab, carriers: [SymId], crossing: [SpawnParam],
+                          all_decls: [Decl], ds: [Decl],
                           acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, _, _, _, _, _, body, _, _, _) -> {
         let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
-        let acc1 = walk_spawn_rows_expr(site, carriers, all_decls, body, acc)
-        check_spawn_rows_loop(df, tab, carriers, all_decls, rest, acc1)
+        let acc1 = walk_spawn_rows_expr(site, carriers, crossing, all_decls, body, acc)
+        check_spawn_rows_loop(df, tab, carriers, crossing, all_decls, rest, acc1)
       }
-      _ -> check_spawn_rows_loop(df, tab, carriers, all_decls, rest, acc)
+      _ -> check_spawn_rows_loop(df, tab, carriers, crossing, all_decls, rest, acc)
     }
   }
 }
 
 
-fn walk_spawn_rows_expr(site: SpawnSite, carriers: [SymId], decls: [Decl], e: Expr,
+fn walk_spawn_rows_expr(site: SpawnSite, carriers: [SymId], crossing: [SpawnParam], decls: [Decl], e: Expr,
                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   let here = match e.kind {
-    ECall(callee, args_) -> if callee_is_spawn(callee) { check_spawned_thunk(site, carriers, decls, args_) } else { [] }
-    _ -> []
+    ECall(callee, args_) -> if callee_is_spawn(callee) { check_spawned_thunk(site, carriers, decls, args_) } else { check_crossing_args(site, crossing, decls, e) }
+    _ -> check_crossing_args(site, crossing, decls, e)
   }
-  walk_spawn_rows_list(site, carriers, decls, spawn_expr_children(e), list_append(acc, here))
+  walk_spawn_rows_list(site, carriers, crossing, decls, spawn_expr_children(e), list_append(acc, here))
+}
+
+
+# An argument passed where the callee spawns it is held to the same rule
+# as a thunk handed to `spawn`.
+fn check_crossing_args(site: SpawnSite, crossing: [SpawnParam], decls: [Decl],
+                        e: Expr) : [Diagnostic] / Console + File = match call_target(e) {
+  None             -> []
+  Some((s, args_)) -> foldl(args_at(args_, spawn_params_for(crossing, s)), [],
+                            (acc, a) => list_append(acc, check_crossing_arg(site, decls, a)))
 }
 
 
@@ -76,13 +87,13 @@ fn check_spawned_thunk(site: SpawnSite, carriers: [SymId], decls: [Decl],
 }
 
 
-fn walk_spawn_rows_list(site: SpawnSite, carriers: [SymId], decls: [Decl], es: [Expr],
+fn walk_spawn_rows_list(site: SpawnSite, carriers: [SymId], crossing: [SpawnParam], decls: [Decl], es: [Expr],
                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
-      let a1 = walk_spawn_rows_expr(site, carriers, decls, h, acc)
-      walk_spawn_rows_list(site, carriers, decls, rest, a1)
+      let a1 = walk_spawn_rows_expr(site, carriers, crossing, decls, h, acc)
+      walk_spawn_rows_list(site, carriers, crossing, decls, rest, a1)
     }
   }
 }
@@ -187,20 +198,21 @@ pub(pkg) fn spawn_thunk_arg(args_: [Expr]) : Option[Expr] {
 }
 
 
-fn check_spawned_thunk_row(site: SpawnSite, decls: [Decl],                             args_: [Expr]) : [Diagnostic] / Console + File {
+fn check_spawned_thunk_row(site: SpawnSite, decls: [Decl], args_: [Expr]) : [Diagnostic] / Console + File {
   match spawn_thunk_arg(args_) {
     None      -> []
-    Some(thk) -> match thk.ty {
-      None     -> []
-      Some(t)  -> match t {
-        TyFnT(_, _, row) ->
-          report_spawn_row_labels(site, decls, row.labels,
-                                   thk.line, thk.col, [])
-        _ -> []
-      }
-    }
+    Some(thk) -> check_crossing_arg(site, decls, thk)
   }
 }
+
+
+# The one rule at every boundary: what a function value may perform must be
+# something a child fiber resolves on its own.
+fn check_crossing_arg(site: SpawnSite, decls: [Decl], arg: Expr) : [Diagnostic] / Console + File =
+  match arg.ty {
+    Some(TyFnT(_, _, row)) -> report_spawn_row_labels(site, decls, row.labels, arg.line, arg.col, [])
+    _                      -> []
+  }
 
 
 # An effect crosses a spawn when the runtime installs it for the child:

@@ -271,7 +271,8 @@ introduces a local capability under the chosen name, and the body
 performs the op through that name: inside the handle body the bare
 effect name does not reach this handler (`Logger.log(...)` there is
 `effect not handled: Logger` unless another `Logger` handler encloses
-it).
+it, and then the bare op reaches that enclosing handler, never the
+rebound one).
 
 ```kaikai
 effect Logger {

@@ -333,7 +333,10 @@ fn main() : Int / Stdout = handle {
 `log` is an ordinary identifier now; inside the body, `Io` is
 **not** in scope. Calling `Io.print(s)` there would be a type
 error: the rebind replaces the default capability name, it does
-not shadow-and-hide it.
+not shadow-and-hide it. When another `Io` handler encloses the
+rebinding one, a bare `Io.print(s)` in the body is not an error: it
+reaches that enclosing handler, in the same function or in the
+caller that supplied the effect, and never the rebound one.
 
 ### Handling
 
