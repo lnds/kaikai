@@ -444,9 +444,32 @@ static void kai_llvm_wasm_prepare(LLVMModuleRef m) {
  * using the host target machine. Returns 0 on success, non-zero on a
  * verify or codegen failure (the driver surfaces the error and aborts).
  * One process: no `.ll` text, no `clang` subprocess. */
+/* Assign `tailcc` to every function marked `kai-tail` and to each direct
+ * call of one. A marked function whose address escapes (stored, passed)
+ * would be called through the wrong convention, so it fails the build. */
+static int kai_llvm_apply_tail_cc(LLVMModuleRef m) {
+    enum { KAI_TAILCC = 18 };
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (!LLVMGetStringAttributeAtIndex(f, LLVMAttributeFunctionIndex, "kai-tail", 8)) continue;
+        LLVMSetFunctionCallConv(f, KAI_TAILCC);
+        for (LLVMUseRef u = LLVMGetFirstUse(f); u; u = LLVMGetNextUse(u)) {
+            LLVMValueRef user = LLVMGetUser(u);
+            if ((LLVMIsACallInst(user) || LLVMIsAInvokeInst(user)) && LLVMGetCalledValue(user) == f) {
+                LLVMSetInstructionCallConv(user, KAI_TAILCC);
+            } else {
+                size_t n = 0;
+                kai_eprintf("kai: tail-call function `%s` has its address taken\n", LLVMGetValueName2(f, &n));
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runtime) {
     int64_t rc = 0;
     char *err = NULL;
+    if (kai_llvm_apply_tail_cc((LLVMModuleRef) m)) return 1;
 
     /* Debug hook (KIR native walk): dump the in-memory module IR to the
      * path in KAI_NATIVE_DUMP_IR before verify, so a malformed module can

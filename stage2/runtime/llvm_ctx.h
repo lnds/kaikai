@@ -535,6 +535,23 @@ static KaiValue *kai_llvm_add_memory_none(void *fn) {
     kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "memory", 6, 0);
     return kai_unit();
 }
+/* A function marked here runs under `tailcc`, whose guaranteed tail calls
+ * may change the argument layout; `kai_llvm_apply_tail_cc` assigns the
+ * convention to the function and to every direct call once the module is
+ * complete, so no declaration or call site can disagree. */
+static KaiValue *kai_llvm_mark_tail_fn(void *fn) {
+    LLVMContextRef c = LLVMGetTypeContext(LLVMTypeOf((LLVMValueRef) fn));
+    LLVMAttributeRef a = LLVMCreateStringAttribute(c, "kai-tail", 8, "1", 1);
+    LLVMAddAttributeAtIndex((LLVMValueRef) fn, LLVMAttributeFunctionIndex, a);
+    return kai_unit();
+}
+/* Mark a direct call as a guaranteed tail call; 0 when the value is not a
+ * call (an `invoke` under a landing pad cannot be one). */
+static int64_t kai_llvm_set_musttail(void *call) {
+    if (!LLVMIsACallInst((LLVMValueRef) call)) return 0;
+    LLVMSetTailCallKind((LLVMValueRef) call, LLVMTailCallKindMustTail);
+    return 1;
+}
 /* Demote a DEFINED function to internal linkage. The modular/split root
  * partitions emit user fns raw (external) so cross-TU stdlib calls link; a
  * root-private user fn keeps a bare source name, which then overrides a libc
