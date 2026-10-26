@@ -22,6 +22,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAI="$ROOT/bin/kai"
 SELF="$ROOT/tools/prune-differential.sh"
 SKIPS="${PRUNE_DIFF_SKIPS:-$ROOT/tools/prune-differential-skips.txt}"
+SHIMS="$ROOT/tools/prune-differential-shims.txt"
 
 norm() { sed -e "s#$ROOT#<root>#g" -e "s#${WORK:-/nonexistent}#<work>#g" -e 's#/private/var#/var#g' -e 's#/tmp\.[A-Za-z0-9]*#/tmp.X#g' \
   -e 's#[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z#<time>#g' -e 's#elapsed: [0-9.]*s#elapsed: <t>#g' \
@@ -36,11 +37,14 @@ run_variant() {
     test)  set -- test --backend="$be" "$base" ;;
     cover) set -- test --backend="$be" --json --coverage "$base" ;;
   esac
+  shim=$(awk -v f="${file#"$ROOT"/}" '$1 == f { print $2 }' "$SHIMS" 2>/dev/null)
+  [ -z "$shim" ] || export CFLAGS="$ROOT/$shim"
   if [ "$tag" = whole ]; then
     ( cd "$dir" && KAI_CORE_PRUNE=off timeout 300 "$KAI" "$@" </dev/null ) > "$OUT/$tag.out" 2> "$OUT/$tag.err"
   else
     ( cd "$dir" && timeout 300 "$KAI" "$@" </dev/null ) > "$OUT/$tag.out" 2> "$OUT/$tag.err"
   fi
+  unset CFLAGS
   echo $? > "$OUT/$tag.rc"
 }
 
