@@ -8,6 +8,7 @@ import compiler.ast_map
 import compiler.expr_positions
 import compiler.marks
 import compiler.perceus_reads
+import compiler.unbox
 
 # One read of an owned local: the local, where it sits, the field it
 # projects (empty for a whole read) and whether a closure holds it.
@@ -18,10 +19,16 @@ type PtkRead = PtkRead(LocalId, Int, Int, PtkField, Bool)
 #[doc("The body with every projection of an owned record's last read of that field turned into a take. `owned` lists the locals whose reads this body pays for.")]
 pub(pkg) fn ptk_take_fields(body: Expr, owned: [Binder]) : Expr = match owned {
   [] -> body
-  _  -> {
-    let reads = ptk_reads(body, owned, false, [])
-    if any(reads, ptk_is_projection) { ptk_rewrite(body, reads) } else { body }
-  }
+  _  ->
+    if xp_exists(body, false, ptk_is_dup_projection) {
+      let reads = ptk_reads(body, owned, false, [])
+      if any(reads, ptk_is_projection) { ptk_rewrite(body, reads) } else { body }
+    } else { body }
+}
+
+fn ptk_is_dup_projection(e: Expr) : Bool = match e.kind {
+  EField(b, _) -> ptk_is_dup_wrapped(b)
+  _            -> false
 }
 
 fn ptk_is_projection(r: PtkRead) : Bool = match r {
@@ -76,7 +83,7 @@ fn ptk_rewrite(e: Expr, reads: [PtkRead]) : Expr = match e.kind {
   EField(b, f) -> match ptk_base(b) {
     Some(lx) -> match lx.kind {
       ELocal(l) ->
-        if ptk_is_dup_wrapped(b) and ptk_takes(reads, l, lx.line, lx.col, f) and ptk_at(reads, l, lx.line, lx.col, f) == 1 { ptk_take(e, b, f) }
+        if ptk_is_dup_wrapped(b) and not ty_is_unboxable(e.ty) and ptk_takes(reads, l, lx.line, lx.col, f) and ptk_at(reads, l, lx.line, lx.col, f) == 1 { ptk_take(e, b, f) }
         else { e }
       _ -> e
     }
@@ -89,11 +96,10 @@ fn ptk_take(e: Expr, b: Expr, f: String) : Expr =
   Expr { ...e, kind: ECall(Expr { ...e, kind: EMark(MkTakeField(f)), ty: None }, [b]) }
 
 # How many reads of `l` sit at one position: a synthesised body shares one among several reads, whose order is then unknown.
-fn ptk_at(reads: [PtkRead], l: LocalId, line: Int, col: Int, f: String) : Int = match reads {
-  []                                       -> 0
-  [PtkRead(m, rl, rc, g, _), ...rest] ->
-    (if local_eq(m, l) and rl == line and rc == col and ptk_covers(g, f) { 1 } else { 0 }) + ptk_at(rest, l, line, col, f)
-}
+fn ptk_at(reads: [PtkRead], l: LocalId, line: Int, col: Int, f: String) : Int =
+  list_length(filter(reads, (r) => match r {
+    PtkRead(m, rl, rc, g, _) -> local_eq(m, l) and rl == line and rc == col and ptk_covers(g, f)
+  }))
 
 # Nothing the traversal meets after the read at `(line, col)` reads `f` or the
 # whole record, and no closure holds the record. `reads` runs latest first.
