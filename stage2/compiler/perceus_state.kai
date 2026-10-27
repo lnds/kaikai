@@ -1,0 +1,75 @@
+#[doc("""
+State taking: a stateful clause that resumes with a new state built from the old one hands the old one over instead of dup'ing it, so a write through it finds the value unshared.
+
+The state leaves the handler's slot only inside the `resume` that installs the next one. Nothing else reads the slot in between, and no exit of the clause falls between the take and the install.
+""")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.ast_map
+import compiler.expr_positions
+import compiler.handler_alias
+import compiler.util
+
+#[doc("The expression with every `resume(v, f(state, ..))` that reads the handler state once, as a direct argument beside plain operands, taking it from the slot.")]
+pub(pkg) fn pst_take_state(e: Expr) : Expr = {
+  let e1 = Expr { ...e, kind: prc_map_expr_kind(e.kind, (c) => pst_take_state(c)) }
+  match e1.kind {
+    ECall(f, xs) -> match f.kind {
+      ELocal(c) ->
+        if local_eq(c, local_minted(canonical_continuation())) { pst_resume(e1, f, xs) } else { e1 }
+      _ -> e1
+    }
+    _ -> e1
+  }
+}
+
+fn pst_resume(e: Expr, f: Expr, xs: [Expr]) : Expr = match xs {
+  [a, ns] -> Expr { ...e, kind: ECall(f, [a, pst_next_state(ns)]) }
+  _       -> e
+}
+
+fn pst_next_state(ns: Expr) : Expr = match ns.kind {
+  ECall(g, args) ->
+    if pst_callee(g) and list_length(filter(args, pst_is_state_read)) == 1 and all(args, pst_plain) {
+      Expr { ...ns, kind: ECall(g, map(args, pst_swap)) }
+    } else { ns }
+  _ -> ns
+}
+
+fn pst_callee(g: Expr) : Bool = match g.kind {
+  ESym(_, _) -> true
+  _          -> false
+}
+
+fn pst_is_alias(l: LocalId) : Bool = any(user_state_aliases(), (k) => local_eq(l, local_minted(k)))
+
+# The state alias, bare or behind a dup.
+fn pst_is_state_read(a: Expr) : Bool = match a.kind {
+  ELocal(l) -> pst_is_alias(l)
+  ECall(f, xs) -> match f.kind {
+    EMark(MkDup) -> match xs {
+      [x] -> match x.kind { ELocal(l) -> pst_is_alias(l)  _ -> false }
+      _   -> false
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
+# An operand that reads no state and runs no code of its own.
+fn pst_plain(a: Expr) : Bool = pst_is_state_read(a) or pst_quiet(a)
+
+fn pst_quiet(a: Expr) : Bool = match a.kind {
+  ELocal(l)    -> not pst_is_alias(l)
+  ESym(_, _)   -> false
+  ECall(f, xs) -> match f.kind {
+    EMark(MkDup) -> all(xs, pst_quiet)
+    _            -> false
+  }
+  _ -> list_is_empty(xp_positions(a))
+}
+
+fn pst_swap(a: Expr) : Expr =
+  if pst_is_state_read(a) { Expr { ...a, kind: ECall(Expr { ...a, kind: EMark(MkTakeState), ty: None }, []) } }
+  else { a }
