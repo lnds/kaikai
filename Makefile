@@ -233,11 +233,16 @@ tier0: selfhost tier0-gates
 # rather than in series. Locally `tier0` stays the single pre-commit gate.
 # Gates that read only sources and scripts: no compiler is built or run, so
 # CI reports them from a job that does not wait for the build.
-FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-canonical-aliases test-release-platforms test-kaic-boot
+FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-canonical-aliases test-release-platforms test-kaic-boot test-runtime-decls
 
 # The tier0 gates that need a built kaic2, cheapest first so a break reports
 # before the slow demos and cache gates.
 KAIC2_GATES := test-selfhost-warnings test-cmodular-prune test-fmt-classify test-compiler-lint-ratchet test-symid-names-compiled test-builtin-table test-kai-builtins test-symtab test-resolve-sym test-symid-pipeline test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-kai-namespace test-native-namespace test-module-name-ident test-rboxed-prim-scope test-heap-limit test-evidence-frame test-tls-hoist-gate test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-core-cache-tid test-rc-budget demos-no-regression
+
+# stage2/runtime/runtime_llvm_decls.h is generated from stage0/runtime_llvm.c;
+# a user's build never runs the generator, so the committed header must match.
+test-runtime-decls:
+	@python3 tools/gen-runtime-decls.py --check
 
 fast-gates: $(FAST_GATES)
 	@echo "fast-gates OK — every tier0 gate that needs no compiler"

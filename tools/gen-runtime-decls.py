@@ -17,7 +17,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "stage0", "runtime_llvm.c")
 OUT = os.path.join(ROOT, "stage2", "runtime", "runtime_llvm_decls.h")
 
-DEF = re.compile(r'^([A-Za-z_][^\n;{}=#]*?\b(kaix_\w+)\s*\(([^)]*)\))\s*\{(.*)$')
+DEF = re.compile(r'^([A-Za-z_][^\n;{}=#]*?\b(kaix_\w+)\s*\(((?:[^()]|\([^()]*\))*)\))\s*\{(.*)$')
 THUNK = re.compile(r'^KAIX_CORE_THUNK\d\((\w+)\)')
 COLD = re.compile(r'^#\s*if\s+!defined\(KAI_HOT_ONLY\)')
 IF = re.compile(r'^#\s*if')
@@ -26,7 +26,7 @@ MACRO_USE = re.compile(r'\b[A-Z][A-Z0-9_]{2,}\b')
 ONE_LINER =re.compile(r'^\s*return\b[^;{}]*;\s*\}\s*(/\*.*\*/)?\s*$')
 
 
-OPEN_SIG = re.compile(r'^[A-Za-z_][^;{}=#]*\bkaix_\w+\s*\([^)]*$')
+OPEN_SIG = re.compile(r'^[A-Za-z_][^;{}=#]*\bkaix_\w+\s*\((?:[^()]|\([^()]*\))*$')
 
 
 def join_signatures(text):
@@ -125,9 +125,9 @@ def render(text):
         "#include <runtime.h>",
     ]
     for k in sorted(protos):
-        out.append(("static inline " if k in bodies else "") + protos[k])
+        out.append(("static inline " + protos[k].replace("KAI_RT_SHARED ", "") if k in bodies else protos[k]))
     for k in sorted(bodies):
-        sig = protos[k][:-1]
+        sig = protos[k][:-1].replace("KAI_RT_SHARED ", "")
         out.append("static inline " + sig + " " + bodies[k])
     out.append("#endif")
     return "\n".join(out) + "\n"
