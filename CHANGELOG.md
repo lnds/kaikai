@@ -84,6 +84,74 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.180.0 (2026-10-27)
+
+### BREAKING CHANGE
+
+- callers of spawn, spawn_actor and spawn_actor_policy
+whose thunk performs effects now see them in their own row; a main that
+spawns a child declaring Cancel must declare Cancel.
+
+### Added
+
+- **tco**: name what the user wrote in tail-call warnings and pin them in fixtures
+- **tco**: report tail calls through closures and protocol dispatch, split the shaping report
+- **tco**: guarantee tail calls on the native backend and read tail position once
+
+### Fixed
+
+- **resolver**: lower var and check cell escapes in every mode that resolves
+- **typer**: scope effect aliases by declaration id
+- **typer**: dedupe the type-id dump by declaration ids
+- **typer**: keep alias ops reachable and the capture check reporting
+- **typer**: check spawn parameters once per import-cycle unit
+- **typer**: check a callable's effects at every boundary it crosses
+- **runtime**: give main one 32 MiB stack on every host, command and thread count
+- **tco**: rewrite every function that tail-calls itself so a let read back by the tail still loops
+- **tco**: drop the tail_pos import tailgraph no longer uses
+- **tco**: warn about unfused tail cycles after protocol calls resolve to their implementations
+- **tco**: report every unguaranteed tail call on a cycle instead of skipping some callees
+- **tco**: normalise tail calls only on cycles and tail call only between identical signatures
+- **protocols**: blame a check-only run's unrewritten call by symbol
+- **protocols**: drop an unused import from the dispatch passes
+- **protocols**: name the blamed impl without keeping text beside an id
+- **protocols**: blame the nearest call in the user's package, not the root file
+- **protocols**: report a dispatch error found in a template at the user call that instantiates it
+- **protocols**: reject a protocol operation left on an unsettled receiver after monomorphisation
+- **protocols**: report a protocol operation used as a value at a type with no impl
+- **ci**: run prune-differential fixtures at their pinned thread count and keep their exit code
+- **cli**: keep fenced lines out of kai info --json and list every lint rule
+- **typer**: judge mailbox and fiber-result types, not send call shapes
+- **typer**: reject fiber-bound values crossing a spawn or actor message through type parameters
+
+### Changed
+
+- **resolver**: decide cells, loops and var by identity after the resolver
+- **resolver**: restore a block's opened effects without leaving the module
+- **resolver**: restore the opened effects without a list comparison
+- **resolver**: run the nursery rewrite only for a program that calls nursery
+- **resolver**: skip the opened-effect lookup when nothing is open
+- **resolver**: keep the opened effects in the resolution state
+- **resolver**: walk the nursery rewrite over non-core declarations only
+- **resolver**: open effects in the resolver instead of rewriting names by text
+- **nursery**: bind capabilities by resolved id after the resolver
+- **compiler**: package identity is an id fixed at load
+- **typer**: write the alias walks tail-recursively
+- **typer**: structural type dedupe and one FFI type display
+- **typer**: one Ty display printer
+- **runtime**: resolve fiber-local builtins on a stack segment through its own slots
+- **runtime**: keep fiber-local slot lookup O(1) inside a clause in dispatch
+- **runtime**: resolve fiber-local builtins through per-fiber slots in O(1)
+- **typer**: read the spawn boundary of each function in one walk
+- **typer**: skip functions without a spawn in the spawn-parameter scan
+- **tests**: one file per baseline entry for the high-churn gates
+- **tests**: generate the remaining duplicated native/asan gates from rows
+- **tests**: fixture metadata beside the fixture, backend gates generated from declared rows
+- **tco**: read tail self-calls behind or/and/pipe without a second call graph
+- **native**: drop the unused tail calling convention prims and pin the signature-mismatch warning
+- **protocols**: use map where the blame lookup wrapped an option by hand
+- **protocols**: ask the package definition the resolver uses when blaming a module
+
 ## v0.179.0 (2026-10-26)
 
 ### Added
