@@ -101,7 +101,10 @@ pub(pkg) fn klf_cx(f: KFn, fns: LinFns) : Kx =
 
 #[doc("The ledger the params of `kx` start with.")]
 pub(pkg) fn klf_entry(kx: Kx) : LinSt =
-  if klin_fused(kx.f.params) { kls_empty() } else { klin_entry(kx.f.params, klin_caps(kx.f.blocks), kls_empty()) }
+  if klin_fused(kx.f.params) { kls_empty() }
+  else { klin_donor(kx, klin_entry(kx.f.params, klin_caps(kx.f.blocks), kls_empty())) }
+
+fn klin_donor(kx: Kx, st: LinSt) : LinSt = if kx.f.donor { kls_fresh(st, kir_donor_reg(), 1) } else { st }
 
 # A fused group's slots hold a member's param in some states and an absent
 # value in others, which no path through the dispatch tells apart.
@@ -226,7 +229,7 @@ fn klin_stmt(kx: Kx, s: KStmt, st: LinSt) : (LinSt, [LinV]) = match s {
   KLet(x, _, op, _)                -> klin_let(kx, x, op, st)
   KDo(op, _)                       -> match op {
     KLitOp(v) -> klin_take(kx, st, v, "do-discard")
-    _         -> klin_apply(kx, klo_fx(op, kx.fns), st)
+    _         -> match klin_apply(kx, klo_fx(op, kx.fns), st) { (st1, vs) -> (klin_implicit(kx, op, st1), vs) }
   }
   KRC(rc, _)                       -> klin_rc(kx, rc, st)
   KStore(t, v, _)                  -> klin_store(kx, t, v, st)
@@ -237,7 +240,7 @@ fn klin_stmt(kx: Kx, s: KStmt, st: LinSt) : (LinSt, [LinV]) = match s {
 fn klin_let(kx: Kx, x: String, op: KOp, st: LinSt) : (LinSt, [LinV]) = {
   let fx = klo_fx(op, kx.fns)
   let (st0, vs) = klin_apply(kx, fx, st)
-  let st1 = klin_gain(kx, op, st0)
+  let st1 = klin_implicit(kx, op, klin_gain(kx, op, st0))
   if not klf_boxed(kx, x) { (st1, vs) }
   else { match fx {
     LinFx(_, _, res) -> (klin_note(klin_bind(kx, x, res, st1), x, op), vs)
@@ -294,7 +297,25 @@ fn klin_rc(kx: Kx, rc: KRCOp, st: LinSt) : (LinSt, [LinV]) = match rc {
   KFreeToken(v)          -> klin_take(kx, st, v, "free-token")
   KIncrefIfShared(_, c)  -> (klin_dup(kx, st, c), [])
   KArmTake(v, bs, _)     -> klin_take(kx, klin_dups(kx, st, bs), v, "arm-take")
+  KArmTopReuse(v, _, ns, _) -> klin_arm_top(kx, v, ns, st)
+  KArmTokenFree          -> (kls_release(st, kir_armru_reg()), [])
   _                      -> (st, [])
+}
+
+# The scrutinee becomes the arm-top token and the named binders each own one
+# reference on both paths; a token still owned is overwritten.
+fn klin_arm_top(kx: Kx, v: KVal, ns: [String], st: LinSt) : (LinSt, [LinV]) = {
+  let (st1, vs) = klin_take(kx, klin_dups(kx, st, map(ns, (n) => KVar(n))), v, "arm-top")
+  let over = if kls_owns(st1, kir_armru_reg()) { [LinV("arm-token-overwritten", kir_armru_reg())] } else { [] }
+  (kls_fresh(st1, kir_armru_reg(), 1), list_append(over, vs))
+}
+
+# Implicit token traffic: a donating call moves `_arm_ru` in, a donor rebuild
+# reads and nulls `__donor`.
+fn klin_implicit(kx: Kx, op: KOp, st: LinSt) : LinSt = match op {
+  KCall(sym, _)                    -> if klo_callee_donor(sym, kx.fns) { kls_release(st, kir_armru_reg()) } else { st }
+  KConReuse(RkDonorVariant, _, _, _, _) -> kls_release(st, kir_donor_reg())
+  _                                -> st
 }
 
 fn klin_store(kx: Kx, t: String, v: KVal, st: LinSt) : (LinSt, [LinV]) = {
@@ -330,15 +351,16 @@ pub(pkg) fn klin_term(kx: Kx, t: KTerm, st: LinSt) : ([(String, LinSt)], [LinV])
   KTcrecGoto(_, asg, dm, _)                    -> klin_exit(klin_goto(kx, asg, dm, st))
   KTrmcStep(_, _, _, _, _, dm, hs, asg, _, _)  -> {
     let (st1, v1) = klin_takes(kx, map(hs, (h) => (h, "trmc-head")), st, [])
-    let (out, v2) = klin_exit(klin_goto(kx, asg, dm, st1))
+    let (out, v2) = klin_exit(klin_goto(kx, asg, dm, kls_release(st1, kir_armru_reg())))
     (out, list_append(v2, v1))
   }
-  KTrmcApply(v, _)                             -> klin_exit(klin_take(kx, st, v, "trmc-apply"))
+  KTrmcApply(v, _)                             -> klin_exit(klin_take(kx, kls_release(st, kir_armru_reg()), v, "trmc-apply"))
   _                                            -> (map(klc_succ(t), (l) => (l, st)), [])
 }
 
+# The emitter frees a donor token left at exit.
 fn klin_exit(r: (LinSt, [LinV])) : ([(String, LinSt)], [LinV]) = match r {
-  (st, vs) -> ([], list_append(kls_leaks(st), vs))
+  (st, vs) -> ([], list_append(kls_leaks(kls_release(st, kir_donor_reg())), vs))
 }
 
 # A setjmp's landing branch is the exceptional path; a branch on a known
@@ -449,7 +471,7 @@ fn klin_loop(kx: Kx, work: [(String, LinSt, [String])], seen: [String], steps: I
 fn klin_canon(kx: Kx, b: String, st: LinSt) : (String, LinSt, [LinV]) =
   if klc_is_doomed(kx.cfg, b) { (cat2(b, "|unreachable"), st, []) }
   else {
-    let (k, st1, dead) = klk_canon(st, klc_live_at(kx.cfg, b))
+    let (k, st1, dead) = klk_canon(st, [kir_armru_reg(), kir_donor_reg(), ...klc_live_at(kx.cfg, b)])
     (concat_all([b, "|", k]), st1, dead)
   }
 
