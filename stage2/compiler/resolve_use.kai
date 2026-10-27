@@ -1,0 +1,89 @@
+#[doc("""
+`use Effect`: the effects a file or a block opens, and the bare operation names they make mean `Effect.op`. A local binder outranks an opened operation, which outranks every other declaration.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.scope_view
+import compiler.written
+import compiler.resolve_state
+import compiler.resolve_env
+import compiler.resolve_names
+import compiler.effect_alias
+
+#[doc("True when `d` is one of the root file's own declarations, which `use` rewrites; a core or imported body keeps its bare names.")]
+pub(pkg) fn use_decl_is_root(d: Decl, root: String) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo)  -> mo_is_root(mo, root)
+  DDerive(_, inner, _, _)             -> use_decl_is_root(inner, root)
+  DUnstable(inner, _, _)              -> use_decl_is_root(inner, root)
+  DProtoLaws(_, inner, _, _, _)       -> use_decl_is_root(inner, root)
+  DImplAxiom(_, inner, _, _, _)       -> use_decl_is_root(inner, root)
+  DConstructor(inner, _, _)           -> use_decl_is_root(inner, root)
+  DDoc(_, _, inner, _, _)             -> use_decl_is_root(inner, root)
+  _                                   -> true
+}
+
+fn mo_is_root(mo: Option[String], root: String) : Bool = match mo { None -> true  Some(m) -> m == root }
+
+# The effect a `use` names from the walk's file; none when it names none.
+fn use_effect(e: Env, name: String) : SymId =
+  if not rs_recording(e.rs) { sym_none() }
+  else { match st_candidates(e.rs.tab, NCEffect, name) {
+    []  -> sym_none()
+    [s] -> s
+    _   -> match sv_resolve(e.rs.tab, e.rs.view, NCEffect, name) {
+      SvSym(s) -> s
+      _        -> sym_none()
+    }
+  } }
+
+#[doc("The effects the file-level `use` declarations of `decls` open, and `e` with an error counted for each one that names no effect.")]
+pub(pkg) fn use_file_opens(e: Env, decls: [Decl]) : Env / Console + File = match decls {
+  [] -> e
+  [DUse(name, _, _), ...rest] -> {
+    let s = use_effect(e, name)
+    if sym_raw(s) >= 0 { use_file_opens(Env { ...e, use_file: list_append(e.use_file, [s]) }, rest) }
+    else {
+      diag_error(e.file, 0, 0, "`use #{name}`: no effect named `#{name}` is in scope")
+      diag_help("declare the effect (`effect #{name} { ... }`) or import the module that declares it")
+      use_file_opens(env_mark_err(e), rest)
+    }
+  }
+  [_, ...rest] -> use_file_opens(e, rest)
+}
+
+#[doc("`e` with the effect `name` open for the rest of the block; a name that settles to no effect opens nothing.")]
+pub(pkg) fn use_open_block(e: Env, name: String) : Env = {
+  let s = use_effect(e, name)
+  if sym_raw(s) >= 0 { Env { ...e, opens: [s, ...e.opens] } } else { e }
+}
+
+fn use_owners(e: Env, op: String) : [SymId] = filter(e.opens, (eff) => eff_owns_op(e.eff_ops, eff, op))
+
+fn eff_owns_op(table: [EffOps], eff: SymId, op: String) : Bool = match table {
+  [] -> false
+  [EO(n, ops), ...rest] -> if sym_same(n, eff) { list_has(ops, op) } else { eff_owns_op(rest, eff, op) }
+}
+
+#[doc("The `Effect.op` a bare `name` stands for under the opened effects, or None when a local binder shadows it or no opened effect owns it. Two owners are an error, reported once, and leave the name as written.")]
+pub(pkg) fn use_bare_op(e: Env, name: String, x: Expr) : Option[UseOp] / Console + File =
+  if e.opens == [] or env_shadowed(e, name) { None }
+  else { match use_owners(e, name) {
+    []        -> None
+    [eff]     -> Some(UseOp { env: e, expr: at(EField(mk_sym(eff, x.line, x.col), name), x) })
+    [e1, e2, ..._] -> {
+      let n1 = decl_name(e.rs.tab, e1)
+      let n2 = decl_name(e.rs.tab, e2)
+      diag_error(e.file, x.line, x.col, "ambiguous bare name `#{name}`: opened by both `#{n1}` and `#{n2}`")
+      diag_help("qualify explicitly (e.g. `#{n1}.#{name}` or `#{n2}.#{name}`) or remove one of the `use` declarations")
+      Some(UseOp { env: env_mark_err(e), expr: x })
+    }
+  } }
+
+#[doc("A bare name resolved through an opened effect: the environment after any error and the expression it stands for.")]
+pub(pkg) type UseOp = { env: Env, expr: Expr }
