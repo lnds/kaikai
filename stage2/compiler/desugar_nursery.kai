@@ -10,7 +10,7 @@ import compiler.desugar_brand
 import compiler.brand_transp
 import compiler.written
 import compiler.symtab
-import compiler.desugar_rename
+import compiler.ast_ids
 import compiler.util
 import compiler.diag
 import compiler.desugar_cell_access
@@ -19,10 +19,16 @@ import compiler.desugar_cell_access
 # program plus the brand registry collected during the walk.
 pub(pkg) type NurseryRwProgram = { decls: [Decl], brands: [BrandRec], calls: [BrandCall] }
 
-#[doc("Expand `nursery { n -> body }` by stripping the cap param and rewriting `n.<op>` to `Spawn.<op>`, minting one BrandId per scope.")]
-pub(pkg) fn rewrite_nursery_caps_decls(decls: [Decl], df: DiagFiles) : NurseryRwProgram {
+#[doc("The `nursery` function of the core, or no symbol when the program has none.")]
+pub(pkg) fn nursery_fn(tab: SymTab) : SymId = match st_module(tab, "spawn") {
+  Some(m) -> unwrap_or(st_lookup(tab, NCFn, "nursery", m), sym_none())
+  None    -> sym_none()
+}
+
+#[doc("Expand `nursery { n -> body }`, `nursery` being the function that binds a capability, by stripping the cap param and rewriting `n.<op>` to `Spawn.<op>`, minting one BrandId per scope. Runs on the resolved stream, where a capability is its binder's id.")]
+pub(pkg) fn rewrite_nursery_caps_decls(decls: [Decl], nursery: SymId, df: DiagFiles) : NurseryRwProgram {
   let bw0 = BrandWalk { bnext: 0, registry: [], calls: [] }
-  let res = rewrite_nursery_caps_loop(decls, df, bw0, [])
+  let res = rewrite_nursery_caps_loop(decls, df, nursery, bw0, [])
   NurseryRwProgram { decls: res.decls,
                       brands: list_reverse(res.bw.registry),
                       calls: list_reverse(res.bw.calls) }
@@ -30,74 +36,74 @@ pub(pkg) fn rewrite_nursery_caps_decls(decls: [Decl], df: DiagFiles) : NurseryRw
 
 type NurseryRwLoop = { decls: [Decl], bw: BrandWalk }
 
-fn rewrite_nursery_caps_loop(decls: [Decl], df: DiagFiles, bw: BrandWalk,
+fn rewrite_nursery_caps_loop(decls: [Decl], df: DiagFiles, nursery: SymId, bw: BrandWalk,
                                acc: [Decl]) : NurseryRwLoop {
   match decls {
     [] -> NurseryRwLoop { decls: list_reverse(acc), bw: bw }
     [d, ...rest] -> {
-      let r = rewrite_nursery_caps_decl(d, decl_diag_file(d, df), bw)
-      rewrite_nursery_caps_loop(rest, df, r.bw, [r.decl, ...acc])
+      let r = rewrite_nursery_caps_decl(d, decl_diag_file(d, df), nursery, bw)
+      rewrite_nursery_caps_loop(rest, df, nursery, r.bw, [r.decl, ...acc])
     }
   }
 }
 
 # The `DImpl` arm re-enters the walk for the methods, which already
 # resolved their file from the enclosing decl.
-fn rewrite_nursery_caps_sub_decls(decls: [Decl], file: String, bw: BrandWalk,
+fn rewrite_nursery_caps_sub_decls(decls: [Decl], file: String, nursery: SymId, bw: BrandWalk,
                                     acc: [Decl]) : NurseryRwLoop {
   match decls {
     [] -> NurseryRwLoop { decls: list_reverse(acc), bw: bw }
     [d, ...rest] -> {
-      let r = rewrite_nursery_caps_decl(d, file, bw)
-      rewrite_nursery_caps_sub_decls(rest, file, r.bw, [r.decl, ...acc])
+      let r = rewrite_nursery_caps_decl(d, file, nursery, bw)
+      rewrite_nursery_caps_sub_decls(rest, file, nursery, r.bw, [r.decl, ...acc])
     }
   }
 }
 
 type NurseryRwDecl = { decl: Decl, bw: BrandWalk }
 
-fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDecl {
+fn rewrite_nursery_caps_decl(d: Decl, file: String, nursery: SymId, bw: BrandWalk) : NurseryRwDecl {
   match d {
     DFn(p_, fid, tps, ps, ret, row, body, l, c, mo) -> {
-      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(nursery), file, bw)
       NurseryRwDecl { decl: DFn(p_, fid, tps, ps, ret, row, r.expr, l, c, mo),
                        bw: r.bw }
     }
     DTest(desc, body, l, c, mo) -> {
-      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(nursery), file, bw)
       NurseryRwDecl { decl: DTest(desc, r.expr, l, c, mo), bw: r.bw }
     }
     DBench(desc, body, l, c, mo) -> {
-      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(nursery), file, bw)
       NurseryRwDecl { decl: DBench(desc, r.expr, l, c, mo), bw: r.bw }
     }
     DCheck(desc, ps, body, l, c, mo) -> {
-      let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
+      let r = rewrite_nursery_caps_expr(body, ncs_empty(nursery), file, bw)
       NurseryRwDecl { decl: DCheck(desc, ps, r.expr, l, c, mo), bw: r.bw }
     }
     DImpl(pname, proto_args, target, ms, l, c, tps, isym) -> {
-      let rms = rewrite_nursery_caps_sub_decls(ms, file, bw, [])
+      let rms = rewrite_nursery_caps_sub_decls(ms, file, nursery, bw, [])
       NurseryRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c, tps, isym),
                        bw: rms.bw }
     }
     DDerive(names, inner, l, c) -> {
-      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      let r = rewrite_nursery_caps_decl(inner, file, nursery, bw)
       NurseryRwDecl { decl: DDerive(names, r.decl, l, c), bw: r.bw }
     }
     DUnstable(inner, l, c) -> {
-      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      let r = rewrite_nursery_caps_decl(inner, file, nursery, bw)
       NurseryRwDecl { decl: DUnstable(r.decl, l, c), bw: r.bw }
     }
     DProtoLaws(thy, inner, l, c, mo) -> {
-      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      let r = rewrite_nursery_caps_decl(inner, file, nursery, bw)
       NurseryRwDecl { decl: DProtoLaws(thy, r.decl, l, c, mo), bw: r.bw }
     }
     DImplAxiom(thy, inner, l, c, mo) -> {
-      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      let r = rewrite_nursery_caps_decl(inner, file, nursery, bw)
       NurseryRwDecl { decl: DImplAxiom(thy, r.decl, l, c, mo), bw: r.bw }
     }
     DConstructor(inner, l, c) -> {
-      let r = rewrite_nursery_caps_decl(inner, file, bw)
+      let r = rewrite_nursery_caps_decl(inner, file, nursery, bw)
       NurseryRwDecl { decl: DConstructor(r.decl, l, c), bw: r.bw }
     }
     _ -> NurseryRwDecl { decl: d, bw: bw }
@@ -417,10 +423,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
       }
     }
     ELambda(ps, body) -> {
-      # Lambda params shadow outer caps with the same name.
-      let pnames = map(ps, (p) => written_text(p.binder.name))
-      let s1 = ncs_remove_all(s, pnames)
-      let r = rewrite_nursery_caps_expr(body, s1, file, bw)
+      let r = rewrite_nursery_caps_expr(body, s, file, bw)
       NurseryRwKind { kind: ELambda(ps, r.expr), bw: r.bw }
     }
     EBlock(stmts, tail) -> {
@@ -510,8 +513,8 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
 # the call to its scope; and any other call, which recurses.
 fn rewrite_nursery_caps_call(callee: Expr, args_: [Expr], s: NCapStack, file: String, bw: BrandWalk,
                              line: Int, col: Int) : NurseryRwKind = match callee.kind {
-  EName(callee_name) ->
-    if written_text(callee_name) == "nursery" { rewrite_nursery_call(callee, args_, s, file, bw, line, col) }
+  ESym(f, _) ->
+    if ncs_is_nursery(s, f) { rewrite_nursery_call(callee, args_, s, file, bw, line, col) }
     else { rewrite_nursery_plain_call(callee, args_, s, file, bw) }
   EField(base, op_name) -> match nursery_cap_brand(base, op_name, s) {
     Some(bid) -> {
@@ -535,7 +538,7 @@ fn rewrite_nursery_plain_call(callee: Expr, args_: [Expr], s: NCapStack, file: S
 # The brand of the active capability `base` names, when `op_name` is one
 # of its operations.
 fn nursery_cap_brand(base: Expr, op_name: String, s: NCapStack) : Option[Int] = match base.kind {
-  EName(name) -> if is_nursery_cap_op(op_name) { ncs_lookup(s, written_text(name)) } else { None }
+  ELocal(l) -> if is_nursery_cap_op(op_name) { ncs_lookup(s, l) } else { None }
   _           -> None
 }
 
@@ -570,13 +573,11 @@ fn rewrite_nursery_caps_stmts(ss: [Stmt], s: NCapStack, file: String,
     [stmt, ...rest] -> match stmt {
       SLet(pat, ann, rhs) -> {
         let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
-        let s1 = ncs_remove_all(s, dsg_pat_bindings(pat, []))
-        rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SLet(pat, ann, r.expr), ...acc])
+        rewrite_nursery_caps_stmts(rest, s, file, r.bw, [SLet(pat, ann, r.expr), ...acc])
       }
       SVar(n, ty, rhs, l, c) -> {
         let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
-        let s1 = ncs_remove(s, written_text(n.name))
-        rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SVar(n, ty, r.expr, l, c), ...acc])
+        rewrite_nursery_caps_stmts(rest, s, file, r.bw, [SVar(n, ty, r.expr, l, c), ...acc])
       }
       SAssert(c, m) -> {
         let cr = rewrite_nursery_caps_expr(c, s, file, bw)
@@ -612,9 +613,8 @@ fn rewrite_nursery_caps_arms(arms: [Arm], s: NCapStack, file: String,
     [] -> NurseryRwArms { arms: list_reverse(acc), bw: bw }
     [a, ...rest] -> match a {
       Arm(p, g, b) -> {
-        let s1 = ncs_remove_all(s, dsg_pat_bindings(p, []))
-        let gr = rewrite_nursery_caps_opt(g, s1, file, bw)
-        let br = rewrite_nursery_caps_expr(b, s1, file, gr.bw)
+        let gr = rewrite_nursery_caps_opt(g, s, file, bw)
+        let br = rewrite_nursery_caps_expr(b, s, file, gr.bw)
         rewrite_nursery_caps_arms(rest, s, file, br.bw, [Arm(p, gr.expr, br.expr), ...acc])
       }
     }
@@ -627,9 +627,7 @@ fn rewrite_nursery_caps_clauses(cs: [HClause], s: NCapStack, file: String,
     [] -> NurseryRwClauses { clauses: list_reverse(acc), bw: bw }
     [c, ...rest] -> match c {
       HC(n, ps, b, l, co) -> {
-        let pnames = map(ps, (pm) => written_text(pm.binder.name))
-        let s1 = ncs_remove_all(s, pnames)
-        let r = rewrite_nursery_caps_expr(b, s1, file, bw)
+        let r = rewrite_nursery_caps_expr(b, s, file, bw)
         rewrite_nursery_caps_clauses(rest, s, file, r.bw, [HC(n, ps, r.expr, l, co), ...acc])
       }
     }
@@ -642,8 +640,7 @@ fn rewrite_nursery_caps_opt_return(opt: Option[HReturn], s: NCapStack,
     None -> NurseryRwRet { ret: None, bw: bw }
     Some(r) -> match r {
       HR(p, b, l, c) -> {
-        let s1 = ncs_remove(s, written_text(p.name))
-        let br = rewrite_nursery_caps_expr(b, s1, file, bw)
+        let br = rewrite_nursery_caps_expr(b, s, file, bw)
         NurseryRwRet { ret: Some(HR(p, br.expr, l, c)), bw: br.bw }
       }
     }
@@ -699,9 +696,8 @@ fn rewrite_nursery_call(callee: Expr, args_: [Expr], s: NCapStack,
     HasLast(prefix, last) -> match last.kind {
       ELambda(ps, body) -> match ps {
         [p0] -> {
-          let p_name = written_text(p0.binder.name)
-          let alloc = bw_alloc(bw, p_name, file, last.line, last.col)
-          let s1 = ncs_push(s, p_name, alloc.bid)
+          let alloc = bw_alloc(bw, written_text(p0.binder.name), file, last.line, last.col)
+          let s1 = ncs_push(s, p0.binder.id, alloc.bid)
           let pr = rewrite_nursery_caps_exprs(prefix, s, file, alloc.bw, [])
           let br = rewrite_nursery_caps_expr(body, s1, file, pr.bw)
           let stripped_lam = mk_expr(ELambda([], br.expr), last.line, last.col)
