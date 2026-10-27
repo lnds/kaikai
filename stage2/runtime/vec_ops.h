@@ -486,6 +486,21 @@ static KaiValue *kai_op_field_take(KaiValue *rec, const char *name) {
     kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
 }
 
+/* After a guard passed: when the cell is held only by its owner, its own
+   reference to a field the arm binds moves to that binder, the slot left
+   unit. The binder's reference to the same value stays. */
+static void kai_op_field_untake(KaiValue *rec, const char *name) {
+    if (!kai_check_unique(rec) || rec->tag != KAI_RECORD) return;
+    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+        if (strcmp(rec->as.rec.names[i], name) == 0) {
+            KaiValue *old = rec->as.rec.fields[i];
+            rec->as.rec.fields[i] = kai_unit();
+            kai_decref(old);
+            return;
+        }
+    }
+}
+
 /* Field read of a dup'd base: when the base is held only by its owner and
    this dup, the field is moved out of the cell and the slot left unit; the
    dup is consumed either way. */

@@ -22,6 +22,7 @@ import compiler.ast_ids
 import compiler.ctor_ix
 import compiler.emit_shared_syms
 import compiler.expr_positions
+import compiler.marks
 import compiler.arm_top_plan
 import compiler.perceus_reads
 import compiler.trmc_exit_drops
@@ -40,26 +41,58 @@ pub fn arm_release(pat: Pattern, body: Expr, may_take: Bool) : ScrRelease = matc
   _ -> ScrKept
 }
 
-#[doc("True when an owned arm over a flat record pattern binds its fields by taking them from the cell: a unique cell hands each field over, a shared one dups it. `may_take` is false behind a guard, which may still reject the arm, or inside a region.")]
+#[doc("True when an owned arm over a record pattern of binders, wildcards and nested such records binds its fields by taking them from the cell: a unique cell hands each field over, a shared one dups it. `may_take` is false behind a guard, which may still reject the arm, or inside a region.")]
 pub fn arm_takes_fields(pat: Pattern, may_take: Bool) : Bool = may_take and match pat.pkind {
   PRecord(fs) -> arl_flat_fields(fs) and arl_binds_field(fs)
   _           -> false
 }
 
+#[doc("True when a guarded arm over a flat record pattern may hand the cell's references to its binders once the guard has passed.")]
+pub fn arm_untakes_fields(pat: Pattern) : Bool = match pat.pkind {
+  PRecord(fs) -> arl_all_plain(fs)
+  _           -> false
+}
+
+#[doc("True when the guard `g` reads `l` other than to release it on its failing path.")]
+pub fn guard_reads(l: LocalId, g: Expr) : Bool = match g.kind {
+  ELocal(x)    -> local_eq(x, l)
+  ECall(f, xs) -> match f.kind {
+    EMark(m) -> if mark_is_drop(m) { false } else { arl_guard_reads_all(l, xp_positions(g)) }
+    _        -> arl_guard_reads_all(l, xp_positions(g))
+  }
+  _ -> arl_guard_reads_all(l, xp_positions(g))
+}
+
+fn arl_guard_reads_all(l: LocalId, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> guard_reads(l, c) or arl_guard_reads_all(l, rest)
+}
+
+fn arl_all_plain(fs: [PField]) : Bool = match fs {
+  []                         -> true
+  [PField(_, p, _), ...rest] -> match p.pkind {
+    PBind(_) -> arl_all_plain(rest)
+    PWild    -> arl_all_plain(rest)
+    _        -> false
+  }
+}
+
 fn arl_flat_fields(fs: [PField]) : Bool = match fs {
   []                    -> true
   [PField(_, p, _), ...rest] -> match p.pkind {
-    PBind(_) -> arl_flat_fields(rest)
-    PWild    -> arl_flat_fields(rest)
-    _        -> false
+    PBind(_)    -> arl_flat_fields(rest)
+    PWild       -> arl_flat_fields(rest)
+    PRecord(fs) -> arl_flat_fields(fs) and arl_flat_fields(rest)
+    _           -> false
   }
 }
 
 fn arl_binds_field(fs: [PField]) : Bool = match fs {
   []                    -> false
   [PField(_, p, _), ...rest] -> match p.pkind {
-    PBind(_) -> true
-    _        -> arl_binds_field(rest)
+    PBind(_)    -> true
+    PRecord(fs) -> arl_binds_field(fs) or arl_binds_field(rest)
+    _           -> arl_binds_field(rest)
   }
 }
 
