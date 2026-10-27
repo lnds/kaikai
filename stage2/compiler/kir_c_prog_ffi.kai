@@ -1,5 +1,6 @@
 #[doc("KIR to C printer: `extern \"C\"` shims and the C-ABI entries of exports.")]
 
+import compiler.emit_native_fn
 import compiler.kir
 import compiler.kir_c_core
 import compiler.util
@@ -70,8 +71,10 @@ fn kcf_is_struct(k: KFfiKind) : Bool = match k {
 
 fn kcf_is_js(sym: String) : Bool = string_length(sym) > 7 and string_slice(sym, 0, 7) == "kai_js:"
 
-fn kcf_boxed_params(n: Int) : String =
-  if n == 0 { "void" } else { string_join(kcf_boxed_param_list(0, n), ", ") }
+#[doc("The parameter list of an FFI shim of `n` boxed params, led by the evidence frame when the shim's fn carries one.")]
+pub fn kcf_boxed_params(evf: Bool, n: Int) : String =
+  if n == 0 and not evf { "void" }
+  else { string_join(list_append(if evf { ["void *p_evf"] } else { [] }, kcf_boxed_param_list(0, n)), ", ") }
 
 fn kcf_boxed_param_list(i: Int, n: Int) : [String] =
   if i >= n { [] } else { [concat_all(["KaiValue *a", int_to_string(i)]), ...kcf_boxed_param_list(i + 1, n)] }
@@ -81,8 +84,8 @@ fn kcf_c_params(ks: [KFfiKind]) : String = match filter(ks, (k) => not kcf_is_un
   cs -> string_join(map(cs, (k) => kcf_ctype(k)), ", ")
 }
 
-fn kcf_unsupported_shim(sym: String, arity: Int, why: String) : String =
-  concat_all(["KaiValue *", sym, "(", kcf_boxed_params(arity), ") {\n    ",
+fn kcf_unsupported_shim(evf: Bool, sym: String, arity: Int, why: String) : String =
+  concat_all(["KaiValue *", sym, "(", kcf_boxed_params(evf, arity), ") {\n    ",
               kc_unsupported(why), ";\n    return kaix_unit();\n}\n"])
 
 fn kcf_call_args(ks: [KFfiKind], i: Int) : [String] = match ks {
@@ -99,12 +102,12 @@ fn kcf_decrefs(ks: [KFfiKind], i: Int) : [String] = match ks {
     else { [concat_all(["    kaix_decref(a", int_to_string(i), ");\n"]), ...kcf_decrefs(rest, i + 1)] }
 }
 
-fn kcf_shim(sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+fn kcf_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
   let alias = cat2("kc_ffi_", kc_mangle(sym))
   let call = kc_call(alias, kcf_call_args(pks, 0))
   concat_all([
     "extern ", kcf_ctype(rk), " ", alias, "(", kcf_c_params(pks), ") __asm__(KC_ASM(", kc_cstr(csym), "));\n",
-    "KaiValue *", sym, "(", kcf_boxed_params(list_length(pks)), ") {\n",
+    "KaiValue *", sym, "(", kcf_boxed_params(evf, list_length(pks)), ") {\n",
     if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", kcf_ctype(rk), " r = ", call, ";\n"]) },
     concat_all(kcf_decrefs(pks, 0)),
     "    return ", if kcf_is_unit(rk) { "kaix_unit()" } else { kcf_rebox(rk, "r") }, ";\n}\n"
@@ -115,14 +118,15 @@ fn kcf_shim(sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String =
 pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
   let sym = cx.cur
   let arity = list_length(f.params)
+  let evf = not list_is_empty(nfnx_frame_keys(cx.fx, f))
   if any(pks, kcf_is_unknown) or kcf_is_unknown(rk) {
-    kcf_unsupported_shim(sym, arity, cat2("unsupported FFI boundary type in ", csym))
+    kcf_unsupported_shim(evf, sym, arity, cat2("unsupported FFI boundary type in ", csym))
   } else if any(pks, kcf_is_struct) or kcf_is_struct(rk) {
-    kcf_unsupported_shim(sym, arity, cat2("struct-by-value FFI is not supported: ", csym))
+    kcf_unsupported_shim(evf, sym, arity, cat2("struct-by-value FFI is not supported: ", csym))
   } else if kcf_is_js(csym) {
-    kcf_unsupported_shim(sym, arity, cat2("extern js is not supported: ", csym))
+    kcf_unsupported_shim(evf, sym, arity, cat2("extern js is not supported: ", csym))
   } else {
-    kcf_shim(sym, csym, pks, rk)
+    kcf_shim(evf, sym, csym, pks, rk)
   }
 }
 
