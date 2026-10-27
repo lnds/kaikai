@@ -158,15 +158,29 @@ cell gives each binder a reference and loses one. Behind a guard or
 inside a region the cell is not taken apart: the arm dups its binders
 and, when it hands one on, drops the cell before its body runs.
 
-> **Current state (2026-10-10):** four shapes still copy on every write.
-> A `let` bound inside a loop or closure body and then written: every
-> read inside such a body takes a reference. An arm binder read and then
-> written (`Box(v, n) -> Box(vec_set(v, i, vec_get(v, i) + 1), n)`): the
-> lend rule above covers params and `let`s only. A vector reached through
-> a record field (`vec_set(s.buf, i, x)`): the field read takes a
-> reference while the record keeps its own. On the C backend only, an arm
-> that rebuilds an `Option` or `Result` in place around the written
-> vector (`Some(v) -> Some(vec_set(v, i, x))`).
+**A projection of a dead owner hands the field over.** A field read
+`s.buf` whose owner `s` is owned, and which no later read of that field or
+of `s` as a whole follows, takes the field out of the cell when the cell
+is held only by its owner and the read's own reference; a record pattern
+does the same for each binder (nested records too; behind a guard, once
+the guard has passed, for the fields it does not read), and a spread
+copies the fields it keeps the same way. "Later" is the order the read
+walk meets, not source position: a record literal evaluates its fields in
+declaration order. A stateful handler's `resume(v, f(.., state, ..))`
+takes the state out of the slot at its last read when the callee has an
+empty effect row and no operand after the read holds a call, so no exit
+of the clause can find the slot taken. A capture takes its own reference,
+so a read that follows every capture in the walk is free to move, and a
+non-`pub` parameter the closure only reads stays borrowed. Fixtures
+`examples/perceus/vec_own_*` pin the shapes on both backends.
+
+> **Current state:** three shapes still copy on every write. A `let` bound
+> inside a loop or closure body and then written: every read inside such a
+> body takes a reference. An arm binder read and then written
+> (`Box(v, n) -> Box(vec_set(v, i, vec_get(v, i) + 1), n)`): the lend rule
+> above covers params and `let`s only. On the C backend only, an arm that
+> rebuilds an `Option` or `Result` in place around the written vector
+> (`Some(v) -> Some(vec_set(v, i, x))`).
 
 ### User-parameter borrow (#1127)
 
