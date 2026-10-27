@@ -12,27 +12,13 @@ import compiler.written
 import compiler.util
 import compiler.diag
 import compiler.desugar_rename
-
-#[doc("A lowered expression and the error count so far.")]
-pub(pkg) type VLExpr = { expr: Expr, errs: Int }
-#[doc("A lowered optional expression and the error count so far.")]
-pub(pkg) type VLOpt  = { opt: Option[Expr], errs: Int }
-#[doc("Lowered expressions and the error count so far.")]
-pub(pkg) type VLExprs = { exprs: [Expr], errs: Int }
-#[doc("Lowered list elements and the error count so far.")]
-pub(pkg) type VLElems = { elems: [ListElem], errs: Int }
-#[doc("Lowered field initialisers and the error count so far.")]
-pub(pkg) type VLFields = { fields: [FieldInit], errs: Int }
-#[doc("Lowered arms and the error count so far.")]
-pub(pkg) type VLArms = { arms: [Arm], errs: Int }
-#[doc("Lowered handler clauses and the error count so far.")]
-pub(pkg) type VLClauses = { clauses: [HClause], errs: Int }
-#[doc("Lowered statements with their tail, and the error count so far.")]
-pub(pkg) type VLStmts = { stmts: [Stmt], opt: Option[Expr], errs: Int }
+import compiler.diag_file
+import compiler.ast_decl
+import compiler.expr_positions
 
 #[doc("""
 A user-written `with State[T] as name` / `with Reader[T] as name`
-binds `name` as a readable cell, the same as a desugared `var`. Other
+binds `name` as a readable cell, the same as a `var`. Other
 effects' aliases (`with Console as c`) are ordinary capability values,
 not cells, so their alias shadows rather than seeds the cell set.
 """)]
@@ -126,38 +112,6 @@ fn fields_contain_cell_access(fs: [FieldInit], cell: Binder) : Bool {
   }
 }
 
-#[doc("""
-A var lowered to a slot: its cell's binder and the slot's. A read of the
-cell becomes `array_get(slot, 0)` and a write a unit-typed block
-`{ let _ = array_set(slot, 0, v); () }`.
-""")]
-pub(pkg) type VarSlot = VarSlot(Binder, Binder)
-
-#[doc("""
-The `let` a var's slot lowering mints: its var's binder and the slot's.
-Its value is a `MkVarSlot` call on the allocation's callee and
-arguments until the cell-read relowering turns it into that call.
-""")]
-pub(pkg) fn var_slot_of(p: Pattern, rhs: Expr) : Option[VarSlot] = match p.pkind {
-  PBind(s) -> match rhs.kind {
-    ECall(f, _) -> match f.kind {
-      EMark(MkVarSlot(cell, slot)) -> Some(VarSlot(cell, slot))
-      _ -> None
-    }
-    _ -> None
-  }
-  _ -> None
-}
-
-#[doc("""
-The call a var's slot stands for, from the operands of its mark: the
-callee, then the arguments. `k` is the marked node itself.
-""")]
-pub(pkg) fn var_slot_call(k: ExprKind, operands: [Expr]) : ExprKind = match operands {
-  [f, ...xs] -> ECall(f, xs)
-  []         -> k
-}
-
 #[doc("The effect a rewritten cap call performs on: the core `Spawn`, already settled.")]
 pub(pkg) fn spawn_ref(line: Int, col: Int) : Expr =
   mk_sym(core_effect_id(CeSpawn), line, col)
@@ -235,14 +189,14 @@ pub(pkg) fn lcr_escape_in_value(e: Expr, cell: Binder, file: String) : Int / Con
 # Forward pass: a `let f = rhs` taints `f` when `rhs` (in value
 # position) carries a closure accessing `n`. Only `let`-bound names
 # are tracked — other statements introduce no exit-reaching binder.
-fn lcr_taint_stmts(stmts: [Stmt], cell: Binder, tainted: [String]) : [String] {
+fn lcr_taint_stmts(stmts: [Stmt], cell: Binder, tainted: [LocalId]) : [LocalId] {
 
   match stmts {
     [] -> tainted
     [s, ...rest] -> match s {
       SLet(p, _, rhs) -> {
         let t1 = match p.pkind {
-          PBind(f) -> match escaping_closure_pos(rhs, cell, tainted) { Some(_) -> [written_text(f.name), ...tainted]  None -> tainted }
+          PBind(f) -> match escaping_closure_pos(rhs, cell, tainted) { Some(_) -> [f.id, ...tainted]  None -> tainted }
           _ -> tainted
         }
         lcr_taint_stmts(rest, cell, t1)
@@ -251,6 +205,8 @@ fn lcr_taint_stmts(stmts: [Stmt], cell: Binder, tainted: [String]) : [String] {
     }
   }
 }
+
+fn local_tainted(tainted: [LocalId], l: LocalId) : Bool = any(tainted, (t) => local_eq(t, l))
 
 # The source position of the escaping closure, for the diagnostic.
 type CellPos = { line: Int, col: Int }
@@ -261,15 +217,15 @@ type CellPos = { line: Int, col: Int }
 # or a tainted binder is the escaping value; applying either consumes
 # it. Call arguments are not followed — a lambda passed as an argument
 # runs eagerly inside the block.
-fn escaping_closure_pos(e: Expr, cell: Binder, tainted: [String]) : Option[CellPos] {
+fn escaping_closure_pos(e: Expr, cell: Binder, tainted: [LocalId]) : Option[CellPos] {
 
   match e.kind {
     ELambda(_, body) -> if contains_cell_access(body, cell) { Some(CellPos { line: e.line, col: e.col }) } else { None }
-    EName(f) -> if list_has(tainted, written_text(f)) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    ELocal(f) -> if local_tainted(tainted, f) { Some(CellPos { line: e.line, col: e.col }) } else { None }
     ECall(callee, _) -> match callee.kind {
       # `f(...)` / `(\...)(...)` — applying consumes the closure; the
       # value is the call result, never the closure itself.
-      EName(_) -> None
+      ELocal(_) -> None
       ESym(_, _) -> None
       ELambda(_, _) -> None
       # Any other callee (a field access, a nested call) might itself
@@ -296,11 +252,11 @@ fn escaping_closure_pos(e: Expr, cell: Binder, tainted: [String]) : Option[CellP
 # `cell` in the child fiber. Unlike the value-reaching-exit check, this
 # follows into eager lambdas (a `nursery { cell -> ... }` body runs in place
 # but may itself spawn), so the whole block is scanned.
-fn spawn_block_escape_pos(stmts: [Stmt], tail: Option[Expr], cell: Binder, tainted: [String]) : Option[CellPos] =
+fn spawn_block_escape_pos(stmts: [Stmt], tail: Option[Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] =
   first_pos(spawn_stmts_escape_pos(stmts, cell, tainted),
             match tail { Some(t) -> spawn_escape_pos(t, cell, tainted)  None -> None })
 
-fn spawn_stmts_escape_pos(stmts: [Stmt], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn spawn_stmts_escape_pos(stmts: [Stmt], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match stmts {
     [] -> None
     [s, ...rest] -> {
@@ -325,7 +281,7 @@ fn spawn_stmts_escape_pos(stmts: [Stmt], cell: Binder, tainted: [String]) : Opti
 # touches the cell escapes its handler. Recurse the whole expression to
 # reach spawns nested under eager lambdas; at each spawn call, test its
 # arguments with `spawn_arg_escape_pos`.
-fn spawn_escape_pos(e: Expr, cell: Binder, tainted: [String]) : Option[CellPos] =
+fn spawn_escape_pos(e: Expr, cell: Binder, tainted: [LocalId]) : Option[CellPos] =
   match e.kind {
     ECall(callee, args_) -> {
       let at_spawn = match callee.kind {
@@ -352,21 +308,21 @@ fn spawn_escape_pos(e: Expr, cell: Binder, tainted: [String]) : Option[CellPos] 
     _ -> None
   }
 
-fn spawn_escape_args(es: [Expr], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn spawn_escape_args(es: [Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match es {
     [] -> None
     [h, ...rest] -> first_pos(spawn_escape_pos(h, cell, tainted), spawn_escape_args(rest, cell, tainted))
   }
 }
 
-fn spawn_escape_arms(arms: [Arm], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn spawn_escape_arms(arms: [Arm], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match arms {
     [] -> None
     [Arm(_, _, b), ...rest] -> first_pos(spawn_escape_pos(b, cell, tainted), spawn_escape_arms(rest, cell, tainted))
   }
 }
 
-fn spawn_escape_elems(es: [ListElem], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn spawn_escape_elems(es: [ListElem], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match es {
     [] -> None
     [el, ...rest] -> {
@@ -381,7 +337,7 @@ fn spawn_escape_elems(es: [ListElem], cell: Binder, tainted: [String]) : Option[
 # closure that captured it (a tainted binder), or BE such a captured closure
 # passed straight through (`spawn(reader)`). A bare mention that only forwards
 # the closure onward is not an escape here — the spawn that runs it is.
-fn spawn_args_escape_pos(args_: [Expr], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn spawn_args_escape_pos(args_: [Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match args_ {
     [] -> None
     [a, ...rest] -> first_pos(spawn_arg_escape_pos(a, cell, tainted),
@@ -389,21 +345,21 @@ fn spawn_args_escape_pos(args_: [Expr], cell: Binder, tainted: [String]) : Optio
   }
 }
 
-fn spawn_arg_escape_pos(e: Expr, cell: Binder, tainted: [String]) : Option[CellPos] =
+fn spawn_arg_escape_pos(e: Expr, cell: Binder, tainted: [LocalId]) : Option[CellPos] =
   match e.kind {
     ELambda(_, body) ->
       if task_touches_cell(body, cell.id, tainted) { Some(CellPos { line: e.line, col: e.col }) } else { None }
-    EName(f) -> if list_has(tainted, written_text(f)) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    ELocal(f) -> if local_tainted(tainted, f) { Some(CellPos { line: e.line, col: e.col }) } else { None }
     _ -> None
   }
 
 fn first_pos(a: Option[CellPos], b: Option[CellPos]) : Option[CellPos] =
   match a { Some(_) -> a  None -> b }
 
-fn escaping_closure_opt(o: Option[Expr], cell: Binder, tainted: [String]) : Option[CellPos] =
+fn escaping_closure_opt(o: Option[Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] =
   match o { Some(e) -> escaping_closure_pos(e, cell, tainted)  None -> None }
 
-fn arms_escaping_pos(arms: [Arm], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn arms_escaping_pos(arms: [Arm], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match arms {
     [] -> None
     [Arm(_, _, b), ...rest] ->
@@ -411,7 +367,7 @@ fn arms_escaping_pos(arms: [Arm], cell: Binder, tainted: [String]) : Option[Cell
   }
 }
 
-fn elems_escaping_pos(es: [ListElem], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn elems_escaping_pos(es: [ListElem], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match es {
     [] -> None
     [el, ...rest] -> {
@@ -424,10 +380,58 @@ fn elems_escaping_pos(es: [ListElem], cell: Binder, tainted: [String]) : Option[
   }
 }
 
-fn fields_escaping_pos(fs: [FieldInit], cell: Binder, tainted: [String]) : Option[CellPos] {
+fn fields_escaping_pos(fs: [FieldInit], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
   match fs {
     [] -> None
     [FI(_, v), ...rest] ->
       first_pos(escaping_closure_pos(v, cell, tainted), fields_escaping_pos(rest, cell, tainted))
   }
+}
+
+#[doc("Reports each cell of `ds` read or written from a closure that outlives its block or from a spawned task, and each capability returned out of its handle; the number of reports.")]
+pub(pkg) fn check_cell_escapes_decls(ds: [Decl], df: DiagFiles) : Int / Console + File = ces_decls(ds, df, 0)
+
+fn ces_decls(ds: [Decl], df: DiagFiles, acc: Int) : Int / Console + File = match ds {
+  []           -> acc
+  [d, ...rest] -> ces_decls(rest, df, acc + ces_decl(d, decl_diag_file(d, df)))
+}
+
+fn ces_decl(d: Decl, file: String) : Int / Console + File = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> ces_expr(body, file)
+  DTest(_, body, _, _, _)              -> ces_expr(body, file)
+  DBench(_, body, _, _, _)             -> ces_expr(body, file)
+  DCheck(_, _, body, _, _, _)          -> ces_expr(body, file)
+  DImpl(_, _, _, inner, _, _, _, _)    -> ces_inner(inner, file, 0)
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> ces_decl(inner, file)
+    None        -> 0
+  }
+}
+
+fn ces_inner(ds: [Decl], file: String, acc: Int) : Int / Console + File = match ds {
+  []           -> acc
+  [d, ...rest] -> ces_inner(rest, file, acc + ces_decl(d, file))
+}
+
+# The checks of a node follow those of its children, so an inner block reports first.
+fn ces_expr(e: Expr, file: String) : Int / Console + File = {
+  let inner = ces_children(xp_positions(e), file, 0)
+  let here = match e.kind {
+    EBlock(stmts, tail)                        -> ces_block(stmts, tail, file, 0)
+    EHandle(body, _, _, _, Some(alias), _, _) -> lcr_escape_in_value(body, alias, file)
+    _                                          -> 0
+  }
+  inner + here
+}
+
+fn ces_children(ps: [XPos], file: String, acc: Int) : Int / Console + File = match ps {
+  []              -> acc
+  [XP(_, c), ...rest] -> ces_children(rest, file, acc + ces_expr(c, file))
+}
+
+# A `var` takes the rest of its block as the scope its cell must not outlive.
+fn ces_block(stmts: [Stmt], tail: Option[Expr], file: String, acc: Int) : Int / Console + File = match stmts {
+  [] -> acc
+  [SVar(b, _, _, _, _), ...rest] -> ces_block(rest, tail, file, acc + lcr_escape_check(rest, tail, b, file))
+  [_, ...rest] -> ces_block(rest, tail, file, acc)
 }

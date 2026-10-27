@@ -1710,14 +1710,17 @@ page the way they are written.
    identifier stays an ordinary variable read, and `cap := v` on
    a Reader binding falls through to the existing "unknown op
    `set` on effect Reader" diagnostic. **Landed.**
-5. **`var x := init`** — pre-resolve desugar + variable
+5. **`var x := init`** — lowering after the resolver + variable
    specialisation (§*Variable specialisation*). **Landed.** Doc B
    §3 mandates lowering to `handle { rest } with State[T](init) as
    name { ... }` with the canonical `get`/`set`/`return` clauses;
-   `desugar_var_decls` (`stage2/compiler.kai`) walks every block,
-   wraps the rest-of-block from each `SVar` onward in that handler
-   shape, and recurses so nested vars nest handlers innermost
-   first. The annotated form `var x: T := init` passes `[T]` as the
+   `lower_vars_decls` (`stage2/compiler/desugar_var.kai`) walks every
+   block, wraps the rest-of-block from each `SVar` onward in that
+   handler shape, and recurses so nested vars nest handlers
+   innermost first. The resolver has already turned each read and
+   write of the cell into a node naming its binder, and a literal
+   `while`/`until`/`repeat` call of the core into a loop
+   intrinsic. The annotated form `var x: T := init` passes `[T]` as the
    handler's syntactic type args; the unannotated form leaves the
    list empty and synth_handle fills `[type_of_init]` from the
    `init`'s inferred type. A pre-resolve alias rewrite (sibling

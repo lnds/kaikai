@@ -21,6 +21,9 @@ import compiler.refine_types
 import compiler.resolve_names
 import compiler.pipe_fusion
 import compiler.resolve_use
+import compiler.resolve_cells
+import compiler.loop_lower
+import compiler.desugar_cell_access
 
 fn bind_pat(e: Env, pat: Pattern) : RPat / Console + File = match bind_pat_kind(e, pat.pkind) {
   RPatKind(e1, k) -> RPat(e1, Pattern { pkind: k, line: pat.line, col: pat.col })
@@ -121,7 +124,7 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File = match x.kind {
   EOp(_)     -> rk_same(e, x.kind)
   EName(name) -> chk_var(e, written_text(name), x)
   EMark(_) -> rk_same(chk_interp_mark(e, x), x.kind)
-  ECall(f, xs) -> chk_call(chk_literal_import(e, x), f, xs, list_length(xs))
+  ECall(f, xs) -> chk_call(chk_literal_import(e, x), x, f, xs, list_length(xs))
   EField(base, fname) -> chk_field(e, base, fname)
   EIndex(base, idx) -> chk_index(e, base, idx)
   EBinop(op, a, b) -> chk_binop(e, op, a, b)
@@ -244,7 +247,7 @@ fn chk_var_plain(e: Env, name: String, x: Expr) : RKind / Console + File =
 fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
   if env_has(e, name) {
     match env_lookup(e, name) {
-      Some(BLocal(l)) -> RKind(e, ELocal(l))
+      Some(BLocal(l)) -> RKind(e, local_read_kind(e, l, x))
       Some(BDecl(s))  -> RKind(chk_hidden(e, name, x, s), ESym(s, spec_none()))
       None            -> RKind(chk_hidden(e, name, x, sym_none()), x.kind)
     }
@@ -298,7 +301,7 @@ fn chk_apply_pipe(e: Env, p: Expr, a: Expr, b: Expr) : RKind / Console + File =
   }
 
 fn chk_apply_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
-  ECall(f, xs) -> match chk_call(e, f, xs, list_length(xs) + piped_slot(xs)) {
+  ECall(f, xs) -> match chk_call(e, b, f, xs, list_length(xs) + piped_slot(xs)) {
     RKind(e1, k) -> RExpr(e1, at(k, b))
   }
   _ -> chk_stage(e, b)
@@ -306,17 +309,56 @@ fn chk_apply_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
 
 # A call `f(args)` with `n` arguments, the piped value counted. A bare
 # callee climbs the ladder with that arity.
-fn chk_call(e: Env, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = {
+fn chk_call(e: Env, x: Expr, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = match f.kind {
+  EMark(MkCellSet) -> chk_cell_set(e, x, f, xs, n)
+  EMark(MkDeref)   -> chk_deref(e, x, f, xs, n)
+  EField(base, fname) -> match cell_reached(e, base) {
+    Some(l) -> chk_cell_op(e, f, base, fname, l, xs)
+    None    -> chk_call_plain(e, f, xs, n)
+  }
+  _ -> chk_call_plain(e, f, xs, n)
+}
+
+fn chk_call_plain(e: Env, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = {
   let rf = match f.kind {
     EName(name) -> chk_callee(e, written_text(name), f, n)
     _           -> chk_expr(e, f)
   }
   match rf {
     RExpr(e1, f1) -> match chk_exprs(e1, xs) {
-      RExprs(e2, xs1) -> RKind(e2, ECall(f1, xs1))
+      RExprs(e2, xs1) -> RKind(e2, loop_call_kind(call_loops(e2), f1, xs1))
     }
   }
 }
+
+# The `loop` module's own recursive calls stay calls.
+fn call_loops(e: Env) : [SymId] = if sym_same(e.rs.home, e.rs.loop_home) { [] } else { e.rs.loops }
+
+# `n := v` on a cell is the cell's write; on anything else it stays for the typer.
+fn chk_cell_set(e: Env, x: Expr, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = match xs {
+  [target, v] -> match cell_reached(e, target) {
+    Some(l) -> match chk_expr(e, v) {
+      RExpr(e1, v1) -> RKind(e1, mk_cell_put(l, v1, x.line, x.col))
+    }
+    None -> chk_call_plain(e, f, xs, n)
+  }
+  _ -> chk_call_plain(e, f, xs, n)
+}
+
+# `@n` on a cell is rejected; any other operand stays for the typer to read by its type.
+fn chk_deref(e: Env, x: Expr, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = match xs {
+  [operand] -> match cell_reached(e, operand) {
+    Some(_) -> RKind(cell_deref_rejected(e, operand, x.line, x.col), ECall(f, xs))
+    None    -> chk_call_plain(e, f, xs, n)
+  }
+  _ -> chk_call_plain(e, f, xs, n)
+}
+
+# An op called on a cell by name: the base is the cell itself, not a read of it.
+fn chk_cell_op(e: Env, f: Expr, base: Expr, fname: String, l: LocalId, xs: [Expr]) : RKind / Console + File =
+  match chk_exprs(e, xs) {
+    RExprs(e1, xs1) -> RKind(e1, ECall(mk_expr(EField(mk_local(l, base.line, base.col), fname), f.line, f.col), xs1))
+  }
 
 # A bare callee: the binding the ladder reaches at this arity, or, when
 # nothing fits, the name read as a value so the arity error names the
@@ -337,7 +379,7 @@ fn chk_ladder_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + 
     None      -> e
   }
   match h {
-    Hit(RLocal(l), _) -> RExpr(e1, at(ELocal(l), x))
+    Hit(RLocal(l), _) -> RExpr(e1, at(local_read_kind(e1, l, x), x))
     Hit(RDecl(s), _)  -> RExpr(note_nursery(chk_hidden(e1, name, x, s), s), sym_ref(s, x))
     Hit(RProto(d), _) -> RExpr(e1, at(disp_ref(d), x))
     Hit(RBare, _)     -> RExpr(chk_hidden(e1, name, x, sym_none()), x)
@@ -364,7 +406,7 @@ fn chk_handle(e: Env, x: Expr, body: Expr, eff: DeclRef, ta: [TypeExpr],
       ret_opt: Option[HReturn]) : RKind / Console + File = {
   let stateful = match init_opt { Some(_) -> true None -> false }
   let eff1 = chk_handle_head(e, eff)
-  match chk_handle_body(e, init_opt, alias_opt, body) {
+  match chk_handle_body(e, eff1, init_opt, alias_opt, body) {
     RHBody(restored, init1, alias1, body1) -> {
       warn_state_shadows(restored, stateful, clauses, ret_opt, x)
       match chk_handle_arms(restored, clauses, ret_opt, stateful) {
@@ -383,17 +425,17 @@ fn chk_handle_head(e: Env, eff: DeclRef) : DeclRef = {
 
 type RHBody = RHBody(Env, Option[Expr], Option[Binder], Expr)
 
-fn chk_handle_body(e: Env, init_opt: Option[Expr], alias_opt: Option[Binder],
+fn chk_handle_body(e: Env, eff: DeclRef, init_opt: Option[Expr], alias_opt: Option[Binder],
       body: Expr) : RHBody / Console + File = match chk_opt_expr(e, init_opt) {
-  ROptExpr(e0, init1) -> match bind_alias(e0, alias_opt) {
+  ROptExpr(e0, init1) -> match bind_alias(e0, eff, alias_opt) {
     RAlias(body_env, alias1) -> match chk_expr(body_env, body) {
       RExpr(eb, body1) -> RHBody(pop_alias(eb, alias_opt), init1, alias1, body1)
     }
   }
 }
 
-fn bind_alias(e: Env, alias_opt: Option[Binder]) : RAlias / Console + File = match alias_opt {
-  Some(alias) -> match env_bind(env_push(e), alias) { RBinder(ea, a1) -> RAlias(ea, Some(a1)) }
+fn bind_alias(e: Env, eff: DeclRef, alias_opt: Option[Binder]) : RAlias / Console + File = match alias_opt {
+  Some(alias) -> match env_bind(env_push(e), alias) { RBinder(ea, a1) -> RAlias(cell_alias_marked(ea, eff, a1.id), Some(a1)) }
   None        -> RAlias(e, None)
 }
 
@@ -577,7 +619,11 @@ fn chk_assign(e: Env, base: Expr, val: Expr, l: Int, c: Int) : RStmt / Console +
 
 fn chk_var_stmt(e: Env, b: Binder, ta: Option[TypeExpr], rhs: Expr, line: Int, col: Int) : RStmt / Console + File =
   match chk_expr(e, rhs) {
-    RExpr(e1, r1) -> match env_bind(e1, b) { RBinder(e2, b1) -> RStmt(e2, SVar(b1, ta, r1, line, col)) }
+    RExpr(e1, r1) -> match chk_opt_ty(e1, ta) {
+      ROptTy(e1t, ta1) -> match env_bind(e1t, b) {
+        RBinder(e2, b1) -> RStmt(vars_marked(cell_marked(e2, b1.id)), SVar(b1, ta1, r1, line, col))
+      }
+    }
   }
 
 fn chk_tys(e: Env, ts: [TypeExpr]) : RTys / Console + File =
@@ -709,16 +755,7 @@ fn chk_const_decl(e: Env, p: Bool, csym: SymId, ta: TypeExpr, body: Expr, mo: Op
 
 # A declaration that wraps another: the inner one is resolved in its place.
 fn chk_wrapped(e: Env, d: Decl, inner: Decl) : RDecl / Console + File = match chk_decl(e, inner) {
-  RDecl(e1, i1) -> RDecl(e1, rewrap_decl(d, i1))
-}
-
-fn rewrap_decl(d: Decl, inner: Decl) : Decl = match d {
-  DProtoLaws(th, _, l, c, mo) -> DProtoLaws(th, inner, l, c, mo)
-  DImplAxiom(th, _, l, c, mo) -> DImplAxiom(th, inner, l, c, mo)
-  DConstructor(_, l, c)       -> DConstructor(inner, l, c)
-  DDoc(ds, dl, _, l, c)       -> DDoc(ds, dl, inner, l, c)
-  DAttr(at, _, l, c)          -> DAttr(at, inner, l, c)
-  _                           -> d
+  RDecl(e1, i1) -> RDecl(e1, decl_rewrap(d, i1))
 }
 
 fn chk_body_scope(e: Env, body: Expr) : RExpr / Console + File =
