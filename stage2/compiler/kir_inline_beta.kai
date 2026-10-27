@@ -3,6 +3,7 @@
 import compiler.kir
 import compiler.util
 import compiler.ast
+import compiler.infer_index
 
 # compiler/kir_uses.kai — register-use queries over KIR blocks.
 #
@@ -124,6 +125,26 @@ pub(pkg) type KinSub = { pargs: [KinArg], sfx: String, params: [KParam], entry: 
 
 #[doc("One admitted template, keyed by its resolved symbol.")]
 pub(pkg) type KinTmpl = KT(String, KFn)
+
+#[doc("Admitted templates indexed by symbol; `n` is how many.")]
+pub(pkg) type KinTmpls = { ix: NameIndex[KinTmpl], n: Int }
+
+#[doc("Index templates by symbol; the first of a repeated symbol is the one found.")]
+pub(pkg) fn kin_tmpls(ts: [KinTmpl]) : KinTmpls =
+  KinTmpls { ix: kin_tmpls_loop(list_reverse(ts), idx_empty()), n: list_length(ts) }
+
+fn kin_tmpls_loop(rev: [KinTmpl], ix: NameIndex[KinTmpl]) : NameIndex[KinTmpl] = match rev {
+  [] -> ix
+  [t, ...rest] -> match t { KT(s, _) -> kin_tmpls_loop(rest, idx_prepend(ix, s, t)) }
+}
+
+#[doc("The template admitted under `sym`.")]
+pub(pkg) fn kin_tmpl_find(ts: KinTmpls, sym: String) : Option[KFn] = kin_tmpl_pick(idx_chain(ts.ix, sym), sym)
+
+fn kin_tmpl_pick(chain: [KinTmpl], sym: String) : Option[KFn] = match chain {
+  [] -> None
+  [KT(s, f), ...rest] -> if s == sym { Some(f) } else { kin_tmpl_pick(rest, sym) }
+}
 
 #[doc("The declared-slot zero init for a paste's result register, so every path through the clone stores over an initialised alloca of the right width.")]
 pub(pkg) fn kin_zero(s: KSlot) : KVal = match s {
@@ -385,7 +406,7 @@ pub(pkg) type KinClo = KCl(String, String, [KVal], Option[String])
 type KinBBlks = KBB([KBlock], Int)
 
 #[doc("Beta-reduce a fn's KCallIndirect sites over its single-assignment KClosure bindings, pasting admitted lambda bodies; then sweep closures left dead by the reduction.")]
-pub(pkg) fn kin_beta_fn(f: KFn, lams: [KinTmpl]) : KFn = {
+pub(pkg) fn kin_beta_fn(f: KFn, lams: KinTmpls) : KFn = {
   let env = kin_clo_env(f.blocks)
   match env {
     [] -> f
@@ -491,7 +512,7 @@ fn kin_clo_find(env: [KinClo], n: String) : Option[KinClo] = match env {
 
 # --- Site scan ------------------------------------------------------------
 
-fn kin_beta_blocks(bs: [KBlock], env: [KinClo], lams: [KinTmpl], c: Int, acc: [KBlock]) : KinBBlks = match bs {
+fn kin_beta_blocks(bs: [KBlock], env: [KinClo], lams: KinTmpls, c: Int, acc: [KBlock]) : KinBBlks = match bs {
   []           -> KBB(list_reverse(acc), c)
   [b, ...rest] -> match kin_beta_scan(b.label, b.stmts, b.term, env, lams, c, []) {
     KBB(nbs, c2) -> kin_beta_blocks(rest, env, lams, c2, kin_prepend_rev_b(nbs, acc))
@@ -507,7 +528,7 @@ fn kin_prepend_rev_b(xs: [KBlock], acc: [KBlock]) : [KBlock] = match xs {
 # clone → join block. The join opens with the closure-consuming `KDrop`
 # (a borrowing apply skips it), then the site's remaining statements.
 fn kin_beta_scan(label: String, ss: [KStmt], term: KTerm, env: [KinClo],
-                 lams: [KinTmpl], c: Int, pre_rev: [KStmt]) : KinBBlks = match ss {
+                 lams: KinTmpls, c: Int, pre_rev: [KStmt]) : KinBBlks = match ss {
   [] -> KBB([KBlock { label: label, stmts: list_reverse(pre_rev), term: term, region_id: None }], c)
   [s, ...rest] -> match kin_beta_site(s, env, lams) {
     Some(hit) -> match hit { KBH(x, slot, cn, lam, caps, vargs, consuming, pos) -> {
@@ -536,7 +557,7 @@ fn kin_beta_scan(label: String, ss: [KStmt], term: KTerm, env: [KinClo],
 # the apply consumes the closure, and the site position.
 type KinBetaHit = KBH(String, KSlot, String, KFn, [KVal], [KVal], Bool, KPos)
 
-fn kin_beta_site(s: KStmt, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] = match s {
+fn kin_beta_site(s: KStmt, env: [KinClo], lams: KinTmpls) : Option[KinBetaHit] = match s {
   KLet(x, slot, KCallIndirect(KVar(cn), vargs), pos) ->
     kin_beta_resolve(x, slot, cn, vargs, true, pos, env, lams)
   KLet(x, slot, KCallIndirectBorrow(KVar(cn), vargs), pos) ->
@@ -545,7 +566,7 @@ fn kin_beta_site(s: KStmt, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] 
 }
 
 fn kin_beta_resolve(x: String, slot: KSlot, cn: String, vargs: [KVal], consuming: Bool,
-                    pos: KPos, env: [KinClo], lams: [KinTmpl]) : Option[KinBetaHit] =
+                    pos: KPos, env: [KinClo], lams: KinTmpls) : Option[KinBetaHit] =
   match kin_clo_find(env, cn) {
     None -> None
     Some(KCl(_, sym, caps, _)) -> match kin_tmpl_find(lams, sym) {
@@ -556,11 +577,6 @@ fn kin_beta_resolve(x: String, slot: KSlot, cn: String, vargs: [KVal], consuming
         } else { None }
     }
   }
-
-fn kin_tmpl_find(ts: [KinTmpl], sym: String) : Option[KFn] = match ts {
-  [] -> None
-  [KT(s, f), ...rest] -> if s == sym { Some(f) } else { kin_tmpl_find(rest, sym) }
-}
 
 fn kin_beta_entry(f: KFn) : String = match f.blocks {
   [b, ..._] -> b.label
