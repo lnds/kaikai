@@ -167,14 +167,18 @@ fn main() : Unit / Stdout = {
   `vec_set(v, i, vec_get(v, i) + 1)` copies nothing. A read that runs
   after the write sees the old vector, so that write copies.
 - A `var` updated from its own value in a loop (`v := vec.set(v, i, x)`)
-  stays in place when it starts from a literal, a `let`-bound vector
-  or an unqualified call. Started straight from a qualified call
-  (`var v := vec.make(n, 0)`), every write in the loop copies: bind
-  the call with `let` first (`let v0 = vec.make(n, 0)`, then
-  `var v := v0`). `KAI_TRACE_RC=1` prints the `vec_inplace` /
-  `vec_cow` counts of a run.
-- A vector bound from a constructor field stays in place too
-  (`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`).
+  stays in place, whether it starts from a literal, a `let`-bound
+  vector or a qualified call (`var v := vec.make(n, 0)`).
+  `KAI_TRACE_RC=1` prints the `vec_inplace` / `vec_cow` counts of a run.
+- A vector stays in place however it reaches the write, as long as
+  nothing else holds it: bound from a constructor field
+  (`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`), a record pattern
+  (`St { buf, n } -> ..`, nested, or behind a guard that does not read
+  the field), a tuple, the projection of a record that is dead
+  afterwards (`St { buf: vec_set(s.buf, i, x), n: s.n + 1 }`,
+  `{ ...s, buf: vec_set(s.buf, i, x) }`), a handler's state
+  (`resume((), vec_set(state, i, x))`), or a vector a closure captured
+  and that closure is dead before the write.
 - Equality (`==`) is structural, element by element.
 - `|`, `||`, `|?` and `|!` over a `Vec` dispatch to `vec.map`,
   `vec.flat_map`, `vec.filter` and `vec.each`.
