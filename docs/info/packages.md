@@ -249,7 +249,7 @@ qualified (`lib.LIMIT`), unqualified, or in match-pattern position.
 `pub(pkg)` takes the same forms and exports to the package alone:
 
 ```text
-pub(pkg) fn helper(n: Int) : Int = n * 2       # every module under this kai.toml
+pub(pkg) fn helper(n: Int) : Int = n * 2       # every module under this kai.toml, a vendored dependency excepted
 pub fn api(n: Int) : Int = helper(n)            # what other packages see
 ```
 

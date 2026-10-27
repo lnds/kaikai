@@ -554,7 +554,11 @@ The package manager is split across three components:
    layout).
 3. **`kai`** (`tools/kai/`) — the driver. `cli_manifest.find_dir`
    walks up looking for `kai.toml`; `cli_pkg.path_flags` consumes
-   `kai-pkg paths` and emits absolute `--path` flags for kaic2.
+   `kai-pkg paths` and emits absolute `--path` flags for kaic2, each
+   with a `--package-root` flag naming the manifest directory that
+   owns it. kaic2 gives every module the id of the deepest declared
+   root that holds its file (the standard library has its own), so a
+   dependency vendored under the package is a package of its own.
    `kai init` / `kai install` / `kai show` drive the kai-pkg
    binary.
 

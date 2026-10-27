@@ -6,6 +6,7 @@ reaches the module, its exports and its home.
 import compiler.util
 import compiler.diag
 import compiler.infer_index
+import compiler.package_id
 
 # ModuleEntry records the surface name a user wrote on an
 # `import` line, the public names that file exports, and the
@@ -21,24 +22,24 @@ import compiler.infer_index
 # top-level (non-import) decls. Selective imports do NOT pre-filter
 # this list — concat semantics still bring every public decl
 # into the unqualified scope, so the qualified surface mirrors that.
-pub(pkg) type ModuleEntry = ME(String, [String], String, [String])
+pub(pkg) type ModuleEntry = ME(String, [String], String, [String], PkgId)
 
 #[doc("The module bound to `name` in this file's qualifier table, if any.")]
 pub(pkg) fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
   match mt {
     [] -> None
     [me, ...rest] -> match me {
-      ME(mn, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
+      ME(mn, _, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
     }
   }
 }
 
 #[doc("The names the module exports.")]
-pub(pkg) fn me_exports(me: ModuleEntry) : [String] = match me { ME(_, exs, _, _) -> exs }
+pub(pkg) fn me_exports(me: ModuleEntry) : [String] = match me { ME(_, exs, _, _, _) -> exs }
 
 #[doc("True when the module exports `fn_name` at its top level.")]
 pub(pkg) fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, exports, _, _) -> list_has(exports, fn_name)
+  ME(_, exports, _, _, _) -> list_has(exports, fn_name)
 }
 
 # Returns true when `fn_name` is in the module's unstable
@@ -46,25 +47,28 @@ pub(pkg) fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
 # decide whether to emit the unstable-consumer warning.
 #[doc("True when the module marks `fn_name` unstable.")]
 pub(pkg) fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, _, _, unstable) -> list_has(unstable, fn_name)
+  ME(_, _, _, unstable, _) -> list_has(unstable, fn_name)
 }
 
 #[doc("The marker a module entry's unstable list holds for an export that reaches the modules of its package alone; no source name has a colon, so no export is mistaken for one.")]
-pub(pkg) fn pkg_marker(root: String, name: String) : String = string_concat_all(["pkg:", root, ":", name])
+pub(pkg) fn pkg_marker(pkg: PkgId, name: String) : String = string_concat_all(["pkg:", pkg_text(pkg), ":", name])
 
-#[doc("Whether the module entry keeps `name` from a reader in the package `root`: it is exported to a package other than that one.")]
-pub(pkg) fn me_hides(me: ModuleEntry, name: String, root: String) : Bool = match me {
-  ME(_, _, _, marks) -> marks_hide(marks, name, root)
+#[doc("The package that owns the module.")]
+pub(pkg) fn me_pkg(me: ModuleEntry) : PkgId = match me { ME(_, _, _, _, pkg) -> pkg }
+
+#[doc("Whether the module entry keeps `name` from a reader in the package `reader`: it is exported to a package other than that one.")]
+pub(pkg) fn me_hides(me: ModuleEntry, name: String, reader: PkgId) : Bool = match me {
+  ME(_, _, _, marks, _) -> marks_hide(marks, name, reader)
 }
 
-#[doc("Whether some marker in `marks` keeps `name` from a reader in the package `root`.")]
-fn marks_hide(marks: [String], name: String, root: String) : Bool =
+#[doc("Whether some marker in `marks` keeps `name` from a reader in the package `reader`.")]
+fn marks_hide(marks: [String], name: String, reader: PkgId) : Bool =
   not list_is_empty(marks) and any(marks, (m) => starts_with(m, "pkg:") and ends_with(m, string_concat(":", name))
-                                                  and not starts_with(m, string_concat_all(["pkg:", root, ":"])))
+                                                  and not (pkg_known(reader) and starts_with(m, string_concat_all(["pkg:", pkg_text(reader), ":"]))))
 
 #[doc("The exports a module shows an importer: all of them to a module of its own package, the rest to another.")]
-pub(pkg) fn me_exports_for(exports: [String], marks: [String], root: String) : [String] =
-  if list_is_empty(marks) { exports } else { filter(exports, (n) => not marks_hide(marks, n, root)) }
+pub(pkg) fn me_exports_for(exports: [String], marks: [String], reader: PkgId) : [String] =
+  if list_is_empty(marks) { exports } else { filter(exports, (n) => not marks_hide(marks, n, reader)) }
 
 # Collect the absolute origin path of every ModuleEntry
 # in `mes`. Used to pre-seed the import resolver's `visited` set with
@@ -73,7 +77,7 @@ pub(pkg) fn me_exports_for(exports: [String], marks: [String], root: String) : [
 pub(pkg) fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
-    ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
+    ME(_, _, origin, _, _) -> collect_module_origins(rest, [origin, ...acc])
   }
 }
 
@@ -81,7 +85,7 @@ pub(pkg) fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String]
 pub fn module_files(mes: [ModuleEntry], acc: [ModFile]) : [ModFile] = match mes {
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
-    ME(name, _, origin, _) -> module_files(rest, [MF(name, origin), ...acc])
+    ME(name, _, origin, _, _) -> module_files(rest, [MF(name, origin), ...acc])
   }
 }
 
@@ -93,7 +97,7 @@ pub(pkg) fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEnt
   match mt {
     [] -> None
     [me, ...rest] -> match me {
-      ME(_, _, origin, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
+      ME(_, _, origin, _, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
     }
   }
 }
@@ -138,7 +142,7 @@ pub(pkg) fn ms_scope_table(scopes: [ModScope], home: String, global: [ModuleEntr
       else { ms_scope_table(rest, home, global) }
   }
 
-fn me_name(me: ModuleEntry) : String = match me { ME(n, _, _, _) -> n }
+fn me_name(me: ModuleEntry) : String = match me { ME(n, _, _, _, _) -> n }
 
 fn mt_by_name(mt: [ModuleEntry], ix: NameIndex[ModuleEntry]) : NameIndex[ModuleEntry] = match mt {
   [] -> ix
@@ -146,13 +150,13 @@ fn mt_by_name(mt: [ModuleEntry], ix: NameIndex[ModuleEntry]) : NameIndex[ModuleE
 }
 
 fn mt_binds_elsewhere(ix: NameIndex[ModuleEntry], g: ModuleEntry) : Bool = match g {
-  ME(name, _, origin, _) -> mt_rebinds(idx_chain(ix, name), name, origin)
+  ME(name, _, origin, _, _) -> mt_rebinds(idx_chain(ix, name), name, origin)
 }
 
 # Buckets are keyed by hash, so each entry re-tests the name.
 fn mt_rebinds(xs: [ModuleEntry], name: String, origin: String) : Bool = match xs {
   [] -> false
-  [ME(n, _, o, _), ...rest] -> (n == name and o != origin) or mt_rebinds(rest, name, origin)
+  [ME(n, _, o, _, _), ...rest] -> (n == name and o != origin) or mt_rebinds(rest, name, origin)
 }
 
 #[doc("The module a read of `q.member` goes through: of the modules bound to `q`, the first that exports `member`, else the first.")]
@@ -169,7 +173,7 @@ fn mt_rivals(mt: [ModuleEntry], q: String, member: String) : [ModuleEntry] =
 fn mt_rivals_loop(mt: [ModuleEntry], q: String, member: String, acc: [ModuleEntry]) : [ModuleEntry] = match mt {
   [] -> list_reverse(acc)
   [me, ...rest] -> match me {
-    ME(n, exports, origin, _) ->
+    ME(n, exports, origin, _, _) ->
       if n == q and list_has(exports, member) and not me_origin_in(acc, origin) {
         mt_rivals_loop(rest, q, member, [me, ...acc])
       } else { mt_rivals_loop(rest, q, member, acc) }
@@ -178,7 +182,7 @@ fn mt_rivals_loop(mt: [ModuleEntry], q: String, member: String, acc: [ModuleEntr
 
 fn me_origin_in(mes: [ModuleEntry], origin: String) : Bool = match mes {
   []            -> false
-  [ME(_, _, o, _), ...rest] -> o == origin or me_origin_in(rest, origin)
+  [ME(_, _, o, _, _), ...rest] -> o == origin or me_origin_in(rest, origin)
 }
 
 #[doc("`mt_lookup_member`, warning at the read when several modules bound to `q` export `member`.")]
@@ -226,18 +230,18 @@ fn mt_rival_homes_diag(homes: [String], q: String, member: String, file: String,
 #[doc("The name codegen minted the symbols of `me` under: the last entry of its file in `mt`, else `written`.")]
 pub(pkg) fn me_emit_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String =
   match me {
-    ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
+    ME(_, _, origin, _, _) -> me_last_name_for_origin(mt, origin, written)
   }
 
 #[doc("How the reader whose table is `mt` names the module homed at `home`: the reader's own binding for that module's file, else the module's import path.")]
 pub(pkg) fn mt_spell_home(mt: [ModuleEntry], home: String) : String = match mt_lookup(mt, home) {
-  Some(ME(_, _, origin, _)) -> me_first_name_for_origin(mt, origin, home_path(home))
+  Some(ME(_, _, origin, _, _)) -> me_first_name_for_origin(mt, origin, home_path(home))
   None                      -> home_path(home)
 }
 
 fn me_first_name_for_origin(mt: [ModuleEntry], origin: String, dflt: String) : String = match mt {
   []                        -> dflt
-  [ME(n, _, o, _), ...rest] -> if o == origin { n } else { me_first_name_for_origin(rest, origin, dflt) }
+  [ME(n, _, o, _, _), ...rest] -> if o == origin { n } else { me_first_name_for_origin(rest, origin, dflt) }
 }
 
 # A home spells its import path's `.` as `__`.
@@ -252,7 +256,7 @@ fn home_path_loop(s: String, i: Int, n: Int, acc: String) : String =
 pub(pkg) fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : String =
   match mt {
     [] -> acc
-    [ME(n, _, o, _), ...rest] ->
+    [ME(n, _, o, _, _), ...rest] ->
       me_last_name_for_origin(rest, origin, if o == origin { n } else { acc })
   }
 
@@ -265,7 +269,7 @@ pub(pkg) fn mt_tagged_name(mt: [ModuleEntry], written: String) : String =
 
 #[doc("`fname` when the module exports it.")]
 pub(pkg) fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
-  ME(_, exports, _, _) ->
+  ME(_, exports, _, _, _) ->
     if list_has(exports, fname) { Some(fname) } else { None }
 }
 
@@ -301,7 +305,7 @@ fn mtabs_homes(scopes: [ModScope], global: [ModuleEntry], shared: NameIndex[Modu
 fn mtabs_index(mes: [ModuleEntry], ix: NameIndex[ModuleEntry]) : NameIndex[ModuleEntry] = match mes {
   [] -> ix
   [me, ...rest] -> match me {
-    ME(n, _, _, _) -> mtabs_index(rest, idx_prepend(ix, n, me))
+    ME(n, _, _, _, _) -> mtabs_index(rest, idx_prepend(ix, n, me))
   }
 }
 
@@ -351,7 +355,7 @@ fn path_home_loop(s: String, i: Int, n: Int, acc: String) : String =
 #[doc("The file other than `path` already homed at `home`: two files that would mint one set of symbols.")]
 pub(pkg) fn home_taken_by(mods: [ModuleEntry], home: String, path: String) : Option[String] =
   match mt_lookup(mods, home) {
-    Some(ME(_, _, origin, _)) -> if origin == path { None } else { Some(origin) }
+    Some(ME(_, _, origin, _, _)) -> if origin == path { None } else { Some(origin) }
     None                      -> None
   }
 
