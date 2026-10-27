@@ -95,25 +95,47 @@ fn klk_index(xs: [Int], o: Int, i: Int) : Int = match xs {
 }
 
 #[doc("One function under check: its KIR, the program's functions, its CFG facts, which registers are boxed, and its `setjmp` registers.")]
-pub(pkg) type Kx = { f: KFn, fns: LinFns, cfg: LinCfg, slots: [(String, Bool)], setjmps: [String] }
+pub(pkg) type Kx = { f: KFn, fns: LinFns, cfg: LinCfg, slots: [(String, Bool)], setjmps: [String], state: Option[FusedState] }
+
+#[doc("One dispatch state of a fused group: its tag, and which slots a call into it leaves absent.")]
+pub(pkg) type FusedState = FusedState(Int, [Bool])
 
 #[doc("The facts of `f`.")]
-pub(pkg) fn klf_cx(f: KFn, fns: LinFns) : Kx =
-  Kx { f: f, fns: fns, cfg: klc_build(f), slots: klin_slots(f), setjmps: klin_setjmps(f.blocks) }
+pub(pkg) fn klf_cx(f: KFn, fns: LinFns, state: Option[FusedState]) : Kx =
+  Kx { f: f, fns: fns, cfg: klc_build(f), slots: klin_slots(f), setjmps: klin_setjmps(f.blocks), state: state }
 
 #[doc("The ledger the params of `kx` start with.")]
-pub(pkg) fn klf_entry(kx: Kx) : LinSt =
-  if klin_fused(kx.f.params) { kls_empty() }
-  else { klin_donor(kx, klin_entry(kx.f.params, klin_caps(kx.f.blocks), kls_empty())) }
-
-fn klin_donor(kx: Kx, st: LinSt) : LinSt = if kx.f.donor { kls_fresh(st, kir_donor_reg(), 1) } else { st }
+pub(pkg) fn klf_entry(kx: Kx) : LinSt = match kx.state {
+  Some(FusedState(tag, absent)) -> klin_donor(kx, klin_entry_in(kx.f.params, absent, 0, klin_caps(kx.f.blocks), klin_seed_tag(kx.f.params, tag, kls_empty())))
+  None -> if klin_fused(kx.f.params) { kls_empty() }
+          else { klin_donor(kx, klin_entry(kx.f.params, klin_caps(kx.f.blocks), kls_empty())) }
+}
 
 # A fused group's slots hold a member's param in some states and an absent
-# value in others, which no path through the dispatch tells apart.
+# value in others; a function none of the program's calls enter is not walked.
 fn klin_fused(ps: [KParam]) : Bool = match ps {
   [p, ..._] -> string_starts_with_q(p.name, tailfuse_tag_param())
   []        -> false
 }
+
+fn klin_seed_tag(ps: [KParam], tag: Int, st: LinSt) : LinSt = match ps {
+  [p, ..._] -> kls_int(st, p.name, tag)
+  []        -> st
+}
+
+# The params of a dispatch state: the slots a call leaves absent hold nothing.
+fn klin_entry_in(ps: [KParam], absent: [Bool], i: Int, caps: [String], st: LinSt) : LinSt = match ps {
+  []           -> st
+  [p, ...rest] -> klin_entry_in(rest, absent, i + 1, caps,
+    if klin_absent_at(absent, i) { st } else { klin_entry([p], caps, st) })
+}
+
+fn klin_absent_at(absent: [Bool], i: Int) : Bool = match absent {
+  []           -> false
+  [a, ...rest] -> if i == 0 { a } else { klin_absent_at(rest, i - 1) }
+}
+
+fn klin_donor(kx: Kx, st: LinSt) : LinSt = if kx.f.donor { kls_fresh(st, kir_donor_reg(), 1) } else { st }
 
 #[doc("True when register `n` holds a boxed value.")]
 pub(pkg) fn klf_boxed(kx: Kx, n: String) : Bool = match klin_slot_of(kx.slots, n) {
@@ -243,7 +265,7 @@ fn klin_let(kx: Kx, x: String, op: KOp, st: LinSt) : (LinSt, [LinV]) = {
   let fx = klo_fx(op, kx.fns)
   let (st0, vs) = klin_apply(kx, fx, st)
   let st1 = klin_implicit(kx, op, klin_gain(kx, op, st0))
-  if not klf_boxed(kx, x) { (st1, vs) }
+  if not klf_boxed(kx, x) { (klin_note(st1, x, op), vs) }
   else { match fx {
     LinFx(_, _, res) -> (klin_note(klin_bind(kx, x, res, st1), x, op), vs)
   } }
@@ -254,6 +276,8 @@ fn klin_note(st: LinSt, x: String, op: KOp) : LinSt = match op {
   KProj(KVar(d), _)       -> kls_view_of(st, x, d)
   KProjBorrow(KVar(d), _) -> kls_view_of(st, x, d)
   KCall("kaix_check_unique", [KVar(d)]) -> kls_unique_test(st, x, d)
+  KPrim(KpBox(_), [KVar(a)])            -> match kls_int_of(st, a) { Some(v) -> kls_int(st, x, v)  None -> st }
+  KPrim(KpEqRaw, [KVar(a), KIntV(n)])   -> match kls_int_of(st, a) { Some(v) -> kls_const(st, x, Some(v == n))  None -> st }
   _                       -> st
 }
 
@@ -357,7 +381,16 @@ pub(pkg) fn klin_term(kx: Kx, t: KTerm, st: LinSt) : ([(String, LinSt)], [LinV])
     (out, list_append(v2, v1))
   }
   KTrmcApply(v, _)                             -> klin_exit(klin_take(kx, kls_release(st, kir_armru_reg()), v, "trmc-apply"))
+  KSwitch(KVar(a), cs, d, _)                   -> match kls_int_of(st, a) {
+    Some(v) -> ([(klin_case(cs, d, v), st)], [])
+    None    -> (map(klc_succ(t), (l) => (l, st)), [])
+  }
   _                                            -> (map(klc_succ(t), (l) => (l, st)), [])
+}
+
+fn klin_case(cs: [KCase], d: String, v: Int) : String = match cs {
+  []               -> d
+  [KC(k, l), ...rest] -> if k == v { l } else { klin_case(rest, d, v) }
 }
 
 # The emitter frees a donor token left at exit.
@@ -424,20 +457,60 @@ pub(pkg) fn kir_lin_hook(kp: KProgram, path: String) : KProgram / File = {
 }
 
 #[doc("One line per violation in `kp`: function, kind and registers, tab-separated.")]
-pub(pkg) fn kir_lin_report(kp: KProgram) : [String] = klin_fns(kp_names(kp), kp.fns, klo_index(kp_names(kp), kp.fns))
+pub(pkg) fn kir_lin_report(kp: KProgram) : [String] = klin_fns(kp_names(kp), kp.fns, kp.fns, klo_index(kp_names(kp), kp.fns), [])
 
-fn klin_fns(nm: KNames, fs: [KFn], fns: LinFns) : [String] = match fs {
-  []           -> []
-  [f, ...rest] -> list_append(klin_fn_lines(nm, f, fns), klin_fns(nm, rest, fns))
+fn klin_fns(nm: KNames, all: [KFn], fs: [KFn], fns: LinFns, acc: [String]) : [String] = match fs {
+  []           -> acc
+  [f, ...rest] -> klin_fns(nm, all, rest, fns, list_append(acc, klin_fn_lines(nm, all, f, fns)))
 }
 
-fn klin_fn_lines(nm: KNames, f: KFn, fns: LinFns) : [String] = match f.kind {
+fn klin_fn_lines(nm: KNames, all: [KFn], f: KFn, fns: LinFns) : [String] = match f.kind {
   KFnFfi(_, _, _) -> []
   _               -> match f.blocks {
     []         -> []
-    [b0, ..._] ->
-      map(klin_dedupe(klin_check(klf_cx(f, fns), b0.label), []), (v) => klin_line(kfn_sym(nm, f), v))
+    [b0, ..._] -> {
+      let vs = if klin_fused(f.params) { klin_states_check(nm, all, f, fns, b0.label) }
+               else { klin_check(klf_cx(f, fns, None), b0.label) }
+      map(klin_dedupe(vs, []), (v) => klin_line(kfn_sym(nm, f), v))
+    }
   }
+}
+
+# Each dispatch state the program enters is walked on its own.
+fn klin_states_check(nm: KNames, all: [KFn], f: KFn, fns: LinFns, entry: String) : [LinV] =
+  klin_state_walks(f, fns, entry, klin_states(all, kfn_sym(nm, f), []), [])
+
+fn klin_state_walks(f: KFn, fns: LinFns, entry: String, ss: [FusedState], acc: [LinV]) : [LinV] = match ss {
+  []           -> acc
+  [s, ...rest] -> klin_state_walks(f, fns, entry, rest, list_append(acc, klin_check(klf_cx(f, fns, Some(s)), entry)))
+}
+
+# The states of the fused function `sym`: the tag and absent slots of each call into it.
+fn klin_states(fs: [KFn], sym: String, acc: [FusedState]) : [FusedState] = match fs {
+  []           -> acc
+  [f, ...rest] -> klin_states(rest, sym, klin_block_states(f.blocks, sym, acc))
+}
+
+fn klin_block_states(bs: [KBlock], sym: String, acc: [FusedState]) : [FusedState] = match bs {
+  []           -> acc
+  [b, ...rest] -> klin_block_states(rest, sym, klin_stmt_states(b.stmts, sym, acc))
+}
+
+fn klin_stmt_states(ss: [KStmt], sym: String, acc: [FusedState]) : [FusedState] = match ss {
+  []           -> acc
+  [s, ...rest] -> klin_stmt_states(rest, sym, match s {
+    KLet(_, _, KCall(c, xs), _) -> klin_add_state(c, xs, sym, acc)
+    KDo(KCall(c, xs), _)        -> klin_add_state(c, xs, sym, acc)
+    _                           -> acc
+  })
+}
+
+fn klin_add_state(c: String, xs: [KVal], sym: String, acc: [FusedState]) : [FusedState] = match xs {
+  [KIntV(k), ..._] ->
+    if c == sym and not any(acc, (s) => match s { FusedState(t, _) -> t == k }) {
+      [FusedState(k, map(xs, (x) => match x { KUnitV -> true  _ -> false })), ...acc]
+    } else { acc }
+  _ -> acc
 }
 
 fn klin_line(sym: String, v: LinV) : String = match v { LinV(k, r) -> concat_all([sym, "\t", k, "\t", r]) }
