@@ -18,6 +18,8 @@ import compiler.ast
 import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
+import compiler.core_types
+import compiler.expr_positions
 import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
@@ -44,12 +46,7 @@ pub fn obl_handled_effects(decls: [Decl]) : [SymId] = obl_decls_heads(decls, [])
 
 #[doc("evidence: true when some fn in the program installs a `handle ... with <eff>`.")]
 pub fn obl_eff_handled_anywhere(decls: [Decl], eff: SymId) : Bool =
-  sym_raw(eff) >= 0 and obl_head_known(obl_handled_effects(decls), eff)
-
-fn obl_head_known(acc: [SymId], s: SymId) : Bool = match acc {
-  []           -> false
-  [a, ...rest] -> sym_raw(a) == sym_raw(s) or obl_head_known(rest, s)
-}
+  sym_raw(eff) >= 0 and effect_among(obl_handled_effects(decls), eff)
 
 fn obl_decls_heads(ds: [Decl], acc: [SymId]) : [SymId] = match ds {
   []           -> acc
@@ -59,93 +56,22 @@ fn obl_decls_heads(ds: [Decl], acc: [SymId]) : [SymId] = match ds {
   }
 }
 
-# Every `handle ... with <eff>` under `e` adds its effect to `acc`. A
-# read-only structural descent over every sub-expression form (the
-# `_ -> acc` arm covers leaves).
-fn obl_body_heads(e: Expr, acc: [SymId]) : [SymId] = match e.kind {
-  EHandle(body, head, _, init_opt, _, clauses, ret_opt) ->
-    obl_ret_heads(ret_opt, obl_clauses_heads(clauses, obl_opt_heads(init_opt, obl_body_heads(body, obl_add_head(ref_sym(head), acc)))))
-  ECall(callee, args_)  -> obl_any_heads(args_, obl_body_heads(callee, acc))
-  EIntrinsic(_, args_)  -> obl_any_heads(args_, acc)
-  ESurface(sf)  -> obl_any_heads(surface_children(sf), acc)
-  EField(b, _)          -> obl_body_heads(b, acc)
-  EUnop(_, x)           -> obl_body_heads(x, acc)
-  EBang(x)              -> obl_body_heads(x, acc)
-  ELitUnit(x, _)        -> obl_body_heads(x, acc)
-  ELambda(_, b)         -> obl_body_heads(b, acc)
-  EIndex(a, b)          -> obl_heads2(a, b, acc)
-  EBinop(_, a, b)       -> obl_heads2(a, b, acc)
-  EPipe(a, b)           -> obl_heads2(a, b, acc)
-  EDispatchPipe(_, a, b) -> obl_heads2(a, b, acc)
-  EIf(c, t, eo)         -> obl_opt_heads(eo, obl_heads2(c, t, acc))
-  ERange(a, b, eo)      -> obl_opt_heads(eo, obl_heads2(a, b, acc))
-  EMatch(scr, arms)     -> obl_arms_heads(arms, obl_body_heads(scr, acc))
-  ERecordLit(_, fs)     -> obl_fields_heads(fs, acc)
-  EList(els)            -> obl_elems_heads(els, acc)
-  EBlock(stmts, tail)   -> obl_opt_heads(tail, obl_stmts_heads(stmts, acc))
-  _                     -> acc
+# Every `handle ... with <eff>` under `e` adds its effect to `acc`; the
+# descent goes through the one enumeration of an expression's positions.
+fn obl_body_heads(e: Expr, acc: [SymId]) : [SymId] =
+  obl_pos_heads(xp_positions(e), match e.kind {
+    EHandle(_, head, _, _, _, _, _) -> obl_add_head(ref_sym(head), acc)
+    _ -> acc
+  })
+
+fn obl_pos_heads(ps: [XPos], acc: [SymId]) : [SymId] = match ps {
+  [] -> acc
+  [XP(_, c), ...rest] -> obl_pos_heads(rest, obl_body_heads(c, acc))
 }
 
 # An absent id names no effect.
 fn obl_add_head(s: SymId, acc: [SymId]) : [SymId] =
-  if sym_raw(s) < 0 or obl_head_known(acc, s) { acc } else { [s, ...acc] }
-
-fn obl_heads2(a: Expr, b: Expr, acc: [SymId]) : [SymId] =
-  obl_body_heads(b, obl_body_heads(a, acc))
-
-fn obl_opt_heads(eo: Option[Expr], acc: [SymId]) : [SymId] = match eo {
-  Some(e) -> obl_body_heads(e, acc)   None -> acc
-}
-
-fn obl_any_heads(es: [Expr], acc: [SymId]) : [SymId] = match es {
-  []           -> acc
-  [h, ...rest] -> obl_any_heads(rest, obl_body_heads(h, acc))
-}
-
-fn obl_arms_heads(arms: [Arm], acc: [SymId]) : [SymId] = match arms {
-  []           -> acc
-  [a, ...rest] -> match a {
-    Arm(_, og, body) -> obl_arms_heads(rest, obl_body_heads(body, obl_opt_heads(og, acc)))
-  }
-}
-
-fn obl_fields_heads(fs: [FieldInit], acc: [SymId]) : [SymId] = match fs {
-  []           -> acc
-  [f, ...rest] -> match f { FI(_, e) -> obl_fields_heads(rest, obl_body_heads(e, acc)) }
-}
-
-fn obl_elems_heads(els: [ListElem], acc: [SymId]) : [SymId] = match els {
-  []            -> acc
-  [el, ...rest] -> match el {
-    ElPlain(e)  -> obl_elems_heads(rest, obl_body_heads(e, acc))
-    ElSpread(e) -> obl_elems_heads(rest, obl_body_heads(e, acc))
-  }
-}
-
-fn obl_stmts_heads(ss: [Stmt], acc: [SymId]) : [SymId] = match ss {
-  []           -> acc
-  [s, ...rest] -> obl_stmts_heads(rest, obl_stmt_heads(s, acc))
-}
-
-fn obl_stmt_heads(s: Stmt, acc: [SymId]) : [SymId] = match s {
-  SLet(_, _, e)        -> obl_body_heads(e, acc)
-  SVar(_, _, e, _, _)  -> obl_body_heads(e, acc)
-  SExprStmt(e)         -> obl_body_heads(e, acc)
-  SAssert(e, og)       -> obl_opt_heads(og, obl_body_heads(e, acc))
-  SIndexAssign(a, b, c, _, _) -> obl_body_heads(c, obl_body_heads(b, obl_body_heads(a, acc)))
-  SAssign(a, c, _, _) -> obl_body_heads(c, obl_body_heads(a, acc))
-  SUse(_, _, _)        -> acc
-}
-
-fn obl_clauses_heads(cs: [HClause], acc: [SymId]) : [SymId] = match cs {
-  []           -> acc
-  [c, ...rest] -> match c { HC(_, _, b, _, _) -> obl_clauses_heads(rest, obl_body_heads(b, acc)) }
-}
-
-fn obl_ret_heads(ret_opt: Option[HReturn], acc: [SymId]) : [SymId] = match ret_opt {
-  Some(r) -> match r { HR(_, b, _, _) -> obl_body_heads(b, acc) }
-  None    -> acc
-}
+  if sym_raw(s) < 0 or effect_among(acc, s) { acc } else { [s, ...acc] }
 
 # ----------------------------------------------------------------------
 # Distinct live-instance count for an effect, keyed by handler alias binder.
