@@ -31,6 +31,7 @@ KaiValue *kaix_array_set_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_array_take_thunk(KaiValue *s, KaiValue **a, int n);
 void kaix_assert_check(KaiValue *cond, const char *msg);
 void kaix_assert_check_with_value(KaiValue *cond, const char *base_msg, const char *ident_name, KaiValue *val);
+void kaix_bench_run_one(const char *desc, KaiValue *(*body)(void));
 void kaix_bench_summary_exit(void);
 static inline KaiValue *kaix_bit_and(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_bit_clear(KaiValue *a, KaiValue *b);
@@ -554,6 +555,7 @@ static inline int64_t kaix_take_enum(KaiValue *v);
 static inline double kaix_take_real(KaiValue *v);
 static inline KaiValue *kaix_take_slot(KaiValue *cell, KaiValue *child);
 void kaix_test_drive(void);
+void kaix_test_register(const char *desc, KaiValue *(*body)(void), int line, const char *home);
 void kaix_test_summary_exit(void);
 static inline int kaix_to_bool(KaiValue *v);
 static inline uint32_t kaix_to_char(KaiValue *v);
@@ -583,7 +585,7 @@ static inline KaiValue *kaix_variant_arg(KaiValue *v, int i);
 static inline KaiValue *kaix_variant_arg_borrow(KaiValue *v, int i);
 static inline double kaix_variant_arg_f64(KaiValue *v, int i);
 static inline int64_t kaix_variant_arg_i64(KaiValue *v, int i);
-static inline KAI_RT_SHARED KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i);
+static inline KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i);
 static inline KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name, int n, KaiValue **args);
 static inline KaiValue *kaix_variant_at_argv(int32_t tag, const char *name, int n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n, KaiVarSlot *slots);
@@ -1138,7 +1140,7 @@ static inline double kaix_variant_arg_f64(KaiValue *v, int i) {
 static inline int64_t kaix_variant_arg_i64(KaiValue *v, int i) {
     return kai_var_slots(v)[i].i64;
 }
-static inline KAI_RT_SHARED KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i) {
+static inline KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i) {
     return kai_variant_slot_box(v, i);
 }
 static inline KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name, int n, KaiValue **args) {
