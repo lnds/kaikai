@@ -418,10 +418,10 @@ pub(pkg) fn kir_inline_program(kp: KProgram) : KProgram =
   if kin_max_stmts() <= 0 and kin_max_reuse_stmts() <= 0 { kp }
   else {
     let nm    = kp_names(kp)
-    let tmpls = kin_collect(kp.fns, nm, [])
-    let fns1  = match tmpls { [] -> kp.fns  _ -> kin_fn_loop(kp.fns, nm, tmpls, []) }
-    let lams  = kin_lam_collect(fns1, nm, [])
-    let fns2  = match lams { [] -> fns1 _ -> kin_beta_loop(fns1, lams, []) }
+    let tmpls = kin_tmpls(kin_collect(kp.fns, nm, []))
+    let fns1  = if tmpls.n == 0 { kp.fns } else { kin_fn_loop(kp.fns, nm, tmpls, []) }
+    let lams  = kin_tmpls(kin_lam_collect(fns1, nm, []))
+    let fns2  = if lams.n == 0 { fns1 } else { kin_beta_loop(fns1, lams, []) }
     kvs_program(KProgram { types: kp.types, fns: fns2,
                handlers: kp.handlers,
                install_order: kp.install_order,
@@ -432,7 +432,7 @@ pub(pkg) fn kir_inline_program(kp: KProgram) : KProgram =
                runners: kp.runners, exports: kp.exports, entry: kp.entry, tab: kp.tab, specs: kp.specs, reg: kp.reg, ids: kp.ids, reuse_tags: kp.reuse_tags })
   }
 
-fn kin_beta_loop(fs: [KFn], lams: [KinTmpl], acc: [KFn]) : [KFn] = match fs {
+fn kin_beta_loop(fs: [KFn], lams: KinTmpls, acc: [KFn]) : [KFn] = match fs {
   []           -> list_reverse(acc)
   [f, ...rest] -> kin_beta_loop(rest, lams, [kin_beta_fn(f, lams), ...acc])
 }
@@ -641,23 +641,18 @@ fn kin_term_ok(t: KTerm) : Bool = match t {
   _                      -> false
 }
 
-fn kin_find(tmpls: [KinTmpl], sym: String) : Option[KFn] = match tmpls {
-  []            -> None
-  [KT(s, f), ...rest] -> if s == sym { Some(f) } else { kin_find(rest, sym) }
-}
-
 # --- Caller walk ----------------------------------------------------------
 
-fn kin_fn_loop(fs: [KFn], nm: KNames, tmpls: [KinTmpl], acc: [KFn]) : [KFn] = match fs {
+fn kin_fn_loop(fs: [KFn], nm: KNames, tmpls: KinTmpls, acc: [KFn]) : [KFn] = match fs {
   []           -> list_reverse(acc)
   [f, ...rest] -> kin_fn_loop(rest, nm, tmpls, [kin_fn(f, kfn_sym(nm, f), tmpls), ...acc])
 }
 
-fn kin_fn(f: KFn, sym: String, tmpls: [KinTmpl]) : KFn = match kin_fn_blocks(f.blocks, tmpls, sym, 0, []) {
+fn kin_fn(f: KFn, sym: String, tmpls: KinTmpls) : KFn = match kin_fn_blocks(f.blocks, tmpls, sym, 0, []) {
   KBO(bs, _) -> kfn_with_blocks(f, bs)
 }
 
-fn kin_fn_blocks(bs: [KBlock], tmpls: [KinTmpl], caller: String, c: Int, acc: [KBlock]) : KinBlksOut = match bs {
+fn kin_fn_blocks(bs: [KBlock], tmpls: KinTmpls, caller: String, c: Int, acc: [KBlock]) : KinBlksOut = match bs {
   []           -> KBO(list_reverse(acc), c)
   [b, ...rest] -> match kin_block(b, tmpls, caller, c) {
     KBO(nbs, c2) -> kin_fn_blocks(rest, tmpls, caller, c2, kin_prepend_rev(nbs, acc))
@@ -669,7 +664,7 @@ fn kin_prepend_rev(xs: [KBlock], acc: [KBlock]) : [KBlock] = match xs {
   [x, ...rest] -> kin_prepend_rev(rest, [x, ...acc])
 }
 
-fn kin_block(b: KBlock, tmpls: [KinTmpl], caller: String, c: Int) : KinBlksOut =
+fn kin_block(b: KBlock, tmpls: KinTmpls, caller: String, c: Int) : KinBlksOut =
   if kin_region_some(b.region_id) { KBO([b], c) }
   else { kin_scan(b.label, b.stmts, b.term, tmpls, caller, c, []) }
 
@@ -685,7 +680,7 @@ fn kin_block(b: KBlock, tmpls: [KinTmpl], caller: String, c: Int) : KinBlksOut =
 # use inside the paste. The materialised register's name is exactly
 # `param+sfx`, which is what the clone's fallback rename resolves an
 # unbound param read to.
-fn kin_scan(label: String, ss: [KStmt], term: KTerm, tmpls: [KinTmpl],
+fn kin_scan(label: String, ss: [KStmt], term: KTerm, tmpls: KinTmpls,
             caller: String, c: Int, pre_rev: [KStmt]) : KinBlksOut = match ss {
   [] -> KBO([KBlock { label: label, stmts: list_reverse(pre_rev), term: term, region_id: None }], c)
   [s, ...rest] -> match kin_site(s, tmpls, caller) {
@@ -718,10 +713,10 @@ fn kin_scan(label: String, ss: [KStmt], term: KTerm, tmpls: [KinTmpl],
 # The site filter: a `KLet`-bound saturated direct call to an admitted
 # template other than the caller itself. An `SInt32` destination is the
 # one register kind the raw-literal init cannot seed, so it stays a call.
-fn kin_site(s: KStmt, tmpls: [KinTmpl], caller: String) : Option[KFn] = match s {
+fn kin_site(s: KStmt, tmpls: KinTmpls, caller: String) : Option[KFn] = match s {
   KLet(_, slot, KCall(sym, cargs), _) ->
     if sym == caller or kin_slot_is_i32(slot) { None }
-    else { match kin_find(tmpls, sym) {
+    else { match kin_tmpl_find(tmpls, sym) {
       Some(f) -> if list_length(f.params) == list_length(cargs) { Some(f) } else { None }
       None    -> None
     } }
