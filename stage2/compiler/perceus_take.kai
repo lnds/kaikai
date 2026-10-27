@@ -11,7 +11,9 @@ import compiler.perceus_reads
 
 # One read of an owned local: the local, where it sits, the field it
 # projects (empty for a whole read) and whether a closure holds it.
-type PtkRead = PtkRead(LocalId, Int, Int, String, Bool)
+type PtkField = PfWhole | PfOf(String)
+
+type PtkRead = PtkRead(LocalId, Int, Int, PtkField, Bool)
 
 #[doc("The body with every projection of an owned record's last read of that field turned into a take. `owned` lists the locals whose reads this body pays for.")]
 pub(pkg) fn ptk_take_fields(body: Expr, owned: [Binder]) : Expr = match owned {
@@ -22,15 +24,18 @@ pub(pkg) fn ptk_take_fields(body: Expr, owned: [Binder]) : Expr = match owned {
   }
 }
 
-fn ptk_is_projection(r: PtkRead) : Bool = match r { PtkRead(_, _, _, f, _) -> f != "" }
+fn ptk_is_projection(r: PtkRead) : Bool = match r {
+  PtkRead(_, _, _, PfOf(_), _) -> true
+  _                            -> false
+}
 
 # ---- reads ----
 
 fn ptk_reads(e: Expr, owned: [Binder], in_lam: Bool, acc: [PtkRead]) : [PtkRead] = match e.kind {
-  ELocal(l) -> if pcs_has(owned, l) { [PtkRead(l, e.line, e.col, "", in_lam), ...acc] } else { acc }
+  ELocal(l) -> if pcs_has(owned, l) { [PtkRead(l, e.line, e.col, PfWhole, in_lam), ...acc] } else { acc }
   EField(b, f) -> match ptk_base(b) {
     Some(lx) -> match lx.kind {
-      ELocal(l) -> if pcs_has(owned, l) { [PtkRead(l, lx.line, lx.col, f, in_lam), ...acc] } else { acc }
+      ELocal(l) -> if pcs_has(owned, l) { [PtkRead(l, lx.line, lx.col, PfOf(f), in_lam), ...acc] } else { acc }
       _         -> acc
     }
     None -> ptk_reads(b, owned, in_lam, acc)
@@ -87,7 +92,7 @@ fn ptk_take(e: Expr, lx: Expr, f: String) : Expr =
 fn ptk_at(reads: [PtkRead], l: LocalId, line: Int, col: Int, f: String) : Int = match reads {
   []                                       -> 0
   [PtkRead(m, rl, rc, g, _), ...rest] ->
-    (if local_eq(m, l) and rl == line and rc == col and (g == f or g == "") { 1 } else { 0 }) + ptk_at(rest, l, line, col, f)
+    (if local_eq(m, l) and rl == line and rc == col and ptk_covers(g, f) { 1 } else { 0 }) + ptk_at(rest, l, line, col, f)
 }
 
 # Nothing the traversal meets after the read at `(line, col)` reads `f` or the
@@ -103,7 +108,18 @@ fn ptk_after_free(reads: [PtkRead], l: LocalId, line: Int, col: Int, f: String) 
   [] -> false
   [PtkRead(m, rl, rc, g, _), ...rest] ->
     if not local_eq(m, l) { ptk_after_free(rest, l, line, col, f) }
-    else if rl == line and rc == col and g == f { true }
-    else if g == "" or g == f { false }
+    else if rl == line and rc == col and ptk_is_field(g, f) { true }
+    else if ptk_covers(g, f) { false }
     else { ptk_after_free(rest, l, line, col, f) }
+}
+
+# A read of `g` reads the field `f`: the whole record, or that field.
+fn ptk_is_field(g: PtkField, f: String) : Bool = match g {
+  PfWhole -> false
+  PfOf(h) -> h == f
+}
+
+fn ptk_covers(g: PtkField, f: String) : Bool = match g {
+  PfWhole -> true
+  PfOf(h) -> h == f
 }
