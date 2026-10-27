@@ -6583,7 +6583,7 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4 \
   vec_var_loop_write:470:0 vec_in_ctor_write:400:0 \
   vec_own_record_fresh:20000:0 vec_own_record_spread:20000:0 vec_own_record_pattern:20000:0 \
-  vec_own_tuple_let:20000:0 vec_own_var_module_set:20000:0 vec_own_handler_state:20000:0
+  vec_own_tuple_let:20000:0 vec_own_var_module_set:20000:0 vec_own_handler_state:20000:0 vec_own_dead_closure:40000:0
 
 test-perceus-vec-lend-write: $(TARGET) build
 	@set -e; \
