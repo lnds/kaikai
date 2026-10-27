@@ -18,9 +18,62 @@ import compiler.util
 #[doc("What printing one fn needs: the symbol tables, the fn index, the handler declarations, the fn being printed and its registers by name.")]
 pub type KcCx = { tab: SymTab, nm: KNames, fx: NFnIndex, hs: [KHandlerDecl], defs: [KDefault], cur: String, regs: NameIndex[RSpec] }
 
-#[doc("The context of printing `f`: its registers are those `collect_fn_specs` decides.")]
-pub fn kc_cx_for(base: KcCx, f: KFn, sym: String) : KcCx =
-  KcCx { ...base, cur: sym, regs: kc_regs_index(collect_fn_specs(f), idx_empty()) }
+#[doc("The context of printing the fn `sym` whose registers are `specs`.")]
+pub fn kc_cx_with(base: KcCx, sym: String, specs: [RSpec]) : KcCx =
+  KcCx { ...base, cur: sym, regs: kc_regs_index(specs, idx_empty()) }
+
+#[doc("The context of printing the fn `sym` before its registers matter, such as for its signature.")]
+pub fn kc_cx_head(base: KcCx, sym: String) : KcCx = KcCx { ...base, cur: sym }
+
+#[doc("The register of `f` in order of first appearance: its params, then every binder and store destination, a name bound at two slots widening to boxed.")]
+pub fn kc_fn_specs(f: KFn) : [RSpec] = kc_specs_done(kc_specs_blocks(f.blocks, kc_specs_params(f.params, KcSpecs { acc: [], seen: idx_empty(), wide: idx_empty() })))
+
+type KcSpecs = { acc: [RSpec], seen: NameIndex[RSpec], wide: NameIndex[String] }
+
+fn kc_specs_find(chain: [RSpec], n: String) : Option[RSpec] = match chain {
+  [] -> None
+  [r, ...rest] -> match r { RS(m, _) -> if m == n { Some(r) } else { kc_specs_find(rest, n) } }
+}
+
+fn kc_specs_add(st: KcSpecs, n: String, s: KSlot) : KcSpecs = match kc_specs_find(idx_chain(st.seen, n), n) {
+  None -> KcSpecs { acc: [RS(n, s), ...st.acc], seen: idx_prepend(st.seen, n, RS(n, s)), wide: st.wide }
+  Some(RS(_, cur)) -> if nslot_tag(cur) == nslot_tag(s) { st } else { KcSpecs { ...st, wide: idx_prepend(st.wide, n, n) } }
+}
+
+fn kc_specs_store(st: KcSpecs, n: String) : KcSpecs = match kc_specs_find(idx_chain(st.seen, n), n) {
+  None -> kc_specs_add(st, n, SBoxed)
+  Some(_) -> st
+}
+
+fn kc_specs_boxed_all(st: KcSpecs, ns: [String]) : KcSpecs = match ns {
+  [] -> st
+  [n, ...rest] -> kc_specs_boxed_all(kc_specs_add(st, n, SBoxed), rest)
+}
+
+fn kc_specs_params(ps: [KParam], st: KcSpecs) : KcSpecs = match ps {
+  [] -> st
+  [p, ...rest] -> kc_specs_params(rest, kc_specs_add(st, p.name, p.slot))
+}
+
+fn kc_specs_blocks(bs: [KBlock], st: KcSpecs) : KcSpecs = match bs {
+  [] -> st
+  [b, ...rest] -> kc_specs_blocks(rest, kc_specs_stmts(b.stmts, st))
+}
+
+fn kc_specs_stmts(ss: [KStmt], st: KcSpecs) : KcSpecs = match ss {
+  [] -> st
+  [s, ...rest] -> kc_specs_stmts(rest, match s {
+    KLet(n, slot, _, _) -> kc_specs_add(st, n, slot)
+    KStore(n, _, _) -> kc_specs_store(st, n)
+    KBindEvState(_, _, regs, _) -> kc_specs_boxed_all(st, regs)
+    KBindSelfState(regs, _) -> kc_specs_boxed_all(st, regs)
+    _ -> st
+  })
+}
+
+fn kc_specs_done(st: KcSpecs) : [RSpec] = map(list_reverse(st.acc), (r) => match r {
+  RS(n, s) -> if list_has(idx_chain(st.wide, n), n) { RS(n, SBoxed) } else { RS(n, s) }
+})
 
 fn kc_regs_index(specs: [RSpec], ix: NameIndex[RSpec]) : NameIndex[RSpec] = match specs {
   [] -> ix
@@ -42,21 +95,30 @@ fn kc_hex_digit(n: Int) : String = string_slice("0123456789abcdef", n, 1)
 fn kc_plain_char(c: Int) : Bool =
   (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
 
+fn kc_all_plain(s: String, i: Int, n: Int) : Bool =
+  i >= n or ((kc_plain_char(char_to_int(char_at_or_zero(s, i))) or char_to_int(char_at_or_zero(s, i)) == 95) and kc_all_plain(s, i + 1, n))
+
 fn kc_mangle_loop(s: String, i: Int, n: Int, acc: [String]) : String =
   if i >= n { concat_all(list_reverse(acc)) }
   else {
     let c = char_to_int(char_at_or_zero(s, i))
-    let piece = if kc_plain_char(c) { string_slice(s, i, 1) }
-                else if c == 95 { "__" }
-                else { concat_all(["_", kc_hex_digit(c / 16 % 16), kc_hex_digit(c % 16)]) }
+    let piece = if kc_plain_char(c) or c == 95 { string_slice(s, i, 1) }
+                else { concat_all(["$", kc_hex_digit(c / 16 % 16), kc_hex_digit(c % 16)]) }
     kc_mangle_loop(s, i + 1, n, [piece, ...acc])
   }
 
-#[doc("A C identifier for a KIR register or label name: alphanumerics stay, `_` doubles, every other byte becomes `_` and two hex digits. Injective.")]
-pub fn kc_mangle(s: String) : String = kc_mangle_loop(s, 0, string_length(s), [])
+#[doc("A C identifier for a KIR register or label name: alphanumerics and `_` stay, every other byte becomes `$` and two hex digits. Injective.")]
+pub fn kc_mangle(s: String) : String =
+  if kc_all_plain(s, 0, string_length(s)) { s } else { kc_mangle_loop(s, 0, string_length(s), []) }
 
-#[doc("The C variable of register `n`.")]
-pub fn kc_reg(n: String) : String = cat2("r_", kc_mangle(n))
+fn kc_all_digits(s: String, i: Int, n: Int) : Bool =
+  i >= n or (char_to_int(char_at_or_zero(s, i)) >= 48 and char_to_int(char_at_or_zero(s, i)) <= 57 and kc_all_digits(s, i + 1, n))
+
+fn kc_is_temp(n: String) : Bool = string_length(n) > 2 and string_slice(n, 0, 2) == ".t" and kc_all_digits(n, 2, string_length(n))
+
+#[doc("The C variable of register `n`: a numbered temporary is `t<N>`, every other register `r_` and its mangled name.")]
+pub fn kc_reg(n: String) : String =
+  if kc_is_temp(n) { string_slice(n, 1, string_length(n) - 1) } else { cat2("r_", kc_mangle(n)) }
 
 #[doc("The C label of block `l`.")]
 pub fn kc_label(l: String) : String = cat2("L_", kc_mangle(l))
