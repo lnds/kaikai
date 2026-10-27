@@ -25,8 +25,8 @@ pub type KcFnPrinters = { def: (KcCx, KFn) -> String, proto: (KcCx, KFn) -> Stri
 pub fn kc_ffi_shim(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) : String =
   kc_ffi_fn(cx, f, csym, pks, rk)
 
-fn kcg_prelude() : String = concat_all([
-  "#include <runtime_llvm.c>\n",
+fn kcg_prelude(modular: Bool) : String = concat_all([
+  if modular { "#include <runtime_llvm_decls.h>\n" } else { "#include <runtime_llvm.c>\n" },
   "#ifdef __APPLE__\n#define KC_ASM(s) \"_\" s\n#else\n#define KC_ASM(s) s\n#endif\n",
   "#if defined(__clang__)\n#define KC_MUSTTAIL __attribute__((musttail))\n#elif defined(__GNUC__) && __GNUC__ >= 15\n#define KC_MUSTTAIL [[gnu::musttail]]\n#else\n#define KC_MUSTTAIL\n#endif\n",
   "#define KD(x) kaix_internal_drop(x)\n#define KU(x) kaix_internal_dup(x)\n",
@@ -183,7 +183,7 @@ pub fn kc_program(kp: KProgram, ps: KcFnPrinters, bmode: BuildMode, decls: [Decl
   let declared = kcg_sym_index(base.nm, kp.fns)
   let defaults = nemit_entry_defaults(kp, bmode)
   let pieces = [
-    kcg_prelude(),
+    kcg_prelude(false),
     concat_all(map(kp.fns, (f) => kcg_proto(base, ps, f))),
     concat_all(map(kp.fns, (f) => kcg_thunk_proto(f, base, valued))),
     concat_all(map(kp.synth_defaults, (d) => kcg_default_decls(declared, d))),
@@ -195,4 +195,134 @@ pub fn kc_program(kp: KProgram, ps: KcFnPrinters, bmode: BuildMode, decls: [Decl
     kc_exports(kp.exports, (s) => c_user_thunk_sym(s))
   ]
   concat_all(pieces)
+}
+
+# ---- separate translation units ----------------------------------------------------
+
+#[doc("One translation unit of the separately compiled program: the stem it is named by and its C text.")]
+pub type KcTu = { stem: String, header: String, body: String }
+
+#[doc("The program split by module: one unit per module, each with the header slice it includes, the root unit holding the program-wide definitions.")]
+pub type KcModular = { tus: [KcTu] }
+
+type KcSymText = KST(String, String)
+
+type KcStemFn = KSF(String, KFn)
+
+fn kcg_stem(mo: Option[String]) : String = match mo {
+  None    -> "__root__"
+  Some(m) -> string_join(string_split(m, "."), "_")
+}
+
+fn kcg_default_extern(tab: SymTab, d: KDefault) : String = match d {
+  KDef(esym, ops) -> {
+    let eff = rt_name(tab, esym)
+    concat_all([
+      "extern int64_t _kai_default_ev_", eff, "[", int_to_string(nfx_op_base() + list_length(ops)), "];\n",
+      "extern int64_t _kai_default_node_", eff, "[", int_to_string(nfx_node_slots()), "];\n"
+    ])
+  }
+}
+
+fn kcg_default_defs(tab: SymTab, d: KDefault) : String = match d {
+  KDef(esym, ops) -> {
+    let eff = rt_name(tab, esym)
+    concat_all([
+      "int64_t _kai_default_ev_", eff, "[", int_to_string(nfx_op_base() + list_length(ops)), "] __attribute__((aligned(16)));\n",
+      "int64_t _kai_default_node_", eff, "[", int_to_string(nfx_node_slots()), "] __attribute__((aligned(16)));\n"
+    ])
+  }
+}
+
+type KcGroup = { ix: NameIndex[KcStemFn], seen: NameIndex[String], stems: [String] }
+
+fn kcg_group(fns: [KFn], g: KcGroup) : KcGroup = match fns {
+  [] -> KcGroup { ix: g.ix, seen: g.seen, stems: list_reverse(g.stems) }
+  [f, ...rest] -> {
+    let st = kcg_stem(f.mo)
+    let fresh = not list_has(idx_chain(g.seen, st), st)
+    kcg_group(rest, KcGroup {
+      ix: idx_prepend(g.ix, st, KSF(st, f)),
+      seen: if fresh { idx_prepend(g.seen, st, st) } else { g.seen },
+      stems: if fresh { [st, ...g.stems] } else { g.stems } })
+  }
+}
+
+fn kcg_stem_fns(g: KcGroup, st: String) : [KFn] = list_reverse(kcg_stem_fns_in(idx_chain(g.ix, st), st))
+
+fn kcg_stem_fns_in(es: [KcStemFn], st: String) : [KFn] = match es {
+  [] -> []
+  [KSF(n, f), ...rest] -> if n == st { [f, ...kcg_stem_fns_in(rest, st)] } else { kcg_stem_fns_in(rest, st) }
+}
+
+fn kcg_sym_texts(base: KcCx, ps: KcFnPrinters, valued: NameIndex[String], fns: [KFn], ix: NameIndex[KcSymText]) : NameIndex[KcSymText] = match fns {
+  [] -> ix
+  [f, ...rest] -> {
+    let k = kfn_sym(base.nm, f)
+    let t = kcg_thunk_proto(f, base, valued)
+    let ix1 = idx_prepend(ix, k, KST(k, kcg_proto(base, ps, f)))
+    kcg_sym_texts(base, ps, valued, rest, if t == "" { ix1 } else { idx_prepend(ix1, c_user_thunk_sym(k), KST(c_user_thunk_sym(k), t)) })
+  }
+}
+
+fn kcg_text_of(ix: NameIndex[KcSymText], sym: String) : String = kcg_text_pick(idx_chain(ix, sym), sym)
+
+fn kcg_text_pick(es: [KcSymText], sym: String) : String = match es {
+  [] -> ""
+  [KST(n, t), ...rest] -> if n == sym { t } else { kcg_text_pick(rest, sym) }
+}
+
+fn kcg_stem_refs(fns: [KFn], hs: [KHandlerDecl], seen: NameIndex[String], acc: [String]) : [String] = match fns {
+  [] -> acc
+  [f, ...rest] -> {
+    let r = kcg_refs_fresh(kfn_refs(f, hs), seen, acc)
+    kcg_stem_refs(rest, hs, r.seen, r.acc)
+  }
+}
+
+type KcRefAcc = { seen: NameIndex[String], acc: [String] }
+
+fn kcg_refs_fresh(rs: [String], seen: NameIndex[String], acc: [String]) : KcRefAcc = match rs {
+  [] -> KcRefAcc { seen: seen, acc: acc }
+  [r, ...rest] ->
+    if list_has(idx_chain(seen, r), r) { kcg_refs_fresh(rest, seen, acc) }
+    else { kcg_refs_fresh(rest, idx_prepend(seen, r, r), [r, ...acc]) }
+}
+
+fn kcg_own_syms(base: KcCx, fns: [KFn]) : [String] = map(fns, (f) => kfn_sym(base.nm, f))
+
+fn kcg_slice(base: KcCx, hs: [KHandlerDecl], texts: NameIndex[KcSymText], fns: [KFn]) : String = {
+  let refs = kcg_stem_refs(fns, hs, idx_empty(), kcg_own_syms(base, fns))
+  let own_thunks = map(kcg_own_syms(base, fns), c_user_thunk_sym)
+  concat_all(map(sort_by(list_append(refs, own_thunks), (a, b) => if a < b { 0 - 1 } else if a == b { 0 } else { 1 }), (sy) => kcg_text_of(texts, sy)))
+}
+
+#[doc("As `kc_program`, split by module for separate compilation: each unit includes a header slice (prelude, the prototypes its fns name, `extern` default evidence); a module's unit defines its fns, and the root unit also holds the program-wide definitions (default evidence, hooks, protocol tables, the runner driver, exports) and sees every prototype.")]
+pub fn kc_program_modular(kp: KProgram, ps: KcFnPrinters, bmode: BuildMode, decls: [Decl], nfns: [EFn], nvariants: [VariantEntry]) : KcModular = {
+  let base = kcg_base(kp, decls)
+  let valued = ndecl_valued(kp)
+  let declared = kcg_sym_index(base.nm, kp.fns)
+  let defaults = nemit_entry_defaults(kp, bmode)
+  let texts = kcg_sym_texts(base, ps, valued, kp.fns, idx_empty())
+  let g = kcg_group(kp.fns, KcGroup { ix: idx_empty(), seen: idx_empty(), stems: [] })
+  let stems = if list_has(g.stems, "__root__") { g.stems } else { ["__root__", ...g.stems] }
+  let common = concat_all([
+    kcg_prelude(true),
+    concat_all(map(kp.synth_defaults, (d) => kcg_default_decls(declared, d))),
+    concat_all(map(kp.synth_defaults, (d) => kcg_default_extern(kp.tab, d)))
+  ])
+  let root_header = concat_all([common, concat_all(map(kp.fns, (f) => kcg_proto(base, ps, f))), concat_all(map(kp.fns, (f) => kcg_thunk_proto(f, base, valued)))])
+  let root_extra = concat_all([
+    concat_all(map(kp.synth_defaults, (d) => kcg_default_defs(kp.tab, d))),
+    kcg_defaults_hooks(kp.tab, defaults),
+    kc_proto_section(decls, kp.tab, kp.ids, nvariants, nfns, kp.reuse_tags, declared),
+    kcg_runner_driver(base, kp.runners, bmode),
+    kc_exports(kp.exports, (s) => c_user_thunk_sym(s))
+  ])
+  KcModular { tus: map(stems, (st) => {
+    let fns = kcg_stem_fns(g, st)
+    let body = concat_all(map(fns, (f) => kcg_def(base, ps, valued, f)))
+    if st == "__root__" { KcTu { stem: st, header: root_header, body: cat2(body, root_extra) } }
+    else { KcTu { stem: st, header: cat2(common, kcg_slice(base, kp.handlers, texts, fns)), body: body } }
+  }) }
 }
