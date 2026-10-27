@@ -11,14 +11,18 @@ import compiler.symtab
 import compiler.written
 import compiler.util
 import compiler.module_table
+import compiler.package_id
 import compiler.infer_index
 import compiler.core_refs
 
 #[doc("The modules one file can see: its own home, the names its selective imports pick, the modules its plain imports open, and the prelude cores. `quals` are the qualifiers the file binds, each to its module; they open nothing. `pkgs` binds a module to the package it belongs to, for the modules that sit in one.")]
-pub(pkg) type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick], pkgs: [SvPick] }
+pub(pkg) type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick], pkgs: [PkgPick] }
 
 #[doc("One name a selective import picks, bound to the module that exports it.")]
 pub(pkg) type SvPick = SvPick(String, SymId)
+
+#[doc("A module and the package that owns it.")]
+pub(pkg) type PkgPick = PkgPick(PkgId, SymId)
 
 #[doc("A view that sees nothing but its own home. The root file before any import is resolved.")]
 pub(pkg) fn sv_of_home(home: SymId) : ScopeView =
@@ -34,7 +38,7 @@ fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
 
 fn sv_with_quals(v: ScopeView, quals: [SvPick]) : ScopeView = ScopeView { ...v, quals: quals }
 
-fn sv_with_pkgs(v: ScopeView, pkgs: [SvPick]) : ScopeView = ScopeView { ...v, pkgs: pkgs }
+fn sv_with_pkgs(v: ScopeView, pkgs: [PkgPick]) : ScopeView = ScopeView { ...v, pkgs: pkgs }
 
 #[doc("Whether the declaration `s`, owned by the module `owner`, is within reach of this view's package: a declaration exported to its package alone is seen from the modules of that package, and a package is a directory with a manifest.")]
 pub(pkg) fn sv_pkg_reaches(t: SymTab, v: ScopeView, s: SymId, owner: SymId) : Bool =
@@ -43,14 +47,14 @@ pub(pkg) fn sv_pkg_reaches(t: SymTab, v: ScopeView, s: SymId, owner: SymId) : Bo
 fn sv_same_pkg(v: ScopeView, a: SymId, b: SymId) : Bool = pkgs_same(v.pkgs, a, b)
 
 #[doc("Whether the modules `a` and `b` sit in one package of `ps`.")]
-pub(pkg) fn pkgs_same(ps: [SvPick], a: SymId, b: SymId) : Bool = match sv_pkg_of(ps, a) {
-  Some(pa) -> match sv_pkg_of(ps, b) { Some(pb) -> pa != "" and pa == pb  None -> false }
+pub(pkg) fn pkgs_same(ps: [PkgPick], a: SymId, b: SymId) : Bool = match sv_pkg_of(ps, a) {
+  Some(pa) -> match sv_pkg_of(ps, b) { Some(pb) -> pkg_same(pa, pb)  None -> false }
   None     -> false
 }
 
-fn sv_pkg_of(ps: [SvPick], m: SymId) : Option[String] = match ps {
+fn sv_pkg_of(ps: [PkgPick], m: SymId) : Option[PkgId] = match ps {
   [] -> None
-  [SvPick(pkg, o), ...rest] -> if sym_raw(o) == sym_raw(m) { Some(pkg) } else { sv_pkg_of(rest, m) }
+  [PkgPick(pkg, o), ...rest] -> if sym_raw(o) == sym_raw(m) { Some(pkg) } else { sv_pkg_of(rest, m) }
 }
 
 #[doc("The qualifier the file binds module `m` under, if it binds one.")]
@@ -64,7 +68,7 @@ fn sv_qual_of(qs: [SvPick], m: SymId) : Option[String] = match qs {
 #[doc("Every rung of the view rendered as text: two views that resolve some name differently render differently. A cache key folds it in.")]
 pub(pkg) fn sv_key(v: ScopeView) : String =
   string_concat_all([int_to_string(sym_raw(v.home)), "|", sv_picks_key(v.picks), "|", sv_ids_key(v.imports),
-              "|", sv_ids_key(v.cores), "|", sv_picks_key(v.quals), "|", unwrap_or(sv_pkg_of(v.pkgs, v.home), "")])
+              "|", sv_ids_key(v.cores), "|", sv_picks_key(v.quals), "|", pkg_text(pkgs_root(v.pkgs, v.home))])
 
 fn sv_ids_key(ms: [SymId]) : String = string_join(map(ms, (m) => int_to_string(sym_raw(m))), ",")
 
@@ -330,8 +334,8 @@ pub(pkg) fn sv_qualified_type(t: SymTab, modn: String, name: String) : SvRes =
 pub(pkg) fn sv_resolve_type(t: SymTab, v: ScopeView, name: String) : SvRes =
   sv_resolve_any(t, v, type_classes(), name)
 
-#[doc("The package of the module `m` in `ps`; empty when `m` sits in none.")]
-pub(pkg) fn pkgs_root(ps: [SvPick], m: SymId) : String = unwrap_or(sv_pkg_of(ps, m), "")
+#[doc("The package of the module `m` in `ps`; none when `m` sits in none.")]
+pub(pkg) fn pkgs_root(ps: [PkgPick], m: SymId) : PkgId = unwrap_or(sv_pkg_of(ps, m), pkg_none())
 
 #[doc("Every file's scope view, each found by its home module's id, and the view a home with no recorded file falls back to.")]
 pub(pkg) type FileViews = FileViews([ScopeView], ScopeView)
@@ -347,7 +351,7 @@ module as its file wrote it, which `scopes` over `global` turns into the
 home the module's declarations carry.
 """)]
 pub(pkg) fn fv_build(imports: [ModImports], sels: [SelImport], scopes: [ModScope],
-      global: [ModuleEntry], cores: [String], root: String, pkgs: [SvPick]) : FileViews {
+      global: [ModuleEntry], cores: [String], root: String, pkgs: [PkgPick]) : FileViews {
   let core_ids = fv_ids(cores, [])
   FileViews(map(fv_entries(imports, fv_tag_sels(sels, scopes, global), scopes, fv_origins(global, idx_empty()), core_ids, root, []),
                 (v) => sv_with_pkgs(v, pkgs)),
@@ -416,7 +420,7 @@ fn fv_quals(scopes: [ModScope], owner: String, origins: NameIndex[FvOrigin]) : [
   [MScope(o, mes, _), ...rest] ->
     if o == owner {
       map(mes, (me) => match me {
-        ME(written, _, origin, _) -> SvPick(written, st_module_id(fv_origin_name(origins, origin, written)))
+        ME(written, _, origin, _, _) -> SvPick(written, st_module_id(fv_origin_name(origins, origin, written)))
       })
     } else { fv_quals(rest, owner, origins) }
 }
@@ -427,7 +431,7 @@ type FvOrigin = FvOrigin(String, String)
 
 fn fv_origins(global: [ModuleEntry], ix: NameIndex[FvOrigin]) : NameIndex[FvOrigin] = match global {
   [] -> ix
-  [ME(n, _, o, _), ...rest] -> fv_origins(rest, idx_prepend(ix, o, FvOrigin(o, n)))
+  [ME(n, _, o, _, _), ...rest] -> fv_origins(rest, idx_prepend(ix, o, FvOrigin(o, n)))
 }
 
 fn fv_origin_name(ix: NameIndex[FvOrigin], origin: String, fallback: String) : String =

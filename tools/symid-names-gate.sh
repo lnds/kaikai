@@ -60,7 +60,7 @@ fail() {
   exit 1
 }
 
-probe=$(compared --path "$ROOT/stage2" --path "$ROOT/stdlib" "$CENSUS/probe/main.kai")
+probe=$(compared --package-root "$CENSUS/probe" --package-root "$ROOT/stage2" --path "$ROOT/stage2" --path "$ROOT/stdlib" "$CENSUS/probe/main.kai")
 for f in main.cmp_direct main.cmp_field main.cmp_nested main.cmp_binder main.cmp_ref main.has__mono__Written; do
   printf '%s\n' "$probe" | grep -qx "$f" || fail "--check-written-eq no longer reports the probe's $f"
 done

@@ -11,6 +11,7 @@ import compiler.symtab
 import compiler.modules_paths
 import compiler.modules_segments
 import compiler.module_table
+import compiler.package_id
 import compiler.infer_name_collisions
 import compiler.driver_exports
 import compiler.import_cycles
@@ -61,7 +62,7 @@ fn report_import_cycle(rs: ResolveState, abs_path: String, mod_path: String, own
   if abspath(importer_file(rs)) == abs_path {
     rs_report(rs, [import_diag(importer_file(rs), line, col,
       "`#{mod_path}` is this file's own name, so it shadows the module it imports; rename the file")])
-  } else if abs_path != rs_root(rs) and same_package(importer_file(rs), abs_path) {
+  } else if abs_path != rs_root(rs) and pkg_same(rs_pkg_of(rs, importer_file(rs)), rs_pkg_of(rs, abs_path)) {
     rs_defer(rs, abs_path, owner, import_name, importer_file(rs))
   } else {
     rs_report(rs, [import_diag(importer_file(rs), line, col,
@@ -85,8 +86,8 @@ fn rebind_loaded(rs: ResolveState, cores: [ModuleEntry], abs_path: String, owner
   match rs_lookup_origin(rs, cores, abs_path) {
     None -> rs
     Some(me) -> match me {
-      ME(_, exports, origin, unstable) ->
-        rs_bind_in(rs, owner, ME(import_name, me_exports_for(exports, unstable, reader_root(unstable, importer_file(rs))), origin, unstable))
+      ME(_, exports, origin, unstable, pkg) ->
+        rs_bind_in(rs, owner, ME(import_name, me_exports_for(exports, unstable, rs_pkg_of(rs, importer_file(rs))), origin, unstable, pkg))
     }
   }
 
@@ -143,6 +144,12 @@ fn load_source(base_dir: String, mod_path: String, import_name: String, line: In
   }
 }
 
+# A module no declared root holds belongs to the package of the file that imported it.
+fn local_pkg(rs: ResolveState, abs_path: String) : PkgId = {
+  let own = rs_pkg_of(rs, abs_path)
+  if pkg_known(own) { own } else { rs_pkg_of(rs, importer_file(rs)) }
+}
+
 fn adopt_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState, rs_doc: ResolveState, abs_path: String, home: String, src: String, tokens: [Token], decls: [Decl], rows: [NEnt]) : ResolveState / Console + File {
   let ftab = st_of_entries(rows)
   # The loaded file owns the imports it declares. Its
@@ -166,16 +173,17 @@ fn adopt_module(base_dir: String, mod_path: String, import_name: String, search_
   let exports = collect_pub_exports(kept, ftab, [])
   let rs3 = rs_scan_imports(rs_note_names(rs_append_decls(rs2b, home, tagged, rows), abs_path, exports, kept),
                             abs_path, abs_path, src, tokens, decls, home)
-  let unstable_exports = list_append(collect_unstable_exports(kept, ftab, []), package_markers(rows, abs_path))
-  let entry = ME(home, exports, abs_path, unstable_exports)
-  let bound = ME(import_name, me_exports_for(exports, unstable_exports, reader_root(unstable_exports, importer_file(rs))), abs_path, unstable_exports)
+  let pkg = local_pkg(rs, abs_path)
+  let unstable_exports = list_append(collect_unstable_exports(kept, ftab, []), package_markers(rows, pkg))
+  let entry = ME(home, exports, abs_path, unstable_exports, pkg)
+  let bound = ME(import_name, me_exports_for(exports, unstable_exports, rs_pkg_of(rs, importer_file(rs))), abs_path, unstable_exports, pkg)
   # A module may qualify its own names by its file name,
   # which is not its home once the path is nested.
-  let own = ME(last_segment(mod_path), exports, abs_path, unstable_exports)
+  let own = ME(last_segment(mod_path), exports, abs_path, unstable_exports, pkg)
   let rs4 = rs_bind_in(rs_bind_in(rs_add_module(rs3, entry), owner, bound), home, own)
   let released = foldl(rs_waiting(rs4, abs_path), rs4, (r, w) => match w {
     Deferred(_, o, written, importer) ->
-      rs_bind_in(r, o, ME(written, me_exports_for(exports, unstable_exports, reader_root(unstable_exports, importer)), abs_path, unstable_exports))
+      rs_bind_in(r, o, ME(written, me_exports_for(exports, unstable_exports, rs_pkg_of(r, importer)), abs_path, unstable_exports, pkg))
   })
   rs_release(released, abs_path)
 }
@@ -224,7 +232,7 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], core
 # whose resolved file matches a core entry a no-op, instead of
 # concatenating the same module a second time and producing a
 # duplicate-symbol C output.
-pub(pkg) fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], search_paths: [String], root_decls: [Decl], core_paths: [String], core_mods: [ModuleEntry], core_segs: [CoreSegment], cache_dir: String, test_roots: [String], blocks: BlockPolicy, inputs_out: String) : ExpandedProgram / Console + File {
+pub(pkg) fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], search_paths: [String], root_decls: [Decl], core_paths: [String], core_mods: [ModuleEntry], core_segs: [CoreSegment], cache_dir: String, test_roots: [String], blocks: BlockPolicy, inputs_out: String, plan: PkgPlan) : ExpandedProgram / Console + File {
 
   let base_dir = dir_of(root_path)
   # Canonicalise root + core paths so the resolver's `visited`
@@ -242,7 +250,7 @@ pub(pkg) fn expand_imports(root_path: String, root_src: String, root_tokens: [To
   # the importer wrote) but never accumulate into `rev_modules` — the
   # caller supplies the core table separately.
   let cores = canon_module_origins(core_mods)
-  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [], rev_tried: [], back: [], rev_edges: [], looped: false }
+  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [], rev_tried: [], back: [], rev_edges: [], looped: false, plan: plan }
   let rs_roots = load_test_roots(base_dir, test_roots, search_paths, cores, cache_dir,
                                  process_imports(base_dir, root_decls, search_paths, cores, "", cache_dir, rs0))
   let rs1 = rs_scan_imports(rs_roots, canon_root, root_path, root_src, root_tokens, root_decls, "")
