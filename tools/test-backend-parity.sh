@@ -115,7 +115,9 @@ target_build() {
   else
     local nopt
     nopt="$(kai_corpus_meta "$1" KAI_NATIVE_OPT)" || nopt=""
-    kai_corpus_build "$1" "$2" ${nopt:+KAI_NATIVE_OPT="$nopt"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0
+    local verify=""
+    [ "$TARGET_BACKEND" = native ] && verify="$2.kv"
+    kai_corpus_build "$1" "$2" ${nopt:+KAI_NATIVE_OPT="$nopt"} ${verify:+KAI_KIR_VERIFY="$verify"} KAI_BACKEND="$TARGET_BACKEND" KAI_NATIVE_MODULAR=0
   fi
 }
 
@@ -274,6 +276,17 @@ process_one() {
     return 0
   fi
 
+  # The native compile also ran the KIR linearity check; any violation fails.
+  if [ -s "$t_bin.kv" ]; then
+    {
+      echo "FAIL $f — $(grep -c . "$t_bin.kv") KIR linearity violation(s):"
+      head -10 "$t_bin.kv" | sed 's/^/    /'
+      echo
+    } >> "$failures"
+    printf 'F\n' >> "$results"
+    return 0
+  fi
+
   o_out_file="$tmp/${slug}.oracle.out"
   t_out_file="$tmp/${slug}.target.out"
   pin="$(parity_pin "$f")"
@@ -391,6 +404,7 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
       if ! target_build "$rf" "$rtb" >/dev/null 2>&1; then
         return 0   # target build failed => a deterministic, real gap.
       fi
+      [ -s "$rtb.kv" ] && return 0   # a linearity violation is deterministic.
       rt=0; rtout="$(run_with_timeout env ${pin:+KAI_THREADS="$pin"} bash -c 'target_exec "$1"' _ "$rtb" 2>&1 </dev/null | kai_corpus_normalize_timestamps)" || rt=$?
       if [ "$rt" != "$oref" ] || [ "$rtout" != "$orefout" ]; then
         return 0   # diverged on a recheck => a real (new) gap.
