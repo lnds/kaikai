@@ -1,7 +1,7 @@
 #[doc("""
 State taking: a stateful clause that resumes with a new state built from the old one hands the old one over instead of dup'ing it, so a write through it finds the value unshared.
 
-The state leaves the handler's slot only inside the `resume` that installs the next one. Nothing else reads the slot in between, and no exit of the clause falls between the take and the install.
+The state leaves the handler's slot at its last read before the `resume` that installs the next one, and only when nothing evaluated from that read up to the install can leave the clause: the call that consumes it has an empty effect row and the operands after the read hold no call. An exit by a perform, an unwind or a cancel therefore finds the state where it was.
 """)]
 
 import compiler.ast
@@ -11,7 +11,7 @@ import compiler.expr_positions
 import compiler.handler_alias
 import compiler.util
 
-#[doc("The expression with every `resume(v, f(state, ..))` that reads the handler state once, as a direct argument beside plain operands, taking it from the slot.")]
+#[doc("The expression with every `resume(v, f(.., state, ..))` that can take the handler state at its last read, taking it from the slot.")]
 pub(pkg) fn pst_take_state(e: Expr) : Expr = {
   let e1 = Expr { ...e, kind: prc_map_expr_kind(e.kind, (c) => pst_take_state(c)) }
   match e1.kind {
@@ -31,15 +31,40 @@ fn pst_resume(e: Expr, f: Expr, xs: [Expr]) : Expr = match xs {
 
 fn pst_next_state(ns: Expr) : Expr = match ns.kind {
   ECall(g, args) ->
-    if pst_callee(g) and list_length(filter(args, pst_is_state_read)) == 1 and all(args, pst_plain) {
-      Expr { ...ns, kind: ECall(g, map(args, pst_swap)) }
-    } else { ns }
+    if pst_cannot_exit(g) { Expr { ...ns, kind: ECall(g, pst_take_last(args)) } } else { ns }
   _ -> ns
 }
 
-fn pst_callee(g: Expr) : Bool = match g.kind {
-  ESym(_, _) -> true
-  _          -> false
+# A callee whose row holds no effect: closed and empty.
+fn pst_cannot_exit(g: Expr) : Bool = match g.ty {
+  Some(TyFnT(_, _, r)) -> list_is_empty(r.labels) and pst_closed(r.tail)
+  _                    -> false
+}
+
+fn pst_closed(tail: Option[Int]) : Bool = match tail {
+  None    -> true
+  Some(_) -> false
+}
+
+# The last direct read of the state is taken when no operand after it holds a call.
+fn pst_take_last(args: [Expr]) : [Expr] = {
+  let k = pst_last_read(args, 0, 0 - 1)
+  if k >= 0 and all(pst_after(args, k), pst_quiet) { pst_swap_at(args, k, 0) } else { args }
+}
+
+fn pst_last_read(args: [Expr], i: Int, best: Int) : Int = match args {
+  []           -> best
+  [a, ...rest] -> pst_last_read(rest, i + 1, if pst_is_state_read(a) { i } else { best })
+}
+
+fn pst_after(args: [Expr], k: Int) : [Expr] = match args {
+  []           -> []
+  [_, ...rest] -> if k <= 0 { rest } else { pst_after(rest, k - 1) }
+}
+
+fn pst_swap_at(args: [Expr], k: Int, i: Int) : [Expr] = match args {
+  []           -> []
+  [a, ...rest] -> [if i == k { pst_swap(a) } else { a }, ...pst_swap_at(rest, k, i + 1)]
 }
 
 fn pst_is_alias(l: LocalId) : Bool = any(user_state_aliases(), (k) => local_eq(l, local_minted(k)))
@@ -57,12 +82,10 @@ fn pst_is_state_read(a: Expr) : Bool = match a.kind {
   _ -> false
 }
 
-# An operand that reads no state and runs no code of its own.
-fn pst_plain(a: Expr) : Bool = pst_is_state_read(a) or pst_quiet(a)
-
+# An operand that evaluates no call.
 fn pst_quiet(a: Expr) : Bool = match a.kind {
-  ELocal(l)    -> not pst_is_alias(l)
-  ESym(_, _)   -> false
+  ELocal(_)    -> true
+  ESym(_, _)   -> true
   ECall(f, xs) -> match f.kind {
     EMark(MkDup) -> all(xs, pst_quiet)
     _            -> false
@@ -71,5 +94,4 @@ fn pst_quiet(a: Expr) : Bool = match a.kind {
 }
 
 fn pst_swap(a: Expr) : Expr =
-  if pst_is_state_read(a) { Expr { ...a, kind: ECall(Expr { ...a, kind: EMark(MkTakeState), ty: None }, []) } }
-  else { a }
+  Expr { ...a, kind: ECall(Expr { ...a, kind: EMark(MkTakeState), ty: None }, []) }
