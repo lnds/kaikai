@@ -25,23 +25,23 @@ import compiler.diag_file
 import compiler.expr_positions
 import compiler.name_report
 
-#[doc("Settle every effect reference of each import segment under its own file's view to the declaration it names; the decls past the marks are the root file's.")]
+#[doc("Settle every effect reference of each import segment under its own file's view to the declaration it names; the decls past the marks are the root file's. A row label that names one of `aliases` settles to that alias.")]
 pub(pkg) fn es_segmented(segs: [ImportSeg], decls: [Decl],
       tabs: ModTables, target: String,
-      tab: SymTab, views: FileViews) : [Decl] = match segs {
-  [] -> es_decls(decls, es_ctx(target, target, tabs, tab, views))
+      tab: SymTab, views: FileViews, aliases: [SymId]) : [Decl] = match segs {
+  [] -> es_decls(decls, es_ctx(target, target, tabs, tab, views, aliases))
   [ISeg(home, n), ...rest] -> {
-    list_append(es_decls(seg_take(decls, n), es_ctx(home, target, tabs, tab, views)),
-                es_segmented(rest, seg_drop(decls, n), tabs, target, tab, views))
+    list_append(es_decls(seg_take(decls, n), es_ctx(home, target, tabs, tab, views, aliases)),
+                es_segmented(rest, seg_drop(decls, n), tabs, target, tab, views, aliases))
   }
 }
 
 #[doc("The viewpoint of the module `home` in a program whose root is `target`: its qualifier table, and the symbol table with the file's scope view.")]
 fn es_ctx(home: String, target: String,
-      tabs: ModTables, tab: SymTab, views: FileViews) : ESCtx = {
+      tabs: ModTables, tab: SymTab, views: FileViews, aliases: [SymId]) : ESCtx = {
   let owner = if home == target { "" } else { home }
   ESCtx { home: home,
-          mt: mtabs_of(tabs, owner).entries, tab: tab, view: fv_of(views, st_module_id(home)) }
+          mt: mtabs_of(tabs, owner).entries, tab: tab, view: fv_of(views, st_module_id(home)), aliases: aliases }
 }
 
 fn es_decls(ds: [Decl], cx: ESCtx) : [Decl] = match ds {
@@ -134,8 +134,8 @@ fn es_re(e: Expr, k: ExprKind) : Expr =
 #[doc("One effect declaration: `ESE(name, home, pub)`. Root declarations carry the target module as home.")]
 pub(pkg) type ESEntry = ESE(String, String, Bool)
 
-#[doc("What one module sees: its own home, its qualifier table, and the symbol table with the file's scope view, which settle every bare name.")]
-type ESCtx = { home: String, mt: [ModuleEntry], tab: SymTab, view: ScopeView }
+#[doc("What one module sees: its own home, its qualifier table, the symbol table with the file's scope view, which settle every bare name, and the effect aliases a row label may name.")]
+type ESCtx = { home: String, mt: [ModuleEntry], tab: SymTab, view: ScopeView, aliases: [SymId] }
 
 #[doc("The effect declarations of `decls` whose name another home also declares, in stream order.")]
 pub(pkg) fn es_collect(decls: [Decl], tab: SymTab, target: String) : [ESEntry] = {
@@ -303,7 +303,7 @@ fn es_ty(t: TypeExpr, cx: ESCtx) : TypeExpr = {
 fn es_ty_arg(t: TypeExpr, cx: ESCtx) : TypeExpr = match t.tkind {
   TyName(DrWritten(None, n), []) -> match es_effect_arg(cx, written_text(n)) {
     Some(k) -> TypeExpr { tkind: k, line: t.line, col: t.col }
-    None    -> t
+    None    -> TypeExpr { tkind: TyName(es_alias_ref(cx, DrWritten(None, n)), []), line: t.line, col: t.col }
   }
   _ -> es_ty(t, cx)
 }
@@ -316,15 +316,39 @@ fn es_row(r: RowExpr, cx: ESCtx) : RowExpr = match r {
 }
 
 fn es_label(l: RowLabel, cx: ESCtx) : RowLabel = match l {
-  RL(r, ts) -> RL(es_ref(cx, r), map(ts, (x) => es_ty(x, cx)))
+  RL(r, ts) -> RL(es_alias_ref(cx, es_ref(cx, r)), map(ts, (x) => es_ty(x, cx)))
 }
+
+#[doc("The alias a label still written names from the file's view, or the label unchanged: an effect outranks an alias, and only a resolved alias settles.")]
+fn es_alias_ref(cx: ESCtx, r: DeclRef) : DeclRef = match cx.aliases {
+  [] -> r
+  _  -> match r {
+    DrSym(_)        -> r
+    DrWritten(q, n) -> es_alias_of(cx, r, es_alias_type(cx, q, written_text(n)))
+  }
+}
+
+fn es_alias_type(cx: ESCtx, q: Option[Written], n: String) : SvRes = match q {
+  Some(m) -> sv_qualified_type(cx.tab, written_text(m), n)
+  None    -> match split_dotted_qualifier(n) {
+    Some(QSplit(m, bare)) -> sv_qualified_type(cx.tab, m, bare)
+    None                  -> sv_resolve_type(cx.tab, cx.view, n)
+  }
+}
+
+fn es_alias_of(cx: ESCtx, r: DeclRef, res: SvRes) : DeclRef = match res {
+  SvSym(t) -> if list_has_sym(cx.aliases, t) { DrSym(t) } else { r }
+  _        -> r
+}
+
+fn list_has_sym(ss: [SymId], s: SymId) : Bool = any(ss, (x) => sym_same(x, s))
 
 # the core stream through the effect pass.
 
 #[doc("The core stream through the same pass, each declaration from its own module's viewpoint: a core signature's effects settle to declarations like any other.")]
 pub(pkg) fn es_core_decls(ds: [Decl], tabs: ModTables,
-      target: String, tab: SymTab, views: FileViews) : [Decl] = {
-  let mk = (h: String) => es_ctx(h, target, tabs, tab, views)
+      target: String, tab: SymTab, views: FileViews, aliases: [SymId]) : [Decl] = {
+  let mk = (h: String) => es_ctx(h, target, tabs, tab, views, aliases)
   es_core_loop(ds, mk(target), mk, target)
 }
 
@@ -348,7 +372,7 @@ pub(pkg) fn eschk_segmented(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
       tab: SymTab, views: FileViews, df: DiagFiles) : [Diagnostic] =
   if list_length(coll) == 0 { [] }
   else {
-    let cx = es_ctx(target, target, tabs, tab, views)
+    let cx = es_ctx(target, target, tabs, tab, views, [])
     finalize_diags(eschk_decls(seg_root(segs, decls), cx, df_root(df), []))
   }
 
