@@ -501,27 +501,22 @@ static void kai_op_field_untake(KaiValue *rec, const char *name) {
     }
 }
 
-/* Field read of a dup'd base: when the base is held only by its owner and
-   this dup, the field is moved out of the cell and the slot left unit; the
-   dup is consumed either way. */
-static KaiValue *kai_op_field_take_dup(KaiValue *rec, const char *name) {
+/* Field read of a dup'd base at slot `i`: when the base is held only by its
+   owner and this dup, the field is moved out of the cell and the slot left
+   unit; the dup is consumed either way. */
+static inline KaiValue *kai_op_field_take_dup_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
-        if (strcmp(rec->as.rec.names[i], name) == 0) {
-            KaiValue *f = rec->as.rec.fields[i];
-            if (!kai_is_value(rec) && kai_rc_load(rec) == 2) {
-                rec->as.rec.fields[i] = kai_unit();
-                kai_decref(rec);
-                return f;
-            }
-            f = kai_incref(f);
-            kai_decref(rec);
-            return f;
-        }
+    KaiValue *f = rec->as.rec.fields[i];
+    if (!kai_is_value(rec) && kai_rc_load(rec) == 2) {
+        rec->as.rec.fields[i] = kai_unit();
+        kai_decref(rec);
+        return f;
     }
-    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
+    f = kai_incref(f);
+    kai_decref(rec);
+    return f;
 }
 
 /* Constant-index field read. Same RC contract as kai_op_field (increfs the
