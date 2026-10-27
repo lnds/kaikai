@@ -1147,6 +1147,7 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
 KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag)    { return kai_rec_stamp(rec, head_tag); }
 
 KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_op_field(rec, name); }
+KaiValue *kaix_field_take(KaiValue *rec, const char *name)    { return kai_op_field_take(rec, name); }
 KaiValue *kaix_field_at(KaiValue *rec, int32_t i)            { return kai_op_field_at(rec, i); }
 KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_field_borrow(rec, name); }
 
