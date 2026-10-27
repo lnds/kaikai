@@ -20,6 +20,7 @@ import compiler.written
 import compiler.refine_types
 import compiler.resolve_names
 import compiler.pipe_fusion
+import compiler.resolve_use
 
 fn bind_pat(e: Env, pat: Pattern) : RPat / Console + File = match bind_pat_kind(e, pat.pkind) {
   RPatKind(e1, k) -> RPat(e1, Pattern { pkind: k, line: pat.line, col: pat.col })
@@ -213,18 +214,20 @@ fn chk_list(e: Env, elems: [ListElem]) : RKind / Console + File = match chk_list
 }
 
 fn chk_block(e: Env, stmts: [Stmt], opt_final: Option[Expr]) : RKind / Console + File = match chk_stmts(env_push(e), stmts) {
-  RStmts(e1, ss1) -> match chk_opt_expr(e1, opt_final) { ROptExpr(e2, f1) -> RKind(env_pop(e2), EBlock(ss1, f1)) }
+  RStmts(e1, ss1) -> match chk_opt_expr(e1, opt_final) { ROptExpr(e2, f1) -> RKind(Env { ...env_pop(e2), opens: e.opens }, EBlock(ss1, f1)) }
 }
 
 # The one place a bare name becomes an identity. A read of a binder is
 # its local id, so no pass can take it for a declaration that shares its
 # spelling; a declaration is the id the ladder reached. An unbound name
 # is reported and left as written, as is a name only the type settles.
-fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File =
-  match value_proto(env_call_cx(e), name) {
+fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File = match use_bare_op(e, name, x) {
+  Some(u) -> RKind(u.env, u.expr.kind)
+  None    -> match value_proto(env_call_cx(e), name) {
     Some(d) -> RKind(e, disp_ref(d))
     None    -> chk_name(e, name, x)
   }
+}
 
 fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
   if env_has(e, name) {
@@ -306,7 +309,12 @@ fn chk_call(e: Env, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = {
 # A bare callee: the binding the ladder reaches at this arity, or, when
 # nothing fits, the name read as a value so the arity error names the
 # nearest binding.
-fn chk_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = {
+fn chk_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = match use_bare_op(e, name, x) {
+  Some(u) -> RExpr(u.env, u.expr)
+  None    -> chk_ladder_callee(e, name, x, n)
+}
+
+fn chk_ladder_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = {
   let cx = env_call_cx(e)
   let h = call_hit(cx, name, n)
   let e1 = match skip_warning(cx, name, n, h) {
@@ -503,7 +511,10 @@ fn chk_stmts(e: Env, ss: [Stmt]) : RStmts / Console + File = chk_stmts_loop(e, s
 fn chk_stmts_loop(e: Env, ss: [Stmt], acc: [Stmt]) : RStmts / Console + File = match ss {
   [] -> RStmts(e, list_reverse(acc))
   [s, ...rest] -> match chk_stmt(e, s) {
-    RStmt(e1, s1) -> chk_stmts_loop(e1, rest, [s1, ...acc])
+    RStmt(e1, s1) -> match s1 {
+    SUse(_, _, _) -> chk_stmts_loop(e1, rest, acc)
+    _             -> chk_stmts_loop(e1, rest, [s1, ...acc])
+  }
   }
 }
 
@@ -519,7 +530,7 @@ fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File = match s {
   SIndexAssign(base, idx, val, l, c) -> chk_index_assign(e, base, idx, val, l, c)
   SAssign(base, val, l, c) -> chk_assign(e, base, val, l, c)
   SVar(b, ta, rhs, line, col) -> chk_var_stmt(e, b, ta, rhs, line, col)
-  SUse(_, _, _) -> RStmt(e, s)
+  SUse(name, _, _) -> RStmt(use_open_block(e, name), s)
 }
 
 fn chk_let(e: Env, pat: Pattern, ta: Option[TypeExpr], rhs: Expr) : RStmt / Console + File = match chk_expr(e, rhs) {
