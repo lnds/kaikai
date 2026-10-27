@@ -14,6 +14,7 @@ import compiler.emit_tcrec_live
 import compiler.enc_unit
 import compiler.fn_index
 import compiler.fnreg
+import compiler.infer_index
 import compiler.handler_alias
 import compiler.kir
 import compiler.kir_lin_model
@@ -68,7 +69,7 @@ pub(pkg) type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt
                      # binds a fresh one (`ls_bind`). Seeded at fn entry,
                      # extended at each binding statement, restored at a
                      # block's exit.
-                     regs: [String],
+                     regs: NameIndex[String],
                      # `ffi` is the set of `extern "C" fn` declarations.
                      # An FFI wrapper's kaikai-visible symbol is mangled to
                      # `__ffi_<c_sym>` (via `ffi_wrapper_sym`) so it does NOT
@@ -200,7 +201,7 @@ pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], ctors: CtorIx, 
               consts: [Decl], ffi: [SymId], recs: [RecInfo], stamps: [RecStamp], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String],
               tab: SymTab, specs: SpecNames) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, core_ix: core_ix_build(), ctor_ix: ctors, vs: variants,
-            lams: lams, cls: cls, enc_fn: enc_none(), consts: consts, regs: [], ffi: ffi, scope: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
+            lams: lams, cls: cls, enc_fn: enc_none(), consts: consts, regs: idx_empty(), ffi: ffi, scope: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
             tab: tab, specs: specs, locals: ln_empty() }
 
 #[doc("`st` with the arm-top token marked held (or released).")]
@@ -215,11 +216,16 @@ pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_
 pub fn ls_enter_fn_with(st: LowerSt, enc_fn: EncFn, entry: EntryRegs, locals: LocalNames,
                         body_fns: [EFn]) : LowerSt =
   LowerSt { ...st, rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, enc_fn: enc_fn,
-            regs: entry.regs, scope: list_append(entry.scope, implicit_scope()), mscr: "", reuse_gc: [], rnested: reuse_plan_none(), in_region: false,
+            regs: regs_of_names(entry.regs, idx_empty()), scope: list_append(entry.scope, implicit_scope()), mscr: "", reuse_gc: [], rnested: reuse_plan_none(), in_region: false,
             tcpend: [], unw: unw_blank(st.unw), arm_tok: false, handles: [], locals: kir_body_locals(locals) }
 
 #[doc("What a body starts with: the register each param and capture is read from, and the names of the registers they take.")]
 pub type EntryRegs = { scope: [Rename], regs: [String] }
+
+fn regs_of_names(names: [String], ix: NameIndex[String]) : NameIndex[String] = match names {
+  [] -> ix
+  [n, ...rest] -> regs_of_names(rest, idx_prepend(ix, n, n))
+}
 
 #[doc("The register of the local `l`, one per binder of the declaration `locals` lists.")]
 pub(pkg) fn kir_local_reg(locals: LocalNames, l: LocalId) : String = emitted_text(ln_emitted(locals, l))
@@ -283,10 +289,10 @@ pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt = LowerSt { ...st, unw: u
 # Extend the lexical scope with one bound register. Forward-visible: a
 # register is in scope only after its definition. Idempotent.
 pub fn ls_bind_reg(st: LowerSt, reg: String) : LowerSt =
-  if ls_reg_bound(st, reg) { st } else { LowerSt { ...st, regs: [reg, ...st.regs] } }
+  if ls_reg_bound(st, reg) { st } else { LowerSt { ...st, regs: idx_prepend(st.regs, reg, reg) } }
 
 # Is `reg` the name of a register live in the current scope?
-pub fn ls_reg_bound(st: LowerSt, reg: String) : Bool = name_in_list(st.regs, reg)
+pub fn ls_reg_bound(st: LowerSt, reg: String) : Bool = name_in_list(idx_chain(st.regs, reg), reg)
 
 # Set the current match's owned-scrutinee exit-drop binder (`<join>$sd`), so a
 # TRMC cons-modulo step lowered inside this match drops the right register. Saved
@@ -379,7 +385,7 @@ pub fn ls_set_scope(st: LowerSt, snap: [Rename]) : LowerSt = LowerSt { ...st, sc
 # Restore the live-register names to a block-entry snapshot, so registers
 # defined inside the block leave scope at its exit. Paired with
 # `ls_set_scope` in `lower_block`.
-pub fn ls_set_regs(st: LowerSt, snap: [String]) : LowerSt = LowerSt { ...st, regs: snap }
+pub fn ls_set_regs(st: LowerSt, snap: NameIndex[String]) : LowerSt = LowerSt { ...st, regs: snap }
 
 # Set the arena-routing flag. `lower_fn` seeds it from the signature brand;
 # `lower_block` sets it for a lexical `region { }` extent and restores the
@@ -436,7 +442,7 @@ fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt = LowerSt { ...st, ss: [s, ...st
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub(pkg) fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { ...st,
-            bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
+            bs: [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }, ...st.bs],
             cl: next_label, ss: [] }
 
 # Seal the final block without opening a successor (function exit). When
@@ -448,7 +454,7 @@ pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] = {
     KRet(_, p) if ls_cursor_dead(st) -> KUnreachable(p)
     _                                -> term
   }
-  list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: t, region_id: None }])
+  list_reverse([KBlock { label: st.cl, stmts: list_reverse(st.ss), term: t, region_id: None }, ...st.bs])
 }
 
 # The open block is past the entry and no sealed block branches to it.
