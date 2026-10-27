@@ -1,6 +1,7 @@
 # Arm-top, cons and variant reuse planning for match arms.
 
 import compiler.arm_release
+import compiler.arm_reuse_site
 import compiler.arm_top_plan
 import compiler.ast
 import compiler.ast_ids
@@ -406,18 +407,7 @@ pub(pkg) fn rv_overwrites(cargs: [Expr], tys: [Int], i: Int) : String {
 
 # True iff any new ctor arg is a NESTED ctor call with at least one arg — the
 # non-bijective shape that embeds a pointer child of the reused cell.
-pub(pkg) fn rv_any_nested_ctor(cargs: [Expr], ctors: CtorIx) : Bool = match cargs {
-  []           -> false
-  [e, ...rest] -> {
-    let here = match e.kind {
-      ECall(f, xs) -> ctor_ix_names(ctors, f) and rv_nonempty(xs)
-      _ -> false
-    }
-    here or rv_any_nested_ctor(rest, ctors)
-  }
-}
-
-fn rv_nonempty(xs: [Expr]) : Bool = match xs { [] -> false _ -> true }
+pub(pkg) fn rv_any_nested_ctor(cargs: [Expr], ctors: CtorIx) : Bool = rebuild_nests_ctor(cargs, (f) => ctor_ix_names(ctors, f))
 
 # Replace the FIRST textual occurrence of `needle` in `hay` with `repl`.
 # Used to donate the inner reuse token to the first matching sub-ctor of
@@ -548,13 +538,13 @@ fn reuse_carg_reads(cargs: [Expr], l: LocalId) : Bool = match cargs {
 # RC) is suppressed under a region, dropping every arm to the plain ctor path
 # (which routes through the arena ctor when `in_region`).
 pub(pkg) fn reuse_cons_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseConsArm] =
-  if cx.in_region { None } else { try_reuse_cons_arm(pat, body) }
+  if site_may_reuse(arm_site(true, false, cx)) { try_reuse_cons_arm(pat, body) } else { None }
 
 # Under a registered scrutinee only a flat rebuild keeps the dual layout: a
 # rotation moves grand-children out of an inner cell the registered one
 # still reaches, so it takes the owned path.
 pub(pkg) fn reuse_variant_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] =
-  if cx.in_region { None } else {
+  if not site_may_reuse(arm_site(true, false, cx)) { None } else {
     match try_reuse_variant_arm(pat, body, cx) {
       Some(ReuseVariantArm(subs, row, cargs, tys)) ->
         if cx.unw.scr and not rv_flat_arm(subs, cargs, cx.ctor_ix) { None } else { Some(ReuseVariantArm(subs, row, cargs, tys)) }
@@ -568,9 +558,11 @@ fn rv_flat_arm(subs: [Pattern], cargs: [Expr], ctors: CtorIx) : Bool =
 # An arm nested in an arm-top body leaves the enclosing token in place: its
 # steps rebuild into that cell.
 pub(pkg) fn arm_top_reuse_here(pat: Pattern, body: Expr, owned: Bool, cx: EmitCtx) : Option[ArmTopReuse] =
-  if not owned or cx.in_region or arm_top_token_held(cx) { None } else { arm_top_reuse_plan(pat, body, cx.ctor_ix) }
+  site_arm_top(arm_site(owned, false, cx), pat, body, cx.ctor_ix)
 
-fn arm_top_token_held(cx: EmitCtx) : Bool = match cx.reuse_donor { Some(_) -> true  None -> false }
+#[doc("The arm site of an arm emitted under `cx`.")]
+pub(pkg) fn arm_site(owned: Bool, guarded: Bool, cx: EmitCtx) : ArmSite =
+  ArmSite { owned: owned, guarded: guarded, in_region: cx.in_region, token_held: is_some(cx.reuse_donor) }
 
 # The start of an arm's result assignment. An arm that releases its scrutinee
 # first leaves the slot empty for the exit decref of the match.
@@ -582,7 +574,7 @@ pub(pkg) fn arm_result_open(rel: ScrRelease) : String = match rel {
 # A guard may still reject its arm, and a region frees its cells itself:
 # neither takes the cell apart.
 pub(pkg) fn arm_scr_release(owned: Bool, guarded: Bool, pat: Pattern, body: Expr, cx: EmitCtx) : ScrRelease =
-  if owned { arm_release(pat, body, not guarded and not cx.in_region) } else { ScrKept }
+  site_release(arm_site(owned, guarded, cx), pat, body)
 
 # The binders of an arm that takes its scrutinee apart alias its slots: the
 # take gives each its reference.
