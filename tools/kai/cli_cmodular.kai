@@ -11,6 +11,7 @@ import cli_err
 import cli_fs
 import cli_hash
 import cli_lto
+import cli_native
 import cli_plan
 import cli_proc
 import cli_runtime_headers
@@ -46,6 +47,8 @@ fn owner_module(t: Toolchain, dir: String, cs: [String]) : String / Ffi =
   } else {
     list.head(cs) ?? ""
   }
+
+fn ckir() : Bool / Env = cli_caches.env_or("KAI_CKIR", "0") == "1"
 
 fn tu(dir: String, owner: String, common: String, f: String) : Tu / Ffi {
   let defs = if f == owner { [SEPARATE, "-DKAI_RUNTIME_OWNER=1"] } else { [SEPARATE] }
@@ -146,7 +149,7 @@ fn cache_dir(t: Toolchain) : String / Env + File + Ffi {
 }
 
 # Every TU to an object: cache hits copy, the rest compile in parallel. Fails when any compile does.
-fn compile_all(t: Toolchain, dir: String) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+fn compile_all(t: Toolchain, dir: String, plain: Bool) : Result[Unit, Int] / Stderr + Env + File + Ffi {
   let cs = sources(dir)
   let cache = cache_dir(t)
   let common = if cache == "" {
@@ -160,7 +163,9 @@ fn compile_all(t: Toolchain, dir: String) : Result[Unit, Int] / Stderr + Env + F
         PER_FN_SECTIONS,
         cli_toolchain.host(t)
       ]),
-      cli_runtime_headers.kept(cache, t.inc_c)
+      cli_runtime_headers.kept(cache, t.inc_c),
+      if plain { cli_hash.Bytes("#{t.inc}/runtime_llvm_decls.h") } else { cli_hash.Text("") },
+      cli_hash.Text(if plain { "ckir-separate" } else { "" })
     ])
   }
   let owner = owner_module(t, dir, cs)
@@ -217,7 +222,7 @@ pub fn build(p: Plan) : Result[Unit, Int] / Stderr + Env + File + Ffi {
   let dir = "#{p.job.tmp}/mod"
   let err = "#{stream}.err"
   let rc = cli_budget.run(
-    cli_plan.kaic2(p, ["--emit=c-modular"], p.job.src),
+    cli_plan.kaic2(p, [if ckir() { "--emit=ckir-modular" } else { "--emit=c-modular" }], p.job.src),
     cli_plan.kaic2_spawn([], stream, err)
   )
   cli_plan.replay(err)
@@ -237,7 +242,11 @@ pub fn build(p: Plan) : Result[Unit, Int] / Stderr + Env + File + Ffi {
       cflags_compile: t.cflags_compile ++ lto.compile,
       cflags: t.cflags ++ lto.link
     }
-    compile_all(tl, dir)!
-    link_all(cli_plan.with_objects(Plan { ...p, t: tl })!, dir)
+    compile_all(tl, dir, ckir())!
+    if ckir() {
+      cli_native.modular_link(Plan { ...p, t: tl }, sources(dir) | (f => "#{dir}/#{stem(f)}.o"), ["-DKAI_SEPARATE_COMPILATION=1", "-DKAI_RUNTIME_OWNER=1"])
+    } else {
+      link_all(cli_plan.with_objects(Plan { ...p, t: tl })!, dir)
+    }
   }
 }
