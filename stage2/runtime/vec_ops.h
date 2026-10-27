@@ -486,6 +486,29 @@ static KaiValue *kai_op_field_take(KaiValue *rec, const char *name) {
     kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
 }
 
+/* Field read of a dup'd base: when the base is held only by its owner and
+   this dup, the field is moved out of the cell and the slot left unit; the
+   dup is consumed either way. */
+static KaiValue *kai_op_field_take_dup(KaiValue *rec, const char *name) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
+    }
+    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+        if (strcmp(rec->as.rec.names[i], name) == 0) {
+            KaiValue *f = rec->as.rec.fields[i];
+            if (!kai_is_value(rec) && kai_rc_load(rec) == 2) {
+                rec->as.rec.fields[i] = kai_unit();
+                kai_decref(rec);
+                return f;
+            }
+            f = kai_incref(f);
+            kai_decref(rec);
+            return f;
+        }
+    }
+    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
+}
+
 /* Constant-index field read. Same RC contract as kai_op_field (increfs the
    read field) but skips the strcmp: the emitter computes the slot from the
    static record type when known, relying on the desugar-canonicalised

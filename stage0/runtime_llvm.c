@@ -1148,6 +1148,7 @@ KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag)    { return kai_rec_st
 
 KaiValue *kaix_field(KaiValue *rec, const char *name)        { return kai_op_field(rec, name); }
 KaiValue *kaix_field_take(KaiValue *rec, const char *name)    { return kai_op_field_take(rec, name); }
+KaiValue *kaix_field_take_dup(KaiValue *rec, const char *name) { return kai_op_field_take_dup(rec, name); }
 KaiValue *kaix_field_at(KaiValue *rec, int32_t i)            { return kai_op_field_at(rec, i); }
 KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) { return kai_op_field_borrow(rec, name); }
 
@@ -1537,6 +1538,7 @@ void kaix_clause_state_set(void *self, KaiValue *v) {
  * prefix is invariant across every Ev<Eff>. The native backend binds the
  * result under `state` (and the legacy alias `log`) in the entry block,
  * mirroring emit_c's `clause_state_prologue`. */
+KaiValue *kaix_clause_state_take(void *self) { KaiValue **s = (KaiValue **) KAIX_EV_FIELD(self, state); KaiValue *v = *s; *s = kai_unit(); return v; }
 KaiValue *kaix_clause_state_get(void *self) {
     return *((KaiValue **) KAIX_EV_FIELD(self, state));
 }
