@@ -11,6 +11,7 @@ import compiler.diag_file
 import compiler.symtab
 import compiler.scope_view
 import compiler.desugar_record_lit
+import compiler.handler_alias
 import compiler.util
 import compiler.diag
 import compiler.written
@@ -401,6 +402,62 @@ fn dpr_spread_of(rh: DeclRef, ri: RecInfo, fis: [FieldInit], src: Expr, override
 # generic record has none: `T[a, b]` cannot be spelled without committing
 # to its arguments, so the typer's field-by-field check stands alone.
 fn dpr_spread_block(head: DeclRef, tparams: [TBinder], fds: [FieldDecl], src: Expr, overrides: [FieldInit],
+                    line: Int, col: Int) : Expr = {
+  match src.kind {
+    # A name is read again for each copied field; binding it first would hide that
+    # the record is read only through projections.
+    EName(w) ->
+      if any(overrides, (fi) => match fi { FI(_, v) -> expr_mentions(written_text(w), v) }) { dpr_spread_ordered(head, fds, src, overrides, line, col) }
+      else { mk_expr(ERecordLit(head, dpr_spread_copies(fds, overrides, src, line, col, 0)), line, col) }
+    _        -> dpr_spread_bound(head, tparams, fds, src, overrides, line, col)
+  }
+}
+
+# Each copied field reads the source at a position of its own: the reads of one
+# local are told apart, and ordered, by where they sit.
+fn dpr_spread_copies(fds: [FieldDecl], overrides: [FieldInit], src: Expr, line: Int, col: Int, i: Int) : [FieldInit] = match fds {
+  []                   -> []
+  [FD(_, fname, _, _), ...rest] -> {
+    let val = match find_override(overrides, fname) {
+      Some(ov) -> ov
+      None     -> mk_expr(EField(Expr { ...src, line: line, col: col + 100000 + i }, fname), line, col)
+    }
+    [FI(fname, val), ...dpr_spread_copies(rest, overrides, src, line, col, i + 1)]
+  }
+}
+
+# An override that reads the source is evaluated before the copies, so the
+# copies are its last reads in position as they are in execution.
+fn dpr_spread_ordered(head: DeclRef, fds: [FieldDecl], src: Expr, overrides: [FieldInit], line: Int, col: Int) : Expr = {
+  let stmts = dpr_override_lets(fds, overrides, line, col, 0)
+  let fields = dpr_ordered_fields(fds, overrides, src, line, col, 0)
+  mk_expr(EBlock(stmts, Some(mk_expr(ERecordLit(head, fields), line, col))), line, col)
+}
+
+fn dpr_override_name(line: Int, col: Int, i: Int) : String =
+  concat_all(["__spread_ov_", int_to_string(line), "_", int_to_string(col), "_", int_to_string(i), "__"])
+
+fn dpr_override_lets(fds: [FieldDecl], overrides: [FieldInit], line: Int, col: Int, i: Int) : [Stmt] = match fds {
+  []                            -> []
+  [FD(_, fname, _, _), ...rest] -> match find_override(overrides, fname) {
+    Some(v) -> [SLet(mk_pat(PBind(binder_minted(dpr_override_name(line, col, i))), line, col), None, v),
+                ...dpr_override_lets(rest, overrides, line, col, i + 1)]
+    None    -> dpr_override_lets(rest, overrides, line, col, i + 1)
+  }
+}
+
+fn dpr_ordered_fields(fds: [FieldDecl], overrides: [FieldInit], src: Expr, line: Int, col: Int, i: Int) : [FieldInit] = match fds {
+  []                            -> []
+  [FD(_, fname, _, _), ...rest] -> {
+    let val = match find_override(overrides, fname) {
+      Some(_) -> mk_name(dpr_override_name(line, col, i), line, col)
+      None    -> mk_expr(EField(Expr { ...src, line: line, col: col + 100000 + i }, fname), line, col)
+    }
+    [FI(fname, val), ...dpr_ordered_fields(rest, overrides, src, line, col, i + 1)]
+  }
+}
+
+fn dpr_spread_bound(head: DeclRef, tparams: [TBinder], fds: [FieldDecl], src: Expr, overrides: [FieldInit],
                     line: Int, col: Int) : Expr = {
   let var_name = spread_src_var_name(line, col)
   let bind_pat = mk_pat(PBind(binder_minted(var_name)), line, col)

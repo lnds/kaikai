@@ -1,0 +1,103 @@
+#[doc("""
+Field taking: a projection `s.f` of a record the reader owns, where nothing later reads `f` or `s` whole, takes the field out of the cell, so a unique cell hands it over and the projected value reaches its use unshared.
+""")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.ast_map
+import compiler.expr_positions
+import compiler.marks
+import compiler.perceus_reads
+
+# One read of an owned local: the local, where it sits, the field it
+# projects (empty for a whole read) and whether a closure holds it.
+type PtkRead = PtkRead(LocalId, Int, Int, String, Bool)
+
+#[doc("The body with every projection of an owned record's last read of that field turned into a take. `owned` lists the locals whose reads this body pays for.")]
+pub(pkg) fn ptk_take_fields(body: Expr, owned: [Binder]) : Expr = match owned {
+  [] -> body
+  _  -> {
+    let reads = ptk_reads(body, owned, false, [])
+    if any(reads, ptk_is_projection) { ptk_rewrite(body, reads) } else { body }
+  }
+}
+
+fn ptk_is_projection(r: PtkRead) : Bool = match r { PtkRead(_, _, _, f, _) -> f != "" }
+
+# ---- reads ----
+
+fn ptk_reads(e: Expr, owned: [Binder], in_lam: Bool, acc: [PtkRead]) : [PtkRead] = match e.kind {
+  ELocal(l) -> if pcs_has(owned, l) { [PtkRead(l, e.line, e.col, "", in_lam), ...acc] } else { acc }
+  EField(b, f) -> match ptk_base(b) {
+    Some(lx) -> match lx.kind {
+      ELocal(l) -> if pcs_has(owned, l) { [PtkRead(l, lx.line, lx.col, f, in_lam), ...acc] } else { acc }
+      _         -> acc
+    }
+    None -> ptk_reads(b, owned, in_lam, acc)
+  }
+  ECall(f, xs) -> match f.kind {
+    EMark(m) -> if mark_is_drop(m) { acc } else { ptk_reads_all(xp_positions(e), owned, in_lam, acc) }
+    _        -> ptk_reads_all(xp_positions(e), owned, in_lam, acc)
+  }
+  _ -> ptk_reads_all(xp_positions(e), owned, in_lam, acc)
+}
+
+fn ptk_reads_all(ps: [XPos], owned: [Binder], in_lam: Bool, acc: [PtkRead]) : [PtkRead] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> ptk_reads_all(rest, owned, in_lam, ptk_reads(c, owned, in_lam or not xrole_inline(r), acc))
+}
+
+# The local a projection reads, bare or behind a dup.
+fn ptk_base(b: Expr) : Option[Expr] = match b.kind {
+  ELocal(_) -> Some(b)
+  ECall(f, xs) -> match f.kind {
+    EMark(MkDup) -> match xs {
+      [x] -> match x.kind { ELocal(_) -> Some(x)  _ -> None }
+      _   -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn ptk_is_dup_wrapped(b: Expr) : Bool = match b.kind {
+  ECall(_, _) -> true
+  _           -> false
+}
+
+# ---- rewrite ----
+
+fn ptk_rewrite(e: Expr, reads: [PtkRead]) : Expr = match e.kind {
+  EField(b, f) -> match ptk_base(b) {
+    Some(lx) -> match lx.kind {
+      ELocal(l) ->
+        if ptk_is_dup_wrapped(b) and ptk_takes(reads, l, lx.line, lx.col, f) and ptk_at(reads, l, lx.line, lx.col) == 1 { ptk_take(e, lx, f) }
+        else { e }
+      _ -> e
+    }
+    None -> Expr { ...e, kind: EField(ptk_rewrite(b, reads), f) }
+  }
+  _ -> Expr { ...e, kind: prc_map_expr_kind(e.kind, (c) => ptk_rewrite(c, reads)) }
+}
+
+fn ptk_take(e: Expr, lx: Expr, f: String) : Expr =
+  Expr { ...e, kind: ECall(Expr { ...e, kind: EMark(MkTakeField(f)), ty: None }, [lx]) }
+
+# How many reads of `l` sit at one position: a synthesised body shares one among several reads, whose order is then unknown.
+fn ptk_at(reads: [PtkRead], l: LocalId, line: Int, col: Int) : Int = match reads {
+  []                                       -> 0
+  [PtkRead(m, rl, rc, _, _), ...rest] ->
+    (if local_eq(m, l) and rl == line and rc == col { 1 } else { 0 }) + ptk_at(rest, l, line, col)
+}
+
+# Nothing after the read at `(line, col)` reads `f` or the whole record, and no closure holds the record.
+fn ptk_takes(reads: [PtkRead], l: LocalId, line: Int, col: Int, f: String) : Bool = match reads {
+  [] -> true
+  [PtkRead(m, rl, rc, g, in_lam), ...rest] ->
+    if not local_eq(m, l) { ptk_takes(rest, l, line, col, f) }
+    else if in_lam { false }
+    else if rl > line or (rl == line and rc > col) {
+      if g == "" or g == f { false } else { ptk_takes(rest, l, line, col, f) }
+    }
+    else { ptk_takes(rest, l, line, col, f) }
+}

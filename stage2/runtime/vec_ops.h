@@ -467,6 +467,25 @@ static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
     kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
 }
 
+/* Field read for an arm that owns its record: a unique cell hands the field
+   over and keeps the unit immediate in its slot, so the binder is the sole
+   owner and a write through it is in place; a shared cell increfs as
+   kai_op_field does. Only an unguarded arm may use it, since a rejected arm
+   would find the slot emptied. */
+static KaiValue *kai_op_field_take(KaiValue *rec, const char *name) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
+    }
+    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+        if (strcmp(rec->as.rec.names[i], name) == 0) {
+            KaiValue *f = rec->as.rec.fields[i];
+            if (kai_check_unique(rec)) { rec->as.rec.fields[i] = kai_unit(); return f; }
+            return kai_incref(f);
+        }
+    }
+    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
+}
+
 /* Constant-index field read. Same RC contract as kai_op_field (increfs the
    read field) but skips the strcmp: the emitter computes the slot from the
    static record type when known, relying on the desugar-canonicalised
