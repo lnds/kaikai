@@ -183,6 +183,19 @@ static void kai_host_absent(const char *facility) {
 #define KAI_CONST
 #endif
 
+/* A `return f(...)` it prefixes is a guaranteed tail call where the
+ * compiler can promise one; elsewhere it vanishes and the call is ordinary. */
+#if defined(__clang__) && defined(__has_attribute)
+#if __has_attribute(musttail)
+#define KAI_MUSTTAIL __attribute__((musttail))
+#endif
+#elif defined(__GNUC__) && __GNUC__ >= 15
+#define KAI_MUSTTAIL [[gnu::musttail]]
+#endif
+#ifndef KAI_MUSTTAIL
+#define KAI_MUSTTAIL
+#endif
+
 /* M:N scheduler — Class A per-scheduler-thread state (docs/mn-scheduler-
  * design.md §1). Each OS scheduler thread owns its own copy; a fiber runs on
  * exactly one thread at a time and only ever touches that thread's copy, so
