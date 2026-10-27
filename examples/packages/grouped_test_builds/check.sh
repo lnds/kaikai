@@ -72,10 +72,14 @@ printf '#include <stdint.h>\nint32_t grouped_probe(void) { return 7; }\n' > "$TM
 printf '\n[native]\nsources = ["c/probe.c"]\n' >> "$TMP/dup/kai.toml"
 printf 'extern "C"("grouped_probe") fn probe() : I32 / Ffi\n\ntest "a" {\n  assert 1 == 1\n}\n' > "$TMP/dup/tests/a_test.kai"
 printf 'extern "C"("grouped_probe") fn probe() : Int / Ffi\n\ntest "b" {\n  assert 1 == 1\n}\n' > "$TMP/dup/tests/b_test.kai"
-run dup
-[ "$(cat "$TMP/rc")" -ne 0 ] || fail "test files that do not build together passed"
-grep -q "conflicting declarations of extern function" "$TMP/err" || fail "the shared build's error was not reported"
-if grep -q "ok   a" "$TMP/err"; then fail "a test ran although the shared build failed"; fi
+for backend in c native; do
+  rc=0
+  (cd "$TMP/dup" && KAI_BACKEND="$backend" "$KAI" test . > "$TMP/out" 2> "$TMP/err") || rc=$?
+  [ "$rc" -ne 0 ] || fail "test files that do not build together passed on $backend"
+  [ "$(grep '^error:' "$TMP/err" | head -1 | sed 's/^error: //')" = "$(cat "$DIR/extern_conflict.err.expected")" ] \
+    || fail "the shared build's error was not the pinned one on $backend"
+  if grep -q "ok   a" "$TMP/err"; then fail "a test ran although the shared build failed on $backend"; fi
+done
 
 # 4 — an unused binding in an imported module's block names that module's file,
 # where the module's blocks run.
