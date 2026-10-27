@@ -1,73 +1,21 @@
 #[doc("""
-The names patterns and parameters bind, whether an expression mentions a variable, and whether a task body touches a cell.
+Whether an expression mentions a cell, whether a task body touches one, and the read and write nodes of a cell.
 """)]
 
-import compiler.util
 import compiler.ast
-import compiler.ast_build
-import compiler.ast_build
-import compiler.written
 import compiler.ast_ids
 import compiler.core_types
-
-#[doc("`acc` with the names the parameters bind.")]
-pub(pkg) fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> dsg_rename_param_names(rest, [written_text(p.binder.name), ...acc])
-  }
-}
-
-# Names introduced by a single pattern. Mirrors `bind_pat` but
-# accumulates into a `[String]` rather than a resolver Env.
-
-#[doc("`acc` with the names the pattern binds.")]
-pub(pkg) fn dsg_rename_pat_names(p: Pattern, acc: [String]) : [String] {
-  match p.pkind {
-    PWild         -> acc
-    PLit(_)       -> acc
-    PRange(_, _)  -> acc
-    PBind(b)      -> [written_text(b.name), ...acc]
-    PList(pats, opt_rest) -> {
-      let a = dsg_rename_pats_names(pats, acc)
-      match opt_rest { Some(r) -> [written_text(r.name), ...a] None -> a }
-    }
-    PVariant(_, subs)     -> dsg_rename_pats_names(subs, acc)
-    PVariantRecord(_, fs) -> dsg_rename_pfields_names(fs, acc)
-    PRecord(fs)              -> dsg_rename_pfields_names(fs, acc)
-    PHole(_)                 -> acc
-    PAs(b, sub)              -> dsg_rename_pat_names(sub, [written_text(b.name), ...acc])
-    PNarrow(b, _)            -> [written_text(b.name), ...acc]
-    PSurface(sp)             -> dsg_rename_pats_names(patsurface_children(sp), acc)
-  }
-}
-
-fn dsg_rename_pats_names(ps: [Pattern], acc: [String]) : [String] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> dsg_rename_pats_names(rest, dsg_rename_pat_names(p, acc))
-  }
-}
-
-fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
-  match fs {
-    [] -> acc
-    [pf, ...rest] -> match pf {
-      PField(_, sub, _) -> dsg_rename_pfields_names(rest, dsg_rename_pat_names(sub, acc))
-    }
-  }
-}
 
 #[doc("""
 Does the spawn task `e` touch the cell `n` (read/write directly, or apply a
 tainted closure that captured it)? Shadow-aware: a nested binder that rebinds
 `n` masks the cell from that point on, so the inner `n` is its own fiber's.
 """)]
-pub(pkg) fn task_touches_cell(e: Expr, cell: LocalId, tainted: [String]) : Bool =
+pub(pkg) fn task_touches_cell(e: Expr, cell: LocalId, tainted: [LocalId]) : Bool =
   match e.kind {
     ECall(callee, args_) -> {
       let direct = match cell_access_of(cell, callee, args_) { Some(_) -> true  None -> false }
-      let applied = match callee.kind { EName(f) -> list_has(tainted, written_text(f))  _ -> false }
+      let applied = match callee.kind { ELocal(f) -> any(tainted, (t) => local_eq(t, f))  _ -> false }
       direct or applied or task_touches_cell(callee, cell, tainted) or task_args_touch_cell(args_, cell, tainted)
     }
     ELambda(_, body) -> task_touches_cell(body, cell, tainted)
@@ -89,14 +37,14 @@ pub(pkg) fn task_touches_cell(e: Expr, cell: LocalId, tainted: [String]) : Bool 
     _ -> false
   }
 
-fn task_args_touch_cell(es: [Expr], cell: LocalId, tainted: [String]) : Bool {
+fn task_args_touch_cell(es: [Expr], cell: LocalId, tainted: [LocalId]) : Bool {
   match es {
     [] -> false
     [h, ...rest] -> if task_touches_cell(h, cell, tainted) { true } else { task_args_touch_cell(rest, cell, tainted) }
   }
 }
 
-fn task_stmts_touch_cell(ss: [Stmt], cell: LocalId, tainted: [String], tail: Option[Expr]) : Bool {
+fn task_stmts_touch_cell(ss: [Stmt], cell: LocalId, tainted: [LocalId], tail: Option[Expr]) : Bool {
   match ss {
     [] -> match tail { Some(x) -> task_touches_cell(x, cell, tainted)  None -> false }
     [s, ...rest] -> {
@@ -117,14 +65,14 @@ fn task_stmts_touch_cell(ss: [Stmt], cell: LocalId, tainted: [String], tail: Opt
   }
 }
 
-fn task_arms_touch_cell(arms: [Arm], cell: LocalId, tainted: [String]) : Bool {
+fn task_arms_touch_cell(arms: [Arm], cell: LocalId, tainted: [LocalId]) : Bool {
   match arms {
     [] -> false
     [Arm(_, _, b), ...rest] -> task_touches_cell(b, cell, tainted) or task_arms_touch_cell(rest, cell, tainted)
   }
 }
 
-fn task_elems_touch_cell(es: [ListElem], cell: LocalId, tainted: [String]) : Bool {
+fn task_elems_touch_cell(es: [ListElem], cell: LocalId, tainted: [LocalId]) : Bool {
   match es {
     [] -> false
     [el, ...rest] -> {
@@ -239,52 +187,6 @@ fn clauses_contain(cell: LocalId, cs: [HClause]) : Bool {
 
 fn ret_opt_contains(cell: LocalId, opt: Option[HReturn]) : Bool {
   match opt { None -> false  Some(r) -> match r { HR(_, b, _, _) -> contains_var(cell, b) } }
-}
-
-#[doc("`acc` with the names the pattern binds.")]
-pub(pkg) fn dsg_pat_bindings(pat: Pattern, acc: [String]) : [String] {
-  match pat.pkind {
-    PWild -> acc
-    PLit(_) -> acc
-    PRange(_, _) -> acc
-    PBind(b) -> [written_text(b.name), ...acc]
-    PList(pats, opt_rest) -> {
-      let acc1 = dsg_pat_bindings_loop(pats, acc)
-      match opt_rest {
-        Some(r) -> [written_text(r.name), ...acc1]
-        None -> acc1
-      }
-    }
-    PVariant(_, subs) -> dsg_pat_bindings_loop(subs, acc)
-    PVariantRecord(_, fields) -> dsg_pfield_bindings_loop(fields, acc)
-    PRecord(fields) -> dsg_pfield_bindings_loop(fields, acc)
-    PHole(_) -> acc
-    PAs(b, sub) -> dsg_pat_bindings(sub, [written_text(b.name), ...acc])
-    PNarrow(b, _) -> [written_text(b.name), ...acc]
-    PSurface(sp) -> dsg_pat_bindings_loop(patsurface_children(sp), acc)
-  }
-}
-
-# Like `dsg_pat_bindings`, but if the pattern is a single `PBind` and
-# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
-# must NOT enter the Perceus tracking scope. All other shapes —
-# destructured lets, wildcards, literals — defer to the standard
-# `dsg_pat_bindings` walker.
-
-fn dsg_pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> dsg_pat_bindings_loop(rest, dsg_pat_bindings(p, acc))
-  }
-}
-
-fn dsg_pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
-  match fs {
-    [] -> acc
-    [f, ...rest] -> match f {
-      PField(_, sub, _) -> dsg_pfield_bindings_loop(rest, dsg_pat_bindings(sub, acc))
-    }
-  }
 }
 
 #[doc("The op a call performs on the cell `cell`: a read or write node, or an op called on the cell by name.")]

@@ -1,5 +1,5 @@
 #[doc("""
-`var` desugared to one-slot cells, and the cell reads lowered over a program's declarations.
+`var` lowered after the resolver. A `var` whose initial value is a plain expression and whose cell is only read and written in place becomes a one-slot array; every other `var` becomes a `State` handler. The decision reads ids: a cell is its binder, a loop is the intrinsic the resolver made of a call of the core's.
 """)]
 
 import compiler.util
@@ -12,118 +12,82 @@ import compiler.handler_alias
 import compiler.core_types
 import compiler.core_builtins
 import compiler.written
-import compiler.desugar_refine_pred
 import compiler.desugar_escape
-import compiler.desugar_cell_read
-import compiler.diag_file
-import compiler.desugar_rename
-import compiler.desugar_brand
+import compiler.desugar_refine_pred
 
-#[doc("Pre-resolve desugar of `var name [: T] = init` into a Ref-cell let plus get/set rewrites; the per-program entry point.")]
-pub(pkg) fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
+#[doc("`ds` with each `var` lowered, to a slot or to a handler.")]
+pub(pkg) fn lower_vars_decls(ds: [Decl]) : [Decl] = map(ds, lower_vars_decl)
 
-fn desugar_var_decl(d: Decl) : Decl {
+#[doc("`d` with each `var` lowered, to a slot or to a handler.")]
+pub(pkg) fn lower_vars_decl(d: Decl) : Decl {
   match d {
     DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(pub_, fid, tps, ps, ret, row, desugar_var_expr(body), l, c, mo)
-    DTest(desc, body, l, c, mo) -> DTest(desc, desugar_var_expr(body), l, c, mo)
-    DBench(desc, body, l, c, mo) -> DBench(desc, desugar_var_expr(body), l, c, mo)
-    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, desugar_var_expr(body), l, c, mo)
-    # `#[unstable]` wraps a `pub fn`; the wrapper is transparent, so
-    # recurse into the inner decl and rewrap. Without
-    # this, a `var` in an unstable fn body never lowers to State and the
-    # `.get`/`.set` receiver fails to resolve.
-    DUnstable(inner, l, c) -> DUnstable(desugar_var_decl(inner), l, c)
-    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, desugar_var_decl(inner), l, c, mo)
-    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, desugar_var_decl(inner), l, c, mo)
-    DConstructor(inner, l, c) -> DConstructor(desugar_var_decl(inner), l, c)
-    _ -> d
+      DFn(pub_, fid, tps, ps, ret, row, lower_vars_expr(body), l, c, mo)
+    DTest(desc, body, l, c, mo) -> DTest(desc, lower_vars_expr(body), l, c, mo)
+    DBench(desc, body, l, c, mo) -> DBench(desc, lower_vars_expr(body), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, lower_vars_expr(body), l, c, mo)
+    DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, lower_vars_decl), l, c, tps, isym)
+    _ -> match decl_transparent_inner(d) {
+      Some(inner) -> decl_rewrap(d, lower_vars_decl(inner))
+      None        -> d
+    }
   }
 }
 
-fn desugar_var_expr(e: Expr) : Expr =
-  Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+fn lower_vars_expr(e: Expr) : Expr =
+  Expr { kind: lower_vars_kind(e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-fn desugar_var_opt(opt: Option[Expr]) : Option[Expr] {
-  match opt {
-    Some(e) -> Some(desugar_var_expr(e))
-    None    -> None
-  }
+fn lower_vars_opt(opt: Option[Expr]) : Option[Expr] = map(opt, lower_vars_expr)
+
+fn lower_vars_kind(k: ExprKind) : ExprKind = match k {
+  EBlock(stmts, tail) -> lower_vars_block(stmts, tail)
+  _                   -> dsg_map_expr_kind(k, lower_vars_expr)
 }
 
-# Recurse into a non-block stmt's expressions. Used for stmts that
-# appear *before* the head SVar of a block — they cannot reference the
-# cell the var introduces, but their inner blocks (lambdas, ifs, match
-# arms, etc.) may declare their own `var`s.
-fn desugar_var_stmt(s: Stmt) : Stmt {
-  match s {
-    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_var_expr(rhs))
-    SAssert(c, m) -> SAssert(desugar_var_expr(c), desugar_var_opt(m))
-    SExprStmt(x) -> SExprStmt(desugar_var_expr(x))
-    SIndexAssign(b, i, v, l, c) ->
-      SIndexAssign(desugar_var_expr(b), desugar_var_expr(i),
-                   desugar_var_expr(v), l, c)
-    SAssign(b, v, l, c) ->
-      SAssign(desugar_var_expr(b), desugar_var_expr(v), l, c)
-    # SVar at this site means it sits at non-head position relative to
-    # the wrapping pass. desugar_var_block consumes head-position SVars;
-    # any residual one here is rewritten to a `let` so the resolver does
-    # not see a stray SVar (defensive — should not occur in well-formed
-    # input).
-    SVar(n, _, rhs, _, _) -> SLet(mk_pat(PBind(n), 0, 0), None,
-                                   desugar_var_expr(rhs))
-    # SUse pass through.
-    SUse(n, l, c) -> SUse(n, l, c)
-  }
+# A statement before a block's first `var`: it cannot see that cell, but its inner blocks may declare their own.
+fn lower_vars_stmt(s: Stmt) : Stmt = match s {
+  SLet(pat, ann, rhs) -> SLet(pat, ann, lower_vars_expr(rhs))
+  SAssert(c, m) -> SAssert(lower_vars_expr(c), lower_vars_opt(m))
+  SExprStmt(x) -> SExprStmt(lower_vars_expr(x))
+  SIndexAssign(b, i, v, l, c) -> SIndexAssign(lower_vars_expr(b), lower_vars_expr(i), lower_vars_expr(v), l, c)
+  SAssign(b, v, l, c) -> SAssign(lower_vars_expr(b), lower_vars_expr(v), l, c)
+  SVar(n, _, rhs, _, _) -> SLet(mk_pat(PBind(n), 0, 0), None, lower_vars_expr(rhs))
+  SUse(n, l, c) -> SUse(n, l, c)
 }
 
-# Build the canonical `with State[?T](init) as name { ... }` clauses
-# for a `var` lowering. They read the slot through the var-cell alias,
-# which no enclosing binding takes over the way it takes over `state`.
-#
-# The alias is a borrowed read of the slot, so Perceus dups it for the
-# resume in `get`. `set`'s `resume(unit, v)` stores `v` into the slot,
-# which then owns it.
-fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
-  let p_resume = Param { binder: binder_written("resume"), ptype: None, pline: line, pcol: col, pborrow: false }
-  let p_v      = Param { binder: binder_written("v"),      ptype: None, pline: line, pcol: col, pborrow: false }
-  let resume_e = mk_name("resume", line, col)
-  let cell_e   = mk_name(var_cell_alias(), line, col)
-  let unit_e   = mk_expr(EUnit,           line, col)
-  let v_e      = mk_name("v",       line, col)
-  let get_body = mk_expr(ECall(resume_e, [cell_e]), line, col)
-  let set_body = mk_expr(ECall(resume_e, [unit_e, v_e]), line, col)
+# The ids the handler form mints for a cell's clauses, derived from the cell's own so that no two vars share one.
+fn var_clause_id(cell: Binder, what: String) : LocalId =
+  local_minted(concat_all(["__var_", what, "#", int_to_string(local_raw(cell.id))]))
+
+# A binder of the clause `op`, named `name`: each clause binds its own, as the resolver numbers them.
+fn var_clause_binder(cell: Binder, op: String, name: String) : Binder =
+  Binder { id: var_clause_id(cell, concat_all([op, "_", name])), name: written(name) }
+
+fn var_clause_param(cell: Binder, op: String, name: String, line: Int, col: Int) : Param =
+  Param { binder: var_clause_binder(cell, op, name), ptype: None, pline: line, pcol: col, pborrow: false }
+
+# The canonical `State` clauses of a `var`. `get` resumes with the slot the
+# alias holds, which Perceus dups; `set` resumes with the new value stored in it.
+fn var_canonical_clauses(cell: Binder, line: Int, col: Int) : [HClause] {
+  let get_k = var_clause_param(cell, "get", "resume", line, col)
+  let set_v = var_clause_param(cell, "set", "v", line, col)
+  let set_k = var_clause_param(cell, "set", "resume", line, col)
+  let get_body = mk_expr(ECall(mk_local(get_k.binder.id, line, col), [mk_local(local_minted(var_cell_alias()), line, col)]), line, col)
+  let set_body = mk_expr(ECall(mk_local(set_k.binder.id, line, col), [mk_expr(EUnit, line, col), mk_local(set_v.binder.id, line, col)]), line, col)
   [
-    HC(ChOp(cell_op_name(CellGet)), [p_resume], get_body, line, col),
-    HC(ChOp(cell_op_name(CellSet)), [p_v, p_resume], set_body, line, col)
+    HC(ChOp(cell_op_name(CellGet)), [get_k], get_body, line, col),
+    HC(ChOp(cell_op_name(CellSet)), [set_v, set_k], set_body, line, col)
   ]
 }
 
-fn var_canonical_return(line: Int, col: Int) : HReturn {
-  HR(binder_written("x"), mk_name("x", line, col), line, col)
+fn var_canonical_return(cell: Binder, line: Int, col: Int) : HReturn = {
+  let x = var_clause_binder(cell, "return", "x")
+  HR(x, mk_local(x.id, line, col), line, col)
 }
 
-# Variable specialisation: a `var x := init; x; x := v` block compiles
-# to a stack slot, not a chain of handler invocations. The specialised
-# form replaces the canonical `with State[T] as x` handler with:
-#   let x_slot = array_make(1, init)
-#   { rest, each read of x → array_get(x_slot, 0)
-#           and each write → { let _ = array_set(x_slot, 0, v); () } }
-# Trigger conditions:
-#   1. canonical handler shape (always true — emitted by us);
-#   2. no multi-shot resume (always true — canonical clauses);
-#   3. the cell only appears as the operand of its own read or write
-#      (no escape into a closure or argument);
-#   4. `init` is a "normal expression" — no op calls.
-# Conditions 1 and 2 hold by construction; this section adds the
-# conservative checks for 3 and 4 plus the rewrite.
-
-# Trigger 4: init is a normal expression. Conservative subset:
-# literals, a reference (to a local or global value), core
-# arithmetic / unary, calls whose callee is such a reference.
-# Anything else (op call, lambda, handle, match, if, block, list,
-# record, etc.) is rejected so the canonical handler runs instead.
+# The initial value is a plain expression: literals, a reference, core
+# arithmetic, and calls whose callee is a reference. An op call, lambda,
+# handle, match, if, block, list or record keeps the handler.
 fn init_is_safe(e: Expr) : Bool {
   match e.kind {
     EInt(_, _)  -> true
@@ -160,181 +124,60 @@ fn init_args_safe(es: [Expr]) : Bool {
   }
 }
 
-fn var_slot_name(name: String) : String = string_concat(name, "__slot")
+fn var_slot_binder(cell: Binder) : Binder =
+  Binder { id: local_minted(concat_all(["__var_slot#", int_to_string(local_raw(cell.id))])),
+           name: written(string_concat(written_text(cell.name), "__slot")) }
 
-# The slot's binder is the desugar's own: spelled after its var, and
-# identified by where the var is declared.
-fn var_slot_binder(name: String, line: Int, col: Int) : Binder =
-  Binder { id: local_minted(concat_all(["__var_slot@", int_to_string(line), ":", int_to_string(col)])),
-           name: written(var_slot_name(name)) }
+# The statements of a block up to its first `var`, and that `var` with the rest of the block, which is its scope.
+type VarAt = { b: Binder, ty: Option[TypeExpr], init: Expr, rest: [Stmt], line: Int, col: Int }
 
-# Walk a block's stmts looking for the first SVar. Returns the rewritten
-# (stmts, tail) pair: every stmt before the first SVar is structurally
-# desugared (so lambdas / inner blocks inside their expressions still
-# get their own `var`s rewritten), and from the SVar onward the rest
-# of the block becomes the body of a fresh `with State[T](init) as name`
-# handler. If no SVar is present, recursion proceeds structurally.
-fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
-  match stmts {
-    [] -> EBlock([], desugar_var_opt(tail))
-    [s, ...rest] -> match s {
-      SVar(b, ty, init, line, col) -> {
-        let name = written_text(b.name)
-        let init_d0 = desugar_var_expr(init)
-        # A declared `: T` binds the cell, so it must be checked against
-        # the initialiser. Neither lowering below carries the annotation
-        # (the slot drops it; the handler's `[T]` types the capability,
-        # not the state), so pin it here with an annotated `let` and feed
-        # its binder to both — the annotation check is the authority.
-        let ann = var_ann_binder(name, line, col)
-        let ann_pre = match ty {
-          Some(t) -> [SLet(mk_pat(PBind(ann), line, col), Some(t), init_d0)]
-          None -> []
-        }
-        let init_d = match ty {
-          Some(_) -> mk_expr(EName(ann.name), line, col)
-          None -> init_d0
-        }
-        let inner_kind = desugar_var_block(rest, tail)
-        let inner_expr = rc_check_var_writes(b, ty, mk_expr(inner_kind, line, col))
-        # Try variable specialisation first. When all
-        # trigger conditions hold, lower the var to a 1-element
-        # array slot (core `array_*`, no `Mutable` row) instead
-        # of the canonical State[T] handler. The conditions:
-        #   * init is a "normal expression" (init_is_safe)
-        #   * the cell only appears as the operand of its own read or
-        #     write in the body (body_escapes is false)
-        # When either fails, fall back to the canonical handler so
-        # captures, escapes, and complex inits still work.
-        if init_is_safe(init_d) and not body_escapes(b.id, inner_expr) {
-          let slot = var_slot_binder(name, line, col)
-          let slot_init = mk_expr(
-            ECall(mk_expr(EMark(MkVarSlot(b, slot)), line, col),
-                  [builtin_mk(CbArrayMake, line, col),
-                   mk_expr(mk_int_synth(1), line, col), init_d]),
-            line, col)
-          let let_pat = mk_pat(PBind(slot), line, col)
-          let let_stmt = SLet(let_pat, None, slot_init)
-          let body_spec = specialise_body(b.id, slot.id, inner_expr)
-          EBlock(list_append(ann_pre, [let_stmt]), Some(body_spec))
-        } else {
-          let tyargs = match ty { Some(t) -> [t] None -> [] }
-          let clauses = var_canonical_clauses(line, col)
-          let ret = var_canonical_return(line, col)
-          let handle_kind = EHandle(inner_expr, DrSym(core_effect_id(CeState)), tyargs,
-                                     Some(init_d), Some(b),
-                                     clauses, Some(ret))
-          EBlock(ann_pre, Some(mk_expr(handle_kind, line, col)))
-        }
-      }
-      _ -> {
-        let s_d = desugar_var_stmt(s)
-        let inner_kind = desugar_var_block(rest, tail)
-        match inner_kind {
-          EBlock(rest_stmts, rest_tail) ->
-            EBlock([s_d, ...rest_stmts], rest_tail)
-          _ -> EBlock([s_d], Some(mk_expr(inner_kind, 0, 0)))
-        }
-      }
+type VarSplit = { before: [Stmt], found: Option[VarAt] }
+
+fn split_first_var(stmts: [Stmt], acc: [Stmt]) : VarSplit = match stmts {
+  [] -> VarSplit { before: list_reverse(acc), found: None }
+  [SVar(b, ty, init, line, col), ...rest] ->
+    VarSplit { before: list_reverse(acc), found: Some(VarAt { b: b, ty: ty, init: init, rest: rest, line: line, col: col }) }
+  [s, ...rest] -> split_first_var(rest, [s, ...acc])
+}
+
+# The statements before the first `var` are lowered on their own.
+fn lower_vars_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
+  let sp = split_first_var(stmts, [])
+  let before = map(sp.before, lower_vars_stmt)
+  match sp.found {
+    None -> EBlock(before, lower_vars_opt(tail))
+    Some(v) -> match lower_var(v.b, v.ty, lower_vars_expr(v.init), lower_vars_block(v.rest, tail), v.line, v.col) {
+      EBlock(ss, t) -> EBlock(list_append(before, ss), t)
+      k             -> EBlock(before, Some(mk_expr(k, 0, 0)))
     }
   }
 }
 
-fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
-  match k {
-    # EBlock is the only kind that needs special handling: a head
-    # SVar inside the block lifts to a fresh `with State[T](init)`
-    # handler, which `desugar_var_block` builds. Stmts before the
-    # head SVar still recurse into their inner expressions.
-    EBlock(stmts, tail) -> desugar_var_block(stmts, tail)
-    _ -> dsg_map_expr_kind(k, desugar_var_expr)
+fn lower_var(b: Binder, ty: Option[TypeExpr], init0: Expr, inner_kind: ExprKind, line: Int, col: Int) : ExprKind {
+  # A declared `: T` binds the cell, so it is checked against the initialiser.
+  # Neither lowering carries the annotation (the slot drops it; the handler's
+  # `[T]` types the capability, not the state), so an annotated `let` pins it.
+  let ann = var_ann_binder(written_text(b.name), line, col)
+  let ann_pre = match ty {
+    Some(t) -> [SLet(mk_pat(PBind(ann), line, col), Some(t), init0)]
+    None -> []
   }
-}
-
-# Naked-cell-read lowering + escape veto. Walks every fn / test body
-# tracking the set `caps` of names currently bound as a mutable cell —
-# either by an enclosing `var name := init` (an SVar not yet rewritten
-# into a State[T] handler) or by a user-written `with State[T] as name`
-# / `with Reader[T] as name`. A bare `EName(name)` for such a name is
-# lowered here to a read node naming the cell's binder, and `name := v`
-# to a write node. The binder is numbered here because the resolver has
-# not run: the slot specialisation and the escape veto change the shape
-# of the program before it does, and need to tell a read from a
-# capability passed on. From this pass on a cell is its binder's id.
-#
-# Escape veto: a cell cannot be read or written from a closure whose
-# VALUE reaches the block's exit (tail / returned / stored in the exit
-# value), because the State[T] handler is torn down when the block
-# exits (the runtime is dynamic-scoping) — such a closure run later
-# reads a dead frame. A closure that is applied inside the block, or
-# passed as a call argument (applied eagerly), is sound and allowed.
-# The veto is a separate forward-taint walk (lcr_escape_check), not part
-# of the read lowering.
-#
-# Scope rules: SLet, lambda params, match arm patterns, fn params,
-# nested SVar with the same name, and handler `as` aliases all shadow a
-# name of the scope; a name under them is an ordinary local, left
-# untouched.
-pub(pkg) type VarLow = { decls: [Decl], errs: Int }
-
-#[doc("Lower naked reads and writes of mutable cells to nodes naming the cell and reject cell access that escapes its block; the entry point used before the SVar rewrite, where `@cell` is rejected.")]
-pub(pkg) fn lower_cell_reads_decls(ds: [Decl], df: DiagFiles) : VarLow / Console + File =
-  lcr_decls_loop(ds, true, df, [], 0)
-
-#[doc("Re-run of the cell-read lowering after string-interp lifting; `reject_at` is false because reads were already lowered, so only the reads the interpolation lift surfaced are left to lower.")]
-pub(pkg) fn relower_cell_reads_decls(ds: [Decl], df: DiagFiles) : VarLow / Console + File =
-  lcr_decls_loop(ds, false, df, [], 0)
-
-fn lcr_decls_loop(ds: [Decl], reject_at: Bool, df: DiagFiles, acc: [Decl], errs: Int) : VarLow / Console + File {
-
-  match ds {
-    [] -> VarLow { decls: list_reverse(acc), errs: errs }
-    [d, ...rest] -> {
-      let r = lcr_decl(d, reject_at, decl_diag_file(d, df), errs)
-      lcr_decls_loop(rest, reject_at, df, [r.decl, ...acc], r.errs)
-    }
+  let init_d = match ty {
+    Some(_) -> mk_local(ann.id, line, col)
+    None -> init0
   }
-}
-
-type VLDecl = { decl: Decl, errs: Int }
-
-fn lcr_decl(d: Decl, reject_at: Bool, file: String, errs: Int) : VLDecl / Console + File {
-
-  match d {
-    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> {
-      let pnames = dsg_rename_param_names(ps, [])
-      let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
-      VLDecl { decl: DFn(pub_, fid, tps, ps, ret, row, r.expr, l, c, mo), errs: r.errs }
-    }
-    DTest(desc, body, l, c, mo) -> {
-      let r = lcr_expr(body, [], reject_at, file, errs)
-      VLDecl { decl: DTest(desc, r.expr, l, c, mo), errs: r.errs }
-    }
-    DBench(desc, body, l, c, mo) -> {
-      let r = lcr_expr(body, [], reject_at, file, errs)
-      VLDecl { decl: DBench(desc, r.expr, l, c, mo), errs: r.errs }
-    }
-    DCheck(desc, ps, body, l, c, mo) -> {
-      let pnames = dsg_rename_param_names(ps, [])
-      let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
-      VLDecl { decl: DCheck(desc, ps, r.expr, l, c, mo), errs: r.errs }
-    }
-    DUnstable(inner, l, c) -> {
-      let r = lcr_decl(inner, reject_at, file, errs)
-      VLDecl { decl: DUnstable(r.decl, l, c), errs: r.errs }
-    }
-    DProtoLaws(thy, inner, l, c, mo) -> {
-      let r = lcr_decl(inner, reject_at, file, errs)
-      VLDecl { decl: DProtoLaws(thy, r.decl, l, c, mo), errs: r.errs }
-    }
-    DImplAxiom(thy, inner, l, c, mo) -> {
-      let r = lcr_decl(inner, reject_at, file, errs)
-      VLDecl { decl: DImplAxiom(thy, r.decl, l, c, mo), errs: r.errs }
-    }
-    DConstructor(inner, l, c) -> {
-      let r = lcr_decl(inner, reject_at, file, errs)
-      VLDecl { decl: DConstructor(r.decl, l, c), errs: r.errs }
-    }
-    _ -> VLDecl { decl: d, errs: errs }
+  let inner_expr = rc_check_var_writes(b, ty, mk_expr(inner_kind, line, col))
+  if init_is_safe(init_d) and not body_escapes(b.id, inner_expr) {
+    let slot = var_slot_binder(b)
+    let slot_init = mk_expr(
+      ECall(builtin_mk(CbArrayMake, line, col), [mk_expr(mk_int_synth(1), line, col), init_d]),
+      line, col)
+    let let_stmt = SLet(mk_pat(PBind(slot), line, col), None, slot_init)
+    EBlock(list_append(ann_pre, [let_stmt]), Some(specialise_body(b.id, slot.id, inner_expr)))
+  } else {
+    let tyargs = match ty { Some(t) -> [t]  None -> [] }
+    let handle_kind = EHandle(inner_expr, DrSym(core_effect_id(CeState)), tyargs, Some(init_d), Some(b),
+                              var_canonical_clauses(b, line, col), Some(var_canonical_return(b, line, col)))
+    EBlock(ann_pre, Some(mk_expr(handle_kind, line, col)))
   }
 }

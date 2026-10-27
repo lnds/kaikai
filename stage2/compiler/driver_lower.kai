@@ -1,4 +1,4 @@
-#[doc("Compile stages that lower surface forms before the resolver: regions, cells, loops, `var`, `use`, protocols and nursery capabilities.")]
+#[doc("Compile stages that lower surface forms before the resolver: regions, protocols and string interpolation.")]
 
 import compiler.ast_decl
 import compiler.verdicts
@@ -14,8 +14,6 @@ import compiler.module_table
 import compiler.import_unit
 import compiler.driver_cli
 import compiler.core_front
-import compiler.loop_lower
-import compiler.desugar_var
 import compiler.bang_hoist
 import compiler.region
 import compiler.edition
@@ -34,9 +32,9 @@ import compiler.driver_front
 import compiler.desugar_mangle
 import compiler.driver_kinds
 
-pub(pkg) type Regioned = { prev: Aliased, region_marks: [RegionMark], cell_low: VarLow }
+pub(pkg) type Regioned = { prev: Aliased, region_marks: [RegionMark], indexed: [Decl] }
 
-pub(pkg) type Lowered = { prev: Regioned, loop_low_md: Bool, loop_blocked: [String], post_use_decls: [Decl],
+pub(pkg) type Lowered = { prev: Regioned, post_use_decls: [Decl],
   lowered: LoweredProtocols, sym_tab: SymTab, interp_cores: [String], callee_ops: [ProtoRung], root_picks: [NPick],
   early_const_uses: [NUse], pattern_consts: [CDecl], all_decls: [Decl],
   proto_reg: ProtocolReg, held_impls: [Decl], emptied_impls: [ImplOrigin] }
@@ -74,22 +72,14 @@ pub(pkg) fn stage_region(req: Req, cx: Aliased) : Flow[Regioned] / Console + Fil
   # `var`'s init or its rest-of-block has already been
   # lowered to a call.
   let indexed_decls = split_resume_decls(desugar_index_decls(raw_decls))
-  # Lower naked cell reads (`counter` → `counter.get()`) and
-  # veto cell access from an escaping closure. Runs before the
-  # SVar → State[T] rewrite, so the lowered `.get()` is a plain
-  # call by the time `desugar_var_decls` decides stack-slot
-  # specialisation. Short-circuit on error so downstream passes
-  # never see a dangling cap read.
-  let cell_low = lower_cell_reads_decls(indexed_decls, diag_ctx)
-  if cell_low.errs > 0 { Halt(cell_low.errs) }
-  else { Go(Regioned { prev: cx, region_marks: region_marks, cell_low: cell_low }) }
+  Go(Regioned { prev: cx, region_marks: region_marks, indexed: indexed_decls })
 }
 
 pub(pkg) fn stage_lower(req: Req, cx: Regioned) : Flow[Lowered] / Console + File + Mutable {
   let alias_res = cx.prev.alias_res
   let axiom_name_coll = cx.prev.prev.prev.axiom_name_coll
   let backend = req.backend
-  let cell_low = cx.cell_low
+  let indexed = cx.indexed
   let const_name_coll = cx.prev.prev.prev.const_name_coll
   let constructor_uniq_vd = cx.prev.constructor_uniq_vd
   let core_mods = req.core_mods
@@ -131,17 +121,6 @@ pub(pkg) fn stage_lower(req: Req, cx: Regioned) : Flow[Lowered] / Console + File
   let union_collision_vd = cx.prev.union_collision_vd
   let unit_ref_vd = cx.prev.prev.unit_ref_vd
   let variant_cap_vd = cx.prev.variant_cap_vd
-  # Loop lowering (both backends): dissolve literal `while`/
-  # `until`/`repeat` combinator calls into loop intrinsics so the
-  # var→slot specialisation below sees no capturing closure. The
-  # C emitter pastes the bodies into an inline `for (;;)`; the
-  # KIR lowering builds the equivalent block loop, so the KIR
-  # dump modes keep matching the native pipeline byte-for-byte.
-  let loop_low_md = match mode { MDumpPurity -> false _ -> true }
-  let loop_blocked = if loop_low_md { loop_blocked_names(cell_low.decls, tab3) } else { [] }
-  let loop_low = if loop_low_md { lower_loop_intrinsics_with(loop_blocked, cell_low.decls) }
-                 else { cell_low.decls }
-  let var_decls = desugar_var_decls(loop_low)
   # `use Effect` desugar. Strips DUse / SUse and rewrites bare
   # `EName(op)` references into qualified
   # `EField(EName(eff), op)` form when the op belongs to an
@@ -149,7 +128,7 @@ pub(pkg) fn stage_lower(req: Req, cx: Regioned) : Flow[Lowered] / Console + File
   # desugars so SVar and SIndexAssign are already lowered;
   # runs before lower_protocols so protocol ops don't
   # conflict with effect ops in the open set.
-  let post_use_decls = var_decls
+  let post_use_decls = indexed
   # Lower protocols / impls / #[derive] into ordinary
   # top-level fns + a registry the post-inference rewrite
   # consumes. The registry-driven dispatch resolution runs
@@ -186,11 +165,7 @@ pub(pkg) fn stage_lower(req: Req, cx: Regioned) : Flow[Lowered] / Console + File
                                            interp_cores, target_mod_name)), sym_tab)
   let root_picks = nt_picks_of(sel_imports, "", module_table)
   let early_const_uses = nu_scan_consts(interp_lifted, sym_tab, target_mod_name, root_picks)
-  # The cell set is now seeded from the `with State[T] as name`
-  # handlers the var rewrite produced, and from the user's own.
-  # Idempotent on a read already lowered to `name.get()`.
-  let interp_cell = relower_cell_reads_decls(interp_lifted, diag_ctx)
-  let interp_decls_pre = interp_cell.decls
+  let interp_decls_pre = interp_lifted
   # Value-position const reads need no rewrite (a const IS a
   # value). The ONE ambiguous case is pattern position: a bare
   # const name parses as PVariant/PBind, so rewrite it to an
@@ -216,7 +191,7 @@ pub(pkg) fn stage_lower(req: Req, cx: Regioned) : Flow[Lowered] / Console + File
   # carries what every pass collected, whichever fails first.
   let front_vds = [
     Verdict(doc_errs, docs.diags), eff_scope_vd, ty_scope_vd, interp_dot_vd,
-    vd_count(interp_cell.errs), import_resolve_vd, Verdict(alias_res.errs, alias_res.diags),
+    import_resolve_vd, Verdict(alias_res.errs, alias_res.diags),
     Verdict(proto_errs, lowered.diags), import_hole_vd,
     unit_ref_vd, hab_decl_vd, shape_ref_vd, post_alias_unit_vd,
     vd_rendered(nominal_row_diags), union_collision_vd, constructor_uniq_vd,
@@ -230,7 +205,7 @@ pub(pkg) fn stage_lower(req: Req, cx: Regioned) : Flow[Lowered] / Console + File
   if vd_failed(front_vds) { Halt(vd_exit(json, list_append(front_vds, back_vds))) }
   else if missing_exports != [] { Halt(vd_exit(json, [vd_render(missing_exports), ...back_vds])) }
   else if vd_failed(back_vds) { Halt(vd_exit(json, back_vds)) }
-  else { Go(Lowered { prev: cx, loop_low_md: loop_low_md, loop_blocked: loop_blocked, post_use_decls: post_use_decls, lowered: lowered, sym_tab: sym_tab, interp_cores: interp_cores, callee_ops: callee_ops, root_picks: root_picks, early_const_uses: early_const_uses, pattern_consts: pattern_consts, all_decls: all_decls, proto_reg: proto_reg, held_impls: hold.held, emptied_impls: hold.emptied }) }
+  else { Go(Lowered { prev: cx, post_use_decls: post_use_decls, lowered: lowered, sym_tab: sym_tab, interp_cores: interp_cores, callee_ops: callee_ops, root_picks: root_picks, early_const_uses: early_const_uses, pattern_consts: pattern_consts, all_decls: all_decls, proto_reg: proto_reg, held_impls: hold.held, emptied_impls: hold.emptied }) }
 }
 
 pub(pkg) fn stage_ready(req: Req, cx: Lowered) : Ready / Console + File + Mutable {
@@ -246,8 +221,6 @@ pub(pkg) fn stage_ready(req: Req, cx: Lowered) : Ready / Console + File + Mutabl
   let kind_ctx_a = cx.prev.prev.prev.kind_ctx_a
   let kind_ctx_b = cx.prev.prev.kind_ctx_b
   let kind_theories = cx.prev.prev.prev.kind_theories
-  let loop_blocked = cx.loop_blocked
-  let loop_low_md = cx.loop_low_md
   let lowered = cx.lowered
   let mod_imps = cx.prev.prev.prev.prev.prev.prev.mod_imps
   let mod_tabs = cx.prev.prev.prev.prev.prev.prev.mod_tabs
@@ -277,7 +250,7 @@ pub(pkg) fn stage_ready(req: Req, cx: Lowered) : Ready / Console + File + Mutabl
                              tab2: tab2, tab3: tab3, sym_tab: sym_tab, file: path,
                              narrow_aliases: narrow_aliases, kind_ctx_a: kind_ctx_a, kind_ctx_b: kind_ctx_b,
                              effect_aliases: alias_res.aliases, ta_table: ta_table, ref_pred_fns: ref_pred_fns,
-                             recs: pos_recs, blocked: loop_blocked, loops: loop_low_md,
+                             recs: pos_recs,
                              show: proto_core_show(lowered.reg, interp_cores), cores: interp_cores,
                              bound: (ds) => c_bounded_decls(backend, ds, sym_tab), consts: pattern_consts,
                              ts_coll: ts_coll, vs_coll: vs_coll, mod_imps: mod_imps, sel_imports: sel_imports, entry: entry, reg: lowered.reg,
