@@ -37,7 +37,7 @@ expect dropped --user-cache --user-cache-dir @UC
 expect dropped --check --core-cache-dir @CC --toolchain-id @TID
 expect off     --full-core
 expect off     --check --full-core
-expect off     --emit=c-modular --core-cache-dir @CC --toolchain-id @TID
+expect dropped --emit=c-modular --core-cache-dir @CC --toolchain-id @TID
 
 if "$KAIC2" --emit=native "$WORK/main.kai" > /dev/null 2> "$WORK/probe.err"; then
   expect dropped --emit=native

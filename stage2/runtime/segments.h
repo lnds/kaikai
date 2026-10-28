@@ -547,7 +547,7 @@ struct KaiRtEvCancel {
     KaiHandlerId handler_id;
     void        *env;
     KaiValue    *state;
-    KaiValue   *(*raise)(KaiRtEvCancel *self, KaiCont *k);
+    KaiValue   *(*raise)(void *self, KaiCont *k);
 };
 
 /* An exit to `node`'s handle abandons the scopes opened inside its body. */

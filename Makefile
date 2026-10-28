@@ -408,9 +408,9 @@ test-rboxed-prim-scope: kaic1 kaic2
 	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	$(KAIC2) --path stdlib examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
-	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag_[0-9][0-9]*)' $$tmp/s2.c \
+	grep -qE '^    KU\(r_ntag_[0-9]+\);$$' $$tmp/s2.c \
 	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
-	if grep -q 'kai_op_ne_v(kaiv_ntag_[0-9][0-9]*,' $$tmp/s2.c; then \
+	if awk '/kaix_ne\(r_ntag_[0-9]+,/ && prev !~ /KU\(r_ntag_/ { bad = 1 } { prev = $$0 } END { exit !bad }' $$tmp/s2.c; then \
 	  echo "rboxed-prim FAIL kaic2: raw llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"
@@ -442,9 +442,9 @@ test-kai-namespace: kaic2
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/adv-emitted.txt; \
 	leaks=$$(comm -23 $$tmp/adv-emitted.txt $$tmp/runtime.txt); \
 	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: a user fn named after a runtime helper reached the kai_ namespace:"; echo "$$leaks"; exit 1; }; \
-	( cd stage2 && ./kaic2 $(EDITION_FLAG) --emit=kir-noinline ../$$fx/main.kai ) | grep -q '^fn ha__kai_internal_drop' \
-	  || { echo "test-kai-namespace FAIL: $$fx did not emit ha.kai_internal_drop as ha__kai_internal_drop"; exit 1; }; \
-	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_; user names shaped like runtime helpers keep their module prefix"
+	grep -q 'kaiu_ha__kai_internal_drop' $$tmp/adv.c \
+	  || { echo "test-kai-namespace FAIL: $$fx did not emit ha.kai_internal_drop as kaiu_ha__kai_internal_drop"; exit 1; }; \
+	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_; user names shaped like runtime helpers stay in kaiu_"
 
 # A root file whose basename is not a C identifier still mints valid symbols.
 # Both backends, since the name reaches C emission and KIR lowering alike.

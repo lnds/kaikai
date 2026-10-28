@@ -2321,9 +2321,10 @@ test-trmc-list-build: $(TARGET) build
 	name=$$(basename $$f .kai); \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	  || { echo "trmc-list-build FAIL (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	grep -q 'goto _kai_trmc_list_build_large__build_entry' build/s2-$$name.c \
+	../tools/c-probe.sh fn build/s2-$$name.c trmc_list_build_large__build | grep -q 'goto L_entry;' \
+	  && ../tools/c-probe.sh fn build/s2-$$name.c trmc_list_build_large__build | grep -q 'kaix_cctx_extend' \
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for build — rewrite regressed?)"; exit 1; }; \
-	grep -q 'goto _kai_trmc_list_build_large__map_inc_entry' build/s2-$$name.c \
+	../tools/c-probe.sh fn build/s2-$$name.c trmc_list_build_large__map_inc | grep -q 'goto L_entry;' \
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for map_inc — reuse-cons shape regressed?)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	  || { echo "trmc-list-build FAIL (C compile failed)"; exit 1; }; \
@@ -3769,9 +3770,9 @@ test-effects-m7a_6e_discard_resume: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_evidence_push_with_jmp" build/s2-$$name.c \
-	    && grep -q "if (_setjmp(_jmp) == 0)" build/s2-$$name.c \
-	    && grep -q "longjmp(\*_node_op->handle_jmp" build/s2-$$name.c \
+	  grep -q "kaix_evidence_push_with_jmp_l(" build/s2-$$name.c \
+	    && grep -q "_setjmp(r___jmpbuf_" build/s2-$$name.c \
+	    && grep -q "= r___kai_discard_" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (discard wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -5718,7 +5719,7 @@ test-unbox-phase2: $(TARGET) build
 	@# no `kai_op_eq(` (per-arm equality chain) inside the body.
 	@../tools/c-probe.sh raw build/perceus-unbox_phase2_match.c int64_t n \
 	  || { echo "unbox FAIL match (scrutinee binder not raw)"; exit 1; }
-	@grep -q '^int64_t unbox_phase2_match__classify_raw(void) {' build/perceus-unbox_phase2_match.c \
+	@grep -q '^int64_t kaiu_unbox_phase2_match__classify_raw(void) {' build/perceus-unbox_phase2_match.c \
 	  || { echo "unbox FAIL match (match result not returned raw)"; exit 1; }
 	@# match-raw unboxing (asu): a `match` whose RESULT is a raw scalar
 	@# (boxed variant scrutinee, Int arms) lowers `_r` as a raw int64_t —
@@ -5727,9 +5728,9 @@ test-unbox-phase2: $(TARGET) build
 	@# exercising the path: the compiler source has no match→scalar, so
 	@# selfhost byte-id stays green even if emit_match_raw regresses.
 	@# Without this grep the byte-id lies.
-	@grep -q '^int64_t unbox_phase2_match_scalar__area(KaiValue \* p0) {' build/perceus-unbox_phase2_match_scalar.c \
+	@grep -q '^int64_t kaiu_unbox_phase2_match_scalar__area(KaiValue \* p0) {' build/perceus-unbox_phase2_match_scalar.c \
 	  || { echo "unbox FAIL match_scalar (match result not raw in area)"; exit 1; }
-	@grep -q '^int64_t unbox_phase2_match_scalar__sides(KaiValue \* p0) {' build/perceus-unbox_phase2_match_scalar.c \
+	@grep -q '^int64_t kaiu_unbox_phase2_match_scalar__sides(KaiValue \* p0) {' build/perceus-unbox_phase2_match_scalar.c \
 	  || { echo "unbox FAIL match_scalar (panic catch-all blocked raw promotion in sides)"; exit 1; }
 	@# Tongariki Real-unboxing — arith fixture. The chain must lower
 	@# to raw `double kair_*` locals with no `kai_op_add(` / `kai_op_mul(` /
@@ -5837,7 +5838,7 @@ test-unbox-phase2: $(TARGET) build
 	  || { echo "unbox FAIL match_pbind_catchall_raw (output mismatch)"; \
 	       diff ../examples/perceus/match_pbind_catchall_raw.out.expected \
 	            build/perceus-match_pbind_catchall_raw.out; exit 1; }
-	@grep -q '^int64_t match_pbind_catchall_raw__classify_raw_pure(void) {' build/perceus-match_pbind_catchall_raw.c \
+	@grep -q '^int64_t kaiu_match_pbind_catchall_raw__classify_raw_pure(void) {' build/perceus-match_pbind_catchall_raw.c \
 	  || { echo "unbox FAIL match_pbind_catchall_raw (match result not returned raw)"; exit 1; }
 	@echo "unbox phase2 OK"
 
@@ -5879,7 +5880,7 @@ test-issue-892-mono-arg-unbox: $(TARGET) build
 	  || { echo "892 FAIL $$name (cc errored)"; exit 1; }; \
 	out=$$(./build/perceus-$$name); \
 	[ "$$out" = "agree" ] || { echo "892 FAIL $$name (generic != direct: $$out)"; exit 1; }
-	@grep -q '^int64_t mono_arg_unbox_892__larger__mono__Int(int64_t p0, int64_t p1) {' build/perceus-mono_arg_unbox_892.c \
+	@grep -q '^int64_t kaiu_mono_arg_unbox_892__larger__mono__Int(int64_t p0, int64_t p1) {' build/perceus-mono_arg_unbox_892.c \
 	  || { echo "892 FAIL (spec signature not unboxed)"; exit 1; }
 	@if grep -E 'static int64_t kaiu_mono_arg_unbox_892__loop_g\(.*\) \{[^}]*kai_int(f)?\(' build/perceus-mono_arg_unbox_892.c; then \
 	  echo "892 FAIL (boxing survived in loop_g body)"; exit 1; \
@@ -5956,17 +5957,13 @@ test-tco-zero-arg: $(TARGET) build
 test-tco-309: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/issue_309_countdown.kai > build/tco-309.c; \
-	grep -F -q '_kai_issue_309_countdown__count_down_entry:;' build/tco-309.c \
-	  || { echo "tco-309 FAIL (no _kai_count_down_entry label in emitted C)"; exit 1; }; \
-	grep -F -q 'goto _kai_issue_309_countdown__count_down_entry;' build/tco-309.c \
-	  || { echo "tco-309 FAIL (no goto _kai_count_down_entry in emitted C)"; exit 1; }; \
-	if grep -F -q 'int64_t _scr =' build/tco-309.c; then \
-	  : "Phase 3 unboxing — raw int64_t scrutinee carries no RC; pre-goto decref is unnecessary"; \
-	elif grep -F -q 'kai_decref(_scr); ({' build/tco-309.c; then \
-	  : "boxed scrutinee path — pre-goto _scr decref injected as before"; \
-	else \
-	  echo "tco-309 FAIL (boxed scrut without pre-goto kai_decref(_scr) injection)"; exit 1; \
-	fi; \
+	body=$$(../tools/c-probe.sh fn build/tco-309.c issue_309_countdown__count_down); \
+	echo "$$body" | grep -qx 'L_entry:;' \
+	  || { echo "tco-309 FAIL (no entry label in count_down)"; exit 1; }; \
+	echo "$$body" | grep -q 'goto L_entry;' \
+	  || { echo "tco-309 FAIL (no back-edge to the entry label in count_down)"; exit 1; }; \
+	echo "$$body" | grep -q 'kaix_decref' \
+	  && { echo "tco-309 FAIL (count_down decrefs a scrutinee it should hold raw)"; exit 1; } || true; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-309.c -o build/tco-309 $(LDLIBS_M) ; \
 	./build/tco-309 > build/tco-309.out; \
 	diff -q ../examples/tco/issue_309_countdown.out.expected build/tco-309.out > /dev/null \
@@ -8765,7 +8762,7 @@ test-perceus-1069-projection-reuse: $(TARGET) bin-kai build
 	diff -q $$exp build/s2-1069proj-n.out > /dev/null \
 	  || { echo "perceus-1069-projection-reuse FAIL (native output diff — original corrupted)"; diff $$exp build/s2-1069proj-n.out; exit 1; }; \
 	$(KAIC2) --path ../stdlib $$src > build/s2-1069proj.c; \
-	body=$$(awk '/^KaiValue \* reuse_projection_scrutinee_1069__grow_kind\(.*\) \{$$/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
+	body=$$(awk '/^KaiValue \* kaiu_reuse_projection_scrutinee_1069__grow_kind\(.*\) \{$$/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
 	echo "$$body" | grep -qE "kaix_variant(_masked)?[(]" \
 	  || { echo "perceus-1069-projection-reuse FAIL (grow_kind has no fresh variant allocation in emitted C)"; exit 1; }; \
 	if echo "$$body" | grep -qE "kaix_variant_reuse_at|kaix_variant_at|kaix_reuse"; then \
@@ -10090,7 +10087,7 @@ test-tco-fuse-order: $(TARGET) build
 	done; \
 	for f in mutual_fuse_slot_layout; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/$$f.kai > build/tco-$$f.c; \
-	  grep -E '^(KAI_CONST )?static [^=]*kaiu_[A-Za-z0-9_]*__kai_fused_[A-Za-z0-9_]*\(.*\);$$' build/tco-$$f.c | grep -v '_thunk(' > build/tco-$$f.proto; \
+	  grep -E '^[A-Za-z0-9_ *]+ kaiu_[A-Za-z0-9_]*__kai_fused_[A-Za-z0-9_]*\(.*\);$$' build/tco-$$f.c | grep -v '_thunk(' > build/tco-$$f.proto; \
 	  diff ../examples/tco/$$f.proto.expected build/tco-$$f.proto || { echo "tco-fuse-order DIFF ($$f slots)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-$$f.c -o build/tco-$$f $(LDLIBS_M) ; \
 	  ./build/tco-$$f > build/tco-$$f.out; \

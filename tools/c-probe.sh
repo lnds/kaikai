@@ -16,7 +16,7 @@ case "${1:-}" in
     ;;
   fn)
     [ $# -eq 3 ] || { echo "usage: c-probe.sh fn <file.c> <name-regex>" >&2; exit 2; }
-    awk -v re="^[A-Za-z_0-9 *]+ $3\\\\(.*\\\\) \\\\{\$" '$0 ~ re { on = 1 } on { print } on && /^}/ { exit }' "$2"
+    awk -v re="^[A-Za-z_0-9 *]+ (kaiu_)?$3\\\\(.*\\\\) \\\\{\$" '$0 ~ re { on = 1 } on { print } on && /^}/ { exit }' "$2"
     ;;
   *)
     echo "usage: c-probe.sh raw|fn ..." >&2
