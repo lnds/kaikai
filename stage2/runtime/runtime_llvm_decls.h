@@ -11,13 +11,13 @@ static inline KaiValue *kaix_apply(KaiValue *clo, int32_t n, KaiValue **args);
 static inline KaiValue *kaix_apply_borrow(KaiValue *clo, int32_t n, KaiValue **args);
 static inline KaiValue *kaix_arena_alloc(KaiTag tag);
 static inline KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t);
-void kaix_arena_pop(void);
-void kaix_arena_push(void);
+static inline void kaix_arena_pop(void);
+static inline void kaix_arena_push(void);
 static inline KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names);
 static inline KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args);
 static inline KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots);
 KaiValue *kaix_args_thunk(KaiValue *s, KaiValue **a, int n);
-void kaix_arm_share(int32_t took, KaiValue *child);
+static inline void kaix_arm_share(int32_t took, KaiValue *child);
 static inline int32_t kaix_arm_take(KaiValue *v, int32_t unbound);
 KaiValue *kaix_array_empty_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_array_get_borrow_thunk(KaiValue *s, KaiValue **a, int n);
@@ -84,7 +84,7 @@ static inline KaiValue *kaix_cons_head(KaiValue *v);
 static inline KaiValue *kaix_cons_reuse_move(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_cons_tail(KaiValue *v);
 static inline KaiValue **kaix_cons_tail_addr(KaiValue *node);
-void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid);
+static inline void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid);
 static inline KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v);
 KaiValue *kaix_core___deep_apply1(KaiValue *x, KaiValue *f);
 KaiValue *kaix_core___deep_apply2(KaiValue *x, KaiValue *p, KaiValue *f);
@@ -100,18 +100,18 @@ KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init);
 KaiValue *kaix_core_array_same(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v);
 KaiValue *kaix_core_array_take(KaiValue *a, KaiValue *i);
-KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_count(KaiValue *a);
-KaiValue *kaix_core_bit_not(KaiValue *a);
-KaiValue *kaix_core_bit_or(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_set(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_shl(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_shr(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b);
-KaiValue *kaix_core_bit_xor(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_count(KaiValue *a);
+static inline KaiValue *kaix_core_bit_not(KaiValue *a);
+static inline KaiValue *kaix_core_bit_or(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_set(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_shl(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_shr(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b);
+static inline KaiValue *kaix_core_bit_xor(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_byte_add(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_byte_eq(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_byte_lt(KaiValue *a, KaiValue *b);
@@ -242,7 +242,7 @@ KaiValue *kaix_core_uint32_to_int(KaiValue *v);
 KaiValue *kaix_core_uint32_to_string(KaiValue *v);
 KaiValue *kaix_core_uint64_to_int(KaiValue *v);
 KaiValue *kaix_core_uint64_to_string(KaiValue *v);
-KaiValue *kaix_core_unit_name(KaiValue *x);
+static inline KaiValue *kaix_core_unit_name(KaiValue *x);
 KaiValue *kaix_core_vec_empty(void);
 KaiValue *kaix_core_vec_from_list(KaiValue *xs);
 KaiValue *kaix_core_vec_get(KaiValue *v, KaiValue *i);
@@ -258,7 +258,7 @@ KaiValue *kaix_core_vec_tail_from(KaiValue *v, KaiValue *s);
 KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c);
 KaiValue *kaix_core_write_stdout(KaiValue *v);
 void kaix_cov_hit(const char *site);
-void kaix_decref(KaiValue *v);
+static inline void kaix_decref(KaiValue *v);
 static inline KaiValue *kaix_deep_copy_out(KaiValue *v);
 KaiValue *kaix_default_cancel_raise(void *self, KaiCont *k);
 KaiValue *kaix_default_clock_monotonic_now(void *self, KaiCont *k);
@@ -347,7 +347,7 @@ KaiValue *kaix_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_dir_temp_dir_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_dir_walk_thunk(KaiValue *s, KaiValue **a, int n);
 static inline void *kaix_disp_enter(KaiFiber *f, void *node_v);
-void kaix_disp_leave(KaiFiber *f, void *prev_v);
+static inline void kaix_disp_leave(KaiFiber *f, void *prev_v);
 static inline KaiFiber *kaix_dispatch_fiber(void);
 static inline KaiValue *kaix_div(KaiValue *a, KaiValue *b);
 static inline KaiReuse kaix_drop_reuse_token(KaiValue *v, int n);
@@ -384,7 +384,7 @@ static inline KaiValue *kaix_field_at(KaiValue *rec, int32_t i);
 static inline KaiValue *kaix_field_borrow(KaiValue *rec, const char *name);
 static inline KaiValue *kaix_field_take(KaiValue *rec, const char *name);
 static inline KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i);
-KaiValue *kaix_field_untake(KaiValue *rec, const char *name);
+static inline KaiValue *kaix_field_untake(KaiValue *rec, const char *name);
 KaiValue *kaix_file_append_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_file_delete_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_file_exists_thunk(KaiValue *s, KaiValue **a, int n);
@@ -519,7 +519,7 @@ void kaix_register_one_reusable_tag(int32_t tag);
 void kaix_register_one_variant_head(int32_t variant_tag, int32_t head_tag);
 KaiValue *kaix_resume_frame_push(KaiValue *clo);
 KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v);
-void kaix_reuse_free(KaiReuse at);
+static inline void kaix_reuse_free(KaiReuse at);
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask);
 static inline KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
@@ -581,7 +581,7 @@ KaiValue *kaix_uint64_to_int_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_uint64_to_string_thunk(KaiValue *s, KaiValue **a, int n);
 static inline uint64_t kaix_umod_chk(uint64_t a, uint64_t b);
 static inline KaiValue *kaix_unit(void);
-void kaix_unw_pop(KaiFiber *f);
+static inline void kaix_unw_pop(KaiFiber *f);
 KaiFiber *kaix_unw_push_ev_state_f(KaiFiber **cache, void *ev);
 static inline KaiFiber *kaix_unw_push_f(KaiFiber **cache, KaiValue **base, int64_t n);
 static inline KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args);
@@ -593,11 +593,14 @@ static inline KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i);
 static inline KaiValue *kaix_variant_at(KaiReuse at, int32_t tag, const char *name, int n, KaiValue **args);
 static inline KaiValue *kaix_variant_at_argv(int32_t tag, const char *name, int n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n, KaiVarSlot *slots);
+static inline KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots);
+static inline KaiValue *kaix_variant_reuse_at_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots);
+static inline KaiValue *kaix_variant_reuse_move_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline KaiValue **kaix_variant_slot_addr(KaiValue *node, int slot);
 static inline int32_t kaix_variant_tag_of(KaiValue *v);
 KaiValue *kaix_vec_empty_thunk(KaiValue *s, KaiValue **a, int n);
@@ -645,6 +648,8 @@ static inline KaiValue *kaix_arena_alloc(KaiTag tag) {
     return a ? kai_arena_alloc(a, tag) : kai_alloc(tag);
 }
 static inline KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t) {return kai_arena_cons(h, t); }
+static inline void kaix_arena_pop(void) {kai_arena_pop(); }
+static inline void kaix_arena_push(void) {(void) kai_arena_push(); }
 static inline KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) {return kai_arena_record(n, fields, names); }
 static inline KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args) {
     /* Same boxed-args bridge as kaix_variant: stamp into slot-mask shape
@@ -666,6 +671,7 @@ static inline KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name,
     if (n <= 0) return kai_arena_variant(tag, name, 0, 0, NULL);
     return kai_arena_variant(tag, name, n, kai_slot_mask_of(tag), slots);
 }
+static inline void kaix_arm_share(int32_t took, KaiValue *child) {if (!took) kai_incref(child); }
 static inline int32_t kaix_arm_take(KaiValue *v, int32_t unbound) {return kai_arm_take(v, (uint32_t) unbound); }
 static inline KaiValue *kaix_bit_and(KaiValue *a, KaiValue *b) {
     KaiValue *r = kai_int(kai_intf(a) & kai_intf(b));
@@ -767,7 +773,20 @@ static inline KaiValue *kaix_cons_tail(KaiValue *v) {return kai_incref(kai_seq_n
 static inline KaiValue **kaix_cons_tail_addr(KaiValue *node) {
     return &node->as.cons.tail;
 }
+static inline void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid) {kai_cont_init_identity(k, hid); }
 static inline KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {return kai_cont_resume(k, v); }
+static inline KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) & kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) & ~(int64_t)((uint64_t)1 << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_count(KaiValue *a) {KaiValue *r = kai_int((int64_t) __builtin_popcountll((uint64_t) kai_intf(a))); kai_decref(a); return r; }
+static inline KaiValue *kaix_core_bit_not(KaiValue *a) {KaiValue *r = kai_int(~ kai_intf(a)); kai_decref(a); return r; }
+static inline KaiValue *kaix_core_bit_or(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) | kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_set(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) | (int64_t)((uint64_t)1 << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_shl(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int((int64_t)((uint64_t) kai_intf(a) << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_shr(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) >> (kai_intf(b) & 63)); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b) {KaiValue *r = kai_bool(((kai_intf(a) >> (kai_intf(b) & 63)) & 1) != 0); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) ^ (int64_t)((uint64_t)1 << (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int((int64_t)(((uint64_t) kai_intf(a)) >> (kai_intf(b) & 63))); kai_decref(a); kai_decref(b); return r; }
+static inline KaiValue *kaix_core_bit_xor(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) ^ kai_intf(b)); kai_decref(a); kai_decref(b); return r; }
 static inline KaiValue *kaix_core_defer(KaiValue *thunk) {return kai_seq_defer(thunk); }
 static inline KaiValue *kaix_core_filter_cell(KaiValue *s, KaiValue *p) {return kai_seq_filter(s, p); }
 static inline KaiValue *kaix_core_force(KaiValue *s) {return kai_seq_force(s); }
@@ -775,6 +794,8 @@ static inline KaiValue *kaix_core_once(KaiValue *init) {return kai_seq_once(init
 static inline KaiValue *kaix_core_release_userdata(KaiValue *u) {return kai_ffi_release(u); }
 static inline KaiValue *kaix_core_retain_userdata(KaiValue *v) {return kai_ffi_retain(v); }
 static inline KaiValue *kaix_core_take_userdata(KaiValue *u) {return kai_ffi_take(u); }
+static inline KaiValue *kaix_core_unit_name(KaiValue *x) {if (x) kai_decref(x); return kai_str(""); }
+static inline void kaix_decref(KaiValue *v) {kai_decref(v); }
 static inline KaiValue *kaix_deep_copy_out(KaiValue *v) {
     KaiValue *r = kai_deep_copy_out(v);
     kai_decref(v);
@@ -785,6 +806,7 @@ static inline void *kaix_disp_enter(KaiFiber *f, void *node_v) {
     f->in_dispatch_node = (KaiEvidence *) node_v;
     return (void *) prev;
 }
+static inline void kaix_disp_leave(KaiFiber *f, void *prev_v) {f->in_dispatch_node = (KaiEvidence *) prev_v; }
 static inline KaiFiber *kaix_dispatch_fiber(void) {return kai_current_fiber(); }
 static inline KaiValue *kaix_div(KaiValue *a, KaiValue *b) {return kai_op_div(a, b); }
 static inline KaiReuse kaix_drop_reuse_token(KaiValue *v, int n) {return kai_drop_reuse_token(v, n); }
@@ -807,6 +829,7 @@ static inline KaiValue *kaix_field_at(KaiValue *rec, int32_t i) {return kai_op_f
 static inline KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) {return kai_op_field_borrow(rec, name); }
 static inline KaiValue *kaix_field_take(KaiValue *rec, const char *name) {return kai_op_field_take(rec, name); }
 static inline KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i) {return kai_op_field_take_dup_at(rec, i); }
+static inline KaiValue *kaix_field_untake(KaiValue *rec, const char *name) {kai_op_field_untake(rec, name); return kai_unit(); }
 static inline int64_t kaix_fixed_val_field(KaiValue *v) {
     if (!v) return 0;
     switch ((KaiTag) v->tag) {
@@ -885,6 +908,7 @@ static inline void kaix_register_one_payload_ctor(int32_t tag, const char *name,
     kai_varname_register(tag, name);
     kai_slotmask_register(tag, (uint32_t) mask);
 }
+static inline void kaix_reuse_free(KaiReuse at) {kai_reuse_free(at); }
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
   return kai_reuse_or_alloc_cons(scr, h, t);
 }
@@ -957,6 +981,7 @@ static inline int64_t kaix_uint64_field(KaiValue *v) {return (int64_t) v->as.u64
 static inline KaiValue *kaix_uint64_str(const char *s) {return kai_uint64((uint64_t) kai_i128_parse(s)); }
 static inline uint64_t kaix_umod_chk(uint64_t a, uint64_t b) {return kai_umod_chk(a, b); }
 static inline KaiValue *kaix_unit(void) {return kai_unit(); }
+static inline void kaix_unw_pop(KaiFiber *f) {kai_unw_pop(f); }
 static inline KaiFiber *kaix_unw_push_f(KaiFiber **cache, KaiValue **base, int64_t n) {return kai_unw_push_c(cache, base, (intptr_t) n); }
 static inline KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args) {
     /* LLVM backend still passes args as KaiValue **; bridge to the
@@ -1025,6 +1050,9 @@ static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_argv_i64(
   return kaix_variant_at_masked((KaiReuse) slots[0].ptr, tag, name, n - 1,
                                 (int32_t) kai_slot_mask_of(tag), slots + 1);
 }
+static inline KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  return kaix_variant_at_masked((KaiReuse) slots[0].ptr, tag, name, n - 1, mask, slots + 1);
+}
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
   if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
   return kai_variant_at(at, tag, name, n, (uint32_t) mask, slots);
@@ -1052,6 +1080,10 @@ static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64
   return kai_variant_reuse_at(scr, tag, name, n,
                               (uint32_t) kai_slot_mask_of(tag), slots);
 }
+static inline KaiValue *kaix_variant_reuse_at_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
+  return kai_variant_reuse_at(scr, tag, name, n, (uint32_t) mask, slots);
+}
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots) {
   if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
       scr->var_n_args == n && kai_check_unique(scr)) {
@@ -1061,6 +1093,16 @@ static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i
     return scr;
   }
   return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
+}
+static inline KaiValue *kaix_variant_reuse_move_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
+      scr->var_n_args == n && kai_check_unique(scr)) {
+    for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
+    scr->variant_tag = tag;
+    kai_rc_count_reuse();
+    return scr;
+  }
+  return kai_variant_u(tag, name, n, (uint32_t) mask, slots);
 }
 static inline KaiValue **kaix_variant_slot_addr(KaiValue *node, int slot) {
     return &kai_var_slots(node)[slot].ptr;

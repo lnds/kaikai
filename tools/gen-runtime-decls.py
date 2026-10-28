@@ -23,7 +23,7 @@ COLD = re.compile(r'^#\s*if\s+!defined\(KAI_HOT_ONLY\)')
 IF = re.compile(r'^#\s*if')
 ENDIF = re.compile(r'^#\s*endif')
 MACRO_USE = re.compile(r'\b[A-Z][A-Z0-9_]{2,}\b')
-ONE_LINER =re.compile(r'^\s*return\b[^;{}]*;\s*\}\s*(/\*.*\*/)?\s*$')
+ONE_LINER = re.compile(r'^\s*[^{}]*;\s*\}\s*(/\*.*\*/)?\s*$')
 
 
 OPEN_SIG = re.compile(r'^[A-Za-z_][^;{}=#]*\bkaix_\w+\s*\((?:[^()]|\([^()]*\))*$')

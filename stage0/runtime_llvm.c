@@ -1127,6 +1127,32 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *s
   return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
+/* `kaix_variant_at_argv_i64` with the slot mask given by the caller. */
+KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n,
+                                   int32_t mask, KaiVarSlot *slots) {
+  return kaix_variant_at_masked((KaiReuse) slots[0].ptr, tag, name, n - 1, mask, slots + 1);
+}
+
+/* The two reuse rebuilds above with the slot mask given by the caller, a
+ * compile-time constant in C-printed code, so the slot copy folds. */
+KaiValue *kaix_variant_reuse_at_k(KaiValue *scr, int32_t tag,
+                                    const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
+  return kai_variant_reuse_at(scr, tag, name, n, (uint32_t) mask, slots);
+}
+
+KaiValue *kaix_variant_reuse_move_k(KaiValue *scr, int32_t tag,
+                                    const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
+      scr->var_n_args == n && kai_check_unique(scr)) {
+    for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
+    scr->variant_tag = tag;
+    kai_rc_count_reuse();
+    return scr;
+  }
+  return kai_variant_u(tag, name, n, (uint32_t) mask, slots);
+}
+
 /* A lambda thunk's read of capture i. Borrowed: the closure owns its
    captures and releases them when it dies. */
 KaiValue *kaix_capture(KaiValue *self, int i)             { return self->as.clo.captures[i]; }
