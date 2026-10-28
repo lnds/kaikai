@@ -86,20 +86,20 @@ static inline KaiValue *kaix_cons_tail(KaiValue *v);
 static inline KaiValue **kaix_cons_tail_addr(KaiValue *node);
 void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid);
 static inline KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v);
-static inline KaiValue *kaix_core___deep_apply1(KaiValue *x, KaiValue *f);
-static inline KaiValue *kaix_core___deep_apply2(KaiValue *x, KaiValue *p, KaiValue *f);
-static inline KaiValue *kaix_core_abspath(KaiValue *p);
-static inline KaiValue *kaix_core_args(void);
-static inline KaiValue *kaix_core_array_empty(void);
-static inline KaiValue *kaix_core_array_get(KaiValue *a, KaiValue *i);
-static inline KaiValue *kaix_core_array_get_borrow(KaiValue *a, KaiValue *i);
-static inline KaiValue *kaix_core_array_grow(KaiValue *a, KaiValue *n, KaiValue *init);
-static inline KaiValue *kaix_core_array_length(KaiValue *a);
-static inline KaiValue *kaix_core_array_length_borrow(KaiValue *a);
-static inline KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init);
-static inline KaiValue *kaix_core_array_same(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v);
-static inline KaiValue *kaix_core_array_take(KaiValue *a, KaiValue *i);
+KaiValue *kaix_core___deep_apply1(KaiValue *x, KaiValue *f);
+KaiValue *kaix_core___deep_apply2(KaiValue *x, KaiValue *p, KaiValue *f);
+KaiValue *kaix_core_abspath(KaiValue *p);
+KaiValue *kaix_core_args(void);
+KaiValue *kaix_core_array_empty(void);
+KaiValue *kaix_core_array_get(KaiValue *a, KaiValue *i);
+KaiValue *kaix_core_array_get_borrow(KaiValue *a, KaiValue *i);
+KaiValue *kaix_core_array_grow(KaiValue *a, KaiValue *n, KaiValue *init);
+KaiValue *kaix_core_array_length(KaiValue *a);
+KaiValue *kaix_core_array_length_borrow(KaiValue *a);
+KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init);
+KaiValue *kaix_core_array_same(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v);
+KaiValue *kaix_core_array_take(KaiValue *a, KaiValue *i);
 KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_bit_clear(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_bit_count(KaiValue *a);
@@ -112,151 +112,151 @@ KaiValue *kaix_core_bit_test(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_bit_ushr(KaiValue *a, KaiValue *b);
 KaiValue *kaix_core_bit_xor(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_byte_add(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_byte_eq(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_byte_lt(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_byte_sub(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_byte_to_int(KaiValue *v);
-static inline KaiValue *kaix_core_byte_to_string(KaiValue *v);
-static inline KaiValue *kaix_core_bytes_blit(KaiValue *d, KaiValue *o, KaiValue *s, KaiValue *so, KaiValue *n);
-static inline KaiValue *kaix_core_bytes_get_le(KaiValue *s, KaiValue *o, KaiValue *w);
-static inline KaiValue *kaix_core_bytes_get_string(KaiValue *s, KaiValue *o, KaiValue *n);
-static inline KaiValue *kaix_core_bytes_put_le(KaiValue *d, KaiValue *o, KaiValue *v, KaiValue *w);
-static inline KaiValue *kaix_core_bytes_put_string(KaiValue *d, KaiValue *o, KaiValue *s);
-static inline KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i);
-static inline KaiValue *kaix_core_char_to_int(KaiValue *c);
-static inline KaiValue *kaix_core_char_to_string(KaiValue *c);
-static inline KaiValue *kaix_core_core_program_name(void);
+KaiValue *kaix_core_byte_add(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_byte_eq(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_byte_lt(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_byte_sub(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_byte_to_int(KaiValue *v);
+KaiValue *kaix_core_byte_to_string(KaiValue *v);
+KaiValue *kaix_core_bytes_blit(KaiValue *d, KaiValue *o, KaiValue *s, KaiValue *so, KaiValue *n);
+KaiValue *kaix_core_bytes_get_le(KaiValue *s, KaiValue *o, KaiValue *w);
+KaiValue *kaix_core_bytes_get_string(KaiValue *s, KaiValue *o, KaiValue *n);
+KaiValue *kaix_core_bytes_put_le(KaiValue *d, KaiValue *o, KaiValue *v, KaiValue *w);
+KaiValue *kaix_core_bytes_put_string(KaiValue *d, KaiValue *o, KaiValue *s);
+KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i);
+KaiValue *kaix_core_char_to_int(KaiValue *c);
+KaiValue *kaix_core_char_to_string(KaiValue *c);
+KaiValue *kaix_core_core_program_name(void);
 static inline KaiValue *kaix_core_defer(KaiValue *thunk);
-static inline KaiValue *kaix_core_dir_create_dir(KaiValue *p);
-static inline KaiValue *kaix_core_dir_current_dir(void);
-static inline KaiValue *kaix_core_dir_list_dir(KaiValue *p);
-static inline KaiValue *kaix_core_dir_remove_dir(KaiValue *p);
-static inline KaiValue *kaix_core_dir_temp_dir(void);
-static inline KaiValue *kaix_core_dir_walk(KaiValue *p);
-static inline KaiValue *kaix_core_each(KaiValue *xs, KaiValue *f);
-static inline KaiValue *kaix_core_eprint(KaiValue *v);
-static inline KaiValue *kaix_core_exit(KaiValue *v);
-static inline KaiValue *kaix_core_file_append(KaiValue *p, KaiValue *c);
-static inline KaiValue *kaix_core_file_delete(KaiValue *p);
-static inline KaiValue *kaix_core_file_exists(KaiValue *p);
-static inline KaiValue *kaix_core_file_metadata(KaiValue *p);
-static inline KaiValue *kaix_core_file_read_bytes(KaiValue *p);
-static inline KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t);
-static inline KaiValue *kaix_core_file_write_bytes(KaiValue *p, KaiValue *b);
-static inline KaiValue *kaix_core_filter(KaiValue *xs, KaiValue *p);
+KaiValue *kaix_core_dir_create_dir(KaiValue *p);
+KaiValue *kaix_core_dir_current_dir(void);
+KaiValue *kaix_core_dir_list_dir(KaiValue *p);
+KaiValue *kaix_core_dir_remove_dir(KaiValue *p);
+KaiValue *kaix_core_dir_temp_dir(void);
+KaiValue *kaix_core_dir_walk(KaiValue *p);
+KaiValue *kaix_core_each(KaiValue *xs, KaiValue *f);
+KaiValue *kaix_core_eprint(KaiValue *v);
+KaiValue *kaix_core_exit(KaiValue *v);
+KaiValue *kaix_core_file_append(KaiValue *p, KaiValue *c);
+KaiValue *kaix_core_file_delete(KaiValue *p);
+KaiValue *kaix_core_file_exists(KaiValue *p);
+KaiValue *kaix_core_file_metadata(KaiValue *p);
+KaiValue *kaix_core_file_read_bytes(KaiValue *p);
+KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t);
+KaiValue *kaix_core_file_write_bytes(KaiValue *p, KaiValue *b);
+KaiValue *kaix_core_filter(KaiValue *xs, KaiValue *p);
 static inline KaiValue *kaix_core_filter_cell(KaiValue *s, KaiValue *p);
-static inline KaiValue *kaix_core_flat_map(KaiValue *xs, KaiValue *f);
+KaiValue *kaix_core_flat_map(KaiValue *xs, KaiValue *f);
 static inline KaiValue *kaix_core_force(KaiValue *s);
-static inline KaiValue *kaix_core_int128_to_int(KaiValue *v);
-static inline KaiValue *kaix_core_int128_to_string(KaiValue *v);
-static inline KaiValue *kaix_core_int32_to_int(KaiValue *v);
-static inline KaiValue *kaix_core_int32_to_string(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_byte(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_byte_string(KaiValue *i);
-static inline KaiValue *kaix_core_int_to_char(KaiValue *i);
-static inline KaiValue *kaix_core_int_to_int128(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_int32(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_le4(KaiValue *n);
-static inline KaiValue *kaix_core_int_to_le8(KaiValue *n);
-static inline KaiValue *kaix_core_int_to_real(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_string(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_string_radix(KaiValue *v, KaiValue *r);
-static inline KaiValue *kaix_core_int_to_uint32(KaiValue *v);
-static inline KaiValue *kaix_core_int_to_uint64(KaiValue *v);
-static inline KaiValue *kaix_core_list_append(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_list_length(KaiValue *xs);
-static inline KaiValue *kaix_core_list_reverse(KaiValue *xs);
-static inline KaiValue *kaix_core_mailbox_alloc(void);
-static inline KaiValue *kaix_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow);
-static inline KaiValue *kaix_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow);
-static inline KaiValue *kaix_core_mailbox_alloc_unowned(void);
+KaiValue *kaix_core_int128_to_int(KaiValue *v);
+KaiValue *kaix_core_int128_to_string(KaiValue *v);
+KaiValue *kaix_core_int32_to_int(KaiValue *v);
+KaiValue *kaix_core_int32_to_string(KaiValue *v);
+KaiValue *kaix_core_int_to_byte(KaiValue *v);
+KaiValue *kaix_core_int_to_byte_string(KaiValue *i);
+KaiValue *kaix_core_int_to_char(KaiValue *i);
+KaiValue *kaix_core_int_to_int128(KaiValue *v);
+KaiValue *kaix_core_int_to_int32(KaiValue *v);
+KaiValue *kaix_core_int_to_le4(KaiValue *n);
+KaiValue *kaix_core_int_to_le8(KaiValue *n);
+KaiValue *kaix_core_int_to_real(KaiValue *v);
+KaiValue *kaix_core_int_to_string(KaiValue *v);
+KaiValue *kaix_core_int_to_string_radix(KaiValue *v, KaiValue *r);
+KaiValue *kaix_core_int_to_uint32(KaiValue *v);
+KaiValue *kaix_core_int_to_uint64(KaiValue *v);
+KaiValue *kaix_core_list_append(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_list_length(KaiValue *xs);
+KaiValue *kaix_core_list_reverse(KaiValue *xs);
+KaiValue *kaix_core_mailbox_alloc(void);
+KaiValue *kaix_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow);
+KaiValue *kaix_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow);
+KaiValue *kaix_core_mailbox_alloc_unowned(void);
 KaiValue *kaix_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber);
 KaiValue *kaix_core_mailbox_free(KaiValue *pid);
 KaiValue *kaix_core_mailbox_recv(KaiValue *pid);
 KaiValue *kaix_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ns);
 KaiValue *kaix_core_mailbox_send(KaiValue *pid, KaiValue *msg);
-static inline KaiValue *kaix_core_map(KaiValue *xs, KaiValue *f);
+KaiValue *kaix_core_map(KaiValue *xs, KaiValue *f);
 static inline KaiValue *kaix_core_once(KaiValue *init);
-static inline KaiValue *kaix_core_panic(KaiValue *msg);
-static inline KaiValue *kaix_core_print(KaiValue *v);
-static inline KaiValue *kaix_core_program_name(void);
+KaiValue *kaix_core_panic(KaiValue *msg);
+KaiValue *kaix_core_print(KaiValue *v);
+KaiValue *kaix_core_program_name(void);
 KaiValue *kaix_core_program_name_thunk(KaiValue *s, KaiValue **a, int n);
-static inline KaiValue *kaix_core_read_bytes(KaiValue *n);
-static inline KaiValue *kaix_core_read_file(KaiValue *p);
-static inline KaiValue *kaix_core_read_line(void);
-static inline KaiValue *kaix_core_real_acos(KaiValue *x);
-static inline KaiValue *kaix_core_real_asin(KaiValue *x);
-static inline KaiValue *kaix_core_real_atan(KaiValue *x);
-static inline KaiValue *kaix_core_real_atan2(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_real_bits(KaiValue *v);
-static inline KaiValue *kaix_core_real_cbrt(KaiValue *x);
-static inline KaiValue *kaix_core_real_cos(KaiValue *x);
-static inline KaiValue *kaix_core_real_cosh(KaiValue *x);
-static inline KaiValue *kaix_core_real_exp(KaiValue *x);
-static inline KaiValue *kaix_core_real_is_inf(KaiValue *x);
-static inline KaiValue *kaix_core_real_is_nan(KaiValue *x);
-static inline KaiValue *kaix_core_real_log(KaiValue *x);
-static inline KaiValue *kaix_core_real_log10(KaiValue *x);
-static inline KaiValue *kaix_core_real_log2(KaiValue *x);
-static inline KaiValue *kaix_core_real_pow(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_real_rem(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_real_signum(KaiValue *x);
-static inline KaiValue *kaix_core_real_sin(KaiValue *x);
-static inline KaiValue *kaix_core_real_sinh(KaiValue *x);
-static inline KaiValue *kaix_core_real_sqrt(KaiValue *x);
-static inline KaiValue *kaix_core_real_tan(KaiValue *x);
-static inline KaiValue *kaix_core_real_tanh(KaiValue *x);
-static inline KaiValue *kaix_core_real_to_int(KaiValue *v);
-static inline KaiValue *kaix_core_real_to_string(KaiValue *v);
-static inline KaiValue *kaix_core_reduce(KaiValue *xs, KaiValue *i, KaiValue *f);
-static inline KaiValue *kaix_core_ref_get(KaiValue *r);
-static inline KaiValue *kaix_core_ref_make(KaiValue *init);
-static inline KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v);
+KaiValue *kaix_core_read_bytes(KaiValue *n);
+KaiValue *kaix_core_read_file(KaiValue *p);
+KaiValue *kaix_core_read_line(void);
+KaiValue *kaix_core_real_acos(KaiValue *x);
+KaiValue *kaix_core_real_asin(KaiValue *x);
+KaiValue *kaix_core_real_atan(KaiValue *x);
+KaiValue *kaix_core_real_atan2(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_real_bits(KaiValue *v);
+KaiValue *kaix_core_real_cbrt(KaiValue *x);
+KaiValue *kaix_core_real_cos(KaiValue *x);
+KaiValue *kaix_core_real_cosh(KaiValue *x);
+KaiValue *kaix_core_real_exp(KaiValue *x);
+KaiValue *kaix_core_real_is_inf(KaiValue *x);
+KaiValue *kaix_core_real_is_nan(KaiValue *x);
+KaiValue *kaix_core_real_log(KaiValue *x);
+KaiValue *kaix_core_real_log10(KaiValue *x);
+KaiValue *kaix_core_real_log2(KaiValue *x);
+KaiValue *kaix_core_real_pow(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_real_rem(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_real_signum(KaiValue *x);
+KaiValue *kaix_core_real_sin(KaiValue *x);
+KaiValue *kaix_core_real_sinh(KaiValue *x);
+KaiValue *kaix_core_real_sqrt(KaiValue *x);
+KaiValue *kaix_core_real_tan(KaiValue *x);
+KaiValue *kaix_core_real_tanh(KaiValue *x);
+KaiValue *kaix_core_real_to_int(KaiValue *v);
+KaiValue *kaix_core_real_to_string(KaiValue *v);
+KaiValue *kaix_core_reduce(KaiValue *xs, KaiValue *i, KaiValue *f);
+KaiValue *kaix_core_ref_get(KaiValue *r);
+KaiValue *kaix_core_ref_make(KaiValue *init);
+KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v);
 static inline KaiValue *kaix_core_release_userdata(KaiValue *u);
 static inline KaiValue *kaix_core_retain_userdata(KaiValue *v);
 KaiValue *kaix_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk);
-static inline KaiValue *kaix_core_stdlib_path(void);
-static inline KaiValue *kaix_core_string_byte_at_int(KaiValue *s, KaiValue *i);
-static inline int64_t kaix_core_string_byte_at_int_raw(KaiValue *s, int64_t i);
-static inline KaiValue *kaix_core_string_concat(KaiValue *a, KaiValue *b);
-static inline KaiValue *kaix_core_string_concat_all(KaiValue *xs);
-static inline KaiValue *kaix_core_string_contains(KaiValue *s, KaiValue *sub);
-static inline KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off);
-static inline KaiValue *kaix_core_string_cp_len(KaiValue *s, KaiValue *off);
-static inline KaiValue *kaix_core_string_find(KaiValue *s, KaiValue *sub);
-static inline KaiValue *kaix_core_string_hash(KaiValue *s);
-static inline KaiValue *kaix_core_string_join(KaiValue *xs, KaiValue *sep);
-static inline KaiValue *kaix_core_string_length(KaiValue *s);
-static inline int64_t kaix_core_string_length_raw(KaiValue *s);
-static inline KaiValue *kaix_core_string_reverse(KaiValue *s);
-static inline KaiValue *kaix_core_string_slice(KaiValue *s, KaiValue *i, KaiValue *n);
-static inline KaiValue *kaix_core_string_split(KaiValue *s, KaiValue *d);
-static inline KaiValue *kaix_core_string_to_int(KaiValue *s);
-static inline KaiValue *kaix_core_string_to_lower_ascii(KaiValue *s);
-static inline KaiValue *kaix_core_string_to_real(KaiValue *s);
-static inline KaiValue *kaix_core_string_to_upper_ascii(KaiValue *s);
+KaiValue *kaix_core_stdlib_path(void);
+KaiValue *kaix_core_string_byte_at_int(KaiValue *s, KaiValue *i);
+int64_t kaix_core_string_byte_at_int_raw(KaiValue *s, int64_t i);
+KaiValue *kaix_core_string_concat(KaiValue *a, KaiValue *b);
+KaiValue *kaix_core_string_concat_all(KaiValue *xs);
+KaiValue *kaix_core_string_contains(KaiValue *s, KaiValue *sub);
+KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off);
+KaiValue *kaix_core_string_cp_len(KaiValue *s, KaiValue *off);
+KaiValue *kaix_core_string_find(KaiValue *s, KaiValue *sub);
+KaiValue *kaix_core_string_hash(KaiValue *s);
+KaiValue *kaix_core_string_join(KaiValue *xs, KaiValue *sep);
+KaiValue *kaix_core_string_length(KaiValue *s);
+int64_t kaix_core_string_length_raw(KaiValue *s);
+KaiValue *kaix_core_string_reverse(KaiValue *s);
+KaiValue *kaix_core_string_slice(KaiValue *s, KaiValue *i, KaiValue *n);
+KaiValue *kaix_core_string_split(KaiValue *s, KaiValue *d);
+KaiValue *kaix_core_string_to_int(KaiValue *s);
+KaiValue *kaix_core_string_to_lower_ascii(KaiValue *s);
+KaiValue *kaix_core_string_to_real(KaiValue *s);
+KaiValue *kaix_core_string_to_upper_ascii(KaiValue *s);
 static inline KaiValue *kaix_core_take_userdata(KaiValue *u);
-static inline KaiValue *kaix_core_to_int_radix(KaiValue *s, KaiValue *r);
-static inline KaiValue *kaix_core_uint32_to_int(KaiValue *v);
-static inline KaiValue *kaix_core_uint32_to_string(KaiValue *v);
-static inline KaiValue *kaix_core_uint64_to_int(KaiValue *v);
-static inline KaiValue *kaix_core_uint64_to_string(KaiValue *v);
+KaiValue *kaix_core_to_int_radix(KaiValue *s, KaiValue *r);
+KaiValue *kaix_core_uint32_to_int(KaiValue *v);
+KaiValue *kaix_core_uint32_to_string(KaiValue *v);
+KaiValue *kaix_core_uint64_to_int(KaiValue *v);
+KaiValue *kaix_core_uint64_to_string(KaiValue *v);
 KaiValue *kaix_core_unit_name(KaiValue *x);
-static inline KaiValue *kaix_core_vec_empty(void);
-static inline KaiValue *kaix_core_vec_from_list(KaiValue *xs);
-static inline KaiValue *kaix_core_vec_get(KaiValue *v, KaiValue *i);
-static inline KaiValue *kaix_core_vec_get_borrow(KaiValue *v, KaiValue *i);
-static inline KaiValue *kaix_core_vec_length(KaiValue *v);
-static inline KaiValue *kaix_core_vec_length_borrow(KaiValue *v);
-static inline KaiValue *kaix_core_vec_make(KaiValue *n, KaiValue *init);
-static inline KaiValue *kaix_core_vec_push(KaiValue *v, KaiValue *x);
-static inline KaiValue *kaix_core_vec_reserve(KaiValue *n);
-static inline KaiValue *kaix_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x);
-static inline KaiValue *kaix_core_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n);
-static inline KaiValue *kaix_core_vec_tail_from(KaiValue *v, KaiValue *s);
-static inline KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c);
-static inline KaiValue *kaix_core_write_stdout(KaiValue *v);
+KaiValue *kaix_core_vec_empty(void);
+KaiValue *kaix_core_vec_from_list(KaiValue *xs);
+KaiValue *kaix_core_vec_get(KaiValue *v, KaiValue *i);
+KaiValue *kaix_core_vec_get_borrow(KaiValue *v, KaiValue *i);
+KaiValue *kaix_core_vec_length(KaiValue *v);
+KaiValue *kaix_core_vec_length_borrow(KaiValue *v);
+KaiValue *kaix_core_vec_make(KaiValue *n, KaiValue *init);
+KaiValue *kaix_core_vec_push(KaiValue *v, KaiValue *x);
+KaiValue *kaix_core_vec_reserve(KaiValue *n);
+KaiValue *kaix_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x);
+KaiValue *kaix_core_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n);
+KaiValue *kaix_core_vec_tail_from(KaiValue *v, KaiValue *s);
+KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c);
+KaiValue *kaix_core_write_stdout(KaiValue *v);
 void kaix_cov_hit(const char *site);
 void kaix_decref(KaiValue *v);
 static inline KaiValue *kaix_deep_copy_out(KaiValue *v);
@@ -458,7 +458,7 @@ KaiValue *kaix_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_map_thunk(KaiValue *s, KaiValue **a, int n);
-static inline KaiValue *kaix_match_panic(KaiValue *msg);
+KaiValue *kaix_match_panic(KaiValue *msg);
 static inline KaiValue *kaix_mod(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_mul(KaiValue *a, KaiValue *b);
 KaiValue *kaix_ne(KaiValue *a, KaiValue *b);
@@ -768,157 +768,13 @@ static inline KaiValue **kaix_cons_tail_addr(KaiValue *node) {
     return &node->as.cons.tail;
 }
 static inline KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {return kai_cont_resume(k, v); }
-static inline KaiValue *kaix_core___deep_apply1(KaiValue *x, KaiValue *f) {return kai_core___deep_apply1(x, f); }
-static inline KaiValue *kaix_core___deep_apply2(KaiValue *x, KaiValue *p, KaiValue *f) {return kai_core___deep_apply2(x, p, f); }
-static inline KaiValue *kaix_core_abspath(KaiValue *p) {return kai_core_abspath(p); }
-static inline KaiValue *kaix_core_args(void) {return kai_core_args(); }
-static inline KaiValue *kaix_core_array_empty(void) {return kai_core_array_empty(); }
-static inline KaiValue *kaix_core_array_get(KaiValue *a, KaiValue *i) {return kai_core_array_get(a, i); }
-static inline KaiValue *kaix_core_array_get_borrow(KaiValue *a, KaiValue *i) {return kai_core_array_get_borrow(a, i); }
-static inline KaiValue *kaix_core_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {return kai_core_array_grow(a, n, init); }
-static inline KaiValue *kaix_core_array_length(KaiValue *a) {return kai_core_array_length(a); }
-static inline KaiValue *kaix_core_array_length_borrow(KaiValue *a) {return kai_core_array_length_borrow(a); }
-static inline KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init) {return kai_core_array_make(n, init); }
-static inline KaiValue *kaix_core_array_same(KaiValue *a, KaiValue *b) {return kai_core_array_same(a, b); }
-static inline KaiValue *kaix_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {return kai_core_array_set(a, i, v); }
-static inline KaiValue *kaix_core_array_take(KaiValue *a, KaiValue *i) {return kai_core_array_take(a, i); }
-static inline KaiValue *kaix_core_byte_add(KaiValue *a, KaiValue *b) {return kai_core_byte_add(a, b); }
-static inline KaiValue *kaix_core_byte_eq(KaiValue *a, KaiValue *b) {return kai_core_byte_eq(a, b); }
-static inline KaiValue *kaix_core_byte_lt(KaiValue *a, KaiValue *b) {return kai_core_byte_lt(a, b); }
-static inline KaiValue *kaix_core_byte_sub(KaiValue *a, KaiValue *b) {return kai_core_byte_sub(a, b); }
-static inline KaiValue *kaix_core_byte_to_int(KaiValue *v) {return kai_core_byte_to_int(v); }
-static inline KaiValue *kaix_core_byte_to_string(KaiValue *v) {return kai_core_byte_to_string(v); }
-static inline KaiValue *kaix_core_bytes_blit(KaiValue *d, KaiValue *o, KaiValue *s, KaiValue *so, KaiValue *n) {return kai_core_bytes_blit(d, o, s, so, n); }
-static inline KaiValue *kaix_core_bytes_get_le(KaiValue *s, KaiValue *o, KaiValue *w) {return kai_core_bytes_get_le(s, o, w); }
-static inline KaiValue *kaix_core_bytes_get_string(KaiValue *s, KaiValue *o, KaiValue *n) {return kai_core_bytes_get_string(s, o, n); }
-static inline KaiValue *kaix_core_bytes_put_le(KaiValue *d, KaiValue *o, KaiValue *v, KaiValue *w) {return kai_core_bytes_put_le(d, o, v, w); }
-static inline KaiValue *kaix_core_bytes_put_string(KaiValue *d, KaiValue *o, KaiValue *s) {return kai_core_bytes_put_string(d, o, s); }
-static inline KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i) {return kai_core_char_at(s, i); }
-static inline KaiValue *kaix_core_char_to_int(KaiValue *c) {return kai_core_char_to_int(c); }
-static inline KaiValue *kaix_core_char_to_string(KaiValue *c) {return kai_core_char_to_string(c); }
-static inline KaiValue *kaix_core_core_program_name(void) {return kai_core_program_name(); }
 static inline KaiValue *kaix_core_defer(KaiValue *thunk) {return kai_seq_defer(thunk); }
-static inline KaiValue *kaix_core_dir_create_dir(KaiValue *p) {return kai_core_dir_create_dir(p); }
-static inline KaiValue *kaix_core_dir_current_dir(void) {return kai_core_dir_current_dir(); }
-static inline KaiValue *kaix_core_dir_list_dir(KaiValue *p) {return kai_core_dir_list_dir(p); }
-static inline KaiValue *kaix_core_dir_remove_dir(KaiValue *p) {return kai_core_dir_remove_dir(p); }
-static inline KaiValue *kaix_core_dir_temp_dir(void) {return kai_core_dir_temp_dir(); }
-static inline KaiValue *kaix_core_dir_walk(KaiValue *p) {return kai_core_dir_walk(p); }
-static inline KaiValue *kaix_core_each(KaiValue *xs, KaiValue *f) {return kai_core_each(xs, f); }
-static inline KaiValue *kaix_core_eprint(KaiValue *v) {return kai_core_eprint(v); }
-static inline KaiValue *kaix_core_exit(KaiValue *v) {return kai_core_exit(v); }
-static inline KaiValue *kaix_core_file_append(KaiValue *p, KaiValue *c) {return kai_core_file_append(p, c); }
-static inline KaiValue *kaix_core_file_delete(KaiValue *p) {return kai_core_file_delete(p); }
-static inline KaiValue *kaix_core_file_exists(KaiValue *p) {return kai_core_file_exists(p); }
-static inline KaiValue *kaix_core_file_metadata(KaiValue *p) {return kai_core_file_metadata(p); }
-static inline KaiValue *kaix_core_file_read_bytes(KaiValue *p) {return kai_core_file_read_bytes(p); }
-static inline KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t) {return kai_core_file_rename(f, t); }
-static inline KaiValue *kaix_core_file_write_bytes(KaiValue *p, KaiValue *b) {return kai_core_file_write_bytes(p, b); }
-static inline KaiValue *kaix_core_filter(KaiValue *xs, KaiValue *p) {return kai_core_filter(xs, p); }
 static inline KaiValue *kaix_core_filter_cell(KaiValue *s, KaiValue *p) {return kai_seq_filter(s, p); }
-static inline KaiValue *kaix_core_flat_map(KaiValue *xs, KaiValue *f) {return kai_core_flat_map(xs, f); }
 static inline KaiValue *kaix_core_force(KaiValue *s) {return kai_seq_force(s); }
-static inline KaiValue *kaix_core_int128_to_int(KaiValue *v) {return kai_core_int128_to_int(v); }
-static inline KaiValue *kaix_core_int128_to_string(KaiValue *v) {return kai_core_int128_to_string(v); }
-static inline KaiValue *kaix_core_int32_to_int(KaiValue *v) {return kai_core_int32_to_int(v); }
-static inline KaiValue *kaix_core_int32_to_string(KaiValue *v) {return kai_core_int32_to_string(v); }
-static inline KaiValue *kaix_core_int_to_byte(KaiValue *v) {return kai_core_int_to_byte(v); }
-static inline KaiValue *kaix_core_int_to_byte_string(KaiValue *i) {return kai_core_int_to_byte_string(i); }
-static inline KaiValue *kaix_core_int_to_char(KaiValue *i) {return kai_core_int_to_char(i); }
-static inline KaiValue *kaix_core_int_to_int128(KaiValue *v) {return kai_core_int_to_int128(v); }
-static inline KaiValue *kaix_core_int_to_int32(KaiValue *v) {return kai_core_int_to_int32(v); }
-static inline KaiValue *kaix_core_int_to_le4(KaiValue *n) {return kai_core_int_to_le4(n); }
-static inline KaiValue *kaix_core_int_to_le8(KaiValue *n) {return kai_core_int_to_le8(n); }
-static inline KaiValue *kaix_core_int_to_real(KaiValue *v) {return kai_core_int_to_real(v); }
-static inline KaiValue *kaix_core_int_to_string(KaiValue *v) {return kai_core_int_to_string(v); }
-static inline KaiValue *kaix_core_int_to_string_radix(KaiValue *v, KaiValue *r) {return kai_core_int_to_string_radix(v, r); }
-static inline KaiValue *kaix_core_int_to_uint32(KaiValue *v) {return kai_core_int_to_uint32(v); }
-static inline KaiValue *kaix_core_int_to_uint64(KaiValue *v) {return kai_core_int_to_uint64(v); }
-static inline KaiValue *kaix_core_list_append(KaiValue *a, KaiValue *b) {return kai_core_list_append(a, b); }
-static inline KaiValue *kaix_core_list_length(KaiValue *xs) {return kai_core_list_length(xs); }
-static inline KaiValue *kaix_core_list_reverse(KaiValue *xs) {return kai_core_list_reverse(xs); }
-static inline KaiValue *kaix_core_mailbox_alloc(void) {return kai_core_mailbox_alloc(); }
-static inline KaiValue *kaix_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {return kai_core_mailbox_alloc_bounded(cap, overflow); }
-static inline KaiValue *kaix_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) {return kai_core_mailbox_alloc_bounded_unowned(cap, overflow); }
-static inline KaiValue *kaix_core_mailbox_alloc_unowned(void) {return kai_core_mailbox_alloc_unowned(); }
-static inline KaiValue *kaix_core_map(KaiValue *xs, KaiValue *f) {return kai_core_map(xs, f); }
 static inline KaiValue *kaix_core_once(KaiValue *init) {return kai_seq_once(init); }
-static inline KaiValue *kaix_core_panic(KaiValue *msg) {return kai_core_panic(msg); }
-static inline KaiValue *kaix_core_print(KaiValue *v) {return kai_core_print(v); }
-static inline KaiValue *kaix_core_program_name(void) {return kai_core_program_name(); }
-static inline KaiValue *kaix_core_read_bytes(KaiValue *n) {return kai_core_read_bytes(n); }
-static inline KaiValue *kaix_core_read_file(KaiValue *p) {return kai_core_read_file(p); }
-static inline KaiValue *kaix_core_read_line(void) {return kai_core_read_line(); }
-static inline KaiValue *kaix_core_real_acos(KaiValue *x) {return kai_core_real_acos(x); }
-static inline KaiValue *kaix_core_real_asin(KaiValue *x) {return kai_core_real_asin(x); }
-static inline KaiValue *kaix_core_real_atan(KaiValue *x) {return kai_core_real_atan(x); }
-static inline KaiValue *kaix_core_real_atan2(KaiValue *a, KaiValue *b) {return kai_core_real_atan2(a, b); }
-static inline KaiValue *kaix_core_real_bits(KaiValue *v) {return kai_core_real_bits(v); }
-static inline KaiValue *kaix_core_real_cbrt(KaiValue *x) {return kai_core_real_cbrt(x); }
-static inline KaiValue *kaix_core_real_cos(KaiValue *x) {return kai_core_real_cos(x); }
-static inline KaiValue *kaix_core_real_cosh(KaiValue *x) {return kai_core_real_cosh(x); }
-static inline KaiValue *kaix_core_real_exp(KaiValue *x) {return kai_core_real_exp(x); }
-static inline KaiValue *kaix_core_real_is_inf(KaiValue *x) {return kai_core_real_is_inf(x); }
-static inline KaiValue *kaix_core_real_is_nan(KaiValue *x) {return kai_core_real_is_nan(x); }
-static inline KaiValue *kaix_core_real_log(KaiValue *x) {return kai_core_real_log(x); }
-static inline KaiValue *kaix_core_real_log10(KaiValue *x) {return kai_core_real_log10(x); }
-static inline KaiValue *kaix_core_real_log2(KaiValue *x) {return kai_core_real_log2(x); }
-static inline KaiValue *kaix_core_real_pow(KaiValue *a, KaiValue *b) {return kai_core_real_pow(a, b); }
-static inline KaiValue *kaix_core_real_rem(KaiValue *a, KaiValue *b) {return kai_core_real_rem(a, b); }
-static inline KaiValue *kaix_core_real_signum(KaiValue *x) {return kai_core_real_signum(x); }
-static inline KaiValue *kaix_core_real_sin(KaiValue *x) {return kai_core_real_sin(x); }
-static inline KaiValue *kaix_core_real_sinh(KaiValue *x) {return kai_core_real_sinh(x); }
-static inline KaiValue *kaix_core_real_sqrt(KaiValue *x) {return kai_core_real_sqrt(x); }
-static inline KaiValue *kaix_core_real_tan(KaiValue *x) {return kai_core_real_tan(x); }
-static inline KaiValue *kaix_core_real_tanh(KaiValue *x) {return kai_core_real_tanh(x); }
-static inline KaiValue *kaix_core_real_to_int(KaiValue *v) {return kai_core_real_to_int(v); }
-static inline KaiValue *kaix_core_real_to_string(KaiValue *v) {return kai_core_real_to_string(v); }
-static inline KaiValue *kaix_core_reduce(KaiValue *xs, KaiValue *i, KaiValue *f) {return kai_core_reduce(xs, i, f); }
-static inline KaiValue *kaix_core_ref_get(KaiValue *r) {return kai_core_ref_get(r); }
-static inline KaiValue *kaix_core_ref_make(KaiValue *init) {return kai_core_ref_make(init); }
-static inline KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v) {return kai_core_ref_set(r, v); }
 static inline KaiValue *kaix_core_release_userdata(KaiValue *u) {return kai_ffi_release(u); }
 static inline KaiValue *kaix_core_retain_userdata(KaiValue *v) {return kai_ffi_retain(v); }
-static inline KaiValue *kaix_core_stdlib_path(void) {return kai_core_stdlib_path(); }
-static inline KaiValue *kaix_core_string_byte_at_int(KaiValue *s, KaiValue *i) {return kai_core_string_byte_at_int(s, i); }
-static inline int64_t kaix_core_string_byte_at_int_raw(KaiValue *s, int64_t i) {return kai_core_string_byte_at_int_raw(s, i); }
-static inline KaiValue *kaix_core_string_concat(KaiValue *a, KaiValue *b) {return kai_core_string_concat(a, b); }
-static inline KaiValue *kaix_core_string_concat_all(KaiValue *xs) {return kai_core_string_concat_all(xs); }
-static inline KaiValue *kaix_core_string_contains(KaiValue *s, KaiValue *sub) {return kai_core_string_contains(s, sub); }
-static inline KaiValue *kaix_core_string_cp_at(KaiValue *s, KaiValue *off) {return kai_core_string_cp_at(s, off); }
-static inline KaiValue *kaix_core_string_cp_len(KaiValue *s, KaiValue *off) {return kai_core_string_cp_len(s, off); }
-static inline KaiValue *kaix_core_string_find(KaiValue *s, KaiValue *sub) {return kai_core_string_find(s, sub); }
-static inline KaiValue *kaix_core_string_hash(KaiValue *s) {return kai_core_string_hash(s); }
-static inline KaiValue *kaix_core_string_join(KaiValue *xs, KaiValue *sep) {return kai_core_string_join(xs, sep); }
-static inline KaiValue *kaix_core_string_length(KaiValue *s) {return kai_core_string_length(s); }
-static inline int64_t kaix_core_string_length_raw(KaiValue *s) {return kai_core_string_length_raw(s); }
-static inline KaiValue *kaix_core_string_reverse(KaiValue *s) {return kai_core_string_reverse(s); }
-static inline KaiValue *kaix_core_string_slice(KaiValue *s, KaiValue *i, KaiValue *n) {return kai_core_string_slice(s, i, n); }
-static inline KaiValue *kaix_core_string_split(KaiValue *s, KaiValue *d) {return kai_core_string_split(s, d); }
-static inline KaiValue *kaix_core_string_to_int(KaiValue *s) {return kai_core_string_to_int(s); }
-static inline KaiValue *kaix_core_string_to_lower_ascii(KaiValue *s) {return kai_core_string_to_lower_ascii(s); }
-static inline KaiValue *kaix_core_string_to_real(KaiValue *s) {return kai_core_string_to_real(s); }
-static inline KaiValue *kaix_core_string_to_upper_ascii(KaiValue *s) {return kai_core_string_to_upper_ascii(s); }
 static inline KaiValue *kaix_core_take_userdata(KaiValue *u) {return kai_ffi_take(u); }
-static inline KaiValue *kaix_core_to_int_radix(KaiValue *s, KaiValue *r) {return kai_core_to_int_radix(s, r); }
-static inline KaiValue *kaix_core_uint32_to_int(KaiValue *v) {return kai_core_uint32_to_int(v); }
-static inline KaiValue *kaix_core_uint32_to_string(KaiValue *v) {return kai_core_uint32_to_string(v); }
-static inline KaiValue *kaix_core_uint64_to_int(KaiValue *v) {return kai_core_uint64_to_int(v); }
-static inline KaiValue *kaix_core_uint64_to_string(KaiValue *v) {return kai_core_uint64_to_string(v); }
-static inline KaiValue *kaix_core_vec_empty(void) {return kai_core_vec_empty(); }
-static inline KaiValue *kaix_core_vec_from_list(KaiValue *xs) {return kai_core_vec_from_list(xs); }
-static inline KaiValue *kaix_core_vec_get(KaiValue *v, KaiValue *i) {return kai_core_vec_get(v, i); }
-static inline KaiValue *kaix_core_vec_get_borrow(KaiValue *v, KaiValue *i) {return kai_core_vec_get_borrow(v, i); }
-static inline KaiValue *kaix_core_vec_length(KaiValue *v) {return kai_core_vec_length(v); }
-static inline KaiValue *kaix_core_vec_length_borrow(KaiValue *v) {return kai_core_vec_length_borrow(v); }
-static inline KaiValue *kaix_core_vec_make(KaiValue *n, KaiValue *init) {return kai_core_vec_make(n, init); }
-static inline KaiValue *kaix_core_vec_push(KaiValue *v, KaiValue *x) {return kai_core_vec_push(v, x); }
-static inline KaiValue *kaix_core_vec_reserve(KaiValue *n) {return kai_core_vec_reserve(n); }
-static inline KaiValue *kaix_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {return kai_core_vec_set(v, i, x); }
-static inline KaiValue *kaix_core_vec_slice(KaiValue *v, KaiValue *s, KaiValue *n) {return kai_core_vec_slice(v, s, n); }
-static inline KaiValue *kaix_core_vec_tail_from(KaiValue *v, KaiValue *s) {return kai_core_vec_tail_from(v, s); }
-static inline KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c) {return kai_core_write_file(p, c); }
-static inline KaiValue *kaix_core_write_stdout(KaiValue *v) {return kai_core_write_stdout(v); }
 static inline KaiValue *kaix_deep_copy_out(KaiValue *v) {
     KaiValue *r = kai_deep_copy_out(v);
     kai_decref(v);
@@ -994,7 +850,6 @@ static inline int kaix_is_variant(KaiValue *v, const char *name) {
 static inline int kaix_is_variant_tag(KaiValue *v, int32_t tag) {
     return v && v->tag == KAI_VARIANT && v->variant_tag == tag;
 }
-static inline KaiValue *kaix_match_panic(KaiValue *msg) {return kai_core_panic(msg); }
 static inline KaiValue *kaix_mod(KaiValue *a, KaiValue *b) {return kai_op_mod(a, b); }
 static inline KaiValue *kaix_mul(KaiValue *a, KaiValue *b) {return kai_op_mul(a, b); }
 static inline KaiValue *kaix_neg(KaiValue *a) {return kai_op_neg(a); }

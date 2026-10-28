@@ -66,6 +66,8 @@ def local_names(lines):
 def inlinable(body, names):
     if "static " in body or "__thread" in body or "setjmp" in body or "alloca" in body:
         return False
+    if "kai_core_" in body:
+        return False
     return not any(w in names for w in WORD.findall(body))
 
 
