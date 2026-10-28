@@ -480,13 +480,12 @@ static size_t kai_main_fiber_stack_size(void) {
 #endif
 }
 
-/* SIGSEGV / SIGBUS handler for fiber stack overflow. The fault lands
- * on the active fiber's guard page (PROT_NONE); we print a diagnostic
- * and re-raise with the default disposition. Faults outside any guard
- * (e.g. NULL deref in user code) fall through to default — we only
- * decorate the stack-overflow case. The handler runs on a sigaltstack
- * so the overflowed stack is never used to format the message. Spec:
- * `docs/fibers-honesty-targets.md` Tier 1. */
+/* SIGSEGV / SIGBUS handler for fiber stack overflow. A fault on the active
+ * fiber's guard page (PROT_NONE) prints a diagnostic and ends the process
+ * with the original signal; every other fault belongs to whoever installed a
+ * handler before us (a JIT, a managed runtime, a sanitizer) and is chained to
+ * it. The handler runs on a sigaltstack so the overflowed stack is never used,
+ * and it calls only async-signal-safe functions. */
 /* Two different scopes live here, and conflating them loses the diagnostic:
  * the SIGSEGV/SIGBUS disposition is process-wide (installed once, guarded by
  * kai_sigsegv_installed), while sigaltstack is PER-THREAD. A thread without
@@ -494,35 +493,61 @@ static size_t kai_main_fiber_stack_size(void) {
  * would run on the stack that just overflowed, fault again, and the process
  * dies with no message. Every thread that can run a fiber installs its own. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern int   kai_sigsegv_installed;
+extern int              kai_sigsegv_installed;
+extern struct sigaction kai_prev_segv;
+extern struct sigaction kai_prev_bus;
 #  if defined(KAI_RUNTIME_OWNER)
-int   kai_sigsegv_installed = 0;
+int              kai_sigsegv_installed = 0;
+struct sigaction kai_prev_segv;
+struct sigaction kai_prev_bus;
 #  endif
 #else
-static int   kai_sigsegv_installed = 0;
+static int              kai_sigsegv_installed = 0;
+static struct sigaction kai_prev_segv;
+static struct sigaction kai_prev_bus;
 #endif
 
+static void kai_write_stack_overflow(void *fiber) {
+    char buf[64];
+    size_t n = 0;
+    for (const char *p = "kai: fiber stack overflow at 0x"; *p; p++) buf[n++] = *p;
+    uintptr_t v = (uintptr_t) fiber;
+    int digits = 1;
+    for (uintptr_t t = v >> 4; t; t >>= 4) digits++;
+    for (int i = 0; i < digits; i++) {
+        buf[n + (size_t) i] = "0123456789abcdef"[(v >> (4 * (digits - 1 - i))) & 0xf];
+    }
+    n += (size_t) digits;
+    buf[n++] = '\n';
+    ssize_t w = write(2, buf, n);
+    (void) w;
+}
+
 static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
-    (void) ucp;
     KaiFiber *f = kai_worker_here()->active;
     if (f && f->stack_base && info && info->si_addr) {
         char *guard_lo = (char *) f->stack_base;
         char *guard_hi = guard_lo + kai_page_size();
         char *addr     = (char *) info->si_addr;
         if (addr >= guard_lo && addr < guard_hi) {
-            char buf[96];
-            int n = snprintf(buf, sizeof(buf),
-                             "kai: fiber stack overflow at %p\n", (void *) f);
-            if (n > 0) {
-                ssize_t w = write(2, buf, (size_t) n);
-                (void) w;
-            }
+            kai_write_stack_overflow(f);
+            signal(sig, SIG_DFL);
+            raise(sig);
+            return;
         }
     }
-    /* Re-raise with default disposition so the process terminates with
-     * the original signal — preserving the standard SIGSEGV exit
-     * status for callers (shell `$?` = 139) without swallowing
-     * unrelated faults. */
+    const struct sigaction *prev = sig == SIGBUS ? &kai_prev_bus : &kai_prev_segv;
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) {
+            prev->sa_sigaction(sig, info, ucp);
+            return;
+        }
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    /* The default disposition ends the process with the original signal
+     * (shell `$?` = 139); ignoring a synchronous fault would loop on it. */
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -572,8 +597,8 @@ static void kai_install_fiber_sigsegv_handler(void) {
     sa.sa_sigaction = kai_fiber_sigsegv_handler;
     sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGSEGV, &sa, &kai_prev_segv);
+    sigaction(SIGBUS,  &sa, &kai_prev_bus);
 }
 #elif defined(__wasm__)
 static size_t kai_main_fiber_stack_size(void) { return kai_fiber_stack_size(); }

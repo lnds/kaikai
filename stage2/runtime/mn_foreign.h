@@ -18,7 +18,9 @@ typedef struct {
 } KaiExportCall;
 
 #if !KAI_SCHED_DECL_ONLY
-/* A trap or a cancel inside the body must not unwind through C frames: the
+/* The fiber stays on its OS thread for the call: the C frames below it carry
+ * thread-local state, locks and errno that cannot follow a migration.
+ * A trap or a cancel inside the body must not unwind through C frames: the
  * fiber's pad is pointed at this frame for the call, and landing here ends
  * the process. `cross` copies the arguments and the result across the thread
  * border: the caller's cells belong to a thread the scheduler does not own. */
@@ -33,7 +35,9 @@ static void kai_export_guarded(KaiExportCall *c, int cross) {
         f->cancel_pad_set = 1;
         KaiValue *argv[c->n > 0 ? c->n : 1];
         for (int i = 0; i < c->n; i++) argv[i] = cross ? kai_deep_copy_cross(c->args[i]) : c->args[i];
+        f->seg_pin++;
         KaiValue *r = c->thunk(NULL, argv, c->n);
+        f->seg_pin--;
         if (cross) { c->result = kai_deep_copy_cross(r); kai_decref(r); } else { c->result = r; }
         f->cancel_pad_set = saved_set;
         memcpy(&f->cancel_pad, &saved_pad, sizeof saved_pad);
