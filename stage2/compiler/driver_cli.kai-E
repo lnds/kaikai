@@ -1,0 +1,784 @@
+#[doc("""
+The options a command line selects: the mode, the backend and the core
+cache settings, the setters `parse_cli` folds them through, and the
+usage text.
+""")]
+
+import compiler.util
+import compiler.package_id
+import compiler.fmt
+import compiler.user_cache
+import compiler.edition
+import compiler.build_target
+import compiler.core_cut
+import compiler.ncore_index
+import compiler.module_table
+import compiler.ast
+import compiler.ast_decl
+import compiler.escapes
+import compiler.modules_segments
+import compiler.symtab
+import compiler.ast_build
+import compiler.ast_ids
+import compiler.ast_map
+import compiler.expr_positions
+
+#[doc("The CLI mode selected by parse_cli: build/run/test/check/fmt, the dump variants, the library-query modes, and the core-cache emitter.")]
+pub type Mode
+  = MDefault
+  | MTokens
+  | MAst
+  | MTypes
+  | MEnv
+  | MInfer
+  | MCheck
+  | MDumpTyped
+  # `--dump-typed-core` — like --dump-typed but inverted: dumps the
+  # typed AST of core / imported modules (module_origin = Some), hiding
+  # the root file. The probe for #962's differential independence oracle.
+  | MDumpTypedCore
+  # `--dump-tycon-ids`: the declaration behind each nominal type in the
+  # root file's typed bodies, as the protocol-call rewrite receives them.
+  | MDumpTyconIds
+  # `--check-type-ids`: fail when a written name of a declared type reaches the passes after the typer without its declaration's identity.
+  | MCheckTypeIds
+  | MDumpMono
+  | MDumpMonoOut
+  | MDumpRawSafe
+  | MDumpBorrowSafe
+  # `--dump-purity` — the confirmed purity verdict (issue #1139) per
+  # top-level fn, computed over the post-perceus / post-tcrec AST (the
+  # same lowered form the backends stamp from). Read-only; no binary.
+  | MDumpPurity
+  # `--dump-symids` — the ids unbox and perceus receive, the effect id
+  # each `KPerform` carries, and the home each constructor site carries,
+  # decoded against the symbol table.
+  | MDumpSymIds
+  # `--check-site-ids`: fail when two unwind-site nodes of one declaration share a site id, or one carries none.
+  | MCheckSiteIds
+  # `--check-field-types`: fail when a field read of a program the typer accepted carries no type.
+  | MCheckFieldTypes
+  # `--check-written-eq`: fail when `==` or `!=` compares a value that holds a `Written`.
+  | MCheckWrittenEq
+  | MDumpLastUse
+  # `--dump=evidence-obligations` — per function, the distinct effect-
+  # instance evidence obligations the row demands and which supplier
+  # discharges each (lexical handle / forwarded caller param / startup
+  # default / collision). Analysis only; emits nothing codegen reads.
+  | MDumpEvidenceObligations
+  # `--dump=evidence-arity` — histogram the injected evidence-param count
+  # per function (max / p99 / mean / count > 3). The §A.3 spike feeding the
+  # L3 individual-params-vs-packed-tuple ABI decision. Analysis only.
+  | MDumpEvidenceArity
+  | MHoles
+  | MHolesJson
+  # `--holes-scope` / `--holes-json-scope` — the hole reports with the
+  # FULL reachable scope per hole. The plain forms list only the
+  # hole's local bindings.
+  | MHolesScope
+  | MHolesJsonScope
+  | MEffectsJson
+  | MExplain
+  | MEffectHolesJson
+  # `--doc-json` — dump the root file's `#[doc(...)]` side table
+  # (module_doc + per-item docs) as one JSON object.
+  | MDocJson
+  # `--builtins-doc-json` — file-less mode dumping the doc attributes
+  # of the auto-loaded core module set as a JSON array. Consumed by
+  # `kai info builtins --json`.
+  | MBuiltinsDocJson
+  # Dump the kaikai Intermediate Representation (ANF + basic blocks +
+  # first-class Perceus RC nodes) produced from the post-perceus /
+  # post-tcrec AST. Read-only dumper; no binary is emitted. Used to
+  # pin the lowering against `.kir.expected` goldens and to feed the
+  # KIR→target translators. Carries the mode of the program it dumps
+  # (`MDefault`, `MTest`, `MBench` or `MPropCheck`).
+  | MEmitKir(Mode)
+  # Same dump with the KIR inliner skipped — the raw lowering the
+  # `.kir.expected` goldens pin, decoupled from inline thresholds.
+  | MEmitKirNoInline(Mode)
+  | MTest
+  # Emits a main wrapper that runs every `bench "..." { ... }` block
+  # and reports mean ns/iter.
+  | MBench
+  # Emits a main wrapper that runs every
+  # `check "..." [with p: T, ...] { body }` property block.
+  # Distinct from MCheck (the typecheck-only dump triggered by
+  # `--check`). Property-check uses `--prop-check` to avoid the
+  # collision; the user-facing entry is `kai check <file.kai>`,
+  # which `kai` translates.
+  | MPropCheck
+  | MHelp
+  | MUsageError
+  | MVersion
+  # `--backend-tag` — file-less: the native backend's tag, empty without libLLVM.
+  | MBackendTag
+  # Dump per-fn body intervals for Int-typed expressions. Debug-only;
+  # lets fixtures pin the walker output before the unifier reshape
+  # consumes it.
+  | MDumpIntervals
+  # Dump per-call-site contract elision report
+  # — `callee.param @line:col -> elided | runtime | loose(reason)`.
+  # Lets fixtures pin which call-sites the analysis discharges
+  # statically before any codegen pass consumes it.
+  | MDumpCallElision
+  # Dump the brand registry collected by the cap-binding nursery
+  # rewrite. For each minted brand id prints the cap binder name and
+  # allocation site (file:line:col) plus the per-call attributions
+  # (`Spawn.<op>` calls tagged with the owning brand). Output is
+  # deterministic and grep-friendly, mirroring `--dump-intervals`.
+  # Lets fixtures pin the brand propagation before the brand-mismatch
+  # check consumes it.
+  | MDumpBrands
+  # Runs every core function through the passes on its own and reports the ones that differ from the stream.
+  | MCheckCoreFront
+  # Pretty-print the parsed program back as canonical kaikai source.
+  # MFmt writes formatted source to stdout; MFmtCheck prints the
+  # formatted source if it differs from input (exit 1) and otherwise
+  # emits nothing (exit 0).
+  | MFmt(Int)
+  | MFmtCheck(Int)
+  # `kai mutate` — mutation testing. MMutateList catalogues every
+  # mutation site the operators find in the parsed program, one
+  # tab-separated record per line (MMutateListJson the same as JSON);
+  # MMutateApply(i) writes the source with site `i` mutated to stdout.
+  # Both stop right after parse: a mutation is a surface rewrite, and
+  # running the semantic pipeline on the parent would only slow the
+  # enumeration down.
+  | MMutateList
+  | MMutateListJson
+  | MMutateApply(Int)
+  # `--list-tests <label>`: the root file's test blocks as run records, parse only.
+  | MListTests(String)
+  # `--migrate` — edition source migration. Parse, rewrite every
+  # edition-broken surface form the rule set knows, re-emit through
+  # the fmt-writer. Prints the migrated source to stdout and a
+  # `manual:` report to stderr; the bin/kai wrapper owns the safe
+  # write-back (diff by default, `--write` to apply). Idempotent: the
+  # type-order rewrites are gated on `--edition`, so a second run over
+  # migrated source is a no-op.
+  | MMigrate
+  # Library mode. Run lex → parse → resolve → infer and answer
+  # position-keyed queries against the typed AST instead of emitting
+  # C. Probes are embedded in the source as line comments of the
+  # shape `# @probe <kind> <line>:<col>` (kind ∈ {type, def, enc})
+  # so fixtures stay self-contained. Output is a single JSON array
+  # with one object per probe — schema in docs/library-mode.md.
+  | MLibraryMode
+  # Dump collected structured diagnostics as JSON for LSP-style
+  # consumers. Schema:
+  #   [{"severity": String, "file": String, "line": Int, "col": Int,
+  #     "message": String,
+  #     "related": [{"file": String, "line": Int, "col": Int,
+  #                  "message": String}]}, ...]
+  # Stable across runs; source order at the per-decl level, with
+  # unbound-name diagnostics first.
+  | MDiagsJson
+  # `--lint` / `--lint-json`: Clippy-style opinion linter over the
+  # typed AST. Reports suspicious-but-valid code the compiler stays
+  # silent about. Warnings only; always exits 0 so a lint never blocks
+  # a build. JSON form mirrors the `--diags-json` / `--holes-json`
+  # discipline.
+  | MLint
+  | MLintJson
+  # Run the in-memory cache serde round-trip self-test. Builds a fixed
+  # [Decl] fragment, serialises it, deserialises it, re-serialises,
+  # compares the two hex blobs, prints "OK ..." on success or
+  # "FAIL ..." on mismatch. Exit 0 on OK, 1 on FAIL. The mode ignores
+  # `path` and any cores.
+  | MCacheRoundtrip
+  # Emit a .kab cache blob for a single source file to stdout. Reads
+  # `path`, lexes, parses, strips
+  # core tests, stamps module_origin, serialises the resulting
+  # `[Decl]` against the source's sha256 (supplied by the caller).
+  # Used by bin/kai's cache MISS path; the driver redirects stdout
+  # to a temp file and atomically renames into the cache dir.
+  | MEmitCoreCache
+  # Internal batch driver. `path` names a list file whose lines are
+  # `<input.kai>\t<output>` pairs. Loads (lexes + parses) the core
+  # module set once, then compiles every input against that shared
+  # `CoresLoaded`, writing each result to its `<output>`. Amortises
+  # the core's lex + parse — the ~90ms fixed cost every standalone
+  # invocation re-pays — across N fixtures; the per-file typecheck +
+  # codegen still runs fresh, so each output is byte-identical to a
+  # standalone build. Not a user-facing build mode — the test harness
+  # uses it to avoid forking once per fixture.
+  | MBatchList
+  # Print every source file the compile would read besides the root, one
+  # per line, without loading the core or parsing; `kai` keys its memo of
+  # a check on these.
+  | MGuardInputs
+  | MGuardInterfaces
+  # The same listing for the core modules alone, shared by every compile.
+  | MGuardCoreInputs
+  # Run the in-memory typed-codec + interface-hash gates
+  # (cache_delta_test.kai): Ty/Scheme round-trip and the delta hash's
+  # order/renumber invariance + change sensitivity. Prints "OK ..." /
+  # "FAIL ...", exit 0/1. Ignores `path` and cores.
+  | MCacheTypedSelftest
+  # Run the in-memory symbol-table gates (symtab_test.kai): homonym
+  # identity, class separation, index/scan agreement, dense ids. Prints
+  # "OK ..." / "FAIL ...", exit 0/1. Ignores `path` and cores.
+  | MSymtabSelftest
+  | MResolveSymSelftest
+  # Print the builtin registry for the runtime-forwarder gate, after
+  # checking it against the resolver and the typer (builtins_test.kai).
+  | MBuiltinTable
+  # Print every core builtin name a bare use binds.
+  | MBuiltinNames
+  # Print the manifest of the builtins the core modules declare.
+  | MKaiBuiltins
+
+#[doc("True when a literal loop call of the core lowers to a loop intrinsic: every mode but the purity dump.")]
+pub(pkg) fn loops_on(m: Mode) : Bool = match m {
+  MDumpPurity -> false
+  _           -> true
+}
+
+# The codegen backend, ORTHOGONAL to `Mode`. `Mode` carries the
+# build-shape (build / test / bench / prop-check) plus every read-only
+# dump; `Backend` carries the destination. Keeping them separate lets
+# `--emit=native --test` compose — the dev-loop subcommands now run
+# their runners on the native backend instead of being forced through
+# the C oracle. `BkC` is the default (bootstrap + parity oracle);
+# `BkNative` is the in-process libLLVM destination `kai build`/`run`
+# already default to; `BkCModular` is the separate-compilation C path; `BkCOwner` prints one C unit that
+# links against the runtime owner object instead of compiling the runtime in.
+pub type Backend = BkC | BkNative | BkCModular | BkNativeModular | BkCOwner
+
+# Shared core-cache configuration. `dir` is the writable cache
+# directory bin/kai resolves (empty = caching off); `toolchain` is an
+# opaque id folded into every content key so a rebuilt compiler misses
+# cleanly; `stats` prints one hit/miss line per layer to stderr.
+#
+# `proj_dir` is the per-project cache directory for artifacts that must
+# follow the sources rather than the toolchain. The native paths compile
+# a copy of the entry file from an ephemeral object-cache directory, so
+# deriving a project cache from the entry's own directory lands in a
+# scratch dir that is never read back; an empty value falls back to that
+# derivation, which is correct whenever the entry is compiled in place.
+# `nmod_dir` holds the native-modular partition objects; empty puts them
+# next to the entry. `full_core` keeps the core functions the program
+# cannot reach. `inputs` are the arguments and environment a cached native
+# core object may depend on (`ncore_build_inputs`).
+pub(pkg) type CoreCacheOpt = { dir: String, toolchain: String, stats: Bool, proj_dir: String, nmod_dir: String,
+                           full_core: Bool, early_cut: EarlyCut, inputs: String }
+
+#[doc("The core cache options of a run that caches nothing.")]
+pub(pkg) fn cc_opt_off() : CoreCacheOpt =
+  CoreCacheOpt { dir: "", toolchain: "", stats: false, proj_dir: "", nmod_dir: "", full_core: false,
+                 early_cut: EcOn, inputs: "" }
+
+#[doc("Parsed CLI configuration: mode, target path, cores, search paths, edition, and feature flags. Produced by parse_cli, consumed by run.")]
+pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], cores: [String],
+                    core_caches: [String], cache_sha: String,
+                    strict_holes: Bool, search_paths: [String], pkg_roots: [String],
+                    # Identity of the consuming package (from
+                    # `name = ...` in the user's kai.toml; empty when no
+                    # manifest is present) and the list of packages this
+                    # consumer has opted into via `[unstable] <pkg> =
+                    # true`. Threaded into the qualified-call rewriter
+                    # so #unstable warnings skip both self-imports and
+                    # opted-in deps.
+                    package_name: String,
+                    unstable_optins: [String],
+                    # The edition `--edition <name>` selected.
+                    # `bin/kai` always provides a value (kai.toml field
+                    # or repo EDITION fallback); `None` means the flag
+                    # was not passed. The typer gates feature branches
+                    # on this (e.g. convention pipe dispatch is active
+                    # only for >= hanga-roa).
+                    edition: Option[Edition],
+                    target: Target,
+                    # Opt-in user-file incremental cache. `bin/kai`
+                    # passes `--user-cache` (and creates
+                    # `<project>/.kai-cache/`) only under `KAI_CACHE=1`,
+                    # so the default build path is byte-for-byte
+                    # unchanged and pays no lookup cost. When true,
+                    # resolve_module + compile_source consult
+                    # compiler.user_cache before lexing each file.
+                    user_cache: Bool,
+                    # Shared core-cache configuration (post-parse core
+                    # blobs + emitted-C core TUs). Off when dir is "".
+                    core_cache: CoreCacheOpt,
+                    # `--test-root <stem>` loads that file beside the root as
+                    # one of a grouped build's test files; `--test-plan <file>`
+                    # gets each one's test-block run order.
+                    test_roots: [String],
+                    # `--test-own <file>`: the module loaded from that file is
+                    # the package's own, so its blocks run and a lint reports on it.
+                    test_own: [String],
+                    # `--cover <file>` / `--cover-root <file>`: a test build
+                    # probes that module's lines, or the root file's.
+                    cover: CoverSpec,
+                    test_plan: String,
+                    # `--kir-verify <file>` writes the KIR linearity check's
+                    # violations there; the check runs only when it is set.
+                    kir_verify: String,
+                    # `--inputs-out <file>` has a compile write there the
+                    # module files it reads and the files it tries ahead of each.
+                    inputs_out: String,
+                    # `--ffi-header-out <file>` has a compile write there the
+                    # shared FFI header when the program declares a struct.
+                    ffi_out: String }
+
+#[doc("Add the file a `--cover` or `--cover-root` flag names to the coverage spec.")]
+pub(pkg) fn cli_with_cover(opts: CliOptions, flag: String, f: String) : CliOptions =
+  if flag == "--cover-root" { CliOptions { ...opts, cover: CoverSpec { ...opts.cover, root: f } } }
+  else { CliOptions { ...opts, cover: CoverSpec { ...opts.cover, files: list_append(opts.cover.files, [f]) } } }
+
+#[doc("Select the mode.")]
+pub fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
+  CliOptions { ...opts, mode: m }
+
+#[doc("""
+Select the codegen backend, orthogonal to `mode`. `--emit=native` and
+`--emit=c-modular` set this instead of `mode`, so they compose with
+`--test`/`--bench`/`--prop-check`.
+""")]
+pub(pkg) fn cli_with_backend(opts: CliOptions, bk: Backend) : CliOptions =
+  CliOptions { ...opts, backend: bk }
+
+#[doc("""
+Enable the user-file incremental cache for this invocation. Set by
+`--user-cache`, which `bin/kai` passes only under `KAI_CACHE=1`
+after creating `<project>/.kai-cache/`.
+""")]
+pub(pkg) fn cli_with_user_cache(opts: CliOptions) : CliOptions =
+  CliOptions { ...opts, user_cache: true }
+
+fn cli_with_cc_opt(opts: CliOptions, cc: CoreCacheOpt) : CliOptions =
+  CliOptions { ...opts, core_cache: cc }
+
+#[doc("Set the shared core cache directory.")]
+pub(pkg) fn cli_with_cc_opt_dir(opts: CliOptions, d: String) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, dir: d })
+
+#[doc("Set the toolchain id cached artifacts are keyed by.")]
+pub(pkg) fn cli_with_toolchain_id(opts: CliOptions, t: String) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, toolchain: t })
+
+#[doc("Turn on the cache statistics.")]
+pub(pkg) fn cli_with_cc_opt_stats(opts: CliOptions) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, stats: true })
+
+#[doc("Keep the whole core: no pruning.")]
+pub(pkg) fn cli_with_full_core(opts: CliOptions) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, full_core: true })
+
+#[doc("Set how the core is cut before the front end walks it.")]
+pub(pkg) fn cli_with_early_cut(opts: CliOptions, ec: EarlyCut) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, early_cut: ec })
+
+#[doc("Set the project cache directory.")]
+pub(pkg) fn cli_with_user_cache_dir(opts: CliOptions, d: String) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, proj_dir: d })
+
+#[doc("Set the directory of the native-modular partition objects.")]
+pub(pkg) fn cli_with_nmod_dir(opts: CliOptions, d: String) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache, nmod_dir: d })
+
+#[doc("Set the input file.")]
+pub fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
+  CliOptions { ...opts, path: Some(p) }
+
+#[doc("Set the source hash a core cache blob is stamped with.")]
+pub(pkg) fn cli_with_cache_sha(opts: CliOptions, sha: String) : CliOptions =
+  CliOptions { ...opts, cache_sha: sha }
+
+#[doc("Turn on strict holes.")]
+pub(pkg) fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
+  CliOptions { ...opts, strict_holes: true }
+
+#[doc("Declare a directory as the root of one package.")]
+pub(pkg) fn cli_push_pkg_root(opts: CliOptions, dir: String) : CliOptions =
+  CliOptions { ...opts, pkg_roots: list_append(opts.pkg_roots, [dir]) }
+
+#[doc("The package plan of one compile: the declared roots and the standard library.")]
+pub(pkg) fn req_plan(req: Req) : PkgPlan / File = pkg_plan(req.pkg_roots, stdlib_path(), req.path)
+
+#[doc("Add a directory to the module search path.")]
+pub(pkg) fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
+  CliOptions { ...opts, search_paths: list_append(opts.search_paths, [sp]) }
+
+#[doc("""
+The line width a fmt mode carries; the default when the mode is not
+a fmt mode yet, so `--fmt-width N` and `--fmt` compose in either order.
+""")]
+pub(pkg) fn mode_fmt_width(m: Mode) : Int = match m {
+  MFmt(w) -> w
+  MFmtCheck(w) -> w
+  _ -> fmt_default_width()
+}
+
+#[doc("The fmt mode `m` at line width `w`; a mode that is not a fmt check becomes a plain fmt.")]
+pub(pkg) fn mode_with_fmt_width(m: Mode, w: Int) : Mode = match m {
+  MFmtCheck(_) -> MFmtCheck(w)
+  _ -> MFmt(w)
+}
+
+#[doc("The mode whose program `m` builds: a KIR dump's, else `m` itself.")]
+pub(pkg) fn mode_program(m: Mode) : Mode = match m {
+  MEmitKir(p) -> p
+  MEmitKirNoInline(p) -> p
+  _ -> m
+}
+
+#[doc("The program mode a KIR dump selected after `m` keeps; a mode that builds no blocks keeps none.")]
+pub(pkg) fn mode_kir_program(m: Mode) : Mode = match mode_program(m) {
+  MTest -> MTest
+  MBench -> MBench
+  MPropCheck -> MPropCheck
+  _ -> MDefault
+}
+
+#[doc("`m` building the program of `p`, so a KIR dump and `--test`/`--bench`/`--prop-check` compose in either order.")]
+pub(pkg) fn mode_with_program(m: Mode, p: Mode) : Mode = match m {
+  MEmitKir(_) -> MEmitKir(p)
+  MEmitKirNoInline(_) -> MEmitKirNoInline(p)
+  _ -> p
+}
+
+#[doc("A non-numeric or non-positive count falls back to the default width.")]
+pub(pkg) fn cli_parse_width(w: String) : Int = match string_to_int(w) {
+  Some(n) -> if n > 0 { n } else { fmt_default_width() }
+  None -> fmt_default_width()
+}
+
+#[doc("""
+A site index is an offset into the catalogue `--mutate-list` prints.
+A non-numeric or negative argument resolves to -1, which no site
+carries, so the run reports the bad index rather than mutating
+something the caller did not name.
+""")]
+pub(pkg) fn cli_parse_site(w: String) : Int = match string_to_int(w) {
+  Some(n) -> if n >= 0 { n } else { 0 - 1 }
+  None -> 0 - 1
+}
+
+#[doc("""
+Set the consumer-package name parsed from kai.toml. The value flows
+through to the qualified-call rewriter so self-imports from a
+package's own modules never emit the unstable warning.
+""")]
+pub(pkg) fn cli_with_package_name(opts: CliOptions, n: String) : CliOptions =
+  CliOptions { ...opts, package_name: n }
+
+#[doc("""
+Set the consumer-declared edition (`--edition <name>`, which
+`bin/kai` derives from kai.toml's `edition = "..."` field, falling
+back to the repo EDITION file). A build that never passes the flag
+runs under the oldest edition (tongariki), so flagless invocations
+and old fixture harnesses keep working.
+""")]
+pub(pkg) fn cli_with_edition(opts: CliOptions, e: Edition) : CliOptions =
+  CliOptions { ...opts, edition: Some(e) }
+
+# The newest edition whose semantics this compiler actually implements.
+# The `Edition` type runs ahead of it: a name is parseable as soon as
+# the edition is being built out, but selecting it only means something
+# once the gates keyed on it exist. Bump on the edition cut, together
+# with the EDITION file.
+fn implemented_edition() : Edition = EdHangaRoa
+
+#[doc("""
+A manifest may name an edition this compiler does not implement yet.
+That is not an error — the name is legal and the build is sound today,
+because every `edition_at_least` gate for the newer edition is still
+absent. It is worth a warning: the manifest reads as a promise the
+toolchain cannot keep, and the moment the first gate lands the same
+source silently changes meaning.
+""")]
+pub(pkg) fn warn_if_edition_ahead(e: Edition) : Unit / Console =
+  if edition_rank(e) > edition_rank(implemented_edition()) {
+    let have = edition_name(implemented_edition())
+    eprint(concat_all(["kaic2: warning: kai.toml selects edition `", edition_name(e),
+      "`, which this compiler does not implement yet (it provides `",
+      have,
+      "`); the build proceeds under `", have,
+      "` semantics — set the edition to `", have,
+      "` to pin what is actually being compiled"]))
+  } else { () }
+
+#[doc("Opt in to the unstable surface of the package `pkg`.")]
+pub(pkg) fn cli_push_unstable_optin(opts: CliOptions, pkg: String) : CliOptions =
+  CliOptions { ...opts, unstable_optins: list_append(opts.unstable_optins, [pkg]) }
+
+#[doc("Record the arguments and `KAI_*` environment this run was started with, which a cached native core object is keyed by before typing.")]
+pub fn with_build_inputs(opts: CliOptions, argv: [String], env: [Pair[String, String]]) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache,
+    inputs: ncore_build_inputs(argv, env, match opts.path { Some(p) -> p  None -> "" }) })
+
+#[doc("Apply the test knobs the environment carries: `KAI_CORE_PRUNE=off` compiles against the whole core, as `--full-core` does.")]
+pub fn with_env_knobs(opts: CliOptions, env: [Pair[String, String]]) : CliOptions =
+  if any(env, (kv) => kv.fst == "KAI_CORE_PRUNE" and kv.snd == "off") { cli_with_full_core(opts) } else { opts }
+
+#[doc("Print the command-line usage to stderr.")]
+pub fn usage() : Unit / Console {
+  eprint("usage: kaic2 [options] <file.kai>")
+  eprint("  --core <file>   include <file>'s decls before the input")
+  eprint("  --path <dir>       add <dir> to the module search path (repeatable)")
+  eprint("  --core-cache-dir <dir>  enable the shared core cache (post-parse blobs + emitted-C core TUs) under <dir>")
+  eprint("  --test-root <stem>      load <stem>.kai beside the root as a grouped test file (repeatable)")
+  eprint("  --test-own <file>       the module loaded from <file> is the package's own: its blocks run, a lint reports on it (repeatable)")
+  eprint("  --cover <file>          a test build probes the lines of the module loaded from <file> (repeatable)")
+  eprint("  --cover-root <file>     a test build probes the root file's lines, reported under <file>")
+  eprint("  --list-tests <label>    print the test records the root file's own blocks report under <label>, without building it")
+  eprint("  --test-plan <file>      write each --test-root's test-block run order to <file>")
+  eprint("  --native-obj-dir <dir>  keep --emit=native / native-modular objects under <dir> (default: the entry's directory)")
+  eprint("  --toolchain-id <id>     opaque toolchain id folded into core-cache keys (bin/kai supplies it)")
+  eprint("  --core-cache-stats      print one core-cache hit/miss line per layer to stderr")
+  eprint("  --tokens           print the token stream and exit")
+  eprint("  --ast              parse and print the AST and exit")
+  eprint("  --types            print declared top-level signatures and exit")
+  eprint("  --env              print the full type environment (core + variants + decls)")
+  eprint("  --infer            run HM inference over each fn body and dump the inferred type")
+  eprint("  --check            typecheck only: full front-end, no codegen; report diagnostics and exit")
+  eprint("  --guard-inputs     print the sources the import closure of the root and its --test-roots reads besides the root, then exit")
+  eprint("  --inputs-out <f>   a compile also writes to <f> the module files it reads and, with a leading -, the files it tries ahead of each")
+  eprint("  --guard-interfaces as --guard-inputs, each module that parses followed by a tab and the digest of its interface")
+  eprint("  --guard-core-inputs  print the core modules and their import closure, then exit")
+  eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
+  eprint("  --dump-tycon-ids   print the declaration each nominal type in the root file's bodies denotes")
+  eprint("  --check-type-ids   fail when a written type name the later passes read carries no declaration identity")
+  eprint("  --check-field-types  fail when a field read of a program that typechecks carries no type")
+  eprint("  --check-written-eq  fail when `==` or `!=` compares a value that holds a written name")
+  eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
+  eprint("  --dump-mono-out    list call-site instantiations with planned mangled monomorphic names")
+  eprint("  --dump-rawsafe     Phase 1.B.0: dump cons-head raw-safe analysis marks (load/store sites)")
+  eprint("  --dump-borrowsafe  Phase 1.B.1: dump cons-head borrow-safe analysis marks (per match arm)")
+  eprint("  --dump-purity      dump the confirmed purity verdict per top-level fn (issue #1139)")
+  eprint("  --dump-last-use    list each fn parameter's last-use position (m5 #2 diagnostic)")
+  eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + local scope")
+  eprint("  --holes-scope      like --holes, but list the full reachable scope per hole")
+  eprint("  --dump-brands      list nursery cap-binding brand allocations + per-call attributions (issue #71 option (b))")
+  eprint("  --dump=evidence-obligations  per fn: demanded effect-instance evidence + per-supplier classification")
+  eprint("  --dump=evidence-arity        histogram injected evidence-param count per fn (max/p99/mean/>3)")
+  eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
+  eprint("  --holes-json-scope same as --holes-json, with the full reachable scope per hole")
+  eprint("  --effects-json     report per-fn effects + handlers as JSON")
+  eprint("  --effect-holes-json  report typed effect-hole resolutions (`?` / `?e` in row tail) as JSON")
+  eprint("  --explain          note each `handle` that runs its body on a stack segment, and why")
+  eprint("  --doc-json         dump the file's #[doc(...)] attributes (module_doc + items) as JSON")
+  eprint("  --builtins-doc-json  dump the core module set's #[doc(...)] attributes as JSON (no input file)")
+  eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
+  eprint("  --fmt              pretty-print canonical kaikai source to stdout (Tongariki)")
+  eprint("  --fmt-check        write formatted source to stdout iff different from input; exit 1")
+  eprint("  --fmt-width <n>    line width for --fmt / --fmt-check (default 100)")
+  eprint("  --mutate-list      list every mutation site: id, operator, line, col, description")
+  eprint("  --mutate-list-json same catalogue as JSON")
+  eprint("  --mutate-apply <i> write the source with mutation site <i> applied to stdout")
+  eprint("  --library-mode     run lex/parse/resolve/infer; answer `# @probe <kind> L:C` queries as JSON (issue #454)")
+  eprint("  --test             emit C wired to a test runner (runs test blocks)")
+  eprint("  --package-root <dir> declare <dir> the root of one package (repeatable); a module belongs to the deepest root holding its file")
+  eprint("  --package-name <n>   identifier of the consuming package (from kai.toml `name`); silences #unstable on self-imports (#602)")
+  eprint("  --unstable-optin <p> mark package <p> as `[unstable] = true` opt-in (repeatable; #602)")
+  eprint("  --edition <name>     declared edition from kai.toml — gates edition-bumped features (#603)")
+  eprint("  --lint             report suspect-but-valid code; never blocks compilation")
+  eprint("  --lint-json        same findings as --lint, as a JSON array")
+  eprint("  --diags-json       report every diagnostic of the run as a JSON array")
+  eprint("  --migrate          rewrite the source to the declared edition and write it to stdout")
+  eprint("  --target=<name>    build for a target: host (default), wasm32-browser or wasm32-wasi")
+  eprint("  --bench            emit C wired to a bench runner (runs bench blocks)")
+  eprint("  --prop-check       emit C wired to a property-check runner (runs `check` blocks)")
+  eprint("  --emit=kir         dump KIR after lowering instead of emitting C")
+  eprint("  --emit=kir-noinline  dump KIR with the inliner disabled")
+  eprint("  --ffi-header-out <f>  a compile also writes to <f> kai_ffi.h, the C typedefs of the extern \"C\" type structs; no file when there are none")
+  eprint("  -h, --help         this help")
+  eprint("  -V, --version      print version and exit")
+  eprint("  --backend-tag      print the native backend's tag, empty when built without libLLVM, and exit")
+}
+
+fn tplan_home_of(mods: [ModuleEntry], path: String) : Option[String] = match mt_lookup_origin(mods, path) {
+  Some(ME(home, _, _, _, _)) -> Some(home)
+  None -> None
+}
+
+# The files `owner`'s imports name, in the order it wrote them.
+fn tplan_scope_of(scopes: [ModScope], owner: String) : [ModuleEntry] = match scopes {
+  [] -> []
+  [MScope(m, entries, _), ...rest] -> if m == owner { entries } else { tplan_scope_of(rest, owner) }
+}
+
+fn tplan_line(mods: [ModuleEntry], root: ModuleEntry) : String = match root {
+  ME(name, _, path, _, _) -> match tplan_home_of(mods, path) {
+    Some(h) -> concat_all([name, "\t", h, "\n"])
+    None -> ""
+  }
+}
+
+#[doc("One line per module the root file imports: its written name, a tab, then the module whose blocks its run holds.")]
+pub(pkg) fn tplan_text(scopes: [ModScope], mods: [ModuleEntry]) : String =
+  concat_all(map(tplan_scope_of(scopes, ""), (root) => tplan_line(mods, root)))
+
+fn tlist_name(span: String) : String {
+  let n = string_length(span)
+  let triple = n >= 6 and string_slice(span, 0, 3) == "\"\"\""
+  let q = if triple { 3 } else { 1 }
+  match esc_decode_body(span, q, n - q) {
+    EscOk(bytes, _) -> bytes
+    EscBad(_, _) -> span
+  }
+}
+
+fn tlist_record(label: String, d: Decl) : [String] = match d {
+  DTest(desc, _, line, _, _) -> [concat_all([
+    "{\"type\":\"test\",\"id\":", json_quote(concat_all([label, ":", tlist_name(desc)])),
+    ",\"file\":", json_quote(label), ",\"line\":", int_to_string(line), "}"
+  ])]
+  _ -> []
+}
+
+#[doc("One `{\"type\":\"test\",...}` line per `test` block of `decls`, in declaration order, its id spelled as a run under `label` spells it.")]
+pub(pkg) fn tlist_text(label: String, decls: [Decl]) : String =
+  join_with(flat_map(decls, (d) => tlist_record(label, d)), "\n")
+
+#[doc("One compile request: everything `compile_source` is called with.")]
+pub(pkg) type Req = { path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], pkg_roots: [String],
+  src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], core_rows: [NEnt],
+  package_name: String, unstable_optins: [String], edition: Option[Edition], target: Target, user_cache: Bool,
+  batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_own: [String], cover: CoverSpec,
+  test_plan: String, kir_verify: String, inputs_out: String, ffi_out: String, quiet: Bool }
+
+#[doc("The outcome of one compile stage: the exit code to stop with, or the value the next stage takes.")]
+pub(pkg) type Flow[T] = Halt(Int) | Go(T)
+
+#[doc("What a coverage build probes: the modules loaded from `files`, and the root file when `root` is not empty, each reported under the path given for it.")]
+pub(pkg) type CoverSpec = { files: [String], root: String }
+
+#[doc("The spec of a build that probes nothing.")]
+pub(pkg) fn cover_none() : CoverSpec = CoverSpec { files: [], root: "" }
+
+#[doc("Whether `spec` probes anything.")]
+fn cover_on(spec: CoverSpec) : Bool = spec.root != "" or not list_is_empty(spec.files)
+
+#[doc("The import stream `decls`, partitioned by `segs` over the module table `mods`, with the code of every file `spec` covers probed.")]
+pub(pkg) fn cover_decls(spec: CoverSpec, segs: [ImportSeg], mods: [ModuleEntry], decls: [Decl]) : [Decl] =
+  if cover_on(spec) { cv_segs(spec.root, cv_homes(spec.files, mods), segs, decls) } else { decls }
+
+# A covered module, by home, with the path its lines report under.
+type CvHome = { home: String, file: String }
+
+fn cv_homes(files: [String], mods: [ModuleEntry]) : [CvHome] = match files {
+  [] -> []
+  [f, ...rest] -> match mt_lookup_origin(mods, abspath(f)) {
+    Some(ME(home, _, _, _, _)) -> [CvHome { home: home, file: f }, ...cv_homes(rest, mods)]
+    None                    -> cv_homes(rest, mods)
+  }
+}
+
+fn cv_home_file(homes: [CvHome], home: String) : String = match homes {
+  []           -> ""
+  [h, ...rest] -> if h.home == home { h.file } else { cv_home_file(rest, home) }
+}
+
+# The root file's own decls follow the last segment.
+fn cv_segs(root: String, homes: [CvHome], segs: [ImportSeg], decls: [Decl]) : [Decl] = match segs {
+  [] -> cv_file(root, decls)
+  [ISeg(home, n), ...rest] ->
+    list_append(cv_file(cv_home_file(homes, home), seg_take(decls, n)),
+                cv_segs(root, homes, rest, seg_drop(decls, n)))
+}
+
+fn cv_file(file: String, ds: [Decl]) : [Decl] =
+  if file == "" { ds } else { map(ds, (d) => cv_decl(file, d)) }
+
+# A function's body is probed; a test, bench or check block is the probes'
+# reader. A constant is pasted where it is read, so its initialiser carries
+# a probe of the definition line and each read hits it.
+fn cv_decl(file: String, d: Decl) : Decl = match d {
+  DConst(p, s, ty, body, mo, l, c) ->
+    DConst(p, s, ty, mk_expr(EBlock(cv_probe(file, [l], []), Some(body)), body.line, 0), mo, l, c)
+  _ -> cv_named_bodies(file, d)
+}
+
+fn cv_named_bodies(file: String, d: Decl) : Decl =
+  decl_map_named_bodies(d, (owner, body) => if sym_same(fnid_sym(owner), sym_none()) { body } else { cv_region(file, body) })
+
+# A block probes each of its statements; any other body takes one probe
+# ahead of it. Column 0 is no source position, so a block the emitters
+# look up by position (a `region`) never matches the wrapper.
+fn cv_region(file: String, e: Expr) : Expr = match e.kind {
+  EBlock(_, _)      -> cv_expr(file, e)
+  EExternBody(_, _) -> e
+  EIntrinsic(_, _)  -> e
+  _ -> mk_expr(EBlock(cv_probe(file, cv_lines(e, []), []), Some(cv_expr(file, e))), e.line, 0)
+}
+
+fn cv_expr(file: String, e: Expr) : Expr = match e.kind {
+  EBlock(ss, tail) -> Expr { ...e, kind: cv_block(file, e, ss, tail) }
+  EIf(c, t, oe) -> Expr { ...e, kind: EIf(cv_expr(file, c), cv_region(file, t), prc_map_opt_expr(oe, (x) => cv_region(file, x))) }
+  EMatch(s, arms) -> Expr { ...e, kind: EMatch(cv_expr(file, s), map(arms, (a) => cv_arm(file, a))) }
+  ELambda(ps, b) -> Expr { ...e, kind: ELambda(ps, cv_region(file, b)) }
+  EHandle(body, eff, tas, oi, oa, cls, oret) ->
+    Expr { ...e, kind: EHandle(cv_expr(file, body), eff, tas, prc_map_opt_expr(oi, (x) => cv_expr(file, x)), oa,
+                               map(cls, (c) => cv_clause(file, c)), cv_return(file, oret)) }
+  EExternBody(_, _) -> e
+  _ -> Expr { ...e, kind: prc_map_expr_kind(e.kind, (x) => cv_expr(file, x)) }
+}
+
+fn cv_arm(file: String, a: Arm) : Arm = match a {
+  Arm(p, g, b) -> Arm(p, prc_map_opt_expr(g, (x) => cv_expr(file, x)), cv_region(file, b))
+}
+
+fn cv_clause(file: String, c: HClause) : HClause = match c {
+  HC(h, ps, b, l, co) -> HC(h, ps, cv_region(file, b), l, co)
+}
+
+fn cv_return(file: String, r: Option[HReturn]) : Option[HReturn] = match r {
+  Some(HR(p, b, l, c)) -> Some(HR(p, cv_region(file, b), l, c))
+  None                 -> None
+}
+
+# An empty block still runs its own line.
+fn cv_block(file: String, e: Expr, ss: [Stmt], tail: Option[Expr]) : ExprKind = match tail {
+  None -> if list_is_empty(ss) { EBlock(cv_probe(file, [e.line], []), None) } else { EBlock(cv_stmts(file, ss), None) }
+  Some(t) -> EBlock(list_append(cv_stmts(file, ss), cv_probe(file, cv_lines(t, []), [])), Some(cv_expr(file, t)))
+}
+
+fn cv_stmts(file: String, ss: [Stmt]) : [Stmt] = match ss {
+  []           -> []
+  [s, ...rest] ->
+    cv_probe(file, cv_pos_lines(xp_positions_kind(EBlock([s], None)), []),
+             [prc_map_stmt_exprs(s, (x) => cv_expr(file, x)), ...cv_stmts(file, rest)])
+}
+
+# `onto` behind the probe of `lines`, or alone when they are none.
+fn cv_probe(file: String, lines: [Int], onto: [Stmt]) : [Stmt] = match list_reverse(lines) {
+  [] -> onto
+  [l, ...rest] -> {
+    let site = concat_all([join_with(map([l, ...rest], int_to_string), ","), ":", file])
+    [SExprStmt(mk_expr(EIntrinsic(InCovHit(site), []), l, 0)), ...onto]
+  }
+}
+
+# The lines of `e` and of every node below it, regions of their own left out; newest first.
+fn cv_lines(e: Expr, acc: [Int]) : [Int] = match e.kind {
+  EBlock(_, _)    -> cv_add(e.line, acc)
+  EMatch(s, arms) -> cv_guard_lines(arms, cv_lines(s, cv_add(e.line, acc)))
+  _               -> cv_pos_lines(xp_positions(e), cv_add(e.line, acc))
+}
+
+fn cv_pos_lines(ps: [XPos], acc: [Int]) : [Int] = match ps {
+  [] -> acc
+  [XP(r, x), ...rest] -> match r {
+    XAll -> cv_pos_lines(rest, cv_lines(x, acc))
+    XSc  -> cv_pos_lines(rest, cv_lines(x, acc))
+    XMsg -> cv_pos_lines(rest, cv_lines(x, acc))
+    _    -> cv_pos_lines(rest, acc)
+  }
+}
+
+fn cv_guard_lines(arms: [Arm], acc: [Int]) : [Int] = match arms {
+  [] -> acc
+  [Arm(_, Some(g), _), ...rest] -> cv_guard_lines(rest, cv_lines(g, acc))
+  [_, ...rest] -> cv_guard_lines(rest, acc)
+}
+
+fn cv_add(l: Int, acc: [Int]) : [Int] =
+  if l <= 0 or list_has_int(acc, l) { acc } else { [l, ...acc] }
+
+fn list_has_int(xs: [Int], x: Int) : Bool = match xs {
+  []           -> false
+  [h, ...rest] -> h == x or list_has_int(rest, x)
+}

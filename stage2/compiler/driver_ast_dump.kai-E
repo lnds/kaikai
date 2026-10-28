@@ -1,0 +1,782 @@
+#[doc("The `--ast` dump: the parsed declarations printed as an indented tree.")]
+
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.util
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.operators
+import compiler.type_text
+import compiler.marks
+import compiler.builtins
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.infer_holes_json
+import compiler.fmt_shape
+import compiler.driver_exports
+import compiler.driver_enclosing
+import compiler.driver_lib_query
+
+fn indent_of(depth: Int) : String {
+  if depth == 0 { "" } else { string_concat("  ", indent_of(depth - 1)) }
+}
+
+fn emit_line(depth: Int, s: String) : Unit / Console = print("#{indent_of(depth)}#{s}")
+
+fn dump_expr(tab: SymTab, e: Expr, depth: Int) : Unit / Console {
+
+  match e.kind {
+    EInt(n, _) -> emit_line(depth, "int #{int_to_string(n)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EReal(RealLit(r), _) -> emit_line(depth, "real #{real_to_string(r)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EFixed(s, _) -> emit_line(depth, "fixed #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EIntLit(s) -> emit_line(depth, "intlit #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EDecimalLit(s) -> emit_line(depth, "declit #{s}d @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EBool(b) -> {
+      let s = if b { "true" } else { "false" }
+      emit_line(depth, "bool #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    }
+    EChar(c) -> emit_line(depth, "char '#{c}' @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EStr(s, _) -> emit_line(depth, "string #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EUnit -> emit_line(depth, "unit @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EName(name) -> emit_line(depth, "ident #{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EMark(m) -> emit_line(depth, "mark #{mark_name(m)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    ESym(s, _) -> emit_line(depth, "ident #{decl_name(tab, s)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    ELocal(l) -> emit_line(depth, "local #{int_to_string(local_raw(l))} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EOp(r) -> emit_line(depth, "op #{decl_name(tab, r.eff)}.#{r.op} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EUnder -> emit_line(depth, "_ @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EPlaceholder -> emit_line(depth, ". @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    ECall(callee, xs) -> {
+      emit_line(depth, "call @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, callee, depth + 1)
+      xs |> each((a) => dump_expr(tab, a, depth + 1))
+    }
+    EField(base, name) -> {
+      emit_line(depth, "field .#{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, base, depth + 1)
+    }
+    EIndex(base, idx) -> {
+      emit_line(depth, "index @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, base, depth + 1)
+      dump_expr(tab, idx, depth + 1)
+    }
+    EBinop(op, a, b) -> {
+      emit_line(depth, "binop #{binop_text(op)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, a, depth + 1)
+      dump_expr(tab, b, depth + 1)
+    }
+    EUnop(op, x) -> {
+      emit_line(depth, "unop #{unop_text(op)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, x, depth + 1)
+    }
+    EIf(c, a, opt_b) -> {
+      emit_line(depth, "if @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, c, depth + 1)
+      dump_expr(tab, a, depth + 1)
+      match opt_b { Some(b) -> dump_expr(tab, b, depth + 1) None -> () }
+    }
+    EMatch(scrut, arms) -> {
+      emit_line(depth, "match @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, scrut, depth + 1)
+      arms |> each((a) => dump_arm(tab, a, depth + 1))
+    }
+    ELambda(params, body) -> {
+      emit_line(depth, "lambda @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      dump_expr(tab, body, depth + 1)
+    }
+    ERecordLit(r, fields) -> {
+      emit_line(depth, "record #{dump_ref_name(tab, r)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_field_inits(tab, fields, 0, depth + 1)
+    }
+    EList(elems) -> {
+      emit_line(depth, "list @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      elems |> each((el) => dump_list_elem(tab, el, depth + 1))
+    }
+    ERange(a, b, opt_step) -> {
+      emit_line(depth, "range @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, a, depth + 1)
+      dump_expr(tab, b, depth + 1)
+      match opt_step { Some(s) -> dump_expr(tab, s, depth + 1) None -> () }
+    }
+    EBlock(stmts, opt_final) -> {
+      emit_line(depth, "block @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      stmts |> each((s) => dump_stmt(tab, s, depth + 1))
+      match opt_final { Some(fe) -> dump_expr(tab, fe, depth + 1) None -> () }
+    }
+    EPipe(a, b) -> {
+      emit_line(depth, "pipe @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, a, depth + 1)
+      dump_expr(tab, b, depth + 1)
+    }
+    EDispatchPipe(op, a, b) -> {
+      emit_line(depth, "#{pipe_op_dump_name(op)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, a, depth + 1)
+      dump_expr(tab, b, depth + 1)
+    }
+    EHole(nm_opt) -> {
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      emit_line(depth, "hole #{label} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    }
+    ETodo(msg) ->
+      emit_line(depth, "todo \"#{msg}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EExternBody(abi, sym) ->
+      emit_line(depth, "extern-body #{extern_abi_literal(abi)} \"#{sym}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EBang(inner) -> {
+      emit_line(depth, "bang @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, inner, depth + 1)
+    }
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      dump_handle(tab, e, depth, body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt)
+    ELitUnit(inner, u) -> {
+      emit_line(depth, "lit-unit <#{unit_text(u)}> @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(tab, inner, depth + 1)
+    }
+    EVariantsOf(ty, _) ->
+      emit_line(depth, "variants-of #{type_text(tab, ty)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    # Qualified module call. Two strings (module + fn).
+    EModCall(m, fname) ->
+      emit_line(depth, "modcall #{m}.#{fname} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EIntrinsic(name, args_) -> {
+      emit_line(depth, "intrinsic $#{intrinsic_name(name)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      args_ |> each((a) => dump_expr(tab, a, depth + 1))
+    }
+    ESurface(sf) -> dump_surface(tab, e, sf, depth)
+  }
+}
+
+fn dump_handle(tab: SymTab, e: Expr, depth: Int, body: Expr, eff: DeclRef, eff_tyargs: [TypeExpr], init_opt: Option[Expr],
+                alias_opt: Option[Binder], clauses: [HClause], ret_opt: Option[HReturn]) : Unit / Console {
+      let alias_s = match alias_opt { Some(a) -> string_concat(" as ", written_text(a.name)) None -> "" }
+      let targs_s = match eff_tyargs {
+        [] -> ""
+        _ -> concat_all(["[", join_with(map(eff_tyargs, (t) => type_text(tab, t)), ", "), "]"])
+      }
+      emit_line(depth, "handle #{dump_ref_shown(tab, eff)}#{targs_s}#{alias_s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      match init_opt {
+        Some(ie) -> { emit_line(depth + 1, "init"); dump_expr(tab, ie, depth + 2) }
+        None -> ()
+      }
+      emit_line(depth + 1, "body")
+      dump_expr(tab, body, depth + 2)
+      clauses |> each((c) => dump_hclause(tab, c, depth + 1))
+      match ret_opt { Some(r) -> dump_hreturn(tab, r, depth + 1) None -> () }
+}
+
+fn dump_surface(tab: SymTab, e: Expr, sf: SurfaceForm, depth: Int) : Unit / Console = match sf {
+  SfContract(reqs, enss, body) -> {
+    emit_line(depth, "contract @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    reqs |> each((r) => { emit_line(depth + 1, "requires"); dump_expr(tab, r, depth + 2) })
+    enss |> each((en) => { emit_line(depth + 1, "ensures"); dump_expr(tab, en, depth + 2) })
+    dump_expr(tab, body, depth + 1)
+  }
+  SfEnsure(value, pred) -> {
+    emit_line(depth, "ensure-where @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, value, depth + 1)
+    dump_expr(tab, pred, depth + 1)
+  }
+  SfLamBlock(lam, trailing) -> {
+    let kind_s = if trailing { "trailing" } else { "plain" }
+    emit_line(depth, "lam-block #{kind_s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, lam, depth + 1)
+  }
+  SfTuple(elems) -> {
+    emit_line(depth, "tuple @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    elems |> each((el) => dump_expr(tab, el, depth + 1))
+  }
+  SfHandleInit(init) -> {
+    emit_line(depth, "handle-initially @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, init, depth + 1)
+  }
+  SfBigIntLit(digits) -> {
+    emit_line(depth, "bigint-lit #{digits}n @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+  }
+  SfMapLit(spread, flat) -> {
+    emit_line(depth, "map-lit @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    match spread { Some(b) -> dump_expr(tab, b, depth + 1)  None -> () }
+    flat |> each((el) => dump_expr(tab, el, depth + 1))
+  }
+  SfSetLit(spread, elems) -> {
+    emit_line(depth, "set-lit @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    match spread { Some(b) -> dump_expr(tab, b, depth + 1)  None -> () }
+    elems |> each((el) => dump_expr(tab, el, depth + 1))
+  }
+  SfRefMake(inner) -> {
+    emit_line(depth, "ref-make @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, inner, depth + 1)
+  }
+  SfDeref(target) -> {
+    emit_line(depth, "deref @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, target, depth + 1)
+  }
+  SfMultiMatch(scruts, arms) -> {
+    emit_line(depth, "multi-match @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    scruts |> each((sc) => dump_expr(tab, sc, depth + 1))
+    arms |> each((a) => dump_mmarm(tab, a, depth + 1))
+  }
+  SfCaseBlock(arms) -> {
+    emit_line(depth, "case-block @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    arms |> each((a) => dump_mmarm(tab, a, depth + 1))
+  }
+  # `dump_field_init` prints a pun under its field; this is the
+  # wrapper met anywhere else.
+  SfFieldPun(value) -> {
+    emit_line(depth, "field-pun @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, value, depth + 1)
+  }
+  SfSteppedRange(first, second, last) -> {
+    emit_line(depth, "stepped-range @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    [first, second, last] |> each((x) => dump_expr(tab, x, depth + 1))
+  }
+  SfEndlessRange(_, _) -> {
+    emit_line(depth, "endless-range @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    surface_children(sf) |> each((x) => dump_expr(tab, x, depth + 1))
+  }
+  SfLazy(bracket) -> {
+    emit_line(depth, "lazy @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    dump_expr(tab, bracket, depth + 1)
+  }
+  SfInterp(span, _, _, holes) -> {
+    emit_line(depth, "interp #{span} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    holes |> each((x) => dump_expr(tab, x, depth + 1))
+  }
+}
+
+fn dump_mmarm(tab: SymTab, a: MMArm, depth: Int) : Unit / Console {
+  match a {
+    MMArm(pats, guard, body) -> {
+      emit_line(depth, "mm-arm")
+      pats |> each((pp) => dump_pat(tab, pp, depth + 1))
+      match guard {
+        Some(g) -> {
+          emit_line(depth + 1, "guard")
+          dump_expr(tab, g, depth + 2)
+        }
+        None -> ()
+      }
+      dump_expr(tab, body, depth + 1)
+    }
+  }
+}
+
+fn dump_hclause(tab: SymTab, c: HClause, depth: Int) : Unit / Console {
+
+  match c {
+    HC(head, params, body, line, col) -> {
+      emit_line(depth, "clause #{clause_head_word(head)} @#{int_to_string(line)}:#{int_to_string(col)}")
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      dump_expr(tab, body, depth + 1)
+    }
+  }
+}
+
+fn dump_hreturn(tab: SymTab, r: HReturn, depth: Int) : Unit / Console {
+
+  match r {
+    HR(b, body, line, col) -> {
+      emit_line(depth, "return #{b.name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(tab, body, depth + 1)
+    }
+  }
+}
+
+fn dump_arm(tab: SymTab, a: Arm, depth: Int) : Unit / Console {
+
+  emit_line(depth, "arm")
+  match a {
+    Arm(pat, guard, body) -> {
+      dump_pat(tab, pat, depth + 1)
+      match guard { Some(g) -> { emit_line(depth + 1, "guard"); dump_expr(tab, g, depth + 2) } None -> () }
+      dump_expr(tab, body, depth + 1)
+    }
+  }
+}
+
+fn dump_field_inits(tab: SymTab, fis: [FieldInit], i: Int, depth: Int) : Unit / Console = match fis {
+  [] -> ()
+  [fi, ...rest] -> {
+    dump_field_init(tab, fi, i, depth)
+    dump_field_inits(tab, rest, i + 1, depth)
+  }
+}
+
+# A field with no name prints the tag of its kind where a name goes: the
+# spread, and a positional field by its index `i`.
+fn dump_field_init(tab: SymTab, fi: FieldInit, i: Int, depth: Int) : Unit / Console {
+
+  match fi {
+    FI(name, val) -> match field_spread_value(val) {
+      Some(src) -> {
+        emit_line(depth, "field_init __spread__")
+        dump_expr(tab, src, depth + 1)
+      }
+      None -> match field_pos_value(val) {
+        Some(v) -> {
+          emit_line(depth, "field_init __pos_#{int_to_string(i)}__")
+          dump_expr(tab, v, depth + 1)
+        }
+        None -> match field_pun_value(val) {
+          Some(inner) -> {
+            emit_line(depth, "field_init __pun__#{name}")
+            dump_expr(tab, inner, depth + 1)
+          }
+          None -> {
+            emit_line(depth, "field_init #{name}")
+            dump_expr(tab, val, depth + 1)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn dump_list_elem(tab: SymTab, el: ListElem, depth: Int) : Unit / Console {
+
+  match el {
+    ElPlain(e) -> dump_expr(tab, e, depth)
+    ElSpread(e) -> {
+      emit_line(depth, "spread")
+      dump_expr(tab, e, depth + 1)
+    }
+  }
+}
+
+fn dump_stmt(tab: SymTab, s: Stmt, depth: Int) : Unit / Console {
+
+  match s {
+    SLet(pat, opt_ty, rhs) -> {
+      emit_line(depth, "let")
+      dump_pat(tab, pat, depth + 1)
+      match opt_ty { Some(ty) -> dump_type(tab, ty, depth + 1) None -> () }
+      dump_expr(tab, rhs, depth + 1)
+    }
+    SAssert(cond, opt_msg) -> {
+      emit_line(depth, "assert")
+      dump_expr(tab, cond, depth + 1)
+      match opt_msg { Some(m) -> dump_expr(tab, m, depth + 1) None -> () }
+    }
+    SExprStmt(e) -> dump_expr(tab, e, depth)
+    SIndexAssign(base, idx, val, line, col) -> {
+      emit_line(depth, "index-assign @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(tab, base, depth + 1)
+      dump_expr(tab, idx, depth + 1)
+      dump_expr(tab, val, depth + 1)
+    }
+    SAssign(lhs, val, line, col) -> {
+      emit_line(depth, "assign @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(tab, lhs, depth + 1)
+      dump_expr(tab, val, depth + 1)
+    }
+    SVar(b, opt_ty, rhs, line, col) -> {
+      emit_line(depth, "var #{b.name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      match opt_ty { Some(ty) -> dump_type(tab, ty, depth + 1) None -> () }
+      dump_expr(tab, rhs, depth + 1)
+    }
+    SUse(name, line, col) ->
+      emit_line(depth, "use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+  }
+}
+
+fn dump_pat(tab: SymTab, pat: Pattern, depth: Int) : Unit / Console {
+
+  match pat.pkind {
+    PWild -> emit_line(depth, "pat _ @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    PLit(e) -> {
+      emit_line(depth, "pat_lit @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_expr(tab, e, depth + 1)
+    }
+    PRange(lo, hi) -> {
+      emit_line(depth, "pat_range @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_expr(tab, lo, depth + 1)
+      dump_expr(tab, hi, depth + 1)
+    }
+    PBind(b) -> emit_line(depth, "pat_bind #{b.name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    PList(pats, opt_rest) -> {
+      emit_line(depth, "pat_list @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      pats |> each((pp) => dump_pat(tab, pp, depth + 1))
+      match opt_rest { Some(r) -> emit_line(depth + 1, "...#{r.name}") None -> () }
+    }
+    PVariant(r, subs) -> {
+      emit_line(depth, "pat_variant #{dump_ref_shown(tab, r)} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      subs |> each((pp) => dump_pat(tab, pp, depth + 1))
+    }
+    PVariantRecord(r, fields) -> {
+      emit_line(depth, "pat_variant_record #{dump_ref_shown(tab, r)} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      fields |> each((pf) => dump_pfield(tab, pf, depth + 1))
+    }
+    PRecord(fields) -> {
+      emit_line(depth, "pat_record @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      fields |> each((pf) => dump_pfield(tab, pf, depth + 1))
+    }
+    PHole(nm_opt) -> {
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      emit_line(depth, "pat_hole #{label} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    }
+    PAs(b, sub) -> {
+      emit_line(depth, "pat_as #{b.name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_pat(tab, sub, depth + 1)
+    }
+    PNarrow(b, ty) -> {
+      emit_line(depth, "pat_narrow #{b.name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_type(tab, ty, depth + 1)
+    }
+    PSurface(ps) -> match ps {
+      PsTuple(pats) -> {
+        emit_line(depth, "pat_tuple @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+        pats |> each((pp) => dump_pat(tab, pp, depth + 1))
+      }
+      PsQualified(qual, sub) -> {
+        emit_line(depth, "pat_qualified #{qual} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+        dump_pat(tab, sub, depth + 1)
+      }
+      PsAs(name, sub) -> {
+        emit_line(depth, "pat_as_kw #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+        dump_pat(tab, sub, depth + 1)
+      }
+      PsRefine(name, ty) -> {
+        emit_line(depth, "pat_refine #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+        dump_type(tab, ty, depth + 1)
+      }
+      PsAnonRest(pats, wild) -> {
+        emit_line(depth, "pat_list @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+        pats |> each((pp) => dump_pat(tab, pp, depth + 1))
+        emit_line(depth + 1, if wild { "..._" } else { "..." })
+      }
+    }
+  }
+}
+
+fn dump_pfield(tab: SymTab, pf: PField, depth: Int) : Unit / Console {
+
+  match pf {
+    PField(name, sub, short) -> {
+      let suffix = if short { " (shorthand)" } else { "" }
+      emit_line(depth, "pat_field #{name}#{suffix}")
+      dump_pat(tab, sub, depth + 1)
+    }
+  }
+}
+
+fn dump_type(tab: SymTab, ty: TypeExpr, depth: Int) : Unit / Console {
+
+  match ty.tkind {
+    TyName(r, targs) -> {
+      emit_line(depth, "ty_name #{dump_ref_name(tab, r)} @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(tab, a, depth + 1))
+    }
+    TyList(inner) -> {
+      emit_line(depth, "ty_list @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(tab, inner, depth + 1)
+    }
+    TyFn(targs, ret, row) -> {
+      emit_line(depth, "ty_fn @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(tab, a, depth + 1))
+      dump_type(tab, ret, depth + 1)
+      dump_row_expr(tab, row, depth + 1)
+    }
+    TyDim(base, u) -> {
+      emit_line(depth, "ty_dim <#{unit_text(u)}> @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(tab, base, depth + 1)
+    }
+    TyRefine(base, pred) -> {
+      emit_line(depth, "ty_refine @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(tab, base, depth + 1)
+      dump_expr(tab, pred, depth + 1)
+    }
+    # Compound row as a type argument.
+    TyRow(row) -> {
+      emit_line(depth, "ty_row @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_row_expr(tab, row, depth + 1)
+    }
+    TySurface(ts) -> match ts {
+      TsTuple(tys) -> {
+        emit_line(depth, "ty_tuple @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+        tys |> each((a) => dump_type(tab, a, depth + 1))
+      }
+      TsUnitSpan(raw, inner) -> {
+        emit_line(depth, "ty_unit_span <#{raw}> @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+        dump_type(tab, inner, depth + 1)
+      }
+    }
+    TyParam(p, targs) -> {
+      emit_line(depth, "ty_param #{int_to_string(tlocal_raw(p))} @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(tab, a, depth + 1))
+    }
+  }
+}
+
+fn dump_row_expr(tab: SymTab, r: RowExpr, depth: Int) : Unit / Console {
+
+  match r {
+    REmpty -> ()
+    RClosed(labels) -> {
+      let s = if labels == [] { "row (empty)" }
+              else { string_concat("row ", join_with(map(labels, (l) => row_label_text(tab, l)), " + ")) }
+      emit_line(depth, s)
+    }
+    ROpen(tail, labels) -> {
+      let rv = tail_written_text(tail)
+      let s = if labels == [] { string_concat("row ", rv) }
+              else { string_concat("row ",
+                       string_concat(join_with(map(labels, (l) => row_label_text(tab, l)), " + "),
+                         string_concat(" + ", rv))) }
+      emit_line(depth, s)
+    }
+  }
+}
+
+fn pub_word(is_pub: Bool) : String = if is_pub { "pub " } else { "" }
+
+fn axiom_extern_text(abi: Option[ExternAbi], sym: String) : String = match abi {
+  Some(AbiKai) -> concat_all(["extern_kai(\"", sym, "\") "])
+  Some(AbiC)   -> if string_length(sym) > 0 { concat_all(["extern_c(\"", sym, "\") "]) } else { "extern_c " }
+  Some(AbiJs)  -> concat_all(["extern_js(\"", sym, "\") "])
+  None         -> ""
+}
+
+fn unit_body_text(body: UnitBody) : String = match body {
+  UBNone -> ""
+  UBAlias(u) -> string_concat(" = ", unit_text(u))
+  UBMeasure(m) -> string_concat(" = ", m)
+}
+
+fn kind_hab_text(hab: KindHab) : String = match hab {
+  HabNone -> ""
+  HabIntro(w) -> w
+  HabDomain(dom) -> value_domain_name(dom)
+  HabClosed(w, atoms) -> concat_all([w, " { ", join_with(atoms, " "), " }"])
+}
+
+fn dump_import(ik: ImportKind, line: Int, col: Int, depth: Int) : Unit / Console = match ik {
+  IkPath(path) -> emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
+  IkAlias(path, a) -> emit_line(depth, "import #{path} as #{a} @#{int_to_string(line)}:#{int_to_string(col)}")
+  IkSelective(path, names) -> {
+    emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
+    names |> each((n) => emit_line(depth + 1, "sel #{n}"))
+  }
+  IkHole(name) -> emit_line(depth, "import ?#{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+}
+
+fn theory_text(name: String, props: [String]) : String =
+  if theory_props_builtin(props) { "theory \"#{name}\" builtin" }
+  else { "theory \"#{name}\" { #{join_with(props, ", ")} }" }
+
+fn dump_decl(tab: SymTab, d: Decl, depth: Int) : Unit / Console {
+
+  match d {
+    DFn(is_pub, fid, tparams, params, opt_ret, row, body, line, col, _) -> {
+      let pub_s = pub_word(is_pub)
+      emit_line(depth, "fn #{pub_s}\"#{decl_name(tab, fnid_sym(fid))}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{fmt_tparam(tp)}"))
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      match opt_ret { Some(ty) -> dump_type(tab, ty, depth + 1) None -> () }
+      dump_row_expr(tab, row, depth + 1)
+      dump_expr(tab, body, depth + 1)
+    }
+    DAxiom(is_pub, abi, name, sym, tparams, params, ret_ty, row, line, col) -> {
+      let pub_s = pub_word(is_pub)
+      let ext_s = axiom_extern_text(abi, sym)
+      emit_line(depth, "axiom #{ext_s}#{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{fmt_tparam(tp)}"))
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      dump_type(tab, ret_ty, depth + 1)
+      dump_row_expr(tab, row, depth + 1)
+    }
+    DConst(is_pub, s, ty, body, _, line, col) -> {
+      let pub_s = pub_word(is_pub)
+      emit_line(depth, "const #{pub_s}\"#{decl_name(tab, s)}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_type(tab, ty, depth + 1)
+      dump_expr(tab, body, depth + 1)
+    }
+    DType(is_pub, s, tparams, body, line, col, _, _) -> {
+      let pub_s = pub_word(is_pub)
+      emit_line(depth, "type #{pub_s}\"#{decl_name(tab, s)}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{fmt_tparam(tp)}"))
+      dump_type_body(tab, body, depth + 1)
+    }
+    DTest(desc, body, line, col, _) -> {
+      emit_line(depth, "test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(tab, body, depth + 1)
+    }
+    DBench(desc, body, line, col, _) -> {
+      emit_line(depth, "bench #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(tab, body, depth + 1)
+    }
+    DCheck(desc, params, body, line, col, _) -> {
+      emit_line(depth, "check #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      dump_expr(tab, body, depth + 1)
+    }
+    DImport(ik, line, col) -> dump_import(ik, line, col, depth)
+    DEffect(is_pub, s, tparams, ops, _default_block, line, col, _) -> {
+      let pub_s = pub_word(is_pub)
+      emit_line(depth, "effect #{pub_s}\"#{decl_name(tab, s)}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{fmt_tparam(tp)}"))
+      ops |> each((op) => dump_effect_op(tab, op, depth + 1))
+    }
+    DProtocol(is_pub, s, tparams, ops, line, col, _) -> {
+      let pub_s = pub_word(is_pub)
+      emit_line(depth, "protocol #{pub_s}\"#{decl_name(tab, s)}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{fmt_tparam(tp)}"))
+      ops |> each((op) => dump_proto_op(tab, op, depth + 1))
+    }
+    DImpl(pname, proto_args, target, ms, line, col, impl_tps, _) -> {
+      emit_line(depth, "impl \"#{dump_ref_shown(tab, pname)}\" for @#{int_to_string(line)}:#{int_to_string(col)}")
+      proto_args |> each((pa) => dump_type(tab, pa, depth + 1))
+      dump_type(tab, target, depth + 1)
+      ms |> each((m) => dump_decl(tab, m, depth + 1))
+    }
+    DDerive(names, inner, line, col) -> {
+      let names_s = join_with(names, ", ")
+      emit_line(depth, "#[derive(#{names_s})] @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DUnstable(inner, line, col) -> {
+      emit_line(depth, "#[unstable] @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DProtoLaws(_, inner, line, col, _) -> {
+      emit_line(depth, "#[proto_laws] @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DImplAxiom(_, inner, line, col, _) -> {
+      emit_line(depth, "#[impl_axiom] @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DConstructor(inner, line, col) -> {
+      emit_line(depth, "#[constructor] @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DUnit(is_pub, name, body, _, line, col, _) -> {
+      let pub_s = pub_word(is_pub)
+      let body_s = unit_body_text(body)
+      emit_line(depth, "unit #{pub_s}\"#{name}\"#{body_s} @#{int_to_string(line)}:#{int_to_string(col)}")
+    }
+    DUse(name, line, col) ->
+      emit_line(depth, "use #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    DUseKind(name, line, col, _) ->
+      emit_line(depth, "use_kind #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    # Doc wrappers. The item wrapper recurses into the documented
+    # decl; the module-doc carrier prints its position.
+    DDoc(raw, _, inner, line, col) -> {
+      emit_line(depth, "doc @#{int_to_string(line)}:#{int_to_string(col)}")
+      emit_line(depth + 1, "raw #{raw}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DAttr(raw, inner, line, col) -> {
+      emit_line(depth, "attr @#{int_to_string(line)}:#{int_to_string(col)}")
+      emit_line(depth + 1, "raw #{raw}")
+      dump_decl(tab, inner, depth + 1)
+    }
+    DModuleDoc(raw, _, line, col) -> {
+      emit_line(depth, "module_doc @#{int_to_string(line)}:#{int_to_string(col)}")
+      emit_line(depth + 1, "raw #{raw}")
+    }
+    DExternType(_, name, _, line, col, _) ->
+      emit_line(depth, "extern_type #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+    DTheory(name, props, line, col, _) -> {
+      emit_line(depth, "#{theory_text(name, props)} @#{int_to_string(line)}:#{int_to_string(col)}")
+    }
+    DKind(is_pub, name, thy, _, hab, line, col, _) -> {
+      let pub_s = pub_word(is_pub)
+      let hab_s = kind_hab_text(hab)
+      emit_line(depth, "kind #{pub_s}\"#{name}\" : #{thy} with #{hab_s} @#{int_to_string(line)}:#{int_to_string(col)}")
+    }
+  }
+}
+
+fn dump_proto_op(tab: SymTab, op: ProtoOp, depth: Int) : Unit / Console {
+
+  match op {
+    POp(name, op_tparams, params, ret, line, col) -> {
+      emit_line(depth, "op \"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      op_tparams |> each((tp) => emit_line(depth + 1, "op_tparam #{fmt_tparam(tp)}"))
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      dump_type(tab, ret, depth + 1)
+    }
+  }
+}
+
+fn dump_effect_op(tab: SymTab, op: EffectOp, depth: Int) : Unit / Console {
+
+  match op {
+    EffOp(name, op_tparams, params, ret, line, col) -> {
+      emit_line(depth, "op \"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      op_tparams |> each((tp) => emit_line(depth + 1, "op_tparam #{fmt_tparam(tp)}"))
+      params |> each((pm) => dump_param(tab, pm, depth + 1))
+      dump_type(tab, ret, depth + 1)
+    }
+  }
+}
+
+fn dump_param(tab: SymTab, pm: Param, depth: Int) : Unit / Console {
+
+  emit_line(depth, "param #{pm.binder.name} @#{int_to_string(pm.pline)}:#{int_to_string(pm.pcol)}")
+  match pm.ptype { Some(ty) -> dump_type(tab, ty, depth + 1) None -> () }
+}
+
+fn dump_type_body(tab: SymTab, tb: TypeBody, depth: Int) : Unit / Console {
+
+  match tb {
+    TBAlias(ty) -> {
+      emit_line(depth, "ty_alias")
+      dump_type(tab, ty, depth + 1)
+    }
+    TBRecord(fields) -> {
+      emit_line(depth, "ty_record")
+      fields |> each((fd) => dump_field_decl(tab, fd, depth + 1))
+    }
+    TBSum(variants) -> {
+      emit_line(depth, "ty_sum")
+      variants |> each((v) => dump_variant(tab, v, depth + 1))
+    }
+    TBEffectAlias(labels) -> {
+      let s = if labels == [] { "ty_effect_alias (empty)" }
+              else { string_concat("ty_effect_alias ", join_with(map(labels, (l) => row_label_text(tab, l)), " + ")) }
+      emit_line(depth, s)
+    }
+  }
+}
+
+fn dump_field_decl(tab: SymTab, fd: FieldDecl, depth: Int) : Unit / Console {
+
+  match fd {
+    FD(is_pub, name, ty, _) -> {
+      let vis = if is_pub { "pub" } else { "priv" }
+      emit_line(depth, "field_decl #{vis} #{name}")
+      dump_type(tab, ty, depth + 1)
+    }
+  }
+}
+
+fn dump_variant(tab: SymTab, v: Variant, depth: Int) : Unit / Console {
+
+  match v {
+    Var(s, vargs) -> {
+      emit_line(depth, "variant #{decl_name(tab, s)}")
+      vargs |> each((a) => dump_type(tab, a, depth + 1))
+    }
+  }
+}
+
+pub(pkg) fn dump_program(decls: [Decl], tab: SymTab) : Unit / Console {
+  print("program")
+  decls |> each((d) => dump_decl(tab, d, 1))
+}
+
+pub(pkg) fn dump_library_mode(file: String, src: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
+  let tab = tin.tab
+  let tm = compile_to_module(file, decls, tin)
+  let probes = lib_collect_probes(src)
+  let entries = lib_run_probes(tm, tab, decls, probes)
+  print(concat_all([
+    "{\"file\": ", json_str(file),
+    ", \"probes\": [",
+    join_with(entries, ", "),
+    "]}"
+  ]))
+  0
+}

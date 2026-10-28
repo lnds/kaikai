@@ -1,0 +1,276 @@
+#[doc("""
+The names a module's declarations export, the names a reference is shown
+by, and the module origin stamped on loaded declarations.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.written
+import compiler.symtab
+import compiler.desugar_refine_pred
+
+#[doc("""
+A reference as a dump prints it: the name alone, or with the qualifier
+the source wrote.
+""")]
+pub fn dump_ref_name(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(_, n) -> written_text(n)
+  DrSym(s)        -> written_text(decl_name(tab, s))
+}
+
+#[doc("A reference as a dump prints it, keeping the qualifier the source wrote.")]
+pub fn dump_ref_shown(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(Some(q), n) -> cat3(written_text(q), ".", written_text(n))
+  _                     -> dump_ref_name(tab, r)
+}
+
+#[doc("""
+Extract the public-facing names declared at the top of a module
+file: pub fn, pub type (plus its variant ctors), pub effect,
+pub protocol, pub extern type, pub axiom (still a DAxiom here — lower_axioms turns
+it into a pub fn later), pub unit and pub const. Private (non-pub)
+decls are intentionally excluded — they cannot be reached via
+qualified syntax from outside. `tab` holds the file's own rows.
+""")]
+pub fn collect_pub_exports(decls: [Decl], tab: SymTab, acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DFn(true, f, _, _, _, _, _, _, _, _) -> [export_name(tab, fnid_sym(f)), ...acc]
+        # A `pub type T = A | B | ...` exports both the type name AND
+        # every variant constructor — `mod.A` / `mod.B` qualified
+        # expressions / patterns rely on the ctor names being looked
+        # up in the module table.
+        DType(true, s, _, body, _, _, _, _) -> match body {
+          TBSum(vs) -> collect_variant_names(vs, tab, [export_name(tab, s), ...acc])
+          _ -> [export_name(tab, s), ...acc]
+        }
+        DEffect(true, s, _, _, _, _, _, _) -> [export_name(tab, s), ...acc]
+        DProtocol(true, s, _, _, _, _, _) -> [export_name(tab, s), ...acc]
+        DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
+        DUnit(true, name, _, _, _, _, _) -> [name, ...acc]
+        DExternType(true, name, _, _, _, _) -> [name, ...acc]
+        DConst(true, s, _, _, _, _, _) -> [export_name(tab, s), ...acc]
+        # `#[derive(...)]` wraps the underlying `pub type` in a
+        # DDerive node. Export collection runs before the typer
+        # expands derives, so without recursing into the wrapper the
+        # `pub type` is invisible to qualified imports. Walk the
+        # inner decl with the same accumulator so the wrapped type
+        # (and its variants, if a sum) lands in the export list.
+        DDerive(_, inner, _, _) -> collect_pub_exports([inner], tab, acc)
+        # `#[unstable]` wrapper preserves the inner pub name in the
+        # regular export list so import resolution sees it; the
+        # unstable bit is collected separately by
+        # `collect_unstable_exports` below.
+        DUnstable(inner, _, _) -> collect_pub_exports([inner], tab, acc)
+        DProtoLaws(_, inner, _, _, _) -> collect_pub_exports([inner], tab, acc)
+        DImplAxiom(_, inner, _, _, _) -> collect_pub_exports([inner], tab, acc)
+        DConstructor(inner, _, _) -> collect_pub_exports([inner], tab, acc)
+        _ -> acc
+      }
+      collect_pub_exports(rest, tab, acc1)
+    }
+  }
+}
+
+#[doc("The name a module table lists the declaration `s` under.")]
+pub fn export_name(tab: SymTab, s: SymId) : String = written_text(decl_name(tab, s))
+
+#[doc("""
+Collect the names of pub decls wrapped in `DUnstable`.
+Mirrors `collect_pub_exports` shape so the per-pub-form variant
+expansion (sum-type ctors, etc.) stays consistent. The result lives
+alongside `exports` on the `ModuleEntry` and is consulted by the
+qualified-call rewrite + import-name resolver to decide whether to
+emit the unstable-consumer warning.
+""")]
+pub fn collect_unstable_exports(decls: [Decl], tab: SymTab, acc: [String]) : [String] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let acc1 = match d {
+        DUnstable(inner, _, _) -> collect_pub_names_for_unstable(inner, tab, acc)
+        DProtoLaws(_, inner, _, _, _) -> collect_unstable_exports([inner], tab, acc)
+        DImplAxiom(_, inner, _, _, _) -> collect_unstable_exports([inner], tab, acc)
+        DConstructor(inner, _, _) -> collect_unstable_exports([inner], tab, acc)
+        DDerive(_, inner, _, _) -> collect_unstable_exports([inner], tab, acc)
+        _ -> acc
+      }
+      collect_unstable_exports(rest, tab, acc1)
+    }
+  }
+}
+
+# Extract the pub names introduced by the inner Decl of a DUnstable
+# wrapper. Mirrors the `collect_pub_exports` per-variant logic so a
+# `#unstable pub type T = A | B` marks `T`, `A`, and `B` as unstable.
+fn collect_pub_names_for_unstable(d: Decl, tab: SymTab, acc: [String]) : [String] = match d {
+  DFn(true, f, _, _, _, _, _, _, _, _) -> [export_name(tab, fnid_sym(f)), ...acc]
+  DType(true, s, _, body, _, _, _, _) -> match body {
+    TBSum(vs) -> collect_variant_names(vs, tab, [export_name(tab, s), ...acc])
+    _ -> [export_name(tab, s), ...acc]
+  }
+  DEffect(true, s, _, _, _, _, _, _) -> [export_name(tab, s), ...acc]
+  DProtocol(true, s, _, _, _, _, _) -> [export_name(tab, s), ...acc]
+  DAxiom(true, _, name, _, _, _, _, _, _, _) -> [name, ...acc]
+  DUnit(true, name, _, _, _, _, _) -> [name, ...acc]
+  DExternType(true, name, _, _, _, _) -> [name, ...acc]
+  DConst(true, s, _, _, _, _, _) -> [export_name(tab, s), ...acc]
+  DDerive(_, inner, _, _) -> collect_pub_names_for_unstable(inner, tab, acc)
+  _ -> acc
+}
+
+fn collect_variant_names(vs: [Variant], tab: SymTab, acc: [String]) : [String] = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(c, _) -> collect_variant_names(rest, tab, [export_name(tab, c), ...acc])
+  }
+}
+
+#[doc("""
+Walk a freshly-parsed module's decls and stamp every home-carrying
+form with the surface module name, at the boundary between the parsed
+module and the global flat decl stream. The parser only produces None.
+`mod` is the home the file was parsed under: a declaration's id is
+derived from it, so its origin must never name another module.
+""")]
+pub fn tag_decls_module_origin(ds: [Decl], mod: String) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [tag_decl_module_origin(d, mod), ...tag_decls_module_origin(rest, mod)]
+}
+
+fn tag_decl_module_origin(d: Decl, mod: String) : Decl = match d {
+  DFn(p, f, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, f, tps, ps, ret, row, body, l, c, Some(mod))
+  # DAttribPure wraps a DFn (refinement-pure const decls); keep the
+  # outer wrap and tag the inner.
+  # DDerive wraps a Decl too (the wrapped one is normally a DType
+  # but the lower pass synthesises further DFns from it later, after
+  # this point). Tag whatever's inside.
+  DDerive(ps, inner, l, c) -> DDerive(ps, tag_decl_module_origin(inner, mod), l, c)
+  DUnstable(inner, l, c) -> DUnstable(tag_decl_module_origin(inner, mod), l, c)
+  DProtoLaws(thy, inner, l, c, _) ->
+    DProtoLaws(thy, tag_decl_module_origin(inner, mod), l, c, Some(mod))
+  DImplAxiom(thy, inner, l, c, _) ->
+    DImplAxiom(thy, tag_decl_module_origin(inner, mod), l, c, Some(mod))
+  DConstructor(inner, l, c) -> DConstructor(tag_decl_module_origin(inner, mod), l, c)
+  # A `pub axiom` (with or without `[<extern_c>]`) needs the same
+  # module_origin stamp as a regular DFn so the lowered FFI
+  # shim's C symbol becomes `kai_<mod>__<name>` — the symbol that
+  # cross-module call sites resolve through `EModCall`. `lower_axioms`
+  # runs later in the pipeline; without this case the lowered DFn
+  # would carry `module_origin = None` and link as the bare
+  # `kai_<name>`, which the importer cannot find. We lower the axiom
+  # in place here so the produced DFn picks up the same `Some(mod)`
+  # stamp the DFn arm above writes.
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> tag_decl_module_origin(lower_axiom_one(d, mod), mod)
+  # Stamp the const's home module directly on its own
+  # `module_origin` slot — no lowering to a disguised fn. `pub`
+  # enforcement reads the const's home the same way it reads a fn's.
+  DConst(p, s, ty, body, _, l, c) -> DConst(p, s, ty, body, Some(mod), l, c)
+  # DImpl wraps a list of DFn method bodies. Without
+  # tagging the inner methods, `validate_pub_access_decls` would
+  # treat their home module as the root file's basename and flag
+  # every bare-name reference to a non-`pub` helper authored in
+  # the same core (e.g. `show_char_ascii_table` inside
+  # `impl Show for Char`). Recurse so each method's `mo` matches
+  # the enclosing core.
+  DImpl(name, proto_args, target, sub_decls, l, c, tps, isym) ->
+    DImpl(name, proto_args, target,
+          tag_decls_module_origin(sub_decls, mod), l, c, tps, isym)
+  # Tag `DType` with its module_origin too. Without this, the typer
+  # cannot tell whether a `type Pair = ...` came from
+  # `core/tuple.kai` or the user's root file, and same-name records
+  # collapse into a single (last-loaded-wins) entry — breaking
+  # shadowing in either direction. The typer's record / sum / union
+  # tables read `module_origin` to disambiguate.
+  DType(p, s, tps, body, l, c, _, slots) ->
+    DType(p, s, tps, body, l, c, Some(mod), slots)
+  # An effect is a module-qualified symbol like a type: tag its home
+  # so two same-name effects from different modules stay distinct and
+  # a local effect shadows a same-name stdlib one in its own scope.
+  DEffect(p, s, tps, ops, defblk, l, c, _) ->
+    DEffect(p, s, tps, ops, defblk, l, c, Some(mod))
+  # A protocol is a module-qualified name the same way: its home keys
+  # the registry so two same-name protocols stay distinct and each
+  # impl validates against the one its own module declares.
+  DProtocol(p, s, tps, ops, l, c, _) ->
+    DProtocol(p, s, tps, ops, l, c, Some(mod))
+  DTest(desc, body, l, c, _) -> DTest(desc, body, l, c, Some(mod))
+  DBench(desc, body, l, c, _) -> DBench(desc, body, l, c, Some(mod))
+  DCheck(desc, ps, body, l, c, _) -> DCheck(desc, ps, body, l, c, Some(mod))
+  DUnit(p, n, body, intro, l, c, _) -> DUnit(p, n, body, intro, l, c, Some(mod))
+  DExternType(pb, n, body, l, c, _) -> DExternType(pb, n, body, l, c, Some(mod))
+  DTheory(n, props, l, c, _) -> DTheory(n, props, l, c, Some(mod))
+  DKind(p, n, thy, over, hab, l, c, _) -> DKind(p, n, thy, over, hab, l, c, Some(mod))
+  # `use kind` is file scope: the open belongs to the module that wrote it.
+  DUseKind(k, l, c, _) -> DUseKind(k, l, c, Some(mod))
+  _ -> d
+}
+
+#[doc("""
+Tag the target file's DFns with the target's basename — the same way
+`tag_decls_module_origin` tags every DFn in a core — so the whole file
+is one module with one translation unit. Two carve-outs:
+
+1. The entry point stays untagged even when `pub`: it is defined in
+   the root unit, beside the startup that calls it. A `main` the
+   binary does not start is tagged even when private: its bare symbol
+   is the one the OS starts.
+
+2. DFns that ALREADY carry a `module_origin = Some(_)` stay
+   untouched. Those came from `expand_imports` (an `import foo`
+   brings in `foo.kai`'s decls already tagged with `Some("foo")`),
+   so re-tagging would rename `kai_foo__bar` to `kai_<target>__bar`
+   and break the qualified call from the user's `foo.bar()` site,
+   which still emits `kai_foo__bar` from `EModCall("foo", "bar")`.
+""")]
+pub fn tag_target_decls_module_origin(ds: [Decl], mod: String, entry: SymId) : [Decl] =
+  map(ds, (d) => tag_target_decl(d, mod, entry))
+
+#[doc("The decls of a root that is a core module's own file, tagged as `load_core_file` tags a core's: every kind that carries a home, the entry point and the test blocks aside: the root unit runs its own blocks. A core module imports nothing, so no decl arrives already tagged.")]
+pub fn tag_core_root_decls(ds: [Decl], mod: String, entry: SymId) : [Decl] =
+  map(ds, (d) => match d {
+    DFn(_, f, _, _, _, _, _, _, _, _) -> if is_entry(entry, f) { d } else { tag_decl_module_origin(d, mod) }
+    DTest(_, _, _, _, _)              -> d
+    DBench(_, _, _, _, _)             -> d
+    DCheck(_, _, _, _, _, _)          -> d
+    _                                 -> tag_decl_module_origin(d, mod)
+  })
+
+# `entry` is what the binary starts.
+fn tag_target_decl(d: Decl, mod: String, entry: SymId) : Decl = match d {
+  DFn(_, f, _, _, _, _, _, _, _, mo) ->
+    match mo {
+      Some(_) -> d
+      None    -> if is_entry(entry, f) { d } else { tag_decl_module_origin(d, mod) }
+    }
+  DDerive(ps, inner, l, c) -> DDerive(ps, tag_target_decl(inner, mod, entry), l, c)
+  DUnstable(inner, l, c) -> DUnstable(tag_target_decl(inner, mod, entry), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, tag_target_decl(inner, mod, entry), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, tag_target_decl(inner, mod, entry), l, c, mo)
+  DConstructor(inner, l, c) -> DConstructor(tag_target_decl(inner, mod, entry), l, c)
+  # Only `pub` axioms get the module stamp: a non-pub axiom (an in-file FFI
+  # helper) keeps the bare `kai_<name>` symbol, so its call site within the
+  # module does not synthesise a `kai_<mod>__<name>` form.
+  DAxiom(p, _, _, _, _, _, _, _, _, _) ->
+    if p { tag_decl_module_origin(d, mod) } else { d }
+  # The root file's own DTypes need a module_origin too so the
+  # typer's per-module record / sum / union resolution treats
+  # root-file definitions as belonging to a named scope (the file's
+  # basename), not the unscoped "global". Without this, a user
+  # `type Pair = ...` ends up with `module_origin = None` and the
+  # disambiguation falls back to "newest wins" — exactly the legacy
+  # bug. We tag every root-file DType (pub or not), since `pub`
+  # gates cross-module export, not whether the type has an identity
+  # of its own.
+  DType(p, s, tps, body, l, c, mo, slots) ->
+    match mo {
+      Some(_) -> d
+      None    -> DType(p, s, tps, body, l, c, Some(mod), slots)
+    }
+  _ -> d
+}

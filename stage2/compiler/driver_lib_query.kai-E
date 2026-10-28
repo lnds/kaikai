@@ -1,0 +1,470 @@
+#[doc("""
+Library-mode probes: reading a probe's position and answering it against
+the typed module.
+""")]
+
+import compiler.infer_handle_walk
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.util
+import compiler.chars
+import compiler.ast
+import compiler.symtab
+import compiler.modules_paths
+import compiler.infer_holes_json
+import compiler.driver_enclosing
+import compiler.driver_def
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.infer_state
+import compiler.infer_env_exhaust
+import compiler.diag_type_text
+import compiler.doc_attr
+import compiler.driver_exports
+import compiler.real_lit
+import compiler.written
+import compiler.builtins
+
+#[doc("A single probe parsed out of the source.")]
+pub(pkg) type LibProbe = LbP(String, Int, Int)   # kind, line, col
+
+# Tiny non-negative integer parser. Consumes leading digits only;
+# stops at the first non-digit. Returns Some(Int) when at least one
+# digit was consumed, None otherwise. Used by probe-comment parsing.
+fn lib_parse_uint_loop(s: String, i: Int, n: Int, acc: Int, any: Bool) : Option[Int] {
+  if i >= n {
+    if any { Some(acc) } else { None }
+  } else {
+    match char_at(s, i) {
+      None    -> if any { Some(acc) } else { None }
+      Some(c) -> if ch_is_digit(c) {
+                   lib_parse_uint_loop(s, i + 1, n, acc * 10 + (char_to_int(c) - char_to_int('0')), true)
+                 } else if any { Some(acc) } else { None }
+    }
+  }
+}
+
+fn lib_parse_uint(s: String) : Option[Int] =
+  lib_parse_uint_loop(s, 0, string_length(s), 0, false)
+
+#[doc("""
+Parse "<line>:<col>" → Some((line, col)).
+""")]
+pub(pkg) type LineColPair = LC(Int, Int)
+
+#[doc("Parse a `line:col` pair.")]
+pub(pkg) fn lib_parse_linecol(s: String) : Option[LineColPair] {
+  let n = string_length(s)
+  let colon = lib_find_char(s, 0, n, ':')
+  if colon < 0 { None }
+  else {
+    let l_str = string_slice(s, 0, colon)
+    let c_str = string_slice(s, colon + 1, n - (colon + 1))
+    match lib_parse_uint(l_str) {
+      None    -> None
+      Some(l) -> match lib_parse_uint(c_str) {
+                   None    -> None
+                   Some(c) -> Some(LC(l, c))
+                 }
+    }
+  }
+}
+
+#[doc("The index of the first `want` in `s` from `i` up to `n`, or -1.")]
+pub(pkg) fn lib_find_char(s: String, i: Int, n: Int, want: Char) : Int {
+  if i >= n { 0 - 1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == want { i } else { lib_find_char(s, i + 1, n, want) }
+      None    -> 0 - 1
+    }
+  }
+}
+
+#[doc("""
+Skip ASCII spaces / tabs starting at i; return the first non-space
+offset (or n if EOL).
+""")]
+pub(pkg) fn lib_skip_ws(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ' ' or c == '\t' { lib_skip_ws(s, i + 1, n) } else { i }
+      None    -> i
+    }
+  }
+}
+
+#[doc("Scan to the next ASCII whitespace boundary (space, tab, newline, EOL).")]
+pub(pkg) fn lib_scan_token_end(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ' ' or c == '\t' or c == '\n' or c == '\r' { i }
+                 else { lib_scan_token_end(s, i + 1, n) }
+      None    -> i
+    }
+  }
+}
+
+#[doc("Scan to the next newline; return its offset (or n if no newline).")]
+pub(pkg) fn lib_scan_to_eol(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '\n' { i } else { lib_scan_to_eol(s, i + 1, n) }
+      None    -> i
+    }
+  }
+}
+
+#[doc("""
+Match a literal substring at offset i. Returns true when the next
+`|sub|` chars equal `sub`.
+""")]
+pub(pkg) fn lib_match_at(s: String, i: Int, sub: String) : Bool {
+  let m = string_length(sub)
+  let n = string_length(s)
+  if i + m > n { false }
+  else { string_slice(s, i, m) == sub }
+}
+
+# ---------------- JSON serialization ----------------
+
+fn lib_json_pos(line: Int, col: Int) : String =
+  concat_all([
+    "\"line\": ", int_to_string(line),
+    ", \"col\": ", int_to_string(col)
+  ])
+
+fn lib_json_enc(opt: Option[EncResult]) : String {
+  match opt {
+    None -> "{\"node_kind\": null}"
+    Some(ER(kn, l, c, _)) ->
+      concat_all([
+        "{\"node_kind\": ", json_str(kn),
+        ", \"node_line\": ", int_to_string(l),
+        ", \"node_col\": ", int_to_string(c),
+        "}"
+      ])
+  }
+}
+
+fn lib_json_type(tab: SymTab, opt: Option[Ty]) : String {
+  match opt {
+    None    -> "null"
+    Some(t) -> json_str(inf_ty_to_string(tab, t))
+  }
+}
+
+fn lib_run_probe(tm: TypedModule, tab: SymTab, raw_decls: [Decl], p: LibProbe) : String {
+  match p {
+    LbP(kind, line, col) -> {
+      let head = concat_all([
+        "{\"kind\": ", json_str(kind),
+        ", ", lib_json_pos(line, col)
+      ])
+      if kind == "type" {
+        let enc = enclosing_node(tm, line, col)
+        let ty = type_at(tm, line, col)
+        concat_all([head,
+          ", \"enclosing\": ", lib_json_enc(enc),
+          ", \"type\": ", lib_json_type(tab, ty),
+          "}"])
+      } else if kind == "enc" {
+        let enc = enclosing_node(tm, line, col)
+        concat_all([head,
+          ", \"enclosing\": ", lib_json_enc(enc),
+          "}"])
+      } else if kind == "def" {
+        let hit = def_hit_at(tm.tm_decls, tab, line, col)
+        let nm_field = match hit { None -> json_null()  Some(DH(s, _)) -> json_str(s) }
+        let dl = match hit { None -> None  Some(DH(_, loc)) -> loc }
+        concat_all([head,
+          ", \"identifier\": ", nm_field,
+          ", \"def\": ", lib_json_def(tm.tm_file, dl),
+          "}"])
+      } else if kind == "complete" {
+        # LSP completion. Enumerate every callable name in scope at
+        # the cursor: top-level decls in the root file plus core /
+        # stdlib decls (origin != None). Local bindings are out of
+        # scope — covering 90% of editor autocomplete cases.
+        #
+        # Each entry: {name, kind, signature}. The shim layer adds
+        # LSP CompletionItem fields (kind code, sortText, ...).
+        let comps = lib_collect_completions(tm.tm_decls, tab)
+        concat_all([head,
+          ", \"completions\": [", join_with(comps, ", "), "]",
+          "}"])
+      } else if kind == "sig" {
+        # LSP signatureHelp. Walk to the innermost ECall whose
+        # argument list contains the cursor; emit the callee's
+        # type so the editor can render the parameter hints. Falls
+        # back to `null` when the cursor isn't inside any call.
+        let sig = lib_signature_at(tm, tab, line, col)
+        concat_all([head,
+          ", \"signature\": ", sig,
+          "}"])
+      } else if kind == "symbols" {
+        # LSP documentSymbol support. Lists every top-level decl
+        # authored in the root file (module_origin =
+        # None). Line/col on the probe are ignored — symbols is a
+        # whole-file query, not positional.
+        #
+        # We walk the pre-elaboration `raw_decls` (parser shape) so
+        # DType / DConst survive — the typer drops DType and reshapes
+        # DConst into DAttribPure(DFn), neither of which carries the
+        # parser-visible identity.
+        let syms = lib_collect_symbols(raw_decls, tab, module_name_of_path(tm.tm_file))
+        concat_all([head,
+          ", \"symbols\": [", join_with(syms, ", "), "]",
+          "}"])
+      } else {
+        # Unknown kind — surface the input so fixture authors can
+        # spot the typo without having to grep the source.
+        concat_all([head,
+          ", \"error\": \"unknown probe kind\"",
+          "}"])
+      }
+    }
+  }
+}
+
+#[doc("The JSON answer to each probe, in order.")]
+pub(pkg) fn lib_run_probes(tm: TypedModule, tab: SymTab, raw_decls: [Decl], ps: [LibProbe]) : [String] =
+  map(ps, (p) => lib_run_probe(tm, tab, raw_decls, p))
+
+# ----- signature help -----
+#
+# Walk the typed module looking for the innermost ECall — the one starting
+# last at or before the cursor. Emit the callee's inferred type so
+# the shim can render the parameter hints. Returns the JSON literal
+# "null" when no enclosing call is found.
+fn lib_signature_at(tm: TypedModule, tab: SymTab, line: Int, col: Int) : String =
+  match find_enc_call(tm.tm_decls, line, col, None) {
+    None -> "null"
+    Some(EC(callee, d, _, _)) ->
+      concat_all([
+        "{\"name\": ", json_str(call_name_of(callee, tab, d)),
+        ", \"type\": ", lib_json_type(tab, callee.ty),
+        "}"
+      ])
+  }
+
+#[doc("""
+documentSymbol. Walk the raw decls and emit a JSON entry per
+top-level decl authored in the root file — the editor only wants
+the user's own declarations in the outline panel. Root membership
+follows the origin stamps where the decl kind carries one; kinds
+without an origin slot (DUnit, DTest, DBench) attribute to the
+walk's running anchor, mirroring partition_by_homes_walk: they
+live in the same physical file as the surrounding stamped decls.
+""")]
+fn lib_collect_symbols(ds: [Decl], tab: SymTab, root_mod: String) : [String] =
+  list_reverse(lib_collect_symbols_loop(ds, tab, root_mod, false, []))
+
+fn lib_collect_symbols_loop(ds: [Decl], tab: SymTab, root_mod: String, in_root: Bool,
+                            acc: [String]) : [String] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> {
+      let root1 = lib_symbol_in_root(d, root_mod, in_root)
+      match lib_decl_to_symbol(d, tab, root1) {
+        None    -> lib_collect_symbols_loop(rest, tab, root_mod, root1, acc)
+        Some(s) -> lib_collect_symbols_loop(rest, tab, root_mod, root1, [s, ...acc])
+      }
+    }
+  }
+}
+
+# The root file's own pub DFns and DTypes carry `Some(<root basename>)`
+# (tag_target_decl), so root membership is canon_mo-style: untagged or
+# tagged with the root's own name.
+fn lib_origin_is_root(mo: Option[String], root_mod: String) : Bool =
+  match mo { None -> true  Some(m) -> m == root_mod }
+
+fn lib_symbol_in_root(d: Decl, root_mod: String, in_root: Bool) : Bool {
+  match d {
+    DFn(_, _, _, _, _, _, _, _, _, mo)      -> lib_origin_is_root(mo, root_mod)
+    DEffect(_, _, _, _, _, _, _, mo)        -> lib_origin_is_root(mo, root_mod)
+    DProtocol(_, _, _, _, _, _, mo)         -> lib_origin_is_root(mo, root_mod)
+    DConst(_, _, _, _, mo, _, _)            -> lib_origin_is_root(mo, root_mod)
+    DType(_, _, _, _, _, _, mo, _)          ->
+      match mo { Some(m) -> m == root_mod  None -> in_root }
+    DDerive(_, inner, _, _)              -> lib_symbol_in_root(inner, root_mod, in_root)
+    DUnstable(inner, _, _)               -> lib_symbol_in_root(inner, root_mod, in_root)
+    DProtoLaws(_, inner, _, _, _)           -> lib_symbol_in_root(inner, root_mod, in_root)
+    DImplAxiom(_, inner, _, _, _)           -> lib_symbol_in_root(inner, root_mod, in_root)
+    DConstructor(inner, _, _)            -> lib_symbol_in_root(inner, root_mod, in_root)
+    _ -> in_root
+  }
+}
+
+fn lib_decl_to_symbol(d: Decl, tab: SymTab, in_root: Bool) : Option[String] {
+  if not in_root { None }
+  else { match d {
+    DFn(_, f, _, _, _, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Function", export_name(tab, fnid_sym(f)), line, col)) } else { None }
+    DConst(_, s, _, _, _, line, col) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Constant", export_name(tab, s), line, col)) } else { None }
+    DType(_, s, _, _, line, col, _, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Class", export_name(tab, s), line, col)) } else { None }
+    DEffect(_, s, _, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Interface", export_name(tab, s), line, col)) } else { None }
+    DProtocol(_, s, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Interface", export_name(tab, s), line, col)) } else { None }
+    DUnit(_, n, _, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Variable", n, line, col)) } else { None }
+    DTest(name, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Method", name, line, col)) } else { None }
+    DBench(name, _, line, col, _) ->
+      if is_user_pos(line, col) { Some(lib_symbol_json("Method", name, line, col)) } else { None }
+    DDerive(_, inner, _, _) -> lib_decl_to_symbol(inner, tab, in_root)
+    DUnstable(inner, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    DProtoLaws(_, inner, _, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    DImplAxiom(_, inner, _, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    DConstructor(inner, _, _)  -> lib_decl_to_symbol(inner, tab, in_root)
+    _ -> None
+  } }
+}
+
+# Compiler-injected decls (builtin effects, root core, anonymous
+# axioms) carry line/col = 0 to mark their non-source origin. A
+# decl with a real source position has line ≥ 1.
+fn is_user_pos(line: Int, col: Int) : Bool = line >= 1
+
+# The "kind" string maps to LSP SymbolKind names. The LSP wire
+# protocol uses integer codes, but the LSP shim layer decodes the
+# string to the right code so the kaic2 surface stays human-readable.
+fn lib_symbol_json(kind: String, name: String, line: Int, col: Int) : String =
+  concat_all([
+    "{\"kind\": ", json_str(kind),
+    ", \"name\": ", json_str(name),
+    ", \"line\": ", int_to_string(line),
+    ", \"col\": ", int_to_string(col),
+    "}"
+  ])
+
+#[doc("""
+----- completion -----
+
+Enumerate every top-level decl visible from the cursor: user decls
+(origin = None) followed by core / stdlib decls (origin != None).
+Each entry carries the decl kind so the LSP shim can map it to the
+right LSP CompletionItemKind, plus a render-friendly "detail" string
+the editor shows next to the candidate.
+""")]
+fn lib_collect_completions(ds: [Decl], tab: SymTab) : [String] = {
+  let user_and_stdlib = list_reverse(lib_collect_completions_loop(ds, tab, []))
+  let core = lib_collect_core_completions(tab)
+  list_append(user_and_stdlib, core)
+}
+
+# Builtins injected by `add_core_sigs` do NOT live as DFn in the
+# typed-module decl list — they're TyEntry rows added directly to the
+# initial type env. We synthesise CompletionItem-shaped JSON for them
+# from the same env shape, so editors see `print`, `int_to_string`,
+# `read_line`, etc. alongside the user-authored and stdlib decls.
+fn lib_collect_core_completions(tab: SymTab) : [String] = {
+  let env = add_core_sigs(ty_env_empty())
+  core_entries_to_completions(env.entries, tab, [])
+}
+
+fn core_entries_to_completions(entries: [TyEntry], tab: SymTab, acc: [String]) : [String] {
+  match entries {
+    []           -> list_reverse(acc)
+    [e, ...rest] -> {
+      let ty_str = match e.scheme {
+        Scheme(_, _, _, _, t) -> inf_ty_to_string(tab, t)
+      }
+      let item = lib_completion_json("Function", env_key_text(tab, e.key), ty_str)
+      core_entries_to_completions(rest, tab, [item, ...acc])
+    }
+  }
+}
+
+fn lib_collect_completions_loop(ds: [Decl], tab: SymTab, acc: [String]) : [String] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> match lib_decl_to_completion(d, tab) {
+      None    -> lib_collect_completions_loop(rest, tab, acc)
+      Some(s) -> lib_collect_completions_loop(rest, tab, [s, ...acc])
+    }
+  }
+}
+
+fn lib_decl_to_completion(d: Decl, tab: SymTab) : Option[String] {
+  match d {
+    DFn(_, f, tps, params, ret, eff, _, _, _, _) ->
+      Some(lib_completion_json("Function", export_name(tab, fnid_sym(f)), doc_sig(params, ret, eff, tab, tps)))
+    DConst(_, s, ty, _, _, _, _) ->
+      Some(lib_completion_json("Constant", export_name(tab, s), doc_te(ty, tab, [])))
+    DType(_, s, _, _, _, _, _, _) ->
+      Some(lib_completion_json("Class", export_name(tab, s), ""))
+    DEffect(_, s, _, _, _, _, _, _) ->
+      Some(lib_completion_json("Interface", export_name(tab, s), ""))
+    DProtocol(_, s, _, _, _, _, _) ->
+      Some(lib_completion_json("Interface", export_name(tab, s), ""))
+    DUnit(_, n, _, _, _, _, _) ->
+      Some(lib_completion_json("Variable", n, ""))
+    DAxiom(_, _, _, n, tps, params, ret, eff, _, _) ->
+      Some(lib_completion_json("Function", n, doc_sig(params, Some(ret), eff, tab, tps)))
+    DDerive(_, inner, _, _)  -> lib_decl_to_completion(inner, tab)
+    DUnstable(inner, _, _)   -> lib_decl_to_completion(inner, tab)
+    DProtoLaws(_, inner, _, _, _)   -> lib_decl_to_completion(inner, tab)
+    DImplAxiom(_, inner, _, _, _)   -> lib_decl_to_completion(inner, tab)
+    DConstructor(inner, _, _)   -> lib_decl_to_completion(inner, tab)
+    _ -> None
+  }
+}
+
+fn lib_completion_json(kind: String, name: String, detail: String) : String =
+  concat_all([
+    "{\"kind\": ", json_str(kind),
+    ", \"name\": ", json_str(name),
+    ", \"detail\": ", json_str(detail),
+    "}"
+  ])
+
+# Parse all `# @probe <kind> <line>:<col>` markers out of `src`.
+# A marker may sit anywhere on a comment line; everything after the
+# `<line>:<col>` token on the same line is ignored. Comment syntax
+# follows the lexer (`#` to end of line).
+pub(pkg) fn lib_collect_probes(src: String) : [LibProbe] =
+  lib_collect_probes_loop(src, 0, string_length(src), [])
+
+fn lib_collect_probes_loop(src: String, i: Int, n: Int, acc: [LibProbe]) : [LibProbe] {
+  if i >= n { list_reverse(acc) }
+  else {
+    # Find the next '#' (start of a comment).
+    let h = lib_find_char(src, i, n, '#')
+    if h < 0 { list_reverse(acc) }
+    else {
+      let eol = lib_scan_to_eol(src, h, n)
+      # Inspect the comment body.
+      let after_hash = lib_skip_ws(src, h + 1, eol)
+      if lib_match_at(src, after_hash, "@probe") {
+        let after_kw = after_hash + 6
+        let k_start = lib_skip_ws(src, after_kw, eol)
+        let k_end = lib_scan_token_end(src, k_start, eol)
+        if k_end == k_start { lib_collect_probes_loop(src, eol, n, acc) }
+        else {
+          let kind = string_slice(src, k_start, k_end - k_start)
+          let p_start = lib_skip_ws(src, k_end, eol)
+          let p_end = lib_scan_token_end(src, p_start, eol)
+          if p_end == p_start { lib_collect_probes_loop(src, eol, n, acc) }
+          else {
+            let pos_str = string_slice(src, p_start, p_end - p_start)
+            match lib_parse_linecol(pos_str) {
+              None        -> lib_collect_probes_loop(src, eol, n, acc)
+              Some(LC(l, c)) -> lib_collect_probes_loop(src, eol, n, [LbP(kind, l, c), ...acc])
+            }
+          }
+        }
+      } else {
+        lib_collect_probes_loop(src, eol, n, acc)
+      }
+    }
+  }
+}

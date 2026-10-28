@@ -1,0 +1,148 @@
+#[doc("The backends that turn the lowered program into an object, an object set or C text.")]
+
+import compiler.emit_shared_syms
+import compiler.util
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.modules_paths
+import compiler.driver_cli
+import compiler.kir_lin
+import compiler.edition
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.fnreg
+import compiler.kir_inline
+import compiler.kir_tail
+import compiler.kir_dump
+import compiler.emit_native
+import compiler.emit_native_core
+import compiler.kir_lower_fns
+import compiler.driver_modes
+import compiler.driver_front
+import compiler.kir_c_fn
+import compiler.kir_c_modular
+import compiler.kir_c_prog
+import compiler.driver_mono
+
+pub(pkg) fn emit_native(req: Req, cx: PerceusRun) : Int / Console + File + Mutable {
+  let bmode = cx.bmode
+  let core_cache = req.core_cache
+  let core_hit = cx.core_hit
+  let core_mods = req.core_mods
+  let edition = req.edition
+  let emit_tab = cx.emit_tab
+  let entry = cx.entry
+  let kir_verify = req.kir_verify
+  let npre = cx.npre
+  let nsrcs = cx.nsrcs
+  let path = req.path
+  let perceus_decls = cx.perceus_decls
+  let proto_reg = cx.proto_reg
+  let pruned = cx.pruned
+  let raw_arm_binders = cx.raw_arm_binders
+  let region_marks = cx.region_marks
+  let specs = cx.specs
+  let stamp_ids = cx.stamp_ids
+  let target_mod_name = cx.target_mod_name
+  # In-process libLLVM native backend. Lower to
+  # KIR (same preamble as the KIR dumper: the decls
+  # are post-perceus / post-tcrec; only the
+  # symbol/variant tables are rebuilt), build the
+  # module via the C API in memory, and emit a
+  # native object. The output path is `<source>.o`;
+  # the `bin/kai` wrapper (or the test harness)
+  # links it against the effects runtime to the
+  # final executable.
+  let nfns = register_fn_decls(perceus_decls, emit_tab, specs, entry)
+  let nvariants = register_variants(perceus_decls, emit_tab)
+  let ncore_names = core_mod_names(core_mods, [])
+  let kp = kir_lin_hook(ncore_prune_unreachable(kir_tail_program(kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, proto_reg.ids, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true, stamp_ids, entry)), target_mod_name),
+                                   perceus_decls, nfns, bmode, ncore_names), kir_verify)
+  let obj_path = native_object_in(core_cache.nmod_dir, path)
+  # Core-object split: with the shared core cache
+  # available (dir + toolchain id) and a backend tag
+  # that allows it (libLLVM present, not a debug
+  # build), emit user + core as two raw objects and
+  # reuse the content-addressed core object across
+  # builds. Any missing ingredient falls back to the
+  # whole-program single object. One path per line on
+  # stdout; the wrapper links every listed object.
+  # llvm_backend_tag() is called at each use, never
+  # bound to a shared let: the ownership pass
+  # mis-counts a let consumed in this condition and
+  # reused in the branch below, so the record would
+  # capture a freed (empty) tag and every backend-tag
+  # component (triple, opt level, bitcode ids) would
+  # silently drop out of the core-object key.
+  native_single_emit(kp, perceus_decls, nvariants, nfns, bmode, obj_path, path, ncore_names,
+                     if pruned { core_hit } else { None },
+                     NCoreCfg { dir: core_cache.dir, toolchain: core_cache.toolchain,
+                                edition: edition_key_text(edition), tag: llvm_backend_tag(), srcs_hex: nsrcs,
+                                stats: core_cache.stats, pre: npre })
+}
+
+pub(pkg) fn emit_native_modular(req: Req, cx: PerceusRun) : Int / Console + File + Mutable {
+  let bmode = cx.bmode
+  let core_cache = req.core_cache
+  let core_mods = req.core_mods
+  let emit_tab = cx.emit_tab
+  let entry = cx.entry
+  let kir_verify = req.kir_verify
+  let path = req.path
+  let perceus_decls = cx.perceus_decls
+  let proto_reg = cx.proto_reg
+  let raw_arm_binders = cx.raw_arm_binders
+  let region_marks = cx.region_marks
+  let specs = cx.specs
+  let stamp_ids = cx.stamp_ids
+  let target_mod_name = cx.target_mod_name
+  # Native separate compilation: partition the KIR by
+  # `KFn.mo` into N content-addressed objects, reused by
+  # any build that projects the same partition, and print
+  # one object path per line for the wrapper to link.
+  let nfns = register_fn_decls(perceus_decls, emit_tab, specs, entry)
+  let nvariants = register_variants(perceus_decls, emit_tab)
+  let kp = kir_lin_hook(ncore_prune_unreachable(kir_tail_program(kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, proto_reg.ids, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true, stamp_ids, entry)), target_mod_name),
+                                   perceus_decls, nfns, bmode, core_mod_names(core_mods, [])), kir_verify)
+  let obj_dir = if core_cache.nmod_dir == "" { dir_of(path) } else { core_cache.nmod_dir }
+  let objs = build_native_modular(kp, perceus_decls, nvariants, nfns, bmode,
+                                  dir_of(path), Some(obj_dir), path)
+  match objs { [] -> 1 _ -> { print(string_join(objs, "\n")); 0 } }
+}
+
+pub(pkg) fn emit_c(req: Req, cx: PerceusRun) : Int / Console + File + Mutable {
+  let batch_out = req.batch_out
+  let bmode = cx.bmode
+  let emit_tab = cx.emit_tab
+  let entry = cx.entry
+  let kir_inline_on = cx.kir_inline_on
+  let perceus_decls = cx.perceus_decls
+  let proto_reg = cx.proto_reg
+  let raw_arm_binders = cx.raw_arm_binders
+  let region_marks = cx.region_marks
+  let specs = cx.specs
+  let stamp_ids = cx.stamp_ids
+  let target_mod_name = cx.target_mod_name
+  let use_kir = cx.use_kir
+  let out = if use_kir {
+    emit_kir(perceus_decls, emit_tab, specs, region_marks, kir_inline_on, stamp_ids, entry)
+  } else {
+    let nfns = register_fn_decls(perceus_decls, emit_tab, specs, entry)
+    let nvariants = register_variants(perceus_decls, emit_tab)
+    let lowered = lower_to_kir(perceus_decls, emit_tab, specs, proto_reg.ids, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, false, stamp_ids, entry)
+    let kp = ncore_prune_unreachable(kir_tail_program(kir_inline_program(lowered), target_mod_name), perceus_decls, nfns, bmode, [])
+    let ps = KcFnPrinters { def: kc_fn_def, proto: kc_fn_proto, thunk: kc_fn_thunk }
+    if cx.use_modular { kc_modular_stream(kc_program_modular(kp, ps, bmode, perceus_decls, nfns, nvariants), cat2("k748x", int_to_string(string_length(req.src)))) }
+    else { kc_program(kp, ps, bmode, perceus_decls, nfns, nvariants, cx.use_owner) }
+  }
+  match batch_out {
+    Some(op) -> match write_file(op, cat2(out, "\n")) {
+      Ok(_)  -> 0
+      Err(e) -> { eprint("kaic2: cannot write `#{op}`: #{e}"); 1 }
+    }
+    None -> { print(out); 0 }
+  }
+}

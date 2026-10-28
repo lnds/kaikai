@@ -1,0 +1,289 @@
+#[doc("Compile stages that resolve kinds and units, run the declaration checks and expand aliases.")]
+
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.diag
+import compiler.verdicts
+import compiler.kinds
+import compiler.kind_theory
+import compiler.kind_resolve
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.home_dup
+import compiler.extern_fn_types
+import compiler.resolve_names
+import compiler.proto_resolve
+import compiler.driver_cli
+import compiler.block_scope
+import compiler.desugar_refine_pred
+import compiler.desugar_pos_records
+import compiler.refine_coerce
+import compiler.infer_glue
+import compiler.infer_row_kinds
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.infer_unit_validate
+import compiler.infer_name_collisions
+import compiler.protos_check
+import compiler.name_uses
+import compiler.law_checks
+import compiler.effect_alias
+import compiler.driver_policy
+import compiler.driver_front
+import compiler.desugar_alias
+import compiler.driver_scope
+import compiler.core_cut
+import compiler.diag_file
+import compiler.doc_attr
+import compiler.module_table
+import compiler.modules
+import compiler.modules_segments
+import compiler.scope_view
+import compiler.type_scope
+
+pub(pkg) type Kinded = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, own_tab: SymTab, docs: DocStrip,
+  doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, expanded: ExpandedProgram, tab0: SymTab, nsrcs: String, npre: String,
+  core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String], pcut: Option[PreCut],
+  emptied: [SymId], gone: [SymId], surface_decls: [Decl], core_segs: [CoreSegment], surface_fn_bounds: [FnBoundsRec],
+  import_resolve_vd: Verdict, module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables, mod_imps: [ModImports],
+  sel_imports: [SelImport], sym_views: FileViews, alias_res: AliasResolution, ts_coll: [TSEntry], ty_scope_vd: Verdict,
+  eff_scope_vd: Verdict, pat_qual_vd: Verdict, qh_vd: Verdict, qualtype_vd: Verdict, tab1: SymTab, cs_coll: [NEnt], rqc_fx: [RqcFx],
+  vs_coll: [VSEntry], qualified_core: [Decl], missing_exports: [Diagnostic], pa_segs: [CoreSegment], type_name_coll: [Diagnostic],
+  pub_access_vd: Verdict, fn_name_coll: [Diagnostic], effect_name_coll: [Diagnostic], const_name_coll: [Diagnostic],
+  axiom_name_coll: [Diagnostic], kai_decl_vd: Verdict, tab2: SymTab, ref_pred_fns: [SymId], narrow_aliases: [SymId], tab3: SymTab,
+  extern_scope: ExternScope, kind_reg: KindReg, usites: [UnitSite], hab_view: HabView, kind_ctx_a: KindCtx, kind_ctx: KindCtx,
+  kind_theories: [KindTheory], unit_ref_vd: Verdict, hab_decl_vd: Verdict, kind_home_vd: Verdict, shape_ref_vd: Verdict, merged: [Decl] }
+
+pub(pkg) type Aliased = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, own_tab: SymTab, docs: DocStrip,
+  doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, expanded: ExpandedProgram, tab0: SymTab, nsrcs: String, npre: String,
+  core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String], pcut: Option[PreCut],
+  emptied: [SymId], gone: [SymId], surface_decls: [Decl], core_segs: [CoreSegment], surface_fn_bounds: [FnBoundsRec],
+  import_resolve_vd: Verdict, module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables, mod_imps: [ModImports],
+  sel_imports: [SelImport], sym_views: FileViews, ts_coll: [TSEntry], ty_scope_vd: Verdict, eff_scope_vd: Verdict, pat_qual_vd: Verdict,
+  qh_vd: Verdict, qualtype_vd: Verdict, tab1: SymTab, cs_coll: [NEnt], rqc_fx: [RqcFx], vs_coll: [VSEntry], qualified_core: [Decl],
+  missing_exports: [Diagnostic], pa_segs: [CoreSegment], type_name_coll: [Diagnostic], pub_access_vd: Verdict, fn_name_coll: [Diagnostic],
+  effect_name_coll: [Diagnostic], const_name_coll: [Diagnostic], axiom_name_coll: [Diagnostic], kai_decl_vd: Verdict, tab2: SymTab,
+  ref_pred_fns: [SymId], narrow_aliases: [SymId], tab3: SymTab, kind_ctx_a: KindCtx, kind_theories: [KindTheory], unit_ref_vd: Verdict,
+  hab_decl_vd: Verdict, kind_home_vd: Verdict, shape_ref_vd: Verdict, nominal_row_diags: [Diagnostic], union_collision_vd: Verdict,
+  constructor_uniq_vd: Verdict, variant_cap_vd: Verdict, extern_home_vd: Verdict, extern_fn_vd: Verdict, extern_type_diags: [Diagnostic],
+  alias_res: AliasResolution, ta_table: [TAEntry], kind_ctx_b: KindCtx, post_alias_unit_vd: Verdict, pos_recs: [RecInfo],
+  raw_decls_with_regions: [Decl] }
+
+pub(pkg) fn stage_kinds(req: Req, cx: Accessed) : Kinded / Console + File + Mutable {
+  let blocks = cx.blocks
+  let core_mods = req.core_mods
+  let diag_ctx = cx.diag_ctx
+  let expanded = cx.expanded
+  let merged_raw = cx.merged_raw
+  let mod_imps = cx.mod_imps
+  let mode = req.mode
+  let path = req.path
+  let roots = cx.roots
+  let stripped_laws = cx.stripped_laws
+  let sym_views = cx.sym_views
+  let tab1 = cx.tab1
+  let target_mod_name = cx.target_mod_name
+  let test_roots = req.test_roots
+  let ref_synth = synthesize_refine_pred_fns(merged_raw, tab1, target_mod_name)
+  let merged_raw_synth_ref = ref_synth.decls
+  let tab2 = st_extend(tab1, ref_synth.rows)
+  let ref_pred_fns = refine_pred_fn_syms(merged_raw, tab1)
+  # Rewrite `PNarrow(name, T)` where `T` is a
+  # refinement-type alias back into `PBind(name)` +
+  # `__ref_pred_T(name)` guard so match-arm narrowing keeps
+  # working under the unified parser path. Non-alias
+  # `PNarrow` survives for the typer's union-component check.
+  let narrow_aliases = collect_refine_alias_ids(merged_raw_synth_ref)
+  let merged_raw_synth = lower_pattern_narrow_decls(merged_raw_synth_ref, tab2, sym_views, target_mod_name, narrow_aliases)
+  # Lower DAxiom → DFn(body=todo!) before any other Decl
+  # walker runs. Subsequent passes (alias resolution,
+  # builtin injection, desugars, typer) see only ordinary
+  # fns and never need to handle the DAxiom variant.
+  let opaques = lower_extern_opaques(lower_axioms(merged_raw_synth, target_mod_name), target_mod_name)
+  # The record each opaque handle lowered to.
+  let tab3 = st_extend(tab2, opaques.rows)
+  let extern_scope = ExternScope(tab3, sym_views, target_mod_name, roots)
+  let merged_pre_kinds = settle_extern_structs(opaques.decls, extern_scope)
+  # Kind resolution + unit hygiene, done up front so every later
+  # pass sees a stream with habitant symbols already qualified
+  # (`m` -> `Metric$m`) and no `DKind`/`DUseKind` catalog decls.
+  # The rewrite makes the abelian engine isolate habitants
+  # across kinds; the validator then reports every still-bare
+  # `<sym>` that is undeclared or ambiguous. The kind registry
+  # comes from the `DKind` decls kept in the merged stream (they
+  # are stripped here). Runs before alias expansion, so alias
+  # names pass through bare for the later expansion pass.
+  let kind_reg = kind_reg_from_decls(merged_pre_kinds)
+  # Habitant declaration sites with exact per-module homes,
+  # stamped at the declaration boundary. A `unit` name is
+  # module-scoped: resolution prefers a module's own
+  # declaration and separates same-kind homonyms declared by
+  # different modules.
+  let usites = nu_unit_sites(merged_pre_kinds, target_mod_name)
+  let hab_view = hab_view_of(mod_imps,
+                             core_mod_names(core_mods, []), target_mod_name)
+  let kind_ctx_a = resolve_kinds_ctx(merged_pre_kinds, kind_reg, usites, hab_view)
+  let merged_kr = resolve_kinds_decls_in(kind_ctx_a, merged_pre_kinds, usites, target_mod_name)
+  let kind_ctx = build_kind_ctx(merged_kr, tab3, kind_reg, usites, hab_view)
+  # Atomic (kind, theory) pairs, captured before the catalog
+  # decls are stripped; the typer's unit formation and
+  # unify_dim dispatch on the theory of each habitant's kind.
+  let kind_theories = atomic_kind_theories(merged_kr)
+  let unit_ref_vd = vd_render(validate_unit_refs_decls(merged_kr, PScope(tab3, sym_views, target_mod_name), unit_scope(kind_ctx), diag_ctx))
+  # Habitant-declaration rules: closed-set atoms are
+  # engine-known, closed kinds admit no habitant decls, and
+  # measure payloads land only on measure-carrying kinds.
+  let hab_decl_vd = vd_render(validate_habitant_decls(merged_kr, kind_reg, diag_ctx))
+  # A kind names one unification algebra and an introducer is
+  # habitant-declaration syntax; neither has a use site a
+  # qualifier reaches, so the duplicate is rejected here —
+  # before `strip_kind_decls` removes the declarations.
+  let kind_home_vd = vd_render(validate_kind_homes(merged_kr, diag_ctx))
+  # Shape-application formation: arity-1, no composition.
+  let shape_ref_vd = vd_render(validate_shape_refs_decls(merged_kr, diag_ctx))
+  let merged_no_laws = strip_kind_decls(merged_kr)
+  # Autogenerate `Functorial` property-checks for each lawful
+  # Shape-protocol impl of a module whose blocks the build keeps,
+  # injected only when the mode runs checks (`kai check` /
+  # `kai test`): a dependency's impls are its own build's to check.
+  # The witnesses come from the impl type's own constructors; an
+  # `axiom` clause exempts.
+  let law_reg = strip_sl_reg(stripped_laws)
+  let gen_laws =
+    if wants_law_checks(mode) {
+      let kept = match expanded { EP_Mod(_, mods, _, _, _, scopes, _, _, _, _) -> bscope_kept(blocks, scopes, mods, test_roots) }
+      gen_law_checks(merged_no_laws, PScope(tab3, sym_views, target_mod_name), law_reg, path, kept)
+    }
+    else { GL([], []) }
+  let merged = list_append(merged_no_laws, gen_laws_decls(gen_laws))
+  emit_law_check_notes(gen_laws_notes(gen_laws))
+  # A nominal `pub type` whose ctor field uses an effect-row
+  # variable it never declares panics the scheme builder; catch
+  # it here with an unbound-row-var diagnostic.
+  Kinded { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, own_tab: cx.own_tab, docs: cx.docs,
+    doc_errs: cx.doc_errs, doc_decls: cx.doc_decls, import_hole_vd: cx.import_hole_vd, expanded: cx.expanded, tab0: cx.tab0,
+    nsrcs: cx.nsrcs, npre: cx.npre, core_hit: cx.core_hit, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole,
+    surface_decls_whole: cx.surface_decls_whole, lib_mods: cx.lib_mods, pcut: cx.pcut, emptied: cx.emptied, gone: cx.gone,
+    surface_decls: cx.surface_decls, core_segs: cx.core_segs, surface_fn_bounds: cx.surface_fn_bounds,
+    import_resolve_vd: cx.import_resolve_vd, module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs,
+    mod_imps: cx.mod_imps, sel_imports: cx.sel_imports, sym_views: cx.sym_views, alias_res: cx.alias_res, ts_coll: cx.ts_coll,
+    ty_scope_vd: cx.ty_scope_vd, eff_scope_vd: cx.eff_scope_vd, pat_qual_vd: cx.pat_qual_vd, qh_vd: cx.qh_vd, qualtype_vd: cx.qualtype_vd,
+    tab1: cx.tab1, cs_coll: cx.cs_coll, rqc_fx: cx.rqc_fx, vs_coll: cx.vs_coll, qualified_core: cx.qualified_core,
+    missing_exports: cx.missing_exports, pa_segs: cx.pa_segs, type_name_coll: cx.type_name_coll, pub_access_vd: cx.pub_access_vd,
+    fn_name_coll: cx.fn_name_coll, effect_name_coll: cx.effect_name_coll, const_name_coll: cx.const_name_coll,
+    axiom_name_coll: cx.axiom_name_coll, kai_decl_vd: cx.kai_decl_vd, tab2: tab2, ref_pred_fns: ref_pred_fns,
+    narrow_aliases: narrow_aliases, tab3: tab3, extern_scope: extern_scope, kind_reg: kind_reg, usites: usites, hab_view: hab_view,
+    kind_ctx_a: kind_ctx_a, kind_ctx: kind_ctx, kind_theories: kind_theories, unit_ref_vd: unit_ref_vd, hab_decl_vd: hab_decl_vd,
+    kind_home_vd: kind_home_vd, shape_ref_vd: shape_ref_vd, merged: merged }
+}
+
+pub(pkg) fn stage_alias(req: Req, cx: Kinded) : Flow[Aliased] / Console + File + Mutable {
+  let core_mods = req.core_mods
+  let diag_ctx = cx.diag_ctx
+  let extern_scope = cx.extern_scope
+  let hab_view = cx.hab_view
+  let kind_ctx = cx.kind_ctx
+  let kind_reg = cx.kind_reg
+  let merged = cx.merged
+  let path = req.path
+  let ref_pred_fns = cx.ref_pred_fns
+  let sym_views = cx.sym_views
+  let tab3 = cx.tab3
+  let target_mod_name = cx.target_mod_name
+  let unit_ref_vd = cx.unit_ref_vd
+  let usites = cx.usites
+  let nominal_row_diags = validate_nominal_row_vars_decls(merged, diag_ctx)
+  # Collision check on `type T = A | B` declarations. Walks
+  # every TBSum and reports any variant
+  # name claimed implicitly by two different parents (with
+  # neither parent pre-declaring the variant as its own
+  # `type`).
+  let union_collision_vd = vd_render(validate_union_collisions_decls(merged, tab3, diag_ctx))
+  # At most one `#[constructor]` per constructed type. A second
+  # marked fn returning the same type is rejected — arity/type
+  # overloading is out (Tier 1 #3).
+  let constructor_uniq_vd = vd_render(validate_constructor_uniqueness_decls(merged, PScope(tab3, sym_views, target_mod_name), diag_ctx))
+  let variant_cap_vd = vd_render(validate_variant_capacity(merged, tab3, diag_ctx))
+  # An extern type names one C layout, so a second declaration
+  # under the same spelling has no reading that keeps both
+  # correct — the duplicate is the defect, not an ambiguity.
+  let extern_home_vd = vd_render(validate_extern_type_homes(merged, diag_ctx))
+  # One C symbol has one signature. Two modules describing it
+  # alike is the ordinary pattern; two describing it
+  # differently emit contradictory prototypes no backend can
+  # honour, and under separate compilation neither `cc` nor
+  # the linker ever sees the two side by side.
+  let extern_fn_vd = vd_render(validate_extern_fn_homes(merged, tab3, diag_ctx))
+  # An extern signature names C types only: scalars, fixed-width
+  # annotations, and the declared extern structs / opaques.
+  let extern_type_diags = validate_extern_fn_types(merged, extern_scope, diag_ctx)
+  # Closed effect aliases. Resolve every
+  # `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
+  # single-name form) into a flat label set and rewrite every
+  # DFn's RowExpr to substitute alias names. Builtin effect
+  # injection runs *first* so the auto-injected
+  # `type Console = Stdout + Stderr` alias participates in
+  # alias resolution alongside user-declared aliases. Builtin
+  # effect names still participate in the namespace whether or
+  # not the file declared an `effect` for them. Cycles and
+  # non-effect labels in alias bodies are fatal.
+  let injected = inject_builtin_effects(merged)
+  let alias_res = cx.alias_res
+  let raw_decls_post_eff = expand_aliases_in_decls(injected, tab3, alias_res.aliases)
+  # Expand transparent type aliases. `type Foo = T`
+  # (single-component, name not an effect) is structural —
+  # every TyName("Foo", args) rewrites to the alias body with
+  # tparams substituted. Multi-component `type X = A | B`
+  # (TBSum) keeps nominal-union semantics. Refinement-aliases
+  # (`type Pos = Int where p`) expand to their inline
+  # `TyRefine` form at every use site (the synthesised
+  # `__ref_pred_X` fns and the pattern-narrow lowering have
+  # already run). A copy carries the identities the alias's
+  # own module gives its predicate.
+  let raw_decls_settled = settle_alias_refinements(raw_decls_post_eff, tab3, sym_views, target_mod_name)
+  let ta_table = collect_transparent_aliases(raw_decls_settled, tab3,
+                                              alias_res.aliases, target_mod_name,
+                                              core_mod_names(core_mods, []))
+  # Re-run effect-alias expansion after transparent type-alias
+  # expansion. Transparent aliases parameterised by
+  # a row variable (`type Foo[t, e] = ... / e`) may surface
+  # effect-alias labels (e.g. `Console`) that the first pass
+  # did not see, because the substituted name was carried in
+  # the TPSubst as a TypeExpr argument rather than appearing
+  # syntactically in the decl stream.
+  let raw_decls_pre_pos0 =
+    expand_aliases_in_decls(
+      expand_ta_decls(raw_decls_settled, tab3, ta_table,
+                       alias_res.aliases),
+      tab3, alias_res.aliases)
+  # Alias expansion may have inserted bare unit symbols
+  # (`Money[USD]` -> `Decimal<USD>`): re-qualify habitants
+  # against the kind registry and re-validate, so an unknown
+  # or ill-shaped alias argument diagnoses at its use site.
+  # Gated on the first validation being clean to avoid
+  # duplicate diagnostics.
+  let kind_ctx_b = resolve_kinds_ctx(raw_decls_pre_pos0, kind_reg, usites, hab_view)
+  let raw_decls_pre_pos = resolve_kinds_decls_in(kind_ctx_b, raw_decls_pre_pos0, usites, target_mod_name)
+  let post_alias_unit_vd = if vd_failed([unit_ref_vd]) { vd_count(0) } else {
+    vd_render(validate_unit_refs_decls_expanded(raw_decls_pre_pos, PScope(tab3, sym_views, target_mod_name), unit_scope(kind_ctx), diag_ctx))
+  }
+  # Refined parameters are checked on entry, now that every
+  # refinement is the inline `TyRefine` form.
+  let raw_decls_enforced = enforce_refinements_decls(raw_decls_pre_pos, tab3, ref_pred_fns)
+  # Rewrite `T { v1, v2 }` (the parser plants nameless
+  # positional fields) into `T { f1: v1, f2: v2 }`
+  # using the record's declared field order. Runs before any
+  # other pre-typer pass so no downstream walker observes a
+  # nameless field. Reports unknown-record + arity
+  # diagnostics; on errs > 0 we short-circuit before
+  # invariants downstream can panic on the still-tagged AST.
+  let pos_recs = typer_records(raw_decls_enforced, tab3)
+  let pos_rec = desugar_pos_records_with(pos_recs, raw_decls_enforced, tab3, sym_views, target_mod_name, diag_ctx)
+  let raw_decls_with_regions = pos_rec.decls
+  let pos_rec_errs = pos_rec.errs
+  if pos_rec_errs > 0 { Halt(pos_rec_errs) }
+  else { Go(Aliased { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, own_tab: cx.own_tab, docs: cx.docs, doc_errs: cx.doc_errs, doc_decls: cx.doc_decls, import_hole_vd: cx.import_hole_vd, expanded: cx.expanded, tab0: cx.tab0, nsrcs: cx.nsrcs, npre: cx.npre, core_hit: cx.core_hit, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole, surface_decls_whole: cx.surface_decls_whole, lib_mods: cx.lib_mods, pcut: cx.pcut, emptied: cx.emptied, gone: cx.gone, surface_decls: cx.surface_decls, core_segs: cx.core_segs, surface_fn_bounds: cx.surface_fn_bounds, import_resolve_vd: cx.import_resolve_vd, module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs, mod_imps: cx.mod_imps, sel_imports: cx.sel_imports, sym_views: cx.sym_views, ts_coll: cx.ts_coll, ty_scope_vd: cx.ty_scope_vd, eff_scope_vd: cx.eff_scope_vd, pat_qual_vd: cx.pat_qual_vd, qh_vd: cx.qh_vd, qualtype_vd: cx.qualtype_vd, tab1: cx.tab1, cs_coll: cx.cs_coll, rqc_fx: cx.rqc_fx, vs_coll: cx.vs_coll, qualified_core: cx.qualified_core, missing_exports: cx.missing_exports, pa_segs: cx.pa_segs, type_name_coll: cx.type_name_coll, pub_access_vd: cx.pub_access_vd, fn_name_coll: cx.fn_name_coll, effect_name_coll: cx.effect_name_coll, const_name_coll: cx.const_name_coll, axiom_name_coll: cx.axiom_name_coll, kai_decl_vd: cx.kai_decl_vd, tab2: cx.tab2, ref_pred_fns: cx.ref_pred_fns, narrow_aliases: cx.narrow_aliases, tab3: cx.tab3, kind_ctx_a: cx.kind_ctx_a, kind_theories: cx.kind_theories, unit_ref_vd: cx.unit_ref_vd, hab_decl_vd: cx.hab_decl_vd, kind_home_vd: cx.kind_home_vd, shape_ref_vd: cx.shape_ref_vd, nominal_row_diags: nominal_row_diags, union_collision_vd: union_collision_vd, constructor_uniq_vd: constructor_uniq_vd, variant_cap_vd: variant_cap_vd, extern_home_vd: extern_home_vd, extern_fn_vd: extern_fn_vd, extern_type_diags: extern_type_diags, alias_res: alias_res, ta_table: ta_table, kind_ctx_b: kind_ctx_b, post_alias_unit_vd: post_alias_unit_vd, pos_recs: pos_recs, raw_decls_with_regions: raw_decls_with_regions }) }
+}
+

@@ -1,0 +1,446 @@
+#[doc("""
+Go-to-definition: the reference at a source position, the binders in
+scope there, and the declaration it names.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.written
+import compiler.symtab
+import compiler.local_names
+import compiler.expr_positions
+import compiler.infer_holes_json
+import compiler.driver_enclosing
+
+#[doc("""
+The `def` probe resolves the reference at a position to where what it
+names is declared: a top-level fn / type / const / effect / protocol,
+or a local binder (`let`, `var`, a parameter of a function, lambda or
+handler clause, a pattern binder, a handler's `return` binder).
+
+The resolver has already decided what every reference names, so the
+probe reads the id the node carries: the innermost reference at the
+position, then the binder or the declaration with that id.
+""")]
+pub type DefLoc = DL(String, String, Int, Int)   # decl_kind, name, line, col
+type ScopeBind = SB(String, Binder, Int, Int) # kind ("Param"|"PatBind"|"VarMut"|"HReturn"), binder, line, col
+
+# The reference a position lands on: a local, a declaration, an effect
+# operation, or a name the resolver left unsettled.
+type RefAt = RaLocal(LocalId) | RaDecl(SymId) | RaOp(OpRef) | RaName(Written)
+
+# A reference and the declaration whose body holds it. Binder ids are
+# numbered per declaration, so a local read is settled against that one.
+type DefRead = DRead(Decl, RefAt)
+
+#[doc("How the reference reads, and where what it names is declared.")]
+pub type DefHit = DH(String, Option[DefLoc])
+
+#[doc("What the reference at the position names, when a declaration holds one there.")]
+pub fn def_hit_at(ds: [Decl], tab: SymTab, ql: Int, qc: Int) : Option[DefHit] =
+  match def_read_decls(ds, ql, qc, None) {
+    None              -> None
+    Some(DRead(d, r)) -> Some(def_hit(d, ds, tab, r))
+  }
+
+# The last declaration holding a reference at or before the position decides.
+fn def_read_decls(ds: [Decl], ql: Int, qc: Int, acc: Option[DefRead]) : Option[DefRead] = match ds {
+  []           -> acc
+  [d, ...rest] -> def_read_decls(rest, ql, qc, def_read_decl(d, ql, qc, acc))
+}
+
+fn def_read_decl(d: Decl, ql: Int, qc: Int, acc: Option[DefRead]) : Option[DefRead] = match d {
+  DImpl(_, _, _, subs, _, _, _, _) -> def_read_decls(subs, ql, qc, acc)
+  DDerive(_, inner, _, _)       -> def_read_decl(inner, ql, qc, acc)
+  DUnstable(inner, _, _)        -> def_read_decl(inner, ql, qc, acc)
+  DProtoLaws(_, inner, _, _, _) -> def_read_decl(inner, ql, qc, acc)
+  DImplAxiom(_, inner, _, _, _) -> def_read_decl(inner, ql, qc, acc)
+  DConstructor(inner, _, _)     -> def_read_decl(inner, ql, qc, acc)
+  _ -> match find_var_at_decl(d, ql, qc, None) {
+    None    -> acc
+    Some(r) -> Some(DRead(d, r))
+  }
+}
+
+fn def_hit(d: Decl, all: [Decl], tab: SymTab, r: RefAt) : DefHit = match r {
+  RaLocal(l) -> DH(written_text(ln_text(ln_of_decl(d), l)), binder_def(decl_binders(d), l))
+  RaDecl(s)  -> DH(written_text(decl_name(tab, s)), find_decl_def(all, tab, s))
+  RaOp(o)    -> DH(op_ref_text(tab, ln_of_decl(d), o), None)
+  RaName(w)  -> DH(written_text(w), None)
+}
+
+# An operation as its perform reads: `Eff.op`, with the alias or the
+# capability it goes through.
+fn op_ref_text(tab: SymTab, ns: LocalNames, o: OpRef) : String = {
+  let base = concat_all([written_text(decl_name(tab, o.eff)), ".", written_text(o.op)])
+  match o.via {
+    ViaAmbient  -> base
+    ViaNamed    -> base
+    ViaAlias(a) -> concat_all([base, "@", written_text(ln_text(ns, a))])
+    ViaRecv(x)  -> concat_all([base, "#", written_text(ln_text(ns, x))])
+  }
+}
+
+fn binder_def(bs: [ScopeBind], l: LocalId) : Option[DefLoc] = match bs {
+  [] -> None
+  [SB(k, b, line, col), ...rest] ->
+    if local_eq(b.id, l) { Some(DL(k, written_text(b.name), line, col)) } else { binder_def(rest, l) }
+}
+
+# ---------------- binders of a declaration ----------------
+#
+# Every binder a declaration's parameters and body declare, each with
+# the position the probe reports. Rest-list binders, narrow binds and
+# `as` aliases carry no position of their own and take their pattern's.
+
+fn decl_binders(d: Decl) : [ScopeBind] = match d {
+  DFn(_, _, _, params, _, _, body, _, _, _) -> expr_binders(body, push_params(params, []))
+  DCheck(_, params, body, _, _, _)          -> expr_binders(body, push_params(params, []))
+  DConst(_, _, _, body, _, _, _)            -> expr_binders(body, [])
+  DTest(_, body, _, _, _)                   -> expr_binders(body, [])
+  DBench(_, body, _, _, _)                  -> expr_binders(body, [])
+  _                                         -> []
+}
+
+# A node's own binders first, then every sub-expression's.
+fn expr_binders(e: Expr, acc: [ScopeBind]) : [ScopeBind] =
+  positions_binders(xp_positions(e), own_binders(e.kind, acc))
+
+fn positions_binders(ps: [XPos], acc: [ScopeBind]) : [ScopeBind] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> positions_binders(rest, expr_binders(c, acc))
+}
+
+fn own_binders(k: ExprKind, acc: [ScopeBind]) : [ScopeBind] = match k {
+  ELambda(ps, _)                   -> push_params(ps, acc)
+  EMatch(_, arms)                  -> arms_binders(arms, acc)
+  EBlock(ss, _)                    -> stmts_binders(ss, acc)
+  EHandle(_, _, _, _, _, cls, ret) -> hret_binder(ret, clauses_binders(cls, acc))
+  _                                -> acc
+}
+
+fn arms_binders(arms: [Arm], acc: [ScopeBind]) : [ScopeBind] = match arms {
+  []                      -> acc
+  [Arm(p, _, _), ...rest] -> arms_binders(rest, pat_binds(p, acc))
+}
+
+fn stmts_binders(ss: [Stmt], acc: [ScopeBind]) : [ScopeBind] = match ss {
+  []           -> acc
+  [s, ...rest] -> stmts_binders(rest, match s {
+    SLet(p, _, _)             -> pat_binds(p, acc)
+    SVar(b, _, _, line, col)  -> [SB("VarMut", b, line, col), ...acc]
+    _                         -> acc
+  })
+}
+
+fn clauses_binders(cls: [HClause], acc: [ScopeBind]) : [ScopeBind] = match cls {
+  []                            -> acc
+  [HC(_, ps, _, _, _), ...rest] -> clauses_binders(rest, push_params(ps, acc))
+}
+
+fn hret_binder(ret: Option[HReturn], acc: [ScopeBind]) : [ScopeBind] = match ret {
+  Some(HR(b, _, line, col)) -> [SB("HReturn", b, line, col), ...acc]
+  None                      -> acc
+}
+
+fn pat_binds(p: Pattern, acc: [ScopeBind]) : [ScopeBind] {
+  match p.pkind {
+    PWild              -> acc
+    PLit(_)            -> acc
+    PRange(_, _)       -> acc
+    PBind(b)           -> [SB("PatBind", b, p.line, p.col), ...acc]
+    PList(subs, rest)  -> {
+      let a1 = pat_binds_list(subs, acc)
+      match rest {
+        None       -> a1
+        Some(rb)   -> [SB("PatBind", rb, p.line, p.col), ...a1]
+      }
+    }
+    PVariant(_, subs)         -> pat_binds_list(subs, acc)
+    PVariantRecord(_, fields) -> pat_binds_fields(fields, acc)
+    PRecord(fields)           -> pat_binds_fields(fields, acc)
+    PHole(_)                  -> acc
+    PAs(b, inner)    -> pat_binds(inner, [SB("PatBind", b, p.line, p.col), ...acc])
+    PNarrow(b, _)    -> [SB("PatBind", b, p.line, p.col), ...acc]
+    PSurface(sp)     -> pat_binds_list(patsurface_children(sp), acc)
+  }
+}
+
+fn pat_binds_list(ps: [Pattern], acc: [ScopeBind]) : [ScopeBind] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> pat_binds_list(rest, pat_binds(p, acc))
+  }
+}
+
+fn pat_binds_fields(fs: [PField], acc: [ScopeBind]) : [ScopeBind] {
+  match fs {
+    []           -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pat_binds_fields(rest, pat_binds(sub, acc))
+    }
+  }
+}
+
+fn push_params(ps: [Param], acc: [ScopeBind]) : [ScopeBind] {
+  match ps {
+    []           -> acc
+    [p, ...rest] -> push_params(rest, [SB("Param", p.binder, p.pline, p.pcol), ...acc])
+  }
+}
+
+# Locate the innermost reference at the query position. We walk the
+# same AST as `find_enc_*` but only record the nodes that name
+# something — anything else is uninteresting for def-at.
+fn find_var_at_decls(ds: [Decl], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match ds {
+    []           -> acc
+    [d, ...rest] -> find_var_at_decls(rest, ql, qc, find_var_at_decl(d, ql, qc, acc))
+  }
+}
+
+fn find_var_at_decl(d: Decl, ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match d {
+    DFn(_, _, _, _, _, _, body, _, _, _)    -> find_var_at_expr(body, ql, qc, acc)
+    DConst(_, _, _, body, _, _, _)          -> find_var_at_expr(body, ql, qc, acc)
+    DTest(_, body, _, _, _)                 -> find_var_at_expr(body, ql, qc, acc)
+    DBench(_, body, _, _, _)                -> find_var_at_expr(body, ql, qc, acc)
+    DCheck(_, _, body, _, _, _)             -> find_var_at_expr(body, ql, qc, acc)
+    DImpl(_, _, _, decls, _, _, _, _)          -> find_var_at_decls(decls, ql, qc, acc)
+    DDerive(_, inner, _, _)              -> find_var_at_decl(inner, ql, qc, acc)
+    DUnstable(inner, _, _)               -> find_var_at_decl(inner, ql, qc, acc)
+    DProtoLaws(_, inner, _, _, _)           -> find_var_at_decl(inner, ql, qc, acc)
+    DImplAxiom(_, inner, _, _, _)           -> find_var_at_decl(inner, ql, qc, acc)
+    DConstructor(inner, _, _)            -> find_var_at_decl(inner, ql, qc, acc)
+    _                                    -> acc
+  }
+}
+
+fn var_better(a: Option[RefAt], cl: Int, cc: Int, r: RefAt, ql: Int, qc: Int) : Option[RefAt] {
+  if not pos_ge(ql, qc, cl, cc) { a }
+  else { Some(r) }   # later (deeper / later document order) overrides
+}
+
+fn find_var_at_expr(e: Expr, ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  let a0 = match e.kind {
+    ELocal(l)  -> var_better(acc, e.line, e.col, RaLocal(l), ql, qc)
+    ESym(s, _) -> var_better(acc, e.line, e.col, RaDecl(s), ql, qc)
+    EOp(r)     -> var_better(acc, e.line, e.col, RaOp(r), ql, qc)
+    EName(w)   -> var_better(acc, e.line, e.col, RaName(w), ql, qc)
+    _          -> acc
+  }
+  find_var_at_expr_kind(e.kind, ql, qc, a0)
+}
+
+fn find_var_at_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match k {
+    EInt(_, _)        -> acc
+    EReal(_, _)       -> acc
+    EIntLit(_)        -> acc
+    EDecimalLit(_)    -> acc
+    EFixed(_, _)      -> acc
+    EBool(_)       -> acc
+    EChar(_)       -> acc
+    EStr(_, _)     -> acc
+    EUnit          -> acc
+    EName(_)        -> acc
+    EMark(_)        -> acc
+    ESym(_, _)     -> acc
+    ELocal(_)      -> acc
+    EOp(_)         -> acc
+    EUnder         -> acc
+    EPlaceholder   -> acc
+    EHole(_)       -> acc
+    ETodo(_)       -> acc
+    EExternBody(_, _) -> acc
+    EModCall(_, _) -> acc
+    ECall(f, call_args) -> find_var_at_exprs(call_args, ql, qc, find_var_at_expr(f, ql, qc, acc))
+    EField(e1, _)  -> find_var_at_expr(e1, ql, qc, acc)
+    EIndex(e1, e2) -> find_var_at_expr(e2, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+    EBinop(_, l, r) -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EUnop(_, e1)   -> find_var_at_expr(e1, ql, qc, acc)
+    EIf(c, t, eo)  -> {
+      let a1 = find_var_at_expr(c, ql, qc, acc)
+      let a2 = find_var_at_expr(t, ql, qc, a1)
+      match eo { None -> a2  Some(el) -> find_var_at_expr(el, ql, qc, a2) }
+    }
+    EMatch(s, arms) -> {
+      let a1 = find_var_at_expr(s, ql, qc, acc)
+      find_var_at_arms(arms, ql, qc, a1)
+    }
+    ELambda(_, body) -> find_var_at_expr(body, ql, qc, acc)
+    ERecordLit(_, fis) -> find_var_at_field_inits(fis, ql, qc, acc)
+    EList(elems)    -> find_var_at_list_elems(elems, ql, qc, acc)
+    ERange(a, b, so) -> {
+      let a1 = find_var_at_expr(a, ql, qc, acc)
+      let a2 = find_var_at_expr(b, ql, qc, a1)
+      match so { None -> a2  Some(s) -> find_var_at_expr(s, ql, qc, a2) }
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = find_var_at_stmts(stmts, ql, qc, acc)
+      match tail { None -> a1  Some(t) -> find_var_at_expr(t, ql, qc, a1) }
+    }
+    EPipe(l, r)        -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EDispatchPipe(_, l, r) -> find_var_at_expr(r, ql, qc, find_var_at_expr(l, ql, qc, acc))
+    EBang(inner)       -> find_var_at_expr(inner, ql, qc, acc)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = find_var_at_expr(body, ql, qc, acc)
+      let a2 = match init_opt { None -> a1  Some(i) -> find_var_at_expr(i, ql, qc, a1) }
+      let a3 = find_var_at_hclauses(clauses, ql, qc, a2)
+      match ret_opt {
+        None                       -> a3
+        Some(HR(_, e1, _, _))      -> find_var_at_expr(e1, ql, qc, a3)
+      }
+    }
+    ELitUnit(inner, _) -> find_var_at_expr(inner, ql, qc, acc)
+    EVariantsOf(_, _)  -> acc
+    EIntrinsic(_, args_) -> find_var_at_exprs(args_, ql, qc, acc)
+    ESurface(sf) -> find_var_at_exprs(surface_children(sf), ql, qc, acc)
+  }
+}
+
+fn find_var_at_exprs(es: [Expr], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> find_var_at_exprs(rest, ql, qc, find_var_at_expr(e, ql, qc, acc))
+  }
+}
+
+fn find_var_at_arms(arms: [Arm], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(_, guard, body) -> {
+        let a1 = match guard { None -> acc  Some(g) -> find_var_at_expr(g, ql, qc, acc) }
+        let a2 = find_var_at_expr(body, ql, qc, a1)
+        find_var_at_arms(rest, ql, qc, a2)
+      }
+    }
+  }
+}
+
+fn find_var_at_field_inits(fis: [FieldInit], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match fis {
+    []           -> acc
+    [f, ...rest] -> match f {
+      FI(_, e1) -> find_var_at_field_inits(rest, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+    }
+  }
+}
+
+fn find_var_at_list_elems(es: [ListElem], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match es {
+    []           -> acc
+    [e, ...rest] -> match e {
+      ElPlain(e1)  -> find_var_at_list_elems(rest, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+      ElSpread(e1) -> find_var_at_list_elems(rest, ql, qc, find_var_at_expr(e1, ql, qc, acc))
+    }
+  }
+}
+
+fn find_var_at_stmts(ss: [Stmt], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match ss {
+    []           -> acc
+    [s, ...rest] -> find_var_at_stmts(rest, ql, qc, find_var_at_stmt(s, ql, qc, acc))
+  }
+}
+
+fn find_var_at_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match s {
+    SLet(_, _, body)                -> find_var_at_expr(body, ql, qc, acc)
+    SAssert(e1, mo)                 -> {
+      let a1 = find_var_at_expr(e1, ql, qc, acc)
+      match mo { None -> a1  Some(m) -> find_var_at_expr(m, ql, qc, a1) }
+    }
+    SExprStmt(e1)                   -> find_var_at_expr(e1, ql, qc, acc)
+    SIndexAssign(arr, idx, v, _, _) -> find_var_at_expr(v, ql, qc,
+                                          find_var_at_expr(idx, ql, qc,
+                                            find_var_at_expr(arr, ql, qc, acc)))
+    SAssign(lhs, v, _, _)           -> find_var_at_expr(v, ql, qc,
+                                          find_var_at_expr(lhs, ql, qc, acc))
+    SVar(_, _, init, _, _)          -> find_var_at_expr(init, ql, qc, acc)
+    SUse(_, _, _)                   -> acc
+  }
+}
+
+fn find_var_at_hclauses(cs: [HClause], ql: Int, qc: Int, acc: Option[RefAt]) : Option[RefAt] {
+  match cs {
+    []           -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) -> find_var_at_hclauses(rest, ql, qc, find_var_at_expr(body, ql, qc, acc))
+    }
+  }
+}
+
+# The declaration `s` among `ds`. Imported decls sit in the same flat
+# list as the root's, so an imported `pub fn foo` is found like a local
+# one. A constructor is defined where its type is.
+fn find_decl_def(ds: [Decl], tab: SymTab, s: SymId) : Option[DefLoc] =
+  if sym_raw(s) < 0 { None } else { find_decl_def_loop(ds, tab, s) }
+
+fn find_decl_def_loop(ds: [Decl], tab: SymTab, s: SymId) : Option[DefLoc] = match ds {
+  []           -> None
+  [d, ...rest] -> match decl_def_of(d, tab, s) {
+    Some(loc) -> Some(loc)
+    None      -> find_decl_def_loop(rest, tab, s)
+  }
+}
+
+fn decl_def_of(d: Decl, tab: SymTab, s: SymId) : Option[DefLoc] = match d {
+  DFn(_, f, _, _, _, _, _, line, col, _) -> def_if(sym_same(fnid_sym(f), s), "DFn", tab, s, line, col)
+  DConst(_, c, _, _, _, line, col)       -> def_if(sym_same(c, s), "DConst", tab, s, line, col)
+  DType(_, t, _, body, line, col, _, _)  -> def_if(sym_same(t, s) or body_declares_ctor(body, s), "DType", tab, t, line, col)
+  DEffect(_, e, _, _, _, line, col, _)   -> def_if(sym_same(e, s), "DEffect", tab, s, line, col)
+  DProtocol(_, p, _, _, line, col, _)    -> def_if(sym_same(p, s), "DProtocol", tab, s, line, col)
+  DDerive(_, inner, _, _)       -> decl_def_of(inner, tab, s)
+  DUnstable(inner, _, _)        -> decl_def_of(inner, tab, s)
+  DProtoLaws(_, inner, _, _, _) -> decl_def_of(inner, tab, s)
+  DImplAxiom(_, inner, _, _, _) -> decl_def_of(inner, tab, s)
+  DConstructor(inner, _, _)     -> decl_def_of(inner, tab, s)
+  _ -> None
+}
+
+fn def_if(hit: Bool, kind: String, tab: SymTab, s: SymId, line: Int, col: Int) : Option[DefLoc] =
+  if hit { Some(DL(kind, written_text(decl_name(tab, s)), line, col)) } else { None }
+
+fn body_declares_ctor(body: TypeBody, s: SymId) : Bool = match body {
+  TBSum(vs) -> any(vs, (v) => match v { Var(c, _) -> sym_same(c, s) })
+  _         -> false
+}
+
+#[doc("A definition location as JSON; `null` when there is none.")]
+pub fn lib_json_def(file: String, opt: Option[DefLoc]) : String {
+  match opt {
+    None -> "null"
+    Some(DL(kind, name, line, col)) ->
+      concat_all([
+        "{\"decl_kind\": ", json_str(kind),
+        ", \"name\": ", json_str(name),
+        ", \"file\": ", json_str(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        "}"
+      ])
+  }
+}
+
+#[doc("""
+Signature help wants what the user reads: the name the callee was
+declared with. `d` is the declaration the call sits in, whose binders
+name a local callee.
+""")]
+pub fn call_name_of(callee: Expr, tab: SymTab, d: Decl) : String =
+  match callee.kind {
+    ELocal(l)    -> written_text(ln_text(ln_of_decl(d), l))
+    ESym(s, _)   -> written_text(decl_name(tab, s))
+    EOp(r)       -> op_ref_text(tab, ln_of_decl(d), r)
+    EName(n)     -> written_text(n)
+    EField(_, n) -> n
+    _ -> "<call>"
+  }

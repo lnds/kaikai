@@ -1,0 +1,252 @@
+#[doc("Compile stages that monomorphise and run the ownership passes.")]
+
+import compiler.emit_c_shims
+import compiler.package_id
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.emit_shared_syms
+import compiler.verdicts
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.spec_names
+import compiler.unwind_clauses
+import compiler.diag_file
+import compiler.extern_fn_types
+import compiler.fn_index
+import compiler.const_pattern
+import compiler.scope_view
+import compiler.proto_resolve
+import compiler.driver_cli
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.infer_holes_json
+import compiler.evidence_inject
+import compiler.fnreg
+import compiler.pub_access
+import compiler.cell_promote
+import compiler.unbox_pass
+import compiler.unbox
+import compiler.unique_binders
+import compiler.perceus_decl
+import compiler.unwind_operands
+import compiler.record_fields_hoist
+import compiler.sym_erase
+import compiler.monomorph_pass
+import compiler.core_cut
+import compiler.driver_policy
+import compiler.driver_front
+import compiler.emit_c_tcrec
+import compiler.driver_solve
+import compiler.region
+
+pub(pkg) type Monoed = { target_mod_name: String, entry: SymId, nsrcs: String, npre: String, sym_views: FileViews,
+  region_marks: [RegionMark], stamp_ids: [SymId], core_hit: Option[String], dropped: [SymId], pruned: Bool, proto_reg: ProtocolReg,
+  mf: MonoFront, tcut: TypedCut, mono_decls: [Decl], emit_tab: SymTab, specs: SpecNames }
+
+pub(pkg) type UnboxRun = { target_mod_name: String, entry: SymId, nsrcs: String, npre: String, sym_views: FileViews,
+  region_marks: [RegionMark], stamp_ids: [SymId], core_hit: Option[String], dropped: [SymId], pruned: Bool, proto_reg: ProtocolReg,
+  mf: MonoFront, tcut: TypedCut, mono_decls: [Decl], emit_tab: SymTab, specs: SpecNames, erase_ctx: SymErase, cell_decls: [Decl],
+  unboxed_decls: [Decl], raw_arm_binders: [RawArmBinder], bmode: BuildMode, use_kir: Bool, kir_inline_on: Bool, use_native: Bool,
+  use_native_modular: Bool, use_modular: Bool, use_owner: Bool }
+
+pub(pkg) type PerceusRun = { target_mod_name: String, entry: SymId, nsrcs: String, npre: String, region_marks: [RegionMark],
+  stamp_ids: [SymId], core_hit: Option[String], dropped: [SymId], pruned: Bool, proto_reg: ProtocolReg, mf: MonoFront, tcut: TypedCut,
+  mono_decls: [Decl], emit_tab: SymTab, specs: SpecNames, cell_decls: [Decl], unboxed_decls: [Decl], raw_arm_binders: [RawArmBinder],
+  bmode: BuildMode, use_kir: Bool, kir_inline_on: Bool, use_native: Bool, use_native_modular: Bool, use_modular: Bool, use_owner: Bool,
+  perceus_decls: [Decl], use_purity: Bool, use_symids: Bool }
+
+pub(pkg) fn stage_mono(req: Req, cx: Checked) : Flow[Monoed] / Console + File + Mutable {
+  let all_decls = cx.all_decls
+  let core_mods = req.core_mods
+  let diag_ctx = cx.diag_ctx
+  let dm = cx.dm
+  let docs = cx.docs
+  let dropped = cx.dropped
+  let entry = cx.entry
+  let json = cx.json
+  let mode = req.mode
+  let pa_segs = cx.pa_segs
+  let path = req.path
+  let proto_reg = cx.proto_reg
+  let pruned = cx.pruned
+  let strict_holes = req.strict_holes
+  let surface_fn_bounds = cx.surface_fn_bounds
+  let sym_tab = cx.sym_tab
+  let sym_views = cx.sym_views
+  let target_mod_name = cx.target_mod_name
+  let tin = cx.tin
+  let typed_prog = cx.typed_prog
+  let typed_tab = cx.typed_tab
+  let typed_vds = cx.typed_vds
+  let hole_errs = if strict_holes { strict_holes_check(path, all_decls, tin) } else { 0 }
+  if hole_errs != 0 { Halt(vd_exit(json, [...typed_vds, vd_count(hole_errs)])) }
+  else if is_check_mode(mode) { Halt(check_mode_exit(json, typed_vds, typed_prog, proto_reg, surface_fn_bounds, typed_tab, sym_views, target_mod_name, path, diag_ctx, tin.roots, req_plan(req))) }
+  else if is_report_mode(mode) { Halt(run_report_dump(mode, diag_ctx, pa_hidden_from_root(pa_segs, sym_tab, target_mod_name), typed_prog, typed_tab, docs.items)) }
+  else {
+    let mf = mono_front(typed_prog, proto_reg,
+               bounds_by_sym(typed_prog.decls, surface_fn_bounds, target_mod_name),
+                        PScope(typed_tab, sym_views, target_mod_name), target_mod_name, path, diag_ctx, tin.roots, req_plan(req))
+    # A constant's initialiser with locals of its own is a
+    # function from here on; its read pastes the call.
+    let const_inits = const_init_fns(mf.decls, typed_tab, target_mod_name)
+    let tcut = if pruned { core_typed_cut(const_inits.decls, core_mod_names(core_mods, []), proto_reg, match dm { Some(x) -> demand_dropped(dropped, x, typed_prog.decls)  None -> dropped }) } else { TypedCut(const_inits.decls, []) }
+    let mono_decls = match tcut { TypedCut(ds, _) -> ds }
+    # The names the backends spell: the table with the
+    # closure specialisations the front minted, and the
+    # emitted name of every specialised instance. The index
+    # is rebuilt here: one read out of a record is never
+    # local, and the emitters' `Mutable` is masked only
+    # over carriers this function built.
+    let emit_tab = st_extend(typed_tab, list_append(mf.rows, const_inits.rows))
+    let specs = spec_names_of(spec_names_rows(mf.specs))
+    # Per-function evidence obligations, computed pre-mono
+    # and re-keyed onto the specialised symbols. Codegen
+    # reads none of it: the result is exercised, not consumed.
+    let _ev_meta = reindex_evidence_params(
+      inject_evidence_params(mf.prog.decls, entry), mono_decls)
+    # In-process libLLVM native backend. Computed BEFORE
+    # unbox so the pass can gate raw-binder promotion on the
+    # backend: the native load-border is NOT total, so a
+    # kind-1 Int arm binder may go raw ONLY where the native
+    # re-boxes it (a raw-op operand or a same-ctor reuse
+    # slot); the C oracle's mode-slave border is total, so it
+    # keeps the wider promotion.
+    Go(Monoed { target_mod_name: cx.target_mod_name, entry: cx.entry, nsrcs: cx.nsrcs, npre: cx.npre, sym_views: cx.sym_views, region_marks: cx.region_marks, stamp_ids: cx.stamp_ids, core_hit: cx.core_hit, dropped: cx.dropped, pruned: cx.pruned, proto_reg: cx.proto_reg, mf: mf, tcut: tcut, mono_decls: mono_decls, emit_tab: emit_tab, specs: specs })
+  }
+}
+
+pub(pkg) fn stage_unbox(req: Req, cx: Monoed) : UnboxRun / Console + File + Mutable {
+  let backend = req.backend
+  let emit_tab = cx.emit_tab
+  let entry = cx.entry
+  let mode = req.mode
+  let mono_decls = cx.mono_decls
+  let specs = cx.specs
+  let target_mod_name = cx.target_mod_name
+  let unbox_native = true
+  # Scalar var cells: rewrite non-escaping scalar
+  # slots (`array_make(1, lit)`) to raw local cells
+  # so the unbox pass below marks arithmetic over
+  # their reads raw on both backends.
+  # Every reference to a declaration keeps its id through
+  # unbox and perceus. One spelling per local binder from
+  # here on: every ownership table below keys on the name.
+  let erase_ctx = SymErase(emit_tab, target_mod_name)
+  # Operands a sibling can unwind past are named, so
+  # the ownership passes see binders, not temporaries.
+  let cell_decls = rfh_hoist_decls(unw_name_operands(unique_binders_decls(promote_scalar_cells(sym_qualify_decls_in(erase_ctx, mono_decls))), emit_tab, unw_seed_none()))
+  # Unbox analysis. Runs between monomorphisation
+  # and perceus so the perceus pass sees post-unbox
+  # modes (it only inserts dup/drop on `MBoxed`
+  # nodes).
+  let ci_slots = build_ctor_int_slots(cell_decls, emit_tab)
+  let unboxed_decls = unbox_pass(cell_decls, emit_tab, specs, ci_slots, unbox_native, entry)
+  # The native-raw match-arm Int binders, decided ONCE here
+  # (same verdict as the unbox seed) and read by perceus +
+  # KIR-lowering so no phase re-derives rawness from the
+  # mutated body. Empty under the C backend.
+  let raw_arm_binders = if unbox_native { native_raw_arm_binders(unboxed_decls, ci_slots, fnx_build(register_fn_decls(unboxed_decls, emit_tab, specs, entry))) } else { [] }
+  let bmode = match mode_program(mode) {
+    MTest -> BMTest
+    MBench -> BMBench
+    MPropCheck -> BMCheck
+    _ -> BMBuild
+  }
+  # Read-only KIR dump (no binary emitted).
+  let use_kir = match mode { MEmitKir(_) -> true MEmitKirNoInline(_) -> true _ -> false }
+  let kir_inline_on = match mode { MEmitKirNoInline(_) -> false _ -> true }
+  # In-process libLLVM native backend.
+  let use_native = match backend { BkNative -> true _ -> false }
+  # In-process libLLVM native SEPARATE compilation
+  # (per-`KFn.mo` object + content-addressed cache).
+  let use_native_modular = match backend { BkNativeModular -> true _ -> false }
+  # Separate-compilation C path (per-module .c/.h).
+  let use_modular = match backend { BkCModular -> true _ -> false }
+  let use_owner = match backend { BkCOwner -> true _ -> false }
+  # Pipeline order: `perceus → tcrec`. Perceus runs
+  # first so the AST already carries explicit
+  # `__perceus_dup` / `__perceus_drop` nodes by the
+  # time tcrec plants its sentinels. Tcrec then
+  # descends into the perceus wrap
+  # (`EBlock([entry, SLet(__pcs_ret, body),
+  # exit_drops], Some(ELocal(__pcs_ret)))`) and
+  # operates on the inner body — the wrap stays
+  # intact, the goto fires before the wrap's exit
+  # drops, and the dropmask is computed from the same
+  # `uses` set perceus consumed. See
+  # `tcrec_unwrap_pcs_ret` for the shape detector.
+  # Coupling the order the other way forces tcrec to
+  # re-emulate perceus's exit-drop computation, so a
+  # change to one has to be mirrored in the other.
+  # Below the erasure a name is a C symbol to spell.
+  UnboxRun { target_mod_name: cx.target_mod_name, entry: cx.entry, nsrcs: cx.nsrcs, npre: cx.npre, sym_views: cx.sym_views,
+    region_marks: cx.region_marks, stamp_ids: cx.stamp_ids, core_hit: cx.core_hit, dropped: cx.dropped, pruned: cx.pruned,
+    proto_reg: cx.proto_reg, mf: cx.mf, tcut: cx.tcut, mono_decls: cx.mono_decls, emit_tab: cx.emit_tab, specs: cx.specs,
+    erase_ctx: erase_ctx, cell_decls: cell_decls, unboxed_decls: unboxed_decls, raw_arm_binders: raw_arm_binders, bmode: bmode,
+    use_kir: use_kir, kir_inline_on: kir_inline_on, use_native: use_native, use_native_modular: use_native_modular,
+    use_modular: use_modular, use_owner: use_owner }
+}
+
+pub(pkg) fn stage_perceus(req: Req, cx: UnboxRun) : PerceusRun / Console + File + Mutable {
+  let emit_tab = cx.emit_tab
+  let entry = cx.entry
+  let erase_ctx = cx.erase_ctx
+  let ffi_out = req.ffi_out
+  let mode = req.mode
+  let specs = cx.specs
+  let sym_views = cx.sym_views
+  let target_mod_name = cx.target_mod_name
+  let unboxed_decls = cx.unboxed_decls
+  let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, emit_tab, specs, sym_views, target_mod_name, entry))
+  # TCO is mandatory on BOTH backends.
+  # `tcrec_rewrite_decls` is a pure AST→AST pre-pass
+  # that plants the `__kai_tcrec|...` self-tail-call
+  # sentinel; the C emitter lowers it to a goto-loop
+  # and the LLVM emitter to a br-loop
+  # (`llvm_emit_tcrec_goto`). Running it for both
+  # keeps the analysis (dropmask + tail-position)
+  # single-sourced.
+  # TRMC (modulo-cons cctx rewrite) also runs on both
+  # backends. The LLVM emitter lowers the
+  # `__kai_trmc|` step sentinel and the
+  # `__kai_trmc_apply` terminal sentinel to a cctx
+  # br-loop (`llvm_emit_trmc_goto` /
+  # `llvm_emit_trmc_apply`), carrying the constructor
+  # context in two prologue allocas (`%_kai_acc.res` /
+  # `%_kai_acc.hole`) via the `kaix_cctx_*` runtime
+  # shims. Passing `allow_trmc = true` unconditionally
+  # keeps the rewrite single-sourced so both backends
+  # get mandatory TCO on modulo-cons recursion.
+  # `cons_ok` enables TRMC for the BUILTIN cons idiom
+  # (`[h, ...self(t)]` / perceus reuse-cons). The
+  # C-text emitter lowers the cons step sentinel
+  # (`emit_trmc_cons_step`) and the KIR/native path
+  # carries a well-formed `KTrmcStep` (head value +
+  # back-edge rebinds; see `lower_trmc_step`) — both
+  # get the rewrite so modulo-cons recursion stays
+  # O(1)-stack.
+  let cons_ok = true
+  let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok, target_mod_name, emit_tab, specs)
+  let use_purity = match mode { MDumpPurity -> true _ -> false }
+  let use_symids = match mode { MDumpSymIds -> true _ -> false }
+  let _ffi_header = write_ffi_header(ffi_out, collect_extern_types(perceus_decls, emit_tab), emit_tab)
+  PerceusRun { target_mod_name: cx.target_mod_name, entry: cx.entry, nsrcs: cx.nsrcs, npre: cx.npre, region_marks: cx.region_marks,
+    stamp_ids: cx.stamp_ids, core_hit: cx.core_hit, dropped: cx.dropped, pruned: cx.pruned, proto_reg: cx.proto_reg, mf: cx.mf,
+    tcut: cx.tcut, mono_decls: cx.mono_decls, emit_tab: cx.emit_tab, specs: cx.specs, cell_decls: cx.cell_decls,
+    unboxed_decls: cx.unboxed_decls, raw_arm_binders: cx.raw_arm_binders, bmode: cx.bmode, use_kir: cx.use_kir,
+    kir_inline_on: cx.kir_inline_on, use_native: cx.use_native, use_native_modular: cx.use_native_modular, use_modular: cx.use_modular,
+    use_owner: cx.use_owner, perceus_decls: perceus_decls, use_purity: use_purity, use_symids: use_symids }
+}
+
+
+fn check_mode_exit(json: Option[String], typed_vds: [Verdict], typed_prog: TypedProgram, proto_reg: ProtocolReg, surface_fn_bounds: [FnBoundsRec],
+                   typed_tab: SymTab, sym_views: FileViews, target_mod_name: String, path: String, diag_ctx: DiagFiles, roots: Roots, plan: PkgPlan) : Int / Console + File + Mutable {
+  let mf = mono_front(typed_prog, proto_reg,
+             bounds_by_sym(typed_prog.decls, surface_fn_bounds, target_mod_name),
+             PScope(typed_tab, sym_views, target_mod_name), target_mod_name, path, diag_ctx, roots, plan)
+  vd_exit(json, [...typed_vds, mf.verdict])
+}
+

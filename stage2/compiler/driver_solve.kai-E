@@ -1,0 +1,280 @@
+#[doc("Compile stages that resolve, stamp and type the lowered program and check its verdicts.")]
+
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.verdicts
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.call_site_check
+import compiler.resolve_program
+import compiler.module_table
+import compiler.user_cache
+import compiler.typed_cut
+import compiler.driver_cli
+import compiler.core_front
+import compiler.region_yield
+import compiler.build_target
+import compiler.diag
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.rec_stamp
+import compiler.evidence_inject
+import compiler.pub_access
+import compiler.desugar_nursery
+import compiler.diag_file
+import compiler.tailfuse
+import compiler.tail_norm
+import compiler.protos_calls
+import compiler.protos_registry
+import compiler.name_report
+import compiler.core_cut
+import compiler.core_impl_hold
+import compiler.driver_policy
+import compiler.driver_front
+import compiler.emit_c_unused
+import compiler.driver_lower
+import compiler.doc_attr
+import compiler.modules_segments
+import compiler.name_uses
+import compiler.protos
+import compiler.protos_impls
+import compiler.region
+import compiler.scope_view
+
+pub(pkg) type StampRun = { json: Option[String], target_mod_name: String, entry: SymId, docs: DocStrip, nsrcs: String, npre: String,
+  core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String], pcut: Option[PreCut],
+  emptied: [SymId], gone: [SymId], surface_fn_bounds: [FnBoundsRec], module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables,
+  sym_views: FileViews, pa_segs: [CoreSegment], region_marks: [RegionMark], post_use_decls: [Decl], lowered: LoweredProtocols,
+  sym_tab: SymTab, root_picks: [NPick], early_const_uses: [NUse], held_impls: [Decl], emptied_impls: [ImplOrigin],
+  front_cx_of: () -> CoreFrontCx, front: TyperFront, rd: ResolvedDecls, chk: Int, all_decls: [Decl], stamped: Stamped,
+  proto_reg: ProtocolReg, stamp_ids: [SymId] }
+
+pub(pkg) type Solved = { json: Option[String], target_mod_name: String, entry: SymId, docs: DocStrip, nsrcs: String, npre: String,
+  prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String], emptied: [SymId], gone: [SymId],
+  surface_fn_bounds: [FnBoundsRec], module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables, sym_views: FileViews,
+  pa_segs: [CoreSegment], region_marks: [RegionMark], post_use_decls: [Decl], lowered: LoweredProtocols, sym_tab: SymTab,
+  root_picks: [NPick], early_const_uses: [NUse], held_impls: [Decl], emptied_impls: [ImplOrigin], front_cx_of: () -> CoreFrontCx,
+  front: TyperFront, rd: ResolvedDecls, all_decls: [Decl], stamped: Stamped, proto_reg: ProtocolReg, stamp_ids: [SymId],
+  core_hit: Option[String], pcut: PoolCut, cut: CoreCut }
+
+pub(pkg) type InferRun = { json: Option[String], target_mod_name: String, entry: SymId, docs: DocStrip, nsrcs: String, npre: String,
+  surface_fn_bounds: [FnBoundsRec], module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables, sym_views: FileViews,
+  pa_segs: [CoreSegment], region_marks: [RegionMark], post_use_decls: [Decl], lowered: LoweredProtocols, sym_tab: SymTab,
+  root_picks: [NPick], early_const_uses: [NUse], rd: ResolvedDecls, proto_reg: ProtocolReg, stamp_ids: [SymId], core_hit: Option[String],
+  all_decls: [Decl], dropped: [SymId], pruned: Bool, dm: Option[Demand], typed_tab: SymTab, tin: TyperIn, typed_prog0: TypedProgram }
+
+pub(pkg) type Checked = { json: Option[String], target_mod_name: String, entry: SymId, docs: DocStrip, nsrcs: String, npre: String,
+  surface_fn_bounds: [FnBoundsRec], diag_ctx: DiagFiles, sym_views: FileViews, pa_segs: [CoreSegment], region_marks: [RegionMark],
+  sym_tab: SymTab, stamp_ids: [SymId], core_hit: Option[String], all_decls: [Decl], dropped: [SymId], pruned: Bool, dm: Option[Demand],
+  typed_tab: SymTab, tin: TyperIn, proto_reg: ProtocolReg, typed_prog: TypedProgram, typed_vds: [Verdict] }
+
+pub(pkg) fn stage_stamp(req: Req, cx: Ready) : StampRun / Console + File + Mutable {
+  let all_decls = cx.all_decls
+  let callee_ops = cx.callee_ops
+  let core_mods = req.core_mods
+  let diag_ctx = cx.diag_ctx
+  let front = cx.front
+  let lowered = cx.lowered
+  let proto_reg = cx.proto_reg
+  let sym_tab = cx.sym_tab
+  let sym_views = cx.sym_views
+  let target_mod_name = cx.target_mod_name
+  let rd0 = resolve_decls_stamped(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops, loops_on(req.mode))
+  let nursery_rw = if rd0.env.rs.nursery_used { rewrite_nursery_caps_decls(rd0.decls, rd0.env.rs.nursery, core_mod_names(core_mods, []), diag_ctx) }
+                   else { NurseryRwProgram { decls: rd0.decls, brands: [], calls: [] } }
+  let rd = ResolvedDecls { ...rd0, decls: nursery_rw.decls }
+  let brand_errs = if df_quiet(diag_ctx) { 0 }
+                   else { check_nursery_brand_mismatch_decls(rd.decls, sym_tab, diag_ctx, nursery_rw.calls, nursery_rw.brands) }
+  let chk = rd.errs + brand_errs
+  let all_decls = rd.decls
+  let stamped = stamped_registry(front, proto_reg, all_decls, sym_tab)
+  let proto_reg = reg_with_walked(stamped.reg, walked_impls(stamped.reg.impls, lowered.derived, all_decls))
+  let stamp_ids = stamp_targets(proto_reg.impls, lowered.derived, core_mod_names(core_mods, []))
+  StampRun { json: cx.json, target_mod_name: cx.target_mod_name, entry: cx.entry, docs: cx.docs, nsrcs: cx.nsrcs, npre: cx.npre,
+    core_hit: cx.core_hit, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole, surface_decls_whole: cx.surface_decls_whole,
+    lib_mods: cx.lib_mods, pcut: cx.pcut, emptied: cx.emptied, gone: cx.gone, surface_fn_bounds: cx.surface_fn_bounds,
+    module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs, sym_views: cx.sym_views, pa_segs: cx.pa_segs,
+    region_marks: cx.region_marks, post_use_decls: cx.post_use_decls, lowered: cx.lowered, sym_tab: cx.sym_tab, root_picks: cx.root_picks,
+    early_const_uses: cx.early_const_uses, held_impls: cx.held_impls, emptied_impls: cx.emptied_impls, front_cx_of: cx.front_cx_of,
+    front: cx.front, rd: rd, chk: chk, all_decls: all_decls, stamped: stamped, proto_reg: proto_reg, stamp_ids: stamp_ids }
+}
+
+pub(pkg) fn stage_solve(req: Req, cx: StampRun) : Flow[Solved] / Console + File + Mutable {
+  let all_decls = cx.all_decls
+  let chk = cx.chk
+  let core_hit = cx.core_hit
+  let core_mods = req.core_mods
+  let emptied = list_append(cx.emptied, list_append(impl_hold_syms(cx.held_impls), impl_origin_syms(cx.emptied_impls)))
+  let json = cx.json
+  let lib_mods = cx.lib_mods
+  let pcut = cx.pcut
+  let proto_reg = cx.proto_reg
+  let prunes = cx.prunes
+  let rd = cx.rd
+  let sym_tab = cx.sym_tab
+  let pcut = if chk == 0 and prunes {
+               core_pool(sym_tab, all_decls, list_append(core_mod_names(core_mods, []), lib_mods), proto_reg, emptied, false)
+             } else { pool_none(all_decls) }
+  let cut = pcut.cut
+  let missed = match cut { CoreCut(_, _, m) -> m }
+  if chk != 0 { Halt(vd_exit(json, [Verdict(chk, rd.diags)])) }
+  else if list_length(missed) > 0 { Halt(core_cut_fail("keeps a function the early cut emptied", core_cut_names(sym_tab, missed))) }
+  else { Go(Solved { json: cx.json, target_mod_name: cx.target_mod_name, entry: cx.entry, docs: cx.docs, nsrcs: cx.nsrcs, npre: cx.npre, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole, surface_decls_whole: cx.surface_decls_whole, lib_mods: cx.lib_mods, emptied: cx.emptied, gone: cx.gone, surface_fn_bounds: cx.surface_fn_bounds, module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs, sym_views: cx.sym_views, pa_segs: cx.pa_segs, region_marks: cx.region_marks, post_use_decls: cx.post_use_decls, lowered: cx.lowered, sym_tab: cx.sym_tab, root_picks: cx.root_picks, early_const_uses: cx.early_const_uses, held_impls: cx.held_impls, emptied_impls: cx.emptied_impls, front_cx_of: cx.front_cx_of, front: cx.front, rd: cx.rd, all_decls: cx.all_decls, stamped: cx.stamped, proto_reg: cx.proto_reg, stamp_ids: cx.stamp_ids, core_hit: core_hit, pcut: pcut, cut: cut }) }
+}
+
+pub(pkg) fn stage_infer(req: Req, cx: Solved) : Flow[InferRun] / Console + File + Mutable {
+  let all_decls = cx.all_decls
+  let core_cache = req.core_cache
+  let core_decls_whole = cx.core_decls_whole
+  let cut = cx.cut
+  let emptied = cx.emptied
+  let front = cx.front
+  let front_cx_of = cx.front_cx_of
+  let lib_mods = cx.lib_mods
+  let mode = req.mode
+  let path = req.path
+  let pcut = cx.pcut
+  let proto_reg = cx.proto_reg
+  let prunes = cx.prunes
+  let rd = cx.rd
+  let stamped = cx.stamped
+  let surface_decls_whole = cx.surface_decls_whole
+  let sym_tab = cx.sym_tab
+  let target_mod_name = cx.target_mod_name
+  let user_cache = req.user_cache
+  # Build the per-compile head-owner cache once from the
+  # post-`expand_imports` decl stream + the
+  # full module table (cores + transitively imported +
+  # the target file itself). The typer threads this cache
+  # into `synth_pipe_dispatch` so any in-scope `pub type`
+  # whose declaring module exports the canonical
+  # `map / flat_map / filter` participates in `|`, `||`,
+  # `|?` automatically — no compiler change required when
+  # a downstream package adds a new pipe-eligible type.
+  prune_note(core_cache.stats, prunes, cut)
+  let whole_decls = all_decls
+  let all_decls = match cut { CoreCut(kept, _, _) -> kept }
+  let dropped = list_append(match cut { CoreCut(_, d, _) -> d }, cx.gone)
+  let pruned = match dropped { [] -> false _ -> true }
+  let whole_decls = pcut.stream
+  # The typed blobs follow the sources, so an explicit
+  # project directory wins over the entry's own: the
+  # native paths compile a copy of the entry from an
+  # ephemeral object-cache dir, and deriving the cache
+  # from that copy publishes blobs nothing ever reads.
+  # With the project cache off, a typecheck-only run rides
+  # the shared core-cache directory: the blobs are
+  # content-addressed by a key folding the module's decls,
+  # its inherited interface hash and the cross-module
+  # context, so a toolchain-scoped directory serves them
+  # safely, and without it the stdlib core is re-inferred
+  # on every invocation. Restricted to the modes that stop
+  # at the front-end: a build publishes one blob per module
+  # and the whole-compiler selfhost pays that serialisation
+  # on every run for a cache it never reads back.
+  let tcut_dir = typed_cut_dir(mode, user_cache, core_cache, path)
+  # Mutual tail recursion is fused into one
+  # self-recursive function ahead of inference, so the
+  # synthesised dispatch is typed like any other body and
+  # the self-tail rewrite downstream turns the cycle into
+  # the goto-loop it already emits.
+  let fused = pub_loop_workers(tailfuse_decls(tailnorm_decls(whole_decls), sym_tab, target_mod_name), sym_tab, target_mod_name)
+  let dm = if pruned { Some(demand_new(fused.decls, pcut, proto_reg, true)) } else { None }
+  let front_src = FrontSrc { cx_of: front_cx_of, core: core_decls_whole, libs: precut_lib_fns(surface_decls_whole, lib_mods), impls: cx.held_impls, origins: cx.emptied_impls,
+                             stream: whole_decls, held: pcut.held, env: rd.env }
+  let defer = TcDefer { demand: dm, order: fused.decls, stats: core_cache.stats, front: Some(front_src) }
+  # The fused functions are declarations the typer must name.
+  let typed_tab = st_extend(sym_tab, fused.rows)
+  let tin = typer_in(front, stamped.view, whole_decls, typed_tab)
+  let tout = tcut_infer_demand(path, fused.decls, tcut_dir, tin, defer, match mode { MDumpSymIds -> true _ -> false })
+  let typed_prog0 = match tout { TcOut(tp, _) -> tp }
+  let asked_bare = match tout { TcOut(_, ms) -> ms }
+  if list_length(asked_bare) > 0 { Halt(core_cut_fail("asks for a function the early cut emptied", core_cut_names(sym_tab, asked_bare))) }
+  else { Go(InferRun { json: cx.json, target_mod_name: cx.target_mod_name, entry: cx.entry, docs: cx.docs, nsrcs: cx.nsrcs, npre: cx.npre, surface_fn_bounds: cx.surface_fn_bounds, module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs, sym_views: cx.sym_views, pa_segs: cx.pa_segs, region_marks: cx.region_marks, post_use_decls: cx.post_use_decls, lowered: cx.lowered, sym_tab: cx.sym_tab, root_picks: cx.root_picks, early_const_uses: cx.early_const_uses, rd: cx.rd, proto_reg: cx.proto_reg, stamp_ids: cx.stamp_ids, core_hit: cx.core_hit, all_decls: all_decls, dropped: dropped, pruned: pruned, dm: dm, typed_tab: typed_tab, tin: tin, typed_prog0: typed_prog0 }) }
+}
+
+pub(pkg) fn stage_check(req: Req, cx: InferRun) : Flow[Checked] / Console + File + Mutable {
+  let core_mods = req.core_mods
+  let diag_ctx = cx.diag_ctx
+  let entry = cx.entry
+  let dm = cx.dm
+  let early_const_uses = cx.early_const_uses
+  let json = cx.json
+  let lowered = cx.lowered
+  let mod_tabs = cx.mod_tabs
+  let module_table = cx.module_table
+  let path = req.path
+  let post_use_decls = cx.post_use_decls
+  let proto_reg = cx.proto_reg
+  let rd = cx.rd
+  let region_marks = cx.region_marks
+  let root_picks = cx.root_picks
+  let sym_tab = cx.sym_tab
+  let target_mod_name = cx.target_mod_name
+  let typed_prog0 = cx.typed_prog0
+  let typed_tab = cx.typed_tab
+  # Contracts are discharged against the typed calls, where a
+  # pipe is the call it spells.
+  let contract_vd = if typed_prog0.errs != 0 { vd_count(0) }
+                    else { vd_render(call_site_diags(path, typed_prog0.decls, typed_tab)) }
+  # Post-inference protocol-call rewrite. `Expr.ty` is
+  # populated for every node now, so each `op(x, ...)`
+  # call can be redirected to the matching
+  # `__pimpl_<P>_<T>_<op>` direct call. Sites with
+  # unknown types fall through and execute the
+  # dispatcher fn's panic at runtime.
+  let proto_reg = match dm { Some(x) -> demand_registry(proto_reg, x, typed_prog0.decls)  None -> proto_reg }
+  let typed_prog = resolve_protocol_calls(typed_prog0, proto_reg)
+  # Walk the post-rewrite AST and report any
+  # `__proto_<op>` call whose receiver type is concrete
+  # but has no matching impl. Polymorphic helpers whose
+  # receiver is a TyVar at this point keep the runtime
+  # fallthrough behaviour.
+  let dispatch_diags =
+    validate_resolved_protocols(typed_prog, typed_tab, proto_reg, diag_ctx)
+  # The pinned-region gate. A `region { }` bump-arena is
+  # a per-thread pointer; a fiber that parks inside one
+  # would resume on another OS thread with a stale arena
+  # pointer. Fail the compile if any region body can reach
+  # a suspending effect — the typed row already carries
+  # the transitive reach a syntactic scan would miss.
+  let region_yield_diags = region_yield_findings(typed_prog.decls, region_marks, path)
+  # Op-name collision diagnostic. The by-name handler
+  # walk binds the wrong evidence when an op name is shared
+  # by ≥2 effects and the call is not disambiguated; the
+  # typer's resolution record (`op_res`) flags those sites.
+  # Capability passing makes the collision impossible, so it
+  # is a compile error, not corruption.
+  let collision_errs =
+    check_op_collisions(path, typed_prog.op_res, typed_prog.decls, typed_tab)
+  # One table, one message, every class: a contested
+  # type reads like a contested function, and a bare
+  # name two modules both export is an error rather
+  # than a pick by registration order.
+  let name_errs =
+    nr_report_program_tab(diag_ctx, typed_prog.decls, target_mod_name,
+                      lowered.reg, early_const_uses,
+                      core_mod_names(core_mods, []),
+                      post_use_decls, root_picks, sym_tab,
+                      mtabs_of(mod_tabs, "").entries, typed_prog.diags)
+  # Unused local bindings in the root file's fns and in every
+  # runner block; warnings only.
+  report_unused_in_decls(path, module_table, typed_prog.decls)
+  let typed_vds = [Verdict(0, rd.diags), Verdict(typed_prog.errs, typed_prog.diags), contract_vd,
+                   vd_render(dispatch_diags), vd_rendered(region_yield_diags),
+                   vd_rendered(collision_errs), vd_rendered(name_errs),
+                   vd_render(target_main_diags(req.target, path, typed_prog.decls, sym_tab, entry)),
+                   vd_render(backend_js_diags(req.backend, req.target, path, typed_prog.decls))]
+  if vd_failed(typed_vds) { Halt(vd_exit(json, typed_vds)) }
+  else { Go(Checked { json: cx.json, target_mod_name: cx.target_mod_name, entry: cx.entry, docs: cx.docs, nsrcs: cx.nsrcs, npre: cx.npre, surface_fn_bounds: cx.surface_fn_bounds, diag_ctx: cx.diag_ctx, sym_views: cx.sym_views, pa_segs: cx.pa_segs, region_marks: cx.region_marks, sym_tab: cx.sym_tab, stamp_ids: cx.stamp_ids, core_hit: cx.core_hit, all_decls: cx.all_decls, dropped: cx.dropped, pruned: cx.pruned, dm: cx.dm, typed_tab: cx.typed_tab, tin: cx.tin, proto_reg: proto_reg, typed_prog: typed_prog, typed_vds: typed_vds }) }
+}
+
+
+fn backend_js_diags(bk: Backend, target: Target, path: String, decls: [Decl]) : [Diagnostic] = match bk {
+  BkNative        -> if target == TgWasm32Browser { [] } else { js_native_diags(path, decls) }
+  BkNativeModular -> if target == TgWasm32Browser { [] } else { js_native_diags(path, decls) }
+  _               -> []
+}
