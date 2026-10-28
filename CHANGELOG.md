@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.182.0 (2026-10-28)
+
+### Added
+
+- **emit**: print the C backend from KIR and delete the AST to C lowering (#3276)
+
+### Fixed
+
+- **wasm**: build the wasm runtime with tail calls enabled
+- **wasm**: enable tail calls on the WebAssembly targets
+
 ## v0.181.0 (2026-10-27)
 
 ### Added
