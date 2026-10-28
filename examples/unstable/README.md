@@ -38,7 +38,7 @@ holding the marked declarations. Run with `bin/kai run <dir>/main.kai`.
 
 - **`non_pub_ignored/`** — `#[unstable]` on a non-`pub` declaration
   is rejected: `` `#[unstable]` must precede a `pub fn`, `pub type`,
-  or `pub const` declaration``.
+  `pub const`, `pub effect`, or `pub protocol` declaration``.
 
 - **`unknown_pkg_optin/`** — `[unstable] zzz = true` for a
   package that the program never imports. The compiler does
