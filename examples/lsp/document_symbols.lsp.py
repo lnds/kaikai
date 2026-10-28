@@ -35,6 +35,10 @@ src = """fn add(x: Int, y: Int) : Int = x + y
 
 fn double(n: Int) : Int = n * 2
 
+protocol Shape {
+  area(self: Self) : Int
+}
+
 fn main() {
   let z = add(double(3), 4)
   z
@@ -59,8 +63,11 @@ names = [s["name"] for s in syms]
 assert "add" in names, names
 assert "double" in names, names
 assert "main" in names, names
-# All should be Function kind (12).
-assert all(s["kind"] == 12 for s in syms), syms
+assert "__proto_area" not in names, names
+shape = next(s for s in syms if s["name"] == "Shape")
+assert shape["kind"] == 11, shape
+assert [(c["name"], c["kind"]) for c in shape["children"]] == [("area", 6)], shape
+assert all(s["kind"] == 12 for s in syms if s["name"] != "Shape"), syms
 
 send({"jsonrpc":"2.0","id":3,"method":"shutdown","params":None})
 recv()

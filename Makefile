@@ -1222,7 +1222,7 @@ test-library-mode: kaic2
 	          def_at_pattern_record def_at_pattern_shadow \
 	          def_at_pattern_as def_at_closure_capture \
 	          def_at_nested_let def_at_match_arm \
-	          def_at_lambda_param symbols_root_only; do \
+	          def_at_lambda_param symbols_root_only symbols_protocol; do \
 	  src="examples/library_mode/$$fx.kai"; \
 	  exp="examples/library_mode/$$fx.out.expected"; \
 	  out=$$(mktemp); \
