@@ -1400,7 +1400,13 @@ test-ffi-v2-struct: $(TARGET) build
 	grep -v "makecontext/swapcontext" build/v2_struct.asan.raw > build/v2_struct.asan.out || true; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.asan.out > /dev/null \
 	  && echo "ffi-v2-struct OK (ASAN clean)" \
-	  || { echo "ffi-v2-struct ASAN DIFF"; cat build/v2_struct.asan.raw; exit 1; }
+	  || { echo "ffi-v2-struct ASAN DIFF"; cat build/v2_struct.asan.raw; exit 1; }; \
+	if $(CC) $(CFLAGS) -Wno-absolute-value -I build/v2_struct.d -c ../examples/ffi/v2_struct_shim_mismatch.c -o build/v2_struct_mismatch.o 2> build/v2_struct_mismatch.err; then \
+	  echo "ffi-v2-struct FAIL (a shim that disagrees with kai_ffi.h compiled)"; exit 1; \
+	fi; \
+	grep -q "alpha" build/v2_struct_mismatch.err \
+	  && echo "ffi-v2-struct OK (a shim that disagrees with kai_ffi.h fails to compile)" \
+	  || { echo "ffi-v2-struct FAIL (mismatch rejected for the wrong reason)"; cat build/v2_struct_mismatch.err; exit 1; }
 
 # FFI v2 (#417) — opaque handles. A handle is used in three consuming
 # calls (two bumps + the destructor), pinning the no-Drop ownership rule
