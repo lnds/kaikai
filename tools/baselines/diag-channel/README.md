@@ -1,0 +1,1 @@
+Functions that print a diagnostic line themselves (`tools/diag-channel-audit.sh`). One file per `<file>__<fn>`, the reason as its content. A new one fails the gate; build the diagnostic with `mk_diag` and print it with `render_diag` instead.

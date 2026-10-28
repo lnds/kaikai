@@ -11,6 +11,7 @@ import compiler.diag
 import compiler.emit_c_ctx
 import compiler.emit_c_handle_env
 import compiler.emit_shared_fv
+import compiler.expr_positions
 import compiler.infer_index
 import compiler.module_table
 import compiler.util
@@ -84,36 +85,19 @@ fn ubind_binder(u: UBind) : Binder = match u {
   UB(b, _, _) -> b
 }
 
-fn report_unused_ubinds(file: String, ubs: [UBind], refs: [LocalId]) : Unit / Console + File {
-
-  match ubs {
-    [] -> ()
-    [u, ...rest] -> match u {
-      UB(b, line, col) -> {
-        if name_is_silenced(written_text(b.name)) { () }
-        else if locals_have(refs, b.id) { () }
-        else {
-          diag_warning(file, line, col,
-            concat_all(["unused binding `", written_text(b.name), "`"]))
-          diag_help("prefix with `_` to mark as intentionally unused")
-        }
-        report_unused_ubinds(file, rest, refs)
+fn report_unused_ubinds(file: String, ubs: [UBind], refs: [LocalId]) : [Diagnostic] =
+  flat_map(ubs, (u) => match u {
+    UB(b, line, col) ->
+      if name_is_silenced(written_text(b.name)) or locals_have(refs, b.id) { [] }
+      else {
+        [mk_diag(SevWarning, file, line, col, concat_all(["unused binding `", written_text(b.name), "`"]),
+                 [ri_help(file, line, col, "prefix with `_` to mark as intentionally unused")])]
       }
-    }
-  }
-}
+  })
 
 #[doc("Walk a decl looking for unused local bindings: the root file's own, and every block's in the file that declares it (`mods` maps a module to its file). Skips parameter names entirely — interface compliance, protocol dispatch, and axiom signatures all justify silent unused params.")]
-pub fn report_unused_in_decls(file: String, mods: [ModuleEntry], decls: [Decl]) : Unit / Console + File {
-
-  match decls {
-    [] -> ()
-    [d, ...rest] -> {
-      report_unused_in_decl(file, mods, d)
-      report_unused_in_decls(file, mods, rest)
-    }
-  }
-}
+pub fn report_unused_in_decls(file: String, mods: [ModuleEntry], decls: [Decl]) : [Diagnostic] / Console =
+  flat_map(decls, (d) => report_unused_in_decl(file, mods, d))
 
 fn block_file(file: String, mods: [ModuleEntry], mo: Option[String]) : String = match mo {
   None -> file
@@ -123,175 +107,43 @@ fn block_file(file: String, mods: [ModuleEntry], mo: Option[String]) : String = 
   }
 }
 
-fn report_unused_in_decl(file: String, mods: [ModuleEntry], d: Decl) : Unit / Console + File {
-
-  match d {
-    DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
-      None    -> report_unused_in_expr(file, body)
-      Some(_) -> ()
-    }
-    DTest(_, body, _, _, mo)       -> report_unused_in_expr(block_file(file, mods, mo), body)
-    DBench(_, body, _, _, mo)      -> report_unused_in_expr(block_file(file, mods, mo), body)
-    DCheck(_, _, body, _, _, mo)   -> report_unused_in_expr(block_file(file, mods, mo), body)
-    _ -> ()
+fn report_unused_in_decl(file: String, mods: [ModuleEntry], d: Decl) : [Diagnostic] / Console = match d {
+  DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
+    None    -> report_unused_in_expr(file, body)
+    Some(_) -> []
   }
+  DTest(_, body, _, _, mo)       -> report_unused_in_expr(block_file(file, mods, mo), body)
+  DBench(_, body, _, _, mo)      -> report_unused_in_expr(block_file(file, mods, mo), body)
+  DCheck(_, _, body, _, _, mo)   -> report_unused_in_expr(block_file(file, mods, mo), body)
+  _ -> []
 }
 
-fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
+fn report_unused_in_expr(file: String, e: Expr) : [Diagnostic] / Console = match e.kind {
+  EMatch(scr, arms) -> list_append(report_unused_in_expr(file, scr), report_unused_in_arms(file, arms))
+  EBlock(stmts, tail) -> report_unused_in_block(file, stmts, tail)
+  _ -> report_unused_in_children(file, xp_positions(e))
+}
 
-  match e.kind {
-    EInt(_, _)  -> ()
-    EReal(_, _) -> ()
-    EIntLit(_) -> ()
-    EDecimalLit(_) -> ()
-    EFixed(_, _) -> ()
-    EBool(_) -> ()
-    EChar(_) -> ()
-    EStr(_, _) -> ()
-    EUnit -> ()
-    EName(_) -> ()
-    EMark(_) -> ()
-    ESym(_, _) -> ()
-    ELocal(_) -> ()
-    EOp(_) -> ()
-    EUnder -> ()
-    EPlaceholder -> ()
-    EHole(_) -> ()
-    ETodo(_) -> ()
-    EExternBody(_, _) -> ()
-    EVariantsOf(_, _) -> ()
-    EModCall(_, _) -> ()
-    EIntrinsic(_, args_) -> report_unused_in_exprs(file, args_)
-    ESurface(sf) -> report_unused_in_exprs(file, surface_children(sf))
-    ECall(f, xs) -> {
-      report_unused_in_expr(file, f)
-      report_unused_in_exprs(file, xs)
-    }
-    EField(base, _) -> report_unused_in_expr(file, base)
-    EIndex(a, b) -> {
-      report_unused_in_expr(file, a)
-      report_unused_in_expr(file, b)
-    }
-    EBinop(_, a, b) -> {
-      report_unused_in_expr(file, a)
-      report_unused_in_expr(file, b)
-    }
-    EUnop(_, x) -> report_unused_in_expr(file, x)
-    EIf(c, t, eo) -> {
-      report_unused_in_expr(file, c)
-      report_unused_in_expr(file, t)
-      match eo { Some(b) -> report_unused_in_expr(file, b) None -> () }
-    }
-    EMatch(scr, arms) -> {
-      report_unused_in_expr(file, scr)
-      report_unused_in_arms(file, arms)
-    }
-    ELambda(_, body) -> report_unused_in_expr(file, body)
-    ERecordLit(_, fs) -> report_unused_in_field_inits(file, fs)
-    EList(els) -> report_unused_in_list_elems(file, els)
-    ERange(a, b, opt) -> {
-      report_unused_in_expr(file, a)
-      report_unused_in_expr(file, b)
-      match opt { Some(s) -> report_unused_in_expr(file, s) None -> () }
-    }
-    EBlock(stmts, tail) -> report_unused_in_block(file, stmts, tail)
-    EPipe(a, b) -> {
-      report_unused_in_expr(file, a)
-      report_unused_in_expr(file, b)
-    }
-    EDispatchPipe(_, a, b) -> {
-      report_unused_in_expr(file, a)
-      report_unused_in_expr(file, b)
-    }
-    EBang(inner) -> report_unused_in_expr(file, inner)
-    ELitUnit(inner, _) -> report_unused_in_expr(file, inner)
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      report_unused_in_expr(file, body)
-      match init_opt { Some(i) -> report_unused_in_expr(file, i) None -> () }
-      report_unused_in_hclauses(file, clauses)
-      match ret_opt {
-        Some(r) -> match r { HR(_, b, _, _) -> report_unused_in_expr(file, b) }
-        None -> ()
+fn report_unused_in_children(file: String, ps: [XPos]) : [Diagnostic] / Console =
+  flat_map(ps, (p) => match p { XP(_, c) -> report_unused_in_expr(file, c) })
+
+fn report_unused_in_arms(file: String, arms: [Arm]) : [Diagnostic] / Console =
+  flat_map(arms, (a) => match a {
+    Arm(pat, opt_g, body) -> {
+      # An arm's pattern binders are visible in the (optional)
+      # guard and the body. Collect references from both, then
+      # warn on any binder absent from the union.
+      let ubs = pat_ubinds(pat, [])
+      let scope = ubind_scope(ubs)
+      let refs0 = match opt_g {
+        Some(g) -> fv_expr(g, [], scope, [])
+        None    -> []
       }
+      let refs = capture_locals(fv_expr(body, [], scope, refs0))
+      let guard = match opt_g { Some(g) -> report_unused_in_expr(file, g)  None -> [] }
+      list_append(report_unused_ubinds(file, ubs, refs), list_append(guard, report_unused_in_expr(file, body)))
     }
-  }
-}
-
-fn report_unused_in_exprs(file: String, es: [Expr]) : Unit / Console + File {
-
-  match es {
-    [] -> ()
-    [h, ...rest] -> {
-      report_unused_in_expr(file, h)
-      report_unused_in_exprs(file, rest)
-    }
-  }
-}
-
-fn report_unused_in_arms(file: String, arms: [Arm]) : Unit / Console + File {
-
-  match arms {
-    [] -> ()
-    [a, ...rest] -> match a {
-      Arm(pat, opt_g, body) -> {
-        # An arm's pattern binders are visible in the (optional)
-        # guard and the body. Collect references from both, then
-        # warn on any binder absent from the union.
-        let ubs = pat_ubinds(pat, [])
-        let scope = ubind_scope(ubs)
-        let refs0 = match opt_g {
-          Some(g) -> fv_expr(g, [], scope, [])
-          None    -> []
-        }
-        let refs = capture_locals(fv_expr(body, [], scope, refs0))
-        report_unused_ubinds(file, ubs, refs)
-        match opt_g { Some(g) -> report_unused_in_expr(file, g) None -> () }
-        report_unused_in_expr(file, body)
-        report_unused_in_arms(file, rest)
-      }
-    }
-  }
-}
-
-fn report_unused_in_field_inits(file: String, fs: [FieldInit]) : Unit / Console + File {
-
-  match fs {
-    [] -> ()
-    [f, ...rest] -> match f {
-      FI(_, e) -> {
-        report_unused_in_expr(file, e)
-        report_unused_in_field_inits(file, rest)
-      }
-    }
-  }
-}
-
-fn report_unused_in_list_elems(file: String, els: [ListElem]) : Unit / Console + File {
-
-  match els {
-    [] -> ()
-    [el, ...rest] -> {
-      match el {
-        ElPlain(e)  -> report_unused_in_expr(file, e)
-        ElSpread(e) -> report_unused_in_expr(file, e)
-      }
-      report_unused_in_list_elems(file, rest)
-    }
-  }
-}
-
-fn report_unused_in_hclauses(file: String, cs: [HClause]) : Unit / Console + File {
-
-  match cs {
-    [] -> ()
-    [c, ...rest] -> match c {
-      HC(_, _, body, _, _) -> {
-        report_unused_in_expr(file, body)
-        report_unused_in_hclauses(file, rest)
-      }
-    }
-  }
-}
+  })
 
 # Walk a block in source order. For each `SLet(pat, _, rhs)`:
 #   1. Recurse into `rhs` (its body cannot reference the pattern's
@@ -299,13 +151,13 @@ fn report_unused_in_hclauses(file: String, cs: [HClause]) : Unit / Console + Fil
 #   2. Compute the locals read in the rest of the block (subsequent
 #      stmts + optional tail).
 #   3. Warn on any pat-binder absent from that read set.
-fn report_unused_in_block(file: String, stmts: [Stmt], tail: Option[Expr]) : Unit / Console + File {
+fn report_unused_in_block(file: String, stmts: [Stmt], tail: Option[Expr]) : [Diagnostic] / Console {
   let bound = ru_binders(stmts, [])
   let tail_reads = match tail {
     Some(t) -> ru_mark(idx_empty(), capture_locals(fv_expr(t, [], fv_outer_of(bound), [])))
     None    -> idx_empty()
   }
-  ru_walk(file, stmts, ru_live_after(list_reverse(stmts), bound, idx_empty(), []), tail_reads, tail)
+  ru_walk(file, stmts, ru_live_after(list_reverse(stmts), bound, idx_empty(), []), tail_reads, tail, [])
 }
 
 # The block's binders, the latest statement's first.
@@ -376,42 +228,29 @@ fn ru_used(ubs: [UBind], live: NameIndex[RuLive], tail_reads: NameIndex[RuLive])
 }
 
 fn ru_walk(file: String, stmts: [Stmt], lives: [NameIndex[RuLive]], tail_reads: NameIndex[RuLive],
-           tail: Option[Expr]) : Unit / Console + File =
+           tail: Option[Expr], acc: [Diagnostic]) : [Diagnostic] / Console =
   match stmts {
     [] -> match tail {
-      Some(t) -> report_unused_in_expr(file, t)
-      None    -> ()
+      Some(t) -> list_append(acc, report_unused_in_expr(file, t))
+      None    -> acc
     }
     [s, ...rest] -> match lives {
-      [] -> ()
-      [live, ...more] -> {
-        ru_stmt(file, s, live, tail_reads)
-        ru_walk(file, rest, more, tail_reads, tail)
-      }
+      [] -> acc
+      [live, ...more] -> ru_walk(file, rest, more, tail_reads, tail, list_append(acc, ru_stmt(file, s, live, tail_reads)))
     }
   }
 
-fn ru_stmt(file: String, s: Stmt, live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : Unit / Console + File =
+fn ru_stmt(file: String, s: Stmt, live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : [Diagnostic] / Console =
   match s {
     SLet(pat, _, rhs) -> {
-      report_unused_in_expr(file, rhs)
       let ubs = pat_ubinds(pat, [])
-      report_unused_ubinds(file, ubs, ru_used(ubs, live, tail_reads))
+      list_append(report_unused_in_expr(file, rhs), report_unused_ubinds(file, ubs, ru_used(ubs, live, tail_reads)))
     }
     SVar(_, _, rhs, _, _) -> report_unused_in_expr(file, rhs)
-    SAssert(c, opt_m) -> {
-      report_unused_in_expr(file, c)
-      match opt_m { Some(m) -> report_unused_in_expr(file, m) None -> () }
-    }
+    SAssert(c, opt_m) -> list_append(report_unused_in_expr(file, c), match opt_m { Some(m) -> report_unused_in_expr(file, m)  None -> [] })
     SExprStmt(x) -> report_unused_in_expr(file, x)
-    SIndexAssign(b, i, v, _, _) -> {
-      report_unused_in_expr(file, b)
-      report_unused_in_expr(file, i)
-      report_unused_in_expr(file, v)
-    }
-    SAssign(b, v, _, _) -> {
-      report_unused_in_expr(file, b)
-      report_unused_in_expr(file, v)
-    }
-    SUse(_, _, _) -> ()
+    SIndexAssign(b, i, v, _, _) ->
+      list_append(report_unused_in_expr(file, b), list_append(report_unused_in_expr(file, i), report_unused_in_expr(file, v)))
+    SAssign(b, v, _, _) -> list_append(report_unused_in_expr(file, b), report_unused_in_expr(file, v))
+    SUse(_, _, _) -> []
   }

@@ -4,8 +4,9 @@
   diags-json-parity.py <manifest> <baseline-dir>
 
 Each manifest line is `<fixture> <stderr file> <json file>`. A fixture is
-at parity when the errors its `--diags-json` document carries are exactly
-the errors its plain run printed to stderr, by (file, message, line, col).
+at parity when the errors and warnings its `--diags-json` document carries
+are exactly the ones its plain run printed to stderr, by (severity, file,
+message, line, col).
 Fixtures not yet at parity have a file in the baseline directory (one
 entry per fixture, the reason as its second column); the set may only shrink.
 """
@@ -19,21 +20,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib
 sys.dont_write_bytecode = True
 import entries
 
-SINGLE = re.compile(r"(.*?):(\d+):(\d+): error: (.*)$")
+SINGLE = re.compile(r"(.*?):(\d+):(\d+): (error|warning): (.*)$")
 ARROW = re.compile(r"\s+--> (.*):(\d+):(\d+)$")
 
 
 def stderr_error(lines, i):
-    """The error that starts at line i, or None."""
+    """The error or warning that starts at line i, or None."""
     m = SINGLE.match(lines[i])
     if m:
-        return (m.group(1), m.group(4), int(m.group(2)), int(m.group(3)))
-    if not lines[i].startswith("error: "):
+        return (m.group(4), m.group(1), m.group(5), int(m.group(2)), int(m.group(3)))
+    sev = next((k for k in ("error", "warning") if lines[i].startswith(k + ": ")), None)
+    if not sev:
         return None
+    msg = lines[i][len(sev) + 2:]
     a = ARROW.match(lines[i + 1]) if i + 1 < len(lines) else None
     if not a:
-        return (None, lines[i][len("error: "):], None, None)
-    return (a.group(1), lines[i][len("error: "):], int(a.group(2)), int(a.group(3)))
+        return (sev, None, msg, None, None)
+    return (sev, a.group(1), msg, int(a.group(2)), int(a.group(3)))
 
 
 def stderr_errors(path):
@@ -46,8 +49,8 @@ def json_errors(path):
         doc = json.load(open(path))
     except ValueError:
         return None
-    return sorted((d["file"], d["message"], d["line"], d["col"])
-                  for d in doc.get("diagnostics", []) if d.get("severity") == "error")
+    return sorted((d["severity"], d["file"], d["message"], d["line"], d["col"])
+                  for d in doc.get("diagnostics", []) if d.get("severity") in ("error", "warning"))
 
 
 def off_parity(manifest):
@@ -69,7 +72,7 @@ def main(argv):
         return 1
     total, off = off_parity(manifest)
     fails = []
-    fails += ["%s — --diags-json does not report the errors kai build prints" % f for f in sorted(off - set(pinned))]
+    fails += ["%s — --diags-json does not report the errors and warnings kai build prints" % f for f in sorted(off - set(pinned))]
     fails += ["%s is at parity now; delete it from %s" % (f, baseline) for f in sorted(set(pinned) - off)]
     for f in fails:
         print("diags-json-parity FAIL: " + f)
