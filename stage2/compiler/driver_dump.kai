@@ -10,7 +10,6 @@ import compiler.symtab
 import compiler.builtins
 import compiler.call_site_check
 import compiler.resolve_program
-import compiler.typed_cut
 import compiler.driver_cli
 import compiler.core_front
 import compiler.desugar_brand
@@ -24,15 +23,15 @@ import compiler.evidence_inject
 import compiler.pub_access
 import compiler.rawsafe
 import compiler.tailfuse
-import compiler.protos
 import compiler.lint
 import compiler.core_cut
 import compiler.doc_attr
 import compiler.driver_policy
 import compiler.driver_front
-import compiler.desugar_nursery
 import compiler.emit_c_dump
 import compiler.driver_lower
+import compiler.driver_solve
+import compiler.diag
 import compiler.modules_paths
 
 pub(pkg) fn is_dump_mode(mode: Mode) : Bool = match mode {
@@ -60,27 +59,22 @@ pub(pkg) fn is_dump_mode(mode: Mode) : Bool = match mode {
   _ -> false
 }
 
-fn mode_dump_call_elision(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  let rd = resolve_decls_stamped(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops, loops_on(req.mode))
-  let chk = rd.errs
-  let all_decls = rd.decls
-  if chk != 0 { chk } else {
-    let protos = stamped_view(front, lowered.reg, all_decls, sym_tab)
-    let fused = pub_loop_workers(tailfuse_decls(all_decls, sym_tab, target_mod_name), sym_tab, target_mod_name)
-    let typed_tab = st_extend(sym_tab, fused.rows)
-    let tin = typer_in(front, protos, all_decls, typed_tab)
-    let typed = tcut_infer_program(path, fused.decls, "", tin, tcut_no_defer(), false)
-    if typed.errs != 0 { typed.errs } else { dump_call_elision(path, typed.decls, typed_tab) }
-  }
+#[doc("The stage after which a dump mode reads the pipeline.")]
+pub(pkg) type DumpCut = | CutReady | CutStamp | CutInfer
+
+pub(pkg) fn dump_cut(mode: Mode) : DumpCut = match mode {
+  MAst -> CutReady
+  MTypes -> CutReady
+  MEnv -> CutReady
+  MDocJson -> CutReady
+  MCheckCoreFront -> CutReady
+  MDumpBrands -> CutStamp
+  MDumpEvidenceObligations -> CutStamp
+  MDumpEvidenceArity -> CutStamp
+  MLibraryMode -> CutStamp
+  MLint -> CutStamp
+  MLintJson -> CutStamp
+  _ -> CutInfer
 }
 
 fn mode_check_core_front(req: Req, cx: Ready) : Int / Console + File + Mutable {
@@ -108,59 +102,6 @@ fn mode_check_core_front(req: Req, cx: Ready) : Int / Console + File + Mutable {
   match core_cache.early_cut { EcOff -> bad  EcOn -> 0 }
 }
 
-fn mode_dump_brands(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let sym_tab = cx.sym_tab
-  let rd = resolve_decls_stamped(cx.front.df, cx.all_decls, cx.front.views, sym_tab, cx.front.target, cx.callee_ops, loops_on(req.mode))
-  let nursery_rw = rewrite_nursery_caps_decls(rd.decls, core_nursery_fn(sym_tab), core_mod_names(req.core_mods, []), cx.front.df)
-  dump_brands(nursery_rw.brands, nursery_rw.calls); 0
-}
-
-fn mode_dump_evidence_obligations(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let entry = entry_id(root_module_name(req.path), runs_blocks(req.mode))
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  # Deliberately NOT gated on the resolver: the collision
-  # the dump must surface lives in programs the typer
-  # mis-resolves or rejects. The pass
-  # runs inference itself to anchor op-call callees, then
-  # detects collisions structurally by op name, so a
-  # mis-resolved or partially-rejected program still dumps.
-  # Exit 0 — analysis only, so fixtures can pin a golden.
-  # The typer knows the entry point by id, so the declarations
-  # are stamped first; a resolver error leaves them unstamped.
-  let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-  let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab)
-  dump_evidence_obligations(path, rd.decls, tin, entry, target_mod_name)
-}
-
-fn mode_dump_evidence_arity(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let entry = entry_id(root_module_name(req.path), runs_blocks(req.mode))
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  # Injection-arity histogram for the §A.3 ABI spike. Runs
-  # the injection pass over the whole loaded program (self-
-  # compile + stdlib when pointed at the compiler) and
-  # reports the per-fn evidence-param count distribution.
-  # Analysis only; exit 0.
-  let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-  let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab)
-  dump_evidence_arity(path, rd.decls, tin, entry)
-}
-
 fn mode_doc_json(req: Req, cx: Ready) : Int / Console + File + Mutable {
   let docs = cx.docs
   let own_tab = cx.own_tab
@@ -171,127 +112,67 @@ fn mode_doc_json(req: Req, cx: Ready) : Int / Console + File + Mutable {
   0
 }
 
-fn mode_library_mode(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let src = req.src
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  # Library mode reuses the typer through `infer_program`
-  # (same as the other JSON dumps) and
-  # answers position-keyed queries against the typed
-  # AST. Probes are read from `# @probe` comments in
-  # the source so a fixture is self-describing.
-  let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-  if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_library_mode(path, src, rd.decls, tin) }
-}
+fn typer_in_stamped(cx: StampRun) : TyperIn =
+  typer_in(cx.front, cx.stamped.view, cx.all_decls, cx.sym_tab)
 
-fn mode_lint(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let expanded = cx.expanded
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let post_use_decls = cx.post_use_decls
-  let surface_decls = cx.surface_decls
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  let test_own = req.test_own
-  # Lints read the typed AST, so a clean typecheck is the
-  # precondition. A type-rejected program returns its error
-  # count (it is not a valid build); a clean one runs the
-  # lints and always exits 0 so a lint never blocks a build.
-  # The typer reads what a build's does: a lint that rejected
-  # a pipe the build accepts would be unusable on idiomatic code.
-  let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-  let chk = rd.errs
-  let all_decls = rd.decls
-  if chk != 0 { chk } else {
-    let tin = typer_in(front, stamped_view(front, lowered.reg, all_decls, sym_tab), all_decls, sym_tab)
-    run_lint(path, lint_owned_mods(expanded, test_own), all_decls, post_use_decls, surface_decls, tin)
-  }
-}
+fn mode_dump_evidence_obligations(req: Req, cx: StampRun) : Int / Console + File + Mutable =
+  dump_evidence_obligations(req.path, cx.all_decls, typer_in_stamped(cx), entry_id(root_module_name(req.path), runs_blocks(req.mode)), root_module_name(req.path))
 
-fn mode_lint_json(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let expanded = cx.expanded
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let post_use_decls = cx.post_use_decls
-  let surface_decls = cx.surface_decls
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  let test_own = req.test_own
-  let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-  let chk = rd.errs
-  let all_decls = rd.decls
-  if chk != 0 { chk } else {
-    let tin = typer_in(front, stamped_view(front, lowered.reg, all_decls, sym_tab), all_decls, sym_tab)
-    run_lint_json(path, lint_owned_mods(expanded, test_own), all_decls, post_use_decls, surface_decls, tin)
-  }
-}
+fn mode_dump_evidence_arity(req: Req, cx: StampRun) : Int / Console + File + Mutable =
+  dump_evidence_arity(req.path, cx.all_decls, typer_in_stamped(cx), entry_id(root_module_name(req.path), runs_blocks(req.mode)))
 
-fn dump_resolved(req: Req, cx: Ready, run: (String, [Decl], TyperIn) -> Int / Stdout + Stderr + Stdin + File + Mutable) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let callee_ops = cx.callee_ops
-  let diag_ctx = cx.diag_ctx
-  let front = cx.front
-  let lowered = cx.lowered
-  let path = req.path
-  let sym_tab = cx.sym_tab
-  let sym_views = cx.sym_views
-  let target_mod_name = root_module_name(req.path)
-  let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-  if rd.errs != 0 { rd.errs }
-  else {
-    let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab)
-    run(path, rd.decls, tin)
-  }
-}
+fn mode_library_mode(req: Req, cx: StampRun) : Int / Console + File + Mutable =
+  if cx.chk != 0 { cx.chk } else { dump_library_mode(req.path, req.src, cx.all_decls, typer_in_stamped(cx)) }
 
-pub(pkg) fn run_dump_mode(req: Req, cx: Ready) : Int / Console + File + Mutable {
-  let all_decls = cx.all_decls
-  let doc_decls = cx.doc_decls
-  let mode = req.mode
-  let own_tab = cx.own_tab
-  let surface_decls = cx.surface_decls
-  let sym_tab = cx.sym_tab
-  let tab0 = cx.tab0
-  match mode {
-  MAst -> { dump_program(surface_decls, tab0); 0 }
-  MTypes -> { dump_types(doc_decls, own_tab); 0 }
-  MEnv -> { dump_env(build_ty_env(all_decls, sym_tab).env); 0 }
-  MInfer -> dump_resolved(req, cx, dump_infer)
-  MDumpTyped -> dump_resolved(req, cx, dump_typed)
-  MDumpTypedCore -> dump_resolved(req, cx, dump_typed_core)
-  MDumpMono -> dump_resolved(req, cx, dump_mono)
-  MDumpMonoOut -> dump_resolved(req, cx, dump_mono_out)
-  MDumpRawSafe -> dump_resolved(req, cx, dump_rawsafe)
-  MDumpBorrowSafe -> dump_resolved(req, cx, dump_borrowsafe)
-  MDumpLastUse -> dump_resolved(req, cx, dump_last_use)
-  MDumpIntervals -> dump_resolved(req, cx, dump_intervals)
-  MDumpCallElision -> mode_dump_call_elision(req, cx)
+fn mode_lint(req: Req, cx: StampRun) : Int / Console + File + Mutable =
+  if cx.chk != 0 { cx.chk }
+  else { run_lint(req.path, lint_owned_mods(cx.expanded, req.test_own), cx.all_decls, cx.post_use_decls, cx.surface_decls, typer_in_stamped(cx)) }
+
+fn mode_lint_json(req: Req, cx: StampRun) : Int / Console + File + Mutable =
+  if cx.chk != 0 { cx.chk }
+  else { run_lint_json(req.path, lint_owned_mods(cx.expanded, req.test_own), cx.all_decls, cx.post_use_decls, cx.surface_decls, typer_in_stamped(cx)) }
+
+#[doc("Runs the dump of a mode that reads the program after the front end.")]
+pub(pkg) fn run_dump_ready(req: Req, cx: Ready) : Int / Console + File + Mutable = match req.mode {
+  MAst -> { dump_program(cx.surface_decls, cx.tab0); 0 }
+  MTypes -> { dump_types(cx.doc_decls, cx.own_tab); 0 }
+  MEnv -> { dump_env(build_ty_env(cx.all_decls, cx.sym_tab).env); 0 }
+  MDocJson -> mode_doc_json(req, cx)
   MCheckCoreFront -> mode_check_core_front(req, cx)
-  MDumpBrands -> mode_dump_brands(req, cx)
+  _ -> 0
+}
+
+#[doc("Runs the dump of a mode that reads the program once its names are resolved and stamped.")]
+pub(pkg) fn run_dump_stamp(req: Req, cx: StampRun) : Int / Console + File + Mutable = match req.mode {
+  MDumpBrands -> { dump_brands(cx.nursery_brands, cx.nursery_calls); 0 }
   MDumpEvidenceObligations -> mode_dump_evidence_obligations(req, cx)
   MDumpEvidenceArity -> mode_dump_evidence_arity(req, cx)
-  MDocJson -> mode_doc_json(req, cx)
   MLibraryMode -> mode_library_mode(req, cx)
   MLint -> mode_lint(req, cx)
   MLintJson -> mode_lint_json(req, cx)
-    _ -> 0
-  }
+  _ -> 0
 }
 
+#[doc("Runs the dump of a mode that reads the typed program.")]
+pub(pkg) fn run_dump_infer(req: Req, cx: InferRun) : Int / Console + File + Mutable = {
+  let tp = cx.typed_prog0
+  let tab = cx.typed_tab
+  match req.mode {
+    MDumpCallElision -> if tp.errs != 0 { tp.errs } else { dump_call_elision(req.path, tp.decls, tab) }
+    _ -> {
+      each(tp.diags, render_diag)
+      match req.mode {
+        MInfer -> dump_infer(req.path, tp, tab)
+        MDumpTyped -> dump_typed(req.path, tp, tab)
+        MDumpTypedCore -> dump_typed_core(req.path, tp, tab)
+        MDumpMono -> dump_mono(req.path, tp, tab)
+        MDumpMonoOut -> dump_mono_out(req.path, tp, tab)
+        MDumpRawSafe -> dump_rawsafe(req.path, tp, tab)
+        MDumpBorrowSafe -> dump_borrowsafe(req.path, tp, tab)
+        MDumpLastUse -> dump_last_use(req.path, tp, tab)
+        MDumpIntervals -> dump_intervals(req.path, tp, tab)
+        _ -> 0
+      }
+    }
+  }
+}
