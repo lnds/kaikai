@@ -279,7 +279,7 @@ stdlib/
   stream.kai     lazy streams as generators over the Emit[t] effect
   reader.kai     with_reader for Reader[T]
   writer.kai     with_writer for Writer[W]
-  ffi.kai        Userdata: a kaikai value parked behind a void * for C callbacks
+  ffi.kai        Userdata[T]: a kaikai value parked behind a void * for C callbacks (under Ffi)
   array.kai      [T] / Array[T] bridge, plus `each` for `|!`
   string_builder.kai  amortised text accumulator; `append` rides Mutable, `build` is pure
   text.kai       Unicode text measurement (terminal-column width)

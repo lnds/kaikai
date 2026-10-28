@@ -178,7 +178,7 @@ Rules, all checked at compile time:
   (`Stdout`, `Stderr`, `Clock`, `Random`, `Log`, `Spawn`, ...). C calls
   with no `handle` on the stack, so `State`, a user effect or an
   open row is an error at the declaration naming the effect. `Ffi` is
-  not required: the body is kaikai code.
+  not required: the body is kaikai code, and it may list `Ffi` when it calls `take_userdata`.
 - Boundary types are the import ones minus two: a `String` is accepted
   as a PARAMETER only (copied in from the C string, which the caller keeps),
   and a struct by value is not supported. Scalars, fixed-width types and
@@ -203,26 +203,30 @@ body never unwinds through C frames: the process prints
 
 **Context as a value.** A C API with a `void *userdata` carries a kaikai
 value through `ffi.retain_userdata`, which parks a private copy of it behind a
-`Userdata` handle (an `extern "C" opaque`, so it crosses as `void *`).
-The exported function receives the handle and reads the value back with
-`ffi.take_userdata[T]`; `ffi.release_userdata` frees the parked copy. State belongs in
-actors: park the owner's `Pid` and forward from the callback with
-`mailbox_send(pid, msg)`.
+`Userdata[T]` handle (an `extern "C" opaque`, so it crosses as `void *`; `T` is
+the parked value's type). The exported function receives the handle and reads
+the value back with `ffi.take_userdata`; `ffi.release_userdata` frees the
+parked copy. All three need `Ffi`, so an exported callback that takes the value
+back lists `Ffi` in its row. State belongs in actors: park the owner's `Pid`
+and forward from the callback with `mailbox_send(pid, msg)`.
 
 ```kaikai
 import ffi
 
 type Msg = Tick(Int) | Done
 
-extern "C" fn on_event(ud: Userdata, n: Int) : Unit = {
-  let pid: Pid[Msg] = take_userdata(ud)
+extern "C" fn on_event(ud: Userdata[Pid[Msg]], n: Int) : Unit / Ffi = {
+  let pid = take_userdata(ud)
   mailbox_send(pid, if n < 0 { Done } else { Tick(n) })
 }
 
 fn main() : Int = 0
 ```
 
-`take_userdata[T]` trusts `T` to be the type the handle was retained at.
+The handle's `T` is checked at every take, so a take cannot read another type.
+A handle names a slot and its generation, not a pointer: a take or release of
+a released handle (or of a value C forged) traps with `released or invalid`,
+also after the slot is reused by a later `retain_userdata`.
 
 ## JavaScript imports
 
