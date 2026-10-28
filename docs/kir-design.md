@@ -42,9 +42,9 @@ Stage 2 has two backends that walk the **same** post-perceus `[Decl]`:
   API, and emits a native object — no `.ll` text. **The default backend
   since the Lane 1.5 flip** (native-vs-C parity ratchet reached zero); a
   `kaic2` built without libLLVM degrades the implicit default to C.
-- `emit_program(...)` → C (`--emit=c` / `c-modular`, `--backend=c`): the
-  portable bootstrap path and parity oracle. No longer the user default,
-  but the permanent fallback and selfhost oracle.
+- the C backend (`--emit=c` / `c-modular`, `--backend=c`): the same KIR
+  lowering as native, printed as C by `kir_c_*`. The portable bootstrap path
+  and selfhost oracle; no longer the user default.
 
 (The earlier `emit_program_llvm` `.ll`-text frontend — `--emit=llvm` — was
 removed once the in-process backend's C-API binding was written; see the
@@ -713,18 +713,9 @@ grow, not after.
   The deferred flip steps (default flip, `tier1-native` → always-on,
   release static-link) are wired-but-dormant; they land when parity closes.
 
-### Lane 2 (deferrable cleanup, OFF critical path) — migrate C-text under KIR
-- **Brief:** Only if/when reducing the emit_c↔emit_llvm duplication (§1) is worth
-  it on its own. Write a KIR→C consumer; route `--emit=c` through KIR; delete the
-  direct `emit_program`/`emit_program_modular` and the duplicated lowering helpers.
-- **Gate (strictest, IF this lane is done):** **selfhost byte-id** — C-from-KIR
-  textually identical to C-direct over the compiler itself, as a *migration proof*
-  (then a follow-up normalization commit may diverge toward cleaner C, validated
-  by behaviour + selfhost-determinism, not against the retired path). ASAN,
-  parity, KAI_TRACE_RC, #748 modular intact.
-- **Deps:** Lane 0. Independent of Lane 1. **Explicitly optional / later** — the
-  in-process backend is the production target; the C-text backend already works
-  and stays as bootstrap+oracle whether or not it is ever moved under KIR.
+### Lane 2 (done) — C-text migrated under KIR
+- The C backend prints from the same KIR lowering as native (`kir_c_*`); the
+  direct AST→C emitter and its duplicated lowering helpers are deleted.
 
 ### Lane 3 (optional) — effects-on-KIR audit
 - **Brief:** With the in-process backend live, audit that `install_order` and

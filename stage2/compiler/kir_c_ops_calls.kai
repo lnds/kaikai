@@ -1,0 +1,196 @@
+#[doc("KIR to C printer: direct, indirect and closure calls and the evidence frame a callee takes.")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.native_prims
+import compiler.builtins
+import compiler.effect_instance
+import compiler.core_types
+import compiler.emit_native_fn
+import compiler.fnreg
+import compiler.emit_native_ops_calls
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_c_ops_util
+import compiler.spec_names
+import compiler.symtab
+import compiler.util
+
+fn kc_ncall_sym(callee: String) : String =
+  if string_starts_with_q(callee, "kai_") { nprim_runtime_sym(callee) }
+  else if string_starts_with_q(callee, "kaix_core_llvm_") or string_starts_with_q(callee, "kaix_core_native_") {
+    cat2("kai_", string_slice(callee, 10, string_length(callee) - 10))
+  }
+  else { callee }
+
+fn kc_is_void_arena_op(sym: String) : Bool = sym == "kaix_arena_push" or sym == "kaix_arena_pop"
+
+#[doc("The nullary call of a void arena bracket, or none for any other callee.")]
+pub fn kc_void_arena_call(sym: String) : Option[String] =
+  if kc_is_void_arena_op(sym) { Some(kc_call(sym, [])) } else { None }
+
+# ---- evidence frame --------------------------------------------------------
+
+fn kc_default_ref(defaults: [KDefault], tab: SymTab, k: InstKey) : String =
+  if kc_has_default(defaults, k.eff) { concat_all(["(KaiEvidence *)&_kai_default_node_", rt_name(tab, k.eff)]) } else { "NULL" }
+
+fn kc_has_default(defaults: [KDefault], eff: SymId) : Bool = match defaults {
+  []                      -> false
+  [KDef(e, _), ...rest]   -> if e == eff { true } else { kc_has_default(rest, eff) }
+}
+
+fn kc_unchecked_bits(keys: [InstKey], bit: Int, acc: Int) : Int = match keys {
+  []           -> acc
+  [k, ...rest] -> kc_unchecked_bits(rest, bit * 2, if effect_is_foreign(k.eff) { acc + bit } else { acc })
+}
+
+fn kc_evf_fill(cx: KcCx, defaults: [KDefault], keys: [InstKey], n: Int) : String = {
+  let tab = cx.fx.tab
+  let labels = kc_arr("const char *const", map(keys, (k) => kc_cstr(inst_key_text(tab, k))))
+  let defs = kc_arr("KaiEvidence *const", map(keys, (k) => kc_default_ref(defaults, tab, k)))
+  let cache = concat_all(["({ static const char *lc_[", int_to_string(n), "]; lc_; })"])
+  let frame = concat_all(["(KaiValue *[", int_to_string(n), "]){0}"])
+  kc_call("kaix_evidence_fill_frame_l",
+          [cat2("(void *)", frame), cat2(int_to_string(n), "LL"), labels, cache, defs, cat2(int_to_string(kc_unchecked_bits(keys, 1, 0)), "LL")])
+}
+
+#[doc("The evidence-frame argument of a call to `callee` (`f`), or empty when it carries no frame. A default-bearing effect resolves against `defaults`.")]
+pub fn kc_evf_expr_with(cx: KcCx, defaults: [KDefault], callee: String, f: KFn) : String = {
+  let keys = nfnx_frame_keys(cx.fx, f)
+  let n = list_length(keys)
+  if n == 0 { "" }
+  else if kc_frame_is_own(cx, keys) { kc_reg("__evf") }
+  else { kc_evf_fill(cx, defaults, keys, n) }
+}
+
+fn kc_key_texts(cx: KcCx, keys: [InstKey]) : [String] = map(keys, (k) => inst_key_text(cx.fx.tab, k))
+
+# A call whose frame is the caller's own, slot for slot, passes `__evf` on instead of building a per-call copy.
+fn kc_frame_is_own(cx: KcCx, keys: [InstKey]) : Bool = cx.evf_pass and match kc_cur_fn(cx) {
+  Some(cur) -> kc_key_texts(cx, nfnx_frame_keys(cx.fx, cur)) == kc_key_texts(cx, keys)
+  None      -> false
+}
+
+#[doc("The evidence-frame argument of a call to `callee` (`f`), or empty when it carries no frame; no effect resolves to a default node.")]
+pub fn kc_evf_expr(cx: KcCx, callee: String, f: KFn) : String = kc_evf_expr_with(cx, cx.defs, callee, f)
+
+fn kc_evf_list(cx: KcCx, callee: String, f: KFn) : [String] = match kc_evf_expr(cx, callee, f) {
+  "" -> []
+  e  -> [e]
+}
+
+fn kc_donor_list(cx: KcCx, f: KFn) : [String] = if f.donor { [kc_donate_token(cx)] } else { [] }
+
+# ---- direct calls ----------------------------------------------------------
+
+#[doc("The direct call of `sym` over `args`, its result at the destination `slot`.")]
+pub fn kc_direct_call(cx: KcCx, sym: String, args: [KVal], slot: KSlot) : String =
+  match nfnx_by_sym(cx.fx, sym) {
+    Some(f) -> if nfn_has_raw_slot(f) { kc_call_raw(cx, sym, args, f, slot) } else { kc_call_boxed(cx, sym, args, f) }
+    None    -> kc_call_extern(cx, sym, args, slot)
+  }
+
+fn kc_call_boxed(cx: KcCx, sym: String, args: [KVal], f: KFn) : String =
+  kc_call(kc_fsym(f, sym), kc_evf_list(cx, sym, f) ++ kc_atoms(cx, args) ++ kc_donor_list(cx, f))
+
+fn kc_raw_args(cx: KcCx, ps: [KParam], args: [KVal]) : [String] = match ps {
+  [] -> []
+  [p, ...prest] -> match args {
+    [a, ...arest] -> [kc_arg_at(cx, a, p.slot), ...kc_raw_args(cx, prest, arest)]
+    []            -> [kc_unsupported("raw call arity mismatch")]
+  }
+}
+
+fn kc_arg_at(cx: KcCx, a: KVal, slot: KSlot) : String = match slot {
+  SBoxed -> kc_atom(cx, a)
+  _      -> kc_atom_raw(cx, a, slot)
+}
+
+fn kc_call_raw(cx: KcCx, sym: String, args: [KVal], f: KFn, dst: KSlot) : String = {
+  let call = kc_call(kc_fsym(f, sym), kc_evf_list(cx, sym, f) ++ kc_raw_args(cx, f.params, args) ++ kc_donor_list(cx, f))
+  match dst {
+    SBoxed -> kc_box(f.ret, call)
+    _      -> call
+  }
+}
+
+fn kc_call_extern(cx: KcCx, sym: String, args: [KVal], dst: KSlot) : String =
+  if string_starts_with_q(sym, "kaix_proto_dispatch") { kc_proto_dispatch(cx, sym, args) }
+  else {
+    match core_raw_native(sym) {
+      Some(RE(_, params, _)) -> kc_core_raw_call(cx, sym, params, args, dst)
+      None                   -> match kc_rcore_of(sym) {
+        Some(RP(_, csym, params, ret)) -> kc_rcore_call(cx, csym, params, ret, args, dst)
+        None                           -> kc_call(kc_ncall_sym(sym), kc_atoms(cx, args))
+      }
+    }
+  }
+
+fn kc_rcore_find(name: String, rows: [RCore]) : Option[RCore] = match rows {
+  [] -> None
+  [r, ...rest] -> match r { RP(n, _, _, _) -> if n == name { Some(r) } else { kc_rcore_find(name, rest) } }
+}
+
+fn kc_rcore_of(sym: String) : Option[RCore] =
+  if string_starts_with_q(sym, "kaix_core_") { kc_rcore_find(string_slice(sym, 10, string_length(sym) - 10), rcore_table()) } else { None }
+
+fn kc_rcore_args(cx: KcCx, ps: [Ty], args: [KVal]) : [String] = match ps {
+  [] -> []
+  [p, ...prest] -> match args {
+    [a, ...arest] -> [match p {
+      TyInt    -> kc_atom_raw(cx, a, SInt64)
+      TyReal   -> kc_atom_raw(cx, a, SReal)
+      TyHandle -> kc_call("kai_handle_unbox", [kc_atom(cx, a)])
+      _        -> kc_atom(cx, a)
+    }, ...kc_rcore_args(cx, prest, arest)]
+    [] -> []
+  }
+}
+
+fn kc_rcore_call(cx: KcCx, csym: String, params: [Ty], ret: Ty, args: [KVal], dst: KSlot) : String = {
+  let call = kc_call(csym, kc_rcore_args(cx, params, args))
+  match ret {
+    TyInt    -> match dst { SBoxed -> kc_box(SInt64, call)  _ -> call }
+    TyHandle -> kc_call("kai_handle_box", [call])
+    _        -> call
+  }
+}
+
+fn kc_core_raw_args(cx: KcCx, params: String, i: Int, args: [KVal]) : [String] = match args {
+  []           -> []
+  [v, ...rest] -> {
+    let a = if string_slice(params, i, 1) == "i" { kc_atom_raw(cx, v, SInt64) } else { kc_atom(cx, v) }
+    [a, ...kc_core_raw_args(cx, params, i + 1, rest)]
+  }
+}
+
+fn kc_core_raw_call(cx: KcCx, sym: String, params: String, args: [KVal], dst: KSlot) : String = {
+  let call = kc_call(sym, kc_core_raw_args(cx, params, 0, args))
+  match dst {
+    SBoxed -> kc_box(SInt64, call)
+    _      -> call
+  }
+}
+
+fn kc_proto_dispatch(cx: KcCx, sym: String, args: [KVal]) : String = match args {
+  [KIntV(pid), KIntV(op), KStrV(pn), KStrV(on), ...rest] ->
+    kc_call(sym, [kc_int_lit(pid), kc_int_lit(op), kc_cstr(nemit_decode_span(pn)), kc_cstr(nemit_decode_span(on)), ...kc_atoms(cx, rest)])
+  _ -> kc_unsupported(cat2(sym, " with non-literal metadata"))
+}
+
+# ---- indirect calls and closures -------------------------------------------
+
+fn kc_apply(cx: KcCx, sym: String, fv: KVal, args: [KVal]) : String =
+  kc_call(sym, [kc_atom(cx, fv), kc_i32(list_length(args)), kc_arr("KaiValue *", kc_atoms(cx, args))])
+
+#[doc("An indirect call of the closure `fv`, consuming it.")]
+pub fn kc_call_indirect(cx: KcCx, fv: KVal, args: [KVal]) : String = kc_apply(cx, "kaix_apply", fv, args)
+
+#[doc("An indirect call of the closure `fv` that leaves it alive.")]
+pub fn kc_call_indirect_borrow(cx: KcCx, fv: KVal, args: [KVal]) : String = kc_apply(cx, "kaix_apply_borrow", fv, args)
+
+#[doc("The closure over thunk `sym` of arity `ar` capturing `caps`; a capture-free one is the immortal static closure.")]
+pub fn kc_closure(cx: KcCx, sym: String, ar: Int, caps: [KVal]) : String = match caps {
+  [] -> concat_all(["({ static KaiValue *s_; ", kc_call("kaix_static_closure", ["&s_", cat2("(KaiFn)", kc_op_sym(sym)), kc_i32(ar)]), "; })"])
+  _  -> kc_call("kaix_closure", [cat2("(KaiFn)", kc_op_sym(sym)), kc_i32(ar), kc_i32(list_length(caps)), kc_arr("KaiValue *", kc_atoms(cx, caps))])
+}

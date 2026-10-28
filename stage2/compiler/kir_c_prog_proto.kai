@@ -1,0 +1,151 @@
+#[doc("KIR to C printer: the protocol impl tables, the boxed adapters of raw impls and the registration of variants.")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.emit_shared_proto
+import compiler.emit_shared_syms
+import compiler.fn_index
+import compiler.fnreg
+import compiler.infer_index
+import compiler.kir_c_core
+import compiler.kir
+import compiler.rec_stamp
+import compiler.symtab
+import compiler.util
+
+fn kcp_strip(t: Ty) : Ty = match t {
+  TyDimT(inner, _)    -> kcp_strip(inner)
+  TyRefineT(inner, _) -> kcp_strip(inner)
+  _                   -> t
+}
+
+fn kcp_slot(t: Ty) : KSlot = match kcp_strip(t) {
+  TyInt    -> SInt64
+  TyReal   -> SReal
+  TyBool   -> SBool
+  TyChar   -> SChar
+  TyByte   -> SByte
+  TyInt32  -> SInt32T
+  TyUInt32 -> SUInt32
+  TyUInt64 -> SUInt64
+  TyInt128 -> SInt128
+  _        -> SBoxed
+}
+
+fn kcp_raw_flag(mask: [Bool]) : Bool = match mask {
+  [m, ..._] -> m
+  [] -> false
+}
+
+fn kcp_mask_rest(mask: [Bool]) : [Bool] = match mask {
+  [_, ...r] -> r
+  [] -> []
+}
+
+fn kcp_param_slots(pts: [Ty], mask: [Bool]) : [KSlot] = match pts {
+  [] -> []
+  [t, ...rest] -> [if kcp_raw_flag(mask) { kcp_slot(t) } else { SBoxed }, ...kcp_param_slots(rest, kcp_mask_rest(mask))]
+}
+
+fn kcp_ret_slot(rt: Ty) : KSlot = if ty_is_scalar(rt) { kcp_slot(rt) } else { SBoxed }
+
+fn kcp_arg_names(i: Int, n: Int) : [String] =
+  if i >= n { [] } else { [cat2("a", int_to_string(i)), ...kcp_arg_names(i + 1, n)] }
+
+fn kcp_params_text(tys: [String]) : String = if tys == [] { "void" } else { string_join(tys, ", ") }
+
+fn kcp_boxed_tys(n: Int) : [String] = map(kcp_arg_names(0, n), (_u) => "KaiValue *")
+
+fn kcp_decl_params(ns: [String]) : String =
+  kcp_params_text(map(ns, (a) => cat2("KaiValue *", a)))
+
+# The C prototype of the impl under its own symbol, for a symbol the program does not define.
+fn kcp_extern(csym: String, sig: Option[UFnSig], arity: Int) : String = match sig {
+  Some(US(pts, rt, mask)) ->
+    concat_all([kc_ctype(kcp_ret_slot(rt)), " ", kc_usym(csym), "(",
+                kcp_params_text(map(kcp_param_slots(pts, mask), (s) => kc_ctype(s))), ");\n"])
+  None -> concat_all(["KaiValue *", kc_usym(csym), "(", kcp_params_text(kcp_boxed_tys(arity)), ");\n"])
+}
+
+fn kcp_unboxed_args(slots: [KSlot], i: Int) : [String] = match slots {
+  [] -> []
+  [s, ...rest] -> [kc_unbox(s, cat2("a", int_to_string(i))), ...kcp_unboxed_args(rest, i + 1)]
+}
+
+fn kcp_decref_lent(lent: [Int]) : String =
+  concat_all(map(lent, (i) => concat_all(["    kaix_decref(a", int_to_string(i), ");\n"])))
+
+fn kcp_adapter(csym: String, sig: Option[UFnSig], arity: Int, lent: [Int]) : String = {
+  let call = match sig {
+    Some(US(pts, rt, mask)) ->
+      kc_box(kcp_ret_slot(rt), kc_call(kc_usym(csym), kcp_unboxed_args(kcp_param_slots(pts, mask), 0)))
+    None -> kc_call(kc_usym(csym), kcp_arg_names(0, arity))
+  }
+  concat_all(["KaiValue *", user_boxed_adapter_sym(csym), "(", kcp_decl_params(kcp_arg_names(0, arity)), ") {\n",
+              "    KaiValue *r = ", call, ";\n", kcp_decref_lent(lent), "    return r;\n}\n"])
+}
+
+fn kcp_row_sym(fx: FnIndex, pr: PimplRow) : String =
+  if pimpl_row_needs_adapter(pr) { user_boxed_adapter_sym(pimpl_csym(fx, pr)) } else { kc_usym(pimpl_csym(fx, pr)) }
+
+fn kcp_declared(declared: NameIndex[String], sym: String) : Bool = list_has(idx_chain(declared, sym), sym)
+
+fn kcp_row_prelude(fx: FnIndex, declared: NameIndex[String], pr: PimplRow) : String = match pr {
+  PR(_, _, _, arity, sig, _, lent) -> {
+    let csym = pimpl_csym(fx, pr)
+    concat_all([
+      if kcp_declared(declared, csym) { "" } else { kcp_extern(csym, sig, arity) },
+      if pimpl_row_needs_adapter(pr) { kcp_adapter(csym, sig, arity, lent) } else { "" }
+    ])
+  }
+}
+
+fn kcp_row_register(fx: FnIndex, decls: [Decl], pr: PimplRow) : String = match pr {
+  PR(_, p, t, _, _, op, _) ->
+    concat_all(["    ", kc_call("kaix_register_one_impl", [int_to_string(stdlib_proto_id_int(p)), int_to_string(op),
+                                                         int_to_string(impl_head_tag(t, decls)),
+                                                         cat2("(void *)", kcp_row_sym(fx, pr))]), ";\n"])
+}
+
+fn kcp_variant_heads(v2h: [Int]) : [String] = match v2h {
+  [tag, head, ...rest] ->
+    [concat_all(["    ", kc_call("kaix_register_one_variant_head", [int_to_string(tag), int_to_string(head)]), ";\n"]),
+     ...kcp_variant_heads(rest)]
+  _ -> []
+}
+
+fn kcp_payload_ctor(tab: SymTab, v: VariantEntry) : String = match v {
+  EV(_, ks, tag, c) -> {
+    let mask = variant_slot_mask(ks)
+    if tag >= user_variant_tag_base() and mask != 0 {
+      concat_all(["    ", kc_call("kaix_register_one_payload_ctor", [int_to_string(tag), kc_cstr(ctor_cell_name(tab, c)), int_to_string(mask)]), ";\n"])
+    } else { "" }
+  }
+}
+
+fn kcp_seed_nullary(tab: SymTab, v: VariantEntry) : String = match v {
+  EV(ar, _, tag, c) ->
+    if ar == 0 and tag >= user_variant_tag_base() {
+      concat_all(["    ", kc_call("kaix_seed_nullary", [int_to_string(tag), kc_cstr(ctor_cell_name(tab, c))]), ";\n"])
+    } else { "" }
+}
+
+fn kcp_reusable_tag(tag: Int) : String =
+  concat_all(["    ", kc_call("kaix_register_one_reusable_tag", [int_to_string(tag)]), ";\n"])
+
+#[doc("The adapters and prototypes of the impl rows and `_kai_proto_init_llvm`, which registers the variant heads, the impls, the payload ctors, the reusable tags and the nullary singletons. `declared` indexes the symbols the program defines.")]
+pub fn kc_proto_section(decls: [Decl], tab: SymTab, ids: ProtoIds, variants: [VariantEntry], fns: [EFn],
+                        reuse_tags: [Int], declared: NameIndex[String]) : String = {
+  let fx = fnx_build(fns)
+  let rows = filter(collect_pimpl_rows(decls, fx, ids, []), (pr) => match pr { PR(_, _, t, _, _, _, _) -> impl_head_tag(t, decls) >= 0 })
+  concat_all(list_append(
+    map(rows, (pr) => kcp_row_prelude(fx, declared, pr)),
+    ["void _kai_proto_init_llvm(void) {\n",
+     concat_all(kcp_variant_heads(collect_variant_to_head(variants, decls))),
+     concat_all(map(rows, (pr) => kcp_row_register(fx, decls, pr))),
+     concat_all(map(variants, (v) => kcp_payload_ctor(tab, v))),
+     concat_all(map(reuse_tags, kcp_reusable_tag)),
+     concat_all(map(variants, (v) => kcp_seed_nullary(tab, v))),
+     "}\n"]))
+}

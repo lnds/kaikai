@@ -59,9 +59,6 @@ auto-loaded stdlib core under `~/Library/Caches/kai/core/<toolchain-id>/`
 
 - **post-parse blobs** (KAB2, one per core module) — a warm build skips
   the core's lex+parse entirely;
-- **emitted-C core TU bodies** (KCT1, c-modular backend, plain builds
-  only) — a warm build splices the 13 core `.c` bodies into the marker
-  stream instead of re-emitting them;
 - **the native core object** (`ncore-<key>.o`, native backend) — the
   whole-program native build splits into a user object plus one prebuilt
   object carrying the entire auto-loaded core (fns, their thunks, their
@@ -312,26 +309,7 @@ One TU per module keeps cc from inlining across modules, so a call through a for
 
 A dev build (`kai build`, `kai run`, `kai test`) links without LTO and never runs the probe: the thin link costs about 80 ms on a 41-module edit loop. `KAI_LTO=1` asks for it in any mode (`make kaic2-fast` does, so the compiler it builds keeps its cross-module inlining), `KAI_LTO=0` refuses it; a `CFLAGS` that carries its own `-flto*` or `-O0`, and a debug build, leave it off. Gate: `examples/cache/wrapper_modular_lto.sh` (in `make test-core-cache`) builds as dev (no bitcode, no probe), as `--release` and as `--release` with `KAI_LTO=0` under the default `cc` and `clang`, and asserts equal output, bitcode objects exactly when the probe found a cache, and a warm relink that recompiles nothing and links the same code.
 
-## The c-modular core TU set — pruning against a cached core
-
-The c-modular backend (`--emit=c-modular`, what `bin/kai build --backend=c` uses) emits one translation unit per module. The core's TUs, with the two header slices each compiles against, are cached in the shared core-cache directory (`core-emit-<key>.kct`). A compile that finds the set for its inputs prunes the core to what the typed program asks for (`core_demand`) and splices every cached core TU, so typing, monomorphising, Perceus and emitting never walk the unreached core. Every core and imported-library function is a candidate. The early cut (`core_precut`) empties each body before the front end walks it, keeping the name, the place and the signature (a function that feeds the unwind analysis and an `extern "kai"` keep theirs). The functions the core's impls lower to are emptied the same way once protocol lowering has named them (`hold_core_impls`), and a completed one takes the passes that follow lowering from the declaration lowering held; the front end reads a candidate's scheme from its signature on the first lookup and types it only when typed code refers to it. A body is *completed* when the scan asks for its function: `core_front` runs the parsed declaration through the passes the stream goes through and resolves it against the environment the stream's resolution ended in (`resolve_complete`), so the result is what the stream would have held. An operator on operands the runtime does not combine natively asks for the impls of its protocol, and a dispatcher asks for all of them. `--core-cache-stats` prints, per wave, `core-demand: typing …`.
-
-`kaic2 --check-core-front` completes every core and library function, and every function a core impl lowers to, on its own and compares it with the stream's (`make test-core-front`); `--check-core-front-stubs` does it against the stream with the bodies emptied. The passes read the tables from signatures only, so the two agree.
-
-Two keys, because the TU text depends on the program only through a few global inputs:
-
-- the **pre-key** (`ec_pre_key`): format tag, toolchain id, edition, the core source hashes and the compiler arguments and `KAI_*` environment. It is computed before the core is typed and names an index file, `core-emit-pre-<pre-key>`.
-- the **variant** (`core_variant`): the core effects the program's own handlers make unwind, from the resolved program before the cut. A core function that can unwind is emitted with an unwind frame, so two variants need two TU sets. The index keeps up to `ec_index_cap` variants per pre-key, newest first; each line is `<variant> <content digest> <entry key>`.
-
-A compile prunes only against its own variant. With none recorded it first compiles the core alone for that variant — a one-line program plus a seed (`UnwSeed`: the `all` flag and the unwinding core effects) that stands in for the handlers the program would bring — which records the variant, the entry key and a digest of the TUs; the program then compiles pruned against that set. The same source therefore yields the same bytes whatever the cache state. If a later full compile of the same variant digests differently the variant is marked `conflict` and never pruned against again.
-
-The native-modular backend (`--emit=native-modular`, the default `kai build` for a package) prunes the same way on every compile, with no cached core set to find: each partition's object is keyed by its own projected KIR, so a pruned core publishes under its own keys and an edit that leaves the reached core alone reuses every core object. Gate: `make test-native-modular` asserts `core-prune: dropped` and the modular == whole-program output.
-
-The functions the unwind analysis reads (`unw_feeds_analysis`: a function that handles an effect, declares a `var`, or whose row may cancel) are never cut in a c-modular build, so the pruned program yields the same frames as the whole one. Lifted lambdas and handler clauses of the cacheable modules are emitted into their module's TU, not the root.
-
-Gate: `make test-cmodular-prune` (tier0) primes a cache with one program and compiles the others against it, comparing every file with a no-cache compile — core TUs and their slices exactly, the root and library TUs as subsets. `CMOD_PRUNE_ALL=1` sweeps every example that has an `.out.expected`.
-
-### The pruning differential — `KAI_CORE_PRUNE=off`
+## The pruning differential — `KAI_CORE_PRUNE=off`
 
 Every layer of core pruning (the early cut, demand-driven typing, the typed cut, native-modular partition pruning, lazily completed core impl bodies) is off when kaic2 runs with `--full-core` or with `KAI_CORE_PRUNE=off` in the environment. The variable is a test knob, not a user flag: it reaches kaic2 through `bin/kai` unchanged, and the wrapper's binary memo and the core-object pre-key both fold every `KAI_*` variable, so a whole-core build never shares a cached artefact with a pruned one.
 

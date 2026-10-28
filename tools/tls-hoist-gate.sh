@@ -166,11 +166,9 @@ owner_gate() {
   [ -n "$opt" ] || { echo "tls-hoist-gate: OWNER_OPT not found in tools/kai/cli_plan.kai" >&2; return 2; }
   local common=(-std=c99 -w "$opt" -S -emit-llvm -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1
                 -I "$ROOT/stage2" -I "$ROOT/stage0")
-  "$clang" "${common[@]}" -DKAI_PROGRAM_PROVIDES_MAIN=1 "$ROOT/stage2/runtime_owner_c.c" -o "$WORK/owner-c.ll" \
-    || { echo "tls-hoist-gate: compiling the C owner failed" >&2; return 2; }
   "$clang" "${common[@]}" "$ROOT/stage0/runtime_llvm.c" -o "$WORK/owner-native.ll" \
     || { echo "tls-hoist-gate: compiling the native owner failed" >&2; return 2; }
-  owner_check "$OWNER_ALLOW" "$WORK/owner-c.ll" "$WORK/owner-native.ll"
+  owner_check "$OWNER_ALLOW" "$WORK/owner-native.ll"
   owner_exports_check
 }
 

@@ -84,7 +84,10 @@ _Static_assert(offsetof(KaiValue, rc) == 0, "native emitter layout: rc at 0");
 _Static_assert(offsetof(KaiValue, tag) == 4, "native emitter layout: tag at 4");
 _Static_assert(offsetof(KaiValue, var_n_args) == 5, "native emitter layout: var_n_args at 5");
 _Static_assert(offsetof(KaiValue, variant_tag) == 6, "native emitter layout: variant_tag at 6");
+/* The RC ledger widens the header; only the C backend builds with it. */
+#ifndef KAI_TRACE_RC
 _Static_assert(offsetof(KaiValue, as) == 8, "native emitter layout: slot array at 8");
+#endif
 
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
@@ -1122,6 +1125,32 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *s
     return scr;
   }
   return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
+}
+
+/* `kaix_variant_at_argv_i64` with the slot mask given by the caller. */
+KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n,
+                                   int32_t mask, KaiVarSlot *slots) {
+  return kaix_variant_at_masked((KaiReuse) slots[0].ptr, tag, name, n - 1, mask, slots + 1);
+}
+
+/* The two reuse rebuilds above with the slot mask given by the caller, a
+ * compile-time constant in C-printed code, so the slot copy folds. */
+KaiValue *kaix_variant_reuse_at_k(KaiValue *scr, int32_t tag,
+                                    const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
+  return kai_variant_reuse_at(scr, tag, name, n, (uint32_t) mask, slots);
+}
+
+KaiValue *kaix_variant_reuse_move_k(KaiValue *scr, int32_t tag,
+                                    const char *name, int n, int32_t mask, KaiVarSlot *slots) {
+  if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
+      scr->var_n_args == n && kai_check_unique(scr)) {
+    for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
+    scr->variant_tag = tag;
+    kai_rc_count_reuse();
+    return scr;
+  }
+  return kai_variant_u(tag, name, n, (uint32_t) mask, slots);
 }
 
 /* A lambda thunk's read of capture i. Borrowed: the closure owns its

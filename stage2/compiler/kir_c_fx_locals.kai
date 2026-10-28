@@ -1,0 +1,139 @@
+#[doc("KIR to C printer: the C locals a fn reserves for handle frames, continuations, evidence frames and reuse tokens.")]
+
+import compiler.emit_native_fn
+import compiler.emit_native_fx
+import compiler.kir
+import compiler.kir_c_core
+import compiler.util
+
+type KfxDecl = { name: String, text: String }
+
+fn kfx_push_all(ss: [KStmt], acc: [KStmt]) : [KStmt] = match ss {
+  [] -> acc
+  [s, ...rest] -> kfx_push_all(rest, [s, ...acc])
+}
+
+fn kfx_collect(bs: [KBlock], acc: [KStmt]) : [KStmt] = match bs {
+  [] -> list_reverse(acc)
+  [b, ...rest] -> kfx_collect(rest, kfx_push_all(b.stmts, acc))
+}
+
+fn kfx_op_performs(op: KOp) : Bool = match op {
+  KPerform(_, _, _, _, _) -> true
+  _ -> false
+}
+
+fn kfx_op_unw_fiber(op: KOp) : Bool = match op {
+  KPrim(KpUnwFiber, _) -> true
+  _ -> false
+}
+
+fn kfx_stmt_performs(s: KStmt) : Bool = match s {
+  KLet(_, _, op, _) -> kfx_op_performs(op)
+  KDo(op, _) -> kfx_op_performs(op)
+  _ -> false
+}
+
+fn kfx_stmt_unw_fiber(s: KStmt) : Bool = match s {
+  KLet(_, _, op, _) -> kfx_op_unw_fiber(op)
+  KDo(op, _) -> kfx_op_unw_fiber(op)
+  _ -> false
+}
+
+fn kfx_stmt_arm_top(s: KStmt) : Bool = match s {
+  KRC(KArmTopReuse(_, _, _, _), _) -> true
+  _ -> false
+}
+
+fn kfx_term_is_step(t: KTerm) : Bool = match t {
+  KTrmcStep(_, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+fn kfx_blocks_have_step(bs: [KBlock]) : Bool = any(bs, (b) => kfx_term_is_step(b.term))
+
+#[doc("True when the C printer reserves the arm-top reuse token register `_arm_ru` in `f`: it has a modulo-cons step or an arm-top reuse capture.")]
+pub fn kc_fn_has_armru(f: KFn) : Bool =
+  kfx_blocks_have_step(f.blocks) or any(kfx_collect(f.blocks, []), kfx_stmt_arm_top)
+
+#[doc("The number of evidence-frame slots `f` takes; zero for a frameless fn.")]
+pub fn kc_fn_frame_slots(cx: KcCx, f: KFn) : Int = list_length(nfnx_frame_keys(cx.fx, f))
+
+fn kfx_has(ds: [KfxDecl], n: String) : Bool = any(ds, (d) => d.name == n)
+
+fn kfx_add(cx: KcCx, ds: [KfxDecl], name: String, text: String) : [KfxDecl] =
+  if kc_reg_tag(cx, name) >= 0 or kfx_has(ds, name) { ds } else { [KfxDecl { name: name, text: text }, ...ds] }
+
+fn kfx_ptr(cx: KcCx, ds: [KfxDecl], name: String) : [KfxDecl] =
+  kfx_add(cx, ds, name, concat_all(["    KaiValue *", kc_reg(name), " = NULL;\n"]))
+
+fn kfx_nops(h: Option[KHandlerDecl]) : Int = match h {
+  Some(d) -> if list_length(d.op_thunks) > 1 { list_length(d.op_thunks) } else { 1 }
+  None -> 1
+}
+
+fn kfx_frame_decls(cx: KcCx, ds: [KfxDecl], sym: String, nenv: Int) : [KfxDecl] = {
+  let ev = nfx_ev_reg(sym)
+  let nd = nfx_node_reg(sym)
+  let en = nfx_env_reg(sym)
+  let jb = nfx_jmpbuf_reg(sym)
+  let d1 = kfx_add(cx, ds, ev, concat_all(["    struct { KaiHandlerId handler_id; void *env; KaiValue *state; void *ops[",
+    int_to_string(kfx_nops(nfx_find_handler(cx.hs, sym))), "]; } ", kc_reg(ev), " = {0};\n"]))
+  let d2 = kfx_add(cx, d1, nd, concat_all(["    KaiEvidence ", kc_reg(nd), ";\n"]))
+  let d3 = kfx_add(cx, d2, en, concat_all(["    KaiValue *", kc_reg(en), "[", int_to_string(if nenv > 1 { nenv } else { 1 }), "];\n"]))
+  let d4 = kfx_add(cx, d3, jb, concat_all(["    jmp_buf ", kc_reg(jb), ";\n"]))
+  kfx_ptr(cx, d4, nfx_discard_reg(sym))
+}
+
+fn kfx_alias_decls(cx: KcCx, ds: [KfxDecl], alias: Option[String]) : [KfxDecl] = match alias {
+  None -> ds
+  Some(a) -> kfx_ptr(cx, kfx_ptr(cx, ds, nfx_alias_reg(a)), a)
+}
+
+fn kfx_install_decls(cx: KcCx, ds: [KfxDecl], s: KStmt) : [KfxDecl] = match s {
+  KInstall(_, sym, _, alias, env, _) -> kfx_alias_decls(cx, kfx_frame_decls(cx, ds, sym, list_length(env)), alias)
+  _ -> ds
+}
+
+fn kfx_installs(cx: KcCx, ds: [KfxDecl], ss: [KStmt]) : [KfxDecl] = match ss {
+  [] -> ds
+  [s, ...rest] -> kfx_installs(cx, kfx_install_decls(cx, ds, s), rest)
+}
+
+fn kfx_kind_decls(cx: KcCx, ds: [KfxDecl], f: KFn) : [KfxDecl] = match f.kind {
+  KFnClause -> kfx_ptr(cx, kfx_ptr(cx, ds, kir_resume_reg()), "__self")
+  KFnCleanup -> kfx_ptr(cx, ds, "__self")
+  _ -> ds
+}
+
+fn kfx_trmc_decls(cx: KcCx, ds: [KfxDecl], f: KFn) : [KfxDecl] = {
+  let d1 = if kc_fn_has_armru(f) { kfx_ptr(cx, ds, ntrmc_armru_reg()) } else { ds }
+  if kfx_blocks_have_step(f.blocks) {
+    kfx_add(cx, kfx_ptr(cx, d1, "_kai_acc_res"), "_kai_acc_hole",
+            concat_all(["    KaiValue **", kc_reg("_kai_acc_hole"), " = NULL;\n"]))
+  } else { d1 }
+}
+
+fn kfx_misc_decls(cx: KcCx, ds: [KfxDecl], f: KFn, ss: [KStmt]) : [KfxDecl] = {
+  let d1 = if any(ss, kfx_stmt_performs) {
+    kfx_add(cx, ds, nfx_cont_reg(), concat_all(["    KaiCont ", kc_reg(nfx_cont_reg()), ";\n"]))
+  } else { ds }
+  let d2 = if f.donor { kfx_ptr(cx, d1, ndonor_reg()) } else { d1 }
+  let d3 = if kc_fn_frame_slots(cx, f) > 0 { kfx_ptr(cx, d2, "__evf") } else { d2 }
+  if any(ss, kfx_stmt_unw_fiber) { kfx_add(cx, d3, "kc_unw_fiber", "    KaiFiber *kc_unw_fiber = NULL;\n") } else { d3 }
+}
+
+fn kfx_is_install(s: KStmt) : Bool = match s { KInstall(_, _, _, _, _, _) -> true  _ -> false }
+
+#[doc("Whether `f` installs a handler, so a call inside it may see an evidence frame other than the one `f` was given.")]
+pub fn kcx_installs_handler(f: KFn) : Bool = any(kfx_collect(f.blocks, []), kfx_is_install)
+
+#[doc("The C local declarations of the non-register locals `f` reserves: handle frames, continuation slot, `__evf`, `__self`, resume register, reuse accumulators and donor.")]
+pub fn kcx_locals(cx: KcCx, f: KFn) : String = {
+  let ss = kfx_collect(f.blocks, [])
+  let d1 = kfx_installs(cx, [], ss)
+  let d2 = kfx_kind_decls(cx, d1, f)
+  let d3 = kfx_trmc_decls(cx, d2, f)
+  let d4 = kfx_misc_decls(cx, d3, f, ss)
+  concat_all(list_reverse(d4) | .text)
+}

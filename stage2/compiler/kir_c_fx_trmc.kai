@@ -1,0 +1,143 @@
+#[doc("KIR to C printer: arm-top reuse tokens and the modulo-cons loop terminators.")]
+
+import compiler.emit_native_fn
+import compiler.emit_shared_syms
+import compiler.kir
+import compiler.kir_c_core
+import compiler.tcrec_plan
+import compiler.util
+
+fn kfx_armru() : String = kc_reg(ntrmc_armru_reg())
+
+fn kfx_slot_of_tag(t: Int) : KSlot =
+  if t == 1 { SInt64 } else if t == 2 { SReal } else if t == 3 { SBool } else if t == 4 { SInt32 }
+  else if t == 5 { SChar } else if t == 6 { SByte } else if t == 7 { SInt32T } else if t == 8 { SUInt32 }
+  else if t == 9 { SUInt64 } else if t == 10 { SInt128 } else { SBoxed }
+
+fn kfx_incref_lines(cx: KcCx, bs: [String]) : String =
+  concat_all(map(bs, (b) => concat_all(["    (void)", kc_call("kaix_incref_if_token_null", [kfx_armru(), kc_atom(cx, KVar(b))]), ";\n"])))
+
+fn kfx_drop_slots(us: [Int]) : String =
+  concat_all(map(us, (i) => concat_all(["    (void)", kc_call("kaix_drop_slot_if_token", [kfx_armru(), int_to_string(i)]), ";\n"])))
+
+fn kfx_share_lines(cx: KcCx, bs: [KVal]) : String =
+  concat_all(map(bs, (b) => concat_all(["        kaix_arm_share(took_, ", kc_atom(cx, b), ");\n"])))
+
+#[doc("The statement text of an arm-top reuse capture, its leftover release, or a flat arm take; empty for the other RC ops.")]
+pub fn kcx_rc(cx: KcCx, rc: KRCOp) : String = match rc {
+  KArmTopReuse(d, n, bs, us) ->
+    concat_all(["    ", kfx_armru(), " = ", kc_call("kaix_drop_reuse_token", [kc_atom(cx, d), int_to_string(n)]), ";\n",
+                kfx_incref_lines(cx, bs), kfx_drop_slots(us)])
+  KArmTokenFree -> concat_all(["    kaix_reuse_free(", kfx_armru(), ");\n    ", kfx_armru(), " = NULL;\n"])
+  KArmTake(d, bs, m) ->
+    concat_all(["    {\n        int32_t took_ = ", kc_call("kaix_arm_take", [kc_atom(cx, d), kc_int_lit(m)]), ";\n", kfx_share_lines(cx, bs), "    }\n"])
+  _ -> ""
+}
+
+# ---- loop back-edge ------------------------------------------------------------
+
+fn kfx_param_name(ps: [KParam], idx: Int) : String = match ps {
+  [] -> ""
+  [p, ...rest] -> if idx == 0 { p.name } else { kfx_param_name(rest, idx - 1) }
+}
+
+fn kfx_param_slot(cx: KcCx, ps: [KParam], idx: Int) : KSlot = kfx_slot_of_tag(kc_reg_tag(cx, kfx_param_name(ps, idx)))
+
+fn kfx_temps(cx: KcCx, ps: [KParam], asg: [KAssign]) : String = concat_all(map(asg, (a) => match a {
+  KAsg(idx, v) -> {
+    let s = kfx_param_slot(cx, ps, idx)
+    concat_all(["        ", kc_ctype(s), " t", int_to_string(idx), "_ = ", kc_atom_raw(cx, v, s), ";\n"])
+  }
+}))
+
+fn kfx_drops(cx: KcCx, ps: [KParam], asg: [KAssign], dropmask: Int) : String = concat_all(map(asg, (a) => match a {
+  KAsg(idx, _) -> {
+    let nm = kfx_param_name(ps, idx)
+    if tcrec_param_dropped(dropmask, kc_reg_tag(cx, nm) == 0, idx) { concat_all(["        kaix_internal_drop(", kc_reg(nm), ");\n"]) } else { "" }
+  }
+}))
+
+fn kfx_stores(ps: [KParam], asg: [KAssign]) : String = concat_all(map(asg, (a) => match a {
+  KAsg(idx, _) -> concat_all(["        ", kc_reg(kfx_param_name(ps, idx)), " = t", int_to_string(idx), "_;\n"])
+}))
+
+fn kfx_first_label(f: KFn, loop_label: String) : String = match f.blocks {
+  [b, ..._] -> kc_label(b.label)
+  [] -> kc_label(loop_label)
+}
+
+fn kfx_extend(node: String, hole: String) : String =
+  concat_all(["        ", kc_reg("_kai_acc_res"), " = kaix_cctx_extend(", kc_reg("_kai_acc_res"), ", ", kc_reg("_kai_acc_hole"), ", ", node, ");\n",
+              "        ", kc_reg("_kai_acc_hole"), " = ", hole, ";\n"])
+
+fn kfx_cons_step(cx: KcCx, heads: [KVal], in_region: Bool) : String = {
+  let head = match heads { [h] -> kc_atom(cx, h)  _ -> "kaix_unit()" }
+  concat_all(["        kaix_reuse_free(", kfx_armru(), ");\n        ", kfx_armru(), " = NULL;\n",
+              "        KaiValue *n_ = ", kc_call(if in_region { "kaix_arena_cons" } else { "kaix_cons" }, [head, "NULL"]), ";\n",
+              "        KaiValue **h_ = kaix_cons_tail_addr(n_);\n", kfx_extend("n_", "h_")])
+}
+
+fn kfx_slot_value(cx: KcCx, v: KVal, kind: Int) : String = match trmc_slot_class(kind) {
+  SlotInt -> kc_atom_raw(cx, v, SInt64)
+  SlotReal -> match v {
+    KRealV(r) -> kc_real_lit(r)
+    KVar(n) -> if kc_reg_tag(cx, n) == 2 { kc_reg(n) } else { kc_call("kaix_take_real", [kc_atom(cx, v)]) }
+    _ -> kc_call("kaix_take_real", [kc_atom(cx, v)])
+  }
+  SlotEnum -> match v {
+    KIntV(t) -> kc_int_lit(t)
+    _ -> kc_call("kaix_take_enum", [kc_atom(cx, v)])
+  }
+  SlotPtr -> kc_atom(cx, v)
+}
+
+fn kfx_slot_line(cx: KcCx, v: KVal, kind: Int, at: Int) : String =
+  concat_all(["        s_[", int_to_string(at), "]", trmc_slot_class_field(trmc_slot_class(kind)), " = ", kfx_slot_value(cx, v, kind), ";\n"])
+
+fn kfx_slot_lines(cx: KcCx, heads: [KVal], hole: Int, mask: Int, off: Int, i: Int, acc: [String]) : String =
+  if i == hole {
+    kfx_slot_lines(cx, heads, hole, mask, off, i + 1, [concat_all(["        s_[", int_to_string(i + off), "].ptr = NULL;\n"]), ...acc])
+  } else {
+    match heads {
+      [] -> concat_all(list_reverse(acc))
+      [h, ...rest] -> kfx_slot_lines(cx, rest, hole, mask, off, i + 1, [kfx_slot_line(cx, h, variant_mask_kind(mask, i), i + off), ...acc])
+    }
+  }
+
+fn kfx_variant_build(cx: KcCx, hole: Int, name: String, tag: Int, mask: Int, heads: [KVal], in_region: Bool) : String = {
+  let n = list_length(heads) + 1
+  let off = if in_region { 0 } else { 1 }
+  let token = if in_region { "" } else { concat_all(["        s_[0].ptr = ", kfx_armru(), ";\n        ", kfx_armru(), " = NULL;\n"]) }
+  let call = if in_region { kc_call("kaix_arena_variant_masked", [int_to_string(tag), kc_cstr(name), int_to_string(n), "s_"]) }
+             else { kc_call("kaix_variant_at_argv_i64", [int_to_string(tag), kc_cstr(name), int_to_string(n + 1), "s_"]) }
+  concat_all(["        KaiVarSlot s_[", int_to_string(n + off), "];\n", token, kfx_slot_lines(cx, heads, hole, mask, off, 0, []),
+              "        KaiValue *n_ = ", call, ";\n",
+              "        KaiValue **h_ = ", kc_call("kaix_variant_slot_addr", ["n_", int_to_string(hole)]), ";\n", kfx_extend("n_", "h_")])
+}
+
+fn kfx_step_build(cx: KcCx, hole: Int, spine: KSpine, tag: Int, mask: Int, heads: [KVal], in_region: Bool) : String = match spine {
+  KSpineCons(_) -> kfx_cons_step(cx, heads, in_region)
+  KSpineCtor(name) -> kfx_variant_build(cx, hole, name, tag, mask, heads, in_region)
+}
+
+fn kfx_trmc_step(cx: KcCx, f: KFn, loop_label: String, hole: Int, spine: KSpine, tag: Int, mask: Int, dropmask: Int,
+                 heads: [KVal], asg: [KAssign], in_region: Bool) : String =
+  concat_all(["    {\n", kfx_step_build(cx, hole, spine, tag, mask, heads, in_region),
+              kfx_temps(cx, f.params, asg), kfx_drops(cx, f.params, asg, dropmask), kfx_stores(f.params, asg),
+              "    }\n    goto ", kfx_first_label(f, loop_label), ";\n"])
+
+fn kfx_trmc_apply(cx: KcCx, f: KFn, leaf: KVal) : String =
+  concat_all(["    {\n        KaiValue *out_ = ", kc_call("kaix_cctx_apply", [kc_reg("_kai_acc_res"), kc_reg("_kai_acc_hole"), kc_atom(cx, leaf)]), ";\n",
+              "        kaix_reuse_free(", kfx_armru(), ");\n        ", kfx_armru(), " = NULL;\n",
+              if f.donor { concat_all(["        kaix_reuse_free(", kc_reg(ndonor_reg()), ");\n        ", kc_reg(ndonor_reg()), " = NULL;\n"]) } else { "" },
+              "        return out_;\n    }\n"])
+
+#[doc("The statement text of a modulo-cons step (build the cell, extend the accumulator, rebind the params, loop) or of the terminal leaf plug.")]
+pub fn kcx_term(cx: KcCx, t: KTerm) : String = match nfnx_by_sym(cx.fx, cx.cur) {
+  None -> concat_all(["    ", kc_unsupported("TRMC terminator outside a known fn"), ";\n"])
+  Some(f) -> match t {
+    KTrmcStep(l, hole, spine, tag, mask, dropmask, heads, asg, in_region, _) -> kfx_trmc_step(cx, f, l, hole, spine, tag, mask, dropmask, heads, asg, in_region)
+    KTrmcApply(leaf, _) -> kfx_trmc_apply(cx, f, leaf)
+    _ -> concat_all(["    ", kc_unsupported("not a TRMC terminator"), ";\n"])
+  }
+}

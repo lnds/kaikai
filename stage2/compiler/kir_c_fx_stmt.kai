@@ -1,0 +1,113 @@
+#[doc("KIR to C printer: handle-frame statements and the clause / cleanup signature and prologue.")]
+
+import compiler.emit_native_fx
+import compiler.kir
+import compiler.kir_c_core
+import compiler.util
+
+fn kfx_ev(sym: String) : String = kc_reg(nfx_ev_reg(sym))
+
+fn kfx_ev_ptr(sym: String) : String = cat2("(void *) &", kfx_ev(sym))
+
+fn kfx_label(text: String) : String = concat_all(["KAI_EFF(", kc_cstr(text), ")"])
+
+fn kfx_state_set(cx: KcCx, sym: String, init: Option[KVal]) : String = match init {
+  None -> ""
+  Some(v) -> concat_all(["        kaix_clause_state_set(", kfx_ev_ptr(sym), ", ", kc_atom(cx, v), ");\n"])
+}
+
+fn kfx_alias_id(alias: Option[String]) : String = match alias {
+  None -> ""
+  Some(a) -> concat_all(["        ", kc_reg(nfx_alias_reg(a)), " = kaix_int((int64_t) hid_);\n"])
+}
+
+fn kfx_alias_cap(sym: String, alias: Option[String]) : String = match alias {
+  None -> ""
+  Some(a) -> concat_all(["        ", kc_reg(a), " = (KaiValue *) &", kc_reg(nfx_node_reg(sym)), ";\n"])
+}
+
+fn kfx_env_lines(cx: KcCx, sym: String, slots: [Option[String]], j: Int, acc: [String]) : [String] = match slots {
+  [] -> list_reverse(acc)
+  [c, ...rest] -> {
+    let v = match c { Some(r) -> kc_reg_boxed(cx, r)  None -> "NULL" }
+    kfx_env_lines(cx, sym, rest, j + 1, [concat_all(["        ", kc_reg(nfx_env_reg(sym)), "[", int_to_string(j), "] = ", v, ";\n"]), ...acc])
+  }
+}
+
+fn kfx_env(cx: KcCx, sym: String, slots: [Option[String]]) : String = match slots {
+  [] -> ""
+  _ -> concat_all([concat_all(kfx_env_lines(cx, sym, slots, 0, [])),
+                   "        kaix_ev_set_env(", kfx_ev_ptr(sym), ", ", kc_reg(nfx_env_reg(sym)), ");\n"])
+}
+
+fn kfx_op_lines(sym: String, ts: [KOpThunk], i: Int, acc: [String]) : [String] = match ts {
+  [] -> list_reverse(acc)
+  [KOT(_, thunk, _), ...rest] -> kfx_op_lines(sym, rest, i + 1, [concat_all([
+    "        kaix_ev_set_op(", kfx_ev_ptr(sym), ", ", int_to_string(nfx_op_base() + i), ", (void *) ", thunk, ");\n"]), ...acc])
+}
+
+fn kfx_install_with(cx: KcCx, eff: String, sym: String, init: Option[KVal], alias: Option[String],
+                    env: [Option[String]], h: KHandlerDecl) : String =
+  concat_all([
+    "    {\n        KaiHandlerId hid_ = kaix_fresh_handler_id();\n",
+    "        kaix_ev_set_handler_id(", kfx_ev_ptr(sym), ", hid_);\n",
+    kfx_alias_id(alias), kfx_state_set(cx, sym, init), kfx_env(cx, sym, env),
+    concat_all(kfx_op_lines(sym, h.op_thunks, 0, [])),
+    "        kaix_evidence_push_with_jmp_l(&", kc_reg(nfx_node_reg(sym)), ", ", kfx_label(eff), ", ", kfx_ev_ptr(sym),
+    ", (void *) ", kc_reg(nfx_jmpbuf_reg(sym)), ", (void *) &", kc_reg(nfx_discard_reg(sym)), ");\n",
+    kfx_alias_cap(sym, alias), "    }\n"])
+
+fn kfx_install(cx: KcCx, eff: String, sym: String, init: Option[KVal], alias: Option[String], env: [Option[String]]) : String =
+  match nfx_find_handler(cx.hs, sym) {
+    None -> concat_all(["    ", kc_unsupported(cat2("KInstall: no handler decl for ", sym)), ";\n"])
+    Some(h) -> kfx_install_with(cx, eff, sym, init, alias, env, h)
+  }
+
+fn kfx_bind_state(regs: [String], ev: String) : String = match regs {
+  [] -> ""
+  _ -> concat_all(["    {\n        KaiValue *st_ = kaix_clause_state_get(", ev, ");\n",
+                   concat_all(map(regs, (r) => concat_all(["        ", kc_reg(r), " = st_;\n"]))), "    }\n"])
+}
+
+#[doc("The statement text of an install, pop, state binding, cleanup arming or cleanup run.")]
+pub fn kcx_stmt(cx: KcCx, s: KStmt) : String = match s {
+  KInstall(eff, sym, init, alias, env, _) -> kfx_install(cx, eff, sym, init, alias, env)
+  KPop(_, _, _) -> "    kaix_evidence_pop();\n"
+  KBindEvState(_, sym, regs, _) -> kfx_bind_state(regs, kfx_ev_ptr(sym))
+  KBindSelfState(regs, _) -> kfx_bind_state(regs, kc_reg("__self"))
+  KSetCleanup(_, sym, thunk, _) ->
+    concat_all(["    kaix_evidence_set_cleanup(&", kc_reg(nfx_node_reg(sym)), ", (void *) ", thunk, ", ", kfx_ev_ptr(sym), ");\n"])
+  KRunCleanup(_, sym, _) -> concat_all(["    kaix_evidence_run_cleanup(&", kc_reg(nfx_node_reg(sym)), ");\n"])
+  _ -> concat_all(["    ", kc_unsupported("not an effect statement"), ";\n"])
+}
+
+# ---- clause and cleanup fns --------------------------------------------------
+
+fn kfx_direct_count(ps: [KParam], acc: Int) : Int = match ps {
+  [] -> acc
+  [p, ...rest] -> match p.origin {
+    PDirect(_) -> kfx_direct_count(rest, acc + 1)
+    _ -> kfx_direct_count(rest, acc)
+  }
+}
+
+fn kfx_param_decls(n: Int, i: Int, acc: [String]) : [String] =
+  if i >= n { list_reverse(acc) } else { kfx_param_decls(n, i + 1, [concat_all(["KaiValue *p", int_to_string(i)]), ...acc]) }
+
+#[doc("The C signature of a clause or cleanup fn: `self`, one boxed param per direct arg, and for a clause the continuation.")]
+pub fn kcx_clause_sig(f: KFn, sym: String) : String = {
+  let direct = kfx_param_decls(kfx_direct_count(f.params, 0), 0, [])
+  let tail = match f.kind { KFnCleanup -> []  _ -> ["KaiCont *p_k"] }
+  concat_all(["KaiValue *", sym, "(", string_join(["void *p_self", ...list_append(direct, tail)], ", "), ")"])
+}
+
+fn kfx_seed_param(p: KParam) : String = match p.origin {
+  PDirect(i) -> concat_all(["    ", kc_reg(p.name), " = p", int_to_string(i), ";\n"])
+  PResume -> concat_all(["    ", kc_reg(kir_resume_reg()), " = (KaiValue *) p_k;\n"])
+  PEnvCapture(j) -> concat_all(["    ", kc_reg(p.name), " = ", kc_call("kaix_clause_env_get", [kc_reg("__self"), int_to_string(j)]), ";\n"])
+  PCapture(_) -> concat_all(["    ", kc_unsupported("a closure-capture param in a handler clause"), ";\n"])
+}
+
+#[doc("The statements that seed a clause or cleanup fn's registers from its C params.")]
+pub fn kcx_clause_seed(f: KFn) : String =
+  concat_all([concat_all(["    ", kc_reg("__self"), " = (KaiValue *) p_self;\n"]), concat_all(map(f.params, kfx_seed_param))])

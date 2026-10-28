@@ -1,0 +1,130 @@
+#[doc("KIR to C printer: raw scalar arithmetic, comparisons, conversions and the box borders.")]
+
+import compiler.ast_ids
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_syms
+import compiler.operators
+import compiler.util
+
+fn kc_bad(what: String) : String = kc_unsupported(cat2("raw op outside its scalar's family: ", what))
+
+fn kc_infix(op: String, a: String, b: String) : String = concat_all(["(", a, " ", op, " ", b, ")"])
+
+fn kc_arith_c(op: BinOp) : String = match op {
+  BoAdd -> "+"
+  BoSub -> "-"
+  BoMul -> "*"
+  BoDiv -> "/"
+  BoMod -> "%"
+  _     -> "?"
+}
+
+fn kc_cmp_c(op: BinOp) : String = match op {
+  BoLt -> "<"
+  BoGt -> ">"
+  BoLe -> "<="
+  BoGe -> ">="
+  BoEq -> "=="
+  _    -> "!="
+}
+
+fn kc_is_div(op: BinOp) : Bool = match op {
+  BoDiv -> true
+  BoMod -> true
+  _     -> false
+}
+
+fn kc_trapless(b: KVal) : Bool = match b {
+  KIntV(n) -> n != 0 and n != -1
+  _        -> false
+}
+
+fn kc_wrap(cty: String, wide: String, op: BinOp, a: String, b: String) : String =
+  concat_all(["((", cty, ")((", wide, ")", a, " ", kc_arith_c(op), " (", wide, ")", b, "))"])
+
+# ---- per-scalar arithmetic -------------------------------------------------
+
+fn kc_checked_div(signed: Bool, op: BinOp, a: String, b: String, narrow: String) : String = {
+  let sym = if signed { if (match op { BoDiv -> true _ -> false }) { "kaix_idiv_chk" } else { "kaix_imod_chk" } }
+            else { if (match op { BoDiv -> true _ -> false }) { "kaix_udiv_chk" } else { "kaix_umod_chk" } }
+  let wide = if signed { "int64_t" } else { "uint64_t" }
+  concat_all(["((", narrow, ")", sym, "((", wide, ")", a, ", (", wide, ")", b, "))"])
+}
+
+fn kc_int_arith(op: BinOp, a: String, b: String, bv: KVal) : String =
+  if kc_is_div(op) and not kc_trapless(bv) { kc_checked_div(true, op, a, b, "int64_t") }
+  else if kc_is_div(op) { kc_infix(kc_arith_c(op), a, b) }
+  else { kc_wrap("int64_t", "uint64_t", op, a, b) }
+
+fn kc_byte_arith(op: BinOp, a: String, b: String) : String =
+  if kc_is_div(op) { kc_checked_div(true, op, a, b, "int32_t") }
+  else { concat_all(["(", kc_wrap("int32_t", "uint32_t", op, a, b), " & 255)"]) }
+
+fn kc_real_arith(op: BinOp, a: String, b: String) : String = match op {
+  BoMod -> kc_bad("real %")
+  _     -> kc_infix(kc_arith_c(op), a, b)
+}
+
+fn kc_fixed_arith(s: RawScalar, op: BinOp, a: String, b: String) : String = match s {
+  RwInt32  -> if kc_is_div(op) { kc_checked_div(true, op, a, b, "int32_t") } else { kc_wrap("int32_t", "uint32_t", op, a, b) }
+  RwUInt32 -> if kc_is_div(op) { kc_checked_div(false, op, a, b, "uint32_t") } else { kc_wrap("uint32_t", "uint32_t", op, a, b) }
+  RwUInt64 -> if kc_is_div(op) { kc_checked_div(false, op, a, b, "uint64_t") } else { kc_wrap("uint64_t", "uint64_t", op, a, b) }
+  RwInt128 -> if kc_is_div(op) { kc_unsupported("raw i128 div/mod must stay boxed") } else { kc_wrap("__int128", "unsigned __int128", op, a, b) }
+  _        -> kc_bad("fixed arithmetic")
+}
+
+fn kc_arith(s: RawScalar, op: BinOp, y: KVal, a: String, b: String) : String = match s {
+  RwReal -> kc_real_arith(op, a, b)
+  RwInt  -> kc_int_arith(op, a, b, y)
+  RwByte -> kc_byte_arith(op, a, b)
+  RwBool -> kc_bad("bool arithmetic")
+  RwChar -> kc_bad("char arithmetic")
+  _      -> kc_fixed_arith(s, op, a, b)
+}
+
+fn kc_logical(op: BinOp, a: String, b: String) : String = match op {
+  BoAnd -> concat_all(["((int32_t)(", a, " && ", b, "))"])
+  BoOr  -> concat_all(["((int32_t)(", a, " || ", b, "))"])
+  _     -> kc_bad("bool op")
+}
+
+#[doc("One raw binary op over two atoms of scalar `s`: arithmetic yields the scalar's own register, a comparison an int32 0 or 1.")]
+pub fn kc_raw_bin(cx: KcCx, s: RawScalar, op: BinOp, args: [KVal]) : String = match args {
+  [x, y] -> {
+    let slot = raw_scalar_slot(s)
+    let a = kc_atom_raw(cx, x, slot)
+    let b = kc_atom_raw(cx, y, slot)
+    if binop_is_arith(op) { kc_arith(s, op, y, a, b) }
+    else if binop_is_comparison(op) { concat_all(["((int32_t)", kc_infix(kc_cmp_c(op), a, b), ")"]) }
+    else { match s { RwBool -> kc_logical(op, a, b)  _ -> kc_bad("logical op") } }
+  }
+  _ -> kc_unsupported("raw binop arity")
+}
+
+#[doc("A raw unary op: negation over a Real, `not` over a Bool.")]
+pub fn kc_raw_un(cx: KcCx, op: UnOp, args: [KVal]) : String = match args {
+  [a] -> match op {
+    UoNeg -> concat_all(["(-", kc_atom_raw(cx, a, SReal), ")"])
+    UoNot -> concat_all(["((int32_t)!", kc_atom_raw(cx, a, SBool), ")"])
+  }
+  _ -> kc_unsupported("raw unary arity")
+}
+
+#[doc("A raw scalar conversion through its runtime entry, the argument read at `slot`.")]
+pub fn kc_raw_conv(cx: KcCx, sym: String, slot: KSlot, args: [KVal]) : String = match args {
+  [a] -> kc_call(sym, [kc_atom_raw(cx, a, slot)])
+  _   -> kc_unsupported("raw conv arity")
+}
+
+#[doc("A raw scalar boxed by its runtime constructor.")]
+pub fn kc_raw_box(cx: KcCx, s: RawScalar, args: [KVal]) : String = match args {
+  [a] -> kc_box(raw_scalar_slot(s), kc_atom_raw(cx, a, raw_scalar_slot(s)))
+  _   -> kc_unsupported("raw box arity")
+}
+
+#[doc("The raw payload of an atom at the scalar's slot, borrowing a box.")]
+pub fn kc_raw_unbox(cx: KcCx, s: RawScalar, args: [KVal]) : String = match args {
+  [a] -> kc_atom_raw(cx, a, raw_scalar_slot(s))
+  _   -> kc_unsupported("raw unbox arity")
+}

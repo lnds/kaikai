@@ -128,8 +128,8 @@ make -C stage1 selfhost >&2
 make -C stage2 selfhost SELFHOST_ONCE=1 >&2
 
 # The next release's seed: the C this kaic2 emits for its own source and the
-# runtime.h it pairs with. Linked from those two files alone, as a rescue
-# would, it must reproduce itself.
+# runtime it includes (runtime.h, runtime/ and runtime_llvm.c). Linked from
+# those files alone, as a rescue would, it must reproduce itself.
 SEED="$DIST/bootstrap-seed-v$VERSION"
 echo "==> emitting and verifying bootstrap-seed-v$VERSION"
 rm -rf "$SEED"
@@ -137,6 +137,7 @@ mkdir -p "$SEED/bootstrap"
 cp stage2/build/kaic2b.c "$SEED/bootstrap/stage2.c"
 cp stage2/runtime.h      "$SEED/bootstrap/runtime.h"
 cp -R stage2/runtime     "$SEED/bootstrap/runtime"
+cp stage0/runtime_llvm.c "$SEED/bootstrap/runtime_llvm.c"
 make -s -C stage2 boot-hop HOP_C="$SEED/bootstrap/stage2.c" HOP_BIN="$SEED/kaic2" HOP_INC="$SEED/bootstrap" >&2
 (cd stage2 && KAIKAI_STDLIB_PATH="$ROOT/stdlib" "$SEED/kaic2" --edition "$(cat ../EDITION)" main.kai) > "$SEED/self.c"
 if ! cmp -s "$SEED/bootstrap/stage2.c" "$SEED/self.c"; then
@@ -204,9 +205,6 @@ chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
 cp -R stage2/runtime       "$STAGE/share/kaikai/include/runtime"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
-# The minimal C-backend runtime owner: the C split's owner
-# object, next to runtime.h so kai resolves it here in the installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.
-cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 
 # P2 (docs/native-codegen-perf-plan.md §P2): ship the native-runtime bitcode
 # so the installed `kai build --backend=native` links it before O2 and

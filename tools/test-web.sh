@@ -181,7 +181,7 @@ check_installed_layout() {
   cp "$KAI" "$p/bin/kai"
   cp "$ROOT/stage2/kaic2" "$p/libexec/kaikai/kaic2"
   ln -s "$ROOT/stdlib" "$p/share/kaikai/stdlib"
-  cp -R "$ROOT/stage2/runtime" "$ROOT/stage2/runtime.h" "$ROOT/stage2/runtime_owner_c.c" "$ROOT/stage0/runtime_llvm.c" "$p/share/kaikai/include/"
+  cp -R "$ROOT/stage2/runtime" "$ROOT/stage2/runtime.h" "$ROOT/stage0/runtime_llvm.c" "$p/share/kaikai/include/"
   cp "$ROOT/VERSION" "$ROOT/EDITION" "$p/share/kaikai/"
   cp "$ROOT/stage2/web/kai_host.mjs" "$p/share/kaikai/web/"
   if "$p/bin/kai" build --target=wasm32-browser "${FIXTURES[0]}" -o "$TMP/inst/$n" 2>"$TMP/inst.err" \

@@ -233,11 +233,16 @@ tier0: selfhost tier0-gates
 # rather than in series. Locally `tier0` stays the single pre-commit gate.
 # Gates that read only sources and scripts: no compiler is built or run, so
 # CI reports them from a job that does not wait for the build.
-FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-canonical-aliases test-release-platforms test-kaic-boot
+FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-canonical-aliases test-release-platforms test-kaic-boot test-runtime-decls
 
 # The tier0 gates that need a built kaic2, cheapest first so a break reports
 # before the slow demos and cache gates.
-KAIC2_GATES := test-selfhost-warnings test-cmodular-prune test-fmt-classify test-compiler-lint-ratchet test-symid-names-compiled test-builtin-table test-kai-builtins test-symtab test-resolve-sym test-symid-pipeline test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-kai-namespace test-native-namespace test-module-name-ident test-rboxed-prim-scope test-heap-limit test-evidence-frame test-tls-hoist-gate test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-core-cache-tid test-rc-budget demos-no-regression
+KAIC2_GATES := test-selfhost-warnings test-fmt-classify test-compiler-lint-ratchet test-symid-names-compiled test-builtin-table test-kai-builtins test-symtab test-resolve-sym test-symid-pipeline test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-kai-namespace test-native-namespace test-module-name-ident test-rboxed-prim-scope test-heap-limit test-evidence-frame test-tls-hoist-gate test-compile-alloc test-nest-alloc test-block-reuse test-core-full test-core-cache-tid test-rc-budget demos-no-regression
+
+# stage2/runtime/runtime_llvm_decls.h is generated from stage0/runtime_llvm.c;
+# a user's build never runs the generator, so the committed header must match.
+test-runtime-decls:
+	@python3 tools/gen-runtime-decls.py --check
 
 fast-gates: $(FAST_GATES)
 	@echo "fast-gates OK — every tier0 gate that needs no compiler"
@@ -318,20 +323,6 @@ test-builtin-table: kaic2
 .PHONY: test-kai-builtins
 test-kai-builtins: kaic2
 	@./tools/kai-builtins-gate.sh --self-test
-
-# A c-modular compile that prunes the core against a cached core TU set
-# emits what an unpruned compile with no cache emits: every core TU and its
-# slices byte for byte, the root and library TUs as a subset. The programs
-# are the shapes that once differed (unwinding handlers, fixed vectors, a
-# pruned-away library module); `make test-cmodular-prune CMOD_PRUNE_ALL=1`
-# sweeps every example that has an .out.expected.
-CMOD_PRUNE_PROGS := examples/portfolio/portfolio.kai demos/poker/main.kai examples/actors/dual_actor_receive_only.kai examples/actors/dual_actor_send_only.kai examples/effects/row_carrier_naming.kai examples/effects/actor_receive_outer_mailbox.kai examples/perceus/fixed_vec_border_1481.kai examples/stdlib/fs_delete.kai examples/stdlib/real_libm_basic.kai examples/units/real_round_measure.kai examples/sugars/kinds_dim_vec.kai examples/writer/main.kai
-.PHONY: test-cmodular-prune
-test-cmodular-prune: kaic2
-	@if [ -n "$(CMOD_PRUNE_ALL)" ]; then \
-	  set -- $$(for f in examples/*/*.kai; do [ -f "$${f%.kai}.out.expected" ] && echo $$f; done); \
-	else set -- $(CMOD_PRUNE_PROGS); fi; \
-	./tools/cmodular-prune-diff.sh stage2/kaic2 stdlib examples/portfolio/portfolio.kai "$$@"
 
 # Core pruning must not change behaviour: every program compiles and runs
 # with the core pruned and against the whole core (KAI_CORE_PRUNE=off), and
@@ -417,16 +408,16 @@ test-rboxed-prim-scope: kaic1 kaic2
 	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	$(KAIC2) --path stdlib examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
-	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag_[0-9][0-9]*)' $$tmp/s2.c \
+	grep -qE '^    KU\(r_ntag_[0-9]+\);$$' $$tmp/s2.c \
 	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
-	if grep -q 'kai_op_ne_v(kaiv_ntag_[0-9][0-9]*,' $$tmp/s2.c; then \
+	if awk '/kaix_ne\(r_ntag_[0-9]+,/ && prev !~ /KU\(r_ntag_/ { bad = 1 } { prev = $$0 } END { exit !bad }' $$tmp/s2.c; then \
 	  echo "rboxed-prim FAIL kaic2: raw llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
 	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"
 
 # C-emission namespace gate. User identifiers ride their own namespaces
-# (`kaiu_` fns, `kaiv_` locals), so every `kai_*` token in kaic2-emitted C
-# must be a name runtime.h itself contains. A binder that leaks into `kai_*`
+# (module-prefixed fns, `r_`/`t` locals), so every `kai_*` token in
+# kaic2-emitted C must be a name the runtime itself contains. A binder that leaks into `kai_*`
 # with a runtime helper's name breaks the selfhost cc build; this catches
 # the rest of the class — any leak, colliding or not — over the compiler's
 # own thousands of binders. The reverse check keeps future runtime helpers
@@ -440,7 +431,7 @@ test-kai-namespace: kaic2
 	( cd stage2 && ./kaic2 $(EDITION_FLAG) main.kai ) > $$tmp/self.c; \
 	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/self.c \
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/emitted.txt; \
-	cat stage2/runtime.h stage2/runtime/*.h | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
+	cat stage2/runtime.h stage2/runtime/*.h stage0/runtime_llvm.c | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
 	leaks=$$(comm -23 $$tmp/emitted.txt $$tmp/runtime.txt); \
 	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: user-derived identifiers emitted into the runtime kai_ namespace:"; echo "$$leaks"; exit 1; }; \
 	rev=$$(cat stage2/runtime.h stage2/runtime/*.h | tr -c 'A-Za-z0-9_' '\n' | grep -E '^(kaiu_|kaiv_)' | sort -u); \
@@ -826,7 +817,6 @@ test-kai-cli: kaic2
 	@tests/bin_memo.sh
 	@tests/cache_trim.sh
 	@tests/header_digest.sh
-	@tests/runtime_gates.sh
 	@tests/sha_nested.sh
 	@tests/run_memo.sh
 	@tests/src_entry.sh

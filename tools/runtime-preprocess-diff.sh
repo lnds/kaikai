@@ -44,7 +44,7 @@ fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/kai-rt-pp.XXXXXX")"
 trap 'rm -rf "$work"' EXIT INT TERM
 mkdir -p "$work/base/stage0" "$work/base/stage2"
-for f in stage2/runtime.h stage2/runtime_owner_c.c stage0/runtime_llvm.c $(git ls-tree -r --name-only "$base" stage2/runtime/); do
+for f in stage2/runtime.h stage0/runtime_llvm.c $(git ls-tree -r --name-only "$base" stage2/runtime/); do
   mkdir -p "$work/base/$(dirname "$f")"
   git show "$base:$f" > "$work/base/$f"
 done
@@ -78,11 +78,10 @@ compare() {
 }
 
 echo "runtime-preprocess-diff: $(git rev-parse --short "$base") against the working tree, $CC on $(uname -sm)"
-compare single-tu     stage2/runtime_owner_c.c ""
-compare c-owner       stage2/runtime_owner_c.c "$OWNER -DKAI_PROGRAM_PROVIDES_MAIN=1"
-compare c-module      stage2/runtime_owner_c.c "$SEP"
+compare single-tu     stage0/runtime_llvm.c    ""
 compare native-owner  stage0/runtime_llvm.c    "$OWNER"
+compare native-module stage0/runtime_llvm.c    "$SEP"
 compare native-hot    stage0/runtime_llvm.c    "$SEP -DKAI_HOT_ONLY=1"
-compare rc-ledger     stage2/runtime_owner_c.c "-DKAI_TRACE_RC=1"
-compare sized-main    stage2/runtime_owner_c.c "-DKAI_MAIN_STACK_SIZE=67108864"
+compare rc-ledger     stage0/runtime_llvm.c    "-DKAI_TRACE_RC=1"
+compare sized-main    stage0/runtime_llvm.c    "-DKAI_MAIN_STACK_SIZE=67108864"
 exit "$status"

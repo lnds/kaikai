@@ -1,0 +1,202 @@
+#[doc("KIR to C printer: fused Vec prims over bare words and fixed-width vec aggregates.")]
+
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_c_ops_util
+import compiler.kir_syms
+import compiler.util
+
+fn kc_bad_vec(what: String) : String = kc_unsupported(cat2("malformed bare-word vec prim ", what))
+
+# ---- bare-word vec prims ---------------------------------------------------
+
+fn kc_vec_read_field(cx: KcCx, sym: String, args: [KVal]) : String = match args {
+  [v, i, KIntV(fidx), KIntV(n), KIntV(owned)] ->
+    kc_call(sym, [kc_atom(cx, v), kc_atom_raw(cx, i, SInt64), kc_i32(fidx), kc_i32(n), kc_i32(owned)])
+  _ -> kc_bad_vec(sym)
+}
+
+fn kc_vec_read_field_boxed(cx: KcCx, args: [KVal]) : String = match args {
+  [v, i, KIntV(fidx), KIntV(owned)] ->
+    kc_call("kaix_vec_field_boxed", [kc_atom(cx, v), kc_atom_raw(cx, i, SInt64), kc_i32(fidx), kc_i32(owned)])
+  _ -> kc_bad_vec("vec.read.field.boxed")
+}
+
+fn kc_vec_read(cx: KcCx, sym: String, args: [KVal]) : String = match args {
+  [v, i, KIntV(owned)] -> kc_call(sym, [kc_atom(cx, v), kc_atom_raw(cx, i, SInt64), kc_i32(owned)])
+  _                    -> kc_bad_vec(sym)
+}
+
+fn kc_vec_push(cx: KcCx, sym: String, slot: KSlot, args: [KVal]) : String = match args {
+  [v, x] -> kc_call(sym, [kc_atom(cx, v), kc_atom_raw(cx, x, slot)])
+  _      -> kc_bad_vec(sym)
+}
+
+fn kc_vec_set(cx: KcCx, sym: String, slot: KSlot, args: [KVal]) : String = match args {
+  [v, i, x] -> kc_call(sym, [kc_atom(cx, v), kc_atom_raw(cx, i, SInt64), kc_atom_raw(cx, x, slot)])
+  _         -> kc_bad_vec(sym)
+}
+
+fn kc_tail(xs: [KVal]) : [KVal] = match xs {
+  []           -> []
+  [_, ...rest] -> rest
+}
+
+fn kc_evens(xs: [KVal]) : [KVal] = match xs {
+  []           -> []
+  [x, ...rest] -> [x, ...kc_evens(kc_tail(rest))]
+}
+
+fn kc_kind_slot(kinds: String, k: Int) : KSlot = if string_slice(kinds, k, 1) == "r" { SReal } else { SInt64 }
+
+fn kc_bits_words(cx: KcCx, kinds: String, vals: [KVal], k: Int) : [String] = match vals {
+  []           -> []
+  [x, ...rest] -> {
+    let slot = kc_kind_slot(kinds, k)
+    let raw = kc_atom_raw(cx, x, slot)
+    let w = match slot { SReal -> concat_all(["((KaiVarSlot){.r = ", raw, "}).i64"])  _ -> raw }
+    [w, ...kc_bits_words(cx, kinds, rest, k + 1)]
+  }
+}
+
+fn kc_bit_names(names: [KVal]) : [String] = match names {
+  []                   -> []
+  [KStrV(nm), ...rest] -> [kc_cstr(nm), ...kc_bit_names(rest)]
+  _                    -> [kc_unsupported("bare-word vec push with a non-literal field name")]
+}
+
+fn kc_vec_push_rec(cx: KcCx, args: [KVal]) : String = match args {
+  [v, KStrV(kinds), ...pairs] ->
+    kc_call("kaix_vec_push_rec_bits",
+            [kc_atom(cx, v), kc_int_lit(string_length(kinds)),
+             kc_arr("int64_t", kc_bits_words(cx, kinds, kc_evens(pairs), 0)), kc_cstr(kinds),
+             kc_arr("const char *", kc_bit_names(kc_evens(kc_tail(pairs))))])
+  _ -> kc_bad_vec("vec.write.push.rec")
+}
+
+fn kc_vec_set_rec(cx: KcCx, args: [KVal]) : String = match args {
+  [v, i, KStrV(kinds), ...vals] ->
+    kc_call("kaix_vec_set_rec_bits",
+            [kc_atom(cx, v), kc_atom_raw(cx, i, SInt64), kc_int_lit(string_length(kinds)),
+             kc_arr("int64_t", kc_bits_words(cx, kinds, vals, 0)), kc_cstr(kinds)])
+  _ -> kc_bad_vec("vec.write.set.rec")
+}
+
+fn kc_rec_pairs(cx: KcCx, pairs: [KVal], vs: [String], ns: [String]) : ([String], [String]) = match pairs {
+  [x, KStrV(nm), ...rest] -> kc_rec_pairs(cx, rest, [kc_atom(cx, x), ...vs], [kc_cstr(nm), ...ns])
+  _                       -> (list_reverse(vs), list_reverse(ns))
+}
+
+fn kc_vec_push_rec_raw(cx: KcCx, args: [KVal]) : String = match args {
+  [v, KIntV(n), ...pairs] -> match kc_rec_pairs(cx, pairs, [], []) {
+    (vs, ns) -> kc_call("kaix_vec_push_rec_raw", [kc_atom(cx, v), kc_int_lit(n), kc_arr("KaiValue *", vs), kc_arr("const char *", ns)])
+  }
+  _ -> kc_unsupported("vec_push_rec_raw with malformed args")
+}
+
+fn kc_vec_set_rec_raw(cx: KcCx, args: [KVal]) : String = match args {
+  [v, i, KIntV(n), ...xs] ->
+    kc_call("kaix_vec_set_rec_raw", [kc_atom(cx, v), kc_atom(cx, i), kc_int_lit(n), kc_arr("KaiValue *", kc_atoms(cx, xs))])
+  _ -> kc_unsupported("vec_set_rec_raw with malformed args")
+}
+
+#[doc("A fused Vec prim: a read yields its payload, a write the result vec.")]
+pub fn kc_vec_raw_prim(cx: KcCx, p: PrimOp, args: [KVal]) : String = match p {
+  KpVecReadField(VbInt)  -> kc_vec_read_field(cx, "kaix_vec_field_i64", args)
+  KpVecReadField(VbReal) -> kc_vec_read_field(cx, "kaix_vec_field_f64", args)
+  KpVecReadFieldBoxed    -> kc_vec_read_field_boxed(cx, args)
+  KpVecRead(VbInt)       -> kc_vec_read(cx, "kaix_vec_get_i64", args)
+  KpVecRead(VbReal)      -> kc_vec_read(cx, "kaix_vec_get_f64", args)
+  KpVecPushRec           -> kc_vec_push_rec(cx, args)
+  KpVecSetRec            -> kc_vec_set_rec(cx, args)
+  KpVecPush(VbInt)       -> kc_vec_push(cx, "kaix_vec_push_i64", SInt64, args)
+  KpVecPush(VbReal)      -> kc_vec_push(cx, "kaix_vec_push_f64", SReal, args)
+  KpVecSet(VbInt)        -> kc_vec_set(cx, "kaix_vec_set_i64", SInt64, args)
+  KpVecSet(VbReal)       -> kc_vec_set(cx, "kaix_vec_set_f64", SReal, args)
+  KpVecPushRecRaw        -> kc_vec_push_rec_raw(cx, args)
+  KpVecSetRecRaw         -> kc_vec_set_rec_raw(cx, args)
+  _                      -> kc_bad_vec(kprim_text(p))
+}
+
+# ---- fixed-width vecs ------------------------------------------------------
+
+fn kc_elem_cty(tag: RawScalar) : String = match tag {
+  RwReal   -> "double"
+  RwInt    -> "int64_t"
+  RwUInt64 -> "uint64_t"
+  RwUInt32 -> "uint32_t"
+  _        -> "int32_t"
+}
+
+fn kc_elem_slot(tag: RawScalar) : KSlot = match tag {
+  RwInt128 -> SInt64
+  _        -> raw_scalar_slot(tag)
+}
+
+fn kc_elem_box(tag: RawScalar, raw: String) : String = match tag {
+  RwInt128 -> kc_call("kaix_int", [raw])
+  _        -> kc_box(raw_scalar_slot(tag), raw)
+}
+
+fn kc_elem_ref(tag: RawScalar, base: String, ix: String) : String =
+  concat_all(["((", kc_elem_cty(tag), " *)", base, ")[", ix, "]"])
+
+fn kc_lit_stores(cx: KcCx, tag: RawScalar, es: [KVal], i: Int) : [String] = match es {
+  []           -> []
+  [e, ...rest] -> [concat_all(["a_[", int_to_string(i), "] = ", kc_atom_raw(cx, e, kc_elem_slot(tag)), "; "]),
+                   ...kc_lit_stores(cx, tag, rest, i + 1)]
+}
+
+fn kc_fixed_vec_lit(cx: KcCx, tag: RawScalar, args: [KVal]) : String = {
+  let cty = kc_elem_cty(tag)
+  concat_all(["({ ", cty, " *a_ = __builtin_alloca(", int_to_string(list_length(args)), " * sizeof(", cty, ")); ",
+              concat_all(kc_lit_stores(cx, tag, args, 0)), "(KaiValue *)a_; })"])
+}
+
+fn kc_static_idx(idx: KVal) : String = match idx {
+  KIntV(k) -> int_to_string(k)
+  _        -> "0"
+}
+
+fn kc_checked_idx(cx: KcCx, idx: KVal, n: Int) : String =
+  kc_call("kaix_fixed_vec_idx", [kc_atom_raw(cx, idx, SInt64), kc_int_lit(n)])
+
+fn kc_fixed_read(cx: KcCx, tag: RawScalar, n: Int, args: [KVal], dyn: Bool, raw_out: Bool) : String = match args {
+  [base, idx] -> {
+    let ix = if dyn { kc_checked_idx(cx, idx, n) } else { kc_static_idx(idx) }
+    let load = kc_elem_ref(tag, kc_atom(cx, base), ix)
+    if raw_out { load } else { kc_elem_box(tag, load) }
+  }
+  _ -> kc_unsupported("fixed vec read arity")
+}
+
+fn kc_fixed_dget(cx: KcCx, tag: RawScalar, n: Int, args: [KVal], dyn: Bool, raw_out: Bool) : String = match args {
+  [base, idx] -> {
+    let ix = if dyn { kc_checked_idx(cx, idx, n) } else { kc_static_idx(idx) }
+    let cty = kc_elem_cty(tag)
+    let out = if raw_out { "rv_" } else { kc_elem_box(tag, "rv_") }
+    concat_all(["({ KaiValue *v_ = ", kc_atom(cx, base), "; ", cty, " rv_ = *(const ", cty, " *)kaix_vec_raw_slot(v_, ", ix,
+                "); kaix_decref(v_); ", out, "; })"])
+  }
+  _ -> kc_unsupported("fixed vec read arity")
+}
+
+fn kc_materialize_pushes(tag: RawScalar, n: Int, i: Int) : [String] =
+  if i >= n { [] }
+  else { [concat_all(["v_ = kaix_core_vec_push(v_, ", kc_elem_box(tag, kc_elem_ref(tag, "p_", int_to_string(i))), "); "]),
+          ...kc_materialize_pushes(tag, n, i + 1)] }
+
+fn kc_fixed_materialize(cx: KcCx, tag: RawScalar, n: Int, args: [KVal]) : String = match args {
+  [base] -> concat_all(["({ KaiValue *p_ = ", kc_atom(cx, base), "; KaiValue *v_ = kaix_core_vec_reserve(", kc_call("kaix_int", [kc_int_lit(n)]),
+                        "); ", concat_all(kc_materialize_pushes(tag, n, 0)), "v_; })"])
+  _      -> kc_unsupported("fixed vec materialize arity")
+}
+
+#[doc("A fixed-width vec prim: the literal yields the element array, a read the element, the materialise a dynamic Vec.")]
+pub fn kc_fixed_vec_prim(cx: KcCx, p: PrimOp, args: [KVal]) : String = match p {
+  KpFixedVecLit(elem, _)         -> kc_fixed_vec_lit(cx, elem, args)
+  KpFixedVecMaterialize(elem, n) -> kc_fixed_materialize(cx, elem, n, args)
+  KpFixedVecGet(r, elem, n)      ->
+    if r.heap { kc_fixed_dget(cx, elem, n, args, r.dyn, r.raw) } else { kc_fixed_read(cx, elem, n, args, r.dyn, r.raw) }
+  _                              -> kc_unsupported("not a fixed vec prim")
+}

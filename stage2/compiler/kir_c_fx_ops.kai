@@ -1,0 +1,207 @@
+#[doc("KIR to C printer: perform, resume, setjmp and the unwind / segment primitives.")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.core_types
+import compiler.effect_instance
+import compiler.emit_native_fn
+import compiler.emit_native_fx
+import compiler.kir
+import compiler.kir_c_core
+import compiler.util
+
+fn kfx_unsup(what: String) : String = concat_all(["((KaiValue *) ", kc_unsupported(what), ")"])
+
+fn kfx_label(text: String) : String = concat_all(["KAI_EFF(", kc_cstr(text), ")"])
+
+fn kfx_text_match(a: String, b: String) : Bool =
+  if a == b { true }
+  else {
+    let i = string_index_of_char(a, '[')
+    let la = string_length(a)
+    let lb = string_length(b)
+    let n = if i < 0 { la } else { i }
+    if lb < n { false }
+    else if string_slice(b, 0, n) != string_slice(a, 0, n) { false }
+    else if n == la { lb > n and char_at_or_zero(b, n) == '[' }
+    else { lb == n }
+  }
+
+fn kfx_slot_exact(texts: [String], eff: String, i: Int) : Int = match texts {
+  [] -> 0 - 1
+  [t, ...rest] -> if t == eff { i } else { kfx_slot_exact(rest, eff, i + 1) }
+}
+
+fn kfx_slot_loose(texts: [String], eff: String, i: Int) : Int = match texts {
+  [] -> 0 - 1
+  [t, ...rest] -> if kfx_text_match(t, eff) { i } else { kfx_slot_loose(rest, eff, i + 1) }
+}
+
+fn kfx_frame_slot(cx: KcCx, eff: String) : Int = match nfnx_by_sym(cx.fx, cx.cur) {
+  None -> 0 - 1
+  Some(f) -> {
+    let texts = map(nfnx_frame_keys(cx.fx, f), (k) => inst_key_text(cx.tab, k))
+    let e = kfx_slot_exact(texts, eff, 0)
+    if e >= 0 { e } else { kfx_slot_loose(texts, eff, 0) }
+  }
+}
+
+fn kfx_walk_node(cx: KcCx, eff: String) : String = {
+  let name = inst_key_eff(eff)
+  let lookup = match nfx_find_handler(cx.hs, cat2("__default_", name)) {
+    Some(_) -> concat_all(["kaix_evidence_lookup_or_default_l(eff_, (KaiEvidence *) ", cat2("_kai_default_node_", name), ")"])
+    None -> "kaix_evidence_lookup_node_l(eff_)"
+  }
+  concat_all(["const char *eff_ = ", kfx_label(eff), "; void *node_ = kaix_evidence_require(", lookup, ", eff_); "])
+}
+
+fn kfx_ambient_node(cx: KcCx, eff: String) : String = {
+  let slot = kfx_frame_slot(cx, eff)
+  if slot >= 0 {
+    concat_all(["kaix_cancel_poll(fib_); void *node_ = (void *) ((void **) ", kc_reg("__evf"), ")[", int_to_string(slot), "]; "])
+  } else { kfx_walk_node(cx, eff) }
+}
+
+fn kfx_node_code(cx: KcCx, eff: String, via: KVia) : String = match via {
+  KvRecv(r) -> concat_all(["void *node_ = (void *) ", kc_reg(r), "; "])
+  KvAlias(a, shown) -> concat_all(["void *node_ = kaix_evidence_require_reachable(kaix_evidence_lookup_node_by_id((KaiHandlerId) kaix_to_int(",
+    kc_reg(kir_alias_id_reg(a)), ")), ", kc_cstr(shown), "); "])
+  KvAmbient -> kfx_ambient_node(cx, eff)
+  KvLexical -> kfx_walk_node(cx, eff)
+  KvNamed -> kfx_walk_node(cx, eff)
+}
+
+fn kfx_arg_temps(cx: KcCx, vs: [KVal], i: Int, acc: [String]) : [String] = match vs {
+  [] -> list_reverse(acc)
+  [a, ...rest] -> kfx_arg_temps(cx, rest, i + 1, [concat_all(["KaiValue *a", int_to_string(i), "_ = ", kc_atom(cx, a), "; "]), ...acc])
+}
+
+fn kfx_arg_names(n: Int, i: Int, acc: [String]) : [String] =
+  if i >= n { list_reverse(acc) } else { kfx_arg_names(n, i + 1, [concat_all(["a", int_to_string(i), "_"]), ...acc]) }
+
+fn kfx_arg_types(n: Int) : [String] = if n <= 0 { [] } else { ["KaiValue *", ...kfx_arg_types(n - 1)] }
+
+fn kfx_perform_call(cx: KcCx, node: String, field: Int, cargs: [KVal]) : String = {
+  let n = list_length(cargs)
+  let cont = cat2("&", kc_reg(nfx_cont_reg()))
+  let fty = concat_all(["KaiValue *(*)(", string_join(["void *", ...list_append(kfx_arg_types(n), ["KaiCont *"])], ", "), ")"])
+  concat_all([
+    "({ KaiFiber *fib_ = kaix_dispatch_fiber(); ", node,
+    "void *h_ = kaix_evidence_node_handler(node_); ",
+    "kaix_cont_init_identity(", cont, ", (KaiHandlerId) kaix_ev_handler_id(h_)); ",
+    concat_all(kfx_arg_temps(cx, cargs, 0, [])),
+    "void *prev_ = kaix_disp_enter(fib_, node_); ",
+    "KaiValue *r_ = ((", fty, ") kaix_ev_op_at(h_, ", int_to_string(field), "))(",
+    string_join(["h_", ...list_append(kfx_arg_names(n, 0, []), [cont])], ", "), "); ",
+    "kaix_disp_leave(fib_, prev_); ",
+    "kaix_op_finish(node_, ", cont, ", r_); })"])
+}
+
+fn kfx_perform(cx: KcCx, esym: SymId, targs: [Ty], op: String, via: KVia, cargs: [KVal]) : String = {
+  let key = kir_eff_key(cx.tab, esym, targs)
+  let eff = match via { KvNamed -> named_label(key)  _ -> key }
+  match nfx_find_handler_by_eff(cx.hs, esym) {
+    None -> kfx_unsup(cat2("KPerform: no handler for effect ", key))
+    Some(h) -> {
+      let field = nfx_op_field(h.op_thunks, op, 0)
+      if field < 0 { kfx_unsup(cat2("KPerform: no such op ", op)) }
+      else { kfx_perform_call(cx, kfx_node_code(cx, eff, via), field, cargs) }
+    }
+  }
+}
+
+fn kfx_resume2(cx: KcCx, k: KVal, v: KVal, ns: KVal) : String =
+  concat_all([
+    "({ void *self_ = (void *) ", kc_reg("__self"), "; KaiValue *old_ = kaix_clause_state_get(self_); ",
+    "kaix_clause_state_set(self_, ", kc_atom(cx, ns), "); kaix_internal_drop(old_); ",
+    "kaix_cont_resume((KaiCont *) ", kc_atom(cx, k), ", ", kc_atom(cx, v), "); })"])
+
+#[doc("The expression of a perform, resume, resume with state, or setjmp op; unsupported for any other op.")]
+pub fn kcx_op(cx: KcCx, op: KOp) : String = match op {
+  KPerform(esym, targs, o, via, cargs) -> kfx_perform(cx, esym, targs, o, via, cargs)
+  KResumeOp(k, v) -> concat_all(["kaix_cont_resume((KaiCont *) ", kc_atom(cx, k), ", ", kc_atom(cx, v), ")"])
+  KResume2Op(k, v, ns) -> kfx_resume2(cx, k, v, ns)
+  KSetjmp(_, sym) -> concat_all(["kaix_bool_of_i32(_setjmp(", kc_reg(nfx_jmpbuf_reg(sym)), "))"])
+  _ -> kfx_unsup("not an effect op")
+}
+
+# ---- unwind and segment primitives -------------------------------------------
+
+fn kfx_boxed_regs(cx: KcCx, vs: [KVal], acc: [String]) : [String] = match vs {
+  [] -> list_reverse(acc)
+  [v, ...rest] -> kfx_boxed_regs(cx, rest, match v {
+    KVar(n) -> if kc_reg_tag(cx, n) == 0 { [kc_reg(n), ...acc] } else { acc }
+    _ -> acc
+  })
+}
+
+fn kfx_ptr_array(xs: [String]) : String = match xs {
+  [] -> "NULL"
+  _ -> concat_all(["((KaiValue *[]){ ", string_join(xs, ", "), " })"])
+}
+
+fn kfx_atoms(cx: KcCx, vs: [KVal]) : [String] = map(vs, (v) => kc_atom(cx, v))
+
+fn kfx_fiber(cx: KcCx, v: KVal) : String = cat2("(KaiFiber **) ", kc_atom(cx, v))
+
+fn kfx_unw_push(cx: KcCx, args: [KVal]) : String = match args {
+  [fib, ...regs] -> {
+    let rs = kfx_boxed_regs(cx, regs, [])
+    concat_all(["(KaiValue *) kaix_unw_push_f(", kfx_fiber(cx, fib), ", ", kfx_ptr_array(rs), ", ", kc_int_lit(list_length(rs)), ")"])
+  }
+  [] -> kfx_unsup("kai_unw_push takes the frame's fiber")
+}
+
+fn kfx_unw_push_reg(cx: KcCx, args: [KVal]) : String = match args {
+  [KStrV(reg), fib] -> {
+    let boxed = kc_reg_tag(cx, reg) == 0
+    concat_all(["(KaiValue *) kaix_unw_push_f(", kfx_fiber(cx, fib), ", ", if boxed { cat2("&", kc_reg(reg)) } else { "NULL" },
+                ", ", if boxed { "1LL" } else { "0LL" }, ")"])
+  }
+  _ -> kfx_unsup("kai_unw_push_reg takes a register and the fiber")
+}
+
+fn kfx_unw_push_state(cx: KcCx, args: [KVal]) : String = match args {
+  [KStrV(sym), fib] ->
+    concat_all(["(KaiValue *) kaix_unw_push_ev_state_f(", kfx_fiber(cx, fib), ", (void *) &", kc_reg(nfx_ev_reg(sym)), ")"])
+  _ -> kfx_unsup("kai_unw_push_state takes the install site and the fiber")
+}
+
+fn kfx_resume_frames_run(cx: KcCx, args: [KVal]) : String = match args {
+  [KStrV(sym), v] -> kc_call("kaix_resume_frames_run", [cat2("&", kc_reg(nfx_node_reg(sym))), kc_atom(cx, v)])
+  _ -> kfx_unsup("kai_resume_frames_run takes the install site and a value")
+}
+
+fn kfx_seg_handle(cx: KcCx, args: [KVal]) : String = match args {
+  [body, ret, ...cls] -> kc_call("kaix_seg_handle", [kc_atom(cx, body), kc_atom(cx, ret), int_to_string(list_length(cls)), kfx_ptr_array(kfx_atoms(cx, cls))])
+  _ -> kfx_unsup("kai_seg_handle takes a body and a return")
+}
+
+fn kfx_seg_request(cx: KcCx, args: [KVal]) : String = match args {
+  [KIntV(op), ...rest] -> kc_call("kaix_seg_request", [int_to_string(op), int_to_string(list_length(rest)), kfx_ptr_array(kfx_atoms(cx, rest))])
+  _ -> kfx_unsup("kai_seg_request takes a constant op index")
+}
+
+fn kfx_resume_frame_push(cx: KcCx, args: [KVal]) : String = match args {
+  [v] -> kc_call("kaix_resume_frame_push", [kc_atom(cx, v)])
+  _ -> kfx_unsup("kai_resume_frame_push takes a closure")
+}
+
+#[doc("The expression of an unwind, landing-pad, resume-frame or segment primitive; landing pads are no-ops.")]
+pub fn kcx_prim(cx: KcCx, p: PrimOp, args: [KVal]) : String = match p {
+  KpUnwFiber -> "(KaiValue *) &kc_unw_fiber"
+  KpUnwPush -> kfx_unw_push(cx, args)
+  KpUnwPushReg -> kfx_unw_push_reg(cx, args)
+  KpUnwPushState -> kfx_unw_push_state(cx, args)
+  KpUnwPop -> match args {
+    [f] -> kc_call("kaix_unw_pop", [cat2("(KaiFiber *) ", kc_atom(cx, f))])
+    _ -> kfx_unsup("kai_unw_pop takes the pushing fiber")
+  }
+  KpPadOpen -> "NULL"
+  KpPadClose -> "NULL"
+  KpResumeFramesRun -> kfx_resume_frames_run(cx, args)
+  KpResumeFramePush -> kfx_resume_frame_push(cx, args)
+  KpSegHandle -> kfx_seg_handle(cx, args)
+  KpSegRequest -> kfx_seg_request(cx, args)
+  _ -> kfx_unsup("not an effect prim")
+}

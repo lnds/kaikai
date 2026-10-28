@@ -1,0 +1,326 @@
+#[doc("""
+KIR to C printer: one KFn as C text.
+
+The fn driver of the printer: signature by ABI, register declarations, the
+prologue that seeds params, then each block as a label with its statements
+and terminator. Operations, effects and program assembly live in sibling
+modules; this one only sequences them.
+""")]
+
+import compiler.ast_ids
+import compiler.emit_native_fn
+import compiler.emit_native_term
+import compiler.emit_shared_syms
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_c_fx
+import compiler.kir_c_ops
+import compiler.kir_syms
+import compiler.kir_tail
+import compiler.tcrec_plan
+import compiler.util
+
+# ---- which part prints an op ----------------------------------------------
+
+fn kc_fx_prim(p: PrimOp) : Bool = match p {
+  KpUnwFiber -> true
+  KpUnwPush -> true
+  KpUnwPushReg -> true
+  KpUnwPushState -> true
+  KpUnwPop -> true
+  KpPadOpen -> true
+  KpPadClose -> true
+  KpResumeFramesRun -> true
+  KpResumeFramePush -> true
+  KpSegHandle -> true
+  KpSegRequest -> true
+  _ -> false
+}
+
+fn kc_fx_op(op: KOp) : Bool = match op {
+  KPerform(_, _, _, _, _) -> true
+  KResumeOp(_, _) -> true
+  KResume2Op(_, _, _) -> true
+  KSetjmp(_, _) -> true
+  KPrim(p, _) -> kc_fx_prim(p)
+  _ -> false
+}
+
+fn kc_value(cx: KcCx, op: KOp, slot: KSlot) : String = match op {
+  KPrim(p, args) -> if kc_fx_prim(p) { kc_prim_fx_expr(cx, p, args) } else { kc_op_expr(cx, op, slot) }
+  _ -> if kc_fx_op(op) { kc_op_fx_expr(cx, op) } else { kc_op_expr(cx, op, slot) }
+}
+
+# ---- statements -----------------------------------------------------------
+
+fn kc_do(cx: KcCx, op: KOp) : String =
+  if kc_do_drops_owned(cx, op) { concat_all(["    KD(", kc_value(cx, op, SBoxed), ");\n"]) }
+  else { concat_all(["    (void)", kc_value(cx, op, SBoxed), ";\n"]) }
+
+fn kc_stmt(cx: KcCx, s: KStmt) : String = match s {
+  KLet(n, slot, op, _) -> kc_assign(cx, n, slot, kc_value(cx, op, slot))
+  KDo(op, _)           -> kc_do(cx, op)
+  KStore(n, v, _)      -> kc_store(cx, n, v)
+  KRC(rc, _)           -> cat2(kc_rc_expr_stmt(cx, rc), kc_rc_fx(cx, rc))
+  _                    -> kc_stmt_fx(cx, s)
+}
+
+fn kc_stmts(cx: KcCx, ss: [KStmt], acc: [String]) : [String] = match ss {
+  [] -> acc
+  [s, ...rest] -> kc_stmts(cx, rest, [kc_stmt(cx, s), ...acc])
+}
+
+# ---- terminators ----------------------------------------------------------
+
+fn kc_first_label(f: KFn) : String = match f.blocks {
+  [b, ..._] -> kc_label(b.label)
+  [] -> "L_entry"
+}
+
+fn kc_ret(cx: KcCx, f: KFn, v: KVal) : String = {
+  let e = if (match f.ret { SBoxed -> true _ -> false }) { kc_atom(cx, v) } else { kc_atom_raw(cx, v, f.ret) }
+  if f.donor {
+    concat_all(["    { ", kc_ctype(f.ret), " rv_ = ", e, "; kaix_reuse_free(", kc_reg(ndonor_reg()), "); return rv_; }\n"])
+  } else { concat_all(["    return ", e, ";\n"]) }
+}
+
+fn kc_cond_is_raw(cx: KcCx, c: KVal) : Bool = match c {
+  KVar(n)   -> { let t = kc_reg_tag(cx, n); t == 3 or t == 4 }
+  KBoolV(_) -> true
+  _         -> false
+}
+
+fn kc_condbr(cx: KcCx, c: KVal, tl: String, el: String) : String = {
+  let cond = if kc_cond_is_raw(cx, c) {
+    match c { KVar(n) -> kc_reg(n)  _ -> kc_atom_raw(cx, c, SBool) }
+  } else { kc_call("kaix_truthy", [kc_atom(cx, c)]) }
+  concat_all(["    if (", cond, ") goto ", kc_label(tl), "; else goto ", kc_label(el), ";\n"])
+}
+
+fn kc_cases(cs: [KCase], acc: [String]) : [String] = match cs {
+  [] -> acc
+  [KC(tag, lbl), ...rest] -> kc_cases(rest, [concat_all(["    case ", int_to_string(tag), ": goto ", kc_label(lbl), ";\n"]), ...acc])
+}
+
+fn kc_switch(cx: KcCx, v: KVal, cs: [KCase], def: String) : String =
+  concat_all(["    switch (", kc_atom(cx, v), ") {\n", concat_all(list_reverse(kc_cases(cs, []))),
+              "    default: goto ", kc_label(def), ";\n    }\n"])
+
+fn kc_nth(ps: [KParam], i: Int) : Option[KParam] = match ps {
+  [] -> None
+  [p, ...rest] -> if i == 0 { Some(p) } else { kc_nth(rest, i - 1) }
+}
+
+fn kc_param_slot(f: KFn, idx: Int) : KSlot = match kc_nth(f.params, idx) {
+  Some(p) -> p.slot
+  None    -> SBoxed
+}
+
+fn kc_param_name(f: KFn, idx: Int) : String = match kc_nth(f.params, idx) {
+  Some(p) -> p.name
+  None    -> ""
+}
+
+fn kc_asg_temps(cx: KcCx, f: KFn, asg: [KAssign], acc: [String]) : [String] = match asg {
+  [] -> acc
+  [KAsg(idx, v), ...rest] -> {
+    let s = kc_param_slot(f, idx)
+    kc_asg_temps(cx, f, rest, [concat_all([kc_ctype(s), " t", int_to_string(idx), "_ = ", kc_atom_raw(cx, v, s), "; "]), ...acc])
+  }
+}
+
+fn kc_asg_drops(f: KFn, asg: [KAssign], dropmask: Int, acc: [String]) : [String] = match asg {
+  [] -> acc
+  [KAsg(idx, _), ...rest] -> kc_asg_drops(f, rest, dropmask, if tcrec_param_dropped(dropmask, (match kc_param_slot(f, idx) { SBoxed -> true _ -> false }), idx) {
+    [concat_all(["KD(", kc_reg(kc_param_name(f, idx)), "); "]), ...acc]
+  } else { acc })
+}
+
+fn kc_asg_stores(f: KFn, asg: [KAssign], acc: [String]) : [String] = match asg {
+  [] -> acc
+  [KAsg(idx, _), ...rest] -> kc_asg_stores(f, rest, [concat_all([kc_reg(kc_param_name(f, idx)), " = t", int_to_string(idx), "_; "]), ...acc])
+}
+
+fn kc_tcrec(cx: KcCx, f: KFn, asg: [KAssign], dropmask: Int) : String =
+  concat_all(["    { ", concat_all(list_reverse(kc_asg_temps(cx, f, asg, []))),
+              concat_all(list_reverse(kc_asg_drops(f, asg, dropmask, []))),
+              concat_all(list_reverse(kc_asg_stores(f, asg, []))), "}\n    goto ", kc_first_label(f), ";\n"])
+
+fn kc_term(cx: KcCx, f: KFn, t: KTerm) : String = match t {
+  KRet(v, _)             -> kc_ret(cx, f, v)
+  KBr(l, _)              -> concat_all(["    goto ", kc_label(l), ";\n"])
+  KCondBr(c, tl, el, _)  -> kc_condbr(cx, c, tl, el)
+  KSwitch(v, cs, d, _)   -> kc_switch(cx, v, cs, d)
+  KUnreachable(_)        -> "    __builtin_unreachable();\n"
+  KTcrecGoto(_, asg, dm, _) -> kc_tcrec(cx, f, asg, dm)
+  KTrmcStep(_, _, _, _, _, _, _, _, _, _) -> kc_term_fx(cx, t, f.ret)
+  KTrmcApply(_, _)       -> kc_term_fx(cx, t, f.ret)
+}
+
+# ---- tail calls ------------------------------------------------------------
+
+fn kc_frameless(cx: KcCx, f: KFn) : Bool = list_is_empty(nfnx_frame_keys(cx.fx, f))
+
+fn kc_tail_pair(cx: KcCx, cur: KFn, sym: String) : Bool =
+  kc_frameless(cx, cur) and not cur.donor and kir_is_tail_fn(cur) and match nfnx_by_sym(cx.fx, sym) {
+    Some(g) -> kir_is_tail_fn(g) and not g.donor and kc_frameless(cx, g) and kir_same_sig(cur, g)
+    None    -> false
+  }
+
+type KcTail = { init: [KStmt], sym: String, args: [KVal], slot: KSlot }
+
+fn kc_tail_site(cx: KcCx, f: KFn, b: KBlock) : Option[KcTail] = match b.term {
+  KRet(KVar(x), _) -> match list_reverse(b.stmts) {
+    [KLet(y, slot, KCall(sym, args), _), ...before] ->
+      if y == x and slot == f.ret and kc_tail_pair(cx, f, sym) {
+        Some(KcTail { init: list_reverse(before), sym: sym, args: args, slot: slot })
+      } else { None }
+    _ -> None
+  }
+  _ -> None
+}
+
+# ---- blocks ----------------------------------------------------------------
+
+fn kc_block(cx: KcCx, f: KFn, b: KBlock, acc: [String]) : [String] = {
+  let head = [concat_all([kc_label(b.label), ":;\n"]), ...acc]
+  match kc_tail_site(cx, f, b) {
+    Some(t) -> [concat_all(["    KC_MUSTTAIL return ", kc_call_direct(cx, t.sym, t.args, t.slot), ";\n"]),
+                ...kc_stmts(cx, t.init, head)]
+    None -> [kc_term(cx, f, b.term), ...kc_stmts(cx, b.stmts, head)]
+  }
+}
+
+fn kc_blocks(cx: KcCx, f: KFn, bs: [KBlock], acc: [String]) : [String] = match bs {
+  [] -> acc
+  [b, ...rest] -> kc_blocks(cx, f, rest, kc_block(cx, f, b, acc))
+}
+
+# ---- registers and prologues ------------------------------------------------
+
+fn kc_spec_is(want: KSlot, r: RSpec) : Bool = match r { RS(_, s) -> nslot_tag(s) == nslot_tag(want) }
+
+fn kc_spec_name(r: RSpec) : String = match r { RS(n, _) -> kc_reg(n) }
+
+fn kc_decl_kind(specs: [RSpec], s: KSlot) : String = match filter(specs, (r) => kc_spec_is(s, r)) {
+  [] -> ""
+  rs -> match s {
+    SBoxed -> concat_all(["    KaiValue ", string_join(map(rs, (r) => cat2("*", kc_spec_name(r))), ", "), ";\n"])
+    _      -> concat_all(["    ", kc_ctype(s), " ", string_join(map(rs, kc_spec_name), ", "), ";\n"])
+  }
+}
+
+fn kc_reg_decls(specs: [RSpec]) : String =
+  concat_all(map([SBoxed, SInt64, SReal, SBool, SInt32, SChar, SByte, SInt32T, SUInt32, SUInt64, SInt128], (s) => kc_decl_kind(specs, s)))
+
+fn kc_seed_direct(ps: [KParam], evf: Int, acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> kc_seed_direct(rest, evf, match p.origin {
+    PDirect(i) -> [concat_all(["    ", kc_reg(p.name), " = p", int_to_string(i), ";\n"]), ...acc]
+    _ -> [concat_all(["    ", kc_unsupported("a thunk or clause param in a direct fn"), ";\n"]), ...acc]
+  })
+}
+
+fn kc_seed_normal(cx: KcCx, f: KFn) : String =
+  concat_all([
+    if kc_frameless(cx, f) { "" } else { concat_all(["    ", kc_reg("__evf"), " = p_evf;\n"]) },
+    concat_all(list_reverse(kc_seed_direct(f.params, 0, []))),
+    if f.donor { concat_all(["    ", kc_reg(ndonor_reg()), " = p_donor;\n"]) } else { "" }
+  ])
+
+fn kc_seed_thunk(ps: [KParam], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> kc_seed_thunk(rest, match p.origin {
+    PDirect(i)  -> [concat_all(["    ", kc_reg(p.name), " = p_args[", int_to_string(i), "];\n"]), ...acc]
+    PCapture(j) -> [concat_all(["    ", kc_reg(p.name), " = ", kc_call("kaix_capture", ["p_self", int_to_string(j)]), ";\n"]), ...acc]
+    _ -> [concat_all(["    ", kc_unsupported("a clause-only param in a lambda thunk"), ";\n"]), ...acc]
+  })
+}
+
+# ---- signatures --------------------------------------------------------------
+
+fn kc_param_decls(ps: [KParam], i: Int, acc: [String]) : [String] = match ps {
+  [] -> list_reverse(acc)
+  [p, ...rest] -> kc_param_decls(rest, i + 1, [concat_all([kc_ctype(p.slot), " p", int_to_string(i)]), ...acc])
+}
+
+fn kc_normal_params(cx: KcCx, f: KFn) : String = {
+  let evf = if kc_frameless(cx, f) { [] } else { ["void *p_evf"] }
+  let ps = kc_param_decls(f.params, 0, [])
+  let dn = if f.donor { ["KaiValue *p_donor"] } else { [] }
+  match list_append(list_append(evf, ps), dn) {
+    [] -> "void"
+    all -> string_join(all, ", ")
+  }
+}
+
+fn kc_storage(cx: KcCx, f: KFn) : String =
+  if (match f.kind { KFnNormal -> true _ -> false }) and f.mo == None and not nfn_link_visible(f, cx.fx) { "static " } else { "" }
+
+fn kc_sig(cx: KcCx, f: KFn, sym: String) : String = match f.kind {
+  KFnNormal -> concat_all([kc_storage(cx, f), kc_ctype(f.ret), " ", kc_fsym(f, sym), "(", kc_normal_params(cx, f), ")"])
+  KFnLambda -> concat_all(["KaiValue *", kc_usym(sym), "(KaiValue *p_self, KaiValue **p_args, int p_n)"])
+  _         -> kc_clause_sig(cx, f, sym)
+}
+
+#[doc("The forward declaration of `f`; empty for an `extern \"C\"` shim, which the program printer owns.")]
+pub fn kc_fn_proto(cx: KcCx, f: KFn) : String = match f.kind {
+  KFnFfi(_, _, _) -> ""
+  _ -> cat2(kc_sig(cx, f, nfn_sym(cx.nm, f)), ";\n")
+}
+
+fn kc_seed(fcx: KcCx, f: KFn) : String = match f.kind {
+  KFnNormal -> kc_seed_normal(fcx, f)
+  KFnLambda -> concat_all(list_reverse(kc_seed_thunk(f.params, [])))
+  _         -> kc_clause_seed(fcx, f)
+}
+
+fn kc_fn_is_plain(f: KFn) : Bool = match f.kind { KFnNormal -> true  _ -> false }
+
+#[doc("The definition of `f`: signature, register declarations, effect locals, param seeding and every block. Empty for an `extern \"C\"` shim.")]
+pub fn kc_fn_def(cx: KcCx, f: KFn) : String = match f.kind {
+  KFnFfi(_, _, _) -> ""
+  _ -> {
+    let sym = nfn_sym(cx.nm, f)
+    let specs = kc_fn_specs(f)
+    let fcx0 = kc_cx_with(cx, sym, specs)
+    let fcx = KcCx { ...fcx0, evf_pass: kc_fn_is_plain(f) and kc_fx_passes_frame(cx, f) }
+    concat_all([kc_sig(cx, f, sym), " {\n", kc_reg_decls(specs), kc_fx_locals(fcx, f), kc_seed(fcx, f),
+                concat_all(list_reverse(kc_blocks(fcx, f, f.blocks, []))), "}\n\n"])
+  }
+}
+
+# ---- fn-value thunks -----------------------------------------------------------
+
+fn kc_thunk_args(cx: KcCx, ps: [KParam], i: Int, acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> kc_thunk_args(cx, rest, i + 1, [kc_unbox(p.slot, concat_all(["p_args[", int_to_string(i), "]"])), ...acc])
+}
+
+fn kc_raw_slot(s: KSlot) : Bool = match s { SBoxed -> false _ -> true }
+
+fn kc_thunk_releases(ps: [KParam], i: Int, acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> kc_thunk_releases(rest, i + 1, if kc_raw_slot(p.slot) {
+    [concat_all(["    kaix_decref(p_args[", int_to_string(i), "]);\n"]), ...acc]
+  } else { acc })
+}
+
+#[doc("The `_kaiu_<sym>_thunk` forwarder that lets `f` be called through the boxed thunk ABI, adapting raw params and return.")]
+pub fn kc_fn_thunk(cx: KcCx, f: KFn) : String = match f.kind {
+  KFnNormal -> kc_fn_thunk_body(cx, f)
+  KFnFfi(_, _, _) -> kc_fn_thunk_body(cx, f)
+  _ -> ""
+}
+
+fn kc_fn_thunk_body(cx: KcCx, f: KFn) : String = {
+  let callee = kc_fsym(f, nfn_sym(cx.nm, f))
+  let tsym = c_user_thunk_sym(kfn_sym(cx.nm, f))
+  let evf = kc_evf_arg(cx, callee, f)
+  let args = list_append(if evf == "" { [] } else { [evf] },
+                         list_append(list_reverse(kc_thunk_args(cx, f.params, 0, [])), if f.donor { ["0"] } else { [] }))
+  concat_all(["KaiValue *", tsym, "(KaiValue *p_self, KaiValue **p_args, int p_n) {\n",
+              "    ", kc_ctype(f.ret), " r_ = ", kc_call(callee, args), ";\n",
+              concat_all(list_reverse(kc_thunk_releases(f.params, 0, []))),
+              "    return ", kc_box(f.ret, "r_"), ";\n}\n\n"])
+}

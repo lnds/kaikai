@@ -1,0 +1,145 @@
+#[doc("KIR to C printer: variants, records, their reuse, slot reads and tag reads.")]
+
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_c_ops_util
+import compiler.emit_shared_syms.{variant_slot_pos}
+import compiler.util
+
+# ---- slot words ------------------------------------------------------------
+
+fn kc_real_word(cx: KcCx, v: KVal) : String = match v {
+  KRealV(r) -> kc_real_lit(r)
+  KVar(n)   -> if kc_reg_tag(cx, n) == 2 { kc_reg(n) } else { kc_call("kaix_take_real", [kc_atom(cx, v)]) }
+  _         -> kc_call("kaix_take_real", [kc_atom(cx, v)])
+}
+
+fn kc_enum_word(cx: KcCx, v: KVal) : String = match v {
+  KIntV(tag) -> kc_int_lit(tag)
+  _          -> kc_call("kaix_take_enum", [kc_atom(cx, v)])
+}
+
+fn kc_slot_word(cx: KcCx, it: KSlotInit) : String = match it {
+  SIInt64(v) -> concat_all(["{.i64 = ", kc_atom_raw(cx, v, SInt64), "}"])
+  SIReal(v)  -> concat_all(["{.r = ", kc_real_word(cx, v), "}"])
+  SIEnum(v)  -> concat_all(["{.i64 = ", kc_enum_word(cx, v), "}"])
+  SIBoxed(v) -> concat_all(["{.ptr = ", kc_atom(cx, v), "}"])
+}
+
+fn kc_init_atom(cx: KcCx, it: KSlotInit) : String = match it {
+  SIInt64(v) -> kc_atom(cx, v)
+  SIReal(v)  -> kc_atom(cx, v)
+  SIEnum(v)  -> kc_atom(cx, v)
+  SIBoxed(v) -> kc_atom(cx, v)
+}
+
+fn kc_words(cx: KcCx, inits: [KSlotInit]) : [String] = map(inits, (it) => kc_slot_word(cx, it))
+
+fn kc_word_arr(words: [String]) : String = kc_arr("KaiVarSlot", words)
+
+fn kc_name(nm: String) : String = kc_cstr(nm)
+
+# ---- constructors ----------------------------------------------------------
+
+#[doc("A variant constructor, routed to the cheapest runtime entry; a region-branded one builds in the arena.")]
+pub fn kc_con(cx: KcCx, nm: String, tag: Int, mask: Int, inits: [KSlotInit], rgn: Bool) : String = match inits {
+  [] -> kc_call("kaix_nullary_fast", [kc_i32(tag), kc_name(nm)])
+  _  -> if mask == 0 { kc_con_boxed(cx, nm, tag, inits, rgn) } else { kc_con_masked(cx, nm, tag, inits, rgn) }
+}
+
+fn kc_con_boxed(cx: KcCx, nm: String, tag: Int, inits: [KSlotInit], rgn: Bool) : String =
+  kc_call(if rgn { "kaix_arena_variant" } else { "kaix_variant" },
+          [kc_i32(tag), kc_name(nm), kc_i32(list_length(inits)), kc_arr("KaiValue *", map(inits, (it) => kc_init_atom(cx, it)))])
+
+fn kc_con_masked(cx: KcCx, nm: String, tag: Int, inits: [KSlotInit], rgn: Bool) : String =
+  kc_call(if rgn { "kaix_arena_variant_masked" } else { "kaix_variant_masked" },
+          [kc_i32(tag), kc_name(nm), kc_i32(list_length(inits)), kc_word_arr(kc_words(cx, inits))])
+
+fn kc_field_vals(cx: KcCx, fs: [KFieldInit]) : String =
+  kc_arr("KaiValue *", map(fs, (f) => match f { KFI(_, v) -> kc_atom(cx, v) }))
+
+fn kc_field_names(fs: [KFieldInit]) : String =
+  kc_arr("const char *", map(fs, (f) => match f { KFI(nm, _) -> kc_cstr(nm) }))
+
+fn kc_stamp(e: String, tag: Int) : String =
+  if tag == 0 { e } else { kc_call("kaix_rec_stamp", [e, kc_i32(tag)]) }
+
+#[doc("A record literal, stamped with its head tag when it has one; a region-branded one builds in the arena.")]
+pub fn kc_record(cx: KcCx, fs: [KFieldInit], rgn: Bool, tag: Int) : String =
+  kc_stamp(kc_call(if rgn { "kaix_arena_record" } else { "kaix_record" },
+                   [kc_i32(list_length(fs)), kc_field_vals(cx, fs), kc_field_names(fs)]), tag)
+
+# ---- reuse -----------------------------------------------------------------
+
+#[doc("A variant or cons rebuilt in place of its donor, or into a reuse token.")]
+pub fn kc_con_reuse(cx: KcCx, rk: KReuseKind, d: KVal, nm: String, tag: Int, inits: [KSlotInit]) : String = match rk {
+  RkVariant      -> kc_reuse_at(cx, "kaix_variant_reuse_at_k", d, nm, tag, inits)
+  RkVariantMove  -> kc_reuse_at(cx, "kaix_variant_reuse_move_k", d, nm, tag, inits)
+  RkCons         -> kc_cons_reuse(cx, d, inits)
+  RkTokenVariant -> kc_variant_into(cx, concat_all(["{.ptr = ", kc_atom(cx, d), "}"]), nm, tag, inits)
+  RkDonorVariant -> kc_variant_into(cx, concat_all(["{.ptr = ", kc_donor_token(cx), "}"]), nm, tag, inits)
+}
+
+fn kc_init_kind(it: KSlotInit) : Int = match it {
+  SIBoxed(_) -> 0
+  SIInt64(_) -> 1
+  SIReal(_)  -> 2
+  SIEnum(_)  -> 3
+}
+
+fn kc_init_mask(inits: [KSlotInit], i: Int, acc: Int) : Int = match inits {
+  []           -> acc
+  [it, ...rest] -> if i >= 16 { 0 } else { kc_init_mask(rest, i + 1, acc + kc_init_kind(it) * variant_slot_pos(i)) }
+}
+
+fn kc_reuse_at(cx: KcCx, sym: String, d: KVal, nm: String, tag: Int, inits: [KSlotInit]) : String =
+  kc_call(sym, [kc_atom(cx, d), kc_i32(tag), kc_name(nm), kc_i32(list_length(inits)),
+                kc_i32(kc_init_mask(inits, 0, 0)), kc_word_arr(kc_words(cx, inits))])
+
+fn kc_cons_reuse(cx: KcCx, d: KVal, inits: [KSlotInit]) : String = match inits {
+  [h, t] -> kc_call("kaix_cons_reuse_move", [kc_atom(cx, d), kc_init_atom(cx, h), kc_init_atom(cx, t)])
+  _      -> kc_unsupported("cons reuse needs a head and a tail")
+}
+
+fn kc_variant_into(cx: KcCx, tokword: String, nm: String, tag: Int, inits: [KSlotInit]) : String =
+  kc_call("kaix_variant_at_argv_k",
+          [kc_i32(tag), kc_name(nm), kc_i32(list_length(inits) + 1), kc_i32(kc_init_mask(inits, 0, 0)),
+           kc_word_arr([tokword, ...kc_words(cx, inits)])])
+
+#[doc("A record rebuilt in place of its donor.")]
+pub fn kc_record_reuse(cx: KcCx, d: KVal, fs: [KFieldInit], kept: Int, tag: Int) : String =
+  kc_stamp(kc_call("kaix_reuse_or_alloc_record",
+                   [kc_atom(cx, d), kc_i32(list_length(fs)), kc_field_vals(cx, fs), kc_field_names(fs), cat2(int_to_string(kept), "ULL")]), tag)
+
+#[doc("A cell captured as a reuse token of the given rebuild arity.")]
+pub fn kc_token_steal(cx: KcCx, v: KVal, n: Int) : String = kc_call("kaix_drop_reuse_token", [kc_atom(cx, v), kc_i32(n)])
+
+# ---- reads -----------------------------------------------------------------
+
+fn kc_slot_ref(cx: KcCx, v: KVal, i: Int, field: String) : String =
+  concat_all(["kai_var_slots(", kc_atom(cx, v), ")[", int_to_string(i), "].", field])
+
+#[doc("Slot `i` of `v` at the destination `slot`: a raw Int or Real destination reads the slot word inline.")]
+pub fn kc_proj(cx: KcCx, v: KVal, i: Int, slot: KSlot) : String = match slot {
+  SInt64 -> kc_slot_ref(cx, v, i, "i64")
+  SReal  -> kc_slot_ref(cx, v, i, "r")
+  _      -> kc_call("kaix_variant_arg", [kc_atom(cx, v), int_to_string(i)])
+}
+
+#[doc("A slot known to hold a pointer, read as a direct borrow.")]
+pub fn kc_proj_borrow(cx: KcCx, v: KVal, i: Int) : String = kc_slot_ref(cx, v, i, "ptr")
+
+#[doc("A slot of a statically known kind: raw at a raw destination, re-boxed minimally at a boxed one.")]
+pub fn kc_proj_kind(cx: KcCx, v: KVal, i: Int, k: Int, slot: KSlot) : String = match slot {
+  SInt64 -> kc_proj(cx, v, i, slot)
+  SReal  -> kc_proj(cx, v, i, slot)
+  _      -> kc_proj_kind_boxed(cx, v, i, k)
+}
+
+fn kc_proj_kind_boxed(cx: KcCx, v: KVal, i: Int, k: Int) : String =
+  if k == 2 { kc_call("kaix_real", [kc_slot_ref(cx, v, i, "r")]) }
+  else if k == 3 { kc_call("kaix_enum_slot_box", [kc_slot_ref(cx, v, i, "i64")]) }
+  else { kc_call("kaix_int", [kc_slot_ref(cx, v, i, "i64")]) }
+
+#[doc("The variant tag of `v` as a raw int32.")]
+pub fn kc_tag_of(cx: KcCx, v: KVal) : String = concat_all(["((int32_t)(", kc_atom(cx, v), ")->variant_tag)"])

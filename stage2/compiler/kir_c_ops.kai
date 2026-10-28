@@ -1,0 +1,202 @@
+#[doc("KIR to C printer: operations, primitives and RC statements.")]
+
+import compiler.ast_ids
+import compiler.emit_native_fn
+import compiler.emit_native_ops_calls
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_c_ops_calls
+import compiler.kir_c_ops_cons
+import compiler.kir_c_ops_raw
+import compiler.kir_c_ops_util
+import compiler.kir_c_ops_vec
+import compiler.kir_syms
+import compiler.util
+
+fn kc_fx_owned() : String = kc_unsupported("owned by kir_c_fx")
+
+# ---- prims -----------------------------------------------------------------
+
+fn kc_field_read(cx: KcCx, sym: String, args: [KVal]) : String = match args {
+  [rec, KStrV(name)] -> kc_call(sym, [kc_atom(cx, rec), kc_cstr(name)])
+  _                  -> kc_unsupported("record field read with non-literal field name")
+}
+
+fn kc_field_at(cx: KcCx, args: [KVal]) : String = kc_field_at_sym(cx, "kaix_field_at", args)
+
+fn kc_field_at_sym(cx: KcCx, sym: String, args: [KVal]) : String = match args {
+  [rec, KIntV(i)] -> kc_call(sym, [kc_atom(cx, rec), kc_i32(i)])
+  _               -> kc_unsupported("constant-index field read with non-literal index")
+}
+
+fn kc_assert_check(cx: KcCx, args: [KVal]) : String = match args {
+  [cond, KStrV(msg)] -> kc_call("kaix_assert_check", [kc_atom(cx, cond), kc_cstr(nemit_decode_span(msg))])
+  _                  -> kc_unsupported("assert_check with non-literal message")
+}
+
+fn kc_assert_check_value(cx: KcCx, args: [KVal]) : String = match args {
+  [cond, KStrV(msg), KStrV(ident), val] ->
+    kc_call("kaix_assert_check_with_value",
+            [kc_atom(cx, cond), kc_cstr(nemit_decode_span(msg)), kc_cstr(nemit_decode_span(ident)), kc_atom(cx, val)])
+  _ -> kc_unsupported("assert_check_with_value with non-literal strings")
+}
+
+fn kc_cov_hit(args: [KVal]) : String = match args {
+  [KStrV(site)] -> kc_call("kaix_cov_hit", [kc_cstr(nemit_decode_span(site))])
+  _             -> kc_unsupported("cov_hit with non-literal site")
+}
+
+fn kc_tag_eq(cx: KcCx, args: [KVal]) : String = match args {
+  [slot, KIntV(tag)] -> kc_call("kaix_tag_eq", [kc_atom(cx, slot), kc_i32(tag)])
+  _                  -> kc_unsupported("tag_eq with non-literal tag")
+}
+
+fn kc_cell_test(cx: KcCx, sym: String, p: PrimOp, slot: KSlot, args: [KVal]) : String = match (slot, args) {
+  (SBool, [cell]) -> kc_call(sym, [kc_atom(cx, cell)])
+  _               -> kc_prim_runtime(cx, p, args)
+}
+
+fn kc_prim_runtime(cx: KcCx, p: PrimOp, args: [KVal]) : String =
+  kc_call(nprim_runtime_sym(kprim_text(p)), kc_atoms(cx, args))
+
+fn kc_boxed_bin(cx: KcCx, op: BinOp, args: [KVal]) : String = match op {
+  BoConcat -> kc_unsupported("unresolved ++")
+  _        -> kc_call(nprim_binop_sym(op), kc_atoms(cx, args))
+}
+
+fn kc_prim_scalar(cx: KcCx, p: PrimOp, args: [KVal]) : String = match p {
+  KpBox(s)        -> kc_raw_box(cx, s, args)
+  KpUnbox(s)      -> kc_raw_unbox(cx, s, args)
+  KpRawUn(op)     -> kc_raw_un(cx, op, args)
+  KpIntToReal     -> kc_raw_conv(cx, "kaix_int_to_real_raw", SInt64, args)
+  KpRealToInt     -> kc_raw_conv(cx, "kaix_real_to_int_raw", SReal, args)
+  KpRawBin(s, op) -> kc_raw_bin(cx, s, op, args)
+  KpBin(op)       -> kc_boxed_bin(cx, op, args)
+  KpUn(op)        -> kc_call(nprim_unop_sym(op), kc_atoms(cx, args))
+  _               -> kc_prim_runtime(cx, p, args)
+}
+
+fn kc_prim_fx(p: PrimOp) : Bool = match p {
+  KpUnwFiber         -> true
+  KpUnwPush          -> true
+  KpUnwPushReg       -> true
+  KpUnwPushState     -> true
+  KpUnwPop           -> true
+  KpPadOpen          -> true
+  KpPadClose         -> true
+  KpResumeFramesRun  -> true
+  KpResumeFramePush  -> true
+  KpSegHandle        -> true
+  KpSegRequest       -> true
+  _                  -> false
+}
+
+fn kc_prim_data(cx: KcCx, p: PrimOp, slot: KSlot, args: [KVal]) : String = match p {
+  KpField                -> kc_field_read(cx, "kaix_field", args)
+  KpFieldAt              -> kc_field_at(cx, args)
+  KpFieldBorrow          -> kc_field_read(cx, "kaix_field_borrow", args)
+  KpFieldTake            -> kc_field_read(cx, "kaix_field_take", args)
+  KpFieldUntake          -> kc_field_read(cx, "kaix_field_untake", args)
+  KpFieldTakeDupAt       -> kc_field_at_sym(cx, "kaix_field_take_dup_at", args)
+  KpStateTake            -> kc_call("kaix_clause_state_take", [kc_reg("__self")])
+  KpAssertCheck          -> kc_assert_check(cx, args)
+  KpAssertCheckWithValue -> kc_assert_check_value(cx, args)
+  KpCovHit               -> kc_cov_hit(args)
+  KpTagEq                -> kc_tag_eq(cx, args)
+  KpIsNil                -> kc_cell_test(cx, "kaix_is_nil", p, slot, args)
+  KpIsCons               -> kc_cell_test(cx, "kaix_is_cons", p, slot, args)
+  KpFixedVecLit(_, _)         -> kc_fixed_vec_prim(cx, p, args)
+  KpFixedVecMaterialize(_, _) -> kc_fixed_vec_prim(cx, p, args)
+  KpFixedVecGet(_, _, _)      -> kc_fixed_vec_prim(cx, p, args)
+  KpVecReadField(_)      -> kc_vec_raw_prim(cx, p, args)
+  KpVecReadFieldBoxed    -> kc_vec_raw_prim(cx, p, args)
+  KpVecRead(_)           -> kc_vec_raw_prim(cx, p, args)
+  KpVecPush(_)           -> kc_vec_raw_prim(cx, p, args)
+  KpVecSet(_)            -> kc_vec_raw_prim(cx, p, args)
+  KpVecPushRec           -> kc_vec_raw_prim(cx, p, args)
+  KpVecSetRec            -> kc_vec_raw_prim(cx, p, args)
+  KpVecPushRecRaw        -> kc_vec_raw_prim(cx, p, args)
+  KpVecSetRecRaw         -> kc_vec_raw_prim(cx, p, args)
+  _                      -> kc_prim_scalar(cx, p, args)
+}
+
+fn kc_prim(cx: KcCx, p: PrimOp, slot: KSlot, args: [KVal]) : String =
+  if kc_prim_fx(p) { kc_fx_owned() } else { kc_prim_data(cx, p, slot, args) }
+
+# ---- ops -------------------------------------------------------------------
+
+fn kc_call_op(cx: KcCx, sym: String, args: [KVal], slot: KSlot) : String = match kc_void_arena_call(sym) {
+  Some(e) -> e
+  None    -> kc_direct_call(cx, sym, args, slot)
+}
+
+#[doc("The C expression computing `op` at the destination `slot`, for every KOp the effects part does not own.")]
+pub fn kc_op_expr(cx: KcCx, op: KOp, slot: KSlot) : String = match op {
+  KLitOp(v)                          -> kc_atom_raw(cx, v, slot)
+  KPrim(p, args)                     -> kc_prim(cx, p, slot, args)
+  KCall(sym, args)                   -> kc_call_op(cx, sym, args, slot)
+  KCallIndirect(fv, args)            -> kc_call_indirect(cx, fv, args)
+  KCallIndirectBorrow(fv, args)      -> kc_call_indirect_borrow(cx, fv, args)
+  KCon(nm, tag, mask, inits, rgn)    -> kc_con(cx, nm, tag, mask, inits, rgn)
+  KRecord(fs, rgn, tag)              -> kc_record(cx, fs, rgn, tag)
+  KConReuse(rk, d, nm, tag, inits)   -> kc_con_reuse(cx, rk, d, nm, tag, inits)
+  KRecordReuse(d, fs, kept, tag)     -> kc_record_reuse(cx, d, fs, kept, tag)
+  KTokenSteal(v, n)                  -> kc_token_steal(cx, v, n)
+  KProj(v, i)                        -> kc_proj(cx, v, i, slot)
+  KProjBorrow(v, i)                  -> kc_proj_borrow(cx, v, i)
+  KProjKind(v, i, k)                 -> kc_proj_kind(cx, v, i, k, slot)
+  KTagOf(v)                          -> kc_tag_of(cx, v)
+  KClosure(sym, ar, caps)            -> kc_closure(cx, sym, ar, caps)
+  KPerform(_, _, _, _, _)            -> kc_fx_owned()
+  KSetjmp(_, _)                      -> kc_fx_owned()
+  KResumeOp(_, _)                    -> kc_fx_owned()
+  KResume2Op(_, _, _)                -> kc_fx_owned()
+}
+
+#[doc("Whether a discarded `op` owns a boxed value that must be dropped: a bare read of a boxed register.")]
+pub fn kc_do_drops_owned(cx: KcCx, op: KOp) : Bool = match op {
+  KLitOp(KVar(n)) -> kc_reg_tag(cx, n) == 0
+  _               -> false
+}
+
+# ---- RC statements ---------------------------------------------------------
+
+fn kc_rc_line(e: String) : String = concat_all(["    ", e, ";\n"])
+
+fn kc_rc_call(cx: KcCx, sym: String, v: KVal) : String =
+  if kc_val_is_raw(cx, v) { "" } else { kc_rc_line(kc_call(sym, [kc_atom(cx, v)])) }
+
+#[doc("The statement of a Perceus RC op: a duplicate, a drop, a conditional incref or a token free. Empty for a raw register and for the arm-token ops the effects part owns.")]
+pub fn kc_rc_expr_stmt(cx: KcCx, rc: KRCOp) : String = match rc {
+  KDup(v)  -> kc_rc_call(cx, "KU", v)
+  KDrop(v) -> kc_rc_call(cx, "KD", v)
+  KIncrefIfShared(d, c) ->
+    if kc_val_is_raw(cx, d) { "" } else { kc_rc_line(cat2("(void)", kc_call("kaix_incref_if_shared", [kc_atom(cx, d), kc_atom(cx, c)]))) }
+  KFreeToken(t) -> kc_rc_line(kc_call("kaix_reuse_free", [kc_atom(cx, t)]))
+  KArmTopReuse(_, _, _, _) -> ""
+  KArmTokenFree            -> ""
+  KArmTake(_, _, _)        -> ""
+}
+
+# ---- calls and fn-wide registers, for the fn driver --------------------------
+
+#[doc("The direct call of `sym` over `args`, its result at the destination `slot`.")]
+pub fn kc_call_direct(cx: KcCx, sym: String, args: [KVal], slot: KSlot) : String = kc_direct_call(cx, sym, args, slot)
+
+#[doc("The evidence-frame argument of a call to `callee` (`f`), or empty when it carries no frame; no effect resolves to a default node.")]
+pub fn kc_evf_arg(cx: KcCx, callee: String, f: KFn) : String = kc_evf_expr(cx, callee, f)
+
+#[doc("The evidence-frame argument of a call to `callee` (`f`), or empty when it carries no frame; a default-bearing effect resolves against `defaults`.")]
+pub fn kc_evf_arg_with(cx: KcCx, defaults: [KDefault], callee: String, f: KFn) : String = kc_evf_expr_with(cx, defaults, callee, f)
+
+#[doc("Whether the fn being printed takes the hidden donor token parameter, held in the register `kc_donor_reg`.")]
+pub fn kc_has_donor(cx: KcCx) : Bool = kc_fn_has_donor(cx)
+
+#[doc("Whether the fn being printed keeps an arm-top reuse token, held in the register `kc_armru_reg`.")]
+pub fn kc_has_armru(cx: KcCx) : Bool = kc_fn_has_armru(cx)
+
+#[doc("The C variable of the donor token register.")]
+pub fn kc_donor_reg() : String = kc_reg(ndonor_reg())
+
+#[doc("The C variable of the arm-top reuse token register.")]
+pub fn kc_armru_reg() : String = kc_reg(ntrmc_armru_reg())

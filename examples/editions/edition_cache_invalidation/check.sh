@@ -1,13 +1,12 @@
 #!/bin/sh
 # Edition cache-isolation smoke: shared-cache entries written under one
 # edition must never be served to a build under another. The isolation
-# lives in the cache KEY, not the directory layout — the c-modular
-# core-emit entries (core-emit-*.kct) and the native core objects
-# (ncore-*.o) both fold the edition into their content key — so
+# lives in the cache KEY, not the directory layout — the native core
+# objects (ncore-*.o) fold the edition into their content key — so
 # switching editions must create a sibling entry and leave the other
 # edition's entry untouched.
 #
-# Per backend, against a private core-cache root:
+# Native, against a private core-cache root:
 #   1. build under tongariki  -> at least one entry appears
 #   2. build under hanga-roa  -> a NEW entry appears; tongariki's survive
 #   3. rebuild under tongariki -> pure hit, the entry set is unchanged
@@ -91,7 +90,29 @@ check_layer() {
   rm -rf "$CACHE"
 }
 
-check_layer "c" "core-emit-*.kct" "c-modular KCT1"
+# The C backend keeps no artifact keyed by edition: its cache is content-
+# addressed by the emitted translation units. The isolation to show is in the
+# result: a program whose meaning depends on the edition (convention pipe
+# dispatch, hanga-roa and later) must flip between rejected and running as the
+# edition flips, with the cache warm from the previous build.
+GATED="$WORK/gated"
+mkdir -p "$GATED"
+cp "$FIXTURE/pipe_main.kai.txt" "$GATED/main.kai"
+cp "$FIXTURE/box.kai.txt" "$GATED/box.kai"
+gated_build() {
+  printf 'name = "gated"\nversion = "0.1.0"\nedition = "%s"\n' "$1" > "$GATED/kai.toml"
+  (cd "$GATED" && "$KAI" build --backend=c main.kai -o "$2") >"$WORK/gated.log" 2>&1
+}
+for step in "hanga-roa ok" "tongariki rejected" "hanga-roa ok" "tongariki rejected"; do
+  set -- $step
+  if gated_build "$1" "g-$1"; then got=ok; else got=rejected; fi
+  [ "$got" = "$2" ] || { echo "FAIL(c): $1 build was $got, want $2 (stale artifact across an edition switch?)"; cat "$WORK/gated.log"; exit 1; }
+  if [ "$got" = ok ]; then
+    [ "$("$GATED/g-$1")" = "42" ] || { echo "FAIL(c): $1 binary printed the wrong result"; exit 1; }
+  fi
+done
+echo "edition-cache-isolation OK (c): hanga-roa runs, tongariki rejects, hanga-roa runs again, tongariki rejects again — warm cache"
+rm -rf "$CACHE"
 
 set_edition "tongariki"
 if (cd "$PKG" && "$KAI" build --backend=native main.kai -o probe) >/dev/null 2>&1; then

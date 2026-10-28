@@ -1,0 +1,279 @@
+#[doc("KIR to C printer: `extern \"C\"` shims and the C-ABI entries of exports.")]
+
+import compiler.emit_native_ffi
+import compiler.emit_shared_proto.{ffi_fixed_c_type_of}
+import compiler.emit_native_fn
+import compiler.kir
+import compiler.kir_c_core
+import compiler.kir_c_ops_util
+import compiler.util
+
+
+fn kcf_ctype(k: KFfiKind) : String = match k {
+  KFfiUnit               -> "void"
+  KFfiInt                -> "int64_t"
+  KFfiReal               -> "double"
+  KFfiBool               -> "int32_t"
+  KFfiChar               -> "int32_t"
+  KFfiString             -> "const char *"
+  KFfiForeign            -> "void *"
+  KFfiFixed(bits, s, isf) -> ffi_fixed_c_type_of(bits, s, isf)
+  KFfiFixedVal(bits, s)  -> ffi_fixed_c_type_of(bits, s, false)
+  _                      -> "void *"
+}
+
+fn kcf_cast(ty: String, e: String) : String = concat_all(["(", ty, ")", e])
+
+fn kcf_unbox(k: KFfiKind, a: String) : String = match k {
+  KFfiInt                -> kc_call("kaix_int_field", [a])
+  KFfiReal               -> kc_call("kaix_real_field", [a])
+  KFfiBool               -> kc_call("kaix_bool_field", [a])
+  KFfiChar               -> kc_call("kaix_to_char", [a])
+  KFfiString             -> kc_call("kaix_str_bytes", [a])
+  KFfiForeign            -> kc_call("kaix_foreign_ptr", [a])
+  KFfiFixed(bits, s, isf) ->
+    if isf { kcf_cast("float", kc_call("kaix_real_field", [a])) }
+    else { kcf_cast(ffi_fixed_c_type_of(bits, s, false), kc_call("kaix_int_field", [a])) }
+  KFfiFixedVal(bits, s)  -> kcf_cast(ffi_fixed_c_type_of(bits, s, false), kc_call("kaix_fixed_val_field", [a]))
+  _                      -> "NULL"
+}
+
+fn kcf_rebox_fixed_val(bits: Int, signed: Bool, r: String) : String =
+  if bits == 32 { kc_call(if signed { "kaix_int32" } else { "kaix_uint32" }, [cat2("(int64_t)", r)]) }
+  else { kc_call("kaix_uint64", [cat2("(int64_t)", r)]) }
+
+fn kcf_rebox(k: KFfiKind, r: String) : String = match k {
+  KFfiUnit               -> "kaix_unit()"
+  KFfiInt                -> kc_call("kaix_int", [r])
+  KFfiReal               -> kc_call("kaix_real", [r])
+  KFfiBool               -> kc_call("kaix_bool", [r])
+  KFfiChar               -> kc_call("kaix_char", [r])
+  KFfiString             -> kc_call("kaix_str", [r])
+  KFfiForeign            -> kc_call("kaix_foreign", [r])
+  KFfiFixed(_, _, isf)   -> if isf { kc_call("kaix_real", [cat2("(double)", r)]) } else { kc_call("kaix_int", [cat2("(int64_t)", r)]) }
+  KFfiFixedVal(bits, s)  -> kcf_rebox_fixed_val(bits, s, r)
+  _                      -> "kaix_unit()"
+}
+
+fn kcf_is_unit(k: KFfiKind) : Bool = match k {
+  KFfiUnit -> true
+  _ -> false
+}
+
+fn kcf_is_unknown(k: KFfiKind) : Bool = match k {
+  KFfiUnknown(_) -> true
+  _ -> false
+}
+
+fn kcf_is_struct(k: KFfiKind) : Bool = match k {
+  KFfiStruct(_) -> true
+  _ -> false
+}
+
+#[doc("The parameter list of an FFI shim of `n` boxed params, led by the evidence frame when the shim's fn carries one.")]
+pub fn kcf_boxed_params(evf: Bool, n: Int) : String =
+  if n == 0 and not evf { "void" }
+  else { string_join(list_append(if evf { ["void *p_evf"] } else { [] }, kcf_boxed_param_list(0, n)), ", ") }
+
+fn kcf_boxed_param_list(i: Int, n: Int) : [String] =
+  if i >= n { [] } else { [concat_all(["KaiValue *a", int_to_string(i)]), ...kcf_boxed_param_list(i + 1, n)] }
+
+fn kcf_sname(sym: String, tag: String) : String = concat_all(["kc_s_", kc_mangle(sym), "_", tag])
+
+fn kcf_member(sname: String, field: String) : String = concat_all([sname, "_", field])
+
+fn kcf_tyname(k: KFfiKind, sname: String) : String = match k {
+  KFfiStruct(_) -> cat2("struct ", sname)
+  _             -> kcf_ctype(k)
+}
+
+fn kcf_param_sname(sym: String, i: Int) : String = kcf_sname(sym, cat2("p", int_to_string(i)))
+
+fn kcf_field_decl(sname: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> concat_all([kcf_tyname(fk, kcf_member(sname, n)), " ", n, "; "])
+}
+
+fn kcf_field_defs(sname: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> kcf_struct_defs(fk, kcf_member(sname, n))
+}
+
+fn kcf_struct_defs(k: KFfiKind, sname: String) : String = match k {
+  KFfiStruct(fs) -> concat_all([
+    concat_all(map(fs, (f) => kcf_field_defs(sname, f))),
+    "struct ", sname, " { ", concat_all(map(fs, (f) => kcf_field_decl(sname, f))), "};\n"
+  ])
+  _ -> ""
+}
+
+fn kcf_param_defs(sym: String, ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] -> [kcf_struct_defs(k, kcf_param_sname(sym, i)), ...kcf_param_defs(sym, rest, i + 1)]
+}
+
+fn kcf_unbox_field(a: String, sname: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> concat_all([".", n, " = ", kcf_unbox_s(fk, kc_call("kaix_field_borrow", [a, kc_cstr(n)]), kcf_member(sname, n))])
+}
+
+fn kcf_unbox_s(k: KFfiKind, a: String, sname: String) : String = match k {
+  KFfiStruct(fs) -> concat_all(["((struct ", sname, "){", string_join(map(fs, (f) => kcf_unbox_field(a, sname, f)), ", "), "})"])
+  _              -> kcf_unbox(k, a)
+}
+
+fn kcf_rebox_field(e: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> kcf_rebox_s(fk, concat_all([e, ".", n]))
+}
+
+fn kcf_field_name(f: KFfiField) : String = match f {
+  KFF(n, _) -> kc_cstr(n)
+}
+
+fn kcf_rebox_s(k: KFfiKind, e: String) : String = match k {
+  KFfiStruct(fs) -> kc_call("kaix_record", [int_to_string(list_length(fs)),
+                                            kc_arr("KaiValue *", map(fs, (f) => kcf_rebox_field(e, f))),
+                                            kc_arr("const char *", map(fs, kcf_field_name))])
+  _              -> kcf_rebox(k, e)
+}
+
+fn kcf_c_params(sym: String, ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] ->
+    if kcf_is_unit(k) { kcf_c_params(sym, rest, i + 1) }
+    else { [kcf_tyname(k, kcf_param_sname(sym, i)), ...kcf_c_params(sym, rest, i + 1)] }
+}
+
+fn kcf_c_param_list(sym: String, ks: [KFfiKind]) : String = match kcf_c_params(sym, ks, 0) {
+  [] -> "void"
+  cs -> string_join(cs, ", ")
+}
+
+fn kcf_unsupported_shim(evf: Bool, sym: String, arity: Int, why: String) : String =
+  concat_all(["KaiValue *", kc_usym(sym), "(", kcf_boxed_params(evf, arity), ") {\n    ",
+              kc_unsupported(why), ";\n    return kaix_unit();\n}\n"])
+
+fn kcf_call_args(sym: String, ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] ->
+    if kcf_is_unit(k) { kcf_call_args(sym, rest, i + 1) }
+    else { [kcf_unbox_s(k, cat2("a", int_to_string(i)), kcf_param_sname(sym, i)), ...kcf_call_args(sym, rest, i + 1)] }
+}
+
+fn kcf_decrefs(ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] ->
+    if kcf_is_unit(k) { kcf_decrefs(rest, i + 1) }
+    else { [concat_all(["    kaix_decref(a", int_to_string(i), ");\n"]), ...kcf_decrefs(rest, i + 1)] }
+}
+
+fn kcf_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+  let alias = cat2("kc_ffi_", kc_mangle(sym))
+  let rname = kcf_sname(sym, "r")
+  let call = kc_call(alias, kcf_call_args(sym, pks, 0))
+  concat_all([
+    concat_all(kcf_param_defs(sym, pks, 0)),
+    kcf_struct_defs(rk, rname),
+    "extern ", kcf_tyname(rk, rname), " ", alias, "(", kcf_c_param_list(sym, pks), ") __asm__(KC_ASM(", kc_cstr(csym), "));\n",
+    "KaiValue *", kc_usym(sym), "(", kcf_boxed_params(evf, list_length(pks)), ") {\n",
+    if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", kcf_tyname(rk, rname), " r = ", call, ";\n"]) },
+    concat_all(kcf_decrefs(pks, 0)),
+    "    return ", if kcf_is_unit(rk) { "kaix_unit()" } else { kcf_rebox_s(rk, "r") }, ";\n}\n"
+  ])
+}
+
+fn kcf_js_param_types(ks: [KFfiKind]) : [String] = flat_map(filter(ks, (k) => not js_is_unit(k)), (k) => match k {
+  KFfiString -> ["const char *", "uint32_t"]
+  _          -> [kcf_ctype(k)]
+})
+
+fn kcf_js_call_args(ks: [KFfiKind], i: Int, acc: [String]) : [String] = match ks {
+  [] -> list_reverse(acc)
+  [k, ...rest] -> {
+    let a = cat2("a", int_to_string(i))
+    match k {
+      KFfiUnit   -> kcf_js_call_args(rest, i + 1, acc)
+      KFfiString -> kcf_js_call_args(rest, i + 1, [kc_call("kaix_str_len32", [a]), kcf_unbox(k, a), ...acc])
+      _          -> kcf_js_call_args(rest, i + 1, [kcf_unbox(k, a), ...acc])
+    }
+  }
+}
+
+fn kcf_js_rebox(k: KFfiKind) : String = match k {
+  KFfiString  -> kc_call("kaix_js_take_str", ["r"])
+  KFfiForeign -> kc_call("kaix_foreign_js", ["r"])
+  _           -> if kcf_is_unit(k) { "kaix_unit()" } else { kcf_rebox(k, "r") }
+}
+
+fn kcf_js_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+  let path = string_slice(csym, 7, string_length(csym) - 7)
+  let imp = concat_all([js_params_letters(pks), ":", js_letter(rk), ":", path])
+  let alias = cat2("kc_js_", kc_mangle(sym))
+  let rty = match rk { KFfiString -> "uint32_t"  _ -> kcf_ctype(rk) }
+  let ps = match kcf_js_param_types(pks) { [] -> "void"  tys -> string_join(tys, ", ") }
+  let call = kc_call(alias, kcf_js_call_args(pks, 0, []))
+  let head = concat_all(["KaiValue *", kc_usym(sym), "(", kcf_boxed_params(evf, list_length(pks)), ")"])
+  concat_all([
+    "#if defined(__wasm__)\n",
+    "extern ", rty, " ", alias, "(", ps, ") __attribute__((import_module(\"kai_js\"), import_name(", kc_cstr(imp), ")));\n",
+    head, " {\n",
+    if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", rty, " r = ", call, ";\n"]) },
+    concat_all(kcf_decrefs(pks, 0)),
+    "    return ", kcf_js_rebox(rk), ";\n}\n",
+    "#else\n", head, " {\n    ", kc_unsupported("extern \"js\" needs a JavaScript host"), ";\n    return kaix_unit();\n}\n#endif\n"
+  ])
+}
+
+#[doc("The definition of the `extern \"C\"` shim `cx.cur`: it unboxes each argument, calls `csym`, drops the boxed inputs after the call and boxes the result. A struct by value, an unknown boundary type and a `kai_js:` import print a body that aborts at run time.")]
+pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+  let sym = cx.cur
+  let arity = list_length(f.params)
+  let evf = not list_is_empty(nfnx_frame_keys(cx.fx, f))
+  if any(pks, kcf_is_unknown) or kcf_is_unknown(rk) {
+    kcf_unsupported_shim(evf, sym, arity, cat2("unsupported FFI boundary type in ", csym))
+  } else if ffi_is_js(csym) and (any(pks, kcf_is_struct) or kcf_is_struct(rk)) {
+    kcf_unsupported_shim(evf, sym, arity, cat2("extern js cannot pass a struct by value: ", csym))
+  } else if ffi_is_js(csym) {
+    kcf_js_shim(evf, sym, csym, pks, rk)
+  } else {
+    kcf_shim(evf, sym, csym, pks, rk)
+  }
+}
+
+# ---- exports --------------------------------------------------------------
+
+fn kcf_export_params(ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] ->
+    if kcf_is_unit(k) { kcf_export_params(rest, i + 1) }
+    else { [concat_all([kcf_ctype(k), " p", int_to_string(i)]), ...kcf_export_params(rest, i + 1)] }
+}
+
+fn kcf_export_boxes(ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] -> [kcf_rebox(k, cat2("p", int_to_string(i))), ...kcf_export_boxes(rest, i + 1)]
+}
+
+fn kcf_export_head(e: KExport) : String = {
+  let ps = kcf_export_params(e.params, 0)
+  concat_all([kcf_ctype(e.ret), " kc_exp_", kc_mangle(e.csym), "(", if ps == [] { "void" } else { string_join(ps, ", ") }, ")"])
+}
+
+fn kcf_export_finish(e: KExport) : String =
+  if kcf_is_unit(e.ret) { "    kaix_decref(r);\n    return;\n" }
+  else { concat_all(["    ", kcf_ctype(e.ret), " v = ", kcf_unbox(e.ret, "r"), ";\n    kaix_decref(r);\n    return v;\n"]) }
+
+fn kcf_export(e: KExport, thunk: String) : String = {
+  let n = list_length(e.params)
+  let head = kcf_export_head(e)
+  concat_all([
+    head, " __asm__(KC_ASM(", kc_cstr(e.csym), "));\n",
+    head, " {\n",
+    if n == 0 { "    KaiValue **args = NULL;\n" }
+    else { concat_all(["    KaiValue *args[", int_to_string(n), "] = { ", string_join(kcf_export_boxes(e.params, 0), ", "), " };\n"]) },
+    "    KaiValue *r = ", kc_call("kaix_export_call", [kc_cstr(e.csym), cat2("(KaiFn)", thunk), "args", int_to_string(n)]), ";\n",
+    kcf_export_finish(e),
+    "}\n"
+  ])
+}
+
+#[doc("The C-ABI entry of every export, each running its fn through the thunk `thunk_of` names.")]
+pub fn kc_exports(es: [KExport], thunk_of: (String) -> String) : String =
+  concat_all(map(es, (e) => kcf_export(e, thunk_of(e.sym))))

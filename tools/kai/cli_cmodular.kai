@@ -11,6 +11,7 @@ import cli_err
 import cli_fs
 import cli_hash
 import cli_lto
+import cli_native
 import cli_plan
 import cli_proc
 import cli_runtime_headers
@@ -37,18 +38,8 @@ fn sources(dir: String) : [String] / File =
 
 fn stem(f: String) : String = string.drop_suffix(f, ".c") ?? f
 
-# The program TU that owns the runtime when there is no separate owner object.
-fn owner_module(t: Toolchain, dir: String, cs: [String]) : String / Ffi =
-  if t.owner_c != "" {
-    ""
-  } else if cli_sys.is_file("#{dir}/__root__.c") {
-    "__root__.c"
-  } else {
-    list.head(cs) ?? ""
-  }
-
-fn tu(dir: String, owner: String, common: String, f: String) : Tu / Ffi {
-  let defs = if f == owner { [SEPARATE, "-DKAI_RUNTIME_OWNER=1"] } else { [SEPARATE] }
+fn tu(dir: String, common: String, f: String) : Tu / Ffi {
+  let defs = [SEPARATE]
   let th = "#{dir}/kai_types_#{stem(f)}.h"
   let dh = "#{dir}/kai_decls_#{stem(f)}.h"
   let keyed = common != "" and cli_sys.is_file(th) and cli_sys.is_file(dh)
@@ -160,12 +151,13 @@ fn compile_all(t: Toolchain, dir: String) : Result[Unit, Int] / Stderr + Env + F
         PER_FN_SECTIONS,
         cli_toolchain.host(t)
       ]),
-      cli_runtime_headers.kept(cache, t.inc_c)
+      cli_runtime_headers.kept(cache, t.inc_c),
+      cli_hash.Bytes("#{t.inc_c}/runtime/runtime_llvm_decls.h"),
+      cli_hash.Text("kir-separate")
     ])
   }
-  let owner = owner_module(t, dir, cs)
   let jobs = jobs_setting(t)
-  let misses = cs | (f => tu(dir, owner, common, f)) |? (u => not cache_hit(cache, u))
+  let misses = cs | (f => tu(dir, common, f)) |? (u => not cache_hit(cache, u))
   let failed = pool(t, dir, cache, jobs, misses, [], 0)
   if cli_caches.env_or("KAI_MODULAR_STATS", "0") == "1" {
     let ntu = list.length(cs)
@@ -176,38 +168,6 @@ fn compile_all(t: Toolchain, dir: String) : Result[Unit, Int] / Stderr + Env + F
     )
   }
   if failed > 0 { cli_err.die("modular compile failed") } else { Ok(()) }
-}
-
-fn link_all(p: Plan, dir: String) : Result[Unit, Int] / Stderr + Env + File + Ffi {
-  let t = p.t
-  let cs = sources(dir)
-  let objs = cs | (f => "#{dir}/#{stem(f)}.o")
-  let owner = owner_module(t, dir, cs)
-  let programs = cs |? (f => f != owner) | (f => "#{dir}/#{stem(f)}.o")
-  let lead = cli_plan.cc(t) ++ t.cflags
-  let tail = p.native_objs ++ ["-o", p.job.out, "-lm", ...p.libs]
-  let ldstack = cli_toolchain.dead_strip(t)
-  let defs = [SEPARATE, "-DKAI_RUNTIME_OWNER=1", "-DKAI_PROGRAM_PROVIDES_MAIN=1"]
-  let rt = if t.owner_c == "" { "" } else { cli_plan.runtime_obj(t, t.owner_c, defs) }
-  let argv = if t.owner_c == "" {
-    lead ++ ldstack ++ objs ++ tail
-  } else if rt != "" {
-    lead ++ ldstack ++ objs ++ p.native_objs ++ [rt, "-o", p.job.out, "-lm", ...p.libs]
-  } else {
-    cli_plan.runtime_cc(t)
-      ++ t.cflags
-      ++ [cli_plan.OWNER_OPT, ...defs]
-      ++ ldstack
-      ++ ["-I", t.inc_c, "-I", t.inc]
-      ++ objs
-      ++ p.native_objs
-      ++ [t.owner_c, "-o", p.job.out, "-lm", ...p.libs]
-  }
-  if cli_plan.reads_scheduler_tls(p, programs) {
-    cli_err.die(cli_plan.SCHEDULER_TLS_READ)
-  } else {
-    cli_plan.link(p, argv, "modular")
-  }
 }
 
 #[doc("Build through `--emit=c-modular`: split the stream, compile each TU (cached, in parallel), link. A kaic2 failure passes its status through.")]
@@ -238,6 +198,6 @@ pub fn build(p: Plan) : Result[Unit, Int] / Stderr + Env + File + Ffi {
       cflags: t.cflags ++ lto.link
     }
     compile_all(tl, dir)!
-    link_all(cli_plan.with_objects(Plan { ...p, t: tl })!, dir)
+    cli_native.modular_link(Plan { ...p, t: tl }, sources(dir) | (f => "#{dir}/#{stem(f)}.o"), [SEPARATE, "-DKAI_RUNTIME_OWNER=1"])
   }
 }

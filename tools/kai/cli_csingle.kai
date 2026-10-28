@@ -1,98 +1,33 @@
 #[doc("""
-The single-TU C path: one emitted `.c` compiled at -O2 as the program
-object, linked with the runtime owner that holds every fiber suspend
-point.
+The single-unit C path: one `.c` printed from KIR against the runtime's
+declarations, compiled alone and linked with the cached runtime owner object.
 """)]
 
-import cli_err
-import cli_fs
 import cli_plan
 import cli_budget
+import cli_err
+import cli_native
 import cli_proc
 
-const OWNER_DEFS : [String] =
-  ["-DKAI_SEPARATE_COMPILATION=1", "-DKAI_RUNTIME_OWNER=1", "-DKAI_PROGRAM_PROVIDES_MAIN=1"]
-
-fn link_split(
-  p: Plan,
-  cfile: String,
-  incl: String
-) : Result[Unit, Int] / Stderr + Env + File + Ffi {
-  let t = p.t
-  let obj = "#{p.job.tmp}/out.o"
-  let compile = cli_plan.runtime_cc(t)
-    ++ t.cflags_compile
-    ++ [
-      "-DKAI_SEPARATE_COMPILATION=1",
-      "-I",
-      incl,
-      "-I",
-      t.inc_c,
-      "-I",
-      t.inc,
-      "-c",
-      cfile,
-      "-o",
-      obj
-    ]
-  if cli_budget.run(compile, cli_proc.inherit()) != 0 {
-    cli_err.die("C backend compile failed")
-  } else if cli_plan.reads_scheduler_tls(p, [obj]) {
-    cli_err.die(cli_plan.SCHEDULER_TLS_READ)
-  } else {
-    let rt = cli_plan.runtime_obj(t, t.owner_c, OWNER_DEFS)
-    let argv = if rt != "" {
-      cli_plan.cc(t)
-        ++ t.cflags
-        ++ ["-I", incl, obj]
-        ++ p.native_objs
-        ++ [rt, "-o", p.job.out, "-lm", ...p.libs]
-    } else {
-      cli_plan.runtime_cc(t)
-        ++ t.cflags
-        ++ [cli_plan.OWNER_OPT, ...OWNER_DEFS]
-        ++ ["-I", incl, "-I", t.inc_c, "-I", t.inc, obj]
-        ++ p.native_objs
-        ++ [t.owner_c, "-o", p.job.out, "-lm", ...p.libs]
-    }
-    cli_plan.link(p, argv, "C backend")
-  }
-}
-
-#[doc("""
-Build through the plain C emit. A struct-by-value FFI program emits a
-marker stream carrying `kai_ffi.h` beside `out.c`; it splits into a
-subdir a hand-written shim can include from.
-""")]
+#[doc("Build through the single-unit C emit: kaic2 prints one `.c` that includes the runtime declarations, which is compiled and linked with the runtime owner object.")]
 pub fn build(p: Plan) : Result[Unit, Int] / Stderr + Env + File + Ffi {
   let t = p.t
   let out_c = "#{p.job.tmp}/out.c"
+  let out_o = "#{p.job.tmp}/out.o"
   let err = "#{out_c}.err"
-  let rc = cli_budget.run(cli_plan.kaic2(p, [], p.job.src), cli_plan.kaic2_spawn([], out_c, err))
+  let rc = cli_budget.run(cli_plan.kaic2(p, ["--emit=c-owner"], p.job.src), cli_plan.kaic2_spawn([], out_c, err))
   cli_plan.replay(err)
   if rc != 0 {
     Err(rc)
   } else {
-    let text = cli_fs.read_or_empty(out_c)
-    let p = cli_plan.with_objects(p)!
-    let n = cli_plan.nonce(text)
-    let ffi = "#{p.job.tmp}/ffi"
-    let split = n != ""
-    if split {
-      let _ = cli_fs.mkdir_p(ffi)
-      cli_plan.split_stream(text, n, ffi)
-    }
-    let cfile = if split { "#{ffi}/out.c" } else { out_c }
-    let incl = if split { ffi } else { t.inc_c }
-    if t.owner_c == "" {
-      let argv = cli_plan.runtime_cc(t)
-        ++ t.cflags
-        ++ ["-I", incl, "-I", t.inc_c, "-I", t.inc, cfile]
-        ++ p.native_objs
-        ++ ["-o", p.job.out, "-lm", ...p.libs]
-      cli_plan.link(p, argv, "C backend")
+    let argv = cli_plan.runtime_cc(t)
+      ++ t.cflags_compile
+      ++ ["-DKAI_SEPARATE_COMPILATION=1", "-I", t.inc_c, "-I", t.inc]
+      ++ ["-c", out_c, "-o", out_o]
+    if cli_budget.run(argv, cli_proc.inherit()) != 0 {
+      cli_err.die("C backend compile failed")
     } else {
-      link_split(p, cfile, incl)
+      cli_native.modular_link(p, [out_o], ["-DKAI_SEPARATE_COMPILATION=1", "-DKAI_RUNTIME_OWNER=1"])
     }
   }
 }

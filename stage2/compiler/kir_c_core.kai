@@ -1,0 +1,327 @@
+#[doc("""
+KIR to C printer core: C identifiers, the per-fn register table, the atoms of an expression and the boxed/raw borders.
+
+Every function returns the text it prints. A fn body is built as one
+reverse-accumulated piece list joined once, never by repeated concatenation.
+""")]
+
+import compiler.ast
+import compiler.parse_lexical
+import compiler.kir
+import compiler.kir_syms
+import compiler.emit_native_fn
+import compiler.infer_index
+import compiler.real_lit
+import compiler.symtab
+import compiler.util
+import compiler.fnreg.{string_starts_with_q}
+
+#[doc("What printing one fn needs: the symbol tables, the fn index, the handler declarations, the fn being printed, its registers by name, and whether its own evidence frame may be passed on to a call.")]
+pub type KcCx = { tab: SymTab, nm: KNames, fx: NFnIndex, hs: [KHandlerDecl], defs: [KDefault], cur: String, regs: NameIndex[RSpec], evf_pass: Bool }
+
+#[doc("The context of printing the fn `sym` whose registers are `specs`.")]
+pub fn kc_cx_with(base: KcCx, sym: String, specs: [RSpec]) : KcCx =
+  KcCx { ...base, cur: sym, regs: kc_regs_index(specs, idx_empty()) }
+
+#[doc("The context of printing the fn `sym` before its registers matter, such as for its signature.")]
+pub fn kc_cx_head(base: KcCx, sym: String) : KcCx = KcCx { ...base, cur: sym }
+
+#[doc("The register of `f` in order of first appearance: its params, then every binder and store destination, a name bound at two slots widening to boxed.")]
+pub fn kc_fn_specs(f: KFn) : [RSpec] = kc_specs_done(kc_specs_blocks(f.blocks, kc_specs_params(f.params, KcSpecs { acc: [], seen: idx_empty(), wide: idx_empty() })))
+
+type KcSpecs = { acc: [RSpec], seen: NameIndex[RSpec], wide: NameIndex[String] }
+
+fn kc_specs_find(chain: [RSpec], n: String) : Option[RSpec] = match chain {
+  [] -> None
+  [r, ...rest] -> match r { RS(m, _) -> if m == n { Some(r) } else { kc_specs_find(rest, n) } }
+}
+
+fn kc_specs_add(st: KcSpecs, n: String, s: KSlot) : KcSpecs = match kc_specs_find(idx_chain(st.seen, n), n) {
+  None -> KcSpecs { acc: [RS(n, s), ...st.acc], seen: idx_prepend(st.seen, n, RS(n, s)), wide: st.wide }
+  Some(RS(_, cur)) -> if nslot_tag(cur) == nslot_tag(s) { st } else { KcSpecs { ...st, wide: idx_prepend(st.wide, n, n) } }
+}
+
+fn kc_specs_store(st: KcSpecs, n: String) : KcSpecs = match kc_specs_find(idx_chain(st.seen, n), n) {
+  None -> kc_specs_add(st, n, SBoxed)
+  Some(_) -> st
+}
+
+fn kc_specs_boxed_all(st: KcSpecs, ns: [String]) : KcSpecs = match ns {
+  [] -> st
+  [n, ...rest] -> kc_specs_boxed_all(kc_specs_add(st, n, SBoxed), rest)
+}
+
+fn kc_specs_params(ps: [KParam], st: KcSpecs) : KcSpecs = match ps {
+  [] -> st
+  [p, ...rest] -> kc_specs_params(rest, kc_specs_add(st, p.name, p.slot))
+}
+
+fn kc_specs_blocks(bs: [KBlock], st: KcSpecs) : KcSpecs = match bs {
+  [] -> st
+  [b, ...rest] -> kc_specs_blocks(rest, kc_specs_stmts(b.stmts, st))
+}
+
+fn kc_specs_stmts(ss: [KStmt], st: KcSpecs) : KcSpecs = match ss {
+  [] -> st
+  [s, ...rest] -> kc_specs_stmts(rest, match s {
+    KLet(n, slot, _, _) -> kc_specs_add(st, n, slot)
+    KStore(n, _, _) -> kc_specs_store(st, n)
+    KBindEvState(_, _, regs, _) -> kc_specs_boxed_all(st, regs)
+    KBindSelfState(regs, _) -> kc_specs_boxed_all(st, regs)
+    _ -> st
+  })
+}
+
+fn kc_specs_done(st: KcSpecs) : [RSpec] = map(list_reverse(st.acc), (r) => match r {
+  RS(n, s) -> if list_has(idx_chain(st.wide, n), n) { RS(n, SBoxed) } else { RS(n, s) }
+})
+
+fn kc_regs_index(specs: [RSpec], ix: NameIndex[RSpec]) : NameIndex[RSpec] = match specs {
+  [] -> ix
+  [r, ...rest] -> match r { RS(n, _) -> kc_regs_index(rest, idx_prepend(ix, n, r)) }
+}
+
+#[doc("The slot tag of register `n` (`nslot_tag`), or -1 when the fn binds no such register.")]
+pub fn kc_reg_tag(cx: KcCx, n: String) : Int = kc_reg_tag_in(idx_chain(cx.regs, n), n)
+
+fn kc_reg_tag_in(chain: [RSpec], n: String) : Int = match chain {
+  [] -> 0 - 1
+  [RS(m, s), ...rest] -> if m == n { nslot_tag(s) } else { kc_reg_tag_in(rest, n) }
+}
+
+# ---- identifiers ----------------------------------------------------------
+
+fn kc_hex_digit(n: Int) : String = string_slice("0123456789abcdef", n, 1)
+
+fn kc_plain_char(c: Int) : Bool =
+  (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+
+fn kc_all_plain(s: String, i: Int, n: Int) : Bool =
+  if i >= n { true }
+  else {
+    let c = char_to_int(char_at_or_zero(s, i))
+    (kc_plain_char(c) or c == 95) and kc_all_plain(s, i + 1, n)
+  }
+
+fn kc_plain_run(s: String, i: Int, n: Int) : Int =
+  if i >= n { i }
+  else {
+    let c = char_to_int(char_at_or_zero(s, i))
+    if kc_plain_char(c) or c == 95 { kc_plain_run(s, i + 1, n) } else { i }
+  }
+
+fn kc_mangle_loop(s: String, i: Int, n: Int, acc: [String]) : String =
+  if i >= n { concat_all(list_reverse(acc)) }
+  else {
+    let j = kc_plain_run(s, i, n)
+    if j > i { kc_mangle_loop(s, j, n, [string_slice(s, i, j - i), ...acc]) }
+    else {
+      let c = char_to_int(char_at_or_zero(s, i))
+      kc_mangle_loop(s, i + 1, n, [concat_all(["$", kc_hex_digit(c / 16 % 16), kc_hex_digit(c % 16)]), ...acc])
+    }
+  }
+
+#[doc("A C identifier for a KIR register or label name: alphanumerics and `_` stay, every other byte becomes `$` and two hex digits. Injective.")]
+pub fn kc_mangle(s: String) : String =
+  if kc_all_plain(s, 0, string_length(s)) { s } else { kc_mangle_loop(s, 0, string_length(s), []) }
+
+fn kc_all_digits(s: String, i: Int, n: Int) : Bool =
+  if i >= n { true }
+  else {
+    let c = char_to_int(char_at_or_zero(s, i))
+    c >= 48 and c <= 57 and kc_all_digits(s, i + 1, n)
+  }
+
+fn kc_is_temp(n: String) : Bool =
+  string_length(n) > 2 and char_to_int(char_at_or_zero(n, 0)) == 46 and char_to_int(char_at_or_zero(n, 1)) == 116 and kc_all_digits(n, 2, string_length(n))
+
+#[doc("The C variable of register `n`: a numbered temporary is `t<N>`, every other register `r_` and its mangled name.")]
+pub fn kc_reg(n: String) : String =
+  if kc_is_temp(n) { string_slice(n, 1, string_length(n) - 1) } else { cat2("r_", kc_mangle(n)) }
+
+#[doc("The C spelling of the user symbol `s`: `kaiu_`-prefixed so no module name can reach the runtime's `kai_*` / `kaix_*` namespace; `_`-led compiler-minted names stay as they are.")]
+pub fn kc_usym(s: String) : String =
+  if string_starts_with_q(s, "_") { s } else { cat2("kaiu_", s) }
+
+#[doc("The C spelling of the symbol of fn `f`: the program entry keeps its fixed name, every other fn takes `kc_usym`.")]
+pub fn kc_fsym(f: KFn, sym: String) : String = if f.entry { sym } else { kc_usym(sym) }
+
+#[doc("The C spelling of a default-op implementation: the runtime's own `kaix_` ones stay, a program's get `kc_usym`.")]
+pub fn kc_op_sym(s: String) : String = if string_starts_with_q(s, "kaix_") { s } else { kc_usym(s) }
+
+#[doc("The C label of block `l`.")]
+pub fn kc_label(l: String) : String = cat2("L_", kc_mangle(l))
+
+# ---- C types and literals -------------------------------------------------
+
+#[doc("The C type of a register at `s`.")]
+pub fn kc_ctype(s: KSlot) : String = match s {
+  SBoxed  -> "KaiValue *"
+  SInt64  -> "int64_t"
+  SReal   -> "double"
+  SBool   -> "int32_t"
+  SInt32  -> "int32_t"
+  SChar   -> "int32_t"
+  SByte   -> "int32_t"
+  SInt32T -> "int32_t"
+  SUInt32 -> "uint32_t"
+  SUInt64 -> "uint64_t"
+  SInt128 -> "__int128"
+}
+
+fn kc_oct(c: Int) : String =
+  concat_all(["\\", int_to_string(c / 64 % 8), int_to_string(c / 8 % 8), int_to_string(c % 8)])
+
+fn kc_cstr_loop(s: String, i: Int, n: Int, acc: [String]) : String =
+  if i >= n { concat_all(list_reverse(acc)) }
+  else {
+    let c = char_to_int(char_at_or_zero(s, i))
+    let piece = if c == 34 { "\\\"" }
+                else if c == 92 { "\\\\" }
+                else if c == 63 { "\\?" }
+                else if c >= 32 and c < 127 { string_slice(s, i, 1) }
+                else { kc_oct(c) }
+    kc_cstr_loop(s, i + 1, n, [piece, ...acc])
+  }
+
+#[doc("A C string literal spelling the bytes `s`, including embedded NULs.")]
+pub fn kc_cstr(s: String) : String = concat_all(["\"", kc_cstr_loop(s, 0, string_length(s), []), "\""])
+
+#[doc("A C int64 literal of `n`.")]
+pub fn kc_int_lit(n: Int) : String =
+  if n < -9223372036854775807 { "(-9223372036854775807LL-1)" }
+  else if n < 0 { concat_all(["(", int_to_string(n), "LL)"]) }
+  else { cat2(int_to_string(n), "LL") }
+
+#[doc("A C double literal that reads back as exactly `r`.")]
+pub fn kc_real_lit(r: Real) : String = {
+  let t = real_exact_text(r)
+  if t == "nan" or t == "NaN" { "(0.0/0.0)" }
+  else if t == "inf" or t == "Infinity" { "(1.0/0.0)" }
+  else if t == "-inf" or t == "-Infinity" { "(-1.0/0.0)" }
+  else { concat_all(["(", kc_real_text_dot(t), ")"]) }
+}
+
+fn kc_has_float_mark(t: String, i: Int, n: Int) : Bool =
+  if i >= n { false }
+  else {
+    let c = char_to_int(char_at_or_zero(t, i))
+    c == 46 or c == 101 or c == 69 or c == 120 or c == 112 or kc_has_float_mark(t, i + 1, n)
+  }
+
+fn kc_real_text_dot(t: String) : String = if kc_has_float_mark(t, 0, string_length(t)) { t } else { cat2(t, ".0") }
+
+#[doc("The text `args` spell inside a call's parentheses.")]
+pub fn kc_args(args: [String]) : String = string_join(args, ", ")
+
+#[doc("A call of the runtime entry or function `sym` over printed arguments.")]
+pub fn kc_call(sym: String, args: [String]) : String = concat_all([sym, "(", kc_args(args), ")"])
+
+#[doc("An expression that aborts at run time for a KIR node the printer does not cover.")]
+pub fn kc_unsupported(what: String) : String = concat_all(["kc_unsupported(", kc_cstr(what), ")"])
+
+# ---- the boxed and raw borders --------------------------------------------
+
+#[doc("The runtime constructor that boxes a raw register of `s`, or none for a boxed slot.")]
+pub fn kc_box_ctor(s: KSlot) : String = match s {
+  SBoxed  -> ""
+  SInt64  -> "kaix_int"
+  SReal   -> "kaix_real"
+  SBool   -> "kaix_bool"
+  SInt32  -> "kaix_int"
+  SChar   -> "kaix_char"
+  SByte   -> "kaix_byte"
+  SInt32T -> "kaix_int32"
+  SUInt32 -> "kaix_uint32"
+  SUInt64 -> "kaix_uint64"
+  SInt128 -> "kaix_int128"
+}
+
+#[doc("The expression `e`, a raw register value of `s`, boxed.")]
+pub fn kc_box(s: KSlot, e: String) : String = match s {
+  SBoxed  -> e
+  SInt32  -> kc_call("kaix_int", [cat2("(int64_t)", e)])
+  SInt32T -> kc_call("kaix_int32", [cat2("(int64_t)", e)])
+  SUInt32 -> kc_call("kaix_uint32", [cat2("(int64_t)(uint32_t)", e)])
+  _       -> kc_call(kc_box_ctor(s), [e])
+}
+
+#[doc("The expression `e`, a boxed value, read as the raw payload of `s` without releasing it.")]
+pub fn kc_unbox(s: KSlot, e: String) : String = match s {
+  SInt64  -> kc_call("kaix_int_field", [e])
+  SReal   -> kc_call("kaix_real_field", [e])
+  SBool   -> kc_call("kaix_bool_field", [e])
+  SChar   -> kc_call("kaix_char_field", [e])
+  SByte   -> kc_call("kaix_byte_field", [e])
+  SInt32T -> kc_call("kaix_int32_field", [e])
+  SUInt32 -> kc_call("kaix_uint32_field", [e])
+  SUInt64 -> kc_call("kaix_uint64_field", [e])
+  SInt128 -> kc_call("kaix_int128_field", [e])
+  _       -> e
+}
+
+fn kc_slot_of_tag(t: Int) : KSlot =
+  if t == 1 { SInt64 } else if t == 2 { SReal } else if t == 3 { SBool } else if t == 4 { SInt32 }
+  else if t == 5 { SChar } else if t == 6 { SByte } else if t == 7 { SInt32T } else if t == 8 { SUInt32 }
+  else if t == 9 { SUInt64 } else if t == 10 { SInt128 } else { SBoxed }
+
+#[doc("Register `n` in boxed position: a raw register boxes on read.")]
+pub fn kc_reg_boxed(cx: KcCx, n: String) : String =
+  if kc_reg_tag(cx, n) == 4 { kc_reg(n) } else { kc_box(kc_slot_of_tag(kc_reg_tag(cx, n)), kc_reg(n)) }
+
+#[doc("Register `n` at the raw slot `want`: a register already there reads directly, a boxed one unbox-borrows its payload.")]
+pub fn kc_reg_as(cx: KcCx, n: String, want: KSlot) : String =
+  if kc_reg_tag(cx, n) == nslot_tag(want) { kc_reg(n) } else { kc_unbox(want, kc_reg_boxed(cx, n)) }
+
+#[doc("A fixed-width literal, boxed.")]
+fn kc_fixed_lit(span: String, ty: Ty) : String = match ty {
+  TyByte   -> kc_call("kaix_byte", [int_to_string(decode_int(span))])
+  TyInt32  -> kc_call("kaix_int32", [kc_int_lit(decode_int(span))])
+  TyUInt32 -> kc_call("kaix_uint32", [kc_int_lit(decode_int(span))])
+  TyUInt64 -> kc_call("kaix_uint64_str", [kc_cstr(span)])
+  _        -> kc_call("kaix_int128_str", [kc_cstr(span)])
+}
+
+#[doc("An atom as a boxed expression.")]
+pub fn kc_atom(cx: KcCx, v: KVal) : String = match v {
+  KVar(n)   -> kc_reg_boxed(cx, n)
+  KIntV(n)  -> kc_call("kaix_int", [kc_int_lit(n)])
+  KBoolV(b) -> kc_call("kaix_bool", [if b { "1" } else { "0" }])
+  KCharV(c) -> kc_call("kaix_char", [int_to_string(char_to_int(c))])
+  KStrV(s)  -> {
+    let bytes = nemit_decode_span(s)
+    kc_call("kaix_str_n", [kc_cstr(bytes), cat2(int_to_string(string_length(bytes)), "LL")])
+  }
+  KUnitV    -> "kaix_unit()"
+  KRealV(r) -> kc_call("kaix_real", [kc_real_lit(r)])
+  KFixedV(span, ty) -> kc_fixed_lit(span, ty)
+}
+
+#[doc("An atom as a raw expression at `slot`: a literal as an immediate, a register read at its slot, a boxed atom unbox-borrowed.")]
+pub fn kc_atom_raw(cx: KcCx, v: KVal, slot: KSlot) : String = match slot {
+  SBoxed  -> kc_atom(cx, v)
+  SReal   -> match v { KRealV(r) -> kc_real_lit(r)  KVar(n) -> kc_reg_as(cx, n, slot)  _ -> kc_unbox(slot, kc_atom(cx, v)) }
+  SBool   -> match v { KBoolV(b) -> if b { "1" } else { "0" }  KVar(n) -> kc_reg_as(cx, n, slot)  _ -> kc_unbox(slot, kc_atom(cx, v)) }
+  SInt64  -> match v { KIntV(n) -> kc_int_lit(n)  KVar(n) -> kc_reg_as(cx, n, slot)  _ -> kc_unbox(slot, kc_atom(cx, v)) }
+  SChar   -> match v { KCharV(c) -> int_to_string(char_to_int(c))  KVar(n) -> kc_reg_as(cx, n, slot)  _ -> kc_unbox(slot, kc_atom(cx, v)) }
+  _       -> kc_atom_raw_fixed(cx, v, slot)
+}
+
+fn kc_atom_raw_fixed(cx: KcCx, v: KVal, slot: KSlot) : String = match v {
+  KIntV(n)         -> if (match slot { SInt128 -> true _ -> false }) { cat2("(__int128)", kc_int_lit(n)) } else { kc_int_lit(n) }
+  KFixedV(span, _) -> if (match slot { SInt128 -> true _ -> false }) { kc_call("kai_i128_parse", [kc_cstr(span)]) } else { kc_int_lit(decode_int(span)) }
+  KVar(n)          -> kc_reg_as(cx, n, slot)
+  _                -> kc_unbox(slot, kc_atom(cx, v))
+}
+
+#[doc("The register assignment `name = e;` where `e` was printed at `planned`: a register that widened to boxed takes the boxed form of a raw value.")]
+pub fn kc_assign(cx: KcCx, name: String, planned: KSlot, e: String) : String =
+  if kc_reg_tag(cx, name) == 0 { kc_set(name, kc_box(planned, e)) }
+  else { kc_set(name, e) }
+
+fn kc_set(name: String, e: String) : String =
+  if e == kc_reg(name) { "" } else { concat_all(["    ", kc_reg(name), " = ", e, ";\n"]) }
+
+#[doc("`KStore name <- v` at the destination register's slot.")]
+pub fn kc_store(cx: KcCx, name: String, v: KVal) : String =
+  kc_set(name, kc_atom_raw(cx, v, kc_slot_of_tag(kc_reg_tag(cx, name))))
