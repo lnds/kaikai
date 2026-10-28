@@ -15,6 +15,8 @@
 #   6. a dep shipping undeclared C sources — the failed link names the
 #      missing [native] contract.
 #   7. `kai-pkg show` parses a manifest with [native] (array values).
+#   8. a kai.lock still pinning a path dependency by git — the shim
+#      links once, and the stale pin is refreshed away.
 
 set -eu
 
@@ -99,5 +101,21 @@ if [ -x "$ROOT/tools/kai-pkg/kai-pkg" ]; then
   grep -q 'sources = \["c/term_shim.c"\]' "$TMP/.out" \
     || note "kai-pkg show did not render [native] sources"
 fi
+
+# 8. A stale git pin of a dependency the manifest names by path.
+cp -R "$DIR/app" "$TMP/app_s"
+cat > "$TMP/app_s/kai.lock" <<'EOF'
+[[package]]
+name = "term"
+source = "https://invalid.example/term"
+ref = "v0.0.1"
+sha = "0000000000000000000000000000000000000000"
+EOF
+kai_in "$TMP/app_s" env KAIKAI_CACHE_ROOT="$TMP/cache" "$KAI" build . -o "$TMP/app_stale"
+[ "$status" -eq 0 ] || { note "build with a stale git lock entry exited $status"; cat "$TMP/.err" >&2; }
+if [ -x "$TMP/app_stale" ]; then
+  [ "$("$TMP/app_stale")" = "80" ] || note "stale-lock binary printed the wrong width"
+fi
+! grep -q "invalid.example" "$TMP/app_s/kai.lock" || note "stale entry survived the refresh"
 
 exit "$fail"
