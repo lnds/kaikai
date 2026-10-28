@@ -431,7 +431,7 @@ Under `__wasm__` the eight `KAI_HOST_*` macros default to 0 (a build may still d
 
 ```
 CC=$WASI_SDK/bin/clang \
-CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
+CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mtail-call -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
         -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID \
         -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp" \
 KAI_MODULAR=0 KAI_BACKEND=c bin/kai build app.kai -o app.wasm
