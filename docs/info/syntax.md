@@ -187,7 +187,7 @@ functions to C* in `kai info ffi`.
 
 FFI surface beyond `extern "C" fn` — extern structs (`extern "C" [pub]
 type Vec2 = { x: F32, y: F32 }`, usable as a record, spread included), opaque handles (`extern "C" opaque
-Conn`), a C-symbol override (`extern "C"("PQconnectdb") fn
+Conn`, optionally with phantom parameters: `Conn[t]`), a C-symbol override (`extern "C"("PQconnectdb") fn
 connect(...)`), and the fixed-width marshal types (`U8`–`I64`,
 `F32`) — is covered in `kai info ffi`, as is `extern "js"` (a JavaScript
 import with its path `"a.b"`, `"a.b="` to write a property, `".m"` for a
