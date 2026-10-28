@@ -390,7 +390,7 @@ extern void kai_llvm_select_wasm_exception_model(LLVMTargetMachineRef tm);
 static LLVMTargetMachineRef kai_llvm_create_target_machine(LLVMTargetRef target, const char *triple) {
     if (kai_llvm_wasm_target()) {
         LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target, triple, "generic",
-            "+exception-handling,+mutable-globals,+sign-ext,+bulk-memory,+nontrapping-fptoint,+reference-types,+multivalue",
+            "+exception-handling,+mutable-globals,+sign-ext,+bulk-memory,+nontrapping-fptoint,+reference-types,+multivalue,+tail-call",
             kai_llvm_cgen_level(), LLVMRelocStatic, LLVMCodeModelDefault);
 #ifdef KAI_LLVM_WEBASSEMBLY
         if (tm) kai_llvm_select_wasm_exception_model(tm);
