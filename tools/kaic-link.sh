@@ -80,14 +80,11 @@ rm -rf "$KL_DIR"
 mkdir -p "$KL_DIR" "$KL_CACHE"
 awk -v dir="$KL_DIR" -v pfx="//KAIFILE:$nonce::" \
   'index($0,pfx)==1{if(out)close(out);out=dir"/"substr($0,length(pfx)+1);next} out{print > out}' "$in"
-# A boot release that predates the shared runtime ships its own C owner beside
-# the headers it is compiled with; any other hop takes this tree's runtime.
+# A stream of the C backend before the shared runtime has no `kai_main`: it is
+# linked with the C owner, which runtime.h instantiates. Streams printed from
+# KIR define `kai_main` and link with the native runtime.
 owner="$(dirname "$0")/../stage0/runtime_llvm.c"
-prev=""
-for flag in "$@"; do
-  if [ "$prev" = -I ] && [ -f "$flag/runtime_owner_c.c" ]; then owner="$flag/runtime_owner_c.c"; fi
-  prev="$flag"
-done
+if ! grep -qs '^KaiValue \* kai_main(void)' "$KL_DIR"/*.c; then owner="$(dirname "$0")/../stage2/runtime_owner_c.c"; fi
 cp "$owner" "$KL_DIR/"
 
 # Relative -I paths resolve from the caller's directory, not the TU's.
