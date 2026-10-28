@@ -84,6 +84,38 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.181.0 (2026-10-27)
+
+### Added
+
+- **tco**: guaranteed tail jumps between declared functions on the C backend
+- **kir**: walk each dispatch state of a fused group in the linearity check
+
+### Fixed
+
+- **tco**: keep purity and the C output of fns whose tail call stays a call
+- **tco**: a call is bracketed only when its unwind site holds a name
+- **kir**: the linearity check models field untake as returning an immediate
+- **perceus**: a lending builtin's first argument is not a taken use of a reuse donor's child
+- **perceus**: move only on proven paths, skip scalar takes, keep the spread type check and cut the passes' scans
+- **perceus**: keep field names off the id-bearing read type and list the spread name read
+- **perceus**: order field takes by traversal and gate five owned-projection shapes
+- **kir**: bind a list arm's nested head binders after every test has passed
+- **typer**: keep an extern's marker through the library cut so conflicting declarations are rejected
+
+### Changed
+
+- **kir**: classify unit-dimensioned scalars like their carrier
+- **perceus**: decide arm reuse sites once for both backends
+- **kir**: build the linearity check's canonical key with an accumulator
+- **perceus**: resolve a field take by slot at compile time and inline it
+- **perceus**: take nested record patterns and guarded arms, and state only when nothing can exit
+- **perceus**: let a dead captured closure release its captured vector before the write
+- **perceus**: take handler state into resume and keep field takes behind their dup
+- **perceus**: take projected fields of owned records so Vec writes stay in place
+- **kir**: collect handled effects through xp_positions
+- **kir**: index inline templates, handled effects and declared builtins
+
 ## v0.180.0 (2026-10-27)
 
 ### BREAKING CHANGE
