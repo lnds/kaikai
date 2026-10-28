@@ -155,7 +155,7 @@ JOBS="${KAI_TEST_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || e
 self="$ROOT/tools/test-check-parity.sh"
 results="$tmp/results"
 
-find "$ROOT/examples/negative" \
+find "$ROOT/examples/negative" "$ROOT/examples/sugars" "$ROOT/examples/namespace-collisions/neg_module_home_clash" "$ROOT/examples/effects/m8x_8_sibling_nursery_mismatch.err.expected" \
   \( -name '*.err.expected' -o -name '*.diag.expected' \) \
   -not -path '*/silent_contract/*' -print0 2>/dev/null \
   | sort -z \

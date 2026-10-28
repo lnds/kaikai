@@ -126,62 +126,52 @@ then test whether the block's exit value carries one. Applying a
 tainted binder (`f()`) consumes the closure — its result, not `f`,
 flows on — which is what keeps `let f = () => cell; let r = f()` legal.
 """)]
-pub(pkg) fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], cell: Binder, file: String) : Int / Console + File {
+pub(pkg) fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], cell: Binder, file: String) : [Diagnostic] {
 
   let tainted = lcr_taint_stmts(stmts, cell, [])
   # A bare `n` in tail position returns the capability itself out of its handle
   # (escape vector 3). A capability may only appear as a call argument or an op
   # receiver, never as a return value — reject it directly.
   let direct = match tail {
-    Some(t) -> match t.kind { ELocal(v) -> if local_eq(v, cell.id) { report_cap_return(cell, t.line, t.col, file) } else { 0 } _ -> 0 }
-    None    -> 0
+    Some(t) -> match t.kind { ELocal(v) -> if local_eq(v, cell.id) { [report_cap_return(cell, t.line, t.col, file)] } else { [] } _ -> [] }
+    None    -> []
   }
   # A `spawn(task)` anywhere in the block defers `task` to another fiber
   # where the cell's evidence does not exist — a distinct escape from the
   # value-reaching-exit one above, caught over the whole block, not just
   # the tail.
   let spawned = match spawn_block_escape_pos(stmts, tail, cell, tainted) {
-    Some(p) -> report_cell_escape(cell, p, file)
-    None    -> 0
+    Some(p) -> [report_cell_escape(cell, p, file)]
+    None    -> []
   }
   let valued = match escaping_closure_opt(tail, cell, tainted) {
-    Some(p) -> report_cell_escape(cell, p, file)
-    None    -> 0
+    Some(p) -> [report_cell_escape(cell, p, file)]
+    None    -> []
   }
-  direct + spawned + valued
+  [...direct, ...spawned, ...valued]
 }
 
-fn report_cap_return(cell: Binder, line: Int, col: Int, file: String) : Int / Console + File {
-  diag_error(file, line, col, concat_all([
-    "the capability `", written_text(cell.name), "` cannot be returned from its `handle`"
-  ]))
-  diag_help(concat_all([
-    "a capability bound by `as` is second-class — it may only be passed down as a call argument or used as an op receiver, not returned or stored; a value that must outlive its scope is a `Ref[T]` under `Mutable`"
-  ]))
-  1
-}
+fn report_cap_return(cell: Binder, line: Int, col: Int, file: String) : Diagnostic =
+  mk_diag(SevError, file, line, col,
+    concat_all(["the capability `", written_text(cell.name), "` cannot be returned from its `handle`"]),
+    [ri_help(file, line, col, "a capability bound by `as` is second-class — it may only be passed down as a call argument or used as an op receiver, not returned or stored; a value that must outlive its scope is a `Ref[T]` under `Mutable`")])
 
-fn report_cell_escape(cell: Binder, p: CellPos, file: String) : Int / Console + File {
-  diag_error(file, p.line, p.col, concat_all([
-    "a closure that accesses the mutable cell `", written_text(cell.name), "` escapes its block"
-  ]))
-  diag_help(concat_all([
-    "the handler for `", written_text(cell.name), "` is fiber-local: it is torn down when its block exits and does not cross a `spawn`; a `var`/State/Reader cell or a capability bound by `as` cannot outlive its `handle` — pass its value down as a call argument, or model shared mutable state across fibers as an actor"
-  ]))
-  1
-}
+fn report_cell_escape(cell: Binder, p: CellPos, file: String) : Diagnostic =
+  mk_diag(SevError, file, p.line, p.col,
+    concat_all(["a closure that accesses the mutable cell `", written_text(cell.name), "` escapes its block"]),
+    [ri_help(file, p.line, p.col, concat_all(["the handler for `", written_text(cell.name), "` is fiber-local: it is torn down when its block exits and does not cross a `spawn`; a `var`/State/Reader cell or a capability bound by `as` cannot outlive its `handle` — pass its value down as a call argument, or model shared mutable state across fibers as an actor"]))])
 
 #[doc("""
 A single exit value (a handle body that is not a block). Same rule
 with no preceding statements to taint.
 """)]
-pub(pkg) fn lcr_escape_in_value(e: Expr, cell: Binder, file: String) : Int / Console + File {
+pub(pkg) fn lcr_escape_in_value(e: Expr, cell: Binder, file: String) : [Diagnostic] {
 
   match e.kind {
     EBlock(stmts, tail) -> lcr_escape_check(stmts, tail, cell, file)
     _ -> match escaping_closure_pos(e, cell, []) {
-           Some(p) -> report_cell_escape(cell, p, file)
-           None    -> 0
+           Some(p) -> [report_cell_escape(cell, p, file)]
+           None    -> []
          }
   }
 }
@@ -388,50 +378,50 @@ fn fields_escaping_pos(fs: [FieldInit], cell: Binder, tainted: [LocalId]) : Opti
   }
 }
 
-#[doc("Reports each cell of `ds` read or written from a closure that outlives its block or from a spawned task, and each capability returned out of its handle; the number of reports.")]
-pub(pkg) fn check_cell_escapes_decls(ds: [Decl], df: DiagFiles) : Int / Console + File = ces_decls(ds, df, 0)
+#[doc("The diagnostics for each cell of `ds` read or written from a closure that outlives its block or from a spawned task, and each capability returned out of its handle.")]
+pub(pkg) fn check_cell_escapes_decls(ds: [Decl], df: DiagFiles) : [Diagnostic] = ces_decls(ds, df, [])
 
-fn ces_decls(ds: [Decl], df: DiagFiles, acc: Int) : Int / Console + File = match ds {
+fn ces_decls(ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
   []           -> acc
-  [d, ...rest] -> ces_decls(rest, df, acc + ces_decl(d, decl_diag_file(d, df)))
+  [d, ...rest] -> ces_decls(rest, df, list_append(acc, ces_decl(d, decl_diag_file(d, df))))
 }
 
-fn ces_decl(d: Decl, file: String) : Int / Console + File = match d {
+fn ces_decl(d: Decl, file: String) : [Diagnostic] = match d {
   DFn(_, _, _, _, _, _, body, _, _, _) -> ces_expr(body, file)
   DTest(_, body, _, _, _)              -> ces_expr(body, file)
   DBench(_, body, _, _, _)             -> ces_expr(body, file)
   DCheck(_, _, body, _, _, _)          -> ces_expr(body, file)
-  DImpl(_, _, _, inner, _, _, _, _)    -> ces_inner(inner, file, 0)
+  DImpl(_, _, _, inner, _, _, _, _)    -> ces_inner(inner, file, [])
   _ -> match decl_transparent_inner(d) {
     Some(inner) -> ces_decl(inner, file)
-    None        -> 0
+    None        -> []
   }
 }
 
-fn ces_inner(ds: [Decl], file: String, acc: Int) : Int / Console + File = match ds {
+fn ces_inner(ds: [Decl], file: String, acc: [Diagnostic]) : [Diagnostic] = match ds {
   []           -> acc
-  [d, ...rest] -> ces_inner(rest, file, acc + ces_decl(d, file))
+  [d, ...rest] -> ces_inner(rest, file, list_append(acc, ces_decl(d, file)))
 }
 
 # The checks of a node follow those of its children, so an inner block reports first.
-fn ces_expr(e: Expr, file: String) : Int / Console + File = {
-  let inner = ces_children(xp_positions(e), file, 0)
+fn ces_expr(e: Expr, file: String) : [Diagnostic] = {
+  let inner = ces_children(xp_positions(e), file, [])
   let here = match e.kind {
-    EBlock(stmts, tail)                        -> ces_block(stmts, tail, file, 0)
+    EBlock(stmts, tail)                        -> ces_block(stmts, tail, file, [])
     EHandle(body, _, _, _, Some(alias), _, _) -> lcr_escape_in_value(body, alias, file)
-    _                                          -> 0
+    _                                          -> []
   }
-  inner + here
+  list_append(inner, here)
 }
 
-fn ces_children(ps: [XPos], file: String, acc: Int) : Int / Console + File = match ps {
+fn ces_children(ps: [XPos], file: String, acc: [Diagnostic]) : [Diagnostic] = match ps {
   []              -> acc
-  [XP(_, c), ...rest] -> ces_children(rest, file, acc + ces_expr(c, file))
+  [XP(_, c), ...rest] -> ces_children(rest, file, list_append(acc, ces_expr(c, file)))
 }
 
 # A `var` takes the rest of its block as the scope its cell must not outlive.
-fn ces_block(stmts: [Stmt], tail: Option[Expr], file: String, acc: Int) : Int / Console + File = match stmts {
+fn ces_block(stmts: [Stmt], tail: Option[Expr], file: String, acc: [Diagnostic]) : [Diagnostic] = match stmts {
   [] -> acc
-  [SVar(b, _, _, _, _), ...rest] -> ces_block(rest, tail, file, acc + lcr_escape_check(rest, tail, b, file))
+  [SVar(b, _, _, _, _), ...rest] -> ces_block(rest, tail, file, list_append(acc, lcr_escape_check(rest, tail, b, file)))
   [_, ...rest] -> ces_block(rest, tail, file, acc)
 }
