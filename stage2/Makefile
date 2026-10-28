@@ -1497,7 +1497,7 @@ test-ffi-cflags-shim: $(TARGET) bin-kai build
 # calls back, a callback carrying an actor's Pid as userdata, and C threads
 # entering the scheduler. The thread fixture needs the worker pool, so it runs
 # at KAI_THREADS above 1 only, and at 1 the call must abort with the advice.
-FFI_EXPORT_FIXTURES := export_qsort export_userdata export_thread
+FFI_EXPORT_FIXTURES := export_qsort export_userdata export_thread export_pinned
 
 define ffi_export_run
 	@set -e; \
@@ -1589,6 +1589,22 @@ test-issue-1556-main-thread-affinity: $(TARGET) bin-kai build
 	    || { echo "issue-1556 DIFF (C backend, KAI_THREADS=$$n)"; diff ../examples/ffi/main_thread_affinity.out.expected build/main-thread-c.out; exit 1; }; \
 	done; \
 	echo "issue-1556 OK (C backend, KAI_THREADS 1/2/4/8)"
+
+# A fault that is not a fiber stack overflow must reach the SIGSEGV handler a
+# host installed before the runtime started (JIT, managed runtime): the
+# runtime chains to it instead of replacing it. The stack-overflow diagnostic
+# itself is pinned by test-effects-m8_fiber_stack_overflow.
+.PHONY: test-ffi-segv-chain
+test-ffi-segv-chain: $(TARGET) bin-kai build
+	@set -e; \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi/segv_chain.kai)" ../bin/kai build --backend=c ../examples/ffi/segv_chain.kai -o build/segv-chain-c 2> build/segv-chain-c.err \
+	  || { echo "segv-chain BUILD FAIL"; cat build/segv-chain-c.err; exit 1; }; \
+	for n in 1 4; do \
+	  KAI_THREADS=$$n ./build/segv-chain-c > build/segv-chain-c.out; \
+	  diff -q ../examples/ffi/segv_chain.out.expected build/segv-chain-c.out > /dev/null \
+	    || { echo "segv-chain DIFF (KAI_THREADS=$$n)"; diff ../examples/ffi/segv_chain.out.expected build/segv-chain-c.out; exit 1; }; \
+	done; \
+	echo "segv-chain OK"
 
 # Native separate compilation (#989/#963): the whole-program KIR is partitioned
 # into one object per module + the root, each content-addressed, then linked
