@@ -398,12 +398,12 @@ EOF
   return 0
 }
 out=$(cell_dump cell_perform_ids)
-need '^kperform _kaiu_kaiu_cell_perform_ids__stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
+need '^kperform _kaiu_cell_perform_ids__stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
 need '^kperform kaiu_cell_perform_ids__reads Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
-need '^kperform _kaiu_lam_kaiu_cell_perform_ids__reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_lam_cell_perform_ids__reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
 cell_core cell_perform_ids
 out=$(cell_dump cell_perform_ids_stdlib)
-need '^kperform _kaiu_lam_kaiu_cell_perform_ids_stdlib__captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
+need '^kperform _kaiu_lam_cell_perform_ids_stdlib__captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
 cell_core cell_perform_ids_stdlib
 out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
   | grep -v /negative/ \

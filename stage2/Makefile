@@ -5514,8 +5514,8 @@ test-m4c: $(TARGET) build
 	  && grep -q "^fn kaiu_m4c_run_with__run_with__mono__String__Int(" build/s2-m4c_run_with.kir \
 	  && echo "m4c OK m4c_run_with monomorph specialisations emitted" \
 	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }; \
-	grep -q "^clause fn _kaiu_kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.kir \
-	  && grep -q "^clause fn _kaiu_kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.kir \
+	grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.kir \
+	  && grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.kir \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }; \
 	grep -qE "= m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.kir \
