@@ -163,7 +163,20 @@ static void kai_reactor_wait(void) {
      * quiescent after the last worker parked must run it itself. */
     if (kai_nthreads > 1) kai_sched_check_deadlock();
     if (timeout_ms != 0 && kai_nthreads <= 1) kai_flush_stdout();
+    /* A single-threaded program blocks here with nobody else to run: an idle
+     * span longer than the grace period gives its cell pool back. */
+    int grace = 0;
+#ifdef KAI_CELL_POOL_ACTIVE
+    if (kai_nthreads <= 1 && kai_cell_pool_trimmable() &&
+        (timeout_ms < 0 || timeout_ms > KAI_CELL_POOL_IDLE_NS / 1000000L)) {
+        timeout_ms = (int) (KAI_CELL_POOL_IDLE_NS / 1000000L);
+        grace = 1;
+    }
+#endif
     int rc = poll(pfds, (nfds_t) nfds, timeout_ms);
+#ifdef KAI_CELL_POOL_ACTIVE
+    if (grace && rc == 0) kai_cell_pool_trim();
+#endif
     if (kai_nthreads > 1) atomic_store(&kai_reactor_idle, 0);
     if (rc < 0 && errno != EINTR) {
         kai_eprintf("kai: reactor poll() failed: %s\n", strerror(errno));

@@ -107,6 +107,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <string.h>
 #include <sched.h>      /* sched_getaffinity() — CPU count for the KAI_THREADS default */
 #if KAI_HOST_STACK_GUARD

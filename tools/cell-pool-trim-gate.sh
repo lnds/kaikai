@@ -1,9 +1,10 @@
 #!/bin/sh
-# Gate: a multi-threaded program that peaked and went idle gives its cell
-# pools back. The C backend is built with KAI_CELL_POOL_TRACE, which reports
-# each trim; the pooled cells trimmed between the peak and the idle marker
-# must cover the pools the peak filled. RSS is printed for reference only
-# (the allocator decides when freed pages leave the process).
+# Gate: a program that peaks and goes idle, round after round, gives its cell
+# pools back each time, on several worker threads and on the lone main thread
+# of a single-threaded run. The C backend is built with KAI_CELL_POOL_TRACE,
+# which reports each trim; the cells trimmed must cover what the peaks
+# filled. Process memory is not asserted: when freed pages leave the process
+# is the allocator's call.
 # Usage: tools/cell-pool-trim-gate.sh [kai]
 set -eu
 cd "$(dirname "$0")/.."
@@ -12,28 +13,19 @@ src=tools/cell-pool-trim-prog.kai
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 
-CFLAGS="${CFLAGS:-} -DKAI_CELL_POOL_TRACE" "$kai" build --backend=c "$src" -o "$dir/prog" >/dev/null
-KAI_THREADS=4 "$dir/prog" >"$dir/out" 2>"$dir/err" &
-pid=$!
+CFLAGS="${CFLAGS:--O2} -DKAI_CELL_POOL_TRACE" "$kai" build --backend=c "$src" -o "$dir/prog" >/dev/null
 
-wait_for() {
-  n=0
-  until grep -q "$1" "$dir/out"; do
-    n=$((n + 1))
-    [ $n -le 300 ] || { echo "FAIL: marker '$1' never printed" >&2; kill $pid 2>/dev/null; exit 1; }
-    sleep 0.1
-  done
+check() {
+  threads=$1
+  min=$2
+  KAI_THREADS=$threads "$dir/prog" >/dev/null 2>"$dir/err"
+  peaks=$(grep -c '^peak' "$dir/err")
+  trimmed=$(awk '/^cell-pool-trim /{ s += $2 } END { print s + 0 }' "$dir/err")
+  echo "threads=${threads}: peaks ${peaks}, cells trimmed ${trimmed}"
+  [ "$peaks" -eq 5 ] || { echo "FAIL: expected 5 peaks" >&2; exit 1; }
+  [ "$trimmed" -ge "$min" ] || { echo "FAIL: only ${trimmed} cells trimmed (need ${min})" >&2; exit 1; }
 }
-rss() { ps -o rss= -p $pid | tr -d ' '; }
 
-wait_for peak
-before=$(rss)
-wait_for idle
-after=$(rss)
-wait $pid
-
-trimmed=$(awk '/^cell-pool-trim /{ s += $2 } END { print s + 0 }' "$dir/err")
-echo "rss after peak: ${before} KiB, once idle: ${after} KiB; cells trimmed: ${trimmed}"
-# 8 fibers over 4 workers leave far more than this pooled.
-[ "$trimmed" -ge 1000000 ] || { echo "FAIL: only ${trimmed} cells trimmed" >&2; exit 1; }
+check 4 5000000
+check 1 4000000
 echo "ok"
