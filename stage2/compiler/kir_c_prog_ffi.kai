@@ -4,6 +4,7 @@ import compiler.emit_native_ffi
 import compiler.emit_native_fn
 import compiler.kir
 import compiler.kir_c_core
+import compiler.kir_c_ops_util
 import compiler.util
 
 fn kcf_int_type(bits: Int, signed: Bool) : String =
@@ -78,20 +79,83 @@ pub fn kcf_boxed_params(evf: Bool, n: Int) : String =
 fn kcf_boxed_param_list(i: Int, n: Int) : [String] =
   if i >= n { [] } else { [concat_all(["KaiValue *a", int_to_string(i)]), ...kcf_boxed_param_list(i + 1, n)] }
 
-fn kcf_c_params(ks: [KFfiKind]) : String = match filter(ks, (k) => not kcf_is_unit(k)) {
+fn kcf_sname(sym: String, tag: String) : String = concat_all(["kc_s_", kc_mangle(sym), "_", tag])
+
+fn kcf_member(sname: String, field: String) : String = concat_all([sname, "_", field])
+
+fn kcf_tyname(k: KFfiKind, sname: String) : String = match k {
+  KFfiStruct(_) -> cat2("struct ", sname)
+  _             -> kcf_ctype(k)
+}
+
+fn kcf_param_sname(sym: String, i: Int) : String = kcf_sname(sym, cat2("p", int_to_string(i)))
+
+fn kcf_field_decl(sname: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> concat_all([kcf_tyname(fk, kcf_member(sname, n)), " ", n, "; "])
+}
+
+fn kcf_field_defs(sname: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> kcf_struct_defs(fk, kcf_member(sname, n))
+}
+
+fn kcf_struct_defs(k: KFfiKind, sname: String) : String = match k {
+  KFfiStruct(fs) -> concat_all([
+    concat_all(map(fs, (f) => kcf_field_defs(sname, f))),
+    "struct ", sname, " { ", concat_all(map(fs, (f) => kcf_field_decl(sname, f))), "};\n"
+  ])
+  _ -> ""
+}
+
+fn kcf_param_defs(sym: String, ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] -> [kcf_struct_defs(k, kcf_param_sname(sym, i)), ...kcf_param_defs(sym, rest, i + 1)]
+}
+
+fn kcf_unbox_field(a: String, sname: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> concat_all([".", n, " = ", kcf_unbox_s(fk, kc_call("kaix_field_borrow", [a, kc_cstr(n)]), kcf_member(sname, n))])
+}
+
+fn kcf_unbox_s(k: KFfiKind, a: String, sname: String) : String = match k {
+  KFfiStruct(fs) -> concat_all(["((struct ", sname, "){", string_join(map(fs, (f) => kcf_unbox_field(a, sname, f)), ", "), "})"])
+  _              -> kcf_unbox(k, a)
+}
+
+fn kcf_rebox_field(e: String, f: KFfiField) : String = match f {
+  KFF(n, fk) -> kcf_rebox_s(fk, concat_all([e, ".", n]))
+}
+
+fn kcf_field_name(f: KFfiField) : String = match f {
+  KFF(n, _) -> kc_cstr(n)
+}
+
+fn kcf_rebox_s(k: KFfiKind, e: String) : String = match k {
+  KFfiStruct(fs) -> kc_call("kaix_record", [int_to_string(list_length(fs)),
+                                            kc_arr("KaiValue *", map(fs, (f) => kcf_rebox_field(e, f))),
+                                            kc_arr("const char *", map(fs, kcf_field_name))])
+  _              -> kcf_rebox(k, e)
+}
+
+fn kcf_c_params(sym: String, ks: [KFfiKind], i: Int) : [String] = match ks {
+  [] -> []
+  [k, ...rest] ->
+    if kcf_is_unit(k) { kcf_c_params(sym, rest, i + 1) }
+    else { [kcf_tyname(k, kcf_param_sname(sym, i)), ...kcf_c_params(sym, rest, i + 1)] }
+}
+
+fn kcf_c_param_list(sym: String, ks: [KFfiKind]) : String = match kcf_c_params(sym, ks, 0) {
   [] -> "void"
-  cs -> string_join(map(cs, (k) => kcf_ctype(k)), ", ")
+  cs -> string_join(cs, ", ")
 }
 
 fn kcf_unsupported_shim(evf: Bool, sym: String, arity: Int, why: String) : String =
   concat_all(["KaiValue *", sym, "(", kcf_boxed_params(evf, arity), ") {\n    ",
               kc_unsupported(why), ";\n    return kaix_unit();\n}\n"])
 
-fn kcf_call_args(ks: [KFfiKind], i: Int) : [String] = match ks {
+fn kcf_call_args(sym: String, ks: [KFfiKind], i: Int) : [String] = match ks {
   [] -> []
   [k, ...rest] ->
-    if kcf_is_unit(k) { kcf_call_args(rest, i + 1) }
-    else { [kcf_unbox(k, cat2("a", int_to_string(i))), ...kcf_call_args(rest, i + 1)] }
+    if kcf_is_unit(k) { kcf_call_args(sym, rest, i + 1) }
+    else { [kcf_unbox_s(k, cat2("a", int_to_string(i)), kcf_param_sname(sym, i)), ...kcf_call_args(sym, rest, i + 1)] }
 }
 
 fn kcf_decrefs(ks: [KFfiKind], i: Int) : [String] = match ks {
@@ -103,13 +167,16 @@ fn kcf_decrefs(ks: [KFfiKind], i: Int) : [String] = match ks {
 
 fn kcf_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
   let alias = cat2("kc_ffi_", kc_mangle(sym))
-  let call = kc_call(alias, kcf_call_args(pks, 0))
+  let rname = kcf_sname(sym, "r")
+  let call = kc_call(alias, kcf_call_args(sym, pks, 0))
   concat_all([
-    "extern ", kcf_ctype(rk), " ", alias, "(", kcf_c_params(pks), ") __asm__(KC_ASM(", kc_cstr(csym), "));\n",
+    concat_all(kcf_param_defs(sym, pks, 0)),
+    kcf_struct_defs(rk, rname),
+    "extern ", kcf_tyname(rk, rname), " ", alias, "(", kcf_c_param_list(sym, pks), ") __asm__(KC_ASM(", kc_cstr(csym), "));\n",
     "KaiValue *", sym, "(", kcf_boxed_params(evf, list_length(pks)), ") {\n",
-    if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", kcf_ctype(rk), " r = ", call, ";\n"]) },
+    if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", kcf_tyname(rk, rname), " r = ", call, ";\n"]) },
     concat_all(kcf_decrefs(pks, 0)),
-    "    return ", if kcf_is_unit(rk) { "kaix_unit()" } else { kcf_rebox(rk, "r") }, ";\n}\n"
+    "    return ", if kcf_is_unit(rk) { "kaix_unit()" } else { kcf_rebox_s(rk, "r") }, ";\n}\n"
   ])
 }
 
@@ -162,8 +229,8 @@ pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) 
   let evf = not list_is_empty(nfnx_frame_keys(cx.fx, f))
   if any(pks, kcf_is_unknown) or kcf_is_unknown(rk) {
     kcf_unsupported_shim(evf, sym, arity, cat2("unsupported FFI boundary type in ", csym))
-  } else if any(pks, kcf_is_struct) or kcf_is_struct(rk) {
-    kcf_unsupported_shim(evf, sym, arity, cat2("struct-by-value FFI is not supported: ", csym))
+  } else if ffi_is_js(csym) and (any(pks, kcf_is_struct) or kcf_is_struct(rk)) {
+    kcf_unsupported_shim(evf, sym, arity, cat2("extern js cannot pass a struct by value: ", csym))
   } else if ffi_is_js(csym) {
     kcf_js_shim(evf, sym, csym, pks, rk)
   } else {

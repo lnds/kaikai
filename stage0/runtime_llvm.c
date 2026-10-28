@@ -84,7 +84,10 @@ _Static_assert(offsetof(KaiValue, rc) == 0, "native emitter layout: rc at 0");
 _Static_assert(offsetof(KaiValue, tag) == 4, "native emitter layout: tag at 4");
 _Static_assert(offsetof(KaiValue, var_n_args) == 5, "native emitter layout: var_n_args at 5");
 _Static_assert(offsetof(KaiValue, variant_tag) == 6, "native emitter layout: variant_tag at 6");
+/* The RC ledger widens the header; only the C backend builds with it. */
+#ifndef KAI_TRACE_RC
 _Static_assert(offsetof(KaiValue, as) == 8, "native emitter layout: slot array at 8");
+#endif
 
 /* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }

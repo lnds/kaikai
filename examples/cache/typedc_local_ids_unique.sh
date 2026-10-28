@@ -37,9 +37,9 @@ cp "$WORK/a/main.kai" "$WORK/b/main.kai"
 printf '\nfn extra_after(a: Int) : Int = {\n  let t = a + 1\n  t * 2\n}\n' >> "$WORK/b/main.kai"
 
 for p in a b; do
-  "$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" "$WORK/$p/main.kai" > "$WORK/$p.c" 2> "$WORK/$p.err" || { cat "$WORK/$p.err"; fail "$p/main.kai does not compile"; }
+  "$KAIC2" $EDITION_FLAG --emit=kir-noinline --path "$ROOT/stdlib" "$WORK/$p/main.kai" > "$WORK/$p.kir" 2> "$WORK/$p.err" || { cat "$WORK/$p.err"; fail "$p/main.kai does not compile"; }
   for f in put1 put2 put3; do
-    awk -v f="kaiu_main__$f(" 'index($0, f) && /\{$/ { on = 1 } on { print } on && /^}/ { exit }' "$WORK/$p.c" \
+    awk -v f="fn main__$f(" 'index($0, f) == 1 { on = 1 } on { print } on && /^}/ { exit }' "$WORK/$p.kir" \
       | grep -o '__rfh_[0-9]*' | sort -u | head -1 > "$WORK/$p.$f"
     [ -s "$WORK/$p.$f" ] || fail "no hoisted local in $f of $p/main.kai"
   done

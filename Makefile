@@ -416,8 +416,8 @@ test-rboxed-prim-scope: kaic1 kaic2
 	echo "rboxed-prim OK — llvm_backend_tag shared let stays in Perceus scope (both emitters)"
 
 # C-emission namespace gate. User identifiers ride their own namespaces
-# (`kaiu_` fns, `kaiv_` locals), so every `kai_*` token in kaic2-emitted C
-# must be a name runtime.h itself contains. A binder that leaks into `kai_*`
+# (module-prefixed fns, `r_`/`t` locals), so every `kai_*` token in
+# kaic2-emitted C must be a name the runtime itself contains. A binder that leaks into `kai_*`
 # with a runtime helper's name breaks the selfhost cc build; this catches
 # the rest of the class — any leak, colliding or not — over the compiler's
 # own thousands of binders. The reverse check keeps future runtime helpers
@@ -431,7 +431,7 @@ test-kai-namespace: kaic2
 	( cd stage2 && ./kaic2 $(EDITION_FLAG) main.kai ) > $$tmp/self.c; \
 	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/self.c \
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/emitted.txt; \
-	cat stage2/runtime.h stage2/runtime/*.h | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
+	cat stage2/runtime.h stage2/runtime/*.h stage0/runtime_llvm.c | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
 	leaks=$$(comm -23 $$tmp/emitted.txt $$tmp/runtime.txt); \
 	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: user-derived identifiers emitted into the runtime kai_ namespace:"; echo "$$leaks"; exit 1; }; \
 	rev=$$(cat stage2/runtime.h stage2/runtime/*.h | tr -c 'A-Za-z0-9_' '\n' | grep -E '^(kaiu_|kaiv_)' | sort -u); \
@@ -442,9 +442,9 @@ test-kai-namespace: kaic2
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/adv-emitted.txt; \
 	leaks=$$(comm -23 $$tmp/adv-emitted.txt $$tmp/runtime.txt); \
 	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: a user fn named after a runtime helper reached the kai_ namespace:"; echo "$$leaks"; exit 1; }; \
-	grep -q 'kaiu_ha__kai_internal_drop' $$tmp/adv.c \
-	  || { echo "test-kai-namespace FAIL: $$fx did not emit ha.kai_internal_drop as kaiu_ha__kai_internal_drop"; exit 1; }; \
-	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_; user names shaped like runtime helpers stay in kaiu_"
+	( cd stage2 && ./kaic2 $(EDITION_FLAG) --emit=kir-noinline ../$$fx/main.kai ) | grep -q '^fn ha__kai_internal_drop' \
+	  || { echo "test-kai-namespace FAIL: $$fx did not emit ha.kai_internal_drop as ha__kai_internal_drop"; exit 1; }; \
+	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_; user names shaped like runtime helpers keep their module prefix"
 
 # A root file whose basename is not a C identifier still mints valid symbols.
 # Both backends, since the name reaches C emission and KIR lowering alike.
