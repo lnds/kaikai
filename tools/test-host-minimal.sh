@@ -91,11 +91,11 @@ for golden in "$FIX"/host_minimal_*.run.err.expected; do
 done
 
 # Each facility off on its own, and the two groups that only go together.
-OWNER="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1"
+OWNER="-DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1"
 alone() {
   # shellcheck disable=SC2086,SC2046
   "$CC" $BASE_CFLAGS -Werror=implicit-function-declaration -fsyntax-only \
-      -I "$ROOT/stage2" -I "$ROOT/stage0" $OWNER $(off "$@") "$ROOT/stage2/runtime_owner_c.c" \
+      -I "$ROOT/stage2" -I "$ROOT/stage0" $OWNER $(off "$@") "$ROOT/stage0/runtime_llvm.c" \
       > "$work/alone.log" 2>&1 \
     || { cat "$work/alone.log" >&2; fail "the runtime does not compile without: $*"; }
 }

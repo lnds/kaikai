@@ -206,7 +206,6 @@ cp -R stage2/runtime       "$STAGE/share/kaikai/include/runtime"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 # The minimal C-backend runtime owner: the C split's owner
 # object, next to runtime.h so kai resolves it here in the installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.
-cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 
 # P2 (docs/native-codegen-perf-plan.md §P2): ship the native-runtime bitcode
 # so the installed `kai build --backend=native` links it before O2 and

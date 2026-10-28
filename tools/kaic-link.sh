@@ -53,7 +53,7 @@ if [ "${1:-}" = --tu ]; then
   cd "$KL_DIR"
   sep=-DKAI_SEPARATE_COMPILATION=1
   case "${2#./}" in
-    runtime_owner_c.c) compile_tu "${2#./}" "$sep" -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1 ;;
+    runtime_llvm.c) compile_tu "${2#./}" "$sep" -DKAI_RUNTIME_OWNER=1 ;;
     *)                 compile_tu "${2#./}" "$sep" ;;
   esac
   exit
@@ -79,7 +79,7 @@ rm -rf "$KL_DIR"
 mkdir -p "$KL_DIR" "$KL_CACHE"
 awk -v dir="$KL_DIR" -v pfx="//KAIFILE:$nonce::" \
   'index($0,pfx)==1{if(out)close(out);out=dir"/"substr($0,length(pfx)+1);next} out{print > out}' "$in"
-cp "$(dirname "$0")/../stage2/runtime_owner_c.c" "$KL_DIR/"
+cp "$(dirname "$0")/../stage0/runtime_llvm.c" "$KL_DIR/"
 
 # Relative -I paths resolve from the caller's directory, not the TU's.
 prev=""
