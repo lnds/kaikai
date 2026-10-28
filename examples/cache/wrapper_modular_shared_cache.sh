@@ -1,15 +1,12 @@
 #!/bin/sh
-# c-modular shared-cache soundness — program-independent core TUs plus
-# race-free publishes.
+# c-modular shared-cache soundness — race-free publishes and program-
+# dependent units that never leak between programs.
 #
 # Part 1 (sequential): two DIFFERENT programs with the same name-level
-# surface (one `fn main`, no imports) but different bodies share a fresh
-# core cache. Their emit-cache keys collide by design (the key hashes
-# the surface, not bodies), so the second build splices the first
-# build's core TUs. It must still LINK and RUN: monomorphised instances
-# are program-dependent, so they must live in the root TU, never in a
-# spliced module TU. A cached core TU carrying program A's instances
-# leaves program B's instances undefined (or colliding) at link time.
+# surface (one `fn main`, no imports) but different bodies share fresh core
+# and object caches. The second must still LINK and RUN: monomorphised
+# instances are program-dependent, and a unit shared from the first build must
+# not carry program A's instances.
 #
 # Part 2 (parallel): N concurrent `KAI_MODULAR=1` builds share fresh
 # core + .o caches. Every publish on the path must be atomic
@@ -53,17 +50,11 @@ KAI_MODULAR=1 KAI_CORE_CACHE_DIR="$CORE_CACHE" KAI_CORE_CACHE_STATS=1 \
   "$KAI" build $BE "$PROJ/a/main.kai" -o "$PROJ/a/out" 2>"$PROJ/a.err" || {
   echo "wrapper_modular_shared_cache FAIL — cold build of program A failed"
   cat "$PROJ/a.err"; exit 1; }
-grep -q "core-emit-cache: miss" "$PROJ/a.err" || {
-  echo "wrapper_modular_shared_cache FAIL — program A did not report an emit-cache miss"
-  cat "$PROJ/a.err"; exit 1; }
 
 KAI_MODULAR=1 KAI_CORE_CACHE_DIR="$CORE_CACHE" KAI_CORE_CACHE_STATS=1 \
   KAI_MODULAR_CACHE_DIR="$OBJ_CACHE" \
   "$KAI" build $BE "$PROJ/b/main.kai" -o "$PROJ/b/out" 2>"$PROJ/b.err" || {
   echo "wrapper_modular_shared_cache FAIL — program B did not build/link on program A's warm core cache"
-  cat "$PROJ/b.err"; exit 1; }
-grep -q "core-emit-cache: hit" "$PROJ/b.err" || {
-  echo "wrapper_modular_shared_cache FAIL — program B missed the emit cache (keys diverged; splice untested)"
   cat "$PROJ/b.err"; exit 1; }
 
 [ "$("$PROJ/a/out")" = "a=6" ] || {

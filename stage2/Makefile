@@ -1379,21 +1379,17 @@ test-numeric-literal-mint: $(TARGET) build
 	  echo "literal-mint FAIL (a minted literal's call is untyped)"; grep -n -B1 ' call : ?$$' build/literal_mint.typed; exit 1; \
 	else echo "literal-mint OK (every minted call typed)"; fi
 
-# FFI v2 (#417) — struct-by-value across the C boundary. The emitter
-# ships the `extern "C" type` structs in a shared `kai_ffi.h` (issue
-# #924); a struct program emits a `//KAIFILE`-marker stream the wrapper
-# splits into `kai_ffi.h` + `out.c`. The shim (v2_struct_shim.c)
-# `#include`s the SAME header and names the SAME `Color` / `Vector2`
-# types, so a layout mismatch is a C compile error, not silent corruption.
+# FFI v2 (#417) — struct-by-value across the C boundary. `--ffi-header-out`
+# writes the `extern "C" type` structs to `kai_ffi.h`; the shim
+# (v2_struct_shim.c) `#include`s it and names `Color` / `Vector2`, and the
+# program's output pins the layout.
 # ASAN-clean (boundary unwrap + re-box is fresh malloc territory).
 # Struct-by-value is a C-backend feature; the native backend rejects it
 # with an actionable `--backend=c` diagnostic (issue #923).
 test-ffi-v2-struct: $(TARGET) build
 	@set -e; \
-	$(KAIC2) $(TEST_CORE_CACHE) ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.stream; \
 	rm -rf build/v2_struct.d; mkdir -p build/v2_struct.d; \
-	nonce=$$(sed -n '1s/^\/\/KAIDELIM://p' build/v2_struct.stream); \
-	awk -v dir=build/v2_struct.d -v pfx="//KAIFILE:$$nonce::" 'index($$0, pfx) == 1 { out = dir "/" substr($$0, length(pfx) + 1); next } out { print > out }' build/v2_struct.stream; \
+	$(KAIC2) $(TEST_CORE_CACHE) --ffi-header-out build/v2_struct.d/kai_ffi.h ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.d/out.c; \
 	$(CC) $(CFLAGS) -Wno-absolute-value -I build/v2_struct.d -I ../stage2 -I ../stage0 build/v2_struct.d/out.c ../examples/ffi/v2_struct_shim.c -o build/v2_struct-c $(LDLIBS_M); \
 	./build/v2_struct-c > build/v2_struct.out; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.out > /dev/null \
@@ -3241,49 +3237,29 @@ test-stdlib-survey: $(TARGET) build
 STDLIB_FIXTURES := $(filter-out bench_% check_% %_lib qualified_call_in_prelude issue_219_typer_modcall issue_318_kai_test_prelude_scope,$(basename $(notdir $(wildcard ../examples/stdlib/*.kai))))
 
 test-stdlib: $(addprefix test-stdlib-fixture-,$(STDLIB_FIXTURES))
-	@# m13: assert bit ops lowered as compiler intrinsics. Under the
-	@# Koka tagged-Int runtime a small Int is an immediate (no heap
-	@# `->as.i` slot), so the operand is decoded inline via `kai_intf(_a)`
-	@# rather than `_a->as.i`. The intent is unchanged: each raw operator
-	@# appears inline and must NOT reference any `kai_bit_*` runtime
-	@# helper (we never declared one — a leak would be an emit-pass miss).
-	@if grep -q 'kai_bit_' build/stdlib-bits_basic.c; then \
-	  echo "stdlib FAIL bits_basic (intrinsic leaked as kai_bit_* call)"; \
-	  grep 'kai_bit_' build/stdlib-bits_basic.c; \
-	  exit 1; \
-	fi
-	@grep -F -q '(uint64_t) kai_intf(_a) << (kai_intf(_b) & 63)' build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (<< not inlined)"; exit 1; }
-	@grep -F -q 'kai_intf(_a) >> (kai_intf(_b) & 63)' build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (>> not inlined)"; exit 1; }
-	@grep -F -q 'kai_intf(_a) & kai_intf(_b)'  build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (& not inlined)"; exit 1; }
-	@grep -F -q 'kai_intf(_a) | kai_intf(_b)'  build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (| not inlined)"; exit 1; }
-	@grep -F -q 'kai_intf(_a) ^ kai_intf(_b)'  build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (^ not inlined)"; exit 1; }
-	@grep -F -q '~ kai_intf(_a)'     build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (~ not inlined)"; exit 1; }
-	@grep -F -q '__builtin_popcountll' build/stdlib-bits_basic.c \
-	  || { echo "stdlib FAIL bits_basic (popcount not inlined)"; exit 1; }
-	@echo "stdlib OK bits_basic intrinsic-lowered"
-	@# m13 dotted surface: `bit.X(...)` rewrites to the flat-prefix
-	@# `bit_X` intrinsic in rqc_kind, so the same lowering must hold
-	@# for bits_dotted. If a `kai_bit_*` symbol leaks, the rewrite
-	@# regressed and the dotted form fell back to the EModCall codegen
-	@# path (which would mint `kai_bit__and` and break the build).
-	@if grep -q 'kai_bit_' build/stdlib-bits_dotted.c; then \
-	  echo "stdlib FAIL bits_dotted (intrinsic leaked as kai_bit_* call)"; \
-	  grep 'kai_bit_' build/stdlib-bits_dotted.c; \
-	  exit 1; \
-	fi
-	@grep -F -q '(uint64_t) kai_intf(_a) << (kai_intf(_b) & 63)' build/stdlib-bits_dotted.c \
-	  || { echo "stdlib FAIL bits_dotted (<< not inlined)"; exit 1; }
-	@grep -F -q 'kai_intf(_a) & kai_intf(_b)'  build/stdlib-bits_dotted.c \
-	  || { echo "stdlib FAIL bits_dotted (& not inlined)"; exit 1; }
-	@grep -F -q '__builtin_popcountll' build/stdlib-bits_dotted.c \
-	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
-	@echo "stdlib OK bits_dotted intrinsic-lowered"
+	@# m13: bit ops lower to the `kaix_core_bit_*` intrinsics, never to a
+	@# `kai_bit_*` runtime helper (a leak would be an emit-pass miss). Each
+	@# intrinsic is one inline raw operator over the decoded operands, in
+	@# the runtime the printed C includes.
+	@for f in bits_basic bits_dotted; do \
+	  if grep -q 'kai_bit_' build/stdlib-$$f.c; then \
+	    echo "stdlib FAIL $$f (intrinsic leaked as kai_bit_* call)"; grep 'kai_bit_' build/stdlib-$$f.c; exit 1; \
+	  fi; \
+	done
+	@chk() { grep -q "kaix_core_bit_$$2(" build/stdlib-$$1.c && grep -F -q "$$3" ../stage0/runtime_llvm.c \
+	  || { echo "stdlib FAIL $$1 ($$2 not an inline intrinsic)"; exit 1; }; }; \
+	chk bits_basic shl   '(uint64_t) kai_intf(a) << (kai_intf(b) & 63)'; \
+	chk bits_basic shr   'kai_intf(a) >> (kai_intf(b) & 63)'; \
+	chk bits_basic and   'kai_intf(a) & kai_intf(b)'; \
+	chk bits_basic or    'kai_intf(a) | kai_intf(b)'; \
+	chk bits_basic xor   'kai_intf(a) ^ kai_intf(b)'; \
+	chk bits_basic not   '~ kai_intf(a)'; \
+	chk bits_basic count '__builtin_popcount'; \
+	echo "stdlib OK bits_basic intrinsic-lowered"; \
+	chk bits_dotted shl   '(uint64_t) kai_intf(a) << (kai_intf(b) & 63)'; \
+	chk bits_dotted and   'kai_intf(a) & kai_intf(b)'; \
+	chk bits_dotted count '__builtin_popcount'; \
+	echo "stdlib OK bits_dotted intrinsic-lowered"
 
 test-stdlib-fixture-%: $(TARGET) build core-cache-warm
 	@set -e; \
@@ -3800,10 +3776,10 @@ test-effects-m7a_7_default_console: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
-	    && grep -q "kai_default_stderr_eprint" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_stdout" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_stderr" build/s2-$$name.c \
+	  grep -q "kaix_default_stdout_print" build/s2-$$name.c \
+	    && grep -q "kaix_default_stderr_eprint" build/s2-$$name.c \
+	    && grep -q "kaix_evidence_init_default_l[(].*_kai_default_node_Stdout" build/s2-$$name.c \
+	    && grep -q "kaix_evidence_init_default_l[(].*_kai_default_node_Stderr" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-handler wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3824,8 +3800,8 @@ test-effects-m7a_7_default_env: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_env_args" build/s2-$$name.c \
-	    && grep -q "kai_default_env_var"  build/s2-$$name.c \
+	  grep -q "kaix_default_env_args" build/s2-$$name.c \
+	    && grep -q "kaix_default_env_var"  build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Env wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3843,8 +3819,8 @@ test-effects-m7a_7_default_file: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_file_read_file"  build/s2-$$name.c \
-	    && grep -q "kai_default_file_write_file" build/s2-$$name.c \
+	  grep -q "kaix_default_file_read_file"  build/s2-$$name.c \
+	    && grep -q "kaix_default_file_write_file" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-File wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3861,7 +3837,7 @@ test-effects-m7a_7_default_stdin: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
+	  grep -q "kaix_default_stdin_read_line" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Stdin wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3883,8 +3859,8 @@ test-effects-m7b_1_alias_io: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
-	    && grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
+	  grep -q "kaix_default_stdout_print" build/s2-$$name.c \
+	    && grep -q "kaix_default_stdin_read_line" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (alias did not expand to default handlers)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3977,8 +3953,8 @@ test-effects-m8_2_yield_noop: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_spawn_yield" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_spawn" build/s2-$$name.c \
+	  grep -q "kaix_default_spawn_yield" build/s2-$$name.c \
+	    && grep -q "kaix_evidence_init_default_l[(].*_kai_default_node_Spawn" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Spawn wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3996,8 +3972,8 @@ test-effects-m8_3_spawn_await_value: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_spawn_spawn" build/s2-$$name.c \
-	    && grep -q "kai_default_spawn_await" build/s2-$$name.c \
+	  grep -q "kaix_default_spawn_spawn" build/s2-$$name.c \
+	    && grep -q "kaix_default_spawn_await" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Spawn ops missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4226,8 +4202,8 @@ test-effects-m8_4_cancel_uncaught: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_cancel_raise" build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_cancel" build/s2-$$name.c \
+	  grep -q "kaix_default_cancel_raise" build/s2-$$name.c \
+	    && grep -q "kaix_evidence_init_default_l[(].*_kai_default_node_Cancel" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Cancel wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4598,8 +4574,8 @@ test-effects-m8_12_self_delegating_handler: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  set_count=$$(grep -c "_disp_fib->in_dispatch_node = _node_op" build/s2-$$name.c || true); \
-	  rest_count=$$(grep -c "_disp_fib->in_dispatch_node = _saved_disp" build/s2-$$name.c || true); \
+	  set_count=$$(grep -o "kaix_disp_enter(fib_, node_)" build/s2-$$name.c | wc -l | tr -d ' '); \
+	  rest_count=$$(grep -o "kaix_disp_leave(fib_, prev_)" build/s2-$$name.c | wc -l | tr -d ' '); \
 	  test "$$set_count" -gt 0 \
 	    || { echo "effects FAIL $$name (no per-fiber in_dispatch_node sets emitted — bug #12 fix regressed?)"; exit 1; }; \
 	  test "$$set_count" = "$$rest_count" \
@@ -4805,9 +4781,9 @@ test-effects-process_basic: $(TARGET) build core-cache-warm
 	  exp=$${f%.kai}.out.expected; \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_process_start" build/s2-$$name.c \
-	    && grep -q "kai_default_process_wait"  build/s2-$$name.c \
-	    && grep -q "kai_evidence_init_default_l(&_kai_default_node_process" build/s2-$$name.c \
+	  grep -q "kaix_default_process_start" build/s2-$$name.c \
+	    && grep -q "kaix_default_process_wait"  build/s2-$$name.c \
+	    && grep -q "kaix_evidence_init_default_l[(].*_kai_default_node_Process" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Process wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4829,7 +4805,7 @@ test-effects-process_piped_capture: $(TARGET) build core-cache-warm
 	  exp=$${f%.kai}.out.expected; \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_process_start_piped" build/s2-$$name.c \
+	  grep -q "kaix_default_process_start_piped" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default start_piped wiring missing)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4847,7 +4823,7 @@ test-effects-process_uid: $(TARGET) build core-cache-warm
 	f=process_uid; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$f.kai > build/s2-$$f.c 2> build/s2-$$f.err \
 	  || { echo "effects FAIL $$f (kaic2 errored)"; cat build/s2-$$f.err; exit 1; }; \
-	grep -q "kai_default_process_uid" build/s2-$$f.c \
+	grep -q "kaix_default_process_uid" build/s2-$$f.c \
 	  || { echo "effects FAIL $$f (default uid wiring missing)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$f.c -o build/s2-$$f $(LDLIBS_M) \
 	  || { echo "effects FAIL $$f (C compile failed)"; exit 1; }; \
@@ -5087,11 +5063,11 @@ test-effects-file_stream_roundtrip: $(TARGET) build core-cache-warm
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_default_file_open_write" build/s2-$$name.c \
-	    && grep -q "kai_default_file_write_chunk" build/s2-$$name.c \
-	    && grep -q "kai_default_file_open_read"  build/s2-$$name.c \
-	    && grep -q "kai_default_file_read_chunk" build/s2-$$name.c \
-	    && grep -q "kai_default_file_close_file" build/s2-$$name.c \
+	  grep -q "kaix_default_file_open_write" build/s2-$$name.c \
+	    && grep -q "kaix_default_file_write_chunk" build/s2-$$name.c \
+	    && grep -q "kaix_default_file_open_read"  build/s2-$$name.c \
+	    && grep -q "kaix_default_file_read_chunk" build/s2-$$name.c \
+	    && grep -q "kaix_default_file_close_file" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (chunked-File wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -6617,7 +6593,7 @@ test-perceus-1153-modcall-linear: $(TARGET) build
 	    || { echo "perceus-1153-modcall-linear FAIL ($$name: expected vec_inplace=2000 vec_cow=0)"; \
 	         grep vec_ build/s2-$$name.rc || true; exit 1; }; \
 	done; \
-	grep -q 'kai_vec_push_rec_raw' build/s2-vec_module_surface_1153.c \
+	grep -q 'kaix_vec_push_rec_bits' build/s2-vec_module_surface_1153.c \
 	  || { echo "perceus-1153-modcall-linear FAIL (module surface missed the raw push fuse)"; exit 1; }; \
 	echo "perceus-1153-modcall-linear OK (module-call loops move the vec: writes in place on both spellings)"
 
@@ -7399,7 +7375,7 @@ test-trmc-slot-forms: $(TARGET) build
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $(TRMC_SLOT_DIR)/$$p.kai > build/s2-trmc-slot-$$p.c 2> build/s2-trmc-slot-$$p.err \
 	    || { echo "trmc-slot-forms FAIL ($$p: kaic2 errored)"; cat build/s2-trmc-slot-$$p.err; exit 1; }; \
 	done; \
-	loops() { awk -v f="$$2" '$$0 ~ ("^[A-Za-z_0-9 *]+ " f "\\(.*\\) \\{$$") { on = 1 } on && /goto L_entry;/ { found = 1 } on && /^}/ { on = 0 } END { exit !found }' "$$1"; }; \
+	loops() { awk -v f="$$2" '$$0 ~ ("^[A-Za-z_0-9 *]+ (kaiu_)?" f "\\(.*\\) \\{$$") { on = 1 } on && /goto L_entry;/ { found = 1 } on && /^}/ { on = 0 } END { exit !found }' "$$1"; }; \
 	for pf in $(TRMC_SLOT_FORMS); do \
 	  loops build/s2-trmc-slot-$${pf%%:*}.c "$${pf%%:*}__$${pf#*:}" \
 	    || { echo "trmc-slot-forms FAIL ($$pf: modulo-cons step did not fire)"; exit 1; }; \
@@ -10818,8 +10794,8 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu() { got=$$(tu_of "$$2"); [ "$$got" = "$$3" ] \
 	  || { echo "home-tu FAIL: $$1 ($$2) in '$$got', want $$3"; exit 1; }; \
 	  echo "home-tu OK: $$1 -> $$3"; }; \
-	assert_tu "root pub fn"        "^int64_t main__badge"         "main.c"; \
-	assert_tu "root private fn"    "^int64_t main__helper"        "main.c"; \
+	assert_tu "root pub fn"        "^int64_t kaiu_main__badge"       "main.c"; \
+	assert_tu "root private fn"    "^int64_t kaiu_main__helper"       "main.c"; \
 	assert_tu "fn main"            "^KaiValue [*] kai_main"       "__root__.c"; \
 	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/home_tu_partition.c -o build/home_tu_partition $(LDLIBS_M); \
