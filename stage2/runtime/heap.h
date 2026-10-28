@@ -296,6 +296,24 @@ KAI_RT_SHARED int kai_cell_pool_push(KaiValue *v) {
     }
     return 0;
 }
+/* A pool this small is not worth trimming. */
+#define KAI_CELL_POOL_TRIM_MIN 4096
+__attribute__((noinline))
+KAI_RT_SHARED int kai_cell_pool_trimmable(void) {
+    return kai_cell_pool_n > KAI_CELL_POOL_TRIM_MIN;
+}
+/* Return the whole pool, cells and table, to libc; the next push re-creates
+ * the table lazily. */
+__attribute__((noinline))
+KAI_RT_SHARED void kai_cell_pool_trim(void) {
+    if (!kai_cell_pool) return;
+#ifdef KAI_CELL_POOL_TRACE
+    fprintf(stderr, "cell-pool-trim %d\n", kai_cell_pool_n);
+#endif
+    while (kai_cell_pool_n > 0) free(kai_cell_pool[--kai_cell_pool_n]);
+    free(kai_cell_pool);
+    kai_cell_pool = NULL;
+}
 __attribute__((noinline))
 KAI_RT_SHARED KaiValue *kai_var_block_pool_pop(int n) {
     if (n < 0 || n > KAI_VAR_BLOCK_POOL_MAXN) return NULL;
