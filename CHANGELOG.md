@@ -84,6 +84,39 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.183.0 (2026-10-28)
+
+### Added
+
+- **typer**: check the expected type through every nested position
+
+### Fixed
+
+- **perceus**: release an arm binder read in sibling branches that the last read does not reach
+- **kai**: rebuild over the whole core when a cached native core object is trimmed before the link
+- **modules**: drop the import the unstable walker no longer uses
+- **diags**: route every printed warning through the diagnostic channel
+- **diags**: route every printed error through the diagnostic channel
+- **runtime**: classify the cell-pool idle stamp for the global and TLS-hoist audits
+- **pkg**: walk the manifest deps by recursion in the stale-lock check
+- **pkg**: keep the stale-lock check out of tail position so kai-pkg builds silently
+- **pkg**: a lock entry the manifest disagrees with no longer joins the build
+- **diag**: list main's default-handler effects with the predicate that decides them
+- **diag**: name the var assignment, derive the main default-handler list, list protocols in documentSymbol
+- **emit**: name user symbols kaiu_ in KIR so both backends print the same one
+- **tools**: tell the modular C stream by its file markers in prebuilt-kaic2
+
+### Changed
+
+- **runtime**: trim the cell pool of a lone main thread and foreign callers, release pages
+- **runtime**: give an idle worker's cell pool back to libc
+- **driver**: carry each stage's outputs as one shared record, not a copy per field
+- **driver**: every --dump-* reads a stage of the real pipeline
+- **driver**: derive the root name and entry from the request, not the stage contexts
+- **driver**: flat stage contexts instead of the .prev chain
+- **mono**: check mode runs the same call-site rewrite as build
+- **emit**: derive thunk, lambda and clause symbols from the unprefixed user stem
+
 ## v0.182.0 (2026-10-28)
 
 ### Added
