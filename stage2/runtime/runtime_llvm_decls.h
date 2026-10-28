@@ -77,6 +77,7 @@ static inline KaiValue *kaix_check_unique(KaiValue *scr);
 KaiValue *kaix_clause_env_get(void *self, int j);
 KaiValue *kaix_clause_state_get(void *self);
 void kaix_clause_state_set(void *self, KaiValue *v);
+KaiValue *kaix_clause_state_take(void *self);
 static inline KaiValue *kaix_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures);
 static inline KaiValue *kaix_cons(KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_cons_head(KaiValue *v);
@@ -381,6 +382,9 @@ static inline KaiValue *kaix_field(KaiValue *rec, const char *name);
 static inline KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot);
 static inline KaiValue *kaix_field_at(KaiValue *rec, int32_t i);
 static inline KaiValue *kaix_field_borrow(KaiValue *rec, const char *name);
+static inline KaiValue *kaix_field_take(KaiValue *rec, const char *name);
+static inline KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i);
+KaiValue *kaix_field_untake(KaiValue *rec, const char *name);
 KaiValue *kaix_file_append_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_file_delete_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_file_exists_thunk(KaiValue *s, KaiValue **a, int n);
@@ -945,6 +949,8 @@ static inline KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot) {
 }
 static inline KaiValue *kaix_field_at(KaiValue *rec, int32_t i) {return kai_op_field_at(rec, i); }
 static inline KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) {return kai_op_field_borrow(rec, name); }
+static inline KaiValue *kaix_field_take(KaiValue *rec, const char *name) {return kai_op_field_take(rec, name); }
+static inline KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i) {return kai_op_field_take_dup_at(rec, i); }
 static inline int64_t kaix_fixed_val_field(KaiValue *v) {
     if (!v) return 0;
     switch ((KaiTag) v->tag) {

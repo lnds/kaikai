@@ -24,25 +24,16 @@ import compiler.fnreg
 import compiler.doc_attr
 import compiler.driver_core_load
 import compiler.driver_cli
-import compiler.spec_names
 import compiler.resolve_env
-import compiler.home_dup
-import compiler.emit_cache
 import compiler.kir
 import compiler.emit_native
 import compiler.emit_native_core
 import compiler.driver_policy
-import compiler.driver_exports
 import compiler.real_lit
 import compiler.written
-import compiler.module_table
-import compiler.region
 import compiler.infer_glue
 import compiler.infer_state
 import compiler.diag_type_text
-import compiler.unwind_clauses
-import compiler.driver_front
-import compiler.emit_c_program
 
 fn tok_text(src: String, t: Token) : String = string_slice(src, t.start, t.length)
 
@@ -289,44 +280,6 @@ pub(pkg) fn native_core_srcs(backend: Backend, cc: CoreCacheOpt, core_names: [St
   }
 
 #[doc("""
-The pre-key the c-modular core TU set is looked up by before typing; empty
-when that cache is not in play.
-""")]
-pub(pkg) fn cmod_core_pre(backend: Backend, cc: CoreCacheOpt, edition: Option[Edition]) : String / Console + File =
-  match backend {
-    BkCModular ->
-      if cc.dir == "" or cc.toolchain == "" { "" }
-      else {
-        match core_src_hexes(core_module_paths(), []) {
-          None -> ""
-          Some(hx) -> ec_pre_key(cc.toolchain, edition_key_text(edition), string_join(hx, "\n"), cc.inputs)
-        }
-      }
-    _ -> ""
-  }
-
-#[doc("Whether the index already holds `variant` under `pre`.")]
-pub(pkg) fn cmod_variant_known(cc: CoreCacheOpt, pre: String, variant: String) : Bool / Console + File =
-  pre != "" and ec_index_has(cc.dir, pre, variant)
-
-#[doc("The marker that the index holds a c-modular core TU set under `pre`, for some variant.")]
-pub(pkg) fn cmod_core_hit(mode: Mode, cc: CoreCacheOpt, pre: String) : Option[String] / Console + File =
-  match mode {
-    MDefault -> if pre != "" and ec_index_any(cc.dir, pre) { Some(pre) } else { None }
-    _        -> None
-  }
-
-#[doc("The key of the core TU set recorded for the program's variant, when the compile may prune against one.")]
-pub(pkg) fn cmod_core_pick(backend: Backend, mode: Mode, cc: CoreCacheOpt, pre: String, variant: String) : Option[String] / Console + File =
-  match backend {
-    BkCModular -> match mode {
-      MDefault -> if pre == "" or variant == "" { None } else { ec_index_pick(cc.dir, pre, variant) }
-      _        -> None
-    }
-    _ -> None
-  }
-
-#[doc("""
 The single-TU native emit: link a core object the cache holds, emit and
 cache the core object, or emit the whole program as one object. Prints
 one object path per line for the wrapper to link.
@@ -349,129 +302,11 @@ fn print_objects(objs: [String]) : Int / Console = match objs {
 }
 
 # Content hexes of the core sources, in load order. None on any read
-# failure, which disables the emit cache for this invocation.
+# failure, which disables the core cache for this invocation.
 fn core_src_hexes(paths: [String], acc: [String]) : Option[[String]] / Console + File = match paths {
   [] -> Some(list_reverse(acc))
   [p, ...rest] -> match read_file(p) {
     Err(_) -> None
     Ok(s) -> core_src_hexes(rest, [uc_content_hex(s), ...acc])
-  }
-}
-
-# Span-free identity of one decl for the emit-cache key. Core TU
-# emission is fn-body-independent (a user body only shapes the root
-# TU), but the program's NAME-LEVEL surface — types, impls (as their
-# lowered `__pimpl_*` fn names), protocols, effects, units, fn
-# name/arity pairs — can perturb synthetic decls or renames attributed
-# to a core TU. Names and arities capture that surface without spans,
-# so a plain body edit keeps the key while any surface change is a
-# safe miss.
-# The target file's basename is NOT part of the surface: a root pub
-# fn (and an impl's lowered `__pimpl_*` method) carries the target
-# module as its origin, and keying on it would make an identical
-# program under a different filename miss.
-fn ec_key_mo(mo: Option[String], target: String) : String = match mo {
-  None -> ""
-  Some(m) -> if m == target { "" } else { m }
-}
-
-fn ec_key_decl_id(d: Decl, tab: SymTab, specs: SpecNames, target: String) : String = match d {
-  DFn(_, f, _, ps, _, _, _, _, _, mo) ->
-    concat_all(["fn ", "#{fn_emit_name(tab, specs, f)}", "/", int_to_string(list_length(ps)), "@", ec_key_mo(mo, target)])
-  DType(_, s, _, _, _, _, mo, _) -> concat_all(["type ", export_name(tab, s), "@", ec_key_mo(mo, target)])
-  DEffect(_, s, _, _, _, _, _, mo) -> concat_all(["effect ", export_name(tab, s), "@", ec_key_mo(mo, target)])
-  DProtocol(_, s, _, _, _, _, _) -> concat_all(["protocol ", export_name(tab, s)])
-  DImpl(p, _, _, _, _, _, _, _) -> concat_all(["impl ", dump_ref_shown(tab, p)])
-  DUnit(_, n, _, _, _, _, _) -> concat_all(["unit ", n])
-  DConst(_, s, _, _, mo, _, _) -> concat_all(["const ", export_name(tab, s), "@", ec_key_mo(mo, target)])
-  DUse(n, _, _) -> concat_all(["use ", n])
-  _ -> "."
-}
-
-# A per-call-site closure-spec decl is derived and root-homed; its name
-# carries a lambda body's `line`/`col`, so admitting it would let a plain
-# body edit that adds, removes, or moves a specialisable HOF call re-key
-# the core surface. It cannot perturb a core TU, so it stays out.
-fn ec_decl_is_cspec(d: Decl, tab: SymTab) : Bool = match d {
-  DFn(_, f, _, _, _, _, _, _, _, _) -> match sym_mint(tab, fnid_sym(f)) { NmSpec -> true  _ -> false }
-  _ -> false
-}
-
-fn ec_key_user_ids(decls: [Decl], tab: SymTab, specs: SpecNames, core_names: [String], target: String, acc: [String]) : [String] = match decls {
-  [] -> list_reverse(acc)
-  [d, ...rest] -> {
-    let is_core = match home_tu(d) {
-      None -> false
-      Some(m) -> list_has(core_names, m)
-    }
-    if is_core or ec_decl_is_cspec(d, tab) { ec_key_user_ids(rest, tab, specs, core_names, target, acc) }
-    else { ec_key_user_ids(rest, tab, specs, core_names, target, [ec_key_decl_id(d, tab, specs, target), ...acc]) }
-  }
-}
-
-fn ec_key_surface_hex(decls: [Decl], tab: SymTab, specs: SpecNames, core_names: [String], target: String) : String =
-  uc_content_hex(string_join(ec_key_user_ids(decls, tab, specs, core_names, target, []), "\n"))
-
-#[doc("""
-The emit-cache entry key: content hash over the format tag, the
-toolchain id, the edition, every core source, the program's
-type-level surface and its unwind variant. "" means the cache does not participate; a
-missing toolchain id disables it so a rebuilt dev compiler can never
-splice another build's C.
-""")]
-pub(pkg) fn core_emit_key(cc: CoreCacheOpt, edition: Option[Edition], decls: [Decl], tab: SymTab, specs: SpecNames,
-                 core_names: [String], target: String, variant: String) : String / Console + File =
-  if cc.dir == "" or cc.toolchain == "" { "" }
-  else {
-    match core_src_hexes(core_module_paths(), []) {
-      None -> ""
-      Some(hexes) -> uc_content_hex(concat_all([
-        ec_format_tag(), "\n", cc.toolchain, "\n", edition_key_text(edition), "\n",
-        ec_key_surface_hex(decls, tab, specs, core_names, target), "\n", variant, "\n",
-        string_join(hexes, "\n")]))
-    }
-  }
-
-# c-modular emit with the core emit cache threaded through. On a warm
-# entry the core TU bodies splice from the cache; on a miss the fresh
-# core TU bodies are persisted for the next build. Only plain builds
-# participate: test/bench shapes skip the cache instead of folding the
-# shape into the key.
-pub(pkg) fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymTab, specs: SpecNames,
-                             ids: ProtoIds, bmode: BuildMode, target_mod_name: String, entry: SymId,
-                             regions: [RegionMark], cc: CoreCacheOpt,
-                             core_mods: [ModuleEntry], edition: Option[Edition], pre: String, variant: String, seed: UnwSeed, hit: Option[String], stamp_ids: [SymId])
-                             : String / Console + File + Mutable = {
-  let plain = match bmode { BMBuild -> true _ -> false }
-  let cacheable = core_mod_names(core_mods, [])
-  let key = match hit {
-    Some(k) -> k
-    None    -> if plain { core_emit_key(cc, edition, decls, tab, specs, cacheable, target_mod_name, variant) } else { "" }
-  }
-  if key == "" {
-    let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
-    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), entry, regions, [], cacheable, false, seed, stamp_ids) {
-      EMO(stream, _) -> stream
-    }
-  } else {
-    let cached = match ec_lookup(cc.dir, key) { None -> [] Some(tus) -> tus }
-    let _v = if is_some(hit) and list_is_empty(cached) { panic("kaic2: the core TU set the compile pruned against is gone") } else { () }
-    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), entry, regions, cached, cacheable, is_some(hit), seed, stamp_ids) {
-      EMO(stream, fresh) -> {
-        let n_hit = list_length(cached)
-        let written = if n_hit == 0 and list_length(fresh) > 0 { ec_write(cc.dir, key, fresh) } else { "" }
-        let complete = if n_hit == 0 { fresh } else if list_is_empty(fresh) { cached } else { [] }
-        let _i = if is_none(hit) and variant != "" and not list_is_empty(complete) {
-          if written != "" { ec_index_record(cc.dir, pre, variant, key, written, cc.stats) }
-          else if not ec_index_has(cc.dir, pre, variant) { ec_index_record(cc.dir, pre, variant, key, ec_content_hex(complete), cc.stats) }
-          else { () }
-        } else { () }
-        let _s = if cc.stats {
-          if n_hit > 0 { eprint("kaic2: core-emit-cache: hit (#{n_hit} TUs)") }
-          else { eprint("kaic2: core-emit-cache: miss (wrote #{list_length(fresh)} TUs)") }
-        } else { () }
-        stream
-      }
-    }
   }
 }
