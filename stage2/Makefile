@@ -5518,13 +5518,13 @@ test-m4c: $(TARGET) build
 	  && grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.kir \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }; \
-	grep -qE "= m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.kir \
-	  && grep -qE "= m4c_run_with__run_with__mono__String__Int\(" build/s2-m4c_run_with.kir \
-	  && ! grep -qE "= m4c_run_with__run_with\(" build/s2-m4c_run_with.kir \
+	grep -qE "= kaiu_m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.kir \
+	  && grep -qE "= kaiu_m4c_run_with__run_with__mono__String__Int\(" build/s2-m4c_run_with.kir \
+	  && ! grep -qE "= kaiu_m4c_run_with__run_with\(" build/s2-m4c_run_with.kir \
 	  && echo "m4c OK m4c_run_with call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_run_with — main still calls the polymorphic run_with"; exit 1; }; \
-	grep -qE "= m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.kir \
-	  && grep -qE "= m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.kir \
+	grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.kir \
+	  && grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.kir \
 	  && echo "m4c OK m4c_handler_in_body call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls the polymorphic process_with_log"; exit 1; }; \
 	for t in Int String; do \
@@ -5532,7 +5532,7 @@ test-m4c: $(TARGET) build
 	    && grep -q "^fn kaiu_m4c_flow_through__inner__mono__$$t(" build/s2-m4c_flow_through.kir \
 	    || { echo "m4c FAIL m4c_flow_through — outer or inner spec missing"; exit 1; }; \
 	  awk -v f="^fn kaiu_m4c_flow_through__outer__mono__$$t[(]" '$$0 ~ f { on = 1 } on && /^}/ { exit } on' build/s2-m4c_flow_through.kir \
-	    | grep -q "= m4c_flow_through__inner__mono__$$t(" \
+	    | grep -q "= kaiu_m4c_flow_through__inner__mono__$$t(" \
 	    || { echo "m4c FAIL m4c_flow_through — outer__mono__$$t does not call inner__mono__$$t"; exit 1; }; \
 	done; \
 	echo "m4c OK m4c_flow_through outer + inner specialisations emitted and matched"
@@ -8884,10 +8884,10 @@ test-native-purity-attrs: $(TARGET) bin-kai build
 	./build/s2-purity > build/s2-purity.out 2>&1; \
 	diff -q $$exp build/s2-purity.out > /dev/null \
 	  || { echo "native-purity FAIL (native output diff)"; diff $$exp build/s2-purity.out; exit 1; }; \
-	hgrp=$$(grep -oE 'define (internal )?i64 @purity_licm__heavy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
+	hgrp=$$(grep -oE 'define (internal )?i64 @kaiu_purity_licm__heavy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
 	grep -Eq "^attributes $$hgrp = \{ nounwind memory\(none\) \}" build/s2-purity.ll \
 	  || { echo "native-purity FAIL (heavy $$hgrp not nounwind memory(none))"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
-	ngrp=$$(grep -oE 'define (internal )?ptr @purity_licm__noisy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
+	ngrp=$$(grep -oE 'define (internal )?ptr @kaiu_purity_licm__noisy\([^)]*\) #[0-9]+' build/s2-purity.ll | grep -oE '#[0-9]+'); \
 	grep -Eq "^attributes $$ngrp = \{ nounwind \}" build/s2-purity.ll \
 	  || { echo "native-purity FAIL (noisy $$ngrp should be nounwind only)"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
 	if grep -q 'willreturn' build/s2-purity.ll; then echo "native-purity FAIL (willreturn stamped)"; exit 1; fi; \
