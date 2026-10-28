@@ -111,7 +111,9 @@ source = "https://invalid.example/term"
 ref = "v0.0.1"
 sha = "0000000000000000000000000000000000000000"
 EOF
-kai_in "$TMP/app_s" env KAIKAI_CACHE_ROOT="$TMP/cache" "$KAI" build . -o "$TMP/app_stale"
+mkdir -p "$TMP/cache/invalid.example/term"
+cp -R "$DIR/lib_term" "$TMP/cache/invalid.example/term/0000000000000000000000000000000000000000"
+kai_in "$TMP/app_s" env KAIKAI_CACHE="$TMP/cache" "$KAI" build . -o "$TMP/app_stale"
 [ "$status" -eq 0 ] || { note "build with a stale git lock entry exited $status"; cat "$TMP/.err" >&2; }
 if [ -x "$TMP/app_stale" ]; then
   [ "$("$TMP/app_stale")" = "80" ] || note "stale-lock binary printed the wrong width"
