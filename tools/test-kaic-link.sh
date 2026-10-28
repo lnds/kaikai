@@ -36,7 +36,7 @@ EOF
 # link [flags...] — sets `compiled` to the number of objects cc built.
 link() {
   CC="${CC:-cc}" LDLIBS=-lm "$LINK_SH" "$work/prog.c" "$work/prog" \
-    -std=c99 -I "$ROOT/stage2" -I "$ROOT/stage0" "$@" 2> "$work/log" \
+    -std=c99 -DKAI_PROGRAM_PROVIDES_MAIN=1 -I "$ROOT/stage2" -I "$ROOT/stage0" "$@" 2> "$work/log" \
     || { cat "$work/log" >&2; fail "link failed"; }
   compiled="$(sed -n 's/.*compiled=\([0-9]*\)$/\1/p' "$work/log")"
 }
@@ -63,7 +63,7 @@ ok "a flag change rebuilds everything; objects no link used are pruned"
 
 for obj in "$work/obj-cache/prog"/*.o; do : > "$obj.part"; mv "$obj.part" "$obj"; done
 stream 2 2
-if CC="${CC:-cc}" LDLIBS=-lm "$LINK_SH" "$work/prog.c" "$work/prog" -std=c99 -I "$ROOT/stage2" -I "$ROOT/stage0" \
+if CC="${CC:-cc}" LDLIBS=-lm "$LINK_SH" "$work/prog.c" "$work/prog" -std=c99 -DKAI_PROGRAM_PROVIDES_MAIN=1 -I "$ROOT/stage2" -I "$ROOT/stage0" \
     -DKAI_TEST_FLAG=1 2>/dev/null; then
   fail "the test's own probe is blind: emptied cache objects linked"
 fi
