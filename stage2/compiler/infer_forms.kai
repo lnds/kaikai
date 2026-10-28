@@ -34,6 +34,7 @@ import compiler.desugar_record_lit
 import compiler.infer_unit_tables
 import compiler.infer_local_mutation
 import compiler.infer_tparam_escape
+import compiler.infer_expect
 
 #[doc("Typer-internal helper `check_pattern` shared across the infer modules.")]
 pub fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Console + File + Mutable =
@@ -377,7 +378,19 @@ pub fn synth_lambda_pinned(st: InferState, ps: [Param], body: Expr, pins: [Ty], 
 # then closes them all.
 #[doc("Typer-internal helper `synth_lambda_rows` shared across the infer modules.")]
 pub fn synth_lambda_rows(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String, every_tail: Bool,
-                     line: Int, col: Int) : Inferred / Console + File + Mutable {
+                     line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_lambda_body(st, ps, body, pins, why, every_tail, None, line, col)
+
+
+# A lambda read at a function type checks its body against that type's result.
+#[doc("Typer-internal helper `synth_lambda_checked` shared across the infer modules.")]
+pub fn synth_lambda_checked(st: InferState, ps: [Param], body: Expr, doms: [Ty], ret: Ty,
+                        line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_lambda_body(st, ps, body, expected_pins(st, ps, doms), "lambda parameter", false, Some(ret), line, col)
+
+
+fn synth_lambda_body(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String, every_tail: Bool,
+                     body_exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let outer = st
@@ -408,7 +421,10 @@ pub fn synth_lambda_rows(st: InferState, ps: [Param], body: Expr, pins: [Ty], wh
   # A lambda lifted out of a clause body cannot call the clause's
   # continuation, unless a lambda param shadows its name.
   let st_in3 = st_set_in_clause(st_set_clause_resume(st_in2, None), clause_cont_in_lambda(st_in2.in_clause, ps))
-  let rb = w_synth(st_in3, body)
+  let rb = match body_exp {
+    Some(rt) -> w_check_against(st_in3, body, rt, "lambda body", body.line, body.col)
+    None     -> w_synth(st_in3, body)
+  }
   # keep the row labels in their raw form so a downstream
   # `unify_row` partition can see TyVar payloads (an `Actor[?T]` mint-
   # ed by `Actor.self()` inside this body should bias the enclosing
@@ -504,14 +520,15 @@ pub fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], expected:
         Some(s) -> TyCon(s, [])
         None    -> tsh_tycon_at(st_home_view(st), rh, [])
       }
-      let r = synth_field_inits(head.st, fis, [], line, col)
+      let r = synth_field_inits(head.st, fis, [], [], line, col)
       let root = with_ty(mk_expr(ERecordLit(rh, r.fis), line, col), named)
       mk_inferred(r.st, named, root)
     }
     Some(ri) -> match ri {
       RI(rsym, _, fds, _) -> {
         let inst = rec_instantiate(head.st, ri)
-        let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
+        let want = fields_under_result(inst.st, inst.fields, inst.result_ty, expected)
+        let r = synth_field_inits(inst.st, fis, inst.fields, want, line, col)
         let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
         let ty = apply_ty(st1.sub, inst.result_ty)
         if rh_out_of_order(fis, fds) { lay_in_declared_order(head.st, st1, rsym, fds, r.fis, ty, line, col) }
@@ -687,50 +704,10 @@ fn refine_checked(st: InferState, v: Expr, vty: Ty, preds: [Expr], strip: Bool) 
 }
 
 
-# A let-RHS under annotation. A textual numeric literal
-# (`EIntLit`/`EDecimalLit`) coins against the resolved annotation here,
-# before `synth` would error on the missing context; everything else
-# synths normally and the post-synth `maybe_mint_literal` covers the
-# `EInt`/`EReal` cases.
-#[doc("Typer-internal helper `synth_let_rhs_or_mint` shared across the infer modules.")]
-pub fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
-                         line: Int, col: Int) : Inferred / Console + File + Mutable {
-  match rhs.kind {
-    EIntLit(_)     -> mint_let_textual(st, rhs, te, line, col)
-    EDecimalLit(_) -> mint_let_textual(st, rhs, te, line, col)
-    EUnop(UoNeg, x) -> match x.kind {
-      EIntLit(_) -> mint_let_textual(st, rhs, te, line, col)
-      _          -> w_synth(st, rhs)
-    }
-    # The annotation names the record a bare literal head builds.
-    ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, st_annot_ty(st, te), rhs.line, rhs.col)
-    _ -> w_synth(st, rhs)
-  }
-}
-
-
-# `e` where a type is expected: a record literal's head is asked of that
-# type first, as is one written as an element of a list literal, and a
-# lambda's parameters take its domains; any other shape is synthesised.
-#[doc("Typer-internal helper `synth_expecting` shared across the infer modules.")]
-pub fn synth_expecting(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = match e.kind {
-  ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
-  ELambda(ps, body) -> match apply_ty(st.sub, expected) {
-    TyFnT(doms, _, _) -> synth_lambda_expecting(st, ps, body, doms, e.line, e.col)
-    _                 -> w_synth(st, e)
-  }
-  EList(els) -> match apply_ty(st.sub, expected) {
-    TyListT(elem_ty) -> if any(els, elem_is_record_lit) { w_check_elems(st, els, elem_ty, e.line, e.col) }
-                        else { w_synth(st, e) }
-    _ -> w_synth(st, e)
-  }
-  _ -> w_synth(st, e)
-}
-
-
-fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
-                    line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let expected = apply_ty(st.sub, st_annot_ty(st, te))
+#[doc("Typer-internal helper `mint_textual_against` shared across the infer modules.")]
+pub fn mint_textual_against(st: InferState, rhs: Expr, want: Ty,
+                        line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let expected = apply_ty(st.sub, want)
   match mint_literal(rhs, expected, mint_bigint_home(st.env)) {
     MintOk(e2) -> {
       let ty = match e2.ty { Some(t) -> t None -> expected }
@@ -745,23 +722,21 @@ fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 
-# A field whose declared type is a sum picks the constructor the way an
-# annotated binding does; every other shape keeps synthesising, so the
-# field's type still only has to unify.
+# A field's value is checked against the field's declared type.
 fn synth_field_value(st: InferState, ex: Expr, ft: Option[Ty]) : Inferred / Console + File + Mutable =
   match ft {
     None     -> w_synth(st, ex)
-    Some(ty) -> check_branch_for_ctor(st, ex, apply_ty(st.sub, ty))
+    Some(ty) -> w_check_against(st, ex, apply_ty(st.sub, ty), "record field", ex.line, ex.col)
   }
 
 
-fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferredFInits / Console + File + Mutable =
+fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], want: [FTy], line: Int, col: Int) : InferredFInits / Console + File + Mutable =
   match fis {
     [] -> InferredFInits { st: st, fis: [] }
     [FI(fnm, ex), ...rest] -> {
       let ft = fty_find(fields, fnm)
-      let fv = field_init_checked(synth_field_value(st, ex, ft), ft, fnm, ex, line, col)
-      let rr = synth_field_inits(fv.st, rest, fields, line, col)
+      let fv = field_init_checked(synth_field_value(st, ex, fty_find(want, fnm)), ft, fnm, ex, line, col)
+      let rr = synth_field_inits(fv.st, rest, fields, want, line, col)
       InferredFInits { st: rr.st, fis: [FI(fnm, fv.pair.expr), ...rr.fis] }
     }
   }
@@ -775,36 +750,6 @@ fn field_init_checked(r: Inferred, ft: Option[Ty], fnm: String, ex: Expr, line: 
       let coerced = if rc_mentions(fty) or rc_mentions_in(minted.st.sub, minted.pair.ty) { refine_coerce(minted, fty, field_what(fnm), ex.line, ex.col) } else { minted }
       MintedExpr { st: st_unify(coerced.st, fty, coerced.pair.ty, field_what(fnm), line, col), pair: coerced.pair }
     }
-  }
-
-
-# Helper: route a branch through `check_expr_against`
-# when it is a bare ctor reference (or a block whose tail is), so the
-# annotation context can disambiguate. Other shapes fall through to
-# `synth` to keep existing behaviour.
-#[doc("Typer-internal helper `check_branch_for_ctor` shared across the infer modules.")]
-pub fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Console + File + Mutable =
-  match br.kind {
-    EBlock(_, Some(te)) -> if branch_names_ctor(te) or is_record_lit(te) { w_check_against(st, br, expected, "if branch", br.line, br.col) } else { w_synth(st, br) }
-    EBlock(_, None)     -> w_synth(st, br)
-    ECall(_, _)         -> if branch_names_ctor(br) { w_check_against(st, br, expected, "if branch", br.line, br.col) } else { w_synth(st, br) }
-    EName(_)            -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-    ESym(_, _)          -> w_check_against(st, br, expected, "if branch", br.line, br.col)
-    _                   -> synth_expecting(st, br, expected)
-  }
-
-
-# A call of a written or resolved constructor name, or such a name alone.
-fn branch_names_ctor(e: Expr) : Bool =
-  match e.kind {
-    ECall(c, _) -> match c.kind {
-      EName(_)   -> true
-      ESym(_, _) -> true
-      _          -> false
-    }
-    EName(_)    -> true
-    ESym(_, _)  -> true
-    _           -> false
   }
 
 

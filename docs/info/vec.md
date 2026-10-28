@@ -38,7 +38,8 @@ like a value.
 A list literal in a `Vec`-typed position builds the vec directly —
 one pre-sized buffer, no cons list. The annotation, the argument
 position and a declared return type (`fn f() : Vec[T] = [...]`, or a
-block's tail) mint; a BARE `[1, 2, 3]` still denotes the cons list.
+block's tail) mint, at any depth under them: a record field, a tuple
+component, a constructor argument, an `if` branch, a lambda body; a BARE `[1, 2, 3]` still denotes the cons list.
 
 ```kaikai
 fn total(v: Vec[Int]) : Int = vec_get(v, 0) + vec_get(v, 1)
