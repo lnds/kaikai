@@ -955,7 +955,8 @@ exactly, at compile time. An annotation is the trigger: `let a: Decimal
 = 0.2` is born an exact `Decimal` (not a rounded float), `let a:
 DecimalBig = 3.14159265358979323846` keeps every digit, `let x: BigInt =
 5` builds a `BigInt` with no `n` suffix, and `let w: UInt32 = 40` mints a
-`UInt32`. The lattice is by lexical shape: an integer literal reaches
+`UInt32`. A call argument is a trigger too: `double_byte(5)` with a `Byte`
+parameter mints `5` to `Byte`, and `double_byte(256)` is a range error. The lattice is by lexical shape: an integer literal reaches
 `Int`/`Int32`/`UInt32`/`UInt64`/`Int128`/`Byte`/`Decimal`/`DecimalBig`/
 `BigInt`/`Real`; a point literal (`0.2`) reaches only `Real`/`Decimal`/
 `DecimalBig` — `let n: Int = 0.2` (or `3.0`) is an error, never a
